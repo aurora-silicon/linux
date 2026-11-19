@@ -109,10 +109,6 @@
 	status = "okay";
 };
 
-&cpu_pmu {
-	status = "okay";
-};
-
 &dockchannel {
 	status = "okay";
 };
@@ -236,20 +232,6 @@
 &mtp_hid {
 	multi-touch {
 		firmware-name = "apple/tpmtfw-j813.bin";
-	};
-};
-
-&{/soc} {
-	/*
-	 * The CPU clusters' power-gate enables, in /arm-io/pmgr reg[34]: E at
-	 * +0x0 and P at +0x60, the offsets T8132 has and the two words
-	 * AppleT8142PMGR's restoreHW sets. iBoot leaves P's clear, and the
-	 * boot core (P core 0) then never powers down in WFI.
-	 */
-	cluster_pwrgate: power-gate@380724000 {
-		compatible = "apple,t8142-cluster-pwrgate", "apple,cluster-pwrgate";
-		reg = <0x3 0x80724000 0x0 0x4>,
-		      <0x3 0x80724060 0x0 0x4>;
 	};
 };
 

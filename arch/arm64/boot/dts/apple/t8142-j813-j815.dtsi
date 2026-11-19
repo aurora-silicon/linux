@@ -344,7 +344,6 @@
 	};
 };
 
-#include "t8142-j813-psci-idle.dtsi"
 #include "t8142-j813-nvme.dtsi"
 #include "t8142-j813-power.dtsi"
 

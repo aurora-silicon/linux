@@ -129,7 +129,6 @@
 	};
 
 	cpu_pmu: pmu {
-		status = "disabled";
 		compatible = "apple,t8142-pmu";
 		interrupt-parent = <&aic>;
 		/* The AIC raises both clusters' PMU FIQs as this one, as on T8140. */
@@ -167,6 +166,19 @@
 		 * the ways and allocation before the kernel, so the driver only
 		 * checks that and flushes the cache on shutdown.
 		 */
+		/*
+		 * The CPU clusters' power-gate enables, in /arm-io/pmgr reg[34]: E at
+		 * +0x0 and P at +0x60, the offsets T8132 has and the two words
+		 * AppleT8142PMGR's restoreHW sets. iBoot leaves P's clear, and the
+		 * boot core (P core 0) then never powers down in WFI. Same pmgr in
+		 * the J704, J813 and J815 ADTs.
+		 */
+		cluster_pwrgate: power-gate@380724000 {
+			compatible = "apple,t8142-cluster-pwrgate", "apple,cluster-pwrgate";
+			reg = <0x3 0x80724000 0x0 0x4>,
+			      <0x3 0x80724060 0x0 0x4>;
+		};
+
 		mcc: memory-controller@220000000 {
 			compatible = "apple,t8142-mcc", "apple,t8140-mcc";
 			reg = <0x2 0x20000000 0x0 0x4000>,
@@ -289,3 +301,4 @@
 };
 
 #include "t8142-peripherals.dtsi"
+#include "t8142-psci-idle.dtsi"
