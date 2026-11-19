@@ -155,9 +155,35 @@
 	status = "disabled";
 };
 
-/* These boards' SMC fan and power keys are not yet checked */
+/*
+ * SMC sensors, as on J714s: the shared fan, power, voltage and current keys,
+ * plus every readable float T* key through apple,discover-temperatures in
+ * t6050-die0.dtsi. A key this SMC lacks only drops its channel. Discovery
+ * refuses to run once any temperature channel exists, so the shared
+ * temperature nodes and apple,soc-die-keys go.
+ *
+ * The four boards' ADTs carry the same SMC node; all four are dual-fan
+ * MacBook Pros like J714s and J716s. The T6050 SMC spells the fan mode keys
+ * F0md/F1md and drives the fans itself (no apple,fan-manual-control). The
+ * keys are read on K116s; on K114c, K114s and K116c they are assumed the same.
+ */
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+#include "hwmon-laptop.dtsi"
+
 &smc_hwmon {
-	status = "disabled";
+	status = "okay";
+	/delete-property/ apple,soc-die-keys;
+	/delete-node/ temperature-TH0x;
+	/delete-node/ temperature-TB0T;
+	/delete-node/ temperature-TCHP;
+	/delete-node/ temperature-TW0P;
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+	};
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+	};
 };
 
 /*
