@@ -370,6 +370,10 @@ bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps, size_t held,
 			 size_t held_bytes, u32 len, size_t decoded_size);
 bool avd_h264_scaling_is_flat(const struct v4l2_ctrl_h264_pps *pps,
 			      const struct v4l2_ctrl_h264_scaling_matrix *scaling);
+const struct avd_coded_fmt_desc *avd_find_coded_fmt_desc(struct avd_ctx *ctx,
+							 u32 fourcc);
+enum avd_image_fmt avd_stored_image_fmt(struct avd_ctx *ctx,
+					const struct avd_coded_fmt_desc *desc);
 #endif
 
 extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;

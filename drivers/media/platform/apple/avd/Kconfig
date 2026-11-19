@@ -25,6 +25,7 @@ config VIDEO_APPLE_AVD_KUNIT_TEST
 	help
 	  Build KUnit tests for the Apple video decoder. They exercise the
 	  H.264 slice bounds, frame-slot ownership, and runtime power management,
-	  including suspend gating and resubmission after firmware resume.
+	  including suspend gating and resubmission after firmware resume, and
+	  the picture format an OUTPUT format change takes from the controls.
 
 	  If unsure, say N.
