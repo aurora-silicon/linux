@@ -2,8 +2,12 @@
 /*
  * Apple ProRes (APR) V4L2 memory-to-memory codec.
  *
- * One job runs at a time. The driver writes a descriptor into a 128 KiB DMA
- * ring, advances the producer head and waits for the completion interrupt.
+ * The driver writes job descriptors into a 128 KiB DMA ring and advances the
+ * producer head; the engine works through the ring and reports progress with
+ * a consumer tail and a completion interrupt. Up to APR_MAX_INFLIGHT jobs sit
+ * in the ring at once: a job's buffers leave the m2m queues when its
+ * descriptor is published, so v4l2-m2m can run the next job while the engine
+ * is busy, and they complete in ring order once the tail passes them.
  * The encoder consumes semi-planar 4:2:2 or 4:4:4 frames and produces one
  * complete ProRes frame per buffer. The decoder exposes a second stateful
  * node with the queue directions reversed and linear color output.
@@ -11,6 +15,7 @@
  * Based on Acelogic's J700 ProRes diagnostic, which first encoded on this
  * engine under Linux, and on the m1n1 proxyclient ProRes experiment (MIT).
  */
+#include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
@@ -29,6 +34,7 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 
 #include <media/v4l2-ctrls.h>
@@ -844,6 +850,19 @@ static const struct apr_variant apr_t6050 = {
 	.apri = &apri_t6050,
 };
 
+struct apr_ctx;
+
+/* A job in the ring; its buffers left the m2m queues when it was published. */
+struct apr_job {
+	struct apr_ctx *ctx;
+	struct vb2_v4l2_buffer *src;
+	struct vb2_v4l2_buffer *dst;
+	u32 end;		/* ring pointer just past its descriptor */
+	u32 sequence;
+	u32 bytes;		/* decoded payload */
+	int err;		/* forced result: engine error or cancellation */
+};
+
 struct apr_dev {
 	const struct apr_variant *variant;
 	struct device *dev;
@@ -874,12 +893,22 @@ struct apr_dev {
 	size_t stats_size;
 
 	spinlock_t hw_lock;	/* protects the fields below */
-	struct apr_ctx *active;	/* job in the engine, or NULL */
+	struct apr_job jobs[APR_MAX_INFLIGHT];	/* in ring order */
+	unsigned int job_first;	/* oldest job in jobs[] */
+	unsigned int njobs;	/* jobs the engine owns */
+	unsigned int nencodes;	/* encode jobs among them */
+	struct apr_ctx *held;	/* m2m job left running while the ring is full */
 	u32 head;		/* next free ring offset */
+	u32 done;		/* the engine has consumed the ring up to here */
 	bool ring_ready;	/* engine registers programmed since power-up */
 	bool broken;		/* timed out with no way to reset */
-	unsigned long started;	/* jiffies at submission */
+	bool hung;		/* ring state is inconsistent, reset now */
+	bool resetting;		/* the watchdog is resetting the engine */
+	unsigned long progress;	/* jiffies of the last start or completion */
 	struct delayed_work watchdog;
+
+	atomic_t outstanding;	/* jobs not yet given back to vb2 */
+	wait_queue_head_t idle_wq;	/* woken when jobs are given back */
 };
 
 struct apr_ctx {
@@ -893,7 +922,7 @@ struct apr_ctx {
 	bool decode;
 	bool source_valid;
 	bool decode_444;
-	bool cancelled;
+	atomic_t inflight;	/* jobs in the ring not yet given back to vb2 */
 	enum apr_profile stream_profile;	/* fixed while OUTPUT streams */
 	u32 sequence;
 };
@@ -974,6 +1003,7 @@ static void apr_hw_init(struct apr_dev *apr)
 	/* Order the setup before any descriptor publication. */
 	wmb();
 	apr->head = 0;
+	apr->done = 0;
 	apr->ring_ready = true;
 }
 
@@ -1105,16 +1135,17 @@ static int apr_fill_decode_frame(struct apr_ctx *ctx,
 	return 0;
 }
 
-static void apr_finish_job(struct apr_dev *apr, struct apr_ctx *ctx, int err)
+/*
+ * Give a job's buffers back to vb2. Safe in interrupt context. Not inlined,
+ * so ftrace can time completions against apr_device_run and apr_irq.
+ */
+static noinline void apr_complete(struct apr_dev *apr, struct apr_job *job)
 {
+	struct apr_ctx *ctx = job->ctx;
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
-	struct vb2_v4l2_buffer *src, *dst;
+	struct vb2_v4l2_buffer *src = job->src, *dst = job->dst;
+	int err = job->err;
 	u32 bytes = 0;
-
-	src = v4l2_m2m_src_buf_remove(m2m);
-	dst = v4l2_m2m_dst_buf_remove(m2m);
-	if (WARN_ON(!src || !dst))
-		goto out;
 
 	if (!err && !ctx->decode) {
 		u8 *out = vb2_plane_vaddr(&dst->vb2_buf, 0);
@@ -1129,11 +1160,11 @@ static void apr_finish_job(struct apr_dev *apr, struct apr_ctx *ctx, int err)
 	if (!err && ctx->decode) {
 		/* The ACK and tail read complete before output ownership returns. */
 		dma_rmb();
-		bytes = ctx->dst_fmt.plane_fmt[0].sizeimage;
+		bytes = job->bytes;
 	}
 	vb2_set_plane_payload(&dst->vb2_buf, 0, err ? 0 : bytes);
 	v4l2_m2m_buf_copy_metadata(src, dst);
-	dst->sequence = ctx->sequence++;
+	dst->sequence = job->sequence;
 	dst->flags |= V4L2_BUF_FLAG_KEYFRAME;
 	if (v4l2_m2m_is_last_draining_src_buf(m2m, src)) {
 		static const struct v4l2_event eos = { .type = V4L2_EVENT_EOS };
@@ -1144,27 +1175,72 @@ static void apr_finish_job(struct apr_dev *apr, struct apr_ctx *ctx, int err)
 	}
 	v4l2_m2m_buf_done(src, err ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
 	v4l2_m2m_buf_done(dst, err ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
-out:
+}
+
+/*
+ * Give back jobs taken off the ring, in ring order. A context may be freed
+ * as soon as its in-flight count drops, so it is not touched after that.
+ */
+static void apr_retire(struct apr_dev *apr, struct apr_job *jobs,
+				unsigned int n)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++) {
+		apr_complete(apr, &jobs[i]);
+		pm_runtime_mark_last_busy(apr->dev);
+		pm_runtime_put_autosuspend(apr->dev);
+		atomic_dec(&jobs[i].ctx->inflight);
+		atomic_dec(&apr->outstanding);
+	}
+	if (n)
+		wake_up_all(&apr->idle_wq);
+}
+
+/* Fail the current m2m job before its descriptor reached the ring. */
+static void apr_finish_job(struct apr_dev *apr, struct apr_ctx *ctx, int err)
+{
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+	struct apr_job job = {
+		.ctx = ctx,
+		.err = err,
+		.sequence = ctx->sequence++,
+	};
+
+	job.src = v4l2_m2m_src_buf_remove(m2m);
+	job.dst = v4l2_m2m_dst_buf_remove(m2m);
+	if (!WARN_ON(!job.src || !job.dst))
+		apr_complete(apr, &job);
 	pm_runtime_mark_last_busy(apr->dev);
 	pm_runtime_put_autosuspend(apr->dev);
 	v4l2_m2m_job_finish(apr->m2m_dev, m2m);
 }
 
 /*
- * Claim the active job if the engine has finished it. Returns the context to
- * finish, or NULL. Called with hw_lock held.
+ * Move the jobs the engine has finished, oldest first, to @out (room for
+ * APR_MAX_INFLIGHT). Returns false if the engine raised nothing. Called with
+ * hw_lock held and the engine powered.
+ *
+ * DONE and ERROR are latched per engine, not per descriptor: the status and
+ * detail registers do not say which descriptor failed. An ERROR therefore
+ * fails every job in the ring at that moment; the engine keeps running and
+ * the watchdog resets it if the tail stops moving. Several descriptors may
+ * finish behind one interrupt, and a DONE may arrive for a job already taken
+ * here on the tail alone; both are fine.
  */
-static struct apr_ctx *apr_take_done(struct apr_dev *apr, int *err)
+static bool apr_take_done(struct apr_dev *apr, struct apr_job *out,
+			  unsigned int *n)
 {
-	struct apr_ctx *ctx = apr->active;
+	u32 ring_bytes = apr->variant->ring_bytes;
 	u32 status, tail, st0, st1, st2;
 	u32 detail[6];
+	unsigned int i;
 
-	if (!ctx)
-		return NULL;
+	*n = 0;
 	status = apr_read(apr, APR_REG_IRQ_STATUS);
 	if (!(status & (APR_IRQ_DONE | APR_IRQ_ERROR)))
-		return NULL;
+		return false;
+	/* Snapshot before the W1C, as for a single job. */
 	st0 = apr_read(apr, APR_REG_ST0);
 	st1 = apr_read(apr, APR_REG_ST1);
 	st2 = apr_read(apr, APR_REG_ST2);
@@ -1174,78 +1250,143 @@ static struct apr_ctx *apr_take_done(struct apr_dev *apr, int *err)
 	detail[3] = apr_read(apr, APR_REG_DETAIL2_LO);
 	detail[4] = apr_read(apr, APR_REG_DETAIL2_HI);
 	detail[5] = apr_read(apr, APR_REG_DETAIL3);
+	if (status & APR_IRQ_ERROR) {
+		dev_err_ratelimited(apr->dev,
+				    "job failed: irq %#x head %#x done %#x jobs %u st %#x/%#x/%#x detail %#x/%#x/%#x/%#x/%#x/%#x\n",
+				    status, apr->head, apr->done, apr->njobs,
+				    st0, st1, st2, detail[0], detail[1], detail[2],
+				    detail[3], detail[4], detail[5]);
+		for (i = 0; i < apr->njobs; i++) {
+			struct apr_job *job = &apr->jobs[(apr->job_first + i) %
+							 APR_MAX_INFLIGHT];
+
+			if (!job->err)
+				job->err = -EIO;
+		}
+	}
 	apr_write(apr, APR_REG_IRQ_STATUS, status);
 	/* The tail read flushes the posted W1C before buffers are released. */
 	tail = apr_read(apr, APR_REG_RING_TAIL) & APR_RING_PTR_MASK;
-	*err = 0;
-	if (!(status & APR_IRQ_DONE) || status & APR_IRQ_ERROR || tail != apr->head) {
-		dev_err_ratelimited(apr->dev,
-				    "job failed: irq %#x tail %#x head %#x st %#x/%#x/%#x detail %#x/%#x/%#x/%#x/%#x/%#x\n",
-				    status, tail, apr->head, st0, st1, st2,
-				    detail[0], detail[1], detail[2], detail[3],
-				    detail[4], detail[5]);
-		*err = -EIO;
+	if (!apr_ring_tail_valid(apr->done, tail, apr->head, ring_bytes)) {
+		dev_err_ratelimited(apr->dev, "tail %#x outside %#x..%#x\n",
+				    tail, apr->done, apr->head);
+		apr->hung = true;
+		return true;
 	}
-	if (ctx->cancelled)
-		*err = -ECANCELED;
-	apr->active = NULL;
+	while (apr->njobs) {
+		struct apr_job *job = &apr->jobs[apr->job_first];
+
+		if (!apr_ring_passed(apr->done, job->end, tail, ring_bytes))
+			break;
+		out[(*n)++] = *job;
+		apr->done = job->end;
+		apr->job_first = (apr->job_first + 1) % APR_MAX_INFLIGHT;
+		apr->njobs--;
+		if (!job->ctx->decode)
+			apr->nencodes--;
+	}
+	if (*n)
+		apr->progress = jiffies;
+	return true;
+}
+
+/*
+ * The m2m job left running because the ring was full may finish once there
+ * is room again. Called with hw_lock held; the caller finishes it unlocked.
+ */
+static struct apr_ctx *apr_take_held(struct apr_dev *apr)
+{
+	struct apr_ctx *ctx = apr->held;
+
+	if (!ctx || apr_jobs_full(apr->njobs, apr->nencodes))
+		return NULL;
+	apr->held = NULL;
 	return ctx;
 }
 
 static irqreturn_t apr_irq(int irq, void *data)
 {
 	struct apr_dev *apr = data;
-	struct apr_ctx *ctx;
-	int err = 0;
+	struct apr_job done[APR_MAX_INFLIGHT];
+	struct apr_ctx *held = NULL;
+	unsigned int n = 0;
+	bool handled = false, hung;
 
 	spin_lock(&apr->hw_lock);
-	ctx = apr_take_done(apr, &err);
+	/* Registers are only reachable while the engine is powered. */
+	if (apr->ring_ready)
+		handled = apr_take_done(apr, done, &n);
+	held = apr_take_held(apr);
+	hung = apr->hung;
+	if (!apr->njobs)
+		cancel_delayed_work(&apr->watchdog);
 	spin_unlock(&apr->hw_lock);
-	if (!ctx)
-		return IRQ_NONE;
-	cancel_delayed_work(&apr->watchdog);
-	apr_finish_job(apr, ctx, err);
-	return IRQ_HANDLED;
+	if (hung)
+		mod_delayed_work(system_wq, &apr->watchdog, 0);
+	apr_retire(apr, done, n);
+	if (held)
+		v4l2_m2m_job_finish(apr->m2m_dev, held->fh.m2m_ctx);
+	return handled ? IRQ_HANDLED : IRQ_NONE;
 }
 
 /*
- * Backstop for a lost interrupt and for hangs. A hung engine is reset
- * through its power domain and reprogrammed; without a reset line the
- * device refuses further jobs rather than reuse memory it may still own.
+ * Backstop for a lost interrupt and for hangs. A ring that stops moving for
+ * APR_TIMEOUT_MS fails every job in it. A hung engine is reset through its
+ * power domain and reprogrammed; without a reset line the device refuses
+ * further jobs rather than reuse memory it may still own.
  */
 static void apr_watchdog(struct work_struct *work)
 {
 	struct apr_dev *apr = container_of(work, struct apr_dev, watchdog.work);
-	struct apr_ctx *ctx;
+	struct apr_job done[APR_MAX_INFLIGHT];
+	struct apr_ctx *held;
 	unsigned long flags;
-	int err = 0;
+	unsigned int n = 0;
 
 	spin_lock_irqsave(&apr->hw_lock, flags);
-	ctx = apr_take_done(apr, &err);
-	if (ctx) {
+	if (!apr->njobs) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
+		return;
+	}
+	if (apr->ring_ready && apr_take_done(apr, done, &n) && n)
 		dev_warn_once(apr->dev, "completion found without an interrupt\n");
-		apr_finish_job(apr, ctx, err);
-		return;
-	}
-	ctx = apr->active;
-	if (!ctx) {
+	if (!apr->hung && (!apr->njobs ||
+			   time_before(jiffies, apr->progress +
+				       msecs_to_jiffies(APR_TIMEOUT_MS)))) {
+		held = apr_take_held(apr);
+		if (apr->njobs)
+			schedule_delayed_work(&apr->watchdog,
+					      msecs_to_jiffies(APR_POLL_MS));
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
+		apr_retire(apr, done, n);
+		if (held)
+			v4l2_m2m_job_finish(apr->m2m_dev, held->fh.m2m_ctx);
 		return;
 	}
-	if (time_before(jiffies, apr->started + msecs_to_jiffies(APR_TIMEOUT_MS))) {
-		spin_unlock_irqrestore(&apr->hw_lock, flags);
-		schedule_delayed_work(&apr->watchdog, msecs_to_jiffies(APR_POLL_MS));
-		return;
+	dev_err(apr->dev, "%s: head %#x done %#x tail %#x jobs %u st %#x/%#x\n",
+		apr->hung ? "ring state invalid" : "job timed out",
+		apr->head, apr->done, apr_read(apr, APR_REG_RING_TAIL),
+		apr->njobs, apr_read(apr, APR_REG_ST0), apr_read(apr, APR_REG_ST1));
+	/* Every job still in the ring fails; the engine may own none of them. */
+	while (apr->njobs) {
+		struct apr_job *job = &apr->jobs[apr->job_first];
+
+		done[n] = *job;
+		if (!done[n].err)
+			done[n].err = -ETIMEDOUT;
+		n++;
+		apr->job_first = (apr->job_first + 1) % APR_MAX_INFLIGHT;
+		apr->njobs--;
 	}
-	dev_err(apr->dev, "job timed out: head %#x tail %#x st %#x/%#x\n",
-		apr->head, apr_read(apr, APR_REG_RING_TAIL),
-		apr_read(apr, APR_REG_ST0), apr_read(apr, APR_REG_ST1));
-	apr->active = NULL;
+	apr->nencodes = 0;
+	apr->hung = false;
+	held = apr->held;
+	apr->held = NULL;
 	apr_write(apr, APR_REG_IRQ_ENABLE, 0);
 	apr_write(apr, APR_REG_MODE, APR_MODE_OFF);
 	apr->ring_ready = false;
-	/* No new job can start until this one is finished below. */
+	/* device_run waits until the reset below is over. */
+	apr->resetting = true;
 	spin_unlock_irqrestore(&apr->hw_lock, flags);
 	if (!apr->reset || reset_control_reset(apr->reset)) {
 		dev_err(apr->dev, "engine cannot be reset, refusing further jobs\n");
@@ -1253,24 +1394,41 @@ static void apr_watchdog(struct work_struct *work)
 		apr->broken = true;
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 	}
-	apr_finish_job(apr, ctx, -ETIMEDOUT);
+	spin_lock_irqsave(&apr->hw_lock, flags);
+	apr->resetting = false;
+	spin_unlock_irqrestore(&apr->hw_lock, flags);
+	apr_retire(apr, done, n);
+	/* apr_retire() woke idle_wq only if there was a job to give back. */
+	wake_up_all(&apr->idle_wq);
+	if (held)
+		v4l2_m2m_job_finish(apr->m2m_dev, held->fh.m2m_ctx);
 }
 
+/*
+ * Publish one job and, while the ring has room for another, finish the m2m
+ * job at once so the next one is prepared while the engine works. When the
+ * ring is full the m2m job stays running until a completion makes room, so
+ * device_run is only entered with room for one more descriptor.
+ */
 static void apr_device_run(void *priv)
 {
 	struct apr_ctx *ctx = priv;
 	struct apr_dev *apr = ctx->apr;
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+	u32 ring_bytes = apr->variant->ring_bytes;
 	struct vb2_v4l2_buffer *src, *dst;
 	struct apr_frame f;
 	struct apr_decode_frame decode;
+	struct apr_job *job;
 	u8 desc[APR_ENCODE_DESC_BYTES];
 	u32 desc_bytes;
 	unsigned long flags;
+	bool hold;
 	void *out;
 	int ret;
 
-	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
-	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+	src = v4l2_m2m_next_src_buf(m2m);
+	dst = v4l2_m2m_next_dst_buf(m2m);
 
 	ret = pm_runtime_resume_and_get(apr->dev);
 	if (ret < 0) {
@@ -1298,13 +1456,24 @@ static void apr_device_run(void *priv)
 	}
 
 	spin_lock_irqsave(&apr->hw_lock, flags);
+	while (apr->resetting) {
+		spin_unlock_irqrestore(&apr->hw_lock, flags);
+		wait_event(apr->idle_wq, !READ_ONCE(apr->resetting));
+		spin_lock_irqsave(&apr->hw_lock, flags);
+	}
 	if (apr->broken) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		apr_finish_job(apr, ctx, -EIO);
 		return;
 	}
-	if (!apr->ring_ready)
+	if (!apr->ring_ready && !WARN_ON(apr->njobs))
 		apr_hw_init(apr);
+	if (WARN_ON(apr_jobs_full(apr->njobs, apr->nencodes) ||
+		    apr_ring_free(apr->done, apr->head, ring_bytes) <= desc_bytes)) {
+		spin_unlock_irqrestore(&apr->hw_lock, flags);
+		apr_finish_job(apr, ctx, -EBUSY);
+		return;
+	}
 	ret = ctx->decode ? apr_build_decode_desc(&decode, desc) :
 			    apr->variant->build_desc(&f, desc);
 	if (ret) {
@@ -1312,18 +1481,35 @@ static void apr_device_run(void *priv)
 		apr_finish_job(apr, ctx, ret);
 		return;
 	}
-	apr_ring_write(apr->ring, apr->variant->ring_bytes, apr->head,
-		       desc, desc_bytes);
-	apr->head = apr_ring_advance(apr->head, desc_bytes,
-				     apr->variant->ring_bytes);
-	apr->active = ctx;
-	ctx->cancelled = false;
-	apr->started = jiffies;
+	apr_ring_write(apr->ring, ring_bytes, apr->head, desc, desc_bytes);
+	apr->head = apr_ring_advance(apr->head, desc_bytes, ring_bytes);
+	job = &apr->jobs[(apr->job_first + apr->njobs) % APR_MAX_INFLIGHT];
+	*job = (struct apr_job){
+		.ctx = ctx,
+		.src = v4l2_m2m_src_buf_remove(m2m),
+		.dst = v4l2_m2m_dst_buf_remove(m2m),
+		.end = apr->head,
+		.sequence = ctx->sequence++,
+		.bytes = ctx->dst_fmt.plane_fmt[0].sizeimage,
+	};
+	WARN_ON(job->src != src || job->dst != dst);
+	if (!apr->njobs)
+		apr->progress = jiffies;
+	apr->njobs++;
+	if (!ctx->decode)
+		apr->nencodes++;
+	atomic_inc(&ctx->inflight);
+	atomic_inc(&apr->outstanding);
 	/* Descriptor and buffers must be visible before the head moves. */
 	dma_wmb();
 	writel(apr->head, apr->regs + APR_REG_RING_HEAD);
-	spin_unlock_irqrestore(&apr->hw_lock, flags);
+	hold = apr_jobs_full(apr->njobs, apr->nencodes);
+	if (hold)
+		apr->held = ctx;
 	schedule_delayed_work(&apr->watchdog, msecs_to_jiffies(APR_POLL_MS));
+	spin_unlock_irqrestore(&apr->hw_lock, flags);
+	if (!hold)
+		v4l2_m2m_job_finish(apr->m2m_dev, m2m);
 }
 
 static int apr_job_ready(void *priv)
@@ -1348,10 +1534,21 @@ static void apr_job_abort(void *priv)
 	struct apr_dev *apr = ctx->apr;
 	unsigned long flags;
 
-	/* There is no decode- or encode-specific cancellation opcode. */
+	unsigned int i;
+
+	/*
+	 * There is no cancellation opcode: the context's jobs still run to the
+	 * end of the ring and only report cancelled. stop_streaming waits for
+	 * them; other contexts' jobs in the same ring are not touched.
+	 */
 	spin_lock_irqsave(&apr->hw_lock, flags);
-	if (apr->active == ctx)
-		ctx->cancelled = true;
+	for (i = 0; i < apr->njobs; i++) {
+		struct apr_job *job = &apr->jobs[(apr->job_first + i) %
+						 APR_MAX_INFLIGHT];
+
+		if (job->ctx == ctx)
+			job->err = -ECANCELED;
+	}
 	spin_unlock_irqrestore(&apr->hw_lock, flags);
 }
 
@@ -1613,6 +1810,63 @@ static int apr_subscribe_event(struct v4l2_fh *fh, const struct v4l2_event_subsc
 	return v4l2_ctrl_subscribe_event(fh, sub);
 }
 
+/*
+ * A STOP with no OUTPUT buffer left in the m2m queue makes the m2m helper
+ * mark the next CAPTURE buffer LAST at once. With this context's jobs still
+ * in the ring their frames would follow that LAST buffer, so wait for them
+ * first. The check and the helper run under hw_lock: device_run moves a
+ * job's buffers into the ring under the same lock, so the helper sees the
+ * last OUTPUT buffer either queued or already given back.
+ */
+static int apr_stop_cmd(struct file *file, struct apr_ctx *ctx, void *cmd)
+{
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+	struct apr_dev *apr = ctx->apr;
+	unsigned long flags;
+	int ret;
+
+	for (;;) {
+		spin_lock_irqsave(&apr->hw_lock, flags);
+		if (v4l2_m2m_num_src_bufs_ready(m2m) ||
+		    !atomic_read(&ctx->inflight))
+			break;
+		spin_unlock_irqrestore(&apr->hw_lock, flags);
+		wait_event(apr->idle_wq, !atomic_read(&ctx->inflight));
+	}
+	ret = ctx->decode ? v4l2_m2m_decoder_cmd(file, m2m, cmd) :
+			    v4l2_m2m_encoder_cmd(file, m2m, cmd);
+	spin_unlock_irqrestore(&apr->hw_lock, flags);
+	return ret;
+}
+
+static int apr_encoder_cmd(struct file *file, void *priv,
+			   struct v4l2_encoder_cmd *ec)
+{
+	struct apr_ctx *ctx = apr_file_to_ctx(file);
+	int ret;
+
+	ret = v4l2_m2m_ioctl_try_encoder_cmd(file, priv, ec);
+	if (ret)
+		return ret;
+	if (ec->cmd == V4L2_ENC_CMD_STOP)
+		return apr_stop_cmd(file, ctx, ec);
+	return v4l2_m2m_ioctl_encoder_cmd(file, priv, ec);
+}
+
+static int apr_decoder_cmd(struct file *file, void *priv,
+			   struct v4l2_decoder_cmd *dc)
+{
+	struct apr_ctx *ctx = apr_file_to_ctx(file);
+	int ret;
+
+	ret = v4l2_m2m_ioctl_try_decoder_cmd(file, priv, dc);
+	if (ret)
+		return ret;
+	if (dc->cmd == V4L2_DEC_CMD_STOP)
+		return apr_stop_cmd(file, ctx, dc);
+	return v4l2_m2m_ioctl_decoder_cmd(file, priv, dc);
+}
+
 static const struct v4l2_ioctl_ops apr_ioctl_ops = {
 	.vidioc_querycap = apr_querycap,
 	.vidioc_enum_fmt_vid_out = apr_enum_fmt_out,
@@ -1636,7 +1890,7 @@ static const struct v4l2_ioctl_ops apr_ioctl_ops = {
 	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
 
 	.vidioc_try_encoder_cmd = v4l2_m2m_ioctl_try_encoder_cmd,
-	.vidioc_encoder_cmd = v4l2_m2m_ioctl_encoder_cmd,
+	.vidioc_encoder_cmd = apr_encoder_cmd,
 
 	.vidioc_subscribe_event = apr_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
@@ -1665,7 +1919,7 @@ static const struct v4l2_ioctl_ops apr_decoder_ioctl_ops = {
 	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
 
 	.vidioc_try_decoder_cmd = v4l2_m2m_ioctl_try_decoder_cmd,
-	.vidioc_decoder_cmd = v4l2_m2m_ioctl_decoder_cmd,
+	.vidioc_decoder_cmd = apr_decoder_cmd,
 
 	.vidioc_subscribe_event = apr_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
@@ -1799,6 +2053,12 @@ static void apr_stop_streaming(struct vb2_queue *q)
 	struct apr_ctx *ctx = vb2_get_drv_priv(q);
 	struct vb2_v4l2_buffer *vbuf;
 
+	/*
+	 * The engine still owns this context's jobs in the ring. The m2m core
+	 * cancelled the job being prepared; wait for the ring ones, which the
+	 * watchdog completes or fails within APR_TIMEOUT_MS of no progress.
+	 */
+	wait_event(ctx->apr->idle_wq, !atomic_read(&ctx->inflight));
 	for (;;) {
 		vbuf = V4L2_TYPE_IS_OUTPUT(q->type) ?
 			v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx) :
@@ -1971,6 +2231,8 @@ static int apr_suspend(struct device *dev)
 	struct apr_dev *apr = dev_get_drvdata(dev);
 
 	v4l2_m2m_suspend(apr->m2m_dev);
+	/* No new job starts now; let the ring drain. */
+	wait_event(apr->idle_wq, !atomic_read(&apr->outstanding));
 	return pm_runtime_force_suspend(dev);
 }
 
@@ -2079,6 +2341,9 @@ static int apr_probe(struct platform_device *pdev)
 	mutex_init(&apr->vdev_lock);
 	spin_lock_init(&apr->hw_lock);
 	INIT_DELAYED_WORK(&apr->watchdog, apr_watchdog);
+	init_waitqueue_head(&apr->idle_wq);
+	/* The ring always has room for every job the driver keeps in flight. */
+	BUILD_BUG_ON(APR_MAX_INFLIGHT * APR_ENCODE_DESC_BYTES >= APR_RING_BYTES);
 	platform_set_drvdata(pdev, apr);
 
 	for (i = 0; i < apr->variant->num_regs; i++) {

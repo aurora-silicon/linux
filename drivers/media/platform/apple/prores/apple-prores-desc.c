@@ -661,6 +661,63 @@ u32 apr_ring_advance(u32 ptr, u32 bytes, u32 ring_bytes)
 }
 EXPORT_SYMBOL_IF_KUNIT(apr_ring_advance);
 
+/*
+ * Ring pointers carry a generation bit above the offset, so a pointer names
+ * one of 2 * ring_bytes positions and a full ring differs from an empty one.
+ */
+static u32 apr_ring_pos(u32 ptr, u32 ring_bytes)
+{
+	return (ptr & APR_RING_OFFSET_MASK) +
+	       (ptr & APR_RING_GENERATION ? ring_bytes : 0);
+}
+
+/* Bytes from @from forward to @to. */
+u32 apr_ring_distance(u32 from, u32 to, u32 ring_bytes)
+{
+	u32 span = 2 * ring_bytes;
+
+	return (apr_ring_pos(to, ring_bytes) + span -
+		apr_ring_pos(from, ring_bytes)) % span;
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_ring_distance);
+
+/* Bytes the producer may still write; @done is what the engine consumed. */
+u32 apr_ring_free(u32 done, u32 head, u32 ring_bytes)
+{
+	u32 used = apr_ring_distance(done, head, ring_bytes);
+
+	return used < ring_bytes ? ring_bytes - used : 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_ring_free);
+
+/*
+ * Has the consumer @tail moved past the descriptor that ends at @end? @done
+ * is the start of the oldest descriptor still owned by the engine.
+ */
+bool apr_ring_passed(u32 done, u32 end, u32 tail, u32 ring_bytes)
+{
+	return apr_ring_distance(done, end, ring_bytes) <=
+	       apr_ring_distance(done, tail, ring_bytes);
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_ring_passed);
+
+/* A tail the engine reports must lie between what it consumed and the head. */
+bool apr_ring_tail_valid(u32 done, u32 tail, u32 head, u32 ring_bytes)
+{
+	return !(tail & ~APR_RING_PTR_MASK) &&
+	       (tail & APR_RING_OFFSET_MASK) < ring_bytes &&
+	       apr_ring_distance(done, tail, ring_bytes) <=
+	       apr_ring_distance(done, head, ring_bytes);
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_ring_tail_valid);
+
+/* No further job may enter the ring with @jobs in it, @encodes of them encodes. */
+bool apr_jobs_full(unsigned int jobs, unsigned int encodes)
+{
+	return jobs >= APR_MAX_INFLIGHT || encodes >= APR_ENCODE_MAX_INFLIGHT;
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_jobs_full);
+
 void apr_ring_write(u8 *ring, u32 ring_bytes, u32 ptr, const u8 *desc,
 		    u32 desc_bytes)
 {
