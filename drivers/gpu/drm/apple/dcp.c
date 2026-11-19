@@ -5788,8 +5788,11 @@ static bool dcp_v27_sleep_transport_supported(struct apple_dcp *dcp)
 		return false;
 	if (dcp->v27_j714s)
 		return true;
-	if (!of_machine_is_compatible("apple,j716c") ||
-	    !of_machine_is_compatible("apple,t6050") ||
+	/*
+	 * Elsewhere, where the T6050 sleep is described: the generic 27.0 transport, with the
+	 * live session adopted and the default method table (first run on the J716c).
+	 */
+	if (!apple_t6050_sleep_described() ||
 	    !(of_device_is_compatible(dev->of_node, "apple,t6050-dcp") ||
 	      of_device_is_compatible(dev->of_node, "apple,t6050-dcpext")) ||
 	    !dcp->hw.adopt_live_session ||
