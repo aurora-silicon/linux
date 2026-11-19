@@ -87,7 +87,7 @@ MODULE_PARM_DESC(station_link_addresses, "Diagnostic: use the netdev address for
 
 static bool alpha_sleep_untested;
 module_param(alpha_sleep_untested, bool, 0600);
-MODULE_PARM_DESC(alpha_sleep_untested, "TEST ONLY: J813 Alpha host-power and ACIPC sleep handshake");
+MODULE_PARM_DESC(alpha_sleep_untested, "TEST ONLY: Alpha host-power and ACIPC sleep handshake");
 
 struct centauri_rx_snapshot {
 	__le32 version, count;
@@ -2705,12 +2705,17 @@ static int alpha_resume_locked(struct centauri_wifi *wifi)
 	return 0;
 }
 
+/*
+ * The host-power and ACIPC sleep requests are the N1 firmware's own protocol, the same on
+ * every board this driver binds (one board entry each, same PCI functions). Resume only
+ * undoes what suspend sent, so it needs no gate of its own.
+ */
 int centauri_wifi_resume(struct centauri *c)
 {
 	struct centauri_wifi *wifi = c->wifi;
 	int ret;
 
-	if (!wifi || !of_machine_is_compatible("apple,j813"))
+	if (!wifi)
 		return 0;
 	mutex_lock(&wifi->lock);
 	ret = alpha_resume_locked(wifi);
@@ -2723,8 +2728,7 @@ int centauri_wifi_suspend(struct centauri *c)
 	struct centauri_wifi *wifi = c->wifi;
 	int ret, restore;
 
-	if (!wifi || !of_machine_is_compatible("apple,j813") ||
-	    !READ_ONCE(alpha_sleep_untested))
+	if (!wifi || !READ_ONCE(alpha_sleep_untested))
 		return 0;
 	mutex_lock(&wifi->lock);
 	if (wifi->transport_paused || wifi->connected || wifi->connecting || wifi->scan_request ||
