@@ -15,6 +15,7 @@
 
 #define T6050_J716C
 #include "t6050-max.dtsi"
+#include "hwmon-fan-dual.dtsi"
 
 / {
 	compatible = "apple,j716c", "apple,t6050", "apple,arm-platform";
@@ -184,9 +185,20 @@
 	gpio-reserved-ranges = <0 80>, <81 57>, <139 82>;
 };
 
-/* This board's SMC fan and power keys are not yet checked */
+/* The SoC hotspot is the temperature input to the GPU thermal governor. */
 &smc_hwmon {
-	status = "disabled";
+	/delete-property/ apple,discover-temperatures;
+	status = "okay";
+
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+		apple,fan-manual-control;
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+		apple,fan-manual-control;
+	};
 };
 
 /*

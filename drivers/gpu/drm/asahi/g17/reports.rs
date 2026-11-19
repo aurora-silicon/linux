@@ -128,6 +128,13 @@ impl kernel::debugfs::Writer for PowerView {
         let Some(firmware) = state.as_deref() else {
             return writeln!(f, "online=0");
         };
+        if let (Ok(emergency), Ok(draw), Ok(budget)) = (
+            firmware.init.m5_firmware_clamped(),
+            firmware.init.m5_gpu_power_mw(),
+            firmware.init.m5_power_budget(),
+        ) {
+            writeln!(f, "emergency_clamp={} gpu_power_mw={} budget_mw={}", emergency, draw, budget)?;
+        }
         write_power(firmware, f)
     }
 }
