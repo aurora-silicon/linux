@@ -1152,7 +1152,8 @@ static bool ave_deliver(struct ave_ctx *ctx)
 		v4l2_m2m_buf_copy_metadata(s->src, dst);
 		dst->flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME |
 				V4L2_BUF_FLAG_BFRAME | V4L2_BUF_FLAG_LAST);
-		dst->flags |= key ? V4L2_BUF_FLAG_KEYFRAME : V4L2_BUF_FLAG_PFRAME;
+		dst->flags |= key ? V4L2_BUF_FLAG_KEYFRAME :
+			      s->bframe ? V4L2_BUF_FLAG_BFRAME : V4L2_BUF_FLAG_PFRAME;
 		dst->sequence = ctx->dst_sequence++;
 
 		sess->done_head = (sess->done_head + 1) % AVE_MAX_SLOTS;
