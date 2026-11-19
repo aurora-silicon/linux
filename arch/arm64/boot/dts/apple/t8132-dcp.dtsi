@@ -40,7 +40,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 678 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		power-domains = <&ps_disp_cpu>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		status = "disabled";
 	};
@@ -51,7 +50,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 678 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		power-domains = <&ps_disp_cpu>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		status = "disabled";
 	};
