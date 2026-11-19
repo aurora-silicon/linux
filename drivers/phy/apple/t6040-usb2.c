@@ -1246,14 +1246,18 @@ static int t6040_usb3_power_off(struct phy *phy)
 }
 
 /*
- * Host only. dwc3-apple calls this after the core init and before xHCI
+ * dwc3-apple calls this after the core init and before xHCI or the gadget
  * starts; the xHCI root hub calls it again as it starts, also for a port
- * that stays at USB2, which must not fail.
+ * that stays at USB2, which must not fail. There is no SuperSpeed device
+ * sequence (t6040_usb3_validate()): a device role runs on USB2 and leaves
+ * the PIPE parked on its dummy producer, where power_off put it.
  */
 static int t6040_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
 
+	if (mode == PHY_MODE_USB_DEVICE)
+		return 0;
 	if (mode != PHY_MODE_USB_HOST && mode != PHY_MODE_USB_HOST_SS)
 		return -EOPNOTSUPP;
 
@@ -1267,8 +1271,16 @@ static int t6040_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 	return 0;
 }
 
+/* SuperSpeed host only: dwc3-apple runs a device role as a high-speed device. */
+static int t6040_usb3_validate(struct phy *phy, enum phy_mode mode, int submode,
+			       union phy_configure_opts *opts)
+{
+	return mode == PHY_MODE_USB_HOST || mode == PHY_MODE_USB_HOST_SS ? 0 : -EOPNOTSUPP;
+}
+
 static const struct phy_ops t6040_usb3_phy_ops = {
 	.owner = THIS_MODULE,
+	.validate = t6040_usb3_validate,
 	.set_mode = t6040_usb3_set_mode,
 	.power_on = t6040_usb3_power_on,
 	.power_off = t6040_usb3_power_off,
