@@ -37,3 +37,6 @@
 
 #define T6050_J873S
 #include "t6050-peripherals.dtsi"
+
+/* The GPU in the M5 Pro layout */
+#include "t6050-gpu-g17s.dtsi"

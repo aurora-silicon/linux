@@ -983,8 +983,28 @@
 	};
 };
 
-#ifdef T6050_J716C
+#ifdef T6050_GPU_BUS
+/*
+ * The GPU aperture (ADT sgx, gfx-asc, gfx1-asc and the GPU PMGR, 0x23_0000_0000) as its own
+ * bus, as on J716c (t6050-j716c.dts): the M5 Max GPU handoff (t6050-gpu-g17c.dtsi) finds the
+ * GPU, both mailboxes and the GPU power states under /soc@2300000000.
+ */
+/ {
+	gpu_bus: soc@2300000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x23 0x0 0x23 0x0 0x0 0x4000000>;
+		interrupt-parent = <&aic>;
+		nonposted-mmio;
+	};
+};
+
+#endif
+#if defined(T6050_J716C)
 &j716c_gpu_bus {
+#elif defined(T6050_GPU_BUS)
+&gpu_bus {
 #else
 &{/soc} {
 #endif

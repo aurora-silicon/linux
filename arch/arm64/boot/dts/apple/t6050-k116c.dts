@@ -24,4 +24,8 @@
 };
 
 #define T6050_K116C
+/* The GPU in the M5 Max layout (t6050-gpu-g17c.dtsi), under its own bus */
+#define T6050_GPU_BUS
 #include "t6050-peripherals.dtsi"
+
+#include "t6050-gpu-g17c.dtsi"

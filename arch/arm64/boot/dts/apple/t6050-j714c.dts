@@ -18,6 +18,8 @@
 /dts-v1/;
 
 #define T6050_J714C
+/* The GPU in the M5 Max layout (t6050-gpu-g17c.dtsi), under its own bus */
+#define T6050_GPU_BUS
 #include "t6050-max.dtsi"
 
 / {
@@ -258,6 +260,7 @@
 };
 
 #include "t6050-peripherals.dtsi"
+#include "t6050-gpu-g17c.dtsi"
 
 /*
  * The PMP (ADT pmp0, /chosen, /arm-io/pmgr), as on the J714s. iBoot loads its firmware and the
@@ -306,7 +309,7 @@
 	apple,pmp = <&pmp0>;
 };
 
-&sgx {
+&gpu {
 	power-domains = <&pmp0_gfx>;
 };
 
