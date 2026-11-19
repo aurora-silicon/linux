@@ -252,11 +252,29 @@ fn encode_loaded_lock_state_13(bag: i32, state: TransitionState, secret: &[u8]) 
 /// designation after its temporary handle is unloaded; on the 13.5 store the
 /// loaded-bag unlock needs the handle, so a user's bag stays loaded from
 /// import or create until logout. Keyed by the designation's special handle.
-pub(crate) struct LoadedBags(KVec<(i32, crate::sks::KeyBagHandle)>);
+/// The loaded bags, and the bags the driver holds locked (`hold_locked`):
+/// a lock the store never confirmed. A held bag stays held when it is
+/// unloaded, until a later unlock of it succeeds.
+pub(crate) struct LoadedBags(KVec<(i32, crate::sks::KeyBagHandle)>, KVec<i32>);
 
 impl LoadedBags {
     pub(crate) const fn new() -> Self {
-        LoadedBags(KVec::new())
+        LoadedBags(KVec::new(), KVec::new())
+    }
+
+    fn hold_locked(&mut self, user: i32) -> Result<()> {
+        if !self.held_locked(user) {
+            self.1.push(user, GFP_KERNEL)?;
+        }
+        Ok(())
+    }
+
+    fn held_locked(&self, user: i32) -> bool {
+        self.1.contains(&user)
+    }
+
+    fn release_hold(&mut self, user: i32) {
+        self.1.retain(|u| *u != user);
     }
 
     fn get(&self, user: i32) -> Option<crate::sks::KeyBagHandle> {
@@ -1227,10 +1245,14 @@ impl crate::SepData {
         if !self.userbag_sepos13() {
             return self.userbag_transition(user, TransitionState::Unlocked, 0, secret);
         }
-        let bags = self.user_bags.lock();
+        let mut bags = self.user_bags.lock();
         let bag = bags.get(user.special_handle().value()).ok_or(ENOENT)?;
         self.userbag_loaded_lock_state_13(bag, TransitionState::Unlocked, secret)?;
-        self.userbag_transition(user, TransitionState::Unlocked, 0, secret)
+        self.userbag_transition(user, TransitionState::Unlocked, 0, secret)?;
+        // The store has the bag unlocked again: a hold from a lock it never
+        // confirmed ends.
+        bags.release_hold(user.special_handle().value());
+        Ok(())
     }
 
     fn userbag_loaded_lock_state_13(
@@ -1255,12 +1277,45 @@ impl crate::SepData {
         Ok(())
     }
 
-    /// Locks the session and the loaded bag itself (13.5 store), then sends
-    /// grace-timer fires, as the Mac's kernel does, until the store reports
-    /// the bag locked. Both lock requests are accepted with the bag still
-    /// usable: the store locks only when its timer fires, about 10 s later
-    /// even for an immediate lock on M1.
+    /// Locks the session and the loaded bag itself (13.5 store). If the
+    /// store does not confirm the lock (a refused request, an unreadable
+    /// reply, or no lock within the timer fires), the driver holds the bag
+    /// locked: its keys are refused here (`userbag_key_admitted`) until an
+    /// unlock of it succeeds, whatever the store still allows.
     fn userbag_lock_13(&self, user: crate::sks::DesignateUser, flags: u64) -> Result<()> {
+        let locked = self.userbag_lock_13_steps(user, flags);
+        if let Err(e) = &locked {
+            if *e != ENOENT {
+                let held = self.user_bags.lock().hold_locked(user.special_handle().value());
+                dev_info_ratelimited!(
+                    self.dev,
+                    "userbag: the store did not confirm {}'s lock ({:?}); its keys are refused until its next unlock{}\n",
+                    user.special_handle().value(),
+                    e,
+                    if held.is_ok() { "" } else { " (the hold could not be recorded)" }
+                );
+            }
+        }
+        locked
+    }
+
+    /// Whether a key request under `user`'s bag may go to the store: not
+    /// while the driver holds the bag locked (`userbag_lock_13`).
+    pub(crate) fn userbag_key_admitted(&self, user: crate::sks::DesignateUser) -> Result<()> {
+        if self.user_bags.lock().held_locked(user.special_handle().value()) {
+            return Err(EACCES);
+        }
+        Ok(())
+    }
+
+    /// The 13.5 store's lock: the session and the loaded bag, then
+    /// grace-timer fires until the store reports the bag locked. Both lock
+    /// requests are accepted with the bag still usable: the store locks
+    /// only when its grace timer fires, about 10 s later even for an
+    /// immediate lock on M1. The store acts only on a fire it is sent, and
+    /// on macOS the kernel sends them; nothing else on Linux does, so
+    /// without these the bag would stay unlocked.
+    fn userbag_lock_13_steps(&self, user: crate::sks::DesignateUser, flags: u64) -> Result<()> {
         const FIRES: u32 = 15;
         // Not held across the requests and the waits between fires: every
         // other bag and Touch ID path takes this lock.
@@ -1770,6 +1825,21 @@ impl crate::SepData {
 #[::kernel::macros::kunit_tests(apple_sep_userbag_policy)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_bag_stays_held_until_its_unlock() {
+        let mut bags = LoadedBags::new();
+        assert!(!bags.held_locked(-5));
+        bags.hold_locked(-5).expect("hold");
+        bags.hold_locked(-5).expect("hold again");
+        assert!(bags.held_locked(-5));
+        // Another bag is not held, and unloading does not end the hold.
+        assert!(!bags.held_locked(-6));
+        assert!(bags.remove(-5).is_none());
+        assert!(bags.held_locked(-5));
+        bags.release_hold(-5);
+        assert!(!bags.held_locked(-5));
+    }
 
     const H: u64 = 3600;
     const T0: u64 = 1000;

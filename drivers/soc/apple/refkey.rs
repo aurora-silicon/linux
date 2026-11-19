@@ -549,6 +549,7 @@ impl SepData {
         if !self.profile.per_user_keybags() {
             return Err(EOPNOTSUPP);
         }
+        self.userbag_key_admitted(user)?;
         let key_type = match self.profile.key_store {
             profile::KeyStore::Sepos13 { .. } => 4,
             profile::KeyStore::Variant5 => 5,
@@ -567,6 +568,7 @@ impl SepData {
         acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
     ) -> Result<KVec<u8>> {
         Self::refkey_pub(blob).ok_or(EINVAL)?;
+        self.userbag_key_admitted(user)?;
         let eph = refkey_seal::sealed_ephemeral(sealed)?;
         let handle = crate::sks::KeyBagHandle::from_load_reply(user.special_handle().value());
         let shared = crate::Secret(self.sks_refkey_key_exchange(handle, blob, eph, acm)?);
@@ -581,6 +583,7 @@ impl SepData {
         digest: &[u8; 32],
         acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
     ) -> Result<KVec<u8>> {
+        self.userbag_key_admitted(user)?;
         let handle = crate::sks::KeyBagHandle::from_load_reply(user.special_handle().value());
         self.sks_refkey_sign(handle, blob, digest, acm)
     }
