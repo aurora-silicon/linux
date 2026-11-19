@@ -15,6 +15,10 @@
 / {
 	compatible = "apple,j475c", "apple,t6021", "apple,arm-platform";
 	model = "Apple Mac Studio (M2 Max, 2023)";
+
+	aliases {
+		sep = &sep;
+	};
 };
 
 &wifi0 {
