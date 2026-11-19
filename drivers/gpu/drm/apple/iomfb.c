@@ -3181,13 +3181,32 @@ out:
  * the external H17P processor and the firmware 27 external processors.  The
  * other processors, and the firmware 27 panel, keep SDR.
  */
+/*
+ * A PQ output needs a mode set that selects the timing's PQ colour element
+ * and swaps that tag the surfaces BT.2020 PQ. The IOMFB template
+ * (iomfb_template.c) does both for every firmware it is built for; the
+ * native 14.7 DCPLink session, the J613 26.6 session and the M4 path set
+ * modes elsewhere and do not. Whether a timing has a usable PQ element is
+ * the firmware's own catalogue, checked per mode by the caller. A panel
+ * keeps its SDR link (dcp_panel_edr_supported()), except on the desktop
+ * 26.x firmware, which has driven PQ through the template since its start.
+ */
 static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
 {
 	if (iomfb_is_m4(dcp))
 		return false;
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
-	       (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp));
+	switch (dcp->fw_compat) {
+	case DCP_FIRMWARE_V_26_6_DESKTOP:
+		return true;
+	case DCP_FIRMWARE_V_12_3:
+	case DCP_FIRMWARE_V_13_5:
+	case DCP_FIRMWARE_V_14_7_TEMPLATE:
+	case DCP_FIRMWARE_H17P:
+	case DCP_FIRMWARE_V_27_0:
+		return !dcp_has_panel(dcp);
+	default:
+		return false;
+	}
 }
 
 /*
