@@ -9,10 +9,33 @@
 #include <linux/compiler_types.h>
 #include <linux/errno.h>
 #include <linux/kconfig.h>
+#include <linux/of.h>
 #include <linux/types.h>
 
 struct device;
-struct device_node;
+
+/*
+ * A T6050 machine whose device tree describes the firmware-driven sleep. What a
+ * driver does for that sleep follows the description, not a list of boards.
+ * With @prop: the description also has that property.
+ */
+static inline bool apple_t6050_sleep_property(const char *prop)
+{
+	struct device_node *np;
+	bool ret;
+
+	if (!of_machine_is_compatible("apple,t6050"))
+		return false;
+	np = of_find_compatible_node(NULL, NULL, "apple,t6050-sleep");
+	ret = np && of_device_is_available(np) && (!prop || of_property_read_bool(np, prop));
+	of_node_put(np);
+	return ret;
+}
+
+static inline bool apple_t6050_sleep_described(void)
+{
+	return apple_t6050_sleep_property(NULL);
+}
 
 /* The SMC's sleep messages: the pmVC value and the spacings between them, used as floors */
 struct apple_sleep_smc_policy {
