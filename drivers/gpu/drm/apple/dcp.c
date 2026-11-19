@@ -292,7 +292,7 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
  * once its secure port has gone idle. A device tree without those keeps the firmware
  * running: DPMS is the backlight alone and the display stays up across a sleep. A SoC
  * without a secure mailbox says so (hw.s2r_no_secure_port), and one behind
- * appledrm.s2r_untested stops its firmware for DPMS off and J813 system sleep.
+ * appledrm.s2r_untested stops its firmware for DPMS off and system sleep.
  */
 static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 {
@@ -476,13 +476,14 @@ static bool dcp_j714s_ext(struct device *dev)
 
 /*
  * The firmware stop on a SoC whose display power words were derived from its macOS device
- * tree instead of measured (T8142). J813 supports DPMS off and system sleep with this
- * opt-in. Off by default: such a DCP keeps its firmware running.
+ * tree instead of measured (T8142). DPMS off and system sleep use it with this opt-in, on
+ * a device tree that gives the DCP apple,display-power. Off by default: such a DCP keeps its
+ * firmware running.
  */
 static bool s2r_untested;
 module_param(s2r_untested, bool, 0444);
 MODULE_PARM_DESC(s2r_untested,
-		 "Stop the DCP firmware on DPMS off and J813 system sleep using derived T8142 power words (default 0)");
+		 "Stop the DCP firmware on DPMS off and system sleep using derived T8142 power words (default 0)");
 
 bool dcp_t6041_ext_enabled(void)
 {
@@ -9397,12 +9398,13 @@ static int dcp_platform_suspend(struct device *dev)
 		return dcp_v27_sleep_suspend(dcp);
 
 	/*
-	 * J813 uses the same qualified stop as DPMS off. Probe already gates
-	 * its derived power layout on appledrm.s2r_untested; without this
-	 * system-suspend path an active panel leaves the DCP running.
+	 * System sleep uses the same qualified stop as DPMS off. dcp_s2r_capable()
+	 * already holds only with the DCP's apple,display-power in the device
+	 * tree and, for derived power words (hw.s2r_untested), with
+	 * appledrm.s2r_untested on firmware 27.0; without this system-suspend
+	 * path an active panel leaves the DCP running.
 	 */
-	if (pm_suspend_via_firmware() && dcp_s2r_capable(dcp) &&
-	    (!dcp->hw.s2r_untested || of_machine_is_compatible("apple,j813"))) {
+	if (pm_suspend_via_firmware() && dcp_s2r_capable(dcp)) {
 		int ret = dcp_s2r_suspend(dcp);
 
 		/* Lit by the last resume with its CRTC off: the next resume finds it off by DPMS. */
