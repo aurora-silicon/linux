@@ -196,6 +196,11 @@ pub(crate) struct Pair {
     /// acknowledgement: the pair keeps its owner and graph until then.
     channel_error: bool,
     kick_aliases: Option<[Option<mmu::KernelMapping>; 2]>,
+    /// The read-only views of the two kick rings in the VM of the pair's contexts, installed with
+    /// its first graph in that VM. They belong to the pair's time in that VM, not to the VM: they
+    /// go before the pair runs a context of another VM, so its previous owner cannot read the
+    /// new owner's kick entries. Dropped before `kicks`.
+    client_kicks: [Option<mmu::KernelMapping>; 2],
     memory: KBox<memory::Memory>,
     kicks: [kick::Queue; 2],
     free_list: Arc<RenderPool>,
@@ -353,6 +358,7 @@ impl Pair {
         storage.write_init(kernel::try_init!(Self {
             pool_pin,
             kick_aliases: Some([ta_alias, fragment_alias]),
+            client_kicks: [None, None],
             memory,
             kicks: [tiling, fragment],
             free_list,
@@ -2820,10 +2826,13 @@ impl Pair {
             &mut self.memory,
             &mut self.pending_aliases,
             &mut self.kick_aliases,
+            &mut self.client_kicks,
         )
     }
 }
 
+/// Installs a graph's memory. The new kick ring views in `kick_aliases` go to `views`, the
+/// pair's views in the graph's VM ([`Pair::client_kicks`]).
 fn install_memory(
     alloc: &Allocator<'_>,
     descriptors: &crate::g17::object::KernelObject,
@@ -2831,6 +2840,7 @@ fn install_memory(
     memory: &mut memory::Memory,
     pending_aliases: &mut Option<KVec<mmu::KernelMapping>>,
     kick_aliases: &mut Option<[Option<mmu::KernelMapping>; 2]>,
+    views: &mut [Option<mmu::KernelMapping>; 2],
 ) -> Result {
     use core::sync::atomic::{fence, Ordering};
     if pending_aliases.is_none() && kick_aliases.is_none() {
@@ -2839,8 +2849,6 @@ fn install_memory(
     if !memory.context.is_current() || kick_aliases.is_none() {
         return Err(EIO);
     }
-    let mut driver = KVec::new();
-    driver.reserve(2, GFP_KERNEL)?;
     let aliases = memory.take_persistent(pending_aliases.as_mut().ok_or(EIO)?)?;
     let context = memory.context.clone();
     let vm = context.vm();
@@ -2869,10 +2877,11 @@ fn install_memory(
         }
         fence(Ordering::SeqCst);
         staged = Some(previous);
-        for mapping in kick_aliases.take().ok_or(EIO)?.into_iter().flatten() {
-            driver.push(mapping, GFP_KERNEL)?;
+        for (view, alias) in views.iter_mut().zip(kick_aliases.take().ok_or(EIO)?) {
+            if alias.is_some() {
+                *view = alias;
+            }
         }
-        vm.append_driver_mappings(driver)?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -2914,6 +2923,10 @@ pub(crate) struct PreparedBinding {
 /// The registry retains displaced backing until this exact context's release
 /// is acknowledged. A warm binding retains the old context without its graph.
 pub(crate) struct RetiredBinding {
+    /// Views of the kick rings in `context`'s VM that a pair parked after the VM's client
+    /// closed it gave up (`Pair::park`). Only held: declared first, they drop before the
+    /// memory and the context below.
+    _client_kicks: [Option<mmu::KernelMapping>; 2],
     memory: Option<KBox<memory::Memory>>,
     context: Arc<Context>,
     pool: Arc<RenderPool>,
@@ -3153,10 +3166,25 @@ impl Pair {
             let pm_generation = pm_generation.ok_or(EINVAL)?;
             let layout =
                 m5_render_submission::layout(&first.command, self.clusters, self.variant.programs)?;
+            // A context of another VM gets the rings cleared before its VM is given its view,
+            // so it cannot read the entries earlier owners' commands left, as for a parked pair.
+            // The pair is bindable, hence idle: the firmware consumed every entry.
+            let other_vm = self.context().vm().id() != context.vm().id();
+            if other_vm {
+                for kick in &mut self.kicks {
+                    kick.clear_render_ring()?;
+                }
+            }
             let aliases = [
                 self.kicks[0].prepare_client_alias(context.vm())?,
                 self.kicks[1].prepare_client_alias(context.vm())?,
             ];
+            // A view the VM already has is the one this pair holds for it.
+            for (alias, view) in aliases.iter().zip(&self.client_kicks) {
+                if alias.is_none() && (other_vm || view.is_none()) {
+                    return Err(EFAULT);
+                }
+            }
             let (memory, persistent) = memory::Memory::new(
                 alloc,
                 pool,
@@ -3213,6 +3241,7 @@ impl Pair {
             } else {
                 None
             };
+            let mut views = [None, None];
             let installed = install_memory(
                 alloc,
                 descriptors,
@@ -3220,6 +3249,7 @@ impl Pair {
                 memory,
                 &mut binding.aliases,
                 &mut binding.kicks,
+                &mut views,
             );
             if let Err(error) = installed {
                 if let Some((slot, mappings)) = moved {
@@ -3228,6 +3258,16 @@ impl Pair {
                 return Err(error);
             }
             drop(moved);
+            // The previous VM's views go before the new owner's first kick entry is written.
+            if self.context().vm().id() != binding.context.vm().id() {
+                drop(core::mem::replace(&mut self.client_kicks, views));
+            } else {
+                for (view, alias) in self.client_kicks.iter_mut().zip(views) {
+                    if alias.is_some() {
+                        *view = alias;
+                    }
+                }
+            }
         } else {
             // The same logical context keeps its M5 queue records: their host
             // words already name it, and a rewrite would store firmware-owned
@@ -3246,6 +3286,7 @@ impl Pair {
             .take()
             .map(|memory| core::mem::replace(&mut self.memory, memory));
         let retired = RetiredBinding {
+            _client_kicks: [None, None],
             memory: old_memory,
             context: old_context,
             pool: old_pool,

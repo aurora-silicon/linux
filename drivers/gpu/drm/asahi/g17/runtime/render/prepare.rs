@@ -537,7 +537,7 @@ impl super::super::Backend {
             first,
         } = *ctx;
         let built = (|| -> Result<_> {
-            parked.clear_for_vm(self.context.vm().id())?;
+            parked.clear_for_vm(self.context.vm())?;
             let free_list = self.context.render_pool(
                 alloc,
                 &resources.ids,
@@ -613,10 +613,15 @@ impl super::super::Backend {
         // returns, while the original installed kick owner stays live.
         drop(prepared);
         drop(storage);
+        // Views a returning pair gives up because its VM closed meanwhile; they drop after the
+        // device lock. Checked under the lock, so a VM closed before the pair is back is seen
+        // either here or by the close's own pass (`Registry::take_closed_parked_views`).
+        let mut closed_views = [None, None];
         let grow_ready = {
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if result.is_err() {
+                closed_views = parked.take_closed_views();
                 firmware.queues.render.entry_mut(slot)?.parked = Some(parked);
                 firmware.queues.buffers.release(buffer.0)?;
             } else {
@@ -634,6 +639,7 @@ impl super::super::Backend {
             }
             firmware.render_grow_ready()
         };
+        drop(closed_views);
         self.shared.note_changed();
         if grow_ready {
             self.shared.queue_grow();

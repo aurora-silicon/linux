@@ -2498,6 +2498,21 @@ impl gpu::Gpu for Gpu {
         self.shared.crashed.load(Ordering::Acquire)
     }
 
+    /// A parked render pair keeps its views of the kick rings in the VM that last ran on it
+    /// while that VM is open. Once the client has closed the VM (its status says so before
+    /// this runs), they go, one pair at a time and dropped off the device lock, so they do not
+    /// keep the VM's page tables alive. A pair that parks or returns after this sees the
+    /// closed status itself.
+    fn vm_closed(&self, _vm: &mmu::Vm) {
+        loop {
+            let views = (*self.shared.state.lock())
+                .as_deref_mut()
+                .and_then(|firmware| firmware.queues.take_closed_parked_views());
+            let Some(views) = views else { break };
+            drop(views);
+        }
+    }
+
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {
         params.features |=
             u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)

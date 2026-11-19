@@ -410,7 +410,7 @@ struct RenderStorage {
     // The lower alias drops before its backing.
     low: mmu::KernelMapping,
     high: KernelObject,
-    /// The client VM the storage was created for, whose alias of it lasts as long as that VM.
+    /// The client VM the storage was created for, or last handed to.
     vm: u64,
     /// That VM's status, which tells when its client closed it.
     status: Option<Arc<super::status::VmStatus>>,
@@ -425,13 +425,11 @@ impl RenderStorage {
 
 /// Render ring storage outlives its rings for the life of the device.
 ///
-/// A client VM keeps each render ring alias it installs until the VM closes,
-/// while an installed pair whose identities were never published can be
-/// reclaimed and its rings dropped. Freeing that storage would hand its shared
-/// lower address to another ring; a client still aliasing the old pages there
-/// that later receives the new ring could not alias it (`prepare_client_alias`
-/// fails with EFAULT). Retired storage is therefore kept and reused by later
-/// rings: an address keeps naming the same pages, so every alias stays valid.
+/// An installed pair whose identities were never published can be reclaimed
+/// and its rings dropped. Retired storage is kept and reused by later rings, so
+/// a ring's shared lower address keeps naming the same pages. A client's views
+/// of a ring belong to the render pair holding it (`Pair::client_kicks`),
+/// which drops them before the ring, so no VM has a view of retired storage.
 #[pin_data]
 pub(crate) struct RenderRings {
     #[pin]
@@ -461,8 +459,7 @@ impl RenderRings {
     }
 
     /// Reusable storage created for `client`, else storage whose VM its client has closed,
-    /// which then belongs to `client`. Storage of another open VM is never handed out: that VM
-    /// keeps its read-write alias of the pages, so it could read and write the new ring.
+    /// which then belongs to `client`. Storage of another open VM is never handed out.
     fn take(&self, client: &mmu::Vm) -> Option<RenderStorage> {
         let vm = client.id();
         let mut stock = self.stock.lock();
@@ -518,8 +515,8 @@ impl Drop for RenderRing {
     }
 }
 
-/// An installed queue's permanent ring. Client aliases are held by the bound
-/// context graph and must be dropped before this object.
+/// An installed queue's permanent ring. A render ring's client views are held by its pair
+/// for its time in their VM and must be dropped before this object.
 pub(crate) struct Queue {
     backing: Backing,
     id: Id,
@@ -587,9 +584,9 @@ impl Queue {
         })
     }
 
-    /// Retired storage of a never-written ring is reused first. Its address
-    /// names the same pages in every client that aliases it, so an existing
-    /// alias in `client` is kept (None) and a missing one is created.
+    /// Retired storage of a never-written ring is reused first. The returned view of the ring
+    /// in `client` is new: views belong to the pair that holds the ring, which drops them before
+    /// the ring, so retired storage has none.
     pub(crate) fn render(
         alloc: &Allocator<'_>,
         id: Id,
@@ -613,8 +610,9 @@ impl Queue {
                 ring.storage
                     .high
                     .prepare_alias(client, address, CLIENT_KICK_PROT, false);
-            // On failure the storage returns to the stock and a fresh ring is built.
-            if let Ok(alias) = alias {
+            // On failure, or if `client` still had a view of the pages, the storage returns to
+            // the stock and a fresh ring is built.
+            if let Ok(Some(alias)) = alias {
                 return Ok((
                     Self {
                         backing: Backing::Render(ring),
@@ -622,7 +620,7 @@ impl Queue {
                         timestamp: KickTimestamp::FIRST,
                         previous: None,
                     },
-                    alias,
+                    Some(alias),
                 ));
             }
         }
@@ -736,7 +734,7 @@ impl Queue {
         Ok(())
     }
 
-    /// Reuse a permanent client view only when every page names this ring.
+    /// Reuse the pair's client view only when every page names this ring.
     pub(crate) fn prepare_client_alias(&self, vm: &mmu::Vm) -> Result<Option<mmu::KernelMapping>> {
         let object = match &self.backing {
             Backing::Compute { low, .. } => low,
