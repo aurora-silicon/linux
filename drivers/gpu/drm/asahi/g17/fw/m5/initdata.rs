@@ -2326,12 +2326,7 @@ pub(crate) fn encode_common26_board_region_c(
     if out.len() != REGION_C_SIZE {
         return Err(InitdataError::BufferSize);
     }
-    let source = if board.chip_id == 0x8140 {
-        RootProfile::J700G17P
-    } else {
-        RootProfile::J813G17G25G76
-    };
-    encode_region_c_for_profile(source, out)?;
+    encode_region_c_for_profile(board.region_c_source, out)?;
     let shifted = ABI_ALLOCATION_SIZES_25G76[ALLOC_REGION_C];
     if out[shifted..].iter().any(|byte| *byte != 0) {
         return Err(InitdataError::BufferSize);
@@ -2419,6 +2414,10 @@ pub(crate) struct Board {
     /// Whether queues and register programs use the single-cluster G17 forms shared by J700
     /// and J813 rather than the multi-cluster M5 Pro forms.
     j813_forms: bool,
+    /// The 25G76-era region C layout the board's tunables come from, which
+    /// [`encode_common26_board_region_c`] moves to the common 26A428 layout: the board's own
+    /// firmware generation, not its chip ID.
+    region_c_source: RootProfile,
 }
 
 /// M5 Pro: two clusters of ten cores.
@@ -2449,6 +2448,7 @@ pub(crate) const J714: Board = Board {
     g17d_forms: false,
     completion_inputs: true,
     j813_forms: false,
+    region_c_source: RootProfile::J813G17G25G76,
 };
 
 /// M5 Max: four clusters of ten cores.
@@ -2481,6 +2481,7 @@ pub(crate) const J716C: Board = Board {
     g17d_forms: false,
     completion_inputs: false,
     j813_forms: false,
+    region_c_source: RootProfile::J813G17G25G76,
 };
 
 /// J775D's performance controllers run from P3.
@@ -2523,6 +2524,7 @@ pub(crate) const J775D: Board = Board {
     g17d_forms: true,
     completion_inputs: false,
     j813_forms: false,
+    region_c_source: RootProfile::J813G17G25G76,
 };
 
 /// A18 Pro (J700) on the common 26B123 graph. The performance rows are the eleven states the
@@ -2624,6 +2626,7 @@ pub(crate) const J700_26B123: Board = Board {
     g17d_forms: false,
     completion_inputs: false,
     j813_forms: true,
+    region_c_source: RootProfile::J700G17P,
 };
 
 /// M5 (T8142, MacBook Air J813): one cluster of ten core slots, eight enabled. Values from the
@@ -2664,6 +2667,7 @@ pub(crate) const J813: Board = Board {
     g17d_forms: false,
     completion_inputs: false,
     j813_forms: true,
+    region_c_source: RootProfile::J813G17G25G76,
 };
 
 /// The J813 on its macOS 27.2 (26B123) firmware: the same board on the common 26B123 graph.
