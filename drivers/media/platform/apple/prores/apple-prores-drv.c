@@ -29,8 +29,10 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/workqueue.h>
 
+#include <kunit/visibility.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-event.h>
@@ -742,6 +744,20 @@ static const struct apr_tunable apr_t6050_ctrl_tunables[] = {
 	{ 0x1000, 0xffffffff, 0x00000001 },
 };
 
+/*
+ * T8112 (M2) core power-up rows: deliberately EMPTY.
+ *
+ * The rows must come only from our own MMIO trace of macOS driving this
+ * engine (kits/hv/20261119-t8112-prores-trace, converted by apr8112-rows.py,
+ * which emits { offset, 0xffffffff, value } rows in macOS write order under
+ * this array name). Paste that output here; a "wrapper" table from the same
+ * run goes into .wrapper_tunables of apr_t8112. Until then the probe stops
+ * with -ENODEV before mapping anything, so the engine never runs
+ * half-initialised.
+ */
+static const struct apr_tunable apr_t8112_engine_tunables[] = {
+};
+
 struct apr_stats_regs {
 	u32 lo, hi, size;
 };
@@ -763,6 +779,10 @@ struct apr_variant {
 	const char *reg_names[4];
 	unsigned int num_regs;
 	unsigned int num_irqs;
+	/* IRQs below this index must exist; later ones are optional. */
+	unsigned int num_required_irqs;
+	/* IRQs below this index signal job completion and get apr_irq. */
+	unsigned int num_completion_irqs;
 	u32 ring_bytes;
 	u32 desc_bytes;
 	/* Optional per-machine APRI file that replaces the built-in rows. */
@@ -783,6 +803,8 @@ static const struct apr_variant apr_t8140 = {
 	.reg_names = { "core", "wrapper" },
 	.num_regs = 2,
 	.num_irqs = 2,
+	.num_required_irqs = 1,
+	.num_completion_irqs = 2,
 	.ring_bytes = APR_RING_BYTES,
 	.desc_bytes = APR_ENCODE_DESC_BYTES,
 };
@@ -795,6 +817,31 @@ static const struct apr_variant apr_t6000 = {
 	.reg_names = { "core", "wrapper" },
 	.num_regs = 2,
 	.num_irqs = 1,
+	.num_required_irqs = 1,
+	.num_completion_irqs = 1,
+	.ring_bytes = APR_RING_BYTES,
+	.desc_bytes = APR_ENCODE_DESC_BYTES,
+};
+
+/*
+ * T8112: encode-v1 descriptor and the newer statistics registers, no wrapper
+ * rows and no firmware file. Both interrupts are required; only the first is
+ * a completion source, the second (bandwidth request) is left unrequested
+ * until it has a handler.
+ */
+static const struct apr_variant apr_t8112 = {
+	.build_desc = apr_build_desc,
+	.stats = {
+		{ APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE },
+		{ APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE },
+	},
+	.engine_tunables = apr_t8112_engine_tunables,
+	.num_engine_tunables = ARRAY_SIZE(apr_t8112_engine_tunables),
+	.reg_names = { "core", "wrapper" },
+	.num_regs = 2,
+	.num_irqs = 2,
+	.num_required_irqs = 2,
+	.num_completion_irqs = 1,
 	.ring_bytes = APR_RING_BYTES,
 	.desc_bytes = APR_ENCODE_DESC_BYTES,
 };
@@ -814,6 +861,8 @@ static const struct apr_variant apr_t6041 = {
 	.reg_names = { "core", "wrapper", "aux" },
 	.num_regs = 3,
 	.num_irqs = 1,
+	.num_required_irqs = 1,
+	.num_completion_irqs = 1,
 	.ring_bytes = APR_RING_BYTES,
 	.desc_bytes = APR_DESC_BYTES,
 	.firmware_name = APRI_T6041_FIRMWARE_NAME,
@@ -838,6 +887,8 @@ static const struct apr_variant apr_t6050 = {
 	.reg_names = { "core", "wrapper", "aux", "ctrl" },
 	.num_regs = 4,
 	.num_irqs = 1,
+	.num_required_irqs = 1,
+	.num_completion_irqs = 1,
 	.ring_bytes = APR_RING_BYTES,
 	.desc_bytes = APR_DESC_BYTES,
 	.firmware_name = APRI_T6050_FIRMWARE_NAME,
@@ -2050,8 +2101,9 @@ static int apr_select_tunables(struct apr_dev *apr)
 				 v->firmware_name);
 			return -ENODEV;
 		}
-		return dev_err_probe(dev, -ENOENT,
-				     "no initialization rows for this engine\n");
+		/* No traced rows yet (T8112): stop before touching anything. */
+		dev_info(dev, "no core initialization rows, engine not used\n");
+		return -ENODEV;
 	}
 
 	return 0;
@@ -2128,10 +2180,13 @@ static int apr_probe(struct platform_device *pdev)
 
 	for (i = 0; i < apr->variant->num_irqs; i++) {
 		apr->irq[i] = platform_get_irq_optional(pdev, i);
-		if (apr->irq[i] == -ENXIO && i)
+		if (apr->irq[i] == -ENXIO && i >= apr->variant->num_required_irqs)
 			continue;
 		if (apr->irq[i] < 0)
 			return apr->irq[i];
+		/* A bandwidth-request IRQ is not a frame completion source. */
+		if (i >= apr->variant->num_completion_irqs)
+			continue;
 		ret = devm_request_irq(dev, apr->irq[i], apr_irq, 0,
 				       dev_name(dev), apr);
 		if (ret)
@@ -2217,10 +2272,52 @@ static const struct of_device_id apr_of_match[] = {
 	{ .compatible = "apple,t6000-prores", .data = &apr_t6000 },
 	{ .compatible = "apple,t6041-prores", .data = &apr_t6041 },
 	{ .compatible = "apple,t6050-prores", .data = &apr_t6050 },
+	{ .compatible = "apple,t8112-prores", .data = &apr_t8112 },
 	{ .compatible = "apple,t8140-prores", .data = &apr_t8140 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apr_of_match);
+
+int apr_variant_test_info(const char *compatible,
+			  struct apr_variant_test_info *info)
+{
+	const struct of_device_id *match;
+	const struct apr_variant *variant = NULL;
+
+	if (!compatible || !info)
+		return -EINVAL;
+	for (match = apr_of_match; match->compatible[0]; match++) {
+		if (!strcmp(match->compatible, compatible)) {
+			variant = match->data;
+			break;
+		}
+	}
+	if (!variant)
+		return -ENOENT;
+
+	*info = (struct apr_variant_test_info) {
+		.encode_v1 = variant->build_desc == apr_build_desc,
+		.stats = {
+			variant->stats[0].lo,
+			variant->stats[0].hi,
+			variant->stats[0].size,
+			variant->stats[1].lo,
+			variant->stats[1].hi,
+			variant->stats[1].size,
+		},
+		.num_engine_tunables = variant->num_engine_tunables,
+		.num_wrapper_tunables = variant->num_wrapper_tunables,
+		.num_regs = variant->num_regs,
+		.num_irqs = variant->num_irqs,
+		.num_required_irqs = variant->num_required_irqs,
+		.num_completion_irqs = variant->num_completion_irqs,
+		.ring_bytes = variant->ring_bytes,
+		.desc_bytes = variant->desc_bytes,
+		.has_firmware = !!variant->firmware_name,
+	};
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_variant_test_info);
 
 static struct platform_driver apr_driver = {
 	.probe = apr_probe,

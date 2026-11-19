@@ -101,6 +101,20 @@ struct apr_tunable {
 	u32 value;
 };
 
+struct apr_variant_test_info {
+	bool encode_v1;
+	u32 stats[6];
+	size_t num_engine_tunables;
+	size_t num_wrapper_tunables;
+	unsigned int num_regs;
+	unsigned int num_irqs;
+	unsigned int num_required_irqs;
+	unsigned int num_completion_irqs;
+	u32 ring_bytes;
+	u32 desc_bytes;
+	bool has_firmware;
+};
+
 struct apr_init_block {
 	u32 count;
 	struct apr_tunable entries[APRI_MAX_COUNT];
@@ -220,5 +234,8 @@ static inline int apr_parse_t6041_init(const u8 *data, size_t size,
 u32 apr_ring_advance(u32 ptr, u32 bytes, u32 ring_bytes);
 void apr_ring_write(u8 *ring, u32 ring_bytes, u32 ptr, const u8 *desc,
 		    u32 desc_bytes);
+
+int apr_variant_test_info(const char *compatible,
+			  struct apr_variant_test_info *info);
 
 #endif
