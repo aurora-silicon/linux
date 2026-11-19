@@ -66,6 +66,16 @@
 
 #include "hwmon-fan-dual.dtsi"
 
+/*
+ * The die and its SMC sensor keys are those of the J314c/J316c. The zones
+ * are a backstop above the laptops' loaded peak, and sustainable-power
+ * comes from the energy model, not the chassis: the Studio's larger cooler
+ * only keeps the die further below the trips. TH0x is the only channel
+ * before them, so TCMz is channel 1.
+ */
+#define T600X_CPU_TEMP_BASE 1
+#include "t600x-cpu-thermal.dtsi"
+
 #include "t6001-j375c-peripherals.dtsi"
 
 #include "t6001-j375c-control.dtsi"
