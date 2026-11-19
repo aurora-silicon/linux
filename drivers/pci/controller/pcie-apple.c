@@ -155,6 +155,11 @@ MODULE_PARM_DESC(t6050_sd_port_wake,
 #define   PORT_INT_LINK_DOWN		14
 #define   PORT_INT_LINK_UP		12
 #define   PORT_INT_LINK_BWMGMT		11
+/*
+ * The root port received a PME message (it sets its Root Status PME bit too).
+ * Measured on T8132: the root port never raises its own MSI for a PME.
+ */
+#define   PORT_INT_PME			8
 #define   PORT_INT_AER_MASK		(15 << 4)
 #define   PORT_INT_PORT_ERR		4
 #define   PORT_INT_INTx(i)		i
@@ -635,6 +640,8 @@ struct apple_pcie_port {
 	struct apple_tunable	*tunable;
 	unsigned int		irq;
 	unsigned int		link_irqs[2];
+	/* PORT_INT_PME's interrupt (0: none), see apple_pcie_port_pme_thread() */
+	unsigned int		pme_irq;
 	u32			saved_intmask;
 	int			sid_map_sz;
 	struct gpio_desc	*perst_gpio;
@@ -1093,6 +1100,59 @@ static irqreturn_t apple_pcie_port_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/*
+ * A PME message reached the root port. The root port's own interrupt, the
+ * PCIe port services' MSI, is never raised for one on T8132, so it is handled
+ * as if it had been: the PME service reads the Root Status, resumes or wakes
+ * the requester, and while the system sleeps the wake that interrupt is armed
+ * for (enable_irq_wake() at the PME service's suspend) takes place. This is
+ * how a Wake-on-LAN packet ends suspend-to-idle.
+ */
+static irqreturn_t apple_pcie_port_pme_thread(int irq, void *data)
+{
+	struct apple_pcie_port *port = data;
+	struct pci_host_bridge *bridge = dev_get_drvdata(port->pcie->dev);
+	struct pci_dev *rp;
+	int vector;
+
+	if (!bridge || !bridge->bus)
+		return IRQ_NONE;
+	rp = pci_get_slot(bridge->bus, PCI_DEVFN(port->idx, 0));
+	if (!rp)
+		return IRQ_NONE;
+	vector = rp->msi_enabled || rp->msix_enabled ? pci_irq_vector(rp, 0) : rp->irq;
+	if (vector > 0)
+		generic_handle_irq_safe(vector);
+	else
+		dev_warn_ratelimited(port->pcie->dev, "%pOF: PME, but %s has no interrupt\n",
+				     port->np, pci_name(rp));
+	pci_dev_put(rp);
+	return IRQ_HANDLED;
+}
+
+static int apple_pcie_port_register_pme(struct apple_pcie_port *port)
+{
+	struct irq_fwspec fwspec = {
+		.fwnode		= &port->np->fwnode,
+		.param_count	= 1,
+		.param		= { [0] = PORT_INT_PME, },
+	};
+	int irq, ret;
+
+	irq = irq_domain_alloc_irqs(port->domain, 1, NUMA_NO_NODE, &fwspec);
+	if (irq <= 0)
+		return irq ?: -ENOMEM;
+	/* Runs through suspend: it is what ends a suspend-to-idle for a PME. */
+	ret = request_threaded_irq(irq, NULL, apple_pcie_port_pme_thread,
+				   IRQF_ONESHOT | IRQF_NO_SUSPEND, "PME", port);
+	if (ret) {
+		irq_domain_free_irqs(irq, 1);
+		return ret;
+	}
+	port->pme_irq = irq;
+	return 0;
+}
+
 static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 {
 	static struct {
@@ -1129,6 +1189,14 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 		port->link_irqs[i] = irq;
 	}
 
+	/* Only measured on T8132 so far. */
+	if (of_device_is_compatible(port->pcie->dev->of_node, "apple,t8132-pcie")) {
+		int ret = apple_pcie_port_register_pme(port);
+
+		if (ret)
+			dev_warn(port->pcie->dev, "%pOF: no PME interrupt: %d\n", port->np, ret);
+	}
+
 	return 0;
 }
 
@@ -1143,6 +1211,11 @@ static void apple_pcie_port_unregister_irqs(struct apple_pcie_port *port)
 		free_irq(port->link_irqs[i], port);
 		irq_domain_free_irqs(port->link_irqs[i], 1);
 		port->link_irqs[i] = 0;
+	}
+	if (port->pme_irq) {
+		free_irq(port->pme_irq, port);
+		irq_domain_free_irqs(port->pme_irq, 1);
+		port->pme_irq = 0;
 	}
 }
 
