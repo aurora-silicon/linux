@@ -442,8 +442,11 @@ impl Buffer::ver {
         self.inner.lock().blocks.len() as u32
     }
 
-    /// Automatically grow the Buffer based on feedback from the statistics.
-    pub(crate) fn auto_grow(&self) -> Result<bool> {
+    /// Grow the Buffer based on feedback from the statistics, while the firmware is not using it.
+    ///
+    /// The caller guarantees that all work that used this buffer has completed, so the new size is
+    /// published to the firmware even though scenes of completed jobs may still be held.
+    pub(crate) fn auto_grow_idle(&self) -> Result<bool> {
         let inner = self.inner.lock();
 
         let used_pages = inner.stats.with(|raw, _inner| {
@@ -466,7 +469,7 @@ impl Buffer::ver {
         } else {
             // Grow to 3x requested size (same logic as macOS)
             core::mem::drop(inner);
-            self.ensure_blocks(want_blocks)?;
+            self.ensure_blocks_idle(want_blocks)?;
             Ok(true)
         }
     }
@@ -483,7 +486,20 @@ impl Buffer::ver {
     }
 
     /// Ensure that the buffer has at least a certain minimum size in blocks.
+    ///
+    /// The buffer manager owns the buffer while scenes on it are in flight, so the new size is only
+    /// published if no scene is active.
     pub(crate) fn ensure_blocks(&self, min_blocks: usize) -> Result<bool> {
+        self.ensure_blocks_inner(min_blocks, false)
+    }
+
+    /// [`Self::ensure_blocks`] for a caller that guarantees all work that used this buffer has
+    /// completed: the new size is published although scenes of completed jobs may still be held.
+    pub(crate) fn ensure_blocks_idle(&self, min_blocks: usize) -> Result<bool> {
+        self.ensure_blocks_inner(min_blocks, true)
+    }
+
+    fn ensure_blocks_inner(&self, min_blocks: usize, fw_idle: bool) -> Result<bool> {
         let mut inner = self.inner.lock();
 
         let cur_count = inner.blocks.len();
@@ -528,7 +544,7 @@ impl Buffer::ver {
         });
 
         /* Only do this update if the buffer manager is idle (which means we own it) */
-        if inner.active_scenes == 0 {
+        if inner.active_scenes == 0 || fw_idle {
             let page_count = (new_count * PAGES_PER_BLOCK) as u32;
             inner.info.with(|raw, _inner| {
                 raw.page_count.store(page_count, Ordering::Relaxed);

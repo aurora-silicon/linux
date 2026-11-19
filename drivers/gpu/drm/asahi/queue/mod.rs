@@ -756,6 +756,36 @@ impl Queue::ver {
 }
 
 #[versions(AGX)]
+impl Queue::ver {
+    /// Waits, for at most [`QUEUE_CLOSE_WAIT_MS`], for this queue's earlier work to complete before
+    /// its TVB buffer is grown.
+    fn wait_last_out_for_grow(&self) -> Result {
+        let Some(fence) = self.last_out.as_ref() else {
+            return Ok(());
+        };
+        // SAFETY: `fence` holds a reference for the duration of the call. No lock is held that its
+        // completion needs.
+        let left = unsafe {
+            kernel::bindings::dma_fence_wait_timeout(
+                fence.raw(),
+                false,
+                kernel::time::msecs_to_jiffies(QUEUE_CLOSE_WAIT_MS) as _,
+            )
+        };
+        if left <= 0 {
+            dev_err!(
+                self.dev.as_ref(),
+                "[Queue {}] Earlier work still running after {} ms, cannot grow the TVB\n",
+                self.inner.id,
+                QUEUE_CLOSE_WAIT_MS
+            );
+            return Err(ETIMEDOUT);
+        }
+        Ok(())
+    }
+}
+
+#[versions(AGX)]
 impl Queue for Queue::ver {
     fn drain(&mut self) {
         self.wait_submitted();
@@ -849,6 +879,7 @@ impl Queue for Queue::ver {
         let mut last_render = 0;
         let mut nr_render = 0;
         let mut nr_compute = 0;
+        let mut max_tvb_blocks = 0usize;
 
         while !cmdbuf.is_empty() {
             let header: uapi::drm_asahi_cmd_header = cmdbuf.read()?;
@@ -863,6 +894,8 @@ impl Queue for Queue::ver {
                     {
                         return Err(EINVAL);
                     }
+                    max_tvb_blocks = max_tvb_blocks
+                        .max(QueueInner::ver::render_min_tvb_blocks(&gpu, &render)?);
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
                     let compute: uapi::drm_asahi_cmd_compute = cmdbuf.read_up_to(payload_size)?;
@@ -888,6 +921,31 @@ impl Queue for Queue::ver {
                     nr_compute += 1;
                 }
                 _ => {}
+            }
+        }
+
+        // The firmware buffer manager owns a TVB buffer while scenes on it are in flight. Growing
+        // it then (new blocks in its block list plus an InitBuffer of its bound slot) corrupts the
+        // tiling of those scenes: on G13 clustered rendering the tiler writes to VA 0. So size the
+        // buffer for every render of this submission before any of it is published, and only once
+        // this queue's earlier work, the only other user of the buffer, has completed. A required
+        // grow waits for that work. A grow from the overflow statistics is only an optimisation
+        // (the firmware handles a full heap itself), so it waits for an idle queue instead.
+        let mut tvb_grown = false;
+        if nr_render > 0 {
+            let busy = self.last_out.as_ref().is_some_and(|fence| {
+                // SAFETY: `last_out` owns the live dma_fence reference used for this query.
+                unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) == 0 }
+            });
+            let need = max_tvb_blocks > self.inner.buffer.block_count() as usize;
+            if need && busy {
+                self.wait_last_out_for_grow()?;
+            }
+            if need || !busy {
+                if !busy {
+                    tvb_grown |= self.inner.buffer.auto_grow_idle()?;
+                }
+                tvb_grown |= self.inner.buffer.ensure_blocks_idle(max_tvb_blocks)?;
             }
         }
 
@@ -1024,6 +1082,7 @@ impl Queue for Queue::ver {
                         objects,
                         id,
                         command_index == last_render,
+                        core::mem::take(&mut tvb_grown),
                     )?;
                     events[SQ_RENDER].push(
                         Some(
