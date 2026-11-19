@@ -114,7 +114,7 @@ static const struct dcp_v14_board dcp_v14_board_j613 = {
 	.name = "J613",
 	.debugfs = "dcp-j613",
 	.dcp_compatible = "apple,t8122-dcp",
-	.machine = "apple,j613",
+	.panel = "apple,panel-j613",
 	.firmware_uuid = DCP_V14_J613_FIRMWARE_UUID,
 	.handoff = "apple,t8122-handoff",
 	.panel_width = 2560,
@@ -130,7 +130,7 @@ static const struct dcp_v14_board dcp_v14_board_j615 = {
 	.name = "J615",
 	.debugfs = "dcp-j615",
 	.dcp_compatible = "apple,t8122-dcp",
-	.machine = "apple,j615",
+	.panel = "apple,panel-j615",
 	.firmware_uuid = DCP_V14_J613_FIRMWARE_UUID,
 	.handoff = "apple,t8122-handoff",
 	.panel_width = 2880,
@@ -149,13 +149,15 @@ static const struct dcp_v14_board dcp_v14_board_j615 = {
  * boots. Any other image is refused and the boot framebuffer stays. Every
  * panel timing and the display clock the firmware is told are logged: the
  * first boots on this board are read from the kernel log. The clock is the
- * T6030 rate (clk_disp0), unconfirmed on T6031.
+ * T6030 rate (clk_disp0), unconfirmed on T6031. The record follows the DCP
+ * (apple,t6031-dcp) and the panel (apple,panel-j516): another Mac with both
+ * gets it too, and its own DCP image is still checked against this one.
  */
 static const struct dcp_v14_board dcp_v14_board_j516c = {
 	.name = "J516C",
 	.debugfs = "dcp-j516c",
 	.dcp_compatible = "apple,t6031-dcp",
-	.machine = "apple,j516c",
+	.panel = "apple,panel-j516",
 	.firmware_uuid = DCP_V14_J516C_FIRMWARE_UUID,
 	.handoff = "apple,t6031-handoff",
 	.panel_width = 3456,
@@ -176,13 +178,14 @@ static const struct dcp_v14_board dcp_v14_board_j516c = {
  * (the DCP image is the SoC's; its UUID is checked at probe), in the J514S
  * chassis, so the J514 panel: the board file names the J514S panel values,
  * not yet read from a J514C, and the panel size comes from the boot
- * framebuffer. Every panel timing and the display clock are logged.
+ * framebuffer. Every panel timing and the display clock are logged. Selected
+ * by the T6031 DCP and the J514 panel (apple,panel-j514).
  */
 static const struct dcp_v14_board dcp_v14_board_j514c = {
 	.name = "J514C",
 	.debugfs = "dcp-j514c",
 	.dcp_compatible = "apple,t6031-dcp",
-	.machine = "apple,j514c",
+	.panel = "apple,panel-j514",
 	.firmware_uuid = DCP_V14_J516C_FIRMWARE_UUID,
 	.handoff = "apple,t6031-handoff",
 	.promotion = true,
@@ -1636,10 +1639,10 @@ static int dcp_v14_cpu_running(struct device *dev, const char *name)
 
 /*
  * The board of an internal 14.x DCP node: NULL if the node is not one, an
- * error if it is but this machine has no board record.
+ * error if it is but no board record is for its panel.
  */
 const struct dcp_v14_board *dcp_v14_board_select(dcp_v14_compat_fn dcp_is,
-						 dcp_v14_compat_fn machine_is,
+						 dcp_v14_compat_fn panel_is,
 						 const void *ctx, bool *dcp_known)
 {
 	const struct dcp_v14_board *board;
@@ -1651,7 +1654,7 @@ const struct dcp_v14_board *dcp_v14_board_select(dcp_v14_compat_fn dcp_is,
 		if (!dcp_is(ctx, board->dcp_compatible))
 			continue;
 		*dcp_known = true;
-		if (board->machine && !machine_is(ctx, board->machine))
+		if (board->panel && !panel_is(ctx, board->panel))
 			continue;
 		return board;
 	}
@@ -1668,9 +1671,13 @@ static bool dcp_v14_node_is(const void *np, const char *compat)
 	return of_device_is_compatible(np, compat);
 }
 
-static bool dcp_v14_machine_is(const void *np, const char *compat)
+/* The panel the board device tree puts under the DCP node. */
+static bool dcp_v14_panel_is(const void *np, const char *compat)
 {
-	return of_machine_is_compatible(compat);
+	struct device_node *panel __free(device_node) =
+		of_get_child_by_name(np, "panel");
+
+	return panel && of_device_is_compatible(panel, compat);
 }
 
 const struct dcp_v14_board *iomfb_v14_7_board(struct device *dev)
@@ -1678,23 +1685,15 @@ const struct dcp_v14_board *iomfb_v14_7_board(struct device *dev)
 	const struct dcp_v14_board *board;
 	bool dcp_known;
 
-	board = dcp_v14_board_select(dcp_v14_node_is, dcp_v14_machine_is, dev->of_node,
+	board = dcp_v14_board_select(dcp_v14_node_is, dcp_v14_panel_is, dev->of_node,
 				     &dcp_known);
 	if (board)
 		return board;
 	if (dcp_known) {
-		dev_err(dev, "display not started: no board record for this machine\n");
+		dev_err(dev, "display not started: no board record for this panel\n");
 		return ERR_PTR(-ENODEV);
 	}
 	return NULL;
-}
-
-static bool dcp_v14_panel_nits_admit(const struct dcp_v14_board *board,
-				     dcp_v14_compat_fn machine_is, const void *ctx)
-{
-	return board && board->panel_nits &&
-		(machine_is(ctx, "apple,j514s") || machine_is(ctx, "apple,j516s") ||
-		 machine_is(ctx, "apple,j516c") || machine_is(ctx, "apple,j613"));
 }
 
 const char *iomfb_v14_7_board_name(const struct dcp_v14_board *board)
@@ -1755,7 +1754,7 @@ int iomfb_v14_7_probe(struct apple_dcp *dcp)
 		return -ENOMEM;
 	v14->dev = dev;
 	v14->board = board;
-	v14->panel_nits = dcp_v14_panel_nits_admit(board, dcp_v14_machine_is, np);
+	v14->panel_nits = board->panel_nits;
 	v14->dcp = dcp;
 	mutex_init(&v14->lock);
 	init_waitqueue_head(&v14->described_wait);

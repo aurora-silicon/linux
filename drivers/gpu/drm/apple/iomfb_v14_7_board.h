@@ -6,10 +6,13 @@
 #include <linux/types.h>
 
 /*
- * What differs between the internal panels the 14.x IOMFB drives. The T6030
+ * What differs between the internal panels the 14.x IOMFB drives. A record is
+ * selected by the DCP's compatible and the compatible of its panel node, as
+ * the device tree describes the hardware, never by the machine. The T6030
  * record holds the values the IOMFB code was written and tested with (J514S,
- * J516S); another board's record enables only what was tested on it, and
- * anything else fails closed. External processors have no board record.
+ * J516S panels); another record enables only what was tested with its panel
+ * and firmware image, and anything else fails closed. External processors
+ * have no board record.
  */
 struct dcp_v14_board {
 	/* In log messages. */
@@ -17,8 +20,8 @@ struct dcp_v14_board {
 	/* The debugfs status file. */
 	const char *debugfs;
 	const char *dcp_compatible;
-	/* The machine compatible; NULL for any machine with this DCP. */
-	const char *machine;
+	/* The compatible of the DCP's "panel" child; NULL for any panel. */
+	const char *panel;
 	/* The firmware image whose layouts were tested on this board. */
 	const char *firmware_uuid;
 	/* Set to <1> by the boot loader on the DCP, display and PIODMA nodes. */
@@ -46,20 +49,20 @@ struct dcp_v14_board {
 	 * 16.7 ms, so a 120 Hz panel presents at 60 fps.
 	 */
 	bool swap_timestamps;
-	/* This board has a qualified panel level block; machine admission is separate. */
+	/* This panel and firmware image take a level block in their swaps. */
 	bool panel_nits;
 };
 
-/* Whether the DCP node or the machine (as @ctx gives them) has @compat. */
+/* Whether the DCP node or its panel node (as @ctx gives them) has @compat. */
 typedef bool (*dcp_v14_compat_fn)(const void *ctx, const char *compat);
 
 /*
  * The board record of a DCP. NULL if there is none: *@dcp_known then says
  * whether a record names the DCP's compatible (but no record is for this
- * machine) or none does (not an internal 14.x DCP).
+ * panel) or none does (not an internal 14.x DCP).
  */
 const struct dcp_v14_board *dcp_v14_board_select(dcp_v14_compat_fn dcp_is,
-						 dcp_v14_compat_fn machine_is,
+						 dcp_v14_compat_fn panel_is,
 						 const void *ctx, bool *dcp_known);
 
 /*
