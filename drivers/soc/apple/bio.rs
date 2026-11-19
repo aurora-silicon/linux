@@ -46,6 +46,15 @@ pub(crate) enum Guidance {
     Place = 1,
     LiftAndMove = 2,
     HoldStill = 3,
+    // The last touch's finger is still down; the next capture waits for it.
+    Lift = 4,
+    // A cause reported with a retry (an unusable capture): partial contact,
+    // rest more of the finger on the middle of the sensor.
+    Center = 5,
+    // The finger moved during the capture: hold it still.
+    TooFast = 6,
+    // Dirt on the sensor or a wet finger: clean or dry it.
+    Clean = 7,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -69,6 +78,9 @@ const TOKEN_LIFETIME_NS: u64 = 10 * 1_000_000_000;
 const SUSPEND_SLACK_NS: u64 = 1_000_000;
 
 const STATUS_LOCAL: u32 = 0;
+/// `SEP_BIO_STATUS_RETRY` in a running enrolment's poll: the latest capture
+/// did not count; `guidance` says why.
+pub(crate) const ENROL_POLL_RETRY: u32 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -196,15 +208,43 @@ pub(crate) struct Lockout {
     pub(crate) locked: u32,
     /// Failed matches since the last match or re-arm.
     pub(crate) failures: u32,
-    pub(crate) reserved: [u32; 2],
+    pub(crate) reserved: u32,
+    /// `LOCKOUT_FLAG_*`: what this driver's re-arm does.
+    pub(crate) flags: u32,
 }
 
+/// The re-arm never waits for a capture while Touch ID is not locked, and
+/// it clears pending failed attempts: call it after every verified password.
+pub(crate) const LOCKOUT_FLAG_EVERY_PASSWORD: u32 = 1;
+/// Touch ID waits for the first password since this boot.
+pub(crate) const LOCKOUT_FLAG_AFTER_BOOT: u32 = 2;
+/// The lockout follows too many failed matches.
+pub(crate) const LOCKOUT_FLAG_FAILED_ATTEMPTS: u32 = 4;
+
 impl Lockout {
-    pub(crate) fn new(locked: bool, failures: u32) -> Lockout {
+    /// `locked` is a lockout (or one recorded before the restart);
+    /// `after_boot` is the wait for the first password since boot. Either
+    /// one refuses every verify. `failed_attempts` says that the lockout
+    /// follows too many failed matches; without it, a lockout needs the
+    /// password for another reason, such as a lapsed match credential.
+    pub(crate) fn new(
+        locked: bool,
+        after_boot: bool,
+        failed_attempts: bool,
+        failures: u32,
+    ) -> Lockout {
+        let mut flags = LOCKOUT_FLAG_EVERY_PASSWORD;
+        if after_boot {
+            flags |= LOCKOUT_FLAG_AFTER_BOOT;
+        }
+        if locked && failed_attempts {
+            flags |= LOCKOUT_FLAG_FAILED_ATTEMPTS;
+        }
         Lockout {
-            locked: u32::from(locked),
+            locked: u32::from(locked || after_boot),
             failures,
-            reserved: [0; 2],
+            reserved: 0,
+            flags,
         }
     }
 }
@@ -217,6 +257,26 @@ pub(crate) struct Rearm {
     pub(crate) secret_len: u32,
     pub(crate) reserved: u32,
     pub(crate) secret: [u8; REARM_SECRET_MAX],
+}
+
+impl Drop for Rearm {
+    fn drop(&mut self) {
+        crate::image::wipe(&mut self.secret);
+    }
+}
+
+/// Copies in and checks a `REARM` request: the password it carries, in a
+/// buffer that wipes itself, and nothing left behind on the stack or in the
+/// request, whatever is refused.
+pub(crate) fn read_rearm(arg: usize) -> Result<crate::Secret> {
+    let request = crate::key::read_user_boxed::<Rearm>(UserPtr::from_addr(arg))?;
+    let len = request.secret_len as usize;
+    if request.reserved != 0 || len == 0 || len > request.secret.len() {
+        return Err(EINVAL);
+    }
+    let mut bytes = KVec::with_capacity(len, GFP_KERNEL)?;
+    bytes.extend_from_slice(&request.secret[..len], GFP_KERNEL)?;
+    Ok(crate::Secret(bytes))
 }
 
 // Sizes are baked into the ioctl numbers.
@@ -268,6 +328,7 @@ pub(crate) const IOC_PREPARE_ENROL: u32 = _IOW::<EnrolStart>(MAGIC, 0x0d);
 // On /dev/sep-bio-rearm only.
 pub(crate) const IOC_LOCKOUT_STATE: u32 = _IOR::<Lockout>(MAGIC, 0x0e);
 pub(crate) const IOC_REARM: u32 = _IOW::<Rearm>(MAGIC, 0x0f);
+pub(crate) const IOC_REQUIRE_PASSWORD: u32 = _IO(MAGIC, 0x10);
 
 pub(crate) struct MatchEvidence {
     identity: [u8; UUID_LEN],
@@ -349,22 +410,19 @@ impl IdentityIndex {
         let Some(raw) = store.read(&identity_key())? else {
             return Ok(index);
         };
-        if raw.len() < 4 {
-            return Ok(index);
+        if raw.len() < 8 {
+            return Err(EINVAL);
         }
         if u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) != INDEX_FORMAT {
             return Err(EINVAL);
         }
-        if raw.len() < 8 {
-            return Ok(index);
-        }
         let count = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
         let stride = UUID_LEN + LABEL_LEN;
-        for i in 0..count.min(MAX_IDENTITIES) {
+        if count > MAX_IDENTITIES || raw.len() != 8 + count * stride {
+            return Err(EINVAL);
+        }
+        for i in 0..count {
             let at = 8 + i * stride;
-            if at + stride > raw.len() {
-                break;
-            }
             let mut entry = Identity::ZERO;
             entry.uuid.copy_from_slice(&raw[at..at + UUID_LEN]);
             entry
@@ -500,6 +558,8 @@ pub(crate) struct Session {
     op: Op,
     unseen: bool,
     enrol_stage_unseen: bool,
+    // An enrolment capture was not usable; the next poll reports it once.
+    enrol_retry_unseen: bool,
     token: Option<ResultToken>,
 }
 
@@ -512,6 +572,7 @@ impl Session {
             op: Op::Idle,
             unseen: false,
             enrol_stage_unseen: false,
+            enrol_retry_unseen: false,
             token: None,
         }
     }
@@ -522,6 +583,7 @@ impl Session {
         self.op = Op::Idle;
         self.unseen = false;
         self.enrol_stage_unseen = false;
+        self.enrol_retry_unseen = false;
         self.token = None;
     }
 
@@ -684,6 +746,47 @@ mod enrol_request_tests {
         request
     }
 
+    fn take_enrol_poll(session: &mut Session) -> Result<EnrolPoll> {
+        let out = enrol_poll_report(session)?;
+        mark_enrol_seen(session);
+        Ok(out)
+    }
+
+    fn enrolling(session: &mut Session) -> u64 {
+        session.open = true;
+        session.start_worker().unwrap();
+        session.op = Op::Enrol {
+            label: [0; LABEL_LEN],
+            stage: 0,
+            terminal: None,
+            guidance: Guidance::Place,
+            percent: 0,
+        };
+        session.worker_epoch.unwrap()
+    }
+
+    // An enrolment capture that did not count is reported once, with its
+    // cause, and the enrolment goes on.
+    #[test]
+    fn uncounted_enrol_capture_is_reported_once() {
+        let mut session = Session::new();
+        let epoch = enrolling(&mut session);
+        assert!(enrol_retry(&mut session, epoch, Guidance::Center));
+        let first = take_enrol_poll(&mut session).unwrap();
+        assert_eq!(first.status, ENROL_POLL_RETRY);
+        assert!(first.guidance == Guidance::Center);
+        assert!(matches!(first.state, State::Pending));
+        let second = take_enrol_poll(&mut session).unwrap();
+        assert_eq!(second.status, 0);
+        // A stage after a retry: the next poll carries the stage, no retry.
+        assert!(enrol_advance(&mut session, epoch, 3, 40, Guidance::LiftAndMove));
+        let third = take_enrol_poll(&mut session).unwrap();
+        assert!(matches!(third.state, State::Progress));
+        assert_eq!((third.stage, third.status), (3, 0));
+        // A stale worker cannot report into a newer enrolment.
+        assert!(!enrol_retry(&mut session, epoch + 1, Guidance::Center));
+    }
+
     #[test]
     fn resolved_account_and_known_finger() {
         assert!(validate_enrol_request(&valid()).is_ok());
@@ -739,6 +842,7 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     };
     ctx.session.unseen = false;
     ctx.session.enrol_stage_unseen = false;
+    ctx.session.enrol_retry_unseen = false;
     Ok(Handled {
         ret: 0,
         wake: false,
@@ -773,6 +877,24 @@ pub(crate) fn enrol_advance(
             *guidance = guide;
             session.unseen = true;
             session.enrol_stage_unseen = true;
+            return true;
+        }
+    }
+    false
+}
+
+/// An enrolment capture was not usable: the enrolment goes on, and the next
+/// poll reports `ENROL_POLL_RETRY` once with the cause in `guidance`, so
+/// userspace can say why the touch did not count.
+pub(crate) fn enrol_retry(session: &mut Session, epoch: u64, cause: Guidance) -> bool {
+    if !worker_is_current(session, epoch) {
+        return false;
+    }
+    if let Op::Enrol { terminal, guidance, .. } = &mut session.op {
+        if terminal.is_none() {
+            *guidance = cause;
+            session.unseen = true;
+            session.enrol_retry_unseen = true;
             return true;
         }
     }
@@ -846,13 +968,14 @@ pub(crate) fn enrol_is_live(session: &Session, epoch: u64) -> bool {
     worker_is_current(session, epoch) && matches!(&session.op, Op::Enrol { terminal: None, .. })
 }
 
-fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
+/// What an enrolment poll reports now.
+fn enrol_poll_report(session: &Session) -> Result<EnrolPoll> {
     let mut out = EnrolPoll {
         stages_total: ENROL_STAGES,
         ..EnrolPoll::default()
     };
 
-    match &ctx.session.op {
+    match &session.op {
         Op::Idle => out.state = State::Idle,
         Op::Verify { .. } => return Err(EBUSY),
         Op::Enrol {
@@ -869,10 +992,13 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
                 None => {
                     // Guidance also wakes the poller, but it is not an image
                     // capture or a completed enrollment stage.
-                    out.state = if ctx.session.enrol_stage_unseen {
+                    out.state = if session.enrol_stage_unseen {
                         State::Progress
                     } else {
                         State::Pending
+                    };
+                    if session.enrol_retry_unseen {
+                        out.status = ENROL_POLL_RETRY;
                     }
                 }
                 Some(EnrolOutcome::Failed(status)) => {
@@ -886,12 +1012,22 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
             }
         }
     }
+    Ok(out)
+}
 
+/// The poll was delivered: its one-shot reports are seen.
+fn mark_enrol_seen(session: &mut Session) {
+    session.unseen = false;
+    session.enrol_stage_unseen = false;
+    session.enrol_retry_unseen = false;
+}
+
+fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
+    let out = enrol_poll_report(ctx.session)?;
     UserSlice::new(user, core::mem::size_of::<EnrolPoll>())
         .writer()
         .write(&out)?;
-    ctx.session.unseen = false;
-    ctx.session.enrol_stage_unseen = false;
+    mark_enrol_seen(ctx.session);
     ok()
 }
 
@@ -1117,7 +1253,7 @@ fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         .read()?;
 
     if !ctx.index.contains(&request.uuid) {
-        pr_info!(
+        pr_info_ratelimited!(
             "sep_bio: DELETE of an identity not held; reporting success (nothing to delete)\n"
         );
         return ok();
@@ -1125,7 +1261,7 @@ fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
     // `0x57` takes one `identity_v1_t` (signed user id + 16-byte UUID).
     let Some(identity) = ctx.index.identity_v1_for(&request.uuid, ENROL_USER_ID) else {
-        pr_warn!("sep_bio: DELETE of a held identity could not be expressed as an identity_v1_t\n");
+        pr_warn_ratelimited!("sep_bio: DELETE of a held identity could not be expressed as an identity_v1_t\n");
         return Err(ENOENT);
     };
 
@@ -1146,14 +1282,14 @@ fn delete_all(ctx: &mut Context<'_>) -> Result<Handled> {
     }
 
     if ctx.index.total() == 0 {
-        pr_info!("sep_bio: DELETE_ALL on empty index; reporting success (nothing to delete)\n");
+        pr_info_ratelimited!("sep_bio: DELETE_ALL on empty index; reporting success (nothing to delete)\n");
         return ok();
     }
 
     let mut ids = KVec::new();
     for entry in ctx.index.entries.iter() {
         let Some(identity) = ctx.index.identity_v1_for(&entry.uuid, ENROL_USER_ID) else {
-            pr_warn!(
+            pr_warn_ratelimited!(
                 "sep_bio: DELETE_ALL of a held identity could not be expressed as an identity_v1_t\n"
             );
             return Err(ENOENT);
@@ -1182,4 +1318,74 @@ pub(crate) fn open(session: &mut Session) -> Result<()> {
 
 pub(crate) fn release(session: &mut Session) {
     session.reset();
+}
+
+/// KUnit hooks for `sep_ioctl_test.c`: a `/dev/sep-bio` session driven
+/// through [`ioctl`] from real user memory, with no sensor or enclave.
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+pub(crate) struct KunitBio {
+    session: Session,
+    index: IdentityIndex,
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[no_mangle]
+pub extern "C" fn sep_kunit_bio_new() -> *mut c_void {
+    match KBox::new(KunitBio { session: Session::new(), index: IdentityIndex::new() }, GFP_KERNEL) {
+        Ok(b) => KBox::into_raw(b).cast(),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// # Safety
+/// `bio` comes from [`sep_kunit_bio_new`] and is not yet freed.
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[no_mangle]
+pub unsafe extern "C" fn sep_kunit_bio_ioctl(bio: *mut c_void, cmd: c_uint, arg: c_ulong) -> c_long {
+    // SAFETY: per the contract above.
+    let bio = unsafe { &mut *bio.cast::<KunitBio>() };
+    let mut ctx = Context {
+        session: &mut bio.session,
+        index: &bio.index,
+        sensor_present: true,
+        live_identity_count: Some(0),
+    };
+    match ioctl(&mut ctx, cmd, arg as usize) {
+        Ok(h) => h.ret as c_long,
+        Err(e) => e.to_errno() as c_long,
+    }
+}
+
+/// The capture worker a started enrolment or verify would run has stopped.
+///
+/// # Safety
+/// As for [`sep_kunit_bio_ioctl`].
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[no_mangle]
+pub unsafe extern "C" fn sep_kunit_bio_worker_stopped(bio: *mut c_void) {
+    // SAFETY: per the contract above.
+    let bio = unsafe { &mut *bio.cast::<KunitBio>() };
+    if let Some(epoch) = bio.session.worker_epoch {
+        worker_stopped(&mut bio.session, epoch);
+    }
+}
+
+/// # Safety
+/// As for [`sep_kunit_bio_ioctl`]; `bio` is not used again.
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[no_mangle]
+pub unsafe extern "C" fn sep_kunit_bio_free(bio: *mut c_void) {
+    if !bio.is_null() {
+        // SAFETY: per the contract above, `bio` came from `KBox::into_raw`.
+        drop(unsafe { KBox::from_raw(bio.cast::<KunitBio>()) });
+    }
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[no_mangle]
+pub extern "C" fn sep_kunit_rearm_read(arg: c_ulong) -> c_int {
+    match read_rearm(arg as usize) {
+        Ok(_) => 0,
+        Err(e) => e.to_errno(),
+    }
 }

@@ -37,7 +37,12 @@
  * separate 16 KiB page at 0x350780000, so the register is 0x350780008. The
  * device tree describes that page as its own syscon. t8122 is unresolved.
  *
- * On t8142, RegMap 0x62 is a separate MMIO region at 0x380780000.
+ * On t8142, RegMap 0x62 is a separate MMIO region at 0x380780000. On t6050
+ * the register is at +0x60 in a page of the die's PMGR block (0x280620000
+ * on die 0). There the odd bit is a done flag rather than a busy flag: it
+ * is set once the request is taken, then request and done clear by
+ * themselves within a few ms. Only after that is the port's CPU wrapper
+ * accessible.
  * The t8132 layout has not been decoded.
  *
  * Reference firmware polls the busy bits, stores the request, then polls
@@ -56,6 +61,8 @@
 
 #define APPLE_CIO_RESET_POLL_US 100
 #define APPLE_CIO_RESET_TIMEOUT_US 100000
+/* A t6050 reconfiguration takes a few ms; allow ample margin. */
+#define APPLE_CIO_RESET_T6050_TIMEOUT_US 192000
 
 #define T8103_CIO_CTRL_STRIDE 0x4000
 #define T8103_CIO_CTRL_INIT_REQ BIT(0)
@@ -75,6 +82,7 @@ struct apple_cio_reset;
 struct apple_cio_reset_variant {
 	unsigned int nr_resets;
 	bool pmgr_child;
+	u32 ctrl;	/* request register, t8142 layout */
 	int (*deassert)(struct apple_cio_reset *priv, unsigned long id);
 };
 
@@ -174,19 +182,19 @@ static int t8142_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
 	guard(mutex)(&priv->lock);
 
 	/* Serialize all four ports sharing the request register. */
-	ret = regmap_read_poll_timeout(priv->regmap, T8142_CIO_CTRL, val,
+	ret = regmap_read_poll_timeout(priv->regmap, priv->variant->ctrl, val,
 				       !(val & T8142_CIO_CTRL_BUSY_MASK),
 				       APPLE_CIO_RESET_POLL_US,
 				       APPLE_CIO_RESET_TIMEOUT_US);
 	if (ret)
 		return ret;
 
-	ret = regmap_write(priv->regmap, T8142_CIO_CTRL,
+	ret = regmap_write(priv->regmap, priv->variant->ctrl,
 			   T8142_CIO_CTRL_INIT_REQ(id));
 	if (ret)
 		return ret;
 
-	return regmap_read_poll_timeout(priv->regmap, T8142_CIO_CTRL, val,
+	return regmap_read_poll_timeout(priv->regmap, priv->variant->ctrl, val,
 				       !(val & T8142_CIO_CTRL_INIT_BUSY(id)),
 				       APPLE_CIO_RESET_POLL_US,
 				       APPLE_CIO_RESET_TIMEOUT_US);
@@ -194,7 +202,52 @@ static int t8142_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
 
 static const struct apple_cio_reset_variant apple_t8142_cio_reset = {
 	.nr_resets = 4,
+	.ctrl = T8142_CIO_CTRL,
 	.deassert = t8142_cio_deassert,
+};
+
+static int t6050_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
+{
+	u32 mask = T8142_CIO_CTRL_INIT_REQ(id) | T8142_CIO_CTRL_INIT_BUSY(id);
+	u32 val;
+	int ret;
+
+	guard(mutex)(&priv->lock);
+
+	/* Let a reconfiguration still under way finish first. */
+	ret = regmap_read_poll_timeout(priv->regmap, priv->variant->ctrl, val,
+				       !(val & mask), APPLE_CIO_RESET_POLL_US,
+				       APPLE_CIO_RESET_T6050_TIMEOUT_US);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(priv->regmap, priv->variant->ctrl,
+			   T8142_CIO_CTRL_INIT_REQ(id));
+	if (ret)
+		return ret;
+
+	ret = regmap_read_poll_timeout(priv->regmap, priv->variant->ctrl, val,
+				       val & T8142_CIO_CTRL_INIT_BUSY(id),
+				       APPLE_CIO_RESET_POLL_US,
+				       APPLE_CIO_RESET_T6050_TIMEOUT_US);
+	if (ret)
+		return ret;
+
+	/*
+	 * The CPU wrapper is usable only once the reconfiguration is over, when
+	 * the request and done bits clear again, a few ms later. An access
+	 * before that takes an SError.
+	 */
+	return regmap_read_poll_timeout(priv->regmap, priv->variant->ctrl, val,
+				       !(val & mask), APPLE_CIO_RESET_POLL_US,
+				       APPLE_CIO_RESET_T6050_TIMEOUT_US);
+}
+
+/* The t8142 bit layout in a register mapped on its own, with a done flag. */
+static const struct apple_cio_reset_variant apple_t6050_cio_reset = {
+	.nr_resets = 4,
+	.ctrl = 0x60,
+	.deassert = t6050_cio_deassert,
 };
 
 static const struct apple_cio_reset_variant apple_t8103_cio_reset = {
@@ -277,6 +330,10 @@ static int apple_cio_reset_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_cio_reset_match[] = {
+	{
+		.compatible = "apple,t6050-cio-reset",
+		.data = &apple_t6050_cio_reset,
+	},
 	{
 		.compatible = "apple,t8142-cio-reset",
 		.data = &apple_t8142_cio_reset,

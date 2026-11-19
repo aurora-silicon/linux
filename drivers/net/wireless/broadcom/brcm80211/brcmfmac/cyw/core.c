@@ -31,6 +31,16 @@ static int brcmf_cyw_set_sae_pwd(struct brcmf_if *ifp,
 	u16 pwd_len = crypto->sae_pwd_len;
 	int err;
 
+	/* CYW firmware generates the station RSNE during SAE offload. */
+	if (ifp->vif->wdev.iftype == NL80211_IFTYPE_STATION ||
+	    ifp->vif->wdev.iftype == NL80211_IFTYPE_P2P_CLIENT) {
+		err = brcmf_fil_iovar_data_set(ifp, "wpaie", NULL, 0);
+		if (err) {
+			bphy_err(drvr, "failed to clean up user-space RSNE\n");
+			return err;
+		}
+	}
+
 	if (pwd_len > BRCMF_WSEC_MAX_SAE_PASSWORD_LEN) {
 		bphy_err(drvr, "sae_password must be less than %d\n",
 			 BRCMF_WSEC_MAX_SAE_PASSWORD_LEN);

@@ -21,6 +21,7 @@
 #include <linux/regmap.h>
 #include <linux/workqueue.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 #include <linux/acpi.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
@@ -58,6 +59,7 @@ struct cs42l84_private {
 	unsigned int remote_btn1_prev;
 	unsigned int remote_short_prev;
 	struct delayed_work remote_poll_work;
+	bool sleep_reset;
 };
 
 static bool cs42l84_volatile_register(struct device *dev, unsigned int reg)
@@ -279,6 +281,8 @@ static const struct snd_soc_dapm_route cs42l84_audio_map[] = {
 
 	{"ADC", NULL, "HS"},
 	{"SDOUT1 Select", "ADC", "ADC"},
+	{"SDOUT1 Select", "ASP RX CH1", "SDIN1"},
+	{"SDOUT1 Select", "ASP RX CH2", "SDIN2"},
 	{"SDOUT1", NULL, "SDOUT1 Select"},
 	{"Capture", NULL, "SDOUT1"},
 
@@ -1266,6 +1270,132 @@ static void cs42l84_i2c_remove(struct i2c_client *i2c_client)
 	gpiod_set_value_cansleep(cs42l84->reset_gpio, 0);
 }
 
+/*
+ * A firmware-driven system sleep holds the codec in reset, so it comes back
+ * with none of its registers and answers nothing until the reset is released.
+ * Take it into reset ourselves once nothing uses it, and after the wake
+ * release it as the probe does and write everything back from the cache.
+ * Other sleep states leave the codec alone, as before.
+ */
+static int cs42l84_suspend(struct device *dev)
+{
+	struct i2c_client *i2c_client = to_i2c_client(dev);
+	struct cs42l84_private *cs42l84 = i2c_get_clientdata(i2c_client);
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+
+	/* Still down from a resume that failed. */
+	if (cs42l84->sleep_reset)
+		return 0;
+
+	if (i2c_client->irq)
+		disable_irq(i2c_client->irq);
+	cancel_delayed_work_sync(&cs42l84->remote_poll_work);
+
+	mutex_lock(&cs42l84->irq_lock);
+	cs42l84_remote_stop(cs42l84);
+	regcache_cache_only(cs42l84->regmap, true);
+	regcache_mark_dirty(cs42l84->regmap);
+	gpiod_set_value_cansleep(cs42l84->reset_gpio, 0);
+	cs42l84->sleep_reset = true;
+	mutex_unlock(&cs42l84->irq_lock);
+
+	return 0;
+}
+
+static int cs42l84_resume(struct device *dev)
+{
+	struct i2c_client *i2c_client = to_i2c_client(dev);
+	struct cs42l84_private *cs42l84 = i2c_get_clientdata(i2c_client);
+	int ret, devid;
+
+	if (!cs42l84->sleep_reset)
+		return 0;
+
+	mutex_lock(&cs42l84->irq_lock);
+
+	/*
+	 * The codec restarts on its internal oscillator with the PLL off, and
+	 * stops answering if it is moved to a clock that isn't running. Put
+	 * the clock registers in the cache back to that state, so the sync
+	 * below can't select the PLL; the next unmute sets the clocks up.
+	 * This only reaches the cache: the bus is still closed.
+	 */
+	regmap_write(cs42l84->regmap, CS42L84_CCM_CTL1, CS42L84_CCM_CTL1_RCO);
+	regmap_update_bits(cs42l84->regmap, CS42L84_PLL_CTL1,
+			   CS42L84_PLL_CTL1_EN, 0);
+	regmap_update_bits(cs42l84->regmap, CS42L84_CCM_CTL4,
+			   CS42L84_CCM_CTL4_REFCLK_EN, 0);
+	regmap_update_bits(cs42l84->regmap, CS42L84_DAC_CTL1,
+			   CS42L84_DAC_CTL1_UNMUTE, 0);
+	cs42l84->stream_use = 0;
+
+	/* Out of reset, as in probe */
+	gpiod_set_value_cansleep(cs42l84->reset_gpio, 1);
+	usleep_range(CS42L84_BOOT_TIME_US, CS42L84_BOOT_TIME_US * 2);
+
+	regcache_cache_only(cs42l84->regmap, false);
+
+	devid = cirrus_read_device_id(cs42l84->regmap, CS42L84_DEVID);
+	if (devid != CS42L84_CHIP_ID) {
+		ret = devid < 0 ? devid : -ENODEV;
+		goto err;
+	}
+
+	/* The revision was read into the cache at probe; it isn't ours to write. */
+	regcache_drop_region(cs42l84->regmap, CS42L84_REVID, CS42L84_REVID);
+
+	ret = regcache_sync(cs42l84->regmap);
+	if (ret)
+		goto err;
+
+	/* The plug may have changed while the codec was down: detect it again. */
+	cs42l84_setup_plug_detect(cs42l84);
+	cs42l84->ring_state = CS42L84_UNPLUG;
+	if (cs42l84->tip_state == CS42L84_PLUG) {
+		cs42l84_detect_hs(cs42l84);
+		cs42l84_set_interrupt_masks(cs42l84, 0);
+	} else {
+		cs42l84->hs_type = 0;
+		snd_soc_jack_report(cs42l84->jack, 0, SND_JACK_HEADSET);
+		cs42l84_set_interrupt_masks(cs42l84,
+					    CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+	}
+
+	cs42l84->sleep_reset = false;
+	mutex_unlock(&cs42l84->irq_lock);
+
+	if (i2c_client->irq)
+		enable_irq(i2c_client->irq);
+
+	dev_dbg(dev, "back after the sleep: device ID %X, registers written back, jack %s\n",
+		devid, cs42l84->tip_state == CS42L84_PLUG ? "plugged" : "empty");
+
+	return 0;
+
+err:
+	/* Keep the bus closed and the codec in reset; the interrupt stays off. */
+	regcache_cache_only(cs42l84->regmap, true);
+	regcache_mark_dirty(cs42l84->regmap);
+	gpiod_set_value_cansleep(cs42l84->reset_gpio, 0);
+	mutex_unlock(&cs42l84->irq_lock);
+
+	if (devid < 0)
+		dev_err(dev, "not back after the sleep: no answer to the device ID read: %d\n",
+			devid);
+	else if (devid != CS42L84_CHIP_ID)
+		dev_err(dev, "not back after the sleep: device ID %X, expected %X\n",
+			devid, CS42L84_CHIP_ID);
+	else
+		dev_err(dev, "not back after the sleep: writing the registers back failed: %d\n",
+			ret);
+
+	return ret;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(cs42l84_pm_ops, cs42l84_suspend, cs42l84_resume);
+
 static const struct of_device_id cs42l84_of_match[] = {
 	{ .compatible = "cirrus,cs42l84", },
 	{}
@@ -1282,6 +1412,7 @@ static struct i2c_driver cs42l84_i2c_driver = {
 	.driver = {
 		.name = "cs42l84",
 		.of_match_table = cs42l84_of_match,
+		.pm = pm_sleep_ptr(&cs42l84_pm_ops),
 	},
 	.id_table = cs42l84_id,
 	.probe = cs42l84_i2c_probe,

@@ -64,6 +64,21 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::WorkQueue;
 
 const MAX_JOB_SLOTS: u32 = 127;
 
+fn can_submit_inline(
+    submit_seq: u64,
+    job_seq: u64,
+    pending_commands: usize,
+    free_slots: usize,
+    event_count: usize,
+    free_space: usize,
+    command_count: usize,
+) -> bool {
+    submit_seq == job_seq
+        && pending_commands == 0
+        && free_slots > event_count
+        && free_space > command_count
+}
+
 /// An enum of possible errors that might cause a piece of work to fail execution.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WorkError {
@@ -282,6 +297,14 @@ struct WorkQueueInner {
     size: u32,
     wptr: u32,
     pending: KVec<Pin<KBox<SubmittedWorkContainer>>>,
+    /// The most recently completed command, held back from cleanup until a later command's stamp
+    /// (or queue idle) proves the firmware is done with its descriptor. The firmware stores a
+    /// command's completion stamps through the microsequence embedded in its descriptor, and keeps
+    /// touching that descriptor after the driver-visible stamp is observed. Freeing (and reusing)
+    /// the descriptor at that point lets the firmware store through a stale/reused target and crash
+    /// with a non-canonical pointer (seen on G13 under sustained CTS). Commands are retired in
+    /// order, so observing a later command's stamp proves this one's firmware tail is done.
+    last_completed_work: Option<Pin<KBox<SubmittedWorkContainer>>>,
     last_token: Option<event::Token>,
     pending_jobs: usize,
     last_submitted: Option<event::EventValue>,
@@ -473,6 +496,23 @@ impl Job::ver {
         }
     }
 
+    /// Whether this committed job is the next unpublished prefix, the firmware
+    /// queue has no backlog, and the job fits. Holding the same queue lock as
+    /// `submit()` makes the sequence and backlog observations authoritative.
+    pub(crate) fn can_submit_inline(&self) -> bool {
+        let inner = self.wq.inner.lock();
+
+        can_submit_inline(
+            inner.submit_seq,
+            self.event_info.cmd_seq,
+            inner.pending.len(),
+            inner.free_slots(),
+            self.event_count,
+            inner.free_space(),
+            self.pending.len(),
+        )
+    }
+
     pub(crate) fn submit(&mut self) -> Result<JobSubmission::ver<'_>> {
         if !self.committed {
             pr_err!("WorkQueue: Tried to submit uncommitted Job\n");
@@ -632,6 +672,10 @@ impl Drop for Job::ver {
 
         if inner.pending.is_empty() && inner.pending_jobs == 0 {
             mod_pr_debug!("WorkQueue({:?}): Dropping event\n", inner.pipe_type);
+            // Queue is idle with all work completed; release any held completed command.
+            if let Some(last_cmd) = inner.last_completed_work.take() {
+                workqueue::system_dfl().enqueue(last_cmd);
+            }
             inner.event = None;
             inner.last_submitted = None;
             inner.last_completed = None;
@@ -671,6 +715,11 @@ impl<'a> Drop for JobSubmission::ver<'a> {
 #[versions(AGX)]
 impl Drop for WorkQueueInner::ver {
     fn drop(&mut self) {
+        // Release any command held back for the firmware's completion tail. The queue is being torn
+        // down and its firmware context invalidated (below), so the firmware is done with it.
+        if let Some(last_cmd) = self.last_completed_work.take() {
+            workqueue::system_dfl().enqueue(last_cmd);
+        }
         // The firmware keeps referring to this queue until its context is invalidated. When the
         // queue's owner went away with work in flight, the queue is dropped as soon as that work
         // completes, which can be well before the invalidation.
@@ -812,6 +861,7 @@ impl WorkQueue::ver {
             size,
             wptr: 0,
             pending: KVec::new(),
+            last_completed_work: None,
             last_token: None,
             event: None,
             priority,
@@ -948,6 +998,7 @@ impl WorkQueue for WorkQueue::ver {
     ///
     /// This will check the event stamp value to find out exactly how many commands were processed.
     fn signal(&self) -> bool {
+        let signalling = dma_fence::SignallingGuard::new();
         let mut inner = self.inner.lock();
         let event = inner.event.as_ref();
         let value = match event {
@@ -1005,6 +1056,14 @@ impl WorkQueue for WorkQueue::ver {
         let last_wptr = inner.pending[completed_commands - 1].inner.wptr();
         let pipe_type = inner.pipe_type;
 
+        // Hold back the most recently completed command: the firmware may still be storing its
+        // completion stamps through its descriptor after we observe the driver-visible stamp.
+        // Release each held command only once a strictly-later command has completed (retirement is
+        // in order, so a later stamp proves this one's firmware tail is done), or at queue idle
+        // below. This keeps at most one extra command (and its BufferManager slot) alive per queue,
+        // released promptly, so it does not reintroduce the 127-queue limit that the original
+        // deferred-free (commit 513cd1502fb9) hit.
+        let mut last_cmd = inner.last_completed_work.take();
         for mut cmd in inner.pending.drain(..completed_commands) {
             mod_pr_debug!(
                 "WorkQueue({:?}): Queueing command @ {:?} for cleanup\n",
@@ -1012,8 +1071,12 @@ impl WorkQueue for WorkQueue::ver {
                 cmd.inner.gpu_va()
             );
             cmd.as_mut().inner_mut().complete();
-            workqueue::system_dfl().enqueue(cmd);
+            if let Some(last_cmd) = last_cmd.replace(cmd) {
+                workqueue::system_dfl().enqueue(last_cmd);
+            }
         }
+        inner.last_completed_work = last_cmd;
+        drop(signalling);
 
         mod_pr_debug!(
             "WorkQueue({:?}): Completed {} commands, left pending {}, ls {:#x?}, lc {:#x?}\n",
@@ -1031,6 +1094,13 @@ impl WorkQueue for WorkQueue::ver {
 
         let empty = inner.pending.is_empty();
         if empty && inner.pending_jobs == 0 {
+            // The queue is idle. This completion was signalled by the last command's RetireStamp,
+            // the final op of its microsequence, so the firmware is done with every retired
+            // descriptor including the held one. Release it now rather than pinning its slot until
+            // the next submission or queue drop.
+            if let Some(last_cmd) = inner.last_completed_work.take() {
+                workqueue::system_dfl().enqueue(last_cmd);
+            }
             inner.event = None;
             inner.last_submitted = None;
             inner.last_completed = None;
@@ -1099,15 +1169,50 @@ impl WorkQueue for WorkQueue::ver {
 
         core::mem::swap(&mut inner.pending, &mut cmds);
 
+        // The GPU has failed, so the firmware will not touch any descriptor again: drop the held
+        // completed command along with the rest.
+        let held = inner.last_completed_work.take();
+
         if inner.pending_jobs == 0 {
             inner.event = None;
         }
 
         core::mem::drop(inner);
+        core::mem::drop(held);
 
         for mut cmd in cmds {
             cmd.as_mut().inner_mut().mark_error(error);
             cmd.as_mut().inner_mut().complete();
         }
+    }
+}
+
+#[kunit_tests(asahi_legacy_inline_workqueue)]
+mod tests {
+    use super::can_submit_inline;
+
+    #[test]
+    fn depth_192_stops_at_the_first_inflight_command() {
+        const DEPTH: usize = 192;
+        let mut submit_seq = 0;
+        let mut pending = 0;
+        let mut inline = 0;
+
+        for job_seq in 0..DEPTH as u64 {
+            if can_submit_inline(submit_seq, job_seq, pending, 127, 1, 0x4ff, 1) {
+                inline += 1;
+                submit_seq += 1;
+                pending += 1;
+            }
+        }
+
+        assert_eq!(inline, 1);
+    }
+
+    #[test]
+    fn capacity_keeps_one_firmware_slot_and_ring_entry_free() {
+        assert!(!can_submit_inline(4, 4, 0, 1, 1, 2, 1));
+        assert!(!can_submit_inline(4, 4, 0, 2, 1, 1, 1));
+        assert!(can_submit_inline(4, 4, 0, 2, 1, 2, 1));
     }
 }

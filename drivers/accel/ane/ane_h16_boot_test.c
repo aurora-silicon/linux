@@ -23,6 +23,11 @@ struct ane_h16_sim {
 	u32 command_count;
 	u32 scratch_writes;
 	u32 tuning_writes;
+	/* Tuning writes expected before the first scratch write; XL writes seen. */
+	u32 expect_tuning;
+	u32 xl_writes;
+	/* Engine registers below 0x5000 keep what is written, like the AXI block. */
+	u32 engine[0x5000 / 4];
 	u32 dapf_writes;
 	u32 mailbox_polls;
 	u32 maps;
@@ -66,6 +71,10 @@ struct ane_h16_sim {
 	bool reset;
 	bool unpowered;
 	u32 quarantine_reads;
+	/* The stopped op, and the CPU control word the stop evidence logged. */
+	struct ane_fw_transport_ops transport;
+	u64 stop_control;
+	u32 stopped_checks;
 };
 
 static const u32 sim_power_words[] = { 0x3c0, 0xc008, 0xc000, 0xc010, 0xc018 };
@@ -90,7 +99,8 @@ static void sim_check_dapf(struct ane_h16_sim *s, u32 off, u32 width)
 
 	KUNIT_ASSERT_NOT_NULL(s->test, m);
 	KUNIT_EXPECT_GE(s->test, off, m->dapf_records);
-	KUNIT_EXPECT_LE(s->test, off + width, m->dapf_records + 4 * m->dapf_stride);
+	KUNIT_EXPECT_LE(s->test, off + width,
+			m->dapf_records + s->soc.dapf_count * m->dapf_stride);
 	KUNIT_EXPECT_LE(s->test, off + width, s->soc.dapf_size);
 }
 
@@ -126,6 +136,8 @@ static u32 sim_read32(void *ctx, enum ane_h16_window w, u32 off)
 			return s->scratch[(off - s->soc.scratch) / 4];
 		if (off == s->soc.irq_status)
 			return s->irq;
+		if (off < sizeof(s->engine))
+			return s->engine[off / 4];
 	}
 	return 0xa5a5a5a5;
 }
@@ -229,7 +241,7 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 		if (s->scratch_writes < 8) {
 			KUNIT_EXPECT_EQ(s->test, cell, s->scratch_writes);
 			KUNIT_EXPECT_EQ(s->test, value, 0U);
-			KUNIT_EXPECT_EQ(s->test, s->tuning_writes, 103U);
+			KUNIT_EXPECT_EQ(s->test, s->tuning_writes, s->expect_tuning);
 		}
 		s->scratch_writes++;
 		s->scratch[cell] = value;
@@ -303,6 +315,10 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 	/* The selected AXI and XL tables must finish before scratch writes. */
 	KUNIT_EXPECT_TRUE(s->test, !s->boot.ran || s->reset);
 	s->tuning_writes++;
+	if (w == ANE_H16_XL)
+		s->xl_writes++;
+	else if (off < sizeof(s->engine))
+		s->engine[off / 4] = value;
 }
 
 static void sim_write64(void *ctx, enum ane_h16_window w, u32 off, u64 value)
@@ -410,6 +426,8 @@ static void sim_log(void *ctx, const char *item, u64 a, u64 b)
 		s->timeout_scratch++;
 	if (!strcmp(item, "quarantine scratch"))
 		s->quarantine_reads++;
+	if (!strcmp(item, "startup CPU control/status"))
+		s->stop_control = a;
 }
 
 static bool sim_powered(void *ctx)
@@ -514,12 +532,28 @@ static const struct ane_fw_transport_ops sim_transport_ops = {
 	.refused = sim_refused,
 };
 
+/* As the backend: only while the startup commands are out. */
+static bool sim_stopped(void *ctx)
+{
+	struct ane_h16_sim *s = ctx;
+
+	s->stopped_checks++;
+	return s->boot.starting && !(s->cpu & s->build.run);
+}
+
+static void sim_use_stopped(struct ane_h16_sim *s)
+{
+	s->transport = sim_transport_ops;
+	s->transport.stopped = sim_stopped;
+	s->boot.transport_ops = &s->transport;
+}
+
 /* A programmed bank, ends without their low two bits. */
 static void sim_program_dapf(struct ane_h16_sim *s)
 {
 	unsigned int i;
 
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < s->soc.dapf_count; i++) {
 		u32 *p = &s->dapf[(s->mmio.dapf_records + i * s->mmio.dapf_stride) / 4];
 		u64 end = s->boot.ranges[i][1] & s->mmio.dapf_end_mask;
 
@@ -552,6 +586,8 @@ static int sim_init(struct kunit *test)
 	s->soc.dapf_dart = 0;
 	s->soc.dapf_offset = 0x10000;
 	s->soc.dapf_size = SZ_16K;
+	s->soc.dapf_count = 4;
+	s->soc.has_xl = true;
 	s->soc.scratch = 0x1880020;
 	s->soc.doorbell = 0x1884000;
 	s->soc.irq_status = 0x188c000;
@@ -563,10 +599,11 @@ static int sim_init(struct kunit *test)
 	s->boot.ops = &sim_ops;
 	s->boot.transport_ops = &sim_transport_ops;
 	s->boot.ctx = s;
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < ANE_FW_DAPF_MAX; i++) {
 		s->boot.ranges[i][0] = 0x500000000ULL + i * SZ_16K;
 		s->boot.ranges[i][1] = s->boot.ranges[i][0] + 3;
 	}
+	s->expect_tuning = 103;
 	/* The J616s bank after iBoot: power-on values, flags 0. */
 	for (i = 0; i < ARRAY_SIZE(s->dapf); i++)
 		s->dapf[i] = i % 16 ? 0x5a5a0000 | i : 0;
@@ -852,6 +889,53 @@ static void ane_h16_startup_restart_budget_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->quarantines, 1U);
 	KUNIT_EXPECT_EQ(test, s->timeout_scratch, 24U);
 	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EBUSY);
+}
+
+/*
+ * A CPU that loses RUN during startup can answer nothing: the wait ends at
+ * once with -ESHUTDOWN and the evidence names the control word, instead of
+ * waiting out the command deadline.
+ */
+static void ane_h16_startup_stopped_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	u64 start;
+
+	sim_use_stopped(s);
+	s->build.command_timeout_ns = 3ULL * NSEC_PER_SEC;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), 0);
+	/* Running and answering: never reported stopped. */
+	KUNIT_EXPECT_FALSE(test, sim_stopped(s));
+	s->no_startup_reply = true;
+	s->cpu = 0;
+	start = s->now;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -ESHUTDOWN);
+	KUNIT_EXPECT_LT(test, s->now - start, 2ULL * NSEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test, s->stop_control, 0ULL);
+	KUNIT_EXPECT_EQ(test, s->timeout_scratch, 8U);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+	KUNIT_EXPECT_FALSE(test, s->boot.starting);
+}
+
+/* A stopped CPU gets the same verified restart as a timed-out one. */
+static void ane_h16_startup_stopped_restart_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	u64 start;
+
+	sim_use_restart(s, 1, 2);
+	sim_use_stopped(s);
+	s->build.command_timeout_ns = 3ULL * NSEC_PER_SEC;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), 0);
+	s->cpu = 0;
+	start = s->now;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_EXPECT_LT(test, s->now - start, 100ULL * NSEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test, s->boot.restarts, 1U);
+	KUNIT_EXPECT_EQ(test, s->power_cycles, 1U);
+	KUNIT_EXPECT_FALSE(test, s->boot.quarantined);
+	KUNIT_EXPECT_EQ(test, s->boot.stage, ANE_H16_STARTUP);
+	KUNIT_EXPECT_FALSE(test, s->boot.starting);
 }
 
 /* An unverified power cycle is not followed by another release of the CPU. */
@@ -1155,6 +1239,83 @@ static void ane_h16_foreign_free_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, s->boot.transport.shared_retired[0]);
 }
 
+/* The T8132: five DAPF records, no XL window, its own engine writes. */
+static void sim_use_t8132(struct ane_h16_sim *s)
+{
+	s->build = ane_h16_build_t8132_25g83;
+	s->soc.dapf_count = 5;
+	s->soc.has_xl = false;
+	s->expect_tuning = ARRAY_SIZE(ane_t8132_axi) + ARRAY_SIZE(ane_t8132_axi_wd) +
+			   ARRAY_SIZE(ane_t8132_axi_lock);
+}
+
+/* Map programs and reads back all five T8132 records. */
+static void ane_h16_dapf_five_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	unsigned int i;
+
+	sim_use_t8132(s);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), 0);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 25U);
+	for (i = 0; i < 5; i++)
+		KUNIT_EXPECT_TRUE(test, ane_h16_dapf_record(&s->boot, i));
+}
+
+/* A fifth record that does not read back fails map before RUN. */
+static void ane_h16_dapf_five_readback_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	sim_use_t8132(s);
+	s->dapf_stuck = 4;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), -EIO);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 25U);
+	KUNIT_EXPECT_FALSE(test, s->boot.ran);
+}
+
+/* A platform without the XL window skips the build's XL tunables. */
+static void ane_h16_no_xl_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->soc.has_xl = false;
+	s->expect_tuning = 103 - ARRAY_SIZE(ane_h16_xl);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_EXPECT_EQ(test, s->xl_writes, 0U);
+}
+
+/* The T8132 boots with its own engine writes only: no XL or C1PPT. */
+static void ane_h16_t8132_tunables_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	sim_use_t8132(s);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_EXPECT_EQ(test, s->xl_writes, 0U);
+	KUNIT_EXPECT_EQ(test, s->engine[0], 0x8000001bU);
+	KUNIT_EXPECT_EQ(test, s->engine[0xdfc / 4], 1U);
+}
+
+/*
+ * Within one power cycle the T8132 engine set stays locked: a second
+ * preparation writes nothing when the values match and refuses a changed one.
+ */
+static void ane_h16_t8132_locked_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	u32 writes;
+
+	sim_use_t8132(s);
+	KUNIT_ASSERT_EQ(test, ane_h16_prepare(&s->boot), 0);
+	writes = s->tuning_writes;
+	KUNIT_EXPECT_EQ(test, writes, s->expect_tuning);
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), 0);
+	KUNIT_EXPECT_EQ(test, s->tuning_writes, writes);
+	s->engine[0x4 / 4] ^= 0x10000;
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), -EPERM);
+}
+
 static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_alloc_reuse_test),
 	KUNIT_CASE(ane_h16_happy_test),
@@ -1162,6 +1323,11 @@ static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_dapf_program_test),
 	KUNIT_CASE(ane_h16_dapf_partial_test),
 	KUNIT_CASE(ane_h16_dapf_readback_test),
+	KUNIT_CASE(ane_h16_dapf_five_test),
+	KUNIT_CASE(ane_h16_dapf_five_readback_test),
+	KUNIT_CASE(ane_h16_no_xl_test),
+	KUNIT_CASE(ane_h16_t8132_tunables_test),
+	KUNIT_CASE(ane_h16_t8132_locked_test),
 	KUNIT_CASE(ane_h16_unknown_revision_test),
 	KUNIT_CASE(ane_h16_heap_overlap_test),
 	KUNIT_CASE(ane_h16_native_free_test),
@@ -1191,6 +1357,8 @@ static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_startup_timeout_test),
 	KUNIT_CASE(ane_h16_startup_restart_test),
 	KUNIT_CASE(ane_h16_startup_restart_budget_test),
+	KUNIT_CASE(ane_h16_startup_stopped_test),
+	KUNIT_CASE(ane_h16_startup_stopped_restart_test),
 	KUNIT_CASE(ane_h16_startup_restart_refused_test),
 	KUNIT_CASE(ane_h16_startup_restart_unpowered_test),
 	KUNIT_CASE(ane_h16_startup_no_budget_test),

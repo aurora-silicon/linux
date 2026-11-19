@@ -69,7 +69,8 @@ static void pending_mismatched_ids_test(struct kunit *test)
 		make_event(event, &request, 1);
 		put_unaligned_le32(1, event + offset);
 		KUNIT_EXPECT_EQ(test, ane_h16_pending_dispatch(&table, event, 0x60, 6, 1), -EPROTO);
-		KUNIT_EXPECT_TRUE(test, request.active);
+		KUNIT_EXPECT_FALSE(test, request.active);
+		KUNIT_EXPECT_EQ(test, request.status, -EPROTO);
 		KUNIT_EXPECT_FALSE(test, request.terminal);
 		KUNIT_EXPECT_TRUE(test, table.quarantined);
 		KUNIT_EXPECT_EQ(test, table.error, -EPROTO);
@@ -123,7 +124,8 @@ static void pending_malformed_test(struct kunit *test)
 		}
 		KUNIT_EXPECT_EQ(test, ane_h16_pending_dispatch(&table, bytes, length, channel, 1),
 				-EPROTO);
-		KUNIT_EXPECT_TRUE(test, request.active);
+		KUNIT_EXPECT_FALSE(test, request.active);
+		KUNIT_EXPECT_EQ(test, request.status, -EPROTO);
 		KUNIT_EXPECT_TRUE(test, table.quarantined);
 	}
 }

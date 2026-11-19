@@ -186,6 +186,18 @@ const struct dcp_color_space *dcp_color_space_lookup(const char *name)
 	return ERR_PTR(-EINVAL);
 }
 
+const struct dcp_color_space *dcp_panel_gamut_color_space(enum dcp_panel_gamut gamut)
+{
+	switch (gamut) {
+	case DCP_PANEL_GAMUT_SRGB:
+		return dcp_color_space_lookup("srgb");
+	case DCP_PANEL_GAMUT_DISPLAY_P3:
+		return dcp_color_space_lookup("display-p3");
+	default:
+		return NULL;
+	}
+}
+
 /*
  * Firmware chromaticities win. Without a complete, valid set, use the panel's
  * named target. Without either the block keeps its nominal white only.
@@ -203,25 +215,61 @@ static void dcp_panel_color(struct edid *edid, const struct dcp_display_metadata
 	dcp_metadata_color(edid, &named);
 }
 
-/* Build only a base block: the authoritative firmware mode list stays separate. */
+/* EDID 1.4 dummy descriptor: a placeholder for an unused 18-byte slot. */
+#define DCP_EDID_DETAIL_DUMMY	0x10
+
+/*
+ * The descriptor only names the sink's preferred timing: a sync polarity the
+ * firmware does not report is given as positive, and the authoritative mode
+ * list stays separate.
+ */
+static void dcp_metadata_timing_polarity(struct drm_display_mode *mode)
+{
+	if (!(mode->flags & (DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NHSYNC)))
+		mode->flags |= DRM_MODE_FLAG_PHSYNC;
+	if (!(mode->flags & (DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC)))
+		mode->flags |= DRM_MODE_FLAG_PVSYNC;
+}
+
+/* Whether @mode fits an EDID detailed timing. */
+bool dcp_metadata_timing_fits(const struct drm_display_mode *mode)
+{
+	const struct dcp_display_metadata none = {};
+	struct detailed_timing timing;
+	struct drm_display_mode m = *mode;
+
+	dcp_metadata_timing_polarity(&m);
+	return !dcp_metadata_timing(&timing, &m, &none);
+}
+
+/*
+ * Build only a base block: the authoritative firmware mode list stays
+ * separate. What the sink leaves out stays undefined, as in its own EDID: no
+ * image size, the sRGB primaries, no manufacture week. Without a timing that
+ * fits a detailed timing descriptor, the first descriptor is a dummy one.
+ */
 static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metadata *metadata,
 			      const struct drm_display_mode *mode)
 {
+	bool sized = metadata->width_cm && metadata->width_cm <= 255 &&
+		     metadata->height_cm && metadata->height_cm <= 255;
+	bool dated = metadata->year >= 1990 && metadata->year <= 2245 &&
+		     (metadata->week <= 53 || metadata->week == 255);
+	struct dcp_display_metadata image = *metadata;
 	u32 manufacturer = 0;
 	u8 checksum = 0;
 	int ret;
 
-	if (!metadata->width_cm || metadata->width_cm > 255 ||
-	    !metadata->height_cm || metadata->height_cm > 255 ||
-	    metadata->product > U16_MAX || metadata->week > 53 ||
-	    metadata->year < 1990 || metadata->year > 2245 ||
-	    metadata->gamma < 65536 || metadata->gamma > (354U << 16) / 100 ||
-	    strnlen(metadata->manufacturer, 4) != 3)
+	if (metadata->product > U16_MAX || strnlen(metadata->manufacturer, 4) != 3)
 		return -EINVAL;
 	for (unsigned int i = 0; i < 3; i++) {
 		if (metadata->manufacturer[i] < 'A' || metadata->manufacturer[i] > 'Z')
 			return -EINVAL;
 		manufacturer = manufacturer << 5 | (metadata->manufacturer[i] - '@');
+	}
+	if (!sized) {
+		image.width_cm = 0;
+		image.height_cm = 0;
 	}
 
 	memset(edid, 0, sizeof(*edid));
@@ -229,23 +277,34 @@ static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metada
 	edid->product_id.manufacturer_name = cpu_to_be16(manufacturer);
 	edid->product_id.product_code = cpu_to_le16(metadata->product);
 	edid->product_id.serial_number = cpu_to_le32(metadata->serial);
-	edid->product_id.week_of_manufacture = metadata->week;
-	edid->product_id.year_of_manufacture = metadata->year - 1990;
+	edid->product_id.week_of_manufacture = dated ? metadata->week : 0;
+	edid->product_id.year_of_manufacture = dated ? metadata->year - 1990 : 0;
 	edid->version = 1;
 	edid->revision = 4;
 	/* No claim about connector interface, bit depth, HDR, audio or VRR. */
 	edid->input = DRM_EDID_INPUT_DIGITAL;
-	edid->width_cm = metadata->width_cm;
-	edid->height_cm = metadata->height_cm;
-	ret = dcp_metadata_color(edid, metadata);
-	if (ret)
-		return ret;
+	edid->width_cm = image.width_cm;
+	edid->height_cm = image.height_cm;
+	dcp_panel_color(edid, metadata, dcp_color_space_lookup("srgb"));
 	edid->features = DRM_EDID_FEATURE_PREFERRED_TIMING | DRM_EDID_FEATURE_RGB;
 	memset(edid->standard_timings, 1, sizeof(edid->standard_timings));
-	ret = dcp_metadata_timing(&edid->detailed_timings[0], mode, metadata);
-	if (!ret)
-		ret = dcp_metadata_text(&edid->detailed_timings[1], EDID_DETAIL_MONITOR_NAME,
-					metadata->name);
+	ret = -EINVAL;
+	if (mode) {
+		struct drm_display_mode m = *mode;
+
+		dcp_metadata_timing_polarity(&m);
+		ret = dcp_metadata_timing(&edid->detailed_timings[0], &m, &image);
+	}
+	if (ret) {
+		memset(&edid->detailed_timings[0], 0, sizeof(edid->detailed_timings[0]));
+		edid->detailed_timings[0].data.other_data.type = DCP_EDID_DETAIL_DUMMY;
+		edid->features &= ~DRM_EDID_FEATURE_PREFERRED_TIMING;
+	}
+	ret = metadata->name[0] ?
+		dcp_metadata_text(&edid->detailed_timings[1], EDID_DETAIL_MONITOR_NAME,
+				  metadata->name) :
+		dcp_metadata_text(&edid->detailed_timings[1], EDID_DETAIL_MONITOR_STRING,
+				  "DCP display");
 	if (!ret)
 		ret = dcp_metadata_text(&edid->detailed_timings[2], EDID_DETAIL_MONITOR_STRING,
 					"DCP metadata");

@@ -23,7 +23,9 @@ extern "C" {
  *   PROC_CREATE and EXEC.
  * - ane_t6021 on H16 (T6041) and H17 (T8140) implements ABI version
  *   %DRM_ANE_ABI_V3: GET_CAPS, H16_LOAD and H16_EXEC. The node exists only
- *   after the staged opt-in reached its program stage.
+ *   after the staged opt-in reached its program stage. DRM_IOCTL_VERSION
+ *   minor 1 adds surface mappings (%DRM_ANE_H16_MMAP_OFFSET) and
+ *   %DRM_ANE_H16_EXEC_IN_PLACE.
  *
  * The DRM_IOCTL_VERSION major and &drm_ane_get_caps.abi_version both give
  * the ABI version. The two versions share the ioctl numbers and the
@@ -333,17 +335,36 @@ struct drm_ane_h16_buffer {
 	__u64 size;
 };
 
+/*
+ * mmap() offset of surface @i of the loaded program (ABI version 3, accel
+ * minor 1). A mapping starts at the surface's first byte and may cover a
+ * prefix of it, rounded up to whole pages; read for any surface, write for
+ * an input. The pages stay valid until the mapping is gone, also after the
+ * program closed; they are never given to another program before that.
+ */
+#define DRM_ANE_H16_MMAP_OFFSET(i)	((__u64)((i) + 1) << 32)
+
+/* H16_EXEC flags */
+/*
+ * Run on the surfaces in place: inputs are what the caller wrote through
+ * its mappings, the output stays in its surface and is not poisoned
+ * first. @buffers_ptr must be 0; @count is still the surface count.
+ */
+#define DRM_ANE_H16_EXEC_IN_PLACE	(1u << 0)
+
 /**
  * struct drm_ane_h16_exec - DRM_IOCTL_ANE_H16_EXEC argument (ABI version 3)
  * @buffers_ptr: In. Pointer to struct drm_ane_h16_buffer[@count], one entry
  *	per surface in the order that H16_LOAD reported.
  * @count: In. The surface count of the loaded program.
- * @flags: In. No flags are defined: must be zero.
+ * @flags: In. 0, or %DRM_ANE_H16_EXEC_IN_PLACE.
  *
  * A successful H16_EXEC returns after the firmware reported the end of the
- * request, with the output copied to its buffer. The driver keeps all
- * firmware-visible memory private: inputs are copied in before the request
- * and the output is copied out after it.
+ * request, with the output copied to its buffer (or left in its surface for
+ * %DRM_ANE_H16_EXEC_IN_PLACE). Programs, sections and scratch stay in
+ * private kernel mappings. Without the flag inputs are copied in before the
+ * request and the output is copied out after it; with it the caller reads
+ * and writes the surfaces through its own mappings.
  */
 struct drm_ane_h16_exec {
 	__u64 buffers_ptr;

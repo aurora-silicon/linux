@@ -381,7 +381,6 @@
 		dmas = <&DIE_NODE(sio) 0x66>;
 		dma-names = "tx";
 		power-domains = <&DIE_NODE(ps_dpa1)>;
-		reset-domains = <&DIE_NODE(ps_dpa1)>;
 		status = "disabled";
 
 		ports {
@@ -402,7 +401,6 @@
 		dmas = <&DIE_NODE(sio) 0x68>;
 		dma-names = "tx";
 		power-domains = <&DIE_NODE(ps_dpa2)>;
-		reset-domains = <&DIE_NODE(ps_dpa2)>;
 		status = "disabled";
 
 		ports {
@@ -426,7 +424,6 @@
 		dmas = <&DIE_NODE(sio) 0x6a>;
 		dma-names = "tx";
 		power-domains = <&DIE_NODE(ps_dpa3)>;
-		reset-domains = <&DIE_NODE(ps_dpa3)>;
 		status = "disabled";
 
 		ports {
@@ -447,7 +444,6 @@
 		dmas = <&DIE_NODE(sio) 0x6c>;
 		dma-names = "tx";
 		power-domains = <&DIE_NODE(ps_dpa4)>;
-		reset-domains = <&DIE_NODE(ps_dpa4)>;
 		status = "disabled";
 
 		ports {

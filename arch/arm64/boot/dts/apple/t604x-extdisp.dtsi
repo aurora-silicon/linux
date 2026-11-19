@@ -100,7 +100,6 @@
 		mboxes = <&atcphy3_mbox>;
 		mbox-names = "phy-cpu";
 		nonposted-mmio;
-		status = "disabled";
 		apple,tunable-axi2af =
 			<0x0 0x800000ff 0x80000025>,
 			<0x4 0x80ff00ff 0x80250003>,
@@ -260,6 +259,7 @@
 			<0x1d098 0x00080000 0x00080000>,
 			<0x1d0a4 0x00800000 0x00800000>,
 			<0x1d0a8 0x00200000 0x00200000>;
+		status = "disabled";
 	};
 
 	atcphy3_mbox: mailbox@39b148000 {
@@ -282,32 +282,32 @@
 		compatible = "apple,t6041-display-crossbar";
 		reg = <0x3 0x8324c000 0x0 0x4000>;
 		#mux-control-cells = <1>;
-		status = "disabled";
 		power-domains = <&ps_atc0_usb>;
+		status = "disabled";
 	};
 
 	atcphy1_xbar: mux@38b24c000 {
 		compatible = "apple,t6041-display-crossbar";
 		reg = <0x3 0x8b24c000 0x0 0x4000>;
 		#mux-control-cells = <1>;
-		status = "disabled";
 		power-domains = <&ps_atc1_usb>;
+		status = "disabled";
 	};
 
 	atcphy2_xbar: mux@39324c000 {
 		compatible = "apple,t6041-display-crossbar";
 		reg = <0x3 0x9324c000 0x0 0x4000>;
 		#mux-control-cells = <1>;
-		status = "disabled";
 		power-domains = <&ps_atc2_usb>;
+		status = "disabled";
 	};
 
 	atcphy3_xbar: mux@39b24c000 {
 		compatible = "apple,t6041-display-crossbar";
 		reg = <0x3 0x9b24c000 0x0 0x4000>;
 		#mux-control-cells = <1>;
-		status = "disabled";
 		power-domains = <&ps_atc3_usb>;
+		status = "disabled";
 	};
 };
 

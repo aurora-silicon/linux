@@ -187,12 +187,36 @@ static void sio_boot_dma_arrays_test(struct kunit *test)
 	}
 }
 
+/* Only a channel with nothing on it may pass through a firmware restart. */
+static void sio_sleep_busy_test(struct kunit *test)
+{
+	struct sio_chan *chan = kunit_kzalloc(test, sizeof(*chan), GFP_KERNEL);
+	struct sio_tx *tx = kunit_kzalloc(test, sizeof(*tx), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, chan);
+	KUNIT_ASSERT_NOT_NULL(test, tx);
+	spin_lock_init(&chan->vc.lock);
+
+	KUNIT_EXPECT_FALSE(test, sio_chan_busy(chan));
+	chan->current_tx = tx;
+	KUNIT_EXPECT_TRUE(test, sio_chan_busy(chan));
+	chan->current_tx = NULL;
+	chan->idle = tx;
+	KUNIT_EXPECT_TRUE(test, sio_chan_busy(chan));
+	chan->idle = NULL;
+	chan->ring = true;
+	KUNIT_EXPECT_TRUE(test, sio_chan_busy(chan));
+	chan->ring = false;
+	KUNIT_EXPECT_FALSE(test, sio_chan_busy(chan));
+}
+
 static struct kunit_case sio_boot_test_cases[] = {
 	KUNIT_CASE(sio_boot_order_test),
 	KUNIT_CASE(sio_boot_optional_tables_test),
 	KUNIT_CASE(sio_boot_bad_params_test),
 	KUNIT_CASE(sio_boot_control_ack_failure_test),
 	KUNIT_CASE(sio_boot_dma_arrays_test),
+	KUNIT_CASE(sio_sleep_busy_test),
 	{}
 };
 

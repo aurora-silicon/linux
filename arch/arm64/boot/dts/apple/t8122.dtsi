@@ -198,20 +198,8 @@
 	};
 
 	/*
-	 * opp-microwatt is the power one busy CPU adds at each state, measured
-	 * on a J613 with the SMC's cluster power keys (PPbb for the E cluster,
-	 * PP0b for the P cluster): the cluster pinned to the state, all four of
-	 * its CPUs busy minus the cluster idle, divided by four, starting
-	 * below 60 C. The values are curves fitted to the measurements
-	 * (rms deviation 31 mW for E, 22 mW for P), so that they rise
-	 * monotonically: E P = 58 mW * f^1.842 (f in GHz),
-	 * P ln(P/mW) = 5.394 + 1.164 ln f + 0.521 (ln f)^2.
-	 *
-	 * Above 3288 MHz the P cluster's power stops rising at about 11 W with
-	 * all four CPUs busy, and the work done per clock at 4056 MHz is 8-10%
-	 * lower than at 3420 MHz, also with one CPU busy: the hardware limits
-	 * the top states by itself. Their values are the fitted curve
-	 * extrapolated, the power these states would draw unlimited.
+	 * opp-microwatt: one busy CPU's power, fitted to J613 measurements.
+	 * Above 3288 MHz the hardware caps P power; those are extrapolated.
 	 */
 	sawtooth_opp: opp-table-0 {
 		compatible = "operating-points-v2";
@@ -421,7 +409,7 @@
 		clock-output-names = "nco_ref";
 	};
 
-	soc {
+	soc: soc {
 		compatible = "simple-bus";
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -546,12 +534,7 @@
 			power-domains = <&ps_avd_sys>;
 		};
 
-		/*
-		 * iBoot hands over a running SEP. Keep Linux off its DART at boot;
-		 * apple_sep enables it at module initialization. The SEP only
-		 * accepts IOVAs in this window, which carries the BIT(40) alias
-		 * the DART translates (ADT vm-base 0x10000004000).
-		 */
+		/* apple_sep enables it; the SEP only takes IOVAs in this window. */
 		sep_dart: iommu@29cac0000 {
 			compatible = "apple,t8122-dart", "apple,t8110-dart";
 			reg = <0x2 0x9cac0000 0x0 0x4000>;
@@ -608,12 +591,7 @@
 			status = "disabled";
 		};
 
-		/*
-		 * Touch ID. iBoot leaves the pads muxed and the controller uses
-		 * its native chip select, so there is no pinctrl here. The
-		 * 200 MHz parent is spi1's on this SoC, and the one the J613
-		 * sensor was enrolled and matched with.
-		 */
+		/* Touch ID: pads muxed by iBoot, native chip select, 200 MHz. */
 		spi2: spi@2a1108000 {
 			compatible = "apple,t8122-spi", "apple,t8103-spi";
 			reg = <0x2 0xa1108000 0x0 0x4000>;
@@ -1137,14 +1115,16 @@
 			smc_hwmon: hwmon {
 				compatible = "apple,smc-hwmon";
 				#thermal-sensor-cells = <1>;
-
 				/*
-				 * CPU die temperatures, one per E-cluster sensor
-				 * group and one per P core (the key that rose most
-				 * with only that core busy, on a J613). Board
-				 * thermal zones refer to these by channel index, so
-				 * keep them first and in this order.
+				 * No Tf keys on M3: the six hottest GPU keys (about 0 C
+				 * while the GPU is off), then the CPU die keys.
 				 */
+				apple,soc-die-keys = "Tg0D", "Tg0P", "Tg0X", "Tg0b",
+						     "Tg0j", "Tg0v", "Te05", "Te0P",
+						     "Tp05", "Tp0L", "Tp0b", "Tp0r";
+				apple,thermal-pressure-key = "mTPL";
+
+				/* CPU die temperatures, first: thermal zones index them. */
 				temperature-Te05 {
 					apple,key-id = "Te05";
 					label = "E-cluster Temperature 1";
@@ -1875,12 +1855,7 @@
 			};
 		};
 
-		/*
-		 * The J613 ADT has atc0-dpxbar and atc1-dpxbar with compatible
-		 * "atc-dpxbar,t602x", so these use the T6020 programming
-		 * model. The display gate enables them together with the
-		 * dcpext whose Type-C routes use them.
-		 */
+		/* ADT atc-dpxbar,t602x; the gate enables them with dcpext. */
 		atcphy0_xbar: mux@70304c000 {
 			compatible = "apple,t8122-display-crossbar",
 				     "apple,t6020-display-crossbar";
@@ -1957,3 +1932,11 @@
 #include "t8122-pmgr.dtsi"
 #include "t8122-gpu.dtsi"
 #include "t8122-dcp.dtsi"
+
+#include "t8122-peripherals.dtsi"
+
+#include "t8122-peripheral-buses.dtsi"
+
+#include "t8122-coprocessors.dtsi"
+
+#include "t8122-misc-interfaces.dtsi"

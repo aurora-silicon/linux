@@ -24,6 +24,7 @@ properties:
               - apple,t6000-dcp
               - apple,t6020-dcp
               - apple,t6041-dcp
+              - apple,t6050-dcp
               - apple,t8140-dcp
               - apple,t8142-dcp
           - const: apple,dcp
@@ -34,6 +35,9 @@ properties:
               - apple,t6000-dcpext
               - apple,t6020-dcpext
               - apple,t6041-dcpext
+              - apple,t8122-dcpext
+              - apple,t6050-dcpext
+              - apple,t8142-dcpext
           - const: apple,dcpext
       - items:
           - const: apple,t8140-dcpext
@@ -49,10 +53,17 @@ properties:
           reserves their firmware memory, publishes the firmware identity and
           sets apple,t8132-dcpext-firmware-ready.
         const: apple,t8132-dcpext
+      - description:
+          T6031 (M3 Max) internal display controller. The display gate enables
+          it after the boot loader has handed the running display over.
+        const: apple,t6031-dcp
+      - description:
+          T8122 internal display controller using its native firmware handoff.
+        const: apple,t8122-dcp
 
   reg:
     minItems: 2
-    maxItems: 7
+    maxItems: 8
 
   reg-names:
     minItems: 2
@@ -63,14 +74,23 @@ properties:
       - enum: [disp-2, iop-vbar]
       - enum: [disp-3, iop-vbar]
       - enum: [disp-4, iop-vbar]
+      - enum: [disp-5, iop-vbar, coproc-aux]
       - const: iop-vbar
 
+  interrupts:
+    minItems: 7
+    maxItems: 16
+    description: Optional host display-engine interrupt sources.
+
   mboxes:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
 
   mbox-names:
+    minItems: 1
     items:
       - const: mbox
+      - const: secure
 
   iommus:
     maxItems: 1
@@ -85,17 +105,39 @@ properties:
 
   clocks:
     minItems: 1
-    maxItems: 2
+    maxItems: 64
 
   clock-names:
     minItems: 1
-    items:
-      - const: clock-154
-      - const: clock-194
+    maxItems: 64
+
+  apple,clock-ids:
+    oneOf:
+      - type: boolean
+      - $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 1
+        maxItems: 64
+    description: |
+      Ordered firmware provider clock identifiers. Callback clock indices
+      select the corresponding entry in clocks. An explicitly empty table
+      is allowed when the provider has no clocks.
+
+  apple,firmware-physical-regs:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 1
+    maxItems: 10
+    description: |
+      Coprocessor physical base addresses in display register-table order,
+      including the bandwidth scratch and optional doorbell windows.
+      The number of entries must match the complete register table.
+      Omit on identity-mapped systems; reg supplies the physical view.
 
   memory-region:
     minItems: 1
     maxItems: 64
+    description:
+      Boot framebuffer and reserved mappings. A T6050 external processor
+      without a boot framebuffer may omit these regions and their names.
 
   memory-region-names:
     minItems: 1
@@ -110,6 +152,13 @@ properties:
     maxItems: 8
     items:
       pattern: '^(dp-phy|typec[0-9]+)$'
+
+  apple,display-power:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      A node whose ps, pwrgate and pmc-dcp registers hold the display power
+      words this coprocessor's driver writes around a firmware restart, such
+      as an apple,t8140-display-power node.
 
   apple,bw-scratch:
     $ref: /schemas/types.yaml#/definitions/phandle-array
@@ -218,6 +267,34 @@ properties:
     maxItems: 5
     description: Loader-provided firmware ABI version used for IOMFB selection.
 
+  apple,j613-25g83-dcpext-handoff:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 1
+    description: |
+      Loader validation of the J613 native26 external processor. Requires
+      the separately validated internal mapping handoff, exact 26.6.2 image,
+      complete stream-5 mappings and retained locked page tables. Does not
+      enable hardware. Firmware reservations must also be complete.
+
+  apple,j613-25g83-dcpext-boot-state:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 4
+    maxItems: 4
+    description: |
+      Loader observations in order of powered ancestry, ASC CPU control,
+      ASC CPU status and firmware-DART protection. Read only while the
+      processor's full power ancestry is active. A powered processor must
+      have protected inherited roots; this is not an RTKit readiness claim.
+
+  apple,t8122-dcpext-firmware-ready:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 1
+    description: All external firmware reservations were committed by the loader.
+
+  apple,pmp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Native PMP supplier, independent of the report request entry.
+
   apple,t8132-dcpext-firmware-ready:
     $ref: /schemas/types.yaml#/definitions/uint32
     enum: [0, 1]
@@ -262,6 +339,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Height in pixels reserved for the display notch.
 
+  apple,pmc-interface:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PMC interface enables of this coprocessor's display pipe, an
+      apple,consumer-switched interface node. The coprocessor clears them
+      before it powers its display domains down while the display is off,
+      and restores them after it powers them up again.
+
   apple,pmp-report:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
@@ -280,20 +365,83 @@ properties:
     maxItems: 4
     description: DisplayPort PHY index for each Type-C display route.
 
+  apple,sleep-power-args:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 8
+    maxItems: 8
+    description:
+      Firmware 27 system sleep. The eight bytes that follow the power state in
+      the set_power_state (A484) request that powers the display down before
+      the sleep and up again after it. Set by the boot loader. Without this
+      property and apple,sleep-a500-args the coprocessor refuses the sleep.
+
+  apple,sleep-a500-args:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 8
+    maxItems: 8
+    description:
+      Firmware 27 system sleep. The four-byte argument of the A500 call made
+      after set_power_state before the sleep, then the four-byte argument of
+      the one made before set_power_state after the wake. Set by the boot
+      loader. Without this property and apple,sleep-power-args the
+      coprocessor refuses the sleep.
+
+  apple,sleep-display-power-args:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 8
+    maxItems: 8
+    description:
+      Firmware 27 system sleep, internal panel. The eight bytes that follow
+      the power state in the set_power_state (A484) request that turns the
+      display itself off before the sleep's power-down, and on again after
+      the wake's power-up. Set by the boot loader. Without this property and
+      apple,sleep-display-stage-args the display's own state is left alone
+      across the sleep and only the requests of apple,sleep-power-args are
+      made.
+
+  apple,sleep-display-stage-args:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 12
+    maxItems: 12
+    description:
+      Firmware 27 system sleep, internal panel. The arguments of the two
+      calls with arguments that precede the request of
+      apple,sleep-display-power-args in either direction, the eight-byte
+      argument of A414, then the four-byte argument of A487. Set by the boot
+      loader. Without this property and apple,sleep-display-power-args
+      neither call is made.
+
+  apple,panel-hdcp-open-arg:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Firmware 27, internal panel. The fifth 32-bit word of the call made to
+      the panel's HDCP interface when that interface opens; the call's other
+      words are zero. Set by the boot loader. Without this property the word
+      is zero too.
+
+  apple,panel-video-open-delay-us:
+    maxItems: 1
+    description:
+      Firmware 27, internal panel. The wait, in microseconds, between the
+      firmware's announcement of the panel's video interface and the opening
+      of that interface. Set by the boot loader. Without this property the
+      interface is opened as it is announced.
+
   mux-controls:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     minItems: 1
-    maxItems: 10
+    maxItems: 21
     description: |
       T6030 and T8132 external DCPs may also name the two DP IN tunnel states
       of each Type-C crossbar, in addition to the fixed output and Type-C
-      routes.
+      routes. T6050 has four DP IN states per crossbar and up to four
+      Type-C routes, plus a fixed output.
 
   mux-control-names:
     minItems: 1
-    maxItems: 10
+    maxItems: 21
     items:
-      pattern: '^(dp-xbar|typec[0-9]+(-dpin[01])?)$'
+      pattern: '^(dp-xbar|typec[0-9]+(-dpin[0-3])?)$'
 
   mux-index:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -335,12 +483,14 @@ properties:
     properties:
       compatible:
         oneOf:
-          - const: apple,panel
+          - enum:
+              - apple,panel
+              - apple,panel-mini-led
           - items:
-              - pattern: '^apple,panel-j[0-9]+$'
+              - pattern: '^apple,panel-[jk][0-9]+$'
               - const: apple,panel
           - items:
-              - pattern: '^apple,panel-j[0-9]+$'
+              - pattern: '^apple,panel-[jk][0-9]+$'
               - const: apple,panel-mini-led
               - const: apple,panel
       width-mm:
@@ -352,19 +502,6 @@ properties:
       apple,max-brightness:
         $ref: /schemas/types.yaml#/definitions/uint32
         description: Maximum firmware backlight level.
-      apple,color-gamut:
-        $ref: /schemas/types.yaml#/definitions/string
-        enum:
-          - srgb
-          - display-p3
-        description:
-          Standard colour space the panel is calibrated to by default, as
-          named in the product's published specifications. srgb has the
-          IEC 61966-2-1 primaries, display-p3 the SMPTE EG 432-1 primaries;
-          both have a D65 white and a nominal gamma of 2.2. Factory
-          calibration of the individual unit is applied by the display
-          coprocessor and is not described here. Colour data reported by
-          the firmware takes precedence.
     required:
       - compatible
     additionalProperties: false
@@ -384,12 +521,23 @@ properties:
             maxItems: 1
           mode-switch:
             type: boolean
+          apple,tunnel-only:
+            type: boolean
+            description:
+              The route carries USB4 DP tunnels only, never a DP Alt Mode
+              display. It is not a Type-C mode-switch.
           port:
             $ref: /schemas/graph.yaml#/properties/port
         required:
           - reg
-          - mode-switch
           - port
+        if:
+          not:
+            required:
+              - apple,tunnel-only
+        then:
+          required:
+            - mode-switch
         additionalProperties: false
     required:
       - '#address-cells'
@@ -408,13 +556,31 @@ required:
 
 allOf:
   - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum: ['apple,t6050-dcp', 'apple,t6050-dcpext']
+        required:
+          - compatible
+    then:
       properties:
-        compatible:
-          contains:
-            enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
-      required:
-        - compatible
-    else:
+        mux-controls:
+          maxItems: 10
+        mux-control-names:
+          maxItems: 10
+          items:
+            pattern: '^(dp-xbar|typec[0-9]+(-dpin[01])?)$'
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext',
+                     'apple,t6050-dcp', 'apple,t6050-dcpext']
+        required:
+          - compatible
+    then:
       properties:
         mux-controls:
           maxItems: 8
@@ -423,20 +589,114 @@ allOf:
           items:
             pattern: '^(dp-xbar|typec[0-9]+)$'
   - if:
-      not:
-        properties:
-          compatible:
-            contains:
-              enum: ['apple,t8132-dcp', 'apple,t8132-dcpext']
+      allOf:
+        - not:
+            properties:
+              compatible:
+                contains:
+                  enum: ['apple,t6031-dcp', 'apple,t8132-dcp', 'apple,t8132-dcpext']
+        - not:
+            properties:
+              status:
+                const: disabled
+            required:
+              - status
     then:
       required:
         - apple,bw-scratch
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum: ['apple,t6050-dcp', 'apple,t6050-dcpext']
+    then:
+      required:
+        - apple,clock-ids
+        - apple,firmware-compat
+      dependencies:
+        memory-region: [memory-region-names]
+        memory-region-names: [memory-region]
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6050-dcp
+          then:
+            required:
+              - memory-region
+              - memory-region-names
+      properties:
+        apple,firmware-compat:
+          items:
+            - const: 27
+            - const: 0
+            - const: 0
   - if:
       not:
         properties:
           compatible:
             contains:
-              enum: ['apple,t8140-dcp', 'apple,t8140-dcpext']
+              enum: ['apple,t6050-dcp', 'apple,t6050-dcpext',
+                     'apple,t8142-dcp', 'apple,t8142-dcpext']
+    then:
+      properties:
+        clocks:
+          maxItems: 2
+        clock-names:
+          items:
+            - const: clock-154
+            - const: clock-194
+        apple,clock-ids: false
+        apple,firmware-physical-regs: false
+  # T8142 runs both 26.x and 27.0 DCP firmware. The 26.x paths use the first
+  # clock; firmware 27 asks for the provider clocks of apple,clock-ids by
+  # index, as firmware-0 and firmware-1.
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum: ['apple,t8142-dcp', 'apple,t8142-dcpext']
+    then:
+      properties:
+        clocks:
+          minItems: 1
+          maxItems: 3
+        clock-names:
+          minItems: 1
+          items:
+            - const: clock-154
+            - const: firmware-0
+            - const: firmware-1
+        apple,firmware-physical-regs: false
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum: ['apple,t6050-dcp', 'apple,t6050-dcpext']
+    then:
+      properties:
+        apple,sleep-power-args: false
+        apple,sleep-a500-args: false
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,t6050-dcp
+    then:
+      properties:
+        apple,sleep-display-power-args: false
+        apple,sleep-display-stage-args: false
+        apple,panel-hdcp-open-arg: false
+        apple,panel-video-open-delay-us: false
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum: ['apple,t8140-dcp', 'apple,t8140-dcpext', 'apple,t6050-dcp', 'apple,t6050-dcpext']
     then:
       properties:
         apple,power-lut-data-x: false
@@ -448,7 +708,8 @@ allOf:
       properties:
         compatible:
           contains:
-            enum: ['apple,t8140-dcp', 'apple,t8140-dcpext']
+            enum: ['apple,t8140-dcp', 'apple,t8140-dcpext',
+                   'apple,t6050-dcp', 'apple,t6050-dcpext']
     then:
       properties:
         resets: false

@@ -12,6 +12,7 @@
  * MCHAN: multi-channel for concurrent P2P.
  * PNO: preferred network offload.
  * WOWL: Wake-On-WLAN.
+ * LPAS: firmware low-power associated-sleep policy.
  * P2P: peer-to-peer
  * RSDB: Real Simultaneous Dual Band
  * TDLS: Tunneled Direct Link Setup
@@ -64,7 +65,8 @@
 	BRCMF_FEAT_DEF(PMKID_V3) \
 	BRCMF_FEAT_DEF(SAE_EXT) \
 	BRCMF_FEAT_DEF(EVENT_MSGS_EXT) \
-	BRCMF_FEAT_DEF(GCMP)
+	BRCMF_FEAT_DEF(GCMP) \
+	BRCMF_FEAT_DEF(LPAS)
 
 /*
  * Quirks:

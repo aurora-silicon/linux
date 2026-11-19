@@ -73,12 +73,18 @@ mod g17 {
             pub struct ControlRecord;
             #[derive(Clone, Copy)]
             pub enum Opcode { Dummy }
+            pub type DeviceControlOp = Opcode;
             impl Opcode { pub fn asserts_gpu_power(self)->bool { false } }
             impl ControlRecord {
                 pub fn bytes(&self)->&[u8] { &[] }
                 pub fn opcode(&self)->Opcode { Opcode::Dummy }
                 pub fn asserts_gpu_power(&self)->bool { false }
             }
+        }
+        // M5's statistics tags and power rule, as the family methods below read them.
+        pub mod m5 {
+            M5_STATISTICS_TYPES
+            pub mod power { M5_ASSERTS_GPU_POWER }
         }
         pub mod initdata { pub mod status {
             pub const TRACE_STATE:u32=0;
@@ -94,9 +100,11 @@ mod g17 {
         pub struct InitData {
             pub cursors:[[AtomicU32;2];2],
             pub slots:RefCell<[[[u32;18];8];2]>,
+            pub m5:bool,
         }
         impl InitData {
-            pub fn new()->Self { Self { cursors:std::array::from_fn(|_|std::array::from_fn(|_|AtomicU32::new(0))), slots:RefCell::new([[[0;18];8];2]) } }
+            pub fn new()->Self { Self { cursors:std::array::from_fn(|_|std::array::from_fn(|_|AtomicU32::new(0))), slots:RefCell::new([[[0;18];8];2]), m5:false } }
+            INITDATA_FAMILY
             pub fn push(&self,role:Role,words:[u32;18]) {
                 use std::sync::atomic::Ordering::Relaxed;
                 let producer=self.cursors[role as usize][1].load(Relaxed);
@@ -116,16 +124,118 @@ mod g17 {
             pub fn publish_control(&self,_:u32,_:&[u8],_:bool,_:u32)->Result { Ok(()) }
         }
     }
-    struct Firmware { rings:channel::Rings }
+    struct Recovery(bool);
+    impl Recovery { fn pending(&self)->bool { self.0 } }
+    struct Firmware {
+        rings:channel::Rings,
+        init:initdata::InitData,
+        powered:bool,
+        epoch:u64,
+        recovery:Recovery,
+    }
+    impl Firmware {
+        fn roles(&self)->&'static [Role] { &[Role::Primary,Role::Secondary] }
+        fn observe_statistics_power(&mut self) {
+            if !self.rings.statistics_suspended() {
+                let roles=self.roles();
+                self.rings.observe_statistics_power(&crate::device::Device,&self.init,roles,self.powered,self.epoch);
+            }
+        }
+    }
     struct State(std::sync::Mutex<Option<Box<Firmware>>>);
     impl State {
         fn lock(&self)->std::sync::MutexGuard<'_,Option<Box<Firmware>>> { self.0.lock().unwrap() }
     }
-    struct Variant { graph:fw::variant::InitGraph }
-    struct Shared { state:State, dev:crate::device::Device, variant:Variant }
+    struct Variant { graph:fw::variant::InitGraph, m5_commands:bool }
+    struct Shared { state:State, dev:crate::device::Device, variant:Variant, crashed:std::sync::atomic::AtomicBool }
     mod reports;
 '''
 RUST_TESTS = r'''
+    fn reader(graph:fw::variant::InitGraph)->stats::Reader {
+        stats::Reader(std::sync::Arc::new(Shared {
+            state:State(std::sync::Mutex::new(Some(Box::new(Firmware {
+                rings:channel::Rings::new(graph,false).unwrap(),
+                init:initdata::InitData::new(),powered:true,epoch:0,recovery:Recovery(false),
+            })))),dev:crate::device::Device,variant:Variant { graph, m5_commands:false },crashed:false.into(),
+        }),None)
+    }
+
+    #[test]
+    fn reader_drains_without_events_and_does_not_reuse_old_samples() {
+        use {fw::variant::InitGraph,Role::*};
+        for graph in [InitGraph::V25G83,InitGraph::G17P] {
+            let reader=reader(graph);
+            let sample=|tiler,renderer,device|[0x13,0,0,tiler,renderer,0,device,0,0,0,0,0,0,0,0,0,0,0];
+            {
+                let state=reader.0.state.lock();
+                let fw=state.as_ref().unwrap();
+                fw.init.push(Primary,sample(25,75,50));
+                fw.init.push(Secondary,sample(35,85,65));
+            }
+            let view=reader.read();
+            assert_eq!((view.util_status,view.tiler,view.renderer,view.device,view.util_samples),
+                       (telemetry::VALID,30,80,57,2));
+            assert_eq!(reader.read(),view); // Empty reads do not add samples.
+            NOW.with(|now|now.set(stats::max_age_ns(graph)+1));
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            {
+                let state=reader.0.state.lock();
+                state.as_ref().unwrap().init.push(Secondary,sample(0,0,0));
+            }
+            let view=reader.read();
+            assert_eq!((view.util_status,view.device,view.util_samples),(telemetry::VALID,0,1));
+            // 26A428 reports its state in tags 0x19/0x1b, none of which arrived; 25G83 never does.
+            assert_eq!(view.pstate_status,match graph { InitGraph::G17P=>telemetry::UNAVAILABLE, _=>telemetry::UNSUPPORTED });
+            NOW.with(|now|now.set(1));
+        }
+    }
+
+    #[test]
+    fn reader_respects_suspend_recovery_power_epochs_and_detach() {
+        use {fw::variant::InitGraph,Role::*};
+        for graph in [InitGraph::V25G83,InitGraph::G17P] {
+            let reader=reader(graph);
+            let sample=[0x13,0,0,25,75,0,50,0,0,0,0,0,0,0,0,0,0,0];
+            let push=||reader.0.state.lock().as_ref().unwrap().init.push(Primary,sample);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::VALID);
+            reader.suspend(true);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            reader.suspend(false);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::VALID);
+            reader.0.state.lock().as_mut().unwrap().epoch+=1;
+            push();
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::VALID);
+            reader.0.state.lock().as_mut().unwrap().powered=false;
+            push();
+            // Gated cores run no work: the last sample stays until it ages
+            // out, then the GPU reads idle. Neither is stale.
+            assert_eq!(reader.read().util_status,telemetry::VALID);
+            reader.0.state.lock().as_mut().unwrap().powered=true;
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::VALID);
+            reader.0.state.lock().as_mut().unwrap().recovery.0=true;
+            push();
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            reader.0.state.lock().as_mut().unwrap().recovery.0=false;
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::VALID);
+            reader.0.crashed.store(true,Ordering::Release);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            *reader.0.state.lock()=None;
+            assert_eq!(reader.read().util_status,telemetry::UNAVAILABLE);
+        }
+    }
+
     // Complete V26A428 payloads; unqualified words must never become pstate.
     const HIST_IDLE:[u32;18]=[0x12,0x0dc6727d,0,8,4,1,0,3,7,0,0,1000,0,0,0,0,0,0];
     const HIST_ACTIVE:[u32;18]=[0x12,0x0003c9f5,0,10,0,1,0,3,9,0,0,1000,0,0,0,0,0,0];
@@ -146,11 +256,13 @@ RUST_TESTS = r'''
         let dev=crate::device::Device;
         for graph in [InitGraph::V25G83,InitGraph::G17P] {
             let init=initdata::InitData::new();
-            let mut rings=Rings::new(graph).unwrap();
+            let mut rings=Rings::new(graph,false).unwrap();
             for words in [HIST_IDLE,HIST_ACTIVE,HIST_OTHER,TRANSITION] {
                 init.push(Secondary,words);
                 rings.drain_statistics(&dev,&init,Secondary);
-                assert_eq!(rings.read_statistics(1),telemetry::Readout::default());
+                // 26A428 integrates busy time from its utilisation records; none arrived.
+                let busy=match graph { InitGraph::G17P=>telemetry::VALID, _=>telemetry::UNSUPPORTED };
+                assert_eq!(rings.read_statistics(1),telemetry::Readout { busy_status:busy,..Default::default() });
                 assert!(report(&rings).contains(&format!("words={:08x?}",words)));
             }
         }
@@ -162,7 +274,7 @@ RUST_TESTS = r'''
         let dev=crate::device::Device;
         for start in [0,5,7] {
             let init=initdata::InitData::new();
-            let mut rings=Rings::new(InitGraph::G17P).unwrap();
+            let mut rings=Rings::new(InitGraph::G17P,false).unwrap();
             for &role in &[Primary,Secondary] {
                 for cursor in &init.cursors[role as usize] { cursor.store(start,Ordering::Relaxed); }
                 for words in [HIST_OTHER,HIST_ACTIVE,TRANSITION] { init.push(role,words); }
@@ -177,7 +289,7 @@ RUST_TESTS = r'''
                 let line=text.lines().find(|line|line.starts_with(&format!("role={} tag={:#x} ",role,tag))).unwrap();
                 assert!(line.contains("count=2 host_ns=1 admitted=1 last_admitted=true"),"{}",line);
             } }
-            assert_eq!(rings.read_statistics(1),telemetry::Readout::default());
+            assert_eq!(rings.read_statistics(1),telemetry::Readout { busy_status:telemetry::VALID,..Default::default() });
         }
     }
 
@@ -186,7 +298,8 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        // The decoder's tag 0x10 path: only a firmware without 26A428's state records decodes it.
+        let mut rings=Rings::new(InitGraph::V25G83,false).unwrap();
         let util=[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0];
         let pstate=[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0];
         rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
@@ -213,27 +326,62 @@ RUST_TESTS = r'''
     }
 
     #[test]
-    fn current_firmwares_report_pstate_unsupported_and_keep_utilisation() {
+    fn v25g83_reports_pstate_unsupported_and_keeps_utilisation() {
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
-        for graph in [InitGraph::V25G83,InitGraph::G17P] {
-            assert!(!stats::reports_pstate(graph));
-            let empty=stats::qualify(graph,telemetry::Readout::default());
-            assert_eq!((empty.util_status,empty.pstate_status),(telemetry::UNAVAILABLE,telemetry::UNSUPPORTED));
-            let init=initdata::InitData::new();
-            let mut rings=Rings::new(graph).unwrap();
-            init.push(Primary,[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0]);
-            // Even a decodable tag 0x10 does not override the firmware's match data.
-            init.push(Primary,[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
-            rings.drain_statistics(&dev,&init,Primary);
-            assert_eq!(rings.read_statistics(1).pstate_status,telemetry::VALID);
-            let view=stats::qualify(graph,rings.read_statistics(1));
-            assert_eq!((view.util_status,view.device,view.pstate_status,view.pstate,view.pstate_timestamp),
-                       (telemetry::VALID,97,telemetry::UNSUPPORTED,0,0));
-            rings.invalidate_statistics();
-            let view=stats::qualify(graph,rings.read_statistics(1));
-            assert_eq!((view.util_status,view.pstate_status),(telemetry::STALE,telemetry::UNSUPPORTED));
-        }
+        // 26A428 reports its state on the A18 Pro and on M5; 25G83 never does.
+        assert!(!stats::reports_pstate(InitGraph::V25G83,false));
+        assert!(stats::reports_pstate(InitGraph::G17P,false));
+        assert!(stats::reports_pstate(InitGraph::G17P,true));
+        let graph=InitGraph::V25G83;
+        let empty=stats::qualify(graph,false,telemetry::Readout::default());
+        assert_eq!((empty.util_status,empty.pstate_status),(telemetry::UNAVAILABLE,telemetry::UNSUPPORTED));
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(graph,false).unwrap();
+        init.push(Primary,[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0]);
+        // Even a decodable tag 0x10 does not override the firmware's match data.
+        init.push(Primary,[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).pstate_status,telemetry::VALID);
+        let view=stats::qualify(graph,false,rings.read_statistics(1));
+        assert_eq!((view.util_status,view.device,view.pstate_status,view.pstate,view.pstate_timestamp),
+                   (telemetry::VALID,97,telemetry::UNSUPPORTED,0,0));
+        rings.invalidate_statistics();
+        let view=stats::qualify(graph,false,rings.read_statistics(1));
+        assert_eq!((view.util_status,view.pstate_status),(telemetry::STALE,telemetry::UNSUPPORTED));
+    }
+
+    #[test]
+    fn a18_pro_reports_its_state_through_the_reader() {
+        use {fw::variant::InitGraph,Role::*};
+        // States 0 to 10; an interval record, then the state in words 1 and 3.
+        let mhz=[0,338,492,618,796,928,1056,1170,1278,1338,1470];
+        let reader=stats::Reader(reader(InitGraph::G17P).0,stats::StateFrequencies::new(mhz.into_iter()));
+        let push=|words|reader.0.state.lock().as_ref().unwrap().init.push(Secondary,words);
+        // Tag 0x10 is not this firmware's state report.
+        push([0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
+        assert_eq!(reader.read().pstate_status,telemetry::UNAVAILABLE);
+        assert_eq!(reader.frequency(),Some((None,1_470_000_000)));
+        push([0x19,0x2000,0x40,0x1000,0x40,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        push([0x1b,7,0,7,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        let view=reader.read();
+        assert_eq!((view.pstate_status,view.pstate,view.pstate_timestamp,view.achieved_frequency_hz),
+                   (telemetry::VALID,7,0x40_0000_2000,1_170_000_000));
+        assert_eq!(reader.frequency(),Some((Some(1_170_000_000),1_470_000_000)));
+        // A state beyond the table is not a state.
+        push([0x1b,11,0,11,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        assert_eq!(reader.read().pstate_status,telemetry::UNAVAILABLE);
+        push([0x1b,10,0,10,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        assert_eq!(reader.read().achieved_frequency_hz,1_470_000_000);
+        // Gated cores run at no state: off, 0 Hz.
+        reader.0.state.lock().as_mut().unwrap().powered=false;
+        let view=reader.read();
+        assert_eq!((view.pstate_status,view.pstate,view.achieved_frequency_hz),(telemetry::VALID,0,0));
+        assert_eq!(reader.frequency(),Some((Some(0),1_470_000_000)));
+        // Power-up starts a new epoch: no state until the firmware reports one.
+        reader.0.state.lock().as_mut().unwrap().powered=true;
+        assert_eq!(reader.read().pstate_status,telemetry::STALE);
+        assert_eq!(reader.frequency(),Some((None,1_470_000_000)));
     }
 
     #[test]
@@ -241,7 +389,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::V25G83).unwrap();
+        let mut rings=Rings::new(InitGraph::V25G83,false).unwrap();
         let util=[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0];
         // Three 8 ms records per producer update, one update every 24 ms.
         for n in 0..3u64 {
@@ -261,7 +409,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        let mut rings=Rings::new(InitGraph::G17P,false).unwrap();
         rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],false,0);
         init.push(Secondary,HIST_IDLE);
         rings.drain_statistics(&dev,&init,Secondary);
@@ -281,11 +429,13 @@ RUST_TESTS = r'''
         let graph=InitGraph::G17P;
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(graph).unwrap();
+        let mut rings=Rings::new(graph,false).unwrap();
         init.push(Secondary,HIST_IDLE);
         rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
         init.push(Secondary,HIST_ACTIVE);
-        let shared=std::sync::Arc::new(Shared { state:State(std::sync::Mutex::new(Some(Box::new(Firmware { rings })))),dev,variant:Variant { graph } });
+        let shared=std::sync::Arc::new(Shared { state:State(std::sync::Mutex::new(Some(Box::new(Firmware {
+            rings,init:initdata::InitData::new(),powered:true,epoch:0,recovery:Recovery(false),
+        })))),dev,variant:Variant { graph, m5_commands:false },crashed:false.into() });
         let view=reports::View(shared.clone());
         struct View<'a>(&'a reports::View);
         impl std::fmt::Display for View<'_> {
@@ -303,7 +453,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        let mut rings=Rings::new(InitGraph::G17P,false).unwrap();
         let sample=|ta,render,device|[0x13,0,0,ta,render,0xdeadbeef,device,0,0,0,0,0,0,0,0,0,0,0];
         init.push(Primary,sample(25,75,50));
         init.push(Secondary,sample(35,85,65));
@@ -327,7 +477,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::V25G83).unwrap();
+        let mut rings=Rings::new(InitGraph::V25G83,false).unwrap();
         let words=[0x13,0,0,25,75,0,50,0,0,0,0,0,0,0,0,0,0,0];
         init.push(Primary,words);
         rings.drain_statistics(&dev,&init,Primary);
@@ -340,9 +490,11 @@ RUST_TESTS = r'''
                 2=>rings.observe_statistics_power(&dev,&init,&[Primary],true,1), // Wake observed by a fast publisher.
                 _=>rings.invalidate_statistics(), // Restart handshake.
             }
-            assert_eq!(rings.read_statistics(1).util_status,telemetry::STALE);
+            // A power gate reads idle (valid); every other boundary is stale.
+            let expect=if boundary==1 {telemetry::VALID} else {telemetry::STALE};
+            assert_eq!(rings.read_statistics(1).util_status,expect);
             rings.drain_statistics(&dev,&init,Primary);
-            assert_eq!(rings.read_statistics(1).util_status,telemetry::STALE);
+            assert_eq!(rings.read_statistics(1).util_status,expect);
             rings.observe_statistics_power(&dev,&init,&[Primary],true,u64::from(boundary >= 2));
             init.push(Primary,words);
             rings.drain_statistics(&dev,&init,Primary);
@@ -354,7 +506,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        let mut rings=Rings::new(InitGraph::V25G83,false).unwrap();
         init.push(Primary,[0x10,0x1000,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0]);
         init.push(Secondary,[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
         rings.drain_statistics(&dev,&init,Primary);
@@ -473,11 +625,23 @@ int main(void) {
             assert(strstr(now,status==2?"utilisation_status stale\n":"utilisation_status unavailable\n"));
         }
     }
-    /* G16S/G17P: pstate unsupported by firmware, utilisation still valid. */
-    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=3,.tiler=30,.renderer=80,.device=57,.pstate=0};
+    /* 26A428 reports the state the GPU runs at; state 0 (gated cores) runs at 0 Hz. */
+    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=1,.pstate=10,.achieved_frequency_hz=1470000000};
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"pstate_status valid\npstate 10\nrequested_frequency_hz unsupported\nachieved_frequency_hz 1470000000\n"));
+    current.pstate=0;current.achieved_frequency_hz=0;
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"pstate 0\nrequested_frequency_hz unsupported\nachieved_frequency_hz 0\n"));
+    current.pstate_status=2;
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"pstate unsupported\nrequested_frequency_hz unsupported\nachieved_frequency_hz unsupported\n"));
+    /* G16S: pstate unsupported by firmware, utilisation still valid. */
+    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=3,.tiler=30,.renderer=80,.device=57,.pstate=0,
+                                          .util_samples=19,.util_host_ns=123};
     agx_stats_show(NULL,&stats.attr,now);
     assert(strstr(now,"utilisation_status valid\nutil_tiler_percent 30\nutil_renderer_percent 80\nutil_device_percent 57\n"
                       "pstate_status unsupported\npstate unsupported\nrequested_frequency_hz unsupported\n"));
+    assert(strstr(now,"utilisation_source firmware-statistics-tag-0x13\nutilisation_samples 19\nutilisation_host_ns 123\n"));
     struct device dev;
     struct asahi_gpu_memory memory={0};
     void *handle=NULL;
@@ -509,7 +673,7 @@ def main():
     ap.add_argument('--baseline', default='ebcf9cb777a434867e9d880892ee2b46887728bb',
                     help='revision containing the legacy formatter')
     ap.add_argument('--mutation', choices=['fields', 'range', 'timestamp', 'age', 'delivery',
-                                           'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format'])
+                                           'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format', 'read-drain'])
     args = ap.parse_args()
     work = args.out or Path(tempfile.mkdtemp(prefix='asahi-g17-telemetry-'))
     work.mkdir(parents=True, exist_ok=True)
@@ -554,10 +718,30 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
             telemetry = telemetry.replace(before, after, 1)
     (work / 'telemetry.rs').write_text(telemetry)
     stats_rs = (DRIVER / 'g17/stats.rs').read_text()
+    if args.mutation == 'read-drain':
+        assert 'for &role in firmware.roles()' in stats_rs
+        stats_rs = stats_rs.replace('for &role in firmware.roles()', 'for &role in &[]', 1)
     policy = '\n'.join(item(stats_rs, signature) for signature in
-                       ['pub(super) const fn max_age_ns', 'pub(super) const fn reports_pstate',
+                       ['pub(super) const fn max_age_ns', 'pub(super) const fn protocol(', 'pub(super) const fn reports_pstate',
                         'pub(super) fn qualify('])
-    (work / 'rings.rs').write_text(RUST_HEADER + 'mod stats { use super::fw::variant::InitGraph;\n'
+    # The rings take the family's statistics tags and control power rule from
+    # InitData; build those production methods into the fixture's InitData.
+    initdata = (DRIVER / 'g17/initdata.rs').read_text()
+    family = '\n'.join(item(initdata, signature).replace('pub(super) ', 'pub ', 1) for signature in
+                       ['pub(super) fn statistics_types(', 'pub(super) fn control_asserts_gpu_power('])
+    m5 = (DRIVER / 'g17/fw/m5/mod.rs').read_text()
+    m5_types = next(x for x in m5.splitlines() if 'const STATISTICS_TYPES:' in x).replace('pub(crate)', 'pub')
+    m5_power = item((DRIVER / 'g17/fw/m5/power.rs').read_text(),
+                    'pub(crate) const fn asserts_gpu_power(').replace('pub(crate)', 'pub', 1)
+    header = (RUST_HEADER.replace('M5_STATISTICS_TYPES', m5_types).replace('M5_ASSERTS_GPU_POWER', m5_power)
+              .replace('INITDATA_FAMILY', family))
+
+    reader_rs = ('#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n' + item(stats_rs, 'pub(crate) struct StateFrequencies')
+                 + '\n' + item(stats_rs, 'impl StateFrequencies') + '\n'
+                 + 'pub(crate) struct Reader(pub(super) Arc<Shared>, pub(super) Option<StateFrequencies>);\n'
+                 + item(stats_rs, 'impl Reader'))
+    (work / 'rings.rs').write_text(header + 'mod stats { use super::{fw::variant::InitGraph, telemetry::Readout, Shared};\n'
+                                  + 'use std::sync::{Arc,atomic::Ordering};\n' + reader_rs + '\n'
                                   + policy + '\n}\nmod telemetry;\nmod channel;\n' + RUST_TESTS)
     # Rust resolves child modules relative to the inline parent's directory.
     (work / 'g17').mkdir(exist_ok=True)

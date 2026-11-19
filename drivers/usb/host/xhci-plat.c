@@ -636,6 +636,7 @@ static int xhci_plat_resume_common(struct device *dev, bool power_lost)
 	struct usb_hcd	*hcd = dev_get_drvdata(dev);
 	struct xhci_plat_priv *priv = hcd_to_xhci_priv(hcd);
 	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
+	bool lost;
 	int ret;
 
 	if (!device_may_wakeup(dev) && (xhci->quirks & XHCI_SUSPEND_RESUME_CLKS)) {
@@ -650,11 +651,18 @@ static int xhci_plat_resume_common(struct device *dev, bool power_lost)
 		}
 	}
 
+	/* A positive result: the controller lost its state, which the quirk set up again. */
 	ret = xhci_priv_resume_quirk(hcd);
-	if (ret)
+	if (ret < 0)
 		goto disable_clks;
 
-	ret = xhci_resume(xhci, power_lost || priv->power_lost, false);
+	lost = power_lost || priv->power_lost || ret > 0;
+	ret = xhci_resume(xhci, lost, false);
+	/* As after a restore error: a controller the quirk readied starts over if it can't. */
+	if (ret && !lost && priv->resume_quirk) {
+		dev_warn(dev, "xHC state not restored: %d, starting over\n", ret);
+		ret = xhci_resume(xhci, true, false);
+	}
 	if (ret)
 		goto disable_clks;
 

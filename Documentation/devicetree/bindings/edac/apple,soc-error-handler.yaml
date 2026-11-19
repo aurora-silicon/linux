@@ -14,81 +14,558 @@ description: |
   errors to dedicated platform interrupt groups. A second group reports
   fatal events latched by peripheral event logs.
 
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6000-error-handler
+          - apple,t6000-event-log
+          - apple,t6001-error-handler
+          - apple,t6001-event-log
+          - apple,t6002-error-handler
+          - apple,t6002-event-log
+          - apple,t6020-error-handler
+          - apple,t6020-event-log
+          - apple,t6021-error-handler
+          - apple,t6021-event-log
+          - apple,t6022-error-handler
+          - apple,t6022-event-log
+          - apple,t6030-error-handler
+          - apple,t6030-event-log
+          - apple,t6031-error-handler
+          - apple,t6031-event-log
+          - apple,t6041-error-handler
+          - apple,t6041-event-log
+          - apple,t6050-error-handler
+          - apple,t6050-event-log
+          - apple,t8103-error-handler
+          - apple,t8103-event-log
+          - apple,t8112-error-handler
+          - apple,t8112-event-log
+          - apple,t8122-error-handler
+          - apple,t8122-event-log
+          - apple,t8132-error-handler
+          - apple,t8132-event-log
+          - apple,t8140-error-handler
+          - apple,t8140-event-log
+          - apple,t8142-error-handler
+          - apple,t8142-event-log
+          - apple,t8152-error-handler
+          - apple,t8152-event-log
+  required:
+    - compatible
+
 properties:
-  compatible:
-    oneOf:
-      - items:
-          - const: apple,t6041-error-handler
-          - const: apple,soc-error-handler
-      - items:
-          - const: apple,t8140-error-handler
-          - const: apple,soc-error-handler
-      - items:
-          - const: apple,t6041-event-log
-          - const: apple,soc-event-log
-      - items:
-          - const: apple,t8140-event-log
-          - const: apple,soc-event-log
-
-  interrupts:
-    minItems: 9
-    maxItems: 89
-
-  reg:
-    minItems: 25
-    maxItems: 25
-    description: |
-      T6041 per-source NI0 through NI6 status apertures, in interrupt order.
-
-required:
-  - compatible
-  - interrupts
+  compatible: true
 
 allOf:
   - if:
       properties:
         compatible:
           contains:
-            const: apple,t6041-error-handler
-    then:
-      properties:
-        interrupts:
-          minItems: 89
-          maxItems: 89
+            enum:
+              - apple,t8132-error-handler
+              - apple,t8132-event-log
       required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          oneOf:
+            - items:
+                - const: apple,t8132-error-handler
+                - const: apple,soc-error-handler
+            - items:
+                - const: apple,t8132-event-log
+                - const: apple,soc-event-log
+
+        reg:
+          minItems: 23
+          maxItems: 55
+          description: Status apertures in hardware-description order.
+
+        interrupts:
+          minItems: 12
+          maxItems: 34
+
+      required:
+        - compatible
         - reg
-  - if:
+        - interrupts
+
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8132-error-handler
+          then:
+            properties:
+              reg:
+                minItems: 23
+                maxItems: 23
+              interrupts:
+                minItems: 34
+                maxItems: 34
+          else:
+            properties:
+              reg:
+                minItems: 55
+                maxItems: 55
+              interrupts:
+                minItems: 12
+                maxItems: 12
+    else:
       properties:
         compatible:
-          contains:
-            const: apple,t8140-error-handler
-    then:
-      properties:
-        interrupts:
-          minItems: 26
-          maxItems: 26
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t6041-event-log
-    then:
-      properties:
-        interrupts:
-          minItems: 21
-          maxItems: 21
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t8140-event-log
-    then:
-      properties:
+          oneOf:
+            - items:
+                - enum:
+                    - apple,t6000-error-handler
+                    - apple,t6001-error-handler
+                    - apple,t6002-error-handler
+                    - apple,t6020-error-handler
+                    - apple,t6021-error-handler
+                    - apple,t6022-error-handler
+                    - apple,t6030-error-handler
+                    - apple,t6031-error-handler
+                    - apple,t6041-error-handler
+                    - apple,t6050-error-handler
+                    - apple,t8103-error-handler
+                    - apple,t8112-error-handler
+                    - apple,t8122-error-handler
+                    - apple,t8140-error-handler
+                    - apple,t8142-error-handler
+                    - apple,t8152-error-handler
+                - const: apple,soc-error-handler
+            - items:
+                - enum:
+                    - apple,t6000-event-log
+                    - apple,t6001-event-log
+                    - apple,t6002-event-log
+                    - apple,t6020-event-log
+                    - apple,t6021-event-log
+                    - apple,t6022-event-log
+                    - apple,t6030-event-log
+                    - apple,t6031-event-log
+                    - apple,t6041-event-log
+                    - apple,t6050-event-log
+                    - apple,t8103-event-log
+                    - apple,t8112-event-log
+                    - apple,t8122-event-log
+                    - apple,t8140-event-log
+                    - apple,t8142-event-log
+                    - apple,t8152-event-log
+                - const: apple,soc-event-log
+
+        power-domains:
+          maxItems: 1
+          description: Power domain needed for the associated error-source registers.
+
         interrupts:
           minItems: 9
-          maxItems: 9
+          maxItems: 322
 
-additionalProperties: false
+        reg:
+          minItems: 10
+          maxItems: 255
+          description: |
+            Status apertures in hardware-description order. T6041 uses qualified
+            per-source NI status apertures in interrupt order. Native register
+            access on other variants requires separate qualification.
+
+      required:
+        - compatible
+        - interrupts
+
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8142-error-handler
+          then:
+            properties:
+              reg:
+                minItems: 33
+                maxItems: 33
+              interrupts:
+                minItems: 31
+                maxItems: 31
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8142-event-log
+          then:
+            properties:
+              reg:
+                minItems: 51
+                maxItems: 51
+              interrupts:
+                minItems: 13
+                maxItems: 13
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8152-error-handler
+          then:
+            properties:
+              reg:
+                minItems: 112
+                maxItems: 120
+              interrupts:
+                minItems: 96
+                maxItems: 96
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8152-event-log
+          then:
+            properties:
+              reg:
+                minItems: 57
+                maxItems: 57
+              interrupts:
+                minItems: 9
+                maxItems: 9
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6041-error-handler
+          then:
+            properties:
+              interrupts:
+                minItems: 89
+                maxItems: 89
+              reg:
+                minItems: 25
+                maxItems: 25
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6050-error-handler
+          then:
+            properties:
+              interrupts:
+                minItems: 105
+                maxItems: 105
+              reg:
+                minItems: 214
+                maxItems: 214
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6050-event-log
+          then:
+            properties:
+              interrupts:
+                minItems: 23
+                maxItems: 23
+              reg:
+                minItems: 141
+                maxItems: 141
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8140-error-handler
+          then:
+            properties:
+              interrupts:
+                minItems: 26
+                maxItems: 26
+              reg:
+                minItems: 17
+                maxItems: 17
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6041-event-log
+          then:
+            properties:
+              interrupts:
+                minItems: 21
+                maxItems: 21
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8140-event-log
+          then:
+            properties:
+              interrupts:
+                minItems: 9
+                maxItems: 9
+              reg:
+                minItems: 10
+                maxItems: 10
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t8122-error-handler
+          then:
+            properties:
+              reg:
+                minItems: 19
+                maxItems: 19
+              interrupts:
+                minItems: 39
+                maxItems: 39
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6030-error-handler
+          then:
+            properties:
+              reg:
+                minItems: 26
+                maxItems: 26
+              interrupts:
+                minItems: 54
+                maxItems: 54
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t8122-event-log
+          then:
+            properties:
+              reg:
+                minItems: 13
+                maxItems: 13
+              interrupts:
+                minItems: 13
+                maxItems: 13
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6030-event-log
+          then:
+            properties:
+              reg:
+                minItems: 26
+                maxItems: 26
+              interrupts:
+                minItems: 26
+                maxItems: 26
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6031-event-log
+          then:
+            properties:
+              reg:
+                minItems: 25
+                maxItems: 25
+              interrupts:
+                minItems: 26
+                maxItems: 26
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6031-error-handler
+          then:
+            oneOf:
+              - properties:
+                  reg:
+                    minItems: 123
+                    maxItems: 123
+                  interrupts:
+                    minItems: 159
+                    maxItems: 159
+              - properties:
+                  reg:
+                    minItems: 113
+                    maxItems: 113
+                  interrupts:
+                    minItems: 141
+                    maxItems: 141
+            required:
+              - reg
+
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8103-error-handler
+          then:
+            properties:
+              interrupts:
+                minItems: 11
+                maxItems: 11
+              reg:
+                minItems: 18
+                maxItems: 18
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8103-event-log
+          then:
+            properties:
+              interrupts:
+                minItems: 16
+                maxItems: 16
+              reg:
+                minItems: 16
+                maxItems: 16
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6000-error-handler
+          then:
+            properties:
+              interrupts:
+                minItems: 76
+                maxItems: 76
+              reg:
+                minItems: 55
+                maxItems: 55
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6000-event-log
+          then:
+            properties:
+              interrupts:
+                minItems: 28
+                maxItems: 28
+              reg:
+                minItems: 28
+                maxItems: 28
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6001-error-handler
+          then:
+            properties:
+              interrupts:
+                minItems: 127
+                maxItems: 127
+              reg:
+                minItems: 90
+                maxItems: 90
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6001-event-log
+          then:
+            properties:
+              interrupts:
+                minItems: 28
+                maxItems: 28
+              reg:
+                minItems: 28
+                maxItems: 28
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6002-error-handler
+          then:
+            oneOf:
+              - properties:
+                  interrupts:
+                    minItems: 138
+                    maxItems: 138
+                  reg:
+                    minItems: 104
+                    maxItems: 104
+              - properties:
+                  interrupts:
+                    minItems: 130
+                    maxItems: 130
+                  reg:
+                    minItems: 101
+                    maxItems: 101
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6002-event-log
+          then:
+            oneOf:
+              - properties:
+                  interrupts:
+                    minItems: 28
+                    maxItems: 28
+                  reg:
+                    minItems: 28
+                    maxItems: 28
+              - properties:
+                  interrupts:
+                    minItems: 26
+                    maxItems: 26
+                  reg:
+                    minItems: 26
+                    maxItems: 26
+            required:
+              - reg
+
+      additionalProperties: false
+
+unevaluatedProperties: false
 
 examples:
   - |

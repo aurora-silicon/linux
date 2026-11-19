@@ -107,13 +107,45 @@ bool hibernation_in_progress(void)
 	return !atomic_read(&hibernate_atomic);
 }
 
-bool hibernation_available(void)
+/*
+ * Apple silicon Macs run firmware on their coprocessors (storage, secure
+ * enclave, display, always-on processor, system controller, GPU and more).
+ * Restoring an image means a cold boot through the platform boot chain, which
+ * restarts that firmware, but most of the Linux drivers have no
+ * freeze/poweroff/restore path that rebuilds their mailbox, ring and DMA state
+ * from a cold start. The restored kernel would keep using stale state, so
+ * writing and restoring images stays disabled on these machines.
+ *
+ * pm_test dry runs are allowed (see hibernate()): every pm_test level stops
+ * before create_image() takes a snapshot, so no image is written or restored.
+ * They exercise the freezer and the device freeze/thaw callbacks that a real
+ * implementation needs.
+ */
+static bool hibernation_platform_blocked(void)
+{
+	return of_machine_is_compatible("apple,arm-platform");
+}
+
+static bool hibernation_generic_available(void)
 {
 	return nohibernate == 0 &&
 		!security_locked_down(LOCKDOWN_HIBERNATION) &&
-		!secretmem_active() && !cxl_mem_active() &&
-		!of_machine_is_compatible("apple,arm-platform");
+		!secretmem_active() && !cxl_mem_active();
 }
+
+bool hibernation_available(void)
+{
+	return hibernation_generic_available() &&
+		!hibernation_platform_blocked();
+}
+
+static int __init hibernation_platform_report(void)
+{
+	if (hibernation_platform_blocked())
+		pr_info("disabled on this platform: coprocessor firmware state is not restored from an image\n");
+	return 0;
+}
+late_initcall(hibernation_platform_report);
 
 /**
  * hibernation_set_ops - Set the global hibernate operations.
@@ -764,12 +796,17 @@ static int load_image_and_restore(void)
 int hibernate(void)
 {
 	bool snapshot_test = false;
+	bool dry_run_only = false;
 	unsigned int sleep_flags;
 	int error;
 
 	if (!hibernation_available()) {
-		pm_pr_dbg("Hibernation not available.\n");
-		return -EPERM;
+		if (!hibernation_generic_available() ||
+		    !hibernation_platform_blocked()) {
+			pm_pr_dbg("Hibernation not available.\n");
+			return -EPERM;
+		}
+		dry_run_only = true;
 	}
 
 	/*
@@ -784,6 +821,16 @@ int hibernate(void)
 	}
 
 	sleep_flags = lock_system_sleep();
+	/*
+	 * pm_test_level cannot change while system_transition_mutex is held,
+	 * so a dry run started here stays a dry run.
+	 */
+	if (dry_run_only && pm_test_level == TEST_NONE) {
+		pr_info("not supported on this platform yet; only pm_test dry runs are allowed\n");
+		error = -EPERM;
+		goto Unlock;
+	}
+
 	/* The snapshot device should not be opened while we're running */
 	if (!hibernate_acquire()) {
 		error = -EBUSY;
@@ -815,6 +862,15 @@ int hibernate(void)
 	error = hibernation_snapshot(hibernation_mode == HIBERNATION_PLATFORM);
 	if (error || freezer_test_done)
 		goto Free_bitmaps;
+
+	if (in_suspend && WARN_ON_ONCE(dry_run_only)) {
+		/* A snapshot exists although only a dry run was allowed: drop it. */
+		swsusp_free();
+		in_suspend = 0;
+		pm_restore_gfp_mask();
+		error = -EPERM;
+		goto Free_bitmaps;
+	}
 
 	if (in_suspend) {
 		unsigned int flags = 0;

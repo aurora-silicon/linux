@@ -49,7 +49,7 @@ static void frame(struct ave_ctx *ctx, unsigned int slot, bool force)
 	struct vb2_v4l2_buffer src;
 
 	assert(ave_cmd_process(ctx, slot, &src, 0x10012340000ULL,
-			       ctx->sess->p.bitrate, force) == 0);
+			       ctx->sess->p.bitrate, force, false) == 0);
 }
 
 #ifndef TEST_BASELINE
@@ -138,11 +138,11 @@ static void facts(void)
 		unsigned int before = submissions;
 
 		assert(ave_cmd_process(&ctx, session.p.slots, NULL, 0,
-				       session.p.bitrate, false) == -EINVAL);
+				       session.p.bitrate, false, false) == -EINVAL);
 
 		assert(ave_cmd_process(&ctx, 0, NULL, 0, session.p.bitrate,
-				       true) == -EOPNOTSUPP);
-		assert(ave_cmd_process(&ctx, 0, NULL, 0, 12000000, false) ==
+				       true, false) == -EOPNOTSUPP);
+		assert(ave_cmd_process(&ctx, 0, NULL, 0, 12000000, false, false) ==
 		       -EOPNOTSUPP);
 		assert(submissions == before);
 		dev.sessions[0] = &ctx;

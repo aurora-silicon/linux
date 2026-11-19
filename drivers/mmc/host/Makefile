@@ -115,3 +115,6 @@ endif
 
 obj-$(CONFIG_MMC_SDHCI_XENON)	+= sdhci-xenon-driver.o
 sdhci-xenon-driver-y		+= sdhci-xenon.o sdhci-xenon-phy.o
+
+obj-$(CONFIG_MMC_SDHCI_PCI_GLI_PWRSEQ_KUNIT_TEST) += gli-pwrseq-test.o
+gli-pwrseq-test-y := sdhci-pci-gli-pwrseq.o sdhci-pci-gli-pwrseq-test.o

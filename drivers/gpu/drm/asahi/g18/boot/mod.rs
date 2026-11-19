@@ -171,6 +171,8 @@ pub(crate) const fn stage_runs_firmware(stage: u32) -> bool {
 /// The firmware initializes once per boot; the module is pinned from then on,
 /// so this survives unbind/rebind and refuses a second attempt.
 static G18_FIRMWARE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+/// Set once the module is pinned for the retained session.
+static G18_MODULE_RETAINED: AtomicBool = AtomicBool::new(false);
 /// Bit per PSD request kind written by this module instance: bit 0 sgx,
 /// bit 1 gfx-asc, bit 2 gfx1-asc (power-on), bit 3 restore. Each kind is
 /// written at most once per module load; a re-bind does not repeat it.
@@ -2023,13 +2025,10 @@ fn prepare_firmware_session(pdev: &platform::Device<Core<'_>>, probe: T8152Probe
 
     // Point of no return: from here every path retains the session, and the
     // module stays loaded so RTKit callbacks keep valid code until reboot.
+    // No ASC CPU has started yet: once module removal has begun, refuse with
+    // nothing started and the session freed.
+    crate::retain::retain_module(&G18_MODULE_RETAINED)?;
     G18_FIRMWARE_ATTEMPTED.store(true, Ordering::Release);
-    // SAFETY: THIS_MODULE is this module; the reference is never dropped.
-    unsafe {
-        bindings::__module_get(
-            <crate::DriverModule as kernel::ModuleMetadata>::THIS_MODULE.as_ptr(),
-        )
-    };
     Ok(Retained(Some(session)))
 }
 

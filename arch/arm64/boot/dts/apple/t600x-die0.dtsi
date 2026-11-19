@@ -8,9 +8,9 @@
 
 &SOC_NODE {
 
-	ave_dart1: iommu@20d030000 {
+	ave_dart1: iommu@40d030000 {
 		compatible = "apple,t6000-dart";
-		reg = <0x2 0x0d030000 0 0x4000>;
+		reg = <0x4 0x0d030000 0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1028 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
@@ -18,9 +18,9 @@
 		status = "disabled";
 	};
 
-	ave_dart0: iommu@20d040000 {
+	ave_dart0: iommu@40d040000 {
 		compatible = "apple,t6000-dart";
-		reg = <0x2 0x0d040000 0 0x4000>;
+		reg = <0x4 0x0d040000 0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1028 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
@@ -28,11 +28,11 @@
 		status = "disabled";
 	};
 
-	ave: video-codec@20d100000 {
+	ave: video-codec@40d100000 {
 		compatible = "apple,t6000-ave";
-		reg = <0x2 0x0d100000 0 0x45c000>,
-		      <0x2 0x0d050000 0 0x8000>,
-		      <0x2 0x0d800000 0 0x800000>;
+		reg = <0x4 0x0d100000 0 0x45c000>,
+		      <0x4 0x0d050000 0 0x8000>,
+		      <0x4 0x0d800000 0 0x800000>;
 		reg-names = "codec", "mailbox", "coproc";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1031 IRQ_TYPE_LEVEL_HIGH>,
@@ -87,6 +87,30 @@
 		iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
 		power-domains = <&ps_ane_sys_cpu>, <&ps_ane_set1>,
 			<&ps_ane_set2>, <&ps_ane_set3>, <&ps_ane_set4>;
+		status = "disabled";
+	};
+
+	clvr_spmi0: spmi@28e501100 {
+		compatible = "apple,t6000-spmi", "apple,t8103-spmi";
+		reg = <0x2 0x8e501100 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	clvr_spmi1: spmi@28e509100 {
+		compatible = "apple,t6000-spmi", "apple,t8103-spmi";
+		reg = <0x2 0x8e509100 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	clvr_spmi2: spmi@28e511100 {
+		compatible = "apple,t6000-spmi", "apple,t8103-spmi";
+		reg = <0x2 0x8e511100 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
 		status = "disabled";
 	};
 
@@ -206,7 +230,9 @@
 			label = "pmp-jpg";
 			#power-domain-cells = <0>;
 			power-domains = <&ps_jpg>;
+#ifndef APPLE_USE_PMP
 			status = "disabled";
+#endif
 		};
 
 		pmp_report_scodec: report@14 {
@@ -337,7 +363,7 @@
 			compatible = "apple,smc-hwmon";
 		};
 
-		rtc {
+		smc_rtc: rtc {
 			compatible = "apple,smc-rtc";
 			nvmem-cells = <&rtc_offset>;
 			nvmem-cell-names = "rtc_offset";
@@ -383,10 +409,23 @@
 		reg = <0x2 0x920a1300 0x0 0x100>;
 		#address-cells = <2>;
 		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 636 IRQ_TYPE_LEVEL_HIGH>;
 
 		pmic1: pmic@f {
 			compatible = "apple,maverick-pmic", "apple,spmi-nvmem";
 			reg = <0xf SPMI_USID>;
+
+			pmu_rtc: rtc {
+				compatible = "apple,t6000-pmu-rtc";
+				interrupt-parent = <&nub_spmi0>;
+				interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+				nvmem-cells = <&rtc_offset>;
+				nvmem-cell-names = "rtc_offset";
+				wakeup-source;
+			};
 
 			nvmem-layout {
 				compatible = "fixed-layout";
@@ -435,6 +474,14 @@
 		};
 	};
 
+	nub_spmi1: spmi@2920a9300 {
+		compatible = "apple,t6000-spmi", "apple,t8103-spmi";
+		reg = <0x2 0x920a9300 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
 	wdt: watchdog@2922b0000 {
 		compatible = "apple,t6000-wdt", "apple,wdt";
 		reg = <0x2 0x922b0000 0x0 0x4000>;
@@ -463,6 +510,22 @@
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 597 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	aop_spmi0: spmi@293829300 {
+		compatible = "apple,t6000-spmi", "apple,t8103-spmi";
+		reg = <0x2 0x93829300 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	aop_spmi1: spmi@29382d300 {
+		compatible = "apple,t6000-spmi", "apple,t8103-spmi";
+		reg = <0x2 0x9382d300 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
 		status = "disabled";
 	};
 
@@ -561,7 +624,6 @@
 		dmas = <&sio 0x64>;
 		dma-names = "tx";
 		power-domains = <&ps_dpa0>;
-		reset-domains = <&ps_dpa0>;
 		status = "disabled";
 
 		ports {
@@ -788,6 +850,18 @@
 		status = "disabled";
 	};
 
+	spi4: spi@39b110000 {
+		compatible = "apple,t6000-spi", "apple,t8103-spi";
+		reg = <0x3 0x9b110000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1110 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		clocks = <&clkref>;
+		power-domains = <&ps_spi4>;
+		status = "disabled";
+	};
+
 	serial0: serial@39b200000 {
 		compatible = "apple,s5l-uart";
 		reg = <0x3 0x9b200000 0x0 0x1000>;
@@ -954,7 +1028,9 @@
 		#endif
 			<&ps_isp_set1>, <&ps_isp_fe>, <&ps_isp_set3>,
 			<&ps_isp_set4>, <&ps_isp_set5>, <&ps_isp_set6>,
-			<&ps_isp_set7>, <&ps_isp_set8>;
+			<&ps_isp_set7>, <&ps_isp_set8>,
+			<&ps_ispsens0>, <&ps_ispsens1>,
+			<&ps_ispsens2>, <&ps_ispsens3>;
 		apple,dart-vm-size = <0x0 0xa0000000>;
 
 		status = "disabled";

@@ -61,8 +61,6 @@ pub(crate) mod glue {
         fn asahi_g15_machine(compatible: *const core::ffi::c_char) -> bool;
         fn asahi_g15_hold_power(dev: *mut core::ffi::c_void);
         fn asahi_g15_release_power(dev: *mut core::ffi::c_void);
-        fn asahi_g15_module_try_get() -> bool;
-        fn asahi_g15_module_put();
         pub(crate) fn asahi_g15_reprobe();
         pub(crate) fn asahi_g15_report_loader_gpu();
         fn asahi_g15_adt_phram(start: *mut u64, size: *mut u64) -> core::ffi::c_int;
@@ -127,14 +125,7 @@ pub(crate) mod glue {
     /// Pins this module until reboot, once (`try_module_get(THIS_MODULE)`, see `retain.rs`).
     /// ENODEV, with nothing pinned or marked, once the module's removal has begun.
     pub(crate) fn retain_module() -> Result {
-        crate::g15::retain::retain(
-            &RETAINED,
-            // SAFETY: Takes a reference to this module unless its removal has begun.
-            || unsafe { asahi_g15_module_try_get() },
-            // SAFETY: Drops only the reference this call took; the winner's is never put.
-            || unsafe { asahi_g15_module_put() },
-        )
-        .map_err(|_| ENODEV)
+        crate::retain::retain_module(&RETAINED)
     }
 
     /// The phram "adt" export: start and size.
@@ -318,6 +309,7 @@ static RTKIT_OPS: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
     protocol_version: 0,
     crashed: Some(rtkit_crashed),
     recv_message: Some(rtkit_recv),
+    recv_message_timed: None,
     recv_message_early: Some(rtkit_recv_early),
     shmem_setup: Some(rtkit_shmem_setup),
     shmem_setup_ep: None,

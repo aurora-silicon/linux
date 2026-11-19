@@ -520,4 +520,12 @@ config BT_CENTAURI
 
 	  Say M to build the btcentauri module for bring-up testing.
 
+config BT_HCICENTAURI
+	tristate "Apple N1 Centauri T6050 Bluetooth"
+	depends on PCI && APPLE_CENTAURI_T6050
+	help
+	  Protocol-27 Beta HCI and ACL transport using the T6050 Control
+	  supplier and a device-tree factory address. This can coexist with
+	  the J813/J873 Bluetooth transport. SCO and ISO are not implemented.
+
 endmenu

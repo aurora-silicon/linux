@@ -335,7 +335,7 @@ fn firmware_stamp_wrap() {
         harness += f'#[path = "{G15 / "recovery/logic.rs"}"] mod recovery;\n'
         harness += f'#[path = "{G15 / "power/idle.rs"}"] mod idle;\n'
         harness += f'#[path = "{G15 / "power/pstate.rs"}"] mod pstate;\n'
-        harness += f'#[path = "{G15 / "retain.rs"}"] mod retain;\n'
+        harness += f'#[path = "{G15.parent / "retain.rs"}"] mod retain;\n'
         harness += ("mod firmware_identity {\n" +
                     f'#[path = "{G15 / "identity/matching.rs"}"] pub mod matching;\n' +
                     f'#[path = "{G15 / "identity/lookup.rs"}"] pub mod lookup;\n' + "}\n")

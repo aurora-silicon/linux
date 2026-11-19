@@ -118,7 +118,30 @@
 &{/soc} {
 	isp_dart0: iommu@4a28c0000 {
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
-		reg = <0x4 0xa28c0000 0x0 0xc000>;
+		reg = <0x4 0xa28c0000 0x0 0xc000>,
+		      <0x4 0xa28d0000 0x0 0x4000>;
+		reg-names = "dart", "dapf";
+		/*
+		 * The loader's address filter, from the ADT's dart-isp
+		 * dapf-instance-0 (its sixth reg window) in the ADT's order:
+		 * the firmware's PMGR, PMP and DSID windows. Every entry's
+		 * last word is 0xcc3 there. The filter goes off with the ISP
+		 * system domain and is written back when the DART powers up
+		 * again, so the firmware can start again after the ISP was
+		 * powered down between streams.
+		 */
+		apple,dapf-ranges = /bits/ 64 <0x380704000 0x380704063
+					     0x380730000 0x380733fff
+					     0x380e3c000 0x380e3c003
+					     0x39062c000 0x390658003
+					     0x421660000 0x421660003
+					     0x220104000 0x2201162fc
+					     0x3803c0000 0x3803e4000
+					     0x382724000 0x382724004
+					     0x3a1340000 0x3a13409fc
+					     0x3a1358000 0x3a1363ffc>;
+		apple,dapf-r20 = <0xcc3 0xcc3 0xcc3 0xcc3 0xcc3
+				  0xcc3 0xcc3 0xcc3 0xcc3 0xcc3>;
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 443 IRQ_TYPE_LEVEL_HIGH>;

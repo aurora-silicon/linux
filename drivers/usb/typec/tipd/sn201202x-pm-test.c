@@ -644,6 +644,393 @@ static void sn201202x_sleep_links_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sn201202x_sleep_links(&dp), TPS_DATA_STATUS_DP_CONNECTION);
 }
 
+static void sn201202x_ldcm_dry_test(struct kunit *test)
+{
+	u8 status[SN201202X_LDCM_STATUS_LEN] = {};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_decode(status),
+			TYPEC_CONTAMINANT_NONE);
+}
+
+static void sn201202x_ldcm_liquid_test(struct kunit *test)
+{
+	u8 status[SN201202X_LDCM_STATUS_LEN] = {};
+
+	status[0] = BIT(2);
+	status[1] = BIT(4);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_decode(status),
+			TYPEC_CONTAMINANT_LIQUID);
+
+	status[0] = 0;
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_decode(status),
+			TYPEC_CONTAMINANT_NONE);
+	status[0] = BIT(2);
+	status[1] = 0;
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_decode(status),
+			TYPEC_CONTAMINANT_NONE);
+}
+
+static void sn201202x_ldcm_busy_test(struct kunit *test)
+{
+	u8 status[SN201202X_LDCM_STATUS_LEN] = {
+		[0] = BIT(2),
+		[1] = BIT(1) | BIT(4),
+	};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_decode(status),
+			TYPEC_CONTAMINANT_UNKNOWN);
+}
+
+enum sn201202x_ldcm_test_action {
+	LDCM_TEST_READ,
+	LDCM_TEST_MITIGATE_ON,
+	LDCM_TEST_MITIGATE_OFF,
+	LDCM_TEST_PUBLISH_UNKNOWN,
+	LDCM_TEST_PUBLISH_NONE,
+	LDCM_TEST_PUBLISH_LIQUID,
+};
+
+struct sn201202x_ldcm_test {
+	enum typec_contaminant reads[2];
+	int read_rets[2];
+	int mitigation_rets[2];
+	enum sn201202x_ldcm_test_action actions[8];
+	unsigned int read_count;
+	unsigned int mitigation_count;
+	unsigned int action_count;
+};
+
+static int sn201202x_ldcm_test_read(void *ctx,
+				    enum typec_contaminant *contaminant)
+{
+	struct sn201202x_ldcm_test *t = ctx;
+	unsigned int i = t->read_count++;
+
+	t->actions[t->action_count++] = LDCM_TEST_READ;
+	*contaminant = t->reads[i];
+	return t->read_rets[i];
+}
+
+static int sn201202x_ldcm_test_mitigate(void *ctx, bool enable)
+{
+	struct sn201202x_ldcm_test *t = ctx;
+	unsigned int i = t->mitigation_count++;
+
+	t->actions[t->action_count++] = enable ? LDCM_TEST_MITIGATE_ON :
+						      LDCM_TEST_MITIGATE_OFF;
+	return t->mitigation_rets[i];
+}
+
+static void sn201202x_ldcm_test_publish(void *ctx,
+				       enum typec_contaminant contaminant)
+{
+	struct sn201202x_ldcm_test *t = ctx;
+
+	switch (contaminant) {
+	case TYPEC_CONTAMINANT_UNKNOWN:
+		t->actions[t->action_count++] = LDCM_TEST_PUBLISH_UNKNOWN;
+		break;
+	case TYPEC_CONTAMINANT_NONE:
+		t->actions[t->action_count++] = LDCM_TEST_PUBLISH_NONE;
+		break;
+	case TYPEC_CONTAMINANT_LIQUID:
+		t->actions[t->action_count++] = LDCM_TEST_PUBLISH_LIQUID;
+		break;
+	}
+}
+
+static const struct sn201202x_ldcm_ops sn201202x_ldcm_test_ops = {
+	.read = sn201202x_ldcm_test_read,
+	.set_mitigation = sn201202x_ldcm_test_mitigate,
+	.publish = sn201202x_ldcm_test_publish,
+};
+
+static void sn201202x_ldcm_test_actions(struct kunit *test,
+					struct sn201202x_ldcm_test *t,
+					const enum sn201202x_ldcm_test_action *actions,
+					size_t count)
+{
+	KUNIT_ASSERT_EQ(test, t->action_count, count);
+	KUNIT_EXPECT_MEMEQ(test, t->actions, actions, count * sizeof(*actions));
+}
+
+static void sn201202x_ldcm_liquid_order_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_LIQUID,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_LIQUID },
+	};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN), 0);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_read_failure_order_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_UNKNOWN,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+		.read_rets = { -EIO },
+	};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN), -EIO);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_mitigation_failure_order_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_UNKNOWN,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_LIQUID },
+		.mitigation_rets = { -ETIMEDOUT },
+	};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN),
+			-ETIMEDOUT);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_dry_order_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_OFF,
+		LDCM_TEST_READ,
+		LDCM_TEST_PUBLISH_NONE,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_NONE, TYPEC_CONTAMINANT_NONE },
+	};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN), 0);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_dry_then_busy_test(struct kunit *test)
+{
+	static const enum typec_contaminant last[] = {
+		TYPEC_CONTAMINANT_UNKNOWN,
+		TYPEC_CONTAMINANT_NONE,
+		TYPEC_CONTAMINANT_LIQUID,
+	};
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_OFF,
+		LDCM_TEST_READ,
+		LDCM_TEST_PUBLISH_NONE,
+	};
+	unsigned int i;
+
+	/* Removing mitigation can start a measurement after a fresh dry result. */
+	for (i = 0; i < ARRAY_SIZE(last); i++) {
+		struct sn201202x_ldcm_test t = {
+			.reads = { TYPEC_CONTAMINANT_NONE, TYPEC_CONTAMINANT_UNKNOWN },
+		};
+
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+								  &sn201202x_ldcm_test_ops,
+								  last[i]),
+				-EINPROGRESS);
+		sn201202x_ldcm_test_actions(test, &t, actions,
+					    ARRAY_SIZE(actions));
+	}
+}
+
+static void sn201202x_ldcm_dry_then_read_failure_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_OFF,
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_UNKNOWN,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_NONE, TYPEC_CONTAMINANT_UNKNOWN },
+		.read_rets = { 0, -EIO },
+	};
+
+	/* A failed second read must still mitigate, even after a dry result. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN), -EIO);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_dry_race_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_OFF,
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_LIQUID,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_NONE, TYPEC_CONTAMINANT_LIQUID },
+	};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN), 0);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_dry_race_mitigation_failure_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_OFF,
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_UNKNOWN,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_NONE, TYPEC_CONTAMINANT_LIQUID },
+		.mitigation_rets = { 0, -ETIMEDOUT },
+	};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN),
+			-ETIMEDOUT);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_busy_keeps_result_test(struct kunit *test)
+{
+	static const enum typec_contaminant last[] = {
+		TYPEC_CONTAMINANT_NONE,
+		TYPEC_CONTAMINANT_LIQUID,
+	};
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+	};
+	unsigned int i;
+
+	/* A running measurement neither mitigates nor republishes anything. */
+	for (i = 0; i < ARRAY_SIZE(last); i++) {
+		struct sn201202x_ldcm_test t = {
+			.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+		};
+
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+								  &sn201202x_ldcm_test_ops,
+								  last[i]),
+				-EINPROGRESS);
+		sn201202x_ldcm_test_actions(test, &t, actions,
+					    ARRAY_SIZE(actions));
+	}
+}
+
+static void sn201202x_ldcm_busy_without_result_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_UNKNOWN,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+	};
+
+	/* Without an earlier result a measurement is handled as unknown. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN),
+			-EAGAIN);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_read_failure_with_result_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_UNKNOWN,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+		.read_rets = { -EIO },
+	};
+
+	/* A failed read is never mistaken for a running measurement. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_NONE),
+			-EIO);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+struct sn201202x_ldcm_stop_test {
+	struct sn201202x sn;
+	atomic_t runs;
+};
+
+static void sn201202x_ldcm_test_work(struct work_struct *work)
+{
+	struct sn201202x *sn = container_of(to_delayed_work(work),
+					  struct sn201202x, ldcm_work);
+	struct sn201202x_ldcm_stop_test *t = container_of(sn,
+					struct sn201202x_ldcm_stop_test, sn);
+
+	atomic_inc(&t->runs);
+}
+
+static void sn201202x_ldcm_test_cancel(void *data)
+{
+	cancel_delayed_work_sync(data);
+}
+
+static void sn201202x_ldcm_stop_requeue_test(struct kunit *test)
+{
+	struct sn201202x_ldcm_stop_test *t;
+	struct tps6598x *tps;
+	int ret;
+
+	t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, t);
+	tps = &t->sn.cd.tps;
+	mutex_init(&tps->lock);
+	atomic_set(&t->runs, 0);
+	INIT_DELAYED_WORK(&t->sn.ldcm_work, sn201202x_ldcm_test_work);
+	ret = kunit_add_action_or_reset(test, sn201202x_ldcm_test_cancel, &t->sn.ldcm_work);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	/* Removal must cancel a pending retry and prevent later producers. */
+	mod_delayed_work(system_freezable_wq, &t->sn.ldcm_work, 60 * HZ);
+	sn201202x_contaminant_ops.stop(tps);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->sn.ldcm_work));
+
+	/* Reset recovery can still invalidate the detector before it is drained. */
+	mutex_lock(&tps->lock);
+	sn201202x_contaminant_ops.invalidate(tps);
+	mutex_unlock(&tps->lock);
+	flush_delayed_work(&t->sn.ldcm_work);
+	KUNIT_EXPECT_EQ(test, atomic_read(&t->runs), 0);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->sn.ldcm_work));
+}
+
 static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_sleep_cycle_test),
 	KUNIT_CASE(sn201202x_failed_wakeup_test),
@@ -651,6 +1038,21 @@ static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_unconfirmed_sleep_test),
 	KUNIT_CASE(sn201202x_unconfirmed_sleep_failed_wakeup_test),
 	KUNIT_CASE(sn201202x_sleep_links_test),
+	KUNIT_CASE(sn201202x_ldcm_dry_test),
+	KUNIT_CASE(sn201202x_ldcm_liquid_test),
+	KUNIT_CASE(sn201202x_ldcm_busy_test),
+	KUNIT_CASE(sn201202x_ldcm_liquid_order_test),
+	KUNIT_CASE(sn201202x_ldcm_read_failure_order_test),
+	KUNIT_CASE(sn201202x_ldcm_mitigation_failure_order_test),
+	KUNIT_CASE(sn201202x_ldcm_dry_order_test),
+	KUNIT_CASE(sn201202x_ldcm_dry_then_busy_test),
+	KUNIT_CASE(sn201202x_ldcm_dry_then_read_failure_test),
+	KUNIT_CASE(sn201202x_ldcm_dry_race_test),
+	KUNIT_CASE(sn201202x_ldcm_dry_race_mitigation_failure_test),
+	KUNIT_CASE(sn201202x_ldcm_busy_keeps_result_test),
+	KUNIT_CASE(sn201202x_ldcm_busy_without_result_test),
+	KUNIT_CASE(sn201202x_ldcm_read_failure_with_result_test),
+	KUNIT_CASE(sn201202x_ldcm_stop_requeue_test),
 	KUNIT_CASE(sn201202x_idle_sleep_test),
 	KUNIT_CASE(sn201202x_atomic_access_test),
 	KUNIT_CASE(sn201202x_idle_sleep_retry_test),

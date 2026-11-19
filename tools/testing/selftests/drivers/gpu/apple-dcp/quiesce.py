@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright 2026 Ryan Murray
 """Actual mux prepare/set and TPS removal ordering; firmware/PHY leaves are mocks."""
-from common import block, atc_function, atc_cio_helpers, fabric_core, fabric_rebalance
+from common import block, atc_function, atc_cio_helpers, atc_mux_noop, fabric_core, fabric_rebalance
 
 def make_unit(source, parent=False, reference=None):
  reference=source if reference is None else reference
@@ -58,7 +58,9 @@ struct typec_mux { struct typec_mux_context *context; struct typec_mux_state tra
 struct connector { bool connected; };
 struct apple_dcp { int external_lock,external_error; bool external_cable,external_stopped; struct { bool connected; } dptxport[1]; void *hdmi_hpd; bool active; bool external,typec_cable_connected; void *dev; struct connector *typec_connector; bool ext_backlight; };
 struct apple_dcp_typec_route;
-struct apple_dcp_typec_port { int link; void *connector_np; struct apple_dcp_typec_route *owner,*target,*secondary_target,*preferred_route; void *applied_alt; unsigned long applied_mode; unsigned applied_status,applied_conf; bool applied_valid,safe_pending,safe_finish_ready,dp_wanted,dp_hpd,hpd,busy_noted; };
+struct apple_dcp_typec_port { int link; void *connector_np; struct apple_dcp_typec_route *owner,*target,*secondary_target,*preferred_route; void *applied_alt; unsigned long applied_mode; unsigned applied_status,applied_conf; bool applied_valid,safe_pending,safe_finish_ready,dp_wanted,dp_hpd,hpd,busy_noted;
+    /* Held for a J714s firmware 27 sleep (dcp_fabric_sleep_release()): never here. */
+    bool sleep_held,sleep_withdrawn; };
 struct apple_dcp_typec_route { struct apple_dcp_typec_port *port; struct apple_dcp *dcp; void *xbar; bool deactivate_xbar_done; int deactivate_error; bool selected,tunnel; };
 static int dcp_typec_fabric_lock,dcp_typec_ports,deactivate_calls;
 struct drm_device { int unused; };
@@ -75,6 +77,10 @@ static int ordinary_safe(void);
 static void ordinary_initial(void);
 static void ordinary_usb2_check(void);
 static void event(char c) { assert(count+1<sizeof(events));events[count++]=c;events[count]=0; }
+/* This fixture covers M1/M2 role removal, never T8142 DP admission. */
+static bool dcp_t8142_ext(struct apple_dcp *d) { (void)d;return false; }
+static int dcp_typec_route_apply(struct typec_mux_dev *m,struct typec_mux_state *s)
+{ (void)m;(void)s;assert(!"unexpected T8142 route admission");return -EINVAL; }
 static bool dcp_is_external_h17p(struct apple_dcp *d) { return d->external; }
 static int dcp_dptx_disconnect_oob(void *dev,u32 index) { (void)dev;assert(index==0);event('Q');stops++;if(power_error){display.external_error=power_error;return power_error;}display.external_cable=false;display.external_stopped=true;display.dptxport[0].connected=false;display.typec_cable_connected=false;connector.connected=false;return 0; }
 static struct drm_device *dcp_typec_drm(void) { return NULL; }
@@ -93,7 +99,9 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *r,void *x) { (
 struct tps6598x;
 struct tipd_data { REMOVE_RETURN (*remove)(struct tps6598x *); void (*unregister_port)(struct tps6598x *); int (*reset)(struct tps6598x *); };
 struct typec_port { struct typec_mux *mux; };
-struct tps6598x { bool remove_safe_prepared; struct typec_mux *mux; void *partner,*dev,*psy,*role_sw,*reset,*partner_altmode_dp; int irq,wq_poll; struct typec_port *port; struct tipd_data *data; };
+struct tps6598x;
+struct tipd_contaminant_ops { int (*update)(struct tps6598x *); void (*stop)(struct tps6598x *); };
+struct tps6598x { bool remove_safe_prepared; struct typec_mux *mux; void *partner,*dev,*psy,*role_sw,*reset,*partner_altmode_dp; int irq,wq_poll; struct typec_port *port; struct tipd_data *data; const struct tipd_contaminant_ops *contaminant_ops; };
 struct cd321x { struct tps6598x tps; struct typec_mux *mux; void *tbt_switch; };
 struct typec_thunderbolt_switch_data { int state; };
 static void cd321x_stop_work(struct cd321x *c) { (void)c;event('W'); }
@@ -128,7 +136,8 @@ static void gpiod_set_value_cansleep(void *p,int v) { (void)p;assert(v==1);gpio_
  if not parent:functions+=block(core,'static void tps6598x_drop_partner(')+'\n'+block(core,'static int tps6598x_set_data_role(')+'\n'
  # The fixed-hub SuperSpeed handover moved the locked mux body to atcphy_mux_switch();
  # atcphy_mux_set_locked() also reports whether a SuperSpeed port may come back up.
- split=[atc_cio_helpers(atc)]+[atc_function(atc,name) for name in ('atcphy_usb3_port_ready','atcphy_mux_check','atcphy_mux_park','atcphy_mux_switch')]
+ split=[atc_cio_helpers(atc)]+[atc_function(atc,name) for name in ('atcphy_usb3_port_ready','atcphy_mux_check','atcphy_mux_park')]
+ split+=[atc_mux_noop(atc),atc_function(atc,'atcphy_mux_switch')]
  functions+=block(core,'static '+('void' if parent else 'int')+' tps6598x_disconnect(')+'\n'+block(core,'static '+('void' if parent else 'int')+' cd321x_remove(')+'\n'+block(core,'void tipd_remove(')+'\n'
  ordinary_phy=r'''
 /* Actual ordinary-port ATC power-off, mux recheck and USB2 init; MMIO leaves. */
@@ -147,16 +156,21 @@ struct apple_atcphy {
  void *dev; int lock;
  const struct atcphy_hw *hw;
  struct { void *usb2phy; } regs;
- bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables,cio_tunables;
+ bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables,cio_tunables,t8132_dp_alt;
  bool usb3_port_off,park_owed,dp_only,pd_was_off;
  bool t8103_dummy_pending,t8103_usb3_retry,t8103_usb3_workaround;
  enum atcphy_mode mode,typec_mode;
  enum atcphy_pipehandler_state pipe_state;
+ /* A CIO sleep is T8132's, covered by tools/asahi/atc-cio-sleep-tests.py. */
+ struct { bool prepared; } cio_sleep;
 };
 struct phy { struct apple_atcphy *data; };
 #define phy_get_drvdata(p) ((p)->data)
 #define USB2PHY_SIG 0
 #define USB2PHY_SIG_HOST 1
+USB2_RUN_DEFINES
+/* Retained USB2 power is exercised by dwc3-teardown, not these role removals. */
+static u32 readl(void *p) { (void)p;assert(false);return 0; }
 static struct { enum atcphy_pipehandler_state pipehandler_state; bool enable_dp_aux; } atcphy_modes[7];
 static struct apple_atcphy ordinary_phy;
 static struct phy usb_phy={.data=&ordinary_phy};
@@ -193,6 +207,10 @@ static void ordinary_usb2_check(void) {
 '''
  # The ordinary port is the T8122 profile unless a case selects the T8103
  # generation, whose live legacy PIPE park the mux switch now consults.
+ ordinary_phy=ordinary_phy.replace('USB2_RUN_DEFINES', '\n'.join(
+  line for line in atc.splitlines()
+  if line.startswith(('#define USB2PHY_USBCTL ', '#define USB2PHY_USBCTL_USB_MODE ',
+                      '#define USB2PHY_USBCTL_RUN '))))
  generation='enum atcphy_generation {' in atc
  ordinary_phy=ordinary_phy.replace('GENERATION_ENUM\n',block(atc,'enum atcphy_generation {')+';\n' if generation else '',1)
  ordinary_phy=ordinary_phy.replace('GENERATION_FIELD ','enum atcphy_generation gen; ' if generation else '',1)

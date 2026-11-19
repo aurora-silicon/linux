@@ -463,3 +463,5 @@
 &ps_afr_d2d_1_die1 {
 	status = "okay";
 };
+
+#include "t6032-peripherals.dtsi"

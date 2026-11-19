@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Host-check production M4 Rust stream parsing with generated kernel UAPI types."""
 from common import kernel_root, output_dir, rustc, flat_bindings
+from abi import c_layout, differences, rust_layout
 
 import hashlib
 import json
@@ -13,7 +14,41 @@ import tempfile
 ROOT = kernel_root()
 OUT = output_dir()
 SOURCE = ROOT / 'drivers/gpu/drm/asahi/g16/command.rs'
-BINDINGS = flat_bindings()
+FLAT = flat_bindings()
+# The M5 render payload and resource commands are newer than the frozen M4
+# bindings. Declare them beside the flat ones and check their layout and values
+# against the kernel header, as the frozen ones are.
+M5_UAPI = r'''
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct drm_asahi_render_stage_prefixes {
+    pub ta_cdm_barrier: __u16,
+    pub reserved0: __u16,
+    pub reserved1: __u32,
+    pub ta_prior_cdm: __u64,
+    pub ta_vdm_barrier: __u16,
+    pub reserved2: __u16,
+    pub reserved3: __u32,
+    pub ta_prior_vdm: __u64,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct drm_asahi_cmd_render_m5 {
+    pub legacy: drm_asahi_cmd_render,
+    pub stage_prefixes: drm_asahi_render_stage_prefixes,
+}
+pub const drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES: drm_asahi_cmd_type = 5;
+pub const drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_RESOURCES: drm_asahi_cmd_type = 6;
+pub const drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES_V2: drm_asahi_cmd_type = 7;
+pub const drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES: drm_asahi_render_flags = 8388608;
+'''
+BINDINGS = OUT / 'm5-uapi.rs'
+BINDINGS.write_text('include!(' + json.dumps(str(FLAT)) + ');\n' + M5_UAPI)
+with tempfile.TemporaryDirectory(prefix='m4-m5-uapi-') as name:
+    errors = differences(c_layout(ROOT / 'include/uapi/drm/asahi_drm.h', BINDINGS, pathlib.Path(name), 'm5-layout'),
+                         rust_layout(BINDINGS, pathlib.Path(name)))
+if errors:
+    raise RuntimeError('Kernel UAPI ABI differs from the M5 bindings: ' + json.dumps(errors))
 command = SOURCE.read_text()
 hardware = (SOURCE.parent / 'hw.rs').read_text()
 capacities = '\n'.join(re.findall(r'pub\(crate\) const (?:TPC_SIZE|TILEMAP_SIZE): u64 = .*?;', hardware))
@@ -24,7 +59,8 @@ names = ['drm_asahi_cmd_header', 'drm_asahi_attachment', 'drm_asahi_cmd_render',
 constants = command[command.index('/// Largest command buffer.'):command.index('/// A validated render command.')]
 parser = command[command.index('/// One command of the stream.'):command.index('/// Checks that `[start, end)`')]
 g17 = (ROOT / 'drivers/gpu/drm/asahi/g17/command.rs').read_text()
-g17_parser = g17[g17.index('// Commands stay inline'):g17.index('#[derive(Clone, Copy, PartialEq, Eq)]')]
+# The stage-prefix offset and the render payload reader precede the parser.
+g17_parser = g17[g17.index('/// Where a render command\'s stage-prefix fields start'):g17.index('#[derive(Clone, Copy, PartialEq, Eq)]')]
 g17_constants = '\n'.join(re.findall(r'const (?:RENDER_BASE_SIZE|COMPUTE_BASE_SIZE): usize = .*?;|const (?:RENDER_TIMESTAMP_COPIES|COMPUTE_TIMESTAMP_COPIES): Range<usize> = .*?;', g17, re.S))
 reader = (ROOT / 'drivers/gpu/drm/asahi/util.rs').read_text()
 reader = reader[reader.index('pub(crate) unsafe trait AnyBitPattern:'):]
@@ -37,6 +73,8 @@ const EOVERFLOW: i32 = -75;
 const E2BIG: i32 = -7;
 struct Error; impl Error { fn from_errno(error:i32)->i32 { error } }
 extern crate self as kernel;
+// The parser logs why it refuses a command; check the format arguments, print nothing.
+macro_rules! pr_warn { ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }}; }
 pub mod bindings { pub const EOPNOTSUPP:i32=95; }
 pub mod prelude { pub type Result<T=()> = core::result::Result<T,i32>; pub const E2BIG:i32=-7; }
 mod uapi { include!("FULL_UAPI"); }
@@ -58,6 +96,21 @@ PRODUCTION_PARSER
 mod g17 {
     use super::{uapi, AnyBitPattern, Reader, Result, EINVAL, size_of, offset_of, Range};
     G17_CONSTANTS
+    const STAGE_PREFIXES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
+    const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+    const GFP_KERNEL: u32 = 0;
+    pub struct Arc<T>(std::rc::Rc<T>);
+    impl<T> Arc<T> { fn new(value: T, _: u32) -> Result<Self> { Ok(Self(std::rc::Rc::new(value))) } }
+    impl<T> Clone for Arc<T> { fn clone(&self) -> Self { Self(self.0.clone()) } }
+    impl<T> core::ops::Deref for Arc<T> { type Target = T; fn deref(&self) -> &T { &self.0 } }
+    // The M5 program lists, likewise retained as their bytes.
+    pub struct Programs(pub Vec<u8>, pub u8);
+    impl Programs {
+        fn parse(bytes: &[u8]) -> Result<Self> { Ok(Self(bytes.to_vec(), 1)) }
+        fn parse_v2(bytes: &[u8]) -> Result<Self> { Ok(Self(bytes.to_vec(), 2)) }
+    }
+    pub struct ComputePrograms(pub Vec<u8>);
+    impl ComputePrograms { fn parse(bytes: &[u8]) -> Result<Self> { Ok(Self(bytes.to_vec())) } }
     // These stand-ins only retain extension bytes. This test checks the actual
     // parser's framing and offsets; backend resource validation has other tests.
     #[derive(Clone,Copy)]
@@ -86,6 +139,9 @@ mod g17 {
     }
     G17_PARSER
 }
+const SET_RENDER_RESOURCES: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES;
+const SET_COMPUTE_RESOURCES: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_RESOURCES;
+const SET_RENDER_RESOURCES_V2: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES_V2;
 fn data<T: Copy>(value: &T) -> Vec<u8> {
     unsafe { core::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()).to_vec() }
 }
@@ -174,14 +230,16 @@ fn g17_extensions_keep_canonical_offsets() {
     r.ray_query[0].scs_layout=0x1234;
     let wire=entry(CMD_RENDER,&data(&r),[NONE;2]);
     let parsed=g17::Parser::new(&wire).next().unwrap().unwrap();
-    let g17::Payload::Render(cmd,_,ray)=parsed.payload else { panic!("wrong engine") };
+    let g17::Payload::Render(cmd,prefixes,_,ray,resources)=parsed.payload else { panic!("wrong engine") };
+    assert!(prefixes.is_none()&&resources.is_none());
     assert_eq!([cmd.prior_vdm,cmd.prior_cdm],[17,29]);
     assert_eq!(u64::from_le_bytes(ray[0].0[..8].try_into().unwrap()),0x1234);
     let c=uapi::drm_asahi_cmd_compute {scs_layout:0x1234,
         prior_vdm:17,prior_cdm:29,cdm_auxiliary_allocation:8,intersection_pool:0x4000,..Default::default()};
     let wire=entry(CMD_COMPUTE,&data(&c),[NONE;2]);
     let parsed=g17::Parser::new(&wire).next().unwrap().unwrap();
-    let g17::Payload::Compute(cmd,_,intersection)=parsed.payload else { panic!("wrong engine") };
+    let g17::Payload::Compute(cmd,_,intersection,resources)=parsed.payload else { panic!("wrong engine") };
+    assert!(resources.is_none());
     assert_eq!([cmd.prior_vdm,cmd.prior_cdm],[17,29]); assert_eq!(cmd.scs_layout,0x1234);
     assert_eq!(u32::from_le_bytes(intersection.0[..4].try_into().unwrap()),8);
     assert_eq!(u64::from_le_bytes(intersection.0[8..16].try_into().unwrap()),0x4000);
@@ -195,6 +253,55 @@ fn g17_extensions_keep_canonical_offsets() {
             let wire=entry(CMD_COMPUTE,&data(&c),[NONE;2]);
             assert!(g17::Parser::new(&wire).next().is_err());
         }
+    }
+}
+#[test]
+fn g17_stage_prefixes_follow_the_complete_render() {
+    let mut m5=uapi::drm_asahi_cmd_render_m5 {legacy:render(),..Default::default()};
+    m5.legacy.flags=uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES; m5.legacy.prior_vdm=17;
+    m5.stage_prefixes.ta_cdm_barrier=3; m5.stage_prefixes.ta_prior_vdm=0x1234;
+    let wire=entry(CMD_RENDER,&data(&m5),[NONE;2]);
+    let parsed=g17::Parser::new(&wire).next().unwrap().unwrap();
+    let g17::Payload::Render(cmd,prefixes,..)=parsed.payload else { panic!("wrong engine") };
+    let prefixes=prefixes.expect("stage prefixes");
+    assert_eq!(cmd.prior_vdm,17); assert_eq!((prefixes.ta_cdm_barrier,prefixes.ta_prior_vdm),(3,0x1234));
+    // The flag needs the complete struct, its reserved fields zero, and no fragment barriers.
+    assert!(g17::Parser::new(&entry(CMD_RENDER,&data(&m5)[..448],[NONE;2])).next().is_err());
+    let mut bad=m5; bad.stage_prefixes.reserved1=1;
+    assert!(g17::Parser::new(&entry(CMD_RENDER,&data(&bad),[NONE;2])).next().is_err());
+    let mut bad=m5; bad.legacy.flags|=FRAGMENT_BARRIERS;
+    assert!(g17::Parser::new(&entry(CMD_RENDER,&data(&bad),[NONE;2])).next().is_err());
+    // Without the flag the prefix fields are absent or zero.
+    let mut plain=m5; plain.legacy.flags=0;
+    assert!(g17::Parser::new(&entry(CMD_RENDER,&data(&plain),[NONE;2])).next().is_err());
+    plain.stage_prefixes=Default::default();
+    let parsed=g17::Parser::new(&entry(CMD_RENDER,&data(&plain),[NONE;2])).next().unwrap().unwrap();
+    let g17::Payload::Render(_,prefixes,..)=parsed.payload else { panic!("wrong engine") };
+    assert!(prefixes.is_none());
+}
+#[test]
+fn g17_resource_lists_apply_to_later_commands_until_cleared() {
+    let mut stream=entry(SET_RENDER_RESOURCES,&[1,2,3,4],[NONE;2]);
+    stream.extend(entry(SET_COMPUTE_RESOURCES,&[5,6],[NONE;2]));
+    stream.extend(entry(CMD_RENDER,&data(&render()),[NONE;2]));
+    stream.extend(entry(CMD_COMPUTE,&data(&compute()),[NONE;2]));
+    stream.extend(entry(SET_RENDER_RESOURCES_V2,&[7],[NONE;2]));
+    stream.extend(entry(CMD_RENDER,&data(&render()),[NONE;2]));
+    stream.extend(entry(SET_RENDER_RESOURCES,&[],[NONE;2]));
+    stream.extend(entry(CMD_RENDER,&data(&render()),[NONE;2]));
+    let mut parser=g17::Parser::new(&stream);
+    let mut renders=Vec::new();
+    while let Some(command)=parser.next().unwrap() {
+        match command.payload {
+            g17::Payload::Render(..,resources)=>renders.push(resources.map(|r|(r.0.clone(),r.1))),
+            g17::Payload::Compute(..,resources)=>assert_eq!(resources.map(|r|r.0.clone()),Some(vec![5,6])),
+        }
+    }
+    assert!(parser.finish().is_ok());
+    assert_eq!(renders,[Some((vec![1,2,3,4],1)),Some((vec![7],2)),None]);
+    // Like the attachment commands, they carry no barriers.
+    for kind in [SET_RENDER_RESOURCES,SET_COMPUTE_RESOURCES,SET_RENDER_RESOURCES_V2] {
+        assert!(g17::Parser::new(&entry(kind,&[1],[0,NONE])).next().is_err());
     }
 }
 #[test]
@@ -310,6 +417,6 @@ with tempfile.TemporaryDirectory(prefix='m4-rust-command-') as directory:
         'g17_source':str(ROOT/'drivers/gpu/drm/asahi/g17/command.rs'),
         'g17_sha256':hashlib.sha256(g17.encode()).hexdigest(),
         'uapi_generated':str(BINDINGS),'uapi_sha256':hashlib.sha256(BINDINGS.read_bytes()).hexdigest(),
-        'result':'pass','test_groups':14,
+        'result':'pass','test_groups':16,
         'limitations':'Links complete production encoder/firmware helper modules; compiles isolated production G16 structural parser/reader and G17 framing/prefix parser with generated UAPI structs. G17 extension validators are stand-ins; does not exercise kernel VM/scheduler or hardware.'
     },indent=2)+'\n')

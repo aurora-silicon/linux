@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/dts-v1/;
+
+#include "t8152.dtsi"
+
+/ {
+	model = "Apple iMac (J833ct)";
+	compatible = "apple,j833ct", "apple,t8152", "apple,arm-platform";
+	chassis-type = "all-in-one";
+};

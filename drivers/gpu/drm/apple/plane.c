@@ -6,6 +6,7 @@
 #include "plane.h"
 #include "dcp.h"
 
+#include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb_internal.h"
 
@@ -145,8 +146,16 @@ static int apple_get_ix_layout(u32 width, u32 height,
 	return 0;
 }
 
+static bool apple_plane_element_geometry(struct drm_crtc *crtc)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
+
+	return dcp_surface_element_geometry(dcp);
+}
+
 /* Use exactly the same geometry for admission and surface construction. */
 static int apple_plane_get_fb_layout(struct drm_framebuffer *fb,
+				     bool element_geometry,
 				     struct apple_plane_layout *planes,
 				     u32 *buf_size)
 {
@@ -195,7 +204,9 @@ static int apple_plane_get_fb_layout(struct drm_framebuffer *fb,
 				return -EINVAL;
 			p->image.tile_w = drm_format_info_block_width(fmt, i);
 			p->image.tile_h = drm_format_info_block_height(fmt, i);
-			p->tile_size = p->image.tile_w * p->image.tile_h;
+			/* tile_size is bytes per element, not pixels. */
+			p->tile_size = element_geometry ? fmt->char_per_block[i] :
+				       p->image.tile_w * p->image.tile_h;
 			p->stride = fb->pitches[i];
 			break;
 		default:
@@ -232,6 +243,27 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 	if (IS_ERR(crtc_state))
 		return PTR_ERR(crtc_state);
 
+	{
+		struct platform_device *pdev = to_apple_crtc(new_plane_state->crtc)->dcp;
+		struct apple_dcp *target = pdev ? platform_get_drvdata(pdev) : NULL;
+		struct drm_framebuffer *fb = new_plane_state->fb;
+
+		if (target && dcp_is_ext26(target) && fb && !iomfb_ext26_backing_fresh(target, fb))
+			return -EINVAL;
+		if (target && dcp_is_ext26(target) && fb &&
+		    (plane->type != DRM_PLANE_TYPE_PRIMARY || fb->format->format != DRM_FORMAT_XRGB8888 ||
+		     fb->modifier != DRM_FORMAT_MOD_LINEAR || fb->offsets[0] ||
+		     crtc_state->vrr_enabled || new_plane_state->rotation != DRM_MODE_ROTATE_0 ||
+		     new_plane_state->src_x || new_plane_state->src_y ||
+		     new_plane_state->src_w != ((u32)crtc_state->mode.hdisplay << 16) ||
+		     new_plane_state->src_h != ((u32)crtc_state->mode.vdisplay << 16) ||
+		     new_plane_state->crtc_x || new_plane_state->crtc_y ||
+		     new_plane_state->crtc_w != crtc_state->mode.hdisplay ||
+		     new_plane_state->crtc_h != crtc_state->mode.vdisplay ||
+		     fb->width != crtc_state->mode.hdisplay || fb->height != crtc_state->mode.vdisplay))
+			return -EINVAL;
+	}
+
 	/*
 	 * DCP limits downscaling to 2x and upscaling to 4x. Attempting to
 	 * scale outside these bounds errors out when swapping.
@@ -251,7 +283,9 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 	if (ret < 0)
 		return ret;
 
-	ret = apple_plane_get_fb_layout(new_plane_state->fb, layouts, &buf_size);
+	ret = apple_plane_get_fb_layout(new_plane_state->fb,
+					apple_plane_element_geometry(new_plane_state->crtc),
+					layouts, &buf_size);
 	if (ret)
 		return ret;
 
@@ -417,8 +451,9 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 
 	struct drm_framebuffer *fb = base->fb;
 	const struct drm_format_info *fmt = fb->format;
+	bool element_geometry = apple_plane_element_geometry(base->crtc);
 
-	if (WARN_ON_ONCE(apple_plane_get_fb_layout(fb, layouts, &buf_size))) {
+	if (WARN_ON_ONCE(apple_plane_get_fb_layout(fb, element_geometry, layouts, &buf_size))) {
 		memset(&new_state->surf, 0, sizeof(new_state->surf));
 		return;
 	}
@@ -450,7 +485,7 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		.surface_id = plane->base.id,
 		.buf_size = buf_size,
 
-		/* Only used for compressed or multiplanar surfaces */
+		/* Only used for compressed or multiplanar surfaces before firmware 27 */
 		.pix_size = 1,
 		.pel_w = 1,
 		.pel_h = 1,
@@ -458,6 +493,16 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		.has_planes = 1,
 		.has_compr_info = 1,
 	};
+
+	if (element_geometry) {
+		/* Bytes per element, and the element's width and height in pixels */
+		new_state->surf.pix_size = fmt->char_per_block[0];
+		new_state->surf.pel_w = drm_format_info_block_width(fmt, 0);
+		new_state->surf.pel_h = drm_format_info_block_height(fmt, 0);
+		/* Present only when compression_info describes a compressed plane */
+		new_state->surf.has_compr_info =
+			fb->modifier == DRM_FORMAT_MOD_APPLE_INTERCHANGE;
+	}
 
 	/* Populate plane information for planar formats */
 	struct dcp_surface *surf = &new_state->surf;
@@ -746,8 +791,9 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   bool xrgb_is_alpha,
 				   enum drm_plane_type type,
 				   bool interchange,
-				   bool premultiplied)
+				   bool premultiplied, bool native26)
 {
+	static const u32 native_formats[] = { DRM_FORMAT_XRGB8888 };
 	struct apple_plane *plane;
 	unsigned int blend_modes;
 	const u32 *fmts;
@@ -756,7 +802,10 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 
 	switch (type) {
 	case DRM_PLANE_TYPE_PRIMARY:
-		if (xrgb_is_alpha) {
+		if (native26) {
+			fmts = native_formats;
+			num_fmts = ARRAY_SIZE(native_formats);
+		} else if (xrgb_is_alpha) {
 			/*
 			 * The firmware blends the X byte as alpha and ignores the
 			 * opaque-X property: offer only formats with alpha, so that

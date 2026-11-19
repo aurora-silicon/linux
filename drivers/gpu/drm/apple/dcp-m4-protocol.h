@@ -7,7 +7,7 @@
 #include <linux/unaligned.h>
 #include "dcp-m4-profile.h"
 
-/* J713 firmware 81BAF476-679D-3CC0-8C6A-E6B6FA659D5E only. */
+/* The 26.6.2 firmware's DCP protocol, the same on every M4 Mac. */
 #define DCP_M4_RPC_SIZE		0xc0000U
 #define DCP_M4_STREAM_SIZE	0x8000U
 #define DCP_M4_ALIGNMENT		64U

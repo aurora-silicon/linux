@@ -7,9 +7,12 @@
  * Copyright (C) 2014 Endless Mobile
  */
 
+#include <linux/soc/apple/j613-display.h>
 #include <linux/aperture.h>
 #include <linux/component.h>
+#include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/dma-fence.h>
 #include <linux/dma-mapping.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
@@ -18,6 +21,7 @@
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
+#include <linux/ratelimit.h>
 #include <linux/workqueue.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/display.h>
@@ -44,6 +48,7 @@
 #include <drm/drm_vblank.h>
 #include <drm/drm_fixed.h>
 #include <linux/pm.h>
+#include <linux/suspend.h>
 
 #include "apple_boot_display.h"
 #include "apple_resume.h"
@@ -64,20 +69,30 @@ struct apple_drm_private {
 	 * the screen, the DRM device stays unregistered and its DCPs running.
 	 */
 	bool aborted;
+	/* This suspend found every firmware already stopped. */
+	bool s2r_skipped;
+	/* A dark wake left the outputs as the suspend did, for the next resume. */
+	bool dark_held;
+	struct notifier_block pm_nb;
 };
+
+static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data);
 
 /* Component readiness is later than platform probe/bind. */
 static DEFINE_MUTEX(apple_g15_display_lock);
 static struct device *apple_t6030_display;
 static struct device *apple_t6031_display;
+static struct device *apple_t8132_display;
 
-/* The publication slot of a G15 SoC's internal display subsystem, or NULL. */
+/* The publication slot of a G15/G16 SoC's internal display subsystem, or NULL. */
 static struct device **apple_g15_display_slot(struct device *dev)
 {
 	if (of_device_is_compatible(dev->of_node, "apple,t6030-display-subsystem"))
 		return &apple_t6030_display;
 	if (of_device_is_compatible(dev->of_node, "apple,t6031-display-subsystem"))
 		return &apple_t6031_display;
+	if (of_device_is_compatible(dev->of_node, "apple,t8132-display-subsystem"))
+		return &apple_t8132_display;
 	return NULL;
 }
 
@@ -110,7 +125,7 @@ static void apple_g15_display_withdraw(struct device *dev)
 	put_device(old);
 }
 
-/* Initial G15 firmware startup must follow successful native display setup.
+/* Initial G15/G16 firmware startup must follow successful native display setup.
  * The component's device lock does not serialize component bind/unbind, so
  * publish separately. This lock protects only publication and a device link;
  * no display calls or firmware RPC run while it is held.
@@ -144,6 +159,13 @@ int apple_drm_t6031_link_device(struct device *consumer)
 }
 EXPORT_SYMBOL_GPL(apple_drm_t6031_link_device);
 
+int apple_drm_t8132_link_device(struct device *consumer)
+{
+	return apple_g15_link_device(consumer, "apple,t8132", "apple,agx-t8132",
+				     &apple_t8132_display);
+}
+EXPORT_SYMBOL_GPL(apple_drm_t8132_link_device);
+
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 
 #define DART_PAGE_SIZE 16384
@@ -170,11 +192,12 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 		if (t8132_ext_crtc(crtc))
 			continue;
 		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P ||
+		    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 			/*
-			 * H17P applies the stored fourth byte as straight alpha,
-			 * the H17G (M5) profile too: an XRGB console with X = 0
-			 * stays black. ARGB makes fbcon write it opaque.
+			 * H17P and firmware 27 apply the stored fourth byte as
+			 * straight alpha: an XRGB console with X = 0 stays black.
+			 * ARGB makes fbcon write it opaque.
 			 */
 			sizes->surface_bpp = 32;
 			sizes->surface_depth = 32;
@@ -371,6 +394,8 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	}
 	if (crtc_state->active &&
 	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
+		/* The HPD of the link dcp_poweron() reconnects precedes our mode set. */
+		WRITE_ONCE(dcp->typec_enable_pending, true);
 		dcp_poweron(apple_crtc->dcp);
 		crtc_state->color_mgmt_changed = true;
 	} else if (crtc_state->active && drm_atomic_crtc_needs_modeset(crtc_state)) {
@@ -379,9 +404,14 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	}
 	if (crtc_state->active) {
 		ret = dcp_crtc_atomic_modeset(crtc, commit);
-		if (ret)
+		if (ret) {
+			if (dcp_is_ext26(dcp))
+				goto failed;
 			dcp_drm_crtc_error(apple_crtc, crtc_state, ret);
+		}
 	}
+	/* The mode set of the enable has run: a sink still without one has a bad link. */
+	WRITE_ONCE(dcp->typec_enable_pending, false);
 	dcp_typec_follow_done(locked);
 	return;
 
@@ -392,6 +422,7 @@ failed:
 	dev_err(dcp->dev, "CRTC route unavailable (%d); modeset deferred\n", ret);
 	/* Flush completes any pending flip without issuing a firmware swap. */
 	schedule_work(&dcp->vblank_wq);
+	WRITE_ONCE(dcp->typec_enable_pending, false);
 	if (dcp->connector)
 		dcp_route_failure_notify(dcp->connector);
 	dcp_typec_follow_done(locked);
@@ -552,12 +583,206 @@ static void apple_atomic_state_free(struct drm_atomic_commit *state)
 	kfree(to_apple_atomic_state(state));
 }
 
+/*
+ * A plane's in-fence (its buffer's implicit write fence, or the compositor's
+ * IN_FENCE_FD) is waited for at most this long per commit. The helpers wait
+ * for it without a timeout: a GPU fence that never signals, after a GPU
+ * recovery for example, leaves the commit worker asleep for good. No later
+ * frame reaches the display, the commit's flip event never comes, and every
+ * later nonblocking commit fails with -EBUSY. One second is many frames even
+ * at the panel's slowest refresh; past it the buffer is scanned out as it is,
+ * so a GPU bug costs a stale or torn frame instead of the panel.
+ */
+#define APPLE_PLANE_FENCE_TIMEOUT_MS	1000
+
+static void apple_warn_fence_timeout(struct drm_device *dev,
+				     struct drm_plane *plane,
+				     struct dma_fence *fence)
+{
+	static DEFINE_RATELIMIT_STATE(rs, 60 * HZ, 1);
+	const char __rcu *driver;
+	const char __rcu *timeline;
+
+	if (!__ratelimit(&rs))
+		return;
+	rcu_read_lock();
+	driver = dma_fence_driver_name(fence);
+	timeline = dma_fence_timeline_name(fence);
+	drm_warn(dev,
+		 "[PLANE:%d:%s] in-fence %s:%s seqno %llu not signalled after %u ms, scanning out without it\n",
+		 plane->base.id, plane->name, rcu_dereference(driver),
+		 rcu_dereference(timeline), fence->seqno,
+		 APPLE_PLANE_FENCE_TIMEOUT_MS);
+	rcu_read_unlock();
+}
+
+/* As the helpers do: the GPU may finish the frame sooner knowing the vblank. */
+static void apple_set_fence_deadline(struct drm_atomic_commit *state)
+{
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_plane_state *new_plane_state;
+	struct drm_plane *plane;
+	struct drm_crtc *crtc;
+	ktime_t vbltime = 0;
+	int i;
+
+	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
+		ktime_t v;
+
+		if (drm_atomic_crtc_needs_modeset(new_crtc_state) ||
+		    !new_crtc_state->active ||
+		    drm_crtc_next_vblank_start(crtc, &v))
+			continue;
+		if (!vbltime || ktime_before(v, vbltime))
+			vbltime = v;
+	}
+	if (!vbltime)
+		return;
+	for_each_new_plane_in_state(state, plane, new_plane_state, i)
+		if (new_plane_state->fence)
+			dma_fence_set_deadline(new_plane_state->fence, vbltime);
+}
+
+/*
+ * drm_atomic_helper_wait_for_fences() with one bound for all of the commit's
+ * planes (APPLE_PLANE_FENCE_TIMEOUT_MS). A fence that does not signal in time
+ * is dropped. Before the swap (blocking commits) the wait is interruptible,
+ * as the helper's is.
+ */
+static int apple_wait_for_fences(struct drm_device *dev,
+				 struct drm_atomic_commit *state,
+				 bool pre_swap)
+{
+	unsigned long deadline =
+		jiffies + msecs_to_jiffies(APPLE_PLANE_FENCE_TIMEOUT_MS);
+	struct drm_plane_state *new_plane_state;
+	struct drm_plane *plane;
+	int i;
+
+	apple_set_fence_deadline(state);
+
+	for_each_new_plane_in_state(state, plane, new_plane_state, i) {
+		struct dma_fence *fence = new_plane_state->fence;
+		long left, ret;
+
+		if (!fence)
+			continue;
+
+		WARN_ON(!new_plane_state->fb);
+
+		left = max_t(long, (long)(deadline - jiffies), 0);
+		ret = dma_fence_wait_timeout(fence, pre_swap, left);
+		if (ret < 0)
+			return ret;
+		if (!ret)
+			apple_warn_fence_timeout(dev, plane, fence);
+
+		dma_fence_put(fence);
+		new_plane_state->fence = NULL;
+	}
+
+	return 0;
+}
+
+/*
+ * A flip DCP did not complete within the helper's 10 s
+ * (drm_atomic_helper_wait_for_flip_done() gave up) leaves its event pending.
+ * A compositor waits for that event before it commits again, so send it now,
+ * with -ETIMEDOUT on its out-fence, and the next commit can go ahead. A swap
+ * completion that still comes later finds no event.
+ */
+static void apple_fail_lost_flips(struct drm_atomic_commit *state)
+{
+	for (int i = 0; i < state->dev->mode_config.num_crtc; i++) {
+		struct drm_crtc_commit *commit = state->crtcs[i].commit;
+		struct drm_crtc *crtc = state->crtcs[i].ptr;
+
+		if (!crtc || !commit || t8132_ext_crtc(crtc) ||
+		    completion_done(&commit->flip_done))
+			continue;
+		dcp_drm_crtc_flip_lost(to_apple_crtc(crtc), &commit->flip_done,
+				       -ETIMEDOUT);
+	}
+}
+
+static void apple_atomic_commit_tail(struct drm_atomic_commit *state);
+
+/* The helper's commit_tail() with the bounded fence wait. */
+static void apple_commit_tail(struct drm_atomic_commit *state)
+{
+	apple_wait_for_fences(state->dev, state, false);
+	drm_atomic_helper_wait_for_dependencies(state);
+	apple_atomic_commit_tail(state);
+	drm_atomic_helper_commit_cleanup_done(state);
+	drm_atomic_commit_put(state);
+}
+
+static void apple_commit_work(struct work_struct *work)
+{
+	apple_commit_tail(container_of(work, struct drm_atomic_commit,
+				       commit_work));
+}
+
+/*
+ * drm_atomic_helper_commit() with apple_wait_for_fences() in place of the
+ * helper's unbounded wait. The driver keeps no self-refresh state, so the
+ * helper's self-refresh accounting is left out.
+ */
+static int apple_atomic_commit(struct drm_device *dev,
+			       struct drm_atomic_commit *state, bool nonblock)
+{
+	int ret;
+
+	if (state->async_update) {
+		ret = drm_atomic_helper_prepare_planes(dev, state);
+		if (ret)
+			return ret;
+
+		drm_atomic_helper_async_commit(dev, state);
+		drm_atomic_helper_unprepare_planes(dev, state);
+
+		return 0;
+	}
+
+	ret = drm_atomic_helper_setup_commit(state, nonblock);
+	if (ret)
+		return ret;
+
+	INIT_WORK(&state->commit_work, apple_commit_work);
+
+	ret = drm_atomic_helper_prepare_planes(dev, state);
+	if (ret)
+		return ret;
+
+	if (!nonblock) {
+		ret = apple_wait_for_fences(dev, state, true);
+		if (ret)
+			goto err;
+	}
+
+	ret = drm_atomic_helper_swap_state(state, true);
+	if (ret)
+		goto err;
+
+	drm_atomic_commit_get(state);
+	if (nonblock)
+		queue_work(system_dfl_wq, &state->commit_work);
+	else
+		apple_commit_tail(state);
+
+	return 0;
+
+err:
+	drm_atomic_helper_unprepare_planes(dev, state);
+	return ret;
+}
+
 static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.atomic_state_alloc	= apple_atomic_state_alloc,
 	.atomic_state_clear	= apple_atomic_state_clear,
 	.atomic_state_free	= apple_atomic_state_free,
 	.atomic_check		= drm_atomic_helper_check,
-	.atomic_commit		= drm_atomic_helper_commit,
+	.atomic_commit		= apple_atomic_commit,
 	.fb_create		= drm_gem_fb_create,
 };
 
@@ -590,9 +815,11 @@ static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
 	drm_atomic_helper_fake_vblank(state);
 	drm_atomic_helper_commit_hw_done(state);
 	drm_atomic_helper_wait_for_flip_done(state->dev, state);
+	apple_fail_lost_flips(state);
 	drm_atomic_helper_cleanup_planes(state->dev, state);
 }
 
+/* apple_atomic_commit() calls the tail itself; this serves other helper users. */
 static const struct drm_mode_config_helper_funcs apple_mode_config_helpers = {
 	.atomic_commit_tail	= apple_atomic_commit_tail,
 };
@@ -607,10 +834,10 @@ static void appledrm_connector_cleanup(struct drm_connector *connector)
 	cancel_work_sync(&apple_connector->bl_commit_wq);
 	mutex_destroy(&apple_connector->bl_lock);
 	drm_connector_cleanup(connector);
-	kfree(apple_connector->color_elements.data);
-	kfree(apple_connector->timing_elements.data);
-	kfree(apple_connector->display_attributes.data);
-	kfree(apple_connector->transport.data);
+	kvfree(apple_connector->color_elements.data);
+	kvfree(apple_connector->timing_elements.data);
+	kvfree(apple_connector->display_attributes.data);
+	kvfree(apple_connector->transport.data);
 	kfree(apple_connector);
 }
 
@@ -708,6 +935,16 @@ static int apple_connector_atomic_check(struct drm_connector *conn,
 	    apple_connector_eotf(old) == apple_connector_eotf(new) &&
 	    to_apple_connector(conn)->dcp &&
 	    dcp_hdr_metadata_live(to_apple_connector(conn)->dcp))
+		return 0;
+	/*
+	 * A panel that shows PQ as EDR keeps its SDR link: SDR and PQ switch
+	 * with the next swap, so a compositor turning HDR on at startup does
+	 * not blank it.  Other EOTFs still go through the mode set's check.
+	 */
+	if (old->crtc == new->crtc && to_apple_connector(conn)->dcp &&
+	    dcp_edr_live(to_apple_connector(conn)->dcp) &&
+	    (apple_connector_eotf(new) == HDMI_EOTF_TRADITIONAL_GAMMA_SDR ||
+	     apple_connector_eotf(new) == HDMI_EOTF_SMPTE_ST2084))
 		return 0;
 	crtc_state->mode_changed = true;
 	return 0;
@@ -821,7 +1058,7 @@ static int apple_connector_create(struct drm_device *drm,
 	if (ret)
 		goto err_cleanup;
 	ret = apple_connector_attach_hdr(&connector->base,
-					 dcp_fw_compat_is_desktop(dcp));
+					 dcp_fw_compat_panel_edr(dcp));
 	if (ret)
 		goto err_cleanup;
 
@@ -915,13 +1152,25 @@ static int apple_probe_per_dcp(struct device *dev,
 			interchange = supports_interchange &&
 				      (zpos <= 1 || surf != top_surf);
 
+			/*
+			 * The T8142 runs macOS 27.0's DCP firmware as firmware
+			 * 27, outside the H17G profile, and blends XRGB's X
+			 * byte as alpha all the same (GPU-rendered alacritty
+			 * showed wrong colours on the panel).
+			 */
+			bool xrgb_is_alpha =
+				dcp_data->hw.iomfb_method_profile ==
+					DCP_IOMFB_METHODS_H17G ||
+				(dcp_data->fw_compat == DCP_FIRMWARE_V_27_0 &&
+				 of_device_is_compatible(dcp_data->dev->of_node,
+							 "apple,t8142-dcp"));
+
 			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 							supports_l10r,
 							supports_xrgb2101010,
-							dcp_data->hw.iomfb_method_profile ==
-								DCP_IOMFB_METHODS_H17G,
+							xrgb_is_alpha,
 							plane_type, interchange,
-							supports_premultiplied);
+							supports_premultiplied, dcp_is_ext26(dcp_data));
 		}
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);
@@ -992,32 +1241,69 @@ static int apple_probe_per_dcp(struct device *dev,
  * Create a connector per physical Type-C port and attach it to every
  * pipeline that can drive it. The M2 Pro/Max laptops append a second
  * connector per port for a dock's second DP tunnel, preserving primary
- * connector names.
+ * connector names. T6050 instead exposes one connector per port/pipeline
+ * pair: tunnel allocation chooses which connector is connected, without
+ * changing any encoder's advertised CRTC mask after registration. Pairs
+ * whose route carries DP tunnels only come last, so adding such a route
+ * does not renumber the connectors that existed before it.
  */
 static int apple_probe_typec_ports(struct drm_device *drm,
 				   struct platform_device **dcp,
 				   u32 *crtc_mask, int num_dcp)
 {
-	unsigned int idx, nr_ports = dcp_typec_nr_ports();
+	unsigned int n, nr_ports = dcp_typec_nr_ports();
+	bool fixed = dcp_typec_fixed_crtcs();
+	unsigned int slots = fixed ? num_dcp : (dcp_typec_dual_stream() ? 2 : 1);
+	/* T6050 creates its tunnel-only port/pipeline pairs in a second pass. */
+	unsigned int passes = fixed ? 2 : 1;
 	int i, ret;
 
 	/* Keep the existing physical-port connector numbers stable. On the
 	 * M2 Pro/Max laptops, append one more connector per port for a second
 	 * USB4 DP tunnel.
 	 */
-	for (idx = 0; idx < nr_ports * (dcp_typec_dual_stream() ? 2 : 1);
-	     idx++) {
+	for (n = 0; n < passes * nr_ports * slots; n++) {
+		unsigned int pass = n / (nr_ports * slots);
+		unsigned int idx = n % (nr_ports * slots);
 		struct apple_connector *connector;
 		struct apple_encoder *enc;
+		struct platform_device *pipeline = fixed ? dcp[idx / nr_ports] : NULL;
 		unsigned int port_idx = idx % nr_ports;
 		bool secondary = idx >= nr_ports;
 		u32 mask = 0;
 
 		/* Only a failed T8122 dcpext could drive it: no connector. */
 		if (dcp_typec_port_unusable(port_idx)) {
-			drm_warn(drm, "Type-C port %u: its display pipeline is unusable\n",
-				 port_idx);
+			if (!pass)
+				drm_warn(drm, "Type-C port %u: its display pipeline is unusable\n",
+					 port_idx);
 			continue;
+		}
+
+		if (fixed) {
+			if (!dcp_typec_port_has_candidate(port_idx, pipeline))
+				continue;
+			/* T6050: tunnel-only pairs in the second pass */
+			if (dcp_typec_port_tunnel_only(port_idx, pipeline) != pass)
+				continue;
+			mask = crtc_mask[idx / nr_ports];
+			if (!mask)
+				continue;
+		} else {
+			for (i = 0; i < num_dcp; i++) {
+				if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
+					continue;
+				/* Ordered dual-stream docks reserve the Type-C-only pipe. */
+				mask = dcp_fabric_port_crtc_mask(secondary,
+								 dcp_typec_ordered_dual_stream(),
+							       dcp_is_typec_only(dcp[i]),
+							       mask, crtc_mask[i]);
+			}
+			if (!mask) {
+				drm_warn(drm, "Type-C port %u has no display pipeline\n",
+					 port_idx);
+				return -ENODEV;
+			}
 		}
 
 		connector = kzalloc_obj(*connector);
@@ -1043,40 +1329,26 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		ret = drm_connector_attach_vrr_capable_property(&connector->base);
 		if (ret)
 			return ret;
-		ret = apple_connector_attach_hdr(&connector->base, false);
-		if (ret)
-			return ret;
+		/*
+		 * T8122's retained external scanout accepts only 8-bit RGB.
+		 * Do not advertise the BT.2020/PQ output contract until this
+		 * route has a qualified 10-bit primary-plane format. The sink
+		 * EDID remains intact; its capabilities are not the pipeline's.
+		 */
+		if (!of_machine_is_compatible("apple,t8122")) {
+			ret = apple_connector_attach_hdr(&connector->base, false);
+			if (ret)
+				return ret;
+		}
 
 		connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 		connector->connected = false;
 		connector->dcp = NULL;
 
-		for (i = 0; i < num_dcp; i++) {
-			if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
-				continue;
-			/*
-			 * A dock's second stream (DPIN1) always runs on the
-			 * lowest-indexed Type-C-only pipeline (dcpext1). Fix the
-			 * connector to it: compositors read possible_crtcs once
-			 * and would otherwise pair it with a pipeline the stream
-			 * can never be routed to. T6030 instead narrows both
-			 * connectors to the native processor holding their route.
-			 */
-			mask = dcp_fabric_port_crtc_mask(secondary,
-						       dcp_typec_ordered_dual_stream(),
-						       dcp_is_typec_only(dcp[i]),
-						       mask, crtc_mask[i]);
-		}
-
-		if (!mask) {
-			drm_warn(drm, "Type-C port %u has no display pipeline\n",
-					 port_idx);
-			return -ENODEV;
-		}
-
 		/*
-		 * One encoder for the port, spanning every pipeline that can
-		 * drive it.  Attaching one encoder per pipeline would describe
+		 * One encoder per connector, covering its allowed pipelines.
+		 * T6050 connectors each cover exactly one. Attaching several
+		 * encoders to the same connector would describe
 		 * the same hardware, but userspace takes the CRTCs a connector
 		 * can use to be what all of its encoders have in common, and
 		 * single-pipeline encoders have nothing in common -- the port
@@ -1094,7 +1366,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		connector->port_encoder = &enc->base;
 		connector->candidate_crtcs = mask;
 
-		dcp_typec_port_set_connector(port_idx, secondary, connector);
+		dcp_typec_port_set_connector(port_idx, secondary, connector, pipeline);
 	}
 
 	return 0;
@@ -1465,8 +1737,13 @@ static int apple_drm_init(struct device *dev)
 	 * the boot framebuffer owns the screen; past the eviction there is no
 	 * way back.  On refusal leave the DCP running (its shutdown sequence
 	 * can crash it and blank the panel), pin the module and keep the boot
-	 * framebuffer.
+	 * framebuffer. The pin is taken before the trials, while a refusal can
+	 * still unwind; it is given back if every trial passes.
 	 */
+	if (!try_module_get(THIS_MODULE)) {
+		ret = -ENODEV;
+		goto err_unbind;
+	}
 	drm_for_each_crtc(crtc, &apple->drm) {
 		const char *reason = "none";
 
@@ -1480,9 +1757,9 @@ static int apple_drm_init(struct device *dev)
 		/*
 		 * The DCPs keep running and keep their pipelines: pin the
 		 * module and the DRM device their CRTCs and connectors live
-		 * in, and keep them out of shutdown and sleep.
+		 * in, and keep them out of shutdown and sleep. The module
+		 * reference taken before the trials is kept.
 		 */
-		__module_get(THIS_MODULE);
 		drm_dev_get(&apple->drm);
 		drm_for_each_crtc(crtc, &apple->drm)
 			if (!t8132_ext_crtc(crtc))
@@ -1492,6 +1769,7 @@ static int apple_drm_init(struct device *dev)
 		t8132_ext_drm_fini(&apple->drm);
 		return 0;
 	}
+	module_put(THIS_MODULE);
 
 	if (retained_modeset)
 		drm_modeset_lock_all(&apple->drm);
@@ -1540,6 +1818,9 @@ static int apple_drm_init(struct device *dev)
 		goto err_unbind;
 	}
 
+	apple->pm_nb.notifier_call = apple_drm_pm_notify;
+	register_pm_notifier(&apple->pm_nb);
+
 	return 0;
 
 err_unlock:
@@ -1562,6 +1843,8 @@ static void apple_drm_uninit(struct device *dev)
 	/* An aborted takeover leaves its DCPs running until the reboot. */
 	if (apple->aborted)
 		return;
+
+	unregister_pm_notifier(&apple->pm_nb);
 
 	/* Before anything of the DRM device is torn down. */
 	t8132_ext_drm_fini(&apple->drm);
@@ -1681,12 +1964,38 @@ static const struct of_device_id of_match[] = {
 MODULE_DEVICE_TABLE(of, of_match);
 
 #ifdef CONFIG_PM_SLEEP
+/*
+ * Left stopped by a suspend that never reached the commit. Nothing can commit to
+ * them, and a refused sleep has to be able to try again.
+ */
+static bool apple_drm_firmware_stopped(struct apple_drm_private *apple)
+{
+	struct drm_crtc *crtc;
+	bool stopped = false;
+
+	drm_for_each_crtc(crtc, &apple->drm) {
+		if (t8132_ext_crtc(crtc) ||
+		    !dcp_s2r_firmware_stopped(to_apple_crtc(crtc)->dcp))
+			return false;
+		stopped = true;
+	}
+
+	return stopped;
+}
+
 static int apple_platform_suspend(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	if (apple && !apple->aborted)
-		return drm_mode_config_helper_suspend(&apple->drm);
+	/* Still suspended from before a dark wake. */
+	if (apple && apple->dark_held)
+		return 0;
+
+	if (apple && !apple->aborted) {
+		apple->s2r_skipped = apple_drm_firmware_stopped(apple);
+		if (!apple->s2r_skipped)
+			return drm_mode_config_helper_suspend(&apple->drm);
+	}
 
 	return 0;
 }
@@ -1708,29 +2017,71 @@ static bool apple_drm_hold_resume_events(struct apple_drm_private *apple, u32 cr
 	return held;
 }
 
+static void apple_drm_resume_outputs(struct apple_drm_private *apple)
+{
+	u32 dropped = 0;
+
+	apple->dark_held = false;
+	if (apple->drm.mode_config.suspend_state)
+		dropped = apple_drm_drop_stale_crtcs(apple->drm.mode_config.suspend_state);
+	/* Have userspace set the mode of a CRTC resumed disabled again. */
+	if (dropped && apple_drm_hold_resume_events(apple, dropped))
+		dropped = 0;
+	drm_mode_config_helper_resume(&apple->drm);
+	if (dropped)
+		drm_kms_helper_hotplug_event(&apple->drm);
+}
+
 static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
-	u32 dropped = 0;
 
-	if (apple && !apple->aborted) {
-		if (apple->drm.mode_config.suspend_state)
-			dropped = apple_drm_drop_stale_crtcs(apple->drm.mode_config.suspend_state);
-		/* Have userspace set the mode of a CRTC resumed disabled again. */
-		if (dropped && apple_drm_hold_resume_events(apple, dropped))
-			dropped = 0;
-		drm_mode_config_helper_resume(&apple->drm);
-		if (dropped)
-			drm_kms_helper_hotplug_event(&apple->drm);
+	if (!apple || apple->aborted || apple->s2r_skipped)
+		return 0;
+
+	/* A dark wake goes back to sleep with user space frozen: nothing is lit for it. */
+	if (pm_dark_wake()) {
+		apple->dark_held = true;
+		dev_info(dev, "dark wake: outputs stay off\n");
+		return 0;
 	}
 
+	apple_drm_resume_outputs(apple);
 	return 0;
+}
+
+/* The suspend after a dark wake failed before it suspended this device. */
+static void apple_platform_complete(struct device *dev)
+{
+	struct apple_drm_private *apple = dev_get_drvdata(dev);
+
+	if (apple && apple->dark_held && !pm_dark_wake())
+		apple_drm_resume_outputs(apple);
+}
+
+/* It failed before ->prepare() reached this device, so ->complete() didn't run either. */
+static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_drm_private *apple = container_of(nb, struct apple_drm_private, pm_nb);
+
+	if (action == PM_POST_SUSPEND && apple->dark_held) {
+		dev_warn(apple->drm.dev, "dark wake over without a resume: outputs back now\n");
+		apple_drm_resume_outputs(apple);
+	}
+
+	return NOTIFY_DONE;
 }
 
 static const struct dev_pm_ops apple_platform_pm_ops = {
 	.suspend	= apple_platform_suspend,
 	.resume		= apple_platform_resume,
+	.complete	= apple_platform_complete,
 };
+#else
+static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	return NOTIFY_DONE;
+}
 #endif
 
 static struct platform_driver apple_platform_driver = {
@@ -1749,8 +2100,10 @@ static struct platform_driver apple_platform_driver = {
 static int __init appledrm_register(void)
 {
 	int ret;
-	if (drm_firmware_drivers_only())
+	if (drm_firmware_drivers_only()) {
+		apple_j613_display_fail();
 		return -ENODEV;
+	}
 
 	/* A refused experimental profile keeps the boot framebuffer available. */
 	ret = apple_j613_25g83_coldplug();
@@ -1759,8 +2112,10 @@ static int __init appledrm_register(void)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	ret = dcp_audio_register();
-	if (ret)
+	if (ret) {
+		apple_j613_display_fail();
 		return ret;
+	}
 #endif
 	ret = dcp_register();
 	if (ret)
@@ -1770,6 +2125,7 @@ static int __init appledrm_register(void)
 		return 0;
 	dcp_unregister();
 unregister_audio:
+	apple_j613_display_fail();
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	dcp_audio_unregister();
 #endif
@@ -1778,6 +2134,7 @@ unregister_audio:
 
 static void __exit appledrm_unregister(void)
 {
+	apple_j613_display_fail();
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	dcp_audio_unregister();
 #endif
@@ -1796,5 +2153,9 @@ MODULE_LICENSE("Dual MIT/GPL");
  * crossbar. Without this, initramfs generators leave it out, it loads only
  * from the root filesystem, and a DCP probe that waits past the deferred
  * probe timeout (an encrypted root's passphrase prompt) gives up its routes.
+ * The same holds for the routes' PHYs: on T6050 they are the combo PHYs of
+ * atc-t6050-dp, which appledrm does not otherwise depend on.
+ * DCP also asks for the battery temperature once while it starts (see
+ * dcp_pmu_temperature()), so have the SMC battery registered by then.
  */
-MODULE_SOFTDEP("pre: mux-apple-display-crossbar");
+MODULE_SOFTDEP("pre: mux-apple-display-crossbar atc-t6050-dp macsmc-power");

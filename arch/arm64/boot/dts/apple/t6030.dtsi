@@ -2141,12 +2141,7 @@
 			power-domains = <&ps_atc2_usb>;
 		};
 
-		/*
-		 * ATC3 has no USB-C connector; boards use it as a four-lane
-		 * DisplayPort PHY for the HDMI port. Only its core window is
-		 * described, so the PHY driver runs it DisplayPort-only and never
-		 * touches the USB2 or PIPE blocks.
-		 */
+		/* No USB-C port: a DisplayPort-only PHY for HDMI (core window only). */
 		atcphy3: phy@1303000000 {
 			compatible = "apple,t6030-atcphy", "apple,t8122-atcphy";
 			reg = <0x13 0x03000000 0x0 0x4c000>;
@@ -2177,3 +2172,19 @@
 #include "t6030-gpu.dtsi"
 #include "t6030-usb4.dtsi"
 #include "t6030-dcp.dtsi"
+
+#include "t6030-peripherals.dtsi"
+
+#include "t6030-peripheral-buses.dtsi"
+
+#include "t6030-coprocessors.dtsi"
+
+#include "t6030-misc-interfaces.dtsi"
+
+&smc_hwmon {
+	/* Not yet checked on hardware; absent firmware keys are skipped. */
+	apple,soc-die-keys = "Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D",
+			     "Tf0E", "Tf14", "Tf18", "Tf19", "Tf1A",
+			     "Tf24", "Tf25", "Tf2A", "Tf2B";
+	apple,thermal-pressure-key = "mTPL";
+};

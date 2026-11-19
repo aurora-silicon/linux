@@ -38,9 +38,39 @@ struct epic_cmd_info {
 	size_t rxlen, txlen;
 };
 
+enum dcp_firmware_version {
+	DCP_FIRMWARE_UNKNOWN,
+	DCP_FIRMWARE_V_27_0,
+};
+
+struct apple_dcp {
+	enum dcp_firmware_version fw_compat;
+};
+
 struct apple_dcp_afkep {
 	bool wire_v2;
+	struct apple_dcp *dcp;
 };
+
+/* Firmware 27's retained-DART fallback: record the call, return the verdict. */
+static int remote_calls, remote_ret = -EACCES;
+static u64 remote_dva;
+static size_t remote_size;
+static bool remote_to_remote, remote_copy;
+
+static int afk_v27_access_remote(struct apple_dcp_afkep *ep, u64 dva,
+				 void *buffer, size_t size, bool to_remote,
+				 bool copy)
+{
+	(void)ep;
+	(void)buffer;
+	remote_calls++;
+	remote_dva = dva;
+	remote_size = size;
+	remote_to_remote = to_remote;
+	remote_copy = copy;
+	return remote_ret;
+}
 
 struct apple_epic_service {
 	int lock;

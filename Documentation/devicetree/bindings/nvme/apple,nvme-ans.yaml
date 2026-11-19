@@ -14,6 +14,7 @@ properties:
     oneOf:
       - const: apple,t8015-nvme-ans2
       - const: apple,t6041-nvme-ans2
+      - const: apple,t6050-nvme-ans2
       - items:
           - enum:
               - apple,t6020-nvme-ans2
@@ -109,6 +110,12 @@ properties:
       adopts that RTKit session without renegotiating it. Shared firmware
       buffers must remain reserved and protected by the SART.
 
+  apple,sleep-wake-delay-ms:
+    description:
+      T6050. After a deep sleep, the time from the storage power being back
+      to the restart of the ANS2 co-processor. Set by the boot loader.
+      Without it the controller refuses the deep sleep.
+
 allOf:
   - if:
       properties:
@@ -116,6 +123,7 @@ allOf:
           not:
             contains:
               enum:
+                - apple,t6050-nvme-ans2
                 - apple,t8132-nvme-ans2
                 - apple,t8140-nvme-ans2
     then:
@@ -151,6 +159,7 @@ allOf:
           contains:
             enum:
               - apple,t6041-nvme-ans2
+              - apple,t6050-nvme-ans2
               - apple,t8132-nvme-ans2
               - apple,t8140-nvme-ans2
     then:
@@ -166,13 +175,32 @@ allOf:
         reg-names:
           maxItems: 2
 
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-nvme-ans2
+    then:
+      description:
+        On T6050 the boot loader leaves ANS running with the controller shut
+        down. Its power stays with the firmware and it is never reset through
+        PMGR, so the node names no power domain and no reset.
+      properties:
+        resets: false
+        power-domains: false
+        power-domain-names: false
+    else:
+      properties:
+        apple,sleep-wake-delay-ms: false
+      required:
+        - resets
+        - power-domains
+        - power-domain-names
+
 required:
   - compatible
   - reg
   - reg-names
-  - resets
-  - power-domains
-  - power-domain-names
   - mboxes
   - interrupts
   - apple,sart

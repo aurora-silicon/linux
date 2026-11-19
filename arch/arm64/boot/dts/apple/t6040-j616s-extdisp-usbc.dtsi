@@ -23,15 +23,10 @@
 };
 
 /*
- * DISPEXT1_SYS sits on FAB7_SOC (ADT pmgr device id2 134, pmgr_aux 0x488, parent
- * FAB6_SOC, off at boot), which t604x-pmgr.dtsi does not describe. m4.62 enabled
- * DISPEXT1_SYS without it and the first DCPEXT1 register access (its DART) reset
- * the SoC. DISPEXT0_SYS's parent FAB2_SOC is on anyway through ATC0..2_COMMON.
+ * DISPEXT1_SYS sits on FAB7_SOC (ADT pmgr id2 133, parent AFI as described
+ * in t6040-pmgr.dtsi, off at boot). m4.62 enabled DISPEXT1_SYS without it
+ * and the first DCPEXT1 register access (its DART) reset the SoC.
  */
-&ps_fab7_soc {
-	power-domains = <&ps_fab6_soc>;
-};
-
 &ps_dispext1_sys {
 	power-domains = <&ps_fab7_soc>, <&pmp_dispext1>;
 };

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * G16 (T8132, M4) helpers that have no Rust bindings: static inlines,
- * macros and THIS_MODULE. Built only with CONFIG_DRM_ASAHI_G16.
+ * G16 (T8132, M4) helpers that have no Rust bindings: static inlines
+ * and macros. The module pin is retain.c's. Built only with CONFIG_DRM_ASAHI_G16.
  */
 #include <linux/device.h>
 #include <linux/atomic.h>
 #include <linux/dma-map-ops.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/ioport.h>
 #include <linux/mm.h>
 #include <linux/mfd/syscon.h>
@@ -18,14 +19,15 @@
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/clpc.h>
+#include <linux/soc/apple/display.h>
 #include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/thermal.h>
 
 bool asahi_g16_board(void);
+int asahi_g16_display_prepare(struct device *dev);
 int asahi_g16_hold_power(struct device *dev);
-void asahi_g16_module_get(void);
 bool asahi_g16_ram_disjoint(u64 start, u64 size);
 void __iomem *asahi_g16_ioremap_wc(u64 start, size_t size);
 bool asahi_g16_dma_unsupported(struct device *dev);
@@ -40,11 +42,14 @@ struct asahi_g16_cooling {
 	struct device_node *pmp_node;
 	struct apple_pmp_cooling policy;
 	struct thermal_cooling_device *cdev;
+	/* The last reading from a sensor that was valid, and when. */
+	u64 valid_ns;
+	long valid_mc;
 };
 
 struct asahi_g16_cooling *asahi_g16_cooling_register(struct device *dev);
 void asahi_g16_cooling_unregister(struct asahi_g16_cooling *cooling);
-int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
+int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool idle,
 			    long *temperature, u32 *governor, u32 *power,
 			    u32 *backstop);
 int asahi_g16_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out);
@@ -130,8 +135,10 @@ void asahi_g16_cooling_unregister(struct asahi_g16_cooling *cooling)
 
 /* Serialized by the GPU owner. Provider lifetime and MMIO access stay with
  * PMP: this consumer owns no SRAM mapping and cannot restart its firmware.
+ * An idle GPU samples about twice a second and makes no heat, so with nothing
+ * in flight the last cool reading stands for as long as the sensors stay dark.
  */
-int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
+int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool idle,
 			    long *temperature, u32 *governor, u32 *power,
 			    u32 *backstop)
 {
@@ -139,6 +146,18 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
 
 	*temperature = 0;
 	ret = apple_pmp_telemetry_get_hotspot(cooling->pmp_node, temperature);
+	if (!ret) {
+		cooling->valid_ns = now;
+		cooling->valid_mc = *temperature;
+	} else if (ret == -ENODATA && cooling->valid_ns &&
+		   (idle || now - cooling->valid_ns < APPLE_PMP_GATED_HOLD_NS) &&
+		   cooling->valid_mc < APPLE_PMP_GATED_HOLD_MC) {
+		*temperature = cooling->valid_mc;
+		/* Idle makes no heat: the 2 s with work in flight start with the work. */
+		if (idle)
+			cooling->valid_ns = now;
+		ret = 0;
+	}
 	apple_pmp_cooling_sample(&cooling->policy, now, *temperature, ret);
 	*governor = atomic_read(&cooling->state);
 	*power = apple_pmp_gpu_power_state(cooling->pmp);
@@ -147,10 +166,69 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
 	return ret;
 }
 
+/*
+ * genpd never turned the GFX domain's TVM gate off, so a sleep that lost it goes
+ * unnoticed: the domain then doesn't come on. Enabled here if it's found clear.
+ */
+int asahi_g16_tvm_enable(struct device *dev);
+int asahi_g16_tvm_enable(struct device *dev)
+{
+	struct device_node *gfx, *tvm;
+	void __iomem *reg;
+	u32 val;
+	int ret = 0;
+
+	gfx = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (!gfx)
+		return -EINVAL;
+	tvm = of_parse_phandle(gfx, "power-domains", 0);
+	of_node_put(gfx);
+	if (!tvm)
+		return -EINVAL;
+	reg = of_iomap(tvm, 0);
+	of_node_put(tvm);
+	if (!reg)
+		return -ENOMEM;
+	val = readl(reg);
+	dev_dbg(dev, "GFX TVM gate after the sleep: %#x\n", val);
+	if (!(val & BIT(0))) {
+		writel(val | BIT(0), reg);
+		ret = readl_poll_timeout(reg, val, val & BIT(0), 1, 1000);
+	}
+	iounmap(reg);
+
+	return ret;
+}
+
 /* Whether this is a qualified J713/T8132 board. */
 bool asahi_g16_board(void)
 {
 	return apple_pmp_j713_board();
+}
+
+/*
+ * The first firmware start follows the native display the boot loader handed
+ * over, as on J713 bring-up: defer until drm/apple has published it. A boot
+ * without one (no internal panel, or none qualified) starts on the boot
+ * framebuffer.
+ */
+int asahi_g16_display_prepare(struct device *dev)
+{
+	struct device_node *np;
+	bool handed_over;
+	int ret;
+
+	np = of_find_compatible_node(NULL, NULL, "apple,t8132-display-subsystem");
+	handed_over = np && of_device_is_available(np);
+	of_node_put(np);
+	if (!handed_over) {
+		dev_info_once(dev, "G16: no native display this boot; starting on the boot framebuffer\n");
+		return 0;
+	}
+	ret = apple_drm_t8132_link_device(dev);
+	if (ret == -EPROBE_DEFER)
+		dev_info_once(dev, "G16: waiting for the T8132 native display to register\n");
+	return ret;
 }
 
 /*
@@ -167,12 +245,6 @@ int asahi_g16_hold_power(struct device *dev)
 		return ret;
 	pm_runtime_enable(dev);
 	return dev->pm_domain ? 0 : -EINVAL;
-}
-
-/* Pin this module until reboot. */
-void asahi_g16_module_get(void)
-{
-	__module_get(THIS_MODULE);
 }
 
 /* The range is disjoint from System RAM (ADT region admission). */

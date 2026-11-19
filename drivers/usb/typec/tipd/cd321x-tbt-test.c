@@ -367,6 +367,45 @@ static void cd321x_tbt_router_binds_after_removal_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, cd->tbt_notifier_registered);
 }
 
+/* A router that unbinds and binds again is taken again; the cable is reread. */
+static void cd321x_tbt_router_rebinds_test(struct kunit *test)
+{
+	struct cd321x *cd = cd321x_tbt_test_late_port(test);
+	struct typec_thunderbolt_switch_desc desc = {
+		.fwnode = software_node_fwnode(&cd321x_test_router),
+		.set = cd321x_tbt_test_set,
+		.name = "router-first",
+	};
+	struct typec_thunderbolt_switch_dev *sw_dev;
+	struct device *router;
+	int ret;
+
+	router = kunit_device_register(test, "router-first");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, router);
+	sw_dev = typec_thunderbolt_switch_register(router, &desc);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, sw_dev);
+
+	ret = cd321x_tbt_watch_late(cd, software_node_fwnode(&cd321x_test_connector));
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	flush_work(&cd->tbt_attach_work);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, cd->tbt_switch);
+	KUNIT_EXPECT_TRUE(test, typec_thunderbolt_switch_is_live(cd->tbt_switch));
+	KUNIT_EXPECT_EQ(test, atomic_read(&cd->restore_event), 1);
+	atomic_set(&cd->restore_event, 0);
+
+	typec_thunderbolt_switch_unregister(sw_dev);
+	KUNIT_EXPECT_FALSE(test, typec_thunderbolt_switch_is_live(cd->tbt_switch));
+
+	cd321x_tbt_test_add_router(test, &cd321x_test_router);
+	flush_work(&cd->tbt_attach_work);
+	KUNIT_EXPECT_TRUE(test, typec_thunderbolt_switch_is_live(cd->tbt_switch));
+	KUNIT_EXPECT_TRUE(test, cd->tbt_notifier_registered);
+	KUNIT_EXPECT_EQ(test, atomic_read(&cd->restore_event), 1);
+
+	cd321x_tbt_test_release_port(cd);
+	KUNIT_EXPECT_FALSE(test, cd->tbt_notifier_registered);
+}
+
 static struct kunit_case cd321x_tbt_cases[] = {
 	KUNIT_CASE(cd321x_tbt_no_router_test),
 	KUNIT_CASE(cd321x_tbt_router_bound_test),
@@ -376,6 +415,7 @@ static struct kunit_case cd321x_tbt_cases[] = {
 	KUNIT_CASE(cd321x_tbt_router_bound_before_watch_test),
 	KUNIT_CASE(cd321x_tbt_other_router_binds_test),
 	KUNIT_CASE(cd321x_tbt_router_binds_after_removal_test),
+	KUNIT_CASE(cd321x_tbt_router_rebinds_test),
 	{}
 };
 

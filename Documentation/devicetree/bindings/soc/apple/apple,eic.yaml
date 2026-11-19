@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,eic.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple secure peripheral controller
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Secure peripheral controller register apertures. These are absolute
+  secure-side aliases published separately from the ordinary AP devices.
+  The firmware retains ownership; an AP driver must establish an access
+  contract before touching these resources.
+
+properties:
+  compatible:
+    items:
+      - const: apple,t8140-eic
+      - const: apple,eic
+
+  reg:
+    minItems: 6
+    maxItems: 6
+
+  reg-names:
+    items:
+      - const: ps
+      - const: wd-isp
+      - const: gpio
+      - const: fpwm
+      - const: gltb
+      - const: wd-e
+
+required:
+  - compatible
+  - reg
+  - reg-names
+
+additionalProperties: false

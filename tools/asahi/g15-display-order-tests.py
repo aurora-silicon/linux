@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""Run the actual G15 native-display start-order bodies on host models.
+"""Run the actual G15/G16 native-display start-order bodies on host models.
 
-The publication slots, the shared link helper and both SoC wrappers are taken
-from drivers/gpu/drm/apple/apple_drv.c, the T6031 glue from g15/glue.c and
-admit() from g15/boot.rs, unchanged. OF lookups, device references, links and
+The publication slots, the shared link helper and the SoC wrappers are taken
+from drivers/gpu/drm/apple/apple_drv.c, the T6031 glue from g15/glue.c, the
+T8132 glue from g16/glue.c and admit() from g15/boot.rs, unchanged. OF lookups, device references, links and
 the admission steps are host models; no device or firmware is touched. Each
 mutant must build and fail an intended assertion.
 """
@@ -19,6 +19,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 APPLE = "drivers/gpu/drm/apple/apple_drv.c"
 GLUE = "drivers/gpu/drm/asahi/g15/glue.c"
+GLUE16 = "drivers/gpu/drm/asahi/g16/glue.c"
 BOOT = "drivers/gpu/drm/asahi/g15/boot.rs"
 MODULE = "drivers/gpu/drm/asahi/g15/mod.rs"
 
@@ -36,11 +37,13 @@ def item(text, marker):
 def c_source(root):
     apple = (root / APPLE).read_text()
     glue = (root / GLUE).read_text()
+    glue16 = (root / GLUE16).read_text()
     state = [line for line in apple.splitlines()
              if line in ("static DEFINE_MUTEX(apple_g15_display_lock);",
                          "static struct device *apple_t6030_display;",
-                         "static struct device *apple_t6031_display;")]
-    assert len(state) == 3, f"publication state not found: {state}"
+                         "static struct device *apple_t6031_display;",
+                         "static struct device *apple_t8132_display;")]
+    assert len(state) == 4, f"publication state not found: {state}"
     bodies = [item(apple, marker) for marker in (
         "\nstatic struct device **apple_g15_display_slot(struct device *dev)\n{",
         "\nstatic int apple_g15_display_publish(struct device *dev)\n{",
@@ -48,8 +51,10 @@ def c_source(root):
         "\nstatic int apple_g15_link_device(",
         "\nint apple_drm_t6030_link_device(struct device *consumer)\n{",
         "\nint apple_drm_t6031_link_device(struct device *consumer)\n{",
+        "\nint apple_drm_t8132_link_device(struct device *consumer)\n{",
     )]
     bodies.append(item(glue, "\nint asahi_g15_display_prepare(struct device *dev)\n{"))
+    bodies.append(item(glue16, "\nint asahi_g16_display_prepare(struct device *dev)\n{"))
     return "\n".join(state) + "\n\n" + "\n\n".join(bodies) + "\n"
 
 
@@ -126,11 +131,14 @@ static const char *scenario;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", scenario, __LINE__, #c); exit(1); } } while (0)
 
 static struct device_node gpu31 = { "apple,agx-t6031", true }, gpu30 = { "apple,agx-t6030", true };
+static struct device_node gpu8132 = { "apple,agx-t8132", true };
+static struct device_node disp8132 = { "apple,t8132-display-subsystem", false };
 static struct device_node disp31 = { "apple,t6031-display-subsystem", false };
 static struct device_node disp30 = { "apple,t6030-display-subsystem", true };
 static struct device_node other = { "apple,display-subsystem", true };
 static struct device g31 = { &gpu31 }, g30 = { &gpu30 }, none = { NULL };
 static struct device d31 = { &disp31 }, d31b = { &disp31 }, d30 = { &disp30 }, dother = { &other };
+static struct device g8132 = { &gpu8132 }, d8132 = { &disp8132 };
 
 static void machine(const char *soc, const char *board)
 {
@@ -146,6 +154,8 @@ static void clean(void)
 static int prepare(struct device *dev) { int ret = asahi_g15_display_prepare(dev); clean(); return ret; }
 static int link30(struct device *dev) { int ret = apple_drm_t6030_link_device(dev); clean(); return ret; }
 static int link31(struct device *dev) { int ret = apple_drm_t6031_link_device(dev); clean(); return ret; }
+static int link8132(struct device *dev) { int ret = apple_drm_t8132_link_device(dev); clean(); return ret; }
+static int prepare16(struct device *dev) { int ret = asahi_g16_display_prepare(dev); clean(); return ret; }
 static int publish(struct device *dev) { int ret = apple_g15_display_publish(dev); clean(); return ret; }
 static void withdraw(struct device *dev) { apple_g15_display_withdraw(dev); clean(); }
 
@@ -206,6 +216,30 @@ int main(int argc, char **argv)
 		withdraw(&d30);
 		CHECK(d30.refs == 0 && link30(&g30) == -EPROBE_DEFER);
 		CHECK(link30(&g31) == -ENODEV);
+	} else if (!strcmp(scenario, "t8132")) {
+		/* No handed-over display: G16 starts on the boot framebuffer, said once. */
+		machine("apple,t8132", "apple,j713");
+		nodes[0] = &gpu8132;
+		nodes[1] = &disp8132;
+		CHECK(prepare16(&g8132) == 0 && infos == 1 && links_made == 0);
+		nodes[1] = NULL;
+		CHECK(prepare16(&g8132) == 0 && infos == 1 && links_made == 0);
+		nodes[1] = &disp8132;
+		/* A handed-over display: wait for its own publication, said once, then link. */
+		disp8132.available = true;
+		CHECK(prepare16(&g8132) == -EPROBE_DEFER && infos == 2 && links_made == 0);
+		CHECK(publish(&d31) == 0 && prepare16(&g8132) == -EPROBE_DEFER && links_made == 0);
+		withdraw(&d31);
+		CHECK(publish(&d8132) == 0 && d8132.refs == 1);
+		CHECK(prepare16(&g8132) == 0 && links_made == 1);
+		CHECK(last_link.consumer == &g8132 && last_link.supplier == &d8132 &&
+		      last_link.flags == DL_FLAG_AUTOREMOVE_CONSUMER);
+		CHECK(link8132(&g31) == -ENODEV && link8132(&none) == -ENODEV);
+		withdraw(&d8132);
+		CHECK(d8132.refs == 0 && prepare16(&g8132) == -EPROBE_DEFER);
+		CHECK(publish(&d8132) == 0);
+		machine("apple,t6031", "apple,j516c");
+		CHECK(link8132(&g8132) == -ENODEV && prepare16(&g8132) == -ENODEV && links_made == 1);
 	} else {
 		CHECK(!"unknown scenario");
 	}
@@ -213,7 +247,7 @@ int main(int argc, char **argv)
 }
 '''
 
-C_SCENARIOS = ["disabled", "absent", "pending", "ready", "isolation", "foreign", "t6030"]
+C_SCENARIOS = ["disabled", "absent", "pending", "ready", "isolation", "foreign", "t6030", "t8132"]
 
 C_MUTANTS = {
     "unpublished-succeeds": ("if (!*display)\n\t\treturn -EPROBE_DEFER;", "if (!*display)\n\t\treturn 0;"),
@@ -221,6 +255,11 @@ C_MUTANTS = {
     "pending-display-silent": (re.compile(r"\telse\n\t\tdev_info_once\(dev,[^;]*;\n"), ""),
     "t6031-reads-t6030-slot": ("&apple_t6031_display);", "&apple_t6030_display);"),
     "t6031-published-as-t6030": ("return &apple_t6031_display;", "return &apple_t6030_display;"),
+    "t8132-reads-t6031-slot": ("&apple_t8132_display);", "&apple_t6031_display);"),
+    "t8132-published-as-t6031": ("return &apple_t8132_display;", "return &apple_t6031_display;"),
+    "g16-ignores-handed-over-display": ("handed_over = np && of_device_is_available(np);", "handed_over = false;"),
+    "g16-waits-without-display": ("\t\treturn 0;\n\t}\n\tret = apple_drm_t8132_link_device(dev);",
+                                  "\t\treturn -EPROBE_DEFER;\n\t}\n\tret = apple_drm_t8132_link_device(dev);"),
     "no-machine-check": ("!of_machine_is_compatible(machine) ||", ""),
     "withdraw-keeps-display": ("*slot = NULL;", ";"),
     "publish-without-reference": ("*slot = get_device(dev);", "*slot = dev;"),

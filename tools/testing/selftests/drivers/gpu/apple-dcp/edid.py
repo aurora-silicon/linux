@@ -53,6 +53,7 @@ static unsigned diagnostic_errors,diagnostic_information,legacy_publishes;
 /* The T6030 14.7 backend never matches these H17P scenarios. */
 #define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
 #define DCP_FIRMWARE_V_14_7_TEMPLATE (DCP_FIRMWARE_H17P + 2)
+#define DCP_FIRMWARE_V_27_0 (DCP_FIRMWARE_H17P + 3)
 #define EPIC_TYPE_NOTIFY 0
 #define EPIC_CAT_REPORT 0
 #define max(a,b) ((a)>(b)?(a):(b))
@@ -61,6 +62,7 @@ static unsigned diagnostic_errors,diagnostic_information,legacy_publishes;
 #define dma_rmb() ((void)0)
 #define DRM_CONNECTOR_REGISTERED 1
 #define DPAVSERV_ENDPOINT_V2 0x2a
+#define AV_AUDIO_ENDPOINT_DESKTOP 0x2b
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define DCP_IOMFB_METHODS_H17G 7
 #define EPIC_SUBTYPE_STD_SERVICE 0xc0
@@ -68,6 +70,7 @@ static unsigned diagnostic_errors,diagnostic_information,legacy_publishes;
 #define to_platform_device(x) (x)
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
 #define IS_ERR(x) ((uintptr_t)(x)>(uintptr_t)-4096)
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
 #define lockdep_assert_held(p) assert(*(p))
 static bool *hpd_lock,*av_lock;
 static void mutex_lock(bool *p) { if(p==hpd_lock) assert(!*av_lock);assert(!*p);*p=true; }
@@ -81,7 +84,8 @@ static bool queue_work(void *wq,struct work_struct *w) { assert(wq);bool fresh=!
 static bool __attribute__((unused)) cancel_work_sync(struct work_struct *w) { bool queued=w->pending;assert(!queued);return queued; }
 struct apple_dcp;struct apple_dcp_afkep;struct apple_epic_service;
 void afk_service_retry(struct apple_dcp_afkep *ep);
-struct apple_epic_service_ops { char name[32];bool reusable,optional;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *); };
+/* open_later: a firmware 27 panel service that sends its own OPEN; none is here. */
+struct apple_epic_service_ops { char name[32];bool reusable,optional,open_later;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init_props)(struct apple_epic_service *,s64,const void *,size_t);void (*teardown)(struct apple_epic_service *); };
 struct epic_cmd_info { u16 tag;u8 type;size_t reply_length,reply_len;bool reply_len_valid;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
 struct apple_epic_service {
     struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;
@@ -90,16 +94,19 @@ struct apple_epic_service {
     struct { u64 generation,epoch; } admission;void *cookie;
     bool pending_open;const char *pending_name,*pending_class;s64 pending_unit;
 };
-struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;void *wq;struct work_struct service_work;struct apple_dcp *dcp;const struct apple_epic_service_ops *ops;bool wire_v2,inline_v2,match_epic_name;u32 endpoint;unsigned int num_channels;struct apple_epic_service services[AFK_MAX_CHANNEL]; };
+/* v27_closed_teardown: set only by a J714s firmware 27 sleep. */
+struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;void *wq;struct work_struct service_work;struct apple_dcp *dcp;const struct apple_epic_service_ops *ops;bool wire_v2,inline_v2,match_epic_name,v27_closed_teardown;u32 endpoint;unsigned int num_channels;struct apple_epic_service services[AFK_MAX_CHANNEL]; };
 struct apple_connector { void *dcp;bool connected,edid_invalidation_pending;struct { int registration_state; } base;unsigned int hotplug_wq; };
 struct apple_dcp {
     void *dev;int fw_compat;struct apple_dcp_afkep *dcpavservep;struct apple_connector *connector;
     bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;u64 typec_generation;unsigned int nr_modes;
-    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead,external_native;
+    struct { int iomfb_method_profile,firmware_compat; bool fw_14_7_endpoints; unsigned int num_dptx_ports; } hw; bool ext_dead,external_native;
     struct { bool lock,enabled;u64 epoch;int enable_completion;struct apple_epic_service *service,*opened;
              u64 opened_epoch,close_gen,terminated_epoch,close_epoch;bool opening;struct work_struct close_wq; } dcpavserv;
+    /* A J714s firmware 27 processor's: this one is not. */
+    bool v27_j714s, v27_sleep_transport; struct apple_dcp_afkep *sleep_v27_ep[0x20], *panelav[0x20];
 };
-'''+internal_inline(root,'dcp_fw_is_14_7')+internal_inline(root,'dcp_is_v14_7_external')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
+'''+internal_inline(root,'dcp_fw_is_14_7')+internal_inline(root,'dcp_is_v14_7_external')+internal_inline(root,'dcp_is_v27_external')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
 static unsigned int dma_frees,opens;
 
 static int open_error,open_action;
@@ -170,7 +177,11 @@ static int skip(struct dcp_parse_ctx *h) { assert(!h->key);h->index++;h->key=tru
            function('afk.c','static void afk_discard_pending_open('),function('afk.c','static void afk_retry_service_init('),function('afk.c','static void afk_service_worker('),function('afk.c','static void afk_recv_handle_init('),
            function('epic/dpavservep.c','static int dcpdpserv_prepare('),
            function('epic/dpavservep.c','static void dcpdpserv_teardown('),function('afk.c','static void afk_recv_handle_teardown('),
-           function('afk.c','static void afk_recv_handle_reply('),function('afk.c','static void afk_v2_receive(')]
+           function('afk.c','static void afk_recv_handle_reply(')]
+    # A firmware 27 panel's AV service closes as the H17P one does.
+    if 'static bool afk_is_panelav(' in (base/'afk.c').read_text():
+        parts.append(function('afk.c','static bool afk_is_panelav('))
+    parts.append(function('afk.c','static void afk_v2_receive('))
     suffix=r'''
 static struct apple_dcp d;
 static struct apple_dcp_afkep ep;
@@ -467,13 +478,21 @@ int main(void)
     optional_admission_controls();
     struct item h17p[]={{"compartment","dcpav-service-epic",0},{"name","AppleDCPDP2HDMI",0},{"interface-id",NULL,13}};
     struct dcp_parse_ctx parse_ctx={.items=h17p,.count=3};const char *parsed_name,*parsed_class;s64 parsed_unit=-1;
-    assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,true));
+    assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,true,false));
     assert(parsed_unit==13 && !strcmp(parsed_name,name) && !strcmp(parsed_class,class));
     struct apple_epic_service *proof=prepare(13,parsed_unit,parsed_name,parsed_class);assert(proof);afk_service_discard(proof);
     free((void *)parsed_name);free((void *)parsed_class);
     struct item legacy[]={{"EPICName","dcpav-service-epic",0},{"EPICProviderClass","legacy-class",0},{"EPICUnit",NULL,0}};
     parse_ctx=(struct dcp_parse_ctx){.items=legacy,.count=3};
-    assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,false));assert(parsed_unit==0);
+    assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,false,false));assert(parsed_unit==0);
+    free((void *)parsed_name);free((void *)parsed_class);
+    /* Firmware 27 carries both spellings; its EPICUnit is the unit in either order. */
+    struct item both[]={{"compartment","dcpav-service-epic",0},{"name","AppleDCPDP2HDMI",0},{"EPICUnit",NULL,5},{"interface-id",NULL,13}};
+    parse_ctx=(struct dcp_parse_ctx){.items=both,.count=4};
+    assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,true,true));assert(parsed_unit==5);
+    free((void *)parsed_name);free((void *)parsed_class);
+    parse_ctx=(struct dcp_parse_ctx){.items=both,.count=4};
+    assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,true,false));assert(parsed_unit==13);
     free((void *)parsed_name);free((void *)parsed_class);
     ep.wq=&ep;ep.command_tags=calloc(AFKV2_INTERFACES,1);assert(ep.command_tags);
     struct apple_epic_service *old=prepare(1,1,name,class);assert(old);publish(old,1);
@@ -572,9 +591,13 @@ typedef int64_t s64;
 #define U16_MAX UINT16_MAX
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
+/* As the shared Apple configuration builds it. */
+#define CONFIG_APPLE_SOC_SLEEP 1
+#define IS_ENABLED(option) (option)
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
 #define PTR_ERR(x) ((int)(intptr_t)(x))
 #define IS_ERR(x) ((uintptr_t)(x) > (uintptr_t)-4096)
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
 #define spin_lock_irqsave(p,f) do { assert(!*(p)); *(p)=true; (f)=0; } while(0)
 #define spin_unlock_irqrestore(p,f) do { (void)(f); assert(*(p)); *(p)=false; } while(0)
 #define lockdep_assert_held(p) assert(*(p))
@@ -627,6 +650,9 @@ struct apple_dcp {
     int fw_compat;
     void *dev;
     struct dcp_desktop_state { struct apple_dcp_afkep *graph[0x20]; } *desktop;
+    /* A J714s firmware 27 processor's: none is one here. */
+    bool v27_j714s, v27_sleep_transport, sleep_v27_unhandled;
+    struct apple_dcp_afkep *sleep_v27_ep[0x20], *panelav[0x20];
 };
 struct drm_edid { int identity; };
 '''+internal_inline(root,'dcp_is_v14_7_external')+r'''static unsigned int reads, allocations, legacy_reads, receives;
@@ -658,8 +684,8 @@ static int __attribute__((unused)) dcpavserv_v14_open(struct apple_dcp *d,struct
 { (void)d;(void)s;(void)epoch;(void)gen;assert(!"14.7 AV client open on H17P");return -ENODEV; }
 static bool __attribute__((unused)) drm_edid_valid(const struct drm_edid *e) { (void)e;assert(!"14.7 EDID validation on H17P");return false; }
 static void iomfb_recv_msg(struct apple_dcp *d, u64 message) { (void)d; (void)message; }
-static void afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
-{ (void)message; received_ep=ep; receives++; }
+static int afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
+{ (void)message; received_ep=ep; receives++; return 0; }
 '''
     parts = [function('epic/dpavservep.c', 'static void dcpavserv_notify_edid('),
              function('epic/dpavservep.c', 'static void dcpavserv_invalidate_edid('),
@@ -793,11 +819,22 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
+/* As the shared Apple configuration builds it. */
+#define CONFIG_APPLE_SOC_SLEEP 1
+#define IS_ENABLED(option) (option)
+/* The jobs a firmware sleep waits for; nothing here does. */
+typedef int atomic_t;
+#define atomic_inc(p) ((void)++*(p))
+#define atomic_dec_return_release(p) (--*(p))
+#define dev_err(...) ((void)0)
 #define GFP_KERNEL 0
 #define kzalloc(n,f) calloc(1,n)
 #define kfree(p) free(p)
+#define kvzalloc(n,f) calloc(1,n)
+#define kvfree(p) free(p)
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define INIT_WORK(p,f) ((p)->fn=(f))
+#define IS_ERR_OR_NULL(x) (!(x) || (uintptr_t)(x) > (uintptr_t)-4096)
 #define dev_warn(...) ((void)0)
 #define DCP_FW_VER 26
 #define DCP_FW_VERSION(a,b,c) (a)
@@ -836,7 +873,7 @@ struct drm_device { struct { struct mutex mutex; } mode_config; };
 struct drm_connector { struct drm_device *dev; struct { int width_mm,height_mm; } display_info; };
 struct apple_connector { struct drm_connector base; struct work_struct hotplug_wq; };
 struct apple_dcp;
-struct apple_dcp_afkep { struct apple_dcp *dcp; u8 endpoint; struct mutex lock; bool stopping; struct workqueue_struct *wq; };
+struct apple_dcp_afkep { struct apple_dcp *dcp; u8 endpoint; struct mutex lock; bool stopping; struct workqueue_struct *wq; atomic_t sleep_jobs; };
 struct test_mode_ticket { u64 generation; bool associated; };
 struct apple_dcp {
     bool quiescing; int fw_compat; void *dev;
@@ -853,11 +890,16 @@ struct apple_dcp {
     struct apple_dcp_afkep *dcpavservep,*dptxep,*avep,*systemep,*ibootep,*dptx_controller_ep;
     struct { struct mutex lock; bool stopped; void *owner; } iomfb;
     struct dcp_desktop_state { struct apple_dcp_afkep *graph[0x20]; } *desktop;
+    /* A J714s firmware 27 processor's: this one is not. */
+    bool v27_j714s, v27_sleep_transport, sleep_v27_unhandled;
+    struct apple_dcp_afkep *sleep_v27_ep[0x20], *panelav[0x20];
 };
 struct afk_receive_message_work { struct apple_dcp_afkep *ep; u64 message; struct work_struct work; };
-struct apple_rtkit_ops { void (*recv_message)(void *,u8,u64); };
-struct apple_rtkit { bool shutting_down, sync_syslog_ack, pmp_registry_v2; const struct apple_rtkit_ops *ops; void *cookie,*dev; };
-struct apple_rtkit_rx_work { struct apple_rtkit *rtk; u8 ep; u64 msg; struct work_struct work; };
+struct apple_rtkit_ops { void (*recv_message)(void *,u8,u64); void (*recv_message_timed)(void *,u8,u64,u64); };
+struct apple_rtkit { bool shutting_down, sync_syslog_ack, pmp_registry_v2; const struct apple_rtkit_ops *ops; void *cookie,*dev;
+    /* Messages a firmware sleep holds and the RX jobs it counts; none are held here. */
+    struct { bool tracked; int error; atomic_t jobs; } m5_saved; atomic_t v27_jobs; };
+struct apple_rtkit_rx_work { u64 received_ns; struct apple_rtkit *rtk; u8 ep; u64 msg; struct work_struct work; };
 #define current ((void *)1)
 static pthread_mutex_t reply_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t reply_ready=PTHREAD_COND_INITIALIZER;
@@ -902,7 +944,12 @@ rx_unused(apple_rtkit_oslog_rx)
         parts.append('static void dcp_update_connector_dimensions(struct apple_dcp *d, struct drm_connector *c) { (void)d; (void)c; }')
     parts += [function(iomfb,'void iomfb_recv_msg('),function(af,'int afk_receive_message('),
               function(dcp,'static struct apple_dcp_afkep *dcp_afkep('),
-              function(dcp,'static void dcp_recv_msg('),function(rtkit,'static void apple_rtkit_rx_work(')]
+              function(dcp,'static void dcp_recv_msg(')]
+    # The RX work's dispatch, shared with the messages a firmware sleep holds.
+    if 'static void apple_rtkit_rx_dispatch(' in rtkit:
+        parts += [function(rtkit,'static void apple_rtkit_rx_dispatch('),
+                  function(rtkit,'static void apple_rtkit_saved_job_done(')]
+    parts.append(function(rtkit,'static void apple_rtkit_rx_work('))
     suffix=r'''
 static struct drm_device drm={.mode_config.mutex.native=PTHREAD_MUTEX_INITIALIZER};
 static struct apple_connector connector={.base.dev=&drm};
@@ -1025,7 +1072,9 @@ def startup(root):
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define DPAVSERV_ENDPOINT 0x28
 #define DPAVSERV_ENDPOINT_V2 0x2a
+#define DCP_FIRMWARE_V_27_0 7
 #define IS_ERR(p) ((uintptr_t)(p) > (uintptr_t)-4096)
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 #define ERR_PTR(e) ((void *)(intptr_t)(e))
 #define dev_warn(...) do { warnings++; } while (0)
@@ -1041,6 +1090,7 @@ struct apple_dcp {
     struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead,external_native;
     struct { unsigned enable_completion; bool enabled; } dcpavserv;
     struct apple_dcp_afkep *dcpavservep;
+    int fw_compat;
 };
 static const unsigned dpavservep_ops[] = {0};
 static struct apple_dcp_afkep endpoint;
@@ -1100,7 +1150,14 @@ int main(void)
             init_error=0;
         }
     }
-    puts("PASS optional legacy discovery, AFKV2 early/absent service, endpoint failures");
+    /* Firmware 27 speaks AFKV2 on the legacy endpoint and does not wait. */
+    struct apple_dcp v27={.fw_compat=DCP_FIRMWARE_V_27_0};
+    announce=false;waits=warnings=starts=shutdowns=detaches=debug=0;
+    assert(dpavservep_init(&v27)==0);
+    assert(starts==1&&!waits&&!warnings&&!shutdowns&&!detaches&&!debug);
+    assert(v27.dcpavservep==&endpoint&&endpoint.wire_v2&&!endpoint.inline_v2);
+    assert(endpoint.endpoint==DPAVSERV_ENDPOINT&&!v27.dcpavserv.enabled);
+    puts("PASS optional legacy discovery, AFKV2 early/absent service, firmware 27, endpoint failures");
     return 0;
 }
 '''

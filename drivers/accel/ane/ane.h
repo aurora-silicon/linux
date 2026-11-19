@@ -94,6 +94,13 @@ struct ane_device {
 	bool recovering;
 
 	/*
+	 * Set by system suspend for an engine that was wedged when it began:
+	 * the sleep powers its partitions off as a recovery cycle does, so
+	 * runtime suspend lets it go, and resume tries one recovery.
+	 */
+	bool sleep_wedged;
+
+	/*
 	 * TM_STATUS sampled right after the first tm_enable at probe: the
 	 * engine's fresh, idle-state signature. Recovery accepts a reset
 	 * whose post-cycle status matches it, since the register reset
@@ -111,6 +118,23 @@ struct ane_device {
 	 * False on T8103, where the cycle is a full POR of the file.
 	 */
 	bool tm_retention;
+
+	/*
+	 * Set under engine_lock when a failure is known to survive the
+	 * recovery power cycle: the engine stays wedged, recovery and the
+	 * reset attribute refuse, and only a reboot brings it back.
+	 * wedge_reason names why for the wedge_reason sysfs file.
+	 */
+	bool wedge_final;
+	const char *wedge_reason;
+
+	/*
+	 * Recoveries since the last completed job: raised by a recovery that
+	 * reported the engine idle, cleared by the next completed job. A
+	 * recovery that only looks successful is caught by the jobs after it
+	 * hanging the same way.
+	 */
+	unsigned int recovery_unproven;
 
 	/* Protected independently of engine_lock so idle work can release votes. */
 	struct ane_perf {
@@ -169,6 +193,34 @@ struct ane_request {
 	u32 btsp_iova;
 	u32 bar[DRM_ANE_TILE_COUNT];
 };
+
+/*
+ * Recoveries in a row without one completed job that a T600x engine gets
+ * before it is declared wedged until reboot: a run this long means the
+ * recovery does not bring the engine back.
+ */
+#define ANE_TM_RECOVERIES_MAX 3
+
+/*
+ * Can a power cycle bring the engine back after a failed job? A job that
+ * timed out without one completion event (@finished == 0) left the task
+ * manager stopped mid-program. The cycle stops it; a hang on a job after a
+ * recovery (@unproven recoveries since the last completed job) shows that
+ * the recovery did not bring the engine back. T8103 allows no such repeat.
+ * T600x (@tm_retention), whose recovery also drains and re-arms the tm/tq
+ * file, allows up to ANE_TM_RECOVERIES_MAX in a row, so back-to-back bad
+ * programs do not cost a reboot. Every other failure is worth a recovery.
+ */
+static inline bool ane_tm_failure_recoverable(bool tm_retention,
+					      unsigned int unproven, int err,
+					      u32 finished)
+{
+	if (err != -ETIMEDOUT || finished)
+		return true;
+	if (tm_retention)
+		return unproven < ANE_TM_RECOVERIES_MAX;
+	return !unproven;
+}
 
 #if IS_ENABLED(CONFIG_KUNIT)
 int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,

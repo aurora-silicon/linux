@@ -7,6 +7,24 @@
 #define CREATE_TRACE_POINTS
 #include "trace.h"
 
+void asahi_g17_trace_submit(u8 phase, u64 submit_id, u32 ctx, u32 inputs,
+			    u32 outputs, s32 result, struct dma_fence *fence)
+{
+	if (trace_asahi_g17_submit_enabled())
+		trace_asahi_g17_submit(phase, submit_id, ctx, inputs, outputs,
+				       result, fence ? fence->context : 0,
+				       fence ? fence->seqno : 0,
+				       __arch_counter_get_cntvct());
+}
+
+void asahi_g17_trace_output(s32 result, struct dma_fence *fence)
+{
+	if (trace_asahi_g17_output_enabled())
+		trace_asahi_g17_output(result, fence ? fence->context : 0,
+				       fence ? fence->seqno : 0,
+				       __arch_counter_get_cntvct());
+}
+
 bool asahi_g17_trace_publish_enabled(void)
 {
 	return trace_asahi_g17_publish_enabled();

@@ -102,7 +102,8 @@ int do_kexec_load(unsigned long entry, unsigned long nr_segments,
 	 */
 	if (!kexec_trylock())
 		return -EBUSY;
-	if (nr_segments && kexec_blocked()) {
+	if (nr_segments && ((flags & KEXEC_ON_CRASH) ? kexec_crash_blocked() :
+						      kexec_blocked())) {
 		pr_warn_ratelimited("kexec load refused by active interlock; first reason: %s\n",
 				    kexec_block_reason());
 		ret = -EOPNOTSUPP;

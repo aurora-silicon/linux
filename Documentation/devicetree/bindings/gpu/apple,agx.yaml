@@ -17,10 +17,16 @@ properties:
           - apple,agx-g13s
           - apple,agx-g14g
           - apple,agx-g14s
+          - apple,agx-g17s
           - apple,agx-t6040
           - apple,agx-t6041
+          - apple,agx-t6050
           - apple,agx-t8132
           - apple,agx-t8140
+          - apple,agx-t8142
+      - items:
+          - const: apple,agx-g17c
+          - const: apple,agx-g17s
       - items:
           - const: apple,agx-t8103
           - const: apple,agx-g13g
@@ -39,13 +45,21 @@ properties:
           - const: apple,agx-g14s
 
   reg:
+    minItems: 1
     maxItems: 2
 
   reg-names:
+    minItems: 1
     maxItems: 2
 
   power-domains:
     maxItems: 1
+
+  interrupts:
+    maxItems: 8
+    description:
+      Interrupt outputs of the raw T6050 GPU block. The coprocessor-driven
+      GPU uses its mailbox interrupts instead.
 
   dma-noncoherent: true
 
@@ -70,16 +84,12 @@ properties:
       - description:
           Shared global variables, preserved firmware data or text segment of
           the loaded GPU firmware
+      - description: Additional firmware crash-log data on T8142
+      - description: Combined firmware text on T8142
 
   memory-region-names:
     minItems: 3
-    items:
-      - const: ttbs
-      - const: pagetables
-      - const: handoff
-      - enum: [hw-cal-a, shared-l2, fw-data]
-      - enum: [hw-cal-b, fw-text, l2-pagetables]
-      - enum: [globals, fw-data, fw-text]
+    maxItems: 8
 
   apple,clpc:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -87,6 +97,31 @@ properties:
       Host performance controller receiving GPU submission and idle demand.
       GFX supplier power cannot represent GPU work on firmware that keeps
       its coprocessor domain powered while the cores are idle.
+
+  apple,pmp-report-entry:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      PMP report entry that tells the PMP the GPU is in use. The driver withdraws
+      this request before it lowers the GPU's power state for a system sleep, and
+      makes it again after raising it.
+
+  apple,sleep-ps-auto:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 15
+    description:
+      The automatic power state (bits 27:24 of the power state word) the GPU's
+      power domain is raised with after a system sleep. Without it the domain
+      keeps the automatic state it had before the sleep. Set by the boot
+      loader.
+
+  apple,sleep-ps-min:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 15
+    description:
+      The floor (bits 19:16 of the power state word) the GPU's power domain is
+      raised with after a system sleep, the lowest state its automatic power
+      management may take between jobs. Without it the domain keeps the floor
+      the sleep's wake left in the word.
 
   apple,idle-off-delay-ms:
     minimum: 2
@@ -112,6 +147,21 @@ properties:
       ceiling than the thermal framework requests.
 
   operating-points-v2: true
+
+  apple,csafr-min-sram-microvolt:
+    maxItems: 1
+    description: Loader-filled SRAM voltage floor for the CS and AFR domains.
+
+  apple,aon-ptd:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    oneOf:
+      - minItems: 9
+        maxItems: 9
+      - minItems: 18
+        maxItems: 18
+    description:
+      Loader-filled power telemetry records, three per die. Each record is
+      an identifier followed by two configuration words.
 
   apple,firmware-version:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -203,6 +253,14 @@ properties:
       AFR leakage. Per-chip efuse values decoded by the boot loader,
       stored as IEEE-754 binary32 bit patterns in big-endian cells.
 
+  apple,leakage-calibration-words:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 3
+    description:
+      Raw per-chip GPU leakage calibration words for the M5 Pro controller
+      defaults. Supplied by the boot loader, never fixed in a board DT.
+
   apple,firmware-abi:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 3
@@ -214,10 +272,119 @@ properties:
 required:
   - compatible
   - reg
-  - mboxes
-  - memory-region
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          const: apple,agx-g17s
+    then:
+      description:
+        The M5 Pro GPU uses one MMIO range and two firmware mailbox roles.
+        Its firmware graph supplies the performance tables, so it has no
+        operating-point table in the board DT.
+      properties:
+        reg:
+          maxItems: 1
+        reg-names:
+          items:
+            - const: sgx
+        mboxes:
+          items:
+            - description: Primary GFX firmware mailbox
+            - description: Secondary GFX firmware mailbox
+        memory-region:
+          items:
+            - description: Region containing GPU MMU TTBs
+            - description: Region containing GPU MMU page tables
+            - description: Shared handoff structure for VM coordination
+            - description: Data segment of the loaded GPU firmware
+            - description: Firmware kernel-window page tables
+            - description: Text segment identifying the loaded GPU firmware
+        memory-region-names:
+          items:
+            - const: ttbs
+            - const: pagetables
+            - const: handoff
+            - const: fw-data
+            - const: l2-pagetables
+            - const: fw-text
+      required:
+        - power-domains
+        - reg-names
+        - memory-region-names
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,agx-t6050
+          maxItems: 1
+    then:
+      description:
+        The T6050 GPU block, described from the ADT /arm-io/sgx node. Its
+        firmware coprocessor is a separate node, and the GPU stays disabled
+        until the firmware handoff is supported.
+      properties:
+        reg:
+          items:
+            - description: GPU block MMIO registers
+            - description: GPU block secondary registers
+        interrupts:
+          minItems: 8
+        status:
+          const: disabled
+      required:
+        - interrupts
+        - power-domains
+        - status
+    else:
+      properties:
+        interrupts: false
+      required:
+        - mboxes
+        - memory-region
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,agx-g17c
+    then:
+      properties:
+        reg:
+          items:
+            - description: GFX coprocessor control registers
+            - description: GPU block MMIO registers
+        reg-names:
+          items:
+            - const: asc
+            - const: sgx
+        mboxes:
+          items:
+            - description: GFX coprocessor mailbox
+            - description: GFX1 coprocessor mailbox
+        memory-region:
+          minItems: 6
+        memory-region-names:
+          items:
+            - const: ttbs
+            - const: pagetables
+            - const: handoff
+            - const: fw-data
+            - const: l2-pagetables
+            - const: fw-text
+      required:
+        - reg-names
+        - power-domains
+        - memory-region-names
+        - operating-points-v2
+        - apple,cs-opp
+        - apple,afr-opp
+        - apple,csafr-min-sram-microvolt
+        - apple,aon-ptd
+    else:
+      properties:
+        apple,csafr-min-sram-microvolt: false
+        apple,aon-ptd: false
   - if:
       properties:
         compatible:
@@ -273,17 +440,23 @@ allOf:
             - description: GFX coprocessor mailbox
             - description: GFX1 coprocessor mailbox
         memory-region:
+          minItems: 3
           items:
             - description: Region containing GPU MMU TTBs
             - description: Region containing GPU MMU page tables
             - description:
                 Region containing a shared handoff structure for VM
                 management coordination
+            - description:
+                Data segments of both GPU firmware roles, where each keeps
+                its crash log
         memory-region-names:
+          minItems: 3
           items:
             - const: ttbs
             - const: pagetables
             - const: handoff
+            - const: fw-data
       required:
         - power-domains
         - operating-points-v2
@@ -381,10 +554,13 @@ allOf:
           compatible:
             contains:
               enum:
+                - apple,agx-g17s
                 - apple,agx-t6040
                 - apple,agx-t6041
+                - apple,agx-t6050
                 - apple,agx-t8132
                 - apple,agx-t8140
+                - apple,agx-t8142
     then:
       properties:
         reg:
@@ -409,6 +585,79 @@ allOf:
             - const: globals
       required:
         - apple,firmware-abi
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,agx-t8142
+    then:
+      properties:
+        reg:
+          items:
+            - description: GFX coprocessor control registers
+            - description: GPU block MMIO registers
+        reg-names:
+          items:
+            - const: asc
+            - const: sgx
+        mboxes:
+          items:
+            - description: GFX coprocessor mailbox
+            - description: GFX1 coprocessor mailbox
+        memory-region:
+          minItems: 7
+          items:
+            - description: GPU MMU TTBs
+            - description: GPU MMU page tables
+            - description: Shared GPU MMU handoff structure
+            - description: Shared L2 page tables
+            - description: GFX firmware data
+            - description: GFX1 firmware data
+            - description: Combined firmware data and shared read-only crash logs
+            - description: Combined GFX and GFX1 firmware text
+        memory-region-names:
+          minItems: 7
+          items:
+            - const: ttbs
+            - const: pagetables
+            - const: handoff
+            - const: shared-l2
+            - const: gfx-data
+            - const: gfx1-data
+            - const: fw-data
+            - const: fw-text
+      oneOf:
+        - properties:
+            memory-region:
+              maxItems: 7
+            memory-region-names:
+              maxItems: 7
+        - properties:
+            memory-region:
+              minItems: 8
+            memory-region-names:
+              minItems: 8
+      required:
+        - reg-names
+        - mboxes
+        - memory-region
+        - memory-region-names
+        - power-domains
+        - operating-points-v2
+    else:
+      properties:
+        memory-region:
+          maxItems: 6
+        memory-region-names:
+          minItems: 3
+          items:
+            - const: ttbs
+            - const: pagetables
+            - const: handoff
+            - enum: [hw-cal-a, shared-l2, fw-data]
+            - enum: [hw-cal-b, fw-text, l2-pagetables]
+            - enum: [globals, fw-data, fw-text]
 
 additionalProperties: false
 

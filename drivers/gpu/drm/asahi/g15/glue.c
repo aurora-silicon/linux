@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * G15 (T6030/T6031, M3 Pro/Max) helpers that have no Rust bindings: static inlines,
- * macros and THIS_MODULE. Built only with CONFIG_DRM_ASAHI_G15.
+ * G15 (T6030/T6031, M3 Pro/Max) helpers that have no Rust bindings: static inlines
+ * and macros. The module pin is retain.c's. Built only with CONFIG_DRM_ASAHI_G15.
  */
 #include <crypto/sha2.h>
 #include <linux/device.h>
@@ -26,8 +26,6 @@ bool asahi_g15_board(void);
 bool asahi_g15_machine(const char *compatible);
 void asahi_g15_hold_power(struct device *dev);
 void asahi_g15_release_power(struct device *dev);
-bool asahi_g15_module_try_get(void);
-void asahi_g15_module_put(void);
 void asahi_g15_reprobe(void);
 void asahi_g15_report_loader_gpu(void);
 int asahi_g15_adt_phram(u64 *start, u64 *size);
@@ -245,22 +243,6 @@ void asahi_g15_release_power(struct device *dev)
 	pm_runtime_disable(dev);
 	pm_runtime_set_suspended(dev);
 
-}
-
-/*
- * Pin this module until reboot, unless its removal has begun: a deferred or
- * asynchronous probe can run after an ordinary rmmod has passed its reference
- * check, which __module_get() would not stop.
- */
-bool asahi_g15_module_try_get(void)
-{
-	return try_module_get(THIS_MODULE);
-}
-
-/* Drop a reference asahi_g15_module_try_get() took. */
-void asahi_g15_module_put(void)
-{
-	module_put(THIS_MODULE);
 }
 
 /*

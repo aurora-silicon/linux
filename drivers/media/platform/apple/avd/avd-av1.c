@@ -1396,17 +1396,79 @@ static void update_dec_buf_info(struct avd_decoded_buffer *buf,
 		buf->av1.ref_frame_idx[i] = frame->ref_frame_idx[i];
 }
 
+/* The engine fetches each tile from these: bad values make it read wild addresses. */
+static int avd_av1_check_tiles(struct avd_ctx *ctx, struct avd_av1_run *run,
+			       unsigned int entries)
+{
+	unsigned int tiles = run->frame->tile_info.tile_cols *
+			     run->frame->tile_info.tile_rows;
+	unsigned int t;
+	size_t payload;
+
+	if (entries < tiles) {
+		dev_err_ratelimited(ctx->dev->dev, "AV1: %u tiles but %u tile entries\n",
+				    tiles, entries);
+		return -EINVAL;
+	}
+	if (!tiles)
+		return 0;
+	payload = vb2_get_plane_payload(&run->base.bufs.src->vb2_buf, 0);
+	for (t = 0; t < tiles; t++) {
+		const struct v4l2_ctrl_av1_tile_group_entry *e = &run->tile_group[t];
+
+		if ((u64)e->tile_offset + e->tile_size > payload) {
+			dev_err_ratelimited(ctx->dev->dev, "AV1: tile %u at %u+%u past %zu bytes\n",
+					    t, e->tile_offset, e->tile_size, payload);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Only the AV1 Main profile at 4:2:0 (8 and 10 bits) decodes. A High
+ * profile (4:4:4) frame is never completed: it times out and the whole
+ * decoder is reset, failing every other stream's frames too. Professional
+ * (4:2:2, 12-bit) has no capture format. Refuse anything but Main 4:2:0
+ * when the sequence is set and again when a frame runs, so it never
+ * reaches the decoder.
+ */
+static int avd_av1_validate_sequence(struct avd_ctx *ctx,
+				     const struct v4l2_ctrl_av1_sequence *seq)
+{
+	const u32 subsampling = V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
+				V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
+
+	if (seq->seq_profile != 0)
+		return -EINVAL;
+	if (seq->bit_depth != 8 && seq->bit_depth != 10)
+		return -EINVAL;
+	if (seq->flags & V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME)
+		return -EINVAL; /* monochrome (4:0:0) is refused */
+	if ((seq->flags & subsampling) != subsampling)
+		return -EINVAL;
+
+	return 0;
+}
+
 static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 {
 	struct v4l2_ctrl *ctrl;
-	int dst_len, tlb_len;
+	int dst_len, ret, tlb_len;
 
 	avd_run_preamble(ctx, &run->base);
+	if (run->base.setup_err)
+		return run->base.setup_err;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_AV1_SEQUENCE);
 	if (WARN_ON(!ctrl))
 		return -EINVAL;
 	run->seq = ctrl->p_cur.p;
+
+	/* The sequence may have been set, unchecked, while another codec was selected. */
+	ret = avd_av1_validate_sequence(ctx, run->seq);
+	if (ret)
+		return ret;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_AV1_FRAME);
 	if (WARN_ON(!ctrl))
@@ -1436,6 +1498,9 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	if (WARN_ON(!ctrl))
 		return -EINVAL;
 	run->tile_group = ctrl->p_cur.p;
+	ret = avd_av1_check_tiles(ctx, run, ctrl->elems);
+	if (ret)
+		return ret;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
 			      V4L2_CID_STATELESS_AV1_FILM_GRAIN);
@@ -1825,13 +1890,7 @@ static enum avd_image_fmt avd_av1_get_image_fmt(struct avd_ctx *ctx,
 	if (ctrl->id != V4L2_CID_STATELESS_AV1_SEQUENCE)
 		return AVD_IMG_FMT_ANY;
 
-	if (!(seq->flags & V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X)) /* 4:4:4 */
-		return AVD_IMG_FMT_ANY;
-	if (!(seq->flags & V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y))
-		return BIT_DEPTH(422);
-	if (seq->flags & V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME)
-		return AVD_IMG_FMT_ANY; /* 4:0:0 (not supported?) */
-
+	/* avd_av1_validate_sequence() admits only Main profile 4:2:0. */
 	return BIT_DEPTH(420);
 #undef BIT_DEPTH
 }
@@ -1872,15 +1931,6 @@ static void avd_av1_adjust_decoded_fmt(struct avd_ctx *ctx,
 		ALIGN(avd_color_size(pix_mp->width, pix_mp->height), AVD_ALIGN);
 	pix_mp->plane_fmt[0].sizeimage +=
 		avd_av1_seg_size(pix_mp->width, pix_mp->height);
-}
-
-static int avd_av1_validate_sequence(struct avd_ctx *ctx,
-				     struct v4l2_ctrl_av1_sequence *seq)
-{
-	if (seq->flags & V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME)
-		return -EINVAL; /* 4:0:0 (not supported?) */
-
-	return 0;
 }
 
 static int avd_av1_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)

@@ -15,6 +15,7 @@
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/unaligned.h>
@@ -40,7 +41,20 @@ MODULE_PARM_DESC(sensor_spi_mode,
 struct sep_sensor_lifetime {
 	/* Serializes sensor operations with this device's resource teardown. */
 	struct mutex lock;
+	/* The power last written; a failed write counts as on. */
+	bool powered;
+	/* Set across a system sleep: bus and power requests are refused. */
+	bool asleep;
 };
+
+/* The power line or rails and the bus, with no settling delays. */
+struct sep_sensor_hw {
+	int (*set_power)(int on);
+	int (*send)(const void *tx, size_t len);
+};
+
+/* Puts the sensor in its low-power state; macOS sends it before a sleep. */
+static const u8 sep_sensor_cmd_sleep[] = { 0x80, 0x31, 0x00, 0x07, 0x00, 0x00, 0x00 };
 
 static DEFINE_MUTEX(sep_sensor_registry_lock);
 static struct sep_sensor_lifetime *sep_active_sensor;
@@ -58,6 +72,7 @@ static struct sep_sensor_lifetime *sep_lock_sensor(void)
 }
 
 static void sep_sensor_irq_teardown_locked(void);
+static int sep_sensor_xfer_tx_locked(const void *tx, size_t len);
 
 static struct spi_device *sep_spi;
 static struct gpio_desc *sep_power;
@@ -126,7 +141,7 @@ static int sep_smc_set_power(int on)
 				for (; i >= 0; i--) {
 					rc = sep_smc_write_rail(sep_smc_rails[i], 0);
 					if (rc)
-						pr_err("apple_sep: sensor: SMC rail rollback failed (%d)\n", rc);
+						pr_err_ratelimited("apple_sep: sensor: SMC rail rollback failed (%d)\n", rc);
 				}
 				break;
 			}
@@ -140,7 +155,7 @@ static int sep_smc_set_power(int on)
 		}
 	}
 	if (first_error)
-		pr_err("apple_sep: sensor: SMC rail write failed (%d)\n", first_error);
+		pr_err_ratelimited("apple_sep: sensor: SMC rail write failed (%d)\n", first_error);
 	return first_error;
 }
 
@@ -328,6 +343,52 @@ static void sep_release_power(void)
 	sep_power_source = SEP_POWER_NONE;
 }
 
+static int sep_sensor_set_power_now(int on)
+{
+	if (sep_power_source == SEP_POWER_SMC_RAILS)
+		return sep_smc_set_power(on);
+	if (!sep_power)
+		return -ENODEV;
+	gpiod_set_value_cansleep(sep_power, on);
+	return 0;
+}
+
+static const struct sep_sensor_hw sep_hw = {
+	.set_power = sep_sensor_set_power_now,
+	.send = sep_sensor_xfer_tx_locked,
+};
+
+static int sep_sensor_write_power(struct sep_sensor_lifetime *sensor,
+				  const struct sep_sensor_hw *hw, int on)
+{
+	int rc = hw->set_power(on);
+
+	/* A failed write may have taken effect. */
+	sensor->powered = rc || on;
+	return rc;
+}
+
+/*
+ * As macOS does for a sleep: the sleep command, then the power off. The next
+ * bring-up's power cycle powers the sensor again, so a resume does not.
+ * Returns the power-off's error.
+ */
+static int sep_sensor_sleep_locked(struct sep_sensor_lifetime *sensor,
+				   const struct sep_sensor_hw *hw)
+{
+	WRITE_ONCE(sensor->asleep, true);
+	if (!sensor->powered)
+		return 0;
+	/* Best effort: only the power-off matters. */
+	hw->send(sep_sensor_cmd_sleep, sizeof(sep_sensor_cmd_sleep));
+	return sep_sensor_write_power(sensor, hw, 0);
+}
+
+static int sep_sensor_awake_locked(struct sep_sensor_lifetime *sensor)
+{
+	return READ_ONCE(sensor->asleep) ? -ESHUTDOWN : 0;
+}
+
 #define SEP_CS_TIMING_SOFTWARE	0
 #define SEP_CS_TIMING_HOOK_BYPASSED	1
 #define SEP_CS_TIMING_HARDWARE	2
@@ -462,6 +523,35 @@ static void sep_sensor_remove(struct spi_device *spi)
 	mutex_unlock(&sep_sensor_registry_lock);
 }
 
+static int sep_sensor_suspend(struct device *dev)
+{
+	struct sep_sensor_lifetime *sensor = dev_get_drvdata(dev);
+	bool was_on;
+	int rc;
+
+	mutex_lock(&sensor->lock);
+	was_on = sensor->powered;
+	rc = sep_sensor_sleep_locked(sensor, &sep_hw);
+	mutex_unlock(&sensor->lock);
+	/* Failing the sleep would keep the machine awake; the next bring-up recovers. */
+	if (rc)
+		dev_warn(dev, "sep sensor: power-off for sleep failed (%d)\n", rc);
+	else if (was_on)
+		dev_dbg(dev, "sep sensor: off for sleep\n");
+	return 0;
+}
+
+/* No lock: a capture still waiting on the data-ready line may hold it. */
+static int sep_sensor_resume(struct device *dev)
+{
+	struct sep_sensor_lifetime *sensor = dev_get_drvdata(dev);
+
+	WRITE_ONCE(sensor->asleep, false);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(sep_sensor_pm_ops, sep_sensor_suspend, sep_sensor_resume);
+
 /*
  * Its own compatible, deliberately not spidev's: capture must stay in the
  * kernel, and a spidev node would leak an image to userspace. No
@@ -485,6 +575,7 @@ static struct spi_driver sep_sensor_driver = {
 	.driver = {
 		.name = "apple-mesa",
 		.of_match_table = sep_sensor_of_match,
+		.pm = pm_sleep_ptr(&sep_sensor_pm_ops),
 	},
 	.id_table = sep_sensor_spi_ids,
 	.probe = sep_sensor_probe,
@@ -528,26 +619,16 @@ static int sep_sensor_cs_timing_mode_locked(void)
 }
 
 /* Power cycle: off, 10 ms, on, 7 ms. -ENODEV if there is no power line. */
-static int sep_sensor_power_cycle_locked(void)
+static int sep_sensor_power_cycle_locked(struct sep_sensor_lifetime *sensor)
 {
-	if (sep_power_source == SEP_POWER_SMC_RAILS) {
-		int rc = sep_smc_set_power(0);
+	int rc = sep_sensor_write_power(sensor, &sep_hw, 0);
 
-		if (rc)
-			return rc;
-		msleep(SEP_SENSOR_OFF_DELAY_MS);
-		rc = sep_smc_set_power(1);
-		if (rc)
-			return rc;
-		msleep(SEP_SENSOR_ON_DELAY_MS);
-		return 0;
-	}
-	if (!sep_power)
-		return -ENODEV;
-
-	gpiod_set_value_cansleep(sep_power, 0);
+	if (rc)
+		return rc;
 	msleep(SEP_SENSOR_OFF_DELAY_MS);
-	gpiod_set_value_cansleep(sep_power, 1);
+	rc = sep_sensor_write_power(sensor, &sep_hw, 1);
+	if (rc)
+		return rc;
 	msleep(SEP_SENSOR_ON_DELAY_MS);
 	return 0;
 }
@@ -588,24 +669,13 @@ static const char *sep_sensor_firmware_name_locked(unsigned int index)
 }
 
 /* Powers the sensor on/off, holding the hardware settling delay. */
-static int sep_sensor_power_locked(int on)
+static int sep_sensor_power_locked(struct sep_sensor_lifetime *sensor, int on)
 {
-	if (sep_power_source == SEP_POWER_SMC_RAILS) {
-		int rc = sep_smc_set_power(on ? 1 : 0);
+	int rc = sep_sensor_write_power(sensor, &sep_hw, on ? 1 : 0);
 
-		if (rc)
-			return rc;
-		msleep(on ? SEP_SENSOR_ON_DELAY_MS : SEP_SENSOR_OFF_DELAY_MS);
-		return 0;
-	}
-	if (!sep_power)
-		return -ENODEV;
-
-	gpiod_set_value_cansleep(sep_power, on ? 1 : 0);
-	if (on)
-		msleep(SEP_SENSOR_ON_DELAY_MS);
-	else
-		msleep(SEP_SENSOR_OFF_DELAY_MS);
+	if (rc)
+		return rc;
+	msleep(on ? SEP_SENSOR_ON_DELAY_MS : SEP_SENSOR_OFF_DELAY_MS);
 	return 0;
 }
 
@@ -846,7 +916,7 @@ int sep_sensor_power_cycle(void)
 
 	if (!sensor)
 		return -ENODEV;
-	result = sep_sensor_power_cycle_locked();
+	result = sep_sensor_awake_locked(sensor) ?: sep_sensor_power_cycle_locked(sensor);
 	mutex_unlock(&sensor->lock);
 	return result;
 }
@@ -894,7 +964,7 @@ int sep_sensor_power(int on)
 
 	if (!sensor)
 		return -ENODEV;
-	result = sep_sensor_power_locked(on);
+	result = sep_sensor_awake_locked(sensor) ?: sep_sensor_power_locked(sensor, on);
 	mutex_unlock(&sensor->lock);
 	return result;
 }
@@ -962,7 +1032,7 @@ int sep_sensor_xfer(const void *tx, void *rx, size_t len)
 
 	if (!sensor)
 		return -ENODEV;
-	result = sep_sensor_xfer_locked(tx, rx, len);
+	result = sep_sensor_awake_locked(sensor) ?: sep_sensor_xfer_locked(tx, rx, len);
 	mutex_unlock(&sensor->lock);
 	return result;
 }
@@ -974,7 +1044,7 @@ int sep_sensor_xfer_tx(const void *tx, size_t len)
 
 	if (!sensor)
 		return -ENODEV;
-	result = sep_sensor_xfer_tx_locked(tx, len);
+	result = sep_sensor_awake_locked(sensor) ?: sep_sensor_xfer_tx_locked(tx, len);
 	mutex_unlock(&sensor->lock);
 	return result;
 }
@@ -986,7 +1056,13 @@ int sep_sensor_xfer2(const void *tx, size_t tx_len, void *rx, size_t rx_len)
 
 	if (!sensor)
 		return -ENODEV;
-	result = sep_sensor_xfer2_locked(tx, tx_len, rx, rx_len);
+	result = sep_sensor_awake_locked(sensor) ?:
+		 sep_sensor_xfer2_locked(tx, tx_len, rx, rx_len);
 	mutex_unlock(&sensor->lock);
 	return result;
 }
+
+/* Like the module's Rust tests, which need KUnit built in. */
+#if IS_ENABLED(CONFIG_APPLE_SEP_KUNIT_TEST) && IS_BUILTIN(CONFIG_KUNIT)
+#include "sensor_shim_test.c"
+#endif

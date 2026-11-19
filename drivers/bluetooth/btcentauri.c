@@ -10,11 +10,13 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/etherdevice.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/pci.h>
+#include <linux/property.h>
 #include <linux/random.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
@@ -54,6 +56,22 @@ MODULE_PARM_DESC(arm_auxiliary_rings, "Diagnostic: arm remaining native Beta res
 static bool native_startup;
 module_param(native_startup, bool, 0444);
 MODULE_PARM_DESC(native_startup, "Diagnostic: program a temporary address, InitDone and random seed before the first HCI reset");
+
+static bool factory_address = true;
+module_param(factory_address, bool, 0444);
+MODULE_PARM_DESC(factory_address, "Program the loader-provided local-bd-address before the first HCI reset");
+
+static bool fixup_adv_phy = true;
+module_param(fixup_adv_phy, bool, 0444);
+MODULE_PARM_DESC(fixup_adv_phy, "Mask the firmware's extra bits in LE extended advertising report PHYs");
+
+static bool scan_dup_filter;
+module_param(scan_dup_filter, bool, 0444);
+MODULE_PARM_DESC(scan_dup_filter, "Let the controller drop duplicate LE advertising reports (off: every report reaches the host)");
+
+static bool accept_list;
+module_param(accept_list, bool, 0444);
+MODULE_PARM_DESC(accept_list, "Let the controller filter LE scans by its accept list (off: report its size as 0, the host filters)");
 
 static bool enable_acl;
 module_param(enable_acl, bool, 0444);
@@ -118,6 +136,15 @@ struct cen_bt {
 	u32 proprietary_features, hrb_commands, hrb_status_events;
 	u32 hrb_connection_events;
 	u8 hrb_last_link_type;
+	u32 scan_dup_rewritten, accept_list_hidden;
+	bool transport_paused, transport_sleep_sent;
+	/* MSI backed by a DMA buffer, outside the PCI core's IRQ allocation. */
+	struct {
+		u32 lo, hi;
+		u16 flags, data;
+		u8 cap;
+		bool saved;
+	} sleep_msi;
 };
 
 static u16 cen_tail(struct cen_bt *bt, u16 ring)
@@ -489,6 +516,26 @@ static void cen_normalize_ext_adv(struct sk_buff *skb)
 	}
 }
 
+/*
+ * When a paired LE device is put on the accept list and hci_sync scans
+ * passively with filter policy 1, the N1 sends no advertising report and no
+ * other event at all, so the connection is never made. Unless accept_list is
+ * set, report an accept list of size 0: hci_update_accept_list_sync() then
+ * finds no room and scans with filter policy 0, and the host matches
+ * pend_le_conns itself, as for a controller whose list is full.
+ */
+static void cen_fixup_event(struct cen_bt *bt, struct sk_buff *skb)
+{
+	if (skb->len >= 7 && skb->data[0] == HCI_EV_CMD_COMPLETE &&
+	    get_unaligned_le16(skb->data + 3) == HCI_OP_LE_READ_ACCEPT_LIST_SIZE &&
+	    !skb->data[5] && !accept_list) {
+		bt_dev_info(bt->hdev, "LE accept list (%u entries) not used; the host filters scans",
+			    skb->data[6]);
+		skb->data[6] = 0;
+		bt->accept_list_hidden++;
+	}
+}
+
 static void cen_poll(struct work_struct *work)
 {
 	struct cen_bt *bt = container_of(to_delayed_work(work), struct cen_bt, poll);
@@ -500,7 +547,7 @@ static void cen_poll(struct work_struct *work)
 	int budget = CEN_RX_SLOTS;
 
 	mutex_lock(&bt->lock);
-	if (!bt->running)
+	if (!bt->running || bt->transport_paused)
 		goto unlock;
 	if (readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 2) {
 		/* Preserve already completed diagnostics after abort, without posting
@@ -573,6 +620,7 @@ static void cen_poll(struct work_struct *work)
 				bt->hrb_connection_events++;
 			}
 			cen_normalize_ext_adv(skb);
+			cen_fixup_event(bt, skb);
 			hci_skb_pkt_type(skb) = HCI_EVENT_PKT;
 			hdev->stat.byte_rx += length;
 			hci_recv_frame(hdev, skb);
@@ -673,24 +721,57 @@ static int cen_hci_post_init(struct hci_dev *hdev)
 	return 0;
 }
 
+/*
+ * The factory address in network byte order, for WriteBdAddr, from the
+ * standard local-bd-address (least significant byte first; the loader fills
+ * it from the ADT for the bluetooth0 alias). As in btcentauri_t6050.c.
+ */
+static int cen_bt_address(struct device *dev, u8 address[6])
+{
+	u8 bd[6];
+	int i, ret;
+
+	if (device_property_count_u8(dev, "local-bd-address") != 6)
+		return -ENOENT;
+	ret = device_property_read_u8_array(dev, "local-bd-address", bd, sizeof(bd));
+	if (ret)
+		return ret;
+	for (i = 0; i < 6; i++)
+		address[i] = bd[5 - i];
+	if (is_zero_ether_addr(address) || is_broadcast_ether_addr(address))
+		return -EINVAL;
+	return 0;
+}
+
 static int cen_hci_setup(struct hci_dev *hdev)
 {
 	struct cen_bt *bt = hci_get_drvdata(hdev);
 	u8 address[6], init_done[16], seed[24];
+	bool factory;
 	int ret;
 
-	if (!native_startup)
+	/*
+	 * Without WriteBdAddr the controller reports BD_ADDR 00:00:00:00:00:00
+	 * and bluetoothd ignores it ("No Bluetooth address for index 0").
+	 */
+	factory = factory_address && !cen_bt_address(&bt->pdev->dev, address);
+	if (factory_address && !factory)
+		bt_dev_info(hdev, "No factory local-bd-address from the loader");
+	if (!factory && !native_startup)
 		return 0;
 
 	/* Native PROXIMA initialization starts with these three commands, then
 	 * HCI Reset. The core calls setup before its ordinary reset/init sequence.
-	 * Address provisioning is still diagnostic: use a temporary locally
-	 * administered address, in native WriteBdAddr display/network byte order.
+	 * The address is the factory one when the loader provided it, else
+	 * (diagnostic) a temporary locally administered address, in native
+	 * WriteBdAddr display/network byte order.
 	 */
-	ret = get_random_bytes_wait(address, sizeof(address));
-	if (ret)
-		return ret;
-	address[0] = (address[0] & 0xfc) | 0x02;
+	if (!factory) {
+		ret = get_random_bytes_wait(address, sizeof(address));
+		if (ret)
+			return ret;
+		address[0] = (address[0] & 0xfc) | 0x02;
+	}
 	get_random_bytes(seed, sizeof(seed));
 	memset(init_done, 0xff, sizeof(init_done));
 	ret = cen_vendor_command(hdev, 0xfc06, address, sizeof(address));
@@ -710,7 +791,8 @@ out:
 		bt_dev_err(hdev, "Native startup stopped after %u commands: %d",
 			   bt->native_startup_steps, ret);
 	else
-		bt_dev_info(hdev, "Native startup accepted; temporary diagnostic address in use");
+		bt_dev_info(hdev, "Native startup accepted; %s address in use",
+			    factory ? "factory" : "temporary diagnostic");
 	return ret;
 }
 
@@ -780,13 +862,29 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 		}
 	}
 	mutex_lock(&bt->lock);
+	/*
+	 * The N1 does not reset its duplicate filter when scanning is enabled
+	 * again. A discovery shortly after another one reports only addresses
+	 * not seen before, and so does the passive scan hci_sync starts for a
+	 * pending LE connection: a device found in discovery never matches
+	 * pend_le_conns and no LE Create Connection is sent. Unless
+	 * scan_dup_filter is set, enable scans with Filter_Duplicates = 0; the
+	 * host copes with repeated reports.
+	 */
+	if (hci_skb_pkt_type(skb) == HCI_COMMAND_PKT && skb->len >= 5 && !scan_dup_filter &&
+	    (get_unaligned_le16(skb->data) == HCI_OP_LE_SET_EXT_SCAN_ENABLE ||
+	     get_unaligned_le16(skb->data) == HCI_OP_LE_SET_SCAN_ENABLE) &&
+	    skb->data[3] && skb->data[4] && !skb_ensure_writable(skb, 5)) {
+		skb->data[4] = 0;
+		bt->scan_dup_rewritten++;
+	}
 	if (!bt->running)
 		ret = -ENETDOWN;
 	else if (skb_queue_len(queue) >= 64)
 		ret = -ENOBUFS;
 	else {
 		skb_queue_tail(queue, skb);
-		mod_delayed_work(system_wq, &bt->poll, 0);
+		mod_delayed_work(system_percpu_wq, &bt->poll, 0);
 	}
 	mutex_unlock(&bt->lock);
 	if (!ret)
@@ -823,6 +921,11 @@ static int cen_status_show(struct seq_file *s, void *unused)
 		   readl(bt->bar + 0x18), readl(bt->bar), bt->running,
 		   bt->tx_head, cen_tail(bt, 1), bt->rx_head, cen_tail(bt, 7),
 		   skb_queue_len(&bt->txq));
+	seq_printf(s, "peripheral_exec=%u peripheral_ipc=%u sleep_status=%u transport_paused=%u\n",
+		   le32_to_cpu(READ_ONCE(*(__le32 *)(bt->arena + 0x68))),
+		   le32_to_cpu(READ_ONCE(*(__le32 *)(bt->arena + 0x6c))),
+		   le32_to_cpu(READ_ONCE(*(__le32 *)(bt->arena + 0x70))),
+		   bt->transport_paused);
 	seq_printf(s, "commands=%u events=%u tx_bytes=%u rx_bytes=%u tx_errors=%u rx_errors=%u\n",
 		   bt->hdev->stat.cmd_tx, bt->hdev->stat.evt_rx,
 		   bt->hdev->stat.byte_tx, bt->hdev->stat.byte_rx,
@@ -836,6 +939,10 @@ static int cen_status_show(struct seq_file *s, void *unused)
 		   bt->hrb_status_events, bt->hrb_status_pending);
 	seq_printf(s, "hrb_connection_events=%u hrb_last_link_type=0x%02x\n",
 		   bt->hrb_connection_events, bt->hrb_last_link_type);
+	seq_printf(s, "accept_list=%u accept_list_hidden=%u\n", accept_list,
+		   bt->accept_list_hidden);
+	seq_printf(s, "scan_dup_filter=%u scan_dup_rewritten=%u\n", scan_dup_filter,
+		   bt->scan_dup_rewritten);
 	seq_printf(s, "acl_enabled=%u acl_tx=%u acl_rx=%u acl_queued=%u le_queued=%u\n",
 		   enable_acl, bt->hdev->stat.acl_tx, bt->hdev->stat.acl_rx,
 		   skb_queue_len(&bt->acl_txq), skb_queue_len(&bt->le_txq));
@@ -901,7 +1008,8 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct hci_dev *hdev;
 	int ret;
 
-	if (!(of_machine_is_compatible("apple,j813") || of_machine_is_compatible("apple,j873g")) ||
+	if (!(of_machine_is_compatible("apple,j813") || of_machine_is_compatible("apple,j815") ||
+	      of_machine_is_compatible("apple,j873g")) ||
 	    PCI_FUNC(pdev->devfn) != 2)
 		return -ENODEV;
 	bt = devm_kzalloc(&pdev->dev, sizeof(*bt), GFP_KERNEL);
@@ -962,6 +1070,14 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->send = cen_hci_send;
 	hdev->setup = cen_hci_setup;
 	hdev->post_init = cen_hci_post_init;
+	/*
+	 * The N1 sets bits above the PHY value in LE Extended Advertising
+	 * Reports, as on T6050 (btcentauri_t6050.c). Unmasked, no PHY matches in
+	 * hci_le_ext_create_conn_sync(): LE Extended Create Connection goes out
+	 * with no initiating PHY and LE devices never connect.
+	 */
+	if (fixup_adv_phy)
+		hci_set_quirk(hdev, HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY);
 	SET_HCIDEV_DEV(hdev, &pdev->dev);
 	hci_set_drvdata(hdev, bt);
 	pci_set_drvdata(pdev, bt);
@@ -1001,27 +1117,129 @@ static void cen_remove(struct pci_dev *pdev)
  * bus mastering off, and the next poll stopped the transport for good) and
  * the PCIe host powered. Polling pauses across the sleep.
  */
+/*
+ * 26B123 AirshipDK: Beta sleep_control is BAR0 + 0x1078. Host sleep
+ * writes 3 and waits for peripheral_info.sleep_status == 3; wake writes
+ * 0 and waits for status 0 (active) or 1 (device sleep). The peripheral
+ * info block is at context + 0x68, with sleep_status at +8.
+ *
+ * Qualified on J813 with the installed Linux firmware.
+ * All ring doorbells must stay paused until the wake acknowledgment.
+ */
+static u32 cen_sleep_status(struct cen_bt *bt)
+{
+	return le32_to_cpu(READ_ONCE(*(__le32 *)(bt->arena + 0x70)));
+}
+
+static int cen_transport_state(struct cen_bt *bt, bool asleep)
+{
+	u32 status;
+	int ret;
+
+	if (readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 2)
+		return -EIO;
+	dma_wmb();
+	writel(asleep ? 3 : 0, bt->bar + 0x1078);
+	ret = read_poll_timeout(cen_sleep_status, status,
+				asleep ? status == 3 : status <= 1,
+				100, 2000000, false, bt);
+	dma_rmb();
+	dev_dbg(&bt->pdev->dev,
+		"ACIPC host %s: ret=%d status=%u exec=%u ipc=%u\n",
+		asleep ? "sleep" : "wake", ret, status,
+		readl(bt->bar + 0x18), readl(bt->bar));
+	return ret;
+}
+
+static int cen_resume(struct device *dev);
+
 static int cen_suspend(struct device *dev)
 {
 	struct cen_bt *bt = pci_get_drvdata(to_pci_dev(dev));
+	struct pci_dev *pdev = bt->pdev;
+	u16 flags;
+	int cap, ret;
 
+	mutex_lock(&bt->lock);
+	bt->transport_paused = true;
+	mutex_unlock(&bt->lock);
 	cancel_delayed_work_sync(&bt->poll);
+	if (of_machine_is_compatible("apple,j813") && bt->ipc_requested) {
+		bt->transport_sleep_sent = true;
+		ret = cen_transport_state(bt, true);
+		if (ret)
+			goto undo;
+	}
+	bt->sleep_msi.saved = false;
+	cap = pci_find_capability(pdev, PCI_CAP_ID_MSI);
+	if (cap && !pdev->msi_enabled &&
+	    !pci_read_config_word(pdev, cap + PCI_MSI_FLAGS, &flags) &&
+	    (flags & PCI_MSI_FLAGS_ENABLE) && (flags & PCI_MSI_FLAGS_64BIT)) {
+		bt->sleep_msi.cap = cap;
+		bt->sleep_msi.flags = flags;
+		bt->sleep_msi.saved =
+			!pci_read_config_dword(pdev, cap + PCI_MSI_ADDRESS_LO, &bt->sleep_msi.lo) &&
+			!pci_read_config_dword(pdev, cap + PCI_MSI_ADDRESS_HI, &bt->sleep_msi.hi) &&
+			!pci_read_config_word(pdev, cap + PCI_MSI_DATA_64, &bt->sleep_msi.data);
+	}
+	dev_dbg(dev, "Beta suspend exec=%x ipc=%x fallback MSI saved=%d\n",
+		readl(bt->bar + 0x18), readl(bt->bar), bt->sleep_msi.saved);
 	device_set_awake_path(dev);
-	return pci_save_state(to_pci_dev(dev));
+	ret = pci_save_state(pdev);
+	if (!ret)
+		return 0;
+undo:
+	cen_resume(dev);
+	return ret;
+}
+
+static int cen_resume_noirq(struct device *dev)
+{
+	struct cen_bt *bt = pci_get_drvdata(to_pci_dev(dev));
+	struct pci_dev *pdev = bt->pdev;
+	int cap = bt->sleep_msi.cap;
+
+	dev_dbg(dev, "Beta noirq exec=%x ipc=%x fallback MSI saved=%d\n",
+		readl(bt->bar + 0x18), readl(bt->bar), bt->sleep_msi.saved);
+	/*
+	 * PERST clears MSI. The PCI core only restores vectors it allocated;
+	 * Centauri's DMA-backed MSI mailbox is programmed directly by the
+	 * Control driver. Restore it before interrupts and polling resume.
+	 */
+	if (bt->sleep_msi.saved && !pdev->msi_enabled) {
+		pci_write_config_word(pdev, cap + PCI_MSI_FLAGS,
+				      bt->sleep_msi.flags & ~PCI_MSI_FLAGS_ENABLE);
+		pci_write_config_dword(pdev, cap + PCI_MSI_ADDRESS_LO, bt->sleep_msi.lo);
+		pci_write_config_dword(pdev, cap + PCI_MSI_ADDRESS_HI, bt->sleep_msi.hi);
+		pci_write_config_word(pdev, cap + PCI_MSI_DATA_64, bt->sleep_msi.data);
+		pci_write_config_word(pdev, cap + PCI_MSI_FLAGS, bt->sleep_msi.flags);
+	}
+	return 0;
 }
 
 static int cen_resume(struct device *dev)
 {
 	struct cen_bt *bt = pci_get_drvdata(to_pci_dev(dev));
+	int ret;
 
+	if (bt->transport_sleep_sent) {
+		ret = cen_transport_state(bt, false);
+		if (ret)
+			return ret;
+		bt->transport_sleep_sent = false;
+	}
 	mutex_lock(&bt->lock);
+	bt->transport_paused = false;
 	if (bt->running)
 		schedule_delayed_work(&bt->poll, 0);
 	mutex_unlock(&bt->lock);
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(cen_pm_ops, cen_suspend, cen_resume);
+static const struct dev_pm_ops cen_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(cen_suspend, cen_resume)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, cen_resume_noirq)
+};
 
 static const struct pci_device_id cen_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1903) },

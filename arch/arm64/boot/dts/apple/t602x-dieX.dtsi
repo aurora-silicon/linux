@@ -160,7 +160,7 @@
 	};
 
 	DIE_NODE(pinctrl_nub): pinctrl@29e1f0000 {
-		compatible = "apple,t6020-pinctrl", "apple,t8103-pinctrl", "apple,pinctrl";
+		compatible = "apple,t6020-pinctrl", "apple,t8103-pinctrl";
 		reg = <0x2 0x9e1f0000 0x0 0x4000>;
 		power-domains = <&DIE_NODE(ps_nub_gpio)>;
 
@@ -189,7 +189,7 @@
 	};
 
 	DIE_NODE(pinctrl_aop): pinctrl@2a6820000 {
-		compatible = "apple,t6020-pinctrl", "apple,t8103-pinctrl", "apple,pinctrl";
+		compatible = "apple,t6020-pinctrl", "apple,t8103-pinctrl";
 		reg = <0x2 0xa6820000 0x0 0x4000>;
 
 		gpio-controller;
@@ -315,7 +315,7 @@
 	};
 
 	DIE_NODE(pinctrl_ap): pinctrl@39b028000 {
-		compatible = "apple,t6020-pinctrl", "apple,t8103-pinctrl", "apple,pinctrl";
+		compatible = "apple,t6020-pinctrl", "apple,t8103-pinctrl";
 		reg = <0x3 0x9b028000 0x0 0x4000>;
 
 		interrupt-parent = <&aic>;
@@ -371,7 +371,6 @@
 		dmas = <&DIE_NODE(sio) 0x66>;
 		dma-names = "tx";
 		power-domains = <&DIE_NODE(ps_dpa1)>;
-		reset-domains = <&DIE_NODE(ps_dpa1)>;
 		status = "disabled";
 
 		ports {
@@ -392,7 +391,6 @@
 		dmas = <&DIE_NODE(sio) 0x68>;
 		dma-names = "tx";
 		power-domains = <&DIE_NODE(ps_dpa2)>;
-		reset-domains = <&DIE_NODE(ps_dpa2)>;
 		status = "disabled";
 
 		ports {
@@ -416,7 +414,6 @@
 		dmas = <&DIE_NODE(sio) 0x6a>;
 		dma-names = "tx";
 		power-domains = <&DIE_NODE(ps_dpa3)>;
-		reset-domains = <&DIE_NODE(ps_dpa3)>;
 		status = "disabled";
 
 		ports {
@@ -437,7 +434,6 @@
 		dmas = <&DIE_NODE(sio) 0x6c>;
 		dma-names = "tx";
 		power-domains = <&DIE_NODE(ps_dpa4)>;
-		reset-domains = <&DIE_NODE(ps_dpa4)>;
 		status = "disabled";
 
 		ports {
@@ -591,7 +587,7 @@
 				<0x7 0x21000000 0x0 0x8000>,
 				<0x7 0x20004000 0x0 0x4000>,
 				<0x7 0x20200000 0x0 0x4000>,
-				<0x7 0x21100000 0x0 0x4000>,
+				<0x7 0x21010000 0x0 0x4000>,
 				<0x7 0x2100c000 0x0 0x4000>;
 			reg-names = "config", "rc", "port0", "fabric",
 				    "debug", "ltssm", "intr2axi";
@@ -818,7 +814,7 @@
 				<0xb 0x21000000 0x0 0x8000>,
 				<0xb 0x20004000 0x0 0x4000>,
 				<0xb 0x20200000 0x0 0x4000>,
-				<0xb 0x21100000 0x0 0x4000>,
+				<0xb 0x21010000 0x0 0x4000>,
 				<0xb 0x2100c000 0x0 0x4000>;
 			reg-names = "config", "rc", "port0", "fabric",
 				    "debug", "ltssm", "intr2axi";
@@ -1045,7 +1041,7 @@
 				<0xf 0x21000000 0x0 0x8000>,
 				<0xf 0x20004000 0x0 0x4000>,
 				<0xf 0x20200000 0x0 0x4000>,
-				<0xf 0x21100000 0x0 0x4000>,
+				<0xf 0x21010000 0x0 0x4000>,
 				<0xf 0x2100c000 0x0 0x4000>;
 			reg-names = "config", "rc", "port0", "fabric",
 				    "debug", "ltssm", "intr2axi";
@@ -1247,9 +1243,19 @@
 
 #ifdef APPLE_T602X_NON_ULTRA
 	DIE_NODE(usb4_3_pcie_tunnel): usb4-pcie-tunnel-3 {
+#else
+	DIE_NODE(usb4_3_pcie_tunnel): usb4-pcie-tunnel@1320000000 {
+#endif
 		#address-cells = <2>;
 		#size-cells = <2>;
+#ifdef APPLE_T602X_NON_ULTRA
 		ranges;
+#else
+		/* Identity-map the controller and PCIe memory windows. */
+		ranges = <0x13 0x20000000 0x13 0x20000000 0x0 0x20000000>,
+			 <0x14 0x0 0x14 0x0 0x2 0x80000000>;
+		status = "disabled";
+#endif
 
 		DIE_NODE(apciec3_dart): iommu@1321008000 {
 			compatible = "apple,t8110-dart";
@@ -1259,6 +1265,9 @@
 			#iommu-cells = <1>;
 			apple,dma-range = <0x0 0x80000000 0x0 0x80000000>;
 			apple,dma-offset = <0x100 0x0>;
+#ifndef APPLE_T602X_NON_ULTRA
+			status = "disabled";
+#endif
 		};
 
 		DIE_NODE(apciec3): pcie@1330000000 {
@@ -1270,7 +1279,7 @@
 				<0x13 0x21000000 0x0 0x8000>,
 				<0x13 0x20004000 0x0 0x4000>,
 				<0x13 0x20200000 0x0 0x4000>,
-				<0x13 0x21100000 0x0 0x4000>,
+				<0x13 0x21010000 0x0 0x4000>,
 				<0x13 0x2100c000 0x0 0x4000>;
 			reg-names = "config", "rc", "port0", "fabric",
 				    "debug", "ltssm", "intr2axi";
@@ -1278,6 +1287,9 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1318 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&DIE_NODE(ps_atc3_pcie)>;
+#ifndef APPLE_T602X_NON_ULTRA
+			status = "disabled";
+#endif
 
 			msi-controller;
 			msi-parent = <&DIE_NODE(apciec3)>;
@@ -1316,7 +1328,6 @@
 			};
 		};
 	};
-#endif
 
 	DIE_NODE(dwc3_3): usb@1302280000 {
 		compatible = "apple,t6020-dwc3", "apple,t8103-dwc3";

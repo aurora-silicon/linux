@@ -22,6 +22,8 @@
 	aliases {
 		bluetooth0 = &bluetooth0;
 		ethernet0 = &ethernet0;
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		wifi0 = &wifi0;
 	};
 };
@@ -275,3 +277,6 @@
 };
 
 #include "hwmon-mini.dtsi"
+
+
+#include "t8112-j473-peripherals.dtsi"

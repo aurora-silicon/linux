@@ -1,0 +1,193 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/crypto/apple,aes.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple AES engine
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  AES hardware attached to the SIO DART. The register banks are the
+  engine, shared control and auxiliary control windows, in that order.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6000-aes
+          - apple,t6020-aes
+          - apple,t6021-aes
+          - apple,t6022-aes
+          - apple,t6030-aes
+          - apple,t6031-aes
+          - apple,t6032-aes
+          - apple,t6041-aes
+          - apple,t6050-aes
+          - apple,t8103-aes
+          - apple,t8112-aes
+          - apple,t8122-aes
+          - apple,t8132-aes
+          - apple,t8140-aes
+  required:
+    - compatible
+
+properties:
+  compatible: true
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8132-aes
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t8132-aes
+            - const: apple,aes
+
+        reg:
+          minItems: 3
+          maxItems: 3
+
+        interrupts:
+          maxItems: 1
+
+        power-domains:
+          maxItems: 1
+
+        iommus:
+          maxItems: 1
+
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - power-domains
+        - iommus
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-aes
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-aes
+                  - const: apple,aes
+
+              reg:
+                minItems: 2
+                maxItems: 2
+
+              interrupts:
+                maxItems: 1
+
+              power-domains:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
+          else:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t6000-aes
+                      - apple,t6020-aes
+                      - apple,t6021-aes
+                      - apple,t6022-aes
+                      - apple,t6030-aes
+                      - apple,t6031-aes
+                      - apple,t6041-aes
+                      - apple,t6050-aes
+                      - apple,t8103-aes
+                      - apple,t8112-aes
+                      - apple,t8122-aes
+                      - apple,t8140-aes
+                  - const: apple,aes
+
+              reg:
+                minItems: 2
+                maxItems: 3
+                description: Engine and control banks, with an auxiliary bank on later variants.
+
+              interrupts:
+                maxItems: 1
+
+              power-domains:
+                maxItems: 1
+
+              iommus:
+                minItems: 1
+                maxItems: 2
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
+
+            allOf:
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        enum:
+                          - apple,t6000-aes
+                          - apple,t6020-aes
+                          - apple,t6021-aes
+                          - apple,t6022-aes
+                          - apple,t6030-aes
+                          - apple,t6031-aes
+                          - apple,t8103-aes
+                          - apple,t8112-aes
+                          - apple,t8122-aes
+                then:
+                  properties:
+                    reg:
+                      maxItems: 2
+                else:
+                  properties:
+                    reg:
+                      minItems: 3
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t6000-aes
+                then:
+                  properties:
+                    iommus:
+                      minItems: 2
+                else:
+                  properties:
+                    iommus:
+                      maxItems: 1
+
+            additionalProperties: false
+
+unevaluatedProperties: false

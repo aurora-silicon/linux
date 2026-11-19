@@ -10,7 +10,9 @@
 #include <linux/device.h>
 #include <linux/ioport.h>
 #include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
@@ -30,6 +32,7 @@
 #include "dcp-180hz.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
+#include "iomfb_v27.h"
 #include "iomfb-state.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
@@ -37,6 +40,7 @@
 #include "iomfb_v14_7_tpl.h"
 #include "iomfb_v26_6.h"
 #include "iomfb_v26_6_desktop.h"
+#include "dcp-peer-frames-v27.h"
 #include "epic/dpavservep.h"
 #include "version_utils.h"
 
@@ -46,6 +50,7 @@
 
 struct apple_dcp;
 struct iomfb_m4;
+struct ext26_control;
 struct apple_dcp_afkep;
 struct dcp_method_entry;
 
@@ -73,6 +78,7 @@ struct apple_dcp_typec_port;
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
+bool dcp_swap_lost(struct apple_dcp *dcp, u32 swap_id);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
 bool dcp_typec_relink(struct apple_dcp *dcp);
@@ -103,8 +109,20 @@ enum {
 	AV_AUDIO_ENDPOINT_DESKTOP = 0x2b,
 	DPTX_ENDPOINT = 0x2a,
 	DPTX_ENDPOINT_V2 = 0x2c,
-	HDCP_ENDPOINT = 0x2b,
+	/*
+	 * Compact desktop/M4 firmware: the panel processor advertises
+	 * dcpav-video-interface-epic on 0x2b, the external ones the audio
+	 * service (AV_AUDIO_ENDPOINT_DESKTOP).  Nothing HDCP lives here.
+	 */
+	AV_VIDEO_ENDPOINT = 0x2b,
+	/*
+	 * 0x2d is the remote allocator for the IOMFB firmware (H17P, 27.0
+	 * internal), which must be started before IOMFB.  Compact desktop/M4
+	 * firmware advertises dcpdptx-hdcp-interface on it instead, one per
+	 * processor (disp0, dispext0, dispext1).  Bind HDCP by service name.
+	 */
 	REMOTE_ALLOC_ENDPOINT = 0x2d,
+	DPTX_HDCP_ENDPOINT = 0x2d,
 	IOMFB_ENDPOINT = 0x37,
 };
 
@@ -205,8 +223,26 @@ struct dcp_panel {
 	u32 peak_nits;
 	/// EDR headroom ceiling x1000 from the ADT (desktop 26.x; 0 if none)
 	u32 edr_ceiling;
-	/// calibrated colour target from apple,color-gamut; NULL if not given
+	/// calibrated colour target from the raw ADT; NULL if not given
 	const struct dcp_color_space *color_target;
+};
+
+/*
+ * The internal display's power words for hw.s2r, see dcp_s2r_domains_off(): its domains'
+ * offsets in "ps", its retention controls in "pwrgate" (the PMGR's per-device "retention"
+ * words: flip-flops 3 off / 0 on, memories 0 off / 1 on), and the DART streams its firmware
+ * and scanout use.
+ */
+struct dcp_s2r_layout {
+	u32 disp_cpu;
+	u32 disp_fe;
+	u32 disp_sys;
+	u32 ret_ff;
+	u32 ret_mem;
+	u32 dcp_streams;
+	u32 disp_streams;
+	/* "pmc-dcp" counts the powered DCPs: T8132 and T8140 only */
+	bool pmc_dcp;
 };
 
 /*
@@ -229,9 +265,11 @@ enum dcp_iomfb_method_profile {
 	DCP_IOMFB_METHODS_DEFAULT,
 	DCP_IOMFB_METHODS_H17G,
 	DCP_IOMFB_METHODS_H17P_EXTERNAL,
+	DCP_IOMFB_METHODS_J613_EXT26,
 };
 
 struct apple_dcp_hw_data {
+	u8 firmware_dma_bits;
 	u32 num_dptx_ports;
 	enum dcp_iomfb_method_profile iomfb_method_profile;
 	/*
@@ -259,6 +297,45 @@ struct apple_dcp_hw_data {
 	 * (desktop 26.x), see dcp_sink_metadata().
 	 */
 	bool sink_metadata_edid;
+	/*
+	 * One info line per connection of an external display with its link, sink and mode,
+	 * see dcp_link_report(). With it come a search of every firmware log line and the
+	 * EDID's CRC at get_modes; without it none of the three is done. Cleared at probe on
+	 * every board but the one it has run on (dcp.c, dcp_j714s_ext()).
+	 */
+	bool link_report;
+	/*
+	 * The endpoint the DPTX port services are announced on, where it is not
+	 * the firmware's default (DPTX_ENDPOINT_V2 on firmware 27): the T8142
+	 * dcpext announces them on DPTX_ENDPOINT. 0: the default.
+	 */
+	u8 dptx_endpoint;
+	/*
+	 * Open the DPTX controller endpoint before the ports, as for H17P
+	 * externals: the T8142 dcpext announces AppleDCPDPTXController there.
+	 */
+	bool dptx_controller;
+	/*
+	 * With H17P firmware: a firmware-driven system sleep stops the internal processor's
+	 * firmware and powers it down, as DPMS off does, then restarts it warm, see
+	 * dcp_s2r_suspend(). @s2r_ext: the same for an external one, see dcp_s2r_ext_suspend().
+	 */
+	bool s2r;
+	bool s2r_ext;
+	/* The firmware crashes on any mode but the 120 Hz boot timing, see dcp_mode_settable(). */
+	bool only_120hz_modes;
+	/* A firmware 27 sleep in progress, and how it ended */
+	bool v27_sleep_protocol;
+	bool v27_sleep_recovery;
+	/* Required with @s2r */
+	const struct dcp_s2r_layout *s2r_layout;
+	/* @s2r with derived power words: off unless appledrm.s2r_untested is set */
+	bool s2r_untested;
+	/*
+	 * @s2r without a secure mailbox: the SoC's ADT has no dcp-exclave-mailbox (T8142, on
+	 * firmware 27.0 and 27.2.1), so there is no secure port to idle before the IOP.
+	 */
+	bool s2r_no_secure_port;
 };
 
 enum dcp_test_point {
@@ -337,6 +414,8 @@ struct dcp_desktop_state {
 	 * framebuffer was evicted; the first atomic enable reuses them.
 	 */
 	bool trial_powered, trial_modeset_ok;
+	/* The takeover kept the loader's mode without setting it. */
+	bool takeover_adopted;
 	u32 trial_timing_mode_id, trial_color_mode_id;
 	/* Result of the last power-on: 0 ok, 1 timeout, 2 failed. */
 	u8 poweron_result;
@@ -360,6 +439,8 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 					       const struct dcp_display_mode *modes,
 					       unsigned int count, u64 *generation);
 bool dcp_panel_metadata_current(struct apple_dcp *dcp, u64 generation);
+
+void dcp_s2r_dart_power(struct apple_dcp *dcp, u32 on);
 
 struct apple_dcp {
 	/* Generation-specific wire/transaction state, sharing the common KMS owner. */
@@ -398,6 +479,12 @@ struct apple_dcp {
 	struct delayed_work hybrid_wq;
 	struct dcp_peer_tiling peer_tiling;
 	bool peer_unbinding;
+	/*
+	 * T6050: the platform limit left this display no pair when last
+	 * evaluated (dcp_peer_hints_v27(), dcp_peer_limit_update_v27()). Under
+	 * dcp_peer_lock.
+	 */
+	bool peer_limited;
 	/* Firmware display endpoint (its Disp_Index), apple,dcp-endpoint;
 	 * separate from index, which also selects the doorbell and PHY mode. */
 	u32 peer_endpoint;
@@ -415,6 +502,10 @@ struct apple_dcp {
 	struct apple_rtkit *rtk;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
+	/* Protected by dcp_peer_lock; never take the physical route lock in
+	 * an AFK callback (a route operation may be waiting for that reply).
+	 */
+	struct dcp_peer_frames_v27 peer_frames;
 
 	struct apple_dcp_hw_data hw;
 	bool external_prepared;
@@ -446,9 +537,14 @@ struct apple_dcp {
 	enum dcp_firmware_version fw_compat;
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
+	/* Firmware 27.x: the method IDs of this build (iomfb_v27_methods()). */
+	const struct dcp_method_entry *v27_methods;
 	bool external;
+	/* A desktop 26.x external processor (apple,t6041-dcpext) */
+	bool desktop_external;
 	/*
-	 * T8122 dcpext: the panel's DRM device never waits on this processor.
+	 * A failsafe dcpext (dcp_ext_is_failsafe(): T8122's, T6041's, T6050's):
+	 * the DRM device of the other displays never waits on this processor.
 	 * A probe or bind failure leaves it in the device as an unusable pipe
 	 * (ext_dead): no CRTC, Type-C routes disabled or ignored, RTKit
 	 * messages dropped. See dcp_platform_probe().
@@ -503,6 +599,43 @@ struct apple_dcp {
 
 	/* DCP has crashed */
 	bool crashed;
+	/* Native26 control/property epochs, serialized by the IOMFB owner. */
+	struct completion ext26_link_ready;
+	bool ext26_services_open;
+	bool ext26_client_open;
+	struct apple_dcp_afkep *ext26_aux[3];
+	u32 ext26_stride;
+	u64 ext26_edid_generation;
+	bool ext26_edid_tried;
+	u64 ext26_rx_ns;
+	u64 ext26_power_ns;
+	u64 ext26_generation;
+	u64 ext26_buffer_bytes;
+	bool ext26_blocked;
+	bool ext26_pm_work_off;
+	bool ext26_stopping;
+	bool ext26_blanked;
+	bool ext26_pm_preparing;
+	bool ext26_control_pending;
+	bool ext26_early_complete;
+	u32 ext26_early_id;
+	u64 ext26_early_ns;
+	u32 ext26_control_id;
+	struct ext26_control *ext26_control;
+	struct work_struct ext26_blank_work;
+	struct list_head ext26_retained;
+	u64 ext26_retained_bytes;
+	unsigned int ext26_epochs;
+	struct drm_display_mode ext26_mode;
+	DECLARE_BITMAP(ext26_released, DCP_MAX_MAPPINGS);
+	bool ext26_power_sent;
+	bool ext26_normal;
+	struct completion ext26_ready;
+	iomfb_cb_handler *ext26_handlers;
+	u8 ext26_present[0x1bd8];
+
+	/* CoreAnalytics events dumped in full (dcpep_cb_core_analytics_v27). */
+	u32 analytics_dumps;
 
 	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 
@@ -514,6 +647,26 @@ struct apple_dcp {
 	/* clock rate request by dcp in */
 	struct clk *clk;
 	struct clk *clk_194;
+	struct clk_bulk_data *firmware_clocks;
+	unsigned int num_firmware_clocks;
+	u64 disp_firmware_base[MAX_DISP_REGISTERS];
+	u32 dfb_format, dfb_compression;
+	u64 dfb_region_size;
+	bool dfb_format_valid, dfb_compression_valid;
+	struct list_head iomfb_boolean_properties;
+	u32 iomfb_boolean_property_count;
+	u32 external_pipes_v27, external_displays_v27, external_suppression_v27;
+	struct dcp_swap_submit_req_v27 present_v27;
+	/* Both paired wire records belong to the primary endpoint lock. */
+	struct dcp_swap_submit_req_v27 peer_present_v27;
+	/*
+	 * Swaps go out as A407 with its longer request, from these records: on the J714s with
+	 * the 27.0 method table, where A407 has run (v27_methods is then the J714s's copy of
+	 * that table). Everywhere else A408 and the records above, as before.
+	 */
+	bool v27_a407;
+	struct dcp_swap_submit_req_v27_a407 present_v27_a407;
+	struct dcp_swap_submit_req_v27_a407 peer_present_v27_a407;
 
 	/* DCP shared memory */
 	void *shmem;
@@ -573,6 +726,15 @@ struct apple_dcp {
 	u32 last_swap_id;
 	/* last_swap_id is only meaningful after the first swap completes */
 	bool have_swap_complete;
+	/* swap id of the last started swap */
+	u32 started_swap_id;
+	/*
+	 * A started swap whose flip a commit gave up on
+	 * (dcp_drm_crtc_flip_lost()); event_lock. Firmware that does not track
+	 * its presents ignores its completion, see dcp_swap_lost().
+	 */
+	u32 lost_swap_id;
+	bool swap_lost;
 	ktime_t swap_start;
 	u64 swap_submit_timestamp;
 
@@ -614,10 +776,17 @@ struct apple_dcp {
 	u32 edr_hm;
 	u32 edr_sdr;
 	bool edr_restart;
+	/* Firmware 27: when the headroom last moved, and short of its target. */
+	ktime_t edr_step;
+	bool edr_ramping;
+	/* SDR white in nits of the present being built (H17P backlight) */
+	u32 edr_present_sdr;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */
 	struct completion start_done;
+	/* IOMFB has published fresh modes and acknowledged a Type-C display. */
+	struct completion typec_display_ready;
 
 	/* Is the DCP booted? */
 	bool active;
@@ -625,6 +794,69 @@ struct apple_dcp {
 	bool pipe_enabled_h17p;
 	/* Messages from the coprocessor are held in the mailbox for sleep. */
 	bool rx_held;
+
+	/* A firmware-driven suspend stops the firmware, see dcp_s2r_suspend(). */
+	struct apple_dcp_afkep *sleep_v27_ep[0x20];
+	/* The J714s normal method table, panel services and swap profile. */
+	bool v27_j714s;
+	/* Sleep endpoint inventory and control replies; not a normal RPC profile. */
+	bool v27_sleep_transport;
+	struct dcp_v27_sleep *sleep_v27;
+	bool sleep_v27_closed;
+	/*
+	 * Its display on a USB-C port was released for a firmware sleep and the DRM device
+	 * has not resumed since: the CRTC's saved mode is not restored (it resumes disabled,
+	 * and the display's return has user space set a mode again).
+	 */
+	bool sleep_v27_torn;
+	/* V27 sleep: the wait for an HPD low's answer while a display that never returned is let go */
+	unsigned int v27_hpd_low_ms;
+	/* Unhandled application traffic permanently invalidates the sleep's inventory. */
+	bool sleep_v27_unhandled;
+	bool s2r_active;
+	bool s2r_stopped;
+	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
+	bool dpms_powered_off;
+	/* Refused its idle with the display off: the firmware still runs, the display is dark. */
+	bool s2r_refused_off;
+	/* The firmware's secure mailbox, where it has one. */
+	struct apple_rtkit *secure_rtk;
+	bool secure_answered;
+	bool secure_polling;
+	/* Polled every jiffy until then, see dcp_secure_poll(). */
+	unsigned long secure_fast_until;
+	int secure_map_ret;
+	s64 secure_map_us;
+	struct delayed_work secure_poll_wq;
+	/* Stopped and not restarted, which outlives a suspend that gets refused. */
+	bool s2r_fw_down;
+	/* DCPEXT kept down through a dark wake, see dcp_s2r_dark_finish(). */
+	bool s2r_dark_held;
+	struct notifier_block s2r_pm_nb;
+	/* This driver raised the display domains, and nothing has lowered them since. */
+	bool s2r_domains_up;
+	/* Firmware started by the resume, panel still dark: DPMS on lights it. */
+	bool s2r_prewarmed;
+	struct work_struct s2r_prewarm_work;
+	struct delayed_work s2r_prewarm_off_wq;
+	/* Orders the start from the resume and its timeout against DPMS on and off. */
+	struct mutex s2r_prewarm_lock;
+	/* This wake lights the panel from the resume too: full wake, lid read open. */
+	bool s2r_wake_light;
+	/* Lit by the resume, with the CRTC still off: DPMS on has nothing left to power. */
+	bool s2r_wake_lit;
+	ktime_t s2r_wake_lit_at;
+	/* The retained scanout is from before the sleep; with hold, no present reuses it. */
+	bool s2r_scanout_stale;
+	bool s2r_scanout_hold;
+	/* Counted in pmc-dcp, the number of powered DCPs */
+	bool pmc_up;
+	bool s2r_power_on;
+	bool s2r_power_oob;
+	u8 s2r_step;
+	struct completion s2r_dart_done;
+	struct device *s2r_disp_dart;
+	struct device *s2r_dcp_dart;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;
@@ -705,6 +937,19 @@ struct apple_dcp {
 	bool dpav_ctrl_open;
 
 	struct dptx_port dptxport[2];
+	/* The last link report, and the connection it was for; DSC as the firmware last named it */
+	char link_line[120];
+	u64 link_line_generation;
+	u8 link_dsc;
+
+	/* V27 sleep: the panel's next mode set is the mode it already has */
+	bool v27_keep_mode;
+	/* V27 sleep: the output area of the call being pushed holds this (an in/out word) */
+	const void *push_out_prefill;
+
+	/* firmware 27 panel: its AV and DP service endpoints, by endpoint - 0x20 */
+	struct apple_dcp_afkep *panelav[0x20];
+	struct workqueue_struct *panelav_wq;
 
 	/* debugfs entries */
 	struct dentry *ep_debugfs[0x20];
@@ -776,6 +1021,8 @@ struct apple_dcp {
 	u64 typec_follow_gen;
 	/* dcp_poweron() reconnects DPTX; its own modeset follows the HPD */
 	bool typec_poweron_hpd;
+	/* A Type-C CRTC enable runs: its own mode set follows, the link is not bad */
+	bool typec_enable_pending;
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
@@ -837,8 +1084,14 @@ struct apple_dcp {
 		struct iomfb_transaction *active;
 		struct task_struct *owner;
 		struct work_struct work;
+		spinlock_t callback_lock;
+		struct list_head callbacks;
+		struct work_struct callback_work;
+		unsigned int callback_count;
 		struct delayed_work timeout;
 		struct delayed_work backlight_retry;
+		/* A firmware 27 panel's EDR ramp on a still frame (iomfb_edr_tick()) */
+		struct delayed_work edr_tick;
 		unsigned long deadline;
 		unsigned int queued;
 		bool stopped;
@@ -874,6 +1127,21 @@ struct apple_dcp {
 	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
 	struct dcp_hdmi *hdmi;
 
+	/*
+	 * Interrupts of a Thunderbolt DP tunnel's DP IN adapter, to pass to
+	 * the DPTX port; see apple_dcp_tb_dp_event().
+	 */
+	struct work_struct tb_event_work;
+	/* Serializes event delivery against attachment retirement. */
+	struct mutex tb_event_lock;
+	struct apple_dcp_typec_route *tb_event_route;
+	u64 tb_event_generation;
+	unsigned long tb_events;
+	bool tb_event_hpd;
+	unsigned int tb_irq_hpd_count;
+	unsigned int tb_hpd_count;
+	ktime_t tb_irq_hpd_last;
+
 	/* Kept last: the template instances share the layout above. */
 	struct dcp_desktop_state *desktop;
 	/* Internal panel identity; NULL without an internal panel. */
@@ -890,7 +1158,8 @@ static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
 /* Presents carry nits; one serialized IOMFB owner. */
 static inline bool dcp_presents_nits(const struct apple_dcp *dcp)
 {
-	return (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	return ((dcp->fw_compat == DCP_FIRMWARE_H17P ||
+	         dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
 	       iomfb_is_m4(dcp);
 }
@@ -899,6 +1168,7 @@ static inline bool dcp_presents_nits(const struct apple_dcp *dcp)
 static inline bool dcp_fail_stop(const struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_H17P ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
 	       iomfb_is_m4(dcp);
 }
 
@@ -911,14 +1181,17 @@ void dcp_firmware_metadata_attributes(struct apple_dcp *dcp,
 				      const struct dcp_display_metadata *attributes);
 void dcp_firmware_metadata_timing(struct apple_dcp *dcp);
 bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation);
-const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation);
+const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation,
+					 u32 *defaults);
 
 void iomfb_scanout_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_backlight_h17p(struct apple_dcp *dcp);
+void iomfb_present_matrix_h17p(struct apple_dcp *dcp);
 bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_failed_h17p(struct apple_dcp *dcp);
 bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp);
+bool iomfb_present_has_surface_h17p(const struct dcp_swap_submit_req_h17p *request);
 bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 				const struct dcp_swap_submit_req_h17p *request,
 				struct dcp_present_h17p *wire);
@@ -928,8 +1201,11 @@ void iomfb_opaque_x_reset_h17p(struct apple_dcp *dcp);
 int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
 				   bool inherited_valid, u32 inherited,
 				   bool default_valid, u32 default_nits);
+int iomfb_queue_callback(struct apple_dcp *dcp, dcp_callback_t callback,
+			 const void *data, size_t size, void *cookie);
 void iomfb_queue_init(struct apple_dcp *dcp);
 void iomfb_queue_stop(struct apple_dcp *dcp);
+void iomfb_reset_transport(struct apple_dcp *dcp);
 bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);
 int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout);
 void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause);
@@ -975,12 +1251,31 @@ int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
+extern int fw27_panel_boot_mode;
+extern int notify_clients_form;
 
 /*
  * The desktop 26.6 panel takes VRR_ENABLED on its live mode, through the
  * adaptive sync minimum rate (see dcp_vrr_update()).  The external
  * processors ignore a new minimum on a live mode.
  */
+/*
+ * Desktop 26.x swaps that the watchdog follows: adaptive ones, and those on a
+ * loader mode the takeover adopted until one of them completes.
+ */
+static inline bool dcp_desktop_swap_watched(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	       (READ_ONCE(dcp->vrr_enabled) ||
+		(dcp->desktop && READ_ONCE(dcp->desktop->takeover_adopted)));
+}
+
+static inline void dcp_takeover_adopt_proven(struct apple_dcp *dcp)
+{
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->desktop)
+		WRITE_ONCE(dcp->desktop->takeover_adopted, false);
+}
+
 static inline bool dcp_vrr_live(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->main_display &&
@@ -1001,6 +1296,11 @@ static inline bool dcp_fw_is_14_7(const struct apple_dcp *dcp)
 		dcp->hw.fw_14_7_endpoints);
 }
 
+static inline bool dcp_is_ext26(const struct apple_dcp *dcp)
+{
+	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_J613_EXT26;
+}
+
 /*
  * The T6030 external processor (the J514S/J516S built-in HDMI port and
  * USB-C displays) driven natively through Aurora's DCPLink session: DCP
@@ -1011,6 +1311,15 @@ static inline bool dcp_fw_is_14_7(const struct apple_dcp *dcp)
 static inline bool dcp_is_v14_7_external(const struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_14_7 && dcp->external_native;
+}
+
+/*
+ * Firmware 27's external processors (the T6050 DCPEXTs): their DP/HDMI
+ * audio service is the desktop one, on endpoint 0x2b (see av.c).
+ */
+static inline bool dcp_is_v27_external(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->hw.num_dptx_ports;
 }
 
 /* The 14.7 internal panel (J514S/J516S), presented through DCPLink. */
@@ -1033,8 +1342,35 @@ void dcp_external_audio_start(struct apple_dcp *dcp);
 static inline bool dcp_ext_dptx_607(const struct apple_dcp *dcp)
 {
 	/* Not the generic M1/M2 DCPs this tree also runs on the template. */
-	return dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE &&
-	       dcp->hw.fw_14_7_endpoints;
+	return (dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE &&
+		dcp->hw.fw_14_7_endpoints);
+}
+
+/*
+ * Whether this DCP reads a surface's element geometry as the surface record
+ * defines it: bytes per element (pix_size, a linear plane's tile_size), the
+ * element's width and height in pixels, and compression information only for
+ * a compressed plane. Only firmware 27 (DCP_FIRMWARE_V_27_0, which only
+ * T6050's DCP hw data selects) is tested with it. Earlier firmware keeps the
+ * fixed 1/1/1 and has_compr_info 1 it has run on: before widening this,
+ * check a linear XRGB8888 and an NV12 swap, and the default framebuffer, on
+ * 12.x-26.x firmware.
+ */
+static inline bool dcp_surface_element_geometry(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+}
+
+/*
+ * Whether @pa, a physical address the DCP firmware placed a buffer at, can be
+ * DRAM. On Apple SoCs every device register window lies below DRAM, so an
+ * address below all of Linux's RAM may be a device's registers and is never
+ * mapped as memory. The firmware's own segments lie in DRAM beside Linux's RAM.
+ */
+static inline bool dcp_fw_phys_in_dram(phys_addr_t pa)
+{
+	return pa && region_intersects(0, pa, IORESOURCE_SYSTEM_RAM,
+				       IORES_DESC_NONE) != REGION_DISJOINT;
 }
 
 #define DCP_AUDIO_MAX_CHANS 15

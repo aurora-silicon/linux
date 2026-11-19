@@ -25,6 +25,7 @@ struct device_link {
 static pthread_mutex_t apple_g15_display_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct device *apple_t6030_display;
 static struct device *apple_t6031_display;
+static struct device *apple_t8132_display;
 static struct device_node display_node = { "apple,t6030-display-subsystem" },
 			  gpu_node = { "apple,agx-t6030" },
 			  other_node = { "apple,display-subsystem" },

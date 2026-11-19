@@ -23,6 +23,7 @@
 #include <linux/scatterlist.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/spinlock.h>
 #include <linux/suspend.h>
 #include <linux/workqueue.h>
@@ -527,7 +528,7 @@ static void t8132_ext_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_commit
 		if (READ_ONCE(out->dying))
 			t8132_ext_send_event(out);
 		else
-			mod_delayed_work(system_wq, &out->flip_work,
+			mod_delayed_work(system_percpu_wq, &out->flip_work,
 					 ret >= 0 ? 0 : msecs_to_jiffies(16));
 	}
 }
@@ -1089,7 +1090,7 @@ int t8132_ext_drm_init(struct drm_device *drm)
 	bool mine, reg;
 	int ret = 0;
 
-	if (!of_machine_is_compatible("apple,j713"))
+	if (!apple_t8132_firmware_path())
 		return 0;
 	/* Sleep handling for the outputs of one DRM device only. */
 	mutex_lock(&t8132_ext_reg_lock);

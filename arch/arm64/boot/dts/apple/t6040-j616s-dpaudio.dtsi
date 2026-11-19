@@ -1,18 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * DPA1 and DPA2 belong to DCPEXT0 and DCPEXT1, respectively. SIO supplies
- * their sample streams; neither interface has AP-side registers. Keep the
- * clients disabled until the T6041 SIO firmware backend and loader handoff
- * are available and the compact audio protocol has been qualified.
+ * their sample streams; neither interface has AP-side registers.
+ *
+ * Both chains are enabled: the SIO DART, mailbox and CPU domain, DPA1 and
+ * DPA2 and their clients. The SIO itself stays disabled here: iBoot has
+ * loaded its firmware, and the boot loader enables the node once it has
+ * reserved that firmware and published the T6041 boot tables (it finds it
+ * by the alias). Without a T6041-aware loader DPA1 and DPA2 wait for their
+ * DMA channels and nothing else changes. The DCP side starts unless
+ * appledrm.hdmi_audio=0.
  */
 
 / {
+	aliases {
+		sio = &sio;
+	};
+
 	dpaudio1: audio-controller-1 {
 		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
 		dmas = <&sio 0x66>;
 		dma-names = "tx";
 		power-domains = <&ps_dpa1>;
-		status = "disabled";
+		status = "okay";
 
 		ports {
 			#address-cells = <1>;
@@ -32,7 +42,7 @@
 		dmas = <&sio 0x68>;
 		dma-names = "tx";
 		power-domains = <&ps_dpa2>;
-		status = "disabled";
+		status = "okay";
 
 		ports {
 			#address-cells = <1>;
@@ -74,4 +84,40 @@
 			};
 		};
 	};
+};
+
+/*
+ * The SIO firmware drives the SPI, UART and DP audio shims, so keep their
+ * parents on while it runs, as on T6000, T8112 and T8140. The ADT lists
+ * only SIO as SIO_CPU's parent. Without this, SPI_P stays on only because
+ * the QSPI controller never runtime-suspends, and UART_P is left as iBoot
+ * set it; a T8140 SIO with SPI_P/UART_P off crashes at boot.
+ */
+&ps_sio_cpu {
+	power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
+	status = "okay";
+};
+
+&ps_uart_p {
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
+};
+
+&ps_dpa_p {
+	status = "okay";
+};
+
+&ps_dpa1 {
+	status = "okay";
+};
+
+&ps_dpa2 {
+	status = "okay";
 };

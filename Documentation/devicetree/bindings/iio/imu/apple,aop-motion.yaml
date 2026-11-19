@@ -25,12 +25,16 @@ properties:
     oneOf:
       - items:
           - enum:
+              - apple,t6000-aop-accel
               - apple,t6041-aop-accel
+              - apple,t8112-aop-accel
               - apple,t8132-aop-accel
           - const: apple,aop-accel
       - items:
           - enum:
+              - apple,t6000-aop-gyro
               - apple,t6041-aop-gyro
+              - apple,t8112-aop-gyro
               - apple,t8132-aop-gyro
           - const: apple,aop-gyro
 

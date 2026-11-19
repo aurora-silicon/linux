@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <kunit/test.h>
 #include <linux/module.h>
+#include <linux/soc/apple/clpc.h>
 
 #include "ane_fw_cold.h"
 #include "ane_fw_sleep.h"
+
+static const struct ane_fw_platform ane_cold_t8140 = { .dart_revision = 0x203 };
+static const struct ane_fw_platform ane_cold_t6050 = { .dart_revision = 0x204 };
 
 static struct ane_fw_cold_state ane_cold_fixture(void)
 {
@@ -25,14 +29,21 @@ static void ane_cold_evidence_test(struct kunit *test)
 {
 	struct ane_fw_cold_state s = ane_cold_fixture();
 
-	KUNIT_EXPECT_TRUE(test, ane_fw_cold_valid(&s, true));
-	KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, false));
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, false));
 	/*
 	 * ANE_SYS is no marker: it may read on while genpd reports off, and
 	 * generic DART runtime PM powers it off again.
 	 */
 	s.sys = 0x2300;
-	KUNIT_EXPECT_TRUE(test, ane_fw_cold_valid(&s, true));
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
+	/* Each SoC's ANE DARTs report their own revision; another one is refused. */
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, &ane_cold_t6050, true));
+	for (unsigned int i = 0; i < ANE_FW_DARTS; i++)
+		s.dart[i].version = 0x2a2a0204;
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_valid(&s, &ane_cold_t6050, true));
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_engine_restartable(&s, &ane_cold_t6050));
 }
 
 /*
@@ -49,12 +60,12 @@ static void ane_cold_step_test(struct kunit *test)
 	s.gate_request = 0;
 	KUNIT_EXPECT_TRUE(test, ane_fw_cold_pmgr_valid(&s, true));
 	KUNIT_EXPECT_FALSE(test, ane_fw_cold_gate_valid(&s));
-	KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_valid(&s));
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_valid(&s, &ane_cold_t8140));
 	s = ane_cold_fixture();
 	s.cpu = 0x0f0003ff;
 	KUNIT_EXPECT_FALSE(test, ane_fw_cold_pmgr_valid(&s, true));
 	KUNIT_EXPECT_TRUE(test, ane_fw_cold_gate_valid(&s));
-	KUNIT_EXPECT_TRUE(test, ane_fw_cold_engine_valid(&s));
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_engine_valid(&s, &ane_cold_t8140));
 	s = ane_cold_fixture();
 	s.subblock = 0x3ff;
 	KUNIT_EXPECT_FALSE(test, ane_fw_cold_pmgr_valid(&s, true));
@@ -82,22 +93,22 @@ static void ane_cold_warm_test(struct kunit *test)
 		s = original;
 		word = (u32 *)((u8 *)&s + offsets[i]);
 		*word ^= 1;
-		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, true));
+		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
 	}
 	for (unsigned int i = 0; i < 8; i++) {
 		s = original;
 		s.scratch[i] = 1;
-		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, true));
+		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
 	}
 	s = original;
 	s.rvbar++;
-	KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, true));
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
 	s = original;
 	s.ce_state = 1;
-	KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, true));
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
 	s = original;
 	s.ce_error = BIT_ULL(63);
-	KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, true));
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
 }
 
 static void ane_cold_dart_test(struct kunit *test)
@@ -107,21 +118,21 @@ static void ane_cold_dart_test(struct kunit *test)
 	for (unsigned int i = 0; i < ANE_FW_DARTS; i++) {
 		s = original;
 		s.dart[i].version++;
-		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, true));
+		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
 		s = original;
 		s.dart[i].protect |= BIT(0);
-		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, true));
+		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
 		s = original;
 		s.dart[i].lock |= BIT(2);
-		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, true));
+		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
 		s = original;
 		s.dart[i].error = 1;
-		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, true));
+		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
 		/* The bound DART driver enables all streams; that is not a refusal. */
 		for (unsigned int j = 0; j < 16; j++) {
 			s = original;
 			s.dart[i].enabled[j] = U32_MAX;
-			KUNIT_EXPECT_TRUE(test, ane_fw_cold_valid(&s, true));
+			KUNIT_EXPECT_TRUE(test, ane_fw_cold_valid(&s, &ane_cold_t8140, true));
 		}
 	}
 }
@@ -305,23 +316,23 @@ static void ane_cold_restartable_test(struct kunit *test)
 {
 	struct ane_fw_cold_state s, original = ane_cold_fixture();
 
-	KUNIT_EXPECT_TRUE(test, ane_fw_cold_engine_restartable(&original));
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_engine_restartable(&original, &ane_cold_t8140));
 	s = original;
 	s.status = 0x62;
 	s.ce_state = 5;
 	s.scratch[6] = 9;
-	KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_valid(&s));
-	KUNIT_EXPECT_TRUE(test, ane_fw_cold_engine_restartable(&s));
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_valid(&s, &ane_cold_t8140));
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_engine_restartable(&s, &ane_cold_t8140));
 	for (unsigned int i = 0; i < ANE_FW_DARTS; i++) {
 		s = original;
 		s.dart[i].error = 1;
-		KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_restartable(&s));
+		KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_restartable(&s, &ane_cold_t8140));
 		s = original;
 		s.dart[i].lock |= BIT(2);
-		KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_restartable(&s));
+		KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_restartable(&s, &ane_cold_t8140));
 		s = original;
 		s.dart[i].protect |= BIT(0);
-		KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_restartable(&s));
+		KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_restartable(&s, &ane_cold_t8140));
 	}
 }
 
@@ -337,7 +348,25 @@ static void ane_cold_rvbar_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_fw_rvbar_check(0x20000000001ULL, text), ANE_FW_RVBAR_FOREIGN);
 }
 
+/* The boot/transport configs intentionally leave the floor driver disabled. */
+static void ane_cold_no_clpc_test(struct kunit *test)
+{
+#if !IS_REACHABLE(CONFIG_APPLE_CLPC)
+	struct apple_clpc_ane *ane = NULL;
+	struct device dev = {};
+
+	KUNIT_EXPECT_EQ(test, apple_clpc_ane_get(&dev, &ane), 0);
+	KUNIT_EXPECT_PTR_EQ(test, ane, NULL);
+	apple_clpc_ane_set_active(ane, true);
+	apple_clpc_ane_set_active(ane, false);
+	apple_clpc_ane_put(ane);
+#else
+	kunit_skip(test, "CLPC enabled; absence is covered by the CLPC suite");
+#endif
+}
+
 static struct kunit_case ane_cold_cases[] = {
+	KUNIT_CASE(ane_cold_no_clpc_test),
 	KUNIT_CASE(ane_cold_restartable_test),
 	KUNIT_CASE(ane_cold_rvbar_test),
 	KUNIT_CASE(ane_cold_sleep_test),

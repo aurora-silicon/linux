@@ -45,6 +45,7 @@ typedef uint64_t dma_addr_t;
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))
 #define VISIBLE_IF_KUNIT
+#define EXPORT_SYMBOL_IF_KUNIT(sym)
 #define AVD_QUIRK_LSR 1
 #define AVD_QUIRK_NO_PIPE_STATE 2
 #define AVD_QUIRK_H264_MV_128 (1U << 4)
@@ -114,7 +115,7 @@ struct avd_ctx { struct avd_dev *dev; void *priv; struct avd_job job; unsigned i
  dma_addr_t job_fifo; struct avd_buf inst;
 };
 struct avd_run { struct { struct vb2_v4l2_buffer *dst; } bufs;
- dma_addr_t comp_out, y_out, uv_out; };
+ dma_addr_t comp_out, y_out, uv_out; int setup_err; };
 struct dma_site { unsigned int segment,word,shift,width; dma_addr_t addr; };
 static struct dma_site dma_sites[256];static unsigned int dma_count;
 static void record_dma(struct avd_ctx *ctx,dma_addr_t addr,unsigned int shift,unsigned int width) {
@@ -334,6 +335,17 @@ int main(int argc, char **argv)
   assert(!avd_qfw_stream(&dev,words,32));
   assert(q.wp==(u32)(start+32));
   for(unsigned int i=0;i<32;i++)assert(readl(q.sram+4*((u32)(start+i)%0x1800))==words[i]);
+ }
+ /* After the u32 wrap, the reader still in the short last lap (slot 3000):
+  * the writer may fill slots 0-2999 only, not the 2048 slots that lap skipped. */
+ {
+  static u32 many[3100];u32 rp=(u32)(0x100000000ULL-4096+3000);
+  for(unsigned int i=0;i<3100;i++)many[i]=0x56780000U+i;
+  memset(q.sram,0,0x10000);writel(0xdeadbeef,q.sram+4*3000);
+  q.wp=0;writel(rp,q.sram+0x7ff8);
+  assert(avd_qfw_stream(&dev,many,3100)==-ETIMEDOUT);
+  assert(q.wp==3000);
+  assert(readl(q.sram+4*2999)==many[2999]&&readl(q.sram+4*3000)==0xdeadbeef);
  }
  /* A sole fatal completion must keep DMA buffers owned until reset. */
  memset(q.sram,0,0x10000);jiffies=123;
@@ -728,6 +740,16 @@ def conformance(out):
         data = subprocess.check_output([str(exe)], text=True)
         programs[label] = dict(line.split(' ', 1) for line in data.splitlines())
         (out / (label + '.json')).write_text(json.dumps(programs[label], indent=2) + '\n')
+    # The baseline set the temporal-direct bit (15) of the slice reference
+    # header word for every slice; it belongs to B slices only. Clear it in
+    # the baseline I/P programs so the checks below compare everything else.
+    for key, program in programs['before'].items():
+        parts = key.split('/')
+        if len(parts) == 5 and parts[0].isdigit() and parts[2] != '1':
+            programs['before'][key] = ' '.join(
+                f'{int(w, 16) & ~0x8000:08x}'
+                if len(w) == 8 and int(w, 16) >> 18 == 0x2d << 6 else w
+                for w in program.split())
     unchanged = sparse = normalized = 0
     for key, program in programs['after'].items():
         if key.startswith('guard/type/'):

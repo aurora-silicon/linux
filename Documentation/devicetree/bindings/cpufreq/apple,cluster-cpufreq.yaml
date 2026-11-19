@@ -38,6 +38,7 @@ properties:
       - const: apple,s5l8960x-cluster-cpufreq
       - const: apple,t8140-cluster-cpufreq
       - const: apple,t8142-cluster-cpufreq
+      - const: apple,t6050-cluster-cpufreq
       - const: apple,t8152-cluster-cpufreq
       - items:
           - enum:
@@ -45,6 +46,7 @@ properties:
               - apple,t6030-cluster-cpufreq
               - apple,t6031-cluster-cpufreq
               - apple,t6041-cluster-cpufreq
+              - apple,t6050-cluster-cpufreq
               - apple,t8122-cluster-cpufreq
           - const: apple,t8112-cluster-cpufreq
 
@@ -63,8 +65,18 @@ properties:
       - items:
           - description: PMP report region
           - description: Cluster lane (0 for E, 1 for P on T8140; 0 for
-              E, 1 for P0, 2 for P1 on T6041)
+              E, 1 for P0, 2 for P1 on T6041; 0 for M0, 1 for M1, 2 for P
+              on T6050)
             enum: [0, 1, 2]
+
+  apple,firmware-managed-thermal:
+    type: boolean
+    description:
+      The boot loader leaves the cluster's voltage and PLL control with the
+      firmware for the whole time Linux runs. The firmware does not lower
+      the requested performance state itself; where it publishes an effort,
+      apple,fast-die-effort lets the OS enforce it. The T6050 driver
+      registers DVFS only when this is present.
 
   '#performance-domain-cells':
     const: 0
@@ -73,6 +85,16 @@ required:
   - compatible
   - reg
   - '#performance-domain-cells'
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-cluster-cpufreq
+    then:
+      required:
+        - apple,firmware-managed-thermal
 
 additionalProperties: false
 

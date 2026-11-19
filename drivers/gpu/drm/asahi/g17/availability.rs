@@ -98,14 +98,33 @@ impl Availability {
     /// Wakes every waiter of this domain. Call after dropping the resource's own lock; fence
     /// callbacks run outside the domain lock.
     pub(crate) fn notify(&self) {
-        let mut waiters = {
+        self.advance();
+    }
+
+    /// [`Self::notify`] for a caller that sampled `observed` and is giving back its own claim,
+    /// never published, before it waits. Returns the sample it waits on next: the new
+    /// generation if nothing else changed the domain since `observed`, so its own notification
+    /// does not end its wait at once, and `observed` otherwise, so it retries.
+    pub(crate) fn notify_own(&self, observed: u64) -> u64 {
+        if self.advance() == observed {
+            observed.wrapping_add(1)
+        } else {
+            observed
+        }
+    }
+
+    /// Notifies, returning the generation before this notification.
+    fn advance(&self) -> u64 {
+        let (previous, mut waiters) = {
             let mut state = self.state.lock();
-            state.generation = state.generation.wrapping_add(1);
-            state.waiters.take()
+            let previous = state.generation;
+            state.generation = previous.wrapping_add(1);
+            (previous, state.waiters.take())
         };
         while let Some(mut entry) = waiters {
             waiters = entry.next.take();
             entry.fence.signal();
         }
+        previous
     }
 }

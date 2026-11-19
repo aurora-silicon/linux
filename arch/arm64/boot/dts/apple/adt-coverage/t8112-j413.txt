@@ -1,0 +1,616 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Device name, address and DT path only; - means no usable reg address.
+/cpus - -> /cpus
+/cpus/cpu0 /cpus@0x0 -> /cpus/cpu@0
+/cpus/cpu1 /cpus@0x1 -> /cpus/cpu@1
+/cpus/cpu2 /cpus@0x2 -> /cpus/cpu@2
+/cpus/cpu3 /cpus@0x3 -> /cpus/cpu@3
+/cpus/cpu4 /cpus@0x100 -> /cpus/cpu@10100
+/cpus/cpu5 /cpus@0x101 -> /cpus/cpu@10101
+/cpus/cpu6 /cpus@0x102 -> /cpus/cpu@10102
+/cpus/cpu7 /cpus@0x103 -> /cpus/cpu@10103
+/arm-io 0x210f00000 -> WAIVED: ADT SoC bus container; child hardware is inventoried separately.
+/arm-io/spi2 0x235108000 -> /soc/spi@235108000
+/arm-io/spi2/mesa /arm-io/spi2@0x0 -> /soc/spi@235108000/fingerprint@0
+/arm-io/spi4 0x235110000 -> /soc/spi@235110000
+/arm-io/spi4/dp855 /arm-io/spi4@0x0 -> /soc/spi@235110000/panel-timing-controller@0
+/arm-io/spi4/dp855/lcd-pmicwp /arm-io/spi4/dp855@0x4f -> WAIVED: Firmware write-protection view of the panel power-management interface mediated by DP855; not an independent host bus device.
+/arm-io/spi4/dp855/lcd-pmic /arm-io/spi4/dp855@0x74 -> WAIVED: Firmware panel power-management register-access view mediated by DP855; its address is internal to the TCON transport.
+/arm-io/spi4/dp855/lcd-sswp /arm-io/spi4/dp855@0x71 -> WAIVED: Firmware write-protection view of the panel source-driver interface mediated by DP855; not an independent host bus device.
+/arm-io/spi4/dp855/lcd-ss /arm-io/spi4/dp855@0x40 -> WAIVED: Firmware panel source-driver register-access view mediated by DP855; its address is internal to the TCON transport.
+/arm-io/spi4/dp855/tcon-registers /arm-io/spi4/dp855@0x0 -> WAIVED: Firmware register-access view of the DP855 itself; the panel timing controller represents this hardware.
+/arm-io/spi4/dp855/lcd-eeprom /arm-io/spi4/dp855@0x0 -> WAIVED: Firmware view of panel nonvolatile storage mediated by DP855; no independently addressed host bus endpoint.
+/arm-io/i2c1 0x235014000 -> /soc/i2c@235014000
+/arm-io/i2c1/audio-speaker /arm-io/i2c1@0x38 -> /soc/i2c@235014000/codec@38
+/arm-io/i2c1/audio-speaker-left-tweeter /arm-io/i2c1@0x39 -> /soc/i2c@235014000/codec@39
+/arm-io/i2c2 0x235018000 -> /soc/i2c@235018000
+/arm-io/i2c2/atcrt0 /arm-io/i2c2@0x18 -> /soc/i2c@235018000/retimer@18
+/arm-io/i2c2/atcrt1 /arm-io/i2c2@0x19 -> /soc/i2c@235018000/retimer@19
+/arm-io/i2c3 0x23501c000 -> /soc/i2c@23501c000
+/arm-io/i2c3/audio-speaker-right-woofer /arm-io/i2c3@0x3b -> /soc/i2c@23501c000/codec@3b
+/arm-io/i2c3/audio-speaker-right-tweeter /arm-io/i2c3@0x3c -> /soc/i2c@23501c000/codec@3c
+/arm-io/i2c3/audio-codec-output /arm-io/i2c3@0x4b -> /soc/i2c@23501c000/codec@4b
+/arm-io/i2c4 0x235020000 -> /soc/i2c@235020000
+/arm-io/i2c4/avellino-pre /arm-io/i2c4@0x77 -> /soc/i2c@235020000/avellino@77
+/arm-io/i2c4/avellino-post /arm-io/i2c4@0x44 -> /soc/i2c@235020000/avellino@44
+/arm-io/fpwm1 0x235044000 -> /soc/pwm@235044000
+/arm-io/fpwm1/kbd-backlight - -> /led-controller
+/arm-io/alc0 - -> /soc/aop@24ac00000
+/arm-io/alc0/audio-leap-mic - -> /soc/aop@24ac00000
+/arm-io/wlan - -> /soc/pcie@690000000/pci@0,0/wifi@0,0
+/arm-io/bluetooth - -> /soc/pcie@690000000/pci@0,0/bluetooth@0,1
+/arm-io/apcie 0x690000000 -> /soc/pcie@690000000
+/arm-io/apcie/pci-bridge0 - -> /soc/pcie@690000000/pci@0,0
+/arm-io/apcie/pci-bridge0/wlan - -> /soc/pcie@690000000/pci@0,0/wifi@0,0
+/arm-io/apcie/pci-bridge0/bluetooth-pcie - -> /soc/pcie@690000000/pci@0,0/bluetooth@0,1
+/arm-io/dart-apcie0 0x681008000 -> /soc/iommu@681008000
+/arm-io/dart-apcie0/mapper-apcie0-wlan - -> /soc/iommu@681008000
+/arm-io/dart-apcie0/mapper-apcie0-bt - -> /soc/iommu@681008000
+/arm-io/apciec0 0x3b0000000 -> /soc/usb4-pcie-tunnel-0/pcie@3b0000000
+/arm-io/apciec0/pcic0-bridge - -> /soc/usb4-pcie-tunnel-0/pcie@3b0000000/pci@0,0
+/arm-io/dart-apciec0 0x3a1008000 -> /soc/usb4-pcie-tunnel-0/iommu@3a1008000
+/arm-io/dart-apciec0/mapper-pciec0-piodma - -> /soc/usb4-pcie-tunnel-0/iommu@3a1008000
+/arm-io/apciec0-piodma 0x3a2000000 -> /soc/dma-controller@3a2000000
+/arm-io/acio0 0x381f00000 -> /soc/cio@381ac0000/nhi@f00000
+/arm-io/dart-acio0 0x381a80000 -> /soc/cio@381ac0000/iommu@a80000
+/arm-io/dart-acio0/mapper-acio0 - -> /soc/cio@381ac0000/iommu@a80000
+/arm-io/acio-cpu0 0x381108000 -> /soc/mailbox@381108000
+/arm-io/acio-cpu0/iop-acio0-nub - -> /soc/mailbox@381108000
+/arm-io/apciec1 0x530000000 -> /soc/usb4-pcie-tunnel-1/pcie@530000000
+/arm-io/apciec1/pcic1-bridge - -> /soc/usb4-pcie-tunnel-1/pcie@530000000/pci@0,0
+/arm-io/dart-apciec1 0x521008000 -> /soc/usb4-pcie-tunnel-1/iommu@521008000
+/arm-io/dart-apciec1/mapper-pciec1-piodma - -> /soc/usb4-pcie-tunnel-1/iommu@521008000
+/arm-io/apciec1-piodma 0x522000000 -> /soc/dma-controller@522000000
+/arm-io/acio1 0x501f00000 -> /soc/cio@501ac0000/nhi@f00000
+/arm-io/dart-acio1 0x501a80000 -> /soc/cio@501ac0000/iommu@a80000
+/arm-io/dart-acio1/mapper-acio1 - -> /soc/cio@501ac0000/iommu@a80000
+/arm-io/acio-cpu1 0x501108000 -> /soc/mailbox@501108000
+/arm-io/acio-cpu1/iop-acio1-nub - -> /soc/mailbox@501108000
+/arm-io/display-crossbar0 - -> /soc/dcp@231c00000
+/arm-io/atc0-dpxbar 0x38304c000 -> /soc/mux@38304c000
+/arm-io/atc0-dpphy - -> /soc/phy@383000000
+/arm-io/atc0-dpin0 0x381e50000 -> /soc/displayport-input@381e50000
+/arm-io/atc0-dpin1 0x381e58000 -> /soc/displayport-input@381e58000
+/arm-io/atc1-dpxbar 0x50304c000 -> /soc/mux@50304c000
+/arm-io/atc1-dpphy - -> /soc/phy@503000000
+/arm-io/atc1-dpin0 0x501e50000 -> /soc/displayport-input@501e50000
+/arm-io/atc1-dpin1 0x501e58000 -> /soc/displayport-input@501e58000
+/arm-io/mcc 0x200100000 -> /soc/memory-controller@200100000
+/arm-io/aic 0x23b0c0000 -> /soc/interrupt-controller@23b0c0000
+/arm-io/aic-timebase 0x23b0dc000 -> /soc/timer@23b0dc000
+/arm-io/wdt 0x23d2b0000 -> /soc/watchdog@23d2b0000
+/arm-io/error-handler 0x200100000 -> /soc/error-handler@200100000
+/arm-io/dwi 0x23b200000 -> /soc/dwi@23b200000
+/arm-io/pwm 0x235040000 -> /soc/pwm@235040000
+/arm-io/aes 0x23500c000 -> /soc/aes@23500c000
+/arm-io/gpio 0x23c100000 -> /soc/pinctrl@23c100000
+/arm-io/aop-gpio 0x24a820000 -> /soc/pinctrl@24a820000
+/arm-io/nub-gpio 0x23d1f0000 -> /soc/pinctrl@23d1f0000
+/arm-io/smc-gpio 0x23e820000 -> /soc/pinctrl@23e820000
+/arm-io/aop 0x24a400000 -> /soc/aop@24ac00000
+/arm-io/aop/iop-aop-nub - -> /soc/aop@24ac00000
+/arm-io/aop/iop-aop-nub/accel - -> /soc/aop@24ac00000/accel
+/arm-io/aop/iop-aop-nub/gyro - -> /soc/aop@24ac00000/gyro
+/arm-io/aop/iop-aop-nub/aop-audio - -> /soc/aop@24ac00000
+/arm-io/aop/iop-aop-nub/aop-audio/audio-pdm2 - -> /soc/aop@24ac00000
+/arm-io/aop/iop-aop-nub/aop-audio/dc-800000 - -> /soc/aop@24ac00000
+/arm-io/aop/iop-aop-nub/aop-audio/dc-2400000 - -> /soc/aop@24ac00000
+/arm-io/aop/iop-aop-nub/aop-audio/audio-hp - -> /soc/aop@24ac00000
+/arm-io/aop/iop-aop-nub/aop-audio/audio-lp-mic-in - -> /soc/aop@24ac00000
+/arm-io/dart-aop 0x24a808000 -> /soc/iommu@24a808000
+/arm-io/dart-aop/mapper-aop - -> /soc/iommu@24a808000
+/arm-io/dart-aop/mapper-aop-admac - -> /soc/iommu@24a808000
+/arm-io/dart-aop/mapper-scm - -> /soc/iommu@24a808000
+/arm-io/pmgr 0x23b700000 -> /soc/power-management@23b700000
+/arm-io/pmgr/clpc - -> WAIVED: Firmware performance policy; PMGR and PMP hardware are inventoried separately.
+/arm-io/pmgr/soc-tuner - -> WAIVED: Firmware tuning policy; not an independent hardware block.
+/arm-io/pmgr/ppm - -> WAIVED: Firmware power policy; PMGR and PMP hardware are inventoried separately.
+/arm-io/pmgr/power-devices - -> WAIVED: ADT power-device collection container; individual power-state records are checked separately.
+/arm-io/pmgr/power-devices/ECPU0 0x23b700000 -> /soc/power-management@23b700000/power-controller@0
+/arm-io/pmgr/power-devices/ECPU1 0x23b700008 -> /soc/power-management@23b700000/power-controller@8
+/arm-io/pmgr/power-devices/ECPU2 0x23b700010 -> /soc/power-management@23b700000/power-controller@10
+/arm-io/pmgr/power-devices/ECPU3 0x23b700018 -> /soc/power-management@23b700000/power-controller@18
+/arm-io/pmgr/power-devices/PCPU0 0x23b700020 -> /soc/power-management@23b700000/power-controller@20
+/arm-io/pmgr/power-devices/PCPU1 0x23b700028 -> /soc/power-management@23b700000/power-controller@28
+/arm-io/pmgr/power-devices/PCPU2 0x23b700030 -> /soc/power-management@23b700000/power-controller@30
+/arm-io/pmgr/power-devices/PCPU3 0x23b700038 -> /soc/power-management@23b700000/power-controller@38
+/arm-io/pmgr/power-devices/ECPM 0x23b700040 -> /soc/power-management@23b700000/power-controller@40
+/arm-io/pmgr/power-devices/PCPM 0x23b700048 -> /soc/power-management@23b700000/power-controller@48
+/arm-io/pmgr/power-devices/SBR 0x23b700100 -> /soc/power-management@23b700000/power-controller@100
+/arm-io/pmgr/power-devices/AIC 0x23b700108 -> /soc/power-management@23b700000/power-controller@108
+/arm-io/pmgr/power-devices/DWI 0x23b700110 -> /soc/power-management@23b700000/power-controller@110
+/arm-io/pmgr/power-devices/SOC_SPMI0 0x23b700118 -> /soc/power-management@23b700000/power-controller@118
+/arm-io/pmgr/power-devices/GPIO 0x23b700120 -> /soc/power-management@23b700000/power-controller@120
+/arm-io/pmgr/power-devices/PMS_BUSIF 0x23b700128 -> /soc/power-management@23b700000/power-controller@128
+/arm-io/pmgr/power-devices/PMS 0x23b700130 -> /soc/power-management@23b700000/power-controller@130
+/arm-io/pmgr/power-devices/PMS_FPWM0 - -> WAIVED: Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+/arm-io/pmgr/power-devices/PMS_FPWM1 - -> WAIVED: Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+/arm-io/pmgr/power-devices/PMS_FPWM2 - -> WAIVED: Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+/arm-io/pmgr/power-devices/PMS_FPWM3 - -> WAIVED: Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+/arm-io/pmgr/power-devices/PMS_FPWM4 - -> WAIVED: Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+/arm-io/pmgr/power-devices/PMS_C1PPT 0x23b700160 -> /soc/power-management@23b700000/power-controller@160
+/arm-io/pmgr/power-devices/SOC_DPE 0x23b700168 -> /soc/power-management@23b700000/power-controller@168
+/arm-io/pmgr/power-devices/PMGR_SOC_OCLA 0x23b700170 -> /soc/power-management@23b700000/power-controller@170
+/arm-io/pmgr/power-devices/ISPSENS0 0x23b700178 -> /soc/power-management@23b700000/power-controller@178
+/arm-io/pmgr/power-devices/ISPSENS1 0x23b700180 -> /soc/power-management@23b700000/power-controller@180
+/arm-io/pmgr/power-devices/ISPSENS2 0x23b700188 -> /soc/power-management@23b700000/power-controller@188
+/arm-io/pmgr/power-devices/ISPSENS3 0x23b700190 -> /soc/power-management@23b700000/power-controller@190
+/arm-io/pmgr/power-devices/PCIE_REF 0x23b700198 -> /soc/power-management@23b700000/power-controller@198
+/arm-io/pmgr/power-devices/AFT0 0x23b7001a0 -> /soc/power-management@23b700000/power-controller@1a0
+/arm-io/pmgr/power-devices/IMX 0x23b7001a8 -> /soc/power-management@23b700000/power-controller@1a8
+/arm-io/pmgr/power-devices/SIO_BUSIF 0x23b7001b0 -> /soc/power-management@23b700000/power-controller@1b0
+/arm-io/pmgr/power-devices/SIO 0x23b7001b8 -> /soc/power-management@23b700000/power-controller@1b8
+/arm-io/pmgr/power-devices/SIO_CPU 0x23b7001c0 -> /soc/power-management@23b700000/power-controller@1c0
+/arm-io/pmgr/power-devices/FPWM0 0x23b7001c8 -> /soc/power-management@23b700000/power-controller@1c8
+/arm-io/pmgr/power-devices/FPWM1 0x23b7001d0 -> /soc/power-management@23b700000/power-controller@1d0
+/arm-io/pmgr/power-devices/FPWM2 0x23b7001d8 -> /soc/power-management@23b700000/power-controller@1d8
+/arm-io/pmgr/power-devices/I2C0 0x23b7001e0 -> /soc/power-management@23b700000/power-controller@1e0
+/arm-io/pmgr/power-devices/I2C1 0x23b7001e8 -> /soc/power-management@23b700000/power-controller@1e8
+/arm-io/pmgr/power-devices/I2C2 0x23b7001f0 -> /soc/power-management@23b700000/power-controller@1f0
+/arm-io/pmgr/power-devices/I2C3 0x23b7001f8 -> /soc/power-management@23b700000/power-controller@1f8
+/arm-io/pmgr/power-devices/I2C4 0x23b700200 -> /soc/power-management@23b700000/power-controller@200
+/arm-io/pmgr/power-devices/SPI_P 0x23b700208 -> /soc/power-management@23b700000/power-controller@208
+/arm-io/pmgr/power-devices/UART_P 0x23b700210 -> /soc/power-management@23b700000/power-controller@210
+/arm-io/pmgr/power-devices/AUDIO_P 0x23b700218 -> /soc/power-management@23b700000/power-controller@218
+/arm-io/pmgr/power-devices/AES 0x23b700220 -> /soc/power-management@23b700000/power-controller@220
+/arm-io/pmgr/power-devices/SPI0 0x23b700228 -> /soc/power-management@23b700000/power-controller@228
+/arm-io/pmgr/power-devices/SPI1 0x23b700230 -> /soc/power-management@23b700000/power-controller@230
+/arm-io/pmgr/power-devices/SPI2 0x23b700238 -> /soc/power-management@23b700000/power-controller@238
+/arm-io/pmgr/power-devices/SPI3 0x23b700240 -> /soc/power-management@23b700000/power-controller@240
+/arm-io/pmgr/power-devices/SPI4 0x23b700248 -> /soc/power-management@23b700000/power-controller@248
+/arm-io/pmgr/power-devices/SPI5 0x23b700250 -> /soc/power-management@23b700000/power-controller@250
+/arm-io/pmgr/power-devices/UART_N 0x23b700258 -> /soc/power-management@23b700000/power-controller@258
+/arm-io/pmgr/power-devices/UART0 0x23b700260 -> /soc/power-management@23b700000/power-controller@260
+/arm-io/pmgr/power-devices/UART1 0x23b700268 -> /soc/power-management@23b700000/power-controller@268
+/arm-io/pmgr/power-devices/UART2 0x23b700270 -> /soc/power-management@23b700000/power-controller@270
+/arm-io/pmgr/power-devices/UART3 0x23b700278 -> /soc/power-management@23b700000/power-controller@278
+/arm-io/pmgr/power-devices/UART4 0x23b700280 -> /soc/power-management@23b700000/power-controller@280
+/arm-io/pmgr/power-devices/UART5 0x23b700288 -> /soc/power-management@23b700000/power-controller@288
+/arm-io/pmgr/power-devices/UART6 0x23b700290 -> /soc/power-management@23b700000/power-controller@290
+/arm-io/pmgr/power-devices/UART7 0x23b700298 -> /soc/power-management@23b700000/power-controller@298
+/arm-io/pmgr/power-devices/UART8 0x23b7002a0 -> /soc/power-management@23b700000/power-controller@2a0
+/arm-io/pmgr/power-devices/SIO_ADMA 0x23b7002a8 -> /soc/power-management@23b700000/power-controller@2a8
+/arm-io/pmgr/power-devices/DPA0 0x23b7002b0 -> /soc/power-management@23b700000/power-controller@2b0
+/arm-io/pmgr/power-devices/DPA1 0x23b7002b8 -> /soc/power-management@23b700000/power-controller@2b8
+/arm-io/pmgr/power-devices/MCA0 0x23b7002c0 -> /soc/power-management@23b700000/power-controller@2c0
+/arm-io/pmgr/power-devices/MCA1 0x23b7002c8 -> /soc/power-management@23b700000/power-controller@2c8
+/arm-io/pmgr/power-devices/MCA2 0x23b7002d0 -> /soc/power-management@23b700000/power-controller@2d0
+/arm-io/pmgr/power-devices/MCA3 0x23b7002d8 -> /soc/power-management@23b700000/power-controller@2d8
+/arm-io/pmgr/power-devices/MCA4 0x23b7002e0 -> /soc/power-management@23b700000/power-controller@2e0
+/arm-io/pmgr/power-devices/MCA5 0x23b7002e8 -> /soc/power-management@23b700000/power-controller@2e8
+/arm-io/pmgr/power-devices/MCC 0x23b7002f0 -> /soc/power-management@23b700000/power-controller@2f0
+/arm-io/pmgr/power-devices/DCS0 0x23b7002f8 -> /soc/power-management@23b700000/power-controller@2f8
+/arm-io/pmgr/power-devices/DCS2 0x23b700300 -> /soc/power-management@23b700000/power-controller@300
+/arm-io/pmgr/power-devices/DCS1 0x23b700308 -> /soc/power-management@23b700000/power-controller@308
+/arm-io/pmgr/power-devices/DCS3 0x23b700310 -> /soc/power-management@23b700000/power-controller@310
+/arm-io/pmgr/power-devices/DCS4 0x23b700318 -> /soc/power-management@23b700000/power-controller@318
+/arm-io/pmgr/power-devices/DCS5 0x23b700320 -> /soc/power-management@23b700000/power-controller@320
+/arm-io/pmgr/power-devices/DCS6 0x23b700328 -> /soc/power-management@23b700000/power-controller@328
+/arm-io/pmgr/power-devices/DCS7 0x23b700330 -> /soc/power-management@23b700000/power-controller@330
+/arm-io/pmgr/power-devices/SMX0 0x23b700338 -> /soc/power-management@23b700000/power-controller@338
+/arm-io/pmgr/power-devices/SMX1 0x23b700340 -> /soc/power-management@23b700000/power-controller@340
+/arm-io/pmgr/power-devices/APCIE 0x23b700348 -> /soc/power-management@23b700000/power-controller@348
+/arm-io/pmgr/power-devices/RMX0 0x23b700350 -> /soc/power-management@23b700000/power-controller@350
+/arm-io/pmgr/power-devices/RMX1 0x23b700358 -> /soc/power-management@23b700000/power-controller@358
+/arm-io/pmgr/power-devices/CMX 0x23b700360 -> /soc/power-management@23b700000/power-controller@360
+/arm-io/pmgr/power-devices/MMX 0x23b700368 -> /soc/power-management@23b700000/power-controller@368
+/arm-io/pmgr/power-devices/DISP0_SYS 0x23b700370 -> /soc/power-management@23b700000/power-controller@370
+/arm-io/pmgr/power-devices/DISP0_FE 0x23b700378 -> /soc/power-management@23b700000/power-controller@378
+/arm-io/pmgr/power-devices/DISPEXT_SYS 0x23b700380 -> /soc/power-management@23b700000/power-controller@380
+/arm-io/pmgr/power-devices/DISPEXT_FE 0x23b700388 -> /soc/power-management@23b700000/power-controller@388
+/arm-io/pmgr/power-devices/DISPEXT_BE 0x23b700390 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISPEXT_GP0 0x23b700398 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISPEXT_GP1 0x23b7003a0 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISPEXT_GP2 0x23b7003a8 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISPEXT_PPP 0x23b7003b0 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DPEXT 0x23b7003b8 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISPEXT_DSC 0x23b7003c0 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISPEXT_CPU0 0x23b7003c8 -> /soc/power-management@23b700000/power-controller@3c8
+/arm-io/pmgr/power-devices/DPTX_PHY 0x23b7003d0 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DPTX_EXT_PHY 0x23b7003d8 -> /soc/power-management@23b700000/power-controller@3d8
+/arm-io/pmgr/power-devices/DISPDFR_FE 0x23b7003e0 -> /soc/power-management@23b700000/power-controller@3e0
+/arm-io/pmgr/power-devices/DISPDFR_BE 0x23b7003e8 -> /soc/power-management@23b700000/power-controller@3e8
+/arm-io/pmgr/power-devices/MIPI_DSI 0x23b7003f0 -> /soc/power-management@23b700000/power-controller@3f0
+/arm-io/pmgr/power-devices/JPG 0x23b7003f8 -> /soc/power-management@23b700000/power-controller@3f8
+/arm-io/pmgr/power-devices/APCIE_GP 0x23b700400 -> /soc/power-management@23b700000/power-controller@400
+/arm-io/pmgr/power-devices/MSR 0x23b700408 -> /soc/power-management@23b700000/power-controller@408
+/arm-io/pmgr/power-devices/PMP 0x23b700410 -> /soc/power-management@23b700000/power-controller@410
+/arm-io/pmgr/power-devices/PMS_SRAM 0x23b700418 -> /soc/power-management@23b700000/power-controller@418
+/arm-io/pmgr/power-devices/MSR_ASE_CORE 0x23b700420 -> /soc/power-management@23b700000/power-controller@420
+/arm-io/pmgr/power-devices/ANS 0x23b700428 -> /soc/power-management@23b700000/power-controller@428
+/arm-io/pmgr/power-devices/GFX 0x23b700430 -> /soc/power-management@23b700000/power-controller@430
+/arm-io/pmgr/power-devices/ISP_SYS 0x23b700438 -> /soc/power-management@23b700000/power-controller@438
+/arm-io/pmgr/power-devices/VENC_SYS 0x23b700440 -> /soc/power-management@23b700000/power-controller@440
+/arm-io/pmgr/power-devices/AVD_SYS 0x23b700448 -> /soc/power-management@23b700000/power-controller@448
+/arm-io/pmgr/power-devices/APCIE_ST 0x23b700450 -> /soc/power-management@23b700000/power-controller@450
+/arm-io/pmgr/power-devices/ATC0_COMMON 0x23b700458 -> /soc/power-management@23b700000/power-controller@458
+/arm-io/pmgr/power-devices/ATC0_PCIE 0x23b700460 -> /soc/power-management@23b700000/power-controller@460
+/arm-io/pmgr/power-devices/ATC0_CIO 0x23b700468 -> /soc/power-management@23b700000/power-controller@468
+/arm-io/pmgr/power-devices/ATC0_CIO_PCIE 0x23b700470 -> /soc/power-management@23b700000/power-controller@470
+/arm-io/pmgr/power-devices/ATC0_CIO_USB 0x23b700478 -> /soc/power-management@23b700000/power-controller@478
+/arm-io/pmgr/power-devices/ATC1_COMMON 0x23b700480 -> /soc/power-management@23b700000/power-controller@480
+/arm-io/pmgr/power-devices/ATC1_PCIE 0x23b700488 -> /soc/power-management@23b700000/power-controller@488
+/arm-io/pmgr/power-devices/ATC1_CIO 0x23b700490 -> /soc/power-management@23b700000/power-controller@490
+/arm-io/pmgr/power-devices/ATC1_CIO_PCIE 0x23b700498 -> /soc/power-management@23b700000/power-controller@498
+/arm-io/pmgr/power-devices/ATC1_CIO_USB 0x23b7004a0 -> /soc/power-management@23b700000/power-controller@4a0
+/arm-io/pmgr/power-devices/ANE_SYS 0x23b7004a8 -> /soc/power-management@23b700000/power-controller@4a8
+/arm-io/pmgr/power-devices/SCODEC 0x23b7004b0 -> /soc/power-management@23b700000/power-controller@4b0
+/arm-io/pmgr/power-devices/SEP 0x23b700c00 -> /soc/power-management@23b700000/power-controller@c00
+/arm-io/pmgr/power-devices/SEP_EISP 0x23b700c08 -> WAIVED: Power state with a register, switched by the SEP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/ISP_CPU_CORE0 0x23b704008 -> /soc/power-management@23b700000/power-controller@4008
+/arm-io/pmgr/power-devices/ISP_CPU_CORE1 0x23b704010 -> /soc/power-management@23b700000/power-controller@4010
+/arm-io/pmgr/power-devices/VENC_DMA 0x23b708000 -> /soc/power-management@23b700000/power-controller@8000
+/arm-io/pmgr/power-devices/VENC_PIPE4 0x23b708008 -> /soc/power-management@23b700000/power-controller@8008
+/arm-io/pmgr/power-devices/VENC_PIPE5 0x23b708010 -> /soc/power-management@23b700000/power-controller@8010
+/arm-io/pmgr/power-devices/VENC_ME0 0x23b708018 -> /soc/power-management@23b700000/power-controller@8018
+/arm-io/pmgr/power-devices/VENC_ME1 0x23b708020 -> /soc/power-management@23b700000/power-controller@8020
+/arm-io/pmgr/power-devices/ANE_CPU 0x23b70c008 -> /soc/power-management@23b700000/power-controller@c008
+/arm-io/pmgr/power-devices/DISP0_CPU0 0x23b710000 -> /soc/power-management@23b700000/power-controller@10000
+/arm-io/pmgr/power-devices/DISP0_BE 0x23b710008 -> WAIVED: Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DP 0x23b710010 -> WAIVED: Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISP0_SPI 0x23b710018 -> WAIVED: Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISP0_SPMI 0x23b710020 -> WAIVED: Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISP0_GP0 0x23b710028 -> WAIVED: Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISP0_GP1 0x23b710030 -> WAIVED: Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISP0_GP2 0x23b710038 -> WAIVED: Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISP0_PPP 0x23b710040 -> WAIVED: Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISP0_BRC 0x23b710048 -> WAIVED: Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISP0_BLC 0x23b710050 -> WAIVED: Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DEBUG_GATED 0x23d280058 -> /soc/power-management@23d280000/power-controller@58
+/arm-io/pmgr/power-devices/NUB_SPMI0 0x23d280060 -> /soc/power-management@23d280000/power-controller@60
+/arm-io/pmgr/power-devices/NUB_SPMI1 0x23d280068 -> /soc/power-management@23d280000/power-controller@68
+/arm-io/pmgr/power-devices/NUB_AON 0x23d280070 -> /soc/power-management@23d280000/power-controller@70
+/arm-io/pmgr/power-devices/MSG 0x23d280078 -> /soc/power-management@23d280000/power-controller@78
+/arm-io/pmgr/power-devices/NUB_GPIO 0x23d280080 -> /soc/power-management@23d280000/power-controller@80
+/arm-io/pmgr/power-devices/ATC0_USB_AON 0x23d280088 -> /soc/power-management@23d280000/power-controller@88
+/arm-io/pmgr/power-devices/ATC1_USB_AON 0x23d280090 -> /soc/power-management@23d280000/power-controller@90
+/arm-io/pmgr/power-devices/ATC0_USB 0x23d280098 -> /soc/power-management@23d280000/power-controller@98
+/arm-io/pmgr/power-devices/ATC1_USB 0x23d2800a0 -> /soc/power-management@23d280000/power-controller@a0
+/arm-io/pmgr/power-devices/NUB_FABRIC 0x23d2800a8 -> /soc/power-management@23d280000/power-controller@a8
+/arm-io/pmgr/power-devices/NUB_SRAM 0x23d2800b0 -> /soc/power-management@23d280000/power-controller@b0
+/arm-io/pmgr/power-devices/DEBUG_SWITCH 0x23d2800b8 -> /soc/power-management@23d280000/power-controller@b8
+/arm-io/pmgr/power-devices/AOP_FILTER - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_GPIO - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_BASE - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_FR - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_LEAP_CLK - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_SHIM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_ADMA0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_PIODMA - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_CPU - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_I2CM0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_I2CM1 - -> WAIVED: Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_I2CM2 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_SCM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_SPI0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_SPI1 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_SPMI0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_SPMI1 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_LEAP - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_AUDIO_SHIM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_AUDIO_ADMA0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_UART0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_UART1 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_UART2 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_MCA0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_MCA1 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_MCA2 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_MCA3 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_MCA4 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_MCA5 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_PDMC_LPD - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_SRAM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_PDM0_REF - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AOP_PDM1_REF - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_FABRIC - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_GPIO - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_AON - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_UART0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_UART1 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_I2CM0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_I2CM1 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_I2CM2 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_I2CM3 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_I2CM4 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_FPWM0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_FPWM1 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_FPWM2 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_FPWM3 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SMC_CPU - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MTP_FABRIC - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MTP_GPIO - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MTP_BASE - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MTP_PERIPH - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MTP_UART0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MTP_CPU - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MTP_SCM_FABRIC - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MTP_SPI0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MTP_I2CM0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MTP_SRAM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MTP_DMA - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ECPU_SRAM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/PCPU_SRAM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/CPU-BUSY - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ECPM_NRG - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/PCPM_NRG - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/GFX-SGX - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/GFX-BUSY - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/GFX-ASC - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ECPU0_SRAM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ECPU1_SRAM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ECPU2_SRAM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ECPU3_SRAM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/PCPU0_SRAM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/PCPU1_SRAM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/PCPU2_SRAM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/PCPU3_SRAM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/VENC-AVE-VNOM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/VENC-MEM-FAST - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/VENC-AVE-VMAX - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AVD-SOC-VNOM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AVD-SOC-VMAX - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/JPG-SOC-VNOM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/JPG-SOC-VMAX - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ISP-SOC-VNOM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ISP-SOC-VMAX - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/CLPC-SOC-VNOM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/CLPC-SOC-VMAX - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/CLPC-DCS-VNOM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/CLPC-DCS-VMAX - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SDEC-SOC-VNOM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SDEC-SOC-VMAX - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DP-SOC-VMAX - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SIO-CPU-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/USB-AUDIO-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/VENC-SYS-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AVD-SYS-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ANE-SYS-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/JPG0-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/JPG1-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MSR-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ISP-SYS-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SEP-PEARL-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AUDIO-P-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ATC0-USB-AUD-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ATC1-USB-AUD-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ATC0_PCIE-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ATC1_PCIE-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AUDIO-LLT-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DISP-MIE-DPB - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DISP-FB-ACTIVE - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DISP-CARVE-OUT - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DCP0-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DCPEXT0-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DISPDFR-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/VDD_CIO-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/FR_SCALING-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/CIO0_RECONFIG-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/CIO1_RECONFIG-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DFR-MIE-DPB - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DFR-FB-ACTIVE - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DFR-CARVE-OUT - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AUSB0_AONUSB-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AUSB1_AONUSB-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AUSB0_AONPCIE-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AUSB1_AONPCIE-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/PRORES_VNOM-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/PRORES_VMAX-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SCDC_VNOM-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SCDC_VMAX-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DP0_VMAX-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DP1_VMAX-V - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ATC0-USB-DART - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ATC1-USB-DART - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SIO-CPU-DART - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AVD-SYS-DART - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ANE-SYS-DART - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/JPG0-DART - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/MSR-DART - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/ISP-SYS-DART - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/VENC-DART - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/JPG1-DART - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-domains - -> WAIVED: ADT power-domain collection container; individual domains require review.
+/arm-io/pmgr/power-domains/MCC - -> /soc/power-management@23b700000/power-controller@2f0
+/arm-io/pmgr/power-domains/DCS0 - -> /soc/power-management@23b700000/power-controller@2f8
+/arm-io/pmgr/power-domains/DCS2 - -> /soc/power-management@23b700000/power-controller@300
+/arm-io/pmgr/power-domains/DCS1 - -> /soc/power-management@23b700000/power-controller@308
+/arm-io/pmgr/power-domains/DCS3 - -> /soc/power-management@23b700000/power-controller@310
+/arm-io/pmgr/power-domains/DCS4 - -> /soc/power-management@23b700000/power-controller@318
+/arm-io/pmgr/power-domains/DCS5 - -> /soc/power-management@23b700000/power-controller@320
+/arm-io/pmgr/power-domains/DCS6 - -> /soc/power-management@23b700000/power-controller@328
+/arm-io/pmgr/power-domains/DCS7 - -> /soc/power-management@23b700000/power-controller@330
+/arm-io/pmgr/power-domains/SMX0 - -> /soc/power-management@23b700000/power-controller@338
+/arm-io/pmgr/power-domains/SMX1 - -> /soc/power-management@23b700000/power-controller@340
+/arm-io/pmgr/power-domains/IMX - -> /soc/power-management@23b700000/power-controller@1a8
+/arm-io/pmgr/power-domains/RMX0 - -> /soc/power-management@23b700000/power-controller@350
+/arm-io/pmgr/power-domains/RMX1 - -> /soc/power-management@23b700000/power-controller@358
+/arm-io/pmgr/power-domains/CMX - -> /soc/power-management@23b700000/power-controller@360
+/arm-io/pmgr/power-domains/MMX - -> /soc/power-management@23b700000/power-controller@368
+/arm-io/pmgr/power-domains/DISP0_CPU - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/DISP0_GP0 - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/DISP0_GP1 - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/DISP0_GP2 - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/DISP0_PPP - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/DISP0_BRC - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/DISP0_BLC - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/DISPEXT_CPU - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/DISPEXT_GP0 - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/DISPEXT_GP1 - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/DISPEXT_GP2 - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/DISPEXT_PPP - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/PMP - -> /soc/power-management@23b700000/power-controller@410
+/arm-io/pmgr/power-domains/PMS_SRAM - -> /soc/power-management@23b700000/power-controller@418
+/arm-io/pmgr/power-domains/APCIE_SYS - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/GFX - -> /soc/power-management@23b700000/power-controller@430
+/arm-io/pmgr/power-domains/SEP - -> /soc/power-management@23b700000/power-controller@c00
+/arm-io/pmgr/power-domains/SEP_EISP - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/ISP_CPU_CORE0 - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/ISP_CPU_CORE1 - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/ANS - -> /soc/power-management@23b700000/power-controller@428
+/arm-io/pmgr/power-domains/ANE_SYS - -> /soc/power-management@23b700000/power-controller@4a8
+/arm-io/pmgr/power-domains/ANE_CPU - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/NUB_FABRIC - -> /soc/power-management@23d280000/power-controller@a8
+/arm-io/pmgr/power-domains/NUB_SRAM - -> /soc/power-management@23d280000/power-controller@b0
+/arm-io/pmgr/power-domains/DEBUG_SWITCH - -> /soc/power-management@23d280000/power-controller@b8
+/arm-io/pmgr/power-domains/AOP_CPU - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/AOP_FILTER - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/SMC_CPU - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/SMC_FABRIC - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/MTP_FABRIC - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/pmgr/power-domains/MTP_CPU - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
+/arm-io/nco 0x23b044000 -> /soc/clock-controller@23b044000
+/arm-io/event-log-handler 0x23b700000 -> /soc/event-log@23b700000
+/arm-io/pmp 0x23bc00000 -> /soc/pmp@23b500000
+/arm-io/pmp/iop-pmp-nub - -> /soc/pmp@23b500000
+/arm-io/dart-pmp 0x23b300000 -> /soc/iommu@23b300000
+/arm-io/dart-pmp/mapper-pmp - -> /soc/iommu@23b300000
+/arm-io/sep 0x25e400000 -> /soc/sep@25e400000
+/arm-io/sep/iop-sep-nub - -> /soc/sep@25e400000
+/arm-io/sep/iop-sep-nub/Ocelot - -> /soc/sep@25e400000
+/arm-io/sep/iop-sep-nub/xART - -> /soc/sep@25e400000
+/arm-io/sep/iop-sep-nub/InvalidateHmac - -> /soc/sep@25e400000
+/arm-io/dart-sep 0x25d2c0000 -> /soc/iommu@25d2c0000
+/arm-io/dart-sep/mapper-sep - -> /soc/iommu@25d2c0000
+/arm-io/sio 0x236400000 -> /soc/sio@236400000
+/arm-io/sio/iop-sio-nub - -> /soc/sio@236400000
+/arm-io/sio/iop-sio-nub/sio-dma - -> /soc/sio@236400000
+/arm-io/dart-sio 0x235004000 -> /soc/iommu@235004000
+/arm-io/dart-sio/mapper-sio - -> /soc/iommu@235004000
+/arm-io/dart-sio/mapper-aes - -> /soc/iommu@235004000
+/arm-io/dart-sio/mapper-admac - -> /soc/iommu@235004000
+/arm-io/ans 0x277400000 -> /soc/nvme@27bcc0000
+/arm-io/ans/iop-ans-nub - -> /soc/nvme@27bcc0000
+/arm-io/sart-ans 0x27bc50000 -> /soc/sart@27bc50000
+/arm-io/smc 0x23e400000 -> /soc/smc@23e400000
+/arm-io/smc/iop-smc-nub - -> /soc/smc@23e400000
+/arm-io/smc/iop-smc-nub/smc-pmu - -> /soc/smc@23e400000
+/arm-io/smc/iop-smc-nub/smc-charger-util-0 - -> /soc/smc@23e400000
+/arm-io/smc/iop-smc-nub/smc-charger-util-1 - -> /soc/smc@23e400000
+/arm-io/smc/iop-smc-nub/smc-charger-util - -> /soc/smc@23e400000
+/arm-io/uart0 0x235200000 -> /soc/serial@235200000
+/arm-io/uart0/debug-console - -> /soc/serial@235200000
+/arm-io/dockchannel-uart 0x23d128000 -> /soc/serial@23d12c000
+/arm-io/dockchannel-mtp 0x24eb14000 -> /soc/fifo@24eb14000
+/arm-io/dockchannel-mtp/mtp-transport - -> /soc/fifo@24eb14000/input@8000
+/arm-io/dockchannel-mtp/mtp-transport/multi-touch - -> /soc/fifo@24eb14000/input@8000/multi-touch
+/arm-io/dockchannel-mtp/mtp-transport/stm - -> /soc/fifo@24eb14000/input@8000/stm
+/arm-io/dockchannel-mtp/mtp-transport/keyboard - -> /soc/fifo@24eb14000/input@8000/keyboard
+/arm-io/dockchannel-mtp/mtp-transport/tp-accel - -> /soc/fifo@24eb14000/input@8000
+/arm-io/dockchannel-mtp/mtp-transport/actuator - -> /soc/fifo@24eb14000/input@8000/actuator
+/arm-io/mtp 0x24e400000 -> /soc/mtp@24e400000
+/arm-io/mtp/iop-mtp-nub - -> /soc/mtp@24e400000
+/arm-io/dart-mtp 0x24e808000 -> /soc/iommu@24e808000
+/arm-io/dart-mtp/mapper-mtp - -> /soc/iommu@24e808000
+/arm-io/mtp-aop-mux - -> WAIVED: Firmware transport arbitration policy; MTP and AOP hardware are inventoried separately.
+/arm-io/spi1 0x235104000 -> /soc/spi@235104000
+/arm-io/spi1/spinor /arm-io/spi1@0x0 -> /soc/spi@235104000/flash@0
+/arm-io/spi1/spinor/firmware - -> WAIVED: Firmware flash partition; parent flash hardware is inventoried separately.
+/arm-io/spi1/spinor/anvram /arm-io/spi1/spinor@0x700000 -> WAIVED: Firmware NVRAM partition; parent flash hardware is inventoried separately.
+/arm-io/spi1/spinor/syscfg /arm-io/spi1/spinor@0x5a0000 -> WAIVED: Firmware configuration partition; parent flash hardware is inventoried separately.
+/arm-io/i2c0 0x235010000 -> /soc/i2c@235010000
+/arm-io/i2c0/hpmBusManager - -> /soc/i2c@235010000
+/arm-io/i2c0/hpmBusManager/hpm0 /arm-io/i2c0/hpmBusManager@0x38 -> /soc/i2c@235010000/usb-pd@38
+/arm-io/i2c0/hpmBusManager/hpm1 /arm-io/i2c0/hpmBusManager@0x3f -> /soc/i2c@235010000/usb-pd@3f
+/arm-io/i2c0/hpmBusManager/hpm5 /arm-io/i2c0/hpmBusManager@0x3a -> /soc/i2c@235010000/usb-pd@3a
+/arm-io/admac-sio 0x238200000 -> /soc/dma-controller@238200000
+/arm-io/admac-aop-audio 0x24a980000 -> /soc/dma-controller@24a980000
+/arm-io/atc-phy0 0x382a90000 -> /soc/phy@383000000
+/arm-io/dart-usb0 0x382f00000 -> /soc/iommu@382f00000
+/arm-io/dart-usb0/mapper-usb0 - -> /soc/iommu@382f00000
+/arm-io/usb-drd0 0x382280000 -> /soc/usb@382280000
+/arm-io/usb-drd0/usb-drd0-port-hs - -> /soc/usb@382280000/ports/port@0
+/arm-io/usb-drd0/usb-drd0-port-ss - -> /soc/usb@382280000/ports/port@1
+/arm-io/atc-phy1 0x502a90000 -> /soc/phy@503000000
+/arm-io/dart-usb1 0x502f00000 -> /soc/iommu@502f00000
+/arm-io/dart-usb1/mapper-usb1 - -> /soc/iommu@502f00000
+/arm-io/usb-drd1 0x502280000 -> /soc/usb@502280000
+/arm-io/usb-drd1/usb-drd1-port-hs - -> /soc/usb@502280000/ports/port@0
+/arm-io/usb-drd1/usb-drd1-port-ss - -> /soc/usb@502280000/ports/port@1
+/arm-io/nub-spmi0 0x23d714000 -> /soc/spmi@23d714000
+/arm-io/nub-spmi0/pmu-main /arm-io/nub-spmi0@0xe -> /soc/spmi@23d714000/pmic@e
+/arm-io/nub-spmi0/btm /arm-io/nub-spmi0@0xe -> /soc/spmi@23d714000/pmic@e
+/arm-io/nub-spmi1 0x23d794000 -> /soc/spmi@23d794000
+/arm-io/nub-spmi1/pmu-aux /arm-io/nub-spmi1@0xe -> /soc/spmi@23d794000/pmic@e
+/arm-io/aop-spmi0 0x24a894000 -> /soc/spmi@24a894000
+/arm-io/aop-spmi0/spmi-wifibt /arm-io/aop-spmi0@0xe -> /soc/spmi@24a894000/radio-pmu@e
+/arm-io/aop-spmi1 0x24a8d4000 -> /soc/spmi@24a8d4000
+/arm-io/aop-spmi1/stockholm-spmi /arm-io/aop-spmi1@0xc -> /soc/spmi@24a8d4000/nfc@c
+/arm-io/aop-spmi1/stockholm-spmi/stockholm - -> WAIVED: NFC firmware service of the parent SPMI device, not another addressed bus device.
+/arm-io/lcd0-sac - -> /soc/dcp@231c00000
+/arm-io/disp0 0x230000000 -> /soc/dcp@231c00000
+/arm-io/dcp0-expert - -> /soc/dcp@231c00000
+/arm-io/dcp 0x231c00000 -> /soc/dcp@231c00000
+/arm-io/dcp/iop-dcp-nub - -> /soc/dcp@231c00000
+/arm-io/dart-dcp 0x23130c000 -> /soc/iommu@23130c000
+/arm-io/dart-dcp/mapper-dcp - -> /soc/iommu@23130c000
+/arm-io/dart-disp0 0x231304000 -> /soc/iommu@231304000
+/arm-io/dart-disp0/mapper-disp0 - -> /soc/iommu@231304000
+/arm-io/dart-disp0/mapper-disp0-piodma - -> /soc/iommu@231304000
+/arm-io/dcp-sac-controller - -> /soc/dcp@231c00000
+/arm-io/dp-audio0 - -> WAIVED: Logical display audio DMA endpoint; SIO and display controllers are inventoried separately.
+/arm-io/dispext0 0x270000000 -> /soc/dcp@271c00000
+/arm-io/dcpext-expert - -> WAIVED: Coprocessor firmware policy view; hosting coprocessor is inventoried separately.
+/arm-io/dcpext 0x271c00000 -> /soc/dcp@271c00000
+/arm-io/dcpext/iop-dcpext-nub - -> /soc/dcp@271c00000
+/arm-io/dart-dcpext 0x27130c000 -> /soc/iommu@27130c000
+/arm-io/dart-dcpext/mapper-dcpext - -> /soc/iommu@27130c000
+/arm-io/dart-dispext0 0x271304000 -> /soc/iommu@271304000
+/arm-io/dart-dispext0/mapper-dispext0 - -> /soc/iommu@271304000
+/arm-io/dart-dispext0/mapper-dispext0-piodma - -> /soc/iommu@271304000
+/arm-io/dp-audio1 - -> WAIVED: Logical display audio DMA endpoint; SIO and display controllers are inventoried separately.
+/arm-io/scaler0 0x263000000 -> /soc/scaler@263000000
+/arm-io/dart-scaler 0x263200000 -> /soc/iommu@263200000
+/arm-io/dart-scaler/mapper-scaler - -> /soc/iommu@263200000
+/arm-io/dart-scaler/mapper-scaler-piodma - -> /soc/iommu@263200000
+/arm-io/jpeg0 0x265000000 -> /soc/jpeg@265000000
+/arm-io/dart-jpeg0 0x265004000 -> /soc/iommu@265004000
+/arm-io/dart-jpeg0/mapper-jpeg0 - -> /soc/iommu@265004000
+/arm-io/jpeg1 0x265008000 -> /soc/jpeg@265008000
+/arm-io/dart-jpeg1 0x26500c000 -> /soc/iommu@26500c000
+/arm-io/dart-jpeg1/mapper-jpeg1 - -> /soc/iommu@26500c000
+/arm-io/ave 0x267100000 -> /soc/video-codec@267100000
+/arm-io/dart-ave 0x267030000 -> /soc/iommu@267030000
+/arm-io/dart-ave/mapper-ave - -> /soc/iommu@267030000
+/arm-io/avd 0x268000000 -> /soc/avd@269080000
+/arm-io/dart-avd 0x269010000 -> /soc/iommu@269010000
+/arm-io/dart-avd/mapper-avd - -> /soc/iommu@269010000
+/arm-io/dart-avd/mapper-avd-piodma - -> /soc/iommu@269010000
+/arm-io/dart-avd/mapper-avd-adsbuf - -> /soc/iommu@269010000
+/arm-io/apr 0x27d000000 -> /soc/video-codec@27d000000
+/arm-io/dart-apr 0x27d028000 -> /soc/iommu@27d028000
+/arm-io/dart-apr/mapper-apr - -> /soc/iommu@27d028000
+/arm-io/dart-scdc 0x27d02c000 -> /soc/iommu@27d02c000
+/arm-io/dart-scdc/mapper-scdc - -> /soc/iommu@27d02c000
+/arm-io/isp 0x22a000000 -> /soc/isp@22a000000
+/arm-io/dart-isp 0x22c4a8000 -> /soc/iommu@22c4a8000
+/arm-io/dart-isp/mapper-isp - -> /soc/iommu@22c4a8000
+/arm-io/ane 0x26a000000 -> /soc/ane@26a000000
+/arm-io/dart-ane 0x26b800000 -> /soc/iommu@26b800000
+/arm-io/dart-ane/mapper-ane - -> /soc/iommu@26b800000
+/arm-io/sgx 0x204000000 -> /soc/gpu@206400000
+/arm-io/gfx-asc 0x206400000 -> /soc/gpu@206400000
+/arm-io/gfx-asc/iop-gfx-nub - -> /soc/gpu@206400000
+/arm-io/mapper-gfx-asc - -> WAIVED: GPU firmware IOMMU stream; represented by the GPU IOMMU relationship.
+/arm-io/mca-switch 0x238400000 -> /soc/i2s@238400000
+/arm-io/mca0 0x238400000 -> /soc/i2s@238400000
+/arm-io/mca0/mca0a - -> /soc/i2s@238400000
+/arm-io/mca0/mca0a/audio-speaker - -> /soc/i2s@238400000
+/arm-io/mca1 0x238404000 -> /soc/i2s@238400000
+/arm-io/mca1/mca1a - -> /soc/i2s@238400000
+/arm-io/mca1/mca1a/audio-loopback - -> /soc/i2s@238400000
+/arm-io/mca2 0x238408000 -> /soc/i2s@238400000
+/arm-io/mca2/mca2a - -> /soc/i2s@238400000
+/arm-io/mca2/mca2a/audio-codec-output - -> /soc/i2s@238400000
+/arm-io/mca2/mca2b - -> /soc/i2s@238400000
+/arm-io/mca2/mca2b/audio-codec-input - -> /soc/i2s@238400000
+/arm-io/smctempsensor0 - -> /soc/smc@23e400000/hwmon
+/arm-io/cpu-debug-interface - -> /cpus
+/arm-io/aft 0x200110000 -> /soc/fabric-tracker@200110000
+/arm-io/timesync - -> WAIVED: Firmware clock synchronization policy, not a separate timer device.
+/arm-io/apple-processor-trace - -> WAIVED: Native diagnostic trace policy; CPU debug hardware is inventoried separately.
+/buttons - -> WAIVED: Button collection container; child devices are inventoried separately.
+/port-usb-c-1 - -> /soc/i2c@235010000/usb-pd@38/connector
+/port-usb-c-2 - -> /soc/i2c@235010000/usb-pd@3f/connector
+/port-t818-1 - -> WAIVED: Firmware accessory-port relationship of the SMC; no independently addressed bus or MMIO device.
+/backlight - -> /soc/dcp@231c00000
+/sacm - -> WAIVED: Display access-control policy; display hardware is inventoried separately.

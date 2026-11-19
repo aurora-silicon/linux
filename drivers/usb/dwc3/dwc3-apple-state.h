@@ -9,6 +9,7 @@
 
 #include <linux/errno.h>
 #include <linux/phy/phy.h>
+#include <linux/usb/role.h>
 
 /* See the comment at the top of dwc3-apple.c for how these states are used. */
 enum dwc3_apple_state {
@@ -44,6 +45,24 @@ static inline int dwc3_apple_usb2_mode_before_reset(enum dwc3_apple_state target
 	default:
 		*mode = PHY_MODE_INVALID;
 		return -EINVAL;
+	}
+}
+
+/**
+ * dwc3_apple_state_for_role() - state a role asks for while the core is stopped for sleep
+ * @role: the role asked for
+ *
+ * Return: the state to bring the controller up in after the sleep.
+ */
+static inline enum dwc3_apple_state dwc3_apple_state_for_role(enum usb_role role)
+{
+	switch (role) {
+	case USB_ROLE_HOST:
+		return DWC3_APPLE_HOST;
+	case USB_ROLE_DEVICE:
+		return DWC3_APPLE_DEVICE;
+	default:
+		return DWC3_APPLE_NO_CABLE;
 	}
 }
 

@@ -36,66 +36,135 @@ description: >
   display crossbar is not part of the PHY resource. SuperSpeed calibration is
   supplied in banked lists so that no list spans that crossbar.
 
+  The T8142 variant adds an optional LIOA bank for DisplayPort calibration.
+  DisplayPort also requires separate bootloader-provided calibration lists
+  for that bank and the common configuration in the lpdptx region.
+
 allOf:
   - $ref: /schemas/usb/usb-switch.yaml#
   - if:
       properties:
         compatible:
           contains:
-            const: apple,t8132-atcphy
+            enum:
+              - apple,t8122-atcphy
+              - apple,t6030-atcphy
+              - apple,t6031-atcphy
+              - apple,t8142-atcphy
     then:
-      oneOf:
-        - properties:
-            reg:
-              minItems: 2
-              maxItems: 2
-            reg-names:
-              items:
-                - const: usb2phy
-                - const: pipehandler
-        - properties:
-            reg:
-              items:
-                - description: USB2 PHY specific controls
-                - description: USB3 PIPE interface controls
-                - description: SuperSpeed PHY core, excluding the display crossbar
-                - description: AXI to Apple Fabric interface controls
-                - description: Local IO address translation controls
-                - description: ATC fabric controls
-                - description: ATC common configuration controls
-            reg-names:
-              items:
-                - const: usb2phy
-                - const: pipehandler
-                - const: core
-                - const: axi2af
-                - const: lioa
-                - const: fabric
-                - const: common-config
-          required:
-            - power-domains
-    else:
       properties:
         reg:
-          minItems: 5
+          minItems: 1
           items:
-            - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
-            - description: DisplayPort Alternate Mode PHY specific controls
-            - description: Type-C PHY AXI to Apple Fabric interconnect controls
-            - description: USB2 PHY specific controls
-            - description: USB3 PIPE interface controls
-            - description: Secondary eUSB2 PHY register bank (T8140)
+            - description: Common controls for USB and DisplayPort
+            - description: DisplayPort alternate mode PHY
+            - description: AXI to Apple Fabric interface
+            - description: USB2 PHY
+            - description: USB3 PIPE interface
+            - description: Local IO address translation controls (T8142)
         reg-names:
-          minItems: 5
+          minItems: 1
           items:
             - const: core
             - const: lpdptx
             - const: axi2af
             - const: usb2phy
             - const: pipehandler
-            - const: usb2phy-reg
+            - const: lioa
+      oneOf:
+        - properties:
+            reg:
+              maxItems: 1
+            reg-names:
+              maxItems: 1
+        - properties:
+            reg:
+              minItems: 5
+            reg-names:
+              minItems: 5
       required:
         - power-domains
+    else:
+      if:
+        properties:
+          compatible:
+            contains:
+              const: apple,t8132-atcphy
+      then:
+        oneOf:
+          - properties:
+              reg:
+                minItems: 2
+                maxItems: 2
+              reg-names:
+                items:
+                  - const: usb2phy
+                  - const: pipehandler
+          - properties:
+              reg:
+                items:
+                  - description: USB2 PHY specific controls
+                  - description: USB3 PIPE interface controls
+                  - description: SuperSpeed PHY core, excluding the display crossbar
+                  - description: AXI to Apple Fabric interface controls
+                  - description: Local IO address translation controls
+                  - description: ATC fabric controls
+                  - description: ATC common configuration controls
+              reg-names:
+                items:
+                  - const: usb2phy
+                  - const: pipehandler
+                  - const: core
+                  - const: axi2af
+                  - const: lioa
+                  - const: fabric
+                  - const: common-config
+            required:
+              - power-domains
+      else:
+        properties:
+          reg:
+            minItems: 5
+            items:
+              - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
+              - description: DisplayPort Alternate Mode PHY specific controls
+              - description: Type-C PHY AXI to Apple Fabric interconnect controls
+              - description: USB2 PHY specific controls
+              - description: USB3 PIPE interface controls
+              - description: Secondary eUSB2 PHY register bank (T8140)
+              - description:
+                  Power and hibernation control of the USB controller the PHY
+                  serves (T8140). The PHY drives that controller's reset and
+                  takes it through hibernation for a system sleep.
+          reg-names:
+            minItems: 5
+            items:
+              - const: core
+              - const: lpdptx
+              - const: axi2af
+              - const: usb2phy
+              - const: pipehandler
+              - const: usb2phy-reg
+              - const: pwrctl
+        required:
+          - power-domains
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-atcphy
+    then:
+      properties:
+        reg:
+          minItems: 5
+          maxItems: 6
+        reg-names:
+          minItems: 5
+          maxItems: 6
+    else:
+      properties:
+        apple,tunable-dp-lioa: false
+        apple,tunable-dp-common-config: false
   - if:
       properties:
         compatible:
@@ -123,6 +192,7 @@ allOf:
               enum:
                 - apple,t8132-atcphy
                 - apple,t8140-atcphy
+                - apple,t8142-atcphy
     then:
       properties:
         reg:
@@ -137,6 +207,7 @@ allOf:
               const: apple,t8132-atcphy
     then:
       properties:
+        apple,dp-alt-mode: false
         apple,tunable-usb3-axi2af: false
         apple,tunable-usb3-lioa: false
         apple,tunable-usb3-fabric: false
@@ -154,6 +225,20 @@ allOf:
         apple,tunable-cio-lane1: false
         apple,tunable-cio-lane1-eq: false
         apple,tunable-cio-post: false
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              enum:
+                - apple,t8122-atcphy
+                - apple,t6030-atcphy
+                - apple,t6031-atcphy
+    then:
+      required:
+        - orientation-switch
+        - mode-switch
+        - ports
 
 $defs:
   apple,tunable:
@@ -181,16 +266,22 @@ properties:
               - apple,t8112-atcphy
           - const: apple,t8103-atcphy
       - const: apple,t8103-atcphy
+      - const: apple,t8122-atcphy
+      - items:
+          - enum:
+              - apple,t6030-atcphy
+              - apple,t6031-atcphy
+          - const: apple,t8122-atcphy
       - const: apple,t8132-atcphy
       - const: apple,t8140-atcphy
       - const: apple,t8142-atcphy
 
   reg:
-    minItems: 2
+    minItems: 1
     maxItems: 7
 
   reg-names:
-    minItems: 2
+    minItems: 1
     maxItems: 7
 
   "#phy-cells":
@@ -231,6 +322,14 @@ properties:
       port@3:
         $ref: /schemas/graph.yaml#/properties/port
         description: Incoming endpoint from the USB4/Thunderbolt controller.
+
+  apple,dp-alt-mode:
+    type: boolean
+    description: >
+      T8132 only. The board wires this port's SuperSpeed lanes for
+      DisplayPort alternate mode, so 4-lane DP and USB3+DP run the PHY's own
+      DP transmitter instead of falling back to USB. Without it, DP on T8132
+      is only carried in USB4/Thunderbolt tunnels.
 
   apple,tunable-usb3-axi2af:
     $ref: "#/$defs/apple,tunable"
@@ -355,6 +454,18 @@ properties:
       Note that lane here refers to a USB RX and TX pair re-used for DisplayPort
       and not to an individual DisplayPort differential lane.
 
+  apple,tunable-dp-lioa:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      T8142 DisplayPort calibration for the lioa register region. Applied
+      after the common and lane tunables, before common configuration.
+
+  apple,tunable-dp-common-config:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      T8142 DisplayPort common configuration for the lpdptx register region,
+      applied after the LIOA list. Both lists are required for DisplayPort.
+
   apple,tunable-dp-common-pre:
     $ref: "#/$defs/apple,tunable"
     maxItems: 5461
@@ -383,6 +494,18 @@ properties:
       T8140, copied from Apple's Device Tree by the bootloader. Unlike the
       other tunables these are applied to the usb2phy-reg region.
 
+  apple,axi2af-gate:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset in the axi2af region
+        - description: Bits
+    description: >
+      The fabric bridge bits macOS clears, in this order, before the PHY's
+      common power domain goes off for a system sleep and sets again once it
+      is back. With pwrctl, the controller then keeps its power through the
+      sleep.
+
 patternProperties:
   "^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$":
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -399,9 +522,6 @@ required:
   - reg-names
   - "#phy-cells"
   - "#reset-cells"
-  - orientation-switch
-  - mode-switch
-  - ports
 
 additionalProperties: false
 

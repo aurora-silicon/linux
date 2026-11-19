@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J613/J615 QSPIMC boot NOR and NVRAM layout. */
+
+/ {
+	aliases {
+		nvram = &nvram_qspi;
+	};
+
+	soc {
+		qspi: spi@2a1118000 {
+			status = "okay";
+			compatible = "apple,t8122-qspi";
+			reg = <0x2 0xa1118000 0x0 0x4800>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 771 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_200m>;
+			power-domains = <&ps_qspi>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			flash@0 {
+				compatible = "jedec,spi-nor";
+				reg = <0>;
+				spi-max-frequency = <10000000>;
+				vcc-supply = <&nor_flash_vcc>;
+
+				partitions {
+					compatible = "fixed-partitions";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					nvram_qspi: partition@700000 {
+						label = "nvram";
+						reg = <0x700000 0x100000>;
+					};
+				};
+			};
+		};
+	};
+};
+
+/* This board variant uses QSPIMC instead of SPI1 for NVRAM. */
+&spi1 {
+	status = "disabled";
+};

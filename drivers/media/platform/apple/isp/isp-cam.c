@@ -279,7 +279,7 @@ static int isp_ch_cache_sensor_configs(struct apple_isp *isp, u32 ch, u32 count)
 	if (!count || count > ISP_MAX_SENSOR_CONFIGS)
 		return -EINVAL;
 
-	presets = devm_kcalloc(isp->dev, num + count, sizeof(*presets), GFP_KERNEL);
+	presets = devm_kcalloc(isp->dev, num, sizeof(*presets), GFP_KERNEL);
 	if (!presets)
 		return -ENOMEM;
 	memcpy(presets, isp->presets, num * sizeof(*presets));
@@ -290,7 +290,6 @@ static int isp_ch_cache_sensor_configs(struct apple_isp *isp, u32 ch, u32 count)
 	for (u32 i = 0; i < count; i++) {
 		struct cmd_ch_camera_config *config = &args.config;
 		struct isp_sensor_config *cached = &configs[i];
-		bool duplicate = false;
 
 		err = isp_cmd_ch_camera_config_get(isp, ch, i, &args);
 		if (err)
@@ -335,27 +334,6 @@ static int isp_ch_cache_sensor_configs(struct apple_isp *isp, u32 ch, u32 count)
 			    preset->crop_size.y * preset->output_dim.x)
 				preset->p010 = preview || reported;
 		}
-		if (!cached->usable)
-			continue;
-
-		/* Keep the board's config-5 presets, including the default, first. */
-		for (unsigned int j = 0; j < num; j++) {
-			if (presets[j].output_dim.x == config->out_width &&
-			    presets[j].output_dim.y == config->out_height) {
-				duplicate = true;
-				break;
-			}
-		}
-		if (duplicate)
-			continue;
-
-		presets[num++] = (struct isp_preset){
-			.index = i,
-			.input_dim = cached->input_dim,
-			.output_dim = cached->output_dim,
-			.crop_size = cached->output_dim,
-			.p010 = true,
-		};
 	}
 	isp->sensor_configs = configs;
 	isp->num_sensor_configs = count;
@@ -515,6 +493,11 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 		goto exit;
 	}
 
+	/* Once, when the camera is detected: which one it is, and its setfile. */
+	dev_info(isp->dev, "ch %u: sensor 0x%x, %u configs, platform 0x%x, setfile %s\n",
+		 ch, fmt->version, args->num_presets, isp->platform_id,
+		 isp_setfiles[fmt->id].path);
+
 	err = isp_check_presets(isp, args->num_presets);
 	if (!err)
 		err = isp_ch_cache_sensor_configs(isp, ch, args->num_presets);
@@ -587,11 +570,14 @@ int apple_isp_detect_camera(struct apple_isp *isp)
 
 	err = isp_detect_camera(isp);
 
-	/* Resident firmware stays up; the channel is set up per stream. */
+	/*
+	 * Resident firmware stays up, the channel set up per stream, unless it starts
+	 * again: then it's off until the first stream, as on macOS.
+	 */
 	if (isp->hw->resident_fw) {
-		if (err)
+		if (err || isp->hw->fw_restart)
 			apple_isp_firmware_halt(isp);
-		else
+		if (!err)
 			isp->camera_detected = true;
 		return err;
 	}
@@ -931,7 +917,9 @@ select_config:
 	if (err)
 		return err;
 
-	err = isp_cmd_ch_mbnr_enable(isp, ch, 0, ISP_MBNR_MODE_ENABLE, 1);
+	err = isp_cmd_ch_mbnr_enable(isp, ch, 0,
+				     isp->preview_26 ? ISP_MBNR_MODE_DISABLE :
+				     ISP_MBNR_MODE_ENABLE, 1);
 	if (err)
 		return err;
 
@@ -965,7 +953,11 @@ select_config:
 			return err;
 	}
 
-	err = isp_ch_configure_temporal_filter(isp, ch);
+	/* Preview has no consumer for temporal history on this firmware. */
+	if (isp->preview_26)
+		err = isp_cmd_apple_ch_temporal_filter_disable(isp, ch);
+	else
+		err = isp_ch_configure_temporal_filter(isp, ch);
 	if (err)
 		return err;
 
@@ -1102,10 +1094,10 @@ int apple_isp_start_capture(struct apple_isp *isp)
 
 void apple_isp_stop_capture(struct apple_isp *isp)
 {
-	if (isp->ipc_failed || isp->fw_state == ISP_FW_DEAD)
+	if (isp->ipc_failed || isp->fw_state != ISP_FW_RUNNING)
 		return;
-	isp_cmd_ch_stop(isp, 0); // TODO channel mask
-	isp_cmd_ch_buffer_return(isp, isp->current_ch);
+	if (!isp_cmd_ch_stop(isp, 0)) /* TODO channel mask */
+		isp_cmd_ch_buffer_return(isp, isp->current_ch);
 
 	/* ... until its buffers are back. */
 	apple_isp_wdt_stop(isp);
