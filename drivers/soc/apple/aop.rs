@@ -937,6 +937,12 @@ impl AFKEndpoint {
         data: &[u8],
         ret: Option<KVec<u8>>,
     ) -> Result<Arc<FutureValue<CallResult>>> {
+        // A crashed firmware takes no more messages and answers none. Refuse the call before it
+        // reserves a tag: a tag reserved now is never released, and once they are all gone every
+        // caller would see "too many inflight calls" instead of the crash.
+        if client.crashed.load(Acquire) {
+            return Err(ENODEV);
+        }
         if client.epic_v4
             && self
                 .calls
