@@ -1895,17 +1895,15 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 				     "Failed to get the USB2 PHY\n");
 
 	/*
-	 * Older T8132 device trees and the T6040 ports without a USB3 PHY
-	 * expose only USB2; a NULL PHY is a no-op.
+	 * A port whose device tree names no USB3 PHY (the USB2-only T6040 ports, older T8132
+	 * device trees) exposes only USB2; a NULL PHY is a no-op.
 	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t8132-dwc3") ||
-	    of_device_is_compatible(dev->of_node, "apple,t6040-dwc3"))
-		appledwc->usb3_phy = devm_phy_optional_get(dev, "usb3-phy");
-	else
-		appledwc->usb3_phy = devm_phy_get(dev, "usb3-phy");
+	appledwc->usb3_phy = devm_phy_optional_get(dev, "usb3-phy");
 	if (IS_ERR(appledwc->usb3_phy))
 		return dev_err_probe(dev, PTR_ERR(appledwc->usb3_phy),
 				     "Failed to get the USB3 PHY\n");
+	if (!appledwc->usb3_phy)
+		dev_dbg(dev, "no USB3 PHY in the device tree: USB2 only\n");
 
 	ret = reset_control_assert(appledwc->reset);
 	if (ret) {
