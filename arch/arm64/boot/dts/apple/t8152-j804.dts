@@ -400,6 +400,32 @@
 		power-domains = <&ps_apcie_gp>;
 		apple,always-on;
 	};
+
+	/*
+	 * The GPIO block the SEP depends on, as on T8140 and T8142: kept on,
+	 * since the enclave stops servicing its mailbox for good once it is
+	 * switched off under it.
+	 */
+	ps_gpio: power-controller@b60 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xb60 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "gpio";
+		apple,always-on;
+	};
+
+	/* The SEP's own state: critical in the ADT, the enclave gates it itself. */
+	ps_sep: power-controller@c00 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xc00 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sep";
+		apple,always-on;
+	};
 };
 
 /*
@@ -438,6 +464,30 @@
 		reg = <0x10200 0x0 0x0 0x0 0x0>;
 		local-bd-address = [00 00 00 00 00 00];
 	};
+};
+
+/*
+ * Secure Enclave (J804 ADT sep, dart-sep; PMGR SEP +0xc00, GPIO +0xb60).
+ * The alias makes the loader reserve the SEP firmware and publish the boot
+ * manifests on the node. The SEP and its DART stay disabled: apple_sep
+ * enables them when it loads.
+ */
+/ {
+	aliases {
+		sep = &sep;
+	};
+};
+
+&sep {
+	power-domains = <&ps_sep>, <&ps_gpio>;
+};
+
+&sep_dart {
+	power-domains = <&ps_sep>;
+};
+
+&sep_mbox {
+	status = "okay";
 };
 
 /* Unexposed chassis port instances remain described and disabled. */

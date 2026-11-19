@@ -63,6 +63,43 @@
 		reg = <0x2 0x88c80000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 547 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		/*
+		 * The window iBoot programmed (ADT dart-sep vm-base-0, vm-size-0),
+		 * which already carries the BIT(40) alias the DART translates. The
+		 * SEP consumes the high IOVA on the wire, so no offset.
+		 */
+		apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+		apple,dma-offset = /bits/ 64 <0x0>;
+		status = "disabled";
+	};
+
+	/*
+	 * The Secure Enclave (ADT sep, iop-sep,ascwrap-v8). iBoot hands over a
+	 * running SEP (sepfw-booted); apple_sep enables this node and its DART
+	 * when it loads. The board names it with the "sep" alias so the loader
+	 * reserves the SEP firmware and publishes the boot manifests on it.
+	 */
+	sep: sep@28a600000 {
+		compatible = "apple,sep";
+		reg = <0x2 0x8a600000 0x0 0x74000>;
+		mboxes = <&sep_mbox>;
+		mbox-names = "mbox";
+		iommus = <&sep_dart 0>;
+		status = "disabled";
+	};
+
+	/*
+	 * Not an ASC v4 mailbox: the SEP's window of the post-office block,
+	 * at its third ADT reg + 0x10080 as for the SMC. ADT interrupts in
+	 * order: send-empty, recv-not-empty.
+	 */
+	sep_mbox: mailbox@28a710080 {
+		compatible = "apple,t8152-sep-mailbox", "apple,t8152-smc-mailbox";
+		reg = <0x2 0x8a710080 0x0 0x80>;
+		interrupts = <AIC_IRQ 542 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 541 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		#mbox-cells = <0>;
 		status = "disabled";
 	};
 
