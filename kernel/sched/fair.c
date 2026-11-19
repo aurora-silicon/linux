@@ -9980,8 +9980,11 @@ static bool wake_short_local(struct task_struct *p, int cpu)
  * thread then starts on a core of a cold, often clocked-down cluster, misses
  * in a cache that does not hold its parent's data, and the wake-ups between
  * it and its parent cross clusters. A thread that runs for long is spread by
- * load balancing anyway; most short-lived threads are done before then. New
- * processes keep the usual fork and exec balancing.
+ * load balancing anyway; most short-lived threads are done before then.
+ *
+ * A new process gets the same start: most new processes exec at once, and
+ * exec balancing still places the program they run in the idlest group;
+ * until then the child shares its parent's pages and cache.
  */
 static int fork_local_idle_cpu(struct task_struct *p, int cpu)
 {
@@ -10072,8 +10075,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 
 	/* Slow path */
 	if (unlikely(sd)) {
-		if (sched_feat(FORK_LOCAL) && (wake_flags & WF_FORK) &&
-		    p->mm && p->mm == current->mm) {
+		if (sched_feat(FORK_LOCAL) && (wake_flags & WF_FORK) && p->mm) {
 			int i = fork_local_idle_cpu(p, cpu);
 
 			if (i >= 0)

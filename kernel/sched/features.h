@@ -102,8 +102,9 @@ SCHED_FEAT(SIS_UTIL, true)
 SCHED_FEAT(WAKE_SHORT_LOCAL, true)
 
 /*
- * Start a new thread on an idle CPU that shares the last-level cache with
- * the thread creating it, before looking further. See fork_local_idle_cpu().
+ * Start a new thread or process on an idle CPU that shares the last-level
+ * cache with the task creating it, before looking further. See
+ * fork_local_idle_cpu().
  */
 SCHED_FEAT(FORK_LOCAL, true)
 
