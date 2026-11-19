@@ -549,6 +549,12 @@ struct apple_dcp {
 	enum dcp_firmware_version fw_compat;
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
+	/*
+	 * AFK endpoints the bootloader left running, bit N for endpoint
+	 * 0x20 + N, from its hand-off: afk_start() stops each before its
+	 * INIT. Zero for a processor without such a hand-off.
+	 */
+	u32 afk_live_endpoints;
 	/* Firmware 27.x: the method IDs of this build (iomfb_v27_methods()). */
 	const struct dcp_method_entry *v27_methods;
 	bool external;

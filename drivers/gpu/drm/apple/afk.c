@@ -236,6 +236,35 @@ static int afk_start_polled(struct apple_dcp_afkep *ep)
 	return -ETIMEDOUT;
 }
 
+/*
+ * An endpoint the bootloader left running (afk_live_endpoints): an INIT
+ * on a live endpoint asserts in the firmware. Stop it and wait for the
+ * acknowledgment first. Its old ring stays with the bootloader, which
+ * keeps it reserved.
+ */
+static int afk_stop_live(struct apple_dcp_afkep *ep)
+{
+	u32 bit;
+
+	if (ep->endpoint < 0x20 || ep->endpoint >= 0x40)
+		return 0;
+	bit = BIT(ep->endpoint - 0x20);
+	if (!(ep->dcp->afk_live_endpoints & bit))
+		return 0;
+	reinit_completion(&ep->stopped);
+	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SHUTDOWN));
+	if (!wait_for_completion_timeout(&ep->stopped, msecs_to_jiffies(1000))) {
+		dev_err(ep->dcp->dev, "AFK[ep:%02x]: inherited endpoint did not stop\n",
+			ep->endpoint);
+		return -ETIMEDOUT;
+	}
+	reinit_completion(&ep->stopped);
+	ep->dcp->afk_live_endpoints &= ~bit;
+	dev_info(ep->dcp->dev, "AFK[ep:%02x]: inherited endpoint stopped\n",
+		 ep->endpoint);
+	return 0;
+}
+
 int afk_start(struct apple_dcp_afkep *ep)
 {
 	int ret;
@@ -256,6 +285,9 @@ int afk_start(struct apple_dcp_afkep *ep)
 	 */
 	if (ep->dcp->hw.afk_adopt_endpoints)
 		apple_rtkit_adopt_ep(ep->dcp->rtk, ep->endpoint);
+	ret = afk_stop_live(ep);
+	if (ret)
+		return ret;
 	ret = apple_rtkit_start_ep(ep->dcp->rtk, ep->endpoint);
 	if (ret)
 		return ret;
