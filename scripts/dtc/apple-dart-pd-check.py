@@ -5,9 +5,10 @@
 A DART probes as a device of its own. Without its engine's power state it can be
 probed, and read, while the block it sits in is off, which takes an SError. The
 DART has no power gate of its own; the engine's covers it. So every node with an
-"apple,*dart*" compatible must have power-domains, and an enabled DART must not
-name a disabled power state (it would wait for it forever) unless its engine
-names the same state, in which case the engine is not usable either.
+"apple,*dart*" compatible must have power-domains, and no DART may name a power
+state that is disabled in that DTB, whatever the DART's own status: the boot
+loader enables DARTs (the display's, for one) that the DTB leaves disabled, and
+such a DART would then wait for its state forever.
 
 Exempt: the DARTs of the SEP and of the AOP. Those coprocessors run from
 before the handoff on states the AP never switches off.
@@ -103,21 +104,14 @@ def findings(filename):
             problem = "exempt (%s)" % why[0] if why else "no power-domains"
             yield path, label, compatible[0], status(offset), problem
             continue
-        if status(offset) != "okay":
-            continue
         i = 0
         while i < len(domains):
             provider = phandles.get(domains[i])
             if provider is None:
                 break
             if status(provider) != "okay":
-                # Not a DART problem when its engine waits for the same state.
-                users = [o for o in consumers.get(offset, []) if status(o) == "okay"]
-                shared = users and all(domains[i] in cells(prop(o, "power-domains"))
-                                       for o in users)
-                yield (path, label, compatible[0], "okay",
-                       "%spower domain %s is disabled" %
-                       ("note: engine waits too, " if shared else "", nodes[provider]))
+                yield (path, label, compatible[0], status(offset),
+                       "power domain %s is disabled" % nodes[provider])
             n = cells(prop(provider, "#power-domain-cells"))
             i += 1 + (n[0] if n else 0)
 
@@ -149,13 +143,13 @@ def main():
     for key in sorted(head):
         board, path, problem = key
         label, compatible, status = head[key]
-        exempt = problem.startswith(("exempt", "note:"))
+        exempt = problem.startswith("exempt")
         new = not exempt and (not args.baseline_dtb_dir or key not in base)
         if args.report or new:
             print("%s %s %s %s %s: %s%s" % (board, path, label, compatible, status, problem,
                                             " (new)" if new and args.baseline_dtb_dir else ""))
         failing += new
-    counted = ("exempt", "note:")
+    counted = ("exempt",)
     gone = [k for k in base if k not in head and not k[2].startswith(counted)]
     total = sum(1 for k in head if not k[2].startswith(counted))
     print("DARTs without a usable power domain: %d, new: %d, fixed: %d" %
