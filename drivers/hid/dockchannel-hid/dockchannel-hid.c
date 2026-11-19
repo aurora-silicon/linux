@@ -50,7 +50,7 @@ struct dchid_hdr {
 	u16 pad;
 } __packed;
 
-#define IFACE_COMM DCHID_IFACE_COMM
+#define IFACE_COMM 0
 
 #define FLAGS_GROUP GENMASK(7, 6)
 #define FLAGS_REQ GENMASK(5, 0)
@@ -1480,9 +1480,7 @@ static int dchid_dispatch(struct dockchannel_hid *dchid, struct dchid_hdr *hdr,
 
 	if (dchid->use_rx_ring && hdr->channel == DCHID_CHANNEL_NOTIFY) {
 		/* A FIFO notification has no application subheader or report ID. */
-		dev_dbg(dchid->dev, "notify fifo=%d iface=%u length=%u\n",
-			fifo, hdr->iface, hdr->length);
-		return dchid_notify_wants_drain(fifo, hdr->iface, hdr->length);
+		return fifo && !hdr->length && hdr->iface == IFACE_COMM;
 	}
 
 	if (hdr->iface >= MAX_INTERFACES || hdr->length < sizeof(struct dchid_subhdr))
@@ -1533,14 +1531,13 @@ static void dchid_ring_copy(struct dockchannel_hid *dchid, void *dst,
 	memcpy(dst + first, data, length - first);
 }
 
-static int dchid_drain_ring(struct dockchannel_hid *dchid, bool *partial)
+static int dchid_drain_ring(struct dockchannel_hid *dchid)
 {
 	const u32 capacity = dchid->ring_size - DCHID_RING_HEADER_SIZE;
 	u32 *indices = dchid->ring;
 	u32 producer, consumer, available;
-	int size, frames = 0;
+	int size;
 
-	*partial = false;
 	if (!READ_ONCE(dchid->ring_registered)) {
 		/* The firmware can notify before it has the ring address: nothing to read. */
 		dev_dbg(dchid->dev, "Ring notification before registration\n");
@@ -1557,19 +1554,15 @@ static int dchid_drain_ring(struct dockchannel_hid *dchid, bool *partial)
 		dma_rmb();
 		available = producer >= consumer ? producer - consumer :
 			    capacity - consumer + producer;
-		if (available < sizeof(struct dchid_hdr)) {
-			*partial = !!available;
-			return frames;
-		}
+		if (available < sizeof(struct dchid_hdr))
+			return 0;
 		dchid_ring_copy(dchid, dchid->pkt_buf, consumer,
 				sizeof(struct dchid_hdr));
 		size = dchid_frame_size((void *)dchid->pkt_buf);
 		if (size < 0)
 			return size;
-		if (available < size) {
-			*partial = true;
-			return frames;
-		}
+		if (available < size)
+			return 0;
 		dchid_ring_copy(dchid, dchid->pkt_buf, consumer, size);
 		dchid_dispatch(dchid, (void *)dchid->pkt_buf,
 			       dchid->pkt_buf + sizeof(struct dchid_hdr), false);
@@ -1577,50 +1570,19 @@ static int dchid_drain_ring(struct dockchannel_hid *dchid, bool *partial)
 		if (consumer >= capacity)
 			consumer -= capacity;
 		dchid->ring_read = consumer;
-		frames++;
 		/* All frame reads must complete before the producer can reuse it. */
 		mb();
 		WRITE_ONCE(indices[1], consumer);
 		cond_resched();
 	}
-	return frames;
-}
-
-/*
- * Drain after a doorbell. The firmware can ring the doorbell before the
- * producer index (or the whole frame) is visible, and the doorbell is not
- * repeated: the frame would then wait for the next one. Look again a bounded
- * number of times while the ring looks empty or the last frame is incomplete.
- */
-static void dchid_drain_ring_rechecked(struct dockchannel_hid *dchid)
-{
-	int tries = 0;
-	bool partial = false;
-	unsigned int delay;
-	int frames;
-
-	do {
-		frames = dchid_drain_ring(dchid, &partial);
-		if (frames < 0) {
-			dev_err(dchid->dev, "Receive ring failed: %d\n", frames);
-			return;
-		}
-		dev_dbg(dchid->dev, "drain: try %d frames %d partial %d producer %u consumer %u\n",
-			tries, frames, partial,
-			READ_ONCE(((u32 *)dchid->ring)[0]),
-			READ_ONCE(((u32 *)dchid->ring)[1]));
-		if (!dchid_ring_retry_needed(frames, partial, tries++))
-			return;
-		delay = dchid_ring_recheck_delay_us(partial);
-		if (delay)
-			fsleep(delay);
-	} while (!READ_ONCE(dchid->stopping));
+	return 0;
 }
 
 static void dchid_handle_packet(void *cookie, size_t avail)
 {
 	struct dockchannel_hid *dchid = cookie;
 	struct dchid_hdr hdr;
+	int ret;
 
 	if (READ_ONCE(dchid->stopping))
 		return;
@@ -1638,8 +1600,11 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 		goto done;
 	}
 
-	if (dchid_dispatch(dchid, &hdr, dchid->pkt_buf, true))
-		dchid_drain_ring_rechecked(dchid);
+	if (dchid_dispatch(dchid, &hdr, dchid->pkt_buf, true)) {
+		ret = dchid_drain_ring(dchid);
+		if (ret < 0)
+			dev_err(dchid->dev, "Receive ring failed: %d\n", ret);
+	}
 
 done:
 	if (!READ_ONCE(dchid->stopping))
@@ -1726,11 +1691,12 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	/* The M4 Pro (J616s) MTP uses the same 26.6.2 firmware transport as T8132. */
 	dchid->use_ring = of_device_is_compatible(dev->of_node, "apple,t6041-dockchannel-hid");
 	/*
-	 * The T6050 MTP keeps this platform's reset and GPIO paths, but macOS gives
-	 * its large raw touch reports a 20 MiB host read FIFO. A board opts in with
-	 * the t6050 compatible, once its MTP DART streams 0 and 1 are described.
-	 * Try that receive transport and fall back to the MMIO FIFO if the
-	 * firmware refuses it.
+	 * The T6050 MTP keeps this platform's reset and GPIO paths, but its large
+	 * raw touch reports need a bigger receive path: the T6050 MTP compatible
+	 * selects the ring and its size, the 20 MiB introduced for it in #2015
+	 * (the T6041 path keeps its 2 MiB). The ring needs the node's MTP DART
+	 * streams 0 and 1 described (see #2014). Try that receive transport and
+	 * fall back to the MMIO FIFO if the firmware refuses it.
 	 */
 	dchid->use_rx_ring = dchid->use_ring ||
 			     of_device_is_compatible(dev->of_node, "apple,t6050-dockchannel-hid");
