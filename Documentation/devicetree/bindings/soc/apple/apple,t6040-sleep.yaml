@@ -33,7 +33,6 @@ properties:
       - description: AON watchdog
       - description: control words of the three CPU complexes
       - description: SoC power gate, wake and retention voters
-      - description: clock generator, the clock mux park words
       - description: SPMI controller of the PMU (boot stage, notify, hibernate)
       - description: second SPMI controller's notify word
       - description: MasterMini block with the S2R timer
@@ -47,7 +46,6 @@ properties:
       - const: wdt
       - const: cluster
       - const: pwrgate
-      - const: clkgen
       - const: spmi
       - const: spmi-a0
       - const: mastermini
@@ -107,7 +105,6 @@ examples:
                   <0x5 0x0836c000 0x0 0x4000>,
                   <0x5 0x02820000 0x0 0x20>,
                   <0x5 0x0282c000 0x0 0x1000>,
-                  <0x5 0x00000000 0x0 0x80000>,
                   <0x5 0x09014000 0x0 0x1000>,
                   <0x5 0x09188000 0x0 0x1000>,
                   <0x5 0x08900000 0x0 0x8000>,
@@ -115,8 +112,8 @@ examples:
                   <0x5 0x02800000 0x0 0x9000>,
                   <0x5 0x08004000 0x0 0x1000>;
             reg-names = "cpu-start", "wdt", "cluster", "pwrgate",
-                        "clkgen", "spmi", "spmi-a0", "mastermini",
-                        "soc-east", "soc-ps", "wake";
+                        "spmi", "spmi-a0", "mastermini", "soc-east",
+                        "soc-ps", "wake";
             apple,check-ps-b4-sleep = <&pmgr_disp 0x0 0x58>;
             apple,check-ps-b4-sleep-names = "disp";
         };
