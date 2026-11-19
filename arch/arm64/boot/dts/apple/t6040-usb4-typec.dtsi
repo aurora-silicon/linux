@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * MacBook Pro (14-inch and 16-inch, M4 Pro) USB4/Thunderbolt on all three
- * Type-C ports. The J614s and J616s ADTs have the same acio0-2, dart-acio0-2
- * and acio-cpu0-2, and pair each router with the ATC PHY of one port (ADT
- * acioN atc-phy-parent = atc-phyN): typec0 (left back) is linked to ACIO0,
- * typec1 (left front) to ACIO1, typec2 (right) to ACIO2.
+ * M4 Pro (T6040) USB4/Thunderbolt on every Type-C port. Each port's
+ * connector is linked to the USB4 router behind the same ATC PHY. Every
+ * T6040 board's ADT has the same acio0-2, dart-acio0-2 and acio-cpu0-2, pairs
+ * acioN with atc-phyN (atc-phy-parent) and with the port controller whose
+ * acio-parent is acioN, and the boards name that connector typecN:
+ *   MacBook Pro 14/16 (J614s, J616s): typec0 left back, typec1 left front,
+ *     typec2 right;
+ *   Mac mini (J773s): typec0 back middle, typec1 back left, typec2 back
+ *     right.
  *
  * The loader hands each router its router, adapter and NHI tuning and its
  * DROM over. No PCIe tunnels yet: host-to-host (XDomain, thunderbolt-net) and

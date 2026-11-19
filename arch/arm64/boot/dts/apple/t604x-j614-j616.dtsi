@@ -3481,4 +3481,4 @@
 	status = "okay";
 };
 
-#include "t604x-j614-j616-usb4.dtsi"
+#include "t6040-usb4-typec.dtsi"
