@@ -571,5 +571,16 @@
 	};
 };
 
+/*
+ * About 230 ms after a lid close starts a suspend, this board's SMC has
+ * reported the lid open while it stays shut, in step with the trackpad
+ * moving its touch AFE to dependent mode, and MSLD can agree with that
+ * report: a lid-open report in the first 2000 ms of a sleep does not wake
+ * the system.
+ */
+&smc {
+	apple,lid-open-wake-holdoff-ms = <2000>;
+};
+
 #define T6050_J716S
 #include "t6050-peripherals.dtsi"
