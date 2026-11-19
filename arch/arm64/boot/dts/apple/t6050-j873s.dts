@@ -7,6 +7,7 @@
  * One T6050 die (t6050-max.dtsi). Nobody has booted Linux on this board
  * yet: beyond the SoC this file only adds the board's hardware inventory
  * (t6050-peripherals.dtsi), all of it disabled, from the board's ADT.
+ * The SMC hwmon keys (one fan) follow the other Mac minis.
  *
  * Copyright The Asahi Linux Contributors
  */
@@ -30,6 +31,31 @@
 /* PCIe port 0 is not described for this board yet */
 &pcie0 {
 	status = "disabled";
+};
+
+/*
+ * SMC sensors, as on the other Mac minis: the shared power, voltage and current
+ * keys and the single fan, plus every readable float T* key through
+ * apple,discover-temperatures in t6050-die0.dtsi. A key this SMC lacks only
+ * drops its channel.
+ *
+ * Discovery refuses to run once any temperature channel exists, so the shared
+ * temperature nodes go (their keys are discovered anyway), as on J714s/J716s.
+ */
+#include "hwmon-common.dtsi"
+#include "hwmon-mini.dtsi"
+
+&smc_hwmon {
+	/delete-node/ temperature-TH0x;
+	/delete-node/ temperature-TW0P;
+
+	/*
+	 * The T6050 SMC spells the fan mode key F0md, as on J714s, J716s, K116s
+	 * and J775d. No apple,fan-manual-control: the SMC drives the fan.
+	 */
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+	};
 };
 
 #define T6050_J873S

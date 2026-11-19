@@ -7,6 +7,8 @@
  * One T6050 die (t6050-max.dtsi). Nobody has booted Linux on this board
  * yet: beyond the SoC this file only adds the board's hardware inventory
  * (t6050-peripherals.dtsi), all of it disabled, from the board's ADT.
+ * The SMC hwmon keys (DC input power, two fans) are the J775d's
+ * (t6050-j775-hwmon.dtsi).
  *
  * Copyright The Asahi Linux Contributors
  */
@@ -31,6 +33,8 @@
 &pcie0 {
 	status = "disabled";
 };
+
+#include "t6050-j775-hwmon.dtsi"
 
 #define T6050_J775C
 #include "t6050-peripherals.dtsi"

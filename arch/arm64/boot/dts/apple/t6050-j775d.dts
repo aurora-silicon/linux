@@ -284,35 +284,7 @@
 	status = "okay";
 };
 
-/*
- * The Studio's DC input. PSTR and PDTR read 0 on the Studio; PD0R is its DC input (36.5 W at an
- * idle desktop).
- */
-&smc_hwmon {
-	power-PD0R {
-		apple,key-id = "PD0R";
-		label = "DC Input Power";
-	};
-};
-
-#include "hwmon-fan-dual.dtsi"
-
-/*
- * The Studio's SMC has F0Ac/F0Mn/F0Mx/F0Tg and F1*, but its mode keys are F0md/F1md (ui8, flags 0xd0:
- * readable, writable, a function key), not the F0Md/F1Md the dtsi names; with the dtsi's names fan
- * creation failed on the missing key. With the real keys the fans can be set by the kernel's
- * thermal policy (the M5 GPU governor, through macsmc_hwmon_fans_request()). No
- * apple,fan-manual-control: userspace still only reads them.
- */
-&smc_hwmon {
-	fan-F0Ac {
-		apple,fan-mode = "F0md";
-	};
-
-	fan-F1Ac {
-		apple,fan-mode = "F1md";
-	};
-};
+#include "t6050-j775-hwmon.dtsi"
 
 /*
  * The boot NOR's NVRAM: the loader fills the partition from ADT /arm-io/qspi/spinor/anvram reg
