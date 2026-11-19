@@ -20,6 +20,8 @@
 
 	chosen {
 		aurora,t6030-dispext = "1";
+		/* LEGACY-ASAHI(2027-02-28): the same switch under its old name, read by aura built before the rename */
+		asahi,t6030-dispext = "1";
 	};
 };
 
