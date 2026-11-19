@@ -377,6 +377,10 @@ pub(crate) struct ComputeOwners {
     owner: [Option<Arc<super::vm::VmState>>; sizes::COMPUTE_UNITS],
     pending_retarget: [Option<VmRetarget>; sizes::COMPUTE_UNITS],
     pending_owner: [Option<Arc<super::vm::VmState>>; sizes::COMPUTE_UNITS],
+    /// The arena holding each owner's unit: the firmware may still write the unit's
+    /// descriptor when a later owner displaces it, after its VM's client closed.
+    arena: [Option<Arc<super::resources::ComputeArena>>; sizes::COMPUTE_UNITS],
+    pending_arena: [Option<Arc<super::resources::ComputeArena>>; sizes::COMPUTE_UNITS],
 }
 
 pub(crate) struct Slots {
@@ -393,6 +397,9 @@ pub(crate) struct Slots {
     pass_owner: [Option<Arc<super::vm::VmState>>; 2],
     pending_pass_retarget: [Option<VmRetarget>; 2],
     pending_pass_owner: [Option<Arc<super::vm::VmState>>; 2],
+    /// The render arena of each pass slot's owner (see [`ComputeOwners::arena`]).
+    pass_arena: [Option<Arc<super::resources::RenderArena>>; 2],
+    pending_pass_arena: [Option<Arc<super::resources::RenderArena>>; 2],
 }
 impl Slots {
     pub(crate) fn new() -> Result<Self> {
@@ -407,6 +414,8 @@ impl Slots {
                     owner: [const { None }; sizes::COMPUTE_UNITS],
                     pending_retarget: [None; sizes::COMPUTE_UNITS],
                     pending_owner: [const { None }; sizes::COMPUTE_UNITS],
+                    arena: [const { None }; sizes::COMPUTE_UNITS],
+                    pending_arena: [const { None }; sizes::COMPUTE_UNITS],
                 },
                 GFP_KERNEL,
             )?,
@@ -414,6 +423,8 @@ impl Slots {
             pass_owner: [None, None],
             pending_pass_retarget: [None, None],
             pending_pass_owner: [None, None],
+            pass_arena: [None, None],
+            pending_pass_arena: [None, None],
         })
     }
     pub(crate) fn init(&self) -> Result {
@@ -599,6 +610,21 @@ impl Slots {
         Ok(())
     }
 
+    /// With [`Self::hold_vm`]: the claimed units' arenas, held with their VM leases. The VM's
+    /// own cache lets go of its arenas when its client closes.
+    pub(crate) fn hold_arenas(&mut self, f: &Claims, resources: &super::resources::Prepared) {
+        for &k in &f.slot[..(f.slot_count as usize).min(f.slot.len())] {
+            if let Some(cell) = self.compute.pending_arena.get_mut(k as usize) {
+                *cell = resources.compute_arena(k as usize);
+            }
+        }
+        for k in 0..2 {
+            if f.pass_mask & (1 << k) != 0 {
+                self.pending_pass_arena[k] = resources.render_arena();
+            }
+        }
+    }
+
     /// Reserve the actual same-slot publication. Call before producers become visible.
     pub(crate) fn publish(&mut self, f: &Claims) -> Result {
         // Validate on a private copy so a failure changes no ownership.
@@ -636,10 +662,12 @@ impl Slots {
         self.pass_lifetime = p;
         for &k in &f.slot[..f.slot_count as usize] {
             self.compute.owner[k as usize] = self.compute.pending_owner[k as usize].take();
+            self.compute.arena[k as usize] = self.compute.pending_arena[k as usize].take();
         }
         for k in 0..2 {
             if f.pass_mask & (1 << k) != 0 {
                 self.pass_owner[k] = self.pending_pass_owner[k].take();
+                self.pass_arena[k] = self.pending_pass_arena[k].take();
             }
         }
         self.pass_busy &= !f.pass_mask;
@@ -670,12 +698,14 @@ impl Slots {
             self.compute.lifetime.cancel(k as usize);
             self.compute.pending_retarget[k as usize] = None;
             self.compute.pending_owner[k as usize] = None;
+            self.compute.pending_arena[k as usize] = None;
         }
         for k in 0..2 {
             if f.pass_mask & (1 << k) != 0 {
                 self.pass_lifetime.cancel(k);
                 self.pending_pass_retarget[k] = None;
                 self.pending_pass_owner[k] = None;
+                self.pending_pass_arena[k] = None;
             }
         }
         self.pass_busy &= !f.pass_mask;
