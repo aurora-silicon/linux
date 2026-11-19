@@ -354,16 +354,13 @@ static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
 /*
  * The sleep's rules for the port controllers' system power state command (the controller is
  * woken first, the command's end is read at intervals, a failed S3 refuses the sleep, the
- * command's limit and its lines) apply on the J714s, J716c, J813 and J815.
- * These boards send the command (apple,sleep-ssps) during firmware-driven
- * sleep. Other boards retain the original command behavior.
+ * command's limit and its lines) apply to every controller that sends the command around a
+ * firmware-driven sleep (apple,sleep-ssps). Other controllers retain the original command
+ * behavior.
  */
-static bool tipd_sleep_ssps_rules(void)
+static bool tipd_sleep_ssps_rules(const struct tps6598x *tps)
 {
-	return of_machine_is_compatible("apple,j714s") ||
-	       of_machine_is_compatible("apple,j716c") ||
-	       of_machine_is_compatible("apple,j813") ||
-	       of_machine_is_compatible("apple,j815");
+	return device_property_read_bool(tps->dev, "apple,sleep-ssps");
 }
 
 /*
@@ -419,11 +416,11 @@ static int tps6598x_exec_cmd_gap(struct tps6598x *tps, const char *cmd,
 		 * its last read was made at. Elsewhere a read made past the limit is a timeout,
 		 * as before.
 		 */
-		if ((val || !tipd_sleep_ssps_rules()) && time_is_before_jiffies(timeout))
+		if ((val || !tipd_sleep_ssps_rules(tps)) && time_is_before_jiffies(timeout))
 			return -ETIMEDOUT;
 		/* A command with a long limit is not waited for in silence: a line each second */
 		if (val && cmd_timeout_ms > 1000 && time_is_before_jiffies(note) &&
-		    tipd_sleep_ssps_rules()) {
+		    tipd_sleep_ssps_rules(tps)) {
 			dev_info(tps->dev, "command %.4s not done after %u ms (limit %u ms)\n", cmd,
 				 jiffies_to_msecs(jiffies - (timeout - msecs_to_jiffies(cmd_timeout_ms))),
 				 cmd_timeout_ms);
@@ -1719,17 +1716,12 @@ static int cd321x_prepare(struct tps6598x *tps)
 	cancel_delayed_work_sync(&cd321x->rearm_work);
 
 	/* As macOS does a second or so before the commit, measured on the same controller. */
-	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps")) {
+	if (pm_suspend_via_firmware() && tipd_sleep_ssps_rules(tps)) {
 		ktime_t start = ktime_get();
 
 		guard(mutex)(&tps->lock);
 		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S3);
-		/* Without the rules: the lines and their levels as they were */
-		if (!tipd_sleep_ssps_rules() && ret)
-			dev_warn(tps->dev, "didn't take system power state S3: %d\n", ret);
-		else if (!tipd_sleep_ssps_rules())
-			dev_dbg(tps->dev, "system power state S3\n");
-		else if (ret)
+		if (ret)
 			dev_warn(tps->dev, "didn't take system power state S3: %d after %lld ms%s\n", ret,
 				 ktime_ms_delta(ktime_get(), start),
 				 sleep_s3_refuse ? ": sleep refused" : "");
@@ -1737,7 +1729,7 @@ static int cd321x_prepare(struct tps6598x *tps)
 			dev_info(tps->dev, "system power state S3 in %lld ms\n",
 				 ktime_ms_delta(ktime_get(), start));
 	}
-	if (ret && sleep_s3_refuse && tipd_sleep_ssps_rules())
+	if (ret && sleep_s3_refuse)
 		return -EBUSY;
 	return 0;
 }
@@ -1916,14 +1908,12 @@ static void cd321x_complete(struct tps6598x *tps)
 		cd321x->pm.setup_pending = true;
 		cd321x->reset_by_cut = true;
 	}
-	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps")) {
+	if (pm_suspend_via_firmware() && tipd_sleep_ssps_rules(tps)) {
 		ktime_t start = ktime_get();
 		int ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
 
 		/* After a sleep or a refused one: never waited for in silence, and never longer */
-		if (!tipd_sleep_ssps_rules())
-			ret = 0;
-		else if (ret)
+		if (ret)
 			dev_warn(tps->dev, "didn't take system power state S0: %d after %lld ms; set up again by its next event\n",
 				 ret, ktime_ms_delta(ktime_get(), start));
 		else
@@ -2395,7 +2385,7 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state)
 	 * Under the sleep's rules the command goes to a controller that has just been sent its
 	 * bus's wake command and has answered it, whatever it was doing: woken, read, commanded.
 	 */
-	if (tps->wake && tipd_sleep_ssps_rules()) {
+	if (tps->wake && tipd_sleep_ssps_rules(tps)) {
 		ret = tps->wake(tps);
 		if (ret)
 			return ret;
@@ -2413,13 +2403,13 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state)
 	 * the sleep's rules. Under them S0 and S3 have the sleep's own limit and are read with
 	 * gaps.
 	 */
-	if ((target_state == TPS_SYSTEM_POWER_STATE_S0 || tipd_sleep_ssps_rules()) &&
+	if ((target_state == TPS_SYSTEM_POWER_STATE_S0 || tipd_sleep_ssps_rules(tps)) &&
 	    device_is_compatible(tps->dev, "apple,sn201202x"))
 		ret = tps6598x_exec_cmd_gap(tps, "SSPS", sizeof(target_state),
 					  &target_state, 0, NULL,
-					  tipd_sleep_ssps_rules() ?
+					  tipd_sleep_ssps_rules(tps) ?
 					  clamp(sleep_ssps_ms, 1000U, 5000U) : 5000, 0,
-					  tipd_sleep_ssps_rules() ? CD321X_SSPS_READ_GAP_US : 0);
+					  tipd_sleep_ssps_rules(tps) ? CD321X_SSPS_READ_GAP_US : 0);
 	else
 		ret = tps6598x_exec_cmd(tps, "SSPS", sizeof(target_state),
 				      &target_state, 0, NULL);

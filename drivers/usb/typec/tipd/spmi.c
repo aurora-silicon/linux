@@ -9,6 +9,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/spmi.h>
 #include <linux/suspend.h>
 #include <linux/usb/role.h>
@@ -734,7 +735,7 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 }
 
 /*
- * On the T6050 boards that sleep (J714s, J716c), the probe and the sleep's SLEEP command print a
+ * On the T6050 boards that describe a deep sleep, the probe and the sleep's SLEEP command print a
  * line; on every other machine they don't. A controller without a connector (the MagSafe one,
  * hpm5) is probed as any other: it registers its Type-C port and power supply, and with
  * apple,sleep-ssps it follows the system's sleep as the USB-C ports' controllers do (woken and
@@ -743,12 +744,7 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
  */
 static bool sn201202x_sleep_board(void)
 {
-	return of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c");
-}
-
-static bool sn201202x_j714s(void)
-{
-	return of_machine_is_compatible("apple,j714s");
+	return apple_t6050_sleep_described();
 }
 
 /*
@@ -760,7 +756,7 @@ static bool sn201202x_j714s(void)
  * -EINVAL. Both ports, and every USB, Thunderbolt and DisplayPort device on them, stayed gone
  * until the next boot.
  *
- * On that board a failed probe is tried again after a growing wait. After the third failed try
+ * On these boards a failed probe is tried again after a growing wait. After the third failed try
  * the controller's firmware is cold-reset ("Gaid", as the debug link's recovery does), unless
  * it is in the debug mode of the boot loader's debug link, and it is tried twice more. Each try
  * runs in a devres group of its own, so what a failed try set up is released before the next.
@@ -817,7 +813,7 @@ static int sn201202x_init(struct sn201202x *sn)
 	void *group;
 	int ret;
 
-	if (!sn201202x_j714s()) {
+	if (!sn201202x_sleep_board()) {
 		ret = tipd_init(tps);
 		if (ret)
 			cancel_delayed_work_sync(&sn->ldcm_work);

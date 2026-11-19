@@ -1083,12 +1083,12 @@ static void dwc3_apple_check_hub_later(struct dwc3_apple *appledwc)
 
 /*
  * Waiting for a Type-C PHY that is not started after sleep is specific to the T6050 boards
- * whose port controllers take the sleep's power states (J714s, J716c). The notifier work
- * and its admission rules apply to every board.
+ * whose port controllers take the sleep's power states: those whose device tree describes
+ * the sleep. The notifier work and its admission rules apply to every board.
  */
 static bool dwc3_apple_sleep_board(void)
 {
-	return of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c");
+	return apple_t6050_sleep_described();
 }
 
 /*
