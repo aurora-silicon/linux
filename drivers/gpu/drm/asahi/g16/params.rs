@@ -39,10 +39,16 @@ pub(crate) mod tune {
     pub(crate) static COMPUTE_FLIGHTS: AtomicU32 = AtomicU32::new(16);
     /// Completion repoll interval override, us (0: `g16_resnap_us`).
     pub(crate) static RESNAP_US: AtomicU32 = AtomicU32::new(0);
-    const NAMES: [(&str, &AtomicU32, u32, u32); 3] = [
+    /// PB heap of a VM's render arena, MiB (VMs created after a change).
+    pub(crate) static PB_HEAP_MB: AtomicU32 = AtomicU32::new(64);
+    /// PB blocks posted to a fresh epoch at most (2048: the whole heap).
+    pub(crate) static PB_BLOCKS: AtomicU32 = AtomicU32::new(2048);
+    const NAMES: [(&str, &AtomicU32, u32, u32); 5] = [
         ("compute_units", &COMPUTE_UNITS, 2, super::hw::sizes::COMPUTE_UNITS as u32),
         ("compute_flights", &COMPUTE_FLIGHTS, 1, super::hw::sizes::FLIGHTS as u32),
         ("resnap_us", &RESNAP_US, 0, 1000),
+        ("pb_heap_mb", &PB_HEAP_MB, 8, 256),
+        ("pb_blocks", &PB_BLOCKS, 16, 2048),
     ];
 
     /// Applies one `name=value` line.
@@ -70,6 +76,20 @@ pub(crate) mod tune {
         }
         writeln!(f)
     }
+}
+
+/// PB heap blocks of a new render arena (128 KiB each).
+pub(crate) fn pb_heap_blocks() -> u32 {
+    let mb = tune::PB_HEAP_MB.load(core::sync::atomic::Ordering::Relaxed).clamp(8, 256);
+    mb * 8
+}
+
+/// PB blocks posted to a fresh epoch of a heap of `heap_blocks`.
+pub(crate) fn pb_posted_blocks(heap_blocks: u32) -> u32 {
+    tune::PB_BLOCKS
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .clamp(16, 2048)
+        .min(heap_blocks)
 }
 
 /// Compute units of a VM that submits compute back to back.
