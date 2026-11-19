@@ -833,8 +833,13 @@
 
 			smc_rtc: rtc {
 				compatible = "apple,smc-rtc";
-				nvmem-cells = <&rtc_offset>;
-				nvmem-cell-names = "rtc_offset";
+				nvmem-cells = <&rtc_offset>, <&rtc_ctrl>, <&rtc_alarm>,
+					      <&rtc_alarm_mask>;
+				nvmem-cell-names = "rtc_offset", "rtc_ctrl", "rtc_alarm",
+						   "rtc_alarm_mask";
+				/* The PMU's alarm: its peripheral interrupt 2 on nub-spmi0 (edge, rising). */
+				interrupts-extended = <&nub_spmi0 0x02 0x01>;
+				wakeup-source;
 			};
 
 			gpio-low {
@@ -898,6 +903,10 @@
 			reg = <0x02 0x8a014000 0x00 0x4000>;
 			#address-cells = <0x02>;
 			#size-cells = <0x00>;
+			/* ADT /arm-io/nub-spmi0 interrupts[1]: AIC 726. Its peripheral interrupts carry the PMU's. */
+			interrupts = <0x00 0x00 0x2d6 0x04>;
+			interrupt-controller;
+			#interrupt-cells = <0x02>;
 
 			pmu: pmic@e {
 				compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
