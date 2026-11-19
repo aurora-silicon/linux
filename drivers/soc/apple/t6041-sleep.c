@@ -206,7 +206,7 @@ struct t6041_sleep {
 	u32 pre_perf[2], pre_pmc[5], pre_clk[4], pre_mask[2], pre_wake[9], pre_votes[5];
 	/* Each AMCC plane's cache ways (+0x2800) and status (+0x2804). */
 	u32 pre_ways[32], pre_cache[32];
-	u32 full_pre[15];	/* t6041_full_ps as the commit starts */
+	u32 full_pre[16];	/* t6041_full_ps as the commit starts */
 	bool pre_a0;
 	/* GP PCIe ports 0/1: port block, PHY word, and what they held as the commit started. */
 	void __iomem *gp_port[2], *gp_phy[2];
@@ -237,9 +237,11 @@ static void __iomem *t6041_reg_map[ARRAY_SIZE(t6041_macos_regs)];
  * channels (named from a full J614c's ADT; on the binned part they read target and actual 0),
  * each with the value macOS has for the same kind of word: an AMCC slice 0x1000030f (AUTO,
  * auto state 0), a DCS channel 0x1400034f (auto state 4). Left forced on, they keep fab3_soc
- * (East +0x118) on at the commit. dcs_27 isn't among the words the J614c has on there.
+ * (East +0x118) on at the commit. dcs_27 is at main +0x530, past the other DCS words (+0x280 is
+ * amcc27): the J614c's iBoot leaves it forced on (0x0f0002ff), and the full part resets in the
+ * sleep unless it goes to AUTO too.
  */
-static const struct { u8 east; u16 off; u32 val; } t6041_full_ps[15] = {
+static const struct { u8 east; u16 off; u32 val; } t6041_full_ps[16] = {
 	{ 0, 0x248, 0x1000030f },	/* amcc24 */
 	{ 0, 0x250, 0x1400034f },	/* dcs_24 */
 	{ 0, 0x258, 0x1000030f },	/* amcc25 */
@@ -247,6 +249,7 @@ static const struct { u8 east; u16 off; u32 val; } t6041_full_ps[15] = {
 	{ 0, 0x268, 0x1000030f },	/* amcc26 */
 	{ 0, 0x270, 0x1400034f },	/* dcs_26 */
 	{ 0, 0x280, 0x1000030f },	/* amcc27 */
+	{ 0, 0x530, 0x1400034f },	/* dcs_27 */
 	{ 1, 0x2c0, 0x1000030f },	/* amcc28 */
 	{ 1, 0x2c8, 0x1000030f },	/* amcc29 */
 	{ 1, 0x2d0, 0x1000030f },	/* amcc30 */
