@@ -131,6 +131,7 @@ struct apple_smc {
 	 * resolve only the matching pending ID; timeout never cancels SRAM use.
 	 */
 	bool saved_enabled, saved_blocked, saved_scope, saved_committed;
+	bool port_dark_wake;
 	bool saved_pending, saved_recovery, saved_wake;
 	int saved_fault, saved_notice_error, saved_restore_error;
 	/*
