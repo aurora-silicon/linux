@@ -182,7 +182,7 @@ pub(crate) struct Regs {
     /// Host-owned generation register page (SGX +0xd60000).
     generation: Mapping,
     /// Highest firmware performance state the board's table holds: S9 until the table is
-    /// known (the ten-row J713/J604 tables), S10 on the eleven-row J773g table.
+    /// known (the ten-row tables), S10 on the eleven-row ones.
     top: AtomicU32,
 }
 

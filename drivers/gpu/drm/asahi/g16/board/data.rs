@@ -17,29 +17,22 @@ pub(crate) struct Layout {
 }
 
 /// Tried in order; a layout matches only when each row's two states share frequency, SRAM
-/// frequency and both voltages, so the J713 shape cannot be mistaken for the others. J604 and
-/// J773g have the same shape and differ only in their row count, which the board selects.
-pub(crate) const LAYOUTS: [Layout; 3] = [
-    // J713: four common low states followed by six equal-voltage pairs.
+/// frequency and both voltages, so the two shapes cannot be mistaken for each other. The row
+/// count follows from the shape of the machine's own ADT states; no board is asked.
+pub(crate) const LAYOUTS: [Layout; 2] = [
+    // Four common low states followed by six equal-voltage pairs (the J713's ADT): ten rows.
     Layout {
-        name: "J713",
+        name: "4+6 pairs",
         rows: 10,
         main: [0, 1, 2, 3, 5, 7, 9, 11, 13, 15, 0],
         auxiliary: [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 0],
     },
-    // J604 (MacBook Pro 14-inch, M4): five low states, five equal-voltage pairs (5/6 to
-    // 13/14) and a single top state 15. Eleven distinct rows do not fit in ten, so the fifth
-    // low state (4) is left out; the four lowest states, every pair and the top state keep
-    // their own ADT values.
+    // Five low states, five equal-voltage pairs (5/6 to 13/14) and a single top state 15 (the
+    // J604's and the J773g's ADT): eleven distinct rows, every state kept. The firmware takes
+    // eleven rows; this was run on a J773g. An earlier ten-row selection for this shape left
+    // the fifth low state out only because ten rows were thought to be the limit.
     Layout {
-        name: "J604",
-        rows: 10,
-        main: [0, 1, 2, 3, 6, 8, 10, 12, 14, 15, 0],
-        auxiliary: [0, 1, 2, 3, 5, 7, 9, 11, 13, 15, 0],
-    },
-    // J773g (Mac mini, M4): the J604 shape, with every state kept in eleven rows.
-    Layout {
-        name: "J773g",
+        name: "5+5 pairs+top",
         rows: 11,
         main: [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 15],
         auxiliary: [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 15],
@@ -52,23 +45,18 @@ use super::super::fw::initdata::{Performance, PERF_STATES};
 pub(crate) fn select(
     source: &super::super::adt::perf::Source,
 ) -> core::result::Result<Performance, super::super::adt::perf::Error> {
-    select_named(source, None).map(|(performance, _)| performance)
+    select_named(source).map(|(performance, _)| performance)
 }
 
-/// As [`select`], with the name of the layout that matched. With `rows`, only the layouts with
-/// that row count, the one qualified for the board, are tried.
+/// As [`select`], with the name of the layout that matched.
 pub(crate) fn select_named(
     source: &super::super::adt::perf::Source,
-    rows: Option<usize>,
 ) -> core::result::Result<(Performance, &'static str), super::super::adt::perf::Error> {
     use super::super::adt::perf::Error;
     if source.count != SOURCE_STATES {
         return Err(Error::Shape);
     }
     for layout in LAYOUTS.iter() {
-        if rows.is_some_and(|rows| rows != layout.rows) {
-            continue;
-        }
         match select_layout(source, layout) {
             Err(Error::Shape) => continue,
             Err(error) => return Err(error),

@@ -1,0 +1,16 @@
+{
+ "provenance": {
+  "source": "Mac mini (J773g, Mac16,10) ADT read from the running machine on the macOS 27.2 (26B123) stub; the GPU performance-state properties match the 26.6.2 ADT byte for byte",
+  "source_sha256": "e0487b2be078c7e8e098ab4432b92b0c3d99ebf852ba8e29fa35fc983468f3b8",
+  "source_bytes": 475136,
+  "extraction": "Exact property values from /arm-io/sgx. Names and unrelated nodes omitted. No serial identifiers or full ADT included."
+ },
+ "properties_hex": {
+  "compatible": "6770752c743831333200",
+  "perf-state-count": "10000000",
+  "perf-state-table-count": "01000000",
+  "gpu-num-perf-states": "0f000000",
+  "perf-states": "000000007d000000807825146202000080eed5248002000000ff712f9e02000000285037cb020000005ebe38020300000048f13e020300004081c33e2f03000080c8bc452f0300000020aa446603000080bb2c4c660300000095c347840300008042c04f840300008027094fca030000806b9e57ca030000805e0e5e15040000",
+  "perf-states-sram": "000000000c030000807825140c03000080eed5240c03000000ff712f0c030000002850370c030000005ebe380c0300000048f13e0c0300004081c33e2f03000080c8bc452f0300000020aa446603000080bb2c4c660300000095c347840300008042c04f840300008027094fca030000806b9e57ca030000805e0e5e15040000"
+ }
+}

@@ -26,6 +26,14 @@ def node(props, children=()):
 # Minimal synthetic envelope around exact measured properties, with no unrelated machine data.
 image = node({'name': b'device-tree\0'}, [node({'name': b'arm-io\0'}, [node({'name': b'sgx\0', **properties})])])
 blob = out / 'measured-perf.adt'
+# The Mac mini's own properties (five low states, five pairs, a top state), in the same envelope.
+j773g_fixture = HERE / 'fixtures/m4-perf-source-j773g.json'
+if sha(j773g_fixture) != '3248fe413aa6bd9206baf2f41e2eaa8154452a2ba0eda65131382e04dccbedd7':
+    raise RuntimeError('J773g original ADT performance fixture changed')
+j773g_properties = {name: bytes.fromhex(value)
+                    for name, value in json.loads(j773g_fixture.read_text())['properties_hex'].items()}
+j773g_blob = out / 'measured-perf-j773g.adt'
+j773g_blob.write_bytes(node({'name': b'device-tree\0'}, [node({'name': b'arm-io\0'}, [node({'name': b'sgx\0', **j773g_properties})])]))
 blob.write_bytes(image)
 backend = root / 'drivers/gpu/drm/asahi/g16'
 source = r'''
@@ -37,6 +45,7 @@ mod backend {
 }
 use backend::{adt::perf, board::data, fw::initdata as wire};
 const MEASURED: &[u8] = include_bytes!("@FIXTURE@");
+const MEASURED_J773G: &[u8] = include_bytes!("@FIXTURE_J773G@");
 fn put32(out: &mut [u8], at: usize, value: u32) { out[at..at+4].copy_from_slice(&value.to_le_bytes()); }
 fn property_offset(data: &[u8], name: &[u8]) -> usize {
     data.windows(32).position(|value| value.starts_with(name) && value[name.len()..].iter().all(|&x| x==0)).unwrap()
@@ -98,8 +107,8 @@ fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
          [100,590,630,650,690,730,790,840,890,940,990],
          [760,760,760,760,760,760,790,840,890,940,990]),
     ] {
-        let (p,name)=data::select_named(&j773g(core,sram),Some(11)).unwrap();
-        assert_eq!(name,"J773g"); assert_eq!(p.count,11);
+        let (p,name)=data::select_named(&j773g(core,sram)).unwrap();
+        assert_eq!(name,"5+5 pairs+top"); assert_eq!(p.count,11);
         assert_eq!(p.frequency,[0,338,618,796,928,1056,1170,1278,1338,1470,1578]);
         assert_eq!(p.auxiliary,[0,338,618,796,928,952,1053,1152,1204,1326,1578]);
         assert_eq!(p.voltage,voltage); assert_eq!(p.sram,row_sram);
@@ -118,7 +127,7 @@ fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
 #[test] fn the_row_count_bounds_the_encoded_ceiling() {
     let j713=tables(); let j773g=data::select_named(&j773g(
         [100,600,620,660,700,750,750,800,800,850,850,900,900,950,950,1000],
-        [740,740,740,740,740,750,750,800,800,850,850,900,900,950,950,1000]),Some(11)).unwrap().0;
+        [740,740,740,740,740,750,750,800,800,850,850,900,900,950,950,1000])).unwrap().0;
     for (p,good,bad) in [(j713,[1,9],[0,10]),(j773g,[1,10],[0,11])] {
         for ceiling in good {
             let mut buffers=wire::OBJECT_SIZE.map(|size|vec![0xa5;size]);
@@ -201,10 +210,24 @@ fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
     let mut s=source();s.core_mv[6]=s.core_mv[5];s.sram_mv[6]=s.sram_mv[5];assert!(data::select(&s).is_err());
     let mut s=source();s.core_mv[4]-=1;s.core_mv[6]-=1;assert!(data::select(&s).is_err());
 }
-#[test] fn j604_shape_selects_its_own_layout_and_the_j713_keeps_its_own() {
-    assert_eq!(data::select_named(&source(),None).unwrap().1,"J713");
-    // J604 shape: five low states, equal-voltage pairs 5/6 to 13/14, a single top state 15.
-    // Rows 0-3 and 5-15 are the J604's selected values; state 4 (left out) is synthetic.
+#[test] fn measured_adts_give_ten_rows_on_the_j713_and_eleven_on_the_j773g() {
+    // The two machines' own, unmodified ADT states: the count is derived from each.
+    let (p,name)=data::select_named(&perf::parse(MEASURED).unwrap()).unwrap();
+    assert_eq!((p.count,name),(10,"4+6 pairs"));
+    let s=perf::parse(MEASURED_J773G).unwrap(); assert_eq!(s.count,16);
+    let (p,name)=data::select_named(&s).unwrap();
+    assert_eq!((p.count,name),(11,"5+5 pairs+top"));
+    assert_eq!(p.frequency,[0,338,618,796,928,1056,1170,1278,1338,1470,1578]);
+    assert_eq!(p.auxiliary,[0,338,618,796,928,952,1053,1152,1204,1326,1578]);
+    assert_eq!(p.voltage,[125,610,640,670,715,770,815,870,900,970,1045]);
+    assert!(encode(p).is_ok());
+}
+#[test] fn the_row_count_follows_from_the_shape_of_the_adt_states() {
+    // Four low states and six pairs (the J713's own values): ten rows.
+    let (p,name)=data::select_named(&source()).unwrap();
+    assert_eq!(name,"4+6 pairs"); assert_eq!(p.count,10);
+    // Five low states, pairs 5/6 to 13/14 and a single top state 15 (the J604's selected
+    // values; its state 4 is synthetic here): eleven rows, every state kept.
     let mhz=[0,338,618,796,928,952,1056,1053,1170,1152,1278,1204,1338,1326,1470,1578];
     let mv=[125,625,640,680,725,780,780,825,825,865,865,895,895,970,970,1045];
     let mut s=source();
@@ -212,27 +235,22 @@ fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
         s.frequency_mhz[i]=mhz[i];s.sram_frequency_mhz[i]=mhz[i];
         s.core_mv[i]=mv[i];s.sram_mv[i]=mv[i].max(780);
     }
-    let (p,name)=data::select_named(&s,None).unwrap();
-    assert_eq!(name,"J604"); assert_eq!(p.count,10);
-    assert_eq!(p.frequency,[0,338,618,796,1056,1170,1278,1338,1470,1578,0]);
-    assert_eq!(p.auxiliary,[0,338,618,796,952,1053,1152,1204,1326,1578,0]);
-    assert_eq!(p.voltage,[125,625,640,680,780,825,865,895,970,1045,0]);
-    assert_eq!(p.sram,[780,780,780,780,780,825,865,895,970,1045,0]);
-    assert!(encode(p.clone()).is_ok());
-    // The board's row count picks between the two layouts of this shape.
-    assert_eq!(data::select_named(&s,Some(10)).unwrap(),(p,"J604"));
-    let (p,name)=data::select_named(&s,Some(11)).unwrap();
-    assert_eq!(name,"J773g"); assert_eq!(p.count,11);
+    let (p,name)=data::select_named(&s).unwrap();
+    assert_eq!(name,"5+5 pairs+top"); assert_eq!(p.count,11);
     assert_eq!(p.frequency,[0,338,618,796,928,1056,1170,1278,1338,1470,1578]);
     assert_eq!(p.auxiliary,[0,338,618,796,928,952,1053,1152,1204,1326,1578]);
-    // The J713 shape has no eleven-row layout, and no board has another row count.
-    assert_eq!(data::select_named(&source(),Some(10)).unwrap().1,"J713");
-    assert_eq!(data::select_named(&source(),Some(11)),Err(perf::Error::Shape));
-    for rows in [0,9,12] { assert_eq!(data::select_named(&s,Some(rows)),Err(perf::Error::Shape)); }
-    // A J604 shape with one unequal pair matches no layout.
+    assert_eq!(p.voltage,[125,625,640,680,725,780,825,865,895,970,1045]);
+    assert!(encode(p.clone()).is_ok());
+    // The same shape with the J773g's frequencies gives eleven rows too; no board is asked.
+    let (q,name)=data::select_named(&j773g(mv,mv.map(|v: u32| v.max(780)))).unwrap();
+    assert_eq!(name,"5+5 pairs+top"); assert_eq!(q.count,11);
+    // The count is derived, not fixed: each shape keeps its own, and neither fits the other.
+    assert_ne!(data::select(&source()).unwrap().count,p.count);
+    assert_eq!(data::LAYOUTS.len(),2);
+    assert!(data::LAYOUTS.iter().any(|l| l.rows==10) && data::LAYOUTS.iter().any(|l| l.rows==11));
+    // This shape with one unequal pair matches no layout.
     let mut bad=s;bad.core_mv[9]+=1;bad.sram_mv[9]+=1;
     assert_eq!(data::select(&bad),Err(perf::Error::Shape));
-    assert_eq!(data::select_named(&bad,Some(11)),Err(perf::Error::Shape));
 }
 #[test] fn invalid_encoder_input_is_refused_without_mutating_output() {
     for variant in 0..5 {
@@ -244,7 +262,8 @@ fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
 }
 '''
 for marker, value in {'PARSER': backend / 'adt/perf.rs', 'ENCODER': backend / 'fw/initdata.rs',
-                      'SELECT': backend / 'board/data.rs', 'FIXTURE': blob}.items():
+                      'SELECT': backend / 'board/data.rs', 'FIXTURE_J773G': j773g_blob,
+                      'FIXTURE': blob}.items():
     source = source.replace('@' + marker + '@', str(value))
 path = out / 'perf.rs'
 path.write_text(source)

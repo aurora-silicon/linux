@@ -317,6 +317,22 @@ bool apple_pmp_display_receive(struct apple_pmp_display *p, u8 endpoint, u64 wor
 	return true; /* This is a reply; never send an ACK for it. */
 }
 
+/*
+ * The DISP vote is the internal panel's: its consumer is the main DCP of a
+ * machine with a panel. A main DCP that is not available, or that drives a
+ * connector instead (it has apple,connector-type, as on a machine without a
+ * panel), is no DISP consumer, whatever records the PMP's table carries.
+ */
+static bool pmp_disp_consumer(void)
+{
+	struct device_node *dcp = of_find_node_by_path("dcp");
+	bool panel = dcp && of_device_is_available(dcp) &&
+		     !of_property_present(dcp, "apple,connector-type");
+
+	of_node_put(dcp);
+	return panel && apple_pmp_j713_board();
+}
+
 static struct apple_pmp_display *pmp_power_consumer(struct device *consumer,
 						    enum pmp_power_kind kind)
 {
@@ -324,9 +340,7 @@ static struct apple_pmp_display *pmp_power_consumer(struct device *consumer,
 	struct device_node *pmp, *supplier;
 	bool match;
 
-	/* J773g uses the AGX record and has no display consumer. */
-	if (kind == PMP_POWER_AGX ? apple_pmp_t8132_g16_board() :
-	    (apple_pmp_j713_board() && !of_machine_is_compatible("apple,j773g"))) {
+	if (kind == PMP_POWER_AGX ? apple_pmp_t8132_g16_board() : pmp_disp_consumer()) {
 		/* Both consumers must name the exact boot-profile node. */
 		if ((kind != PMP_POWER_AGX && kind != PMP_POWER_DISP) || !consumer->of_node ||
 		    !of_device_is_compatible(consumer->of_node,
