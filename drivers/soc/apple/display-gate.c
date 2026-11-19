@@ -3288,16 +3288,29 @@ static void __init gate_t6041_max_run(void)
  * every available route. Enable them only for a dcpext the boot loader handed
  * over (apple,t8132-dcpext-firmware-ready = 1). A handed-over dcpext that is
  * not adopted then disables them again, see dcp_platform_probe_t8132_ext().
- * Only the device tree changes here; no register is touched.
+ * Only the T8132 display driver binds a dcpext and can do that, so without it,
+ * or with nomodeset, the routes stay disabled: the ports would wait for mode
+ * switches that never register. Only the device tree changes here; no
+ * register is touched.
  */
 static void __init gate_j713_dcpext_routes(void)
 {
-	struct of_changeset *cs = gate_cs_alloc();
+	struct of_changeset *cs;
 	struct device_node *np;
 	unsigned int n = 0;
 	u32 ready;
 	int ret = 0;
 
+	if (!IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)) {
+		pr_info("apple-j713-display: dcpext Type-C routes left disabled: the T8132 display driver is not built\n");
+		return;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only()) {
+		pr_info("apple-j713-display: dcpext Type-C routes left disabled: nomodeset is on the command line\n");
+		return;
+	}
+
+	cs = gate_cs_alloc();
 	if (!cs)
 		return;
 	for_each_compatible_node(np, NULL, "apple,t8132-dcpext") {
