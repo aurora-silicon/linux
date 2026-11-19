@@ -389,3 +389,45 @@
 &cpu7 { capacity-dmips-mhz = <1024>; };
 &cpu8 { capacity-dmips-mhz = <1024>; };
 &cpu9 { capacity-dmips-mhz = <1024>; };
+
+&{/soc} {
+	/*
+	 * The CPU clusters' power-gate enables, in /arm-io/pmgr reg[34]: E at
+	 * +0x0 and P at +0x60, the offsets T8132 has and the two words
+	 * AppleT8142PMGR's restoreHW sets. iBoot leaves P's clear, and the
+	 * boot core (P core 0) then never powers down in WFI. The PMGR is the
+	 * SoC's, so J815 has the same words.
+	 */
+	cluster_pwrgate: power-gate@380724000 {
+		compatible = "apple,t8142-cluster-pwrgate", "apple,cluster-pwrgate";
+		reg = <0x3 0x80724000 0x0 0x4>,
+		      <0x3 0x80724060 0x0 0x4>;
+	};
+
+	/*
+	 * The internal display's power words for a DCP firmware stop (DPMS off):
+	 * /arm-io/pmgr reg[34] (pwrgate: DISP_CPU's retention words 0x11cc and
+	 * 0x11f0, the pmgr's retention_config_ff/_mem) and reg[32] (ps: DISP_CPU
+	 * 0x10000, DISP_FE 0x318, DISP_SYS 0x290). T8142's PMC keeps no count of
+	 * powered DCPs, so there is no pmc-dcp word.
+	 */
+	dcp_power: display-power@380724000 {
+		compatible = "apple,t8142-display-power";
+		reg = <3 0x80724000 0 0x2000>,
+		      <3 0x80700000 0 0x14000>;
+		reg-names = "pwrgate", "ps";
+	};
+};
+
+&dcp {
+	apple,display-power = <&dcp_power>;
+};
+
+&dcp_dart {
+	/* PMGR PS write-disable for DISP_CPU: offset 0x3fdc, bit 6. */
+	reg = <2 0x86340000 0 0x20000>,
+	      <3 0x80717fdc 0 0x4>;
+	reg-names = "dart", "ps-wr-dis";
+	apple,ps-wr-dis-bit = <6>;
+};
+
