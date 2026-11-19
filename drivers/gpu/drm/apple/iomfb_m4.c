@@ -138,6 +138,8 @@ struct iomfb_m4_ext_mode {
  * compositor may draw into a buffer that is still on screen.
  */
 #define DCP_M4_EXT_INFLIGHT	2
+/* How long a direct frame waits for a free slot before it is dropped */
+#define DCP_M4_EXT_SLOT_WAIT_MS	1000
 static unsigned int t8132_ext_swap_depth = DCP_M4_EXT_INFLIGHT;
 
 static int t8132_ext_swap_depth_set(const char *val, const struct kernel_param *kp)
@@ -4162,6 +4164,28 @@ static bool dcp_m4_ext_ids_current(struct iomfb_m4 *dcp, const struct iomfb_m4_e
 }
 
 /*
+ * A copied frame: the direct swaps in flight complete (D590) or are given up
+ * first, 1 s at most (-EBUSY then), the session lock dropped meanwhile.
+ */
+static int dcp_m4_ext_drain_direct(struct iomfb_m4 *dcp, struct dcp_m4_runtime *r)
+{
+	unsigned long end = jiffies + msecs_to_jiffies(DCP_M4_EXT_SLOT_WAIT_MS);
+
+	lockdep_assert_held(&dcp->lock);
+	while (r->ext_qn) {
+		long left = (long)(end - jiffies);
+
+		if (left <= 0 || READ_ONCE(dcp->error))
+			return -EBUSY;
+		mutex_unlock(&dcp->lock);
+		wait_event_timeout(dcp->ext_settle_wq,
+				   !READ_ONCE(r->ext_qn) || READ_ONCE(dcp->error), left);
+		mutex_lock(&dcp->lock);
+	}
+	return 0;
+}
+
+/*
  * DRM: before an enable or disable, which must not be refused: the direct
  * swaps in flight complete (D590) or are given up (5 s, or at once when the
  * link goes). The session lock is dropped while waiting, so those can run;
@@ -4415,9 +4439,23 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 	if (r->ext_mode_stale)
 		goto out;
 	ret = -EBUSY;
-	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
-	    r->ext_qn || r->ext_sleeping)
+	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start || r->ext_sleeping)
 		goto out;
+	/*
+	 * Direct swaps in flight complete (or are given up) first, 1 s at most,
+	 * rather than the frame being dropped; the DART is checked again after.
+	 */
+	if (r->ext_qn) {
+		ret = dcp_m4_ext_drain_direct(dcp, r);
+		if (!ret)
+			ret = dcp_m4_ext_scanout_gate(dcp);
+		if (ret)
+			goto out;
+		ret = -EBUSY;
+		if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
+		    r->ext_sleeping || READ_ONCE(dcp->error))
+			goto out;
+	}
 	r->ext_hold_probe = false;
 	/*
 	 * Never the surface on screen, nor one a given-up swap may still
@@ -4964,6 +5002,7 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 				const struct iomfb_m4_ext_cursor *cursor)
 {
 	struct iomfb_m4 *dcp = owner->v26_6;
+	unsigned long until = jiffies + msecs_to_jiffies(DCP_M4_EXT_SLOT_WAIT_MS);
 	struct dcp_m4_runtime *r;
 	struct dcp_m4_frame f, cf;
 	struct dcp_m4_upper cu;
@@ -4974,6 +5013,7 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 	if (!dcp || !dcp->external)
 		return -ENODEV;
 	mutex_lock(&dcp->lock);
+again:
 	r = dcp->runtime;
 	/* Pairs with the release store of r->done in startup. */
 	if (!r || !smp_load_acquire(&r->done) || READ_ONCE(dcp->error) || !r->ext_connected ||
@@ -4985,9 +5025,25 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 		goto out;
 	ret = -EBUSY;
 	depth = clamp_val(READ_ONCE(t8132_ext_swap_depth), 1, DCP_M4_EXT_INFLIGHT);
-	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
-	    r->ext_qn >= depth || r->ext_sleeping)
+	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start || r->ext_sleeping)
 		goto out;
+	/*
+	 * Every slot taken: the frame waits for the oldest swap in flight to
+	 * complete (or be given up), rather than being dropped while the
+	 * display is slow to take the first frames of a mode. The session lock
+	 * is dropped meanwhile; whatever changed is checked again.
+	 */
+	if (r->ext_qn >= depth) {
+		long left = (long)(until - jiffies);
+
+		if (left <= 0)
+			goto out;
+		mutex_unlock(&dcp->lock);
+		wait_event_timeout(dcp->ext_settle_wq,
+				   READ_ONCE(r->ext_qn) < depth || READ_ONCE(dcp->error), left);
+		mutex_lock(&dcp->lock);
+		goto again;
+	}
 	/*
 	 * A slot for each swap in flight, this one included, that a later D590
 	 * may complete (dcp_m4_runtime_swap_done()); else frames are copied.
