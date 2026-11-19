@@ -78,7 +78,7 @@ static unsigned reports;
 STUBS = r'''
 struct atcphy_hw { enum atcphy_generation gen;
     bool has_t8140_dp, dp_t8122, has_usb4, park_pipe_unlocked, park_dummy_phy, usb2_only;
-    bool clear_boot_hold, dp_banked_tunables; };
+    bool clear_boot_hold, dp_banked_tunables, pipe_lock_unacked; };
 struct device_node { const char *const *compatible; unsigned int count; };
 static bool of_device_is_compatible(const struct device_node *root, const char *compatible) {
     if (!root) return false;
@@ -98,7 +98,7 @@ struct apple_atcphy {
     enum atcphy_pipehandler_state pipe_state;
     enum atcphy_mode typec_mode;
     bool pipe_pending, t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround, mode_dirty, usb_off_pending;
-    bool host_active, usb3_port_off, dp_only, ss_tunables, fixed_usb2, t8140_dp_tunables, dp_tunables;
+    bool host_active, usb3_port_off, dp_only, ss_tunables, fixed_usb2, fixed_usb3, t8140_dp_tunables, dp_tunables;
     /* T8132 ownership is tested without entering its lane-setup backend. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     struct { void *usb3_dp; } tunables;
@@ -184,6 +184,9 @@ static int atcphy_configure_t8132(struct apple_atcphy *a, enum atcphy_mode mode)
 }
 static int atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *a) {
     (void)a; assert(!"T8132 PIPE setup reached"); return -EINVAL;
+}
+static int atcphy_configure_pipehandler_usb3_host_t8152(struct apple_atcphy *a) {
+    (void)a; assert(!"T8152 PIPE setup reached"); return -EINVAL;
 }
 static void atcphy_usb2_power_on(struct apple_atcphy *a) {
     (void)a; assert(!"USB2-only power restore reached");

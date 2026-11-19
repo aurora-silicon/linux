@@ -1450,3 +1450,116 @@ static struct kunit_suite atcphy_t8132_pm_test_suite = {
 };
 
 kunit_test_suite(atcphy_t8132_pm_test_suite);
+
+#define ATCPHY_TEST_T8152_LANE0_UP                                            \
+	(ACIOPHY_T8152_AON_LANE_SLEEP_SMALL | ACIOPHY_T8152_AON_LANE_SLEEP_BIG |  \
+	 ACIOPHY_T8152_AON_LANE_AHB_RESET_N)
+
+/*
+ * A T8152 fixed-USB3 PHY over zeroed memory in place of its ATC window, up to
+ * the sync reset. Its USB controller's DARTs sit at the T8103 offsets of the
+ * power and reset block: mark those words to see that nothing writes them.
+ */
+static struct apple_atcphy *atcphy_test_alloc_t8152(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, false);
+	void *core = kunit_kzalloc(test, ATCPHY_T8152_SYNC_RESET + 4, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, core);
+	atcphy->regs.core = (__force void __iomem *)core;
+	atcphy->hw = &atcphy_hw_t8152;
+	atcphy->fixed_usb3 = true;
+	writel(0xdeadbeef, atcphy->regs.core + ATCPHY_POWER_CTRL);
+	writel(0xdeadbeef, atcphy->regs.core + ATCPHY_MISC);
+
+	return atcphy;
+}
+
+static void atcphy_test_t8152_untouched(struct kunit *test, struct apple_atcphy *atcphy)
+{
+	KUNIT_EXPECT_EQ(test, readl(atcphy->regs.core + ATCPHY_POWER_CTRL), 0xdeadbeefU);
+	KUNIT_EXPECT_EQ(test, readl(atcphy->regs.core + ATCPHY_MISC), 0xdeadbeefU);
+}
+
+/* USB3: lane 0 powered up, crossbar 0x110, no lane mode register, lane swap bit 1 */
+static void atcphy_test_t8152_lanes(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_t8152(test);
+	void __iomem *core = atcphy->regs.core;
+
+	writel(ACIOPHY_T8152_AON_LANE_CLAMP_EN, core + ACIOPHY_T8152_AON_LANE0);
+	writel(ATCPHY_T8152_MISC_LANE_SWAP, core + ATCPHY_T8152_CFG_OFFSET + ATCPHY_MISC);
+
+	atcphy_lanes_up_t8152(atcphy, APPLE_ATCPHY_MODE_USB3);
+	KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_LANE0), ATCPHY_TEST_T8152_LANE0_UP);
+	KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_SLEEP_CTRL2),
+			ACIOPHY_T8152_AON_SLEEP_CTRL2_RXA_LFPS_SMALL_LN0 |
+			ACIOPHY_T8152_AON_SLEEP_CTRL2_RXA_LFPS_BIG_LN0);
+	KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_CROSSBAR_T8103), 0x110U);
+
+	KUNIT_EXPECT_EQ(test, atcphy_configure_lanes(atcphy, APPLE_ATCPHY_MODE_USB3), 0);
+	KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_CROSSBAR_T8103), 0x110U);
+	KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_LANE_MODE_T8103), 0U);
+	KUNIT_EXPECT_EQ(test, readl(core + ATCPHY_T8152_CFG_OFFSET + ATCPHY_MISC), 0U);
+	atcphy_test_t8152_untouched(test, atcphy);
+}
+
+/* Power-up and power-down go to the block at 0x60000 and the sync reset at 0x60030 */
+static void atcphy_test_t8152_power(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_t8152(test);
+	void __iomem *core = atcphy->regs.core;
+	u32 ctrl = ATCPHY_T8152_CFG_OFFSET + ATCPHY_POWER_CTRL;
+	u32 stat = ATCPHY_T8152_CFG_OFFSET + ATCPHY_POWER_STAT;
+
+	writel(ATCPHY_POWER_CLAMP_EN, core + ctrl);
+	writel(ATCPHY_POWER_SLEEP_SMALL | ATCPHY_POWER_SLEEP_BIG, core + stat);
+	KUNIT_EXPECT_EQ(test, atcphy_power_on(atcphy), 0);
+	KUNIT_EXPECT_EQ(test, readl(core + ctrl), ATCPHY_POWER_SLEEP_SMALL |
+			ATCPHY_POWER_SLEEP_BIG | ATCPHY_POWER_APB_RESET_N);
+	KUNIT_EXPECT_EQ(test, readl(core + ATCPHY_T8152_SYNC_RESET), ATCPHY_MISC_RESET_N);
+	atcphy_test_t8152_untouched(test, atcphy);
+
+	writel(ATCPHY_TEST_T8152_LANE0_UP, core + ACIOPHY_T8152_AON_LANE0);
+	writel(0, core + stat);
+	KUNIT_EXPECT_EQ(test, atcphy_power_off(atcphy), 0);
+	KUNIT_EXPECT_EQ(test, readl(core + ctrl), ATCPHY_POWER_CLAMP_EN);
+	KUNIT_EXPECT_EQ(test, readl(core + ATCPHY_T8152_SYNC_RESET), 0U);
+	KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_LANE0),
+			ACIOPHY_T8152_AON_LANE_CLAMP_EN);
+	atcphy_test_t8152_untouched(test, atcphy);
+}
+
+/*
+ * The T8152 PIPE handler does not acknowledge the lock: the request is made
+ * and the PIPE changes under it without waiting. Its release then finds the
+ * acknowledge clear at once.
+ */
+static void atcphy_test_t8152_pipe_lock(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_t8152(test);
+	void *pipehandler = kunit_kzalloc(test, PIPEHANDLER_NONSELECTED_OVERRIDE + 4,
+					  GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, pipehandler);
+	atcphy->regs.pipehandler = (__force void __iomem *)pipehandler;
+	KUNIT_EXPECT_EQ(test, atcphy_pipehandler_lock(atcphy), 0);
+	KUNIT_EXPECT_EQ(test, readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ),
+			PIPEHANDLER_LOCK_EN);
+	KUNIT_EXPECT_EQ(test, atcphy_pipehandler_unlock(atcphy), 0);
+	KUNIT_EXPECT_EQ(test, readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ), 0U);
+}
+
+static struct kunit_case atcphy_t8152_test_cases[] = {
+	KUNIT_CASE(atcphy_test_t8152_lanes),
+	KUNIT_CASE(atcphy_test_t8152_power),
+	KUNIT_CASE(atcphy_test_t8152_pipe_lock),
+	{}
+};
+
+static struct kunit_suite atcphy_t8152_test_suite = {
+	.name = "phy-apple-atc-t8152",
+	.test_cases = atcphy_t8152_test_cases,
+};
+
+kunit_test_suite(atcphy_t8152_test_suite);
