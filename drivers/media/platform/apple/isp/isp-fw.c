@@ -371,11 +371,37 @@ static int isp_check_coproc_t6040(struct apple_isp *isp)
 	return 0;
 }
 
+/*
+ * The reset of the ISPs before T8140 and T6040 reads two words until they are
+ * 0, at most this many times each with no wait between reads, and goes on
+ * whatever they read: the WFI poll that follows is the check that fails the
+ * boot. The reads, their offsets and this bound come from the original driver
+ * and have no known source (aurora-silicon/linux#2318).
+ */
+#define ISP_COPROC_DRAIN_READS 128
+
+static void isp_drain_coproc_word(struct apple_isp *isp, u32 reg)
+{
+	unsigned int reads = 0;
+	u32 val;
+
+	do {
+		val = isp_coproc_read32(isp, reg);
+		reads++;
+	} while (val && reads < ISP_COPROC_DRAIN_READS);
+
+	if (val)
+		dev_warn_once(isp->dev,
+			      "coprocessor word %#x still %#x after %u reads\n",
+			      reg, val, reads);
+	else
+		isp_dbg(isp, "coprocessor word %#x read 0 after %u reads\n",
+			reg, reads);
+}
+
 static int isp_reset_coproc(struct apple_isp *isp)
 {
-	int retries;
 	u32 status;
-	u32 val;
 
 	if (isp->hw->gen == ISP_GEN_T8140)
 		return isp_reset_coproc_t8140(isp);
@@ -396,17 +422,8 @@ static int isp_reset_coproc(struct apple_isp *isp)
 	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_4, 0xffffffff);
 	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_5, 0xffffffff);
 
-	for (retries = 0; retries < 128; retries++) {
-		val = isp_coproc_read32(isp, 0x818);
-		if (val == 0)
-			break;
-	}
-
-	for (retries = 0; retries < 128; retries++) {
-		val = isp_coproc_read32(isp, 0x81c);
-		if (val == 0)
-			break;
-	}
+	isp_drain_coproc_word(isp, ISP_COPROC_DRAIN_0);
+	isp_drain_coproc_word(isp, ISP_COPROC_DRAIN_1);
 
 	if (readl_poll_timeout(isp->coproc + ISP_COPROC_STATUS, status,
 			       status & ISP_COPROC_IN_WFI,
