@@ -1435,7 +1435,7 @@ static int tas2764_parse_bop_config(struct device *dev, struct tas2764_priv *tas
 
 	len = of_property_count_u8_elems(dev->of_node, "apple,bop-config");
 	if (len == -EINVAL) {
-		dev_info(dev, "no brownout configuration in the device tree\n");
+		dev_dbg(dev, "no brownout configuration in the device tree\n");
 		return 0;
 	}
 	if (len != TAS2764_BOP_CFG_LEN)

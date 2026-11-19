@@ -187,6 +187,26 @@ module_param(legacy_query, bool, 0444);
 MODULE_PARM_DESC(legacy_query,
 		 "Service bounded startup allocations and CONFIG_GET; default on.");
 
+/*
+ * A job that hangs the engine leaves the ANE CPU busy: clearing RUN never
+ * brings STOPPED. The vendor driver then powers the CPU off through its
+ * power controller and cold-starts the firmware later; it never resets the
+ * live CPU domain (doing so resets the SoC). 1: power the CPU and engine
+ * domains off through genpd (children first, each PMGR transition run by
+ * its state machine, the DARTs kept powered), read them all back off and
+ * cold-boot. 0: keep the instance quarantined until reboot.
+ */
+unsigned int ane_t6021_hung_stop = 1;
+module_param_named(hung_stop, ane_t6021_hung_stop, uint, 0644);
+MODULE_PARM_DESC(hung_stop,
+		 "After a hung job (T8112: ANE CPU left busy; H16: session quarantined): 1 power the ANE off through its power domains and cold-boot (default), 0 keep it quarantined until reboot.");
+
+/* How long a busy CPU may take to stop by itself before it is powered off. */
+unsigned int ane_t6021_hung_settle_ms = 100;
+module_param_named(hung_settle_ms, ane_t6021_hung_settle_ms, uint, 0644);
+MODULE_PARM_DESC(hung_settle_ms,
+		 "Extra wait after a hung job before the power-off (T8112: for STOPPED; H16: after RUN clear) (ms, default 100, max 60000).");
+
 /* 0 (default) skips RTKit in legacy mode, so the ANE mailbox never
  * starts: the 13.5 firmware sends no HELLO (-ETIME after
  * 1000 ms), and starting the mailbox enables AIC2 884, a level line
@@ -262,8 +282,10 @@ struct ane_rtclient {
 	struct delayed_work poll_work;
 	struct ane_t6021_pm sleep_pm;
 	struct ane_rtclient_restart *sleep_restart;
-	/* A resume found the CPU domain never went off; restart pending. */
+	/* A system resume left the firmware restart to sleep_work. */
 	bool sleep_deferred;
+	/* The deferred restart must power-cycle a CPU that stayed on. */
+	bool sleep_cycle;
 	struct work_struct sleep_work;
 
 	/* fw_start=1 view over the shared boot/fwload helpers. */
@@ -3130,12 +3152,19 @@ static void ane_rtclient_reap_retired(struct ane_rtclient *ane)
 	ane->retired_count = 0;
 }
 
+#define ANE_RTCLIENT_MAX_DARTS	4
+
 struct ane_rtclient_restart {
 	struct ane_rtclient *ane;
 	struct ane_rtclient_cycle cycle;
 	struct ane_rtclient_retired *retired;
 	struct ane_legacy_buffer *fresh;
 	bool live;		/* POWER_DOWN never reached the firmware */
+	bool unplanned;		/* timeout recovery: the firmware cannot answer */
+	bool busy;		/* core never stopped; domains contain it */
+	/* DARTs held powered while a busy core is powered off. */
+	struct device *dart[ANE_RTCLIENT_MAX_DARTS];
+	unsigned int darts;
 	/* System sleep: ane_sys_cpu power-off count when the ASC stopped. */
 	bool cpu_off_known;
 	unsigned int cpu_off_mark;
@@ -3256,7 +3285,95 @@ static int ane_rtclient_rs_halt(void *ctx)
 		ret = -EBUSY;
 	dev_info(ane->dev, "restart: ASC stop %s: CPU_STATUS %#x CPU_CONTROL %#x\n",
 		 ret ? "NOT proven" : "proven", status, readl(ctl));
+	/* RUN is clear but the core never stopped: a busy core, not a gone one. */
+	if (ret == -ETIMEDOUT && !(readl(ctl) & ANE_ASC_CPU_CONTROL_RUN))
+		return ANE_T6021_ASC_BUSY;
 	return ret;
+}
+
+static void ane_rtclient_log_ps(struct ane_rtclient *ane, const char *what)
+{
+	u32 ps[7] = {};
+
+	if (ane->engine_ps_valid)
+		for (int i = 0; i < 7; i++)
+			ps[i] = readl(ane->pmgr + ane->engine_ps_off + i * 8);
+	dev_info(ane->dev,
+		 "%s: PMGR cpu %#x engine %#x %#x %#x %#x %#x %#x %#x\n", what,
+		 readl(ane->pmgr + ane->soc->ps_cpu_off), ps[0], ps[1], ps[2],
+		 ps[3], ps[4], ps[5], ps[6]);
+}
+
+/*
+ * A busy core after a timeout (unplanned only): give it hung_settle_ms to
+ * stop by itself, then let the power cycle contain it. Only the PMGR power
+ * state machines act on it, children first; nothing touches the engine
+ * once its domains start to go off.
+ */
+static int ane_rtclient_rs_contain(void *ctx)
+{
+	struct ane_rtclient_restart *rs = ctx;
+	struct ane_rtclient *ane = rs->ane;
+	u32 status;
+	int ret;
+
+	if (!ane_t6021_hung_stop || !rs->unplanned)
+		return -EOPNOTSUPP;
+	ret = ane_rtclient_engine_accessible(ane);
+	if (ret)
+		return ret;
+	ret = readl_poll_timeout(ane->engine + ANE_ASC_CPU_STATUS, status,
+				 (status & ANE_ASC_CPU_STATUS_STOPPED) &&
+				 !(status & ANE_ASC_CPU_STATUS_RUNNING),
+				 1000, min(ane_t6021_hung_settle_ms, 60000U) * 1000ULL);
+	if (!ret) {
+		dev_info(ane->dev, "restart: ASC stopped late (CPU_STATUS %#x)\n",
+			 status);
+		return 0;
+	}
+	ane_rtclient_log_ps(ane, "restart: busy ASC");
+	dev_info(ane->dev,
+		 "restart: ASC busy after a hung job (CPU_STATUS %#x); powering the ANE off through its domains\n",
+		 status);
+	rs->busy = true;
+	return 0;
+}
+
+/*
+ * Keep the ANE DARTs (and with them ane_sys, the outer supply) powered while
+ * a busy core goes off, so translation stays up for anything still in flight.
+ */
+static void ane_rtclient_hold_darts(struct ane_rtclient_restart *rs)
+{
+	struct device_node *np = rs->ane->dev->of_node;
+	struct of_phandle_args args;
+
+	for (int i = 0; rs->darts < ANE_RTCLIENT_MAX_DARTS &&
+	     !of_parse_phandle_with_args(np, "iommus", "#iommu-cells", i, &args);
+	     i++) {
+		struct platform_device *pdev = of_find_device_by_node(args.np);
+
+		of_node_put(args.np);
+		if (!pdev)
+			continue;
+		if (pm_runtime_resume_and_get(&pdev->dev) < 0) {
+			dev_warn(rs->ane->dev, "restart: %s not held powered\n",
+				 dev_name(&pdev->dev));
+			put_device(&pdev->dev);
+			continue;
+		}
+		rs->dart[rs->darts++] = &pdev->dev;
+	}
+}
+
+static void ane_rtclient_release_darts(struct ane_rtclient_restart *rs)
+{
+	while (rs->darts) {
+		struct device *dart = rs->dart[--rs->darts];
+
+		pm_runtime_put(dart);
+		put_device(dart);
+	}
 }
 
 /* Shared post-power-transition admission, including system resume. */
@@ -3284,11 +3401,18 @@ static int ane_rtclient_rs_power_cycle(void *ctx)
 	struct ane_rtclient *ane = rs->ane;
 	int ret;
 
+	if (rs->busy)
+		ane_rtclient_hold_darts(rs);
 	/* Probe retains one consumer reference for this firmware lifetime. */
 	ret = ane_pm_cycle(ane->dev, rs->cycle.pd->pd_dev, rs->cycle.pd->count,
 			   ane_rtclient_verify_off, &rs->cycle);
+	ane_rtclient_release_darts(rs);
+	if (rs->busy)
+		ane_rtclient_log_ps(ane, ret ? "restart: busy ASC cycle failed" :
+				    "restart: busy ASC cycled");
 	if (ret)
 		return ret;
+	/* The cold CPU must read STOPPED with RUN clear before it boots. */
 	return ane_rtclient_rs_ready(ctx);
 }
 
@@ -3380,6 +3504,7 @@ static const struct ane_t6021_restart_ops ane_rtclient_restart_ops = {
 	.power_down = ane_rtclient_rs_power_down,
 	.wait_idle = ane_rtclient_rs_wait_idle,
 	.halt = ane_rtclient_rs_halt,
+	.contain = ane_rtclient_rs_contain,
 	.power_cycle = ane_rtclient_rs_power_cycle,
 	.boot = ane_rtclient_rs_boot,
 };
@@ -3481,7 +3606,9 @@ failed:
  */
 static int __ane_rtclient_recover(struct ane_rtclient *ane, bool planned)
 {
-	struct ane_rtclient_restart rs = { .ane = ane, .cycle.ane = ane };
+	struct ane_rtclient_restart rs = {
+		.ane = ane, .cycle.ane = ane, .unplanned = !planned,
+	};
 	enum ane_t6021_restart_stage stage = ANE_T6021_RESTART_STOP;
 	int ret;
 
@@ -3529,20 +3656,25 @@ static int ane_rtclient_sleep_stop(void *ctx)
 {
 	struct ane_rtclient *ane = ctx;
 	struct ane_rtclient_restart *rs;
+	bool planned = !atomic_read(&ane_t6021_quarantined);
 	int ret;
 
 	lockdep_assert_held(&ane_t6021_fw_lock);
-	if (atomic_read(&ane_t6021_quarantined) || ane->sleep_restart)
+	/* A quarantined instance (its recovery failed) cannot shut down;
+	 * with hung_stop its busy core goes off with the sleep instead.
+	 */
+	if ((!planned && !ane_t6021_hung_stop) || ane->sleep_restart)
 		return -EBUSY;
 	rs = kzalloc_obj(*rs);
 	if (!rs)
 		return -ENOMEM;
 	rs->ane = ane;
 	rs->cycle.ane = ane;
+	rs->unplanned = !planned;
 	ret = ane_rtclient_rs_prepare(rs);
 	if (ret)
 		goto free;
-	ret = ane_t6021_restart_stop(&ane_rtclient_restart_ops, rs, true);
+	ret = ane_t6021_restart_stop(&ane_rtclient_restart_ops, rs, planned);
 	if (ret) {
 		ane_rtclient_rs_finish(rs, true, ANE_T6021_RESTART_STOP, ret);
 		goto free;
@@ -3551,6 +3683,7 @@ static int ane_rtclient_sleep_stop(void *ctx)
 	rs->cpu_off_mark = READ_ONCE(rs->cycle.pd->cpu_off_count);
 	ane->sleep_restart = rs;
 	ane->sleep_deferred = false;
+	ane->sleep_cycle = false;
 	return 0;
 free:
 	kfree(rs);
@@ -3558,63 +3691,62 @@ free:
 }
 
 /*
- * System resume. The stopped ASC may only cold-start after its CPU domain
- * went off. A suspend that aborted before genpd powered the domains off (a
- * wake event during the device phase) resumes a CPU that was only halted;
- * booting it then fails and leaves the firmware half-started. Keep it
- * stopped and let the work below power-cycle it once system PM is done.
+ * System resume. The firmware boot takes about 1.2 s on a T8112, so it never
+ * runs here: resume only queues the work below, and the first client that
+ * beats the work finishes the restart itself (ane_rtclient_admit()). Until
+ * then submissions are held off as for any SUSPENDED device. Probe holds a
+ * runtime PM reference for the firmware lifetime, so the domains stay up
+ * between resume and the work.
+ *
+ * The stopped ASC may only cold-start after its CPU domain went off. A
+ * suspend that aborted before genpd powered the domains off (a wake event
+ * during the device phase) resumes a CPU that was only halted; booting it
+ * then fails and leaves the firmware half-started. The work power-cycles
+ * that CPU first.
  */
 static int ane_rtclient_sleep_restart(void *ctx)
 {
 	struct ane_rtclient *ane = ctx;
 	struct ane_rtclient_restart *rs = ane->sleep_restart;
-	enum ane_t6021_restart_stage stage = ANE_T6021_RESTART_CYCLE;
-	int ret;
 
 	lockdep_assert_held(&ane_t6021_fw_lock);
 	if (!rs)
 		return -EIO;
 	if (rs->cpu_off_known &&
 	    READ_ONCE(rs->cycle.pd->cpu_off_count) == rs->cpu_off_mark) {
-		if (!ane->sleep_deferred)
+		if (!ane->sleep_cycle)
 			dev_info(ane->dev,
 				 "resume: CPU domain stayed on through the sleep; restart after a power cycle\n");
-		ane->sleep_deferred = true;
-		queue_work(system_freezable_wq, &ane->sleep_work);
-		return ANE_T6021_PM_RESTART_DEFERRED;
+		ane->sleep_cycle = true;
 	}
-	ane->sleep_restart = NULL;
-	ane->sleep_deferred = false;
-	ret = ane_rtclient_rs_ready(rs);
-	if (!ret) {
-		stage = ANE_T6021_RESTART_BOOT;
-		ret = ane_rtclient_rs_boot(rs);
-	}
-	ret = ane_rtclient_rs_finish(rs, true, stage, ret);
-	kfree(rs);
-	return ret;
+	WRITE_ONCE(ane->sleep_deferred, true);
+	queue_work(system_freezable_wq, &ane->sleep_work);
+	return ANE_T6021_PM_RESTART_DEFERRED;
 }
 
-/* The deferred half: runtime power cycle (verified off), then boot. */
+/* The deferred half: runtime power cycle (verified off) if needed, then boot. */
 static int ane_rtclient_sleep_restart_deferred(void *ctx)
 {
 	struct ane_rtclient *ane = ctx;
 	struct ane_rtclient_restart *rs = ane->sleep_restart;
 	enum ane_t6021_restart_stage stage = ANE_T6021_RESTART_CYCLE;
+	bool cycle = ane->sleep_cycle;
 	int ret;
 
 	lockdep_assert_held(&ane_t6021_fw_lock);
 	if (!rs)
 		return -EIO;
 	ane->sleep_restart = NULL;
-	ane->sleep_deferred = false;
-	ret = ane_rtclient_rs_power_cycle(rs);
+	ane->sleep_cycle = false;
+	ret = cycle ? ane_rtclient_rs_power_cycle(rs) : ane_rtclient_rs_ready(rs);
 	if (!ret) {
 		stage = ANE_T6021_RESTART_BOOT;
 		ret = ane_rtclient_rs_boot(rs);
 	}
 	ret = ane_rtclient_rs_finish(rs, true, stage, ret);
 	kfree(rs);
+	/* Cleared only now: wedged_show() reads it without the lock. */
+	WRITE_ONCE(ane->sleep_deferred, false);
 	return ret;
 }
 
@@ -3649,6 +3781,16 @@ static int ane_rtclient_sleep_park(void *ctx)
 				 100, 100000);
 	if (!ret && (readl(ctl) & ANE_ASC_CPU_CONTROL_RUN))
 		ret = -EBUSY;
+	/* A busy core (RUN clear, never STOPPED) is contained by the same
+	 * domain power-off the sleep performs anyway.
+	 */
+	if (ret == -ETIMEDOUT && ane_t6021_hung_stop && !(readl(ctl) & ANE_ASC_CPU_CONTROL_RUN)) {
+		ane_rtclient_log_ps(ane, "suspend while unavailable: busy ASC");
+		dev_info(ane->dev,
+			 "suspend while unavailable: ASC busy (CPU_STATUS %#x); its domains go off with the sleep\n",
+			 status);
+		return 0;
+	}
 	dev_info(ane->dev, "suspend while unavailable: ASC stop %s (CPU_STATUS %#x)\n",
 		 ret ? "NOT proven, sleep refused" : "proven", status);
 	return ret;
@@ -4274,6 +4416,10 @@ static const struct ane_t602x_soc ane_h16_soc = {
 	.platform = &ane_h16_platform,
 };
 
+static const struct ane_t602x_soc ane_t8132_soc = {
+	.platform = &ane_t8132_platform,
+};
+
 static const struct ane_t602x_soc ane_h17_soc = {
 	.platform = &ane_h17_platform,
 };
@@ -4282,14 +4428,20 @@ static const struct ane_t602x_soc ane_t6050_soc = {
 	.platform = &ane_t6050_platform,
 };
 
+static const struct ane_t602x_soc ane_t8142_soc = {
+	.platform = &ane_t8142_platform,
+};
+
 static const struct of_device_id ane_rtclient_of_match[] = {
 	{ .compatible = "apple,t6020-ane", .data = &ane_t6020_soc },
 	{ .compatible = "apple,t6021-ane", .data = &ane_t6021_soc },
 	{ .compatible = "apple,t6022-ane", .data = &ane_t6022_soc },
 	{ .compatible = "apple,t8112-ane", .data = &ane_t8112_soc },
 	{ .compatible = "apple,t6041-ane", .data = &ane_h16_soc },
+	{ .compatible = "apple,t8132-ane", .data = &ane_t8132_soc },
 	{ .compatible = "apple,t8140-ane", .data = &ane_h17_soc },
 	{ .compatible = "apple,t6050-ane", .data = &ane_t6050_soc },
+	{ .compatible = "apple,t8142-ane", .data = &ane_t8142_soc },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, ane_rtclient_of_match);
@@ -4313,8 +4465,13 @@ static ssize_t wedged_show(struct device *dev, struct device_attribute *attr,
 {
 	struct ane_rtclient *ane = dev_get_drvdata(dev);
 
+	/* A restart left pending by system resume is not a wedge: the first
+	 * client finishes it (ane_rtclient_admit()) and its outcome sets FAILED.
+	 */
 	return sysfs_emit(buf, "%d\n", atomic_read(&ane_t6021_quarantined) ||
-			  READ_ONCE(ane->recovering) || !READ_ONCE(ane->registered) ||
+			  (READ_ONCE(ane->recovering) &&
+			   !READ_ONCE(ane->sleep_deferred)) ||
+			  !READ_ONCE(ane->registered) ||
 			  READ_ONCE(ane->sleep_pm.state) == ANE_T6021_PM_FAILED);
 }
 static DEVICE_ATTR_RO(wedged);

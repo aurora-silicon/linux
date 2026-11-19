@@ -19,6 +19,15 @@ maintainers:
 
 allOf:
   - $ref: dma-controller.yaml#
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,t6050-display-admac
+    then:
+      properties:
+        apple,admac-control: false
 
 properties:
   compatible:
@@ -47,6 +56,10 @@ properties:
       - items:
           - const: apple,t6050-admac
           - const: apple,t8140-admac
+      - description:
+          A T6050 display engine's own ADMAC (ADT "self-actuated"), which
+          feeds the engine's DisplayPort audio.
+        const: apple,t6050-display-admac
 
   reg:
     maxItems: 1
@@ -90,6 +103,12 @@ properties:
 
   resets:
     maxItems: 1
+
+  apple,admac-control:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The display ADMAC's control block, its LLT escalation detector (see
+      apple,admac-control.yaml).
 
 required:
   - compatible

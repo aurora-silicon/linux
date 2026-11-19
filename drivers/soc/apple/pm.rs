@@ -231,7 +231,17 @@ unsafe extern "C" fn pm_sleep() -> c_int {
 /// # Safety
 /// Called by `pm_shim.c` from the device's resume callback.
 unsafe extern "C" fn pm_wake() {
-    with_sep((), |sep| sep.sleep_exit());
+    let ptr = SEP.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: as in `pm_event`.
+    let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
+    if sep.sleep_exit() {
+        // The enclave slept and is back: report the accessory service online
+        // again, as macOS does right after the wake.
+        SepData::queue_stac_online(sep.into());
+    }
 }
 
 /// # Safety

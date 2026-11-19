@@ -41,6 +41,7 @@
 #include <linux/seq_file.h>
 #include <linux/soc/apple/pmc.h>
 #include <linux/uaccess.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 #define APPLE_CLPC_MAX_CLUSTERS	8
@@ -105,8 +106,13 @@ enum apple_clpc_rail {
  *	from a deferrable timer
  * @low_power_khz: CPU frequency ceiling of the low-power platform profile,
  *	taken up to the next table frequency; 0 for no platform profile
+ * @low_power_machine: the machine compatible @low_power_khz was read for; SoCs
+ *	sharing this CLPC without it get no low-power profile. NULL for any
  * @low_power_mw: package power (the SMC's PHPC key) the low-power profile
  *	holds the CPU clusters to; 0 for none
+ * @high_power_machine: the machine compatible on which the performance
+ *	profile tells the SMC that macOS's High Power mode is on (the zETM
+ *	record below); NULL for none
  */
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
@@ -125,7 +131,9 @@ struct apple_clpc_hw {
 	const char *ane_cluster_machine;
 	bool idle_on_time;
 	unsigned int low_power_khz;
+	const char *low_power_machine;
 	unsigned int low_power_mw;
+	const char *high_power_machine;
 };
 
 struct apple_clpc_cluster {
@@ -229,8 +237,14 @@ struct apple_clpc {
 	/* The platform profile and, for its power target, the SMC */
 	enum platform_profile_option profile;
 	bool low_power;
+	/* hw->low_power_khz where it applies to this machine, else 0 */
+	unsigned int low_power_khz;
 	struct device_node *smc_np;
 	struct apple_smc *smc;
+	/* The performance profile is sent to the SMC as High Power mode */
+	bool high_power;
+	u8 high_power_seq;
+	bool high_power_sent;
 	unsigned long power_next;
 	unsigned long power_reads, power_updates;
 	int power_mw;
@@ -781,13 +795,10 @@ static unsigned int apple_clpc_step_khz(struct cpufreq_policy *policy,
 	return best;
 }
 
-/* The package power the SMC reports (PHPC, a float in W), in mW. */
-static int apple_clpc_read_power(struct apple_clpc *clpc)
+/* The SMC of the apple,smc phandle, once its driver is bound; NULL before. */
+static struct apple_smc *apple_clpc_smc(struct apple_clpc *clpc)
 {
 	struct platform_device *pdev;
-	int exp, ret;
-	u64 mw;
-	u32 f;
 
 	if (!clpc->smc && clpc->smc_np) {
 		pdev = of_find_device_by_node(clpc->smc_np);
@@ -797,7 +808,17 @@ static int apple_clpc_read_power(struct apple_clpc *clpc)
 		if (pdev)
 			put_device(&pdev->dev);
 	}
-	if (!clpc->smc)
+	return clpc->smc;
+}
+
+/* The package power the SMC reports (PHPC, a float in W), in mW. */
+static int apple_clpc_read_power(struct apple_clpc *clpc)
+{
+	int exp, ret;
+	u64 mw;
+	u32 f;
+
+	if (!apple_clpc_smc(clpc))
 		return -ENODEV;
 	ret = apple_smc_read_u32(clpc->smc, SMC_KEY(PHPC), &f);
 	if (ret)
@@ -839,7 +860,7 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 	unsigned int i, khz, pick_khz = 0;
 	int mw, step = 0, pick = -1;
 
-	if (!clpc->hw->low_power_khz || time_before(jiffies, clpc->power_next))
+	if (!clpc->low_power_khz || time_before(jiffies, clpc->power_next))
 		return;
 	clpc->power_next = jiffies + msecs_to_jiffies(APPLE_CLPC_POWER_MS);
 	if (low && clpc->hw->low_power_mw) {
@@ -866,8 +887,8 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 					 FREQ_QOS_MAX_DEFAULT_VALUE) < 0)
 			clpc->update_errors++;
 		/* The top: the first table frequency at or above hw->low_power_khz */
-		cl->top_khz = apple_clpc_step_khz(policy[i], clpc->hw->low_power_khz - 1, true);
-		if (cl->top_khz < clpc->hw->low_power_khz)
+		cl->top_khz = apple_clpc_step_khz(policy[i], clpc->low_power_khz - 1, true);
+		if (cl->top_khz < clpc->low_power_khz)
 			cl->top_khz = policy[i]->cpuinfo.max_freq;
 		if (!low)
 			cl->max_khz = 0;
@@ -1036,7 +1057,7 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 	}
 	seq_printf(s, "samples: %lu update errors: %lu\n", clpc->samples,
 		   clpc->update_errors);
-	if (clpc->hw->low_power_khz) {
+	if (clpc->low_power_khz) {
 		seq_printf(s, "profile: %s power %d mW (%lu new of %lu readings) ceilings (kHz):",
 			   clpc->profile == PLATFORM_PROFILE_LOW_POWER ? "low-power" :
 			   clpc->profile == PLATFORM_PROFILE_PERFORMANCE ? "performance" :
@@ -1045,6 +1066,9 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 			seq_printf(s, " cpu%u %u", clpc->clusters[i].policy_cpu,
 				   clpc->clusters[i].max_khz);
 		seq_puts(s, "\n");
+		if (clpc->high_power)
+			seq_printf(s, "smc high power: %s (%u records sent)\n",
+				   clpc->high_power_sent ? "on" : "off", clpc->high_power_seq);
 	}
 	if (clpc->gpu_pmgr) {
 		seq_printf(s, "gpu: powered %u for %u ms, pmp limited ", clpc->gpu_on,
@@ -1162,6 +1186,8 @@ static void apple_clpc_halt(struct apple_clpc *clpc)
 	clpc->ane_until = jiffies;
 }
 
+static int apple_clpc_send_high_power(struct apple_clpc *clpc, bool on);
+
 static void apple_clpc_stop(void *data)
 {
 	struct apple_clpc *clpc = data;
@@ -1180,6 +1206,11 @@ static void apple_clpc_stop(void *data)
 	apple_clpc_ane_detach(clpc->ane);
 	debugfs_remove_recursive(clpc->debugfs);
 	apple_clpc_halt(clpc);
+	/* The SMC keeps this mode after the driver's profile state is gone. */
+	mutex_lock(&clpc->sample_lock);
+	if (clpc->high_power && clpc->high_power_sent)
+		apple_clpc_send_high_power(clpc, false);
+	mutex_unlock(&clpc->sample_lock);
 	if (clpc->policy_nb_added)
 		cpufreq_unregister_notifier(&clpc->policy_nb, CPUFREQ_POLICY_NOTIFIER);
 	if (freq_qos_request_active(&clpc->ane_qos))
@@ -1246,6 +1277,38 @@ static int apple_clpc_cluster_cpu(unsigned int index)
 	return id;
 }
 
+/*
+ * macOS tells the SMC its power mode through thermalmonitord's 120-byte zETM
+ * record, written at every mode change: a record type (0x1d), a version (1), a
+ * count of the writes, zeros, and at byte 112 a float that is 1.0 while High
+ * Power mode is on and 0.0 otherwise. With it on, the SMC lets the fans run up
+ * to their maximum under a sustained load; in Automatic they level off well
+ * below it, whatever the temperature. No other SMC key changes with the mode.
+ */
+#define APPLE_CLPC_ZETM_SIZE		120
+#define APPLE_CLPC_ZETM_TYPE		0x1d
+#define APPLE_CLPC_ZETM_VERSION		1
+#define APPLE_CLPC_ZETM_HIGH_POWER	112
+#define APPLE_CLPC_FLOAT_ONE		0x3f800000
+
+static int apple_clpc_send_high_power(struct apple_clpc *clpc, bool on)
+{
+	u8 rec[APPLE_CLPC_ZETM_SIZE] = { APPLE_CLPC_ZETM_TYPE, APPLE_CLPC_ZETM_VERSION };
+	int ret;
+
+	if (!apple_clpc_smc(clpc))
+		return -ENODEV;
+	rec[2] = ++clpc->high_power_seq;
+	put_unaligned_le32(on ? APPLE_CLPC_FLOAT_ONE : 0, rec + APPLE_CLPC_ZETM_HIGH_POWER);
+	ret = apple_smc_write(clpc->smc, SMC_KEY(zETM), rec, sizeof(rec));
+	if (ret < 0)
+		dev_warn(clpc->dev, "High Power mode %s not sent to the SMC: %d\n",
+			 on ? "on" : "off", ret);
+	else
+		clpc->high_power_sent = on;
+	return ret < 0 ? ret : 0;
+}
+
 static int apple_clpc_profile_probe(void *drvdata, unsigned long *choices)
 {
 	set_bit(PLATFORM_PROFILE_LOW_POWER, choices);
@@ -1265,8 +1328,18 @@ static int apple_clpc_profile_get(struct device *dev, enum platform_profile_opti
 static int apple_clpc_profile_set(struct device *dev, enum platform_profile_option profile)
 {
 	struct apple_clpc *clpc = dev_get_drvdata(dev);
+	bool high_power = profile == PLATFORM_PROFILE_PERFORMANCE;
 
 	mutex_lock(&clpc->sample_lock);
+	/* Performance is macOS's High Power mode; the other two are its Automatic. */
+	if (clpc->high_power && high_power != clpc->high_power_sent) {
+		int ret = apple_clpc_send_high_power(clpc, high_power);
+
+		if (ret) {
+			mutex_unlock(&clpc->sample_lock);
+			return ret;
+		}
+	}
 	WRITE_ONCE(clpc->profile, profile);
 	WRITE_ONCE(clpc->low_power, profile == PLATFORM_PROFILE_LOW_POWER);
 	/* The next sample applies it. */
@@ -1426,11 +1499,15 @@ static int apple_clpc_probe(struct platform_device *pdev)
 
 	clpc->profile = PLATFORM_PROFILE_BALANCED;
 	clpc->power_next = jiffies;
-	if (clpc->hw->low_power_khz && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
+	if (!clpc->hw->low_power_machine || of_machine_is_compatible(clpc->hw->low_power_machine))
+		clpc->low_power_khz = clpc->hw->low_power_khz;
+	if (clpc->low_power_khz && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
 		struct device *ppdev;
 
 		/* The SMC is optional: without it the low-power profile has only its ceiling. */
 		clpc->smc_np = of_parse_phandle(dev->of_node, "apple,smc", 0);
+		clpc->high_power = clpc->smc_np && clpc->hw->high_power_machine &&
+				   of_machine_is_compatible(clpc->hw->high_power_machine);
 		if (!clpc->policy_nb_added) {
 			clpc->policy_nb.notifier_call = apple_clpc_policy_notify;
 			clpc->policy_nb_added = !cpufreq_register_notifier(&clpc->policy_nb,
@@ -1581,6 +1658,14 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.ane_cluster = 2,
 	.ane_cluster_khz = 3756000,
 	.ane_cluster_machine = "apple,t6040",
+	/*
+	 * The M4 Max's ADT has macOS's Low Power mode CPU ceiling,
+	 * cpu-low-power-frequency-max = 2808 MHz, as T6050's does. macOS's package
+	 * target in that mode is not measured here, so the profile has the
+	 * ceiling only. The M4 Pro's value is not checked: not for it yet.
+	 */
+	.low_power_khz = 2808000,
+	.low_power_machine = "apple,t6041",
 };
 
 /*
@@ -1956,6 +2041,8 @@ static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
 	.idle_on_time = true,
 	.low_power_khz = 2808000,
 	.low_power_mw = 15000,
+	/* High Power mode's record, as macOS 27.0 writes it on the 14-inch M5 Pro */
+	.high_power_machine = "apple,j714s",
 };
 
 static const struct of_device_id apple_clpc_of_match[] = {

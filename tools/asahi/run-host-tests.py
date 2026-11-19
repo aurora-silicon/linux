@@ -24,6 +24,7 @@ import concurrent.futures
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,34 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'dcpext26-crossbar-union-tests.py': [([], PASS), (['--drop-native26'], KILL), (['--drop-t8132'], KILL)],
+    'dcpext26-suspend-route-tests.py': [([], PASS), (['--native-parks'], KILL), (['--drop-h17p-park'], KILL)],
+    'j613-mux-order-tests.py': [([], PASS), (['--negative-control'], KILL),
+                                 (['--ignore-nomodeset'], KILL), (['--drop-failed-completion'], KILL),
+                                 (['--ignore-external-node'], KILL), (['--drop-board-scope'], KILL)],
+    'display-sleep-merge-tests.py': [(out(), PASS)],
+    'dcpext26-slot-unregister-tests.py': [(out(), PASS)],
+    'dcpext26-budget-tests.py': [([], PASS)],
+    'dcpext26-queue-tests.py': [([], PASS), (['--drop-v27-close'], KILL)],
+    'dcpext26-retrain-tests.py': [([], PASS), (['--negative-control'], KILL)],
+    'dcpext26-lifecycle-tests.py': [([], PASS)],
+    'dcpext26-modeset-tests.py': [([], PASS)],
+    'dcpext26-parity-tests.py': [([], PASS)],
+    'dcpext26-present-tests.py': [([], PASS)],
+    'dcpext26-profile-tests.py': [([], PASS)],
+    'dcpext26-edid-tests.py': [([], PASS)],
+    'dcpext26-changeset-tests.py': [([], PASS)],
+    'dcpext26-admission-tests.py': [([], PASS)],
+
+    'dcpext26-startup-tests.py': [([], PASS)],
+    'iomfb-startup-tests.py': [([], PASS)],
+    'dcpext26-wire-tests.py': [([], PASS)],
+    'pmp-native26-tests.py': [([], PASS)],
+
+
+    'm3-stamp-admission-tests.py': [(out(), PASS),
+                                     (out() + ['--mutation', 'live-reseed'], KILL)],
+    'hardware-defaults-tests.py': [([], PASS)],
     'j613-mtp-s2idle-tests.py': [([], PASS)],
     # 11eccbedc3ed writes frames without a transport-wide lock.
     'mtp-tx-frame-tests.py': [(out(), PASS),
@@ -81,9 +110,19 @@ ASAHI_TESTS = {
     'apple-dart-dapf-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('missing-guard', 'ignore-replay', 'ignore-orphan'), out()),
     'apple-dart-fw-tests.py': [(out(), PASS)],
+    'apple-dart-fw-harness-tests.py': [([], PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
+    # 551b937502b5 gives up on a stalled J700 display invalidate after 2 ms; the
+    # every-handoff mutation waits it out on every handed-off DART, not just the display's.
+    'apple-dart-tlb-stall-tests.py': [(['--dtc', '{dtc}'], PASS),
+                                      (['--ref', '551b937502b54b0d1eb250bba6d9442b3672a0fb'],
+                                       KILL),
+                                      (['--dtc', '{dtc}', '--mutation', 'every-handoff'],
+                                       KILL)],
+    'apple-router-sleep-tests.py': [(out('--output'), PASS)],
     'asahi-stats-raw-tests.py': [([], PASS)],
     'agx-stats-busy-tests.py': [([], PASS), (['--negative-control'], PASS)],
+    'atc-cio-sleep-tests.py': [(out('--output'), PASS)],
     'atc-usb3-tests.py': [(out(), PASS), (out() + ['--mutations'], PASS)],
     'avd-av1-tail-tests.py': [(out(), PASS)]
         + [(out() + ['--case', c], PASS) for c in ('copy', 'seed', 'aligned')]
@@ -95,6 +134,7 @@ ASAHI_TESTS = {
     # These mutations are caught inside the test, which then exits 0.
     'bcm4377-resume-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('epoch', 'close', 'producer-fence', 'active-fence', 'board'), out(), PASS),
+    'bcm4377-sleep-config-tests.py': [([], PASS)],
     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),
     'brcmf-bss-tests.py': [(out(), PASS)],
@@ -107,6 +147,9 @@ ASAHI_TESTS = {
         + [(out() + ['--ref', '33bec4016c466985bfbb5ff4c2089fcab8242dcf'], KILL)],
     'brcmf-pcie-dma-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
+    'brcmf-recovery-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('stall-limit', 'trap-flag', 'console', 'line-start', 'once',
+                                   'rate-limit', 'stall-reset', 'ring-full'), out()),
     'brcmf-roam-tests.py': [(out(), PASS)],
     'brcmf-sae-vendor-tests.py': [(out(), PASS)]
         + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
@@ -116,10 +159,23 @@ ASAHI_TESTS = {
     'brcmf-wowl-filter-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('base-order', 'mask-last', 'totsize', 'no-track'), out()),
     'brcmfmac-scan-timeout-tests.py': [(out('--output'), PASS)],
+    'brcmfmac-sleep-lifetime-tests.py': [([], PASS)],
+    'cio-native-tests.py': [(out('--output'), PASS)],
+    'centauri-wifi-pm-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
+    'centauri-bt-arena-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
+    'centauri-recovery-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'clpc-gpu-demand-tests.py': [([], PASS)],
+    'clpc-high-power-cleanup-tests.py': [(out(), PASS),
+        (out() + ['--old-ref', '677be395b9d2e15d98696107ebf88191f08efbf9'], PASS)],
     # The old policy always disabled compute preemption.
     'compute-preempt-tests.py': [(out(), PASS),
                                  (out() + ['--old-ref', '6dbfbcb21eb09d07ae59037a1ceca8cc3500841f'], PASS)],
+    'dart-cio-owner-tests.py': [(out('--output'), PASS)],
+    'dart-cio-power-tests.py': [(out('--output'), PASS)],
+    'dart-sleep-power-tests.py': [([], PASS)],
+    'dart-sleep-snapshot-tests.py': [([], PASS)],
+    'dart-sleep-writer-tests.py': [([], PASS)],
+    'backlight-coldboot-tests.py': [(out('--output'), PASS), (out('--output') + ['--negative-controls'], PASS)],
     'dcp14-backlight-tests.py': [([], PASS)],
     'dcp14-panel-tests.py': [([], PASS)],
     'devcoredump-init-tests.py': [([], PASS)],
@@ -140,17 +196,39 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('fields', 'range', 'timestamp', 'age', 'delivery',
                                    'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format', 'read-drain'), out()),
     'g17-admission-deadline-tests.py': [([], PASS)],
-    'g17-admission-order-tests.py': [([], PASS)],
+    'g17-admission-order-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-held-free', 'no-held-sibling', 'no-held-refusal', 'no-held-pick',
+                                   'no-held-spare', 'no-held-other', 'no-held-cancel', 'no-held-killed',
+                                   'no-held-used', 'no-held-wake', 'wake-on-every-clear', 'no-held-stop',
+                                   'held-blocks-owner', 'hold-ignores-release', 'hold-ignores-work',
+                                   'close-unheld', 'hold-after-release', 'put-back-own-work',
+                                   'sync-skips-lent', 'lent-close-unheld', 'parked-stays-held',
+                                   'sync-clobbers', 'sync-no-wake'), []),
     'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
+    'g17-compute-owed-stamp-tests.py': [([], PASS)]
+        + mutations('--mutation', ('own-finished', 'no-retire-glue', 'retire-unchecked', 'no-expiry',
+                                   'no-step-past', 'pop-owed', 'head-includes-owed', 'held-stamped-pops',
+                                   'crossed-behind-owed', 'owed-classified', 'rebind-check-entry',
+                                   'timeout-fails-retired', 'no-owed-poll'), []),
     'g17-compute-deadline-tests.py': [([], PASS)],
     'g17-compute-growth-deadline-tests.py': [([], PASS)],
+    'g17-kill-route-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
+                                   'unsafe-wait', 'owed-blocks-kill', 'open-owed-skipped'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-growth-gate-tests.py': [([], PASS)],
     'g17-growth-tests.py': [([], PASS)],
+    'g17-object-fence-tests.py': [([], PASS)]
+        + mutations('--mutation', ('overrun-work-states', 'unseen-strict', 'retain-not-sticky',
+                                   'node-unmarked', 'no-release'), []),
     'g17-owner-release-order-tests.py': [([], PASS)],
     'g17-pool-release-tests.py': [([], PASS)],
+    # no-drain-release is the old rule: only a lease ends a slot's quarantine.
+    'g17-quarantine-drain-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-drain-release', 'without-witness', 'ignore-leases', 'no-last-lease',
+                                   'witness-covers-later-failure', 'unquarantined-drain'), []),
     'g17-resource-tests.py': [([], PASS)],
     'g17-shared-pool-tests.py': [([], PASS)],
     'g17-t6041-initdata-tests.py': [([], PASS)],
@@ -169,7 +247,7 @@ ASAHI_TESTS = {
                                (out('--output') + ['--old'], KILL)],
     'neo-stability-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('sep-syscore', 'wake-irq', 'rx-suspend', 'stale-policy',
-                                   'usb-rpm', 'vlp-client', 'six-band'), out('--output'))
+                                   'usb-rpm', 'usb-epoch-syscore', 'vlp-client', 'six-band'), out('--output'))
         + [(out('--output') + ['--old-usb'], KILL), (out('--output') + ['--old-regulatory'], KILL)],
     'pciec-policy-tests.py': [(out(), PASS)],
     'pmgr-bus-tests.py': [([], PASS)],
@@ -191,6 +269,10 @@ ASAHI_TESTS = {
                                    'set-no-round', 'set-negative'), out()),
     'perf-mmap-alias-lifecycle-tests.py': [([], PASS)],
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
+    'radio-pm-tests.py': [([], PASS)],
+    'radio-sleep-fence-tests.py': [([], PASS)],
+    'radio-sleep-power-tests.py': [([], PASS)],
+    'radio-sleep-snapshot-tests.py': [([], PASS)],
     'rtkit-crashlog-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
                                    'mailbox-minimum', 'version-string', 'message-string'), out()),
@@ -207,6 +289,9 @@ ASAHI_TESTS = {
                               (out() + ['--old-classifier', 'dcp'], PASS)],
     't6040-calibration-tests.py': [([], PASS)],
     't604x-cpu-order-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
+    't8132-usb4-policy-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
+    'tb-cio-sleep-tests.py': [(out('--output'), PASS)],
+    'tb-dock-pm-tests.py': [(out('--output'), PASS)],
     'tb-dp-repair-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'tbnet-refill-tests.py': [(out(), PASS)]
         + mutations('--mutant', ('refill-count', 'no-retry', 'no-cancel', 'worker-allocation'), out()),
@@ -215,9 +300,9 @@ ASAHI_TESTS = {
 }
 
 # Rust unit-test files built with `rustc --test`, and shell drivers.
-ASAHI_RUST = ['m3-batching-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs',
+ASAHI_RUST = ['m3-batching-tests.rs', 'm3-stamp-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs',
               'usage-tests.rs']
-ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh']
+ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh', 'g17-traversal-admission-tests.sh']
 
 # Production G17 decoder vectors also build directly with rustc --test.
 ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
@@ -278,17 +363,33 @@ def jobs(work, conf, dtc):
     return result
 
 
+def kill_group(p):
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def run(job, timeout):
     label, cmd, cwd, expect, d, extra = job
     (d / 'tmp').mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, TMPDIR=str(d / 'tmp'), **extra)
     start = time.monotonic()
+    # Each test runs in its own session: a timeout (or an interrupted run) stops the test and everything it started, such
+    # as a compiler or a `git show` of an old revision, which would otherwise outlive it, re-parented to init.
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, errors='replace', start_new_session=True)
     try:
-        p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, errors='replace', timeout=timeout)
-        rc, text = p.returncode, p.stdout
-    except subprocess.TimeoutExpired as e:
-        rc, text = 'timeout', (e.stdout or b'').decode(errors='replace') if isinstance(e.stdout, bytes) else (e.stdout or '')
+        text, _ = p.communicate(timeout=timeout)
+        rc = p.returncode
+    except subprocess.TimeoutExpired:
+        kill_group(p)
+        text, _ = p.communicate()
+        rc = 'timeout'
+    except BaseException:
+        kill_group(p)
+        p.wait()
+        raise
     took = time.monotonic() - start
     (d / 'log').write_text(f'$ {shlex.join(cmd)}\n{text}\nexit: {rc}\n')
     if expect == PASS:

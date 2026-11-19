@@ -3,12 +3,18 @@
 #define of_device_is_compatible(...) false
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
-    struct { void *usb3_dp; } tunables;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+	/* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
+	struct {
+		bool prepared;
+	} cio_sleep;
+	struct {
+		void *usb3_dp, *dp_lioa, *dp_common_config;
+	} tunables;
 
 	const struct atcphy_hw *hw;
 	struct {
-		unsigned char *core, *lpdptx, *pipehandler, *usb2phy;
+		unsigned char *core, *lpdptx, *lioa, *pipehandler, *usb2phy;
 	} regs;
 	struct reset_controller_dev rcdev;
 	void *dev;
@@ -94,9 +100,25 @@ struct dwc3_apple {
 	bool rpm_held, host_only;
 	/* T8132 only: runtime PM before the first core probe; never set here. */
 	bool pre_core_rpm;
+	/* J714s only: the start after a sleep waits for its Type-C PHY; never set here. */
+	bool sleep_phy_wait, sleep_phy_pending;
 	bool dt_dis_u3_susphy;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
+	/* The PM sleep epoch (dwc3_apple_pm_notify()); the fixtures stay IDLE. */
+	int sleep_pm_lock;
+	enum dwc3_apple_sleep_phase sleep_phase;
+	bool sleep_syscore, sleep_role_pending;
+	enum dwc3_apple_state sleep_role;
+	/*
+	 * J714s only: a host kept suspended on its USB4 router's USB3 tunnel through the
+	 * router's sleep, and the role its port controller asked for meanwhile.
+	 */
+	bool sleep_tunnel;
+	enum usb_role sleep_tunnel_role;
 };
+/* The epoch spinlock: taken only when free, released only when held. */
+#define spin_lock_irqsave(l, f) do { assert(!*(l)); *(l) = 1; (f) = 0; } while (0)
+#define spin_unlock_irqrestore(l, f) do { assert(*(l)); *(l) = 0; (void)(f); } while (0)
 static void __attribute__((unused)) apple_sleep_usb_slp_ddr(bool on)
 {
 	(void)on;
@@ -235,11 +257,22 @@ static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(
 { (void)p; assert(false); return -EOPNOTSUPP; }
 
 
-/* USB2 power-on is outside this teardown/recovery control. */
+/* Model the USB2 power-on boundary's running state. */
+static unsigned int usb2_starts;
 static void atcphy_usb2_power_on(struct apple_atcphy *p)
 {
-	(void)p;
+	usb2_starts++;
+	writel(USB2PHY_USBCTL_RUN, p->regs.usb2phy + USB2PHY_USBCTL);
 }
+
+/* This teardown fixture never selects T8142 DP calibration. */
+static void apple_tunable_apply(void *base, void *tunable)
+{
+	(void)base;
+	(void)tunable;
+	assert(!"unexpected banked DP calibration");
+}
+
 static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode m)
 {
 	(void)p;

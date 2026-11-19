@@ -32,6 +32,19 @@ select:
 properties:
   compatible: true
 
+  apple,battery-record:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Directory row of the firmware battery telemetry record, for machines
+      whose firmware publishes one. Each record is a run of 16-byte slots,
+      readable at the same offset through the fourth (peek) register
+      aperture.
+    items:
+      - description: Record identifier.
+      - description: Record layout version.
+      - description: Index of the first 16-byte slot.
+      - description: Number of slots.
+
 allOf:
   - if:
       properties:
@@ -139,6 +152,8 @@ allOf:
 
               '#address-cells':
                 const: 0
+
+              apple,battery-record: true
 
             required:
               - compatible

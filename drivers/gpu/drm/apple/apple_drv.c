@@ -7,6 +7,7 @@
  * Copyright (C) 2014 Endless Mobile
  */
 
+#include <linux/soc/apple/j613-display.h>
 #include <linux/aperture.h>
 #include <linux/component.h>
 #include <linux/completion.h>
@@ -393,6 +394,8 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	}
 	if (crtc_state->active &&
 	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
+		/* The HPD of the link dcp_poweron() reconnects precedes our mode set. */
+		WRITE_ONCE(dcp->typec_enable_pending, true);
 		dcp_poweron(apple_crtc->dcp);
 		crtc_state->color_mgmt_changed = true;
 	} else if (crtc_state->active && drm_atomic_crtc_needs_modeset(crtc_state)) {
@@ -401,9 +404,14 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	}
 	if (crtc_state->active) {
 		ret = dcp_crtc_atomic_modeset(crtc, commit);
-		if (ret)
+		if (ret) {
+			if (dcp_is_ext26(dcp))
+				goto failed;
 			dcp_drm_crtc_error(apple_crtc, crtc_state, ret);
+		}
 	}
+	/* The mode set of the enable has run: a sink still without one has a bad link. */
+	WRITE_ONCE(dcp->typec_enable_pending, false);
 	dcp_typec_follow_done(locked);
 	return;
 
@@ -414,6 +422,7 @@ failed:
 	dev_err(dcp->dev, "CRTC route unavailable (%d); modeset deferred\n", ret);
 	/* Flush completes any pending flip without issuing a firmware swap. */
 	schedule_work(&dcp->vblank_wq);
+	WRITE_ONCE(dcp->typec_enable_pending, false);
 	if (dcp->connector)
 		dcp_route_failure_notify(dcp->connector);
 	dcp_typec_follow_done(locked);
@@ -825,10 +834,10 @@ static void appledrm_connector_cleanup(struct drm_connector *connector)
 	cancel_work_sync(&apple_connector->bl_commit_wq);
 	mutex_destroy(&apple_connector->bl_lock);
 	drm_connector_cleanup(connector);
-	kfree(apple_connector->color_elements.data);
-	kfree(apple_connector->timing_elements.data);
-	kfree(apple_connector->display_attributes.data);
-	kfree(apple_connector->transport.data);
+	kvfree(apple_connector->color_elements.data);
+	kvfree(apple_connector->timing_elements.data);
+	kvfree(apple_connector->display_attributes.data);
+	kvfree(apple_connector->transport.data);
 	kfree(apple_connector);
 }
 
@@ -1161,7 +1170,7 @@ static int apple_probe_per_dcp(struct device *dev,
 							supports_xrgb2101010,
 							xrgb_is_alpha,
 							plane_type, interchange,
-							supports_premultiplied);
+							supports_premultiplied, dcp_is_ext26(dcp_data));
 		}
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);
@@ -1234,22 +1243,28 @@ static int apple_probe_per_dcp(struct device *dev,
  * connector per port for a dock's second DP tunnel, preserving primary
  * connector names. T6050 instead exposes one connector per port/pipeline
  * pair: tunnel allocation chooses which connector is connected, without
- * changing any encoder's advertised CRTC mask after registration.
+ * changing any encoder's advertised CRTC mask after registration. Pairs
+ * whose route carries DP tunnels only come last, so adding such a route
+ * does not renumber the connectors that existed before it.
  */
 static int apple_probe_typec_ports(struct drm_device *drm,
 				   struct platform_device **dcp,
 				   u32 *crtc_mask, int num_dcp)
 {
-	unsigned int idx, nr_ports = dcp_typec_nr_ports();
+	unsigned int n, nr_ports = dcp_typec_nr_ports();
 	bool fixed = dcp_typec_fixed_crtcs();
 	unsigned int slots = fixed ? num_dcp : (dcp_typec_dual_stream() ? 2 : 1);
+	/* T6050 creates its tunnel-only port/pipeline pairs in a second pass. */
+	unsigned int passes = fixed ? 2 : 1;
 	int i, ret;
 
 	/* Keep the existing physical-port connector numbers stable. On the
 	 * M2 Pro/Max laptops, append one more connector per port for a second
 	 * USB4 DP tunnel.
 	 */
-	for (idx = 0; idx < nr_ports * slots; idx++) {
+	for (n = 0; n < passes * nr_ports * slots; n++) {
+		unsigned int pass = n / (nr_ports * slots);
+		unsigned int idx = n % (nr_ports * slots);
 		struct apple_connector *connector;
 		struct apple_encoder *enc;
 		struct platform_device *pipeline = fixed ? dcp[idx / nr_ports] : NULL;
@@ -1259,13 +1274,17 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 
 		/* Only a failed T8122 dcpext could drive it: no connector. */
 		if (dcp_typec_port_unusable(port_idx)) {
-			drm_warn(drm, "Type-C port %u: its display pipeline is unusable\n",
-				 port_idx);
+			if (!pass)
+				drm_warn(drm, "Type-C port %u: its display pipeline is unusable\n",
+					 port_idx);
 			continue;
 		}
 
 		if (fixed) {
 			if (!dcp_typec_port_has_candidate(port_idx, pipeline))
+				continue;
+			/* T6050: tunnel-only pairs in the second pass */
+			if (dcp_typec_port_tunnel_only(port_idx, pipeline) != pass)
 				continue;
 			mask = crtc_mask[idx / nr_ports];
 			if (!mask)
@@ -1310,9 +1329,17 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		ret = drm_connector_attach_vrr_capable_property(&connector->base);
 		if (ret)
 			return ret;
-		ret = apple_connector_attach_hdr(&connector->base, false);
-		if (ret)
-			return ret;
+		/*
+		 * T8122's retained external scanout accepts only 8-bit RGB.
+		 * Do not advertise the BT.2020/PQ output contract until this
+		 * route has a qualified 10-bit primary-plane format. The sink
+		 * EDID remains intact; its capabilities are not the pipeline's.
+		 */
+		if (!of_machine_is_compatible("apple,t8122")) {
+			ret = apple_connector_attach_hdr(&connector->base, false);
+			if (ret)
+				return ret;
+		}
 
 		connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 		connector->connected = false;
@@ -2073,8 +2100,10 @@ static struct platform_driver apple_platform_driver = {
 static int __init appledrm_register(void)
 {
 	int ret;
-	if (drm_firmware_drivers_only())
+	if (drm_firmware_drivers_only()) {
+		apple_j613_display_fail();
 		return -ENODEV;
+	}
 
 	/* A refused experimental profile keeps the boot framebuffer available. */
 	ret = apple_j613_25g83_coldplug();
@@ -2083,8 +2112,10 @@ static int __init appledrm_register(void)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	ret = dcp_audio_register();
-	if (ret)
+	if (ret) {
+		apple_j613_display_fail();
 		return ret;
+	}
 #endif
 	ret = dcp_register();
 	if (ret)
@@ -2094,6 +2125,7 @@ static int __init appledrm_register(void)
 		return 0;
 	dcp_unregister();
 unregister_audio:
+	apple_j613_display_fail();
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	dcp_audio_unregister();
 #endif
@@ -2102,6 +2134,7 @@ unregister_audio:
 
 static void __exit appledrm_unregister(void)
 {
+	apple_j613_display_fail();
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	dcp_audio_unregister();
 #endif
@@ -2120,7 +2153,9 @@ MODULE_LICENSE("Dual MIT/GPL");
  * crossbar. Without this, initramfs generators leave it out, it loads only
  * from the root filesystem, and a DCP probe that waits past the deferred
  * probe timeout (an encrypted root's passphrase prompt) gives up its routes.
+ * The same holds for the routes' PHYs: on T6050 they are the combo PHYs of
+ * atc-t6050-dp, which appledrm does not otherwise depend on.
  * DCP also asks for the battery temperature once while it starts (see
  * dcp_pmu_temperature()), so have the SMC battery registered by then.
  */
-MODULE_SOFTDEP("pre: mux-apple-display-crossbar macsmc-power");
+MODULE_SOFTDEP("pre: mux-apple-display-crossbar atc-t6050-dp macsmc-power");

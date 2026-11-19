@@ -62,8 +62,15 @@ pub(crate) struct Variant {
     pub(crate) mcache: bool,
     /// Renders may set the few-primitives auxiliary framebuffer flag.
     pub(crate) few_primitives: bool,
+    /// Renders may carry DRM_ASAHI_RENDER_STAGE_PREFIXES: the tiling kick waits on its own,
+    /// narrower render and compute prefixes, the fragment kick on the whole ones. The M5
+    /// command set accepts them in its own validation.
+    pub(crate) render_stage_prefixes: bool,
     /// The firmware runs ray-traversal work (ray queries and intersection programs).
     pub(crate) ray_traversal: bool,
+    /// Ray-traversal commands run for one client at a time, with other clients' compute
+    /// commands kept out meanwhile ([`crate::g17::traversal`]).
+    pub(crate) traversal_exclusion: bool,
     /// Renders may carry ray-query stages. The M5 command set has none: it encodes no render
     /// ray-query state.
     pub(crate) render_ray_query: bool,
@@ -87,6 +94,19 @@ pub(crate) struct Variant {
     /// work. The bare-metal M5 firmware powers the cores for work by its own policy: under a
     /// hold, the M5 Ultra's core-power witness reads unpowered until the hold is released.
     pub(crate) registration_power_hold: bool,
+    /// A context takes its render pool identity when it is created, not at its first render,
+    /// so that identities held by render graphs kept until the firmware stops refuse new
+    /// contexts with an error instead of failing a context's first render. Set for the A18
+    /// Pro only: the M4 Pro and Max keep the first-render claim until the claim at creation has
+    /// been tested on that hardware.
+    pub(crate) render_id_at_create: bool,
+    /// Cached descriptor storage, queue records and queue configuration that come back
+    /// after their owner's release was consumed are reused once the firmware has consumed
+    /// every control record published before they came back, not only after a later one.
+    /// Set for the A18 Pro. Elsewhere they keep the stricter fence of 34b438de, which fixed
+    /// an M4 Pro crash on a recycled work state; extending this needs a create/destroy-heavy
+    /// queue test on that hardware.
+    pub(crate) objects_after_release: bool,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -126,7 +146,9 @@ pub(crate) const V26A428: Variant = Variant {
     registration: QueueRegistration::PoweredRenderPairs,
     mcache: true,
     few_primitives: true,
+    render_stage_prefixes: true,
     ray_traversal: true,
+    traversal_exclusion: true,
     render_ray_query: true,
     fragment_busy: true,
     lead_commands: false,
@@ -137,6 +159,8 @@ pub(crate) const V26A428: Variant = Variant {
     split_firmware_area: false,
     m5_commands: false,
     registration_power_hold: true,
+    render_id_at_create: true,
+    objects_after_release: true,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -158,7 +182,11 @@ pub(crate) const V25G83: Variant = Variant {
     mcache: false,
     // A fragment stage with the few-primitives flag hangs.
     few_primitives: false,
+    // Not measured on this firmware.
+    render_stage_prefixes: false,
     ray_traversal: true,
+    // Not measured on this firmware.
+    traversal_exclusion: false,
     render_ray_query: true,
     // When a tiling pass runs out of memory with this set, the firmware resumes it without
     // adding memory and the tiler stops silently; macOS always writes 0.
@@ -171,14 +199,20 @@ pub(crate) const V25G83: Variant = Variant {
     split_firmware_area: false,
     m5_commands: false,
     registration_power_hold: true,
+    render_id_at_create: false,
+    objects_after_release: false,
 };
 
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
 /// command set).
 pub(crate) const V26A428_M5: Variant = Variant {
     m5_commands: true,
+    // Not measured on the M5 firmware.
+    traversal_exclusion: false,
     render_ray_query: false,
     registration_power_hold: false,
+    render_id_at_create: false,
+    objects_after_release: false,
     ..V26A428
 };
 

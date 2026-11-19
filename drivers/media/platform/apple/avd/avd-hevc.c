@@ -1030,11 +1030,7 @@ static enum avd_image_fmt avd_hevc_get_image_fmt(struct avd_ctx *ctx,
 	if (ctrl->id != V4L2_CID_STATELESS_HEVC_SPS)
 		return AVD_IMG_FMT_ANY;
 
-	/*
-	 * TODO: we can do up to 4:4:4 12 bit
-	 * not sure if v4l2 supports RExt
-	 */
-
+	/* avd_hevc_validate_sps() refuses 4:4:4 and depths other than 8/10. */
 	if (sps->bit_depth_luma_minus8 == 0) {
 		if (sps->chroma_format_idc == 2)
 			return AVD_IMG_FMT_422_8BIT;
@@ -1068,6 +1064,13 @@ static int avd_hevc_validate_sps(struct avd_ctx *ctx,
 		return -EINVAL;
 	if (sps->chroma_format_idc == 2 && sps->bit_depth_luma_minus8 == 2)
 		/* 4:2:2 10 bit would need P210, which is not offered */
+		return -EINVAL;
+	if (sps->chroma_format_idc > 2)
+		/*
+		 * 4:4:4 has no capture format, and its frames are never
+		 * completed: each times out and resets the whole decoder.
+		 * 4:0:0, 4:2:0 and 4:2:2 at 8 bits decode.
+		 */
 		return -EINVAL;
 
 	return 0;

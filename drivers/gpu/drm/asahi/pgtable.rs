@@ -921,6 +921,39 @@ impl UatPageTable {
         Ok((entry & self.oas_mask & !(UAT_PGMSK as u64)) | (iova & UAT_PGMSK as u64))
     }
 
+    /// The page frame of every page of the page-aligned `iova_range`, in one walk: what
+    /// [`Self::translate_iova`] gives for each page start, failing with `EFAULT` if any page
+    /// has no leaf.
+    pub(crate) fn translate_pages(&mut self, iova_range: Range<u64>, out: &mut [u64]) -> Result {
+        if (iova_range.start | iova_range.end) & UAT_PGMSK as u64 != 0 || iova_range.is_empty() {
+            return Err(EINVAL);
+        }
+        let pages = ((iova_range.end - iova_range.start) >> UAT_PGBIT) as usize;
+        if out.len() != pages {
+            return Err(EINVAL);
+        }
+        let first = iova_range.start & self.ias_mask;
+        let oas_mask = self.oas_mask;
+        out.fill(u64::MAX);
+        self.with_pages(iova_range, false, false, |iova, ptes| {
+            let index = ((iova - first) >> UAT_PGBIT) as usize;
+            let slots = out.get_mut(index..index + ptes.len()).ok_or(EINVAL)?;
+            for (slot, pte) in slots.iter_mut().zip(ptes) {
+                let value = pte.load(Ordering::Relaxed);
+                if value & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
+                    return Err(EFAULT);
+                }
+                *slot = value & oas_mask & !(UAT_PGMSK as u64);
+            }
+            Ok(())
+        })?;
+        // Pages under a missing table are skipped by the walk.
+        if out.contains(&u64::MAX) {
+            return Err(EFAULT);
+        }
+        Ok(())
+    }
+
     /// Reads one mapped leaf entry without allocating missing tables.
     pub(crate) fn leaf_entry(&mut self, iova: u64) -> Result<u64> {
         if iova & UAT_PGMSK as u64 != 0 {

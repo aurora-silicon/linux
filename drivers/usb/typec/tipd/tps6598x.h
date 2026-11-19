@@ -350,7 +350,7 @@ struct tipd_data {
 	bool (*read_power_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
-	void (*prepare)(struct tps6598x *tps);
+	int (*prepare)(struct tps6598x *tps);
 	void (*complete)(struct tps6598x *tps);
 };
 
@@ -384,6 +384,8 @@ struct tps6598x {
 	int wakeup;
 	/* Handles events while the system sleeps, if the variant can filter them */
 	bool (*sleep_event)(struct tps6598x *tps);
+	/* Wakes the controller, where its bus has a command for that */
+	int (*wake)(struct tps6598x *tps);
 	u32 status; /* status reg */
 	u32 data_status;
 	u16 pwr_status;
@@ -477,6 +479,9 @@ struct cd321x {
 	unsigned int rearm_resets;
 	bool dp_sink_reported;
 	bool dp_irq_hpd;
+	/* A plug was in when the sleep began, and a wake's first port state is still to be applied */
+	bool sleep_plug;
+	bool wake_apply;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
@@ -508,6 +513,8 @@ struct sn201202x {
 	bool ldcm_mitigated;
 	/* ldcm_mitigated matches the controller (unknown after a reset) */
 	bool ldcm_mitigation_known;
+	/* A mitigation was requested since the controller's last reset */
+	bool ldcm_requested;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];

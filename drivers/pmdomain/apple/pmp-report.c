@@ -129,8 +129,12 @@ struct apple_pmp_report {
 	u64 *dvfs_shadow;
 	unsigned int polls;
 	struct delayed_work ready_work;
+	struct device_node *native_pmp;
+	u64 native_claimed;
 	/* J613 floor owner, absent on all other report instances. */
 	struct j613_floor *j613;
+	/* T6050: the boot-time PTD entries (apple,ptd-boot) are written */
+	bool t6050_boot_done;
 };
 
 static bool apple_pmp_report_running(const struct apple_pmp_report *rep)
@@ -428,6 +432,77 @@ static void apple_pmp_report_release(void *data)
 	synchronize_rcu();
 	/* The debugfs proxy drains active reads and rejects subsequent accesses. */
 	debugfs_remove(rep->debugfs);
+	of_node_put(rep->native_pmp);
+}
+
+/*
+ * T6050: the PTD entries the PMP's memory-cache channel and PPM-TO-SMC need at boot, which no
+ * Linux driver otherwise writes, from the DT (apple,ptd-boot: entry and value pairs, where the
+ * boot loader puts them). An entry is written at the update page (+0x10000, 8 bytes each) and
+ * read at the read aperture (16 bytes each). Entry 0xfff waits for the channel's echo of the
+ * value in the entry apple,ptd-echo-entry names; entry 0xffe reads the entry the value names.
+ */
+#define PTD_W(e)		(0x10000 + 8 * (e))
+#define PTD_R(e)		(16 * (e))
+#define T6050_PTD_WAIT		0xfff
+#define T6050_PTD_READ		0xffe
+#define T6050_PTD_ENTRIES	0x400
+#define T6050_MC_FIRST_MS	3000
+#define T6050_MC_STEP_MS	100
+
+static void apple_pmp_report_t6050_boot(struct apple_pmp_report *rep)
+{
+	struct device_node *np = rep->dev->of_node;
+	int n = of_property_count_u64_elems(np, "apple,ptd-boot");
+	unsigned int i, waited = 0;
+	u64 *seq, val = 0;
+	u32 echo = T6050_PTD_ENTRIES;
+	int ret = 0;
+
+	if (rep->t6050_boot_done || !of_device_is_compatible(np, "apple,t6050-pmp-v2-report"))
+		return;
+	rep->t6050_boot_done = true;
+	if (n <= 0)
+		return;
+	if (n % 2) {
+		dev_err(rep->dev, "apple,ptd-boot is not in pairs\n");
+		return;
+	}
+	seq = kcalloc(n, sizeof(*seq), GFP_KERNEL);
+	if (!seq)
+		return;
+	if (of_property_read_u64_array(np, "apple,ptd-boot", seq, n))
+		goto out;
+	/* A sequence that waits needs its echo entry: without it, none of it is written. */
+	of_property_read_u32(np, "apple,ptd-echo-entry", &echo);
+	for (i = 0; echo >= T6050_PTD_ENTRIES && i < n; i += 2) {
+		if (seq[i] == T6050_PTD_WAIT) {
+			dev_warn(rep->dev, "PTD boot entries wait with no echo entry: skipped\n");
+			goto out;
+		}
+	}
+	for (i = 0; i < n; i += 2) {
+		u64 e = seq[i], want = seq[i + 1];
+
+		if (e == T6050_PTD_WAIT) {
+			ret = readq_poll_timeout(rep->base + PTD_R(echo), val, val == want,
+						 1000, (waited++ ? T6050_MC_STEP_MS :
+							T6050_MC_FIRST_MS) * 1000);
+			if (ret)
+				break;
+		} else if (e == T6050_PTD_READ && want < T6050_PTD_ENTRIES) {
+			readq(rep->base + PTD_R(want));
+		} else if (e < T6050_PTD_ENTRIES) {
+			writeq(want, rep->base + PTD_W(e));
+		}
+	}
+	if (ret)
+		dev_err(rep->dev, "PTD boot entries: no echo of %llu at step %u (echo %#llx)\n",
+			seq[i + 1], i / 2, val);
+	else
+		dev_info(rep->dev, "PTD boot entries written (%d steps)\n", n / 2);
+out:
+	kfree(seq);
 }
 
 /*
@@ -466,6 +541,7 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
 			 want, val);
 	dev_info(rep->dev, "PMP running (status %#llx), requests %#llx\n",
 		 readq(rep->base + offs->status), want);
+	apple_pmp_report_t6050_boot(rep);
 }
 
 /* A report names its PMP where a SoC has more than one kind of link to it. */
@@ -838,7 +914,7 @@ static const struct {
  * records are not in ID order, so the bit is the index of the record that
  * holds that ID. Only a report that starts its PMP has that table.
  */
-static int apple_pmp_report_bit(const struct apple_pmp_start *st,
+static int apple_pmp_report_record(struct device_node *pmp,
 				struct device_node *entry, u32 *bit, bool *record)
 {
 	const u8 *table;
@@ -852,13 +928,80 @@ static int apple_pmp_report_bit(const struct apple_pmp_start *st,
 		*bit = reg;
 		return 0;
 	}
-	if (!st)
+	if (!pmp)
 		return -EINVAL;
-	table = of_get_property(st->pmp, "apple,tunable-soc-device", &len);
+	table = of_get_property(pmp, "apple,tunable-soc-device", &len);
 	index = apple_pmp_record_of_id(table, len > 0 ? len : 0, reg + 1);
 	if (index < 0 || index > 63)
 		return -ENOENT;
 	*bit = index;
+	return 0;
+}
+
+static int apple_pmp_report_bit(const struct apple_pmp_start *st,
+				struct device_node *entry, u32 *bit, bool *record)
+{
+	return apple_pmp_report_record(st ? st->pmp : NULL, entry, bit, record);
+}
+
+/* The native PMP owns startup; this report still exclusively owns PTD votes. */
+static int apple_pmp_native_records(struct apple_pmp_report *rep)
+{
+	struct device_node *pmp, *link;
+	const u8 *table, *group, *ranges;
+	const char *uuid;
+	int ntable, ngroup, nranges;
+
+	{
+		struct device_node *chosen = of_find_node_by_path("/chosen");
+		const char *opt = NULL;
+		int len = 0;
+		bool selected;
+
+		if (chosen)
+			opt = of_get_property(chosen, "asahi,j613-25g83-dcpext", &len);
+		selected = opt && len == 2 && opt[0] == '1' && !opt[1] &&
+			of_device_is_compatible(rep->dev->of_node, "apple,j613-25g83-pmp-report");
+		of_node_put(chosen);
+		if (!selected)
+			return 0;
+	}
+	if (!of_machine_is_compatible("apple,j613") ||
+	    !of_device_is_compatible(rep->dev->of_node, "apple,j613-25g83-pmp-report"))
+		return -ENODEV;
+	for_each_compatible_node(pmp, NULL, "apple,t8122-pmp-v2") {
+		link = of_parse_phandle(pmp, "apple,pmp-report", 0);
+		if (link != rep->dev->of_node || !of_device_is_available(pmp)) {
+			of_node_put(link);
+			continue;
+		}
+		of_node_put(link);
+		if (rep->native_pmp) {
+			of_node_put(pmp);
+			return -EINVAL;
+		}
+		rep->native_pmp = of_node_get(pmp);
+	}
+	pmp = rep->native_pmp;
+	if (!pmp || of_property_read_string(pmp, "apple,tunable-uuid", &uuid) ||
+	    strcmp(uuid, "EFD60284-7C58-33A9-8522-CB3366AF6040"))
+		return -EINVAL;
+	table = of_get_property(pmp, "apple,tunable-soc-device", &ntable);
+	group = of_get_property(pmp, "apple,tunable-soc-device-ps-group", &ngroup);
+	ranges = of_get_property(pmp, "apple,tunable-ptd-range", &nranges);
+	if (!table || ntable != 20 * PMP_SOC_DEVICE_SIZE || !group || ngroup != 8 ||
+	    get_unaligned_le64(group) != 0x3fff0 ||
+	    !apple_pmp_ranges_valid(ranges, nranges, 0x1000, 0x10800, 0x1080) ||
+	    apple_pmp_record_of_id(table, ntable, 8) != 11 ||
+	    apple_pmp_record_of_id(table, ntable, 9) != 12 ||
+	    apple_pmp_record_of_id(table, ntable, 18) != 19 ||
+	    memcmp(table + 11 * PMP_SOC_DEVICE_SIZE + 0x74, "DISP\0\0\0\0", 8) ||
+	    memcmp(table + 12 * PMP_SOC_DEVICE_SIZE + 0x74, "DISPEXT\0", 8) ||
+	    memcmp(table + 19 * PMP_SOC_DEVICE_SIZE + 0x74, "ANS\0\0\0\0\0", 8) ||
+	    !apple_pmp_records_valid(table, ntable, BIT_ULL(11) | BIT_ULL(12) | BIT_ULL(19),
+				     BIT_ULL(11) | BIT_ULL(12)))
+		return -EINVAL;
+	dev_dbg(rep->dev, "native26 PTD admitted: DISP11 DISPEXT12 ANS19 (no ANS ack)\n");
 	return 0;
 }
 
@@ -1472,6 +1615,17 @@ int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout
 		list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
 			if (rep->dev->of_node == parent) {
 				bound = true;
+				if (rep->native_pmp) {
+					ret = apple_pmp_report_record(rep->native_pmp, entry, &id, &record);
+					if (!ret && (!record || id != 12))
+						ret = -EINVAL;
+					if (!ret && (!(readq(rep->base + rep->offsets->status) & 1) ||
+						    !(readq(rep->base + rep->offsets->actual) & BIT_ULL(id)) ||
+						    !(readq(rep->base + rep->offsets->tgt_read) & BIT_ULL(id))))
+						ret = -EIO;
+					rcu_read_unlock();
+					goto out;
+				}
 				break;
 			}
 		}
@@ -2330,6 +2484,10 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	ret = apple_pmp_native_records(rep);
+	if (ret)
+		return dev_err_probe(dev, ret, "native26 PTD table refused\n");
+
 	ret = j613_floor_probe(rep);
 	if (ret)
 		return ret;
@@ -2532,6 +2690,7 @@ struct apple_pmp_report_entry {
 	u64 dvfs_off;
 	u64 dvfs_on;
 	bool removed;
+	struct apple_pmp_report *native_owner;
 };
 
 #define genpd_to_apple_pmp_report_entry(_genpd) \
@@ -2542,6 +2701,7 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 {
 	u64 bit_val = BIT_ULL(id);
 	u64 val;
+	bool latched = true;
 	unsigned long flags;
 	bool ready;
 
@@ -2562,8 +2722,12 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 		if (enable)
 			val |= bit_val;
 		writeq(val, rep->base + rep->offsets->tgt_write);
+		if (rep->native_pmp)
+			latched = !!(readq(rep->base + rep->offsets->tgt_read) & bit_val) == enable;
 	}
 	spin_unlock_irqrestore(&rep->lock, flags);
+	if (!latched)
+		return -EIO;
 	if (!ready || !apple_pmp_report_running(rep) || no_ack)
 		return 0;
 	return readq_poll_timeout_atomic(
@@ -3152,6 +3316,14 @@ static int apple_pmp_report_entry_power_off(struct generic_pm_domain *genpd)
 
 static void apple_pmp_report_entry_free(struct apple_pmp_report_entry *ent)
 {
+	if (ent->native_owner) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&ent->native_owner->lock, flags);
+		ent->native_owner->native_claimed &= ~BIT_ULL(ent->id);
+		spin_unlock_irqrestore(&ent->native_owner->lock, flags);
+	}
+
 	of_node_put(ent->report_node);
 	of_node_put(ent->node);
 	kfree(ent->genpd.name);
@@ -3177,7 +3349,7 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct device_node *node = dev->of_node;
 	struct apple_pmp_report_entry *ent;
-	const struct apple_pmp_report *rep;
+	struct apple_pmp_report *rep;
 	struct apple_pmp_start *start;
 	int ret;
 	const char *name;
@@ -3202,7 +3374,30 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	/* Only a report that starts its PMP requests by record, or without ack. */
 	rep = dev->parent ? dev_get_drvdata(dev->parent) : NULL;
 	start = rep ? rep->start : NULL;
-	if (start) {
+	if (rep && rep->native_pmp) {
+		unsigned long flags;
+		bool record;
+
+		ret = apple_pmp_report_record(rep->native_pmp, node, &ent->id, &record);
+		if (ret || !record || (ent->id != 11 && ent->id != 12 && ent->id != 19)) {
+			ret = -EINVAL;
+			goto err_free;
+		}
+		ent->no_ack = of_property_read_bool(node, "apple,no-ack");
+		if (ent->no_ack != (ent->id == 19)) {
+			ret = -EINVAL;
+			goto err_free;
+		}
+		spin_lock_irqsave(&rep->lock, flags);
+		ret = rep->native_claimed & BIT_ULL(ent->id) ? -EBUSY : 0;
+		if (!ret) {
+			rep->native_claimed |= BIT_ULL(ent->id);
+			ent->native_owner = rep;
+		}
+		spin_unlock_irqrestore(&rep->lock, flags);
+		if (ret)
+			goto err_free;
+	} else if (start) {
 		bool record;
 
 		ret = apple_pmp_report_bit(start, node, &ent->id, &record);
@@ -3283,7 +3478,14 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 
 	if (of_property_read_bool(node, "apple,always-on")) {
 		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
-		apple_pmp_report_entry_set_state(&ent->genpd, true);
+		ret = apple_pmp_report_entry_set_state(&ent->genpd, true);
+		if (ret && ent->native_owner)
+			goto err_free;
+		/* Native DCPEXT keeps its resident producer and request through s2idle. */
+		if (ent->native_owner && ent->id == 12) {
+			ent->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
+			ent->sleep_release = false;
+		}
 	}
 
 	ent->genpd.power_on = apple_pmp_report_entry_power_on;
@@ -3296,7 +3498,8 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	if (of_property_read_bool(node, "apple,irq-safe"))
 		ent->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 
-	ret = pm_genpd_init(&ent->genpd, NULL, true);
+	ret = pm_genpd_init(&ent->genpd, NULL,
+			    !(ent->genpd.flags & GENPD_FLAG_ALWAYS_ON));
 	if (ret) {
 		ret = dev_err_probe(dev, ret, "pm_genpd_init failed\n");
 		goto err_free;

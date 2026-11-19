@@ -42,6 +42,12 @@ allOf:
     then:
       required:
         - apple,consumer-switched
+  - if:
+      required:
+        - apple,bridge-link
+    then:
+      required:
+        - apple,consumer-switched
 
 description: |
   Apple SoCs include PMGR blocks responsible for power management,
@@ -178,6 +184,21 @@ properties:
         - description: mask
         - description: value while the domain is off
     maxItems: 4
+
+  apple,bridge-link:
+    description:
+      The two consecutive 32-bit link words of the bus bridge of the block
+      behind this consumer-switched domain, as the node of that block, the
+      index of one of its reg entries and the offset of the words from the
+      start of that entry. Bit 0 of each is cleared before the domain powers
+      off and set after it has powered on. The words are only accessible
+      while the domain is on.
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: node of the block behind the domain
+          - description: index of a reg entry of that node
+          - description: offset of the link words from the start of that entry
 
   apple,inherited-on:
     description: |

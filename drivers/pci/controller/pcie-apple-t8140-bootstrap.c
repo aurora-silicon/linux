@@ -95,6 +95,8 @@ struct apple_t8140_bootstrap {
 	/* The host stops the radios for a sleep that takes this engine's power. */
 	bool sleep_armed;
 	bool power_lost;
+	/* The engine has answered once since boot; later bootstraps follow a lost power. */
+	bool answered;
 	/* After a real sleep: read the engine once the host's port is up again. */
 	bool power_check;
 	bool irq_held;
@@ -102,6 +104,8 @@ struct apple_t8140_bootstrap {
 	struct module *radio_stop_owner;
 	void (*radio_recover)(void *data);
 	void *radio_recover_data;
+	/* Done once the host has the radios back after a sleep, or gave up. */
+	struct completion radio_ready;
 };
 
 /* A successful supplier probe owns its unpublished arena until full reset. */
@@ -512,7 +516,7 @@ static int apple_t8140_bootstrap_submit(struct apple_t8140_bootstrap *bootstrap,
 	u64 comp = descriptor + PIODMA_COMPLETION_OFFSET;
 	unsigned long waited;
 	u32 fifo, command, tag = index + 1;
-	int i, ret;
+	int i, checks, ret;
 
 	ret = apple_t8140_bootstrap_check_slots(bootstrap);
 	if (ret || READ_ONCE(bootstrap->irq_fault))
@@ -567,12 +571,18 @@ static int apple_t8140_bootstrap_submit(struct apple_t8140_bootstrap *bootstrap,
 				 (fifo & PIODMA_FIFO_MASK) == 16, 10, 50000);
 	if (ret)
 		return ret;
-	for (i = 0; i < 10; i++) {
+	/*
+	 * The slots must hold still after the response. After a sleep, the same engine has
+	 * answered the same request before, and the slots are read again before every sleep.
+	 */
+	checks = bootstrap->answered ? 2 : 10;
+	for (i = 0; i < checks; i++) {
 		usleep_range(1000, 2000);
 		ret = apple_t8140_bootstrap_check_slots(bootstrap);
 		if (ret || READ_ONCE(bootstrap->irq_fault))
 			return ret ?: -EIO;
 	}
+	bootstrap->answered = true;
 	dev_dbg(bootstrap->dev,
 		"READ_VALIDATED request=%u word=%#x FIFO=%#x command=%#x; retained slots stable\n",
 		index, slot->result, fifo, command);
@@ -814,6 +824,21 @@ int apple_piodma_bootstrap_power_lost(struct device *supplier)
 	return apple_piodma_transition(bootstrap, PIODMA_POWER_LOST);
 }
 
+/* The host brings the radios back after its resume_noirq; until then, see the resume below. */
+void apple_piodma_bootstrap_radio_pending(struct device *supplier)
+{
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
+
+	reinit_completion(&bootstrap->radio_ready);
+}
+
+void apple_piodma_bootstrap_radio_done(struct device *supplier)
+{
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
+
+	complete_all(&bootstrap->radio_ready);
+}
+
 bool apple_piodma_bootstrap_retained(struct device *supplier)
 {
 	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
@@ -939,6 +964,8 @@ static int apple_t8140_bootstrap_probe(struct platform_device *pdev)
 		"Neo radio admission or retained DMA ownership";
 	for (i = 0; i < PIODMA_REQUEST_COUNT; i++)
 		init_completion(&bootstrap->slots[i].event);
+	init_completion(&bootstrap->radio_ready);
+	complete_all(&bootstrap->radio_ready);
 	atomic_set(&bootstrap->irq_count, 0);
 	atomic_set(&bootstrap->state, PIODMA_IDLE);
 	ret = apple_t8140_bootstrap_iommu(bootstrap);
@@ -964,6 +991,8 @@ static int apple_t8140_bootstrap_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, bootstrap);
 	/* Pairs with radio_check's smp_load_acquire of this boot-lifetime owner. */
 	smp_store_release(&active_bootstrap, bootstrap);
+	/* Its resume waits for the radios, with nothing that doesn't depend on them. */
+	device_enable_async_suspend(dev);
 	dev_dbg(dev, "bootstrap supplier ready; no command submitted during probe\n");
 	return 0;
 
@@ -1047,6 +1076,19 @@ static int apple_t8140_bootstrap_resume_noirq(struct device *dev)
 	return apple_t8140_bootstrap_sleep_check(bootstrap);
 }
 
+/*
+ * The host is this device's consumer and the radios are below the host, so none of them
+ * resumes before the host has the link and the functions back.
+ */
+static int apple_t8140_bootstrap_resume(struct device *dev)
+{
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(dev);
+
+	if (!wait_for_completion_timeout(&bootstrap->radio_ready, HZ))
+		dev_warn(dev, "radios not back 1 s into the resume\n");
+	return 0;
+}
+
 static int apple_t8140_bootstrap_freeze(struct device *dev)
 {
 	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(dev);
@@ -1058,6 +1100,7 @@ static const struct dev_pm_ops apple_t8140_bootstrap_pm_ops = {
 	.prepare = apple_piodma_pm_prepare,
 	.suspend_noirq = apple_t8140_bootstrap_suspend_noirq,
 	.resume_noirq = apple_t8140_bootstrap_resume_noirq,
+	.resume = apple_t8140_bootstrap_resume,
 	.freeze = apple_t8140_bootstrap_freeze,
 	.poweroff = apple_t8140_bootstrap_freeze,
 };

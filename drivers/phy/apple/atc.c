@@ -21,6 +21,7 @@
 #include <kunit/static_stub.h>
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
+#include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/devm-helpers.h>
 #include <linux/iopoll.h>
@@ -530,6 +531,8 @@ enum atcphy_lane_mode {
 #define PIPEHANDLER_NONSELECTED_OVERRIDE 0x20
 #define PIPEHANDLER_NATIVE_RESET BIT(12)
 #define PIPEHANDLER_DUMMY_PHY_EN BIT(15)
+/* Boot-owned PIPE hold, released before selecting the dummy backend. */
+#define PIPEHANDLER_NONSELECTED_BOOT_HOLD BIT(16)
 #define PIPEHANDLER_NATIVE_POWER_DOWN GENMASK(3, 0)
 
 #define PIPEHANDLER_LOCK_ACK_TIMEOUT_US 1000
@@ -687,6 +690,8 @@ struct apple_atcphy;
  *                     generation has none) and the SuperSpeed tunables; USB2
  *                     still works without the latter
  * @park_pipe_unlocked: A stopped controller may park without a PIPE handshake
+ * @clear_boot_hold: Release the boot PIPE hold before dummy backend selection
+ * @dp_banked_tunables: DisplayPort requires separate LIOA/common calibration
  * @dp_t8122: DisplayPort runs the T8122 AUX, AUSPLL and lane sequences
  * @park_dummy_phy: Enable the dummy PIPE backend whenever the PIPE is parked on
  *                  it; the lock handshake that starts the next PIPE change is
@@ -714,8 +719,10 @@ struct atcphy_hw {
 	bool optional_tunables;
 	bool has_t8140_dp;
 	bool dp_t8122;
+	bool dp_banked_tunables;
 	bool park_pipe_unlocked;
 	bool park_dummy_phy;
+	bool clear_boot_hold;
 	bool restore_after_pd_off;
 	bool idle_power_off;
 };
@@ -745,6 +752,15 @@ enum atcphy_t8132_cio_tunable {
 	T8132_CIO_NR,
 };
 
+
+struct atcphy_cio_sleep {
+	bool prepared, changed, off, restored;
+	enum atcphy_mode mode;
+	bool swap;
+	u32 misc, lane_mode, crossbar;
+	u8 clock_users, clock_rate[2];
+	unsigned int clock_source[2];
+};
 
 /**
  * struct apple_atcphy - Apple Type-C PHY device struct
@@ -855,6 +871,8 @@ struct apple_atcphy {
 		struct apple_tunable *lane_usb4[2];
 		struct apple_tunable *usb2phy_reg_dflt;
 		struct apple_tunable *usb3_dp;
+		struct apple_tunable *dp_lioa;
+		struct apple_tunable *dp_common_config;
 		struct apple_tunable *dp_common_pre;
 		struct apple_tunable *dp_lpdptx;
 		struct apple_tunable *dp_common_post;
@@ -868,6 +886,9 @@ struct apple_atcphy {
 	/* A touched failure has no qualified partial rollback or retry. */
 	bool t8132_failed;
 	bool t8132_suspended;
+	/* T8132: the board wires this port for DisplayPort alt mode */
+	bool t8132_dp_alt;
+	struct atcphy_cio_sleep cio_sleep;
 	struct {
 		void __iomem *regs;
 		struct resource *resource;
@@ -922,6 +943,7 @@ struct apple_atcphy {
 	struct delayed_work usb3_port_work;
 	unsigned int usb3_port_retries;
 	struct work_struct sleep_finish_work;
+	struct completion sleep_finish_done;
 	bool sleep_finish_kept;
 	enum atcphy_mode mode;
 	int dp_link_rate;
@@ -939,6 +961,8 @@ struct apple_atcphy {
 	bool tunnel_dual_stream;
 	bool tunnel_routes_present;
 	bool tunnel_clock_on;
+	/* The clock block was reset by a CIO sleep and no clock start has run since. */
+	bool tunnel_ack_stale;
 	bool tunnel_attempted, tunnel_saved;
 	u32 tunnel_saved_regs[12];
 	u8 tunnel_rate;
@@ -961,11 +985,13 @@ struct apple_atcphy {
 		void __iomem *pipehandler;
 		void __iomem *lpdptx;
 		void __iomem *pwrctl;
+		void __iomem *lioa;
 	} regs;
 
 	struct {
 		struct resource *core;
 		struct resource *lpdptx;
+		struct resource *lioa;
 		struct resource *axi2af;
 		struct resource *usb2phy_reg;
 	} res;
@@ -1806,6 +1832,9 @@ static int atcphy_configure_pipehandler_usb4(struct apple_atcphy *atcphy)
  */
 static void atcphy_enable_dummy_phy(struct apple_atcphy *atcphy)
 {
+	if (atcphy->hw->clear_boot_hold)
+		clear32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
+			PIPEHANDLER_NONSELECTED_BOOT_HOLD);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
 	      PIPEHANDLER_DUMMY_PHY_EN);
 }
@@ -2919,6 +2948,13 @@ static int atc_t8122_tunnel_stop(struct apple_atcphy *atcphy)
 		dev_err(atcphy->dev, "T8122 tunnel clock shutdown incomplete: %d\n", ret);
 		return ret;
 	}
+	if (atcphy->cio_sleep.prepared)
+		dev_dbg(atcphy->dev,
+			"CIO tunnel clock stopped: TX %#x CLKOUT %#x APB %#x STATUS %#x\n",
+			readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0),
+			readl(atcphy->regs.core + AUSPLL_CLKOUT_MASTER),
+			readl(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE),
+			readl(atcphy->regs.core + T8122_DP_PCLK_STATUS));
 	atcphy->tunnel_clock_on = false;
 	atcphy->tunnel_rate = 0;
 	atcphy->tunnel_users = 0;
@@ -2959,7 +2995,8 @@ static void atc_t8122_tunnel_pclk(struct apple_atcphy *atcphy,
 static int atc_t8122_tunnel_start(struct apple_atcphy *atcphy,
 				unsigned int pclk, u8 rate)
 {
-	u32 selector, value, saved_tx;
+	u32 selector, value, saved_tx, apb;
+	bool stale_ack;
 	int ret, cleanup;
 
 	lockdep_assert_held(&atcphy->lock);
@@ -2988,11 +3025,23 @@ static int atc_t8122_tunnel_start(struct apple_atcphy *atcphy,
 		return 0;
 	}
 	saved_tx = readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0);
+	apb = readl(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE);
+	/*
+	 * A PHY power cycle for CIO sleep leaves ACK set with no request pending,
+	 * until the first clock start after it, whenever that comes.
+	 */
+	stale_ack = atcphy->tunnel_ack_stale && (apb & (BIT(0) | BIT(1))) == BIT(1);
 	if ((readl(atcphy->regs.core + AUSPLL_CLKOUT_MASTER) & T8122_AUSPLL_PCLK_DRIVER) ||
-	    (readl(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE) & (BIT(0) | BIT(1))) ||
+	    ((apb & (BIT(0) | BIT(1))) && !stale_ack) ||
 	    (readl(atcphy->regs.core + T8122_DP_PCLK_STATUS) & ACIOPHY_AUSPLL_LOCK) ||
-	    ((saved_tx & T8122_PCLK_ENABLES) && (saved_tx & 0xffff) != 0xe001))
+	    ((saved_tx & T8122_PCLK_ENABLES) && (saved_tx & 0xffff) != 0xe001)) {
+		dev_err(atcphy->dev,
+			"T8122 tunnel clock not idle: TX %#x CLKOUT %#x APB %#x STATUS %#x\n",
+			saved_tx, readl(atcphy->regs.core + AUSPLL_CLKOUT_MASTER),
+			readl(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE),
+			readl(atcphy->regs.core + T8122_DP_PCLK_STATUS));
 		return -EBUSY;
+	}
 
 	/*
 	 * Inactive slots use selector zero; all gates stay off during PLL setup.
@@ -3017,6 +3066,17 @@ static int atc_t8122_tunnel_start(struct apple_atcphy *atcphy,
 		writel(saved_tx, atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0);
 		return ret;
 	}
+	if (stale_ack) {
+		/* The same release a clock stop ends with, so the start sees a real ACK. */
+		ret = atc_t8122_tunnel_apb(atcphy, 0x10000018, false);
+		dev_dbg(atcphy->dev, "CIO tunnel clock ACK release: %d (APB %#x)\n", ret,
+			readl(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE));
+		if (ret) {
+			writel(saved_tx, atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0);
+			return ret;
+		}
+	}
+	atcphy->tunnel_ack_stale = false;
 
 	atcphy->tunnel_clock_on = true;
 	atcphy->tunnel_rate = 0;
@@ -3550,6 +3610,30 @@ static int apple_atc_tunnel_pclk(struct apple_atcphy *atcphy, unsigned int sourc
 	 FIELD_PREP(AUSPLL_APB_CMD_OVERRIDE_CMD, (cmd)) |            \
 	 ((req) ? AUSPLL_APB_CMD_OVERRIDE_REQ : 0))
 
+/*
+ * T8132 DisplayPort alt mode: the DP lanes and AUX sit in the core window at
+ * the T8122 offsets and run the T8122 sequences. Only on a port whose board
+ * description says it is wired for it (apple,dp-alt-mode).
+ */
+static bool atcphy_t8132_dp_on(const struct apple_atcphy *atcphy)
+{
+	return atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy->t8132_dp_alt;
+}
+
+/*
+ * The T8132 lane start differs from the T8122 one: both blocks start at swing
+ * 0 / pre-emphasis 0, the RX block's VREF filter is held until both DTVREG
+ * stages are on, and HBR3 keeps the LDOCLK1 regulator in circuit.
+ */
+static unsigned int atcphy_dp_lane_flags(const struct apple_atcphy *atcphy,
+					 unsigned int link_rate)
+{
+	if (atcphy->hw->gen != ATCPHY_GENERATION_T8132)
+		return 0;
+	return ATC_T8132_DP_START_EQ | ATC_T8132_DP_VREF |
+	       (link_rate == 8100 ? ATC_T8132_DP_NO_LDOCLK_BYPASS : 0);
+}
+
 static void atcphy_dp_aux_on_t8122(struct apple_atcphy *atcphy)
 {
 	void __iomem *core = atcphy->regs.core;
@@ -3655,7 +3739,8 @@ static int atcphy_dp_link_start_t8122(struct apple_atcphy *atcphy,
 	atcphy->dp_t8122.pairs = pairs;
 	for (unsigned int pair = 0; pair < 2; pair++)
 		if (pairs & BIT(pair))
-			atc_t8122_dp_lane_start(core, pair, rate->div2);
+			atc_t8122_dp_lane_start(core, pair, rate->div2,
+						atcphy_dp_lane_flags(atcphy, rate->link_rate));
 	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DP_PMA_BYTECLK_RESET);
 
 	return 0;
@@ -3868,7 +3953,7 @@ static int atcphy_t8132_full_stop(struct apple_atcphy *atcphy)
  * and the lanes are then brought up by the PHY itself, driven by the host
  * router; nothing here waits for lock.
  */
-static void atcphy_t8132_cio_start(struct apple_atcphy *atcphy)
+static void atcphy_t8132_cio_config(struct apple_atcphy *atcphy, bool keep_swap)
 {
 	static const int bank[T8132_CIO_COMMON] = {
 		[T8132_CIO_AXI2AF] = T8132_AXI2AF,
@@ -3890,11 +3975,17 @@ static void atcphy_t8132_cio_start(struct apple_atcphy *atcphy)
 				    atcphy->t8132_cio[T8132_CIO_LANE0_EQA + 2 * lane]);
 	}
 	/* CIO swaps in the crossbar alone; drop a swap left by a USB3 epoch. */
-	core_clear32(atcphy, ATCPHY_MISC, ATCPHY_MISC_LANE_SWAP);
+	if (!keep_swap)
+		core_clear32(atcphy, ATCPHY_MISC, ATCPHY_MISC_LANE_SWAP);
 	core_mask32(atcphy, ACIOPHY_LANE_MODE_T8122, GENMASK(11, 0), 0);
 	core_mask32(atcphy, ACIOPHY_CROSSBAR_T8122, GENMASK(4, 0),
 		    atcphy->swap_lanes ? 1 : 0);
 	apple_tunable_apply(atcphy->regs.core, atcphy->t8132_cio[T8132_CIO_POST]);
+}
+
+static void atcphy_t8132_cio_start(struct apple_atcphy *atcphy)
+{
+	atcphy_t8132_cio_config(atcphy, false);
 	udelay(10);
 	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
 	udelay(100);
@@ -3904,23 +3995,24 @@ static void atcphy_t8132_cio_start(struct apple_atcphy *atcphy)
 static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 {
 	bool cio = atcphy_mode_is_cio(mode);
+	bool dp_only = mode == APPLE_ATCPHY_MODE_DP && atcphy_t8132_dp_on(atcphy);
 	u32 reg;
 	int ret;
 
 	if (mode != APPLE_ATCPHY_MODE_OFF && mode != APPLE_ATCPHY_MODE_USB2 &&
-	    mode != APPLE_ATCPHY_MODE_USB3 && mode != APPLE_ATCPHY_MODE_USB3_DP && !cio)
+	    mode != APPLE_ATCPHY_MODE_USB3 && mode != APPLE_ATCPHY_MODE_USB3_DP && !cio && !dp_only)
 		return -EOPNOTSUPP;
 	if (cio && !atcphy->cio_tunables)
 		return -EOPNOTSUPP;
-	if ((mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP) &&
+	if ((mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP || dp_only) &&
 	    !atcphy->ss_tunables)
 		return -EOPNOTSUPP;
-	if (mode == APPLE_ATCPHY_MODE_USB3_DP && !atcphy->tunables.usb3_dp)
+	if ((mode == APPLE_ATCPHY_MODE_USB3_DP || dp_only) && !atcphy->tunables.usb3_dp)
 		return -ENODEV;
 	if (atcphy->t8132_failed)
 		return -EIO;
-	if ((mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP || cio) &&
-	    atcphy->t8132_suspended)
+	if ((mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP || cio ||
+	     dp_only) && atcphy->t8132_suspended)
 		return -EBUSY;
 	if (atcphy->pipe_pending || atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
 		return -EBUSY;
@@ -3932,8 +4024,11 @@ static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode 
 	if (ret)
 		return ret;
 	atcphy->mode_dirty = true;
+	/* Main link and AUX go down before the PHY leaves a DP mode. */
+	atcphy_dp_stop_t8122(atcphy);
 	if (atcphy->t8132_common_owned) {
-		if (atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP)
+		if (atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP ||
+		    atcphy->mode == APPLE_ATCPHY_MODE_DP)
 			ret = atcphy_t8132_full_stop(atcphy);
 		else if (atcphy_mode_is_cio(atcphy->mode))
 			ret = atcphy_t8132_phy_stop(atcphy);
@@ -3956,9 +4051,21 @@ static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode 
 		goto done;
 	}
 
+	/* A deep sleep took the block's power: it comes back at reset values, clamp not set yet. */
+	if (!core_read32(atcphy, ATCPHY_POWER_CTRL) && !core_read32(atcphy, ATCPHY_POWER_STAT) &&
+	    !(core_read32(atcphy, ATCPHY_MISC) & ~ATCPHY_MISC_LANE_SWAP)) {
+		dev_dbg(atcphy->dev, "PHY at reset values, setting the clamp\n");
+		core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_CLAMP_EN);
+		udelay(1);
+	}
 	/* Never reset an inherited common-power epoch to manufacture a cold state. */
-	if (!atcphy_t8132_cold(atcphy))
+	if (!atcphy_t8132_cold(atcphy)) {
+		dev_err(atcphy->dev, "PHY not cold: ctrl %#x stat %#x misc %#x\n",
+			core_read32(atcphy, ATCPHY_POWER_CTRL),
+			core_read32(atcphy, ATCPHY_POWER_STAT),
+			core_read32(atcphy, ATCPHY_MISC));
 		return -EBUSY;
+	}
 	atcphy_usb2_power_on(atcphy);
 	ndelay(500);
 	/* A touched failure retains this epoch without guessing a rollback. */
@@ -3994,25 +4101,50 @@ static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode 
 	for (unsigned int i = T8132_AXI2AF; i <= T8132_COMMON; i++)
 		apple_tunable_apply(atcphy->t8132_banks[i].regs,
 				    atcphy->t8132_banks[i].tunable);
-	apple_tunable_apply(atcphy->regs.core,
-			    atcphy->tunables.lane_usb3[atcphy->swap_lanes ? 1 : 0]);
-	if (mode == APPLE_ATCPHY_MODE_USB3_DP)
+	/* DP-only mode carries no USB lanes, so it takes no USB lane tunables. */
+	if (!dp_only)
+		apple_tunable_apply(atcphy->regs.core,
+				    atcphy->tunables.lane_usb3[atcphy->swap_lanes ? 1 : 0]);
+	if (mode == APPLE_ATCPHY_MODE_USB3_DP || dp_only)
 		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.usb3_dp);
-	core_mask32(atcphy, ACIOPHY_LANE_MODE_T8122, GENMASK(11, 0),
-		    atcphy->swap_lanes ? 0x252 : 0x489);
-	core_mask32(atcphy, ACIOPHY_CROSSBAR_T8122, GENMASK(16, 0),
-		    atcphy->swap_lanes ? 0x111 : 0x110);
-	core_mask32(atcphy, ATCPHY_MISC, ATCPHY_MISC_LANE_SWAP,
-		    atcphy->swap_lanes ? ATCPHY_MISC_LANE_SWAP : 0);
+	if (dp_only) {
+		/* Both lane pairs carry DP, as in atcphy_modes[]. */
+		const struct atcphy_mode_configuration *cfg = atcphy_get_mode_config(atcphy, mode);
+
+		core_mask32(atcphy, ACIOPHY_LANE_MODE_T8122, GENMASK(11, 0),
+			    FIELD_PREP(ACIOPHY_LANE_MODE_RX0, cfg->lane_mode[0]) |
+			    FIELD_PREP(ACIOPHY_LANE_MODE_TX0, cfg->lane_mode[0]) |
+			    FIELD_PREP(ACIOPHY_LANE_MODE_RX1, cfg->lane_mode[1]) |
+			    FIELD_PREP(ACIOPHY_LANE_MODE_TX1, cfg->lane_mode[1]));
+		core_mask32(atcphy, ACIOPHY_CROSSBAR_T8122, GENMASK(17, 0),
+			    FIELD_PREP(ACIOPHY_CROSSBAR_PROTOCOL, cfg->crossbar) |
+			    FIELD_PREP(ACIOPHY_CROSSBAR_DP_SINGLE_PMA,
+				       cfg->crossbar_dp_single_pma) |
+			    (cfg->crossbar_dp_both_pma ? ACIOPHY_CROSSBAR_DP_BOTH_PMA : 0));
+		core_mask32(atcphy, ATCPHY_MISC, ATCPHY_MISC_LANE_SWAP,
+			    cfg->set_swap ? ATCPHY_MISC_LANE_SWAP : 0);
+	} else {
+		core_mask32(atcphy, ACIOPHY_LANE_MODE_T8122, GENMASK(11, 0),
+			    atcphy->swap_lanes ? 0x252 : 0x489);
+		core_mask32(atcphy, ACIOPHY_CROSSBAR_T8122, GENMASK(16, 0),
+			    atcphy->swap_lanes ? 0x111 : 0x110);
+		core_mask32(atcphy, ATCPHY_MISC, ATCPHY_MISC_LANE_SWAP,
+			    atcphy->swap_lanes ? ATCPHY_MISC_LANE_SWAP : 0);
+	}
 	udelay(1);
 	apple_tunable_apply(atcphy->regs.core, atcphy->t8132_banks[T8132_EFUSE].tunable);
 	udelay(10);
 	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
 	udelay(100);
-	if (mode == APPLE_ATCPHY_MODE_USB3_DP) {
+	if (mode == APPLE_ATCPHY_MODE_USB3_DP || dp_only) {
 		ret = atcphy_t8132_common_start(atcphy);
 		if (ret)
 			goto failed;
+	}
+	/* AUX comes up after RCAL; the DCP's link rate starts the main link. */
+	if ((mode == APPLE_ATCPHY_MODE_USB3_DP || dp_only) && atcphy_t8132_dp_on(atcphy)) {
+		atcphy->mode = mode;
+		atcphy_dp_aux_on_t8122(atcphy);
 	}
 
 done:
@@ -4057,7 +4189,8 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 		if (ret)
 			return ret;
 	}
-	if (atcphy->hw->has_t8140_dp && atcphy_modes[mode].enable_dp_aux &&
+	if ((atcphy->hw->has_t8140_dp || atcphy->hw->dp_banked_tunables) &&
+	    atcphy_modes[mode].enable_dp_aux &&
 	    !atcphy->dp_tunables)
 		return -EOPNOTSUPP;
 	if (atcphy->hw->has_t8140_dp &&
@@ -4128,6 +4261,10 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	}
 
 	atcphy_apply_tunables(atcphy, mode);
+	if (atcphy->hw->dp_banked_tunables && atcphy_modes[mode].enable_dp_aux) {
+		apple_tunable_apply(atcphy->regs.lioa, atcphy->tunables.dp_lioa);
+		apple_tunable_apply(atcphy->regs.lpdptx, atcphy->tunables.dp_common_config);
+	}
 	atcphy->hw->configure_post_tunable(atcphy, mode);
 
 	/* Setup AUX channel if DP altmode is requested */
@@ -4302,6 +4439,9 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
 
 	lockdep_assert_held(&atcphy->lock);
 
+	/* The CIO host restores this epoch before restarting its controller. */
+	if (atcphy->cio_sleep.prepared)
+		return;
 	if (!atcphy->hw->restore_after_pd_off || !READ_ONCE(atcphy->pd_was_off))
 		return;
 	WRITE_ONCE(atcphy->pd_was_off, false);
@@ -4337,12 +4477,22 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
 			atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 		}
 		dev_dbg(atcphy->dev,
-			"power domain was off, restoring mode %d: PIPE mux=%08x lock=%08x/%08x aon=%08x nonsel=%08x\n",
+			"power domain was off, restoring mode %d: PIPE mux=%08x lock=%08x/%08x aon=%08x nonsel=%08x usb2 sig=%08x\n",
 			mode, readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
 			readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ),
 			readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK),
 			readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN),
-			readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE));
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE),
+			readl(atcphy->regs.usb2phy + USB2PHY_SIG));
+		/*
+		 * A USB2 PHY behind a fixed hub may have lost its registers with the
+		 * domain, and the host role with them. Put the role back before the
+		 * mode below powers the PHY on, as probe and atcphy_common_restore()
+		 * do: set later, on the running PHY, it doesn't take effect and the
+		 * hub never connects to the controller's USB2 root port.
+		 */
+		if (atcphy->fixed_usb2)
+			set32(atcphy->regs.usb2phy + USB2PHY_SIG, atcphy_usb2_sig_host(atcphy));
 	}
 
 	if (mode == APPLE_ATCPHY_MODE_OFF)
@@ -4404,6 +4554,14 @@ static int atcphy_usb2_init(struct phy *phy)
 	if (!atcphy->fixed_usb2) {
 		if (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)
 			return atcphy_configure(atcphy, atcphy->typec_mode);
+		/*
+		 * Reset assertion stops USB2 even when a DisplayPort mode keeps
+		 * the common block running. An aborted suspend need not produce
+		 * a new mux event: restore USB2 without disturbing the DP link.
+		 */
+		if ((readl(atcphy->regs.usb2phy + USB2PHY_USBCTL) &
+		     USB2PHY_USBCTL_USB_MODE) != USB2PHY_USBCTL_RUN)
+			atcphy_usb2_power_on(atcphy);
 		return 0;
 	}
 
@@ -4479,6 +4637,16 @@ static int atcphy_usb3_power_off(struct phy *phy)
 	if (ret)
 		return ret;
 	atcphy->t8103_usb3_retry = false;
+	/*
+	 * T8132 keeps DWC3 on the dummy PIPE while USB4/Thunderbolt owns the
+	 * lanes. Stopping that USB host must not take the dock's PCIe and DP
+	 * tunnels down before their drivers suspend. The Type-C mux owns the
+	 * CIO mode and releases it when the connection ends. A CIO mode whose
+	 * last transition failed is still taken down, as before.
+	 */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy_mode_is_cio(atcphy->mode) &&
+	    !atcphy->mode_dirty)
+		return 0;
 	/*
 	 * dwc3 can tear its host down while a DisplayPort alt mode link is up,
 	 * e.g. when a monitor's built-in hub re-enumerates after a hot-plug.
@@ -4663,6 +4831,14 @@ static int atcphy_dpphy_set_mode_t8132(struct apple_atcphy *atcphy, enum phy_mod
 	if ((mode == PHY_MODE_DP || mode == PHY_MODE_INVALID) &&
 	    (atcphy->mode == APPLE_ATCPHY_MODE_USB4 || atcphy->mode == APPLE_ATCPHY_MODE_TBT))
 		return 0;
+	/*
+	 * DP alt mode. The submode is the DCP index; on an ATC the display
+	 * crossbar selects the DCP, so any submode is fine. The DCP's ACTIVATE
+	 * is answered only once this succeeds.
+	 */
+	if ((mode == PHY_MODE_DP || mode == PHY_MODE_INVALID) && atcphy_t8132_dp_on(atcphy) &&
+	    (atcphy->mode == APPLE_ATCPHY_MODE_DP || atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP))
+		return 0;
 	return -EOPNOTSUPP;
 }
 
@@ -4686,8 +4862,16 @@ static int atcphy_dpphy_validate(struct phy *phy, enum phy_mode mode, int submod
 
 	if (mode != PHY_MODE_DP)
 		return -EINVAL;
-	if (submode != 0)
+	if (submode != 0 && !atcphy_t8132_dp_on(atcphy))
 		return -EINVAL;
+
+	/* The Type-C mux owns lane setup; validate observes its completed epoch. */
+	guard(mutex)(&atcphy->lock);
+	if (atcphy->hw->dp_t8122 &&
+	    (atcphy->mode_dirty || !atcphy->dp_t8122.aux)) {
+		opts->lanes = 0;
+		return 0;
+	}
 
 	switch (atcphy->mode) {
 	case APPLE_ATCPHY_MODE_USB3_DP:
@@ -4729,9 +4913,36 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
 	enum atcphy_dp_link_rate link_rate;
 
-	/* No DP alternate mode: a tunnel sets its rate through its own call. */
-	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
-		return -EOPNOTSUPP;
+	/*
+	 * T8132: in DP alt mode the link rate runs the T8122 main link sequence.
+	 * The lanes keep their start drive level: these PHYs have no
+	 * dp-training-table to map a drive request to. Without DP alt mode a
+	 * tunnel sets its rate through its own call.
+	 */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132) {
+		if (!atcphy_t8132_dp_on(atcphy))
+			return -EOPNOTSUPP;
+		if (opts->set_voltages && !opts->set_rate) {
+			dev_dbg(atcphy->dev, "DP drive request ignored (lane 0 swing %u pre %u)\n",
+				opts->voltage[0], opts->pre[0]);
+			return 0;
+		}
+		if (opts->set_rate) {
+			int ret;
+
+			guard(mutex)(&atcphy->lock);
+			if (atcphy->mode != APPLE_ATCPHY_MODE_DP &&
+			    atcphy->mode != APPLE_ATCPHY_MODE_USB3_DP)
+				return -EOPNOTSUPP;
+			atcphy_restore_after_pd_off(atcphy);
+			ret = atcphy_dp_set_rate_t8122(atcphy, opts->link_rate);
+			if (ret)
+				dev_err(atcphy->dev, "DP link rate %u failed: %d\n",
+					opts->link_rate, ret);
+			return ret;
+		}
+		return opts->set_lanes ? -EINVAL : 0;
+	}
 	if (atcphy->hw->has_t8140_dp)
 		return j700_dp_configure(atcphy, opts);
 
@@ -4810,6 +5021,8 @@ int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
 	 * mode, and leaving one stops the tunnel clock (atcphy_configure_t8132()):
 	 * outside one there is nothing to stop and no register to touch.
 	 */
+	if (atcphy->cio_sleep.changed && !atcphy->cio_sleep.restored)
+		return -EBUSY;
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 &&
 	    atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
 	    atcphy->mode != APPLE_ATCPHY_MODE_TBT) {
@@ -4948,10 +5161,17 @@ int apple_atc_dp_tunnel_open(struct phy *phy)
 {
 	struct apple_atcphy *atcphy;
 
-	if (!phy || phy->ops != &apple_atc_dp_phy_ops)
+	if (!phy)
 		return -EINVAL;
+	/*
+	 * Everything but t600x has nothing to open, whichever driver provides
+	 * the PHY: T6050's tunnel clocks belong to atc-t6050-dp.c, whose PHY
+	 * this driver does not know, and start from the link rate alone.
+	 */
 	if (!apple_atc_tunnel_is_t600x())
 		return -EOPNOTSUPP;
+	if (phy->ops != &apple_atc_dp_phy_ops)
+		return -EINVAL;
 	atcphy = phy_get_drvdata(phy);
 	guard(mutex)(&atcphy->lock);
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
@@ -5147,6 +5367,8 @@ static int atcphy_set_orientation(struct apple_atcphy *atcphy, enum typec_orient
 	default:
 		return -EINVAL;
 	}
+	if (atcphy->cio_sleep.prepared)
+		return atcphy->swap_lanes == swap_lanes ? 0 : -EBUSY;
 	/* The mode alone cannot describe a route after its orientation changes. */
 	if (atcphy->swap_lanes != swap_lanes) {
 		atcphy->swap_lanes = swap_lanes;
@@ -5554,13 +5776,34 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132) {
 		enum atcphy_mode usb_mode = target_mode;
 
-		if (target_mode == APPLE_ATCPHY_MODE_DP)
+		/* 4-lane DP stays DP only on a port wired for DP alt mode */
+		if (target_mode == APPLE_ATCPHY_MODE_DP && !atcphy_t8132_dp_on(atcphy))
 			usb_mode = APPLE_ATCPHY_MODE_USB2;
 		else if (target_mode == APPLE_ATCPHY_MODE_USB3_DP && !atcphy->tunables.usb3_dp)
 			usb_mode = APPLE_ATCPHY_MODE_USB3;
 		if (usb_mode != target_mode) {
 			dev_warn(atcphy->dev,
 				 "DisplayPort is not available on this port: serving its USB only\n");
+			target_mode = usb_mode;
+		}
+	}
+
+	/*
+	 * T8142 runs DisplayPort only with the boot loader's LIOA and common
+	 * configuration banks, and the mode switch refuses a DP mode without
+	 * them. Serve a DP Alt Mode partner's USB then, as on T8132: USB2 next
+	 * to four DP lanes, USB3 next to two.
+	 */
+	if (atcphy->hw->dp_banked_tunables && !atcphy->dp_tunables) {
+		enum atcphy_mode usb_mode = target_mode;
+
+		if (target_mode == APPLE_ATCPHY_MODE_DP)
+			usb_mode = APPLE_ATCPHY_MODE_USB2;
+		else if (target_mode == APPLE_ATCPHY_MODE_USB3_DP)
+			usb_mode = APPLE_ATCPHY_MODE_USB3;
+		if (usb_mode != target_mode) {
+			dev_warn(atcphy->dev,
+				 "DisplayPort calibration missing: serving the partner's USB only\n");
 			target_mode = usb_mode;
 		}
 	}
@@ -5607,6 +5850,11 @@ static int atcphy_mux_check(const struct apple_atcphy *atcphy, enum atcphy_mode 
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy_mode_is_cio(mode) &&
 	    atcphy->cio_tunables)
 		return 0;
+
+	/* T8132 4-lane DP alt mode needs the SuperSpeed and AUX calibration */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && mode == APPLE_ATCPHY_MODE_DP &&
+	    atcphy_t8132_dp_on(atcphy))
+		return atcphy->ss_tunables && atcphy->tunables.usb3_dp ? 0 : -ENODEV;
 
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 &&
 	    mode != APPLE_ATCPHY_MODE_OFF && mode != APPLE_ATCPHY_MODE_USB2 &&
@@ -5779,6 +6027,10 @@ static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode t
 	KUNIT_STATIC_STUB_REDIRECT(atcphy_mux_set_locked, atcphy, target_mode, port_on);
 
 	guard(mutex)(&atcphy->lock);
+	if (atcphy->cio_sleep.prepared) {
+		*port_on = false;
+		return atcphy_mux_is_noop(atcphy, target_mode) ? 0 : -EBUSY;
+	}
 	ret = atcphy_mux_switch(atcphy, target_mode);
 	*port_on = atcphy->usb3_port_off && atcphy_usb3_port_ready(atcphy);
 	return ret;
@@ -5801,6 +6053,8 @@ static int atcphy_mux_update_to(struct apple_atcphy *atcphy, enum atcphy_mode ta
 	int ret;
 
 	scoped_guard(mutex, &atcphy->lock) {
+		if (atcphy->cio_sleep.prepared)
+			return atcphy_mux_is_noop(atcphy, target_mode) ? 0 : -EBUSY;
 		atcphy_restore_after_pd_off(atcphy);
 		/*
 		 * Only a lane or PIPE change, or a SuperSpeed port still owed
@@ -6087,6 +6341,36 @@ static int atcphy_load_t8132_tunables(struct apple_atcphy *atcphy)
 	return 0;
 }
 
+static int atcphy_load_dp_banks(struct apple_atcphy *atcphy)
+{
+	struct apple_tunable *lioa, *common;
+
+	if (!atcphy->res.lioa) {
+		atcphy->dp_tunables = false;
+		return 0;
+	}
+
+	lioa = devm_apple_tunable_parse(atcphy->dev, atcphy->np,
+					"apple,tunable-dp-lioa", atcphy->res.lioa);
+	common = devm_apple_tunable_parse(atcphy->dev, atcphy->np,
+					  "apple,tunable-dp-common-config", atcphy->res.lpdptx);
+	if (IS_ERR(lioa) || IS_ERR(common)) {
+		int ret = IS_ERR(lioa) ? PTR_ERR(lioa) : PTR_ERR(common);
+
+		if ((IS_ERR(lioa) && PTR_ERR(lioa) != -ENOENT) ||
+		    (IS_ERR(common) && PTR_ERR(common) != -ENOENT))
+			return ret == -ENOENT ? PTR_ERR(common) : ret;
+		atcphy->dp_tunables = false;
+		dev_warn(atcphy->dev, "DisplayPort bank calibration missing; DP disabled\n");
+		return 0;
+	}
+	if (!lioa->sz || !common->sz)
+		return -EINVAL;
+	atcphy->tunables.dp_lioa = lioa;
+	atcphy->tunables.dp_common_config = common;
+	return 0;
+}
+
 static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 {
 	size_t tunable_count;
@@ -6199,6 +6483,12 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 	atcphy->ss_tunables = !ss_missing;
 	if (atcphy->hw->dp_t8122)
 		atcphy->dp_tunables = !common_missing;
+	if (atcphy->hw->dp_banked_tunables) {
+		int ret = atcphy_load_dp_banks(atcphy);
+
+		if (ret)
+			return ret;
+	}
 	if (atcphy->dp_only && !atcphy->dp_tunables)
 		dev_warn(atcphy->dev, "Calibration tunables missing, DisplayPort disabled\n");
 	else if (ss_missing && atcphy->dp_tunables && !atcphy->dp_only)
@@ -6282,6 +6572,21 @@ static int atcphy_map_resources(struct platform_device *pdev, struct apple_atcph
 		*resources[i].addr = addr;
 		if (resources[i].res)
 			*resources[i].res = res;
+	}
+
+	/*
+	 * Device trees written before DisplayPort was supported have no LIOA
+	 * bank: the PHY then serves USB as before, without DisplayPort.
+	 */
+	res = atcphy->hw->dp_banked_tunables ?
+	      platform_get_resource_byname(pdev, IORESOURCE_MEM, "lioa") : NULL;
+	if (res) {
+		addr = devm_ioremap_resource(&pdev->dev, res);
+		if (IS_ERR(addr))
+			return dev_err_probe(atcphy->dev, PTR_ERR(addr),
+					     "Unable to map LIOA bank\n");
+		atcphy->res.lioa = res;
+		atcphy->regs.lioa = addr;
 	}
 
 	if (atcphy->hw->has_usb2phy_reg) {
@@ -6597,15 +6902,11 @@ static int atcphy_probe(struct platform_device *pdev)
 
 	atcphy->dev = dev;
 	atcphy->np = dev->of_node;
+	atcphy->t8132_dp_alt = atcphy->hw->gen == ATCPHY_GENERATION_T8132 &&
+			       of_property_read_bool(dev->of_node, "apple,dp-alt-mode");
 	apple_atc_tunnel_wiring(atcphy);
 	mutex_init(&atcphy->lock);
 	platform_set_drvdata(pdev, atcphy);
-	ret = devm_delayed_work_autocancel(dev, &atcphy->usb3_port_work, atcphy_usb3_port_work);
-	if (ret)
-		return ret;
-	ret = devm_work_autocancel(dev, &atcphy->sleep_finish_work, atcphy_sleep_finish_work);
-	if (ret)
-		return ret;
 
 	ret = atcphy_map_resources(pdev, atcphy);
 	if (ret)
@@ -6654,6 +6955,16 @@ static int atcphy_probe(struct platform_device *pdev)
 			return ret;
 		atcphy->idle_rpm = true;
 	}
+
+	/* Unpublish consumers first, then drain work before its resources are released. */
+	ret = devm_delayed_work_autocancel(dev, &atcphy->usb3_port_work, atcphy_usb3_port_work);
+	if (ret)
+		return ret;
+	init_completion(&atcphy->sleep_finish_done);
+	complete(&atcphy->sleep_finish_done);
+	ret = devm_work_autocancel(dev, &atcphy->sleep_finish_work, atcphy_sleep_finish_work);
+	if (ret)
+		return ret;
 
 	ret = atcphy_probe_finalize(atcphy);
 	if (ret)
@@ -7042,6 +7353,8 @@ static int atcphy_suspend_noirq(struct device *dev)
 	int ret;
 
 	guard(mutex)(&atcphy->lock);
+	if (atcphy->cio_sleep.prepared)
+		return atcphy->cio_sleep.off ? 0 : -EBUSY;
 	/* Suspend-to-idle keeps every domain on: nothing to do. */
 	if (!atcphy->sleep_in_place || !pm_suspend_via_firmware())
 		return 0;
@@ -7085,8 +7398,9 @@ static int atcphy_suspend_noirq(struct device *dev)
  */
 static void atcphy_sleep_lost_common(struct apple_atcphy *atcphy)
 {
-	if (!atcphy->hw->has_t8140_dp || !atcphy->hw->restore_after_pd_off ||
-	    !pm_resume_via_firmware())
+	if ((!atcphy->hw->has_t8140_dp &&
+	     !of_device_is_compatible(atcphy->np, "apple,t8142-atcphy")) ||
+	    !atcphy->hw->restore_after_pd_off || !pm_resume_via_firmware())
 		return;
 	WRITE_ONCE(atcphy->pd_was_off, true);
 	dev_dbg(atcphy->dev, "mode %d lost in the sleep: setting it up again\n", atcphy->mode);
@@ -7097,6 +7411,12 @@ static int atcphy_resume_noirq(struct device *dev)
 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
 
 	guard(mutex)(&atcphy->lock);
+	/* The ACIO consumer restores the PHY before its controller and rings. */
+	if (atcphy->cio_sleep.prepared)
+		return 0;
+	/* A real sleep took T8132's PHY state behind its power domain's back. */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && pm_resume_via_firmware())
+		WRITE_ONCE(atcphy->pd_was_off, true);
 	if (!atcphy->hibernated) {
 		atcphy_sleep_lost_common(atcphy);
 		return 0;
@@ -7158,6 +7478,38 @@ static void atcphy_sleep_ss_up(struct apple_atcphy *atcphy)
 }
 
 /* No lane or port change here: anything the sleep needs is done at noirq, in a few ms. */
+/* For the debug line: the conditions of atcphy_can_sleep_in_place() that fail, by name. */
+static void atcphy_sleep_in_place_misses(const struct apple_atcphy *atcphy, char *buf, size_t size)
+{
+	enum atcphy_pipehandler_state pipe = atcphy_pipe_state_for(atcphy, atcphy->mode);
+	unsigned int i;
+	int len = 0;
+
+#define ATCPHY_MISS(cond, name) \
+	do { if (cond) len += scnprintf(buf + len, size - len, " %s", name); } while (0)
+	buf[0] = 0;
+	ATCPHY_MISS(!atcphy->hw->has_t8140_dp, "no_t8140_dp");
+	ATCPHY_MISS(!atcphy->fixed_usb2, "no_fixed_usb2");
+	ATCPHY_MISS(!atcphy->sleep_power, "no_sleep_power");
+	for (i = 0; i < atcphy->sleep_ndarts; i++)
+		ATCPHY_MISS(!apple_dart_sleep_listed(atcphy->sleep_darts[i]), "dart_unlisted");
+	ATCPHY_MISS(apple_sleep_domain_check(atcphy->pd_usb), "pd_usb");
+	ATCPHY_MISS(apple_sleep_domain_check(atcphy->pd_common), "pd_common");
+	ATCPHY_MISS(atcphy->sleep_no_keep, "sleep_no_keep");
+	ATCPHY_MISS(!atcphy->host_active, "host_inactive");
+	ATCPHY_MISS(atcphy->mode != APPLE_ATCPHY_MODE_USB2 &&
+		    atcphy->mode != APPLE_ATCPHY_MODE_USB3, "mode");
+	ATCPHY_MISS(atcphy->mode_dirty, "mode_dirty");
+	ATCPHY_MISS(atcphy->pipe_pending, "pipe_pending");
+	ATCPHY_MISS(atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY &&
+		    atcphy->pipe_state != pipe, "pipe_state");
+	ATCPHY_MISS(atcphy->usb_off_pending, "usb_off_pending");
+	ATCPHY_MISS(atcphy->dp_owned_pmas, "dp_owned_pmas");
+	ATCPHY_MISS(atcphy->aux_power_requested, "aux_power_requested");
+	ATCPHY_MISS(atcphy->tunnel_users, "tunnel_users");
+#undef ATCPHY_MISS
+}
+
 int apple_atcphy_sleep_prepare(struct phy *usb2_phy)
 {
 	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
@@ -7172,10 +7524,14 @@ int apple_atcphy_sleep_prepare(struct phy *usb2_phy)
 		atcphy->sleep_ret = 0;
 		return 0;
 	}
-	if (atcphy->regs.pwrctl && atcphy->fixed_usb2)
+	if (atcphy->regs.pwrctl && atcphy->fixed_usb2) {
+		char why[160];
+
+		atcphy_sleep_in_place_misses(atcphy, why, sizeof(why));
 		dev_dbg(atcphy->dev,
-			"USB controller stops for the sleep: mode %d, PIPE %d, host %d\n",
-			atcphy->mode, atcphy->pipe_state, atcphy->host_active);
+			"USB controller stops for the sleep: mode %d, PIPE %d, host %d, because:%s\n",
+			atcphy->mode, atcphy->pipe_state, atcphy->host_active, why);
+	}
 
 	return -EBUSY;
 }
@@ -7235,6 +7591,7 @@ static void atcphy_sleep_finish_work(struct work_struct *work)
 	struct apple_atcphy *atcphy = container_of(work, struct apple_atcphy, sleep_finish_work);
 
 	atcphy_sleep_finish(atcphy, READ_ONCE(atcphy->sleep_finish_kept));
+	complete(&atcphy->sleep_finish_done);
 }
 
 /*
@@ -7248,9 +7605,19 @@ void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept)
 	if (!atcphy)
 		return;
 	WRITE_ONCE(atcphy->sleep_finish_kept, kept);
+	reinit_completion(&atcphy->sleep_finish_done);
 	queue_work(system_dfl_wq, &atcphy->sleep_finish_work);
 }
 EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish_async);
+
+/* The controller serializes finish epochs; this query never joins the PHY's work. */
+bool apple_atcphy_sleep_finish_done(struct phy *usb2_phy)
+{
+	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
+
+	return !atcphy || completion_done(&atcphy->sleep_finish_done);
+}
+EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish_done);
 
 void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy)
 {
@@ -7260,6 +7627,210 @@ void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy)
 		flush_work(&atcphy->sleep_finish_work);
 }
 EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish_flush);
+
+static struct apple_atcphy *atcphy_from_cio_phy(struct phy *phy)
+{
+	struct apple_atcphy *atcphy;
+
+	if (!phy || phy->ops != &apple_atc_usb3_phy_ops)
+		return NULL;
+	atcphy = phy_get_drvdata(phy);
+	return atcphy->hw->gen == ATCPHY_GENERATION_T8132 ? atcphy : NULL;
+}
+
+int apple_atcphy_cio_prepare(struct phy *phy)
+{
+	struct apple_atcphy *atcphy = atcphy_from_cio_phy(phy);
+	struct atcphy_cio_sleep *s;
+
+	/* The same test as its host's, so the two never disagree about a sleep. */
+	if (!atcphy || pm_suspend_target_state != PM_SUSPEND_MEM)
+		return -EOPNOTSUPP;
+	guard(mutex)(&atcphy->lock);
+	s = &atcphy->cio_sleep;
+	if (s->prepared || !atcphy->t8132_common_owned || !atcphy->cio_tunables ||
+	    atcphy->t8132_failed || atcphy->mode_dirty || atcphy->pipe_pending ||
+	    !atcphy_mode_is_cio(atcphy->mode))
+		return -EBUSY;
+	*s = (struct atcphy_cio_sleep){
+		.prepared = true,
+		.mode = atcphy->mode,
+		.swap = atcphy->swap_lanes,
+	};
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_atcphy_cio_prepare);
+
+/* The host calls only after stopping rings, the DART and all ACIO domains. */
+/* Restore the pixel clocks without releasing their logical DP owners. */
+static int atcphy_cio_restart_clocks(struct apple_atcphy *atcphy,
+				     const struct atcphy_cio_sleep *s)
+{
+	int ret;
+
+	atcphy->tunnel_clock_on = false;
+	atcphy->tunnel_rate = 0;
+	atcphy->tunnel_users = s->clock_users;
+	for (unsigned int i = 0; i < 2; i++) {
+		int pclk;
+
+		atcphy->tunnel_source[i] = s->clock_source[i];
+		atcphy->tunnel_dpin_rate[i] = s->clock_rate[i];
+		if (!(s->clock_users & BIT(i)))
+			continue;
+		pclk = apple_atc_tunnel_pclk(atcphy, s->clock_source[i], i);
+		if (pclk < 0)
+			return pclk;
+		ret = atc_t8122_tunnel_start(atcphy, pclk, s->clock_rate[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+int apple_atcphy_cio_off(struct phy *phy)
+{
+	struct apple_atcphy *atcphy = atcphy_from_cio_phy(phy);
+	struct atcphy_cio_sleep *s;
+	u32 value;
+	int ret;
+
+	if (!atcphy)
+		return -EOPNOTSUPP;
+	guard(mutex)(&atcphy->lock);
+	s = &atcphy->cio_sleep;
+	if (!s->prepared || s->changed || atcphy->mode_dirty || atcphy->t8132_failed ||
+	    atcphy->mode != s->mode || atcphy->swap_lanes != s->swap ||
+	    atcphy->host_active || atcphy->pipe_pending ||
+	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
+		return -EBUSY;
+	if (atcphy->tunnel_clock_on && !atcphy->tunnel_rate)
+		return -EBUSY;
+	s->misc = core_read32(atcphy, ATCPHY_MISC);
+	s->lane_mode = core_read32(atcphy, ACIOPHY_LANE_MODE_T8122);
+	s->crossbar = core_read32(atcphy, ACIOPHY_CROSSBAR_T8122);
+	if (!(s->misc & ATCPHY_MISC_RESET_N))
+		return -EUCLEAN;
+	s->clock_users = atcphy->tunnel_users;
+	for (unsigned int i = 0; i < 2; i++) {
+		s->clock_rate[i] = atcphy->tunnel_dpin_rate[i];
+		s->clock_source[i] = atcphy->tunnel_source[i];
+	}
+	/*
+	 * This PLL belongs to the saved DP streams, not to the CIO link. If it
+	 * does not stop, nothing has been powered down yet: give the DP inputs
+	 * their clocks back (a start refuses a clock that is not idle) and
+	 * refuse the sleep.
+	 */
+	ret = atc_t8122_tunnel_stop(atcphy);
+	if (ret) {
+		if (s->clock_users && atcphy_cio_restart_clocks(atcphy, s)) {
+			/*
+			 * Keep a clock that may still run, as the stop does, and
+			 * its DP owners, whose release stops it.
+			 */
+			atcphy->tunnel_clock_on = true;
+			atcphy->tunnel_users = s->clock_users;
+			for (unsigned int i = 0; i < 2; i++) {
+				atcphy->tunnel_dpin_rate[i] = s->clock_rate[i];
+				atcphy->tunnel_source[i] = s->clock_source[i];
+			}
+			dev_err(atcphy->dev, "DP tunnel clocks not restarted after a failed stop\n");
+		}
+		return ret;
+	}
+	s->changed = true;
+	udelay(1);
+	core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
+	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_CLAMP_EN);
+	udelay(2);
+	core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_APB_RESET_N);
+	core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_SLEEP_BIG);
+	ret = readl_poll_timeout_atomic(atcphy->regs.core + ATCPHY_POWER_STAT, value,
+					!(value & ATCPHY_POWER_SLEEP_BIG), 1, 500000);
+	if (ret)
+		return ret;
+	udelay(2);
+	core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_SLEEP_SMALL);
+	ret = readl_poll_timeout_atomic(atcphy->regs.core + ATCPHY_POWER_STAT, value,
+					!(value & ATCPHY_POWER_SLEEP_SMALL), 1, 500000);
+	if (ret)
+		return ret;
+	udelay(2);
+	s->off = true;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_atcphy_cio_off);
+
+/* The PHY supplier has power; the ACIO host has not yet restarted its CPU. */
+int apple_atcphy_cio_on(struct phy *phy)
+{
+	struct apple_atcphy *atcphy = atcphy_from_cio_phy(phy);
+	struct atcphy_cio_sleep *s;
+	u32 value;
+	int ret;
+
+	if (!atcphy)
+		return -EOPNOTSUPP;
+	guard(mutex)(&atcphy->lock);
+	s = &atcphy->cio_sleep;
+	if (!s->prepared || atcphy->t8132_failed || atcphy->mode != s->mode ||
+	    atcphy->swap_lanes != s->swap)
+		return -EUCLEAN;
+	if (!s->changed || s->restored)
+		return 0;
+	core_set32(atcphy, ATCPHY_MISC, ATCPHY_MISC_RESET_N);
+	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_SLEEP_SMALL);
+	ret = readl_poll_timeout_atomic(atcphy->regs.core + ATCPHY_POWER_STAT, value,
+					value & ATCPHY_POWER_SLEEP_SMALL, 1, 500000);
+	if (ret)
+		return ret;
+	udelay(2);
+	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_SLEEP_BIG);
+	ret = readl_poll_timeout_atomic(atcphy->regs.core + ATCPHY_POWER_STAT, value,
+					value & ATCPHY_POWER_SLEEP_BIG, 1, 500000);
+	if (ret)
+		return ret;
+	udelay(2);
+	core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_CLAMP_EN);
+	udelay(2);
+	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_APB_RESET_N);
+	udelay(2);
+	core_mask32(atcphy, ATCPHY_MISC, ATCPHY_MISC_LANE_SWAP,
+		    s->misc & ATCPHY_MISC_LANE_SWAP);
+	atcphy_t8132_cio_config(atcphy, true);
+	writel(s->lane_mode, atcphy->regs.core + ACIOPHY_LANE_MODE_T8122);
+	writel(s->crossbar, atcphy->regs.core + ACIOPHY_CROSSBAR_T8122);
+	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
+	/* The clock block was reset with the PHY: see atc_t8122_tunnel_start(). */
+	atcphy->tunnel_ack_stale = true;
+	ret = atcphy_cio_restart_clocks(atcphy, s);
+	if (ret) {
+		atcphy->t8132_failed = true;
+		return ret;
+	}
+	s->restored = true;
+	WRITE_ONCE(atcphy->pd_was_off, false);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_atcphy_cio_on);
+
+int apple_atcphy_cio_finish(struct phy *phy)
+{
+	struct apple_atcphy *atcphy = atcphy_from_cio_phy(phy);
+	struct atcphy_cio_sleep *s;
+
+	if (!atcphy)
+		return -EOPNOTSUPP;
+	guard(mutex)(&atcphy->lock);
+	s = &atcphy->cio_sleep;
+	if (!s->prepared || (s->changed && !s->restored))
+		return -EUCLEAN;
+	*s = (struct atcphy_cio_sleep){};
+	atcphy->t8132_suspended = false;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_atcphy_cio_finish);
 
 static int atcphy_suspend(struct device *dev)
 {
@@ -7272,6 +7843,10 @@ static int atcphy_suspend(struct device *dev)
 	/* An incomplete common epoch has no qualified sleep handoff. */
 	if (atcphy->mode_dirty)
 		return -EBUSY;
+	if (atcphy->cio_sleep.prepared) {
+		atcphy->t8132_suspended = true;
+		return 0;
+	}
 	/*
 	 * An active one survives suspend-to-idle while a host runs on it: DWC3
 	 * then keeps the power domain on across system sleep, so the link stays
@@ -7296,6 +7871,8 @@ static int atcphy_resume(struct device *dev)
 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
 
 	guard(mutex)(&atcphy->lock);
+	if (atcphy->cio_sleep.prepared)
+		return atcphy->cio_sleep.changed && !atcphy->cio_sleep.restored ? -EIO : 0;
 	atcphy->t8132_suspended = false;
 	if (atcphy->t8132_common_owned && atcphy->host_active &&
 	    READ_ONCE(atcphy->pd_was_off))
@@ -7399,6 +7976,11 @@ static const struct atcphy_hw atcphy_hw_t8142 = {
 	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8142,
 	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8142,
 	.has_usb4 = true,
+	.dp_t8122 = true,
+	.dp_banked_tunables = true,
+	.park_dummy_phy = true,
+	.restore_after_pd_off = true,
+	.clear_boot_hold = true,
 };
 
 static const struct of_device_id atcphy_match[] = {

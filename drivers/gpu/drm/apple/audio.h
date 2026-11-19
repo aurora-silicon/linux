@@ -28,7 +28,23 @@ enum dcp_audio_link {
 	/* The started and stopping notifications around START and STOP */
 	DCP_AUDIO_LINK_DID_START,
 	DCP_AUDIO_LINK_WILL_STOP,
+	/* The link's state, asked as a stream starts and stops (firmware 27) */
+	DCP_AUDIO_LINK_QUERY,
 };
+
+/*
+ * Firmware 27's link data: the stream's format, which dcp_audiosrv_link()
+ * sends at body+48 in place of the element's ElementData.
+ */
+struct dcp_audio_link_format {
+	__le32 format;
+	__le32 channels;
+	__le32 sample_size;
+	__le32 rate;
+} __packed;
+
+/* Whether the link data is the stream's format (firmware 27's external role) */
+bool dcp_audiosrv_link_by_format(struct device *dev);
 
 bool dcp_audiosrv_native_link(struct device *dev);
 int dcp_audiosrv_open(struct device *dev);

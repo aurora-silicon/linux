@@ -79,7 +79,7 @@ struct brcmf_cfg80211_connect_info {u8 *req_ie,*resp_ie;int req_ie_len,resp_ie_l
 struct brcmf_cfg80211_info {struct brcmf_pub *pub;u8 extra_buf[2048];u8 ac_priority[8];struct brcmf_cfg80211_connect_info conn;};
 static struct brcmf_cfg80211_connect_info *cfg_to_conn(struct brcmf_cfg80211_info *c){return &c->conn;}
 struct sk_buff {u8 data[8192];u32 len;};
-struct brcmf_msgbuf {struct brcmf_pub *drvr;void *rx_pktids;u32 ioctl_resp_pktid,ioctl_resp_ret_len;int ioctl_resp_status;bool ctl_completed;};
+struct brcmf_msgbuf {struct brcmf_pub *drvr;void *rx_pktids;u32 ioctl_resp_pktid,ioctl_resp_ret_len;int ioctl_resp_status;bool ctl_completed;u32 ctl_stalls;};
 #define BUS_HEADER_LEN 80
 @BCDC_STRUCTS@
 static struct sk_buff packet;
@@ -116,6 +116,7 @@ static int brcmf_msgbuf_tx_ioctl(struct brcmf_pub *d,int idx,uint c,void *b,uint
  return fail?-EIO:(wme?wme_error:query_error);
 }
 static int brcmf_msgbuf_ioctl_resp_wait(struct brcmf_msgbuf *m){(void)m;return !timeout_reply;}
+static void brcmf_bus_ctl_stall(struct brcmf_bus *b,u32 n){(void)b;(void)n;}
 static struct sk_buff *brcmf_msgbuf_get_pktid(void *d,void *p,u32 n){(void)d;(void)p;(void)n;return no_skb?NULL:&packet;}
 static void brcmu_pkt_buf_free_skb(struct sk_buff *s){if(s)free_packets++;}
 static int brcmf_proto_bcdc_msg(struct brcmf_pub *d,int idx,uint c,void *b,uint l,bool set){

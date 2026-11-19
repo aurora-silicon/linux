@@ -36,6 +36,10 @@ description: >
   display crossbar is not part of the PHY resource. SuperSpeed calibration is
   supplied in banked lists so that no list spans that crossbar.
 
+  The T8142 variant adds an optional LIOA bank for DisplayPort calibration.
+  DisplayPort also requires separate bootloader-provided calibration lists
+  for that bank and the common configuration in the lpdptx region.
+
 allOf:
   - $ref: /schemas/usb/usb-switch.yaml#
   - if:
@@ -46,6 +50,7 @@ allOf:
               - apple,t8122-atcphy
               - apple,t6030-atcphy
               - apple,t6031-atcphy
+              - apple,t8142-atcphy
     then:
       properties:
         reg:
@@ -56,6 +61,7 @@ allOf:
             - description: AXI to Apple Fabric interface
             - description: USB2 PHY
             - description: USB3 PIPE interface
+            - description: Local IO address translation controls (T8142)
         reg-names:
           minItems: 1
           items:
@@ -64,6 +70,7 @@ allOf:
             - const: axi2af
             - const: usb2phy
             - const: pipehandler
+            - const: lioa
       oneOf:
         - properties:
             reg:
@@ -145,6 +152,23 @@ allOf:
       properties:
         compatible:
           contains:
+            const: apple,t8142-atcphy
+    then:
+      properties:
+        reg:
+          minItems: 5
+          maxItems: 6
+        reg-names:
+          minItems: 5
+          maxItems: 6
+    else:
+      properties:
+        apple,tunable-dp-lioa: false
+        apple,tunable-dp-common-config: false
+  - if:
+      properties:
+        compatible:
+          contains:
             const: apple,t8140-atcphy
     then:
       properties:
@@ -168,6 +192,7 @@ allOf:
               enum:
                 - apple,t8132-atcphy
                 - apple,t8140-atcphy
+                - apple,t8142-atcphy
     then:
       properties:
         reg:
@@ -182,6 +207,7 @@ allOf:
               const: apple,t8132-atcphy
     then:
       properties:
+        apple,dp-alt-mode: false
         apple,tunable-usb3-axi2af: false
         apple,tunable-usb3-lioa: false
         apple,tunable-usb3-fabric: false
@@ -296,6 +322,14 @@ properties:
       port@3:
         $ref: /schemas/graph.yaml#/properties/port
         description: Incoming endpoint from the USB4/Thunderbolt controller.
+
+  apple,dp-alt-mode:
+    type: boolean
+    description: >
+      T8132 only. The board wires this port's SuperSpeed lanes for
+      DisplayPort alternate mode, so 4-lane DP and USB3+DP run the PHY's own
+      DP transmitter instead of falling back to USB. Without it, DP on T8132
+      is only carried in USB4/Thunderbolt tunnels.
 
   apple,tunable-usb3-axi2af:
     $ref: "#/$defs/apple,tunable"
@@ -419,6 +453,18 @@ properties:
 
       Note that lane here refers to a USB RX and TX pair re-used for DisplayPort
       and not to an individual DisplayPort differential lane.
+
+  apple,tunable-dp-lioa:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      T8142 DisplayPort calibration for the lioa register region. Applied
+      after the common and lane tunables, before common configuration.
+
+  apple,tunable-dp-common-config:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      T8142 DisplayPort common configuration for the lpdptx register region,
+      applied after the LIOA list. Both lists are required for DisplayPort.
 
   apple,tunable-dp-common-pre:
     $ref: "#/$defs/apple,tunable"

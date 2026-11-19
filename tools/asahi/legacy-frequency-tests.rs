@@ -9,6 +9,11 @@ mod prelude {
 mod g17 {
     pub mod stats {
         pub struct Reader;
+        impl Reader {
+            pub fn frequency(&self) -> Option<(Option<u64>, u64)> {
+                Some((None, 1_620_000_000))
+            }
+        }
     }
 }
 #[path = "../../drivers/gpu/drm/asahi/stats.rs"]
@@ -26,4 +31,14 @@ fn firmware_order_zero_and_invalid_indices() {
     assert_eq!(snapshot.requested_frequency(4), None);
     assert_eq!(snapshot.requested_frequency(u32::MAX), None);
     assert_eq!(stats::StatsSnapshot::default().requested_frequency(0), None);
+}
+
+#[test]
+fn engine_frequency_needs_the_g17_reader() {
+    assert_eq!(stats::StatsSnapshot::default().engine_frequency(), None);
+    let snapshot = stats::StatsSnapshot {
+        g17_reader: Some(g17::stats::Reader),
+        ..Default::default()
+    };
+    assert_eq!(snapshot.engine_frequency(), Some((None, 1_620_000_000)));
 }

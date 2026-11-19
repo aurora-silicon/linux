@@ -16,7 +16,7 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--ref');p.add_argument('--source',type=Path);p.add_argument('--out',type=Path,required=True);p.add_argument('--case',action='append');a=p.parse_args()
     s=a.source.read_text() if a.source else subprocess.check_output(['git','-C',str(ROOT),'show',a.ref+':drivers/iommu/apple-dart.c'],text=True) if a.ref else (ROOT/'drivers/iommu/apple-dart.c').read_text()
     bodies={n:function(s,n) for n in NAMES};missing=[n for n,b in bodies.items() if b is None]
-    if missing and not a.case:p.error('production functions missing: '+','.join(missing))
+    if missing:p.error('production functions missing: '+','.join(missing))
     core_path=ROOT/'drivers/iommu/iommu.c';core= subprocess.check_output(['git','-C',str(ROOT),'show',a.ref+':drivers/iommu/iommu.c'],text=True) if a.ref else core_path.read_text()
     core_body=function(core,'iommu_create_device_fw_mappings')
     fixture=Path(__file__).with_name('apple-dart-fw')/'fixture.c';code=fixture.read_text().replace('/* PRODUCTION */','\n'.join(b for b in bodies.values() if b)).replace('/* CORE */',core_body)

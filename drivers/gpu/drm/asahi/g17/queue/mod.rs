@@ -85,10 +85,14 @@ impl Frontend {
 pub(crate) struct Queue<B: Backend> {
     dev: AsahiDevRef,
     context: Arc<Context>,
-    usage: Arc<crate::usage::Client>,
+    /// This queue's engine time: the union of its overlapping stages, charged to its file.
+    usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>,
     backend: Arc<B>,
     render: Option<Scheduler<B>>,
     compute: Option<Scheduler<B>>,
+    /// The watchdog allowance of each compute command, set before the first one
+    /// ([`crate::queue::Queue::set_compute_timeout`]).
+    compute_allowance_ms: u32,
     fences: FenceContexts,
     allocation_failure: Fence,
     range: Range<u64>,
@@ -127,14 +131,20 @@ impl<B: Backend> Queue<B> {
             window,
             variant,
         } = frontend;
-        let render = Some(Scheduler::new(dev, backend.clone(), Engine::Render)?);
+        let render = Some(Scheduler::new(
+            dev,
+            backend.clone(),
+            Engine::Render,
+            super::timeout::DEFAULT_ALLOWANCE_MS,
+        )?);
         Ok(Self {
             dev: dev.into(),
             context,
-            usage,
+            usage: Arc::new(crate::usage::Lane::new(usage), GFP_KERNEL)?,
             backend,
             render,
             compute: None,
+            compute_allowance_ms: super::timeout::DEFAULT_ALLOWANCE_MS,
             fences,
             allocation_failure,
             range,
@@ -158,6 +168,7 @@ impl<B: Backend> Queue<B> {
                 &self.dev,
                 self.backend.clone(),
                 Engine::Compute,
+                self.compute_allowance_ms,
             )?);
         }
         Ok(())
@@ -513,6 +524,16 @@ impl<B: Backend> Queue<B> {
 }
 
 impl<B: Backend> crate::queue::Queue for Queue<B> {
+    fn set_compute_timeout(&mut self, requested_ms: u32) -> Result<u32> {
+        // The compute scheduler takes the allowance when the first compute command creates it.
+        if self.compute.is_some() {
+            return Err(EBUSY);
+        }
+        let maximum = crate::module_parameters::compute_timeout_max_ms.value();
+        self.compute_allowance_ms = super::timeout::allowance_ms(requested_ms, maximum);
+        Ok(self.compute_allowance_ms)
+    }
+
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
         let pages = [
             super::fw::compute::ScratchRequest::new(layouts[0])?.pages(),
@@ -531,7 +552,31 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
-        let mut outputs = Outputs::new(&self.fences, syncs, input_count, &self.allocation_failure)?;
+        let output_count = syncs.len().saturating_sub(input_count);
+        super::trace::submit(0, id, self.context.id(), input_count, output_count, 0, None);
+        let mut outputs = match Outputs::new(
+            &self.fences,
+            syncs,
+            input_count,
+            &self.allocation_failure,
+        ) {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                // Allocation failure installs the queue's immutable error fence. A malformed
+                // input/output split installs nothing because no output set is well-defined.
+                let fence = (error != EINVAL).then_some(&self.allocation_failure);
+                super::trace::submit(
+                    2,
+                    id,
+                    self.context.id(),
+                    input_count,
+                    output_count,
+                    error.to_errno(),
+                    fence,
+                );
+                return Err(error);
+            }
+        };
         let result = (|| {
             if !self.backend.supports_submission() {
                 return Err(ENOTSUPP);
@@ -560,6 +605,16 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                     if *visible_completion || !visible_required)
                 && !pending[0].2.has_outputs();
             let aggregate = outputs.publish(self.context.clone(), firmware_source)?;
+            let output_fence = aggregate.fence();
+            super::trace::submit(
+                1,
+                id,
+                self.context.id(),
+                input_count,
+                output_count,
+                0,
+                Some(&output_fence),
+            );
             for (command, order, destinations) in pending {
                 let guard = guards.next().ok_or(EIO)?;
                 self.enqueue(
@@ -582,6 +637,16 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 self.backend.fail_vm(error);
             }
         }
+        let output_fence = outputs.output_fence();
+        super::trace::submit(
+            2,
+            id,
+            self.context.id(),
+            input_count,
+            output_count,
+            result.as_ref().err().map_or(0, |error| error.to_errno()),
+            output_fence.as_ref(),
+        );
         outputs.finish(result)
     }
 }

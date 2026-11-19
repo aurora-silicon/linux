@@ -530,6 +530,7 @@ static int h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *
 	init_waitqueue_head(&s->wake);
 	INIT_LIST_HEAD(&s->deferred);
 	INIT_LIST_HEAD(&s->programs);
+	INIT_LIST_HEAD(&s->held);
 	spin_lock_init(&s->stats_lock);
 	INIT_DELAYED_WORK(&s->gate_work, h16_gate_work);
 	spin_lock_init(&s->export_lock);
@@ -566,6 +567,8 @@ static int h16_fail(struct ane_h16_session *s, int error)
 		ane_h16_pending_fail_all(&s->pending, s->error);
 		wake_up_all(&s->wake);
 		s->ops->log(s->ctx, "program quarantine", (u64)-s->error, 0);
+		if (s->ops->hung)
+			s->ops->hung(s->ctx, s->error);
 	}
 	return s->error;
 }
@@ -1729,12 +1732,17 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 			    p->key.process);
 		return 0;
 	}
-	if (s->quarantined)
+	/* Kept, memory and all, until a verified power cycle (held list). */
+	if (s->quarantined) {
+		list_add_tail(&p->node, &s->held);
 		return -EIO;
+	}
 	/* TERMINATE and UNLOAD run with gating on, as without the hold. */
 	ret = h16_gate_release(s);
-	if (ret)
+	if (ret) {
+		list_add_tail(&p->node, &s->held);
 		return ret;
+	}
 	ret = ane_h16_terminate_encode(command, ANE_H16_TERMINATE_SIZE, p->key.program,
 				       p->key.process);
 	if (!ret)
@@ -1747,14 +1755,18 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 		ret = h16_send(s, ANE_FW_IO, command, ANE_H16_UNLOAD_SIZE, &reply);
 	if (!ret)
 		ret = ane_h16_id_reply(reply, ANE_H16_UNLOAD_SIZE, command);
-	if (ret)
+	if (ret) {
+		list_add_tail(&p->node, &s->held);
 		return h16_fail(s, ret);
+	}
 	s->ops->log(s->ctx, "TERMINATE and UNLOAD", p->key.program, p->key.process);
 	/* Answer the FREE of the process pool while the firmware waits for it. */
 	ret = ane_fw_transport_settle(s->transport, s->settle_ns,
 				      max(s->settle_ns, ANE_H16_SETTLE_LIMIT_NS));
-	if (ret < 0)
+	if (ret < 0) {
+		list_add_tail(&p->node, &s->held);
 		return h16_fail(s, ret);
+	}
 	/*
 	 * The firmware acknowledged TERMINATE and UNLOAD, so it no longer
 	 * reads or writes this program's memory: later programs may reuse it.
@@ -1846,6 +1858,32 @@ void ane_h16_session_restart(struct ane_h16_session *s)
 	s->error = 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_restart);
+
+/*
+ * After ane_h16_session_restart() on a quarantined session: the backend
+ * powered the engine off (every domain verified off) and booted a new
+ * firmware from the preload, so nothing reads the old firmware's memory any
+ * more. End the quarantine, and give back the memory of every program that
+ * was closed while it lasted. Open programs are replayed by the caller.
+ * Called with the session asleep.
+ */
+void ane_h16_session_recovered(struct ane_h16_session *s)
+{
+	struct ane_h16_program *p, *n;
+
+	s->quarantined = false;
+	s->pending.quarantined = false;
+	s->pending.error = 0;
+	s->error = 0;
+	list_for_each_entry_safe(p, n, &s->held, node) {
+		list_del_init(&p->node);
+		h16_give_back(s, p);
+		s->ops->log(s->ctx, "program closed while quarantined, released",
+			    p->key.program, p->key.process);
+		ane_h16_session_put(s, p);
+	}
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_recovered);
 
 /*
  * Put one program back on a firmware booted again from the preload, behind

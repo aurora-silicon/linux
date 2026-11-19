@@ -803,6 +803,40 @@ static u64 calculate_clock(struct dimension *horiz, struct dimension *vert)
 	return DIV_ROUND_CLOSEST_ULL(clock >> 16, 1000);
 }
 
+/* Is this timing the full size of the tiled display the sink reported? */
+static bool timing_is_tiled_size(const struct dcp_parse_ctx *handle)
+{
+	struct dcp_parse_ctx scan = *handle;
+	struct iterator it;
+	s64 width = -1, height = -1;
+
+	if (iterator_begin(&scan, &it, true))
+		return false;
+	for (; it.idx < it.len; it.idx++) {
+		struct dimension dim;
+		char *key = parse_string(&scan);
+		int ret;
+
+		if (IS_ERR(key))
+			return false;
+		if (!strcmp(key, "HorizontalAttributes")) {
+			ret = parse_dimension(&scan, &dim, false);
+			if (!ret)
+				width = dim.active;
+		} else if (!strcmp(key, "VerticalAttributes")) {
+			ret = parse_dimension(&scan, &dim, false);
+			if (!ret)
+				height = dim.active;
+		} else {
+			ret = skip(&scan);
+		}
+		kfree(key);
+		if (ret)
+			return false;
+	}
+	return width == handle->tiled_width && height == handle->tiled_height;
+}
+
 static int parse_mode(struct dcp_parse_ctx *handle,
 		      struct dcp_display_mode *out, s64 *score, int width_mm,
 		      int height_mm, unsigned notch_height, bool internal, bool external_sdr)
@@ -852,6 +886,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		limits_known = !ret;
 		ret = 0;
 	}
+	if (!internal && handle->tiled_width && timing_is_tiled_size(handle))
+		limits.dsc_required.count = 0;
 	ret = iterator_begin(handle, &it, true);
 	if (ret)
 		return ret;
@@ -987,8 +1023,9 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		out->vrr = dcp_refresh_range(vert.precise_sync_rate, min_vrr,
 					     max_vrr, internal && vrr_fallback,
 					     &out->min_vrr, &out->max_vrr);
-	out->needs_timestamps = out->vrr ||
-		(internal && dcp_refresh_is_promotion(vert.precise_sync_rate));
+	out->needs_timestamps = dcp_refresh_needs_deadline(vert.precise_sync_rate,
+							   out->vrr, internal,
+							   handle->internal_present_deadline);
 
 	clock = calculate_clock(&horiz, &vert);
 	if (!clock || clock > INT_MAX)
@@ -1532,6 +1569,21 @@ static int parse_panel_label(struct dcp_parse_ctx *handle, char out[14])
 	return 0;
 }
 
+/*
+ * An optional value an EDID can do without: on any error the value is skipped,
+ * the caller's default stays, and the field is noted in @defaults.
+ */
+static int parse_metadata_optional(struct dcp_parse_ctx *handle,
+				   const struct dcp_parse_ctx *at, int ret,
+				   u32 *defaults, u32 field)
+{
+	if (!ret)
+		return 0;
+	*handle = *at;
+	*defaults |= field;
+	return skip(handle);
+}
+
 static int parse_metadata_product(struct dcp_parse_ctx *handle,
 				  struct dcp_display_metadata *out, bool panel)
 {
@@ -1543,11 +1595,13 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle,
 	if (ret)
 		return ret;
 	for (; it.idx < it.len; it.idx++) {
+		struct dcp_parse_ctx at;
 		char key[64];
 
 		ret = parse_metadata_string(handle, key, sizeof(key));
 		if (ret)
 			return ret;
+		at = *handle;
 		if (!strcmp(key, "ManufacturerID")) {
 			if (seen & 1)
 				return -EINVAL;
@@ -1558,8 +1612,11 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle,
 			if (seen & 2)
 				return -EINVAL;
 			seen |= 2;
-			ret = panel ? parse_panel_label(handle, out->name) :
-				parse_metadata_string(handle, out->name, sizeof(out->name));
+			/* Longer than a descriptor holds: keep its first 13 characters. */
+			ret = parse_panel_label(handle, out->name);
+			if (!panel)
+				ret = parse_metadata_optional(handle, &at, ret, &out->defaults,
+							      DCP_METADATA_DEFAULT_NAME);
 		} else if (!strcmp(key, "ProductID")) {
 			if (seen & 4)
 				return -EINVAL;
@@ -1569,14 +1626,23 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle,
 			if (seen & 8)
 				return -EINVAL;
 			seen |= 8;
+			/* 255: the year is a model year (EDID 1.4). */
 			ret = panel ? skip(handle) :
-				parse_metadata_number(handle, &out->week, 0, 53);
+				parse_metadata_number(handle, &out->week, 0, 255);
+			if (!panel && !ret && out->week > 53 && out->week != 255)
+				ret = -EINVAL;
+			if (!panel)
+				ret = parse_metadata_optional(handle, &at, ret, &out->defaults,
+							      DCP_METADATA_DEFAULT_DATE);
 		} else if (!strcmp(key, "YearOfManufacture")) {
 			if (seen & 16)
 				return -EINVAL;
 			seen |= 16;
 			ret = panel ? skip(handle) :
 				parse_metadata_number(handle, &out->year, 1990, 2245);
+			if (!panel)
+				ret = parse_metadata_optional(handle, &at, ret, &out->defaults,
+							      DCP_METADATA_DEFAULT_DATE);
 		} else if (!strcmp(key, "SerialNumber")) {
 			if (seen & 64)
 				return -EINVAL;
@@ -1589,6 +1655,9 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle,
 			ret = panel ? parse_panel_label(handle, out->serial_text) :
 				parse_metadata_string(handle, out->serial_text,
 						      sizeof(out->serial_text));
+			if (!panel)
+				ret = parse_metadata_optional(handle, &at, ret, &out->defaults,
+							      DCP_METADATA_DEFAULT_SERIAL);
 		} else if (!strcmp(key, "LegacyManufacturerID")) {
 			if (seen & 32)
 				return -EINVAL;
@@ -1600,14 +1669,26 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle,
 		if (ret)
 			return ret;
 	}
-	if (panel && !(seen & 1) && (seen & 32)) {
+	if (!(seen & 1) && (seen & 32)) {
 		for (unsigned int i = 0; i < 3; i++)
 			out->manufacturer[i] = '@' + ((legacy >> (10 - 5 * i)) & 31);
 		seen |= 1;
 	}
-	if ((seen & (panel ? 5 : 31)) != (panel ? 5 : 31) ||
-	    strlen(out->manufacturer) != 3)
+	/*
+	 * The identity is the manufacturer and product code. A sink's name,
+	 * serial and date are optional, as in its own EDID.
+	 */
+	if ((seen & 5) != 5 || strlen(out->manufacturer) != 3)
 		return -EINVAL;
+	if (!panel) {
+		if (!(seen & 2) || !out->name[0])
+			out->defaults |= DCP_METADATA_DEFAULT_NAME;
+		if ((seen & 24) != 24 || (out->defaults & DCP_METADATA_DEFAULT_DATE)) {
+			out->week = 0;
+			out->year = 0;
+			out->defaults |= DCP_METADATA_DEFAULT_DATE;
+		}
+	}
 	for (unsigned int i = 0; i < 3; i++)
 		if (out->manufacturer[i] < 'A' || out->manufacturer[i] > 'Z')
 			return -EINVAL;
@@ -1677,6 +1758,12 @@ static int parse_metadata_capability(struct dcp_parse_ctx *handle, bool *out)
 	return skip(handle);
 }
 
+/*
+ * A sink's DisplayAttributes. Only its identity (ProductAttributes) is
+ * required: a missing or out-of-range size or colour description is noted in
+ * defaults and left to the EDID's own defaults, as a sink's EDID may leave
+ * them undefined too.
+ */
 int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out)
 {
 	struct dcp_display_metadata parsed = {};
@@ -1687,31 +1774,41 @@ int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_meta
 	if (ret)
 		return ret;
 	for (; it.idx < it.len; it.idx++) {
+		struct dcp_parse_ctx at;
 		char key[64];
 
 		ret = parse_metadata_string(handle, key, sizeof(key));
 		if (ret)
 			return ret;
+		at = *handle;
 		if (!strcmp(key, "MaxHorizontalImageSize")) {
 			if (seen & 1)
 				return -EINVAL;
 			seen |= 1;
 			ret = parse_metadata_number(handle, &parsed.width_cm, 1, 255);
+			ret = parse_metadata_optional(handle, &at, ret, &parsed.defaults,
+						      DCP_METADATA_DEFAULT_SIZE);
 		} else if (!strcmp(key, "MaxVerticalImageSize")) {
 			if (seen & 2)
 				return -EINVAL;
 			seen |= 2;
 			ret = parse_metadata_number(handle, &parsed.height_cm, 1, 255);
+			ret = parse_metadata_optional(handle, &at, ret, &parsed.defaults,
+						      DCP_METADATA_DEFAULT_SIZE);
 		} else if (!strcmp(key, "Chromaticity")) {
 			if (seen & 4)
 				return -EINVAL;
 			seen |= 4;
 			ret = parse_metadata_chromaticity(handle, &parsed);
+			ret = parse_metadata_optional(handle, &at, ret, &parsed.defaults,
+						      DCP_METADATA_DEFAULT_COLOR);
 		} else if (!strcmp(key, "DefaultWhitePoint")) {
 			if (seen & 8)
 				return -EINVAL;
 			seen |= 8;
 			ret = parse_metadata_point(handle, parsed.white, &parsed.gamma, false);
+			ret = parse_metadata_optional(handle, &at, ret, &parsed.defaults,
+						      DCP_METADATA_DEFAULT_COLOR);
 		} else if (!strcmp(key, "ProductAttributes")) {
 			if (seen & 16)
 				return -EINVAL;
@@ -1731,8 +1828,22 @@ int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_meta
 		if (ret)
 			return ret;
 	}
-	if (seen != 31)
+	if (!(seen & 16))
 		return -EINVAL;
+	/* An image size is both dimensions or none. */
+	if ((seen & 3) != 3 || !parsed.width_cm || !parsed.height_cm ||
+	    (parsed.defaults & DCP_METADATA_DEFAULT_SIZE)) {
+		parsed.width_cm = 0;
+		parsed.height_cm = 0;
+		parsed.defaults |= DCP_METADATA_DEFAULT_SIZE;
+	}
+	/* Primaries and white point are one description: both or neither. */
+	if ((seen & 12) != 12 || (parsed.defaults & DCP_METADATA_DEFAULT_COLOR)) {
+		memset(parsed.chromaticity, 0, sizeof(parsed.chromaticity));
+		memset(parsed.white, 0, sizeof(parsed.white));
+		parsed.gamma = 0;
+		parsed.defaults |= DCP_METADATA_DEFAULT_COLOR;
+	}
 	*out = parsed;
 	return 0;
 }

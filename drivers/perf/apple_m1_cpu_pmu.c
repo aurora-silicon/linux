@@ -992,6 +992,20 @@ static int t6050_pmu_init(struct arm_pmu *cpu_pmu)
 	return 0;
 }
 
+/*
+ * The M5 (T8142) cores count as the M5 Pro and Max cores do: XNU's event
+ * table is the same in both kernels, and macOS's event database for the
+ * M5 lists the same counter classes, so take T6050's tables.
+ */
+static int t8142_pmu_init(struct arm_pmu *cpu_pmu)
+{
+	int ret = t6050_pmu_init(cpu_pmu);
+
+	if (!ret)
+		cpu_pmu->name = "apple_t8142_pmu";
+	return ret;
+}
+
 static int m4_pmu_t8140_init(struct arm_pmu *cpu_pmu)
 {
 	cpu_pmu->name = "apple_t8140_pmu";
@@ -1002,6 +1016,7 @@ static const struct of_device_id m1_pmu_of_device_ids[] = {
 	{ .compatible = "apple,t8140-pmu",	.data = m4_pmu_t8140_init, },
 	{ .compatible = "apple,t6040-pmu",	.data = m4_pmu_t6040_init, },
 	{ .compatible = "apple,t6050-pmu",	.data = t6050_pmu_init, },
+	{ .compatible = "apple,t8142-pmu",	.data = t8142_pmu_init, },
 	{ .compatible = "apple,avalanche-pmu",	.data = m2_pmu_avalanche_init, },
 	{ .compatible = "apple,blizzard-pmu",	.data = m2_pmu_blizzard_init, },
 	{ .compatible = "apple,icestorm-pmu",	.data = m1_pmu_ice_init, },

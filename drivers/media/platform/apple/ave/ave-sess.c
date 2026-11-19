@@ -169,21 +169,28 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	/*
 	 * HEVC Main 10 encodes P010 input; Main encodes NV12. The firmware
 	 * takes 16-bit samples for Main 10 (macOS converts 8-bit input to that
-	 * first), so other pairings are refused rather than converted.
+	 * first), so other pairings are refused rather than converted. S_FMT
+	 * sets the profile from the raw format, so only a profile set after it
+	 * gets here.
 	 */
 	if ((p->codec == AVE_CODEC_HEVC &&
 	     ctx->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10) !=
-	    (p->sample_bytes == 2))
+	    (p->sample_bytes == 2)) {
+		dev_info_ratelimited(ctx->ave->dev, "%s%s does not take %s input\n",
+				     p->codec == AVE_CODEC_HEVC ? "HEVC " : "H.264",
+				     p->codec != AVE_CODEC_HEVC ? "" :
+				     p->sample_bytes == 2 ? "Main" : "Main 10",
+				     p->sample_bytes == 2 ? "10-bit P010" : "8-bit NV12");
 		return -EINVAL;
+	}
 	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->sample_bytes != 1)
 		return -EOPNOTSUPP;
 	/*
-	 * The 6070 path is qualified for 8-bit H.264 (low delay and one B per
-	 * P) with frame widths in whole macroblocks; HEVC and wider-than-coded
-	 * widths are not yet.
+	 * The 6070 path supports 8-bit H.264 and HEVC Main, including one B per
+	 * P, with frame widths in whole macroblocks. Wider-than-coded widths are
+	 * not yet supported.
 	 */
-	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 &&
-	    (p->codec != AVE_CODEC_H264 || p->width % 16))
+	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->width % 16)
 		return -EOPNOTSUPP;
 	p->bit_depth = 8;
 	if (p->sample_bytes == 2) {
@@ -261,8 +268,13 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->coded_cap = max_t(u32, p->coded_cap, AVE_CODED_MIN);
 	if (ctx->ave->layout->counted &&
 	    (p->fps_num != 30ULL * p->fps_den ||
-	     (!p->bframes && (p->codec == AVE_CODEC_HEVC || (!baseline && !p->intra_only)))))
+	     (!p->bframes && (p->codec == AVE_CODEC_HEVC || (!baseline && !p->intra_only))))) {
+		dev_info(ctx->ave->dev,
+			 "%s layout: only 30 fps with 3 B-frames is qualified (asked %u/%u fps, %s B-frames)\n",
+			 ctx->ave->layout->name, p->fps_num, p->fps_den,
+			 p->bframes ? "with" : "no");
 		return -EOPNOTSUPP;
+	}
 	return 0;
 }
 

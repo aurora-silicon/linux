@@ -70,7 +70,7 @@ allocating session buffers or acquiring runtime power.
 Command sizes, offsets, descriptor groups, constants, Process subtype and
 buffer sizes are selected by the verified TEXT CRC, independently of the
 SoC match data. ``69c54454`` and ``68d5f9f6`` select the 9003.78.0 layout and
-``87279429`` the 26A428 one.
+``87279429`` (T6050) and ``8a3784bd`` (T8142) the 26A428 one.
 There is no fallback layout and zero is not a wildcard CRC. Hardware boot
 qualification is a separate requirement; presenting the J700 CRC on T6041
 does not authorize the J700 boot sequence.
@@ -86,6 +86,14 @@ buffer; an HEVC slice header comes back in the slot's 16 KiB buffer, the only
 per-slot buffer its Process command carries, and must start with an Annex B
 start code. The 26A428 capture and the J700 capture used different OS
 versions; a SoC compatible cannot identify a command ABI.
+
+The M5 (T8142) with a macOS 27.0 stub gets the same firmware version
+(AppleAVE2FW 9013.45.1) built for its chip: TEXT 0x154000, DATA 0x12c000,
+TEXT CRC ``8a3784bd``. AppleAVE2 and the firmware share one device table, in
+which T8142 is device 27; the driver boots it and names it in the handshake
+as device 27, device type 27, and clears the SVE idle word at mailbox +0x118
+as on T6050 (both chips use the same SVE register block). Its start has not
+been traced under macOS.
 
 The public API continues to offer 8-bit NV12 and VBR/CBR. CQ and Main10
 layout facts are exercised by host tests without exposing new V4L2 modes.

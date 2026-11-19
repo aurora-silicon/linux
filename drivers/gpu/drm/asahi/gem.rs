@@ -21,6 +21,7 @@ use kernel::{
         }, //
     },
     error::Result,
+    mm::Mm,
     new_mutex,
     prelude::*,
     sync::aref::ARef,
@@ -30,6 +31,8 @@ use kernel::{
 
 use core::ops::Range;
 use core::sync::atomic::{
+    AtomicBool,
+    AtomicI64,
     AtomicU64,
     AtomicUsize,
     Ordering, //
@@ -63,6 +66,13 @@ pub(crate) struct AsahiObject {
     kernel_mappings: AtomicU64,
     /// Memory accounting and process attribution of the held backing.
     charge: memacct::Charge,
+    /// Userspace asked to keep the backing resident (DRM_IOCTL_ASAHI_GEM_RESIDENCY): idle
+    /// reclaim of the object's VM releases it after the VM's other objects, and only if those
+    /// did not meet the scan target. Changed and read under the object's reservation.
+    keep_resident: AtomicBool,
+    /// The pinned pages of a user-memory object (DRM_IOCTL_ASAHI_GEM_USERPTR), its backing.
+    /// The shmem layer unmaps them from the device before this is dropped.
+    user_memory: Option<UserPages>,
     /// Serializes overlapping timestamp writes through every binding of this BO.
     #[pin]
     pub(crate) timestamp_lock: Mutex<()>,
@@ -113,7 +123,40 @@ pub(crate) fn set_mapping_held(gem: &Object, held: bool) {
 
 /// Takes the SG table of `gem`, which holds its pages for the device, and marks the
 /// object held (see [`set_mapping_held`]).
+///
+/// For mappings the driver creates for itself or the firmware (kernel aliases, timestamp
+/// buffers, firmware structures), which user-memory objects never back: those are refused.
 pub(crate) fn held_sg_table<'a>(
+    gem: &'a Object,
+    dev: &'a kernel::device::Device<kernel::device::Bound>,
+) -> Result<shmem::SGTable<'a, AsahiObject>> {
+    if gem.user_memory.is_some() {
+        return Err(EINVAL);
+    }
+    mapped_sg_table(gem, dev)
+}
+
+/// Takes the SG table of `gem` for a user VM binding with `prot`, as [`held_sg_table`].
+///
+/// A read-only user-memory object takes only GPU read-only bindings (`EACCES` otherwise): its
+/// pages may be another file's page cache, which the caller may not write.
+pub(crate) fn held_user_sg_table<'a>(
+    gem: &'a Object,
+    dev: &'a kernel::device::Device<kernel::device::Bound>,
+    prot: mmu::Prot,
+) -> Result<shmem::SGTable<'a, AsahiObject>> {
+    if gem.user_memory.as_ref().is_some_and(|user| !user.writable)
+        && prot != mmu::PROT_GPU_SHARED_RO
+    {
+        return Err(EACCES);
+    }
+    mapped_sg_table(gem, dev)
+}
+
+/// Takes the SG table of `gem` for a device mapping that [`held_sg_table`] or
+/// [`held_user_sg_table`] already admitted (the caller holds a lease from one of them, or the
+/// mapping exists).
+pub(crate) fn mapped_sg_table<'a>(
     gem: &'a Object,
     dev: &'a kernel::device::Device<kernel::device::Bound>,
 ) -> Result<shmem::SGTable<'a, AsahiObject>> {
@@ -232,6 +275,7 @@ pub(crate) struct AsahiObjConfig {
     exportable: bool,
     kernel: bool,
     charge: memacct::Charge,
+    user_memory: Option<UserPages>,
 }
 
 /// Create a new kernel-owned GEM object.
@@ -295,6 +339,7 @@ fn new_kernel_object_mapped(
             exportable: false,
             kernel: true,
             charge,
+            user_memory: None,
         },
     )?;
 
@@ -335,11 +380,213 @@ pub(crate) fn new_object(
             exportable: parent_object.is_none(),
             kernel: false,
             charge: memacct::Charge::user_current(commit),
+            user_memory: None,
         },
     )?;
 
     mod_pr_debug!("AsahiObject new user object: id={}\n", gem.id);
     Ok(gem)
+}
+
+/// Create a user-memory object over `pages`, the caller's memory pinned by [`UserPages::pin`].
+///
+/// `commit` is the admission of the pages' size for the creating client. The pages count as held
+/// by the GPU for the object's whole life, but are not attributed to the process again: they are
+/// already part of its memory (anonymous memory or page cache it maps). The object cannot be
+/// exported, CPU-mapped through the driver, vmapped, purged or idle-reclaimed.
+pub(crate) fn new_user_memory_object(
+    dev: &AsahiDrmDevice,
+    parent: &kernel::device::Device<kernel::device::Bound>,
+    pages: UserPages,
+    flags: u32,
+    parent_object: Option<&shmem::Object<AsahiObject>>,
+    commit: memacct::Commit,
+) -> Result<ARef<Object>> {
+    if (flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0) != parent_object.is_some()
+    {
+        return Err(EINVAL);
+    }
+    let writable = pages.writable;
+    // The page array is a heap allocation: moving `pages` into the object leaves it in place.
+    let array = core::ptr::slice_from_raw_parts(pages.pages.as_ptr(), pages.pages.len());
+    // SAFETY:
+    // - `array` is the array of `pages`, which the object's data holds from its initialization
+    //   on: the array stays allocated and its pages pinned until `pages` is dropped with that
+    //   data.
+    // - Coherent access. The object is only ever mapped by user VM binds
+    //   (`held_user_sg_table()`; `held_sg_table()` refuses it for every mapping the driver makes
+    //   for itself or for the firmware), and only on the GPUs of `File::supports_user_memory()`,
+    //   where a user VM bind is a set of GPU-only entries (`mmu::PROT_GPU_SHARED_*`) of the VM's
+    //   page tables at the DMA addresses of the pages. The GPU reads and writes the pages
+    //   through those entries and in no other way. This driver depends on such accesses being
+    //   coherent with the CPU caches for its ordinary objects already: an object created with
+    //   DRM_ASAHI_GEM_WRITEBACK is mapped cacheable into its process, which stores to it and
+    //   loads from it while the GPU uses it through entries of the same kind, the driver can do
+    //   no cache maintenance for those accesses, and the UAPI has no call for it. Whether the
+    //   device is marked DMA-coherent does not enter into it: where it is not, the DMA layer
+    //   would clean and invalidate CPU caches when it maps and unmaps, which is what the
+    //   object's mapping skips.
+    let gem = unsafe {
+        shmem::Object::<AsahiObject>::new_external(
+            dev,
+            parent,
+            array,
+            writable,
+            shmem::ObjectConfig::<AsahiObject> {
+                parent_resv_obj: parent_object,
+                ..Default::default()
+            },
+            AsahiObjConfig {
+                flags,
+                exportable: false,
+                kernel: false,
+                charge: memacct::Charge::user(commit, None),
+                user_memory: Some(pages),
+            },
+        )
+    }?;
+    gem.charge.set_held(true);
+    mod_pr_debug!("AsahiObject new user-memory object: id={}\n", gem.id);
+    Ok(gem)
+}
+
+/// Pages of the calling process pinned as the backing of a user-memory object, and counted in its
+/// mm's `pinned_vm` against RLIMIT_MEMLOCK.
+pub(crate) struct UserPages {
+    pages: KVVec<*mut kernel::bindings::page>,
+    writable: bool,
+    /// The mm whose `pinned_vm` counts the pages; it may outlive the address space.
+    mm: ARef<Mm>,
+    /// Pages counted in `pinned_vm`: all of the range, including any not pinned yet.
+    counted: i64,
+}
+
+// SAFETY: The pinned pages may be released from any thread; the mm reference is thread-safe.
+unsafe impl Send for UserPages {}
+// SAFETY: Shared access only reads the array.
+unsafe impl Sync for UserPages {}
+
+/// Pages pinned per `pin_user_pages_fast()` call.
+const PIN_CHUNK: usize = 16384;
+
+impl UserPages {
+    /// Pins the `size` bytes at `addr` in the calling process, for device writes as well if
+    /// `writable`. Both must be multiples of the page size, and `size` non-zero.
+    ///
+    /// All of the range is pinned, long-term, or none of it. Fails with `EFAULT` when a page cannot
+    /// be pinned: unmapped, a device or PFN mapping, or a writable pin of a mapping that is not
+    /// writable or whose filesystem tracks writes (`FOLL_LONGTERM` refuses those). Fails with
+    /// `ENOMEM` when the pages would take the process past RLIMIT_MEMLOCK without CAP_IPC_LOCK,
+    /// counting every page pinned this way or by other long-term pinners.
+    ///
+    /// Anonymous pages pinned here stay with this process across fork(): the child gets copies.
+    /// Pages unmapped by the process stay pinned, and backing the object, until it is freed.
+    pub(crate) fn pin(addr: usize, size: usize, writable: bool) -> Result<Self> {
+        let page_size = kernel::page::PAGE_SIZE;
+        if size == 0 || (addr | size) & (page_size - 1) != 0 {
+            return Err(EINVAL);
+        }
+        addr.checked_add(size).ok_or(EFAULT)?;
+        let count = size / page_size;
+        let mm: ARef<Mm> = kernel::current!()
+            .mm()
+            .map(|mm| ARef::from(&**mm))
+            .ok_or(EFAULT)?;
+        let pinned_vm = Self::pinned_vm(&mm);
+        let added = i64::try_from(count).map_err(|_| ENOMEM)?;
+        let total = pinned_vm
+            .fetch_add(added, Ordering::AcqRel)
+            .saturating_add(added);
+        if !memlock_allows(total, memlock_limit_pages()) {
+            // SAFETY: `capable()` has no preconditions.
+            if !unsafe { kernel::bindings::capable(kernel::bindings::CAP_IPC_LOCK as i32) } {
+                pinned_vm.fetch_sub(added, Ordering::AcqRel);
+                return Err(ENOMEM);
+            }
+        }
+        // From here on, dropping `this` unpins what it holds and uncounts all `count` pages.
+        let mut this = Self {
+            pages: KVVec::new(),
+            writable,
+            mm,
+            counted: added,
+        };
+        this.pages.reserve(count, GFP_KERNEL)?;
+        let mut flags = kernel::bindings::FOLL_LONGTERM;
+        if writable {
+            flags |= kernel::bindings::FOLL_WRITE;
+        }
+        while this.pages.len() < count {
+            let done = this.pages.len();
+            let chunk = (count - done).min(PIN_CHUNK);
+            // SAFETY: The array has room for `count` entries, of which `done` are in use; the
+            // call fills at most `chunk` more.
+            let ret = unsafe {
+                kernel::bindings::pin_user_pages_fast(
+                    (addr + done * page_size) as _,
+                    chunk as _,
+                    flags,
+                    this.pages.as_mut_ptr().add(done),
+                )
+            };
+            if ret <= 0 {
+                return Err(if ret < 0 {
+                    Error::from_errno(ret)
+                } else {
+                    EFAULT
+                });
+            }
+            let ret = (ret as usize).min(chunk);
+            // SAFETY: The call stored `ret` valid page pointers after the first `done`.
+            unsafe { this.pages.inc_len(ret) };
+        }
+        Ok(this)
+    }
+
+    fn pinned_vm(mm: &Mm) -> &AtomicI64 {
+        // SAFETY: `pinned_vm` is an aligned atomic64 of the live mm, which the kernel only changes
+        // atomically.
+        unsafe {
+            AtomicI64::from_ptr(core::ptr::addr_of_mut!(
+                (*mm.as_raw()).__bindgen_anon_1.pinned_vm.counter
+            ))
+        }
+    }
+}
+
+impl Drop for UserPages {
+    fn drop(&mut self) {
+        if !self.pages.is_empty() {
+            // SAFETY: The array holds pages pinned by `pin_user_pages_fast()` and not yet
+            // unpinned. Pages the device may have written are marked dirty.
+            unsafe {
+                kernel::bindings::unpin_user_pages_dirty_lock(
+                    self.pages.as_mut_ptr(),
+                    self.pages.len() as _,
+                    self.writable,
+                )
+            };
+        }
+        Self::pinned_vm(&self.mm).fetch_sub(self.counted, Ordering::AcqRel);
+    }
+}
+
+/// RLIMIT_MEMLOCK of the calling process, in pages.
+fn memlock_limit_pages() -> u64 {
+    let task = kernel::current!().as_ptr();
+    // SAFETY: The current task and its signal structure are live; the limit is read once, as
+    // `rlimit()` does.
+    let bytes = unsafe {
+        core::ptr::read_volatile(core::ptr::addr_of!(
+            (*(*task).signal).rlim[kernel::bindings::RLIMIT_MEMLOCK as usize].rlim_cur
+        ))
+    };
+    (bytes >> kernel::page::PAGE_SHIFT) as u64
+}
+
+/// Whether `pinned` pages stay within a memlock limit of `limit` pages.
+fn memlock_allows(pinned: i64, limit: u64) -> bool {
+    u64::try_from(pinned).is_ok_and(|pinned| pinned <= limit)
 }
 
 #[vtable]
@@ -360,7 +607,9 @@ impl DriverObject for AsahiObject {
             exportable: args.exportable,
             kernel: args.kernel,
             kernel_mappings: AtomicU64::new(0),
+            keep_resident: AtomicBool::new(false),
             charge: args.charge,
+            user_memory: args.user_memory,
             timestamp_lock <- new_mutex!((), "Asahi timestamp stores"),
         })
     }
@@ -376,6 +625,7 @@ impl DriverObject for AsahiObject {
             exportable: true,
             kernel: false,
             charge: memacct::Charge::none(),
+            user_memory: None,
         })
     }
 
@@ -442,7 +692,25 @@ impl AsahiObject {
     }
 
     pub(crate) fn idle_reclaim_candidate(&self) -> bool {
-        !self.kernel && !self.exportable && self.kernel_mappings.load(Ordering::Acquire) == 0
+        !self.kernel
+            && !self.exportable
+            && self.user_memory.is_none()
+            && self.kernel_mappings.load(Ordering::Acquire) == 0
+    }
+
+    /// Whether userspace asked to keep this object's backing resident. Idle reclaim releases
+    /// the backing of such an object after the VM's other objects, and only if those did not
+    /// meet the scan target. Purge of contents userspace advised away does not look at this:
+    /// the advice says the contents are not needed.
+    ///
+    /// The caller holds the object's reservation.
+    pub(crate) fn keep_resident(&self) -> bool {
+        self.keep_resident.load(Ordering::Relaxed)
+    }
+
+    /// Whether this object is backed by the creating process's own memory.
+    pub(crate) fn is_user_memory(&self) -> bool {
+        self.user_memory.is_some()
     }
 }
 
@@ -466,10 +734,35 @@ pub(crate) fn prepare_new_object(
 /// Purge advice for a VM-private, non-exportable object. Returns whether the
 /// contents are retained (0 once purged).
 pub(crate) fn madvise(gem: &Object, dontneed: bool) -> Result<u32> {
-    if gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE == 0 || gem.exportable {
+    if gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE == 0
+        || gem.exportable
+        || gem.user_memory.is_some()
+    {
         return Err(EINVAL);
     }
     Ok(u32::from(gem.madvise(i32::from(dontneed))))
+}
+
+/// Keep (or stop keeping) the backing of a user object resident: once this returns, idle reclaim
+/// treats the object as kept (released after the VM's other objects, where those did not meet
+/// the scan target) or as any other. This is an order among the objects idle reclaim may
+/// release, not an exemption. Backing already released stays released until the VM's next job
+/// or binding restores it. Kernel objects are refused.
+pub(crate) fn set_keep_resident(gem: &Object, keep: bool) -> Result {
+    if gem.kernel {
+        return Err(EINVAL);
+    }
+    // SAFETY: A live object's reservation pointer is set at creation and never changes.
+    let resv = unsafe { (*gem.as_raw()).resv };
+    // SAFETY: The reservation of a live object. Idle reclaim tests the flag while it holds the
+    // reservation of the object's VM, which a VM-private object shares, so after the unlock no
+    // reclaim pass can still act on the old value; other objects are never reclaimed.
+    unsafe { kernel::bindings::dma_resv_lock(resv, core::ptr::null_mut()) };
+    gem.keep_resident.store(keep, Ordering::Relaxed);
+    gem.charge.set_kept(keep);
+    // SAFETY: Locked above.
+    unsafe { kernel::bindings::dma_resv_unlock(resv) };
+    Ok(())
 }
 
 /// Large user BOs may release clean page cache but never swap out the rest of the
@@ -490,6 +783,158 @@ mod allocation_policy_tests {
         assert!(user_pages_bounded_reclaim(256 * 1024 * 1024, true));
         assert!(user_pages_bounded_reclaim(3_257_113_344, true));
         assert!(!user_pages_bounded_reclaim(3_257_113_344, false));
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_gem_user_memory)]
+mod user_memory_tests {
+    use super::*;
+    use kernel::{
+        bindings,
+        page::PAGE_SIZE,
+        uaccess::{UserPtr, UserSlice},
+    };
+
+    const PROT_READ: u64 = 1;
+    const PROT_WRITE: u64 = 2;
+    const MAP_PRIVATE: u64 = 2;
+    const MAP_ANONYMOUS: u64 = 0x20;
+
+    /// Maps `len` bytes of anonymous memory into the test's user address space.
+    fn map(len: usize, prot: u64) -> Result<usize> {
+        // SAFETY: Called on a KUnit test thread. KUnit attaches a user mm for the test and
+        // removes the mapping with it when the test ends.
+        let addr = unsafe {
+            bindings::kunit_vm_mmap(
+                bindings::kunit_get_current_test(),
+                core::ptr::null_mut(),
+                0,
+                len as _,
+                prot as _,
+                (MAP_PRIVATE | MAP_ANONYMOUS) as _,
+                0,
+            )
+        } as usize;
+        if addr == 0 || addr > usize::MAX - 4095 {
+            return Err(ENOMEM);
+        }
+        Ok(addr)
+    }
+
+    fn pinned_vm() -> Result<i64> {
+        let mm: ARef<Mm> = kernel::current!()
+            .mm()
+            .map(|mm| ARef::from(&**mm))
+            .ok_or(EINVAL)?;
+        Ok(UserPages::pinned_vm(&mm).load(Ordering::Acquire))
+    }
+
+    fn read_pinned(pages: &UserPages, index: usize, offset: usize) -> Result<u32> {
+        let page = *pages.pages.get(index).ok_or(EINVAL)?;
+        // SAFETY: The page is pinned while `pages` lives; the word is inside it.
+        Ok(unsafe {
+            let p = bindings::kmap_local_page(page);
+            let value = core::ptr::read_volatile(p.cast::<u8>().add(offset).cast::<u32>());
+            bindings::kunmap_local(p);
+            value
+        })
+    }
+
+    #[test]
+    fn memlock_limit_policy() {
+        assert!(memlock_allows(0, 0));
+        assert!(memlock_allows(512, 512));
+        assert!(!memlock_allows(513, 512));
+        assert!(!memlock_allows(-1, 512));
+        assert!(memlock_allows(i64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn pins_anonymous_memory() -> Result {
+        let addr = map(4 * PAGE_SIZE, PROT_READ | PROT_WRITE)?;
+        let before = pinned_vm()?;
+        let pages = UserPages::pin(addr, 4 * PAGE_SIZE, true)?;
+        assert_eq!(pages.pages.len(), 4);
+        assert_eq!(pinned_vm()?, before + 4);
+        // CPU writes through the caller's mapping land in the pinned pages.
+        UserSlice::new(UserPtr::from_addr(addr + PAGE_SIZE + 8), 4)
+            .writer()
+            .write_slice(&0x1234_5678u32.to_ne_bytes())?;
+        assert_eq!(read_pinned(&pages, 1, 8)?, 0x1234_5678);
+        drop(pages);
+        assert_eq!(pinned_vm()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn bad_ranges_pin_nothing() -> Result {
+        let addr = map(3 * PAGE_SIZE, PROT_READ | PROT_WRITE)?;
+        // SAFETY: Unmaps the last page of the test's own mapping.
+        assert_eq!(
+            unsafe { bindings::vm_munmap((addr + 2 * PAGE_SIZE) as _, PAGE_SIZE) },
+            0
+        );
+        let before = pinned_vm()?;
+        assert_eq!(
+            UserPages::pin(addr + 1, PAGE_SIZE, true).err(),
+            Some(EINVAL)
+        );
+        assert_eq!(UserPages::pin(addr, 0, true).err(), Some(EINVAL));
+        assert_eq!(
+            UserPages::pin(addr, PAGE_SIZE + 1, true).err(),
+            Some(EINVAL)
+        );
+        // Two pages pin before the hole: those are unpinned again.
+        assert_eq!(
+            UserPages::pin(addr, 3 * PAGE_SIZE, true).err(),
+            Some(EFAULT)
+        );
+        assert_eq!(
+            UserPages::pin(addr + 2 * PAGE_SIZE, PAGE_SIZE, false).err(),
+            Some(EFAULT)
+        );
+        let top = usize::MAX & !(PAGE_SIZE - 1);
+        assert_eq!(
+            UserPages::pin(top, 2 * PAGE_SIZE, false).err(),
+            Some(EFAULT)
+        );
+        assert_eq!(pinned_vm()?, before);
+        // What remains of the mapping still pins.
+        drop(UserPages::pin(addr, 2 * PAGE_SIZE, true)?);
+        assert_eq!(pinned_vm()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_mappings_pin_read_only() -> Result {
+        let addr = map(2 * PAGE_SIZE, PROT_READ)?;
+        let before = pinned_vm()?;
+        assert_eq!(
+            UserPages::pin(addr, 2 * PAGE_SIZE, true).err(),
+            Some(EFAULT)
+        );
+        assert_eq!(pinned_vm()?, before);
+        let pages = UserPages::pin(addr, 2 * PAGE_SIZE, false)?;
+        assert_eq!(pages.pages.len(), 2);
+        assert!(!pages.writable);
+        assert_eq!(pinned_vm()?, before + 2);
+        drop(pages);
+        assert_eq!(pinned_vm()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn pages_outlive_the_mapping() -> Result {
+        let addr = map(PAGE_SIZE, PROT_READ | PROT_WRITE)?;
+        UserSlice::new(UserPtr::from_addr(addr + 16), 4)
+            .writer()
+            .write_slice(&0xa5a5_5a5au32.to_ne_bytes())?;
+        let pages = UserPages::pin(addr, PAGE_SIZE, true)?;
+        // SAFETY: Unmaps the test's own mapping; the pinned page stays allocated.
+        assert_eq!(unsafe { bindings::vm_munmap(addr as _, PAGE_SIZE) }, 0);
+        assert_eq!(read_pinned(&pages, 0, 16)?, 0xa5a5_5a5a);
+        drop(pages);
+        Ok(())
     }
 }
 

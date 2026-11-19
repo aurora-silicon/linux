@@ -28,6 +28,8 @@ struct dcp_parse_ctx {
 	bool ambiguous_180hz;
 	/* Desktop 26.6 uses zero placeholders for an unreported VRR range. */
 	bool zero_vrr_range_fallback;
+	/* Desktop 26.6 internal panels take a deadline at every timing. */
+	bool internal_present_deadline;
 	/*
 	 * A desktop 26.x external processor: read the sink timing keys that
 	 * describe the preferred timing for the firmware-derived EDID, without
@@ -44,6 +46,12 @@ struct dcp_parse_ctx {
 	 * as needing DSC itself, so such an element is usable for PQ.
 	 */
 	bool pq_dsc;
+	/*
+	 * Size of the tiled display the sink reported (0 when untiled). Its
+	 * full-size timing needs DSC, which DCP runs itself, so that timing
+	 * keeps its DSC-required color modes.
+	 */
+	u32 tiled_width, tiled_height;
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	/*
 	 * T6030 external processor audio elements (DCP firmware 14.7, external

@@ -94,6 +94,13 @@ struct ane_device {
 	bool recovering;
 
 	/*
+	 * Set by system suspend for an engine that was wedged when it began:
+	 * the sleep powers its partitions off as a recovery cycle does, so
+	 * runtime suspend lets it go, and resume tries one recovery.
+	 */
+	bool sleep_wedged;
+
+	/*
 	 * TM_STATUS sampled right after the first tm_enable at probe: the
 	 * engine's fresh, idle-state signature. Recovery accepts a reset
 	 * whose post-cycle status matches it, since the register reset

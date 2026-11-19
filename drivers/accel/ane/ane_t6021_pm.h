@@ -25,14 +25,17 @@ enum ane_t6021_pm_state {
  * The firmware may only cold-start on a CPU whose power domain went off
  * after the stop. A suspend that aborts before the domains are powered off
  * (a wake event during the device phase, or pm_test=devices) still runs
- * every resume callback. restart then returns ANE_T6021_PM_RESTART_DEFERRED:
+ * every resume callback. restart may then return ANE_T6021_PM_RESTART_DEFERRED:
  * the CPU stays stopped, the device stays SUSPENDED (submissions refused)
  * and restart_deferred() later power-cycles the domains through runtime PM
- * and boots, once system PM has released its references.
+ * and boots, once system PM has released its references. restart may also
+ * defer a cold start that needs no power cycle, to keep a slow firmware boot
+ * out of system resume.
  *
  * park is optional. It runs when a FAILED device is suspended and must leave
- * its CPU safe to lose power (proven stopped, or already unpowered); an error
- * aborts only that suspend. A FAILED device stays unavailable until reboot
+ * its CPU safe to lose power (proven stopped, already unpowered, or a busy
+ * core after a hung job that the driver lets the domain power-off contain);
+ * an error aborts only that suspend. A FAILED device stays unavailable until reboot
  * but never blocks system sleep by itself.
  *
  * These callbacks hold the existing firmware mutex. stop, restart and park
@@ -124,10 +127,11 @@ static inline int ane_t6021_pm_restart_deferred(struct ane_t6021_pm *pm)
 	lockdep_assert_held(pm->fw_lock);
 	if (pm->state != ANE_T6021_PM_SUSPENDED)
 		return 0;
-	pm->state = ANE_T6021_PM_FAILED;
+	/* User space runs here and reads FAILED as wedged: stay SUSPENDED
+	 * (submitters wait on the firmware mutex) until the outcome is known.
+	 */
 	ret = pm->ops->restart_deferred(pm->ctx);
-	if (!ret)
-		pm->state = ANE_T6021_PM_ACTIVE;
+	pm->state = ret ? ANE_T6021_PM_FAILED : ANE_T6021_PM_ACTIVE;
 	return ret;
 }
 

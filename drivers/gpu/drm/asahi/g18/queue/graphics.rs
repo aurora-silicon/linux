@@ -1023,13 +1023,12 @@ impl G18ParameterBuffer {
         for (address, bytes) in [(a.page_list_low, self.inputs.page_list_bytes as usize),
             (a.metrics_low, METRICS_BYTES), (a.scene_scratch_low, SCENE_SCRATCH_BYTES),
             (a.discard_low, DISCARD_BYTES), (a.blocks_low, self.policy.blocks as usize * G18_PB_BLOCK_BYTES as usize)] {
-            for offset in (0..bytes).step_by(mmu::UAT_PGSZ) {
-                if vm.translate_iova(address + offset as u64)? != vm.translate_iova(bias + address + offset as u64)? { return Err(EFAULT); }
-                pages += 1;
-            }
+            let low = vm.translate_pages(address, bytes)?;
+            if vm.translate_pages(bias + address, bytes)? != low { return Err(EFAULT); }
+            pages += low.len();
         }
         for object in [&self.state, &self.graph, &self.page_list, &self.metrics] {
-            for off in (0..object.logical_size).step_by(mmu::UAT_PGSZ) { uat.kernel_vm().translate_iova(object.iova() + off as u64)?; }
+            uat.kernel_vm().translate_pages(object.iova(), object.logical_size)?;
         }
         Ok(pages)
     }

@@ -20,6 +20,9 @@ pub(crate) struct VmStatus {
     reported_error: AtomicI32,
     /// The client's VM handle is gone: no client can see a lost device any more.
     client_closed: AtomicBool,
+    /// A queue of this VM went away while its work was still in the GPU, and the wait for that
+    /// work ended. Never cleared.
+    teardown_expired: AtomicBool,
     /// A failure of this VM has been logged as a warning.
     warned: AtomicBool,
     /// A GPU recovery found this VM's work guilty.
@@ -56,6 +59,7 @@ impl VmStatus {
             error: AtomicI32::new(0),
             reported_error: AtomicI32::new(0),
             client_closed: AtomicBool::new(false),
+            teardown_expired: AtomicBool::new(false),
             warned: AtomicBool::new(false),
             recovery_guilty: AtomicBool::new(false),
             tgid,
@@ -105,10 +109,11 @@ impl VmStatus {
     ///
     /// The first failure reported to a VM is logged once, with the reporting site: the client treats
     /// any reported failure as a lost device, and nothing else in the kernel log names it.
-    /// Teardown of a closed client fails its queued work with ENOENT (VM context gone) or
-    /// ECANCELED (queue destroyed); nobody can see that, so it is only a debug message, and the
-    /// first other failure of that VM, such as device loss (EIO, ETIMEDOUT, ENODEV), is still
-    /// logged as a warning.
+    /// Teardown of a closed client fails its queued work with ENOENT (VM context gone),
+    /// ECANCELED (queue destroyed) or, when the wait for work still in the GPU ends
+    /// ([`Self::note_teardown_expired`]), ETIMEDOUT; nobody can see that, so it is only a debug
+    /// message, and the first other failure of that VM, such as device loss (EIO, ENODEV, or
+    /// ETIMEDOUT while no teardown wait of the VM has ended), is still logged as a warning.
     #[track_caller]
     pub(crate) fn report_failure(&self, error: Error) {
         let first = self.reported_error.compare_exchange(
@@ -152,8 +157,16 @@ impl VmStatus {
     }
 
     /// A teardown error of a client whose VM handle is already gone.
-    fn unobserved_teardown(&self, error: Error) -> bool {
-        (error == ENOENT || error == ECANCELED) && self.client_closed.load(Ordering::Acquire)
+    pub(crate) fn unobserved_teardown(&self, error: Error) -> bool {
+        self.client_closed.load(Ordering::Acquire)
+            && (error == ENOENT
+                || error == ECANCELED
+                || (error == ETIMEDOUT && self.teardown_expired.load(Ordering::Acquire)))
+    }
+
+    /// A queue teardown stopped waiting for this VM's work, which now fails with ETIMEDOUT.
+    pub(crate) fn note_teardown_expired(&self) {
+        self.teardown_expired.store(true, Ordering::Release);
     }
 
     /// Rejected submissions and contention leave the VM usable.
@@ -227,6 +240,21 @@ mod tests {
         assert!(!status.unobserved_teardown(ETIMEDOUT));
         assert!(!status.unobserved_teardown(EIO));
         assert!(!status.unobserved_teardown(ENODEV));
+    }
+
+    #[test]
+    fn a_closed_client_hides_the_end_of_its_teardown_wait() {
+        let Ok(status) = KBox::pin_init(VmStatus::new(), GFP_KERNEL) else {
+            panic!("allocation failed");
+        };
+        // A client that only destroyed a queue still sees the failure.
+        status.note_teardown_expired();
+        assert!(!status.unobserved_teardown(ETIMEDOUT));
+        status.mark_client_closed();
+        assert!(status.unobserved_teardown(ETIMEDOUT));
+        assert!(!status.unobserved_teardown(EIO));
+        status.report_failure(ETIMEDOUT);
+        assert!(!status.warned.load(Ordering::Acquire));
     }
 
     #[test]
