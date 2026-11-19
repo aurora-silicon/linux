@@ -127,6 +127,8 @@ static const char *const modes[] = {
 /* Unrecognized commands will be replaced with "!CMD" */
 #define INVALID_CMD(_cmd_)		(_cmd_ == 0x444d4321)
 
+#define TPS_CMD_IDLE_POLL_US		10000
+
 static enum power_supply_property tps6598x_psy_props[] = {
 	POWER_SUPPLY_PROP_USB_TYPE,
 	POWER_SUPPLY_PROP_ONLINE,
@@ -475,6 +477,56 @@ static int tps6598x_exec_cmd(struct tps6598x *tps, const char *cmd,
 	return tps6598x_exec_cmd_tmo(tps, cmd, in_len, in_data,
 				     out_len, out_data, 1000, 0);
 }
+
+/**
+ * tipd_cmd_wait_idle - wait for the controller to end the command it is running
+ * @tps: the controller
+ * @timeout_ms: how long to wait
+ * @busy: if not NULL, set to the command still running at the end, or 0
+ *
+ * The command register holds a command's 4CC until the controller has ended it, and then
+ * reads 0, or "!CMD" for a command it did not know. That is the controller's only report of a
+ * command's end. A command that this driver gave up waiting for, or that a reboot cut short,
+ * keeps running, and the next command written meanwhile is refused (-EBUSY). A read that
+ * fails is taken as the controller still being busy, as a bus with a busy controller on it can
+ * fail reads.
+ *
+ * Return: 0 once the controller is idle, -ETIMEDOUT if a command is still running at the end,
+ * or the error of the last read if the register could not be read until then.
+ */
+int tipd_cmd_wait_idle(struct tps6598x *tps, unsigned int timeout_ms, u32 *busy)
+{
+	unsigned long timeout = jiffies + msecs_to_jiffies(timeout_ms);
+	u32 val = 0;
+	int ret;
+
+	if (busy)
+		*busy = 0;
+	for (;;) {
+		ret = tps6598x_read32(tps, TPS_REG_CMD1, &val);
+		if (!ret && (!val || INVALID_CMD(val)))
+			return 0;
+		if (time_is_before_jiffies(timeout))
+			break;
+		usleep_range(TPS_CMD_IDLE_POLL_US, TPS_CMD_IDLE_POLL_US + TPS_CMD_IDLE_POLL_US / 4);
+	}
+	if (ret)
+		return ret;
+	if (busy)
+		*busy = val;
+	return -ETIMEDOUT;
+}
+EXPORT_SYMBOL_GPL(tipd_cmd_wait_idle);
+
+/*
+ * Write a command without the check that the controller has ended the last one. Only for a
+ * reset of a controller whose last command does not end (see tipd_cmd_wait_idle()).
+ */
+int tipd_cmd_write_busy(struct tps6598x *tps, const char *cmd)
+{
+	return tps6598x_write_4cc(tps, TPS_REG_CMD1, cmd);
+}
+EXPORT_SYMBOL_GPL(tipd_cmd_write_busy);
 
 static int tps6598x_dr_set(struct typec_port *port, enum typec_data_role role)
 {
@@ -2729,6 +2781,21 @@ VISIBLE_IF_KUNIT int cd321x_tbt_watch_late(struct cd321x *cd321x,
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_watch_late);
 
+/*
+ * At shutdown: no worker runs again, so none sends the controller a command. Unlike
+ * cd321x_stop_work(), the Thunderbolt and display notifiers stay registered: what they queue
+ * is dropped, and the routes are left as they are.
+ */
+static void cd321x_shutdown(struct tps6598x *tps)
+{
+	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+
+	disable_work_sync(&cd321x->tbt_attach_work);
+	disable_delayed_work_sync(&cd321x->resume_work);
+	disable_delayed_work_sync(&cd321x->update_work);
+	disable_delayed_work_sync(&cd321x->rearm_work);
+}
+
 /* Separate so that the KUnit tests can drive the workers without a port. */
 VISIBLE_IF_KUNIT void cd321x_init_work(struct cd321x *cd321x)
 {
@@ -3785,6 +3852,38 @@ void tipd_usb_wake(struct tps6598x *tps, bool asleep)
 }
 EXPORT_SYMBOL_GPL(tipd_usb_wake);
 
+/*
+ * Leave the controller idle for the next boot. A command the controller is still running when
+ * the system restarts is still running when the next kernel probes it: on a J714s an LDCM ran
+ * for more than three seconds after a soft reboot, the bus reported frames that failed their
+ * parity check meanwhile, and the probe failed. Stop the interrupt and the workers, the only
+ * senders of commands once user space is gone, and wait under the device lock, so that no
+ * command of this driver is in flight, for the controller to end the one it runs. The port, its
+ * mux and its USB role are left as they are.
+ */
+void tipd_shutdown(struct tps6598x *tps)
+{
+	u32 busy;
+	int ret;
+
+	if (tps->irq)
+		disable_irq(tps->irq);
+	else
+		disable_delayed_work_sync(&tps->wq_poll);
+	if (tps->contaminant_ops)
+		tps->contaminant_ops->stop(tps);
+	if (tps->data->shutdown)
+		tps->data->shutdown(tps);
+
+	scoped_guard(mutex, &tps->lock)
+		ret = tipd_cmd_wait_idle(tps, TPS_CMD_MAX_MS, &busy);
+	if (ret == -ETIMEDOUT)
+		dev_warn(tps->dev, "command %.4s still running at shutdown\n", (char *)&busy);
+	else if (ret)
+		dev_warn(tps->dev, "command register unreadable at shutdown: %d\n", ret);
+}
+EXPORT_SYMBOL_GPL(tipd_shutdown);
+
 int tipd_suspend(struct tps6598x *tps)
 {
 	if (tps->wakeup) {
@@ -3885,6 +3984,7 @@ static const struct tipd_data tipd_cd321x_data = {
 	.connect = cd321x_connect,
 	.prepare = cd321x_prepare,
 	.complete = cd321x_complete,
+	.shutdown = cd321x_shutdown,
 };
 
 static const struct tipd_data tipd_tps6598x_data = {
@@ -3966,6 +4066,7 @@ static const struct tipd_data tipd_sn201202x_data = {
 	.connect = cd321x_connect,
 	.prepare = cd321x_prepare,
 	.complete = cd321x_complete,
+	.shutdown = cd321x_shutdown,
 };
 
 const struct tipd_data *tipd_hw_variants[] = {
