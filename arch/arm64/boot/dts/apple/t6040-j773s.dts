@@ -31,6 +31,10 @@
 		/* the boot loader finds the GPU node through this alias */
 		gpu = &gpu;
 		pmp = &pmp;
+		/* the boot loader finds the display subsystem through these */
+		dcp = &dcp;
+		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
 		/* the boot loader reserves the SEP firmware through this alias */
 		sep = &sep;
 	};
@@ -795,8 +799,56 @@
 	};
 };
 
+/*
+ * Displays: HDMI on dcpext0 through the LPDPTX PHY (the J575c's path) and
+ * USB-C DisplayPort on dcpext1 over the three back ports (the J616s's), each
+ * powered with the PMP's acknowledgement as on the J616s.
+ *
+ * iBoot leaves the external display processors running with their firmware
+ * loaded. There is no panel (ADT disp0 is external), so the boot loader never
+ * hands the internal DCP over: it hands over each external processor's
+ * firmware memory on its own and enables the display subsystem (found through
+ * the disp0 alias; dcp has to be there too), and the display gate powers the
+ * chains that have firmware memory once the PMP is bound. Without that the
+ * Mac keeps the boot framebuffer.
+ */
+&display {
+	phandle = <&display>;
+};
+
+&disp0_piodma {
+	phandle = <&disp0_piodma>;
+};
+
+#include "t604x-extdisp.dtsi"
+
+/*
+ * ATC3 is the front USB hub's PHY (t6040-j773s-usb-front.dtsi), not a fixed
+ * DP PHY, and this ADT has no atc3-dpxbar: drop those descriptions and keep
+ * ATC3's power as it was. HDMI runs through the LPDPTX PHY instead.
+ */
+/delete-node/ &atcphy3;
+/delete-node/ &atcphy3_mbox;
+/delete-node/ &atcphy3_xbar;
+
+&ps_atc3_common {
+	/delete-property/ apple,always-on;
+};
+
+&ps_atc3_usb_aon {
+	/delete-property/ apple,always-on;
+};
+
+&ps_atc3_common_dp {
+	/delete-property/ power-domains;
+};
+
 #include "t6040-j773s-usb3.dtsi"
 #include "t6040-j773s-usb-front.dtsi"
+#include "t6040-dispext0.dtsi"
+#include "t604x-j575-j773-hdmi.dtsi"
+#include "t604x-dcpext1-mem.dtsi"
+#include "t6040-extdisp-usbc.dtsi"
 
 /* The video encoder, its DARTs and its power domains. */
 &ps_venc0_sys {
@@ -910,8 +962,6 @@
 };
 
 /*
- * HDMI is not described: it runs through the LPDPTX PHY (ADT lpdptx-phy0,
- * display crossbar output 4) and a converter on i2c8, which have no T6040
- * driver. The SEP stays off: its driver only runs on boards whose Touch ID
- * wiring was read.
+ * The SEP stays off: its driver only runs on boards whose Touch ID wiring was
+ * read.
  */
