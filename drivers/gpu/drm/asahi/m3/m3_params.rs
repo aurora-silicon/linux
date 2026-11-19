@@ -22,6 +22,8 @@ use kernel::{
     prelude::*, //
 };
 
+use crate::m3::m3_thermal_policy::ThermalMode;
+
 /// Parse a decimal or `0x`-prefixed hexadecimal `u64`.
 fn parse_u64(text: &str) -> Option<u64> {
     let text = text.trim();
@@ -516,6 +518,9 @@ fn parse_retire_mmio(text: &str) -> Option<u64> {
 /// job before retiring it. Bit 0 reads the engine-busy registers (SGX+0xc020/0xc120), bit 1
 /// selects and reads each cluster's fault bank (0xd800/0xd8c0), bit 2 reads the performance
 /// state (0xe01000). Unset: the SoC's default ([`crate::m3::m3_soc::Soc::retire_mmio`]).
+/// While the thermal limit's ceiling is above its safe cap the performance state is read and
+/// the runtime cap moved at every retirement with no later batch in flight even without bit 2
+/// (`m3_thermal`); the first such retirement of a module load says so in the log.
 static M3_RETIRE_MMIO: AtomicU64 = AtomicU64::new(RETIRE_MMIO_UNSET);
 m3_param!("m3_retire_mmio", M3_RETIRE_MMIO, parse_retire_mmio, 0o644, Some(get_atomic_param));
 
@@ -545,21 +550,6 @@ fn parse_thermal(text: &str) -> Option<u64> {
 static M3_THERMAL: AtomicU64 = AtomicU64::new(THERMAL_UNSET);
 m3_param!("m3_thermal", M3_THERMAL, parse_thermal);
 
-/// How the runtime backend limits the GPU performance state by temperature.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) enum ThermalMode {
-    /// Today's fixed cap: the firmware is given the cap as its highest state, and nothing
-    /// changes it at runtime.
-    Off,
-    /// The firmware is given the whole table as its highest state, and the runtime cap words
-    /// hold the fixed cap for the whole boot. The same performance as `Off`, if the firmware
-    /// follows the runtime cap: this checks that it does.
-    Hold,
-    /// As `Hold`, and the runtime cap follows the SoC die temperature, up to the whole table
-    /// while the die is cool.
-    On,
-}
-
 /// The `asahi.m3_thermal` setting, if given.
 pub(crate) fn thermal_param() -> Option<ThermalMode> {
     match M3_THERMAL.load(Ordering::Relaxed) {
@@ -570,21 +560,30 @@ pub(crate) fn thermal_param() -> Option<ThermalMode> {
     }
 }
 
-/// Default and bounds of `asahi.m3_thermal_hot`, in degrees Celsius.
-pub(crate) const THERMAL_HOT_DEFAULT: u64 = 80;
-pub(crate) const THERMAL_HOT_MIN: u64 = 40;
-pub(crate) const THERMAL_HOT_MAX: u64 = 85;
+pub(crate) use crate::m3::m3_thermal_policy::{
+    COOL_GAP_DEFAULT, COOL_GAP_MAX, COOL_GAP_MIN, THERMAL_HOT_DEFAULT, THERMAL_HOT_MAX,
+    THERMAL_HOT_MIN,
+};
 
 /// `asahi.m3_thermal_hot`: the SoC die temperature (degrees Celsius) at or above which the thermal
-/// limit lowers the runtime cap, clamped to [`THERMAL_HOT_MIN`]..=[`THERMAL_HOT_MAX`].
+/// limit lowers the runtime cap, clamped to [`THERMAL_HOT_MIN`]..=[`THERMAL_HOT_MAX`]. Writable
+/// at runtime through sysfs. The thermal limit picks a new value up at its next update.
 static M3_THERMAL_HOT: AtomicU64 = AtomicU64::new(THERMAL_HOT_DEFAULT);
-m3_param!("m3_thermal_hot", M3_THERMAL_HOT, parse_u64);
+m3_param!("m3_thermal_hot", M3_THERMAL_HOT, parse_u64, 0o644, Some(get_atomic_param));
 
-/// The `asahi.m3_thermal_hot` setting and whether it was clamped.
-pub(crate) fn thermal_hot_param() -> (u64, bool) {
-    let value = M3_THERMAL_HOT.load(Ordering::Relaxed);
-    let clamped = value.clamp(THERMAL_HOT_MIN, THERMAL_HOT_MAX);
-    (clamped, clamped != value)
+/// `asahi.m3_thermal_cool_gap`: how far below `hot` (degrees Celsius) the die must be before the
+/// thermal limit raises the runtime cap again, clamped to [`COOL_GAP_MIN`]..=[`COOL_GAP_MAX`].
+/// Writable at runtime through sysfs, like `asahi.m3_thermal_hot`.
+static M3_THERMAL_COOL_GAP: AtomicU64 = AtomicU64::new(COOL_GAP_DEFAULT);
+m3_param!("m3_thermal_cool_gap", M3_THERMAL_COOL_GAP, parse_u64, 0o644, Some(get_atomic_param));
+
+/// The requested `asahi.m3_thermal_hot` and `asahi.m3_thermal_cool_gap`, in degrees Celsius
+/// and not yet clamped (`m3_thermal_policy::clamp_thresholds` does that).
+pub(crate) fn thermal_threshold_params() -> (u64, u64) {
+    (
+        M3_THERMAL_HOT.load(Ordering::Relaxed),
+        M3_THERMAL_COOL_GAP.load(Ordering::Relaxed),
+    )
 }
 
 /// Whether to start the runtime backend on a T8122 (`asahi.m3_backend`), and say why not.
@@ -661,7 +660,10 @@ m3_param!("t8122_unit_mask_a", T8122_UNIT_MASK_A, parse_t8122_number);
 /// `asahi.t8122_unit_mask_b=<u32>`: HwDataB unit mask B (+0x17c8).
 static T8122_UNIT_MASK_B: AtomicU64 = AtomicU64::new(T8122_UNSET);
 m3_param!("t8122_unit_mask_b", T8122_UNIT_MASK_B, parse_t8122_number);
-/// `asahi.t8122_pstate_cap=N`: the highest performance state the T8122 firmware may use.
+/// `asahi.t8122_pstate_cap=N`: the highest performance state the T8122 firmware may use, 1 to 8.
+/// The runtime cap starts at and falls back to 2; with `asahi.m3_thermal=on` it may rise to the
+/// cap on usable die temperatures. 6 to 8 need `on`: with `hold` or `off` they are lowered to 5
+/// (`t8122_knobs::pstate_cap_use`).
 static T8122_PSTATE_CAP: AtomicU64 = AtomicU64::new(T8122_UNSET);
 m3_param!("t8122_pstate_cap", T8122_PSTATE_CAP, parse_t8122_number);
 

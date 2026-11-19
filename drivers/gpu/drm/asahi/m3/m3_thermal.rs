@@ -7,9 +7,12 @@
 //! J516S) and nothing watches temperatures. The firmware's own die temperature controller is
 //! off in the InitData this driver builds. With device-tree InitData the default is `on`;
 //! `asahi.m3_thermal=off` restores the fixed cap exactly.
+//! On T8122 the fixed cap is state 2 (or a lower requested ceiling). A higher
+//! `asahi.t8122_pstate_cap` changes only the monitored ceiling, never this fallback.
 //!
-//! With it, the InitData gives the firmware the whole table as its highest state (the
-//! "ceiling"), and what bounds the firmware is the runtime cap: the Globals performance-state
+//! With it, the InitData gives the firmware the requested, table-clamped highest state (the
+//! "ceiling", also bounded by the T8122 experiment), and what bounds the firmware is the
+//! runtime cap: the Globals performance-state
 //! cap and power-interface state targets, which the firmware keeps reading while it runs (a
 //! host moves the cap with a single store, with no message). The runtime cap starts at the
 //! fixed cap of `off` (the "safe cap") and never goes below it, so at worst the GPU runs as it
@@ -22,10 +25,10 @@
 //!   500 ms while the GPU is busy (every 2 s when idle) from the thermal zones in [`ZONES`]
 //!   that exist: the SMC's die sensors and the PMP's CPU cluster sensors (see [`ZONES`]):
 //!   * at or above `critical` (`hot` + 8 C): the safe cap at once;
-//!   * at or above `hot` (`asahi.m3_thermal_hot`, default 80 C): one state lower, at most every
-//!     500 ms and once per reading;
-//!   * at or below `cool` (`hot` - 10 C): one state higher, at most every 2 s and once per
-//!     reading, up to the ceiling;
+//!   * at or above `hot` (`asahi.m3_thermal_hot`, default 80 C, at most 92 C): one state
+//!     lower, at most every 500 ms and once per reading;
+//!   * at or below `cool` (`hot` minus `asahi.m3_thermal_cool_gap`, default 10 C, 3 to 10 C):
+//!     one state higher, at most every 2 s and once per reading, up to the ceiling;
 //!   * no zone, a zone that cannot be read, a reading outside 10..=125 C, one older than 3 s
 //!     or one that has not changed at all for 60 s: the safe cap at once.
 //!
@@ -35,11 +38,20 @@
 //! reacts in steps of hundreds of milliseconds while the firmware changes state within the cap
 //! much faster.
 //!
+//! `asahi.m3_thermal_hot` and `asahi.m3_thermal_cool_gap` are writable at runtime in
+//! /sys/module/asahi/parameters. The next update after a write applies the clamped values and
+//! logs them; the runtime cap itself only moves with the usual pacing.
+//!
 //! The cap is changed only by the job thread, after a job has retired, right before the state
-//! the firmware reports is checked. After a lowering the previous cap is tolerated for 1 s. A
-//! reported state above the runtime cap in 20 consecutive checks spanning at least 3 s means
-//! the firmware does not follow the runtime cap, so this limit cannot work: the GPU is then
-//! marked failed, as for a state above the ceiling.
+//! the firmware reports is checked. That check runs at a retirement with no later batch in
+//! flight. While the ceiling is above the safe cap it runs at every such retirement whatever
+//! `asahi.m3_retire_mmio` says, and a batch is published behind batches still in flight
+//! (`asahi.m3_pipeline_depth` above 1) only within 500 ms of the last check, so that a client
+//! that keeps the pipeline full cannot keep the check from running.
+//! After a lowering the previous cap is tolerated for 1 s. A reported state above the runtime
+//! cap in 20 consecutive checks spanning at least 3 s means the firmware does not follow the
+//! runtime cap, so this limit cannot work: the GPU is then marked failed, as for a state above
+//! the ceiling.
 //!
 //! The decisions are in `m3_thermal_policy`, which host tests drive; this module reads the
 //! sensors, publishes the cap and logs.
@@ -59,8 +71,8 @@ use kernel::{
 
 use crate::{
     m3::m3_adt_config::PstatePolicy,
-    m3::m3_params::{self, ThermalMode},
-    m3::m3_thermal_policy::{Change, Policy, Reading, Source, Why, S},
+    m3::m3_params,
+    m3::m3_thermal_policy::{clamp_thresholds, Change, Policy, Reading, Source, ThermalMode, Why, S},
 };
 
 /// The thermal zones read, each the hottest of a set of SoC die sensors: the SMC's die sensors
@@ -229,22 +241,28 @@ pub(crate) struct Governor {
     /// The highest state the firmware reported since the last summary.
     peak: u32,
     lines: u32,
+    /// The `asahi.m3_thermal_hot` and `asahi.m3_thermal_cool_gap` values last applied, as
+    /// written (before clamping).
+    requested: (u64, u64),
 }
 
 impl Governor {
     /// The governor for `policy`. Starts the sensor work item unless the limit is off.
     pub(crate) fn new(dev: &device::Device, pstates: &PstatePolicy) -> Result<Self> {
-        let (hot_c, clamped) = m3_params::thermal_hot_param();
+        let requested = m3_params::thermal_threshold_params();
+        let (hot, gap, clamped) = clamp_thresholds(requested.0, requested.1);
         let base = Time::now();
+        let mut policy = Policy::new(
+            pstates.thermal == ThermalMode::On,
+            pstates.safe,
+            pstates.max,
+            hot,
+        );
+        policy.set_thresholds(hot, gap);
         let mut governor = Governor {
             mode: pstates.thermal,
             fixed: pstates.max,
-            policy: Policy::new(
-                pstates.thermal == ThermalMode::On,
-                pstates.safe,
-                pstates.max,
-                hot_c as i32 * 1000,
-            ),
+            policy,
             freqs: pstates.freqs,
             base,
             sensor: None,
@@ -252,18 +270,13 @@ impl Governor {
             last_summary: None,
             peak: 0,
             lines: 0,
+            requested,
         };
         if governor.mode == ThermalMode::Off {
             return Ok(governor);
         }
         if clamped {
-            dev_info!(
-                dev,
-                "M3: asahi.m3_thermal_hot clamped to {} C ({}..={} C)\n",
-                hot_c,
-                m3_params::THERMAL_HOT_MIN,
-                m3_params::THERMAL_HOT_MAX
-            );
+            governor.log_clamped(dev);
         }
         let sensor = Arc::pin_init(
             pin_init!(Sensor {
@@ -293,7 +306,7 @@ impl Governor {
             ),
             _ => dev_info!(
                 dev,
-                "M3: thermal limit on (asahi.m3_thermal=on): runtime cap {}..={} ({}..={} MHz) from the hottest SoC die temperature of zones macsmc_soc_die and apple_pmp_hotspot: up while at or below {}, down at or above {}, cap {} at or above {} or without a fresh reading\n",
+                "M3: thermal limit on (asahi.m3_thermal=on): runtime cap {}..={} ({}..={} MHz) from the hottest SoC die temperature of zones macsmc_soc_die and apple_pmp_hotspot: up while at or below {}, down at or above {}, cap {} at or above {} or without a fresh reading (asahi.m3_thermal_hot {}, asahi.m3_thermal_cool_gap {}, both writable at runtime)\n",
                 p.safe(),
                 p.ceiling(),
                 governor.mhz(p.safe()),
@@ -301,10 +314,58 @@ impl Governor {
                 Celsius(cool),
                 Celsius(hot),
                 p.safe(),
-                Celsius(critical)
+                Celsius(critical),
+                Celsius(hot),
+                Celsius(hot - cool)
             ),
         }
         Ok(governor)
+    }
+
+    /// Log that the requested thresholds were clamped, and to what.
+    fn log_clamped(&self, dev: &device::Device) {
+        let (cool, hot, _) = self.policy.thresholds();
+        dev_info!(
+            dev,
+            "M3: asahi.m3_thermal_hot {} and asahi.m3_thermal_cool_gap {} clamped to {} and {} ({}..={} C and {}..={} C)\n",
+            self.requested.0,
+            self.requested.1,
+            Celsius(hot),
+            Celsius(hot - cool),
+            m3_params::THERMAL_HOT_MIN,
+            m3_params::THERMAL_HOT_MAX,
+            m3_params::COOL_GAP_MIN,
+            m3_params::COOL_GAP_MAX
+        );
+    }
+
+    /// Apply `asahi.m3_thermal_hot` and `asahi.m3_thermal_cool_gap` if either was written since
+    /// they were last applied, and log the thresholds now in use.
+    fn reread_thresholds(&mut self, dev: &device::Device) {
+        let requested = m3_params::thermal_threshold_params();
+        if requested == self.requested {
+            return;
+        }
+        self.requested = requested;
+        let (hot, gap, clamped) = clamp_thresholds(requested.0, requested.1);
+        if clamped {
+            self.log_clamped(dev);
+        }
+        if !self.policy.set_thresholds(hot, gap) {
+            return;
+        }
+        let (cool, hot, critical) = self.policy.thresholds();
+        let safe = self.policy.safe();
+        dev_info!(
+            dev,
+            "M3: thermal: thresholds changed at runtime: up while at or below {}, down at or above {}, cap {} ({} MHz) at or above {}; runtime cap {} now\n",
+            Celsius(cool),
+            Celsius(hot),
+            safe,
+            self.mhz(safe),
+            Celsius(critical),
+            self.policy.cap()
+        );
     }
 
     fn mhz(&self, state: u32) -> u32 {
@@ -336,13 +397,29 @@ impl Governor {
                 } else {
                     ""
                 };
-                dev_info!(
-                    dev,
-                    "M3: thermal: SoC die temperature {} from zones:{}{}\n",
-                    Celsius(t),
-                    smc,
-                    pmp
-                )
+                // With a ceiling above the safe cap, a usable reading is what lets the runtime
+                // cap rise above it: say so, so the log shows when states above it are allowed.
+                if self.mode == ThermalMode::On && self.policy.above_safe() {
+                    let ceiling = self.policy.ceiling();
+                    dev_info!(
+                        dev,
+                        "M3: thermal: SoC die temperature {} from zones:{}{}; the runtime cap may rise above {} up to {} ({} MHz)\n",
+                        Celsius(t),
+                        smc,
+                        pmp,
+                        safe,
+                        ceiling,
+                        self.mhz(ceiling)
+                    )
+                } else {
+                    dev_info!(
+                        dev,
+                        "M3: thermal: SoC die temperature {} from zones:{}{}\n",
+                        Celsius(t),
+                        smc,
+                        pmp
+                    )
+                }
             }
             (Source::Failed(e), _) => dev_info!(
                 dev,
@@ -439,6 +516,7 @@ impl Governor {
             return None;
         };
         let reading = sensor.state.lock().reading;
+        self.reread_thresholds(dev);
         let now = ns(self.base, now);
         let (usable, change) = self.policy.update(now, reading);
         let temp = usable.ok().map(|(t, _, _)| t);
@@ -485,6 +563,20 @@ impl Governor {
             return Err(ERANGE);
         }
         Ok(())
+    }
+
+    /// Whether the firmware's ceiling is above the safe cap, so that only the runtime cap keeps
+    /// it within what the temperature allows: the caller must then move and check the cap at
+    /// every retirement with no later batch in flight. False with the limit off, where the cap
+    /// is fixed.
+    pub(crate) fn enforces(&self) -> bool {
+        self.mode != ThermalMode::Off && self.policy.above_safe()
+    }
+
+    /// Whether a batch may be published now behind batches still in flight: always unless
+    /// [`Self::enforces`], then only within 500 ms of the last check.
+    pub(crate) fn overlap_allowed(&self, now: Time) -> bool {
+        !self.enforces() || self.policy.overlap_allowed(ns(self.base, now))
     }
 
     /// Note that the GPU retired a job, so the sensor is read at the busy rate.

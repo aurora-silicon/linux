@@ -1,10 +1,44 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Decisions of the M3 thermal limit (see `m3_thermal`), kept free of kernel dependencies so
-//! that host tests drive exactly this code (`tools/asahi/m3-thermal-policy-tests.rs`).
+//! that host tests drive exactly this code (`tools/asahi/m3-runtime-tests.rs`).
 //!
 //! Times are monotonic nanoseconds from any fixed origin, temperatures millidegrees Celsius, and
 //! states indices of the published performance-state table.
+
+/// Highest fixed cap for non-T8122 device-tree InitData, whose firmware die-temperature
+/// controller is disabled. T8122 retains its lower default cap without temperature feedback.
+/// The T8122 start experiment admits a ceiling above it only with the thermal limit on
+/// (`t8122_knobs::PSTATE_CAP_NO_FEEDBACK_MAX` is this number).
+pub(crate) const ADT_MAX_PSTATE_LIMIT: u32 = 5;
+/// T8122's unmonitored cap, independent of any experiment ceiling or future default change
+/// (`t8122_knobs::PSTATE_FALLBACK` is this number).
+pub(crate) const T8122_SAFE_PSTATE: u32 = 2;
+
+/// How the runtime backend limits the GPU performance state by temperature.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum ThermalMode {
+    /// A fixed ceiling no higher than the safe cap, without temperature feedback.
+    Off,
+    /// Publish the requested ceiling, but hold the runtime cap at the safe cap.
+    Hold,
+    /// Allow the runtime cap to follow the die temperature up to the requested ceiling.
+    On,
+}
+
+impl ThermalMode {
+    /// Return (firmware ceiling, boot/failure cap) for a table-clamped request. A T8122
+    /// experiment ceiling permits higher states only with working temperature feedback;
+    /// it must not also raise the cap used before a reading or after a sensor failure.
+    pub(crate) fn pstate_caps(self, requested: u32, t8122_ceiling: Option<u32>) -> (u32, u32) {
+        let (max, limit) = match t8122_ceiling {
+            Some(ceiling) => (requested.min(ceiling), T8122_SAFE_PSTATE),
+            None => (requested, ADT_MAX_PSTATE_LIMIT),
+        };
+        let safe = max.min(limit);
+        (if self == Self::Off { safe } else { max }, safe)
+    }
+}
 
 /// Required thermal-zone bits: SMC die (bit 0), PMP hotspot (bit 1).
 /// A missing or malformed compatible list requires both zones.
@@ -42,9 +76,35 @@ pub(crate) const GRACE_NS: i64 = S;
 /// firmware does not follow the runtime cap.
 pub(crate) const IGNORED_CHECKS: u32 = 20;
 pub(crate) const IGNORED_NS: i64 = 3 * S;
-/// Distance of `cool` below and `critical` above `hot`.
+/// While the ceiling is above the safe cap, a batch is published behind batches still in flight
+/// only within this time of the last check. The cap is moved and the reported state checked
+/// only at a retirement with no later batch in flight, so a client that kept the pipeline full
+/// would otherwise keep the cap wherever it was. The sensor is read every 500 ms while the GPU
+/// is busy, so more frequent checks would not see newer readings.
+pub(crate) const CHECK_EVERY_NS: i64 = 500 * MS;
+/// Default distance of `cool` below `hot` (`asahi.m3_thermal_cool_gap`) and the fixed distance
+/// of `critical` above it.
 pub(crate) const COOL_BELOW_MC: i32 = 10_000;
 pub(crate) const CRITICAL_ABOVE_MC: i32 = 8_000;
+
+/// Default and bounds of `asahi.m3_thermal_hot`, in degrees Celsius. At the top `critical` is
+/// 100 C, still below the 110 C critical trip of the J613 and J615 CPU thermal zones.
+pub(crate) const THERMAL_HOT_DEFAULT: u64 = 80;
+pub(crate) const THERMAL_HOT_MIN: u64 = 40;
+pub(crate) const THERMAL_HOT_MAX: u64 = 92;
+/// Default and bounds of `asahi.m3_thermal_cool_gap`, in degrees Celsius. The default is the
+/// distance used before the gap could be set.
+pub(crate) const COOL_GAP_DEFAULT: u64 = 10;
+pub(crate) const COOL_GAP_MIN: u64 = 3;
+pub(crate) const COOL_GAP_MAX: u64 = 10;
+
+/// `hot` and the cool gap in millidegrees Celsius for the requested values in degrees Celsius,
+/// each clamped to its bounds, and whether either was clamped.
+pub(crate) fn clamp_thresholds(hot_c: u64, gap_c: u64) -> (i32, i32, bool) {
+    let hot = hot_c.clamp(THERMAL_HOT_MIN, THERMAL_HOT_MAX);
+    let gap = gap_c.clamp(COOL_GAP_MIN, COOL_GAP_MAX);
+    (hot as i32 * 1000, gap as i32 * 1000, hot != hot_c || gap != gap_c)
+}
 
 /// The latest sensor reading.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -110,6 +170,8 @@ pub(crate) struct Policy {
     /// Since when, and in how many consecutive checks, the firmware reported a state above the
     /// allowed cap.
     over: Option<(i64, u32)>,
+    /// When the reported state was last checked.
+    checked: Option<i64>,
     raised: u32,
     lowered_count: u32,
 }
@@ -133,6 +195,7 @@ impl Policy {
             last_change: None,
             lowered: None,
             over: None,
+            checked: None,
             raised: 0,
             lowered_count: 0,
         }
@@ -150,8 +213,39 @@ impl Policy {
     pub(crate) fn thresholds(&self) -> (i32, i32, i32) {
         (self.cool, self.hot, self.critical)
     }
+
+    /// Move `hot` to `hot` millidegrees Celsius, `cool` to `gap` below it and `critical` to
+    /// [`CRITICAL_ABOVE_MC`] above it. The runtime cap stays where it is. The next update applies
+    /// the new thresholds with the usual pacing (critical at once). Returns whether anything
+    /// changed.
+    pub(crate) fn set_thresholds(&mut self, hot: i32, gap: i32) -> bool {
+        let (cool, critical) = (hot - gap, hot + CRITICAL_ABOVE_MC);
+        if (self.cool, self.hot, self.critical) == (cool, hot, critical) {
+            return false;
+        }
+        (self.cool, self.hot, self.critical) = (cool, hot, critical);
+        true
+    }
     pub(crate) fn counts(&self) -> (u32, u32) {
         (self.raised, self.lowered_count)
+    }
+
+    /// Whether the ceiling is above the safe cap, so that the runtime cap is what keeps the
+    /// firmware within what the temperature allows. The cap is then moved and the reported
+    /// state checked at every retirement with no later batch in flight, whatever
+    /// `asahi.m3_retire_mmio` says (`m3_runtime`). False with the thermal limit off, where the
+    /// safe cap is the ceiling.
+    pub(crate) fn above_safe(&self) -> bool {
+        self.ceiling > self.safe
+    }
+
+    /// Whether a batch may be published at `now` behind batches still in flight. Always while
+    /// the ceiling is at the safe cap. Above it, only within [`CHECK_EVERY_NS`] of the last
+    /// check: later batches are held back until the pipeline has drained, so the retirement
+    /// that checks comes at most that long, plus the run time of the batches then in flight,
+    /// after the last one.
+    pub(crate) fn overlap_allowed(&self, now: i64) -> bool {
+        !self.above_safe() || self.checked.is_some_and(|t| now - t < CHECK_EVERY_NS)
     }
 
     /// The temperature of `reading` if it may be used at `now` (with when it was taken and its
@@ -246,6 +340,7 @@ impl Policy {
     /// [`Self::allowed`]. Returns the number of consecutive checks and their span when they
     /// show that the firmware does not follow the runtime cap.
     pub(crate) fn note_check(&mut self, now: i64, over: bool) -> Option<(u32, i64)> {
+        self.checked = Some(now);
         if !over {
             self.over = None;
             return None;
@@ -256,6 +351,117 @@ impl Policy {
         };
         self.over = Some((since, count));
         (count >= IGNORED_CHECKS && now - since >= IGNORED_NS).then_some((count, now - since))
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    fn temp(mc: i32, at: i64) -> Reading {
+        Reading::Temp { mc, at, zones: 1 }
+    }
+
+    fn boosted_air() -> Policy {
+        let (ceiling, safe) = ThermalMode::On.pstate_caps(8, Some(5));
+        let mut policy = Policy::new(true, safe, ceiling, 80_000);
+        assert_eq!(policy.cap(), 2);
+        for (at, mc, cap) in [(0, 60_000, 3), (2 * S, 60_001, 4), (4 * S, 60_002, 5)] {
+            policy.update(at, temp(mc, at)).0.unwrap();
+            assert_eq!(policy.cap(), cap);
+        }
+        policy
+    }
+
+    #[test]
+    fn air_ceiling_never_raises_the_unmonitored_cap() {
+        assert_eq!(ThermalMode::On.pstate_caps(8, Some(5)), (5, 2));
+        assert_eq!(ThermalMode::Hold.pstate_caps(8, Some(5)), (5, 2));
+        assert_eq!(ThermalMode::Off.pstate_caps(8, Some(5)), (2, 2));
+        for mode in [ThermalMode::On, ThermalMode::Hold, ThermalMode::Off] {
+            assert_eq!(mode.pstate_caps(1, Some(5)), (1, 1));
+            assert_eq!(mode.pstate_caps(8, Some(1)), (1, 1));
+        }
+    }
+
+    #[test]
+    fn non_air_caps_keep_the_existing_safe_limit() {
+        assert_eq!(ThermalMode::On.pstate_caps(8, None), (8, 5));
+        assert_eq!(ThermalMode::Hold.pstate_caps(8, None), (8, 5));
+        assert_eq!(ThermalMode::Off.pstate_caps(8, None), (5, 5));
+    }
+
+    #[test]
+    fn failed_missing_stale_and_implausible_readings_drop_air_to_two() {
+        for (reading, source) in [
+            (Reading::None, Source::NoReading),
+            (Reading::Failed { errno: -5, at: 5 * S }, Source::Failed(-5)),
+            (temp(60_000, S), Source::Stale),
+            (temp(9_999, 5 * S), Source::Implausible),
+            (temp(125_001, 5 * S), Source::Implausible),
+        ] {
+            let mut policy = boosted_air();
+            let (usable, change) = policy.update(5 * S, reading);
+            assert_eq!(usable, Err(source));
+            assert_eq!(change, Some(Change { from: 5, to: 2, why: Why::NoTemperature(source) }));
+            policy.update(7 * S, temp(60_003, 7 * S)).0.unwrap();
+            assert_eq!(policy.cap(), 3);
+        }
+    }
+
+    #[test]
+    fn air_boost_requires_fresh_paced_readings_and_respects_the_ceiling() {
+        let (ceiling, safe) = ThermalMode::On.pstate_caps(8, Some(5));
+        let mut policy = Policy::new(true, safe, ceiling, 80_000);
+        policy.update(0, temp(60_000, 0)).0.unwrap();
+        assert_eq!(policy.cap(), 3);
+        policy.update(S, temp(60_001, S)).0.unwrap();
+        assert_eq!(policy.cap(), 3);
+        policy.update(2 * S, temp(60_000, 0)).0.unwrap();
+        assert_eq!(policy.cap(), 3);
+        policy.update(2 * S, temp(60_002, 2 * S)).0.unwrap();
+        assert_eq!(policy.cap(), 4);
+        policy.update(4 * S, temp(60_003, 4 * S)).0.unwrap();
+        policy.update(6 * S, temp(60_004, 6 * S)).0.unwrap();
+        assert_eq!(policy.cap(), 5);
+    }
+
+    #[test]
+    fn air_hot_and_critical_readings_reduce_the_cap() {
+        let mut policy = boosted_air();
+        policy.update(4 * S + 500 * MS, temp(80_000, 4 * S + 500 * MS)).0.unwrap();
+        assert_eq!(policy.cap(), 4);
+        policy.update(5 * S, temp(80_000, 4 * S + 500 * MS)).0.unwrap();
+        assert_eq!(policy.cap(), 4);
+        policy.update(5 * S, temp(80_001, 5 * S)).0.unwrap();
+        assert_eq!(policy.cap(), 3);
+        policy.update(5 * S + MS, temp(88_000, 5 * S + MS)).0.unwrap();
+        assert_eq!(policy.cap(), 2);
+        assert_eq!(policy.allowed(5 * S + 2 * MS), 5);
+        assert_eq!(policy.allowed(6 * S + MS), 2);
+    }
+
+    #[test]
+    fn unchanged_air_temperature_cannot_sustain_boost_forever() {
+        let (ceiling, safe) = ThermalMode::On.pstate_caps(8, Some(5));
+        let mut policy = Policy::new(true, safe, ceiling, 80_000);
+        for at in [0, 2 * S, 4 * S] {
+            policy.update(at, temp(60_000, at)).0.unwrap();
+        }
+        assert_eq!(policy.cap(), 5);
+        let (usable, _) = policy.update(STUCK_NS, temp(60_000, STUCK_NS));
+        assert_eq!(usable, Err(Source::Stuck));
+        assert_eq!(policy.cap(), 2);
+    }
+
+    #[test]
+    fn hold_mode_never_boosts_the_air() {
+        let (ceiling, safe) = ThermalMode::Hold.pstate_caps(8, Some(5));
+        let mut policy = Policy::new(false, safe, ceiling, 80_000);
+        for at in [0, 2 * S, 4 * S] {
+            policy.update(at, temp(60_000, at)).0.unwrap();
+        }
+        assert_eq!(policy.cap(), 2);
     }
 }
 
@@ -282,5 +488,562 @@ mod zone_tests {
         assert_eq!(required_zones(b"apple,t8122"), 3);
         assert_eq!(required_zones(b"apple,j274\0apple,t8103\0"), 0);
         assert_eq!(required_zones(b"apple,t81220\0"), 0);
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    /// `hot` of the tests: the default of `asahi.m3_thermal_hot`. Cool is 70 C, critical 88 C.
+    const HOT: i32 = 80_000;
+
+    fn temp(mc: i32, at: i64) -> Reading {
+        Reading::Temp { mc, at, zones: 1 }
+    }
+
+    /// A policy that has climbed from `safe` to `ceiling` on cool readings, the last at
+    /// `2 * (ceiling - safe - 1)` s; returns it with the time of that last reading.
+    fn raised(safe: u32, ceiling: u32) -> (Policy, i64) {
+        let mut p = Policy::new(true, safe, ceiling, HOT);
+        let mut now = 0;
+        for step in 0..ceiling - safe {
+            now = i64::from(step) * UP_PACE_NS;
+            let (usable, change) = p.update(now, temp(50_000 + step as i32, now));
+            assert!(usable.is_ok());
+            assert_eq!(change.map(|c| (c.from, c.to, c.why)), Some((safe + step, safe + step + 1, Why::Cool)));
+        }
+        assert_eq!(p.cap(), ceiling);
+        (p, now)
+    }
+
+    #[test]
+    fn the_cap_starts_at_the_safe_cap_and_climbs_one_state_per_two_seconds_to_the_ceiling() {
+        for ceiling in 6..=8 {
+            let mut p = Policy::new(true, 5, ceiling, HOT);
+            assert_eq!((p.cap(), p.safe(), p.ceiling()), (5, 5, ceiling));
+            assert_eq!(p.thresholds(), (70_000, 80_000, 88_000));
+            // No reading yet: the safe cap.
+            assert_eq!(p.update(0, Reading::None), (Err(Source::NoReading), None));
+            assert_eq!(p.cap(), 5);
+            // A cool reading every 500 ms: one state every 2 s, never above the ceiling.
+            let mut caps = [0u32; 21];
+            for (i, slot) in caps.iter_mut().enumerate() {
+                let now = i as i64 * 500 * MS;
+                let _ = p.update(now, temp(60_000 + i as i32, now));
+                *slot = p.cap();
+                assert!(p.cap() <= ceiling && p.cap() >= 5);
+            }
+            // t = 0, 2, 4 s: 6, 7, 8 (as far as the ceiling allows).
+            assert_eq!(caps[0], 6);
+            assert_eq!(caps[3], 6);
+            assert_eq!(caps[4], 7.min(ceiling));
+            assert_eq!(caps[7], 7.min(ceiling));
+            assert_eq!(caps[8], 8.min(ceiling));
+            assert_eq!(caps[20], ceiling);
+            assert_eq!(p.counts(), (ceiling - 5, 0));
+            // Exactly cool (70.0 C) still raises; anything above it does not.
+            let (mut p, t) = raised(5, ceiling);
+            let _ = p.update(t + 500 * MS, temp(HOT, t + 500 * MS));
+            assert_eq!(p.cap(), ceiling - 1);
+            let _ = p.update(t + 3 * S, temp(70_001, t + 3 * S));
+            assert_eq!(p.cap(), ceiling - 1);
+            let _ = p.update(t + 4 * S, temp(70_000, t + 4 * S));
+            assert_eq!(p.cap(), ceiling);
+        }
+    }
+
+    #[test]
+    fn between_cool_and_hot_the_cap_holds() {
+        for ceiling in 6..=8 {
+            let (mut p, t) = raised(5, ceiling);
+            for (i, mc) in [70_001, 75_000, 79_999].into_iter().enumerate() {
+                let now = t + (i as i64 + 1) * 3 * S;
+                assert_eq!(p.update(now, temp(mc, now)).1, None);
+                assert_eq!(p.cap(), ceiling);
+            }
+        }
+    }
+
+    #[test]
+    fn hot_lowers_one_state_per_fresh_reading_every_500_ms_and_stops_at_the_safe_cap() {
+        for ceiling in 6..=8 {
+            let (mut p, t) = raised(5, ceiling);
+            // Less than 500 ms after the last change: not yet.
+            let now = t + 499 * MS;
+            assert_eq!(p.update(now, temp(HOT, now)).1, None);
+            let mut now = t + 500 * MS;
+            for expected in (5..ceiling).rev() {
+                let change = p.update(now, temp(HOT + (now / MS) as i32 % 7, now)).1.unwrap();
+                assert_eq!((change.to, change.why), (expected, Why::Hot));
+                // The same reading again, however much later, is not acted on twice.
+                assert_eq!(p.update(now + 400 * MS, temp(HOT, now)).1, None);
+                now += 500 * MS;
+            }
+            assert_eq!(p.cap(), 5);
+            // Hot at the safe cap: nothing lower to go to.
+            for i in 0..4 {
+                let at = now + i * 500 * MS;
+                assert_eq!(p.update(at, temp(HOT + 1_000 + i as i32, at)).1, None);
+                assert_eq!(p.cap(), 5);
+            }
+            assert_eq!(p.counts(), (ceiling - 5, ceiling - 5));
+        }
+    }
+
+    #[test]
+    fn critical_and_unusable_readings_restore_the_safe_cap_at_once() {
+        for ceiling in 6..=8 {
+            let (_, t) = raised(5, ceiling);
+            // Right after the last raise, so no pacing would allow a step yet.
+            let now = t + MS;
+            let cases = [
+                (temp(88_000, now), Why::Critical),
+                (temp(110_000, now), Why::Critical),
+                (Reading::None, Why::NoTemperature(Source::NoReading)),
+                (Reading::Failed { errno: -19, at: now }, Why::NoTemperature(Source::Failed(-19))),
+                (Reading::Failed { errno: -5, at: now }, Why::NoTemperature(Source::Failed(-5))),
+                // Older than 3 s, as a temperature and as a failure.
+                (temp(50_000, now - STALE_NS - 1), Why::NoTemperature(Source::Stale)),
+                (Reading::Failed { errno: -5, at: now - STALE_NS - 1 }, Why::NoTemperature(Source::Stale)),
+                // Outside 10..=125 C. The SMC's reading of a powered-down sensor is one of them.
+                (temp(9_999, now), Why::NoTemperature(Source::Implausible)),
+                (temp(-2_849, now), Why::NoTemperature(Source::Implausible)),
+                (temp(125_001, now), Why::NoTemperature(Source::Implausible)),
+            ];
+            for (reading, why) in cases {
+                let (mut p, _) = raised(5, ceiling);
+                let change = p.update(now, reading).1.unwrap();
+                assert_eq!((change.from, change.to, change.why), (ceiling, 5, why), "{reading:?}");
+                // The previous cap is tolerated for the grace period only.
+                assert_eq!(p.allowed(now + GRACE_NS - 1), ceiling);
+                assert_eq!(p.allowed(now + GRACE_NS), 5);
+            }
+            // A reading at exactly 3 s is still used.
+            let (mut p, _) = raised(5, ceiling);
+            assert_eq!(p.update(now, temp(60_000, now - STALE_NS)).1, None);
+            assert_eq!(p.cap(), ceiling);
+            // A reading that has not changed for 60 s is stuck, even while fresh.
+            let (mut p, t) = raised(5, ceiling);
+            let since = t + S;
+            assert_eq!(p.update(since, temp(61_234, since)).1, None);
+            assert_eq!(p.update(since + STUCK_NS - 1, temp(61_234, since + STUCK_NS - 1)).1, None);
+            assert_eq!(p.cap(), ceiling);
+            let change = p.update(since + STUCK_NS, temp(61_234, since + STUCK_NS)).1.unwrap();
+            assert_eq!((change.to, change.why), (5, Why::NoTemperature(Source::Stuck)));
+        }
+    }
+
+    #[test]
+    fn after_a_fallback_the_cap_climbs_again_one_state_per_two_seconds() {
+        for ceiling in 6..=8 {
+            let (mut p, t) = raised(5, ceiling);
+            let _ = p.update(t + S, Reading::Failed { errno: -19, at: t + S });
+            assert_eq!(p.cap(), 5);
+            // A usable reading right away does not raise before 2 s have passed since the fall.
+            let _ = p.update(t + 2 * S, temp(55_000, t + 2 * S));
+            assert_eq!(p.cap(), 5);
+            for step in 0..ceiling - 5 {
+                let now = t + 3 * S + i64::from(step) * UP_PACE_NS;
+                let _ = p.update(now, temp(55_001 + step as i32, now));
+                assert_eq!(p.cap(), 6 + step);
+            }
+            assert_eq!(p.cap(), ceiling);
+        }
+    }
+
+    #[test]
+    fn hold_never_leaves_the_safe_cap() {
+        for ceiling in 6..=8 {
+            let mut p = Policy::new(false, 5, ceiling, HOT);
+            for i in 0..40 {
+                let now = i * S;
+                let reading = match i % 4 {
+                    0 => temp(40_000 + i as i32, now),
+                    1 => temp(85_000 + i as i32, now),
+                    2 => temp(95_000 + i as i32, now),
+                    _ => Reading::Failed { errno: -19, at: now },
+                };
+                assert_eq!(p.update(now, reading).1, None);
+                assert_eq!((p.cap(), p.allowed(now)), (5, 5));
+            }
+            assert_eq!(p.ceiling(), ceiling);
+            assert_eq!(p.counts(), (0, 0));
+        }
+    }
+
+    #[test]
+    fn a_ceiling_at_the_safe_cap_never_moves() {
+        // Today's boots: asahi.t8122_pstate_cap of 1 to 5 gives safe == ceiling.
+        for cap in 1..=5 {
+            let mut p = Policy::new(true, cap, cap, HOT);
+            for i in 0..40 {
+                let now = i * S;
+                let reading = match i % 5 {
+                    0 => temp(40_000 + i as i32, now),
+                    1 => temp(81_000 + i as i32, now),
+                    2 => temp(99_000 + i as i32, now),
+                    3 => Reading::None,
+                    _ => Reading::Failed { errno: -19, at: now },
+                };
+                assert_eq!(p.update(now, reading).1, None);
+                assert_eq!((p.cap(), p.allowed(now)), (cap, cap));
+            }
+            assert_eq!(p.counts(), (0, 0));
+        }
+        // A ceiling below the safe cap is raised to it, not the other way round.
+        let p = Policy::new(true, 5, 3, HOT);
+        assert_eq!((p.safe(), p.ceiling(), p.cap()), (5, 5, 5));
+    }
+
+    #[test]
+    fn the_per_job_check_is_required_only_while_the_ceiling_is_above_the_safe_cap() {
+        for ceiling in 6..=8 {
+            // On and hold: only the runtime cap keeps the firmware below its ceiling.
+            assert!(Policy::new(true, 5, ceiling, HOT).above_safe());
+            assert!(Policy::new(false, 5, ceiling, HOT).above_safe());
+            // Raised, lowered or fallen back, the requirement stays for the whole boot.
+            let (mut p, t) = raised(5, ceiling);
+            assert!(p.above_safe());
+            let _ = p.update(t + S, Reading::None);
+            assert_eq!(p.cap(), 5);
+            assert!(p.above_safe());
+        }
+        // Today's boots (a ceiling of 1 to 5 equals the safe cap) and the limit off (the
+        // governor gets the fixed cap as both) keep asahi.m3_retire_mmio in charge.
+        for cap in 1..=5 {
+            assert!(!Policy::new(true, cap, cap, HOT).above_safe());
+            assert!(!Policy::new(false, cap, cap, HOT).above_safe());
+        }
+        assert!(!Policy::new(true, 5, 3, HOT).above_safe());
+    }
+
+    #[test]
+    fn a_firmware_that_ignores_a_lowered_cap_is_found_after_twenty_checks_over_three_seconds() {
+        let (mut p, t) = raised(5, 8);
+        let fell = t + S;
+        let _ = p.update(fell, Reading::None);
+        assert_eq!((p.cap(), p.allowed(fell)), (5, 8));
+        // Within the grace period a state of 8 is not "over".
+        assert!(p.note_check(fell + 500 * MS, false).is_none());
+        // Afterwards: 20 checks in less than 3 s are not enough; the next one 3 s after the
+        // first is.
+        let start = fell + GRACE_NS;
+        for i in 0..19 {
+            assert!(p.note_check(start + i * 100 * MS, true).is_none());
+        }
+        assert!(p.note_check(start + IGNORED_NS - 1, true).is_none());
+        assert_eq!(p.note_check(start + IGNORED_NS, true), Some((21, IGNORED_NS)));
+        // One check within the cap starts the count again.
+        let again = start + IGNORED_NS + MS;
+        assert!(p.note_check(again, false).is_none());
+        // 19 checks are not enough however long they span; the 20th then is.
+        for i in 0..19 {
+            assert!(p.note_check(again + (i + 1) * S, true).is_none());
+        }
+        assert_eq!(p.note_check(again + 20 * S, true), Some((20, 19 * S)));
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    const HOT: i32 = 80_000;
+    const US: i64 = 1_000;
+
+    /// One check: when, the runtime cap after it, and whether it found that the firmware
+    /// does not follow the runtime cap.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    struct Check {
+        at: i64,
+        cap: u32,
+        ignored: bool,
+    }
+
+    /// A client that keeps the GPU's one lane busy with render batches of `batch` ns, as the
+    /// runtime publishes them (`m3_runtime::Inner::publish_next` and `pipeline_slot`): one
+    /// batch when none is in flight, more behind it up to `depth` while `bounded` is false or
+    /// [`Policy::overlap_allowed`] allows it. The oldest batch retires when it ends; only a
+    /// retirement with no later batch in flight runs the check (`Config::check_pstate`): the
+    /// governor's update with the latest sensor reading, then [`Policy::note_check`]. The
+    /// sensor is read every 500 ms; `temp` gives the die temperature at a time and `over`
+    /// whether the firmware then reports a state above the allowed cap. Returns every check,
+    /// the first being the one after boot at 0.
+    fn run(
+        p: &mut Policy,
+        depth: usize,
+        batch: i64,
+        until: i64,
+        bounded: bool,
+        temp: impl Fn(i64) -> i32,
+        over: impl Fn(i64) -> bool,
+    ) -> Vec<Check> {
+        let check = |p: &mut Policy, now: i64| {
+            let at = now - now % (500 * MS);
+            // A small wobble keeps a constant temperature from reading as stuck.
+            let mc = temp(at) + (at / (500 * MS) % 3) as i32;
+            let _ = p.update(now, Reading::Temp { mc, at, zones: 1 });
+            let ignored = p.note_check(now, over(now)).is_some();
+            Check { at: now, cap: p.cap(), ignored }
+        };
+        let mut checks = vec![check(p, 0)];
+        // When each batch in flight ends, oldest first.
+        let mut active: VecDeque<i64> = VecDeque::new();
+        let mut now = 0;
+        while now < until {
+            while active.len() < depth && (active.is_empty() || !bounded || p.overlap_allowed(now)) {
+                let start = active.back().copied().unwrap_or(now).max(now);
+                active.push_back(start + batch);
+            }
+            now = active.pop_front().unwrap();
+            if active.is_empty() {
+                checks.push(check(p, now));
+            }
+        }
+        checks
+    }
+
+    fn longest_gap(checks: &[Check], until: i64) -> i64 {
+        let mut gap = 0;
+        for pair in checks.windows(2) {
+            gap = gap.max(pair[1].at - pair[0].at);
+        }
+        gap.max(until - checks.last().unwrap().at)
+    }
+
+    fn cool(_: i64) -> i32 {
+        55_000
+    }
+
+    fn obeys(_: i64) -> bool {
+        false
+    }
+
+    /// Critical (90 C) from 10 s on.
+    fn hot_from_10_s(at: i64) -> i32 {
+        if at >= 10 * S { 90_000 } else { 55_000 }
+    }
+
+    #[test]
+    fn without_the_bound_a_full_pipeline_never_checks_and_the_cap_stays_up() {
+        // Today's pipelining with a ceiling of 8: after the check at boot, a client that keeps
+        // two batches in flight is never checked again, so 90 C does not lower the cap.
+        let mut p = Policy::new(true, 5, 8, HOT);
+        for i in 0..4 {
+            let at = i * UP_PACE_NS;
+            let _ = p.update(at, Reading::Temp { mc: 50_000 + i as i32, at, zones: 1 });
+        }
+        assert_eq!(p.cap(), 8);
+        let checks = run(&mut p, 2, 2 * MS, 20 * S, false, hot_from_10_s, obeys);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(p.cap(), 8);
+    }
+
+    #[test]
+    fn with_the_bound_a_full_pipeline_is_checked_every_500_ms_plus_its_batches() {
+        for depth in 1..=4usize {
+            for batch in [100 * US, 2 * MS, 4 * MS, 50 * MS] {
+                let until = 20 * S;
+                let mut p = Policy::new(true, 5, 8, HOT);
+                let checks = run(&mut p, depth, batch, until, true, cool, obeys);
+                let bound = CHECK_EVERY_NS + depth as i64 * batch;
+                let gap = longest_gap(&checks, until);
+                assert!(gap <= bound, "depth {depth} batch {batch}: gap {gap} > {bound}");
+                if depth == 1 {
+                    // No pipelining: every retirement checks, as today.
+                    assert_eq!(checks.len() as i64, until / batch + 1);
+                } else {
+                    // A drain per 500 ms or so, not one per batch.
+                    assert!((checks.len() as i64) < 2 * until / CHECK_EVERY_NS + 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn with_the_bound_a_full_pipeline_cannot_hold_a_raised_cap_when_hot() {
+        for depth in 2..=4usize {
+            for batch in [100 * US, 2 * MS, 4 * MS] {
+                let mut p = Policy::new(true, 5, 8, HOT);
+                let checks = run(&mut p, depth, batch, 20 * S, true, hot_from_10_s, obeys);
+                // The cap rose to 8 while cool.
+                assert!(checks.iter().any(|c| c.at < 10 * S && c.cap == 8));
+                // The sensor reading taken at 10 s is critical. The first check after it comes
+                // within the bound and falls straight to 5, where the cap stays.
+                let deadline = 10 * S + CHECK_EVERY_NS + depth as i64 * batch;
+                let fell = checks.iter().find(|c| c.at >= 10 * S).unwrap();
+                assert!(fell.at <= deadline, "depth {depth} batch {batch}: {} > {deadline}", fell.at);
+                assert_eq!(fell.cap, 5);
+                assert!(checks.iter().filter(|c| c.at >= fell.at).all(|c| c.cap == 5));
+            }
+        }
+    }
+
+    #[test]
+    fn with_the_bound_a_firmware_that_ignores_the_cap_is_found_in_a_full_pipeline() {
+        // Hold with a ceiling of 8 (the first qualification step): the runtime cap stays 5. A
+        // firmware that reports a state above it after boot is found after 20 checks spanning
+        // 3 s, about 10 s into a full pipeline. Without the bound it is never found.
+        for bounded in [true, false] {
+            let mut p = Policy::new(false, 5, 8, HOT);
+            let checks = run(&mut p, 2, 2 * MS, 20 * S, bounded, cool, |now| now > 0);
+            let found = checks.iter().find(|c| c.ignored);
+            if bounded {
+                let at = found.expect("never found").at;
+                assert!(at <= 20 * (CHECK_EVERY_NS + 2 * 2 * MS), "found at {at}");
+            } else {
+                assert_eq!(found, None);
+            }
+            assert!(checks.iter().all(|c| c.cap == 5));
+        }
+    }
+
+    #[test]
+    fn a_ceiling_at_the_safe_cap_keeps_todays_pipelining() {
+        // Every boot today: the bound never holds a batch back.
+        for cap in 1..=5 {
+            for depth in 1..=4usize {
+                let mut p = Policy::new(true, cap, cap, HOT);
+                let bounded = run(&mut p, depth, 2 * MS, 5 * S, true, hot_from_10_s, obeys);
+                let mut q = Policy::new(true, cap, cap, HOT);
+                let today = run(&mut q, depth, 2 * MS, 5 * S, false, hot_from_10_s, obeys);
+                assert_eq!(bounded, today);
+                for now in [0, CHECK_EVERY_NS, 100 * S] {
+                    assert!(p.overlap_allowed(now));
+                }
+            }
+        }
+        // Without any check yet, a ceiling above the safe cap allows no overlap; after one,
+        // for 500 ms.
+        assert!(!Policy::new(true, 5, 8, HOT).overlap_allowed(0));
+        let mut p = Policy::new(false, 5, 6, HOT);
+        let _ = p.note_check(S, false);
+        assert!(p.overlap_allowed(S + CHECK_EVERY_NS - 1));
+        assert!(!p.overlap_allowed(S + CHECK_EVERY_NS));
+    }
+}
+
+#[cfg(test)]
+mod tuning_tests {
+    use super::*;
+
+    fn temp(mc: i32, at: i64) -> Reading {
+        Reading::Temp { mc, at, zones: 1 }
+    }
+
+    /// A policy with `hot` and `gap` in degrees Celsius that has climbed from 5 to 8 on cool
+    /// readings; returns it with the time of the last raise.
+    fn raised(hot_c: u64, gap_c: u64) -> (Policy, i64) {
+        let (hot, gap, _) = clamp_thresholds(hot_c, gap_c);
+        let mut p = Policy::new(true, 5, 8, hot);
+        p.set_thresholds(hot, gap);
+        let mut now = 0;
+        for step in 0..3 {
+            now = i64::from(step) * UP_PACE_NS;
+            let _ = p.update(now, temp(50_000 + step, now));
+        }
+        assert_eq!(p.cap(), 8);
+        (p, now)
+    }
+
+    #[test]
+    fn the_parameters_are_clamped_to_their_bounds() {
+        assert_eq!(clamp_thresholds(THERMAL_HOT_DEFAULT, COOL_GAP_DEFAULT), (80_000, 10_000, false));
+        assert_eq!(clamp_thresholds(85, 10), (85_000, 10_000, false));
+        assert_eq!(clamp_thresholds(92, 3), (92_000, 3_000, false));
+        assert_eq!(clamp_thresholds(93, 3), (92_000, 3_000, true));
+        assert_eq!(clamp_thresholds(150, 0), (92_000, 3_000, true));
+        assert_eq!(clamp_thresholds(39, 11), (40_000, 10_000, true));
+        assert_eq!(clamp_thresholds(40, 10), (40_000, 10_000, false));
+    }
+
+    #[test]
+    fn the_default_gap_keeps_the_thresholds_of_new() {
+        for hot_c in [THERMAL_HOT_MIN, THERMAL_HOT_DEFAULT, 85, THERMAL_HOT_MAX] {
+            let (hot, gap, _) = clamp_thresholds(hot_c, COOL_GAP_DEFAULT);
+            let mut p = Policy::new(true, 5, 8, hot);
+            assert!(!p.set_thresholds(hot, gap));
+            assert_eq!(p.thresholds(), (hot - COOL_BELOW_MC, hot, hot + CRITICAL_ABOVE_MC));
+        }
+        // At the top of both ranges it is up at or below 89 C, down at or above 92 C, safe at 100 C.
+        let (hot, gap, _) = clamp_thresholds(THERMAL_HOT_MAX, COOL_GAP_MIN);
+        let mut p = Policy::new(true, 5, 8, hot);
+        assert!(p.set_thresholds(hot, gap));
+        assert_eq!(p.thresholds(), (89_000, 92_000, 100_000));
+        assert!(!p.set_thresholds(hot, gap));
+    }
+
+    #[test]
+    fn a_narrower_gap_raises_the_cap_again_at_a_higher_temperature() {
+        for (gap_c, raises_at_75) in [(10, false), (5, true), (3, true)] {
+            let (mut p, t) = raised(80, gap_c);
+            // One step down at 80 C.
+            let now = t + 500 * MS;
+            assert_eq!(p.update(now, temp(80_000, now)).1.map(|c| c.to), Some(7));
+            // 75 C, 2 s later: up again only when 75 C is at or below 80 C minus the gap.
+            let now = now + UP_PACE_NS;
+            let change = p.update(now, temp(75_000, now)).1;
+            assert_eq!(change.is_some(), raises_at_75, "gap {gap_c}");
+            assert_eq!(p.cap(), if raises_at_75 { 8 } else { 7 });
+        }
+        // With a gap of 3, 77.001 C holds and 77 C raises.
+        let (mut p, t) = raised(80, 3);
+        let now = t + 500 * MS;
+        let _ = p.update(now, temp(80_000, now));
+        assert_eq!(p.cap(), 7);
+        assert_eq!(p.update(now + UP_PACE_NS, temp(77_001, now + UP_PACE_NS)).1, None);
+        let later = now + 2 * UP_PACE_NS;
+        assert_eq!(p.update(later, temp(77_000, later)).1.map(|c| (c.to, c.why)), Some((8, Why::Cool)));
+    }
+
+    #[test]
+    fn a_higher_hot_keeps_the_cap_where_the_default_would_lower_it() {
+        for (hot_c, lowers_at_84) in [(80, true), (85, false), (88, false), (92, false)] {
+            let (mut p, t) = raised(hot_c, 10);
+            let now = t + 500 * MS;
+            assert_eq!(p.update(now, temp(84_000, now)).1.is_some(), lowers_at_84, "hot {hot_c}");
+        }
+        // Critical follows hot: 88 C is critical at the default, merely hot at 85 and nothing
+        // at 92.
+        for (hot_c, cap) in [(80, 5), (85, 7), (92, 8)] {
+            let (mut p, t) = raised(hot_c, 10);
+            let now = t + 500 * MS;
+            let _ = p.update(now, temp(88_000, now));
+            assert_eq!(p.cap(), cap, "hot {hot_c}");
+        }
+    }
+
+    #[test]
+    fn thresholds_changed_at_runtime_apply_from_the_next_reading_with_the_usual_pacing() {
+        // Running at 8 with hot 92, 86 C holds.
+        let (mut p, t) = raised(92, 10);
+        let now = t + 500 * MS;
+        assert_eq!(p.update(now, temp(86_000, now)).1, None);
+        // Hot back to 85 at runtime. The cap does not move by itself.
+        let (hot, gap, _) = clamp_thresholds(85, 10);
+        assert!(p.set_thresholds(hot, gap));
+        assert_eq!(p.cap(), 8);
+        // The next update lowers one state on that reading, which was not acted on yet. Acted
+        // on once, it is not used again. The next fresh reading 500 ms later lowers one more.
+        let (_, change) = p.update(now + MS, temp(86_000, now));
+        assert_eq!(change.map(|c| (c.to, c.why)), Some((7, Why::Hot)));
+        assert_eq!(p.update(now + 501 * MS, temp(86_000, now)).1, None);
+        let next = now + 501 * MS;
+        assert_eq!(p.update(next, temp(86_001, next)).1.map(|c| (c.to, c.why)), Some((6, Why::Hot)));
+        // Hot 80 at runtime. 88.5 C is now critical, so the safe cap at once without pacing.
+        let (hot, gap, _) = clamp_thresholds(80, 10);
+        assert!(p.set_thresholds(hot, gap));
+        let soon = next + MS;
+        assert_eq!(p.update(soon, temp(88_500, soon)).1.map(|c| (c.to, c.why)), Some((5, Why::Critical)));
+        // A gap of 3 at runtime. 77 C now raises again after 2 s.
+        let (hot, gap, _) = clamp_thresholds(80, 3);
+        assert!(p.set_thresholds(hot, gap));
+        let up = soon + UP_PACE_NS;
+        assert_eq!(p.update(up, temp(77_000, up)).1.map(|c| (c.to, c.why)), Some((6, Why::Cool)));
+        // Unusable readings still drop to the safe cap whatever the thresholds.
+        let gone = up + MS;
+        assert_eq!(p.update(gone, Reading::None).1.map(|c| c.to), Some(5));
     }
 }

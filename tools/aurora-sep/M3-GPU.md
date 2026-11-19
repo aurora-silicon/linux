@@ -109,3 +109,39 @@ to this Mac; neither the installer nor this option migrates firmware or stage1.
 J615 hardware qualification is pending. The retained **Aurora previous (GPU off)**
 entry remains available. After reboot and desktop login, run
 `aurora-m3-gpu-check --details` and collect the installer's `--m3-report`.
+
+## J613/J615 temperature-guarded performance ceiling
+
+The T8122 default ceiling remains state 2. With the state-2 fallback repair in
+this driver, an explicit `asahi.t8122_pstate_cap=5 asahi.m3_thermal=on` permits
+states up to 5 only while the governor has usable die-temperature readings.
+Do not apply this higher ceiling to an older kernel: its implementation can
+also raise the boot and sensor-failure cap.
+
+The repaired driver starts at state 2 and immediately returns there for missing,
+failed, stale, stuck or implausible temperature readings, or at the critical
+temperature. A lower requested ceiling still wins. `m3_thermal=off` and `hold`
+do not permit states above 2. Non-T8122 cap selection is unchanged.
+
+J615 now supplies `macsmc_soc_die` from the six Tg GPU-family keys and the six
+CPU die keys also used on J613. All twelve must be discovered before the J615
+zone is registered; a later read failure in any sensor fails the whole reading.
+Do not shorten the `apple,soc-die-keys` list in `t8122.dtsi`. These are raw sensor
+readings, not a calibration or a hardware safety certification.
+
+Caps 6 to 8 (up to 1338 MHz, the top of the T8122 table) are an experiment on top
+of this. They are admitted only with `asahi.m3_thermal=on`, which is also the
+default. With `off` or `hold` the driver lowers them to 5 with one boot line and
+the GPU still starts. Boot, missing readings and the critical temperature stay at
+state 2. The runtime range is 2 to the cap, and the firmware's highest state is
+the cap. Values of 9 or more are refused. While the firmware's highest state is
+above 2 the driver checks the reported state at every retirement with no later
+batch in flight, whatever `asahi.m3_retire_mmio` says, and lets the pipeline
+drain once the last check is 500 ms old. `air-gpu-oneshot.sh` still offers 1 to 5.
+
+First boot with `asahi.t8122_pstate_cap=5 asahi.m3_thermal=hold` and confirm that
+the firmware respects the runtime cap of 2 under GPU load. Before relying on
+`m3_thermal=on`, check the boot log for all twelve keys, a runtime range of 2..5
+and usable temperatures during GPU work. Keep a bootable previous kernel.
+Verify rendering and temperature response on the running kernel; passing the
+host policy tests alone does not qualify hardware behavior.
