@@ -39,10 +39,10 @@ Contact:	linux-usb@vger.kernel.org
 Description:
 		The device's iAddtionalInfoURL string, empty if it has none.
 
-What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>/svid
-What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>/mode
-What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>/vdo
-What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>/description
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>_svid
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>_mode
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>_vdo
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>_description
 Date:		November 2026
 Contact:	linux-usb@vger.kernel.org
 Description:
@@ -52,7 +52,7 @@ Description:
 		Capability descriptor (only present when the device provides
 		one) and the iAlternateModeString string (empty if none).
 
-What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>/state
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>_state
 Date:		November 2026
 Contact:	linux-usb@vger.kernel.org
 Description:

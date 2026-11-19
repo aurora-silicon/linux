@@ -78,16 +78,14 @@ struct bb_mode {
 	u32 vdo;
 	enum bb_mode_state state;
 	char *desc;
-	char name[16];
 	struct bb_mode_attr attrs[BB_NR_MODE_ATTRS];
-	struct attribute *attr_ptrs[BB_NR_MODE_ATTRS + 1];
-	struct attribute_group group;
 };
 
 struct usb_billboard {
 	struct usb_interface *intf;
 	const struct usb_billboard_cap_descriptor *cap;
 	char *url;
+	struct attribute_group group;
 	unsigned int nr_modes;
 	struct bb_mode modes[] __counted_by(nr_modes);
 };
@@ -184,15 +182,9 @@ static struct attribute *bb_attrs[] = {
 	&dev_attr_version.attr,
 	&dev_attr_additional_failure_info.attr,
 	&dev_attr_num_modes.attr,
-	NULL
 };
 
-static const struct attribute_group bb_group = {
-	.name = "billboard",
-	.attrs = bb_attrs,
-};
-
-/* Per-mode attributes, in billboard/altmodeN */
+/* Per-mode attributes, billboard/altmode<N>_<field> */
 
 static ssize_t bb_mode_show(struct device *dev, struct device_attribute *attr,
 			    char *buf)
@@ -223,29 +215,51 @@ static const char * const bb_mode_attr_names[BB_NR_MODE_ATTRS] = {
 	[BB_ATTR_DESC]	= "description",
 };
 
-static int bb_add_mode_group(struct usb_billboard *bb, unsigned int i)
+/*
+ * Sysfs groups cannot nest, so everything lives in one "billboard" group:
+ * the device-wide attributes plus altmode<N>_<field> for each mode.
+ */
+static int bb_add_group(struct usb_billboard *bb)
 {
-	struct bb_mode *m = &bb->modes[i];
-	unsigned int a, n = 0;
+	struct device *dev = &bb->intf->dev;
+	struct attribute **attrs;
+	unsigned int i, a, n = 0;
 
-	snprintf(m->name, sizeof(m->name), "altmode%u", i);
-	for (a = 0; a < BB_NR_MODE_ATTRS; a++) {
-		struct bb_mode_attr *ma = &m->attrs[a];
+	attrs = devm_kcalloc(dev, ARRAY_SIZE(bb_attrs) +
+			     bb->nr_modes * BB_NR_MODE_ATTRS + 1,
+			     sizeof(*attrs), GFP_KERNEL);
+	if (!attrs)
+		return -ENOMEM;
 
-		if (a == BB_ATTR_VDO && !m->has_vdo)
-			continue;
-		sysfs_attr_init(&ma->attr.attr);
-		ma->attr.attr.name = bb_mode_attr_names[a];
-		ma->attr.attr.mode = 0444;
-		ma->attr.show = bb_mode_show;
-		ma->mode = m;
-		m->attr_ptrs[n++] = &ma->attr.attr;
+	for (a = 0; a < ARRAY_SIZE(bb_attrs); a++)
+		attrs[n++] = bb_attrs[a];
+
+	for (i = 0; i < bb->nr_modes; i++) {
+		struct bb_mode *m = &bb->modes[i];
+
+		for (a = 0; a < BB_NR_MODE_ATTRS; a++) {
+			struct bb_mode_attr *ma = &m->attrs[a];
+			const char *name;
+
+			if (a == BB_ATTR_VDO && !m->has_vdo)
+				continue;
+			name = devm_kasprintf(dev, GFP_KERNEL, "altmode%u_%s",
+					      i, bb_mode_attr_names[a]);
+			if (!name)
+				return -ENOMEM;
+			sysfs_attr_init(&ma->attr.attr);
+			ma->attr.attr.name = name;
+			ma->attr.attr.mode = 0444;
+			ma->attr.show = bb_mode_show;
+			ma->mode = m;
+			attrs[n++] = &ma->attr.attr;
+		}
 	}
-	m->attr_ptrs[n] = NULL;
-	m->group.name = m->name;
-	m->group.attrs = m->attr_ptrs;
 
-	return devm_device_add_group(&bb->intf->dev, &m->group);
+	bb->group.name = "billboard";
+	bb->group.attrs = attrs;
+
+	return devm_device_add_group(dev, &bb->group);
 }
 
 /* Descriptor parsing */
@@ -375,14 +389,9 @@ static int billboard_probe(struct usb_interface *intf,
 
 	usb_set_intfdata(intf, bb);
 
-	ret = devm_device_add_group(&intf->dev, &bb_group);
+	ret = bb_add_group(bb);
 	if (ret)
 		return ret;
-	for (i = 0; i < nr; i++) {
-		ret = bb_add_mode_group(bb, i);
-		if (ret)
-			return ret;
-	}
 
 	for (i = 0; i < nr; i++)
 		bb_log_mode(intf, i, &bb->modes[i]);
