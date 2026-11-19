@@ -92,6 +92,12 @@
  *
  * Port 0 carries the N1 (Wi-Fi and Bluetooth), described disabled until the boot loader trains
  * it (pci@0,0 below).
+ *
+ * Port 1 carries the SD card reader (t6050-sdreader.dtsi), as on the MacBook Pros. From this
+ * board's ADT: port1, phy1 and intr2axi1 are apcie0 reg[22], reg[24] and reg[25], its interrupt
+ * 1531 (apcie0 interrupts[1]). The kernel does not train it here: the bus it would number the
+ * port is port 3's. Like port 0, it stays disabled with its DART until a boot loader that powers
+ * and trains it enables both and renumbers the buses.
  */
 &pcie0 {
 	reg = <0x1c 0xb0000000 0x0 0x10000000>,
@@ -104,25 +110,31 @@
 	      <0x4 0x13024000 0x0 0x4000>,
 	      <0x4 0x10028000 0x0 0x8000>,
 	      <0x4 0x17010000 0x0 0x4000>,
-	      <0x4 0x10024000 0x0 0x4000>;
+	      <0x4 0x10024000 0x0 0x4000>,
+	      <0x4 0x11028000 0x0 0x8000>,
+	      <0x4 0x17014000 0x0 0x4000>,
+	      <0x4 0x11024000 0x0 0x4000>;
 	reg-names = "config", "rc", "port2", "phy2", "intr2axi2",
 		    "port3", "phy3", "intr2axi3",
-		    "port0", "phy0", "intr2axi0";
+		    "port0", "phy0", "intr2axi0",
+		    "port1", "phy1", "intr2axi1";
 	interrupts = <AIC_IRQ 0 1539 IRQ_TYPE_LEVEL_HIGH>,
 		     <AIC_IRQ 0 1547 IRQ_TYPE_LEVEL_HIGH>,
-		     <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>;
-	interrupt-names = "port2", "port3", "port0";
+		     <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 0 1531 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "port2", "port3", "port0", "port1";
 
 	/*
 	 * The boot loader numbers port 2's secondary bus 1 and port 3's 2;
-	 * port 0's is 3 until a boot loader that trains it renumbers all three
-	 * in the PCI core's order. The N1's three functions are on DART
-	 * streams 1-3.
+	 * port 0's is 3 and port 1's 4 until a boot loader that trains them
+	 * renumbers all four in the PCI core's order. The N1's three functions
+	 * are on DART streams 1-3, the SD reader on stream 1.
 	 */
 	iommu-map = <0x100 &dart_apcie2 1 1>,
 		    <0x200 &dart_apcie3 1 1>,
-		    <0x300 &dart_apcie0 1 3>;
-	bus-range = <0 3>;
+		    <0x300 &dart_apcie0 1 3>,
+		    <0x400 &dart_apcie1 1 1>;
+	bus-range = <0 4>;
 
 	port02: pci@2,0 {
 		device_type = "pci";
@@ -226,17 +238,29 @@
 	};
 };
 
+#define T6050_SDREADER_BUS 4
+#include "t6050-sdreader.dtsi"
+
+/* Down at boot: a boot loader that powers and trains port 1 enables both */
+&port01 {
+	status = "disabled";
+};
+
+&dart_apcie1 {
+	status = "disabled";
+};
+
 /* The pins this board's nodes name, and no others */
 &pinctrl_ap {
 	/*
 	 * Every pin reads cleanly, but only
-	 * the pins a node in this file names are exposed: 80 (PCIe port 0's PERST#, ADT
-	 * pci-bridge0 function-perst), 106 (amp IRQ), 107 (amp shutdown), 134 (jack IRQ)
+	 * the pins a node in this file names are exposed: 80 and 81 (PCIe ports 0 and 1's
+	 * PERST#, ADT pci-bridge0 and pci-bridge1 function-perst), 106 (amp IRQ), 107 (amp shutdown), 134 (jack IRQ)
 	 * and 139 (jack codec reset), from the ADT's audio-speaker and audio-codec-output.
 	 * A reserved line cannot be requested (gpiolib answers -EINVAL), so a node that
 	 * names a new pin of pinctrl_ap opens it here too.
 	 */
-	gpio-reserved-ranges = <0 80>, <81 25>, <108 26>, <135 4>, <140 81>;
+	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 4>, <140 81>;
 };
 
 &i2c1 {
