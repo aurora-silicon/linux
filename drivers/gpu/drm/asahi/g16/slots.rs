@@ -182,15 +182,15 @@ impl PassSlot {
             return Err(EINVAL);
         }
         let va = |pass0: u64| client::pass_va(i, pass0);
-        let tpc = if i != 0 {
-            client::TPC_SLOT_SIZE
-        } else {
-            client::TPC_SIZE
+        let tpc = match i {
+            0 => client::TPC_SIZE,
+            1 => client::TPC_SLOT_SIZE,
+            _ => client::EXT_TPC_SIZE,
         };
-        let tilemap = if i != 0 {
-            client::TILEMAP_SLOT_SIZE
-        } else {
-            client::TILEMAP_SIZE
+        let tilemap = match i {
+            0 => client::TILEMAP_SIZE,
+            1 => client::TILEMAP_SLOT_SIZE,
+            _ => client::EXT_TILEMAP_SIZE,
         };
         let _ = pre_records;
 

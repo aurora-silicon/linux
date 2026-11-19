@@ -372,6 +372,10 @@ pub(crate) mod client {
     pub(crate) const TILEMAP_SIZE: u64 = 0x800000;
     pub(crate) const TPC_SLOT_SIZE: u64 = TPC_SIZE;
     pub(crate) const TILEMAP_SLOT_SIZE: u64 = TILEMAP_SIZE;
+    /// TPC and tilemap of pass slots 2 and 3: one layer up to 8192x8192 fits; larger renders
+    /// take slots 0 and 1 (`Slots::pick_pass` checks every slot's capacity).
+    pub(crate) const EXT_TPC_SIZE: u64 = 0x100000;
+    pub(crate) const EXT_TILEMAP_SIZE: u64 = 0x100000;
     pub(crate) const TPC_SLOT_STRIDE: u64 = WORK_STRIDE;
     pub(crate) const CT: u64 = 0x7080000000;
     pub(crate) const CT_STRIDE: u64 = 0x1000000;
