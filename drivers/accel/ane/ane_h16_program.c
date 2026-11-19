@@ -632,6 +632,34 @@ static int h16_pool_room(struct ane_h16_session *s, const size_t *lengths,
 }
 
 /*
+ * Every CREATE makes the firmware ask for a 2 MiB EXPP process pool by
+ * SHAREDMALLOC and wait for it before it answers; a pool it could not get
+ * leaves the CREATE stalled and the engine quarantined, and with it every
+ * other program of the session. Take the pool before LOAD instead
+ * (ane_fw_transport_shared_reserve()), so that without memory or quota the
+ * LOAD fails cleanly, before any traffic. A FREE of a torn-down program's
+ * pool may still be posted (it can come after the post-UNLOAD settle):
+ * serve it and try once more before giving up.
+ */
+static int h16_process_pool(struct ane_h16_session *s)
+{
+	int ret = ane_fw_transport_shared_reserve(s->transport, SZ_2M, ANE_FW_SHARED_EXPP);
+
+	if (ret == -ENOSPC) {
+		ret = ane_fw_transport_settle(s->transport, s->settle_ns,
+					      max(s->settle_ns, ANE_H16_SETTLE_LIMIT_NS));
+		if (ret < 0)
+			return h16_fail(s, ret);
+		ret = ane_fw_transport_shared_reserve(s->transport, SZ_2M,
+						      ANE_FW_SHARED_EXPP);
+	}
+	if (ret)
+		s->ops->log(s->ctx, "LOAD: no process pool", (u64)-ret,
+			    s->transport->shared_bytes);
+	return ret;
+}
+
+/*
  * Outside a request batch, the commands published since mark were all
  * acknowledged and the firmware keeps no pointer into them: give their
  * arena back. A batch gives back its own commands, and those published
@@ -1101,6 +1129,9 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	if (ret)
 		return ret;
 	ret = h16_load_room(s);
+	if (ret)
+		return ret;
+	ret = h16_process_pool(s);
 	if (ret)
 		return ret;
 	p = kzalloc_obj(*p);
@@ -2074,6 +2105,9 @@ static int h16_replay(struct ane_h16_session *s, struct ane_h16_program *p)
 	unsigned int i;
 	int ret;
 
+	ret = h16_process_pool(s);
+	if (ret)
+		return ret;
 	command = kzalloc(ANE_H16_CREATE_SIZE, GFP_KERNEL);
 	if (!command)
 		return -ENOMEM;

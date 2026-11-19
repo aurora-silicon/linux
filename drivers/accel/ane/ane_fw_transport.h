@@ -723,7 +723,9 @@ ane_fw_transport_free(struct ane_fw_transport *t, void *slot, u64 dva, u64 bytes
  * firmware frees it after UNLOAD (often only during a later program), but the
  * backing stays mapped until reset: without reuse the 12 MiB quota ran out at
  * the sixth program of a boot. Only memory the firmware itself gave back by
- * FREE is served again, and only for the same tag and size.
+ * FREE, or that the host reserved for the request
+ * (ane_fw_transport_shared_reserve()), is served again, and only for the
+ * same tag and size.
  */
 static inline unsigned int
 ane_fw_shared_reusable(const struct ane_fw_transport *t, size_t size, u64 tag)
@@ -737,11 +739,73 @@ ane_fw_shared_reusable(const struct ane_fw_transport *t, size_t size, u64 tag)
 	return t->shared_count;
 }
 
+/*
+ * A new shared allocation of size bytes under tag, within the host's caps
+ * (ANE_FW_SHARED_MAX entries, ANE_FW_SHARED_TOTAL bytes): its index, live.
+ */
+static inline int ane_fw_shared_add(struct ane_fw_transport *t, size_t size, u64 tag,
+				    unsigned int *index)
+{
+	struct ane_fw_surface s = {};
+	unsigned int i;
+	int ret;
+
+	if (t->shared_count == ANE_FW_SHARED_MAX || size > ANE_FW_SHARED_TOTAL -
+	    t->shared_bytes)
+		return -ENOSPC;
+	ret = t->ops->alloc(t->ctx, size, tag, &s);
+	if (ret)
+		return ret;
+	if (!ane_fw_surface_valid(&s) || !IS_ALIGNED(s.dva, SZ_16K) ||
+	    s.size != size || ane_fw_surfaces_overlap(&s, &t->ipc) ||
+	    ane_fw_surfaces_overlap(&s, &t->pool))
+		return -EPROTO;
+	for (i = 0; i < t->shared_count; i++)
+		if (ane_fw_surfaces_overlap(&s, &t->shared[i]))
+			return -EPROTO;
+	*index = t->shared_count;
+	t->shared_tags[t->shared_count] = tag;
+	t->shared_retired[t->shared_count] = false;
+	t->shared[t->shared_count++] = s;
+	t->shared_bytes += size;
+	return 0;
+}
+
+/*
+ * Make sure a later SHAREDMALLOC request of size bytes under tag is served
+ * from memory the host already has: a retired allocation of that tag and
+ * size, or a new one made now and kept retired for it. The firmware waits
+ * for the answer to every request, with its shared-memory lock held, and a
+ * request the host cannot serve is never answered: the command behind it
+ * stalls and only a power cycle recovers the engine. A request the host
+ * knows is coming is therefore taken before the command that causes it, so
+ * running out of memory or quota (-ENOMEM, -ENOSPC) refuses that command
+ * before the firmware sees it.
+ */
+static inline int ane_fw_transport_shared_reserve(struct ane_fw_transport *t, size_t size,
+						  u32 tag)
+{
+	unsigned int i;
+	int ret;
+
+	if (t->error)
+		return t->error;
+	if (!size || !IS_ALIGNED(size, SZ_16K))
+		return -EINVAL;
+	if (ane_fw_shared_reusable(t, size, tag) < t->shared_count)
+		return 0;
+	ret = ane_fw_shared_add(t, size, tag, &i);
+	if (ret)
+		return ret;
+	t->shared_retired[i] = true;
+	ane_fw_shared_note(t, "reserve", i);
+	return 0;
+}
+
 static inline int ane_fw_transport_irq(struct ane_fw_transport *t, u32 *pending);
 
 static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 {
-	struct ane_fw_surface s = {};
 	u64 word0, word1, word2;
 	size_t size;
 	unsigned int i;
@@ -801,33 +865,13 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 		ane_fw_shared_note(t, "reuse", i);
 		return 0;
 	}
-	if (t->shared_count == ANE_FW_SHARED_MAX || size > ANE_FW_SHARED_TOTAL -
-	    t->shared_bytes) {
-		ret = -ENOSPC;
-		goto refused;
-	}
-	ret = t->ops->alloc(t->ctx, size, word2, &s);
+	ret = ane_fw_shared_add(t, size, word2, &i);
 	if (ret)
 		goto refused;
-	if (!ane_fw_surface_valid(&s) || !IS_ALIGNED(s.dva, SZ_16K) ||
-	    s.size != size || ane_fw_surfaces_overlap(&s, &t->ipc) ||
-	    ane_fw_surfaces_overlap(&s, &t->pool)) {
-		ret = -EPROTO;
-		goto refused;
-	}
-	for (i = 0; i < t->shared_count; i++) {
-		if (ane_fw_surfaces_overlap(&s, &t->shared[i])) {
-			ret = -EPROTO;
-			goto refused;
-		}
-	}
-	t->shared_tags[t->shared_count] = word2;
-	t->shared[t->shared_count++] = s;
-	t->shared_bytes += size;
 	t->ops->store64(t->ctx, p + 8, 0);
-	t->ops->store64(t->ctx, p + 16, t->shared_count);
+	t->ops->store64(t->ctx, p + 16, i + 1);
 	t->ops->write_barrier(t->ctx);
-	t->ops->store64(t->ctx, p, s.dva | 1);
+	t->ops->store64(t->ctx, p, t->shared[i].dva | 1);
 	t->ops->write_barrier(t->ctx);
 	ane_fw_transport_doorbell(t, ANE_FW_SHAREDMALLOC);
 	ane_fw_transport_advance(t, ANE_FW_SHAREDMALLOC);
