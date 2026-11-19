@@ -32,6 +32,9 @@
 #include <linux/workqueue.h>
 
 #include "dwc3-apple-state.h"
+
+/* drivers/usb/typec/tipd, through symbol_get(): no load dependency on that module. */
+int tipd_port_replug(struct usb_role_switch *sw, u8 seconds);
 #include "glue.h"
 #include "io.h"
 
@@ -1340,10 +1343,26 @@ static void dwc3_apple_ss_check(struct dwc3_apple *appledwc)
 		ltssm = dwc3_readl(&appledwc->dwc, DWC3_GDBGLTSSM);
 	}
 
-	dev_warn(appledwc->dev,
-		 "TEST: SuperSpeed device not back after the sleep, %04x:%04x on USB2 only: PORTSC %#010x %#010x (%u), LTSSM %#010x (log only)\n",
-		 le16_to_cpu(usb2->descriptor.idVendor), le16_to_cpu(usb2->descriptor.idProduct),
-		 portsc[0], portsc[1], nports, ltssm);
+	/*
+	 * J714s: no host-side reset brings that SuperSpeed side back (a USB2 reset, a root port
+	 * warm reset or power cycle, a PIPE reset, xHCI rebuilt: 8 of 8 lost wakes, 11-18); a
+	 * replug does. Have the port controller replug the port, once: the display on it goes dark
+	 * for a few seconds, and both of the hub's sides enumerate again from the attach. The
+	 * replug runs on the port controller's work, after this check.
+	 */
+	{
+		int (*replug)(struct usb_role_switch *sw, u8 seconds) = symbol_get(tipd_port_replug);
+		int ret = -ENOENT;
+
+		if (replug) {
+			ret = replug(appledwc->role_sw, 1);
+			symbol_put(tipd_port_replug);
+		}
+		dev_warn(appledwc->dev,
+			 "SuperSpeed side of %04x:%04x not back after the sleep (PORTSC %#010x %#010x (%u), LTSSM %#010x): port replug requested (%d)\n",
+			 le16_to_cpu(usb2->descriptor.idVendor), le16_to_cpu(usb2->descriptor.idProduct),
+			 portsc[0], portsc[1], nports, ltssm, ret);
+	}
 	usb_put_dev(usb2);
 }
 
