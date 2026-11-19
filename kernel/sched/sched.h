@@ -1038,6 +1038,9 @@ struct root_domain {
 	/* Indicate one or more CPUs over-utilized (tipping point) */
 	bool			overutilized;
 
+	/* Spread across CPU capacities, see update_asym_spread() */
+	bool			asym_spread;
+
 	/*
 	 * The bit corresponding to a CPU gets set here if such CPU has more
 	 * than one runnable -deadline task (as it is below for RT tasks).

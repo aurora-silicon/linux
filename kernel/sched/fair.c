@@ -6337,12 +6337,23 @@ static inline int task_fits_cpu(struct task_struct *p, int cpu)
 	return (util_fits_cpu(util, uclamp_min, uclamp_max, cpu) > 0);
 }
 
+/* See update_asym_spread(). */
+static inline bool asym_spread(struct root_domain *rd)
+{
+	return sched_feat(ASYM_SPREAD) && READ_ONCE(rd->asym_spread);
+}
+
 static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
 {
 	int cpu = cpu_of(rq);
 
 	if (!sched_asym_cpucap_active())
 		return;
+
+	if (asym_spread(rq->rd)) {
+		rq->misfit_task_load = 0;
+		return;
+	}
 
 	/*
 	 * Affinity allows us to go somewhere higher?  Or are we on biggest
@@ -9280,9 +9291,10 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 
 	/*
 	 * For asymmetric CPU capacity systems, our domain of interest is
-	 * sd_asym_cpucapacity rather than sd_llc.
+	 * sd_asym_cpucapacity rather than sd_llc, unless load is spread
+	 * across capacities.
 	 */
-	if (sched_asym_cpucap_active()) {
+	if (sched_asym_cpucap_active() && !asym_spread(cpu_rq(target)->rd)) {
 		sd = rcu_dereference_all(per_cpu(sd_asym_cpucapacity, target));
 		/*
 		 * On an asymmetric CPU capacity system where an exclusive
@@ -11039,6 +11051,7 @@ static inline bool task_misfits_asym_cpu(struct lb_env *env, struct task_struct 
 	 * cannot make things worse, so let the LLC preference decide.
 	 */
 	if ((env->sd->flags & SD_ASYM_CPUCAPACITY) && p &&
+	    !asym_spread(env->dst_rq->rd) &&
 	    !task_fits_cpu(p, env->dst_cpu) &&
 	    task_fits_cpu(p, env->src_cpu))
 		return true;
@@ -12385,7 +12398,7 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 			continue;
 
 		if (sd_flags & SD_ASYM_CPUCAPACITY) {
-			if (rq->misfit_task_load) {
+			if (rq->misfit_task_load && !asym_spread(env->dst_rq->rd)) {
 				/*
 				 * Always mark the root domain overloaded so big
 				 * CPUs can pick up misfit tasks via newly idle
@@ -12490,6 +12503,7 @@ static bool update_sd_pick_busiest(struct lb_env *env,
 	 */
 	if ((env->sd->flags & SD_ASYM_CPUCAPACITY) &&
 	    (sgs->group_type <= group_fully_busy) &&
+	    !asym_spread(env->dst_rq->rd) &&
 	    (capacity_greater(sg->sgc->min_capacity, capacity_of(env->dst_cpu))))
 		return false;
 
@@ -13040,6 +13054,51 @@ static void update_idle_cpu_scan(struct lb_env *env,
  * @sds: variable to hold the statistics for this sched_domain.
  */
 
+/*
+ * Decides, when balancing the root domain of an asymmetric CPU capacity
+ * system, whether to balance load as if all CPU capacities were equal: while
+ * at least as many CPUs are saturated as there are CPUs of the highest
+ * capacity. Tasks are then not misfits on smaller CPUs, a group of bigger
+ * CPUs running one task each may lose tasks to smaller CPUs, and wake-ups
+ * look for an idle CPU in the target's LLC. Until then, tasks fill the
+ * biggest CPUs first, as usual.
+ *
+ * Several threads that saturate the biggest CPUs saturate one cluster. When
+ * the cluster, not the CPU, limits them, as with memory bandwidth on Apple
+ * SoCs (an M5 Max's six-core Everest cluster reads and writes about
+ * 180-210 GB/s, a Sawtooth cluster about 140 GB/s), spreading them across
+ * clusters raises their throughput: STREAM triad with 6 threads goes from
+ * 179 GB/s on the Everest cluster to 359 GB/s spread two per cluster, and
+ * with 12 threads from 317 to 353 GB/s. Compute-bound threads lose instead:
+ * 6-thread 7-Zip drops from 73.4k to 65.5k MIPS spread that way, while
+ * 6-thread SHA-256 gains 2%. Hence off by default.
+ */
+static void update_asym_spread(struct lb_env *env)
+{
+	struct root_domain *rd = env->dst_rq->rd;
+	unsigned long max_cap = 0;
+	int i, nr_big = 0, nr_busy = 0;
+	bool spread = false;
+
+	if (sched_feat(ASYM_SPREAD)) {
+		for_each_cpu(i, sched_domain_span(env->sd)) {
+			unsigned long cap = arch_scale_cpu_capacity(i);
+
+			if (cap > max_cap) {
+				max_cap = cap;
+				nr_big = 0;
+			}
+			if (cap == max_cap)
+				nr_big++;
+			if (!fits_capacity(cpu_util_cfs(i), cap))
+				nr_busy++;
+		}
+		spread = nr_busy >= nr_big;
+	}
+	if (READ_ONCE(rd->asym_spread) != spread)
+		WRITE_ONCE(rd->asym_spread, spread);
+}
+
 static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sds)
 {
 	struct sched_group *sg = env->sd->groups;
@@ -13049,6 +13108,9 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
 	bool sg_overloaded = 0, sg_overutilized = 0;
 
 	env->dst_core_idle = !sched_smt_active() || is_core_idle(env->dst_cpu);
+
+	if ((env->sd->flags & SD_ASYM_CPUCAPACITY) && !env->sd->parent)
+		update_asym_spread(env);
 
 	do {
 		struct sg_lb_stats *sgs = &tmp_sgs;
@@ -13516,7 +13578,7 @@ static struct rq *sched_balance_find_src_rq(struct lb_env *env,
 		 * average load.
 		 */
 		if (env->sd->flags & SD_ASYM_CPUCAPACITY &&
-		    nr_running == 1) {
+		    nr_running == 1 && !asym_spread(env->dst_rq->rd)) {
 			bool cluster_equal_cap = static_branch_unlikely(&sched_cluster_active) &&
 						 (get_actual_cpu_capacity(env->dst_cpu) ==
 						  get_actual_cpu_capacity(i));
@@ -14606,7 +14668,7 @@ static void nohz_balancer_kick(struct rq *rq)
 	}
 
 	sd = rcu_dereference_all(per_cpu(sd_asym_cpucapacity, cpu));
-	if (sd) {
+	if (sd && !asym_spread(rq->rd)) {
 		/*
 		 * When ASYM_CPUCAPACITY; see if there's a higher capacity CPU
 		 * to run the misfit task on.

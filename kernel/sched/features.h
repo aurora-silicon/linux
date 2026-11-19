@@ -109,6 +109,13 @@ SCHED_FEAT(WAKE_SHORT_LOCAL, true)
 SCHED_FEAT(FORK_LOCAL, true)
 
 /*
+ * On asymmetric CPU capacity systems, balance load across all CPUs as if
+ * their capacities were equal while at least as many CPUs are saturated as
+ * there are CPUs of the highest capacity. See update_asym_spread().
+ */
+SCHED_FEAT(ASYM_SPREAD, false)
+
+/*
  * Issue a WARN when we do multiple update_rq_clock() calls
  * in a single rq->lock section. Default disabled because the
  * annotations are not complete.
