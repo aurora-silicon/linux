@@ -268,6 +268,60 @@ patternProperties:
           The SMC, whose package power reading the low-power platform profile
           holds the CPU clusters to.
 
+      apple,cpu-memory-states:
+        $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        description:
+          The DCS state (first row) and fabric state (second row) a busy CPU
+          cluster asks for below 25, 50, 75 and 100 percent of its frequency,
+          as measured on this SoC's memory. Without it, the states of the
+          compatible's own table.
+        minItems: 2
+        maxItems: 2
+        items:
+          minItems: 4
+          maxItems: 4
+          items:
+            maximum: 255
+
+      apple,cpu-level-mhz:
+        description:
+          The CPU frequency whose quarters index apple,cpu-memory-states for
+          every cluster, so that clusters of different speed share them.
+          Without it, each cluster's own maximum.
+        maxItems: 1
+
+      apple,gpu-busy-memory-states:
+        $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        description:
+          The DCS state (first row) and fabric state (second row) for GPU work
+          the GPU driver reports, by the busy share it reports, below each of
+          the three apple,gpu-busy-permille shares and at or above the last.
+          Without it, such work gets the top of the CPU states.
+        minItems: 2
+        maxItems: 2
+        items:
+          minItems: 4
+          maxItems: 4
+          items:
+            maximum: 255
+
+      apple,gpu-busy-permille:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        description:
+          The GPU busy shares, in permille of the time the GPU spends
+          executing, from which reported GPU work gets the second, third and
+          top column of apple,gpu-busy-memory-states.
+        minItems: 3
+        maxItems: 3
+        items:
+          maximum: 1000
+
+    dependentRequired:
+      apple,gpu-busy-memory-states:
+        - apple,gpu-busy-permille
+      apple,gpu-busy-permille:
+        - apple,gpu-busy-memory-states
+
     required:
       - compatible
       - reg
