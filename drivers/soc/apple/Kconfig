@@ -140,10 +140,13 @@ config APPLE_SOC_SLEEP_T8122
 
 	  The driver binds only on J613, only with the sleep node enabled in
 	  the device tree, and only when the boot object published
-	  /chosen/aurora,s2r-mailbox. A sleep is refused, with the system left
-	  running, unless every coprocessor it must stop is ready and the tree
-	  enables the wake source of the PMU's RTC alarm. The display and the
-	  GPU have no restart on this machine: both stay down after a sleep
+	  /chosen/aurora,s2r-mailbox. Deep sleep is offered only with
+	  apple_sleep.deep=1, and a sleep is then a dry run that refuses before
+	  it stops anything unless apple_sleep.untested_commit=1. A sleep is
+	  refused, with the system left running, unless every coprocessor it
+	  must stop is ready and the tree enables the wake source of the PMU's
+	  RTC alarm. No wake is qualified, and the display and the GPU have no
+	  restart on this machine: both stay down after a sleep that commits
 	  until a reboot.
 
 	  If unsure, say N.

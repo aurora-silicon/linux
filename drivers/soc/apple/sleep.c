@@ -667,6 +667,13 @@ struct apple_sleep_soc {
 	bool no_wd2;
 	/* Keep the debug link until the coprocessors have stopped. */
 	bool debug_cut_after_stops;
+	/* The PMU scratch the step notes are written to is unmeasured on this SoC: none are. */
+	bool no_pmu_notes;
+	/*
+	 * The first display's driver stops its coprocessor cold for a sleep and can't restart
+	 * it. A dry run leaves it running and doesn't count it among the refusals.
+	 */
+	bool display_no_restart;
 	bool strict_gate_inventory;
 	/*
 	 * No PMP runs and its report is disabled: the PTD entries the commit drops have no
@@ -1016,6 +1023,8 @@ struct apple_sleep {
 	/* This wake came back down the deep path, not the DRAM-kept one. */
 	bool deep_ran;
 	bool regs_staged, wake_masks_saved, entry_prepared, entry_committed;
+	/* An untested SoC's sleep that stops before the commit, as .begin found the switch. */
+	bool dry_run;
 	u64 smc_idle_sent, smc_idle_ack, timer_at;
 	struct {
 		struct device *dev;
@@ -1143,6 +1152,18 @@ static bool sleep_untested_commit;
 module_param_named(untested_commit, sleep_untested_commit, bool, 0644);
 MODULE_PARM_DESC(untested_commit,
 		 "Untested SoC: let a deep sleep through to the commit (else a dry run that refuses)");
+
+/*
+ * This sleep stops before the commit. A SoC with early_context has drivers that act on the
+ * answer in their .suspend, so it is the one .begin latched: the switch can't change under a
+ * sleep. The common entry reads the switch where it stops, as before.
+ */
+static bool apple_sleep_dry(const struct apple_sleep *s)
+{
+	if (!s->soc->untested)
+		return false;
+	return s->soc->early_context ? s->dry_run : !READ_ONCE(sleep_untested_commit);
+}
 
 /*
  * Untested SoCs: each step of a sleep in PMU scratch, readable after a reset. J815's ADT
@@ -1660,6 +1681,15 @@ bool apple_sleep_commit_stops_coprocs(void)
 	return READ_ONCE(apple_sleep) && pm_suspend_via_firmware();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
+
+/* This firmware sleep stops before its commit: a driver must stop nothing it can't restart. */
+bool apple_sleep_dry_run(void)
+{
+	struct apple_sleep *s = READ_ONCE(apple_sleep);
+
+	return s && pm_suspend_via_firmware() && apple_sleep_dry(s);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_dry_run);
 
 /*
  * The last thing that can fail on the way to the commit: no CPU but this one is up and
@@ -3149,6 +3179,10 @@ static bool apple_sleep_gate_failed(struct apple_sleep *s)
 		/* Idled below full power, or stopped: its registers read only at full power. */
 		if (g->asc && g->ps && !sleep_asc_running(s, g->ps, g->asc))
 			continue;
+		/* Left running by a dry run, see apple_sleep_refuse(). */
+		if (s->soc->display_no_restart && s->display[0].np && g->np == s->display[0].np &&
+		    apple_sleep_dry(s))
+			continue;
 		if (g->asc && g->ps && (g->allow_unstarted || s->soc->regions))
 			dev_err(s->dev, "%s didn't stop: control %#x\n", g->name,
 				readl(g->asc + ASC_CPU_CONTROL));
@@ -3278,6 +3312,11 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 		dev_err(s->dev, "refused: the device tree doesn't enable the timed wake's source\n");
 		refused = true;
 	}
+	/* A required source can be neither armed nor read back without its block. */
+	if (s->soc->nwake_required && !s->wake) {
+		dev_err(s->dev, "refused: the wake block isn't mapped\n");
+		refused = true;
+	}
 
 	sleep_note(s, 0x21);
 	/* Its first config access after the power loss would hang on the untrained link. */
@@ -3331,6 +3370,11 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 		}
 		if (s->display[i].bound && sleep_asc_running(s, ps, s->display[i].asc) &&
 		    (!apple_sleep_v27_late() || sleep_v27_final_check(i))) {
+			/* Only a sleep that commits has its driver stop it: there is no restart. */
+			if (i == 0 && s->soc->display_no_restart && apple_sleep_dry(s)) {
+				dev_info(s->dev, "dry run: the display coprocessor is left running; a sleep that commits stops it cold, until a reboot\n");
+				continue;
+			}
 			dev_err(s->dev, "refused: a bound display coprocessor is still running\n");
 			refused = true;
 		}
@@ -3345,7 +3389,7 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 
 	sleep_note(s, 0x28);
 	/* A dry run, which stops right after this, writes no power word (as in b27). */
-	return apple_sleep_lower_stray(s, s->soc->untested && !READ_ONCE(sleep_untested_commit));
+	return apple_sleep_lower_stray(s, apple_sleep_dry(s));
 }
 
 static void sleep_wake_arm(struct apple_sleep *s)
@@ -4818,7 +4862,8 @@ static void sleep_spmi_sources_report(struct apple_sleep *s)
 
 static bool sleep_notes_on(struct apple_sleep *s)
 {
-	return s && s->spmi && s->soc->untested && READ_ONCE(sleep_pmu_notes);
+	return s && s->spmi && s->soc->untested && !s->soc->no_pmu_notes &&
+	       READ_ONCE(sleep_pmu_notes);
 }
 
 /*
@@ -5070,8 +5115,8 @@ static void apple_sleep_match(struct apple_sleep *s)
 			continue;
 		/* Measured at the commit with AUTO_ENABLE clear, unlike after a wake. */
 		if (sleep_ps_raise_start(s, offset))
-			(*failed)++;
-		(*raised)++;
+			failed++;
+		raised++;
 	}
 	for (i = 0; i < soc->ps_macos_off.count; i++) {
 		u32 offset = soc->ps_macos_off.offset[i];
@@ -5901,6 +5946,31 @@ static void apple_sleep_display_then_gpu(struct apple_sleep *s)
 }
 
 /*
+ * An untested SoC with early_context stops here unless asked, as the common entry does: the
+ * refusals have run and passed, no stray word was lowered, and no core is held, no display
+ * word lowered, no SMC notice sent from here and nothing stopped. What is left that can refuse without
+ * changing anything runs too, so the dry run reports it: each coprocessor's own last check and
+ * the SoC's final check.
+ */
+static int apple_sleep_enter_dry(struct apple_sleep *s)
+{
+	int ret = apple_sleep_coprocs_check(s);
+
+	if (!ret && s->soc->ops->final_check)
+		ret = s->soc->ops->final_check(s);
+	if (!ret && pm_wakeup_pending())
+		ret = -EBUSY;
+	apple_sleep_stray_restore(s);
+	if (ret) {
+		dev_info(s->dev, "dry run: refused at the last checks: %d\n", ret);
+		return ret;
+	}
+	dev_info(s->dev,
+		 "dry run: every check passed; refusing before the first stop and the commit (untested SoC, apple_sleep.untested_commit=1 lets it through)\n");
+	return -EAGAIN;
+}
+
+/*
  * The entry of a SoC with early_context, called with the boot core's context saved. All
  * returning checks precede enclave/final-stop.
  */
@@ -5920,6 +5990,8 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 	ret = apple_sleep_refuse(s);
 	if (ret)
 		return ret;
+	if (apple_sleep_dry(s))
+		return apple_sleep_enter_dry(s);
 	ret = apple_sleep_cpus_hold(s);
 	if (!ret) {
 		step = "display prepare";
@@ -6420,6 +6492,8 @@ static int apple_sleep_begin(suspend_state_t state)
 	if (ret)
 		return ret;
 
+	apple_sleep->dry_run = apple_sleep->soc->untested && !READ_ONCE(sleep_untested_commit);
+
 	if (apple_sleep->soc->ops->begin) {
 		ret = apple_sleep->soc->ops->begin(apple_sleep);
 		if (ret)
@@ -6898,7 +6972,8 @@ static const struct platform_suspend_ops apple_sleep_ops = {
 
 /* For a SoC with early_context: the same, with the scopes its entry needs held */
 static const struct platform_suspend_ops apple_sleep_early_ops = {
-	.valid = suspend_valid_only_mem,
+	/* An untested SoC's deep sleep is offered only with apple_sleep.deep=1. */
+	.valid = apple_sleep_valid,
 	.begin = apple_sleep_begin,
 	.prepare = apple_sleep_prepare,
 	.prepare_late = apple_sleep_late_scope_begin,
@@ -7871,13 +7946,15 @@ static int apple_sleep_probe(struct platform_device *pdev)
 				 READ_ONCE(sleep_el1_wfi) >= 2 ? "EL1 on every core" : "EL1 on the boot core",
 				 &(phys_addr_t){ __pa_symbol(t8142_el1_wfi_stub) });
 		}
-		dev_info(dev, "probe: pwrgate wake %#x %#x cpm %#x %#x, commit %#x, clusters %#x %#x\n",
-			 readl(s->pwrgate + s->soc->pwrgate_wake[0]),
-			 readl(s->pwrgate + s->soc->pwrgate_wake[1]),
-			 readl(s->pwrgate + s->soc->pwrgate_cpm[0]),
-			 readl(s->pwrgate + s->soc->pwrgate_cpm[1]), readl(s->commit),
-			 readl(s->cluster + s->soc->cluster_cpu[0]),
-			 readl(s->cluster + s->soc->cluster_cpu[1]));
+		/* The common layout's words: a SoC with its own map names none of them. */
+		if (!s->soc->ops->map_regs)
+			dev_info(dev, "probe: pwrgate wake %#x %#x cpm %#x %#x, commit %#x, clusters %#x %#x\n",
+				 readl(s->pwrgate + s->soc->pwrgate_wake[0]),
+				 readl(s->pwrgate + s->soc->pwrgate_wake[1]),
+				 readl(s->pwrgate + s->soc->pwrgate_cpm[0]),
+				 readl(s->pwrgate + s->soc->pwrgate_cpm[1]), readl(s->commit),
+				 readl(s->cluster + s->soc->cluster_cpu[0]),
+				 readl(s->cluster + s->soc->cluster_cpu[1]));
 		dev_warn(dev, "sleep data derived for this SoC, untested: deep sleep is %s, and %s\n",
 			 READ_ONCE(sleep_deep) ? "offered (apple_sleep.deep=1)" : "off (apple_sleep.deep=1 offers it)",
 			 READ_ONCE(sleep_untested_commit) ? "the commit is allowed" :

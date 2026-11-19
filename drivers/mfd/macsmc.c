@@ -58,8 +58,10 @@
 
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
 /*
- * Measured on J613: macOS writes WKTP=2 129 ms before its sleep commit. Whether the entry or
- * the wake needs it is not established, so it stays off unless asked for.
+ * Measured on J613: macOS writes WKTP=2 129 ms before its sleep commit, between MBSE=slpw
+ * (240 ms) and MBSE=slpa (25.6 ms). Whether the entry or the wake needs it is not established,
+ * so it stays off unless asked for. Here it follows slpw at once, which keeps it between the
+ * two; its distance from the commit is not macOS's.
  */
 static bool j613_wktp2;
 module_param(j613_wktp2, bool, 0600);
