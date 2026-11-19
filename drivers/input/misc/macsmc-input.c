@@ -19,12 +19,10 @@
 #include <linux/reboot.h>
 #include <linux/suspend.h>
 
-#define LID_WAKE_SETTLE_MS_J716S	2000
-
 static int lid_wake_settle_ms = -1;
 module_param(lid_wake_settle_ms, int, 0444);
 MODULE_PARM_DESC(lid_wake_settle_ms,
-		 "A lid-open report this many ms or less after system sleep starts does not wake the system (0 = always wake, default: 2000 on the J716s, 0 elsewhere)");
+		 "A lid-open report this many ms or less after system sleep starts does not wake the system (0 = always wake, default: the SMC node's apple,lid-open-wake-holdoff-ms, else 0)");
 
 /**
  * struct macsmc_input
@@ -111,7 +109,13 @@ static void macsmc_input_event_button(struct macsmc_input *smcin, unsigned long 
  * moving its AFE to "Dependent Mode". Taken at face value, that report ends
  * the suspend the close started. So in the sleep window an open report wakes
  * the system only if the SMC's lid key agrees and the sleep has run for
- * longer than lid_settle_ms, which is nonzero only where this was seen.
+ * longer than lid_settle_ms.
+ *
+ * MSLD is the only lid state the SMC offers, and it can agree with the
+ * false report, so no state read or acknowledgement tells the two apart:
+ * the hold-off is a measured property of the board, which its device tree
+ * gives as apple,lid-open-wake-holdoff-ms on the SMC node (2000 ms on the
+ * J716s). Without it lid_settle_ms is 0 and MSLD alone decides.
  * Called with lid_lock held.
  */
 static bool macsmc_input_lid_wake_ok(struct macsmc_input *smcin, unsigned long event)
@@ -253,11 +257,13 @@ static int macsmc_input_probe(struct platform_device *pdev)
 	if (error)
 		return error;
 
-	/* No OF node of its own: the false report has been seen on the J716s only. */
+	/* An MFD cell without a node of its own: the board describes it on the SMC. */
 	if (lid_wake_settle_ms >= 0)
 		smcin->lid_settle_ms = lid_wake_settle_ms;
-	else if (of_machine_is_compatible("apple,j716s"))
-		smcin->lid_settle_ms = LID_WAKE_SETTLE_MS_J716S;
+	else
+		of_property_read_u32(pdev->dev.parent->of_node,
+				     "apple,lid-open-wake-holdoff-ms",
+				     &smcin->lid_settle_ms);
 
 	smcin->input = devm_input_allocate_device(&pdev->dev);
 	if (!smcin->input)
