@@ -190,6 +190,13 @@ static unsigned int dcp_hybrid_fails;
 #define DCP_HYBRID_MAX_FAILS	2
 /* Current DTs wire the same stream capacity on every physical port. */
 static atomic_t dcp_dual_stream_routes = ATOMIC_INIT(0);
+/*
+ * A processor with pinned dual-stream routes (apple_dcp_hw_data's
+ * pinned_dual_stream) has registered its routes. Every external processor
+ * of such a fabric has the flag, and it is set before any of its routes
+ * counts in dcp_dual_stream_routes.
+ */
+static bool dcp_pinned_dual_stream;
 
 static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *dcp);
 static void dcp_hdmi_update_locked(struct apple_dcp *dcp);
@@ -245,6 +252,19 @@ bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
 }
 
 /*
+ * A T6030 display processor, from its compatible's match data. Its outputs go
+ * through the T6030 display crossbars (apple,t6030-display-crossbar): there a
+ * selected output is only routed until its link is brought up, which starts
+ * its clocks, and only external sources 0 and 2 feed the ATC tunnel pixel
+ * clocks (dcp_fabric_t6030_pclk()). The T6031 and T6034 processors have
+ * their own compatibles and keep the default flow.
+ */
+bool dcp_is_t6030_fabric(const struct apple_dcp *dcp)
+{
+	return dcp->hw.t6030_fabric;
+}
+
+/*
  * DP IN outputs (bits 0/1) whose tunnel pixel clock source @route cannot be:
  * T6030 even sources only, T8132 its dcpexts (2 and 4), others any.
  */
@@ -253,7 +273,7 @@ static u8 dcp_route_tunnel_clock_blocked(const struct apple_dcp_typec_route *rou
 	if (dcp_is_t8132_ext(route->dcp))
 		return (apple_dp_tunnel_t8132_pclk(route->mux_index, 0) < 0 ? BIT(0) : 0) |
 		       (apple_dp_tunnel_t8132_pclk(route->mux_index, 1) < 0 ? BIT(1) : 0);
-	return dcp_fabric_tunnel_clock_blocked(of_machine_is_compatible("apple,t6030"),
+	return dcp_fabric_tunnel_clock_blocked(dcp_is_t6030_fabric(route->dcp),
 					       route->mux_index);
 }
 
@@ -343,13 +363,16 @@ bool dcp_typec_dual_stream(void)
 /*
  * Keep native T6030 and T6050 routes pinned to their owning processor, on
  * any DPIN: their external processors are interchangeable, so no ordering
- * pass pairs streams with pipelines.
+ * pass pairs streams with pipelines. The processors' match data says so
+ * (pinned_dual_stream).
  */
 bool dcp_typec_ordered_dual_stream(void)
 {
-	return dcp_fabric_ordered_dual_stream(dcp_typec_dual_stream(),
-					    of_machine_is_compatible("apple,t6030") ||
-					    of_machine_is_compatible("apple,t6050"));
+	bool wired = dcp_typec_dual_stream();
+
+	/* Pairs with the smp_wmb() in dcp_register_typec_routes(). */
+	smp_rmb();
+	return dcp_fabric_ordered_dual_stream(wired, READ_ONCE(dcp_pinned_dual_stream));
 }
 
 /*
@@ -481,7 +504,7 @@ static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
 	}
 
 	/* A T8132 dcpext names its source (2 or 4), as T6030 does. */
-	if (of_machine_is_compatible("apple,t6030") || t8132) {
+	if (dcp_is_t6030_fabric(route->dcp) || t8132) {
 		typeof(apple_atc_dp_tunnel_rate_source) *fn;
 
 		if (t8132 ? apple_dp_tunnel_t8132_pclk(route->mux_index, dpin) < 0 :
@@ -2619,7 +2642,7 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 	 * On T6030, a T8132 dcpext and the selected native26 pipeline,
 	 * selecting a crossbar output only routes it; link-up enables clocks.
 	 */
-	if (!of_machine_is_compatible("apple,t6030") &&
+	if (!dcp_is_t6030_fabric(dcp) &&
 	    !dcp_is_t8132_ext(dcp) && !dcp_is_ext26(dcp))
 		return 0;
 	guard(mutex)(&dcp->tb_lock);
@@ -2697,7 +2720,7 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 		}
 		return ret;
 	}
-	if (of_machine_is_compatible("apple,t6030") &&
+	if (dcp_is_t6030_fabric(dcp) &&
 	    (unit || dcp->dptx_dfp_port != 1 + route->tunnel_dpin ||
 	     apple_dp_tunnel_t6030_pclk(route->mux_index,
 				      route->tunnel_dpin) < 0))
@@ -4853,6 +4876,11 @@ int dcp_register_typec_routes(struct apple_dcp *dcp)
 		of_get_child_by_name(dcp->dev->of_node, "typec-routes");
 	struct dcp_route_probe_context ctx = { .dcp = dcp, .routes = routes };
 
+	if (dcp->hw.pinned_dual_stream) {
+		WRITE_ONCE(dcp_pinned_dual_stream, true);
+		/* Seen by whoever sees one of the routes counted below. */
+		smp_wmb();
+	}
 	return dcp_fabric_run_probe(!!routes, dcp_register_typec_routes_present, &ctx);
 }
 

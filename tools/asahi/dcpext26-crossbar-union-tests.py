@@ -52,7 +52,7 @@ struct apple_dcp_typec_route {
     bool tunnel, selected;
 };
 struct apple_dcp {
-    struct { int iomfb_method_profile; } hw;
+    struct { int iomfb_method_profile; bool t6030_fabric; } hw;
     int fw_compat, tb_lock;
     struct device *dev;
     struct apple_dcp_typec_route *active_typec_route;
@@ -64,7 +64,7 @@ static unsigned links, v27, locks;
 static struct mux_control *last;
 static bool last_up;
 static int fault;
-static bool of_machine_is_compatible(const char *name) { return !strcmp(machine, name); }
+/* The gate reads the processor's match data, not the machine. */
 static bool of_device_is_compatible(const struct device_node *n, const char *name) {
     return !strcmp(n->compatible, name);
 }
@@ -90,6 +90,8 @@ int main(void) {
         node.compatible = profile == 1 ? "apple,t8132-dcpext" : "apple,other-dcp";
         struct apple_dcp d = { .dev = &dev, .active_typec_route = &route };
         d.hw.iomfb_method_profile = profile == 2 ? DCP_IOMFB_METHODS_J613_EXT26 : 0;
+        /* A T6030 processor's match data, on the T6030 machine only. */
+        d.hw.t6030_fabric = !strcmp(machine, "apple,t6030");
         reset();
         assert(dcp_direct_crossbar_link(&d, true) == 0);
         assert(links == 1 && locks == 1 && last == &a && last_up && d.direct_xbar_up == &a);
@@ -134,7 +136,8 @@ int main(void) {
 }
 '''
 unit = pre + function(header, 'dcp_is_ext26') + '\n'
-unit += function(source, 'dcp_is_t8132_ext') + '\n' + link + '\n' + cases
+unit += function(source, 'dcp_is_t8132_ext') + '\n'
+unit += function(source, 'dcp_is_t6030_fabric') + '\n' + link + '\n' + cases
 with tempfile.TemporaryDirectory() as tmp:
     c = Path(tmp) / 'crossbar.c'
     binary = Path(tmp) / 'crossbar'
