@@ -14,6 +14,21 @@ import os
 from pathlib import Path
 import subprocess
 
+# Commits made before the aurora rename keep the driver under its old directory name (git history,
+# not renamed). git_show_at() reads <ref>:<path> and, when the ref predates the rename, the same file
+# under that old directory.
+PRE_RENAME_DRIVER_DIR = "drivers/gpu/drm/asahi"  # LEGACY-ASAHI(git history): path in pre-rename commits
+
+
+def git_show_at(root, ref, path):
+    try:
+        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{path}"],
+                                       text=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        old = path.replace("drivers/gpu/drm/aurora-neo/", PRE_RENAME_DRIVER_DIR + "-neo/")
+        old = old.replace("drivers/gpu/drm/aurora/", PRE_RENAME_DRIVER_DIR + "/")
+        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{old}"], text=True)
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -235,7 +250,7 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     job_path = "drivers/gpu/drm/aurora/g15/job.rs"
-    job = (subprocess.check_output(["git", "show", args.ref + ":" + job_path], cwd=ROOT, text=True)
+    job = (git_show_at(ROOT, args.ref, job_path)
            if args.ref else (ROOT / job_path).read_text())
     current = (ROOT / job_path).read_text()
     status = (ROOT / "drivers/gpu/drm/aurora/g17/status.rs").read_text()

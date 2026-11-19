@@ -14,6 +14,21 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+# Commits made before the aurora rename keep the driver under its old directory name (git history,
+# not renamed). git_show_at() reads <ref>:<path> and, when the ref predates the rename, the same file
+# under that old directory.
+PRE_RENAME_DRIVER_DIR = "drivers/gpu/drm/asahi"  # LEGACY-ASAHI(git history): path in pre-rename commits
+
+
+def git_show_at(root, ref, path):
+    try:
+        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{path}"],
+                                       text=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        old = path.replace("drivers/gpu/drm/aurora-neo/", PRE_RENAME_DRIVER_DIR + "-neo/")
+        old = old.replace("drivers/gpu/drm/aurora/", PRE_RENAME_DRIVER_DIR + "/")
+        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{old}"], text=True)
+
 ROOT = Path(__file__).resolve().parents[2]
 G15 = ROOT / "drivers/gpu/drm/aurora/g15"
 CONTROL_REF = "31da169251bd34d5810a0874563d9a019b85bf56"
@@ -298,9 +313,7 @@ def main():
     variants = {"actual": source}
     if args.mutations:
         old = (args.control_source.read_text() if args.control_source else
-               subprocess.check_output(
-                   ["git", "show", CONTROL_REF + ":drivers/gpu/drm/aurora/g15/mod.rs"],
-                   cwd=ROOT, text=True))
+               git_show_at(ROOT, CONTROL_REF, "drivers/gpu/drm/aurora/g15/mod.rs"))
         variants["consume-orphan-before-allocation"] = source.replace(orphan, item(old, "    pub(crate) fn orphan("))
         variants["unguarded-registry-allocation"] = source.replace(backend, item(old, "    fn start_backend("))
         variants["ignore-pmp-readiness-error"] = source.replace(

@@ -9,6 +9,21 @@ from pathlib import Path
 import re
 import subprocess
 
+# Commits made before the aurora rename keep the driver under its old directory name (git history,
+# not renamed). git_show_at() reads <ref>:<path> and, when the ref predates the rename, the same file
+# under that old directory.
+PRE_RENAME_DRIVER_DIR = "drivers/gpu/drm/asahi"  # LEGACY-ASAHI(git history): path in pre-rename commits
+
+
+def git_show_at(root, ref, path):
+    try:
+        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{path}"],
+                                       text=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        old = path.replace("drivers/gpu/drm/aurora-neo/", PRE_RENAME_DRIVER_DIR + "-neo/")
+        old = old.replace("drivers/gpu/drm/aurora/", PRE_RENAME_DRIVER_DIR + "/")
+        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{old}"], text=True)
+
 
 def sha(data):
     return hashlib.sha256(data.encode()).hexdigest()
@@ -25,7 +40,7 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     def read(path, ref=None):
         if ref:
-            return subprocess.check_output(['git', 'show', f'{ref}:{path}'], cwd=root, text=True)
+            return git_show_at(root, ref, path)
         return (root / path).read_text()
     def policy(text):
         start = text.index('        let mut prio = *raw::PRIORITY.get(priority as usize).ok_or(EINVAL)?;')

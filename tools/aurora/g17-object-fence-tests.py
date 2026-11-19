@@ -29,6 +29,21 @@ import subprocess
 import sys
 import tempfile
 
+# Commits made before the aurora rename keep the driver under its old directory name (git history,
+# not renamed). git_show_at() reads <ref>:<path> and, when the ref predates the rename, the same file
+# under that old directory.
+PRE_RENAME_DRIVER_DIR = "drivers/gpu/drm/asahi"  # LEGACY-ASAHI(git history): path in pre-rename commits
+
+
+def git_show_at(root, ref, path):
+    try:
+        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{path}"],
+                                       text=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        old = path.replace("drivers/gpu/drm/aurora-neo/", PRE_RENAME_DRIVER_DIR + "-neo/")
+        old = old.replace("drivers/gpu/drm/aurora/", PRE_RENAME_DRIVER_DIR + "/")
+        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{old}"], text=True)
+
 ROOT = Path(__file__).resolve().parents[2]
 DRIVER = ROOT / 'drivers/gpu/drm/aurora'
 # The merge the object-cache fence change (linux#1978) is based on: pool decisions before it.
@@ -776,8 +791,7 @@ def main():
     ctx = (DRIVER / 'g17/context.rs').read_text()
     chan = (DRIVER / 'g17/channel.rs').read_text()
     observation = (DRIVER / 'g17/queue/render/observation.rs').read_text()
-    base = subprocess.run(['git', '-C', str(ROOT), 'show', f'{BASE}:drivers/gpu/drm/aurora/g17/object.rs'],
-                          check=True, capture_output=True, text=True).stdout
+    base = git_show_at(ROOT, BASE, 'drivers/gpu/drm/aurora/g17/object.rs')
     source_rules(ctx, observation, DRIVER)
 
     now = pool_source(obj)

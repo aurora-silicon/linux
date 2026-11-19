@@ -8,6 +8,21 @@ from pathlib import Path
 import resource
 import subprocess
 
+# Commits made before the aurora rename keep the driver under its old directory name (git history,
+# not renamed). git_show_at() reads <ref>:<path> and, when the ref predates the rename, the same file
+# under that old directory.
+PRE_RENAME_DRIVER_DIR = "drivers/gpu/drm/asahi"  # LEGACY-ASAHI(git history): path in pre-rename commits
+
+
+def git_show_at(root, ref, path):
+    try:
+        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{path}"],
+                                       text=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        old = path.replace("drivers/gpu/drm/aurora-neo/", PRE_RENAME_DRIVER_DIR + "-neo/")
+        old = old.replace("drivers/gpu/drm/aurora/", PRE_RENAME_DRIVER_DIR + "/")
+        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{old}"], text=True)
+
 ROOT = Path(__file__).resolve().parents[2]
 PATH = 'drivers/gpu/drm/aurora/g17/queue/render/memory.rs'
 PREFIX = r'''
@@ -77,7 +92,7 @@ def main():
     p.add_argument('--mutation', action='store_true')
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    source = (subprocess.check_output(['git','show','990a45b609dd:'+PATH.replace('/aurora/', '/aurora-neo/')], cwd=ROOT,text=True)
+    source = (git_show_at(ROOT, '990a45b609dd', PATH.replace('/aurora/', '/aurora-neo/'))
               if args.old else (ROOT/PATH).read_text())
     # The G17P generation is NeoGeneration since the M5 one joined it behind
     # the Generation enum; the old revision still calls it Generation.

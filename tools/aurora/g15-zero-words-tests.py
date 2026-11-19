@@ -37,7 +37,7 @@ G15 = "drivers/gpu/drm/aurora/g15"
 GOLDEN_FILES = {
     "board/data.rs": "7c5ff1077ca3296cbfc9e7144294162b6dea78a3774c38eeed4b0f59a14d7a5c",
     "board/template.rs": "286872f5474a67534f214e83e659253299f85143f3dc59035fa80894022e2549",
-    "hw.rs": "c54a4f8342fb466f82f4b9cfed6a137ee1ca1f4d80ede4e1b7f397d39223558e",
+    "hw.rs": "d7e461038630691e84293ebe346c2f89015dde06beee06e820ff487f359eab39",
     "power/idle.rs": "4928ecf7699b3ca85ff5143eb6e996efd40d47321e29a238a02c8873bc9f102c",
 }
 GOLDEN_FUNCTIONS = {

@@ -136,7 +136,7 @@
       "sha256_before_spdx_notice": "e3ba6fa572ed16636c9b6d7428e921cf1d81930429e4610738f5a86e906bc7fe"
     },
     "public-uapi.rs": {
-      "sha256": "1cb62b5c57600855b38ffff960d59b35cd5f306d35cfe77a47ed3d60ee29e601",
+      "sha256": "578a8b76e40fd6b7a603de1b5b652180f4c9667fffefe954596af77bbbb48d62",
       "sha256_before_spdx_notice": "e9f1ebf957d800bd1ed6fb372a4f8890fb1f1d8ff30e2fd436134de8c998cc76"
     },
     "vm-case-0.bin.gz": {

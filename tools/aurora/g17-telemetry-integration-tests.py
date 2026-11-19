@@ -6,6 +6,21 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+# Commits made before the aurora rename keep the driver under its old directory name (git history,
+# not renamed). git_show_at() reads <ref>:<path> and, when the ref predates the rename, the same file
+# under that old directory.
+PRE_RENAME_DRIVER_DIR = "drivers/gpu/drm/asahi"  # LEGACY-ASAHI(git history): path in pre-rename commits
+
+
+def git_show_at(root, ref, path):
+    try:
+        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{path}"],
+                                       text=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        old = path.replace("drivers/gpu/drm/aurora-neo/", PRE_RENAME_DRIVER_DIR + "-neo/")
+        old = old.replace("drivers/gpu/drm/aurora/", PRE_RENAME_DRIVER_DIR + "/")
+        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{old}"], text=True)
+
 ROOT = Path(__file__).resolve().parents[2]
 DRIVER = ROOT / 'drivers/gpu/drm/aurora'
 
@@ -753,7 +768,7 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
     if args.mutation == 'legacy-format':
         source = source.replace('READ_ONCE(snap->util1)', 'READ_ONCE(snap->util2)', 1)
     header = (DRIVER / 'sysfs.h').read_text()
-    baseline = subprocess.check_output(['git', '-C', str(ROOT), 'show', args.baseline + ':drivers/gpu/drm/aurora/sysfs.c'], text=True)
+    baseline = git_show_at(ROOT, args.baseline, 'drivers/gpu/drm/aurora/sysfs.c')
     pieces = [C_HEADER]
     for signature in ['struct aurora_qualified_stats']:
         pieces.append(item(header, signature) + ';')
