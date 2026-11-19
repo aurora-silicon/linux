@@ -9,6 +9,7 @@
 #include <linux/compiler_types.h>
 #include <linux/errno.h>
 #include <linux/kconfig.h>
+#include <linux/of.h>
 #include <linux/types.h>
 
 struct device;
@@ -35,6 +36,32 @@ struct apple_sleep_smc_saved_ops {
 	/* Optional, after the irreversible stops: pmVC alone, before late_notice (which then skips it). */
 	int (*pmvc)(void *data);
 };
+
+/*
+ * Whether the device tree describes a deep sleep with the sleep controller @compatible: an
+ * available node with that compatible. The per-device handling that belongs to such a sleep
+ * (what a block keeps or puts back across it, the steps it takes for it) is selected by this,
+ * not by the boards the sleep has run on, so a board gains it with its sleep description.
+ * It tells what the hardware description has, independent of CONFIG_APPLE_SOC_SLEEP.
+ */
+static inline bool apple_sleep_described(const char *compatible)
+{
+	struct device_node *np;
+
+	for_each_compatible_node(np, NULL, compatible) {
+		if (of_device_is_available(np)) {
+			of_node_put(np);
+			return true;
+		}
+	}
+	return false;
+}
+
+/* The T6050's (M5 Pro and Max) deep sleep, apple,t6050-sleep. */
+static inline bool apple_t6050_sleep_described(void)
+{
+	return apple_sleep_described("apple,t6050-sleep");
+}
 
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
 const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void);
