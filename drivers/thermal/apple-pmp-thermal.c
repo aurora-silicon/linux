@@ -843,9 +843,24 @@ static void apple_pmp_thermal_remove(struct platform_device *pdev)
 	apple_pmp_thermal_cleanup();
 }
 
+/*
+ * A reboot or power-off tells the SMC the system is going down and then puts it
+ * in atomic mode, which fails every ordinary read with -EIO. Left running, the
+ * power reader logs an error every 500 ms until the machine resets, burying
+ * whatever a stalled shutdown printed. Stop the reader. Its budgets go stale as
+ * they would after failed reads, so the CPU/GPU fall back to their minimum
+ * ceilings; the die sampler keeps running.
+ */
+static void apple_pmp_thermal_shutdown(struct platform_device *pdev)
+{
+	cancel_delayed_work_sync(&pmp_thermal.setup_work);
+	cancel_delayed_work_sync(&pmp_thermal.power_work);
+}
+
 static struct platform_driver apple_pmp_thermal_driver = {
 	.probe = apple_pmp_thermal_probe,
 	.remove = apple_pmp_thermal_remove,
+	.shutdown = apple_pmp_thermal_shutdown,
 	.driver = {
 		.name = "apple-pmp-thermal",
 		.pm = pm_sleep_ptr(&apple_pmp_thermal_pm_ops),
