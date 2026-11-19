@@ -3176,12 +3176,6 @@ out:
 }
 
 /*
- * PQ output goes through the IOMFB template's mode set, which picks the
- * timing's PQ element (see dcp_display_mode.pq): the desktop 26.x firmware,
- * the external H17P processor and the firmware 27 external processors.  The
- * other processors, and the firmware 27 panel, keep SDR.
- */
-/*
  * A PQ output needs a mode set that selects the timing's PQ colour element
  * and swaps that tag the surfaces BT.2020 PQ. The IOMFB template
  * (iomfb_template.c) does both for every firmware it is built for; the
