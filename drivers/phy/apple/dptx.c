@@ -82,7 +82,7 @@ struct apple_dptx_phy {
 
 	struct mutex lock;
 
-	// TODO: m1n1 port things to clean up
+	// TODO: aura port things to clean up
 	u32 active_lanes;
 };
 

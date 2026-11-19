@@ -14,7 +14,7 @@
 #include "dcpext_scanout.h"
 #include "ibootep.h"
 
-/* m1n1 src/dcp_iboot.c: iBoot commands have their own wrapper inside EPIC. */
+/* aura src/dcp_iboot.c: iBoot commands have their own wrapper inside EPIC. */
 #define IBOOT_QUERY_RX_SIZE 0x4000
 #define IBOOT_MODE_SIZE 24
 #define IBOOT_PATTERN_WIDTH DCPEXT_WIDTH
@@ -27,7 +27,7 @@ enum iboot_query_op {
 	IBOOT_GET_COLOR_MODES = 5,
 };
 
-/* Packed layouts from m1n1 src/dcp_iboot.h and swap_set_layer_cmd_v13_3. */
+/* Packed layouts from aura src/dcp_iboot.h and swap_set_layer_cmd_v13_3. */
 struct iboot_plane {
 	__le32 unk1;
 	__le64 addr;
@@ -633,7 +633,7 @@ int ibootep_present_pattern(struct apple_dcp *dcp, u64 iova, size_t size, u32 st
 	ret = iboot_pattern_command(query, step, &power, sizeof(power), reply);
 	if (ret)
 		goto free;
-	/* Match m1n1's Sonoma power-on settling interval before changing timing. */
+	/* Match aura's Sonoma power-on settling interval before changing timing. */
 	msleep(100);
 	step = 6;
 	ret = iboot_pattern_command(query, step, modes, sizeof(modes), reply);

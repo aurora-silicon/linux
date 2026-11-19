@@ -47,7 +47,7 @@ struct centauri {
  * macOS 27.0, so it takes the 27.0 adapter's link TLV 386 and scan TLVs.
  * J873 (Mac mini M6): board 0x24, chip 0x8152 from its ADT, the composition taken from the J813
  * word; port 0 config 0x388028000, lane 0x38f010000 and PERST# gpio0 pin 3 (0x31a000000 + 4 * 3)
- * from its ADT; config +0x130 is 0x208 as in the m1n1 T8152 bring-up that links the port.
+ * from its ADT; config +0x130 is 0x208 as in the aura T8152 bring-up that links the port.
  * keep_port_tables: the J813 sequence zeroes the 16 words at port+0x3000 and the 256 words at
  * port+0x3800. On the J873 those are the RID2SID and MSIMAP tables that pcie-apple programmed
  * (PORT_T602X_RID2SID, PORT_T602X_MSIMAP); the cycle then drops function 0's stream entry and

@@ -4,7 +4,7 @@
  * Apertures and the PERST pad come from the per-machine table in centauri.h; those were
  * verified from the live ADT. The J873 row reuses the J813 sequence with T8152 addresses and
  * config +0x130 = 0x208: the reset table and the lane window bits equal the T8152 bring-up that
- * links port 0 in m1n1, but the cycle itself (link down, retrain with firmware running) has not
+ * links port 0 in aura, but the cycle itself (link down, retrain with firmware running) has not
  * been run on a J873. This temporary board helper belongs in the host-controller driver.
  */
 #include <linux/delay.h>

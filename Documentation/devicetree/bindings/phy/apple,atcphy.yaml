@@ -23,7 +23,7 @@ description: >
 
   In order to correctly setup these lanes for the various modes calibration
   values copied from Apple's firmware and converted to the format described
-  below by our bootloader m1n1 are required. Without these only USB2 operation
+  below by our bootloader aura are required. Without these only USB2 operation
   is possible.
 
   The T8140 variant has no USB4/Thunderbolt controller behind it and carries a
@@ -250,7 +250,7 @@ $defs:
         - description: Bits to be set after applying the mask
     description: >
       List of (register offset, mask, value) tuples copied from Apple's Device
-      Tree by our bootloader m1n1 and used to configure the PHY. These values
+      Tree by our bootloader aura and used to configure the PHY. These values
       even vary for a single product/device and likely contain calibration
       values determined by Apple at manufacturing time.
       Unless otherwise noted these tunables are always applied to the core

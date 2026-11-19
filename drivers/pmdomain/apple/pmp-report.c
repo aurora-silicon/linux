@@ -959,7 +959,7 @@ static int apple_pmp_native_records(struct apple_pmp_report *rep)
 		bool selected;
 
 		if (chosen)
-			opt = of_get_property(chosen, "asahi,j613-25g83-dcpext", &len);
+			opt = of_get_property(chosen, "aurora,j613-25g83-dcpext", &len);
 		selected = opt && len == 2 && opt[0] == '1' && !opt[1] &&
 			of_device_is_compatible(rep->dev->of_node, "apple,j613-25g83-pmp-report");
 		of_node_put(chosen);

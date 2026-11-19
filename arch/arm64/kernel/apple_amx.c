@@ -4,7 +4,7 @@
  *
  * Measured on the M2 Pro (t6020) with Linux at EL2:
  *  - With AMX_CTL.EN (bit 63) clear, every AMX instruction from EL0 traps
- *    with the IMPLEMENTATION DEFINED EC 0x3f, ISS 3. m1n1 leaves it clear.
+ *    with the IMPLEMENTATION DEFINED EC 0x3f, ISS 3. aura leaves it clear.
  *  - AMX SET makes the register file usable and zeroes it; CLR discards it.
  *    AMX_STATE_T bit 0 tells whether the CPU is between the two.
  *  - That state belongs to the CPU, not to the thread: a thread that moves

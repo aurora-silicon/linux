@@ -25,5 +25,5 @@ On physical J873g, capture the source revision, image and DTB hashes, boot log,
 online CPU list, per-CPU workload completion, interrupt counters and both
 cpufreq policies. Exercise both exposed states in each domain, compare timed
 dependent workloads, restore the low states and check the kernel log. Save
-the commands and a machine-readable receipt. Native m1n1 SMP results alone
+the commands and a machine-readable receipt. Native aura SMP results alone
 do not qualify Linux scheduling.

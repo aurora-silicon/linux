@@ -34,7 +34,7 @@
 		/* Aura's ACIO tunable copy fills rear port 4's router (/arm-io/acio3) through these. */
 		usb4-3-acio = &usb4_3_acio;
 		usb4-3-nhi = &usb4_3_nhi;
-		/* asahi-bless and the boot loader's dt_set_nvram find the partition by this alias */
+		/* aurora-bless and the boot loader's dt_set_nvram find the partition by this alias */
 		nvram = &nvram;
 	};
 

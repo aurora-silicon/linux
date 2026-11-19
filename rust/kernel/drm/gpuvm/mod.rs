@@ -284,14 +284,14 @@ impl<T: DriverGpuVm> GpuVm<T> {
         unsafe { bindings::drm_gpuvm_is_extobj(self.as_raw(), obj.as_raw()) }
     }
 
-    /// HACK: added for the asahi downstream driver. Validate a range against the immutable
+    /// HACK: added for the aurora downstream driver. Validate a range against the immutable
     /// address-space bounds and the kernel cutout.
     pub fn range_valid(&self, addr: u64, range: u64) -> bool {
         // SAFETY: The borrowed VM retains its immutable geometry.
         unsafe { bindings::drm_gpuvm_range_valid(self.as_raw(), addr, range) }
     }
 
-    /// HACK: added for compatibility with asahi downstream driver. Only safe to use
+    /// HACK: added for compatibility with aurora downstream driver. Only safe to use
     /// when the gpuvm user forgot the UniqueRefGpuVm it got from `GpuVm::new()`.
     pub unsafe fn exec_lock<'a>(
         &'a self,
@@ -302,7 +302,7 @@ impl<T: DriverGpuVm> GpuVm<T> {
         unsafe { self.exec_lock_impl(obj, interruptible, true) }
     }
 
-    /// HACK: added for the asahi downstream driver. Like [`GpuVm::exec_lock`], but locks only
+    /// HACK: added for the aurora downstream driver. Like [`GpuVm::exec_lock`], but locks only
     /// the VM's shared reservation (and `obj` if it is external), not every external object.
     ///
     /// Enough for VA updates of this immediate-mode, `DRM_GPUVM_RESV_PROTECTED` VM: they need
@@ -395,7 +395,7 @@ impl<T: DriverGpuVm> GpuVm<T> {
 }
 
 impl<T: DriverGpuVm> GpuVm<T> {
-    /// HACK: added for the asahi downstream driver. Lock only the VM's shared reservation.
+    /// HACK: added for the aurora downstream driver. Lock only the VM's shared reservation.
     ///
     /// This takes the same shared reservation as [`GpuVm::exec_lock`], but does not lock
     /// external BO reservations or allocate an exec context. The returned guard exposes only the
@@ -442,7 +442,7 @@ impl<T: DriverGpuVm> GpuVm<T> {
         Ok(())
     }
 
-    /// HACK: added for the asahi downstream driver. Try to lock only the VM reservation, without
+    /// HACK: added for the aurora downstream driver. Try to lock only the VM reservation, without
     /// allocation or waiting.
     ///
     /// The guard protects VM metadata and private BOs, not external backing. Callers must not
@@ -462,7 +462,7 @@ impl<T: DriverGpuVm> GpuVm<T> {
 }
 
 impl<T: DriverGpuVm> GpuVmExec<T> {
-    /// HACK: added for the asahi downstream driver. Mark the exact retained logical mapping after
+    /// HACK: added for the aurora downstream driver. Mark the exact retained logical mapping after
     /// page-table restoration.
     pub fn set_invalidated(&mut self, addr: u64, range: u64, invalidated: bool) -> Result {
         // SAFETY: The exec guard owns the VM reservation.
@@ -473,7 +473,7 @@ impl<T: DriverGpuVm> GpuVmExec<T> {
     }
 }
 
-/// HACK: added for the asahi downstream driver. Logical binding retained independently of
+/// HACK: added for the aurora downstream driver. Logical binding retained independently of
 /// hardware page-table residency.
 ///
 /// Owns a GEM reference and copied metadata, never a [`GpuVmBo`] reference. Driver metadata
@@ -496,7 +496,7 @@ where
     pub inner: T::VaData,
 }
 
-/// HACK: added for the asahi downstream driver. Nonblocking reservation ownership for pressure
+/// HACK: added for the aurora downstream driver. Nonblocking reservation ownership for pressure
 /// scans of private objects.
 pub struct PrivateGpuVmGuard<'a, T: DriverGpuVm> {
     gpuvm: &'a GpuVm<T>,
@@ -722,7 +722,7 @@ impl<T: DriverGpuVm> Drop for PrivateGpuVmGuard<'_, T> {
     }
 }
 
-/// HACK: added for the asahi downstream driver. Access to the VM driver data under its shared
+/// HACK: added for the aurora downstream driver. Access to the VM driver data under its shared
 /// reservation, without external BO locks.
 pub struct GpuVmInnerGuard<'a, T: DriverGpuVm> {
     gpuvm: &'a GpuVm<T>,
@@ -905,7 +905,7 @@ pub trait DriverGpuVm: Sized + Send + Sync {
     ) -> Result<OpRemapped<'op, Self>, Error>;
 }
 
-/// HACK: added for compatibility with asahi downstream driver.
+/// HACK: added for compatibility with aurora downstream driver.
 pub struct GpuVmExec<T: DriverGpuVm> {
     vm_exec: KBox<bindings::drm_gpuvm_exec>,
     /// alternative way to get UniqueRefGpuVm when using `GpuVm::exec_lock()`.

@@ -71,7 +71,7 @@ out=$(mktemp "${TMPDIR:-/tmp}/tb-pcie-report.XXXXXX") || exit 1
 	say
 	missing=no
 	for t in "$dt"/soc/usb4-pcie-tunnel-*; do
-		# m1n1 only fills in ports that this Mac has.
+		# aura only fills in ports that this Mac has.
 		[ -e "$t"/pcie@*/apple,tunable-rc ] || continue
 		for d in "$t"/iommu@*; do
 			if [ -e "$d/apple,tunable" ]; then

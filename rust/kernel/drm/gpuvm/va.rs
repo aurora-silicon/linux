@@ -115,7 +115,7 @@ impl<T: DriverGpuVm> GpuVa<T> {
         unsafe { <T::Object as IntoGEMObject>::from_raw((*self.as_raw()).gem.obj) }
     }
 
-    /// HACK: added for the asahi downstream driver. Driver metadata retained independently of
+    /// HACK: added for the aurora downstream driver. Driver metadata retained independently of
     /// the resident page tables.
     #[inline]
     pub fn data(&self) -> &T::VaData {

@@ -17,7 +17,7 @@
  *   4. Which copy runs. By default the staged copy (own memory). The
  *      option fw_alias_reserved=1 (T6021 only) maps the copy iBoot
  *      preloaded at SEG0/SEGi; probe refuses it unless no-map
- *      /reserved-memory nodes cover both windows (m1n1 1.6.1 adds
+ *      /reserved-memory nodes cover both windows (aura 1.6.1 adds
  *      none). The staged copy runs: ane_fw_apply_boot_patches() first
  *      writes iBoot's runtime patches into it (DATA base, RTK_soc,
  *      revision, ASC addresses, stack guard, ASC tunables), and then it
@@ -116,7 +116,7 @@ static const struct { u64 phys, len; } ane_t6021_fw_preload[] = {
 };
 
 /* Only a no-map /reserved-memory node that the kernel took at boot keeps
- * it off those pages. m1n1 1.6.1 adds none, so this mode needs a boot
+ * it off those pages. aura 1.6.1 adds none, so this mode needs a boot
  * loader that reserves both windows (e.g. as ane-firmware@ nodes).
  */
 static bool ane_t6021_fw_preload_reserved(void)
@@ -175,7 +175,7 @@ bool ane_t6021_fwload_options_ok(void)
 	       IS_ALIGNED(fw_extra_ram, ANE_T6021_FW_ALIAS_PAGE);
 }
 
-/* Per-SoC data. RTK_soc_revision on T602x is a measured constant: m1n1
+/* Per-SoC data. RTK_soc_revision on T602x is a measured constant: aura
  * gives Linux no chip-revision. T6021: 0x11, as in the preloaded images;
  * T6020: ANEMinorVersion 1; T6022: ANEMinorVersion 17. T6020 and T6022
  * have the T6021 die-0 addresses (13.5 ADTs).
@@ -445,7 +445,7 @@ err_unmap:
 /* RTK_soc_revision. T8112 reads it as iBoot does: the two eFuse words
  * of the DT "fuse" window (0x23d2c8060, 8 bytes), decoded by
  * ane_t8112_fuse_revision(). Two non-posted 32-bit reads and nothing
- * else: the eFuse block (ADT pmgr reg[36]) is always on, and m1n1 reads
+ * else: the eFuse block (ADT pmgr reg[36]) is always on, and aura reads
  * its ATC and GPU fuses at 0x23d2c8484 and 0x23d2c84dc on every T8112
  * boot. Without the window the revision is unknown, so the load refuses.
  */

@@ -2,7 +2,7 @@
 
 /*
  * The boot NOR behind the QSPIMC controller (ADT /arm-io/qspi/spinor: firmware,
- * anvram, syscfg), for asahi-nvram and asahi-bless. The controller's power
+ * anvram, syscfg), for aurora-nvram and aurora-bless. The controller's power
  * states (PMGR devices SPI_P and QSPI) are off once iBoot is done with it;
  * reading it without them takes an SError.
  */

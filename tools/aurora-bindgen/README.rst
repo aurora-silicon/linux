@@ -116,7 +116,7 @@ The defect is generic: any explicitly aligned empty C record can have the wrong
 Rust alignment, and embedding it can shift later fields or change enclosing
 size/alignment. Configurations that empty conditional records, change cacheline
 alignment or change preceding fields can expose it; it is not specific to
-Asahi or ARM64. SCHEDSTATS=y masks this particular scheduler case. Every emitted
+Aurora or ARM64. SCHEDSTATS=y masks this particular scheduler case. Every emitted
 layout assertion is compiled regardless of KUnit, but this only covers types
 and fields emitted by bindgen, not arbitrary C-only or opaque internals.
 

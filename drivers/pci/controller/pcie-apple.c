@@ -1301,7 +1301,7 @@ static int apple_pcie_tunnel_reinitialize(struct apple_pcie_port *port)
 	/*
 	 * A cable disconnect intentionally stops PCIe-C after destroying its
 	 * host bridge. Its always-on power domain retains that stopped state, so
-	 * a later platform reprobe cannot rely on the original m1n1 handoff.
+	 * a later platform reprobe cannot rely on the original aura handoff.
 	 * Replay the port enable sequence, which is the same on T8103 and
 	 * T600x, while ACIO's tunnel and Intr2AXI aperture are live.
 	 */
@@ -1385,7 +1385,7 @@ static int apple_pcie_tunnel_cold_init(struct apple_pcie_port *port)
 	apple_pcie_port_rmw_set(port, PORT_PERST_OFF, pcie->hw->port_perst);
 	apple_pcie_port_rmw_set(port, PORT_APPCLK_EN, PORT_APPCLK);
 	/*
-	 * Without an m1n1 handoff, T600x/T602x ports must report RUN before
+	 * Without an aura handoff, T600x/T602x ports must report RUN before
 	 * the root complex config space is written: writing the RC tunables
 	 * first hard-resets a J416c.
 	 */
@@ -2385,7 +2385,7 @@ static int apple_pcie_t6050_port_link(struct apple_pcie_port *port)
 	if (ret)
 		return ret;
 	apple_pcie_t6050_rmw(port->base + PORT_LTSSMCTL, 0, PORT_LTSSMCTL_START);
-	/* Up to 1 s: what m1n1 allows the J716s N1 after its power-up */
+	/* Up to 1 s: what aura allows the J716s N1 after its power-up */
 	ret = apple_pcie_t6050_wait(port, port->base, PORT_LINKSTS, PORT_LINKSTS_UP,
 				    PORT_LINKSTS_UP, 1000000);
 	return ret;
@@ -2408,7 +2408,7 @@ static int apple_pcie_t6050_port_train(struct apple_pcie_port *port)
  * PCIe PHY clocked and out of reset, the RC running, the endpoint powered (pwren-gpios)
  * with PERST# held, then the port enable, configure and train sequences the root-port
  * reset uses, and the bus numbers a boot loader leaves. The adopt checks then run as for
- * a port trained before Linux. Order and values are m1n1's controller bring-up and the
+ * a port trained before Linux. Order and values are aura's controller bring-up and the
  * kernel's own T6050 port sequence.
  */
 #define T6050_PHY_CTRL			0x0
@@ -2432,7 +2432,7 @@ static int apple_pcie_t6050_port_train(struct apple_pcie_port *port)
  */
 #define T6050_PHY_CFG_BIT4		BIT(4)
 #define T6050_PHY_STAT			0x8
-/* Rises once T6050_PHY_CFG_BIT4 is set; polled by macOS and by m1n1; meaning not known */
+/* Rises once T6050_PHY_CFG_BIT4 is set; polled by macOS and by aura; meaning not known */
 #define T6050_PHY_STAT_BIT0		BIT(0)
 /*
  * Set and held once the shared PHY is started in macOS's post-iBoot order (aura's
@@ -2442,7 +2442,7 @@ static int apple_pcie_t6050_port_train(struct apple_pcie_port *port)
 #define T6050_PHYCMN_CLK		0x0
 #define T6050_PHYCMN_CLK_MODE		GENMASK(1, 0)
 /*
- * Written before CORE_RC_CTL_RUN: a trace of macOS shows 0x140 written here, and m1n1
+ * Written before CORE_RC_CTL_RUN: a trace of macOS shows 0x140 written here, and aura
  * writes the same. Neither bit's meaning is known.
  */
 #define CORE_RC_T6050_PRE_RUN		0x54
@@ -2541,7 +2541,7 @@ static int apple_pcie_t6050_shared_phy_on(struct apple_pcie *pcie)
 	if (IS_ERR(cmn))
 		return PTR_ERR(cmn);
 
-	/* Fabric, clock generator and PHY tunables, then the PHY clocks (m1n1's order) */
+	/* Fabric, clock generator and PHY tunables, then the PHY clocks (aura's order) */
 	ret = apple_pcie_t6050_tune_host(pcie, "axi2af", "axi2af") ?:
 	      apple_pcie_t6050_tune_host(pcie, "cio3pllcore", "pcieclkgen") ?:
 	      apple_pcie_t6050_tune_host(pcie, "pcieclkgen", "pcieclkgen") ?:
@@ -2609,7 +2609,7 @@ static int apple_pcie_t6050_cold_train(struct apple_pcie_port *port)
 	 * GPIO bank probes late) defers the probe with the hardware untouched. The endpoint
 	 * is held off from here. A restart resets the SoC but not the endpoint: after one
 	 * without a shutdown that powered it off, the J716s N1 still runs its firmware, and
-	 * only a power cycle of 250 ms (what m1n1 measured for a warm N1) brings it back in
+	 * only a power cycle of 250 ms (what aura measured for a warm N1) brings it back in
 	 * its ROM personality.
 	 */
 	if (!port->perst)
@@ -2845,7 +2845,7 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	 * Assert PERST# and configure the pin as output.
 	 * The Aquantia AQC113 10GB nic used desktop macs is sensitive to
 	 * deasserting it without prior clock setup.
-	 * Observed on M1 Max/Ultra Mac Studios under m1n1's hypervisor.
+	 * Observed on M1 Max/Ultra Mac Studios under aura's hypervisor.
 	 */
 	reset = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(np), "reset",
 				      GPIOD_OUT_HIGH, "PERST#");
@@ -3081,7 +3081,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		bool preinit_ok;
 
 		/*
-		 * m1n1 owns PCIe-C cold initialization on T6020. Replaying the
+		 * aura owns PCIe-C cold initialization on T6020. Replaying the
 		 * port reset against that live handoff raises an asynchronous
 		 * SError. t8103 boots with ATC_PCIE off and no handoff, so
 		 * apple,pciec-kernel-init selects the in-kernel sequence on each
@@ -3164,7 +3164,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 			rmw_set(PHY_LANE_CFG_REFCLKCGEN,
 				port->phy + PHY_LANE_CFG);
 
-		/* PCIe-C APPCLK state is part of the m1n1 handoff. */
+		/* PCIe-C APPCLK state is part of the aura handoff. */
 		if (!pcie->hw->tunneled)
 			rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
 	}
@@ -5684,7 +5684,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 
 	/*
 	 * A tunneled PCIe-C port has no host GPIO for PERST#: the tunnel
-	 * firmware and m1n1 handoff own its reset state.  Requiring a
+	 * firmware and aura handoff own its reset state.  Requiring a
 	 * reset-gpios provider here rejects the valid synthesized port before
 	 * the tunneled setup path can consume that handoff.
 	 */
@@ -6472,7 +6472,7 @@ static void apple_pcie_remove(struct platform_device *pdev)
 }
 
 /*
- * A restart with an adopted port's link alive never reaches m1n1 on the J714c (hard
+ * A restart with an adopted port's link alive never reaches aura on the J714c (hard
  * reset needed). Put each adopted port back the way the boot stage leaves it on a
  * cold start: bridge decoding off, link to L2, PERST# asserted, port and lane clocks
  * stopped (the first half of apple_pcie_t6050_reset_root_port, without the restart).
@@ -7489,7 +7489,7 @@ static const struct of_device_id apple_pcie_of_match[] = {
 	{ .compatible = "apple,t8112-pciec",	.data = &t8112_pciec_hw },
 	{ .compatible = "apple,t8103-pciec",	.data = &t8103_pciec_hw },
 	{ .compatible = "apple,t6000-pciec",	.data = &t8112_pciec_hw },
-	/* T8132 currently inherits controller and PHY setup from m1n1. */
+	/* T8132 currently inherits controller and PHY setup from aura. */
 	{ .compatible = "apple,t8132-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t8152-pcie",	.data = &t8152_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },

@@ -26,7 +26,7 @@
  * and storage requests and starts the PMP when the display driver asks for
  * it. The PMP node needs this Mac's board and DRAM vendor ids and its PMP
  * tunables. A boot loader that copies them from the ADT into
- * /chosen/asahi,t6030-pmp gets the T6030 overlay with those values, on any
+ * /chosen/aurora,t6030-pmp gets the T6030 overlay with those values, on any
  * T6030 board; without them, only a J516S gets the PMP, from an overlay with
  * one J516S's values. Before any driver probes, the gate then
  *  - raises the minimum power state of the display domains (display
@@ -47,7 +47,7 @@
  * must be), so the gate adds no overlay there: it checks that the PMP
  * topology is complete and unused, and then completes it (see
  * gate_reuse_resolve()). There is no T8122 fallback: the boot loader must pass
- * this Mac's PMP values in /chosen/asahi,t8122-pmp, or nothing is enabled. A
+ * this Mac's PMP values in /chosen/aurora,t8122-pmp, or nothing is enabled. A
  * T8122 device tree without display nodes is normal and the gate says
  * nothing. apple_t8122_display.enable=0 has the same effect as the T6030
  * option.
@@ -60,14 +60,14 @@
  * comes up) keeps the GPU off for that boot too: it is not a display-only
  * switch. The default changes no check of the
  * handoff or the PMP below. The PMP values must come from the boot loader, in
- * /chosen/asahi,t6031-pmp; there is no fallback. Its PMP topology is
+ * /chosen/aurora,t6031-pmp; there is no fallback. Its PMP topology is
  * reused from the device tree, as on T8122. The T6031 display power
  * states nest the other way round (the DCP's DISP_FE under DISP_CPU under
  * DISP_SYS), and its PMP power states are in another PMGR block. On every
  * T6031 boot the gate also logs what the boot loader handed over, so that
  * a boot without the option already records what the next one needs.
  *
- * On T6041 (the display coprocessor of the M4 Pro, apple,t6040) m1n1 hands
+ * On T6041 (the display coprocessor of the M4 Pro, apple,t6040) aura hands
  * over the DCP that iBoot leaves running. It marks the DCP, the display
  * subsystem and the DCP's piodma child with apple,t6041-handoff and names
  * the display firmware in apple,firmware-compat. There is no PMP to add or
@@ -165,7 +165,7 @@ static const char gate_t8122_pmp_uuid[] __initconst = "3B18C886-4C70-349B-B1C4-7
 
 /*
  * The T6031 PMP image, as the J516C ADT names it (iop-pmp-nub, passed on by
- * the boot loader in /chosen/asahi,t6031-pmp). It is not the T6030 image.
+ * the boot loader in /chosen/aurora,t6031-pmp). It is not the T6030 image.
  */
 static const char gate_t6031_pmp_uuid[] __initconst = "07FF4C5B-CB2E-3DE6-95FF-3B107D19B7AB";
 
@@ -243,7 +243,7 @@ static const struct gate_soc gate_t6030 __initconst = {
 	.marker = "apple,t6030-handoff",
 	.pwrstate_compat = "apple,t6030-pmgr-pwrstate",
 	.dcp_full_name = "dcp@28ec00000",
-	.pmp_values = "/chosen/asahi,t6030-pmp",
+	.pmp_values = "/chosen/aurora,t6030-pmp",
 	.pmp_uuid = gate_pmp_uuid,
 	.report_compat = "apple,t6030-pmp-v2-report",
 	.disp_entry = "report@7",
@@ -271,7 +271,7 @@ static const struct gate_soc gate_t8122 __initconst = {
 	.marker = "apple,t8122-handoff",
 	.pwrstate_compat = "apple,t8122-pmgr-pwrstate",
 	.dcp_full_name = "dcp@28ec00000",
-	.pmp_values = "/chosen/asahi,t8122-pmp",
+	.pmp_values = "/chosen/aurora,t8122-pmp",
 	.pmp_uuid = gate_t8122_pmp_uuid,
 	.report_compat = "apple,t8122-pmp-v2-report",
 	.disp_entry = "report@7",
@@ -304,7 +304,7 @@ static const struct gate_soc gate_t6031 __initconst = {
 	.marker = "apple,t6031-handoff",
 	.pwrstate_compat = "apple,t6031-pmgr-pwrstate",
 	.dcp_full_name = "dcp@386c00000",
-	.pmp_values = "/chosen/asahi,t6031-pmp",
+	.pmp_values = "/chosen/aurora,t6031-pmp",
 	.pmp_uuid = gate_t6031_pmp_uuid,
 	.report_compat = "apple,t6031-pmp-v2-report",
 	.disp_entry = "report@10",
@@ -316,7 +316,7 @@ static const struct gate_soc gate_t6031 __initconst = {
 	.ps_chain = { PMP_PS_DISP_FE, PMP_PS_DISP_CPU, PMP_PS_DISP_SYS },
 	.pmp_ps_any_pmgr = true,
 	.describe = true,
-	.fw_uuids = "asahi,t6031-fw-uuids",
+	.fw_uuids = "aurora,t6031-fw-uuids",
 };
 
 static void __init gate_t6041_run(void);

@@ -1173,7 +1173,7 @@ static const struct isp_mmio_window apple_isp_fw_mmio_t6040[] = {
 /*
  * T6040 runs the same coprocessor and firmware interface as T8140, booted
  * as macOS boots it on the J616s (macOS 26.6.2 camera log, kext register
- * map) and as aurora's m1n1 proxy captures with it: no coprocessor reset,
+ * map) and as aurora's aura proxy captures with it: no coprocessor reset,
  * four broadcast-clear windows in eight slots, the scaler 1 output path and
  * no capture metadata pool or watchdog.
  *

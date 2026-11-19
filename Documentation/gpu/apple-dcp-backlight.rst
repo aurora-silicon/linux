@@ -5,7 +5,7 @@ Apple DCP H17P backlight integration
 
 The backlight policy implements the clean display specification's BACKLIGHT-1
 through BACKLIGHT-4, with IOMFB-3 and LIFETIME-1 through LIFETIME-3 constraints.
-It extends the existing Asahi backlight driver. The measured internal H17P profile carries brightness activation through the
+It extends the existing Aurora backlight driver. The measured internal H17P profile carries brightness activation through the
 central present queue. It latches the first bounded powerlog hint without
 sending a brightness update and leaves registration unavailable if there is
 no hint. H17G and older firmware retain their existing paths. Physical loader

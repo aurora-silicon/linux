@@ -36,7 +36,7 @@ struct ane_device {
 
 	void __iomem *engine;
 
-	/* The ane SET block (m1n1 ANE.ps_map): pmgr power-state words for
+	/* The ane SET block (aura ANE.ps_map): pmgr power-state words for
 	 * this engine, mapped at probe on every SoC. Read-only, always:
 	 * pmgr reads give recovery the ACTUAL power state, while direct
 	 * SET writes are firmware-locked and external-abort the SoC

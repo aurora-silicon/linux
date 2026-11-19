@@ -19,7 +19,7 @@
 	model = "Apple MacBook Pro (14-inch, M3 Pro, Nov 2023)";
 
 	chosen {
-		asahi,t6030-dispext = "1";
+		aurora,t6030-dispext = "1";
 	};
 };
 

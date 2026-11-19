@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * Experimental J615 with the J613 25G83 DCP and PMP profile. m1n1 hands the
- * display over only with chosen.asahi,j615-25g83-experimental=1.
+ * Experimental J615 with the J613 25G83 DCP and PMP profile. aura hands the
+ * display over only with chosen.aurora,j615-25g83-experimental=1.
  */
 #include "t8122-j615.dts"
 #include "t8122-j613-dcp-25g83.dtsi"

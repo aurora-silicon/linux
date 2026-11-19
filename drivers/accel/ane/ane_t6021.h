@@ -7,8 +7,8 @@
  *    low 32 bits).
  *  - ASC cpu block (+0x1400000 h14g) + MBI transport (SCRATCH, channel
  *    table, +0x1844000 doorbell): register reads and the handshake
- *    described below; m1n1 ASCRegs = t8103 cross-ref only.
- *  - RTKit MGMT protocol: Asahi rtkit.c semantics, u64 message halves.
+ *    described below; aura ASCRegs = t8103 cross-ref only.
+ *  - RTKit MGMT protocol: Aurora rtkit.c semantics, u64 message halves.
  *  - RTBuddy endpoint table + doorbell word: the per-endpoint ring sizes,
  *    fourccs and doorbell bits listed with ane_t6021_eps below.
  *
@@ -79,10 +79,10 @@ enum {
  * for h14g: CPU_CONTROL is 0x1400044, without the 0x200000 offset of
  * the h16g/h17/h18g parts (whose block is the 0x1600044 one).
  * RUN is set at 0x1400044 on this part.
- * CPU_STATUS +0x48 keeps the m1n1 ASCRegs +4 shape (0x1400048, polled
+ * CPU_STATUS +0x48 keeps the aura ASCRegs +4 shape (0x1400048, polled
  * while the ASC CPU starts).
  *
- * The m1n1 t8103 mailbox (INBOX_CTRL +0x8110 / INBOX0 +0x8800) has an
+ * The aura t8103 mailbox (INBOX_CTRL +0x8110 / INBOX0 +0x8800) has an
  * h14g analog, and it is live: see ANE_ASC_MBOX_* below.  +0x1608114,
  * the h16g base, is simply the wrong address on this part.  The
  * mailbox belongs to the RTBuddy transport rather than to the ANE
@@ -100,7 +100,7 @@ enum {
  */
 #define ANE_ASC_CPU_CONTROL	0x1400044
 #define ANE_ASC_CPU_CONTROL_RUN	BIT(4)
-#define ANE_ASC_CPU_STATUS	0x1400048	/* m1n1 R_CPU_STATUS shape */
+#define ANE_ASC_CPU_STATUS	0x1400048	/* aura R_CPU_STATUS shape */
 #define ANE_ASC_RVBAR		0x1050000	/* fw entry | valid bit0 */
 #define ANE_ASC_EDPRCR		0x1010310	/* read whitelist */
 #define ANE_ASC_VERS		0x1840000
@@ -120,7 +120,7 @@ enum {
  * size 0x4000, IRQs send-empty/send-not-empty/recv-empty/
  * recv-not-empty) fixes mailbox = asc_base + 0x8000; upstream
  * drivers/soc/apple/mailbox.c apple_mbox_asc_hw fixes the register
- * offsets; m1n1 proxyclient/m1n1/hw/asc.py ASCRegs gives the same set
+ * offsets; aura proxyclient/aura/hw/asc.py ASCRegs gives the same set
  * ASC-relative plus the R_MBOX_CTRL field layout.
  *
  * Before the firmware is started, both directions read the same:
@@ -136,14 +136,14 @@ enum {
  * A 32-bit or memcpy-based read would eat messages.
  */
 #define ANE_ASC_MBOX		0x1408000
-#define ANE_ASC_MBOX_A2I_CTRL	0x1408110	/* m1n1 INBOX_CTRL  */
-#define ANE_ASC_MBOX_I2A_CTRL	0x1408114	/* m1n1 OUTBOX_CTRL */
-#define ANE_ASC_MBOX_A2I_SEND0	0x1408800	/* m1n1 INBOX0,  u64 */
-#define ANE_ASC_MBOX_A2I_SEND1	0x1408808	/* m1n1 INBOX1,  u64 */
-#define ANE_ASC_MBOX_I2A_RECV0	0x1408830	/* m1n1 OUTBOX0, u64 */
-#define ANE_ASC_MBOX_I2A_RECV1	0x1408838	/* m1n1 OUTBOX1, u64 */
+#define ANE_ASC_MBOX_A2I_CTRL	0x1408110	/* aura INBOX_CTRL  */
+#define ANE_ASC_MBOX_I2A_CTRL	0x1408114	/* aura OUTBOX_CTRL */
+#define ANE_ASC_MBOX_A2I_SEND0	0x1408800	/* aura INBOX0,  u64 */
+#define ANE_ASC_MBOX_A2I_SEND1	0x1408808	/* aura INBOX1,  u64 */
+#define ANE_ASC_MBOX_I2A_RECV0	0x1408830	/* aura OUTBOX0, u64 */
+#define ANE_ASC_MBOX_I2A_RECV1	0x1408838	/* aura OUTBOX1, u64 */
 
-/* R_MBOX_CTRL fields (m1n1 hw/asc.py) */
+/* R_MBOX_CTRL fields (aura hw/asc.py) */
 #define ANE_ASC_MBOX_CTRL_FIFOCNT	GENMASK(23, 20)
 #define ANE_ASC_MBOX_CTRL_OVERFLOW	BIT(18)
 #define ANE_ASC_MBOX_CTRL_EMPTY		BIT(17)
@@ -188,7 +188,7 @@ enum {
  * see ane_t6021_eps), which this driver does not walk yet.
  *
  * [INFERENCE: the fw->host doorbell/IRQ bit numbering mirrors the
- * host->fw SET bit per Asahi rtkit semantics.]
+ * host->fw SET bit per Aurora rtkit semantics.]
  *
  */
 #define ANE_MBI_SCRATCH0	0x1840048	/* SCRATCH0..7 = +0x48..+0x64 */

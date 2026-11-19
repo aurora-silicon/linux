@@ -26,6 +26,6 @@ Launch first with supported M3 Air/Pro and Neo profiles alongside M1/M2; add acc
 - [M3 Max next stage](https://github.com/omacom/linux-aurora/milestone/2): accelerated Max bring-up.
 - [Platform maturity and wider coverage](https://github.com/omacom/linux-aurora/milestone/3): broader retests, performance, display/sleep refinements, trusted-key persistence and advanced hardware. Original reports and priorities remain intact; these are not all initial-launch gates.
 
-**Parallel work:** VA-API/m1n1 ownership migration [#71](https://github.com/omacom/linux-aurora/issues/71) waits for GitHub administrator access. Existing desktop lock-intent delivery [#17](https://github.com/omacom/linux-aurora/issues/17) remains **P0** with the shared desktop owner; a kernel release does not close it or require bundling custom Hyprland/Aquamarine.
+**Parallel work:** VA-API/aura ownership migration [#71](https://github.com/omacom/linux-aurora/issues/71) waits for GitHub administrator access. Existing desktop lock-intent delivery [#17](https://github.com/omacom/linux-aurora/issues/17) remains **P0** with the shared desktop owner; a kernel release does not close it or require bundling custom Hyprland/Aquamarine.
 
 [Historical issue destinations](AURORA_ISSUE_HISTORY.md) retain the original reports and migration links.

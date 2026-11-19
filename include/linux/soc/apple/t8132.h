@@ -41,7 +41,7 @@ static inline bool apple_t8132_qualified_firmware(void)
 	const char *version;
 
 	return of_machine_is_compatible("apple,t8132") &&
-	       !of_property_read_string(of_chosen, "asahi,os-fw-version", &version) &&
+	       !of_property_read_string(of_chosen, "aurora,os-fw-version", &version) &&
 	       !strcmp(version, "26.6.2");
 }
 
