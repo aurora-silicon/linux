@@ -2280,8 +2280,7 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 		goto free_rtk;
 	rtk->pmp_registry_v2 =
 		of_device_is_compatible(dev->of_node, "apple,t6050-pmp-v2");
-	rtk->pmp_ca_event_ack = rtk->pmp_registry_v2 &&
-				of_machine_is_compatible("apple,j714s");
+	rtk->pmp_ca_event_ack = rtk->pmp_registry_v2;
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->coreanalytics_completion);
