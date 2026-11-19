@@ -63,6 +63,8 @@ extern "C" {
     fn sep_diag_sse_event() -> c_uint;
     fn sep_diag_xarm_failed() -> c_uint;
     fn sep_diag_unhandled() -> c_uint;
+    fn sep_diag_sensor_bringup_failed() -> c_uint;
+    fn sep_diag_capture_frame_error() -> c_uint;
     fn sep_diag_log_summary(dev: *mut c_void);
 }
 
@@ -419,6 +421,21 @@ pub(crate) fn xarm_failed() -> u32 {
 pub(crate) fn unhandled() -> u32 {
     // SAFETY: no preconditions; updates one word.
     unsafe { sep_diag_unhandled() }
+}
+
+/// One sensor bring-up attempt failed, whether or not another follows.
+/// Returns how many have since probe, this one included.
+pub(crate) fn sensor_bringup_failed() -> u32 {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_sensor_bringup_failed() }
+}
+
+/// A capture's frame was refused for a bad checksum or an unusable length,
+/// and the user was asked to touch again. Returns how many have since
+/// probe, this one included.
+pub(crate) fn capture_frame_error() -> u32 {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_capture_frame_error() }
 }
 
 /// Logs the one-line summary of the boot-time bring-up. Call it after
