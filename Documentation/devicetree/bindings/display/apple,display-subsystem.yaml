@@ -36,6 +36,8 @@ properties:
     minItems: 1
     maxItems: 8
 
+  dma-noncoherent: true
+
   memory-region:
     minItems: 1
     maxItems: 64
