@@ -485,3 +485,46 @@
 				     0x228004000 0x2281d62fc
 				     0x22a004000 0x22a1d62fc>;
 };
+
+/*
+ * The first video encoder (ADT ave0, soc-id t6040), its DARTs and its power
+ * domains. It has no board wiring, so it is enabled on every M4 Max board.
+ * iBoot preloads its firmware; the driver refuses a firmware layout it does
+ * not know at probe. The second encoder (ave1, soc-id t6041) is not
+ * described.
+ */
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+&ave0_dart0 {
+	status = "okay";
+};
+
+&ave0_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
