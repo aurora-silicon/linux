@@ -511,4 +511,78 @@
 		status = "disabled";
 	};
 
+	ane_dart0: iommu@309800000 {
+		compatible = "apple,t6030-dart", "apple,t8110-dart";
+		reg = <0x3 0x09800000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 577 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		status = "disabled";
+	};
+
+	ane_dart1: iommu@309810000 {
+		compatible = "apple,t6030-dart", "apple,t8110-dart";
+		reg = <0x3 0x09810000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 577 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		status = "disabled";
+	};
+
+	ane_dart2: iommu@309820000 {
+		compatible = "apple,t6030-dart", "apple,t8110-dart";
+		reg = <0x3 0x09820000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 577 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		status = "disabled";
+	};
+
+	/*
+	 * The ANE's ASC (ADT "iop,ascwrap-v6": engine + 0x1400000, 0x6c000) has
+	 * its mailbox at the ASC + 0x8000, as on the SIO of the same wrapper
+	 * revision. The ADT lists the four mailbox interrupts in the SIO's order.
+	 */
+	ane_mbox: mailbox@309408000 {
+		compatible = "apple,t6030-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x09408000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 558 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 559 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 560 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 561 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_ane_cpu>;
+		status = "disabled";
+	};
+
+	/*
+	 * H15 Neural Engine, ADT-derived only. The ADT's two ASC windows lie inside
+	 * "engine" and are not repeated. The driver does not bind H15 yet: keep
+	 * this, its mailbox and its DARTs disabled until it does (enabled ANE DART
+	 * nodes were reported to hang an M3 Pro at boot).
+	 */
+	ane: ane@308000000 {
+		compatible = "apple,t6030-ane";
+		reg = <0x3 0x08000000 0x0 0x2000000>,
+		      <0x3 0x50700000 0x0 0x18000>,
+		      <0x3 0x50724000 0x0 0x4000>,
+		      <0x3 0x503c0000 0x0 0x24000>,
+		      <0x2 0x11000000 0x0 0xf74000>,
+		      <0x3 0x642c8000 0x0 0x4000>;
+		reg-names = "engine", "pmgr", "aux-0", "aux-1", "aux-2", "aux-4";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 576 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+		power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+				<&ps_ane_td>, <&ps_ane_base>;
+		mboxes = <&ane_mbox>;
+		apple,ane-type = <0xc0>;
+		status = "disabled";
+	};
 };

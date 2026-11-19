@@ -515,6 +515,81 @@
 		status = "disabled";
 	};
 
+	ultra_ane0_dart0: iommu@3c9800000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0xc9800000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 984 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		status = "disabled";
+	};
+
+	ultra_ane0_dart1: iommu@3c9810000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0xc9810000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 984 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		status = "disabled";
+	};
+
+	ultra_ane0_dart2: iommu@3c9820000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0xc9820000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 984 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		status = "disabled";
+	};
+
+	/*
+	 * The ANE's ASC (ADT "iop,ascwrap-v6": engine + 0x1400000, 0x6c000) has
+	 * its mailbox at the ASC + 0x8000, as on the SIO of the same wrapper
+	 * revision. The ADT lists the four mailbox interrupts in the SIO's order.
+	 */
+	ultra_ane0_mbox: mailbox@3c9408000 {
+		compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0xc9408000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 964 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 965 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 966 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 967 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_ane_cpu>;
+		status = "disabled";
+	};
+
+	/*
+	 * The first die's ANE, the T6031 engine (ADT ane0, ane-type 0xe0).
+	 * H15 Neural Engine, ADT-derived only. The ADT's two ASC windows lie inside
+	 * "engine" and are not repeated. The driver does not bind H15 yet: keep
+	 * this, its mailbox and its DARTs disabled until it does (enabled ANE DART
+	 * nodes were reported to hang an M3 Pro at boot).
+	 */
+	ultra_ane0: ane@3c8000000 {
+		compatible = "apple,t6031-ane";
+		reg = <0x3 0xc8000000 0x0 0x2000000>,
+		      <0x2 0x92280000 0x0 0x10000>,
+		      <0x2 0x92290000 0x0 0x4000>,
+		      <0x2 0x903c0000 0x0 0x30000>,
+		      <0x4 0x04000000 0x0 0x2000000>,
+		      <0x2 0xa02dc000 0x0 0x4000>;
+		reg-names = "engine", "pmgr", "aux-0", "aux-1", "aux-3", "aux-4";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 983 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&ultra_ane0_dart0 0>, <&ultra_ane0_dart1 0>, <&ultra_ane0_dart2 0>;
+		power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+				<&ps_ane_td>, <&ps_ane_base>;
+		mboxes = <&ultra_ane0_mbox>;
+		apple,ane-type = <0xe0>;
+		status = "disabled";
+	};
 };
 
 &die1 {
@@ -830,6 +905,82 @@
 		status = "disabled";
 	};
 
+	ultra_ane1_dart0: iommu@3c9800000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0xc9800000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 984 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys_die1>;
+		status = "disabled";
+	};
+
+	ultra_ane1_dart1: iommu@3c9810000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0xc9810000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 984 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys_die1>;
+		status = "disabled";
+	};
+
+	ultra_ane1_dart2: iommu@3c9820000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0xc9820000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 984 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys_die1>;
+		status = "disabled";
+	};
+
+	/*
+	 * The ANE's ASC (ADT "iop,ascwrap-v6": engine + 0x1400000, 0x6c000) has
+	 * its mailbox at the ASC + 0x8000, as on the SIO of the same wrapper
+	 * revision. The ADT lists the four mailbox interrupts in the SIO's order.
+	 */
+	ultra_ane1_mbox: mailbox@3c9408000 {
+		compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0xc9408000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 964 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 965 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 966 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 967 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_ane_cpu_die1>;
+		status = "disabled";
+	};
+
+	/*
+	 * The second die's ANE (ADT ane1, ane-type 0xe0). Its ADT aux-1 entry is
+	 * the first die's window (0x2903c0000), which this bus cannot address;
+	 * it is left out.
+	 * H15 Neural Engine, ADT-derived only. The ADT's two ASC windows lie inside
+	 * "engine" and are not repeated. The driver does not bind H15 yet: keep
+	 * this, its mailbox and its DARTs disabled until it does (enabled ANE DART
+	 * nodes were reported to hang an M3 Pro at boot).
+	 */
+	ultra_ane1: ane@3c8000000 {
+		compatible = "apple,t6031-ane";
+		reg = <0x3 0xc8000000 0x0 0x2000000>,
+		      <0x2 0x92280000 0x0 0x10000>,
+		      <0x2 0x92290000 0x0 0x4000>,
+		      <0x4 0x04000000 0x0 0x2000000>,
+		      <0x2 0xa02dc000 0x0 0x4000>;
+		reg-names = "engine", "pmgr", "aux-0", "aux-3", "aux-4";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 983 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&ultra_ane1_dart0 0>, <&ultra_ane1_dart1 0>, <&ultra_ane1_dart2 0>;
+		power-domains = <&ps_ane_sys_die1>, <&ps_ane_cpu_die1>, <&ps_ane_mpm_die1>,
+				<&ps_ane_td_die1>, <&ps_ane_base_die1>;
+		mboxes = <&ultra_ane1_mbox>;
+		apple,ane-type = <0xe0>;
+		status = "disabled";
+	};
 };
 
 / {
