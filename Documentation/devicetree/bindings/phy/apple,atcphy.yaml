@@ -40,6 +40,13 @@ description: >
   DisplayPort also requires separate bootloader-provided calibration lists
   for that bank and the common configuration in the lpdptx region.
 
+  The T8152 variant is supported as the USB3 PHY of a fixed-USB3 port only,
+  see apple,fixed-usb3. It is described by its core and pipehandler banks; the
+  core bank also holds the USB controller's DARTs. Its power domains are the
+  ATC's PMGR power states and PSD service the PHY needs, in the order they are
+  powered up. Lane 0 is powered up and the crossbar set between the common-a
+  tunables and the others.
+
 allOf:
   - $ref: /schemas/usb/usb-switch.yaml#
   - if:
@@ -122,32 +129,78 @@ allOf:
             required:
               - power-domains
       else:
-        properties:
-          reg:
-            minItems: 5
-            items:
-              - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
-              - description: DisplayPort Alternate Mode PHY specific controls
-              - description: Type-C PHY AXI to Apple Fabric interconnect controls
-              - description: USB2 PHY specific controls
-              - description: USB3 PIPE interface controls
-              - description: Secondary eUSB2 PHY register bank (T8140)
-              - description:
-                  Power and hibernation control of the USB controller the PHY
-                  serves (T8140). The PHY drives that controller's reset and
-                  takes it through hibernation for a system sleep.
-          reg-names:
-            minItems: 5
-            items:
-              - const: core
-              - const: lpdptx
-              - const: axi2af
-              - const: usb2phy
-              - const: pipehandler
-              - const: usb2phy-reg
-              - const: pwrctl
-        required:
-          - power-domains
+        if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t8152-atcphy
+        then:
+          properties:
+            reg:
+              items:
+                - description:
+                    PHY core with its power and reset block, which also holds
+                    the USB controller's DARTs
+                - description: USB3 PIPE interface controls
+            reg-names:
+              items:
+                - const: core
+                - const: pipehandler
+            power-domains:
+              items:
+                - description: The ATC's USB_AON power state
+                - description: The ATC's common PSD service
+                - description: The ATC's COMMON_DP_0 power state
+                - description: The ATC's COMMON_DP_1 power state
+          required:
+            - power-domains
+        else:
+          properties:
+            reg:
+              minItems: 5
+              items:
+                - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
+                - description: DisplayPort Alternate Mode PHY specific controls
+                - description: Type-C PHY AXI to Apple Fabric interconnect controls
+                - description: USB2 PHY specific controls
+                - description: USB3 PIPE interface controls
+                - description: Secondary eUSB2 PHY register bank (T8140)
+                - description:
+                    Power and hibernation control of the USB controller the PHY
+                    serves (T8140). The PHY drives that controller's reset and
+                    takes it through hibernation for a system sleep.
+            reg-names:
+              minItems: 5
+              items:
+                - const: core
+                - const: lpdptx
+                - const: axi2af
+                - const: usb2phy
+                - const: pipehandler
+                - const: usb2phy-reg
+                - const: pwrctl
+          required:
+            - power-domains
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8152-atcphy
+    then:
+      properties:
+        "#reset-cells": false
+        mode-switch: false
+        orientation-switch: false
+        ports: false
+      required:
+        - apple,fixed-usb3
+    else:
+      properties:
+        apple,fixed-usb3: false
+        power-domains:
+          maxItems: 1
+      required:
+        - "#reset-cells"
   - if:
       properties:
         compatible:
@@ -234,6 +287,7 @@ allOf:
                 - apple,t8122-atcphy
                 - apple,t6030-atcphy
                 - apple,t6031-atcphy
+                - apple,t8152-atcphy
     then:
       required:
         - orientation-switch
@@ -275,6 +329,7 @@ properties:
       - const: apple,t8132-atcphy
       - const: apple,t8140-atcphy
       - const: apple,t8142-atcphy
+      - const: apple,t8152-atcphy
 
   reg:
     minItems: 1
@@ -294,7 +349,8 @@ properties:
   orientation-switch: true
 
   power-domains:
-    maxItems: 1
+    minItems: 1
+    maxItems: 4
 
   phys:
     maxItems: 1
@@ -322,6 +378,15 @@ properties:
       port@3:
         $ref: /schemas/graph.yaml#/properties/port
         description: Incoming endpoint from the USB4/Thunderbolt controller.
+
+  apple,fixed-usb3:
+    type: boolean
+    description: >
+      T8152 only, and required there. The port's SuperSpeed lanes go straight
+      to a USB3 device or hub, with no Type-C mux in between, so the PHY runs
+      USB3 on lane 0 from probe on and ignores mux and orientation changes. It
+      provides only the USB3 PHY of its USB controller, which is a host, and
+      leaves the controller's USB2 side and reset to the bootloader.
 
   apple,dp-alt-mode:
     type: boolean
@@ -521,7 +586,6 @@ required:
   - reg
   - reg-names
   - "#phy-cells"
-  - "#reset-cells"
 
 additionalProperties: false
 
@@ -620,5 +684,27 @@ examples:
             remote-endpoint = <&dwc3_0_ss>;
           };
         };
+      };
+    };
+
+  - |
+    soc {
+      #address-cells = <2>;
+      #size-cells = <2>;
+
+      phy@383000000 {
+        compatible = "apple,t8152-atcphy";
+        reg = <0x3 0x83000000 0x0 0x84000>,
+              <0x3 0x82414000 0x0 0x4000>;
+        reg-names = "core", "pipehandler";
+
+        #phy-cells = <1>;
+        apple,fixed-usb3;
+        power-domains = <&ps_atc2_usb_aon>, <&ps_atc2_common>,
+                        <&ps_atc2_common_dp_0>, <&ps_atc2_common_dp_1>;
+
+        apple,tunable-common-a = <0x00800 0x00fc0000 0x00fc0000>;
+        apple,tunable-common-b = <0x6c004 0x003f003f 0x00200020>;
+        apple,tunable-lane0-usb = <0x082d8 0xf0000000 0x70000000>;
       };
     };
