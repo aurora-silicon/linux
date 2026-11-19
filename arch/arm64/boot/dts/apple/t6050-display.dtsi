@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T6050 external display engines and their DisplayPort alt mode routes through the ATC1 and
+ * ATC2 Type-C PHYs. Every T6050 board's ADT has the same four engines on die 0 (dcpext0..3,
+ * with their dart-dcpextN and dart-dispextN) and the same display crossbar, which can send any
+ * engine to any ATC port; the values here are the same in each board's ADT.
+ *
+ * A board includes this after t6050-peripherals.dtsi (and after t6050-max-atc2.dtsi where it
+ * uses that), once its ATC1 and ATC2 connectors are described, and links each connector's
+ * DisplayPort port (port@2) to the routes with these endpoint labels:
+ *   atc2_dp_dcpext0, atc2_dp_dcpext2: the ATC2 connector's endpoint@0 and endpoint@1
+ *   atc1_dp_dcpext0, atc1_dp_dcpext2: the ATC1 connector's endpoint@0 and endpoint@1
+ *
+ * dcpext0 and dcpext2 each have a route to both ports (route@0 ATC2, route@1 ATC1), on crossbar
+ * source 0 and 4 (2 * the engine index), so two displays run at once on either port or one on
+ * each. dcpext1 and dcpext3 have no route: dcpext3 is the pair for modes that need two
+ * pipelines, and dcpext1 is left for USB4 DisplayPort tunnels, which need the port's router.
+ * The routes and the crossbar's DP IN controls are those of the J714s and J716c.
+ *
+ * The engines, their mailboxes and DARTs stay disabled: the boot loader hands each engine over
+ * (enables it, its mailbox and DARTs, sets its firmware version and bandwidth scratch, and adds
+ * its display DART to the display subsystem) when its checks of the running engine pass. The
+ * DARTs have no power-domains: the ADT gives them no gate, the engines run with auto-enable
+ * and nothing here enables them. A route under a disabled engine is passed over by the Type-C
+ * mux lookup, so the PD controllers do not wait for it.
+ */
+
+/* Each engine's DCP and display DARTs: vm-base 1 TiB, vm-size 3 TiB, as dcpext0's */
+&dcpext1_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dispext1_dart {
+	/* Scanout and PIODMA share the first register window, as on dispext0 */
+	reg = <0x3 0x92300000 0x0 0xc000>;
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dcpext2_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dispext2_dart {
+	reg = <0x3 0x02300000 0x0 0xc000>;
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dcpext3_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dispext3_dart {
+	reg = <0x3 0x06300000 0x0 0xc000>;
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+/*
+ * The firmware-facing index (the ADT's external index: dcpext0 is 1), USB-C outputs on die 0's
+ * DPTX. The ADT lists no clocks for the external engines.
+ */
+&dcpext1 {
+	apple,clock-ids;
+	apple,dcp-index = <2>;
+	apple,connector-type = "USB-C";
+	apple,dptx-die = <0>;
+};
+
+&dcpext2 {
+	apple,clock-ids;
+	apple,dcp-index = <3>;
+	apple,connector-type = "USB-C";
+	apple,dptx-die = <0>;
+	apple,typec-dptx-phys = <2 1>;
+	apple,typec-mux-indices = <4 4>;
+	phys = <&atc2_phy 6>, <&atc1_phy 6>;
+	phy-names = "typec0", "typec1";
+	mux-controls = <&atc2_xbar 0>, <&atc2_xbar 1>, <&atc2_xbar 2>, <&atc2_xbar 3>,
+		       <&atc2_xbar 4>, <&atc1_dpxbar 0>, <&atc1_dpxbar 1>, <&atc1_dpxbar 2>,
+		       <&atc1_dpxbar 3>, <&atc1_dpxbar 4>;
+	mux-control-names = "typec0", "typec0-dpin0", "typec0-dpin1", "typec0-dpin2",
+			    "typec0-dpin3", "typec1", "typec1-dpin0", "typec1-dpin1",
+			    "typec1-dpin2", "typec1-dpin3";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext2_atc2: endpoint {
+					remote-endpoint = <&atc2_dp_dcpext2>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext2_atc1: endpoint {
+					remote-endpoint = <&atc1_dp_dcpext2>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext3 {
+	apple,clock-ids;
+	apple,dcp-index = <4>;
+	apple,connector-type = "USB-C";
+	apple,dptx-die = <0>;
+};
+
+/* dcpext0 keeps its ATC2 route (t6050-die0.dtsi) as route@0 and gains ATC1's */
+&dcpext0 {
+	apple,typec-dptx-phys = <2 1>;
+	apple,typec-mux-indices = <0 0>;
+	phys = <&atc2_phy 6>, <&atc1_phy 6>;
+	phy-names = "typec0", "typec1";
+	mux-controls = <&atc2_xbar 0>, <&atc2_xbar 1>, <&atc2_xbar 2>, <&atc2_xbar 3>,
+		       <&atc2_xbar 4>, <&atc1_dpxbar 0>, <&atc1_dpxbar 1>, <&atc1_dpxbar 2>,
+		       <&atc1_dpxbar 3>, <&atc1_dpxbar 4>;
+	mux-control-names = "typec0", "typec0-dpin0", "typec0-dpin1", "typec0-dpin2",
+			    "typec0-dpin3", "typec1", "typec1-dpin0", "typec1-dpin1",
+			    "typec1-dpin2", "typec1-dpin3";
+
+	typec-routes {
+		route@0 {
+			status = "okay";
+
+			port {
+				dcpext0_atc2: endpoint {
+					remote-endpoint = <&atc2_dp_dcpext0>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext0_atc1: endpoint {
+					remote-endpoint = <&atc1_dp_dcpext0>;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * The DisplayPort side of the ATC1 and ATC2 PHYs: their DP clock source (the ADT's
+ * atc_dp_clock_source function) and the four DP power states, which the PHY switches with its
+ * DP lanes, and each port's display crossbar.
+ */
+&atc2_xbar {
+	status = "okay";
+};
+
+&atc1_dpxbar {
+	power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>;
+	power-domain-names = "usb-aon", "common";
+	status = "okay";
+};
+
+&ps_atc2_common_dp_0 {
+	status = "okay";
+};
+
+&ps_atc2_common_dp_1 {
+	status = "okay";
+};
+
+&ps_atc2_common_dp_2 {
+	status = "okay";
+};
+
+&ps_atc2_common_dp_3 {
+	status = "okay";
+};
+
+&ps_atc1_common_dp_0 {
+	status = "okay";
+};
+
+&ps_atc1_common_dp_1 {
+	status = "okay";
+};
+
+&ps_atc1_common_dp_2 {
+	status = "okay";
+};
+
+&ps_atc1_common_dp_3 {
+	status = "okay";
+};
+
+&atc2_phy {
+	reg = <0x3 0x83000000 0x0 0x2c000>,
+	      <0x3 0x82a90000 0x0 0x4000>,
+	      <0x3 0x82800000 0x0 0x4000>,
+	      <0x3 0x83200000 0x0 0x4000>,
+	      <0x3 0x83244000 0x0 0x4000>,
+	      <0x3 0x80000000 0x0 0x8000>,
+	      <0x3 0x80020000 0x0 0x4000>,
+	      <0x3 0x83250000 0x0 0x4000>,
+	      <0x3 0x83140000 0x0 0x4000>,
+	      <0x3 0x830c0000 0x0 0x10000>,
+	      <0x3 0x82a84000 0x0 0x4000>,
+	      <0x2 0x80000068 0x0 0x10>;
+	reg-names = "core", "usb2phy", "usb2-digital", "reset", "fabric", "axi2af", "lioa",
+		    "common-cfg", "usb-control", "firmware-data", "pipehandler",
+		    "dp-clock-source";
+	power-domains = <&ps_atc2_usb_aon>, <&ps_atc2_common>, <&ps_atc2_phymxwrap>,
+			<&ps_atc2_usb>, <&ps_atc2_common_dp_0>, <&ps_atc2_common_dp_1>,
+			<&ps_atc2_common_dp_2>, <&ps_atc2_common_dp_3>;
+	power-domain-names = "usb-aon", "common", "wrapper", "usb", "dp0", "dp1", "dp2", "dp3";
+};
+
+&atc1_phy {
+	reg = <0x2 0xab000000 0x0 0x2c000>,
+	      <0x2 0xaaa90000 0x0 0x4000>,
+	      <0x2 0xaa800000 0x0 0x4000>,
+	      <0x2 0xab200000 0x0 0x4000>,
+	      <0x2 0xab244000 0x0 0x4000>,
+	      <0x2 0xa8000000 0x0 0x8000>,
+	      <0x2 0xa8020000 0x0 0x4000>,
+	      <0x2 0xab250000 0x0 0x4000>,
+	      <0x2 0xab140000 0x0 0x4000>,
+	      <0x2 0xab0c0000 0x0 0x10000>,
+	      <0x2 0xaaa84000 0x0 0x4000>,
+	      <0x2 0x80000058 0x0 0x10>;
+	reg-names = "core", "usb2phy", "usb2-digital", "reset", "fabric", "axi2af", "lioa",
+		    "common-cfg", "usb-control", "firmware-data", "pipehandler",
+		    "dp-clock-source";
+	power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>, <&ps_atc1_phymxwrap>,
+			<&ps_atc1_usb>, <&ps_atc1_common_dp_0>, <&ps_atc1_common_dp_1>,
+			<&ps_atc1_common_dp_2>, <&ps_atc1_common_dp_3>;
+	power-domain-names = "usb-aon", "common", "wrapper", "usb", "dp0", "dp1", "dp2", "dp3";
+};

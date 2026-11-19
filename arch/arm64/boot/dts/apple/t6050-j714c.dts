@@ -406,8 +406,8 @@
  * ADT /arm-io/nub-spmi-a0/hpm1 (SN201202x, SPMI address 0xa, port-number 2, port-location
  * "left-front", acio-parent acio1), with atc-phy1, usb-drd1 and dart-usb1. The PHY, the DWC3 and
  * their DARTs and mailbox are the ATC1 template of t6050-dieX.dtsi; only the links to the PD
- * controller are the board's. The port's USB4/Thunderbolt router (/arm-io/acio1) and its
- * DisplayPort routes are not described yet; the PHY runs in USB mode.
+ * controller are the board's. The port's USB4/Thunderbolt router (/arm-io/acio1) is not
+ * described yet; its DisplayPort alt mode routes follow this block.
  *
  * The left-back port (ATC0, hpm0) is the boot link's debug port. The combo PHY binding and
  * driver exclude it on purpose (apple,port-index 0), so it is not described either.
@@ -461,6 +461,59 @@
 					hpm1_ss: endpoint {
 						remote-endpoint = <&atc1_phy_ep>;
 					};
+				};
+			};
+		};
+	};
+};
+
+/*
+ * External displays: DisplayPort alt mode on the left-front (ATC1) and right
+ * (ATC2) ports, through dcpext0 and dcpext2 (t6050-display.dtsi). It takes over
+ * the right port's DisplayPort endpoint of t6050-max-atc2.dtsi.
+ */
+#include "t6050-display.dtsi"
+
+&hpm1 {
+	connector {
+		ports {
+			port@2 {
+				reg = <2>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				atc1_dp_dcpext0: endpoint@0 {
+					reg = <0>;
+					remote-endpoint = <&dcpext0_atc1>;
+				};
+
+				atc1_dp_dcpext2: endpoint@1 {
+					reg = <1>;
+					remote-endpoint = <&dcpext2_atc1>;
+				};
+			};
+		};
+	};
+};
+
+&hpm2 {
+	connector {
+		ports {
+			port@2 {
+				reg = <2>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				/delete-node/ endpoint;
+
+				atc2_dp_dcpext0: endpoint@0 {
+					reg = <0>;
+					remote-endpoint = <&dcpext0_atc2>;
+				};
+
+				atc2_dp_dcpext2: endpoint@1 {
+					reg = <1>;
+					remote-endpoint = <&dcpext2_atc2>;
 				};
 			};
 		};
