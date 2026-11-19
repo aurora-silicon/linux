@@ -39,6 +39,7 @@ policy = re.sub(r'^#include <linux/[^>]+>\n', '',
 functions = '\n'.join(function(f, n) for f, n in (
     ('dcp_backlight.c', 'dcp_backlight_complete'),
     ('dcp_backlight.c', 'dcp_backlight_pending'),
+    ('dcp_backlight.c', 'dcp_backlight_retry_delay_locked'),
     ('dcp_backlight.c', 'dcp_backlight_retry_delay'),
     ('iomfb.c', 'iomfb_present_failed_h17p'),
     ('iomfb.c', 'iomfb_present_complete_h17p'),
@@ -55,6 +56,10 @@ prefix = r'''
 #include <string.h>
 typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;
 #define READ_ONCE(x) (x)
+#define min(a,b) ((a)<(b)?(a):(b))
+#define max(a,b) ((a)>(b)?(a):(b))
+static inline u64 div_u64(u64 n,u32 d) {return n/d;}
+static inline u64 mul_u32_u32(u32 a,u32 b) {return (u64)a*b;}
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define lockdep_assert_held(x) ((void)(x))
 #define spin_lock_irqsave(x,f) do { (void)(x);(f)=0; } while(0)
@@ -64,6 +69,11 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;
 #define msecs_to_jiffies(x) (x)
 #define IOMFB_OPAQUE_X_WAITING 0
 #define IOMFB_OPAQUE_X_NEEDED 1
+#define DCP_FIRMWARE_V_27_0 27
+#define list_for_each_entry_safe(p,n,h,m) for((void)(n),(p)=NULL;(p)&&(h)->empty;)
+#define list_del(x) ((void)(x))
+struct iomfb_scanout_h17p {int link;};
+static void iomfb_scanout_release_h17p(struct iomfb_scanout_h17p *s) {(void)s;}
 struct work_struct {int id;};struct delayed_work {struct work_struct work;};
 struct list_head {int empty;};
 struct iomfb_transaction {
@@ -72,16 +82,16 @@ struct iomfb_transaction {
  void (*release)(struct iomfb_transaction *);
 };
 struct apple_dcp {
- bool crashed;void *dev;struct work_struct bl_update_wq,vblank_wq;
+ bool crashed,ext26_control_pending;int fw_compat;void *dev;struct work_struct bl_update_wq,vblank_wq;
  struct {int lock;struct dcp_backlight_state state;} backlight;
  struct {bool pending;} present_state_h17p;
  struct {int lock;bool stopped,backlight_queued;struct iomfb_transaction *active;
   struct delayed_work timeout,backlight_retry;struct work_struct work;
-  struct list_head pending;int opaque_x_state;
+  struct list_head pending,dropped;int opaque_x_state,callback_count;
  } iomfb;
 };
-static unsigned delay,scheduled,released,discarded;static bool idle=true;
-static void *system_wq;
+static unsigned delay,scheduled,released,discarded,warned;static bool idle=true;
+static void *system_dfl_wq;
 static bool iomfb_channels_idle(struct apple_dcp *d) {(void)d;return idle;}
 static int iomfb_enqueue_opaque_x(struct apple_dcp *d) {(void)d;return 0;}
 static void iomfb_discard_pending(struct apple_dcp *d) {(void)d;discarded++;}
@@ -91,7 +101,7 @@ static void schedule_work(struct work_struct *w) {assert(w->id==1);scheduled++;}
 static void mod_delayed_work(void *q,struct delayed_work *w,unsigned ms) {
  (void)q;assert(w->work.id==2);delay=ms;
 }
-static void dev_warn_ratelimited(void *d,const char *msg) {(void)d;(void)msg;}
+#define dev_warn_ratelimited(d,...) do { (void)(d);warned++; } while(0)
 static void iomfb_scanout_complete_h17p(struct apple_dcp *d) {(void)d;}
 static void atomic_cmpxchg(int *p,int old,int value) {if(*p==old)*p=value;}
 static void release(struct iomfb_transaction *t) {(void)t;released++;}
@@ -106,7 +116,7 @@ static void init(struct apple_dcp *d) {
  d->iomfb.pending.empty=1;assert(!dcp_bl_init(&d->backlight.state,509,true,inherited,false,0));
  assert(dcp_bl_seed(&d->backlight.state,36));assert(!dcp_bl_dpms(&d->backlight.state,true));
  assert(!dcp_bl_request(&d->backlight.state,140,false,false));
- delay=scheduled=released=discarded=0;idle=true;
+ delay=scheduled=released=discarded=warned=0;idle=true;
 }
 static void reserve(struct apple_dcp *d,struct iomfb_transaction *t) {
  memset(t,0,sizeof(*t));t->brightness_only=true;t->release=release;
@@ -129,8 +139,11 @@ int main(void) {
  init(&d);
  for(unsigned i=0;i<4;i++) {
   reserve(&d,&t);delay=0;reject(&d);assert(delay==(i<3?(100U<<i):0));
+  /* Only the refusal that ends the budget is reported as exhausted. */
+  assert(warned==(i==3));
  }
  assert(d.backlight.state.dirty&&d.backlight.state.retries==4&&!d.iomfb.active);
+ assert(d.backlight.state.refused==4);
  /* A new user request re-arms the budget and can complete. */
  assert(!dcp_bl_request(&d.backlight.state,36,false,false));assert(!d.backlight.state.retries);
  reserve(&d,&t);reject(&d);assert(delay==100);
@@ -151,7 +164,7 @@ int main(void) {
 code = a.output / 'backlight-retry.c'
 code.write_text(prefix + functions + main)
 command = [a.cc, '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
-           '-Wno-unused-parameter', '-fsanitize=address,undefined', str(code),
+           '-Wno-unused-parameter', '-Wno-unused-function', '-fsanitize=address,undefined', str(code),
            '-o', str(a.output / 'backlight-retry')]
 subprocess.run(command, check=True)
 result = subprocess.check_output([str(a.output / 'backlight-retry')], text=True)
