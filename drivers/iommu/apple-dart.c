@@ -1034,13 +1034,18 @@ static phys_addr_t apple_dart_pte_to_paddr(const struct apple_dart *dart,
 	return (pte & GENMASK_ULL(37, 10)) << 4;
 }
 
-/* Firmware table pages must remain outside Linux's page allocator. */
+/*
+ * Firmware table pages must remain outside Linux's page allocator. The boot
+ * loader says it reserved them with apple,firmware-root-handoff; the walker
+ * decodes them in the APPLE_DART2 PTE layout, so that is the only other
+ * condition.
+ */
 static bool apple_dart_fw_handoff_enabled(const struct apple_dart *dart)
 {
 	struct device_node *np = dart->dev->of_node;
 	u32 handoff;
 
-	return dart->locked && of_device_is_compatible(np, "apple,t8140-dart") &&
+	return dart->locked && dart->hw->fmt == APPLE_DART2 &&
 		of_property_count_u32_elems(np, "apple,firmware-root-handoff") == 1 &&
 		!of_property_read_u32(np, "apple,firmware-root-handoff", &handoff) &&
 		handoff == 1;
