@@ -163,7 +163,7 @@
 		 * System level cache planes: ADT mcc,t8142 reg[1] (amcc-reg-idx 1,
 		 * one AMCC, amcc-plane-enable-mask 0xf), four planes 0x40000 apart,
 		 * T8140's register layout (ways 0x2800, power 0x2804, allocation
-		 * disable 0x82c, flush 0x2844; m1n1/aura mcc_init_m5). aura enables
+		 * disable 0x82c, flush 0x2844; aura/aura mcc_init_m5). aura enables
 		 * the ways and allocation before the kernel, so the driver only
 		 * checks that and flushes the cache on shutdown.
 		 */

@@ -3,7 +3,7 @@
  * J613 CPU memory-floor governor: pure decision logic.
  *
  * No MMIO, locking or time source here, so the same code runs in the kernel,
- * in KUnit and in the host harness (tools/asahi/pmp-j613-floor-tests.py).
+ * in KUnit and in the host harness (tools/aurora/pmp-j613-floor-tests.py).
  * The caller samples CPU and GPU busy time, calls pmp_floor_gov_step() once
  * per sample and performs the returned transition.
  */

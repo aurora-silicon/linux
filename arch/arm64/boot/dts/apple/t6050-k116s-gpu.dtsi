@@ -133,7 +133,7 @@
 &sgx {
 	/*
 	 * "apple,agx-g17s" is what the loader checks and the driver binds
-	 * (drivers/gpu/drm/asahi/driver.rs). The driver uses the J714 tables for it,
+	 * (drivers/gpu/drm/aurora/driver.rs). The driver uses the J714 tables for it,
 	 * 5 mV below this unit's ADT voltages at eight of the fourteen states.
 	 */
 	compatible = "apple,agx-g17s";

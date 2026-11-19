@@ -100,7 +100,7 @@ def main():
         if not ok:
             sys.exit(1)
         arm_until = time.time() + 180      # keep trying for three minutes
-        # Re-arm back to back while it boots: m1n1's first lines come a few
+        # Re-arm back to back while it boots: aura's first lines come a few
         # seconds after the reset, and serial mode only sticks once the port
         # is back. Arms before the reset itself are lost, so wait for it first.
         time.sleep(2)

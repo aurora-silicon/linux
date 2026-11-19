@@ -15,7 +15,7 @@
 #include <asm/cache.h>
 #include <asm/tlbflush.h>
 
-/* Explicit publication of retained coprocessor page tables before ASC start (asahi G15). */
+/* Explicit publication of retained coprocessor page tables before ASC start (aurora G15). */
 EXPORT_SYMBOL_GPL(dcache_clean_poc);
 
 void sync_icache_aliases(unsigned long start, unsigned long end)

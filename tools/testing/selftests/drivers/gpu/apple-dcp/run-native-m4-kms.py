@@ -45,15 +45,15 @@ def preflight(args):
     if boot != args.expected_boot_id:
         raise RuntimeError('Boot ID changed')
     words = shlex.split(Path('/proc/cmdline').read_text())
-    for key, value in [('m4_asahi_rust', '1'), ('m4_asahi_rust.source', args.expected_source),
-                       ('m4_asahi_rust.image', args.expected_image_sha256)]:
+    for key, value in [('m4_aurora_rust', '1'), ('m4_aurora_rust.source', args.expected_source),
+                       ('m4_aurora_rust.image', args.expected_image_sha256)]:
         if [w for w in words if w.startswith(key + '=')] != [key + '=' + value]:
             raise RuntimeError('Missing exact candidate command-line proof: ' + key)
-    state_path = Path('/usr/lib/m4_asahi_rust/source-state.json')
+    state_path = Path('/usr/lib/m4_aurora_rust/source-state.json')
     state = root_json(state_path)
     if not state.get('ready') or state.get('source_commit') != args.expected_source:
         raise RuntimeError('Installed source manifest is not the requested candidate')
-    image = Path('/usr/lib/linux-m4-asahi-rust/Image')
+    image = Path('/usr/lib/linux-m4-aurora-rust/Image')
     if sha(image) != args.expected_image_sha256 or state['artifact_sha256'].get(str(image)) != args.expected_image_sha256:
         raise RuntimeError('Image does not match exact candidate identity')
     module = Path(capture(['modinfo', '-n', 'appledrm'])).resolve(strict=True)
@@ -69,14 +69,14 @@ def preflight(args):
     if len(cards) != 1:
         raise RuntimeError('Expected one DRM card owned by common appledrm')
     guard = dict(line.split('=', 1) for line in capture([
-        'systemctl', 'show', 'm4-asahi-rust-rollback.service',
+        'systemctl', 'show', 'm4-aurora-rust-rollback.service',
         '--property=ActiveState', '--property=MainPID', '--property=StatusText',
         '--property=ExecStart', '--property=DropInPaths', '--property=Environment']).splitlines())
     if (guard.get('ActiveState') != 'active' or not int(guard.get('MainPID', '0'))
             or 'unqualified' not in guard.get('StatusText', '').lower()
-            or '/usr/lib/m4_asahi_rust/rollback-guard.py' not in guard.get('ExecStart', '')
+            or '/usr/lib/m4_aurora_rust/rollback-guard.py' not in guard.get('ExecStart', '')
             or guard.get('DropInPaths') or guard.get('Environment')
-            or Path('/run/m4_asahi_rust-qualified').exists()):
+            or Path('/run/m4_aurora_rust-qualified').exists()):
         raise RuntimeError('Independent unqualified-candidate rollback guard must remain armed')
     desktop = capture(['systemctl', 'show', 'display-manager.service', '--property=ActiveState', '--value'])
     if desktop not in ('inactive', 'failed'):
@@ -112,7 +112,7 @@ def main():
     parser.add_argument('--expected-source')
     parser.add_argument('--expected-boot-id')
     parser.add_argument('--expected-image-sha256')
-    parser.add_argument('--expected-release', default='7.1.12-m4_asahi_rust')
+    parser.add_argument('--expected-release', default='7.1.12-m4_aurora_rust')
     args = parser.parse_args()
     if not args.execute and not args.compile_only:
         print(json.dumps({'state': 'dry_run', 'hardware_access': False,

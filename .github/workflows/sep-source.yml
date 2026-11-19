@@ -102,7 +102,7 @@ jobs:
         run: |
           make LLVM=1 ARCH=arm64 rustavailable
           make LLVM=1 ARCH=arm64 defconfig
-          scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/asahi.config
+          scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/aurora.config
           scripts/config -e KUNIT -e APPLE_SEP_KUNIT_TEST
           make LLVM=1 ARCH=arm64 olddefconfig
           grep -qx 'CONFIG_APPLE_SEP=m' .config

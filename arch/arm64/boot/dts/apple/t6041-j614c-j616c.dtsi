@@ -2697,7 +2697,7 @@
 /*
  * Boot NOR, as on the M4 Pro boards. The partition is the J614c ADT
  * /arm-io/qspi/spinor/anvram (0x700000, 0x100000), flash-relative;
- * asahi-bless and asahi-nvram find it by its label.
+ * aurora-bless and aurora-nvram find it by its label.
  */
 &qspi {
 	status = "okay";

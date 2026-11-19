@@ -6,10 +6,10 @@ J616s ISP modes and capture protocol
 Sources and scope
 -----------------
 
-The source reference is Ryan's m1n1 PR 20, branch ``j616s`` at
+The source reference is Ryan's aura PR 20, branch ``j616s`` at
 ``9be380c8a5a94609fdbe62d693c7b2121478ad8f``:
 
-* ``proxyclient/m1n1/fw/isp/isp_sensor.py`` discovers IMX958 and queries
+* ``proxyclient/aura/fw/isp/isp_sensor.py`` discovers IMX958 and queries
   ``CH_CAMERA_CONFIG_GET`` for every configuration reported by ``CH_INFO_GET``.
 * ``isp_capture.py:T6040PreviewConfiguration`` contains the successful
   processed capture command sequence. ``isp_pixels.py`` decodes its P010

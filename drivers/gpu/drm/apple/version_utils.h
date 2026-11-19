@@ -48,7 +48,7 @@ enum dcp_firmware_version {
 	DCP_FIRMWARE_V_14_7,
 	/*
 	 * Generic 14.7.0 firmware on M1/M2 DCPs, driven through the classic
-	 * IOMFB template (iomfb_v14_7_tpl.c), as on Asahi.
+	 * IOMFB template (iomfb_v14_7_tpl.c), as on Aurora.
 	 */
 	DCP_FIRMWARE_V_14_7_TEMPLATE,
 	DCP_FIRMWARE_H17P,

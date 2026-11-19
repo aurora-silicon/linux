@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * KUnit cases for the J613 CPU memory-floor governor logic
- * (pmp-j613-floor-gov.h). The host harness tools/asahi/pmp-j613-floor-tests.py
+ * (pmp-j613-floor-gov.h). The host harness tools/aurora/pmp-j613-floor-tests.py
  * covers the same header in more depth, with mutants.
  */
 #include <kunit/test.h>

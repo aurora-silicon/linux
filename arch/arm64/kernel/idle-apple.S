@@ -6,7 +6,7 @@
  * Affected Apple cores can resume from WFI with cleared general registers.
  * SP and stack memory survive. Preserve the AAPCS64 callee-saved registers
  * and x18 (which may hold the shadow call stack), including the return PC.
- * This follows the stateless-wait approach used during m1n1 M5 Windows
+ * This follows the stateless-wait approach used during aura M5 Windows
  * bring-up. It does not configure an Apple deep-sleep state or DVFS policy.
  *
  * IRQ masking/context management remains with cpu_do_idle(). The direct

@@ -576,11 +576,11 @@ pub(crate) fn machine_has(compatible: &[u8]) -> bool {
 /// before. Firmware from 26.4 on has an `mBoot-` build and never gets here.
 const T6020_SEPOS13_BEFORE: (u32, u32) = (13822, 80);
 
-/// The leading `major.minor` of an `iBoot-` build string, as m1n1 copies the
-/// machine's own iBoot into `asahi,iboot1-version` ("iBoot-13822.61.10").
+/// The leading `major.minor` of an `iBoot-` build string, as aura copies the
+/// machine's own iBoot into `aurora,iboot1-version` ("iBoot-13822.61.10").
 /// Anything else, including an `mBoot-` build, yields `None`. Unlike
-/// `asahi,system-fw-version`, this does not depend on m1n1's version table,
-/// so every m1n1 gives the same answer.
+/// `aurora,system-fw-version`, this does not depend on aura's version table,
+/// so every aura gives the same answer.
 fn parse_iboot_build(raw: &[u8]) -> Option<(u32, u32)> {
     fn number(text: &[u8]) -> Option<(u32, &[u8])> {
         let digits = text.iter().take_while(|byte| byte.is_ascii_digit()).count();
@@ -627,9 +627,9 @@ fn shown(raw: &Option<KVec<u8>>) -> &kernel::str::BStr {
 /// a missing property, keeps [`T6020`], so a machine that works today keeps
 /// the encoding it works with.
 fn t6020_profile() -> &'static PlatformProfile {
-    let iboot = chosen_string(c"asahi,iboot1-version");
-    let firmware = chosen_string(c"asahi,system-fw-version");
-    let os_firmware = chosen_string(c"asahi,os-fw-version");
+    let iboot = chosen_string(c"aurora,iboot1-version");
+    let firmware = chosen_string(c"aurora,system-fw-version");
+    let os_firmware = chosen_string(c"aurora,os-fw-version");
     let sepos13 = t6020_uses_sepos13(iboot.as_deref());
     let profile = if sepos13 { &T6020_SEPOS13 } else { &T6020 };
     pr_info_once!(
@@ -901,7 +901,7 @@ mod dart_window_tests {
 /// The owner-qualified J613 OS-firmware lane; system firmware may differ.
 pub(crate) fn j613_26_6_2() -> bool {
     machine_has(b"apple,j613")
-        && chosen_string(c"asahi,os-fw-version")
+        && chosen_string(c"aurora,os-fw-version")
             .as_deref()
             .is_some_and(os_firmware_26_6_2)
 }

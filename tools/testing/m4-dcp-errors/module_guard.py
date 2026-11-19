@@ -104,7 +104,7 @@ def check_module_guard(source_root, output, compiler, conf=None):
     (output / "dart-module-expanded.c").write_text(result.stdout)
     symbols = ["arch_dma_prep_coherent", "dma_common_pages_remap", "dma_pgprot"]
     references = {name: len(re.findall(r"\b" + name + r"\b", result.stdout)) for name in symbols}
-    defconfig_path = "arch/arm64/configs/asahi.config"
+    defconfig_path = "arch/arm64/configs/aurora.config"
     defconfig = (source_root / defconfig_path).read_text()
     hashes[defconfig_path] = hashlib.sha256(defconfig.encode()).hexdigest()
     native_opt_in = "CONFIG_APPLE_DART_J713_DCP=y\n" in defconfig

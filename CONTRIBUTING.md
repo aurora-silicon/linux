@@ -22,7 +22,7 @@ board, running kernel, and both firmware versions:
 ```sh
 uname -r
 tr '\0' '\n' < /proc/device-tree/compatible
-for property in asahi,os-fw-version asahi,system-fw-version; do
+for property in aurora,os-fw-version aurora,system-fw-version; do
     printf '%s: ' "$property"
     if [ -r "/proc/device-tree/chosen/$property" ]; then
         tr '\0' '\n' < "/proc/device-tree/chosen/$property"

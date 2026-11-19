@@ -32,7 +32,7 @@
 };
 
 /*
- * m1n1 keys off the sep alias to add the sepfw region and the boot
+ * aura keys off the sep alias to add the sepfw region and the boot
  * manifests the driver needs to cold-boot SEPOS.
  */
 &sep {

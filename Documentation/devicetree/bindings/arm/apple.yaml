@@ -509,7 +509,7 @@ properties:
   aurora,minimal-boot:
     type: boolean
     description:
-      Request a minimal native RAM boot from the Aurora m1n1 loader. Skip
+      Request a minimal native RAM boot from the aura loader. Skip
       generic PCIe and DAPF initialization and the legacy EL2 Apple Device
       Tree handoff. The loader still supplies the Linux flattened device
       tree, usable memory, reserved regions and CPU release addresses.

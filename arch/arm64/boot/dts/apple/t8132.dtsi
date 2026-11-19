@@ -425,7 +425,7 @@
 
 		/*
 		 * The ANS register addresses and interrupts are populated from the
-		 * live Apple device tree by m1n1.  Keeping these aliases stable lets
+		 * live Apple device tree by aura.  Keeping these aliases stable lets
 		 * the same SoC description work across T8132 machines.
 		 */
 		ans_mbox: mbox@0 {
@@ -1146,7 +1146,7 @@
 		mbox-names = "mbox";
 		iommus = <&pmp_dart 0>;
 		power-domains = <&ps_pmp>;
-		/* m1n1 supplies board/DRAM parameters and tunables before enabling. */
+		/* aura supplies board/DRAM parameters and tunables before enabling. */
 		status = "disabled";
 	};
 

@@ -423,7 +423,7 @@ EXPORT_SYMBOL_IF_KUNIT(apr_build_desc);
  * T6000 constants: Copyright The Asahi Linux Contributors.
  * MIT license: see m1n1-LICENSE.
  * Descriptor v0 (APR a0). Source: MIT m1n1 f3ac615eb137,
- * proxyclient/m1n1/hw/prores.py:7-111 and
+ * proxyclient/aura/hw/prores.py:7-111 and
  * proxyclient/experiments/prores.py:592-644. Only the input/output prefix
  * is shared with v1. The rate-control block is v1's, 0x20 bytes earlier:
  * the target and maximum Q3 bytes per macroblock at 0xf0/0xf2 take the same
@@ -457,7 +457,7 @@ int apr_build_desc_v0(const struct apr_frame *f, u8 *desc)
 	desc[0x068] = f->matrix;
 	/* No alpha. Both quantisation matrices are included in the header. */
 	desc[0x06b] = 3;
-	/* Deprecated slice count at 0x0ec stays zero, as in m1n1. */
+	/* Deprecated slice count at 0x0ec stays zero, as in aura. */
 	desc[0x0ee] = APR_SLICE_LOG2 << 4;
 	desc[0x0ef] = apr_profile_policy[f->profile].quant_index;
 	put_unaligned_le16(apr_mb_budget(target, slices, mbs), desc + 0x0f0);

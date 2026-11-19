@@ -28,7 +28,7 @@
 	status = "disabled";
 };
 
-/* Reuse the complete Asahi PMP topology, with this profile left disabled. */
+/* Reuse the complete Aurora PMP topology, with this profile left disabled. */
 &pmp_report {
 	compatible = "apple,j613-25g83-pmp-report";
 	/* The native PMP names its report instead (apple,pmp-report). */

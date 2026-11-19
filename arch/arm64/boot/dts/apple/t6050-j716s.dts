@@ -184,7 +184,7 @@
 /*
  * The SMC's first GPIO bank, the gP keys: the N1's power line is gP13.
  * gpio-macsmc drives it with the line's ADT template, pKW4("gP13",
- * 0x00800000): 0x00800000 | level, as m1n1 does.
+ * 0x00800000): 0x00800000 | level, as aura does.
  */
 &smc {
 	smc_gpio: gpio {
@@ -198,7 +198,7 @@
  * The power of the N1's port. iBoot leaves APCIE_SYS_GP, APCIE_PHY_SW and
  * APHY_GP_AUS5 in automatic power management with the block gated (boot
  * state 0x1000030f, 0x1400024f, 0x1000030f); the train needs them on and
- * staying on, as m1n1 raises them (target active, auto-PM off). Always on:
+ * staying on, as aura raises them (target active, auto-PM off). Always on:
  * the port's link is kept through suspend-to-idle, and the host has no
  * power domain of its own. Parents as the ADT names them, the
  * register-less APCIE_SYS_GE left out. ADT pmgr devices APCIE_GP +0x118,

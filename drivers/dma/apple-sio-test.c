@@ -2,7 +2,7 @@
 /*
  * Included by apple-sio.c: the T6030 SIO boot-table check.
  *
- * sio_t6030_build() lays the tables out the way the boot loader does (m1n1's add_fwdata(): a
+ * sio_t6030_build() lays the tables out the way the boot loader does (aura's add_fwdata(): a
  * table shares the previous mapping while it fits in that mapping's 16K, the mappings start at
  * IOVA 0x30000 and end up 16K-aligned). It builds both a T6030-aware loader's protocol-10 tables
  * and an earlier loader's.

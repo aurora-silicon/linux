@@ -66,7 +66,7 @@ copied from proprietary sources.
   registers port DP/TBT altmodes and partner identity, but has no
   `typec_partner_register_altmode` call or Billboard desktop hint in that
   driver. This is a bounded driver inspection, not a claim about every
-  Asahi package.
+  Aurora package.
 * [Linux Type-C class API](https://docs.kernel.org/driver-api/usb/typec.html)
   represents partner and port modes separately. Exposing real discovered
   modes is a driver concern; displaying a desktop notification is a

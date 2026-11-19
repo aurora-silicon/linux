@@ -9,9 +9,9 @@ GPU Driver Documentation
    apple-dcp-backlight
    apple-dcp-panel-colorimetry
    apple-drm-parameters
-   asahi-reclaim
-   asahi-usage-stats
-   asahi-m4-bringup
+   aurora-reclaim
+   aurora-usage-stats
+   aurora-m4-bringup
    apple-dcp-m4
    i915
    imagination/index

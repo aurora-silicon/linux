@@ -90,7 +90,7 @@ MODULE_PARM_DESC(tm_abort,
 #define tq_write32(ane, off, val) \
 	(writel(val, (ane)->engine + ANE_TQ_BASE + (off)))
 
-/* The ane SET block (m1n1 ANE.ps_map) maps the pmgr power-state words
+/* The ane SET block (aura ANE.ps_map) maps the pmgr power-state words
  * for this engine (set0, base, set1..4). pmgr reads are always safe and
  * give recovery its ACTUAL power state; the SET words themselves are
  * firmware-locked: a direct write external-aborts the SoC (T6001 at

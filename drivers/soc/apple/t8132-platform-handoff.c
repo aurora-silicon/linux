@@ -2,7 +2,7 @@
 /* Supply missing platform descriptions for the original J713 loader ABI,
  * which the J715 shares, and the M4 PMGR ownership policy on the qualified
  * firmware for every M4 Mac.
- * Keep the shared m1n1 payload usable by the stable kernel. Hardware control
+ * Keep the shared aura payload usable by the stable kernel. Hardware control
  * remains in the ordinary MCC, PMC and CLPC drivers, with one DTS data source.
  * J713 PMGR ownership/status also comes from its board DTS, before any domain
  * registers can be accessed. Native descriptions take precedence.

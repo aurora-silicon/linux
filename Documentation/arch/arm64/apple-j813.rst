@@ -10,7 +10,7 @@ console and the framebuffer left by the boot firmware. The J813 tree also
 describes SMC temperature monitoring, MTP input and the keyboard backlight.
 
 The device tree describes all ten CPU affinities. For the initial one-CPU
-baseline, keep secondary cores stopped in m1n1 and use ``maxcpus=1``.
+baseline, keep secondary cores stopped in aura and use ``maxcpus=1``.
 The loader removes unavailable CPUs and fills the release addresses of the
 remaining nodes. The P-core
 affinities are 0x10100 through 0x10103, rather than the 0x100 through 0x103
@@ -26,7 +26,7 @@ M5 secondary CPUs can return from WFI with cleared general-purpose registers.
 Both M5 MIDRs (parts 0x062 and 0x063) select the Apple register-preserving idle
 path. Without it, all ten CPUs can start and then panic in their idle tasks.
 
-SMP also requires the M5-capable m1n1 secondary-start path: dense PMGR CPU
+SMP also requires the M5-capable aura secondary-start path: dense PMGR CPU
 masks, correct reset vectors and per-core stacks. Verify all ten cores there
 before preparing the FDT, and use ``maxcpus=10`` for the Linux test. The
 existing J813 DT and configuration support this handoff.
@@ -52,7 +52,7 @@ measured firmware handoff values; higher states remain unqualified.
 State 1 is 300 MHz on both clusters. The firmware SRAM voltage tables begin
 at state 2: the E cluster exposes 300/972 MHz, and the P cluster exposes
 300/1308/1608/1932/2220/2508/2820/3072/3300/3516 MHz. A dependent decrement
-loop timed against CNTPCT_EL0 in m1n1 confirmed this mapping on J813.
+loop timed against CNTPCT_EL0 in aura confirmed this mapping on J813.
 ``scaling_cur_freq`` reports the requested state, not an independent clock
 measurement or a guarantee against firmware throttling.
 
@@ -90,7 +90,7 @@ register state.
 Bootloader requirements
 =======================
 
-Use the J813-capable Aurora m1n1 and U-Boot bring-up stack. A stock M1/M2
+Use the J813-capable aura and U-Boot bring-up stack. A stock M1/M2
 loader is not sufficient. Before entering Linux, the loader must:
 
 * Supply usable memory and reserved regions. T8142 DRAM starts at
@@ -137,14 +137,14 @@ Use a RAM-only initramfs with a serial shell and BusyBox (including
 ``mount``, ``sleep``, ``cat``, ``uname`` and ``sha256sum``). Its init must
 mount proc, sysfs and devtmpfs, keep PID 1 alive and make no disk mounts.
 Record the source commit, any uncommitted patch, final kernel config and
-SHA-256 hashes of Image, DTB, initramfs, m1n1 and U-Boot with the console
+SHA-256 hashes of Image, DTB, initramfs, aura and U-Boot with the console
 capture. Verify uploaded payload bytes before handing over to U-Boot.
 
 The initial command line is::
 
   earlycon=dockchannel,0x38812c000 console=tty0 console=ttyDC0 keep_bootcon maxcpus=1 rdinit=/init panic=0
 
-Use m1n1 to load Image, the initramfs, the DTB and U-Boot into RAM and
+Use aura to load Image, the initramfs, the DTB and U-Boot into RAM and
 prepare the FDT. Pass that prepared FDT through U-Boot's ``booti`` command.
 Do not install this experimental payload into the resident boot image.
 
@@ -194,7 +194,7 @@ The existing J700 thermal provider and bounded J813 frequency states are
 unchanged. Temperature reporting alone does not qualify sustained load.
 
 MTP provides keyboard and trackpad HID descriptors and identifiers at runtime.
-The ``keyboard`` alias lets m1n1 fill ``hid-country-code`` and
+The ``keyboard`` alias lets aura fill ``hid-country-code`` and
 ``apple,keyboard-layout-id`` from this machine's own boot environment. The
 source tree does not assume a US keyboard or contain another machine's layout.
 The J813 trackpad uses power method 2 with firmware-owned reset; the host

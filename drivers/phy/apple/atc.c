@@ -10,7 +10,7 @@
  * reset controller for the attached DWC3 USB controller.
  *
  * In order to correctly setup the high speed lanes for the various modes
- * calibration values copied from Apple's firmware by our bootloader m1n1 are
+ * calibration values copied from Apple's firmware by our bootloader aura are
  * required. Without these only USB2 operation is possible.
  *
  * Copyright (C) The Asahi Linux Contributors
@@ -2895,7 +2895,7 @@ static void atcphy_configure_post_tunable_all_modes(struct apple_atcphy *atcphy,
  * with a per-rate selector and the AUSPLL gets a fixed descriptor
  * ({0,0x21c,8,3,8,7,0,0,0,0,2,1,0,5,5,1,0,1,1,1}, APB commands 0 then 0x2000),
  * without touching the lane mux. Based on Oliver Lukschander's t6020 tunnel
- * clock patch (asahi-j416s-display).
+ * clock patch (aurora-j416s-display).
  */
 /* t600x (M1 Pro/Max) has the t8103 generation ATC. */
 static bool apple_atc_tunnel_is_t600x(void)

@@ -21,7 +21,7 @@
  * Remaining parameters are overridable from sysfs for bisection only.
  *
  * Division of labor:
- *  - CPU start: from kernel context — the m1n1 RTBuddy path stays
+ *  - CPU start: from kernel context — the aura RTBuddy path stays
  *    dormant (no MGMT session comes up) and the 13.5 (22G74) selene
  *    image brings up the legacy ChMan transport after DONE without
  *    RTKit. Boot is fenced in ane_t6021_boot.c (entry fold, RVBAR
@@ -115,7 +115,7 @@
  */
 #define ANE_IPI_OFF			0x1844000
 
-/* CPU_STATUS bits (m1n1 ASCRegs shape). On T8112 RUNNING is clear while
+/* CPU_STATUS bits (aura ASCRegs shape). On T8112 RUNNING is clear while
  * the firmware is live and IDLE (WFI) is set whenever it waits, so STOPPED
  * is the only stop predicate.
  */
@@ -2807,7 +2807,7 @@ static void ane_rtclient_post_boot(struct work_struct *w)
 }
 
 /* STARTEP every fw-announced app endpoint (>= 0x20; the fw mgmt
- * dispatcher starts an endpoint on flag bit 1). Same call every Asahi
+ * dispatcher starts an endpoint on flag bit 1). Same call every Aurora
  * RTKit client makes.
  */
 static void ane_rtclient_start_app_eps(struct ane_rtclient *ane)
@@ -3890,7 +3890,7 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 
 	if (!ane_t6021_fwload_placement_ok(dev)) {
 		dev_err(dev,
-			"fw_alias_reserved=1, but no no-map /reserved-memory node covers the iBoot firmware windows (this m1n1 does not reserve them); refusing before power access, ANE off\n");
+			"fw_alias_reserved=1, but no no-map /reserved-memory node covers the iBoot firmware windows (this aura does not reserve them); refusing before power access, ANE off\n");
 		return -ENODEV;
 	}
 

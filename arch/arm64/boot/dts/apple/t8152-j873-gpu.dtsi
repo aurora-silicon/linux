@@ -13,7 +13,7 @@
  *    with aurora.g18_initdata_test=0;
  *  - the eight reserved regions are boot-local. They stay disabled with a
  *    zero reg until the loader copies this boot's /arm-io/sgx base and size
- *    values into them and sets status = "okay" (as m1n1 dt_set_resvmem()
+ *    values into them and sets status = "okay" (as aura dt_set_resvmem()
  *    does). The loader finds them by these node names;
  *  - the four firmware segment carveouts (GFX/GFX1 __DATA and
  *    __DATA_SHARED_RO) are no-map, so they never enter the linear map. The
@@ -33,7 +33,7 @@
  * are listed for state reads (state +0x80, ack +0xbc).
  */
 
-/* Loaders locate the node through this alias (m1n1 dt_set_gpu()). */
+/* Loaders locate the node through this alias (aura dt_set_gpu()). */
 &{/aliases} {
 	gpu = &gpu;
 };

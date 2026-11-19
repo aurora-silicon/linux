@@ -152,7 +152,7 @@ out:
 
 static int j613_pmp_values(struct device_node *pmp)
 {
-	struct device_node *values = of_find_node_by_path("/chosen/asahi,t8122-pmp");
+	struct device_node *values = of_find_node_by_path("/chosen/aurora,t8122-pmp");
 	struct property *prop, *copy;
 	const char *uuid;
 	const u8 *table;
@@ -259,7 +259,7 @@ static struct device_node *j613_target(const struct device_node *np,
  * Finds the display and PMP nodes from nodes[J613_DCP] through the phandles
  * that wire them, and the display subsystem through the "disp0" alias, so
  * that the lookup follows the device tree rather than its node names and
- * places: the profile reuses Asahi's PMP report and mailbox nodes, and the
+ * places: the profile reuses Aurora's PMP report and mailbox nodes, and the
  * display subsystem sits at the root, outside the simple-bus. A node that is
  * not found stays NULL.
  */
@@ -344,12 +344,12 @@ static int __init j613_external_gate(struct device_node *display)
 	int len, ret = -EINVAL, i, count = 0;
 
 	chosen = of_find_node_by_path("/chosen");
-	opt = chosen ? of_get_property(chosen, "asahi,j613-25g83-dcpext", &len) : NULL;
+	opt = chosen ? of_get_property(chosen, "aurora,j613-25g83-dcpext", &len) : NULL;
 	if (!opt || len != 2 || opt[0] != '1' || opt[1]) {
 		of_node_put(chosen);
 		return 0;
 	}
-	loader_result = of_get_property(chosen, "asahi,j613-25g83-dcpext-result", &len);
+	loader_result = of_get_property(chosen, "aurora,j613-25g83-dcpext-result", &len);
 	if (loader_result && len > 0 && loader_result[len - 1] == 0)
 		pr_info("J613 native26 external loader result: %s\n", loader_result);
 	else

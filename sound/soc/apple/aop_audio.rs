@@ -993,7 +993,7 @@ impl SndSocAopDriver {
         let mut pcm = ptr::null_mut();
         // Like the T8140 card, identify the high-quality array by its service
         // and give the PCM a readable name. Keep the card ID and long name:
-        // UCM and the existing Asahi microphone rules use them for discovery.
+        // UCM and the existing Aurora microphone rules use them for discovery.
         let ret = unsafe { bindings::snd_pcm_new(this.card, c"hpai".as_ptr(), 0, 0, 1, &mut pcm) };
         if ret < 0 {
             dev_err!(data.dev, "Unable to allocate PCM device");

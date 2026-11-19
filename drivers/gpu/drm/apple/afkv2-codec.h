@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 /* Copyright 2026 Aurora Silicon */
-/* Wire layout: public Linux PR254 and m1n1 AFKV2 implementations. */
+/* Wire layout: public Linux PR254 and aura AFKV2 implementations. */
 #ifndef AURORA_AFKV2_CODEC_H
 #define AURORA_AFKV2_CODEC_H
 

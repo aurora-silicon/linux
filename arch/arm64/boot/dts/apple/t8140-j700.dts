@@ -2188,7 +2188,7 @@
 	wifi0: wifi@0,0 {
 		compatible = "pci14c3,7932";
 		reg = <0x10000 0 0 0 0>;
-		/* Public m1n1 supplies this device's address at boot. */
+		/* Public aura supplies this device's address at boot. */
 		local-mac-address = [00 00 00 00 00 00];
 	};
 };

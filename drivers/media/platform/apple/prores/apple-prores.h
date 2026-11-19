@@ -7,7 +7,7 @@
  * producer head and the engine reports completion through a status register
  * and a consumer tail.
  *
- * Register names and descriptor fields follow the m1n1 proxyclient ProRes
+ * Register names and descriptor fields follow the aura proxyclient ProRes
  * experiment (MIT), proxyclient/m1n1/hw/prores.py and
  * proxyclient/experiments/prores.py. The T8140 descriptor layout (version 1,
  * frame header moved from 0x58 to 0x7c) comes from Acelogic's J700 work.

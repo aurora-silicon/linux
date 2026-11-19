@@ -19,6 +19,8 @@
 	model = "Apple MacBook Pro (16-inch, M3 Pro, Nov 2023)";
 
 	chosen {
+		aurora,t6030-dispext = "1";
+		/* LEGACY-ASAHI(2027-02-28): the same switch under its old name, read by aura built before the rename */
 		asahi,t6030-dispext = "1";
 	};
 };
