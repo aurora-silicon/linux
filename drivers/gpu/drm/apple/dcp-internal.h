@@ -336,6 +336,12 @@ struct apple_dcp_hw_data {
 	 * firmware 27.0 and 27.2.1), so there is no secure port to idle before the IOP.
 	 */
 	bool s2r_no_secure_port;
+	/*
+	 * Every AFK endpoint speaks AFKv2 (see afk_init()), whatever the
+	 * firmware interface: for a firmware that does so on all of them
+	 * without an IOMFB interface version that implies it.
+	 */
+	bool afk_v2;
 };
 
 enum dcp_test_point {
