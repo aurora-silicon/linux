@@ -83,6 +83,20 @@
 	label = "USB-C Left-front";
 };
 
+&i2c0 {
+	/*
+	 * MagSafe port. Bus address and interrupt line (shared with hpm0 and
+	 * hpm1) from the board's ADT.
+	 */
+	hpm5: usb-pd@3a {
+		compatible = "apple,cd321x";
+		reg = <0x3a>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <11 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "irq";
+	};
+};
+
 &fpwm1 {
 	status = "okay";
 };
