@@ -634,7 +634,7 @@ impl AsahiPlatformDriver {
             dev_info!(pdev.as_ref(), "M5: m5_probe_only set, identifying the GPU only\n");
         }
         if !has_25g76 || probe_only {
-            let cfg = hw::t8142::select()?;
+            let cfg = hw::t8142::select();
             return Self::probe_g17(pdev, regs::G17Resources::new(pdev)?, cfg);
         }
         // SAFETY: The M5 UAT has 42 output bits.
