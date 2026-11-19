@@ -16,6 +16,7 @@
 #include <linux/sched/signal.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/string_helpers.h>
 
 #include "tb.h"
@@ -3819,8 +3820,7 @@ static int tb_switch_sleep_cio_frames(struct tb_switch *sw)
 	ret = usb4_switch_set_sleep(sw);
 	tb_cio_test_dock.ready = ktime_get();
 	tb_cio_test_dock.ret = ret;
-	if (!ret && (of_machine_is_compatible("apple,j714s") ||
-		     of_machine_is_compatible("apple,j716c")))
+	if (!ret && apple_t6050_sleep_described())
 		msleep(TB_CIO_MACOS_HOST_AFTER_DOCK_MS);
 	return ret;
 }
@@ -4102,8 +4102,7 @@ int tb_switch_cio_pm_roles(struct tb_switch *sw)
 
 	if (!parent || tb_route(parent) || !(parent->quirks & QUIRK_NO_CLX) ||
 	    !(sw->tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES) || !tb_switch_is_usb4(parent) ||
-	    !tb_switch_is_usb4(sw) || !(of_machine_is_compatible("apple,j714s") ||
-					of_machine_is_compatible("apple,j716c")))
+	    !tb_switch_is_usb4(sw) || !apple_t6050_sleep_described())
 		return 0;
 	/* TEST (sv6u3) */
 	tb_cio_test_roles_words(sw, &tb_cio_test_roles.down_was, &tb_cio_test_roles.up_was);
@@ -4141,8 +4140,7 @@ int tb_switch_suspend_cio(struct tb_switch *sw)
 	if (ret)
 		return ret;
 	if ((sw->tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES) && tb_switch_is_usb4(sw) &&
-	    !tb_route(sw) && (of_machine_is_compatible("apple,j714s") ||
-			      of_machine_is_compatible("apple,j716c"))) {
+	    !tb_route(sw) && apple_t6050_sleep_described()) {
 		ret = tb_switch_cio_macos_host_state(sw);
 		tb_cio_test_host.ret = ret;	/* TEST */
 		if (ret)

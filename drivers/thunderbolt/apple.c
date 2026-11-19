@@ -88,6 +88,7 @@
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/string.h>
 #include <linux/suspend.h>
 #include <linux/of.h>
@@ -3988,8 +3989,7 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 /* The T6050 firmware sleep, selected by the sleep driver's profile and mem_sleep. */
 static bool apple_cio_t6050_sleep(struct apple_cio *acio)
 {
-	return (of_machine_is_compatible("apple,j714s") ||
-		of_machine_is_compatible("apple,j716c")) &&
+	return apple_t6050_sleep_described() &&
 	       READ_ONCE(t6050_sleep_teardown) && acio->hw == &apple_cio_t6050_hw &&
 	       apple_sleep_v27_late() && !pm_suspend_default_s2idle();
 }
