@@ -2165,6 +2165,9 @@ pub(crate) struct Board {
     /// Whether explicit waits on other kicks take the completion class
     /// ([`Board::completion_inputs`]).
     completion_inputs: bool,
+    /// Whether firmware accepts tiling kicks without an entry signal and retained
+    /// render pairs kicked through the host port alone.
+    pub(crate) host_only_render_kicks: bool,
 }
 
 /// M5 Pro: two clusters of ten cores.
@@ -2195,6 +2198,7 @@ pub(crate) const J714: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: true,
+    host_only_render_kicks: false,
 };
 
 /// M5 Max: four clusters of ten cores.
@@ -2227,6 +2231,10 @@ pub(crate) const J716C: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
+    // Qualified on G17C's 26A428 image. G17S uses completion-class inputs,
+    // G17D has distinct kick encodings, and common 26A428 publishes descriptors
+    // on the item ring. Qualify those interfaces separately.
+    host_only_render_kicks: true,
 };
 
 /// J775D's performance controllers run from P3.
@@ -2269,6 +2277,7 @@ pub(crate) const J775D: Board = Board {
     fan_curve_start_mc: 97_000,
     g17d_forms: true,
     completion_inputs: false,
+    host_only_render_kicks: false,
 };
 
 /// M5 (T8142, MacBook Air J813): one cluster of ten core slots, eight enabled. Values from the
@@ -2309,6 +2318,7 @@ pub(crate) const J813: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
+    host_only_render_kicks: false,
 };
 
 const _: () = {
