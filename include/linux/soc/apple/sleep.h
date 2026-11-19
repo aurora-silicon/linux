@@ -111,6 +111,12 @@ bool apple_sleep_coproc_stopped(struct device *dev);
 bool apple_sleep_commit_stops_coprocs(void);
 
 /*
+ * Whether this firmware sleep is an untested SoC's dry run, which refuses before its commit and
+ * returns. A driver must then stop nothing that it can't start again.
+ */
+bool apple_sleep_dry_run(void);
+
+/*
  * Untested SoCs: a coprocessor's last stop notes its own step in PMU scratch (kept across a
  * WD2 reset), next to the sleep driver's step and the coprocessor's slot.
  */
@@ -313,6 +319,11 @@ static inline bool apple_sleep_coproc_stopped(struct device *dev)
 static inline void apple_sleep_note_sub(u8 step) {}
 
 static inline bool apple_sleep_commit_stops_coprocs(void)
+{
+	return false;
+}
+
+static inline bool apple_sleep_dry_run(void)
 {
 	return false;
 }

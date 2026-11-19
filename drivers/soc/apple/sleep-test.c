@@ -374,6 +374,12 @@ static void apple_sleep_test_t8122_unqualified(struct kunit *test)
 
 	KUNIT_EXPECT_STREQ(test, soc->machine, "apple,j613");
 	KUNIT_EXPECT_TRUE(test, soc->untested);
+	/* No bespoke stage, no notes in unmeasured PMU scratch, no cold display stop in a dry run. */
+	KUNIT_EXPECT_NULL(test, soc->ops->commit_begin);
+	KUNIT_EXPECT_TRUE(test, soc->no_pmu_notes);
+	KUNIT_EXPECT_TRUE(test, soc->display_no_restart);
+	KUNIT_EXPECT_PTR_EQ(test, apple_sleep_early_ops.valid, &apple_sleep_valid);
+	KUNIT_EXPECT_FALSE(test, apple_sleep_wake_admitted(soc, NULL, 0));
 	KUNIT_EXPECT_NOT_NULL(test, soc->ops->final_check);
 	KUNIT_EXPECT_NOT_NULL(test, soc->ops->commit_regs);
 	KUNIT_EXPECT_TRUE(test, apple_sleep_wake_admitted(soc, soc->wake_required,

@@ -9479,12 +9479,15 @@ static void dcp_dpms_power_off(struct apple_dcp *dcp)
  * the sleep driver, which refuses a sleep while a bound display coprocessor runs, its .suspend
  * stops the coprocessor cold, as macOS's last write to it does, and the sleep driver lowers
  * its domains. The display stays dark until a reboot: this is for qualifying the sleep's entry.
+ *
+ * Not in the sleep driver's dry run, which returns before its commit: there the coprocessor is
+ * left running and takes the ordinary suspend below, and the sleep driver doesn't count it.
  */
 static bool dcp_j613_sleep_owned(struct apple_dcp *dcp)
 {
 	return IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) && dcp->fw_compat == DCP_FIRMWARE_V_26_6 &&
 	       !dcp->external && of_machine_is_compatible("apple,j613") &&
-	       apple_sleep_commit_stops_coprocs();
+	       apple_sleep_commit_stops_coprocs() && !apple_sleep_dry_run();
 }
 
 bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
