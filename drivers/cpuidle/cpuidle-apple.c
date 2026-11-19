@@ -107,11 +107,21 @@ static struct cpuidle_driver apple_idle_driver = {
 			.desc			= "CPU clock-gated",
 			.flags			= 0,
 		},
+		/*
+		 * The cluster only grants its top P-states while few of its
+		 * cores are out of this state: a core idling in WFI counts as
+		 * active. With a 10 ms residency the governor almost never
+		 * picked CPU PD on busy systems, so a single busy M2 P core saw
+		 * 2-3 "active" WFI siblings and was held at 2208-2724 MHz
+		 * instead of 3204 MHz. 100 us is where the grant and the idle
+		 * cluster power stop improving on T8112; shorter only adds
+		 * wake latency.
+		 */
 		[STATE_PWRDOWN] = {
 			.enter			= apple_enter_idle,
 			.enter_s2idle		= apple_enter_idle,
 			.exit_latency		= 10,
-			.target_residency	= 10000,
+			.target_residency	= 100,
 			.power_usage            = 0,
 			.name			= "CPU PD",
 			.desc			= "CPU/cluster powered down",
