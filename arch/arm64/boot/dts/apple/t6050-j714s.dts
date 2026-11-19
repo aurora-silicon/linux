@@ -213,30 +213,14 @@
 	status = "okay";
 };
 
-/* The keyboard backlight: ADT pwm0/kbd-backlight, channel 0 at 25 kHz */
 / {
 	aliases {
 		/* The loader fills the keyboard layout from the ADT's keyboard node */
 		keyboard = &keyboard;
 	};
-
-	led-controller {
-		compatible = "pwm-leds";
-
-		led-0 {
-			pwms = <&fpwm0 0 40000>;
-			label = "kbd_backlight";
-			function = LED_FUNCTION_KBD_BACKLIGHT;
-			color = <LED_COLOR_ID_WHITE>;
-			max-brightness = <255>;
-			default-state = "keep";
-		};
-	};
 };
 
-&fpwm0 {
-	status = "okay";
-};
+#include "t6050-kbd-backlight.dtsi"
 
 /*
  * The keyboard and trackpad: the HID transport on the MTP's DockChannel FIFO
