@@ -63,6 +63,7 @@ static unsigned reports;
 #define dev_warn(...) ((void)reports++)
 #define dev_err(...) ((void)reports++)
 #define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define lockdep_assert_held(...) ((void)0)
 #define guard(which) (void)
 #define IS_ENABLED(x) 0
@@ -78,7 +79,7 @@ static unsigned reports;
 STUBS = r'''
 struct atcphy_hw { enum atcphy_generation gen;
     bool has_t8140_dp, dp_t8122, has_usb4, park_pipe_unlocked, park_dummy_phy, usb2_only;
-    bool clear_boot_hold, dp_banked_tunables; };
+    bool clear_boot_hold, dp_banked_tunables, no_ss_device; };
 struct device_node { const char *const *compatible; unsigned int count; };
 static bool of_device_is_compatible(const struct device_node *root, const char *compatible) {
     if (!root) return false;
@@ -101,6 +102,8 @@ struct apple_atcphy {
     bool host_active, usb3_port_off, dp_only, ss_tunables, fixed_usb2, t8140_dp_tunables, dp_tunables;
     /* T8132 ownership is tested without entering its lane-setup backend. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* Device role on a PHY without SuperSpeed device mode (hw->no_ss_device). */
+    bool usb2_device;
     struct { void *usb3_dp; } tunables;
 };
 struct phy { struct apple_atcphy *data; };
@@ -432,6 +435,14 @@ static void target_mode_table_and_dirty(void) {
  /* T8132: 4-lane DP stays DP only on a port marked apple,dp-alt-mode. */
  hw.gen=ATCPHY_GENERATION_T8132;assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB2);
  p.t8132_dp_alt=true;assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_DP);
+ /* T8132 device role (no SuperSpeed device mode): USB3 lanes run USB2, 4-lane DP stays. */
+ hw.no_ss_device=true;p.usb2_device=true;p.tunables.usb3_dp=&p;
+ assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_DP);state.mode=TYPEC_DP_STATE_D;
+ assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_DP);p.t8132_dp_alt=false;
+ assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB2);
+ state.mode=TYPEC_STATE_USB;state.alt=NULL;assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB2);
+ p.usb2_device=false;assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB3);
+ hw.no_ss_device=false;p.tunables.usb3_dp=NULL;state.alt=&alt;state.mode=TYPEC_DP_STATE_C;
  hw.gen=ATCPHY_GENERATION_T8103;p.t8132_dp_alt=false;
  p.mode=APPLE_ATCPHY_MODE_USB3;p.mode_dirty=true;assert(atcphy_usb3_route(&p,true)==-EBUSY);assert(!muxes&&!configure_calls);
  p.mode_dirty=false;p.usb_off_pending=true;assert(atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0)==-EBUSY);
@@ -717,6 +728,9 @@ def harness(source):
     # The PIPE backend of a mode, which T8132 CIO keeps on the dummy one.
     helpers = [block(source, "static bool atcphy_mode_is_cio("),
                block(source, "static bool atcphy_t8132_dp_on("),
+               block(source, "static enum atcphy_mode atcphy_usb2_device_mode("),
+               # atcphy_usb3_set_mode() calls atcphy_mux_switch() before its definition.
+               "static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode target_mode);",
                block(source, "static enum atcphy_pipehandler_state\natcphy_pipe_state_for(")]
     functions = "\n".join(helpers + [block(source, "static " + kind + " " + name + "(")
                                       for kind, name in function_specs])

@@ -35,6 +35,8 @@ def parking(root):
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* A device role without SuperSpeed device mode runs on USB2 (hw->no_ss_device). */
+    bool usb2_device;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
@@ -224,6 +226,7 @@ typedef uint16_t u16;
 #define hweight32(v) __builtin_popcount(v)
 #define dev_info_once(...) ((void)0)
 #define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define dev_warn(...) ((void)0)
 static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define dev_err report
@@ -1937,6 +1940,8 @@ def pipe(root):
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* A device role without SuperSpeed device mode runs on USB2 (hw->no_ss_device). */
+    bool usb2_device;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
@@ -2047,6 +2052,7 @@ typedef uint16_t u16;
 #define FIELD_GET(m, v) (((v) & (m)) >> __builtin_ctz(m))
 #define field_prep FIELD_PREP
 #define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define dev_warn(...) ((void)0)
 #define dev_err(...) ((void)0)
 #define lockdep_assert_held(...) ((void)0)
@@ -2337,6 +2343,8 @@ def unwind(root):
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* A device role without SuperSpeed device mode runs on USB2 (hw->no_ss_device). */
+    bool usb2_device;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
@@ -2467,6 +2475,7 @@ typedef uint16_t u16;
 #define hweight32(v) __builtin_popcount(v)
 #define dev_info_once(...) ((void)0)
 #define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define dev_warn(...) ((void)0)
 static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define dev_err report
@@ -2662,6 +2671,8 @@ typedef uint32_t u32;
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* A device role without SuperSpeed device mode runs on USB2 (hw->no_ss_device). */
+    bool usb2_device;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
