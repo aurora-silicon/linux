@@ -21,6 +21,7 @@
 
 	aliases {
 		keyboard = &keyboard;
+		sep = &sep;
 	};
 
 	led-controller {
@@ -272,6 +273,21 @@
 
 &isp {
 	apple,platform-id = <4>;
+};
+
+/* Touch ID; its data-ready line (AP GPIO 199) is left out, so it polls. */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	/* Sensor power is an AP GPIO here, not the Airs' nub GPIO 29. */
+	enable-gpios = <&pinctrl_ap 200 GPIO_ACTIVE_HIGH>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/* Per-device factory data from this Mac's own iBoot system container. */
+	firmware-name = "apple/mesacal-j504.bin";
 };
 
 #include "hwmon-fan-dual.dtsi"
