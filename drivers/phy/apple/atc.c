@@ -4612,9 +4612,17 @@ static int atcphy_rpm_usb2_set_mode(struct phy *phy, enum phy_mode mode, int sub
 	return ret;
 }
 
+/* Both roles: atcphy_usb2_set_mode() sets or clears the host signature. */
+static int atcphy_usb2_validate(struct phy *phy, enum phy_mode mode, int submode,
+				union phy_configure_opts *opts)
+{
+	return mode == PHY_MODE_USB_HOST || mode == PHY_MODE_USB_DEVICE ? 0 : -EOPNOTSUPP;
+}
+
 static const struct phy_ops apple_atc_usb2_phy_ops = {
 	.owner = THIS_MODULE,
 	.init = atcphy_rpm_usb2_init,
+	.validate = atcphy_usb2_validate,
 	.set_mode = atcphy_rpm_usb2_set_mode,
 };
 
