@@ -26,6 +26,18 @@ config APPLE_PMGR_PWRSTATE_KUNIT_TEST
 	  and need no Apple hardware. Also check the T6000 GFX missing-parent
 	  wait, its timeout, and the separate actual-state acknowledgment.
 
+config APPLE_PMGR_PSD
+	bool "Apple T8152 PMGR service power domains"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on PM && OF
+	select PM_GENERIC_DOMAINS
+	default ARCH_APPLE
+	help
+	  The T8152 PMGR switches some blocks, among them the USB and USB4
+	  DARTs and controllers and the video decoder, through service
+	  power states (PSD) rather than PMGR power state registers. This
+	  driver offers each service as a generic power domain.
+
 config APPLE_T6041_CIO_RECONFIG
 	bool "Apple T6041 CIO cluster reconfiguration"
 	depends on OF
