@@ -3225,6 +3225,15 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 					    output, output_len, retcode, timeout_ms, NULL);
 }
 
+int afk_send_command_len(struct apple_epic_service *service, u8 type,
+			 const void *payload, size_t payload_len, void *output,
+			 size_t output_len, u32 *retcode, size_t *received)
+{
+	return afk_send_command_timeout_len(service, type, payload, payload_len,
+					    output, output_len, retcode,
+					    afk_service_timeout_ms(service), received);
+}
+
 /*
  * @reply_len (legacy EPIC only): return just the bytes the firmware reported
  * in its reply instead of the whole allocated output.

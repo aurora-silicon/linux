@@ -628,6 +628,13 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 			     const void *payload, size_t payload_len,
 			     void *output, size_t output_len, u32 *retcode,
 			     unsigned int timeout_ms);
+/*
+ * As afk_send_command(), and @received is set to the number of bytes of
+ * @output the reply filled: an AFKv2 reply may be shorter than @output_len.
+ */
+int afk_send_command_len(struct apple_epic_service *service, u8 type,
+			 const void *payload, size_t payload_len, void *output,
+			 size_t output_len, u32 *retcode, size_t *received);
 int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 		     const void *data, size_t data_len, size_t data_pad,
 		     void *output, size_t output_len, size_t output_pad);
