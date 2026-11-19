@@ -2100,8 +2100,10 @@ static unsigned acks, case_tag;
 static struct dcp_channel *dcp_get_channel(struct apple_dcp *d, enum dcp_context_id c)
 { (void)c; return &d->channel; }
 static int dcp_parse_tag(char *p) { (void)p; return case_tag; }
-static bool of_machine_is_compatible(const char *n) { (void)n; return machine; }
-static bool of_device_is_compatible(struct device_node *n, const char *s)
+/* Neither the board nor the node decides the D134 reply any more. */
+static __attribute__((unused)) bool of_machine_is_compatible(const char *n)
+{ (void)n; return machine; }
+static __attribute__((unused)) bool of_device_is_compatible(struct device_node *n, const char *s)
 { (void)s; return n->external; }
 static bool iomfb_check_callback_h17p(struct apple_dcp *d, int t, u32 i, u32 o)
 { (void)d; (void)t; (void)i; (void)o; return true; }
@@ -2140,7 +2142,8 @@ int main(void)
             d.hw.iomfb_method_profile = 0;
         case_tag = tag; acks = 0;
         dcpep_handle_cb(&d, context, h, sizeof(*h) + in + out, 0);
-        bool accepted = scope == 7 && tag == 134 && context == 3 && !in && out == 4;
+        /* Only the H17P external method profile (scope bit 2) decides. */
+        bool accepted = (scope & 4) && tag == 134 && context == 3 && !in && out == 4;
         if (scope & 4) {
             assert(acks == accepted && d.crashed != accepted);
             for (unsigned i = 0; i < out; i++)
