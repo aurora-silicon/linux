@@ -432,9 +432,8 @@ struct sep_key_unseal_password {
 #define SEP_KEY_UNSEAL_PASSWORD _IOWR(SEP_BIO_IOC_MAGIC, 0x2a, struct sep_key_unseal_password)
 
 /*
- * Authorization contexts (SEP_KEY_FEATURE_CONTEXTS; module parameter
- * key_context_api=1, a key store with per-user bags). DESIGN DRAFT, not a
- * stable ABI.
+ * Authorization contexts (SEP_KEY_FEATURE_CONTEXTS, offered on every key
+ * store with per-user bags). DESIGN DRAFT, not a stable ABI.
  *
  * One authentication (a Touch ID match in the bag user's own domain, or the
  * bag's password checked by the enclave) authorizes a bounded run of

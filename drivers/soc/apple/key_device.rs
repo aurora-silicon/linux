@@ -21,10 +21,11 @@ unsafe impl kernel::transmute::FromBytes for Cancel {}
 /// `SEP_KEY_CANCEL_ID`: ends this file's request `request_id`.
 const IOC_CANCEL: u32 = kernel::ioctl::_IOW::<Cancel>(crate::key::MAGIC, 0x48);
 
-/// Whether the authorization-context requests are offered: opted in by
-/// `key_context_api`, on a key store with per-user bags (13.5 or variant 5).
+/// Whether the authorization-context requests are offered: on any key store
+/// with per-user bags (13.5 or variant 5), since a context authorizes keys
+/// under one user's bag.
 pub(crate) fn contexts_supported(sep: &SepData) -> bool {
-    crate::module_parameters::key_context_api.value() != 0 && sep.profile.per_user_keybags()
+    sep.profile.per_user_keybags()
 }
 
 enum Operation {

@@ -4087,10 +4087,6 @@ module! {
             default: 0,
             description: "Opt-in J414s diagnostic: with zero live identities, select the system context and try saving the missing owner Catacomb",
         },
-        key_context_api: u8 {
-            default: 0,
-            description: "Enable the authorization-context requests on /dev/sep-key (SEP_KEY_CTX_*, a design draft; key stores with per-user bags)",
-        },
         key_selftest: u8 {
             default: 0,
             description: "Test only: let root run SEP_KEY_SELFTEST, which signs with an access-controlled /dev/sep-key key under deliberately unsuitable credential contexts to show the enclave refuses",
