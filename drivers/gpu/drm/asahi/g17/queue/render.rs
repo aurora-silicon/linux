@@ -232,6 +232,11 @@ pub(crate) struct Pair {
     /// Bit `p` set once a work slot of priority class `p` named the pair.
     outer_started: u8,
     quarantined: bool,
+    /// Its groups were released on the guilty proof after its context's kill
+    /// (`Pair::guilty_killed`): the firmware may never consume the ring entries of the groups
+    /// the kill unlinked, so the pair is released and detached on that proof
+    /// (`counts_idle`, `Pair::can_keep`), never parked for reuse while those entries remain.
+    guilty_released: bool,
     terminal: Option<(Arc<VmStatus>, Error)>,
     previous: Option<RetiredBinding>,
     displaced: Option<RetiredBinding>,
@@ -386,6 +391,7 @@ impl Pair {
             registered: None,
             outer_started: 0,
             quarantined: false,
+            guilty_released: false,
             terminal: None,
             previous: None,
             displaced: None,
@@ -2059,6 +2065,11 @@ impl Pair {
         error: Error,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
+        // A killed guilty pair released on its proof holds no groups and only waits for its
+        // detach: quarantined again (another queue of its VM failed), it could never park.
+        if self.guilty_released {
+            return Ok(());
+        }
         self.quarantined = true;
         // Its groups end here, without their own watchdogs: none of their fragment kicks may hold
         // the task-stage order of other clients.
@@ -2635,9 +2646,22 @@ impl Pair {
         }
         let counters = self.free_list.counters()?;
         let stamps = host.stamps(self.qids())?;
-        let (_, state) = host.epoch()?;
+        let (generation, state) = host.epoch()?;
         Ok(retirement::drained(self.ordinal, stamps, counters, state)
-            || (state == 0 && self.executed_unstamped() && self.context_killed()))
+            || (state == 0 && self.executed_unstamped() && self.context_killed())
+            || self.guilty_killed(generation, state))
+    }
+
+    /// The pair's groups of a guilty context may go although they never retired: the firmware
+    /// finished the context's kill, and a GPU restart it raised after that has completed
+    /// (`state` 0). The kill unlinks the context's work list, but a group that was running at
+    /// the kill keeps running until a restart drops it, and only then is none of its memory
+    /// reachable. The pair itself, its ring and the context's work list stay held until the
+    /// context's scheduler release is consumed (detach, `release_killed_slots`).
+    fn guilty_killed(&self, generation: u64, state: u32) -> bool {
+        guilty_kill_done(self.guilty_unretired(generation), state, || {
+            self.memory.context.restarted_since_kill(self.context_killed(), generation)
+        })
     }
 
     /// The firmware acknowledged a kill of this pair's context (scheduler page): it no longer
@@ -2652,6 +2676,42 @@ impl Pair {
     /// Its memory stays until the kill is acknowledged.
     pub(crate) fn executed_for_kill(&self, context: &Arc<Context>) -> bool {
         Arc::ptr_eq(context, &self.memory.context) && self.executed_unstamped()
+    }
+
+    /// A kill of the pair's context releases it with work that never retired: its commands all
+    /// ran unstamped (`executed_unstamped`), or a recovery found its VM guilty
+    /// (`guilty_unretired`). Its memory stays until the kill is done (`firmware_drained`).
+    pub(crate) fn releasable_by_kill(&self, context: &Arc<Context>, generation: u64) -> bool {
+        self.executed_for_kill(context) || self.guilty_for_kill(context, generation)
+    }
+
+    /// The pair's context may be killed although its queued groups did not run: a recovery
+    /// found its VM guilty (`guilty_unretired`).
+    pub(crate) fn guilty_for_kill(&self, context: &Arc<Context>, generation: u64) -> bool {
+        Arc::ptr_eq(context, &self.memory.context) && self.guilty_unretired(generation)
+    }
+
+    /// A closed owner's quarantined pair holding published work of a VM that a GPU recovery
+    /// found guilty. Its started group hangs the GPU again after every restart, with its queued
+    /// groups behind it, so its work never retires like other work: on 25G83 the host cannot
+    /// take published groups back, and only a kill of the context unlinks them. Left alone,
+    /// the restarts reach the storm limit and every client loses the device (11-19 19:12 UTC).
+    ///
+    /// Only once the host accepted a restart (`generation`) since the context's latest close:
+    /// the VM stays guilty, and a failed VM's pairs are all quarantined, but its groups queued
+    /// behind the one that hung may run and retire on their stamps. A kill then would unlink
+    /// those with nothing left to hang and so no restart to release them. A guilty group still
+    /// running hangs the GPU again within about 83 ms, which costs at most that one restart.
+    /// Not on M5, which takes published work back through its recovery target.
+    fn guilty_unretired(&self, generation: u64) -> bool {
+        !self.memory.graph.is_m5()
+            && self.memory.context.restarted_since_close(generation)
+            && self.quarantined
+            && self.owner.is_none()
+            && self.prepared.is_none()
+            && self.active.len() != 0
+            && self.active.iter().all(|active| active.outer_published)
+            && self.memory.context.status().recovery_guilty()
     }
 
     /// Every command of this quarantined pair ran, its ring entries were consumed and its
@@ -2693,7 +2753,8 @@ impl Pair {
         // Commands the firmware never unlinked are released only after it acknowledged the
         // kill of their context, on every path (see `firmware_drained`).
         let unstamped = self.executed_unstamped();
-        let killed = unstamped && self.context_killed();
+        let (generation, state) = host.epoch()?;
+        let killed = (unstamped && self.context_killed()) || self.guilty_killed(generation, state);
         let Some(active) = self.active.iter_mut().find(|a| !a.flist_completed) else {
             return Ok(false);
         };
@@ -2704,8 +2765,9 @@ impl Pair {
         };
         let result = match retirement::poll(&mut active.ticket, &mut observer)? {
             retirement::Poll::Complete(ticks) => Ok(ticks),
-            // Its commands ran without a stamp (see `executed_unstamped`): they already failed
-            // with the quarantine, and the client sees them cancelled.
+            // Its commands ran without a stamp (see `executed_unstamped`), or its guilty context
+            // was killed (`guilty_killed`): they already failed with the quarantine, and the
+            // client sees them cancelled.
             retirement::Poll::Pending | retirement::Poll::Retry if killed => {
                 crate::g17::trace::teardown(2, u64::from(self.slot), active.ticket.ordinal, 0);
                 Err(ECANCELED)
@@ -2752,6 +2814,12 @@ impl Pair {
         if self.active.iter().any(|a| !a.flist_completed) || !self.firmware_drained(host)? {
             return Ok(false);
         }
+        let (generation, state) = host.epoch()?;
+        let guilty = self.guilty_killed(generation, state);
+        if guilty {
+            pr_warn!("G17: render slot {}: {} groups of a killed guilty context released after a later restart (gen {})\n",
+                self.slot, self.active.len(), generation);
+        }
         while let Some(active) = self.active.front() {
             // A group retired on its pass record was reported then (`stamps_owed`): the pair-wide
             // proof above covers its stamps too (or the kill of its context), so only its
@@ -2765,10 +2833,25 @@ impl Pair {
             self.active.pop().ok_or(EIO)?;
         }
         self.quarantined = false;
+        self.guilty_released |= guilty;
         self.drain_failures = 0;
         self.drain_retry_at = 0;
         self.resync();
         Ok(true)
+    }
+
+    /// While the firmware is halted for a restart: a finished kill of this pair's context
+    /// counts as seen done at `generation`, the one before that restart, at the latest.
+    pub(crate) fn note_kill_sighting(&self, generation: u64) {
+        let context = &self.memory.context;
+        if context.kill_published() {
+            context.restarted_since_kill(self.context_killed(), generation);
+        }
+    }
+
+    /// See the `guilty_released` field.
+    pub(crate) fn guilty_released(&self) -> bool {
+        self.guilty_released
     }
 
     /// The registry first polls the completed prefix through this exact Arc.
@@ -3452,6 +3535,32 @@ mod completion_noted_tests {
         let mut both = bit(3);
         both[1] |= bit(68)[1];
         assert!(completion_noted([3, 68], both));
+    }
+}
+
+/// See `Pair::guilty_killed`: a guilty pair (`guilty`) goes only with no restart in progress
+/// (`state` 0) and once `restarted` (`Context::restarted_since_kill`) holds. `restarted` is only
+/// asked of a guilty pair with no restart in progress, so that its first sighting of the kill
+/// is recorded at a settled generation.
+fn guilty_kill_done(guilty: bool, state: u32, restarted: impl FnOnce() -> bool) -> bool {
+    guilty && state == 0 && restarted()
+}
+
+#[kunit_tests(asahi_g17_render_guilty_kill)]
+mod guilty_kill_tests {
+    use super::guilty_kill_done;
+
+    #[test]
+    fn a_guilty_pair_goes_only_after_its_kill_and_a_later_restart() {
+        // Kill not acknowledged, or acknowledged with no restart since: held.
+        assert!(!guilty_kill_done(true, 0, || false));
+        // A restart in progress: held, and the kill's sighting is not recorded mid-restart.
+        assert!(!guilty_kill_done(true, 1, || panic!("asked during a restart")));
+        assert!(!guilty_kill_done(true, 3, || panic!("asked during a restart")));
+        // Acknowledged, restarted since, restart complete: released.
+        assert!(guilty_kill_done(true, 0, || true));
+        // Not a guilty pair: this proof never applies.
+        assert!(!guilty_kill_done(false, 0, || panic!("asked for an innocent pair")));
     }
 }
 

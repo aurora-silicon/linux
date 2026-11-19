@@ -22,6 +22,13 @@ impl Registry {
         }
     }
 
+    /// See `recovery::Queues::note_kill_sightings`.
+    pub(in crate::g17::runtime) fn note_render_kill_sightings(&self, generation: u64) {
+        for pair in self.render.entries.iter().flatten().filter_map(|entry| entry.pair.as_ref()) {
+            pair.note_kill_sighting(generation);
+        }
+    }
+
     pub(in crate::g17::runtime) fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool> {
         self.render.entries.iter().flatten()
             .filter_map(|entry| entry.pair.as_ref())

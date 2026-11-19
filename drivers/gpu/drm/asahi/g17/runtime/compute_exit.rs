@@ -54,14 +54,24 @@ fn render_kill_target(listed: u128, own: u128) -> Option<u8> {
     (candidates != 0).then(|| candidates.trailing_zeros() as u8)
 }
 
-/// A closed context may be killed on its render pairs' behalf once it has been closed for
-/// [`RENDER_KILL_DELAY_NS`], it was never killed, a pair of it holds executed but unstamped
-/// commands and no compute queue still runs it, switches away from it or killed it. A second kill
-/// of a killed context made the firmware fault on the killed pair's own tiling queue within a
-/// millisecond of acknowledging it: with the pair's release held back, a context killed through
-/// its compute queue still looked like a render-only candidate.
-fn render_kill_eligible(age: u64, killed: bool, executed: bool, compute_clear: bool) -> bool {
-    age >= RENDER_KILL_DELAY_NS && !killed && executed && compute_clear
+/// A closed context may be killed on its render pairs' behalf once it was never killed, no
+/// compute queue still runs it, switches away from it or killed it, and a pair of it holds
+/// executed but unstamped commands (`executed`) once it has been closed for
+/// [`RENDER_KILL_DELAY_NS`], or holds guilty work (`guilty`, `Pair::guilty_for_kill`) at once:
+/// that work never retires, it hangs the GPU again about every 83 ms, and eight such restarts
+/// stop the GPU for every client. A second kill of a killed context made the firmware fault on
+/// the killed pair's own tiling queue within a millisecond of acknowledging it: with the
+/// pair's release held back, a context killed through its compute queue still looked like a
+/// render-only candidate.
+fn render_kill_eligible(age: u64, killed: bool, executed: bool, guilty: bool, compute_clear: bool) -> bool {
+    !killed && compute_clear && (guilty || (executed && age >= RENDER_KILL_DELAY_NS))
+}
+
+/// A closed context's kill waits only for other contexts' compute to pause, not for their
+/// render work, when its compute failed (`compute_failed`) or the kill releases render pairs
+/// that nothing else releases (`releases_pairs`, `Firmware::kill_releases_render`).
+fn waits_as_failed(compute_failed: bool, releases_pairs: bool) -> bool {
+    compute_failed || releases_pairs
 }
 
 /// How a closed context whose render pairs are idle for a kill (`teardown_idle`) is killed.
@@ -217,7 +227,7 @@ impl Firmware {
             let Some((context, age)) = self.queues.teardown.closed(index, now) else {
                 continue;
             };
-            if !self.queues.render.teardown_idle(&context)? {
+            if !self.queues.render.teardown_idle(&context, self.recovery.generation())? {
                 self.queues.teardown.clear_kill_wait(index);
                 continue;
             }
@@ -253,7 +263,7 @@ impl Firmware {
             let Some((context, age)) = due else {
                 continue;
             };
-            if !self.queues.render.teardown_idle(&context)? {
+            if !self.queues.render.teardown_idle(&context, self.recovery.generation())? {
                 continue;
             }
             if let Err(error) = self.publish_compute_exit(&context, age, now, &mut pressed) {
@@ -345,7 +355,7 @@ impl Firmware {
             && !self
                 .queues
                 .admission
-                .hold_render_slots_for_exit_kill(owner, hold, self.queues.render.executed_slots(context) & hold)
+                .hold_render_slots_for_exit_kill(owner, hold, self.queues.render.kill_slots(context, self.recovery.generation()) & hold)
         {
             return Ok(());
         }
@@ -359,6 +369,7 @@ impl Firmware {
         // stop, and the held render identities until this context's scheduler release
         // is consumed or processors stop.
         context.note_kill_published();
+        self.note_guilty_kill(context, hold, "compute exit");
         let mut queue = self.queues.compute[index]
             .as_mut()
             .and_then(|entry| entry.queue.as_deref_mut())
@@ -392,37 +403,51 @@ impl Firmware {
         kill_route(
             self.compute_failed(context),
             self.queues.render.teardown_pools_released(context),
-            self.kill_releases_executed_render(context),
+            self.kill_releases_render(context),
             self.compute_exit_pending(context),
             self.render_kill_candidate(index, context, age),
         )
     }
 
     /// A kill of `context` would release render pairs of it whose commands all ran but were
-    /// never stamped (`Pair::executed_for_kill`), and no kill of it was published yet. Only that
-    /// kill releases them. Never a second time: a second kill of a killed context made the
-    /// firmware fault on the killed pair's own tiling queue (see `render_kill_eligible`). Not on
-    /// M5, which never kills a context on its render pairs' behalf.
-    fn kill_releases_executed_render(&self, context: &Arc<Context>) -> bool {
-        !self.init.is_m5() && !context.kill_published() && self.queues.render.executed_slots(context) != 0
+    /// never stamped (`Pair::executed_for_kill`) or that hold guilty work
+    /// (`Pair::guilty_for_kill`), and no kill of it was published yet. Only that kill releases
+    /// them. Never a second time: a second kill of a killed context made the firmware fault on
+    /// the killed pair's own tiling queue (see `render_kill_eligible`). Not on M5, which never
+    /// kills a context on its render pairs' behalf.
+    fn kill_releases_render(&self, context: &Arc<Context>) -> bool {
+        !self.init.is_m5() && !context.kill_published() && self.queues.render.kill_slots(context, self.recovery.generation()) != 0
+    }
+
+    /// Logs a published kill that releases guilty pairs (`Pair::guilty_for_kill`), with the
+    /// recovery generation, so a test shows whether the next restart dropped their work.
+    fn note_guilty_kill(&self, context: &Arc<Context>, hold: u64, route: &str) {
+        let generation = self.recovery.generation();
+        let guilty = self.queues.render.guilty_slots(context, generation) & hold;
+        if guilty != 0 {
+            pr_warn!("G17: scheduler {} killed by its {} at recovery gen {}: render slots {:#x} hold guilty work\n",
+                context.id(), route, generation, guilty);
+        }
     }
 
     /// A compute exit of `context` waits only for other contexts' compute to pause
     /// ([`Self::foreign_compute_running`]), as a failed context's kill and a render-only kill
     /// do, instead of for all of their work ([`Self::kill_unsafe`]). That holds when its compute
-    /// failed ([`Self::compute_failed`]), and when the kill releases executed render pairs:
-    /// those are what a render-only kill releases, and nothing else does. `kill_unsafe` also
-    /// waits for other clients' render work, and it gives no warning and has no memory-pressure
-    /// escape. Under a steady render load the pairs, pools and memory would stay held.
+    /// failed ([`Self::compute_failed`]), and when the kill releases executed or guilty render
+    /// pairs: those are what a render-only kill releases, and nothing else does. `kill_unsafe`
+    /// also waits for other clients' render work, and it gives no warning and has no
+    /// memory-pressure escape. Under a steady render load the pairs, pools and memory would
+    /// stay held, and a guilty pair would hang the GPU until the restart storm limit.
     fn kill_waits_as_failed(&self, context: &Arc<Context>) -> bool {
-        self.compute_failed(context) || self.kill_releases_executed_render(context)
+        waits_as_failed(self.compute_failed(context), self.kill_releases_render(context))
     }
 
     /// A closed context whose compute side is clean, with render pairs whose commands all ran
     /// but were never stamped (`Pair::executed_for_kill`). Its failed compute command was
     /// retired on the firmware's fault record, so no compute queue is left to carry a kill,
     /// yet those pairs are released only after one: without this the context, its pairs and
-    /// its memory stay until the processors stop.
+    /// its memory stay until the processors stop. Likewise a closed context with a pair holding
+    /// guilty work (`Pair::guilty_for_kill`), which only a kill stops hanging the GPU.
     ///
     /// M5 has none: it issues a context kill only from a compute queue's exit, so a
     /// render-only M5 context is never killed.
@@ -431,6 +456,7 @@ impl Firmware {
             age,
             self.queues.teardown.render_kill_published(index) || context.kill_published(),
             self.queues.render.executed_slots(context) != 0,
+            self.queues.render.guilty_slots(context, self.recovery.generation()) != 0,
             self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).all(|queue| {
                 queue.idle_for_context(context) && !queue.switching_from(context) && !queue.exit_published(context)
             }),
@@ -494,7 +520,7 @@ impl Firmware {
         if !self
             .queues
             .admission
-            .hold_render_slots_for_exit_kill(owner, hold, self.queues.render.executed_slots(context) & hold)
+            .hold_render_slots_for_exit_kill(owner, hold, self.queues.render.kill_slots(context, self.recovery.generation()) & hold)
         {
             refuse_render_kill(&mut self.queues.teardown, index, RENDER_KILL_HOLD);
             return Ok(());
@@ -508,6 +534,7 @@ impl Firmware {
         // can fail. The held pairs stay held until this context's scheduler release is
         // consumed (`release_killed_slots` at detach).
         context.note_kill_published();
+        self.note_guilty_kill(context, hold, "render kill");
         self.queues.teardown.record_render_kill(index, cookie, now)?;
         record_kill_wait(self.queues.teardown.take_kill_wait(index, now));
         if beside {
@@ -563,7 +590,7 @@ impl Firmware {
                 self.queues.teardown.closed(index, now).is_some_and(|(context, _)| {
                     !context.kill_published()
                         && (self.compute_exit_pending(&context)
-                            || self.queues.render.executed_slots(&context) != 0)
+                            || self.queues.render.kill_slots(&context, self.recovery.generation()) != 0)
                 })
             })
             .then_some(KILL_RETRY_NS)
@@ -647,7 +674,10 @@ impl Firmware {
 
 #[kernel::macros::kunit_tests(asahi_g17_render_kill_target)]
 mod render_kill_target_tests {
-    use super::{hold_owner, kill_route, render_kill_eligible, render_kill_target, KillRoute, RENDER_KILL_DELAY_NS};
+    use super::{
+        hold_owner, kill_route, render_kill_eligible, render_kill_target, waits_as_failed, KillRoute,
+        RENDER_KILL_DELAY_NS,
+    };
 
     #[test]
     fn executed_render_pairs_do_not_hold_back_their_compute_exit() {
@@ -667,11 +697,42 @@ mod render_kill_target_tests {
 
     #[test]
     fn a_killed_context_is_never_killed_again() {
-        assert!(render_kill_eligible(RENDER_KILL_DELAY_NS, false, true, true));
-        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS, true, true, true));
-        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS - 1, false, true, true));
-        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS, false, false, true));
-        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS, false, true, false));
+        assert!(render_kill_eligible(RENDER_KILL_DELAY_NS, false, true, false, true));
+        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS, true, true, false, true));
+        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS - 1, false, true, false, true));
+        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS, false, false, false, true));
+        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS, false, true, false, false));
+        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS, true, false, true, true));
+    }
+
+    #[test]
+    fn a_closed_guilty_context_is_killed_on_its_render_pairs_behalf_at_once() {
+        // A pair holding a spinning group and never-started groups behind it: not executed,
+        // guilty. Eligible without the retirement delay, and the render pairs carry the kill
+        // when no compute queue will exit.
+        assert!(render_kill_eligible(0, false, false, true, true));
+        assert_eq!(kill_route(false, false, true, false, render_kill_eligible(0, false, false, true, true)),
+                   KillRoute::Render);
+        // A compute queue that will exit carries it instead, under the same rule as an
+        // executed pair (`releases` = executed or guilty).
+        assert_eq!(kill_route(false, false, true, true, false), KillRoute::Compute);
+        // Never a second time, and not while compute of the context still runs.
+        assert!(!render_kill_eligible(0, true, false, true, true));
+        assert!(!render_kill_eligible(0, false, false, true, false));
+    }
+
+    #[test]
+    fn only_a_kill_that_releases_pairs_skips_the_wait_for_foreign_render_work() {
+        // Guilty or executed pairs, or failed compute: only foreign compute is waited for.
+        assert!(waits_as_failed(false, true));
+        assert!(waits_as_failed(true, false));
+        // A closed context that is neither, with queued work: `kill_unsafe` as before, which
+        // also waits for every foreign render.
+        assert!(!waits_as_failed(false, false));
+        // Its route is unchanged too: before the delay, or with only queued work, no render kill.
+        assert!(!render_kill_eligible(RENDER_KILL_DELAY_NS * 4, false, false, false, true));
+        assert_eq!(kill_route(false, false, false, false, false), KillRoute::None);
+        assert_eq!(kill_route(false, true, false, true, false), KillRoute::Compute);
     }
 
     #[test]

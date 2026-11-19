@@ -100,6 +100,9 @@ impl Backend {
         let Some(firmware) = (*state).as_deref_mut() else {
             return Ok(());
         };
+        // A pair of this context that holds guilty work counts for a kill only after a restart
+        // since this close (`Pair::guilty_for_kill`).
+        self.context.note_closed(firmware.recovery.generation());
         // Retain a published scheduler before a never-kicked physical graph is
         // removed. The teardown entry owns its root until control consumption.
         firmware

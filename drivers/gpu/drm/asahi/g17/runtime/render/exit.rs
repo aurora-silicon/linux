@@ -28,11 +28,24 @@ impl RenderState {
 
     /// Slots of `context`'s pairs whose commands all ran but stay unretired until its kill.
     pub(in crate::g17::runtime) fn executed_slots(&self, context: &Arc<Context>) -> u64 {
+        self.slots_where(|pair| pair.executed_for_kill(context))
+    }
+
+    /// Slots of `context`'s pairs whose guilty work stays unretired until its kill
+    /// (`Pair::guilty_for_kill`).
+    pub(in crate::g17::runtime) fn guilty_slots(&self, context: &Arc<Context>, generation: u64) -> u64 {
+        self.slots_where(|pair| pair.guilty_for_kill(context, generation))
+    }
+
+    /// Slots of `context`'s pairs that only its kill releases (`Pair::releasable_by_kill`).
+    pub(in crate::g17::runtime) fn kill_slots(&self, context: &Arc<Context>, generation: u64) -> u64 {
+        self.slots_where(|pair| pair.releasable_by_kill(context, generation))
+    }
+
+    fn slots_where(&self, matches: impl Fn(&crate::g17::queue::render::Pair) -> bool) -> u64 {
         let mut slots = 0;
         for (slot, entry) in self.entries.iter().enumerate() {
-            if entry.as_ref().and_then(|entry| entry.pair.as_ref())
-                .is_some_and(|pair| pair.executed_for_kill(context))
-            {
+            if entry.as_ref().and_then(|entry| entry.pair.as_deref()).is_some_and(&matches) {
                 slots |= 1u64 << slot;
             }
         }
