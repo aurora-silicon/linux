@@ -964,7 +964,14 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 	appledwc->dwc.dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
 	dwc3_enable_susphy(&appledwc->dwc, true);
 	ret = phy_set_mode(appledwc->usb3_phy, host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
-	if (ret) {
+	if (!host && ret == -EOPNOTSUPP) {
+		/*
+		 * The USB3 PHY has no SuperSpeed device mode (T6040, or a T8132 port whose
+		 * lanes run USB3) and has left the PIPE alone: offer the gadget at high speed,
+		 * whatever the SoC. The USB2 PHY already runs as a device.
+		 */
+		dwc3_apple_gadget_high_speed(appledwc);
+	} else if (ret) {
 		/*
 		 * A failed T8132 BIST or PIPE handoff must not start xHCI. Neither must a failed
 		 * T6050 one: that PHY reports a port left on USB2 (four DisplayPort lanes) as
@@ -975,15 +982,7 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 			dev_err(appledwc->dev, "USB3 PHY setup failed, err=%d\n", ret);
 			return ret;
 		}
-		/*
-		 * A USB3 PHY without a device sequence (T6040) leaves the PIPE on its
-		 * dummy producer: offer the gadget at high speed only.
-		 */
-		if (!host && ret == -EOPNOTSUPP) {
-			dwc3_apple_gadget_high_speed(appledwc);
-		} else {
-			dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
-		}
+		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
 	} else if (host && appledwc->usb3_phy &&
 		   (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
 		    of_device_is_compatible(appledwc->dev->of_node, "apple,t8142-dwc3"))) {
