@@ -836,7 +836,7 @@ struct atcphy_cio_sleep {
  * @pipe_state: Backend the PIPE mux ("pipehandler") is routed to
  * @t8103_dummy_pending: A live T8103-generation handoff still needs its unlock ACK
  * @t8103_usb3_retry: USB3 routing owed after a deferred role or parked lane change
- * @t8103_usb3_workaround: Base M1 admission for the USB3 handoff workaround
+ * @t8103_usb3_workaround: The T8103-generation USB3 handoff, see atcphy_has_t8103_usb3_workaround()
  * @pd_nb: Power domain notifier, registered with restore_after_pd_off
  * @pd_was_off: The power domain was switched off since the state was last
  *              brought back; set from the notifier, cleared under @lock
@@ -6890,12 +6890,16 @@ static bool atcphy_probe_pd_notifier(struct apple_atcphy *atcphy)
 	return !ret;
 }
 
-/* The T8103 PHY compatible is also a fallback on unqualified M1/M2 variants. */
-static bool atcphy_has_t8103_usb3_workaround(const struct atcphy_hw *hw,
-					   const struct device_node *root)
+/*
+ * The USB3 handoff of the T8103-generation PIPE handler: a live PIPE is parked
+ * on the dummy backend under a held lock before a lane change, host BIST is
+ * skipped, and an early dwc3 role routes USB3 once Type-C asks for it. It is a
+ * property of that PIPE handler, so every PHY of the generation takes it: the
+ * apple,t8103-atcphy fallback of T8103, T600x, T8112 and T602x.
+ */
+static bool atcphy_has_t8103_usb3_workaround(const struct atcphy_hw *hw)
 {
-	return hw->gen == ATCPHY_GENERATION_T8103 &&
-	       of_device_is_compatible(root, "apple,t8103");
+	return hw->gen == ATCPHY_GENERATION_T8103;
 }
 
 static void atcphy_sleep_finish_work(struct work_struct *work);
@@ -6914,7 +6918,7 @@ static int atcphy_probe(struct platform_device *pdev)
 	atcphy->hw = of_device_get_match_data(&pdev->dev);
 	if (!atcphy->hw)
 		return -EINVAL;
-	atcphy->t8103_usb3_workaround = atcphy_has_t8103_usb3_workaround(atcphy->hw, of_root);
+	atcphy->t8103_usb3_workaround = atcphy_has_t8103_usb3_workaround(atcphy->hw);
 
 	atcphy->dev = dev;
 	atcphy->np = dev->of_node;
