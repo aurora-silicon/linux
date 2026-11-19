@@ -355,6 +355,21 @@
 		apple,always-on;
 	};
 
+	/*
+	 * The internal PCIe (apcie): ADT pmgr devices APCIE_GP +0x8c0 and its
+	 * child APCIE_SYS_GP +0xec0. The loader trains the N1 link with them
+	 * on; they stay on so the link is not dropped under the endpoint.
+	 */
+	ps_apcie_gp: power-controller@8c0 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x8c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_gp";
+		apple,always-on;
+	};
+
 	ps_i2c1: power-controller@cc0 {
 		compatible = "apple,t8152-pmgr-pwrstate",
 			     "apple,t8103-pmgr-pwrstate";
@@ -373,6 +388,55 @@
 		#reset-cells = <0>;
 		label = "i2c3";
 		power-domains = <&ps_sio>;
+	};
+
+	ps_apcie_sys_gp: power-controller@ec0 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xec0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_sys_gp";
+		power-domains = <&ps_apcie_gp>;
+		apple,always-on;
+	};
+};
+
+/*
+ * The N1 (Wi-Fi and Bluetooth) on apcie port 0. The J804 ADT's apcie,
+ * pci-bridge0 (PERST# GPIO 3, CLKREQ# GPIO 0, gen 3), its three centauri
+ * functions and dart-apcie0 match the J873g's, so the host and port come
+ * from the shared t8152-n1.dtsi; pcie0_dart is t8152.dtsi's.
+ */
+#include "t8152-n1.dtsi"
+
+/ {
+	aliases {
+		/* The loader fills the N1's factory addresses through these. */
+		wifi0 = &n1_alpha;
+		bluetooth0 = &n1_beta;
+	};
+};
+
+&pcie0_dart {
+	power-domains = <&ps_apcie_sys_gp>;
+	status = "okay";
+};
+
+&pcie {
+	power-domains = <&ps_apcie_sys_gp>;
+};
+
+&port00 {
+	n1_alpha: wifi@0,1 {
+		reg = <0x10100 0x0 0x0 0x0 0x0>;
+		local-mac-address = [00 00 00 00 00 00];
+	};
+
+	n1_beta: bluetooth@0,2 {
+		compatible = "pci106b,1903";
+		reg = <0x10200 0x0 0x0 0x0 0x0>;
+		local-bd-address = [00 00 00 00 00 00];
 	};
 };
 
