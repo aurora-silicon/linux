@@ -98,6 +98,7 @@ enum combo_mode { COMBO_SAFE, COMBO_USB, COMBO_DP4, COMBO_DP2, COMBO_CIO };
 struct t6050_dp {
 	bool combo, usb_prepared, usb2_active, pipe_active, controller_active, cio_prepared;
 	bool pipe_tunnel;	/* the active PIPE is a USB4 router's USB3 tunnel */
+	bool usb2_device;	/* device mode chosen: USB2 starts without the host signature */
 	enum combo_mode combo_mode;
 	enum typec_orientation orientation;
 	struct phy *combo_phy[3];
