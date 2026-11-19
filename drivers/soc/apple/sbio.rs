@@ -1569,7 +1569,7 @@ impl SepData {
             match outcome {
                 RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => any = true,
                 RestoreOutcome::NoStoredFile => missing_files = true,
-                RestoreOutcome::Failed | RestoreOutcome::EmptyTolerated => {}
+                RestoreOutcome::Failed | RestoreOutcome::EmptyTolerated | RestoreOutcome::LoadedEmpty => {}
             }
             if id == user_id {
                 user_outcome = outcome;
@@ -1591,7 +1591,7 @@ impl SepData {
                 missing_files = true;
                 false
             }
-            RestoreOutcome::Failed => false,
+            RestoreOutcome::Failed | RestoreOutcome::LoadedEmpty => false,
         };
 
         if missing_files {
@@ -1661,6 +1661,22 @@ impl SepData {
                             == Some(crate::sbio::SBIO_STATUS_COLD_TRANSITION) =>
                     {
                         let active = self.confirm_active(id, what, LoadAnswer::ColdTransition);
+                        // A bag user's 0x8002 load has been seen to come back
+                        // active with none of the bag's identities: the same
+                        // proof as the configured user's below, without the
+                        // retry.
+                        if id >= crate::userbag::USER_BAG_BASE as i32
+                            && matches!(&active, RestoreOutcome::Restored)
+                        {
+                            let listed = self.enclave_identities_for(id).map(|ids| ids.len());
+                            dev_info_ratelimited!(
+                                self.dev,
+                                "sbio: {} cold-transition load: the enclave lists {:?} of its identities\n",
+                                what,
+                                listed
+                            );
+                            return bag_cold_load(listed);
+                        }
                         if id != SBIO_PROBE_USER_ID
                             || !matches!(&active, RestoreOutcome::Restored)
                         {
@@ -7648,10 +7664,30 @@ pub(crate) fn bag_identity_proof(listed: Option<usize>, components_restored: boo
     }
 }
 
+/// What a bag user's catacomb load that answered the cold-transition status
+/// amounts to, from how many of the bag's identities the enclave then lists
+/// (None: the list could not be read).
+fn bag_cold_load(listed: Option<usize>) -> RestoreOutcome {
+    match listed {
+        Some(0) => RestoreOutcome::LoadedEmpty,
+        Some(_) => RestoreOutcome::Restored,
+        None => RestoreOutcome::Failed,
+    }
+}
+
 #[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
 #[::kernel::macros::kunit_tests(apple_sep_enclave_identity_scope)]
 mod identity_scope_tests {
     use super::*;
+
+    #[test]
+    fn a_bag_cold_load_needs_its_identities_back() {
+        assert!(matches!(bag_cold_load(Some(2)), RestoreOutcome::Restored));
+        // Active, but none of the bag's templates came back.
+        assert!(matches!(bag_cold_load(Some(0)), RestoreOutcome::LoadedEmpty));
+        // No proof either way.
+        assert!(matches!(bag_cold_load(None), RestoreOutcome::Failed));
+    }
 
     #[test]
     fn list_excludes_other_users_and_selectors() {

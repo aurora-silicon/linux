@@ -457,6 +457,9 @@ enum RestoreOutcome {
     Failed,
     // 0x8002 cold-transition; tolerated only for the lockout record, never a catacomb
     EmptyTolerated,
+    // A bag user's catacomb answered 0x8002 and the enclave then listed none
+    // of its identities: its saved templates did not come back.
+    LoadedEmpty,
 }
 
 const PRIVATE_TYPE_CATACOMB_MASTER: u8 = 0xF2;

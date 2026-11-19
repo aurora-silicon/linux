@@ -226,7 +226,8 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 macro_rules! dev_info {($($x:tt)*)=>{()};}
 const PRIVATE_TYPE_CATACOMB_MASTER:u8=0xF2;const PRIVATE_TYPE_CATACOMB_OWNER:u8=0xF3;const PRIVATE_TYPE_CATACOMB_USER:u8=0xF4;
 const SBIO_PROBE_USER_ID:i32=1;
-#[derive(Debug,PartialEq)] enum RestoreOutcome{Restored,AlreadyActive,NoStoredFile,Failed,EmptyTolerated}
+#[derive(Debug,PartialEq)] enum RestoreOutcome{Restored,AlreadyActive,NoStoredFile,Failed,EmptyTolerated,LoadedEmpty}
+mod userbag{pub const USER_BAG_BASE:u32=0x0100_0000;}
 enum LoadAnswer{StatusZero,ColdTransition,AlreadyActive}
 // 0 = valid file, ENOENT = missing, anything else = read error.
 thread_local!{
@@ -281,6 +282,7 @@ impl Sbio{
  @@READ_STORED@@
  @@PROBE@@
 }
+@@BAG_COLD@@
 fn set(files:[i32;3],host:i32){FILE.with(|f|*f.borrow_mut()=files);HOST.with(|h|h.set(host));ASKED_ENCLAVE.with(|a|a.set(false));TRANSFERRED.with(|t|t.set(false));}
 fn main(){
  let s=Sbio{dev:(),templates_restored:AtomicBool::new(false)};
@@ -364,7 +366,7 @@ class Preservation(unittest.TestCase):
         cat=(ROOT/'catacomb.rs').read_text();sb=(ROOT/'sbio.rs').read_text()
         parts={'IS_SAVED':body(cat,'pub(crate) fn is_saved('),'IS_ABSENT':body(cat,'pub(crate) fn is_absent('),
                'RESTORE':body(sb,'fn restore_catacomb('),'READ_STORED':body(sb,'    fn read_stored('),
-               'PROBE':body(sb,'    fn probe_owner_export(')}
+               'PROBE':body(sb,'    fn probe_owner_export('),'BAG_COLD':body(sb,'fn bag_cold_load(')}
         def make(**over):
             text=CALLERS
             for key,value in {**parts,**over}.items():

@@ -1514,7 +1514,16 @@ impl crate::SepData {
             return false;
         } else if plan == BagRestore::Load {
             let outcome = self.restore_catacomb(state, id, slot, c"bag user catacomb");
-            if !matches!(outcome, crate::RestoreOutcome::AlreadyActive | crate::RestoreOutcome::Restored) {
+            if matches!(outcome, crate::RestoreOutcome::LoadedEmpty) {
+                // The file loaded, but its fingerprints did not come back.
+                // As for a stale file above: the bag stays usable, so the
+                // owner can enrol again, and nothing in it can match.
+                dev_warn_ratelimited!(
+                    self.dev,
+                    "userbag: uid {}'s saved fingerprints loaded empty (cold-transition answer, no identities listed); its Touch ID starts afresh: enrol again\n",
+                    uid
+                );
+            } else if !matches!(outcome, crate::RestoreOutcome::AlreadyActive | crate::RestoreOutcome::Restored) {
                 if matches!(outcome, crate::RestoreOutcome::NoStoredFile) {
                     dev_info_ratelimited!(
                         self.dev,
@@ -1530,7 +1539,7 @@ impl crate::SepData {
             // which invalidates a Touch ID preparation made before it: that
             // one goes, and the next password makes a valid one
             // (`userbag_refresh_touch_13`).
-            if matches!(outcome, crate::RestoreOutcome::Restored) {
+            if matches!(outcome, crate::RestoreOutcome::Restored | crate::RestoreOutcome::LoadedEmpty) {
                 if let Some(t) = entry.touch.take() {
                     self.userbag_dispose_touch(t);
                     dev_info_ratelimited!(self.dev,
