@@ -138,7 +138,7 @@ module! {
         },
         m5_probe_only: u32 {
             default: 0,
-            description: "M5 (T8142) on 26A428: 1 logs the GPU ID registers and core masks and refuses the GPU before the UAT or the firmware are touched (bring-up); 0 starts the board's configuration",
+            description: "M5 (T8142): 1 logs the GPU ID registers and core masks and refuses the GPU before the UAT or the firmware are touched (bring-up); 0 starts the GPU with the board's power data from its device-tree node",
         },
         m5_thermal_governor: u32 {
             default: 0,
