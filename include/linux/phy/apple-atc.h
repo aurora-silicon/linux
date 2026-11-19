@@ -133,6 +133,11 @@ enum apple_t6050_cio_usb {
 	APPLE_T6050_CIO_USB_KEEP,
 	APPLE_T6050_CIO_USB_PARK,
 	APPLE_T6050_CIO_USB_RESULT,
+	/*
+	 * Not a tunnel step: whether the port's USB3 PIPE is on the PHY's own lanes now (1), or
+	 * not (0: four DisplayPort lanes, a USB2-only fallback, the USB4 tunnel, no mode).
+	 */
+	APPLE_T6050_CIO_USB_PIPE_LANES,
 };
 /* Kept on the tunnel's PIPE, untouched: xHCI resumes with its state. */
 #define APPLE_T6050_CIO_USB_KEPT	0

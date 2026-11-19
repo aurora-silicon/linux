@@ -1360,6 +1360,8 @@ int apple_t6050_phy_cio_usb(struct device *dev, enum apple_t6050_cio_usb step)
 			 mux, mux & 0x73, lock, readl(dp->banks[44] + 0xc),
 			 readl(dp->banks[44] + 0xc) & 0x73, readl(dp->banks[44] + 0x14));
 		return 0;
+	case APPLE_T6050_CIO_USB_PIPE_LANES:
+		return !dp->faulted && dp->pipe_active && !dp->pipe_tunnel;
 	case APPLE_T6050_CIO_USB_RESULT:
 		if (!dp->cio_usb_kept)
 			return -ENOENT;
