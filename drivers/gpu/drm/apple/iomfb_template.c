@@ -1534,7 +1534,17 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 		dma_addr_t dva = rsrc->start;
 #elif DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 		dma_addr_t dva = dcpep_map_reg_dva(dcp, req->index, rsrc);
-		WARN_ON(dva == DMA_MAPPING_ERROR);
+
+		/*
+		 * Refuse the request as for an invalid index: a success
+		 * would hand the firmware DMA_MAPPING_ERROR as the address
+		 * to reach the registers at.
+		 */
+		if (dva == DMA_MAPPING_ERROR) {
+			dev_err(dcp->dev, "map_reg: cannot map register range %u\n",
+				req->index);
+			return (struct DCP_FW_NAME(dcp_map_reg_resp)){ .ret = 1 };
+		}
 #endif
 
 		return (struct DCP_FW_NAME(dcp_map_reg_resp)){
