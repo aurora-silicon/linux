@@ -1265,8 +1265,6 @@ struct Shared {
     events: Arc<workqueue::OwnedQueue>,
     /// M5: the event work and the scheduler workers follow the submitting CPU.
     follows_submitter: bool,
-    /// T6041: the render scheduler worker runs on the highest-capacity CPUs.
-    fastest_cpu_render: bool,
     /// M5: the CPU of the last publication, `u32::MAX` before the first.
     submitter: AtomicU32,
     #[pin]
@@ -1459,11 +1457,6 @@ impl Shared {
     /// Whether the event work and the scheduler workers follow the submitting CPU (M5).
     pub(super) fn follows_submitter(&self) -> bool {
         self.follows_submitter
-    }
-
-    /// Whether the render scheduler worker runs on the highest-capacity CPUs (T6041).
-    pub(super) fn fastest_cpu_render(&self) -> bool {
-        self.fastest_cpu_render
     }
 
     /// Records the publishing CPU for the event work's placement (M5).
@@ -1795,7 +1788,6 @@ impl Gpu {
                 governor_activity_ns: AtomicU64::new(0),
                 events,
                 follows_submitter: m5,
-                fastest_cpu_render: cfg.chip_id == crate::hw::t6041::CHIP_ID,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),

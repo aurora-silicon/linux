@@ -121,8 +121,11 @@ impl job::Backend for Backend {
     fn creator_cluster_scheduling(&self) -> bool {
         self.shared.follows_submitter()
     }
+    // Every G17: the render run work publishes one job at a time, so an E core puts it behind
+    // the GPU on any part with both core types, and asahi_fastest_cpus() leaves every CPU to a
+    // part with one. M5 takes the creator's cluster instead (creator_cluster_scheduling()).
     fn fastest_cpu_render(&self) -> bool {
-        self.shared.fastest_cpu_render()
+        true
     }
     fn host_producer_waits(&self) -> bool {
         self.shared.m5_board.is_some_and(|board| !board.g17d_forms() && !board.completion_inputs())
