@@ -130,8 +130,6 @@ struct apple_rtkit {
 	struct apple_rtkit_shmem kdebug_buffer1;
 	struct apple_rtkit_shmem pmp_aux_buffer;
 	bool pmp_registry_v2;
-	/* J714s: endpoint 7's CoreAnalytics event acknowledged (apple_rtkit_pmp_aux_rx()) */
-	bool pmp_ca_event_ack;
 
 	struct apple_rtkit_shmem syslog_buffer;
 	char *syslog_msg_buffer;

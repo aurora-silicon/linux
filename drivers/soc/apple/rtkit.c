@@ -1401,15 +1401,17 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 
 /* Registry-v2 firmware requests one 8 KiB auxiliary buffer at endpoint 7.
  * Identical requests reuse the session buffer; changed geometry is refused.
- * On the J714s the same endpoint also carries a CoreAnalytics event with every
- * field zero, some minutes after the PMP has started; it is acknowledged with
- * an event acknowledgement whose fields are zero too, as the CoreAnalytics
+ * The same endpoint also carries a CoreAnalytics event with every field zero,
+ * some minutes after the PMP has started (seen on the J714s); it is acknowledged
+ * with an event acknowledgement whose fields are zero too, as the CoreAnalytics
  * endpoint of other coprocessors acknowledges an event
- * (apple_rtkit_coreanalytics_rx()). Any other message is refused as before.
+ * (apple_rtkit_coreanalytics_rx()). That is the registry-v2 firmware's endpoint
+ * protocol, not a board's: the reply only ever answers that exact word from the
+ * firmware. Any other message is refused as before.
  */
 static void apple_rtkit_pmp_aux_rx(struct apple_rtkit *rtk, u64 msg)
 {
-	if (rtk->pmp_ca_event_ack &&
+	if (rtk->pmp_registry_v2 &&
 	    msg == FIELD_PREP(APPLE_RTKIT_CA_TYPE, APPLE_RTKIT_CA_EVENT)) {
 		int ret = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_PMP_AUX,
 						   FIELD_PREP(APPLE_RTKIT_CA_TYPE,
@@ -2257,8 +2259,6 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 		goto free_rtk;
 	rtk->pmp_registry_v2 =
 		of_device_is_compatible(dev->of_node, "apple,t6050-pmp-v2");
-	rtk->pmp_ca_event_ack = rtk->pmp_registry_v2 &&
-				of_machine_is_compatible("apple,j714s");
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->coreanalytics_completion);

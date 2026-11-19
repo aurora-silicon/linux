@@ -697,12 +697,25 @@ static const struct sio_hw_data sio_hw_t6050 = {
 };
 
 /*
- * The T6050 description is in force on the board it has run on. On another T6050 board the
- * node is taken as before: by its generic compatible.
+ * The T6050 description has the SIO run until the sleep's commit stops it (commit_stop), so it
+ * is in force where the board's sleep controller has that stop: an available apple,t6050-sleep
+ * node with an apple,seq-commit-sio sequence. Without one nothing would stop the SIO for a sleep,
+ * and the node is taken as before: by its generic compatible.
  */
-static bool sio_t6050_board(void)
+static bool sio_t6050_commit_stops(void)
 {
-	return of_machine_is_compatible("apple,j714s");
+	struct device_node *sleep;
+	bool stops = false;
+
+	for_each_compatible_node(sleep, NULL, "apple,t6050-sleep") {
+		if (of_device_is_available(sleep) &&
+		    of_property_present(sleep, "apple,seq-commit-sio")) {
+			stops = true;
+			of_node_put(sleep);
+			break;
+		}
+	}
+	return stops;
 }
 
 static const struct of_device_id sio_of_match[] = {
@@ -1997,7 +2010,7 @@ static int sio_probe(struct platform_device *pdev)
 	if (!match)
 		return -ENODEV;
 	hw = match->data;
-	if (hw == &sio_hw_t6050 && !sio_t6050_board())
+	if (hw == &sio_hw_t6050 && !sio_t6050_commit_stops())
 		hw = &sio_hw_generic;
 	/* Refuse incompatible firmware tables before DMA or hardware setup. */
 	firmware_only = hw->firmware_only;
