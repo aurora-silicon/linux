@@ -808,12 +808,15 @@ static int sn201202x_probe(struct spmi_device *device)
 		tps->sleep_event = sn201202x_sleep_event;
 	/*
 	 * Idle sleep needs only the event interrupt to stay live while the
-	 * controller sleeps, as it does on T8132 and on T6041 (M4 Max). A
-	 * register access then wakes it through runtime PM, select notification
-	 * or not. T6041 keeps its own system sleep path (a wake IRQ).
+	 * controller sleeps. T8132's select-polled controllers have that, as
+	 * the system sleep filter above relies on; elsewhere the DT says so
+	 * (apple,event-irq-in-sleep). A register access then wakes the
+	 * controller through runtime PM, select notification or not. Those
+	 * controllers keep their own system sleep path (a wake IRQ).
 	 */
 	sn->idle_sleep = !sn->polled &&
-			 (sn->select_polled || of_machine_is_compatible("apple,t6041"));
+			 (sn->select_polled ||
+			  device_property_read_bool(&device->dev, "apple,event-irq-in-sleep"));
 
 	spmi_device_set_drvdata(device, tps);
 	tps->regmap = devm_regmap_init_sn201202x(device, &tps6598x_regmap_config);
