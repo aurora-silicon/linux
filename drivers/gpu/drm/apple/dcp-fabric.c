@@ -464,16 +464,22 @@ static int dcp_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
 	return ret;
 }
 
+static bool dcp_t6041_ext_v27(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->desktop_external;
+}
+
 /*
- * Desktop 26.x firmware does not power the DP PHY of a Type-C route itself:
- * the route does, once its crossbar points at the pipeline, and gives it
- * back before the crossbar is released.
+ * Desktop 26.x and T6041 firmware-27 external processors do not power the DP
+ * PHY of a Type-C route themselves: the route does, once its crossbar points at
+ * the pipeline, and gives it back before the crossbar is released.
  */
 static int dcp_typec_route_phy_on(struct apple_dcp_typec_route *route)
 {
 	int ret;
 
-	if (route->dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP ||
+	if ((route->dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP &&
+	     !dcp_t6041_ext_v27(route->dcp)) ||
 	    route->phy_powered)
 		return 0;
 	ret = phy_init(route->phy);
@@ -517,7 +523,8 @@ int dcp_typec_phy_on(struct apple_dcp *dcp)
 	 */
 	if (route->tunnel)
 		return 0;
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	if ((dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	     dcp_t6041_ext_v27(dcp)) &&
 	    route->deactivate_xbar_done)
 		return -ENODEV;
 	return dcp_typec_route_phy_on(route);
@@ -845,7 +852,8 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		 * attached. Desktop 26.x powers the PHY with the route, so an
 		 * idle pipeline must not point at one.
 		 */
-		dcp->phy = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ?
+		dcp->phy = (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+			    dcp_t6041_ext_v27(dcp)) ?
 			   NULL : dcp->typec_routes[0].phy;
 		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
 			WRITE_ONCE(dcp->xbar, NULL);
@@ -1901,7 +1909,8 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		 * another port is refused as busy. The route is taken again
 		 * when HPD returns.
 		 */
-		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+		    dcp_t6041_ext_v27(dcp)) {
 			port->preferred_route = port->owner;
 			port->hpd = false;
 			/*
@@ -2026,7 +2035,8 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	 * would otherwise hold it against the port that has one.
 	 */
 	if (!port->owner && !hpd &&
-	    route->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+	    (route->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	     dcp_t6041_ext_v27(route->dcp))) {
 		port->applied_valid = true;
 		return 0;
 	}
@@ -2468,13 +2478,14 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 	struct mux_control *xbar = NULL;
 	int ret;
 
-	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_t6041_ext_v27(dcp))
 		return dcp_direct_crossbar_link_t6050(dcp, up);
 	/*
-	 * On T6030 and on a T8132 dcpext, selecting a crossbar output only
-	 * routes it; the link-up enables its clocks.
+	 * On T6030, a T6041 firmware-27 dcpext and a T8132 dcpext, selecting a
+	 * crossbar output only routes it; the link-up enables its clocks.
 	 */
-	if (!of_machine_is_compatible("apple,t6030") && !dcp_is_t8132_ext(dcp))
+	if (!of_machine_is_compatible("apple,t6030") &&
+	    !dcp_t6041_ext_v27(dcp) && !dcp_is_t8132_ext(dcp))
 		return 0;
 	guard(mutex)(&dcp->tb_lock);
 	route = dcp->active_typec_route;
