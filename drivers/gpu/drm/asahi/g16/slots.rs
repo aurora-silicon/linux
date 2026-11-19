@@ -2,8 +2,9 @@
 
 //! Per-VM M4 command storage and device-wide displacement lifetime tracking.
 //!
-//! Both compute units alternate hardware UMA slot 1; both render units alternate slot 33.
-//! Firmware retirement and a later distinct retired owner are both required before reuse.
+//! The compute units share hardware UMA slot 1 and may be in flight together, in publication
+//! order; both render units alternate slot 33, one at a time. Firmware retirement and a later
+//! distinct retired owner are both required before reuse.
 //! Private backing and old VM leases survive until a distinct replacement fully retires.
 //! Aborted storage remains mapped and quarantined. Pool cursors are never scrubbed.
 
@@ -370,20 +371,27 @@ pub(crate) struct SlotStats {
     pub(crate) pass_scrubs: u64,
 }
 
+/// Displacement ledger and VM leases of the compute units (see [`Slots`]).
+pub(crate) struct ComputeOwners {
+    lifetime: Lifetime<{ sizes::COMPUTE_UNITS }>,
+    owner: [Option<Arc<super::vm::VmState>>; sizes::COMPUTE_UNITS],
+    pending_retarget: [Option<VmRetarget>; sizes::COMPUTE_UNITS],
+    pending_owner: [Option<Arc<super::vm::VmState>>; sizes::COMPUTE_UNITS],
+}
+
 pub(crate) struct Slots {
     pub(crate) cursor: u32,
     pub(crate) pass_busy: u32,
     pub(crate) pass_cursor: u32,
     pub(crate) stats: SlotStats,
-    compute_lifetime: Lifetime,
-    pass_lifetime: Lifetime,
+    /// The compute owners, on the heap: `Firmware` (and so `Slots`) is built on the probe's
+    /// stack, which has no room for it.
+    compute: KBox<ComputeOwners>,
+    pass_lifetime: Lifetime<2>,
     // Last-owner leases remain bound through retirement and displacement. Replaced only
     // when the displaced unit is safely rebound to a new publication.
-    compute_owner: [Option<Arc<super::vm::VmState>>; 2],
     pass_owner: [Option<Arc<super::vm::VmState>>; 2],
-    pending_compute_retarget: [Option<VmRetarget>; 2],
     pending_pass_retarget: [Option<VmRetarget>; 2],
-    pending_compute_owner: [Option<Arc<super::vm::VmState>>; 2],
     pending_pass_owner: [Option<Arc<super::vm::VmState>>; 2],
 }
 impl Slots {
@@ -393,13 +401,18 @@ impl Slots {
             pass_busy: 0,
             pass_cursor: 0,
             stats: SlotStats::default(),
-            compute_lifetime: Lifetime::new(),
-            pass_lifetime: Lifetime::new(),
-            compute_owner: [None, None],
+            compute: KBox::new(
+                ComputeOwners {
+                    lifetime: Lifetime::new(true),
+                    owner: [const { None }; sizes::COMPUTE_UNITS],
+                    pending_retarget: [None; sizes::COMPUTE_UNITS],
+                    pending_owner: [const { None }; sizes::COMPUTE_UNITS],
+                },
+                GFP_KERNEL,
+            )?,
+            pass_lifetime: Lifetime::new(false),
             pass_owner: [None, None],
-            pending_compute_retarget: [None, None],
             pending_pass_retarget: [None, None],
-            pending_compute_owner: [None, None],
             pending_pass_owner: [None, None],
         })
     }
@@ -408,10 +421,10 @@ impl Slots {
     }
     #[allow(dead_code)]
     pub(crate) fn compute_generation(&self, k: usize) -> Result<u8> {
-        if k >= 2 {
+        if k >= sizes::COMPUTE_UNITS {
             return Err(EINVAL);
         }
-        Ok(self.compute_lifetime.generation(k))
+        Ok(self.compute.lifetime.generation(k))
     }
     #[allow(dead_code)]
     pub(crate) fn pass_generation(&self, k: usize) -> Result<u8> {
@@ -421,39 +434,57 @@ impl Slots {
         Ok(self.pass_lifetime.generation(k))
     }
     pub(crate) fn compute_exhausted(&self) -> bool {
-        self.compute_lifetime.exhausted()
+        // Ledger indices above the most units a VM gets never have an owner.
+        self.compute
+            .lifetime
+            .exhausted_within(super::params::compute_units())
+    }
+    /// Whether none of the first `n` compute units (a VM's own) can ever be claimed again.
+    pub(crate) fn compute_exhausted_within(&self, n: usize) -> bool {
+        self.compute.lifetime.exhausted_within(n)
     }
     pub(crate) fn render_exhausted(&self) -> bool {
         self.pass_lifetime.exhausted()
     }
     pub(crate) fn lifetime_counts(&self) -> [super::pools::lifetime::Counts; 2] {
-        [self.compute_lifetime.counts(), self.pass_lifetime.counts()]
+        [self.compute.lifetime.counts(), self.pass_lifetime.counts()]
+    }
+    /// Whether one of the first `n` compute units can be claimed now.
+    pub(crate) fn compute_available(&self, n: usize) -> bool {
+        (0..n.min(sizes::COMPUTE_UNITS)).any(|k| self.compute.lifetime.available(k))
+    }
+    /// Compute units published and not yet retired.
+    pub(crate) fn compute_published(&self) -> u32 {
+        self.compute.lifetime.published()
     }
     #[allow(dead_code)]
     pub(crate) fn free_compute(&self) -> u32 {
-        (0..2)
-            .filter(|&k| self.compute_lifetime.available(k))
+        (0..super::params::compute_units())
+            .filter(|&k| self.compute.lifetime.available(k))
             .count() as u32
     }
     pub(crate) fn claim_compute(
         &mut self,
-        arena: &super::resources::ComputeArena,
+        units: &super::resources::Prepared,
         f: &mut Claims,
         _j: u32,
     ) -> Result<Option<usize>> {
         if f.slot_count != 0 {
             return Ok(None);
         }
-        for i in 0..2 {
-            let k = (self.cursor as usize + i) % 2;
-            if self.compute_lifetime.claim(k) {
-                if let Err(e) = arena.compute[k].scrub() {
-                    self.compute_lifetime.cancel(k);
+        // Round robin over this VM's units: the next one in publication order is the
+        // oldest, the first to be displaced by a later retired publication.
+        let n = units.compute_units()?.min(sizes::COMPUTE_UNITS);
+        for i in 0..n {
+            let k = (self.cursor as usize + i) % n;
+            if self.compute.lifetime.claim(k) {
+                if let Err(e) = units.compute_unit(k).and_then(|unit| unit.scrub()) {
+                    self.compute.lifetime.cancel(k);
                     return Err(e);
                 }
                 f.slot[0] = k as u32;
                 f.slot_count = 1;
-                self.cursor = (1 - k) as u32;
+                self.cursor = ((k + 1) % n) as u32;
                 return Ok(Some(k));
             }
         }
@@ -522,7 +553,7 @@ impl Slots {
     /// Full wire retirement is a separate condition for hardware qualification.
     pub(crate) fn note_published(&mut self, f: &Claims) {
         for &k in &f.slot[..f.slot_count as usize] {
-            if let Some(proof) = self.pending_compute_retarget[k as usize].take() {
+            if let Some(proof) = self.compute.pending_retarget[k as usize].take() {
                 self.stats.cross_vm_retargets[0] =
                     self.stats.cross_vm_retargets[0].saturating_add(1);
                 self.stats.last_retarget[0] = proof;
@@ -543,17 +574,19 @@ impl Slots {
     /// A previous lease is replaced only after the new publication fully retires.
     pub(crate) fn hold_vm(&mut self, f: &Claims, vm: &Arc<super::vm::VmState>) -> Result {
         if f.slot_count > 2
-            || f.slot[..f.slot_count as usize].iter().any(|&k| k >= 2)
+            || f.slot[..f.slot_count as usize]
+                .iter()
+                .any(|&k| k as usize >= sizes::COMPUTE_UNITS)
             || f.pass_mask & !3 != 0
         {
             return Err(EINVAL);
         }
         for &k in &f.slot[..f.slot_count as usize] {
             let k = k as usize;
-            self.pending_compute_retarget[k] = self.compute_owner[k]
+            self.compute.pending_retarget[k] = self.compute.owner[k]
                 .as_ref()
                 .and_then(|old| Self::vm_retarget(k, old, vm));
-            self.pending_compute_owner[k] = Some(vm.clone());
+            self.compute.pending_owner[k] = Some(vm.clone());
         }
         for k in 0..2 {
             if f.pass_mask & (1 << k) != 0 {
@@ -569,7 +602,7 @@ impl Slots {
     /// Reserve the actual same-slot publication. Call before producers become visible.
     pub(crate) fn publish(&mut self, f: &Claims) -> Result {
         // Validate on a private copy so a failure changes no ownership.
-        let mut c = self.compute_lifetime.clone();
+        let mut c = self.compute.lifetime.clone();
         let mut p = self.pass_lifetime.clone();
         for &k in &f.slot[..f.slot_count as usize] {
             if !c.publish(k as usize) {
@@ -581,13 +614,13 @@ impl Slots {
                 return Err(EBUSY);
             }
         }
-        self.compute_lifetime = c;
+        self.compute.lifetime = c;
         self.pass_lifetime = p;
         Ok(())
     }
     /// Full wire retirement is a precondition; completion fences alone are insufficient.
     pub(crate) fn retire(&mut self, f: &mut Claims) -> Result {
-        let mut c = self.compute_lifetime.clone();
+        let mut c = self.compute.lifetime.clone();
         let mut p = self.pass_lifetime.clone();
         for &k in &f.slot[..f.slot_count as usize] {
             if !c.retire(k as usize) {
@@ -599,10 +632,10 @@ impl Slots {
                 return Err(EINVAL);
             }
         }
-        self.compute_lifetime = c;
+        self.compute.lifetime = c;
         self.pass_lifetime = p;
         for &k in &f.slot[..f.slot_count as usize] {
-            self.compute_owner[k as usize] = self.pending_compute_owner[k as usize].take();
+            self.compute.owner[k as usize] = self.compute.pending_owner[k as usize].take();
         }
         for k in 0..2 {
             if f.pass_mask & (1 << k) != 0 {
@@ -617,8 +650,8 @@ impl Slots {
     }
     pub(crate) fn quarantine(&mut self, f: &mut Claims) {
         for &k in &f.slot[..f.slot_count as usize] {
-            self.compute_lifetime.quarantine(k as usize);
-            self.pending_compute_retarget[k as usize] = None;
+            self.compute.lifetime.quarantine(k as usize);
+            self.compute.pending_retarget[k as usize] = None;
         }
         for k in 0..2 {
             if f.pass_mask & (1 << k) != 0 {
@@ -634,9 +667,9 @@ impl Slots {
     /// Cancels preparation only. Published units require retire() or quarantine().
     pub(crate) fn release(&mut self, f: &mut Claims) {
         for &k in &f.slot[..f.slot_count as usize] {
-            self.compute_lifetime.cancel(k as usize);
-            self.pending_compute_retarget[k as usize] = None;
-            self.pending_compute_owner[k as usize] = None;
+            self.compute.lifetime.cancel(k as usize);
+            self.compute.pending_retarget[k as usize] = None;
+            self.compute.pending_owner[k as usize] = None;
         }
         for k in 0..2 {
             if f.pass_mask & (1 << k) != 0 {
