@@ -1095,7 +1095,7 @@ static int apple_soc_cpufreq_find_cluster(struct cpufreq_policy *policy,
 			pr_info("M2CLOCK2: cluster %pa APSC path kind %u; first transition in 1 s\n",
 				&res.start, m2c_kind);
 			msleep(1000);
-			*reg_base = ioremap(res.start, max_t(resource_size_t,
+			*reg_base = ioremap_np(res.start, max_t(resource_size_t,
 							     resource_size(&res), 0x60000));
 			if (*reg_base && m2c_trace) {
 				const struct apple_soc_cpufreq_info *ti = *info;
