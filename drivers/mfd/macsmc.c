@@ -1481,8 +1481,8 @@ static int apple_smc_prepare(struct device *dev)
 		int ret = 0;
 
 		if (smc->saved_enabled) {
-			if (!mutex_trylock(&smc->mutex))
-				return -EBUSY;
+			/* A sleep right after a dark wake finds the wake's commands in flight */
+			mutex_lock(&smc->mutex);
 			ret = apple_smc_saved_guard(smc);
 			mutex_unlock(&smc->mutex);
 		}
