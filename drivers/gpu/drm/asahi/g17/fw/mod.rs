@@ -19,6 +19,7 @@ pub(crate) mod context;
 pub(crate) mod freelist;
 pub(crate) mod initdata;
 pub(crate) mod kick;
+pub(crate) mod power;
 // Most M5 encodings are reached only once an M5 board has a page-table boot path.
 #[allow(dead_code)]
 pub(crate) mod m5;
