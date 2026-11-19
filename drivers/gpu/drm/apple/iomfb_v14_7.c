@@ -2344,6 +2344,11 @@ int iomfb_v14_7_external_open(struct apple_dcp *dcp)
 		v14->opened = true;
 	} else {
 		v14->failed = true;
+		/*
+		 * A refused open (-EPROTO) leaves the link running: nothing pumps
+		 * a failed session, so stop it queueing events.
+		 */
+		dcp_v14_link_fail(&v14->link);
 		dcp_v14_external_stopped(v14);
 	}
 	mutex_unlock(&v14->lock);
