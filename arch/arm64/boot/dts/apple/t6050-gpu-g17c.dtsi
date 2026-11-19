@@ -151,7 +151,7 @@
 		};
 	};
 
-	gpu_afr_opp: opp-table-gpu-afr {
+	gpu_afr_opp: opp-table-afr {
 		compatible = "operating-points-v2";
 
 		opp00 {
@@ -225,7 +225,7 @@
 		};
 	};
 
-	gpu_cs_opp: opp-table-gpu-cs {
+	gpu_cs_opp: opp-table-cs {
 		compatible = "operating-points-v2";
 
 		opp00 {
