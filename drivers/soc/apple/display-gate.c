@@ -1102,19 +1102,17 @@ static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **p
  * (apple,t6030-dispext-handoff). Nothing here touches a processor's CPU: the
  * display driver starts the firmware when a display is first attached.
  *
- * Each processor ends in one of three states:
- *  - native (the default): the processor, its DART, mailbox, PMP request and
- *    Type-C routes are enabled; its display DART is added to the display
+ * Each processor ends in one of two states:
+ *  - native: the processor, its DART, mailbox, PMP request and Type-C
+ *    routes are enabled; its display DART is added to the display
  *    subsystem's iommus, so every framebuffer is mapped for this pipe as on
  *    M1/M2, and a piodma child is added for the DART's PIODMA stream 4. The
  *    processor then joins the main DRM device.
- *  - manual (apple_t6030_display.dcpext_manual=1): the earlier diagnostic
- *    path, with explicit start and a separately mapped scanout buffer.
  *  - refused: everything stays disabled, and so do its Type-C routes, so the
  *    USB-C ports never wait for a display mode switch nobody registers.
  * apple_t6030_display.dcpext=0 refuses every processor;
- * apple_t6030_display.scanout=0 refuses the display DART, which the native
- * path needs.
+ * apple_t6030_display.scanout=0 refuses the display DART, which every
+ * processor needs, and so refuses them all.
  */
 static bool gate_dcpext_requested __initdata = true;
 
@@ -1131,14 +1129,6 @@ static int __init gate_scanout_setup(char *arg)
 	return kstrtobool(arg, &gate_scanout_requested);
 }
 early_param("apple_t6030_display.scanout", gate_scanout_setup);
-
-static bool gate_dcpext_manual __initdata;
-
-static int __init gate_dcpext_manual_setup(char *arg)
-{
-	return kstrtobool(arg, &gate_dcpext_manual);
-}
-early_param("apple_t6030_display.dcpext_manual", gate_dcpext_manual_setup);
 
 #define GATE_DCPEXT_MAX		4
 
@@ -1528,8 +1518,8 @@ static int __init gate_ext_piodma(struct of_changeset *cs, struct gate_ext *ext)
 	return ret;
 }
 
-/* Enables @ext's processor, in the native or the manual configuration. */
-static int __init gate_ext_apply(struct gate_ext *ext, bool native)
+/* Enables @ext's processor. */
+static int __init gate_ext_apply(struct gate_ext *ext)
 {
 	struct of_changeset *cs = gate_cs_alloc();
 	int ret;
@@ -1557,15 +1547,10 @@ static int __init gate_ext_apply(struct gate_ext *ext, bool native)
 		ret = gate_ext_routes(cs, ext->dcp, "okay");
 	if (!ret && ext->scanout_ok)
 		ret = of_changeset_update_prop_string(cs, ext->disp_dart, "status", "okay");
-	if (!ret && native) {
+	if (!ret)
 		ret = gate_ext_piodma(cs, ext);
-		if (!ret)
-			ret = gate_display_add_dart(cs, ext->disp_dart);
-	} else if (!ret && ext->scanout_ok) {
-		ret = gate_set_u32(cs, ext->scanout, "apple,t6030-scanout-verified", 1);
-		if (!ret)
-			ret = of_changeset_update_prop_string(cs, ext->scanout, "status", "okay");
-	}
+	if (!ret)
+		ret = gate_display_add_dart(cs, ext->disp_dart);
 	if (!ret)
 		ret = of_changeset_apply(cs);
 	if (ret)
@@ -1604,7 +1589,6 @@ static bool __init gate_ext_firmware_ok(struct device_node *np)
 static void __init gate_dcpext_one(struct device_node *np, const char *refuse)
 {
 	struct gate_ext ext = { .dcp = of_node_get(np) };
-	bool native = !gate_dcpext_manual;
 	int ret;
 
 	if (!gate_disabled(np)) {
@@ -1638,22 +1622,18 @@ static void __init gate_dcpext_one(struct device_node *np, const char *refuse)
 		if (ret && ret != -ENODEV)
 			gate_warn("%pOF: display DART handoff failed validation (%d)\n", np, ret);
 	}
-	if (native && !ext.scanout_ok) {
+	if (!ext.scanout_ok) {
 		gate_ext_refuse(np, "no usable display DART handoff");
 		goto put;
 	}
-	ret = gate_ext_apply(&ext, native);
+	ret = gate_ext_apply(&ext);
 	if (ret) {
 		gate_warn("%pOF: changeset failed: %d\n", np, ret);
 		gate_ext_refuse(np, "the gate could not enable it");
 		goto put;
 	}
-	if (native)
-		gate_info("enabled dcpext%u (%pOF) with PMP DISPEXT%u request, CPU power floor, display DART %pOF and its Type-C routes; started by the display driver on first use\n",
-			  ext.index, np, ext.index, ext.disp_dart);
-	else
-		gate_info("enabled dcpext%u (%pOF) for manual start%s\n", ext.index, np,
-			  ext.scanout_ok ? " with the verified scanout DART" : "");
+	gate_info("enabled dcpext%u (%pOF) with PMP DISPEXT%u request, CPU power floor, display DART %pOF and its Type-C routes; started by the display driver on first use\n",
+		  ext.index, np, ext.index, ext.disp_dart);
 put:
 	gate_ext_put(&ext);
 }

@@ -68,7 +68,6 @@
 #include "dcp-fabric.h"
 #include "dcp-hdmi.h"
 #include "dcp-syslog.h"
-#include "dcpext_scanout.h"
 #include "dcp-internal.h"
 #include "j613-25g83.h"
 #include "dcp-external-bw.h"
@@ -2356,10 +2355,6 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_unlock;
 	}
 	generation = dcp->typec_generation;
-	if (dcp->external && dcpext_scanout_terminal(dcp)) {
-		mutex_unlock(&dcp->hpd_mutex);
-		return -ESHUTDOWN;
-	}
 	if (!dptx_service_available(&dcp->dptxport[port])) {
 		dev_warn(dcp->dev, "dcp_dptx_connect: dptx service for port %d not enabled\n", port);
 		ret = -ENODEV;
@@ -2517,12 +2512,11 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		mutex_lock(&dcp->hpd_mutex);
 		if (!dcp->dptxport[port].connected ||
 		    !(READ_ONCE(dcp->typec_cable_connected) || dcp_hdmi_port_attached(dcp)) ||
-		    READ_ONCE(dcp->crashed) || dcpext_scanout_terminal(dcp)) {
+		    READ_ONCE(dcp->crashed)) {
 			mutex_unlock(&dcp->hpd_mutex);
 			return -ENOLINK;
 		}
 		smp_store_release(&dcp->external_link_ready, true);
-		dcpext_scanout_link_restored(dcp);
 		mutex_unlock(&dcp->hpd_mutex);
 	}
 
@@ -3485,8 +3479,7 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	}
 
 	/* A route following its CRTC hands the link over itself. */
-	if ((dcp->external && dcpext_scanout_terminal(dcp)) ||
-	    !READ_ONCE(dcp->typec_cable_connected) ||
+	if (!READ_ONCE(dcp->typec_cable_connected) ||
 	    READ_ONCE(dcp->typec_follow_retiring))
 		return;
 
@@ -3785,10 +3778,8 @@ static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 	int ret;
 
 	lockdep_assert_held(&dcp->hpd_mutex);
-	if (dcp->external) {
+	if (dcp->external)
 		smp_store_release(&dcp->external_link_ready, false);
-		dcpext_scanout_invalidate(dcp);
-	}
 	if (dptx_service_available(&dcp->dptxport[port]) && dcp->dptxport[port].connected) {
 		/*
 		 * A T8132 dcpext's DRM swaps stop with the route, before
@@ -7875,8 +7866,7 @@ static const char *dcp_external_sleep_vetoed(struct apple_dcp *dcp)
 
 	if (!dcp->external_native)
 		return (atomic_read(&dcp->external_requested) ||
-			(dcp->rtk && apple_rtkit_is_running(dcp->rtk)) ||
-			dcpext_scanout_requested(dcp)) ?
+			(dcp->rtk && apple_rtkit_is_running(dcp->rtk))) ?
 		       "external firmware/scanout attempted" : NULL;
 	why = iomfb_v14_7_external_busy(dcp);
 	if (why)

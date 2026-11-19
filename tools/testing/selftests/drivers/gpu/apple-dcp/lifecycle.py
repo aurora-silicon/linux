@@ -607,10 +607,8 @@ static int dptxport_request_display(void *s)
 static int dptxport_set_hpd_timeout(void *s, bool on, int t) { (void)t; return dptxport_set_hpd(s, on); }
 /* The pre-split condition: neither a USB4 output nor a T602X tunnel machine here. */
 static bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *d) { return dcp_is_usb4_output(d) && apple_dp_tunnel_t602x(); }
-/* An H17P display is not a T6030 dcpext (dcp->external): no scanout to fault or restore. */
+/* An H17P display is not a T6030 dcpext (dcp->external). */
 #define smp_store_release(p, v) (*(p) = (v))
-static bool dcpext_scanout_terminal(struct apple_dcp *d) { (void)d; return false; }
-static void dcpext_scanout_link_restored(struct apple_dcp *d) { (void)d; assert(!"T6030 dcpext path in an H17P scenario"); }
 static bool iomfb_v14_7_external_ready(struct apple_dcp *d) { (void)d; assert(!"T6030 external processor in an H17P scenario"); return false; }
 static int iomfb_v14_7_external_open(struct apple_dcp *d) { (void)d; assert(!"T6030 external processor in an H17P scenario"); return -ENODEV; }
 '''

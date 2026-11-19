@@ -3,7 +3,6 @@
 
 #include <linux/atomic.h>
 #include <linux/device.h>
-#include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -11,7 +10,6 @@
 #include "afk.h"
 #include "dcp.h"
 #include "dcpext_mode.h"
-#include "dcpext_scanout.h"
 #include "ibootep.h"
 
 /* m1n1 src/dcp_iboot.c: iBoot commands have their own wrapper inside EPIC. */
@@ -19,7 +17,6 @@
 #define IBOOT_MODE_SIZE 24
 #define IBOOT_PATTERN_WIDTH DCPEXT_WIDTH
 #define IBOOT_PATTERN_HEIGHT DCPEXT_HEIGHT
-#define IBOOT_PATTERN_STRIDE DCPEXT_STRIDE
 
 enum iboot_query_op {
 	IBOOT_GET_HPD = 3,
@@ -27,53 +24,11 @@ enum iboot_query_op {
 	IBOOT_GET_COLOR_MODES = 5,
 };
 
-/* Packed layouts from m1n1 src/dcp_iboot.h and swap_set_layer_cmd_v13_3. */
-struct iboot_plane {
-	__le32 unk1;
-	__le64 addr;
-	__le32 tile_size;
-	__le32 stride;
-	__le32 unk2[4];
-	__le32 addr_format;
-	__le32 unk3;
-} __packed;
-
-struct iboot_layer {
-	struct iboot_plane planes[3];
-	__le32 unk;
-	__le32 plane_count;
-	__le32 width;
-	__le32 height;
-	__le32 surface_format;
-	__le32 colorspace;
-	__le32 eotf;
-	u8 transform;
-	u8 padding[3];
-} __packed;
-
-struct iboot_swap_layer_v13_3 {
-	__le32 unk;
-	__le32 layer_id;
-	struct iboot_layer layer;
-	__le32 unk3;
-	__le32 unk4;
-	__le32 src[4];
-	__le32 dst[4];
-	__le32 unk2;
-} __packed;
-
-static_assert(sizeof(struct iboot_plane) == 44);
-static_assert(sizeof(struct iboot_layer) == 164);
-static_assert(sizeof(struct iboot_swap_layer_v13_3) == 216);
-
 struct iboot_query {
 	struct apple_epic_service *service;
 	struct work_struct work;
 	atomic_t busy;
 	bool stopping;
-	bool pattern_requested;
-	bool presentation_failed;
-	u32 last_frame_swap;
 	bool timing_valid;
 	bool color_valid;
 	/* Preserve the exact queried records, including firmware-owned padding. */
@@ -123,31 +78,6 @@ static int iboot_parse_hpd(const u8 *payload, size_t size, bool *hpd,
 	return 0;
 }
 
-static int iboot_parse_swap_begin(const u8 *reply, size_t received, u32 *id)
-{
-	const u8 *payload;
-	size_t size;
-	int ret;
-
-	/* The gated 14.7 firmware writes 284 in this wrapper but returns only
-	 * the 28-byte Begin record through EPIC. Accept that exact mismatch,
-	 * bounded by the actual transport length; never read the absent tail.
-	 */
-	if (received == 28 && get_unaligned_le32(reply) == 15 &&
-	    get_unaligned_le32(reply + 4) == 284) {
-		payload = reply + 8;
-		size = 20;
-	} else {
-		ret = iboot_reply_payload(reply, received, 15, &payload, &size);
-		if (ret)
-			return ret;
-	}
-	if (size < 20)
-		return -EPROTO;
-	*id = get_unaligned_le32(payload + 12);
-	return 0;
-}
-
 static int iboot_parse_modes(const u8 *payload, size_t size, u32 *count)
 {
 	u32 i;
@@ -164,7 +94,7 @@ static int iboot_parse_modes(const u8 *payload, size_t size, u32 *count)
 }
 
 /*
- * 3840x2160 timings the first pattern may use, best first: the reduced-blanking
+ * 3840x2160 timings the mode query selects, best first: the reduced-blanking
  * 59.9966 Hz timing seen through TB3 docks, then the standard 59.94 Hz and 60 Hz
  * timings that monitors report over faster USB4 links. 59.94 Hz comes before
  * 60 Hz because firmware can resolve "60 Hz" to a DSC timing on 4K120 monitors,
@@ -197,63 +127,6 @@ static bool iboot_pattern_mode(u32 op, const u8 *mode)
 		       get_unaligned_le32(mode + 12) == 1 && /* RGB */
 		       get_unaligned_le32(mode + 16) == 32;
 	return false;
-}
-
-static int iboot_pattern_params(u64 iova, size_t size, u32 stride)
-{
-	/* The caller owns address allocation and both DART mappings. */
-	if (!iova || (iova & 0x3fff) || stride != IBOOT_PATTERN_STRIDE ||
-	    size < (size_t)IBOOT_PATTERN_STRIDE * IBOOT_PATTERN_HEIGHT ||
-	    size > DCPEXT_MAX_BUFFER_SIZE || iova >= (1ULL << 42) ||
-	    size > (1ULL << 42) - iova)
-		return -EINVAL;
-	return 0;
-}
-
-static void iboot_build_pattern_layer(struct iboot_swap_layer_v13_3 *cmd,
-				       u64 iova, u32 stride)
-{
-	memset(cmd, 0, sizeof(*cmd));
-	/* Layer zero, one linear BGRA plane with opaque alpha in the supplied pixels. */
-	cmd->layer.planes[0].addr = cpu_to_le64(iova);
-	cmd->layer.planes[0].stride = cpu_to_le32(stride);
-	cmd->layer.planes[0].addr_format = cpu_to_le32(1);
-	cmd->layer.plane_count = cpu_to_le32(1);
-	cmd->layer.width = cpu_to_le32(IBOOT_PATTERN_WIDTH);
-	cmd->layer.height = cpu_to_le32(IBOOT_PATTERN_HEIGHT);
-	cmd->layer.surface_format = cpu_to_le32(1); /* BGRA */
-	cmd->layer.colorspace = cpu_to_le32(1); /* sRGB */
-	cmd->layer.eotf = cpu_to_le32(1); /* SDR */
-	cmd->src[0] = cmd->dst[0] = cpu_to_le32(IBOOT_PATTERN_WIDTH);
-	cmd->src[1] = cmd->dst[1] = cpu_to_le32(IBOOT_PATTERN_HEIGHT);
-}
-
-static int iboot_build_pattern_request(u32 op, const void *data, size_t data_size,
-				       u8 *request, size_t capacity, size_t *size)
-{
-	size_t expected;
-
-	switch (op) {
-	case 2: expected = 1; break; /* SetPower */
-	case 6: expected = 2 * IBOOT_MODE_SIZE; break; /* SetMode */
-	case 15: expected = 0; break; /* SwapBegin */
-	case 16: expected = sizeof(struct iboot_swap_layer_v13_3); break;
-	case 18: expected = 12; break; /* SwapEnd */
-	case 19: /* SwapWait */
-		expected = 16;
-		break;
-	default: return -EINVAL;
-	}
-	if (data_size != expected || capacity < 16 + expected ||
-	    (expected && !data))
-		return -EINVAL;
-	memset(request, 0, 16 + expected);
-	put_unaligned_le32(op, request);
-	put_unaligned_le32(16 + expected, request + 4);
-	if (expected)
-		memcpy(request + 16, data, expected);
-	*size = 16 + expected;
-	return 0;
 }
 
 static int iboot_read_query(struct iboot_query *query, u32 op, u8 *reply,
@@ -433,241 +306,6 @@ int ibootep_query_modes(struct apple_dcp *dcp)
 	return 0;
 }
 
-/* Observational only: inner status fields for mutation ops are not decoded.
- * AFK currently exposes capacity rather than the actual DMA reply length.
- * Never trust the firmware length to enlarge this fixed diagnostic snapshot.
- */
-static void iboot_log_pattern_reply(struct device *dev, u32 op, const u8 *reply)
-{
-	const u8 *payload;
-	size_t size;
-	int header = iboot_reply_payload(reply, IBOOT_QUERY_RX_SIZE, op, &payload, &size);
-
-	dev_info(dev, "iBoot command %u EPIC success: inner-op=%u declared-len=%u header-check=%d raw64=%*phN (capacity snapshot, inner status unknown)\n",
-		 op, get_unaligned_le32(reply), get_unaligned_le32(reply + 4),
-		 header, 64, reply);
-}
-
-static int iboot_pattern_command(struct iboot_query *query, u32 op,
-				 const void *data, size_t data_size, u8 *reply)
-{
-	u8 request[16 + sizeof(struct iboot_swap_layer_v13_3)];
-	size_t size;
-	u32 retcode = 0;
-	int ret;
-
-	if (READ_ONCE(query->stopping) || READ_ONCE(query->service->torndown))
-		return -ENODEV;
-	ret = iboot_build_pattern_request(op, data, data_size, request, sizeof(request), &size);
-	if (ret)
-		return ret;
-	memset(reply, 0, IBOOT_QUERY_RX_SIZE);
-	ret = afk_send_command(query->service, EPIC_SUBTYPE_STD_SERVICE,
-			       request, size, reply, IBOOT_QUERY_RX_SIZE, &retcode);
-	if (retcode) {
-		dev_warn(query->service->ep->dcp->dev,
-			 "iBoot pattern command %u returned %#x\n", op, retcode);
-		return -EIO;
-	}
-	if (!ret)
-		iboot_log_pattern_reply(query->service->ep->dcp->dev, op, reply);
-	return ret;
-}
-
-/* Unlike startup diagnostics, presentation needs the actual received length
- * before trusting the swap id. Mutation operations may have no DMA body;
- * their outer EPIC return code carries the operation's success or failure.
- */
-static int iboot_frame_command(struct iboot_query *query, u32 op,
-			       const void *data, size_t data_size, u8 *reply,
-			       size_t *received)
-{
-	u8 request[16 + sizeof(struct iboot_swap_layer_v13_3)];
-	size_t size;
-	u32 retcode = 0;
-	int ret;
-
-	if (READ_ONCE(query->stopping) || READ_ONCE(query->service->torndown))
-		return -ENODEV;
-	ret = iboot_build_pattern_request(op, data, data_size, request,
-					 sizeof(request), &size);
-	if (ret)
-		return ret;
-	ret = afk_send_command_with_reply_len(query->service, EPIC_SUBTYPE_STD_SERVICE,
-			request, size, reply, IBOOT_QUERY_RX_SIZE, &retcode, received);
-	if (ret)
-		return ret;
-	return retcode ? -EIO : 0;
-}
-
-int ibootep_present_frame(struct apple_dcp *dcp, u64 iova, size_t size, u32 stride)
-{
-	struct iboot_swap_layer_v13_3 layer;
-	struct iboot_query *query;
-	__le32 end[3] = {}, wait[4] = {};
-	size_t received;
-	u32 id = 0, step = 15;
-	u8 *reply;
-	int ret;
-
-	ret = iboot_pattern_params(iova, size, stride);
-	if (ret)
-		return ret;
-	if (dcp->fw_compat != DCP_FIRMWARE_V_14_7)
-		return -EOPNOTSUPP;
-	query = iboot_find_query(dcp);
-	if (IS_ERR(query))
-		return PTR_ERR(query);
-	might_sleep();
-	if (atomic_cmpxchg(&query->busy, 0, 1))
-		return -EBUSY;
-	if (!query->pattern_requested || query->presentation_failed) {
-		ret = -EIO;
-		goto done;
-	}
-	reply = kzalloc(IBOOT_QUERY_RX_SIZE, GFP_KERNEL);
-	if (!reply) {
-		ret = -ENOMEM;
-		goto done;
-	}
-	ret = iboot_frame_command(query, step, NULL, 0, reply, &received);
-	if (ret)
-		goto failed;
-	ret = iboot_parse_swap_begin(reply, received, &id);
-	if (ret)
-		goto failed;
-	if (!id || id == query->last_frame_swap) {
-		ret = -EPROTO;
-		goto failed;
-	}
-	iboot_build_pattern_layer(&layer, iova, stride);
-	step = 16;
-	ret = iboot_frame_command(query, step, &layer, sizeof(layer), reply, &received);
-	if (ret)
-		goto failed;
-	step = 18;
-	ret = iboot_frame_command(query, step, end, sizeof(end), reply, &received);
-	if (ret)
-		goto failed;
-	/* Display zero, exact swap id, wait for completion, no extra delay.
-	 * Mode 1 waits while this id remains in the pending/current transaction
-	 * queue. It does not wait for the newly displayed frame to be replaced.
-	 * AFK bounds the host wait; on timeout neither buffer may be reused.
-	 */
-	wait[1] = cpu_to_le32(id);
-	wait[2] = cpu_to_le32(1);
-	step = 19;
-	ret = iboot_frame_command(query, step, wait, sizeof(wait), reply, &received);
-	if (ret)
-		goto failed;
-	query->last_frame_swap = id;
-	kfree(reply);
-	goto done;
-failed:
-	query->presentation_failed = true;
-	dev_err(dcp->dev, "external frame swap %u failed at step %u: %d; buffers retained, no retry\n",
-		id, step, ret);
-	kfree(reply);
-done:
-	atomic_set_release(&query->busy, 0);
-	return ret;
-}
-
-int ibootep_rearm_pattern(struct apple_dcp *dcp)
-{
-	struct iboot_query *query = iboot_find_query(dcp);
-
-	if (IS_ERR(query))
-		return PTR_ERR(query);
-	if (atomic_read(&query->busy))
-		return -EBUSY;
-	WRITE_ONCE(query->pattern_requested, false);
-	return 0;
-}
-
-int ibootep_present_pattern(struct apple_dcp *dcp, u64 iova, size_t size, u32 stride)
-{
-	struct iboot_query *query;
-	struct iboot_swap_layer_v13_3 layer;
-	u8 modes[2 * IBOOT_MODE_SIZE], power = 1, end[12] = {};
-	const u8 *payload;
-	u8 *reply;
-	size_t payload_size;
-	u32 step = IBOOT_GET_HPD, swap_id = 0;
-	int ret;
-
-	ret = iboot_pattern_params(iova, size, stride);
-	if (ret)
-		return ret;
-	query = iboot_find_query(dcp);
-	if (IS_ERR(query))
-		return PTR_ERR(query);
-	if (dcp->fw_compat != DCP_FIRMWARE_V_14_7)
-		return -EOPNOTSUPP;
-	/* The caller uses its own sleepable worker, not the ordered AFK RX queue. */
-	might_sleep();
-	if (atomic_cmpxchg(&query->busy, 0, 1))
-		return -EBUSY;
-	if (query->pattern_requested) {
-		ret = -EALREADY;
-		goto done;
-	}
-	/* Even failure is one-shot; a timeout leaves the firmware state uncertain. */
-	query->pattern_requested = true;
-	reply = kzalloc(IBOOT_QUERY_RX_SIZE, GFP_KERNEL);
-	if (!reply) {
-		ret = -ENOMEM;
-		goto done;
-	}
-	ret = iboot_refresh_modes(query, reply);
-	if (ret)
-		goto free;
-	if (!query->timing_valid || !query->color_valid) {
-		ret = -ENODATA;
-		goto free;
-	}
-	memcpy(modes, query->timing, IBOOT_MODE_SIZE);
-	memcpy(modes + IBOOT_MODE_SIZE, query->color, IBOOT_MODE_SIZE);
-	iboot_build_pattern_layer(&layer, iova, stride);
-	step = 2;
-	ret = iboot_pattern_command(query, step, &power, sizeof(power), reply);
-	if (ret)
-		goto free;
-	/* Match m1n1's Sonoma power-on settling interval before changing timing. */
-	msleep(100);
-	step = 6;
-	ret = iboot_pattern_command(query, step, modes, sizeof(modes), reply);
-	if (ret)
-		goto free;
-	step = 15;
-	ret = iboot_pattern_command(query, step, NULL, 0, reply);
-	if (ret)
-		goto free;
-	ret = iboot_reply_payload(reply, IBOOT_QUERY_RX_SIZE, step, &payload, &payload_size);
-	if (ret || payload_size < 20) {
-		ret = -EPROTO;
-		goto free;
-	}
-	swap_id = get_unaligned_le32(payload + 12);
-	step = 16;
-	ret = iboot_pattern_command(query, step, &layer, sizeof(layer), reply);
-	if (ret)
-		goto free;
-	step = 18;
-	ret = iboot_pattern_command(query, step, end, sizeof(end), reply);
-	if (!ret)
-		dev_info(dcp->dev, "iBoot EPIC sequence completed for 3840x2160 BGRA pattern; physical scanout unverified, stride %u IOVA %#llx swap %u; buffer retained\n",
-			 stride, iova, swap_id);
-free:
-	if (ret)
-		dev_warn(dcp->dev, "iBoot first-pattern step %u failed: %d; no retry, buffer must remain mapped\n",
-			 step, ret);
-	kfree(reply);
-done:
-	atomic_set_release(&query->busy, 0);
-	return ret;
-}
-
 static ssize_t dcpext_modes_query_store(struct device *dev,
 				       struct device_attribute *attr,
 				       const char *buf, size_t count)
@@ -717,9 +355,6 @@ static void disp_service_init(struct apple_epic_service *service, const char *na
 		return;
 	}
 	smp_store_release(&service->cookie, query);
-	ret = dcpext_scanout_register(dcp);
-	if (ret && ret != -ENODEV)
-		dev_warn(dcp->dev, "external pattern interface unavailable: %d\n", ret);
 	dev_info(dcp->dev, "external iBoot disp0 service ready on channel %u; mode queries are manual\n",
 		 service->channel);
 }

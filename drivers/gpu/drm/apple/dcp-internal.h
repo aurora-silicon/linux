@@ -429,7 +429,6 @@ struct dcp_desktop_state {
 };
 
 /* TODO: move IOMFB members to its own struct */
-struct dcpext_scanout;
 struct dcp_hdmi;
 
 bool dcp_desktop_present_complete(struct apple_dcp *dcp, u32 id);
@@ -554,10 +553,9 @@ struct apple_dcp {
 	/*
 	 * A T6030 external processor in the main DRM device: the kernel starts
 	 * its firmware on first use, its modes come from the attached display.
-	 * Clear for the manual diagnostic path (separate scanout, explicit start).
+	 * Clear for the manual diagnostic path (explicit start).
 	 */
 	bool external_native;
-	struct dcpext_scanout *dcpext_scanout;
 	bool external_link_ready; /* Full connect/HPD handshake completed. */
 	bool external_suspended; /* hpd_mutex serializes PM against explicit start */
 	struct work_struct external_work;
@@ -1305,8 +1303,8 @@ static inline bool dcp_is_ext26(const struct apple_dcp *dcp)
  * The T6030 external processor (the J514S/J516S built-in HDMI port and
  * USB-C displays) driven natively through Aurora's DCPLink session: DCP
  * firmware 14.7's external role, whose DP/HDMI audio service differs from
- * the M1/M2 one (see av.c). The manual diagnostic pipe (dcpext_scanout) and
- * the T8122 template path are not this.
+ * the M1/M2 one (see av.c). The manual explicit-start path and the T8122
+ * template path are not this.
  */
 static inline bool dcp_is_v14_7_external(const struct apple_dcp *dcp)
 {
