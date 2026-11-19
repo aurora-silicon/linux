@@ -264,6 +264,13 @@
 
 #include "t6050-max-atc2.dtsi"
 
+/* The AOP, its sensors and the microphone array (t6050-aop.dtsi) */
+&aop_audio {
+	apple,chassis-name = "J716";
+};
+
+#include "t6050-aop.dtsi"
+
 /* This unit's host DROM (router UUID from an earlier boot) */
 &acio2_nhi {
 	apple,thunderbolt-drom = [ff 92 e6 6e ee 18 7c ac 05 90 19 c3 8c 00 5c 00

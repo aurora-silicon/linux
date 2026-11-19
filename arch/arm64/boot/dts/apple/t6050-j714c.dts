@@ -168,8 +168,8 @@
  * 0 left woofer 1, 1 right woofer 1, 2 left woofer 2, 3 right woofer 2, 4 left tweeter,
  * 5 right tweeter.
  *
- * There is no sound card yet: the AOP audio service is not enabled on this board. The jack
- * codec is on i2c2 (t6050-jack.dtsi). The amps stay in shutdown until a stream asks for them.
+ * There is no sound card yet. The jack codec is on i2c2 (t6050-jack.dtsi) and the AOP audio
+ * service in t6050-aop.dtsi. The amps stay in shutdown until a stream asks for them.
  */
 / {
 	speaker_sdz: regulator-sn012776-sdz {
@@ -480,3 +480,10 @@
 
 /* The camera. The loader sets the platform ID from the ADT isp0 sensor-type (0x73). */
 #include "t6050-isp.dtsi"
+
+/* The AOP, its sensors and the microphone array (t6050-aop.dtsi) */
+&aop_audio {
+	apple,chassis-name = "J714";
+};
+
+#include "t6050-aop.dtsi"

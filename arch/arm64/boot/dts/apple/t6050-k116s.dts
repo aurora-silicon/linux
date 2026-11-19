@@ -657,19 +657,13 @@
 	};
 };
 
-/* ADT admac-base-ns: 0x293800000, IRQ 637, 13 TX + 13 RX channels, dart-aop stream 8 */
-&admac_base_ns {
-	status = "okay";
-};
-
 /*
  * The AOP audio service (apple,t6050-aop-audio, t6050-die0.dtsi: dmas cout/cin/spkr/sense =
- * base-ns 4/5/0/1). The chassis name is the microphone card's identity (AppleK116HPAI), the
- * machine kind the card's long name.
+ * base-ns 4/5/0/1). The chassis name is the microphone card's identity (AppleK116HPAI); the
+ * rest of the AOP is in t6050-aop.dtsi, below.
  */
 &aop_audio {
 	apple,chassis-name = "K116";
-	apple,machine-kind = "MacBook Pro";
 };
 
 /*
@@ -731,51 +725,9 @@
 	};
 };
 
-/*
- * The AOP, booted through its setup port (ADT aop-exclave-mailbox at 0x2d067c000, dart-aop
- * stream 1), with its RTKit mailbox (ADT aop interrupts 578-581), dart-aop (0x290fc0000,
- * IRQ 616, 17 streams, locked tables on the ADT l1-tt-0 root) and the AOP itself
- * (0x290c00000 SRAM window, ASC 0x290600000). All four nodes are in t6050-die0.dtsi /
- * t6050-peripherals.dtsi of the PR tree, disabled.
- */
-&aop_mbox {
-	status = "okay";
-};
+/* The AOP, its sensors and the microphone array */
+#include "t6050-aop.dtsi"
 
-&aop_setup_mbox {
-	status = "okay";
-};
-
-&aop_dart {
-	status = "okay";
-};
-
-&aop {
-	status = "okay";
-};
-
-/*
- * The microphone array: ADT audio-hp-mic ("Digital Mic", three microphones imi1/imi2/imi3,
- * 48 kHz float32) on leap-s ADMAC RX0, which the AP reaches through the proxy aperture ADT
- * admac-hp-mic-ec-proxy: reg 0x2d3200000 size 0x34000 (not behind the arm-io translation,
- * like the AOP setup port), dma-channel 0, admac-leap-s interrupt 638, dart-aop
- * mapper-admac-leap-s stream 11 (vm-base-11 0x10040000000, vm-size-11 0xffff0000). The K116s
- * ADT has the J714s values in each of these. The AOP audio service captures the array on a
- * card of its own (AppleK116HPAI). The LEAP leaves have no AP power state: the firmware
- * raises them with the hpai service's "pw0 " when the capture opens, and the ADMAC's
- * registers are first touched after that, when the capture requests its channel.
- */
-&admac_ec_proxy {
-	status = "okay";
-};
-
-&aop_audio {
-	/* hpai: leap-s RX0 is Linux channel 1 of the proxy ADMAC (2N for TX N, 2N+1 for RX N) */
-	dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
-	       <&admac_base_ns 0>, <&admac_base_ns 1>,
-	       <&admac_ec_proxy 1>;
-	dma-names = "cout", "cin", "spkr", "sense", "hpai";
-};
 /* The GPU, handed over by the boot loader */
 #include "t6050-k116s-gpu.dtsi"
 

@@ -33,3 +33,10 @@
 #include "t6050-isp.dtsi"
 
 #include "t6050-media.dtsi"
+
+/* The AOP, its sensors and the microphone array (t6050-aop.dtsi) */
+&aop_audio {
+	apple,chassis-name = "K114";
+};
+
+#include "t6050-aop.dtsi"
