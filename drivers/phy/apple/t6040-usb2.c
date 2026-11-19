@@ -394,6 +394,7 @@ static u32 t6040_usb2_sig_want(struct t6040_usb2_phy *tphy)
 		return want & T6040_USB2_SIG_CHECKED;
 	}
 
+	want = t6040_usb2_sig_tunable(want, tphy->tunable_usb2_default);
 	want = t6040_usb2_sig_tunable(want, tphy->tunable_usb2_host);
 	return want & T6040_USB2_SIG_INIT;
 }
@@ -437,6 +438,8 @@ static int t6040_usb2_power_on(struct phy *phy)
 		 * controller's: force it valid, or the controller sees no session
 		 * (J616s USB2 device row, aura#245, 2026-11-19).
 		 */
+		if (!tphy->tunable_usb2_device)
+			dev_dbg(tphy->dev, "USB2 device mode without device tunables\n");
 		apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_default);
 		apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_device);
 		t6040_usb2_clear32(tphy->usb2 + T6040_USB2_SIG, T6040_USB2_SIG_ROLE);
@@ -446,7 +449,11 @@ static int t6040_usb2_power_on(struct phy *phy)
 		 * The host tunable then sets the signal fields for host mode: on
 		 * the J616s it clears SIG[14:12] again (mask 0x7003, value 0x3).
 		 * Left at their init values the USB2 port never sees a connect.
+		 * The default tunable, when the boot loader provides it, goes
+		 * first, as for a device: fields only the device tunable writes
+		 * do not carry over from a device session.
 		 */
+		apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_default);
 		apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_host);
 	}
 
@@ -2389,6 +2396,9 @@ static int t6040_usb2_reset_assert(struct reset_controller_dev *rcdev,
 			   T6040_PIPEHANDLER_AON_GEN_DWC3_RESET_N);
 	t6040_usb2_set32(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN,
 			 T6040_PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+	/* A device start that failed before power_on also ends here: back to host mode. */
+	if (!tphy->powered)
+		tphy->mode = PHY_MODE_USB_HOST;
 	if (tphy->dwc3_running) {
 		tphy->dwc3_running = false;
 		pm_runtime_put(tphy->dev);
