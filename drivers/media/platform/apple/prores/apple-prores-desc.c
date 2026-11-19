@@ -725,6 +725,28 @@ bool apr_ring_tail_valid(u32 done, u32 tail, u32 head, u32 ring_bytes)
 }
 EXPORT_SYMBOL_IF_KUNIT(apr_ring_tail_valid);
 
+/*
+ * Decode job ids are device-wide and never 0: the engine reports the id of
+ * the last job it finished, and that report reads 0 after a reset, before
+ * any job has run.
+ */
+u16 apr_next_job_id(u16 id)
+{
+	return id == U16_MAX ? 1 : id + 1;
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_next_job_id);
+
+/*
+ * Has the engine finished job @id, given the last finished id @done_id?
+ * Jobs finish in ring order and far fewer than 2^15 are ever outstanding,
+ * so the signed distance decides, across the wrap as well.
+ */
+bool apr_job_id_done(u16 done_id, u16 id)
+{
+	return (u16)(done_id - id) < 0x8000;
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_job_id_done);
+
 /* No further job may enter the ring with @jobs in it, @encodes of them encodes. */
 bool apr_jobs_full(unsigned int jobs, unsigned int encodes)
 {

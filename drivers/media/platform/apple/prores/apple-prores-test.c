@@ -794,6 +794,21 @@ static void apr_test_inflight(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apr_ring_free(done, head, r), r);
 }
 
+static void apr_test_job_id(struct kunit *test)
+{
+	/* Ids are never 0, which ST1 reads after a reset. */
+	KUNIT_EXPECT_EQ(test, apr_next_job_id(1), 2);
+	KUNIT_EXPECT_EQ(test, apr_next_job_id(U16_MAX), 1);
+	KUNIT_EXPECT_FALSE(test, apr_job_id_done(0, 1));
+	KUNIT_EXPECT_TRUE(test, apr_job_id_done(1, 1));
+	KUNIT_EXPECT_TRUE(test, apr_job_id_done(5, 3));
+	KUNIT_EXPECT_FALSE(test, apr_job_id_done(3, 5));
+	/* Across the wrap: 65535 finishes before 1 and 2. */
+	KUNIT_EXPECT_TRUE(test, apr_job_id_done(1, U16_MAX));
+	KUNIT_EXPECT_FALSE(test, apr_job_id_done(U16_MAX, 1));
+	KUNIT_EXPECT_FALSE(test, apr_job_id_done(U16_MAX - 1, 2));
+}
+
 static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_qmat_regs),
 	KUNIT_CASE(apr_test_dc_scale),
@@ -819,6 +834,7 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_ring_space),
 	KUNIT_CASE(apr_test_ring_tail),
 	KUNIT_CASE(apr_test_inflight),
+	KUNIT_CASE(apr_test_job_id),
 	{}
 };
 

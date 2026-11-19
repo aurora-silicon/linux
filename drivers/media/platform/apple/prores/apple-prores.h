@@ -29,6 +29,8 @@
 #define APR_IRQ_ERROR		BIT(1)
 #define APR_REG_ST0		0x0014
 #define APR_REG_ST1		0x0018
+/* Job id of the last descriptor the engine has finished (decode command 31:16). */
+#define APR_ST1_DONE_ID		GENMASK(31, 16)
 #define APR_REG_ST2		0x001c
 #define APR_REG_DETAIL0		0x003c
 #define APR_REG_DETAIL1_LO	0x0040
@@ -237,6 +239,8 @@ u32 apr_ring_distance(u32 from, u32 to, u32 ring_bytes);
 u32 apr_ring_free(u32 done, u32 head, u32 ring_bytes);
 bool apr_ring_passed(u32 done, u32 end, u32 tail, u32 ring_bytes);
 bool apr_ring_tail_valid(u32 done, u32 tail, u32 head, u32 ring_bytes);
+u16 apr_next_job_id(u16 id);
+bool apr_job_id_done(u16 done_id, u16 id);
 bool apr_jobs_full(unsigned int jobs, unsigned int encodes);
 void apr_ring_write(u8 *ring, u32 ring_bytes, u32 ptr, const u8 *desc,
 		    u32 desc_bytes);

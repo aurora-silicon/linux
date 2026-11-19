@@ -4,10 +4,14 @@
  *
  * The driver writes job descriptors into a 128 KiB DMA ring and advances the
  * producer head; the engine works through the ring and reports progress with
- * a consumer tail and a completion interrupt. Up to APR_MAX_INFLIGHT jobs sit
- * in the ring at once: a job's buffers leave the m2m queues when its
+ * a consumer tail and a completion interrupt. Up to APR_MAX_INFLIGHT decode
+ * jobs sit in the ring at once: a job's buffers leave the m2m queues when its
  * descriptor is published, so v4l2-m2m can run the next job while the engine
- * is busy, and they complete in ring order once the tail passes them.
+ * is busy. The tail moves when the engine fetches a descriptor, not when it
+ * has finished the frame, so decode jobs complete in ring order once the
+ * engine reports their job id as finished in ST1. An encode descriptor
+ * carries no job id: it only enters an empty ring and completes on its
+ * interrupt, as a lone job.
  * The encoder consumes semi-planar 4:2:2 or 4:4:4 frames and produces one
  * complete ProRes frame per buffer. The decoder exposes a second stateful
  * node with the queue directions reversed and linear color output.
@@ -16,6 +20,7 @@
  * engine under Linux, and on the m1n1 proxyclient ProRes experiment (MIT).
  */
 #include <linux/atomic.h>
+#include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
@@ -875,6 +880,7 @@ struct apr_job {
 	struct vb2_v4l2_buffer *src;
 	struct vb2_v4l2_buffer *dst;
 	u32 end;		/* ring pointer just past its descriptor */
+	u16 id;			/* decode job id in the descriptor */
 	u32 sequence;
 	u32 bytes;		/* decoded payload */
 	int err;		/* forced result: engine error or cancellation */
@@ -917,6 +923,7 @@ struct apr_dev {
 	struct apr_ctx *held;	/* m2m job left running while the ring is full */
 	u32 head;		/* next free ring offset */
 	u32 done;		/* the engine has consumed the ring up to here */
+	u16 next_id;		/* id for the next decode job, never 0 */
 	bool ring_ready;	/* engine registers programmed since power-up */
 	bool broken;		/* timed out with no way to reset */
 	bool hung;		/* ring state is inconsistent, reset now */
@@ -1020,6 +1027,7 @@ static void apr_hw_init(struct apr_dev *apr)
 	/* Order the setup before any descriptor publication. */
 	wmb();
 	apr->head = 0;
+	apr->next_id = 1;
 	apr->done = 0;
 	apr->ring_ready = true;
 }
@@ -1145,7 +1153,6 @@ static int apr_fill_decode_frame(struct apr_ctx *ctx,
 			 src->vb2_buf.planes[0].data_offset,
 		.luma = output,
 		.chroma = output + (u64)luma_stride * d->height,
-		.job_id = ctx->sequence,
 	};
 	return 0;
 }
@@ -1250,6 +1257,7 @@ static bool apr_take_done(struct apr_dev *apr, struct apr_job *out,
 	u32 status, tail, st0, st1, st2;
 	u32 detail[6];
 	unsigned int i;
+	u16 done_id;
 
 	*n = 0;
 	status = apr_read(apr, APR_REG_IRQ_STATUS);
@@ -1288,10 +1296,15 @@ static bool apr_take_done(struct apr_dev *apr, struct apr_job *out,
 		apr->hung = true;
 		return true;
 	}
+	/* Read after the W1C: a job finishing later raises DONE again. */
+	done_id = FIELD_GET(APR_ST1_DONE_ID, apr_read(apr, APR_REG_ST1));
 	while (apr->njobs) {
 		struct apr_job *job = &apr->jobs[apr->job_first];
 
-		if (!apr_ring_passed(apr->done, job->end, tail, ring_bytes))
+		if (job->ctx->decode ?
+		    !apr_job_id_done(done_id, job->id) :
+		    !(status & (APR_IRQ_DONE | APR_IRQ_ERROR)) ||
+		    !apr_ring_passed(apr->done, job->end, tail, ring_bytes))
 			break;
 		out[(*n)++] = *job;
 		apr->done = job->end;
@@ -1471,9 +1484,11 @@ static void apr_device_run(void *priv)
 	}
 
 	spin_lock_irqsave(&apr->hw_lock, flags);
-	while (apr->resetting) {
+	/* An encode has no job id, so it only runs alone in the ring. */
+	while (apr->resetting || (!ctx->decode && apr->njobs)) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
-		wait_event(apr->idle_wq, !READ_ONCE(apr->resetting));
+		wait_event(apr->idle_wq, !READ_ONCE(apr->resetting) &&
+			   (ctx->decode || !READ_ONCE(apr->njobs)));
 		spin_lock_irqsave(&apr->hw_lock, flags);
 	}
 	if (apr->broken) {
@@ -1489,6 +1504,8 @@ static void apr_device_run(void *priv)
 		apr_finish_job(apr, ctx, -EBUSY);
 		return;
 	}
+	if (ctx->decode)
+		decode.job_id = apr->next_id;
 	ret = ctx->decode ? apr_build_decode_desc(&decode, desc) :
 			    apr->variant->build_desc(&f, desc);
 	if (ret) {
@@ -1504,6 +1521,7 @@ static void apr_device_run(void *priv)
 		.src = v4l2_m2m_src_buf_remove(m2m),
 		.dst = v4l2_m2m_dst_buf_remove(m2m),
 		.end = apr->head,
+		.id = ctx->decode ? apr->next_id : 0,
 		.sequence = ctx->sequence++,
 		.bytes = ctx->dst_fmt.plane_fmt[0].sizeimage,
 	};
@@ -1513,6 +1531,8 @@ static void apr_device_run(void *priv)
 	apr->njobs++;
 	if (!ctx->decode)
 		apr->nencodes++;
+	if (ctx->decode)
+		apr->next_id = apr_next_job_id(apr->next_id);
 	atomic_inc(&ctx->inflight);
 	atomic_inc(&apr->outstanding);
 	/* Descriptor and buffers must be visible before the head moves. */
