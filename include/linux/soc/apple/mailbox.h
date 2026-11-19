@@ -86,6 +86,12 @@ struct apple_mbox {
 	 */
 	int rx_util_min;
 	int rx_util_min_applied;
+	/*
+	 * The receive handler runs in an IRQ thread (an RT thread) rather than
+	 * in hard IRQ context. Only then is there a thread whose minimum
+	 * utilization a consumer can set.
+	 */
+	bool rx_threaded;
 
 	/*
 	 * Protected by tx_lock: set while irq_send_empty is unmasked, so that
