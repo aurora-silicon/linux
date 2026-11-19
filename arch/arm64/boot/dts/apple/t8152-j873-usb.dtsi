@@ -18,6 +18,11 @@
  * own window only, and describe instance 1 as a node of its own.
  */
 
+/*
+ * The USB DARTs' power domain is PSD service 175 (usb-drd1) and 176 (usb-drd2).
+ * It waits on the T8152 PSD provider (aurora-silicon/linux#2459), and must stay
+ * on until Linux can restore the USB2 PHY setup the loader leaves behind.
+ */
 &dwc3_1_dart {
 	reg = <0x4 0x0b020000 0x0 0xc000>;
 	status = "okay";
@@ -30,6 +35,7 @@
 
 / {
 	soc {
+		/* Power domain: PSD service 175, see dwc3_1_dart above. */
 		dwc3_1_dart_1: iommu@40b040000 {
 			compatible = "apple,t8152-dart", "apple,t8110-dart";
 			reg = <0x4 0x0b040000 0x0 0xc000>;
@@ -48,6 +54,7 @@
 			snps,dis_u3_susphy_quirk;
 		};
 
+		/* Power domain: PSD service 176, see dwc3_1_dart above. */
 		dwc3_2_dart_1: iommu@383040000 {
 			compatible = "apple,t8152-dart", "apple,t8110-dart";
 			reg = <0x3 0x83040000 0x0 0xc000>;
