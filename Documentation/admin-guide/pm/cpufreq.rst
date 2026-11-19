@@ -434,7 +434,7 @@ is passed by the scheduler to the governor callback which causes the frequency
 to go up to the allowed maximum immediately and then draw back to the value
 returned by the above formula over time.
 
-This governor exposes only one tunable:
+This governor exposes two tunables:
 
 ``rate_limit_us``
 	Minimum time (in microseconds) that has to pass between two consecutive
@@ -443,6 +443,17 @@ This governor exposes only one tunable:
 
 	The purpose of this tunable is to reduce the scheduler context overhead
 	of the governor which might be excessive without it.
+
+``busy_boost_us``
+	Time (in microseconds) a CPU has to run without entering its idle loop
+	before the governor requests the highest frequency for it, until it
+	idles again (default: as the scaling driver suggests, 0 if it does not;
+	0 means never).
+
+	Frequency-invariant utilization of a task that starts running flat out
+	grows only as fast as the CPU it runs on is clocked, so from a low
+	frequency it can take on the order of 100 ms to reach the top.  This
+	tunable bounds that time for work that does not pause.
 
 This governor generally is regarded as a replacement for the older `ondemand`_
 and `conservative`_ governors (described below), as it is simpler and more

@@ -133,6 +133,14 @@ struct cpufreq_policy {
 	unsigned int		transition_delay_us;
 
 	/*
+	 * Time a CPU has to stay busy, without idling, before schedutil runs
+	 * the policy at its highest frequency, see busy_boost_us in
+	 * Documentation/admin-guide/pm/cpufreq.rst. To be set by the scaling
+	 * driver (0, which is the default, means never).
+	 */
+	unsigned int		busy_boost_us;
+
+	/*
 	 * Remote DVFS flag (Not added to the driver structure as we don't want
 	 * to access another structure from scheduler hotpath).
 	 *

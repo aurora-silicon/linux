@@ -1329,6 +1329,24 @@ unsigned long tick_nohz_get_idle_calls_cpu(int cpu)
 	return ts->idle_calls;
 }
 
+/**
+ * tick_nohz_get_idle_entrytime_cpu - return when a CPU last entered idle
+ * @cpu: target CPU number
+ *
+ * Every pass of @cpu's idle loop sets this, whether or not the tick is
+ * stopped, so a value that has not changed since an earlier read means @cpu
+ * has not been idle in between unless it is idle now. Called from the
+ * schedutil frequency scaling governor in scheduler context.
+ *
+ * Return: the time @cpu last entered its idle loop
+ */
+ktime_t tick_nohz_get_idle_entrytime_cpu(int cpu)
+{
+	struct tick_sched *ts = tick_get_tick_sched(cpu);
+
+	return READ_ONCE(ts->idle_entrytime);
+}
+
 void tick_nohz_idle_restart_tick(void)
 {
 	struct tick_sched *ts = this_cpu_ptr(&tick_cpu_sched);
