@@ -2065,3 +2065,4 @@
 };
 
 #include "t604x-pmgr.dtsi"
+#include "t604x-usb4.dtsi"

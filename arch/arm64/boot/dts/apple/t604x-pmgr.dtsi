@@ -533,6 +533,173 @@
 	};
 };
 
+/*
+ * The USB4 router (CIO) and PCIe-C domains of each ATC, children of its
+ * ATCn_COMMON. The J614s, J616s, J773s, J614c, J616c and J575c ADTs list
+ * them at the same offsets. t604x-usb4.dtsi enables the ATC0-2 ones.
+ */
+&pmgr_aux {
+	ps_atc0_cio: power-controller@398 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x398 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_cio";
+		power-domains = <&ps_atc0_common>;
+		status = "disabled";
+	};
+
+	ps_atc0_pcie: power-controller@3a0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_pcie";
+		power-domains = <&ps_atc0_common>;
+		status = "disabled";
+	};
+
+	ps_atc0_cio_pcie: power-controller@3a8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_cio_pcie";
+		power-domains = <&ps_atc0_cio>;
+		status = "disabled";
+	};
+
+	ps_atc0_cio_usb: power-controller@3b0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3b0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_cio_usb";
+		power-domains = <&ps_atc0_cio>;
+		status = "disabled";
+	};
+
+	ps_atc1_cio: power-controller@3c0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1_cio";
+		power-domains = <&ps_atc1_common>;
+		status = "disabled";
+	};
+
+	ps_atc1_pcie: power-controller@3c8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3c8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1_pcie";
+		power-domains = <&ps_atc1_common>;
+		status = "disabled";
+	};
+
+	ps_atc1_cio_pcie: power-controller@3d0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3d0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1_cio_pcie";
+		power-domains = <&ps_atc1_cio>;
+		status = "disabled";
+	};
+
+	ps_atc1_cio_usb: power-controller@3d8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3d8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1_cio_usb";
+		power-domains = <&ps_atc1_cio>;
+		status = "disabled";
+	};
+
+	ps_atc2_cio: power-controller@3e8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_cio";
+		power-domains = <&ps_atc2_common>;
+		status = "disabled";
+	};
+
+	ps_atc2_pcie: power-controller@3f0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3f0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_pcie";
+		power-domains = <&ps_atc2_common>;
+		status = "disabled";
+	};
+
+	ps_atc2_cio_pcie: power-controller@3f8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3f8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_cio_pcie";
+		power-domains = <&ps_atc2_cio>;
+		status = "disabled";
+	};
+
+	ps_atc2_cio_usb: power-controller@400 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x400 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_cio_usb";
+		power-domains = <&ps_atc2_cio>;
+		status = "disabled";
+	};
+
+	ps_atc3_cio: power-controller@420 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x420 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc3_cio";
+		power-domains = <&ps_atc3_common>;
+		status = "disabled";
+	};
+
+	ps_atc3_pcie: power-controller@428 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x428 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc3_pcie";
+		power-domains = <&ps_atc3_common>;
+		status = "disabled";
+	};
+
+	ps_atc3_cio_pcie: power-controller@430 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x430 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc3_cio_pcie";
+		power-domains = <&ps_atc3_cio>;
+		status = "disabled";
+	};
+
+	ps_atc3_cio_usb: power-controller@438 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x438 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc3_cio_usb";
+		power-domains = <&ps_atc3_cio>;
+		status = "disabled";
+	};
+};
+
 &pmgr_ane {
 	ps_ane_mpm: power-controller@0 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";

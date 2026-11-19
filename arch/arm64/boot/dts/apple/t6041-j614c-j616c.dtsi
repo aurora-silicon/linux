@@ -2902,3 +2902,10 @@
 &jpeg1 {
 	status = "okay";
 };
+
+/*
+ * USB4/Thunderbolt on all three Type-C ports: the routers are enabled in
+ * t604x-usb4.dtsi. hpm0 (left back), hpm1 (left front) and hpm2 (right)
+ * name acio0, acio1 and acio2 as their routers, as on the J614s/J616s.
+ */
+#include "t604x-usb4-typec.dtsi"

@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * M4 Pro (T6040) USB4/Thunderbolt: each Type-C port's connector is linked
- * to the USB4 router behind the same ATC PHY. On every T6040 board the ADT
- * pairs acioN with atc-phyN (atc-phy-parent) and with the port controller
- * whose acio-parent is acioN, and the boards name that connector typecN:
- *   MacBook Pro 14/16 (J614s, J616s): typec0 left back, typec1 left front,
- *     typec2 right;
+ * M4 Pro and M4 Max (T6040/T6041) USB4/Thunderbolt: each Type-C port's
+ * connector is linked to the USB4 router behind the same ATC PHY. On every
+ * T604x board the ADT pairs acioN with atc-phyN (atc-phy-parent) and with
+ * the port controller whose acio-parent is acioN, and the boards name that
+ * connector typecN:
+ *   MacBook Pro 14/16 (J614s, J616s, J614c, J616c): typec0 left back,
+ *     typec1 left front, typec2 right;
  *   Mac mini (J773s): typec0 back middle, typec1 back left, typec2 back
- *     right.
+ *     right;
+ *   Mac Studio (J575c): typec0 back right, typec1 back right middle,
+ *     typec2 back left middle (its fourth router, ACIO3, is linked in
+ *     t6041-j575c-usb4.dtsi).
  * A port controller skips a link to a disabled router.
  *
  * Each ATC PHY is its connector's mode switch: the port controller switches
