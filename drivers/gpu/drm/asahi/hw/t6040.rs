@@ -59,7 +59,7 @@ pub(crate) const CONFIG: Config = Config {
     m5: None,
     adopt_root_entries: false,
     fabric_bridge: false,
-    sleep_restart: false,
+    sleep_restart: true,
     // The firmware's per-slot recovery keys are not known for this build; recovery relies on
     // the firmware's own blame.
     recovery_slot_keys: None,
