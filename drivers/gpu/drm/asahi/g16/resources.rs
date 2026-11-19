@@ -13,7 +13,7 @@ use super::{
     vm::VmState,
 };
 use crate::mmu;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
     new_mutex,
     prelude::*,
@@ -140,6 +140,8 @@ struct Ready {
 pub(crate) struct Cache {
     #[pin]
     ready: Mutex<Ready>,
+    /// The VM's client closed: no arena is kept here any more.
+    closed: AtomicBool,
     pub(crate) factory: Factory,
     bind: mmu::VmBind,
     live: Arc<super::vm::LiveToken>,
@@ -154,10 +156,26 @@ impl Cache {
         let budget = super::budget::Budget::new()?;
         Arc::pin_init(
             pin_init!(Self { ready <- new_mutex!(Ready::default(), "g16::resources"),
+            closed: AtomicBool::new(false),
             factory, bind, live, budget }),
             GFP_KERNEL,
         )
     }
+    /// The VM's client closed. Lets go of the arenas: what jobs and the hardware slots'
+    /// last-owner leases still need, they hold themselves.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        let ready = {
+            let mut ready = self.ready.lock();
+            (
+                ready.compute.take(),
+                ready.compute_ext.take(),
+                ready.render.take(),
+            )
+        };
+        drop(ready);
+    }
+
     pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<Prepared> {
         let computes = commands
             .iter()
@@ -173,7 +191,7 @@ impl Cache {
         let (compute, compute_ext, render) = {
             // Never held by publication, completion, recovery or fence signalling.
             let mut ready = self.ready.lock();
-            if vm.status.get() != 0 || vm.vm.is_closed() {
+            if vm.status.get() != 0 || vm.vm.is_closed() || self.closed.load(Ordering::Acquire) {
                 return Err(EIO);
             }
             if compute && ready.compute.is_none() {
@@ -267,6 +285,19 @@ impl Prepared {
     pub(crate) fn compute_units(&self) -> Result<usize> {
         Ok(self.compute()?.compute.len()
             + self.compute_ext.as_deref().map_or(0, |e| e.compute.len()))
+    }
+    /// The arena holding compute unit `k`.
+    pub(crate) fn compute_arena(&self, k: usize) -> Option<Arc<ComputeArena>> {
+        let base = self.compute.as_ref()?;
+        if k < base.compute.len() {
+            Some(base.clone())
+        } else {
+            self.compute_ext.clone()
+        }
+    }
+    /// The render arena.
+    pub(crate) fn render_arena(&self) -> Option<Arc<RenderArena>> {
+        self.render.clone()
     }
     /// Compute unit `k`: the VM's base units, then its extension units.
     pub(crate) fn compute_unit(&self, k: usize) -> Result<&ComputeSlot> {

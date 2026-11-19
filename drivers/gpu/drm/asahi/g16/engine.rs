@@ -1174,6 +1174,7 @@ impl Firmware {
         // Reserve lifetime ownership before any counter or producer becomes reachable.
         job.vm.vm.mark_binding_published()?;
         self.slots.hold_vm(&f.claims, &job.vm)?;
+        self.slots.hold_arenas(&f.claims, &job.resources);
         self.slots.publish(&f.claims)?;
         // Even a failed first store may have become visible. From this boundary preserve
         // every owner and return explicit uncertainty rather than guessing from errno.
@@ -1318,6 +1319,7 @@ impl Firmware {
             .ok_or(EAGAIN)?;
         let generation = job.vm.generation;
         self.slots.hold_vm(&f.claims, &job.vm)?;
+        self.slots.hold_arenas(&f.claims, &job.resources);
         let s = job.resources.compute_unit(index)?;
         let g = &self.graph.compute;
         let before = s.counter.r64(0)?;
@@ -1413,6 +1415,7 @@ impl Firmware {
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
         self.slots.claim_pass(job.resources.render()?, k)?;
         self.slots.hold_vm(&f.claims, &job.vm)?;
+        self.slots.hold_arenas(&f.claims, &job.resources);
         let (refs, init_buffer, epoch, binding) = self.render_refs(k, job, draw)?;
         f.pb = Some(epoch);
         f.pb_binding = binding;
