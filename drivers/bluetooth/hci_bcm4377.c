@@ -2690,6 +2690,34 @@ static int bcm4377_probe_dmi(struct bcm4377_data *bcm4377)
 	return 0;
 }
 
+static void bcm4377_release_cal_fw(void *fw)
+{
+	release_firmware(fw);
+}
+
+/*
+ * The M3 and M4 Macs' ADT carries no Taurus calibration: macOS reads it from
+ * the factory data (the "btbf" object of the BWCl record), and the installer
+ * copies it into the vendor firmware. Load it from there when the loader put
+ * none in the device tree.
+ */
+static const void *bcm4377_request_cal_fw(struct bcm4377_data *bcm4377,
+					  const char *name, int *size)
+{
+	struct device *dev = &bcm4377->pdev->dev;
+	const struct firmware *fw;
+
+	if (firmware_request_nowarn(&fw, name, dev))
+		return NULL;
+	if (!fw->size || fw->size > INT_MAX ||
+	    devm_add_action_or_reset(dev, bcm4377_release_cal_fw, (void *)fw))
+		return NULL;
+
+	*size = fw->size;
+	dev_info(dev, "using %s (%zu bytes)\n", name, fw->size);
+	return fw->data;
+}
+
 static int bcm4377_probe_of(struct bcm4377_data *bcm4377)
 {
 	struct device_node *np = bcm4377->pdev->dev.of_node;
@@ -2708,6 +2736,11 @@ static int bcm4377_probe_of(struct bcm4377_data *bcm4377)
 	bcm4377->taurus_beamforming_cal_blob =
 		of_get_property(np, "brcm,taurus-bf-cal-blob",
 				&bcm4377->taurus_beamforming_cal_size);
+	if (!bcm4377->taurus_beamforming_cal_blob)
+		bcm4377->taurus_beamforming_cal_blob =
+			bcm4377_request_cal_fw(bcm4377,
+					       "apple/bluetooth-taurus-calibration-bf.bin",
+					       &bcm4377->taurus_beamforming_cal_size);
 	if (!bcm4377->taurus_beamforming_cal_blob) {
 		dev_err(&bcm4377->pdev->dev,
 			"no brcm,taurus-bf-cal-blob property\n");
@@ -3397,3 +3430,4 @@ MODULE_FIRMWARE("brcm/brcmbt4387*.bin");
 MODULE_FIRMWARE("brcm/brcmbt4387*.ptb");
 MODULE_FIRMWARE("brcm/brcmbt4388*.bin");
 MODULE_FIRMWARE("brcm/brcmbt4388*.ptb");
+MODULE_FIRMWARE("apple/bluetooth-taurus-calibration-bf.bin");
