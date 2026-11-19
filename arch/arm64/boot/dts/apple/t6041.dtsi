@@ -485,3 +485,51 @@
 				     0x228004000 0x2281d62fc
 				     0x22a004000 0x22a1d62fc>;
 };
+
+/*
+ * The SIO coprocessor is part of every T6041 and has no board wiring: iBoot
+ * loads its firmware on every board, and the boot loader enables the SIO
+ * node, which it finds by the alias, once it has reserved that firmware and
+ * published the T6041 boot tables. The PMGR has UART_P (0x1a0) and DPA_P
+ * (0x1a8) under SIO.
+ */
+/ {
+	aliases {
+		sio = &sio;
+	};
+};
+
+&pmgr {
+	ps_uart_p: power-controller@1a0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart_p";
+		power-domains = <&ps_sio>;
+	};
+
+	ps_dpa_p: power-controller@1a8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa_p";
+		power-domains = <&ps_sio>;
+		apple,always-on;
+	};
+};
+
+/* The SIO firmware drives the SPI, UART and DP audio shims: keep their parents on. */
+&ps_sio_cpu {
+	power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
+};
