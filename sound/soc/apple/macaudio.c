@@ -184,10 +184,15 @@ struct macaudio_platform_cfg {
 	 */
 	bool spk_secondary_only;
 	/*
-	 * No voltage or current sense reaches the AP, so no protection daemon
-	 * can govern the speakers: their SN012776 volumes stay under safe_vol,
-	 * locked, unlocked or granted alike, and there is no sense PCM. A
-	 * granted lease runs them at safe_vol, its operating gain.
+	 * Keep SN012776 speaker volumes capped at safe_vol even under a
+	 * granted lease, and omit the sense PCM, for models without a
+	 * full-scale protection model. Models without V/I sense that leave
+	 * this false (e.g. J773g) run at 0 dB under a granted lease while a
+	 * feed-forward protection daemon governs the signal path in software
+	 * and renews the lease; if the daemon dies or stops renewing,
+	 * spk_lease_timer closes the start gate, spk_stop_worker stops active
+	 * streams, and spk_expire_work returns the amp to the muted floor (0)
+	 * within the lease window.
 	 */
 	bool spk_fixed_ceiling;
 };
@@ -2674,9 +2679,6 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 				}
 			}
 			ma->has_speakers = 1;
-			if (ma->cfg->amp != AMP_SSM3515 && ma->cfg->safe_vol != 0 &&
-			    !ma->cfg->spk_fixed_ceiling)
-				ma->has_sense = 1;
 		}
 
 		cpu = of_get_child_by_name(np, "cpu");
@@ -2756,6 +2758,13 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 
 			link_props->is_speakers = speakers;
 			link_props->is_headphones = !speakers;
+			if (speakers && ma->cfg->amp != AMP_SSM3515 &&
+			    ma->cfg->safe_vol != 0 && !ma->cfg->spk_fixed_ceiling) {
+				if (!ma->cfg->fe_cpu_is_platform ||
+				    of_property_match_string(link->cpus->of_node,
+							     "dma-names", "sense") >= 0)
+					ma->has_sense = 1;
+			}
 			if (speakers && ma->cfg->spk_dai_fmt)
 				link->dai_fmt = ma->cfg->spk_dai_fmt;
 
@@ -4246,13 +4255,12 @@ struct macaudio_platform_cfg macaudio_j604_cfg = {
 };
 
 /*
- * J575c (Mac Studio, M4 Max): the J616s stream, six 32-bit playback and
- * twelve 16-bit sense slots in the same 250-bit frame (the firmware runs it
- * so, although the ADT's audio-speaker lists one playback slot), with one
- * SN012776 on the first two playback slots (it downmixes them) and the
- * first two sense slots (current, then voltage), which speakersafetyd's
- * J575 model reads. The front-end carries all six channels; the last four
- * are silent.
+ * J575c (Mac Studio, M4 Max) and J773g (Mac mini, M4): the J616s AOP speaker
+ * stream (six 32-bit playback slots in a 250-BCLK frame, with one SN012776 on
+ * the front slots). Whether V/I sense is exposed is derived from the speaker
+ * CPU DAI node's "sense" DMA channel: J575c provides it, while J773g has no
+ * sense channel and is governed under a lease by a feed-forward protection
+ * daemon. The headphone jack is a separate card.
  */
 struct macaudio_platform_cfg macaudio_j575c_cfg = {
 	.enable_speakers = true,
@@ -4443,6 +4451,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j773-macaudio", .data = &macaudio_j575c_j773_cfg },
 	/* j773    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j773-macaudio-jack", .data = &macaudio_j616_jack_cfg },
+	/* j773g   -       sn012776    15      1x 1W    (AOP-fed, no V/I sense) */
+	{ .compatible = "apple,j773g-macaudio", .data = &macaudio_j575c_cfg },
 	/* j873    AID48   sn012776    15      1x 1W    (AOP-fed, no protection) */
 	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
 	/* j813    AID?    sn012776    15      2x 1W+1T (AOP-fed, V/I sense) */
