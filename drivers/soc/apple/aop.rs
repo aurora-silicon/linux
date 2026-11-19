@@ -1854,6 +1854,60 @@ impl AopData {
         result
     }
 
+    fn bootargs_has_ed0p(
+        aop_mmio: &Mmio<'_, Region<AOP_MMIO_SIZE>>,
+        word_access: bool,
+    ) -> Result<bool> {
+        let offset = aop_mmio.read32(BOOTARGS_OFFSET) as usize;
+        let size = aop_mmio.read32(BOOTARGS_SIZE) as usize;
+        if offset > aop_mmio.size() || size > aop_mmio.size() - offset {
+            return Err(EINVAL);
+        }
+        let start = if word_access { offset & !3 } else { offset };
+        let end = if word_access {
+            (offset + size).checked_add(3).ok_or(EINVAL)? & !3
+        } else {
+            offset + size
+        };
+        if end > aop_mmio.size() || (word_access && size == 0) {
+            return Err(EINVAL);
+        }
+        let mut bytes = KVec::<u8>::from_elem(0, end - start, GFP_KERNEL)?;
+        let aop_io_array: Mmio<'_, [u8; AOP_MMIO_SIZE]> = aop_mmio.try_cast()?;
+        let bootargs = io_project!(aop_io_array, [try: offset .. offset+size]);
+        if word_access {
+            for (i, chunk) in bytes.chunks_exact_mut(4).enumerate() {
+                chunk.copy_from_slice(&aop_mmio.try_read32(start + i * 4)?.to_le_bytes());
+            }
+        } else {
+            bootargs.copy_to_slice(&mut bytes);
+        }
+        let ed0p_key = from_fourcc(b"ED0p");
+        let mut seen = false;
+        let first = offset - start;
+        let arg_bytes = &bytes[first..first + size];
+        let mut idx = 0;
+        while idx < size {
+            if size - idx < 8 {
+                return Err(EINVAL);
+            }
+            let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
+            let len = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
+            idx += 8;
+            if len > size - idx {
+                return Err(EINVAL);
+            }
+            if key == ed0p_key {
+                if seen || len != mem::size_of::<u64>() {
+                    return Err(EINVAL);
+                }
+                seen = true;
+            }
+            idx += len;
+        }
+        Ok(seen)
+    }
+
     fn patch_bootargs(
         &self,
         aop_mmio: &Mmio<'_, Region<AOP_MMIO_SIZE>>,
@@ -2043,11 +2097,14 @@ impl AopData {
     /// (one to one when the IOVA is the physical address, translated
     /// otherwise), so they are only checked here. Every page has to be mapped
     /// where the DT says, with the external code (`__ETEXT`) at `ec0p`.
-    /// Other segments may also use translated IOVAs: macOS 27 firmware adds
-    /// `__EDATA` after the external code, while `__OS_LOG` remains
-    /// identity-mapped. Returns the unique additional translated region for
-    /// `ED0p`, if any, requiring it to follow and not overlap `__ETEXT`.
-    fn check_fw_regions(dev: &device::Device, ec0p: u64) -> Result<Option<(u64, u64)>> {
+    /// When the firmware bootargs declare `ED0p` (`allow_ed0p`), macOS 27
+    /// firmware may also supply one translated `__EDATA` segment after
+    /// `__ETEXT`, while `__OS_LOG` remains identity-mapped.
+    fn check_fw_regions(
+        dev: &device::Device,
+        ec0p: u64,
+        allow_ed0p: bool,
+    ) -> Result<Option<(u64, u64)>> {
         // SAFETY: `dev` is a live device being probed.
         let np = unsafe { (*dev.as_raw()).of_node };
         if np.is_null() {
@@ -2096,9 +2153,21 @@ impl AopData {
                 }
                 etext = true;
                 etext_end = iova + size;
-            } else if iova != phys && external_data.replace((iova, size)).is_some() {
-                dev_err!(dev, "Multiple translated external data regions");
-                return Err(EINVAL);
+            } else if iova != phys {
+                if !allow_ed0p {
+                    dev_err!(
+                        dev,
+                        "Firmware memory-region {} is translated without ED0p ({:#x} != {:#x})",
+                        idx,
+                        iova,
+                        phys
+                    );
+                    return Err(EINVAL);
+                }
+                if external_data.replace((iova, size)).is_some() {
+                    dev_err!(dev, "Multiple translated external data regions");
+                    return Err(EINVAL);
+                }
             }
             let mut off = 0;
             while off < size {
@@ -3203,9 +3272,12 @@ impl platform::Driver for AopDriver {
         let asc_req = pdev.io_request_by_index(1).ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
         let asc_mmio = asc_mmio.as_view().relaxed();
+        let aop_mmio = aop_mmio.as_view();
         let ed0p = if cfg.fw_regions {
             // Before anything is written to the AOP: no mapping, no start.
-            AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p)?.map(|(iova, _)| iova)
+            let allow_ed0p = cfg.patch_bootargs
+                && AopData::bootargs_has_ed0p(&aop_mmio, cfg.bootargs_word_access)?;
+            AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p, allow_ed0p)?.map(|(iova, _)| iova)
         } else {
             None
         };
@@ -3213,7 +3285,6 @@ impl platform::Driver for AopDriver {
         // Whatever fails below leaves the AOP running and its children
         // registering; the same teardown as unbind's cleans that up.
         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
-        let aop_mmio = aop_mmio.as_view();
         if cfg.patch_bootargs {
             data.patch_bootargs(
                 &aop_mmio,
