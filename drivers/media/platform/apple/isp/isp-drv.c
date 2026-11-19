@@ -300,13 +300,14 @@ static void apple_isp_select_hw(struct apple_isp *isp)
 		of_parse_phandle(dev->of_node, "iommus", 0);
 
 	/*
-	 * T6041 has six AMCCs on binned parts and eight on full-die parts.
-	 * Trim the mapped DSID windows and broadcast-clear count to the AMCC
-	 * ranges described on isp_dart0 (falling back to the six common AMCCs
-	 * when apple,dapf-ranges is absent).
+	 * apple,t6041-isp is also the T6040 ISP: T6040 has four AMCCs, T6041
+	 * six on binned parts and eight on full-die parts. Trim the mapped DSID
+	 * windows and broadcast-clear count to the AMCC ranges described on
+	 * isp_dart0. Without them, keep the four that every part has, as
+	 * before T6041's own windows were described.
 	 */
 	if (of_device_is_compatible(dev->of_node, "apple,t6041-isp")) {
-		unsigned int amccs = 6;
+		unsigned int amccs = 4;
 		int n = dart ? of_property_count_u64_elems(dart, "apple,dapf-ranges") : -EINVAL;
 
 		if (n > 0 && !(n % 2)) {
@@ -321,7 +322,7 @@ static void apple_isp_select_hw(struct apple_isp *isp)
 				    !((start - 0x220004000ULL) % 0x2000000ULL))
 					found++;
 			}
-			if (found >= 6 && found <= 8)
+			if (found >= 4 && found <= 8)
 				amccs = found;
 		}
 		hw->dsid_count = amccs;
