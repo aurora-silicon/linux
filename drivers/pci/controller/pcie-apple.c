@@ -5426,8 +5426,7 @@ static void apple_pcie_t6050_sleep_probe(struct platform_device *pdev, struct ap
 {
 	struct apple_pcie_port *port;
 
-	if (pcie->managed_sids || !(of_machine_is_compatible("apple,j714s") ||
-				    of_machine_is_compatible("apple,j716c")))
+	if (pcie->managed_sids || !apple_t6050_sleep_described())
 		return;
 	/* The one port a boot loader trained; an endpoint Linux powers is parked instead. */
 	list_for_each_entry(port, &pcie->ports, entry)
