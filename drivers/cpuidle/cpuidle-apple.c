@@ -10,13 +10,45 @@
 #include <linux/cpu_pm.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
+#include <linux/soc/apple/cpuidle.h>
 #include <asm/cpuidle.h>
 
 enum idle_state {
 	STATE_WFI,
+	STATE_PARK,
 	STATE_PWRDOWN,
 	STATE_COUNT
 };
+
+/*
+ * Cluster performance-state parking, see <linux/soc/apple/cpuidle.h>. Set
+ * and cleared with cpuidle paused, so no CPU is inside an enter callback
+ * then: every parking enter is matched by the exit of the same ops.
+ */
+static const struct apple_cpuidle_park_ops *apple_park_ops;
+
+int apple_cpuidle_set_park_ops(const struct apple_cpuidle_park_ops *ops)
+{
+	int ret = 0;
+
+	cpuidle_pause_and_lock();
+	if (apple_park_ops)
+		ret = -EBUSY;
+	else
+		WRITE_ONCE(apple_park_ops, ops);
+	cpuidle_resume_and_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_cpuidle_set_park_ops);
+
+void apple_cpuidle_clear_park_ops(const struct apple_cpuidle_park_ops *ops)
+{
+	cpuidle_pause_and_lock();
+	if (apple_park_ops == ops)
+		WRITE_ONCE(apple_park_ops, NULL);
+	cpuidle_resume_and_unlock();
+}
+EXPORT_SYMBOL_GPL(apple_cpuidle_clear_park_ops);
 
 asm(
 	".pushsection .cpuidle.text, \"ax\"\n"
@@ -65,8 +97,27 @@ static __cpuidle int apple_enter_wfi(struct cpuidle_device *dev, struct cpuidle_
 	return index;
 }
 
+/* WFI with the cluster parked once all of its CPUs idle like this. */
+static __cpuidle int apple_enter_park(struct cpuidle_device *dev,
+				      struct cpuidle_driver *drv, int index)
+{
+	const struct apple_cpuidle_park_ops *ops = READ_ONCE(apple_park_ops);
+
+	if (ops)
+		ops->enter(dev->cpu);
+	ct_cpuidle_enter();
+	cpu_do_idle();
+	ct_cpuidle_exit();
+	if (ops)
+		ops->exit(dev->cpu);
+
+	return index;
+}
+
 static __cpuidle int apple_enter_idle(struct cpuidle_device *dev, struct cpuidle_driver *drv, int index)
 {
+	const struct apple_cpuidle_park_ops *ops;
+
 	/*
 	 * Deep WFI will clobber FP state, among other things.
 	 * The CPU PM notifier will take care of saving that and anything else
@@ -75,6 +126,9 @@ static __cpuidle int apple_enter_idle(struct cpuidle_device *dev, struct cpuidle
 	if (cpu_pm_enter())
 		return -1;
 
+	ops = READ_ONCE(apple_park_ops);
+	if (ops)
+		ops->enter(dev->cpu);
 	ct_cpuidle_enter();
 
 	switch(index) {
@@ -87,6 +141,8 @@ static __cpuidle int apple_enter_idle(struct cpuidle_device *dev, struct cpuidle
 	}
 
 	ct_cpuidle_exit();
+	if (ops)
+		ops->exit(dev->cpu);
 
 	cpu_pm_exit();
 
@@ -106,6 +162,21 @@ static struct cpuidle_driver apple_idle_driver = {
 			.name			= "WFI",
 			.desc			= "CPU clock-gated",
 			.flags			= 0,
+		},
+		/*
+		 * The first CPU to wake from a parked cluster restores its
+		 * performance state: one transition, about 50 us, while it
+		 * runs. Worth it for idle periods of a millisecond or more.
+		 */
+		[STATE_PARK] = {
+			.enter			= apple_enter_park,
+			.enter_s2idle		= apple_enter_park,
+			.exit_latency		= 50,
+			.target_residency	= 1000,
+			.power_usage            = UINT_MAX / 2,
+			.name			= "WFI-park",
+			.desc			= "WFI, cluster at its slowest",
+			.flags			= CPUIDLE_FLAG_RCU_IDLE,
 		},
 		[STATE_PWRDOWN] = {
 			.enter			= apple_enter_idle,
@@ -136,12 +207,13 @@ static int apple_cpuidle_probe(struct platform_device *pdev)
 	/*
 	 * CPU PD writes CYC_OVRD, which only M1 to M3 let the OS write. From
 	 * M4 on it is locked and the write is undefined, and WFI already
-	 * power-gates an idle core, so both entries use WFI. Keep index 1:
-	 * the generic s2idle selector skips fallback index 0, otherwise
-	 * tick_freeze() and timekeeping suspension are never reached.
+	 * power-gates an idle core, so the deepest state there is WFI with
+	 * the cluster parked. Keep a state above index 0: the generic s2idle
+	 * selector skips fallback index 0, otherwise tick_freeze() and
+	 * timekeeping suspension are never reached.
 	 */
 	if (!of_machine_compatible_match(apple_cyc_ovrd_machines))
-		apple_idle_driver.states[STATE_PWRDOWN] = apple_idle_driver.states[STATE_WFI];
+		apple_idle_driver.state_count = STATE_PWRDOWN;
 
 	return cpuidle_register(&apple_idle_driver, NULL);
 }
