@@ -12,6 +12,9 @@
  * Copyright The Asahi Linux Contributors
  */
 
+/* The Neural Engine (t6050-ane.dtsi, through t6050-peripherals.dtsi) */
+#define T6050_ANE
+
 /dts-v1/;
 
 #define T6050_J714C
