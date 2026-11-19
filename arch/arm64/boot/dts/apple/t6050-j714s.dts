@@ -717,6 +717,23 @@
 #include "t6050-j714s-sleep-soc.dtsi"
 #include "t6050-j714s-sleep-adt.dtsi"
 
+/* A merged mode's pair is given only while every external display has an engine */
+&dcpext0 {
+	apple,merged-mode-limit;
+};
+
+&dcpext1 {
+	apple,merged-mode-limit;
+};
+
+&dcpext2 {
+	apple,merged-mode-limit;
+};
+
+&dcpext3 {
+	apple,merged-mode-limit;
+};
+
 /* The display coprocessors take the sleep through their firmware 27 method table */
 &sleep {
 	apple,display-method-sleep;
