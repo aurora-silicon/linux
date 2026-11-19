@@ -30,6 +30,20 @@ impl ApplicationJob {
             guard:None,scene,generation:0,retired:true,client_frames:0,scratch:None},GFP_KERNEL)?)
     }
     pub(crate) fn frame(&self) -> Frame {Frame::new(self.generation).expect("admitted frame")}
+    /// Grow the PB of the frame in flight for a firmware TVB grow request
+    /// naming its slot and context. The client aliases join the client's
+    /// other PB aliases; a later client maps every block afresh.
+    pub(crate) fn grow_parameter_buffer(&mut self, dev: &AsahiDrmDevice, buffer_slot: u32,
+        vm_slot: u32) -> Result<u32> {
+        use crate::g18::uapi::render_policy::{PB_GROW_BLOCKS,PB_MAX_BLOCKS};
+        if self.retired || buffer_slot!=self.job.parameter_buffer.command_fields().pb_slot
+            || vm_slot!=u32::from(self.job.context_id()) {return Err(ENOENT);}
+        self.user_aliases.reserve(2,GFP_KERNEL)?;
+        let vm=self.job.vm().clone();
+        let (added,aliases)=self.job.parameter_buffer.grow(dev,&self.storage,&vm,PB_GROW_BLOCKS,PB_MAX_BLOCKS)?;
+        for alias in aliases {let _=self.user_aliases.push_within_capacity(alias);}
+        Ok(added)
+    }
     /// The last frame kicked to both graphics queues (0 before the first).
     pub(crate) fn submitted_generation(&self) -> u32 {self.generation}
     pub(crate) fn quarantine(&mut self) {
