@@ -273,15 +273,12 @@ pub(crate) struct CoreLayout {
 
 /// Where a G17 target's crash log buffers live.
 pub(crate) enum CrashBuffers {
-    /// One buffer per [`Role`] that the firmware requests at a fixed address of the kernel
-    /// lower root, mapped by the driver before the coprocessors start.
-    Fixed([FixedBuffer; 2]),
     /// The firmware places its crash log in its own data segment, the `fw-data` reserved
     /// region, and asks for it there by physical address.
     FirmwareData,
     /// As [`CrashBuffers::FirmwareData`] when the boot loader describes the data segment as
-    /// the `fw-data` region. A boot loader that does not gets the driver's own buffers, as
-    /// [`CrashBuffers::Fixed`], at the low bits of the physical address the firmware asks for;
+    /// the `fw-data` region. A boot loader that does not gets the driver's own buffers, one per
+    /// [`Role`], at the low bits of the physical address the firmware asks for;
     /// the firmware does not write its crash log there.
     FirmwareDataOrFixed([FixedBuffer; 2]),
 }
@@ -369,7 +366,7 @@ pub(crate) struct CrashLog {
 
 /// The CPU mapping of a crash log buffer.
 enum CrashLogMap {
-    /// The driver's buffer ([`CrashBuffers::Fixed`]).
+    /// The driver's buffer ([`CrashBuffers::FirmwareDataOrFixed`]).
     Object(shmem::VMapOwned<AsahiObject>),
     /// A buffer in the firmware's data segment ([`CrashBuffers::FirmwareData`]).
     FirmwareData(data_segment::DataSegmentLog),
@@ -562,7 +559,6 @@ impl Coprocessor {
     ) -> Result<Coprocessor> {
         let index = role as usize;
         let fixed = match &cfg.crash_buffers {
-            CrashBuffers::Fixed(buffers) => Some(buffers),
             CrashBuffers::FirmwareData => None,
             CrashBuffers::FirmwareDataOrFixed(buffers) => {
                 let described = data_segment::described(dev.as_ref().as_ref());
@@ -898,18 +894,6 @@ impl Firmware {
             return Ok(());
         }
         power::release(self)
-    }
-
-    /// Retry a temporarily unavailable transaction once under a registration
-    /// power hold. Other access errors propagate to the retained owner.
-    fn submit_m5_work(&mut self, submission: &fw::m5::queue::HardwareSubmission) -> Result {
-        match self.bridge.regs.submit_m5_work(submission) {
-            Err(error) if error == EAGAIN => {
-                self.acquire_registration_power()?;
-                self.bridge.regs.submit_m5_work(submission)
-            }
-            result => result,
-        }
     }
 
     /// Both outer slots and their capacity are checked before any host-port

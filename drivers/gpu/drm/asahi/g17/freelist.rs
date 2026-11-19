@@ -78,10 +78,6 @@ impl RenderIds {
         }), GFP_KERNEL)
     }
 
-    pub(crate) fn availability(&self) -> &Arc<super::availability::Availability> {
-        &self.available
-    }
-
     fn pin(self: &Arc<Self>, cell: &Arc<RenderIdCell>, assigned: impl FnOnce()) -> Result<RenderIdPin> {
         let mut state = self.state.lock();
         let slot = cell.slot.load(Ordering::Acquire);
@@ -1116,9 +1112,6 @@ impl ComputePool {
     pub(crate) fn descriptor(&self) -> Result<PoolDescriptor> {
         self.pages.as_ref().ok_or(EAGAIN)?.descriptor(self.id)
     }
-    pub(crate) fn completed_submissions(&self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.completed_bytes()?))
-    }
     fn completed_bytes(&self) -> Result<[u8; 8]> {
         let offset = if self.m5 { super::fw::m5::pool::completed_offset() } else { FreeListControl::COMPLETED };
         let pointer = self.control.pointer(offset, 8)?;
@@ -1390,10 +1383,6 @@ impl Lease {
         }
         self.phase = LeasePhase::ReleaseSent(cursor);
         Ok(())
-    }
-    /// Only sent releases and inherited release witnesses consume cursors.
-    pub(crate) fn needs_release_observation(&self) -> bool {
-        self.previous_release.is_some() || matches!(self.phase, LeasePhase::ReleaseSent(_))
     }
 
     /// Observes all older release records passed by one consumer snapshot.

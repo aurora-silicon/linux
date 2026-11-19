@@ -844,16 +844,8 @@ impl InitData {
         Ok(values)
     }
 
-    /// Publishes an M5 compute record on the shared compute ring under the device mutex.
-    pub(super) fn publish_work(
-        &self,
-        priority: u8,
-        record: &super::fw::channels::WorkSlot,
-    ) -> Result<u32> {
-        self.publish_work_at(priority, record, None)
-    }
-
-    /// [`Self::publish_work`] against the cursors of a room check made earlier under the same
+    /// Publishes an M5 compute record on the shared compute ring under the device mutex,
+    /// against the cursors of a room check made earlier under the same
     /// hold of the device mutex ([`Self::m5_compute_room`]), or a fresh read for None.
     pub(super) fn publish_work_at(
         &self,
