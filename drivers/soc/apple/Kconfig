@@ -285,11 +285,13 @@ config APPLE_T8132_PLATFORM_HANDOFF
 	depends on OF_DYNAMIC && OF_FLATTREE
 	default y if APPLE_PMP
 	help
-	  Supply missing cache and PMC descriptions, and the J713 board's PMGR
-	  availability/ownership policy, for the original loader tree before devices
-	  are populated. Native memory-controller descriptions take precedence.
-	  Required for that legacy tree to keep inaccessible PMGR domains from
-	  probing; kernels using the complete J713 DT do not require this adapter.
+	  Supply missing cache and PMC descriptions for the original J713
+	  loader tree, and the T8132 PMGR availability/ownership policy for
+	  every T8132 tree, before devices are populated. Native
+	  memory-controller descriptions take precedence. Required to keep
+	  PMGR domains the firmware owns from being switched. With it, a T8132
+	  power state it could not mark is not registered; without it every
+	  T8132 power state is registered as the tree describes it.
 
 config APPLE_T8132_PLATFORM_KUNIT_TEST
 	tristate "KUnit tests for T8132 platform descriptions" if !KUNIT_ALL_TESTS

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Supply missing platform descriptions for the original J713 loader ABI,
- * which the J715 shares, and the M4 PMGR ownership policy on the qualified
- * firmware for every M4 Mac.
+ * which the J715 shares, and the M4 PMGR ownership policy for every T8132
+ * tree: the policy describes the SoC's power manager, whatever the firmware.
  * Keep the shared m1n1 payload usable by the stable kernel. Hardware control
  * remains in the ordinary MCC, PMC and CLPC drivers, with one DTS data source.
  * J713 PMGR ownership/status also comes from its board DTS, before any domain
@@ -319,7 +319,7 @@ static int __init t8132_platform_handoff(void)
 	unsigned int added = 0, changed = 0;
 	int root, node, ret;
 
-	if (!apple_t8132_firmware_path() || !of_machine_is_compatible("apple,t8132"))
+	if (!of_machine_is_compatible("apple,t8132"))
 		return 0;
 	if (fdt_check_header(data))
 		return -EINVAL;

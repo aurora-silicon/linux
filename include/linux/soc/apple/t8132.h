@@ -32,9 +32,10 @@ static inline bool apple_t8132_pro_mini_imac(void)
 }
 
 /*
- * The OS firmware the M4 PMP, PMGR ownership, display and GPU paths are
- * qualified on, as the boot loader reports it: macOS 26.6.2 (iBoot
- * mBoot-18000.161.10). These paths depend on the firmware, not the board.
+ * The OS firmware the M4 PMP, display and GPU paths are qualified on, as
+ * the boot loader reports it: macOS 26.6.2 (iBoot mBoot-18000.161.10).
+ * These paths depend on the firmware, not the board. The PMGR ownership
+ * policy does not: the platform handoff applies it on any firmware.
  */
 static inline bool apple_t8132_qualified_firmware(void)
 {
