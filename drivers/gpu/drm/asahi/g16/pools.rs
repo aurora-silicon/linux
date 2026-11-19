@@ -80,6 +80,8 @@ pub(crate) struct PbStats {
 
 pub(crate) struct PoolSet {
     units: KVec<Allocator>,
+    /// Blocks of the shared heap (the PB managers' lists cover the whole 256 MiB window).
+    heap_blocks: u32,
 }
 
 fn alloc(
@@ -216,9 +218,12 @@ impl Allocator {
 }
 impl PoolSet {
     pub(crate) fn new(o: &mut Objects) -> Result<Self> {
+        // The firmware copes with a full PB without the host (its overflow counters move and
+        // the scene completes), so the heap is sized well below the 256 MiB window.
+        let heap_blocks = super::params::pb_heap_blocks().min(buffer::MAX_BLOCKS);
         let heap = alloc(
             o,
-            client::PB_HEAP_SIZE as usize,
+            heap_blocks as usize * buffer::BLOCK_BYTES as usize,
             Class::Shared,
             Some((client::pb_heap(0), pte::LEAF_NC)),
             false,
@@ -227,7 +232,7 @@ impl PoolSet {
         for k in 0..2 {
             units.push(Allocator::new(o, k, &heap)?, GFP_KERNEL)?;
         }
-        Ok(Self { units })
+        Ok(Self { units, heap_blocks })
     }
     #[allow(dead_code)]
     pub(crate) fn allocator_refs_for(&self, k: usize) -> Result<AllocatorRefs> {
@@ -261,6 +266,9 @@ impl PoolSet {
     }
     pub(crate) fn heap_gva(&self, k: usize) -> Result<u64> {
         gva(&self.units.get(k).ok_or(EINVAL)?.heap)
+    }
+    pub(crate) fn heap_blocks(&self) -> u32 {
+        self.heap_blocks
     }
 }
 
@@ -417,18 +425,23 @@ impl PbEpoch {
 
     /// Seed only unpublished storage. A retry may choose another physical slot; after
     /// exposure neither the manager nor any of its firmware-mutated lists is reset.
-    pub(crate) fn prepare(&self, k: usize, heap: u64) -> Result {
-        if k >= 2 || self.exposed.load(Ordering::Acquire) {
+    pub(crate) fn prepare(&self, k: usize, heap: u64, heap_blocks: u32) -> Result {
+        if k >= 2 || self.exposed.load(Ordering::Acquire) || heap_blocks > buffer::MAX_BLOCKS {
             return Err(EINVAL);
         }
+        // Only the backed part of the heap is named; the rest of the lists stays zero.
+        let pages = heap_blocks * buffer::PAGES_PER_BLOCK;
         write_records(&self.pages, buffer::MAX_PAGES as usize, |i| {
-            buffer::page_record(heap, i as u32).to_le_bytes()
+            let i = i as u32;
+            (if i < pages { buffer::page_record(heap, i) } else { 0 }).to_le_bytes()
         })?;
         write_records(&self.blocks, buffer::MAX_BLOCKS as usize, |i| {
-            u64::from(buffer::block_record(heap, i as u32)).to_le_bytes()
+            let b = i as u32;
+            u64::from(if b < heap_blocks { buffer::block_record(heap, b) } else { 0 }).to_le_bytes()
         })?;
-        self.ring.w32(0, buffer::MAX_BLOCKS)?;
-        self.ring.w32(4, buffer::MAX_BLOCKS)?;
+        let posted = super::params::pb_posted_blocks(heap_blocks);
+        self.ring.w32(0, posted)?;
+        self.ring.w32(4, posted)?;
         self.counter.w64(0, 1)?;
         self.manager.write(
             0,

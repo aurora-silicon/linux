@@ -988,7 +988,7 @@ impl Firmware {
             }
             None => {
                 let e = job.resources.pb(job.progress.sent() as usize)?.clone();
-                e.prepare(k, arena.pools.heap_gva(k)?)?;
+                e.prepare(k, arena.pools.heap_gva(k)?, arena.pools.heap_blocks())?;
                 self.pools.stats.fresh += 1;
                 (e, false)
             }
