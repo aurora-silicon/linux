@@ -194,7 +194,8 @@ pub(crate) const PB_REGIONS: &[Region] = &[
     r("pb-metrics-high", PB_METRICS_HIGH, PAGE),
     r("pb-page-list-low", PB_PAGE_LIST_LOW, PB_PAGE_LIST_BYTES as u64),
     r("pb-metrics-low", PB_METRICS_LOW, PAGE), r("pb-scene-scratch", PB_SCENE_SCRATCH, PAGE),
-    r("pb-discard", PB_DISCARD, 0x8000), r("pb-blocks", PB_BLOCKS, 8 * 0x80000),
+    r("pb-discard", PB_DISCARD, 0x8000),
+    r("pb-blocks", PB_BLOCKS, crate::g18::uapi::render_policy::PB_BLOCKS as u64 * 0x80000),
 ];
 const _: () = assert!(nonoverlapping(PB_REGIONS));
 

@@ -4,7 +4,11 @@
 use crate::{g18::fw::render_params::G17pRenderParameters, g18::address_map as va,
     g18::fw::render::G18RenderControls, g18::fw::render_command::*, g18::fw::render_assembly as g18_render_assembly};
 
-pub(crate) const PB_BLOCKS: u32 = 8; // plan: overprovision >=8; no PB growth.
+/// Backed PB blocks. There is no PB growth: a TVB grow request (firmware
+/// event 6) stalls the tiler until the job watchdog, so overprovision. 8
+/// blocks (4 MiB) overflowed on a zoomed map in a browser; 30 fill the
+/// graphics-pb window.
+pub(crate) const PB_BLOCKS: u32 = 30;
 pub(crate) const PB_CAPACITY: u32 = 1650;
 pub(crate) const UMA_BLOCKS: u32 = 24; // 24 MiB > sum of both M5 budgets.
 pub(crate) const USC_REQUIRED: [u64; 2] = [0x7d4000, 0x934000]; // M5 DRM hardware path.
