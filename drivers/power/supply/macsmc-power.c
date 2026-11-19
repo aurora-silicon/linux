@@ -895,6 +895,16 @@ static const struct power_supply_desc macsmc_battery_desc_template = {
 	.property_is_writeable	= macsmc_battery_property_is_writeable,
 };
 
+/*
+ * PDTR is the power the system takes from the adapter (DC in) now, in watts.
+ * With ACPW (what the adapter may deliver) it tells how much of the adapter is
+ * in use; the battery's own power_now tells how much of that goes to charging.
+ */
+static int macsmc_ac_read_power_now(struct macsmc_power *power, int *uw)
+{
+	return apple_smc_read_f32_scaled(power->smc, SMC_KEY(PDTR), uw, 1000000);
+}
+
 static int macsmc_ac_get_property(struct power_supply *psy,
 				  enum power_supply_property psp,
 				  union power_supply_propval *val)
@@ -920,6 +930,9 @@ static int macsmc_ac_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_INPUT_POWER_LIMIT:
 		ret = apple_smc_read_u32(power->smc, SMC_KEY(ACPW), &vu32);
 		val->intval = vu32 * 1000;
+		break;
+	case POWER_SUPPLY_PROP_POWER_NOW:
+		ret = macsmc_ac_read_power_now(power, &val->intval);
 		break;
 	default:
 		return -EINVAL;
@@ -1282,6 +1295,9 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		/* Input power limits are usually available */
 		if (apple_smc_key_exists(power->smc, SMC_KEY(ACPW)))
 			props[nprops++] = POWER_SUPPLY_PROP_INPUT_POWER_LIMIT;
+
+		if (apple_smc_key_exists(power->smc, SMC_KEY(PDTR)))
+			props[nprops++] = POWER_SUPPLY_PROP_POWER_NOW;
 
 		/* macOS 15.4+ firmware dropped legacy AC keys (AC-n, AC-i) */
 		if (apple_smc_read_u16(power->smc, SMC_KEY(AC-n), &vu16) >= 0) {
