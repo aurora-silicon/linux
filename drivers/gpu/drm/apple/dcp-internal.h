@@ -353,6 +353,12 @@ struct apple_dcp_hw_data {
 	 * properties after it are not parsed (afk_recv_handle_init()).
 	 */
 	bool afk_announced_names;
+	/*
+	 * How long AFK waits for the firmware to start or stop an endpoint
+	 * and to answer a command or service call (afk_timeout_ms()); zero
+	 * for one second.
+	 */
+	unsigned int afk_timeout_ms;
 };
 
 enum dcp_test_point {
