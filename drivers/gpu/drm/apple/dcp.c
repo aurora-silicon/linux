@@ -7658,8 +7658,11 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	void *group;
 	int ret;
 
-	if (hw->firmware_compat == DCP_FIRMWARE_IBOOT)
+	if (hw->firmware_compat == DCP_FIRMWARE_IBOOT) {
+		/* The port controllers wait for the USB-C display switches. */
+		t8152_typec_register(dev);
 		return dcp_platform_probe_iboot(pdev);
+	}
 
 	/* t6041_dcpext=0: stay off the external processors' hardware. */
 	if (of_device_is_compatible(dev->of_node, "apple,t6041-dcpext") &&
@@ -9893,6 +9896,7 @@ int __init dcp_register(void)
 void dcp_unregister(void)
 {
 	platform_driver_unregister(&apple_platform_driver);
+	t8152_typec_unregister();
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
