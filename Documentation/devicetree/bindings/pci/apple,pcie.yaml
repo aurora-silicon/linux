@@ -191,6 +191,15 @@ properties:
       sequence. T600x and T8112 use the Intr2AXI bridge and require tunables
       for their associated DART before the tunnel children can be populated.
 
+  apple,s2idle-retain-adopted-links:
+    type: boolean
+    description: |
+      This board's suspend-to-idle has been qualified with the links the boot
+      loader trained ("adopted") left running: the host keeps its root ports,
+      DART and adopted devices in D0 across s2idle instead of resetting them.
+      Without it, suspend-to-idle on a host with an adopted link is refused
+      with -EBUSY.
+
   apple,tunable-rc:
     $ref: '#/$defs/tunable'
     description: Root-complex register initialization tuples.

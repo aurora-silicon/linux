@@ -6769,15 +6769,15 @@ static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
 	int error = 0;
 
 	/*
-	 * Qualified on the J716c, the K114c, the K116s and the J714s: the same
-	 * T6050 host with the N1 adopted on port 0. The K116s and the J714s
-	 * (16- and 14-inch M5 Pro) also have a kernel-trained SD reader port.
-	 * Other adopted platforms and deeper sleep remain unqualified.
+	 * Only boards whose device tree says their s2idle has been qualified
+	 * with adopted links (apple,s2idle-retain-adopted-links): so far the
+	 * J716c, the K114c, the K116s and the J714s, the same T6050 host with
+	 * the N1 adopted on port 0. The K116s and the J714s (16- and 14-inch
+	 * M5 Pro) also have a kernel-trained SD reader port. Deeper sleep
+	 * remains unqualified.
 	 */
-	if (!(of_machine_is_compatible("apple,j716c") ||
-	      of_machine_is_compatible("apple,k114c") ||
-	      of_machine_is_compatible("apple,k116s") ||
-	      of_machine_is_compatible("apple,j714s")) || !pm_suspend_no_platform())
+	if (!of_property_read_bool(pcie->dev->of_node, "apple,s2idle-retain-adopted-links") ||
+	    !pm_suspend_no_platform())
 		return -EBUSY;
 
 	if (!(readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN) ||

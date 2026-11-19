@@ -83,6 +83,9 @@
 };
 
 &pcie0 {
+	/* s2idle qualified with the N1 link adopted (pcie-apple.c) */
+	apple,s2idle-retain-adopted-links;
+
 	reg = <0x1c 0xb0000000 0x0 0x10000000>,
 	      <0x4 0x14000000 0x0 0x4000>,
 	      <0x4 0x10028000 0x0 0x8000>,
