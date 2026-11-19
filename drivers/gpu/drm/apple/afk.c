@@ -3286,11 +3286,20 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 			goto err_put_service;
 	}
 
-	rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
-				   GFP_KERNEL);
-	if (!rxbuf) {
-		ret = -ENOMEM;
-		goto err_put_service;
+	/*
+	 * A command without output carries no reply buffer: firmware that
+	 * answers some commands with a status alone asserts when it is given
+	 * one, since it then copies an empty reply.
+	 */
+	rxbuf = NULL;
+	rxbuf_dma = 0;
+	if (output_len) {
+		rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
+					   GFP_KERNEL);
+		if (!rxbuf) {
+			ret = -ENOMEM;
+			goto err_put_service;
+		}
 	}
 	txbuf = dma_alloc_coherent(ep->dcp->dev, payload_len, &txbuf_dma,
 				   GFP_KERNEL);
@@ -3448,7 +3457,7 @@ err_free_txbuf:
 	if (!dcp_is_ext26(ep->dcp))
 		dma_free_coherent(ep->dcp->dev, payload_len, txbuf, txbuf_dma);
 err_free_rxbuf:
-	if (!dcp_is_ext26(ep->dcp))
+	if (rxbuf && !dcp_is_ext26(ep->dcp))
 		dma_free_coherent(ep->dcp->dev, output_len, rxbuf, rxbuf_dma);
 err_put_service:
 	afk_service_put(service);
