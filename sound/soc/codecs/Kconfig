@@ -1005,8 +1005,9 @@ config SND_SOC_CS42L42_TEST
 	help
 	  This builds KUnit tests for the clock switching that the
 	  Cirrus Logic cs42l42 codec driver does when a stream is
-	  muted or unmuted, including PCM resume refusal and prepare recovery.
-	  These tests use built-in ALSA/ASoC entry points.
+	  muted or unmuted, including the unmute that a card resume holds
+	  until the host has triggered the stream again. These tests use
+	  built-in ALSA/ASoC entry points.
 
 	  For more information on KUnit and unit tests in general,
 	  please refer to the KUnit documentation in
