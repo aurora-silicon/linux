@@ -78,6 +78,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/string-array
     description: One name per apple,check-ps-b4-sleep entry.
 
+  apple,pinctrl:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The AP pin controller, whose pins a deep sleep resets.
+
+  apple,pinctrl-skip-pins:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Pins neither saved nor restored.
+
 required:
   - compatible
   - reg
