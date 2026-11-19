@@ -471,3 +471,5 @@
 &jpeg1 {
 	status = "okay";
 };
+
+#include "t8142-j813-j815-sleep.dtsi"
