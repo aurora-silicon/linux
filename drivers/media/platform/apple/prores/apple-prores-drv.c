@@ -749,7 +749,6 @@ struct apr_stats_regs {
 /* Selected only by the DT compatible, before mapping any resources. */
 struct apr_variant {
 	int (*build_desc)(const struct apr_frame *f, u8 *desc);
-	bool has_decoder;
 	struct apr_stats_regs stats[2];
 	const struct apr_tunable *engine_tunables;
 	size_t num_engine_tunables;
@@ -773,7 +772,6 @@ struct apr_variant {
 
 static const struct apr_variant apr_t8140 = {
 	.build_desc = apr_build_desc,
-	.has_decoder = true,
 	.stats = {
 		{ APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE },
 		{ APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE },
@@ -791,7 +789,6 @@ static const struct apr_variant apr_t8140 = {
 
 static const struct apr_variant apr_t6000 = {
 	.build_desc = apr_build_desc_v0,
-	.has_decoder = true,
 	.stats = { { 0x278, 0x27c, 0x280 }, { 0x358, 0x35c, 0x360 } },
 	.engine_tunables = apr_t6000_engine_tunables,
 	.num_engine_tunables = ARRAY_SIZE(apr_t6000_engine_tunables),
@@ -2185,9 +2182,13 @@ static int apr_probe(struct platform_device *pdev)
 	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
 	video_set_drvdata(vdev, apr);
 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, APPLE_M2M_VIDEO_NR);
-	if (ret || !apr->variant->has_decoder)
+	if (ret)
 		return ret;
 
+	/*
+	 * Every APR engine is a ProRes encode and decode engine (the decode
+	 * descriptor shares the encoder's ring), so each one gets a decoder node.
+	 */
 	vdev = &apr->dec_vdev;
 	strscpy(vdev->name, APR_NAME "-decode", sizeof(vdev->name));
 	vdev->fops = &apr_fops;
@@ -2208,8 +2209,7 @@ static void apr_remove(struct platform_device *pdev)
 {
 	struct apr_dev *apr = platform_get_drvdata(pdev);
 
-	if (apr->variant->has_decoder)
-		video_unregister_device(&apr->dec_vdev);
+	video_unregister_device(&apr->dec_vdev);
 	video_unregister_device(&apr->enc_vdev);
 }
 
