@@ -138,7 +138,11 @@ impl Shared {
                 firmware.engine.shared = Some(self.clone());
             }
             let accepted = firmware.enqueue(job);
-            if accepted.is_ok() {
+            // Nothing is published while a render is in flight: the poll pass after its
+            // retirement publishes this job. Skipping the pass here keeps queued submissions
+            // from holding the device lock (ring drains, health checks) on that path.
+            let render_busy = firmware.engine.flights.iter().any(|f| f.renders != 0);
+            if accepted.is_ok() && !render_busy {
                 if let Err(error) = firmware.publish(&mut done) {
                     firmware.fail_stop(error, &mut done);
                     self.fail_stop(error);
