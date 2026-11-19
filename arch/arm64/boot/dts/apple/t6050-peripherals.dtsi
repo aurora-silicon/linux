@@ -1551,7 +1551,6 @@
 		reg = <0x2 0xa4000000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 1406 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		power-domains = <&ps_atc0_pcie>;
 		status = "disabled";
 	};
 #endif
@@ -1573,7 +1572,6 @@
 		reg = <0x2 0xac000000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 1438 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		power-domains = <&ps_atc1_pcie>;
 		status = "disabled";
 	};
 #endif
@@ -1595,7 +1593,6 @@
 		reg = <0x3 0x84000000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 1470 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		power-domains = <&ps_atc2_pcie>;
 		status = "disabled";
 	};
 #endif
@@ -2629,7 +2626,6 @@
 		      <0x4 0x8a314000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 990 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		power-domains = <&ps_disp_cpu>;
 		status = "disabled";
 	};
 #endif
@@ -2701,7 +2697,6 @@
 		reg = <0x4 0x8a340000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 990 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		power-domains = <&ps_disp_cpu>;
 		status = "disabled";
 	};
 #endif
@@ -3572,7 +3567,6 @@
 		reg = <0x3 0x8c000000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 1502 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		power-domains = <&ps_atc3_pcie>;
 		status = "disabled";
 	};
 #endif

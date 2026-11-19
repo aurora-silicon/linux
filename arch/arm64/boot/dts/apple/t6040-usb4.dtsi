@@ -60,7 +60,6 @@
 			compatible = "apple,t6041-dart", "apple,t8110-dart";
 			reg = <0x1a80000 0xc000>;
 			#iommu-cells = <1>;
-			power-domains = <&ps_atc0_cio>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1789 IRQ_TYPE_LEVEL_HIGH>;
 			status = "disabled";
@@ -158,7 +157,6 @@
 			compatible = "apple,t6041-dart", "apple,t8110-dart";
 			reg = <0x1a80000 0xc000>;
 			#iommu-cells = <1>;
-			power-domains = <&ps_atc1_cio>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1837 IRQ_TYPE_LEVEL_HIGH>;
 			status = "disabled";
@@ -256,7 +254,6 @@
 			compatible = "apple,t6041-dart", "apple,t8110-dart";
 			reg = <0x1a80000 0xc000>;
 			#iommu-cells = <1>;
-			power-domains = <&ps_atc2_cio>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1885 IRQ_TYPE_LEVEL_HIGH>;
 			status = "disabled";
@@ -328,7 +325,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1606 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
-			power-domains = <&ps_atc0_pcie>;
 			status = "disabled";
 		};
 
@@ -400,7 +396,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1638 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
-			power-domains = <&ps_atc1_pcie>;
 			status = "disabled";
 		};
 
@@ -472,7 +467,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1670 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
-			power-domains = <&ps_atc2_pcie>;
 			status = "disabled";
 		};
 
