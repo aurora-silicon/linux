@@ -1082,13 +1082,14 @@ static void dwc3_apple_check_hub_later(struct dwc3_apple *appledwc)
 }
 
 /*
- * Waiting for a Type-C PHY that is not started after sleep is specific to the T6050 boards
- * whose port controllers take the sleep's power states (J714s, J716c). The notifier work
- * and its admission rules apply to every board.
+ * Waiting for a Type-C PHY that is not started after sleep is specific to the T6050 deep
+ * sleep, whose port controllers take the sleep's power states: where the device tree
+ * describes that sleep (apple,t6050-sleep). The notifier work and its admission rules apply
+ * to every board.
  */
 static bool dwc3_apple_sleep_board(void)
 {
-	return of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c");
+	return apple_t6050_sleep_described();
 }
 
 /*
@@ -1472,8 +1473,7 @@ static int dwc3_apple_recover(struct dwc3_apple *appledwc)
 static bool dwc3_apple_tunnel_keep(struct dwc3_apple *appledwc)
 {
 	lockdep_assert_held(&appledwc->lock);
-	if (appledwc->fixed_hub || !(of_machine_is_compatible("apple,j714s") ||
-				     of_machine_is_compatible("apple,j716c")) ||
+	if (appledwc->fixed_hub || !apple_t6050_sleep_described() ||
 	    !of_device_is_compatible(appledwc->dev->of_node, "apple,t6050-dwc3") ||
 	    dwc3_apple_tunnel_phy(appledwc, APPLE_T6050_CIO_USB_KEEP))
 		return false;
