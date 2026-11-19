@@ -453,6 +453,16 @@
 	status = "okay";
 };
 
+/*
+ * The radio's reg-on is the SMC's gP13: the ADT's /amfm function-reg_on is
+ * pKW4("gP13", 0x00800000), so a write is 0x00800000 | level. No readback
+ * of this line is established, so it is write-only.
+ */
+&smc_gpio {
+	apple,output-templates = <0x13 0x00800000>;
+	apple,write-only-outputs = <0x13>;
+};
+
 &port00 {
 	pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
 	reset-gpios = <&pinctrl_ap 163 GPIO_ACTIVE_LOW>;
