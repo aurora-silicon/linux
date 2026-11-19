@@ -306,6 +306,10 @@ static inline void dwc3_apple_mask(struct dwc3_apple *appledwc, u32 offset, u32 
  * of 0xd. Without the enable the core's power management accepts a
  * D0/D3 request but saves and restores nothing, so the PHY's hibernation for a sleep
  * needs it.
+ * This stays on T8140: the power-down scale is the number of suspend clock periods
+ * in one 16 kHz period, so it follows the SoC's suspend clock rate, and T8140 is the
+ * only SoC whose value is known. Another SoC that keeps its core through a deep sleep
+ * needs its own scale before it can set the enable.
  */
 #define DWC3_APPLE_T8140_PWRDNSCALE 0xd
 
