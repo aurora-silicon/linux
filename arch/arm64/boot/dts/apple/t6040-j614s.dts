@@ -216,3 +216,8 @@
 };
 
 #include "t6040-j614s-extdisp-hdmi.dtsi"
+
+/* macOS Low Power mode CPU ceiling: the ADT's cpu-low-power-frequency-max */
+&clpc {
+	apple,low-power-frequency-max-mhz = <2616>;
+};

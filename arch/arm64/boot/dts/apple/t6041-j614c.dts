@@ -96,3 +96,8 @@
 &mesa {
 	firmware-name = "apple/mesacal-j614c.bin", "apple/msrk-j614c.bin";
 };
+
+/* macOS Low Power mode CPU ceiling: the ADT's cpu-low-power-frequency-max */
+&clpc {
+	apple,low-power-frequency-max-mhz = <2616>;
+};
