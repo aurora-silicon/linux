@@ -4287,6 +4287,32 @@ struct macaudio_platform_cfg macaudio_j575c_j773_cfg = {
 };
 
 /*
+ * J773g (T8132, Mac mini M4): one SN012776 on the AOP's speaker stream, the
+ * J713's frame (250 BCLKs of 12 MHz, six 32-bit playback slots, which the
+ * firmware runs whole although the ADT's audio-speaker lists one), the amp on
+ * the first slot. The stream has no sense channel (the ADT's audio-speaker
+ * lists no RX channel and the amp's speaker-protection is 0), so there is no
+ * V/I to read: playback waits for a protection lease (macaudio_spk_admitted()),
+ * which only speakerguardd v2 takes, with a feed-forward unit compiled from
+ * this Mac's own tuning. Without it the speaker stays silent.
+ */
+struct macaudio_platform_cfg macaudio_j773g_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W,
+	.stereo = false,
+	.safe_vol = -20,
+	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.secondary_bclk_ratio = 250,
+	.fe_cpu_is_platform = true,
+	/* No headphone codec on this card: the jack is a card of its own. */
+	.route_only_fes = BIT(0),
+	.speaker_fe_channels = 6,
+};
+
+/*
  * J713 (T8132, MacBook Air 13" M4): the J616s stream, six 32-bit playback
  * and twelve 16-bit sense slots in the same 250-bit frame, with four
  * SN012776 amps, a woofer and a tweeter per side, on the first four and the
@@ -4443,6 +4469,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j773-macaudio", .data = &macaudio_j575c_j773_cfg },
 	/* j773    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j773-macaudio-jack", .data = &macaudio_j616_jack_cfg },
+	/* j773g   -       sn012776    15      1x 1W    (AOP-fed, no V/I sense) */
+	{ .compatible = "apple,j773g-macaudio", .data = &macaudio_j773g_cfg },
 	/* j873    AID48   sn012776    15      1x 1W    (AOP-fed, no protection) */
 	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
 	/* j813    AID?    sn012776    15      2x 1W+1T (AOP-fed, V/I sense) */
