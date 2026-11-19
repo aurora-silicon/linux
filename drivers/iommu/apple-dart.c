@@ -5345,9 +5345,13 @@ static int apple_dart_probe(struct platform_device *pdev)
 	struct apple_dart *dart;
 	struct device *dev = &pdev->dev;
 	u64 dma_range[2];
+	/*
+	 * Tunnel containers are "usb4-pcie-tunnel-N", or carry a unit address
+	 * ("usb4-pcie-tunnel@...") where they have their own ranges.
+	 */
 	bool tunneled = dev->of_node->parent &&
 			 of_node_name_prefix(dev->of_node->parent,
-					     "usb4-pcie-tunnel-");
+					     "usb4-pcie-tunnel");
 	bool j713_display, j713_dcpext, j713_dispext, j713_radio;
 
 	/*
@@ -5782,10 +5786,17 @@ params_done:
 	 * accepts the upper 2 GiB of its 32-bit bus window and adds the 1 TiB
 	 * alias before DART translation. Keep those FDTs bootable while returning
 	 * the low bus address to DMA clients.
+	 *
+	 * This is a property of the T602x PCIe-C host bridge, which every die
+	 * of T6020/T6021/T6022 carries. The SoC match stays because the DART and
+	 * host compatibles ("apple,t8110-dart", "apple,t6000-pciec") are shared
+	 * with T600x, whose bridge has no alias: its 0..4 GiB window must not be
+	 * rewritten.
 	 */
 	if (!dart->dma_offset && tunneled &&
 	    (of_machine_is_compatible("apple,t6020") ||
-	     of_machine_is_compatible("apple,t6021")) &&
+	     of_machine_is_compatible("apple,t6021") ||
+	     of_machine_is_compatible("apple,t6022")) &&
 	    ((dart->dma_min == 0 &&
 	      dart->dma_max == DMA_BIT_MASK(dart->ias)) ||
 	     (dart->dma_min == BIT_ULL(40) &&
