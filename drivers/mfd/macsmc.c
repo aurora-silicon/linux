@@ -652,8 +652,11 @@ static int apple_smc_probe(struct platform_device *pdev)
 		of_device_is_compatible(dev->of_node, "apple,t6050-smc");
 	if (smc->saved_enabled && of_machine_is_compatible("apple,j714s"))
 		smc->wake_reasons = apple_smc_j714s_wake_reasons;
-	/* J813's late notice needs the bounded, IRQ-independent transport too. */
-	if (of_machine_is_compatible("apple,j813"))
+	/*
+	 * A sleep controller that sends the final notice after the peer stops (T8142) needs the
+	 * bounded, IRQ-independent transport too.
+	 */
+	if (apple_sleep_smc_defer_notice_hw())
 		smc->saved_enabled = true;
 	smc->sram_base = devm_platform_get_and_ioremap_resource(pdev, 1, &smc->sram);
 	if (IS_ERR(smc->sram_base))
@@ -1229,7 +1232,7 @@ static int apple_smc_sleep_saved_end(void *data)
 }
 
 /*
- * J813's ordinary wake notice belongs in macsmc's resume_noirq, after the
+ * A deferred notice's ordinary wake notice belongs in macsmc's resume_noirq, after the
  * device dependencies have resumed. Platform wake precedes every noirq
  * device callback; an AP ON there can wake the radio before its DMA path.
  * Release the bounded transport here, retaining ap_notified for the usual
@@ -1360,7 +1363,7 @@ static const struct apple_sleep_smc_saved_ops apple_smc_saved_ops = {
 };
 
 /*
- * J813 retains its existing MBSE/AP sequence and delay floors. The transport
+ * The deferred notice keeps the existing MBSE/AP sequence and delay floors. The transport
  * is the saved lane: no scheduler, jiffies, IRQ worker or SRAM reuse is needed
  * after the peer stops. Unrelated notifications are retained until resume.
  */
