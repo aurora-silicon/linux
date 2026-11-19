@@ -443,6 +443,10 @@ struct sep_key_unseal_password {
  *
  * - a context belongs to one Unix account's key bag (NEW: root or that
  *   user) and is a file descriptor: closing it ends it;
+ * - it belongs to the effective uid that made it: every request on the
+ *   context, or naming it, from another effective uid fails with EPERM.
+ *   Within that uid the descriptor is a capability: a process it is
+ *   passed to, or a child that inherits it, can use it;
  * - BIND, before AUTH, may name the one key and the operations
  *   (SEP_KEY_CTX_SCOPE_*) it authorizes; nothing else is then accepted;
  * - it lasts lifetime_s from the authentication (1 s to 12 hours; 0 is

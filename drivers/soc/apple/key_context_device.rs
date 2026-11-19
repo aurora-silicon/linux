@@ -200,6 +200,7 @@ impl File {
         if !Arc::ptr_eq(&context.sep, &self.sep) {
             return Err(EXDEV);
         }
+        context.check_owner()?;
         context.check_domain()?;
         Ok(context)
     }
@@ -244,6 +245,7 @@ impl File {
                 self.sep.clone(),
                 self.context_generation,
                 bag,
+                crate::shim::current_euid(),
                 out.lifetime_s,
             )?;
             let pointer = context.clone().into_foreign();
@@ -364,6 +366,7 @@ unsafe extern "C" fn context_ioctl(pointer: *mut c_void, cmd: c_uint, arg: c_ulo
     let context: Arc<Context> = borrowed.into();
     let result = (|| {
         let _call = Call::enter(&context.sep)?;
+        context.check_owner()?;
         let user = UserPtr::from_addr(arg as usize);
         if cmd == QUERY {
             let (phase, cleanup, reason) = context.query();

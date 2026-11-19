@@ -51,6 +51,17 @@ impl Drop for Credential {
 }
 
 /// `Context::bind` operations: what a bound context may run on its key.
+/// Whether `caller` (an effective uid) may use a context `owner` made: only
+/// the same effective uid, root included. Root may make a context for any
+/// user, but cannot use one another uid made.
+fn owner_admits(owner: u32, caller: u32) -> Result {
+    if owner == caller {
+        Ok(())
+    } else {
+        Err(EPERM)
+    }
+}
+
 /// The longest a context's one authentication lasts (`SEP_KEY_CTX_LIFETIME_MAX`).
 pub(crate) const LIFETIME_MAX_S: u32 = 12 * 3600;
 
@@ -115,6 +126,11 @@ pub(crate) struct Context {
     /// in that user's domain, and the bag's lock revokes it. None for the
     /// identity bag's biometric keys.
     pub(crate) bag: Option<u32>,
+    /// The effective uid that made the context (`SEP_KEY_CTX_NEW`). Every
+    /// request on it, or naming it, from another effective uid is refused
+    /// (`check_owner`): its descriptor passed or inherited across users
+    /// authorizes nothing.
+    owner_euid: u32,
     /// How long one authentication authorizes, from that authentication.
     lifetime_ns: u64,
     #[pin]
@@ -149,6 +165,7 @@ impl Context {
         sep: Arc<SepData>,
         expected_generation: u64,
         bag: Option<u32>,
+        owner_euid: u32,
         lifetime_s: u32,
     ) -> Result<Arc<Self>> {
         let mut contexts = sep.key_contexts.lock();
@@ -169,6 +186,7 @@ impl Context {
                 sep: owner,
                 generation,
                 bag,
+                owner_euid,
                 lifetime_ns,
                 inner <- kernel::new_mutex!(Inner {
                     life: State::new(),
@@ -224,6 +242,11 @@ impl Context {
         }
         inner.scope = Some(scope);
         Ok(())
+    }
+
+    /// Refuses a caller whose effective uid did not make the context.
+    pub(crate) fn check_owner(&self) -> Result {
+        owner_admits(self.owner_euid, crate::shim::current_euid())
     }
 
     /// Refuses a key or an operation outside a bound context's scope.
@@ -501,6 +524,16 @@ mod tests {
         let mut out = KVec::new();
         out.extend_from_slice(bytes, GFP_KERNEL).unwrap();
         out
+    }
+
+    #[test]
+    fn only_the_creator_uses_a_context() {
+        assert!(owner_admits(1001, 1001).is_ok());
+        assert_eq!(owner_admits(1001, 1000), Err(EPERM));
+        // Root made it: another user may not use it, and root may not use
+        // a user's.
+        assert_eq!(owner_admits(0, 1001), Err(EPERM));
+        assert_eq!(owner_admits(1001, 0), Err(EPERM));
     }
 
     #[test]
