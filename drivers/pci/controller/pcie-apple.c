@@ -3407,7 +3407,12 @@ static int apple_msi_init(struct apple_pcie *pcie)
 			default:
 				goto invalid_slice;
 			}
-		} else if (of_machine_is_compatible("apple,t6040")) {
+		} else if (pcie->hw == &t6040_pciec_hw) {
+			/*
+			 * The T6040 PCIe-C block, on the M4 Pro and M4 Max
+			 * alike: same ECAM apertures and MSI window. The M4
+			 * Max Mac Studio adds a fourth router (ADT apciec3).
+			 */
 			aic_base = 2071;
 			switch (ecam.start) {
 			case 0x1c50000000ULL:
@@ -3418,6 +3423,9 @@ static int apple_msi_init(struct apple_pcie *pcie)
 				break;
 			case 0x1c70000000ULL:
 				expected_base = 0x60;
+				break;
+			case 0x1c80000000ULL:
+				expected_base = 0x80;
 				break;
 			default:
 				goto invalid_slice;
