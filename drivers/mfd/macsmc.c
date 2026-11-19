@@ -67,6 +67,17 @@ static bool j613_wktp2;
 module_param(j613_wktp2, bool, 0600);
 MODULE_PARM_DESC(j613_wktp2,
 		 "J613: write WKTP=2 after the SMC's sleep warning, as macOS does (unqualified)");
+
+/*
+ * Measured on J613 (capture run 51, both sleeps): after MBSE=slpw, macOS asks for pmVC's key
+ * info and writes it, four bytes, 0x00000100, about 241 ms after slpw and 3.2 ms before WKTP=2.
+ * It writes the same value again 16 ms after a wake, after MBSE=waka.
+ */
+static bool j613_pmvc;
+module_param(j613_pmvc, bool, 0600);
+MODULE_PARM_DESC(j613_pmvc,
+		 "J613: write pmVC=0x100 after the SMC's sleep warning and after waka, as macOS does");
+#define J613_PMVC	0x00000100
 #endif
 
 static const struct mfd_cell apple_smc_devs[] = {
@@ -858,6 +869,19 @@ static void apple_smc_sleep_warn(struct apple_smc *smc)
 	apple_smc_write_mbse(smc, SMC_KEY(slpw));
 	smc->sleep_warned = true;
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
+	if (j613_pmvc && of_machine_is_compatible("apple,j613")) {
+		struct apple_smc_key_info info;
+		int ret = apple_smc_get_key_info(smc, SMC_KEY(pmVC), &info);
+
+		if (!ret && info.size == sizeof(u32))
+			ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), J613_PMVC);
+		else if (!ret)
+			ret = -EINVAL;
+		if (ret)
+			dev_err(smc->dev, "J613 sleep: pmVC=0x%x failed: %d\n", J613_PMVC, ret);
+		else
+			dev_info(smc->dev, "J613 sleep: pmVC=0x%x accepted\n", J613_PMVC);
+	}
 	if (j613_wktp2 && of_machine_is_compatible("apple,j613")) {
 		int ret;
 
@@ -1099,6 +1123,14 @@ static void apple_smc_sleep_wake(struct apple_smc *smc)
 		}
 	} else {
 		apple_smc_write_mbse(smc, SMC_KEY(waka));
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
+		/* macOS: pmVC=0x100 again 9 ms after waka (capture run 51). */
+		if (j613_pmvc && of_machine_is_compatible("apple,j613")) {
+			ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), J613_PMVC);
+			if (ret)
+				dev_err(smc->dev, "J613 wake: pmVC=0x%x failed: %d\n", J613_PMVC, ret);
+		}
+#endif
 	}
 	smc->sleep_warned = false;
 	apple_smc_lid_wake(smc);

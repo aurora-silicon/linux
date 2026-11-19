@@ -127,6 +127,11 @@ module_param(t8122_quiet, bool, 0600);
 MODULE_PARM_DESC(t8122_quiet,
 		 "J613 trial: mask the EL1 timers and stop the core PMU before each core's last WFI, as T8142 does");
 
+static bool t8122_mcc;
+module_param(t8122_mcc, bool, 0600);
+MODULE_PARM_DESC(t8122_mcc,
+		 "J613 trial: step the memory controller down after the watchdog-control clear, as macOS");
+
 static bool t8122_dry_regs;
 module_param(t8122_dry_regs, bool, 0600);
 MODULE_PARM_DESC(t8122_dry_regs,
@@ -272,7 +277,60 @@ static struct {
 	u32 dc_dropped;
 	int disp_poll_us;
 	unsigned int wfi_returns;
+	void __iomem *mcc[5];
+	bool mcc_ok;
 } t8122;
+
+/*
+ * J613's memory-controller stop, as macOS ran it on both sleeps of run 52: CPU4, after the
+ * CPU disables and the WD0 control clear, before the power gates, over about 1.1 ms. Pages
+ * (device-tree reg-names): "mcc-a" 0x220024000, "mcc-b" 0x220064000, "mcc-c" 0x220158000,
+ * "mcc-d" 0x220400000, "mcc-e" 0x2201c1000. The first write clears mcc-e +0xc00; every later
+ * step clears the lowest set bit of a fresh read of one word, in the measured interleave
+ * below. Words A-F are 64-bit, G and H 32-bit, as macOS accessed them.
+ */
+static const struct {
+	u8 page;
+	u16 off;
+	bool wide;
+} t8122_mcc_words[] = {
+	['A' - 'A'] = { 2, 0x000, true },	/* 0x220158000: 0x7ffffff down to 0 */
+	['B' - 'A'] = { 0, 0x000, true },	/* 0x220024000: 0xffff down to 0 */
+	['C' - 'A'] = { 1, 0x000, true },	/* 0x220064000: 0xffff down to 0 */
+	['D' - 'A'] = { 2, 0x800, true },	/* 0x220158800: 0xff down to 0 */
+	['E' - 'A'] = { 0, 0x800, true },	/* 0x220024800: 3, 2, 0 */
+	['F' - 'A'] = { 1, 0x800, true },	/* 0x220064800: 3, 2, 0 */
+	['G' - 'A'] = { 3, 0x584, false },	/* 0x220400584: 0x1ff down to 0 */
+	['H' - 'A'] = { 3, 0x588, false },	/* 0x220400588: 0x11, 0x10, 0 */
+};
+
+static const char t8122_mcc_order[] =
+	"ABABABABABABAAAAAAAAABABABAABABABABABABABACACCCCCCCCCCCCCCCDDDEDEDFDFDDGGGGGGGGGHH";
+
+static void t8122_mcc_stop(struct apple_sleep *s)
+{
+	unsigned int i;
+
+	if (!t8122.mcc_ok)
+		return;
+	writel(0, t8122.mcc[4] + 0xc00);
+	for (i = 0; t8122_mcc_order[i]; i++) {
+		unsigned int w = t8122_mcc_order[i] - 'A';
+		void __iomem *reg = t8122.mcc[t8122_mcc_words[w].page] + t8122_mcc_words[w].off;
+
+		if (t8122_mcc_words[w].wide) {
+			u64 v = readq(reg);
+
+			if (v)
+				writeq(v & (v - 1), reg);
+		} else {
+			u32 v = readl(reg);
+
+			if (v)
+				writel(v & (v - 1), reg);
+		}
+	}
+}
 
 static void t8122_dc_putc(unsigned char c)
 {
@@ -580,6 +638,20 @@ static int t8122_sleep_map_regs(struct apple_sleep *s)
 		if (IS_ERR(*field))
 			return dev_err_probe(s->dev, PTR_ERR(*field), "no %s registers\n",
 					     regs[i].name);
+	}
+	if (t8122_mcc) {
+		static const char *const names[] = { "mcc-a", "mcc-b", "mcc-c", "mcc-d", "mcc-e" };
+
+		t8122.mcc_ok = true;
+		for (i = 0; i < ARRAY_SIZE(names); i++) {
+			t8122.mcc[i] = t8122_map(s, names[i], NULL);
+			if (IS_ERR(t8122.mcc[i])) {
+				dev_warn(s->dev, "no %s registers: no memory-controller stop\n", names[i]);
+				t8122.mcc_ok = false;
+			}
+		}
+		if (t8122.mcc_ok)
+			dev_info(s->dev, "J613 trial: memory controller stepped down before the gates\n");
 	}
 	t8122.hpm_notify = t8122_map(s, "spmi-hpm", NULL);
 	if (IS_ERR(t8122.hpm_notify))
@@ -1026,6 +1098,7 @@ static void t8122_sleep_commit_regs(struct apple_sleep *s)
 		writel(0, s->wdt + WDT_WD0_CTL);
 	/* The discriminator: a SoC that stays powered resets itself; one that slept may not. */
 	t8122_trial_wdt(s, true);
+	t8122_mcc_stop(s);
 
 	writel(PWRGATE_ON, s->pwrgate + T8122_PWRGATE_E);
 	writel(PWRGATE_ON, s->pwrgate + T8122_PWRGATE_P);
