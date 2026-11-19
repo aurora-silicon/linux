@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * Mac mini (M4, J773g) HDMI audio, the SIO half, as the ADT has it: the HDMI
- * port's display processor (dcp) has "audio" = dp-audio0, which is SIO DMA
- * channel 0x64 with power state DPA0 under DPA_P. dp-audio1 and dp-audio2
- * belong to dcpext0/1 (DisplayPort alt mode on the rear ports) and stay off.
+ * Mac mini (M4, J773g) HDMI audio, the SIO half. The ADT gives the HDMI
+ * port's display processor (dcp) "audio" = dp-audio0: SIO DMA channel 0x64,
+ * power state DPA0 under DPA_P; dp-audio1 and dp-audio2 (0x66, 0x68) belong
+ * to dcpext0/1.
  *
  * SIO supplies the sample stream. iBoot preloads its firmware; the boot
  * loader reserves it, publishes the boot tables (the T6041 layout: the ADT's
@@ -11,22 +11,14 @@
  * key for key) and then enables the SIO node, which it finds by the alias.
  * Without such a loader the SIO stays disabled and nothing else changes.
  *
- * DPA0 is not linked to the dcp yet: the M4 display processor's own audio
- * service (dcpav-audio-interface, AV endpoint) has no driver on that path, so
- * the link would only make the dcp start a service it cannot drive.
+ * No DP audio interface is described yet: the display processor's own audio
+ * service has no driver on the M4 path, and an interface needs the graph link
+ * to the processor that owns that service.
  */
 
 / {
 	aliases {
 		sio = &sio;
-	};
-
-	dpaudio0: audio-controller-0 {
-		compatible = "apple,t8132-dpaudio", "apple,dpaudio";
-		dmas = <&sio 0x64>;
-		dma-names = "tx";
-		power-domains = <&ps_dpa0>;
-		status = "disabled";
 	};
 };
 
@@ -55,9 +47,5 @@
 };
 
 &ps_dpa_p {
-	status = "okay";
-};
-
-&ps_dpa0 {
 	status = "okay";
 };
