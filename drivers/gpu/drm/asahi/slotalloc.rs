@@ -62,6 +62,11 @@ impl SlotToken {
     pub(crate) fn last_slot(&self) -> u32 {
         self.slot
     }
+
+    /// REFFLAKE3 test: a nonzero 8-bit value that changes on every new slot assignment.
+    pub(crate) fn seq8(&self) -> u8 {
+        (self.time % 255) as u8 + 1
+    }
 }
 
 /// A guard representing active ownership of a slot.

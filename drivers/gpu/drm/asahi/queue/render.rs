@@ -299,6 +299,15 @@ impl super::QueueInner::ver {
 
         let vm_bind = job.vm_bind.clone();
 
+        // REFFLAKE3 test (default off): alternative client_sequence sources.
+        let client_seq: u8 = if debug_enabled(debug::DebugFlags::G13BmSlotSeq) {
+            scene.slot_seq()
+        } else if debug_enabled(debug::DebugFlags::G13VmGenSeq) {
+            vm_bind.generation()
+        } else {
+            slot_client_seq
+        };
+
         mod_dev_dbg!(
             self.dev,
             "[Submission {}] VM slot = {}\n",
@@ -910,7 +919,7 @@ impl super::QueueInner::ver {
                         end_addr: Some(inner_ptr!(inner.timestamps.gpu_pointer(), frag.end)),
                     }),
                     user_timestamp_pointers: inner.user_timestamps.pointers()?,
-                    client_sequence: slot_client_seq,
+                    client_sequence: client_seq,
                     pad_925: Default::default(),
                     unk_928: 0,
                     unk_92c: 0,
@@ -1355,7 +1364,7 @@ impl super::QueueInner::ver {
                         end_addr: Some(inner_ptr!(inner.timestamps.gpu_pointer(), vtx.end)),
                     }),
                     user_timestamp_pointers: inner.user_timestamps.pointers()?,
-                    client_sequence: slot_client_seq,
+                    client_sequence: client_seq,
                     pad_5d5: Default::default(),
                     unk_5d8: 0,
                     unk_5dc: 0,

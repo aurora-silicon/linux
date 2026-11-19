@@ -77,8 +77,10 @@ pub(crate) enum DebugFlags {
     // 48-: Misc
     Debug0 = 48,
     Debug1 = 49,
-    Debug2 = 50,
-    Debug3 = 51,
+    // Test: client_sequence from the buffer manager slot binding.
+    G13BmSlotSeq = 50,
+    // Test: client_sequence from the VM slot binding generation.
+    G13VmGenSeq = 51,
     Debug4 = 52,
     Debug5 = 53,
     Debug6 = 54,

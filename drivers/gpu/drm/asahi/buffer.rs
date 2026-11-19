@@ -121,6 +121,7 @@ pub(crate) struct TileInfo {
 pub(crate) struct Scene {
     object: GpuObject<buffer::Scene::ver>,
     slot: u32,
+    slot_seq: u8,
     rebind: bool,
     preempt2_off: usize,
     preempt3_off: usize,
@@ -147,6 +148,11 @@ impl Scene::ver {
     /// Returns the buffer manager slot this scene's buffer was bound to.
     pub(crate) fn slot(&self) -> u32 {
         self.slot
+    }
+
+    /// REFFLAKE3 test: changes whenever the buffer is bound to a manager slot afresh.
+    pub(crate) fn slot_seq(&self) -> u8 {
+        self.slot_seq
     }
 
     /// Returns the GPU pointer to the [`buffer::Scene::ver`].
@@ -701,6 +707,7 @@ impl Buffer::ver {
         Ok(Scene::ver {
             object: scene,
             slot: inner.active_slot.as_ref().unwrap().slot(),
+            slot_seq: inner.active_slot.as_ref().unwrap().token().seq8(),
             rebind,
             preempt2_off: inner.preempt1_size,
             preempt3_off: inner.preempt1_size + inner.preempt2_size,
