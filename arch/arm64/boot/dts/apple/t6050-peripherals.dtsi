@@ -3708,3 +3708,28 @@
 		status = "disabled";
 	};
 };
+
+/*
+ * The PMP runs a control loop on die 0's hot-spot sensors and publishes an effort for each
+ * cluster in its FAST-DIE-CE range (pmp0_report, three lanes), in the order of the ADT's
+ * fast-die-ctrl-ce-map: MACC0, MACC1 and PACC_ANE (the P cluster). The ADT's CLPC node lists
+ * the same range among its ptd-ranges. The firmware does not lower the clusters' states itself
+ * (see the CPU OPP tables in t6050-base.dtsi): the OS enforces the effort as a frequency limit.
+ * The lanes are the SoC's, not a board's, so every T6050 board carries them. Die 1's clusters
+ * on a two-die part have no lane in this range and stay unmapped.
+ *
+ * The limit follows pmp0_report: a board that leaves it disabled does not run the PMP, and
+ * cpufreq then applies no limit, as without the property. Once the report is enabled, cpufreq
+ * holds each cluster at its fallback limit until the PMP reports that it runs.
+ */
+&cpufreq_mc0 {
+	apple,fast-die-effort = <&pmp0_report 0>;
+};
+
+&cpufreq_mc1 {
+	apple,fast-die-effort = <&pmp0_report 1>;
+};
+
+&cpufreq_pc {
+	apple,fast-die-effort = <&pmp0_report 2>;
+};

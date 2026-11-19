@@ -465,26 +465,6 @@
 	status = "okay";
 };
 
-/*
- * The PMP runs a control loop on the die's hot-spot sensors and publishes an effort for each
- * cluster in its FAST-DIE-CE range, in the order of the ADT's fast-die-ctrl-ce-map: MACC0, MACC1
- * and PACC_ANE (the P cluster). The OS enforces it as a frequency limit; the ADT's CLPC node lists
- * the same range among its ptd-ranges. Without the limit the clusters keep their top state while
- * the effort sits at its maximum under a sustained all-core load. Until the PMP reports that it
- * runs (also on a boot without the PMP driver), cpufreq holds each cluster at its fallback limit.
- */
-&cpufreq_mc0 {
-	apple,fast-die-effort = <&pmp0_report 0>;
-};
-
-&cpufreq_mc1 {
-	apple,fast-die-effort = <&pmp0_report 1>;
-};
-
-&cpufreq_pc {
-	apple,fast-die-effort = <&pmp0_report 2>;
-};
-
 &pmc {
 	/* PMP, CLPC and AP agents, once the PMP runs */
 	apple,static-voters = <0 1 3>;
