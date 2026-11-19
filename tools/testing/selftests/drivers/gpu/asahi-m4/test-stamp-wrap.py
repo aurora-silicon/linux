@@ -43,10 +43,11 @@ struct RGraph{fw_stamp:[Object;2],qstate:[Object;2],qinfo:[Object;2],notifier:Ob
 struct Graph{compute:CGraph,render:RGraph}
 struct Vm{slot:u32}struct Job{vm:Vm,resources:Resources}
 struct Resources{compute:Vec<CUnit>,passes:Vec<RUnit>,pools:Pools}
-impl Resources{fn compute(&self)->Result<&Self>{Ok(self)}fn render(&self)->Result<&Self>{Ok(self)}}
+impl Resources{fn compute(&self)->Result<&Self>{Ok(self)}fn render(&self)->Result<&Self>{Ok(self)}fn compute_unit(&self,k:usize)->Result<&CUnit>{self.compute.get(k).ok_or(EINVAL)}}
 struct Claims{slot:[u32;1],pass:[u32;1]}
 struct Flight{computes:u32,renders:u32,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],recovery_suspect:bool,recovery_started_ns:u64,doomed:bool}
-struct Engine{flights:Vec<Flight>}
+struct Engine{flights:Vec<Flight>,target:u32}
+fn stamp_reached(observed:u32,own:u32,tail:u32)->bool{logic::stamp_reached(observed,own,tail)}
 impl Engine{fn oldest(&self)->Option<&Flight>{self.flights.first()}}
 struct CUnit{counter:Object,its:Object,work:Object}
 struct RUnit{scene:Object}
@@ -58,6 +59,7 @@ struct Firmware{graph:Graph,engine:Engine,slots:Slots,pools:Pools,queue_passed:b
 fn rmb(){}fn now_ns()->u64{100_000_000}
 impl Firmware{
     fn queue_receipt(&self,_ch:Channel,_state:&Object,_info:&Object,_head:u32,_rec:u32)->Result<bool>{Ok(self.queue_passed)}
+    fn queue_passed(&self,_ch:Channel,_state:&Object,_info:&Object,_f:&Flight)->Result<bool>{Ok(self.queue_passed)}
     __RETIRED__
     __RETIRED_SNAPSHOT__
 }
@@ -66,7 +68,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     let mut f=Firmware{
         graph:Graph{compute:CGraph{fw_stamp:Object::default(),qstate:Object::default(),qinfo:Object::default(),notifier:Object::default()},
             render:RGraph{fw_stamp:Default::default(),qstate:Default::default(),qinfo:Default::default(),notifier:Object::default()}},
-        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true}}},claims:Claims{slot:[0],pass:[0]},head:1,ta_head:1,fs_head:1,rec:[1;3],recovery_suspect:false,recovery_started_ns:0,doomed:false}]},
+        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true}}},claims:Claims{slot:[0],pass:[0]},head:1,ta_head:1,fs_head:1,rec:[1;3],recovery_suspect:false,recovery_started_ns:0,doomed:false}],target},
         slots:Slots{scrub:Scrub{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}]}},
         pools:Pools{full:true},queue_passed:true,
     };
@@ -112,6 +114,25 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
             assert_eq!(f.retired(),Ok(Retirement::Pending));
         }
     }}
+}
+#[test]fn queued_compute_flight_retires_on_passed_receipts_in_order(){
+    for n in [0x7fffff,0x800000,0xffffff,0x1000000,0x1000001]{
+        let mut f=firmware(false,n);
+        let later=firmware(false,n+1).engine.flights.remove(0);
+        f.engine.flights.push(later);f.engine.target=encode::stamp(n+1);
+        // The command behind it finished too: the shared stamp and notifier cells name it.
+        f.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(n+1)));
+        f.graph.compute.notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(n+1)));
+        f.graph.compute.notifier.set(notifier_page::COMPUTE_CONTEXT,9);
+        assert_eq!(f.retired(),Ok(Retirement::Full));
+        f.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(n-1)));
+        assert_eq!(f.retired(),Ok(Retirement::Pending));
+        f.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(n)));
+        assert_eq!(f.retired(),Ok(Retirement::Full));
+        f.queue_passed=false;assert_eq!(f.retired(),Ok(Retirement::Pending));
+        f.queue_passed=true;f.engine.flights[0].job.resources.compute[0].work.set(compute::DESCRIPTOR_COMPLETED,n-1);
+        assert_eq!(f.retired(),Ok(Retirement::Pending));
+    }
 }
 #[test]fn changing_packed_receipt_remains_pending_and_stable_retry_can_retire(){
     let mut f=firmware(false,1);f.engine.flights[0].job.resources.compute[0].its.unstable=true;

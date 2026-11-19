@@ -44,7 +44,11 @@ pub const EBUSY:Error=Error(16); pub const EOVERFLOW:Error=Error(75); pub const 
 pub const ETIMEDOUT:Error=Error(110);pub const ERESTARTSYS:Error=Error(512);
 pub const GFP_KERNEL:u32=0;
 pub type Result<T=()> = std::result::Result<T,Error>;
-pub mod prelude {pub use crate::{Result,KVec,GFP_KERNEL,EINVAL,EAGAIN,E2BIG,EBUSY,EOVERFLOW,EIO,ETIMEDOUT,ERESTARTSYS};}
+pub mod prelude {pub use crate::{Result,KVec,KBox,GFP_KERNEL,EINVAL,EAGAIN,E2BIG,EBUSY,EOVERFLOW,EIO,ETIMEDOUT,ERESTARTSYS};}
+pub struct KBox<T>(Box<T>);
+impl<T>KBox<T>{pub fn new(x:T,_:u32)->Result<Self>{Ok(Self(Box::new(x)))}}
+impl<T>std::ops::Deref for KBox<T>{type Target=T;fn deref(&self)->&T{&self.0}}
+impl<T>std::ops::DerefMut for KBox<T>{fn deref_mut(&mut self)->&mut T{&mut self.0}}
 pub struct KVec<T>(Vec<T>);
 impl<T>KVec<T>{pub fn new()->Self{Self(Vec::new())} pub fn with_capacity(n:usize,_:u32)->Result<Self>{Ok(Self(Vec::with_capacity(n)))} pub fn push(&mut self,x:T,_:u32)->Result{self.0.push(x);Ok(())}}
 impl<T>std::ops::Deref for KVec<T>{type Target=Vec<T>;fn deref(&self)->&Vec<T>{&self.0}}
@@ -143,10 +147,18 @@ pub mod g16 {
     pub mod resources {
         use core::sync::atomic::{AtomicU64,Ordering};use crate::*;
         pub struct ComputeArena{pub compute:KVec<super::slots::ComputeSlot>}
+        // A job's compute units; here one arena.
+        pub type Prepared=ComputeArena;
+        impl ComputeArena{
+            pub fn compute_units(&self)->Result<usize>{Ok(self.compute.len())}
+            pub fn compute_unit(&self,k:usize)->Result<&super::slots::ComputeSlot>{self.compute.get(k).ok_or(EINVAL)}
+        }
         pub struct RenderArena{pub passes:KVec<super::slots::PassSlot>,pub tpc_dirty:[AtomicU64;2],pub tilemap_dirty:[AtomicU64;2]}
         impl RenderArena{ __SET_DIRTY__ }
     }
     pub mod boot {pub fn eproto()->crate::Error{crate::Error(71)}}
+    // Arenas here have the two base units.
+    pub mod params {pub fn compute_units()->usize{2}}
     pub struct Events{pub grow:crate::KVec<[u32;18]>}
     pub struct Firmware{pub pools:pools::Pools,pub events:Events}
     pub mod budget{__BUDGET__}
