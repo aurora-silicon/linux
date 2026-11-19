@@ -77,7 +77,8 @@ pub(crate) enum DebugFlags {
     // 48-: Misc
     Debug0 = 48,
     Debug1 = 49,
-    Debug2 = 50,
+    // Test: floor the TVB heap for G13 clustered scenes.
+    ClusterTvbFloor = 50,
     Debug3 = 51,
     Debug4 = 52,
     Debug5 = 53,

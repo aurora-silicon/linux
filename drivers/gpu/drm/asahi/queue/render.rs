@@ -281,7 +281,17 @@ impl super::QueueInner::ver {
             );
         }
 
-        let tvb_grown = buffer.ensure_blocks(tile_info.min_tvb_blocks)?;
+        // REFFLAKE3 test (default off, debug bit 50): start G13 clustered scenes on a
+        // TVB heap big enough that a fresh Buffer does not overflow and grow mid-scene.
+        #[ver(G < G14)]
+        let min_blocks = if clustering && debug_enabled(debug::DebugFlags::ClusterTvbFloor) {
+            tile_info.min_tvb_blocks.max(64)
+        } else {
+            tile_info.min_tvb_blocks
+        };
+        #[ver(G >= G14)]
+        let min_blocks = tile_info.min_tvb_blocks;
+        let tvb_grown = buffer.ensure_blocks(min_blocks)?;
         if tvb_grown {
             cls_dev_dbg!(
                 TVBStats,
