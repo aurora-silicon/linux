@@ -1196,8 +1196,15 @@ impl crate::SepData {
     /// Logs a reply the decoders refused: which step, its length and its
     /// first bytes. Replies to these queries carry no secret.
     fn userbag_refused(&self, step: &str, body: &[u8]) -> Error {
-        let n = body.len().min(96);
-        dev_info_ratelimited!(self.dev, "userbag: {}: reply refused, {} bytes: {:02x?}\n", step, body.len(), &body[..n]);
+        // Length and status only: the replies refused here (create,
+        // change-secret, the lock steps) can carry key-bag material.
+        dev_info_ratelimited!(
+            self.dev,
+            "userbag: {}: reply refused, {} bytes, status {:?}\n",
+            step,
+            body.len(),
+            crate::image::operation_status(body)
+        );
         EPROTO
     }
 
