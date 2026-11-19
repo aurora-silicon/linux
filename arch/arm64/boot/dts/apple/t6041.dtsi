@@ -337,7 +337,12 @@
 };
 
 &pmc {
+	#cooling-cells = <2>;
 	apple,static-voters = <1 3>;
+};
+
+&clpc {
+	compatible = "apple,t6041-max-clpc", "apple,t6041-clpc";
 };
 
 / {
@@ -352,6 +357,7 @@
 		reg-names = "asc", "sgx";
 		mboxes = <&agx_mbox>;
 		power-domains = <&ps_gfx>;
+		apple,clpc = <&clpc>;
 	};
 
 	agx_mbox: mailbox@28a600000 {
