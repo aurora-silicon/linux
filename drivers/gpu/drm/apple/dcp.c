@@ -9662,6 +9662,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6030 = {
 	.num_dptx_ports = 1,
+	.t6030_fabric = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8122 = {
@@ -9675,6 +9676,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6031 = {
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6030_dcpext = {
 	.num_dptx_ports = 1,
+	.t6030_fabric = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8122_dcpext = {

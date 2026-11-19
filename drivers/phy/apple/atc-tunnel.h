@@ -3,29 +3,17 @@
 #define _APPLE_ATC_TUNNEL_H
 
 #include <linux/errno.h>
-#include <linux/of.h>
 #include <linux/types.h>
 
-static inline bool apple_atc_t602x_qualified(const struct device_node *root)
+/*
+ * May a PHY with a pixel clock per DP IN adapter (@dpin_clocks, from its
+ * match data) run a DP tunnel clock? Only if the Type-C connector it serves
+ * is wired to both DP IN adapters of its router (@dual_stream, from the
+ * connector's display routes, apple_dp_tunnel_dual_stream()).
+ */
+static inline int apple_atc_dpin_clock_gate(bool dpin_clocks, bool dual_stream)
 {
-	return of_device_is_compatible(root, "apple,t6020") ||
-	       of_device_is_compatible(root, "apple,t6021");
-}
-
-static inline bool apple_atc_t602x_core_valid(const struct device_node *np, u64 base, u64 size)
-{
-	return of_device_is_compatible(np, "apple,t6020-atcphy") &&
-	       (base == 0x703000000ULL || base == 0xb03000000ULL || base == 0xf03000000ULL) &&
-	       size >= 0x7048;
-}
-
-static inline int apple_atc_t602x_gate(bool own_wiring, bool routes_present, bool valid_core)
-{
-	if (!routes_present)
-		return -EOPNOTSUPP;
-	if (!valid_core)
-		return -EINVAL;
-	return own_wiring ? 0 : -EOPNOTSUPP;
+	return dpin_clocks && dual_stream ? 0 : -EOPNOTSUPP;
 }
 
 #endif

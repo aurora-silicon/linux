@@ -286,6 +286,13 @@ struct apple_dcp_hw_data {
 	/* M2 Pro/Max laptop T6020 Thunderbolt flow, from the match data */
 	bool t6020_tunnel_flow;
 	/*
+	 * A T6030 display processor (apple,t6030-dcp, apple,t6030-dcpext),
+	 * behind the T6030 display crossbars: selecting an output only routes
+	 * it and linking it up starts its clocks, and only the even external
+	 * sources reach the ATC tunnel pixel clocks, see dcp_is_t6030_fabric().
+	 */
+	bool t6030_fabric;
+	/*
 	 * A processor Linux starts itself on 14.7 firmware through the IOMFB
 	 * template whose AFK, DPTX and DPAV endpoints speak the 14.7 protocol
 	 * (the T8122 dcpext), see dcp_fw_is_14_7().

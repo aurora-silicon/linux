@@ -149,7 +149,7 @@ static int atc_t8122_tunnel_stop(struct apple_atcphy *p)
 static int atcphy_dp_link_stop_t8122(struct apple_atcphy *p)
 { assert(!p->dp_t8122.pll && !p->dp_t8122.pairs); return 0; }
 #define __iomem
-static bool of_machine_is_compatible(const char *name) { (void)name; return false; }
+static bool __attribute__((unused)) of_machine_is_compatible(const char *name) { (void)name; return false; }
 #ifndef READ_ONCE
 #define READ_ONCE(x) (x)
 #endif
@@ -2414,7 +2414,7 @@ static void atcphy_dp_stop_t8122(struct apple_atcphy *p)
 { assert(!p->dp_t8122.aux && !p->dp_t8122.pll); }
 static void atcphy_dp_aux_on_t8122(struct apple_atcphy *p)
 { assert(!p->hw->dp_t8122); }
-static bool of_machine_is_compatible(const char *name) { (void)name; return false; }
+static bool __attribute__((unused)) of_machine_is_compatible(const char *name) { (void)name; return false; }
 #ifndef READ_ONCE
 #define READ_ONCE(x) (x)
 #endif
