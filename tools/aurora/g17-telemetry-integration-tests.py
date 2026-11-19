@@ -19,7 +19,11 @@ def git_show_at(root, ref, path):
     except subprocess.CalledProcessError:
         old = path.replace("drivers/gpu/drm/aurora-neo/", PRE_RENAME_DRIVER_DIR + "-neo/")
         old = old.replace("drivers/gpu/drm/aurora/", PRE_RENAME_DRIVER_DIR + "/")
-        return subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{old}"], text=True)
+        text = subprocess.check_output(["git", "-C", str(root), "show", f"{ref}:{old}"], text=True)
+        # Give the old source the names the current tree uses, so it splices into today's code.
+        for before, after in (("asahi", "aurora"), ("Asahi", "Aurora"), ("ASAHI", "AURORA")):
+            text = text.replace(before, after)
+        return text
 
 ROOT = Path(__file__).resolve().parents[2]
 DRIVER = ROOT / 'drivers/gpu/drm/aurora'
