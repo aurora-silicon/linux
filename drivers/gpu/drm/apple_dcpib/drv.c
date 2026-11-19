@@ -161,8 +161,7 @@ static bool dcpib_handoff_quiesced(struct dcpib *dcp)
 
 	if (dcp->hdmi || !chosen)
 		return false;
-	/* Despite its name, the loader property is one for a running core. */
-	if (!of_property_read_u32(chosen, "apple,dcp-rtkit-quiesced", &running))
+	if (!of_property_read_u32(chosen, "apple,dcp-rtkit-running", &running))
 		return running == 0;
 	/*
 	 * This older J873 loader predates the state property. Its failed
