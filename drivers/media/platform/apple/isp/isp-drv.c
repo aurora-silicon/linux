@@ -876,6 +876,10 @@ static int apple_isp_probe(struct platform_device *pdev)
 	if (err)
 		isp->temporal_filter = 0;
 
+	/* the camera module's own tuning, where the board names one */
+	of_property_read_string(dev->of_node, "apple,module-tuning",
+				&isp->module_tuning);
+
 	/* the sensor connection layout, for firmware that takes it at boot */
 	of_property_read_u32(dev->of_node, "apple,cam-connections-scheme",
 			     &isp->cam_connections_scheme);

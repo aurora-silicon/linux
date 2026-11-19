@@ -732,6 +732,55 @@ static void isp_test_sensor_names(struct kunit *test)
 	KUNIT_EXPECT_STREQ(test, apple_isp_sensor_name(isp), "imx958-uw");
 }
 
+static void isp_test_module_tuning(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_capture_alloc(test);
+	static const char *const keep[] = {
+		"9999_99",	/* no such setfile */
+		"7523_01",	/* another sensor's */
+		"2224",		/* not a whole name */
+	};
+
+	/* No property: the sensor's default. */
+	KUNIT_EXPECT_EQ(test, isp_module_tuning(isp, ISP_IMX958_2224_01), ISP_IMX958_2224_01);
+	isp->module_tuning = "2226_02";
+	KUNIT_EXPECT_EQ(test, isp_module_tuning(isp, ISP_IMX958_2224_01), ISP_IMX958_2226_02);
+	isp->module_tuning = "2226_01";
+	KUNIT_EXPECT_EQ(test, isp_module_tuning(isp, ISP_IMX958_2224_01), ISP_IMX958_2226_01);
+	isp->module_tuning = "2224_01";
+	KUNIT_EXPECT_EQ(test, isp_module_tuning(isp, ISP_IMX958_2224_01), ISP_IMX958_2224_01);
+	for (unsigned int i = 0; i < ARRAY_SIZE(keep); i++) {
+		isp->module_tuning = keep[i];
+		KUNIT_EXPECT_EQ_MSG(test, isp_module_tuning(isp, ISP_IMX958_2224_01),
+				    ISP_IMX958_2224_01, "%s", keep[i]);
+	}
+}
+
+/*
+ * A setfile missing from the system is replaced by its fallback after the
+ * size check against the data surface, so a fallback must be the same
+ * sensor, no larger, and final.
+ */
+static void isp_test_setfile_fallbacks(struct kunit *test)
+{
+	unsigned int n = 0;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(isp_setfiles); i++) {
+		const struct isp_setfile *s = &isp_setfiles[i], *f = s->fallback;
+
+		if (!f)
+			continue;
+		n++;
+		KUNIT_EXPECT_EQ_MSG(test, f->version, s->version, "setfile %u", i);
+		KUNIT_EXPECT_LE_MSG(test, f->size, s->size, "setfile %u", i);
+		KUNIT_EXPECT_NULL_MSG(test, f->fallback, "setfile %u", i);
+		KUNIT_EXPECT_STRNEQ_MSG(test, f->path, s->path, "setfile %u", i);
+	}
+	KUNIT_EXPECT_EQ(test, n, 2);
+	KUNIT_EXPECT_PTR_EQ(test, isp_setfiles[ISP_IMX958_2226_02].fallback,
+			    &isp_setfiles[ISP_IMX958_2224_01]);
+}
+
 static void isp_test_snf_flatten(u8 *snf)
 {
 	int k;
@@ -1019,6 +1068,8 @@ static struct kunit_case isp_cam_test_cases[] = {
 	KUNIT_CASE(isp_test_stop_key_on_debug),
 	KUNIT_CASE(isp_test_sensor_geometry),
 	KUNIT_CASE(isp_test_sensor_names),
+	KUNIT_CASE(isp_test_module_tuning),
+	KUNIT_CASE(isp_test_setfile_fallbacks),
 	KUNIT_CASE(isp_test_sensor_config_list),
 	KUNIT_CASE(isp_test_sensor_config_failure),
 	KUNIT_CASE(isp_test_preview_stream),

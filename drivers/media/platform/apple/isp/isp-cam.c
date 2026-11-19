@@ -41,6 +41,8 @@ struct isp_setfile {
 	 * noise filter gains. The setfile does not carry it.
 	 */
 	int snf_centre_dy;
+	/* used instead when this file is not installed (module tunings missing from vendorfw) */
+	const struct isp_setfile *fallback;
 };
 
 // clang-format off
@@ -97,10 +99,43 @@ static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX913_7523_01] = {0x913, "imx913", 0x75230107, "apple/isp_7523_01XX.dat", 0x247f8},
 	[ISP_IMX958_2224_01] = {0x958, "imx958-uw", 0x22240106, "apple/isp_2224_01XX.dat", 0x6ff4,
 				0, ISP_TEMPORAL_FILTER_BAND0, -156},
+	/*
+	 * J815's own module tunings, H17-native (lens-shading records without
+	 * the xx24 stride). The optical centre is 2224_01's: same sensor, not
+	 * measured for this module.
+	 */
+	[ISP_IMX958_2226_01] = {0x958, "imx958-uw", 0x22260101, "apple/isp_2226_01XX.dat", 0x7040,
+				0, ISP_TEMPORAL_FILTER_BAND0, -156,
+				&isp_setfiles[ISP_IMX958_2224_01]},
+	[ISP_IMX958_2226_02] = {0x958, "imx958-uw", 0x22260201, "apple/isp_2226_02XX.dat", 0x7000,
+				0, ISP_TEMPORAL_FILTER_BAND0, -156,
+				&isp_setfiles[ISP_IMX958_2224_01]},
 	[ISP_VD56G0_6221_01] = {0xd56, "vd56g0", 0x62210102, "apple/isp_6221_01XX.dat", 0x1b80},
 	[ISP_VD56G0_6222_01] = {0xd56, "vd56g0", 0x62220102, "apple/isp_6222_01XX.dat", 0x1b80},
 };
 // clang-format on
+
+/*
+ * The board's camera module tuning, named in the DT (apple,module-tuning,
+ * e.g. "2226_02"), in place of the sensor's default setfile. Unknown names
+ * and other sensors' setfiles keep the default.
+ */
+static enum isp_sensor_id isp_module_tuning(struct apple_isp *isp, enum isp_sensor_id def)
+{
+	char path[48];
+	unsigned int i;
+
+	if (!isp->module_tuning)
+		return def;
+	snprintf(path, sizeof(path), "apple/isp_%sXX.dat", isp->module_tuning);
+	for (i = 0; i < ARRAY_SIZE(isp_setfiles); i++)
+		if (isp_setfiles[i].path && isp_setfiles[i].version == isp_setfiles[def].version &&
+		    !strcmp(isp_setfiles[i].path, path))
+			return i;
+	dev_warn(isp->dev, "module tuning %s: no such setfile for sensor 0x%x, using %s\n",
+		 isp->module_tuning, isp_setfiles[def].version, isp_setfiles[def].path);
+	return def;
+}
 
 static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 {
@@ -187,7 +222,7 @@ static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 		break;
 	case 0x958:
 		/* Section 0x50f of 2224 names sensor 0x958; 2924's names 0x614. */
-		id = ISP_IMX958_2224_01;
+		id = isp_module_tuning(isp, ISP_IMX958_2224_01);
 		break;
 	case 0xd56:
 		id = ISP_VD56G0_6221_01;
@@ -495,7 +530,8 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 	if (err ||
 	    (fmt->id != ISP_IMX248_1820_01 && fmt->id != ISP_IMX558_1921_01 &&
 	     fmt->id != ISP_IMX558_1925_03 && fmt->id != ISP_IMX364_8720_01 &&
-	     fmt->id != ISP_IMX958_2224_01)) {
+	     fmt->id != ISP_IMX958_2224_01 && fmt->id != ISP_IMX958_2226_01 &&
+	     fmt->id != ISP_IMX958_2226_02)) {
 		dev_err(isp->dev,
 			"ch %d: unsupported sensor. Please file a bug report with hardware info & dmesg trace.\n",
 			ch);
@@ -821,6 +857,13 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 		return -ENOSPC;
 
 	err = firmware_request_nowarn(&fw, setfile->path, isp->dev);
+	if (err == -ENOENT && setfile->fallback) {
+		dev_info_once(isp->dev, "setfile '%s' not installed, using '%s'\n",
+			      setfile->path, setfile->fallback->path);
+		setfile = setfile->fallback;
+		len = setfile->file_size ?: setfile->size;
+		err = firmware_request_nowarn(&fw, setfile->path, isp->dev);
+	}
 	if (err) {
 		if (err == -ENOENT)
 			dev_warn_once(isp->dev,
