@@ -235,7 +235,7 @@ impl Control {
             }
         }
         if held > 0 {
-            dev_info!(
+            dev_dbg!(
                 self.dev,
                 "{} of {} calibration packets kept from an earlier start\n",
                 held,
