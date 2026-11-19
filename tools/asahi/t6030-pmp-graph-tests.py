@@ -60,7 +60,7 @@ def main():
                         'static int apple_pmp_report_entry_resume_noirq(']
     offsets = re.search(r'static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030 = \{.*?\n\};', source, re.S)[0]
     functions = '\n'.join(extract.function(source, n) for n in names)
-    # The T8122 14.x wait (CONFIG_APPLE_T8122_GPU_PMP_LINK=0 here) precedes the dispatch; it is
+    # The T8122 14.x wait (no T8122 PMP here, so it returns -ENODEV) precedes the dispatch; it is
     # added after the mutations are placed, so they target the T6030 path only.
     t8122 = extract.function(source, 'static int apple_pmp_report_wait_t8122_14(') + '\n'
     dispatch = 'int apple_pmp_report_wait_supplier_ready('

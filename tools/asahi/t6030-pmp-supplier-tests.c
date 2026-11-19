@@ -574,7 +574,7 @@ int main(void)
 	RUN((void)0, -ENODEV, 0, 0);
 	assert(!find_calls);
 #endif
-	/* T8122 current14 remains unsupported by this supplier API. */
+	/* A T8122 PMP without a linked T8122 report node is not waited for. */
 	RUN(machine = "apple,t8122";
 	    supplier_node.compatible = "apple,t8122-pmp-v2", -ENODEV, 0, 0);
 	/* A declared report, including malformed/unresolved data, never falls back. */
