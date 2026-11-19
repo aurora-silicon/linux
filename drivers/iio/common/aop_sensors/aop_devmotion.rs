@@ -18,7 +18,7 @@ use kernel::{
     bindings, c_str,
     device::{self, Core},
     dma::Coherent,
-    module_platform_driver, new_delayed_work, new_mutex, new_spinlock, of, platform,
+    driver, new_delayed_work, new_mutex, new_spinlock, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, AOP},
     sync::{
@@ -29,6 +29,7 @@ use kernel::{
     time::{self, delay::fsleep, Delta},
     types::{ForeignOwnable, Opaque},
     workqueue::{self, impl_has_delayed_work, DelayedWork, Work, WorkItem},
+    ThisModule,
 };
 
 const SUBTYPE_GET_PROPERTY: u16 = 10;
@@ -989,10 +990,30 @@ impl platform::Driver for IIOAopDevMotionDriver {
     }
 }
 
-module_platform_driver! {
-    type: IIOAopDevMotionDriver,
+/// The AOP core creates the device of a service, named after the service,
+/// whenever the firmware announces that service. Registering the driver under
+/// the same name lets the platform bus bind it on every machine whose AOP
+/// offers the service, with or without a device tree node for it.
+const SERVICE_NAME: &CStr = c_str!("devmotion6");
+
+#[pin_data]
+struct IIOAopDevMotionModule {
+    #[pin]
+    _driver: driver::Registration<platform::Adapter<IIOAopDevMotionDriver>>,
+}
+
+impl kernel::InPlaceModule for IIOAopDevMotionModule {
+    fn init(module: &'static ThisModule) -> impl PinInit<Self, Error> {
+        try_pin_init!(Self {
+            _driver <- driver::Registration::new(SERVICE_NAME, module),
+        })
+    }
+}
+
+module! {
+    type: IIOAopDevMotionModule,
     name: "iio_aop_devmotion",
     description: "AOP device-motion fusion driver",
     license: "Dual MIT/GPL",
-    alias: ["platform:iio_aop_devmotion"],
+    alias: ["platform:devmotion6"],
 }
