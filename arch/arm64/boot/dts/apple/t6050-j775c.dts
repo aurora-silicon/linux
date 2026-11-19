@@ -34,17 +34,3 @@
 
 #define T6050_J775C
 #include "t6050-peripherals.dtsi"
-
-/*
- * The boot chain hands AFR and GFX over with an auto-PM floor of clock-gated
- * (PS_MIN = 4), and the power-state driver writes back the floor it reads.
- * That holds the idle GFX domain at state 4. macOS runs both domains with a
- * floor of power-gated, where idle GFX rests at state 0; request the same.
- */
-&ps_afr {
-	apple,min-state = <0>;
-};
-
-&ps_gfx {
-	apple,min-state = <0>;
-};
