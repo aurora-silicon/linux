@@ -778,7 +778,7 @@
 			<AIC_IRQ 0 1188 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&m2_dart_scaler0 0>, <&m2_dart_scaler0 1>;
 		power-domains = <&ps_msr0>, <&ps_afr>, <&ps_msr0_ase_core>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	m2_dart_scaler0: iommu@40b200000 {
@@ -788,7 +788,7 @@
 		interrupts = <AIC_IRQ 0 1187 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_msr0>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	m2_dart_ave0_2: iommu@40d020000 {
@@ -870,7 +870,7 @@
 			<AIC_IRQ 0 1194 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&m2_dart_scaler1 0>, <&m2_dart_scaler1 1>;
 		power-domains = <&ps_msr1>, <&ps_afr>, <&ps_msr1_ase_core>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	m2_dart_scaler1: iommu@491200000 {
@@ -880,7 +880,7 @@
 		interrupts = <AIC_IRQ 0 1193 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_msr1>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	m2_dart_ave1_2: iommu@507020000 {

@@ -895,6 +895,13 @@ static const struct of_device_id asc_of_match[] = {
 	{ .compatible = "apple,t8103-scaler", .data = &apple_scaler_t8103 },
 	{ .compatible = "apple,t6000-scaler", .data = &apple_scaler_t6000 },
 	{ .compatible = "apple,t8112-scaler", .data = &apple_scaler_t8112 },
+	/*
+	 * M2 Pro/Max/Ultra: the M2 engine. Same three register ranges at the
+	 * same offsets, two DART streams, and the binding's T8112 contract.
+	 */
+	{ .compatible = "apple,t6020-scaler", .data = &apple_scaler_t8112 },
+	{ .compatible = "apple,t6021-scaler", .data = &apple_scaler_t8112 },
+	{ .compatible = "apple,t6022-scaler", .data = &apple_scaler_t8112 },
 	{ .compatible = "apple,t8132-scaler", .data = &apple_scaler_t8132 },
 	{ .compatible = "apple,t6041-scaler", .data = &apple_scaler_t6041 },
 	{ .compatible = "apple,t8140-scaler", .data = &apple_scaler_t8140 },
