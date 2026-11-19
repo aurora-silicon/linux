@@ -44,6 +44,11 @@ struct ave_mctf_layout;
 #define AVE_MAX_SLOTS 7
 /* Sessions one firmware boot serves at once (macOS was seen running two). */
 #define AVE_MAX_SESSIONS 2
+/*
+ * Stopped sessions whose memory may wait for a power cycle while another
+ * session keeps the firmware up. A session beyond this is refused instead.
+ */
+#define AVE_QUARANTINE_MAX 4
 
 /*
  * Coprocessor memory every firmware boot uses, all inside one allocation.
@@ -284,6 +289,7 @@ struct ave_dev {
 	struct ave_recovery_history recovery;
 	unsigned int recovery_count;
 	struct ave_session *failed_sessions;
+	unsigned int quarantined;
 	bool inject_wedge;
 
 	/* debugfs: the last Start and first Process built, per codec */

@@ -129,6 +129,10 @@ The firmware boots when the first stream starts and is halted when the last
 one ends, as macOS does; the next stream starts it from reset. Runtime PM
 powers the encoder down two seconds after the last stream.
 
+A stream's buffers are freed only after that power cycle. While one stream
+stays open, up to four streams that ended keep their buffers; a further
+stream then fails to start with ``EBUSY`` until every stream has closed.
+
 Up to five frames per stream are inside the firmware at once (three without
 B-frames). The firmware reorders B-frames itself, so CAPTURE buffers come
 back in bitstream order, each with the timestamp of the frame it codes.

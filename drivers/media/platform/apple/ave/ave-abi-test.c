@@ -1583,6 +1583,35 @@ static void ave_6070_qualified_bytes(struct kunit *test)
 	}
 }
 
+/*
+ * A session the firmware saw counts toward the quarantine bound until a reap;
+ * one it never saw is freed at once.
+ */
+static void ave_quarantine_count(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+
+	KUNIT_ASSERT_TRUE(test, ave && ctx);
+	ave->dev = kunit_device_register(test, "apple-ave-quarantine");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(ave->dev));
+	mutex_init(&ave->hw_lock);
+	ctx->ave = ave;
+	for (unsigned int i = 0; i <= AVE_QUARANTINE_MAX; i++) {
+		ctx->sess = kzalloc_obj(*ctx->sess);
+		KUNIT_ASSERT_NOT_NULL(test, ctx->sess);
+		ctx->sess->handed = i < AVE_QUARANTINE_MAX;
+		ave_sess_destroy(ctx);
+		KUNIT_EXPECT_NULL(test, ctx->sess);
+	}
+	KUNIT_EXPECT_EQ(test, ave->quarantined, AVE_QUARANTINE_MAX);
+	mutex_lock(&ave->hw_lock);
+	ave_sess_reap(ave);
+	mutex_unlock(&ave->hw_lock);
+	KUNIT_EXPECT_EQ(test, ave->quarantined, 0U);
+	KUNIT_EXPECT_NULL(test, ave->failed_sessions);
+}
+
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_t6041_text_boot_word),
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
@@ -1599,6 +1628,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
 	KUNIT_CASE(ave_6070_variants),	    KUNIT_CASE(ave_6070_text_id),
 	KUNIT_CASE(ave_6070_smalloc),
+	KUNIT_CASE(ave_quarantine_count),
 	{}
 };
 
