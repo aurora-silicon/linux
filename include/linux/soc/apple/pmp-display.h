@@ -12,8 +12,17 @@ static inline bool apple_pmp_j713_board(void)
 	return apple_t8132_firmware_path() && of_machine_is_compatible("apple,t8132");
 }
 
-/* T8132 boards on which Linux retains the qualified PMP firmware session. */
+/*
+ * T8132: Linux retains the PMP firmware session the boot loader left
+ * running, on any OS firmware.
+ */
 static inline bool apple_pmp_t8132_retained_board(void)
+{
+	return of_machine_is_compatible("apple,t8132");
+}
+
+/* The G16 consumer of that session: only on the firmware it was run on. */
+static inline bool apple_pmp_t8132_g16_board(void)
 {
 	return apple_t8132_firmware_path() &&
 	       of_machine_is_compatible("apple,t8132");
