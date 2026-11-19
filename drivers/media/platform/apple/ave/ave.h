@@ -404,6 +404,7 @@ struct ave_params {
 	/* The layout's encode settings, see struct ave_fw_layout. */
 	bool h264_inter;
 	bool rate_control;
+	bool low_delay;
 	u32 slots;
 	u32 refs; /* max_num_ref_frames + 1 */
 	bool bframes;

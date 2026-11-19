@@ -619,8 +619,10 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 	/*
 	 * The firmware either uses up to three B-frames (reordering them
 	 * itself) or none. Baseline and intra-only H.264 never have any.
+	 * A low_delay layout defaults to none.
 	 */
-	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_B_FRAMES, 0, 3, 3, 3);
+	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_B_FRAMES, 0, 3, 3,
+			  ctx->ave->layout && ctx->ave->layout->low_delay ? 0 : 3);
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEADER_MODE,
 			       V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
 			       BIT(V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE),
@@ -1247,12 +1249,17 @@ static int ave_encode_one(struct ave_ctx *ctx)
 		return ret;
 	}
 
-	/* Like macOS: the first frame goes alone, then a Complete. */
-	if (sess->frames == 1) {
+	/*
+	 * Like macOS: the first frame goes alone, then a Complete. Without
+	 * B-frames a low_delay layout waits for every frame, so each one is
+	 * answered before the next goes in; a second session on the same
+	 * core waits behind it.
+	 */
+	if (sess->frames == 1 || (sess->p.low_delay && !sess->p.bframes)) {
 		ret = ave_ipc_pump(ave, AVE_FRAME_WAIT_MS, ave_frame_answered, &sess->slot[slot]);
-		if (!ret)
+		if (!ret && sess->frames == 1)
 			ret = ave_cmd_complete(ctx, 1);
-		if (!ret)
+		if (!ret && sess->frames == 1)
 			ret = ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
 		if (ret)
 			return ret;

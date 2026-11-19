@@ -392,6 +392,8 @@ struct ave_fw_layout {
 	bool h264_inter;
 	/* CBR and VBR run the firmware rate controller. */
 	bool rate_control;
+	/* No B-frames by default; each frame is answered before the next. */
+	bool low_delay;
 	bool counted;
 };
 

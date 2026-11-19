@@ -73,6 +73,10 @@ the same firmware version and get the same settings, untested:
   rate, and VBR's limit, are scaled by the Start rate over the new one; an HEVC
   stream at 30, then 15, then 30 frames per second kept every picture, its
   frames at 15 about 1.7 times the size.
+- One frame at a time. B pictures default to off, and without them each frame
+  is answered before the next is submitted. Every T6021 result above was
+  measured this way; submitting frames ahead without B pictures was not
+  measured on 6070.11.1.
 
 Lifecycle-only validation
 -------------------------

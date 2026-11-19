@@ -145,6 +145,7 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->client_fps_den = p->fps_den;
 	p->h264_inter = layout->h264_inter;
 	p->rate_control = layout->rate_control;
+	p->low_delay = layout->low_delay;
 	/*
 	 * The rate controller divides the bit rate by the frame-rate
 	 * numerator, so 1000/30000 s would divide it by 30000. Give it the
