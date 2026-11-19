@@ -100,6 +100,13 @@ properties:
       The driver takes it as the "secure" mailbox. Elsewhere the port is the
       second entry of mboxes.
 
+  apple,merged-mode-limit:
+    type: boolean
+    description:
+      The platform's limit on merged modes applies to this external display
+      coprocessor. A display takes a second coprocessor as its pair only
+      while one is left for every external display that is present.
+
   iommus:
     maxItems: 1
 
