@@ -340,6 +340,27 @@
 	apple,static-voters = <1 3>;
 };
 
+/*
+ * The CLPC's memory states, measured on a J616c. A busy CPU cluster asks
+ * for DCS 1, 1, 3 or 4 and fabric 0, by quarters of 4512 MHz, so the E
+ * cluster at its top speed (57 %) gets the third column. With a 3 GB/s
+ * copy: DCS 0 / fabric 0 5.46 W at 309 ns DRAM latency, DCS 3 6.22 W at
+ * 166 ns, DCS 4 6.92 W at 114 ns, DCS 5 7.04 W at 113 ns; fabric 1 and 2
+ * add 0.3 and 1.4 W with less gain than a DCS step.
+ *
+ * GPU work takes DCS 1, 2, 4 or 5 and fabric 0, 0, 0 or 2 by the busy
+ * share the GPU driver reports, split at 160, 500 and 800 permille, and the
+ * top states with no share reported. Scrolling a browser went from 24.9 to
+ * 22.1 W on AC with these states and the G17 light effort, against the
+ * M4 Pro's.
+ */
+&clpc {
+	apple,cpu-memory-states = <1 1 3 4>, <0 0 0 0>;
+	apple,cpu-level-mhz = <4512>;
+	apple,gpu-busy-memory-states = <1 2 4 5>, <0 0 0 2>;
+	apple,gpu-busy-permille = <160 500 800>;
+};
+
 / {
 	/*
 	 * The loader fills the operating points, the CS and AFR tables and the
