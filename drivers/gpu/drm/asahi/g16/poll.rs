@@ -945,6 +945,31 @@ impl Firmware {
             };
             stage(&c.its, 0, &mut s.cdm_ticks, crate::usage::Engine::Compute);
         }
+        // UMA manager words at retirement (min/max), compute unit or render allocator.
+        let uma: Option<(usize, &super::object::FwObject, usize)> = if f.renders != 0 {
+            f.job.resources.render.as_ref().and_then(|a| {
+                a.pools.descriptor(f.claims.pass[0] as usize).map(|d| (1, d, 0))
+            })
+        } else if f.claims.slot_count != 0 {
+            f.job
+                .resources
+                .compute_unit(f.claims.slot[0] as usize)
+                .ok()
+                .map(|u| (0, &*u.work, super::fw::work::compute::DESCRIPTOR))
+        } else {
+            None
+        };
+        if let Some((i, d, base)) = uma {
+            for w in 0..12 {
+                if let Ok(v) = d.r32(base + 0x18 + 4 * w) {
+                    if s.uma_max[i][w] == 0 && s.uma_min[i][w] == 0 {
+                        s.uma_min[i][w] = v;
+                    }
+                    s.uma_min[i][w] = s.uma_min[i][w].min(v);
+                    s.uma_max[i][w] = s.uma_max[i][w].max(v);
+                }
+            }
+        }
         if hi > lo {
             s.span_ticks = s.span_ticks.saturating_add(hi - lo);
             // Latency: publication -> start, execution, end -> kick, end -> retirement.
@@ -1172,6 +1197,11 @@ impl Firmware {
                 ns(l[3]),
                 ns(l[4]),
                 ns(l[5])
+            )?;
+            writeln!(
+                f,
+                "uma_{}: words 0x18.. min {:x?} max {:x?}",
+                name, s.uma_min[e], s.uma_max[e]
             )?;
             let seen = &s.seen[e];
             let m = seen[0].max(1);

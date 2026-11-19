@@ -277,6 +277,10 @@ impl PoolSet {
     pub(crate) fn retired(&self, k: usize) -> Result<bool> {
         self.units.get(k).ok_or(EINVAL)?.retired()
     }
+    /// Allocator `k`'s descriptor (statistics).
+    pub(crate) fn descriptor(&self, k: usize) -> Option<&FwObject> {
+        self.units.get(k).map(|u| &*u.descriptor)
+    }
     pub(crate) fn heap_gva(&self, k: usize) -> Result<u64> {
         gva(&self.units.get(k).ok_or(EINVAL)?.heap)
     }

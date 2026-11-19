@@ -322,6 +322,10 @@ pub(crate) struct Stats {
     /// Retired flights whose stamp a poll saw first: count, stamp seen -> retirement ticks,
     /// last end -> stamp seen ticks (compute [0], render [1]).
     pub(crate) seen: [[u64; 3]; 2],
+    /// UMA manager words 0x18..0x48 (u32) seen at retirement, min and max, compute [0] and
+    /// render [1]: whether the firmware ever takes pages from a unit's pool.
+    pub(crate) uma_min: [[u32; 12]; 2],
+    pub(crate) uma_max: [[u32; 12]; 2],
 }
 
 /// Host-side phase timers of publication and polling, on with `debug_flags` bit 49
