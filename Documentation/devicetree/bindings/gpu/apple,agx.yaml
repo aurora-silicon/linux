@@ -132,6 +132,25 @@ properties:
       backend extends the firmware's native delay with its host idle-hold
       control; an absent property preserves the native policy.
 
+  apple,fast-die0-target-temp:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 85
+    maximum: 110
+    description:
+      Die temperature, in degrees Celsius, that the GPU firmware's die
+      temperature limiter holds the GPU below. A board whose enclosure must
+      run the GPU cooler than the firmware default sets it. It can only
+      lower the firmware default (110 C on the G17 family); absent, the
+      default applies.
+
+  apple,fast-die0-release-temp:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 40
+    description:
+      Die temperature, in degrees Celsius, below which the GPU firmware's die
+      temperature limiter releases the GPU. Must be below the target. It can
+      only lower the firmware default; absent, the default applies.
+
   apple,pmp:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: PMP firmware provider owning the GPU power vote and telemetry

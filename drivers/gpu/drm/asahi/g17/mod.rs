@@ -35,6 +35,7 @@ mod cooling;
 pub(crate) mod context;
 mod data_segment;
 mod dependency;
+mod die_limit;
 mod sync_input;
 pub(crate) mod exec_share;
 pub(crate) mod sync_output;
@@ -2146,6 +2147,11 @@ impl Gpu {
             .uat
             .adopt_firmware_root_entries()
             .inspect_err(at("root adoption"))?;
+        if die_limit::DieLimit::read(dev.as_ref().as_ref()).is_set() {
+            // The M5 graph's limiter words move with its firmware's layout (common26 bands);
+            // they are not located here, so its own defaults stay.
+            dev_warn!(dev.as_ref(), "GPU die limit not applied on this firmware build\n");
+        }
         session
             .init
             .build_m5(dev, &session.uat, id, board)

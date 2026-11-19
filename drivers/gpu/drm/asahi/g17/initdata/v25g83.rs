@@ -162,6 +162,7 @@ impl InitData {
                 if let Some(chip) = chip {
                     power.apply_chip(chip)?;
                 }
+                power.apply_die_limit(&env.die_limit);
                 Ok(())
             })?;
         self.object_mut(self.region_c)?
@@ -244,6 +245,9 @@ impl InitData {
                     .write(offset + 4 * index, value)?;
             }
         }
+        let state = env.die_limit.apply(v::STATE_DIE_LIMIT);
+        self.object_mut(objects.power_state)?.write(v::STATE_TEMP_TARGET, state.target_cc)?;
+        self.object_mut(objects.power_state)?.write(v::STATE_TEMP_RELEASE, state.release_cc)?;
 
         let producer = match variant.opening_record {
             true => abi::OPENING_PRODUCER,

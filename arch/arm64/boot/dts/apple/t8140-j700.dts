@@ -2179,6 +2179,15 @@
 
 &gpu {
 	status = "okay";
+	/*
+	 * Our own measurements on this machine, 10 min sustained GPU load:
+	 * macOS holds the hottest GPU die key at or below 105.5 C.  Linux
+	 * with the firmware limiter's default 110 C target peaks at 107.75 C
+	 * (base600 row); a 108 C target peaks at 105.78 C, a 107 C target at
+	 * 104.73 C (die107-600 row, 417 fps vs 460 fps).  107 C is the
+	 * highest target that stays within the macOS level.
+	 */
+	apple,fast-die0-target-temp = <107>;
 };
 
 #include "hwmon-common.dtsi"
