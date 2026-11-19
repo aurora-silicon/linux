@@ -442,7 +442,7 @@ pub(crate) const T8122: PlatformProfile = PlatformProfile {
 /// attaches, provisions the keybag, enrols, matches, and still matches after a
 /// reboot and after suspend; macOS Touch ID keeps working alongside it.
 pub(crate) const T6030: PlatformProfile = PlatformProfile {
-    name: "T6030/J514s",
+    name: "T6030",
     sensor: SensorProfile {
         controller_base: 0x2_8910_8000,
         ..T8122.sensor
@@ -719,9 +719,12 @@ fn select(
     if has(b"apple,t8122") && (has(b"apple,j613") || has(b"apple,j615")) {
         return Ok(&T8122);
     }
-    // Only the board whose ADT was read: J514s. The 16" M3 Pro (J516s)
-    // shares the SoC but its sensor wiring is unchecked.
-    if has(b"apple,t6030") && has(b"apple,j514s") {
+    // Selected by the SoC. The SEP, its DART and spi2 are T6030 blocks at the
+    // same addresses on every T6030 Mac. Whether a board has the sensor wired
+    // is the board device tree's job: a board enables sep_mbox, spi2 and the
+    // mesa node only once its ADT has been read (J514s today); on the others
+    // they stay disabled and nothing binds.
+    if has(b"apple,t6030") {
         return Ok(&T6030);
     }
     // The T6040 profile is tested on J614s and J616s.
@@ -816,8 +819,8 @@ mod tests {
         assert_eq!(picked(&[b"apple,j613", b"apple,t8122"]), Some(T8122.name));
         assert_eq!(picked(&[b"apple,j700", b"apple,t8140"]), Some(T8140.name));
         assert_eq!(picked(&[b"apple,j514s", b"apple,t6030"]), Some(T6030.name));
-        assert_eq!(picked(&[b"apple,j516s", b"apple,t6030"]), None);
-        assert_eq!(picked(&[b"apple,t6030"]), None);
+        assert_eq!(picked(&[b"apple,j516s", b"apple,t6030"]), Some(T6030.name));
+        assert_eq!(picked(&[b"apple,t6030"]), Some(T6030.name));
         assert_eq!(picked(&[b"apple,j616s", b"apple,t6040"]), Some(T6040.name));
         assert_eq!(picked(&[b"apple,t6040"]), None);
         assert_eq!(picked(&[b"apple,j614s", b"apple,t6040"]), Some(T6040.name));
