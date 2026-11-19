@@ -22,7 +22,6 @@
 #include <linux/soc/apple/display.h>
 
 void asahi_g15_sha256(const u8 *data, size_t len, u8 *out);
-bool asahi_g15_board(void);
 bool asahi_g15_machine(const char *compatible);
 void asahi_g15_hold_power(struct device *dev);
 void asahi_g15_release_power(struct device *dev);
@@ -131,8 +130,7 @@ int asahi_g15_pmp_prepare(struct device *dev)
 {
 	int ret;
 
-	if (!asahi_g15_board() || !dev->of_node ||
-	    !of_device_is_compatible(dev->of_node, "apple,agx-t6030"))
+	if (!dev->of_node || !of_device_is_compatible(dev->of_node, "apple,agx-t6030"))
 		return -ENODEV;
 	/* DISP ACK alone does not prove the native DRM component set is up. */
 	/* The direct import waits for the display module to become LIVE; a
@@ -173,8 +171,7 @@ int asahi_g15_display_prepare(struct device *dev)
 
 int asahi_g15_pmp_get(struct device *dev)
 {
-	if (!asahi_g15_board() || !dev->of_node ||
-	    !of_device_is_compatible(dev->of_node, "apple,agx-t6030"))
+	if (!dev->of_node || !of_device_is_compatible(dev->of_node, "apple,agx-t6030"))
 		return -ENODEV;
 	return apple_pmp_set_device_power(0x0f, 5, 1);
 
@@ -203,14 +200,6 @@ void asahi_g15_pmp_put(struct device *dev)
 void asahi_g15_sha256(const u8 *data, size_t len, u8 *out)
 {
 	sha256(data, len, out);
-}
-
-/* Whether this is a J514S/J516S T6030 board. */
-bool asahi_g15_board(void)
-{
-	return of_machine_is_compatible("apple,t6030") &&
-	       (of_machine_is_compatible("apple,j514s") ||
-		of_machine_is_compatible("apple,j516s"));
 }
 
 /* Whether the machine carries this compatible (of_machine_is_compatible()). */

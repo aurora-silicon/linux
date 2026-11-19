@@ -2,8 +2,8 @@
 
 //! Admission and firmware start to READY.
 //!
-//! Admission (no firmware-visible writes): machine check (the T6030 board check
-//! `apple_pmp_t6030_board`, or the SoC's machine compatible), the PMP supplier on a SoC with
+//! Admission (no firmware-visible writes): machine check (the configuration's machine
+//! compatible: the SoC on T6030, the J516C on T6031), the PMP supplier on a SoC with
 //! the PMP AGX vote (`apple_pmp_j514s_gpu_prepare`, may return EPROBE_DEFER), the GPU regions and
 //! segments ([`super::adt`]: the ADT export, or the GPU device tree node), exact firmware TEXT
 //! identity ([`super::identity`]), MMIO windows, runtime-PM hold of the GFX domain.
@@ -57,7 +57,6 @@ pub(crate) mod glue {
 
     extern "C" {
         fn asahi_g15_sha256(data: *const u8, len: usize, out: *mut u8);
-        fn asahi_g15_board() -> bool;
         fn asahi_g15_machine(compatible: *const core::ffi::c_char) -> bool;
         fn asahi_g15_hold_power(dev: *mut core::ffi::c_void);
         fn asahi_g15_release_power(dev: *mut core::ffi::c_void);
@@ -83,12 +82,6 @@ pub(crate) mod glue {
         // SAFETY: `data` is valid for its length and `out` holds the 32-byte digest.
         unsafe { asahi_g15_sha256(data.as_ptr(), data.len(), out.as_mut_ptr()) };
         out
-    }
-
-    /// A J514S/J516S T6030 board (`apple_pmp_t6030_board()`).
-    pub(crate) fn board() -> bool {
-        // SAFETY: Reads the machine compatible strings only.
-        unsafe { asahi_g15_board() }
     }
 
     /// Exact enabled UAT reservation from the maintained boot-loader handoff.
@@ -462,10 +455,13 @@ pub(crate) fn admit(
 ) -> Result<Admitted> {
     let dev = pdev.as_ref();
     let pmp = cfg.platform == hw::Platform::AdtWithPmp;
+    // The SoC (T6031: the board its reference words belong to). The firmware identity below
+    // is what admits a build; no board list is involved on T6030.
+    if !glue::machine(cfg.machine) {
+        dev_err!(dev, "G15: not a {} machine\n", cfg.name);
+        return Err(ENODEV);
+    }
     if pmp {
-        if !glue::board() {
-            return Err(ENODEV);
-        }
         // Retain the PMP supplier (and its AGX bridge) before any vote.
         // SAFETY: `dev` is the bound GPU device.
         let ret = unsafe { glue::asahi_g15_pmp_prepare(dev.as_raw().cast()) };
@@ -476,9 +472,6 @@ pub(crate) fn admit(
             }
             return Err(err);
         }
-    } else if !glue::machine(cfg.machine) {
-        dev_err!(dev, "G15: not a {} machine\n", cfg.name);
-        return Err(ENODEV);
     } else {
         // No PMP vote here, but the first start follows the native display all the same.
         // SAFETY: `dev` is the bound GPU device.

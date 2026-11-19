@@ -6,11 +6,10 @@
 #include <stdio.h>
 
 struct device { void *of_node; };
-static bool board = true, compatible = true;
+static bool compatible = true;
 static int links, votes, link_result, vote_result;
 static int display_calls, display_result;
 static bool display_admitted;
-static bool asahi_g15_board(void) { return board; }
 static bool of_device_is_compatible(void *node, const char *name)
 {
 	(void)node;
@@ -45,10 +44,6 @@ int main(void)
 {
 	struct device dev = { .of_node = &dev };
 
-	board = false;
-	assert(asahi_g15_pmp_prepare(&dev) == -ENODEV);
-	assert(asahi_g15_pmp_get(&dev) == -ENODEV);
-	board = true;
 	compatible = false;
 	assert(asahi_g15_pmp_prepare(&dev) == -ENODEV);
 	assert(asahi_g15_pmp_get(&dev) == -ENODEV);
@@ -77,5 +72,5 @@ int main(void)
 	vote_result = 0;
 	assert(asahi_g15_pmp_get(&dev) == 0);
 	assert(display_calls == 4 && links == 2 && votes == 3);
-	puts("production PMP bridge: board rejection, display-before-PMP admission, defer, ACK errors and exact AGX vote: PASS");
+	puts("production PMP bridge: GPU compatible rejection, display-before-PMP admission, defer, ACK errors and exact AGX vote: PASS");
 }
