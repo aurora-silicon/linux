@@ -2107,6 +2107,7 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 	t6040_ed_map(dev);
 
 	s->mbox = c->mbox;
+	c->ps = s->soc_east;
 	c->wdt = s->wdt;
 	c->cpu_start = s->cpu_start;
 	c->commit = s->mastermini + MASTERMINI_S2R_TIMER;
@@ -2368,6 +2369,14 @@ static const struct apple_sleep_ops t6040_sleep_ops = {
 
 static const struct apple_sleep_soc t6040_sleep_soc = {
 	.unavailable_reason = "T6040 entry is not qualified",
+	.ps = {
+		.ans = PS_ANS,
+		.apcie_gp = PS_APCIE_GP,
+		.apcie_sys_gp = PS_APCIE_SYS_GP,
+		.apcie_st = PS_APCIE_ST0,
+		.apcie_sys_st = PS_APCIE_SYS_ST0,
+		.apcie_phy_sw = PS_APCIE_PHY_SW,
+	},
 	.early_context = true,
 	.own_wake = true,
 	.ops = &t6040_sleep_ops,
