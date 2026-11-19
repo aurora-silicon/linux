@@ -120,9 +120,9 @@ SCHED_FEAT(ASYM_SPREAD, false)
  * whose memory bandwidth is limited per cluster) instead of packing them
  * onto the biggest CPUs; other tasks are placed as usual. Tasks are
  * classified from a per-CPU PMU count of L1D load misses, see
- * mem_spread_tick().
+ * mem_spread_tick(); without such a counter nothing changes.
  */
-SCHED_FEAT(MEM_SPREAD, false)
+SCHED_FEAT(MEM_SPREAD, true)
 
 /*
  * Issue a WARN when we do multiple update_rq_clock() calls

@@ -6365,8 +6365,8 @@ static inline int task_fits_cpu(struct task_struct *p, int cpu)
  * per task over samples with weight 2^-shift, and classified with
  * hysteresis (memory-bound at high, no longer below low). Tasks inherit
  * their parent's state at fork. The counters exist only while MEM_SPREAD
- * is on or debugfs sched/mem_spread/sample is set; the sample setting
- * classifies without changing placement.
+ * (on by default) is on or debugfs sched/mem_spread/sample is set; the
+ * sample setting classifies without changing placement.
  */
 static DEFINE_STATIC_KEY_FALSE(sched_mem_sample);
 
@@ -6462,33 +6462,46 @@ static struct perf_event *mem_spread_create_event(int cpu)
 	return event;
 }
 
-static DEFINE_MUTEX(mem_spread_mutex);
+static inline bool mem_spread_wanted(void)
+{
+	return sched_feat(MEM_SPREAD) || READ_ONCE(mem_spread_sample);
+}
 
+/* Give @cpu its counter if it has none; CPU hotplug lock held. */
+static bool mem_spread_start_cpu(int cpu)
+{
+	struct mem_spread_cpu *ms = per_cpu_ptr(&mem_spread_cpu, cpu);
+	struct perf_event *event;
+
+	if (ms->event)
+		return true;
+	event = mem_spread_create_event(cpu);
+	if (IS_ERR(event))
+		return false;
+	WRITE_ONCE(ms->event, event);
+	return true;
+}
+
+/*
+ * Runs with the CPU hotplug lock held throughout, so the hotplug callbacks
+ * below, which run under it too, see either the old or the new setting.
+ */
 static void mem_spread_update_events(struct work_struct *work)
 {
 	int cpu, nr = 0;
 
-	guard(mutex)(&mem_spread_mutex);
+	guard(cpus_read_lock)();
 
-	if (sched_feat(MEM_SPREAD) || READ_ONCE(mem_spread_sample)) {
-		scoped_guard(cpus_read_lock) {
-			for_each_online_cpu(cpu) {
-				struct mem_spread_cpu *ms = per_cpu_ptr(&mem_spread_cpu, cpu);
-				struct perf_event *event = ms->event;
-
-				if (!event) {
-					event = mem_spread_create_event(cpu);
-					if (IS_ERR(event))
-						continue;
-					WRITE_ONCE(ms->event, event);
-				}
-				nr++;
-			}
-			if (nr)
-				static_branch_enable_cpuslocked(&sched_mem_sample);
-		}
-		if (!nr)
+	if (mem_spread_wanted()) {
+		for_each_online_cpu(cpu)
+			nr += mem_spread_start_cpu(cpu);
+		if (nr) {
+			static_branch_enable_cpuslocked(&sched_mem_sample);
+			pr_info_once("sched: MEM_SPREAD: counting L1D load misses on %d CPUs\n",
+				     nr);
+		} else {
 			pr_info_once("sched: MEM_SPREAD: no L1D load miss counter, nothing classified\n");
+		}
 		return;
 	}
 
@@ -6496,7 +6509,7 @@ static void mem_spread_update_events(struct work_struct *work)
 	 * The tick reads the counters with interrupts disabled, so once no
 	 * tick sees the key any more, none uses a counter either.
 	 */
-	static_branch_disable(&sched_mem_sample);
+	static_branch_disable_cpuslocked(&sched_mem_sample);
 	synchronize_rcu();
 	for_each_possible_cpu(cpu) {
 		struct mem_spread_cpu *ms = per_cpu_ptr(&mem_spread_cpu, cpu);
@@ -6508,6 +6521,40 @@ static void mem_spread_update_events(struct work_struct *work)
 	}
 }
 
+/*
+ * CPU hotplug: perf takes CPU-wide events off a CPU that goes offline and
+ * does not put them back when it returns, so release the counter before
+ * perf's own teardown and create a new one when the CPU is back (suspend
+ * to RAM takes every secondary CPU down and up again). Both run on @cpu
+ * itself.
+ */
+static int mem_spread_cpu_online(unsigned int cpu)
+{
+	if (mem_spread_wanted() && mem_spread_start_cpu(cpu))
+		static_branch_enable_cpuslocked(&sched_mem_sample);
+	return 0;
+}
+
+static int mem_spread_cpu_offline(unsigned int cpu)
+{
+	struct mem_spread_cpu *ms = per_cpu_ptr(&mem_spread_cpu, cpu);
+	struct perf_event *event;
+	unsigned long flags;
+
+	WARN_ON_ONCE(cpu != smp_processor_id());
+
+	/* Only this CPU's tick reads its counter, with interrupts disabled. */
+	local_irq_save(flags);
+	event = ms->event;
+	WRITE_ONCE(ms->event, NULL);
+	ms->last_event = NULL;
+	local_irq_restore(flags);
+
+	if (event)
+		perf_event_release_kernel(event);
+	return 0;
+}
+
 static DECLARE_WORK(mem_spread_work, mem_spread_update_events);
 
 /* Set up or release the counters after MEM_SPREAD or sample changed. */
@@ -6515,6 +6562,24 @@ void sched_mem_spread_update(void)
 {
 	schedule_work(&mem_spread_work);
 }
+
+/*
+ * MEM_SPREAD is on from boot: set the counters up once the CPU PMU drivers
+ * have probed (device initcalls, deferred probes in late initcalls), and
+ * follow CPUs that come and go from then on.
+ */
+static int __init sched_mem_spread_init(void)
+{
+	int ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "sched/mem_spread:online",
+					    mem_spread_cpu_online, mem_spread_cpu_offline);
+
+	if (ret < 0)
+		pr_warn("sched: MEM_SPREAD: no CPU hotplug state (%d), CPUs that go offline lose their counter\n",
+			ret);
+	sched_mem_spread_update();
+	return 0;
+}
+late_initcall_sync(sched_mem_spread_init);
 
 static int mem_spread_sample_get(void *data, u64 *val)
 {
