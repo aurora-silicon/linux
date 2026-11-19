@@ -2328,6 +2328,10 @@ static void t6040_sleep_wake(struct apple_sleep *c)
 	t6040_aop_ps_restore(s);
 	t6040_wake_sync();
 
+	/* Every AP pin but the skipped ones reset in the sleep: all put back */
+	c->pins_lost = c->pins_saved_valid;
+	apple_sleep_restore_pins();
+
 	writel(readl(s->pwrgate + PWRGATE_CPM_0) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_0);
 	writel(readl(s->pwrgate + PWRGATE_CPM_1) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_1);
 	writel(readl(s->pwrgate + PWRGATE_CPM_2) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_2);
