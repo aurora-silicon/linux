@@ -1455,6 +1455,8 @@ static void dcp_v14_idle(struct work_struct *work)
 	if (ret && ret != -ETIMEDOUT && ret != -EAGAIN) {
 		v14->failed = true;
 		dev_err(v14->dev, "DCP notification failed: %d; recovery requires a reboot\n", ret);
+		/* Nothing pumps the link again: stop it queueing events. */
+		dcp_v14_link_fail(&v14->link);
 		dcp_v14_external_stopped(v14);
 	}
 	mutex_unlock(&v14->lock);
