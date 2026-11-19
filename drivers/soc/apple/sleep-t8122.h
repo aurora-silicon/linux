@@ -132,6 +132,11 @@ module_param(t8122_mcc, bool, 0600);
 MODULE_PARM_DESC(t8122_mcc,
 		 "J613 trial: step the memory controller down after the watchdog-control clear, as macOS");
 
+static bool t8122_dump;
+module_param(t8122_dump, bool, 0600);
+MODULE_PARM_DESC(t8122_dump,
+		 "J613 trial: print, before the commit word, the words macOS's intercepted-commit snapshot reads (capture runs 43-49), for a one-to-one diff");
+
 static bool t8122_dry_regs;
 module_param(t8122_dry_regs, bool, 0600);
 MODULE_PARM_DESC(t8122_dry_regs,
@@ -279,6 +284,7 @@ static struct {
 	unsigned int wfi_returns;
 	void __iomem *mcc[5];
 	bool mcc_ok;
+	void __iomem *dump_aon;
 } t8122;
 
 /*
@@ -652,6 +658,11 @@ static int t8122_sleep_map_regs(struct apple_sleep *s)
 		}
 		if (t8122.mcc_ok)
 			dev_info(s->dev, "J613 trial: memory controller stepped down before the gates\n");
+	}
+	if (t8122_dump) {
+		t8122.dump_aon = t8122_map(s, "ps-aon", NULL);
+		if (IS_ERR(t8122.dump_aon))
+			t8122.dump_aon = NULL;
 	}
 	t8122.hpm_notify = t8122_map(s, "spmi-hpm", NULL);
 	if (IS_ERR(t8122.hpm_notify))
@@ -1113,9 +1124,84 @@ static void t8122_sleep_commit_regs(struct apple_sleep *s)
 	writel(0x1c17, s->cllt + T8122_CLLT_LAST);
 }
 
+/*
+ * The same words, in the same order, as macOS's commit snapshot (J613STOP, capture runs 43-49;
+ * docs/j613-stock-sptm-sleep-20261117.md, B3-B5), so the two lists diff line for line. One
+ * "K <base>" line per block, then one value per word. A coprocessor's run registers only with
+ * its CPU domain up (they abort otherwise), as the witness reads them.
+ */
+static void t8122_dump_block(const char *tag, u64 base, void __iomem *reg, u32 first, u32 last,
+			     u32 stride)
+{
+	u32 off;
+	int n = 0;
+
+	t8122_dc_puts("\nK ");
+	t8122_dc_puts(tag);
+	t8122_dc_putc(' ');
+	t8122_dc_hex(upper_32_bits(base));
+	t8122_dc_hex(lower_32_bits(base) + first);
+	for (off = first; off <= last; off += stride) {
+		t8122_dc_putc(n++ % 8 ? ' ' : '\n');
+		t8122_dc_hex(reg ? readl(reg + off) : T8122_W_UNREAD);
+	}
+}
+
+static void t8122_dump_macos(struct apple_sleep *s)
+{
+	static const u32 pwrgate[] = { 0x80, 0x88, 0xcac, 0xcd0, 0xcf0 };
+	unsigned int i;
+
+	t8122_dump_block("ps", 0x2d0700000, s->ps, 0x100, 0x4c0, 8);
+	t8122_dump_block("ps4", 0x2d0700000, s->ps, 0x4000, 0x4060, 8);
+	t8122_dump_block("ps8", 0x2d0700000, s->ps, 0x8000, 0x8020, 8);
+	t8122_dump_block("ps10", 0x2d0700000, s->ps, 0x10000, 0x10000, 8);
+	t8122_dump_block("sep", 0x2d0700000, s->ps, 0xc00, 0xc00, 8);
+	t8122_dump_block("aon", 0x2e4280000, t8122.dump_aon, 0x0, 0x100, 8);
+	t8122_dump_block("wdt", 0x2e42b0000, s->wdt, 0x0, 0x1c, 4);
+	t8122_dump_block("wake", 0x2e4004000, s->wake, 0x0, 0x44, 4);
+	t8122_dc_puts("\nK gate 2d0724000\n");
+	for (i = 0; i < ARRAY_SIZE(pwrgate); i++) {
+		t8122_dc_hex(readl(s->pwrgate + pwrgate[i]));
+		t8122_dc_putc(' ');
+	}
+	t8122_dc_puts("\nK misc cluster/cllt/cpustart/notify\n");
+	t8122_dc_hex(readl(s->cluster + T8122_CLUSTER_E));
+	t8122_dc_putc(' ');
+	t8122_dc_hex(readl(s->cluster + T8122_CLUSTER_P));
+	t8122_dc_putc(' ');
+	t8122_dc_hex(readl(s->cllt + T8122_CLLT_CTL));
+	t8122_dc_putc(' ');
+	t8122_dc_hex(readl(s->cllt + T8122_CLLT_LAST));
+	t8122_dc_putc(' ');
+	t8122_dc_hex(readl(s->cpu_start));
+	t8122_dc_putc(' ');
+	t8122_dc_hex(readl(s->spmi + SPMI_NOTIFY_ENABLE));
+	t8122_dc_putc(' ');
+	t8122_dc_hex(readl(t8122.hpm_notify + SPMI_NOTIFY_ENABLE));
+	t8122_dc_puts("\nK asc control/status (UNREAD = CPU domain down)\n");
+	for (i = 0; i < T8122_W_COPROCS; i++) {
+		bool up = FIELD_GET(PS_ACTUAL, readl(s->ps + t8122_witness_coprocs[i].ps));
+
+		t8122_dc_puts(t8122_witness_coprocs[i].name);
+		t8122_dc_putc('=');
+		if (t8122.asc[i] && up && i != T8122_W_SEP) {
+			t8122_dc_hex(readl(t8122.asc[i] + ASC_CPU_CONTROL));
+			t8122_dc_putc('/');
+			t8122_dc_hex(readl(t8122.asc[i] + ASC_CPU_STATUS));
+		} else {
+			t8122_dc_puts(up ? "up-unread" : "down");
+		}
+		t8122_dc_putc(' ');
+	}
+	t8122_dc_puts("\nK end\n");
+}
+
 /* The mailbox is armed: 'c' before the commit word, 'C' once every line is masked after it. */
 static void t8122_sleep_pre_commit(struct apple_sleep *s)
 {
+	if (READ_ONCE(t8122_dump))
+		t8122_dump_macos(s);
 	t8122_dc_putc('c');
 	/* The hold: the commit word is not written, and the next thing is a reset from outside. */
 	if (READ_ONCE(sleep_untested_hold))
