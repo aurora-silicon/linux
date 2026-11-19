@@ -783,7 +783,14 @@ static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.atomic_state_free	= apple_atomic_state_free,
 	.atomic_check		= drm_atomic_helper_check,
 	.atomic_commit		= apple_atomic_commit,
-	.fb_create		= drm_gem_fb_create,
+	/*
+	 * DCP shows only what a swap gives it, and the firmware may keep
+	 * presenting a cached copy of a frame that has stopped flipping (the
+	 * M4 idle cache does). A client that draws into the scanout buffer
+	 * without a flip (fbcon, a DIRTYFB caller) has its damage turned into
+	 * a commit by the dirty hook, so the drawing reaches the display.
+	 */
+	.fb_create		= drm_gem_fb_create_with_dirty,
 };
 
 static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
