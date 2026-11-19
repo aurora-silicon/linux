@@ -891,12 +891,6 @@ impl Firmware {
                     l[3] += kick - hi;
                 }
                 l[4] += now_t - hi;
-                if f.stamp_seen_ticks >= hi && now_t >= f.stamp_seen_ticks {
-                    let seen = &mut s.seen[li];
-                    seen[0] += 1;
-                    seen[1] += now_t - f.stamp_seen_ticks;
-                    seen[2] += f.stamp_seen_ticks - hi;
-                }
                 if f.renders != 0 {
                     if let Some(arena) = f.job.resources.render.as_ref() {
                         let p = &arena.passes[f.claims.pass[0] as usize];
@@ -906,6 +900,12 @@ impl Firmware {
                             }
                         }
                     }
+                }
+                if f.stamp_seen_ticks >= hi && now_t >= f.stamp_seen_ticks {
+                    let seen = &mut s.seen[li];
+                    seen[0] += 1;
+                    seen[1] += now_t - f.stamp_seen_ticks;
+                    seen[2] += f.stamp_seen_ticks - hi;
                 }
             }
         }
