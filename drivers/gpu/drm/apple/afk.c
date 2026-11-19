@@ -249,6 +249,13 @@ int afk_start(struct apple_dcp_afkep *ep)
 	}
 
 	reinit_completion(&ep->started);
+	/*
+	 * An adopted session's endpoint map went to the bootloader, and RTKit
+	 * starts only endpoints it knows. Registered before anything is sent,
+	 * the endpoint's replies are not reported as an unknown endpoint's.
+	 */
+	if (ep->dcp->hw.afk_adopt_endpoints)
+		apple_rtkit_adopt_ep(ep->dcp->rtk, ep->endpoint);
 	ret = apple_rtkit_start_ep(ep->dcp->rtk, ep->endpoint);
 	if (ret)
 		return ret;

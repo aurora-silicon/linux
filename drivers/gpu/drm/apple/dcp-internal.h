@@ -342,6 +342,12 @@ struct apple_dcp_hw_data {
 	 * without an IOMFB interface version that implies it.
 	 */
 	bool afk_v2;
+	/*
+	 * The RTKit session is taken over without its endpoint map (see
+	 * apple_rtkit_init_adopted()): afk_start() registers each endpoint
+	 * with RTKit before starting it.
+	 */
+	bool afk_adopt_endpoints;
 };
 
 enum dcp_test_point {
