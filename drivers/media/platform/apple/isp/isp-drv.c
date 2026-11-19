@@ -14,6 +14,8 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/sizes.h>
+#include <linux/sort.h>
 #include <linux/suspend.h>
 #include <linux/workqueue.h>
 
@@ -325,6 +327,107 @@ static void apple_isp_select_hw(struct apple_isp *isp)
 	hw->dapf = NULL;
 	hw->num_dapf = 0;
 	hw->fw_idle_ms = 0;
+}
+
+/* A T8132 address filter bank has 16 slices. */
+#define ISP_MAX_DT_DAPF 16
+
+static int isp_mmio_window_cmp(const void *a, const void *b)
+{
+	const struct isp_mmio_window *wa = a, *wb = b;
+
+	return wa->base < wb->base ? -1 : wa->base > wb->base;
+}
+
+/*
+ * The firmware reaches the address filter windows through its DART at their
+ * physical addresses: the 16 KiB pages that contain them, sorted, with
+ * overlapping and adjacent ones merged so that each is mapped once. Returns
+ * their count; @out has room for @num.
+ */
+static unsigned int isp_dapf_mmio_windows(const struct isp_dapf_window *dapf,
+					  unsigned int num,
+					  struct isp_mmio_window *out)
+{
+	unsigned int used = 0;
+
+	for (unsigned int i = 0; i < num; i++) {
+		u64 base = ALIGN_DOWN(dapf[i].start, SZ_16K);
+
+		out[i].base = base;
+		out[i].size = ALIGN(dapf[i].end + 1, SZ_16K) - base;
+	}
+	sort(out, num, sizeof(*out), isp_mmio_window_cmp, NULL);
+
+	for (unsigned int i = 0; i < num; i++) {
+		struct isp_mmio_window *last = used ? &out[used - 1] : NULL;
+
+		if (last && out[i].base <= last->base + last->size) {
+			last->size = max(last->size,
+					 out[i].base + out[i].size - last->base);
+			continue;
+		}
+		out[used++] = out[i];
+	}
+
+	return used;
+}
+
+/*
+ * With hw->dapf_from_dt, apple,dapf-ranges has the address filter windows of
+ * the ADT's ISP DART, inclusive start and end pairs in record order, which
+ * the boot loader copies. Without them the firmware cannot run again after
+ * its first power-down, so the camera is not used.
+ */
+static int apple_isp_of_dapf(struct apple_isp *isp)
+{
+	struct device *dev = isp->dev;
+	struct apple_isp_hw *hw = &isp->hw_local;
+	struct isp_dapf_window *dapf;
+	struct isp_mmio_window *mmio;
+	unsigned int num;
+	u64 *ranges;
+	int n;
+
+	if (!hw->dapf_from_dt)
+		return 0;
+
+	n = of_property_count_u64_elems(dev->of_node, "apple,dapf-ranges");
+	if (n == -EINVAL)
+		return dev_err_probe(dev, -ENODEV,
+				     "the boot loader gave no address filter (apple,dapf-ranges)\n");
+	if (n <= 0 || n % 2 || n / 2 > ISP_MAX_DT_DAPF)
+		return dev_err_probe(dev, -EINVAL,
+				     "apple,dapf-ranges needs 1 to %d start and end pairs\n",
+				     ISP_MAX_DT_DAPF);
+	num = n / 2;
+
+	ranges = devm_kcalloc(dev, n, sizeof(*ranges), GFP_KERNEL);
+	dapf = devm_kcalloc(dev, num, sizeof(*dapf), GFP_KERNEL);
+	mmio = devm_kcalloc(dev, num, sizeof(*mmio), GFP_KERNEL);
+	if (!ranges || !dapf || !mmio)
+		return -ENOMEM;
+
+	n = of_property_read_u64_array(dev->of_node, "apple,dapf-ranges", ranges, n);
+	if (n)
+		return dev_err_probe(dev, n, "failed to read apple,dapf-ranges\n");
+
+	for (unsigned int i = 0; i < num; i++) {
+		dapf[i].start = ranges[2 * i];
+		dapf[i].end = ranges[2 * i + 1];
+		if (dapf[i].end < dapf[i].start || dapf[i].end > U64_MAX - SZ_16K)
+			return dev_err_probe(dev, -EINVAL,
+					     "address filter window %u 0x%llx-0x%llx is invalid\n",
+					     i, dapf[i].start, dapf[i].end);
+	}
+	devm_kfree(dev, ranges);
+
+	hw->dapf = dapf;
+	hw->num_dapf = num;
+	hw->fw_mmio = mmio;
+	hw->num_fw_mmio = isp_dapf_mmio_windows(dapf, num, mmio);
+
+	return 0;
 }
 
 /*
@@ -751,6 +854,10 @@ static int apple_isp_probe(struct platform_device *pdev)
 	}
 
 	apple_isp_select_hw(isp);
+
+	err = apple_isp_of_dapf(isp);
+	if (err)
+		goto free_isp;
 
 	err = apple_isp_attach_genpd(isp);
 	if (err) {
@@ -1224,36 +1331,6 @@ static const struct apple_isp_hw apple_isp_hw_t6040 = {
 	.meta_exposure = true,
 };
 
-/* T8132: the firmware's MMIO windows, from the J713 ADT's DART address filter */
-static const struct isp_mmio_window apple_isp_fw_mmio_t8132[] = {
-	{ 0x220004000, 0x1d4000 },	/* DSID broadcast-clear windows */
-	{ 0x222004000, 0x1d4000 },
-	{ 0x3803c0000, 0x28000 },	/* PMGR, with the PMP clock scratch */
-	{ 0x380704000, 0x4000 },	/* PMGR, ISP power states */
-	{ 0x380730000, 0x4000 },
-	{ 0x380e3c000, 0x4000 },
-	{ 0x382824000, 0x4000 },	/* PMP bandwidth scratch */
-	{ 0x39062c000, 0x20000 },
-	{ 0x501660000, 0x4000 },
-};
-
-/* The ADT's DART address filter windows, in its order and with its ends */
-static const struct isp_dapf_window apple_isp_dapf_t8132[] = {
-	{ 0x380704000, 0x380704063 },	/* PMGR, ISP power states */
-	{ 0x380730000, 0x380733fff },
-	{ 0x380e3c000, 0x380e3c003 },
-	{ 0x39062c000, 0x390648003 },
-	{ 0x501660000, 0x501660003 },
-	{ 0x220004000, 0x2200162fc },	/* DSID broadcast-clear windows */
-	{ 0x220044000, 0x2200562fc },
-	{ 0x2201c4000, 0x2201d62fc },
-	{ 0x222004000, 0x2220162fc },
-	{ 0x222044000, 0x2220562fc },
-	{ 0x2221c4000, 0x2221d62fc },
-	{ 0x3803c0000, 0x3803e4000 },	/* PMGR, with the PMP clock scratch */
-	{ 0x382824000, 0x382824004 },	/* PMP bandwidth scratch */
-};
-
 /*
  * T8132 runs T6040's coprocessor and firmware interface, booted the same
  * way. Its two AMCCs (ADT mcc amcc_aperture_count) give two broadcast-clear
@@ -1261,7 +1338,7 @@ static const struct isp_dapf_window apple_isp_dapf_t8132[] = {
  * sent: T8132's PMP scratch offsets are not established. Its firmware
  * starts again from its data segment as loaded once the coprocessor was
  * quiesced before the power-down, so the ISP is powered only while the
- * camera is in use.
+ * camera is in use. The boot loader gives its address filter windows.
  */
 static const struct apple_isp_hw apple_isp_hw_t8132 = {
 	.gen = ISP_GEN_T6040,
@@ -1278,10 +1355,7 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
 	.scl1 = true,
 	.lpdp = false,
 	.meta_size = ISP_META_SIZE_T8140,
-	.fw_mmio = apple_isp_fw_mmio_t8132,
-	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8132),
-	.dapf = apple_isp_dapf_t8132,
-	.num_dapf = ARRAY_SIZE(apple_isp_dapf_t8132),
+	.dapf_from_dt = true,
 
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
 	.coproc_status = ISP_COPROC_STATUS_T8140,
