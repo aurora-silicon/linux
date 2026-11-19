@@ -313,6 +313,11 @@
 	};
 };
 
+&pmp {
+	/* The PMP firmware's SRAM kept over a sleep: offset, size */
+	apple,sram-keep = <0x61000 0x7d000>;
+};
+
 &pmc {
 	/*
 	 * The SoC rail at its highest state. The video encoder runs on
