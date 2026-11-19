@@ -34,9 +34,33 @@
 	};
 
 	/*
+	 * The speaker: the AOP audio component's speaker back-end (DAI 3) to
+	 * the SN012776. Its playback waits for a protection lease (macaudio).
+	 */
+	sound: sound {
+		compatible = "apple,j773g-macaudio", "apple,macaudio";
+		model = "Mac mini J773g";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Speaker";
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker>;
+			};
+		};
+	};
+
+	/*
 	 * The headphone jack: the AOP audio component's jack back-end (DAI 4)
 	 * to the CS42L84 (ADT /arm-io/i2c1/audio-codec-output), a card of its
-	 * own as on the M4 Pro Mac mini. The speaker has no card yet.
+	 * own as on the M4 Pro Mac mini.
 	 */
 	sound_jack: sound-jack {
 		compatible = "apple,j773-macaudio-jack", "apple,macaudio";
@@ -78,22 +102,24 @@
 };
 
 /*
- * No microphones (ADT iop-audio-controller has no audio-hp): only the jack's
- * streams, "cout" and "cin" on base-ns ADMAC channels 4 and 5 (ADT
- * audio-codec-output and audio-codec-input), as on the M4 Pro Mac mini.
- * Without a "dma" channel the AOP audio component attaches no PDM device.
+ * No microphones (ADT iop-audio-controller has no audio-hp): the speaker's
+ * stream, "spkr" on base-ns ADMAC channel 0 (ADT audio-speaker, which lists
+ * no RX channel, so no "sense"), and the jack's, "cout" and "cin" on
+ * channels 4 and 5 (ADT audio-codec-output and audio-codec-input), as on the
+ * M4 Pro Mac mini. Without a "dma" channel the AOP audio component attaches
+ * no PDM device.
  */
 &aop_audio {
-	dmas = <&admac1 4>, <&admac1 5>;
-	dma-names = "cout", "cin";
+	dmas = <&admac1 0>, <&admac1 4>, <&admac1 5>;
+	dma-names = "spkr", "cout", "cin";
 	apple,chassis-name = "J773g";
 	apple,machine-kind = "Mac mini";
 };
 
 /*
  * The SN012776 speaker amp (ADT /arm-io/i2c3/audio-speaker at 0x38, mono,
- * speaker-protection 0): interrupt on AP GPIO 14, level low. Disabled
- * until the speaker has a sound card and a protection profile.
+ * speaker-protection 0): interrupt on AP GPIO 14, level low, held in
+ * hardware shutdown until the sound card enables it.
  */
 &i2c3 {
 	status = "okay";
@@ -105,11 +131,10 @@
 		apple,sdz-group-fail-closed;
 		apple,deferred-shutdown;
 		#sound-dai-cells = <0>;
-		sound-name-prefix = "Speaker";
+		/* No sound-name-prefix: a mono speaker's controls go unprefixed (macaudio). */
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <0>;
 		ti,vmon-slot-no = <2>;
-		status = "disabled";
 	};
 };
 
