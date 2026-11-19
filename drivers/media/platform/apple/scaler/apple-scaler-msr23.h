@@ -34,7 +34,8 @@
 
 /*
  * The sizes the builder was checked over on hardware: even, 64 pixels to
- * 4096 wide and 4K UHD in area, at most 4x down or up per axis.
+ * 4096 wide and 4K UHD in area, at most 4x down or up per axis. The same
+ * holds for the crop and compose rectangles.
  */
 #define MSR23_MIN_SIZE		64
 #define MSR23_MAX_WIDTH		4096
@@ -76,11 +77,23 @@ struct msr23_pic {
  * struct msr23_job - a conversion
  * @src: source picture
  * @dst: destination picture
+ * @crop: the part of the source read (a zero width: all of it)
+ * @compose: the part of the destination written (a zero width: all of it);
+ *	the rest of the destination is left as it is. The caller adds
+ *	&msr23_built.dst_off to the destination pointers.
+ * @rotate: clockwise rotation in degrees: 0, 90, 180 or 270
+ * @hflip: mirror the result left to right, after the rotation
+ * @vflip: mirror the result top to bottom, after the rotation
  * @enc: Y'CbCr encoding of the Y'CbCr side (both sides: the same)
  * @full: that side is full range
+ *
+ * The rectangles are in pixels, with even origins and sizes.
  */
 struct msr23_job {
 	struct msr23_pic src, dst;
+	struct v4l2_rect crop, compose;
+	u16 rotate;
+	bool hflip, vflip;
 	enum v4l2_ycbcr_encoding enc;
 	bool full;
 };
@@ -90,10 +103,13 @@ struct msr23_job {
  * @nc0: NC0 spill pages (16 KiB each)
  * @nc1: NC1 spill pages
  * @planes: number of planes of the source and of the destination
+ * @dst_off: bytes to add to each destination plane's pointer (the compose
+ *	rectangle's origin)
  */
 struct msr23_built {
 	u32 nc0, nc1;
 	u8 planes[2];
+	u32 dst_off[2];
 };
 
 bool msr23_format_ok(u32 fourcc);

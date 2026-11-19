@@ -12,7 +12,11 @@
  * The OUTPUT queue takes the source image, the CAPTURE queue the result.
  * The MMIO engines convert between formats at the same size: Y'CbCr <->
  * R'G'B' with the colorimetry of the Y'CbCr side, chroma resampling and
- * alpha fill. MSR23 converts and scales (up to 4x either way per axis).
+ * alpha fill. MSR23 converts and scales (up to 4x either way per axis). It
+ * also reads a crop of the source (OUTPUT crop selection), writes into a
+ * rectangle of the destination (CAPTURE compose selection), rotates in
+ * quarter turns and mirrors (V4L2_CID_ROTATE, _HFLIP, _VFLIP: the mirrors
+ * apply to the rotated picture).
  */
 #include <linux/crc32.h>
 #include <linux/delay.h>
@@ -117,6 +121,13 @@ struct apple_scaler_ctx {
 	 */
 	u32 dst_ycbcr_req, dst_quant_req;
 	u32 sequence;
+
+	/* MSR23 geometry: the source region read, the destination region written. */
+	struct v4l2_rect crop, compose;
+	struct v4l2_ctrl_handler hdl;
+	struct v4l2_ctrl *rotate_ctrl;
+	u16 rotate;
+	bool hflip, vflip;
 };
 
 static struct apple_scaler_ctx *asc_file_to_ctx(struct file *file)
@@ -478,6 +489,27 @@ static void asc_fill(const struct apple_scaler *asc, struct v4l2_pix_format_mpla
 		pix->xfer_func = V4L2_MAP_XFER_FUNC_DEFAULT(pix->colorspace);
 }
 
+static struct v4l2_rect asc_full_rect(const struct v4l2_pix_format_mplane *pix)
+{
+	return (struct v4l2_rect){ 0, 0, pix->width, pix->height };
+}
+
+/*
+ * After a format change: a rectangle that covered the whole old picture
+ * covers the whole new one; one set by the application stays while it fits
+ * (v4l2-ctl sets the CAPTURE format again after the selection, when it starts
+ * streaming).
+ */
+static void asc_fit_rect(struct v4l2_rect *r, u32 old_w, u32 old_h,
+			 const struct v4l2_pix_format_mplane *pix)
+{
+	bool whole = !r->left && !r->top && r->width == old_w && r->height == old_h;
+
+	if (whole || (u64)r->left + r->width > pix->width ||
+	    (u64)r->top + r->height > pix->height)
+		*r = asc_full_rect(pix);
+}
+
 static int asc_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
 {
 	strscpy(cap->driver, ASC_NAME, sizeof(cap->driver));
@@ -550,12 +582,16 @@ static int asc_try_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
 static int asc_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct apple_scaler_ctx *ctx = asc_file_to_ctx(file);
+	u32 w, h;
 
 	if (vb2_is_busy(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)) ||
 	    vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
 		return -EBUSY;
 	asc_fill(asc_file_to_ctx(file)->asc, &f->fmt.pix_mp, NULL, V4L2_PIX_FMT_NV12M);
+	w = ctx->src.width;
+	h = ctx->src.height;
 	ctx->src = f->fmt.pix_mp;
+	asc_fit_rect(&ctx->crop, w, h, &ctx->src);
 	/*
 	 * Re-derive CAPTURE from the new source, with the matrix and range it was asked for: a
 	 * CAPTURE format set before this (v4l2-ctl sets CAPTURE first) took them from the previous
@@ -563,20 +599,98 @@ static int asc_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 	 */
 	ctx->dst.ycbcr_enc = ctx->dst_ycbcr_req;
 	ctx->dst.quantization = ctx->dst_quant_req;
+	w = ctx->dst.width;
+	h = ctx->dst.height;
 	asc_fill(ctx->asc, &ctx->dst, &ctx->src, V4L2_PIX_FMT_ARGB32);
+	asc_fit_rect(&ctx->compose, w, h, &ctx->dst);
 	return 0;
 }
 
 static int asc_s_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct apple_scaler_ctx *ctx = asc_file_to_ctx(file);
+	u32 w, h;
 
 	if (vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
 		return -EBUSY;
 	ctx->dst_ycbcr_req = f->fmt.pix_mp.ycbcr_enc;
 	ctx->dst_quant_req = f->fmt.pix_mp.quantization;
 	asc_fill(ctx->asc, &f->fmt.pix_mp, &ctx->src, V4L2_PIX_FMT_ARGB32);
+	w = ctx->dst.width;
+	h = ctx->dst.height;
 	ctx->dst = f->fmt.pix_mp;
+	asc_fit_rect(&ctx->compose, w, h, &ctx->dst);
+	return 0;
+}
+
+/*
+ * MSR23: crop on the OUTPUT queue is the part of the source read, compose on
+ * the CAPTURE queue the part of the destination written. The engine leaves
+ * the rest of the CAPTURE buffer as it is, so COMPOSE_PADDED is the compose
+ * rectangle. Rectangles are even and at least 64 pixels, like the formats.
+ */
+static int asc_g_selection(struct file *file, void *priv, struct v4l2_selection *s)
+{
+	struct apple_scaler_ctx *ctx = asc_file_to_ctx(file);
+	bool out = s->type == V4L2_BUF_TYPE_VIDEO_OUTPUT;
+
+	if (!out && s->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+	switch (s->target) {
+	case V4L2_SEL_TGT_CROP:
+		if (!out)
+			return -EINVAL;
+		s->r = ctx->crop;
+		return 0;
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		if (!out)
+			return -EINVAL;
+		s->r = asc_full_rect(&ctx->src);
+		return 0;
+	case V4L2_SEL_TGT_COMPOSE:
+	case V4L2_SEL_TGT_COMPOSE_PADDED:
+		if (out)
+			return -EINVAL;
+		s->r = ctx->compose;
+		return 0;
+	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
+	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
+		if (out)
+			return -EINVAL;
+		s->r = asc_full_rect(&ctx->dst);
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int asc_s_selection(struct file *file, void *priv, struct v4l2_selection *s)
+{
+	struct apple_scaler_ctx *ctx = asc_file_to_ctx(file);
+	bool out = s->type == V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	const struct v4l2_pix_format_mplane *pix = out ? &ctx->src : &ctx->dst;
+	struct v4l2_rect r;
+	bool le;
+
+	if (out ? s->target != V4L2_SEL_TGT_CROP :
+		  (s->type != V4L2_BUF_TYPE_VIDEO_CAPTURE || s->target != V4L2_SEL_TGT_COMPOSE))
+		return -EINVAL;
+	if (vb2_is_streaming(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)) ||
+	    vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+		return -EBUSY;
+	/* even: round outwards, or inwards when only V4L2_SEL_FLAG_LE is set */
+	le = (s->flags & (V4L2_SEL_FLAG_LE | V4L2_SEL_FLAG_GE)) == V4L2_SEL_FLAG_LE;
+	r.width = clamp_t(u32, le ? ALIGN_DOWN(s->r.width, 2) : ALIGN(s->r.width, 2),
+			  MSR23_MIN_SIZE, pix->width);
+	r.height = clamp_t(u32, le ? ALIGN_DOWN(s->r.height, 2) : ALIGN(s->r.height, 2),
+			   MSR23_MIN_SIZE, pix->height);
+	r.left = clamp_t(s32, le ? ALIGN(s->r.left, 2) : s->r.left & ~1, 0, pix->width - r.width);
+	r.top = clamp_t(s32, le ? ALIGN(s->r.top, 2) : s->r.top & ~1, 0, pix->height - r.height);
+	if (out)
+		ctx->crop = r;
+	else
+		ctx->compose = r;
+	s->r = r;
 	return 0;
 }
 
@@ -591,6 +705,8 @@ static const struct v4l2_ioctl_ops asc_ioctl_ops = {
 	.vidioc_try_fmt_vid_cap_mplane = asc_try_fmt_cap,
 	.vidioc_s_fmt_vid_out_mplane = asc_s_fmt_out,
 	.vidioc_s_fmt_vid_cap_mplane = asc_s_fmt_cap,
+	.vidioc_g_selection = asc_g_selection,
+	.vidioc_s_selection = asc_s_selection,
 
 	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
 	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
@@ -695,6 +811,9 @@ static int asc_start_streaming(struct vb2_queue *q, unsigned int count)
 		asc_return_bufs(q, VB2_BUF_STATE_QUEUED);
 		return -EINVAL;
 	}
+	/* a rotation changes which sizes fit: fixed while either queue streams */
+	if (ctx->rotate_ctrl)
+		v4l2_ctrl_grab(ctx->rotate_ctrl, true);
 	if (V4L2_TYPE_IS_OUTPUT(q->type))
 		ctx->sequence = 0;
 	return 0;
@@ -702,7 +821,14 @@ static int asc_start_streaming(struct vb2_queue *q, unsigned int count)
 
 static void asc_stop_streaming(struct vb2_queue *q)
 {
+	struct apple_scaler_ctx *ctx = vb2_get_drv_priv(q);
+	struct vb2_queue *other = V4L2_TYPE_IS_OUTPUT(q->type) ?
+				  v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx) :
+				  v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx);
+
 	asc_return_bufs(q, VB2_BUF_STATE_ERROR);
+	if (ctx->rotate_ctrl && !vb2_is_streaming(other))
+		v4l2_ctrl_grab(ctx->rotate_ctrl, false);
 }
 
 static const struct vb2_ops asc_qops = {
@@ -734,6 +860,50 @@ static int asc_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 	return ret ?: asc_init_queue(priv, dst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 }
 
+/* ---- controls --------------------------------------------------------- */
+
+static int asc_s_ctrl(struct v4l2_ctrl *c)
+{
+	struct apple_scaler_ctx *ctx = container_of(c->handler, struct apple_scaler_ctx, hdl);
+
+	switch (c->id) {
+	case V4L2_CID_ROTATE:
+		ctx->rotate = c->val;
+		return 0;
+	case V4L2_CID_HFLIP:
+		ctx->hflip = c->val;
+		return 0;
+	case V4L2_CID_VFLIP:
+		ctx->vflip = c->val;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static const struct v4l2_ctrl_ops asc_ctrl_ops = {
+	.s_ctrl = asc_s_ctrl,
+};
+
+/* MSR23: rotation in quarter turns and the mirrors (of the rotated picture). */
+static int asc_ctrls_init(struct apple_scaler_ctx *ctx)
+{
+	struct v4l2_ctrl_handler *hdl = &ctx->hdl;
+
+	v4l2_ctrl_handler_init(hdl, 3);
+	ctx->rotate_ctrl = v4l2_ctrl_new_std(hdl, &asc_ctrl_ops, V4L2_CID_ROTATE, 0, 270, 90, 0);
+	v4l2_ctrl_new_std(hdl, &asc_ctrl_ops, V4L2_CID_HFLIP, 0, 1, 1, 0);
+	v4l2_ctrl_new_std(hdl, &asc_ctrl_ops, V4L2_CID_VFLIP, 0, 1, 1, 0);
+	if (hdl->error) {
+		int ret = hdl->error;
+
+		v4l2_ctrl_handler_free(hdl);
+		ctx->rotate_ctrl = NULL;
+		return ret;
+	}
+	ctx->fh.ctrl_handler = hdl;
+	return 0;
+}
+
 /* ---- file operations -------------------------------------------------- */
 
 static int asc_open(struct file *file)
@@ -754,12 +924,23 @@ static int asc_open(struct file *file)
 	ctx->dst.height = 1080;
 	ctx->dst.pixelformat = V4L2_PIX_FMT_ARGB32;
 	asc_fill(ctx->asc, &ctx->dst, &ctx->src, V4L2_PIX_FMT_ARGB32);
+	ctx->crop = asc_full_rect(&ctx->src);
+	ctx->compose = asc_full_rect(&ctx->dst);
 	v4l2_fh_init(&ctx->fh, video_devdata(file));
+	if (asc->variant->fw_fronted) {
+		ret = asc_ctrls_init(ctx);
+		if (ret) {
+			v4l2_fh_exit(&ctx->fh);
+			kfree(ctx);
+			return ret;
+		}
+	}
 
 	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(asc->m2m_dev, ctx, asc_queue_init);
 	if (IS_ERR(ctx->fh.m2m_ctx)) {
 		ret = PTR_ERR(ctx->fh.m2m_ctx);
 		v4l2_fh_exit(&ctx->fh);
+		v4l2_ctrl_handler_free(&ctx->hdl);
 		kfree(ctx);
 		return ret;
 	}
@@ -777,6 +958,7 @@ static int asc_release(struct file *file)
 	mutex_unlock(&asc->lock);
 	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
+	v4l2_ctrl_handler_free(&ctx->hdl);
 	kfree(ctx);
 	return 0;
 }
@@ -1345,6 +1527,11 @@ static int msr23_job_of(const struct apple_scaler_ctx *ctx, struct msr23_job *jo
 	msr23_pic(&job->dst, d);
 	job->enc = msr23_enc(y);
 	job->full = msr23_full(y);
+	job->crop = ctx->crop;
+	job->compose = ctx->compose;
+	job->rotate = ctx->rotate;
+	job->hflip = ctx->hflip;
+	job->vflip = ctx->vflip;
 	return msr23_check(job);
 }
 
@@ -1425,7 +1612,7 @@ static int msr23_run(struct msr23 *m, struct apple_scaler_ctx *ctx, struct vb2_b
 	for (k = 0; k < out.planes[0]; k++)
 		msr23_ptr(img, MSR23_PTR_SRC(k), msr23_plane(&ctx->src, src, k));
 	for (k = 0; k < out.planes[1]; k++)
-		msr23_ptr(img, MSR23_PTR_DST(k), msr23_plane(&ctx->dst, dst, k));
+		msr23_ptr(img, MSR23_PTR_DST(k), msr23_plane(&ctx->dst, dst, k) + out.dst_off[k]);
 	/*
 	 * Block 0 +0x60 is the frame id too: it must equal the record's word 1
 	 * (the tiler refuses a job where they differ).
@@ -1752,6 +1939,11 @@ static int asc_register_video(struct apple_scaler *asc)
 	vdev->v4l2_dev = &asc->v4l2_dev;
 	vdev->vfl_dir = VFL_DIR_M2M;
 	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
+	/* crop and compose: MSR23 only (the MMIO engines convert at the same size) */
+	if (!asc->variant->fw_fronted) {
+		v4l2_disable_ioctl(vdev, VIDIOC_G_SELECTION);
+		v4l2_disable_ioctl(vdev, VIDIOC_S_SELECTION);
+	}
 	video_set_drvdata(vdev, asc);
 	return video_register_device(vdev, VFL_TYPE_VIDEO, APPLE_M2M_VIDEO_NR);
 }
