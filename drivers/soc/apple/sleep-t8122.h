@@ -300,8 +300,9 @@ static struct {
 static const u32 t8122_macos_wake_masks[] = {
 	0xffffeff7, 0xfff7ffff, 0xf877fbff, 0xffffd7ef, 0xf7ff7ffc, 0xfef7ffdf, 0x0006ffff,
 };
-static const u16 t8122_macos_ps_off[] = { 0x1e8, 0x238, 0x240, 0x248, 0x2a8, 0x2c8 };
-static const u16 t8122_macos_aon_off[] = { 0x80, 0x88 };
+/* Second diff (d2 on n4): FPWM1 and MCA2 still partly on, and the other port's ATC1 domains. */
+static const u16 t8122_macos_ps_off[] = { 0x1e8, 0x220, 0x238, 0x240, 0x248, 0x2a8, 0x2c8, 0x3a8 };
+static const u16 t8122_macos_aon_off[] = { 0x80, 0x88, 0xb8, 0xc8 };
 
 static void t8122_macos_state_apply(struct apple_sleep *s)
 {
