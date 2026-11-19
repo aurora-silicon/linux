@@ -79,8 +79,6 @@ mod agx_memory;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod agx_resources;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-mod agx_status;
-#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod agx_uapi;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod g15_raw;
@@ -140,8 +138,6 @@ mod m3_compute_layout;
 mod m3_compute_sequence;
 
 mod m3_compute_storage;
-
-mod m3_coverage;
 
 mod m3_init_layout;
 
