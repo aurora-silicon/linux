@@ -334,6 +334,8 @@ enum isp_sensor_id {
 	ISP_IMX853_7622_01,
 	ISP_IMX913_7523_01,
 	ISP_IMX958_2224_01,
+	ISP_IMX958_2226_01,	/* J815 module tunings (macOS appleh16camerad) */
+	ISP_IMX958_2226_02,
 	ISP_VD56G0_6221_01,
 	ISP_VD56G0_6222_01,
 };
@@ -370,6 +372,8 @@ struct apple_isp {
 	bool preview_26;
 	u32 platform_id;
 	u32 temporal_filter;
+	/* setfile name of the board's camera module (DT apple,module-tuning), or NULL */
+	const char *module_tuning;
 	u32 cam_connections_scheme;
 	struct isp_preset *presets;
 	int num_presets;
