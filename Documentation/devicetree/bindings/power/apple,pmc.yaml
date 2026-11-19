@@ -268,6 +268,13 @@ patternProperties:
           The SMC, whose package power reading the low-power platform profile
           holds the CPU clusters to.
 
+      apple,low-power-frequency-max-mhz:
+        description:
+          The machine's CPU frequency ceiling in macOS's Low Power mode, in
+          MHz, as the ADT's cpu-low-power-frequency-max has it. The low-power
+          platform profile holds the CPU clusters to it, up to the next
+          frequency of their tables.
+
     required:
       - compatible
       - reg
