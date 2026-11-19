@@ -693,7 +693,8 @@
 / {
 	firmware {
 		atc0-handoff {
-			compatible = "apple,j714s-atc0-handoff";
+			compatible = "apple,atc-handoff";
+			apple,phy = <&atc0_phy>;
 			apple,devices = <&ps_atc0_common>,
 				<&ps_atc0_usb_aon>,
 				<&ps_atc0_usb>,
