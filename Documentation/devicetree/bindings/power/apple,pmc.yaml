@@ -268,6 +268,13 @@ patternProperties:
           The SMC, whose package power reading the low-power platform profile
           holds the CPU clusters to.
 
+      apple,high-power-mode:
+        type: boolean
+        description:
+          The machine has macOS's High Power mode. The performance platform
+          profile then tells the SMC, over apple,smc, that the mode is on,
+          which lifts the ceiling of its fan policy.
+
     required:
       - compatible
       - reg
