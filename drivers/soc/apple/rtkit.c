@@ -96,7 +96,6 @@ enum {
 #define APPLE_RTKIT_OSLOG_TYPE GENMASK_ULL(63, 56)
 #define APPLE_RTKIT_OSLOG_BUFFER_REQUEST 1
 #define APPLE_RTKIT_OSLOG_LOG 2
-#define APPLE_RTKIT_OSLOG_LOG_RESERVED GENMASK_ULL(55, 32)
 #define APPLE_RTKIT_OSLOG_SIZE GENMASK_ULL(55, 36)
 #define APPLE_RTKIT_OSLOG_IOVA GENMASK_ULL(35, 0)
 
@@ -1359,6 +1358,8 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 	 * A firmware counts its log writes and holds the next counter until the last is
 	 * echoed, and with one outstanding takes no AP power notice: a DCP after a warm
 	 * restart, the MTP and the SMC after about eight sleeps. macOS echoes every one.
+	 * The counter is cumulative, so echoing the newest one acknowledges every write
+	 * before it.
 	 */
 	if (type == APPLE_RTKIT_OSLOG_LOG && rtk->oslog_echo) {
 		/* A polled idle that came first echoed it already. */
@@ -1373,10 +1374,8 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 		return;
 	}
 
-	/* Preserve the tested Neo/M5 and synchronous-log no-ACK policy. */
-	if (type == APPLE_RTKIT_OSLOG_LOG &&
-	    (rtk->sync_syslog_ack || of_machine_is_compatible("apple,t8140") ||
-	     of_machine_is_compatible("apple,t8142"))) {
+	/* A client that turned the echo off (apple_rtkit_set_oslog_echo()) drops them. */
+	if (type == APPLE_RTKIT_OSLOG_LOG) {
 		dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
 		return;
 	}
@@ -1385,24 +1384,6 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 	case APPLE_RTKIT_OSLOG_BUFFER_REQUEST:
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->oslog_buffer,
 						 APPLE_RTKIT_EP_OSLOG, msg);
-		break;
-	case APPLE_RTKIT_OSLOG_LOG:
-		/* Channel zero reports a cumulative 32-bit write counter. Even
-		 * though we discard these logs, acknowledge that exact counter:
-		 * AppleDCP waits for its log transport to drain before AP sleep.
-		 * This is not a buffer offset and may wrap. Other channels do not
-		 * have a buffer admitted by this endpoint implementation. An inherited
-		 * channel zero needs no buffer mapping to acknowledge its counter.
-		 */
-		if ((!rtk->oslog_buffer.size && !rtk->oslog_inherited) ||
-		    (msg & APPLE_RTKIT_OSLOG_LOG_RESERVED)) {
-			dev_warn(rtk->dev, "RTKit: invalid oslog notification: %llx\n", msg);
-			break;
-		}
-		err = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_OSLOG,
-					       msg, NULL, false);
-		if (err)
-			dev_err(rtk->dev, "RTKit: oslog acknowledgment failed: %d\n", err);
 		break;
 	case 3 ... 5:
 		/*
@@ -1420,15 +1401,17 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 
 /* Registry-v2 firmware requests one 8 KiB auxiliary buffer at endpoint 7.
  * Identical requests reuse the session buffer; changed geometry is refused.
- * On the J714s the same endpoint also carries a CoreAnalytics event with every
- * field zero, some minutes after the PMP has started; it is acknowledged with
- * an event acknowledgement whose fields are zero too, as the CoreAnalytics
+ * The same endpoint also carries a CoreAnalytics event with every field zero,
+ * some minutes after the PMP has started (seen on the J714s); it is acknowledged
+ * with an event acknowledgement whose fields are zero too, as the CoreAnalytics
  * endpoint of other coprocessors acknowledges an event
- * (apple_rtkit_coreanalytics_rx()). Any other message is refused as before.
+ * (apple_rtkit_coreanalytics_rx()). That is the registry-v2 firmware's endpoint
+ * protocol, not a board's: the reply only ever answers that exact word from the
+ * firmware. Any other message is refused as before.
  */
 static void apple_rtkit_pmp_aux_rx(struct apple_rtkit *rtk, u64 msg)
 {
-	if (rtk->pmp_ca_event_ack &&
+	if (rtk->pmp_registry_v2 &&
 	    msg == FIELD_PREP(APPLE_RTKIT_CA_TYPE, APPLE_RTKIT_CA_EVENT)) {
 		int ret = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_PMP_AUX,
 						   FIELD_PREP(APPLE_RTKIT_CA_TYPE,
@@ -2111,7 +2094,6 @@ static void apple_rtkit_mark_running(struct apple_rtkit *rtk)
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
 	rtk->syslog_inherited = true;
 	rtk->crashlog_inherited = true;
-	rtk->oslog_inherited = true;
 }
 
 static int apple_rtkit_claim_rx(struct apple_rtkit *rtk)
@@ -2252,13 +2234,17 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->sync_syslog_ack =
 		of_property_read_bool(dev->of_node, "apple,sync-syslog-ack");
 	/*
-	 * As macOS does; a driver whose firmware shouldn't get them turns it off. T8142 too:
-	 * its MTP left a counter unechoed after the first sleep's resume, then took no AP
-	 * idle notice for the next one (J815, -ETIME at prepare) and asserted on the one
-	 * after ("Invalid AP power").
+	 * Echo every OSLOG channel-0 counter, as macOS does. This is the OSLOG protocol of
+	 * every RTKit firmware that sends counters: it holds the next one until the last is
+	 * echoed and takes no AP power notice while one is outstanding (T8140, and the J815
+	 * MTP, whose second sleep failed at prepare with -ETIME without it). The IOP sends
+	 * no version or capability for this; a firmware that does not use the protocol
+	 * sends no counters, so the echo never goes out. A client whose firmware has only
+	 * run with them unanswered turns it off. So does apple,sync-syslog-ack: the dcpext
+	 * that carries it (T8122) has only run with its counters unanswered; a DCP driver
+	 * that restarts its DCP across a sleep turns the echo back on.
 	 */
-	rtk->oslog_echo = of_machine_is_compatible("apple,t8140") ||
-			  of_machine_is_compatible("apple,t8142");
+	rtk->oslog_echo = !rtk->sync_syslog_ack;
 	rtk->m5_saved.tracked = track_saved;
 	atomic_set(&rtk->m5_saved.jobs, 0);
 	atomic_set(&rtk->v27_jobs, 0);
@@ -2273,8 +2259,6 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 		goto free_rtk;
 	rtk->pmp_registry_v2 =
 		of_device_is_compatible(dev->of_node, "apple,t6050-pmp-v2");
-	rtk->pmp_ca_event_ack = rtk->pmp_registry_v2 &&
-				of_machine_is_compatible("apple,j714s");
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->coreanalytics_completion);
@@ -2512,7 +2496,6 @@ static void apple_rtkit_reset_session(struct apple_rtkit *rtk)
 	rtk->syslog_msg_size = 0;
 	rtk->syslog_inherited = false;
 	rtk->crashlog_inherited = false;
-	rtk->oslog_inherited = false;
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);

@@ -241,6 +241,10 @@ pub(crate) struct Config {
     /// The firmware's warm restart across a system sleep is known for this SoC. Otherwise the
     /// driver refuses a sleep that powers the SoC down.
     pub(crate) sleep_restart: bool,
+    /// Echo the coprocessors' OSLOG counters, as RTKit does by default. The A18 Pro and M5
+    /// GPU firmware has only run with them unanswered; the M4 Pro/Max and M5 Pro/Max/Ultra
+    /// GPU firmware has had them answered.
+    pub(crate) oslog_echo: bool,
     /// The SoC's values of region C; `None` where the firmware graph has its own (M5).
     pub(crate) region_c: Option<&'static fw::initdata::RegionCConfig>,
     pub(crate) chip: Option<&'static fw::initdata::v25g83::Chip>,
@@ -618,7 +622,7 @@ impl Coprocessor {
         Ok(Coprocessor {
             cpu: regs::CpuControl::new(pdev, index)?,
             running: false,
-            rtkit: Mailbox::new(Self::receiver(dev, index, &state)?)?,
+            rtkit: Mailbox::new(Self::receiver(dev, index, &state, cfg.oslog_echo)?)?,
             state,
             _crash_buffer: crash_buffer,
         })
@@ -628,12 +632,16 @@ impl Coprocessor {
         dev: &AsahiDrmDevice,
         index: usize,
         state: &Arc<RoleState>,
+        oslog_echo: bool,
     ) -> Result<rtkit::RtKit<RoleOps>> {
         for attempt in 0..RECEIVER_ATTEMPTS {
             match rtkit::RtKit::<RoleOps>::new(dev.as_ref().as_ref(), None, index, state.clone()) {
                 Ok(receiver) => {
-                    // Its OSLOG counters stay unanswered until a soak shows echoing them is safe.
-                    receiver.set_oslog_echo(false);
+                    // Where its OSLOG counters have only gone unanswered, they stay so until
+                    // a soak shows echoing them is safe.
+                    if !oslog_echo {
+                        receiver.set_oslog_echo(false);
+                    }
                     return Ok(receiver);
                 }
                 Err(error) if error == EINVAL || error == ETIMEDOUT => {
