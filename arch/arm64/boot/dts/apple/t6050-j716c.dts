@@ -255,3 +255,8 @@
 
 #include "t6050-j716c-sleep.dtsi"
 #include "t6050-j716c-sleep-full.dtsi"
+
+/* This MacBook Pro offers macOS's High Power mode. */
+&clpc {
+	apple,high-power-mode;
+};

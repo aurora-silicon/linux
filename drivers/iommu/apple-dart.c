@@ -5875,33 +5875,36 @@ params_done:
 		 of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8142-dart"));
 	/*
-	 * J614s may arrive with the MTP live after the boot keyboard used it.
-	 * Do not reset its DART unless there is no advertised handoff.
+	 * A T6040/T6041 MTP (apple,t6041-mtp on both) may arrive live after the
+	 * boot keyboard used it; its firmware cannot be restarted. Do not reset
+	 * the DART it sits behind unless there is no advertised handoff. This
+	 * follows the MTP node and its iommus link, so it holds on every board
+	 * with that MTP.
 	 */
-	if (of_machine_is_compatible("apple,j614s") &&
-	    res->start == 0x514800000ULL) {
+	if (of_device_is_compatible(dev->of_node, "apple,t6041-dart")) {
 		struct device_node *mtp, *iommu;
 		const char *handoff;
 		bool live, advertised;
 
-		mtp = of_find_node_by_path("/mtp@514600000");
+		mtp = of_find_compatible_node(NULL, NULL, "apple,t6041-mtp");
 		iommu = mtp ? of_parse_phandle(mtp, "iommus", 0) : NULL;
-		advertised = mtp && of_find_property(mtp, "apple,rtkit-handoff", NULL);
-		live = advertised && of_device_is_compatible(mtp, "apple,t6041-mtp") &&
+		advertised = iommu == dev->of_node &&
+			     of_find_property(mtp, "apple,rtkit-handoff", NULL);
+		live = advertised &&
 		       !of_property_read_string(mtp, "apple,rtkit-handoff", &handoff) &&
 		       !strcmp(handoff, "mtp-live-v1");
-		if (advertised && (!live || iommu != dev->of_node || dart->hw->type != DART_T8110 ||
+		if (advertised && (!live || dart->hw->type != DART_T8110 ||
 				   dart->locked || tunneled || !dart->supports_bypass ||
 				   !apple_dart_streams_bypassed(dart))) {
 			of_node_put(iommu);
 			of_node_put(mtp);
-			dev_err(dev, "Refusing invalid J614s live MTP DART handoff\n");
+			dev_err(dev, "Refusing invalid live MTP DART handoff\n");
 			ret = -EINVAL;
 			goto err_clk_disable;
 		}
 		if (live) {
 			dart->retained_mtp = true;
-			dev_info(dev, "Retaining the live J614s MTP bypass\n");
+			dev_info(dev, "Retaining the live MTP bypass\n");
 		}
 		of_node_put(iommu);
 		of_node_put(mtp);
