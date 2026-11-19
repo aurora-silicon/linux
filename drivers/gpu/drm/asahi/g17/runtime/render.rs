@@ -79,6 +79,9 @@ pub(super) struct RenderState {
     /// Graphs of released contexts the firmware may still walk (see `detach_context`): kept
     /// until the firmware stops, when this state is dropped.
     kept_graphs: KVec<crate::g17::queue::render::RetiredBinding>,
+    /// Killed guilty pairs whose rings the firmware never consumed (see `detach_context`):
+    /// kept, with their slots out of service, until the firmware stops.
+    kept_pairs: KVec<crate::g17::queue::render::parked::ParkedPair>,
     next_pm_generation: u64,
 }
 
@@ -106,6 +109,7 @@ impl RenderState {
             grow: grow::Grow::new()?,
             retired: KVec::with_capacity(128, GFP_KERNEL)?,
             kept_graphs: KVec::new(),
+            kept_pairs: KVec::new(),
             next_pm_generation: 1,
         })
     }
@@ -1377,7 +1381,7 @@ impl Registry {
 impl RenderState {
     pub(super) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         writeln!(f, "retired_render_bindings used={} total={}", self.retired.len(), self.retired.capacity())?;
-        writeln!(f, "firmware_linked_render_graphs kept={} leaked={}", self.kept_graphs.len(),
+        writeln!(f, "firmware_linked_render_graphs kept={} kept_guilty_pairs={} leaked={}", self.kept_graphs.len(), self.kept_pairs.len(),
                  teardown::LEAKED_GRAPHS.load(core::sync::atomic::Ordering::Relaxed))?;
         let unsettled = self.entries.iter().flatten()
             .filter_map(|entry| entry.pair.as_ref())

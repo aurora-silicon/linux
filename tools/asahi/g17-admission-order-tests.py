@@ -407,6 +407,7 @@ mod g17 {
         impl Context {
             pub fn is_published(&self) -> bool { self.published }
             pub fn scheduler_va(&self) -> u64 { self.scheduler }
+            pub fn note_closed(&self, _generation: u64) {}
         }
     }
     pub mod teardown {
@@ -472,7 +473,9 @@ mod g17 {
 """ + item(render_teardown, 'pub(in crate::g17::runtime) fn release_render(') + '\n' + runtime + r"""
         }
 """ + item(render, 'fn render_hold(') + r"""
-        pub struct Firmware { pub queues: Registry }
+        pub struct Recovery;
+        impl Recovery { pub fn generation(&self) -> u64 { 0 } }
+        pub struct Firmware { pub queues: Registry, pub recovery: Recovery }
         pub struct Host<'a> {
             firmware: &'a mut Firmware,
             registration_powered: bool,
@@ -533,7 +536,7 @@ impl Pool {
 }
 
 use g17::context::Context;
-use g17::runtime::{Active, Entry, Firmware, Pair, Registry, RenderState, Reservation};
+use g17::runtime::{Active, Entry, Firmware, Pair, Recovery, Registry, RenderState, Reservation};
 use g17::runtime::backend::{Backend, Channels, Lock as DeviceLock, Shared};
 const SLOTS: usize = cfg::RENDER_SLOTS;
 const NEW: u64 = 5000;
@@ -574,7 +577,7 @@ fn device(pairs: &[(usize, &Arc<Context>)]) -> Arc<Shared> {
         });
     }
     let queues = Registry { admission, render: RenderState { entries }, teardown: g17::teardown::Pending::new().unwrap() };
-    Arc::new(Shared { state: DeviceLock(Mutex::new(Some(Box::new(Firmware { queues })))), channels: Channels })
+    Arc::new(Shared { state: DeviceLock(Mutex::new(Some(Box::new(Firmware { queues, recovery: Recovery })))), channels: Channels })
 }
 fn backend(shared: &Arc<Shared>, slot: usize, context: &Arc<Context>) -> Backend {
     Backend { closed: AtomicBool::new(false), shared: shared.clone(), context: context.clone(), owner: owner(slot) }

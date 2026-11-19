@@ -273,6 +273,9 @@ impl recovery::Queues for Service<'_> {
                 queue.note_interrupted(stamp)
             })
     }
+    fn note_kill_sightings(&self, generation: u64) {
+        self.firmware.queues.note_render_kill_sightings(generation);
+    }
     fn report_blamed_render(&self, qid: u8) {
         self.firmware
             .queues

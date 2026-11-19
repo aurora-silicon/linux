@@ -116,6 +116,12 @@ pub(super) trait Queues {
     fn note_interrupted(&mut self, qid: u8, stamp: u32) -> Interrupted;
     /// Optional diagnostics only; absence cannot alter attribution or release.
     fn report_blamed_render(&self, _qid: u8) {}
+    /// Read while firmware is halted for the restart the host accepted after `generation`:
+    /// every killed context whose kill the firmware finished counts as first seen done at
+    /// `generation` at the latest, so this restart releases its guilty pairs
+    /// (`Context::restarted_since_kill`). Without this, a kill finished just before a restart
+    /// that the host had not observed yet would wait for a restart that may never come.
+    fn note_kill_sightings(&self, _generation: u64) {}
     /// Optional diagnostics: logs the MMU fault banks while the firmware is halted.
     fn report_mmu_fault(&self) {}
     fn settle_blamed_render(&mut self, qid: u8, error: Error);
@@ -306,6 +312,7 @@ pub(super) fn service<H: Host>(
     // still retire it with stamps and records that look like success, so it is
     // marked before firmware resumes and never reports success.
     let entries = read_entries(host);
+    host.note_kill_sightings(host.recovery().accepted.wrapping_sub(1));
     host.transition(3, 0)?;
     if host.recovery_state()? != 0 {
         return Err(EIO);

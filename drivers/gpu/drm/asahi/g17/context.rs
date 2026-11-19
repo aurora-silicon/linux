@@ -14,7 +14,7 @@ use super::{
     status::VmStatus,
 };
 use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use identity::{Order, RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
 
 /// Both of a context's render channels are bound to other pairs whose publications have not
@@ -214,6 +214,12 @@ pub(crate) struct Context {
     /// A kill of this context was published, through a compute queue or on its render pairs'
     /// behalf. A context is killed at most once.
     kill_published: AtomicBool,
+    /// The host's recovery generation when it first saw the kill of this context done (its
+    /// scheduler page's killed state), `u64::MAX` before ([`Self::restarted_since_kill`]).
+    kill_seen: AtomicU64,
+    /// The host's recovery generation at this context's latest close, `u64::MAX` while open
+    /// ([`Self::restarted_since_close`]).
+    closed_generation: AtomicU64,
     /// Advisory only: publication still checks the physical binding under the
     /// device mutex. False skips an inline attempt known to need admission.
     compute_binding_hint: AtomicBool,
@@ -346,6 +352,8 @@ impl Context {
             scheduler_generation,
             published: AtomicBool::new(false),
             kill_published: AtomicBool::new(false),
+            kill_seen: AtomicU64::new(u64::MAX),
+            closed_generation: AtomicU64::new(u64::MAX),
             compute_binding_hint: AtomicBool::new(false),
             render_seen: AtomicBool::new(false),
             qos,
@@ -533,6 +541,23 @@ impl Context {
     /// A kill of this context was published.
     pub(crate) fn kill_published(&self) -> bool {
         self.kill_published.load(Ordering::Acquire)
+    }
+
+    /// A queue of this context closed at the host's recovery `generation` (under the device
+    /// mutex). The latest close counts.
+    pub(crate) fn note_closed(&self, generation: u64) {
+        self.closed_generation.store(generation, Ordering::Release);
+    }
+
+    /// The host accepted a GPU restart (`generation`) after this context's latest close.
+    pub(crate) fn restarted_since_close(&self, generation: u64) -> bool {
+        restarted_after(self.closed_generation.load(Ordering::Acquire), generation)
+    }
+
+    /// The firmware finished the kill of this context (`killed`, its scheduler page) and the
+    /// host accepted a GPU restart (`generation`) after it first saw that. See [`restarted_since`].
+    pub(crate) fn restarted_since_kill(&self, killed: bool, generation: u64) -> bool {
+        restarted_since(&self.kill_seen, killed, generation)
     }
 
     pub(crate) fn is_published(&self) -> bool {
@@ -834,9 +859,53 @@ fn must_retain(head: Option<[u64; 2]>, head_va: u64, killed: u32) -> bool {
     killed == 0 && head.is_none_or(|head| head != [0, head_va])
 }
 
+/// A restart was accepted (`generation`) after the event recorded at generation `at`
+/// (`u64::MAX`: never happened).
+fn restarted_after(at: u64, generation: u64) -> bool {
+    at != u64::MAX && generation > at
+}
+
+/// Records in `seen` the recovery `generation` of the first call that sees a kill done
+/// (`killed`), and reports whether a later generation was accepted since. A restart accepted
+/// after that sighting was raised after the firmware had finished the kill, so it dropped
+/// whatever of the killed context was still running; a restart between the kill's
+/// publication and its completion does not count. A late first sighting only asks for a later
+/// restart.
+fn restarted_since(seen: &AtomicU64, killed: bool, generation: u64) -> bool {
+    if !killed {
+        return false;
+    }
+    let first = match seen.compare_exchange(u64::MAX, generation, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => generation,
+        Err(first) => first,
+    };
+    restarted_after(first, generation)
+}
+
 #[kunit_tests(asahi_g17_qos_capacity)]
 mod capacity_tests {
     use super::*;
+
+    #[test]
+    fn only_a_restart_after_the_kill_was_seen_done_counts() {
+        let seen = AtomicU64::new(u64::MAX);
+        // No acknowledged kill: never, whatever restarts happened.
+        assert!(!restarted_since(&seen, false, 3));
+        assert!(!restarted_since(&seen, false, 9));
+        // The kill seen done at generation 4 (a restart at 3 came before it): not yet.
+        assert!(!restarted_since(&seen, true, 4));
+        assert!(!restarted_since(&seen, true, 4));
+        // The next accepted restart.
+        assert!(restarted_since(&seen, true, 5));
+        assert_eq!(seen.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn only_a_restart_after_the_close_counts() {
+        assert!(!restarted_after(u64::MAX, u64::MAX - 1));
+        assert!(!restarted_after(7, 7));
+        assert!(restarted_after(7, 8));
+    }
 
     #[test]
     fn linked_unkilled_work_is_retained() {
