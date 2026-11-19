@@ -1758,7 +1758,7 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	 * EPICProviderClass was used. If the init call has props parse them and
 	 * use EPICProviderClass to match the service.
 	 */
-	if (props_size > 36) {
+	if (props_size > 36 && !ep->dcp->hw.afk_announced_names) {
 		int ret = parse(props, props_size, &ctx);
 		if (ret) {
 			dev_err(ep->dcp->dev,
@@ -1802,8 +1802,17 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			service_name = epic_class;
 		}
 	} else {
-            service_name = name;
-        }
+		service_name = name;
+		/*
+		 * hw.afk_announced_names: the announced name is the service's
+		 * identity, and its handler gets it as the EPIC name.
+		 */
+		if (ep->dcp->hw.afk_announced_names) {
+			epic_name = kstrdup(name, GFP_KERNEL);
+			if (!epic_name)
+				return;
+		}
+	}
 
 	if (ep->match_epic_name)
 		ops = afk_match_service(ep, epic_name);

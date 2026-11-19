@@ -100,7 +100,7 @@ struct apple_connector { void *dcp;bool connected,edid_invalidation_pending;stru
 struct apple_dcp {
     void *dev;int fw_compat;struct apple_dcp_afkep *dcpavservep;struct apple_connector *connector;
     bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;u64 typec_generation;unsigned int nr_modes;
-    struct { int iomfb_method_profile,firmware_compat; bool fw_14_7_endpoints; unsigned int num_dptx_ports; } hw; bool ext_dead,external_native;
+    struct { int iomfb_method_profile,firmware_compat; bool fw_14_7_endpoints,afk_announced_names; unsigned int num_dptx_ports; } hw; bool ext_dead,external_native;
     struct { bool lock,enabled;u64 epoch;int enable_completion;struct apple_epic_service *service,*opened;
              u64 opened_epoch,close_gen,terminated_epoch,close_epoch;bool opening;struct work_struct close_wq; } dcpavserv;
     /* A J714s firmware 27 processor's: this one is not. */
@@ -144,6 +144,8 @@ struct item { const char *key,*value; s64 integer; };
 struct dcp_parse_ctx { struct item *items;unsigned int count,index;bool key; };
 struct iterator { struct dcp_parse_ctx *handle;unsigned int idx,len; };
 #define kfree(p) free((void *)(p))
+#define GFP_KERNEL 0
+#define kstrdup(s,f) strdup(s)
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 static struct item announcement_items[3];
 static int parse(u8 *p,size_t n,struct dcp_parse_ctx *ctx)
@@ -572,7 +574,7 @@ def admission(root):
 
     av = (base / 'epic/dpavservep.c').read_text()
     af = (base / 'afk.c').read_text()
-    announce = af[af.index('static void afk_recv_handle_init('):af.index('static void afk_recv_handle_init(') + 6500]
+    announce = af[af.index('static void afk_recv_handle_init('):af.index('static void afk_recv_handle_init(') + 7000]
     assert announce.index('ops->prepare(service,') < announce.index('EPIC_CAT_REPORT, AFKV2_OPEN')
     assert '.prepare = dcpavserv_prepare,' in av and '.prepare = dcpdpserv_prepare,' in av
     prefix = r'''

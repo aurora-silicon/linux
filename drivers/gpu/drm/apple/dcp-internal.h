@@ -348,6 +348,11 @@ struct apple_dcp_hw_data {
 	 * with RTKit before starting it.
 	 */
 	bool afk_adopt_endpoints;
+	/*
+	 * AFK services are matched by the name in their announcement; the
+	 * properties after it are not parsed (afk_recv_handle_init()).
+	 */
+	bool afk_announced_names;
 };
 
 enum dcp_test_point {
