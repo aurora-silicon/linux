@@ -2408,7 +2408,6 @@ static const struct apple_sleep_ops t6040_sleep_ops = {
 };
 
 static const struct apple_sleep_soc t6040_sleep_soc = {
-	.unavailable_reason = "T6040 entry is not qualified",
 	.ps = {
 		.ans = PS_ANS,
 		.apcie_gp = PS_APCIE_GP,
