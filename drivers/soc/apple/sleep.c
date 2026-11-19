@@ -1784,24 +1784,6 @@ bool apple_sleep_smc_defer_notice(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_smc_defer_notice);
 
-int apple_sleep_smc_register(struct device *dev,
-		int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data)
-{
-	struct apple_sleep *s = apple_sleep;
-	guard(mutex)(&apple_sleep_smc_lock);
-
-	if (!s || !s->soc->smc_policy || !pm_suspend_via_firmware())
-		return -EOPNOTSUPP;
-	if (!late_notice || s->smc.saved_ops || (s->smc.dev && s->smc.dev != dev))
-		return -EBUSY;
-	if (!s->smc.dev)
-		s->smc.dev = get_device(dev);
-	s->smc.late_notice = late_notice;
-	s->smc.data = data;
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_smc_register);
-
 int apple_sleep_smc_register_saved(struct device *dev,
 		const struct apple_sleep_smc_saved_ops *ops, void *data)
 {
