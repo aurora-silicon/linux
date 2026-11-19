@@ -7268,6 +7268,16 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			set_bit(surf, dcp->iomfb_surfaces);
 		surf++;
 	}
+	/*
+	 * A list that enables no slot is the older single-index form,
+	 * "apple,iomfb-surfaces = <0>" naming slot 0, which device trees from
+	 * before the per-slot flags still carry. A pipe needs a surface, so
+	 * read it that way on every DCP rather than refusing the display.
+	 */
+	if (num_surfs > 0 && bitmap_empty(dcp->iomfb_surfaces, DCP_MAX_PLANES)) {
+		dev_info(dev, "apple,iomfb-surfaces enables no slot: using slot 0 (single-index form)\n");
+		set_bit(0, dcp->iomfb_surfaces);
+	}
 	if (dcp_is_ext26(dcp)) {
 		bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
 		set_bit(0, dcp->iomfb_surfaces);

@@ -189,7 +189,9 @@ properties:
     items:
       enum: [0, 1]
     description: |
-      Per-slot enable flags, in slot order.
+      Per-slot enable flags, in slot order. A list that enables no slot is
+      the older single-index form (a single 0 naming slot 0), still found in
+      device trees from before the per-slot flags; it is read as slot 0.
 
   apple,power-lut-data-x:
     $ref: /schemas/types.yaml#/definitions/uint8-array
