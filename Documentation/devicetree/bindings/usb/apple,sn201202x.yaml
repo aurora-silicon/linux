@@ -49,7 +49,7 @@ properties:
 
   apple,display-native-hpd:
     type: boolean
-    description:
+    description: |
       The display route behind this controller's port has its own HPD path,
       as the display coprocessor routes of the T8140 and T8142 do. The driver
       passes on the HPD level of the port's data status only: it does not
