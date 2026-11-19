@@ -8,6 +8,11 @@
  * from the job's parameters: the words that depend on the sizes, formats and
  * matrix are computed, the others hold the fixed values below.
  *
+ * Crop is the source region's size and origin, rotation and mirroring a
+ * field of the pipe word; the reader rotates, so the rest of the pipe works
+ * in the destination's orientation. Compose writes a picture of the
+ * rectangle's size at an offset into the destination.
+ *
  * The firmware tiles the job itself, so no tile array is built.
  */
 
@@ -327,13 +332,16 @@ static u8 msr23_bits(const struct msr23_fmt *f, unsigned int c)
 #define W(img, o, v)		((img)[(o) / 4] = (v))
 
 /*
- * One side's DMA words: plane codes, strides, sizes, swizzle (block 1 for the
- * source, block 14 for the destination).
+ * One side's DMA words: plane codes, strides, the region's size and its
+ * origin per plane, the planes' sizes, swizzle (block 1 for the source, block
+ * 14 for the destination). The origins are in samples of each plane (y << 16
+ * | x); the plane pointers stay at the start of the planes.
  */
-static void msr23_side(u32 *img, const struct msr23_pic *p, const struct msr23_fmt *f, bool dst)
+static void msr23_side(u32 *img, const struct msr23_pic *p, const struct v4l2_rect *r,
+		       const struct msr23_fmt *f, bool dst)
 {
 	u32 b = dst ? MSR23_B14 : MSR23_B1;
-	u32 so = dst ? 0x40 : 0x58, wo = dst ? 0x5c : 0x7c;
+	u32 so = dst ? 0x40 : 0x58, wo = dst ? 0x5c : 0x7c, oo = dst ? 0x4c : 0x68;
 	u32 po = dst ? 0x88 : 0xb4, ho = dst ? 0x94 : 0xc4;
 	bool chroma = !f->rgb && !f->grey;
 	u32 cw = chroma ? p->width / f->hs : p->width, ch = chroma ? p->height / f->vs : p->height;
@@ -343,8 +351,11 @@ static void msr23_side(u32 *img, const struct msr23_pic *p, const struct msr23_f
 		W(img, b + 4 + 4 * i, (dst ? 0x8000 : 0) | f->code[i]);
 	W(img, b + so, p->stride[0]);
 	W(img, b + so + 4, chroma ? p->stride[1] : 0);
-	W(img, b + wo, p->width);
-	W(img, b + wo + 4, p->height);
+	W(img, b + wo, r->width);
+	W(img, b + wo + 4, r->height);
+	W(img, b + oo, (u32)r->top << 16 | r->left);
+	if (chroma)
+		W(img, b + oo + 4, (u32)r->top / f->vs << 16 | (u32)r->left / f->hs);
 	for (i = 0; i < 3; i++) {
 		W(img, b + po + 4 * i, i == 1 ? cw : p->width);
 		W(img, b + ho + 4 * i, i == 1 ? ch : p->height);
@@ -408,16 +419,19 @@ static int msr23_axis(u32 *img, u32 src, u32 dst, bool horizontal, bool yuv_src)
 
 /*
  * Block 0 +0x78..+0x84: the channels' component sizes, source in the low
- * half, destination in the high half.
+ * half, destination in the high half. A conversion at 1:1 (the matrix in
+ * block 3) takes 0x30 on the source side; without a conversion, as with a
+ * scaled one, the source's own sizes (with 0x30, values above half scale
+ * come out 1 lower: v * 255 / 256).
  */
-static void msr23_map(u32 *img, const struct msr23_fmt *s, const struct msr23_fmt *d, bool scaled)
+static void msr23_map(u32 *img, const struct msr23_fmt *s, const struct msr23_fmt *d, bool csc11)
 {
 	unsigned int c;
 
 	for (c = 0; c < 4; c++) {
 		u32 lo, hi;
 
-		if (!scaled)
+		if (csc11)
 			lo = 0x30;
 		else if (!s->rgb)
 			lo = c ? 0x20 | (c < 3 ? msr23_bits(s, c) : 0) : msr23_bits(s, c);
@@ -463,22 +477,93 @@ static bool msr23_size_ok(const struct msr23_pic *p)
 	       p->width <= MSR23_MAX_WIDTH && (u64)p->width * p->height <= MSR23_MAX_PIXELS;
 }
 
+/* A job's crop or compose rectangle: all of the picture when its width is 0. */
+static void msr23_region(const struct msr23_pic *p, const struct v4l2_rect *r,
+			 struct v4l2_rect *out)
+{
+	if (r->width)
+		*out = *r;
+	else
+		*out = (struct v4l2_rect){ 0, 0, p->width, p->height };
+}
+
+/* Even, at least the minimum size, and inside the picture. */
+static bool msr23_region_ok(const struct msr23_pic *p, const struct v4l2_rect *r)
+{
+	return r->left >= 0 && r->top >= 0 && !((r->left | r->top | r->width | r->height) & 1) &&
+	       min(r->width, r->height) >= MSR23_MIN_SIZE &&
+	       (u64)r->left + r->width <= p->width && (u64)r->top + r->height <= p->height;
+}
+
+/*
+ * Block 0 +0x64 bits 3-6: the rotation (bits 3-4: 1, 2, 3 quarter turns
+ * clockwise), then a mirror of the result left to right (bit 5) and top to
+ * bottom (bit 6). A mirror both ways is a half turn, and a half turn and one
+ * mirror is the other mirror: each orientation is sent in one form only.
+ */
+static u32 msr23_orient(const struct msr23_job *job)
+{
+	unsigned int rot = job->rotate / 90;
+	bool h = job->hflip, v = job->vflip;
+
+	if (h && v) {
+		rot = (rot + 2) & 3;
+		h = false;
+		v = false;
+	}
+	if (rot == 2 && (h || v)) {
+		rot = 0;
+		swap(h, v);
+	}
+	return rot << 3 | h << 5 | v << 6;
+}
+
+/* The source region's size as the pipe sees it: after the rotation. */
+static void msr23_turned(const struct msr23_job *job, const struct v4l2_rect *c, u32 *w, u32 *h)
+{
+	bool quarter = job->rotate == 90 || job->rotate == 270;
+
+	*w = quarter ? c->height : c->width;
+	*h = quarter ? c->width : c->height;
+}
+
 /**
  * msr23_check - whether the builder covers a job
  * @job: the conversion
  *
- * Return: 0, or -EINVAL for a format, size or ratio the builder was not checked over.
+ * Return: 0, or -EINVAL for a format, size, rectangle, rotation or ratio the
+ * builder was not checked over.
  */
 int msr23_check(const struct msr23_job *job)
 {
 	const struct msr23_pic *sp = &job->src, *dp = &job->dst;
 	const struct msr23_fmt *s = msr23_fmt(sp->fourcc), *d = msr23_fmt(dp->fourcc);
-	u32 sw = sp->width, sh = sp->height, dw = dp->width, dh = dp->height;
+	struct v4l2_rect c, o;
+	u32 sw, sh, dw, dh;
 
 	if (!s || !d || !msr23_size_ok(sp) || !msr23_size_ok(dp) || s->grey != d->grey)
 		return -EINVAL;
+	if (job->rotate % 90 || job->rotate > 270)
+		return -EINVAL;
+	/* a quarter turn of 4:2:2 moves its subsampling to the other axis: not checked */
+	if (job->rotate % 180 && (s->sub == 1 || d->sub == 1))
+		return -EINVAL;
+	msr23_region(sp, &job->crop, &c);
+	msr23_region(dp, &job->compose, &o);
+	if (!msr23_region_ok(sp, &c) || !msr23_region_ok(dp, &o))
+		return -EINVAL;
+	msr23_turned(job, &c, &sw, &sh);
+	dw = o.width;
+	dh = o.height;
 	if (sw > MSR23_MAX_RATIO * dw || dw > MSR23_MAX_RATIO * sw ||
 	    sh > MSR23_MAX_RATIO * dh || dh > MSR23_MAX_RATIO * sh)
+		return -EINVAL;
+	/*
+	 * A conversion at 1:1 with a mirror or a half turn: not checked on
+	 * hardware (with a quarter turn it is; see msr23_build()).
+	 */
+	if (s->rgb != d->rgb && sw == dw && sh == dh && !(job->rotate % 180) &&
+	    (msr23_orient(job) & 0x70))
 		return -EINVAL;
 	return 0;
 }
@@ -499,8 +584,10 @@ int msr23_build(const struct msr23_job *job, u32 *img, struct msr23_built *out)
 {
 	const struct msr23_pic *sp = &job->src, *dp = &job->dst;
 	const struct msr23_fmt *s = msr23_fmt(sp->fourcc), *d = msr23_fmt(dp->fourcc);
-	u32 sw = sp->width, sh = sp->height, dw = dp->width, dh = dp->height;
-	bool yuv_src, yuv_dst, csc_on, scaled, ups, wide;
+	struct v4l2_rect c, o, whole;
+	struct msr23_pic sub;
+	u32 sw, sh, dw, dh, ybpp;
+	bool yuv_src, yuv_dst, csc_on, scaled, csc_pre, ups, wide;
 	u64 px;
 	u32 cds, k, rows;
 	unsigned int i;
@@ -509,11 +596,26 @@ int msr23_build(const struct msr23_job *job, u32 *img, struct msr23_built *out)
 	ret = msr23_check(job);
 	if (ret)
 		return ret;
+	/*
+	 * The source is read rotated: from the reader on, the pipe (scaler,
+	 * window) works in the destination's orientation.
+	 */
+	msr23_region(sp, &job->crop, &c);
+	msr23_region(dp, &job->compose, &o);
+	msr23_turned(job, &c, &sw, &sh);
+	dw = o.width;
+	dh = o.height;
 
 	yuv_src = !s->rgb;
 	yuv_dst = !d->rgb;
 	csc_on = yuv_src != yuv_dst;
 	scaled = sw != dw || sh != dh;
+	/*
+	 * A conversion at 1:1 runs its matrix in block 3, ahead of the scaler;
+	 * with a quarter turn it runs where a scaled job's does (block 11): in
+	 * block 3 the rotated output is wrong.
+	 */
+	csc_pre = csc_on && !scaled && !(job->rotate % 180);
 	/* chroma upsampling: a subsampled Y'CbCr source */
 	ups = yuv_src && (s->hs > 1 || s->vs > 1);
 	px = max((u64)sw * sh, (u64)dw * dh);
@@ -533,18 +635,30 @@ int msr23_build(const struct msr23_job *job, u32 *img, struct msr23_built *out)
 	/* a time budget: 40e6 (80e6 above 1080p) + 8/15 per pixel of the larger side */
 	W(img, MSR23_B0 + 0x18, 40000000U * (px > 1920 * 1080 ? 2 : 1) + (u32)div_u64(px * 8, 15));
 	W(img, MSR23_B0 + 0x64, 0x38d800 | s->rgb | s->sub << 1 | d->rgb << 7 | d->sub << 8 |
-	  (csc_on && !scaled ? BIT(16) : 0) | (ups ? BIT(13) : 0));
+	  (csc_pre ? BIT(16) : 0) | (ups ? BIT(13) : 0) | msr23_orient(job));
 	/* scaler enables per axis: off at 1:1, the low 3 bits upscaling, all 5 downscaling */
 	W(img, MSR23_B0 + 0x68, (sw == dw ? 0 : (dw > sw ? 0x7 : 0x1f) << 11) |
 	  (sh == dh ? 0 : (dh > sh ? 0x7 : 0x1f) << 6));
 	/* chroma downsampling of a subsampled Y'CbCr destination */
 	cds = 0xc | (yuv_dst && d->hs == 2 ? 1 : 0) | (yuv_dst && d->vs == 2 ? 2 : 0);
-	W(img, MSR23_B0 + 0x6c, cds << 16 | (csc_on && scaled ? 3 : 0));
+	W(img, MSR23_B0 + 0x6c, cds << 16 | (csc_on && !csc_pre ? 3 : 0));
 	W(img, MSR23_B0 + 0x70, (dh - 1) << 16 | (dw - 1));
-	msr23_map(img, s, d, scaled);
+	msr23_map(img, s, d, csc_pre);
 
-	msr23_side(img, sp, s, false);
-	msr23_side(img, dp, d, true);
+	msr23_side(img, sp, &c, s, false);
+	/*
+	 * The destination rectangle is written as a picture of its own: its
+	 * size, at an offset into the planes the caller adds to the pointers.
+	 */
+	sub = *dp;
+	sub.width = o.width;
+	sub.height = o.height;
+	whole = (struct v4l2_rect){ 0, 0, o.width, o.height };
+	msr23_side(img, &sub, &whole, d, true);
+	ybpp = d->rgb ? 4 : msr23_bits(d, 0) > 8 ? 2 : 1;
+	out->dst_off[0] = (u32)o.top * dp->stride[0] + (u32)o.left * ybpp;
+	out->dst_off[1] = d->rgb || d->grey ? 0 :
+			  (u32)o.top / d->vs * dp->stride[1] + (u32)o.left / d->hs * 2 * ybpp;
 
 	ret = msr23_axis(img, sh, dh, false, yuv_src);
 	if (!ret)
@@ -560,7 +674,7 @@ int msr23_build(const struct msr23_job *job, u32 *img, struct msr23_built *out)
 	for (i = 0; i < 4; i++)
 		W(img, MSR23_B3 + (i < 2 ? 0x8 : 0x10) + 4 * i, ups ? 0x800 : 0);
 	if (csc_on) {
-		ret = msr23_matrix(img, job, yuv_dst, scaled);
+		ret = msr23_matrix(img, job, yuv_dst, !csc_pre);
 		if (ret)
 			return ret;
 	}

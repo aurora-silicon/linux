@@ -12,7 +12,8 @@ config VIDEO_APPLE_SCALER
 	  V4L2 memory-to-memory driver for the image scaler and
 	  colour-space converter (MSR) in Apple silicon SoCs (M1 to M5
 	  generations and A18 Pro). It converts between Y'CbCr (NV12,
-	  P010) and 32-bit RGB; on M5 it also scales.
+	  P010) and 32-bit RGB; on M5 it also scales, crops, rotates and
+	  mirrors.
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called apple-scaler.
