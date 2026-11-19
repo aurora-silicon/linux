@@ -56,9 +56,10 @@ Fast and outer protection
 -------------------------
 
 Before submission opens, the G17 firmware die limiter is initialized with
-sensor mask ``0x82a``, target 95 C, release 80 C and its native 16 ms period.
-The existing gains are preserved. These temperatures are provisional Linux
-bring-up policy, not device safety ratings.
+sensor mask ``0x82a``, target 110 C, release 80 C and its native 16 ms period,
+with its existing gains: the values the driver used before this cooling work.
+They are not device safety ratings. Changing the target needs a sustained-load
+temperature and performance measurement on the board.
 
 The cooling device is optional. A board with ``#cooling-cells`` whose selected
 firmware layout has no live power state (V25F84 and the packed M5-profile
