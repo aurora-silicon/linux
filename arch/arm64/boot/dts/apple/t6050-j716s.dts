@@ -570,3 +570,4 @@
 
 #define T6050_J716S
 #include "t6050-peripherals.dtsi"
+#include "t6050-media.dtsi"
