@@ -658,6 +658,37 @@ void ane_h16_session_sync(struct ane_h16_session *s, struct ane_h16_program *p,
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_sync);
 
+/*
+ * Spare memory can go back to the backend: it has ops->unmap and the engine
+ * is up, so the DART invalidation that comes with the unmap reaches it.
+ */
+static bool h16_can_unmap(const struct ane_h16_session *s)
+{
+	return s->ops->unmap && !s->asleep && !s->parked;
+}
+
+static struct ane_fw_surface h16_spare_remove(struct ane_h16_session *s, unsigned int i)
+{
+	struct ane_fw_surface surface = s->spares[i].surface;
+
+	s->spare_bytes -= surface.size;
+	s->spare_count--;
+	memmove(&s->spares[i], &s->spares[i + 1], (s->spare_count - i) * sizeof(s->spares[0]));
+	return surface;
+}
+
+/* Free the oldest spares until at most @count entries and @bytes remain. */
+static void h16_spares_trim(struct ane_h16_session *s, unsigned int count, size_t bytes)
+{
+	if (!h16_can_unmap(s))
+		return;
+	while (s->spare_count && (s->spare_count > count || s->spare_bytes > bytes)) {
+		struct ane_fw_surface surface = h16_spare_remove(s, 0);
+
+		s->ops->unmap(s->ctx, &surface);
+	}
+}
+
 static bool h16_take_spare(struct ane_h16_session *s, size_t size, bool write,
 			   struct ane_fw_surface *out)
 {
@@ -666,8 +697,7 @@ static bool h16_take_spare(struct ane_h16_session *s, size_t size, bool write,
 	for (i = 0; i < s->spare_count; i++) {
 		if (s->spares[i].surface.size != size || s->spares[i].write != write)
 			continue;
-		*out = s->spares[i].surface;
-		s->spares[i] = s->spares[--s->spare_count];
+		*out = h16_spare_remove(s, i);
 		/* Zeroed like new memory; LOAD writes it back after filling it. */
 		memset(out->cpu, 0, size);
 		return true;
@@ -678,12 +708,20 @@ static bool h16_take_spare(struct ane_h16_session *s, size_t size, bool write,
 static void h16_give_spare(struct ane_h16_session *s, struct ane_fw_surface *surface,
 			   bool write)
 {
-	/* A full table keeps the surface mapped and unused until reset. */
-	if (surface->cpu && s->spare_count < ANE_H16_SPARES)
+	if (!surface->cpu) {
+		memset(surface, 0, sizeof(*surface));
+		return;
+	}
+	if (s->spare_count < ANE_H16_SPARES) {
 		s->spares[s->spare_count++] = (struct ane_h16_spare) {
 			.surface = *surface,
 			.write = write,
 		};
+		s->spare_bytes += surface->size;
+	} else if (h16_can_unmap(s)) {
+		s->ops->unmap(s->ctx, surface);
+	}
+	/* Otherwise a full table keeps the surface mapped and unused until reset. */
 	memset(surface, 0, sizeof(*surface));
 }
 
@@ -702,6 +740,7 @@ static void h16_export_work(struct work_struct *work)
 		h16_give_spare(s, &e->surface, e->write);
 		kfree(e);
 	}
+	h16_spares_trim(s, ANE_H16_SPARES_KEEP, ANE_H16_SPARE_BYTES);
 	mutex_unlock(s->lock);
 }
 
@@ -793,13 +832,22 @@ static void h16_give_back(struct ane_h16_session *s, struct ane_h16_program *p)
 		h16_give_spare(s, &p->aux[i], false);
 	memset(p->surfaces, 0, sizeof(p->surfaces));
 	p->released = true;
+	h16_spares_trim(s, ANE_H16_SPARES_KEEP, ANE_H16_SPARE_BYTES);
 }
 
 static int h16_map(struct ane_h16_session *s, size_t size, bool write,
 		   struct ane_fw_surface *out)
 {
-	int ret = h16_take_spare(s, size, write, out) ? 0 : s->ops->map(s->ctx, size, write, out);
+	int ret = 0;
 
+	if (!h16_take_spare(s, size, write, out)) {
+		ret = s->ops->map(s->ctx, size, write, out);
+		/* No DVA range or memory left: free every spare and try once more. */
+		if ((ret == -ENOSPC || ret == -ENOMEM) && s->spare_count && h16_can_unmap(s)) {
+			h16_spares_trim(s, 0, 0);
+			ret = s->ops->map(s->ctx, size, write, out);
+		}
+	}
 	if (ret)
 		return ret;
 	if (!ane_fw_surface_valid(out) || out->size != size || !IS_ALIGNED(out->dva, SZ_16K))
@@ -922,6 +970,19 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 	return ane_h16_custom_bars(&p->snapshot, hwx, s->dsid, p->bars, &p->bar_count);
 }
 
+/*
+ * LOAD or CREATE failed with the firmware holding the program, maybe: the
+ * session is quarantined and the program is kept, memory and all, with
+ * those closed while quarantined, until a verified power cycle gives them
+ * back (ane_h16_session_recovered()).
+ */
+static int h16_failed_load(struct ane_h16_session *s, struct ane_h16_program *p, int error)
+{
+	p->closed = true;
+	list_add_tail(&p->node, &s->held);
+	return h16_fail(s, error);
+}
+
 static const size_t h16_load_sequence[] = {
 	ANE_H16_LOAD_SIZE, ANE_H16_CREATE_SIZE, ANE_H16_TERMINATE_SIZE, ANE_H16_UNLOAD_SIZE,
 };
@@ -933,8 +994,9 @@ static const size_t h16_load_sequence[] = {
  * queues the first EXECUTE whenever the engine last ran another program, the
  * first one after boot included (see ane_h16_session_execute()). A LOAD is
  * serialized with in-flight EXECUTEs. The transport also requeues on every
- * program or process change, so a session may hold several programs. Every
- * program's firmware-visible memory stays mapped until reset.
+ * program or process change, so a session may hold several programs. A
+ * program's firmware-visible memory goes back to the spares once the
+ * firmware no longer uses it (see h16_give_back()).
  */
 int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_hwx_snapshot *snapshot,
@@ -991,9 +1053,9 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	if (ret)
 		goto free;
 	/*
-	 * From the first mapping on, firmware-visible memory exists that is never
-	 * released before reset, so the program becomes the session's here and
-	 * is never freed.
+	 * From the first mapping on, firmware-visible memory exists, so the
+	 * program becomes the session's here; it is freed only once that memory
+	 * went back (ane_h16_session_put()).
 	 */
 	p->generation = ++s->generation;
 	p->epoch = s->epoch;
@@ -1006,11 +1068,10 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	if (!ret)
 		ret = ane_h16_load_encode(command, ANE_H16_LOAD_SIZE, p->slots);
 	if (ret) {
-		/*
-		 * Firmware never saw this program. It keeps its mappings until
-		 * reset, but it must not hold the session against the next LOAD.
-		 */
+		/* Firmware never saw this program: its memory goes back now. */
 		p->closed = true;
+		h16_give_back(s, p);
+		ane_h16_session_put(s, p);
 		goto out;
 	}
 	if (list_empty(&s->programs) && list_empty(&s->held) && !s->running) {
@@ -1022,7 +1083,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 		ret = ane_h16_load_reply(reply, ANE_H16_LOAD_SIZE, command, &p->key.program);
 	if (ret) {
 		s->ops->log(s->ctx, "LOAD refused", (u64)-ret, 0);
-		ret = h16_fail(s, ret);
+		ret = h16_failed_load(s, p, ret);
 		goto out;
 	}
 	s->ops->log(s->ctx, "LOAD program", p->key.program, p->bar_count);
@@ -1034,7 +1095,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 					   &p->key.process);
 	if (ret) {
 		s->ops->log(s->ctx, "CREATE refused", (u64)-ret, 0);
-		ret = h16_fail(s, ret);
+		ret = h16_failed_load(s, p, ret);
 		goto out;
 	}
 	/* Each validated program has exactly one procedure. */
@@ -1044,6 +1105,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	s->ops->log(s->ctx, "CREATE process", p->key.program, p->key.process);
 	*program = p;
 out:
+	h16_spares_trim(s, ANE_H16_SPARES_KEEP, ANE_H16_SPARE_BYTES);
 	kfree(command);
 	return ret;
 free:
