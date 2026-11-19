@@ -77,6 +77,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 971 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_scodec>;
 		status = "disabled";
 	};
 
@@ -86,6 +87,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 971 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_scodec>;
 		status = "disabled";
 	};
 
@@ -503,10 +505,12 @@
 		reg = <0x3 0x0d000000 0x0 0x4000>,
 		      <0x3 0x0c000000 0x0 0x8000>,
 		      <0x3 0x0d078000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 972 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 1009 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_scodec>;
+		resets = <&ps_scodec>;
 		iommus = <&dart_apr0 1>, <&dart_apr1 1>;
 		status = "disabled";
 	};

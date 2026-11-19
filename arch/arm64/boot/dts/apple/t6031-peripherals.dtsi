@@ -801,9 +801,11 @@
 		reg = <0x2 0xc5000000 0x0 0x4000>,
 		      <0x2 0xc4000000 0x0 0x1000000>,
 		      <0x2 0xc5078000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1738 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_scodec>;
+		resets = <&ps_scodec>;
 		iommus = <&dart_apr00 1>, <&dart_apr01 1>;
 		status = "disabled";
 	};
@@ -812,9 +814,11 @@
 		compatible = "apple,t6031-prores", "apple,prores";
 		reg = <0x2 0x87000000 0x0 0x4000>,
 		      <0x2 0x86000000 0x0 0x1000000>;
+		reg-names = "core", "wrapper";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1785 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_prores>;
+		resets = <&ps_prores>;
 		iommus = <&dart_apr1 0>;
 		status = "disabled";
 	};
