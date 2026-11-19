@@ -9,6 +9,9 @@
  * Copyright The Asahi Linux Contributors
  */
 
+/* The N1's firmware and this board's ADT board-id, for t6050-k114-k116.dtsi */
+#define T6050_K_N1_FIRMWARE	"apple/centauri/k116c-ftab.bin"
+#define T6050_K_BOARD_ID	0x06
 #include "t6050-k114-k116.dtsi"
 
 / {
@@ -22,3 +25,6 @@
 
 #define T6050_K116C
 #include "t6050-peripherals.dtsi"
+
+/* The USB-C ports ATC1 and ATC2, as on the other K boards */
+#include "t6050-k114-k116-usb.dtsi"
