@@ -95,7 +95,7 @@ struct apple_epic_service_ops {const char *name;bool reusable,optional,open_late
 struct apple_epic_service {struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;bool enabled,torndown,pending_open,defer_start;unsigned users;int lock;u32 channel;void *cookie;const char *pending_name,*pending_class;s64 pending_unit;int cmd_map[1];};
 struct dptx_port {struct apple_epic_service *service;s64 unit;bool enabled,connected;int enable_completion;};
 struct apple_dcp {const void *push_out_prefill;bool native,ext26_services_open,v27_j714s,v27_sleep_transport;int fw_compat,index,dptx_controller_ready;struct {unsigned num_dptx_ports;int iomfb_method_profile,firmware_compat;bool afk_announced_names;} hw;struct dptx_port dptxport[2];void *dev;struct apple_dcp_afkep *systemep,*ibootep,*dptx_controller_ep,*dcpavservep,*dptxep,*ext26_aux[3];};
-struct apple_dcp_afkep {struct apple_dcp *dcp;u32 endpoint,num_channels;bool wire_v2,stopping,match_epic_name,compact;int lock;void *wq,*service_work;const struct apple_epic_service_ops *ops;struct apple_epic_service services[AFK_MAX_CHANNEL];};
+struct apple_dcp_afkep {struct apple_dcp *dcp;u32 endpoint,num_channels;bool wire_v2,stopping,match_epic_name,compact;int lock;void *wq,*service_work;const struct apple_epic_service_ops *ops,*unmatched_ops;struct apple_epic_service services[AFK_MAX_CHANNEL];};
 static bool dcp_is_ext26(struct apple_dcp *d){return d->native;}
 static bool dcp_fail_stop(struct apple_dcp *d){return d->native;}
 static bool dcp_is_v14_7_external(struct apple_dcp *d){return false;}

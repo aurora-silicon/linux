@@ -1835,6 +1835,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	if (!ops && dcp_is_ext26(ep->dcp) && ep->ops &&
 	    !strcmp(ep->ops->name, "native26-observer"))
 		ops = ep->ops;
+	if (!ops)
+		ops = ep->unmatched_ops;
 	if (!ops) {
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: unable to match service %s on channel %d\n",

@@ -563,6 +563,11 @@ struct apple_dcp_afkep {
 	void *compact_rx_data;
 
 	const struct apple_epic_service_ops *ops;
+	/*
+	 * Bound to an announced service no entry of @ops names, which is then
+	 * opened like a matched one. NULL leaves such a service unopened.
+	 */
+	const struct apple_epic_service_ops *unmatched_ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];
 	u32 num_channels;
 
