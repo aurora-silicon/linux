@@ -3702,3 +3702,11 @@
 		status = "disabled";
 	};
 };
+
+/*
+ * The Neural Engine's firmware reservations and enables. A board whose engine
+ * is described defines T6050_ANE before including this file.
+ */
+#ifdef T6050_ANE
+#include "t6050-ane.dtsi"
+#endif
