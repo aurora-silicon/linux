@@ -441,3 +441,62 @@
 };
 
 /* Unexposed chassis port instances remain described and disabled. */
+
+/*
+ * The SD card reader (ADT pci-bridge2/pcie-sdreader, a GL9755) on apcie
+ * port 2, which the Mac mini does not have. The loader switches on its
+ * power (the ADT's SMC function-sd_pwr_en) and trains the link (pci-bridge2
+ * maximum-link-speed 1). From the J804 ADT: port 2's registers and PHY
+ * lane, host interrupt 1587 (the third of apcie's per-port interrupts, the
+ * driver indexes them by port number), PERST# GPIO 5 and dart-apcie2. Its
+ * MSIs come from the host's shared range.
+ */
+&pcie {
+	reg = <0x1c 0xb0000000 0x0 0x1000000>,
+	      <0x3 0x8c000000 0x0 0x4000>,
+	      <0x3 0x88028000 0x0 0x4000>,
+	      <0x3 0x8f010000 0x0 0x4000>,
+	      <0x3 0x8a028000 0x0 0x4000>,
+	      <0x3 0x8f018000 0x0 0x4000>;
+	reg-names = "config", "rc", "port0", "phy0", "port2", "phy2";
+	interrupts = <AIC_IRQ 1571 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 1579 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 1587 IRQ_TYPE_LEVEL_HIGH>;
+	iommu-map = <0x100 &pcie0_dart 1 1>,
+		    <0x101 &pcie0_dart 2 1>,
+		    <0x102 &pcie0_dart 3 1>,
+		    <0x200 &pcie2_dart 1 1>;
+	bus-range = <0 2>;
+
+	/* PERST#: ADT pci-bridge2 function-perst, GPIO 5 */
+	port02: pci@2,0 {
+		device_type = "pci";
+		reg = <0x1000 0x0 0x0 0x0 0x0>;
+		reset-gpios = <&pinctrl_ap 5 GPIO_ACTIVE_LOW>;
+		max-link-speed = <1>;
+		bus-range = <2 2>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port02 0 0 0 0>,
+				<0 0 0 2 &port02 0 0 0 1>,
+				<0 0 0 3 &port02 0 0 0 2>,
+				<0 0 0 4 &port02 0 0 0 3>;
+
+		/* Card detect and write protect active high (ADT *-polarity = 1) */
+		sdhci0: mmc@0,0 {
+			compatible = "pci17a0,9755";
+			reg = <0x20000 0x0 0x0 0x0 0x0>;
+			cd-inverted;
+			wp-inverted;
+		};
+	};
+};
+
+&pcie2_dart {
+	power-domains = <&ps_apcie_sys_gp>;
+	status = "okay";
+};
