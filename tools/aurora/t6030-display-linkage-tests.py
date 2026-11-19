@@ -65,7 +65,7 @@ config CRYPTO_LIB_SHA256
     # The provider does not import any of Aurora's glue symbols. Full modpost
     # and the actual .modinfo dependency are separately required build gates.
     provider = '\n'.join(f.read_text() for f in (ROOT / 'drivers/gpu/drm/apple').glob('*.c'))
-    assert not re.search(r'\basahi_g15_\w+\s*\(', provider)
+    assert not re.search(r'\baurora_g15_\w+\s*\(', provider)
     good = all(row['pass'] for row in results)
     (args.output / 'receipt.json').write_text(json.dumps({'passed': good,
         'stanza_sha256': hashlib.sha256(stanza.encode()).hexdigest(),

@@ -90,7 +90,7 @@ register state.
 Bootloader requirements
 =======================
 
-Use the J813-capable Aurora aura and U-Boot bring-up stack. A stock M1/M2
+Use the J813-capable aura and U-Boot bring-up stack. A stock M1/M2
 loader is not sufficient. Before entering Linux, the loader must:
 
 * Supply usable memory and reserved regions. T8142 DRAM starts at

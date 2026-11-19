@@ -143,7 +143,7 @@ def compile_helper(args, output):
         '-std=gnu11', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
         # Raw source UAPI annotations are removed by headers_install; no ABI changes.
         '-D__user=', '-I', str(header_dir),
-        '-DASAHI_M4_UAPI_SHA256="' + header_hashes[str(headers[0])] + '"',
+        '-DAURORA_M4_UAPI_SHA256="' + header_hashes[str(headers[0])] + '"',
         str(HERE / 'native-ioctl-regression.c'), '-o', str(binary)]
     subprocess.run(command, check=True, timeout=60)
     proof = {'compiled_utc': utc(), 'command': command, 'binary_sha256': sha(binary),

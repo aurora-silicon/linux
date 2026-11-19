@@ -38,7 +38,7 @@ def main():
         for index, (includes, header) in enumerate(sources):
             producer = work / ("producer-" + str(index))
             run([cc, "-std=c11", "-Wall", "-Wextra", "-Werror",
-                 "-I" + str(includes), '-DASAHI_HEADER="' + header + '"',
+                 "-I" + str(includes), '-DAURORA_HEADER="' + header + '"',
                  str(fixture_source), "-o", str(producer)])
             prefix = work / ("prefix-" + str(index))
             with prefix.open("wb") as output:
