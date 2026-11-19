@@ -160,7 +160,7 @@ pub mod g16 {
     }
     pub mod boot {pub fn eproto()->crate::Error{crate::Error(71)}}
     // Arenas here have the two base units.
-    pub mod params {pub fn compute_units()->usize{2}}
+    pub mod params {pub fn compute_units()->usize{2}pub fn pb_heap_blocks()->u32{2048}pub fn pb_posted_blocks(heap:u32)->u32{heap}}
     pub struct Events{pub grow:crate::KVec<[u32;18]>}
     pub struct Firmware{pub pools:pools::Pools,pub events:Events}
     pub mod budget{__BUDGET__}
@@ -377,10 +377,10 @@ pub mod g16 {
     #[test]fn pb_installations_are_fresh_and_exposed_records_cannot_be_reinitialized(){
         let vm=vm(1);let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
         let a=g16::pools::PbEpoch::new(&factory,&vm,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
-        a.prepare(0,0x70c0000000).unwrap();a.check_assignment(0).unwrap();a.expose();
+        a.prepare(0,0x70c0000000,2048).unwrap();a.check_assignment(0).unwrap();a.expose();
         a.manager.w64(0xb0,0x123456789abcdef0).unwrap();let saved=a.manager.snapshot();
-        assert_eq!(a.prepare(0,0x70c0000000),Err(EINVAL));assert_eq!(saved,a.manager.snapshot());
-        let b=g16::pools::PbEpoch::new(&factory,&vm,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();b.prepare(0,0x70c0000000).unwrap();
+        assert_eq!(a.prepare(0,0x70c0000000,2048),Err(EINVAL));assert_eq!(saved,a.manager.snapshot());
+        let b=g16::pools::PbEpoch::new(&factory,&vm,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();b.prepare(0,0x70c0000000,2048).unwrap();
         assert!(!std::ptr::eq(&a.manager.data,&b.manager.data));
         assert_eq!(b.manager.class,g16::object::Class::Fw);assert_eq!(b.manager.gva,None);
         let mut slots=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
@@ -391,7 +391,7 @@ pub mod g16 {
     #[test]fn pb_reuse_needs_the_same_binding_vm_and_a_completed_render_and_holds_nothing(){
         let one=vm(1);let two=vm(2);let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
         let a=g16::pools::PbEpoch::new(&factory,&one,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
-        a.prepare(0,0x70c0000000).unwrap();a.check_assignment(0).unwrap();a.expose();
+        a.prepare(0,0x70c0000000,2048).unwrap();a.check_assignment(0).unwrap();a.expose();
         let mut p=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
         let n=p.bind(0,false);p.retire_binding(0,&a).unwrap();p.retire_epoch(true,0,n,true);
         assert_eq!(sync::Arc::strong_count(&a),2,"only the owner lease");
