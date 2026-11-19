@@ -57,6 +57,9 @@
 #include <linux/sysfs.h>
 #include <linux/types.h>
 
+#include <asm/kvm_arm.h>
+#include <asm/virt.h>
+
 #include "dma-iommu.h"
 
 #if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
@@ -277,6 +280,8 @@ struct apple_dart;
 
 struct apple_dart_hw {
 	enum dart_type type;
+	/* T8110 register layout, SPTM-owned TLB invalidation (T8152) */
+	bool gen3;
 	irqreturn_t (*irq_handler)(int irq, void *dev);
 	int (*invalidate_tlb)(struct apple_dart_stream_map *stream_map);
 	void (*enable_remap)(struct apple_dart *dart, int sid, int remap_to);
@@ -356,6 +361,7 @@ struct apple_dart_fw_tree {
 #define APPLE_DART_GAPF_PROTECT BIT(4)
 
 struct apple_dart {
+	bool cold_gen3;
 	struct device *dev;
 	const struct apple_dart_hw *hw;
 
@@ -539,6 +545,10 @@ struct apple_dart {
 	bool cio_active;
 	unsigned int sleep_writers;
 	bool sleep_closed;
+
+	/* Gen3: shared TLBI aperture and this DART's route in it */
+	void __iomem *tlbi;
+	u8 tlbi_route;
 
 	DECLARE_BITMAP(remapped, DART_MAX_STREAMS);
 	u8 remap_target[DART_MAX_STREAMS];
@@ -1985,6 +1995,59 @@ next:
 	return 0;
 }
 
+#define DART_GEN3_TLBI_ROUTE		0x4604
+#define DART_GEN3_TLBI_VALID		BIT_ULL(60)
+#define DART_GEN3_TLBI_ROUTE_FIELD	GENMASK_ULL(59, 56)
+#define DART_GEN3_TLBI_SID		GENMASK_ULL(55, 48)
+
+/*
+ * Gen3 DARTs (T8152) are owned by the SPTM, and their TLB command register at
+ * 0x80 answers translation queries instead of flushing. A stream is
+ * invalidated the way iBoot does it: write a 128-bit payload (valid, route,
+ * SID) to the shared TLBI aperture, then broadcast a TLBI, which the DART
+ * snoops and applies to that stream.
+ */
+static int
+apple_dart_gen3_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
+{
+	struct apple_dart *dart = stream_map->dart;
+	unsigned long flags;
+	u64 hcr = 0;
+	int sid;
+
+	spin_lock_irqsave(&dart->lock, flags);
+	/*
+	 * The DART snoops an EL1&0 TLBI, as iBoot and aura (EL2 without VHE)
+	 * issue it. A VHE kernel's TLBI VALE1OS targets EL2&0 while
+	 * HCR_EL2.TGE is set, so clear TGE around it, as KVM does to reach
+	 * the EL1&0 regime.
+	 */
+	if (is_kernel_in_hyp_mode()) {
+		hcr = read_sysreg(hcr_el2);
+		write_sysreg(hcr & ~HCR_TGE, hcr_el2);
+		isb();
+	}
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		u64 lo = DART_GEN3_TLBI_VALID |
+			 FIELD_PREP(DART_GEN3_TLBI_ROUTE_FIELD, dart->tlbi_route) |
+			 FIELD_PREP(DART_GEN3_TLBI_SID, sid);
+
+		dma_wmb();
+		asm volatile("stp %0, xzr, [%1]\n"
+			     "dsb ish\n"
+			     ".inst 0xd50881bf\n" /* tlbi vale1os, xzr */
+			     "dsb osh\n"
+			     : : "r"(lo), "r"(dart->tlbi) : "memory");
+	}
+	if (is_kernel_in_hyp_mode()) {
+		write_sysreg(hcr, hcr_el2);
+		isb();
+	}
+	spin_unlock_irqrestore(&dart->lock, flags);
+
+	return 0;
+}
+
 static int
 apple_dart_t8020_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 {
@@ -2155,6 +2218,15 @@ static int apple_dart_t8110_v2_unlock(struct apple_dart *dart)
 		return -EPERM;
 	if (!(readl(dart->regs + DART_T8110_DIAG_LOCK) & DART_T8110_DIAG_LOCK_ON_ERR))
 		return 0;
+	/*
+	 * A Gen3 DART's TLB command register serves translation queries and
+	 * cannot unlock it. Its streams stay stopped until the DART is reset.
+	 */
+	if (dart->hw->gen3) {
+		dev_err_ratelimited(dart->dev,
+				    "locked on error; a Gen3 DART is not unlocked\n");
+		return -EOPNOTSUPP;
+	}
 
 	/* Unlock after acknowledging a lock-on-error exception. */
 	__set_bit(0, stream_map.sidmap);
@@ -2577,6 +2649,17 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	struct apple_dart_stream_map stream_map;
 	int i;
 
+	if (dart->cold_gen3) {
+		stream_map.dart = dart;
+		bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
+		bitmap_set(stream_map.sidmap, 0, 3);
+		apple_dart_hw_disable_dma(&stream_map);
+		apple_dart_hw_clear_all_ttbrs(&stream_map);
+		apple_dart_apply_own_tunables(dart);
+		apple_dart_writel(dart, 7, dart->hw->enable_streams);
+		return dart->hw->invalidate_tlb(&stream_map);
+	}
+
 	if (dart->isp_host)
 		return apple_dart_isp_host_reset(dart);
 	if (dart->managed_sids || dart->cold_ane)
@@ -2723,8 +2806,11 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 		/* The range registers take the DVA the device issues. */
 		start = first + domain->dma_offset;
 		end = last + domain->dma_offset;
-		if (range && (stream.dart->fw_mirror || stream.dart->fw_handoff) &&
-		    stream.dart->version >= 0x0202)
+		/* Gen3 has no range command; invalidate the complete stream. */
+		if (stream.dart->hw->gen3)
+			ret = stream.dart->hw->invalidate_tlb(&stream);
+		else if (range && (stream.dart->fw_mirror || stream.dart->fw_handoff) &&
+			 stream.dart->version >= 0x0202)
 			ret = apple_dart_fw_invalidate(&stream, start, end);
 		else if (range && stream.dart->locked && stream.dart->version >= 0x0202)
 			ret = apple_dart_t8110_hw_tlb_command_range(&stream, op, true,
@@ -3305,6 +3391,17 @@ static int __apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 		.coherent_walk = 1,
 		.iommu_dev = dart->dev,
 	};
+
+	if (dart->cold_gen3) {
+		if ((dma_min ^ dma_max) & ~DMA_BIT_MASK(36)) {
+			ret = -ERANGE;
+			goto done;
+		}
+		/* Gen3 selects the high DMA window separately from its two-level
+		 * 16K page-table indices, as with iBoot's display streams.
+		 */
+		pgtbl_cfg.ias = 36;
+	}
 
 	if (dart->locked) {
 		unsigned long *sidmap;
@@ -5453,6 +5550,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
 	dart->tunneled = tunneled;
+	dart->cold_gen3 = of_device_is_compatible(dev->of_node, "apple,t8152-avd-dart");
 	dart->cold_ane = of_device_is_compatible(dev->of_node, "apple,t8140-ane-dart") ||
 			 of_device_is_compatible(dev->of_node, "apple,t8142-ane-dart");
 	if (dart->cold_ane && !IS_BUILTIN(CONFIG_APPLE_DART))
@@ -5611,6 +5709,18 @@ static int apple_dart_probe(struct platform_device *pdev)
 		 * not admitted: never enable that level IRQ for one block alone.
 		 */
 		dart->irq = -1;
+	} else if (dart->hw->gen3) {
+		/*
+		 * Gen3 reports a fault like a v2 DART: the per-SID exception
+		 * bitmap and records, acknowledged by writing the bitmap back
+		 * (apple_dart_t8110_v2_irq()). Only the unlock after a
+		 * lock-on-error exception differs: see apple_dart_t8110_v2_unlock().
+		 */
+		dart->irq = platform_get_irq_optional(pdev, 0);
+		if (dart->irq == -ENXIO)
+			dart->irq = -1;
+		else if (dart->irq < 0)
+			return dart->irq;
 	} else if (dart->preserve_display || j713_radio) {
 		dart->irq = platform_get_irq_optional(pdev, 0);
 		if (dart->irq == -ENXIO)
@@ -5857,6 +5967,38 @@ params_done:
 		ret = -EBUSY;
 		goto err_clk_disable;
 	}
+	if (dart->hw->gen3) {
+		struct resource *tlbi;
+
+		/* Cold initialization is qualified only for the AVD instance. */
+		if (!dart->locked && !dart->cold_gen3) {
+			dev_err(dev, "Gen3 DART is not locked; cold setup is not supported\n");
+			ret = -ENODEV;
+			goto err_clk_disable;
+		}
+		if (dart->cold_gen3 && (dart->locked || dart->version != 0x300 ||
+		    dart->num_streams != 16 || !dev->pm_domain || !dart->tunables ||
+		    (apple_dart_readl(dart, dart->hw->enable_streams) & 7))) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		/* The aperture is shared by every Gen3 DART: map, do not claim. */
+		tlbi = platform_get_resource_byname(pdev, IORESOURCE_MEM, "tlbi");
+		if (!tlbi || resource_size(tlbi) < 16) {
+			dev_err(dev, "Gen3 DART needs its TLBI aperture\n");
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		dart->tlbi = devm_ioremap(dev, tlbi->start, resource_size(tlbi));
+		if (!dart->tlbi) {
+			ret = -ENOMEM;
+			goto err_clk_disable;
+		}
+		dart->tlbi_route = apple_dart_readl(dart, DART_GEN3_TLBI_ROUTE) & 0xf;
+		dev_info(dev, "Gen3 DART, version %#x, TLBI route %u\n",
+			 dart->version, dart->tlbi_route);
+	}
+
 	apple_dart_parse_sleep_list(dart, res, "apple,sleep-prepare", &dart->sleep_prepare);
 	apple_dart_parse_sleep_list(dart, res, "apple,sleep-restore", &dart->sleep_restore);
 	apple_dart_parse_sleep_list(dart, res, "apple,sleep-restore-late",
@@ -5998,7 +6140,7 @@ params_done:
 	}
 
 	/* Borrowed display state: never acknowledge someone else's fault. */
-	if (dart->locked && !dart->preserve_display)
+	if (dart->locked && !dart->preserve_display && !dart->hw->gen3)
 		apple_dart_drain_stale_exceptions(dart);
 
 	/* Refuse an already pending inherited fault before joining the shared IRQ. */
@@ -6351,6 +6493,33 @@ static const struct apple_dart_hw apple_dart_hw_t6000 = {
 	.ttbr_addr_field_shift = DART_T8020_TTBR_ADDR_FIELD_SHIFT,
 	.ttbr_shift = DART_T8020_TTBR_SHIFT,
 	.ttbr_count = 4,
+};
+
+static const struct apple_dart_hw apple_dart_hw_gen3 = {
+	.type = DART_T8110,
+	.gen3 = true,
+	.irq_handler = apple_dart_t8110_irq,
+	.invalidate_tlb = apple_dart_gen3_hw_invalidate_tlb,
+	.fmt = APPLE_DART2,
+	.max_sid_count = 256,
+
+	.enable_streams = DART_T8110_ENABLE_STREAMS,
+	.lock = DART_T8110_PROTECT,
+	.lock_bit = DART_T8110_PROTECT_TTBR_TCR,
+
+	.error = DART_T8110_ERROR,
+
+	.tcr = DART_T8110_TCR,
+	.tcr_enabled = DART_T8110_TCR_TRANSLATE_ENABLE,
+	.tcr_disabled = 0,
+	.tcr_bypass = DART_T8110_TCR_BYPASS_DAPF | DART_T8110_TCR_BYPASS_DART,
+	.tcr_4level = DART_T8110_TCR_FOUR_LEVEL,
+
+	.ttbr = DART_T8110_TTBR,
+	.ttbr_valid = DART_T8110_TTBR_VALID,
+	.ttbr_addr_field_shift = DART_T8110_TTBR_ADDR_FIELD_SHIFT,
+	.ttbr_shift = DART_T8110_TTBR_SHIFT,
+	.ttbr_count = 1,
 };
 
 static const struct apple_dart_hw apple_dart_hw_t8110 = {
@@ -7131,6 +7300,8 @@ static const struct dev_pm_ops apple_dart_pm_ops = {
 };
 
 static const struct of_device_id apple_dart_of_match[] = {
+	{ .compatible = "apple,t8152-dart-gen3", .data = &apple_dart_hw_gen3 },
+	{ .compatible = "apple,t8152-avd-dart", .data = &apple_dart_hw_gen3 },
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },
 	{ .compatible = "apple,t8103-usb4-dart", .data = &apple_dart_hw_t8103_usb4 },
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },

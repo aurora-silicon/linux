@@ -44,7 +44,7 @@ struct io_pgtable { struct io_pgtable_cfg cfg; };
 #define io_pgtable_ops_to_pgtable(x) ((struct io_pgtable *)(x))
 struct apple_dart;
 struct apple_dart_stream_map { struct apple_dart *dart; unsigned long sidmap[1]; };
-struct apple_dart_hw { int (*invalidate_tlb)(struct apple_dart_stream_map *); };
+struct apple_dart_hw { int (*invalidate_tlb)(struct apple_dart_stream_map *); bool gen3; };
 struct apple_dart { int num_streams, locked, version; bool fw_mirror, fw_handoff, managed_sids, display_dark, display_tlb_stale; void *dev; struct apple_dart_hw *hw; };
 struct apple_dart_atomic_stream_map { struct apple_dart *dart; unsigned long sidmap[1]; };
 struct apple_dart_domain {
