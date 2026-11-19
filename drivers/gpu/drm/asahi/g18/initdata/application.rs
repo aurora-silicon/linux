@@ -37,7 +37,7 @@ impl G18FirmwareMemory {
     /// Graphics and compute share this outer ring but have independent inner
     /// sequences. Only publish from a fully retired observed outer position.
     pub(crate) fn publish_application_records(&mut self, records: &[[u8;24]]) -> Result<u32> {
-        if records.is_empty() || records.len()>2 || self.control_counters()?!=[[2;3],[1;3]] {
+        if records.is_empty() || records.len()>2 || self.control_counters()?!=self.control_retired() {
             return Err(EINVAL);
         }
         let counters=self.compute_outer_counters()?;let before=counters[0];

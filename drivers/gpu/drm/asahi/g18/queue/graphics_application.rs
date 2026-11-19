@@ -95,11 +95,75 @@ impl G18ParameterBuffer {
         if a.page_list_row!=a.page_list_low && a.page_list_row!=a.page_list_low+bias {
             aliases.push(self.page_list.map_alias_at(vm,a.page_list_row,mmu::PROT_GPU_SHARED_RW)?,GFP_KERNEL)?;
         }
-        for (index,block) in self.blocks.iter_mut().enumerate() {
-            let low=a.blocks_low+index as u64*G18_PB_BLOCK_BYTES;
+        // Each block object is homed at its own low address; a grown one
+        // spans several blocks.
+        for block in self.blocks.iter_mut() {
+            let low=block.iova();
             for address in [low,low+bias] {aliases.push(block.map_alias_at(vm,address,mmu::PROT_GPU_SHARED_RW)?,GFP_KERNEL)?;}
         }
         Ok(aliases)
+    }
+
+    /// Blocks backed so far: the initial ones plus every growth.
+    fn backed_blocks(&self) -> Result<u32> {
+        let bytes: usize=self.blocks.iter().map(|block|block.logical_size).sum();
+        Ok(u32::try_from(bytes/G18_PB_BLOCK_BYTES as usize)?)
+    }
+
+    /// Answer a firmware TVB grow request (event 6) while the tiler waits:
+    /// back up to `add` more blocks after the existing ones, append them to
+    /// the block ring and advance its total and committed cursors. This is
+    /// the M5 firmware-request growth (g17 Manager::commit_growth without a
+    /// descriptor): the firmware builds the page-list entries itself. The
+    /// new blocks are one object, homed in `storage` like the initial ones
+    /// and aliased into the running client `vm`; the caller retains those
+    /// aliases with the client's other PB aliases. Returns the number of
+    /// blocks added (0: at the limit).
+    pub(crate) fn grow(&mut self, dev: &AsahiDrmDevice, storage: &mmu::Vm, vm: &mmu::Vm,
+        add: u32, max: u32) -> Result<(u32, KVec<mmu::KernelMapping>)> {
+        let a=self.addresses;let bias=crate::g18::address_map::COMPACT_BIAS;
+        let capacity=self.policy.capacity;
+        let blocks=self.backed_blocks()?;
+        let added=max.saturating_sub(blocks).min(add);
+        if added==0 {return Ok((0,KVec::new()));}
+        let cursor=|pb: &mut Self,offset: usize| pb.graph.read_u32(a.graph_high+(SHARED+offset) as u64);
+        let (total,committed,read)=(cursor(self,0)?,cursor(self,4)?,cursor(self,8)?);
+        if total!=committed || total>=capacity || read>=capacity {return Err(EIO);}
+        let retained=(total+capacity-read)%capacity;
+        // The ring keeps one slot empty; the block table ends at SHARED.
+        if retained+added>=capacity || (total+added) as usize*8>SHARED-BLOCK_TABLE {return Err(ENOSPC);}
+        let address=a.blocks_low+u64::from(blocks)*G18_PB_BLOCK_BYTES;
+        let mut object=MappedObject::new_wc_at(dev,storage,address,
+            added as usize*G18_PB_BLOCK_BYTES as usize,mmu::PROT_GPU_SHARED_RW)?;
+        let window=object.map_alias_at(storage,address+bias,mmu::PROT_GPU_SHARED_RW)?;
+        let mut aliases=KVec::with_capacity(2,GFP_KERNEL)?;
+        for at in [address,address+bias] {
+            aliases.push(object.map_alias_at(vm,at,mmu::PROT_GPU_SHARED_RW)?,GFP_KERNEL)?;
+        }
+        let first=u32::try_from(address.wrapping_add(a.user_view_delta)>>15).map_err(|_|ERANGE)?;
+        let last=first+added*G18_PB_PAGES_PER_BLOCK-1;
+        if last>>25!=0 {return Err(ERANGE);}
+        // Firmware owns the blocks once published: nothing below may fail
+        // and drop them, so the owner vectors grow first.
+        self.blocks.reserve(1,GFP_KERNEL)?;
+        self.window_aliases.reserve(1,GFP_KERNEL)?;
+        for index in 0..added {
+            let slot=((total+index)%capacity) as usize;
+            let base=first+index*G18_PB_PAGES_PER_BLOCK;
+            self.graph.write_u32(a.graph_high+(BLOCK_TABLE+slot*8) as u64,base)?;
+            self.graph.write_u32(a.graph_high+(BLOCK_TABLE+slot*8+4) as u64,0)?;
+        }
+        let target=(total+added)%capacity;
+        fence(Ordering::SeqCst);
+        self.graph.write_u32(a.graph_high+SHARED as u64,target)?;
+        fence(Ordering::SeqCst);
+        self.graph.write_u32(a.graph_high+(SHARED+4) as u64,target)?;
+        fence(Ordering::SeqCst);
+        let _=self.blocks.push_within_capacity(object);
+        let _=self.window_aliases.push_within_capacity(window);
+        dev_info!(dev.as_ref(),"G18_PB_GROW blocks={}->{} ring total={}->{} read={}\n",
+            blocks,blocks+added,total,target,read);
+        Ok((added,aliases))
     }
 
     /// The PB words a recovery can leave behind: the firmware-visible state
@@ -132,10 +196,17 @@ impl G18ParameterBuffer {
         let offset=self.policy.slot as usize*G18_PB_ROW_BYTES;
         let row: [u8;G18_PB_ROW_BYTES]=table.with_bytes_mut(|out|out[offset..offset+G18_PB_ROW_BYTES].try_into().map_err(|_|EINVAL))?;
         let word=|i:usize|u32::from_le_bytes(row[i..i+4].try_into().unwrap());
+        // The page count grows with firmware-requested PB growth, never
+        // beyond the backed blocks.
+        let pages=self.policy.blocks*G18_PB_PAGES_PER_BLOCK..=self.backed_blocks()?*G18_PB_PAGES_PER_BLOCK;
         if g18_pb_row_decoded_address(&row)!=Some(self.inputs.page_list_gpu)
-            || (word(4)&0x3f_ffff)!=(self.row.ok_or(EINVAL)?[4..8].try_into().map(u32::from_le_bytes).map_err(|_|EINVAL)?&0x3f_ffff)
+            || (word(4)&0xffc0_0000)!=(self.row.ok_or(EINVAL)?[4..8].try_into().map(u32::from_le_bytes).map_err(|_|EINVAL)?&0xffc0_0000)
+            || !pages.contains(&(word(4)&0x3f_ffff))
             || word(8)&0x3f_ffff>=self.policy.capacity*G18_PB_PAGES_PER_BLOCK
-            || word(12)&0x3f_ffff>=self.policy.capacity*G18_PB_PAGES_PER_BLOCK {return Err(EIO);}
+            || word(12)&0x3f_ffff>=self.policy.capacity*G18_PB_PAGES_PER_BLOCK {
+            pr_err!("G18 PB row {:x?} refused: pages {:?}\n",[word(0),word(4),word(8),word(12)],pages);
+            return Err(EIO);
+        }
         let state: [u8;G18_PB_STATE_FIRMWARE_BYTES]=self.state.with_bytes_mut(|out|out[..G18_PB_STATE_FIRMWARE_BYTES].try_into().map_err(|_|EINVAL))?;
         if u32::from_le_bytes(state[8..12].try_into().map_err(|_|EINVAL)?)!=context {return Err(EIO);}
         let counter=self.graph.read_u32(self.addresses.graph_high+COUNTER as u64)?;
