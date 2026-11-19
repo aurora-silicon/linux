@@ -7577,15 +7577,6 @@ static void atcphy_sleep_finish(struct apple_atcphy *atcphy, bool kept)
 	atcphy_sleep_ss_up(atcphy);
 }
 
-void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
-{
-	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
-
-	if (atcphy)
-		atcphy_sleep_finish(atcphy, kept);
-}
-EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish);
-
 static void atcphy_sleep_finish_work(struct work_struct *work)
 {
 	struct apple_atcphy *atcphy = container_of(work, struct apple_atcphy, sleep_finish_work);
@@ -7618,15 +7609,6 @@ bool apple_atcphy_sleep_finish_done(struct phy *usb2_phy)
 	return !atcphy || completion_done(&atcphy->sleep_finish_done);
 }
 EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish_done);
-
-void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy)
-{
-	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
-
-	if (atcphy)
-		flush_work(&atcphy->sleep_finish_work);
-}
-EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish_flush);
 
 static struct apple_atcphy *atcphy_from_cio_phy(struct phy *phy)
 {
