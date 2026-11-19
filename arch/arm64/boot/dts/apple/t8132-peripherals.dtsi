@@ -153,7 +153,7 @@
 		power-domains = <&ps_ane_sys>;
 		/* Include firmware identity MMIO pages below the preload DVAs. */
 		apple,dma-range = <0x0 0x0 0x400 0x0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ane_dart1: iommu@501820000 {
@@ -164,7 +164,7 @@
 		interrupts = <AIC_IRQ 630 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
 		apple,dma-range = <0x0 0x0 0x400 0x0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ane_dart2: iommu@501840000 {
@@ -175,7 +175,7 @@
 		interrupts = <AIC_IRQ 630 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
 		apple,dma-range = <0x0 0x0 0x400 0x0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	dart_ane_companion3: filter@501810000 {
@@ -348,8 +348,9 @@
 	};
 
 	/*
-	 * ADT-derived only: keep disabled until an M4 owner qualifies the H16
-	 * backend and the loader hands off reserved TEXT/DATA preloads.
+	 * Every M4 has the engine. The driver runs it only when the loader
+	 * hands off the reserved TEXT/DATA preloads (memory-region and
+	 * apple,firmware-iovas); without them it refuses to bind.
 	 */
 	ane: ane@500000000 {
 		compatible = "apple,t8132-ane";
@@ -378,7 +379,7 @@
 				    /bits/ 64 <0x302668000 0x302668003>;
 		/* Default layout; the loader supplies per-boot physical reservations. */
 		apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	scaler0: scaler@505000000 {
