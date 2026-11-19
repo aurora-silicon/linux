@@ -355,6 +355,31 @@ fn bag_restore_plan(component: bool, file: bool, master_active: bool) -> BagRest
     }
 }
 
+/// What a verify or an enrolment naming a Unix account does while that
+/// account's bag is not loaded (logged out, or not yet unlocked this boot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnloadedBag {
+    /// The account never enrolled a finger of its own: the configured
+    /// user's domain, as before per-user bags.
+    Shared,
+    /// The account's fingers are its bag's: refused until its password
+    /// loads the bag. The configured user's are not the account's.
+    Refuse,
+}
+
+/// From whether the account's saved catacomb exists (true unless provably
+/// absent). An enrolment into a bag succeeds only once that file is saved
+/// (`save_bag_user_components`), so the file is what shows the account has
+/// fingers of its own. The master can list a component for a bag that was
+/// designated but never enrolled; that alone is no enrolment.
+fn unloaded_bag_plan(file: bool) -> UnloadedBag {
+    if file {
+        UnloadedBag::Refuse
+    } else {
+        UnloadedBag::Shared
+    }
+}
+
 fn encode_designate(key_store: crate::profile::KeyStore, source_handle: i32, user_handle: i32) -> Result<crate::image::Body> {
     if source_handle < 0 || user_handle >= 0 {
         return Err(EINVAL);
@@ -1520,8 +1545,9 @@ impl crate::SepData {
     /// The subject of an enrolment or a verify for the Unix account `uid`
     /// (a store with per-user bags): that user's own domain when their bag
     /// is loaded. Refused while it is loaded but not unlocked by the password
-    /// since its last lock, as macOS asks for the password then. None (no
-    /// bag) keeps the configured user.
+    /// since its last lock, as macOS asks for the password then, and while it
+    /// is not loaded when the account has an enrolment of its own. None (no
+    /// bag and no enrolment of its own) keeps the configured user.
     pub(crate) fn userbag_bio_subject(&self, uid: u32) -> Result<Option<crate::BioSubject>> {
         if !self.profile.per_user_keybags() || uid < MIN_UID {
             return Ok(None);
@@ -1529,7 +1555,18 @@ impl crate::SepData {
         let user = bag_designation(uid)?;
         let mut bags = self.user_bags.lock();
         if bags.get(user.special_handle().value()).is_none() {
-            return Ok(None);
+            let file = !crate::catacomb::is_absent(crate::catacomb::Slot::BagUser(uid));
+            return match unloaded_bag_plan(file) {
+                UnloadedBag::Shared => Ok(None),
+                UnloadedBag::Refuse => {
+                    dev_info_ratelimited!(
+                        self.dev,
+                        "userbag: uid {}'s fingerprints are in its own key bag, which is not loaded: refused until its password\n",
+                        uid
+                    );
+                    Err(EACCES)
+                }
+            };
         }
         if bags.touch(user.special_handle().value()).is_none() || !self.userbag_restore_13(&mut bags, user, uid) {
             return Err(EACCES);
@@ -2321,6 +2358,17 @@ mod tests {
         assert_eq!(bag_restore_plan(false, true, true), BagRestore::StartFresh);
         // Without a loaded master, nothing proves that.
         assert_eq!(bag_restore_plan(false, true, false), BagRestore::Refuse);
+    }
+
+    #[test]
+    fn an_account_with_its_own_enrolment_is_refused_while_its_bag_is_unloaded() {
+        // A saved bag catacomb, or one that cannot be shown absent, holds
+        // the account's own fingers.
+        assert_eq!(unloaded_bag_plan(true), UnloadedBag::Refuse);
+        // A provably absent file means no enrolment of its own, even if the
+        // master lists a component for a bag designated but never enrolled:
+        // the configured user, as before per-user bags.
+        assert_eq!(unloaded_bag_plan(false), UnloadedBag::Shared);
     }
 
     #[test]

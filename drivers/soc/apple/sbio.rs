@@ -2745,7 +2745,7 @@ impl SepData {
         };
         let subject = match account.map(|uid| self.userbag_bio_subject(uid)) {
             Some(Err(_)) => {
-                dev_info_refusal!(self.dev, "verify: the account's key bag is locked; refusing without a capture until its password unlocks it\n");
+                dev_info_refusal!(self.dev, "verify: the account's key bag is locked, or not loaded while it holds the account's fingerprints; refusing without a capture until its password\n");
                 self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT), [0u8; bio::TOKEN_LEN]);
                 return;
             }
