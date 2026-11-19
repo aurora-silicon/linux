@@ -2319,9 +2319,30 @@ static const char *const t6041_j614s_hdmi_nodes[] = {
 	"/dcp@606e00000",
 };
 
+/*
+ * HDMI through the LPDPTX PHY (t604x-j575-j773-hdmi.dtsi) on an M4 Pro whose
+ * ATC3 is a USB port (J773s): the PHY's power, the PMP DISPEXT0 request,
+ * DISPEXT0, the AOP pins (the converter's hotplug), the PHY, then dcpext0's
+ * chain. dcpext0 drives HDMI only there: no Type-C routes, no crossbars.
+ */
+#define T6041_LPDPTX_PHY "/phy@51c200000"
+
+static const char *const t6041_lpdptx_hdmi_nodes[] = {
+	"/power-management@502280000/power-controller@360",
+	"/pmp-report@5003c0000/report@11",
+	"/power-management@502800000/power-controller@340",
+	"/power-management@502800000/power-controller@348",
+	"/pinctrl@510824000",
+	T6041_LPDPTX_PHY,
+	"/iommu@3a2340000",
+	"/iommu@3a2300000",
+	"/mailbox@3a2e08000",
+	"/dcp@3a2e00000",
+};
+
 enum { STAGED_HDMI, STAGED_USBC };
 
-/* The J614s HDMI stage replaces the J616s one in gate_t6041_staged(). */
+/* The J614s and LPDPTX HDMI stages replace the J616s one in gate_t6041_staged(). */
 static struct gate_staged t6041_stages[] = {
 	[STAGED_HDMI] = { "/iommu@3a2300000", t6041_hdmi_nodes, ARRAY_SIZE(t6041_hdmi_nodes) },
 	[STAGED_USBC] = { "/iommu@602300000", t6041_usbc_nodes, ARRAY_SIZE(t6041_usbc_nodes) },
@@ -2345,13 +2366,23 @@ static bool staged_stage_on(unsigned int i)
  * The HDMI processor's Type-C routes (dcpext0's, or J614s's dcpext2's hybrid
  * DP outputs) switch the Type-C crossbars, which are the USB-C chain's.
  * Without that chain they stay disabled and the processor drives HDMI only;
- * the crossbars are enabled for it, as its mux-controls name them.
+ * the crossbars are enabled for it, as its mux-controls name them. An HDMI
+ * processor without mux-controls (behind the LPDPTX PHY) needs none.
  */
 static const char *const t6041_hdmi_only_muxes[] = {
 	"/mux@38324c000",
 	"/mux@38b24c000",
 	"/mux@39324c000",
 };
+
+static bool staged_dcp_has_muxes(const struct gate_staged *st)
+{
+	struct device_node *np = of_find_node_by_path(st->nodes[st->nr - 1]);
+	bool muxes = np && of_property_present(np, "mux-controls");
+
+	of_node_put(np);
+	return muxes;
+}
 
 static bool staged_path_on(unsigned int i, const char *path)
 {
@@ -2441,6 +2472,8 @@ static bool staged_ready(const struct gate_staged *st)
 /* Enable @st's nodes and put its display DART into the display subsystem's iommus. */
 static int staged_apply(const struct gate_staged *st, struct device_node *display)
 {
+	bool hdmi_only = st == &t6041_stages[STAGED_HDMI] && !staged_stage_on(STAGED_USBC) &&
+			 staged_dcp_has_muxes(st);
 	struct device_node *np;
 	struct of_changeset *cs;
 	unsigned int i;
@@ -2462,8 +2495,7 @@ static int staged_apply(const struct gate_staged *st, struct device_node *displa
 		of_node_put(np);
 	}
 	/* The Type-C crossbars the HDMI processor's mux-controls name. */
-	for (i = 0; !ret && st == &t6041_stages[STAGED_HDMI] && !staged_stage_on(STAGED_USBC) &&
-		    i < ARRAY_SIZE(t6041_hdmi_only_muxes); i++) {
+	for (i = 0; !ret && hdmi_only && i < ARRAY_SIZE(t6041_hdmi_only_muxes); i++) {
 		np = of_find_node_by_path(t6041_hdmi_only_muxes[i]);
 		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
 		of_node_put(np);
@@ -3012,6 +3044,7 @@ static struct notifier_block staged_nb = { .notifier_call = staged_bus_notify };
 
 static void __init gate_t6041_staged(void)
 {
+	struct device_node *np;
 	unsigned int i;
 	int ret;
 
@@ -3021,6 +3054,14 @@ static void __init gate_t6041_staged(void)
 		t6041_stages[STAGED_HDMI] = (struct gate_staged){
 			"/iommu@606300000", t6041_j614s_hdmi_nodes,
 			ARRAY_SIZE(t6041_j614s_hdmi_nodes) };
+
+	/* A board that describes the LPDPTX PHY has its HDMI port behind it, not behind ATC3. */
+	np = of_find_node_by_path(T6041_LPDPTX_PHY);
+	if (np)
+		t6041_stages[STAGED_HDMI] = (struct gate_staged){
+			"/iommu@3a2300000", t6041_lpdptx_hdmi_nodes,
+			ARRAY_SIZE(t6041_lpdptx_hdmi_nodes) };
+	of_node_put(np);
 
 	/*
 	 * Each chain must be all there and disabled, with firmware memory,
@@ -3181,7 +3222,7 @@ static const struct gate_staged t6041_j575c_usbc2 = {
 
 /*
  * The J575c's HDMI chain. Its ATC3 is a USB-C port, and its HDMI port runs
- * through the LPDPTX PHY instead (t6041-j575c-hdmi.dtsi): that PHY's power,
+ * through the LPDPTX PHY instead (t604x-j575-j773-hdmi.dtsi): that PHY's power,
  * the AOP pins (the converter's hotplug), the PHY, then dcpext0's chain.
  */
 static const char *const t6041_j575c_hdmi_nodes[] = {
