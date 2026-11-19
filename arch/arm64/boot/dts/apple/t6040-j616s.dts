@@ -388,3 +388,107 @@
 &aes {
 	status = "okay";
 };
+
+/*
+ * Sustainable power of the thermal zones (t6040-gpu-thermal.dtsi), measured on
+ * the J616s: a 720 s all-core load held TCMz at 112-114 C with P0 25.3 W, P1
+ * 23.9 W and E 2.1 W on the SMC core rails. Each CPU zone gets the sum over
+ * the clusters it throttles; the die and GPU zones, which throttle all three,
+ * get 51.3 W. These are this machine's values: other T6040 boards are not
+ * measured and keep the governor's estimate.
+ */
+&{/thermal-zones/cpu-die-thermal} {
+	sustainable-power = <51300>;
+};
+
+&{/thermal-zones/cpu-e0-thermal} {
+	sustainable-power = <2100>;
+};
+
+&{/thermal-zones/cpu-e1-thermal} {
+	sustainable-power = <2100>;
+};
+
+&{/thermal-zones/cpu-e2-thermal} {
+	sustainable-power = <2100>;
+};
+
+&{/thermal-zones/cpu-e3-thermal} {
+	sustainable-power = <2100>;
+};
+
+&{/thermal-zones/cpu-p00-thermal} {
+	sustainable-power = <25300>;
+};
+
+&{/thermal-zones/cpu-p01-thermal} {
+	sustainable-power = <25300>;
+};
+
+&{/thermal-zones/cpu-p02-thermal} {
+	sustainable-power = <25300>;
+};
+
+&{/thermal-zones/cpu-p03-thermal} {
+	sustainable-power = <25300>;
+};
+
+&{/thermal-zones/cpu-p04-thermal} {
+	sustainable-power = <25300>;
+};
+
+&{/thermal-zones/cpu-p05-thermal} {
+	sustainable-power = <25300>;
+};
+
+&{/thermal-zones/cpu-p10-thermal} {
+	sustainable-power = <23900>;
+};
+
+&{/thermal-zones/cpu-p11-thermal} {
+	sustainable-power = <23900>;
+};
+
+&{/thermal-zones/cpu-p12-thermal} {
+	sustainable-power = <23900>;
+};
+
+&{/thermal-zones/cpu-p13-thermal} {
+	sustainable-power = <23900>;
+};
+
+&{/thermal-zones/cpu-p14-thermal} {
+	sustainable-power = <23900>;
+};
+
+&{/thermal-zones/cpu-p15-thermal} {
+	sustainable-power = <23900>;
+};
+
+&{/thermal-zones/gpu0-thermal} {
+	sustainable-power = <51300>;
+};
+
+&{/thermal-zones/gpu1-thermal} {
+	sustainable-power = <51300>;
+};
+
+&{/thermal-zones/gpu2-thermal} {
+	sustainable-power = <51300>;
+};
+
+&{/thermal-zones/gpu3-thermal} {
+	sustainable-power = <51300>;
+};
+
+&{/thermal-zones/gpu4-thermal} {
+	sustainable-power = <51300>;
+};
+
+&{/thermal-zones/gpu5-thermal} {
+	sustainable-power = <51300>;
+};
+
+&{/thermal-zones/gpu6-thermal} {
+	sustainable-power = <51300>;
+};

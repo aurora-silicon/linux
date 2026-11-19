@@ -179,9 +179,11 @@
 	 *   level, after three samples (critical-samples).
 	 * - The fans stay with the SMC, as on macOS: no active trips.
 	 *
-	 * sustainable-power is the J616s's: a 720 s all-core load held TCMz
-	 * at 112-114 C with P0 25.3 W, P1 23.9 W and E 2.1 W on the SMC core
-	 * rails. The J614s and J773s inherit these values until measured.
+	 * sustainable-power is a measurement of one board's cooling, so it
+	 * lives in the board file (t6040-j616s.dts). A board without one
+	 * (J614s, J773s) runs the power allocator on the governor's estimate,
+	 * the summed lowest-state power of the zone's cooling devices, until
+	 * it is measured.
 	 */
 	thermal-zones {
 		cpu-die-thermal {
@@ -189,7 +191,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 0>;	/* TCMz */
 
 			trips {
@@ -255,7 +256,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 1>;	/* Tex0 */
 
 			trips {
@@ -301,7 +301,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 2>;	/* Tex1 */
 
 			trips {
@@ -347,7 +346,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 3>;	/* Tex2 */
 
 			trips {
@@ -393,7 +391,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 4>;	/* Tex3 */
 
 			trips {
@@ -439,7 +436,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 5>;	/* Tpx0 */
 
 			trips {
@@ -486,7 +482,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 6>;	/* Tpx1 */
 
 			trips {
@@ -533,7 +528,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 7>;	/* Tpx2 */
 
 			trips {
@@ -580,7 +574,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 8>;	/* Tpx3 */
 
 			trips {
@@ -627,7 +620,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 9>;	/* Tpx4 */
 
 			trips {
@@ -674,7 +666,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 10>;	/* Tpx5 */
 
 			trips {
@@ -721,7 +712,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 11>;	/* Tpx8 */
 
 			trips {
@@ -768,7 +758,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 12>;	/* Tpx9 */
 
 			trips {
@@ -815,7 +804,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 13>;	/* TpxA */
 
 			trips {
@@ -862,7 +850,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 14>;	/* TpxB */
 
 			trips {
@@ -909,7 +896,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 15>;	/* TpxC */
 
 			trips {
@@ -956,7 +942,6 @@
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
-			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 16>;	/* TpxD */
 
 			trips {
@@ -1002,7 +987,6 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			critical-samples = <3>;
-			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 17>;	/* Tg05 */
 
 			trips {
@@ -1061,7 +1045,6 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			critical-samples = <3>;
-			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 18>;	/* Tg0S */
 
 			trips {
@@ -1120,7 +1103,6 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			critical-samples = <3>;
-			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 19>;	/* Tg0Y */
 
 			trips {
@@ -1179,7 +1161,6 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			critical-samples = <3>;
-			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 20>;	/* Tg0k */
 
 			trips {
@@ -1238,7 +1219,6 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			critical-samples = <3>;
-			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 21>;	/* Tg0z */
 
 			trips {
@@ -1297,7 +1277,6 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			critical-samples = <3>;
-			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 22>;	/* Tg1V */
 
 			trips {
@@ -1356,7 +1335,6 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			critical-samples = <3>;
-			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 23>;	/* Tg1l */
 
 			trips {
