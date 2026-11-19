@@ -49,17 +49,16 @@
 			status = "disabled";
 		};
 	};
+};
 
+#include "t6050-kbd-backlight.dtsi"
+
+/ {
 	led-controller {
-		compatible = "pwm-leds";
-
-		/* ADT /arm-io/pwm0/kbd-backlight: default-hz 25000 */
+		/* Here the keyboard light keeps its "apple::" name and no boot state */
 		led-0 {
-			pwms = <&fpwm0 0 40000>;
 			label = "apple::kbd_backlight";
-			function = LED_FUNCTION_KBD_BACKLIGHT;
-			color = <LED_COLOR_ID_WHITE>;
-			max-brightness = <255>;
+			/delete-property/ default-state;
 		};
 
 		/*
@@ -167,10 +166,6 @@
  */
 &dockchannel {
 	apple,tx-never-wait;
-	status = "okay";
-};
-
-&fpwm0 {
 	status = "okay";
 };
 

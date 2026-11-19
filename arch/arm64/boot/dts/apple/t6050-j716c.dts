@@ -52,6 +52,8 @@
 	};
 };
 
+#include "t6050-kbd-backlight.dtsi"
+
 /*
  * PCIe port 0: the N1 (Wi-Fi and Bluetooth), the only GP port this board uses besides the SD
  * reader on port 1 (not yet described). The boot loader trains the link after the SMC releases
