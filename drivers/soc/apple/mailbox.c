@@ -146,6 +146,7 @@ static bool ascwrap_v8_rx_irq;
 module_param(ascwrap_v8_rx_irq, bool, 0444);
 MODULE_PARM_DESC(ascwrap_v8_rx_irq,
 		 "Service T8152 GPU ASCWrap v8 receive with the recv-not-empty interrupt (default: poll, no GPU mailbox interrupt is enabled)");
+
 /* Physical T6050 GPU windows, shared by J775D and J716c. */
 #define APPLE_J775D_GFX_WRAPPER_BASE 0x2302600000ULL
 #define APPLE_J775D_GFX_IOP_VBAR_BASE 0x2302050000ULL
@@ -970,6 +971,35 @@ static void apple_mbox_v8_rx_irq_guard(struct apple_mbox *mbox, int drained)
 	queue_delayed_work(system_highpri_wq, &priv->rx_poll_work, 0);
 }
 
+/*
+ * GPU receive, hard interrupt half. Each GPU completion arrives as one or two
+ * messages, and their consumer (RTKit's early receive hook) only queues the
+ * GPU event work. Draining them here saves the receive thread's wakeup and
+ * context switch on every completion, so the event work is queued directly
+ * from the interrupt. The consumer already runs atomically: the threaded
+ * handler calls it under rx_lock with interrupts off.
+ *
+ * A pass that drains the whole budget is treated as a flood: the line stays
+ * masked (IRQF_ONESHOT) and the thread continues, pausing after each full
+ * budget as before. ASCWrap v8 keeps its storm guard in the thread.
+ */
+static irqreturn_t apple_mbox_g17_recv_hardirq(int irq, void *data)
+{
+	struct apple_mbox *mbox = data;
+	unsigned long flags;
+	int consumed = 0;
+
+	if (mbox->hw->is_ascwrap_v8)
+		return IRQ_WAKE_THREAD;
+
+	spin_lock_irqsave(&mbox->rx_lock, flags);
+	if (likely(!READ_ONCE(mbox->removing)))
+		consumed = apple_mbox_poll_locked(mbox);
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+
+	return consumed == APPLE_G17_MBOX_RX_BUDGET ? IRQ_WAKE_THREAD : IRQ_HANDLED;
+}
+
 static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
 {
 	struct apple_mbox *mbox = data;
@@ -1631,7 +1661,8 @@ static int apple_mbox_probe(struct platform_device *pdev)
 			return -ENOMEM;
 
 		if (apple_mbox_is_g17(mbox))
-			ret = devm_request_threaded_irq(dev, mbox->irq_recv_not_empty, NULL,
+			ret = devm_request_threaded_irq(dev, mbox->irq_recv_not_empty,
+							apple_mbox_g17_recv_hardirq,
 							apple_mbox_recv_irq,
 							IRQF_ONESHOT | IRQF_NO_AUTOEN |
 							IRQF_NO_SUSPEND,
