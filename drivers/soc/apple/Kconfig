@@ -98,6 +98,7 @@ config APPLE_SOC_SLEEP
 	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
 	depends on HOTPLUG_CPU && SUSPEND
 	select APPLE_TUNABLE
+	select MFD_SYSCON
 	help
 	  Powers the secondary CPUs off and suspends the system to RAM on an
 	  Apple SoC whose kernel runs directly at EL2, with no monitor to ask.

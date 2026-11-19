@@ -173,7 +173,8 @@ int apple_sleep_engine_reset(struct device *dev);
 
 /*
  * Resets the stopped CPU of an always-on coprocessor (the MTP) with its power state kept.
- * -ENODEV when there's no such CPU or no sleep driver. The caller starts it after.
+ * -ENODEV when the device tree describes no such CPU or there's no sleep driver. The caller
+ * starts it after.
  */
 int apple_sleep_aon_cpu_reset(struct device *dev);
 #else

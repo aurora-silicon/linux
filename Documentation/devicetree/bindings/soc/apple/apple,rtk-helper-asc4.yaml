@@ -118,6 +118,35 @@ properties:
       - $ref: /schemas/types.yaml#/definitions/uint32
         enum: [0, 1]
 
+  apple,aon-pmgr:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The always-on power manager (a syscon) that holds the power state words
+      of the coprocessor's CPU, of the SRAM its firmware runs from, and of the
+      rest of its power chain.
+
+  apple,aon-power-words:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 8
+    description:
+      Offsets in apple,aon-pmgr of the power state words of the coprocessor's
+      power chain, parents first.
+
+  apple,aon-cpu-word:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Offset in apple,aon-pmgr of the coprocessor CPU's power state word. Its
+      presence says the CPU can be reset in place with its power state kept,
+      so the host may stop the firmware with an RTKit sleep and start it again
+      from its reset vector.
+
+  apple,aon-sram-word:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Offset in apple,aon-pmgr of the power state word of the SRAM holding the
+      coprocessor's firmware. It has to stay on across a CPU reset.
+
   '#helper-cells':
     const: 0
     description:
@@ -130,6 +159,11 @@ required:
   - reg-names
   - mboxes
   - iommus
+
+dependencies:
+  apple,aon-power-words: [ 'apple,aon-pmgr' ]
+  apple,aon-cpu-word: [ 'apple,aon-pmgr', 'apple,aon-sram-word' ]
+  apple,aon-sram-word: [ 'apple,aon-pmgr', 'apple,aon-cpu-word' ]
 
 allOf:
   - if:
@@ -159,5 +193,9 @@ examples:
             reg-names = "asc", "sram";
             mboxes = <&mtp_mbox>;
             iommus = <&mtp_dart 0>;
+            apple,aon-pmgr = <&pmgr_mini>;
+            apple,aon-power-words = <0xc000 0xc018 0xc030 0xc028 0xc048 0xc050>;
+            apple,aon-cpu-word = <0xc028>;
+            apple,aon-sram-word = <0xc048>;
         };
     };

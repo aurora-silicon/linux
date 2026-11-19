@@ -45,7 +45,10 @@ struct apple_rtkit_helper {
 	bool ap_idle;
 	/* It was told, gave no answer, and wasn't told otherwise. */
 	bool idle_unanswered;
-	/* T8140 MTP: started after a CPU reset and stopped with an RTKit sleep, to restart. */
+	/*
+	 * Its CPU can be reset in place (apple,aon-cpu-word, as on the T8140 MTP): started after
+	 * a CPU reset and stopped with an RTKit sleep, to restart.
+	 */
 	bool restartable;
 	/* The firmware is stopping for a sleep, so RTKit may free the buffers given to it. */
 	bool free_buffers;
@@ -254,9 +257,9 @@ static int apple_rtkit_helper_inherit_buffers(
 }
 
 /*
- * A T8140 MTP firmware that ran and was stopped for a sleep, as U-Boot leaves it, only comes
- * back from its reset vector, and the run bit alone doesn't take it there. So its CPU is reset
- * first. An image iBoot loaded and nobody started boots cold either way.
+ * A restartable firmware (the T8140 MTP) that ran and was stopped for a sleep, as U-Boot leaves
+ * it, only comes back from its reset vector, and the run bit alone doesn't take it there. So its
+ * CPU is reset first. An image iBoot loaded and nobody started boots cold either way.
  */
 static int apple_rtkit_helper_start(struct apple_rtkit_helper *helper)
 {
@@ -284,8 +287,8 @@ static int apple_rtkit_helper_start(struct apple_rtkit_helper *helper)
 }
 
 /*
- * A T8140 MTP gets an RTKit sleep, so apple_rtkit_helper_start() can bring it back, and is left
- * running with its buffers if it doesn't answer. Others are quiesced.
+ * A restartable helper gets an RTKit sleep, so apple_rtkit_helper_start() can bring it back, and
+ * is left running with its buffers if it doesn't answer. Others are quiesced.
  */
 static void apple_rtkit_helper_stop(struct apple_rtkit_helper *helper)
 {
@@ -333,7 +336,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	helper->dev = dev;
-	helper->restartable = of_device_is_compatible(dev->of_node, "apple,t8140-mtp");
+	helper->restartable = of_property_present(dev->of_node, "apple,aon-cpu-word");
 	platform_set_drvdata(pdev, helper);
 
 	helper->asc_base = devm_platform_ioremap_resource_byname(pdev, "asc");

@@ -41,6 +41,7 @@
 #include <linux/iopoll.h>
 #include <linux/irqchip/irq-apple-aic.h>
 #include <linux/ktime.h>
+#include <linux/mfd/syscon.h>
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -50,6 +51,7 @@
 #include <linux/platform_device.h>
 #include <linux/panic.h>
 #include <linux/pm_domain.h>
+#include <linux/regmap.h>
 #include <linux/smp.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/sleep.h>
@@ -1411,68 +1413,52 @@ int apple_sleep_engine_reset(struct device *dev)
 EXPORT_SYMBOL_GPL(apple_sleep_engine_reset);
 
 /*
- * Coprocessor CPUs on the always-on die that the device tree doesn't describe, by their ASC:
- * the CPU's word in the ADT's PMGR devices table and the word of the SRAM holding its firmware.
- * MTP_SRAM has MTP_CPU as a parent.
- */
-static const struct {
-	phys_addr_t asc;
-	u32 cpu;
-	u32 sram;
-} t8140_aon_cpus[] = {
-	{ 0x314600000, 0xc028, 0xc048 },	/* MTP_CPU, MTP_SRAM */
-};
-
-/*
  * Resets a stopped always-on coprocessor CPU in place, as the PMGR's device reset does, so the
  * run bit starts it from its reset vector. The power state stays, so the SRAM keeps the firmware.
+ * The device tree names the always-on PMGR (apple,aon-pmgr) and, in it, the CPU's word
+ * (apple,aon-cpu-word) and that of the SRAM holding its firmware (apple,aon-sram-word).
  */
 int apple_sleep_aon_cpu_reset(struct device *dev)
 {
-	struct apple_sleep *s = apple_sleep;
-	void __iomem *cpu, *sram;
-	struct resource res;
-	u32 before, held, after;
-	unsigned int i;
-	int idx, ret;
+	struct device_node *np = dev->of_node;
+	struct regmap *aon;
+	u32 cpu, sram, sval, before, held, after;
+	int ret;
 
-	if (!s || !s->ps_aon)
+	if (!apple_sleep)
 		return -ENODEV;
-	idx = of_property_match_string(dev->of_node, "reg-names", "asc");
-	if (idx < 0 || of_address_to_resource(dev->of_node, idx, &res))
+	aon = syscon_regmap_lookup_by_phandle(np, "apple,aon-pmgr");
+	if (IS_ERR(aon) || of_property_read_u32(np, "apple,aon-cpu-word", &cpu) ||
+	    of_property_read_u32(np, "apple,aon-sram-word", &sram))
 		return -ENODEV;
-	for (i = 0; i < ARRAY_SIZE(t8140_aon_cpus); i++)
-		if (t8140_aon_cpus[i].asc == res.start)
-			break;
-	if (i == ARRAY_SIZE(t8140_aon_cpus))
-		return -ENODEV;
-	cpu = s->ps_aon + t8140_aon_cpus[i].cpu;
-	sram = s->ps_aon + t8140_aon_cpus[i].sram;
 
 	/* Check the targets: the PMGR's own idling can lower the actual states. */
-	before = readl(cpu);
-	if (FIELD_GET(PS_TARGET, before) != 0xf || FIELD_GET(PS_TARGET, readl(sram)) != 0xf) {
-		dev_err(dev, "CPU reset refused: CPU %#x, SRAM %#x\n", before, readl(sram));
+	ret = regmap_read(aon, cpu, &before) ?: regmap_read(aon, sram, &sval);
+	if (ret)
+		return ret;
+	if (FIELD_GET(PS_TARGET, before) != 0xf || FIELD_GET(PS_TARGET, sval) != 0xf) {
+		dev_err(dev, "CPU reset refused: CPU %#x, SRAM %#x\n", before, sval);
 		return -EIO;
 	}
 
-	writel((before & ~PS_FLAGS) | PS_DEV_DISABLE, cpu);
-	ret = readl_poll_timeout_atomic(cpu, held, !(held & PS_BUSY), 1, 100);
+	regmap_write(aon, cpu, (before & ~PS_FLAGS) | PS_DEV_DISABLE);
+	ret = regmap_read_poll_timeout_atomic(aon, cpu, held, !(held & PS_BUSY), 1, 100);
 	if (ret) {
-		writel(readl(cpu) & ~(PS_FLAGS | PS_DEV_DISABLE), cpu);
+		regmap_write_bits(aon, cpu, PS_FLAGS | PS_DEV_DISABLE, 0);
 		dev_err(dev, "CPU reset refused: CPU %#x stayed busy\n", held);
 		return ret;
 	}
-	writel((held & ~PS_FLAGS) | PS_RESET, cpu);
+	regmap_write(aon, cpu, (held & ~PS_FLAGS) | PS_RESET);
 	usleep_range(10, 20);
-	held = readl(cpu);
-	writel(held & ~(PS_FLAGS | PS_RESET), cpu);
-	writel(readl(cpu) & ~(PS_FLAGS | PS_DEV_DISABLE), cpu);
-	after = readl(cpu);
+	regmap_read(aon, cpu, &held);
+	regmap_write(aon, cpu, held & ~(PS_FLAGS | PS_RESET));
+	regmap_write_bits(aon, cpu, PS_FLAGS | PS_DEV_DISABLE, 0);
+	regmap_read(aon, cpu, &after);
+	regmap_read(aon, sram, &sval);
 
 	dev_info(dev, "CPU reset in place: %#x before, %#x held, %#x after, SRAM %#x\n", before,
-		 held, after, readl(sram));
-	if (FIELD_GET(PS_TARGET, after) != 0xf || FIELD_GET(PS_TARGET, readl(sram)) != 0xf ||
+		 held, after, sval);
+	if (FIELD_GET(PS_TARGET, after) != 0xf || FIELD_GET(PS_TARGET, sval) != 0xf ||
 	    (after & (PS_RESET | PS_DEV_DISABLE)))
 		return -EIO;
 	return 0;
