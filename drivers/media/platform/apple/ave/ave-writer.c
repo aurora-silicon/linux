@@ -788,9 +788,13 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	/*
 	 * Constant QP is mode 3 on 9003 and mode 2 on 6070. With 3 the 6070
 	 * firmware accepts Start but has no rate control for the session and
-	 * stops on the first Process.
+	 * stops on the first Process. 6070 CBR and VBR are both mode 1: the
+	 * 9003 CBR value, 2, would select constant QP there.
 	 */
-	rc_mode = cq && l->rc_mode_fixed_qp ? l->rc_mode_fixed_qp : p->rc_mode;
+	if (p->rate_control && !cq)
+		rc_mode = AVE_6070_RC_ON;
+	else
+		rc_mode = cq && l->rc_mode_fixed_qp ? l->rc_mode_fixed_qp : p->rc_mode;
 	ave_start_put32(cmd, l->rc_mode, rc_mode);
 	ave_start_put32(cmd, l->bitrate,
 			cq && fw->kind == AVE_LAYOUT_6070 ? 0 : p->bitrate);
@@ -1116,6 +1120,21 @@ int ave_build_start(struct ave_ctx *ctx, u8 *cmd, size_t len)
 #define AVE_PROC_FORCED_TYPE 2
 #define AVE_PROC_LOW_DELAY 3
 
+/*
+ * With rate_control the firmware keeps the frame rate from Start and spends
+ * bit rate / that rate on each frame. After S_PARM the rate it is given is
+ * scaled so the bits per frame match the new frame rate.
+ */
+static u32 ave_live_rate(const struct ave_ctx *ctx, u32 rate)
+{
+	const struct ave_params *p = &ctx->sess->p;
+	u32 now = READ_ONCE(ctx->fps_now);
+
+	if (!p->rate_control || !now || now == p->fps_int)
+		return rate;
+	return min_t(u64, div_u64((u64)rate * p->fps_int, now), U32_MAX);
+}
+
 int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 		      unsigned int slot, dma_addr_t input, u32 bitrate,
 		      bool force_key, bool last)
@@ -1257,12 +1276,27 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 	/* The bit rate may change while streaming; it takes effect here. */
 	if (l->bitrate)
 		ave_put32(cmd, l->bitrate,
-			  p->rc_mode == 3 && fw->kind == AVE_LAYOUT_6070 ? 0 : bitrate);
-	if (l->limits)
-		ave_put32(cmd, l->limits, p->limit_bytes ? 1 : 0);
-	if (l->limit_bytes && p->limit_bytes) {
-		ave_put64(cmd, l->limit_bytes, ave_f64(p->limit_bytes, 1));
-		ave_put64(cmd, l->limit_secs, ave_f64(1, 1));
+			  p->rc_mode == 3 && fw->kind == AVE_LAYOUT_6070 ? 0 :
+			  ave_live_rate(ctx, bitrate));
+	if (p->rate_control && p->rc_mode == AVE_RC_VBR) {
+		/* VBR's data-rate limit follows the bit rate too. */
+		u32 peak = READ_ONCE(ctx->bitrate_peak);
+		u64 limit = (peak ? max(peak, bitrate) : 2ULL * bitrate) / 8;
+
+		if (l->limits)
+			ave_put32(cmd, l->limits, 1);
+		if (l->limit_bytes) {
+			ave_put64(cmd, l->limit_bytes,
+				  ave_f64(ave_live_rate(ctx, min_t(u64, limit, U32_MAX)), 1));
+			ave_put64(cmd, l->limit_secs, ave_f64(1, 1));
+		}
+	} else {
+		if (l->limits)
+			ave_put32(cmd, l->limits, p->limit_bytes ? 1 : 0);
+		if (l->limit_bytes && p->limit_bytes) {
+			ave_put64(cmd, l->limit_bytes, ave_f64(p->limit_bytes, 1));
+			ave_put64(cmd, l->limit_secs, ave_f64(1, 1));
+		}
 	}
 	if (l->frame_type)
 		ave_put32(cmd, l->frame_type, pic.type);

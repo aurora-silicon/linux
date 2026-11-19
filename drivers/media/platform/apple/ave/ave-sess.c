@@ -141,7 +141,20 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->fps_num = ctx->timeperframe.denominator;
 	p->fps_den = ctx->timeperframe.numerator;
 	p->fps_int = max(DIV_ROUND_CLOSEST(p->fps_num, p->fps_den), 1U);
+	p->client_fps_num = p->fps_num;
+	p->client_fps_den = p->fps_den;
 	p->h264_inter = layout->h264_inter;
+	p->rate_control = layout->rate_control;
+	/*
+	 * The rate controller divides the bit rate by the frame-rate
+	 * numerator, so 1000/30000 s would divide it by 30000. Give it the
+	 * rounded rate. The client's timeperframe is not changed, and
+	 * client_fps_num/den keep it exactly, for the VUI timing.
+	 */
+	if (p->rate_control) {
+		p->fps_num = p->fps_int;
+		p->fps_den = 1;
+	}
 
 	if (p->codec == AVE_CODEC_H264) {
 		switch (ctx->h264_profile) {
@@ -248,7 +261,8 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 		p->limit_bytes = (ctx->bitrate_peak ? max(ctx->bitrate_peak, ctx->bitrate) :
 				  2ULL * ctx->bitrate) / 8;
 	}
-	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->rc_mode != AVE_RC_CQ)
+	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && !p->rate_control &&
+	    p->rc_mode != AVE_RC_CQ)
 		return -EOPNOTSUPP;
 
 	level = ave_pick_level(p, p->codec == AVE_CODEC_H264 ? ctx->h264_level :
@@ -1187,13 +1201,22 @@ static size_t ave_sess_cbr_fill(struct ave_ctx *ctx, u8 *out, size_t len, size_t
 	struct ave_session *sess = ctx->sess;
 	const struct ave_params *p = &sess->p;
 	bool hevc = p->codec == AVE_CODEC_HEVC;
-	s64 budget = div_u64((u64)p->bitrate * p->fps_den, 8ULL * p->fps_num);
-	s64 vbv = p->bitrate / 16;	/* 0.5 s of bit rate, in bytes */
-	s64 excess, pad;
+	u32 bitrate = p->bitrate, fps_num = p->fps_num;
+	s64 budget, vbv, excess, pad;
 	u8 *f;
 
 	if (p->rc_mode != AVE_RC_CBR)
 		return len;
+	/* The firmware follows a bit rate or frame rate set while streaming. */
+	if (p->rate_control) {
+		bitrate = READ_ONCE(ctx->bitrate) ?: bitrate;
+		fps_num = READ_ONCE(ctx->fps_now) ?: fps_num;
+	}
+	budget = div_u64((u64)bitrate * p->fps_den, 8ULL * fps_num);
+	vbv = bitrate / 16;	/* 0.5 s of bit rate, in bytes */
+	/* After a drop, the old rate's buffer must not come out as filler. */
+	if (p->rate_control && sess->cbr_surplus > vbv)
+		sess->cbr_surplus = vbv;
 	if (fw_filler && !sess->fw_fills) {
 		sess->fw_fills = true;
 		dev_dbg(ctx->ave->dev, "CBR: the firmware writes filler data\n");

@@ -1602,6 +1602,90 @@ static void ave_6070_h264_inter(struct kunit *test)
 }
 
 /*
+ * rate_control: CBR and VBR are firmware mode 1, the frame rate is an
+ * integer, and a frame rate set while streaming scales the Process bit rate.
+ * The neighbour bank keeps its DMA addresses.
+ */
+static void ave_6070_rate_control(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+	u8 *start = kunit_kzalloc(test, 0x32dc8, GFP_KERNEL);
+	u8 *process = kunit_kzalloc(test, 0x6838, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, sess);
+	KUNIT_ASSERT_NOT_NULL(test, start);
+	KUNIT_ASSERT_NOT_NULL(test, process);
+	KUNIT_EXPECT_TRUE(test, ave_layout_6070_11_1.rate_control);
+
+	for (unsigned int codec = AVE_CODEC_H264; codec <= AVE_CODEC_HEVC;
+	     codec++) {
+		const struct ave_start_layout *sl;
+		const struct ave_proc_layout *pl;
+
+		ave_test_6070_session(test, ave, ctx, sess, codec, 1280, 720);
+		sl = &ave->layout->start[codec - 1];
+		pl = &ave->layout->process[codec - 1];
+		sess->p.rate_control = true;
+		sess->p.fps_num = 30;
+		sess->p.fps_den = 1;
+		sess->p.fps_int = 30;
+
+		/* Constant quality stays constant QP. */
+		ctx->fps_now = 0;
+		ave_test_6070_build(test, ctx, start, process, 1200000);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->rc_mode),
+				ave->layout->start[codec - 1].rc_mode_fixed_qp);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->bitrate), 0U);
+
+		sess->p.rc_mode = AVE_RC_CBR;
+		ave_test_6070_build(test, ctx, start, process, 1200000);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->rc_mode),
+				(u32)AVE_6070_RC_ON);
+		KUNIT_EXPECT_EQ(test,
+				get_unaligned_le64(start + sl->neighbour_fw.address),
+				sess->neighbour_fw[0].dma);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->bitrate),
+				1200000U);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->fps_int),
+				30U);
+
+		/* 60 fps after Start: half the bits per frame, same clock. */
+		ctx->fps_now = 60;
+		ave_test_6070_build(test, ctx, start, process, 1200000);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->bitrate),
+				600000U);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->fps_int),
+				30U);
+
+		/* VBR's limit follows the live rate: twice it, per second. */
+		sess->p.rc_mode = AVE_RC_VBR;
+		ctx->fps_now = 30;
+		ctx->bitrate_peak = 0;
+		ave_test_6070_build(test, ctx, start, process, 2000000);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->rc_mode),
+				(u32)AVE_6070_RC_ON);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->limits), 1U);
+		/* 500000.0 as an IEEE 754 double */
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(process + pl->limit_bytes),
+				0x411e848000000000ULL);
+
+		/* Without rate_control nothing is scaled. */
+		sess->p.rate_control = false;
+		sess->p.rc_mode = AVE_RC_CBR;
+		ctx->fps_now = 60;
+		ave_test_6070_build(test, ctx, start, process, 1200000);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->rc_mode),
+				(u32)AVE_RC_CBR);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->bitrate),
+				1200000U);
+	}
+}
+
+/*
  * The 6070 commands upstream qualified on T6000 and T8112, byte for byte.
  * These CRCs pin the Start and first two Process commands the builder
  * produces with the layout's encode settings (struct ave_fw_layout) off,
@@ -1703,6 +1787,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_start_process_fields),
 	KUNIT_CASE(ave_6070_qualified_bytes),
 	KUNIT_CASE(ave_6070_h264_inter),
+	KUNIT_CASE(ave_6070_rate_control),
 	KUNIT_CASE(ave_6070_reordered_pictures),
 	KUNIT_CASE(ave_6070_hevc_contract),
 	KUNIT_CASE(ave_6070_entropy_interleave),

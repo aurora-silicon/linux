@@ -27,10 +27,10 @@ retained codec-state partitions and per-slot HEVC slice-header tables. The
 session allocator provides distinct backing for every live bank and rejects
 non-16-KiB-aligned IOVAs.
 
-Streaming is enabled for up to two quality-first NV12 constant-quality sessions
-per firmware boot, each of 8-bit H.264 (Baseline, Main or High) or HEVC Main,
-with up to one B picture per P picture, frame widths in whole macroblocks.
-Main 10, bit-rate modes, speed priority, standalone LRME and Reset remain
+Streaming is enabled for up to two quality-first NV12 sessions per firmware
+boot, each of 8-bit H.264 (Baseline, Main or High) or HEVC Main, with up to one
+B picture per P picture, frame widths in whole macroblocks, at constant
+quality, CBR or VBR. Main 10, speed priority, standalone LRME and Reset remain
 unavailable and are refused. No Priority command is sent. Complete is the normal drain barrier; Flush is
 reserved for cancellation before Stop and Close. KUnit checks the 1080p and 4K
 fields directly from the clean ledgers and embeds no Apple command image.
@@ -58,6 +58,21 @@ the same firmware version and get the same settings, untested:
   clip came out at 8.4 Mbit/s. With 64, 256 and 64, 8x8 partitions became rare,
   the same clip came out at 0.30 Mbit/s, and quality 50 took 1.8 times the bits
   of libx264 at the same PSNR.
+- CBR and VBR. Rate-control mode 2, the 9003 CBR value, held the Start QP; mode
+  1 moved slice QP with the bit rate. Both CBR and VBR submit mode 1. Without B
+  pictures the coded rate stayed under the target, at 46% to 96% of it. For CBR
+  the host pads to the target with filler data; with the filler, CBR at 1.0 and
+  2.5 Mbit/s (720p) and 4.0 Mbit/s (1080p) came within 15% of the target over
+  the file and over its last 150 frames.
+- Integer frame rate. With a frame interval of 1000/30000 s every frame sat at
+  the QP ceiling (about 0.31 Mbit/s coded for a 1.0 Mbit/s target), so the
+  firmware is given the rounded rate over 1. The session keeps the client's
+  timeperframe exactly as well, for the VUI timing.
+- Frame rate while streaming. A new rate written into the Process frame-rate
+  words stepped the HEVC picture clock backwards. Instead the next Process bit
+  rate, and VBR's limit, are scaled by the Start rate over the new one; an HEVC
+  stream at 30, then 15, then 30 frames per second kept every picture, its
+  frames at 15 about 1.7 times the size.
 
 Lifecycle-only validation
 -------------------------

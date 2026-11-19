@@ -555,6 +555,7 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 	.max_sessions = 2,
 	.codec_state_bytes = { 0x984, 0x5884 },
 	.h264_inter = true,
+	.rate_control = true,
 	.start = {
 		[0] = {
 			.header = AVE_SURFACE(0x40, 0x10),

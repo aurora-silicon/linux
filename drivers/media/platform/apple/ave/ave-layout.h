@@ -390,6 +390,8 @@ struct ave_fw_layout {
 	 */
 	/* H.264 P pictures are references; inter decisions are weighted. */
 	bool h264_inter;
+	/* CBR and VBR run the firmware rate controller. */
+	bool rate_control;
 	bool counted;
 };
 

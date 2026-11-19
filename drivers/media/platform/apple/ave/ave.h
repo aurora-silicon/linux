@@ -40,6 +40,11 @@ struct ave_mctf_layout;
 #define AVE_RC_CBR 2
 #define AVE_RC_CQ 3
 #define AVE_RC_VBR 4
+/*
+ * 6070 rate-control modes: 1 runs the rate controller, for CBR and VBR
+ * alike; 2 (the 9003 CBR value) holds the Start QP.
+ */
+#define AVE_6070_RC_ON 1
 
 #define AVE_MAX_SLOTS 7
 /* Sessions one firmware boot serves at once (macOS was seen running two). */
@@ -393,10 +398,12 @@ struct ave_params {
 	u32 stride; /* NV12 or P010 line stride in bytes, both planes */
 	u32 sample_bytes; /* 1 for NV12, 2 for P010 */
 	u32 mbs; /* 16x16 macroblocks */
-	u32 fps_num, fps_den; /* frames per second = num / den */
+	u32 fps_num, fps_den; /* frames per second = num / den, as the firmware gets it */
 	u32 fps_int; /* the same, rounded */
+	u32 client_fps_num, client_fps_den; /* the client's timeperframe, exactly */
 	/* The layout's encode settings, see struct ave_fw_layout. */
 	bool h264_inter;
+	bool rate_control;
 	u32 slots;
 	u32 refs; /* max_num_ref_frames + 1 */
 	bool bframes;
@@ -532,6 +539,11 @@ struct ave_ctx {
 
 	u32 bitrate_mode;
 	u32 quality; /* V4L2 constant quality, 0..100 */
+	/*
+	 * Frame rate from the last S_PARM, rounded, with rate_control. It is
+	 * kept here because the worker frees the session without vdev_lock.
+	 */
+	u32 fps_now;
 	u32 bitrate;
 	u32 bitrate_peak;
 	u32 gop_size;

@@ -11,8 +11,8 @@ config VIDEO_APPLE_AVE
 	  V4L2 memory-to-memory driver for the AVE H.264/HEVC encoder in
 	  Apple T8140 (A18 Pro) SoCs, as in the MacBook Neo.
 	  T6000 (M1 Pro) and T8112 (M2) run firmware 6070.11.1 and offer
-	  constant-quality H.264 and HEVC. T6021 (M2 Max) runs a larger
-	  build of that firmware on two encoders.
+	  H.264 and HEVC at constant quality, CBR or VBR. T6021 (M2 Max)
+	  runs a larger build of that firmware on two encoders.
 	  T6041 (M4 Pro) has probe-only support. T6050 (M5 Pro/Max) encodes
 	  H.264.
 
