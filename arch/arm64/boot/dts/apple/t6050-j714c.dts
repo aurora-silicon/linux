@@ -147,8 +147,8 @@
  * 0 left woofer 1, 1 right woofer 1, 2 left woofer 2, 3 right woofer 2, 4 left tweeter,
  * 5 right tweeter.
  *
- * There is no sound card yet: the AOP audio driver is not on this branch, and the jack codec
- * (i2c2) is not described. The amps stay in shutdown until a stream asks for them.
+ * There is no sound card yet: the AOP audio service is not enabled on this board. The jack
+ * codec is on i2c2 (t6050-jack.dtsi). The amps stay in shutdown until a stream asks for them.
  */
 / {
 	speaker_sdz: regulator-sn012776-sdz {
@@ -199,17 +199,16 @@
 	};
 };
 
-&i2c2 {
-	status = "disabled";
-};
+/* The headphone jack's CS42L84 on i2c2 (t6050-jack.dtsi) */
+#include "t6050-jack.dtsi"
 
 /*
  * Only the pins a node here names are exposed, as on the J716c: pin 112's register
- * takes an SError when read. 80 is PCIe port 0's PERST#, 106 the amps' fault interrupt and
- * 107 their shutdown line.
+ * takes an SError when read. 80 is PCIe port 0's PERST#, 106 the amps' fault interrupt,
+ * 107 their shutdown line, and 134 and 139 the jack codec's interrupt and reset.
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <81 25>, <108 113>;
+	gpio-reserved-ranges = <0 80>, <81 25>, <108 26>, <135 4>, <140 81>;
 };
 
 /* This board's SMC fan and power keys are not yet checked */

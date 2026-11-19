@@ -690,24 +690,6 @@
 	};
 };
 
-/*
- * The CS42L84 headphone codec (ADT /arm-io/i2c2/audio-codec-output, reg 0x4b): reset on AP
- * pin 139 (function-reset GPIO(0x8b, 0x1)), driven high to run; interrupt AP pin 134, level
- * low. i2c2 is disabled by t6050-k114-k116.dtsi; re-enabled here.
- */
-&i2c2 {
-	status = "okay";
-
-	jack_codec: codec@4b {
-		compatible = "cirrus,cs42l84";
-		reg = <0x4b>;
-		reset-gpios = <&pinctrl_ap 139 GPIO_ACTIVE_HIGH>;
-		interrupts-extended = <&pinctrl_ap 134 IRQ_TYPE_LEVEL_LOW>;
-		#sound-dai-cells = <0>;
-		sound-name-prefix = "Jack";
-	};
-};
-
 /* ADT admac-base-ns: 0x293800000, IRQ 637, 13 TX + 13 RX channels, dart-aop stream 8 */
 &admac_base_ns {
 	status = "okay";

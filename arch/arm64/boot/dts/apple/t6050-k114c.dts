@@ -225,24 +225,6 @@
 	};
 };
 
-/*
- * The CS42L84 headphone codec (ADT /arm-io/i2c2/audio-codec-output): its reset line
- * is AP pin 139, driven high to run the codec, and its interrupt AP pin 134, level
- * low.
- */
-&i2c2 {
-	status = "okay";
-
-	jack_codec: codec@4b {
-		compatible = "cirrus,cs42l84";
-		reg = <0x4b>;
-		reset-gpios = <&pinctrl_ap 139 GPIO_ACTIVE_HIGH>;
-		interrupts-extended = <&pinctrl_ap 134 IRQ_TYPE_LEVEL_LOW>;
-		#sound-dai-cells = <0>;
-		sound-name-prefix = "Jack";
-	};
-};
-
 / {
 	sound {
 		compatible = "apple,j714-macaudio", "apple,macaudio";
