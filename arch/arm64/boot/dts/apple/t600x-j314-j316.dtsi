@@ -855,7 +855,21 @@
 };
 
 &aop {
-       status = "okay";
+	status = "okay";
+
+	/*
+	 * Every 14" and 16" M1 Pro/Max MacBook Pro has the same AOP-hosted
+	 * inertial sensor. The child only binds once the AOP firmware announces
+	 * the service, and the sensor starts only with the calibration that the
+	 * bootloader copies in from the Apple device tree.
+	 */
+	accel {
+		compatible = "apple,t6000-aop-accel", "apple,aop-accel";
+	};
+
+	gyro {
+		compatible = "apple,t6000-aop-gyro", "apple,aop-gyro";
+	};
 };
 
 / {
