@@ -958,7 +958,7 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 	 */
 	if (crc == AVE_FW_TEXT_CRC_9003_78_0 || crc == AVE_FW_TEXT_CRC_T6040_25G83 ||
 	    crc == AVE_FW_TEXT_CRC_T6041_25G83 ||
-	    crc == AVE_FW_TEXT_CRC_T8132_25G83)
+	    crc == AVE_FW_TEXT_CRC_T8132_25G83 || crc == AVE_FW_TEXT_CRC_T8132_J773G_25G83)
 		return &ave_layout_9003_78_0;
 	if (crc == 0x460c7a7c || crc == 0x25bfd039)
 		return &ave_layout_6070_11_1;

@@ -180,6 +180,8 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_T8142_26A428 0x8a3784bd
 /* The M4 Air (T8132) build of AppleAVE2FW 9003.78.0. */
 #define AVE_FW_TEXT_CRC_T8132_25G83 0x9308d2ab
+/* The M4 Mac mini (T8132, J773g) preload of the same 9003.78.0, its own TEXT. */
+#define AVE_FW_TEXT_CRC_T8132_J773G_25G83 0x234aa48e
 
 struct ave_ctx;
 
@@ -219,6 +221,8 @@ struct ave_variant {
 	u32 device_type;
 	u32 lfs_ref_scale;
 	u32 text_crc;
+	/* Another TEXT CRC of the same build the variant admits (another Mac's preload), or 0 */
+	u32 text_crc_alt;
 	u32 boot_arg_value;
 	u32 timebase_multiplier;
 	u64 vcbar_mask;

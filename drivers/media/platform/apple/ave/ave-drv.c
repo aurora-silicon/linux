@@ -129,6 +129,8 @@ static const struct ave_variant ave_t8132 = {
 	.device_type = 24,
 	.lfs_ref_scale = 2,
 	.text_crc = AVE_FW_TEXT_CRC_T8132_25G83,
+	/* The Mac mini (J773g): the same 9003.78.0 and segment sizes, its own TEXT CRC. */
+	.text_crc_alt = AVE_FW_TEXT_CRC_T8132_J773G_25G83,
 	.boot_qualified = true,
 };
 

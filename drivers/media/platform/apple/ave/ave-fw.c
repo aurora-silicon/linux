@@ -44,6 +44,7 @@ static const u32 ave_known_text_crc[] = {
 	AVE_FW_TEXT_CRC_T6050_26C5035, /* AppleAVE2FW, macOS 27.3 26C5035r / T6050 */
 	AVE_FW_TEXT_CRC_T8142_26A428, /* AppleAVE2FW 9013.45.1, macOS 27.0 26A428 / T8142 */
 	AVE_FW_TEXT_CRC_T8132_25G83, /* AppleAVE2FW 9003.78.0 / T8132 */
+	AVE_FW_TEXT_CRC_T8132_J773G_25G83, /* AppleAVE2FW 9003.78.0 / T8132 Mac mini */
 	0x460c7a7c, /* AppleAVE2FW 6070.11.1 / T6000 */
 	0x25bfd039, /* AppleAVE2FW 6070.11.1 / T8112 */
 };
@@ -302,7 +303,8 @@ int ave_fw_probe(struct ave_dev *ave)
 		return dev_err_probe(dev, ret,
 				     "firmware text link cell is not the DATA address\n");
 	known |= ave_fw_known_crc(text_crc);
-	if (!known || (want_crc && text_crc != want_crc))
+	if (!known || (want_crc && text_crc != want_crc &&
+			(!ave->variant->text_crc_alt || text_crc != ave->variant->text_crc_alt)))
 		return dev_err_probe(dev, -ENODEV,
 				     "unsupported firmware (text CRC %08x)\n",
 				     text_crc);

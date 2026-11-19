@@ -139,9 +139,12 @@
 
 /*
  * The DPTX PHY's domain: the J713 PMGR policy keeps it from Linux, and the
- * PHY (and the DCP that waits on it) would never probe.
+ * PHY (and the DCP that waits on it) would never probe. It stays on through
+ * suspend-to-idle: the PHY keeps no state across a power-off, and the link to
+ * the HDMI converter faults when the display comes back after one.
  */
 &ps_dptx_phy {
+	apple,always-on;
 	status = "okay";
 };
 
