@@ -497,13 +497,6 @@ impl OwnedQueue {
         })
     }
 
-    /// Allocates an unbound workqueue named `name`, with high-priority workers if `highpri`.
-    ///
-    /// Its work items run concurrently, each in the affinity pod of the CPU it is queued for.
-    pub fn new_unbound(name: &CStr, highpri: bool) -> Result<Self> {
-        Self::flags(name, true, highpri, 0)
-    }
-
     /// Allocates an unbound workqueue named `name` that may be used on the memory reclaim path
     /// (`WQ_MEM_RECLAIM`), with high-priority workers if `highpri`.
     pub fn new_unbound_reclaim(name: &CStr, highpri: bool) -> Result<Self> {
