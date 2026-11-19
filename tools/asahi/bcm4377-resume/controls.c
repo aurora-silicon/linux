@@ -30,7 +30,12 @@ int main(int argc,char **argv) {
  case 10: h.flags|=HCI_USER_CHANNEL;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
  case 11: h.flags|=HCI_RFKILLED;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
  case 12: h.flags|=HCI_POWERING_DOWN;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
- case 13: board_j493=false;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
+	case 13:
+		hw.recover_resume_timeout = 0;
+		resume_cycle(&dev);
+		recover(&b);
+		assert(!reset_count);
+		break;
 	case 14:
 		hw = bcm4377_hw_variants[BCM4377];
 		resume_cycle(&dev);

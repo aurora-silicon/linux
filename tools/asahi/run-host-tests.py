@@ -129,11 +129,11 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('round-up', 'cpu-unaligned', 'seg-cpu-unaligned',
                                    'seg-any-size', 'ref-index-upper', 'frame-width-unchecked'), out()),
     'avd-codec-tail-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
-    # The old revision is the one before the J493 hardware-table ID match.
-    'bcm4377-id-tests.py': [(out() + ['--old-ref', '87ddae1397f6f70817cb57df76477a86bdf96424'], PASS)],
+    # The old revision is the board-gated one (J493 only), before the chip flag.
+    'bcm4377-id-tests.py': [(out() + ['--old-ref', '8935b9f50620e'], PASS)],
     # These mutations are caught inside the test, which then exits 0.
     'bcm4377-resume-tests.py': [(out(), PASS)]
-        + mutations('--mutation', ('epoch', 'close', 'producer-fence', 'active-fence', 'board'), out(), PASS),
+        + mutations('--mutation', ('epoch', 'close', 'producer-fence', 'active-fence', 'chip'), out(), PASS),
     'bcm4377-sleep-config-tests.py': [([], PASS)],
     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),

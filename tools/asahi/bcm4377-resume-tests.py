@@ -3,7 +3,7 @@
 """Compile retained Bluetooth resume callbacks against controlled core/PCI services."""
 import argparse, hashlib, json, os, re, resource, subprocess
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--out',required=True);p.add_argument('--old-ref');p.add_argument('--mutation',choices=['epoch','close','producer-fence','active-fence','board']);a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--out',required=True);p.add_argument('--old-ref');p.add_argument('--mutation',choices=['epoch','close','producer-fence','active-fence','chip']);a=p.parse_args()
 r=Path(__file__).resolve().parents[2];o=Path(a.out);o.mkdir(parents=True,exist_ok=False);(o/'tmp').mkdir()
 def extract(s,n):
  m=re.search(r'^(?:static )?(?:int|void|bool) '+n+r'\([^;]*?\)\n\{',s,re.M|re.S)
@@ -23,7 +23,7 @@ mutations={
  'close':('bcm4377_hci_close','bcm4377_resume_recovery_invalidate(bcm4377);','',18),
  'producer-fence':('bcm4377_resume_recovery_stop','cancel_work_sync(&bcm4377->resume_work);','',21),
  'active-fence':('bcm4377_resume_recovery_stop','flush_work(&bcm4377->hdev->cmd_sync_work);','',40),
- 'board':('bcm4377_resume_recovery_supported','of_machine_is_compatible("apple,j493")','true',13),
+ 'chip':('bcm4377_resume_recovery_supported','bcm4377->hw->recover_resume_timeout','true',15),
 }
 if a.mutation:
  n,old,new,case=mutations[a.mutation];assert old in bodies[n];bodies[n]=bodies[n].replace(old,new,1)
