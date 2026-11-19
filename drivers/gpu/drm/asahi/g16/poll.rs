@@ -419,6 +419,25 @@ impl Firmware {
             return Ok(Retirement::Pending);
         };
         rmb();
+        if f.stamp_seen_ticks == 0 {
+            let seen = if f.renders != 0 {
+                stamp_reached(
+                    self.graph.render.fw_stamp[1].r32(0)?,
+                    f.fs_target,
+                    self.engine.fs_target,
+                )
+            } else {
+                stamp_reached(self.graph.compute.fw_stamp.r32(0)?, f.target, self.engine.target)
+            };
+            if seen {
+                if let Some(first) = self.engine.flights.first_mut() {
+                    first.stamp_seen_ticks = super::engine::counter_ticks();
+                }
+            }
+        }
+        let Some(f) = self.engine.oldest() else {
+            return Ok(Retirement::Pending);
+        };
         let mut full = true;
         // Later compute flights queued behind this one: the queue, pipe and stamp cells
         // already moved on, so their receipt is "passed", in order; the newest flight keeps
@@ -872,6 +891,12 @@ impl Firmware {
                     l[3] += kick - hi;
                 }
                 l[4] += now_t - hi;
+                if f.stamp_seen_ticks >= hi && now_t >= f.stamp_seen_ticks {
+                    let seen = &mut s.seen[li];
+                    seen[0] += 1;
+                    seen[1] += now_t - f.stamp_seen_ticks;
+                    seen[2] += f.stamp_seen_ticks - hi;
+                }
                 if f.renders != 0 {
                     if let Some(arena) = f.job.resources.render.as_ref() {
                         let p = &arena.passes[f.claims.pass[0] as usize];
@@ -1074,6 +1099,16 @@ impl Firmware {
                 ns(l[3]),
                 ns(l[4]),
                 ns(l[5])
+            )?;
+            let seen = &s.seen[e];
+            let m = seen[0].max(1);
+            writeln!(
+                f,
+                "seen_{}: n {} end_to_stamp_seen_ns {} stamp_seen_to_retire_ns {}",
+                name,
+                seen[0],
+                seen[2] * 1000 / 24 / m,
+                seen[1] * 1000 / 24 / m
             )?;
         }
         writeln!(

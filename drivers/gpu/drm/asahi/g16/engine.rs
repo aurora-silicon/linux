@@ -187,6 +187,8 @@ pub(crate) struct Flight {
     pub(crate) published_ns: u64,
     /// Publication time in counter ticks (latency statistics).
     pub(crate) pub_ticks: u64,
+    /// First poll that saw its final firmware stamp, counter ticks (latency statistics).
+    pub(crate) stamp_seen_ticks: u64,
     /// Published behind another flight.
     pub(crate) behind: bool,
     /// The PB epoch this render prefix uses (its own, or a reused one with `g16_pb_reuse`).
@@ -223,6 +225,7 @@ impl Flight {
             recovery_started_ns: 0,
             published_ns: 0,
             pub_ticks: 0,
+            stamp_seen_ticks: 0,
             behind: false,
             pb: None,
             pb_binding: 0,
@@ -316,6 +319,9 @@ pub(crate) struct Stats {
     /// publication -> first stage start, first start -> last end, last end -> last kick
     /// (when the kick followed it), last end -> retirement, render TA end -> FS start.
     pub(crate) lat: [[u64; 6]; 2],
+    /// Retired flights whose stamp a poll saw first: count, stamp seen -> retirement ticks,
+    /// last end -> stamp seen ticks (compute [0], render [1]).
+    pub(crate) seen: [[u64; 3]; 2],
 }
 
 /// Host-side phase timers of publication and polling, on with `debug_flags` bit 49
