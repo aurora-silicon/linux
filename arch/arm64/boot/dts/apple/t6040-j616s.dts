@@ -426,3 +426,7 @@
 		status = "disabled";
 	};
 };
+
+&t6040_sleep {
+	status = "okay";
+};
