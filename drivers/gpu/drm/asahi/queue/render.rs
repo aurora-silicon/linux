@@ -43,7 +43,7 @@ const TILECTL_DISABLE_CLUSTERING: u32 = 1u32 << 0;
 #[versions(AGX)]
 impl super::QueueInner::ver {
     /// Get the appropriate tiling parameters for a given userspace command buffer.
-    fn get_tiling_params(
+    pub(super) fn get_tiling_params(
         cmdbuf: &uapi::drm_asahi_cmd_render,
         num_clusters: u32,
     ) -> Result<buffer::TileInfo> {
@@ -186,6 +186,20 @@ impl super::QueueInner::ver {
         clippy::too_many_arguments,
         reason = "Submission inputs are retained separately by the existing queue interface."
     )]
+    /// TVB blocks a render command needs, with the clustering decision [`Self::submit_render`] makes.
+    pub(super) fn render_min_tvb_blocks(
+        gpu: &gpu::GpuManager::ver,
+        cmdbuf: &uapi::drm_asahi_cmd_render,
+    ) -> Result<usize> {
+        let nclusters = gpu.get_dyncfg().id.num_clusters;
+        let clustering = nclusters > 1
+            && !debug_enabled(debug::DebugFlags::DisableClustering)
+            && cmdbuf.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING == 0;
+        Ok(Self::get_tiling_params(cmdbuf, if clustering { nclusters } else { 1 })?.min_tvb_blocks)
+    }
+
+    /// Builds the commands of one render. `tvb_grown` is set on the first render of a submission
+    /// for which [`super::Queue::submit`] grew the TVB, so that it re-initialises the buffer slot.
     pub(super) fn submit_render(
         &self,
         gpu: &gpu::GpuManager::ver,
@@ -196,6 +210,7 @@ impl super::QueueInner::ver {
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
         id: u64,
         flush_stamps: bool,
+        tvb_grown: bool,
     ) -> Result {
         mod_dev_dbg!(self.dev, "[Submission {}] Render!\n", id);
 
@@ -267,33 +282,6 @@ impl super::QueueInner::ver {
 
         let buffer = &self.buffer;
         let notifier = self.notifier.clone();
-
-        let tvb_autogrown = buffer.auto_grow()?;
-        if tvb_autogrown {
-            let new_size = buffer.block_count() as usize;
-            cls_dev_dbg!(
-                TVBStats,
-                &self.dev,
-                "[Submission {}] TVB grew to {} bytes ({} blocks) due to overflows\n",
-                id,
-                new_size * buffer::BLOCK_SIZE,
-                new_size,
-            );
-        }
-
-        let tvb_grown = buffer.ensure_blocks(tile_info.min_tvb_blocks)?;
-        if tvb_grown {
-            cls_dev_dbg!(
-                TVBStats,
-                &self.dev,
-                "[Submission {}] TVB grew to {} bytes ({} blocks) due to dimensions ({}x{})\n",
-                id,
-                tile_info.min_tvb_blocks * buffer::BLOCK_SIZE,
-                tile_info.min_tvb_blocks,
-                cmdbuf.width_px,
-                cmdbuf.height_px
-            );
-        }
 
         let scene = Arc::new(buffer.new_scene(kalloc, &tile_info)?, GFP_KERNEL)?;
 
@@ -948,7 +936,7 @@ impl super::QueueInner::ver {
         let fence = job.fence.clone();
         let vtx_job = job.get_vtx()?;
 
-        if scene.rebind() || tvb_grown || tvb_autogrown {
+        if scene.rebind() || tvb_grown {
             mod_dev_dbg!(self.dev, "[Submission {}] Create Bind Buffer\n", id);
             let bind_buffer = kalloc.private.new_init(
                 {
