@@ -924,8 +924,9 @@ static void dwc3_apple_usb3_pipe_reset(struct dwc3_apple *appledwc)
 }
 
 /*
- * Without a USB3 PHY that runs as a device the PIPE stays on its dummy producer: offer the gadget
- * at high speed only. dwc3_apple_init() undoes this for the next session.
+ * Without a USB3 PHY that runs as a device (no USB3 PHY, or one that does not validate
+ * PHY_MODE_USB_DEVICE) offer the gadget at high speed only. dwc3_apple_init() undoes this for the
+ * next session.
  */
 static void dwc3_apple_gadget_high_speed(struct dwc3_apple *appledwc)
 {
@@ -963,12 +964,22 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 	 */
 	appledwc->dwc.dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
 	dwc3_enable_susphy(&appledwc->dwc, true);
+	/*
+	 * Two layers, one decision: the USB3 PHY says whether it can carry a SuperSpeed device
+	 * (.validate; T8132 and T6040 cannot) and routes its lanes for the role in phy_set_mode(),
+	 * on USB2 when it cannot. The core then has to run as a high-speed device, because its
+	 * device speed and the USB2 clock for its USB3 logic are controller settings that no PHY
+	 * can make. No USB3 PHY at all is the same case.
+	 */
+	if (!host && (!appledwc->usb3_phy ||
+		      phy_validate(appledwc->usb3_phy, PHY_MODE_USB_DEVICE, 0, NULL)))
+		dwc3_apple_gadget_high_speed(appledwc);
 	ret = phy_set_mode(appledwc->usb3_phy, host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
 	if (!host && ret == -EOPNOTSUPP) {
 		/*
-		 * The USB3 PHY has no SuperSpeed device mode (T6040, or a T8132 port whose
-		 * lanes run USB3) and has left the PIPE alone: offer the gadget at high speed,
-		 * whatever the SoC. The USB2 PHY already runs as a device.
+		 * The PHY cannot carry a SuperSpeed device on this connection (a T8103 port whose
+		 * lanes are all DisplayPort or that has no SuperSpeed tunables) and has left the
+		 * PIPE alone: high speed as well, whatever the SoC.
 		 */
 		dwc3_apple_gadget_high_speed(appledwc);
 	} else if (ret) {
@@ -992,11 +1003,10 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 		 */
 		appledwc->dwc.dis_u3_susphy_quirk = true;
 		dwc3_enable_susphy(&appledwc->dwc, true);
-	} else if (appledwc->usb3_phy &&
+	} else if (host && appledwc->usb3_phy &&
 		   of_device_is_compatible(appledwc->dev->of_node, "apple,t6040-dwc3")) {
+		/* A device role leaves the PIPE parked: nothing moved, nothing to reset. */
 		dwc3_apple_usb3_pipe_reset(appledwc);
-	} else if (!host && !appledwc->usb3_phy) {
-		dwc3_apple_gadget_high_speed(appledwc);
 	}
 	return 0;
 }
