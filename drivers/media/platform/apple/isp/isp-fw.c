@@ -508,7 +508,6 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 static int isp_firmware_boot_stage1(struct apple_isp *isp)
 {
 	int err;
-	// u32 val;
 
 	isp_restore_fw_memory(isp);
 
@@ -525,16 +524,6 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	/* ISP17a and T6040 have no clock enable word */
 	if (isp->hw->gen != ISP_GEN_T8140 && isp->hw->gen != ISP_GEN_T6040)
 		isp_gpio_write32(isp, ISP_GPIO_CLOCK_EN, 0x1);
-
-#if 0
-	/* This doesn't work well with system sleep */
-	val = isp_gpio_read32(isp, ISP_GPIO_1);
-	if (val == 0xfeedbabe) {
-		err = isp_reset_coproc(isp);
-		if (err < 0)
-			return err;
-	}
-#endif
 
 	err = isp_reset_coproc(isp);
 	if (err < 0)
