@@ -229,3 +229,31 @@
 };
 
 /* Unexposed chassis port instances remain described and disabled. */
+
+/*
+ * USB-C PD: hpm0 (left-front) and hpm1 (left-rear) come from
+ * t8152-common.dtsi. From the J804 ADT: the MagSafe 3 controller hpm5
+ * (port-type 0x11) at SID 8 on nub-spmi-a0, with no liquid detection and
+ * no USB-C connector, and the right-hand port's hpm3 alone on nub-spmi-a1.
+ */
+&nub_spmi_a0 {
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		apple,no-liquid-detection;
+	};
+};
+
+&{/soc} {
+	nub_spmi_a1: spmi@308a08000 {
+		compatible = "apple,t8152-spmi", "apple,t8142-spmi";
+		reg = <0x3 0x08a08000 0x0 0x4000>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		hpm3: usb-pd@c {
+			compatible = "apple,sn201202x";
+			reg = <0xc SPMI_USID>;
+		};
+	};
+};

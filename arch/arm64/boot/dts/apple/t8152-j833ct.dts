@@ -21,3 +21,20 @@
 	/* ADT no-restore-gpio-pins */
 	gpio-reserved-ranges = <78 2>, <208 1>;
 };
+
+/*
+ * USB-C PD: hpm0 (back-right) and hpm1 (back-right-middle) come from
+ * t8152-common.dtsi; from the J833ct ADT, hpm2 (back-left-middle) and
+ * hpm3 (back-left) are at SIDs 8 and 6 on the same bus.
+ */
+&nub_spmi_a0 {
+	hpm2: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+	};
+
+	hpm3: usb-pd@6 {
+		compatible = "apple,sn201202x";
+		reg = <0x6 SPMI_USID>;
+	};
+};

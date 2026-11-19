@@ -11,6 +11,7 @@
 
 #include "t8152.dtsi"
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	/* Retain the RAM handoff and secondary CPU park contract. */
@@ -255,6 +256,30 @@
 		#size-cells = <0>;
 		power-domains = <&ps_i2c3>;
 		resets = <&ps_i2c3>;
+	};
+
+	/*
+	 * The USB-C PD controllers (SN201202x) of the first two USB-C ports,
+	 * on nub-spmi-a0 at the same SIDs in the J804 and J833ct ADTs. They are
+	 * polled, as on T8142 and T6050. There is no connector graph: the
+	 * ports' dwc3 and ATC PHY nodes are not described on these boards yet.
+	 * Boards add their other controllers on this bus.
+	 */
+	nub_spmi_a0: spmi@308908000 {
+		compatible = "apple,t8152-spmi", "apple,t8142-spmi";
+		reg = <0x3 0x08908000 0x0 0x4000>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		hpm0: usb-pd@c {
+			compatible = "apple,sn201202x";
+			reg = <0xc SPMI_USID>;
+		};
+
+		hpm1: usb-pd@a {
+			compatible = "apple,sn201202x";
+			reg = <0xa SPMI_USID>;
+		};
 	};
 };
 
