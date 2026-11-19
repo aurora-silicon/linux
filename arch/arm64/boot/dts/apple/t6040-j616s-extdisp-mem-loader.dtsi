@@ -37,36 +37,12 @@
 			no-map;
 			status = "disabled";
 		};
-
-		dcpext1_text: dcpext1-text {
-			compatible = "apple,asc-mem";
-			reg = <0x0 0x0 0x0 0x4000>;
-			no-map;
-			status = "disabled";
-		};
-
-		dcpext1_data: dcpext1-data {
-			compatible = "apple,asc-mem";
-			reg = <0x0 0x0 0x0 0x4000>;
-			no-map;
-			status = "disabled";
-		};
-
-		dcpext1_heap: dcpext1-heap {
-			compatible = "apple,asc-mem";
-			reg = <0x0 0x0 0x0 0x4000>;
-			no-map;
-			status = "disabled";
-		};
 	};
 };
 
+#include "t604x-dcpext1-mem.dtsi"
+
 &dcpext0 {
 	memory-region = <&dcpext0_text>, <&dcpext0_data>, <&dcpext0_heap>;
-	memory-region-names = "text", "data", "heap";
-};
-
-&dcpext1 {
-	memory-region = <&dcpext1_text>, <&dcpext1_data>, <&dcpext1_heap>;
 	memory-region-names = "text", "data", "heap";
 };
