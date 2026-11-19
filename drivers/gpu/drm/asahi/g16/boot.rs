@@ -43,6 +43,7 @@ pub(crate) mod glue {
     extern "C" {
         fn asahi_g16_board() -> bool;
         fn asahi_g16_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+        fn asahi_g16_perf_rows() -> core::ffi::c_uint;
         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
         fn asahi_g16_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
@@ -60,7 +61,7 @@ pub(crate) mod glue {
         ) -> core::ffi::c_int;
     }
 
-    /// A qualified J713/T8132 board.
+    /// A qualified T8132 board (J713, J773g).
     pub(crate) fn board() -> bool {
         // SAFETY: Reads the machine compatible strings only.
         unsafe { asahi_g16_board() }
@@ -70,6 +71,12 @@ pub(crate) mod glue {
     pub(crate) fn display_prepare(dev: &device::Device) -> Result {
         // SAFETY: `dev` is the bound GPU device; the helper only adds a device link.
         kernel::error::to_result(unsafe { asahi_g16_display_prepare(dev.as_raw().cast()) })
+    }
+
+    /// The firmware DVFS row count qualified for this board, or zero.
+    pub(crate) fn perf_rows() -> usize {
+        // SAFETY: Reads the machine compatible strings only.
+        unsafe { asahi_g16_perf_rows() as usize }
     }
 
     /// Holds the GFX power domain for the retained session.
@@ -409,7 +416,7 @@ impl Session {
         self.shared.check()?;
         if !self.rtkit.running()
             || self.regs.asc_control()? & regs::ASC_RUN == 0
-            || self.regs.pstate()? > 9
+            || self.regs.pstate()? > self.regs.top()
         {
             return Err(EIO);
         }
@@ -730,7 +737,7 @@ pub(crate) fn start(
         "M4 G16G: {} cores enabled\n",
         id.core_masks[0].count_ones()
     );
-    if regs.pstate()? > 9 {
+    if regs.pstate()? > regs.top() {
         return Err(eproto());
     }
     // Cold only: ASC RUN clear and an all-zero TTBAT before ownership.
@@ -779,6 +786,10 @@ pub(crate) fn start(
         events.reserve()?;
         // Every host object and every context-0 alias is prepared before RUN is set.
         built = Some(initdata::build(&d, &session.adt, &mut objects)?);
+        if let Some((init, _, _)) = built.as_ref() {
+            // The running firmware may report any state of the board's table, up to S10 on J773g.
+            session.regs.set_table(init.rows);
+        }
         objects.window.lock().bootstrap(&d, &session.uat)?;
         uat::tlbi_all();
         if session.regs.asc_control()? & regs::ASC_RUN != 0 {
