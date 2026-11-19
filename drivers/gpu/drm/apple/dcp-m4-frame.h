@@ -258,10 +258,6 @@ static inline int dcp_m4_swap_encode_on(void *output, size_t length, u32 swap_id
 		put_unaligned_le32(f->width, data + 0x10c + 16 * i + 8);
 		put_unaligned_le32(f->height, data + 0x10c + 16 * i + 12);
 		dcp_m4_surface_encode(data + dcp_m4_pf->swap_surface + DCP_M4_SURFACE_SIZE * i, f);
-		/* The surface's own ID is the one the swap names it by. */
-		if (upper->id)
-			put_unaligned_le32(upper->id, data + dcp_m4_pf->swap_surface +
-					   DCP_M4_SURFACE_SIZE * i + 0x35);
 		put_unaligned_le64(f->dva, data + dcp_m4_pf->swap_dva + 8 * i);
 		data[dcp_m4_pf->swap_nullable + i] = 0;
 	}
