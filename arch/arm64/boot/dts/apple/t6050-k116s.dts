@@ -359,31 +359,6 @@
 };
 
 /*
- * SMC sensors, as on J714s: every readable float T* key is discovered through
- * apple,discover-temperatures in t6050-die0.dtsi, so the shared temperature
- * nodes and apple,soc-die-keys go. The T6050 SMC spells the fan mode keys
- * F0md/F1md and drives the fans itself.
- */
-#include "hwmon-common.dtsi"
-#include "hwmon-fan-dual.dtsi"
-#include "hwmon-laptop.dtsi"
-
-&smc_hwmon {
-	status = "okay";
-	/delete-property/ apple,soc-die-keys;
-	/delete-node/ temperature-TH0x;
-	/delete-node/ temperature-TB0T;
-	/delete-node/ temperature-TCHP;
-	/delete-node/ temperature-TW0P;
-	fan-F0Ac {
-		apple,fan-mode = "F0md";
-	};
-	fan-F1Ac {
-		apple,fan-mode = "F1md";
-	};
-};
-
-/*
  * The internal panel and the display coprocessor, for the boot loader's display
  * hand-off (aura, chosen.aurora,t6050-display=1). Everything stays disabled: the
  * loader checks the ADT and the live DCP and DART state, publishes the DCP's
