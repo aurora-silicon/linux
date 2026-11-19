@@ -3331,7 +3331,7 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	/* T8140's values, as T8132 runs them: never run on T6040. */
 	.sleep_traced = true,
 	.sleep_untested = true,
-	.sleep_epmap_last_mask = BIT(0),
+	/* After a sleep that cut the power it takes the whole endpoint map echoed: mask 0. */
 	.sleep_flush_max_nsid = 1,
 	.sleep_shn = NVME_CC_SHN_MASK,
 	.quirks = NVME_QUIRK_NO_APST,
