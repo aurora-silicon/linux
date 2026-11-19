@@ -39,7 +39,8 @@ impl Progress {
     fn count(&self)->u32{self.count}
     fn set_pending(&self,v:bool){self.pending.store(v,Ordering::Relaxed)}
 }
-struct Job { id:u32,vm:Vm,queue:Queue,progress:Progress,commands:Vec<Command>,dependency:Result,terminal_marked:AtomicBool }
+struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}}
+struct Job { id:u32,vm:Vm,queue:Queue,progress:Progress,commands:Vec<Command>,dependency:Result,terminal_marked:AtomicBool,resources:Resources }
 impl Job {
     fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}
     fn mark_terminal_retired(&self)->Result{assert!(!self.progress.pending.load(Ordering::Relaxed));self.terminal_marked.store(true,Ordering::Relaxed);Ok(())}
@@ -64,6 +65,7 @@ struct Slots{compute_exhausted:bool,render_exhausted:bool,releases:u32,quarantin
 impl Slots{
     fn compute_exhausted(&self)->bool{self.compute_exhausted}
     fn render_exhausted(&self)->bool{self.render_exhausted}
+    fn compute_exhausted_within(&self,_units:usize)->bool{self.compute_exhausted}
     fn release(&mut self,_claims:&mut Claims){self.releases+=1;}
     fn quarantine(&mut self,_claims:&mut Claims){self.quarantines+=1;}
 }
@@ -114,6 +116,9 @@ struct Firmware{
 }
 impl Firmware {
     fn mark_class_unavailable(&mut self,class:usize,error:Error){self.unavailable.push((class,error));}
+    // Queuing behind in-flight compute is exercised on hardware; this recorder keeps the
+    // serialized selection and error isolation under test.
+    fn can_queue_behind(&self,_job:&Arc<Job>)->bool{false}
     fn service_power(&self)->Result{Ok(())}
     fn drain_rings(&mut self)->Result{Ok(())}
     fn check_hangs(&mut self,_done:&mut Completions)->Result{Ok(())}
@@ -144,7 +149,7 @@ fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
     Arc::new(Job{id,vm:Vm{status:Status(AtomicU32::new(0)),slot:id},
         queue:Queue{turn:AtomicU64::new(0),priority:0},
         progress:Progress{sent:AtomicU32::new(sent),count:sent+1,pending:AtomicBool::new(true)},
-        commands:vec![if render{Command::Render(())}else{Command::Compute(())};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false)})
+        commands:vec![if render{Command::Render(())}else{Command::Compute(())};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false),resources:Resources})
 }
 fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     Firmware{session:Session{shared:Shared{sleeping:AtomicBool::new(false)}},objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},

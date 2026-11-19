@@ -267,10 +267,17 @@ pub(crate) mod client {
     pub(crate) const CLIENT_APERTURE: Range<u64> = 0x7000000000..0x7100000000;
     pub(crate) const COMPACT_WINDOW: Range<u64> = 0x1000000000..0x9000000000;
 
-    // Two persistent compute units, each in its own 64 MiB interval and reused across
-    // application queues. Every alias is inside Mesa's reserved driver hole.
+    // Persistent compute units, each in its own 64 MiB interval and reused across
+    // application queues. Units 0 and 1 keep their original placement below the render
+    // allocators; further units (up to [`super::sizes::COMPUTE_UNITS`]) live between the
+    // unused CT window and the PB heap, clear of the dynamic PB page-list range
+    // 0x7040000000..0x7080000000. Every alias is inside Mesa's reserved driver hole.
     pub(crate) const fn compute_base(k: u64) -> u64 {
-        0x7001000000 + k * 0x04000000
+        if k < 2 {
+            0x7001000000 + k * 0x04000000
+        } else {
+            0x7090000000 + (k - 2) * 0x04000000
+        }
     }
     pub(crate) const fn compute_pool(k: u64) -> u64 {
         compute_base(k)
@@ -365,13 +372,20 @@ pub(crate) mod sizes {
     pub(crate) const PB_BLOCKS: u32 = 2048;
     pub(crate) const PB_LIST_RECORDS: u32 = 4096;
     pub(crate) const PB_GROW_STEP: u32 = 10;
-    /// The qualified M4 protocol permits only one published command at a time.
-    pub(crate) const FLIGHTS: usize = 1;
+    /// Published prefixes at most. A render is published only with nothing else in flight;
+    /// compute commands may queue behind each other on the one firmware compute queue, each
+    /// in its own retained unit ([`COMPUTE_UNITS`]).
+    pub(crate) const FLIGHTS: usize = 16;
+    /// Retained compute units per VM at most, all in hardware UMA slot 1. A unit is reused
+    /// only after a later publication retired (it displaced the unit), so `n` units keep up
+    /// to `n - 1` compute commands in flight.
+    pub(crate) const COMPUTE_UNITS: usize = 8;
+    const _: () = assert!(super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP);
     /// Inherited diagnostic histogram width; M4 does not fold jobs into a compute horizon.
     pub(crate) const HORIZON_JOBS: u32 = 1;
-    /// Two jobs may be admitted per logical queue so exact prior-command dependencies can
-    /// advance independently of a preceding job's aggregate fence. Firmware stays serialized.
-    pub(crate) const SCHEDULER_CREDITS: u32 = 2;
+    /// Jobs admitted to the engine per logical queue: enough to keep a queue's compute
+    /// commands in flight back to back; exact prior-command dependencies still gate each one.
+    pub(crate) const SCHEDULER_CREDITS: u32 = 16;
     /// Unconsumed records per 256-entry channel ring a prefix may be posted behind.
     pub(crate) const AHEAD_RECORDS: u32 = 64;
     /// Policy bound on logical queues reported in QUEUE_LIMITS (not a firmware limit).

@@ -55,6 +55,10 @@ pub(crate) struct QueueState {
     /// Exact successful firmware receipts, independently for render and compute. These
     /// survive aggregate-fence publication and never advance on aborted/failed commands.
     pub(crate) completed: [AtomicU64; 2],
+    /// Published command frontier per engine. The firmware runs the compute queue in
+    /// publication order, each command to its Finalize, so a compute command may follow its
+    /// published (not yet retired) compute predecessors.
+    pub(crate) published: [AtomicU64; 2],
     /// Owned-job counts at the queue's last 32 arrivals (compute horizon ahead), recorded by the
     /// engine when a job arrives.
     pub(crate) owned: [AtomicU32; 32],
@@ -140,6 +144,7 @@ impl Queue {
                 cancelled_at: [const { AtomicU64::new(0) }; 2],
                 turn: AtomicU64::new(0),
                 completed: [const { AtomicU64::new(0) }; 2],
+                published: [const { AtomicU64::new(0) }; 2],
                 owned: [const { AtomicU32::new(0) }; 32],
                 owned_index: AtomicU32::new(0),
             },

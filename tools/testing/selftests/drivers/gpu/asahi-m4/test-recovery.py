@@ -31,7 +31,7 @@ harness = r'''
     // This is the retirement policy used by poll.rs: an affected fence does not
     // erase the independently authenticated owner receipt. No synthetic receipt
     // is generated here; the hardware poller remains responsible for that proof.
-    fn finish(owners: &mut Lifetime, unit: usize, receipt: Retirement, affected: bool) -> bool {
+    fn finish<const N: usize>(owners: &mut Lifetime<N>, unit: usize, receipt: Retirement, affected: bool) -> bool {
         assert!(receipt.complete());
         if receipt.owner_retired() {
             assert!(owners.retire(unit));
@@ -43,7 +43,7 @@ harness = r'''
 
     #[test]
     fn ten_thousand_affected_full_receipts_preserve_displacement() {
-        let mut owners = Lifetime::new();
+        let mut owners = Lifetime::<2>::new(false);
         for number in 0..10_000 {
             let unit = number % 2;
             assert!(owners.claim(unit));
@@ -58,7 +58,7 @@ harness = r'''
 
     #[test]
     fn actual_abort_never_supplies_a_displacement_receipt() {
-        let mut owners = Lifetime::new();
+        let mut owners = Lifetime::<2>::new(false);
         assert!(owners.claim(0));
         assert!(owners.publish(0));
         assert!(!finish(&mut owners, 0, Retirement::Full, false));
@@ -77,8 +77,8 @@ harness = r'''
 
     #[test]
     fn exhausted_compute_ledger_does_not_poison_render_ledger() {
-        let mut compute = Lifetime::new();
-        let mut render = Lifetime::new();
+        let mut compute = Lifetime::<2>::new(false);
+        let mut render = Lifetime::<2>::new(false);
         assert!(compute.claim(0));
         assert!(compute.publish(0));
         finish(&mut compute, 0, Retirement::Aborted, true);
@@ -101,7 +101,7 @@ harness = r'''
 
     #[test]
     fn two_aborts_stay_bounded_and_cannot_be_reset_by_preparation_cancel() {
-        let mut owners = Lifetime::new();
+        let mut owners = Lifetime::<2>::new(false);
         for unit in 0..2 {
             assert!(owners.claim(unit));
             assert!(owners.publish(unit));
@@ -115,7 +115,7 @@ harness = r'''
 
     #[test]
     fn repeated_handshakes_and_storm_limit_preserve_owner_accounting() {
-        let mut owners = Lifetime::new();
+        let mut owners = Lifetime::<2>::new(false);
         let (mut window, mut count) = (1, 0);
         for number in 0..logic::WINDOW_LIMIT {
             assert!(logic::admit(100, &mut window, &mut count));
