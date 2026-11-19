@@ -3,6 +3,13 @@
  * T8122 (J613, MacBook Air M3): sleep in qualification under the shared
  * untested/untested_commit gates and matched only with APPLE_SOC_SLEEP_T8122.
  *
+ * Those gates are the only ones: deep sleep is offered only with apple_sleep.deep=1, and a
+ * sleep is a dry run unless apple_sleep.untested_commit=1. The dry run runs every refusal and
+ * the first witness and returns: no core held, no power word written, no SMC notice beyond
+ * the ones its driver's own suspend sends and takes back, nothing stopped. The display
+ * coprocessor is left running by it (display_no_restart). No PMU scratch is written for
+ * step notes (no_pmu_notes): the scratch's place is unmeasured on this PMU.
+ *
  * The register sequence is the one measured from a macOS sleep on J613 and tried alone by
  * apple-t8122-sleep.c: the PMU's sleep byte, both SPMI sleep-notify words, the display's
  * words, the two power gates, the cluster controls, CLLT and the commit word. That trial
@@ -16,8 +23,17 @@
  * after the last refusal, after the SEP and GPU stops, after the remaining stops (set against
  * macOS's commit, while the debug link still carries it), and after the link's cut.
  *
- * No wake is qualified. Nothing here arms a wake source, the display and the GPU have no
- * restart, and a real commit is recovered by reset.
+ * No wake is qualified. The wake sources are armed only with t8122_wake_mask=1, at mask
+ * offsets taken from T8140's layout and unmeasured here; the display and the GPU have no
+ * restart; and a real commit is recovered by reset.
+ *
+ * The SMC's order is not macOS's. Measured before its commit: MBSE=slpw 240 ms, pmVC 147 ms,
+ * WKTP=2 129 ms, then the PMU's sleep byte, both notify words and the PMP's stop, and only
+ * then MBSE=slpa (25.6 ms) and the AP idle notice (23.3 ms). Here macsmc's noirq suspend
+ * sends slpa and the idle notice before this entry starts, so before the PMU byte and every
+ * stop, and sends no pmVC. The one shared hook that puts the notice behind the peer stops
+ * (J813's deferred notice) runs on a transport never tried on this SMC and treats a failed
+ * notice as fatal, so it is not taken here: the order stays an open difference.
  */
 
 #define T8122_PS_DISP_SYS	0x1d8
@@ -612,16 +628,26 @@ static int t8122_sleep_begin(struct apple_sleep *s)
 		dev_info(s->dev, "J613: debug switch %#x, port controller %s: %s\n",
 			 readl(s->ps_aon + s->soc->ps_aon_debug_switch),
 			 s->hpm_spmi ? "named" : "not named",
-			 sleep_debug_link_up(s) ? "live debug link, cut before the SMC's warning" :
+			 sleep_debug_link_up(s) ? "live debug link, cut after the coprocessor stops" :
 						  "no cut");
+	if (apple_sleep_dry(s))
+		dev_info(s->dev, "J613: dry run: the refusals and the first witness, then a return before any stop\n");
+	else
+		dev_warn(s->dev, "J613: this sleep commits: wake sources %s; no wake is qualified, the display and the GPU don't restart\n",
+			 t8122_wake_mask && s->wake && s->wake_enable_count ?
+			 "armed from the tree's apple,wake-enable" : "not armed, left as they are");
 
 	return 0;
 }
 
-/* First in .enter: from here a hang resets the machine, where the trial asked for that. */
+/*
+ * First in .enter: from here a hang resets the machine, where the trial asked for that. Not in
+ * a dry run, which returns and commits nothing: no reset is left armed over it.
+ */
 static int t8122_sleep_check(struct apple_sleep *s)
 {
-	t8122_trial_wdt(s, true);
+	if (!apple_sleep_dry(s))
+		t8122_trial_wdt(s, true);
 
 	return 0;
 }
@@ -716,9 +742,67 @@ static void t8122_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
 }
 
 /*
+ * The main block's words at macOS's commit: the ones it has on raised, the ones it has off
+ * lowered. The common match does the same among steps this entry takes in its own order.
+ */
+static void t8122_match_ps(struct apple_sleep *s, int *raised, int *failed, int *lowered)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	int i;
+
+	for (i = 0; i < soc->ps_macos_on.count; i++) {
+		u32 offset = soc->ps_macos_on.offset[i];
+
+		s->ps_on_saved[i] = readl(s->ps + offset);
+		/* State 4 reads as on, and macOS has these at f. */
+		if (FIELD_GET(PS_ACTUAL, s->ps_on_saved[i]) == 0xf)
+			continue;
+		if (sleep_ps_raise_start(s, offset))
+			(*failed)++;
+		(*raised)++;
+	}
+	for (i = 0; i < soc->ps_macos_off.count; i++) {
+		u32 offset = soc->ps_macos_off.offset[i];
+
+		s->ps_off_saved[i] = readl(s->ps + offset);
+		if (!sleep_ps_on(s, offset))
+			continue;
+		sleep_ps_lower(s, offset);
+		(*lowered)++;
+	}
+}
+
+static void t8122_match_ps_wait(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	int i;
+
+	for (i = 0; i < soc->ps_macos_off.count; i++)
+		sleep_ps_wait_off(s, soc->ps_macos_off.offset[i]);
+}
+
+static void t8122_match_ps_undo(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	int i;
+
+	for (i = soc->ps_macos_off.count - 1; i >= 0; i--)
+		if (FIELD_GET(PS_ACTUAL, s->ps_off_saved[i]))
+			sleep_ps_raise(s, soc->ps_macos_off.offset[i]);
+	for (i = soc->ps_macos_on.count - 1; i >= 0; i--) {
+		u32 val = s->ps_on_saved[i];
+
+		if (!FIELD_GET(PS_ACTUAL, val))
+			sleep_ps_lower(s, soc->ps_macos_on.offset[i]);
+		else if (FIELD_GET(PS_ACTUAL, val) != 0xf)
+			writel(val & ~PS_FLAGS, s->ps + soc->ps_macos_on.offset[i]);
+	}
+}
+
+/*
  * macOS's commit state where Linux's differs once its drivers have suspended: the SoC's two
- * lists through the driver's own match, then the words with a stop of their own. ANS's
- * driver has shut its firmware down and released the domain; macOS commits with it up.
+ * lists, then the words with a stop of their own. ANS's driver has shut its firmware down
+ * and released the domain; macOS commits with it up.
  */
 static void t8122_sleep_match(struct apple_sleep *s)
 {
@@ -733,8 +817,8 @@ static void t8122_sleep_match(struct apple_sleep *s)
 	t8122.matched = true;
 	t8122.match_done = t8122_match;
 	if (t8122_match & 1) {
-		apple_sleep_match_ps(s, &raised, &failed, &lowered);
-		apple_sleep_match_ps_wait(s);
+		t8122_match_ps(s, &raised, &failed, &lowered);
+		t8122_match_ps_wait(s);
 	}
 	if (t8122_match & 2) {
 		if (sleep_ps_raise(s, T8122_PS_ANS))
@@ -765,7 +849,7 @@ static void t8122_sleep_match_undo(struct apple_sleep *s)
 			sleep_ps_lower(s, T8122_PS_ANS);
 	}
 	if (t8122.match_done & 1)
-		apple_sleep_match_ps_undo(s);
+		t8122_match_ps_undo(s);
 }
 
 /*
@@ -864,13 +948,6 @@ static void t8122_sleep_atc_off(struct apple_sleep *s)
 		sleep_ps_wait_off(s, T8122_PS_IOA1);
 	}
 }
-
-/*
- * Every coprocessor has stopped and the context is saved; no core has been told to stop and
- * no word of the commit sequence is written. Stage 1 ends here: the stops can't be undone,
- * so it doesn't return.
- */
-static void t8122_sleep_commit_begin(struct apple_sleep *s) { }
 
 /* The other cores are stopped. The measured final 165 us, in its order. */
 static void t8122_sleep_commit_regs(struct apple_sleep *s)
@@ -992,7 +1069,6 @@ static const struct apple_sleep_ops t8122_sleep_ops = {
 	.prepare_regs = t8122_sleep_prepare_regs,
 	.stopped = t8122_sleep_stopped,
 	.undo_regs = t8122_sleep_undo_regs,
-	.commit_begin = t8122_sleep_commit_begin,
 	.commit_regs = t8122_sleep_commit_regs,
 	.pre_commit = t8122_sleep_pre_commit,
 	.post_timer = t8122_sleep_post_timer,
@@ -1005,6 +1081,10 @@ static const struct apple_sleep_ops t8122_sleep_ops = {
 static const struct apple_sleep_soc t8122_sleep_soc = {
 	.ops = &t8122_sleep_ops,
 	.untested = true,
+	/* J815's scratch offset isn't this PMU's: no step notes. */
+	.no_pmu_notes = true,
+	/* The DCP's driver stops it cold for a sleep that commits; a dry run leaves it running. */
+	.display_no_restart = true,
 	.early_context = true,
 	/* The common arm stays off: the trial's switch runs it (t8122_wake_mask). */
 	.own_wake = true,
