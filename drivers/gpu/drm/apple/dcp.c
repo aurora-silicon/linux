@@ -5836,36 +5836,19 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	int ret;
 
 	/*
-	 * T8142 (J813) on macOS 27.0: the H17P interface written for its 26.x
-	 * firmware makes the 27.0 DCP firmware panic right after the first
-	 * hotplug ("ap_link: callback failed with: 0x5"). It runs the T6050's
-	 * firmware-27 generation, and so does 27.2, with the 27.2 method table.
+	 * T8142 (J813) and T8140 (J700) ship on H17-generation DCP firmware.
+	 * On macOS 27 they run the T6050's firmware-27 generation; the H17P
+	 * interface makes it panic right after the first hotplug (T8142 on
+	 * 27.0: "ap_link: callback failed with: 0x5"). A 27 or later build
+	 * runs as firmware 27 with its build's method table, or is not started.
 	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcp")) {
-		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret >= 0 && (!strcmp(compat_str, "27.0.0") ||
-				 !strcmp(compat_str, "27.2.0")))
-			return DCP_FIRMWARE_V_27_0;
-	}
-
-	/*
-	 * T8140 (J700) runs H17P firmware up to 26.6.2. Its 27.2 DCP firmware
-	 * is driven as firmware 27, like T8142 on 27.0. Any other 27.x build
-	 * is not started: the H17P interface is not used on firmware 27.
-	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcp")) {
+	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcp") ||
+	    of_device_is_compatible(dev->of_node, "apple,t8140-dcp")) {
 		u32 major;
 
-		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret >= 0 && !strcmp(compat_str, "27.2.0"))
+		if (!of_property_read_u32_index(dev->of_node, "apple,firmware-compat",
+						0, &major) && major >= 27)
 			return dcp_check_firmware_27(dev);
-		if (ret >= 0 &&
-		    !of_property_read_u32_index(dev->of_node, "apple,firmware-compat",
-						0, &major) && major >= 27) {
-			dev_err(dev, "T8140 display not started: DCP firmware-compat %s is not 27.2.0\n",
-				compat_str);
-			return DCP_FIRMWARE_UNKNOWN;
-		}
 	}
 
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0)

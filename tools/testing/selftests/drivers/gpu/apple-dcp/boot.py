@@ -275,17 +275,24 @@ int main(void)
     assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 27, 2, 0) == DCP_FIRMWARE_UNKNOWN && errors == 1);
     table_27_2_complete = true;
     puts("PASS T8140 27.2 is not started with an incomplete method table");
-    assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 27, 0, 0) == DCP_FIRMWARE_UNKNOWN && errors == 1);
-    assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 27, 3, 0) == DCP_FIRMWARE_UNKNOWN && errors == 1);
+    assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 27, 0, 0) == DCP_FIRMWARE_V_27_0 && !errors);
+    assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 27, 3, 0) == DCP_FIRMWARE_V_27_0 && !errors);
+    puts("PASS T8140 drives every 27.x build with a method table as firmware 27");
     assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 28, 0, 0) == DCP_FIRMWARE_UNKNOWN && errors == 1);
-    puts("PASS T8140 never drives other 27+ builds through H17P");
+    assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 27, 1, 0) == DCP_FIRMWARE_UNKNOWN && errors == 1);
+    puts("PASS T8140 never drives a 27+ build without a method table through H17P");
     assert(pick("apple,t8140-dcpext", DCP_FIRMWARE_H17P, 27, 2, 0) == DCP_FIRMWARE_H17P);
     puts("PASS T8140 dcpext selection is unchanged (its probe admits 26.6.2 only)");
-    assert(pick("apple,t8142-dcp", DCP_FIRMWARE_H17P, 27, 0, 0) == DCP_FIRMWARE_V_27_0);
-    assert(pick("apple,t8142-dcp", DCP_FIRMWARE_H17P, 26, 6, 2) == DCP_FIRMWARE_H17P);
+    assert(pick("apple,t8142-dcp", DCP_FIRMWARE_H17P, 27, 0, 0) == DCP_FIRMWARE_V_27_0 && !errors);
+    assert(pick("apple,t8142-dcp", DCP_FIRMWARE_H17P, 27, 2, 0) == DCP_FIRMWARE_V_27_0 && !errors);
+    assert(pick("apple,t8142-dcp", DCP_FIRMWARE_H17P, 26, 6, 2) == DCP_FIRMWARE_H17P && !errors);
+    puts("PASS T8142 27.0/27.2 and 26.x selection unchanged");
+    assert(pick("apple,t8142-dcp", DCP_FIRMWARE_H17P, 27, 3, 0) == DCP_FIRMWARE_V_27_0 && !errors);
+    assert(pick("apple,t8142-dcp", DCP_FIRMWARE_H17P, 28, 0, 0) == DCP_FIRMWARE_UNKNOWN && errors == 1);
+    puts("PASS T8142 shares the T8140 rule: 27+ runs as firmware 27 or not at all");
     assert(pick("apple,t6050-dcp", DCP_FIRMWARE_V_27_0, 27, 2, 0) == DCP_FIRMWARE_V_27_0 && !errors);
     assert(pick("apple,t6050-dcp", DCP_FIRMWARE_V_27_0, 26, 6, 2) == DCP_FIRMWARE_UNKNOWN && errors == 1);
-    puts("PASS T8142 and T6050 selection unchanged");
+    puts("PASS T6050 selection unchanged");
     return 0;
 }
 '''
