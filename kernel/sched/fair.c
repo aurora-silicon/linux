@@ -8414,6 +8414,15 @@ static bool __dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 	return true;
 }
 
+/* Account the run time since @p last slept, as it goes to sleep again. */
+static inline void update_burst_avg(struct task_struct *p)
+{
+	u64 burst = p->se.sum_exec_runtime - p->se.prev_sleep_sum_runtime;
+
+	p->se.prev_sleep_sum_runtime = p->se.sum_exec_runtime;
+	update_avg(&p->se.burst_avg, burst);
+}
+
 /*
  * The dequeue_task method is called before nr_running is
  * decreased. We remove the task from the rbtree and
@@ -8421,6 +8430,8 @@ static bool __dequeue_task(struct rq *rq, struct task_struct *p, int flags)
  */
 static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
+	bool sleep = (flags & (DEQUEUE_SLEEP | DEQUEUE_DELAYED)) == DEQUEUE_SLEEP;
+
 	if (task_is_throttled(p)) {
 		dequeue_throttled_task(p, flags);
 		return true;
@@ -8429,8 +8440,17 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (!p->se.sched_delayed)
 		util_est_dequeue(&rq->cfs, p);
 
-	if (!__dequeue_task(rq, p, flags))
+	/*
+	 * After the dequeue, which updated sum_exec_runtime. Without
+	 * DEQUEUE_DELAYED, @p is the task going to sleep and stays valid.
+	 */
+	if (!__dequeue_task(rq, p, flags)) {
+		if (sleep)
+			update_burst_avg(p);
 		return false;
+	}
+	if (sleep)
+		update_burst_avg(p);
 
 	/*
 	 * Must not reference @p after __dequeue_task(DEQUEUE_DELAYED).
@@ -9917,6 +9937,41 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 }
 
 /*
+ * Wake @p on @cpu, the waking CPU, rather than on an idle CPU, when @p and the
+ * waker both run only briefly between sleeps and the waker is alone on @cpu.
+ *
+ * Such a pair takes turns: one wakes the other and soon sleeps, as in a pipe
+ * or futex ping-pong, or a thread waking the thread that joins it. On an idle
+ * CPU every turn costs an IPI and the wake-up of a sleeping core, several
+ * microseconds on Apple cores, whose WFI lets the hardware power them down,
+ * and each CPU stays so lightly loaded that schedutil keeps the cluster at a
+ * low clock. On the waking CPU the wakee runs as soon as the waker sleeps,
+ * and the pair keeps one CPU busy at a high clock.
+ *
+ * Only brief runs qualify, so a task that keeps running after a wake-up does
+ * not hold up its wakee for longer than that; and only a waker alone on its
+ * CPU, so at most one wakee is stacked on it. Tasks that wake many others are
+ * spread by wake_wide() before this is considered.
+ */
+static bool wake_short_local(struct task_struct *p, int cpu)
+{
+	u64 limit = sysctl_sched_migration_cost / 8;
+	struct task_struct *waker = current;
+	struct rq *rq = cpu_rq(cpu);
+
+	if (!in_task() || waker->sched_class != &fair_sched_class)
+		return false;
+	if (rq->nr_running - cfs_h_nr_delayed(rq) != 1)
+		return false;
+	if (p->se.burst_avg > limit || waker->se.burst_avg > limit ||
+	    waker->se.sum_exec_runtime - waker->se.prev_sleep_sum_runtime > limit)
+		return false;
+	if (sched_asym_cpucap_active() && !task_fits_cpu(p, cpu))
+		return false;
+	return true;
+}
+
+/*
  * select_task_rq_fair: Select target runqueue for the waking task in domains
  * that have the relevant SD flag set. In practice, this is SD_BALANCE_WAKE,
  * SD_BALANCE_FORK, or SD_BALANCE_EXEC.
@@ -9956,6 +10011,10 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		}
 
 		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
+
+		if (sched_feat(WAKE_SHORT_LOCAL) && want_affine &&
+		    wake_short_local(p, cpu))
+			return cpu;
 	}
 
 	for_each_domain(cpu, tmp) {
