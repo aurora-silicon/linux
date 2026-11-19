@@ -5632,6 +5632,19 @@ static int atcphy_usb3_port_on(struct apple_atcphy *atcphy, struct atcphy_usb3_p
  * root hub, and only while the PIPE is on the USB3 backend of a running host.
  * The work is freezable, so it waits across system sleep, and is cancelled on
  * removal.
+ *
+ * What is retried is a failed request to a running root hub: out of memory
+ * for the control request, a runtime resume of the hub or its port that
+ * failed, or a controller or hub driver not bound yet (-EAGAIN). Nothing
+ * signals that such a request would now succeed, hence the backoff: 100, 200,
+ * 400, 800 and 1600 ms, about 3 s in all, then a warning. Each failed
+ * power-on is logged by atcphy_usb3_port_on() as it happens.
+ *
+ * Nothing is retried for a port that is not held off: there is no power-on
+ * to owe. Nor once the host or its root hub is gone or is not this PHY's
+ * (-ENODEV, -ESHUTDOWN): a new host powers the ports of its root hubs itself
+ * as it starts, and atcphy_usb3_set_mode() then drops the debt, so a retry
+ * could only end in the warning.
  */
 #define ATCPHY_USB3_PORT_RETRIES	5
 #define ATCPHY_USB3_PORT_RETRY_MS	100
@@ -5648,6 +5661,13 @@ static void atcphy_usb3_port_retry(struct apple_atcphy *atcphy, bool restart, in
 	unsigned int retry = 0;
 
 	scoped_guard(mutex, &atcphy->lock) {
+		if (!atcphy->usb3_port_off)
+			return;
+		if (err == -ENODEV || err == -ESHUTDOWN) {
+			dev_dbg(atcphy->dev,
+				"SuperSpeed port left to the next host: %d\n", err);
+			return;
+		}
 		if (restart)
 			atcphy->usb3_port_retries = ATCPHY_USB3_PORT_RETRIES;
 		if (!atcphy->usb3_port_retries) {

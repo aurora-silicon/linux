@@ -507,6 +507,42 @@ static void atcphy_test_update_port_retry(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
 }
 
+/* Only a power-on still owed is retried, and not once the host is gone */
+static void atcphy_test_update_port_unowed(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+	struct atcphy_test_steps *steps = atcphy_test_stub_steps(test);
+
+	/* No port held off: a root hub not bound yet leaves nothing to retry */
+	steps->pm_get_ret = -EAGAIN;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), -EAGAIN);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g");
+	KUNIT_EXPECT_FALSE(test, atcphy_test_run_retry(atcphy));
+
+	/* A port held off behind a root hub not bound yet is retried */
+	atcphy->usb3_port_off = true;
+	memset(steps->log, 0, sizeof(steps->log));
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	KUNIT_EXPECT_TRUE(test, atcphy_test_run_retry(atcphy));
+	KUNIT_EXPECT_STREQ(test, steps->log, "gg");
+
+	/* until the host is gone: the next host powers its port itself */
+	steps->pm_get_ret = -ENODEV;
+	KUNIT_EXPECT_TRUE(test, atcphy_test_run_retry(atcphy));
+	KUNIT_EXPECT_FALSE(test, atcphy_test_run_retry(atcphy));
+	KUNIT_EXPECT_STREQ(test, steps->log, "ggg");
+	KUNIT_EXPECT_TRUE(test, atcphy->usb3_port_off);
+
+	/* A dead controller fails the power-on itself the same way */
+	steps->pm_get_ret = 0;
+	steps->mode_port_on = true;
+	steps->port_on_ret = -ESHUTDOWN;
+	memset(steps->log, 0, sizeof(steps->log));
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m1");
+	KUNIT_EXPECT_FALSE(test, atcphy_test_run_retry(atcphy));
+}
+
 /* A mode the PHY cannot run is turned down before USB3 goes down for it */
 static void atcphy_test_update_unsupported(struct kunit *test)
 {
@@ -1400,6 +1436,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_update_port_failure),
 	KUNIT_CASE(atcphy_test_update_port_owed),
 	KUNIT_CASE(atcphy_test_update_port_retry),
+	KUNIT_CASE(atcphy_test_update_port_unowed),
 	KUNIT_CASE(atcphy_test_update_unsupported),
 	KUNIT_CASE(atcphy_test_update_port_taken),
 	KUNIT_CASE(atcphy_test_update_after_other),
