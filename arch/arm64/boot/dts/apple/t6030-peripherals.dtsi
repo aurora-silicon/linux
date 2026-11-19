@@ -18,7 +18,7 @@
 		interrupts = <AIC_IRQ 861 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_msr>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	dart_jpeg0: iommu@299004000 {
@@ -457,7 +457,7 @@
 		             <AIC_IRQ 862 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_msr>, <&ps_msr_ase_core>;
 		iommus = <&dart_scaler 0>, <&dart_scaler 1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	jpeg0: jpeg@299000000 {

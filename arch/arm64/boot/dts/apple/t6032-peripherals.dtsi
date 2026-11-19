@@ -18,7 +18,7 @@
 		interrupts = <AIC_IRQ 0 1292 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_msr0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ultra_dart_scaler10: iommu@3c7200000 {
@@ -28,7 +28,7 @@
 		interrupts = <AIC_IRQ 0 1298 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_msr1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ultra_dart_apr00: iommu@2c5028000 {
@@ -416,7 +416,7 @@
 		power-domains = <&ps_msr0>, <&ps_msr0_ase_core>;
 		iommus = <&ultra_dart_scaler00 0>, <&ultra_dart_scaler00 1>;
 		clocks = <&ultra_clocks 414>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ultra_scaler1: scaler@3c7000000 {
@@ -431,7 +431,7 @@
 		power-domains = <&ps_msr1>, <&ps_msr1_ase_core>;
 		iommus = <&ultra_dart_scaler10 0>, <&ultra_dart_scaler10 1>;
 		clocks = <&ultra_clocks 415>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ultra_apr0: video-codec@2c5000000 {
@@ -525,7 +525,7 @@
 		interrupts = <AIC_IRQ 1 1292 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_msr0_die1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ultra_dart_scaler30: iommu@3c7200000 {
@@ -535,7 +535,7 @@
 		interrupts = <AIC_IRQ 1 1298 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_msr1_die1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ultra_dart_apr20: iommu@2c5028000 {
@@ -731,7 +731,7 @@
 		power-domains = <&ps_msr0_die1>, <&ps_msr0_ase_core_die1>;
 		iommus = <&ultra_dart_scaler20 0>, <&ultra_dart_scaler20 1>;
 		clocks = <&ultra_clocks 268435870>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ultra_scaler3: scaler@3c7000000 {
@@ -746,7 +746,7 @@
 		power-domains = <&ps_msr1_die1>, <&ps_msr1_ase_core_die1>;
 		iommus = <&ultra_dart_scaler30 0>, <&ultra_dart_scaler30 1>;
 		clocks = <&ultra_clocks 268435871>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ultra_apr2: video-codec@2c5000000 {
