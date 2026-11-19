@@ -76,6 +76,11 @@ static int dcp_v14_pmp_wait_ready(struct device_node *entry,
 	symbol_put(apple_pmp_report_wait_ready);
 	return ret;
 }
+/*
+ * Extra RTKit boots after a wake that timed out (-ETIME). Why the first
+ * handshake times out is not known (aurora-silicon/linux#2461); every retry
+ * that was needed is logged so the cause can be found and the loop dropped.
+ */
 #define DCP_V14_RTKIT_RETRIES	4
 #define DCP_V14_MAX_PROPERTIES	256
 #define DCP_V14_MAX_RAW		32
@@ -2245,6 +2250,8 @@ static int dcpext_boot(struct apple_dcp *dcp)
 	ret = apple_rtkit_wake(rtk);
 	for (n = 0; ret == -ETIME && n < DCP_V14_RTKIT_RETRIES; n++)
 		ret = apple_rtkit_boot(rtk);
+	if (n)
+		dev_warn(dev, "RTKit wake timed out; %u extra boot(s), last %d\n", n, ret);
 	if (ret) {
 		dev_err(dev, "dcpext RTKit did not wake: %d\n", ret);
 		return ret;
@@ -2429,6 +2436,8 @@ int iomfb_v14_7_bind(struct apple_dcp *dcp)
 	ret = apple_rtkit_wake(rtk);
 	for (n = 0; ret == -ETIME && n < DCP_V14_RTKIT_RETRIES; n++)
 		ret = apple_rtkit_boot(rtk);
+	if (n)
+		dev_warn(dev, "RTKit wake timed out; %u extra boot(s), last %d\n", n, ret);
 	if (ret) {
 		v14->failed = true;
 		return dev_err_probe(dev, ret,
