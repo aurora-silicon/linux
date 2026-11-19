@@ -536,6 +536,13 @@ enum atcphy_lane_mode {
 #define PIPEHANDLER_NATIVE_POWER_DOWN GENMASK(3, 0)
 
 #define PIPEHANDLER_LOCK_ACK_TIMEOUT_US 1000
+/*
+ * A live USB3 PIPE: the controller ACKs the lock only once it has let go of
+ * the PIPE, which a running link can take several ms to do. The old handoff
+ * asked up to ten times, 1 ms each with 5-10 ms between; this window covers
+ * the same span with the request held.
+ */
+#define PIPEHANDLER_LOCK_LIVE_ACK_TIMEOUT_US (100 * USEC_PER_MSEC)
 
 /* USB2 PHY regs */
 #define USB2PHY_USBCTL 0x00
@@ -829,7 +836,7 @@ struct atcphy_cio_sleep {
  * @pipe_state: Backend the PIPE mux ("pipehandler") is routed to
  * @t8103_dummy_pending: A live T8103-generation handoff still needs its unlock ACK
  * @t8103_usb3_retry: USB3 routing owed after a deferred role or parked lane change
- * @t8103_usb3_workaround: Base M1 admission for the USB3 handoff workaround
+ * @t8103_usb3_workaround: The T8103-generation USB3 handoff, see atcphy_has_t8103_usb3_workaround()
  * @pd_nb: Power domain notifier, registered with restore_after_pd_off
  * @pd_was_off: The power domain was switched off since the state was last
  *              brought back; set from the notifier, cleared under @lock
@@ -1366,8 +1373,10 @@ static int atcphy_pipehandler_lock_timeout(struct apple_atcphy *atcphy, u32 time
 		set32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
 	}
 
+	/* Step coarser over a long window: the ACK is the only signal to wait for. */
 	ret = readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
-				 reg & PIPEHANDLER_LOCK_EN, 10, timeout);
+				 reg & PIPEHANDLER_LOCK_EN,
+				 timeout > 10 * USEC_PER_MSEC ? 100 : 10, timeout);
 	/*
 	 * A controller that still drives the PIPE can take longer than this to
 	 * let go. What that means is the caller's to decide: a best-effort lock
@@ -1394,20 +1403,27 @@ static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
 		6000 : PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
 }
 
-/* Retry only a live legacy PIPE: USB4 and stopped parking cannot clock the ACK. */
+/*
+ * Lock a live USB3 PIPE: the running controller clocks the ACK, and gives it
+ * once it has let go of the PIPE. One request, held, and the ACK polled for the
+ * whole live window, rather than dropping and asking again. USB4 and stopped
+ * parking cannot clock the ACK and do not come here.
+ */
 static int atcphy_pipehandler_lock_live(struct apple_atcphy *atcphy)
 {
-	unsigned int attempts = atcphy->t8103_usb3_workaround ? 10 : 1;
-	int ret;
+	u32 aon;
 
-	for (unsigned int attempt = 0; attempt < attempts; attempt++) {
-		ret = atcphy_pipehandler_lock(atcphy);
-		if (!ret)
-			return 0;
-		if (attempt + 1 < attempts)
-			usleep_range(5000, 10000);
-	}
-	return ret;
+	/* The tests stand in for the controller that acknowledges the lock. */
+	if (IS_ENABLED(CONFIG_PHY_APPLE_ATC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(atcphy_pipehandler_lock_live, atcphy);
+
+	/* A controller held in reset or clamped clocks nothing: no ACK can come. */
+	aon = readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN);
+	if (!(aon & PIPEHANDLER_AON_GEN_DWC3_RESET_N) ||
+	    (aon & PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN))
+		return -ETIMEDOUT;
+
+	return atcphy_pipehandler_lock_timeout(atcphy, PIPEHANDLER_LOCK_LIVE_ACK_TIMEOUT_US);
 }
 
 static int atcphy_pipehandler_unlock(struct apple_atcphy *atcphy)
@@ -6878,12 +6894,16 @@ static bool atcphy_probe_pd_notifier(struct apple_atcphy *atcphy)
 	return !ret;
 }
 
-/* The T8103 PHY compatible is also a fallback on unqualified M1/M2 variants. */
-static bool atcphy_has_t8103_usb3_workaround(const struct atcphy_hw *hw,
-					   const struct device_node *root)
+/*
+ * The USB3 handoff of the T8103-generation PIPE handler: a live PIPE is parked
+ * on the dummy backend under a held lock before a lane change, host BIST is
+ * skipped, and an early dwc3 role routes USB3 once Type-C asks for it. It is a
+ * property of that PIPE handler, so every PHY of the generation takes it: the
+ * apple,t8103-atcphy fallback of T8103, T600x, T8112 and T602x.
+ */
+static bool atcphy_has_t8103_usb3_workaround(const struct atcphy_hw *hw)
 {
-	return hw->gen == ATCPHY_GENERATION_T8103 &&
-	       of_device_is_compatible(root, "apple,t8103");
+	return hw->gen == ATCPHY_GENERATION_T8103;
 }
 
 static void atcphy_sleep_finish_work(struct work_struct *work);
@@ -6902,7 +6922,7 @@ static int atcphy_probe(struct platform_device *pdev)
 	atcphy->hw = of_device_get_match_data(&pdev->dev);
 	if (!atcphy->hw)
 		return -EINVAL;
-	atcphy->t8103_usb3_workaround = atcphy_has_t8103_usb3_workaround(atcphy->hw, of_root);
+	atcphy->t8103_usb3_workaround = atcphy_has_t8103_usb3_workaround(atcphy->hw);
 
 	atcphy->dev = dev;
 	atcphy->np = dev->of_node;
