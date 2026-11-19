@@ -140,6 +140,7 @@ struct mca_cluster {
 	struct dma_chan *dma_chans[SNDRV_PCM_STREAM_LAST + 1];
 
 	bool clk_provider;
+	bool rx_bclk_inverted;
 
 	bool port_clk_started[SNDRV_PCM_STREAM_LAST + 1];
 	int port_clk_driver; /* The cluster driving this cluster's port */
@@ -594,8 +595,7 @@ static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 
 	mca_modify(cl, CLUSTER_TX_OFF + REG_TX_SERDES_CONF,
 		   SERDES_CONF_BCLK_POL, serdes_conf);
-	/* J613 sense SDOUT is launched on the rising edge, not sampled there. */
-	if (of_machine_is_compatible("apple,j613") && cl->no == 2)
+	if (cl->rx_bclk_inverted)
 		serdes_conf ^= SERDES_CONF_BCLK_POL;
 	mca_modify(cl, CLUSTER_RX_OFF + REG_RX_SERDES_CONF,
 		   SERDES_CONF_BCLK_POL, serdes_conf);
@@ -1310,6 +1310,7 @@ static int apple_mca_probe(struct platform_device *pdev)
 	struct snd_soc_dai_driver *dai_drivers;
 	struct resource *res;
 	void __iomem *base;
+	u32 rx_bclk_cluster;
 	int nclusters;
 	int ret, i;
 
@@ -1330,6 +1331,14 @@ static int apple_mca_probe(struct platform_device *pdev)
 	mutex_init(&mca->port_mutex);
 	platform_set_drvdata(pdev, mca);
 	clusters = mca->clusters;
+
+	of_property_for_each_u32(pdev->dev.of_node, "apple,rx-bclk-inverted-clusters",
+				 rx_bclk_cluster) {
+		if (rx_bclk_cluster >= nclusters)
+			return dev_err_probe(&pdev->dev, -EINVAL,
+					     "invalid RX BCLK cluster %u\n", rx_bclk_cluster);
+		clusters[rx_bclk_cluster].rx_bclk_inverted = true;
+	}
 
 	mca->switch_base =
 		devm_platform_ioremap_resource(pdev, 1);
