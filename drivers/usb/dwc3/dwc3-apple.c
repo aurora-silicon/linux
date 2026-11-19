@@ -929,8 +929,17 @@ static void dwc3_apple_usb3_pipe_reset(struct dwc3_apple *appledwc)
  */
 static void dwc3_apple_gadget_high_speed(struct dwc3_apple *appledwc)
 {
-	if (appledwc->dwc.maximum_speed > USB_SPEED_HIGH)
-		appledwc->dwc.maximum_speed = USB_SPEED_HIGH;
+	struct dwc3 *dwc = &appledwc->dwc;
+	u32 reg;
+
+	if (dwc->maximum_speed <= USB_SPEED_HIGH)
+		return;
+	dwc->maximum_speed = USB_SPEED_HIGH;
+	/* What dwc3_core_init() selects for a core limited to high speed. */
+	if (DWC3_VER_IS_WITHIN(DWC3, 290A, ANY)) {
+		reg = dwc3_readl(dwc, DWC3_GUCTL1);
+		dwc3_writel(dwc, DWC3_GUCTL1, reg | DWC3_GUCTL1_DEV_FORCE_20_CLK_FOR_30_CLK);
+	}
 	dev_info(appledwc->dev, "No USB3 device PHY: gadget at high speed\n");
 }
 
