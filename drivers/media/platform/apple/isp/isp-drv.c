@@ -17,6 +17,7 @@
 #include <linux/sizes.h>
 #include <linux/sort.h>
 #include <linux/suspend.h>
+#include <linux/sysfs.h>
 #include <linux/workqueue.h>
 
 #include "isp-cam.h"
@@ -1771,11 +1772,35 @@ static void apple_isp_shutdown(struct platform_device *pdev)
 	mutex_unlock(&isp->video_lock);
 }
 
+static ssize_t sensor_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct apple_isp *isp = dev_get_drvdata(dev);
+	const char *sensor;
+
+	if (!isp)
+		return -ENODATA;
+
+	sensor = apple_isp_sensor_name(isp);
+	if (!sensor)
+		return -ENODATA;
+
+	return sysfs_emit(buf, "%s\n", sensor);
+}
+static DEVICE_ATTR_RO(sensor);
+
+static struct attribute *apple_isp_attrs[] = {
+	&dev_attr_sensor.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(apple_isp);
+
 static struct platform_driver apple_isp_driver = {
 	.driver	= {
 		.name		= "apple-isp",
 		.of_match_table	= apple_isp_of_match,
 		.pm		= pm_ptr(&apple_isp_pm_ops),
+		.dev_groups	= apple_isp_groups,
 	},
 	.probe	= apple_isp_probe,
 	.remove	= apple_isp_remove,

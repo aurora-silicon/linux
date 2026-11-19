@@ -216,8 +216,33 @@ static void isp_test_firmware_lifetime(struct kunit *test)
 	}
 }
 
+static void isp_test_sensor_sysfs(struct kunit *test)
+{
+	struct device *dev = kunit_device_register(test, "apple-isp-sensor-test");
+	struct apple_isp *isp;
+	char buf[32];
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	KUNIT_EXPECT_EQ(test, sensor_show(dev, &dev_attr_sensor, buf), -ENODATA);
+
+	isp = kunit_kzalloc(test, sizeof(*isp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, isp);
+	mutex_init(&isp->video_lock);
+	dev_set_drvdata(dev, isp);
+
+	/* Before detection on deferred-start hardware, report -ENODATA. */
+	KUNIT_EXPECT_EQ(test, sensor_show(dev, &dev_attr_sensor, buf), -ENODATA);
+
+	isp_get_current_format(isp)->id = ISP_IMX958_2224_01;
+	isp->camera_detected = true;
+	KUNIT_EXPECT_EQ(test, sensor_show(dev, &dev_attr_sensor, buf),
+			(ssize_t)strlen("imx958-uw\n"));
+	KUNIT_EXPECT_STREQ(test, buf, "imx958-uw\n");
+}
+
 static struct kunit_case isp_hw_test_cases[] = {
 	KUNIT_CASE(isp_test_firmware_lifetime),
+	KUNIT_CASE(isp_test_sensor_sysfs),
 	{}
 };
 
