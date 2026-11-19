@@ -191,8 +191,6 @@ int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool fl
 int apple_dart_gapf_ready(struct device *dev);
 /* A display DART whose domain goes off at runtime while others still map into it. */
 void apple_dart_power_dark(struct device *dev, bool dark);
-/* A DART's state kept across its consumer's own power cycle, outside a system sleep. */
-int apple_dart_m5_restore(struct device *dev, struct device *owner);
 /* T6050: a display coprocessor's DART around its restart, the display pipe's around its domain's. */
 int apple_dart_m5_display_cycle(struct device *dev, bool on);
 int apple_dart_m5_display_snapshot(struct device *dev);
@@ -228,11 +226,6 @@ static inline int apple_dart_gapf_ready(struct device *dev)
 
 static inline void apple_dart_power_dark(struct device *dev, bool dark)
 {
-}
-
-static inline int apple_dart_m5_restore(struct device *dev, struct device *owner)
-{
-	return -EOPNOTSUPP;
 }
 
 static inline int apple_dart_m5_display_cycle(struct device *dev, bool on) { return -EOPNOTSUPP; }

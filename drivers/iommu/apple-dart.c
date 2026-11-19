@@ -375,9 +375,8 @@ struct apple_dart {
 	bool sleep_flushed;
 	/* The firmware 27 display sleep owns it: never replay locked trees. */
 	struct device *m5_sleep_owner;
-	u32 m5_streams, m5_gapf, m5_diag, m5_error_mask, m5_protect, m5_lock;
 	u32 m5_disp_streams;	/* the display pipe's streams before its domain went off */
-	bool m5_released, m5_changed, m5_display, m5_failed;
+	bool m5_display;
 	/* Optional cached evidence; never a sleep-ownership grant. */
 	struct mutex v27_lifecycle;
 	struct list_head v27_clients;
@@ -7765,59 +7764,6 @@ static int apple_dart_m5_idle(struct apple_dart *dart)
 	return 0;
 }
 
-
-int apple_dart_m5_restore(struct device *dev, struct device *owner)
-{
-	struct apple_dart *dart = dev_get_drvdata(dev);
-	u32 status;
-	int ret;
-
-	if (!dart)
-		return -EINVAL;
-	guard(spinlock_irqsave)(&dart->lock);
-	if (dart->m5_sleep_owner != owner)
-		return -EINVAL;
-	if (dart->m5_failed)
-		return -EUCLEAN;
-	if (!dart->m5_changed)
-		goto done;
-	/* Caller proved power up. This is a retained warm path, never a cold
-	 * mapper rebuild, PROTECT unlock, or firmware memory reallocation.
-	 */
-	if (!apple_dart_state_retained(dart) ||
-	    readl(dart->regs + DART_T8110_PROTECT) != dart->m5_protect ||
-	    readl(dart->regs + DART_T8110_PROTECT_LOCK) != dart->m5_lock) {
-		dart->m5_failed = true;
-		return -EUCLEAN;
-	}
-	/* A partial restore is uncertain too; only full readback clears poison. */
-	dart->m5_failed = true;
-	writel(dart->m5_gapf, dart->gapf);
-	if (readl(dart->gapf) != dart->m5_gapf)
-		return -EIO;
-	writel(DART_T8110_TLB_CMD_POWERDOWN, dart->regs + DART_T8110_TLB_CMD);
-	ret = readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_CMD, status,
-		!(status & DART_T8110_TLB_CMD_BUSY), 1, DART_T8110_FLUSH_BUSY_TIMEOUT);
-	if (ret)
-		return ret;
-	if (dart->ctc_flush)
-		writel(0, dart->regs + DART_T8110_CTC_FLUSH);
-	writel(dart->m5_diag, dart->regs + DART_T8110_DIAG_LOCK);
-	writel(dart->m5_error_mask, dart->regs + DART_T8110_V2_ERROR_MASK);
-	writel(dart->m5_streams, dart->regs + DART_T8110_ENABLE_STREAMS);
-	if (apple_dart_m5_streams_unowned(dart, dart->m5_streams) ||
-	    readl(dart->regs + DART_T8110_ENABLE_STREAMS) != dart->m5_streams)
-		return -EIO;
-	WRITE_ONCE(dart->display_tlb_stale, false);
-	WRITE_ONCE(dart->display_dark, false);
- done:
-	dart->m5_failed = false;
-	dart->m5_changed = false;
-	dart->m5_released = false;
-	dart->m5_sleep_owner = NULL;
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_dart_m5_restore);
 
 /*
  * T6050 (firmware 27): a display coprocessor's DART around a stop and restart of that
