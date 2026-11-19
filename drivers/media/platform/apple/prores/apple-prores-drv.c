@@ -844,6 +844,23 @@ static const struct apr_variant apr_t6050 = {
 	.apri = &apri_t6050,
 };
 
+/*
+ * A source buffer of the decoder. The frame is parsed once, when it is
+ * queued; job_ready, the source-change check and device_run then use the
+ * cached result instead of walking the slice table of the (uncached) buffer
+ * again each time.
+ */
+struct apr_buf {
+	struct v4l2_m2m_buffer m2m;	/* first: vb2 and m2m embed this */
+	struct apr_prores_info info;
+	int parse_err;
+};
+
+static struct apr_buf *to_apr_buf(struct vb2_v4l2_buffer *vbuf)
+{
+	return container_of(vbuf, struct apr_buf, m2m.vb);
+}
+
 struct apr_dev {
 	const struct apr_variant *variant;
 	struct device *dev;
@@ -1057,14 +1074,12 @@ static void apr_fill_frame(struct apr_ctx *ctx, struct vb2_v4l2_buffer *src,
 static int apr_parse_src(struct vb2_v4l2_buffer *src,
 			 struct apr_prores_info *info)
 {
-	struct vb2_buffer *vb = &src->vb2_buf;
-	u32 payload = vb2_get_plane_payload(vb, 0);
-	u32 offset = vb->planes[0].data_offset;
-	u8 *data = vb2_plane_vaddr(vb, 0);
+	struct apr_buf *buf = to_apr_buf(src);
 
-	if (!data || offset > payload)
-		return -EINVAL;
-	return apr_parse_frame(data + offset, payload - offset, info);
+	if (buf->parse_err)
+		return buf->parse_err;
+	*info = buf->info;
+	return 0;
 }
 
 static int apr_fill_decode_frame(struct apr_ctx *ctx,
@@ -1701,10 +1716,17 @@ static int apr_buf_prepare(struct vb2_buffer *vb)
 		return -EINVAL;
 	if (V4L2_TYPE_IS_OUTPUT(vb->type)) {
 		if (ctx->decode) {
+			struct apr_buf *buf = to_apr_buf(to_vb2_v4l2_buffer(vb));
 			u32 payload = vb2_get_plane_payload(vb, 0);
+			u32 offset = vb->planes[0].data_offset;
+			u8 *data = vb2_plane_vaddr(vb, 0);
 
-			if (payload < 28 || vb->planes[0].data_offset > payload)
+			if (payload < 28 || offset > payload)
 				return -EINVAL;
+			/* A frame that does not parse fails its job, not QBUF. */
+			buf->parse_err = data ?
+				apr_parse_frame(data + offset, payload - offset,
+						&buf->info) : -EINVAL;
 		} else {
 			/* The encoder always reads the whole padded surface. */
 			vb2_set_plane_payload(vb, 0, size);
@@ -1833,7 +1855,7 @@ static int apr_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 	src->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	src->io_modes = VB2_MMAP | VB2_DMABUF;
 	src->drv_priv = ctx;
-	src->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
+	src->buf_struct_size = sizeof(struct apr_buf);
 	src->ops = &apr_qops;
 	src->mem_ops = &vb2_dma_contig_memops;
 	src->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;

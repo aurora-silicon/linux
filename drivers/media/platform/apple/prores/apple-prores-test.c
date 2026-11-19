@@ -563,9 +563,11 @@ static void apr_test_decode_desc(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apr_build_decode_desc(&f, d), -EINVAL);
 }
 
-static u8 *apr_test_bitstream(struct kunit *test, bool interlaced, size_t *bytes)
+static u8 *apr_test_bitstream_size(struct kunit *test, u32 width, u32 height,
+				   bool interlaced, size_t *bytes)
 {
-	u32 slices = interlaced ? 24 : 45;
+	u32 slices = apr_slice_count(width, interlaced ?
+				     DIV_ROUND_UP(height, 2) : height, 3);
 	u32 picture_size = 8 + 2 * slices + 6 * slices;
 	u32 pictures = interlaced ? 2 : 1;
 	u32 frame_size = 28 + pictures * picture_size;
@@ -580,8 +582,8 @@ static u8 *apr_test_bitstream(struct kunit *test, bool interlaced, size_t *bytes
 	put_unaligned_be16(20, frame + 8);
 	put_unaligned_be16(0, frame + 10);
 	memcpy(frame + 12, "kunt", 4);
-	put_unaligned_be16(320, frame + 16);
-	put_unaligned_be16(240, frame + 18);
+	put_unaligned_be16(width, frame + 16);
+	put_unaligned_be16(height, frame + 18);
 	frame[20] = 2 << 6 | (interlaced ? 1 << 2 : 0);
 	frame[22] = 1;
 	frame[23] = 1;
@@ -599,6 +601,11 @@ static u8 *apr_test_bitstream(struct kunit *test, bool interlaced, size_t *bytes
 	}
 	*bytes = frame_size;
 	return frame;
+}
+
+static u8 *apr_test_bitstream(struct kunit *test, bool interlaced, size_t *bytes)
+{
+	return apr_test_bitstream_size(test, 320, 240, interlaced, bytes);
 }
 
 static void apr_test_parse_frame(struct kunit *test)
@@ -638,6 +645,33 @@ static void apr_test_parse_interlaced(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, info.slices[1], 24U);
 	KUNIT_EXPECT_EQ(test, info.picture_offset[1],
 			info.picture_offset[0] + info.picture_size[0]);
+}
+
+/* 1080p has 1020 slices: the table is read in several blocks. */
+static void apr_test_parse_many_slices(struct kunit *test)
+{
+	struct apr_prores_info info;
+	size_t bytes;
+	u8 *frame = apr_test_bitstream_size(test, 1920, 1080, false, &bytes);
+	u8 *table;
+
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.slices[0], 1020U);
+	table = frame + 28 + 8;
+	/* A bad size in the last, partial block is still found. */
+	put_unaligned_be16(5, table + 2 * 1019);
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), -EINVAL);
+	put_unaligned_be16(6, table + 2 * 1019);
+	/* So is one just past the first block. */
+	put_unaligned_be16(0, table + 2 * 128);
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), -EINVAL);
+	put_unaligned_be16(6, table + 2 * 128);
+	/* And slices that together overrun the picture. */
+	put_unaligned_be16(7, table + 2 * 500);
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), -EINVAL);
+	put_unaligned_be16(6, table + 2 * 500);
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
 }
 
 static void apr_test_ring_accounting(struct kunit *test)
@@ -686,6 +720,7 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_decode_desc),
 	KUNIT_CASE(apr_test_parse_frame),
 	KUNIT_CASE(apr_test_parse_interlaced),
+	KUNIT_CASE(apr_test_parse_many_slices),
 	KUNIT_CASE(apr_test_ring_accounting),
 	{}
 };

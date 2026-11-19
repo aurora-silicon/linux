@@ -555,6 +555,9 @@ int apr_build_decode_desc(const struct apr_decode_frame *f, u8 *desc)
 }
 EXPORT_SYMBOL_IF_KUNIT(apr_build_decode_desc);
 
+/* Slice-size entries copied per block; 256 bytes of stack. */
+#define APR_SLICE_CHUNK		128
+
 static int apr_parse_picture(const u8 *data, u32 bytes, u32 width,
 			     u32 height, bool interlaced, u32 max_slices,
 			     u32 *picture_size, u32 *slices)
@@ -577,11 +580,22 @@ static int apr_parse_picture(const u8 *data, u32 bytes, u32 width,
 	    check_add_overflow(header, table_bytes, &min_size) ||
 	    min_size > size)
 		return -EINVAL;
-	for (i = 0; i < *slices; i++) {
-		u32 slice = get_unaligned_be16(data + header + 2 * i);
+	/*
+	 * The decoder's source buffers are mapped uncached, where each load is
+	 * a fabric round trip: copy the table in blocks, then walk the copy.
+	 */
+	for (i = 0; i < *slices; i += APR_SLICE_CHUNK) {
+		__be16 chunk[APR_SLICE_CHUNK];
+		u32 n = min(*slices - i, (u32)APR_SLICE_CHUNK), j;
 
-		if (slice < 6 || check_add_overflow(data_bytes, slice, &data_bytes))
-			return -EINVAL;
+		memcpy(chunk, data + header + 2 * i, 2 * n);
+		for (j = 0; j < n; j++) {
+			u32 slice = be16_to_cpu(chunk[j]);
+
+			if (slice < 6 ||
+			    check_add_overflow(data_bytes, slice, &data_bytes))
+				return -EINVAL;
+		}
 	}
 	if (data_bytes > size - min_size)
 		return -EINVAL;
