@@ -618,6 +618,8 @@ struct apple_sleep_ops {
 	int (*check)(struct apple_sleep *s);
 	/* Optional traffic strictly after timer, before AIC/release/DEEP. */
 	void (*post_timer)(struct apple_sleep *s);
+	/* Optional: every coprocessor has stopped and the debug link is still up. */
+	void (*stopped)(struct apple_sleep *s);
 	/* The dry run's list: does macOS have this ps word off at its commit? */
 	bool (*macos_off_at_commit)(u32 offset);
 };
@@ -661,6 +663,10 @@ struct apple_sleep_soc {
 	bool early_context;
 	/* The SoC's operations arm and read its wake sources: none of the common wake words */
 	bool own_wake;
+	/* WD2 is not this SoC's measured sleep safety net. */
+	bool no_wd2;
+	/* Keep the debug link until the coprocessors have stopped. */
+	bool debug_cut_after_stops;
 	bool strict_gate_inventory;
 	/*
 	 * No PMP runs and its report is disabled: the PTD entries the commit drops have no
@@ -768,6 +774,12 @@ struct apple_sleep_soc {
 	unsigned int nwake_names;
 	/* The sources in the wake block's last word */
 	u32 wake_last_word;
+	/*
+	 * Sources the tree's apple,wake-enable must name, or the sleep is refused: the ones a
+	 * timed wake arrives on, so a sleep can't be entered that only a person can end.
+	 */
+	const u32 *wake_required;
+	unsigned int nwake_required;
 	/* The encoders' system power words: their domains need the AVE complex up */
 	const u32 *ave_domains;
 	unsigned int nave_domains;
@@ -3201,6 +3213,24 @@ static void sleep_wake_masks(struct apple_sleep *s, u32 *val)
 		sleep_wake_unmask(s, val, s->wake_enable[i]);
 }
 
+/* Every source the SoC requires is among the tree's. A SoC that requires none admits any. */
+static bool apple_sleep_wake_admitted(const struct apple_sleep_soc *soc, const u32 *enabled,
+				      int count)
+{
+	unsigned int i;
+	int j;
+
+	for (i = 0; i < soc->nwake_required; i++) {
+		for (j = 0; j < count; j++)
+			if (enabled[j] == soc->wake_required[i])
+				break;
+		if (j >= count)
+			return false;
+	}
+
+	return true;
+}
+
 /* The last checks, then the stray words lowered: what has stopped may not return until a wake. */
 static int apple_sleep_refuse(struct apple_sleep *s)
 {
@@ -3242,6 +3272,10 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 	 */
 	if (!s->soc->own_wake && !s->wake_enable_count) {
 		dev_err(s->dev, "refused: no wake source enabled in the device tree\n");
+		refused = true;
+	}
+	if (!apple_sleep_wake_admitted(s->soc, s->wake_enable, s->wake_enable_count)) {
+		dev_err(s->dev, "refused: the device tree doesn't enable the timed wake's source\n");
 		refused = true;
 	}
 
@@ -3596,7 +3630,8 @@ static int sleep_hpm_sleep(struct apple_sleep *s)
  */
 static int sleep_hpm_wait_contract(struct apple_sleep *s, int *gone_ms)
 {
-	ktime_t start = ktime_get();
+	/* The raw counter: the late cut runs with timekeeping suspended. */
+	u64 start = read_sysreg(cntvct_el0), hz = arch_timer_get_cntfrq();
 	bool wake = true, up;
 	u32 val = 0;
 	int ms, ret;
@@ -3609,7 +3644,7 @@ static int sleep_hpm_wait_contract(struct apple_sleep *s, int *gone_ms)
 	*gone_ms = -1;
 	mdelay(HPM_RESET_FIRST_MS);
 	for (;;) {
-		ms = ktime_ms_delta(ktime_get(), start);
+		ms = div64_u64((read_sysreg(cntvct_el0) - start) * 1000, hz);
 		if (ms >= HPM_CONTRACT_MS)
 			return -ETIMEDOUT;
 		ret = wake ? sleep_hpm_cmd(s, SPMI_OP_WAKEUP, 0, NULL, NULL) : 0;
@@ -3631,7 +3666,7 @@ static int sleep_hpm_wait_contract(struct apple_sleep *s, int *gone_ms)
 /* A live debug link holds the debug switch domain on. */
 static bool sleep_debug_link_up(struct apple_sleep *s)
 {
-	return s->hpm_spmi &&
+	return s->hpm_spmi && s->ps_aon &&
 	       FIELD_GET(PS_ACTUAL, readl(s->ps_aon + s->soc->ps_aon_debug_switch));
 }
 
@@ -3655,7 +3690,9 @@ static bool apple_sleep_usb_down(struct apple_sleep *s)
 	if (!sleep_debug_link_up(s))
 		return false;
 
-	dev_info(s->dev, "debug link: cutting it for the sleep\n");
+	/* The late cut prints nothing after it: the console is the link. */
+	dev_info(s->dev, "debug link: cutting it for the sleep%s\n",
+		 s->soc->debug_cut_after_stops ? ", after the coprocessor stops" : "");
 	enable = readl(s->hpm_spmi + SPMI_NOTIFY_ENABLE);
 	writel(enable & ~SPMI_NOTIFY_REPLY, s->hpm_spmi + SPMI_NOTIFY_ENABLE);
 	/* A reset that the partner doesn't come back from is done again. */
@@ -3670,11 +3707,13 @@ static bool apple_sleep_usb_down(struct apple_sleep *s)
 		WRITE_ONCE(sleep_debug_link_cut, true);
 		ms = sleep_hpm_wait_contract(s, &gone);
 		if (ms >= 0) {
-			dev_info(s->dev, "debug link: contract back %d ms after reset %d (gone at %d ms)\n",
-				 ms, i, gone);
+			if (!s->soc->debug_cut_after_stops)
+				dev_info(s->dev, "debug link: contract back %d ms after reset %d (gone at %d ms)\n",
+					 ms, i, gone);
 			break;
 		}
-		dev_warn(s->dev, "debug link: no contract with the partner after reset %d\n", i);
+		if (!s->soc->debug_cut_after_stops)
+			dev_warn(s->dev, "debug link: no contract with the partner after reset %d\n", i);
 	}
 	if (!ret)
 		ret = sleep_hpm_sleep(s);
@@ -3687,7 +3726,12 @@ static bool apple_sleep_usb_down(struct apple_sleep *s)
 
 bool apple_sleep_debug_link_cut(void)
 {
-	return apple_sleep ? apple_sleep_usb_down(apple_sleep) : false;
+	struct apple_sleep *s = apple_sleep;
+
+	/* The entry cuts it itself, after its stops. */
+	if (!s || s->soc->debug_cut_after_stops)
+		return false;
+	return apple_sleep_usb_down(s);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut);
 
@@ -3695,7 +3739,7 @@ bool apple_sleep_debug_link_up(void)
 {
 	struct apple_sleep *s = apple_sleep;
 
-	return s && !s->usb_down_ran && sleep_debug_link_up(s);
+	return s && !s->soc->debug_cut_after_stops && !s->usb_down_ran && sleep_debug_link_up(s);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_debug_link_up);
 
@@ -5026,8 +5070,8 @@ static void apple_sleep_match(struct apple_sleep *s)
 			continue;
 		/* Measured at the commit with AUTO_ENABLE clear, unlike after a wake. */
 		if (sleep_ps_raise_start(s, offset))
-			failed++;
-		raised++;
+			(*failed)++;
+		(*raised)++;
 	}
 	for (i = 0; i < soc->ps_macos_off.count; i++) {
 		u32 offset = soc->ps_macos_off.offset[i];
@@ -5939,6 +5983,8 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 		if (ret)
 			panic("Apple committed SMC notice failed after peer stop: %d", ret);
 	}
+	if (s->soc->ops->stopped)
+		s->soc->ops->stopped(s);
 	if (!s->soc->regions)
 		apple_sleep_usb_down(s);
 	s->deep_once = READ_ONCE(sleep_deep_requested);
@@ -6386,7 +6432,8 @@ static int apple_sleep_begin(suspend_state_t state)
 		apple_sleep->smc_woke_alone = false;
 		sleep_pins_save(apple_sleep);
 	}
-	apple_sleep_set_wd2(apple_sleep, WDT_SUSPEND_SECS);
+	if (!apple_sleep->soc->no_wd2)
+		apple_sleep_set_wd2(apple_sleep, WDT_SUSPEND_SECS);
 	pm_set_suspend_via_firmware();
 	sleep_ans_late_open();
 
@@ -6400,7 +6447,7 @@ static void apple_sleep_end(void)
 	sleep_v27_scope_end();
 	if (pm_suspend_via_firmware() && apple_sleep->soc->ops->finish)
 		apple_sleep->soc->ops->finish(apple_sleep);
-	if (pm_suspend_via_firmware())
+	if (pm_suspend_via_firmware() && !apple_sleep->soc->no_wd2)
 		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
 }
 
@@ -9534,6 +9581,10 @@ static const struct apple_sleep_soc t8142_sleep_soc = {
 	.wake_last_word = GENMASK(11, 0),
 };
 
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
+#include "sleep-t8122.h"
+#endif
+
 /*
  * Qualified profiles expose system sleep. Inventory-only profiles match for a
  * precise refusal and cannot reach hardware preparation or suspend_set_ops().
@@ -9545,6 +9596,9 @@ static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8142-sleep", .data = &t8142_sleep_soc },
 	{ .compatible = "apple,t6050-sleep", .data = &t6050_sleep_soc },
 	{ .compatible = "apple,t6050-j716c-sleep", .data = &t6050_j716c_sleep_soc },
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
+	{ .compatible = "apple,t8122-sleep", .data = &t8122_sleep_soc },
+#endif
 	{ }
 };
 
