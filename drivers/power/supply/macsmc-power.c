@@ -1157,6 +1157,14 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		 * J700 it does not follow that layout (it decodes to 2082) and
 		 * macOS reports no manufacture date for the battery: leave the
 		 * date out there rather than report a wrong one.
+		 *
+		 * This is the battery's data format, not a driver policy. On
+		 * the J700 BMDT still reads as six ASCII digits, the same form
+		 * as on other Macs, so the value does not tell the layouts
+		 * apart, and no difference in the key's reported type or size
+		 * has been recorded: the J700 stays matched by machine. If the
+		 * SMC key inventory (hwmon debugfs "keys") shows BMDT with a
+		 * different type or size there, key it on that instead.
 		 */
 		if (!of_machine_is_compatible("apple,j700")) {
 			props[nprops++] = POWER_SUPPLY_PROP_MANUFACTURE_YEAR;
