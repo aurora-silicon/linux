@@ -48,7 +48,7 @@ pub(crate) const PROBE: Config = Config {
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
     firmware: crate::g17::fw::variant::Firmware::Fixed(&crate::g17::fw::variant::V26A428_M5),
-    light_effort: None,
+    light_effort: Some(crate::g17::power::LIGHT_DEFAULT),
     core_layout: CoreLayout {
         cores: None,
         alternate_core_masks: None,
