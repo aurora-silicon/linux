@@ -1840,6 +1840,31 @@ static void dockchannel_hid_remove(struct platform_device *pdev)
 	}
 }
 
+/* The feature report each interface's node gives for a firmware-driven sleep, if any. */
+static void dchid_send_sleep_reports(struct dockchannel_hid *dchid)
+{
+	int i, len, ret;
+
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+		const void *prop;
+		void *report;
+
+		if (!iface || !iface->of_node)
+			continue;
+		prop = of_get_property(iface->of_node, "apple,sleep-report", &len);
+		if (!prop || len <= 0)
+			continue;
+		report = kmemdup(prop, len, GFP_KERNEL);
+		if (!report)
+			continue;
+		ret = dchid_cmd(iface, HID_FEATURE_REPORT, REQ_SET_REPORT, report, len, NULL, 0);
+		kfree(report);
+		if (ret < 0)
+			dev_warn(dchid->dev, "%s: sleep report not sent: %d\n", iface->name, ret);
+	}
+}
+
 /*
  * The coprocessor keeps running across suspend-to-idle, and its RTKit session
  * and the trackpad AFE power sequence are not restartable. Mark the sleep
@@ -1865,6 +1890,7 @@ static int dockchannel_hid_suspend(struct device *dev)
 			goto unwind;
 	}
 	if (pm_suspend_via_firmware()) {
+		dchid_send_sleep_reports(dchid);
 		/* A firmware that doesn't answer isn't a reason to stay awake. */
 		ret = dchid_host_state(dchid, HOST_STATE_SLEEP);
 		if (ret)

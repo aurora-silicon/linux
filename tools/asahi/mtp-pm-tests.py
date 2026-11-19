@@ -58,6 +58,8 @@ static void *dev_get_drvdata(struct device *d) { return d->data; }
 /* Not a firmware-driven suspend: the host state is never set here. */
 static bool pm_suspend_via_firmware(void) { return false; }
 static int dchid_host_state(struct dockchannel_hid *d, int state) { (void)d; (void)state; assert(0); return 0; }
+/* Sent only with the host state, in a firmware-driven suspend. */
+static void dchid_send_sleep_reports(struct dockchannel_hid *d) { (void)d; assert(0); }
 static void *hid_get_drvdata(struct hid_device *d) { return d->data; }
 static void magicmouse_force_key(struct magicmouse_sc *m, bool down) {
     assert(!down); key_releases++;

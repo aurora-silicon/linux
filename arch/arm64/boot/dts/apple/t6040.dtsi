@@ -102,11 +102,13 @@
 			opp-hz = /bits/ 64 <4416000000>;
 			opp-level = <18>;
 			opp-microwatt = <8274900>;
+			turbo-mode;
 		};
 		opp19 {
 			opp-hz = /bits/ 64 <4512000000>;
 			opp-level = <19>;
 			opp-microwatt = <9256900>;
+			turbo-mode;
 		};
 	};
 
@@ -203,11 +205,13 @@
 			opp-hz = /bits/ 64 <4416000000>;
 			opp-level = <18>;
 			opp-microwatt = <8075300>;
+			turbo-mode;
 		};
 		opp19 {
 			opp-hz = /bits/ 64 <4512000000>;
 			opp-level = <19>;
 			opp-microwatt = <8949200>;
+			turbo-mode;
 		};
 	};
 

@@ -1212,6 +1212,8 @@ struct Shared {
     sleeping: AtomicBool,
     /// A sleep holds preparations closed, so a recovery settling meanwhile doesn't reopen them.
     sleep_gate: AtomicBool,
+    /// Deadline to reopen an uncommitted sleep after a late preparation drain; zero otherwise.
+    sleep_cancel_deadline: AtomicU64,
     /// The power state word as it was before the firmware stopped.
     sleep_ps: AtomicU32,
     /// The stop the sleep's commit makes, from `.prepare` to `.complete`; null otherwise.
@@ -1361,6 +1363,7 @@ impl WorkItem<POLL_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
         if this.sleeping() {
+            this.sleep_cancel_poll();
             return;
         }
         let result = {
@@ -1509,8 +1512,12 @@ impl Shared {
     }
 
     fn queue_poll(self: &Arc<Self>) {
+        self.queue_poll_after(1);
+    }
+
+    fn queue_poll_after(self: &Arc<Self>, delay_ms: u32) {
         let _ = workqueue::system_highpri()
-            .enqueue_delayed::<Arc<Self>, POLL_WORK>(self.clone(), msecs_to_jiffies(1));
+            .enqueue_delayed::<Arc<Self>, POLL_WORK>(self.clone(), msecs_to_jiffies(delay_ms));
     }
 
     fn queue_governor(self: &Arc<Self>) {
@@ -1766,6 +1773,7 @@ impl Gpu {
                 crashed: AtomicBool::new(false),
                 sleeping: AtomicBool::new(false),
                 sleep_gate: AtomicBool::new(false),
+                sleep_cancel_deadline: AtomicU64::new(0),
                 sleep_ps: AtomicU32::new(0),
                 sleep_commit: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 feed,
@@ -2088,7 +2096,7 @@ impl Gpu {
                     Some(shared.queues.clone()),
                     Some(shared.renders.clone()),
                 ),
-                pool: object::Pool::new()?,
+                pool: object::Pool::new(shared.variant.objects_after_release)?,
                 render_rings: kick::RenderRings::new()?,
                 render_ids: freelist::RenderIds::new()?,
                 init: initdata::InitData::new(),
@@ -2292,7 +2300,7 @@ impl Gpu {
                     Some(shared.queues.clone()),
                     Some(shared.renders.clone()),
                 ),
-                pool: object::Pool::new()?,
+                pool: object::Pool::new(shared.variant.objects_after_release)?,
                 render_rings: kick::RenderRings::new()?,
                 render_ids: freelist::RenderIds::new()?,
                 init: initdata::InitData::new(),
@@ -2504,6 +2512,10 @@ impl gpu::Gpu for Gpu {
         }
         if variant.few_primitives {
             params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES);
+        }
+        // Only the A18 Pro heap sizes itself for it; other command sets accept the hint too.
+        if !variant.m5_commands {
+            params.features |= crate::file::DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT;
         }
         // The M5 command set reports it with M5_FEATURES.
         if !variant.m5_commands && variant.render_stage_prefixes {

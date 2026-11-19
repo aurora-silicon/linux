@@ -113,7 +113,7 @@ def modes(root):
         blobs.append('static const unsigned char b%u[]={%s};' %
                      (i, ','.join(map(str, raw))))
         check = (f'{{ struct dcp_parse_ctx c; unsigned n=99; '
-                 f'assert(!parse(b{i},sizeof(b{i}),&c)); c.zero_vrr_range_fallback={int(desktop)}; '
+                 f'assert(!parse(b{i},sizeof(b{i}),&c)); c.zero_vrr_range_fallback={int(desktop)}; c.internal_present_deadline={int(desktop)}; '
                  'struct dcp_display_mode *m=enumerate_modes(&c,&n,355,230,0,true,false); '
                  f'assert(!IS_ERR(m) && n=={len(expected)});')
         for j, hz in enumerate(expected):
@@ -122,8 +122,11 @@ def modes(root):
                       f'assert(m[{j}].mode.htotal==2200 && m[{j}].mode.vtotal==1125); '
                       f'assert(m[{j}].mode.flags==(DRM_MODE_FLAG_PHSYNC|DRM_MODE_FLAG_PVSYNC)); ')
         for j, hz in enumerate(expected):
-            if hz >= 119.88:
+            # A desktop internal panel takes the deadline at every timing.
+            if desktop or hz >= 119.88:
                 check += f'assert(m[{j}].needs_timestamps); '
+            elif not (ranges and ranges[j][0]):
+                check += f'assert(!m[{j}].needs_timestamps); '
         if ranges:
             for j, (lo, hi) in enumerate(ranges):
                 check += f'assert(m[{j}].vrr=={int(bool(lo))}); '
@@ -190,6 +193,12 @@ int main(void) {
     assert(dcp_desktop_present_deadline(true,true)==120);
     assert(dcp_desktop_present_deadline(true,false)==0);
     assert(dcp_desktop_present_deadline(false,true)==0);
+    assert(dcp_refresh_needs_deadline(48U<<16,false,true,true));
+    assert(dcp_refresh_needs_deadline(60U<<16,false,true,true));
+    assert(!dcp_refresh_needs_deadline(48U<<16,false,true,false));
+    assert(!dcp_refresh_needs_deadline(60U<<16,false,false,true));
+    assert(dcp_refresh_needs_deadline(120U<<16,false,true,false));
+    assert(dcp_refresh_needs_deadline(48U<<16,true,false,false));
     return 0;
 }
 '''

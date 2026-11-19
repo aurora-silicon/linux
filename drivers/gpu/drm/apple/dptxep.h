@@ -40,6 +40,8 @@ enum dptx_apcall {
 #define DCPDPTX_REMOTE_PORT_DIE GENMASK(11, 8)
 #define DCPDPTX_REMOTE_PORT_CONNECTED BIT(15)
 #define DCPDPTX_REMOTE_PORT_SUPPORTS_HPD BIT(8)
+/* Connection attributes of a T6050 tunnel: the DP IN it starts at, 1..4 */
+#define DCPDPTX_REMOTE_PORT_DPIN GENMASK(15, 13)
 
 enum dptx_link_rate {
 	LINK_RATE_RBR = 0x06,
@@ -66,6 +68,7 @@ struct dptx_port {
 	struct phy *atcphy;
 	struct mux_control *mux;
 	u32 lane_count;
+	u32 native26_max_lanes;
 	u32 link_rate, pending_link_rate;
 	u32 drive_settings[2];
 	u32 trained_voltage[4], trained_pre[4];
@@ -100,5 +103,6 @@ int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 int dptxport_sink_irq(struct apple_epic_service *service);
 
 struct apple_dcp;
+bool dptx_native_controllers_ready(struct apple_dcp *dcp);
 int dpav_ctrl_init(struct apple_dcp *dcp);
 #endif

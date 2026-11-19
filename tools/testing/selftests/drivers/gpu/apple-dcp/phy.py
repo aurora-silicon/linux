@@ -37,12 +37,12 @@ struct apple_atcphy {
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
-    struct { void *usb3_dp; } tunables;
+    struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
     /* A sleep took the USB host's domains down; never set here. */
     bool sleep_dead;
 
     const struct atcphy_hw *hw;
-    struct { unsigned char *core, *lpdptx, *pipehandler, *usb2phy; } regs;
+    struct { unsigned char *core, *lpdptx, *lioa, *pipehandler, *usb2phy; } regs;
     struct reset_controller_dev rcdev;
     void *dev;
     int lock, dp_link_rate;
@@ -135,6 +135,10 @@ static void clear32(void *p, u32 v) { mask32(p, v, 0); }
 #define readl_poll_timeout readl_poll_timeout_atomic
 /* Observation is read-only and separately tested; retain production caller control flow. */
 static void atcphy_usb2_power_on(struct apple_atcphy *p) { (void)p; usb2_on++; }
+/* Calibration writes are leaves; the profile test checks their dispatch. */
+static unsigned int dp_bank_writes;
+static void apple_tunable_apply(void *base, void *tunable)
+{ (void)base; (void)tunable; dp_bank_writes++; }
 static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode mode)
 { (void)p; (void)mode; }
 static void atc_tunnel_stop_t8103(struct apple_atcphy *p) { (void)p; }
@@ -1237,13 +1241,15 @@ static void post_tunable_profiles(void)
     for (unsigned int m=0; m<ARRAY_SIZE(modes); m++) {
         struct apple_atcphy p;
         legacy_setup(&p,gen,false);
-        unsigned int before=polls, rcal=0;
+        unsigned int before=polls, rcal=0, banks=dp_bank_writes;
         assert(atcphy_configure(&p,modes[m])==0);
+        assert(dp_bank_writes-banks ==
+               (p.hw->dp_banked_tunables && atcphy_modes[modes[m]].enable_dp_aux ? 2U : 0U));
         for (unsigned int i=before; i<polls; i++)
             rcal+=!strcmp(poll_caller[i],"atcphy_configure");
         bool usb3=atcphy_modes[modes[m]].pipehandler_state==ATCPHY_PIPEHANDLER_STATE_USB3;
         bool wake=gen>=1;
-        if(gen==1 && !usb3) assert(p.dp_t8122.aux && atc_t8122_dp_aux_is_on(p.regs.core));
+        if(p.hw->dp_t8122 && !usb3) assert(p.dp_t8122.aux && atc_t8122_dp_aux_is_on(p.regs.core));
         assert(rcal==wake);
         assert(!!(registers[AUS_COMMON_SHIM_BLK_BIAS_REG/4]&AUS_COMMON_SHIM_BLK_BIAS_REG_BGBIAS_OV)==wake);
         assert(!!(registers[ACIOPHY_SLEEP_CTRL/4]&ACIOPHY_SLEEP_CTRL_TX_CLAMP_OV)==(gen==0));
@@ -1933,7 +1939,7 @@ struct apple_atcphy {
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
-    struct { void *usb3_dp; } tunables;
+    struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
 
     bool dp_only, pd_was_off, tunnel_clock_on;
     unsigned int tunnel_rate, tunnel_users;
@@ -2333,13 +2339,13 @@ struct apple_atcphy {
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
-    struct { void *usb3_dp; } tunables;
+    struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
 
     bool dp_only, pd_was_off, tunnel_clock_on;
     unsigned int tunnel_rate, tunnel_users;
     struct { bool aux, pll; unsigned int pairs, rate; } dp_t8122;
     const struct atcphy_hw *hw;
-    struct { unsigned char *core, *lpdptx; } regs;
+    struct { unsigned char *core, *lpdptx, *lioa; } regs;
     void *dev;
     int lock, dp_link_rate;
     bool fixed_usb2, host_active, swap_lanes, ss_tunables, dp_tunables;
@@ -2394,6 +2400,9 @@ static void clear32(void *p, u32 v) { mask32(p, v, 0); }
        polls == fail_poll || !(condition) ? -ETIMEDOUT : 0; })
 #define readl_poll_timeout readl_poll_timeout_atomic
 static void atcphy_usb2_power_on(struct apple_atcphy *p) { (void)p; usb2_on++; }
+/* These ownership fixtures have no T8142 DP calibration banks. */
+static void apple_tunable_apply(void *base, void *tunable)
+{ (void)base; (void)tunable; assert(!"unexpected banked DP calibration"); }
 static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode mode)
 { (void)p; (void)mode; }
 static void atc_tunnel_stop_t8103(struct apple_atcphy *p) { (void)p; }
@@ -2655,7 +2664,7 @@ struct apple_atcphy {
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
-    struct { void *usb3_dp; } tunables;
+    struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
 
     bool dp_only, pd_was_off, tunnel_clock_on;
     unsigned int tunnel_rate, tunnel_users;

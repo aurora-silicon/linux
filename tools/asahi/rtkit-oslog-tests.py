@@ -37,6 +37,9 @@ typedef uint8_t u8; typedef uint64_t u64; typedef uint32_t u32;
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
 #define APPLE_RTKIT_MAX_ENDPOINTS 256
 #define WRITE_ONCE(x,v) ((x)=(v))
+/* As the shared Apple configuration builds it. */
+#define CONFIG_APPLE_SOC_SLEEP 1
+#define IS_ENABLED(option) (option)
 #define cmpxchg(p,o,n) __sync_val_compare_and_swap((p),(o),(n))
 #define spin_lock_irqsave(l,f) ((void)(l), (f)=0)
 #define spin_unlock_irqrestore(l,f) ((void)(l), (void)(f))
@@ -52,6 +55,8 @@ struct apple_rtkit {
  bool sync_syslog_ack, oslog_inherited, syslog_inherited, crashlog_inherited, crashed, shutting_down;
  bool oslog_echo;
  u64 oslog_owed;
+ /* Read only by the J714s firmware 27 sleep; a failed echo sets it. */
+ bool v27_rx_failed;
  int boot_result;
  unsigned iop_power_state, ap_power_state;
  unsigned long endpoints[4], started[4];
