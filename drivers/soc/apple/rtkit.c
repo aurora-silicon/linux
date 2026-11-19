@@ -1816,6 +1816,16 @@ bool apple_rtkit_m5_saved_unresolved(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_m5_saved_unresolved);
 
+/* A log word the ordinary handler answers with its echo and nothing else. */
+static bool apple_rtkit_log_word(struct apple_rtkit *rtk, u8 ep, u64 msg)
+{
+	if (ep == APPLE_RTKIT_EP_SYSLOG)
+		return apple_rtkit_notification_msg(ep, msg);
+	return ep == APPLE_RTKIT_EP_OSLOG &&
+	       FIELD_GET(APPLE_RTKIT_OSLOG_TYPE, msg) == APPLE_RTKIT_OSLOG_LOG &&
+	       apple_rtkit_oslog_echoed(rtk, msg);
+}
+
 int apple_rtkit_m5_saved_poll(struct apple_rtkit *rtk)
 {
 	struct apple_mbox_msg msg;
@@ -1839,6 +1849,10 @@ int apple_rtkit_m5_saved_poll(struct apple_rtkit *rtk)
 	if (msg.msg1 == rtk->m5_saved.endpoint &&
 	    rtk->ops->recv_message_early &&
 	    rtk->ops->recv_message_early(rtk->cookie, msg.msg1, msg.msg0))
+		return 1;
+	/* Echoed here, its record unread: the firmware takes no AP idle notice with one owed. */
+	if (apple_rtkit_log_word(rtk, msg.msg1, msg.msg0) &&
+	    !apple_mbox_send_nowait(rtk->mbox, msg))
 		return 1;
 	/* SMC notifications remain ordered for the ordinary notifier worker.
 	 * Every other packet is retained, and refuses this attempt. In
