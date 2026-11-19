@@ -117,10 +117,12 @@ class T6030SepTest(unittest.TestCase):
         self.assertEqual(self.prop(dtb, BUS, "status", "s"), ["disabled"])
         self.assertEqual(self.prop(dtb, SENSOR, "status", "s"), ["disabled"])
 
-    def test_profile_selected_only_on_j514s(self):
+    def test_profile_selected_by_soc(self):
+        # The SoC picks the profile; the board device tree decides whether
+        # the SEP and the sensor are enabled (see the J516s test above).
         select = PROFILE.split("fn select(", 1)[1]
         line = next(line for line in select.splitlines() if 'b"apple,t6030"' in line)
-        self.assertIn('b"apple,j514s"', line)
+        self.assertEqual(line.strip(), 'if has(b"apple,t6030") {')
         profile = re.search(r"const T6030: PlatformProfile = PlatformProfile \{(.*?)\n\};",
                             PROFILE, re.S).group(1)
         self.assertIn("..T8122", profile)
