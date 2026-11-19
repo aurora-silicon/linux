@@ -38,6 +38,16 @@ struct iomfb_m4_ext_fb {
 	void (*put)(void *key);
 };
 
+/*
+ * A cursor over the frame (the DRM cursor plane): its framebuffer as for
+ * direct scanout, ARGB8888 with pre-multiplied alpha, @fb.width x @fb.height
+ * from its first byte, at @x,@y wholly on the output. @fb.key NULL: none.
+ */
+struct iomfb_m4_ext_cursor {
+	struct iomfb_m4_ext_fb fb;
+	u32 x, y;
+};
+
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 
 /* Probe is inert; start adopts firmware after the common component is pinned. */
@@ -60,10 +70,11 @@ int iomfb_m4_ext_mode_ids(struct apple_dcp *dcp, const struct drm_display_mode *
 int iomfb_m4_ext_enable(struct apple_dcp *dcp, const struct iomfb_m4_ext_ids *ids,
 			u32 width, u32 height);
 int iomfb_m4_ext_present(struct apple_dcp *dcp, const struct iosys_map *src, u32 pitch,
-			 const struct drm_rect *damage);
+			 const struct drm_rect *damage, const struct iomfb_m4_ext_cursor *cursor);
 int iomfb_m4_ext_blank(struct apple_dcp *dcp);
 /* 0 once submitted, its flip later (t8132_ext_drm_flip_done()); 1: its flip now. */
-int iomfb_m4_ext_present_direct(struct apple_dcp *dcp, const struct iomfb_m4_ext_fb *fb);
+int iomfb_m4_ext_present_direct(struct apple_dcp *dcp, const struct iomfb_m4_ext_fb *fb,
+				const struct iomfb_m4_ext_cursor *cursor);
 /* Why an external DCP's display refuses system sleep, or NULL. */
 const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *dcp);
 /* An external output through a system sleep. */
@@ -125,14 +136,16 @@ static inline int iomfb_m4_ext_enable(struct apple_dcp *dcp, const struct iomfb_
 }
 
 static inline int iomfb_m4_ext_present(struct apple_dcp *dcp, const struct iosys_map *src,
-				       u32 pitch, const struct drm_rect *damage)
+				       u32 pitch, const struct drm_rect *damage,
+				       const struct iomfb_m4_ext_cursor *cursor)
 {
 	return -ENODEV;
 }
 
 static inline int iomfb_m4_ext_blank(struct apple_dcp *dcp) { return -ENODEV; }
 static inline int iomfb_m4_ext_present_direct(struct apple_dcp *dcp,
-					      const struct iomfb_m4_ext_fb *fb)
+					      const struct iomfb_m4_ext_fb *fb,
+					      const struct iomfb_m4_ext_cursor *cursor)
 {
 	return -ENODEV;
 }

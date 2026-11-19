@@ -29,6 +29,8 @@ struct dcp_m4_frame {
 	u32 height;
 	u32 stride;
 	enum dcp_m4_frame_format format;
+	/* ARGB8888 blended pre-multiplied rather than by coverage */
+	bool premultiplied;
 };
 
 static inline int dcp_m4_frame_check(const struct dcp_m4_frame *frame)
@@ -97,7 +99,8 @@ static inline void dcp_m4_surface_encode(u8 *surface, const struct dcp_m4_frame 
 	u32 size = frame->stride * frame->height;
 
 	memset(surface, 0, DCP_M4_SURFACE_SIZE);
-	surface[2] = frame->format == DCP_M4_XRGB8888;
+	/* is_premultiplied: an opaque XRGB8888 frame is blended as one too. */
+	surface[2] = frame->format == DCP_M4_XRGB8888 || frame->premultiplied;
 	put_unaligned_le32(1, surface + 3);
 	put_unaligned_le32(1, surface + 7);
 	put_unaligned_le32(0x42475241, surface + 0x0b);
@@ -255,6 +258,10 @@ static inline int dcp_m4_swap_encode_on(void *output, size_t length, u32 swap_id
 		put_unaligned_le32(f->width, data + 0x10c + 16 * i + 8);
 		put_unaligned_le32(f->height, data + 0x10c + 16 * i + 12);
 		dcp_m4_surface_encode(data + dcp_m4_pf->swap_surface + DCP_M4_SURFACE_SIZE * i, f);
+		/* The surface's own ID is the one the swap names it by. */
+		if (upper->id)
+			put_unaligned_le32(upper->id, data + dcp_m4_pf->swap_surface +
+					   DCP_M4_SURFACE_SIZE * i + 0x35);
 		put_unaligned_le64(f->dva, data + dcp_m4_pf->swap_dva + 8 * i);
 		data[dcp_m4_pf->swap_nullable + i] = 0;
 	}
