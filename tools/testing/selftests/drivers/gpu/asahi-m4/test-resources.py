@@ -176,6 +176,20 @@ pub mod g16 {
         Arenas{compute:g16::resources::ComputeArena{compute},render:g16::resources::RenderArena{passes,tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};2],tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};2]}}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&c).unwrap();s.retire(&mut c).unwrap();}
+    #[test]fn extra_pass_slots_use_their_own_windows(){
+        let mut o=Objects::new();
+        for (k,window) in [(0u64,0x7020000000u64),(1,0x7030000000),(2,0x70b0000000),(3,0x70d0000000)]{
+            let p=g16::slots::PassSlot::new(&mut o,k,1).unwrap();
+            assert_eq!(p.fs_work.lower_gva.map(|v|v&!0x3fff),Some(window));
+            assert_eq!(p.tpc.gva,Some(window+0x4000000));
+            assert_eq!(p.tilemap.gva,Some(window+0x6000000));
+            assert_eq!(p.aux.gva,Some(window+0x160000));
+            assert_eq!(g16::hw::client::render_base(k),if k<2{0x7010000000+k*0x8000000}else{window+0x8000000});
+        }
+        assert!(g16::slots::PassSlot::new(&mut o,4,1).is_err());
+        assert!(PoolSet::new(&mut o,1).is_err());assert!(PoolSet::new(&mut o,5).is_err());
+        assert!(PoolSet::new(&mut o,4).is_ok());
+    }
     #[test]fn shared_compute_pool_rows_are_disjoint(){
         let mut o=Objects::new();
         let rows=g16::slots::SHARED_POOL_ROWS.clone();
@@ -241,7 +255,7 @@ pub mod g16 {
     }
     #[test]fn production_allocations_are_aligned_disjoint_and_in_mesa_hole(){
         let mut o=Objects::new();let slots=Slots::new().unwrap();let arena=arenas(&mut o);
-        let pools=PoolSet::new(&mut o).unwrap();
+        let pools=PoolSet::new(&mut o,2).unwrap();
         let mut aliases=Vec::new();
         for a in &o.objects{if let Some(g)=a.gva{assert_eq!(a.client_leaf,Some(__PRIVATE_RW__),"private GPU alias must match qualified J713 NC RW PTE");let base=g-a.offset as u64;assert_eq!(base&0x3fff,0);assert_eq!(a.mapped&0x3fff,0);assert!(base>=0x7000000000);assert!(base+a.mapped as u64<=0x7100000000);aliases.push((base,base+a.mapped as u64));}}
         aliases.push((0x1000000000,0x1000010000)); // Per-VM context store.
@@ -286,7 +300,7 @@ pub mod g16 {
         }
     }
     #[test]fn allocator_metadata_is_firmware_only_and_shared_state_keeps_real_backing(){
-        let mut o=Objects::new();let pools=PoolSet::new(&mut o).unwrap();
+        let mut o=Objects::new();let pools=PoolSet::new(&mut o,2).unwrap();
         let read64=|obj:&g16::object::FwObject,at:usize|->u64{obj.r32(at).unwrap()as u64|((obj.r32(at+4).unwrap()as u64)<<32)};
         for k in 0..2 {
             let refs=pools.allocator_refs_for(k).unwrap();
@@ -340,7 +354,7 @@ pub mod g16 {
         s.publish(&c).unwrap();s.quarantine(&mut c);assert!(s.compute_exhausted());
     }
     #[test]fn production_render_descriptors_preserve_firmware_bytes_and_exact_counter(){
-        let mut o=Objects::new();let mut pools=PoolSet::new(&mut o).unwrap();
+        let mut o=Objects::new();let mut pools=PoolSet::new(&mut o,2).unwrap();
         let a=pools.prepare(0,1).unwrap();assert!(a.init_buffer);assert_eq!(a.uma_submitted,2);
         assert!(!pools.retired(0).unwrap());pools.publish(0,2).unwrap();
         assert!(pools.publish(0,2).is_err());assert!(pools.prepare(0,2).is_err());

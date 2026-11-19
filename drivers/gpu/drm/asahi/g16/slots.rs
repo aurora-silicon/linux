@@ -178,7 +178,10 @@ impl PassSlot {
     /// Allocates pass slot `i`'s objects, with their client leaf classes.
     pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32) -> Result<Self> {
         let sh = Class::Shared;
-        let (ps, ws) = (i * client::PASS_STRIDE, i * client::WORK_STRIDE);
+        if i as usize >= sizes::RENDER_SLOTS {
+            return Err(EINVAL);
+        }
+        let va = |pass0: u64| client::pass_va(i, pass0);
         let tpc = if i != 0 {
             client::TPC_SLOT_SIZE
         } else {
@@ -195,28 +198,28 @@ impl PassSlot {
             o,
             0x20000,
             sh,
-            Client::nc(client::AUX + i * client::AUX_STRIDE),
+            Client::nc(va(client::AUX)),
             0,
             false,
         )?;
         let mut pre = KVec::with_capacity(3, GFP_KERNEL)?;
         pre.push(
-            alloc(o, 0x4000, sh, Client::nc(client::PRE0_PAGE + ps), 0, false)?,
+            alloc(o, 0x4000, sh, Client::nc(va(client::PRE0_PAGE)), 0, false)?,
             GFP_KERNEL,
         )?;
         pre.push(
-            alloc(o, 0x4000, sh, Client::nc(client::PRE1_PAGE + ps), 0, false)?,
+            alloc(o, 0x4000, sh, Client::nc(va(client::PRE1_PAGE)), 0, false)?,
             GFP_KERNEL,
         )?;
         pre.push(
-            alloc(o, 0x4000, sh, Client::nc(client::PRE2_PAGE + ps), 0, false)?,
+            alloc(o, 0x4000, sh, Client::nc(va(client::PRE2_PAGE)), 0, false)?,
             GFP_KERNEL,
         )?;
         let tpc = alloc(
             o,
             tpc as usize,
             sh,
-            Client::nc(client::TPC + i * client::TPC_SLOT_STRIDE),
+            Client::nc(va(client::TPC)),
             0,
             false,
         )?;
@@ -224,7 +227,7 @@ impl PassSlot {
             o,
             tilemap as usize,
             sh,
-            Client::nc(client::TILEMAP + i * client::TPC_SLOT_STRIDE),
+            Client::nc(va(client::TILEMAP)),
             0,
             false,
         )?;
@@ -232,7 +235,7 @@ impl PassSlot {
             o,
             0x4000,
             sh,
-            Client::nc(client::HEAP_META_PAGE + ps),
+            Client::nc(va(client::HEAP_META_PAGE)),
             0,
             false,
         )?;
@@ -240,7 +243,7 @@ impl PassSlot {
             o,
             0x10000,
             sh,
-            Client::nc(client::SCENE_USER + ps),
+            Client::nc(va(client::SCENE_USER)),
             0,
             false,
         )?;
@@ -248,20 +251,20 @@ impl PassSlot {
             o,
             0x10000,
             sh,
-            Client::nc(client::FS_SCRATCH + ps),
+            Client::nc(va(client::FS_SCRATCH)),
             0,
             false,
         )?;
         let fs_work = alloc_work(
             o,
             fs::WORK_SIZE,
-            client::FS_WORK_PAGE + ws,
+            va(client::FS_WORK_PAGE),
             client::FS_WORK_OFF as usize,
         )?;
         let ta_work = alloc_work(
             o,
             ta::WORK_SIZE,
-            client::TA_WORK_PAGE + ws,
+            va(client::TA_WORK_PAGE),
             client::TA_WORK_OFF as usize,
         )?;
         Ok(Self {
@@ -425,15 +428,15 @@ pub(crate) struct Slots {
     /// The compute owners, on the heap: `Firmware` (and so `Slots`) is built on the probe's
     /// stack, which has no room for it.
     compute: KBox<ComputeOwners>,
-    pass_lifetime: Lifetime<2>,
+    pass_lifetime: Lifetime<{ sizes::RENDER_SLOTS }>,
     // Last-owner leases remain bound through retirement and displacement. Replaced only
     // when the displaced unit is safely rebound to a new publication.
-    pass_owner: [Option<Arc<super::vm::VmState>>; 2],
-    pending_pass_retarget: [Option<VmRetarget>; 2],
-    pending_pass_owner: [Option<Arc<super::vm::VmState>>; 2],
+    pass_owner: [Option<Arc<super::vm::VmState>>; sizes::RENDER_SLOTS],
+    pending_pass_retarget: [Option<VmRetarget>; sizes::RENDER_SLOTS],
+    pending_pass_owner: [Option<Arc<super::vm::VmState>>; sizes::RENDER_SLOTS],
     /// The render arena of each pass slot's owner (see [`ComputeOwners::arena`]).
-    pass_arena: [Option<Arc<super::resources::RenderArena>>; 2],
-    pending_pass_arena: [Option<Arc<super::resources::RenderArena>>; 2],
+    pass_arena: [Option<Arc<super::resources::RenderArena>>; sizes::RENDER_SLOTS],
+    pending_pass_arena: [Option<Arc<super::resources::RenderArena>>; sizes::RENDER_SLOTS],
 }
 impl Slots {
     pub(crate) fn new() -> Result<Self> {
@@ -456,11 +459,11 @@ impl Slots {
             // Publication order is the engine's: a render is queued only behind renders of
             // its VM, each pass slot in its own hardware UMA slot.
             pass_lifetime: Lifetime::new(true),
-            pass_owner: [None, None],
-            pending_pass_retarget: [None, None],
-            pending_pass_owner: [None, None],
-            pass_arena: [None, None],
-            pending_pass_arena: [None, None],
+            pass_owner: [const { None }; sizes::RENDER_SLOTS],
+            pending_pass_retarget: [None; sizes::RENDER_SLOTS],
+            pending_pass_owner: [const { None }; sizes::RENDER_SLOTS],
+            pass_arena: [const { None }; sizes::RENDER_SLOTS],
+            pending_pass_arena: [const { None }; sizes::RENDER_SLOTS],
         })
     }
     pub(crate) fn init(&self) -> Result {
@@ -475,7 +478,7 @@ impl Slots {
     }
     #[allow(dead_code)]
     pub(crate) fn pass_generation(&self, k: usize) -> Result<u8> {
-        if k >= 2 {
+        if k >= sizes::RENDER_SLOTS {
             return Err(EINVAL);
         }
         Ok(self.pass_lifetime.generation(k))
@@ -555,8 +558,9 @@ impl Slots {
         picked: u32,
         split: bool,
     ) -> Option<usize> {
-        for i in 0..2 {
-            let k = (self.pass_cursor as usize + i) % 2;
+        let n = arena.passes.len().min(sizes::RENDER_SLOTS);
+        for i in 0..n {
+            let k = (self.pass_cursor as usize + i) % n;
             let p = &arena.passes[k];
             if (self.pass_busy | picked) & (1 << k) == 0
                 && self.pass_claimable(arena, k, split)
@@ -574,7 +578,8 @@ impl Slots {
         k: usize,
         split: bool,
     ) -> Result {
-        if k >= 2 || !self.pass_claimable(arena, k, split) || !self.pass_lifetime.claim_retired(k) {
+        let n = arena.passes.len().min(sizes::RENDER_SLOTS);
+        if k >= n || !self.pass_claimable(arena, k, split) || !self.pass_lifetime.claim_retired(k) {
             return Err(EBUSY);
         }
         // Only a retired displaced owner may reach here; no in-flight storage is reset.
@@ -590,7 +595,7 @@ impl Slots {
         }
         arena.tpc_dirty[k].store(0, Ordering::Relaxed);
         arena.tilemap_dirty[k].store(0, Ordering::Relaxed);
-        self.pass_cursor = (1 - k) as u32;
+        self.pass_cursor = ((k + 1) % n) as u32;
         Ok(())
     }
     #[allow(dead_code)]
@@ -623,7 +628,7 @@ impl Slots {
                 self.stats.last_retarget[0] = proof;
             }
         }
-        for k in 0..2 {
+        for k in 0..sizes::RENDER_SLOTS {
             if f.pass_mask & (1 << k) != 0 {
                 if let Some(proof) = self.pending_pass_retarget[k].take() {
                     self.stats.cross_vm_retargets[1] =
@@ -641,7 +646,7 @@ impl Slots {
             || f.slot[..f.slot_count as usize]
                 .iter()
                 .any(|&k| k as usize >= sizes::COMPUTE_UNITS)
-            || f.pass_mask & !3 != 0
+            || f.pass_mask >> sizes::RENDER_SLOTS != 0
         {
             return Err(EINVAL);
         }
@@ -652,7 +657,7 @@ impl Slots {
                 .and_then(|old| Self::vm_retarget(k, old, vm));
             self.compute.pending_owner[k] = Some(vm.clone());
         }
-        for k in 0..2 {
+        for k in 0..sizes::RENDER_SLOTS {
             if f.pass_mask & (1 << k) != 0 {
                 self.pending_pass_retarget[k] = self.pass_owner[k]
                     .as_ref()
@@ -671,7 +676,7 @@ impl Slots {
                 *cell = resources.compute_arena(k as usize);
             }
         }
-        for k in 0..2 {
+        for k in 0..sizes::RENDER_SLOTS {
             if f.pass_mask & (1 << k) != 0 {
                 self.pending_pass_arena[k] = resources.render_arena();
             }
@@ -688,7 +693,7 @@ impl Slots {
                 return Err(EBUSY);
             }
         }
-        for k in 0..2 {
+        for k in 0..sizes::RENDER_SLOTS {
             if f.pass_mask & (1 << k) != 0 && !p.publish(k) {
                 return Err(EBUSY);
             }
@@ -706,7 +711,7 @@ impl Slots {
                 return Err(EINVAL);
             }
         }
-        for k in 0..2 {
+        for k in 0..sizes::RENDER_SLOTS {
             if f.pass_mask & (1 << k) != 0 && !p.retire(k) {
                 return Err(EINVAL);
             }
@@ -717,7 +722,7 @@ impl Slots {
             self.compute.owner[k as usize] = self.compute.pending_owner[k as usize].take();
             self.compute.arena[k as usize] = self.compute.pending_arena[k as usize].take();
         }
-        for k in 0..2 {
+        for k in 0..sizes::RENDER_SLOTS {
             if f.pass_mask & (1 << k) != 0 {
                 self.pass_owner[k] = self.pending_pass_owner[k].take();
                 self.pass_arena[k] = self.pending_pass_arena[k].take();
@@ -734,7 +739,7 @@ impl Slots {
             self.compute.lifetime.quarantine(k as usize);
             self.compute.pending_retarget[k as usize] = None;
         }
-        for k in 0..2 {
+        for k in 0..sizes::RENDER_SLOTS {
             if f.pass_mask & (1 << k) != 0 {
                 self.pass_lifetime.quarantine(k);
                 self.pending_pass_retarget[k] = None;
@@ -753,7 +758,7 @@ impl Slots {
             self.compute.pending_owner[k as usize] = None;
             self.compute.pending_arena[k as usize] = None;
         }
-        for k in 0..2 {
+        for k in 0..sizes::RENDER_SLOTS {
             if f.pass_mask & (1 << k) != 0 {
                 self.pass_lifetime.cancel(k);
                 self.pending_pass_retarget[k] = None;

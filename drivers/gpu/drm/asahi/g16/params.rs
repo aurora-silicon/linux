@@ -59,19 +59,22 @@ pub(crate) mod tune {
     /// A VM's compute units share its two base UMA pools in disjoint row ranges instead of
     /// one 32 MiB pool each (compute arenas created later).
     pub(crate) static COMPUTE_POOL_SHARE: AtomicU32 = AtomicU32::new(0);
-    const NAMES: [(&str, &AtomicU32, u32, u32); 12] = [
+    /// Pass slots (with render allocators) of render arenas created later.
+    pub(crate) static RENDER_SLOTS: AtomicU32 = AtomicU32::new(2);
+    const NAMES: [(&str, &AtomicU32, u32, u32); 13] = [
         ("compute_units", &COMPUTE_UNITS, 2, super::hw::sizes::COMPUTE_UNITS as u32),
         ("compute_flights", &COMPUTE_FLIGHTS, 1, super::hw::sizes::FLIGHTS as u32),
         ("resnap_us", &RESNAP_US, 0, 1000),
         ("pb_heap_mb", &PB_HEAP_MB, 8, 256),
         ("pb_blocks", &PB_BLOCKS, 16, 2048),
         ("prof", &PROF, 0, 1),
-        ("render_flights", &RENDER_FLIGHTS, 1, 2),
+        ("render_flights", &RENDER_FLIGHTS, 1, super::hw::sizes::RENDER_SLOTS as u32),
         ("render_uma_split", &RENDER_UMA_SPLIT, 0, 1),
         ("render_hold", &RENDER_HOLD, 0, 1),
         ("credits", &CREDITS, 1, super::hw::sizes::SCHEDULER_CREDITS),
         ("submit_publish", &SUBMIT_PUBLISH, 0, 1),
         ("compute_pool_share", &COMPUTE_POOL_SHARE, 0, 1),
+        ("render_slots", &RENDER_SLOTS, 2, super::hw::sizes::RENDER_SLOTS as u32),
     ];
 
     /// Applies one `name=value` line.
@@ -117,7 +120,14 @@ pub(crate) fn pb_posted_blocks(heap_blocks: u32) -> u32 {
 
 /// Renders of one VM in flight at most.
 pub(crate) fn render_flights() -> usize {
-    tune::RENDER_FLIGHTS.load(core::sync::atomic::Ordering::Relaxed).clamp(1, 2) as usize
+    (tune::RENDER_FLIGHTS.load(core::sync::atomic::Ordering::Relaxed) as usize)
+        .clamp(1, hw::sizes::RENDER_SLOTS)
+}
+
+/// Pass slots of a new render arena.
+pub(crate) fn render_slots() -> usize {
+    (tune::RENDER_SLOTS.load(core::sync::atomic::Ordering::Relaxed) as usize)
+        .clamp(2, hw::sizes::RENDER_SLOTS)
 }
 
 /// Whether new render arenas put each allocator in its own hardware UMA slot.

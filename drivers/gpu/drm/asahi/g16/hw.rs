@@ -301,9 +301,14 @@ pub(crate) mod client {
     pub(crate) const WORK_OFF: u64 = 0;
     pub(crate) const CWORK_STRIDE: u64 = 0x4000;
 
-    // Render allocator units contain one 32 MiB UMA pool and its persistent lists.
+    // Render allocator units contain one 32 MiB UMA pool and its persistent lists. Those of
+    // pass slots 2 and 3 sit 128 MiB into their pass window.
     pub(crate) const fn render_base(k: u64) -> u64 {
-        0x7010000000 + k * 0x08000000
+        if k < 2 {
+            0x7010000000 + k * 0x08000000
+        } else {
+            pass_window(k) + 0x08000000
+        }
     }
     pub(crate) const fn render_pool(k: u64) -> u64 {
         render_base(k)
@@ -329,7 +334,24 @@ pub(crate) mod client {
     pub(crate) const PB_PAGE_LIST: u64 = 0x7012040000;
     pub(crate) const PB_PAGE_LIST_SIZE: u64 = 0x8000;
 
-    // Render pass resources, each in a distinct 256 MiB interval.
+    // Render pass resources, each pass slot in its own 256 MiB window at the offsets pass 0 has
+    // in its window. Slots 0 and 1 take the original windows; slots 2 and 3 windows clear of the
+    // compute extension units, the PB heap, the dynamic PB page lists and the CT window.
+    pub(crate) const fn pass_window(k: u64) -> u64 {
+        match k {
+            0 => 0x7020000000,
+            1 => 0x7030000000,
+            2 => 0x70b0000000,
+            _ => 0x70d0000000,
+        }
+    }
+    /// Pass slot `k`'s address of the resource that pass slot 0 has at `pass0`.
+    pub(crate) const fn pass_va(k: u64, pass0: u64) -> u64 {
+        pass_window(k) + (pass0 - pass_window(0))
+    }
+    const _: () = assert!(pass_window(3) + 0x10000000 <= PB_BLOCK_LIST);
+    const _: () = assert!(pass_window(2) >= compute_base(super::sizes::COMPUTE_UNITS as u64));
+    const _: () = assert!(pass_window(2) + 0x10000000 <= PB_HEAP);
     pub(crate) const FS_WORK_PAGE: u64 = 0x7020000000;
     pub(crate) const FS_WORK_OFF: u64 = 0;
     pub(crate) const TA_WORK_PAGE: u64 = 0x7020004000;
@@ -363,7 +385,9 @@ pub(crate) mod sizes {
     pub(crate) const FREELIST_SEED: u32 = 8192;
     pub(crate) const QUEUE_CAP: u32 = 256;
     pub(crate) const COMPUTE_SLOTS: usize = 2;
-    pub(crate) const RENDER_SLOTS: usize = 2;
+    /// Pass slots (with their render allocators) at most; a render arena has
+    /// `params::render_slots()` of them, 2 by default.
+    pub(crate) const RENDER_SLOTS: usize = 4;
     pub(crate) const CT_BUFS: usize = 0;
     pub(crate) const CLUSTER_PB_PAGES: u32 = 0x3c;
     pub(crate) const MAX_ATTACHMENTS: usize = 16;

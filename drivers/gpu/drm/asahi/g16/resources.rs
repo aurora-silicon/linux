@@ -109,8 +109,8 @@ impl core::ops::Deref for RenderArena {
 pub(crate) struct RenderInner {
     pub(crate) passes: KVec<PassSlot>,
     pub(crate) pools: PoolSet,
-    pub(crate) tpc_dirty: [AtomicU64; 2],
-    pub(crate) tilemap_dirty: [AtomicU64; 2],
+    pub(crate) tpc_dirty: [AtomicU64; super::hw::sizes::RENDER_SLOTS],
+    pub(crate) tilemap_dirty: [AtomicU64; super::hw::sizes::RENDER_SLOTS],
     _objects: Objects,
     _bind: mmu::VmBind,
     _live: Arc<super::vm::LiveToken>,
@@ -123,18 +123,19 @@ impl RenderArena {
         live: &Arc<super::vm::LiveToken>,
     ) -> Result<Arc<Self>> {
         let mut objects = factory.objects(vm);
-        let mut passes = KVec::with_capacity(2, GFP_KERNEL)?;
-        for k in 0..2 {
-            passes.push(PassSlot::new(&mut objects, k, 1)?, GFP_KERNEL)?;
+        let slots = super::params::render_slots();
+        let mut passes = KVec::with_capacity(slots, GFP_KERNEL)?;
+        for k in 0..slots {
+            passes.push(PassSlot::new(&mut objects, k as u64, 1)?, GFP_KERNEL)?;
         }
-        let pools = PoolSet::new(&mut objects)?;
+        let pools = PoolSet::new(&mut objects, slots)?;
         objects.finish_private()?;
         Ok(Arc::new(
             Self(crate::cleanup::Deferred::new(RenderInner {
                 passes,
                 pools,
-                tpc_dirty: [const { AtomicU64::new(0) }; 2],
-                tilemap_dirty: [const { AtomicU64::new(0) }; 2],
+                tpc_dirty: [const { AtomicU64::new(0) }; super::hw::sizes::RENDER_SLOTS],
+                tilemap_dirty: [const { AtomicU64::new(0) }; super::hw::sizes::RENDER_SLOTS],
                 _objects: objects,
                 _bind: bind.clone(),
                 _live: live.clone(),

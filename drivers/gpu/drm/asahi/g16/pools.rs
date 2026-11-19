@@ -225,7 +225,8 @@ impl Allocator {
     }
 }
 impl PoolSet {
-    pub(crate) fn new(o: &mut Objects) -> Result<Self> {
+    /// The heap and `slots` allocators, one per pass slot.
+    pub(crate) fn new(o: &mut Objects, slots: usize) -> Result<Self> {
         // The firmware copes with a full PB without the host (its overflow counters move and
         // the scene completes), so the heap is sized well below the 256 MiB window.
         let heap_blocks = super::params::pb_heap_blocks().min(buffer::MAX_BLOCKS);
@@ -237,8 +238,11 @@ impl PoolSet {
             false,
         )?;
         let split = super::params::render_uma_split();
-        let mut units = KVec::with_capacity(2, GFP_KERNEL)?;
-        for k in 0..2 {
+        if !(2..=super::hw::sizes::RENDER_SLOTS).contains(&slots) {
+            return Err(EINVAL);
+        }
+        let mut units = KVec::with_capacity(slots, GFP_KERNEL)?;
+        for k in 0..slots as u64 {
             units.push(Allocator::new(o, k, &heap, split)?, GFP_KERNEL)?;
         }
         Ok(Self {
@@ -293,21 +297,21 @@ impl PoolSet {
 pub(crate) struct Pools {
     pub(crate) dev: ARef<device::Device>,
     pub(crate) stats: PbStats,
-    owners: [Option<Arc<PbEpoch>>; 2],
+    owners: [Option<Arc<PbEpoch>>; super::hw::sizes::RENDER_SLOTS],
     /// Per pass slot, a binding count, bumped by each fresh epoch (its InitBM rebinds the
     /// slot) and by a firmware recovery. It identifies a binding without holding the epoch.
-    binds: [u64; 2],
+    binds: [u64; super::hw::sizes::RENDER_SLOTS],
     /// Per pass slot, with `g16_pb_reuse`: `owners[k]` may serve the next render of its VM.
-    keep: [bool; 2],
+    keep: [bool; super::hw::sizes::RENDER_SLOTS],
 }
 impl Pools {
     pub(crate) fn new(dev: &AsahiDrmDevice) -> Self {
         Self {
             dev: dev.as_ref().as_ref().into(),
             stats: PbStats::default(),
-            owners: [None, None],
-            binds: [0, 0],
-            keep: [false, false],
+            owners: [const { None }; super::hw::sizes::RENDER_SLOTS],
+            binds: [0; super::hw::sizes::RENDER_SLOTS],
+            keep: [false; super::hw::sizes::RENDER_SLOTS],
         }
     }
     /// With reuse `enabled` (`g16_pb_reuse`): slot `k`'s owner epoch, if its render retired
@@ -443,7 +447,10 @@ impl PbEpoch {
     /// Seed only unpublished storage. A retry may choose another physical slot; after
     /// exposure neither the manager nor any of its firmware-mutated lists is reset.
     pub(crate) fn prepare(&self, k: usize, heap: u64, heap_blocks: u32) -> Result {
-        if k >= 2 || self.exposed.load(Ordering::Acquire) || heap_blocks > buffer::MAX_BLOCKS {
+        if k >= super::hw::sizes::RENDER_SLOTS
+            || self.exposed.load(Ordering::Acquire)
+            || heap_blocks > buffer::MAX_BLOCKS
+        {
             return Err(EINVAL);
         }
         // Only the backed part of the heap is named; the rest of the lists stays zero.
