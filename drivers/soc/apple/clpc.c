@@ -105,7 +105,8 @@ enum apple_clpc_rail {
  * @idle_on_time: sample every period even with no vote held, instead of
  *	from a deferrable timer
  * @low_power_khz: CPU frequency ceiling of the low-power platform profile,
- *	taken up to the next table frequency; 0 for no platform profile
+ *	taken up to the next table frequency, for a node without
+ *	apple,low-power-frequency-max-mhz; 0 for no platform profile
  * @low_power_mw: package power (the SMC's PHPC key) the low-power profile
  *	holds the CPU clusters to; 0 for none
  * @high_power_machine: the machine compatible on which the performance
@@ -234,6 +235,8 @@ struct apple_clpc {
 	/* The platform profile and, for its power target, the SMC */
 	enum platform_profile_option profile;
 	bool low_power;
+	/* the DT ceiling, else hw->low_power_khz, else 0 */
+	unsigned int low_power_khz;
 	struct device_node *smc_np;
 	struct apple_smc *smc;
 	/* The performance profile is sent to the SMC as High Power mode */
@@ -845,7 +848,7 @@ static bool apple_clpc_steps_first(unsigned int a_khz, unsigned int a_max,
 
 /*
  * The platform profile's ceilings. In the low-power profile every cluster
- * stays at or below the first frequency at or above hw->low_power_khz. Each
+ * stays at or below the first frequency at or above clpc->low_power_khz. Each
  * new package power reading above hw->low_power_mw takes one table step off
  * one cluster, and each one below 90% of it puts one back, in the order of
  * apple_clpc_steps_first(). Elsewhere there is no ceiling.
@@ -857,7 +860,7 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 	unsigned int i, khz, pick_khz = 0;
 	int mw, step = 0, pick = -1;
 
-	if (!clpc->hw->low_power_khz || time_before(jiffies, clpc->power_next))
+	if (!clpc->low_power_khz || time_before(jiffies, clpc->power_next))
 		return;
 	clpc->power_next = jiffies + msecs_to_jiffies(APPLE_CLPC_POWER_MS);
 	if (low && clpc->hw->low_power_mw) {
@@ -883,10 +886,10 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 		    freq_qos_add_request(&policy[i]->constraints, &cl->max_qos, FREQ_QOS_MAX,
 					 FREQ_QOS_MAX_DEFAULT_VALUE) < 0)
 			clpc->update_errors++;
-		/* The top: the first table frequency at or above hw->low_power_khz */
+		/* The top: the first table frequency at or above clpc->low_power_khz */
 		cl->top_khz = apple_clpc_step_khz(policy[i],
-						  clpc->hw->low_power_khz - 1, true);
-		if (cl->top_khz < clpc->hw->low_power_khz)
+						  clpc->low_power_khz - 1, true);
+		if (cl->top_khz < clpc->low_power_khz)
 			cl->top_khz = policy[i]->cpuinfo.max_freq;
 		if (!low)
 			cl->max_khz = 0;
@@ -1055,7 +1058,7 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 	}
 	seq_printf(s, "samples: %lu update errors: %lu\n", clpc->samples,
 		   clpc->update_errors);
-	if (clpc->hw->low_power_khz) {
+	if (clpc->low_power_khz) {
 		seq_printf(s, "profile: %s power %d mW (%lu new of %lu readings) ceilings (kHz):",
 			   clpc->profile == PLATFORM_PROFILE_LOW_POWER ? "low-power" :
 			   clpc->profile == PLATFORM_PROFILE_PERFORMANCE ? "performance" :
@@ -1360,6 +1363,7 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	struct device_node *gpu = NULL;
 	struct apple_clpc *clpc;
 	unsigned int rail, i;
+	u32 mhz;
 	int ret;
 
 	clpc = devm_kzalloc(dev, sizeof(*clpc), GFP_KERNEL);
@@ -1497,7 +1501,16 @@ static int apple_clpc_probe(struct platform_device *pdev)
 
 	clpc->profile = PLATFORM_PROFILE_BALANCED;
 	clpc->power_next = jiffies;
-	if (clpc->hw->low_power_khz && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
+	/*
+	 * The boot loader copies the ADT's Low Power mode CPU ceiling
+	 * (pmgr/clpc cpu-low-power-frequency-max) into the node. Without it,
+	 * a SoC's own value applies where it has one.
+	 */
+	if (!of_property_read_u32(dev->of_node, "apple,low-power-frequency-max-mhz", &mhz))
+		clpc->low_power_khz = mhz * 1000;
+	else
+		clpc->low_power_khz = clpc->hw->low_power_khz;
+	if (clpc->low_power_khz && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
 		struct device *ppdev;
 
 		/* The SMC is optional: without it the low-power profile has only its ceiling. */
