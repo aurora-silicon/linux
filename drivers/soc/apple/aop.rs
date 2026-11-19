@@ -1566,9 +1566,14 @@ impl AopData {
                     let mut init = ep_guard.start(rtk.as_mut());
                     if init == Err(ETIMEDOUT) {
                         // The mailbox stayed full for the whole send timeout,
-                        // so the request was never written. The firmware can
-                        // still be busy finishing its own boot: send it once
-                        // more, which checks the mailbox again first.
+                        // so the request was never written and a resend is
+                        // safe. The send already waits on the mailbox's
+                        // send-empty interrupt, and the firmware sends no
+                        // other event when it reads its inbound FIFO again.
+                        // Seen on a J616s warm boot with a slow firmware
+                        // start (#547); why the FIFO stays full after the
+                        // power handshake is open (#2344). Resend once,
+                        // logged, then fail the endpoint.
                         dev_warn!(
                             self.dev,
                             "Endpoint {:#04x}: AFK init not sent (mailbox full); retrying",
