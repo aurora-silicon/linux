@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * HDMI port of the T6030 (M3 Pro) MacBook Pros.
- *
- * The port hangs off the first external display coprocessor: it drives
- * ATC3 as a four-lane DisplayPort PHY into an on-board DP-to-HDMI
- * converter. Power, hotplug and the fixed route work as for the M1/M2 Pro
- * MacBook Pro HDMI port (hdmi-hpd, hdmi-pwren and dp2hdmi-pwren GPIOs, see
+ * Native HDMI ports: an external display coprocessor driving a DisplayPort
+ * PHY into an on-board DP-to-HDMI converter, as on the M1 and later Pro/Max
+ * MacBook Pros, the Mac minis and the Mac Studios. Power, hotplug and the
+ * fixed route use the hdmi-hpd, hdmi-pwren and dp2hdmi-pwren GPIOs (see
  * dcp.c and dcp-fabric.c).
  *
  * Like any DisplayPort sink, the converter asks the source for service by
@@ -19,7 +17,10 @@
  *    the rate those modes use, because not every request of the converter
  *    shows up as a pulse on the GPIO.
  *
- * Only the T6030 external coprocessor with a fixed HDMI route uses this.
+ * Every coprocessor with a fixed HDMI-A connector and an HDMI HPD GPIO in
+ * its DT node uses this: IRQ_HPD is DisplayPort protocol, and the converter
+ * sits behind the same DPTX port on every such board. A firmware that does
+ * not take the request answers it with an error; that stops the polling.
  */
 
 #include <linux/atomic.h>
@@ -211,8 +212,7 @@ int dcp_hdmi_init(struct apple_dcp *dcp)
 	int ret;
 
 	if (!dcp->hdmi_hpd ||
-	    dcp->fixed_connector_type != DRM_MODE_CONNECTOR_HDMIA ||
-	    !of_device_is_compatible(dcp->dev->of_node, "apple,t6030-dcpext"))
+	    dcp->fixed_connector_type != DRM_MODE_CONNECTOR_HDMIA)
 		return 0;
 
 	hdmi = devm_kzalloc(dcp->dev, sizeof(*hdmi), GFP_KERNEL);
