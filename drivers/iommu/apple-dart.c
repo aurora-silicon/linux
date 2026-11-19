@@ -5374,7 +5374,6 @@ static int apple_dart_probe(struct platform_device *pdev)
 		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
 	/* The radio DART's fault interrupt is not described by the loader. */
 	j713_radio = res && !tunneled && apple_t8132_managed_radio() &&
-		of_machine_is_compatible("apple,t8132") &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		res->start == 0x490000000ULL;
 	/*
@@ -5382,7 +5381,6 @@ static int apple_dart_probe(struct platform_device *pdev)
 	 * over, but the running DCP still uses them: never reset them.
 	 */
 	if (res && !tunneled && !apple_t8132_firmware_path() &&
-	    of_machine_is_compatible("apple,t8132") &&
 	    of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 	    (res->start == 0x30a300000ULL || res->start == 0x30a340000ULL)) {
 		dev_info(dev, "Leaving inherited display DART untouched off the qualified firmware\n");
@@ -5913,7 +5911,7 @@ params_done:
 	}
 	dart->fw_tree = dart->fw_mirror &&
 		of_device_is_compatible(dev->of_node, "apple,t6050-dart");
-	if (apple_t8132_live_mtp() && of_machine_is_compatible("apple,t8132") &&
+	if (apple_t8132_live_mtp() &&
 	    res->start == 0x394800000ULL && dart->hw->type == DART_T8110 &&
 	    !dart->locked && !tunneled && dart->supports_bypass &&
 	    apple_dart_streams_bypassed(dart)) {
