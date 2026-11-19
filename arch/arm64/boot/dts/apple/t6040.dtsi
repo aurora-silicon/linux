@@ -593,9 +593,9 @@
 
 /*
  * A DART probes as a device of its own, so it holds the power state of the
- * block it sits in; reading it with that block off faults. These blocks'
- * states are only in the T6040 PMGR, so they are given here and not in
- * t604x.dtsi.
+ * block it sits in; reading it with that block off faults. The internal PCIe
+ * block's states are only in the T6040 PMGR, so they are given here and not
+ * in t604x.dtsi.
  *
  * The internal PCIe DARTs sit in APCIE_SYS_GP. iBoot leaves APCIE_GP and
  * APCIE_SYS_GP on, and the PCIe driver keeps internal links up through
@@ -614,35 +614,6 @@
 
 &pcie_dart {
 	power-domains = <&ps_apcie_sys_gp>;
-};
-
-/*
- * The display DARTs sit in their DISP/DISPEXT blocks. As the J616s external
- * display DARTs already do, they hold the block's front end, not the
- * coprocessor state its firmware owns.
- */
-&disp0_dart {
-	power-domains = <&ps_disp_fe>;
-};
-
-&dcp_dart {
-	power-domains = <&ps_disp_fe>;
-};
-
-&dispext0_dart {
-	power-domains = <&ps_dispext0_fe>;
-};
-
-&dcpext0_dart {
-	power-domains = <&ps_dispext0_fe>;
-};
-
-&dispext1_dart {
-	power-domains = <&ps_dispext1_fe>;
-};
-
-&dcpext1_dart {
-	power-domains = <&ps_dispext1_fe>;
 };
 
 /* The M4 Pro has five cores in each P cluster. */
