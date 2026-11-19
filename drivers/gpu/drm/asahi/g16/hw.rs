@@ -79,8 +79,78 @@ pub(crate) mod t8132 {
                     0xc8, 0x29, 0x86, 0x8b, 0xc9, 0xcf,
                 ],
             },
+            FirmwareBuild {
+                // Build b000 (G16G B0) of armfw_g16g.im4p in 25G83, as iBoot loads it on any
+                // machine: the boot-filled ranges below are zeroed, which gives the digest of
+                // the shipped image with the same ranges zeroed.
+                name: "Apple GFX 25G83 (build b000, iBoot-filled ranges zeroed)",
+                text_size: 0x60000,
+                data_size: 0x13c000,
+                entropy: &[[0x5c8df, 0x5c9c2]],
+                boot_filled: BOOT_FILLED_25G83_B000,
+                text_sha256: [
+                    0xb9, 0xea, 0x7e, 0x6b, 0x2a, 0xca, 0x70, 0xa2, 0x75, 0xa0, 0xb0, 0x68, 0xee,
+                    0x79, 0x1e, 0xd5, 0x05, 0x27, 0xe8, 0xdb, 0x76, 0x19, 0x64, 0xd2, 0x73, 0x3f,
+                    0xa4, 0x07, 0xa6, 0xf2, 0x22, 0x6c,
+                ],
+            },
         ],
     };
+
+    /// What iBoot writes into the 25G83 build b000 TEXT it loads, in TEXT order:
+    /// - the header word at 0x224, which changes from boot to boot, and the DATA address at 0x23c;
+    /// - the value of each of the 39 boot parameter records the header at 0x22c places from
+    ///   0x5c8df to 0x5cb10 (a tag, a 32-bit length and the value: carveout addresses below the
+    ///   top of DRAM, a per-boot slide, the entropy);
+    /// - the entry count and the 0x34c-byte body of the two tunable tables at 0x5cb10 and 0x5ce60
+    ///   (headers 01/03 03 2a), which the shipped image leaves empty.
+    pub(crate) const BOOT_FILLED_25G83_B000: &[(u32, u32)] = &[
+        (0x224, 4),
+        (0x23c, 8),
+        (0x5c8e7, 8),
+        (0x5c8f7, 8),
+        (0x5c907, 8),
+        (0x5c917, 8),
+        (0x5c927, 8),
+        (0x5c937, 8),
+        (0x5c947, 8),
+        (0x5c957, 4),
+        (0x5c963, 1),
+        (0x5c96c, 8),
+        (0x5c97c, 8),
+        (0x5c98c, 4),
+        (0x5c998, 8),
+        (0x5c9a8, 1),
+        (0x5c9b1, 1),
+        (0x5c9ba, 8),
+        (0x5c9ca, 8),
+        (0x5c9da, 8),
+        (0x5c9ea, 8),
+        (0x5c9fa, 8),
+        (0x5ca0a, 8),
+        (0x5ca1a, 8),
+        (0x5ca2a, 8),
+        (0x5ca3a, 8),
+        (0x5ca4a, 8),
+        (0x5ca5a, 8),
+        (0x5ca6a, 8),
+        (0x5ca7a, 4),
+        (0x5ca86, 8),
+        (0x5ca96, 4),
+        (0x5caa2, 4),
+        (0x5caae, 8),
+        (0x5cabe, 8),
+        (0x5cace, 1),
+        (0x5cad7, 8),
+        (0x5cae7, 8),
+        (0x5caf7, 4),
+        (0x5cb03, 1),
+        (0x5cb0c, 4),
+        (0x5cb13, 1),
+        (0x5cb14, 0x34c),
+        (0x5ce63, 1),
+        (0x5ce64, 0x34c),
+    ];
 }
 
 /// User VA range reported as `vm_start..vm_end`: 42 bits with the final two pages excluded.
