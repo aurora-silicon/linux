@@ -872,7 +872,7 @@
  * J714s's sensor. The sensor type is 0xbc and the connection scheme 0x10; the loader passes
  * both. Everything stays disabled until the loader has reserved the firmware.
  */
-#include "t6050-j716c-isp.dtsi"
+#include "t6050-isp.dtsi"
 
 /*
  * Two things the shared T6050 files now turn on for every board are held back here until

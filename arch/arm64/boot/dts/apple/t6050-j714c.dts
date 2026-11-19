@@ -466,3 +466,6 @@
 &avd {
 	status = "okay";
 };
+
+/* The camera. The loader sets the platform ID from the ADT isp0 sensor-type (0x73). */
+#include "t6050-isp.dtsi"
