@@ -23,7 +23,8 @@ mod hw{pub mod sizes{pub const MAX_VMS:u32=63;}}
 mod module_parameters{pub struct Param;impl Param{pub fn value(&self)->u32{0}}pub static robust_isolation:Param=Param;}
 mod types{pub struct ScopeGuard<F:FnOnce()>(Option<F>);impl<F:FnOnce()>ScopeGuard<F>{pub fn new(f:F)->Self{Self(Some(f))}pub fn dismiss(mut self){self.0.take();}}impl<F:FnOnce()>Drop for ScopeGuard<F>{fn drop(&mut self){if let Some(f)=self.0.take(){f()}}}}
 struct Handle;impl Handle{fn is_closed(&self)->bool{false}}
-struct VmState{id:u64,vm:Handle,drops:Arc<AtomicU32>}impl Drop for VmState{fn drop(&mut self){self.drops.fetch_add(1,Ordering::AcqRel);}}
+struct Cache{closes:AtomicU32}impl Cache{fn close(&self){self.closes.fetch_add(1,Ordering::AcqRel);}}
+struct VmState{id:u64,vm:Handle,drops:Arc<AtomicU32>,resources:Option<Arc<Cache>>}impl Drop for VmState{fn drop(&mut self){self.drops.fetch_add(1,Ordering::AcqRel);}}
 __REGISTRY__
 struct Reservation<'a>(Option<&'a Registry>,u64);
 __RESERVATION_DROP__
@@ -46,10 +47,13 @@ impl Registry{
 }
 #[test]fn close_releases_registry_owner_without_another_vm_create(){
  let r=Registry::new_test();let drops=Arc::new(AtomicU32::new(0));
- let state=Arc::new(VmState{id:1,vm:Handle,drops:drops.clone()});r.vms.lock().push(state.clone(),0).unwrap();
+ let cache=Arc::new(Cache{closes:AtomicU32::new(0)});
+ let state=Arc::new(VmState{id:1,vm:Handle,drops:drops.clone(),resources:Some(cache.clone())});r.vms.lock().push(state.clone(),0).unwrap();
  r.close(1);assert!(r.vms.lock().is_empty());assert_eq!(drops.load(Ordering::Acquire),0);
+ // The client's close lets the VM's cache drop its arenas while other owners hold the VM.
+ assert_eq!(cache.closes.load(Ordering::Acquire),1);
  drop(state);assert_eq!(drops.load(Ordering::Acquire),1);
- r.vms.lock().push(Arc::new(VmState{id:2,vm:Handle,drops:drops.clone()}),0).unwrap();
+ r.vms.lock().push(Arc::new(VmState{id:2,vm:Handle,drops:drops.clone(),resources:None}),0).unwrap();
  r.close(2);assert_eq!(drops.load(Ordering::Acquire),2);
 }
 '''
