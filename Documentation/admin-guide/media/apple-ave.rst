@@ -67,6 +67,14 @@ those nodes. A probe with a valid handoff reports the verified CRCs without
 starting the coprocessor. An unknown layout refuses stream start before
 allocating session buffers or acquiring runtime power.
 
+The M3 generation (T8122, T6030, T6031 and both dies of T6032) is probe-only
+as well. Its encoders have the T8112 register windows, interrupt order and
+power states, but run firmware builds of their own (TEXT 0x134000 and DATA
+0x128000 bytes on a T8122 with macOS 27.2), so no build size is pinned: any
+loader-verified handoff binds, the probe logs both segment sizes and CRCs,
+and the coprocessor is never started. The nodes stay disabled until the
+loader hands their firmware over.
+
 Command sizes, offsets, descriptor groups, constants, Process subtype and
 buffer sizes are selected by the verified TEXT CRC, independently of the
 SoC match data. ``69c54454`` and ``68d5f9f6`` select the 9003.78.0 layout and

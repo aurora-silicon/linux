@@ -187,6 +187,21 @@ static const struct ave_variant ave_t8142 = {
 };
 
 /*
+ * The M3 generation (T8122, T6030, T6031, and both dies of T6032) has the
+ * T8112 encoder's register windows, interrupt order and power states, but
+ * iBoot preloads a firmware build of its own: on a J615 under macOS 27.2 the
+ * ADT segment-ranges give TEXT 0x134000 and DATA 0x128000, which is none of
+ * the builds above. Its boot sequence, device numbers and command layout are
+ * not known yet, so the encoder is probe-only: the driver checks the
+ * bootloader's firmware handoff and reports the build's CRCs, and refuses to
+ * start the coprocessor or encode. No segment sizes are pinned, as the M3
+ * Pro, Max and Ultra builds have not been seen.
+ */
+const struct ave_variant ave_m3 = {
+	.lfs_ref_scale = 1,
+};
+
+/*
  * debugfs: apple-ave/last_start_{h264,hevc} hold the last Start built and
  * last_process0_{h264,hevc} the first Process of the last session, so the
  * generated commands can be compared with reference captures.
@@ -617,9 +632,13 @@ static const struct dev_pm_ops ave_pm_ops = {
 
 static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6000-ave", .data = &ave_t6000 },
+	{ .compatible = "apple,t6030-ave", .data = &ave_m3 },
+	{ .compatible = "apple,t6031-ave", .data = &ave_m3 },
+	{ .compatible = "apple,t6032-ave", .data = &ave_m3 },
 	{ .compatible = "apple,t6041-ave", .data = &ave_t6041 },
 	{ .compatible = "apple,t6050-ave", .data = &ave_t6050 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
+	{ .compatible = "apple,t8122-ave", .data = &ave_m3 },
 	{ .compatible = "apple,t8140-ave", .data = &ave_t8140 },
 	{ .compatible = "apple,t8142-ave", .data = &ave_t8142 },
 	{}
