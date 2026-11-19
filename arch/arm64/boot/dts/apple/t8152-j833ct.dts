@@ -21,3 +21,26 @@
 	/* ADT no-restore-gpio-pins */
 	gpio-reserved-ranges = <78 2>, <208 1>;
 };
+
+/*
+ * Hardware monitor: the shared power, voltage and current keys, and two
+ * fans, as in the T8122 iMac description. The ADT does not list the fans;
+ * the hwmon driver skips a fan whose speed key the SMC does not have, so a
+ * single-fan machine shows one. The T8152 SMC spells the fan mode key in
+ * lower case, as on J804. Temperatures are discovered from the SMC, so the
+ * shared NAND temperature node is dropped (its key is discovered too).
+ */
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+
+&smc_hwmon {
+	/delete-node/ temperature-TH0x;
+
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+	};
+};
