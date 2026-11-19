@@ -25,7 +25,7 @@ struct apple_atcphy {
 		bool aux, pll;
 		unsigned int pairs, rate;
 	} dp_t8122;
-	bool fixed_usb2, host_active, mode_dirty, ss_tunables, dp_tunables,
+	bool fixed_usb2, fixed_usb3, host_active, mode_dirty, ss_tunables, dp_tunables,
 		aux_power_requested;
 	unsigned int dp_owned_pmas, dp_idle_pmas;
 	unsigned int dp_usb_context_valid, dp_usb_context_dirty;
@@ -250,11 +250,15 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *p);
 static int atcphy_power_off(struct apple_atcphy *p);
 static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode);
 
-/* These units exercise older PHY generations. Never accept a T8132 dispatch. */
+/* These units exercise older PHY generations. Never accept a T8132 or T8152 dispatch. */
 static int __attribute__((unused)) atcphy_configure_t8132(struct apple_atcphy *p, enum atcphy_mode mode)
 { (void)p; (void)mode; assert(false); return -EOPNOTSUPP; }
 static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *p)
 { (void)p; assert(false); return -EOPNOTSUPP; }
+static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8152(struct apple_atcphy *p)
+{ (void)p; assert(false); return -EOPNOTSUPP; }
+static void __attribute__((unused)) atcphy_lanes_down_t8152(struct apple_atcphy *p)
+{ (void)p; assert(false); }
 
 
 /* Model the USB2 power-on boundary's running state. */
