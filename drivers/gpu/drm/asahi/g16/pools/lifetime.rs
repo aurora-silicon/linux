@@ -301,6 +301,32 @@ mod tests {
         }
     }
     #[test]
+    fn same_storage_reclaims_its_retired_slot_while_the_other_is_in_flight() {
+        // Two pass slots in their own hardware slots: render n+2 reuses n's slot while n+1
+        // is in flight, which only the same storage may do (`claim_retired`).
+        let mut l = Lifetime::<2>::new(true);
+        assert!(l.claim(0));
+        assert!(l.publish(0));
+        assert!(l.claim(1));
+        assert!(l.publish(1));
+        assert!(l.retire(0));
+        assert!(!l.available(0)); // no later publication retired: no displacement proof
+        assert!(l.retired(0));
+        assert!(l.claim_retired(0));
+        assert!(l.publish(0));
+        assert!(!l.retire(0)); // in publication order only
+        assert!(l.retire(1));
+        assert!(l.retire(0));
+        // Published, preparing and quarantined owners are never reclaimed.
+        assert!(l.claim_retired(1));
+        assert!(!l.claim_retired(1));
+        l.cancel(1);
+        l.quarantine(1);
+        assert!(!l.claim_retired(1));
+        assert!(!l.retired(1));
+    }
+
+    #[test]
     fn pipelined_newest_retired_owner_is_never_reusable() {
         let mut l = Lifetime::<3>::new(true);
         for k in 0..3 {

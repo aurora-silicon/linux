@@ -311,6 +311,7 @@ impl Firmware {
             lap.lap(&mut self.engine.prof.drain_ns);
             // Recovery may force stage progress: authenticate it before any receipt.
             self.check_hangs(done)?;
+            self.note_stamp_seen();
             ret = self.retired();
             while let Ok(receipt) = ret {
                 if !receipt.complete() {
@@ -408,6 +409,30 @@ impl Firmware {
             && ring_passed(pipe.completion()?, first, record, producer, slots))
     }
 
+    /// Latency statistics: the first poll that sees the oldest flight's final stamp.
+    fn note_stamp_seen(&mut self) {
+        let (g, r) = (&self.graph.compute, &self.graph.render);
+        let (target, fs_target) = (self.engine.target, self.engine.fs_target);
+        let Some(f) = self.engine.flights.first_mut() else {
+            return;
+        };
+        if f.stamp_seen_ticks != 0 {
+            return;
+        }
+        let seen = if f.renders != 0 {
+            r.fw_stamp[1]
+                .r32(0)
+                .is_ok_and(|s| stamp_reached(s, f.fs_target, fs_target))
+        } else {
+            g.fw_stamp
+                .r32(0)
+                .is_ok_and(|s| stamp_reached(s, f.target, target))
+        };
+        if seen {
+            f.stamp_seen_ticks = super::engine::counter_ticks();
+        }
+    }
+
     /// In-order receipt of a render flight `f` with a later render queued behind it: each
     /// render queue's NC READ cursor (and with uncached queue info its consumers) passed the
     /// flight's entries, and both submit pipes' read and completion cursors passed its records.
@@ -463,25 +488,6 @@ impl Firmware {
             return Ok(Retirement::Pending);
         };
         rmb();
-        if f.stamp_seen_ticks == 0 {
-            let seen = if f.renders != 0 {
-                stamp_reached(
-                    self.graph.render.fw_stamp[1].r32(0)?,
-                    f.fs_target,
-                    self.engine.fs_target,
-                )
-            } else {
-                stamp_reached(self.graph.compute.fw_stamp.r32(0)?, f.target, self.engine.target)
-            };
-            if seen {
-                if let Some(first) = self.engine.flights.first_mut() {
-                    first.stamp_seen_ticks = super::engine::counter_ticks();
-                }
-            }
-        }
-        let Some(f) = self.engine.oldest() else {
-            return Ok(Retirement::Pending);
-        };
         let mut full = true;
         // Later compute flights queued behind this one: the queue, pipe and stamp cells
         // already moved on, so their receipt is "passed", in order; the newest flight keeps
