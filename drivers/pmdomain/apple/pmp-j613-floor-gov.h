@@ -223,6 +223,35 @@ static inline bool pmp_floor_drop_confirmed(unsigned long long resp, unsigned lo
  */
 /* Firmware identity qualified by the J613 hypervisor and Linux trials. */
 #define PMP_FLOOR_J613_UUID "EFD60284-7C58-33A9-8522-CB3366AF6040"
+/*
+ * J615 (15-inch M3 MacBook Air, same SoC, DRAM and PMP tables): the 14.x PMP
+ * image that Linux starts from a legacy handoff tree. On owner hardware a
+ * PACC0 DCS 4/SOC 2 store read back from DVFS-STATE as 0x24 within 5.1 ms,
+ * and the valid floor 0 as 0x0.
+ */
+#define PMP_FLOOR_J615_UUID "3B18C886-4C70-349B-B1C4-70F35DE2C5CD"
+
+/*
+ * J615 is admitted only on the path tested on owner hardware, the generic
+ * T8122 report of a legacy handoff tree whose driver starts the 14.x PMP.
+ * The native J613 report of the experimental J615 25G83 tree is not covered.
+ * The parameter may veto the J615 like the J613. A J615 also needs its own
+ * opt-in until the floor is qualified on that board.
+ */
+static inline bool pmp_floor_j615_enabled(bool j615, bool native_default,
+					  bool legacy_report, bool allowed,
+					  bool opted_in)
+{
+	return j615 && !native_default && legacy_report && allowed && opted_in;
+}
+
+/* J613 runs only on its qualified firmware, J615 only on its 14.x image. */
+static inline bool pmp_floor_uuid_ok(const char *uuid, bool j615)
+{
+	if (j615)
+		return !strcmp(uuid, PMP_FLOOR_J615_UUID);
+	return !strcmp(uuid, PMP_FLOOR_J613_UUID);
+}
 #define PMP_FLOOR_REC_SIZE	0x7c	/* soc-device record */
 #define PMP_FLOOR_REC_NAME	0x74	/* its 8-byte, NUL-padded name */
 #define PMP_FLOOR_RANGE_SIZE	32	/* ptd-range record: id, base, count, name at 16 */
