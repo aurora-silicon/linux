@@ -19,11 +19,11 @@ static int usage(const char *name, int status)
 	return status;
 }
 
-/* Without user4k=on the kernel refuses every smaller size with EINVAL. */
+/* Booted with user4k=off, the kernel refuses every smaller size with EINVAL. */
 static int off_hint(unsigned long size, int error)
 {
 	if (error == EINVAL && size && size < getauxval(AT_PAGESZ))
-		fputs("Smaller page sizes need a kernel booted with user4k=on.\n",
+		fputs("Smaller page sizes are off: the kernel was booted with user4k=off.\n",
 		      stderr);
 	return 1;
 }
