@@ -1563,9 +1563,9 @@ impl crate::SepData {
     pub(crate) fn userbag_ioctl(&self, cmd: u32, arg: usize) -> Result<crate::bio::Handled> {
         crate::bio::require_admin()?;
         if !self.profile.per_user_keybags() {
-            // The 13.5 key store has no user-bag requests, and an enclave
-            // that never answers a user-bag DESIGNATE_KEYBAG would condemn
-            // the SKS endpoint for the boot: refuse before sending anything.
+            // An enclave that never answers a user-bag DESIGNATE_KEYBAG
+            // would condemn the SKS endpoint for the boot: refuse before
+            // sending anything.
             dev_info_ratelimited!(
                 self.dev,
                 "userbag: per-user key bags are not supported on this Mac's Secure Enclave key store\n"

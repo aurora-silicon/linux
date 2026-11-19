@@ -200,11 +200,16 @@ pub(crate) struct PlatformProfile {
 
 impl PlatformProfile {
     /// Whether the enclave can create and designate a NEW per-user key bag
-    /// (`userbag_ioctl`, linux#921). The user-bag requests are the variant-5
-    /// key store's; the 13.5 key store has no such request shapes. An enclave
-    /// with the measured unanswered-DESIGNATE defect is the exception.
+    /// (`userbag_ioctl`, linux#921): a rule of the key store, not of the SoC.
+    /// Both key stores have the user-bag requests, the variant-5 store's and
+    /// the 13.5 store's own shapes (`userbag_sepos13`, run on T8103). An
+    /// enclave with the measured unanswered-DESIGNATE defect is the only
+    /// exception, and a key store added later is refused until its requests
+    /// are written.
     pub(crate) const fn per_user_keybags(&self) -> bool {
-        matches!(self.key_store, KeyStore::Variant5) && !self.designate_unanswered
+        match self.key_store {
+            KeyStore::Variant5 | KeyStore::Sepos13 { .. } => !self.designate_unanswered,
+        }
     }
 }
 
@@ -838,10 +843,13 @@ mod tests {
 
     #[test]
     fn per_user_keybags_follow_the_key_store_and_the_designate_defect() {
-        // The 13.5 key store has no user-bag requests.
-        assert!(!T8103.per_user_keybags());
-        assert!(!T6000.per_user_keybags());
-        assert!(!T6020_SEPOS13.per_user_keybags());
+        // The 13.5 key store's own user-bag requests: run on T8103 (J293);
+        // T6000 and T6020 on the 13.5 store use the same requests.
+        for p in [&T8103, &T6000, &T6020_SEPOS13] {
+            assert!(matches!(p.key_store, KeyStore::Sepos13 { .. }));
+            assert!(!p.designate_unanswered);
+            assert!(p.per_user_keybags());
+        }
         // The measured unanswered DESIGNATE.
         assert!(T8112.designate_unanswered);
         assert!(!T8112.per_user_keybags());
