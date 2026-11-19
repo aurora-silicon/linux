@@ -355,8 +355,11 @@ struct tipd_data {
 };
 
 struct tps6598x {
-	/* Native H17 routes retain ENOSPC admission and their own HPD path. */
-	u8 h17_display:1;
+	/*
+	 * apple,display-native-hpd: the port's display route has its own HPD path
+	 * (the T8140 and T8142 display routes).
+	 */
+	u8 display_native_hpd:1;
 	struct device *dev;
 	struct regmap *regmap;
 	struct mutex lock; /* device lock */
