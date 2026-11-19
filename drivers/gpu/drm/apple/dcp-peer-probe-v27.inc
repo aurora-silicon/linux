@@ -35,7 +35,7 @@ static ssize_t peer_setup_test_store(struct device *dev,
 
 	if (kstrtobool(buf, &value) || !value)
 		return -EINVAL;
-	if (!peer_allocation_probe || !dcp)
+	if (!dcp)
 		return -EOPNOTSUPP;
 	wait = kzalloc(sizeof(*wait), GFP_KERNEL);
 	if (!wait)
@@ -82,15 +82,8 @@ static struct attribute *dcp_peer_probe_attrs[] = {
 	NULL,
 };
 
-static umode_t dcp_peer_probe_visible(struct kobject *kobj,
-				    struct attribute *attr, int n)
-{
-	return peer_allocation_probe ? attr->mode : 0;
-}
-
 static const struct attribute_group dcp_peer_probe_group = {
 	.attrs = dcp_peer_probe_attrs,
-	.is_visible = dcp_peer_probe_visible,
 };
 static const struct attribute_group *dcp_peer_probe_groups[] = {
 	&dcp_peer_probe_group,

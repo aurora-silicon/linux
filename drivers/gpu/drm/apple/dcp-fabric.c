@@ -39,9 +39,6 @@ module_param(tiled_split, bool, 0644);
 MODULE_PARM_DESC(tiled_split,
 		 "Drive both halves of a tiled Thunderbolt display (LG UltraFine 5K) on one pipeline, through its two DPTX ports (default: on)");
 
-static bool typec_follow_crtc = true;
-module_param(typec_follow_crtc, bool, 0444);
-
 /*
  * The hybrid pipeline (dcpext0: fixed HDMI PHY + Type-C routes) normally
  * comes last for a Type-C port, kept for an HDMI display.  On the J616s it
@@ -88,8 +85,6 @@ static bool dcp_typec_hybrid_first(void)
 
 	return policy < 0 ? READ_ONCE(typec_hybrid_first_dt) : policy > 0;
 }
-MODULE_PARM_DESC(typec_follow_crtc,
-		 "Let direct DP-alt routes follow their selected CRTC (default: on)");
 
 /* J714s: how long a tunnel's last pipeline is held for its return, in running time */
 #define DCP_TB_STICKY_MS	20000
@@ -359,7 +354,7 @@ bool dcp_typec_ordered_dual_stream(void)
  */
 bool dcp_typec_follows_crtc(struct apple_dcp *dcp)
 {
-	return typec_follow_crtc && dcp->nr_typec_routes &&
+	return dcp->nr_typec_routes &&
 	       !dcp->external && !dcp->external_native &&
 	       (dcp->fw_compat == DCP_FIRMWARE_V_12_3 ||
 		dcp->fw_compat == DCP_FIRMWARE_V_13_5);
