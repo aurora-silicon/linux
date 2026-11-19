@@ -98,6 +98,13 @@ properties:
       camera streams whether or not the indicator is shown. The indicator is
       software, not a privacy guarantee.
 
+  apple,module-tuning:
+    $ref: /schemas/types.yaml#/definitions/string
+    pattern: "^[0-9]{4}_[0-9]{2}$"
+    description:
+      Name of the camera module's own tuning (setfile), loaded in place of
+      the sensor's default one, e.g. "2226_02" for apple/isp_2226_02XX.dat.
+
   sensor-presets:
     type: object
     description:
