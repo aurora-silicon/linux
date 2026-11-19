@@ -1,0 +1,63 @@
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/num_modes
+Date:		November 2026
+Contact:	linux-usb@vger.kernel.org
+Description:
+		Number of Alternate Modes listed by the USB Billboard device
+		(bNumberOfAlternateModes).
+
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/preferred_mode
+Date:		November 2026
+Contact:	linux-usb@vger.kernel.org
+Description:
+		Index of the Alternate Mode the device prefers
+		(bPreferredAlternateMode).
+
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/vconn_power
+Date:		November 2026
+Contact:	linux-usb@vger.kernel.org
+Description:
+		VCONN power the device needs to run all its Alternate Modes:
+		"1W", "1.5W", "2W", "3W", "4W", "5W", "6W", "not-required" or
+		"reserved".
+
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/version
+Date:		November 2026
+Contact:	linux-usb@vger.kernel.org
+Description:
+		Billboard specification version the device implements
+		(bcdVersion), e.g. "1.21".
+
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/additional_failure_info
+Date:		November 2026
+Contact:	linux-usb@vger.kernel.org
+Description:
+		bAdditionalFailureInfo as reported by the device, in hex.
+
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/additional_info_url
+Date:		November 2026
+Contact:	linux-usb@vger.kernel.org
+Description:
+		The device's iAddtionalInfoURL string, empty if it has none.
+
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>/svid
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>/mode
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>/vdo
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>/description
+Date:		November 2026
+Contact:	linux-usb@vger.kernel.org
+Description:
+		Alternate Mode <N> as listed by the device: the Standard or
+		Vendor ID in hex (wSVID), the mode index within that SVID
+		(bAlternateMode), the mode's VDO from the Billboard AUM
+		Capability descriptor (only present when the device provides
+		one) and the iAlternateModeString string (empty if none).
+
+What:		/sys/bus/usb/devices/<INTERFACE>/billboard/altmode<N>/state
+Date:		November 2026
+Contact:	linux-usb@vger.kernel.org
+Description:
+		Result of the host's attempt to enter Alternate Mode <N>, from
+		bmConfigured: "configured", "not-attempted" (not attempted or
+		exited), "failed" (attempted but not entered) or "error"
+		(unspecified error). The driver also logs a warning for each
+		"failed" or "error" mode when it binds.

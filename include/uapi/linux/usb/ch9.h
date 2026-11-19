@@ -1143,6 +1143,47 @@ struct usb_ptm_cap_descriptor {
 } __attribute__((packed));
 
 #define USB_DT_USB_PTM_ID_SIZE		3
+
+/*-------------------------------------------------------------------------*/
+
+/*
+ * Billboard Capability and Billboard AUM Capability descriptors
+ * (USB Billboard Device Class Specification, Revision 1.21).
+ * Field names follow the specification, including iAddtionalInfoURL.
+ */
+#define	USB_BILLBOARD_CAP_TYPE		0x0d
+#define	USB_BILLBOARD_AUM_CAP_TYPE	0x0f
+
+struct usb_billboard_cap_descriptor {
+	__u8  bLength;
+	__u8  bDescriptorType;		/* USB_DT_DEVICE_CAPABILITY */
+	__u8  bDevCapabilityType;	/* USB_BILLBOARD_CAP_TYPE */
+	__u8  iAddtionalInfoURL;
+	__u8  bNumberOfAlternateModes;
+	__u8  bPreferredAlternateMode;
+	__le16 VCONNPower;
+	__u8  bmConfigured[32];		/* 2 bits per Alternate Mode */
+	__le16 bcdVersion;
+	__u8  bAdditionalFailureInfo;
+	__u8  bReserved;
+	struct {
+		__le16 wSVID;
+		__u8  bAlternateMode;
+		__u8  iAlternateModeString;
+	} __attribute__((packed)) aum[];
+} __attribute__((packed));
+
+#define USB_DT_BILLBOARD_CAP_SIZE(n)	(44 + 4 * (n))
+
+struct usb_billboard_aum_cap_descriptor {
+	__u8  bLength;
+	__u8  bDescriptorType;		/* USB_DT_DEVICE_CAPABILITY */
+	__u8  bDevCapabilityType;	/* USB_BILLBOARD_AUM_CAP_TYPE */
+	__u8  bIndex;
+	__le32 dwAlternateModeVdo;
+} __attribute__((packed));
+
+#define USB_DT_BILLBOARD_AUM_CAP_SIZE	8
 /*
  * The size of the descriptor for the Sublink Speed Attribute Count
  * (SSAC) specified in bmAttributes[4:0]. SSAC is zero-based
