@@ -1206,6 +1206,18 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), b->resume_replayed);
 }
 
+/*
+ * The sleep this notifier refuses does not happen, and the PM core's rollback gives PM_POST_SUSPEND
+ * only to the notifiers before the refusing one: undo PM_SUSPEND_PREPARE's block here, or every
+ * request would wait (-EAGAIN) until a later sleep completes.
+ */
+static void ane_fw_sleep_unblock(struct ane_fw_backend *b)
+{
+	WRITE_ONCE(b->in_sleep, false);
+	WRITE_ONCE(b->session.wake_blocked, false);
+	wake_up_all(&b->session.wake);
+}
+
 static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
 {
 	struct ane_fw_backend *b = container_of(nb, struct ane_fw_backend, pm_notifier);
@@ -1233,11 +1245,14 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 	if (event == PM_SUSPEND_PREPARE && retained) {
 		if (!ane_fw_sleep_prepare(b))
 			return NOTIFY_DONE;
+		ane_fw_sleep_unblock(b);
 		dev_warn_once(&b->pdev->dev, ANE_FW_SLEEP_REFUSED);
 		return NOTIFY_BAD;
 	}
 	/* Hibernation and restore stay refused. */
 	if (ane_fw_sleep_refused_cycle(event, retained, true)) {
+		if (event == PM_SUSPEND_PREPARE)
+			ane_fw_sleep_unblock(b);
 		dev_warn_once(&b->pdev->dev, ANE_FW_SLEEP_REFUSED);
 		return NOTIFY_BAD;
 	}
