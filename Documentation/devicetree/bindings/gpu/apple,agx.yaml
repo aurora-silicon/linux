@@ -136,6 +136,16 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: PMP firmware provider owning the GPU power vote and telemetry
 
+  "#cooling-cells":
+    const: 2
+    description: |
+      The GPU as a thermal cooling device: an absolute power ceiling the GPU
+      firmware applies. Cooling state N, for N in 0..100, requests (100 - N)
+      percent of the GPU's initialized maximum power, bounded below at 25
+      percent. State 0 leaves the firmware's own policy unchanged. Where the
+      running firmware's power inputs are unknown to the driver, a GPU with
+      this property does not start.
+
   operating-points-v2: true
 
   apple,csafr-min-sram-microvolt:
