@@ -395,6 +395,8 @@ struct ave_params {
 	u32 mbs; /* 16x16 macroblocks */
 	u32 fps_num, fps_den; /* frames per second = num / den */
 	u32 fps_int; /* the same, rounded */
+	/* The layout's encode settings, see struct ave_fw_layout. */
+	bool h264_inter;
 	u32 slots;
 	u32 refs; /* max_num_ref_frames + 1 */
 	bool bframes;

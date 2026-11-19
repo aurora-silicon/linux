@@ -49,6 +49,15 @@ the same firmware version and get the same settings, untested:
 
 - Two sessions per boot. Four H.264 sessions, two on each encoder, ran in real
   time for five minutes at their target rates; a fifth STREAMON got EBUSY.
+- H.264 P pictures as references. With the Process timescale word nonzero,
+  every P slice had nal_ref_idc 0; with it zero, P slices have nal_ref_idc 1
+  and frame_num counts up. The driver writes zero for H.264.
+- H.264 motion lambdas, Start 0xff98 (full-pel search), 0xffa4 (inter mode
+  decision) and 0xffa8 (intra mode decision). With all three zero, about 94% of
+  P macroblocks were 8x8 partitions and constant quality 0 on a 720p lecture
+  clip came out at 8.4 Mbit/s. With 64, 256 and 64, 8x8 partitions became rare,
+  the same clip came out at 0.30 Mbit/s, and quality 50 took 1.8 times the bits
+  of libx264 at the same PSNR.
 
 Lifecycle-only validation
 -------------------------
