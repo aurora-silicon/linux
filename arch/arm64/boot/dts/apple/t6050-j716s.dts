@@ -357,9 +357,8 @@
 
 /*
  * Right port (ATC2), the same chain: the SN201202x hpm2 on nub_spmi_a1,
- * polled, and the connector graph into usb_drd2 and the combo PHY. Only the
- * USB route: dcpext0's DisplayPort route through ATC2 (atc2_xbar, the PHY's
- * DP lane, the connector's DP port) stays off. The addresses, interrupts and
+ * polled, and the connector graph into usb_drd2 and the combo PHY. The
+ * DisplayPort routes are at the end of this file. The addresses, interrupts and
  * power states in t6050-die0.dtsi match this board's ADT (atc-phy2,
  * acio-phy-cpu2, usb-drd2, dart-usb2, pmgr ATC2_*). The boot loader puts
  * hpm2 in S0, parks the PIPE and fills the PHY's tunables.
@@ -570,3 +569,50 @@
 
 #define T6050_J716S
 #include "t6050-peripherals.dtsi"
+
+/*
+ * External displays: DisplayPort alt mode on the left-front (ATC1) and right
+ * (ATC2) ports, through dcpext0 and dcpext2 (t6050-display.dtsi). After
+ * t6050-peripherals.dtsi, which defines dcpext1..3.
+ */
+#include "t6050-display.dtsi"
+
+&typec1 {
+	ports {
+		port@2 {
+			reg = <2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			atc1_dp_dcpext0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext0_atc1>;
+			};
+
+			atc1_dp_dcpext2: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext2_atc1>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@2 {
+			reg = <2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			atc2_dp_dcpext0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext0_atc2>;
+			};
+
+			atc2_dp_dcpext2: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext2_atc2>;
+			};
+		};
+	};
+};
