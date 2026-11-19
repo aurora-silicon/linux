@@ -1211,6 +1211,12 @@ struct apple_dcp {
 	struct dcp_cec *cec;
 };
 
+/* A DCP driven through the firmware's iBoot interface alone. */
+static inline bool dcp_is_iboot(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_IBOOT;
+}
+
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
 static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
 {
