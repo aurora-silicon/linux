@@ -62,7 +62,7 @@ Source review on 2026-10-16 was limited to public implementation files;
 upstream agent/AI instruction files were not read. No implementation was
 copied from proprietary sources.
 
-* [Aurora tipd at 94fb23346d52](https://github.com/AsahiLinux/linux/blob/94fb23346d522edf53722357c426a3e58030beea/drivers/usb/typec/tipd/core.c)
+* [Asahi tipd at 94fb23346d52](https://github.com/AsahiLinux/linux/blob/94fb23346d522edf53722357c426a3e58030beea/drivers/usb/typec/tipd/core.c)
   registers port DP/TBT altmodes and partner identity, but has no
   `typec_partner_register_altmode` call or Billboard desktop hint in that
   driver. This is a bounded driver inspection, not a claim about every

@@ -71,3 +71,6 @@ obj-$(CONFIG_APPLE_REGVIEW) += apple-regview.o
 apple-regview-y := regview.o
 
 obj-$(CONFIG_APPLE_AURORA_BOOT_SECURITY) += aurora-boot-security.o
+
+# LEGACY-ASAHI(2027-02-28): copies asahi,* /chosen names to aurora,* for older boot loaders.
+obj-$(CONFIG_ARCH_APPLE) += aurora-chosen-legacy.o
