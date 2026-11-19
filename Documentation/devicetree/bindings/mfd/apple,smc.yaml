@@ -51,6 +51,12 @@ properties:
   mboxes:
     maxItems: 1
 
+  apple,lid-open-wake-holdoff-ms:
+    description:
+      Time after a system sleep starts during which a lid-open report from
+      the SMC does not wake the system, for boards whose SMC can report the
+      lid open, with its lid state agreeing, while the lid stays shut.
+
   gpio:
     oneOf:
       - $ref: /schemas/gpio/apple,smc-gpio.yaml
