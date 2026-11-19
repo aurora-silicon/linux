@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Apple SPMI controller interrupt register layout, shared with the host check
- * (spmi-apple-irq-host-test.c).
+ * Apple SPMI controller interrupt register layout.
  *
  * Peripheral sources 0..255 come first, then the RX FIFO notification (256) and
  * the controller's own fault sources. Source n sits in bit n % 32 of word n / 32
