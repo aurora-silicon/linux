@@ -236,6 +236,12 @@ struct dwc3_apple {
 	 */
 	bool ss_retry;
 	/*
+	 * J714s, T6050 Type-C: the start after an attach (a boot's included) looks once for the
+	 * SuperSpeed side of a USB2 hub that says it has one (@ss_attach); the attach that follows
+	 * a replug this driver asked for (@ss_replugged) is not looked at again.
+	 */
+	bool ss_attach, ss_replugged;
+	/*
 	 * J714s: a host on a USB4 router's USB3 tunnel, kept suspended in place through the
 	 * router's sleep (see dwc3_apple_tunnel_keep()): the PHY's result once taken, the role the
 	 * port controller asked for meanwhile, and the restart that follows a parked PIPE.
@@ -1079,12 +1085,13 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc);
 
 /*
  * Any way a fixed-hub host came out of a sleep, its hub must be there a little later. TEST
- * (J714s): so must a Type-C host's SuperSpeed device, see dwc3_apple_ss_check().
+ * (J714s): so must a Type-C host's SuperSpeed device, after a sleep or an attach, see
+ * dwc3_apple_ss_check().
  */
 static void dwc3_apple_check_hub_later(struct dwc3_apple *appledwc)
 {
 	lockdep_assert_held(&appledwc->lock);
-	if ((appledwc->fixed_hub || appledwc->ss_retry) &&
+	if ((appledwc->fixed_hub || appledwc->ss_retry || appledwc->ss_attach) &&
 	    !appledwc->shutting_down && !appledwc->sleep_dead &&
 	    !appledwc->sleep_stopped && appledwc->state == DWC3_APPLE_HOST &&
 	    appledwc->core_active && !appledwc->core_exit_pending &&
@@ -1302,6 +1309,38 @@ static bool dwc3_apple_ss_seen(struct dwc3_apple *appledwc)
 }
 
 /*
+ * J714s, T6050 Type-C: after an attach, where what was there before isn't known, whether the
+ * USB2 device @hub should have a SuperSpeed side up by now: a hub whose BOS has the SuperSpeed
+ * capability (the USB2 side of a USB3 hub), with the PHY's USB3 PIPE on its own lanes (not four
+ * DisplayPort lanes, a USB2-only fallback or a USB4 tunnel). Not with storage behind the hub,
+ * or a hub whose devices aren't looked at: a replug would pull a filesystem that may be
+ * mounted. Called with @hub's lock.
+ */
+static bool dwc3_apple_ss_expected(struct dwc3_apple *appledwc, struct usb_device *hub)
+{
+	struct usb_device *child;
+	int port1;
+
+	if (hub->descriptor.bDeviceClass != USB_CLASS_HUB || !hub->bos || !hub->bos->ss_cap ||
+	    dwc3_apple_tunnel_phy(appledwc, APPLE_T6050_CIO_USB_PIPE_LANES) <= 0)
+		return false;
+	usb_hub_for_each_child(hub, port1, child) {
+		struct usb_host_config *cfg;
+		bool skip = child->descriptor.bDeviceClass == USB_CLASS_HUB;
+
+		usb_lock_device(child);
+		cfg = child->actconfig;
+		for (unsigned int i = 0; cfg && i < cfg->desc.bNumInterfaces && !skip; i++)
+			skip = cfg->interface[i]->cur_altsetting->desc.bInterfaceClass ==
+			       USB_CLASS_MASS_STORAGE;
+		usb_unlock_device(child);
+		if (skip)
+			return false;
+	}
+	return true;
+}
+
+/*
  * TEST (J714s, T6050 Type-C): the USB3 hub behind a DP alt mode port (Dell S2725QC: 0bda:5409
  * and 0bda:0409, PHY mode 3, DP2) brings its SuperSpeed side up 0.26 to 0.28 s after its USB2
  * side enumerates, in 28 of the 29 wakes that had it and at all but two boots that had it,
@@ -1321,12 +1360,13 @@ static void dwc3_apple_ss_check(struct dwc3_apple *appledwc)
 	struct usb_device *usb2 = NULL;
 	u32 portsc[2] = {}, ltssm = 0;
 	unsigned int nports = 0;
-	bool ss = false;
+	bool ss = false, after_sleep = false;
 
 	scoped_guard(mutex, &appledwc->lock) {
-		if (!appledwc->ss_retry)
+		after_sleep = appledwc->ss_retry;
+		if (!after_sleep && !appledwc->ss_attach)
 			return;
-		appledwc->ss_retry = false;
+		appledwc->ss_retry = appledwc->ss_attach = false;
 		if (appledwc->shutting_down || appledwc->sleep_dead || appledwc->sleep_stopped ||
 		    !appledwc->core_active || appledwc->core_exit_pending ||
 		    READ_ONCE(appledwc->sleep_phase) != DWC3_APPLE_SLEEP_IDLE ||
@@ -1334,13 +1374,29 @@ static void dwc3_apple_ss_check(struct dwc3_apple *appledwc)
 		    dwc3_apple_ss_ports(appledwc, &usb2, &ss, portsc, &nports))
 			return;
 		if (ss || !usb2) {
-			if (ss)
+			if (ss && after_sleep)
 				dev_info(appledwc->dev,
 					 "TEST: SuperSpeed device back after the sleep\n");
 			usb_put_dev(usb2);
 			return;
 		}
 		ltssm = dwc3_readl(&appledwc->dwc, DWC3_GDBGLTSSM);
+	}
+
+	/*
+	 * J714s: the same hub loses its SuperSpeed side at some attaches too (about one boot in
+	 * seven with the Dell on its port, 11-19), and nothing else brings it back either.
+	 */
+	if (!after_sleep) {
+		bool expected;
+
+		usb_lock_device(usb2);
+		expected = dwc3_apple_ss_expected(appledwc, usb2);
+		usb_unlock_device(usb2);
+		if (!expected) {
+			usb_put_dev(usb2);
+			return;
+		}
 	}
 
 	/*
@@ -1354,13 +1410,21 @@ static void dwc3_apple_ss_check(struct dwc3_apple *appledwc)
 		int (*replug)(struct usb_role_switch *sw, u8 seconds) = symbol_get(tipd_port_replug);
 		int ret = -ENOENT;
 
+		/* Before the replug: its detach and attach may come before it returns. */
+		scoped_guard(mutex, &appledwc->lock)
+			appledwc->ss_replugged = true;
 		if (replug) {
 			ret = replug(appledwc->role_sw, 1);
 			symbol_put(tipd_port_replug);
 		}
+		if (ret) {
+			guard(mutex)(&appledwc->lock);
+			appledwc->ss_replugged = false;
+		}
 		dev_warn(appledwc->dev,
-			 "SuperSpeed side of %04x:%04x not back after the sleep (PORTSC %#010x %#010x (%u), LTSSM %#010x): port replug requested (%d)\n",
+			 "SuperSpeed side of %04x:%04x not %s (PORTSC %#010x %#010x (%u), LTSSM %#010x): port replug requested (%d)\n",
 			 le16_to_cpu(usb2->descriptor.idVendor), le16_to_cpu(usb2->descriptor.idProduct),
+			 after_sleep ? "back after the sleep" : "up after the attach",
 			 portsc[0], portsc[1], nports, ltssm, ret);
 	}
 	usb_put_dev(usb2);
@@ -1377,7 +1441,7 @@ static void dwc3_apple_hub_check(struct work_struct *work)
 						   hub_check);
 	int ret;
 
-	/* TEST (J714s): a Type-C host's SuperSpeed device after a sleep. */
+	/* TEST (J714s): a Type-C host's SuperSpeed device after a sleep or an attach. */
 	if (!appledwc->fixed_hub) {
 		dwc3_apple_ss_check(appledwc);
 		return;
@@ -1493,7 +1557,7 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
 	case USB_ROLE_NONE:
 		/* Nothing to do if no cable is connected */
 		appledwc->sleep_phy_pending = false;
-		appledwc->ss_retry = false;
+		appledwc->ss_retry = appledwc->ss_attach = false;
 		return 0;
 	case USB_ROLE_HOST:
 	case USB_ROLE_DEVICE:
@@ -1502,9 +1566,17 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
 		 * before the port controller's mode request. The error goes back as it is, so the
 		 * port controller tries again, without a line in the log.
 		 */
-		/* TEST (J714s): only the start after a sleep looks for its SuperSpeed device. */
-		if (!appledwc->sleep_phy_pending)
+		/*
+		 * TEST (J714s): the start after a sleep looks for the SuperSpeed device it had; any
+		 * other host start, for one its USB2 device says it has, unless it is the attach that
+		 * follows this driver's own replug.
+		 */
+		if (!appledwc->sleep_phy_pending) {
 			appledwc->ss_retry = false;
+			appledwc->ss_attach = role == USB_ROLE_HOST && !appledwc->ss_replugged &&
+					      dwc3_apple_ss_port(appledwc);
+			appledwc->ss_replugged = false;
+		}
 		appledwc->sleep_phy_wait = appledwc->sleep_phy_pending;
 		ret = dwc3_apple_init(appledwc, dwc3_apple_state_for_role(role));
 		appledwc->sleep_phy_wait = false;
@@ -1570,6 +1642,7 @@ static int dwc3_apple_sleep_stop(struct dwc3_apple *appledwc)
 		appledwc->sleep_stopped = true;
 		/* TEST (J714s): looked for once after the start, see dwc3_apple_ss_check(). */
 		appledwc->ss_retry = dwc3_apple_ss_seen(appledwc);
+		appledwc->ss_attach = false;
 	}
 	ret = dwc3_apple_exit(appledwc);
 	if (!ret)
