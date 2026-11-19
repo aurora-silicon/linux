@@ -2953,9 +2953,28 @@ static const struct hid_device_id magic_mice[] = {
 };
 MODULE_DEVICE_TABLE(hid, magic_mice);
 
+/*
+ * Every interface of an internal SPI or DockChannel controller carries the
+ * controller's IDs. Only the trackpad is ours; leave the others to their own
+ * driver or to hid-generic.
+ */
+static bool magicmouse_match(struct hid_device *hdev, bool ignore_special_driver)
+{
+	if (ignore_special_driver ||
+	    (hdev->quirks & HID_QUIRK_IGNORE_SPECIAL_DRIVER))
+		return false;
+
+	if ((hdev->bus == BUS_SPI || hdev->bus == BUS_HOST) &&
+	    hdev->vendor == SPI_VENDOR_ID_APPLE)
+		return hdev->type == HID_TYPE_SPI_MOUSE;
+
+	return true;
+}
+
 static struct hid_driver magicmouse_driver = {
 	.name = "magicmouse",
 	.id_table = magic_mice,
+	.match = magicmouse_match,
 	.probe = magicmouse_probe,
 	.remove = magicmouse_remove,
 	.report_fixup = magicmouse_report_fixup,
