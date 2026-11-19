@@ -1176,6 +1176,12 @@ static const struct isp_mmio_window apple_isp_fw_mmio_t6040[] = {
  * map) and as aurora's m1n1 proxy captures with it: no coprocessor reset,
  * four broadcast-clear windows in eight slots, the scaler 1 output path and
  * no capture metadata pool or watchdog.
+ *
+ * Its firmware starts again from its own memory, as T8140's does, so the
+ * ISP is powered only while the camera is in use: the firmware starts at
+ * probe to detect the camera and stops again, and each stream starts it.
+ * It stays up for 5 s after a stream, as on T8140, and the coprocessor is
+ * quiesced before its domains go off.
  */
 static const struct apple_isp_hw apple_isp_hw_t6040 = {
 	.gen = ISP_GEN_T6040,
@@ -1208,9 +1214,13 @@ static const struct apple_isp_hw apple_isp_hw_t6040 = {
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t6040),
 
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.coproc_status = ISP_COPROC_STATUS_T8140,
+	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
 	.boot_mode = 1,
 	.shared_size = 0xde600000,
 	.resident_fw = true,
+	.fw_restart = true,
+	.fw_idle_ms = 5000,
 	.meta_exposure = true,
 };
 
@@ -1331,11 +1341,21 @@ static const struct apple_isp_hw apple_isp_hw_t8142 = {
 	.mbox2_offset = 0x410,
 	.mbox_irq_route = true,
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.coproc_status = ISP_COPROC_STATUS_T8140,
+	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
 	.fw_mmio = apple_isp_fw_mmio_t8142,
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8142),
 	.boot_mode = 1,
 	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
 	.resident_fw = true,
+	/*
+	 * As on T6040: the firmware starts at probe to detect the camera and
+	 * stops again, each stream starts it from its own memory, and it stays
+	 * up for 5 s after a stream. The coprocessor is quiesced before its
+	 * domains go off.
+	 */
+	.fw_restart = true,
+	.fw_idle_ms = 5000,
 	/* The J813 IMX958 runs the xx24 setfile 2224_01, as T6040 does. */
 	.setfile_stride_fixup = true,
 };

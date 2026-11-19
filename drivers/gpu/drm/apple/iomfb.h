@@ -211,10 +211,17 @@ struct dcp_method_entry {
 	char tag[4];
 	/* H17G shares the H17P transport but changes selected method IDs. */
 	char tag_h17g[4];
+	char tag_ext26[4];
 };
+
+#define IOMFB_METHOD_EXT26(tag, native, name) [name] = { #name, \
+	{ tag[0], tag[1], tag[2], tag[3] }, {0}, \
+	{ native[0], native[1], native[2], native[3] } }
 
 /* The IOMFB method table of a firmware 27.x build, by its compat string; NULL if unknown. */
 const struct dcp_method_entry *iomfb_v27_methods(const char *compat);
+const struct dcp_method_entry *iomfb_v27_methods_j714s(struct device *dev,
+						       const struct dcp_method_entry *methods);
 /* The first method of a firmware 27.x table that has no ID, NULL if none. */
 const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 				     unsigned int *count);
@@ -224,6 +231,18 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
 struct apple_dcp;
 bool iomfb_channels_idle(struct apple_dcp *dcp);
+int iomfb_v27_sleep_rpc(struct apple_dcp *dcp, bool a500, bool on);
+bool iomfb_v27_sleep_described(struct apple_dcp *dcp);
+void iomfb_v27_wake_present(struct apple_dcp *dcp);
+int iomfb_v27_sleep_plain(struct apple_dcp *dcp, bool on);
+int iomfb_v27_sleep_call(struct apple_dcp *dcp, const char *tag, const void *in,
+			 u32 in_len, u32 out_len);
+int iomfb_v27_sleep_a115(struct apple_dcp *dcp, bool awake);
+int iomfb_v27_sleep_call_a442(struct apple_dcp *dcp, const char *tag, u32 out_len, u8 key);
+/* The display stage's DT arguments: A414's eight, then A487's four. */
+#define IOMFB_V27_STAGE_ARGS	12
+int iomfb_v27_display_args(struct apple_dcp *dcp, bool stage, u8 *args);
+bool iomfb_v27_display_described(struct apple_dcp *dcp);
 bool iomfb_check_callback_h17p(struct apple_dcp *dcp, int tag, u32 in_len,
 			       u32 out_len);
 /* Desktop 26.6: does the record hold what the tag's handler reads and writes? */
@@ -358,6 +377,12 @@ struct iomfb_property {
 	u32 id;
 	u32 value;
 } __packed;
+
+/*
+ * The two IOMFB parameters macOS sends to an external display after each mode
+ * set (see dcp_external_hdr_hints()).  Split out so it can be unit tested.
+ */
+void iomfb_external_hdr_hint_values(bool pq, struct iomfb_property out[2]);
 
 struct iomfb_get_color_remap_mode_req {
 	u32 mode;

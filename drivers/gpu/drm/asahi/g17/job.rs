@@ -4,7 +4,7 @@
 
 use super::{command::Validated, completion::Completion, context::Context};
 use crate::driver::AsahiDrmDevice;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use kernel::{
     bindings, c_str,
     cpu::CpuId,
@@ -128,6 +128,9 @@ pub(crate) struct Packet {
     cancelled: AtomicBool,
     early: AtomicI32,
     backlog: AtomicBool,
+    /// When the job's watchdog allowance ends (host ns, [`super::timeout::Allowance::end`]):
+    /// zero under the default allowance, `u64::MAX` for a longer one not yet placed.
+    allowance_end: AtomicU64,
 }
 
 impl Packet {
@@ -160,9 +163,16 @@ impl Packet {
                 cancelled: AtomicBool::new(false),
                 early: AtomicI32::new(0),
                 backlog: AtomicBool::new(false),
+                allowance_end: AtomicU64::new(0),
             },
             GFP_KERNEL,
         )?)
+    }
+
+    /// Its own watchdog still renews the job for the allowance its queue asked for at `now`
+    /// ([`super::timeout::Head::excused`]).
+    pub(crate) fn within_allowance(&self, now: u64) -> bool {
+        now < self.allowance_end.load(Ordering::Relaxed)
     }
 
     pub(crate) fn engine(&self) -> Engine {
@@ -350,13 +360,20 @@ pub(crate) trait Backend: Send + Sync {
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence>;
     fn timed_out(&self, packet: Arc<Packet>) -> sched::Status;
     fn cancel(&self, packet: Arc<Packet>);
-    /// Transfer a timeout to an outstanding off-lock graph transaction, if any.
-    fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool;
+    /// Transfer a timeout to an outstanding off-lock graph transaction, if any, or decide it
+    /// against other VMs' older work ([`super::timeout::decide`]). `renewals` and `excused`
+    /// count the job's earlier [`super::timeout::Decision::Defer`] and
+    /// [`super::timeout::Decision::Excuse`] results; the job is renewed on either.
+    /// [`super::timeout::Decision::Retire`] only once its completion has been signalled.
+    fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8, excused: u32)
+        -> super::timeout::Decision;
     /// A long job of another queue is running beside `packet`.
     fn long_job_beside(&self, _packet: &Arc<Packet>) -> bool { false }
     /// A published job's deadline may be renewed while other work retires
     /// ([`super::timeout::renew_shared`]).
     fn renews_shared(&self) -> bool { true }
+    /// The watchdog stopped renewing `packet`: it is failed as timed out next, if it is published.
+    fn gave_up(&self, _packet: &Arc<Packet>, _why: &super::timeout::GaveUp) {}
     /// Return true only after taking publication ownership and recording its result.
     fn try_early(&self, packet: &Arc<Packet>) -> bool;
     fn count_backlog(&self, packet: &Packet);
@@ -365,13 +382,19 @@ pub(crate) trait Backend: Send + Sync {
 struct Job<B: Backend> {
     backend: Arc<B>,
     packet: Arc<Packet>,
+    /// The watchdog allowance of the job ([`super::timeout::Allowance`]), in ms.
+    allowance_ms: u32,
 }
 
 struct Timeout<B: Backend> {
     backend: Arc<B>,
     victim_renewals: u8,
+    /// Polls excused behind other VMs' live work inside its allowance
+    /// ([`super::timeout::Decision::Excuse`]).
+    excused: u32,
     execution_renewals: u8,
     shared_renewals: u8,
+    allowance: super::timeout::Allowance,
     packet: Arc<Packet>,
 }
 
@@ -395,14 +418,29 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         Timeout {
             backend: self.backend.clone(),
             victim_renewals: 0,
+            excused: 0,
             execution_renewals: 0,
             shared_renewals: 0,
+            allowance: super::timeout::Allowance::new(self.allowance_ms),
             packet: self.packet.clone(),
         }
     }
 
     fn false_timeout(job: &mut Timeout<B>, finished: bool) -> bool {
         if finished || job.packet.completion.take_replay_timeout() {
+            return true;
+        }
+        // Within the allowance its queue asked for. Past it, the deferrals below still apply;
+        // the shared renewals run alongside an allowance rather than after it.
+        let placing = job.allowance.placing_after_wait(job.packet.is_published());
+        let within = job.allowance.renew(job.packet.is_published(), super::now_ns());
+        // Other VMs' watchdogs read the end to excuse work waiting behind this one.
+        if let Some(end) = job.allowance.end() {
+            job.packet.allowance_end.store(end, Ordering::Relaxed);
+        }
+        if within {
+            super::timeout::count_allowance_poll(job.allowance.asked() && !placing,
+                &mut job.shared_renewals);
             return true;
         }
         if super::timeout::renew_execution(
@@ -412,17 +450,35 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         }
         // Other work retiring means the GPU is shared, not hung. So does another long job
         // running beside a long job, though neither retires until it ends.
-        let shared = job.backend.renews_shared()
-            && (super::timeout::retiring(super::recovery::since_retired(super::now_ns()))
+        let renews_shared = job.backend.renews_shared();
+        let since_retired = super::recovery::since_retired(super::now_ns());
+        let shared = renews_shared
+            && (super::timeout::retiring(since_retired)
                 || (job.packet.command.long_job() && job.backend.long_job_beside(&job.packet)));
         if super::timeout::renew_shared(job.packet.is_published(), shared, &mut job.shared_renewals) {
             return true;
         }
-        let deferred = job.backend.defer_timeout(&job.packet, job.victim_renewals);
-        if deferred {
-            job.victim_renewals = job.victim_renewals.saturating_add(1);
+        match job.backend.defer_timeout(&job.packet, job.victim_renewals, job.excused) {
+            super::timeout::Decision::Defer => {
+                job.victim_renewals = job.victim_renewals.saturating_add(1);
+                true
+            }
+            super::timeout::Decision::Excuse => {
+                job.excused = job.excused.saturating_add(1);
+                true
+            }
+            // The backend retired the job on its completion record: its fence has signalled.
+            super::timeout::Decision::Retire => true,
+            decision @ (super::timeout::Decision::Own | super::timeout::Decision::Spare) => {
+                // The sharing inputs are the ones the renewal above was decided on.
+                job.backend.gave_up(&job.packet, &super::timeout::GaveUp::new(
+                    &job.allowance, super::now_ns(), job.packet.command.long_job(),
+                    job.execution_renewals, renews_shared, job.shared_renewals, since_retired,
+                    job.victim_renewals, job.excused, decision,
+                ));
+                false
+            }
         }
-        deferred
     }
 
     fn prepare(job: &mut Self) -> Option<Fence> {
@@ -457,6 +513,7 @@ pub(crate) struct Scheduler<B: Backend> {
     entity: sched::Entity<Job<B>>,
     _scheduler: sched::Scheduler<Job<B>>,
     backend: Arc<B>,
+    allowance_ms: u32,
 }
 
 #[derive(Clone)]
@@ -486,7 +543,11 @@ impl Fences {
 }
 
 impl<B: Backend> Scheduler<B> {
-    pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
+    /// `allowance_ms`: the watchdog allowance of each job ([`super::timeout::allowance_ms`]);
+    /// the watchdog still polls every [`TIMEOUT_MS`].
+    pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine, allowance_ms: u32)
+        -> Result<Self>
+    {
         let (credits, name) = match engine {
             Engine::Render => (
                 RENDER_CREDITS.checked_mul(backend.render_pairs()).ok_or(EOVERFLOW)?,
@@ -513,6 +574,7 @@ impl<B: Backend> Scheduler<B> {
             entity,
             _scheduler: scheduler,
             backend,
+            allowance_ms,
         })
     }
 
@@ -535,11 +597,15 @@ impl<B: Backend> Scheduler<B> {
         } else {
             None
         };
+        if self.allowance_ms > super::timeout::DEFAULT_ALLOWANCE_MS {
+            packet.allowance_end.store(u64::MAX, Ordering::Relaxed);
+        }
         let mut job = self.entity.new_job(
             1,
             Job {
                 backend: self.backend.clone(),
                 packet: packet.clone(),
+                allowance_ms: self.allowance_ms,
             },
         )?;
         if dependencies.len() > MERGED_DEPENDENCIES {

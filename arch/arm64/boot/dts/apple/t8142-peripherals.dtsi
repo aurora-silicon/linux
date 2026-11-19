@@ -149,6 +149,73 @@
 		status = "disabled";
 	};
 
+	/*
+	 * The Neural Engine's three DARTs (ADT dart-ane, one interrupt for all):
+	 * revision 0x204, 16 streams; SIDs 1-7 are the exclave's and 10/13
+	 * bypass. The cold profile leaves every inherited stream alone and
+	 * gives the kernel only SID0.
+	 */
+	ane_dart0: iommu@421800000 {
+		compatible = "apple,t8142-ane-dart", "apple,t8142-dart",
+			     "apple,t8110-dart";
+		reg = <0x4 0x21800000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		/* The firmware DVAs reach 0x100_xxxx_xxxx. */
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		status = "disabled";
+	};
+
+	ane_dart1: iommu@421820000 {
+		compatible = "apple,t8142-ane-dart", "apple,t8142-dart",
+			     "apple,t8110-dart";
+		reg = <0x4 0x21820000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		status = "disabled";
+	};
+
+	ane_dart2: iommu@421840000 {
+		compatible = "apple,t8142-ane-dart", "apple,t8142-dart",
+			     "apple,t8110-dart";
+		reg = <0x4 0x21840000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		status = "disabled";
+	};
+
+	/*
+	 * The Neural Engine (ADT /arm-io/ane, "ane,t8132exclave", ane-type 0x210):
+	 * the H17 engine, exclave-assigned, with firmware that iBoot preloads; the
+	 * boot loader hands the preload over as firmware-text and firmware-data.
+	 * PWGATE is the ADT's reg[2] (PMGR +0x24000) + 0x3640, measured under
+	 * macOS 27.2.1.
+	 */
+	ane: ane@420000000 {
+		compatible = "apple,t8142-ane";
+		reg = <0x4 0x20000000 0x0 0x2000000>,
+		      <0x3 0x80700000 0x0 0x18000>,
+		      <0x3 0x80727640 0x0 0x34>;
+		reg-names = "engine", "pmgr", "pwgate";
+		interrupts = <AIC_IRQ 751 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 764 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+		power-domains = <&ps_ane_sys>;
+		apple,firmware-preloaded;
+		apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
+		/* Inclusive SID0 identity windows from the ADT's dart-ane dapf-instance-0. */
+		apple,dapf-ranges = /bits/ 64 <0x4a1668000 0x4a1668003
+					     0x3807002e8 0x3807002eb
+					     0x38070c008 0x38070c00b
+					     0x582668000 0x582668003>;
+		status = "disabled";
+	};
+
 	scaler0_dart: iommu@305260000 {
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x3 0x5260000 0x0 0x20000>;
@@ -159,11 +226,37 @@
 		status = "disabled";
 	};
 
+	/* ADT dart-jpeg: one DART for both engines, jpeg0 on SID 0, jpeg1 on SID 1. */
 	jpeg_dart: iommu@301020000 {
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x3 0x1020000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 1157 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		/* ADT vm-base 0x100_0000_0000, vm-size 0x300_0000_0000 */
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		power-domains = <&ps_jpg>;
+		status = "disabled";
+	};
+
+	/*
+	 * ADT jpeg0/jpeg1 ("jpeg,t8101", hw-type 0x110010). Their power-gates
+	 * JPG0-V/JPG1-V are virtual PMGR entries under JPG.
+	 */
+	jpeg0: jpeg@301000000 {
+		compatible = "apple,t8142-jpeg", "apple,jpeg";
+		reg = <0x3 0x1000000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1156 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&jpeg_dart 0>;
+		power-domains = <&ps_jpg>;
+		status = "disabled";
+	};
+
+	jpeg1: jpeg@301060000 {
+		compatible = "apple,t8142-jpeg", "apple,jpeg";
+		reg = <0x3 0x1060000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1159 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&jpeg_dart 1>;
+		power-domains = <&ps_jpg>;
 		status = "disabled";
 	};
 
@@ -462,6 +555,26 @@
 };
 
 &pmgr {
+	/* ADT pmgr device JPG (id 64), parent AFISOCNI1 (no power state). */
+	ps_jpg: power-controller@2a0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "jpg";
+		status = "disabled";
+	};
+
+	/* ADT pmgr device ANE_SYS (id 73), parent AFISOCNI3 (no power state). */
+	ps_ane_sys: power-controller@2e8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ane_sys";
+		status = "disabled";
+	};
+
 	ps_msr: power-controller@2a8 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2a8 4>;
@@ -477,6 +590,70 @@
 		#reset-cells = <0>;
 		label = "msr-ase-core";
 		power-domains = <&ps_msr>;
+		status = "disabled";
+	};
+
+	/*
+	 * The video encoder's power states (J815 ADT pmgr): VENC_SYS (id 63,
+	 * parent AFISOCNI0, no power state) feeds VENC_DMA, which feeds the two
+	 * pipes and ME0; ME1 sits under ME0. The same tree as one A18 Pro encoder.
+	 */
+	ps_venc_sys: power-controller@298 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x298 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc_sys";
+		status = "disabled";
+	};
+
+	ps_venc_dma: power-controller@8000 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc_dma";
+		power-domains = <&ps_venc_sys>;
+		status = "disabled";
+	};
+
+	ps_venc_pipe4: power-controller@8008 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc_pipe4";
+		power-domains = <&ps_venc_dma>;
+		status = "disabled";
+	};
+
+	ps_venc_pipe5: power-controller@8010 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc_pipe5";
+		power-domains = <&ps_venc_dma>;
+		status = "disabled";
+	};
+
+	ps_venc_me0: power-controller@8018 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc_me0";
+		power-domains = <&ps_venc_dma>;
+		status = "disabled";
+	};
+
+	ps_venc_me1: power-controller@8020 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc_me1";
+		power-domains = <&ps_venc_me0>;
 		status = "disabled";
 	};
 };
@@ -540,6 +717,53 @@
 		      <0x2 0x10000000 0x0 0xff4000>;
 		#clock-cells = <1>;
 		apple,pmgr = <&pmgr>;
+		status = "disabled";
+	};
+
+	/*
+	 * The video encoder (ADT ave, "ave2", soc-id t8142): the A18 Pro's
+	 * encoder at 0x281000000 instead of 0x285000000. Its firmware is
+	 * preloaded by iBoot and handed over by the boot loader, which adds the
+	 * memory regions. dart-ave is two DARTs (DART and CPUDART) on one IRQ;
+	 * stream 12 carries the temporal filter engines and must translate
+	 * through the encoder's domain, not bypass.
+	 */
+	ave_dart0: iommu@281080000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x2 0x81080000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1096 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
+		status = "disabled";
+	};
+
+	ave_dart1: iommu@2810a0000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x2 0x810a0000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1096 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
+		status = "disabled";
+	};
+
+	ave: video-codec@281100000 {
+		compatible = "apple,t8142-ave";
+		reg = <0x2 0x81100000 0x0 0x45c000>,
+		      <0x2 0x81050000 0x0 0x4000>,
+		      <0x2 0x81800000 0x0 0x800000>;
+		reg-names = "codec", "mailbox", "coproc";
+		interrupts = <AIC_IRQ 1099 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1093 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1092 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1095 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1094 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>,
+				<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+		iommus = <&ave_dart0 0>, <&ave_dart0 12>,
+			 <&ave_dart1 0>, <&ave_dart1 12>;
 		status = "disabled";
 	};
 

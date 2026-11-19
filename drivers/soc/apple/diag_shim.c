@@ -111,6 +111,10 @@ static struct {
 	atomic_t stac;
 	atomic_t stac_onlines;
 	atomic_t pnon;
+	atomic_t sse;
+	atomic_t sse_events;
+	atomic_t hibe;
+	atomic_t skdl;
 	atomic_t xarm_failures;
 	atomic_t unhandled;
 	atomic_t sleeps;
@@ -607,6 +611,47 @@ static ssize_t local_policy_digest_show(struct device *dev,
 }
 static DEVICE_ATTR_ADMIN_RO(local_policy_digest);
 
+static ssize_t sep_diag_offer_emit(char *buf, atomic_t *state)
+{
+	switch (atomic_read(state)) {
+	case SEP_DIAG_OFFER_IDLE:
+		return sysfs_emit(buf, "idle\n");
+	case SEP_DIAG_OFFER_ABSENT:
+		return sysfs_emit(buf, "absent\n");
+	default:
+		return sysfs_emit(buf, "pending\n");
+	}
+}
+
+static ssize_t sse_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	return sep_diag_offer_emit(buf, &sep_diag.sse);
+}
+static DEVICE_ATTR_RO(sse);
+
+static ssize_t sse_events_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n",
+			  (unsigned int)atomic_read(&sep_diag.sse_events));
+}
+static DEVICE_ATTR_RO(sse_events);
+
+static ssize_t hibe_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	return sep_diag_offer_emit(buf, &sep_diag.hibe);
+}
+static DEVICE_ATTR_RO(hibe);
+
+static ssize_t skdl_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	return sep_diag_offer_emit(buf, &sep_diag.skdl);
+}
+static DEVICE_ATTR_RO(skdl);
+
 static ssize_t xarm_failures_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
@@ -666,6 +711,10 @@ static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_stac_onlines.attr,
 	&dev_attr_pnon.attr,
 	&dev_attr_local_policy_digest.attr,
+	&dev_attr_sse.attr,
+	&dev_attr_sse_events.attr,
+	&dev_attr_hibe.attr,
+	&dev_attr_skdl.attr,
 	&dev_attr_xarm_failures.attr,
 	&dev_attr_unhandled_messages.attr,
 	&dev_attr_sleeps.attr,
@@ -751,6 +800,26 @@ void sep_diag_set_pnon(int state, const u8 *digest, size_t len)
 unsigned int sep_diag_xarm_failed(void)
 {
 	return (unsigned int)atomic_inc_return(&sep_diag.xarm_failures);
+}
+
+void sep_diag_set_offer(u8 endpoint, int state)
+{
+	switch (endpoint) {
+	case SEP_DIAG_EP_SSE:
+		atomic_set(&sep_diag.sse, state);
+		break;
+	case SEP_DIAG_EP_HIBE:
+		atomic_set(&sep_diag.hibe, state);
+		break;
+	case SEP_DIAG_EP_SKDL:
+		atomic_set(&sep_diag.skdl, state);
+		break;
+	}
+}
+
+unsigned int sep_diag_sse_event(void)
+{
+	return (unsigned int)atomic_inc_return(&sep_diag.sse_events);
 }
 
 unsigned int sep_diag_unhandled(void)

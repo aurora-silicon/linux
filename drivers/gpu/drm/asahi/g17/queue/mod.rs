@@ -85,10 +85,14 @@ impl Frontend {
 pub(crate) struct Queue<B: Backend> {
     dev: AsahiDevRef,
     context: Arc<Context>,
-    usage: Arc<crate::usage::Client>,
+    /// This queue's engine time: the union of its overlapping stages, charged to its file.
+    usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>,
     backend: Arc<B>,
     render: Option<Scheduler<B>>,
     compute: Option<Scheduler<B>>,
+    /// The watchdog allowance of each compute command, set before the first one
+    /// ([`crate::queue::Queue::set_compute_timeout`]).
+    compute_allowance_ms: u32,
     fences: FenceContexts,
     allocation_failure: Fence,
     range: Range<u64>,
@@ -127,14 +131,20 @@ impl<B: Backend> Queue<B> {
             window,
             variant,
         } = frontend;
-        let render = Some(Scheduler::new(dev, backend.clone(), Engine::Render)?);
+        let render = Some(Scheduler::new(
+            dev,
+            backend.clone(),
+            Engine::Render,
+            super::timeout::DEFAULT_ALLOWANCE_MS,
+        )?);
         Ok(Self {
             dev: dev.into(),
             context,
-            usage,
+            usage: Arc::new(crate::usage::Lane::new(usage), GFP_KERNEL)?,
             backend,
             render,
             compute: None,
+            compute_allowance_ms: super::timeout::DEFAULT_ALLOWANCE_MS,
             fences,
             allocation_failure,
             range,
@@ -158,6 +168,7 @@ impl<B: Backend> Queue<B> {
                 &self.dev,
                 self.backend.clone(),
                 Engine::Compute,
+                self.compute_allowance_ms,
             )?);
         }
         Ok(())
@@ -513,6 +524,16 @@ impl<B: Backend> Queue<B> {
 }
 
 impl<B: Backend> crate::queue::Queue for Queue<B> {
+    fn set_compute_timeout(&mut self, requested_ms: u32) -> Result<u32> {
+        // The compute scheduler takes the allowance when the first compute command creates it.
+        if self.compute.is_some() {
+            return Err(EBUSY);
+        }
+        let maximum = crate::module_parameters::compute_timeout_max_ms.value();
+        self.compute_allowance_ms = super::timeout::allowance_ms(requested_ms, maximum);
+        Ok(self.compute_allowance_ms)
+    }
+
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
         let pages = [
             super::fw::compute::ScratchRequest::new(layouts[0])?.pages(),

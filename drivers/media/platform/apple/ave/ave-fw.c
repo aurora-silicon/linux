@@ -42,6 +42,7 @@ static const u32 ave_known_text_crc[] = {
 	AVE_FW_TEXT_CRC_T6041_25G83, /* AppleAVE2FW 9003.78.0 / M4 Max */
 	AVE_FW_TEXT_CRC_T6050_26A428, /* AppleAVE2FW, macOS 27.0 26A428 / T6050 */
 	AVE_FW_TEXT_CRC_T6050_26C5035, /* AppleAVE2FW, macOS 27.3 26C5035r / T6050 */
+	AVE_FW_TEXT_CRC_T8142_26A428, /* AppleAVE2FW 9013.45.1, macOS 27.0 26A428 / T8142 */
 	0x460c7a7c, /* AppleAVE2FW 6070.11.1 / T6000 */
 	0x25bfd039, /* AppleAVE2FW 6070.11.1 / T8112 */
 };
@@ -907,6 +908,65 @@ static int ave_fw_stop_unanswered(struct ave_dev *ave)
 	return 0;
 }
 
+/*
+ * A 6070 firmware that stopped answering in the middle of a session (a
+ * Process or Close timeout) keeps its power, because a halt the firmware
+ * did not confirm proves nothing about its DMA. Once every session is gone
+ * it gets one more Halt; whether or not that is confirmed, the core is then
+ * stopped and must read back stopped, and the engines get a settle interval
+ * before the power goes. That makes it a halted firmware like any other:
+ * every buffer a session handed it stays quarantined, runtime PM cycles the
+ * VENC power (genpd drops the DARTs after the encoder), and the next session
+ * cold-starts the firmware and reaps that memory. Without this the encoder
+ * stayed broken until reboot after a single hung frame. Recoveries count
+ * against the history; a clean session end clears it. Caller holds hw_lock.
+ */
+static int ave_fw_stop_hung(struct ave_dev *ave)
+{
+	u32 val;
+	int ret = -EIO;
+
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
+		if (ave->sessions[i])
+			return -EBUSY;
+	if (!ave_recovery_allow(&ave->recovery, jiffies)) {
+		dev_err_ratelimited(ave->dev,
+				    "firmware recovery limit: 3 attempts per 10 minutes without a clean session end\n");
+		return -EBUSY;
+	}
+	ave->recovery_count++;
+	dev_warn(ave->dev, "firmware recovery %u: stopping the hung firmware and cycling VENC power\n",
+		 ave->recovery_count);
+
+	if (ave->ipc_fw_base && ave->ring[0].slots && !ave->inject_wedge) {
+		writel(0, ave->mbox + AVE_MBOX_SCRATCH(0));
+		ave->fw_state = AVE_FW_RUNNING;
+		ret = ave_cmd_halt(ave);
+		if (!ret)
+			ret = readl_poll_timeout(ave->mbox + AVE_MBOX_SCRATCH(0), val,
+						 val == AVE_BOOT_MAGIC, 100,
+						 AVE_HUNG_HALT_TIMEOUT_US);
+		ave->fw_state = AVE_FW_BROKEN;
+	}
+	if (ret)
+		dev_warn(ave->dev, "hung firmware did not confirm its Halt (%d); stopping its core\n",
+			 ret);
+	writel(0, ave->coproc + ave->variant->regs->ctrl);
+	ret = readl_poll_timeout(ave->coproc + ave->variant->regs->ctrl, val,
+				 !val, 100, AVE_MBOX_TIMEOUT_US);
+	if (ret) {
+		dev_err(ave->dev, "hung firmware core did not stop (CTRL %#x)\n", val);
+		return -EIO;
+	}
+	/* Engine traffic already issued drains before the power gate. */
+	msleep(AVE_HALT_SETTLE_MS);
+	ave->fw_state = AVE_FW_HALTED;
+	ave->inject_wedge = false;
+	memset(ave->ring, 0, sizeof(ave->ring));
+	ave->ipc_fw_base = 0;
+	return 0;
+}
+
 /* Caller holds hw_lock. */
 int ave_fw_ensure_running(struct ave_dev *ave)
 {
@@ -1008,6 +1068,7 @@ void ave_fw_halt(struct ave_dev *ave)
 	ave->fw_state = AVE_FW_HALTED;
 	memset(ave->ring, 0, sizeof(ave->ring));
 	ave->ipc_fw_base = 0;
+	ave_recovery_reset(&ave->recovery);
 }
 
 /*
@@ -1026,6 +1087,10 @@ int ave_fw_shutdown(struct ave_dev *ave)
 		ave_fw_halt(ave);
 		return ave->fw_state == AVE_FW_HALTED ? 0 : -EBUSY;
 	case AVE_FW_BROKEN:
+		/* 6070: a hung firmware with no session left is stopped and power cycled. */
+		if (ave->layout && ave->layout->abi->transport->scratch_halt)
+			return ave_fw_stop_hung(ave);
+		return -EBUSY;
 	case AVE_FW_RECOVERING:
 		return -EBUSY;
 	default:

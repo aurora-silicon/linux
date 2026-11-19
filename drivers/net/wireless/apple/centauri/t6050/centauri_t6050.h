@@ -13,6 +13,7 @@
 #define CEN_ALPHA_SCRATCH_SIZE (5 * SZ_1M)
 
 struct centauri_t6050_ipc;
+struct centauri_t6050_rewake;
 struct centauri_t6050_wifi;
 struct centauri_t6050_irqs {
 	struct pci_dev *pdev;
@@ -37,6 +38,8 @@ enum centauri_t6050_boot_phase {
 };
 
 struct centauri_t6050 {
+	struct centauri_t6050_rewake *recovery;
+	bool pm_prepared;
 	struct pci_dev *pdev;
 	void __iomem *bar;
 	resource_size_t size;
@@ -54,6 +57,8 @@ struct centauri_t6050 {
 	u32 image_response;
 	bool boot_attempted;
 	bool link_ready;
+	/* Torn down for a sleep; Function 2 stays bound until the N1 is enumerated again */
+	bool firmware_sleep;
 	struct centauri_t6050_ipc *ipc;
 	struct centauri_t6050_wifi *wifi;
 };
@@ -64,6 +69,9 @@ void centauri_t6050_free_irqs(struct centauri_t6050_irqs *irqs);
 
 int centauri_t6050_start_ipc(struct centauri_t6050 *c);
 void centauri_t6050_free_ipc(struct centauri_t6050 *c);
+void centauri_t6050_release_ipc(struct centauri_t6050_ipc *ipc);
+bool centauri_t6050_ipc_fenced(struct centauri_t6050_ipc *ipc);
+void centauri_t6050_detach_ipc(struct centauri_t6050_ipc *ipc);
 int centauri_t6050_alpha_resources(struct centauri_t6050 *c, struct cen_alpha_resources *resources);
 bool centauri_t6050_stop_dma(struct pci_dev *pdev);
 
@@ -71,6 +79,9 @@ bool centauri_t6050_stop_dma(struct pci_dev *pdev);
 irqreturn_t centauri_t6050_alpha_irq(int irq, void *data);
 int centauri_t6050_wifi_register(struct centauri_t6050 *c);
 void centauri_t6050_wifi_unregister(struct centauri_t6050 *c);
+void centauri_t6050_wifi_pm_prepare(struct centauri_t6050 *c);
+int centauri_t6050_wifi_pm_error(struct centauri_t6050 *c);
+void centauri_t6050_wifi_pm_complete(struct centauri_t6050 *c);
 #else
 static inline irqreturn_t centauri_t6050_alpha_irq(int irq, void *data)
 {
@@ -81,6 +92,19 @@ static inline int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	return 0;
 }
 static inline void centauri_t6050_wifi_unregister(struct centauri_t6050 *c)
+{
+}
+
+static inline void centauri_t6050_wifi_pm_prepare(struct centauri_t6050 *c)
+{
+}
+
+static inline int centauri_t6050_wifi_pm_error(struct centauri_t6050 *c)
+{
+	return 0;
+}
+
+static inline void centauri_t6050_wifi_pm_complete(struct centauri_t6050 *c)
 {
 }
 #endif

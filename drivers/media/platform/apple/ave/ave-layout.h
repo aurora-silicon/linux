@@ -220,7 +220,7 @@ struct ave_start_layout {
 	u32 h264_scaling_4x4;
 	u32 h264_scaling_8x8;
 	u32 h264_sve_count;
-	u32 h264_multi_me;
+	u32 multi_me; /* u16: 6070 second ME unit for two active references */
 	u32 h264_vui_restriction;
 	u32 h264_vui_mv_over_boundaries;
 	u32 h264_vui_max_bytes_denom;

@@ -518,7 +518,7 @@ mod tests {
 
     #[cfg(CONFIG_DRM_ASAHI_G16)]
     #[test]
-    fn j713_accepts_both_loaded_images() {
+    fn j713_accepts_all_loaded_images() {
         let builds = crate::g16::hw::t8132::CONFIG.firmware;
         let digests = [
             [
@@ -530,6 +530,11 @@ mod tests {
                 0x3b, 0x36, 0x8e, 0xe4, 0x2d, 0xcc, 0xc6, 0x26, 0xe8, 0x49, 0x67, 0xff, 0x40, 0x87,
                 0x64, 0x71, 0x0a, 0x64, 0xbf, 0xf1, 0x59, 0x4f, 0x3c, 0xfd, 0x2c, 0x6e, 0x4d, 0x34,
                 0xd0, 0x65, 0x24, 0x8b,
+            ],
+            [
+                0xd9, 0x61, 0x42, 0xd1, 0xef, 0x52, 0xaf, 0x13, 0x25, 0x08, 0xca, 0x06, 0xb7, 0xd0,
+                0x14, 0x58, 0xe2, 0x91, 0x0b, 0x85, 0xc8, 0xd7, 0x55, 0x78, 0xbf, 0x01, 0xc8, 0x29,
+                0x86, 0x8b, 0xc9, 0xcf,
             ],
         ];
         for (i, digest) in digests.into_iter().enumerate() {
@@ -584,5 +589,33 @@ mod tests {
             assert!(admit(t + 0x4000, d, e, h).is_none());
             assert!(admit(t, d, &e[..1], h).is_none());
         }
+    }
+
+    #[test]
+    fn t8142_identifies_each_build() {
+        use crate::g17::fw::m5::initdata::RootProfile;
+        let crate::g17::fw::variant::Firmware::Identified(builds) = crate::hw::t8142::CONFIG.firmware
+        else {
+            panic!("the J813 must identify its loaded firmware");
+        };
+        assert_eq!(builds.len(), 2);
+        // Same TEXT and DATA sizes for both builds, so each is told apart by its digest at its
+        // own record offsets.
+        t6050_admits_only(builds);
+        let [a428, b123] = [&builds[0].images[0], &builds[1].images[0]];
+        for (image, other) in [(a428, builds[1].images), (b123, builds[0].images)] {
+            assert!(lookup(other, image.text_size, image.data_size, |_| {
+                Some(image.text_sha256)
+            })
+            .is_none());
+        }
+        // 26A428 runs the board as probed; 26B123 runs it on the 26B123 graph.
+        assert!(builds[0].config.is_none());
+        let config = builds[1].config.unwrap();
+        assert_eq!(config.m5.unwrap().graph.profile, RootProfile::J873G18G26B123);
+        assert_eq!(
+            crate::hw::t8142::CONFIG.m5.unwrap().graph.profile,
+            RootProfile::J873G18G26A428
+        );
     }
 }

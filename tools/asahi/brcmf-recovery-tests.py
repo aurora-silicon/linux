@@ -66,7 +66,7 @@ struct brcmf_pcie_console { u32 base_addr, buf_addr, bufsize, read_idx;
  u32 scan_idx; u8 scan_line[8]; u8 scan_len; };
 struct brcmf_pcie_shared_info { u32 tcm_base_address; struct brcmf_pcie_console console; };
 struct brcmf_pciedev_info { enum brcmf_pcie_state state; struct pci_dev *pdev;
- struct brcmf_pcie_shared_info shared; bool fw_dead; u32 recoveries; unsigned long recovery_window; };
+ struct brcmf_pcie_shared_info shared; bool fw_dead, reset_wanted; u32 recoveries; unsigned long recovery_window; };
 struct pcie_priv { struct brcmf_pciedev_info *devinfo; };
 struct brcmf_bus { enum brcmf_bus_state state; struct device *dev; struct { struct pcie_priv *pcie; } bus_priv; };
 struct brcmf_proto { void *pd; };
@@ -130,7 +130,7 @@ static void con(const char *s)
  put32(CONS + BRCMF_CONSOLE_WRITEIDX_OFFSET, w);
 }
 static void stall(u32 n) { brcmf_pcie_ctl_stall(&pdev.dev, n); }
-static bool died(const char *why) { return crashes == 1 && bus.state == BRCMF_BUS_DOWN && devinfo.fw_dead && strstr(last_err, why); }
+static bool died(const char *why) { return crashes == 1 && bus.state == BRCMF_BUS_DOWN && devinfo.fw_dead && devinfo.reset_wanted && strstr(last_err, why); }
 int main(void)
 {
  unsigned cases = 0;
@@ -171,11 +171,15 @@ int main(void)
  /* At most BRCMF_PCIE_RECOVERY_MAX resets per window, then the driver gives up until it passes. */
  reset();
  for (u32 i = 1; i <= BRCMF_PCIE_RECOVERY_MAX; i++) {
-  devinfo.fw_dead = false; bus.state = BRCMF_BUS_UP; jiffies += 10 * HZ; stall(BRCMF_PCIE_CTL_STALL_MAX);
-  assert(crashes == i);
+  devinfo.fw_dead = devinfo.reset_wanted = false; bus.state = BRCMF_BUS_UP; jiffies += 10 * HZ;
+  stall(BRCMF_PCIE_CTL_STALL_MAX);
+  assert(crashes == i && devinfo.reset_wanted);
  }
- devinfo.fw_dead = false; bus.state = BRCMF_BUS_UP; jiffies += 10 * HZ; stall(BRCMF_PCIE_CTL_STALL_MAX);
- assert(crashes == BRCMF_PCIE_RECOVERY_MAX && bus.state == BRCMF_BUS_UP && strstr(last_err, "not resetting"));
+ devinfo.fw_dead = devinfo.reset_wanted = false; bus.state = BRCMF_BUS_UP; jiffies += 10 * HZ;
+ stall(BRCMF_PCIE_CTL_STALL_MAX);
+ /* A death past the limit asks for no reset, so the end of a system sleep replays none. */
+ assert(crashes == BRCMF_PCIE_RECOVERY_MAX && bus.state == BRCMF_BUS_UP && !devinfo.reset_wanted &&
+        strstr(last_err, "not resetting"));
  devinfo.fw_dead = false; jiffies += BRCMF_PCIE_RECOVERY_WINDOW_S * HZ; stall(BRCMF_PCIE_CTL_STALL_MAX);
  assert(crashes == BRCMF_PCIE_RECOVERY_MAX + 1 && bus.state == BRCMF_BUS_DOWN); cases++;
  /* msgbuf counts stalled control requests in a row and clears the count on a reply. */
@@ -201,6 +205,10 @@ MUTATIONS = {
                    '\t\t\tconsole->scan_len = 0;\n\t\t\tcontinue;'),
     'once': ('pcie', '\tif (xchg(&devinfo->fw_dead, true))\n\t\treturn;', '\tdevinfo->fw_dead = true;'),
     'rate-limit': ('pcie', '\tif (++devinfo->recoveries > BRCMF_PCIE_RECOVERY_MAX) {', '\tif (false) {'),
+    'reset-wanted': ('pcie', '\tWRITE_ONCE(devinfo->reset_wanted, true);\n', ''),
+    'wanted-over-limit': ('pcie', '\tif (xchg(&devinfo->fw_dead, true))\n\t\treturn;\n',
+                          '\tif (xchg(&devinfo->fw_dead, true))\n\t\treturn;\n'
+                          '\tWRITE_ONCE(devinfo->reset_wanted, true);\n'),
     'stall-reset': ('msgbuf', '\tmsgbuf->ctl_stalls = 0;\n', ''),
     'ring-full': ('msgbuf', '\t\tif (err == -ENOMEM)\n', '\t\tif (false)\n'),
 }

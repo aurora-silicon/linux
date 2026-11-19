@@ -53,6 +53,7 @@ static int macsmc_test_init(struct kunit *test)
 	mutex_init(&ctx->smc.mutex);
 	ctx->smc.shmem.iomem = (void __iomem *)ctx->shmem;
 	ctx->smc.key_count = 3;
+	ctx->smc.wake_reasons = apple_smc_t8140_wake_reasons;
 	test->priv = ctx;
 	kunit_activate_static_stub(test, apple_smc_cmd_locked, macsmc_test_command);
 	kunit_activate_static_stub(test, apple_smc_read_sram, macsmc_test_read_sram);
@@ -235,8 +236,8 @@ static void macsmc_sleep_order_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ctx->smc.ap_notified);
 	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warned);
 
-	/* As in the trace, values included. */
-	KUNIT_ASSERT_EQ(test, ctx->seen_count, 7U);
+	/* As in the trace, values included, then the lid's read that every wake makes. */
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 8U);
 	KUNIT_EXPECT_EQ(test, ctx->seen[0], SMC_KEY(slpw));
 	KUNIT_EXPECT_EQ(test, ctx->seen[1], SMC_KEY(slpa));
 	KUNIT_EXPECT_EQ(test, ctx->seen[2], (u32)MACSMC_TEST_AP_IDLE);
@@ -244,6 +245,7 @@ static void macsmc_sleep_order_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->seen[4], SMC_KEY(MBSE));
 	KUNIT_EXPECT_EQ(test, ctx->seen[5], SMC_KEY(MBSW));
 	KUNIT_EXPECT_EQ(test, ctx->seen[6], SMC_KEY(waka));
+	KUNIT_EXPECT_EQ(test, ctx->seen[7], SMC_KEY(MSLD));
 }
 
 static void macsmc_test_outbox_poll(struct apple_smc *smc, const char *after,
@@ -290,13 +292,14 @@ static void macsmc_sleep_refused_test(struct kunit *test)
 static void macsmc_notice_test(struct kunit *test)
 {
 	struct macsmc_test_context *ctx = test->priv;
+	bool mbsw;
 
 	kunit_activate_static_stub(test, apple_smc_ap_power, macsmc_test_ap_power);
 	ctx->result = 8;
 
 	/* The test trigger writes no MBSE value: those announce a real sleep. */
 	KUNIT_EXPECT_EQ(test, apple_smc_notice_idle(&ctx->smc), 0);
-	apple_smc_notice_on(&ctx->smc);
+	apple_smc_notice_on(&ctx->smc, &mbsw);
 	KUNIT_ASSERT_EQ(test, ctx->seen_count, 4U);
 	KUNIT_EXPECT_EQ(test, ctx->seen[0], (u32)MACSMC_TEST_AP_IDLE);
 	KUNIT_EXPECT_EQ(test, ctx->seen[1], (u32)MACSMC_TEST_AP_ON);
@@ -349,27 +352,47 @@ static void macsmc_lid_wake_test(struct kunit *test)
 
 static void macsmc_wake_reason_test(struct kunit *test)
 {
+	struct macsmc_test_context *ctx = test->priv;
 	char names[128];
 
-	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_names(0, names, sizeof(names)), 0);
+	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_names(&ctx->smc, 0, names, sizeof(names)), 0);
 	KUNIT_EXPECT_STREQ(test, names, "");
 
 	/* A bit with no name is left out. */
-	apple_smc_wake_reason_names(BIT_ULL(23) | BIT_ULL(42) | BIT_ULL(1), names, sizeof(names));
+	apple_smc_wake_reason_names(&ctx->smc, BIT_ULL(23) | BIT_ULL(42) | BIT_ULL(1), names,
+				    sizeof(names));
 	KUNIT_EXPECT_STREQ(test, names, "wifibt USB-C_plug");
+
+	/* T8132's own numbering: its lid is bit 8, and bit 10 is nothing. */
+	ctx->smc.wake_reasons = apple_smc_t8132_wake_reasons;
+	apple_smc_wake_reason_names(&ctx->smc, BIT_ULL(8) | BIT_ULL(10) | BIT_ULL(13), names,
+				    sizeof(names));
+	KUNIT_EXPECT_STREQ(test, names, "lid wifibt");
+	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_bit(&ctx->smc, "lid"), 8);
+	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_bit(&ctx->smc, "ipd_touch"), -1);
+
+	/* The J714s's: T8132's lid and radio bits, its SD reader at bit 9. */
+	ctx->smc.wake_reasons = apple_smc_j714s_wake_reasons;
+	apple_smc_wake_reason_names(&ctx->smc, BIT_ULL(8) | BIT_ULL(9) | BIT_ULL(10) | BIT_ULL(13),
+				    names, sizeof(names));
+	KUNIT_EXPECT_STREQ(test, names, "lid sdconn wifibt");
+	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_bit(&ctx->smc, "lid"), 8);
+	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_bit(&ctx->smc, "wifibt"), 13);
 }
 
 static void macsmc_port_reasons_test(struct kunit *test)
 {
+	struct macsmc_test_context *ctx = test->priv;
+
 	/* The debug link's cut: USB-C_plug, acdetach, or both. */
-	KUNIT_EXPECT_TRUE(test, apple_smc_port_reasons_only(BIT_ULL(42)));
-	KUNIT_EXPECT_TRUE(test, apple_smc_port_reasons_only(BIT_ULL(41) | BIT_ULL(42)));
+	KUNIT_EXPECT_TRUE(test, apple_smc_port_reasons_only(&ctx->smc, BIT_ULL(42)));
+	KUNIT_EXPECT_TRUE(test, apple_smc_port_reasons_only(&ctx->smc, BIT_ULL(41) | BIT_ULL(42)));
 	/* Anything else, with it or alone, is a real wake. */
-	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(0));
-	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(BIT_ULL(42) | BIT_ULL(0)));
-	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(BIT_ULL(42) | BIT_ULL(10)));
-	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(BIT_ULL(23)));
-	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(BIT_ULL(43)));
+	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(&ctx->smc, 0));
+	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(&ctx->smc, BIT_ULL(42) | BIT_ULL(0)));
+	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(&ctx->smc, BIT_ULL(42) | BIT_ULL(10)));
+	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(&ctx->smc, BIT_ULL(23)));
+	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(&ctx->smc, BIT_ULL(43)));
 }
 
 static struct kunit_case macsmc_parser_cases[] = {

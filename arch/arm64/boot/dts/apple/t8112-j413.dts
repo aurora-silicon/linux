@@ -285,17 +285,12 @@
  * publishes them only while the GPU is powered: with the GPU off, Tg0e,
  * Tg0m and Tg0q read 0 C and Tg0f, Tg0n and Tg0r 4.6 C (they track the
  * first three plus a fixed 4.6 C). Those placeholders are no data.
+ * Tg0f, Tg0n and Tg0r are in t8112.dtsi.
  */
 &smc_hwmon {
 	temperature-Tg0e {
 		apple,key-id = "Tg0e";
 		label = "GPU Tg0e";
-		apple,no-data-below-millicelsius = <10000>;
-	};
-
-	temperature-Tg0f {
-		apple,key-id = "Tg0f";
-		label = "GPU Tg0f";
 		apple,no-data-below-millicelsius = <10000>;
 	};
 
@@ -305,21 +300,9 @@
 		apple,no-data-below-millicelsius = <10000>;
 	};
 
-	temperature-Tg0n {
-		apple,key-id = "Tg0n";
-		label = "GPU Tg0n";
-		apple,no-data-below-millicelsius = <10000>;
-	};
-
 	temperature-Tg0q {
 		apple,key-id = "Tg0q";
 		label = "GPU Tg0q";
-		apple,no-data-below-millicelsius = <10000>;
-	};
-
-	temperature-Tg0r {
-		apple,key-id = "Tg0r";
-		label = "GPU Tg0r";
 		apple,no-data-below-millicelsius = <10000>;
 	};
 };
@@ -520,10 +503,16 @@
 };
 
 &spi4 {
+	cs-gpios = <&pinctrl_ap 100 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	/* No panel temperature sensors sit behind the controller on this board. */
 	panel_controller: panel-timing-controller@0 {
 		compatible = "parade,dp855";
 		reg = <0>;
-		status = "disabled";
+		spi-max-frequency = <1000000>;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
 	};
 };
 

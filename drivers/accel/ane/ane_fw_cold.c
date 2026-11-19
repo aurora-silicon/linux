@@ -2142,13 +2142,18 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
 			       !strcmp(name, i ? "firmware-data" : "firmware-text") &&
 			       !ane_fw_preload_range(np, i, &h.phys[i], &h.size[i]);
 	}
-	if (h.regions_ok && ane_fw_preload_ranges_valid(soc, h.phys, h.size, h.dva)) {
+	/*
+	 * Hash what the loader handed over even when its layout is not this
+	 * SoC's, so that one boot of a new firmware or SoC reports both.
+	 */
+	if (h.regions_ok) {
 		void *text = memremap(h.phys[0], h.size[0], MEMREMAP_WB);
 
 		if (text) {
 			sha256(text, h.size[0], digest);
 			memunmap(text);
-			h.text_ok = !memcmp(digest, soc->text_pin, sizeof(digest));
+			h.text_ok = ane_fw_preload_ranges_valid(soc, h.phys, h.size, h.dva) &&
+				    !memcmp(digest, soc->text_pin, sizeof(digest));
 		}
 	}
 	*hp = h;
@@ -2158,9 +2163,15 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
 		 !h.marker || strcmp(h.marker, ANE_FW_COLD_BOOT_EVIDENCE) ? "raw-boot marker" :
 		 !h.preloaded || !h.regions_ok ? "preload reservations" :
 		 !h.text_ok ? "firmware TEXT pin" : "preload layout");
-	if (h.regions_ok && !h.text_ok)
+	if (h.regions_ok && !h.text_ok) {
 		dev_info(&pdev->dev, "H17 ANE: preloaded TEXT sha256 %*phN\n",
 			 (int)sizeof(digest), digest);
+		dev_info(&pdev->dev,
+			 "H17 ANE: preload TEXT %#llx+%#llx @%#llx, DATA %#llx+%#llx @%#llx (%s)\n",
+			 h.phys[0], h.size[0], h.dva[0], h.phys[1], h.size[1], h.dva[1],
+			 ane_fw_preload_ranges_valid(soc, h.phys, h.size, h.dva) ?
+			 "layout as expected" : "layout differs");
+	}
 	return false;
 }
 

@@ -318,8 +318,11 @@ impl Backend {
         self.shared.queue_events();
         self.admission_open()?;
         let started = super::super::now_ns();
+        // Backing frees only as other owners' pairs and pools are released, which takes far
+        // longer than one poll under concurrent clients: wait as long as a compute queue
+        // waits for capacity (and a render channel for its retirement).
         let remaining = self
-            .wait_deadline(clock, super::super::WORK_RING_WAIT_NS)?
+            .wait_deadline(clock, crate::g17::preparation::QUEUE_WAIT_NS)?
             .saturating_sub(started);
         if remaining == 0 {
             return Err(EBUSY);
@@ -338,7 +341,9 @@ impl Backend {
     /// Gives idle render backing back under capacity pressure. Returns whether
     /// anything was returned, in which case the caller retries at once.
     fn reclaim_render_capacity(&self) -> Result<bool> {
-        let mut deferred = DeferredBatch::publication()?;
+        let mut deferred = DeferredBatch::reclaim()?;
+        // Idle pools go back only while the shared window is short.
+        let pools = self.lower_window_short();
         let result: Result<bool> = (|| {
             let lease = self.shared.preparations.try_enter()?;
             let mut state = self.shared.state.lock();
@@ -352,7 +357,9 @@ impl Backend {
                 return Ok(false);
             }
             firmware.queues.observe_pool_releases(&firmware.init, &mut deferred)?;
-            firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
+            if pools {
+                firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
+            }
             let mut published = 0;
             if !firmware.render_control_backpressured() {
                 (published, _) = firmware.queues.vacate_idle_pools(
@@ -563,6 +570,10 @@ impl Backend {
         if self.backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
             return false;
         }
+        // As for compute: a render that traces rays is admitted by its scheduler.
+        if !self.traversal_inline(packet) {
+            return false;
+        }
         let admission = match self.admission.try_acquire_render(self.owner, self.pairs.into(), Request::of(packet)) {
             Ok(Some(lease)) => lease,
             _ => return false,
@@ -698,7 +709,9 @@ impl crate::g17::Firmware {
         if entry.closed {
             pair.release_owner();
         }
-        if !entry.pending_timeout {
+        let pending_timeout = entry.pending_timeout;
+        self.queues.hold_render_slot(usize::from(slot));
+        if !pending_timeout {
             return Ok(());
         }
         for _ in 0..crate::hw::t8140::queues::RENDER_DEPTH {

@@ -145,8 +145,10 @@ static int apple_pmp_commit_stop_fn(void *unused)
 	apple_rtkit_mailbox_recv_off(c->rtk);
 	for (i = 0; c->sram && i < c->count; i++)
 		c->words[i] = readl_relaxed(c->sram + 4 * i);
-	/* Told to idle, it can't carry on whatever it answered: the sleep goes on. */
-	return ret ? 1 : 0;
+	/* Told to idle, it can't carry on whatever it answered: the sleep goes on. The value is
+	 * reported before the timer.
+	 */
+	return ret;
 }
 
 /*
@@ -201,9 +203,6 @@ static int apple_pmp_suspend_late(struct device *dev)
 
 	if (!pm_suspend_via_firmware())
 		return 0;
-	/* Retained power votes have no teardown. */
-	if (apple_pmp_display_retained_board())
-		return -EBUSY;
 
 	guard(mutex)(&pmp_lock);
 	if (pmp_device != dev || pmp_asleep)

@@ -534,6 +534,27 @@ Description:
 		lowercase hex digits once pnon reads "read", and
 		"unavailable" before then.
 
+What:		/sys/bus/platform/devices/<unit>.sep/diag/sse
+What:		/sys/bus/platform/devices/<unit>.sep/diag/hibe
+What:		/sys/bus/platform/devices/<unit>.sep/diag/skdl
+What:		/sys/bus/platform/devices/<unit>.sep/diag/sse_events
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		Three enclave services Linux has no consumer for: Secure
+		Enclave to Secure Element sharing (endpoint sse), secure
+		hibernation (hibe) and the CoreKDL kernel deny-list (skdl).
+		As macOS at boot, the driver checks that each is offered and
+		sends it nothing.
+		(RO) sse, hibe and skdl read "pending" until the bring-up
+		ends, then "idle" (offered with its name and the buffer layout
+		the driver knows) or "absent" (not offered, or with another
+		name or layout).
+		(RO) sse_events counts the events the secure-element sharing
+		service announced on its own since probe, as an unsigned
+		decimal. They are not answered.
+
 What:		/sys/bus/platform/devices/<unit>.sep/diag/xarm_failures
 Date:		November 2026
 KernelVersion:	7.3

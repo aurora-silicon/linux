@@ -33,6 +33,13 @@ pub(crate) fn control_fence() -> u64 {
     CONTROL_PUBLISHED.load(Ordering::Acquire) + 1
 }
 
+/// A fence met once the firmware has consumed every record published so far. For storage
+/// whose owner's release was already consumed it needs no later record (see
+/// [`control_fence`]).
+pub(crate) fn control_published() -> u64 {
+    CONTROL_PUBLISHED.load(Ordering::Acquire)
+}
+
 /// The control-ring progress the firmware has shown so far (see [`control_fence`]).
 pub(crate) fn control_witnessed() -> u64 {
     CONTROL_CONSUMED.load(Ordering::Acquire)
@@ -92,11 +99,12 @@ pub(crate) struct Rings {
 }
 
 impl Rings {
-    pub(crate) fn new(graph: super::fw::variant::InitGraph) -> Result<Self> {
+    /// `m5`: the firmware runs the M5 protocol ([`super::stats::protocol`]).
+    pub(crate) fn new(graph: super::fw::variant::InitGraph, m5: bool) -> Result<Self> {
         Ok(Self {
             quarantined: [[false; 2]; 2],
             reports: super::reports::Reports::new()?,
-            telemetry: super::telemetry::Telemetry::default(),
+            telemetry: super::telemetry::Telemetry::new(super::stats::protocol(graph, m5)),
             max_age_ns: super::stats::max_age_ns(graph),
             suspended: false,
             discard_statistics: [false; 2],

@@ -95,7 +95,7 @@ impl Completion {
     fn signalled(&self) -> bool { false }
 }
 struct Packet { completion: Arc<Completion> }
-struct Active { packet: Arc<Packet>, ticket: Option<Ticket>, observed: Option<Observation>, qos_pending: bool }
+struct Active { packet: Arc<Packet>, ticket: Option<Ticket>, observed: Option<Observation>, qos_pending: bool, stamps_owed: bool }
 struct Fifo<T> { entries: Vec<T>, len: usize }
 impl<T> Fifo<T> {
     fn new() -> Self { Self { entries: vec![], len: 0 } }
@@ -150,7 +150,7 @@ fn fault(live: &Arc<AtomicUsize>) -> Queue {
     let old = Context::new(1, live);
     queue.previous = Some(Previous { binding: Some(Binding { context: old.clone() }), context: old, publication: Some((11, 3)), moved: false });
     queue.active.push(Active { packet: Arc::new(Packet { completion: Arc::new(Completion) }),
-        ticket: Some(Ticket { owner: 2, item_count: 1280, descriptor: 0x1000, item_producer: 4, kick: 7 }), observed: None, qos_pending: true }).unwrap();
+        ticket: Some(Ticket { owner: 2, item_count: 1280, descriptor: 0x1000, item_producer: 4, kick: 7 }), observed: None, qos_pending: true, stamps_owed: false }).unwrap();
     queue.quarantined = true;
     queue.awaiting_witness = true;
     queue.submitted = 1;

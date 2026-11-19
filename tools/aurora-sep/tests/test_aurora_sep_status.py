@@ -28,6 +28,7 @@ HEALTHY = {
     "matching": "unverified", "os_identity": "explicit", "hwrng": "registered",
     "xarm_failures": "0", "unhandled_messages": "0", "sleep": "awake",
     "sleeps": "3", "stac": "online", "stac_onlines": "4", "pnon": "read",
+    "sse": "idle", "sse_events": "0", "hibe": "idle", "skdl": "idle",
 }
 
 
@@ -142,6 +143,25 @@ class StatusTest(unittest.TestCase):
         self.assertNotIn("pnon", v)
         row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
         self.assertIn("pnon", row["detail"])
+
+    def test_the_endpoints_checked_at_boot_are_reported(self):
+        rc, report, v = self.run_status()
+        self.assertEqual((rc, v["sse"], v["hibe"], v["skdl"]), (0, "PASS", "PASS", "PASS"))
+        row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
+        for ep in ("sse=", "hibe=", "skdl="):
+            self.assertIn(ep, row["value"])
+        self.set("sse", "absent")
+        self.set("skdl", "pending")
+        rc, _, v = self.run_status()
+        self.assertEqual((rc, v["sse"], v["skdl"]), (0, "INFO", "INFO"))
+        # A kernel without the clients lists them as unserved.
+        for ep in ("sse", "hibe", "skdl"):
+            self.set(ep, None)
+        rc, report, v = self.run_status()
+        self.assertNotIn("sse", v)
+        row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
+        for ep in ("sse", "hibe", "skdl"):
+            self.assertIn(ep, row["detail"])
 
     def test_a_closed_key_store_fails(self):
         self.set("keystore", "closed")

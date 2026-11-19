@@ -205,7 +205,7 @@ impl InitData {
             m::encode_common26_board_region_c(
                 &mut self.object_mut(self.region_c)?.bytes_mut()[..m::REGION_C_SIZE])
                 .map_err(|_| EINVAL)?;
-            m::encode_common26_private_cluster(PRIVATE, FWCTL,
+            m::encode_common26_private_cluster(board.graph.profile, PRIVATE, FWCTL,
                 &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total])
                 .map_err(|_| EINVAL)?;
         } else {
@@ -255,18 +255,7 @@ impl InitData {
         } else {
             m::encode_m5_bundle_policy(bindings, self.object_mut(self.bundle)?.bytes_mut())
         }.map_err(|_| EINVAL)?;
-        // The controller configuration applies where the part's leakage calibration matches the
-        // one it was made for, or on a board whose configuration holds for every part.
-        let calibrated = match board.calibration {
-            None => true,
-            Some(expected) => {
-                let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
-                let calibration: Result<KVec<u32>> =
-                    node.get_property(c_str!("apple,leakage-calibration-words"));
-                calibration.as_ref().is_ok_and(|words| words.as_slice() == expected)
-            }
-        };
-        if let Some(defaults) = board.controller_defaults.filter(|_| calibrated) {
+        if let Some(defaults) = board.controller_defaults {
             defaults(self.object_mut(self.bundle)?.bytes_mut()).map_err(|_| EINVAL)?;
             let maximum = self.object(self.bundle)?.word(shared.policy + m::M5_POLICY_MAXIMUM_POWER)?
                 .load(Ordering::Relaxed);

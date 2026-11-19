@@ -161,6 +161,9 @@ def status(live=True):
             served["stac"] = "accessory power state"
         if d("pnon") is not None:
             served["pnon"] = "LocalPolicy nonce digest"
+        for ep in ("sse", "hibe", "skdl"):
+            if d(ep) is not None:
+                served[ep] = "checked at boot, nothing sent"
         unserved = [e for e in have if e not in served]
         r.add(INFO, "endpoint-clients",
               ", ".join("%s=%s" % (e, served[e]) for e in have if e in served),
@@ -270,6 +273,20 @@ def status(live=True):
         else:
             r.add(WARN, "pnon", pnon, "the LocalPolicy nonce digest read has not succeeded "
                   "(the kernel log says why)")
+
+    for ep, what in (("sse", "secure-element sharing"), ("hibe", "hibernation"),
+                     ("skdl", "kernel deny-list")):
+        v = d(ep)
+        if v is None:
+            continue
+        if v == "idle":
+            r.add(PASS, ep, v, "the %s endpoint is offered as the driver knows it; "
+                  "nothing is sent to it, as macOS at boot" % what)
+        elif v == "absent":
+            r.add(INFO, ep, v, "this enclave does not offer the %s endpoint "
+                  "as the driver knows it" % what)
+        else:
+            r.add(INFO, ep, v, "the bring-up has not ended yet")
 
     for node, why in (("/dev/sep-bio", "Touch ID"), ("/dev/sep-key", "enclave keys")):
         if os.path.exists(path(node)):

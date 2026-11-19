@@ -33,6 +33,14 @@ struct apple_crtc {
 
 	/* External scanout keeps the fabric up while the CRTC is active. */
 	bool fabric_held;
+
+	/*
+	 * DCP has no vblank interrupt or counter. Flip-complete events carry
+	 * a sequence estimated from the flip time and the mode's refresh
+	 * rate. Protected by the DRM event_lock.
+	 */
+	u64 flip_seq;
+	ktime_t flip_seq_time;
 };
 
 #define to_apple_crtc(x) container_of(x, struct apple_crtc, base)
@@ -65,6 +73,8 @@ bool dcp_peer_tiling_state_v27(struct apple_dcp *dcp, bool write,
 void dcp_peer_display_ids_v27(struct apple_dcp *dcp, u32 own, u32 related);
 int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_vrr);
 bool dcp_peer_needs_pair_v27(struct apple_dcp *dcp, u32 clock_khz);
+bool dcp_peer_mode_limited_v27(struct apple_dcp *dcp, u32 clock_khz);
+void dcp_peer_limit_update_v27(struct drm_device *drm);
 int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
 		       struct drm_crtc_state *crtc_state);
 int dcp_peer_color_v27(struct apple_dcp *dcp, struct iomfb_set_matrix_req *matrix);
@@ -91,6 +101,8 @@ bool dcp_ext_unusable(struct platform_device *pdev);
 unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev);
 int dcp_start(struct platform_device *pdev);
 int dcp_activate(struct platform_device *pdev);
+void dcp_ext26_open_services(struct apple_dcp *dcp);
+int dcp_ext26_layout_stop(struct apple_dcp *dcp);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
 bool dcp_hdr_metadata_live(struct platform_device *pdev);
@@ -143,6 +155,7 @@ bool dcp_hold_resume_event(struct platform_device *pdev);
 bool dcp_s2r_firmware_stopped(struct platform_device *pdev);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);
+void iomfb_ext26_start(struct apple_dcp *dcp);
 void iomfb_shutdown(struct apple_dcp *dcp);
 /* rtkit message handler for IOMFB messages */
 void iomfb_recv_msg(struct apple_dcp *dcp, u64 message);
@@ -153,6 +166,7 @@ int dptxep_init_desktop(struct apple_dcp *dcp, u32 endpoint);
 int dptx_controller_init(struct apple_dcp *dcp);
 int ibootep_init(struct apple_dcp *dcp);
 int dpavservep_init(struct apple_dcp *dcp);
+int panelavep_init(struct apple_dcp *dcp);
 int avep_init(struct apple_dcp *dcp);
 
 

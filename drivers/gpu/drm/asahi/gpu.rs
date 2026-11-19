@@ -150,6 +150,15 @@ pub(crate) const IOVA_KERN_GPU_BUFMGR_HIGH: u64 = 0xffffffaeffff0000;
 /// Timeout for entering the halt state after a fault or request.
 const HALT_ENTER_TIMEOUT: Delta = Delta::from_millis(100);
 
+/// Minimum interval between GPU fault / timeout / channel-error reports.
+///
+/// Each report is a dozen-odd error lines, and a single misbehaving client can
+/// fault thousands of times in a row, so without a limit a bad job buries the
+/// kernel log (one soak logged ~14k reports / ~400k journal lines). The fault
+/// is always handled and recovered regardless; only the repeated logging is
+/// throttled, and the number of coalesced reports is surfaced on the next one.
+const FAULT_LOG_INTERVAL: Delta = Delta::from_millis(1000);
+
 /// Maximum amount of firmware-private memory garbage allowed before collection.
 /// Collection flushes the FW cache and is expensive, so this needs to be
 /// reasonably high.
@@ -243,6 +252,15 @@ pub(crate) struct SequenceIDs {
     pub(crate) queue: ID,
 }
 
+/// Rate-limiter state for the GPU fault / timeout / channel-error reports.
+#[derive(Default)]
+struct FaultLogState {
+    /// When the last report was emitted, or `None` if none has been yet.
+    last: Option<Instant<Monotonic>>,
+    /// Reports suppressed since the last emitted one.
+    suppressed: u32,
+}
+
 /// Top-level GPU manager that owns all the global state relevant to the driver instance.
 #[versions(AGX)]
 #[pin_data]
@@ -278,6 +296,8 @@ pub(crate) struct GpuManager {
     ids: SequenceIDs,
     #[pin]
     garbage_contexts: Mutex<KVec<workqueue::RetiredContext>>,
+    #[pin]
+    fault_log: SpinLock<FaultLogState>,
 }
 
 #[versions(AGX)]
@@ -1023,6 +1043,7 @@ impl GpuManager::ver {
                 buffer_mgr,
                 ids: Default::default(),
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
+                fault_log <- new_spinlock!(FaultLogState::default(), "fault_log"),
             }),
             GFP_KERNEL,
         )?;
@@ -1293,8 +1314,41 @@ impl GpuManager::ver {
         });
     }
 
+    /// Rate-limit the GPU fault / timeout / channel-error reports.
+    ///
+    /// Returns `(log, suppressed)`: when `log` is true the caller should emit the
+    /// full report, and `suppressed` is the number of reports dropped since the
+    /// last emitted one (so the coalesced count can be surfaced). The fault is
+    /// always handled and recovered regardless of whether it is logged.
+    fn fault_log_ratelimit(&self) -> (bool, u32) {
+        // Anyone debugging the GPU sets VerboseFaults and wants every report, so
+        // never throttle in that case; just drain any coalesced count.
+        if debug_enabled(DebugFlags::VerboseFaults) {
+            let mut state = self.fault_log.lock();
+            let suppressed = state.suppressed;
+            state.suppressed = 0;
+            return (true, suppressed);
+        }
+
+        let now = Instant::<Monotonic>::now();
+        let mut state = self.fault_log.lock();
+        let throttled = match &state.last {
+            Some(last) => last.elapsed() < FAULT_LOG_INTERVAL,
+            None => false,
+        };
+        if throttled {
+            state.suppressed = state.suppressed.saturating_add(1);
+            (false, 0)
+        } else {
+            let suppressed = state.suppressed;
+            state.suppressed = 0;
+            state.last = Some(now);
+            (true, suppressed)
+        }
+    }
+
     /// Fetch the GPU MMU fault information from the hardware registers.
-    fn get_fault_info(&self) -> Option<regs::FaultInfo> {
+    fn get_fault_info(&self, log: bool) -> Option<regs::FaultInfo> {
         // TODO: handle differently
         let guard = self.dev.registration_guard()?;
 
@@ -1303,19 +1357,23 @@ impl GpuManager::ver {
 
             let info = res.get_fault_info(self.cfg);
             if let Some(fault) = &info {
-                dev_err!(self.dev.as_ref(), "  Fault info: {:#x?}\n", fault);
+                if log {
+                    dev_err!(self.dev.as_ref(), "  Fault info: {:#x?}\n", fault);
+                }
             }
             info
         })
     }
 
     /// Resume the GPU firmware after it halts (due to a timeout, fault, or request).
-    fn recover(&self) {
+    fn recover(&self, log: bool) {
         self.initdata.fw_status.with(|raw, _inner| {
             let halt_count = raw.flags.halt_count.load(Ordering::Relaxed);
             let mut halted = raw.flags.halted.load(Ordering::Relaxed);
-            dev_err!(self.dev.as_ref(), "  Halt count: {}\n", halt_count);
-            dev_err!(self.dev.as_ref(), "  Halted: {}\n", halted);
+            if log {
+                dev_err!(self.dev.as_ref(), "  Halt count: {}\n", halt_count);
+                dev_err!(self.dev.as_ref(), "  Halted: {}\n", halted);
+            }
 
             if halted == 0 {
                 let start = Instant::<Monotonic>::now();
@@ -1335,7 +1393,9 @@ impl GpuManager::ver {
                     "  GPU recovery is disabled, wedging forever!\n"
                 );
             } else if halted != 0 {
-                dev_err!(self.dev.as_ref(), "  Attempting recovery...\n");
+                if log {
+                    dev_err!(self.dev.as_ref(), "  Attempting recovery...\n");
+                }
                 raw.flags.halted.store(0, Ordering::SeqCst);
                 raw.flags.resume.store(1, Ordering::SeqCst);
             } else {
@@ -1748,40 +1808,60 @@ impl GpuManager for GpuManager::ver {
     }
 
     fn handle_timeout(&self, counter: u32, event_slot: i32, unk: u32) {
-        dev_err!(self.dev.as_ref(), " (\\________/) \n");
-        dev_err!(self.dev.as_ref(), "  |        |  \n");
-        dev_err!(self.dev.as_ref(), "'.| \\  , / |.'\n");
-        dev_err!(self.dev.as_ref(), "--| / (( \\ |--\n");
-        dev_err!(self.dev.as_ref(), ".'|  _-_-  |'.\n");
-        dev_err!(self.dev.as_ref(), "  |________|  \n");
-        dev_err!(self.dev.as_ref(), "** GPU timeout nya~!!!!! **\n");
-        dev_err!(self.dev.as_ref(), "  Event slot: {}\n", event_slot);
-        dev_err!(self.dev.as_ref(), "  Timeout count: {}\n", counter);
-        dev_err!(self.dev.as_ref(), "  Unk: {}\n", unk);
+        let (log, suppressed) = self.fault_log_ratelimit();
+        if log {
+            if suppressed > 0 {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "(+{} suppressed GPU fault/timeout reports)\n",
+                    suppressed
+                );
+            }
+            dev_err!(self.dev.as_ref(), " (\\________/) \n");
+            dev_err!(self.dev.as_ref(), "  |        |  \n");
+            dev_err!(self.dev.as_ref(), "'.| \\  , / |.'\n");
+            dev_err!(self.dev.as_ref(), "--| / (( \\ |--\n");
+            dev_err!(self.dev.as_ref(), ".'|  _-_-  |'.\n");
+            dev_err!(self.dev.as_ref(), "  |________|  \n");
+            dev_err!(self.dev.as_ref(), "** GPU timeout nya~!!!!! **\n");
+            dev_err!(self.dev.as_ref(), "  Event slot: {}\n", event_slot);
+            dev_err!(self.dev.as_ref(), "  Timeout count: {}\n", counter);
+            dev_err!(self.dev.as_ref(), "  Unk: {}\n", unk);
+        }
 
         // If we have fault info, consider it a fault.
-        let error = match self.get_fault_info() {
+        let error = match self.get_fault_info(log) {
             Some(info) => workqueue::WorkError::Fault(info),
             None => workqueue::WorkError::Timeout,
         };
         self.mark_pending_events(event_slot.try_into().ok(), error);
-        self.recover();
+        self.recover(log);
     }
 
     fn handle_fault(&self) {
-        dev_err!(self.dev.as_ref(), " (\\________/) \n");
-        dev_err!(self.dev.as_ref(), "  |        |  \n");
-        dev_err!(self.dev.as_ref(), "'.| \\  , / |.'\n");
-        dev_err!(self.dev.as_ref(), "--| / (( \\ |--\n");
-        dev_err!(self.dev.as_ref(), ".'|  _-_-  |'.\n");
-        dev_err!(self.dev.as_ref(), "  |________|  \n");
-        dev_err!(self.dev.as_ref(), "GPU fault nya~!!!!!\n");
-        let error = match self.get_fault_info() {
+        let (log, suppressed) = self.fault_log_ratelimit();
+        if log {
+            if suppressed > 0 {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "(+{} suppressed GPU fault/timeout reports)\n",
+                    suppressed
+                );
+            }
+            dev_err!(self.dev.as_ref(), " (\\________/) \n");
+            dev_err!(self.dev.as_ref(), "  |        |  \n");
+            dev_err!(self.dev.as_ref(), "'.| \\  , / |.'\n");
+            dev_err!(self.dev.as_ref(), "--| / (( \\ |--\n");
+            dev_err!(self.dev.as_ref(), ".'|  _-_-  |'.\n");
+            dev_err!(self.dev.as_ref(), "  |________|  \n");
+            dev_err!(self.dev.as_ref(), "GPU fault nya~!!!!!\n");
+        }
+        let error = match self.get_fault_info(log) {
             Some(info) => workqueue::WorkError::Fault(info),
             None => workqueue::WorkError::Unknown,
         };
         self.mark_pending_events(None, error);
-        self.recover();
+        self.recover(log);
     }
 
     fn handle_channel_error(
@@ -1791,17 +1871,27 @@ impl GpuManager for GpuManager::ver {
         event_slot: u32,
         event_value: u32,
     ) {
-        dev_err!(self.dev.as_ref(), " (\\________/) \n");
-        dev_err!(self.dev.as_ref(), "  |        |  \n");
-        dev_err!(self.dev.as_ref(), "'.| \\  , / |.'\n");
-        dev_err!(self.dev.as_ref(), "--| / (( \\ |--\n");
-        dev_err!(self.dev.as_ref(), ".'|  _-_-  |'.\n");
-        dev_err!(self.dev.as_ref(), "  |________|  \n");
-        dev_err!(self.dev.as_ref(), "GPU channel error nya~!!!!!\n");
-        dev_err!(self.dev.as_ref(), "  Error type: {:?}\n", error_type);
-        dev_err!(self.dev.as_ref(), "  Pipe type: {}\n", pipe_type);
-        dev_err!(self.dev.as_ref(), "  Event slot: {}\n", event_slot);
-        dev_err!(self.dev.as_ref(), "  Event value: {:#x?}\n", event_value);
+        let (log, suppressed) = self.fault_log_ratelimit();
+        if log {
+            if suppressed > 0 {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "(+{} suppressed GPU fault/timeout reports)\n",
+                    suppressed
+                );
+            }
+            dev_err!(self.dev.as_ref(), " (\\________/) \n");
+            dev_err!(self.dev.as_ref(), "  |        |  \n");
+            dev_err!(self.dev.as_ref(), "'.| \\  , / |.'\n");
+            dev_err!(self.dev.as_ref(), "--| / (( \\ |--\n");
+            dev_err!(self.dev.as_ref(), ".'|  _-_-  |'.\n");
+            dev_err!(self.dev.as_ref(), "  |________|  \n");
+            dev_err!(self.dev.as_ref(), "GPU channel error nya~!!!!!\n");
+            dev_err!(self.dev.as_ref(), "  Error type: {:?}\n", error_type);
+            dev_err!(self.dev.as_ref(), "  Pipe type: {}\n", pipe_type);
+            dev_err!(self.dev.as_ref(), "  Event slot: {}\n", event_slot);
+            dev_err!(self.dev.as_ref(), "  Event value: {:#x?}\n", event_value);
+        }
 
         self.event_manager.mark_error(
             event_slot,

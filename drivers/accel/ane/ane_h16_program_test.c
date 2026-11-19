@@ -1624,8 +1624,8 @@ static void mobilenet_sections(struct kunit *test, const void *aux[ANE_H16_AUX_C
 /*
  * The H17 MobileNetV1 HWX is one linked program: 28 tasks, input x and
  * output y as surfaces, the 3.5 MiB __DATA scratch on BAR slot 3 and the
- * kernel table on slot 8. The H16 rules hold except the subtype and the zero
- * stream prologue.
+ * kernel table on slot 8. The H16 rules hold except the subtype and the stream
+ * prologue, which is 0 or 1.
  */
 static void program_h17_hwx_test(struct kunit *test)
 {
@@ -1649,13 +1649,16 @@ static void program_h17_hwx_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, hwx->kernel.size, 0x81cb40);
 	KUNIT_EXPECT_EQ(test, hwx->text.size, 0x3110);
 
-	/* Subtype 9 opens its stream with 0; a subtype 7 file must open with 1. */
+	/* Subtype 9 opens its stream with 0 or 1; a subtype 7 file must open with 1. */
 	put_unaligned_le32(ANE_HWX_SUBTYPE_H16, bytes + 8);
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, snapshot->size, hwx), -ENOEXEC);
 	put_unaligned_le32(1, bytes + hwx->text.offset);
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, snapshot->size, hwx), 0);
 	KUNIT_EXPECT_EQ(test, hwx->subtype, ANE_HWX_SUBTYPE_H16);
+	/* Apple's matmul and add programs for H17 open with 1; other words stay refused. */
 	put_unaligned_le32(ANE_HWX_SUBTYPE_H17, bytes + 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, snapshot->size, hwx), 0);
+	put_unaligned_le32(2, bytes + hwx->text.offset);
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, snapshot->size, hwx), -ENOEXEC);
 	put_unaligned_le32(0, bytes + hwx->text.offset);
 	put_unaligned_le32(8, bytes + 8);

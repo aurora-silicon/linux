@@ -2,11 +2,10 @@
 #ifndef __ANE_FW_COLD_H__
 #define __ANE_FW_COLD_H__
 
+#include "ane_fw_platform.h"
 #include "ane_fw_transport.h"
 
 #define ANE_FW_DARTS 3
-/* DAPF records: four on T8140, five on T6050. */
-#define ANE_FW_DAPF_MAX 5
 
 struct ane_fw_cold_state {
 	u32 sys, cpu, subblock, gate_request, gate_ack;

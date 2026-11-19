@@ -25,6 +25,28 @@ static void apple_pmp_test_fault_recovery(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, state.level, 8U);
 }
 
+static void apple_pmp_test_poll_cadence(struct kunit *test)
+{
+	struct apple_pmp_cooling state;
+	unsigned int i;
+
+	apple_pmp_cooling_init(&state);
+	KUNIT_EXPECT_TRUE(test, apple_pmp_cooling_fast(&state, 50000, 0));
+	for (i = 1; i <= 10; i++)
+		apple_pmp_cooling_sample(&state, i * 20000000ULL, 50000, 0);
+	KUNIT_EXPECT_FALSE(test, state.hard);
+	/* Recovery still holds a cooling level until it has been released. */
+	KUNIT_EXPECT_TRUE(test, apple_pmp_cooling_fast(&state, 50000, 0));
+	for (i = 0; i < 40 && state.level; i++)
+		apple_pmp_cooling_sample(&state, 400000000ULL + i * 100000000ULL,
+					 50000, 0);
+	KUNIT_EXPECT_EQ(test, state.level, 0U);
+	KUNIT_EXPECT_FALSE(test, apple_pmp_cooling_fast(&state, 50000, 0));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_cooling_fast(&state, APPLE_PMP_FAST_POLL_MC - 1, 0));
+	KUNIT_EXPECT_TRUE(test, apple_pmp_cooling_fast(&state, APPLE_PMP_FAST_POLL_MC, 0));
+	KUNIT_EXPECT_TRUE(test, apple_pmp_cooling_fast(&state, 50000, -EIO));
+}
+
 static void apple_pmp_test_critical_confirmation(struct kunit *test)
 {
 	struct apple_pmp_confirmation state = {};
@@ -133,6 +155,7 @@ static void apple_pmp_test_gpu_attachment(struct kunit *test)
 
 static struct kunit_case apple_pmp_policy_cases[] = {
 	KUNIT_CASE(apple_pmp_test_fault_recovery),
+	KUNIT_CASE(apple_pmp_test_poll_cadence),
 	KUNIT_CASE(apple_pmp_test_critical_confirmation),
 	KUNIT_CASE(apple_pmp_test_power_validation),
 	KUNIT_CASE(apple_pmp_test_gpu_budget_freshness),

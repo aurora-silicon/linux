@@ -47,6 +47,52 @@ void iomfb_serialize_present_v27(struct dcp_swap_submit_req_v27 *wire,
 	memcpy((u8 *)wire + tail_dst, (const u8 *)request + tail_src, tail_size);
 }
 
+/* The A407 request (dcp->v27_a407): the same fields, six surfaces more before the tail. */
+void iomfb_serialize_present_v27_a407(struct dcp_swap_submit_req_v27_a407 *wire,
+				      const struct dcp_swap_submit_req_h17p *request)
+{
+	/*
+	 * The common geometry runs from swap_id through bg_color, across
+	 * several fields, so copy it by offset from the start of each
+	 * structure.  The tail is copied field by field: the A407 request puts
+	 * six more surfaces before it, which are never presented.
+	 */
+	size_t geom_dst = offsetof(struct dcp_swap_submit_req_v27_a407, swap.swap_id);
+	size_t geom_src = offsetof(struct dcp_swap_submit_req_h17p, swap.swap_id);
+	size_t geom_size = offsetof(struct dcp_swap_v27, reserved_158) -
+			   offsetof(struct dcp_swap_v27, swap_id);
+
+	static_assert(offsetof(struct dcp_swap_submit_req_h17p, swap.swap_id) +
+		      offsetof(struct dcp_swap_v27, reserved_158) -
+		      offsetof(struct dcp_swap_v27, swap_id) <=
+		      offsetof(struct dcp_swap_submit_req_h17p, swap) +
+		      sizeof(request->swap));
+	static_assert(sizeof(wire->surf_iova) == sizeof(request->surf_iova));
+	static_assert(sizeof(wire->unk_u64_a) == sizeof(request->unk_u64_a));
+	static_assert(sizeof(wire->surf_null) == sizeof(request->surf_null));
+
+	memset(wire, 0, sizeof(*wire));
+	memcpy(wire->swap.timestamp, request->swap.timestamp,
+	       sizeof(wire->swap.timestamp));
+	wire->swap.unk_38 = request->swap.unk_38;
+	memcpy((u8 *)wire + geom_dst, (const u8 *)request + geom_src, geom_size);
+	memcpy(wire->surf, request->surf, sizeof(wire->surf));
+	memcpy(wire->surf_iova, request->surf_iova, sizeof(wire->surf_iova));
+	memcpy(wire->unk_u64_a, request->unk_u64_a, sizeof(wire->unk_u64_a));
+	wire->unkbool = request->unkbool;
+	wire->unkdouble = request->unkdouble;
+	wire->unkU64 = request->unkU64;
+	wire->unkbool2 = request->unkbool2;
+	wire->clear = request->clear;
+	wire->unkU32Ptr = request->unkU32Ptr;
+	wire->swap_null = request->swap_null;
+	memcpy(wire->surf_null, request->surf_null, sizeof(wire->surf_null));
+	memset(wire->surf2_null, 1, sizeof(wire->surf2_null));
+	wire->unkoutbool_null = request->unkoutbool_null;
+	wire->unknown_pointer_null = request->unknown_pointer_null;
+	wire->unknown_output_null = request->unknown_output_null;
+}
+
 struct dcp_h17p_hotplug_request {
 	__le64 connected;
 	u8 tiled_display[0x4c];
@@ -112,6 +158,12 @@ static const struct dcp_method_entry dcp_methods_27_0[dcpep_num_methods] = {
 	IOMFB_METHOD("A479", iomfbep_abort_swaps_dcp),
 	IOMFB_METHOD("A484", dcpep_set_power_state),
 	IOMFB_METHOD("A483", dcpep_register_dfb_surface),
+	/*
+	 * The AP link's release, unnamed: H17P's and 26.6's A500, (0x4, 0). The 27.0 firmware
+	 * still dispatches it as A500 (t8142dcp 1317.1.1: cmp 'A500', then 'A500' | 1), unlike
+	 * the IOMFB calls around it; 27.2 moved both to A550/A551.
+	 */
+	IOMFB_METHOD("A500", dcpep_unnamed_500),
 };
 
 /*
@@ -119,9 +171,9 @@ static const struct dcp_method_entry dcp_methods_27_0[dcpep_num_methods] = {
  * A400/A401, so IOMobileFramebufferAP moved up by 50 (start_signal A451,
  * get_color_remap_mode A477), and set_create_DFB and vi_set_temperature_hint
  * up by one. The UPPipe A0xx and A1xx IDs are unchanged. The firmware rejects
- * an unknown tag with a panic ("link_rpc_lookup callback not found"), so
- * dfb_ready_query, whose 27.2 tag has not been seen in a call, has no entry
- * here and is not sent to this build (boot_5()).
+ * an unknown tag with a panic ("link_rpc_lookup callback not found").
+ * dfb_ready_query is A385, one above its 27.0 ID: the 27.3 trace sends it
+ * there, and the J813's DCP answers it at A385 on 27.2.
  */
 static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
@@ -147,6 +199,7 @@ static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 	IOMFB_METHOD("A104", dcpep_set_dfb_dimensions),
 	IOMFB_METHOD("A105", dcpep_commit_dfb_info),
 	IOMFB_METHOD("A035", dcpep_dfb_query),
+	IOMFB_METHOD("A385", dcpep_dfb_ready_query),
 	IOMFB_METHOD("A353", dcpep_pipe_query_353),
 	IOMFB_METHOD("A352", dcpep_pipe_set_352),
 	IOMFB_METHOD("A465", dcpep_pipe_cfg_415),
@@ -164,6 +217,11 @@ static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 	IOMFB_METHOD("A529", iomfbep_abort_swaps_dcp),
 	IOMFB_METHOD("A534", dcpep_set_power_state),
 	IOMFB_METHOD("A533", dcpep_register_dfb_surface),
+	/*
+	 * The AP link's release: t8142dcp 26B123 compares 'A550', then 'A550' | 1, in the
+	 * dispatch where 26A428's compares 'A500' (0x1df68c vs 0x1de0dc, same code).
+	 */
+	IOMFB_METHOD("A550", dcpep_unnamed_500),
 };
 
 /*
@@ -212,6 +270,30 @@ const struct dcp_method_entry *iomfb_v27_methods(const char *compat)
 }
 
 /*
+ * The 27.0 table for the J714s, the board the firmware 27 sleep has run on (dcp->v27_j714s): a
+ * copy with the sleep's A500 added. The shared table keeps the methods it had, so every other
+ * machine sends what it sent, and a 27.2 or 27.3 build is judged against the same list as
+ * before (iomfb_v27_missing_method()). NULL if @methods is not the 27.0 table or the copy
+ * cannot be made.
+ */
+const struct dcp_method_entry *iomfb_v27_methods_j714s(struct device *dev,
+						       const struct dcp_method_entry *methods)
+{
+	static const struct dcp_method_entry a500 = { "dcpep_unnamed_500", { 'A', '5', '0', '0' } };
+	struct dcp_method_entry *table;
+
+	if (methods != dcp_methods_27_0)
+		return NULL;
+	table = devm_kmemdup(dev, dcp_methods_27_0, sizeof(dcp_methods_27_0), GFP_KERNEL);
+	if (!table)
+		return NULL;
+	table[dcpep_unnamed_500] = a500;
+	/* macOS 27 submits every swap with A407 (the H17P table's A408 is not used). */
+	memcpy(table[dcpep_swap_submit].tag, "A407", sizeof(table[dcpep_swap_submit].tag));
+	return table;
+}
+
+/*
  * The driver sends every method of the 27.0 table. dfb_ready_query is the one
  * it leaves out for a build whose table has no ID for it (boot_5()). Return
  * the name of the first other method @methods has no ID for, with their number
@@ -227,8 +309,9 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 
 	*count = 0;
 	for (i = 0; i < dcpep_num_methods; i++) {
+		/* Only a firmware sleep sends unnamed_500, and it checks the build's table. */
 		if (!dcp_methods_27_0[i].tag[0] || methods[i].tag[0] ||
-		    i == dcpep_dfb_ready_query)
+		    i == dcpep_dfb_ready_query || i == dcpep_unnamed_500)
 			continue;
 		if (!first)
 			first = dcp_methods_27_0[i].name;
@@ -247,6 +330,9 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 #define iomfb_sleep_h17p iomfb_sleep_v27
 #define iomfb_shutdown_h17p iomfb_shutdown_v27
 #define iomfb_present_backlight_h17p iomfb_present_backlight_v27
+#define iomfb_present_matrix_h17p iomfb_present_matrix_v27
+#define iomfb_s2r_500_h17p iomfb_s2r_500_v27
+#define iomfb_s2r_power_h17p iomfb_s2r_power_v27
 #define DCP_FW h17p
 #define DCP_FW_VER DCP_FW_VERSION(27, 0, 0)
 
@@ -279,6 +365,21 @@ static bool trampoline_get_frequency_v27(struct apple_dcp *dcp, int tag,
 			index);
 	*(__le64 *)out = cpu_to_le64(rate);
 	return true;
+}
+
+/*
+ * D572, as on H17P: the firmware powers the display DART's streams with it, 0 when it's done
+ * with the display. Only a sleep's stop acts on it (dcp_s2r_dart_power()).
+ */
+static bool trampoline_dart_power_v27(struct apple_dcp *dcp, int tag,
+				      void *out, void *in)
+{
+	const struct dcp_packet_header *header = in - sizeof(*header);
+
+	if (header->in_len >= sizeof(u32))
+		dcp_s2r_dart_power(dcp, get_unaligned_le32(in));
+
+	return trampoline_zero(dcp, tag, out, in);
 }
 
 static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
@@ -593,7 +694,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[565] = trampoline_true,
 	[567] = trampoline_true,
 	[569] = trampoline_set_boolean_property_v27,
-	[572] = trampoline_zero,
+	[572] = trampoline_dart_power_v27, /* powerUpDART */
 	[574] = iomfbep_cb_video_range_h17p,
 	[575] = trampoline_hotplug_h17p,
 	[576] = trampoline_nop,

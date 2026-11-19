@@ -19,8 +19,13 @@ typedef uint8_t u8;
 #define FIELD_GET(mask,value) (((value) & (mask)) >> __builtin_ctzll(mask))
 #define APPLE_RTKIT_EP_OSLOG 8
 struct buffer { unsigned sentinel; unsigned size; };
-struct apple_rtkit { void *dev; struct buffer oslog_buffer; bool oslog_inherited, sync_syslog_ack, oslog_echo; u64 oslog_owed; };
+/* v27_rx_failed: read only by the J714s firmware 27 sleep; a failed echo sets it. */
+struct apple_rtkit { void *dev; struct buffer oslog_buffer; bool oslog_inherited, sync_syslog_ack, oslog_echo; u64 oslog_owed; bool v27_rx_failed; };
 #define cmpxchg(p,o,n) __sync_val_compare_and_swap((p),(o),(n))
+#define WRITE_ONCE(x,v) ((x)=(v))
+/* As the shared Apple configuration builds it. */
+#define CONFIG_APPLE_SOC_SLEEP 1
+#define IS_ENABLED(option) (option)
 static unsigned warnings, notifications, requests, acks, errors;
 static u64 observed;
 static bool neo, m5;
@@ -105,7 +110,8 @@ def syslog(root):
 typedef uint8_t u8;
 typedef uint64_t u64;
 #define APPLE_RTKIT_EP_SYSLOG 2
-struct buffer { size_t size; unsigned char *buffer; bool iomem; };
+/* is_mapped without a buffer: a firmware-owned log, which no buffer here is. */
+struct buffer { size_t size; unsigned char *buffer; bool iomem, is_mapped; };
 struct apple_rtkit_ops {
     bool (*syslog_is_debug)(void *, const char *, const char *);
 };
@@ -239,6 +245,7 @@ static const char *iomfb_v27_missing_method(const struct dcp_method_entry *m, un
     return m[0].tag[0] ? NULL : "some_method";
 }
 static bool of_property_present(struct device_node *n, const char *s) { (void)n; (void)s; return false; }
+static bool dcp_ext26_admitted(struct device_node *n) { (void)n; return false; }
 static bool apple_t8122_25g83_board(void) { return false; }
 static int of_property_read_u32(struct device_node *n, const char *s, u32 *v) { (void)n; (void)s; (void)v; return -EINVAL; }
 static int of_property_read_string(struct device_node *n, const char *s, const char **v) { (void)n; (void)s; (void)v; return -EINVAL; }

@@ -3136,17 +3136,23 @@ static const struct gate_staged t6041_max_stages[] = {
 };
 
 /*
- * The J575c's typec1 chain: ATC1 crossbar, DARTs, mailbox, route, dcpext1.
- * That port is also a USB3 port, so its device tree enables the ATC1 PHY's
- * coprocessor mailbox, as the M4 Pro boards do: the mailbox is not part of
- * the chain here.
+ * The J575c's USB-C chain: the crossbars of its four back Type-C ports
+ * (ATC0-3), DARTs, mailbox, a route per port, dcpext1. The ports are also
+ * USB3 ports, so the device tree enables the ATC PHYs' coprocessor
+ * mailboxes, as the M4 Pro boards do: they are not part of the chain here.
  */
 static const char *const t6041_j575c_usbc_nodes[] = {
+	"/mux@38324c000",
 	"/mux@38b24c000",
+	"/mux@39324c000",
+	"/mux@39b24c000",
 	"/iommu@602340000",
 	"/iommu@602300000",
 	"/mailbox@602e08000",
+	"/dcp@602e00000/typec-routes/route@0",
 	"/dcp@602e00000/typec-routes/route@1",
+	"/dcp@602e00000/typec-routes/route@2",
+	"/dcp@602e00000/typec-routes/route@3",
 	"/dcp@602e00000",
 };
 
@@ -3154,10 +3160,52 @@ static const struct gate_staged t6041_j575c_usbc = {
 	"/iommu@602300000", t6041_j575c_usbc_nodes, ARRAY_SIZE(t6041_j575c_usbc_nodes),
 };
 
+/*
+ * The J575c's second USB-C processor, as the J614c/J616c's, with a route to
+ * the fourth port too. It shares the crossbars with dcpext1's chain.
+ */
+static const char *const t6041_j575c_usbc2_nodes[] = {
+	"/iommu@606340000",
+	"/iommu@606300000",
+	"/mailbox@606e08000",
+	"/dcp@606e00000/typec-routes/route@0",
+	"/dcp@606e00000/typec-routes/route@1",
+	"/dcp@606e00000/typec-routes/route@2",
+	"/dcp@606e00000/typec-routes/route@3",
+	"/dcp@606e00000",
+};
+
+static const struct gate_staged t6041_j575c_usbc2 = {
+	"/iommu@606300000", t6041_j575c_usbc2_nodes, ARRAY_SIZE(t6041_j575c_usbc2_nodes),
+};
+
+/*
+ * The J575c's HDMI chain. Its ATC3 is a USB-C port, and its HDMI port runs
+ * through the LPDPTX PHY instead (t6041-j575c-hdmi.dtsi): that PHY's power,
+ * the AOP pins (the converter's hotplug), the PHY, then dcpext0's chain.
+ */
+static const char *const t6041_j575c_hdmi_nodes[] = {
+	"/power-management@502280000/power-controller@360",
+	"/pinctrl@510824000",
+	"/phy@51c200000",
+	"/iommu@3a2340000",
+	"/iommu@3a2300000",
+	"/mailbox@3a2e08000",
+	"/dcp@3a2e00000",
+};
+
+static const struct gate_staged t6041_j575c_hdmi = {
+	"/iommu@3a2300000", t6041_j575c_hdmi_nodes, ARRAY_SIZE(t6041_j575c_hdmi_nodes),
+};
+
 static const struct gate_staged *t6041_max_stage(unsigned int i)
 {
+	if (i == 0 && of_machine_is_compatible("apple,j575c"))
+		return &t6041_j575c_hdmi;
 	if (i == 1 && of_machine_is_compatible("apple,j575c"))
 		return &t6041_j575c_usbc;
+	if (i == 2 && of_machine_is_compatible("apple,j575c"))
+		return &t6041_j575c_usbc2;
 	return &t6041_max_stages[i];
 }
 

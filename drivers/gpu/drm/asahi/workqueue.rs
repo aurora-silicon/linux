@@ -297,6 +297,14 @@ struct WorkQueueInner {
     size: u32,
     wptr: u32,
     pending: KVec<Pin<KBox<SubmittedWorkContainer>>>,
+    /// The most recently completed command, held back from cleanup until a later command's stamp
+    /// (or queue idle) proves the firmware is done with its descriptor. The firmware stores a
+    /// command's completion stamps through the microsequence embedded in its descriptor, and keeps
+    /// touching that descriptor after the driver-visible stamp is observed. Freeing (and reusing)
+    /// the descriptor at that point lets the firmware store through a stale/reused target and crash
+    /// with a non-canonical pointer (seen on G13 under sustained CTS). Commands are retired in
+    /// order, so observing a later command's stamp proves this one's firmware tail is done.
+    last_completed_work: Option<Pin<KBox<SubmittedWorkContainer>>>,
     last_token: Option<event::Token>,
     pending_jobs: usize,
     last_submitted: Option<event::EventValue>,
@@ -664,6 +672,10 @@ impl Drop for Job::ver {
 
         if inner.pending.is_empty() && inner.pending_jobs == 0 {
             mod_pr_debug!("WorkQueue({:?}): Dropping event\n", inner.pipe_type);
+            // Queue is idle with all work completed; release any held completed command.
+            if let Some(last_cmd) = inner.last_completed_work.take() {
+                workqueue::system_dfl().enqueue(last_cmd);
+            }
             inner.event = None;
             inner.last_submitted = None;
             inner.last_completed = None;
@@ -703,6 +715,11 @@ impl<'a> Drop for JobSubmission::ver<'a> {
 #[versions(AGX)]
 impl Drop for WorkQueueInner::ver {
     fn drop(&mut self) {
+        // Release any command held back for the firmware's completion tail. The queue is being torn
+        // down and its firmware context invalidated (below), so the firmware is done with it.
+        if let Some(last_cmd) = self.last_completed_work.take() {
+            workqueue::system_dfl().enqueue(last_cmd);
+        }
         // The firmware keeps referring to this queue until its context is invalidated. When the
         // queue's owner went away with work in flight, the queue is dropped as soon as that work
         // completes, which can be well before the invalidation.
@@ -844,6 +861,7 @@ impl WorkQueue::ver {
             size,
             wptr: 0,
             pending: KVec::new(),
+            last_completed_work: None,
             last_token: None,
             event: None,
             priority,
@@ -1038,6 +1056,14 @@ impl WorkQueue for WorkQueue::ver {
         let last_wptr = inner.pending[completed_commands - 1].inner.wptr();
         let pipe_type = inner.pipe_type;
 
+        // Hold back the most recently completed command: the firmware may still be storing its
+        // completion stamps through its descriptor after we observe the driver-visible stamp.
+        // Release each held command only once a strictly-later command has completed (retirement is
+        // in order, so a later stamp proves this one's firmware tail is done), or at queue idle
+        // below. This keeps at most one extra command (and its BufferManager slot) alive per queue,
+        // released promptly, so it does not reintroduce the 127-queue limit that the original
+        // deferred-free (commit 513cd1502fb9) hit.
+        let mut last_cmd = inner.last_completed_work.take();
         for mut cmd in inner.pending.drain(..completed_commands) {
             mod_pr_debug!(
                 "WorkQueue({:?}): Queueing command @ {:?} for cleanup\n",
@@ -1045,8 +1071,11 @@ impl WorkQueue for WorkQueue::ver {
                 cmd.inner.gpu_va()
             );
             cmd.as_mut().inner_mut().complete();
-            workqueue::system_dfl().enqueue(cmd);
+            if let Some(last_cmd) = last_cmd.replace(cmd) {
+                workqueue::system_dfl().enqueue(last_cmd);
+            }
         }
+        inner.last_completed_work = last_cmd;
         drop(signalling);
 
         mod_pr_debug!(
@@ -1065,6 +1094,13 @@ impl WorkQueue for WorkQueue::ver {
 
         let empty = inner.pending.is_empty();
         if empty && inner.pending_jobs == 0 {
+            // The queue is idle. This completion was signalled by the last command's RetireStamp,
+            // the final op of its microsequence, so the firmware is done with every retired
+            // descriptor including the held one. Release it now rather than pinning its slot until
+            // the next submission or queue drop.
+            if let Some(last_cmd) = inner.last_completed_work.take() {
+                workqueue::system_dfl().enqueue(last_cmd);
+            }
             inner.event = None;
             inner.last_submitted = None;
             inner.last_completed = None;
@@ -1133,11 +1169,16 @@ impl WorkQueue for WorkQueue::ver {
 
         core::mem::swap(&mut inner.pending, &mut cmds);
 
+        // The GPU has failed, so the firmware will not touch any descriptor again: drop the held
+        // completed command along with the rest.
+        let held = inner.last_completed_work.take();
+
         if inner.pending_jobs == 0 {
             inner.event = None;
         }
 
         core::mem::drop(inner);
+        core::mem::drop(held);
 
         for mut cmd in cmds {
             cmd.as_mut().inner_mut().mark_error(error);
