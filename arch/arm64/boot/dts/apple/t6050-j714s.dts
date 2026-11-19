@@ -638,7 +638,7 @@
 };
 
 /* The same T6050 camera as J716c (J714sAP ADT); the loader sets the J714s sensor type. */
-#include "t6050-j716c-isp.dtsi"
+#include "t6050-isp.dtsi"
 
 /*
  * The J714s camera sizes: sensor config 6 (two stacked 3040x2880 frames; the ISP processes
