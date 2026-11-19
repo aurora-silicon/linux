@@ -6,50 +6,46 @@
 
 static void atc_tunnel_soc_qualification(struct kunit *test)
 {
+	/* The ATC node compatible, as T6020/T6021/T6022 and their siblings carry it. */
 	const struct {
-		const char *soc;
+		const char *phy;
 		bool qualified;
 	} cases[] = {
-		{ "apple,t6020", true },
-		{ "apple,t6021", true },
-		{ "apple,t6022", false },
-		{ "apple,t8103", false },
-		{ "apple,t6000", false },
-		{ "apple,t6001", false },
-		{ "apple,t6002", false },
-		{ "apple,t8112", false },
-		{ "apple,t6030", false },
-		{ "apple,t6031", false },
+		{ "apple,t6020-atcphy", true },
+		{ "apple,t8103-atcphy", false },
+		{ "apple,t6000-atcphy", false },
+		{ "apple,t8112-atcphy", false },
+		{ "apple,t8122-atcphy", false },
+		{ "apple,t6030-atcphy", false },
+		{ "apple,t6031-atcphy", false },
 	};
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(cases); i++) {
 		struct property compatible = {
-			.name = "compatible", .value = (void *)cases[i].soc,
-			.length = strlen(cases[i].soc) + 1,
+			.name = "compatible", .value = (void *)cases[i].phy,
+			.length = strlen(cases[i].phy) + 1,
 		};
-		struct device_node root = { .properties = &compatible };
+		struct device_node np = { .properties = &compatible };
 
-		KUNIT_EXPECT_EQ(test, apple_atc_t602x_qualified(&root), cases[i].qualified);
+		KUNIT_EXPECT_EQ(test, apple_atc_t602x_qualified(&np), cases[i].qualified);
 	}
 	KUNIT_EXPECT_FALSE(test, apple_atc_t602x_qualified(NULL));
 }
 
 static void atc_tunnel_core_qualification(struct kunit *test)
 {
+	/* Any port's core on either die: only the register window matters. */
 	const struct {
 		const char *compatible;
-		u64 base;
 		u64 size;
 		bool valid;
 	} cases[] = {
-		{ "apple,t6020-atcphy", 0x703000000ULL, 0x7048, true },
-		{ "apple,t6020-atcphy", 0xb03000000ULL, 0x7048, true },
-		{ "apple,t6020-atcphy", 0xf03000000ULL, 0x7048, true },
-		{ "apple,t6020-atcphy", 0x703000000ULL, 0x7047, false },
-		{ "apple,t6020-atcphy", 0x1303000000ULL, 0x4c000, false },
-		{ "apple,t6020-atcphy", 0x2703000000ULL, 0x4c000, false },
-		{ "apple,t8103-atcphy", 0x703000000ULL, 0x4c000, false },
+		{ "apple,t6020-atcphy", 0x7048, true },
+		{ "apple,t6020-atcphy", 0x4c000, true },
+		{ "apple,t6020-atcphy", 0x7047, false },
+		{ "apple,t8103-atcphy", 0x4c000, false },
+		{ "apple,t6000-atcphy", 0x4c000, false },
 	};
 	unsigned int i;
 
@@ -61,10 +57,10 @@ static void atc_tunnel_core_qualification(struct kunit *test)
 		struct device_node np = { .properties = &compatible };
 
 		KUNIT_EXPECT_EQ(test,
-				apple_atc_t602x_core_valid(&np, cases[i].base, cases[i].size),
+				apple_atc_t602x_core_valid(&np, cases[i].size),
 				cases[i].valid);
 	}
-	KUNIT_EXPECT_FALSE(test, apple_atc_t602x_core_valid(NULL, 0x703000000ULL, 0x7048));
+	KUNIT_EXPECT_FALSE(test, apple_atc_t602x_core_valid(NULL, 0x7048));
 }
 
 static void atc_tunnel_wiring_gate(struct kunit *test)

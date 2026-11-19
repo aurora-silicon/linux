@@ -6,17 +6,23 @@
 #include <linux/of.h>
 #include <linux/types.h>
 
-static inline bool apple_atc_t602x_qualified(const struct device_node *root)
+/*
+ * The T602x per-DP-IN tunnel clock belongs to the T602x ATC IP block, which
+ * every die of T6020/T6021/T6022 carries: qualify the PHY node, not the SoC.
+ * Which ports carry tunnel routes is the connector's DT wiring.
+ */
+static inline bool apple_atc_t602x_qualified(const struct device_node *np)
 {
-	return of_device_is_compatible(root, "apple,t6020") ||
-	       of_device_is_compatible(root, "apple,t6021");
+	return of_device_is_compatible(np, "apple,t6020-atcphy");
 }
 
-static inline bool apple_atc_t602x_core_valid(const struct device_node *np, u64 base, u64 size)
+/*
+ * A T602x ATC core whose register window covers the tunnel clock registers
+ * (up to 0x7048). Every port's core has the same layout, on either die.
+ */
+static inline bool apple_atc_t602x_core_valid(const struct device_node *np, u64 size)
 {
-	return of_device_is_compatible(np, "apple,t6020-atcphy") &&
-	       (base == 0x703000000ULL || base == 0xb03000000ULL || base == 0xf03000000ULL) &&
-	       size >= 0x7048;
+	return apple_atc_t602x_qualified(np) && size >= 0x7048;
 }
 
 static inline int apple_atc_t602x_gate(bool own_wiring, bool routes_present, bool valid_core)
