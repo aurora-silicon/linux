@@ -695,7 +695,8 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	 * dwc3_core_probe() enabled runtime PM with the device active and forbade it, for the
 	 * dwc3 platform driver's own callbacks, which this glue does not use. The core is being
 	 * brought up now, so take the glue's reference (see dwc3_apple_core_start()) and, where
-	 * that is tested, allow runtime PM so the reference alone decides.
+	 * the power domain may drop under an idle controller (see dwc3_apple_idle_rpm()), allow
+	 * runtime PM so the reference alone decides.
 	 */
 	pm_runtime_get_noresume(appledwc->dev);
 	appledwc->rpm_held = true;
@@ -1822,6 +1823,45 @@ static bool dwc3_apple_has_fixed_hub(struct device *dev, u32 *port)
 	return hub;
 }
 
+/*
+ * Whether an idle controller may runtime-suspend and let its power domain drop. Everything
+ * that keeps state in that domain must be known to it:
+ * - the controller itself, which has no state of its own while its core is down;
+ * - its DARTs, which save and restore their state in their runtime PM callbacks. They are
+ *   resumed before the controller, so a DART outside any domain would be written while the
+ *   controller's domain is still off and come back empty;
+ * - its PHYs, which hold the domain while they have state in it, or follow it and restore
+ *   that state once it is on again.
+ * The device tree says this with power-domains on all of them.
+ */
+static bool dwc3_apple_idle_rpm(struct device_node *np)
+{
+	static const struct {
+		const char *list;
+		const char *cells;
+	} suppliers[] = {
+		{ "iommus", "#iommu-cells" },
+		{ "phys", "#phy-cells" },
+	};
+	struct of_phandle_iterator it;
+	int i, err;
+
+	if (!of_property_present(np, "power-domains"))
+		return false;
+	for (i = 0; i < ARRAY_SIZE(suppliers); i++) {
+		of_for_each_phandle(&it, err, np, suppliers[i].list, suppliers[i].cells, 0) {
+			if (!of_property_present(it.node, "power-domains")) {
+				of_node_put(it.node);
+				return false;
+			}
+		}
+		if (err != -ENOENT)
+			return false;
+	}
+
+	return true;
+}
+
 static int dwc3_apple_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1837,9 +1877,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->host_only = dwc3_apple_host_only(dev);
 	appledwc->dt_dis_u3_susphy = device_property_read_bool(dev, "snps,dis_u3_susphy_quirk");
 	appledwc->sleep_ddr = device_property_read_bool(dev, "apple,sleep-ddr");
-	/* The PHY driver and the DARTs follow runtime PM on these SoCs. */
-	appledwc->idle_rpm = of_device_is_compatible(dev->of_node, "apple,t6040-dwc3") ||
-			     of_device_is_compatible(dev->of_node, "apple,t8132-dwc3");
+	appledwc->idle_rpm = dwc3_apple_idle_rpm(dev->of_node);
 	mutex_init(&appledwc->lock);
 	spin_lock_init(&appledwc->sleep_pm_lock);
 	/* A never-connected port has no generic core probe to publish this. */
@@ -1929,11 +1967,9 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	/*
 	 * Until the first cable there is no core to keep powered: let the controller
 	 * runtime-suspend, and its DARTs with it, so that its power domain can drop.
-	 * Tested on T8132; on the T6041 (M4 Max) the never-plugged ports are the usual case.
+	 * A fixed-hub host starts below, so it never waits for a cable.
 	 */
-	if (appledwc->idle_rpm && !appledwc->fixed_hub &&
-	    (of_device_is_compatible(dev->of_node, "apple,t8132-dwc3") ||
-	     of_machine_is_compatible("apple,t6041"))) {
+	if (appledwc->idle_rpm && !appledwc->fixed_hub) {
 		pm_runtime_set_active(dev);
 		pm_runtime_enable(dev);
 		appledwc->pre_core_rpm = true;
