@@ -365,6 +365,8 @@ struct tps6598x {
 	int irq;
 	u8 i2c_protocol:1;
 	u8 dbma_at_probe:1; /* Apple "DBMa" debug mode was active at probe */
+	/* apple,sleep-ssps: SSPS around a firmware-driven sleep, under the sleep's rules */
+	u8 sleep_ssps:1;
 
 	struct gpio_desc *reset;
 	struct typec_port *port;
