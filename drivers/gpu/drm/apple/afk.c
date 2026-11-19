@@ -115,7 +115,8 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 
 	afkep->ops = ops;
 	afkep->dcp = dcp;
-	afkep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 || dcp_is_ext26(dcp);
+	afkep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 || dcp_is_ext26(dcp) ||
+			  dcp->hw.afk_v2;
 	afkep->endpoint = endpoint;
 	afkep->wq = alloc_ordered_workqueue("apple-dcp-afkep%02x",
 					    WQ_MEM_RECLAIM, endpoint);
