@@ -116,9 +116,13 @@ impl Order {
         // Same-engine compute order and barriers are kept by the firmware compute queue,
         // which finishes each command before it starts the next: its published frontier
         // suffices. Renders, and every cross-engine dependency, need the completed one.
+        // With queued renders, a render's TA waits for the previous render's FS in the
+        // firmware, so same-engine render order holds from publication on as well.
         let mut frontier = completed;
         if self.engine == COMPUTE {
             frontier[COMPUTE] = published[COMPUTE].max(completed[COMPUTE]);
+        } else if super::params::render_flights() > 1 {
+            frontier[RENDER] = published[RENDER].max(completed[RENDER]);
         }
         frontier[self.engine].checked_add(1) == Some(self.sequence)
             && self

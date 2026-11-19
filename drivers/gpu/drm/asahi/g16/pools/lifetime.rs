@@ -113,6 +113,24 @@ impl<const N: usize> Lifetime<N> {
                 .iter()
                 .any(|u| matches!(u.state, State::Preparing | State::Published))
     }
+    /// Whether `k`'s owner retired (reusable by the same storage; see `claim_retired`).
+    pub(crate) fn retired(&self, k: usize) -> bool {
+        self.units.get(k).is_some_and(|u| u.state == State::Retired)
+    }
+    /// Claims a fresh or retired `k` without the displacement proof: the caller proved its
+    /// last owner is the storage being claimed.
+    pub(crate) fn claim_retired(&mut self, k: usize) -> bool {
+        if !matches!(
+            self.units.get(k).map(|u| u.state),
+            Some(State::Fresh | State::Retired)
+        ) {
+            return false;
+        }
+        self.units[k].previous = self.units[k].state;
+        self.units[k].state = State::Preparing;
+        self.units[k].generation = 1;
+        true
+    }
     pub(crate) fn claim(&mut self, k: usize) -> bool {
         if !self.available(k) {
             return false;

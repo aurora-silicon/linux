@@ -62,6 +62,8 @@ struct Allocator {
     scene_list: Arc<FwObject>,
     published: AtomicBool,
     id: u32,
+    /// Hardware UMA slot of the descriptor.
+    slot: u32,
 }
 
 #[derive(Default)]
@@ -80,6 +82,8 @@ pub(crate) struct PbStats {
 
 pub(crate) struct PoolSet {
     units: KVec<Allocator>,
+    /// Each allocator owns its own hardware UMA slot: renders of this arena may be queued.
+    pub(crate) split: bool,
     /// Blocks of the shared heap (the PB managers' lists cover the whole 256 MiB window).
     heap_blocks: u32,
 }
@@ -133,7 +137,10 @@ fn write_records<const N: usize>(
     Ok(())
 }
 impl Allocator {
-    fn new(o: &mut Objects, k: u64, heap: &Arc<FwObject>) -> Result<Self> {
+    fn new(o: &mut Objects, k: u64, heap: &Arc<FwObject>, split: bool) -> Result<Self> {
+        // Split: allocator k in slot 33 + k, so two queued renders never share a hardware
+        // slot (the firmware sets a queued command up while the one before it still runs).
+        let slot = engine::RENDER_UMA_SLOT + if split { k as u32 } else { 0 };
         let base = client::render_base(k);
         let nc = |va| Some((va, pte::LEAF_NC));
         // Native UMA software metadata is ASC-owned and never needs a client GPU alias.
@@ -170,7 +177,7 @@ impl Allocator {
             0,
             &buffer::uma_manager_image(
                 descriptor.va,
-                engine::RENDER_UMA_SLOT,
+                slot,
                 gva(&state)?,
                 gva(&list)?,
                 submitted.va,
@@ -187,6 +194,7 @@ impl Allocator {
             scene_list,
             published: AtomicBool::new(false),
             id: k as u32,
+            slot,
         })
     }
     fn refs(&self) -> Result<AllocatorRefs> {
@@ -228,11 +236,16 @@ impl PoolSet {
             Some((client::pb_heap(0), pte::LEAF_NC)),
             false,
         )?;
+        let split = super::params::render_uma_split();
         let mut units = KVec::with_capacity(2, GFP_KERNEL)?;
         for k in 0..2 {
-            units.push(Allocator::new(o, k, &heap)?, GFP_KERNEL)?;
+            units.push(Allocator::new(o, k, &heap, split)?, GFP_KERNEL)?;
         }
-        Ok(Self { units, heap_blocks })
+        Ok(Self {
+            units,
+            split,
+            heap_blocks,
+        })
     }
     #[allow(dead_code)]
     pub(crate) fn allocator_refs_for(&self, k: usize) -> Result<AllocatorRefs> {
@@ -245,7 +258,7 @@ impl PoolSet {
         }
         // Descriptor pointer/counter and slot must still identify this exact retained unit.
         if read64(&u.descriptor, 0)? != u.descriptor.va
-            || u.descriptor.r32(8)? != engine::RENDER_UMA_SLOT
+            || u.descriptor.r32(8)? != u.slot
             || read64(&u.descriptor, 0x4c)? != u.submitted.va
         {
             return Err(EINVAL);

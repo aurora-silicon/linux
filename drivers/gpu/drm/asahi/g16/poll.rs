@@ -141,7 +141,8 @@ impl Shared {
             // Nothing is published while a render is in flight: the poll pass after its
             // retirement publishes this job. Skipping the pass here keeps queued submissions
             // from holding the device lock (ring drains, health checks) on that path.
-            let render_busy = firmware.engine.flights.iter().any(|f| f.renders != 0);
+            let render_busy = firmware.engine.flights.iter().any(|f| f.renders != 0)
+                && firmware.engine.flights.len() >= params::render_flights();
             if accepted.is_ok() && !render_busy {
                 if let Err(error) = firmware.publish(&mut done) {
                     firmware.fail_stop(error, &mut done);
@@ -402,6 +403,44 @@ impl Firmware {
             && ring_passed(pipe.completion()?, first, record, producer, slots))
     }
 
+    /// In-order receipt of a render flight `f` with a later render queued behind it: each
+    /// render queue's NC READ cursor (and with uncached queue info its consumers) passed the
+    /// flight's entries, and both submit pipes' read and completion cursors passed its records.
+    fn render_passed(&self, f: &Flight) -> Result<bool> {
+        let cap = super::hw::sizes::QUEUE_CAP;
+        let g = &self.graph.render;
+        let e = &self.engine;
+        let queues = [
+            (Channel::Ta, &g.qstate[0], &g.qinfo[0], f.ta_start, f.ta_head, e.ta_head, f.rec[0]),
+            (Channel::Fs, &g.qstate[1], &g.qinfo[1], f.fs_start, f.fs_head, e.fs_head, f.rec[1]),
+        ];
+        for (channel, state, info, start, head, tail, record) in queues {
+            if head >= cap || start >= cap || tail >= cap {
+                return Err(EINVAL);
+            }
+            if !ring_passed(state.r32(qstate::READ)?, start, head, tail, cap) {
+                return Ok(false);
+            }
+            if !super::hw::tuning::FW_CACHED {
+                for offset in [0x20, 0x24, 0x28] {
+                    if !ring_passed(info.r32(offset)?, start, head, tail, cap) {
+                        return Ok(false);
+                    }
+                }
+            }
+            let slots = super::fw::channels::RING_SLOTS;
+            let first = (record + slots - 1) % slots;
+            let producer = self.channels.producer(channel);
+            let pipe = self.channels.channel(channel);
+            if !ring_passed(pipe.read()?, first, record, producer, slots)
+                || !ring_passed(pipe.completion()?, first, record, producer, slots)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// A full receipt includes stage and notifier stamps, every physical consumer,
     /// the private allocator completion and the internal timestamp pair. An aborted
     /// receipt omits only the writes firmware does not make for an aborted command,
@@ -485,7 +524,41 @@ impl Firmware {
                 && start != 0
                 && end > start;
         }
-        if f.renders != 0 {
+        if f.renders != 0 && behind {
+            // A later render queued behind this one: its receipts are "passed", in order.
+            let g = &self.graph.render;
+            let e = &self.engine;
+            if !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target)
+                || !stamp_reached(g.fw_stamp[1].r32(0)?, f.fs_target, e.fs_target)
+                || !self.render_passed(f)?
+            {
+                return Ok(Retirement::Pending);
+            }
+            let k = f.claims.pass[0] as usize;
+            let unit = f.job.resources.render()?.passes.get(k).ok_or(EINVAL)?;
+            let ta_start = unit.scene.r64(0x600)?;
+            let ta_end = unit.scene.r64(0x608)?;
+            let fs_start = unit.scene.r64(0x620)?;
+            let fs_end = unit.scene.r64(0x628)?;
+            // Every flight is a render of this VM: the notifier contexts name it.
+            full &= stamp_reached(
+                g.notifier.r32(notifier_page::TA_STAMP)?,
+                f.ta_target,
+                e.ta_target,
+            ) && stamp_reached(
+                g.notifier.r32(notifier_page::FS_STAMP)?,
+                f.fs_target,
+                e.fs_target,
+            ) && g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot
+                && g.notifier
+                    .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
+                    == f.job.vm.slot
+                && f.job.resources.render()?.pools.retired(k)?
+                && ta_start != 0
+                && ta_end > ta_start
+                && fs_start != 0
+                && fs_end > fs_start;
+        } else if f.renders != 0 {
             let g = &self.graph.render;
             if g.fw_stamp[0].r32(0)? != f.ta_target
                 || g.fw_stamp[1].r32(0)? != f.fs_target

@@ -938,6 +938,10 @@ impl Firmware {
     /// need an empty engine: under several clients, compute queued behind another VM's
     /// lost its writes and stalled the firmware compute queue.
     fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
+        let sent = job.progress.sent();
+        if matches!(command(job, sent), Some(Command::Render(_))) {
+            return self.can_queue_render_behind(job);
+        }
         let e = &self.engine;
         if e.flights.len() >= params::compute_flights()
             || e.flights.iter().any(|f| {
@@ -959,6 +963,29 @@ impl Firmware {
         }
         let sent = job.progress.sent();
         matches!(command(job, sent), Some(Command::Compute(_)))
+            && job.check_command_dependencies(sent).is_ok()
+    }
+
+    /// Whether `job`'s next command, a render, may be queued behind the flights: render
+    /// queueing is on (`render_flights`), every flight is a healthy render of the same VM
+    /// without user timestamps, and the VM's allocators each own a hardware UMA slot. Its TA
+    /// then waits in the firmware for the previous FS: the render order stays total.
+    fn can_queue_render_behind(&self, job: &Arc<Job>) -> bool {
+        let e = &self.engine;
+        let sent = job.progress.sent();
+        e.flights.len() < params::render_flights()
+            && e.flights.iter().all(|f| {
+                f.renders != 0
+                    && f.computes == 0
+                    && !f.doomed
+                    && !f.recovery_suspect
+                    && Arc::ptr_eq(&f.job.vm, &job.vm)
+                    && !Self::writes_timestamps(f)
+            })
+            && job.vm.status.get() == 0
+            && !self.slots.render_exhausted()
+            && super::recovery::logic::next_ordinal(e.draw).is_some()
+            && job.resources.render().is_ok_and(|arena| arena.pools.split)
             && job.check_command_dependencies(sent).is_ok()
     }
 
@@ -1130,7 +1157,7 @@ impl Firmware {
         if prefix.c_head >= 256 || prefix.ta_head >= 256 || prefix.fs_head >= 256 {
             return Err(super::boot::eproto());
         }
-        if behind {
+        if behind && !render {
             // Room for one more compute entry behind the unconsumed ones.
             let read = self.graph.compute.qstate.r32(qstate::READ)?;
             if read >= 256
@@ -1138,6 +1165,21 @@ impl Firmware {
             {
                 return Err(EAGAIN);
             }
+        }
+        if behind && render {
+            // Room for a render's TA entries (wait, InitBM, TA) and FS entries behind the
+            // unconsumed ones; its TA waits for the newest published FS.
+            for (state, head) in [
+                (&self.graph.render.qstate[0], prefix.ta_head),
+                (&self.graph.render.qstate[1], prefix.fs_head),
+            ] {
+                let read = state.r32(qstate::READ)?;
+                if read >= 256 || head.wrapping_sub(read) % sizes::QUEUE_CAP >= sizes::QUEUE_CAP - 4 {
+                    return Err(EAGAIN);
+                }
+            }
+            prefix.prev = Prev::Render;
+            prefix.last_fs = self.engine.fs_target;
         }
         f.c_start = prefix.c_head;
         f.ta_start = prefix.ta_head;
@@ -1488,6 +1530,21 @@ impl Firmware {
         f.uma_submitted = refs.uma_submitted;
         let r = &self.graph.render;
         let cap = sizes::QUEUE_CAP;
+        if pf.prev == Prev::Render {
+            // Queued behind a published render: nothing of this one (not even its InitBM)
+            // starts before the previous FS finished.
+            let wait = encode::barrier(
+                r.fw_stamp[1].va,
+                pf.last_fs,
+                0x71,
+                target,
+                refs.uuid,
+                BarrierType::from_stamp_only(!params::render_hold()),
+            );
+            p.prev_barrier.write(0, &wait)?;
+            r.ring[0].w64(8 * pf.ta_head as usize, p.prev_barrier.va)?;
+            pf.ta_head = (pf.ta_head + 1) % cap;
+        }
         if init_buffer {
             pf.initbm = true;
             let bm = encode::initbm(job.vm.slot, refs.parameter_id, refs.pb_mgr, target);

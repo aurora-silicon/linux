@@ -419,7 +419,9 @@ impl Slots {
                 },
                 GFP_KERNEL,
             )?,
-            pass_lifetime: Lifetime::new(false),
+            // Publication order is the engine's: a render is queued only behind renders of
+            // its VM, each pass slot in its own hardware UMA slot.
+            pass_lifetime: Lifetime::new(true),
             pass_owner: [None, None],
             pending_pass_retarget: [None, None],
             pending_pass_owner: [None, None],
@@ -501,6 +503,17 @@ impl Slots {
         }
         Ok(None)
     }
+    /// Whether pass slot `k` can be claimed for `arena`: its last owner was displaced by a
+    /// later retired publication, or (each allocator in its own hardware UMA slot) its last
+    /// owner is this same retired storage, which a reload of the same descriptor reuses.
+    fn pass_claimable(&self, arena: &super::resources::RenderArena, k: usize) -> bool {
+        self.pass_lifetime.available(k)
+            || (arena.pools.split
+                && self.pass_lifetime.retired(k)
+                && self.pass_arena[k]
+                    .as_ref()
+                    .is_some_and(|a| core::ptr::eq::<super::resources::RenderArena>(&**a, arena)))
+    }
     pub(crate) fn pick_pass(
         &self,
         arena: &super::resources::RenderArena,
@@ -511,7 +524,7 @@ impl Slots {
             let k = (self.pass_cursor as usize + i) % 2;
             let p = &arena.passes[k];
             if (self.pass_busy | picked) & (1 << k) == 0
-                && self.pass_lifetime.available(k)
+                && self.pass_claimable(arena, k)
                 && geo.tpc_bytes <= p.tpc.size as u64
                 && geo.tilemap_bytes <= p.tilemap.size as u64
             {
@@ -521,7 +534,7 @@ impl Slots {
         None
     }
     pub(crate) fn claim_pass(&mut self, arena: &super::resources::RenderArena, k: usize) -> Result {
-        if k >= 2 || !self.pass_lifetime.claim(k) {
+        if k >= 2 || !self.pass_claimable(arena, k) || !self.pass_lifetime.claim_retired(k) {
             return Err(EBUSY);
         }
         // Only a retired displaced owner may reach here; no in-flight storage is reset.

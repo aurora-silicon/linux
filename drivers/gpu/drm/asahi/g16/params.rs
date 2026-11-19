@@ -45,13 +45,22 @@ pub(crate) mod tune {
     pub(crate) static PB_BLOCKS: AtomicU32 = AtomicU32::new(2048);
     /// Host phase timers (the `prof:` statistics line) on.
     pub(crate) static PROF: AtomicU32 = AtomicU32::new(0);
-    const NAMES: [(&str, &AtomicU32, u32, u32); 6] = [
+    /// Renders of one VM in flight at most (1: a render runs alone).
+    pub(crate) static RENDER_FLIGHTS: AtomicU32 = AtomicU32::new(1);
+    /// Each render allocator in its own hardware UMA slot (render arenas created later).
+    pub(crate) static RENDER_UMA_SPLIT: AtomicU32 = AtomicU32::new(1);
+    /// A queued render's TA waits for the previous FS with the predecessor hold (type 1).
+    pub(crate) static RENDER_HOLD: AtomicU32 = AtomicU32::new(1);
+    const NAMES: [(&str, &AtomicU32, u32, u32); 9] = [
         ("compute_units", &COMPUTE_UNITS, 2, super::hw::sizes::COMPUTE_UNITS as u32),
         ("compute_flights", &COMPUTE_FLIGHTS, 1, super::hw::sizes::FLIGHTS as u32),
         ("resnap_us", &RESNAP_US, 0, 1000),
         ("pb_heap_mb", &PB_HEAP_MB, 8, 256),
         ("pb_blocks", &PB_BLOCKS, 16, 2048),
         ("prof", &PROF, 0, 1),
+        ("render_flights", &RENDER_FLIGHTS, 1, 2),
+        ("render_uma_split", &RENDER_UMA_SPLIT, 0, 1),
+        ("render_hold", &RENDER_HOLD, 0, 1),
     ];
 
     /// Applies one `name=value` line.
@@ -93,6 +102,21 @@ pub(crate) fn pb_posted_blocks(heap_blocks: u32) -> u32 {
         .load(core::sync::atomic::Ordering::Relaxed)
         .clamp(16, 2048)
         .min(heap_blocks)
+}
+
+/// Renders of one VM in flight at most.
+pub(crate) fn render_flights() -> usize {
+    tune::RENDER_FLIGHTS.load(core::sync::atomic::Ordering::Relaxed).clamp(1, 2) as usize
+}
+
+/// Whether new render arenas put each allocator in its own hardware UMA slot.
+pub(crate) fn render_uma_split() -> bool {
+    tune::RENDER_UMA_SPLIT.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Whether a queued render's TA waits on the previous FS with the predecessor hold.
+pub(crate) fn render_hold() -> bool {
+    tune::RENDER_HOLD.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
 /// Whether the host phase timers run.
