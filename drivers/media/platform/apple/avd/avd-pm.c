@@ -339,7 +339,8 @@ int avd_pm_recover(struct avd_dev *avd)
 	/*
 	 * On the J616C the machine hangs right after this reset, while the
 	 * decoder's DART domain is restored. The cause is not known yet, so
-	 * stay parked: players fall back to software.
+	 * stay parked: players fall back to software. Tracked in
+	 * https://github.com/aurora-silicon/linux/issues/2450.
 	 */
 	if (avd->variant && avd->variant->quirks & AVD_QUIRK_NO_RECOVERY_RESET) {
 		dev_err(avd->dev, "recover: staying parked, no reset on this SoC\n");
