@@ -43,7 +43,7 @@ const TILECTL_DISABLE_CLUSTERING: u32 = 1u32 << 0;
 #[versions(AGX)]
 impl super::QueueInner::ver {
     /// Get the appropriate tiling parameters for a given userspace command buffer.
-    fn get_tiling_params(
+    pub(super) fn get_tiling_params(
         cmdbuf: &uapi::drm_asahi_cmd_render,
         num_clusters: u32,
     ) -> Result<buffer::TileInfo> {
@@ -186,6 +186,18 @@ impl super::QueueInner::ver {
         clippy::too_many_arguments,
         reason = "Submission inputs are retained separately by the existing queue interface."
     )]
+    /// TVB blocks a render command needs, with the clustering decision `submit_render` makes.
+    pub(super) fn render_min_tvb_blocks(
+        gpu: &gpu::GpuManager::ver,
+        cmdbuf: &uapi::drm_asahi_cmd_render,
+    ) -> Result<usize> {
+        let nclusters = gpu.get_dyncfg().id.num_clusters;
+        let clustering = nclusters > 1
+            && !debug_enabled(debug::DebugFlags::DisableClustering)
+            && cmdbuf.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING == 0;
+        Ok(Self::get_tiling_params(cmdbuf, if clustering { nclusters } else { 1 })?.min_tvb_blocks)
+    }
+
     pub(super) fn submit_render(
         &self,
         gpu: &gpu::GpuManager::ver,
@@ -196,6 +208,7 @@ impl super::QueueInner::ver {
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
         id: u64,
         flush_stamps: bool,
+        pre_grown: bool,
     ) -> Result {
         mod_dev_dbg!(self.dev, "[Submission {}] Render!\n", id);
 
@@ -268,7 +281,16 @@ impl super::QueueInner::ver {
         let buffer = &self.buffer;
         let notifier = self.notifier.clone();
 
-        let tvb_autogrown = buffer.auto_grow()?;
+        if super::subtrace::enabled() {
+            let (m, o, n) = buffer.peek_stats();
+            let v = (u64::from(m) & 0xffff)
+                | (u64::from(o) & 0xffff) << 16
+                | (u64::from(n) & 0xffff) << 32
+                | (tile_info.min_tvb_blocks as u64 & 0xffff) << 48;
+            self.sub_stats.store(v, Ordering::Relaxed);
+        }
+        let idle_grow = debug_enabled(debug::DebugFlags::Debug7);
+        let tvb_autogrown = if idle_grow { pre_grown } else { buffer.auto_grow()? };
         if tvb_autogrown {
             let new_size = buffer.block_count() as usize;
             cls_dev_dbg!(
@@ -281,6 +303,7 @@ impl super::QueueInner::ver {
             );
         }
 
+        // With idle_grow the submission was sized up front (Queue::submit); this is then a no-op.
         let tvb_grown = buffer.ensure_blocks(tile_info.min_tvb_blocks)?;
         if tvb_grown {
             cls_dev_dbg!(
@@ -296,6 +319,13 @@ impl super::QueueInner::ver {
         }
 
         let scene = Arc::new(buffer.new_scene(kalloc, &tile_info)?, GFP_KERNEL)?;
+        if super::subtrace::enabled() {
+            // bits 0..7 buffer slot, bit 8 rebind, bit 9 grown (shifted into the record by submit()).
+            let v = (scene.slot() as u64 & 0x7f)
+                | (u64::from(scene.rebind()) << 8)
+                | (u64::from(tvb_grown || tvb_autogrown) << 9);
+            self.sub_last.store(v, Ordering::Relaxed);
+        }
 
         let vm_bind = job.vm_bind.clone();
 
@@ -928,7 +958,9 @@ impl super::QueueInner::ver {
         let usage = self.usage.clone();
         let usage_timestamps = timestamps.clone();
         let timestamp_hz = gpu.get_cfg().base_clock_hz;
+        let gate_tok = super::firstgate::tracking().then(super::firstgate::RenderToken::new);
         frag_job.add_cb(frag, vm_bind.slot(), move |error| {
+            let _gate_tok = gate_tok;
             if let Some(err) = error {
                 fence.set_error(err.into());
             } else {
@@ -948,7 +980,18 @@ impl super::QueueInner::ver {
         let fence = job.fence.clone();
         let vtx_job = job.get_vtx()?;
 
-        if scene.rebind() || tvb_grown || tvb_autogrown {
+        let idle_init = debug_enabled(debug::DebugFlags::Debug6);
+        let send_init = if idle_init {
+            // Only (re)initialise the slot when no earlier scene of this buffer is in flight.
+            scene.rebind() || (scene.exclusive() && (tvb_grown || tvb_autogrown || buffer.init_pending()))
+        } else {
+            scene.rebind() || tvb_grown || tvb_autogrown
+        };
+        if idle_init && super::subtrace::enabled() {
+            self.sub_last.fetch_or(u64::from(send_init) << 10 | u64::from(scene.exclusive()) << 11, Ordering::Relaxed);
+        }
+        if send_init {
+            buffer.clear_init_pending();
             mod_dev_dbg!(self.dev, "[Submission {}] Create Bind Buffer\n", id);
             let bind_buffer = kalloc.private.new_init(
                 {

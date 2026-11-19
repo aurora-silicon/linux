@@ -60,6 +60,274 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Queue;
 
 const WQ_SIZE: u32 = 0x500;
 
+/// REFFLAKE4 test-only submission trace (debug bit 53, Debug5).
+pub(crate) mod subtrace {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use kernel::prelude::*;
+
+    const N: usize = 1024;
+    const W: usize = 4;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static RING: [AtomicU64; N * W] = [const { AtomicU64::new(0) }; N * W];
+
+    pub(crate) fn enabled() -> bool {
+        crate::debug::debug_enabled(crate::debug::DebugFlags::Debug5)
+    }
+
+    fn now_ns() -> u64 {
+        // SAFETY: `ktime_get()` may be called from any context.
+        unsafe { kernel::bindings::ktime_get() as u64 }
+    }
+
+    /// One record per render submission. `a` packs: render index of the queue (bits 0..24),
+    /// nr_render (24..32), vtx event slot (32..40), frag event slot (40..48), vm slot (48..56),
+    /// buffer slot (56..63) ; `b`: bit0 inline, bit1 rebind, bit2 tvb grown, bits 8.. queue id.
+    pub(crate) fn record(a: u64, b: u64, s: u64) {
+        let i = (NEXT.fetch_add(1, Ordering::Relaxed) as usize) % N;
+        RING[i * W].store(0, Ordering::Relaxed);
+        RING[i * W + 1].store(a, Ordering::Relaxed);
+        RING[i * W + 2].store(b, Ordering::Relaxed);
+        RING[i * W + 3].store(s, Ordering::Relaxed);
+        RING[i * W].store(now_ns(), Ordering::Release);
+    }
+
+    /// Teardown event: kind 1/2 context invalidation begin/end (val = context VA), 3 BM slot release
+    /// (val = slot), 4/5 queue drop begin/end (val = queue id), 6 event slot release (val = slot).
+    pub(crate) fn mark(kind: u64, val: u64) {
+        if enabled() {
+            record(0xff << 56 | kind, val, 0);
+        }
+    }
+
+    fn line(tag: &str, now: u64, i: usize) {
+        let ts = RING[i * W].load(Ordering::Acquire);
+        let a = RING[i * W + 1].load(Ordering::Relaxed);
+        let b = RING[i * W + 2].load(Ordering::Relaxed);
+        if a >> 56 == 0xff {
+            pr_err!("subtrace {}: -{}us EVT kind={} val={:#x}\n", tag, now.saturating_sub(ts) / 1000, a & 0xff, b);
+            return;
+        }
+        let s = RING[i * W + 3].load(Ordering::Relaxed);
+        pr_err!(
+            "subtrace {}: -{}us q={} ridx={} nr={} vtx_ev={} frag_ev={} vm={} buf={} inline={} rebind={} grown={} init={} excl={} maxpg={} ovf={} blocks={} minblk={}\n",
+            tag,
+            now.saturating_sub(ts) / 1000,
+            b >> 8,
+            a & 0xff_ffff,
+            (a >> 24) & 0xff,
+            (a >> 32) & 0xff,
+            (a >> 40) & 0xff,
+            (a >> 48) & 0xff,
+            (a >> 56) & 0x7f,
+            b & 1,
+            (b >> 1) & 1,
+            (b >> 2) & 1,
+            (b >> 3) & 1,
+            (b >> 4) & 1,
+            s & 0xffff,
+            (s >> 16) & 0xffff,
+            (s >> 32) & 0xffff,
+            s >> 48
+        );
+    }
+
+    /// Dump the newest records whose event slot or vm slot matches, plus the last few overall.
+    pub(crate) fn dump(event_slot: Option<u32>, vm_slot: Option<u32>) {
+        if !enabled() {
+            return;
+        }
+        let now = now_ns();
+        let next = NEXT.load(Ordering::Relaxed) as usize;
+        let total = next.min(N);
+        let mut shown = 0;
+        // Per queue id: count how many records of the matching queues are in the ring.
+        for k in 1..=total {
+            let i = (next - k) % N;
+            let a = RING[i * W + 1].load(Ordering::Relaxed);
+            let ev_v = ((a >> 32) & 0xff) as u32;
+            let ev_f = ((a >> 40) & 0xff) as u32;
+            let vm = ((a >> 48) & 0xff) as u32;
+            if a >> 56 == 0xff {
+                continue;
+            }
+            let m_ev = event_slot.is_some_and(|e| e == ev_v || e == ev_f);
+            let m_vm = vm_slot.is_some_and(|v| v == vm);
+            if m_ev || m_vm {
+                line(if m_ev { "match-ev" } else { "match-vm" }, now, i);
+                shown += 1;
+                if shown >= 12 {
+                    break;
+                }
+            }
+        }
+        for k in 1..=total.min(24) {
+            line("recent", now, (next - k) % N);
+        }
+        pr_err!("subtrace: total={} ev={:?} vm={:?}\n", next, event_slot, vm_slot);
+    }
+}
+
+/// REFFLAKE4 test-only discriminator (debug bit 52, Debug4): serialise the first render of every queue.
+pub(crate) mod firstgate {
+    use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+    use kernel::prelude::*;
+    use kernel::time::{delay::fsleep, Delta, Instant, Monotonic};
+
+    /// Render work (submissions being built + render commands not yet completed) of all queues.
+    pub(crate) static INFLIGHT: AtomicI64 = AtomicI64::new(0);
+    /// A first render currently owns the GPU.
+    pub(crate) static EXCL: AtomicBool = AtomicBool::new(false);
+    pub(crate) static FIRSTS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static HELD: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+    /// Published render commands not yet completed (all queues).
+    pub(crate) static RENDERING: AtomicI64 = AtomicI64::new(0);
+    pub(crate) static TEARDOWNS: AtomicU64 = AtomicU64::new(0);
+    const LIMIT_MS: i64 = 3000;
+
+    pub(crate) fn enabled() -> bool {
+        crate::debug::debug_enabled(crate::debug::DebugFlags::Debug4)
+    }
+
+    /// Teardown gate (bit 49).
+    pub(crate) fn teardown_enabled() -> bool {
+        crate::debug::debug_enabled(crate::debug::DebugFlags::Debug1)
+    }
+
+    /// Any gate needs the in-flight accounting.
+    pub(crate) fn tracking() -> bool {
+        enabled() || teardown_enabled()
+    }
+
+    /// Counts one published render command until dropped (with its completion callback).
+    pub(crate) struct RenderToken(Token);
+    impl RenderToken {
+        pub(crate) fn new() -> RenderToken {
+            RENDERING.fetch_add(1, Ordering::SeqCst);
+            RenderToken(Token::new())
+        }
+    }
+    impl Drop for RenderToken {
+        fn drop(&mut self) {
+            RENDERING.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Context invalidation: hold new render submissions back and wait for published renders to finish.
+    pub(crate) fn enter_teardown() -> bool {
+        if !teardown_enabled() {
+            return false;
+        }
+        let start = Instant::<Monotonic>::now();
+        while EXCL
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            if timed_out(&start, "teardown exclusive wait") {
+                return false;
+            }
+            fsleep(Delta::from_micros(100));
+        }
+        while RENDERING.load(Ordering::SeqCst) != 0 {
+            if timed_out(&start, "teardown drain wait") {
+                break;
+            }
+            fsleep(Delta::from_micros(50));
+        }
+        true
+    }
+
+    pub(crate) fn leave_teardown(held: bool) {
+        if held {
+            EXCL.store(false, Ordering::SeqCst);
+            let n = TEARDOWNS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 256 == 0 {
+                pr_info!("firstgate: teardowns={} timeouts={}\n", n, TIMEOUTS.load(Ordering::Relaxed));
+            }
+        }
+    }
+
+    /// Counts one unit of in-flight render work until dropped.
+    pub(crate) struct Token(());
+    impl Token {
+        pub(crate) fn new() -> Token {
+            INFLIGHT.fetch_add(1, Ordering::SeqCst);
+            Token(())
+        }
+    }
+    impl Drop for Token {
+        fn drop(&mut self) {
+            INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn timed_out(start: &Instant<Monotonic>, what: &str) -> bool {
+        if start.elapsed() > Delta::from_millis(LIMIT_MS) {
+            let n = TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+            pr_warn!("firstgate: {} timed out after {} ms (timeouts={})\n", what, LIMIT_MS, n);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ordinary render submission: register as in flight, but never while a first render owns the GPU.
+    pub(crate) fn enter_normal() -> Token {
+        let start = Instant::<Monotonic>::now();
+        let mut held = false;
+        loop {
+            let tok = Token::new();
+            if !EXCL.load(Ordering::SeqCst) {
+                if held {
+                    HELD.fetch_add(1, Ordering::Relaxed);
+                }
+                return tok;
+            }
+            drop(tok);
+            held = true;
+            if timed_out(&start, "normal submission wait") {
+                return Token::new();
+            }
+            fsleep(Delta::from_micros(100));
+        }
+    }
+
+    /// First render of a queue: take exclusive ownership, then wait for all other render work to drain.
+    /// Returns true if the exclusive window is held (release with `leave_first`).
+    pub(crate) fn enter_first() -> bool {
+        let start = Instant::<Monotonic>::now();
+        while EXCL
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            if timed_out(&start, "first-render exclusive wait") {
+                return false;
+            }
+            fsleep(Delta::from_micros(100));
+        }
+        while INFLIGHT.load(Ordering::SeqCst) != 0 {
+            if timed_out(&start, "first-render drain wait") {
+                break;
+            }
+            fsleep(Delta::from_micros(50));
+        }
+        true
+    }
+
+    pub(crate) fn leave_first() {
+        EXCL.store(false, Ordering::SeqCst);
+        let n = FIRSTS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 512 == 0 {
+            pr_info!(
+                "firstgate: firsts={} held={} timeouts={}\n",
+                n,
+                HELD.load(Ordering::Relaxed),
+                TIMEOUTS.load(Ordering::Relaxed)
+            );
+        }
+    }
+}
+
 mod common;
 mod compute;
 mod render;
@@ -163,6 +431,8 @@ pub(crate) struct Queue {
     stats: Arc<stats::StatsSnapshot>,
     /// Finished fence of the last submitted job, waited for when the queue goes away.
     last_out: Option<Fence>,
+    /// REFFLAKE4 test: this queue already submitted a render.
+    first_render_done: bool,
 }
 
 #[versions(AGX)]
@@ -178,6 +448,10 @@ pub(crate) struct QueueInner {
     id: u64,
     #[ver(V >= V13_0B4)]
     counter: AtomicU64,
+    /// REFFLAKE4 test: render submissions of this queue / last scene facts.
+    sub_renders: AtomicU64,
+    sub_last: AtomicU64,
+    sub_stats: AtomicU64,
 }
 
 #[versions(AGX)]
@@ -598,6 +872,7 @@ impl Queue::ver {
             fence_ctx: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
             stats,
             last_out: None,
+            first_render_done: false,
             inner: QueueInner::ver {
                 dev: dev.clone(),
                 ualloc,
@@ -610,6 +885,9 @@ impl Queue::ver {
                 id,
                 #[ver(V >= V13_0B4)]
                 counter: AtomicU64::new(0),
+                sub_renders: AtomicU64::new(0),
+                sub_last: AtomicU64::new(0),
+                sub_stats: AtomicU64::new(0),
             },
         };
 
@@ -849,6 +1127,8 @@ impl Queue for Queue::ver {
         let mut last_render = 0;
         let mut nr_render = 0;
         let mut nr_compute = 0;
+        let idle_grow = debug_enabled(DebugFlags::Debug7);
+        let mut max_tvb_blocks = 0usize;
 
         while !cmdbuf.is_empty() {
             let header: uapi::drm_asahi_cmd_header = cmdbuf.read()?;
@@ -862,6 +1142,10 @@ impl Queue for Queue::ver {
                         .any(|ts| ts.handle != 0 || ts.offset != 0)
                     {
                         return Err(EINVAL);
+                    }
+                    if idle_grow {
+                        max_tvb_blocks = max_tvb_blocks
+                            .max(QueueInner::ver::render_min_tvb_blocks(&gpu, &render)?);
                     }
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
@@ -890,6 +1174,25 @@ impl Queue for Queue::ver {
                 _ => {}
             }
         }
+
+        let gate_on = firstgate::tracking() && nr_render > 0;
+        let gate_first = firstgate::enabled() && gate_on && !self.first_render_done;
+        let gate_excl = gate_first && firstgate::enter_first();
+        let _gate_tok = if gate_on && !gate_first {
+            Some(firstgate::enter_normal())
+        } else {
+            None
+        };
+        // Release the exclusive window on every early-return path too.
+        struct ExclGuard(bool);
+        impl Drop for ExclGuard {
+            fn drop(&mut self) {
+                if self.0 {
+                    firstgate::leave_first();
+                }
+            }
+        }
+        let excl_guard = ExclGuard(gate_excl);
 
         let mut job = self.entity.new_job(
             1,
@@ -951,6 +1254,48 @@ impl Queue for Queue::ver {
                 MAX_COMMANDS_PER_SUBMISSION - 1
             );
             return Err(EINVAL);
+        }
+
+        // Grow the TVB only while the firmware is not using it: the buffer manager owns a buffer
+        // while scenes on it are in flight, and growing it then (new blocks plus an InitBuffer of
+        // the bound slot) corrupts their tiling on G13 clustered rendering. Size the buffer for every
+        // render of this submission before any of it is published, after this queue's earlier work
+        // has finished. Required growth waits for that work; stats-driven growth only happens on an
+        // idle queue, as the firmware copes with a full heap itself.
+        let mut pre_grown = false;
+        if idle_grow && nr_render > 0 {
+            let busy = self.last_out.as_ref().is_some_and(|fence| {
+                // SAFETY: `last_out` owns the live dma_fence reference used for this query.
+                unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) == 0 }
+            });
+            let need = max_tvb_blocks > self.inner.buffer.block_count() as usize;
+            if need && busy {
+                let fence = self.last_out.as_ref().expect("busy queue has a last fence");
+                // SAFETY: `fence` holds a reference for the duration of the call; no lock that its
+                // completion needs is held.
+                let left = unsafe {
+                    kernel::bindings::dma_fence_wait_timeout(
+                        fence.raw(),
+                        false,
+                        kernel::time::msecs_to_jiffies(QUEUE_CLOSE_WAIT_MS) as _,
+                    )
+                };
+                if left <= 0 {
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "[Queue {}] Earlier work still running after {} ms, cannot grow the TVB\n",
+                        self.inner.id,
+                        QUEUE_CLOSE_WAIT_MS
+                    );
+                    return Err(ETIMEDOUT);
+                }
+            }
+            if need || !busy {
+                if !busy {
+                    pre_grown |= self.inner.buffer.auto_grow_idle()?;
+                }
+                pre_grown |= self.inner.buffer.ensure_blocks_idle(max_tvb_blocks)?;
+            }
         }
 
         cmdbuf.rewind();
@@ -1024,6 +1369,7 @@ impl Queue for Queue::ver {
                         objects,
                         id,
                         command_index == last_render,
+                        core::mem::take(&mut pre_grown),
                     )?;
                     events[SQ_RENDER].push(
                         Some(
@@ -1083,6 +1429,13 @@ impl Queue for Queue::ver {
             }
         }
 
+        let sub_slots = if subtrace::enabled() && nr_render > 0 {
+            let v = job.get_vtx().map(|j| j.event_info().slot as u64).unwrap_or(0xff);
+            let f = job.get_frag().map(|j| j.event_info().slot as u64).unwrap_or(0xff);
+            Some((v & 0xff) << 32 | (f & 0xff) << 40 | (vm_slot as u64 & 0xff) << 48)
+        } else {
+            None
+        };
         mod_dev_dbg!(
             self.dev,
             "Queue {}: Committing job {}\n",
@@ -1109,6 +1462,13 @@ impl Queue for Queue::ver {
             let result = <QueueJob::ver as sched::JobImpl>::run(&mut job).map(|_| ());
             job.inline_result = result.map_or_else(|error| error.to_errno(), |()| 1);
         }
+        if let Some(slots) = sub_slots {
+            let ridx = self.inner.sub_renders.fetch_add(1, Ordering::Relaxed);
+            let last = self.inner.sub_last.load(Ordering::Relaxed);
+            let a = (ridx & 0xff_ffff) | ((nr_render as u64 & 0xff) << 24) | slots | ((last & 0x7f) << 56);
+            let b = u64::from(job.inline_result != 0) | ((last >> 7) & 0b11110) | (self.inner.id << 8);
+            subtrace::record(a, b, self.inner.sub_stats.load(Ordering::Relaxed));
+        }
         self.last_out = Some(out_fence.clone());
         mod_dev_dbg!(
             self.dev,
@@ -1132,6 +1492,26 @@ impl Queue for Queue::ver {
                 sync.syncobj.replace_fence(Some(&out_fence));
             }
         }
+
+        if gate_first {
+            self.first_render_done = true;
+            if excl_guard.0 {
+                // SAFETY: `out_fence` holds a reference for the duration of the call; no lock is
+                // held that its completion needs.
+                let left = unsafe {
+                    kernel::bindings::dma_fence_wait_timeout(
+                        out_fence.raw(),
+                        false,
+                        kernel::time::msecs_to_jiffies(3000) as _,
+                    )
+                };
+                if left == 0 {
+                    let n = firstgate::TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                    pr_warn!("firstgate: first render not done after 3000 ms (timeouts={})\n", n);
+                }
+            }
+        }
+        drop(excl_guard);
 
         Ok(())
     }
@@ -1181,11 +1561,13 @@ mod tests {
 impl Drop for Queue::ver {
     fn drop(&mut self) {
         mod_dev_dbg!(self.dev, "[Queue {}] Dropping queue\n", self.inner.id);
+        subtrace::mark(4, self.inner.id);
         // A client that exits or is killed drops its queues with jobs still queued or running
         // on the GPU, and its VMs right after (see `file::File`). Those VMs do not track jobs:
         // dropping one unmaps the user range at once, and the firmware then faults on the
         // next access of the running job and times out. Let the submitted work finish first.
         self.wait_submitted();
+        subtrace::mark(5, self.inner.id);
     }
 }
 

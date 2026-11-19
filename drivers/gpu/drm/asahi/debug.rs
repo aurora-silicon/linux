@@ -83,6 +83,11 @@ pub(crate) enum DebugFlags {
     Debug5 = 53,
     Debug6 = 54,
     Debug7 = 55,
+    Debug8 = 56,
+    Debug9 = 57,
+    Debug10 = 58,
+    Debug11 = 59,
+    Debug12 = 60,
 
     VerboseFaults = 61,
     AllowUnknownOverrides = 62,

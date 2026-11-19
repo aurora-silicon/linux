@@ -676,9 +676,12 @@ impl Drop for Job::ver {
             if let Some(last_cmd) = inner.last_completed_work.take() {
                 workqueue::system_dfl().enqueue(last_cmd);
             }
-            inner.event = None;
-            inner.last_submitted = None;
-            inner.last_completed = None;
+            if true {
+                crate::queue::subtrace::mark(6, inner.event.as_ref().map_or(0xffff, |e| e.0.slot() as u64));
+                inner.event = None;
+                inner.last_submitted = None;
+                inner.last_completed = None;
+            }
         }
         mod_pr_debug!("WorkQueue({:?}): Dropped Job\n", inner.pipe_type);
     }
@@ -1101,9 +1104,12 @@ impl WorkQueue for WorkQueue::ver {
             if let Some(last_cmd) = inner.last_completed_work.take() {
                 workqueue::system_dfl().enqueue(last_cmd);
             }
-            inner.event = None;
-            inner.last_submitted = None;
-            inner.last_completed = None;
+            if true {
+                crate::queue::subtrace::mark(6, inner.event.as_ref().map_or(0xffff, |e| e.0.slot() as u64));
+                inner.event = None;
+                inner.last_submitted = None;
+                inner.last_completed = None;
+            }
         }
 
         empty
