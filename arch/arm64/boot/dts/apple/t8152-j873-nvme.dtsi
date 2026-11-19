@@ -5,15 +5,21 @@
  * the driver wakes it with a fresh RTKit handshake (as m1n1 does). NVMe
  * registers and NVMMU share the 0x325cc0000 window. The mailbox is the ANS
  * post-office window (msgbox-mailbox-num 3, no alias: 0x316000000 +
- * 0x10300). No PMGR power or reset yet.
+ * 0x10300), the SMC mailbox's counted FIFO. Its interrupts are the first two
+ * of the ADT's ans list, in the order the SMC and DCP mailboxes' ADT lists
+ * give theirs: send-empty, recv-not-empty. No PMGR power or reset yet.
  * Resources are from the 26A434 ADT: ans, sart-ans.
  */
 
 / {
 	soc {
 		ans_mbox: mailbox@316010300 {
-			compatible = "apple,t8152-ans-mailbox";
+			compatible = "apple,t8152-ans-mailbox",
+				     "apple,t8152-smc-mailbox";
 			reg = <0x3 0x16010300 0x0 0x80>;
+			interrupts = <AIC_IRQ 302 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 262 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
 			#mbox-cells = <0>;
 		};
 
