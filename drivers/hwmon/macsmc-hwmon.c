@@ -48,16 +48,6 @@
 #define FLT_MANT_MASK	GENMASK(22, 0)
 #define FLT_SIGN_MASK	BIT(31)
 
-/*
- * Fans whose device tree node has apple,fan-manual-control take a target speed
- * from userspace. This parameter, kept for compatibility, allows it for every
- * fan with a mode key, whatever the device tree says.
- */
-static bool fan_control;
-module_param_unsafe(fan_control, bool, 0644);
-MODULE_PARM_DESC(fan_control,
-		 "Allow manual fan speeds on every fan with a mode key, also where the device tree does not (default: the device tree decides)");
-
 struct macsmc_hwmon_sensor {
 	struct apple_smc_key_info info;
 	smc_key macsmc_key;
@@ -539,10 +529,13 @@ relock:
 	return ret;
 }
 
-/* Whether userspace may set this fan's speed. */
+/*
+ * Whether userspace may set this fan's speed: only fans whose device tree
+ * node has apple,fan-manual-control. On other fans fanX_target is read-only.
+ */
 static bool macsmc_hwmon_fan_user_control(const struct macsmc_hwmon_fan *fan)
 {
-	return fan->mode.macsmc_key && (fan->manual_control || fan_control);
+	return fan->mode.macsmc_key && fan->manual_control;
 }
 
 static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long val)
