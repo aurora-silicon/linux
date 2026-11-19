@@ -495,6 +495,7 @@ struct apple_cio {
 	bool resume_link_pending; /* set by NHI resume, consumed by ACIO complete */
 	struct delayed_work link_lost_work;
 	unsigned int start_gen; /* protected by lock: bumped by every start */
+	unsigned int start_retried; /* protected by lock: starts whose CIO reset timed out first */
 	unsigned int link_lost_gen; /* start_gen when the peer went away */
 	unsigned int link_lost_cycles; /* protected by lock */
 	u64 link_lost_cycle_activity; /* remote activity at the last cycle */
@@ -3398,6 +3399,7 @@ static int apple_cio_start(struct apple_cio *acio)
 {
 	struct device_link *link;
 	int i, ret, attempts;
+	ktime_t deassert_start;
 	u32 state, val;
 
 	lockdep_assert_held(&acio->lock);
@@ -3445,22 +3447,42 @@ static int apple_cio_start(struct apple_cio *acio)
 	/*
 	 * After the power domains are on we need to signal and wait for the ACIO block
 	 * to actually start before we can bring up the co-processor.
+	 *
+	 * The deassert is the CIO reconfiguration request in the PMGR: the reset
+	 * driver stores the request and polls the port's busy bit, and returns
+	 * -ETIMEDOUT when it is still set after its budget (100 ms, 192 ms on
+	 * T6050; the reference sequence allows 192 ms). On resume from suspend
+	 * with a USB4 tunnel up that poll has timed out. Why the reconfiguration
+	 * is late there is not known: it may just take longer than 100 ms while
+	 * the SoC resumes, or the first request may not be taken. Until that is
+	 * settled only a timeout is asked again (the next request polls the same
+	 * busy bit first), every one is logged, and a start that needed one is
+	 * reported with how long it took and how often it happened. See
+	 * https://github.com/aurora-silicon/linux/issues/2326.
 	 */
 	attempts = apple_cio_recovering(acio) ? 1 : APPLE_CIO_START_RETRIES;
+	deassert_start = ktime_get();
 	for (i = 0; i < attempts; i++) {
 		ret = reset_control_deassert(acio->reset);
-		if (!ret)
+		if (ret != -ETIMEDOUT || i + 1 == attempts)
 			break;
-		if (i + 1 < attempts) {
-			dev_warn(acio->dev,
-				 "ACIO block failed to start (attempt %d/%d): %d, retrying\n",
-				 i + 1, attempts, ret);
-			msleep(APPLE_CIO_START_RETRY_DELAY_MS);
-		}
+		dev_warn(acio->dev,
+			 "ACIO block failed to start (attempt %d/%d): %d, retrying\n",
+			 i + 1, attempts, ret);
+		msleep(APPLE_CIO_START_RETRY_DELAY_MS);
 	}
 	if (ret) {
-		dev_err(acio->dev, "ACIO block failed to start: %d\n", ret);
+		dev_err(acio->dev, "ACIO block failed to start (attempt %d/%d): %d\n",
+			i + 1, attempts, ret);
 		goto remove_links;
+	}
+	if (i) {
+		acio->start_retried++;
+		dev_warn(acio->dev,
+			 "ACIO block started on attempt %d/%d after %lld ms (%u start(s) with a CIO reset timeout since probe)\n",
+			 i + 1, attempts,
+			 ktime_ms_delta(ktime_get(), deassert_start),
+			 acio->start_retried);
 	}
 
 	/*
