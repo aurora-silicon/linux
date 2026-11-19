@@ -252,6 +252,7 @@
 };
 
 #include "t6050-peripherals.dtsi"
+#include "t6050-media.dtsi"
 
 /* After the peripherals, which describe dart-apcie1 (disabled) at the same node */
 #include "t6050-sdreader.dtsi"

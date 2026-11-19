@@ -712,3 +712,4 @@
 
 #define T6050_J775D
 #include "t6050-peripherals.dtsi"
+#include "t6050-media.dtsi"

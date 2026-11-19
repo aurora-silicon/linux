@@ -43,3 +43,5 @@
 
 /* The GPU in the M5 Pro layout */
 #include "t6050-gpu-g17s.dtsi"
+
+#include "t6050-media.dtsi"

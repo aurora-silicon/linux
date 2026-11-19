@@ -584,3 +584,5 @@
 
 /* The camera. The loader sets the platform ID from the ADT isp0 sensor-type (0x76). */
 #include "t6050-isp.dtsi"
+
+#include "t6050-media.dtsi"
