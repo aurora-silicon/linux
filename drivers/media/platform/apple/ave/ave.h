@@ -178,6 +178,8 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_T6050_26C5035 0xc25b4ddb
 /* The M5 (T8142) build of the same 26A428 firmware (AppleAVE2FW 9013.45.1). */
 #define AVE_FW_TEXT_CRC_T8142_26A428 0x8a3784bd
+/* The M4 Air (T8132) build of AppleAVE2FW 9003.78.0. */
+#define AVE_FW_TEXT_CRC_T8132_25G83 0x9308d2ab
 
 struct ave_ctx;
 
