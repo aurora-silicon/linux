@@ -102,6 +102,12 @@ SCHED_FEAT(SIS_UTIL, true)
 SCHED_FEAT(WAKE_SHORT_LOCAL, true)
 
 /*
+ * Start a new thread on an idle CPU that shares the last-level cache with
+ * the thread creating it, before looking further. See fork_local_idle_cpu().
+ */
+SCHED_FEAT(FORK_LOCAL, true)
+
+/*
  * Issue a WARN when we do multiple update_rq_clock() calls
  * in a single rq->lock section. Default disabled because the
  * annotations are not complete.
