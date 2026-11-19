@@ -68,6 +68,22 @@ properties:
   hwmon:
     $ref: /schemas/hwmon/apple,smc-hwmon.yaml
 
+  apple,wake-reasons:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 64
+    items:
+      maximum: 63
+    description: |
+      The bits of the SMC's wake record that have a name on this board, as the
+      ADT's smc-pmu node numbers them (event_name-bitN).
+
+  apple,wake-reason-names:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    minItems: 1
+    maxItems: 64
+    description: The names of the bits in apple,wake-reasons, in the same order.
+
 additionalProperties: false
 
 required:
