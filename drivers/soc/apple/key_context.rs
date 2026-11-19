@@ -51,6 +51,19 @@ impl Drop for Credential {
 }
 
 /// `Context::bind` operations: what a bound context may run on its key.
+/// The longest a context's one authentication lasts (`SEP_KEY_CTX_LIFETIME_MAX`).
+pub(crate) const LIFETIME_MAX_S: u32 = 12 * 3600;
+
+/// A context's lifetime in nanoseconds: 1 s up to `LIFETIME_MAX_S`. A zero
+/// lifetime is refused rather than read as "no expiry", so the ceiling
+/// always holds.
+pub(crate) fn lifetime_ns(lifetime_s: u32) -> Result<u64> {
+    if !(1..=LIFETIME_MAX_S).contains(&lifetime_s) {
+        return Err(EINVAL);
+    }
+    Ok(u64::from(lifetime_s) * 1_000_000_000)
+}
+
 pub(crate) const SCOPE_SIGN: u32 = 1;
 pub(crate) const SCOPE_DECRYPT: u32 = 2;
 
@@ -102,7 +115,7 @@ pub(crate) struct Context {
     /// in that user's domain, and the bag's lock revokes it. None for the
     /// identity bag's biometric keys.
     pub(crate) bag: Option<u32>,
-    /// How long one match authorizes, from the match; 0 until revoked.
+    /// How long one authentication authorizes, from that authentication.
     lifetime_ns: u64,
     #[pin]
     inner: Mutex<Inner>,
@@ -148,6 +161,7 @@ impl Context {
         if contexts.len() >= MAX_CONTEXTS {
             return Err(ENOSPC);
         }
+        let lifetime_ns = lifetime_ns(lifetime_s)?;
         let owner = sep.clone();
         let generation = sep.key_context_generation.load(Relaxed);
         let context = Arc::pin_init(
@@ -155,7 +169,7 @@ impl Context {
                 sep: owner,
                 generation,
                 bag,
-                lifetime_ns: u64::from(lifetime_s) * 1_000_000_000,
+                lifetime_ns,
                 inner <- kernel::new_mutex!(Inner {
                     life: State::new(),
                     grant: None,
@@ -242,9 +256,7 @@ impl Context {
         let status = match result {
             Ok((credential, status)) => {
                 inner.grant = Some(Grant(credential.into_handle()));
-                if self.lifetime_ns != 0 {
-                    inner.expires_ns = crate::shim::monotonic_ns().saturating_add(self.lifetime_ns);
-                }
+                inner.expires_ns = crate::shim::monotonic_ns().saturating_add(self.lifetime_ns);
                 if self.sep.key_context_failed.load(Relaxed) {
                     Err(EIO)
                 } else if completion.is_live() {
@@ -489,6 +501,14 @@ mod tests {
         let mut out = KVec::new();
         out.extend_from_slice(bytes, GFP_KERNEL).unwrap();
         out
+    }
+
+    #[test]
+    fn a_lifetime_is_bounded_and_never_zero() {
+        assert!(lifetime_ns(0).is_err());
+        assert_eq!(lifetime_ns(1).unwrap(), 1_000_000_000);
+        assert_eq!(lifetime_ns(LIFETIME_MAX_S).unwrap(), u64::from(LIFETIME_MAX_S) * 1_000_000_000);
+        assert!(lifetime_ns(LIFETIME_MAX_S + 1).is_err());
     }
 
     #[test]

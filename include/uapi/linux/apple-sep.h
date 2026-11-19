@@ -445,9 +445,9 @@ struct sep_key_unseal_password {
  *   user) and is a file descriptor: closing it ends it;
  * - BIND, before AUTH, may name the one key and the operations
  *   (SEP_KEY_CTX_SCOPE_*) it authorizes; nothing else is then accepted;
- * - it lasts lifetime_s from the authentication (at most 12 hours, 0 =
- *   until revoked), and ends at once when the bag locks, on suspend, on
- *   REVOKE and when the driver stops;
+ * - it lasts lifetime_s from the authentication (1 s to 12 hours; 0 is
+ *   refused with EINVAL), and ends at once when the bag locks, on suspend,
+ *   on REVOKE and when the driver stops;
  * - each SIGN or DECRYPT still runs one enclave operation under the
  *   enclave's own access-control check of that key.
  *
@@ -479,7 +479,7 @@ struct sep_key_ctx_new {
 	__u32 flags;            /* SEP_KEY_CTX_NEW_BAG */
 	__s32 fd;               /* out: the context */
 	__u32 uid;              /* the bag's Unix account */
-	__u32 lifetime_s;       /* 0..SEP_KEY_CTX_LIFETIME_MAX */
+	__u32 lifetime_s;       /* 1..SEP_KEY_CTX_LIFETIME_MAX */
 };
 
 struct sep_key_ctx_auth {

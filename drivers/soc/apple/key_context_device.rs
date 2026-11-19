@@ -13,8 +13,8 @@ pub(super) struct Buffer {
     pub(super) ptr: u64,
 }
 /// `flags` NEW_BAG: the context authorizes keys under `uid`'s bag (root or
-/// that user). `lifetime_s`: how long one match authorizes, from the match;
-/// 0 until revoked or closed.
+/// that user). `lifetime_s`: how long one authentication authorizes, from
+/// that authentication, 1 s to `key_context::LIFETIME_MAX_S`.
 #[repr(C)]
 struct NewContext {
     flags: u32,
@@ -31,7 +31,6 @@ const METHOD_TOUCH: u32 = 1;
 const OUTCOME_OK: u32 = 0;
 const OUTCOME_NOT_MATCHED: u32 = 1;
 const OUTCOME_FAILED: u32 = 5;
-const LIFETIME_MAX_S: u32 = 12 * 3600;
 #[repr(C)]
 struct Authenticate {
     id: u64,
@@ -227,9 +226,10 @@ impl File {
         }
         if cmd == NEW {
             let mut out: NewContext = UserSlice::new(user, 16).reader().read()?;
-            if out.flags & !NEW_BAG != 0 || out.fd != -1 || out.lifetime_s > LIFETIME_MAX_S {
+            if out.flags & !NEW_BAG != 0 || out.fd != -1 {
                 return Err(EINVAL);
             }
+            crate::key_context::lifetime_ns(out.lifetime_s)?;
             let bag = if out.flags & NEW_BAG != 0 {
                 keys::bag_user(out.uid)?;
                 keys::require_admin_or(out.uid)?;
