@@ -902,21 +902,19 @@ static bool avd_h264_refs_valid(const struct avd_h264_run *run)
 }
 
 /*
- * Slices one picture may hold. H.264 allows one slice per macroblock, so the
- * bound is the macroblock count of the NEGOTIATED DECODED size, counting both
- * fields of a frame. The SPS control geometry is not trusted: it does not
- * have to match the negotiated format.
+ * Slices one picture may hold. H.264 7.4.3: each slice holds at least one
+ * macroblock (first_mb_in_slice), so slices <= PicSizeInMbs. PicSizeInMbs for
+ * the decode path is the macroblock count of the NEGOTIATED decoded size (the
+ * SPS control geometry is not trusted). Interlaced pictures use a negotiated
+ * buffer tall enough for both fields; do not scale again from FRAME_MBS_ONLY.
  */
 static size_t avd_h264_max_slices(const struct v4l2_pix_format_mplane *pix,
 				  const struct v4l2_ctrl_h264_sps *sps)
 {
-	size_t mbs = DIV_ROUND_UP((size_t)pix->width, 16) *
-		     DIV_ROUND_UP((size_t)pix->height, 16);
+	(void)sps;
 
-	if (!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY))
-		mbs *= 2;
-
-	return mbs;
+	return DIV_ROUND_UP((size_t)pix->width, 16) *
+	       DIV_ROUND_UP((size_t)pix->height, 16);
 }
 
 /*
