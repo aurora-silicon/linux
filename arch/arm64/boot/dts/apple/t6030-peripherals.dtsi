@@ -483,17 +483,20 @@
 	ave: video-encoder@2cd100000 {
 		compatible = "apple,t6030-ave", "apple,ave";
 		reg = <0x2 0xcd100000 0x0 0x45c000>,
-		      <0x2 0xcd800000 0x0 0x800000>,
 		      <0x2 0xcd050000 0x0 0x4000>,
+		      <0x2 0xcd800000 0x0 0x800000>,
 		      <0x3 0x507003d0 0x0 0x7c54>,
 		      <0x2 0xcc000000 0x0 0x1000000>;
+		reg-names = "codec", "mailbox", "coproc", "pmgr", "pio";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 810 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 804 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 803 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 806 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 805 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_venc_sys>, <&ps_venc_pipe4>, <&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>, <&ps_venc_dma>;
+			     <AIC_IRQ 804 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 803 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 806 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 805 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>,
+				<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 		iommus = <&dart_ave0 0>, <&dart_ave1 0>;
 		status = "disabled";
 	};
