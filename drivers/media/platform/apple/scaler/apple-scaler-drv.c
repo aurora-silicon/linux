@@ -872,6 +872,24 @@ static const struct apple_scaler_variant apple_scaler_t8112 = {
 	.num_reg = 3,
 };
 
+/*
+ * M3 (hardware-version 16) and M3 Pro/Max/Ultra (hardware-version 17): the
+ * hardware description gives a 0x30000 MSR aperture, between the 0x28000 of
+ * the M1/M2 engines and the 0x38000 of the MSR20 engines, and the same two
+ * interrupts and two DART streams. They run the common job without the
+ * MSR20 control block, as every engine up to hardware-version 14 does. M3
+ * Pro/Max/Ultra add the PMGR-facing fourth range of the later engines.
+ */
+static const struct apple_scaler_variant apple_scaler_t8122 = {
+	.hw_version = 16,
+	.num_reg = 3,
+};
+
+static const struct apple_scaler_variant apple_scaler_t6030 = {
+	.hw_version = 17,
+	.num_reg = 4,
+};
+
 /* M4: the first engine with the MSR20 control block. */
 static const struct apple_scaler_variant apple_scaler_t8132 = {
 	.hw_version = 20,
@@ -902,6 +920,10 @@ static const struct of_device_id asc_of_match[] = {
 	{ .compatible = "apple,t6020-scaler", .data = &apple_scaler_t8112 },
 	{ .compatible = "apple,t6021-scaler", .data = &apple_scaler_t8112 },
 	{ .compatible = "apple,t6022-scaler", .data = &apple_scaler_t8112 },
+	{ .compatible = "apple,t8122-scaler", .data = &apple_scaler_t8122 },
+	{ .compatible = "apple,t6030-scaler", .data = &apple_scaler_t6030 },
+	{ .compatible = "apple,t6031-scaler", .data = &apple_scaler_t6030 },
+	{ .compatible = "apple,t6032-scaler", .data = &apple_scaler_t6030 },
 	{ .compatible = "apple,t8132-scaler", .data = &apple_scaler_t8132 },
 	{ .compatible = "apple,t6041-scaler", .data = &apple_scaler_t6041 },
 	{ .compatible = "apple,t8140-scaler", .data = &apple_scaler_t8140 },
