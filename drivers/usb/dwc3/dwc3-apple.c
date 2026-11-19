@@ -966,6 +966,17 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 	ret = phy_set_mode(appledwc->usb3_phy, host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
 	if (ret) {
 		/*
+		 * A USB3 PHY without a device sequence (T6040, T6050) refuses the mode before it
+		 * touches the PIPE, which stays on its dummy producer: offer the gadget at high
+		 * speed only. T8132 refuses device mode while its SuperSpeed lanes are routed,
+		 * which is not that case: it keeps failing below.
+		 */
+		if (!host && ret == -EOPNOTSUPP &&
+		    !of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3")) {
+			dwc3_apple_gadget_high_speed(appledwc);
+			return 0;
+		}
+		/*
 		 * A failed T8132 BIST or PIPE handoff must not start xHCI. Neither must a failed
 		 * T6050 one: that PHY reports a port left on USB2 (four DisplayPort lanes) as
 		 * success, and its errors leave the PIPE without a known producer.
@@ -975,15 +986,7 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 			dev_err(appledwc->dev, "USB3 PHY setup failed, err=%d\n", ret);
 			return ret;
 		}
-		/*
-		 * A USB3 PHY without a device sequence (T6040) leaves the PIPE on its
-		 * dummy producer: offer the gadget at high speed only.
-		 */
-		if (!host && ret == -EOPNOTSUPP) {
-			dwc3_apple_gadget_high_speed(appledwc);
-		} else {
-			dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
-		}
+		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
 	} else if (host && appledwc->usb3_phy &&
 		   (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
 		    of_device_is_compatible(appledwc->dev->of_node, "apple,t8142-dwc3"))) {
@@ -1003,11 +1006,11 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 }
 
 /*
- * No device mode: a USB2 PHY that does not validate PHY_MODE_USB_DEVICE (the T6050 Type-C PHY
- * implements host mode only), or a kernel built without gadget support, which turns
- * dwc3_gadget_init() into a stub that succeeds. Such a controller must not follow a
- * USB_ROLE_DEVICE request from the Type-C port controller (a charger or a host on the other end),
- * or the core would end up in device mode on top of a PHY powered in host mode.
+ * No device mode: a USB2 PHY that does not validate PHY_MODE_USB_DEVICE, or a kernel built
+ * without gadget support, which turns dwc3_gadget_init() into a stub that succeeds. Such a
+ * controller must not follow a USB_ROLE_DEVICE request from the Type-C port controller (a
+ * charger or a host on the other end), or the core would end up in device mode on top of a PHY
+ * powered in host mode.
  */
 static bool dwc3_apple_host_only(struct dwc3_apple *appledwc)
 {
