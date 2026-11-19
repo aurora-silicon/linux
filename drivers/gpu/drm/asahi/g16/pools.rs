@@ -154,9 +154,10 @@ impl Allocator {
             nc(client::render_descriptor(k)),
             false,
         )?;
+        let rows = super::params::render_pool_rows();
         let pool = alloc(
             o,
-            0x2000000,
+            rows as usize * 0x200000,
             Class::Shared,
             nc(client::render_pool(k)),
             false,
@@ -172,15 +173,16 @@ impl Allocator {
             nc(base + 0x2070000),
             true,
         )?;
-        super::slots::init_uma_pool(&state, &list, gva(&pool)?)?;
+        let seeds = super::slots::init_uma_pool_rows(&state, &list, gva(&pool)?, 0..rows)?;
         descriptor.write(
             0,
-            &buffer::uma_manager_image(
+            &buffer::uma_manager_image_seeded(
                 descriptor.va,
                 slot,
                 gva(&state)?,
                 gva(&list)?,
                 submitted.va,
+                seeds,
             ),
         )?;
         Ok(Self {

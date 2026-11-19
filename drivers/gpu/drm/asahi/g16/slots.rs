@@ -40,13 +40,9 @@ pub(crate) struct ComputeSlot {
 /// first range, extension units take the others.
 pub(crate) const SHARED_POOL_ROWS: [core::ops::Range<u32>; 3] = [0..5, 5..10, 10..16];
 
-/// Initializes the private pool exactly once, before it is exposed. Never called on reuse.
-pub(crate) fn init_uma_pool(state: &FwObject, list: &FwObject, pool: u64) -> Result {
-    init_uma_pool_rows(state, list, pool, 0..16).map(|_| ())
-}
-
-/// Initializes a unit's freelist and pool table with rows `rows` of the 32 MiB pool at `pool`
-/// only. Returns the pages seeded.
+/// Initializes a private pool's freelist and pool table, exactly once before it is exposed
+/// (never on reuse), with rows `rows` of the up to 32 MiB pool at `pool` only. Returns the
+/// pages seeded.
 pub(crate) fn init_uma_pool_rows(
     state: &FwObject,
     list: &FwObject,

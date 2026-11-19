@@ -61,7 +61,9 @@ pub(crate) mod tune {
     pub(crate) static COMPUTE_POOL_SHARE: AtomicU32 = AtomicU32::new(0);
     /// Pass slots (with render allocators) of render arenas created later.
     pub(crate) static RENDER_SLOTS: AtomicU32 = AtomicU32::new(2);
-    const NAMES: [(&str, &AtomicU32, u32, u32); 13] = [
+    /// 2 MiB rows of each render allocator's UMA pool (render arenas created later; 16 = 32 MiB).
+    pub(crate) static RENDER_POOL_ROWS: AtomicU32 = AtomicU32::new(16);
+    const NAMES: [(&str, &AtomicU32, u32, u32); 14] = [
         ("compute_units", &COMPUTE_UNITS, 2, super::hw::sizes::COMPUTE_UNITS as u32),
         ("compute_flights", &COMPUTE_FLIGHTS, 1, super::hw::sizes::FLIGHTS as u32),
         ("resnap_us", &RESNAP_US, 0, 1000),
@@ -75,6 +77,7 @@ pub(crate) mod tune {
         ("submit_publish", &SUBMIT_PUBLISH, 0, 1),
         ("compute_pool_share", &COMPUTE_POOL_SHARE, 0, 1),
         ("render_slots", &RENDER_SLOTS, 2, super::hw::sizes::RENDER_SLOTS as u32),
+        ("render_pool_rows", &RENDER_POOL_ROWS, 3, 16),
     ];
 
     /// Applies one `name=value` line.
@@ -122,6 +125,14 @@ pub(crate) fn pb_posted_blocks(heap_blocks: u32) -> u32 {
 pub(crate) fn render_flights() -> usize {
     (tune::RENDER_FLIGHTS.load(core::sync::atomic::Ordering::Relaxed) as usize)
         .clamp(1, hw::sizes::RENDER_SLOTS)
+}
+
+/// 2 MiB rows of a new render allocator's UMA pool. Three rows (1536 pages) still cover the
+/// firmware's page reserves (DUPM 0x400 pages + 3 x 0x60 PTC).
+pub(crate) fn render_pool_rows() -> u32 {
+    tune::RENDER_POOL_ROWS
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .clamp(3, 16)
 }
 
 /// Pass slots of a new render arena.

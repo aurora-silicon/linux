@@ -119,14 +119,27 @@ pub(crate) fn uma_manager_image(
     list_gpu: u64,
     submitted_fw: u64,
 ) -> [u8; uma_manager::SIZE] {
+    uma_manager_image_seeded(descriptor, slot, state_gpu, list_gpu, submitted_fw, 8192)
+}
+
+/// [`uma_manager_image`] for a freelist seeded with `seeds` pages (1..=8192).
+pub(crate) fn uma_manager_image_seeded(
+    descriptor: u64,
+    slot: u32,
+    state_gpu: u64,
+    list_gpu: u64,
+    submitted_fw: u64,
+    seeds: u32,
+) -> [u8; uma_manager::SIZE] {
+    let seeds = seeds.clamp(1, 8192);
     let mut m = [0; uma_manager::SIZE];
     put64(&mut m, 0, descriptor);
     put32(&mut m, 8, slot);
     put32(&mut m, 0x10, 2);
     put64(&mut m, 0x14, state_gpu);
     put32(&mut m, 0x1c, 16384);
-    put32(&mut m, 0x24, 8192);
-    put32(&mut m, 0x2c, 8192);
+    put32(&mut m, 0x24, seeds);
+    put32(&mut m, 0x2c, seeds);
     put64(&mut m, 0x30, list_gpu);
     put32(&mut m, 0x40, 4);
     put32(&mut m, 0x48, 128);
