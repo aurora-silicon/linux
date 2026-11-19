@@ -390,6 +390,11 @@
 	};
 };
 
+&mca {
+	/* Speaker-sense SDOUT is launched on the nominal RX sample edge. */
+	apple,rx-bclk-inverted-clusters = <2>;
+};
+
 / {
 	sound {
 		compatible = "apple,j613-macaudio", "apple,j413-macaudio", "apple,macaudio";
