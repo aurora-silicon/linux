@@ -329,7 +329,7 @@ struct dcp_desktop_state {
 	 */
 	struct apple_dcp_afkep *graph[0x20];
 	u32 graph_started, graph_skipped;
-	/* J616s firmware-declared dcp-2-smc route, published before IOMFB. */
+	/* Firmware-declared dcp-2-smc route to the DT-linked SMC, published before IOMFB. */
 	struct apple_smc *smc;
 	struct apple_epic_service *smc_services[3];
 	/* DPAVCTRL (0x24): its two AV controllers and the deferred service. */

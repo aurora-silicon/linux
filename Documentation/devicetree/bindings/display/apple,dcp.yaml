@@ -280,6 +280,12 @@ properties:
       PMP report entry for this coprocessor's display request. The display
       firmware runs only once the PMP has acknowledged it.
 
+  apple,smc:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      SMC that serves the dcp-2-smc service route this coprocessor's
+      firmware declares. The route's SMC key reads go to this SMC.
+
   apple,typec-mux-indices:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 1

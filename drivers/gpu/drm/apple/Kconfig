@@ -30,9 +30,9 @@ config DRM_APPLE_DCP_SMC
 	help
 	  Publish the read-only AFK SMC service used by supported internal
 	  display firmware, and pass its native key reads to the Apple SMC
-	  core. The route is enabled at runtime only on described machines,
-	  before panel compensation starts. Unsupported machines retain the
-	  existing display startup path.
+	  core. The route is enabled at runtime only on DCPs whose device
+	  tree node links an SMC (apple,smc), before panel compensation
+	  starts. Other DCPs retain the existing display startup path.
 
 config DRM_APPLE_AUDIO
 	bool "DisplayPort/HDMI Audio support"

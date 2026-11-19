@@ -35,6 +35,11 @@
 	};
 };
 
+/* The internal DCP's firmware declares a dcp-2-smc service route */
+&dcp {
+	apple,smc = <&smc>;
+};
+
 &aop_spmi0 {
 	status = "okay";
 

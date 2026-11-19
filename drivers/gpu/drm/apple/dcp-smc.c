@@ -98,11 +98,11 @@ static const struct apple_epic_service_ops dcp_smc_service_ops[] = {
 	},
 };
 
+/* The DT links an SMC to the DCPs whose firmware declares the dcp-2-smc route. */
 static bool dcp_smc_afk_supported(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-		!of_device_is_compatible(dcp->dev->of_node, "apple,t6041-dcpext") &&
-		of_machine_is_compatible("apple,j616s");
+		of_property_present(dcp->dev->of_node, "apple,smc");
 }
 
 int dcp_smc_afk_probe(struct apple_dcp *dcp)
@@ -115,7 +115,7 @@ int dcp_smc_afk_probe(struct apple_dcp *dcp)
 	if (!dcp_smc_afk_supported(dcp))
 		return 0;
 
-	smc_np = of_find_compatible_node(NULL, NULL, "apple,t6041-smc");
+	smc_np = of_parse_phandle(dcp->dev->of_node, "apple,smc", 0);
 	if (!smc_np)
 		return dev_err_probe(dcp->dev, -ENODEV,
 				     "DCP-to-SMC route has no SMC device\n");
