@@ -107,7 +107,7 @@
 		label = "aes";
 		power-domains = <&ps_sio>;
 		apple,always-on;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ps_spi0: power-controller@1b8 {
