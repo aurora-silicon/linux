@@ -40,6 +40,8 @@
  * after the stops. The order stays an open difference until both are settled.
  */
 
+#include <linux/console.h>
+
 #define T8122_PS_DISP_SYS	0x1d8
 #define T8122_PS_GFX		0x1e0
 #define T8122_PS_DISP_FE	0x208
@@ -295,6 +297,36 @@ static void t8122_dc_putc(unsigned char c)
 	else
 		t8122.dc_stalled = true;
 }
+
+/*
+ * The kernel's console on the same channel, for a trial booted from RAM with the debug cable
+ * as its only output (apple_sleep.t8122_console=1): this tree gives T8122 no DockChannel UART
+ * node, so no serial console binds. Each character waits a bounded time for room and is then
+ * dropped, so a cable nobody reads never stalls printk.
+ */
+static void t8122_dc_console_write(struct console *con, const char *str, unsigned int n)
+{
+	while (n--) {
+		unsigned char c = *str++;
+		unsigned int pass = c == '\n' ? 2 : 1;
+
+		while (pass--) {
+			unsigned int tries = 4000;
+
+			while (!readl(t8122.dc_uart + T8122_DC_TX_FREE) && --tries)
+				cpu_relax();
+			if (tries)
+				writel(pass ? '\r' : c, t8122.dc_uart + T8122_DC_TX8);
+		}
+	}
+}
+
+static struct console t8122_dc_console = {
+	.name = "t8122dc",
+	.write = t8122_dc_console_write,
+	.flags = CON_ENABLED | CON_ANYTIME | CON_PRINTBUFFER,
+	.index = -1,
+};
 
 static void t8122_dc_puts(const char *str)
 {
@@ -587,6 +619,11 @@ static int t8122_sleep_map_regs(struct apple_sleep *s)
 		if (IS_ERR(t8122.dc_uart)) {
 			dev_warn(s->dev, "no dockchannel registers: no late witness\n");
 			t8122.dc_uart = NULL;
+		} else {
+			/* Kept across the suspend: the entry's own lines are the evidence. */
+			console_suspend_enabled = false;
+			register_console(&t8122_dc_console);
+			dev_info(s->dev, "J613 trial: kernel console on the debug-cable DockChannel\n");
 		}
 	}
 	s->driver_down = devm_bitmap_zalloc(s->dev, resource_size(&s->ps_res) / 4, GFP_KERNEL);
