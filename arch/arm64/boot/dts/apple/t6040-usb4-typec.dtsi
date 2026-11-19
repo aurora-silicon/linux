@@ -9,7 +9,23 @@
  *   Mac mini (J773s): typec0 back middle, typec1 back left, typec2 back
  *     right.
  * A port controller skips a link to a disabled router.
+ *
+ * Each ATC PHY is its connector's mode switch: the port controller switches
+ * it between USB3, DP alt mode and USB4/Thunderbolt through the connector
+ * graph, and finds it by this property.
  */
+
+&atcphy0 {
+	mode-switch;
+};
+
+&atcphy1 {
+	mode-switch;
+};
+
+&atcphy2 {
+	mode-switch;
+};
 
 &usb4_0_acio_tbt {
 	remote-endpoint = <&typec0_con_tbt>;
