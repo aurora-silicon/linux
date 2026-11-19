@@ -453,6 +453,7 @@ struct dcp_desktop_state {
 
 /* TODO: move IOMFB members to its own struct */
 struct dcpext_scanout;
+struct t8152_display;
 struct dcp_hdmi;
 
 bool dcp_desktop_present_complete(struct apple_dcp *dcp, u32 id);
@@ -558,6 +559,8 @@ struct apple_dcp {
 
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;
+	/* T8152: the DisplayPort hardware behind the DPTX port (t8152_display.h) */
+	struct t8152_display *t8152;
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
 	/*

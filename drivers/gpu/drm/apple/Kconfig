@@ -64,6 +64,22 @@ config DRM_APPLE_DCP_T8132
 	  Load appledrm explicitly before the GPU, with its alias autoload
 	  disabled, after guarded admission of the inherited display DARTs.
 
+config DRM_APPLE_DCP_T8152
+	bool "Mac mini M6 (J873g) displays"
+	depends on DRM_APPLE
+	depends on SPMI=y || SPMI=DRM_APPLE
+	depends on MFD_MACSMC=y || MFD_MACSMC=DRM_APPLE
+	help
+	  Lets the common Apple display driver drive the three display
+	  coprocessors of the T8152 Mac mini (J873g) through their firmware's
+	  iBoot interface: the HDMI port, whose DisplayPort-to-HDMI converter
+	  is powered through the SMC, and displays on the rear USB-C ports,
+	  whose PD controllers are polled over SPMI.
+
+	  The boot loader hands each coprocessor over, running or quiesced,
+	  with the AFK endpoints it left running. The adopted sessions cannot
+	  be stopped; their DMA stays retained until reboot.
+
 config DRM_APPLE_DEBUG
 	bool "Enable additional driver debugging"
 	depends on DRM_APPLE

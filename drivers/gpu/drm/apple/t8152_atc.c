@@ -1,0 +1,924 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * T8152 (J873g) ATC PHYs as DisplayPort outputs of the DCPs' DPTX ports.
+ *
+ * Interim, until drivers/phy/apple/atc.c has a DisplayPort mode for T8152
+ * and the display crossbar driver and the Type-C route layer of
+ * dcp-fabric.c take over the route and the choice of port: this programs
+ * the PHY's DisplayPort lanes, its pixel clock and the crossbar route
+ * itself.
+ *
+ * The bootloader trains a USB-C display before Linux starts; this takes
+ * that link over and then follows the firmware: link rate changes (stop and
+ * set up the lanes again), drive settings, the DCP -> ATCn/DFP0 crossbar
+ * route, and with the display off or unplugged a full power down and a cold
+ * start. A DCP drives one USB-C port at a time: the one it claims from the
+ * shared ports while polling their PD controllers.
+ */
+
+#include <linux/bits.h>
+#include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
+
+#include "dptxep.h"
+#include "t8152_display.h"
+
+#define ATC_AON		0x1e00
+#define ATC_CFG		0x60000
+#define ATC_XBAR	0x74000
+/*
+ * The DP clock switch at CFG + 0x14 (select), + 0x18 (enable) and + 0x1c
+ * (status). DP pixel clock n (1..4) runs from switch n: select field n is n
+ * for PMGR DP clock n - 1, 7 for none, and enable/status bit 1 + 7 * (n - 1)
+ * gates that PMGR clock. PCLK1 is used here, from PMGR DP0, whose divider
+ * atc_clock_write() sets for the link rate.
+ */
+#define ATC_CLKSW_SELECT	(ATC_CFG + 0x14)
+#define ATC_CLKSW_ENABLE	(ATC_CFG + 0x18)
+#define ATC_CLKSW_STATUS	(ATC_CFG + 0x1c)
+#define ATC_CLKSW_PCLK1_SEL	GENMASK(2, 0)
+#define ATC_CLKSW_PCLK1_MODE	BIT(12)
+#define ATC_CLKSW_PCLK1_OFF	7
+#define ATC_CLKSW_PCLK1_DP0	1
+#define ATC_CLKSW_PCLK1_EN	BIT(1)
+#define ATC_TIMEOUT_US	10000
+
+struct t8152_atc_port {
+	void __iomem *base;
+	unsigned int index;		/* ATC instance */
+	/* display crossbar DFP endpoint of this ATC */
+	u32 dfp;
+	struct spmi_device *pd;
+	/* AP DisplayPort AUX controller aux0 (shared), for the EDID */
+	struct t8152_aux *aux;
+	/* PMGR power states of the four ATC dependencies */
+	void __iomem *ps;
+	void __iomem *psd;
+	/* the dependencies this driver powered up, and may power down */
+	u8 owned;
+	/* {offset, mask, value} tunables, before and after the lane setup */
+	const __be32 *tunable[2];
+	int tunable_len[2];
+	/* This ATC's PMGR DP clock divider selects the link rate. */
+	void __iomem *dp_clock;
+	bool swap;
+	bool active;
+	bool route_started;
+	u32 link_rate;
+	u32 lanes, next_lanes;
+};
+
+struct t8152_atc {
+	struct t8152_aux aux;
+	struct t8152_atc_port port[4];
+	unsigned int nports;
+	/* the port the DCP drives, and the one a sink was found on */
+	struct t8152_atc_port *cur, *next;
+};
+
+/* J873 has one display crossbar. Claims outlive firmware PHY power cycles. */
+static DEFINE_MUTEX(atc_owner_lock);
+static struct device *atc_owner[4];
+/* All three DCPs borrow the same AP AUX controller for EDID reads. */
+static DEFINE_MUTEX(atc_aux_lock);
+
+static struct t8152_atc_port *atc_cur(struct t8152_display *disp)
+{
+	return ((struct t8152_atc *)disp->phy_priv)->cur;
+}
+
+static const u32 atc_rates[] = {
+	LINK_RATE_RBR, LINK_RATE_HBR, LINK_RATE_HBR2, LINK_RATE_HBR3,
+};
+
+static bool atc_dp_pma(struct t8152_atc_port *atc, u32 pma)
+{
+	return atc->lanes == 4 || pma == !atc->swap;
+}
+
+static bool atc_dp_register(struct t8152_atc_port *atc, u32 offset)
+{
+	if (offset >= 0x3000 && offset < 0xc000)
+		return atc_dp_pma(atc, 0);
+	if (offset >= 0xc000 && offset < 0x15000)
+		return atc_dp_pma(atc, 1);
+	return true;
+}
+
+static void atc_update(struct t8152_atc_port *atc, u32 offset, u32 mask, u32 value)
+{
+	u32 reg = readl(atc->base + offset);
+
+	writel((reg & ~mask) | value, atc->base + offset);
+}
+
+static int atc_poll(struct t8152_atc_port *atc, u32 offset, u32 mask, u32 value)
+{
+	u32 reg;
+
+	return readl_poll_timeout(atc->base + offset, reg,
+				  (reg & mask) == value, 1, ATC_TIMEOUT_US);
+}
+
+static int atc_route_stop(struct t8152_display *disp, struct t8152_atc_port *atc)
+{
+	u32 ufp = disp->dp_source * 2;
+	u32 mask = BIT(ufp);
+
+	if (!atc->route_started)
+		return 0;
+	atc_update(atc, ATC_XBAR + 0x3c, mask, 0);
+	atc_update(atc, ATC_XBAR, mask, 0);
+	atc_update(atc, ATC_XBAR + 0xc, mask, 0);
+	atc_update(atc, ATC_XBAR + 0x24, 0x100, 0);
+	udelay(1);
+	/*
+	 * With the pipe powered off (the bootloader hands the display over
+	 * that way) nothing acknowledges the stop; the route is idle then, so
+	 * finish it anyway.
+	 */
+	if (atc_poll(atc, ATC_XBAR + 0x800, mask, 0) ||
+	    atc_poll(atc, ATC_XBAR + 0x808, mask, 0) ||
+	    atc_poll(atc, ATC_XBAR + 0x81c, 0x100, 0))
+		dev_info(disp->dev, "ATC%u: no crossbar stop acknowledgment\n", atc->index);
+	atc_update(atc, ATC_XBAR + 8, mask, 0);
+	atc_update(atc, ATC_XBAR + 0x20, 7 << (3 * ufp), 0);
+	atc_update(atc, ATC_XBAR + 0x38, 0x700, 0);
+	atc_update(atc, ATC_XBAR + 4, mask, mask);
+	atc_update(atc, ATC_XBAR + 0x1c, mask, mask);
+	atc_update(atc, ATC_XBAR + 0x34, 0x100, 0x100);
+	atc->route_started = false;
+	dev_dbg(disp->dev, "ATC%u: display route disabled\n", atc->index);
+	return 0;
+}
+
+/*
+ * A source -> ATCn/DFP0 route, PCLK1: both DFP0 mux fields (0x44 bits 23:20
+ * and 11:8) select the source. The upstream reset, clock and enable fields
+ * are indexed by DCP endpoint * 2 + DPTX port, independently of the
+ * downstream DFP0 fields. AUX borrowing keeps that DCP's clock path.
+ */
+#define ATC_SEL_AUX0	9	/* UFP endpoint 5 (aux0) + 4 */
+
+static int atc_route_start_sel(struct t8152_display *disp,
+			       struct t8152_atc_port *atc, u32 sel)
+{
+	u32 ufp = disp->dp_source * 2;
+	u32 mask = BIT(ufp);
+
+	if (atc->route_started)
+		return 0;
+	atc_update(atc, ATC_XBAR + 0x44, 0x00f00000, sel << 20);
+	atc_update(atc, ATC_XBAR + 0x44, 0x00000f00, sel << 8);
+	atc_update(atc, ATC_XBAR + 4, mask, 0);
+	atc_update(atc, ATC_XBAR + 0x1c, mask, 0);
+	atc_update(atc, ATC_XBAR + 0x34, 0x100, 0);
+	udelay(1);
+	if (atc_poll(atc, ATC_XBAR + 0x804, mask, 0) ||
+	    atc_poll(atc, ATC_XBAR + 0x818, mask, 0) ||
+	    atc_poll(atc, ATC_XBAR + 0x82c, 0x100, 0)) {
+		dev_err(disp->dev, "ATC%u: crossbar reset acknowledgment timeout\n",
+			atc->index);
+		return -ETIMEDOUT;
+	}
+	atc_update(atc, ATC_XBAR + 8, mask, mask);
+	atc_update(atc, ATC_XBAR + 0x20, 7 << (3 * ufp), 1 << (3 * ufp));
+	atc_update(atc, ATC_XBAR + 0x38, 0x700, 0x100);
+	atc_update(atc, ATC_XBAR + 0x48, 1, 0);
+	atc_update(atc, ATC_XBAR, mask, mask);
+	atc_update(atc, ATC_XBAR + 0xc, mask, mask);
+	atc_update(atc, ATC_XBAR + 0x24, 0x100, 0x100);
+	atc_update(atc, ATC_XBAR + 0x4c, 0x100, 0x100);
+	atc_update(atc, ATC_XBAR + 0x3c, mask, mask);
+	atc->route_started = true;
+	dev_dbg(disp->dev, "ATC%u: source %u to local DFP0 route configured\n",
+		atc->index, sel);
+	return 0;
+}
+
+static int atc_route_start(struct t8152_display *disp, struct t8152_atc_port *atc)
+{
+	return atc_route_start_sel(disp, atc, disp->dp_source * 2);
+}
+
+/* Common four-lane setup; the rate-dependent fields follow in atc_dp_start. */
+static const struct {
+	u32 offset, mask, value;
+} atc_dp_setup[] = {
+	{ 0x2044, 0xffff, 0x4b0 },
+	{ 0x4c, 0x3c0000, 0x3c0000 },
+	{ 0x4c80, 0x40, 0x40 },
+	{ 0xdc80, 0x40, 0x40 },
+	{ 0x4fd4, 0x2000000, 0x2000000 },
+	{ 0x4fd4, 0x1800000, 0x800000 },
+	{ 0xdfd4, 0x2000000, 0x2000000 },
+	{ 0xdfd4, 0x1800000, 0x800000 },
+	{ 0x4d84, 0x1c0000, 0 },
+	{ 0x4fd4, 1, 0 },
+	{ 0x4fd4, 8, 0 },
+	{ 0x4fd4, 2, 2 },
+	{ 0x4fd4, 0x10, 0x10 },
+	{ 0x8904, 0x1c0000, 0 },
+	{ 0x8800, 0x10000000, 0 },
+	{ 0x8800, 0x80000000, 0 },
+	{ 0x8800, 0x20000000, 0x20000000 },
+	{ 0x8804, 1, 1 },
+	{ 0xdd84, 0x1c0000, 0 },
+	{ 0xdfd4, 1, 0 },
+	{ 0xdfd4, 8, 0 },
+	{ 0xdfd4, 2, 2 },
+	{ 0xdfd4, 0x10, 0x10 },
+	{ 0x11904, 0x1c0000, 0 },
+	{ 0x11800, 0x10000000, 0 },
+	{ 0x11800, 0x80000000, 0 },
+	{ 0x11800, 0x20000000, 0x20000000 },
+	{ 0x11804, 1, 1 },
+	{ 0x3c04, 2, 2 },
+	{ 0x3c04, 1, 1 },
+	{ 0xcc04, 2, 2 },
+	{ 0xcc04, 1, 1 },
+};
+
+/* Program the PMGR DP clock divider and wait for the change to settle. */
+static int atc_clock_write(struct t8152_atc_port *atc, u32 divider)
+{
+	u32 reg = readl(atc->dp_clock);
+
+	writel((reg & ~0x0f000000) | (divider << 24), atc->dp_clock);
+	return readl_poll_timeout(atc->dp_clock, reg, !(reg & BIT(30)), 1,
+				  ATC_TIMEOUT_US);
+}
+
+/* Stop the DP lanes: route, pixel clock, then both PMAs. */
+static int atc_dp_stop(struct t8152_display *disp, struct t8152_atc_port *atc)
+{
+	u32 reg;
+
+	atc_route_stop(disp, atc);
+	atc_update(atc, ATC_CLKSW_SELECT, ATC_CLKSW_PCLK1_SEL | ATC_CLKSW_PCLK1_MODE,
+		   ATC_CLKSW_PCLK1_OFF);
+	atc_update(atc, ATC_CLKSW_ENABLE, ATC_CLKSW_PCLK1_EN, 0);
+	if (readl_poll_timeout(atc->base + ATC_CLKSW_STATUS, reg,
+			       !(reg & ATC_CLKSW_PCLK1_EN), 1, ATC_TIMEOUT_US)) {
+		dev_err(disp->dev, "ATC%u: DPTX clock stop failed\n", atc->index);
+		return -ETIMEDOUT;
+	}
+	atc_update(atc, 0x2040, BIT(16), 0);
+	udelay(5);
+	atc_update(atc, 0x2000, BIT(15), 0);
+	atc_update(atc, 0x2000, BIT(13), 0);
+	atc_update(atc, 0x2000, BIT(14), 0);
+	atc_update(atc, 0x2000, BIT(2), 0);
+	atc_update(atc, 0x2000, BIT(3), BIT(3));
+	atc_update(atc, 0xe10, BIT(2), BIT(2));
+	atc_update(atc, 0xe08, BIT(29), BIT(29));
+	/* Remove both PMA clock requests, then clamp and power down both lanes. */
+	for (u32 offset = 0x1e18; offset <= 0x1e1c; offset += 4) {
+		u32 pma = (offset - 0x1e18) / 4;
+
+		if (!atc_dp_pma(atc, pma))
+			continue;
+		atc_update(atc, ATC_AON + 0x24,
+			   BIT(12 + 2 * pma) | BIT(16 + 2 * pma), 0);
+		udelay(1);
+		atc_update(atc, offset, BIT(5), 0);
+		udelay(1);
+		atc_update(atc, offset, BIT(0), BIT(0));
+		udelay(1);
+		atc_update(atc, offset, BIT(2), 0);
+		udelay(1);
+		atc_update(atc, offset, BIT(1), 0);
+		udelay(1);
+	}
+	atc->link_rate = 0;
+	return 0;
+}
+
+/* DP lane setup at rate index r. */
+static int atc_dp_start(struct t8152_display *disp, struct t8152_atc_port *atc, u32 r)
+{
+	static const u32 tx_ctrl[] = { 0x4eb0, 0x8b10, 0xdeb0, 0x11b10 };
+	static const u32 wake_count[] = { 0xbb5, 0xbb7, 0xbb8, 0xbb9 };
+	u32 reg;
+	int ret;
+
+	if (readl(atc->dp_clock) & BIT(30))
+		return -EBUSY;
+	if (!r) {
+		atc_update(atc, 0xe10, BIT(2), BIT(2));
+		atc_update(atc, 0xe08, BIT(29), BIT(29));
+	}
+	for (u32 i = 0; i < 2; i++) {
+		u32 offset = 0x1e18 + 4 * i;
+
+		if (!atc_dp_pma(atc, i))
+			continue;
+		atc_update(atc, ATC_AON + 0x24, BIT(12 + 2 * i), BIT(12 + 2 * i));
+		udelay(1);
+		atc_update(atc, ATC_AON + 0x24, BIT(16 + 2 * i), BIT(16 + 2 * i));
+		udelay(1);
+		atc_update(atc, offset, BIT(1), BIT(1));
+		udelay(1);
+		atc_update(atc, offset, BIT(2), BIT(2));
+		udelay(1);
+		atc_update(atc, offset, BIT(0), 0);
+		udelay(1);
+		atc_update(atc, offset, BIT(5), BIT(5));
+		udelay(2);
+	}
+	atc_update(atc, 0x2000, 0x380000, r << 19);
+	for (unsigned int i = 0; i < ARRAY_SIZE(atc_dp_setup); i++)
+		if (atc_dp_register(atc, atc_dp_setup[i].offset))
+			atc_update(atc, atc_dp_setup[i].offset, atc_dp_setup[i].mask,
+				   atc_dp_setup[i].value);
+	for (u32 i = 0; i < 2; i++) {
+		if (!atc_dp_pma(atc, i))
+			continue;
+		atc_update(atc, 0x8684 + i * 0x9000, 3, r ? 0 : 1);
+		atc_update(atc, 0x4c80 + i * 0x9000, 0x30, r ? 0 : 0x10);
+	}
+	for (unsigned int i = 0; i < ARRAY_SIZE(tx_ctrl); i++) {
+		if (!atc_dp_register(atc, tx_ctrl[i]))
+			continue;
+		atc_update(atc, tx_ctrl[i], 0x7e07ff, 1);
+		atc_update(atc, tx_ctrl[i] - 0x14, 0x7f, r < 2 ? 0x65 : 0x40);
+	}
+	atc_update(atc, 0x2000, 0x70, 0x10);
+	atc_update(atc, 0x2000, BIT(13), BIT(13));
+	atc_update(atc, 0x2044, 0xffff0000, wake_count[r] << 16);
+	atc_update(atc, atc->swap ? 0x89f0 : 0x119f0, BIT(14), BIT(14));
+	atc_update(atc, 0x2000, BIT(2), BIT(2));
+	atc_update(atc, 0x2000, BIT(3), BIT(3));
+	atc_update(atc, 0x2040, BIT(16), BIT(16));
+
+	ret = atc_clock_write(atc, 10 - r);
+	if (ret) {
+		dev_err(disp->dev, "ATC%u: DP clock change timeout\n", atc->index);
+		return ret;
+	}
+	/*
+	 * Clock the stream from PMGR DP0 at the link-rate divider just set.
+	 * With source 0 selected instead, the pixel clock does not follow the
+	 * divider, and every mode above about 165 MHz stays black.
+	 */
+	atc_update(atc, ATC_CLKSW_SELECT, ATC_CLKSW_PCLK1_SEL | ATC_CLKSW_PCLK1_MODE,
+		   ATC_CLKSW_PCLK1_DP0);
+	atc_update(atc, ATC_CLKSW_ENABLE, ATC_CLKSW_PCLK1_EN, ATC_CLKSW_PCLK1_EN);
+	if (readl_poll_timeout(atc->base + ATC_CLKSW_STATUS, reg,
+			       reg & ATC_CLKSW_PCLK1_EN, 1, ATC_TIMEOUT_US)) {
+		dev_err(disp->dev, "ATC%u: DP pixel clock does not start\n", atc->index);
+		return -ETIMEDOUT;
+	}
+	ret = atc_route_start(disp, atc);
+	if (ret)
+		return ret;
+	atc->link_rate = atc_rates[r];
+	dev_info(disp->dev, "ATC%u: %u-lane DPTX setup at rate %#x\n", atc->index,
+		 atc->lanes, atc->link_rate);
+	return 0;
+}
+
+/*
+ * The power dependencies, in order: the ATC's USB AON (PS +0x100), its common
+ * PSD, then its two DP PS registers (+0, +0x20), with the values they idle at
+ * (ATC3: PS 0x1c0, PSD 58, PS 0xc0, 0xe0).
+ */
+#define ATC_PSD_TARGET	0x90
+#define ATC_PSD_STATE	0x80
+static const u32 atc_ps_offset[] = { 0x100, 0, 0x0, 0x20 };
+static const u32 atc_ps_idle[] = { 0x300, 6, 0x244, 0x244 };
+
+static int atc_psd_wait(struct t8152_atc_port *atc, u32 state)
+{
+	u32 reg;
+
+	/*
+	 * Only the state: the acknowledge bit stays clear when Linux switches
+	 * the PSD, in either direction.
+	 */
+	return readl_poll_timeout(atc->psd + ATC_PSD_STATE, reg,
+				  (reg & 7) == state, 1, ATC_TIMEOUT_US);
+}
+
+static int atc_gate(struct t8152_atc_port *atc, unsigned int i, bool on)
+{
+	u32 value = on ? (atc_ps_idle[i] & 0xfffffcf0) | 15 : atc_ps_idle[i];
+	u32 reg;
+
+	/* Already up (the bootloader's or an earlier activation's). */
+	if (on && (i == 1 ? !(readl(atc->psd + ATC_PSD_STATE) & 7) :
+			    (readl(atc->ps + atc_ps_offset[i]) & 0xf0) == 0xf0))
+		return 0;
+	if (on)
+		atc->owned |= BIT(i);
+	else
+		atc->owned &= ~BIT(i);
+	if (i == 1) {
+		writel(on ? 0 : atc_ps_idle[i], atc->psd + ATC_PSD_TARGET);
+		return atc_psd_wait(atc, on ? 0 : atc_ps_idle[i]);
+	}
+	writel(value, atc->ps + atc_ps_offset[i]);
+	return readl_poll_timeout(atc->ps + atc_ps_offset[i], reg,
+				  (reg & 0xf0) == ((value & 15) << 4), 1,
+				  ATC_TIMEOUT_US);
+}
+
+static void atc_apply_tunables(struct t8152_atc_port *atc, unsigned int which)
+{
+	const __be32 *t = atc->tunable[which];
+
+	for (int i = 0; i + 3 <= atc->tunable_len[which]; i += 3)
+		atc_update(atc, be32_to_cpu(t[i]), be32_to_cpu(t[i + 1]),
+			   be32_to_cpu(t[i + 2]));
+}
+
+/* Cold start: the power dependencies, the common block and AUX, then the lanes at HBR. */
+static int atc_activate(struct t8152_display *disp)
+{
+	struct t8152_atc_port *atc = atc_cur(disp);
+	void __iomem *cfg = atc->base + ATC_CFG;
+	unsigned int gates = 0;
+	u32 reg;
+
+	if (READ_ONCE(atc_owner[atc->index]) != disp->dev)
+		return -EBUSY;
+	if (atc->active)
+		return 0;
+	if (!atc->tunable[0] || !atc->tunable[1])
+		return -EOPNOTSUPP;
+	for (; gates < ARRAY_SIZE(atc_ps_idle); gates++)
+		if (atc_gate(atc, gates, true))
+			goto fail;
+	if (readl(cfg) != 4 || (readl(cfg + 4) & 3) || readl(cfg + 0x30))
+		goto fail;
+	writel(readl(cfg + 0x30) | BIT(0), cfg + 0x30);
+	udelay(1);
+	writel(readl(cfg) | BIT(0), cfg);
+	if (readl_poll_timeout(cfg + 4, reg, reg & BIT(0), 1, ATC_TIMEOUT_US))
+		goto fail;
+	writel(readl(cfg) | BIT(1), cfg);
+	if (readl_poll_timeout(cfg + 4, reg, reg & BIT(1), 1, ATC_TIMEOUT_US))
+		goto fail;
+	writel(readl(cfg) & ~BIT(2), cfg);
+	udelay(1);
+	writel(readl(cfg) | BIT(3), cfg);
+
+	atc_apply_tunables(atc, 0);
+	/* Pin D/F keeps the other PMA out of the DP path. */
+	atc_update(atc, 0x4c, 0x1f,
+		   atc->lanes == 2 ? (atc->swap ? 0x11 : 0x10) : 0x14);
+	atc_update(atc, 0x4c, 0x3ffe0,
+		   atc->lanes == 2 || atc->swap ? 0x100 : 0x22000);
+	atc_apply_tunables(atc, 1);
+	atc_update(atc, ATC_CFG + 8, BIT(1), atc->swap ? BIT(1) : 0);
+	writel(readl(cfg) | BIT(4), cfg);
+	if ((readl(cfg) & 0x1f) != 0x1b)
+		goto fail;
+	/* AUX: release small and big sleep, then the AUX clamp. */
+	atc_update(atc, ATC_AON + 0x24, BIT(8), BIT(8));
+	udelay(1);
+	atc_update(atc, ATC_AON + 0x24, BIT(6), BIT(6));
+	udelay(1);
+	atc_update(atc, ATC_AON + 0x24, BIT(10), 0);
+	udelay(1);
+	atc->active = true;
+	dev_info(disp->dev, "ATC%u: common PHY and AUX up from cold\n", atc->index);
+	/*
+	 * The lanes start at HBR right away. From cold, AUX only works with
+	 * the DP PLL and PMAs running (without them the firmware reports
+	 * DEVICE_NOT_RESPONDING); the firmware switches to its rate afterwards.
+	 */
+	return atc_dp_start(disp, atc, 1);
+fail:
+	dev_err(disp->dev, "ATC%u: cold start failed (gates %u, cfg %#x/%#x)\n",
+		atc->index, gates,
+		gates == ARRAY_SIZE(atc_ps_idle) ? readl(cfg) : 0,
+		gates == ARRAY_SIZE(atc_ps_idle) ? readl(cfg + 4) : 0);
+	return -EIO;
+}
+
+/* Power the PHY down, dependencies included. */
+static int atc_deactivate(struct t8152_display *disp)
+{
+	struct t8152_atc_port *atc = atc_cur(disp);
+	void __iomem *cfg = atc->base + ATC_CFG;
+	int ret = 0;
+	u32 reg;
+
+	if (!atc->active)
+		return 0;
+	if (atc->link_rate && atc_dp_stop(disp, atc)) {
+		dev_err(disp->dev, "ATC%u: DP stop failed\n", atc->index);
+		return -EIO;
+	}
+	atc_route_stop(disp, atc);
+	atc_update(atc, ATC_AON + 0x24, BIT(10), BIT(10));
+	udelay(1);
+	atc_update(atc, ATC_AON + 0x24, BIT(6), 0);
+	udelay(1);
+	atc_update(atc, ATC_AON + 0x24, BIT(8), 0);
+	udelay(1);
+	writel(readl(cfg) & ~BIT(4), cfg);
+	udelay(1);
+	writel(readl(cfg) & ~BIT(3), cfg);
+	writel(readl(cfg) | BIT(2), cfg);
+	writel(readl(cfg) & ~BIT(1), cfg);
+	if (readl_poll_timeout(cfg + 4, reg, !(reg & BIT(1)), 1, ATC_TIMEOUT_US)) {
+		dev_err(disp->dev, "ATC%u: big-sleep entry timeout\n", atc->index);
+		ret = -ETIMEDOUT;
+	}
+	writel(readl(cfg) & ~BIT(0), cfg);
+	if (readl_poll_timeout(cfg + 4, reg, !(reg & BIT(0)), 1, ATC_TIMEOUT_US)) {
+		dev_err(disp->dev, "ATC%u: small-sleep entry timeout\n", atc->index);
+		ret = -ETIMEDOUT;
+	}
+	writel(readl(cfg + 0x30) & ~BIT(0), cfg + 0x30);
+	atc->active = false;
+	/*
+	 * Then the power dependencies it powered up: the next activation starts
+	 * it cold. The USB controller of a port keeps the ones it uses.
+	 */
+	for (int i = ARRAY_SIZE(atc_ps_idle) - 1; i >= 0; i--)
+		if ((atc->owned & BIT(i)) && atc_gate(atc, i, false))
+			ret = -ETIMEDOUT;
+	dev_info(disp->dev, "ATC%u: powered down: %d\n", atc->index, ret);
+	return ret;
+}
+
+static int atc_set_link_rate(struct t8152_display *disp, u32 rate)
+{
+	struct t8152_atc_port *atc = atc_cur(disp);
+	u32 r;
+	int ret;
+
+	/* The firmware drops the link (rate 0) before it retrains. */
+	if (!rate || rate == atc->link_rate)
+		return 0;
+	for (r = 0; r < ARRAY_SIZE(atc_rates); r++)
+		if (atc_rates[r] == rate)
+			break;
+	if (r == ARRAY_SIZE(atc_rates) || !atc->active)
+		return -EINVAL;
+	dev_info(disp->dev, "ATC%u: link rate %#x, was %#x\n", atc->index, rate,
+		 atc->link_rate);
+	if (atc->link_rate) {
+		ret = atc_dp_stop(disp, atc);
+		if (ret)
+			return ret;
+	}
+	return atc_dp_start(disp, atc, r);
+}
+
+static int atc_set_route(struct t8152_display *disp, bool enable)
+{
+	struct t8152_atc_port *atc = atc_cur(disp);
+
+	if (!enable)
+		return atc_route_stop(disp, atc);
+	if (!atc->active)
+		return -ENODEV;
+	if (atc_route_start(disp, atc))
+		return -EIO;
+	mdelay(5);
+	return 0;
+}
+
+/*
+ * Lane drive presets, indexed by voltage * 4 + pre-emphasis; they serve
+ * every link rate.
+ */
+static const u32 atc_drive_presets[16] = {
+	0x025, 0x420, 0x717, 0x90f, 0x019, 0x397, 0x78f, 0x025,
+	0x011, 0x38f, 0x025, 0x025, 0x000, 0x025, 0x025, 0x025,
+};
+
+static int atc_set_drive(struct t8152_display *disp,
+			 const struct t8152_drive_settings *settings, u32 count)
+{
+	struct t8152_atc_port *atc = atc_cur(disp);
+	u32 presets[4];
+
+	if (!count)
+		return 0;
+	if (count > atc->lanes || !atc->active || !atc->link_rate)
+		return -EINVAL;
+	/* Validate the entire request before changing any lane. */
+	for (u32 i = 0; i < count; i++) {
+		u32 v = le32_to_cpu(settings[i].voltage);
+		u32 e = le32_to_cpu(settings[i].pre_emphasis);
+
+		if (settings[i].format || v > 3 || e > 3 || v + e > 3)
+			return -EINVAL;
+		presets[i] = atc_drive_presets[v * 4 + e];
+	}
+	for (u32 i = 0; i < count; i++) {
+		u32 pma = (i / 2) ^ !atc->swap;
+		/* Even DP lanes use the PMA RX pair, odd lanes its TX pair. */
+		u32 offset = ((i & 1) ? 0x4eb0 : 0x8b10) + pma * 0x9000;
+		u32 preset = presets[i];
+		u32 control = 1 | (((preset >> 13) & 0x3f) << 17) |
+			      (((preset >> 7) & 0x3f) << 5);
+
+		atc_update(atc, offset, 0x7e07ff, control);
+		atc_update(atc, offset - 0x14, 0x7f, (preset & 0x3f) | 0x40);
+	}
+	return 0;
+}
+
+static void atc_set_orientation(struct t8152_display *disp, bool flipped)
+{
+	struct t8152_atc_port *atc = atc_cur(disp);
+
+	/* Applied by the next cold start; a running PHY keeps its own. */
+	if (atc->active && atc->swap != flipped)
+		dev_warn(disp->dev, "ATC%u: orientation changed while active\n",
+			 atc->index);
+	atc->swap = flipped;
+	atc->lanes = atc->next_lanes;
+}
+
+static u32 atc_max_lane_count(struct t8152_display *disp)
+{
+	return atc_cur(disp)->lanes;
+}
+
+/*
+ * The sink's EDID through the AP AUX controller aux0, which reaches the ATC
+ * through crossbar UFP aux0 like the DCP: the DCP's route comes down for
+ * the read, so this runs while the firmware does no AUX itself (display
+ * off, HPD not asserted yet).
+ */
+static int atc_read_edid(struct t8152_display *disp, u8 *buf, size_t size)
+{
+	struct t8152_atc_port *atc = atc_cur(disp);
+	bool was_started = atc->route_started;
+	int ret;
+
+	if (!atc->active || !atc->aux->regs)
+		return -ENODEV;
+	mutex_lock(&atc_aux_lock);
+	/* The AUX output select of an ATC port: ATC instance * 3 + local DFP. */
+	atc->aux->sel = atc->index * 3;
+	ret = t8152_aux_init(disp, atc->aux);
+	if (ret)
+		goto out;
+	atc_route_stop(disp, atc);
+	ret = atc_route_start_sel(disp, atc, ATC_SEL_AUX0);
+	if (!ret)
+		ret = t8152_aux_read_edid(disp, atc->aux, buf, size);
+	atc_route_stop(disp, atc);
+	if (was_started)
+		atc_route_start(disp, atc);
+out:
+	mutex_unlock(&atc_aux_lock);
+	return ret;
+}
+
+/*
+ * 1 with a sink on one of the ports: the current one first, then the
+ * others; select() switches to a port found that way.
+ */
+static int atc_detect(struct t8152_display *disp, bool *flipped)
+{
+	struct t8152_atc *atc = disp->phy_priv;
+	int ret = 0;
+
+	mutex_lock(&atc_owner_lock);
+	atc->next = atc->cur;
+	/* Keep a monitor on its controller, including while userspace blanks it. */
+	if (atc_owner[atc->cur->index] == disp->dev) {
+		ret = t8152_pd_sink(atc->cur->pd, flipped, &atc->cur->next_lanes);
+		if (ret > 0 && (atc->cur->swap != *flipped ||
+				atc->cur->lanes != atc->cur->next_lanes))
+			disp->hpd = 0;
+		if (ret)
+			goto out;
+		/* Unplug powers down in KMS; release on the next poll. */
+		if (!atc->cur->active)
+			atc_owner[atc->cur->index] = NULL;
+	}
+	for (unsigned int i = 0; i < atc->nports; i++) {
+		struct t8152_atc_port *port = &atc->port[i];
+
+		if (atc_owner[port->index] ||
+		    t8152_pd_sink(port->pd, flipped, &port->next_lanes) <= 0)
+			continue;
+		atc_owner[port->index] = disp->dev;
+		atc->next = port;
+		disp->hpd = 0;
+		ret = 1;
+		break;
+	}
+out:
+	mutex_unlock(&atc_owner_lock);
+	return ret;
+}
+
+/*
+ * Drive the port a sink was found on: power the old one down and connect
+ * the DPTX port to the new one's display crossbar endpoint.
+ */
+static void atc_select(struct t8152_display *disp)
+{
+	struct t8152_atc *atc = disp->phy_priv;
+	struct t8152_atc_port *port = atc->next;
+
+	if (!port || port == atc->cur)
+		return;
+	if (atc->cur->active && atc_deactivate(disp))
+		return;
+	mutex_lock(&atc_owner_lock);
+	if (atc_owner[atc->cur->index] == disp->dev)
+		atc_owner[atc->cur->index] = NULL;
+	mutex_unlock(&atc_owner_lock);
+	dev_info(disp->dev, "USB-C display on ATC%u now, was ATC%u\n",
+		 port->index, atc->cur->index);
+	atc->cur = port;
+	disp->pd = port->pd;
+	disp->dcp_output = port->dfp;
+}
+
+/*
+ * Before the DCP drives another PHY (the HDMI port): give up the claim on a
+ * port that is powered down. False while the current port is still up.
+ */
+bool t8152_atc_release(struct t8152_display *disp)
+{
+	struct t8152_atc_port *atc = atc_cur(disp);
+
+	if (atc->active)
+		return false;
+	guard(mutex)(&atc_owner_lock);
+	if (atc_owner[atc->index] == disp->dev)
+		atc_owner[atc->index] = NULL;
+	return true;
+}
+
+static const struct t8152_phy_ops atc_ops = {
+	.activate = atc_activate,
+	.deactivate = atc_deactivate,
+	.set_link_rate = atc_set_link_rate,
+	.max_lane_count = atc_max_lane_count,
+	.set_drive = atc_set_drive,
+	.set_route = atc_set_route,
+	.set_orientation = atc_set_orientation,
+	.read_edid = atc_read_edid,
+	.detect = atc_detect,
+	.select = atc_select,
+	.max_link_rate = LINK_RATE_HBR2,
+};
+
+/* PMGR registers, inside blocks their power domain driver has claimed. */
+static void __iomem *atc_map(struct t8152_display *disp, struct device_node *np,
+			     const char *name)
+{
+	int i = of_property_match_string(np, "reg-names", name);
+	struct resource res;
+
+	if (i < 0 || of_address_to_resource(np, i, &res))
+		return NULL;
+	return devm_ioremap(disp->dev, res.start, resource_size(&res));
+}
+
+static int atc_port_init(struct t8152_display *disp, struct t8152_atc *atc,
+			 struct device_node *np, void __iomem *dp_clock)
+{
+	struct t8152_atc_port *port = &atc->port[atc->nports];
+	u32 cfg, r;
+
+	port->base = atc_map(disp, np, "atc");
+	port->ps = atc_map(disp, np, "atc-ps");
+	port->psd = atc_map(disp, np, "atc-psd");
+	if (!port->base || !port->ps || !port->psd)
+		return -ENOMEM;
+	port->pd = t8152_pd_get(np);
+	if (IS_ERR_OR_NULL(port->pd))
+		return port->pd ? PTR_ERR(port->pd) : -ENODEV;
+	/* The node without ports is ATC3's (J873g back-right). */
+	port->dfp = 3;
+	of_property_read_u32(np, "apple,dfp-endpoint", &port->dfp);
+	port->index = port->dfp;
+	port->lanes = 4;
+	port->next_lanes = 4;
+	if (port->index >= 4)
+		return -EINVAL;
+	port->dp_clock = dp_clock + port->index * 8;
+	port->aux = &atc->aux;
+	port->tunable[0] = of_get_property(np, "apple,tunable-pre",
+					   &port->tunable_len[0]);
+	port->tunable[1] = of_get_property(np, "apple,tunable-post",
+					   &port->tunable_len[1]);
+	port->tunable_len[0] /= sizeof(__be32);
+	port->tunable_len[1] /= sizeof(__be32);
+	atc->nports++;
+
+	/*
+	 * The PHY block hangs the bus while it is power-gated: look at it only
+	 * with its DP dependencies and the common PSD up.
+	 */
+	if ((readl(port->ps) & 0xf0) != 0xf0 ||
+	    (readl(port->psd + ATC_PSD_STATE) & 7)) {
+		dev_info(disp->dev, "ATC%u: powered down\n", port->index);
+		return 0;
+	}
+	/* A different DCP may already be driving this port. */
+	if (atc_owner[port->index] ||
+	    ((readl(port->base + ATC_XBAR + 0x44) >> 20) & 0xf) !=
+							 disp->dp_source * 2)
+		return 0;
+	/* Common block out of reset and AUX up, as the bootloader leaves it. */
+	cfg = readl(port->base + ATC_CFG);
+	port->active = (cfg & 0x1f) == 0x1b;
+	if ((readl(port->base + 0x4c) & 0x1f) == 0x10 ||
+	    (readl(port->base + 0x4c) & 0x1f) == 0x11) {
+		port->lanes = 2;
+		port->next_lanes = 2;
+	}
+	port->swap = !!(readl(port->base + ATC_CFG + 8) & BIT(1));
+	port->route_started =
+		(readl(port->base + ATC_XBAR) & BIT(disp->dp_source * 2)) &&
+		(readl(port->base + ATC_XBAR + 0x3c) & BIT(disp->dp_source * 2));
+	r = (readl(port->base + 0x2000) >> 19) & 7;
+	if (port->active && (readl(port->base + 0x2040) & BIT(16)) &&
+	    r < ARRAY_SIZE(atc_rates))
+		port->link_rate = atc_rates[r];
+	/* The bootloader's display: its dependencies are the display's. */
+	if (port->active)
+		port->owned = GENMASK(ARRAY_SIZE(atc_ps_idle) - 1, 0);
+	dev_info(disp->dev,
+		 "ATC%u: inherited state: active %d, rate %#x, route %d, reversed %d (cfg %#x)\n",
+		 port->index, port->active, port->link_rate, port->route_started,
+		 port->swap, cfg);
+	return 0;
+}
+
+int t8152_atc_init(struct t8152_display *disp)
+{
+	struct device_node *ports __free(device_node) =
+		of_parse_phandle(disp->dev->of_node, "apple,usb-c-ports", 0);
+	struct device_node *np = ports ?: disp->dev->of_node;
+	struct resource clock_res;
+	void __iomem *dp_clock;
+	struct t8152_atc *atc;
+	int ret;
+
+	atc = devm_kzalloc(disp->dev, sizeof(*atc), GFP_KERNEL);
+	if (!atc)
+		return -ENOMEM;
+	ret = of_property_match_string(np, "reg-names", "dp-clock");
+	if (ret < 0 || of_address_to_resource(np, ret, &clock_res))
+		return -EINVAL;
+	/* Older J873 DTs describe ATC3's divider alone; each ATC has its own. */
+	if (resource_size(&clock_res) == 4 && clock_res.start == 0x30002005cULL)
+		clock_res.start -= 3 * 8;
+	if (resource_size(&clock_res) < 28)
+		return -EINVAL;
+	dp_clock = devm_ioremap(disp->dev, clock_res.start, resource_size(&clock_res));
+	if (!dp_clock)
+		return -ENOMEM;
+	/* Shared AUX0 is serialized by atc_aux_lock. */
+	atc->aux.regs = atc_map(disp, np, "aux");
+	atc->aux.ps = atc_map(disp, np, "aux-ps");
+	if (!atc->aux.ps)
+		atc->aux.regs = NULL;
+
+	guard(mutex)(&atc_owner_lock);
+	/* One child per USB-C port, or the node itself for ATC3 alone. */
+	for_each_child_of_node_scoped(np, child) {
+		if (!of_property_present(child, "apple,dfp-endpoint"))
+			continue;
+		if (atc->nports == ARRAY_SIZE(atc->port))
+			break;
+		ret = atc_port_init(disp, atc, child, dp_clock);
+		if (ret)
+			return ret;
+	}
+	if (!atc->nports) {
+		ret = atc_port_init(disp, atc, np, dp_clock);
+		if (ret)
+			return ret;
+	}
+
+	/* Only adopt a bootloader route belonging to this DCP. */
+	atc->cur = &atc->port[0];
+	for (unsigned int i = 0; i < atc->nports; i++) {
+		if (atc->port[i].active) {
+			atc->cur = &atc->port[i];
+			atc_owner[atc->cur->index] = disp->dev;
+			break;
+		}
+	}
+	atc->next = atc->cur;
+	disp->phy = &atc_ops;
+	disp->phy_priv = atc;
+	disp->pd = atc->cur->pd;
+	disp->dcp_output = atc->cur->dfp;
+	dev_info(disp->dev, "USB-C display on ATC%u (%u ports)\n", atc->cur->index,
+		 atc->nports);
+	return 0;
+}
