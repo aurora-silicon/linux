@@ -182,8 +182,16 @@ struct aura_s2r_mailbox {
 #define HPM_CMD_SSPS		0x53505353
 #define HPM_CMD_COLD_RESET	0x64696147
 #define HPM_SSPS_S3		3
-/* The first look after the reset, and how long a contract that never seemed to go is trusted to have gone. */
-#define HPM_RESET_FIRST_MS	50
+#define HPM_PAGE_MODE		0x03
+/* "DBMa" in MODE: the boot loader's debug link, which only the cold reset ends */
+#define HPM_MODE_DEBUG_LINK	0x614d4244
+/*
+ * For a moment after the reset command the controller still answers as before it, with its
+ * old contract; nothing read in that window tells whether the reset was taken. Then: how often
+ * it is looked at, and how long a contract that never seemed to go is trusted to have gone.
+ */
+#define HPM_RESET_STALE_MS	50
+#define HPM_CONTRACT_POLL_MS	10
 #define HPM_RESET_FLOOR_MS	1000
 #define HPM_PAGE_POWER_STATUS	0x3f
 #define HPM_POWER_CONNECTED	BIT(0)
@@ -3573,43 +3581,75 @@ static int sleep_hpm_sleep(struct apple_sleep *s)
 	return ret;
 }
 
+/* A port controller register: its page selected, then four bytes of the data window. */
+static int sleep_hpm_read(struct apple_sleep *s, u32 page, u32 *val)
+{
+	int ret = sleep_hpm_select(s, page);
+
+	return ret ?: sleep_hpm_cmd(s, SPMI_OP_EXT_READ(4), HPM_REG_DATA, NULL, val);
+}
+
+struct sleep_hpm_contract {
+	ktime_t start;
+	/* ms from the reset to the first look that saw it taken, or -1 */
+	int gone_ms;
+	/* The last look had no answer: wake it first. */
+	bool wake;
+	/* MODE read the debug link's before the reset. */
+	bool debug_mode;
+};
+
+/*
+ * One look at the port controller after the reset: 1 once the partner's contract is back, 0
+ * while not yet, -ETIMEDOUT after HPM_CONTRACT_MS. The reset counts as taken once the
+ * controller has left the debug link's mode, or had no answer or no contract (it restarts); a
+ * contract that never seemed to go counts as back only after HPM_RESET_FLOOR_MS.
+ */
+static int sleep_hpm_contract_back(struct apple_sleep *s, struct sleep_hpm_contract *c)
+{
+	int ms = ktime_ms_delta(ktime_get(), c->start);
+	u32 mode = HPM_MODE_DEBUG_LINK, val = 0;
+	bool up, taken;
+	int ret;
+
+	if (ms >= HPM_CONTRACT_MS)
+		return -ETIMEDOUT;
+	ret = c->wake ? sleep_hpm_cmd(s, SPMI_OP_WAKEUP, 0, NULL, NULL) : 0;
+	if (!ret && c->debug_mode)
+		ret = sleep_hpm_read(s, HPM_PAGE_MODE, &mode);
+	if (!ret)
+		ret = sleep_hpm_read(s, HPM_PAGE_POWER_STATUS, &val);
+	up = !ret && (val & HPM_POWER_CONNECTED) &&
+	     FIELD_GET(HPM_POWER_TYPEC_MODE, val) == HPM_POWER_TYPEC_PD;
+	/* A controller still waking reads zeros: that says nothing of its mode. */
+	taken = !up || (c->debug_mode && mode && mode != HPM_MODE_DEBUG_LINK);
+	if (taken && c->gone_ms < 0)
+		c->gone_ms = ms;
+	c->wake = ret;
+
+	return up && (c->gone_ms >= 0 || ms >= HPM_RESET_FLOOR_MS);
+}
+
 /*
  * The partner takes the reset as an unplug, attaches again and renegotiates its contract.
  * Left to finish across the commit, that sometimes failed: neither side had a contract or
  * saw the other, and no VDM got through until a replug. Returns the ms it took.
  */
-static int sleep_hpm_wait_contract(struct apple_sleep *s, int *gone_ms)
+static int sleep_hpm_wait_contract(struct apple_sleep *s, bool debug_mode, int *gone_ms)
 {
-	ktime_t start = ktime_get();
-	bool wake = true, up;
-	u32 val = 0;
-	int ms, ret;
+	struct sleep_hpm_contract c = {
+		.start = ktime_get(), .gone_ms = -1, .wake = true, .debug_mode = debug_mode,
+	};
+	int back, ret;
 
-	/*
-	 * It reads back as before for a moment after the reset. Count it as back once it was
-	 * seen gone (no contract, or no answer while the controller restarts), or after the
-	 * floor if it never seemed to go.
-	 */
-	*gone_ms = -1;
-	mdelay(HPM_RESET_FIRST_MS);
-	for (;;) {
-		ms = ktime_ms_delta(ktime_get(), start);
-		if (ms >= HPM_CONTRACT_MS)
-			return -ETIMEDOUT;
-		ret = wake ? sleep_hpm_cmd(s, SPMI_OP_WAKEUP, 0, NULL, NULL) : 0;
-		if (!ret)
-			ret = sleep_hpm_select(s, HPM_PAGE_POWER_STATUS);
-		if (!ret)
-			ret = sleep_hpm_cmd(s, SPMI_OP_EXT_READ(4), HPM_REG_DATA, NULL, &val);
-		up = !ret && (val & HPM_POWER_CONNECTED) &&
-		     FIELD_GET(HPM_POWER_TYPEC_MODE, val) == HPM_POWER_TYPEC_PD;
-		if (!up && *gone_ms < 0)
-			*gone_ms = ms;
-		if (up && (*gone_ms >= 0 || ms >= HPM_RESET_FLOOR_MS))
-			return ms;
-		wake = ret;
-		mdelay(10);
-	}
+	mdelay(HPM_RESET_STALE_MS);
+	/* The look itself bounds the wait in wall time: its SPMI commands take a while. */
+	ret = read_poll_timeout_atomic(sleep_hpm_contract_back, back, back,
+				       HPM_CONTRACT_POLL_MS * USEC_PER_MSEC, 0, false, s, &c);
+	*gone_ms = c.gone_ms;
+	if (ret || back < 0)
+		return ret ?: back;
+	return ktime_ms_delta(ktime_get(), c.start);
 }
 
 /* A live debug link holds the debug switch domain on. */
@@ -3629,7 +3669,8 @@ static bool sleep_debug_link_up(struct apple_sleep *s)
 static bool apple_sleep_usb_down(struct apple_sleep *s)
 {
 	u32 cmd = HPM_CMD_COLD_RESET;
-	u32 enable;
+	u32 enable, mode = 0;
+	bool debug_mode;
 	int i, ret, ms, gone;
 
 	if (s->usb_down_ran)
@@ -3645,6 +3686,9 @@ static bool apple_sleep_usb_down(struct apple_sleep *s)
 	/* A reset that the partner doesn't come back from is done again. */
 	for (i = 1; i <= HPM_RESET_TRIES; i++) {
 		ret = sleep_hpm_cmd(s, SPMI_OP_WAKEUP, 0, NULL, NULL);
+		/* Where it is in the debug link's mode, leaving that mode is the reset taken. */
+		debug_mode = !ret && !sleep_hpm_read(s, HPM_PAGE_MODE, &mode) &&
+			     mode == HPM_MODE_DEBUG_LINK;
 		if (!ret)
 			ret = sleep_hpm_select(s, HPM_PAGE_CMD1);
 		if (!ret)
@@ -3652,10 +3696,10 @@ static bool apple_sleep_usb_down(struct apple_sleep *s)
 		if (ret)
 			break;
 		WRITE_ONCE(sleep_debug_link_cut, true);
-		ms = sleep_hpm_wait_contract(s, &gone);
+		ms = sleep_hpm_wait_contract(s, debug_mode, &gone);
 		if (ms >= 0) {
-			dev_info(s->dev, "debug link: contract back %d ms after reset %d (gone at %d ms)\n",
-				 ms, i, gone);
+			dev_info(s->dev, "debug link: contract back %d ms after reset %d (gone at %d ms%s)\n",
+				 ms, i, gone, debug_mode ? ", mode" : "");
 			break;
 		}
 		dev_warn(s->dev, "debug link: no contract with the partner after reset %d\n", i);
