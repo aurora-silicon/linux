@@ -349,6 +349,12 @@ struct ane_h16_session {
 	bool pipelined;
 	/* Reclaim a batch of command buffers only after its last caller ends. */
 	size_t execute_mark;
+	/*
+	 * Command arena position at a LOAD with no program alive in this
+	 * firmware boot: once none is again, every command above it is done.
+	 */
+	size_t pool_base;
+	bool pool_base_set;
 	/* Firmware log lines printed after the last failed EXECUTE. */
 	unsigned int fwlog_lines;
 	bool quarantined;

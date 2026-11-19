@@ -597,8 +597,9 @@ static int h16_send(struct ane_h16_session *s, unsigned int ch, const void *comm
 
 /*
  * The transport copies commands into a pool arena. LOAD and CREATE stay in
- * it; each EXECUTE sequence gives its space back once the firmware reported
- * the request complete. Refuse a sequence up front when it cannot fit, so
+ * it while any program of this firmware boot is alive (h16_pool_rewind());
+ * each EXECUTE sequence gives its space back once the firmware reported the
+ * request complete. Refuse a sequence up front when it cannot fit, so
  * running out of arena is a clean -ENOSPC and never a half-sent sequence.
  */
 static int h16_pool_room(struct ane_h16_session *s, const size_t *lengths,
@@ -615,6 +616,23 @@ static int h16_pool_room(struct ane_h16_session *s, const size_t *lengths,
 		used += lengths[i];
 	}
 	return 0;
+}
+
+/*
+ * The last program of this firmware boot was torn down cleanly and nothing
+ * is in flight: the firmware is done with every command published since the
+ * LOAD that found no program alive (LOAD, CREATE, gates, TERMINATE and
+ * UNLOAD), so give their arena back. Without this the arena filled after
+ * about two hundred programs and every LOAD failed with -ENOSPC until the
+ * firmware was booted again.
+ */
+static void h16_pool_rewind(struct ane_h16_session *s)
+{
+	if (!s->pool_base_set || !list_empty(&s->programs) || !list_empty(&s->held) ||
+	    s->running || s->active || s->quarantined)
+		return;
+	if (!ane_fw_transport_release(s->transport, s->pool_base))
+		s->pool_base_set = false;
 }
 
 static void h16_sync(struct ane_h16_session *s, const struct ane_fw_surface *surface,
@@ -994,6 +1012,10 @@ int ane_h16_session_load(struct ane_h16_session *s,
 		 */
 		p->closed = true;
 		goto out;
+	}
+	if (list_empty(&s->programs) && list_empty(&s->held) && !s->running) {
+		s->pool_base = ane_fw_transport_mark(s->transport);
+		s->pool_base_set = true;
 	}
 	ret = h16_send(s, ANE_FW_IO, command, ANE_H16_LOAD_SIZE, &reply);
 	if (!ret)
@@ -1772,6 +1794,7 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 	 * reads or writes this program's memory: later programs may reuse it.
 	 */
 	h16_give_back(s, p);
+	h16_pool_rewind(s);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_close);
@@ -1850,6 +1873,8 @@ void ane_h16_session_restart(struct ane_h16_session *s)
 {
 	s->epoch++;
 	s->program = NULL;
+	/* The new firmware's arena starts afresh. */
+	s->pool_base_set = false;
 	/* A firmware booted again from the preload starts with gating on. */
 	s->gate_held = false;
 	s->executed = 0;

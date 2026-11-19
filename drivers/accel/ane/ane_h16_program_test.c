@@ -2809,7 +2809,65 @@ static void program_hung_recovery_test(struct kunit *test)
 	ane_h16_session_put(&f->s, p);
 }
 
+/* Load, run, close and free one program. */
+static int fw_cycle(struct prog_fw *f)
+{
+	struct ane_h16_program *p = NULL;
+	int ret = fw_load_program(f, &p);
+
+	if (ret)
+		return ret;
+	ret = ane_h16_session_execute(&f->s, p);
+	if (!ret)
+		ret = ane_h16_session_close(&f->s, p);
+	if (!ret)
+		ane_h16_session_put(&f->s, p);
+	return ret;
+}
+
+/*
+ * LOAD, CREATE, TERMINATE and UNLOAD of each program used to stay in the
+ * 256 KiB command arena until the firmware was booted again: about two
+ * hundred programs in, every LOAD failed with -ENOSPC. Once the last
+ * program is torn down the arena goes back to where the first LOAD found
+ * it, and never below a program that is still loaded.
+ */
+static void program_pool_rewind_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	size_t base, kept;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	base = ane_fw_transport_mark(&f->t);
+	for (i = 0; i < 1000; i++) {
+		KUNIT_ASSERT_EQ(test, fw_cycle(f), 0);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_mark(&f->t), base);
+	}
+
+	/* A program that stays loaded keeps its commands and all after them. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	kept = ane_fw_transport_mark(&f->t);
+	KUNIT_EXPECT_GT(test, kept, base);
+	for (i = 0; i < 20; i++)
+		KUNIT_ASSERT_EQ(test, fw_cycle(f), 0);
+	KUNIT_EXPECT_GT(test, ane_fw_transport_mark(&f->t), kept);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	ane_h16_session_put(&f->s, p);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_mark(&f->t), base);
+
+	/* A quarantined session keeps the arena as it is. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	kept = ane_fw_transport_mark(&f->t);
+	f->s.quarantined = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), -EIO);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_mark(&f->t), kept);
+	KUNIT_EXPECT_FALSE(test, list_empty(&f->s.held));
+}
+
 static struct kunit_case program_cases[] = {
+	KUNIT_CASE_SLOW(program_pool_rewind_test),
 	KUNIT_CASE(program_hung_recovery_test),
 	KUNIT_CASE(program_pipeline_out_of_order_test),
 	KUNIT_CASE(program_pipeline_same_program_test),
