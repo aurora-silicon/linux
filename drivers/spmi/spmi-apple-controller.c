@@ -112,6 +112,7 @@ struct apple_spmi {
 	void __iomem *regs;
 	void __iomem *faults;
 	unsigned int nfaults;
+	struct device *dev;
 	const struct apple_spmi_hw *hw;
 	struct mutex fifo_lock;
 	struct completion fifo_rx;
@@ -478,6 +479,17 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 
 	chained_irq_enter(chip, desc);
 	val = readl(spmi->regs + spmi->hw->irq_ack + (notify / 32) * 4);
+	/*
+	 * On gen4 the controller's own fault source shares this last ack word
+	 * (0x620, bit 7). Its queued records must be read before the source is
+	 * acked, or drain_faults() never sees them.
+	 */
+	if (!spmi->hw->legacy_irqs && spmi->faults &&
+	    (val & BIT(APPLE_SPMI_GEN4_FAULT_IRQ % 32))) {
+		apple_spmi_drain_faults(spmi->dev, spmi);
+		val &= ~BIT(APPLE_SPMI_GEN4_FAULT_IRQ % 32);
+		handled = true;
+	}
 	raw_pending |= !!val;
 	if (val & BIT(notify % 32)) {
 		apple_spmi_irq_ack_raw(spmi, notify);
@@ -503,6 +515,14 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 		 * pending for its unmask: it isn't a bad interrupt either.
 		 */
 		stray = val & ~spmi->irq_used[offset / sizeof(val)];
+		if (stray && !spmi->hw->legacy_irqs && spmi->faults &&
+		    offset == (APPLE_SPMI_GEN4_FAULT_IRQ / 32) * sizeof(val) &&
+		    (stray & BIT(APPLE_SPMI_GEN4_FAULT_IRQ % 32))) {
+			/* Same rule as above: read the queued records first. */
+			apple_spmi_drain_faults(spmi->dev, spmi);
+			stray &= ~BIT(APPLE_SPMI_GEN4_FAULT_IRQ % 32);
+			handled = true;
+		}
 		if (stray) {
 			writel(lower_32_bits(stray), spmi->regs + spmi->hw->irq_ack + offset);
 			writel(upper_32_bits(stray), spmi->regs + spmi->hw->irq_ack + offset + 4);
@@ -543,7 +563,8 @@ static void apple_spmi_teardown_irq(void *data)
 {
 	struct apple_spmi *spmi = data;
 
-	for (size_t offset = 0; offset < (spmi->hw->num_irqs + 32) / 8; offset += 4)
+	for (size_t offset = 0; offset < spmi->hw->num_irqs / 8 + (spmi->hw->legacy_irqs ? 4 : 0);
+	     offset += 4)
 		writel(0, spmi->regs + spmi->hw->irq_mask + offset);
 
 	synchronize_irq(spmi->irq);
@@ -563,7 +584,8 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 
 	raw_spin_lock_init(&spmi->irq_mask_lock);
 
-	for (size_t offset = 0; offset < (spmi->hw->num_irqs + 32) / 8; offset += 4) {
+	for (size_t offset = 0; offset < spmi->hw->num_irqs / 8 + (spmi->hw->legacy_irqs ? 4 : 0);
+	     offset += 4) {
 		writel(0, spmi->regs + spmi->hw->irq_mask + offset);
 		writel(U32_MAX, spmi->regs + spmi->hw->irq_ack + offset);
 	}
@@ -662,6 +684,7 @@ static int apple_spmi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	spmi = spmi_controller_get_drvdata(ctrl);
+	spmi->dev = &pdev->dev;
 	spmi->hw = device_get_match_data(&pdev->dev);
 	if (!spmi->hw)
 		return -EINVAL;
