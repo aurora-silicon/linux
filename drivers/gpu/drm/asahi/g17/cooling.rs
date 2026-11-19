@@ -47,14 +47,12 @@ fn required(dev: &device::Device) -> Result<bool> {
     }
 }
 
-/// Check before starting either processor. A GPU the device tree makes a cooling device must
-/// not run without its ceiling: a build whose power inputs are not described here
-/// ([`Variant::live_power`] is `None`) refuses to start rather than silently
-/// ignoring the thermal zones.
+/// Check before starting either processor. The firmware keeps its own die limiter, so a build
+/// whose power inputs are not described here ([`Variant::live_power`] is `None`) still runs; the
+/// GPU just does not become a cooling device and its thermal zones get no GPU ceiling.
 pub(super) fn admit(dev: &device::Device, variant: &Variant) -> Result {
     if required(dev)? && variant.live_power.is_none() {
-        dev_err!(dev, "GPU live power layout not admitted\n");
-        return Err(EOPNOTSUPP);
+        dev_warn!(dev, "GPU live power layout unknown for this firmware, no GPU cooling device\n");
     }
     Ok(())
 }
@@ -81,7 +79,9 @@ impl Cooling {
         if !required(dev)? {
             return Ok(None);
         }
-        let layout = variant.live_power.as_ref().ok_or(EOPNOTSUPP)?;
+        let Some(layout) = variant.live_power.as_ref() else {
+            return Ok(None);
+        };
         let words = init.cooling_words(layout)?;
         // SAFETY: The owner keeps all validated shared words mapped until after
         // Drop drains the C callbacks. Registration republishes the initialized

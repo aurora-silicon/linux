@@ -30,9 +30,9 @@ Firmware builds
 
 The driver writes the power inputs only where the running build's layout is
 described (``Variant::live_power`` in ``g17/fw/variant.rs``): the A18 Pro
-(26A428) and M4 Pro (25G83) builds. A GPU the device tree makes a cooling
-device does not start on any other build, rather than run with the thermal
-zones silently ignored. The M5 firmware takes its host budget at a different
+(26A428) and M4 Pro (25G83) builds. On any other build the GPU still starts
+under the firmware's own die limiter, warns once, and does not register as a
+cooling device, so its thermal zones get no GPU ceiling. The M5 firmware takes its host budget at a different
 Region C offset, which its own governor (``g17/thermal.rs``) writes; moving
 that governor onto this cooling device is separate work.
 
