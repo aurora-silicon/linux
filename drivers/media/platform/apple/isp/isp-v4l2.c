@@ -895,8 +895,7 @@ static inline void isp_get_sp_pix_format(struct apple_isp *isp,
 	f->fmt.pix.colorspace = V4L2_COLORSPACE_REC709;
 	f->fmt.pix.ycbcr_enc = V4L2_YCBCR_ENC_709;
 	f->fmt.pix.xfer_func = V4L2_XFER_FUNC_709;
-	if (fmt->pixelformat == V4L2_PIX_FMT_P010)
-		f->fmt.pix.quantization = V4L2_QUANTIZATION_LIM_RANGE;
+	f->fmt.pix.quantization = V4L2_QUANTIZATION_LIM_RANGE;
 }
 
 static int isp_vidioc_get_format(struct file *file, void *fh,

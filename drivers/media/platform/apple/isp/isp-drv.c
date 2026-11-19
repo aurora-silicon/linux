@@ -17,6 +17,7 @@
 #include <linux/sizes.h>
 #include <linux/sort.h>
 #include <linux/suspend.h>
+#include <linux/sysfs.h>
 #include <linux/workqueue.h>
 
 #include "isp-cam.h"
@@ -285,6 +286,8 @@ static int apple_isp_copy_fw_data(struct apple_isp *isp)
  * trees from before those were described run it resident instead
  * (hw->resident_fallback), as it ran before.
  */
+#define ISP_T6041_NON_AMCC_MMIO	7
+
 static void apple_isp_select_hw(struct apple_isp *isp)
 {
 	struct device *dev = isp->dev;
@@ -295,6 +298,36 @@ static void apple_isp_select_hw(struct apple_isp *isp)
 
 	struct device_node *dart __free(device_node) =
 		of_parse_phandle(dev->of_node, "iommus", 0);
+
+	/*
+	 * apple,t6041-isp is also the T6040 ISP: T6040 has four AMCCs, T6041
+	 * six on binned parts and eight on full-die parts. Trim the mapped DSID
+	 * windows and broadcast-clear count to the AMCC ranges described on
+	 * isp_dart0. Without them, keep the four that every part has, as
+	 * before T6041's own windows were described.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t6041-isp")) {
+		unsigned int amccs = 4;
+		int n = dart ? of_property_count_u64_elems(dart, "apple,dapf-ranges") : -EINVAL;
+
+		if (n > 0 && !(n % 2)) {
+			unsigned int found = 0;
+
+			for (int i = 0; i < n; i += 2) {
+				u64 start = 0;
+
+				if (!of_property_read_u64_index(dart, "apple,dapf-ranges",
+								i, &start) &&
+				    start >= 0x220004000ULL && start <= 0x22e004000ULL &&
+				    !((start - 0x220004000ULL) % 0x2000000ULL))
+					found++;
+			}
+			if (found >= 4 && found <= 8)
+				amccs = found;
+		}
+		hw->dsid_count = amccs;
+		hw->num_fw_mmio = ISP_T6041_NON_AMCC_MMIO + amccs;
+	}
 
 	/*
 	 * Resident firmware that starts again (hw->fw_restart) runs from its own
@@ -1332,6 +1365,78 @@ static const struct apple_isp_hw apple_isp_hw_t6040 = {
 };
 
 /*
+ * T6041: the seven PMGR/PMP/fabric windows of J616c's dart-isp0 filter
+ * followed by up to eight AMCC DSID broadcast-clear windows (six on binned
+ * parts, eight on full-die parts; apple_isp_select_hw() trims to the active
+ * AMCCs listed on isp_dart0).
+ */
+static const struct isp_mmio_window apple_isp_fw_mmio_t6041[] = {
+	{ 0x485660000, 0x4000 },
+	{ 0x5003c0000, 0x28000 },	/* PMGR, with the PMP clock scratch */
+	{ 0x500e3c000, 0x4000 },
+	{ 0x502284000, 0x4000 },	/* PMGR, ISP power states */
+	{ 0x502880000, 0x8000 },
+	{ 0x504824000, 0x4000 },	/* PMP bandwidth scratch */
+	{ 0x51062c000, 0x20000 },
+	{ 0x220004000, 0x1d4000 },	/* DSID broadcast-clear windows */
+	{ 0x222004000, 0x1d4000 },
+	{ 0x224004000, 0x1d4000 },
+	{ 0x226004000, 0x1d4000 },
+	{ 0x228004000, 0x1d4000 },
+	{ 0x22a004000, 0x1d4000 },
+	{ 0x22c004000, 0x1d4000 },
+	{ 0x22e004000, 0x1d4000 },
+};
+
+static const u64 apple_isp_dsid_t6041[] = {
+	0x2201d4000,
+	0x2221d4000,
+	0x2241d4000,
+	0x2261d4000,
+	0x2281d4000,
+	0x22a1d4000,
+	0x22c1d4000,
+	0x22e1d4000,
+};
+
+static const struct apple_isp_hw apple_isp_hw_t6041 = {
+	.gen = ISP_GEN_T6040,
+	.fw_abi = ISP_FW_ABI_H17,
+	.pmu_base = 0x0,
+
+	.dsid_count = ARRAY_SIZE(apple_isp_dsid_t6041),
+	.dsid_slots = 8,
+	.dsid_clr_bases = apple_isp_dsid_t6041,
+	.dsid_clr_range0 = 0x2fc,
+
+	.clock_scratch = 0x5003d0fa8,
+	.clock_base = 0x0,
+	.clock_bit = 0x0,
+	.clock_size = 0x8,
+	.bandwidth_scratch = 0x504824000,
+	.bandwidth_base = 0x0,
+	.bandwidth_bit = 0x0,
+	.bandwidth_size = 0x8,
+	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
+
+	.scl1 = true,
+	.lpdp = false,
+	.meta_size = ISP_META_SIZE_T8140,
+	.fw_mmio = apple_isp_fw_mmio_t6041,
+	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t6041),
+
+	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.coproc_status = ISP_COPROC_STATUS_T8140,
+	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
+	.boot_mode = 1,
+	.shared_size = 0xde600000,
+	.resident_fw = true,
+	.fw_restart = true,
+	.fw_idle_ms = 5000,
+	.meta_exposure = true,
+};
+
+/*
  * T8132 runs T6040's coprocessor and firmware interface, booted the same
  * way. Its two AMCCs (ADT mcc amcc_aperture_count) give two broadcast-clear
  * windows, passed one per AMCC without padding slots. No PMP_CTRL_SET is
@@ -1519,7 +1624,7 @@ static const struct of_device_id apple_isp_of_match[] = {
 	{ .compatible = "apple,t6031-isp", .data = &apple_isp_hw_t6031 },
 	{ .compatible = "apple,t8140-isp", .data = &apple_isp_hw_t8140 },
 	{ .compatible = "apple,t8142-isp", .data = &apple_isp_hw_t8142 },
-	{ .compatible = "apple,t6041-isp", .data = &apple_isp_hw_t6040 },
+	{ .compatible = "apple,t6041-isp", .data = &apple_isp_hw_t6041 },
 	{ .compatible = "apple,t8132-isp", .data = &apple_isp_hw_t8132 },
 	{},
 };
@@ -1668,11 +1773,35 @@ static void apple_isp_shutdown(struct platform_device *pdev)
 	mutex_unlock(&isp->video_lock);
 }
 
+static ssize_t sensor_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct apple_isp *isp = dev_get_drvdata(dev);
+	const char *sensor;
+
+	if (!isp)
+		return -ENODATA;
+
+	sensor = apple_isp_sensor_name(isp);
+	if (!sensor)
+		return -ENODATA;
+
+	return sysfs_emit(buf, "%s\n", sensor);
+}
+static DEVICE_ATTR_RO(sensor);
+
+static struct attribute *apple_isp_attrs[] = {
+	&dev_attr_sensor.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(apple_isp);
+
 static struct platform_driver apple_isp_driver = {
 	.driver	= {
 		.name		= "apple-isp",
 		.of_match_table	= apple_isp_of_match,
 		.pm		= pm_ptr(&apple_isp_pm_ops),
+		.dev_groups	= apple_isp_groups,
 	},
 	.probe	= apple_isp_probe,
 	.remove	= apple_isp_remove,
