@@ -2217,6 +2217,15 @@ static int apple_dart_t8110_v2_unlock(struct apple_dart *dart)
 		return -EPERM;
 	if (!(readl(dart->regs + DART_T8110_DIAG_LOCK) & DART_T8110_DIAG_LOCK_ON_ERR))
 		return 0;
+	/*
+	 * A Gen3 DART's TLB command register serves translation queries and
+	 * cannot unlock it. Its streams stay stopped until the DART is reset.
+	 */
+	if (dart->hw->gen3) {
+		dev_err_ratelimited(dart->dev,
+				    "locked on error; a Gen3 DART is not unlocked\n");
+		return -EOPNOTSUPP;
+	}
 
 	/* Unlock after acknowledging a lock-on-error exception. */
 	__set_bit(0, stream_map.sidmap);
@@ -5678,11 +5687,16 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->irq = -1;
 	} else if (dart->hw->gen3) {
 		/*
-		 * The T8110 fault handler acknowledges through the TLB command
-		 * register, which a Gen3 DART uses for translation queries.
-		 * Leave its faults to the firmware for now.
+		 * Gen3 reports a fault like a v2 DART: the per-SID exception
+		 * bitmap and records, acknowledged by writing the bitmap back
+		 * (apple_dart_t8110_v2_irq()). Only the unlock after a
+		 * lock-on-error exception differs: see apple_dart_t8110_v2_unlock().
 		 */
-		dart->irq = -1;
+		dart->irq = platform_get_irq_optional(pdev, 0);
+		if (dart->irq == -ENXIO)
+			dart->irq = -1;
+		else if (dart->irq < 0)
+			return dart->irq;
 	} else if (dart->preserve_display || j713_radio) {
 		dart->irq = platform_get_irq_optional(pdev, 0);
 		if (dart->irq == -ENXIO)
