@@ -8,3 +8,4 @@ obj-$(CONFIG_APPLE_PMP_DRAM_KUNIT_TEST) += pmp-dram-test.o
 obj-$(CONFIG_APPLE_PMC)		+= pmc.o
 obj-$(CONFIG_APPLE_PMP_ANE_KUNIT_TEST) += pmp-ane-test.o
 obj-$(CONFIG_APPLE_PMP_J613_FLOOR_KUNIT_TEST) += pmp-j613-floor-gov-test.o
+obj-$(CONFIG_APPLE_PMGR_PWRSTATE)	+= pmgr-psd.o
