@@ -2,6 +2,7 @@
 #ifndef __ANE_H16_PROGRAM_H__
 #define __ANE_H16_PROGRAM_H__
 
+#include <linux/bitmap.h>
 #include <linux/refcount.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -30,6 +31,14 @@
 #define ANE_H16_UNLOAD_SIZE 0xc
 #define ANE_H16_GATE_SIZE 0xc
 #define ANE_H16_REPORT_MAX 0x100
+/*
+ * One program's LOAD and CREATE, which stay in the command arena while the
+ * program lives, in a record of their own. 128 records take 136 KiB of the
+ * 256 KiB arena and leave the rest to EXECUTE batches and teardown.
+ */
+#define ANE_H16_RECORD_SIZE (ALIGN(ANE_H16_LOAD_SIZE, ANE_FW_SLOT_SIZE) + \
+			     ALIGN(ANE_H16_CREATE_SIZE, ANE_FW_SLOT_SIZE))
+#define ANE_H16_RECORDS 128
 /* First value of the firmware mcache DSID pool (custom-BAR facts, 4). */
 #define ANE_H16_MCACHE_DSID 36
 
@@ -248,6 +257,8 @@ struct ane_h16_program {
 	struct list_head deferred;
 	/* Firmware boot the program was loaded in; an older one means lost. */
 	u64 epoch;
+	/* Its LOAD and CREATE record in the session's arena range, or -1. */
+	int record;
 	/* In the session's list of programs to replay after a cold boot. */
 	struct list_head node;
 };
@@ -368,11 +379,10 @@ struct ane_h16_session {
 	/* Reclaim a batch of command buffers only after its last caller ends. */
 	size_t execute_mark;
 	/*
-	 * Command arena position at a LOAD with no program alive in this
-	 * firmware boot: once none is again, every command above it is done.
+	 * Records in use in the transport's placed range (ane_h16_program
+	 * record), cleared when the firmware boots again.
 	 */
-	size_t pool_base;
-	bool pool_base_set;
+	DECLARE_BITMAP(records, ANE_H16_RECORDS);
 	/* Firmware log lines printed after the last failed EXECUTE. */
 	unsigned int fwlog_lines;
 	bool quarantined;
