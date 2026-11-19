@@ -1523,6 +1523,7 @@
 			operating-points-v2 = <&gpu_opp>;
 			apple,clpc = <&clpc>;
 			apple,pmp-report-entry = <&pmp_report_gfx>;
+			#cooling-cells = <2>;
 			status = "disabled";
 		};
 

@@ -46,6 +46,9 @@ pub(crate) enum QueueRegistration {
 /// The layouts and rules of one G17 firmware build.
 #[derive(Copy, Clone)]
 pub(crate) struct Variant {
+    /// Where the build takes the GPU's absolute power inputs, which the power-ceiling
+    /// cooling device writes ([`crate::g17::cooling`]); `None` where they are not described.
+    pub(crate) live_power: Option<crate::g17::cooling::Layout>,
     /// The initialization graph.
     pub(crate) graph: InitGraph,
     /// How the firmware acknowledges its initialization.
@@ -135,6 +138,7 @@ pub(crate) enum Firmware {
 
 /// The A18 Pro firmware (26A428).
 pub(crate) const V26A428: Variant = Variant {
+    live_power: Some(crate::g17::cooling::Layout::Common),
     graph: InitGraph::G17P,
     init_ack: InitAck::Message,
     power_on_done: true,
@@ -165,6 +169,7 @@ pub(crate) const V26A428: Variant = Variant {
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
 pub(crate) const V25G83: Variant = Variant {
+    live_power: Some(crate::g17::cooling::Layout::Common),
     graph: InitGraph::V25G83,
     init_ack: InitAck::Status,
     // Never sent on the M4 Pro: the firmware has retired its opening record when it accepts
@@ -206,6 +211,9 @@ pub(crate) const V25G83: Variant = Variant {
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
 /// command set).
 pub(crate) const V26A428_M5: Variant = Variant {
+    // The M5 firmware takes its host power budget at Region C +0x88, not +0x84, and the M5
+    // session never releases its storage; the M5 governor (g17/thermal.rs) owns that word.
+    live_power: None,
     m5_commands: true,
     // Not measured on the M5 firmware.
     traversal_exclusion: false,
@@ -217,6 +225,9 @@ pub(crate) const V26A428_M5: Variant = Variant {
 };
 
 pub(crate) const V25F84: Variant = Variant {
+    // The power inputs of this build have not been described: its PowerState is not the
+    // 25G83 one. A GPU the device tree makes a cooling device refuses to start on it.
+    live_power: None,
     qid_floor: 0,
     registration: QueueRegistration::Mailbox,
     compute: super::compute::ComputeProgram::V25F84,

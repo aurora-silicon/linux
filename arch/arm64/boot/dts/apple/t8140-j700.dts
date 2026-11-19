@@ -12,6 +12,84 @@
 #include "t8140.dtsi"
 #include <dt-bindings/thermal/thermal.h>
 
+/*
+ * GPU die zones.  The SMC publishes eight GPU die temperatures (channels
+ * 83-90 of smc_hwmon below); each gets a zone, so whichever is hottest
+ * sets the GPU's power ceiling (the deepest state any zone asks for wins).
+ *
+ * Under a sustained GPU load macOS lets the hottest GPU key reach about
+ * 107.7 C, then holds it at 104.5-106.3 C (mean 105.5 C) with the GPU
+ * drawing 4.3-4.7 W, down from 6.0 W.  Without a host ceiling Linux sits
+ * at 107.6 C, where the firmware's own die limiter holds it.  The ladder
+ * below steps the GPU's absolute power ceiling (state N = 100 - N percent
+ * of its initialized maximum power) from 102 C on, so the ceiling lands
+ * in the 4.3-4.7 W band near 104 C, and reaches the actuator's floor at
+ * 106 C.  The zones are active-trip ladders: the power allocator runs
+ * them bang-bang, like a fan curve, since the GPU is not a power actor.
+ *
+ * The GPU keys read placeholders while the GPU is powered down; the SMC
+ * driver reports those as no data, and the zones skip those updates.  No
+ * critical trip: the firmware's die limiter and the SMC keep their own
+ * overtemperature protection, and the CPU zones keep theirs.
+ */
+#define J700_GPU_ZONE(node, n, ch)						\
+	node {									\
+		polling-delay-passive = <500>;				\
+		polling-delay = <500>;					\
+		thermal-sensors = <&smc_hwmon ch>;			\
+									\
+		trips {							\
+			gpu##n##_cap0: trip-cap0 {			\
+				temperature = <102000>;			\
+				hysteresis = <1500>;			\
+				type = "active";			\
+			};						\
+			gpu##n##_cap1: trip-cap1 {			\
+				temperature = <103000>;			\
+				hysteresis = <1500>;			\
+				type = "active";			\
+			};						\
+			gpu##n##_cap2: trip-cap2 {			\
+				temperature = <104000>;			\
+				hysteresis = <1500>;			\
+				type = "active";			\
+			};						\
+			gpu##n##_cap3: trip-cap3 {			\
+				temperature = <105000>;			\
+				hysteresis = <1500>;			\
+				type = "active";			\
+			};						\
+			gpu##n##_cap4: trip-cap4 {			\
+				temperature = <106000>;			\
+				hysteresis = <1500>;			\
+				type = "active";			\
+			};						\
+		};							\
+									\
+		cooling-maps {						\
+			map0 {						\
+				trip = <&gpu##n##_cap0>;		\
+				cooling-device = <&gpu 40 40>;		\
+			};						\
+			map1 {						\
+				trip = <&gpu##n##_cap1>;		\
+				cooling-device = <&gpu 48 48>;		\
+			};						\
+			map2 {						\
+				trip = <&gpu##n##_cap2>;		\
+				cooling-device = <&gpu 55 55>;		\
+			};						\
+			map3 {						\
+				trip = <&gpu##n##_cap3>;		\
+				cooling-device = <&gpu 62 62>;		\
+			};						\
+			map4 {						\
+				trip = <&gpu##n##_cap4>;		\
+				cooling-device = <&gpu 75 75>;		\
+			};						\
+		};							\
+	}
+
 / {
 	compatible = "apple,j700", "apple,t8140", "apple,arm-platform";
 	model = "Apple MacBook Neo";
@@ -87,7 +165,8 @@
 	};
 
 	/*
-	 * The J700 is fanless: the CPUs are the only cooling devices.  Every
+	 * The J700 is fanless: the CPUs and the GPU are the only cooling
+	 * devices.  The GPU zones follow the CPU ones.  Every CPU
 	 * die sensor gets a zone that throttles both clusters, since they share
 	 * one die and one heat spreader.  The power allocator splits the budget
 	 * by the energy models, with the E cluster weighted three to one: its
@@ -405,6 +484,15 @@
 				};
 			};
 		};
+
+		J700_GPU_ZONE(gpu0-thermal, gpu0, 83);	/* Tg04 */
+		J700_GPU_ZONE(gpu1-thermal, gpu1, 84);	/* Tg05 */
+		J700_GPU_ZONE(gpu2-thermal, gpu2, 85);	/* Tg0C */
+		J700_GPU_ZONE(gpu3-thermal, gpu3, 86);	/* Tg0D */
+		J700_GPU_ZONE(gpu4-thermal, gpu4, 87);	/* Tg0K */
+		J700_GPU_ZONE(gpu5-thermal, gpu5, 88);	/* Tg0L */
+		J700_GPU_ZONE(gpu6-thermal, gpu6, 89);	/* Tg0d */
+		J700_GPU_ZONE(gpu7-thermal, gpu7, 90);	/* Tg0e */
 	};
 
 	/*
