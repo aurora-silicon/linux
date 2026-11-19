@@ -530,6 +530,9 @@ impl Inner {
     fn publish_mixed(&mut self,entries:&[(Arc<crate::m3::m3_submit::Packet>,usize)],
         base:usize,overlap:bool)->core::result::Result<Batch,(Error,bool)> {
         let early=|e:Error|(e,false);
+        // A firmware ABI gate, not a GPU generation one: the two-engine prefix was measured on
+        // the T6030 firmware's idle queues. This runtime starts only on T8122 (m3_soc::SOCS),
+        // whose Legacy and Extended firmware were not shown to take it, so it stays off there.
         if overlap || base!=0 || self.device.soc().chip_id!=0x6030
             || !self.render_initialized || entries.len()>policy::SLOTS {return Err(early(EINVAL));}
         let packet=&entries[0].0;
@@ -1273,6 +1276,7 @@ impl Runtime {
         let inner: &mut Inner = &mut *self.inner;
         inner.config.drain(&inner.drm)?;
         inner.config.log_ready(&inner.drm)?;
+        // The debug word sits in the T6030 firmware's Globals layout (m3_globals_debug).
         if inner.device.soc().chip_id==0x6030 &&
             (crate::m3::m3_params::active_power() || crate::m3::m3_params::globals_debug_off()) {
             inner.config.log_globals_debug(&inner.drm)?;
