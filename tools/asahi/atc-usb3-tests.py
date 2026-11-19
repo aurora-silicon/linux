@@ -624,7 +624,7 @@ int main(void) {
 def generation_scope(source, root):
     """Resolve real DT fallback compatibles through the driver's actual match table."""
     tables = {}
-    for name in ("t8103", "t8122", "t6030", "t8140", "t8142"):
+    for name in ("t8103", "t6000", "t6020", "t8122", "t6030", "t8140", "t8142"):
         text = block(source, "static const struct atcphy_hw atcphy_hw_" + name + " =")
         tables["atcphy_hw_" + name] = re.search(r"\.gen\s*=\s*(ATCPHY_GENERATION_\w+)", text).group(1)
     matches = dict(re.findall(r'\.compatible\s*=\s*"([^"]+)"\s*,\s*\.data\s*=\s*&([a-zA-Z0-9_]+)', source))

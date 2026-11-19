@@ -680,6 +680,15 @@ struct apple_atcphy;
  * @aciophy_lane_mode: Lane mode register offset
  * @aciophy_crossbar: Crossbar register offset
  * @has_usb4: A USB4/Thunderbolt controller sits behind the PHY
+ * @tunnel_t8103_clock: DP tunnels are clocked by the T8103 sequence: one
+ *                      AUSPLL pixel clock (PCLK1) feeds both DP IN adapters,
+ *                      see atc_tunnel_start_t8103(); the T8103, T8112 and T600x
+ *                      PHYs. Without it, and without @t8122_tunnel_clock, each
+ *                      DP IN has its own clock (atc_tunnel_set_t602x())
+ * @tunnel_dprx_clock: With @tunnel_t8103_clock, the tunnel also runs PCLK2 and
+ *                     the DP IN (DPRX) clock at the same rate, and the clock
+ *                     path is woken before the first rate request
+ *                     (apple_atc_dp_tunnel_open()): the T600x PHY
  * @usb2_only: Uses the USB2 subset unless its banked SuperSpeed resources exist
  * @usb2phy_sig_host: Host role field mask, or zero for the original layout
  * @pipe_mux_clk: PIPE clock selection field mask
@@ -714,6 +723,8 @@ struct atcphy_hw {
 	int aciophy_lane_mode;
 	int aciophy_crossbar;
 	bool has_usb4;
+	bool tunnel_t8103_clock;
+	bool tunnel_dprx_clock;
 	bool usb2_only;
 	u32 usb2phy_sig_host;
 	u32 pipe_mux_clk;
@@ -2901,13 +2912,6 @@ static void atcphy_configure_post_tunable_all_modes(struct apple_atcphy *atcphy,
  * without touching the lane mux. Based on Oliver Lukschander's t6020 tunnel
  * clock patch (asahi-j416s-display).
  */
-/* t600x (M1 Pro/Max) has the t8103 generation ATC. */
-static bool apple_atc_tunnel_is_t600x(void)
-{
-	return of_machine_is_compatible("apple,t6000") ||
-	       of_machine_is_compatible("apple,t6001");
-}
-
 /*
  * Stop the tunnel pixel clock: switch the AUSPLL output drivers off and send
  * APB command 3. TX_DP_CTRL0, the sleep overrides and the
@@ -3139,7 +3143,7 @@ static void atc_tunnel_pclk_t8103(struct apple_atcphy *atcphy, u32 selector)
 {
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N);
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N_OV);
-	if (apple_atc_tunnel_is_t600x()) {
+	if (atcphy->hw->tunnel_dprx_clock) {
 		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPRX_PCLK_ENABLE);
 		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK2_ENABLE);
 		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPRX_PCLK_SELECT,
@@ -5002,13 +5006,13 @@ static const struct phy_ops apple_atc_dp_phy_ops = {
  * Thunderbolt DP IN adapter @dpin (rate is the DP link rate code, 0 = stop).
  */
 /*
- * t600x (M1 Pro/Max) and t8112 (M2, whose ATC PHY is t8103-compatible) run
- * the t8103 tunnel clock sequence unchanged.
+ * The T8103-generation PHYs of T8103, T8112 (M2) and T600x (M1 Pro/Max/Ultra)
+ * run the T8103 tunnel clock sequence; the T6020 PHY, of the same generation,
+ * has a clock per DP IN. The PHY's match data says which (tunnel_t8103_clock).
  */
-static bool apple_atc_tunnel_is_t8103_style(void)
+static bool apple_atc_tunnel_is_t8103_style(const struct apple_atcphy *atcphy)
 {
-	return of_machine_is_compatible("apple,t8103") ||
-	       of_machine_is_compatible("apple,t8112") || apple_atc_tunnel_is_t600x();
+	return atcphy->hw->tunnel_t8103_clock;
 }
 
 int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
@@ -5125,7 +5129,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 	 */
 	if (apple_atc_tunnel_t8122_clock(atcphy))
 		return apple_atc_dp_tunnel_rate_source(phy, 0, dpin, rate);
-	if (!apple_atc_tunnel_is_t8103_style()) {
+	if (!apple_atc_tunnel_is_t8103_style(atcphy)) {
 		bool valid_core = apple_atc_t602x_core_valid(atcphy->np, atcphy->res.core->start,
 							     resource_size(atcphy->res.core));
 
@@ -5136,7 +5140,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 	}
 	guard(mutex)(&atcphy->lock);
 	if (!rate) {
-		if (apple_atc_tunnel_is_t8103_style()) {
+		if (apple_atc_tunnel_is_t8103_style(atcphy)) {
 			/*
 			 * One pixel clock feeds both DP IN adapters: a stream
 			 * that ends must not stop the other one's clock.
@@ -5151,7 +5155,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 	}
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
 		return -EBUSY;
-	if (apple_atc_tunnel_is_t8103_style()) {
+	if (apple_atc_tunnel_is_t8103_style(atcphy)) {
 		ret = atc_tunnel_start_t8103(atcphy, rate);
 		if (!ret)
 			atcphy->tunnel_users |= BIT(dpin);
@@ -5173,15 +5177,16 @@ int apple_atc_dp_tunnel_open(struct phy *phy)
 	if (!phy)
 		return -EINVAL;
 	/*
-	 * Everything but t600x has nothing to open, whichever driver provides
-	 * the PHY: T6050's tunnel clocks belong to atc-t6050-dp.c, whose PHY
-	 * this driver does not know, and start from the link rate alone.
+	 * Only a PHY with the DPRX tunnel clock (T600x) has something to open.
+	 * Others, whichever driver provides them, start from the link rate
+	 * alone: T6050's tunnel clocks belong to atc-t6050-dp.c, whose PHY this
+	 * driver does not know.
 	 */
-	if (!apple_atc_tunnel_is_t600x())
-		return -EOPNOTSUPP;
 	if (phy->ops != &apple_atc_dp_phy_ops)
-		return -EINVAL;
+		return -EOPNOTSUPP;
 	atcphy = phy_get_drvdata(phy);
+	if (!atcphy->hw->tunnel_dprx_clock)
+		return -EOPNOTSUPP;
 	guard(mutex)(&atcphy->lock);
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
 		return -EBUSY;
@@ -7928,7 +7933,35 @@ static const struct dev_pm_ops atcphy_pm_ops = {
 	NOIRQ_SYSTEM_SLEEP_PM_OPS(atcphy_suspend_noirq, atcphy_resume_noirq)
 };
 
+/* T8103, and T8112 through its fallback compatible. */
 static const struct atcphy_hw atcphy_hw_t8103 = {
+	.gen = ATCPHY_GENERATION_T8103,
+	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8103,
+	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8103,
+	.configure_post_tunable = atcphy_configure_post_tunable_t8103,
+	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
+	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
+	.has_usb4 = true,
+	.tunnel_t8103_clock = true,
+	.park_pipe_unlocked = true,
+};
+
+/* T600x: the T8103 PHY, whose tunnels also run PCLK2 and the DPRX clock. */
+static const struct atcphy_hw atcphy_hw_t6000 = {
+	.gen = ATCPHY_GENERATION_T8103,
+	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8103,
+	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8103,
+	.configure_post_tunable = atcphy_configure_post_tunable_t8103,
+	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
+	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
+	.has_usb4 = true,
+	.tunnel_t8103_clock = true,
+	.tunnel_dprx_clock = true,
+	.park_pipe_unlocked = true,
+};
+
+/* T602x: the T8103 PHY, with a tunnel clock per DP IN. */
+static const struct atcphy_hw atcphy_hw_t6020 = {
 	.gen = ATCPHY_GENERATION_T8103,
 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8103,
 	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8103,
@@ -8011,6 +8044,8 @@ static const struct atcphy_hw atcphy_hw_t8142 = {
 
 static const struct of_device_id atcphy_match[] = {
 	{ .compatible = "apple,t8103-atcphy", .data = &atcphy_hw_t8103 },
+	{ .compatible = "apple,t6000-atcphy", .data = &atcphy_hw_t6000 },
+	{ .compatible = "apple,t6020-atcphy", .data = &atcphy_hw_t6020 },
 	{ .compatible = "apple,t6030-atcphy", .data = &atcphy_hw_t6030 },
 	{ .compatible = "apple,t8122-atcphy", .data = &atcphy_hw_t8122 },
 	{ .compatible = "apple,t8132-atcphy", .data = &atcphy_hw_t8132 },
