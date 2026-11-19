@@ -1154,6 +1154,17 @@ MODULE_PARM_DESC(untested_commit,
 		 "Untested SoC: let a deep sleep through to the commit (else a dry run that refuses)");
 
 /*
+ * Untested SoCs, with untested_commit=1: every step up to the commit word runs, the stops
+ * included, and the boot core then holds without writing it. Nothing returns from there: the
+ * coprocessors are stopped and the clusters armed off, so the machine is reset from outside.
+ * For a trial booted from RAM, to show the whole entry completes before a commit is tried.
+ */
+static bool sleep_untested_hold;
+module_param_named(untested_hold, sleep_untested_hold, bool, 0644);
+MODULE_PARM_DESC(untested_hold,
+		 "Untested SoC: stop at the last step before the commit word and hold there until a reset");
+
+/*
  * This sleep stops before the commit. A SoC with early_context has drivers that act on the
  * answer in their .suspend, so it is the one .begin latched: the switch can't change under a
  * sleep. The common entry reads the switch where it stops, as before.
@@ -2333,18 +2344,27 @@ static bool t8142_el1_wfi_here(void)
 	return mode >= 2 || (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) == READ_ONCE(t8142_boot_mpidr);
 }
 
+/*
+ * A core's own FIQ sources quiet before its last WFI: the EL1 timer pair a VHE kernel doesn't
+ * reach through cntp/cntv_ctl_el0, and the core PMU. T8142 by default (m5_quiet); T8122 when
+ * its trial asks.
+ */
+static void sleep_core_fiq_quiet(void)
+{
+	if (is_kernel_in_hyp_mode()) {
+		write_sysreg_s(ARCH_TIMER_CTRL_IT_MASK, SYS_CNTP_CTL_EL02);
+		write_sysreg_s(ARCH_TIMER_CTRL_IT_MASK, SYS_CNTV_CTL_EL02);
+	}
+	write_sysreg_s(0, T8142_PMCR0);
+	isb();
+}
+
 static void t8142_deep_wfi_arm(void)
 {
 	if (READ_ONCE(sleep_m5_pwrdn) && is_kernel_in_hyp_mode())
 		sysreg_clear_set_s(SLEEP_M5_C1_6, 0, SLEEP_M5_C1_6_PWRDN);
-	if (READ_ONCE(sleep_m5_quiet)) {
-		if (is_kernel_in_hyp_mode()) {
-			write_sysreg_s(ARCH_TIMER_CTRL_IT_MASK, SYS_CNTP_CTL_EL02);
-			write_sysreg_s(ARCH_TIMER_CTRL_IT_MASK, SYS_CNTV_CTL_EL02);
-		}
-		write_sysreg_s(0, T8142_PMCR0);
-		isb();
-	}
+	if (READ_ONCE(sleep_m5_quiet))
+		sleep_core_fiq_quiet();
 	t8142_ed_release();
 	t8140_deep_wfi_arm();
 	if (t8142_el1_wfi_here()) {
@@ -5466,6 +5486,11 @@ static int apple_sleep_commit(unsigned long unused)
 	if (s->soc->ops->pre_commit)
 		s->soc->ops->pre_commit(s);
 	dsb(sy);
+
+	/* The hold: everything before the commit word has run, and it is never written. */
+	if (s->soc->untested && READ_ONCE(sleep_untested_hold))
+		for (;;)
+			cpu_relax();
 
 	writel(1, s->commit);
 
