@@ -12,6 +12,7 @@ export ARCH=arm64 LLVM=1
 mkdir -p "$W"
 warnings() { # rev tag
 	local t=$W/src-$2 o=$W/out-$2
+	rm -f "$W/$2.warn"
 	git worktree add -q --detach "$t" "$1" || return 1
 	make -s -C "$t" O="$o" defconfig >/dev/null || return 1
 	local dtbs; dtbs=$(cd "$t/arch/arm64/boot/dts" && ls apple/*.dts | sed 's/dts$/dtb/')
@@ -24,12 +25,18 @@ warnings() { # rev tag
 	echo "$2: make rc=$rc, $(wc -l < "$W/$2.warn") warning lines, $(echo $dtbs | wc -w) DTBs"
 	return $rc
 }
+fail=0
 warnings "$BASE" base || echo "base build failed (its warnings still count)"
+if [ ! -f "$W/base.warn" ]; then
+	# No list to compare against: every HEAD warning counts as new.
+	echo "BASE $BASE could not be checked out or configured"
+	: > "$W/base.warn"
+	fail=1
+fi
 warnings "$HEAD" head; hrc=$?
 comm -13 "$W/base.warn" "$W/head.warn" > "$W/new.warn"
 comm -23 "$W/base.warn" "$W/head.warn" > "$W/gone.warn"
 echo "new warnings: $(wc -l < "$W/new.warn"), removed: $(wc -l < "$W/gone.warn")"
-fail=0
 [ $hrc = 0 ] || { echo "HEAD device trees do not build"; fail=1; }
 if [ -s "$W/new.warn" ]; then echo "--- new CHECK_DTBS warnings"; cat "$W/new.warn"; fail=1; fi
 b=$(git diff --name-only --diff-filter=AM "$BASE" "$HEAD" -- 'Documentation/devicetree/bindings/*.yaml')
