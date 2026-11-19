@@ -1545,6 +1545,11 @@ static void t6040_gp_pcie_clk(struct t6040_sleep *s)
 	u32 val;
 	int i;
 
+	s->gp_clk_timeouts = 0;
+	/* The port blocks answer only with GP and SYS_GP on. */
+	if (FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_APCIE_GP)) != PS_ACTIVE ||
+	    FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_APCIE_SYS_GP)) != PS_ACTIVE)
+		return;
 	for (i = 0; i < ARRAY_SIZE(s->gp_port); i++) {
 		void __iomem *phy = s->gp_phy[i], *port = s->gp_port[i];
 		u32 cfg, app;
@@ -2004,8 +2009,7 @@ static void t6040_sleep_map_gp(struct t6040_sleep *s)
 	host = of_find_compatible_node(NULL, NULL, "apple,t6041-pcie");
 	if (!host)
 		return;
-	if (!of_device_is_available(host))
-		goto out;
+	/* Also with the host disabled: its port blocks hold DARTs that stay bound. */
 	for (p = 0; p < ARRAY_SIZE(s->gp_port); p++) {
 		idx = of_property_match_string(host, "reg-names", ports[p]);
 		if (idx >= 0 && !of_address_to_resource(host, idx, &res))
@@ -2014,6 +2018,9 @@ static void t6040_sleep_map_gp(struct t6040_sleep *s)
 		if (idx >= 0 && !of_address_to_resource(host, idx, &res))
 			s->gp_phy[p] = t6040_ioremap_np(s->dev, res.start, resource_size(&res));
 	}
+	/* Its endpoints' PERST# pins only for a host Linux runs. */
+	if (!of_device_is_available(host))
+		goto out;
 	for_each_available_child_of_node(host, child) {
 		struct of_phandle_args args;
 		u32 reg[1];
