@@ -1680,8 +1680,7 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 		return dev_err_probe(hwmon->dev, PTR_ERR(hwmon->hwmon_dev),
 				     "Probing SMC hwmon device failed\n");
 
-	if (macsmc_hwmon_is_m3() || of_machine_is_compatible("apple,t6050"))
-		macsmc_hwmon_debugfs_init(hwmon);
+	macsmc_hwmon_debugfs_init(hwmon);
 
 	ret = macsmc_hwmon_die_register(hwmon);
 	if (ret)
