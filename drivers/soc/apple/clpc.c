@@ -104,8 +104,6 @@ enum apple_clpc_rail {
  *	of @map
  * @low_power_khz: CPU frequency ceiling of the low-power platform profile,
  *	taken up to the next table frequency; 0 for no platform profile
- * @low_power_machine: the machine compatible @low_power_khz was read for; SoCs
- *	sharing this CLPC without it get no low-power profile. NULL for any
  * @low_power_mw: package power (the SMC's PHPC key) the low-power profile
  *	holds the CPU clusters to; 0 for none
  * @high_power_machine: the machine compatible on which the performance
@@ -128,7 +126,6 @@ struct apple_clpc_hw {
 	unsigned int ane_cluster_khz;
 	const char *ane_cluster_machine;
 	unsigned int low_power_khz;
-	const char *low_power_machine;
 	unsigned int low_power_mw;
 	const char *high_power_machine;
 };
@@ -234,8 +231,6 @@ struct apple_clpc {
 	/* The platform profile and, for its power target, the SMC */
 	enum platform_profile_option profile;
 	bool low_power;
-	/* hw->low_power_khz where it applies to this machine, else 0 */
-	unsigned int low_power_khz;
 	struct device_node *smc_np;
 	struct apple_smc *smc;
 	/* The performance profile is sent to the SMC as High Power mode */
@@ -309,7 +304,8 @@ int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
 	}
 	if (!np)
 		return of_find_property(dev->of_node, "apple,clpc", NULL) ? -EINVAL : 0;
-	if (!of_device_is_compatible(np, "apple,t6041-clpc") &&
+	if (!of_device_is_compatible(np, "apple,t6041-max-clpc") &&
+	    !of_device_is_compatible(np, "apple,t6041-clpc") &&
 	    !of_device_is_compatible(np, "apple,t6050-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8132-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8140-clpc") &&
@@ -399,6 +395,7 @@ EXPORT_SYMBOL_GPL(apple_clpc_ane_put);
 
 /* SoCs whose CLPC takes ANE input; each SoC has exactly one CLPC. */
 static const struct of_device_id apple_clpc_ane_providers[] = {
+	{ .compatible = "apple,t6041-max-clpc" },
 	{ .compatible = "apple,t6041-clpc" },
 	{ .compatible = "apple,t8140-clpc" },
 	{}
@@ -854,7 +851,7 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 	unsigned int i, khz, pick_khz = 0;
 	int mw, step = 0, pick = -1;
 
-	if (!clpc->low_power_khz || time_before(jiffies, clpc->power_next))
+	if (!clpc->hw->low_power_khz || time_before(jiffies, clpc->power_next))
 		return;
 	clpc->power_next = jiffies + msecs_to_jiffies(APPLE_CLPC_POWER_MS);
 	if (low && clpc->hw->low_power_mw) {
@@ -881,8 +878,9 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 					 FREQ_QOS_MAX_DEFAULT_VALUE) < 0)
 			clpc->update_errors++;
 		/* The top: the first table frequency at or above hw->low_power_khz */
-		cl->top_khz = apple_clpc_step_khz(policy[i], clpc->low_power_khz - 1, true);
-		if (cl->top_khz < clpc->low_power_khz)
+		cl->top_khz = apple_clpc_step_khz(policy[i],
+						  clpc->hw->low_power_khz - 1, true);
+		if (cl->top_khz < clpc->hw->low_power_khz)
 			cl->top_khz = policy[i]->cpuinfo.max_freq;
 		if (!low)
 			cl->max_khz = 0;
@@ -1051,7 +1049,7 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 	}
 	seq_printf(s, "samples: %lu update errors: %lu\n", clpc->samples,
 		   clpc->update_errors);
-	if (clpc->low_power_khz) {
+	if (clpc->hw->low_power_khz) {
 		seq_printf(s, "profile: %s power %d mW (%lu new of %lu readings) ceilings (kHz):",
 			   clpc->profile == PLATFORM_PROFILE_LOW_POWER ? "low-power" :
 			   clpc->profile == PLATFORM_PROFILE_PERFORMANCE ? "performance" :
@@ -1491,9 +1489,7 @@ static int apple_clpc_probe(struct platform_device *pdev)
 
 	clpc->profile = PLATFORM_PROFILE_BALANCED;
 	clpc->power_next = jiffies;
-	if (!clpc->hw->low_power_machine || of_machine_is_compatible(clpc->hw->low_power_machine))
-		clpc->low_power_khz = clpc->hw->low_power_khz;
-	if (clpc->low_power_khz && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
+	if (clpc->hw->low_power_khz && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
 		struct device *ppdev;
 
 		/* The SMC is optional: without it the low-power profile has only its ceiling. */
@@ -1650,14 +1646,33 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.ane_cluster = 2,
 	.ane_cluster_khz = 3756000,
 	.ane_cluster_machine = "apple,t6040",
-	/*
-	 * The M4 Max's ADT has macOS's Low Power mode CPU ceiling,
-	 * cpu-low-power-frequency-max = 2808 MHz, as T6050's does. macOS's package
-	 * target in that mode is not measured here, so the profile has the
-	 * ceiling only. The M4 Pro's value is not checked: not for it yet.
-	 */
+};
+
+/*
+ * T6041 (M4 Max): DCS states 0-5 on rail 0, fabric states 0-3 on rail 1.
+ * Unlike M4 Pro (4 AMCCs, 256-bit LPDDR5X-8533, fabric states 0-2), M4 Max's
+ * 6/8-AMCC 384/512-bit LPDDR5X-8533 memory subsystem adds fabric state 3
+ * (VOVD; ADT clpc fabric-mem-separation-max = 3) to sustain full 410/546 GB/s
+ * bandwidth, and macOS 27.2.1 votes DCS 5 and fabric 3 immediately for active
+ * CPU demand without a busy-sample streak (as on T8132), raising 12-thread
+ * CPU DRAM reads on J616c from ~256 GB/s at fabric 2 to ~297 GB/s.
+ *
+ * G17 GPU demand uses the same host publication/idle input as T6040 and
+ * holds DCS 5 / fabric 3 while GPU work is in flight (~230 GB/s vs ~43 GB/s
+ * at state 0 on J616c). ANE demand preserves T6041's DCS 5 / fabric 2 floor,
+ * and the ADT's cpu-low-power-frequency-max = 2808 MHz supplies the Low
+ * Power platform profile ceiling (package power target not yet measured).
+ */
+static const struct apple_clpc_hw apple_clpc_hw_t6041 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 5, 5, 5, 5 },
+		[APPLE_CLPC_SOC] = { 3, 3, 3, 3 },
+	},
+	.gpu_demand = false,
+	.gpu_input = true,
+	.ane = { [APPLE_CLPC_DCS] = 5, [APPLE_CLPC_SOC] = 2 },
 	.low_power_khz = 2808000,
-	.low_power_machine = "apple,t6041",
 };
 
 /*
@@ -1831,6 +1846,48 @@ static void apple_clpc_t8132_gpu_input_test(struct kunit *test)
 	apple_clpc_gpu_put(gpu);
 }
 
+static void apple_clpc_t6041_policy_test(struct kunit *test)
+{
+	struct apple_clpc *clpc = kunit_kzalloc(test, sizeof(*clpc), GFP_KERNEL);
+	struct apple_clpc_gpu *gpu = kzalloc_obj(*gpu);
+	unsigned int demand[APPLE_CLPC_RAILS] = {};
+	struct apple_clpc_ane ane = {};
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, clpc);
+	KUNIT_ASSERT_NOT_NULL(test, gpu);
+	kref_init(&gpu->ref);
+	spin_lock_init(&gpu->lock);
+	spin_lock_init(&ane.lock);
+
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6041.sustain, 0u);
+	KUNIT_EXPECT_FALSE(test, apple_clpc_hw_t6041.gpu_demand);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_hw_t6041.gpu_input);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6041.low_power_khz, 2808000u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.low_power_khz, 0u);
+	for (i = 0; i < APPLE_CLPC_LEVELS; i++) {
+		KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6041.map[APPLE_CLPC_DCS][i], 5);
+		KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6041.map[APPLE_CLPC_SOC][i], 3);
+	}
+
+	clpc->hw = &apple_clpc_hw_t6041;
+	clpc->ane = &ane;
+	clpc->ane_states[APPLE_CLPC_DCS] = clpc->hw->ane[APPLE_CLPC_DCS];
+	clpc->ane_states[APPLE_CLPC_SOC] = clpc->hw->ane[APPLE_CLPC_SOC];
+
+	apple_clpc_ane_set_active(&ane, true);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_ane_input_demand(clpc, demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 5u);
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 2u);
+
+	apple_clpc_gpu_set_active(gpu, true);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_gpu_input_demand(&apple_clpc_hw_t6041,
+							    gpu, demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 5u);
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 3u);
+	apple_clpc_gpu_put(gpu);
+}
+
 static void apple_clpc_ane_demand_hold_test(struct kunit *test)
 {
 	struct apple_clpc_ane ane = {};
@@ -1972,6 +2029,7 @@ static struct kunit_case apple_clpc_cases[] = {
 	KUNIT_CASE(apple_clpc_ane_no_provider_test),
 	KUNIT_CASE(apple_clpc_ane_wake_removal_test),
 	KUNIT_CASE(apple_clpc_t8132_gpu_input_test),
+	KUNIT_CASE(apple_clpc_t6041_policy_test),
 	KUNIT_CASE(apple_clpc_gpu_dense_test),
 	KUNIT_CASE(apple_clpc_gpu_cold_wake_test),
 	KUNIT_CASE(apple_clpc_gpu_request_lifetime_test),
@@ -2042,6 +2100,7 @@ static const struct of_device_id apple_clpc_of_match[] = {
 	{ .compatible = "apple,t8140-clpc", .data = &apple_clpc_hw_t8140 },
 	{ .compatible = "apple,t8142-clpc", .data = &apple_clpc_hw_t8142 },
 	{ .compatible = "apple,t8152-clpc", .data = &apple_clpc_hw_t8152 },
+	{ .compatible = "apple,t6041-max-clpc", .data = &apple_clpc_hw_t6041 },
 	{ .compatible = "apple,t6041-clpc", .data = &apple_clpc_hw_t6040 },
 	{}
 };
