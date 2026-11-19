@@ -438,6 +438,8 @@ struct apple_dpin_binding;
  * @sram_res: ACIO co-processor SRAM resource
  * @sram_base: ACIO co-processor SRAM
  * @reset: ACIO reset controller
+ * @start_retried: Starts since probe whose CIO reset deassert timed out at
+ *	least once before it succeeded
  * @pd_list: Power domains used by the ACIO complex
  * @lock: Serializes cable transitions and ACIO power changes
  * @current_cable_info: Cable information currently programmed into ACIO
@@ -495,7 +497,7 @@ struct apple_cio {
 	bool resume_link_pending; /* set by NHI resume, consumed by ACIO complete */
 	struct delayed_work link_lost_work;
 	unsigned int start_gen; /* protected by lock: bumped by every start */
-	unsigned int start_retried; /* protected by lock: starts whose CIO reset timed out first */
+	unsigned int start_retried; /* protected by lock */
 	unsigned int link_lost_gen; /* start_gen when the peer went away */
 	unsigned int link_lost_cycles; /* protected by lock */
 	u64 link_lost_cycle_activity; /* remote activity at the last cycle */
