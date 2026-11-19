@@ -146,54 +146,31 @@
 			local-bd-address = [00 00 00 00 00 00];
 		};
 	};
+};
 
-	port01: pci@1,0 {
-		device_type = "pci";
-		reg = <0x800 0 0 0 0>;
-		bus-range = <2 2>;
-		/* Down at boot: the kernel trains it, powering the reader first */
-		apple,link-trained-by-bootloader;
-		pwren-gpios = <&smc_pcio 0 GPIO_ACTIVE_HIGH>;
-		/* PERST#: ADT pci-bridge1 function-perst, GPIO 81 */
-		reset-gpios = <&pinctrl_ap 81 GPIO_ACTIVE_LOW>;
-		apple,apcie-config-tunables = <0x140 4 0x1 0x1>,
-			<0x144 4 0xffffff 0x253770>,
-			<0x8a8 4 0x1 0x1>,
-			<0x8ac 4 0x1 0x1>;
-		apple,pcie-rc-tunables = <0x78 4 0x7000 0x0>,
-			<0x194 4 0x2 0x2>,
-			<0xb80 4 0x7f3f3f 0x7f1e1e>,
-			<0xb88 4 0x7f3f3f 0x7f1e1e>;
-		apple,pcie-rc-gen3-shadow-tunables = <0x154 4 0xf0f0f0f 0x5050505>,
-			<0x890 4 0x3000000 0x0>,
-			<0x8a8 4 0xffff0f 0x1>;
-		apple,pcie-rc-gen4-shadow-tunables = <0x178 4 0xffff 0x5555>,
-			<0x890 4 0x3000000 0x1000000>,
-			<0x8a8 4 0xffff0f 0x1>;
-		apple,pcie-rc-gen5-shadow-tunables = <0x1ac 4 0xffff 0x5555>,
-			<0x890 4 0x3000000 0x2000000>,
-			<0x8a8 4 0xffff0f 0x1>;
+#include "t6050-sdreader.dtsi"
 
-		#address-cells = <3>;
-		#size-cells = <2>;
-		ranges;
-
-		interrupt-controller;
-		#interrupt-cells = <1>;
-		interrupt-map-mask = <0 0 0 7>;
-		interrupt-map = <0 0 0 1 &port01 0 0 0 0>,
-				<0 0 0 2 &port01 0 0 0 1>,
-				<0 0 0 3 &port01 0 0 0 2>,
-				<0 0 0 4 &port01 0 0 0 3>;
-
-		/* The GL9755; card detect and write protect active high (ADT *-polarity = 1) */
-		sdhci0: mmc@0,0 {
-			compatible = "pci17a0,9755";
-			reg = <0x20000 0x0 0x0 0x0 0x0>;
-			cd-inverted;
-			wp-inverted;
-		};
-	};
+&port01 {
+	/* Down at boot: the kernel trains it, powering the reader first */
+	pwren-gpios = <&smc_pcio 0 GPIO_ACTIVE_HIGH>;
+	/* pci-bridge1's link tunables */
+	apple,apcie-config-tunables = <0x140 4 0x1 0x1>,
+		<0x144 4 0xffffff 0x253770>,
+		<0x8a8 4 0x1 0x1>,
+		<0x8ac 4 0x1 0x1>;
+	apple,pcie-rc-tunables = <0x78 4 0x7000 0x0>,
+		<0x194 4 0x2 0x2>,
+		<0xb80 4 0x7f3f3f 0x7f1e1e>,
+		<0xb88 4 0x7f3f3f 0x7f1e1e>;
+	apple,pcie-rc-gen3-shadow-tunables = <0x154 4 0xf0f0f0f 0x5050505>,
+		<0x890 4 0x3000000 0x0>,
+		<0x8a8 4 0xffff0f 0x1>;
+	apple,pcie-rc-gen4-shadow-tunables = <0x178 4 0xffff 0x5555>,
+		<0x890 4 0x3000000 0x1000000>,
+		<0x8a8 4 0xffff0f 0x1>;
+	apple,pcie-rc-gen5-shadow-tunables = <0x1ac 4 0xffff 0x5555>,
+		<0x890 4 0x3000000 0x2000000>,
+		<0x8a8 4 0xffff0f 0x1>;
 };
 
 /*
@@ -205,12 +182,6 @@
  */
 &pinctrl_ap {
 	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <140 81>;
-};
-
-/* It answers only once port 1's root complex is up: pcie-apple then enables it */
-&dart_apcie1 {
-	apple,manual-availability;
-	status = "okay";
 };
 
 /* The keyboard backlight: ADT pwm0/kbd-backlight, channel 0 at 25 kHz */
