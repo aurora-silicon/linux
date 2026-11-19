@@ -29,7 +29,49 @@
 		usb4_4_nhi = &usb4_0_nhi_die1;
 		usb4_5_rc = &usb4_1_acio_die1;
 		usb4_5_nhi = &usb4_1_nhi_die1;
+
+		usb4-0-pcie-adapter = &usb4_0_acio;
+		usb4-0-pcie = &apciec0;
+		usb4-1-pcie-adapter = &usb4_1_acio;
+		usb4-1-pcie = &apciec1;
+		usb4-2-pcie-adapter = &usb4_2_acio;
+		usb4-2-pcie = &apciec2;
+		usb4-3-pcie-adapter = &usb4_3_acio;
+		usb4-3-pcie = &apciec3;
+		usb4-4-pcie-adapter = &usb4_0_acio_die1;
+		usb4-4-pcie = &apciec0_die1;
+		usb4-5-pcie-adapter = &usb4_1_acio_die1;
+		usb4-5-pcie = &apciec1_die1;
 	};
+};
+
+/*
+ * Thunderbolt PCIe tunnels: each die carries the same PCIe-C hosts as a
+ * T6001 (t600x-pciec.dtsi), so every USB4 port gets its die's tunnel, as on
+ * J375c.
+ */
+&usb4_0_acio {
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
+};
+
+&usb4_1_acio {
+	apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
+};
+
+&usb4_2_acio {
+	apple,pcie-tunnel = <&usb4_2_pcie_tunnel>;
+};
+
+&usb4_3_acio {
+	apple,pcie-tunnel = <&usb4_3_pcie_tunnel>;
+};
+
+&usb4_0_acio_die1 {
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel_die1>;
+};
+
+&usb4_1_acio_die1 {
+	apple,pcie-tunnel = <&usb4_1_pcie_tunnel_die1>;
 };
 
 &dpaudio0 {
@@ -268,6 +310,9 @@
 
 /delete-node/ &usb4_3_acio_die1;
 /delete-node/ &usb4_3_mbox_die1;
+
+/delete-node/ &usb4_2_pcie_tunnel_die1;
+/delete-node/ &usb4_3_pcie_tunnel_die1;
 
 /delete-node/ &dwc3_2_dart_0_die1;
 /delete-node/ &dwc3_2_dart_1_die1;
