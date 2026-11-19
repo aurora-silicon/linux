@@ -1472,6 +1472,8 @@ static void ave_26b123_layout(struct kunit *test)
 {
 	const struct ave_fw_layout *a = &ave_layout_26a428;
 	const struct ave_fw_layout *b = ave_layout_for_crc(0x99fc929a);
+	struct ave_start_layout *start = kunit_kzalloc(test, sizeof(a->start), GFP_KERNEL);
+	struct ave_proc_layout *process = kunit_kzalloc(test, sizeof(a->process), GFP_KERNEL);
 
 	KUNIT_ASSERT_PTR_EQ(test, b, &ave_layout_26b123);
 	KUNIT_EXPECT_TRUE(test, b->encode_ready);
@@ -1485,8 +1487,19 @@ static void ave_26b123_layout(struct kunit *test)
 	}
 	KUNIT_EXPECT_EQ(test, b->bytes[0][AVE_IMAGE_PROCESS], 0x6e08);
 	KUNIT_EXPECT_EQ(test, b->bytes[1][AVE_IMAGE_PROCESS], 0x78c8);
-	KUNIT_EXPECT_EQ(test, memcmp(b->start, a->start, sizeof(a->start)), 0);
-	KUNIT_EXPECT_EQ(test, memcmp(b->process, a->process, sizeof(a->process)), 0);
+	/* Apart from the two words only the M5 26A428 sessions were run with. */
+	KUNIT_ASSERT_NOT_NULL(test, start);
+	KUNIT_ASSERT_NOT_NULL(test, process);
+	memcpy(start, a->start, sizeof(a->start));
+	memcpy(process, a->process, sizeof(a->process));
+	for (unsigned int c = 0; c < 2; c++) {
+		KUNIT_EXPECT_EQ(test, b->start[c].fps_int_copy, 0U);
+		start[c].fps_int_copy = 0;
+	}
+	KUNIT_EXPECT_EQ(test, b->process[1].low_delay, 0U);
+	process[1].low_delay = 0;
+	KUNIT_EXPECT_EQ(test, memcmp(b->start, start, sizeof(a->start)), 0);
+	KUNIT_EXPECT_EQ(test, memcmp(b->process, process, sizeof(a->process)), 0);
 	KUNIT_EXPECT_EQ(test, memcmp(b->result, a->result, sizeof(a->result)), 0);
 	KUNIT_EXPECT_EQ(test, b->hdr_bytes, a->hdr_bytes);
 	KUNIT_EXPECT_EQ(test, b->max_slots, a->max_slots);
