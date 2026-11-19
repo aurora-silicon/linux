@@ -210,6 +210,9 @@ pub(crate) const V25G83: Variant = Variant {
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
 /// command set).
 pub(crate) const V26A428_M5: Variant = Variant {
+    // The common M5 graph moves region C's fields from +0x38 up by four, so the G17P
+    // max_power_mw word at +0x84 is not this build's: not admitted for the live power actuator.
+    live_power: None,
     m5_commands: true,
     // Not measured on the M5 firmware.
     traversal_exclusion: false,

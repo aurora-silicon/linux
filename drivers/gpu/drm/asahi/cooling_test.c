@@ -193,5 +193,6 @@ static struct kunit_suite asahi_gpu_cooling_suite = {
 	.test_cases = asahi_gpu_cooling_cases,
 };
 kunit_test_suite(asahi_gpu_cooling_suite);
+MODULE_DESCRIPTION("Aurora GPU power-cap policy tests");
 MODULE_LICENSE("Dual MIT/GPL");
 #endif
