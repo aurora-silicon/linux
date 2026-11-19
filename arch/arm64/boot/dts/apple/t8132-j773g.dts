@@ -77,7 +77,22 @@
 	phy-names = "dp-phy";
 	hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
 	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+	/*
+	 * The main pipe's realtime bandwidth request slot (D003), as macOS
+	 * gives it on this Mac ("IOMFB Int RTBandwidth: 0x382820000"). Without
+	 * it the firmware runs with "IOMFB Int RTBandwidth: DISABLED".
+	 */
+	apple,bw-scratch = <&pmgr_dcp_bw 0 4 0>;
 	status = "okay";
+};
+
+&soc {
+	/* 0x20000 into the window the main DCP has as disp-4. */
+	pmgr_dcp_bw: power-management@382820000 {
+		reg = <0x3 0x82820000 0x0 0x8>;
+		reg-names = "dcp-bw-scratch";
+		#apple,bw-scratch-cells = <3>;
+	};
 };
 
 &disp0_piodma {
