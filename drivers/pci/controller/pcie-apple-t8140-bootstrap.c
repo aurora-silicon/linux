@@ -572,8 +572,12 @@ static int apple_t8140_bootstrap_submit(struct apple_t8140_bootstrap *bootstrap,
 	if (ret)
 		return ret;
 	/*
-	 * The slots must hold still after the response. After a sleep, the same engine has
-	 * answered the same request before, and the slots are read again before every sleep.
+	 * The slots must hold still after the response. The engine's own completion (the
+	 * status interrupt, the command bit and the drained FIFO) has been waited for above;
+	 * this watch looks for a late write into the retained memory, an absence that no
+	 * status or interrupt reports, so it can only be sampled. After a sleep, the same
+	 * engine has answered the same request before, and the slots are read again before
+	 * every sleep: two periods there, ten for a first bootstrap.
 	 */
 	checks = bootstrap->answered ? 2 : 10;
 	for (i = 0; i < checks; i++) {
