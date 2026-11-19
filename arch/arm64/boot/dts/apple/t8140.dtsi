@@ -1694,11 +1694,8 @@
 			clock-names = "clock-154", "clock-194";
 			apple,bw-scratch = <&pmgr_dcp 0 5 0>;
 			apple,bw-doorbell = <&pmgr_dcp 1 6>;
-			/*
-			 * A single zero selects surface 0; J700 kernels that
-			 * read this as a surface list take it the same way.
-			 */
-			apple,iomfb-surfaces = <0>;
+			/* Per-slot enable flags: the firmware's surface 0 only. */
+			apple,iomfb-surfaces = <1>;
 			/* generate a phandle for the loader */
 			phandle = <&dcp>;
 			/* bus properties for the piodma child device */
