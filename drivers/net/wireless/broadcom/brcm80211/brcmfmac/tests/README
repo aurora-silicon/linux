@@ -15,4 +15,4 @@ do not arm the foreground timer.
 
 To exercise the scan entrypoints with mocked firmware and timer services:
 
-  python3 tools/asahi/brcmfmac-scan-timeout-tests.py
+  python3 tools/aurora/brcmfmac-scan-timeout-tests.py

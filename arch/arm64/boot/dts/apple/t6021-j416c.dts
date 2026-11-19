@@ -20,7 +20,7 @@
 
 /* This machine model (only) has two extra boost CPU P-states *
  * Disabled: Only the highest CPU bin (38 GPU cores) has this.
- * Keep this disabled until m1n1 learns how to remove these OPPs
+ * Keep this disabled until aura learns how to remove these OPPs
  * for unsupported machines, otherwise it breaks cpufreq.
 &avalanche_opp {
 	opp18 {

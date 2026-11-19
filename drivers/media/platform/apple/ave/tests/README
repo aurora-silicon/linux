@@ -56,7 +56,7 @@ reclaim it. Allocator failures and ordinary import/map/release are covered too.
 The apple-ave-recovery KUnit suite tests the actual sliding-window helper at
 expiry boundaries, with staggered attempts and across jiffies wrap. Run with
 ../.kunitconfig using tools/testing/kunit/kunit.py. The existing
-tools/asahi/ave-pm-tests.py also checks the #651 sleep rollback contract.
+tools/aurora/ave-pm-tests.py also checks the #651 sleep rollback contract.
 
 MCTF streaming tool
 -------------------

@@ -35,7 +35,7 @@
  * Why mode 3 is coherent, on both SoCs:
  *  - T6001 (apple,t6000-dart x3, APPLE_DART2 PTEs): (1) the ANE sits in
  *    the dma-coherent DART class every SoC DMA-API device uses on
- *    arm64/Asahi, where dma-iommu itself programs descriptors with
+ *    arm64/Aurora, where dma-iommu itself programs descriptors with
  *    IOMMU_CACHE; (2) eiln's pre-GEM driver mapped BOs cacheable
  *    on the CPU while DMAing them through this same iommu_map() path for
  *    months with no maintenance; (3) buffers reused with alternating
@@ -1135,7 +1135,7 @@ static int ane_attach_genpd(struct ane_device *ane)
  * "power-domains", the engine window from "reg", the IRQ by name. The SET
  * block is the one exception: the device tree carries no range for it, so
  * it is compiled in per SoC, and only from a source that confirms the
- * address on hardware (m1n1 proxyclient ANE.ps_map, then a bound device).
+ * address on hardware (aura proxyclient ANE.ps_map, then a bound device).
  * A guessed SET base is not a bug but a brick: direct writes to the
  * block external-abort the SoC (T6001 at 0x28e08c000 with PS_SET0 down;
  * T8103 same mechanism at 0x23b70c000).
@@ -1241,7 +1241,7 @@ static int ane_platform_probe(struct platform_device *pdev)
 		goto detach_genpd;
 	}
 
-	/* m1n1 keys the SET block by ADT node name (ANE.ps_map); the device
+	/* aura keys the SET block by ADT node name (ANE.ps_map); the device
 	 * tree carries no range for it, so the SoC descriptor picks the
 	 * base (see struct ane_soc above). Mapped read-only, always:
 	 * recovery logs its ACTUAL nibbles beside every engine write and

@@ -25,7 +25,7 @@
 // Expected to become stable.
 #![feature(arbitrary_self_types)]
 #![feature(derive_coerce_pointee)]
-// ============ start asahi downstream features ===========
+// ============ start aurora downstream features ===========
 #![feature(associated_type_defaults)]
 //
 #![feature(cfg_version)]
@@ -38,7 +38,7 @@
 #![feature(slice_range)]
 //
 #![cfg_attr(CONFIG_RUSTC_HAS_COERCE_POINTEE, feature(pin_coerce_unsized_trait))]
-// ============ end asahi dowanstream features ============
+// ============ end aurora dowanstream features ============
 //
 // To be determined.
 #![feature(used_with_arg)]

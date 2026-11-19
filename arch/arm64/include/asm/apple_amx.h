@@ -15,7 +15,7 @@
 /* EL0 access control; the EL2 copy when the kernel runs at EL2 (VHE) */
 #define SYS_IMP_APL_AMX_CTL_EL1		sys_reg(3, 4, 15, 1, 4)
 #define AMX_CTL_APPLE_EN		BIT_ULL(63)
-/* SET while already SET faults (m1n1 leaves it set); a guest owns its copy */
+/* SET while already SET faults (aura leaves it set); a guest owns its copy */
 #define AMX_CTL_APPLE_SET_FAULT		BIT_ULL(8)
 #define AMX_CTL_APPLE_GUEST_BITS	(AMX_CTL_APPLE_EN | AMX_CTL_APPLE_SET_FAULT)
 /* In the EL2 copy: let EL1 (a guest kernel) use AMX as its own copy allows */

@@ -77,7 +77,7 @@
 };
 
 /*
- * m1n1 programs the AOP DART's DAPF and reserves its firmware and DAPF
+ * aura programs the AOP DART's DAPF and reserves its firmware and DAPF
  * windows when /chosen asks for the handoff, or disables the AOP.
  */
 &aop {
@@ -436,7 +436,7 @@
 };
 
 /*
- * The radio port. m1n1 trains the link; Linux owns only the radio's
+ * The radio port. aura trains the link; Linux owns only the radio's
  * streams (ADT mapper-apcie0-wlan and -bt), RID-to-SID routing and MSI.
  * Power is the SMC's gP13, reset AP GPIO 163.
  */
@@ -461,7 +461,7 @@
 	bluetooth0: bluetooth@0,1 {
 		compatible = "pci14e4,5f72";
 		reg = <0x10100 0x0 0x0 0x0 0x0>;
-		/* Per-machine address and calibration supplied by m1n1. */
+		/* Per-machine address and calibration supplied by aura. */
 		local-bd-address = [00 00 00 00 00 00];
 	};
 

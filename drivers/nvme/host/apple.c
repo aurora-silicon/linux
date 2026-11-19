@@ -321,7 +321,7 @@ static inline void apple_nvme_writeq(struct apple_nvme *anv, u64 value,
 	/*
 	 * Post-M4 ANS consumes the queue and NVMMU TCB base addresses as paired
 	 * 32-bit registers. Match the access sequence used by Apple firmware,
-	 * m1n1, and U-Boot; older ANS generations retain their native 64-bit
+	 * aura, and U-Boot; older ANS generations retain their native 64-bit
 	 * access.
 	 */
 	if (anv->hw->needs_ioq_registers)
@@ -1290,7 +1290,7 @@ static void apple_nvme_disable_legacy(struct apple_nvme *anv, bool shutdown)
 		 * others (like disabling after bringing back the firmware on
 		 * resume) seem to run into trouble under some circumstances.
 		 *
-		 * Both U-Boot and m1n1 also use this convention (i.e. an ANS
+		 * Both U-Boot and aura also use this convention (i.e. an ANS
 		 * NVMe controller is handed off with firmware shut down, in an
 		 * NVMe disabled state, after a clean shutdown).
 		 */
@@ -3126,7 +3126,7 @@ static const struct apple_nvme_hw apple_nvme_t8103_hw = {
 
 /*
  * The post-M4 (T8132 and later) I/O queue setup follows Yureka Lilian's T8132
- * support in m1n1 (commit 53f8ee9b54ba, "nvme: support T8132").
+ * support in aura (commit 53f8ee9b54ba, "nvme: support T8132").
  */
 static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.has_lsq_nvmmu = true,

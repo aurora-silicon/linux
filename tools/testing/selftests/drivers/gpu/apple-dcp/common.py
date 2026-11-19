@@ -83,7 +83,7 @@ def run_unit(name, unit, output, cases=((),), includes=(), extra=()):
     return hashlib.sha256(unit.encode()).hexdigest()
 
 
-# Asahi 7.2 moved the generation-specific setup after the tunables into
+# Aurora 7.2 moved the generation-specific setup after the tunables into
 # per-SoC atcphy_hw callbacks; atcphy_configure() calls them and compares
 # against the all-modes one for the RCAL wait.
 ATC_POST_TUNABLE = ('atcphy_configure_post_tunable_t8103', 'atcphy_wake_common_t8122',

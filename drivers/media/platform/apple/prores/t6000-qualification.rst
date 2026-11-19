@@ -31,7 +31,7 @@ The licensed implementation source is MIT m1n1 commit
 f3ac615eb1376d3bbba24cd84c414b9e41892adb:
 
 * ``proxyclient/experiments/prores.py:42-89``: all 48 core RMWs, in order.
-* ``proxyclient/m1n1/hw/prores.py:7-111``: the v0 descriptor layout.
+* ``proxyclient/aura/hw/prores.py:7-111``: the v0 descriptor layout.
 * ``proxyclient/experiments/prores.py:592-644``: legacy header, slice and
   rate-control words. The v0 rate-control block is the v1 one, 0x20 bytes
   earlier; the builder writes the per-profile target and maximum budgets

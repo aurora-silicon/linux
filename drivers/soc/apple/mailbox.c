@@ -77,7 +77,7 @@
  * reg[2] = the post-office bank 0x316020000/0x10000, which is shared with
  * PMP, DCP, DCPEXT0/1 and SCALER0. Only the GFX/GFX1 0x80-byte windows of
  * that bank are claimed: offset (2 * msgbox-mailbox-num + !postoffice) *
- * 0x80 with msgbox-using-alias=1 (m1n1 asc.c) gives 0x316020100 (mailbox 1)
+ * 0x80 with msgbox-using-alias=1 (aura asc.c) gives 0x316020100 (mailbox 1)
  * and 0x316020200 (mailbox 2). Each window is a counted FIFO: RX at +0,
  * TX at +0x10 and a status word at +0x20 that holds the RX occupancy and the
  * free TX slots.
@@ -101,7 +101,7 @@
 #define APPLE_ASCWRAP_V8_IOP_VBAR_SIZE 0x8
 #define APPLE_ASCWRAP_V8_MBOX_SIZE 0x80
 #define APPLE_ASCWRAP_V8_PSD_SIZE 0x100
-/* m1n1 asc.c starts a v8 CPU with reg[0] + 0x44 bit 4. */
+/* aura asc.c starts a v8 CPU with reg[0] + 0x44 bit 4. */
 #define APPLE_ASCWRAP_V8_CPU_CONTROL 0x44
 #define APPLE_ASCWRAP_V8_CPU_STATUS 0x48
 #define APPLE_ASCWRAP_V8_CPU_RUN BIT(4)
@@ -352,7 +352,7 @@ static void apple_mbox_ascwrap_v6_run_off(struct apple_mbox *mbox)
 		u32 state, ack;
 
 		/*
-		 * Reached only after an allowed v8 start. As m1n1
+		 * Reached only after an allowed v8 start. As aura
 		 * asc_cpu_stop(): clear RUN at +0x44. An unpowered block cannot
 		 * be running, and touching its wrapper would fault, so skip the
 		 * write then.
@@ -452,7 +452,7 @@ int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
 	}
 
 	if (mbox->hw->is_ascwrap_v8) {
-		/* As m1n1 asc_cpu_start(): set RUN at reg[0] + 0x44. */
+		/* As aura asc_cpu_start(): set RUN at reg[0] + 0x44. */
 		cpu_control = (u8 __iomem *)mbox->wrapper_regs +
 			      APPLE_ASCWRAP_V8_CPU_CONTROL;
 		val = readl(cpu_control);

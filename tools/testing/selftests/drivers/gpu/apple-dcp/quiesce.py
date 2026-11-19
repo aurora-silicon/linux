@@ -155,7 +155,7 @@ struct apple_atcphy {
  bool t8103_dummy_pending,t8103_usb3_retry,t8103_usb3_workaround;
  enum atcphy_mode mode,typec_mode;
  enum atcphy_pipehandler_state pipe_state;
- /* A CIO sleep is T8132's, covered by tools/asahi/atc-cio-sleep-tests.py. */
+ /* A CIO sleep is T8132's, covered by tools/aurora/atc-cio-sleep-tests.py. */
  struct { bool prepared; } cio_sleep;
 };
 struct phy { struct apple_atcphy *data; };

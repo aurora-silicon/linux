@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * Read-only Apple device tree decoding. The wire layout is documented by
- * m1n1's public src/adt.h (GPL-2.0-or-later OR BSD-2-Clause). No firmware
+ * aura's public src/adt.h (GPL-2.0-or-later OR BSD-2-Clause). No firmware
  * implementation or captured device identifiers are used here.
  */
 #include <linux/err.h>

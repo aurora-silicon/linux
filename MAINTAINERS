@@ -2071,7 +2071,7 @@ S:	Maintained
 F:	drivers/pci/controller/pcie-apple-radio.c
 F:	drivers/pci/controller/pcie-apple.c
 F:	include/linux/soc/apple/radio-sleep.h
-F:	tools/asahi/radio-*-tests.*
+F:	tools/aurora/radio-*-tests.*
 
 APPLE SMC DRIVER
 M:	Henrik Rydberg <rydberg@bitmath.org>
@@ -2142,7 +2142,7 @@ F:	include/linux/soc/apple/sleep.h
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
 F:	sound/soc/apple/aop_t8140.rs
-F:	tools/asahi/mt7932*
+F:	tools/aurora/mt7932*
 F:	tools/testing/apple/
 F:	tools/testing/kunit/configs/apple_firmware.config
 F:	tools/testing/kunit/configs/apple_t8140_bootstrap.config
@@ -2719,7 +2719,7 @@ L:	linux-arm-kernel@lists.infradead.org (moderated for non-subscribers)
 S:	Maintained
 W:	https://asahilinux.org
 B:	https://github.com/AsahiLinux/linux/issues
-C:	irc://irc.oftc.net/asahi-dev
+C:	irc://irc.oftc.net/aurora-dev
 T:	git https://github.com/AsahiLinux/linux.git
 F:	Documentation/ABI/testing/sysfs-driver-apple-dart
 F:	Documentation/ABI/testing/sysfs-driver-apple-pmp-dram
@@ -2773,7 +2773,7 @@ F:	Documentation/hwmon/macsmc-hwmon.rst
 F:	Documentation/power/apple-s2idle.rst
 F:	arch/arm64/boot/dts/apple/
 F:	drivers/bluetooth/hci_bcm4377.c
-F:	tools/asahi/bcm4377-sleep-config-tests.*
+F:	tools/aurora/bcm4377-sleep-config-tests.*
 F:	drivers/clk/clk-apple-nco.c
 F:	drivers/cpufreq/apple-soc-cpufreq.c
 F:	drivers/dma/apple-admac.c
@@ -2808,17 +2808,17 @@ F:	drivers/pmdomain/apple/
 F:	drivers/power/reset/macsmc-reboot.c
 F:	drivers/power/supply/macsmc-power*.c
 F:	drivers/pwm/pwm-apple.c
-F:	tools/asahi/apple-pwm-pm-tests.py
+F:	tools/aurora/apple-pwm-pm-tests.py
 F:	drivers/reset/reset-apple-cio.c
 F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
-F:	tools/asahi/isp-preview-flow-tests.py
-F:	tools/asahi/isp-preview-tests.py
-F:	tools/asahi/m3-uapi-*
+F:	tools/aurora/isp-preview-flow-tests.py
+F:	tools/aurora/isp-preview-tests.py
+F:	tools/aurora/m3-uapi-*
 F:	drivers/soc/apple/clpc.kunitconfig
-F:	tools/asahi/pmp-bootargs-tests.rs
+F:	tools/aurora/pmp-bootargs-tests.rs
 F:	drivers/spi/spi-apple-test.c
-F:	tools/asahi/test-m3-uapi.py
+F:	tools/aurora/test-m3-uapi.py
 F:	drivers/spi/spi-apple.c
 F:	drivers/spmi/spmi-apple-controller.c
 F:	drivers/thermal/apple-pmp*
@@ -2837,12 +2837,12 @@ F:	include/linux/irqchip/irq-apple-aic.h
 F:	include/linux/mfd/macsmc.h
 F:	include/linux/phy/apple-atc.h
 F:	include/linux/soc/apple/*
-F:	include/uapi/drm/asahi_drm.h
+F:	include/uapi/drm/aurora_drm.h
 F:	include/uapi/linux/apple-sep.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
-F:	tools/asahi/dart-sleep-*-tests.*
-F:	tools/asahi/sleep_test_utils.py
+F:	tools/aurora/dart-sleep-*-tests.*
+F:	tools/aurora/sleep_test_utils.py
 F:	tools/testing/selftests/drivers/apple/
 
 ARM/APPLE AVE VIDEO ENCODER DRIVER
@@ -2853,7 +2853,7 @@ W:	https://aurora-silicon.github.io
 F:	Documentation/admin-guide/media/apple-ave.rst
 F:	Documentation/devicetree/bindings/media/apple,t8140-ave.yaml
 F:	drivers/media/platform/apple/ave/
-F:	tools/asahi/ave*-tests.py
+F:	tools/aurora/ave*-tests.py
 
 ARM/APPLE PRORES VIDEO ENCODER DRIVER
 M:	Ryan Murray <ryan@aurorasilicon.org>
@@ -4548,8 +4548,8 @@ K:	\baudit_[a-z_0-9]\+\b
 AURORA APPLE SILICON HOST TOOLS
 M:	Ryan Murray <ryan@aurorasilicon.org>
 S:	Maintained
-F:	tools/asahi-m3/
-F:	tools/asahi/
+F:	tools/aurora-m3/
+F:	tools/aurora/
 F:	tools/aurora-m3/
 
 AURORA DISPLAY NOTIFIER
@@ -5584,7 +5584,7 @@ L:	brcm80211-dev-list.pdl@broadcom.com
 S:	Supported
 F:	drivers/net/wireless/broadcom/brcm80211/
 F:	include/linux/platform_data/brcmfmac.h
-F:	tools/asahi/brcmfmac-sleep-lifetime-tests.*
+F:	tools/aurora/brcmfmac-sleep-lifetime-tests.*
 
 BROADCOM BRCMSTB GPIO DRIVER
 M:	Doug Berger <opendmb@gmail.com>
@@ -9109,7 +9109,7 @@ L:	asahi@lists.linux.dev
 S:	Maintained
 W:	https://asahilinux.org
 B:	https://github.com/AsahiLinux/linux/issues
-C:	irc://irc.oftc.net/asahi-dev
+C:	irc://irc.oftc.net/aurora-dev
 T:	git https://gitlab.freedesktop.org/drm/misc/kernel.git
 F:	Documentation/devicetree/bindings/display/apple,h7-display-pipe-mipi.yaml
 F:	Documentation/devicetree/bindings/display/apple,h7-display-pipe.yaml

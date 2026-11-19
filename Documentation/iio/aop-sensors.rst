@@ -16,7 +16,7 @@ Lid angle
 Enable ``CONFIG_APPLE_AOP`` and ``CONFIG_IIO_AOP_SENSOR_LAS``. The AOP must
 have a ``las`` child with a SoC-specific compatible followed by
 ``apple,aop-las``. The T6040 device tree already supplies this child for
-J616s, and ``asahi.config`` enables the driver. The bootloader must hand
+J616s, and ``aurora.config`` enables the driver. The bootloader must hand
 over the AOP firmware memory regions before the AOP can start.
 
 The device is named ``aop-sensors-las``. Its ``in_angl_raw`` attribute is
@@ -129,7 +129,7 @@ They do not test EPIC transport or firmware behaviour.
 
 On J616s, or another supported laptop:
 
-1. Build with ``asahi.config`` and the board's DTB. Check that the AOP,
+1. Build with ``aurora.config`` and the board's DTB. Check that the AOP,
    LAS and ALS options survived configuration, and that the bootloader
    supplies the AOP memory regions.
 2. Boot and locate the IIO device whose ``name`` is ``aop-sensors-las``.

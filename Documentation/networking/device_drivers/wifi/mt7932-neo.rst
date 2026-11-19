@@ -17,7 +17,7 @@ Platform and configuration
 Use the T8140 PCIe bootstrap described in
 ``Documentation/PCI/controller/apple-t8140.rst``. Build the provider with
 ``CONFIG_PCIE_APPLE_T8140_BOOTSTRAP=y`` and select it through reciprocal
-host/engine DT links. Public m1n1 must populate the J700 ``wifi0`` endpoint's
+host/engine DT links. Public aura must populate the J700 ``wifi0`` endpoint's
 own ``local-mac-address``; a zero placeholder is rejected.
 
 The tested configuration includes ``CONFIG_MT7932_FULLMAC=m``,
@@ -232,9 +232,9 @@ J7RP version 1 remains valid and never authorizes 6 GHz. Version 2 packages
 are installed under ``policy-v2/``. Generate them from the original text
 tables and the installed version-1 packages::
 
-  python3 tools/asahi/mt7932-policy-6ghz.py --tables /path/to/IZUBA \
+  python3 tools/aurora/mt7932-policy-6ghz.py --tables /path/to/IZUBA \
     --legacy-dir /path/to/policy --output-dir /path/to/new-policy-root
-  python3 tools/asahi/mt7932-policy-6ghz-tests.py
+  python3 tools/aurora/mt7932-policy-6ghz-tests.py
 
 The default is every eligible VLP country, with skipped countries reported.
 Use repeated ``--country CC`` options to select a subset. Packages are written
@@ -632,8 +632,8 @@ tests preserving that sequence are not proof of AP TPE enforcement there.
 
 The software regressions can be exercised without a radio::
 
-  python3 tools/asahi/mt7932-scan-tests.py --out /tmp/mt7932-scan-tests
-  python3 tools/asahi/run-host-tests.py --only mt7932 --jobs 8
+  python3 tools/aurora/mt7932-scan-tests.py --out /tmp/mt7932-scan-tests
+  python3 tools/aurora/run-host-tests.py --only mt7932 --jobs 8
 
 The KUnit ``mt7932-six-ghz``, ``mt7932-regulatory`` and
 ``mt7932-pmf-lpi`` suites also cover runtime D7 rejection, the header pad,
@@ -673,13 +673,13 @@ related softmac driver's CLC command into this fullmac driver.
 
 Run an audit without producing packages::
 
-  python3 tools/asahi/mt7932-policy-classes.py --tables /path/to/IZUBA
+  python3 tools/aurora/mt7932-policy-classes.py --tables /path/to/IZUBA
 
 Opt in to **host data archives**, separate from operational v1/v2 packages::
 
-  python3 tools/asahi/mt7932-policy-classes.py --tables /path/to/IZUBA \
+  python3 tools/aurora/mt7932-policy-classes.py --tables /path/to/IZUBA \
     --legacy-dir /path/to/policy --output-dir /path/to/private-archive-root
-  python3 tools/asahi/mt7932-policy-classes-tests.py
+  python3 tools/aurora/mt7932-policy-classes-tests.py
 
 Archives use ``policy-v3/CC.bin`` exclusively. Never place them in ``policy/``
 or ``policy-v2/``. The driver does not search policy-v3 and rejects version 3
@@ -800,7 +800,7 @@ search this directory, and v1/v2 remain available for rollback.
 
 Produce bound packages from the same authenticated inputs::
 
-  python3 tools/asahi/mt7932-policy-classes.py --tables /path/to/IZUBA \
+  python3 tools/aurora/mt7932-policy-classes.py --tables /path/to/IZUBA \
     --legacy-dir /path/to/policy --output-dir /path/to/new-root --runtime
 
 For new LPI and v4-only VLP associations the driver validates the complete IE

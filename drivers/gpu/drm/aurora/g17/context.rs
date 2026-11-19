@@ -1,0 +1,846 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+//! Logical queue ownership of scheduler, QoS and work-state identities.
+//!
+//! Installed bindings retain this context until replacement is acknowledged.
+//! A job keeps its work-state lease through exact retirement, even if its error
+//! fence has already been signalled. Context-local accounting never waits for GPU work.
+
+mod identity;
+use super::{
+    freelist::{RenderIds, RenderPool},
+    fw::{context as fw, queue::Policy},
+    object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
+    status::VmStatus,
+};
+use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use identity::{Order, RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
+
+/// Both of a context's render channels are bound to other pairs whose publications have not
+/// all retired: the publisher waits for that retirement.
+pub(crate) const RENDER_CHANNEL_PENDING: Error = ERECALLCONFLICT;
+use super::job::Engine;
+use kernel::{
+    new_mutex,
+    prelude::*,
+    sync::{Arc, Mutex},
+};
+
+const QOS_IDS: usize = 128;
+
+struct QosState {
+    used: u128,
+    /// Released IDs whose firmware QoS rows still need clearing.
+    released: u128,
+    /// When each ID was last returned; reuse takes the one returned longest ago.
+    returns: [u64; QOS_IDS],
+    /// Firmware progress a returned ID waits for (see `channel::control_fence`).
+    fences: [u64; QOS_IDS],
+    clock: u64,
+}
+
+/// QoS IDs belong to one device; the two lowest values are reserved. Queue records name a
+/// published context by its QoS ID, so an ID follows the context's execution identity:
+/// held while any record names it, then fenced and reused oldest first.
+#[pin_data]
+pub(crate) struct QosIds {
+    #[pin]
+    state: Mutex<QosState>,
+}
+impl QosIds {
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                state <- new_mutex!(
+                    QosState { used: 3, released: 0, returns: [0; QOS_IDS], fences: [0; QOS_IDS], clock: 0 },
+                    "G17 QoS IDs"
+                )
+            }),
+            GFP_KERNEL,
+        )
+    }
+    fn acquire(self: &Arc<Self>) -> Result<Arc<QosLease>> {
+        let witnessed = super::channel::control_witnessed();
+        let id = {
+            let mut state = self.state.lock();
+            let used = state.used;
+            let free = (0..QOS_IDS).filter(|&id| used & (1u128 << id) == 0);
+            let Some((id, _)) = mmu::pick_returned(free, &state.returns, &state.fences, witnessed)
+            else {
+                return Err(super::capacity::refused(super::capacity::Site::QosIds));
+            };
+            state.used |= 1u128 << id;
+            // A new owner writes its own scheduler row at its first publication.
+            state.released &= !(1u128 << id);
+            id
+        };
+        // Drop returns the ID if the allocation fails.
+        Ok(Arc::new(
+            QosLease {
+                ids: self.clone(),
+                id: id as u8,
+                seen: AtomicBool::new(false),
+            },
+            GFP_KERNEL,
+        )?)
+    }
+}
+/// Held by the context and by every retained queue record that names it.
+struct QosLease {
+    ids: Arc<QosIds>,
+    id: u8,
+    /// The firmware may have seen this ID.
+    seen: AtomicBool,
+}
+impl Drop for QosLease {
+    fn drop(&mut self) {
+        let fence = if self.seen.load(Ordering::Acquire) {
+            super::channel::control_fence()
+        } else {
+            0
+        };
+        let mut state = self.ids.state.lock();
+        let id = usize::from(self.id);
+        state.clock += 1;
+        state.returns[id] = state.clock;
+        state.fences[id] = fence;
+        state.used &= !(1u128 << id);
+        state.released |= 1u128 << id;
+    }
+}
+
+struct WorkStorage {
+    object: PooledObject,
+    words: [Option<u32>; STATE_COUNT],
+    counts: [u32; STATE_COUNT],
+    render: RenderSlots,
+}
+impl WorkStorage {
+    fn initialize(&mut self, word: u32) -> Result {
+        let slot = (word & 63) as usize;
+        if slot >= STATE_COUNT {
+            return Err(EINVAL);
+        }
+        let counter = UAT_PGSZ + slot * 4;
+        let node = fw::WorkNode::new(self.object.gpu_va() + counter as u64, word).ok_or(EINVAL)?;
+        // The exact work-state lease excludes a previous firmware owner. Only
+        // the node's 0xc8 initialized bytes are replaced; the stride tail is retained.
+        self.object.write(slot * NODE_STRIDE, node)?;
+        self.object.word(counter)?.store(0, Ordering::Relaxed);
+        self.words[slot] = Some(word);
+        self.counts[slot] = 0;
+        fence(Ordering::Release);
+        Ok(())
+    }
+    /// Whether the firmware completed every kick counted so far on node `word`.
+    fn drained(&self, word: u32) -> Result<bool> {
+        let slot = (word & 63) as usize;
+        if self.words.get(slot) != Some(&Some(word)) {
+            return Err(EINVAL);
+        }
+        let completed = self
+            .object
+            .word(slot * NODE_STRIDE + core::mem::offset_of!(fw::WorkNode, completed))?
+            .load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        Ok(completed >= self.counts[slot])
+    }
+    fn change_count(&mut self, word: u32, kicks: u32, add: bool) -> Result<u32> {
+        let slot = (word & 63) as usize;
+        if self.words.get(slot) != Some(&Some(word)) {
+            return Err(EINVAL);
+        }
+        let value = if add {
+            self.counts[slot].checked_add(kicks)
+        } else {
+            self.counts[slot].checked_sub(kicks)
+        }
+        .ok_or(EOVERFLOW)?;
+        self.object
+            .word(UAT_PGSZ + slot * 4)?
+            .store(value, Ordering::Relaxed);
+        self.counts[slot] = value;
+        fence(Ordering::SeqCst);
+        Ok(value)
+    }
+}
+
+/// A context's scheduler page. The M5 firmware caches its mapping, so on M5 it
+/// comes from the retention pool and stays mapped until firmware stop; elsewhere
+/// it is an ordinary allocation.
+pub(crate) enum SchedulerStorage {
+    Ordinary(KernelObject),
+    Retained(PooledObject),
+}
+impl core::ops::Deref for SchedulerStorage {
+    type Target = KernelObject;
+    fn deref(&self) -> &KernelObject {
+        match self {
+            Self::Ordinary(object) => object,
+            Self::Retained(object) => object,
+        }
+    }
+}
+impl core::ops::DerefMut for SchedulerStorage {
+    fn deref_mut(&mut self) -> &mut KernelObject {
+        match self {
+            Self::Ordinary(object) => object,
+            Self::Retained(object) => object,
+        }
+    }
+}
+
+/// Firmware-visible pages of a context, retained by an installed queue whose
+/// last owner has exited (see [`Context::retain_firmware_pages`]).
+pub(crate) struct FirmwarePages {
+    _scheduler: Arc<SchedulerStorage>,
+    _work: Arc<Mutex<WorkStorage>>,
+    /// The queue record still names the context's execution identity and QoS ID.
+    _hold: Arc<mmu::ContextHold>,
+    _qos: Arc<QosLease>,
+}
+
+pub(crate) struct Context {
+    /// The GPU runs the M5 firmware's protocol.
+    m5: bool,
+    execution: Arc<ExecutionContext>,
+    /// This context's own hold on its execution identity, cloned by retained queue records.
+    hold: Arc<mmu::ContextHold>,
+    status: Arc<VmStatus>,
+    scheduler: Arc<SchedulerStorage>,
+    scheduler_generation: u32,
+    published: AtomicBool,
+    /// A kill of this context was published, through a compute queue or on its render pairs'
+    /// behalf. A context is killed at most once.
+    kill_published: AtomicBool,
+    /// Advisory only: publication still checks the physical binding under the
+    /// device mutex. False skips an inline attempt known to need admission.
+    compute_binding_hint: AtomicBool,
+    /// Mixed-engine contexts keep the original inline publication path.
+    render_seen: AtomicBool,
+    qos: Arc<QosLease>,
+    owner_pid: u32,
+    states: WorkStates,
+    /// Signalled when a work state returns; publishers that found none wait on it.
+    state_returns: Arc<super::availability::Availability>,
+    /// The domain refused compute publishers wait on; signalled with `state_returns` when the
+    /// admission turn moves on.
+    compute_returns: Arc<super::availability::Availability>,
+    /// The order in which this context's ioctls take work-state nodes.
+    order: Arc<Mutex<Order>>,
+    work: Arc<Mutex<WorkStorage>>,
+    work_base: u64,
+    render: Arc<Mutex<Option<Arc<RenderPool>>>>,
+    render_blocks: AtomicUsize,
+    /// Timestamp pages of retired compute commands, mapped in this context's VM.
+    compute_timestamps: Arc<super::completion::ComputeTimestampCache>,
+    /// Fixed for the context's life. Physical queues bound to it carry this
+    /// profile in every record, ring, doorbell and registration.
+    policy: Policy,
+}
+impl Context {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "A context takes its allocators, identities and both admission domains."
+    )]
+    pub(crate) fn new(
+        alloc: &Allocator<'_>,
+        pool: &Arc<Pool>,
+        qos: &Arc<QosIds>,
+        execution: Arc<ExecutionContext>,
+        owner_pid: u32,
+        policy: Policy,
+        state_returns: Arc<super::availability::Availability>,
+        compute_returns: Arc<super::availability::Availability>,
+    ) -> Result<Self> {
+        let status = execution.vm().status().ok_or(EINVAL)?.clone();
+        let hold = execution.hold(super::channel::control_fence)?;
+        let qos = qos.acquire()?;
+        // On M5 only the firmware reads and writes the scheduler and work-state pages; the GPU
+        // has no access to them.
+        let kernel_prot = if alloc.uat.is_m5() {
+            mmu::PROT_FW_SHARED_RW
+        } else {
+            mmu::PROT_GPU_FW_SHARED_RW
+        };
+        let mut scheduler = if alloc.uat.is_m5() {
+            SchedulerStorage::Retained(pool.allocate(
+                alloc,
+                Family::Scheduler,
+                UAT_PGSZ,
+                UAT_PGSZ,
+                kernel_prot,
+                CpuMap::WriteCombined,
+            )?)
+        } else {
+            SchedulerStorage::Ordinary(alloc.kernel(
+                UAT_PGSZ,
+                UAT_PGSZ as u64,
+                mmu::PROT_GPU_FW_SHARED_RW,
+                CpuMap::WriteCombined,
+            )?)
+        };
+        scheduler.initialize::<fw::Scheduler>(0, |value| {
+            value.init();
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        let scheduler_generation = super::ids::OBJECTS.object()?;
+        let scheduler = Arc::new(scheduler, GFP_KERNEL)?;
+        let mut object = pool.allocate(
+            alloc,
+            Family::WorkState,
+            2 * UAT_PGSZ,
+            UAT_PGSZ,
+            kernel_prot,
+            CpuMap::WriteCombined,
+        )?;
+        let work_base = object.gpu_va();
+        object.write(
+            UAT_PGSZ + 0x400,
+            fw::WorkHead {
+                next: 0,
+                previous: work_base + (UAT_PGSZ + 0x400) as u64,
+                unk10: 0,
+                unk14: 0,
+            },
+        )?;
+        fence(Ordering::Release);
+        let work = Arc::pin_init(
+            new_mutex!(
+                WorkStorage {
+                    object,
+                    words: [None; STATE_COUNT],
+                    counts: [0; STATE_COUNT],
+                    render: RenderSlots::new()
+                },
+                "G17 work states"
+            ),
+            GFP_KERNEL,
+        )?;
+        let render = Arc::pin_init(new_mutex!(None, "G17 context private memory"), GFP_KERNEL)?;
+        let order =
+            Arc::pin_init(new_mutex!(Order::new(), "G17 context admission order"), GFP_KERNEL)?;
+        Ok(Self {
+            m5: alloc.uat.is_m5(),
+            execution,
+            hold,
+            status,
+            scheduler,
+            scheduler_generation,
+            published: AtomicBool::new(false),
+            kill_published: AtomicBool::new(false),
+            compute_binding_hint: AtomicBool::new(false),
+            render_seen: AtomicBool::new(false),
+            qos,
+            owner_pid,
+            states: WorkStates::new(),
+            state_returns,
+            compute_returns,
+            order,
+            work,
+            work_base,
+            render,
+            render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
+            compute_timestamps: super::completion::ComputeTimestampCache::new()?,
+            policy,
+        })
+    }
+    pub(crate) fn vm(&self) -> &Vm {
+        self.execution.vm()
+    }
+    pub(crate) fn compute_binding_hint(&self) -> bool {
+        self.render_seen.load(Ordering::Acquire)
+            || self.compute_binding_hint.load(Ordering::Relaxed)
+    }
+    /// This logical queue has submitted render work, so its compute may have a render prefix.
+    pub(crate) fn render_seen(&self) -> bool {
+        self.render_seen.load(Ordering::Acquire)
+    }
+    pub(crate) fn note_render(&self) {
+        if !self.render_seen.load(Ordering::Relaxed) {
+            self.render_seen.store(true, Ordering::Release);
+        }
+    }
+    pub(crate) fn note_compute_binding(&self, owned: bool) {
+        self.compute_binding_hint.store(owned, Ordering::Relaxed);
+    }
+    pub(crate) fn compute_timestamps(&self) -> &Arc<super::completion::ComputeTimestampCache> {
+        &self.compute_timestamps
+    }
+    pub(crate) fn status(&self) -> &Arc<VmStatus> {
+        &self.status
+    }
+    pub(crate) fn id(&self) -> u32 {
+        self.execution.id()
+    }
+
+    pub(crate) fn generation(&self) -> u8 {
+        self.execution.generation()
+    }
+    pub(crate) fn is_current(&self) -> bool {
+        self.execution.is_current()
+    }
+    /// Claim the context's hardware identity for one published M5 command until it retires.
+    pub(crate) fn pin(&self) -> Result<mmu::ContextPin> {
+        self.execution.pin()
+    }
+    pub(crate) fn unpin(&self, pin: mmu::ContextPin) {
+        self.execution.unpin(pin)
+    }
+    /// Claim the queue's QoS slot for one published M5 command. Stage 1: the slot is the
+    /// context's own, taken at creation.
+    pub(crate) fn pin_qos(&self) -> Result<u8> {
+        Ok(self.qos_id())
+    }
+    pub(crate) fn unpin_qos(&self, _slot: u8) {}
+
+    pub(crate) fn is_m5(&self) -> bool {
+        self.m5
+    }
+
+    pub(crate) fn owner_pid(&self) -> u32 {
+        self.owner_pid
+    }
+    pub(crate) fn policy(&self) -> Policy {
+        self.policy
+    }
+    pub(crate) fn qos_id(&self) -> u8 {
+        self.qos.id
+    }
+    pub(crate) fn scheduler_va(&self) -> u64 {
+        self.scheduler.gpu_va()
+    }
+    /// Installed physical channels retain this page after the logical execution
+    /// context and its VM lease have completed their scheduler release.
+    pub(crate) fn scheduler_owner(&self) -> Arc<SchedulerStorage> {
+        self.scheduler.clone()
+    }
+    /// Scheduler release and command retirement have both been witnessed.
+    /// Keep installed storage alive while returning the finite TTBAT identity.
+    pub(crate) fn release_execution(&self) {
+        self.execution.release();
+    }
+    pub(crate) fn scheduler_generation(&self) -> u32 {
+        self.scheduler_generation
+    }
+    /// The pages an installed queue record of this context still names: the
+    /// scheduler page and the work storage holding the job-list head. A retained
+    /// physical queue keeps these after dropping the context itself.
+    pub(crate) fn retain_firmware_pages(&self) -> FirmwarePages {
+        FirmwarePages {
+            _scheduler: self.scheduler.clone(),
+            _work: self.work.clone(),
+            _hold: self.hold.clone(),
+            _qos: self.qos.clone(),
+        }
+    }
+    /// Called once the firmware consumed this context's scheduler release. If its work list
+    /// still links a node, the firmware keeps referencing that node: on Neo a render command
+    /// that ran behind a failed compute command is never unlinked, and a later context given
+    /// the same work storage (the object cache hands it out again) made the firmware recover
+    /// the GPU. Keep the storage mapped and out of reuse until firmware stop; returns whether
+    /// it was linked.
+    pub(crate) fn retain_linked_work(&self, pool: &Arc<Pool>) -> bool {
+        // An unreadable head counts as linked: retaining is the safe side.
+        let linked = self.work_head().map_or(true, |head| head != [0, self.work_head_va()]);
+        if linked {
+            self.work.lock().object.retain_until_stop(pool);
+        }
+        linked
+    }
+
+    /// The firmware may still walk this context's work list into memory it names: a node is
+    /// linked and the scheduler page shows no kill. Unreadable state counts as linked.
+    pub(crate) fn firmware_may_link(&self) -> bool {
+        let killed = super::queue::compute::exit::State::read(self).map_or(0, |state| state.killed);
+        must_retain(self.work_head().ok(), self.work_head_va(), killed)
+    }
+
+    pub(crate) fn work_head_va(&self) -> u64 {
+        self.work_base + (UAT_PGSZ + 0x400) as u64
+    }
+    /// Shared scheduler list head, sampled under the context's storage lock.
+    pub(crate) fn work_head(&self) -> Result<[u64; 2]> {
+        let work = self.work.lock();
+        let head = [
+            work.object.dword(UAT_PGSZ + 0x400)?.load(Ordering::Relaxed),
+            work.object.dword(UAT_PGSZ + 0x408)?.load(Ordering::Relaxed),
+        ];
+        fence(Ordering::Acquire);
+        Ok(head)
+    }
+
+    /// Record that a kill of this context was published (see `kill_published`).
+    pub(crate) fn note_kill_published(&self) {
+        self.kill_published.store(true, Ordering::Release);
+    }
+
+    /// A kill of this context was published.
+    pub(crate) fn kill_published(&self) -> bool {
+        self.kill_published.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
+    }
+    pub(crate) fn mark_published(&self) {
+        self.hold.mark_seen();
+        self.qos.seen.store(true, Ordering::Release);
+        self.published.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn release_identity(&self) -> Result<[u8; 4]> {
+        let mut result = [0; 4];
+        fence(Ordering::Acquire);
+        for (value, offset) in result.iter_mut().zip([0, 1, 4, 0x26]) {
+            let pointer = self.scheduler.pointer(offset, 1)?;
+            // SAFETY: pointer checked against retained scheduler allocation;
+            // a byte read observes firmware state without borrowing its fields.
+            *value = unsafe { core::ptr::read_volatile(pointer) };
+        }
+        Ok(result)
+    }
+    pub(crate) fn reserve_render_blocks(&self, blocks: usize) -> Result {
+        if self.is_published() || self.render.lock().is_some() { return Err(EBUSY); }
+        self.render_blocks.store(blocks, Ordering::Release);
+        Ok(())
+    }
+    pub(crate) fn render_blocks(&self) -> usize {
+        self.render_blocks.load(Ordering::Acquire)
+    }
+    pub(crate) fn render_pool(
+        &self,
+        alloc: &Allocator<'_>,
+        ids: &Arc<RenderIds>,
+        render_global: &Vm,
+        plan: Option<super::render_resources::Plan>,
+    ) -> Result<Arc<RenderPool>> {
+        if !self.is_current() {
+            return Err(EFAULT);
+        }
+        if alloc.uat.is_m5() != plan.is_some() {
+            return Err(EINVAL);
+        }
+        let mut render = self.render.lock();
+        if let Some(pool) = &*render {
+            if pool.fits(plan.as_ref().map(|p| p.geometry)) {
+                // A pool vacated under memory pressure is re-armed before reuse.
+                // M5 backing is installed by the pair that pins the pool.
+                if !alloc.uat.is_m5() {
+                    pool.ensure_backing(alloc, render_global, self.vm())?;
+                }
+                return Ok(pool.clone());
+            }
+            // M5: existing pairs retain the old pool through their rebind and
+            // its release acknowledgement. Allocation failure leaves it installed.
+        }
+        let pool = Arc::new(
+            match plan {
+                Some(plan) => RenderPool::m5(
+                    alloc,
+                    super::freelist::RenderId::logical(ids)?,
+                    self.vm(),
+                    plan.geometry,
+                )?,
+                None => {
+                    RenderPool::new(alloc, ids, render_global, self.vm(), self.render_blocks())?
+                }
+            },
+            GFP_KERNEL,
+        )?;
+        let previous = render.replace(pool.clone());
+        drop(render);
+        drop(previous);
+        Ok(pool)
+    }
+    /// Drops the pool once its free-list release is consumed and the closed
+    /// scheduler is detached. Installed compute bindings may retain the
+    /// context itself until replacement; they never use the render pool.
+    pub(crate) fn take_render_pool(&self) -> Option<Arc<RenderPool>> {
+        self.render.lock().take()
+    }
+    pub(crate) fn render_pools_released(&self, released: impl Fn(u32, u64) -> bool) -> bool {
+        self.render
+            .lock()
+            .as_ref()
+            .is_none_or(|pool| released(u32::from(pool.id()), pool.control_va()))
+    }
+}
+
+/// Shared by all engines of one ioctl. Queued work initially consumes no node.
+pub(crate) struct WorkStateLease {
+    context: Arc<Context>,
+    word: AtomicU32,
+    /// Index of the engine whose admission took the node, valid once `word` is set.
+    engine: AtomicU8,
+    /// The ioctl's place in its context's submission order.
+    ordinal: u64,
+}
+impl WorkStateLease {
+    pub(super) fn status(&self) -> &Arc<VmStatus> { self.context.status() }
+    /// The lease of a new ioctl, ordered after every earlier one of its context. EBUSY while
+    /// too many of the context's ioctls are queued behind its oldest waiting one
+    /// (see `identity::Order`).
+    pub(crate) fn deferred(context: Arc<Context>) -> Result<Self> {
+        let ordinal = context.order.lock().assign().ok_or(EBUSY)?;
+        Ok(Self {
+            context,
+            word: AtomicU32::new(FREE),
+            engine: AtomicU8::new(0),
+            ordinal,
+        })
+    }
+    /// The ioctl's node, taking one for `engine`'s admission if it has none yet. EBUSY: an older
+    /// ioctl still waits for its node (see `identity::Order`), or no node may be taken now
+    /// (see `identity::may_take`); an older ioctl's admission or a return lets it try again.
+    pub(crate) fn acquire(&self, engine: Engine) -> Result<u32> {
+        let current = self.word();
+        if current != FREE {
+            return Ok(current);
+        }
+        // The work-storage lock serializes the decision with this context's other
+        // admissions, and with the other engine of this ioctl taking its node.
+        let mut work = self.context.work.lock();
+        let current = self.word();
+        if current != FREE {
+            return Ok(current);
+        }
+        let mut order = self.context.order.lock();
+        if !order.admits(self.ordinal) {
+            return Err(EBUSY);
+        }
+        let engine = engine.index();
+        let candidate = self.context.states.allocate(engine).ok_or(EBUSY)?;
+        if let Err(error) = work.initialize(candidate) {
+            self.context.release_state(candidate, engine);
+            return Err(error);
+        }
+        self.engine.store(engine as u8, Ordering::Relaxed);
+        self.word.store(candidate, Ordering::Release);
+        let wake = order.admit(self.ordinal);
+        drop(order);
+        drop(work);
+        if wake {
+            self.context.pass_turn();
+        }
+        Ok(candidate)
+    }
+    /// The domain a publisher samples before acquire() and waits on after EBUSY.
+    pub(crate) fn returns(&self) -> &Arc<super::availability::Availability> {
+        &self.context.state_returns
+    }
+    pub(crate) fn word(&self) -> u32 {
+        self.word.load(Ordering::Acquire)
+    }
+    /// The oldest node of this ioctl's context still in use ahead of this ioctl's node, whose
+    /// draining the firmware's flush of this node waits for; none without a node of its own.
+    pub(crate) fn older_node(&self) -> Option<u32> {
+        let word = self.word();
+        if word == FREE {
+            return None;
+        }
+        self.context.states.older_live(word)
+    }
+    pub(crate) fn node_va(&self) -> Result<u64> {
+        let word = self.word();
+        if word == FREE {
+            return Err(EINVAL);
+        }
+        Ok(self.context.work_base + u64::from(word & 63) * NODE_STRIDE as u64)
+    }
+    /// Whether the firmware completed every kick counted so far on this ioctl's node. It stores
+    /// the completion stamps of the node's commands only then, so a command whose record is
+    /// present still waits for its stamp while other commands of its ioctl run.
+    pub(crate) fn drained(&self) -> Result<bool> {
+        let word = self.word();
+        if word == FREE {
+            return Err(EINVAL);
+        }
+        self.context.work.lock().drained(word)
+    }
+    pub(crate) fn add_submitted_kicks(&self, kicks: u32) -> Result<u32> {
+        self.context
+            .work
+            .lock()
+            .change_count(self.word(), kicks, true)
+    }
+    pub(crate) fn cancel_unpublished_kicks(&self, kicks: u32) -> Result<u32> {
+        self.context
+            .work
+            .lock()
+            .change_count(self.word(), kicks, false)
+    }
+
+    /// The render channel of `pair` for a publication. When both channels are bound to other
+    /// pairs, the least recently used one whose every publication `retired(qids, ordinal)`
+    /// moves to `pair`; otherwise [`RENDER_CHANNEL_PENDING`]: the caller waits for retirement
+    /// instead of failing the client.
+    pub(crate) fn render_channel(
+        &self,
+        pair: u8,
+        retired: impl Fn([u8; 2], u64) -> bool,
+    ) -> Result<u32> {
+        let (index, previous) = self
+            .context
+            .work
+            .lock()
+            .render
+            .bind(pair, retired)
+            .ok_or(RENDER_CHANNEL_PENDING)?;
+        if let Some(previous) = previous {
+            static REBINDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let n = REBINDS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                pr_info!("aurora: render channel {} of context {} moved from pair {} to pair {} (rebind {})\n",
+                    index, self.context.id(), previous, pair, n);
+            }
+        }
+        Ok(index)
+    }
+    /// Records a publication through `pair`'s channel once it reached firmware.
+    pub(crate) fn channel_published(&self, pair: u8, qids: [u8; 2], ordinal: u64) {
+        self.context.work.lock().render.published(pair, qids, ordinal);
+    }
+    pub(crate) fn channel_payload(&self, pair: u8, ordinal: u64) -> Result<u8> {
+        self.context
+            .work
+            .lock()
+            .render
+            .payload(pair, ordinal)
+            .ok_or(EINVAL)
+    }
+}
+impl Drop for WorkStateLease {
+    fn drop(&mut self) {
+        let word = self.word();
+        if word != FREE {
+            self.context.release_state(word, usize::from(self.engine.load(Ordering::Relaxed)));
+        } else if self.context.order.lock().leave(self.ordinal) {
+            self.context.pass_turn();
+        }
+    }
+}
+
+impl Context {
+    /// Every return bumps the domain: a publisher that sampled it before its
+    /// failed acquire() then never sleeps through this node.
+    fn release_state(&self, word: u32, engine: usize) {
+        if self.states.release(word, engine) {
+            self.state_returns.notify();
+        }
+    }
+    /// A refused publisher waits on its engine's domain. Bumping both once the turn moved past a
+    /// refusal means one that sampled before its refused acquire() never sleeps through it.
+    fn pass_turn(&self) {
+        self.state_returns.notify();
+        self.compute_returns.notify();
+    }
+}
+
+impl QosIds {
+    pub(crate) fn used(&self) -> u32 {
+        (self.state.lock().used & !3u128).count_ones()
+    }
+    /// Clears, with `forget`, the firmware QoS rows of the IDs released and not taken again:
+    /// they still name the released context's scheduler page. The IDs `forget` returns, whose
+    /// rows still have work in flight (or all, if it fails), stay released for the next call.
+    pub(crate) fn forget_released(&self, forget: impl FnOnce(u128) -> Result<u128>) {
+        let ids = {
+            let mut state = self.state.lock();
+            let ids = state.released & !state.used;
+            state.released = 0;
+            ids
+        };
+        if ids == 0 {
+            return;
+        }
+        let left = forget(ids).unwrap_or(ids);
+        let mut state = self.state.lock();
+        // An ID taken again meanwhile has a new owner, which writes its own row.
+        state.released |= left & !state.used;
+    }
+}
+
+/// Memory a context's work list may lead the firmware to stays allocated: a linked node (or
+/// an unreadable head) and no acknowledged kill.
+fn must_retain(head: Option<[u64; 2]>, head_va: u64, killed: u32) -> bool {
+    killed == 0 && head.is_none_or(|head| head != [0, head_va])
+}
+
+#[kunit_tests(aurora_g17_qos_capacity)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn linked_unkilled_work_is_retained() {
+        let va = 0xfffffc20_0000_4400;
+        assert!(!must_retain(Some([0, va]), va, 0));
+        assert!(must_retain(Some([0xfffffc20_0000_0000, 0xfffffc20_0000_0098]), va, 0));
+        assert!(must_retain(None, va, 0));
+        assert!(!must_retain(Some([0xfffffc20_0000_0000, 0xfffffc20_0000_0098]), va, 1));
+        assert!(!must_retain(None, va, 1));
+    }
+
+    #[test]
+    fn failed_client_construction_returns_every_qos_id() {
+        let ids = QosIds::new().unwrap();
+        for _ in 0..8 {
+            let mut clients = KVec::with_capacity(126, GFP_KERNEL).unwrap();
+            for _ in 0..126 {
+                clients.push(ids.acquire().unwrap(), GFP_KERNEL).unwrap();
+            }
+            assert_eq!(ids.used(), 126);
+            assert!(matches!(ids.acquire(), Err(ENOSPC)));
+            drop(clients);
+            assert_eq!(ids.used(), 0);
+            assert_eq!(ids.state.lock().used, 3);
+        }
+    }
+
+    #[test]
+    fn a_released_qos_row_still_in_use_is_cleared_later() {
+        let ids = QosIds::new().unwrap();
+        let (first, second) = (ids.acquire().unwrap(), ids.acquire().unwrap());
+        let both = (1u128 << first.id) | (1u128 << second.id);
+        // Occupy fresh IDs so the callback must reuse one of the returned IDs.
+        let mut others = KVec::with_capacity(QOS_IDS - 4, GFP_KERNEL).unwrap();
+        for _ in 0..QOS_IDS - 4 {
+            others.push(ids.acquire().unwrap(), GFP_KERNEL).unwrap();
+        }
+        drop((first, second));
+        // Work still runs on both rows: neither is cleared, and both stay released.
+        ids.forget_released(|released| {
+            assert_eq!(released, both);
+            Ok(released)
+        });
+        // A failed clear keeps them too.
+        ids.forget_released(|released| {
+            assert_eq!(released, both);
+            Err(EIO)
+        });
+        // One is taken again meanwhile: its new owner writes its own row.
+        let mut again = None;
+        ids.forget_released(|released| {
+            again = Some(ids.acquire().unwrap());
+            Ok(released)
+        });
+        let again = again.unwrap();
+        assert_ne!(both & (1u128 << again.id), 0);
+        let rest = both & !(1u128 << again.id);
+        ids.forget_released(|released| {
+            assert_eq!(released, rest);
+            Ok(0)
+        });
+        ids.forget_released(|_| panic!("nothing left to clear"));
+        drop(again);
+    }
+}
+
+impl Context {
+    pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>, scope: &str, index: usize) -> kernel::fmt::Result {
+        writeln!(f, "context scope={} index={} id={} work_used={} work_total={} render_used={} render_total=2",
+                 scope, index, self.id(), self.states.used(), STATE_COUNT, self.work.lock().render.used())
+    }
+}

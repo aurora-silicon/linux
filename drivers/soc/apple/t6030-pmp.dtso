@@ -2,12 +2,12 @@
 /*
  * T6030 power management processor, added by the T6030 display gate when
  * it enables the internal display, on any T6030 board whose boot loader
- * passes that Mac's PMP values in /chosen/asahi,t6030-pmp.
+ * passes that Mac's PMP values in /chosen/aurora,t6030-pmp.
  *
  * The layout is the J516S overlay's (t6030-j516s-pmp.dtso): the PMP, its
  * DART, its mailbox and its report, at the T6030's addresses and
  * interrupts, which are the same on every T6030 board. It carries none of
- * the per-Mac values. The gate copies those from /chosen/asahi,t6030-pmp
+ * the per-Mac values. The gate copies those from /chosen/aurora,t6030-pmp
  * onto the PMP node: apple,board-id and apple,dram-vendor-id from the ADT
  * /chosen node, apple,dram-capacity and every apple,tunable-* value from
  * the ADT iop-pmp-nub node, including apple,tunable-uuid.

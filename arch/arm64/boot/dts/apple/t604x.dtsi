@@ -95,7 +95,7 @@
 			};
 		};
 
-		/* m1n1 requires CPU nodes in MPIDR order. */
+		/* aura requires CPU nodes in MPIDR order. */
 		cpu_e0: cpu@0 {
 			compatible = "apple,brava-e";
 			device_type = "cpu";

@@ -363,7 +363,7 @@ bool dcp_h17p_external_ready(struct device_node *np)
 
 static bool show_notch;
 module_param(show_notch, bool, 0644);
-MODULE_PARM_DESC(show_notch, "Use the full display height and show the notch (also when /chosen/asahi,show-notch is \"1\")");
+MODULE_PARM_DESC(show_notch, "Use the full display height and show the notch (also when /chosen/aurora,show-notch is \"1\")");
 
 /*
  * DP/HDMI audio of external displays, on by default as on macOS: a display
@@ -1121,7 +1121,7 @@ const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
 }
 
 /*
- * m1n1 reserves the original ADT as a phram node labelled "adt". Read it
+ * aura reserves the original ADT as a phram node labelled "adt". Read it
  * without an MTD dependency.
  */
 void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_np)
@@ -4264,7 +4264,7 @@ int dcp_start(struct platform_device *pdev)
 		} else if (dptx_service_available(&dcp->dptxport[0])) {
 			bool connected;
 			/* force disconnect on start - necessary if the display
-			 * is already up from m1n1
+			 * is already up from aura
 			 */
 			dptxport_set_hpd(dcp->dptxport[0].service, false);
 			dptxport_release_display(dcp->dptxport[0].service);
@@ -5423,11 +5423,11 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	if (strncmp(compat_str, "12.3.0", sizeof(compat_str)) == 0)
 		return DCP_FIRMWARE_V_12_3;
 	/*
-	 * m1n1 reports firmware version 13.5 as compatible with 13.3. This is
+	 * aura reports firmware version 13.5 as compatible with 13.3. This is
 	 * only true for the iomfb endpoint. The interface for the dptx-port
 	 * endpoint changed between 13.3 and 13.5. The driver will only support
 	 * firmware 13.5. Check the actual firmware version for compat version
-	 * 13.3 until m1n1 reports 13.5 as "firmware-compat".
+	 * 13.3 until aura reports 13.5 as "firmware-compat".
 	 */
 	else if ((strncmp(compat_str, "13.3.0", sizeof(compat_str)) == 0) &&
 		 (strncmp(fw_str, "13.5.0", sizeof(compat_str)) == 0))
@@ -5628,14 +5628,14 @@ static bool dcp_external_is_idle(struct apple_dcp *dcp)
 
 /*
  * The boot loader keeps the notch rows in its framebuffer when the OS is to
- * drive the full panel (aura: chosen.asahi,show-notch=1). Follow it, so the
+ * drive the full panel (aura: chosen.aurora,show-notch=1). Follow it, so the
  * mode covers the same rows as the boot framebuffer did.
  */
 static bool boot_show_notch(void)
 {
 	const char *val;
 
-	return !of_property_read_string(of_chosen, "asahi,show-notch", &val) &&
+	return !of_property_read_string(of_chosen, "aurora,show-notch", &val) &&
 	       !strcmp(val, "1");
 }
 

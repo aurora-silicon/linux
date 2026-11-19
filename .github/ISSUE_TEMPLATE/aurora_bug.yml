@@ -27,8 +27,8 @@ body:
       label: Both firmware versions and provisioning
       description: Read both fields from /proc/device-tree/chosen/. Say unavailable if not accessible. For calibration problems, state provisioning status and whether data came from this Mac; do not upload it.
       placeholder: |
-        asahi,os-fw-version:
-        asahi,system-fw-version:
+        aurora,os-fw-version:
+        aurora,system-fw-version:
         Own-Mac provisioning status (if relevant):
     validations:
       required: true

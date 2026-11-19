@@ -26,7 +26,7 @@
 //! clocks run whenever an amp may be active.
 //!
 //! Alignment. Neither slot stream carries a frame marker: a channel lines up with its slots only
-//! when its DMA meets a serializer that starts afresh (Asahi's MCA driver resets the serializer on
+//! when its DMA meets a serializer that starts afresh (Aurora's MCA driver resets the serializer on
 //! every trigger for this reason; here the firmware owns it). So every playback prepare takes a
 //! running serializer down to `pw1 ` and back to `pwrd` (the playback DMA is stopped then, and the
 //! playback channel starts on the fresh serializer, the order every playback start has always

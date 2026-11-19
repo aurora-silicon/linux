@@ -1,7 +1,7 @@
 name: Host tests
 
-# Every host-side test of the Aurora drivers: tools/asahi (with their mutation
-# and old-code controls) and the apple-dcp, apple-afkv2, asahi-g15 and asahi-m4
+# Every host-side test of the Aurora drivers: tools/aurora (with their mutation
+# and old-code controls) and the apple-dcp, apple-afkv2, aurora-g15 and aurora-m4
 # selftests. They extract production code from this tree and build it on the
 # host, so a driver change can break them while the kernel build stays green.
 
@@ -83,7 +83,7 @@ jobs:
           git --version
 
       - name: Run the host tests
-        run: python3 -I tools/asahi/run-host-tests.py --jobs "$(nproc)" --work "$RUNNER_TEMP/host-tests"
+        run: python3 -I tools/aurora/run-host-tests.py --jobs "$(nproc)" --work "$RUNNER_TEMP/host-tests"
 
       - name: Keep the logs of a failed run
         if: failure()

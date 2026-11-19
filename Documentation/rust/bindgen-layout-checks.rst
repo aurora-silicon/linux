@@ -13,8 +13,8 @@ A successful C build does not validate Rust field offsets. In particular,
 ``CONFIG_SCHEDSTATS=n`` leaves a zero-sized, cacheline-aligned
 ``sched_statistics`` in ``task_struct``. Stock bindgen 0.73.2 loses its alignment
 and can shift subsequent fields, including ``mm``. The ARM64 defconfig +
-Asahi configuration exposed a 40-byte difference: Rust read a scheduler list
-pointer as the current mm and Asahi's RSS charge faulted in
+Aurora configuration exposed a 40-byte difference: Rust read a scheduler list
+pointer as the current mm and Aurora's RSS charge faulted in
 ``percpu_counter_add_batch``. The C RSS helpers and allocator agreed on the
 counter layout; the pointer supplied to them was wrong. Enabling SCHEDSTATS
 only masks the generator defect and is not a requirement of the driver.
@@ -70,7 +70,7 @@ alignment support, including locally patched versions. An affected generator
 prints the preparation command above. This is a warning so it cannot silently
 disable Rust drivers during configuration; the layout assertions still reject
 incorrect bindings when compiling the kernel. Prepare the tool before running
-``defconfig`` and merging ``asahi.config``, then keep the resolved configuration
+``defconfig`` and merging ``aurora.config``, then keep the resolved configuration
 unchanged for the kernel build.
 
 The generated bindings are consumed by the Rust kernel crate and by several

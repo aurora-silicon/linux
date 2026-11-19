@@ -20,7 +20,7 @@
 
 / {
 	/*
-	 * Six cores in each cluster, in the order of the ADT's /cpus (cpu0-17). m1n1
+	 * Six cores in each cluster, in the order of the ADT's /cpus (cpu0-17). aura
 	 * matches the CPU nodes to the cores it started by position (dt_set_cpus(): node
 	 * N against the ADT's cpu N), prunes the nodes of cores that are not alive and
 	 * stops the boot at the first MPIDR that differs, so the nodes must keep the

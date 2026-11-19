@@ -19,7 +19,7 @@
  * sets, where unattended boots run with nothing reading the channel. Every
  * other DockChannel Mac keeps waiting for room as before. Before widening
  * it (or making it the default), check on one other DockChannel Mac with a
- * slow attached reader (m1n1 proxy, USB debug) that long printk lines and tty
+ * slow attached reader (aura proxy, USB debug) that long printk lines and tty
  * output still arrive whole.
  */
 #define DOCKCHANNEL_NEVER_WAIT	"apple,tx-never-wait"

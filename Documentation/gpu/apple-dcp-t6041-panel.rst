@@ -99,7 +99,7 @@ a serialized blob, or an ``EDID``, ``edid`` or ``IODisplayEDID`` blob nested
 in a dictionary. Checksum-valid blocks without a usable manufacturer, model
 and serial are rejected so they cannot reintroduce null userspace strings. Without
 one, ProductAttributes remain usable, but are no longer a prerequisite for
-publishing an identity. The fallback reads the original ADT from m1n1's
+publishing an identity. The fallback reads the original ADT from aura's
 reserved-memory ``phram`` node with ``label = "adt"``. The reader accepts at
 most 16 MiB, 4096 nodes, 4096 properties per node and 32 levels, and validates
 all extents before committing any identity data.
@@ -162,15 +162,15 @@ there is no T6041 VRR module parameter. Firmware and mode validation, the main
 panel restriction, and the fixed-refresh failure latch still apply. EDID and
 backlight notifications have no driver-specific tunables.
 
-The kernel does not consume ``chosen.asahi,t6041-dcp``. Its early T6041 gate
-already follows the handoff published by m1n1: ``apple,t6041-handoff = <1>`` on
+The kernel does not consume ``chosen.aurora,t6041-dcp``. Its early T6041 gate
+already follows the handoff published by aura: ``apple,t6041-handoff = <1>`` on
 DCP, display and PIODMA, firmware compatibility 26.6.2, the expected DART stream
 and mailbox relationships, initially disabled nodes, and a running DCP.
 The DCP driver separately validates register resources and the firmware memory
 handoff. Missing or invalid handoff data leaves the boot framebuffer in place.
 These checks must remain when the loader's policy changes.
 
-The current m1n1 producer uses that chosen property to decide whether to attempt
+The current aura producer uses that chosen property to decide whether to attempt
 publication. Removing it cannot be completed by a kernel change: a loader with
 no published handoff provides nothing for the kernel to adopt. The producer
 needs to select the T6041 handoff from its existing chip/board match and the

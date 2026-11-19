@@ -2,13 +2,13 @@
 /*
  * Apple T8122 (M3 / G15G) GPU, from the J613 ADT. The boot loader fills in
  * this machine's performance states, coefficients, firmware version and
- * memory, enables the mailbox and then the GPU; drm/asahi refuses a node
+ * memory, enables the mailbox and then the GPU; drm/aurora refuses a node
  * with any of them missing.
  */
 
 / {
 	aliases {
-		gpu = &gpu;	/* m1n1 finds the GPU node through this alias */
+		gpu = &gpu;	/* aura finds the GPU node through this alias */
 	};
 
 	gpu_opp: opp-table-gpu {

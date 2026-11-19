@@ -151,7 +151,7 @@ out:
 
 static int j613_pmp_values(struct device_node *pmp)
 {
-	struct device_node *values = of_find_node_by_path("/chosen/asahi,t8122-pmp");
+	struct device_node *values = of_find_node_by_path("/chosen/aurora,t8122-pmp");
 	struct property *prop, *copy;
 	const char *uuid;
 	const u8 *table;
@@ -258,7 +258,7 @@ static struct device_node *j613_target(const struct device_node *np,
  * Finds the display and PMP nodes from nodes[J613_DCP] through the phandles
  * that wire them, and the display subsystem through the "disp0" alias, so
  * that the lookup follows the device tree rather than its node names and
- * places: the profile reuses Asahi's PMP report and mailbox nodes, and the
+ * places: the profile reuses Aurora's PMP report and mailbox nodes, and the
  * display subsystem sits at the root, outside the simple-bus. A node that is
  * not found stays NULL.
  */

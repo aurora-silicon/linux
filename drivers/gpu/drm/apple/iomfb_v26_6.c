@@ -1085,7 +1085,7 @@ int iomfb_v26_6_probe(struct apple_dcp *dcp)
 
 /*
  * The boot framebuffer gives the stride and the panel size. The boot loader either hides
- * the notch rows from it (the default) or, with chosen.asahi,show-notch=1 in m1n1, keeps
+ * the notch rows from it (the default) or, with chosen.aurora,show-notch=1 in aura, keeps
  * them; apple,notch-height is recorded either way. A board with a known panel tells the
  * two apart by the height; any other board is taken to have the notch hidden.
  */

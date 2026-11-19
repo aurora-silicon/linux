@@ -72,7 +72,7 @@ void __init apple_wfi_quirk_init(void)
 		pr_info("Apple: preserving registers across WFI\n");
 	}
 	/*
-	 * aura (J813) and m1n1 (T6050) pass idle=nop on M4 and later for
+	 * aura (J813) and aura (T6050) pass idle=nop on M4 and later for
 	 * kernels without this quirk. Spinning idle keeps every core busy
 	 * (cpuidle's WFI states spin too): on T8142 the SoC sits near 90 C
 	 * and throttles, on T6050 the system draws about 10 W more at idle.

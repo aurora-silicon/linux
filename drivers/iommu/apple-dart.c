@@ -863,7 +863,7 @@ static struct apple_dart_domain *to_dart_domain(struct iommu_domain *dom)
 }
 
 /*
- * Asahi's stream remapping programs only the first stream of a map and
+ * Aurora's stream remapping programs only the first stream of a map and
  * remaps the others onto it. A PCIe-C tunnel DART keeps programming and
  * invalidating every stream on its own, with the ordered accesses of
  * apple_dart_writel(). So do the T8140 and T8142 DARTs (per_stream): their

@@ -63,7 +63,7 @@ static const struct gt_soc gt_t6031 __initconst = {
 		   "/soc/iommu@38530c000", "/soc/iommu@385304000" },
 	.dcp = "/soc/dcp@386c00000",
 	.display = "/soc/display-subsystem",
-	.values = "/chosen/asahi,t6031-pmp",
+	.values = "/chosen/aurora,t6031-pmp",
 	.aic = "/soc/interrupt-controller@292400000",
 	.ps = {
 		[PMP_PS_DISP_SYS] = "/soc/power-management@292280000/power-controller@200",
@@ -93,7 +93,7 @@ static const struct gt_soc gt_t8122 __initconst = {
 		   "/t8122-soc/iommu@28d304000" },
 	.dcp = "/t8122-soc/dcp@28ec00000",
 	.display = "/t8122-soc/display-subsystem",
-	.values = "/chosen/asahi,t8122-pmp",
+	.values = "/chosen/aurora,t8122-pmp",
 	.aic = "/t8122-soc/interrupt-controller@2d1000000",
 	.ps = {
 		[PMP_PS_DISP_SYS] = "/t8122-soc/power-management@2d0700000/power-controller@1d8",
@@ -123,7 +123,7 @@ static const struct gt_soc gt_t6030 __initconst = {
 		   "/soc/iommu@28d30c000", "/soc/iommu@28d304000" },
 	.dcp = "/soc/dcp@28ec00000",
 	.display = "/soc/display-subsystem-t6030",
-	.values = "/chosen/asahi,t6030-pmp",
+	.values = "/chosen/aurora,t6030-pmp",
 	.aic = "/soc/interrupt-controller@351000000",
 	.ps = {
 		[PMP_PS_DISP_SYS] = "/soc/power-management@350700000/power-controller@1c0",

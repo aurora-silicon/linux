@@ -83,7 +83,7 @@
 			power-domains = <&ps_atc0_cio_pcie>;
 			apple,pciec-kernel-init;
 			/*
-			 * m1n1 fills the rc, fabric and debug tunables through the
+			 * aura fills the rc, fabric and debug tunables through the
 			 * usb4_0_pcie alias, but not this one.
 			 */
 			apple,tunable-oe-fabric =

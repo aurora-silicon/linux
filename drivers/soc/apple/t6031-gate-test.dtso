@@ -18,7 +18,7 @@
 
 		__overlay__ {
 			chosen {
-				asahi,t6031-pmp {
+				aurora,t6031-pmp {
 					apple,board-id = <0x1234>;
 					apple,dram-vendor-id = <0x5>;
 					apple,tunable-uuid = "07FF4C5B-CB2E-3DE6-95FF-3B107D19B7AB";

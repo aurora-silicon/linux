@@ -11,7 +11,7 @@
 #define J613_25G83_PMP_UUID "EFD60284-7C58-33A9-8522-CB3366AF6040"
 #define J613_25G83_HANDOFF "apple,j613-25g83-mapping-handoff"
 /* J615 requires an explicit chosen switch in addition to the 25G83 profile. */
-#define J615_25G83_OPT_IN "asahi,j615-25g83-experimental"
+#define J615_25G83_OPT_IN "aurora,j615-25g83-experimental"
 
 /* The board half of the identity: a J613, or a J615 with the opt-in. */
 static inline bool t8122_25g83_board(bool j613, bool j615, const char *optin,

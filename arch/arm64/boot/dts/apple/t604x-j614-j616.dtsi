@@ -305,7 +305,7 @@
 
 /*
  * Boot NOR. The partition is the J616s ADT /arm-io/qspi/spinor/anvram,
- * flash-relative; asahi-bless and asahi-nvram find it by its label.
+ * flash-relative; aurora-bless and aurora-nvram find it by its label.
  */
 &qspi {
 	status = "okay";

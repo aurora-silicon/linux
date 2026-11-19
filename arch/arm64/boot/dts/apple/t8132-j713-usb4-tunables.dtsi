@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * J713 USB4 host router calibration and DROM, converted from the ADT the way
- * m1n1 does it. The J713 boot chain does not pass these on yet, so they are
+ * aura does it. The J713 boot chain does not pass these on yet, so they are
  * described here until a bootloader fills them in. The DROM carries a fixed
  * placeholder router UUID; a bootloader derives a per-machine one.
  */
