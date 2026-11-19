@@ -1003,6 +1003,24 @@ static int ane_h16_map(void *ctx)
 	return 0;
 }
 
+/* Memory only: off h->mappings and not mapped. */
+static void ane_h16_mapping_free(struct ane_h16_mapping *m)
+{
+	unsigned int i, pages_per_block = SZ_16K / PAGE_SIZE;
+
+	if (m->cpu)
+		vunmap(m->cpu);
+	for (i = 0; i < m->blocks; i++)
+		__free_pages(m->pages[i * pages_per_block], get_order(SZ_16K));
+	kvfree(m->pages);
+	kfree(m);
+}
+
+/*
+ * Map size bytes of fresh zeroed memory at dva. Memory that never reached
+ * the IOMMU is freed on failure; a failed or partial iommu_map_sgtable()
+ * keeps the mapping and its memory until reset.
+ */
 static int ane_h16_alloc_prot(struct ane_h16_device *h, u64 dva, size_t size, int prot,
 			      struct ane_fw_surface *out)
 {
@@ -1025,15 +1043,15 @@ static int ane_h16_alloc_prot(struct ane_h16_device *h, u64 dva, size_t size, in
 		return -ENOMEM;
 	m->size = size;
 	m->dva = dva;
-	list_add_tail(&m->node, &h->mappings);
+	ret = -ENOMEM;
 	m->pages = kvcalloc(size / PAGE_SIZE, sizeof(*m->pages), GFP_KERNEL);
 	if (!m->pages)
-		return -ENOMEM;
+		goto free;
 	for (i = 0; i < size / SZ_16K; i++) {
 		struct page *page = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
 
 		if (!page)
-			return -ENOMEM;
+			goto free;
 		for (j = 0; j < pages_per_block; j++)
 			m->pages[i * pages_per_block + j] = page + j;
 		m->blocks++;
@@ -1041,10 +1059,12 @@ static int ane_h16_alloc_prot(struct ane_h16_device *h, u64 dva, size_t size, in
 	/* The coherent-client gate permits matching cached CPU/device aliases. */
 	m->cpu = vmap(m->pages, size / PAGE_SIZE, VM_MAP, PAGE_KERNEL);
 	if (!m->cpu)
-		return -ENOMEM;
+		goto free;
 	ret = sg_alloc_table_from_pages(&sgt, m->pages, size / PAGE_SIZE, 0, size, GFP_KERNEL);
 	if (ret)
-		return ret;
+		goto free;
+	/* Recorded before publication, including a failed/partial mapping. */
+	list_add_tail(&m->node, &h->mappings);
 	/* A failed call has already unmapped what it mapped. */
 	mapped = iommu_map_sgtable(h->domain, dva, &sgt, prot);
 	sg_free_table(&sgt);
@@ -1053,6 +1073,9 @@ static int ane_h16_alloc_prot(struct ane_h16_device *h, u64 dva, size_t size, in
 	m->mapped = mapped;
 	*out = (struct ane_fw_surface) { .cpu = m->cpu, .dva = dva, .size = size };
 	return 0;
+free:
+	ane_h16_mapping_free(m);
+	return ret;
 }
 
 static int ane_h16_alloc_at(void *ctx, u64 dva, size_t size, struct ane_fw_surface *out)
@@ -1465,20 +1488,15 @@ static const struct ane_fw_transport_ops ane_h16_transport_ops = {
 static void ane_h16_release(struct ane_h16_device *h)
 {
 	struct ane_h16_mapping *m, *next;
-	unsigned int i, pages_per_block = SZ_16K / PAGE_SIZE;
+	unsigned int i;
 
 	if (h->boot.ran || h->pinned || !h->acquired)
 		return;
 	list_for_each_entry_safe_reverse(m, next, &h->mappings, node) {
 		if (m->mapped)
 			iommu_unmap(h->domain, m->dva, m->mapped);
-		if (m->cpu)
-			vunmap(m->cpu);
-		for (i = 0; i < m->blocks; i++)
-			__free_pages(m->pages[i * pages_per_block], get_order(SZ_16K));
-		kvfree(m->pages);
 		list_del(&m->node);
-		kfree(m);
+		ane_h16_mapping_free(m);
 	}
 	if (h->attached)
 		iommu_detach_device(h->domain, h->dev);
