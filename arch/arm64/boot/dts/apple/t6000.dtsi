@@ -26,6 +26,41 @@
 /delete-node/ &pmp_report_afnc4_ioa;
 /delete-node/ &pmp_report_afnc5_ioa;
 
+&pmp_report {
+	nonposted-mmio;
+
+	/* Experimental, default-off shared-memory floors for CPU clients. */
+	pmp_report_cpu_e: report@6 {
+		compatible = "apple,t6000-pmp-v2-report-entry";
+		reg = <0x6>;
+		label = "pmp-cpu-e";
+		#power-domain-cells = <0>;
+		apple,memory-floor = <0x108 3 2>;
+		apple,always-on;
+		status = "disabled";
+	};
+
+	pmp_report_cpu_p0: report@7 {
+		compatible = "apple,t6000-pmp-v2-report-entry";
+		reg = <0x7>;
+		label = "pmp-cpu-p0";
+		#power-domain-cells = <0>;
+		apple,memory-floor = <0x109 3 2>;
+		apple,always-on;
+		status = "disabled";
+	};
+
+	pmp_report_cpu_p1: report@8 {
+		compatible = "apple,t6000-pmp-v2-report-entry";
+		reg = <0x8>;
+		label = "pmp-cpu-p1";
+		#power-domain-cells = <0>;
+		apple,memory-floor = <0x10a 3 2>;
+		apple,always-on;
+		status = "disabled";
+	};
+};
+
 &pmp {
 	apple,pio-ranges = <0x2 0x82000000 0x0 0x1000000>,
 		<0x3 0x4000000 0x0 0x1000000>,

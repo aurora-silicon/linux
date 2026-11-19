@@ -2080,6 +2080,7 @@ APPLE T8140 SOC AND J700 (MACBOOK NEO) SUPPORT
 M:	Ryan Murray <ryan@aurorasilicon.org>
 W:	https://aurora-silicon.github.io
 S:	Maintained
+F:	Documentation/arch/arm64/apple-pmp-memory-floor.rst
 F:	Documentation/devicetree/bindings/cpu/apple,t8140-cpuidle.yaml
 F:	Documentation/devicetree/bindings/cpufreq/apple,cluster-cpufreq.yaml
 F:	Documentation/devicetree/bindings/power/apple,t8140-pmp-report.yaml

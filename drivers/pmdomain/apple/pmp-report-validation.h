@@ -13,6 +13,28 @@
 #define PMP_PTD_RANGE_REQUEST	10
 #define PMP_PTD_RANGE_ACK	11
 
+#define PMP_DVFS_VALID		BIT_ULL(61)
+#define PMP_DVFS_MEMORY_SHIFT	32
+#define PMP_DVFS_FABRIC_SHIFT	48
+
+/*
+ * Build a shared-memory floor request from logical performance levels.  Both
+ * fields are four bits wide.  The platform-specific maxima reject values that
+ * fit the wire field but do not name a real performance level.
+ */
+static inline bool apple_pmp_memory_floor_word(u32 memory, u32 fabric,
+					       u32 memory_max, u32 fabric_max,
+					       u64 *word)
+{
+	if (!word || memory > memory_max || fabric > fabric_max ||
+	    memory > 0xf || fabric > 0xf)
+		return false;
+
+	*word = PMP_DVFS_VALID | (u64)memory << PMP_DVFS_MEMORY_SHIFT |
+		(u64)fabric << PMP_DVFS_FABRIC_SHIFT;
+	return true;
+}
+
 /* The PTD request read, request update and acknowledgment apertures. */
 static inline bool apple_pmp_ranges_valid(const u8 *table, size_t len,
 					  u32 request_read, u32 request_write,

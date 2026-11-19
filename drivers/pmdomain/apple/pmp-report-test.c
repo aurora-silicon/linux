@@ -254,6 +254,19 @@ static void pmp_bootargs_reject_integer_width(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_pmp_bootargs_valid(args, 29));
 }
 
+static void pmp_memory_floor_words(struct kunit *test)
+{
+	u64 word;
+
+	KUNIT_ASSERT_TRUE(test, apple_pmp_memory_floor_word(0, 0, 3, 2, &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2000000000000000ULL);
+	KUNIT_ASSERT_TRUE(test, apple_pmp_memory_floor_word(3, 2, 3, 2, &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2002000300000000ULL);
+	KUNIT_EXPECT_FALSE(test, apple_pmp_memory_floor_word(4, 2, 3, 2, &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_memory_floor_word(3, 3, 3, 2, &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_memory_floor_word(0, 0, 3, 2, NULL));
+}
+
 static struct kunit_case apple_pmp_report_cases[] = {
 	KUNIT_CASE(pmp_ranges_t6030),
 	KUNIT_CASE(pmp_ranges_t8122),
@@ -267,6 +280,7 @@ static struct kunit_case apple_pmp_report_cases[] = {
 	KUNIT_CASE(pmp_bootargs_valid_ids),
 	KUNIT_CASE(pmp_bootargs_reject_truncation),
 	KUNIT_CASE(pmp_bootargs_reject_integer_width),
+	KUNIT_CASE(pmp_memory_floor_words),
 	{}
 };
 

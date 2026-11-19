@@ -46,6 +46,14 @@
  * @tgt_write: power state request, write side
  * @actual: power state acknowledgment
  * @status: PMP status; bit 0 is set while the PMP is running
+ * @update: base of the eight-byte-per-entry update aperture
+ * @dvfs_ready: report offset of the global DVFS readiness state
+ * @dvfs_ready_update: update offset used to prime DVFS readiness
+ * @dvfs_state: report offset of the achieved shared-memory state
+ * @dvfs_first: first device DVFS request entry
+ * @dvfs_count: number of device DVFS request entries
+ * @memory_max: highest logical memory-controller floor
+ * @fabric_max: highest logical fabric floor
  * @fast_die: 32-bit word holding the fast die-temperature effort of each
  *	CPU cluster, one byte per lane; 0 if the SoC has none
  * @fast_die_lanes: number of lanes at @fast_die, at most 4
@@ -66,6 +74,14 @@ struct apple_pmp_report_offsets {
 	u32 tgt_write;
 	u32 actual;
 	u32 status;
+	u32 update;
+	u32 dvfs_ready;
+	u32 dvfs_ready_update;
+	u32 dvfs_state;
+	u32 dvfs_first;
+	u32 dvfs_count;
+	u32 memory_max;
+	u32 fabric_max;
 	u32 fast_die;
 	u32 fast_die_lanes;
 	bool running_any;
@@ -92,6 +108,8 @@ struct apple_pmp_report {
 	/* Requests made through entries: bits requested on, all bits. */
 	u64 shadow;
 	u64 known;
+	/* Provider-owned request words; request entries themselves stay unread. */
+	u64 *dvfs_shadow;
 	/* Requests are held in memory until the PMP runs (@defer_requests). */
 	bool defer;
 	unsigned int polls;
@@ -164,16 +182,31 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_fast_die_effort);
 
 static void apple_pmp_start_show(struct seq_file *s, struct apple_pmp_start *st);
 
-/* Read only the documented status and fast-die entries, never the aperture. */
+/* Read only documented report entries, never a pending request entry. */
 static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 {
 	struct apple_pmp_report *rep = s->private;
 	const struct apple_pmp_report_offsets *offs = rep->offsets;
 	bool running = apple_pmp_report_running(rep);
-	unsigned int lane;
+	unsigned int entry, lane;
 	u32 effort;
 
 	seq_printf(s, "running: %u\n", running);
+	seq_printf(s, "device-request-shadow: %#llx\n", READ_ONCE(rep->shadow));
+	seq_printf(s, "device-ack: %#llx\n", readq(rep->base + offs->actual));
+	if (offs->dvfs_ready) {
+		seq_printf(s, "dvfs-ready: %#llx\n",
+			   readq(rep->base + offs->dvfs_ready));
+		seq_printf(s, "dvfs-state: %#llx\n",
+			   readq(rep->base + offs->dvfs_state));
+		for (entry = 0; entry < offs->dvfs_count; entry++) {
+			u64 word = READ_ONCE(rep->dvfs_shadow[entry]);
+
+			if (word)
+				seq_printf(s, "dvfs-shadow@%#x: %#llx\n",
+					   offs->dvfs_first + entry, word);
+		}
+	}
 	if (rep->start)
 		apple_pmp_start_show(s, rep->start);
 	if (!running || !offs->fast_die)
@@ -1143,6 +1176,12 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (IS_ERR(rep->base))
 		return PTR_ERR(rep->base);
 	rep->offsets = of_device_get_match_data(dev);
+	if (rep->offsets->dvfs_count) {
+		rep->dvfs_shadow = devm_kcalloc(dev, rep->offsets->dvfs_count,
+						 sizeof(*rep->dvfs_shadow), GFP_KERNEL);
+		if (!rep->dvfs_shadow)
+			return -ENOMEM;
+	}
 	rep->defer = rep->offsets->defer_requests;
 	INIT_DELAYED_WORK(&rep->ready_work, apple_pmp_report_ready_work);
 	platform_set_drvdata(pdev, rep);
@@ -1163,7 +1202,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	list_add_tail_rcu(&rep->list, &apple_pmp_reports);
 	mutex_unlock(&apple_pmp_reports_lock);
 
-	if (rep->offsets->fast_die || rep->start)
+	if (rep->offsets->fast_die || rep->offsets->dvfs_ready || rep->start)
 		rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
 						   apple_pmp_report_debugfs, rep,
 						   &apple_pmp_report_status_fops);
@@ -1185,6 +1224,14 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x = {
 	.tgt_write = 0x107c0,
 	.actual = 0x1000,
 	.status = 0x10,
+	.update = 0x10000,
+	.dvfs_ready = 0x80,
+	.dvfs_ready_update = 0x10040,
+	.dvfs_state = 0x90,
+	.dvfs_first = 0x108,
+	.dvfs_count = 0x28,
+	.memory_max = 3,
+	.fabric_max = 2,
 };
 
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t602x = {
@@ -1323,6 +1370,9 @@ struct apple_pmp_report_entry {
 	u32 id;
 	/* The PMP does not acknowledge this request (a started PMP only). */
 	bool no_ack;
+	bool floor;
+	u32 floor_entry;
+	u64 floor_on;
 	bool removed;
 };
 
@@ -1362,6 +1412,32 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 		50000);
 }
 
+static int apple_pmp_report_dvfs_ready(struct apple_pmp_report *rep)
+{
+	const struct apple_pmp_report_offsets *offs = rep->offsets;
+	u64 val;
+
+	if (!offs->dvfs_ready)
+		return -EOPNOTSUPP;
+	if (!apple_pmp_report_running(rep))
+		return -EAGAIN;
+	val = readq(rep->base + offs->dvfs_ready);
+	if (val)
+		return 0;
+
+	/* Prime the global state before admitting any per-device request. */
+	writeq(1, rep->base + offs->dvfs_ready_update);
+	return readq_poll_timeout_atomic(rep->base + offs->dvfs_ready, val,
+					 val, 100, 50000);
+}
+
+static void apple_pmp_report_floor_write(struct apple_pmp_report *rep,
+					 u32 entry, u64 word)
+{
+	writeq(word, rep->base + rep->offsets->update + entry * sizeof(u64));
+	WRITE_ONCE(rep->dvfs_shadow[entry - rep->offsets->dvfs_first], word);
+}
+
 static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, bool enable)
 {
 	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
@@ -1374,7 +1450,20 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 	rcu_read_lock();
 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
 		if (rep->dev->of_node == ent->report_node) {
+			if (ent->floor) {
+				ret = apple_pmp_report_dvfs_ready(rep);
+				if (ret)
+					break;
+			}
+			if (ent->floor && !enable)
+				apple_pmp_report_floor_write(rep, ent->floor_entry,
+							     PMP_DVFS_VALID);
 			ret = apple_pmp_report_set_state(rep, ent->id, enable, ent->no_ack);
+			if (ent->floor && enable && !ret)
+				apple_pmp_report_floor_write(rep, ent->floor_entry,
+							     ent->floor_on);
+			else if (ent->floor && enable)
+				apple_pmp_report_set_state(rep, ent->id, false, ent->no_ack);
 			break;
 		}
 	}
@@ -1453,6 +1542,25 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 			goto err_free;
 		}
 		ent->no_ack = of_property_read_bool(node, "apple,no-ack");
+	}
+	if (of_property_present(node, "apple,memory-floor")) {
+		u32 floor[3];
+
+		ret = of_property_read_u32_array(node, "apple,memory-floor", floor,
+						  ARRAY_SIZE(floor));
+		if (ret || of_property_count_u32_elems(node, "apple,memory-floor") !=
+			   ARRAY_SIZE(floor) || !rep || !rep->offsets->update ||
+		    floor[0] < rep->offsets->dvfs_first ||
+		    floor[0] >= rep->offsets->dvfs_first + rep->offsets->dvfs_count ||
+		    !apple_pmp_memory_floor_word(floor[1], floor[2],
+						 rep->offsets->memory_max,
+						 rep->offsets->fabric_max,
+						 &ent->floor_on)) {
+			ret = dev_err_probe(dev, -EINVAL, "invalid apple,memory-floor\n");
+			goto err_free;
+		}
+		ent->floor = true;
+		ent->floor_entry = floor[0];
 	}
 
 	ret = of_property_read_string(node, "label", &name);
