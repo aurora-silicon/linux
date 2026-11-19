@@ -1350,6 +1350,25 @@ static void apple_rtkit_syslog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 }
 
+/* Where a counter has only ever run unanswered: nothing is echoed. */
+static bool apple_rtkit_oslog_unanswered(struct apple_rtkit *rtk)
+{
+	return !rtk->oslog_echo &&
+	       (rtk->sync_syslog_ack || of_machine_is_compatible("apple,t8140") ||
+		of_machine_is_compatible("apple,t8142"));
+}
+
+/* An OSLOG counter that is answered with its echo, on any lane. */
+static bool apple_rtkit_oslog_echoed(struct apple_rtkit *rtk, u64 msg)
+{
+	if (rtk->oslog_echo)
+		return true;
+	if (apple_rtkit_oslog_unanswered(rtk))
+		return false;
+	return (rtk->oslog_buffer.size || rtk->oslog_inherited) &&
+	       !(msg & APPLE_RTKIT_OSLOG_LOG_RESERVED);
+}
+
 static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_OSLOG_TYPE, msg);
@@ -1373,11 +1392,12 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 		return;
 	}
 
-	/* Preserve the tested Neo/M5 and synchronous-log no-ACK policy. */
-	if (type == APPLE_RTKIT_OSLOG_LOG &&
-	    (rtk->sync_syslog_ack || of_machine_is_compatible("apple,t8140") ||
-	     of_machine_is_compatible("apple,t8142"))) {
-		dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
+	if (type == APPLE_RTKIT_OSLOG_LOG && !apple_rtkit_oslog_echoed(rtk, msg)) {
+		/* Preserve the tested Neo/M5 and synchronous-log no-ACK policy. */
+		if (apple_rtkit_oslog_unanswered(rtk))
+			dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
+		else
+			dev_warn(rtk->dev, "RTKit: invalid oslog notification: %llx\n", msg);
 		return;
 	}
 
@@ -1392,13 +1412,9 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 		 * AppleDCP waits for its log transport to drain before AP sleep.
 		 * This is not a buffer offset and may wrap. Other channels do not
 		 * have a buffer admitted by this endpoint implementation. An inherited
-		 * channel zero needs no buffer mapping to acknowledge its counter.
+		 * channel zero needs no buffer mapping to acknowledge its counter
+		 * (apple_rtkit_oslog_echoed()).
 		 */
-		if ((!rtk->oslog_buffer.size && !rtk->oslog_inherited) ||
-		    (msg & APPLE_RTKIT_OSLOG_LOG_RESERVED)) {
-			dev_warn(rtk->dev, "RTKit: invalid oslog notification: %llx\n", msg);
-			break;
-		}
 		err = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_OSLOG,
 					       msg, NULL, false);
 		if (err)
