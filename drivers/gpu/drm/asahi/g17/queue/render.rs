@@ -906,6 +906,8 @@ impl Pair {
         // The J813's (common 26A428) items carry configuration, descriptor and announcement in
         // one publication; macOS 27.0 never publishes a configuration alone there.
         let j813 = crate::g17::J813_FORMS.load(Ordering::Relaxed);
+        let host_only_render_kicks =
+            m5 && !j813 && self.board.is_some_and(|board| board.host_only_render_kicks);
         if m5 && !j813 && self.registered.is_none() {
             if self.installed == [true; 2] {
                 // The cold-install configuration pair must be consumed first.
@@ -1031,12 +1033,8 @@ impl Pair {
                 },
             },
             mcache,
-            // M5 tiling kicks also retain the last event of the mask, except on the J813, whose
-            // macOS 27.0 TA and 3D kicks name no event at all. The J716C also runs its tiling
-            // kick ungated: the redundant entry-signal event adds a firmware round trip to a
-            // lone render and candidate 44 has qualified the zero-event form on this board.
-            event_mask: if m5 && stage == 0 && !j813
-                && !self.board.is_some_and(|board| board.clusters == 4) {
+            // Common 26A428 and the host-only form use an empty tiling event mask.
+            event_mask: if m5 && stage == 0 && !j813 && !host_only_render_kicks {
                 [0, 0, 0, 1u64 << 62]
             } else {
                 abi::RENDER_KICK_EVENT_MASK
@@ -1093,13 +1091,12 @@ impl Pair {
         let tiling_kick = tiling_kick.prepare_entry(&ta_args)?;
         let fragment_kick = fragment_kick.prepare_entry(&fragment_args)?;
         let memory = &mut *self.memory;
-        // J716C retains an installed render pair while work is already in
-        // flight. In that steady state the host-port kick is sufficient:
+        // For a firmware that supports host-only kicks, an installed render
+        // pair with work in flight can use the host-port kick alone:
         // another item-ring notification has no new configuration or lead
         // command to publish. Keep the ordinary inner publication for the
         // first command, a drained restart, a rebind, and a class change.
-        let sparse_inner = m5 && !j813
-            && self.board.is_some_and(|board| board.clusters == 4)
+        let sparse_inner = host_only_render_kicks
             && self.active.front().is_some() && self.previous.is_none()
             && self.registered == Some(policy.priority()) && !self.context_update
             && !self.identity_update && !present.into_iter().any(|value| value)
