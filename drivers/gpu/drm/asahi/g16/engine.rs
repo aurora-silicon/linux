@@ -941,7 +941,7 @@ impl Firmware {
     /// [`params::compute_flights`]. Renders, another VM's commands and every failure path
     /// need an empty engine: under several clients, compute queued behind another VM's
     /// lost its writes and stalled the firmware compute queue.
-    fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
+    pub(crate) fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
         let sent = job.progress.sent();
         if matches!(command(job, sent), Some(Command::Render(_))) {
             return self.can_queue_render_behind(job);

@@ -481,7 +481,7 @@ impl Scheduler {
         let scheduler = sched::Scheduler::new(
             dev,
             1,
-            hw::sizes::SCHEDULER_CREDITS,
+            super::params::credits(),
             0,
             hw::tuning::SCHED_TIMEOUT_MS,
             c_str!("aurora_g16"),

@@ -51,7 +51,12 @@ pub(crate) mod tune {
     pub(crate) static RENDER_UMA_SPLIT: AtomicU32 = AtomicU32::new(1);
     /// A queued render's TA waits for the previous FS with the predecessor hold (type 1).
     pub(crate) static RENDER_HOLD: AtomicU32 = AtomicU32::new(1);
-    const NAMES: [(&str, &AtomicU32, u32, u32); 9] = [
+    /// Jobs of a logical queue admitted to the engine at once (queues created later).
+    pub(crate) static CREDITS: AtomicU32 = AtomicU32::new(16);
+    /// Run the publication pass on every submission (1), or only when the submitted job
+    /// can be published at once (0).
+    pub(crate) static SUBMIT_PUBLISH: AtomicU32 = AtomicU32::new(0);
+    const NAMES: [(&str, &AtomicU32, u32, u32); 11] = [
         ("compute_units", &COMPUTE_UNITS, 2, super::hw::sizes::COMPUTE_UNITS as u32),
         ("compute_flights", &COMPUTE_FLIGHTS, 1, super::hw::sizes::FLIGHTS as u32),
         ("resnap_us", &RESNAP_US, 0, 1000),
@@ -61,6 +66,8 @@ pub(crate) mod tune {
         ("render_flights", &RENDER_FLIGHTS, 1, 2),
         ("render_uma_split", &RENDER_UMA_SPLIT, 0, 1),
         ("render_hold", &RENDER_HOLD, 0, 1),
+        ("credits", &CREDITS, 1, super::hw::sizes::SCHEDULER_CREDITS),
+        ("submit_publish", &SUBMIT_PUBLISH, 0, 1),
     ];
 
     /// Applies one `name=value` line.
@@ -117,6 +124,18 @@ pub(crate) fn render_uma_split() -> bool {
 /// Whether a queued render's TA waits on the previous FS with the predecessor hold.
 pub(crate) fn render_hold() -> bool {
     tune::RENDER_HOLD.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Jobs of a logical queue admitted to the engine at once.
+pub(crate) fn credits() -> u32 {
+    tune::CREDITS
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .clamp(1, hw::sizes::SCHEDULER_CREDITS)
+}
+
+/// Whether every submission runs the publication pass.
+pub(crate) fn submit_publish() -> bool {
+    tune::SUBMIT_PUBLISH.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
 /// Whether the host phase timers run.
