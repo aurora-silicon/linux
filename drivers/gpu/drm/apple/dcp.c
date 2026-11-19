@@ -329,13 +329,18 @@ static void dcp_release_rtkit(void *data)
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
+/*
+ * The H17P external display path is admitted by the processor and its
+ * firmware: an apple,t8140-dcpext node (the H17P external method profile)
+ * whose apple,firmware-version and apple,firmware-compat name the one
+ * firmware release that path speaks. The board does not enter into it.
+ */
 bool dcp_h17p_external_supported(struct device_node *np)
 {
 	u32 firmware[DCP_EXTERNAL_FW_CELLS], compat[DCP_EXTERNAL_FW_CELLS];
 	int firmware_cells, compat_cells;
 
-	if (!of_machine_is_compatible("apple,j700") ||
-	    !of_device_is_compatible(np, "apple,t8140-dcpext"))
+	if (!of_device_is_compatible(np, "apple,t8140-dcpext"))
 		return false;
 	firmware_cells = of_property_read_variable_u32_array(
 		np, "apple,firmware-version", firmware,

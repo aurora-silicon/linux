@@ -1554,8 +1554,9 @@ static bool machine_supported, absent_external;
 static unsigned int references, released, node_puts, probes[2], bind_attempts, disables;
 static int preflight_error, external_probe_error, bind_result;
 static void try_bind(void);
-static bool of_machine_is_compatible(const char *s)
-{ assert(!strcmp(s,"apple,j700")); return machine_supported; }
+/* The board must not enter into admission: any call fails the test. */
+static __attribute__((unused)) bool of_machine_is_compatible(const char *s)
+{ (void)s; assert(false); return machine_supported; }
 static int of_property_read_variable_u32_array(struct device_node *n,const char *s,u32 *v,int min,int max)
 {
     assert(min==3 && max==3);
@@ -1679,10 +1680,11 @@ int main(void)
 {
     assert(apple_dcp_external_bw_valid(0xbc000,0x28000,0x70000));
     assert(apple_dcp_external_clock_window(0x302800000ULL,0xbc000,0x302800000ULL,0xbc000));
-    /* No command line state: exact J700 firmware selects the external profile. */
+    /* No command line state: the exact firmware selects the external profile. */
     initial(true); assert(dcp_h17p_external_supported(&nodes[1]));
+    /* The board does not: the same node and firmware on any machine. */
     machine_supported=false;
-    assert(!dcp_h17p_external_supported(&nodes[1]) && match_providers()==1);
+    assert(dcp_h17p_external_supported(&nodes[1]));
     for(unsigned i=0;i<3;i++) {
         initial(true); nodes[1].firmware[i]++;
         assert(!dcp_h17p_external_supported(&nodes[1]) && match_providers()==1);
@@ -2100,8 +2102,10 @@ static unsigned acks, case_tag;
 static struct dcp_channel *dcp_get_channel(struct apple_dcp *d, enum dcp_context_id c)
 { (void)c; return &d->channel; }
 static int dcp_parse_tag(char *p) { (void)p; return case_tag; }
-static bool of_machine_is_compatible(const char *n) { (void)n; return machine; }
-static bool of_device_is_compatible(struct device_node *n, const char *s)
+/* Neither the board nor the node decides the D134 reply any more. */
+static __attribute__((unused)) bool of_machine_is_compatible(const char *n)
+{ (void)n; return machine; }
+static __attribute__((unused)) bool of_device_is_compatible(struct device_node *n, const char *s)
 { (void)s; return n->external; }
 static bool iomfb_check_callback_h17p(struct apple_dcp *d, int t, u32 i, u32 o)
 { (void)d; (void)t; (void)i; (void)o; return true; }
@@ -2140,7 +2144,8 @@ int main(void)
             d.hw.iomfb_method_profile = 0;
         case_tag = tag; acks = 0;
         dcpep_handle_cb(&d, context, h, sizeof(*h) + in + out, 0);
-        bool accepted = scope == 7 && tag == 134 && context == 3 && !in && out == 4;
+        /* Only the H17P external method profile (scope bit 2) decides. */
+        bool accepted = (scope & 4) && tag == 134 && context == 3 && !in && out == 4;
         if (scope & 4) {
             assert(acks == accepted && d.crashed != accepted);
             for (unsigned i = 0; i < out; i++)
