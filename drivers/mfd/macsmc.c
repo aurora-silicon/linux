@@ -17,6 +17,7 @@
 #include <linux/math.h>
 #include <linux/mfd/core.h>
 #include <linux/mfd/macsmc.h>
+#include <linux/moduleparam.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -54,6 +55,17 @@
 #define SMC_TIMEOUT_MS		500
 /* Restart and power-off go through atomic writes; give the SMC time. */
 #define SMC_ATOMIC_TIMEOUT_MS	5000
+
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
+/*
+ * Measured on J613: macOS writes WKTP=2 129 ms before its sleep commit. Whether the entry or
+ * the wake needs it is not established, so it stays off unless asked for.
+ */
+static bool j613_wktp2;
+module_param(j613_wktp2, bool, 0600);
+MODULE_PARM_DESC(j613_wktp2,
+		 "J613: write WKTP=2 after the SMC's sleep warning, as macOS does (unqualified)");
+#endif
 
 static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_NAME("macsmc-input"),
@@ -843,6 +855,17 @@ static void apple_smc_sleep_warn(struct apple_smc *smc)
 {
 	apple_smc_write_mbse(smc, SMC_KEY(slpw));
 	smc->sleep_warned = true;
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
+	if (j613_wktp2 && of_machine_is_compatible("apple,j613")) {
+		int ret;
+
+		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), 2);
+		if (ret)
+			dev_err(smc->dev, "Failed to issue WKTP=2: %d\n", ret);
+		else
+			dev_info(smc->dev, "J613 sleep: WKTP=2 accepted\n");
+	}
+#endif
 }
 
 static int apple_smc_notice_idle(struct apple_smc *smc)

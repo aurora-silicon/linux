@@ -847,6 +847,8 @@ struct apple_dcp {
 	struct delayed_work secure_poll_wq;
 	/* Stopped and not restarted, which outlives a suspend that gets refused. */
 	bool s2r_fw_down;
+	/* J613: stopped cold for a sleep the sleep driver owns. No restart exists. */
+	bool j613_sleep_down;
 	/* DCPEXT kept down through a dark wake, see dcp_s2r_dark_finish(). */
 	bool s2r_dark_held;
 	struct notifier_block s2r_pm_nb;

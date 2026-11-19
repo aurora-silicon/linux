@@ -22,4 +22,6 @@ int asahi_g17_power_auto_off(struct device *dev, u32 *saved);
 int asahi_g17_power_lower(struct device *dev);
 int asahi_g17_power_raise(struct device *dev, u32 saved);
 int asahi_g17_power_auto_on(struct device *dev, u32 saved);
+int asahi_m3_sleep_prepare(struct device *dev);
+void asahi_m3_sleep_complete(struct device *dev);
 #endif
