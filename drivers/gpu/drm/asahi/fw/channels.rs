@@ -122,7 +122,7 @@ pub(crate) enum PipeType {
     Compute = 2,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug, Copy, Clone, Default)]
 #[repr(C)]
 pub(crate) struct RunWorkQueueMsg {
@@ -137,10 +137,10 @@ pub(crate) struct RunWorkQueueMsg {
     pub(crate) __pad: Pad<0x1b>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) type PipeMsg = RunWorkQueueMsg::ver;
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) const DEVICECONTROL_SZ: usize = {
     #[ver(V < V13_2 || G != G14)]
     {
@@ -155,7 +155,7 @@ pub(crate) const DEVICECONTROL_SZ: usize = {
 // TODO: clean up when arbitrary_enum_discriminant is stable
 // https://github.com/rust-lang/rust/issues/60553
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug, Copy, Clone)]
 #[repr(C, u32)]
 #[allow(dead_code)]
@@ -225,10 +225,10 @@ pub(crate) enum DeviceControlMsg {
     Initialize(Pad<DEVICECONTROL_SZ::ver>), // Update RegionC
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 static_assert!(core::mem::size_of::<DeviceControlMsg::ver>() == 4 + DEVICECONTROL_SZ::ver);
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 default_zeroed!(DeviceControlMsg::ver);
 
 #[derive(Copy, Clone, Default, Debug)]
@@ -331,7 +331,7 @@ pub(crate) struct RawKTraceMsg {
     pub(crate) unk_flag: U64,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) const STATS_SZ: usize = {
     #[ver(V < V13_0B4)]
     {
@@ -343,7 +343,7 @@ pub(crate) const STATS_SZ: usize = {
     }
 };
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug, Copy, Clone)]
 #[repr(C, u32)]
 #[allow(dead_code)]
@@ -425,13 +425,13 @@ pub(crate) enum StatsMsg {
     }, // Max discriminant: 0xe
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 static_assert!(core::mem::size_of::<StatsMsg::ver>() == 4 + STATS_SZ::ver);
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) const STATS_MAX: u32 = 0xe;
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub(crate) union RawStatsMsg {
@@ -439,5 +439,5 @@ pub(crate) union RawStatsMsg {
     pub(crate) msg: StatsMsg::ver,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 default_zeroed!(RawStatsMsg::ver);

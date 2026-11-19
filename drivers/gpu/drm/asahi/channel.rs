@@ -210,13 +210,13 @@ where
 }
 
 /// Device Control channel for global device management commands.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct DeviceControlChannel {
     dev: AsahiDevRef,
     ch: TxChannel<ChannelState, DeviceControlMsg::ver>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl DeviceControlChannel::ver {
     const COMMAND_TIMEOUT_MS: i64 = 1000;
 
@@ -249,13 +249,13 @@ impl DeviceControlChannel::ver {
 }
 
 /// Pipe channel to submit WorkQueue execution requests.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct PipeChannel {
     dev: AsahiDevRef,
     ch: TxChannel<ChannelState, PipeMsg::ver>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl PipeChannel::ver {
     /// Allocate a new Pipe submission channel.
     pub(crate) fn new(
@@ -316,7 +316,7 @@ impl FwCtlChannel {
 
 /// Event channel, used to notify the driver of command completions, GPU faults and errors, and
 /// other events.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct EventChannel {
     dev: AsahiDevRef,
     ch: RxChannel<ChannelState, RawEventMsg>,
@@ -325,7 +325,7 @@ pub(crate) struct EventChannel {
     gpu: Option<Arc<dyn gpu::GpuManager>>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl EventChannel::ver {
     /// Allocate a new Event channel.
     pub(crate) fn new(
@@ -587,7 +587,7 @@ impl KTraceChannel {
 /// Debug-logs the messages and, when the `stats_export` module parameter
 /// is enabled, also updates the shared `StatsSnapshot` exported via
 /// `/sys/class/drm/card*/device/agx_stats`.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct StatsChannel {
     dev: AsahiDevRef,
     ch: RxChannel<ChannelState, RawStatsMsg::ver>,
@@ -602,7 +602,7 @@ pub(crate) struct StatsChannel {
     busy: crate::stats_busy::BusyIntegrator,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl StatsChannel::ver {
     /// Allocate a new Statistics channel.
     pub(crate) fn new(

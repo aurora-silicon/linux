@@ -318,10 +318,12 @@ impl SyncItem {
                 }
                 anchor = Some(i as usize);
             }
-            vec.push(
-                Self::parse_one(file, sync, i >= in_count, allow_cumulative)?,
-                GFP_KERNEL,
-            )?;
+            let (kind, handle, value) = (sync.sync_type, sync.handle, sync.timeline_value);
+            let item = Self::parse_one(file, sync, i >= in_count, allow_cumulative).inspect_err(|e| {
+                pr_info!("asahi: sync {} of {} (in {}) type={} handle={} value={} rejected {:?}\n",
+                         i, count, in_count, kind, handle, value, e);
+            })?;
+            vec.push(item, GFP_KERNEL)?;
         }
         if let Some(anchor) = anchor {
             let bundle = crate::g17::sync_output::SignalBundle::new(
@@ -1650,6 +1652,26 @@ impl File {
         data: &mut uapi::drm_asahi_queue_create,
         file: &DrmFile,
     ) -> Result<u32> {
+        #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+        let (vm, prio, usc, layouts, timeout) = (data.vm_id, data.priority, data.usc_exec_base,
+            data.render_scs_layout, data.compute_timeout_ms);
+        let result = Self::queue_create_inner(device, reg_data, data, file);
+        #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+        if let Err(e) = result.as_ref() {
+            if reg_data.gpu.as_any().is::<crate::j413::Backend>() {
+                dev_info!(device.as_ref(), "queue_create failed {:?}: vm={} priority={} usc={:#x} layouts={:x?} timeout={}\n",
+                          e, vm, prio, usc, layouts, timeout);
+            }
+        }
+        result
+    }
+
+    fn queue_create_inner(
+        device: &AsahiDrmDevice<drm::Registered>,
+        reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        data: &mut uapi::drm_asahi_queue_create,
+        file: &DrmFile,
+    ) -> Result<u32> {
         let file_id = file.inner().id;
 
         mod_dev_dbg!(
@@ -1770,6 +1792,24 @@ impl File {
 
     /// IOCTL: submit: Submit GPU work to a command submission queue.
     pub(crate) fn submit(
+        device: &AsahiDrmDevice,
+        reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        data: &mut uapi::drm_asahi_submit,
+        file: &DrmFile,
+    ) -> Result<u32> {
+        #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+        let fields = (data.flags, data.pad, data.queue_id, data.in_sync_count, data.out_sync_count, data.cmdbuf_size);
+        let result = Self::submit_inner(device, reg_data, data, file);
+        #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+        if let Err(e) = result.as_ref() {
+            if *e != ERESTARTSYS && reg_data.gpu.as_any().is::<crate::j413::Backend>() {
+                dev_info!(device.as_ref(), "J413 submit ioctl failed {:?}: flags/pad/queue/in/out/size={:?}\n", e, fields);
+            }
+        }
+        result
+    }
+
+    fn submit_inner(
         device: &AsahiDrmDevice,
         reg_data: &driver::AsahiDrmRegistrationData<'_>,
         data: &mut uapi::drm_asahi_submit,

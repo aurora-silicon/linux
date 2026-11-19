@@ -55,7 +55,7 @@ pub(crate) mod raw {
         pub(crate) unk_padding: U64,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug, Clone, Copy)]
     #[repr(C)]
     pub(crate) struct AuxFBInfo {
@@ -68,7 +68,7 @@ pub(crate) mod raw {
         pub(crate) unk3: U64,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct JobParameters1<'a> {
@@ -154,7 +154,7 @@ pub(crate) mod raw {
         pub(crate) __pad: Pad<0xac>,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct JobParameters3 {
@@ -204,7 +204,7 @@ pub(crate) mod raw {
         pub(crate) isp_zls_pixels: U64,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct RunFragment<'a> {
@@ -275,7 +275,7 @@ pub(crate) mod raw {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 pub(crate) struct RunFragment {
     pub(crate) notifier: Arc<GpuObject<event::Notifier::ver>>,
@@ -287,10 +287,10 @@ pub(crate) struct RunFragment {
     pub(crate) user_timestamps: job::UserTimestamps,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl GpuStruct for RunFragment::ver {
     type Raw<'a> = raw::RunFragment::ver<'a>;
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl workqueue::Command for RunFragment::ver {}

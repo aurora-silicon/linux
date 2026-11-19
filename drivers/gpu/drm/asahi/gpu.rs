@@ -106,6 +106,20 @@ const EP_DOORBELL: u8 = 0x21;
 const MSG_INIT: u64 = 0x81 << 48;
 const INIT_DATA_MASK: u64 = (1 << 44) - 1;
 
+pub(crate) const fn init_message(address: u64) -> u64 {
+    MSG_INIT | (address & INIT_DATA_MASK)
+}
+
+/// The four 16-bit firmware version words of a packed version.
+pub(crate) fn version_words(word: u64) -> fw::types::Array<4, u16> {
+    fw::types::Array::new(core::array::from_fn(|i| (word >> (16 * i)) as u16))
+}
+
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod j413_root;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+pub(crate) use j413_root::*;
+
 const RX_WORK_PENDING: u32 = 1 << 0;
 const RX_WORK_RUNNING: u32 = 1 << 1;
 
@@ -127,6 +141,7 @@ const DOORBELL_DEVCTRL: u64 = 0x11;
 // Upper kernel half VA address ranges.
 /// Private (cached) firmware structure VA range base.
 const IOVA_KERN_PRIV_RANGE: Range<u64> = 0xffffffa000000000..0xffffffa600000000;
+const G14G_TIMESTAMP_RANGE: Range<u64> = 0xffffffa181400000..0xffffffa185400000;
 /// Private (cached) GPU-RO firmware structure VA range base.
 const IOVA_KERN_GPU_RO_RANGE: Range<u64> = 0xffffffa600000000..0xffffffa800000000;
 /// Shared (uncached) firmware structure VA range base.
@@ -179,7 +194,7 @@ pub(crate) struct KernelAllocators {
 }
 
 /// Receive (GPU->driver) ring buffer channels.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[pin_data]
 struct RxChannels {
     event: channel::EventChannel::ver,
@@ -189,7 +204,7 @@ struct RxChannels {
 }
 
 /// GPU work submission pipe channels (driver->GPU).
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 struct PipeChannels {
     pub(crate) vtx: KVec<Pin<KBox<Mutex<channel::PipeChannel::ver>>>>,
     pub(crate) frag: KVec<Pin<KBox<Mutex<channel::PipeChannel::ver>>>>,
@@ -197,7 +212,7 @@ struct PipeChannels {
 }
 
 /// Misc command transmit (driver->GPU) channels.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[pin_data]
 struct TxChannels {
     pub(crate) device_control: channel::DeviceControlChannel::ver,
@@ -262,7 +277,7 @@ struct FaultLogState {
 }
 
 /// Top-level GPU manager that owns all the global state relevant to the driver instance.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[pin_data]
 pub(crate) struct GpuManager {
     dev: AsahiDevRef,
@@ -300,7 +315,7 @@ pub(crate) struct GpuManager {
     fault_log: SpinLock<FaultLogState>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 unsafe impl HasWork<GpuManager::ver> for GpuManager::ver {
     unsafe fn raw_get_work(ptr: *mut Self) -> *mut Work<GpuManager::ver> {
         // SAFETY: The caller supplies a live GpuManager allocation.
@@ -313,7 +328,7 @@ unsafe impl HasWork<GpuManager::ver> for GpuManager::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl WorkItem for GpuManager::ver {
     type Pointer = Arc<Self>;
 
@@ -529,7 +544,7 @@ impl rtkit::Buffer for RtkitObject {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[vtable]
 impl rtkit::Operations for GpuManager::ver {
     type Data = Arc<GpuManager::ver>;
@@ -598,7 +613,7 @@ impl rtkit::Operations for GpuManager::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl GpuManager::ver {
     fn poll_rx_channels(&self) {
         let mut ch = self.rx_channels.lock();
@@ -653,13 +668,45 @@ impl GpuManager::ver {
         cfg: &'static hw::HwConfig,
     ) -> Result<Arc<GpuManager::ver>> {
         let uat = Self::make_uat(dev, cfg)?;
+        let mgr = Self::build_graph(dev, res, cfg, uat, true, None)?;
+        let rtkit =
+            rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
+
+        *mgr.rtkit.lock() = Some(rtkit);
+
+        {
+            let mut rxc = mgr.rx_channels.lock();
+            rxc.event.set_manager(mgr.clone());
+        }
+
+        Ok(mgr)
+    }
+
+    // Build the owned records before attaching RTKit. A version-check trial can
+    // supply its own reserved UAT and withhold the MMIO aperture and all doorbells.
+    #[inline(never)]
+    pub(crate) fn build_graph(
+        dev: &AsahiDrmDevice,
+        res: &regs::Resources<'_>,
+        cfg: &'static hw::HwConfig,
+        uat: KBox<mmu::Uat>,
+        map_registers: bool,
+        _trial_version: Option<u64>,
+    ) -> Result<Arc<GpuManager::ver>> {
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
+        // The 26B123 timestamp aperture falls inside the legacy private range.
+        // Keep normal allocations below it in the J413 construction profile.
+        let private_end = if cfg.chip_id == 0x8112 && _trial_version == Some(0x0c8a_8342_8392_04c8) {
+            G14G_TIMESTAMP_RANGE.start
+        } else {
+            IOVA_KERN_PRIV_RANGE.end
+        };
 
         let mut alloc = KernelAllocators {
             private: alloc::DefaultAllocator::new(
                 dev,
                 uat.kernel_vm(),
-                IOVA_KERN_PRIV_RANGE,
+                IOVA_KERN_PRIV_RANGE.start..private_end,
                 0x80,
                 mmu::PROT_FW_PRIV_RW,
                 1024 * 1024,
@@ -802,49 +849,54 @@ impl GpuManager::ver {
                 }
             });
 
-        for (i, map) in cfg.io_mappings.iter().enumerate() {
-            if let Some(map) = map.as_ref() {
-                Self::iomap(&mut mgr, cfg, i, map)?;
+        if map_registers {
+            for (i, map) in cfg.io_mappings.iter().enumerate() {
+                if let Some(map) = map.as_ref() {
+                    Self::iomap(&mut mgr, cfg, i, map)?;
+                }
+            }
+
+            #[ver(V >= V13_0B4)]
+            if let Some(base) = cfg.sram_base {
+                let size = cfg.sram_size.unwrap();
+                let iova = mgr.as_mut().alloc_mmio_iova(size);
+
+                let mapping = mgr.uat.kernel_vm().map_io(
+                    dev.as_ref().as_ref(),
+                    iova,
+                    base,
+                    size,
+                    mmu::PROT_FW_SHARED_RW,
+                )?;
+
+                mgr.as_mut()
+                    .initdata_mut()
+                    .runtime_pointers
+                    .hwdata_b
+                    .with_mut(|raw, _| {
+                        raw.sgx_sram_ptr = U64(mapping.iova());
+                    });
+
+                mgr.as_mut().io_mappings_mut().push(mapping, GFP_KERNEL)?;
             }
         }
 
         #[ver(V >= V13_0B4)]
-        if let Some(base) = cfg.sram_base {
-            let size = cfg.sram_size.unwrap();
-            let iova = mgr.as_mut().alloc_mmio_iova(size);
-
-            let mapping = mgr.uat.kernel_vm().map_io(
-                dev.as_ref().as_ref(),
-                iova,
-                base,
-                size,
-                mmu::PROT_FW_SHARED_RW,
-            )?;
-
-            mgr.as_mut()
-                .initdata_mut()
-                .runtime_pointers
-                .hwdata_b
-                .with_mut(|raw, _| {
-                    raw.sgx_sram_ptr = U64(mapping.iova());
-                });
-
-            mgr.as_mut().io_mappings_mut().push(mapping, GFP_KERNEL)?;
+        if let Some(word) = _trial_version {
+            mgr.as_mut().initdata_mut().with_mut(|raw, _| raw.ver_info = version_words(word));
         }
 
         let mgr = Arc::from(mgr);
 
-        let rtkit =
-            rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
-
-        *mgr.rtkit.lock() = Some(rtkit);
-
-        {
-            let mut rxc = mgr.rx_channels.lock();
-            rxc.event.set_manager(mgr.clone());
-        }
-
         Ok(mgr)
+    }
+
+    pub(crate) fn trial_root(&self) -> u64 {
+        self.initdata.gpu_va().get()
+    }
+
+    pub(crate) fn trial_uat(&self) -> &mmu::Uat {
+        &self.uat
     }
 
     /// Return a mutable reference to the initdata member
@@ -1257,6 +1309,10 @@ impl GpuManager::ver {
             }
         }
 
+        // The 27.2 hardware data carries register-map entries; its builder fills them.
+        #[ver(V >= V27_2)]
+        let _ = index;
+        #[ver(V < V27_2)]
         this.as_mut()
             .initdata_mut()
             .runtime_pointers
@@ -1531,7 +1587,7 @@ extern "C" {
     fn asahi_min_cpu_capacity() -> u32;
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Gpu for GpuManager::ver {
     /// A light submission completes in tens of microseconds, so its submitter
     /// sleeps briefly between submissions and the CPU scheduler places and
@@ -1588,7 +1644,7 @@ impl Gpu for GpuManager::ver {
         rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
         rtk.as_mut().start_endpoint(EP_DOORBELL)?;
         rtk.as_mut()
-            .send_message(EP_FIRMWARE, MSG_INIT | (initdata & INIT_DATA_MASK))?;
+            .send_message(EP_FIRMWARE, init_message(initdata))?;
         rtk.as_mut()
             .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
         core::mem::drop(guard);
@@ -1685,7 +1741,7 @@ impl Gpu for GpuManager::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl GpuManager for GpuManager::ver {
     fn update_globals(&self) {
         let mut timeout: u32 = 2;
@@ -2028,7 +2084,7 @@ impl GpuManager for GpuManager::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl GpuManagerPriv for GpuManager::ver {
     fn end_op(&self) {
         let val = self

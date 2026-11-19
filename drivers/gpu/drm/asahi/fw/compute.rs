@@ -39,7 +39,7 @@ pub(crate) mod raw {
         pub(crate) __pad: Pad<0xfc>,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct JobParameters2<'a> {
@@ -55,7 +55,7 @@ pub(crate) mod raw {
         pub(crate) unk_5c: u32,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct RunCompute<'a> {
@@ -100,7 +100,7 @@ pub(crate) mod raw {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 pub(crate) struct RunCompute {
     pub(crate) notifier: Arc<GpuObject<event::Notifier::ver>>,
@@ -111,10 +111,10 @@ pub(crate) struct RunCompute {
     pub(crate) user_timestamps: job::UserTimestamps,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl GpuStruct for RunCompute::ver {
     type Raw<'a> = raw::RunCompute::ver<'a>;
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl workqueue::Command for RunCompute::ver {}

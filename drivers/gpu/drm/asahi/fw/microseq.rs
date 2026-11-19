@@ -147,7 +147,7 @@ pub(crate) struct RetireStamp {
 
 impl Operation for RetireStamp {}
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct Timestamp<'a> {
@@ -166,10 +166,10 @@ pub(crate) struct Timestamp<'a> {
     pub(crate) unk_30_padding: u32,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl<'a> Operation for Timestamp::ver<'a> {}
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct StartVertex<'a> {
@@ -206,10 +206,10 @@ pub(crate) struct StartVertex<'a> {
     pub(crate) unk_178: u32,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl<'a> Operation for StartVertex::ver<'a> {}
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct FinalizeVertex {
@@ -243,10 +243,10 @@ pub(crate) struct FinalizeVertex {
     pub(crate) unk_74: Array<0x10, u8>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Operation for FinalizeVertex::ver {}
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct StartFragment<'a> {
@@ -287,10 +287,10 @@ pub(crate) struct StartFragment<'a> {
     pub(crate) notifier_buf: GpuWeakPointer<Array<0x8, u8>>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl<'a> Operation for StartFragment::ver<'a> {}
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct FinalizeFragment {
@@ -329,10 +329,10 @@ pub(crate) struct FinalizeFragment {
     pub(crate) unk_9c: Array<0x10, u8>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Operation for FinalizeFragment::ver {}
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct StartCompute<'a> {
@@ -364,10 +364,10 @@ pub(crate) struct StartCompute<'a> {
     pub(crate) notifier_buf: GpuWeakPointer<Array<0x8, u8>>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl<'a> Operation for StartCompute::ver<'a> {}
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct FinalizeCompute<'a> {
@@ -408,5 +408,5 @@ pub(crate) struct FinalizeCompute<'a> {
     pub(crate) unk_79: Array<0x7, u8>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl<'a> Operation for FinalizeCompute::ver<'a> {}

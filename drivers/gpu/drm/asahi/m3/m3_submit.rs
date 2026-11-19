@@ -2,6 +2,7 @@
 //! Bounded M3 compute and graphics submissions through the common DRM scheduler/syncobjs.
 use kernel::{c_str,dma_fence::*,drm::sched,prelude::*,sync::{Arc,Mutex},new_mutex,xarray};
 use crate::{file,m3::agx_uapi,mmu,queue,m3::m3_drm::Shared};
+use crate::alloc::Allocator as _;
 use core::sync::atomic::{AtomicBool, Ordering};
 #[derive(Default)]
 pub(crate) struct Completion;
@@ -53,7 +54,12 @@ pub(crate) struct Packet {
     /// Who submitted the packet, for the failure log only.
     pub(crate) owner:Owner,
     vm_job:Pin<KBox<Mutex<Option<mmu::VmJobGuard>>>>,
+    /// J413 27.2: the compute preemption buffer in the packet's VM, kept until retirement.
+    pub(crate) j413_preempt:Option<crate::fw::types::GpuArray<u8>>,
 }
+/// The runtime a queue's packets go to: the M3 runtime or the J413 27.2 compute runtime.
+#[derive(Clone)]
+pub(crate) enum Sink { M3(Shared), J413(Arc<crate::j413::Runtime>) }
 /// The process and thread that submitted a packet, recorded in the submit ioctl. Only logged:
 /// a renamed task leaves a stale name, which is harmless.
 #[derive(Copy,Clone)]
@@ -118,9 +124,9 @@ impl Packet {
         }
     }
 }
-pub(crate) struct Job {shared:Shared,packet:Arc<Packet>}
+pub(crate) struct Job {shared:Sink,packet:Arc<Packet>}
 /// Timeout state of a [`Job`], owned by the scheduler's timeout worker.
-pub(crate) struct JobTimeout {shared:Shared,packet:Arc<Packet>}
+pub(crate) struct JobTimeout {shared:Sink,packet:Arc<Packet>}
 impl sched::JobImpl for Job {
     type TimeoutData = JobTimeout;
     fn timeout_data(&self)->JobTimeout {
@@ -129,7 +135,11 @@ impl sched::JobImpl for Job {
     fn run(job:&mut Self)->Result<Option<Fence>> {
         // Queue the packet and return its fence; the completion worker publishes and retires
         // it, so the scheduler can hand over further ready jobs meanwhile.
-        if let Err(e)=crate::m3::m3_runtime::Runtime::submit(&job.shared,job.packet.clone()) {
+        let submitted=match &job.shared {
+            Sink::M3(shared)=>crate::m3::m3_runtime::Runtime::submit(shared,job.packet.clone()),
+            Sink::J413(runtime)=>runtime.submit(job.packet.clone()),
+        };
+        if let Err(e)=submitted {
             pr_err!("M3 scheduler: submission failed {:?}\n",e);
             // submit() failed before this packet could be published.
             job.packet.release_guard();job.packet.finish(Err(e));
@@ -137,13 +147,23 @@ impl sched::JobImpl for Job {
         Ok(Some(Fence::from_fence(&job.packet.completion)))
     }
     fn timed_out(job:&mut JobTimeout,_finished:bool)->sched::Status {
+        let shared=match &job.shared {
+            Sink::M3(shared)=>shared.clone(),
+            Sink::J413(runtime)=>{
+                // The runtime's own command timeout fails a hung GPU; a healthy one is late.
+                if runtime.healthy() {return sched::Status::NoHang;}
+                runtime.withdraw(&job.packet);
+                job.packet.finish(Err(EIO));
+                return sched::Status::NoDevice;
+            }
+        };
         // Retain the publishing branch's explicit diagnostic override.
         if !crate::m3::m3_params::timeout_nohang() {
-            if let Some(r)=Option::as_mut(&mut *job.shared.lock()) {r.health().mark_failed();}
-            crate::m3::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
+            if let Some(r)=Option::as_mut(&mut *shared.lock()) {r.health().mark_failed();}
+            crate::m3::m3_runtime::Runtime::withdraw(&shared,&job.packet);
             job.packet.finish(Err(ETIMEDOUT));return sched::Status::NoDevice;
         }
-        let guard=job.shared.lock();
+        let guard=shared.lock();
         let Some(runtime)=guard.as_ref() else {
             job.packet.finish(Err(ENODEV));
             return sched::Status::NoDevice;
@@ -154,12 +174,15 @@ impl sched::JobImpl for Job {
         // device loss or corrupting an already signaled fence.
         if runtime.health().healthy() { return sched::Status::NoHang; }
         drop(guard);
-        crate::m3::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
+        crate::m3::m3_runtime::Runtime::withdraw(&shared,&job.packet);
         job.packet.finish(Err(EIO));
         sched::Status::NoDevice
     }
     fn cancel(job:&mut Self) {
-        crate::m3::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
+        match &job.shared {
+            Sink::M3(shared)=>{crate::m3::m3_runtime::Runtime::withdraw(shared,&job.packet);}
+            Sink::J413(runtime)=>runtime.withdraw(&job.packet),
+        }
         job.packet.finish(Err(ECANCELED));
     }
 }
@@ -175,7 +198,9 @@ impl agx_uapi::GpuAddressSpace for AddressSpace<'_> {
 }
 pub(crate) struct Queue {
     entity:sched::Entity<Job>,_scheduler:Arc<sched::Scheduler<Job>>,
-    shared:Shared,vm:mmu::Vm,usc:u64,fences:FenceContexts,
+    shared:Sink,vm:mmu::Vm,usc:u64,fences:FenceContexts,
+    /// J413: the VM's private allocator, for per-packet preemption buffers.
+    j413_alloc:Option<Arc<Mutex<crate::alloc::DefaultAllocator>>>,
     /// Whether the SoC advertises early tiling (`m3_soc::Features::fragment_dependency`).
     early_tiling:bool,
     wide_visibility:bool,
@@ -190,8 +215,19 @@ impl Queue {
         let priority=match priority {3=>sched::Priority::Low,2=>sched::Priority::Normal,
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
-            shared,vm,usc,fences:FenceContexts::new(1,c_str!("asahi_m3_queue"),kernel::static_lock_class!())?,
-            early_tiling,wide_visibility,urgency})
+            shared:Sink::M3(shared),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_m3_queue"),kernel::static_lock_class!())?,
+            early_tiling,wide_visibility,urgency,j413_alloc:None})
+    }
+    /// A J413 27.2 compute queue: the same front end, published by the J413 runtime.
+    pub(crate) fn new_j413(runtime:Arc<crate::j413::Runtime>,scheduler:Arc<sched::Scheduler<Job>>,vm:mmu::Vm,priority:u32,usc:u64,
+        ualloc_priv:Arc<Mutex<crate::alloc::DefaultAllocator>>)->Result<Self> {
+        agx_uapi::QueueUscWindow{base:usc,user_start:0x4000,user_end:(1u64<<42)-0x8000}.validate().map_err(|_|EINVAL)?;
+        let urgency=3u8.saturating_sub(priority.min(3) as u8);
+        let priority=match priority {3=>sched::Priority::Low,2=>sched::Priority::Normal,
+            1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
+        Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
+            shared:Sink::J413(runtime),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_j413_queue"),kernel::static_lock_class!())?,
+            early_tiling:false,wide_visibility:false,urgency,j413_alloc:Some(ualloc_priv)})
     }
 }
 impl queue::Queue for Queue {
@@ -199,13 +235,15 @@ impl queue::Queue for Queue {
         raw:&[u8],objects:Pin<&xarray::XArray<KBox<file::Object>>>)->Result {
         let vm_job=self.vm.retain_job()?;
         let mut parser=agx_uapi::UapiCommandParser::new(raw);let mut commands=KVec::new();let mut timestamps=KVec::new();let mut flushes=KVec::new();let mut visibility=KVec::new();let mut render_attachments=KVec::new();
-        while let Some(command)=parser.next_hardware().map_err(|_|EINVAL)? {
+        while let Some(command)=parser.next_hardware().map_err(|e|{pr_err!("asahi submit: command parse rejected {:?} (cmdbuf {} bytes)\n",e,raw.len());EINVAL})? {
             if let agx_uapi::ParsedHardwareCommand::Render{payload,vertex_attachments,fragment_attachments,..}=command {
+                // The J413 27.2 backend is compute-only.
+                if self.j413_alloc.is_some() {return Err(EINVAL);}
                 if let Err(e)=validate_render(payload,self.usc,&AddressSpace(&self.vm),self.early_tiling) {
                     pr_err!("M3 render rejected {:?}: flags={:#x} size={}x{} layers={} samples={} utile={}x{} sample_size={} depth={:#x} stencil={:#x} zls={:#x} samplers={} heap={:#x}\n",e,payload.flags,payload.width,payload.height,payload.layers,payload.samples,payload.utile_width,payload.utile_height,payload.sample_size,payload.depth.base,payload.stencil.base,payload.zls_control,payload.sampler_count,payload.sampler_heap);
                     return Err(e);
                 }
-                agx_uapi::validate_attachments(&AddressSpace(&self.vm),&vertex_attachments).map_err(|_|EINVAL)?;
+                agx_uapi::validate_attachments(&AddressSpace(&self.vm),&vertex_attachments).map_err(|e|{pr_err!("asahi submit: attachments rejected {:?}\n",e);EINVAL})?;
                 agx_uapi::validate_attachments(&AddressSpace(&self.vm),&fragment_attachments).map_err(|_|EINVAL)?;
                 commands.push(Command::Render{command:payload,usc:self.usc},GFP_KERNEL)?;
                 timestamps.push([Destination::resolve(objects,payload.vertex_timestamps.start)?,
@@ -237,13 +275,22 @@ impl queue::Queue for Queue {
                     pr_err!("M3 compute translation rejected {:?}: stream={:#x}..{:#x} helper={:?}\n",e,payload.control_stream_base,payload.control_stream_end,payload.helper);
                     EINVAL
                 })?;
-            crate::m3::m3_client::check_compute_launches(&self.vm,&AddressSpace(&self.vm),c.control_stream_base,c.control_stream_end)?;
+            // The launch check decodes the 26.x G15 CDM launch format; G14 (J413) streams differ.
+            if self.j413_alloc.is_none() {
+                crate::m3::m3_client::check_compute_launches(&self.vm,&AddressSpace(&self.vm),c.control_stream_base,c.control_stream_end)?;
+            }
             timestamps.push([Destination::resolve(objects,payload.timestamps.start)?,
                 Destination::resolve(objects,payload.timestamps.end)?,None,None],GFP_KERNEL)?;
             commands.push(Command::Compute(crate::m3::agx_compute::Control{base:c.control_stream_base,end:c.control_stream_end,usc_base:self.usc}),GFP_KERNEL)?;
         }
-        parser.finish().map_err(|_|EINVAL)?;
-        let packet=Arc::new(Packet{vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,render_attachments,
+        parser.finish().map_err(|e|{pr_err!("asahi submit: command buffer trailer rejected {:?}\n",e);EINVAL})?;
+        // 13.5 compute preemption buffer: buffer 1 of compute_preempt1_size, then four words.
+        let j413_preempt=match &self.j413_alloc {
+            Some(alloc) if commands.iter().any(|c| matches!(c, Command::Compute(_))) =>
+                Some(alloc.lock().array_empty::<u8>(crate::hw::t8112::HWCONFIG.compute_preempt1_size + 0x20)?),
+            _ => None,
+        };
+        let packet=Arc::new(Packet{j413_preempt,vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,render_attachments,
             completion:self.fences.new_fence(0,Completion)?.into(),
             finish_claimed:AtomicBool::new(false),published:AtomicBool::new(false),urgency:self.urgency,owner:Owner::current(),
             vm_job:KBox::pin_init(new_mutex!(Some(vm_job)),GFP_KERNEL)?},GFP_KERNEL)?;

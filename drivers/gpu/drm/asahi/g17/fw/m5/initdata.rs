@@ -1827,7 +1827,7 @@ const COMMON26_POLICY_BOOT_TIMESTAMP: usize = 0x6c14;
 /// initPowerAndPerformanceData stores (the G18 backend's G18G_26A428_POLICY_BANDS). 26A428
 /// inserts 0x680 bytes between the AON PTD pointer and the boot timestamp; the 25G76 words
 /// there have no place.
-const COMMON26_POLICY_BANDS: &[LayoutBand] = &[
+pub(crate) const COMMON26_POLICY_BANDS: &[LayoutBand] = &[
     band(0x0000, 0x009c, 0, Evidence::ProducerChecked),
     band(0x00a0, 0x0200, 0x10, Evidence::ProducerChecked),
     band(0x09b8, 0x295c, 0x10, Evidence::ProducerChecked),

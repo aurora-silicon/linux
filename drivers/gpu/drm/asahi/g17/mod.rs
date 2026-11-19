@@ -375,6 +375,16 @@ enum CrashLogMap {
     FirmwareData(data_segment::DataSegmentLog),
 }
 
+impl CrashLog {
+    /// Map only the range firmware requested within its loader-reserved data.
+    pub(crate) fn from_firmware(dev: &device::Device, iova: usize, size: usize) -> Result<Self> {
+        Ok(Self {
+            iova,
+            map: CrashLogMap::FirmwareData(data_segment::DataSegmentLog::map(dev, iova, size)?),
+        })
+    }
+}
+
 impl rtkit::Buffer for CrashLog {
     fn iova(&self) -> Result<usize> {
         Ok(self.iova)
@@ -483,14 +493,7 @@ impl rtkit::Operations for RoleOps {
             });
         }
         // The firmware places its buffers in its data segment, at their physical address.
-        Ok(CrashLog {
-            iova,
-            map: CrashLogMap::FirmwareData(data_segment::DataSegmentLog::map(
-                &data.shared.dev,
-                iova,
-                size,
-            )?),
-        })
+        CrashLog::from_firmware(&data.shared.dev, iova, size)
     }
 }
 

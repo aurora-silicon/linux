@@ -54,6 +54,10 @@ pub(crate) type Event = slotalloc::Guard<EventInner>;
 pub(crate) struct EventValue(u32);
 
 impl EventValue {
+    pub(crate) fn raw(self) -> u32 {
+        self.0
+    }
+
     /// Returns the `EventValue` that succeeds this one.
     pub(crate) fn next(&self) -> EventValue {
         EventValue(self.0.wrapping_add(0x100))
@@ -197,6 +201,11 @@ impl EventManager {
             Ok(())
         })?;
         Ok(ev)
+    }
+
+    /// Reserve the normal stamp pair for a kernel queue that polls its own completion.
+    pub(crate) fn try_get_polled(&self) -> Result<Event> {
+        self.alloc.try_get(None)
     }
 
     /// Signals an event by slot, indicating completion (of one or more commands).

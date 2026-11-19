@@ -37,7 +37,7 @@ use ::pin_init;
 use ::pin_init::Init;
 
 /// Builder helper for the global GPU InitData.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct InitDataBuilder<'a> {
     dev: &'a AsahiDrmDevice,
     alloc: &'a mut gpu::KernelAllocators,
@@ -45,7 +45,7 @@ pub(crate) struct InitDataBuilder<'a> {
     dyncfg: &'a hw::DynConfig,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl<'a> InitDataBuilder::ver<'a> {
     /// Create a new InitData builder
     pub(crate) fn new(
@@ -995,9 +995,15 @@ impl<'a> InitDataBuilder::ver<'a> {
         }
     }
 
+
     /// Build the top-level InitData object.
     #[inline(never)]
     pub(crate) fn build(&mut self) -> Result<KBox<GpuObject<InitData::ver>>> {
+        // The 27.2 root is built by the J413 root builder in gpu.rs, not from this graph.
+        #[ver(V >= V27_2)]
+        return Err(ENOSYS);
+        #[ver(V < V27_2)]
+        {
         let runtime_pointers = self.runtime_pointers()?;
         let globals = self.globals()?;
         let fw_status = self.fw_status()?;
@@ -1041,5 +1047,6 @@ impl<'a> InitDataBuilder::ver<'a> {
             },
         )?;
         Ok(KBox::new(obj, GFP_KERNEL)?)
+        }
     }
 }

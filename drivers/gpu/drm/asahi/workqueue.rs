@@ -284,7 +284,7 @@ impl<O: OpaqueCommandObject, C: FnOnce(Option<WorkError>) + Send + Sync> GenSubm
 }
 
 /// Inner data for managing a single work queue.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 struct WorkQueueInner {
     dev: driver::AsahiDevice,
     event_manager: Arc<event::EventManager>,
@@ -317,7 +317,7 @@ struct WorkQueueInner {
 }
 
 /// An instance of a work queue.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[pin_data]
 pub(crate) struct WorkQueue {
     info_pointer: GpuWeakPointer<QueueInfo::ver>,
@@ -325,7 +325,7 @@ pub(crate) struct WorkQueue {
     inner: Mutex<WorkQueueInner::ver>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl WorkQueueInner::ver {
     fn info(&self) -> &GpuObject<QueueInfo::ver> {
         self.info
@@ -348,7 +348,7 @@ impl WorkQueueInner::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Copy, Clone)]
 pub(crate) struct QueueEventInfo {
     pub(crate) stamp_pointer: GpuWeakPointer<Stamp>,
@@ -360,7 +360,7 @@ pub(crate) struct QueueEventInfo {
     pub(crate) info_ptr: GpuWeakPointer<QueueInfo::ver>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct Job {
     wq: Arc<WorkQueue::ver>,
     event_info: QueueEventInfo::ver,
@@ -372,7 +372,7 @@ pub(crate) struct Job {
     fence: dma_fence::Fence,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct JobSubmission<'a> {
     inner: Option<Guard<'a, WorkQueueInner::ver, MutexBackend>>,
     wptr: u32,
@@ -380,7 +380,7 @@ pub(crate) struct JobSubmission<'a> {
     command_count: usize,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Job::ver {
     pub(crate) fn event_info(&self) -> QueueEventInfo::ver {
         let mut info = self.event_info;
@@ -597,7 +597,7 @@ impl Job::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl<'a> JobSubmission::ver<'a> {
     pub(crate) fn run(mut self, channel: &mut channel::PipeChannel::ver) {
         let command_count = self.command_count;
@@ -639,7 +639,7 @@ impl<'a> JobSubmission::ver<'a> {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Drop for Job::ver {
     fn drop(&mut self) {
         mod_pr_debug!("WorkQueue: Dropping Job\n");
@@ -684,7 +684,7 @@ impl Drop for Job::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl<'a> Drop for JobSubmission::ver<'a> {
     fn drop(&mut self) {
         let inner = self.inner.as_mut().expect("No inner?");
@@ -712,7 +712,7 @@ impl<'a> Drop for JobSubmission::ver<'a> {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Drop for WorkQueueInner::ver {
     fn drop(&mut self) {
         // Release any command held back for the firmware's completion tail. The queue is being torn
@@ -734,7 +734,7 @@ impl Drop for WorkQueueInner::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl WorkQueueInner::ver {
     /// Return the number of free entries in the workqueue
     pub(crate) fn free_space(&self) -> usize {
@@ -755,7 +755,7 @@ impl WorkQueueInner::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl WorkQueue::ver {
     /// Create a new WorkQueue of a given type and priority.
     #[allow(clippy::too_many_arguments)]
@@ -988,7 +988,7 @@ pub(crate) trait WorkQueue {
     fn fail_all(&self, error: WorkError);
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl WorkQueue for WorkQueue::ver {
     fn as_any(&self) -> &dyn Any {
         self

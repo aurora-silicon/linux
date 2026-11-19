@@ -22,7 +22,7 @@ pub(crate) mod raw {
         pub(crate) ring: Option<GpuWeakPointer<[U]>>,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct PipeChannels {
@@ -30,7 +30,7 @@ pub(crate) mod raw {
         pub(crate) frag: ChannelRing<channels::ChannelState, channels::PipeMsg::ver>,
         pub(crate) comp: ChannelRing<channels::ChannelState, channels::PipeMsg::ver>,
     }
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     default_zeroed!(PipeChannels::ver);
 
     #[derive(Debug, Default)]
@@ -184,7 +184,7 @@ pub(crate) mod raw {
     }
     default_zeroed!(T81xxData);
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Default, Copy, Clone)]
     #[repr(C)]
     pub(crate) struct PowerZone {
@@ -202,7 +202,7 @@ pub(crate) mod raw {
         pub(crate) pad: u32,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     const MAX_CORES_PER_CLUSTER: usize = {
         #[ver(G >= G14X)]
         {
@@ -223,7 +223,7 @@ pub(crate) mod raw {
         pub(crate) cs_2: Array<2, F32>,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[repr(C)]
     pub(crate) struct HwDataA {
         pub(crate) unk_0: u32,
@@ -587,9 +587,9 @@ pub(crate) mod raw {
 
         pub(crate) unk_3d34: Array<0x38, u8>,
     }
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     default_zeroed!(HwDataA::ver);
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     no_debug!(HwDataA::ver);
 
     #[derive(Debug, Default, Clone, Copy)]
@@ -602,7 +602,7 @@ pub(crate) mod raw {
         pub(crate) readwrite: U64,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     const IO_MAPPING_COUNT: usize = {
         #[ver(V < V13_0B4)]
         {
@@ -637,7 +637,7 @@ pub(crate) mod raw {
         pub(crate) afr_unkpad: u32,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct HwDataB {
@@ -663,10 +663,15 @@ pub(crate) mod raw {
         pub(crate) yuv_matrices: Array<0x3f, Array<3, Array<4, i16>>>,
 
         pub(crate) pad_1c8: Pad<0x8>,
+        #[ver(V < V27_2)]
         pub(crate) io_mappings: Array<IO_MAPPING_COUNT::ver, IOMapping>,
+        #[ver(V >= V27_2)]
+        pub(crate) io_mappings: Array<60, crate::g17::fw::initdata::RegisterMapEntry>,
 
         #[ver(V >= V13_0B4)]
         pub(crate) sgx_sram_ptr: U64,
+        #[ver(V >= V27_2)]
+        pub(crate) coredump_copy_buffer_size: U64,
 
         pub(crate) chip_id: u32,
         pub(crate) unk_454: u32,
@@ -835,7 +840,7 @@ pub(crate) mod raw {
         #[ver(V >= V13_0B4)]
         pub(crate) unk_c3c: u32,
     }
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     default_zeroed!(HwDataB::ver);
 
     #[derive(Debug)]
@@ -846,7 +851,7 @@ pub(crate) mod raw {
     }
     default_zeroed!(GpuStatsVtx);
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct GpuStatsFrag {
@@ -861,7 +866,7 @@ pub(crate) mod raw {
         pub(crate) unk3: Array<0x1000, u8>,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     impl Default for GpuStatsFrag::ver {
         fn default() -> Self {
             Self {
@@ -884,7 +889,7 @@ pub(crate) mod raw {
     }
     default_zeroed!(GpuGlobalStatsVtx);
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug, Default)]
     #[repr(C)]
     pub(crate) struct GpuGlobalStatsFrag {
@@ -901,7 +906,7 @@ pub(crate) mod raw {
     }
     default_zeroed!(GpuStatsComp);
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct RuntimeScratch {
@@ -942,10 +947,10 @@ pub(crate) mod raw {
         pub(crate) unk_6b38: u32,
         pub(crate) pad_6b3c: Pad<0x84>,
     }
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     default_zeroed!(RuntimeScratch::ver);
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[repr(C)]
     pub(crate) struct RuntimePointers<'a> {
         pub(crate) pipes: Array<4, PipeChannels::ver>,
@@ -984,7 +989,7 @@ pub(crate) mod raw {
         pub(crate) __pad1: Pad<0x5c>,
         pub(crate) gpu_scratch: RuntimeScratch::ver,
     }
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     no_debug!(RuntimePointers::ver<'_>);
 
     #[derive(Debug)]
@@ -1016,7 +1021,7 @@ pub(crate) mod raw {
     }
     default_zeroed!(PowerZoneGlobal);
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct Globals {
@@ -1226,7 +1231,7 @@ pub(crate) mod raw {
         #[ver(V >= V13_3)]
         pub(crate) unk_11f00: Array<0x280, u8>,
     }
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     default_zeroed!(Globals::ver);
 
     #[derive(Debug, Default, Clone, Copy)]
@@ -1243,7 +1248,7 @@ pub(crate) mod raw {
         pub(crate) index_mask: U64,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct InitData<'a> {
@@ -1253,20 +1258,67 @@ pub(crate) mod raw {
         pub(crate) unk_buf: GpuPointer<'a, &'a [u8]>,
         pub(crate) unk_8: u32,
         pub(crate) unk_c: u32,
+        #[ver(V < V27_2)]
         pub(crate) runtime_pointers: GpuPointer<'a, super::RuntimePointers::ver>,
+        #[ver(V < V27_2)]
         pub(crate) globals: GpuPointer<'a, super::Globals::ver>,
+        #[ver(V < V27_2)]
         pub(crate) fw_status: GpuPointer<'a, super::FwStatus>,
+        // The newer single-role G15 root splits the old status pointer into two words.
+        // Opaque targets stay tied to their backing until their contents are qualified.
+        #[ver(V >= V27_2)]
+        pub(crate) runtime_pointers: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V27_2)]
+        pub(crate) globals: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V27_2)]
+        pub(crate) role: u32,
+        #[ver(V >= V27_2)]
+        pub(crate) host_mapped_fw_allocations: u32,
         pub(crate) uat_page_size: u16,
         pub(crate) uat_page_bits: u8,
         pub(crate) uat_num_levels: u8,
         pub(crate) uat_level_info: Array<0x3, UatLevelInfo>,
         pub(crate) __pad0: Pad<0x14>,
+        #[ver(V < V27_2)]
         pub(crate) host_mapped_fw_allocations: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_ac: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_b0: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_b4: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_b8: u32,
+        #[ver(V >= V27_2)]
+        pub(crate) status_record: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V27_2)]
+        pub(crate) control: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V27_2)]
+        pub(crate) power: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V27_2)]
+        pub(crate) extra: GpuPointer<'a, &'a [u8]>,
     }
+
+    // The candidate is deliberately limited to the root. These checks validate
+    // host encoding against the neighbouring profiles, independent of firmware admission.
+    const _: () = {
+        // T8112's older layout locates its optional SRAM pointer after 25 IO records.
+        assert!(core::mem::offset_of!(HwDataBG14V13_5, io_mappings) == 0x640);
+        assert!(core::mem::size_of::<IOMapping>() == 0x20);
+        assert!(core::mem::offset_of!(HwDataBG14V13_5, sgx_sram_ptr) == 0x960);
+        assert!(core::mem::offset_of!(HwDataBG14V27_2, io_mappings) == 0x640);
+        assert!(core::mem::offset_of!(HwDataBG14V27_2, sgx_sram_ptr) == 0xfa0);
+        assert!(core::mem::offset_of!(HwDataBG14V27_2, coredump_copy_buffer_size) == 0xfa8);
+        assert!(core::mem::offset_of!(HwDataBG14V27_2, chip_id) == 0xfb0);
+        type Root = InitDataG14V27_2<'static>;
+        assert!(core::mem::offset_of!(Root, ver_info) == 0);
+        assert!(core::mem::offset_of!(Root, role) == 0x28);
+        assert!(core::mem::offset_of!(Root, host_mapped_fw_allocations) == 0x2c);
+        assert!(core::mem::offset_of!(Root, uat_level_info) == 0x34);
+        assert!(core::mem::offset_of!(Root, status_record) == 0xa8);
+        assert!(core::mem::offset_of!(Root, extra) == 0xc0);
+        assert!(core::mem::size_of::<Root>() == 0xc8);
+    };
 }
 
 #[derive(Debug)]
@@ -1292,17 +1344,17 @@ where
 
 trivial_gpustruct!(FwStatus);
 trivial_gpustruct!(GpuGlobalStatsVtx);
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 trivial_gpustruct!(GpuGlobalStatsFrag::ver);
 trivial_gpustruct!(GpuStatsComp);
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 trivial_gpustruct!(HwDataA::ver);
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 trivial_gpustruct!(HwDataB::ver);
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 pub(crate) struct Stats {
     pub(crate) vtx: GpuObject<GpuGlobalStatsVtx>,
@@ -1310,7 +1362,7 @@ pub(crate) struct Stats {
     pub(crate) comp: GpuObject<GpuStatsComp>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 pub(crate) struct RuntimePointers {
     pub(crate) stats: Stats::ver,
@@ -1329,15 +1381,15 @@ pub(crate) struct RuntimePointers {
     pub(crate) buffer_mgr_ctl_high_mapping: Option<mmu::KernelMapping>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl GpuStruct for RuntimePointers::ver {
     type Raw<'a> = raw::RuntimePointers::ver<'a>;
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 trivial_gpustruct!(Globals::ver);
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 pub(crate) struct InitData {
     pub(crate) unk_buf: GpuArray<u8>,
@@ -1346,7 +1398,7 @@ pub(crate) struct InitData {
     pub(crate) fw_status: GpuObject<FwStatus>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl GpuStruct for InitData::ver {
     type Raw<'a> = raw::InitData::ver<'a>;
 }

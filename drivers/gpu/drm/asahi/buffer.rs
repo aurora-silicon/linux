@@ -116,7 +116,7 @@ pub(crate) struct TileInfo {
 }
 
 /// A single scene, representing a render pass and its required buffers.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 pub(crate) struct Scene {
     object: GpuObject<buffer::Scene::ver>,
@@ -136,7 +136,7 @@ pub(crate) struct Scene {
     meta4_off: usize,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Scene::ver {
     /// Returns true if the buffer was bound to a fresh manager slot, and therefore needs an init
     /// command before a render.
@@ -272,7 +272,7 @@ impl Scene::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Drop for Scene::ver {
     fn drop(&mut self) {
         let mut inner = self.object.buffer.inner.lock();
@@ -290,7 +290,7 @@ impl Drop for Scene::ver {
 }
 
 /// Inner data for a single TVB buffer object.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 struct BufferInner {
     info: GpuObject<buffer::Info::ver>,
     ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
@@ -313,12 +313,12 @@ struct BufferInner {
 }
 
 /// Locked and reference counted TVB buffer.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct Buffer {
     inner: Arc<Mutex<BufferInner::ver>>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Buffer::ver {
     /// Create a new Buffer for a given VM, given the per-VM allocators.
     pub(crate) fn new<'drm>(
@@ -729,7 +729,7 @@ impl Buffer::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Clone for Buffer::ver {
     fn clone(&self) -> Self {
         Buffer::ver {
@@ -738,10 +738,10 @@ impl Clone for Buffer::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 struct BufferSlotInner();
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl slotalloc::SlotItem for BufferSlotInner::ver {
     type Data = BufferManagerInner::ver;
 
@@ -752,16 +752,16 @@ impl slotalloc::SlotItem for BufferSlotInner::ver {
 }
 
 /// Inner data for the buffer manager, to be protected by the SlotAllocator lock.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct BufferManagerInner {
     owners: KVec<Option<Buffer::ver>>,
 }
 
 /// The GPU-global buffer manager, used to allocate and release buffer slots from the pool.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct BufferManager(slotalloc::SlotAllocator<BufferSlotInner::ver>);
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl BufferManager::ver {
     pub(crate) fn new() -> Result<BufferManager::ver> {
         let mut owners = KVec::new();
@@ -801,7 +801,7 @@ impl BufferManager::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Clone for BufferManager::ver {
     fn clone(&self) -> Self {
         BufferManager::ver(self.0.clone())

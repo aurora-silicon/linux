@@ -27,6 +27,9 @@ mod g18;
 #[cfg(CONFIG_DRM_ASAHI_M5)]
 mod m5;
 mod gpu;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod j413;
+
 mod hw;
 mod initdata;
 mod m3;
@@ -175,6 +178,254 @@ module! {
         legacy_inline_submit: u32 {
             default: 1,
             description: "G13/G14: publish ready in-order jobs from SUBMIT (0: off)",
+        },
+        t8112_telemetry_ro: bool {
+            default: false,
+            description: "J413 startup trial: expose the shared telemetry window read-only",
+        },
+        t8112_dashboard_ram: bool {
+            default: false,
+            description: "J413 idle-policy trial: back the dashboard update slot with isolated RAM",
+        },
+        t8112_rgx_ram_pages: u32 {
+            default: 255,
+            description: "J413 RGX scratch trial: one bit per 16 KiB RAM page",
+        },
+        t8112_ram_slots: u64 {
+            default: 0,
+            description: "J413 idle trial: isolated RAM substitutes, bit per descriptor (0, 1, 3, 8, 10, 12, 17, 33, 40, 44)",
+        },
+        t8112_cre: bool {
+            default: false,
+            description: "J413 power trial: enable CRE during firmware initialization",
+        },
+        t8112_power_filter: bool {
+            default: false,
+            description: "J413 26B123: seed the calibrated cold power controllers",
+        },
+        t8112_power_curve: bool {
+            default: false,
+            description: "J413 indexed wake: populate the calibrated operating-point power curve",
+        },
+        t8112_alarm_fields: u32 {
+            default: 0,
+            description: "J413 indexed wake: number of additional stock alarm fields to publish",
+        },
+        t8112_calibrated_sensors: u64 {
+            default: 0,
+            description: "J413 trial: sensor inventory from this unit's PMGR calibration records",
+        },
+        t8112_fast_die_fields: u32 {
+            default: 0,
+            description: "J413 metrology trial: cumulative fast-die release temperature, mask, integral and proportional gains (0-4)",
+        },
+        t8112_firmware_log: bool {
+            default: false,
+            description: "J413 diagnostic: open the firmware log publication gate in the directory",
+        },
+        t8112_service_stage: bool {
+            default: true,
+            description: "J413 26B123: also require powered stage 2 before the first engine entry",
+        },
+        t8112_command_notifier: u32 {
+            default: 0,
+            description: "J413 first command: command offset of the per-command notifier pointer (0 none; firmware reads +0xc)",
+        },
+        t8112_drain_statistics: bool {
+            default: false,
+            description: "J413 26B123: consume the firmware statistics ring while polling",
+        },
+        t8112_client_counter: bool {
+            default: false,
+            description: "J413 first command: place the signal counter at a context-0 client VA",
+        },
+        t8112_priority_row: u32 {
+            default: 255,
+            description: "J413 first command: legacy priority row and matching submission group (0-3), 255 for the stock priority fields in group 0",
+        },
+        t8112_stock_header: bool {
+            default: false,
+            description: "J413 first command: type-9 prefix (data master at +0x18) and a tracking slot with its retirement cursor",
+        },
+        t8112_completion_record: bool {
+            default: false,
+            description: "J413 first command: completion destination at command +0x30",
+        },
+        t8112_job_context: u32 {
+            default: 0,
+            description: "J413 26B123: client context of the kernel-owned job (0 kernel context, 1-63 a clone of it)",
+        },
+        t8112_provider_object: u32 {
+            default: 0,
+            description: "J413 26B123 compute job: provider-wide object named by start/finish (0 directory +0x264, 1 directory +0x26c)",
+        },
+        t8112_tail_probe: u32 {
+            default: 0,
+            description: "J413 26B123 compute job diagnostic: poison or fill command tail words",
+        },
+        t8112_start_probe: u32 {
+            default: 0,
+            description: "J413 26B123 compute job diagnostic: poison start-record operands (1 provider, 2 channel, 3 command-relative)",
+        },
+        t8112_job_wait_ms: u32 {
+            default: 3000,
+            description: "J413 26B123: how long to wait for the held command to retire",
+        },
+        t8112_power_zones: u32 {
+            default: 1,
+            description: "J413 26B123: average-power zone count seeded in the controller (stock J413 has 0)",
+        },
+        t8112_rekick_ms: u32 {
+            default: 0,
+            description: "J413 26B123: repeat the engine kick this long after submission (0 never)",
+        },
+        t8112_dashboard_real: bool {
+            default: false,
+            description: "J413 26B123: map the real push-telemetry dashboard page writable for the firmware instead of private RAM",
+        },
+        t8112_state_cap: u32 {
+            default: 0,
+            description: "J413 26B123: upper performance-state cap in hundredths at shared configuration +0x98 (0 = ceiling)",
+        },
+        t8112_firmware_trace: bool {
+            default: false,
+            description: "J413 26B123 diagnostic: set the firmware debug bit that enables its trace ring",
+        },
+        t8112_trace_bits: u32 {
+            default: 2,
+            description: "J413 26B123 diagnostic: firmware debug category bits used with t8112_firmware_trace",
+        },
+        t8112_trace_show: u32 {
+            default: 160,
+            description: "J413 26B123 diagnostic: number of trace records to print",
+        },
+        t8112_hw_legacy: u64 {
+            default: 0,
+            description: "J413 26B123: carry legacy HwDataB configuration words to the inline hardware block (1 num_frags, 2 unk_504, 4 unk_4c0, 8 unk_534, 0x10 unk_524, 0x20 flag/clock group)",
+        },
+        t8112_forced_stop: u32 {
+            default: 0,
+            description: "J413 trial: RTKit acknowledged power-off before teardown (1 if still running, 2 always)",
+        },
+        t8112_queue_lane: u32 {
+            default: 0,
+            description: "J413 trial queue +0x48: 0 as the priority row writes it, 1 all-ones sentinel, n+2 lane n",
+        },
+        t8112_task_configuration: u32 {
+            default: 0,
+            description: "J413 trial scheduler context +0x26: 0 untouched, n+1 task-configuration byte n",
+        },
+        t8112_context_id_field: bool {
+            default: false,
+            description: "J413 trial client context: identifier in bits 63:48 of both table entries",
+        },
+        t8112_private_scan: u32 {
+            default: 0,
+            description: "J413 trial, read-only firmware data log: 1 words around pointers to the job's host objects while parked, 2 non-zero rows of the queue-record areas, 4 both after the wait ends",
+        },
+        t8112_drm: bool {
+            default: false,
+            description: "J413 27.2: keep the firmware running after the boot compute job and register a compute-only DRM device",
+        },
+        t8112_drm_ring_skew: bool {
+            default: false,
+            description: "J413 27.2 diagnostic: publish one empty submission entry at take-over",
+        },
+        t8112_queue_capacity: u32 {
+            default: 0x500,
+            description: "J413 27.2: queue capacity at position block +0x50 (16 x channel count, at most 0x800)",
+        },
+        t8112_job_order: u32 {
+            default: 0,
+            description: "J413 26B123 compute job: 0 alone as the first command, 1 as the second command after the retiring signal, 2 first with the signal published behind it",
+        },
+        t8112_compute_job: bool {
+            default: false,
+            description: "J413 26B123: submit a kernel-owned type-3 compute job (terminate-only CDM stream) in place of the signal",
+        },
+        t8112_command_service: bool {
+            default: false,
+            description: "J413 26B123: request command-handler installation in the firmware data and wait for it",
+        },
+        t8112_ring_start: u32 {
+            default: 0,
+            description: "J413 diagnostic: index of the trial ring's first entry (the ring starts empty there; 255 makes the first client command wrap)",
+        },
+        t8112_first_publication: bool {
+            default: true,
+            description: "J413 first command: first-publication byte of the submission entry",
+        },
+        t8112_queue_owner: u32 {
+            default: 0xffffffff,
+            description: "J413 first command: owning process word of the work queue",
+        },
+        t8112_class_opcode: u32 {
+            default: 0x1b,
+            description: "J413 first command: device-control opcode of the engine-class registrations",
+        },
+        t8112_opening_opcode: u32 {
+            default: 0x15,
+            description: "J413 first command: device-control opcode of the opening record (0x15 on the 27.x line, 0x16 on J613 26.6.2)",
+        },
+        t8112_command_engine: u32 {
+            default: 2,
+            description: "J413 first command: data master of the signal (0 tiler, 1 fragment, 2 compute)",
+        },
+        t8112_command_type: u32 {
+            default: 9,
+            description: "J413 first command: channel-command type word of the kernel-owned signal",
+        },
+        t8112_engine_classes: u32 {
+            default: 0,
+            description: "J413 first command: 0 none, 1 stage the extended opening control record, 2 also register two engine classes per data master",
+        },
+        t8112_active_followup: u32 {
+            default: 0,
+            description: "J413 acknowledged wake: 0 observe, 1 release, 2 complete a held fence then release",
+        },
+        t8112_post_power_job: bool {
+            default: false,
+            description: "J413 power trial: publish one completion after both real-core idle commands retire",
+        },
+        t8112_mtr_sensors: bool {
+            default: false,
+            description: "J413 stock power trial: use the G14G board sensor mask in the secure metrology controller",
+        },
+        t8112_sgx_open: bool {
+            default: false,
+            description: "J413 power trial: open the SGX synchronization window with inherited platform selection",
+        },
+        t8112_gpc_irq_bit: u32 {
+            default: 0,
+            description: "J413 stock power trial: enable one GPC interrupt bit (1 or 2)",
+        },
+        t8112_event_completion: bool {
+            default: false,
+            description: "J413 power trial: select event-assisted operating-point completion",
+        },
+        t8112_base_request: bool {
+            default: false,
+            description: "J413 power trial: initialize the wake operand from the board base operating point",
+        },
+        t8112_performance_control: bool {
+            default: false,
+            description: "J413 power trial: request firmware-managed operating points",
+        },
+        t8112_pmp_vote: bool {
+            default: false,
+            description: "J413 power trial: acquire the linked PMP AGX device before ASC start",
+        },
+        t8112_fender_gating: u32 {
+            default: 0,
+            description: "J413 idle trial: Fender gating at power-on (0 inherited, 1 hold, 2 automatic)",
+        },
+        t8112_idle_policy: bool {
+            default: false,
+            description: "J413 idle trial: request and release GPU power through the idle policy",
+        },
+        t8112_handshake: u32 {
+            default: 0,
+            description: "J413 GPU trial: 1 UAT, 2 legacy InitData, 3-6 neighbouring ABI controls, 7 G14G root, 9/10 extended channel construction, 11 J413 stopped construction, 12 J413 startup with writable MMIO limited to SGX, 13 one kernel-owned compute fence, 14 matching idle control",
         },
         legacy_rx_fastpath: u32 {
             default: 1,

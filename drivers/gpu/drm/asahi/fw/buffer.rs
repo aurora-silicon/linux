@@ -44,7 +44,7 @@ pub(crate) mod raw {
         pub(crate) __pad1: Pad<0x1c>,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct Info<'a> {
@@ -85,7 +85,7 @@ pub(crate) mod raw {
         pub(crate) unk_90: Array<0x30, u8>,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct Scene<'a> {
@@ -109,7 +109,7 @@ pub(crate) mod raw {
         pub(crate) unk_38: U64, // pad
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct InitBuffer<'a> {
@@ -127,7 +127,7 @@ trivial_gpustruct!(BlockControl);
 trivial_gpustruct!(Counter);
 trivial_gpustruct!(Stats);
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 pub(crate) struct Info {
     pub(crate) block_ctl: GpuObject<BlockControl>,
@@ -136,7 +136,7 @@ pub(crate) struct Info {
     pub(crate) block_list: GpuArray<u32>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl GpuStruct for Info::ver {
     type Raw<'a> = raw::Info::ver<'a>;
 }
@@ -146,7 +146,7 @@ pub(crate) struct ClusterBuffers {
     pub(crate) meta: GpuArray<u8>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct Scene {
     pub(crate) user_buffer: GpuArray<u8>,
     pub(crate) buffer: crate::buffer::Buffer::ver,
@@ -159,26 +159,26 @@ pub(crate) struct Scene {
     pub(crate) control_word: GpuArray<u32>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 no_debug!(Scene::ver);
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl GpuStruct for Scene::ver {
     type Raw<'a> = raw::Scene::ver<'a>;
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct InitBuffer {
     pub(crate) scene: Arc<crate::buffer::Scene::ver>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 no_debug!(InitBuffer::ver);
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl workqueue::Command for InitBuffer::ver {}
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl GpuStruct for InitBuffer::ver {
     type Raw<'a> = raw::InitBuffer::ver<'a>;
 }

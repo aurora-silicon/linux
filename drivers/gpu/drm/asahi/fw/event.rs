@@ -27,7 +27,7 @@ pub(crate) mod raw {
     }
     default_zeroed!(NotifierList);
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug, Clone, Copy)]
     #[repr(C)]
     pub(crate) struct NotifierState {
@@ -51,7 +51,7 @@ pub(crate) mod raw {
         pub(crate) unk_buf: Array<0x8, u8>, // Init to all-ff
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     impl Default for NotifierState::ver {
         fn default() -> Self {
             #[allow(unused_mut)]
@@ -77,7 +77,7 @@ pub(crate) mod raw {
         }
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct Notifier<'a> {
@@ -92,13 +92,13 @@ pub(crate) mod raw {
 trivial_gpustruct!(Threshold);
 trivial_gpustruct!(NotifierList);
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 pub(crate) struct Notifier {
     pub(crate) threshold: GpuObject<Threshold>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl GpuStruct for Notifier::ver {
     type Raw<'a> = raw::Notifier::ver<'a>;
 }

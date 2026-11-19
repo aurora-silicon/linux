@@ -32,7 +32,7 @@ use kernel::xarray;
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Compute;
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl super::QueueInner::ver {
     /// Submit work to a compute queue.
     #[expect(

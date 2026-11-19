@@ -81,7 +81,7 @@ mod agx_resources;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod agx_status;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-mod agx_uapi;
+pub(crate) mod agx_uapi;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod g15_raw;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
@@ -125,7 +125,7 @@ mod m3_rtkit;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod m3_runtime;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-mod m3_submit;
+pub(crate) mod m3_submit;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod m3_thermal;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
@@ -162,6 +162,7 @@ mod m3_scene_layout;
 mod m3_shared_layout;
 
 mod m3_state_layout;
+pub(crate) use m3_state_layout::EXTENDED_NOTIFIER_SIZE;
 
 mod m3_sync_layout;
 
@@ -201,11 +202,13 @@ pub(crate) mod m3_soc;
 
 mod t8122_hwdata;
 
-mod m3_init_26;
+pub(crate) mod m3_init_26;
 mod m3_profile;
-mod m3_mmio_26;
+pub(crate) mod m3_mmio_26;
 
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod m3_power_26;
 
-mod m3_channel_format;
+pub(crate) mod m3_channel_format;
+pub(crate) use m3_channel_format::{idle_cursor, payload_offset, submission_entry, Action, CONTROL_BYTES, ENGINE_CLASSES};
+pub(crate) use m3_init_storage::DEVICE_CONTROL;

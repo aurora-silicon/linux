@@ -40,7 +40,7 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Render;
 /// cluster.
 const TILECTL_DISABLE_CLUSTERING: u32 = 1u32 << 0;
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl super::QueueInner::ver {
     /// Get the appropriate tiling parameters for a given userspace command buffer.
     fn get_tiling_params(

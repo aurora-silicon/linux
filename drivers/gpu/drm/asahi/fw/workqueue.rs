@@ -124,7 +124,7 @@ pub(crate) mod raw {
         }
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_ROOT)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct QueueInfo<'a> {
@@ -175,7 +175,7 @@ impl GpuStruct for GpuContextData {
 ///
 /// The raw structure points to the queue's GPU context weakly. The `GpuContext` keeps these
 /// structures until it has been invalidated, and only then frees its own data.
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Debug)]
 pub(crate) struct QueueInfo {
     pub(crate) state: GpuObject<RingState>,
@@ -184,7 +184,7 @@ pub(crate) struct QueueInfo {
     pub(crate) notifier_list: Arc<GpuObject<event::NotifierList>>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl GpuStruct for QueueInfo::ver {
     type Raw<'a> = raw::QueueInfo::ver<'a>;
 }

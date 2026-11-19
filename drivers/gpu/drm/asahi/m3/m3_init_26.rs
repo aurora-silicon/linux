@@ -19,11 +19,24 @@ pub(crate) const LOG_THREADS: usize = 9;
 pub(crate) const RX_BYTES: usize = 0x48;
 pub(crate) const LOG_PAYLOAD_BYTES: usize = 0xd8;
 
+/// The shared cache-flush ring has separate index and entry addresses on the wire.
+pub(crate) fn write_flush_ring(
+    bytes: &mut [u8], offset: usize, state: u64, entries: u64,
+) -> Result<(), Error> {
+    if state == 0 || entries == 0 || (state | entries) & 0x3f != 0 {
+        return Err(Error::Address);
+    }
+    let pair = bytes.get_mut(offset..).and_then(|s| s.get_mut(..16)).ok_or(Error::Size)?;
+    pair[..8].copy_from_slice(&state.to_le_bytes());
+    pair[8..].copy_from_slice(&entries.to_le_bytes());
+    Ok(())
+}
+
 /// Extend the existing M3 owner indices instead of introducing another owner graph.
 pub(crate) fn allocation(index: usize) -> Result<Allocation, Error> {
     let size = match index {
         0..=23 if index % 2 == 0 => 0x30,
-        0..=23 => 0x1800,
+        0..=23 => super::m3_channel_format::SLOTS as usize * super::m3_channel_format::SUBMISSION_BYTES,
         24 | 26 | 30 | 32 => 0x30,
         25 => 0x4000,
         27 | 33 => 0x4800,
@@ -63,6 +76,30 @@ pub(crate) fn allocation(index: usize) -> Result<Allocation, Error> {
 
 pub(crate) fn cached(index: usize) -> bool {
     matches!(index, 39 | PERFORMANCE_CONTROL)
+}
+
+/// Thirteen TX descriptors and four RX state/ring pairs. Both the extended
+/// M3 profile and the adjacent G14G profile use these directory offsets.
+/// The caller owns all 34 buffers through firmware stop.
+pub(crate) fn write_channels(bytes: &mut [u8], addresses: &[u64; 34]) -> Result<(), Error> {
+    if bytes.len() < 0x200 || addresses.contains(&0) {
+        return Err(Error::Bounds);
+    }
+    let pointer = |bytes: &mut [u8], offset, value: u64| {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    };
+    for channel in 0..13 {
+        let offset = 0x20 + channel * 0x20;
+        let state = addresses[channel * 2];
+        pointer(bytes, offset, state);
+        pointer(bytes, offset + 8, state + 0x10);
+        pointer(bytes, offset + 16, state + 0x20);
+        pointer(bytes, offset + 24, addresses[channel * 2 + 1]);
+    }
+    for (index, &address) in addresses[26..].iter().enumerate() {
+        pointer(bytes, 0x1c0 + index * 8, address);
+    }
+    Ok(())
 }
 
 pub(crate) struct PointerGraph<'a> {
@@ -155,14 +192,6 @@ impl PointerGraph<'_> {
         for (offset, owner) in [
             (0, storage::HARDWARE_DATA),
             (0x10, storage::UNKNOWN_PAIR),
-            (0x1c0, 26),
-            (0x1c8, 27),
-            (0x1d0, 28),
-            (0x1d8, 29),
-            (0x1e0, 30),
-            (0x1e8, 31),
-            (0x1f0, 32),
-            (0x1f8, 33),
             (0x200, storage::FWLOG_PAYLOAD),
             (0x254, storage::UNKNOWN_C0),
             (0x25c, storage::UNKNOWN_C1),
@@ -174,14 +203,7 @@ impl PointerGraph<'_> {
         ] {
             pointer(bytes, offset, addresses[owner]);
         }
-        for channel in 0..13 {
-            let offset = 0x20 + channel * 0x20;
-            let state = addresses[channel * 2];
-            pointer(bytes, offset, state);
-            pointer(bytes, offset + 8, state + 0x10);
-            pointer(bytes, offset + 16, state + 0x20);
-            pointer(bytes, offset + 24, addresses[channel * 2 + 1]);
-        }
+        write_channels(bytes, addresses[..34].try_into().map_err(|_| Error::Bounds)?)?;
         Ok(())
     }
 
@@ -191,8 +213,8 @@ impl PointerGraph<'_> {
             .get_mut(..allocation(storage::CONTROL_REGION)?.size)
             .ok_or(Error::Size)?;
         bytes.fill(0);
-        bytes[0x4f88..0x4f90].copy_from_slice(&addresses[storage::FW_CONTROL_STATE].to_le_bytes());
-        bytes[0x4f90..0x4f98].copy_from_slice(&addresses[storage::FW_CONTROL_RING].to_le_bytes());
+        write_flush_ring(bytes, 0x4f88, addresses[storage::FW_CONTROL_STATE],
+                         addresses[storage::FW_CONTROL_RING])?;
         bytes[0x4fd4..0x4fd8].copy_from_slice(&1u32.to_le_bytes());
         Ok(())
     }
@@ -201,6 +223,17 @@ impl PointerGraph<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn j413_empty_flush_ring_publishes_both_views() {
+        let mut control = [0u8; 0x4bf8];
+        let base = 0xffff_ffa8_0010_0000;
+        write_flush_ring(&mut control, 0x4be0, base, base + 0x40).unwrap();
+        assert_eq!(&control[0x4be0..0x4be8], &base.to_le_bytes());
+        assert_eq!(&control[0x4be8..0x4bf0], &(base + 0x40).to_le_bytes());
+        assert_eq!(&control[0x4bf0..], &[0; 8]);
+        assert!(write_flush_ring(&mut control[..0x4be8], 0x4be0, base, base + 0x40).is_err());
+    }
 
     fn owners(delta: u64) -> [Region; COUNT] {
         core::array::from_fn(|index| {

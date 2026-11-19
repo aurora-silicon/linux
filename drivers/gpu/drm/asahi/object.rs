@@ -431,6 +431,11 @@ impl<T: GpuStruct, U: Allocation<T>> GpuObject<T, U> {
         GpuPointer(self.gpu_ptr.0, PhantomData)
     }
 
+    /// Borrow the backing of an object used as an opaque firmware record.
+    pub(crate) fn gpu_bytes(&self) -> GpuPointer<'_, &'_ [u8]> {
+        GpuPointer(self.gpu_ptr.0, PhantomData)
+    }
+
     /// Returns a weak GPU pointer to this object, with no lifetime.
     pub(crate) fn weak_pointer(&self) -> GpuWeakPointer<T> {
         GpuWeakPointer(self.gpu_ptr.0, PhantomData)
@@ -694,6 +699,22 @@ impl<T, U: Allocation<T>> GpuArray<T, U> {
     pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
         // SAFETY: self.raw / self.len are valid per the type invariant
         unsafe { slice::from_raw_parts_mut(self.raw, self.len) }
+    }
+}
+
+impl<U: Allocation<u8>> GpuArray<u8, U> {
+    /// Aligned index in a shared firmware ring, accessed without borrowing its payload.
+    pub(crate) fn shared_index(&self, offset: usize) -> Result<&core::sync::atomic::AtomicU32> {
+        if offset.checked_add(4).is_none_or(|end| end > self.len) {
+            return Err(EINVAL);
+        }
+        let ptr = self.raw.wrapping_add(offset).cast::<u32>();
+        if !ptr.is_aligned() {
+            return Err(EINVAL);
+        }
+        // SAFETY: bounds and alignment checked; the shared ring ABI accesses
+        // this word only in aligned 32-bit transactions while the ring is live.
+        Ok(unsafe { core::sync::atomic::AtomicU32::from_ptr(ptr) })
     }
 }
 

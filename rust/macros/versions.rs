@@ -93,7 +93,7 @@ static AGX_VERSIONS: VersionConfig = VersionConfig {
     fields: &["G", "V"],
     enums: &[
         &["G13", "G14", "G14X"],
-        &["V12_3", "V12_4", "V13_0B4", "V13_2", "V13_3", "V13_5"],
+        &["V12_3", "V12_4", "V13_0B4", "V13_2", "V13_3", "V13_5", "V27_2"],
     ],
     versions: &[
         &["G13", "V12_3"],
@@ -276,8 +276,10 @@ fn filter_versions(
 }
 
 pub(crate) fn versions(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let config = match attr.to_string().as_str() {
-        "AGX" => &AGX_VERSIONS,
+    // AGX_ROOT is AGX plus G14/V27_2, which only the T8112 27.2 bring-up types instantiate.
+    let group = attr.to_string();
+    let config = match group.as_str() {
+        "AGX" | "AGX_ROOT" => &AGX_VERSIONS,
         _ => panic!("Unknown version group {}", attr),
     };
 
@@ -321,7 +323,8 @@ pub(crate) fn versions(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     body.extend(it);
 
-    for ver in config.versions {
+    let candidate = (group == "AGX_ROOT").then_some(&["G14", "V27_2"][..]);
+    for ver in config.versions.iter().copied().chain(candidate) {
         let tag = ver.join("");
         let mut ver_num = Vec::<usize>::new();
         for (i, comp) in ver.iter().enumerate() {

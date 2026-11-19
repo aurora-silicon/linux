@@ -79,8 +79,8 @@ const G17_BRIDGE_ENABLE: u32 = 0x1; // BIT(0)
 
 /// G17 dynamic power gating control. Clearing these bits enables gating of idle GPU cores.
 const G17_GATING_CONTROL: usize = 0xd06030;
-const G17_GATING_DISABLE: u32 = 0x6; // BIT(1) | BIT(2)
-const G17_GATING_HOLD: u32 = 0x4; // BIT(2)
+pub(crate) const G17_GATING_DISABLE: u32 = 0x6; // BIT(1) | BIT(2)
+pub(crate) const G17_GATING_HOLD: u32 = 0x4; // BIT(2)
 
 /// These performance selectors must be sampled before firmware can gate the core registers.
 const G17_PERF_CONTROL: usize = 0xe0141c;
@@ -347,6 +347,57 @@ impl Resources<'_> {
             .relaxed()
             .try_read64(OFF)
             .expect("64-bit read failed!")
+    }
+
+    /// Fender operating-point request and readback, sampled with GFX powered.
+    /// G14 first MMU fault latch. Read only while the core is held at a positive state.
+    pub(crate) fn t8112_fault_latch(&self) -> u64 {
+        self.sgx_read64::<FAULT_INFO>()
+    }
+
+    pub(crate) fn t8112_operating_point(&self) -> u32 {
+        self.sgx_read32::<0xd01000>()
+    }
+
+    /// Apply the shared Fender gate controls and return their observed word.
+    pub(crate) fn t8112_fender_gating(&self, clear: u32, set: u32) -> Result<u32> {
+        let sgx = self.sgx.as_view();
+        let before = sgx.read32(G17_GATING_CONTROL);
+        let value = (before & !clear) | set;
+        sgx.write32(value, G17_GATING_CONTROL);
+        let after = sgx.read32(G17_GATING_CONTROL);
+        dev_info!(self.dev.as_ref(), "G14G Fender gating before={:#x} after={:#x} requested={:#x}\n", before, after, value);
+        if (after ^ value) & G17_GATING_DISABLE != 0 { return Err(EIO); }
+        Ok(before)
+    }
+
+    /// Keep the platform selection and spare bits intact when opening SGX.
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+    pub(crate) fn t8112_sgx_open(&self, enabled: bool) -> (u32, u32) {
+        use crate::g15::regs::SGX_OPEN;
+        let reg = self.sgx.as_view();
+        let before = reg.read32(SGX_OPEN);
+        let target = (before & !1) | u32::from(enabled);
+        if target != before { reg.write32(target, SGX_OPEN); }
+        let after = reg.read32(SGX_OPEN);
+        dev_info!(self.dev.as_ref(), "G14G SGX open before={:#x} after={:#x}\n", before, after);
+        (before, after)
+    }
+
+    /// Change only the selected GPC interrupt bit and read back the GPU-owned register.
+    pub(crate) fn t8112_update_gpc_irq(&self, bit: u32, set: bool) -> u32 {
+        let reg = self.sgx.as_view();
+        let previous = self.t8112_gpc_irq_enable();
+        reg.write32(if set { previous | bit } else { previous & !bit }, 0xd01010);
+        let after = self.t8112_gpc_irq_enable();
+        dev_info!(self.dev.as_ref(), "G14G GPC IRQ bit={:#x} before={:#x} after={:#x}\n",
+                  bit, previous, after);
+        after
+    }
+
+    /// Read the two host interrupt selectors on T8112 without changing their masks.
+    pub(crate) fn t8112_gpc_irq_enable(&self) -> u32 {
+        self.sgx_read32::<0xd01010>()
     }
 
     /// Initialize the MMIO registers for the GPU.

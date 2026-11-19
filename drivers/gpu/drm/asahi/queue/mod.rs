@@ -99,12 +99,12 @@ pub(crate) trait Queue: Send + Sync {
     fn drain(&mut self) {}
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 struct SubQueue {
     wq: Arc<workqueue::WorkQueue::ver>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl SubQueue::ver {
     fn new_job(&mut self, fence: dma_fence::Fence) -> SubQueueJob::ver {
         SubQueueJob::ver {
@@ -115,14 +115,14 @@ impl SubQueue::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 struct SubQueueJob {
     wq: Arc<workqueue::WorkQueue::ver>,
     job: Option<workqueue::Job::ver>,
     fence: Option<dma_fence::Fence>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl SubQueueJob::ver {
     fn get(&mut self) -> Result<&mut workqueue::Job::ver> {
         if self.job.is_none() {
@@ -149,7 +149,7 @@ impl SubQueueJob::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct Queue {
     dev: AsahiDevRef,
     _sched: sched::Scheduler<QueueJob::ver>,
@@ -165,7 +165,7 @@ pub(crate) struct Queue {
     last_out: Option<Fence>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct QueueInner {
     dev: AsahiDevRef,
     ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
@@ -180,7 +180,7 @@ pub(crate) struct QueueInner {
     counter: AtomicU64,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[derive(Default)]
 pub(crate) struct JobFence {
     id: u64,
@@ -188,7 +188,7 @@ pub(crate) struct JobFence {
     stats: Option<Arc<stats::StatsSnapshot>>,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl JobFence::ver {
     fn add_command(self: &FenceObject<Self>) {
         self.pending.fetch_add(1, Ordering::Relaxed);
@@ -211,7 +211,7 @@ impl JobFence::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 #[vtable]
 impl dma_fence::FenceOps for JobFence::ver {
     fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
@@ -222,7 +222,7 @@ impl dma_fence::FenceOps for JobFence::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 pub(crate) struct QueueJob {
     dev: AsahiDevRef,
     vm_bind: mmu::VmBind,
@@ -244,7 +244,7 @@ pub(crate) struct QueueTimeout {
     id: u64,
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl QueueJob::ver {
     fn get_vtx(&mut self) -> Result<&mut workqueue::Job::ver> {
         self.sj_vtx
@@ -300,7 +300,7 @@ impl QueueJob::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl sched::JobImpl for QueueJob::ver {
     type TimeoutData = QueueTimeout;
     const MODULE: Option<&'static kernel::ThisModule> =
@@ -507,7 +507,7 @@ impl sched::JobImpl for QueueJob::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Drop for QueueJob::ver {
     fn drop(&mut self) {
         mod_dev_dbg!(self.dev, "QueueJob {}: Dropping\n", self.id);
@@ -517,7 +517,7 @@ impl Drop for QueueJob::ver {
 static QUEUE_NAME: &CStr = c_str!("aurora_fence");
 static QUEUE_CLASS_KEY: Pin<&LockClassKey> = kernel::static_lock_class!();
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Queue::ver {
     /// Create a new user queue.
     #[allow(clippy::too_many_arguments)]
@@ -727,7 +727,7 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
     Ok(attachments)
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Queue::ver {
     /// Waits, for at most [`QUEUE_CLOSE_WAIT_MS`], for the last submitted job to finish. The
     /// jobs of one queue complete in order, so its finished fence covers all of them.
@@ -755,7 +755,7 @@ impl Queue::ver {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Queue for Queue::ver {
     fn drain(&mut self) {
         self.wait_submitted();
@@ -1177,7 +1177,7 @@ mod tests {
     }
 }
 
-#[versions(AGX)]
+#[versions(AGX_ROOT)]
 impl Drop for Queue::ver {
     fn drop(&mut self) {
         mod_dev_dbg!(self.dev, "[Queue {}] Dropping queue\n", self.inner.id);

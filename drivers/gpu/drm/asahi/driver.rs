@@ -53,6 +53,9 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     #[cfg(CONFIG_DRM_ASAHI_G16)]
     pub(crate) g16: Option<Arc<crate::g16::Gpu>>,
     m3: Option<M3Backend>,
+    /// The J413 27.2 compute backend, whose firmware must be stopped on unbind.
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+    j413: Option<Arc<crate::j413::Backend>>,
     /// Raw `struct device *` of the platform device. Stored once at probe
     /// time so the `Drop` impl can find the sysfs file on unregister.
     raw_dev: *mut bindings::device,
@@ -150,6 +153,7 @@ impl drm::driver::Driver for AsahiDrmDriver {
 /// Firmware interface selected by the hardware compatible.
 pub(crate) enum ProbeConfig {
     Legacy(&'static hw::HwConfig),
+    T8112Identify,
     G17(&'static g17::Config),
     /// M5 Pro, Max and Ultra: the ID registers select the configuration.
     G17M5,
@@ -194,6 +198,10 @@ macro_rules! asahi_of_device_table {
                 (
                     of::DeviceId::new(c"apple,agx-t8103"),
                     ProbeConfig::Legacy(&hw::t8103::HWCONFIG)
+                ),
+                (
+                    of::DeviceId::new(c"apple,agx-t8112-identify"),
+                    ProbeConfig::T8112Identify
                 ),
                 (
                     of::DeviceId::new(c"apple,agx-t8112"),
@@ -337,6 +345,10 @@ impl platform::Driver for AsahiPlatformDriver {
         if let Some(m3) = this.m3.as_ref() {
             m3.stop();
         }
+        #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+        if let Some(j413) = this.j413.as_ref() {
+            j413.stop();
+        }
         this.close_binding();
     }
 
@@ -354,6 +366,20 @@ impl platform::Driver for AsahiPlatformDriver {
         dev_info!(pdev.as_ref(), "Probing...\n");
 
         let cfg = match info.ok_or(ENODEV)? {
+            ProbeConfig::T8112Identify => {
+                let node = pdev.as_ref().fwnode().ok_or(ENODEV)?;
+                let version: KVec<u32> = node
+                    .property_read_array_vec(c"apple,firmware-version", 3)?
+                    .required_by(pdev.as_ref())?;
+                #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+                if version.as_slice() == [27, 2, 0] && matches!(crate::module_parameters::t8112_handshake.value(), 1..=7 | 9..=14) {
+                    if let Some(live) = crate::mmu::Uat::observe_t8112_peer(pdev)? {
+                        return AsahiPlatformDriver::probe_j413(pdev, live);
+                    }
+                }
+                dev_info!(pdev.as_ref(), "T8112 G14G, firmware {:?}: no matching initdata layout; startup disabled\n", version.as_slice());
+                return Err(ENODEV);
+            }
             ProbeConfig::Legacy(cfg) => *cfg,
             ProbeConfig::G17(cfg) => {
                 return AsahiPlatformDriver::probe_g17(pdev, regs::G17Resources::new(pdev)?, cfg)
@@ -449,6 +475,8 @@ impl platform::Driver for AsahiPlatformDriver {
             _reg: reg,
             g17: None,
             m3: None,
+            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+            j413: None,
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             g16: None,
             raw_dev,
@@ -461,6 +489,43 @@ impl platform::Driver for AsahiPlatformDriver {
 }
 
 impl AsahiPlatformDriver {
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+    /// J413 with firmware 27.2: register the compute-only DRM device on the firmware the
+    /// bring-up path left running.
+    fn probe_j413<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        live: crate::j413::Live<'bound>,
+    ) -> Result<AsahiPlatformDriverData<'bound>> {
+        let crate::j413::Live { peer, root, graph, pool, asc, drm, binding, resources } = live;
+        let backend = crate::j413::Backend::start(&drm, pdev.as_ref(), peer, root, graph, pool, asc)?;
+        let gpu = backend.clone() as Arc<dyn gpu::Gpu>;
+        let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
+        // SAFETY: The registration is stored in the platform data and unregistered when it is
+        // dropped, after the backend has stopped the firmware.
+        let reg = match unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0) } {
+            Ok(reg) => reg,
+            Err(error) => {
+                backend.stop();
+                return Err(error);
+            }
+        };
+        dev_info!(pdev.as_ref(), "J413: firmware 27.2 running; compute-only DRM device registered\n");
+        Ok(AsahiPlatformDriverData {
+            binding,
+            _device: reg.device().into(),
+            _reg: reg,
+            g17: None,
+            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            g16: None,
+            m3: None,
+            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+            j413: Some(backend),
+            raw_dev: core::ptr::null_mut(),
+            raw_stats: core::ptr::null_mut(),
+            stats: None,
+        })
+    }
+
     #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) fn probe_g15<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
@@ -487,6 +552,8 @@ impl AsahiPlatformDriver {
             _reg: reg,
             g17: None,
             m3: None,
+            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+            j413: None,
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             g16: None,
             raw_dev: core::ptr::null_mut(),
@@ -529,6 +596,8 @@ impl AsahiPlatformDriver {
             _reg: reg,
             g17: None,
             m3: Some(backend),
+            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+            j413: None,
             raw_dev: core::ptr::null_mut(),
             raw_stats: core::ptr::null_mut(),
             stats: None,
@@ -605,6 +674,8 @@ impl AsahiPlatformDriver {
             _reg: reg,
             g17: Some(gpu),
             m3: None,
+            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+            j413: None,
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             g16: None,
             raw_dev,
@@ -652,6 +723,8 @@ impl AsahiPlatformDriver {
             _reg: reg,
             g17: None,
             m3: None,
+            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+            j413: None,
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             g16: None,
             raw_dev: core::ptr::null_mut(),
@@ -691,6 +764,8 @@ impl AsahiPlatformDriver {
             _reg: reg,
             g17: None,
             m3: None,
+            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+            j413: None,
             g16: Some(gpu),
             raw_dev,
             raw_stats,
@@ -747,6 +822,8 @@ impl AsahiPlatformDriver {
                 _reg: reg,
                 g17: None,
                 m3: None,
+                #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+                j413: None,
                 #[cfg(CONFIG_DRM_ASAHI_G16)]
                 g16: None,
                 raw_dev: core::ptr::null_mut(),
@@ -779,6 +856,10 @@ impl Drop for AsahiPlatformDriverData<'_> {
         #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
         if let Some(m3) = self.m3.as_ref() {
             m3.stop();
+        }
+        #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+        if let Some(j413) = self.j413.as_ref() {
+            j413.stop();
         }
     }
 }
