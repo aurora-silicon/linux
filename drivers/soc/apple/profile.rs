@@ -692,30 +692,36 @@ fn select(
     if has(b"apple,t8112") {
         return Ok(&T8112);
     }
-    // Only the boards whose ADTs were read: the other T8122 Macs (J433, J434,
-    // J504) share the SoC but their sensor wiring is unchecked.
-    if has(b"apple,t8122") && (has(b"apple,j613") || has(b"apple,j615")) {
+    // The SoC alone picks the profile below, as it does above. Whether a
+    // board has an enclave to attach to is the board device tree's call:
+    // `dt::enable_sep_and_dart` leaves the SEP disabled when the board keeps
+    // the SEP mailbox disabled or has no SEP node.
+    //
+    // What these profiles carry beyond the device tree is per SoC: the
+    // shared-memory geometry and handoff the SoC's sepOS expects, the SEP
+    // DART aperture (which the SoC .dtsi also describes), the key-store
+    // dialect and the xART guard level. The sensor's bus, chip select and
+    // SPI mode come from the board's `apple,mesa-fingerprint` node; the
+    // `sensor` constants are not read at run time. `nonce_session` follows
+    // the sensor generation, which is the same on every board of each SoC
+    // read so far (R3 on T8122; V3 on T6040, T6041, T6050, T8132, T8142).
+    // A board without a sensor node has no Touch ID for it to apply to.
+    if has(b"apple,t8122") {
         return Ok(&T8122);
     }
-    // The T6040 profile is tested on J614s and J616s.
-    if has(b"apple,t6040") && (has(b"apple,j616s") || has(b"apple,j614s")) {
+    if has(b"apple,t6040") {
         return Ok(&T6040);
     }
-    if has(b"apple,t6041") && (has(b"apple,j616c") || has(b"apple,j614c")) {
+    if has(b"apple,t6041") {
         return Ok(&T6041);
     }
-    if has(b"apple,t6050")
-        && (has(b"apple,j714s") || has(b"apple,k116s") || has(b"apple,j716c"))
-    {
+    if has(b"apple,t6050") {
         return Ok(&T6050);
     }
-    // Only the M4 MacBook Airs: the other T8132 Macs are unread.
-    if has(b"apple,t8132") && (has(b"apple,j713") || has(b"apple,j715")) {
+    if has(b"apple,t8132") {
         return Ok(&T8132);
     }
-    // The J815 and the J813, whose ADTs were read: both have the sensor (mesa) on spi2
-    // at 0x3a5108000.
-    if has(b"apple,t8142") && (has(b"apple,j815") || has(b"apple,j813")) {
+    if has(b"apple,t8142") {
         return Ok(&T8142);
     }
     Err(ENODEV)
@@ -781,28 +787,48 @@ mod tests {
         select(&has, &|| &T6020).ok().map(|p| p.name)
     }
 
+    /// The SoC picks the profile; the board name plays no part. Boards that
+    /// were outside the old per-board lists (J604, J504, K114s, J704) get
+    /// their SoC's profile, and a board compatible on the wrong SoC does not
+    /// drag its old profile along.
     #[test]
-    fn t8132_selection_is_limited_to_the_m4_airs() {
+    fn selection_follows_the_soc_alone() {
         assert_eq!(picked(&[b"apple,j713", b"apple,t8132"]), Some(T8132.name));
         assert_eq!(picked(&[b"apple,j715", b"apple,t8132"]), Some(T8132.name));
-        assert_eq!(picked(&[b"apple,j604", b"apple,t8132"]), None);
-        assert_eq!(picked(&[b"apple,t8132"]), None);
-        assert_eq!(picked(&[b"apple,j613", b"apple,t8132"]), None);
-        assert_eq!(picked(&[b"apple,j713", b"apple,t8122"]), None);
+        assert_eq!(picked(&[b"apple,j604", b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,j773g", b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,j613", b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,j713", b"apple,t8122"]), Some(T8122.name));
         assert_eq!(picked(&[b"apple,j613", b"apple,t8122"]), Some(T8122.name));
+        assert_eq!(picked(&[b"apple,j504", b"apple,t8122"]), Some(T8122.name));
         assert_eq!(picked(&[b"apple,j700", b"apple,t8140"]), Some(T8140.name));
         assert_eq!(picked(&[b"apple,j616s", b"apple,t6040"]), Some(T6040.name));
-        assert_eq!(picked(&[b"apple,t6040"]), None);
         assert_eq!(picked(&[b"apple,j614s", b"apple,t6040"]), Some(T6040.name));
+        assert_eq!(picked(&[b"apple,t6040"]), Some(T6040.name));
         assert_eq!(picked(&[b"apple,j616c", b"apple,t6041"]), Some(T6041.name));
         assert_eq!(picked(&[b"apple,j614c", b"apple,t6041"]), Some(T6041.name));
-        assert_eq!(picked(&[b"apple,t6041"]), None);
-        assert_eq!(picked(&[b"apple,j713", b"apple,t6041"]), None);
+        assert_eq!(picked(&[b"apple,j713", b"apple,t6041"]), Some(T6041.name));
+        assert_eq!(picked(&[b"apple,j716c", b"apple,t6041"]), Some(T6041.name));
         assert_eq!(picked(&[b"apple,j714s", b"apple,t6050"]), Some(T6050.name));
         assert_eq!(picked(&[b"apple,k116s", b"apple,t6050"]), Some(T6050.name));
         assert_eq!(picked(&[b"apple,j716c", b"apple,t6050"]), Some(T6050.name));
-        assert_eq!(picked(&[b"apple,j716c", b"apple,t6041"]), None);
-        assert_eq!(picked(&[b"apple,t6050"]), None);
+        assert_eq!(picked(&[b"apple,k114s", b"apple,t6050"]), Some(T6050.name));
+        assert_eq!(picked(&[b"apple,j815", b"apple,t8142"]), Some(T8142.name));
+        assert_eq!(picked(&[b"apple,j813", b"apple,t8142"]), Some(T8142.name));
+        assert_eq!(picked(&[b"apple,j704", b"apple,t8142"]), Some(T8142.name));
+        assert_eq!(picked(&[b"apple,j316s", b"apple,t6000"]), Some(T6000.name));
+        assert_eq!(picked(&[b"apple,j413", b"apple,t8112"]), Some(T8112.name));
+    }
+
+    /// SoCs without a profile are still refused, whatever the board.
+    #[test]
+    fn unprofiled_socs_are_refused() {
+        assert_eq!(picked(&[b"apple,j375d", b"apple,t6002"]), None);
+        assert_eq!(picked(&[b"apple,j514c", b"apple,t6031"]), None);
+        assert_eq!(picked(&[b"apple,j804", b"apple,t8152"]), None);
+        assert_eq!(picked(&[b"apple,j713"]), None);
+        assert_eq!(picked(&[]), None);
     }
 
     /// Touch ID has one path for every Mac. The retry limits, the lock
@@ -813,7 +839,7 @@ mod tests {
     /// profile naming one of the known Mesa revisions.
     #[test]
     fn every_touch_id_mac_gets_a_sensor_the_shared_path_decodes() {
-        let macs: [&[&[u8]]; 16] = [
+        let macs: [&[&[u8]]; 21] = [
             &[b"apple,j313", b"apple,t8103"],
             &[b"apple,j316s", b"apple,t6000"],
             &[b"apple,j316c", b"apple,t6001"],
@@ -827,9 +853,14 @@ mod tests {
             &[b"apple,j616s", b"apple,t6040"],
             &[b"apple,j616c", b"apple,t6041"],
             &[b"apple,j713", b"apple,t8132"],
+            &[b"apple,j715", b"apple,t8132"],
+            &[b"apple,j604", b"apple,t8132"],
             &[b"apple,j700", b"apple,t8140"],
             &[b"apple,j714s", b"apple,t6050"],
             &[b"apple,j716c", b"apple,t6050"],
+            &[b"apple,k114s", b"apple,t6050"],
+            &[b"apple,j813", b"apple,t8142"],
+            &[b"apple,j815", b"apple,t8142"],
         ];
         for compatibles in macs {
             let has = |c: &[u8]| compatibles.iter().any(|x| *x == c);

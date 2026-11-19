@@ -11,6 +11,7 @@ use kernel::prelude::*;
 
 const SEP_COMPATIBLE: &CStr = c"apple,sep";
 const IOMMUS_PROP: &CStr = c"iommus";
+const MBOXES_PROP: &CStr = c"mboxes";
 
 const STATUS_PROP: &CStr = c"status";
 const STATUS_OKAY: &CStr = c"okay";
@@ -185,14 +186,34 @@ pub(crate) fn preboot_uuid() -> Option<[u8; 16]> {
     Some(uuid.b)
 }
 
+/// Enables the SEP and its DART for a warm attach, on boards whose device
+/// tree describes a usable enclave.
+///
+/// Most device trees leave the SEP node and its DART `disabled` for this
+/// function to enable, so their status cannot say whether a board has a
+/// usable enclave. The SEP mailbox's status does: the SEP cannot be reached
+/// without it, and the device tree enables it (in the board file, or in the
+/// SoC .dtsi for every board of that SoC) where the SEP is described for the
+/// machine. A board with no SEP node, or one that keeps the mailbox
+/// disabled, is left untouched and the module probes nothing.
 pub(crate) fn enable_sep_and_dart(window: &crate::profile::DartWindow) -> Result<()> {
-    let sep = sep_node().ok_or_else(|| {
-        pr_err!(
-            "apple_sep: no device-tree node with compatible '{}'\n",
+    let Some(sep) = sep_node() else {
+        pr_info!(
+            "apple_sep: no device-tree node with compatible '{}'; the SEP stays disabled\n",
             SEP_COMPATIBLE
         );
-        ENODEV
-    })?;
+        return Ok(());
+    };
+
+    if !sep
+        .parse_phandle(MBOXES_PROP, 0)
+        .is_some_and(|mbox| mbox.is_available())
+    {
+        pr_info!(
+            "apple_sep: the device tree leaves the SEP mailbox disabled on this board; the SEP stays disabled\n"
+        );
+        return Ok(());
+    }
 
     let dart = sep.parse_phandle(IOMMUS_PROP, 0).ok_or_else(|| {
         pr_err!(
