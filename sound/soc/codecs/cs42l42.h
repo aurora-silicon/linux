@@ -18,6 +18,7 @@
 #include <linux/mutex.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
+#include <linux/workqueue.h>
 #include <linux/soundwire/sdw.h>
 #include <sound/jack.h>
 #include <sound/cs42l42.h>
@@ -64,13 +65,22 @@ struct  cs42l42_private {
 	u8 hs_bias_ramp_rate;
 	u8 hs_bias_ramp_time;
 	u8 hs_bias_sense_en;
+	/* stream_use and the resume unmute: mute_stream() and the resume unmute work */
+	struct mutex stream_lock;
 	u8 stream_use;
 	unsigned int dai_format;
 	bool remote_active;
 	unsigned int remote_saved[CS42L83_REMOTE_NUM_SAVED_REGS];
 	bool hp_adc_up_pending;
-	/* Set once at probe for the base-M1 I2C resume workaround. */
-	bool resume_reprepare;
+	/*
+	 * Unmutes from ASoC's card resume, held until the host clocks the ASP again (bit
+	 * per stream direction), the streams the host has triggered since, the DAI, and
+	 * the work that runs them.
+	 */
+	unsigned long resume_unmute;
+	unsigned long resume_unmute_clocked;
+	struct snd_soc_dai *resume_unmute_dai;
+	struct work_struct resume_unmute_work;
 	/* CS42L83 on I2C: the register restore after a sleep, from ASoC's card resume. */
 	struct mutex restore_lock;
 	struct completion powered;
@@ -93,9 +103,7 @@ int cs42l42_pll_config(struct snd_soc_component *component,
 		       unsigned int clk, unsigned int sample_rate);
 void cs42l42_src_config(struct snd_soc_component *component, unsigned int sample_rate);
 int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream);
-int cs42l42_dai_prepare(struct snd_pcm_substream *substream, struct snd_soc_dai *dai);
-bool cs42l42_resume_workaround_required(const struct device_node *root,
-					const struct device_node *codec, bool soundwire);
+void cs42l42_init_streams(struct cs42l42_private *cs42l42);
 irqreturn_t cs42l42_irq_thread(int irq, void *data);
 int cs42l42_suspend(struct device *dev);
 int cs42l42_resume(struct device *dev);
