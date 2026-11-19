@@ -152,6 +152,9 @@ sched_feat_write(struct file *filp, const char __user *ubuf,
 	if (ret < 0)
 		return ret;
 
+	/* MEM_SPREAD needs its PMU counters set up or released. */
+	sched_mem_spread_update();
+
 	*ppos += cnt;
 
 	return cnt;
@@ -722,6 +725,8 @@ static __init int sched_init_debug(void)
 #endif
 
 	debugfs_create_u32("base_slice_ns", 0644, debugfs_sched, &sysctl_sched_base_slice);
+
+	sched_mem_spread_debugfs(debugfs_sched);
 
 	debugfs_create_u32("latency_warn_ms", 0644, debugfs_sched, &sysctl_resched_latency_warn_ms);
 	debugfs_create_u32("latency_warn_once", 0644, debugfs_sched, &sysctl_resched_latency_warn_once);
@@ -1424,6 +1429,8 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 	nr_switches = p->nvcsw + p->nivcsw;
 
 	P(se.nr_migrations);
+	P(se.mem_rate);
+	P(se.mem_bound);
 
 	if (schedstat_enabled()) {
 		u64 avg_atom, avg_per_cpu;

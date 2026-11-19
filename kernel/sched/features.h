@@ -116,6 +116,15 @@ SCHED_FEAT(FORK_LOCAL, true)
 SCHED_FEAT(ASYM_SPREAD, false)
 
 /*
+ * Spread memory-bound tasks evenly across LLCs (on Apple SoCs, clusters,
+ * whose memory bandwidth is limited per cluster) instead of packing them
+ * onto the biggest CPUs; other tasks are placed as usual. Tasks are
+ * classified from a per-CPU PMU count of L1D load misses, see
+ * mem_spread_tick().
+ */
+SCHED_FEAT(MEM_SPREAD, false)
+
+/*
  * Issue a WARN when we do multiple update_rq_clock() calls
  * in a single rq->lock section. Default disabled because the
  * annotations are not complete.

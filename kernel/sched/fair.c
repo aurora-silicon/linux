@@ -52,6 +52,8 @@
 #include <linux/ratelimit.h>
 #include <linux/task_work.h>
 #include <linux/rbtree_augmented.h>
+#include <linux/debugfs.h>
+#include <linux/perf_event.h>
 
 #include <asm/switch_to.h>
 
@@ -6337,6 +6339,237 @@ static inline int task_fits_cpu(struct task_struct *p, int cpu)
 	return (util_fits_cpu(util, uclamp_min, uclamp_max, cpu) > 0);
 }
 
+#ifdef CONFIG_PERF_EVENTS
+/*
+ * MEM_SPREAD: telling memory-bound tasks from compute-bound ones.
+ *
+ * On Apple SoCs memory bandwidth is limited per cluster: on an M5 Max
+ * (T6050) about 190 GB/s for the six Everest cores and 140 GB/s for each
+ * six-core Sawtooth cluster, while one thread alone reaches 130 GB/s. Two
+ * to five STREAM triad threads therefore get 187-195 GB/s on Linux, which
+ * packs them onto the Everest cores as it should for compute, and 248-342
+ * GB/s on macOS, which spreads them over the clusters within a few hundred
+ * milliseconds but keeps compute-bound threads on the Everest cores.
+ *
+ * The signal is the rate of L1D load misses per microsecond of running,
+ * from one pinned CPU-wide perf counter per CPU (the generic L1D read miss
+ * cache event; no counter, no classification). On an M5 Max a triad
+ * thread misses 6,600 times per us alone on an Everest core, 1,600 with
+ * six sharing that cluster and 2,000 alone on a Sawtooth core, dependent
+ * adds 0-1 times. Stall events cannot tell them apart (a dependent add
+ * chain stalls the back end more than triad does), and
+ * the stall on L1D misses grows with contention, so it would fall as soon
+ * as a task is spread and the classification would oscillate. The rate is
+ * sampled at the tick, attributed to the running task only when it ran
+ * the whole period (no context switch since the previous tick), averaged
+ * per task over samples with weight 2^-shift, and classified with
+ * hysteresis (memory-bound at high, no longer below low). Tasks inherit
+ * their parent's state at fork. The counters exist only while MEM_SPREAD
+ * is on or debugfs sched/mem_spread/sample is set; the sample setting
+ * classifies without changing placement.
+ */
+static DEFINE_STATIC_KEY_FALSE(sched_mem_sample);
+
+static unsigned int sysctl_mem_spread_high = 500;
+static unsigned int sysctl_mem_spread_low = 250;
+static unsigned int sysctl_mem_spread_shift = 3;
+static bool mem_spread_sample;
+
+struct mem_spread_cpu {
+	struct perf_event	*event;
+	/* Counter, curr's run time and switch count at the previous tick */
+	struct perf_event	*last_event;
+	u64			last_count;
+	u64			last_exec;
+	u64			last_switches;
+	unsigned long		samples;
+};
+
+static DEFINE_PER_CPU(struct mem_spread_cpu, mem_spread_cpu);
+
+static inline bool mem_spread_enabled(void)
+{
+	return static_branch_unlikely(&sched_mem_sample) && sched_feat(MEM_SPREAD);
+}
+
+static inline bool mem_spread_task(struct task_struct *p)
+{
+	return mem_spread_enabled() && READ_ONCE(p->se.mem_bound);
+}
+
+/* Whether @rq runs a memory-bound task; RCU or @rq's lock held. */
+static inline bool rq_curr_mem_bound(struct rq *rq)
+{
+	struct task_struct *curr = rcu_dereference_all(rq->curr);
+
+	return curr->sched_class == &fair_sched_class && READ_ONCE(curr->se.mem_bound);
+}
+
+static void mem_spread_tick(struct rq *rq, struct task_struct *curr)
+{
+	struct mem_spread_cpu *ms = this_cpu_ptr(&mem_spread_cpu);
+	struct perf_event *event = READ_ONCE(ms->event);
+	struct sched_entity *se = &curr->se;
+	u64 count, exec = se->sum_exec_runtime;
+
+	if (!event || perf_event_read_local(event, &count, NULL, NULL)) {
+		ms->last_event = NULL;
+		return;
+	}
+
+	if (ms->last_event == event && ms->last_switches == rq->nr_switches &&
+	    exec > ms->last_exec + 100 * NSEC_PER_USEC) {
+		unsigned int shift = min(READ_ONCE(sysctl_mem_spread_shift), 8U);
+		u64 rate = div64_u64((count - ms->last_count) * NSEC_PER_USEC,
+				     exec - ms->last_exec);
+		int avg = se->mem_rate;
+
+		avg += ((int)min_t(u64, rate, U16_MAX) - avg) >> shift;
+		WRITE_ONCE(se->mem_rate, avg);
+		if (avg >= READ_ONCE(sysctl_mem_spread_high))
+			WRITE_ONCE(se->mem_bound, 1);
+		else if (avg < READ_ONCE(sysctl_mem_spread_low))
+			WRITE_ONCE(se->mem_bound, 0);
+		ms->samples++;
+	}
+
+	ms->last_event = event;
+	ms->last_count = count;
+	ms->last_exec = exec;
+	ms->last_switches = rq->nr_switches;
+}
+
+static struct perf_event *mem_spread_create_event(int cpu)
+{
+	struct perf_event_attr attr = {
+		.type		= PERF_TYPE_HW_CACHE,
+		.size		= sizeof(attr),
+		.config		= PERF_COUNT_HW_CACHE_L1D |
+				  (PERF_COUNT_HW_CACHE_OP_READ << 8) |
+				  (PERF_COUNT_HW_CACHE_RESULT_MISS << 16),
+		.pinned		= 1,
+		/* Required by PMUs that cannot count guests at EL1 */
+		.exclude_guest	= 1,
+	};
+	struct perf_event *event;
+
+	event = perf_event_create_kernel_counter(&attr, cpu, NULL, NULL, NULL);
+	if (IS_ERR(event)) {
+		/* PMUs that support no mode exclusion at all */
+		attr.exclude_guest = 0;
+		event = perf_event_create_kernel_counter(&attr, cpu, NULL, NULL, NULL);
+	}
+	return event;
+}
+
+static DEFINE_MUTEX(mem_spread_mutex);
+
+static void mem_spread_update_events(struct work_struct *work)
+{
+	int cpu, nr = 0;
+
+	guard(mutex)(&mem_spread_mutex);
+
+	if (sched_feat(MEM_SPREAD) || READ_ONCE(mem_spread_sample)) {
+		scoped_guard(cpus_read_lock) {
+			for_each_online_cpu(cpu) {
+				struct mem_spread_cpu *ms = per_cpu_ptr(&mem_spread_cpu, cpu);
+				struct perf_event *event = ms->event;
+
+				if (!event) {
+					event = mem_spread_create_event(cpu);
+					if (IS_ERR(event))
+						continue;
+					WRITE_ONCE(ms->event, event);
+				}
+				nr++;
+			}
+			if (nr)
+				static_branch_enable_cpuslocked(&sched_mem_sample);
+		}
+		if (!nr)
+			pr_info_once("sched: MEM_SPREAD: no L1D load miss counter, nothing classified\n");
+		return;
+	}
+
+	/*
+	 * The tick reads the counters with interrupts disabled, so once no
+	 * tick sees the key any more, none uses a counter either.
+	 */
+	static_branch_disable(&sched_mem_sample);
+	synchronize_rcu();
+	for_each_possible_cpu(cpu) {
+		struct mem_spread_cpu *ms = per_cpu_ptr(&mem_spread_cpu, cpu);
+
+		if (ms->event)
+			perf_event_release_kernel(ms->event);
+		WRITE_ONCE(ms->event, NULL);
+		ms->last_event = NULL;
+	}
+}
+
+static DECLARE_WORK(mem_spread_work, mem_spread_update_events);
+
+/* Set up or release the counters after MEM_SPREAD or sample changed. */
+void sched_mem_spread_update(void)
+{
+	schedule_work(&mem_spread_work);
+}
+
+static int mem_spread_sample_get(void *data, u64 *val)
+{
+	*val = READ_ONCE(mem_spread_sample);
+	return 0;
+}
+
+static int mem_spread_sample_set(void *data, u64 val)
+{
+	WRITE_ONCE(mem_spread_sample, !!val);
+	sched_mem_spread_update();
+	flush_work(&mem_spread_work);
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(mem_spread_sample_fops, mem_spread_sample_get,
+			 mem_spread_sample_set, "%llu\n");
+
+static int mem_spread_status_show(struct seq_file *m, void *v)
+{
+	int cpu;
+
+	seq_printf(m, "classifying %d placing %d\n",
+		   !!static_branch_unlikely(&sched_mem_sample), mem_spread_enabled());
+	guard(rcu)();
+	for_each_online_cpu(cpu) {
+		struct mem_spread_cpu *ms = per_cpu_ptr(&mem_spread_cpu, cpu);
+		struct task_struct *curr = rcu_dereference(cpu_rq(cpu)->curr);
+
+		seq_printf(m, "cpu%d %s samples %lu curr %d %s rate %u bound %u\n", cpu,
+			   READ_ONCE(ms->event) ? "counting" : "-", READ_ONCE(ms->samples),
+			   task_pid_nr(curr), curr->comm, READ_ONCE(curr->se.mem_rate),
+			   READ_ONCE(curr->se.mem_bound));
+	}
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(mem_spread_status);
+
+void sched_mem_spread_debugfs(struct dentry *parent)
+{
+	struct dentry *d = debugfs_create_dir("mem_spread", parent);
+
+	debugfs_create_file("sample", 0644, d, NULL, &mem_spread_sample_fops);
+	debugfs_create_u32("high", 0644, d, &sysctl_mem_spread_high);
+	debugfs_create_u32("low", 0644, d, &sysctl_mem_spread_low);
+	debugfs_create_u32("shift", 0644, d, &sysctl_mem_spread_shift);
+	debugfs_create_file("status", 0444, d, NULL, &mem_spread_status_fops);
+}
+#else /* !CONFIG_PERF_EVENTS: */
+static inline bool mem_spread_enabled(void) { return false; }
+static inline bool mem_spread_task(struct task_struct *p) { return false; }
+static inline bool rq_curr_mem_bound(struct rq *rq) { return false; }
+#endif /* !CONFIG_PERF_EVENTS */
+
 /* See update_asym_spread(). */
 static inline bool asym_spread(struct root_domain *rd)
 {
@@ -6350,7 +6583,7 @@ static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
 	if (!sched_asym_cpucap_active())
 		return;
 
-	if (asym_spread(rq->rd)) {
+	if (asym_spread(rq->rd) || (p && mem_spread_task(p))) {
 		rq->misfit_task_load = 0;
 		return;
 	}
@@ -9214,6 +9447,30 @@ static inline bool asym_fits_cpu(unsigned long util,
 /*
  * Try and locate an idle core/thread in the LLC cache domain.
  */
+/*
+ * MEM_SPREAD: wake a memory-bound task where the balancer spread it, on
+ * its previous CPU or another idle CPU of that LLC, rather than on the
+ * biggest idle CPU (asymmetric capacities) or next to its waker.
+ */
+static int mem_spread_select_idle(struct task_struct *p, int prev)
+{
+	struct sched_domain *sd;
+	int cpu;
+
+	if (choose_idle_cpu(prev, p) && cpumask_test_cpu(prev, p->cpus_ptr))
+		return prev;
+
+	sd = rcu_dereference_all(per_cpu(sd_llc, prev));
+	if (!sd)
+		return -1;
+
+	for_each_cpu_and(cpu, sched_domain_span(sd), p->cpus_ptr) {
+		if (choose_idle_cpu(cpu, p))
+			return cpu;
+	}
+	return -1;
+}
+
 static int select_idle_sibling(struct task_struct *p, int prev, int target)
 {
 	bool has_idle_core = false;
@@ -9236,6 +9493,12 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 * per-cpu select_rq_mask usage
 	 */
 	lockdep_assert_irqs_disabled();
+
+	if (mem_spread_task(p)) {
+		i = mem_spread_select_idle(p, prev);
+		if (i >= 0)
+			return i;
+	}
 
 	if (choose_idle_cpu(target, p) &&
 	    asym_fits_cpu(task_util, util_min, util_max, target))
@@ -10736,6 +10999,7 @@ enum migration_type {
 #define LBF_ACTIVE_LB	0x10
 #define LBF_LLC_PINNED	0x20
 #define LBF_ACTIVE_LB_LLC	0x40
+#define LBF_MEM		0x80	/* MEM_SPREAD: move a memory-bound task */
 
 struct lb_env {
 	struct sched_domain	*sd;
@@ -11311,6 +11575,9 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	/* Record that we found at least one task that could run on dst_cpu */
 	env->flags &= ~LBF_ALL_PINNED;
 
+	if ((env->flags & LBF_MEM) && !READ_ONCE(p->se.mem_bound))
+		return 0;
+
 	if (task_on_cpu(env->src_rq, p) ||
 	    task_current_donor(env->src_rq, p)) {
 		schedstat_inc(p->stats.nr_failed_migrations_running);
@@ -11795,6 +12062,7 @@ struct sg_lb_stats {
 	unsigned int group_llc_balance;		/* Tasks should be moved to preferred LLC */
 	unsigned long group_misfit_task_load;	/* A CPU has a task too big for its capacity */
 	unsigned int group_overutilized;	/* At least one CPU is overutilized in the group */
+	unsigned int nr_mem_bound;		/* MEM_SPREAD: CPUs running a memory-bound task */
 #ifdef CONFIG_NUMA_BALANCING
 	unsigned int nr_numa_running;
 	unsigned int nr_preferred_running;
@@ -11817,6 +12085,10 @@ struct sd_lb_stats {
 
 	struct sg_lb_stats busiest_stat;	/* Statistics of the busiest group */
 	struct sg_lb_stats local_stat;		/* Statistics of the local group */
+
+	/* MEM_SPREAD: the group running the most memory-bound tasks */
+	struct sched_group *mem_busiest;
+	unsigned int mem_busiest_nr;
 };
 
 static inline void init_sd_lb_stats(struct sd_lb_stats *sds)
@@ -12340,6 +12612,7 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 {
 	int i, nr_running, local_group, sd_flags = env->sd->flags;
 	bool balancing_at_rd = !env->sd->parent;
+	bool mem = mem_spread_enabled() && !(sd_flags & SD_SHARE_LLC);
 
 	memset(sgs, 0, sizeof(*sgs));
 
@@ -12359,6 +12632,9 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 
 		if (cpu_overutilized(i))
 			sgs->group_overutilized = 1;
+
+		if (mem && nr_running && rq_curr_mem_bound(rq))
+			sgs->nr_mem_bound++;
 
 #ifdef CONFIG_SCHED_CACHE
 		if (sched_cache_enabled()) {
@@ -13128,6 +13404,11 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
 
 		update_sg_lb_stats(env, sds, sg, sgs, &sg_overloaded);
 
+		if (!local_group && sgs->nr_mem_bound > sds->mem_busiest_nr) {
+			sds->mem_busiest = sg;
+			sds->mem_busiest_nr = sgs->nr_mem_bound;
+		}
+
 		if (!local_group && update_sd_pick_busiest(env, sds, sg, sgs)) {
 			sds->busiest = sg;
 			sds->busiest_stat = *sgs;
@@ -13353,6 +13634,28 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
 	) / SCHED_CAPACITY_SCALE;
 }
 
+/*
+ * MEM_SPREAD: balancing between LLCs, an idle CPU pulls a memory-bound task
+ * from the group running the most of them when its own runs at least two
+ * fewer. Counts even out (on an M5 Max, two to six triad threads end up
+ * 1/1/0, 1/1/1, 2/1/1, 2/2/1 and 2/2/2 over the three clusters), and the
+ * first goes to the biggest CPUs as usual.
+ */
+static bool mem_spread_imbalance(struct lb_env *env, struct sd_lb_stats *sds)
+{
+	/* sched_balance_rq() may retry with the same env */
+	env->flags &= ~LBF_MEM;
+
+	if (!sds->mem_busiest || !env->idle || env->dst_rq->nr_running ||
+	    sds->mem_busiest_nr < sds->local_stat.nr_mem_bound + 2)
+		return false;
+
+	env->flags |= LBF_MEM;
+	env->migration_type = migrate_task;
+	env->imbalance = 1;
+	return true;
+}
+
 /******* sched_balance_find_src_group() helpers end here *********************/
 
 /*
@@ -13397,6 +13700,9 @@ static struct sched_group *sched_balance_find_src_group(struct lb_env *env)
 	 * this level.
 	 */
 	update_sd_lb_stats(env, &sds);
+
+	if (mem_spread_imbalance(env, &sds))
+		return sds.mem_busiest;
 
 	/* There is no busy sibling group to pull tasks from */
 	if (!sds.busiest)
@@ -13521,6 +13827,24 @@ out_balanced:
 	return NULL;
 }
 
+/* MEM_SPREAD: a CPU of @group running a memory-bound task, the busiest. */
+static struct rq *mem_spread_find_src_rq(struct lb_env *env,
+					 struct sched_group *group)
+{
+	struct rq *busiest = NULL;
+	int i;
+
+	for_each_cpu_and(i, sched_group_span(group), env->cpus) {
+		struct rq *rq = cpu_rq(i);
+
+		if (!rq_curr_mem_bound(rq))
+			continue;
+		if (!busiest || rq->cfs.h_nr_runnable > busiest->cfs.h_nr_runnable)
+			busiest = rq;
+	}
+	return busiest;
+}
+
 /*
  * sched_balance_find_src_rq - find the busiest runqueue among the CPUs in the group.
  */
@@ -13534,6 +13858,9 @@ static struct rq *sched_balance_find_src_rq(struct lb_env *env,
 	unsigned int busiest_nr = 0;
 	int __maybe_unused dst_llc;
 	int i;
+
+	if (env->flags & LBF_MEM)
+		return mem_spread_find_src_rq(env, group);
 
 	for_each_cpu_and(i, sched_group_span(group), env->cpus) {
 		unsigned long capacity, load, util;
@@ -13746,6 +14073,10 @@ static int need_active_balance(struct lb_env *env)
 	if (alb_break_llc(env))
 		return 0;
 
+	/* A running memory-bound task is moved by pushing it. */
+	if (env->flags & LBF_MEM)
+		return 1;
+
 	if (asym_active_balance(env))
 		return 1;
 
@@ -13774,6 +14105,7 @@ static int need_active_balance(struct lb_env *env)
 
 static int active_load_balance_cpu_stop(void *data);
 static int active_load_balance_llc_cpu_stop(void *data);
+static int active_load_balance_mem_cpu_stop(void *data);
 
 /*
  * migration_type is checked elsewhere to decide migration policy, so
@@ -13784,6 +14116,9 @@ static inline cpu_stop_fn_t alb_stop_fn(struct lb_env *env)
 {
 	if (env->migration_type == migrate_llc_task)
 		return active_load_balance_llc_cpu_stop;
+
+	if (env->flags & LBF_MEM)
+		return active_load_balance_mem_cpu_stop;
 
 	return active_load_balance_cpu_stop;
 }
@@ -14091,7 +14426,7 @@ more_balance:
 	 */
 	if (idle != CPU_NEWLY_IDLE &&
 	    env.migration_type != migrate_misfit &&
-	    !(env.flags & LBF_LLC_PINNED))
+	    !(env.flags & (LBF_LLC_PINNED | LBF_MEM)))
 		sd->nr_balance_failed++;
 
 	if (!need_active_balance(&env))
@@ -14323,6 +14658,11 @@ static int active_load_balance_cpu_stop(void *data)
 static int active_load_balance_llc_cpu_stop(void *data)
 {
 	return __active_load_balance_cpu_stop(data, LBF_ACTIVE_LB_LLC);
+}
+
+static int active_load_balance_mem_cpu_stop(void *data)
+{
+	return __active_load_balance_cpu_stop(data, LBF_MEM);
 }
 
 /*
@@ -14592,6 +14932,56 @@ static void kick_ilb(unsigned int flags)
  * Current decision point for kicking the idle load balancer in the presence
  * of idle CPUs in the system.
  */
+#ifdef CONFIG_PERF_EVENTS
+static unsigned int mem_spread_llc_count(int cpu)
+{
+	struct sched_domain *sd = rcu_dereference_all(per_cpu(sd_llc, cpu));
+	unsigned int nr = 0;
+	int i;
+
+	if (!sd)
+		return 0;
+	for_each_cpu(i, sched_domain_span(sd))
+		nr += rq_curr_mem_bound(cpu_rq(i));
+	return nr;
+}
+
+/*
+ * MEM_SPREAD: kick an idle balance when @rq runs a memory-bound task and
+ * an idle CPU's LLC runs at least two fewer than @rq's.
+ */
+static bool mem_spread_kick(struct rq *rq)
+{
+	int seen[8], nr_seen = 0, cpu = cpu_of(rq), i, j;
+	unsigned int nr;
+
+	if (!mem_spread_enabled() || !rq_curr_mem_bound(rq))
+		return false;
+
+	nr = mem_spread_llc_count(cpu);
+	if (nr < 2)
+		return false;
+
+	for_each_cpu(i, nohz.idle_cpus_mask) {
+		int llc = per_cpu(sd_llc_id, i);
+
+		if (cpus_share_cache(i, cpu))
+			continue;
+		for (j = 0; j < nr_seen && seen[j] != llc; j++)
+			;
+		if (j < nr_seen)
+			continue;
+		if (nr_seen < ARRAY_SIZE(seen))
+			seen[nr_seen++] = llc;
+		if (mem_spread_llc_count(i) + 2 <= nr)
+			return true;
+	}
+	return false;
+}
+#else
+static inline bool mem_spread_kick(struct rq *rq) { return false; }
+#endif
+
 static void nohz_balancer_kick(struct rq *rq)
 {
 	unsigned long now = jiffies;
@@ -14633,6 +15023,11 @@ static void nohz_balancer_kick(struct rq *rq)
 		return;
 
 	if (rq->nr_running >= 2) {
+		flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
+		goto out;
+	}
+
+	if (mem_spread_kick(rq)) {
 		flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
 		goto out;
 	}
@@ -15669,6 +16064,11 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 		task_tick_numa(rq, curr);
 
 	task_tick_cache(rq, curr);
+
+#ifdef CONFIG_PERF_EVENTS
+	if (static_branch_unlikely(&sched_mem_sample))
+		mem_spread_tick(rq, curr);
+#endif
 
 	update_misfit_status(curr, rq);
 	check_update_overutilized_status(task_rq(curr));

@@ -2482,6 +2482,15 @@ extern struct static_key sched_feat_keys[__SCHED_FEAT_NR];
 extern struct static_key_false sched_numa_balancing;
 extern struct static_key_false sched_schedstats;
 
+struct dentry;
+#ifdef CONFIG_PERF_EVENTS
+extern void sched_mem_spread_update(void);
+extern void sched_mem_spread_debugfs(struct dentry *parent);
+#else
+static inline void sched_mem_spread_update(void) { }
+static inline void sched_mem_spread_debugfs(struct dentry *parent) { }
+#endif
+
 static inline u64 global_rt_period(void)
 {
 	return (u64)sysctl_sched_rt_period * NSEC_PER_USEC;
