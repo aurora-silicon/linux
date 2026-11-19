@@ -1484,6 +1484,8 @@ def retry(root):
     source = (root / 'drivers/gpu/drm/apple/dcp-180hz.c').read_text()
     production = '\n'.join(block(source, marker) for marker in (
         'static void dcp_180hz_retry_work(', 'void dcp_180hz_retry(', 'static void dcp_180hz_cancel('))
+    production = '\n'.join(line for line in source.splitlines()
+                           if line.startswith('#define DCP_180HZ_PROBE_')) + '\n' + production
     prefix = r"""
 #include <assert.h>
 #include <stdbool.h>
@@ -1506,14 +1508,17 @@ struct apple_connector { void *dcp; struct work_struct hotplug_wq; };
 struct apple_dcp {
     bool hpd_mutex, typec_cable_connected, quiescing, rate_retry_initialized;
     struct { bool lock; } metadata;
-    struct { u64 retry_generation; unsigned retries; } rate_proof;
+    struct { u64 retry_generation; unsigned retries; struct { bool valid; } rate, lanes; } rate_proof;
     u64 typec_generation;
     struct apple_connector *connector;
     void *dev;
     struct delayed_work rate_retry_wq;
 };
 static int system_freezable_wq;
-static unsigned submissions, cancellations;
+static unsigned submissions, cancellations, warnings;
+static void dev_warn(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; warnings++; }
+static bool dcp_180hz_fact_current(struct apple_dcp *d, const void *f)
+{ (void)d; return ((const bool *)f)[0]; }
 static void schedule_work(struct work_struct *w) { w->scheduled++; }
 static void mod_delayed_work(int q,struct delayed_work *w,unsigned delay)
 { (void)q; submissions++; w->pending=true; w->delay=delay; }
@@ -1528,12 +1533,14 @@ int main(void)
     dcp_180hz_retry(&d); assert(!submissions);
     d.rate_retry_initialized=true;
     for(unsigned i=0;i<100;i++) dcp_180hz_retry(&d);
-    assert(submissions==8 && d.rate_proof.retries==8 && d.rate_retry_wq.delay==300);
+    assert(submissions==8 && d.rate_proof.retries==9 && d.rate_retry_wq.delay==300);
+    assert(warnings==1);
     dcp_180hz_retry_work(&d.rate_retry_wq.work); assert(c.hotplug_wq.scheduled==1);
     d.typec_generation++; dcp_180hz_retry_work(&d.rate_retry_wq.work);
     assert(c.hotplug_wq.scheduled==1);
     d.typec_cable_connected=false; dcp_180hz_retry(&d); assert(submissions==8);
     d.typec_cable_connected=true; dcp_180hz_retry(&d); assert(submissions==9 && d.rate_proof.retries==1);
+    assert(warnings==1);
     d.quiescing=true; dcp_180hz_retry(&d); dcp_180hz_retry_work(&d.rate_retry_wq.work);
     assert(submissions==9 && c.hotplug_wq.scheduled==1);
     d.quiescing=false; c.dcp=NULL; dcp_180hz_retry_work(&d.rate_retry_wq.work);
@@ -1541,7 +1548,8 @@ int main(void)
     c.dcp=&d; dcp_180hz_retry_work(&d.rate_retry_wq.work); assert(c.hotplug_wq.scheduled==2);
     dcp_180hz_cancel(&d); assert(!d.rate_retry_initialized && !d.rate_retry_wq.pending && cancellations==1);
     dcp_180hz_retry(&d); assert(submissions==9);
-    puts("PASS: actual eight-retry bound, 300ms delay, stale-generation/disconnect/quiesce/ownership gates and cancellation");
+    assert(warnings==1);
+    puts("PASS: actual eight-retry bound, one warning when it runs out, 300ms delay, stale-generation/disconnect/quiesce/ownership gates and cancellation");
 }
 """
     return prefix + production + controls
