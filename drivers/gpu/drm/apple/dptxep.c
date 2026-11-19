@@ -820,7 +820,8 @@ dptxport_call_activate(struct apple_epic_service *service,
 	 * mode for the whole connection. The DP IN adapter may only be woken
 	 * (DPTX_INACTIVE=0) from here; waking it earlier hangs the machine.
 	 * Activate replies success to DCP, except that firmware 27 is told
-	 * when the PHY could not switch to DisplayPort.
+	 * when the PHY could not switch to DisplayPort or the DP IN adapter
+	 * could not be woken.
 	 */
 	if (dptx->atcphy && !dcp->phy_managed_by_typec) {
 		ret = phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
@@ -831,6 +832,9 @@ dptxport_call_activate(struct apple_epic_service *service,
 		ret = dcp_tunnel_dpin_activate(dcp, dptx->unit, true);
 		if (ret)
 			dev_err(dcp->dev, "DPTX tunnel activation failed: %d\n", ret);
+		/* Firmware 27: no link trains without the adapter, as without the PHY. */
+		if (ret && dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			return ret;
 		/* T6030 14.7: report a failed tunnel activation to DCP. */
 		if (ret && dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 			if (reply_size < sizeof(__le32))
@@ -933,23 +937,25 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		return dptxport_call_will_change_link_config(service);
 	case DPTX_APCALL_DID_CHANGE_LINK_CONFIG: {
 		int ret = dptxport_call_did_change_link_config(service);
+		int xret = 0;
 
 		if (!ret && service->ep->dcp->dptx_tunnel && dptx->link_rate) {
-			int xret = dcp_tunnel_crossbar_up(service->ep->dcp, dptx->unit);
-
+			xret = dcp_tunnel_crossbar_up(service->ep->dcp, dptx->unit);
 			if (xret)
 				dev_err(service->ep->dcp->dev,
 					"DPTX tunnel crossbar up failed: %d\n", xret);
-			/* T6030 14.7: fail the link config without a crossbar. */
-			if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7)
-				ret = xret;
 		} else if (!ret && dptx->link_rate) {
-			dcp_direct_crossbar_link(service->ep->dcp, true);
+			/* Logs its own failure. */
+			xret = dcp_direct_crossbar_link(service->ep->dcp, true);
 		}
+		/* T6030 14.7: fail the link config without a crossbar output. */
+		if (xret && service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7)
+			ret = xret;
 		if (!ret)
 			dcp_hdmi_link_configured(service->ep->dcp, dptx->link_rate);
 		if (ret && service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
-		    service->ep->dcp->dptx_tunnel && reply_size >= sizeof(__le32)) {
+		    (service->ep->dcp->dptx_tunnel || xret) &&
+		    reply_size >= sizeof(__le32)) {
 			put_unaligned_le32(1, reply);
 			return 0;
 		}
