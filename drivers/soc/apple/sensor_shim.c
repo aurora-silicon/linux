@@ -7,8 +7,6 @@
 #include <linux/device.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
-#include <linux/gpio/driver.h>
-#include <linux/gpio/machine.h>
 #include <linux/interrupt.h>
 #include <linux/mfd/macsmc.h>
 #include <linux/of.h>
@@ -78,16 +76,9 @@ static struct spi_device *sep_spi;
 static struct gpio_desc *sep_power;
 static bool sep_registered;
 
-/*
- * Power line resolved by DT node path, not gpiochip index: registration order
- * shifts, so an index would silently pick the wrong chip.
- */
-#define SEP_SENSOR_GPIO_NODE		"/soc/pinctrl@39b028000"
-#define SEP_SENSOR_GPIO_LINE		122
-
+/* Wire values shared with sensor.rs (PowerSource::from_wire). */
 #define SEP_POWER_NONE		0
 #define SEP_POWER_NODE_PROPERTY	1
-#define SEP_POWER_CHIP_LINE		2
 #define SEP_POWER_SMC_RAILS		3
 
 static int sep_power_source;
@@ -102,12 +93,9 @@ static u32 sep_smc_rails[SEP_SMC_MAX_RAILS];
 static int sep_smc_nrails;
 
 /*
- * Data-ready line for interrupt-driven capture. On j414s it is the pin adjacent
- * to the power line (122) on the same controller; other boards describe it as
- * the SPI node's interrupt, which the SPI core resolves into spi->irq.
+ * Data-ready line for interrupt-driven capture: the SPI node's interrupt, which
+ * the SPI core resolves into spi->irq.
  */
-#define SEP_SENSOR_DRDY_LINE	121
-static struct gpio_desc *sep_drdy;	/* set only when we own the gpiochip line (j414s) */
 static int sep_drdy_irq = -1;
 static DECLARE_COMPLETION(sep_drdy_done);
 
@@ -244,10 +232,6 @@ static int sep_acquire_smc_power(struct spi_device *spi)
  */
 static int sep_acquire_power(struct spi_device *spi)
 {
-	struct device_node *np;
-	struct gpio_device *gdev;
-	struct gpio_chip *gc;
-
 	if (spi->dev.of_node &&
 	    of_property_present(spi->dev.of_node, "apple,smc-power-key"))
 		return sep_acquire_smc_power(spi);
@@ -269,58 +253,9 @@ static int sep_acquire_power(struct spi_device *spi)
 	}
 	sep_power = NULL;
 
-	/*
-	 * The fallback below is the j414s power line; a sibling board's sensor sits
-	 * on a different pin, so only j414s may use it. Every other machine must
-	 * describe enable-gpios in its device node.
-	 */
-	if (!of_machine_is_compatible("apple,j414s")) {
-		dev_warn(&spi->dev,
-			 "sep sensor: no power GPIO in the device node; describe enable-gpios in DT\n");
-		return -ENODEV;
-	}
-
-	np = of_find_node_by_path(SEP_SENSOR_GPIO_NODE);
-	if (!np) {
-		dev_warn(&spi->dev,
-			 "sep sensor: no DT node at %s, no power line\n",
-			 SEP_SENSOR_GPIO_NODE);
-		return -ENODEV;
-	}
-
-	gdev = gpio_device_find_by_fwnode(of_fwnode_handle(np));
-	of_node_put(np);
-	if (!gdev) {
-		dev_warn(&spi->dev,
-			 "sep sensor: %s has no registered GPIO device\n",
-			 SEP_SENSOR_GPIO_NODE);
-		return -EPROBE_DEFER;
-	}
-
-	gc = gpio_device_get_chip(gdev);
-	if (gc)
-		sep_power = gpiochip_request_own_desc(gc,
-							 SEP_SENSOR_GPIO_LINE,
-							 "apple-mesa-power",
-							 GPIO_LOOKUP_FLAGS_DEFAULT,
-							 GPIOD_OUT_LOW);
-	if (!gc || IS_ERR(sep_power)) {
-		sep_power = NULL;
-		dev_warn(&spi->dev,
-			 "sep sensor: could not take line %d on %s (%s)\n",
-			 SEP_SENSOR_GPIO_LINE, SEP_SENSOR_GPIO_NODE,
-			 gpio_device_get_label(gdev));
-		gpio_device_put(gdev);
-		return -ENODEV;
-	}
-
-	sep_power_source = SEP_POWER_CHIP_LINE;
-	dev_info(&spi->dev,
-		 "sep sensor: power line %s line %d (%s), driven low\n",
-		 SEP_SENSOR_GPIO_NODE, SEP_SENSOR_GPIO_LINE,
-		 gpio_device_get_label(gdev));
-	gpio_device_put(gdev);
-	return 0;
+	dev_warn(&spi->dev,
+		 "sep sensor: no power GPIO in the device node; describe enable-gpios in DT\n");
+	return -ENODEV;
 }
 
 static void sep_release_power(void)
@@ -335,10 +270,7 @@ static void sep_release_power(void)
 	if (!sep_power)
 		return;
 	gpiod_set_value_cansleep(sep_power, 0);
-	if (sep_power_source == SEP_POWER_CHIP_LINE)
-		gpiochip_free_own_desc(sep_power);
-	else
-		gpiod_put(sep_power);
+	gpiod_put(sep_power);
 	sep_power = NULL;
 	sep_power_source = SEP_POWER_NONE;
 }
@@ -633,7 +565,7 @@ static int sep_sensor_power_cycle_locked(struct sep_sensor_lifetime *sensor)
 	return 0;
 }
 
-/* How the power line was obtained: none, the node's property, or chip+line. */
+/* How the power line was obtained: none, the node's property, or SMC rails. */
 static int sep_sensor_power_source_locked(void)
 {
 	return sep_power_source;
@@ -699,9 +631,6 @@ static irqreturn_t sep_drdy_isr(int irq, void *dev_id)
  */
 static int sep_sensor_irq_setup_locked(void)
 {
-	struct device_node *np;
-	struct gpio_device *gdev;
-	struct gpio_chip *gc;
 	int irq, rc;
 
 	if (!sep_spi)
@@ -709,41 +638,10 @@ static int sep_sensor_irq_setup_locked(void)
 	if (sep_drdy_irq >= 0)
 		return 0;
 
-	if (sep_spi->irq > 0) {
-		/* A board that describes the data-ready line as the SPI node's
-		 * interrupt gets it resolved by the SPI core. */
-		irq = sep_spi->irq;
-	} else if (of_machine_is_compatible("apple,j414s")) {
-		np = of_find_node_by_path(SEP_SENSOR_GPIO_NODE);
-		if (!np)
-			return -ENODEV;
-		gdev = gpio_device_find_by_fwnode(of_fwnode_handle(np));
-		of_node_put(np);
-		if (!gdev)
-			return -ENODEV;
-		gc = gpio_device_get_chip(gdev);
-		if (!gc) {
-			gpio_device_put(gdev);
-			return -ENODEV;
-		}
-		sep_drdy = gpiochip_request_own_desc(gc, SEP_SENSOR_DRDY_LINE,
-						     "apple-mesa-drdy",
-						     GPIO_LOOKUP_FLAGS_DEFAULT,
-						     GPIOD_IN);
-		gpio_device_put(gdev);
-		if (IS_ERR(sep_drdy)) {
-			sep_drdy = NULL;
-			return -ENODEV;
-		}
-		irq = gpiod_to_irq(sep_drdy);
-		if (irq < 0) {
-			gpiochip_free_own_desc(sep_drdy);
-			sep_drdy = NULL;
-			return irq;
-		}
-	} else {
+	/* The board describes the data-ready line as the SPI node's interrupt. */
+	if (sep_spi->irq <= 0)
 		return -ENODEV;
-	}
+	irq = sep_spi->irq;
 
 	init_completion(&sep_drdy_done);
 	/*
@@ -756,13 +654,8 @@ static int sep_sensor_irq_setup_locked(void)
 	rc = request_threaded_irq(irq, NULL, sep_drdy_isr,
 				  IRQF_ONESHOT | IRQF_TRIGGER_RISING,
 				  "apple-mesa-drdy", sep_spi);
-	if (rc) {
-		if (sep_drdy) {
-			gpiochip_free_own_desc(sep_drdy);
-			sep_drdy = NULL;
-		}
+	if (rc)
 		return rc;
-	}
 	sep_drdy_irq = irq;
 	dev_info(&sep_spi->dev,
 		 "sep sensor: data-ready IRQ %d configured for interrupt capture\n",
@@ -775,10 +668,6 @@ static void sep_sensor_irq_teardown_locked(void)
 	if (sep_drdy_irq >= 0) {
 		free_irq(sep_drdy_irq, sep_spi);
 		sep_drdy_irq = -1;
-	}
-	if (sep_drdy) {
-		gpiochip_free_own_desc(sep_drdy);
-		sep_drdy = NULL;
 	}
 }
 
