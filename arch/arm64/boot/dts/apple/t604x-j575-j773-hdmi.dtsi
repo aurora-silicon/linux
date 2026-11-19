@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * The J575c's HDMI port: the LPDPTX PHY (ADT /arm-io/lpdptx-phy0, the display
- * crossbar's output 4) and the on-board DP-to-HDMI converter, whose hotplug
- * and power pins are the J616c's (ADT /arm-io/dp2hdmi-gpio0: AOP GPIO 0x24,
- * SMC gP0f and gP1a).
+ * The HDMI port of the M4 Pro/Max desktops (J575c Mac Studio, J773s Mac
+ * mini): the LPDPTX PHY (ADT /arm-io/lpdptx-phy0, the display crossbar's
+ * output 4) and the on-board DP-to-HDMI converter, whose hotplug and power
+ * pins are the J616c's (ADT /arm-io/dp2hdmi-gpio0: AOP GPIO 0x24, SMC gP0f
+ * and gP1a). The two ADTs describe this path identically: same PHY
+ * registers, PMGR state, crossbar endpoint, converter pins and i2c8 pcon0.
  *
  * macOS drives this port from the internal DCP, which aura's Stage 1 puts to
- * sleep on this board. The crossbar has no registers: the PHY's source select
- * picks the engine, so dcpext0 (crossbar input 0) drives it here, as on the
- * M2 Max Mac Studio (t6021-j475c.dts).
+ * sleep on these boards. The crossbar has no registers: the PHY's source
+ * select picks the engine, so dcpext0 (crossbar input 0) drives it here, as
+ * on the M2 Max Mac Studio (t6021-j475c.dts).
  *
  * Every node is disabled. The boot loader fills dcpext0's firmware memory and
  * the display gate (drivers/soc/apple/display-gate.c) then enables the chain.
@@ -20,7 +22,7 @@
 	};
 
 	reserved-memory {
-		/* Filled by the boot loader, as dcpext1's (t6041-j575c-usbc.dtsi). */
+		/* Filled by the boot loader from this boot's ADT, as dcpext1's. */
 		dcpext0_text: dcpext0-text {
 			compatible = "apple,asc-mem";
 			reg = <0x0 0x0 0x0 0x4000>;
