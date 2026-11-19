@@ -1190,7 +1190,8 @@ static int apple_probe_per_dcp(struct device *dev,
 					     dcp_data->hw.iomfb_method_profile ==
 						     DCP_IOMFB_METHODS_H17G,
 					     DRM_PLANE_TYPE_OVERLAY, false,
-					     supports_premultiplied);
+					     supports_premultiplied,
+					     dcp_is_ext26(dcp_data));
 		if (IS_ERR(ind_plane))
 			return PTR_ERR(ind_plane);
 		ret = drm_plane_create_zpos_immutable_property(ind_plane, zpos++);
