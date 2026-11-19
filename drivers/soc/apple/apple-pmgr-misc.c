@@ -761,8 +761,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, misc);
 
-	if (!ret)
-		apple_pmgr_misc_debugfs_init(misc);
+	apple_pmgr_misc_debugfs_init(misc);
 
 	/*
 	 * With PMP enabled its firmware owns the fabric and DCS p-states.
