@@ -43,12 +43,15 @@ pub(crate) mod tune {
     pub(crate) static PB_HEAP_MB: AtomicU32 = AtomicU32::new(64);
     /// PB blocks posted to a fresh epoch at most (2048: the whole heap).
     pub(crate) static PB_BLOCKS: AtomicU32 = AtomicU32::new(2048);
-    const NAMES: [(&str, &AtomicU32, u32, u32); 5] = [
+    /// Host phase timers (the `prof:` statistics line) on.
+    pub(crate) static PROF: AtomicU32 = AtomicU32::new(0);
+    const NAMES: [(&str, &AtomicU32, u32, u32); 6] = [
         ("compute_units", &COMPUTE_UNITS, 2, super::hw::sizes::COMPUTE_UNITS as u32),
         ("compute_flights", &COMPUTE_FLIGHTS, 1, super::hw::sizes::FLIGHTS as u32),
         ("resnap_us", &RESNAP_US, 0, 1000),
         ("pb_heap_mb", &PB_HEAP_MB, 8, 256),
         ("pb_blocks", &PB_BLOCKS, 16, 2048),
+        ("prof", &PROF, 0, 1),
     ];
 
     /// Applies one `name=value` line.
@@ -90,6 +93,11 @@ pub(crate) fn pb_posted_blocks(heap_blocks: u32) -> u32 {
         .load(core::sync::atomic::Ordering::Relaxed)
         .clamp(16, 2048)
         .min(heap_blocks)
+}
+
+/// Whether the host phase timers run.
+pub(crate) fn prof() -> bool {
+    tune::PROF.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
 /// Compute units of a VM that submits compute back to back.

@@ -855,6 +855,34 @@ impl Firmware {
         }
         if hi > lo {
             s.span_ticks = s.span_ticks.saturating_add(hi - lo);
+            // Latency: publication -> start, execution, end -> kick, end -> retirement.
+            let li = usize::from(f.renders != 0);
+            let now_t = super::engine::counter_ticks();
+            let kick = self
+                .engine
+                .shared
+                .as_ref()
+                .map_or(0, |sh| sh.kick_ticks.load(Ordering::Relaxed));
+            let l = &mut s.lat[li];
+            if f.pub_ticks != 0 && lo >= f.pub_ticks && now_t >= hi {
+                l[0] += 1;
+                l[1] += lo - f.pub_ticks;
+                l[2] += hi - lo;
+                if kick >= hi {
+                    l[3] += kick - hi;
+                }
+                l[4] += now_t - hi;
+                if f.renders != 0 {
+                    if let Some(arena) = f.job.resources.render.as_ref() {
+                        let p = &arena.passes[f.claims.pass[0] as usize];
+                        if let (Ok(ta_end), Ok(fs_start)) = (p.scene.r64(0x608), p.scene.r64(0x620)) {
+                            if fs_start >= ta_end {
+                                l[5] += fs_start - ta_end;
+                            }
+                        }
+                    }
+                }
+            }
         }
         for b in 0..3 {
             let t = self.events.event_ns[b];
@@ -1029,6 +1057,23 @@ impl Firmware {
                 us(s.max_ns[e]),
                 us(s.first_ns[e]),
                 us(s.last_ns[e])
+            )?;
+        }
+        for (e, name) in ["compute", "render"].iter().enumerate() {
+            let l = &s.lat[e];
+            let n = l[0].max(1);
+            // 24 MHz ticks -> ns per flight.
+            let ns = |t: u64| t * 1000 / 24 / n;
+            writeln!(
+                f,
+                "lat_{}: n {} pub_to_start_ns {} exec_ns {} end_to_kick_ns {} end_to_retire_ns {} ta_end_to_fs_start_ns {}",
+                name,
+                l[0],
+                ns(l[1]),
+                ns(l[2]),
+                ns(l[3]),
+                ns(l[4]),
+                ns(l[5])
             )?;
         }
         writeln!(

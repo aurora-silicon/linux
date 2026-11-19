@@ -185,6 +185,8 @@ pub(crate) struct Flight {
     pub(crate) recovery_started_ns: u64,
     /// Publication time, ns.
     pub(crate) published_ns: u64,
+    /// Publication time in counter ticks (latency statistics).
+    pub(crate) pub_ticks: u64,
     /// Published behind another flight.
     pub(crate) behind: bool,
     /// The PB epoch this render prefix uses (its own, or a reused one with `g16_pb_reuse`).
@@ -220,6 +222,7 @@ impl Flight {
             recovery_suspect: false,
             recovery_started_ns: 0,
             published_ns: 0,
+            pub_ticks: 0,
             behind: false,
             pb: None,
             pb_binding: 0,
@@ -309,6 +312,10 @@ pub(crate) struct Stats {
     pub(crate) behind: u64,
     /// Most flights in flight at once.
     pub(crate) max_flights: u64,
+    /// Latency of retired flights, compute [0] and render [1], counter ticks: count,
+    /// publication -> first stage start, first start -> last end, last end -> last kick
+    /// (when the kick followed it), last end -> retirement, render TA end -> FS start.
+    pub(crate) lat: [[u64; 6]; 2],
 }
 
 /// Host-side phase timers of publication and polling, on with `debug_flags` bit 49
@@ -340,7 +347,8 @@ pub(crate) struct Lap(Option<u64>);
 
 impl Lap {
     pub(crate) fn start() -> Self {
-        Lap(crate::debug::debug_enabled(crate::debug::DebugFlags::Debug1).then(now_ns))
+        Lap((crate::debug::debug_enabled(crate::debug::DebugFlags::Debug1) || params::prof())
+            .then(now_ns))
     }
 
     /// Adds the time since the start or the last lap to `acc`.
@@ -1511,6 +1519,7 @@ impl Firmware {
         let s = &mut self.engine.stats;
         s.pub_ns = now_ns();
         f.published_ns = s.pub_ns;
+        f.pub_ticks = counter_ticks();
         if f.behind {
             s.behind += 1;
             s.overlaps += 1;
