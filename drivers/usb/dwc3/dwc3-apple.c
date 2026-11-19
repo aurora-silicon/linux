@@ -547,6 +547,8 @@ static int dwc3_apple_tunnel_phy(struct dwc3_apple *appledwc, enum apple_t6050_c
 	return ret;
 }
 
+static bool dwc3_apple_tunnel_keep(struct dwc3_apple *appledwc);
+
 /*
  * TEST (J714s): before xHCI touches a core kept through its router's sleep. Kept on the tunnel,
  * or only parked after a refusal, the core has its registers and xHCI restores its state. One
@@ -583,6 +585,15 @@ static int dwc3_apple_tunnel_resume(struct dwc3_apple *appledwc)
 	}
 	appledwc->sleep_tunnel_result = DWC3_APPLE_TUNNEL_REINIT;
 	dev_info(appledwc->dev, "USB host's core lost in the router's sleep: set up again, xHCI starts over\n");
+	/*
+	 * A dark wake sleeps again at once, with no PM_SUSPEND_PREPARE: the notifier's keep is not
+	 * made again, and this core, set up again with its PIPE on the tunnel, would hold the PHY's
+	 * CIO stop off at the re-entry (the router's sleep then refused). Keep it here instead; if
+	 * that is not possible, the re-entry is refused as before and the wake becomes a full one.
+	 */
+	if (pm_dark_wake())
+		dev_info(appledwc->dev, "dark wake: USB host kept again for the router's next sleep: %s\n",
+			 dwc3_apple_tunnel_keep(appledwc) ? "yes" : "no");
 	return 1;
 }
 
