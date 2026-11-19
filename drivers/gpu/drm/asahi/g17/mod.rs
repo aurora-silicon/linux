@@ -254,7 +254,9 @@ pub(crate) struct Config {
     pub(crate) gpu_generation: hw::GpuGen,
     /// The firmware builds this SoC runs.
     pub(crate) firmware: fw::variant::Firmware,
-    /// Lower firmware effort for quiet GPU work; `None` runs every submission at full effort.
+    /// Lower firmware effort for quiet GPU work: [`power::LIGHT_DEFAULT`] on every G17. `None`
+    /// runs every submission at full effort, for a SoC whose hardware needs that; its entry says
+    /// why.
     pub(crate) light_effort: Option<power::LightEffort>,
     /// Layouts of the command buffers that follow the GPU's core layout.
     pub(crate) core_layout: CoreLayout,

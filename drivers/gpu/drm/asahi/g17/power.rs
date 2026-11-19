@@ -381,6 +381,17 @@ pub(crate) struct LightEffort {
     pub(crate) job_exit_us: u32,
 }
 
+/// The light effort of every G17. Nothing in the quiet-window logic depends on the SoC: the
+/// values were measured on the M4 Max (scrolling 24.9 -> 22.1 W on AC with its CLPC memory
+/// states) and apply wherever the firmware takes an effort input.
+pub(crate) const LIGHT_DEFAULT: LightEffort = LightEffort {
+    effort: 0x8000,
+    enter_permille: 350,
+    exit_permille: 750,
+    job_enter_us: 3000,
+    job_exit_us: 7000,
+};
+
 static LIGHT_EFFORT: AtomicU32 = AtomicU32::new(0);
 static LIGHT_ENTER: AtomicU32 = AtomicU32::new(0);
 static LIGHT_EXIT: AtomicU32 = AtomicU32::new(0);

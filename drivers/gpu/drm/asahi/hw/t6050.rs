@@ -70,9 +70,9 @@ pub(crate) const CONFIG: Config = Config {
         variant: &crate::g17::fw::variant::V26A428_M5,
         config: None,
     }]),
+    light_effort: Some(crate::g17::power::LIGHT_DEFAULT),
     // Two clusters of ten cores. The buffers are sized for every core slot of the board, so the
     // board's cluster and slot counts admit the GPU, whichever cores are fused off.
-    light_effort: None,
     core_layout: CoreLayout {
         cores: None,
         alternate_core_masks: None,
@@ -142,9 +142,9 @@ pub(crate) const CONFIG_MAX: Config = Config {
         variant: &crate::g17::fw::variant::V26A428_M5,
         config: None,
     }]),
+    light_effort: Some(crate::g17::power::LIGHT_DEFAULT),
     // Four clusters of ten cores. The buffers are sized for every core slot of the board, so the
     // board's cluster and slot counts admit the GPU, whichever cores are fused off.
-    light_effort: None,
     core_layout: CoreLayout {
         cores: None,
         alternate_core_masks: None,
@@ -228,11 +228,11 @@ pub(crate) const CONFIG_ULTRA: Config = Config {
         variant: &crate::g17::fw::variant::V26A428_M5,
         config: None,
     }]),
+    light_effort: Some(crate::g17::power::LIGHT_DEFAULT),
     // Eight clusters of ten cores. M5 renders lay out their tiler context store themselves
     // (`fw::m5::render_registers`), so the deflake layout is the M5 Pro's. As on the M5 Pro, the
     // buffers are sized for all 80 core slots and the board admits the GPU by clusters and slots:
     // parts with fused-off cores (64 enabled) take the same layout.
-    light_effort: None,
     core_layout: CoreLayout {
         cores: None,
         alternate_core_masks: None,
