@@ -2673,6 +2673,8 @@ fail:
 	dev_err(dcp->dev,
 		"%s display not started: %s failed: %d; the boot framebuffer stays (reboot to retry)\n",
 		v14->board->name, step, ret);
+	/* Nothing pumps a failed session: stop the link queueing events. */
+	dcp_v14_link_fail(&v14->link);
 	return ret;
 }
 
@@ -2861,8 +2863,11 @@ static int dcp_v14_swap_locked(struct apple_dcp_v14 *v14, const u8 *surface, u64
 	 * refuses it, which ends nothing. Link failures stop the session in
 	 * dcp_v14_call() either way.
 	 */
-	if (ret && !v14->external)
+	if (ret && !v14->external) {
 		v14->failed = true;
+		/* Nothing pumps a failed session: stop the link queueing events. */
+		dcp_v14_link_fail(&v14->link);
+	}
 
 	kfree(swap);
 	return ret;
