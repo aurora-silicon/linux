@@ -112,7 +112,12 @@ impl Order {
     /// A same-engine command cannot jump a hole in its queue's completed frontier.
     /// Cross-engine historical dependencies end at the named prefix, even while later
     /// commands in that older submission remain pending.
-    pub(crate) fn ready(&self, completed: [u64; 2], published: [u64; 2]) -> bool {
+    pub(crate) fn ready(
+        &self,
+        completed: [u64; 2],
+        published: [u64; 2],
+        renders_queued: bool,
+    ) -> bool {
         // Same-engine compute order and barriers are kept by the firmware compute queue,
         // which finishes each command before it starts the next: its published frontier
         // suffices. Renders, and every cross-engine dependency, need the completed one.
@@ -121,7 +126,7 @@ impl Order {
         let mut frontier = completed;
         if self.engine == COMPUTE {
             frontier[COMPUTE] = published[COMPUTE].max(completed[COMPUTE]);
-        } else if super::params::render_flights() > 1 {
+        } else if renders_queued {
             frontier[RENDER] = published[RENDER].max(completed[RENDER]);
         }
         frontier[self.engine].checked_add(1) == Some(self.sequence)

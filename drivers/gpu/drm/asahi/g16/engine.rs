@@ -1201,7 +1201,12 @@ impl Firmware {
                 }
                 let k = self
                     .slots
-                    .pick_pass(job.resources.render()?, &geometry, 0)
+                    .pick_pass(
+                        job.resources.render()?,
+                        &geometry,
+                        0,
+                        job.resources.render()?.pools.split,
+                    )
                     .ok_or(EAGAIN)?;
                 f.claims.pass[0] = k as u32;
                 f.claims.pass_mask = 1 << k;
@@ -1474,7 +1479,8 @@ impl Firmware {
         let draw = super::recovery::logic::next_ordinal(pf.draw).ok_or(EOVERFLOW)?;
         let target = encode::stamp(draw);
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
-        self.slots.claim_pass(job.resources.render()?, k)?;
+        let arena = job.resources.render()?;
+        self.slots.claim_pass(arena, k, arena.pools.split)?;
         self.slots.hold_vm(&f.claims, &job.vm)?;
         self.slots.hold_arenas(&f.claims, &job.resources);
         let (refs, init_buffer, epoch, binding) = self.render_refs(k, job, draw)?;

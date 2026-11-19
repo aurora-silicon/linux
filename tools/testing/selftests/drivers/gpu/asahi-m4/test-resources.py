@@ -160,7 +160,7 @@ pub mod g16 {
     }
     pub mod boot {pub fn eproto()->crate::Error{crate::Error(71)}}
     // Arenas here have the two base units.
-    pub mod params {pub fn compute_units()->usize{2}pub fn pb_heap_blocks()->u32{2048}pub fn pb_posted_blocks(heap:u32)->u32{heap}}
+    pub mod params {pub fn render_uma_split()->bool{false}pub fn compute_pool_share()->bool{false}pub fn compute_units()->usize{2}pub fn pb_heap_blocks()->u32{2048}pub fn pb_posted_blocks(heap:u32)->u32{heap}}
     pub struct Events{pub grow:crate::KVec<[u32;18]>}
     pub struct Firmware{pub pools:pools::Pools,pub events:Events}
     pub mod budget{__BUDGET__}
@@ -172,50 +172,71 @@ pub mod g16 {
     struct Arenas{compute:g16::resources::ComputeArena,render:g16::resources::RenderArena}
     fn arenas(o:&mut Objects)->Arenas{
         let mut compute=KVec::new();let mut passes=KVec::new();
-        for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
+        for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,k,None).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
         Arenas{compute:g16::resources::ComputeArena{compute},render:g16::resources::RenderArena{passes,tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};2],tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};2]}}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&c).unwrap();s.retire(&mut c).unwrap();}
+    #[test]fn shared_compute_pool_rows_are_disjoint(){
+        let mut o=Objects::new();
+        let rows=g16::slots::SHARED_POOL_ROWS.clone();
+        let base=g16::slots::ComputeSlot::new(&mut o,0,Some((None,rows[0].clone()))).unwrap();
+        let ext=g16::slots::ComputeSlot::new(&mut o,2,Some((Some(base.pool.clone()),rows[1].clone()))).unwrap();
+        let last=g16::slots::ComputeSlot::new(&mut o,3,Some((Some(base.pool.clone()),rows[2].clone()))).unwrap();
+        let pool=base.pool.gva.unwrap();
+        assert_eq!(ext.pool.gva,base.pool.gva);
+        assert_eq!((base.seeds,ext.seeds,last.seeds),(2560,2560,3072));
+        let page=|u:&g16::slots::ComputeSlot,i:usize|u64::from_le_bytes(u.pool_state.snapshot()[i*8..i*8+8].try_into().unwrap());
+        let row=|u:&g16::slots::ComputeSlot,i:usize|u64::from_le_bytes(u.page_list.snapshot()[i*64..i*64+8].try_into().unwrap());
+        assert_eq!((page(&base,0),page(&base,2559)),(pool,pool+2559*0x1000));
+        assert_eq!((page(&ext,0),page(&ext,2559)),(pool+2560*0x1000,pool+5119*0x1000));
+        assert_eq!((page(&last,0),page(&last,3071)),(pool+5120*0x1000,pool+8191*0x1000));
+        assert_eq!(page(&base,2560),0);assert_eq!(page(&ext,2560),0);
+        assert_eq!((row(&base,0),row(&base,4),row(&base,5)),((1<<61)|pool,(1<<61)|(pool+4*0x200000),0));
+        assert_eq!((row(&ext,0),row(&ext,4)),((1<<61)|(pool+5*0x200000),(1<<61)|(pool+9*0x200000)));
+        assert_eq!((row(&last,0),row(&last,5),row(&last,6)),((1<<61)|(pool+10*0x200000),(1<<61)|(pool+15*0x200000),0));
+        let own=g16::slots::ComputeSlot::new(&mut o,4,None).unwrap();
+        assert_eq!(own.seeds,8192);assert_ne!(own.pool.gva,base.pool.gva);
+    }
     #[test]fn render_reuse_clears_only_previous_write_spans(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
-        s.claim_pass(&arena.render,0).unwrap();
+        s.claim_pass(&arena.render,0,false).unwrap();
         let p=arena.render.passes[0].tpc.clone();let m=arena.render.passes[0].tilemap.clone();
         assert_eq!(*p.fills.lock().unwrap(),[(0,0)]);assert_eq!(*m.fills.lock().unwrap(),[(0,0)]);
         arena.render.set_dirty(0,0x8000,0x5000).unwrap();p.fill(0,0xa5,0x8000).unwrap();m.fill(0,0x5a,0x5000).unwrap();
         p.write(0x8000,&[0xf1]).unwrap();m.write(0x5000,&[0xf2]).unwrap();
-        retire_render(&mut s,0);s.claim_pass(&arena.render,1).unwrap();retire_render(&mut s,1);s.claim_pass(&arena.render,0).unwrap();
+        retire_render(&mut s,0);s.claim_pass(&arena.render,1,false).unwrap();retire_render(&mut s,1);s.claim_pass(&arena.render,0,false).unwrap();
         assert!(p.snapshot()[..0x8000].iter().all(|&b|b==0));assert!(m.snapshot()[..0x5000].iter().all(|&b|b==0));
         assert_eq!(p.snapshot()[0x8000],0xf1);assert_eq!(m.snapshot()[0x5000],0xf2);
         assert_eq!(p.fills.lock().unwrap().last(),Some(&(0,0x8000)));assert_eq!(m.fills.lock().unwrap().last(),Some(&(0,0x5000)));
         arena.render.set_dirty(0,0x2000,0x1000).unwrap();p.fill(0,0x45,0x2000).unwrap();m.fill(0,0x67,0x1000).unwrap();
-        retire_render(&mut s,0);s.claim_pass(&arena.render,1).unwrap();retire_render(&mut s,1);s.claim_pass(&arena.render,0).unwrap();
+        retire_render(&mut s,0);s.claim_pass(&arena.render,1,false).unwrap();retire_render(&mut s,1);s.claim_pass(&arena.render,0,false).unwrap();
         assert!(p.snapshot()[..0x8000].iter().all(|&b|b==0));assert!(m.snapshot()[..0x5000].iter().all(|&b|b==0));
         assert_eq!(p.fills.lock().unwrap().last(),Some(&(0,0x2000)));assert_eq!(m.fills.lock().unwrap().last(),Some(&(0,0x1000)));
         assert_eq!((s.stats.tpc_clear_bytes,s.stats.tilemap_clear_bytes,s.stats.pass_scrubs),(0xa000,0x6000,5));
     }
     #[test]fn cancelled_render_preparation_keeps_dirty_union(){
-        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);s.claim_pass(&arena.render,0).unwrap();
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);s.claim_pass(&arena.render,0,false).unwrap();
         let p=arena.render.passes[0].tpc.clone();let m=arena.render.passes[0].tilemap.clone();
         arena.render.set_dirty(0,0x1000,0x3000).unwrap();arena.render.set_dirty(0,0x2000,0x1000).unwrap();
         p.fill(0,0x91,0x2000).unwrap();m.fill(0,0x92,0x3000).unwrap();
-        let mut c=Claims::new();c.pass_mask=1;s.release(&mut c);s.claim_pass(&arena.render,0).unwrap();
+        let mut c=Claims::new();c.pass_mask=1;s.release(&mut c);s.claim_pass(&arena.render,0,false).unwrap();
         assert!(p.snapshot()[..0x2000].iter().all(|&b|b==0));assert!(m.snapshot()[..0x3000].iter().all(|&b|b==0));
         assert_eq!(p.fills.lock().unwrap().last(),Some(&(0,0x2000)));assert_eq!(m.fills.lock().unwrap().last(),Some(&(0,0x3000)));
     }
     #[test]fn failed_scrub_preserves_dirty_bounds_for_retry(){
-        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);s.claim_pass(&arena.render,0).unwrap();
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);s.claim_pass(&arena.render,0,false).unwrap();
         let p=arena.render.passes[0].tpc.clone();let m=arena.render.passes[0].tilemap.clone();
         arena.render.set_dirty(0,0x1000,0x2000).unwrap();p.fill(0,0x31,0x1000).unwrap();m.fill(0,0x32,0x2000).unwrap();
-        retire_render(&mut s,0);s.claim_pass(&arena.render,1).unwrap();retire_render(&mut s,1);
-        m.fail_fill.store(true,std::sync::atomic::Ordering::Relaxed);assert_eq!(s.claim_pass(&arena.render,0),Err(EIO));
-        s.claim_pass(&arena.render,0).unwrap();assert!(p.snapshot()[..0x1000].iter().all(|&b|b==0));assert!(m.snapshot()[..0x2000].iter().all(|&b|b==0));
+        retire_render(&mut s,0);s.claim_pass(&arena.render,1,false).unwrap();retire_render(&mut s,1);
+        m.fail_fill.store(true,std::sync::atomic::Ordering::Relaxed);assert_eq!(s.claim_pass(&arena.render,0,false),Err(EIO));
+        s.claim_pass(&arena.render,0,false).unwrap();assert!(p.snapshot()[..0x1000].iter().all(|&b|b==0));assert!(m.snapshot()[..0x2000].iter().all(|&b|b==0));
         assert_eq!(p.fills.lock().unwrap().last(),Some(&(0,0x1000)));assert_eq!(m.fills.lock().unwrap().last(),Some(&(0,0x2000)));
         assert_eq!((s.stats.tpc_clear_bytes,s.stats.tilemap_clear_bytes,s.stats.pass_scrubs),(0x2000,0x2000,3));
     }
     #[test]fn dirty_bounds_reject_overflow_without_poisoning_next_claim(){
-        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);s.claim_pass(&arena.render,0).unwrap();
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);s.claim_pass(&arena.render,0,false).unwrap();
         assert_eq!(arena.render.set_dirty(0,u64::MAX,0),Err(E2BIG));assert_eq!(arena.render.set_dirty(0,0,u64::MAX),Err(E2BIG));assert_eq!(arena.render.set_dirty(2,0,0),Err(EINVAL));
-        let mut c=Claims::new();c.pass_mask=1;s.release(&mut c);s.claim_pass(&arena.render,0).unwrap();
+        let mut c=Claims::new();c.pass_mask=1;s.release(&mut c);s.claim_pass(&arena.render,0,false).unwrap();
         assert_eq!(arena.render.passes[0].tpc.fills.lock().unwrap().last(),Some(&(0,0)));assert_eq!(arena.render.passes[0].tilemap.fills.lock().unwrap().last(),Some(&(0,0)));
     }
     #[test]fn production_allocations_are_aligned_disjoint_and_in_mesa_hole(){

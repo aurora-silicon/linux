@@ -43,7 +43,8 @@ impl Error { fn from_errno(error: i32)->Self { Self(error) } }
 type Result<T=()> = core::result::Result<T,Error>;
 const EIO:Error=Error(-5); const ENODEV:Error=Error(-19); const ECANCELED:Error=Error(-125);
 const ETIMEDOUT:Error=Error(-110);const ENOMEM:Error=Error(-12);const EAGAIN:Error=Error(-11); const EINVAL:Error=Error(-22);
-const EOVERFLOW:Error=Error(-75); const NONE:u16=u16::MAX; const COMPUTE:usize=1;
+const EOVERFLOW:Error=Error(-75); const NONE:u16=u16::MAX; const COMPUTE:usize=1; const RENDER:usize=0;
+mod params { pub fn render_flights()->usize{1} }
 ORDER_SOURCE
 pub mod task { pub const MAX_SCHEDULE_TIMEOUT:i64=i64::MAX; }
 struct InputState { status:AtomicI32,waits:AtomicUsize,interrupted:AtomicI64,gate:Mutex<()>,changed:Condvar }
@@ -391,7 +392,7 @@ fn full_receipts_are_consecutive_bounded_and_once() {
     assert_eq!(queued.note_full_retirement(u32::MAX,1),Err(EOVERFLOW));
     queued.note_full_retirement(1,1).unwrap();
 }
-'''.replace('QUEUE_METHODS', queue_methods).replace('ORDER_SOURCE', order_source).replace('FENCE_METHODS', fence_methods).replace('METHODS', methods.replace('super::fence::','fence::'))
+'''.replace('QUEUE_METHODS', queue_methods).replace('ORDER_SOURCE', order_source).replace('FENCE_METHODS', fence_methods).replace('METHODS', methods.replace('super::fence::','fence::').replace('super::params::','params::'))
 
 with tempfile.TemporaryDirectory(prefix='m4-rust-job-') as directory:
     directory=pathlib.Path(directory); test=directory/'test.rs'; test.write_text(harness)

@@ -32,7 +32,7 @@ fn refs(variant:u64)->encode::ComputeRefs {
         auxiliary_fw:f+0x400000,auxiliary_gva:g+0x400000,context_store_gva:g+0x500000,
         counter_fw:f+0x500000,pool_state_gva:g+0x600000,page_list_gva:g+0x700000,
         usc_base:if variant&1!=0{1<<40}else{0},record_fw:if variant&1!=0{f+0x700000}else{0},
-        binding_generation:1,uma_slot:1,command_id:1,compute_index:0,work_818:0,target_stamp:0x100,submitted:1,
+        binding_generation:1,uma_slot:1,command_id:1,compute_index:0,work_818:0,target_stamp:0x100,submitted:1,seeds:0,
     }
 }
 

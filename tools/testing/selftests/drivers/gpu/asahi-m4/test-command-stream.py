@@ -356,16 +356,27 @@ fn historical_priors_enforce_entry_bounds() {
     let order=Order::new([4,8],[2,1],[1,NONE],[3,7],RENDER).unwrap();
     assert_eq!(order.sequence,7);
     assert_eq!(order.wait_through,[Some(5),Some(7)]);
-    assert!(!order.ready([6,6],[6,6]));
-    assert!(order.ready([6,7],[6,7]));
+    assert!(!order.ready([6,6],[6,6],false));
+    assert!(order.ready([6,7],[6,7],false));
     // A compute command may follow published compute predecessors (the firmware compute
     // queue runs them in order); every cross-engine dependency still needs completion.
     let compute=Order::new([0,2],[0,0],[NONE,NONE],[0,2],COMPUTE).unwrap();
-    assert!(!compute.ready([0,1],[0,1]));
-    assert!(compute.ready([0,1],[0,2]));
+    assert!(!compute.ready([0,1],[0,1],false));
+    assert!(compute.ready([0,1],[0,2],false));
     let render=Order::new([0,2],[0,0],[NONE,NONE],[0,2],RENDER).unwrap();
-    assert!(!render.ready([0,1],[0,2]));
-    assert!(render.ready([0,2],[0,2]));
+    assert!(!render.ready([0,1],[0,2],false));
+    assert!(render.ready([0,2],[0,2],false));
+    // With queued renders (a TA waits for the previous FS in the firmware) a render may
+    // follow published render predecessors; a cross-engine wait still needs completion.
+    let queued=Order::new([2,0],[0,0],[NONE,NONE],[2,0],RENDER).unwrap();
+    assert!(!queued.ready([1,0],[1,0],true));
+    assert!(queued.ready([1,0],[2,0],true));
+    assert!(!queued.ready([1,0],[2,0],false));
+    let cross=Order::new([2,3],[0,0],[NONE,NONE],[2,3],RENDER).unwrap();
+    assert!(!cross.ready([2,2],[2,3],true));
+    assert!(cross.ready([2,3],[2,3],true));
+    let compute_after_render=Order::new([3,0],[0,0],[NONE,NONE],[3,0],COMPUTE).unwrap();
+    assert!(!compute_after_render.ready([2,0],[3,0],true));
 }
 #[test]
 fn geometry_capacity_boundary_uses_the_real_encoder() {

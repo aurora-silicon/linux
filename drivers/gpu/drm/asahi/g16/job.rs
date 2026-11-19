@@ -295,7 +295,7 @@ impl Job {
             .published
             .each_ref()
             .map(|value| value.load(Ordering::Acquire));
-        if !order.ready(completed, published) {
+        if !order.ready(completed, published, super::params::render_flights() > 1) {
             return Err(EAGAIN);
         }
         Ok(())

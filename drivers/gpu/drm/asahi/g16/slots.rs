@@ -540,9 +540,9 @@ impl Slots {
     /// Whether pass slot `k` can be claimed for `arena`: its last owner was displaced by a
     /// later retired publication, or (each allocator in its own hardware UMA slot) its last
     /// owner is this same retired storage, which a reload of the same descriptor reuses.
-    fn pass_claimable(&self, arena: &super::resources::RenderArena, k: usize) -> bool {
+    fn pass_claimable(&self, arena: &super::resources::RenderArena, k: usize, split: bool) -> bool {
         self.pass_lifetime.available(k)
-            || (arena.pools.split
+            || (split
                 && self.pass_lifetime.retired(k)
                 && self.pass_arena[k]
                     .as_ref()
@@ -553,12 +553,13 @@ impl Slots {
         arena: &super::resources::RenderArena,
         geo: &Geometry,
         picked: u32,
+        split: bool,
     ) -> Option<usize> {
         for i in 0..2 {
             let k = (self.pass_cursor as usize + i) % 2;
             let p = &arena.passes[k];
             if (self.pass_busy | picked) & (1 << k) == 0
-                && self.pass_claimable(arena, k)
+                && self.pass_claimable(arena, k, split)
                 && geo.tpc_bytes <= p.tpc.size as u64
                 && geo.tilemap_bytes <= p.tilemap.size as u64
             {
@@ -567,8 +568,13 @@ impl Slots {
         }
         None
     }
-    pub(crate) fn claim_pass(&mut self, arena: &super::resources::RenderArena, k: usize) -> Result {
-        if k >= 2 || !self.pass_claimable(arena, k) || !self.pass_lifetime.claim_retired(k) {
+    pub(crate) fn claim_pass(
+        &mut self,
+        arena: &super::resources::RenderArena,
+        k: usize,
+        split: bool,
+    ) -> Result {
+        if k >= 2 || !self.pass_claimable(arena, k, split) || !self.pass_lifetime.claim_retired(k) {
             return Err(EBUSY);
         }
         // Only a retired displaced owner may reach here; no in-flight storage is reset.
