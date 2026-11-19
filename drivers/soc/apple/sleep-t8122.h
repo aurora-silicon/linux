@@ -31,9 +31,13 @@
  * WKTP=2 129 ms, then the PMU's sleep byte, both notify words and the PMP's stop, and only
  * then MBSE=slpa (25.6 ms) and the AP idle notice (23.3 ms). Here macsmc's noirq suspend
  * sends slpa and the idle notice before this entry starts, so before the PMU byte and every
- * stop, and sends no pmVC. The one shared hook that puts the notice behind the peer stops
- * (J813's deferred notice) runs on a transport never tried on this SMC and treats a failed
- * notice as fatal, so it is not taken here: the order stays an open difference.
+ * stop, and sends no pmVC. The shared driver has two ways to put the notice behind the peer
+ * stops: J813's deferred notice, and the SMC policy of a SoC with early_context (T6050's:
+ * slpw, pmVC after a measured spacing, then slpa and the idle notice from .commit_notice,
+ * after the stops). The second is macOS's order here. It is not taken yet for two reasons:
+ * pmVC's four bytes travel in the SMC's shared memory and were not captured, and its
+ * saved-context mailbox transport has never run on this SMC, where a failed notice is fatal
+ * after the stops. The order stays an open difference until both are settled.
  */
 
 #define T8122_PS_DISP_SYS	0x1d8
@@ -115,6 +119,16 @@ static unsigned int t8122_wake_mask;
 module_param(t8122_wake_mask, uint, 0600);
 MODULE_PARM_DESC(t8122_wake_mask,
 		 "J613 trial: 1 masks every wake source but the tree's apple,wake-enable, through the driver's own arm");
+
+static bool t8122_quiet;
+module_param(t8122_quiet, bool, 0600);
+MODULE_PARM_DESC(t8122_quiet,
+		 "J613 trial: mask the EL1 timers and stop the core PMU before each core's last WFI, as T8142 does");
+
+static bool t8122_dry_regs;
+module_param(t8122_dry_regs, bool, 0600);
+MODULE_PARM_DESC(t8122_dry_regs,
+		 "J613 trial: a dry run prints the boot core's timer, PMU and deep-sleep registers (reads only)");
 
 /* Every power word J613's device tree names, as the trial's entry dump has them. */
 static const u32 t8122_ps_all[] = {
@@ -717,6 +731,19 @@ static int t8122_sleep_final_check(struct apple_sleep *s)
 	t8122_witness_dc(0);
 	if (t8122_witness_full)
 		t8122_witness_macos_dc(0);
+	/*
+	 * The boot core's own state where a sleep would find it, to set against what the
+	 * hypervisor reads at macOS's last WFI. Reads only, of registers this kernel already uses.
+	 */
+	if (t8122_dry_regs && apple_sleep_dry(s))
+		dev_info(s->dev, "J613 dry run: boot cpu deep-sleep %#llx cntp/cntv_el0 %#llx/%#llx cntp/cntv_el02 %#llx/%#llx VM_TMR_FIQ_ENA %#llx PMCR0 %#llx IPI_SR %#llx ISR %#llx\n",
+			 read_sysreg_s(SYS_APL_DEEP_SLEEP), read_sysreg(cntp_ctl_el0),
+			 read_sysreg(cntv_ctl_el0),
+			 is_kernel_in_hyp_mode() ? read_sysreg_s(SYS_CNTP_CTL_EL02) : 0,
+			 is_kernel_in_hyp_mode() ? read_sysreg_s(SYS_CNTV_CTL_EL02) : 0,
+			 is_kernel_in_hyp_mode() ? read_sysreg_s(T8142_VM_TMR_FIQ_ENA) : 0,
+			 read_sysreg_s(T8142_PMCR0), read_sysreg_s(SYS_APL_IPI_SR_EL1),
+			 read_sysreg(isr_el1));
 
 	return 0;
 }
@@ -901,6 +928,8 @@ static void t8122_sleep_undo_regs(struct apple_sleep *s)
 
 static void t8122_deep_wfi_arm(void)
 {
+	if (t8122_quiet)
+		sleep_core_fiq_quiet();
 	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
 	/* The boot core's, last: 'Z' going in. */
 	if (apple_sleep && (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) == apple_sleep->mbox->boot_mpidr)
@@ -978,6 +1007,9 @@ static void t8122_sleep_commit_regs(struct apple_sleep *s)
 static void t8122_sleep_pre_commit(struct apple_sleep *s)
 {
 	t8122_dc_putc('c');
+	/* The hold: the commit word is not written, and the next thing is a reset from outside. */
+	if (READ_ONCE(sleep_untested_hold))
+		t8122_dc_puts(" HOLD before commit\n");
 }
 
 static void t8122_sleep_post_timer(struct apple_sleep *s)
