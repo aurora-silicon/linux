@@ -64,6 +64,7 @@ mod driver {
 }
 mod float;
 mod initdata;
+mod power;
 mod g17 {
     pub mod fw { pub(crate) use crate::initdata; }
     mod calibration;
@@ -170,6 +171,7 @@ def main():
         for source, target in [
             ("g17/fw/initdata.rs", "initdata.rs"),
             ("g17/fw/initdata/v25g83.rs", "initdata/v25g83.rs"),
+            ("g17/fw/power.rs", "power.rs"),
         ]:
             text = (DRIVER / source).read_text()
             (root / target).write_text(text.replace("use kernel::prelude::*;", "use crate::prelude::*;"))

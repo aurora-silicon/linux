@@ -1,0 +1,20 @@
+What:		/sys/devices/platform/.../gpu_power_ceiling
+Date:		November 2026
+Contact:		Asahi Linux contributors <asahi@lists.linux.dev>
+Description:
+		Read-only diagnostics for the admitted G16S/G17P absolute-power
+		actuator. One key/value pair per line:
+
+		requested_state: thermal cooling state, 0..100.
+		requested_ceiling_mw: minimum of all retained requester ceilings.
+		applied_ceiling_mw: last completed host shared-memory publication.
+		provisional_floor_mw: 25 percent of the initialized maximum,
+		rounded down, but never zero. Pending hardware qualification.
+		achieved_ceiling_mw: unsupported; not inferred from a nominal OPP.
+
+		Applied is a host publication, not firmware acknowledgement or
+		measured GPU power. The debugfs asahi-<device-name>-power/ceiling
+		file also reports separate RegionC/PPM readbacks, initialized max,
+		PPM enable and the thermal/fast-die/system/manual request slots.
+		State N requests max(25, 100 - N) percent of initialized power.
+		Critical shutdown never relies on the provisional floor.

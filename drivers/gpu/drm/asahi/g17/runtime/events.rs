@@ -554,6 +554,9 @@ impl crate::g17::Shared {
             firmware.drain_reports();
         }
         if recover {
+            if let Some(cooling) = firmware.cooling.as_ref() {
+                cooling.rearm();
+            }
             firmware.service_runtime_recovery(deferred)?;
             if !firmware.recovery.pending()
                 && !self.sleep_gate.load(core::sync::atomic::Ordering::Acquire)
