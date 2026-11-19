@@ -184,13 +184,16 @@
 /*
  * The SMC's first GPIO bank, the gP keys: the N1's power line is gP13.
  * gpio-macsmc drives it with the line's ADT template, pKW4("gP13",
- * 0x00800000): 0x00800000 | level, as m1n1 does.
+ * 0x00800000): 0x00800000 | level, as m1n1 does. No readback of the line
+ * is established, so it is write-only.
  */
 &smc {
 	smc_gpio: gpio {
 		compatible = "apple,smc-gpio";
 		#gpio-cells = <2>;
 		gpio-controller;
+		apple,output-templates = <0x13 0x00800000>;
+		apple,write-only-outputs = <0x13>;
 	};
 };
 
@@ -566,6 +569,17 @@
 		tp-accel {
 		};
 	};
+};
+
+/*
+ * About 230 ms after a lid close starts a suspend, this board's SMC has
+ * reported the lid open while it stays shut, in step with the trackpad
+ * moving its touch AFE to dependent mode, and MSLD can agree with that
+ * report: a lid-open report in the first 2000 ms of a sleep does not wake
+ * the system.
+ */
+&smc {
+	apple,lid-open-wake-holdoff-ms = <2000>;
 };
 
 #define T6050_J716S
