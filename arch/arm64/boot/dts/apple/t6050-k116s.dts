@@ -913,3 +913,8 @@
 &avd {
 	status = "okay";
 };
+
+/* This MacBook Pro offers macOS's High Power mode. */
+&clpc {
+	apple,high-power-mode;
+};

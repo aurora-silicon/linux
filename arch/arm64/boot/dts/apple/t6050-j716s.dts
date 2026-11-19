@@ -570,3 +570,8 @@
 
 #define T6050_J716S
 #include "t6050-peripherals.dtsi"
+
+/* This MacBook Pro offers macOS's High Power mode. */
+&clpc {
+	apple,high-power-mode;
+};
