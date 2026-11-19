@@ -551,7 +551,7 @@ static inline struct ave_ctx *ave_file_to_ctx(struct file *file)
 	return container_of(file_to_v4l2_fh(file), struct ave_ctx, fh);
 }
 
-extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112;
+extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112, ave_m3;
 
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
