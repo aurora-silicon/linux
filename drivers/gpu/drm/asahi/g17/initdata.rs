@@ -1701,16 +1701,19 @@ impl InitData {
         Ok(())
     }
 
-    /// Resolve typed fields from their retained objects before any store.
+    /// Resolve typed fields from their retained objects before any store. `None` when the built
+    /// graph has no power state.
     pub(super) fn cooling_words(
         &self,
         layout: &super::cooling::Layout,
-    ) -> Result<super::cooling::PowerWords> {
+    ) -> Result<Option<super::cooling::PowerWords>> {
         let super::cooling::Layout::Common = layout;
+        let Some((index, offset)) = self.power_state else {
+            return Ok(None);
+        };
         let region = self.object(self.region_c)?;
-        let (index, offset) = self.power_state.ok_or(EOPNOTSUPP)?;
         let power = self.object(index)?;
-        Ok(super::cooling::PowerWords {
+        Ok(Some(super::cooling::PowerWords {
             max_power_mw: region
                 .pointer(core::mem::offset_of!(abi::RegionC, max_power_mw), 4)?
                 .cast(),
@@ -1720,7 +1723,7 @@ impl InitData {
             ppm_target_mw: power
                 .pointer(offset + core::mem::offset_of!(abi::PowerState, ppm_target_mw), 4)?
                 .cast(),
-        })
+        }))
     }
 
     pub(super) fn effort(&self) -> Result<u32> {

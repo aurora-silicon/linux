@@ -58,9 +58,14 @@ Fast and outer protection
 Before submission opens, the G17 firmware die limiter is initialized with
 sensor mask ``0x82a``, target 95 C, release 80 C and its native 16 ms period.
 The existing gains are preserved. These temperatures are provisional Linux
-bring-up policy, not device safety ratings. The intentional missing-actuator
-J700 initialization refusal is removed for the admitted layout; invalid
-mappings, absent initialized power and unknown firmware still fail closed.
+bring-up policy, not device safety ratings.
+
+The cooling device is optional. A board with ``#cooling-cells`` whose selected
+firmware layout has no live power state (V25F84 and the packed M5-profile
+graphs, among them the M5 26A428 and the common 26B123 graph) starts the GPU
+without a cooling device and logs that once at probe; the firmware die limiter
+and the SMC zones below still apply. A malformed ``#cooling-cells``, invalid
+mappings and a zero initialized maximum still fail initialization.
 
 J700 has independent SMC thermal zones:
 

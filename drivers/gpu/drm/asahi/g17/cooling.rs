@@ -39,12 +39,25 @@ fn required(dev: &device::Device) -> Result<bool> {
     }
 }
 
-/// Check before starting either processor. A board requiring cooling must
-/// never silently fall back to unrestricted submission with a missing ABI.
-pub(super) fn admit(dev: &device::Device, variant: &Variant) -> Result {
-    if required(dev)? && variant.live_power.is_none() {
-        dev_err!(dev, "GPU live power layout not admitted\n");
-        return Err(EOPNOTSUPP);
+/// The live power layout of the selected firmware. [`Layout::Common`] names objects of the
+/// G17P and G16S 25G83 graphs; a packed (M5-profile) graph places RegionC and its power state
+/// elsewhere, so it has no common layout whatever its variant inherits.
+fn live_layout(variant: &Variant, packed_graph: bool) -> Option<Layout> {
+    match packed_graph {
+        true => None,
+        false => variant.live_power,
+    }
+}
+
+/// Check before starting either processor. The cooling device is optional: when the board asks
+/// for one but the firmware layout describes no live power state, say so once and start the
+/// GPU without it. The firmware die limiter and the board's other thermal zones still apply.
+pub(super) fn admit(dev: &device::Device, variant: &Variant, packed_graph: bool) -> Result {
+    if required(dev)? && live_layout(variant, packed_graph).is_none() {
+        dev_info!(
+            dev,
+            "GPU firmware layout has no live power state: no GPU cooling device\n"
+        );
     }
     Ok(())
 }
@@ -71,8 +84,17 @@ impl Cooling {
         if !required(dev)? {
             return Ok(None);
         }
-        let layout = variant.live_power.as_ref().ok_or(EOPNOTSUPP)?;
-        let words = init.cooling_words(layout)?;
+        // Only the unpacked graphs boot through here; admit() reported a missing layout.
+        let Some(layout) = variant.live_power else {
+            return Ok(None);
+        };
+        let Some(words) = init.cooling_words(&layout)? else {
+            dev_warn!(
+                dev,
+                "GPU initialization data has no power state: no GPU cooling device\n"
+            );
+            return Ok(None);
+        };
         // SAFETY: The owner keeps all validated shared words mapped until after
         // Drop drains the C callbacks. Registration publishes the provisional
         // 25% floor before INIT, port attachment or any work publication.

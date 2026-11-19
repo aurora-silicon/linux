@@ -1631,9 +1631,9 @@ impl Gpu {
         let active_cores: u32 = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
         let (variant, build_cfg) =
             Self::firmware_variant(dev, &cfg.firmware, (id.num_clusters, active_cores))?;
-        cooling::admit(dev.as_ref().as_ref(), variant)?;
         // A build with its own configuration of the SoC runs with that one.
         let cfg = build_cfg.unwrap_or(cfg);
+        cooling::admit(dev.as_ref().as_ref(), variant, cfg.profile.is_m5())?;
         if let Some(calibration) = calibration {
             calibration.check_cores(&id.core_masks)?;
             calibration.check_opps(&initdata::InitData::opps(dev, cfg.opps, id.num_clusters)?)?;
