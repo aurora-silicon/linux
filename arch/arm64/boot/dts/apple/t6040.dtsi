@@ -674,6 +674,26 @@
 };
 
 /*
+ * The scaler/CSC (ADT scaler0, MSR) and its DART. It has no board wiring,
+ * so it is enabled on every M4 Pro.
+ */
+&ps_msr0 {
+	status = "okay";
+};
+
+&ps_msr0_ase_core {
+	status = "okay";
+};
+
+&scaler0_dart {
+	status = "okay";
+};
+
+&scaler0 {
+	status = "okay";
+};
+
+/*
  * The ProRes encoder (ADT apr0) and its DART. It has no board wiring, so it
  * is enabled on every M4 Pro. The engine runs with SCODEC_STREAMING (and so
  * SCODEC) powered. The driver has built-in power-up rows for it; an optional
