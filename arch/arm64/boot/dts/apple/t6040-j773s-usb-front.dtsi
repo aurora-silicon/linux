@@ -2,11 +2,17 @@
 /*
  * The J773s's two front USB-C ports: an on-board USB2/USB3 hub behind ATC3,
  * whose controller (ADT usb-drd3) is a fixed host with no PD controller.
- * The hub's firmware is on its own flash (ADT spi3 usb3hub-flash).
+ * The hub's firmware is on its own flash (ADT spi3 usb3hub-flash): the same
+ * hub as on the M4 Mac mini (J773g), with the same firmware id, on raw USB2
+ * root port 1 and SuperSpeed root port 2 (ADT usb-drd3-port-hs/-ss).
  *
- * Disabled until the T6040 PHY driver has a fixed-host mode: it brings USB3
- * up only for a Type-C plug orientation. Enabling this also takes the ATC3
- * power domains. Tunables are this ADT's atc-phy3 and usb-drd3 tables
+ * The hub child tells dwc3-apple the controller is a host from probe on, and
+ * the graph link from the PHY's USB3 port to the controller's SuperSpeed port
+ * is how the PHY finds that fixed hub: it then runs USB3 on the lanes of a
+ * normal plug orientation, as the ADT gives for atc-phy3, with no orientation
+ * switch. The hub's reset and SPI-flash output-enable lines (ADT
+ * usb3hub_rst, usb3hub_flash_oe) are AP GPIOs; the boot loader leaves both
+ * high, as macOS does. Tunables are this ADT's atc-phy3 and usb-drd3 tables
  * (macOS 26.6.2); DRD_USB31_GBL_DEFAULT is followed by the GCTL.PWRDNSCALE
  * entry the other ports use.
  */
@@ -211,7 +217,18 @@
 			<0x44 0x00000004 0x00000004>;
 		apple,tunable-usb2-host =
 			<0x8 0x00007003 0x00000003>;
-		status = "disabled";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@1 {
+				reg = <1>;
+				atcphy3_usb3: endpoint {
+					remote-endpoint = <&dwc3_3_ss>;
+				};
+			};
+		};
 	};
 
 	atcphy3_mbox: mailbox@39b148000 {
@@ -226,7 +243,6 @@
 				  "recv-empty", "recv-not-empty";
 		#mbox-cells = <0>;
 		power-domains = <&ps_atc3_phymxwrap>;
-		status = "disabled";
 	};
 
 	dwc3_3_dart_0: iommu@39af00000 {
@@ -237,7 +253,6 @@
 		power-domains = <&ps_atc3_usb>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
-		status = "disabled";
 	};
 
 	dwc3_3_dart_1: iommu@39af80000 {
@@ -248,7 +263,6 @@
 		power-domains = <&ps_atc3_usb>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
-		status = "disabled";
 	};
 
 	dwc3_3: usb@39a280000 {
@@ -260,6 +274,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1715 IRQ_TYPE_LEVEL_HIGH>;
 		dr_mode = "host";
+		#address-cells = <1>;
+		#size-cells = <0>;
 		iommus = <&dwc3_3_dart_0 0>, <&dwc3_3_dart_1 1>;
 		power-domains = <&ps_atc3_usb>;
 		resets = <&atcphy3>;
@@ -288,6 +304,60 @@
 		apple,tunable-gbl-default =
 			<0x64 0x00000002 0x00000000>,
 			<0x10 0xfff80000 0x00680000>;
-		status = "disabled";
+
+		hub@1 {
+			compatible = "usb5ac,800b";
+			reg = <1>;
+		};
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* Raw xHCI port 1 is USB2; raw port 2 is SuperSpeed. */
+			port@2 {
+				reg = <2>;
+				dwc3_3_ss: endpoint {
+					remote-endpoint = <&atcphy3_usb3>;
+				};
+			};
+		};
 	};
+};
+
+&pinctrl {
+	usb3hub-flash-oe-hog {
+		gpio-hog;
+		gpios = <130 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-flash-oe";
+	};
+
+	usb3hub-reset-hog {
+		gpio-hog;
+		gpios = <127 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-reset";
+	};
+};
+
+/* The ATC3 domains, which t604x-pmgr.dtsi leaves disabled. */
+&ps_atc3_common {
+	status = "okay";
+};
+
+&ps_atc3_usb_aon {
+	status = "okay";
+};
+
+&ps_atc3_usb {
+	status = "okay";
+};
+
+&ps_atc3_phymxwrap {
+	status = "okay";
+};
+
+&ps_atc3_common_dp {
+	status = "okay";
 };
