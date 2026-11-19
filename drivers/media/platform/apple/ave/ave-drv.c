@@ -88,6 +88,32 @@ const struct ave_variant ave_t8112 = {
 };
 
 /*
+ * The M2 Max runs a larger build of the same 6070.11.1 firmware: TEXT
+ * 0xf0000 and DATA 0x134000 (J475c, macOS 13.5). Its two encoders share
+ * TEXT. Registers and boot parameters are T8112's; the device ID and type
+ * are its own. Neither encoder's extra0 window is 16 KiB aligned;
+ * extra0_size is the smaller of the two, ave1's.
+ */
+const struct ave_variant ave_t6021 = {
+	.regs = &ave_coproc_6070,
+	.fw_text_size = 0xf0000,
+	.fw_data_size = 0x134000,
+	.boot_device_id = 20,
+	.device_type = 17,
+	.lfs_ref_scale = 1,
+	.text_crc = AVE_FW_TEXT_CRC_T6021_6070,
+	.boot_arg_value = 0x10000,
+	.timebase_multiplier = 1,
+	.text_link_cell = 0x423c,
+	.mbox_idle = 0x38,
+	.restore_data_first = true,
+
+	.extra0_size = 0x3dfc,
+	.boot_qualified = true,
+	.config_shared = true,
+};
+
+/*
  * The M4 Pro (T6040 in the ADT, apple,t6041 in the DT) starts its encoder
  * like the A18 Pro: same coprocessor registers and boot sequence, its own
  * device ID and type. The M4 Max (J575c) runs its first encoder, ADT ave0
@@ -620,6 +646,7 @@ static const struct dev_pm_ops ave_pm_ops = {
 
 static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6000-ave", .data = &ave_t6000 },
+	{ .compatible = "apple,t6021-ave", .data = &ave_t6021 },
 	{ .compatible = "apple,t6041-ave", .data = &ave_t6041 },
 	{ .compatible = "apple,t6050-ave", .data = &ave_t6050 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },

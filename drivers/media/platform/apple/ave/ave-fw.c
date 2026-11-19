@@ -46,6 +46,7 @@ static const u32 ave_known_text_crc[] = {
 	AVE_FW_TEXT_CRC_T8142_26A428, /* AppleAVE2FW 9013.45.1, macOS 27.0 26A428 / T8142 */
 	0x460c7a7c, /* AppleAVE2FW 6070.11.1 / T6000 */
 	0x25bfd039, /* AppleAVE2FW 6070.11.1 / T8112 */
+	AVE_FW_TEXT_CRC_T6021_6070, /* AppleAVE2FW 6070.11.1 / T6021 H14C */
 };
 
 static int ave_fw_chosen_crc(struct ave_dev *ave, const char *name, u32 *crc)
@@ -533,6 +534,7 @@ static int ave_fw_map_extra0(struct ave_dev *ave)
 void ave_fw_remove(struct ave_dev *ave)
 {
 	ave_fw_release_boot(ave);
+	ave_free(ave, &ave->config_shared);
 	vfree(ave->data_pristine);
 	ave->data_pristine = NULL;
 }
@@ -768,6 +770,9 @@ static int ave_fw_boot(struct ave_dev *ave)
 		ret = ave_alloc(ave, &ave->log, AVE_LOG_BYTES, 0);
 	if (!ret)
 		ret = ave_fw_map_extra0(ave);
+	/* Config's shared area is allocated once and kept until remove. */
+	if (!ret && ave->variant->config_shared)
+		ret = ave_alloc(ave, &ave->config_shared, SZ_64K, 0);
 	if (ret)
 		return ret;
 

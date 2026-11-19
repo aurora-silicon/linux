@@ -376,6 +376,17 @@ static void ave_6070_images(struct kunit *test)
 	expected[0x41] = 1;
 	put_unaligned_le64(ave->extra0_dma, expected + 0x48);
 	KUNIT_EXPECT_MEMEQ(test, actual, expected, sizeof(actual));
+	/* T6021: the shared area goes at +0x60/+0x68, byte 0x40 stays clear. */
+	ave->config_shared.cpu = ave;
+	ave->config_shared.dma = 0x100000000ULL;
+	ave->config_shared.size = SZ_64K;
+	memset(actual, 0, sizeof(actual));
+	abi->write_config(ave, actual);
+	ave_stamp_command(abi, actual, 3000000, 0x123456);
+	put_unaligned_le64(0x100000000ULL, expected + 0x60);
+	put_unaligned_le32(SZ_64K, expected + 0x68);
+	KUNIT_EXPECT_MEMEQ(test, actual, expected, sizeof(actual));
+	ave->config_shared.cpu = NULL;
 	for (unsigned int codec = AVE_CODEC_H264; codec <= AVE_CODEC_HEVC;
 	     codec++) {
 		static const enum ave_opcode ops[] = { AVE_OP_OPEN,
@@ -1186,6 +1197,8 @@ static void ave_6070_gate(struct kunit *test)
 			    &ave_layout_6070_11_1);
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(0x25bfd039),
 			    &ave_layout_6070_11_1);
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T6021_6070),
+			    &ave_layout_6070_11_1);
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(0), NULL);
 	/* H.264 low delay is qualified; a short command buffer is still refused. */
 	KUNIT_EXPECT_TRUE(test, ave_layout_6070_11_1.encode_ready);
@@ -1412,6 +1425,18 @@ static void ave_6070_variants(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_t8112.timebase_multiplier, 1U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.text_crc, 0x25bfd039U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.mbox_idle, 0x38U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.fw_text_size, 0xf0000U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.fw_data_size, 0x134000U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.text_crc, AVE_FW_TEXT_CRC_T6021_6070);
+	KUNIT_EXPECT_EQ(test, ave_t6021.boot_device_id, 20U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.device_type, 17U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.text_link_cell, 0x423cU);
+	KUNIT_EXPECT_EQ(test, ave_t6021.extra0_size, 0x3dfcU);
+	KUNIT_EXPECT_EQ(test, ave_t6021.boot_arg_value, 0x10000U);
+	/* Only T6021 gives Config a shared area. */
+	KUNIT_EXPECT_TRUE(test, ave_t6021.config_shared);
+	KUNIT_EXPECT_FALSE(test, ave_t6000.config_shared);
+	KUNIT_EXPECT_FALSE(test, ave_t8112.config_shared);
 	KUNIT_EXPECT_EQ(test, ave_t6000.regs->ctrl, 0x400044U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.regs->timebase, 0x178000U);
 	KUNIT_EXPECT_GE(test, t->command_bytes, 0x32dc8U);

@@ -957,7 +957,12 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 	if (crc == AVE_FW_TEXT_CRC_9003_78_0 || crc == AVE_FW_TEXT_CRC_T6040_25G83 ||
 	    crc == AVE_FW_TEXT_CRC_T6041_25G83)
 		return &ave_layout_9003_78_0;
-	if (crc == 0x460c7a7c || crc == 0x25bfd039)
+	/*
+	 * T6000 (H13S), T8112 (H14G) and T6021 (H14C) are one 6070.11.1
+	 * command layout. H14C is a larger link of the same version.
+	 */
+	if (crc == 0x460c7a7c || crc == 0x25bfd039 ||
+	    crc == AVE_FW_TEXT_CRC_T6021_6070)
 		return &ave_layout_6070_11_1;
 	/*
 	 * The macOS 27.0 build for the M5 Pro and Max, and the M5's build of the

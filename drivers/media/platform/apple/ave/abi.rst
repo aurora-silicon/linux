@@ -15,8 +15,10 @@ at 1920x1080 with B-frames enabled/disabled, and 3840x2160 with B-frames enabled
 They compare both deterministic synthetic DART addresses and masked images.
 The constant image tables in ave-image.c are unchanged by this refactor.
 
-6070.11.1 is selected only for T6000 TEXT CRC 460c7a7c or T8112 TEXT CRC 25bfd039,
-with the corresponding SoC identity. Boot, seven-channel discovery, Config,
+6070.11.1 is selected for T6000 TEXT CRC 460c7a7c, T8112 TEXT CRC 25bfd039 or
+T6021 TEXT CRC 0d56db87, with the corresponding SoC identity. T6021 runs a
+larger build of the same version (TEXT 0xf0000, DATA 0x134000) with T8112's
+registers and boot arguments. Boot, seven-channel discovery, Config,
 Open, Close and scratch-confirmed Halt are implemented from the clean derived
 SPEC-6070-lifecycle.md ledger. Start and ordinary Process writers implement the
 clean revision-2/P1 field ledgers: fixed-capacity address banks, split output
@@ -26,14 +28,21 @@ session allocator provides distinct backing for every live bank and rejects
 non-16-KiB-aligned IOVAs.
 
 Streaming is enabled for one quality-first NV12 constant-quality session of
-8-bit H.264 (Baseline, Main or High) with low delay: I and P pictures, two
-reconstruction slots that alternate, frame widths in whole macroblocks. B
-pictures, HEVC, Main 10, bit-rate modes, speed priority, standalone LRME and
-Reset remain unavailable; a session asking for B pictures is encoded without
-them, the others are refused. No Priority command is sent. Complete is the
-normal drain barrier; Flush is reserved for cancellation before Stop and Close.
-KUnit checks the 1080p and 4K fields directly from the clean ledgers and embeds
-no Apple command image.
+8-bit H.264 (Baseline, Main or High) or HEVC Main, with up to one B picture per
+P picture, frame widths in whole macroblocks. Main 10, bit-rate modes, speed
+priority, standalone LRME and Reset remain unavailable and are refused. No
+Priority command is sent. Complete is the normal drain barrier; Flush is
+reserved for cancellation before Stop and Close. KUnit checks the 1080p and 4K
+fields directly from the clean ledgers and embeds no Apple command image.
+
+T6021 differs in these points, each checked on a J475c; they are not from the
+ledgers above. Config carries a shared area, its address at +0x60 and its size
+at +0x68: with both left zero, as on T8112, the firmware never answers Config,
+and with a 64 KiB, 16 KiB-aligned area both encoders answer Config, Open and
+Start and encode. With boot device ID 20 and device type 17 both encoders boot
+and answer the handshake. The TEXT word at 0x423c holds the low 32 bits of
+DATA's device address on both encoders, and TEXT with that word cleared has
+CRC 0d56db87.
 
 Lifecycle-only validation
 -------------------------
@@ -47,11 +56,12 @@ that was never initialized. A second write exercises a cold restart and DATA
 restore. An existing session makes the operation return EBUSY.
 
 The platform must supply the extra-0 register resource as ``extra0`` or register
-resource index 3, with at least 0x24 bytes on T6000 or 0x4000 bytes on T8112.
-The driver uses the translated platform resource address, maps the 16 KiB pages
-that contain it through the device DMA API and puts that dynamically allocated
-IOVA in Config. The base need not be page aligned: Config then gets the IOVA of
-the base, not of its page. Platform DT/binding changes are separate from this driver change.
+resource index 3, with at least 0x24 bytes on T6000, 0x4000 bytes on T8112 or
+0x3dfc bytes on T6021. The driver uses the translated platform resource address,
+maps the 16 KiB pages that contain it through the device DMA API and puts that
+dynamically allocated IOVA in Config. The base need not be page aligned: Config
+then gets the IOVA of the base, not of its page. Platform DT/binding changes are
+separate from this driver change.
 No fixed firmware or register IOVA is used as an ordinary DMA allocation.
 
 Before every boot the driver checks the firmware's IOMMU translations. DATA must
