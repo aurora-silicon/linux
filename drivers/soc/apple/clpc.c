@@ -86,7 +86,8 @@ enum apple_clpc_rail {
  * @sustain: consecutive busy samples before a cluster requests a state;
  *	0 or 1 for the first
  * @map: state of each rail for a busy cluster below 25, 50, 75 and 100
- *	percent of its maximum frequency
+ *	percent of its maximum frequency; the node's apple,cpu-memory-states
+ *	where it has them (apple_clpc_dt_hw())
  * @gpu_demand: streaming GPU work requests @gpu
  * @gpu: state of each rail for streaming GPU work
  * @gpu_sustain_ms: time graphics stays powered without a break before it
@@ -115,7 +116,8 @@ enum apple_clpc_rail {
  *	holds the CPU clusters to; 0 for none
  * @gpu_busy: state of each rail for reported GPU work below @gpu_busy_mid,
  *	@gpu_busy_high and @gpu_busy_top and at or above it; all zero to always
- *	use the top of @map
+ *	use the top of @map. From apple,gpu-busy-memory-states and
+ *	apple,gpu-busy-permille where the node has them
  * @gpu_busy_mid: GPU busy share in permille (apple_clpc_gpu_set_busy())
  *	from which reported GPU work gets the second column of @gpu_busy
  * @gpu_busy_high: busy share from which it gets the third column
@@ -124,7 +126,8 @@ enum apple_clpc_rail {
  *	whatever clock the GPU runs, not bandwidth: a 120 fps game reads
  *	about a third, a scrolling browser a few percent.
  * @level_khz: frequency @map's quarters are taken from, so that clusters of
- *	different speed share them; 0 for each cluster's own maximum
+ *	different speed share them; 0 for each cluster's own maximum. From
+ *	apple,cpu-level-mhz where the node has it
  * @high_power_machine: the machine compatible on which the performance
  *	profile tells the SMC that macOS's High Power mode is on (the zETM
  *	record below); NULL for none
@@ -1444,7 +1447,95 @@ static const struct platform_profile_ops apple_clpc_profile_ops = {
 	.profile_set = apple_clpc_profile_set,
 };
 
-static const struct apple_clpc_hw *apple_clpc_machine_hw(const struct apple_clpc_hw *hw);
+/* Fills @map from a DT matrix: APPLE_CLPC_RAILS rows of APPLE_CLPC_LEVELS states. */
+static int apple_clpc_dt_map(u8 map[APPLE_CLPC_RAILS][APPLE_CLPC_LEVELS],
+			     const u32 *cells, int n)
+{
+	unsigned int rail, level;
+
+	if (n != APPLE_CLPC_RAILS * APPLE_CLPC_LEVELS)
+		return -EINVAL;
+	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++) {
+		for (level = 0; level < APPLE_CLPC_LEVELS; level++) {
+			u32 state = cells[rail * APPLE_CLPC_LEVELS + level];
+
+			if (state > U8_MAX)
+				return -EINVAL;
+			map[rail][level] = state;
+		}
+	}
+	return 0;
+}
+
+/* The busy shares from which reported GPU work gets the 2nd, 3rd and top column. */
+static int apple_clpc_dt_busy(struct apple_clpc_hw *hw, const u32 *cells, int n)
+{
+	if (n != 3 || cells[0] > cells[1] || cells[1] > cells[2] || cells[2] > 1000)
+		return -EINVAL;
+	hw->gpu_busy_mid = cells[0];
+	hw->gpu_busy_high = cells[1];
+	hw->gpu_busy_top = cells[2];
+	return 0;
+}
+
+/* Reads up to @max cells of @name; returns how many, or an error. */
+static int apple_clpc_dt_cells(struct device_node *np, const char *name,
+			       u32 *cells, int max)
+{
+	int n = of_property_count_u32_elems(np, name);
+
+	if (n < 0)
+		return n;
+	if (n > max)
+		return -EOVERFLOW;
+	return of_property_read_u32_array(np, name, cells, n) ?: n;
+}
+
+/*
+ * The compatible's table, with the memory states the node gives in place of
+ * its own (apple,pmc.yaml). The states are measured on a SoC's memory, so
+ * the DT says which a board has: the M4 Max's come from t6041.dtsi, and the
+ * M4 Pro, which shares its compatible, keeps the table's.
+ */
+static const struct apple_clpc_hw *apple_clpc_dt_hw(struct device *dev,
+						    const struct apple_clpc_hw *soc)
+{
+	u32 cells[APPLE_CLPC_RAILS * APPLE_CLPC_LEVELS];
+	struct device_node *np = dev->of_node;
+	struct apple_clpc_hw *hw;
+	bool cpu, gpu;
+	u32 mhz;
+	int n;
+
+	cpu = of_property_present(np, "apple,cpu-memory-states");
+	gpu = of_property_present(np, "apple,gpu-busy-memory-states") ||
+	      of_property_present(np, "apple,gpu-busy-permille");
+	if (!cpu && !gpu && !of_property_present(np, "apple,cpu-level-mhz"))
+		return soc;
+	hw = devm_kmemdup(dev, soc, sizeof(*soc), GFP_KERNEL);
+	if (!hw)
+		return ERR_PTR(-ENOMEM);
+	if (cpu) {
+		n = apple_clpc_dt_cells(np, "apple,cpu-memory-states", cells, ARRAY_SIZE(cells));
+		n = n < 0 ? n : apple_clpc_dt_map(hw->map, cells, n);
+		if (n)
+			return ERR_PTR(n);
+	}
+	if (gpu) {
+		n = apple_clpc_dt_cells(np, "apple,gpu-busy-memory-states", cells,
+					ARRAY_SIZE(cells));
+		n = n < 0 ? n : apple_clpc_dt_map(hw->gpu_busy, cells, n);
+		if (n)
+			return ERR_PTR(n);
+		n = apple_clpc_dt_cells(np, "apple,gpu-busy-permille", cells, ARRAY_SIZE(cells));
+		n = n < 0 ? n : apple_clpc_dt_busy(hw, cells, n);
+		if (n)
+			return ERR_PTR(n);
+	}
+	if (!of_property_read_u32(np, "apple,cpu-level-mhz", &mhz))
+		hw->level_khz = mhz * 1000;
+	return hw;
+}
 
 static int apple_clpc_probe(struct platform_device *pdev)
 {
@@ -1460,7 +1551,10 @@ static int apple_clpc_probe(struct platform_device *pdev)
 
 	clpc->dev = dev;
 	clpc->pmc = dev->parent;
-	clpc->hw = apple_clpc_machine_hw(of_device_get_match_data(dev));
+	clpc->hw = apple_clpc_dt_hw(dev, of_device_get_match_data(dev));
+	if (IS_ERR(clpc->hw))
+		return dev_err_probe(dev, PTR_ERR(clpc->hw),
+				     "invalid memory states in the device tree\n");
 	/* T6040 firmware keeps GFX powered for its whole lifetime. A separate
 	 * host publication/idle input, not that supplier state, drives demand;
 	 * the T8132 and M5 (T8142) GPU drivers report through the same input.
@@ -1757,58 +1851,6 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.low_power_khz = 2808000,
 	.low_power_machine = "apple,t6041",
 };
-
-/*
- * T6041 (M4 Max): the M4 Pro's DCS and fabric states, with the floor scaled
- * to what the work needs. The M4 Pro shares the CLPC compatible and keeps
- * apple_clpc_hw_t6040; apple_clpc_probe() picks this table on an
- * "apple,t6041" machine.
- *
- * A busy CPU cluster asks for DCS 1, 1, 3 or 4 and fabric 0. Both clusters
- * take their quarters from 4512 MHz, so the E cluster at its top speed
- * (57 %) gets the third column, not the fourth. Measured on a J616c with a
- * 3 GB/s copy: DCS 0 / fabric 0 5.46 W at 309 ns DRAM latency, DCS 3 6.22 W
- * at 166 ns, DCS 4 6.92 W at 114 ns, DCS 5 7.04 W at 113 ns; fabric 1 and 2
- * add 0.3 and 1.4 W with less gain than a DCS step.
- *
- * GPU work takes its states from gpu_busy by the busy share the GPU driver
- * reports, DCS 5 / fabric 2 at the top or with no share reported, until
- * publication/in-flight demand ends and HOLD_MS expires. Scrolling a
- * browser went from 24.9 to 22.1 W on AC with this and the G17 light
- * effort, against the T6040 table.
- *
- * The ANE keeps the T6040 rails. Its cluster floor was measured on the
- * M4 Pro only and is left out here.
- */
-static const struct apple_clpc_hw apple_clpc_hw_t6041 = {
-	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
-	.map = {
-		[APPLE_CLPC_DCS] = { 1, 1, 3, 4 },
-		[APPLE_CLPC_SOC] = { 0, 0, 0, 0 },
-	},
-	.sustain = 3,
-	.gpu_demand = false,
-	.gpu_input = true,
-	.gpu_busy = {
-		[APPLE_CLPC_DCS] = { 1, 2, 4, 5 },
-		[APPLE_CLPC_SOC] = { 0, 0, 0, 2 },
-	},
-	.gpu_busy_mid = 160,
-	.gpu_busy_high = 500,
-	.gpu_busy_top = 800,
-	.level_khz = 4512000,
-	.ane = { [APPLE_CLPC_DCS] = 5, [APPLE_CLPC_SOC] = 2 },
-	.low_power_khz = 2808000,
-	.low_power_machine = "apple,t6041",
-};
-
-/* The M4 Max shares the M4 Pro's compatible but has its own table. */
-static const struct apple_clpc_hw *apple_clpc_machine_hw(const struct apple_clpc_hw *hw)
-{
-	if (hw == &apple_clpc_hw_t6040 && of_machine_is_compatible("apple,t6041"))
-		return &apple_clpc_hw_t6041;
-	return hw;
-}
 
 /*
  * T8142: DCS states 0-7 on rail 0, fabric states 0-4 on rail 1. The fabric
