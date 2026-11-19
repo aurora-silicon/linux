@@ -10308,10 +10308,12 @@ static int dcp_t6041_s2r_step(enum dcp_t6041_step step)
 		dcp_t6041_words = true;
 		dcp_t6041_ext_darts_dark();
 		/* Never started, but the complex counts them. */
-		dcp_t6041_word_try("ext3", 0x740, 0x5028002e8UL, 0x5028002e0UL, 0x5028002d8UL,
-				   0x50282dfb4UL, 0x50282dfd8UL);
-		dcp_t6041_word_try("ext2", 0xd80, 0x5028004f0UL, 0x5028004e8UL, 0x5028004e0UL,
-				   0x50282db34UL, 0x50282db58UL);
+		if (!of_machine_is_compatible("apple,t6040")) {
+			dcp_t6041_word_try("ext3", 0x740, 0x5028002e8UL, 0x5028002e0UL,
+					   0x5028002d8UL, 0x50282dfb4UL, 0x50282dfd8UL);
+			dcp_t6041_word_try("ext2", 0xd80, 0x5028004f0UL, 0x5028004e8UL,
+					   0x5028004e0UL, 0x50282db34UL, 0x50282db58UL);
+		}
 		dcp_t6041_word_try("ext1", 0xd00, 0x5028004a0UL, 0x502800498UL, 0x502800490UL,
 				   0x50282d6b4UL, 0x50282d6d8UL);
 		dcp_t6041_word_try("ext0", 0x840, 0x502800350UL, 0x502800348UL, 0x502800340UL,
@@ -10334,7 +10336,8 @@ static int dcp_t6041_s2r_step(enum dcp_t6041_step step)
 /* T6041: the display down for a real sleep and back after it. */
 void dcp_t6041_s2r_all(bool start)
 {
-	if (!of_machine_is_compatible("apple,t6041"))
+	if (!of_machine_is_compatible("apple,t6041") &&
+	    !of_machine_is_compatible("apple,t6040"))
 		return;
 	if (start) {
 		dcp_t6041_s2r_step(DCP_S2R_START);
