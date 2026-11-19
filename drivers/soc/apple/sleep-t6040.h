@@ -76,19 +76,13 @@
 #define SOC_EAST_TIMEOUT_US	5000
 
 /*
- * The clock quiesce, whole and nothing else: two SOC-East words lose BIT28 and are
- * polled until [7:4] reads their [3:0]; then the four clk-mux park words of ClkGen SOC (ADT
- * pmgr reg[3] = 0x500000000, +0x38050/054/060/064), in t6040_clkgen_mux[] order, get [27:24]
- * := 0 with BIT31 set, each polled until BIT30 clears. The wake writes the saved clk-mux
- * words back; there is nothing else to restore. Not measured on the J616s.
+ * The clock quiesce: two SOC-East words lose BIT28 and are polled until [7:4] reads their
+ * [3:0]. The clock mux words of ClkGen SOC are left alone: the PMGR drops AP writes to them
+ * and reports each through the event-log handler, and the wake finds them as they were.
  */
 #define SOC_EAST_CLK_A		0x120
 #define SOC_EAST_CLK_B		0x130
 #define SOC_EAST_CLK_AUTO	BIT(28)
-#define CLKGEN_MUX_SET		0x80000000
-#define CLKGEN_MUX_MASK		0xf0ffffff
-#define CLKGEN_MUX_WORDS	4
-#define CLKGEN_MUX_PENDING	BIT(30)
 #define CLK_QUIESCE_TIMEOUT_US	1000
 
 /*
@@ -313,7 +307,6 @@ struct t6040_sleep {
 	void __iomem *gp_pins;
 	int gp_perst[2];
 	bool gp_perst_low[2];
-	void __iomem *clkgen;
 	void __iomem *spmi0;
 	void __iomem *spmi_a0;
 	void __iomem *mastermini;
@@ -336,8 +329,6 @@ struct t6040_sleep {
 	u64 siq_cfg;
 	u64 cntkctl;
 	/* Saved across the commit, restored on wake. */
-	u32 clkgen_mux_saved[CLKGEN_MUX_WORDS];
-	bool clkgen_saved;
 	void __iomem *ka_soc;
 	void __iomem *ka_east;
 	u64 ka_on_before;		/* keep-alive bits set before the commit cleared them */
@@ -610,14 +601,6 @@ static void t6040_sio_ps_restore(struct t6040_sleep *s)
 }
 
 /*
- * The 4 clk-mux park words (ClkGen SOC + these offsets), from
- * the clock quiesce; the offsets skip 0x58/0x5c.
- */
-static const u32 t6040_clkgen_mux[CLKGEN_MUX_WORDS] = {
-	0x38060, 0x38064, 0x38054, 0x38050,
-};
-
-/*
  * The 9 AOP-global wake-source masks armed before an S2R
  * (the values are decoded from the ADT's ap-wake-sources).
  * valid & ~enabled per word.
@@ -711,36 +694,11 @@ static void t6040_east_clk_quiesce(struct t6040_sleep *s, u32 off)
 				  CLK_QUIESCE_TIMEOUT_US);
 }
 
-/* The clock quiesce, saving the clk-mux words for wake. */
-static void t6040_clkgen_park(struct t6040_sleep *s)
+/* The clock quiesce; it needs nothing back at the wake. */
+static void t6040_clk_quiesce(struct t6040_sleep *s)
 {
-	u32 cur;
-	int i;
-
 	t6040_east_clk_quiesce(s, SOC_EAST_CLK_A);
 	t6040_east_clk_quiesce(s, SOC_EAST_CLK_B);
-	for (i = 0; i < CLKGEN_MUX_WORDS; i++) {
-		void __iomem *reg = s->clkgen + t6040_clkgen_mux[i];
-		u32 val = readl(reg);
-
-		s->clkgen_mux_saved[i] = val;
-		writel((val & CLKGEN_MUX_MASK) | CLKGEN_MUX_SET, reg);
-		readl_poll_timeout_atomic(reg, cur, !(cur & CLKGEN_MUX_PENDING), 1,
-					  CLK_QUIESCE_TIMEOUT_US);
-	}
-	s->clkgen_saved = true;
-}
-
-/* The mirror on wake: the saved clk-mux words back, last parked first. */
-static void t6040_clkgen_restore(struct t6040_sleep *s)
-{
-	int i;
-
-	if (!s->clkgen_saved)
-		return;
-	for (i = CLKGEN_MUX_WORDS - 1; i >= 0; i--)
-		writel(s->clkgen_mux_saved[i], s->clkgen + t6040_clkgen_mux[i]);
-	s->clkgen_saved = false;
 }
 
 /*
@@ -2076,14 +2034,13 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 	s->wdt = t6040_sleep_map(dev, "wdt");
 	s->cluster_ctl = t6040_sleep_map(dev, "cluster");
 	s->pwrgate = t6040_sleep_map(dev, "pwrgate");
-	s->clkgen = t6040_sleep_map(dev, "clkgen");
 	s->spmi0 = t6040_sleep_map(dev, "spmi");
 	s->spmi_a0 = t6040_sleep_map(dev, "spmi-a0");
 	s->mastermini = t6040_sleep_map(dev, "mastermini");
 	s->soc_east = t6040_sleep_map_min(dev, "soc-east", SOC_EAST_SIZE);
 	s->soc_ps = t6040_sleep_map_min(dev, "soc-ps", SOC_PS_SIZE);
 	s->aop_global = t6040_sleep_map(dev, "wake");
-	if (!s->cpu_start || !s->wdt || !s->cluster_ctl || !s->pwrgate || !s->clkgen ||
+	if (!s->cpu_start || !s->wdt || !s->cluster_ctl || !s->pwrgate ||
 	    !s->spmi0 || !s->spmi_a0 || !s->mastermini || !s->soc_east || !s->soc_ps ||
 	    !s->aop_global)
 		return dev_err_probe(dev, -ENODEV, "a register block is missing or not mapped\n");
@@ -2280,7 +2237,7 @@ static void t6040_sleep_commit_regs(struct apple_sleep *c)
 	t6040_agx_gate(s);
 	t6040_clusters_off(s);
 	t6040_axi2af_readcheck(s);
-	t6040_clkgen_park(s);
+	t6040_clk_quiesce(s);
 	s->ka_on_before = t6040_keep_alive(s, false, 0);
 }
 
@@ -2350,10 +2307,6 @@ static void t6040_sleep_wake(struct apple_sleep *c)
 	writel(readl(s->pwrgate + PWRGATE_CPM_0) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_0);
 	writel(readl(s->pwrgate + PWRGATE_CPM_1) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_1);
 	writel(readl(s->pwrgate + PWRGATE_CPM_2) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_2);
-	t6040_wake_sync();
-
-	/* Undo the entry clk-mux park. */
-	t6040_clkgen_restore(s);
 	t6040_wake_sync();
 
 	/* Software ack of the armed S2R request (the S2R timer has no stop). */
