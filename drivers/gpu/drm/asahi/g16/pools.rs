@@ -453,6 +453,10 @@ impl PbEpoch {
     pub(crate) fn expose(&self) {
         self.exposed.store(true, Ordering::Release);
     }
+    /// Never handed to the firmware: its storage may serve another render of its VM.
+    pub(crate) fn unexposed(&self) -> bool {
+        !self.exposed.load(Ordering::Acquire)
+    }
 }
 
 impl Firmware {
