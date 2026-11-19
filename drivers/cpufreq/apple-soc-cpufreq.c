@@ -294,6 +294,10 @@ static unsigned int m2c_clusters = 3;
 module_param(m2c_clusters, uint, 0400);
 static unsigned int m2c_kind;
 module_param(m2c_kind, uint, 0400);
+/* m2c_trace=1: log + pause before every APSC-path MMIO access (probe reads, transition steps). */
+static unsigned int m2c_trace;
+module_param(m2c_trace, uint, 0400);
+#define M2C_STEP(fmt, ...) do { if (m2c_trace) { pr_info("M2CLOCK2 step: " fmt "\n", ##__VA_ARGS__); mdelay(300); } } while (0)
 
 static const struct apple_soc_cpufreq_info soc_s5l8960x_info = {
 	.has_ps2 = false,
@@ -594,13 +598,20 @@ static int apple_soc_cpufreq_set_pstate(struct apple_cpu_priv *priv,
 			return 0;
 	}
 
+	if (priv->info->apsc_state_stride)
+		M2C_STEP("transition: command write pstate %u (cmd ps1 %llu)", pstate,
+			 (unsigned long long)FIELD_GET(APPLE_DVFS_CMD_PS1, reg));
 	apple_soc_cpufreq_write(priv, reg, pstate);
+	if (priv->info->apsc_state_stride)
+		M2C_STEP("transition: command written; APSC sync kind %u next", m2c_kind);
 	if (apple_soc_cpufreq_sync_apsc(priv, pstate)) {
 		dev_err(priv->cpu_dev,
 			"APSC state descriptor read-back failed for P-state %u\n",
 			pstate);
 		return -EIO;
 	}
+	if (priv->info->apsc_state_stride)
+		M2C_STEP("transition: APSC sync returned; busy poll next");
 	if (experimental_apsc_sync && priv->info->apsc_state_stride &&
 	    readq_poll_timeout_atomic(priv->reg_base + APPLE_DVFS_CMD, reg,
 				      !(reg & APPLE_DVFS_CMD_BUSY), 2,
@@ -624,6 +635,8 @@ static int apple_soc_cpufreq_set_pstate(struct apple_cpu_priv *priv,
 	}
 	if (priv->info->verify_transition)
 		priv->expected_pstate = pstate;
+	if (priv->info->apsc_state_stride)
+		M2C_STEP("transition: pstate %u done", pstate);
 
 	return 0;
 }
@@ -1084,6 +1097,29 @@ static int apple_soc_cpufreq_find_cluster(struct cpufreq_policy *policy,
 			msleep(1000);
 			*reg_base = ioremap(res.start, max_t(resource_size_t,
 							     resource_size(&res), 0x60000));
+			if (*reg_base && m2c_trace) {
+				const struct apple_soc_cpufreq_info *ti = *info;
+				unsigned int n;
+				u64 v;
+
+				M2C_STEP("probe read command +0x%x", APPLE_DVFS_CMD);
+				v = readq_relaxed(*reg_base + APPLE_DVFS_CMD);
+				M2C_STEP("probe read status +0x%x", APPLE_DVFS_STATUS);
+				v = readq_relaxed(*reg_base + APPLE_DVFS_STATUS);
+				M2C_STEP("probe read pair lo +0x%x", ti->apsc_state_shadow_lo);
+				v = readq_relaxed(*reg_base + ti->apsc_state_shadow_lo);
+				M2C_STEP("probe read pair hi +0x%x", ti->apsc_state_shadow_hi);
+				v = readq_relaxed(*reg_base + ti->apsc_state_shadow_hi);
+				for (n = 1; n <= 17; n++) {
+					u32 r = apple_soc_cpufreq_apsc_row(ti->apsc_state_table,
+									   ti->apsc_state_stride, n);
+					M2C_STEP("probe read row %u +0x%x", n, r);
+					v = readq_relaxed(*reg_base + r);
+					v = readq_relaxed(*reg_base + r + 8);
+				}
+				M2C_STEP("probe reads done");
+				(void)v;
+			}
 		}
 	} else {
 		*reg_base = of_iomap(args.np, 0);
