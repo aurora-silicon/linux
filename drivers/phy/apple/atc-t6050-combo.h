@@ -48,6 +48,32 @@ static int combo_firmware(void *ctx, unsigned int active)
 {
 	return atc_firmware(ctx, active);
 }
+
+/*
+ * USB2PHY_SIG, bank 0 + 0x8. The USB2 PHY is the block of the older ATC PHYs (atc.c): the host and
+ * stop sequences use its USBCTL, CTL and MISCTUNE registers bit for bit, and the ADT's atc-phy
+ * tunable-host and tunable-device are the same two tuples as on T8103, T6040 and T6041: SIG
+ * bits 14:12 set for host, clear for device. A device session also forces VBUS detect and
+ * VBUS valid, as atc.c does on every generation: VBUS is the port controller's, not the PHY's.
+ * The role applies at every USB2 start (the host sequence's HOST tunable step) and in place on a
+ * running PHY (combo_usb2_mode()).
+ */
+#define COMBO_USB2_SIG			0x8
+#define COMBO_USB2_SIG_VBUS_FORCE	GENMASK(3, 0)
+#define COMBO_USB2_SIG_HOST		GENMASK(14, 12)
+
+static void combo_usb2_signature(struct t6050_dp *dp)
+{
+	void __iomem *sig = dp->banks[0] + COMBO_USB2_SIG;
+	u32 val = readl(sig);
+
+	if (dp->usb2_device)
+		val = (val & ~COMBO_USB2_SIG_HOST) | COMBO_USB2_SIG_VBUS_FORCE;
+	else
+		val |= COMBO_USB2_SIG_HOST;
+	writel(val, sig);
+}
+
 static int combo_tunable(void *ctx, unsigned int bank, const char *name)
 {
 	static const struct { u8 bank, index; const char *name; } common[] = {
@@ -71,6 +97,8 @@ static int combo_tunable(void *ctx, unsigned int bank, const char *name)
 	}
 	if (bank == 0 && !strcmp(name, "tunable_USB2PHY_HOST")) {
 		apple_tunable_apply(dp->banks[0], dp->usb2_host);
+		if (dp->usb2_device)
+			combo_usb2_signature(dp);
 		return 0;
 	}
 	for (unsigned int i = 0; i < ARRAY_SIZE(common); i++)
@@ -442,13 +470,34 @@ static int combo_usb2_start(struct t6050_dp *dp)
 static int combo_usb2_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct t6050_dp *dp = phy_get_drvdata(phy);
+	bool device = mode == PHY_MODE_USB_DEVICE;
 
 	guard(mutex)(&dp->lock);
 	if (dp->faulted)
 		return -EIO;
-	if (mode != PHY_MODE_USB_HOST)
+	if (mode != PHY_MODE_USB_HOST && !device)
 		return -EOPNOTSUPP;
+	/*
+	 * The port's mode started USB2 before the controller chose its role (dwc3-apple selects
+	 * device mode before the core reset, xHCI host mode as its root hub starts): switch the
+	 * running PHY in place, as atc.c does. Back to host, the host tunable comes first again.
+	 */
+	if (device != dp->usb2_device) {
+		dp->usb2_device = device;
+		if (dp->usb2_active) {
+			if (!device)
+				apple_tunable_apply(dp->banks[0], dp->usb2_host);
+			combo_usb2_signature(dp);
+		}
+	}
 	return combo_usb2_start(dp);
+}
+
+/* Both roles: combo_usb2_mode() sets or clears the host signature. */
+static int combo_usb2_validate(struct phy *phy, enum phy_mode mode, int submode,
+			       union phy_configure_opts *opts)
+{
+	return mode == PHY_MODE_USB_HOST || mode == PHY_MODE_USB_DEVICE ? 0 : -EOPNOTSUPP;
 }
 
 static int combo_usb2_reset(struct phy *phy)
@@ -566,6 +615,9 @@ static int combo_usb3_poweroff(struct phy *phy)
 		if (!ret)
 			dp->usb2_active = false;
 	}
+	/* The controller's next session selects its role again; until then USB2 starts as host. */
+	if (!ret)
+		dp->usb2_device = false;
 	if (ret) {
 		dev_err(dp->dev, "USB3 power-off failed (%d)\n", ret);
 		dp->faulted = true;
@@ -573,7 +625,8 @@ static int combo_usb3_poweroff(struct phy *phy)
 	return ret ? -EIO : 0;
 }
 static const struct phy_ops combo_usb2_ops = {
-	.set_mode = combo_usb2_mode, .reset = combo_usb2_reset, .owner = THIS_MODULE,
+	.set_mode = combo_usb2_mode, .validate = combo_usb2_validate, .reset = combo_usb2_reset,
+	.owner = THIS_MODULE,
 };
 static const struct phy_ops combo_usb3_ops = {
 	.set_mode = combo_usb3_mode, .power_off = combo_usb3_poweroff, .owner = THIS_MODULE,
