@@ -2286,6 +2286,12 @@ static int dcp_dpxbar_preselect(struct mux_control *mux, int state)
  * dispext0: any other one activates the link, gets no answer from the sink
  * and gives up with DEVICE_NOT_RESPONDING before it ever sets a link rate.
  */
+/*
+ * Runs from the attach's claim step, which cannot fail, so a failure here
+ * is only logged: the link that follows then fails in training and is
+ * reported there. Moving it before the commit point is tracked in
+ * https://github.com/aurora-silicon/linux/issues/2470.
+ */
 static void dcp_tunnel_prepare(struct apple_dcp_typec_route *route,
 			       struct mux_control *xbar)
 {

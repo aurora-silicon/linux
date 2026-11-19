@@ -968,6 +968,13 @@ static void afk_recv_handle_compact_init(struct apple_dcp_afkep *ep,
 		 service->defer_start ? " (deferred)" : "");
 	afk_populate_service_debugfs(service);
 
+	/*
+	 * A failed start (only a failed send on the transmit ring) leaves the
+	 * service published but not started; its calls may go unanswered.
+	 * Not discarded here: the admission path's discard has not been
+	 * checked against a ring that may recover. Tracked in
+	 * https://github.com/aurora-silicon/linux/issues/2470.
+	 */
 	if (!service->defer_start) {
 		ret = afk_start_service(service);
 		if (ret)
