@@ -11,7 +11,6 @@
 #include <linux/aperture.h>
 #include <linux/component.h>
 #include <linux/completion.h>
-#include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-mapping.h>
 #include <linux/jiffies.h>
@@ -1493,6 +1492,22 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
 	drm_connector_list_iter_end(&iter);
 }
 
+/* Process the hotplug reports queued while the display processors started. */
+static void apple_drm_flush_start_reports(struct drm_device *drm)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+
+	drm_connector_list_iter_begin(drm, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		/* A T8132 external output has no DCP hotplug work. */
+		if (t8132_ext_connector(connector))
+			continue;
+		flush_work(&to_apple_connector(connector)->hotplug_wq);
+	}
+	drm_connector_list_iter_end(&iter);
+}
+
 /*
  * Each display processor runs its own RTKit firmware, and starting one waits
  * for its firmware: a T6041 external processor takes 0.6 to 1.6 s to bring up
@@ -1650,8 +1665,12 @@ static int apple_drm_init_dcp(struct device *dev)
 		return -ENODEV;
 	}
 
-	/* HACK: Wait for dcp* to settle before a modeset */
-	msleep(100);
+	/*
+	 * What the firmware reported while its processor started (connection,
+	 * modes) is processed before the device registers, so the first
+	 * modeset sees it. Later reports arrive as hotplug events.
+	 */
+	apple_drm_flush_start_reports(&apple->drm);
 
 	return 0;
 }
