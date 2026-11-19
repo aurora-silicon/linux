@@ -536,6 +536,13 @@ enum atcphy_lane_mode {
 #define PIPEHANDLER_NATIVE_POWER_DOWN GENMASK(3, 0)
 
 #define PIPEHANDLER_LOCK_ACK_TIMEOUT_US 1000
+/*
+ * A live USB3 PIPE: the controller ACKs the lock only once it has let go of
+ * the PIPE, which a running link can take several ms to do. The old handoff
+ * asked up to ten times, 1 ms each with 5-10 ms between; this window covers
+ * the same span with the request held.
+ */
+#define PIPEHANDLER_LOCK_LIVE_ACK_TIMEOUT_US (100 * USEC_PER_MSEC)
 
 /* USB2 PHY regs */
 #define USB2PHY_USBCTL 0x00
@@ -1366,8 +1373,10 @@ static int atcphy_pipehandler_lock_timeout(struct apple_atcphy *atcphy, u32 time
 		set32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
 	}
 
+	/* Step coarser over a long window: the ACK is the only signal to wait for. */
 	ret = readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
-				 reg & PIPEHANDLER_LOCK_EN, 10, timeout);
+				 reg & PIPEHANDLER_LOCK_EN,
+				 timeout > 10 * USEC_PER_MSEC ? 100 : 10, timeout);
 	/*
 	 * A controller that still drives the PIPE can take longer than this to
 	 * let go. What that means is the caller's to decide: a best-effort lock
@@ -1394,20 +1403,27 @@ static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
 		6000 : PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
 }
 
-/* Retry only a live legacy PIPE: USB4 and stopped parking cannot clock the ACK. */
+/*
+ * Lock a live USB3 PIPE: the running controller clocks the ACK, and gives it
+ * once it has let go of the PIPE. One request, held, and the ACK polled for the
+ * whole live window, rather than dropping and asking again. USB4 and stopped
+ * parking cannot clock the ACK and do not come here.
+ */
 static int atcphy_pipehandler_lock_live(struct apple_atcphy *atcphy)
 {
-	unsigned int attempts = atcphy->t8103_usb3_workaround ? 10 : 1;
-	int ret;
+	u32 aon;
 
-	for (unsigned int attempt = 0; attempt < attempts; attempt++) {
-		ret = atcphy_pipehandler_lock(atcphy);
-		if (!ret)
-			return 0;
-		if (attempt + 1 < attempts)
-			usleep_range(5000, 10000);
-	}
-	return ret;
+	/* The tests stand in for the controller that acknowledges the lock. */
+	if (IS_ENABLED(CONFIG_PHY_APPLE_ATC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(atcphy_pipehandler_lock_live, atcphy);
+
+	/* A controller held in reset or clamped clocks nothing: no ACK can come. */
+	aon = readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN);
+	if (!(aon & PIPEHANDLER_AON_GEN_DWC3_RESET_N) ||
+	    (aon & PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN))
+		return -ETIMEDOUT;
+
+	return atcphy_pipehandler_lock_timeout(atcphy, PIPEHANDLER_LOCK_LIVE_ACK_TIMEOUT_US);
 }
 
 static int atcphy_pipehandler_unlock(struct apple_atcphy *atcphy)
