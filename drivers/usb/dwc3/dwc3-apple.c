@@ -175,6 +175,8 @@ struct dwc3_apple {
 	/* The root port the fixed hub sits on, its node's reg. */
 	u32 hub_port;
 	bool host_only;
+	/* The core's maximum speed from its first probe; device sessions may lower it. */
+	enum usb_device_speed maximum_speed;
 
 	struct mutex lock;
 
@@ -921,6 +923,17 @@ static void dwc3_apple_usb3_pipe_reset(struct dwc3_apple *appledwc)
 	msleep(100);
 }
 
+/*
+ * Without a USB3 PHY that runs as a device the PIPE stays on its dummy producer: offer the gadget
+ * at high speed only. dwc3_apple_init() undoes this for the next session.
+ */
+static void dwc3_apple_gadget_high_speed(struct dwc3_apple *appledwc)
+{
+	if (appledwc->dwc.maximum_speed > USB_SPEED_HIGH)
+		appledwc->dwc.maximum_speed = USB_SPEED_HIGH;
+	dev_info(appledwc->dev, "No USB3 device PHY: gadget at high speed\n");
+}
+
 /* Select the role in the core and route the USB3 PHY, before xhci or the gadget is started */
 static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
 {
@@ -931,6 +944,8 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 
 	appledwc->dwc.dr_mode = host ? USB_DR_MODE_HOST : USB_DR_MODE_PERIPHERAL;
 	dwc3_apple_set_ptrcap(appledwc, host ? DWC3_GCTL_PRTCAP_HOST : DWC3_GCTL_PRTCAP_DEVICE);
+	if (appledwc->maximum_speed == USB_SPEED_UNKNOWN)
+		appledwc->maximum_speed = appledwc->dwc.maximum_speed;
 	/*
 	 * This platform requires SUSPHY to be enabled here already in order to properly
 	 * configure the PHY and switch dwc3's PIPE interface to USB3 PHY. The USB2 PHY's
@@ -951,7 +966,15 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 			dev_err(appledwc->dev, "USB3 PHY setup failed, err=%d\n", ret);
 			return ret;
 		}
-		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
+		/*
+		 * A USB3 PHY without a device sequence (T6040) leaves the PIPE on its
+		 * dummy producer: offer the gadget at high speed only.
+		 */
+		if (!host && ret == -EOPNOTSUPP) {
+			dwc3_apple_gadget_high_speed(appledwc);
+		} else {
+			dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
+		}
 	} else if (host && appledwc->usb3_phy &&
 		   (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
 		    of_device_is_compatible(appledwc->dev->of_node, "apple,t8142-dwc3"))) {
@@ -964,24 +987,25 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 	} else if (appledwc->usb3_phy &&
 		   of_device_is_compatible(appledwc->dev->of_node, "apple,t6040-dwc3")) {
 		dwc3_apple_usb3_pipe_reset(appledwc);
+	} else if (!host && !appledwc->usb3_phy) {
+		dwc3_apple_gadget_high_speed(appledwc);
 	}
 	return 0;
 }
 
 /*
- * No device mode: the T6040 USB2 PHY (phy-apple-t6040-usb2) and the T6050 Type-C PHY implement
- * host mode only, and a kernel built without gadget support turns dwc3_gadget_init() into a stub
- * that succeeds. Such a controller must not follow a USB_ROLE_DEVICE request from the Type-C port
- * controller (a charger or a host on the other end), or the core would end up in device mode on
- * top of a PHY powered in host mode.
+ * No device mode: a USB2 PHY that does not validate PHY_MODE_USB_DEVICE (the T6050 Type-C PHY
+ * implements host mode only), or a kernel built without gadget support, which turns
+ * dwc3_gadget_init() into a stub that succeeds. Such a controller must not follow a
+ * USB_ROLE_DEVICE request from the Type-C port controller (a charger or a host on the other end),
+ * or the core would end up in device mode on top of a PHY powered in host mode.
  */
-static bool dwc3_apple_host_only(struct device *dev)
+static bool dwc3_apple_host_only(struct dwc3_apple *appledwc)
 {
 	if (!IS_ENABLED(CONFIG_USB_DWC3_GADGET) && !IS_ENABLED(CONFIG_USB_DWC3_DUAL_ROLE))
 		return true;
 
-	return of_device_is_compatible(dev->of_node, "apple,t6040-dwc3") ||
-	       of_device_is_compatible(dev->of_node, "apple,t6050-dwc3");
+	return phy_validate(appledwc->usb2_phy, PHY_MODE_USB_DEVICE, 0, NULL) != 0;
 }
 
 static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
@@ -997,6 +1021,9 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	 */
 	if (state == DWC3_APPLE_HOST && appledwc->host_only)
 		appledwc->dwc.current_dr_role = DWC3_GCTL_PRTCAP_HOST;
+	/* Undo a high-speed limit of an earlier device session before the core init. */
+	if (appledwc->maximum_speed != USB_SPEED_UNKNOWN)
+		appledwc->dwc.maximum_speed = appledwc->maximum_speed;
 
 	ret = dwc3_apple_core_start(appledwc, state);
 	if (ret)
@@ -1834,7 +1861,6 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 
 	appledwc->dev = &pdev->dev;
 	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev, &appledwc->hub_port);
-	appledwc->host_only = dwc3_apple_host_only(dev);
 	appledwc->dt_dis_u3_susphy = device_property_read_bool(dev, "snps,dis_u3_susphy_quirk");
 	appledwc->sleep_ddr = device_property_read_bool(dev, "apple,sleep-ddr");
 	/* The PHY driver and the DARTs follow runtime PM on these SoCs. */
@@ -1855,6 +1881,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	if (IS_ERR(appledwc->usb2_phy))
 		return dev_err_probe(dev, PTR_ERR(appledwc->usb2_phy),
 				     "Failed to get the USB2 PHY\n");
+	appledwc->host_only = dwc3_apple_host_only(appledwc);
 
 	/*
 	 * Older T8132 device trees and the T6040 ports without a USB3 PHY
