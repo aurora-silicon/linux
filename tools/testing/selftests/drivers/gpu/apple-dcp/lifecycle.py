@@ -1554,8 +1554,9 @@ static bool machine_supported, absent_external;
 static unsigned int references, released, node_puts, probes[2], bind_attempts, disables;
 static int preflight_error, external_probe_error, bind_result;
 static void try_bind(void);
-static bool of_machine_is_compatible(const char *s)
-{ assert(!strcmp(s,"apple,j700")); return machine_supported; }
+/* The board must not enter into admission: any call fails the test. */
+static __attribute__((unused)) bool of_machine_is_compatible(const char *s)
+{ (void)s; assert(false); return machine_supported; }
 static int of_property_read_variable_u32_array(struct device_node *n,const char *s,u32 *v,int min,int max)
 {
     assert(min==3 && max==3);
@@ -1679,10 +1680,11 @@ int main(void)
 {
     assert(apple_dcp_external_bw_valid(0xbc000,0x28000,0x70000));
     assert(apple_dcp_external_clock_window(0x302800000ULL,0xbc000,0x302800000ULL,0xbc000));
-    /* No command line state: exact J700 firmware selects the external profile. */
+    /* No command line state: the exact firmware selects the external profile. */
     initial(true); assert(dcp_h17p_external_supported(&nodes[1]));
+    /* The board does not: the same node and firmware on any machine. */
     machine_supported=false;
-    assert(!dcp_h17p_external_supported(&nodes[1]) && match_providers()==1);
+    assert(dcp_h17p_external_supported(&nodes[1]));
     for(unsigned i=0;i<3;i++) {
         initial(true); nodes[1].firmware[i]++;
         assert(!dcp_h17p_external_supported(&nodes[1]) && match_providers()==1);
