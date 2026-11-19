@@ -21,6 +21,8 @@ struct NewContext {
     fd: i32,
     uid: u32,
     lifetime_s: u32,
+    /// In: 0.
+    reserved: [u32; 2],
 }
 const NEW_BAG: u32 = 1;
 /// ECIES to a P-256 key: the uncompressed ephemeral point, then the 16-byte
@@ -63,6 +65,8 @@ struct Query {
     cleanup: u32,
     reason: i32,
     activity_flags: u32,
+    /// Out: 0.
+    reserved: [u32; 2],
 }
 #[repr(C)]
 struct Revoke {
@@ -92,11 +96,11 @@ struct ContextDecrypt {
     plain: Buffer,
 }
 
-static_assert!(core::mem::size_of::<NewContext>() == 16);
+static_assert!(core::mem::size_of::<NewContext>() == 24);
 static_assert!(core::mem::size_of::<Authenticate>() == 24);
 static_assert!(core::mem::size_of::<ContextBind>() == 24);
 static_assert!(core::mem::size_of::<AuthPassword>() == 16 + 8 + keys::PASSWORD_MAX);
-static_assert!(core::mem::size_of::<Query>() == 16);
+static_assert!(core::mem::size_of::<Query>() == 24);
 static_assert!(core::mem::size_of::<Revoke>() == 8);
 static_assert!(core::mem::size_of::<ContextSign>() == 144);
 static_assert!(core::mem::size_of::<ContextDecrypt>() == 64);
@@ -226,8 +230,8 @@ impl File {
             return Err(ENODEV);
         }
         if cmd == NEW {
-            let mut out: NewContext = UserSlice::new(user, 16).reader().read()?;
-            if out.flags & !NEW_BAG != 0 || out.fd != -1 {
+            let mut out: NewContext = UserSlice::new(user, core::mem::size_of::<NewContext>()).reader().read()?;
+            if out.flags & !NEW_BAG != 0 || out.fd != -1 || out.reserved != [0; 2] {
                 return Err(EINVAL);
             }
             crate::key_context::lifetime_ns(out.lifetime_s)?;
@@ -262,7 +266,7 @@ impl File {
                 return Err(Error::from_errno(status));
             }
             out.fd = fd;
-            let result = UserSlice::new(user, 16).writer().write(&out);
+            let result = UserSlice::new(user, core::mem::size_of::<NewContext>()).writer().write(&out);
             // SAFETY: reserved fd and file belong to this task. Install only
             // after copyout; failure releases both and asynchronously closes.
             unsafe { sep_context_file_finish(file, fd, result.is_ok()) };
@@ -370,11 +374,12 @@ unsafe extern "C" fn context_ioctl(pointer: *mut c_void, cmd: c_uint, arg: c_ulo
         let user = UserPtr::from_addr(arg as usize);
         if cmd == QUERY {
             let (phase, cleanup, reason) = context.query();
-            return UserSlice::new(user, 16).writer().write(&Query {
+            return UserSlice::new(user, core::mem::size_of::<Query>()).writer().write(&Query {
                 phase,
                 cleanup,
                 reason,
                 activity_flags: context.sep.context_sensor_waiting(&context) as u32,
+                reserved: [0; 2],
             });
         }
         if cmd == REVOKE {

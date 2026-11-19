@@ -484,6 +484,7 @@ struct sep_key_ctx_new {
 	__s32 fd;               /* out: the context */
 	__u32 uid;              /* the bag's Unix account */
 	__u32 lifetime_s;       /* 1..SEP_KEY_CTX_LIFETIME_MAX */
+	__u32 reserved[2];      /* in: 0 */
 };
 
 struct sep_key_ctx_auth {
@@ -512,6 +513,7 @@ struct sep_key_ctx_query {
 	__u32 cleanup;
 	__s32 reason;
 	__u32 activity_flags;
+	__u32 reserved[2];      /* out: 0 */
 };
 
 struct sep_key_ctx_revoke {
