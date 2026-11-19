@@ -192,8 +192,7 @@ static int apple_nvme_m5_attach(struct apple_nvme *anv)
 /* T6050's ANS2, whose final stop the sleep makes in its last steps */
 static bool apple_nvme_m5_sleep(struct apple_nvme *anv)
 {
-	return anv->hw->m5_sleep == &apple_nvme_t6050_sleep_policy && apple_sleep_ans_late() &&
-	       of_device_is_compatible(anv->dev->of_node, "apple,t6050-nvme-ans2");
+	return anv->hw->m5_sleep == &apple_nvme_t6050_sleep_policy && apple_sleep_ans_late();
 }
 
 struct apple_nvme_m5_drain {

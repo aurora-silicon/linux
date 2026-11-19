@@ -1034,13 +1034,18 @@ static phys_addr_t apple_dart_pte_to_paddr(const struct apple_dart *dart,
 	return (pte & GENMASK_ULL(37, 10)) << 4;
 }
 
-/* Firmware table pages must remain outside Linux's page allocator. */
+/*
+ * Firmware table pages must remain outside Linux's page allocator. The boot
+ * loader says it reserved them with apple,firmware-root-handoff; the walker
+ * decodes them in the APPLE_DART2 PTE layout, so that is the only other
+ * condition.
+ */
 static bool apple_dart_fw_handoff_enabled(const struct apple_dart *dart)
 {
 	struct device_node *np = dart->dev->of_node;
 	u32 handoff;
 
-	return dart->locked && of_device_is_compatible(np, "apple,t8140-dart") &&
+	return dart->locked && dart->hw->fmt == APPLE_DART2 &&
 		of_property_count_u32_elems(np, "apple,firmware-root-handoff") == 1 &&
 		!of_property_read_u32(np, "apple,firmware-root-handoff", &handoff) &&
 		handoff == 1;
@@ -5369,7 +5374,6 @@ static int apple_dart_probe(struct platform_device *pdev)
 		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
 	/* The radio DART's fault interrupt is not described by the loader. */
 	j713_radio = res && !tunneled && apple_t8132_managed_radio() &&
-		of_machine_is_compatible("apple,t8132") &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		res->start == 0x490000000ULL;
 	/*
@@ -5377,7 +5381,6 @@ static int apple_dart_probe(struct platform_device *pdev)
 	 * over, but the running DCP still uses them: never reset them.
 	 */
 	if (res && !tunneled && !apple_t8132_firmware_path() &&
-	    of_machine_is_compatible("apple,t8132") &&
 	    of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 	    (res->start == 0x30a300000ULL || res->start == 0x30a340000ULL)) {
 		dev_info(dev, "Leaving inherited display DART untouched off the qualified firmware\n");
@@ -5911,7 +5914,7 @@ params_done:
 	}
 	dart->fw_tree = dart->fw_mirror &&
 		of_device_is_compatible(dev->of_node, "apple,t6050-dart");
-	if (apple_t8132_live_mtp() && of_machine_is_compatible("apple,t8132") &&
+	if (apple_t8132_live_mtp() &&
 	    res->start == 0x394800000ULL && dart->hw->type == DART_T8110 &&
 	    !dart->locked && !tunneled && dart->supports_bypass &&
 	    apple_dart_streams_bypassed(dart)) {
