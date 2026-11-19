@@ -142,8 +142,8 @@
  * 0 left woofer 1, 1 right woofer 1, 2 left woofer 2, 3 right woofer 2, 4 left tweeter,
  * 5 right tweeter.
  *
- * There is no sound card yet: the AOP audio driver is not on this branch, and the jack codec
- * (i2c2) is not described. The amps stay in shutdown until a stream asks for them.
+ * There is no sound card yet: the jack codec (i2c2) is not described. The amps stay in
+ * shutdown until a stream asks for them.
  */
 / {
 	speaker_sdz: regulator-sn012776-sdz {
@@ -460,3 +460,10 @@
 &avd {
 	status = "okay";
 };
+
+/* The AOP, its sensors and the microphone array (t6050-aop.dtsi) */
+&aop_audio {
+	apple,chassis-name = "J714";
+};
+
+#include "t6050-aop.dtsi"

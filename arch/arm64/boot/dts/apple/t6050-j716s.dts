@@ -570,3 +570,10 @@
 
 #define T6050_J716S
 #include "t6050-peripherals.dtsi"
+
+/* The AOP, its sensors and the microphone array (t6050-aop.dtsi) */
+&aop_audio {
+	apple,chassis-name = "J716";
+};
+
+#include "t6050-aop.dtsi"
