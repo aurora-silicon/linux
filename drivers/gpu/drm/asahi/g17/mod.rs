@@ -2104,6 +2104,7 @@ impl Gpu {
                 pool: object::Pool::new(shared.variant.objects_after_release)?,
                 render_rings: kick::RenderRings::new()?,
                 render_ids: freelist::RenderIds::new()?,
+                cooling: None,
                 init: initdata::InitData::new(),
                 _render_global: render_global,
                 _pm_metrics: session_metrics,
