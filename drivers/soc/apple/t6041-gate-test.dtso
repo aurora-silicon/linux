@@ -89,7 +89,9 @@
 				};
 			};
 
-			pinctrl@510824000 {
+			pinctrl_aop: pinctrl@510824000 {
+				gpio-controller;
+				#gpio-cells = <2>;
 				status = "disabled";
 			};
 
@@ -123,6 +125,7 @@
 				compatible = "apple,t6041-dcpext";
 				iommus = <&dcpext0_dart 23>;
 				memory-region = <&dcpext0_data>, <&dcpext0_heap>, <&dcpext0_text>;
+				hdmi-hpd-gpios = <&pinctrl_aop 36 0>;
 				status = "disabled";
 
 				piodma {

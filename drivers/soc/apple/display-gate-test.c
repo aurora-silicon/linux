@@ -21,8 +21,10 @@
  *  - T6041 on the J616c (t6041-gate-test.dtso): no PMP; each external chain
  *    is enabled once its processor has firmware memory, one without it or
  *    already enabled stays as it is, and the chains never write the display
- *    subsystem's status. The tree has no dcp alias, so the internal display
- *    handoff finds nothing to adopt.
+ *    subsystem's status. The HDMI converter's hotplug pin controller is
+ *    enabled with the HDMI chain, and one already enabled does not refuse
+ *    it. The tree has no dcp alias, so the internal display handoff finds
+ *    nothing to adopt.
  * Included at the end of display-gate.c.
  *
  * The test trees are applied once and stay: the gate gives some properties
@@ -1145,6 +1147,8 @@ static void __init gate_t6041_max_enabled(struct kunit *test)
 	gt_max_expect_chain(test, 0, true);
 	gt_max_expect_chain(test, 1, true);
 	gt_max_expect_display(test, BIT(0) | BIT(1));
+	/* The pin controller of the HDMI converter's hotplug input, with the chain. */
+	KUNIT_EXPECT_TRUE(test, gt_okay(test, "/pinctrl@510824000"));
 }
 
 /* A boot loader that fills nothing leaves everything as it is. */
@@ -1155,6 +1159,24 @@ static void __init gate_t6041_max_no_memory(struct kunit *test)
 	gt_max_expect_chain(test, 1, false);
 	gt_max_expect_chain(test, 2, false);
 	gt_max_expect_display(test, 0);
+	KUNIT_EXPECT_FALSE(test, gt_okay(test, "/pinctrl@510824000"));
+}
+
+/*
+ * The hotplug pin controller is a shared supplier, not part of the chain:
+ * already enabled (a board whose USB4 routers use its pins), it does not
+ * refuse the HDMI chain, and it stays enabled.
+ */
+static void __init gate_t6041_max_shared_pins(struct kunit *test)
+{
+	gt_max_fill(test, 0);
+	gt_max_fill(test, 1);
+	gt_set_string(test, "/pinctrl@510824000", "status", "okay");
+	gt_max_run(test);
+	gt_max_expect_chain(test, 0, true);
+	gt_max_expect_chain(test, 1, true);
+	gt_max_expect_display(test, BIT(0) | BIT(1));
+	KUNIT_EXPECT_TRUE(test, gt_okay(test, "/pinctrl@510824000"));
 }
 
 /* With dcpext2 filled too, the second USB-C chain comes up after dcpext1's, its DART last. */
@@ -1178,6 +1200,7 @@ static void __init gate_t6041_max_one_processor(struct kunit *test)
 	gt_max_expect_chain(test, 0, false);
 	gt_max_expect_chain(test, 1, true);
 	gt_max_expect_display(test, BIT(1));
+	KUNIT_EXPECT_FALSE(test, gt_okay(test, "/pinctrl@510824000"));
 }
 
 /* A region that is still a placeholder keeps the whole chain off. */
@@ -1236,6 +1259,7 @@ static void __init gate_t6041_max_no_display(struct kunit *test)
 static struct kunit_case gate_t6041_max_cases[] __refdata = {
 	KUNIT_CASE(gate_t6041_max_enabled),
 	KUNIT_CASE(gate_t6041_max_no_memory),
+	KUNIT_CASE(gate_t6041_max_shared_pins),
 	KUNIT_CASE(gate_t6041_max_second_usbc),
 	KUNIT_CASE(gate_t6041_max_one_processor),
 	KUNIT_CASE(gate_t6041_max_partial_memory),
