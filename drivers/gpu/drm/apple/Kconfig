@@ -80,6 +80,7 @@ config DRM_APPLE_DCP_T8152
 	depends on DRM_APPLE
 	depends on SPMI=y || SPMI=DRM_APPLE
 	depends on MFD_MACSMC=y || MFD_MACSMC=DRM_APPLE
+	select APERTURE_HELPERS
 	help
 	  Lets the common Apple display driver drive the three display
 	  coprocessors of the T8152 Mac mini (J873g) through their firmware's

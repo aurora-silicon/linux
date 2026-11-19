@@ -2156,6 +2156,8 @@ M:	Thomas Glanzmann <thomas@glanzmann.de>
 L:	dri-devel@lists.freedesktop.org
 S:	Maintained
 F:	Documentation/devicetree/bindings/display/apple,t8152-dcp-iboot.yaml
+F:	drivers/gpu/drm/apple/iboot_drm.c
+F:	drivers/gpu/drm/apple/iomfb_iboot.*
 F:	drivers/gpu/drm/apple/t8152_*
 
 APPLETALK NETWORK LAYER

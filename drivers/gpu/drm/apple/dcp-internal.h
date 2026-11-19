@@ -463,6 +463,7 @@ struct dcp_desktop_state {
 /* TODO: move IOMFB members to its own struct */
 struct dcpext_scanout;
 struct t8152_display;
+struct dcp_iboot;
 struct dcp_hdmi;
 struct dcp_cec;
 
@@ -587,6 +588,8 @@ struct apple_dcp {
 	enum dcp_firmware_version fw_compat;
 	/* T8152: the DisplayPort hardware behind the DPTX port (t8152_display.h) */
 	struct t8152_display *t8152;
+	/* DCP_FIRMWARE_IBOOT: the display driven through it (iomfb_iboot.h) */
+	struct dcp_iboot *iboot;
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
 	/*
@@ -1219,6 +1222,13 @@ static inline bool dcp_is_iboot(const struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_IBOOT;
 }
+
+struct apple_rtkit_shmem;
+/* The common RTKit shared memory hooks, for a processor with its own RTKit ops. */
+int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr);
+void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr);
+/* Keep a session that cannot be stopped, its DMA and this driver until reboot. */
+int dcp_retain_live_session(struct apple_dcp *dcp);
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
 static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
