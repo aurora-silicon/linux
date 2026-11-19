@@ -717,6 +717,19 @@
 #include "t6050-j714s-sleep-soc.dtsi"
 #include "t6050-j714s-sleep-adt.dtsi"
 
+/* The display coprocessors take the sleep through their firmware 27 method table */
+&sleep {
+	apple,display-method-sleep;
+};
+
+/* The SMC's wake reasons (ADT smc-pmu, event_name-bitN) */
+&smc {
+	apple,wake-reasons = <0 8 9 11 13 35 40 41 42 43 44 45 48>;
+	apple,wake-reason-names = "pwrbtn", "lid", "sdconn", "charger", "wifibt",
+				  "trackpadkeyboard", "acattach", "acdetach", "USB-C_plug",
+				  "USB2_plug", "USB2_wake", "aupo", "rtc";
+};
+
 /*
  * Sound through the AOP, as on J813: its audio service runs the serializers, the
  * CS42L84 headphone jack on admac-base-ns TX2/RX2 and the six SN012776 speaker amps
