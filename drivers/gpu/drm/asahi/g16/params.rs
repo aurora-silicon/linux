@@ -48,7 +48,7 @@ pub(crate) mod tune {
     /// Renders of one VM in flight at most (1: a render runs alone).
     pub(crate) static RENDER_FLIGHTS: AtomicU32 = AtomicU32::new(1);
     /// Each render allocator in its own hardware UMA slot (render arenas created later).
-    pub(crate) static RENDER_UMA_SPLIT: AtomicU32 = AtomicU32::new(1);
+    pub(crate) static RENDER_UMA_SPLIT: AtomicU32 = AtomicU32::new(0);
     /// A queued render's TA waits for the previous FS with the predecessor hold (type 1).
     pub(crate) static RENDER_HOLD: AtomicU32 = AtomicU32::new(1);
     /// Jobs of a logical queue admitted to the engine at once (queues created later).
