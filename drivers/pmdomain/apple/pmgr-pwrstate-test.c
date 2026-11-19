@@ -414,7 +414,8 @@ static void pmgr_ps_power_off_latch_test(struct kunit *test)
 	bool engine;
 
 	for (engine = false; ; engine = true) {
-		ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_ACTIVE, true, &r);
+		/* One test device per name: vary no_auto_pm (neither has AUTO_ENABLE set). */
+		ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_ACTIVE, engine, &r);
 		ps->sleep_engine_wakes = engine;
 		r->latched = true;
 		KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_off(&ps->genpd), 0);
