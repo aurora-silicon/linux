@@ -224,6 +224,12 @@ PHONY += virtconfig
 virtconfig:
 	$(call merge_into_defconfig_override,defconfig,virt)
 
+# The one configuration for every supported Apple silicon Mac: the generic
+# distribution base with the Apple hardware fragment merged over it.
+PHONY += aurora_defconfig
+aurora_defconfig:
+	$(call merge_into_defconfig,aurora-base.config,asahi)
+
 define archhelp
   echo  '* Image.gz      - Compressed kernel image (arch/$(ARCH)/boot/Image.gz)'
   echo  '  Image         - Uncompressed kernel image (arch/$(ARCH)/boot/Image)'
