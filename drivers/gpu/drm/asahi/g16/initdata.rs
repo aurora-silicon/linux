@@ -38,6 +38,8 @@ pub(crate) struct InitData {
     #[allow(dead_code)]
     pub(crate) parameter: Arc<FwObject>,
     root: Arc<FwObject>,
+    /// Rows of the board's firmware performance table, including off.
+    pub(crate) rows: u32,
     loader: [u8; wire::LOADER_BYTES],
     /// The complete inventory, including firmware-only log and retention data.
     _graph: KVec<Arc<FwObject>>,
@@ -85,6 +87,7 @@ pub(crate) fn build(
     let performance = board::qualify(dev, adt)?;
     // The top row: S9 on J713, S10 on J773g.
     let ceiling = performance.count as u32 - 1;
+    let rows = performance.count as u32;
     let max_khz = performance.frequency[ceiling as usize] * 1000;
     let mut graph = KVec::with_capacity(wire::OBJECT_COUNT, GFP_KERNEL)?;
     for (i, size) in wire::OBJECT_SIZE.iter().copied().enumerate() {
@@ -219,6 +222,7 @@ pub(crate) fn build(
             uma: graph[id::UMA].clone(),
             parameter: graph[id::PARAMETER].clone(),
             root: graph[id::ROOT].clone(),
+            rows,
             loader,
             _graph: graph,
         },

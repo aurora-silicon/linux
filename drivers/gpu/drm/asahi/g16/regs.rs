@@ -21,6 +21,8 @@ use kernel::{
     prelude::*,
 };
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::regs::G16Resources;
 
 /// Write memory barrier (`wmb()`): `dsb st`.
@@ -179,6 +181,9 @@ pub(crate) struct Regs {
     status: Mapping,
     /// Host-owned generation register page (SGX +0xd60000).
     generation: Mapping,
+    /// Highest firmware performance state the board's table holds: S9 until the table is
+    /// known (the ten-row J713/J604 tables), S10 on the eleven-row J773g table.
+    top: AtomicU32,
 }
 
 impl Regs {
@@ -198,6 +203,7 @@ impl Regs {
             asc: window(c_str!("asc"), 0)?,
             status: window(c_str!("sgx"), SGX_STATUS as u64)?,
             generation: window(c_str!("sgx"), 0xd60000)?,
+            top: AtomicU32::new(9),
             res,
         })
     }
@@ -216,10 +222,22 @@ impl Regs {
         })
     }
 
-    /// Actual cold or running firmware pstate (zero is valid while stopped).
+    /// Adopts the board's firmware performance table, `rows` rows including off.
+    pub(crate) fn set_table(&self, rows: u32) {
+        let top = rows.saturating_sub(1).clamp(1, super::fw::initdata::PERF_STATES as u32 - 1);
+        self.top.store(top, Ordering::Relaxed);
+    }
+
+    /// Highest performance state the firmware may run in.
+    pub(crate) fn top(&self) -> u32 {
+        self.top.load(Ordering::Relaxed)
+    }
+
+    /// Actual cold or running firmware pstate (zero is valid while stopped). A state above the
+    /// board table's top row is a protocol error.
     pub(crate) fn pstate(&self) -> Result<u32> {
         let state = self.res.sgx_read32_at(SGX_CORE + 0x1000)? & 0xf;
-        if state > 9 {
+        if state > self.top() {
             Err(super::boot::eproto())
         } else {
             Ok(state)

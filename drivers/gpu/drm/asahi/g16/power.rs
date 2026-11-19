@@ -24,7 +24,7 @@ use super::fw::initdata::globals;
 use super::recovery::now_ns;
 use super::regs::wmb;
 use super::Firmware;
-use policy::{COOLING_MAX, PSTATE_MAX};
+use policy::{COOLING_MAX, TOP_DEFAULT};
 
 static_assert!(globals::PSTATE_SELECTORS[0] == 0x88);
 static_assert!(globals::PSTATE_SELECTORS[1] == 0x8c);
@@ -155,6 +155,8 @@ pub(crate) struct Power {
     cooling: Cooling,
     sample: Sample,
     last_sample_ns: Option<u64>,
+    /// The board's top state: S9 on the ten-row tables, S10 on the J773g table.
+    pub(crate) top: u32,
     pub(crate) configured: u32,
     pub(crate) user: u32,
     pub(crate) effective: u32,
@@ -170,7 +172,7 @@ pub(crate) struct Power {
 }
 
 impl Power {
-    /// The Main image initializes all nine active states. Initdata publishes
+    /// The Main image initializes every active state of the board's table. Initdata publishes
     /// startup S1 before INIT; this object starts with that same effective state.
     pub(crate) fn new(dev: &device::Device) -> Result<Self> {
         Ok(Self {
@@ -185,8 +187,9 @@ impl Power {
                 backstop: COOLING_MAX,
             },
             last_sample_ns: None,
-            configured: PSTATE_MAX,
-            user: PSTATE_MAX,
+            top: TOP_DEFAULT,
+            configured: TOP_DEFAULT,
+            user: TOP_DEFAULT,
             effective: 1,
             temperature_mc: 0,
             governor: COOLING_MAX,
@@ -198,6 +201,17 @@ impl Power {
             last_decision: None,
             utilization: policy::Governor::new(),
         })
+    }
+
+    /// Adopts the board's firmware table, `rows` rows including off, before the first
+    /// governed publication: its top row is the governor's top state and configured
+    /// ceiling. The J773g table has eleven rows, so its top state is S10.
+    pub(crate) fn set_table(&mut self, rows: u32) {
+        let top = policy::top_of(rows);
+        self.top = top;
+        self.configured = top;
+        self.user = top;
+        self.utilization.top = top;
     }
 
     /// Reports a change of work in flight to the CLPC: the memory and fabric
@@ -221,7 +235,7 @@ impl Power {
             self.budget = self.sample.budget;
         }
         let level = self.governor.max(self.budget).max(self.sample.backstop);
-        let ceiling = PSTATE_MAX - level.min(COOLING_MAX);
+        let ceiling = policy::cooling_ceiling(self.top, level);
         let limit = policy::limit(self.configured, ceiling, self.user);
         let decision = (
             limit,

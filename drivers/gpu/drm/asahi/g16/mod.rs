@@ -456,7 +456,7 @@ impl Firmware {
         dev: &AsahiDrmDevice,
         booted: boot::Booted,
         shared: &Arc<Shared>,
-        power: power::Power,
+        mut power: power::Power,
     ) -> Result<KBox<Firmware>> {
         let boot::Booted {
             session,
@@ -470,6 +470,7 @@ impl Firmware {
             dev.as_ref(),
             "G16: firmware at READY, starting the backend\n"
         );
+        power.set_table(init.rows);
         let orphan = |session: boot::Session,
                       objects: object::Objects,
                       channels: channel::Channels,
