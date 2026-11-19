@@ -51,6 +51,17 @@ impl Drop for Credential {
 }
 
 /// `Context::bind` operations: what a bound context may run on its key.
+/// Whether a BIND may set the scope: only once, and only before the first
+/// AUTH starts. Once authentication has begun (or the context ended) the
+/// grant was asked for without that scope, so narrowing it later is
+/// refused rather than taken to cover what is already authorized.
+fn bind_admitted(phase: Phase, bound: bool) -> Result {
+    if phase != Phase::New || bound {
+        return Err(EBUSY);
+    }
+    Ok(())
+}
+
 /// Whether `caller` (an effective uid) may use a context `owner` made: only
 /// the same effective uid, root included. Root may make a context for any
 /// user, but cannot use one another uid made.
@@ -237,9 +248,7 @@ impl Context {
     pub(crate) fn bind(&self, record: KVec<u8>, ops: u32) -> Result {
         let scope = Scope::new(record, ops)?;
         let mut inner = self.inner.lock();
-        if inner.life.phase != Phase::New || inner.scope.is_some() {
-            return Err(EBUSY);
-        }
+        bind_admitted(inner.life.phase, inner.scope.is_some())?;
         inner.scope = Some(scope);
         Ok(())
     }
@@ -524,6 +533,15 @@ mod tests {
         let mut out = KVec::new();
         out.extend_from_slice(bytes, GFP_KERNEL).unwrap();
         out
+    }
+
+    #[test]
+    fn bind_comes_once_and_before_auth() {
+        assert!(bind_admitted(Phase::New, false).is_ok());
+        assert_eq!(bind_admitted(Phase::New, true), Err(EBUSY));
+        for phase in [Phase::Authenticating, Phase::Authorized, Phase::Revoking, Phase::Dead] {
+            assert_eq!(bind_admitted(phase, false), Err(EBUSY));
+        }
     }
 
     #[test]
