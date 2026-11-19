@@ -2713,6 +2713,7 @@ int dcp_get_modes(struct drm_connector *connector)
 	u16 min_vfreq = 0, max_vfreq = 0;
 	bool vrr_capable = false;
 	bool physical_edid;
+	bool edid_fresh = false;
 	bool pending_180hz = false, published_180hz = false;
 	u64 edid_generation = 0;
 	u64 service_epoch = 0;
@@ -2835,6 +2836,7 @@ int dcp_get_modes(struct drm_connector *connector)
 			dcpavserv_edid_retry_reset(dcp);
 			drm_edid_free(apple_connector->drm_edid);
 			apple_connector->drm_edid = edid;
+			edid_fresh = true;
 			apple_connector->drm_edid_generation = edid_generation;
 			apple_connector->drm_edid_service_epoch = service_epoch;
 			/* A native T6030 pipe: its audio, after the first EDID. */
@@ -2959,7 +2961,8 @@ modes_done:
 		mutex_unlock(&dcp->hpd_mutex);
 	if (pending_180hz && !published_180hz)
 		dcp_180hz_retry(dcp);
-	if (apple_connector->drm_edid)
+	/* Only an EDID the firmware read just now: a cached one predates any HPD pulse. */
+	if (edid_fresh && apple_connector->drm_edid)
 		dcp_retry_placeholder_edid(dcp, apple_connector->drm_edid);
 
 	/* EDID updates clear display_info even for panels without an EDID. */

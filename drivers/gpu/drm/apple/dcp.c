@@ -3369,19 +3369,40 @@ static bool dcp_edid_is_placeholder(const struct drm_edid *drm_edid)
 	return false;
 }
 
+/*
+ * A DisplayPort source takes HPD low for more than 2 ms as an unplug, a
+ * shorter pulse (0.5 to 1 ms) as IRQ_HPD. set_hpd(false) is answered only
+ * once the firmware has acted on it, so the low phase needs no more than that.
+ */
+#define DCP_PLACEHOLDER_HPD_LOW_US	3000
+/* Pulses per connection before a placeholder is taken as the display's EDID */
+#define DCP_PLACEHOLDER_PULSES		3
+#define DCP_PLACEHOLDER_DELAY_MS	300
+
+/*
+ * Called with each EDID the firmware has just read. A placeholder gets an
+ * HPD pulse, after which the firmware reads the EDID again and this checks
+ * that one: the panel's EDID ends the pulses, as does the limit.
+ */
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid)
 {
 	guard(mutex)(&dcp->hpd_mutex);
 	if (!dcp_is_typec_output(dcp) || !dcp->typec_cable_connected ||
-	    dcp->placeholder_retried)
+	    dcp->typec_hpd_held || delayed_work_pending(&dcp->placeholder_edid_wq))
 		return;
-	if (!dcp_edid_is_placeholder(drm_edid))
+	if (dcp->placeholder_generation != dcp->typec_generation) {
+		dcp->placeholder_generation = dcp->typec_generation;
+		dcp->placeholder_pulses = 0;
+	}
+	if (dcp->placeholder_pulses >= DCP_PLACEHOLDER_PULSES ||
+	    !dcp_edid_is_placeholder(drm_edid))
 		return;
 
+	dcp->placeholder_pulses++;
 	dcp->placeholder_retried = true;
-	dcp->placeholder_generation = dcp->typec_generation;
-	schedule_delayed_work(&dcp->placeholder_edid_wq, msecs_to_jiffies(300));
+	schedule_delayed_work(&dcp->placeholder_edid_wq,
+			      msecs_to_jiffies(DCP_PLACEHOLDER_DELAY_MS));
 }
 
 static void dcp_placeholder_edid_work(struct work_struct *work)
@@ -3403,7 +3424,8 @@ static void dcp_placeholder_edid_work(struct work_struct *work)
 	/*
 	 * Some adapters answer the first connection with a 1024x768
 	 * placeholder and publish the panel EDID only after HPD drops
-	 * and returns. One pulse; a second placeholder is left alone.
+	 * and returns. The EDID read at the return decides whether
+	 * another pulse follows (dcp_retry_placeholder_edid()).
 	 */
 	WRITE_ONCE(dcp->typec_hpd_held, true);
 	ret = dptxport_set_hpd(service, false);
@@ -3414,7 +3436,7 @@ static void dcp_placeholder_edid_work(struct work_struct *work)
 	}
 	mutex_unlock(&dcp->hpd_mutex);
 
-	msleep(1000);
+	fsleep(DCP_PLACEHOLDER_HPD_LOW_US);
 
 	mutex_lock(&dcp->hpd_mutex);
 	if (!dcp->typec_cable_connected || !dcp->dptxport[0].connected ||

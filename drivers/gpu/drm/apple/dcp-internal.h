@@ -742,8 +742,10 @@ struct apple_dcp {
 	struct dcp_mode_state mode_state;
 	/* hotplug worker: power cycles since the mode was last valid */
 	unsigned int tunnel_power_cycles;
-	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
+	/* An HPD pulse was given after a placeholder EDID on this connection. */
 	bool placeholder_retried;
+	/* hpd_mutex: HPD pulses given on connection placeholder_generation */
+	u8 placeholder_pulses;
 	u64 typec_generation;	/* hpd_mutex: identifies the current connection */
 	/* hpd_mutex: Type-C display sessions released; see dcp_poweroff() */
 	u64 typec_unplugs;
