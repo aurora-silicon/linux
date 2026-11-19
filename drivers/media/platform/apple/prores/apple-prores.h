@@ -65,6 +65,21 @@
 /* Kept for the encode descriptor tests and callers. */
 #define APR_DESC_BYTES		APR_ENCODE_DESC_BYTES
 
+/*
+ * Jobs the driver keeps in the ring at once. The ring itself holds hundreds
+ * of descriptors; the limit bounds the buffers and runtime-PM references a
+ * timeout has to fail and the latency of a stream-off. Eight covers the
+ * decode gap to VideoToolbox (several frames outstanding) with slack for the
+ * scheduling delay between jobs.
+ */
+#define APR_MAX_INFLIGHT	8
+/*
+ * Encode stays at one job in the ring: every encode job uses the one shared
+ * statistics area, and nothing public shows that two encodes may overlap in
+ * it. Encode already runs at macOS speed with one job outstanding.
+ */
+#define APR_ENCODE_MAX_INFLIGHT	1
+
 #define APRI_T6041_FIRMWARE_NAME	"apple/prores-t6041-init.bin"
 #define APRI_T6041_FIRMWARE_SIZE	2728
 #define APRI_T6050_FIRMWARE_NAME	"apple/prores-t6050-init.bin"
@@ -218,6 +233,11 @@ static inline int apr_parse_t6041_init(const u8 *data, size_t size,
 	return apr_parse_init(&apri_t6041, data, size, init);
 }
 u32 apr_ring_advance(u32 ptr, u32 bytes, u32 ring_bytes);
+u32 apr_ring_distance(u32 from, u32 to, u32 ring_bytes);
+u32 apr_ring_free(u32 done, u32 head, u32 ring_bytes);
+bool apr_ring_passed(u32 done, u32 end, u32 tail, u32 ring_bytes);
+bool apr_ring_tail_valid(u32 done, u32 tail, u32 head, u32 ring_bytes);
+bool apr_jobs_full(unsigned int jobs, unsigned int encodes);
 void apr_ring_write(u8 *ring, u32 ring_bytes, u32 ptr, const u8 *desc,
 		    u32 desc_bytes);
 

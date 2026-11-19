@@ -700,6 +700,100 @@ static void apr_test_ring_accounting(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, ring, desc + 0x100, 0x80);
 }
 
+static void apr_test_ring_space(struct kunit *test)
+{
+	const u32 r = APR_RING_BYTES, g = APR_RING_GENERATION;
+
+	KUNIT_EXPECT_EQ(test, apr_ring_distance(0, 0x100, r), 0x100U);
+	KUNIT_EXPECT_EQ(test, apr_ring_distance(0x100, 0x100, r), 0U);
+	/* Across the end of the ring, in either generation. */
+	KUNIT_EXPECT_EQ(test, apr_ring_distance(r - 0x80, g | 0x80, r), 0x100U);
+	KUNIT_EXPECT_EQ(test, apr_ring_distance(g | (r - 0x80), 0x80, r), 0x100U);
+	/* Same offset, other generation: a whole ring apart. */
+	KUNIT_EXPECT_EQ(test, apr_ring_distance(0x100, g | 0x100, r), r);
+
+	KUNIT_EXPECT_EQ(test, apr_ring_free(0, 0, r), r);
+	KUNIT_EXPECT_EQ(test, apr_ring_free(0, 0x800, r), r - 0x800);
+	KUNIT_EXPECT_EQ(test, apr_ring_free(r - 0x80, g | 0x80, r), r - 0x100);
+	KUNIT_EXPECT_EQ(test, apr_ring_free(g | 0x100, 0x100, r), 0U);
+	/* The deepest ring the driver builds still has room. */
+	KUNIT_EXPECT_GT(test, apr_ring_free(0, APR_MAX_INFLIGHT *
+					    APR_ENCODE_DESC_BYTES, r),
+			(u32)APR_ENCODE_DESC_BYTES);
+}
+
+static void apr_test_ring_tail(struct kunit *test)
+{
+	const u32 r = APR_RING_BYTES, g = APR_RING_GENERATION;
+
+	KUNIT_EXPECT_TRUE(test, apr_ring_passed(0, 0x100, 0x100, r));
+	KUNIT_EXPECT_TRUE(test, apr_ring_passed(0, 0x100, 0x300, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_passed(0, 0x100, 0x80, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_passed(0, 0x100, 0, r));
+	KUNIT_EXPECT_TRUE(test, apr_ring_passed(r - 0x80, g | 0x80, g | 0x80, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_passed(r - 0x80, g | 0x80, r - 0x40, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_passed(g | (r - 0x80), 0x80, 0x40, r));
+	KUNIT_EXPECT_TRUE(test, apr_ring_passed(g | (r - 0x80), 0x80, 0x80, r));
+
+	KUNIT_EXPECT_TRUE(test, apr_ring_tail_valid(0x100, 0x100, 0x400, r));
+	KUNIT_EXPECT_TRUE(test, apr_ring_tail_valid(0x100, 0x400, 0x400, r));
+	KUNIT_EXPECT_TRUE(test, apr_ring_tail_valid(0x100, 0x280, 0x400, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_tail_valid(0x100, 0x500, 0x400, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_tail_valid(0x100, 0x80, 0x400, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_tail_valid(0x100, g | 0x200, 0x400, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_tail_valid(0, r, 0x400, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_tail_valid(0, BIT(25), 0x400, r));
+	KUNIT_EXPECT_TRUE(test, apr_ring_tail_valid(r - 0x80, g | 0x40, g | 0x80, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_tail_valid(r - 0x80, 0x40, g | 0x80, r));
+}
+
+static void apr_test_inflight(struct kunit *test)
+{
+	const u32 r = APR_RING_BYTES;
+	u32 ends[APR_MAX_INFLIGHT], done, head, tail;
+	unsigned int i, retired;
+
+	KUNIT_EXPECT_FALSE(test, apr_jobs_full(0, 0));
+	KUNIT_EXPECT_FALSE(test, apr_jobs_full(APR_MAX_INFLIGHT - 1, 0));
+	KUNIT_EXPECT_TRUE(test, apr_jobs_full(APR_MAX_INFLIGHT, 0));
+	/* Encode stays alone at the end of the ring. */
+	KUNIT_EXPECT_TRUE(test, apr_jobs_full(1, 1));
+	KUNIT_EXPECT_TRUE(test, apr_jobs_full(3, 1));
+
+	/* A full ring of decode jobs straddling the wrap, retired in order. */
+	done = r - 3 * APR_DECODE_DESC_BYTES - 0x80;
+	head = done;
+	for (i = 0; i < APR_MAX_INFLIGHT; i++) {
+		KUNIT_ASSERT_GT(test, apr_ring_free(done, head, r),
+				(u32)APR_DECODE_DESC_BYTES);
+		head = apr_ring_advance(head, APR_DECODE_DESC_BYTES, r);
+		ends[i] = head;
+	}
+	KUNIT_EXPECT_EQ(test, apr_ring_distance(done, head, r),
+			(u32)(APR_MAX_INFLIGHT * APR_DECODE_DESC_BYTES));
+	/* The tail stops inside the fifth descriptor: four jobs are done. */
+	tail = apr_ring_advance(ends[3], 0x40, r);
+	KUNIT_ASSERT_TRUE(test, apr_ring_tail_valid(done, tail, head, r));
+	for (retired = 0; retired < APR_MAX_INFLIGHT; retired++) {
+		if (!apr_ring_passed(done, ends[retired], tail, r))
+			break;
+		done = ends[retired];
+	}
+	KUNIT_EXPECT_EQ(test, retired, 4U);
+	KUNIT_EXPECT_EQ(test, done, ends[3]);
+	/* Then the engine drains the ring. */
+	tail = head;
+	KUNIT_ASSERT_TRUE(test, apr_ring_tail_valid(done, tail, head, r));
+	for (; retired < APR_MAX_INFLIGHT; retired++) {
+		if (!apr_ring_passed(done, ends[retired], tail, r))
+			break;
+		done = ends[retired];
+	}
+	KUNIT_EXPECT_EQ(test, retired, (unsigned int)APR_MAX_INFLIGHT);
+	KUNIT_EXPECT_EQ(test, done, head);
+	KUNIT_EXPECT_EQ(test, apr_ring_free(done, head, r), r);
+}
+
 static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_qmat_regs),
 	KUNIT_CASE(apr_test_dc_scale),
@@ -722,6 +816,9 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_parse_interlaced),
 	KUNIT_CASE(apr_test_parse_many_slices),
 	KUNIT_CASE(apr_test_ring_accounting),
+	KUNIT_CASE(apr_test_ring_space),
+	KUNIT_CASE(apr_test_ring_tail),
+	KUNIT_CASE(apr_test_inflight),
 	{}
 };
 
