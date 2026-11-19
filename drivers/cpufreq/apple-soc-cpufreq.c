@@ -209,6 +209,11 @@ struct apple_soc_cpufreq_info {
 	bool needs_thermal_owner;
 	bool needs_firmware_thermal_control;
 	u32 transition_timeout_us;
+	/*
+	 * Measured upper bound of a transition, which sets schedutil's rate
+	 * limit; 0 to derive a conservative one from the timeout.
+	 */
+	u32 transition_latency_us;
 	/* Highest P-state allowed without a thermal policy; 0 if not capped. */
 	u32 max_unmanaged_pstate;
 	u64 min_pstate;
@@ -342,11 +347,18 @@ static const struct apple_soc_cpufreq_info soc_t8132_info = {
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
 
-/* Command-state readback, not a measurement of the clock frequency. */
+/*
+ * Command-state readback, not a measurement of the clock frequency. Requests
+ * from the scheduler are verified lazily, as on T8140. A transition, timed on
+ * J775c through the userspace governor from 300 MHz to the fastest state and
+ * back, takes 12-75 us, at most about 100 us.
+ */
 static const struct apple_soc_cpufreq_info soc_t6050_info = {
 	.verify_transition = true,
+	.lazy_verify = true,
 	.needs_firmware_thermal_control = true,
 	.transition_timeout_us = 2000,
+	.transition_latency_us = 100,
 	.max_pstate = 31,
 	.ps1_mask = APPLE_DVFS_CMD_PS1,
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
@@ -1528,6 +1540,8 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	of_node_put(cluster);
 
 	transition_latency = dev_pm_opp_get_max_transition_latency(cpu_dev);
+	if (!transition_latency)
+		transition_latency = info->transition_latency_us * NSEC_PER_USEC;
 	if (!transition_latency) {
 		/* Conservative transaction bound, not a measured transition time. */
 		transition_latency = apple_soc_cpufreq_timeout(info) * NSEC_PER_USEC;
