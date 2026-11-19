@@ -48,6 +48,7 @@
 #include <linux/bits.h>
 #include <linux/bitfield.h>
 #include <linux/cpuhotplug.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/irqchip.h>
 #include <linux/irqchip/arm-vgic-info.h>
@@ -277,11 +278,7 @@ struct aic_info {
 	bool vm_timer_fiq_readonly;
 	/*
 	 * SIQ_CFG routing verified on hardware: at EL2, AICv2+ IRQs report the
-	 * CPUs that accept them as their effective affinity. The set grows as
-	 * CPUs start and IRQs keep the set they were given, which is enough
-	 * while only one CPU accepts IRQs. A SoC listed here with more than one
-	 * accepting CPU would also need those masks refreshed when such a CPU
-	 * comes online.
+	 * CPUs that accept them as their effective affinity.
 	 */
 	bool siq_cfg_routing;
 	/* A firmware-driven suspend powers the controller down: aic_syscore_ops keep it. */
@@ -1104,22 +1101,50 @@ static int aic_init_cpu(unsigned int cpu)
 		}
 	}
 
-	/*
-	 * Record whether the controller delivers IRQs to this CPU. SIQ_CFG is
-	 * read only on SoCs where its routing has been verified on hardware,
-	 * and only at EL2, since a hypervisor or secure monitor may trap it.
-	 */
-	if (aic_irqc->info.siq_cfg_routing && is_kernel_in_hyp_mode()) {
-		if (FIELD_GET(SIQ_CFG_ROUTE, read_sysreg_s(SYS_IMP_APL_SIQ_CFG_EL1)) ==
-		    SIQ_CFG_ROUTE_NONE)
-			cpumask_clear_cpu(cpu, &aic_irq_cpus);
-		else
-			cpumask_set_cpu(cpu, &aic_irq_cpus);
-	}
-
 	/* Initialize the local mask state */
 	__this_cpu_write(aic_fiq_unmasked, 0);
 
+	return 0;
+}
+
+/*
+ * Keep aic_irq_cpus to the online CPUs that accept IRQs. genirq takes an IRQ's
+ * effective affinity only when its affinity is set, so set it again on every
+ * requested IRQ when the set changes.
+ */
+static void aic_irq_cpus_update(unsigned int cpu, bool accepts)
+{
+	static struct cpumask aff;	/* CPU hotplug is serialized */
+	struct aic_irq_chip *ic = aic_irqc;
+	unsigned int die, i, virq;
+
+	if (accepts == cpumask_test_cpu(cpu, &aic_irq_cpus))
+		return;
+	assign_cpu(cpu, &aic_irq_cpus, accepts);
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < ic->nr_irq; i++) {
+			virq = irq_find_mapping(ic->hw_domain, AIC_IRQ_HWIRQ(die, i));
+			if (!virq || !irq_has_action(virq))
+				continue;
+			cpumask_copy(&aff, irq_get_affinity_mask(virq));
+			irq_set_affinity(virq, &aff);
+		}
+	}
+}
+
+/* Runs on @cpu, which reads its own SIQ_CFG */
+static int aic_irq_cpu_online(unsigned int cpu)
+{
+	aic_irq_cpus_update(cpu, FIELD_GET(SIQ_CFG_ROUTE,
+					   read_sysreg_s(SYS_IMP_APL_SIQ_CFG_EL1)) !=
+				 SIQ_CFG_ROUTE_NONE);
+	return 0;
+}
+
+static int aic_irq_cpu_offline(unsigned int cpu)
+{
+	aic_irq_cpus_update(cpu, false);
 	return 0;
 }
 
@@ -1448,6 +1473,16 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	cpuhp_setup_state(CPUHP_AP_IRQ_APPLE_AIC_STARTING,
 			  "irqchip/apple-aic/ipi:starting",
 			  aic_init_cpu, NULL);
+
+	/*
+	 * SIQ_CFG is read only on SoCs where its routing has been verified on
+	 * hardware, and only at EL2, since a hypervisor or secure monitor may
+	 * trap it.
+	 */
+	if (irqc->info.siq_cfg_routing && is_kernel_in_hyp_mode() &&
+	    cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "irqchip/apple-aic:siq-cfg",
+			      aic_irq_cpu_online, aic_irq_cpu_offline) < 0)
+		pr_warn("Cannot track the CPUs that accept IRQs\n");
 
 	aic_sleep_init(irqc);
 
