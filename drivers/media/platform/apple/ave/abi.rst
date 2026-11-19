@@ -27,11 +27,11 @@ retained codec-state partitions and per-slot HEVC slice-header tables. The
 session allocator provides distinct backing for every live bank and rejects
 non-16-KiB-aligned IOVAs.
 
-Streaming is enabled for one quality-first NV12 constant-quality session of
-8-bit H.264 (Baseline, Main or High) or HEVC Main, with up to one B picture per
-P picture, frame widths in whole macroblocks. Main 10, bit-rate modes, speed
-priority, standalone LRME and Reset remain unavailable and are refused. No
-Priority command is sent. Complete is the normal drain barrier; Flush is
+Streaming is enabled for up to two quality-first NV12 constant-quality sessions
+per firmware boot, each of 8-bit H.264 (Baseline, Main or High) or HEVC Main,
+with up to one B picture per P picture, frame widths in whole macroblocks.
+Main 10, bit-rate modes, speed priority, standalone LRME and Reset remain
+unavailable and are refused. No Priority command is sent. Complete is the normal drain barrier; Flush is
 reserved for cancellation before Stop and Close. KUnit checks the 1080p and 4K
 fields directly from the clean ledgers and embeds no Apple command image.
 
@@ -43,6 +43,12 @@ Start and encode. With boot device ID 20 and device type 17 both encoders boot
 and answer the handshake. The TEXT word at 0x423c holds the low 32 bits of
 DATA's device address on both encoders, and TEXT with that word cleared has
 CRC 0d56db87.
+
+Some 6070.11.1 settings were checked on T6021 (J475c) only. T6000 and T8112 run
+the same firmware version and get the same settings, untested:
+
+- Two sessions per boot. Four H.264 sessions, two on each encoder, ran in real
+  time for five minutes at their target rates; a fifth STREAMON got EBUSY.
 
 Lifecycle-only validation
 -------------------------
