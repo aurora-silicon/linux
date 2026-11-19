@@ -132,6 +132,11 @@ module_param(t8122_mcc, bool, 0600);
 MODULE_PARM_DESC(t8122_mcc,
 		 "J613 trial: step the memory controller down after the watchdog-control clear, as macOS");
 
+static bool t8122_macos_state;
+module_param(t8122_macos_state, bool, 0600);
+MODULE_PARM_DESC(t8122_macos_state,
+		 "J613 trial: at the commit, macOS's wake-source masks and its off state for ISP, I2C1-3, SPI2, QSPI, nub SPI0 and nub OCLA (the commit-dump diff)");
+
 static bool t8122_dump;
 module_param(t8122_dump, bool, 0600);
 MODULE_PARM_DESC(t8122_dump,
@@ -286,6 +291,39 @@ static struct {
 	bool mcc_ok;
 	void __iomem *dump_aon;
 } t8122;
+
+/*
+ * macOS's state at its commit where the Linux trial differed (commit-dump diff, d2 of
+ * 2026-11-19 against capture runs 31 and 49): the wake-source masks at +0x08..+0x20 almost all
+ * set where Linux left all zero, and these domains off where Linux had them on.
+ */
+static const u32 t8122_macos_wake_masks[] = {
+	0xffffeff7, 0xfff7ffff, 0xf877fbff, 0xffffd7ef, 0xf7ff7ffc, 0xfef7ffdf, 0x0006ffff,
+};
+static const u16 t8122_macos_ps_off[] = { 0x1e8, 0x238, 0x240, 0x248, 0x2a8, 0x2c8 };
+static const u16 t8122_macos_aon_off[] = { 0x80, 0x88 };
+
+static void t8122_macos_state_apply(struct apple_sleep *s)
+{
+	unsigned int i;
+
+	if (s->wake)
+		for (i = 0; i < ARRAY_SIZE(t8122_macos_wake_masks); i++)
+			writel(t8122_macos_wake_masks[i], s->wake + 0x08 + i * 4);
+	for (i = 0; i < ARRAY_SIZE(t8122_macos_ps_off); i++) {
+		u32 v = readl(s->ps + t8122_macos_ps_off[i]);
+
+		if (v & 0xf)
+			writel(v & ~0xfU, s->ps + t8122_macos_ps_off[i]);
+	}
+	if (t8122.dump_aon)
+		for (i = 0; i < ARRAY_SIZE(t8122_macos_aon_off); i++) {
+			u32 v = readl(t8122.dump_aon + t8122_macos_aon_off[i]);
+
+			if (v & 0xf)
+				writel(v & ~0xfU, t8122.dump_aon + t8122_macos_aon_off[i]);
+		}
+}
 
 /*
  * J613's memory-controller stop, as macOS ran it on both sleeps of run 52: CPU4, after the
@@ -659,7 +697,7 @@ static int t8122_sleep_map_regs(struct apple_sleep *s)
 		if (t8122.mcc_ok)
 			dev_info(s->dev, "J613 trial: memory controller stepped down before the gates\n");
 	}
-	if (t8122_dump) {
+	if (t8122_dump || t8122_macos_state) {
 		t8122.dump_aon = t8122_map(s, "ps-aon", NULL);
 		if (IS_ERR(t8122.dump_aon))
 			t8122.dump_aon = NULL;
@@ -1110,6 +1148,8 @@ static void t8122_sleep_commit_regs(struct apple_sleep *s)
 	/* The discriminator: a SoC that stays powered resets itself; one that slept may not. */
 	t8122_trial_wdt(s, true);
 	t8122_mcc_stop(s);
+	if (t8122_macos_state)
+		t8122_macos_state_apply(s);
 
 	writel(PWRGATE_ON, s->pwrgate + T8122_PWRGATE_E);
 	writel(PWRGATE_ON, s->pwrgate + T8122_PWRGATE_P);
