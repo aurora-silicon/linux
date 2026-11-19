@@ -4,7 +4,10 @@ T6000 APR a0 qualification
 =========================
 
 This port describes an encoder, not a decoder. T6000 enables APR0 and its
-DART in ``t6000.dtsi``; T6001 and T6002 keep theirs disabled.
+DART in ``t6000.dtsi``. T6001 (APR0, APR1) and T6002 (APR0-APR3, two per
+die) carry the same APR a0 block and enable every instance in ``t6001.dtsi``
+and ``t6002.dtsi``; the run below is the T6000 one, and the M1 Max/Ultra
+rows are listed under "Not yet covered".
 
 Status
 ------
@@ -20,7 +23,8 @@ Rate control matches macOS: with the per-profile budgets, frame sizes
 equal VideoToolbox's on the same input (measured against macOS on the
 T8140 engine), on easy, detailed and noisy clips at 1080p and 2160p.
 
-Not yet covered: cancellation, failed-reset retention (#925), system
+Not yet covered: an M1 Max (T6001) and M1 Ultra (T6002) run of the same
+rows on every instance, cancellation, failed-reset retention (#925), system
 suspend and the SCODEC performance request below.
 
 Implementation sources
