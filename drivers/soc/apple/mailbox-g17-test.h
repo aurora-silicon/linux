@@ -63,8 +63,10 @@ static void apple_g17_rx_util_min_test(struct kunit *test)
 		.rx_util_min = -1, .rx_util_min_applied = -1,
 	};
 
-	KUNIT_EXPECT_EQ(test, apple_mbox_set_rx_util_min(&mbox, 0), -EOPNOTSUPP);
+	/* A hard-IRQ receive handler has no thread to clamp, whatever the role. */
 	mbox.ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX;
+	KUNIT_EXPECT_EQ(test, apple_mbox_set_rx_util_min(&mbox, 0), -EOPNOTSUPP);
+	mbox.rx_threaded = true;
 	if (!IS_ENABLED(CONFIG_UCLAMP_TASK)) {
 		KUNIT_EXPECT_EQ(test, apple_mbox_set_rx_util_min(&mbox, 0), -EOPNOTSUPP);
 		kunit_skip(test, "needs CONFIG_UCLAMP_TASK");
