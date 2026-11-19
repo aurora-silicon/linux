@@ -223,12 +223,31 @@ def atc_mux_noop(source):
     return ''.join(atc_function(source, name) for name in ('atcphy_mux_in_mode', 'atcphy_mux_is_noop'))
 
 
+def atc_set_mode_prototypes(source):
+    """Prototypes atcphy_usb3_set_mode() needs ahead of the mux.
+
+    It moves a T8132 device role to USB2 through atcphy_mux_switch() and
+    atcphy_t8132_device_mode(), which atc_mux_without_pm() emits with the mux,
+    after the role functions in some fixtures.
+    """
+    if 'atcphy_t8132_device_mode(' not in block(source, 'static int atcphy_usb3_set_mode('):
+        return ''
+    return ('static enum atcphy_mode atcphy_t8132_device_mode(const struct apple_atcphy *atcphy,\n'
+            '\t\t\t\t\t\t enum atcphy_mode mode);\n'
+            'static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode target_mode);\n')
+
+
 def atc_mux_without_pm(source):
     """Lane/teardown fixtures omit USB PM, keeping mode mapping and lane work real.
 
     The PM fixtures replace only this adapter with the actual mux update/callback.
     """
     mapping = block(source, 'static enum atcphy_mode atcphy_typec_target_mode(')
+    # A T8132 device role keeps the lanes on USB2 (atcphy_t8132_device_mode()).
+    device_mode = atc_function(source, 'atcphy_t8132_device_mode')
+    if device_mode:
+        mapping = ('static enum atcphy_mode atcphy_t8132_device_mode(const struct apple_atcphy *atcphy,\n'
+                   '\t\t\t\t\t\t enum atcphy_mode mode);\n' + mapping + '\n' + device_mode)
     locked = block(source, 'static int atcphy_mux_set_locked(')
     if 'static int atcphy_mux_switch(' not in source:
         return mapping + '\n' + locked + r'''

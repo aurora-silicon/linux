@@ -3,7 +3,7 @@
 """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
 from pathlib import Path
 import re
-from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers, atc_cio_helpers
+from common import block, apple_function, atc_set_mode_prototypes, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers, atc_cio_helpers
 
 def disconnect(root):
     # Copyright 2026 Ryan Murray
@@ -781,6 +781,9 @@ typedef uint32_t u32; typedef uint64_t u64;
 #define fake_guard(x) ((void)(x))
 #define scoped_guard(x, y) for (int once = ((void)(y), 1); once; once = 0)
 #define dev_dbg(...) ((void)0)
+#ifndef dev_info
+#define dev_info(...) ((void)0)
+#endif
 #define dev_warn(...) ((void)0)
 #define dev_err(...) ((void)0)
 struct delayed_work { bool pending; };
@@ -1084,6 +1087,8 @@ def teardown(root):
         m = re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\([^;{}]*\)\s*\{', s, re.M)
         assert m, (n, name)
         result = block(s, m.start())
+        if n == 'atc' and name == 'atcphy_usb3_set_mode':
+            result = atc_set_mode_prototypes(s) + result
         return result
 
     decls = []
@@ -1795,6 +1800,9 @@ def vrr(root):
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define READ_ONCE(x) (x)
 #define dev_dbg(...) ((void)0)
+#ifndef dev_info
+#define dev_info(...) ((void)0)
+#endif
 struct apple_connector { bool connected; };
 /* The native T6030 14.7 backend is never selected in these scenarios. */
 enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5,

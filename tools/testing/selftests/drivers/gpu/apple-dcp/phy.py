@@ -3,7 +3,7 @@
 """Actual PHY parking, failure/retry, masked context and OFF controls."""
 from pathlib import Path
 import re
-from common import (block, source_defines, atc_mux_without_pm, ATC_POST_TUNABLE,
+from common import (block, source_defines, atc_mux_without_pm, atc_set_mode_prototypes, ATC_POST_TUNABLE,
                     atc_function, ATC_SPLIT, ATC_T8103_LIVE, atc_restore_helpers, atc_common_state_helpers,
                     atc_cio_helpers)
 
@@ -16,6 +16,9 @@ def parking(root):
     def function(source, name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
             return atc_mux_without_pm(source)
+        if name == 'atcphy_usb3_set_mode':
+            return atc_set_mode_prototypes(source) + block(source, re.search(
+                r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
         if name in ATC_SPLIT + ATC_T8103_LIVE:
             return atc_function(source, name)
         return block(source, re.search(r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
@@ -34,7 +37,7 @@ def parking(root):
     parts.append(r'''
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt, t8132_device;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
@@ -224,6 +227,9 @@ typedef uint16_t u16;
 #define hweight32(v) __builtin_popcount(v)
 #define dev_info_once(...) ((void)0)
 #define dev_dbg(...) ((void)0)
+#ifndef dev_info
+#define dev_info(...) ((void)0)
+#endif
 #define dev_warn(...) ((void)0)
 static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define dev_err report
@@ -1901,6 +1907,9 @@ static void record_debug(const char *format, ...)
 }
 #undef dev_dbg
 #define dev_dbg(dev, format, ...) record_debug(format, ##__VA_ARGS__)
+#ifndef dev_info
+#define dev_info(...) ((void)0)
+#endif
 '''
     return ns["prefix"] + logger + "#define PROPOSAL\n" + production + ns["suffix"].replace("int main(", "int original_fixture_main(", 1) + controls
 
@@ -1923,6 +1932,9 @@ def pipe(root):
     def function(name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
             return atc_mux_without_pm(source)
+        if name == 'atcphy_usb3_set_mode':
+            return atc_set_mode_prototypes(source) + block(re.search(
+                r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
         if name in ATC_SPLIT + ATC_T8103_LIVE:
             return atc_function(source, name)
         return block(re.search(r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
@@ -1936,7 +1948,7 @@ def pipe(root):
     parts.append(r'''
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt, t8132_device;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
@@ -2047,6 +2059,9 @@ typedef uint16_t u16;
 #define FIELD_GET(m, v) (((v) & (m)) >> __builtin_ctz(m))
 #define field_prep FIELD_PREP
 #define dev_dbg(...) ((void)0)
+#ifndef dev_info
+#define dev_info(...) ((void)0)
+#endif
 #define dev_warn(...) ((void)0)
 #define dev_err(...) ((void)0)
 #define lockdep_assert_held(...) ((void)0)
@@ -2320,6 +2335,9 @@ def unwind(root):
     def function(source, name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
             return atc_mux_without_pm(source)
+        if name == 'atcphy_usb3_set_mode':
+            return atc_set_mode_prototypes(source) + block(source, re.search(
+                r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
         if name in ATC_SPLIT + ATC_T8103_LIVE:
             return atc_function(source, name)
         return block(source, re.search(r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
@@ -2336,7 +2354,7 @@ def unwind(root):
     parts.append(r'''
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt, t8132_device;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
@@ -2467,6 +2485,9 @@ typedef uint16_t u16;
 #define hweight32(v) __builtin_popcount(v)
 #define dev_info_once(...) ((void)0)
 #define dev_dbg(...) ((void)0)
+#ifndef dev_info
+#define dev_info(...) ((void)0)
+#endif
 #define dev_warn(...) ((void)0)
 static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define dev_err report
@@ -2661,7 +2682,7 @@ typedef uint32_t u32;
 #define BIT(n) (1U << (n))
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt, t8132_device;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
