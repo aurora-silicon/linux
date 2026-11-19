@@ -673,6 +673,11 @@ int ave_sess_free_slot(struct ave_session *sess);
 void ave_sess_reply(struct ave_dev *ave, const struct ave_reply *reply);
 int ave_sess_input(struct ave_ctx *ctx, unsigned int slot,
 		   struct vb2_v4l2_buffer *src, dma_addr_t *input);
+/* Add VUI timing to the SPS at the start of an Annex B buffer. */
+void ave_h264_stamp_timing(u8 *buf, size_t room, size_t *len, u32 fps_num,
+			   u32 fps_den);
+void ave_hevc_stamp_timing(u8 *buf, size_t room, size_t *len, u32 fps_num,
+			   u32 fps_den);
 int ave_sess_output(struct ave_ctx *ctx, unsigned int slot,
 		    struct vb2_v4l2_buffer *dst, bool *keyframe);
 void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot);

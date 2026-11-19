@@ -78,6 +78,20 @@ the same firmware version and get the same settings, untested:
   measured this way; submitting frames ahead without B pictures was not
   measured on 6070.11.1.
 
+6070 firmware writes the parameter sets to a buffer of their own. On T6021 the
+SPS there had no VUI timing, and with B pictures off no VUI at all, so a raw
+Annex B reader guessed 25 fps. The driver adds timing to an SPS from that buffer
+that has none, from the client's timeperframe exactly, not from the integer
+rate the firmware gets: H.264 num_units_in_tick the denominator and time_scale
+twice the numerator, with fixed_frame_rate_flag; HEVC vui_num_units_in_tick the
+denominator and vui_time_scale the numerator. The rate is taken in lowest
+terms, so 30/1 gives 1 and 60 (H.264) or 1 and 30 (HEVC), and 30000/1001 gives
+1001 and 60000 or 1001 and 30000. ffprobe on a raw H.264 stream prints the
+field rate (60/1 at 30 fps, 60000/1001 at 30000/1001; an MP4 mux reports
+30/1 and 30000/1001). When twice the numerator does not fit 32 bits, an even
+denominator is halved instead; otherwise the SPS is left as written. An SPS
+that has timing, or that the walk cannot follow, is left as written.
+
 Lifecycle-only validation
 -------------------------
 
