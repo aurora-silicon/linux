@@ -224,7 +224,8 @@ pub mod g16 {
         aliases.push((0x1000000000,0x1000010000)); // Per-VM context store.
         aliases.sort();for a in aliases.windows(2){assert!(a[0].1<=a[1].0,"overlap {:x?} {:x?}",a[0],a[1]);}
         for (k,s) in arena.compute.compute.iter().enumerate(){assert_eq!(s.work.lower_gva.unwrap()&0x3fff,0);assert_eq!(s.work.size,0x2000);assert_eq!(s.pool.size,0x2000000);assert_eq!(s.pool_state.size,0x20000);assert_eq!(s.page_list.size,0x4000);assert_eq!(s.context_store.size,0x40000);assert_eq!(s.pool_state.r32(0).unwrap()as u64 |((s.pool_state.r32(4).unwrap()as u64)<<32),s.pool.gva.unwrap());assert_eq!(pools.allocator_refs_for(k).unwrap().parameter_id,k as u32);}
-        assert_eq!(aliases.len(),43);
+        // One PB heap per VM, shared by both render allocators.
+        assert_eq!(aliases.len(),42);
     }
     #[test]fn work_has_kernel_lower_alias_without_application_alias(){
         let mut o=Objects::new();let slots=Slots::new().unwrap();let arena=arenas(&mut o);

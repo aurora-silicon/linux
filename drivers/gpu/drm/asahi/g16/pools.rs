@@ -2,7 +2,9 @@
 
 //! Private render UMA/heap backing and device-wide PB-slot leases.
 //!
-//! Each VM keeps two persistent UMA/heap units. With `g16_pb_reuse` (the default), a render
+//! Each VM keeps two persistent UMA units and one PB heap they share: a render is published
+//! only while no other command is in flight and retires with its blocks returned, so the two
+//! pass slots' PB managers never hand out heap blocks at the same time. With `g16_pb_reuse` (the default), a render
 //! reuses its pass slot's lease, its VM's last successfully retired epoch of the slot, while
 //! the slot is still bound to it, unchanged (the host writes nothing to it, no InitBM).
 //! Otherwise it installs a fresh PB manager with full InitBM and never reinitializes exposed
@@ -129,7 +131,7 @@ fn write_records<const N: usize>(
     Ok(())
 }
 impl Allocator {
-    fn new(o: &mut Objects, k: u64) -> Result<Self> {
+    fn new(o: &mut Objects, k: u64, heap: &Arc<FwObject>) -> Result<Self> {
         let base = client::render_base(k);
         let nc = |va| Some((va, pte::LEAF_NC));
         // Native UMA software metadata is ASC-owned and never needs a client GPU alias.
@@ -153,13 +155,7 @@ impl Allocator {
         let state = alloc(o, 0x20000, Class::Shared, nc(client::render_state(k)), true)?;
         let list = alloc(o, 0x4000, Class::Shared, nc(client::render_list(k)), true)?;
         let submitted = alloc(o, 0x40, Class::Fw, None, true)?;
-        let heap = alloc(
-            o,
-            client::PB_HEAP_SIZE as usize,
-            Class::Shared,
-            nc(client::pb_heap(k)),
-            false,
-        )?;
+        let heap = heap.clone();
         let scene_list = alloc(
             o,
             buffer::SCENE_LIST_SIZE,
@@ -220,9 +216,16 @@ impl Allocator {
 }
 impl PoolSet {
     pub(crate) fn new(o: &mut Objects) -> Result<Self> {
+        let heap = alloc(
+            o,
+            client::PB_HEAP_SIZE as usize,
+            Class::Shared,
+            Some((client::pb_heap(0), pte::LEAF_NC)),
+            false,
+        )?;
         let mut units = KVec::with_capacity(2, GFP_KERNEL)?;
         for k in 0..2 {
-            units.push(Allocator::new(o, k)?, GFP_KERNEL)?;
+            units.push(Allocator::new(o, k, &heap)?, GFP_KERNEL)?;
         }
         Ok(Self { units })
     }
