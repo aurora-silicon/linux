@@ -205,7 +205,7 @@ bool dcp_fabric_fits(const struct dcp_fabric_pipeline *pipeline,
 		     const struct dcp_fabric_policy *policy, u32 mask,
 		     bool connector_present);
 bool dcp_fabric_keep_order(bool dual_stream, bool ready, bool frozen);
-bool dcp_fabric_ordered_dual_stream(bool wired, bool t6030);
+bool dcp_fabric_ordered_dual_stream(bool wired, bool pinned);
 bool dcp_fabric_waiting(const struct dcp_fabric_port *port);
 bool dcp_fabric_movable(const struct dcp_fabric_route *owner,
 			const struct dcp_fabric_route *target);

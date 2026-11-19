@@ -293,6 +293,13 @@ struct apple_dcp_hw_data {
 	 */
 	bool t6030_fabric;
 	/*
+	 * The external processors behind this display fabric are
+	 * interchangeable: a dual-stream route stays with the processor that
+	 * owns it, on any DP IN, and no ordering pass pairs streams with
+	 * pipelines (T6030, T6050), see dcp_typec_ordered_dual_stream().
+	 */
+	bool pinned_dual_stream;
+	/*
 	 * A processor Linux starts itself on 14.7 firmware through the IOMFB
 	 * template whose AFK, DPTX and DPAV endpoints speak the 14.7 protocol
 	 * (the T8122 dcpext), see dcp_fw_is_14_7().

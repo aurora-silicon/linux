@@ -141,8 +141,15 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
         'static bool dcp_hdmi_settle_enabled(struct apple_dcp *dcp)\n{',
         'static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *dcp)\n{') if marker in dcp)
     if 'bool dcp_typec_ordered_dual_stream(void)\n{' in dcp:
-        # These scenarios are an M1/M2 Type-C port, never the native T6030 or T6050 machine.
-        available='''static bool of_machine_is_compatible(const char *compat) { assert(!strcmp(compat,"apple,t6030")||!strcmp(compat,"apple,t6050"));return false; }
+        # These scenarios are an M1/M2 Type-C port: no processor with pinned
+        # dual-stream routes (T6030, T6050) has registered.
+        available='''static bool dcp_pinned_dual_stream;
+    #ifndef READ_ONCE
+    #define READ_ONCE(x) (x)
+    #endif
+    #ifndef smp_rmb
+    #define smp_rmb() ((void)0)
+    #endif
     '''+available
     # Route-follow: the fixed output, or a failed T6030 external processor, keeps the route busy.
     available+=apple_function(ROOT,'dcp_typec_route_busy')
