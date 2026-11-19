@@ -3,6 +3,7 @@
  * T6040 (M4 Pro) suspend to RAM. Included by sleep.c after the T6050 part, as that one is.
  * See the profile at the end for what it matches and when it refuses.
  */
+#include <linux/mfd/macsmc.h>
 #include <linux/mfd/syscon.h>
 #include <linux/regmap.h>
 
@@ -2116,6 +2117,25 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 	return 0;
 }
 
+/* The VDD_CIO rail request (SMC key pmVC), written in each .begin. */
+static void t6040_sleep_pmvc(struct t6040_sleep *s)
+{
+	struct platform_device *pdev;
+	struct device_node *np;
+	struct apple_smc *smc;
+
+	np = of_find_matching_node(NULL, t6040_smc_match);
+	pdev = np ? of_find_device_by_node(np) : NULL;
+	of_node_put(np);
+	smc = pdev ? platform_get_drvdata(pdev) : NULL;
+	if (smc)
+		apple_smc_request_pmvc(smc);
+	else
+		dev_warn(s->dev, "pmVC: no SMC to write to\n");
+	if (pdev)
+		put_device(&pdev->dev);
+}
+
 /* Before device suspend: the AOP islands as they are, the DCS power words to automatic mode. */
 static int t6040_sleep_begin(struct apple_sleep *c)
 {
@@ -2126,6 +2146,7 @@ static int t6040_sleep_begin(struct apple_sleep *c)
 	s->gp_saved[0] = false;
 	s->gp_saved[1] = false;
 	t6040_aop_ps_save(s);
+	t6040_sleep_pmvc(s);
 	t6040_dcs_dyn_pg(s);
 	timeouts = t6040_dcs_ps_auto_on(s);
 	if (timeouts)

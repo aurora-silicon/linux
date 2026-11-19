@@ -839,6 +839,34 @@ static void apple_smc_write_mbse(struct apple_smc *smc, smc_key value)
 		dev_err(smc->dev, "Failed to issue MBSE = %p4ch: %d\n", &value, ret);
 }
 
+/*
+ * SMC key pmVC, the request for the VDD_CIO rail: the enable mask | 0x100 (0x101 on the T6040's
+ * J616s). Linux never asks for the rail, which is power-gated otherwise (ADT vdd-cio-rail-pg), and
+ * a rail the SMC drops during the sleep transition races the sleep engine's hand-over of the ATC
+ * ports.
+ */
+#define SMC_PMVC_REQUEST	0x101
+
+/**
+ * apple_smc_request_pmvc() - ask the SMC to keep the VDD_CIO rail up
+ * @smc: the SMC
+ *
+ * Writes pmVC at the moment the caller picks, for a sleep controller that issues it ahead of
+ * the device suspend phase.
+ *
+ * Return: 0 on success, a negative errno otherwise.
+ */
+int apple_smc_request_pmvc(struct apple_smc *smc)
+{
+	int ret;
+
+	ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), SMC_PMVC_REQUEST);
+	if (ret < 0)
+		dev_warn(smc->dev, "pmVC: write %#x failed: %d\n", SMC_PMVC_REQUEST, ret);
+	return ret;
+}
+EXPORT_SYMBOL(apple_smc_request_pmvc);
+
 static void apple_smc_sleep_warn(struct apple_smc *smc)
 {
 	apple_smc_write_mbse(smc, SMC_KEY(slpw));
