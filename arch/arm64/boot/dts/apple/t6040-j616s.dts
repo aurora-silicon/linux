@@ -40,6 +40,11 @@
 	};
 };
 
+/* The 16-inch chassis has High Power mode */
+&clpc {
+	apple,high-power-mode;
+};
+
 /*
  * ADT /arm-io/aon-ptd ptd_data_table: the battery record ("IFtb", layout 1,
  * slots 0x12-0x15). Only its peek aperture is read.

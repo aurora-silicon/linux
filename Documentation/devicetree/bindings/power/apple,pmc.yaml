@@ -269,6 +269,13 @@ patternProperties:
           holds the CPU clusters to, and which the performance profile tells
           about High Power mode on Macs that have it.
 
+      apple,high-power-mode:
+        type: boolean
+        description:
+          The machine has High Power mode, the fan and power headroom macOS
+          offers on some MacBook Pros. The performance platform profile then
+          tells the SMC (apple,smc) that it is on.
+
     required:
       - compatible
       - reg

@@ -110,11 +110,6 @@ enum apple_clpc_rail {
  *	sharing this CLPC without it get no low-power profile. NULL for any
  * @low_power_mw: package power (the SMC's PHPC key) the low-power profile
  *	holds the CPU clusters to; 0 for none
- * @high_power_machine: the machine compatible on which the performance
- *	profile tells the SMC that macOS's High Power mode is on (the zETM
- *	record below); NULL for none. A machine with High Power mode and no
- *	low-power ceiling still gets the platform profile, named "apple-smc"
- *	so that userspace keeps its own low-power CPU budget
  */
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
@@ -135,7 +130,6 @@ struct apple_clpc_hw {
 	unsigned int low_power_khz;
 	const char *low_power_machine;
 	unsigned int low_power_mw;
-	const char *high_power_machine;
 };
 
 struct apple_clpc_cluster {
@@ -1497,8 +1491,14 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->power_next = jiffies;
 	if (!clpc->hw->low_power_machine || of_machine_is_compatible(clpc->hw->low_power_machine))
 		clpc->low_power_khz = clpc->hw->low_power_khz;
-	high_power = clpc->hw->high_power_machine &&
-		     of_machine_is_compatible(clpc->hw->high_power_machine);
+	/*
+	 * The board DT says whether the machine has High Power mode: then the
+	 * performance profile tells the SMC that it is on (the zETM record).
+	 * A machine with High Power mode and no low-power ceiling still gets
+	 * the platform profile, named "apple-smc" so that userspace keeps its
+	 * own low-power CPU budget.
+	 */
+	high_power = of_property_read_bool(dev->of_node, "apple,high-power-mode");
 	if ((clpc->low_power_khz || high_power) && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
 		/* The SMC is optional: without it the low-power profile has only its ceiling. */
 		clpc->smc_np = of_parse_phandle(dev->of_node, "apple,smc", 0);
@@ -1670,13 +1670,6 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	 */
 	.low_power_khz = 2808000,
 	.low_power_machine = "apple,t6041",
-	/*
-	 * The 16-inch M4 Pro has High Power mode. Under a 300 s CPU and GPU
-	 * load on macOS 27 its fans peak at 3800 rpm in Automatic and at
-	 * 5850 rpm in High Power, with the same clocks; the extra cooling buys
-	 * 4-5% sustained throughput. The record is the J714s one.
-	 */
-	.high_power_machine = "apple,j616s",
 };
 
 /*
@@ -2052,8 +2045,6 @@ static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
 	.idle_on_time = true,
 	.low_power_khz = 2808000,
 	.low_power_mw = 15000,
-	/* High Power mode's record, as macOS 27.0 writes it on the 14-inch M5 Pro */
-	.high_power_machine = "apple,j714s",
 };
 
 static const struct of_device_id apple_clpc_of_match[] = {
