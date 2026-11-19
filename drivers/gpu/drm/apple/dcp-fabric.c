@@ -245,6 +245,19 @@ bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
 }
 
 /*
+ * A T6030 display processor, from its compatible's match data. Its outputs go
+ * through the T6030 display crossbars (apple,t6030-display-crossbar): there a
+ * selected output is only routed until its link is brought up, which starts
+ * its clocks, and only external sources 0 and 2 feed the ATC tunnel pixel
+ * clocks (dcp_fabric_t6030_pclk()). The T6031 and T6034 processors have
+ * their own compatibles and keep the default flow.
+ */
+bool dcp_is_t6030_fabric(const struct apple_dcp *dcp)
+{
+	return dcp->hw.t6030_fabric;
+}
+
+/*
  * DP IN outputs (bits 0/1) whose tunnel pixel clock source @route cannot be:
  * T6030 even sources only, T8132 its dcpexts (2 and 4), others any.
  */
@@ -253,7 +266,7 @@ static u8 dcp_route_tunnel_clock_blocked(const struct apple_dcp_typec_route *rou
 	if (dcp_is_t8132_ext(route->dcp))
 		return (apple_dp_tunnel_t8132_pclk(route->mux_index, 0) < 0 ? BIT(0) : 0) |
 		       (apple_dp_tunnel_t8132_pclk(route->mux_index, 1) < 0 ? BIT(1) : 0);
-	return dcp_fabric_tunnel_clock_blocked(of_machine_is_compatible("apple,t6030"),
+	return dcp_fabric_tunnel_clock_blocked(dcp_is_t6030_fabric(route->dcp),
 					       route->mux_index);
 }
 
@@ -481,7 +494,7 @@ static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
 	}
 
 	/* A T8132 dcpext names its source (2 or 4), as T6030 does. */
-	if (of_machine_is_compatible("apple,t6030") || t8132) {
+	if (dcp_is_t6030_fabric(route->dcp) || t8132) {
 		typeof(apple_atc_dp_tunnel_rate_source) *fn;
 
 		if (t8132 ? apple_dp_tunnel_t8132_pclk(route->mux_index, dpin) < 0 :
@@ -2619,7 +2632,7 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 	 * On T6030, a T8132 dcpext and the selected native26 pipeline,
 	 * selecting a crossbar output only routes it; link-up enables clocks.
 	 */
-	if (!of_machine_is_compatible("apple,t6030") &&
+	if (!dcp_is_t6030_fabric(dcp) &&
 	    !dcp_is_t8132_ext(dcp) && !dcp_is_ext26(dcp))
 		return 0;
 	guard(mutex)(&dcp->tb_lock);
@@ -2697,7 +2710,7 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 		}
 		return ret;
 	}
-	if (of_machine_is_compatible("apple,t6030") &&
+	if (dcp_is_t6030_fabric(dcp) &&
 	    (unit || dcp->dptx_dfp_port != 1 + route->tunnel_dpin ||
 	     apple_dp_tunnel_t6030_pclk(route->mux_index,
 				      route->tunnel_dpin) < 0))
