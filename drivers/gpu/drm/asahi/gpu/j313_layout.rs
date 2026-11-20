@@ -61,6 +61,16 @@ pub(crate) fn dump_layouts(dev: &kernel::device::Device) {
     dump!(dev, m::FinalizeComputeG14V13_5<'static>, [header, stats, work_queue, vm_slot, job_params2,
         unk_24, uuid, fw_stamp, stamp_value, unk_38, unk_58, restart_branch_offset, has_attachments,
         unk_64, unk_flag, unk_79]);
+    {
+        use fw::buffer::raw as b;
+        dump!(dev, b::SceneG13V13_5<'static>, [pass_page_count, unk_4, unk_8, unk_10, user_buffer,
+            unk_20, unk_28, stats, total_page_count, unk_30, unk_38]);
+        dump!(dev, b::InfoG13V13_5<'static>, [gpu_counter, unk_4, last_id, cur_id, unk_10,
+            gpu_counter2, unk_18, page_list, page_list_size, page_count, max_blocks, block_count,
+            unk_38, block_list, block_ctl, last_page, gpu_page_ptr1, gpu_page_ptr2, unk_58,
+            block_size, unk_60, counter, unk_70, unk_74, unk_78, unk_7c, unk_80, max_pages,
+            max_pages_nomemless, unk_8c, unk_90]);
+    }
     dev_info!(dev, "LAYOUT sizes vtx.jp1={:#x} vtx.tiling={:#x} vtx.jp2={:#x} frag.jp1={:#x} frag.jp2={:#x} frag.jp3={:#x} comp.jp1={:#x} comp.jp2={:#x}\n",
         size_of::<v::JobParameters1G13V13_5<'static>>(), size_of::<v::TilingParameters>(),
         size_of::<v::JobParameters2<'static>>(), size_of::<f::JobParameters1G13V13_5<'static>>(),

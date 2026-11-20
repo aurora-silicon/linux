@@ -2278,3 +2278,151 @@ impl G13TrialRoot {
         )
     }
 }
+
+/// A work queue for render commands (tiler or fragment engine), laid out as the trial queue is.
+/// Its commands are published on the submission ring of the trial queue's priority group.
+pub(crate) struct J313Ring {
+    queue: fw::types::GpuArray<u8>,
+    positions: fw::types::GpuArray<u8>,
+    pointers: fw::types::GpuArray<u8>,
+    _scheduler: fw::types::GpuArray<u8>,
+    _timestamps: fw::types::GpuArray<u8>,
+    pub(crate) event: event::Event,
+    /// Data master: 0 tiler, 1 fragment.
+    pub(crate) engine: u32,
+}
+
+impl J313Ring {
+    pub(crate) fn new(alloc: &mut KernelAllocators, event: event::Event, engine: u32) -> Result<Self> {
+        if engine > 1 { return Err(EINVAL); }
+        let mut queue = alloc.private.array_empty::<u8>(0x2cc0)?;
+        let mut positions = alloc.shared.array_empty::<u8>(0x2860)?;
+        let pointers = alloc.private.array_empty::<u8>(0x2860)?;
+        let mut scheduler = alloc.private.array_empty::<u8>(0x40)?;
+        let mut timestamps = alloc.shared.array_empty::<u8>(0x18)?;
+        let timestamp_va = timestamps.gpu_va().get();
+        timestamps.as_mut_slice()[8..16].copy_from_slice(&timestamp_va.to_le_bytes());
+        let ctx = scheduler.as_mut_slice();
+        ctx[..2].copy_from_slice(&u16::MAX.to_le_bytes());
+        ctx[5] = 1;
+        ctx[0x27] = 0xff;
+        let task = crate::module_parameters::t8112_task_configuration.value();
+        if task != 0 { ctx[0x26] = (task - 1) as u8; }
+        let queue_va = queue.gpu_va().get();
+        let q = queue.as_mut_slice();
+        for (offset, value) in [(0, positions.gpu_va().get()), (8, pointers.gpu_va().get()),
+                                (0x10, timestamp_va), (0x18, queue_va + 0x90),
+                                (0x7c, scheduler.gpu_va().get())] {
+            q[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        for offset in [0x2c, 0x48, 0x4c, 0x50] {
+            q[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        q[0x30..0x34].copy_from_slice(&4u32.to_le_bytes());
+        q[0x4c..0x50].copy_from_slice(&crate::module_parameters::t8112_queue_owner.value().to_le_bytes());
+        if let row @ 0..=3 = crate::module_parameters::t8112_priority_row.value() {
+            let legacy = crate::fw::workqueue::raw::PRIORITY[row as usize];
+            q[0x30..0x34].copy_from_slice(&legacy.0.to_le_bytes());
+            q[0x34..0x38].copy_from_slice(&legacy.1.to_le_bytes());
+            q[0x38..0x40].copy_from_slice(&legacy.2.0.to_le_bytes());
+            q[0x40..0x44].copy_from_slice(&legacy.3.to_le_bytes());
+            q[0x44..0x48].copy_from_slice(&legacy.4.to_le_bytes());
+            q[0x48..0x4c].copy_from_slice(&legacy.5.to_le_bytes());
+        }
+        match crate::module_parameters::t8112_queue_lane.value() {
+            0 => {}
+            1 => q[0x48..0x4c].copy_from_slice(&u32::MAX.to_le_bytes()),
+            lane => q[0x48..0x4c].copy_from_slice(&(lane - 2).to_le_bytes()),
+        }
+        positions.as_mut_slice()[0x50..0x54]
+            .copy_from_slice(&crate::module_parameters::t8112_queue_capacity.value().to_le_bytes());
+        for owner in [&queue, &positions, &pointers, &scheduler, &timestamps] {
+            crate::pgtable::clean_poc(owner.as_slice().as_ptr(), owner.as_slice().len());
+        }
+        crate::pgtable::poc_barrier();
+        Ok(Self { queue, positions, pointers, _scheduler: scheduler, _timestamps: timestamps, event, engine })
+    }
+
+    pub(crate) fn va(&self) -> u64 { self.queue.gpu_va().get() }
+
+    pub(crate) fn capacity(&self) -> Result<u32> {
+        Ok(self.positions.shared_index(0x50)?.load(Ordering::Acquire))
+    }
+
+    /// Queue head (host) and the firmware's retired position.
+    pub(crate) fn progress(&self) -> Result<(u32, u32)> {
+        crate::pgtable::clean_invalidate_poc(self.positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::poc_barrier();
+        Ok((self.positions.shared_index(0x40)?.load(Ordering::Acquire),
+            self.positions.shared_index(0)?.load(Ordering::Acquire)))
+    }
+
+    /// Logs the queue's position block and its work record for `ordinal`.
+    pub(crate) fn dump(&self, dev: &kernel::device::Device, ordinal: u32) {
+        let w = |a: &fw::types::GpuArray<u8>, at: usize| a.shared_index(at).map(|x| x.load(Ordering::Acquire)).unwrap_or(u32::MAX);
+        crate::pgtable::clean_invalidate_poc(self.positions.as_slice().as_ptr(), 0x60);
+        let at = 0x90 + (ordinal as usize & 0x7f) * 0x58;
+        crate::pgtable::clean_invalidate_poc(self.queue.as_slice()[at..].as_ptr(), 0x58);
+        crate::pgtable::clean_invalidate_poc(self.queue.as_slice().as_ptr(), 0x90);
+        crate::pgtable::poc_barrier();
+        let pos: [u32; 24] = core::array::from_fn(|i| w(&self.positions, 4 * i));
+        let head: [u32; 36] = core::array::from_fn(|i| w(&self.queue, 4 * i));
+        let rec: [u32; 22] = core::array::from_fn(|i| w(&self.queue, at + 4 * i));
+        dev_info!(dev, "J313 ring{} positions={:x?}\n", self.engine, pos);
+        dev_info!(dev, "J313 ring{} info={:x?}\n", self.engine, head);
+        dev_info!(dev, "J313 ring{} record {} = {:x?}\n", self.engine, ordinal & 0x7f, rec);
+    }
+}
+
+impl G13TrialRoot {
+    /// Firmware VAs of the tiler, fragment and compute statistics objects (directory +0x254,
+    /// +0x25c, +0x264).
+    pub(crate) fn j313_engine_stats(&self) -> Result<[u64; 3]> {
+        let d = self.directory.as_ref().ok_or(EINVAL)?.as_slice();
+        let read = |at: usize| u64::from_le_bytes(d[at..at + 8].try_into().unwrap_or([0; 8]));
+        let stats = [read(0x254), read(0x25c), read(0x264)];
+        if stats.iter().any(|v| *v == 0) { return Err(EINVAL); }
+        Ok(stats)
+    }
+
+    /// Publishes `command` as `ring`'s next command: pointer, queue head, then the submission
+    /// entry on the ring of the trial queue's priority group and `ring`'s engine.
+    pub(crate) fn j313_ring_publish(&self, ring: &J313Ring, command: u64) -> Result<u32> {
+        let head = ring.positions.shared_index(0x40)?;
+        let old = head.load(Ordering::Acquire);
+        let capacity = ring.capacity()?;
+        if capacity == 0 || (old % capacity) as usize * 8 + 8 > ring.pointers.as_slice().len() { return Err(EINVAL); }
+        let at = (old % capacity) as usize * 8;
+        ring.pointers.shared_index(at)?.store(command as u32, Ordering::Relaxed);
+        ring.pointers.shared_index(at + 4)?.store((command >> 32) as u32, Ordering::Relaxed);
+        crate::pgtable::clean_poc(ring.pointers.as_slice()[at..].as_ptr(), 8);
+        crate::pgtable::poc_barrier();
+        let new = (old + 1) % capacity;
+        head.store(new, Ordering::Release);
+        crate::pgtable::clean_poc(ring.positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::poc_barrier();
+        let index = 3 * Self::signal_group() + ring.engine as usize;
+        let state = &self._channels[2 * index];
+        let channel = &self._channels[2 * index + 1];
+        let w = state.shared_index(0x20)?.load(Ordering::Acquire);
+        if w >= crate::m3::m3_channel_format::SLOTS { return Err(EIO); }
+        let slot = u8::try_from(ring.event.slot()).map_err(|_| EINVAL)?;
+        let entry = crate::m3::submission_entry(ring.engine, ring.va(),
+            u16::try_from(new).map_err(|_| EINVAL)?, slot, false).map_err(|_| EINVAL)?;
+        let base = w as usize * entry.len();
+        for (k, word) in entry.chunks(4).enumerate() {
+            channel.shared_index(base + 4 * k)?.store(u32::from_le_bytes([word[0], word[1], word[2], word[3]]), Ordering::Relaxed);
+        }
+        crate::pgtable::clean_poc(channel.as_slice()[base..].as_ptr(), entry.len());
+        crate::pgtable::poc_barrier();
+        state.shared_index(0x20)?.store((w + 1) % crate::m3::m3_channel_format::SLOTS, Ordering::Release);
+        crate::pgtable::clean_poc(state.as_slice().as_ptr(), 0x30);
+        crate::pgtable::poc_barrier();
+        Ok(new)
+    }
+
+    /// Kick message for `engine`'s submission ring in the trial queue's priority group.
+    pub(crate) fn j313_kick_engine(engine: u32) -> u64 {
+        (0x83u64 << 48) | (4 * Self::signal_group() + engine as usize) as u64
+    }
+}

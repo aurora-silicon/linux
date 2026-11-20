@@ -501,6 +501,9 @@ impl Uat {
                                                 let (Some(root), Some(control), Some(slots), Some(drm), Some(owner)) =
                                                     (modern.take(), graph.take(), pool.take(), drm_keep.take(), binding.take())
                                                     else { return Err(EINVAL); };
+                                                let window = crate::j313::Window::new(
+                                                    control.trial_uat().kernel_window_root(),
+                                                    shared_l2.map.ptr().cast(), mask)?;
                                                 drop(irq_guard);
                                                 drop(open_guard);
                                                 // The firmware keeps using these until it is stopped; their
@@ -515,7 +518,7 @@ impl Uat {
                                                 dev_info!(device, "G13G handing the running firmware to the DRM backend\n");
                                                 return Ok(Some(crate::j313::Live {
                                                     peer: peer_box, root, graph: control, pool: slots, asc: asc_ctl,
-                                                    drm, binding: owner, resources: sgx,
+                                                    drm, binding: owner, resources: sgx, window,
                                                 }));
                                             }
                                             if module_parameters::t8112_private_scan.value() & 4 != 0 {

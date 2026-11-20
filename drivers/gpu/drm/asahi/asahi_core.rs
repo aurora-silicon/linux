@@ -433,6 +433,18 @@ module! {
             default: 0,
             description: "T8103 27.2 bring-up: print the legacy command layouts and stop (1)",
         },
+        t8112_g13_init_blocks: bool {
+            default: true,
+            description: "T8103 27.2 render: buffer initialization carries the block count (13.5) instead of zero",
+        },
+        t8112_g13_render: bool {
+            default: true,
+            description: "T8103 27.2: accept render commands on the DRM device",
+        },
+        t8112_g13_render_log: u32 {
+            default: 4,
+            description: "T8103 27.2 render: log the first n render passes",
+        },
         t8112_g13_idle_ms: u32 {
             default: 3000,
             description: "T8103 27.2 bring-up: how long the first idle-policy round may take (ms)",

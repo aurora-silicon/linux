@@ -127,6 +127,10 @@ pub(crate) mod j313_layout;
 mod j313_root;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 pub(crate) use j313_root::*;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod j313_render;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+pub(crate) use j313_render::*;
 
 const RX_WORK_PENDING: u32 = 1 << 0;
 const RX_WORK_RUNNING: u32 = 1 << 1;

@@ -569,8 +569,8 @@ impl AsahiPlatformDriver {
         pdev: &'bound platform::Device<Core<'_>>,
         live: crate::j313::Live<'bound>,
     ) -> Result<AsahiPlatformDriverData<'bound>> {
-        let crate::j313::Live { peer, root, graph, pool, asc, drm, binding, resources } = live;
-        let backend = crate::j313::Backend::start(&drm, pdev.as_ref(), peer, root, graph, pool, asc)?;
+        let crate::j313::Live { peer, root, graph, pool, asc, drm, binding, resources, window } = live;
+        let backend = crate::j313::Backend::start(&drm, pdev.as_ref(), peer, root, graph, pool, asc, window)?;
         let gpu = backend.clone() as Arc<dyn gpu::Gpu>;
         let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
         // SAFETY: The registration is stored in the platform data and unregistered when it is

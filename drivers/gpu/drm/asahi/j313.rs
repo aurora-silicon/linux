@@ -26,7 +26,8 @@ use kernel::{
 
 use crate::{
     alloc, event, gem, gpu, gpu::GpuManagerG13V13_5, mmu, queue,
-    gpu::{G13TrialRoot, J313Compute, J313Pool, J313Queue, J313_POOL},
+    gpu::{G13TrialRoot, J313Compute, J313Pool, J313Queue, J313_POOL,
+          J313RenderInputs, J313RenderJob, J313RenderPool, J313Ring, J313_RENDER_SLOTS},
     m3::m3_submit::{Command, Packet},
 };
 
@@ -62,6 +63,61 @@ impl Drop for AscControl {
     }
 }
 
+/// The firmware's view of the kernel window: its own L2 table (the reserved shared-L2 page),
+/// filled from the kernel window's L2 table when the firmware was started. Kernel allocations
+/// made later can need L3 tables the firmware's table does not name yet; `sync` adds them.
+pub(crate) struct Window {
+    shared: usize,
+    l2: u64,
+    mask: u64,
+}
+
+impl Window {
+    /// `root` is the kernel window's root table, `shared` the mapped shared-L2 page.
+    pub(crate) fn new(root: u64, shared: *mut u8, mask: u64) -> Result<Self> {
+        // SAFETY: the bring-up graph owns the window's tables for the life of the boot.
+        let upper = unsafe {
+            crate::pgtable::with_root_entries(None, root, 3, |w| w[2].load(Ordering::Acquire))
+        }?;
+        if upper & 3 != 3 { return Err(EINVAL); }
+        Ok(Self { shared: shared as usize, l2: upper & mask, mask })
+    }
+
+    /// Publishes the kernel window's new L3 tables to the firmware's L2 table and cleans every
+    /// RAM L3 table, so pages mapped since the last call are visible. Returns the new tables.
+    pub(crate) fn sync(&self) -> Result<usize> {
+        const ENTRIES: usize = mmu::UAT_PGSZ / 8;
+        // The window's final 4 GiB are MMIO tables, never extended at run time.
+        let first_io = (0xf_0000_0000u64 >> 25) as usize;
+        // SAFETY: the shared-L2 page stays mapped for the life of the boot (its mapping is
+        // retained at take-over) and holds `ENTRIES` aligned words.
+        let shared = unsafe { &*(self.shared as *const [core::sync::atomic::AtomicU64; ENTRIES]) };
+        let mut kernel = [0u64; 0x780];
+        // SAFETY: as in `new`.
+        unsafe {
+            crate::pgtable::with_root_entries(None, self.l2, first_io, |w| {
+                for (k, e) in kernel.iter_mut().zip(w) { *k = e.load(Ordering::Acquire); }
+            })
+        }?;
+        let mut added = 0;
+        for (i, &entry) in kernel.iter().enumerate().take(first_io) {
+            if entry == 0 { continue; }
+            if entry & 3 != 3 { return Err(EINVAL); }
+            crate::g15::uat::clean_page(entry & self.mask)?;
+            let current = shared[i].load(Ordering::Acquire);
+            if current == 0 {
+                shared[i].store(entry, Ordering::Release);
+                added += 1;
+            } else if current != entry {
+                return Err(EBUSY);
+            }
+        }
+        crate::pgtable::clean_poc(self.shared as *const u8, mmu::UAT_PGSZ);
+        crate::pgtable::poc_barrier();
+        Ok(added)
+    }
+}
+
 /// What the bring-up path hands over when it keeps the firmware running.
 pub(crate) struct Live<'a> {
     pub(crate) peer: Pin<KBox<kernel::soc::apple::rtkit::RtKit<crate::mmu::T8112Peer>>>,
@@ -72,10 +128,15 @@ pub(crate) struct Live<'a> {
     pub(crate) drm: kernel::drm::UnregisteredDevice<crate::driver::AsahiDrmDriver>,
     pub(crate) binding: crate::binding::Owner,
     pub(crate) resources: crate::regs::Resources<'a>,
+    pub(crate) window: Window,
 }
 
 struct Inflight {
     packet: Arc<Packet>,
+    /// 0 tiler, 1 fragment, 2 compute.
+    engine: usize,
+    /// A fragment command's render pass, kept until it retires.
+    render: Option<KBox<J313RenderJob>>,
     last: bool,
     stamp: event::EventValue,
     slot: usize,
@@ -85,7 +146,28 @@ struct Inflight {
     _bind: mmu::VmBind,
 }
 
+/// Render queues and their slots. A render pass publishes its tiler command, waits for it to
+/// retire, then publishes its fragment command; nothing else is in flight meanwhile.
+struct RenderState {
+    rings: [J313Ring; 2],
+    pool: J313RenderPool,
+    last: [event::EventValue; 2],
+    sequence: [u64; 2],
+    published: [u64; 2],
+    retired_total: [u64; 2],
+    retired_raw: [u32; 2],
+    capacity: [u32; 2],
+    next_slot: usize,
+    stats: [u64; 2],
+    window: Window,
+    waiting_unlink: bool,
+    /// The pending render pass whose tiler command is published.
+    staged: Option<KBox<J313RenderJob>>,
+    logged: u32,
+}
+
 struct State {
+    render: Option<RenderState>,
     peer: Pin<KBox<kernel::soc::apple::rtkit::RtKit<crate::mmu::T8112Peer>>>,
     root: crate::fw::types::GpuObject<G13TrialRoot>,
     pool: J313Pool,
@@ -204,77 +286,228 @@ impl Runtime {
         }
     }
 
+    /// Fails the packet at the head of the pending list with `e` (its command `index`).
+    fn fail_pending(&self, state: &mut State, index: usize, e: Error) {
+        let packet = state.pending[0].0.clone();
+        let _ = state.pending.remove(0);
+        if let Some(render) = state.render.as_mut() {
+            if let Some(job) = render.staged.take() {
+                // Its tiler command retired; nothing of it is left in the firmware's queues.
+                drop(job);
+            }
+        }
+        if packet.may_be_published() && index != 0 {
+            // Earlier commands of this packet are in flight; fail it when they retire.
+            packet.finish(Err(e));
+        } else {
+            packet.release_guard();
+            packet.finish(Err(e));
+        }
+    }
+
     /// Publish pending commands while pool slots are free.
     fn pump(&self, state: &mut State) {
-        while state.inflight.len() < J313_POOL - 1 && !state.pending.is_empty() {
-            // A slot is reused only once the firmware has unlinked it (tracking list).
-            match state.pool.registered(state.next_slot) {
-                Ok(false) => {}
-                Ok(true) => {
-                    if !state.waiting_unlink {
-                        state.waiting_unlink = true;
-                        dev_info!(self.dev, "J313: slot {} still in the firmware's tracking list; waiting\n", state.next_slot);
-                        state.pool.dump(&self.dev, state.next_slot);
-                        // Wake the firmware's service so its retirement scan runs.
-                        let _ = state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick());
-                    }
-                    return;
-                }
-                Err(e) => { self.fail_all(state, e); return; }
-            }
-            state.waiting_unlink = false;
+        while !state.pending.is_empty() {
             let (packet, index) = (state.pending[0].0.clone(), state.pending[0].1);
-            let Command::Compute(control) = packet.commands[index] else {
-                // Queues of this backend accept only compute commands (Queue::submit).
-                let _ = state.pending.remove(0);
-                if !(packet.may_be_published() && index != 0) { packet.release_guard(); }
-                packet.finish(Err(EINVAL));
-                continue;
+            match packet.commands[index] {
+                Command::Compute(control) => {
+                    if state.inflight.len() >= J313_POOL - 1 || state.inflight.iter().any(|f| f.engine != 2) {
+                        return;
+                    }
+                    if !self.publish_compute(state, &packet, index, control) { return; }
+                }
+                Command::Render { command, usc } => {
+                    if !crate::module_parameters::t8112_g13_render.value() || state.render.is_none()
+                        || packet.j313_render.is_none() {
+                        self.fail_pending(state, index, EINVAL);
+                        continue;
+                    }
+                    if !state.inflight.is_empty() { return; }
+                    if !self.publish_render(state, &packet, index, &command, usc) { return; }
+                }
+            }
+        }
+    }
+
+    /// Publishes one compute command. Returns false to stop pumping for now.
+    fn publish_compute(&self, state: &mut State, packet: &Arc<Packet>, index: usize,
+        control: crate::m3::agx_compute::Control) -> bool {
+        // A slot is reused only once the firmware has unlinked it (tracking list).
+        match state.pool.registered(state.next_slot) {
+            Ok(false) => {}
+            Ok(true) => {
+                if !state.waiting_unlink {
+                    state.waiting_unlink = true;
+                    dev_info!(self.dev, "J313: slot {} still in the firmware's tracking list; waiting\n", state.next_slot);
+                    state.pool.dump(&self.dev, state.next_slot);
+                    // Wake the firmware's service so its retirement scan runs.
+                    let _ = state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick());
+                }
+                return false;
+            }
+            Err(e) => { self.fail_all(state, e); return false; }
+        }
+        state.waiting_unlink = false;
+        let result = (|| -> Result<(mmu::VmBind, event::EventValue)> {
+            let bind = self.graph.trial_uat().bind(&packet.vm)?;
+            let preempt = packet.j413_preempt.as_ref().ok_or(EINVAL)?.gpu_va().get();
+            let stamp = state.last.next();
+            let job = J313Compute {
+                context: bind.slot(),
+                sequence: state.sequence,
+                cdm_base: control.base,
+                cdm_end: control.end,
+                usc_base: control.usc_base,
+                preempt,
             };
+            let command = state.pool.encode(state.next_slot, &state.queue, stamp.raw(), &job)?;
+            packet.mark_published();
+            state.root.j313_publish(command)?;
+            state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick())?;
+            Ok((bind, stamp))
+        })();
+        match result {
+            Ok((bind, stamp)) => {
+                state.last = stamp;
+                state.sequence += 1;
+                let slot = state.next_slot;
+                state.published += 1;
+                let ordinal = state.published;
+                state.next_slot = (state.next_slot + 1) % J313_POOL;
+                state.submitted += 1;
+                let last = index + 1 == packet.commands.len();
+                if state.inflight.push(Inflight { packet: packet.clone(), engine: 2, render: None, last, stamp, slot, ordinal,
+                    started: Instant::now(), _bind: bind }, GFP_KERNEL).is_err() {
+                    self.fail_all(state, ENOMEM);
+                    return false;
+                }
+                if last { let _ = state.pending.remove(0); } else { state.pending[0].1 += 1; }
+                true
+            }
+            Err(e) => {
+                dev_err!(self.dev, "J313: compute publication failed {:?}\n", e);
+                self.fail_pending(state, index, e);
+                true
+            }
+        }
+    }
+
+    /// Publishes the next stage of a render pass (nothing is in flight). Returns false to stop
+    /// pumping for now.
+    fn publish_render(&self, state: &mut State, packet: &Arc<Packet>, index: usize,
+        command: &crate::m3::agx_uapi::UapiRenderCommand, usc: u64) -> bool {
+        let Some(render) = state.render.as_mut() else { return false; };
+        let ctx = match packet.j313_render.as_ref() { Some(c) => c.clone(), None => return false };
+        if let Some(job) = render.staged.take() {
+            // Fragment stage: the tiler command has retired.
             let result = (|| -> Result<(mmu::VmBind, event::EventValue)> {
                 let bind = self.graph.trial_uat().bind(&packet.vm)?;
-                let preempt = packet.j413_preempt.as_ref().ok_or(EINVAL)?.gpu_va().get();
-                let stamp = state.last.next();
-                let job = J313Compute {
-                    context: bind.slot(),
-                    sequence: state.sequence,
-                    cdm_base: control.base,
-                    cdm_end: control.end,
-                    usc_base: control.usc_base,
-                    preempt,
-                };
-                let command = state.pool.encode(state.next_slot, &state.queue, stamp.raw(), &job)?;
-                packet.mark_published();
-                state.root.j313_publish(command)?;
-                state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick())?;
+                let stamp = render.last[1].next();
+                state.root.j313_ring_publish(&render.rings[1], job.fragment)?;
+                state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick_engine(1))?;
                 Ok((bind, stamp))
             })();
             match result {
                 Ok((bind, stamp)) => {
-                    state.last = stamp;
-                    state.sequence += 1;
-                    let slot = state.next_slot;
-                    state.published += 1;
-                    let ordinal = state.published;
-                    state.next_slot = (state.next_slot + 1) % J313_POOL;
+                    render.last[1] = stamp;
+                    render.sequence[1] += 1;
+                    render.published[1] += 1;
+                    let ordinal = render.published[1];
+                    let slot = job.slot;
+                    render.next_slot = (render.next_slot + 1) % J313_RENDER_SLOTS;
                     state.submitted += 1;
                     let last = index + 1 == packet.commands.len();
-                    if state.inflight.push(Inflight { packet: packet.clone(), last, stamp, slot, ordinal,
-                        started: Instant::now(), _bind: bind }, GFP_KERNEL).is_err() {
+                    if state.inflight.push(Inflight { packet: packet.clone(), engine: 1, render: Some(job), last, stamp,
+                        slot, ordinal, started: Instant::now(), _bind: bind }, GFP_KERNEL).is_err() {
                         self.fail_all(state, ENOMEM);
-                        return;
+                        return false;
                     }
                     if last { let _ = state.pending.remove(0); } else { state.pending[0].1 += 1; }
+                    true
                 }
                 Err(e) => {
-                    dev_err!(self.dev, "J313: compute publication failed {:?}\n", e);
-                    let _ = state.pending.remove(0);
-                    if packet.may_be_published() && index != 0 {
-                        // Earlier commands of this packet are in flight; fail it when they retire.
-                        packet.finish(Err(e));
+                    dev_err!(self.dev, "J313: fragment publication failed {:?}\n", e);
+                    // The tiler stage ran; the pass cannot complete.
+                    self.fail_all(state, e);
+                    false
+                }
+            }
+        } else {
+            // Tiler stage.
+            let slot = render.next_slot;
+            match render.pool.registered(slot) {
+                Ok(false) => {}
+                Ok(true) => {
+                    if !render.waiting_unlink {
+                        render.waiting_unlink = true;
+                        dev_info!(self.dev, "J313: render slot {} still in the firmware's tracking lists; waiting\n", slot);
+                        render.pool.dump(&self.dev, slot);
+                        for engine in 0..2 {
+                            let _ = state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick_engine(engine));
+                        }
+                    }
+                    return false;
+                }
+                Err(e) => { self.fail_all(state, e); return false; }
+            }
+            render.waiting_unlink = false;
+            let result = (|| -> Result<(mmu::VmBind, event::EventValue, KBox<J313RenderJob>)> {
+                let bind = self.graph.trial_uat().bind(&packet.vm)?;
+                let values = [render.last[0].next(), render.last[1].next()];
+                let job = {
+                    let mut alloc = crate::gpu::GpuManager::alloc(&*self.graph);
+                    let inputs = J313RenderInputs {
+                        command,
+                        usc,
+                        attachments: &packet.render_attachments[index],
+                        vm_slot: bind.slot(),
+                        rings: [&render.rings[0], &render.rings[1]],
+                        values: [values[0].raw(), values[1].raw()],
+                        sequence: render.sequence,
+                        stats: render.stats,
+                    };
+                    render.pool.build(&self.graph, &mut alloc, &ctx, slot, &inputs)?
+                };
+                let added = render.window.sync()?;
+                if render.logged < crate::module_parameters::t8112_g13_render_log.value() {
+                    render.logged += 1;
+                    dev_info!(self.dev, "J313 render: slot={} ctx={} vm={} {}x{} layers={} samples={} init={:?} tiler={:#x} fragment={:#x} values={:#x}/{:#x} new-tables={}\n",
+                              slot, bind.slot(), packet.vm.id(), command.width, command.height, command.layers,
+                              command.samples, job.init, job.tiler, job.fragment, values[0].raw(), values[1].raw(), added);
+                }
+                packet.mark_published();
+                if let Some(init) = job.init {
+                    state.root.j313_ring_publish(&render.rings[0], init)?;
+                    render.published[0] += 1;
+                }
+                state.root.j313_ring_publish(&render.rings[0], job.tiler)?;
+                render.published[0] += 1;
+                state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick_engine(0))?;
+                Ok((bind, values[0], KBox::new(job, GFP_KERNEL)?))
+            })();
+            match result {
+                Ok((bind, stamp, job)) => {
+                    render.last[0] = stamp;
+                    render.sequence[0] += 1;
+                    let ordinal = render.published[0];
+                    state.submitted += 1;
+                    let slot = job.slot;
+                    render.staged = Some(job);
+                    if state.inflight.push(Inflight { packet: packet.clone(), engine: 0, render: None, last: false, stamp,
+                        slot, ordinal, started: Instant::now(), _bind: bind }, GFP_KERNEL).is_err() {
+                        self.fail_all(state, ENOMEM);
+                    }
+                    false
+                }
+                Err(e) => {
+                    dev_err!(self.dev, "J313: render build or tiler publication failed {:?}\n", e);
+                    if packet.may_be_published() {
+                        // Something may have reached the tiler queue; its state is unknown.
+                        self.fail_all(state, e);
+                        false
                     } else {
-                        packet.release_guard();
-                        packet.finish(Err(e));
+                        self.fail_pending(state, index, e);
+                        true
                     }
                 }
             }
@@ -302,20 +535,69 @@ impl Runtime {
             state.retired_total += u64::from(delta);
             state.retired_raw = raw;
         }
+        if let Some(render) = state.render.as_mut() {
+            for e in 0..2 {
+                let raw = match render.rings[e].progress() { Ok((_, raw)) => raw, Err(_) => continue };
+                let capacity = render.capacity[e];
+                if capacity != 0 && raw < capacity {
+                    let delta = (raw + capacity - render.retired_raw[e]) % capacity;
+                    render.retired_total[e] += u64::from(delta);
+                    render.retired_raw[e] = raw;
+                }
+            }
+        }
         while !state.inflight.is_empty() {
             let front = &state.inflight[0];
-            if state.retired_total >= front.ordinal {
+            let retired = match (front.engine, state.render.as_ref()) {
+                (2, _) => state.retired_total >= front.ordinal,
+                (e, Some(render)) => render.retired_total[e] >= front.ordinal,
+                _ => false,
+            };
+            if retired {
                 let done = state.inflight.remove(0).ok();
                 if let Some(done) = done {
-                    if let Err(e) = state.pool.retire(done.slot) {
+                    let retirement = match (done.engine, state.render.as_ref()) {
+                        (2, _) => state.pool.retire(done.slot),
+                        (e, Some(render)) => render.pool.retire(done.slot, e),
+                        _ => Err(EINVAL),
+                    };
+                    if let Err(e) = retirement {
                         dev_err!(self.dev, "J313: tracking retirement failed {:?}\n", e);
+                    }
+                    if done.engine != 2 {
+                        if let Some(render) = state.render.as_mut() {
+                            if render.logged <= crate::module_parameters::t8112_g13_render_log.value() && done.engine == 1 {
+                                dev_info!(self.dev, "J313 render: slot {} retired (tiler {}, fragment {})\n",
+                                          done.slot, render.retired_total[0], render.retired_total[1]);
+                            }
+                        }
                     }
                     state.retired += 1;
                     if done.last {
                         done.packet.retired();
                     }
+                    drop(done.render);
                 }
                 continue;
+            }
+            if front.started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) && front.engine != 2 {
+                let (engine, slot, ordinal) = (front.engine, front.slot, front.ordinal);
+                dev_err!(self.dev, "J313: {} command timed out: slot={} ordinal={} submitted={} completed={}\n",
+                         (if engine == 0 { "tiler" } else { "fragment" }), slot, ordinal, state.submitted, state.retired);
+                fault_latch(&self.dev);
+                if let Some(render) = state.render.as_ref() {
+                    for e in 0..2 {
+                        render.rings[e].dump(&self.dev, render.published[e] as u32);
+                    }
+                    render.pool.dump(&self.dev, slot);
+                    dev_err!(self.dev, "J313 render stamps: tiler={:#x}/{:#x} fragment={:#x}/{:#x}\n",
+                             render.rings[0].event.current().raw(), render.last[0].raw(),
+                             render.rings[1].event.current().raw(), render.last[1].raw());
+                }
+                let _ = state.root.j313_trace_tail(64);
+                let _ = state.root.report_job_gates("drm-render-timeout");
+                self.fail_all(state, ETIMEDOUT);
+                return false;
             }
             if front.started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
                 let (head, retired, _) = state.root.j313_progress().unwrap_or((0, 0, current));
@@ -461,6 +743,7 @@ impl Backend {
         graph: Arc<GpuManagerG13V13_5>,
         pool: J313Pool,
         asc: AscControl,
+        window: Window,
     ) -> Result<Arc<Self>> {
         // The runtime is created empty first, so no allocation failure can drop firmware-visible
         // state. Every failure after the state is moved in goes through Runtime::stop, which halts
@@ -501,7 +784,29 @@ impl Backend {
         };
         dev_info!(dev, "J313: taking over the running firmware: queue={:#x} head={} stamp={:#x}\n",
                   queue.queue, head, last.raw());
+        // Render queues and slots, allocated after take-over: `Window::sync` publishes any
+        // new kernel-window tables before the firmware first sees them.
+        let render = if crate::module_parameters::t8112_g13_render.value() {
+            match (|| -> Result<RenderState> {
+                let (rings, pool) = crate::gpu::j313_render_resources(&graph)?;
+                let stats = root.j313_engine_stats()?;
+                let added = window.sync()?;
+                let last = [rings[0].event.current(), rings[1].event.current()];
+                let capacity = [rings[0].capacity()?, rings[1].capacity()?];
+                dev_info!(dev, "J313: render queues tiler={:#x} fragment={:#x} stats={:#x}/{:#x} new-tables={}\n",
+                          rings[0].va(), rings[1].va(), stats[0], stats[1], added);
+                Ok(RenderState { rings, pool, last, sequence: [0; 2], published: [0; 2], retired_total: [0; 2],
+                    retired_raw: [0; 2], capacity, next_slot: 0, stats: [stats[0], stats[1]], window,
+                    waiting_unlink: false, staged: None, logged: 0 })
+            })() {
+                Ok(r) => Some(r),
+                Err(e) => { dev_err!(dev, "J313: render setup failed {:?}; compute only\n", e); None }
+            }
+        } else {
+            None
+        };
         *runtime.state.lock() = Some(State {
+            render,
             peer, root, pool, asc, queue, last,
             sequence: u64::from(head),
             next_slot: 0,
@@ -572,11 +877,17 @@ impl gpu::Gpu for Backend {
     fn new_vm(&self, range: Range<u64>) -> Result<mmu::Vm> {
         self.graph.trial_uat().new_vm(self.ids.vm.next(), range)?.with_tracked_status()
     }
-    fn new_queue(&self, vm: mmu::Vm, _ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
+    fn new_queue(&self, vm: mmu::Vm, ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>, priority: u32,
         usc_exec_base: u64, _usage: Arc<crate::usage::Client>) -> Result<KBox<dyn queue::Queue>> {
+        let render = if crate::module_parameters::t8112_g13_render.value() {
+            let id = (self.ids.queue.next() & 0xffff_ffff) as u32;
+            Some(Arc::new(crate::gpu::J313RenderContext::new(&self.graph, id, ualloc, ualloc_priv.clone())?, GFP_KERNEL)?)
+        } else {
+            None
+        };
         Ok(KBox::new(crate::m3::m3_submit::Queue::new_j313(self.runtime.clone(), self.scheduler.clone(),
-            vm, priority, usc_exec_base, ualloc_priv)?, GFP_KERNEL)?)
+            vm, priority, usc_exec_base, ualloc_priv, render)?, GFP_KERNEL)?)
     }
     fn map_timestamp_buffer(&self, _bo: gem::ObjectRef, _range: Range<usize>) -> Result<crate::timestamp::Buffer> {
         // Timestamp buffers would need new tables in the firmware window after boot.

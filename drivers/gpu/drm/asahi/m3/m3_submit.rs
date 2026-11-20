@@ -56,6 +56,8 @@ pub(crate) struct Packet {
     vm_job:Pin<KBox<Mutex<Option<mmu::VmJobGuard>>>>,
     /// J413 27.2: the compute preemption buffer in the packet's VM, kept until retirement.
     pub(crate) j413_preempt:Option<crate::fw::types::GpuArray<u8>>,
+    /// J313 27.2: the queue's render context (13.5 tile buffer), for render commands.
+    pub(crate) j313_render:Option<Arc<crate::gpu::J313RenderContext>>,
 }
 /// The runtime a queue's packets go to: the M3 runtime or the J413 27.2 compute runtime.
 #[derive(Clone)]
@@ -209,6 +211,8 @@ pub(crate) struct Queue {
     shared:Sink,vm:mmu::Vm,usc:u64,fences:FenceContexts,
     /// J413: the VM's private allocator, for per-packet preemption buffers.
     j413_alloc:Option<Arc<Mutex<crate::alloc::DefaultAllocator>>>,
+    /// J313: the render context; render commands are accepted when present.
+    j313_render:Option<Arc<crate::gpu::J313RenderContext>>,
     /// Whether the SoC advertises early tiling (`m3_soc::Features::fragment_dependency`).
     early_tiling:bool,
     wide_visibility:bool,
@@ -224,7 +228,7 @@ impl Queue {
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
             shared:Sink::M3(shared),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_m3_queue"),kernel::static_lock_class!())?,
-            early_tiling,wide_visibility,urgency,j413_alloc:None})
+            early_tiling,wide_visibility,urgency,j413_alloc:None,j313_render:None})
     }
     /// A J413 27.2 compute queue: the same front end, published by the J413 runtime.
     pub(crate) fn new_j413(runtime:Arc<crate::j413::Runtime>,scheduler:Arc<sched::Scheduler<Job>>,vm:mmu::Vm,priority:u32,usc:u64,
@@ -235,17 +239,18 @@ impl Queue {
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
             shared:Sink::J413(runtime),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_j413_queue"),kernel::static_lock_class!())?,
-            early_tiling:false,wide_visibility:false,urgency,j413_alloc:Some(ualloc_priv)})
+            early_tiling:false,wide_visibility:false,urgency,j413_alloc:Some(ualloc_priv),j313_render:None})
     }
     pub(crate) fn new_j313(runtime:Arc<crate::j313::Runtime>,scheduler:Arc<sched::Scheduler<Job>>,vm:mmu::Vm,priority:u32,usc:u64,
-        ualloc_priv:Arc<Mutex<crate::alloc::DefaultAllocator>>)->Result<Self> {
+        ualloc_priv:Arc<Mutex<crate::alloc::DefaultAllocator>>,
+        render:Option<Arc<crate::gpu::J313RenderContext>>)->Result<Self> {
         agx_uapi::QueueUscWindow{base:usc,user_start:0x4000,user_end:(1u64<<42)-0x8000}.validate().map_err(|_|EINVAL)?;
         let urgency=3u8.saturating_sub(priority.min(3) as u8);
         let priority=match priority {3=>sched::Priority::Low,2=>sched::Priority::Normal,
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
             shared:Sink::J313(runtime),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_j313_queue"),kernel::static_lock_class!())?,
-            early_tiling:false,wide_visibility:false,urgency,j413_alloc:Some(ualloc_priv)})
+            early_tiling:false,wide_visibility:false,urgency,j413_alloc:Some(ualloc_priv),j313_render:render})
     }
 }
 impl queue::Queue for Queue {
@@ -255,9 +260,14 @@ impl queue::Queue for Queue {
         let mut parser=agx_uapi::UapiCommandParser::new(raw);let mut commands=KVec::new();let mut timestamps=KVec::new();let mut flushes=KVec::new();let mut visibility=KVec::new();let mut render_attachments=KVec::new();
         while let Some(command)=parser.next_hardware().map_err(|e|{pr_err!("asahi submit: command parse rejected {:?} (cmdbuf {} bytes)\n",e,raw.len());EINVAL})? {
             if let agx_uapi::ParsedHardwareCommand::Render{payload,vertex_attachments,fragment_attachments,..}=command {
-                // The J413 27.2 backend is compute-only.
-                if self.j413_alloc.is_some() {return Err(EINVAL);}
-                if let Err(e)=validate_render(payload,self.usc,&AddressSpace(&self.vm),self.early_tiling) {
+                // The J413 27.2 backend is compute-only; J313 checks against the 13.5 blocks.
+                if self.j413_alloc.is_some() && self.j313_render.is_none() {return Err(EINVAL);}
+                let checked=if self.j313_render.is_some() {
+                    validate_j313_render(&payload,&AddressSpace(&self.vm))
+                } else {
+                    validate_render(payload,self.usc,&AddressSpace(&self.vm),self.early_tiling)
+                };
+                if let Err(e)=checked {
                     pr_err!("M3 render rejected {:?}: flags={:#x} size={}x{} layers={} samples={} utile={}x{} sample_size={} depth={:#x} stencil={:#x} zls={:#x} samplers={} heap={:#x}\n",e,payload.flags,payload.width,payload.height,payload.layers,payload.samples,payload.utile_width,payload.utile_height,payload.sample_size,payload.depth.base,payload.stencil.base,payload.zls_control,payload.sampler_count,payload.sampler_heap);
                     return Err(e);
                 }
@@ -308,7 +318,8 @@ impl queue::Queue for Queue {
                 Some(alloc.lock().array_empty::<u8>(crate::hw::t8112::HWCONFIG.compute_preempt1_size + 0x20)?),
             _ => None,
         };
-        let packet=Arc::new(Packet{j413_preempt,vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,render_attachments,
+        let j313_render=if commands.iter().any(|c| matches!(c, Command::Render{..})) {self.j313_render.clone()} else {None};
+        let packet=Arc::new(Packet{j413_preempt,j313_render,vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,render_attachments,
             completion:self.fences.new_fence(0,Completion)?.into(),
             finish_claimed:AtomicBool::new(false),published:AtomicBool::new(false),urgency:self.urgency,owner:Owner::current(),
             vm_job:KBox::pin_init(new_mutex!(Some(vm_job)),GFP_KERNEL)?},GFP_KERNEL)?;
@@ -339,6 +350,21 @@ fn encode_attachments(vm: &mmu::Vm, list: &agx_uapi::UapiAttachmentList)
     // M4 range normalization and ownership checks, not its 0x18 attribute.
     for i in 0..list.as_slice().len() {out.0[i*16+12..i*16+14].copy_from_slice(&0x17u16.to_le_bytes());}
     Ok(out)
+}
+
+/// J313 27.2: the 13.5 render parameters (samplers and helper programs allowed), with the
+/// client addresses the firmware dereferences checked against the VM.
+fn validate_j313_render(r: &agx_uapi::UapiRenderCommand, space: &AddressSpace<'_>) -> Result {
+    use agx_uapi::{GpuAddressSpace, GpuAccess};
+    crate::gpu::j313_validate_render(r)?;
+    if r.vdm_base == 0 || r.vdm_base & 3 != 0 || !space.covers(r.vdm_base,4,GpuAccess::Read) {
+        return Err(EINVAL);
+    }
+    for (p,access) in [(r.scissor_base,GpuAccess::Read),(r.depth_bias_base,GpuAccess::Read),
+                       (r.occlusion_query_base,GpuAccess::Write)] {
+        if p != 0 && (p & 7 != 0 || !space.covers(p,8,access)) { return Err(EINVAL); }
+    }
+    Ok(())
 }
 
 fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpace<'_>,

@@ -71,9 +71,9 @@ pub(crate) fn t8122_admitted(pdev: &platform::Device<Core<'_>>) -> Result<&'stat
 
 // The T8122 runtime, ported from the 7.1.12 release-20 kernel (c46d7dcdb871).
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-mod agx_attachments;
+pub(crate) mod agx_attachments;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-mod agx_compute;
+pub(crate) mod agx_compute;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod agx_memory;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
