@@ -760,7 +760,11 @@ static void apr_test_inflight(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, apr_jobs_full(1, 1));
 	KUNIT_EXPECT_TRUE(test, apr_jobs_full(3, 1));
 
-	/* A full ring of decode jobs straddling the wrap, retired in order. */
+	/*
+	 * Ring space and tail arithmetic for a full ring straddling the wrap.
+	 * Only the lone encode retires on the tail; decode jobs retire on
+	 * their ids (apr_test_job_id).
+	 */
 	done = r - 3 * APR_DECODE_DESC_BYTES - 0x80;
 	head = done;
 	for (i = 0; i < APR_MAX_INFLIGHT; i++) {
@@ -807,6 +811,60 @@ static void apr_test_job_id(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, apr_job_id_done(1, U16_MAX));
 	KUNIT_EXPECT_FALSE(test, apr_job_id_done(U16_MAX, 1));
 	KUNIT_EXPECT_FALSE(test, apr_job_id_done(U16_MAX - 1, 2));
+
+	/* ST1 = 0 is no progress, never "everything in 0x8001..0xffff done". */
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(0, 9), APR_DONE_ID_NONE);
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(0, 0x8005), APR_DONE_ID_NONE);
+	KUNIT_EXPECT_TRUE(test, apr_job_id_done(0, 0x8001));
+	/* Ids 1..8 outstanding: ids already issued, finished or not. */
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(1, 9), APR_DONE_ID_ISSUED);
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(8, 9), APR_DONE_ID_ISSUED);
+	/* The other half of the id space reads as old ids: nothing retires. */
+	for (u32 d = 0x8009; d <= U16_MAX; d += 0x7ff) {
+		KUNIT_EXPECT_EQ(test, apr_job_id_check(d, 9), APR_DONE_ID_ISSUED);
+		for (u16 id = 1; id < 9; id++)
+			KUNIT_EXPECT_FALSE(test, apr_job_id_done(d, id));
+	}
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(U16_MAX, 9), APR_DONE_ID_ISSUED);
+	KUNIT_EXPECT_FALSE(test, apr_job_id_done(U16_MAX, 1));
+	/* An id not issued yet: the ring is hung, nothing retires. */
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(9, 9), APR_DONE_ID_FUTURE);
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(10, 9), APR_DONE_ID_FUTURE);
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(0x8008, 9), APR_DONE_ID_FUTURE);
+	/* First job after a reset: id 1 not issued until next_id moves on. */
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(1, 1), APR_DONE_ID_FUTURE);
+
+	/* Eight jobs across the wrap: 0xfffc..0xffff, then 1..4 (0 skipped). */
+	{
+		u16 ids[APR_MAX_INFLIGHT], next = 0xfffc;
+		unsigned int i, retired = 0;
+
+		for (i = 0; i < APR_MAX_INFLIGHT; i++) {
+			ids[i] = next;
+			next = apr_next_job_id(next);
+		}
+		KUNIT_EXPECT_EQ(test, ids[4], 1);
+		KUNIT_EXPECT_EQ(test, next, 5);
+		/* ST1 skips ahead to 2: six jobs finished, in ring order. */
+		KUNIT_EXPECT_EQ(test, apr_job_id_check(2, next), APR_DONE_ID_ISSUED);
+		while (retired < APR_MAX_INFLIGHT &&
+		       apr_job_id_done(2, ids[retired]))
+			retired++;
+		KUNIT_EXPECT_EQ(test, retired, 6U);
+		/* The same id again retires nothing more. */
+		while (retired < APR_MAX_INFLIGHT &&
+		       apr_job_id_done(2, ids[retired]))
+			retired++;
+		KUNIT_EXPECT_EQ(test, retired, 6U);
+		/* A stale id from before the wrap retires nothing more either. */
+		KUNIT_EXPECT_FALSE(test, apr_job_id_done(0xfffe, ids[6]));
+		KUNIT_EXPECT_EQ(test, apr_job_id_check(4, next), APR_DONE_ID_ISSUED);
+		KUNIT_EXPECT_TRUE(test, apr_job_id_done(4, ids[7]));
+		/* 5 = next_id: not issued, hung. */
+		KUNIT_EXPECT_EQ(test, apr_job_id_check(5, next), APR_DONE_ID_FUTURE);
+		KUNIT_EXPECT_EQ(test, apr_job_id_check(0x8004, next), APR_DONE_ID_FUTURE);
+		KUNIT_EXPECT_EQ(test, apr_job_id_check(0x8005, next), APR_DONE_ID_ISSUED);
+	}
 }
 
 static struct kunit_case apr_test_cases[] = {

@@ -747,6 +747,22 @@ bool apr_job_id_done(u16 done_id, u16 id)
 }
 EXPORT_SYMBOL_IF_KUNIT(apr_job_id_done);
 
+/*
+ * Classify @done_id, the last finished id ST1 reports, against @next_id, the
+ * id the next decode job gets. 0 is what ST1 reads before any job finished
+ * since the reset. Ids from @next_id on, half the id space, are not issued
+ * yet; the other half are issued ids, finished or still in the ring.
+ */
+enum apr_done_id apr_job_id_check(u16 done_id, u16 next_id)
+{
+	if (!done_id)
+		return APR_DONE_ID_NONE;
+	if (apr_job_id_done(done_id, next_id))
+		return APR_DONE_ID_FUTURE;
+	return APR_DONE_ID_ISSUED;
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_job_id_check);
+
 /* No further job may enter the ring with @jobs in it, @encodes of them encodes. */
 bool apr_jobs_full(unsigned int jobs, unsigned int encodes)
 {

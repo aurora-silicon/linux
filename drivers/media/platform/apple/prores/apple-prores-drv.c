@@ -1204,7 +1204,7 @@ static noinline void apr_complete(struct apr_dev *apr, struct apr_job *job)
  * as soon as its in-flight count drops, so it is not touched after that.
  */
 static void apr_retire(struct apr_dev *apr, struct apr_job *jobs,
-				unsigned int n)
+		       unsigned int n)
 {
 	unsigned int i;
 
@@ -1219,18 +1219,28 @@ static void apr_retire(struct apr_dev *apr, struct apr_job *jobs,
 		wake_up_all(&apr->idle_wq);
 }
 
-/* Fail the current m2m job before its descriptor reached the ring. */
+/*
+ * Fail the current m2m job before its descriptor reached the ring. Earlier
+ * jobs of the context may still be in the ring: they are given back first,
+ * so this one cannot overtake them. That matters most when it is the drain's
+ * last source buffer, whose LAST flag and EOS end the stream. Sleeps.
+ */
 static void apr_finish_job(struct apr_dev *apr, struct apr_ctx *ctx, int err)
 {
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
 	struct apr_job job = {
 		.ctx = ctx,
 		.err = err,
-		.sequence = ctx->sequence++,
 	};
+	unsigned long flags;
 
+	wait_event(apr->idle_wq, !atomic_read(&ctx->inflight));
+	/* Buffers move under hw_lock, which apr_stop_cmd() relies on. */
+	spin_lock_irqsave(&apr->hw_lock, flags);
+	job.sequence = ctx->sequence++;
 	job.src = v4l2_m2m_src_buf_remove(m2m);
 	job.dst = v4l2_m2m_dst_buf_remove(m2m);
+	spin_unlock_irqrestore(&apr->hw_lock, flags);
 	if (!WARN_ON(!job.src || !job.dst))
 		apr_complete(apr, &job);
 	pm_runtime_mark_last_busy(apr->dev);
@@ -1246,9 +1256,17 @@ static void apr_finish_job(struct apr_dev *apr, struct apr_ctx *ctx, int err)
  * DONE and ERROR are latched per engine, not per descriptor: the status and
  * detail registers do not say which descriptor failed. An ERROR therefore
  * fails every job in the ring at that moment; the engine keeps running and
- * the watchdog resets it if the tail stops moving. Several descriptors may
- * finish behind one interrupt, and a DONE may arrive for a job already taken
- * here on the tail alone; both are fine.
+ * the watchdog resets it if no job finishes for APR_TIMEOUT_MS. Several
+ * descriptors may finish behind one interrupt.
+ *
+ * A decode job is finished once ST1 reports its id. ST1 reads 0 before any
+ * job finished since the reset, which is no progress; an id the driver has
+ * not issued yet means the engine and the ring disagree, so the ring is
+ * declared hung and the watchdog resets the engine before any buffer goes
+ * back. An encode has no id and retires on DONE once the tail passed it.
+ * A DONE still latched after the last job was taken here would make a new
+ * encode look finished as soon as it is fetched, so device_run clears the
+ * status before it publishes into an empty ring.
  */
 static bool apr_take_done(struct apr_dev *apr, struct apr_job *out,
 			  unsigned int *n)
@@ -1256,6 +1274,7 @@ static bool apr_take_done(struct apr_dev *apr, struct apr_job *out,
 	u32 ring_bytes = apr->variant->ring_bytes;
 	u32 status, tail, st0, st1, st2;
 	u32 detail[6];
+	enum apr_done_id state;
 	unsigned int i;
 	u16 done_id;
 
@@ -1298,10 +1317,18 @@ static bool apr_take_done(struct apr_dev *apr, struct apr_job *out,
 	}
 	/* Read after the W1C: a job finishing later raises DONE again. */
 	done_id = FIELD_GET(APR_ST1_DONE_ID, apr_read(apr, APR_REG_ST1));
+	state = apr_job_id_check(done_id, apr->next_id);
+	if (state == APR_DONE_ID_FUTURE && apr->njobs > apr->nencodes) {
+		dev_err_ratelimited(apr->dev, "finished id %#x not issued yet, next %#x\n",
+				    done_id, apr->next_id);
+		apr->hung = true;
+		return true;
+	}
 	while (apr->njobs) {
 		struct apr_job *job = &apr->jobs[apr->job_first];
 
 		if (job->ctx->decode ?
+		    state != APR_DONE_ID_ISSUED ||
 		    !apr_job_id_done(done_id, job->id) :
 		    !(status & (APR_IRQ_DONE | APR_IRQ_ERROR)) ||
 		    !apr_ring_passed(apr->done, job->end, tail, ring_bytes))
@@ -1358,8 +1385,8 @@ static irqreturn_t apr_irq(int irq, void *data)
 }
 
 /*
- * Backstop for a lost interrupt and for hangs. A ring that stops moving for
- * APR_TIMEOUT_MS fails every job in it. A hung engine is reset through its
+ * Backstop for a lost interrupt and for hangs. When no job finishes for
+ * APR_TIMEOUT_MS, every job in the ring fails. A hung engine is reset through its
  * power domain and reprogrammed; without a reset line the device refuses
  * further jobs rather than reuse memory it may still own.
  */
@@ -1513,6 +1540,14 @@ static void apr_device_run(void *priv)
 		apr_finish_job(apr, ctx, ret);
 		return;
 	}
+	/*
+	 * With the ring empty the engine is idle, so a DONE or ERROR still
+	 * latched belongs to a job already given back. Clear it before this
+	 * job can be taken for finished on it. The clear reaches the engine
+	 * before the head write below.
+	 */
+	if (!apr->njobs)
+		apr_write(apr, APR_REG_IRQ_STATUS, APR_IRQ_DONE | APR_IRQ_ERROR);
 	apr_ring_write(apr->ring, ring_bytes, apr->head, desc, desc_bytes);
 	apr->head = apr_ring_advance(apr->head, desc_bytes, ring_bytes);
 	job = &apr->jobs[(apr->job_first + apr->njobs) % APR_MAX_INFLIGHT];
@@ -1568,7 +1603,6 @@ static void apr_job_abort(void *priv)
 	struct apr_ctx *ctx = priv;
 	struct apr_dev *apr = ctx->apr;
 	unsigned long flags;
-
 	unsigned int i;
 
 	/*

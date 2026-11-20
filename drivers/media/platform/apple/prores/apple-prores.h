@@ -241,6 +241,14 @@ bool apr_ring_passed(u32 done, u32 end, u32 tail, u32 ring_bytes);
 bool apr_ring_tail_valid(u32 done, u32 tail, u32 head, u32 ring_bytes);
 u16 apr_next_job_id(u16 id);
 bool apr_job_id_done(u16 done_id, u16 id);
+
+enum apr_done_id {
+	APR_DONE_ID_NONE,	/* nothing finished since the reset */
+	APR_DONE_ID_ISSUED,	/* an id the driver issued */
+	APR_DONE_ID_FUTURE,	/* an id not issued yet: the ring is hung */
+};
+
+enum apr_done_id apr_job_id_check(u16 done_id, u16 next_id);
 bool apr_jobs_full(unsigned int jobs, unsigned int encodes);
 void apr_ring_write(u8 *ring, u32 ring_bytes, u32 ptr, const u8 *desc,
 		    u32 desc_bytes);
