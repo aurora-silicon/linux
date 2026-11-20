@@ -678,6 +678,13 @@ impl Buffer::ver {
         }
     }
 
+    /// Diagnostic: (Counter.count, Info gpu_counter, Info+0x10, Info+8 slot).
+    pub(crate) fn counters(&self) -> (u32, u32, u32, i32) {
+        let inner = self.inner.lock();
+        let count = inner.info.counter.with(|raw, _inner| raw.count.load(Ordering::Acquire));
+        inner.info.with(|raw, _inner| (count, raw.gpu_counter, raw.unk_10, raw.last_id))
+    }
+
     /// Diagnostic: the first 0xc0 bytes of the firmware-visible Info, as words.
     pub(crate) fn info_words(&self) -> [u32; 0x30] {
         let inner = self.inner.lock();

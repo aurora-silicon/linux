@@ -73,6 +73,11 @@ impl J313RenderContext {
 
 impl Drop for J313RenderContext {
     fn drop(&mut self) {
+        let (count, done, ta_done, slot) = self.buffer.counters();
+        if count != done {
+            pr_info!("J313 render: buffer of queue {} ends with counter {} != completed {} (TA {}, slot {}); its slot is not evicted\n",
+                     self.id, count, done, ta_done, slot);
+        }
         buffer::arena_release(&self.arena_vm);
     }
 }
@@ -248,7 +253,10 @@ impl J313RenderPool {
         j313_validate_render(r)?;
         let tile_info = tiling(r)?;
         let buffer = &ctx.buffer;
-        let autogrown = buffer.auto_grow()?;
+        // A tile buffer that grows after it has been used leaves state behind that faults the
+        // next client: size it once (t8112_g13_min_blocks) and let overflowing passes use
+        // partial renders instead.
+        let autogrown = if crate::module_parameters::t8112_g13_autogrow.value() { buffer.auto_grow()? } else { false };
         let grown = buffer.ensure_blocks(tile_info.min_tvb_blocks
             .max(crate::module_parameters::t8112_g13_min_blocks.value() as usize))?;
         let scene = buffer.new_scene(alloc, &tile_info)?;

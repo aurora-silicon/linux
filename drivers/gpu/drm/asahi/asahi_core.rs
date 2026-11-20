@@ -434,7 +434,7 @@ module! {
             description: "T8103 27.2 bring-up: print the legacy command layouts and stop (1)",
         },
         t8112_g13_init_every: bool {
-            default: true,
+            default: false,
             description: "T8103 27.2 render: send the buffer setup (descriptor commit) before every tiler pass",
         },
         t8112_g13_init_blocks: bool {
@@ -449,8 +449,12 @@ module! {
             default: 63,
             description: "T8103 27.2 render: tile buffer slots handed to the firmware",
         },
+        t8112_g13_autogrow: bool {
+            default: false,
+            description: "T8103 27.2 render: grow tile buffers from their usage statistics",
+        },
         t8112_g13_min_blocks: u32 {
-            default: 0,
+            default: 128,
             description: "T8103 27.2 render: minimum tile buffer blocks per queue (0 = as the pass needs)",
         },
         t8112_g13_render_log: u32 {
