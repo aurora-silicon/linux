@@ -18,10 +18,11 @@
 #include <linux/soc/apple/pmp-temps.h>
 #include <linux/soc/apple/pmp-power-policy.h>
 #include <linux/soc/apple/t8132.h>
+#include <linux/soc/apple/t8132-pmp.h>
 
 bool apple_pmp_telemetry_retained_board(void)
 {
-	return apple_pmp_t8132_retained_board();
+	return apple_t8132_pmp_board();
 }
 
 static LIST_HEAD(apple_pmp_telemetry_list);

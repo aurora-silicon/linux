@@ -21,6 +21,7 @@
 #include <linux/workqueue.h>
 #include <linux/unaligned.h>
 #include <linux/soc/apple/pmp-display.h>
+#include <linux/soc/apple/t8132-pmp.h>
 
 /* AGX: command 0x0f, logical device 5, state 1. The reply carries no tag. */
 #define PMP_AGX_REQUEST		0x0020f50100000000ULL
@@ -223,7 +224,7 @@ static DEFINE_MUTEX(pmp_display_registration);
 
 bool apple_pmp_display_retained_board(void)
 {
-	return apple_pmp_t8132_retained_board();
+	return apple_t8132_pmp_board();
 }
 
 /* The qualified loader publishes the existing PMP through its alias. */
@@ -241,7 +242,7 @@ struct apple_pmp_display *apple_pmp_display_register(struct device *dev,
 	int size;
 	bool match, j773g = of_machine_is_compatible("apple,j773g");
 
-	if (!apple_pmp_t8132_retained_board() || !dev->of_node ||
+	if (!apple_t8132_pmp_board() || !dev->of_node ||
 	    !of_device_is_compatible(dev->of_node,
 		"apple,t8132-pmp-v2"))
 		return NULL;
@@ -323,8 +324,8 @@ static struct apple_pmp_display *pmp_power_consumer(struct device *consumer,
 	bool match;
 
 	/* J773g uses the AGX record and has no display consumer. */
-	if (kind == PMP_POWER_AGX ? apple_pmp_t8132_retained_board() :
-	    (apple_pmp_j713_board() && !of_machine_is_compatible("apple,j773g"))) {
+	if (kind == PMP_POWER_AGX ? apple_t8132_pmp_board() :
+	    (apple_t8132_pmp_board() && !of_machine_is_compatible("apple,j773g"))) {
 		/* Both consumers must name the exact boot-profile node. */
 		if ((kind != PMP_POWER_AGX && kind != PMP_POWER_DISP) || !consumer->of_node ||
 		    !of_device_is_compatible(consumer->of_node,
@@ -519,51 +520,51 @@ out:
 /* Probe creates the retained supplier links; get/check never change owners. */
 int apple_pmp_j713_display_prepare(struct device *consumer)
 {
-	return apple_pmp_j713_board() ? pmp_power_prepare(consumer, PMP_POWER_DISP) : -ENODEV;
+	return apple_t8132_pmp_board() ? pmp_power_prepare(consumer, PMP_POWER_DISP) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_display_prepare);
 
 int apple_pmp_j713_gpu_prepare(struct device *consumer)
 {
-	return apple_pmp_t8132_retained_board() ?
+	return apple_t8132_pmp_board() ?
 		pmp_power_prepare(consumer, PMP_POWER_AGX) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_prepare);
 
 int apple_pmp_j713_display_check(struct device *consumer)
 {
-	return apple_pmp_j713_board() ? pmp_power_check(consumer, PMP_POWER_DISP, false) : -ENODEV;
+	return apple_t8132_pmp_board() ? pmp_power_check(consumer, PMP_POWER_DISP, false) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_display_check);
 
 int apple_pmp_j713_display_check_release(struct device *consumer)
 {
-	return apple_pmp_j713_board() ? pmp_power_check(consumer, PMP_POWER_DISP, true) : -ENODEV;
+	return apple_t8132_pmp_board() ? pmp_power_check(consumer, PMP_POWER_DISP, true) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_display_check_release);
 
 int apple_pmp_j713_gpu_check(struct device *consumer)
 {
-	return apple_pmp_t8132_retained_board() ?
+	return apple_t8132_pmp_board() ?
 		pmp_power_check(consumer, PMP_POWER_AGX, false) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_check);
 
 int apple_pmp_j713_display_get(struct device *consumer)
 {
-	return apple_pmp_j713_board() ? pmp_power_get(consumer, PMP_POWER_DISP) : -ENODEV;
+	return apple_t8132_pmp_board() ? pmp_power_get(consumer, PMP_POWER_DISP) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_display_get);
 
 int apple_pmp_j713_display_put(struct device *consumer)
 {
-	return apple_pmp_j713_board() ? pmp_power_put(consumer, PMP_POWER_DISP) : -ENODEV;
+	return apple_t8132_pmp_board() ? pmp_power_put(consumer, PMP_POWER_DISP) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_display_put);
 
 int apple_pmp_j713_gpu_get(struct device *consumer)
 {
-	return apple_pmp_t8132_retained_board() ?
+	return apple_t8132_pmp_board() ?
 		pmp_power_get(consumer, PMP_POWER_AGX) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_get);

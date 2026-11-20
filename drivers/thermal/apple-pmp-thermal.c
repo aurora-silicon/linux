@@ -28,6 +28,7 @@
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-power-policy.h>
 #include <linux/soc/apple/t8132.h>
+#include <linux/soc/apple/t8132-pmp.h>
 #include <linux/suspend.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
@@ -869,7 +870,7 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 	const struct apple_pmp_sensor_data *sensors = dev_get_platdata(&pdev->dev);
 
 	/* The M4 PMP sensor records and the Airs' fanless policy are qualified. */
-	if (!apple_t8132_firmware_path())
+	if (!apple_t8132_pmp_path())
 		return -ENODEV;
 	if (!sensors || !sensors->read || !sensors->dev)
 		return -EINVAL;
