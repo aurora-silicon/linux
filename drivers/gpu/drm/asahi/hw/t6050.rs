@@ -41,7 +41,6 @@ pub(crate) const CONFIG: Config = Config {
     adopt_root_entries: true,
     fabric_bridge: false,
     sleep_restart: false,
-    oslog_echo: true,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
     // The firmware in `fw-text` must be this build. iBoot loads the G17S build of both roles
@@ -113,7 +112,6 @@ pub(crate) const CONFIG_MAX: Config = Config {
     adopt_root_entries: true,
     fabric_bridge: false,
     sleep_restart: false,
-    oslog_echo: true,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
     // As on the M5 Ultra, the firmware in `fw-text` must be this build. The boot loader loads
@@ -197,7 +195,6 @@ pub(crate) const CONFIG_ULTRA: Config = Config {
     adopt_root_entries: true,
     fabric_bridge: false,
     sleep_restart: false,
-    oslog_echo: true,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
     // On bare metal nothing vouches for the firmware the boot loader left in `fw-text`: it

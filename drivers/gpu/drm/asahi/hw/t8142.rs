@@ -45,7 +45,6 @@ pub(crate) const PROBE: Config = Config {
     adopt_root_entries: true,
     fabric_bridge: false,
     sleep_restart: false,
-    oslog_echo: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
     firmware: crate::g17::fw::variant::Firmware::Fixed(&crate::g17::fw::variant::V26A428_M5),
