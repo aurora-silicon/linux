@@ -1956,6 +1956,16 @@ static const struct apple_rtkit_ops link_report_rtkit_ops = {
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
 
+static const struct apple_rtkit_ops firmware_crashlog_rtkit_ops = {
+	.flags = APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG,
+	.syslog_is_debug = dcp_rtk_syslog_is_debug,
+	.crashed = dcp_rtk_crashed,
+	.recv_message = dcp_recv_msg,
+	.recv_message_timed = dcp_recv_msg_timed,
+	.shmem_setup = dcp_rtk_shmem_setup,
+	.shmem_destroy = dcp_rtk_shmem_destroy,
+};
+
 static const struct apple_rtkit_ops external_h17p_rtkit_ops = {
 	.flags = APPLE_RTKIT_COPROC_PLACES_BUFFERS,
 	.syslog_is_debug = dcp_rtk_syslog_is_debug,
@@ -6652,6 +6662,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 					    &external_h17p_rtkit_ops);
 	else if (dcp->hw.link_report)
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &link_report_rtkit_ops);
+	else if (dcp->hw.firmware_crashlog)
+		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &firmware_crashlog_rtkit_ops);
 	else
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
 	if (IS_ERR(dcp->rtk)) {
@@ -7108,6 +7120,7 @@ static int dcp_s2r_pm_register(struct apple_dcp *dcp);
  * - num_dptx_ports 0: it drives the panel only.
  * - adopt_live_session: iBoot leaves it running with the 27.2 image and the
  *   panel lit; Linux never starts its CPU.
+ * - firmware_crashlog: see below.
  * No sleep support: no firmware-27 sleep has run on this processor.
  */
 static const struct apple_dcp_hw_data apple_dcp_hw_t8132_v27 = {
@@ -7115,6 +7128,12 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8132_v27 = {
 	.num_dptx_ports = 0,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
+	/*
+	 * The 26B123 image asks for its crash log at an IOVA of its own
+	 * (0x100066b5000 on the J713) that the inherited SID23 tables do not
+	 * map yet: it is the firmware's, not the host's (J713 27.2 boot log).
+	 */
+	.firmware_crashlog = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext_v27 = {

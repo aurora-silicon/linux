@@ -305,6 +305,11 @@ struct apple_dcp_hw_data {
 	 */
 	bool link_report;
 	/*
+	 * The firmware keeps its crash log in memory it maps itself and asks
+	 * for it with that IOVA (APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG).
+	 */
+	bool firmware_crashlog;
+	/*
 	 * The endpoint the DPTX port services are announced on, where it is not
 	 * the firmware's default (DPTX_ENDPOINT_V2 on firmware 27): the T8142
 	 * dcpext announces them on DPTX_ENDPOINT. 0: the default.
