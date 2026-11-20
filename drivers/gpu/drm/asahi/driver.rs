@@ -270,12 +270,23 @@ unsafe fn sleep_data<'a>(dev: *mut bindings::device) -> &'a AsahiPlatformDriverD
 
 /// Runs before any device suspends, so the GPU goes first and work still in flight can finish.
 unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_int {
+    // SAFETY: Called by the PM core.
+    let data = unsafe { sleep_data(dev) };
+    // G14 on firmware 27.2: the firmware keeps running through suspend-to-idle, with nothing in
+    // flight; a sleep that powers the SoC down would lose it, and it has no cold restart, so that
+    // is refused.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    if let Some(backend) = data.g14_v27_2.as_ref() {
+        // SAFETY: Reads a global flag word.
+        if unsafe { bindings::pm_suspend_via_firmware() } {
+            return EBUSY.to_errno();
+        }
+        return kernel::error::from_result(|| backend.sleep_prepare().map(|_| 0));
+    }
     // SAFETY: Reads a global flag word.
     if !unsafe { bindings::pm_suspend_via_firmware() } {
         return 0;
     }
-    // SAFETY: Called by the PM core.
-    let data = unsafe { sleep_data(dev) };
     match data.g17.as_ref() {
         Some(gpu) => kernel::error::from_result(|| gpu.sleep_prepare().map(|_| 0)),
         None => EBUSY.to_errno(),
@@ -285,7 +296,12 @@ unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_i
 /// Runs after every device resumed. Does nothing unless [`sleep_prepare`] stopped the firmware.
 unsafe extern "C" fn sleep_complete(dev: *mut bindings::device) {
     // SAFETY: Called by the PM core.
-    if let Some(gpu) = unsafe { sleep_data(dev) }.g17.as_ref() {
+    let data = unsafe { sleep_data(dev) };
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    if let Some(backend) = data.g14_v27_2.as_ref() {
+        backend.sleep_complete();
+    }
+    if let Some(gpu) = data.g17.as_ref() {
         gpu.sleep_complete();
     }
 }
