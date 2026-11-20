@@ -6769,15 +6769,13 @@ static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
 	int error = 0;
 
 	/*
-	 * Only boards whose device tree says their s2idle has been qualified
-	 * with adopted links (apple,s2idle-retain-adopted-links): so far the
-	 * J716c, the K114c, the K116s and the J714s, the same T6050 host with
-	 * the N1 adopted on port 0. The K116s and the J714s (16- and 14-inch
-	 * M5 Pro) also have a kernel-trained SD reader port. Deeper sleep
+	 * Every host whose links the boot loader trained (hw->adopt_link) keeps
+	 * them across suspend-to-idle: the root complex, every port's link and
+	 * the devices below must still be up and in D0, which the checks below
+	 * read from the hardware, before and after the sleep. Deeper sleep
 	 * remains unqualified.
 	 */
-	if (!of_property_read_bool(pcie->dev->of_node, "apple,s2idle-retain-adopted-links") ||
-	    !pm_suspend_no_platform())
+	if (!pm_suspend_no_platform())
 		return -EBUSY;
 
 	if (!(readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN) ||
