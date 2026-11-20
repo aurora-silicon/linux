@@ -19,7 +19,7 @@
 
 	sio: dma-controller@2a1c00000 {
 		compatible = "apple,t8122-sio", "apple,sio";
-		reg = <0x2 0xa1c00000 0 0x6c000>,
+		reg = <0x2 0xa1c00000 0 0x8000>,
 		      <0x2 0xa1850000 0 0x4000>;
 		mboxes = <&sio_mbox>;
 		#dma-cells = <1>;
