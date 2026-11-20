@@ -765,7 +765,7 @@ impl Slots {
             self.compute.pending_owner[k] = None;
             self.compute.pending_arena[k] = None;
         }
-        for k in 0..2 {
+        for k in 0..sizes::RENDER_SLOTS {
             if f.pass_mask & (1 << k) != 0 {
                 self.pass_lifetime.abandon(k);
                 self.pending_pass_retarget[k] = None;
