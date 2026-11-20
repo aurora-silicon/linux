@@ -92,6 +92,15 @@
 							reg = <0>;
 						};
 
+						/* SuperSpeed: the ATC PHY */
+						port@1 {
+							reg = <1>;
+
+							typec0_ss: endpoint {
+								remote-endpoint = <&atc0_phy_typec>;
+							};
+						};
+
 						/* DisplayPort: the DCPs' display switch */
 						port@3 {
 							reg = <3>;
@@ -127,6 +136,15 @@
 							reg = <0>;
 						};
 
+						/* SuperSpeed: the ATC PHY */
+						port@1 {
+							reg = <1>;
+
+							typec1_ss: endpoint {
+								remote-endpoint = <&atc1_phy_typec>;
+							};
+						};
+
 						/* DisplayPort: the DCPs' display switch */
 						port@3 {
 							reg = <3>;
@@ -160,6 +178,15 @@
 						/* USB: not linked to its controller yet */
 						port@0 {
 							reg = <0>;
+						};
+
+						/* SuperSpeed: the ATC PHY */
+						port@1 {
+							reg = <1>;
+
+							typec3_ss: endpoint {
+								remote-endpoint = <&atc3_phy_typec>;
+							};
 						};
 
 						/* DisplayPort: the DCPs' display switch */
@@ -229,8 +256,10 @@
 			/*
 			 * USB-C back-middle: ADT atc-phy0. PS: the ATC's DP_0, DP_1 and
 			 * USB_AON power states (+0, +0x20, +0x100), PSD: its common
-			 * domain. Tunables before and after the lane crossbar setup.
-			 * The node is also the port's display switch for all DCPs.
+			 * domain, read to tell whether the PHY runs; the ATC PHY
+			 * driver powers them while the DP PHY is on. Tunables before
+			 * and after the lane crossbar setup. The node is also the
+			 * port's display switch for all DCPs.
 			 */
 			usb-c@403000000 {
 				reg = <0x4 0x03000000 0x0 0x84000>,
@@ -238,6 +267,8 @@
 				      <0x3 0x03a13700 0x0 0xc0>;
 				reg-names = "atc", "atc-ps", "atc-psd";
 				apple,dfp-endpoint = <0>;
+				/* Powered while a DCP drives it */
+				phys = <&atc0_phy PHY_TYPE_DP>;
 				/* The DCPs' display switch of the port */
 				mode-switch;
 				apple,tunable-pre =
@@ -340,8 +371,10 @@
 			/*
 			 * USB-C back-left: ADT atc-phy1. PS: the ATC's DP_0, DP_1 and
 			 * USB_AON power states (+0, +0x20, +0x100), PSD: its common
-			 * domain. Tunables before and after the lane crossbar setup.
-			 * The node is also the port's display switch for all DCPs.
+			 * domain, read to tell whether the PHY runs; the ATC PHY
+			 * driver powers them while the DP PHY is on. Tunables before
+			 * and after the lane crossbar setup. The node is also the
+			 * port's display switch for all DCPs.
 			 */
 			usb-c@40b000000 {
 				reg = <0x4 0x0b000000 0x0 0x84000>,
@@ -349,6 +382,8 @@
 				      <0x3 0x03a13800 0x0 0xc0>;
 				reg-names = "atc", "atc-ps", "atc-psd";
 				apple,dfp-endpoint = <1>;
+				/* Powered while a DCP drives it */
+				phys = <&atc1_phy PHY_TYPE_DP>;
 				/* The DCPs' display switch of the port */
 				mode-switch;
 				apple,tunable-pre =
@@ -451,8 +486,10 @@
 			/*
 			 * USB-C back-right: ADT atc-phy3. PS: the ATC's DP_0, DP_1 and
 			 * USB_AON power states (+0, +0x20, +0x100), PSD: its common
-			 * domain. Tunables before and after the lane crossbar setup.
-			 * The node is also the port's display switch for all DCPs.
+			 * domain, read to tell whether the PHY runs; the ATC PHY
+			 * driver powers them while the DP PHY is on. Tunables before
+			 * and after the lane crossbar setup. The node is also the
+			 * port's display switch for all DCPs.
 			 */
 			usb-c@413000000 {
 				reg = <0x4 0x13000000 0x0 0x84000>,
@@ -460,6 +497,8 @@
 				      <0x3 0x03a13a00 0x0 0xc0>;
 				reg-names = "atc", "atc-ps", "atc-psd";
 				apple,dfp-endpoint = <3>;
+				/* Powered while a DCP drives it */
+				phys = <&atc3_phy PHY_TYPE_DP>;
 				/* The DCPs' display switch of the port */
 				mode-switch;
 				apple,tunable-pre =
