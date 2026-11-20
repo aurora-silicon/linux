@@ -105,7 +105,7 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     sram_size: None,
 };
 
-#[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 const fn reg(slot: usize, base: RegisterBaseV27_2, size: u32, relative: u64, install: Option<u64>) -> RegisterV27_2 {
     RegisterV27_2 { slot, base, size, relative, install }
 }
@@ -113,7 +113,7 @@ const fn reg(slot: usize, base: RegisterBaseV27_2, size: u32, relative: u64, ins
 /// The firmware 27.2 register table. Writable windows outside SGX are left unmapped, except
 /// the push-telemetry window (slot 9), which the firmware shares with the PMP; it is mapped
 /// apart from the others.
-#[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 pub(crate) const REGISTERS_V27_2: &[RegisterV27_2] = {
     use RegisterBaseV27_2::{Physical, Sgx};
     &[
@@ -136,7 +136,7 @@ pub(crate) const REGISTERS_V27_2: &[RegisterV27_2] = {
 };
 
 /// Slots of the 27.2 register table whose stock mode is read-write.
-#[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 pub(crate) const WRITABLE_V27_2: u64 = {
     let mut mask = 0u64;
     let mut slot = 0;
