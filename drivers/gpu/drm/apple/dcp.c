@@ -38,6 +38,7 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/sleep.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -5845,6 +5846,19 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	}
 
 	/*
+	 * The M4 backend (iomfb_m4.c) is written for the 26.6.2 firmware path
+	 * only (apple_t8132_firmware_path()). Off it, as on a Mac mini booted
+	 * from macOS 27.2, the boot loader leaves the main DCP running idle and
+	 * hands it to nobody: never adopt or touch it. iomfb_m4_init() would
+	 * refuse such firmware too, but only after the probe has claimed the
+	 * DCP's IOMMU domain.
+	 */
+	if (hw->firmware_compat == DCP_FIRMWARE_M4 && !apple_t8132_firmware_path()) {
+		dev_info(dev, "T8132 display processor left alone off the M4 26.6.2 firmware path\n");
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+
+	/*
 	 * SoCs introduced with H17-generation firmware pin its interface; the
 	 * loader may not recognise their boot firmware version.
 	 */
@@ -7706,7 +7720,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	if (of_device_is_compatible(dev->of_node, "apple,t8132-dcpext"))
+	if (dcp_t8132_ext_m4_node(dev->of_node))
 		return dcp_platform_probe_t8132_ext(pdev);
 	if (!dcp_ext_is_failsafe(dev->of_node))
 		return dcp_platform_probe_pipe(pdev);
@@ -7782,7 +7796,7 @@ static void dcp_platform_remove(struct platform_device *pdev)
 	if (dcp)
 		av_audiosrv_quiesce(dcp);
 	/* An adopted external DCP never joined the DRM device. */
-	if (of_device_is_compatible(pdev->dev.of_node, "apple,t8132-dcpext")) {
+	if (dcp_t8132_ext_m4_node(pdev->dev.of_node)) {
 		/* Enabled with its Type-C routes, see dcp_t8132_ext_routes(). */
 		if (dcp)
 			disable_delayed_work_sync(&dcp->typec_reconnect_wq);
@@ -7848,7 +7862,7 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 	}
 
 	/* An adopted external DCP never joined the DRM device. */
-	if (of_device_is_compatible(pdev->dev.of_node, "apple,t8132-dcpext"))
+	if (dcp_t8132_ext_m4_node(pdev->dev.of_node))
 		return;
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
