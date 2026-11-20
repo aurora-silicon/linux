@@ -215,7 +215,8 @@ pub(crate) fn build(
         input.channel_ring[i] = channels.submit[i].ring.va;
     }
     for (slot, entry) in wire::LOADERS.iter().enumerate() {
-        if entry.length == 0 {
+        // An empty record, or one this ABI has no slot for, is neither mapped nor described.
+        if entry.length == 0 || layout.slot(slot).is_none() {
             continue;
         }
         let offset = entry.pa & (wire::PAGE - 1);
