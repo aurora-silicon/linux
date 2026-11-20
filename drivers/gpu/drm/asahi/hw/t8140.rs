@@ -58,7 +58,6 @@ pub(crate) const CONFIG: Config = Config {
     adopt_root_entries: true,
     fabric_bridge: true,
     sleep_restart: true,
-    oslog_echo: false,
     firmware: crate::g17::fw::variant::Firmware::Fixed(&crate::g17::fw::variant::V26A428),
     // The layouts the A18 Pro has always run with.
     core_layout: crate::g17::CoreLayout {

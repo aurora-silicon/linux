@@ -2239,10 +2239,10 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	 * echoed and takes no AP power notice while one is outstanding (T8140, and the J815
 	 * MTP, whose second sleep failed at prepare with -ETIME without it). The IOP sends
 	 * no version or capability for this; a firmware that does not use the protocol
-	 * sends no counters, so the echo never goes out. A client whose firmware has only
-	 * run with them unanswered turns it off. So does apple,sync-syslog-ack: the dcpext
-	 * that carries it (T8122) has only run with its counters unanswered; a DCP driver
-	 * that restarts its DCP across a sleep turns the echo back on.
+	 * sends no counters, so the echo never goes out. apple,sync-syslog-ack turns it
+	 * off: the dcpext that carries it (T8122) has only run with its counters
+	 * unanswered; a DCP driver that restarts its DCP across a sleep turns the echo
+	 * back on.
 	 */
 	rtk->oslog_echo = !rtk->sync_syslog_ack;
 	rtk->m5_saved.tracked = track_saved;
