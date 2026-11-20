@@ -120,6 +120,8 @@ mod j413_root;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 pub(crate) use j413_root::*;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod j313_seed;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod j313_root;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 pub(crate) use j313_root::*;

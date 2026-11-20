@@ -29,9 +29,24 @@ impl Uat {
         let mapping = req.iomap_sized::<{ crate::regs::ASC_CTL_SIZE }>()?;
         let asc = mapping.as_view();
         let ctl = asc.read32(0x44);
-        let ap = h.magic_ap.load(Ordering::Acquire);
-        let fw = h.magic_fw.load(Ordering::Acquire);
+        let mut ap = h.magic_ap.load(Ordering::Acquire);
+        let mut fw = h.magic_fw.load(Ordering::Acquire);
         dev_info!(pdev.as_ref(), "G13G pre-init: ASC control={:#x} handoff AP={:#x} FW={:#x}\n", ctl, ap, fw);
+        // A previous load of this driver that stopped the firmware leaves both magic words
+        // behind. With the ASC stopped and nothing else in the handoff, start over.
+        const STALE_MAGIC: u64 = 0x4b1d000000000003;
+        if ctl & 0x10 == 0 && fw == STALE_MAGIC && (ap == 0 || ap == STALE_MAGIC) {
+            // The ASC is stopped, so neither side holds the locks any more.
+            dev_info!(pdev.as_ref(), "G13G clearing the handoff a stopped earlier load left: lock AP={} FW={} turn={}\n",
+                h.lock_ap.load(Ordering::Acquire), h.lock_fw.load(Ordering::Acquire), h.turn.load(Ordering::Acquire));
+            h.lock_ap.store(0, Ordering::Release);
+            h.lock_fw.store(0, Ordering::Release);
+            h.turn.store(0, Ordering::Release);
+            h.magic_ap.store(0, Ordering::Release);
+            h.magic_fw.store(0, Ordering::Release);
+            ap = 0;
+            fw = 0;
+        }
         if ctl & 0x10 != 0 || ap != 0 || fw != 0 ||
             h.lock_ap.load(Ordering::Acquire) != 0 || h.lock_fw.load(Ordering::Acquire) != 0 {
             return Err(EBUSY);
@@ -167,6 +182,7 @@ impl Uat {
                             word, r.runtime_pointers, r.status_record);
                         pgtable::clean_poc(core::ptr::from_ref(r).cast(), core::mem::size_of_val(r));
                     });
+                    candidate.dump_images(device);
                     let address = candidate.gpu_va().get();
                     modern = Some(candidate);
                     address

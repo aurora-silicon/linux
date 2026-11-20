@@ -1015,6 +1015,39 @@ impl G13TrialRoot {
 
     /// After the ASC has stopped: receive-ring cursors, the first records of each
     /// ring and the firmware's own log text. Layout shared with the J613 drain.
+    /// Save every image this root publishes to the firmware as one devcoredump, for comparison
+    /// with the host's own: records of (u64 GPU address, u64 length, bytes).
+    pub(crate) fn dump_images(&self, dev: &kernel::device::Device) {
+        unsafe extern "C" {
+            fn asahi_save_rtkit_dump(dev: *mut kernel::bindings::device, data: *const u8, size: usize);
+        }
+        let mut out = KVec::<u8>::new();
+        let mut add = |a: &fw::types::GpuArray<u8>| -> Result {
+            let bytes = a.as_slice();
+            out.extend_from_slice(&a.gpu_va().get().to_le_bytes(), GFP_KERNEL)?;
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes(), GFP_KERNEL)?;
+            out.extend_from_slice(bytes, GFP_KERNEL)?;
+            Ok(())
+        };
+        let result = (|| -> Result {
+            for a in [&self.directory, &self.controller, &self.globals, &self.boot_page].into_iter().flatten() {
+                add(a)?;
+            }
+            for a in [&self.status, &self.control, &self.power, &self.extra] {
+                add(a)?;
+            }
+            for a in self._channels.iter() {
+                add(a)?;
+            }
+            Ok(())
+        })();
+        dev_info!(dev, "G13G image dump {:?}: {} bytes\n", result, out.len());
+        if result.is_ok() {
+            // SAFETY: the device is live and the buffer is copied before this returns.
+            unsafe { asahi_save_rtkit_dump(dev.as_raw(), out.as_ptr(), out.len()) };
+        }
+    }
+
     pub(crate) fn report_stopped_receive(&self) {
         use crate::m3::m3_init_26 as extended;
         let dev = self.graph.dev.as_ref();
@@ -1582,8 +1615,9 @@ impl G13TrialRoot {
                     let page_start = physical - subpage as u64;
                     let page_end = page_start.checked_add(span as u64).ok_or(EOVERFLOW)?;
                     // The admission-only profile can describe shared SoC registers.
-                    // On live bring-up give write access only to full pages owned by SGX.
-                    if live && writable && (page_start < sgx || page_end > sgx_end) && !(real_dashboard && slot == 9) {
+                    // On live bring-up give write access only to full pages owned by SGX. On T8103
+                    // the PMP telemetry window ("dashboard") is slot 5.
+                    if live && writable && (page_start < sgx || page_end > sgx_end) && !(real_dashboard && slot == 5) {
                         continue;
                     }
                     // Place the optional read-only mapping after the fixed SGX register set
@@ -1780,6 +1814,57 @@ impl G13TrialRoot {
                         hw[sram..sram+4].copy_from_slice(&sram_mv.to_le_bytes());
                     }
                 }
+                // G13G: the inline block as the 27.2.1 (26B131) host fills it on T8103. The
+                // per-state tables follow the device tree; the remaining words are that host's
+                // fixed values for this GPU.
+                {
+                    let put = |hw: &mut [u8], at: usize, v: u32| hw[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                    for (at, v) in [(0xfe4, 1), (0xff4, 8), (0x1000, 1), (0x1004, 1), (0x1020, 0x1f),
+                                    (0x1050, 1), (0x1068, 0x31), (0x1088, 1), (0x10a4, 8), (0x10a8, 1),
+                                    (0x10cc, 0), (0x10d0, 0), (0x10d4, 2),
+                                    (0x2664, 4), (0x2668, 3), (0x266c, 7), (0x2670, 7), (0x267c, 0),
+                                    (0x268c, 1), (0x2690, 0x3e9f_ee5c), (0x2694, 0xffff_fffe),
+                                    (0x2698, 0x3e9f_ee5c), (0x269c, 0xffff_fffe), (0x26a8, 0xe_0000),
+                                    (0x26b0, 1), (0x26b4, 1), (0x26b8, 0), (0x26c0, 1), (0x26c4, 1),
+                                    (0x277c, 0x1_0000), (0x2780, 0x1_0000)] {
+                        put(hw, at, v);
+                    }
+                    hw[0x26d0..0x2700].fill(0xff);
+                    // One SRAM voltage per state (lane 0) and no second frequency series.
+                    for i in 0..abi::COMMON26_HW_PERF_ROWS {
+                        let row = abi::COMMON26_HW_PERF_SRAM_VOLTAGE + i * abi::COMMON26_HW_PERF_ROW_STRIDE;
+                        hw[row + 4..row + abi::COMMON26_HW_PERF_ROW_STRIDE].fill(0);
+                    }
+                    hw[0x1924..0x1964].fill(0);
+                    let n = states.len();
+                    for i in 0..n {
+                        put(hw, abi::COMMON26_HW_PERF_SCALE + 4 * i, crate::f32!(1.02).to_bits());
+                    }
+                    for i in 0..abi::COMMON26_HW_PERF_ROWS {
+                        put(hw, abi::COMMON26_HW_PERF_INDEX_MAP + 4 * i, i as u32);
+                    }
+                    let baseline = states[0].pwr_mw;
+                    let top = states[n - 1].pwr_mw;
+                    if top > baseline {
+                        let span = crate::float::F32::from(top - baseline);
+                        for (i, state) in states.iter().enumerate().skip(1) {
+                            let v = crate::float::F32::from(state.pwr_mw.saturating_sub(baseline))
+                                * crate::f32!(100.0) / span;
+                            put(hw, abi::COMMON26_HW_PERF_RELATIVE_A + 4 * i, v.to_bits());
+                        }
+                    }
+                    let base_idx = pwr.perf_base_pstate as usize;
+                    let base_hz = states.get(base_idx).ok_or(EINVAL)?.freq_hz;
+                    let top_hz = states[n - 1].freq_hz;
+                    if top_hz > base_hz {
+                        let span = crate::float::F32::from(top_hz - base_hz);
+                        for (i, state) in states.iter().enumerate().skip(base_idx + 1) {
+                            let v = crate::float::F32::from(state.freq_hz - base_hz)
+                                * crate::f32!(100.0) / span;
+                            put(hw, abi::COMMON26_HW_PERF_RELATIVE_B + 4 * i, v.to_bits());
+                        }
+                    }
+                }
                 dev_info!(graph.dev.as_ref(), "G13G {} checked MMIO translations; {} operating points, boot SRAM table={}\n",
                     register_mappings.len(), states.len(), sram_table.is_some());
                 crate::pgtable::clean_poc(hw.as_ptr(), hw.len());
@@ -1791,6 +1876,12 @@ impl G13TrialRoot {
                     if offset == 0x485 {
                         let pwr = &graph.dyncfg.pwr;
                         let policy = owner.as_mut_slice();
+                        if crate::module_parameters::t8112_g13_seed.value() == 1 {
+                            for &(at, value) in super::j313_seed::CONTROLLER {
+                                let at = at as usize;
+                                policy[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                            }
+                        }
                         let max_state = (pwr.perf_states.len() as u32 - 1) * 100;
                         for offset in [0x222c, 0x2880] {
                             policy[offset..offset + 4].copy_from_slice(&max_state.to_le_bytes());
@@ -2044,6 +2135,25 @@ impl G13TrialRoot {
             }
             // Hardware configuration +0xff0 is zero in this profile.
             data[0x6e..0x72].copy_from_slice(&1u32.to_le_bytes());
+            // G13G: the controller settings the 27.2.1 host publishes on T8103. The power budget
+            // and state ceiling come from the device tree; the rest are that host's constants.
+            let ceiling = pwr.perf_max_pstate * 100;
+            for (at, value) in [(0x24, 3000u32), (0x30, 1), (0x38, 1), (0x40, 120),
+                                (0x60, 0x1_0000), (0x64, 0x1_0000), (0x68, 0x3_0000), (0x78, 1),
+                                (0x84, pwr.max_power_mw), (0x88, ceiling), (0x8c, ceiling), (0x98, ceiling),
+                                (0x128, u32::MAX), (0x18c, 0xffff), (0x1b4, 0x800), (0x1d0, u32::MAX),
+                                (0x1e8, u32::MAX), (0x6bc, 0xc0_0007), (0x7ec, 1), (0x7f0, 1),
+                                (0x7f4, 100), (0x7f8, 100), (0x990, 400_000), (0x998, 40), (0x99c, 10),
+                                (0x9a0, 250), (0x9a4, 1), (0x9b8, 2), (0x9bc, 40), (0x9c0, 5),
+                                (0x9c8, 40), (0x9cc, 50), (0x9d0, 1), (0x9d8, 50), (0xe08, 250),
+                                (0xe28, 3), (0xe2c, 1)] {
+                data[at..at+4].copy_from_slice(&value.to_le_bytes());
+            }
+            // Unset slots of the per-state arrays start as all ones.
+            data[0xec..0x128].fill(0xff);
+            data[0x1bc..0x1d0].fill(0xff);
+            data[0x1dc..0x1e8].fill(0xff);
+            data[0x1b8..0x1bc].copy_from_slice(&0x1555u32.to_le_bytes());
             crate::pgtable::clean_poc(data.as_ptr(), data.len());
             Some(globals)
         } else {
@@ -2066,6 +2176,42 @@ impl G13TrialRoot {
                       graph.dyncfg.uat_ttb_base);
         }
         let mut power = alloc.shared.array_empty(if board { 0x6a0 } else if directory_layout.is_some() { 0x698 } else { 0x670 })?;
+        if board {
+            // G13G: the power controller's cold settings as the 27.2.1 host fills them on T8103,
+            // from the device tree where it has the value.
+            let data = power.as_mut_slice();
+            let period = pwr.power_sample_period.max(1);
+            let dt = crate::float::F32::from(period) / crate::f32!(1000.0);
+            let zone = pwr.power_zones.first();
+            let words: [(usize, u32); 30] = [
+                (0x0c, 1),
+                (0x10, pwr.avg_power_filter_tc_ms / period),
+                (0x14, (pwr.avg_power_ki_only * dt).to_bits()),
+                (0x18, pwr.avg_power_kp.to_bits()),
+                (0x1c, pwr.avg_power_min_duty_cycle),
+                (0x20, pwr.avg_power_target_filter_tc),
+                (0x24, zone.map_or(0, |z| z.target)),
+                (0x28, zone.map_or(0, |z| z.target.saturating_sub(z.target_offset))),
+                (0x2c, zone.map_or(0, |z| z.filter_tc)),
+                (0xc8, 9880), (0xcc, 8000), (0xd0, (-220i32) as u32),
+                (0xd8, pwr.fast_die0_proportional_gain.to_bits()),
+                (0xdc, (pwr.fast_die0_integral_gain * dt).to_bits()),
+                (0xf0, 9900), (0xf4, 200),
+                (0x108, crate::f32!(100.0).to_bits()), (0x10c, crate::f32!(400.0).to_bits()),
+                (0x110, 200),
+                (0x12c, pwr.max_power_mw),
+                (0x130, pwr.ppm_kp.to_bits()),
+                (0x134, (pwr.ppm_ki * dt).to_bits()),
+                (0x5e0, 1),
+                (0x624, crate::f32!(15.0).to_bits()), (0x628, crate::f32!(5.0).to_bits()),
+                (0x62c, 32), (0x630, pwr.perf_max_pstate * 100), (0x640, 500), (0x68c, 1),
+                (0x5e4, 0x1b),
+            ];
+            for (at, value) in words {
+                data[at..at+4].copy_from_slice(&value.to_le_bytes());
+            }
+            crate::pgtable::clean_poc(data.as_ptr(), data.len());
+        }
         if power_filter {
             // Cold mirrors only. A runtime update must also publish its filter length.
             let gains = graph.initdata.runtime_pointers.hwdata_a.with(|a, _|

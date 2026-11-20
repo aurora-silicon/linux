@@ -425,6 +425,10 @@ module! {
             default: false,
             description: "J413 idle trial: request and release GPU power through the idle policy",
         },
+        t8112_g13_seed: u32 {
+            default: 0,
+            description: "T8103 27.2 bring-up: seed the power controller with the host's static words (1)",
+        },
         t8112_handshake: u32 {
             default: 0,
             description: "J413 GPU trial: 1 UAT, 2 legacy InitData, 3-6 neighbouring ABI controls, 7 G14G root, 9/10 extended channel construction, 11 J413 stopped construction, 12 J413 startup with writable MMIO limited to SGX, 13 one kernel-owned compute fence, 14 matching idle control",
