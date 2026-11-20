@@ -109,6 +109,22 @@ pub(crate) mod t8132 {
                     0xa4, 0x07, 0xa6, 0xf2, 0x22, 0x6c,
                 ],
             },
+            FirmwareBuild {
+                // The 26B123 (macOS 27.2; 26B131 carries the same image) build b000 as loaded
+                // on a J773g, with every range iBoot fills zeroed (`BOOT_FILLED_26B123_B000`).
+                // DATA is the `fw-data` region: __DATA (0xd0000) and its __DATA_SHARED_RO tail
+                // (0x8000), which the boot loader reserves as one.
+                name: "Apple GFX 26B123 (build b000, iBoot-filled ranges zeroed)",
+                text_size: 0x64000,
+                data_size: 0xd8000,
+                entropy: &[[0x60a1b, 0x60afe]],
+                boot_filled: BOOT_FILLED_26B123_B000,
+                text_sha256: [
+                    0x48, 0x4c, 0x43, 0xcb, 0x79, 0x89, 0x00, 0xdd, 0x14, 0x65, 0x4e, 0xd5, 0x4e,
+                    0xfe, 0x16, 0x24, 0xb4, 0x3d, 0xe3, 0xce, 0x80, 0x28, 0xb7, 0x71, 0x42, 0x5d,
+                    0x63, 0xbc, 0xc6, 0xa7, 0x2c, 0x92,
+                ],
+            },
         ],
     };
 
@@ -167,6 +183,154 @@ pub(crate) mod t8132 {
         (0x5ce64, 0x34c),
     ];
 }
+
+/// What iBoot writes into the 26B123 build b000 TEXT it loads: the same two header words and
+/// the same 39 boot parameter records and two tunable tables as 25G83, which the 26B123 image
+/// places 0x413c bytes later (`_rtk_patchbay` at 0x60a1b, `_rtk_tunables` at 0x60c4c).
+pub(crate) const BOOT_FILLED_26B123_B000: &[(u32, u32)] = &[
+        (0x224, 4),
+        (0x23c, 8),
+        (0x60a23, 8),
+        (0x60a33, 8),
+        (0x60a43, 8),
+        (0x60a53, 8),
+        (0x60a63, 8),
+        (0x60a73, 8),
+        (0x60a83, 8),
+        (0x60a93, 4),
+        (0x60a9f, 1),
+        (0x60aa8, 8),
+        (0x60ab8, 8),
+        (0x60ac8, 4),
+        (0x60ad4, 8),
+        (0x60ae4, 1),
+        (0x60aed, 1),
+        (0x60af6, 8),
+        (0x60b06, 8),
+        (0x60b16, 8),
+        (0x60b26, 8),
+        (0x60b36, 8),
+        (0x60b46, 8),
+        (0x60b56, 8),
+        (0x60b66, 8),
+        (0x60b76, 8),
+        (0x60b86, 8),
+        (0x60b96, 8),
+        (0x60ba6, 8),
+        (0x60bb6, 4),
+        (0x60bc2, 8),
+        (0x60bd2, 4),
+        (0x60bde, 4),
+        (0x60bea, 8),
+        (0x60bfa, 8),
+        (0x60c0a, 1),
+        (0x60c13, 8),
+        (0x60c23, 8),
+        (0x60c33, 4),
+        (0x60c3f, 1),
+        (0x60c48, 4),
+        (0x60c4f, 1),
+        (0x60c50, 0x34c),
+        (0x60f9f, 1),
+        (0x60fa0, 0x34c),
+];
+
+/// Which part of the loaded image a firmware page-table leaf maps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Segment {
+    Text,
+    Data,
+}
+
+/// One range of the firmware's own page tables as the boot loader builds them: offsets from
+/// [`UPPER`], the segment whose physical pages back them (at the same offset from the segment's
+/// start), and the exact leaf attribute bits.
+pub(crate) struct Leaves {
+    pub(crate) range: Range<u64>,
+    pub(crate) segment: Segment,
+    pub(crate) attrs: u64,
+}
+
+/// The loaded-image layout of one firmware ABI: the boot loader's handoff for it, the regions
+/// it reserves, the firmware page tables it builds, and where the boot path writes.
+pub(crate) struct FwLayout {
+    pub(crate) name: &'static str,
+    /// `apple,g16-handoff-version`, `apple,firmware-segment-vas` and `-flags`.
+    pub(crate) handoff_version: u32,
+    pub(crate) segment_vas: &'static [u64],
+    pub(crate) segment_flags: &'static [u32],
+    /// Sizes of the reserved `fw-text` and `fw-data` regions (`fw-data` holds every segment
+    /// after TEXT).
+    pub(crate) text_size: u64,
+    pub(crate) data_size: u64,
+    /// Every leaf of the firmware's own page tables, in VA order; `None` until known, which
+    /// refuses the firmware.
+    pub(crate) leaves: Option<&'static [Leaves]>,
+    /// DATA offset of the loader table, the only host write to the loaded DATA; `None` until
+    /// known, which refuses the firmware start.
+    pub(crate) loader_table: Option<u64>,
+}
+
+impl FwLayout {
+    /// Whether a boot loader's handoff describes this layout.
+    pub(crate) fn matches(&self, version: u32, vas: &[u64], flags: &[u32]) -> bool {
+        version == self.handoff_version && vas == self.segment_vas && flags == self.segment_flags
+    }
+}
+
+/// 25G83 (macOS 26.x): __TEXT 0x60000, __DATA 0x13c000.
+pub(crate) const FW_25G83: FwLayout = FwLayout {
+    name: "25G83",
+    handoff_version: 1,
+    segment_vas: &[UPPER, UPPER + 0x60000],
+    segment_flags: &[1, 0],
+    text_size: 0x60000,
+    data_size: 0x13c000,
+    leaves: Some(&[
+        Leaves {
+            range: 0..0x50000,
+            segment: Segment::Text,
+            attrs: 0x4c3,
+        },
+        Leaves {
+            range: 0x50000..0x58000,
+            segment: Segment::Text,
+            attrs: 0x483,
+        },
+        Leaves {
+            range: 0x58000..0x60000,
+            segment: Segment::Text,
+            attrs: 0x4c3,
+        },
+        Leaves {
+            range: 0x60000..0x6c000,
+            segment: Segment::Data,
+            attrs: 0x00200000000004c3,
+        },
+        Leaves {
+            range: 0x6c000..0x19c000,
+            segment: Segment::Data,
+            attrs: 0x0460000000000443,
+        },
+    ]),
+    loader_table: Some(0x1332f0),
+};
+
+/// 26B123 (macOS 27.2, also 26B131): __TEXT 0x64000, __DATA 0xd0000 and a __DATA_SHARED_RO
+/// 0x8000 right after it (aura's handoff version 2; `fw-data` covers both).
+pub(crate) const FW_26B123: FwLayout = FwLayout {
+    name: "26B123",
+    handoff_version: 2,
+    segment_vas: &[UPPER, UPPER + 0x64000, UPPER + 0x134000],
+    segment_flags: &[1, 0x10, 0],
+    text_size: 0x64000,
+    data_size: 0xd8000,
+    leaves: None,
+    loader_table: None,
+};
+
+/// The firmware layouts this backend knows, newest last.
+pub(crate) const FW_LAYOUTS: &[&FwLayout] = &[&FW_25G83, &FW_26B123];
 
 /// User VA range reported as `vm_start..vm_end`: 42 bits with the final two pages excluded.
 pub(crate) const USER_RANGE: Range<u64> = 0x4000..0x3ffffff8000;

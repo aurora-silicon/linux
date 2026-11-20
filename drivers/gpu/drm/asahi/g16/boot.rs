@@ -629,7 +629,15 @@ fn run(
     channels.stage_boot_nop(session)?;
     // This table is the only host write to the loaded DATA segment. It is empty on cold entry.
     let table = init.loader_bytes();
-    let loader = regs::Mapping::write_combined(session.adt.data.start + 0x1332f0, table.len())?;
+    let Some(loader_offset) = session.adt.layout.loader_table else {
+        dev_err!(
+            dev,
+            "G16: the {} firmware start is not supported yet\n",
+            session.adt.layout.name
+        );
+        return Err(ENOTSUPP);
+    };
+    let loader = regs::Mapping::write_combined(session.adt.data.start + loader_offset, table.len())?;
     for _ in 0..2 {
         for offset in (0..table.len()).step_by(4) {
             if loader.io().try_read32(offset)? != 0 {
