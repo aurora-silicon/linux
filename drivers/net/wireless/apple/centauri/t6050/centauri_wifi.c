@@ -747,7 +747,8 @@ static void command_fault(struct centauri_t6050_wifi *wifi, u32 id,
 		netif_stop_queue(wifi->netdev);
 	if (smp_load_acquire(&wifi->irq_ready))
 		schedule_work(&wifi->link_work);
-	centauri_t6050_request_transport_recover(wifi->control);
+	if (!READ_ONCE(wifi->stopping) && !READ_ONCE(wifi->control->removing))
+		centauri_t6050_request_transport_recover(wifi->control);
 }
 
 static bool command_payload_consumed(struct centauri_t6050_wifi *wifi, u16 slot)

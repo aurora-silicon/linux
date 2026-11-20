@@ -17,7 +17,7 @@ import tempfile
 
 
 def block(source, name):
-    match = re.search(r"^(?:static )?(?:int|void) " + re.escape(name) + r"\(", source, re.M)
+    match = re.search(r"^(?:static )?(?:int|void) " + re.escape(name) + r"\([^;]*?\)\n\{", source, re.M)
     if not match:
         raise RuntimeError(f"Production function {name} missing")
     brace = source.index("{", match.start())
@@ -66,7 +66,8 @@ struct centauri_t6050_wifi {
     struct { u8 *window, *bar; uint64_t window_dma; } a;
     int lock, connect_work, link_work, data_tx_queue;
     bool command_failed, stopping, connect_abort, disconnect_pending, connected;
-    bool reply_valid, pm_prepared;
+    bool reply_valid, pm_prepared, configured, data_failed, irq_ready;
+    struct net_device *netdev;
     u16 command_head, sequence, reply_capture, reply_sequence, reply_status;
     u32 reply_command;
     u8 *reply_buffer;
@@ -96,9 +97,14 @@ static void index_write(struct centauri_t6050_wifi *wifi, int array, int index, 
 static void put_unaligned_le16(u16 value, void *p) { memcpy(p, &value, 2); }
 static void put_unaligned_le32(u32 value, void *p) { memcpy(p, &value, 4); }
 static void put_unaligned_le64(uint64_t value, void *p) { memcpy(p, &value, 8); }
-static void command_fault(struct centauri_t6050_wifi *wifi, u32 id,
-                          u32 wifi_stage, const char *reason)
-{ (void)id; (void)wifi_stage; (void)reason; wifi->command_failed = true; }
+static unsigned int recovery_requests;
+#define smp_load_acquire(p) (*(p))
+static void log_transport_fault(struct centauri_t6050_wifi *wifi, u32 id,
+                                u32 stage, const char *reason)
+{ (void)wifi; (void)id; (void)stage; (void)reason; }
+static void schedule_work(int *work) { (void)work; }
+static void centauri_t6050_request_transport_recover(struct centauri_t6050 *control)
+{ (void)control; recovery_requests++; }
 static void drain(struct centauri_t6050_wifi *wifi)
 {
     assert(wifi->lock);
@@ -242,6 +248,16 @@ int main(void)
     expect_error(-ENOSPC);
 
     prepare();
+    recovery_requests = 0;
+    wifi.stopping = true;
+    wifi.configured = true;
+    mutex_lock(&wifi.lock);
+    command_fault(&wifi, 0, 2, "cancel");
+    mutex_unlock(&wifi.lock);
+    assert(wifi.command_failed && wifi.data_failed && !wifi.configured);
+    assert(recovery_requests == 0);
+
+    prepare();
     transport_mode = LOST;
     assert(disconnect() == -EIO);
     assert(wifi.pm_disconnect.submitted && !wifi.pm_disconnect.replied);
@@ -312,7 +328,7 @@ def main():
     receipt = re.search(r"struct centauri_wifi_disconnect_receipt \{.*?\n\};", source, re.S)
     if not receipt:
         raise RuntimeError("Production receipt structure missing")
-    names = ["command_reply", "wait_disconnect", "wifi_disconnect",
+    names = ["command_fault", "command_reply", "wait_disconnect", "wifi_disconnect",
              "centauri_t6050_wifi_pm_prepare", "centauri_t6050_wifi_pm_error",
              "centauri_t6050_wifi_pm_complete", "wifi_suspend"]
     has_resume = bool(re.search(r"^static int wifi_resume\(", source, re.M))
