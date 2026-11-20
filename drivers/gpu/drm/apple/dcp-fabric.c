@@ -552,6 +552,7 @@ static int dcp_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
 	return ret;
 }
 
+/* A desktop external processor on firmware 27: T6041's, or the J773g's T8132 one. */
 static bool dcp_t6041_ext_v27(const struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->desktop_external;
