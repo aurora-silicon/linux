@@ -3702,7 +3702,7 @@ static void tipd_port_list_del(struct tps6598x *tps)
 /* The J714s's port controllers take "DISC" unlocked with this key, the reversed target identifier. */
 static const u8 tipd_replug_key_j714s[4] = { '4', '1', '7', 'J' };
 
-static bool tipd_replug_supported(struct tps6598x *tps)
+bool tipd_replug_supported(struct tps6598x *tps)
 {
 	return of_machine_is_compatible("apple,j714s") &&
 	       device_is_compatible(tps->dev, "apple,sn201202x");
@@ -3769,6 +3769,23 @@ static void tipd_replug_work(struct work_struct *work)
 			 seconds, tries);
 }
 
+/* Context: tipd_ports_lock held, @tps on tipd_ports. */
+static int tipd_replug_queue(struct tps6598x *tps, u8 seconds)
+{
+	int ret;
+
+	lockdep_assert_held(&tipd_ports_lock);
+	if (!tipd_replug_supported(tps))
+		return -EOPNOTSUPP;
+	if (work_pending(&tps->replug_work))
+		return -EBUSY;
+	tps->replug_seconds = seconds;
+	ret = queue_work(system_freezable_wq, &tps->replug_work) ? 0 : -EBUSY;
+	dev_info(tps->dev, "port replug for its partner requested (%u s disconnected): %d\n",
+		 seconds, ret);
+	return ret;
+}
+
 /**
  * tipd_port_replug - disconnect and reattach a port, as a cable pulled and plugged back does
  * @sw: the USB role switch the port drives
@@ -3791,16 +3808,7 @@ int tipd_port_replug(struct usb_role_switch *sw, u8 seconds)
 	list_for_each_entry(tps, &tipd_ports, port_node) {
 		if (tps->role_sw != sw)
 			continue;
-		ret = -EOPNOTSUPP;
-		if (!tipd_replug_supported(tps))
-			break;
-		ret = -EBUSY;
-		if (work_pending(&tps->replug_work))
-			break;
-		tps->replug_seconds = seconds;
-		ret = queue_work(system_freezable_wq, &tps->replug_work) ? 0 : -EBUSY;
-		dev_info(tps->dev, "port replug for its partner requested (%u s disconnected): %d\n",
-			 seconds, ret);
+		ret = tipd_replug_queue(tps, seconds);
 		break;
 	}
 	mutex_unlock(&tipd_ports_lock);
@@ -3808,6 +3816,19 @@ int tipd_port_replug(struct usb_role_switch *sw, u8 seconds)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(tipd_port_replug);
+
+/*
+ * The same replug for this port, asked for through debugfs ("replug"). -ENODEV while the port is
+ * not on tipd_ports: without a role switch, and from tipd_port_list_del() on, which cancels the
+ * work after taking the port off, so nothing is queued after it.
+ */
+int tipd_replug_request(struct tps6598x *tps, u8 seconds)
+{
+	guard(mutex)(&tipd_ports_lock);
+	if (!tps->port_node.next || list_empty(&tps->port_node))
+		return -ENODEV;
+	return tipd_replug_queue(tps, seconds);
+}
 
 int tipd_init(struct tps6598x *tps)
 {
@@ -3973,8 +3994,8 @@ int tipd_init(struct tps6598x *tps)
 			enable_irq_wake(tps->irq);
 	}
 
-	tipd_debugfs_register(tps);
 	tipd_port_list_add(tps);
+	tipd_debugfs_register(tps);
 	if (tps->data->ready)
 		tps->data->ready(tps);
 

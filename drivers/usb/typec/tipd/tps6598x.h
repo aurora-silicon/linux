@@ -549,6 +549,8 @@ extern const struct regmap_config tps6598x_regmap_config;
 
 int tipd_init(struct tps6598x *tps);
 void tipd_remove(struct tps6598x *tps);
+bool tipd_replug_supported(struct tps6598x *tps);
+int tipd_replug_request(struct tps6598x *tps, u8 seconds);
 int tipd_prepare(struct device *dev);
 void tipd_complete(struct device *dev);
 int tipd_suspend(struct tps6598x *tps);
