@@ -177,6 +177,7 @@ bool apple_sleep_debug_link_up(void);
  * device has resumed, as macOS does from a dark wake.
  */
 void apple_sleep_lid_closed_wake(void);
+void apple_sleep_port_wake(bool lid_closed);
 
 /*
  * From the SMC's driver, in its noirq resume: the lid as it reads now, after every
@@ -374,6 +375,10 @@ static inline bool apple_sleep_debug_link_up(void)
 }
 
 static inline void apple_sleep_lid_closed_wake(void)
+{
+}
+
+static inline void apple_sleep_port_wake(bool lid_closed)
 {
 }
 

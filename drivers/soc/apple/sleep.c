@@ -2643,7 +2643,7 @@ static bool sleep_ps_on(struct apple_sleep *s, u32 offset)
 /* Below full power the hardware has idled it, and its registers may not answer. */
 static bool sleep_ps_full(struct apple_sleep *s, u32 offset)
 {
-	return FIELD_GET(PS_ACTUAL, readl(s->ps + offset)) == FIELD_MAX(PS_ACTUAL);
+	return FIELD_GET(PS_ACTUAL, readl(sleep_power_reg(s, offset))) == FIELD_MAX(PS_ACTUAL);
 }
 
 /*
@@ -3697,6 +3697,21 @@ void apple_sleep_lid_closed_wake(void)
 	pm_set_dark_wake();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_wake);
+
+/*
+ * macOS leaves a wake for a charger or a cable alone a dark one. With the lid closed
+ * nothing there is for the user: sleep again.
+ */
+void apple_sleep_port_wake(bool lid_closed)
+{
+	struct apple_sleep *s = apple_sleep;
+
+	if (!s || !s->smc_woke_alone || !lid_closed)
+		return;
+	dev_info(s->dev, "woken for a port with the lid closed: dark wake\n");
+	pm_set_dark_wake();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_port_wake);
 
 /* Read in the SMC's noirq resume. Forgotten as each sleep begins. */
 static int sleep_lid_closed = -ENODATA;
@@ -6685,12 +6700,17 @@ static int apple_sleep_prepare(void)
 }
 
 /* Only the SMC's sources woke the SoC. */
+static bool t6050_smc_woke_alone(struct apple_sleep *s);
+
 static bool apple_sleep_smc_woke_alone(struct apple_sleep *s)
 {
 	const struct apple_sleep_wake_name *names = s->soc->wake_names;
 	u32 smc[WAKE_WORDS] = {};
 	bool any = false;
 	int i;
+
+	if (s->soc->regions)
+		return t6050_smc_woke_alone(s);
 
 	/* SMC.CPUWakeupAP and SMC.OutboxNotEmpty, by their names. */
 	for (i = 0; i < s->soc->nwake_names; i++) {

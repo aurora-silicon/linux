@@ -1153,17 +1153,22 @@ static int apple_probe_per_dcp(struct device *dev,
 				      (zpos <= 1 || surf != top_surf);
 
 			/*
-			 * The T8142 runs macOS 27.0's DCP firmware as firmware
-			 * 27, outside the H17G profile, and blends XRGB's X
-			 * byte as alpha all the same (GPU-rendered alacritty
-			 * showed wrong colours on the panel).
+			 * T8142 and T6041 run firmware 27 outside the H17G
+			 * profile and blend XRGB's fourth byte as straight
+			 * alpha all the same (on AGX, B8G8R8X8 leaves PBE
+			 * Swizzle A at channel 0, storing X = R and turning
+			 * R = 0 blues and cyans black on the panel).
 			 */
 			bool xrgb_is_alpha =
 				dcp_data->hw.iomfb_method_profile ==
 					DCP_IOMFB_METHODS_H17G ||
 				(dcp_data->fw_compat == DCP_FIRMWARE_V_27_0 &&
-				 of_device_is_compatible(dcp_data->dev->of_node,
-							 "apple,t8142-dcp"));
+				 (of_device_is_compatible(dcp_data->dev->of_node,
+							  "apple,t8142-dcp") ||
+				  of_device_is_compatible(dcp_data->dev->of_node,
+							  "apple,t6041-dcp") ||
+				  of_device_is_compatible(dcp_data->dev->of_node,
+							  "apple,t6041-dcpext")));
 
 			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 							supports_l10r,
@@ -1254,8 +1259,11 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 	unsigned int n, nr_ports = dcp_typec_nr_ports();
 	bool fixed = dcp_typec_fixed_crtcs();
 	unsigned int slots = fixed ? num_dcp : (dcp_typec_dual_stream() ? 2 : 1);
-	/* T6050 creates its tunnel-only port/pipeline pairs in a second pass. */
-	unsigned int passes = fixed ? 2 : 1;
+	/*
+	 * Connectors are created in passes, by connector group; on T6050, in a
+	 * group, the tunnel-only port/pipeline pairs after the others.
+	 */
+	unsigned int passes = dcp_typec_nr_passes();
 	int i, ret;
 
 	/* Keep the existing physical-port connector numbers stable. On the
@@ -1283,13 +1291,14 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		if (fixed) {
 			if (!dcp_typec_port_has_candidate(port_idx, pipeline))
 				continue;
-			/* T6050: tunnel-only pairs in the second pass */
-			if (dcp_typec_port_tunnel_only(port_idx, pipeline) != pass)
+			if (dcp_typec_port_pass(port_idx, pipeline) != pass)
 				continue;
 			mask = crtc_mask[idx / nr_ports];
 			if (!mask)
 				continue;
 		} else {
+			if (dcp_typec_port_pass(port_idx, NULL) != pass)
+				continue;
 			for (i = 0; i < num_dcp; i++) {
 				if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
 					continue;
