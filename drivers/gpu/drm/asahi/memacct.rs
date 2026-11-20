@@ -273,6 +273,23 @@ impl Usage {
         self.hold(bytes);
     }
 
+    /// Creates a new [`Usage`] on the same ledger and client holding the same number of bytes,
+    /// without checking limits: used to hand a removed record's charge to a surviving piece right
+    /// before the removed record is dropped.
+    pub(crate) fn transfer_copy(&self) -> Self {
+        let mut copy = Self::new(self.ledger, self.client.clone());
+        copy.add(self.bytes);
+        copy
+    }
+
+    /// Creates a new [`Usage`] on the same ledger and client charged `bytes` if both limits
+    /// admit it; otherwise fails with `ENOMEM` and charges nothing.
+    pub(crate) fn try_fork(&self, bytes: u64) -> Result<Self> {
+        let mut copy = Self::new(self.ledger, self.client.clone());
+        copy.try_add(bytes)?;
+        Ok(copy)
+    }
+
     fn hold(&mut self, bytes: u64) {
         self.client.resident.fetch_add(bytes, Ordering::AcqRel);
         self.ledger.user_resident.fetch_add(bytes, Ordering::AcqRel);

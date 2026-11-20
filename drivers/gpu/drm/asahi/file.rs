@@ -167,41 +167,20 @@ impl Drop for Vm {
             // object must not outlive the client's VM handle.
             status.release_mirror();
         }
-        if self.vm.status().is_some() {
-            // Tracked jobs can outlive their file's VM handle. Their last guard performs
-            // these unmaps once no accepted work can still dereference the mappings.
-            if let Err(error) = self
-                .vm
-                .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
-            {
-                pr_err!("Vm::Drop: deferred user unmap failed: {:?}\n", error);
-            }
-            self.vm.bo_deferred_cleanup();
-            self.gpu.vm_closed(&self.vm);
-            return;
-        }
-        // When the user Vm is dropped, verify that no user mappings exists.
-        let left_range = self.user_range.start..self.kernel_range.start;
-        let right_range = self.kernel_range.end..self.user_range.end;
-
-        if !left_range.is_empty()
-            && self
-                .vm
-                .unmap_range(None, left_range.start, left_range.range())
-                .is_err()
+        // Tracked jobs can outlive their file's VM handle: their last guard runs the
+        // teardown once no accepted work can still dereference the mappings. On
+        // untracked VMs this unmaps every user GPUVA at once without allocating or
+        // charging split nodes, so teardown succeeds even at the client's memory limit.
+        if let Err(error) = self
+            .vm
+            .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
         {
-            pr_err!("Vm::Drop: vm.unmap_range() failed\n");
+            pr_err!("Vm::Drop: user unmap failed: {:?}\n", error);
         }
-        if !right_range.is_empty()
-            && self
-                .vm
-                .unmap_range(None, right_range.start, right_range.range())
-                .is_err()
-        {
-            pr_err!("Vm::Drop: vm.unmap_range() failed\n");
-        }
-
         self.vm.bo_deferred_cleanup();
+        if self.vm.status().is_some() {
+            self.gpu.vm_closed(&self.vm);
+        }
     }
 }
 
