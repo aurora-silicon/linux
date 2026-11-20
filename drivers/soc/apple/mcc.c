@@ -33,7 +33,8 @@
 #define MCC_CACHE_FLUSH		0x2844
 #define MCC_CACHE_FLUSH_BUSY	BIT(0)
 
-#define MCC_MAX_PLANES		32
+/* T6050: eight AMCCs of four planes on each die, 64 planes on two dies. */
+#define MCC_MAX_PLANES		64
 #define MCC_FLUSH_TIMEOUT_US	100000
 
 struct apple_mcc {
@@ -141,8 +142,17 @@ static int apple_mcc_wait_boot_dma(struct device *dev)
 	int ret;
 
 	of_for_each_phandle(&it, ret, dev->of_node, "apple,boot-dma-devices", NULL, 0) {
-		struct platform_device *pdev = of_find_device_by_node(it.node);
-		bool bound = pdev && device_is_bound(&pdev->dev);
+		struct platform_device *pdev;
+		bool bound;
+
+		/*
+		 * A device whose node is not available never binds, and the
+		 * boot loader handed it no DMA to take over.
+		 */
+		if (!of_device_is_available(it.node))
+			continue;
+		pdev = of_find_device_by_node(it.node);
+		bound = pdev && device_is_bound(&pdev->dev);
 
 		if (pdev)
 			put_device(&pdev->dev);
@@ -387,6 +397,7 @@ static const struct of_device_id apple_mcc_of_match[] = {
 	{ .compatible = "apple,t8132-mcc" },
 	{ .compatible = "apple,t8140-mcc" },
 	{ .compatible = "apple,t8142-mcc" },
+	{ .compatible = "apple,t6050-mcc" },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_mcc_of_match);
