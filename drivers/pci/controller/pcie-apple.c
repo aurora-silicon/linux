@@ -3655,6 +3655,24 @@ out_wifi:
 	return ret;
 }
 
+/*
+ * Whether @pdev is a root port the boot loader trained on an adopted link, or a
+ * function below one: a port adopted without its endpoint power line, which
+ * Linux trains itself (pwren-gpios), is not.
+ */
+static bool apple_pcie_on_boot_trained_link(struct apple_pcie *pcie, struct pci_dev *pdev)
+{
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+	struct apple_pcie_port *port;
+
+	if (!pcie->hw->adopt_link || !rp)
+		return false;
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (port->idx == PCI_SLOT(rp->devfn))
+			return !port->pwren;
+	return false;
+}
+
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
@@ -3673,6 +3691,14 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 
 	/* Also cover functions discovered by a later hotplug or rescan. */
 	if (pcie->hw->tunneled)
+		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
+
+	/*
+	 * Firmware owns the power of a boot-trained adopted link, and s2idle
+	 * requires the port and everything below it to stay accessible in D0.
+	 * Keep the PCI core's suspend paths from putting them in D3hot.
+	 */
+	if (apple_pcie_on_boot_trained_link(pcie, pdev))
 		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
 
 	/*
