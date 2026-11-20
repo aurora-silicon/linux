@@ -83,7 +83,31 @@
 	 * it the firmware runs with "IOMFB Int RTBandwidth: DISABLED".
 	 */
 	apple,bw-scratch = <&pmgr_dcp_bw 0 4 0>;
+	/* D408 getClockFrequency(0): /arm-io/disp0 clock-id 364's ADT rate. */
+	clocks = <&dcp_fw_clk364>;
 	status = "okay";
+};
+
+/ {
+	/*
+	 * The display pipes' firmware clocks, from the ADT's /arm-io
+	 * clock-frequencies at their first clock-id (disp0 364, dispext0 369),
+	 * the same in the 26.6.2 and 27.2 trees. Their second clock-ids (431,
+	 * 432) have no rate.
+	 */
+	dcp_fw_clk364: clock-dcp-firmware-364 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <300000000>;
+		clock-output-names = "dcp_firmware_364";
+	};
+
+	dcp_fw_clk369: clock-dcp-firmware-369 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <533333328>;
+		clock-output-names = "dcp_firmware_369";
+	};
 };
 
 &soc {
