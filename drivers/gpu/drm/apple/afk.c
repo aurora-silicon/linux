@@ -1578,6 +1578,12 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: failed to extract init props: %d\n",
 				ep->endpoint, ret);
+			/* What it did announce, to tell the service from its props. */
+			dev_info(ep->dcp->dev,
+				 "AFK[ep:%02x]: unparsed announce '%s' on channel %u, %zu bytes of props\n",
+				 ep->endpoint, name, channel, props_size);
+			print_hex_dump(KERN_INFO, "AFK props: ", DUMP_PREFIX_OFFSET, 16, 1,
+				       props, min_t(size_t, props_size, 256), true);
 			return;
 		} else {
 			service_name = epic_class;

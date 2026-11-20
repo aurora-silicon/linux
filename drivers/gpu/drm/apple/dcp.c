@@ -4278,6 +4278,15 @@ int dcp_start(struct platform_device *pdev)
 			if (ret)
 				return dev_err_probe(dcp->dev, ret,
 						     "Failed to start DPTX controller\n");
+		} else if (dcp->hw.dptx_controller) {
+			/* Best effort: the ports are what the link needs. */
+			ret = dptx_controller_init(dcp);
+			if (ret)
+				dev_warn(dcp->dev, "DPTX controller on endpoint %#04x not ready: %d\n",
+					 DPTX_CONTROLLER_ENDPOINT, ret);
+			else
+				dev_info(dcp->dev, "DPTX controller on endpoint %#04x ready\n",
+					 DPTX_CONTROLLER_ENDPOINT);
 		}
 
 		ret = dptxep_init(dcp);
@@ -6634,6 +6643,16 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext_v27 = {
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
 	.sink_metadata_edid = true,
+	/*
+	 * Its DPTX port services are on DPTX_ENDPOINT (0x2a), as on this SoC's
+	 * 26.6.2 firmware (iomfb_m4.c) and on the T8142 dcpext's 27.2 one;
+	 * DPTX_ENDPOINT_V2 (0x2c) announces nothing (mini, 11-20: "port 0
+	 * service not announced", -110). macOS 27.2 opens dispext0's
+	 * dcpav-/dcpdp-controller-epic (units 0, 1) and dcpdptx-port-epic
+	 * (units 0, 1) on this processor.
+	 */
+	.dptx_endpoint = DPTX_ENDPOINT,
+	.dptx_controller = true,
 };
 
 static int dcp_platform_probe_pipe(struct platform_device *pdev)

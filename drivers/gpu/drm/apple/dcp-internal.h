@@ -251,6 +251,19 @@ enum dcp_iomfb_method_profile {
 struct apple_dcp_hw_data {
 	u8 firmware_dma_bits;
 	u32 num_dptx_ports;
+	/*
+	 * The endpoint the DPTX port services (dcpdptx-port-epic) are announced
+	 * on, where it is not the firmware's default (DPTX_ENDPOINT_V2 on
+	 * firmware 27): the T8132 dcpext on 27.2 announces them on DPTX_ENDPOINT,
+	 * as its 26.6.2 firmware does. 0: the default.
+	 */
+	u8 dptx_endpoint;
+	/*
+	 * Open the DPTX controller endpoint (dcpav-/dcpdp-controller-epic) before
+	 * the ports, best effort: a controller that never announces does not
+	 * stop the ports (dcp_start()).
+	 */
+	bool dptx_controller;
 	enum dcp_iomfb_method_profile iomfb_method_profile;
 	/*
 	 * The bootloader leaves the coprocessor running.  Attach to it with a
