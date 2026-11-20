@@ -712,7 +712,7 @@
 #include "t6050-j714s-dpaudio.dtsi"
 
 /* The Neural Engine, started only after the boot loader's preload hand-off */
-#include "t6050-j714s-ane.dtsi"
+#include "t6050-ane.dtsi"
 #include "t6050-j714s-sleep.dtsi"
 #include "t6050-j714s-sleep-soc.dtsi"
 #include "t6050-j714s-sleep-adt.dtsi"
