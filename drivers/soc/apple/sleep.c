@@ -53,6 +53,7 @@
 #include <linux/ktime.h>
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
@@ -1154,6 +1155,21 @@ void apple_sleep_usb_set_asleep(bool asleep)
 	WRITE_ONCE(sleep_usb_asleep, asleep);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_usb_set_asleep);
+
+/* J714s: see apple_sleep_late_scope_begin() */
+static BLOCKING_NOTIFIER_HEAD(sleep_usb_asleep_chain);
+
+int apple_sleep_usb_asleep_notifier_register(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&sleep_usb_asleep_chain, nb);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_usb_asleep_notifier_register);
+
+void apple_sleep_usb_asleep_notifier_unregister(struct notifier_block *nb)
+{
+	blocking_notifier_chain_unregister(&sleep_usb_asleep_chain, nb);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_usb_asleep_notifier_unregister);
 
 static unsigned long sleep_usb_wake_ports;
 
@@ -2643,7 +2659,7 @@ static bool sleep_ps_on(struct apple_sleep *s, u32 offset)
 /* Below full power the hardware has idled it, and its registers may not answer. */
 static bool sleep_ps_full(struct apple_sleep *s, u32 offset)
 {
-	return FIELD_GET(PS_ACTUAL, readl(s->ps + offset)) == FIELD_MAX(PS_ACTUAL);
+	return FIELD_GET(PS_ACTUAL, readl(sleep_power_reg(s, offset))) == FIELD_MAX(PS_ACTUAL);
 }
 
 /*
@@ -3697,6 +3713,21 @@ void apple_sleep_lid_closed_wake(void)
 	pm_set_dark_wake();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_wake);
+
+/*
+ * macOS leaves a wake for a charger or a cable alone a dark one. With the lid closed
+ * nothing there is for the user: sleep again.
+ */
+void apple_sleep_port_wake(bool lid_closed)
+{
+	struct apple_sleep *s = apple_sleep;
+
+	if (!s || !s->smc_woke_alone || !lid_closed)
+		return;
+	dev_info(s->dev, "woken for a port with the lid closed: dark wake\n");
+	pm_set_dark_wake();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_port_wake);
 
 /* Read in the SMC's noirq resume. Forgotten as each sleep begins. */
 static int sleep_lid_closed = -ENODATA;
@@ -6622,7 +6653,15 @@ static void apple_sleep_smc_scope_end(void)
 static int apple_sleep_late_scope_begin(void)
 {
 	const char *step = "V27 display scope";
-	int ret = sleep_v27_scope_begin();
+	int ret;
+
+	/*
+	 * J714s: every device's noirq suspend is done, the USB PHYs' stops with them. macOS opens
+	 * its USB-C port controllers' USBw 0x09 window 0.5 ms after the port's ATC PHY CPU stops,
+	 * before the SMC's slpa (traced on the J714s).
+	 */
+	blocking_notifier_call_chain(&sleep_usb_asleep_chain, READ_ONCE(sleep_usb_asleep), NULL);
+	ret = sleep_v27_scope_begin();
 
 	if (!ret) {
 		step = "SMC scope";
@@ -6685,12 +6724,17 @@ static int apple_sleep_prepare(void)
 }
 
 /* Only the SMC's sources woke the SoC. */
+static bool t6050_smc_woke_alone(struct apple_sleep *s);
+
 static bool apple_sleep_smc_woke_alone(struct apple_sleep *s)
 {
 	const struct apple_sleep_wake_name *names = s->soc->wake_names;
 	u32 smc[WAKE_WORDS] = {};
 	bool any = false;
 	int i;
+
+	if (s->soc->regions)
+		return t6050_smc_woke_alone(s);
 
 	/* SMC.CPUWakeupAP and SMC.OutboxNotEmpty, by their names. */
 	for (i = 0; i < s->soc->nwake_names; i++) {

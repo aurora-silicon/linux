@@ -1186,6 +1186,8 @@ static void apple_clpc_halt(struct apple_clpc *clpc)
 	clpc->ane_until = jiffies;
 }
 
+static int apple_clpc_send_high_power(struct apple_clpc *clpc, bool on);
+
 static void apple_clpc_stop(void *data)
 {
 	struct apple_clpc *clpc = data;
@@ -1204,6 +1206,11 @@ static void apple_clpc_stop(void *data)
 	apple_clpc_ane_detach(clpc->ane);
 	debugfs_remove_recursive(clpc->debugfs);
 	apple_clpc_halt(clpc);
+	/* The SMC keeps this mode after the driver's profile state is gone. */
+	mutex_lock(&clpc->sample_lock);
+	if (clpc->high_power && clpc->high_power_sent)
+		apple_clpc_send_high_power(clpc, false);
+	mutex_unlock(&clpc->sample_lock);
 	if (clpc->policy_nb_added)
 		cpufreq_unregister_notifier(&clpc->policy_nb, CPUFREQ_POLICY_NOTIFIER);
 	if (freq_qos_request_active(&clpc->ane_qos))
