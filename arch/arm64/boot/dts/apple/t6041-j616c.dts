@@ -61,3 +61,40 @@
 &mesa {
 	firmware-name = "apple/mesacal-j616c.bin", "apple/msrk-j616c.bin";
 };
+
+/*
+ * Both ProRes encoders and their DARTs. apr0 runs with SCODEC_STREAMING (and
+ * so SCODEC) powered and takes the driver's built-in rows; apr1 has no SCODEC
+ * system window and runs in the PRORES domain.
+ */
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&ps_scodec_streaming {
+	status = "okay";
+};
+
+&ps_prores {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
+&apr1_dart {
+	status = "okay";
+};
+
+&apr1 {
+	status = "okay";
+};
