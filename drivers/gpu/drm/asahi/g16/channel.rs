@@ -220,16 +220,11 @@ impl Channels {
         }
         rmb();
         while consumer != producer {
-            if BOOT_LOG_RECORDS
-                .fetch_update(
-                    core::sync::atomic::Ordering::Relaxed,
-                    core::sync::atomic::Ordering::Relaxed,
-                    |n| n.checked_sub(1),
-                )
-                .is_err()
-            {
+            // One drain context at a time: a plain budget is enough for diagnostics.
+            if BOOT_LOG_RECORDS.load(core::sync::atomic::Ordering::Relaxed) == 0 {
                 return;
             }
+            BOOT_LOG_RECORDS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
             let base = (thread * 256 + consumer as usize) * 0x48;
             let mut w = [0u32; 18];
             for (i, word) in w.iter_mut().enumerate() {
