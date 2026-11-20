@@ -448,6 +448,10 @@ pub(crate) struct UatPageTable {
     /// Clean new tables and changed entries to the point of coherency, for a UAT walker that does
     /// not snoop the CPU caches ([`Self::enable_clean_poc`]).
     clean_poc: bool,
+    /// Table pages the driver allocated below the root.
+    tables: usize,
+    /// The client these tables are charged to ([`Self::charge_to`]).
+    charge: Option<crate::memacct::Usage>,
 }
 
 impl UatPageTable {
@@ -466,6 +470,8 @@ impl UatPageTable {
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
             clean_poc: false,
+            tables: 0,
+            charge: None,
         })
     }
 
@@ -548,7 +554,20 @@ impl UatPageTable {
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
             clean_poc: false,
+            tables: 0,
+            charge: None,
         })
+    }
+
+    /// Charges this page table's memory to a client from now on: the root and the tables
+    /// allocated so far at once, whatever the client's limits, and each further table before it
+    /// is allocated, refused with `ENOMEM` past the client's or the device's limit. The tables
+    /// are also allocated as memory of the calling task's memory cgroup from then on. Everything
+    /// stays charged until the page table is dropped, which frees the tables.
+    pub(crate) fn charge_to(&mut self, mut usage: crate::memacct::Usage) {
+        let pages = self.tables + usize::from(self.ttb_owned);
+        usage.add((pages * UAT_PGSZ) as u64);
+        self.charge = Some(usage);
     }
 
     /// Retains every physical table after an uncertain M4 handoff. No other agent may reclaim
@@ -672,6 +691,8 @@ impl UatPageTable {
                         as usize;
                     mod_pr_debug!("UATPageTable::with_pages: borrowed phys {:#x}\n", phys);
                     let driver_tables = &mut self.driver_tables;
+                    let table_count = &mut self.tables;
+                    let charge = &mut self.charge;
                     let oas_mask = self.oas_mask;
                     let firmware_tree = reserved.as_deref();
                     let entry = |p: *mut u8| -> Result<Option<PhysicalAddr>> {
@@ -682,7 +703,15 @@ impl UatPageTable {
                         let mut upte_val = upte.load(Ordering::Relaxed);
                         // Allocate if requested
                         if upte_val == 0 && alloc {
-                            let pt_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
+                            let gfp = if charge.is_some() {
+                                GFP_KERNEL_ACCOUNT
+                            } else {
+                                GFP_KERNEL
+                            };
+                            let pt_page = Page::alloc_page(gfp | __GFP_ZERO)?;
+                            if let Some(charge) = charge.as_mut() {
+                                charge.try_add(UAT_PGSZ as u64)?;
+                            }
                             mod_pr_debug!(
                                 "UATPageTable::with_pages: alloc PT at {:#x}\n",
                                 pt_page.phys()
@@ -699,6 +728,7 @@ impl UatPageTable {
                                 tables.push(pt_page.phys(), GFP_KERNEL)?;
                             }
                             let pt_paddr = Page::into_phys(pt_page);
+                            *table_count += 1;
                             upte_val = pt_paddr | PTE_TYPE_LEAF_TABLE;
                             // Complete child-table initialization before a
                             // concurrent device walk can follow its parent.
@@ -884,6 +914,7 @@ impl UatPageTable {
         // SAFETY: Page tables allocated by the driver always come from Page::into_phys(). Without
         // `driver_tables`, every child table belongs to the driver.
         unsafe { Page::from_phys(phys) };
+        self.tables = self.tables.saturating_sub(1);
         Ok(())
     }
 
@@ -1160,5 +1191,75 @@ impl Drop for UatPageTable {
                 Page::from_phys(self.ttb);
             }
         }
+    }
+}
+
+#[kunit_tests(asahi_pgtable_charge)]
+mod tests {
+    use super::*;
+    use crate::memacct::{
+        Client,
+        Ledger,
+        Limits,
+        Usage, //
+    };
+
+    const PG: u64 = UAT_PGSZ as u64;
+    /// The span of one leaf table (32 MiB); a level-1 table spans 2048 of them.
+    const LEAF_SPAN: u64 = PG << UAT_LVBIT;
+    /// Only written into leaves, never accessed.
+    const PHYS: PhysicalAddr = 0x8_0000_0000;
+
+    static TABLES: Ledger = Ledger::new();
+
+    #[test]
+    fn tables_are_charged_to_the_client_until_dropped() -> Result {
+        TABLES.set_limits(Limits { device: 0, client: 0 });
+        let client = Client::new()?;
+        let mut pt = UatPageTable::new(42, 42)?;
+        let first = 64 * LEAF_SPAN..66 * LEAF_SPAN;
+        let second = 66 * LEAF_SPAN..67 * LEAF_SPAN;
+        // One page repeated over two leaf tables, below one level-1 table, before the charge.
+        pt.map_pages(first.clone(), PHYS, prot::PROT_GPU_SHARED_RW, true)?;
+        pt.charge_to(Usage::new(&TABLES, client.clone()));
+        // The root and the three tables are charged at once.
+        assert_eq!((client.committed(), client.resident()), (4 * PG, 4 * PG));
+        // A further leaf table is charged as it is allocated.
+        pt.map_pages(second.clone(), PHYS, prot::PROT_GPU_SHARED_RW, true)?;
+        assert_eq!((client.committed(), client.resident()), (5 * PG, 5 * PG));
+        // Unmapping keeps the tables, and their charge, until the page table is dropped.
+        pt.unmap_pages(first)?;
+        pt.unmap_pages(second)?;
+        assert_eq!(client.committed(), 5 * PG);
+        drop(pt);
+        assert_eq!((client.committed(), client.resident()), (0, 0));
+        assert_eq!(TABLES.user_committed.load(Ordering::Relaxed), 0);
+        assert_eq!(TABLES.user_resident.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    static REFUSE: Ledger = Ledger::new();
+
+    #[test]
+    fn a_table_past_the_client_limit_is_refused() -> Result {
+        // Room for the root, one level-1 table and one leaf table.
+        REFUSE.set_limits(Limits { device: 0, client: 3 * PG });
+        let client = Client::new()?;
+        let mut pt = UatPageTable::new(42, 42)?;
+        pt.charge_to(Usage::new(&REFUSE, client.clone()));
+        let range = 64 * LEAF_SPAN..66 * LEAF_SPAN;
+        assert_eq!(
+            pt.map_pages(range.clone(), PHYS, prot::PROT_GPU_SHARED_RW, true),
+            Err(ENOMEM)
+        );
+        assert_eq!(client.committed(), 3 * PG);
+        assert_eq!(REFUSE.refused.load(Ordering::Relaxed), 1);
+        // The first leaf table's span was written before the refusal: clear it as a failed map
+        // does.
+        pt.discard_partial_map(range)?;
+        drop(pt);
+        assert_eq!(client.committed(), 0);
+        assert_eq!(REFUSE.user_committed.load(Ordering::Relaxed), 0);
+        Ok(())
     }
 }
