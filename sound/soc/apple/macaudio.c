@@ -185,9 +185,10 @@ struct macaudio_platform_cfg {
 	bool spk_secondary_only;
 	/*
 	 * No voltage or current sense reaches the AP, so no protection daemon
-	 * can govern the speakers: their SN012776 volumes stay under safe_vol,
-	 * locked, unlocked or granted alike, and there is no sense PCM. A
-	 * granted lease runs them at safe_vol, its operating gain.
+	 * can govern the speakers, and there is no sense PCM. "Speaker Volume
+	 * Unlock" does not apply: the SN012776 volumes stay at the floor until
+	 * a "Speaker Protection" lease is granted, which runs them at
+	 * safe_vol, its operating gain and their ceiling.
 	 */
 	bool spk_fixed_ceiling;
 };
@@ -408,6 +409,26 @@ static bool macaudio_spk_leased(const struct macaudio_snd_data *ma)
 	return READ_ONCE(ma->spk_iface) == MACAUDIO_SPK_IFACE_LEASE;
 }
 
+/* Only a "Speaker Protection" lease may lift these speakers (spk_fixed_ceiling) */
+static bool macaudio_spk_lease_only(const struct macaudio_platform_cfg *cfg)
+{
+	return cfg->spk_fixed_ceiling;
+}
+
+/*
+ * The SN012776 volumes' limit: the floor while locked; unlocked, 0 dB, or
+ * on a lease-only machine safe_vol, and there only under the lease.
+ */
+static int macaudio_sn012776_vlimit(const struct macaudio_platform_cfg *cfg,
+				    bool unlock, bool leased)
+{
+	if (macaudio_spk_lease_only(cfg))
+		return unlock && leased ? SN012776_DB(cfg->safe_vol) : 1;
+	if (unlock)
+		return SN012776_0DB;
+	return 1; //SN012776_DB(cfg->safe_vol);
+}
+
 
 SND_SOC_DAILINK_DEFS(primary,
 	DAILINK_COMP_ARRAY(COMP_CPU("mca-pcm-0")), // CPU
@@ -534,12 +555,7 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 			max = 1; //TAS5770_DB(ma->cfg->safe_vol);
 		break;
 	case AMP_SN012776:
-		if (ma->cfg->spk_fixed_ceiling)
-			max = SN012776_DB(ma->cfg->safe_vol);
-		else if (unlock)
-			max = SN012776_0DB;
-		else
-			max = 1; //SN012776_DB(ma->cfg->safe_vol);
+		max = macaudio_sn012776_vlimit(ma->cfg, unlock, macaudio_spk_leased(ma));
 		break;
 	case AMP_SSM3515:
 		if (unlock)
@@ -766,6 +782,10 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 	 * ceiling until the interface switches back (macaudio_spk_leave_lease()).
 	 */
 	if (macaudio_spk_leased(ma))
+		return;
+
+	/* No protection daemon can hold these speakers: nothing to unlock */
+	if (macaudio_spk_lease_only(ma->cfg))
 		return;
 
 	/* Check that someone is holding the main lock */
