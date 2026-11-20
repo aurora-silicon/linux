@@ -617,5 +617,9 @@
 	apple,power-method = <2>;
 	apple,reset-gpios = <&nub_gpio0 25 GPIO_ACTIVE_LOW>;
 	apple,power-gpios = <&nub_gpio0 26 GPIO_ACTIVE_HIGH>;
+	touchscreen-size-x = <3024>;
+	touchscreen-size-y = <1986>;
+	touchscreen-x-mm = <302>;
+	touchscreen-y-mm = <199>;
 	status = "okay";
 };
