@@ -1483,7 +1483,8 @@ static int apr_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *
 		if (f->index)
 			return -EINVAL;
 		f->pixelformat = V4L2_PIX_FMT_PRORES;
-		f->flags = V4L2_FMT_FLAG_COMPRESSED;
+		/* Size and chroma changes are reported with SOURCE_CHANGE. */
+		f->flags = V4L2_FMT_FLAG_COMPRESSED | V4L2_FMT_FLAG_DYN_RESOLUTION;
 		return 0;
 	}
 	if (f->index >= ARRAY_SIZE(apr_raw_fmts))
