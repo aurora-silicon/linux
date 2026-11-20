@@ -400,6 +400,10 @@ pub(crate) type DrmFile = drm::File<File>;
 /// Minimum reserved AS for kernel mappings
 const VM_KERNEL_MIN_SIZE: u64 = 0x20000000;
 
+/// Most VMs one file may hold at a time. Mesa creates one per file. Each VM holds kernel memory
+/// that is not charged to the client (its GPUVM, allocators and per-VM objects).
+const MAX_VMS_PER_FILE: u32 = 64;
+
 impl drm::file::DriverFile for File {
     type Driver = driver::AsahiDrmDriver;
 
@@ -728,7 +732,7 @@ impl File {
         );
 
         let vm_xa = file.inner().vms();
-        let resv = vm_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
+        let resv = vm_xa.lock().reserve_limit(1..=MAX_VMS_PER_FILE, GFP_KERNEL)?;
         let id: u32 = resv.index().try_into()?;
 
         mod_dev_dbg!(device, "[File {} VM {}]: VM Create\n", file_id, id);
