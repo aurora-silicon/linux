@@ -268,6 +268,16 @@ properties:
           the interface on and lowered to power it off during power
           method 2 transitions.
 
+      touchscreen-size-x:
+        $ref: touchscreen/touchscreen.yaml#/properties/touchscreen-size-x
+
+      touchscreen-size-y:
+        $ref: touchscreen/touchscreen.yaml#/properties/touchscreen-size-y
+
+      touchscreen-x-mm: true
+
+      touchscreen-y-mm: true
+
   mtp:
     type: object
     additionalProperties: false
