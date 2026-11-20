@@ -319,7 +319,14 @@ static int __init t8132_platform_handoff(void)
 	unsigned int added = 0, changed = 0;
 	int root, node, ret;
 
-	if (!apple_t8132_firmware_path() || !of_machine_is_compatible("apple,t8132"))
+	/*
+	 * The PMGR ownership policy describes the SoC's domains, not one firmware:
+	 * without it, on firmware off the qualified path (macOS 27.2), Linux owns
+	 * every domain in the board tree, auto-PM included, and the J773g takes an
+	 * SError when its PCIe controller probes. Apply it on every T8132; only the
+	 * PMP/GFX memory compatibility nodes below stay with the qualified firmware.
+	 */
+	if (!of_machine_is_compatible("apple,t8132"))
 		return 0;
 	if (fdt_check_header(data))
 		return -EINVAL;
@@ -335,6 +342,8 @@ static int __init t8132_platform_handoff(void)
 	ret = t8132_pmgr_policy(cs, &changed, apple_t8132_air());
 	if (ret)
 		goto destroy;
+	if (!apple_t8132_firmware_path())
+		goto apply;
 
 	pmp = of_find_compatible_node(NULL, NULL, "apple,t8132-pmp-v2");
 	gpu = of_find_compatible_node(NULL, NULL, "apple,agx-t8132");
