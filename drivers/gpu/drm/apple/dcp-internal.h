@@ -167,6 +167,22 @@ struct dcp_channel {
 	/* Header of each pending AP command record, as dcp_push() wrote it */
 	struct dcp_packet_header header[DCP_MAX_CALL_DEPTH];
 	u16 end[DCP_MAX_CALL_DEPTH];
+	/*
+	 * True for a frame that holds an AP command waiting for its ack, false
+	 * for a firmware callback waiting for ours. An ack from the firmware
+	 * only completes the former, dcp_ack() only answers the latter.
+	 */
+	bool command[DCP_MAX_CALL_DEPTH];
+	/*
+	 * Callback records are copied out of the shared buffer once, into
+	 * @cb_shadow at the same offset, and handled only from that copy: the
+	 * firmware can rewrite shared memory at any time. A callback's reply
+	 * is built in the copy and written back once, to @cb_reply (in the
+	 * shared record), when the callback is acked. NULL for command frames.
+	 */
+	u8 *cb_shadow;
+	void *cb_reply[DCP_MAX_CALL_DEPTH];
+	u32 cb_reply_len[DCP_MAX_CALL_DEPTH];
 
 	/* Current depth of the call stack. Less than DCP_MAX_CALL_DEPTH */
 	u8 depth;

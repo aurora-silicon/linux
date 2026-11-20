@@ -13,12 +13,13 @@ def modeset_unmap(root):
     header = (base / 'iomfb_v26_6_desktop.h').read_text()
     # Reuse the transport boundary mocks, retaining the real callback dispatcher.
     prefix = lifecycle.dispatcher(root).split('static bool dcp_external_zero_reply(')[0]
-    prefix = prefix.replace('struct dcp_channel { unsigned depth; void *output[8]; unsigned end[8]; };', r'''
+    prefix = prefix.replace('struct dcp_channel { unsigned depth; void *output[8]; unsigned end[8]; u8 *cb_shadow; void *cb_reply[8]; u32 cb_reply_len[8]; bool command[8]; };', r'''
 struct apple_dcp;
 typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 struct dcp_channel {
     unsigned depth; void *output[8], *cookies[8]; unsigned end[8];
     dcp_callback_t callbacks[8]; struct dcp_packet_header header[8];
+    u8 *cb_shadow; void *cb_reply[8]; u32 cb_reply_len[8]; bool command[8];
 };
 struct sg_table {void *sgl;};
 struct dcp_mem_descriptor {void *buf;u64 dva,reg;size_t size;bool piodma_mapped;struct sg_table map;};
@@ -31,8 +32,8 @@ struct dcp_mem_descriptor {void *buf;u64 dva,reg;size_t size;bool piodma_mapped;
 ''')
     prefix = prefix.replace('DCP_CONTEXT_CB = 0, DCP_CONTEXT_ASYNC = 3',
                             'DCP_CONTEXT_CB = 0, DCP_CONTEXT_CMD = 1, DCP_CONTEXT_ASYNC = 3')
-    prefix = prefix.replace('(void)c; return &d->channel;',
-                            'return c==DCP_CONTEXT_CMD?&d->command:&d->channel;')
+    prefix = prefix.replace('(void)c; return dcp_shadowed(&d->channel);',
+                            'return c==DCP_CONTEXT_CMD?&d->command:dcp_shadowed(&d->channel);')
     prefix = prefix.replace('((void)dev)', '((void)dcp->dev)')
     prefix += r'''
 #include <sys/types.h>
@@ -129,7 +130,7 @@ int main(void)
     struct dcp_wait_cookie wait={.status=~0U,.refcount=2};
     /* The firmware pauses an A413 modeset until its D202 is acknowledged. */
     __typeof__(*d.desktop) desktop={0};d.desktop=&desktop;
-    d.command.depth=1;d.command.header[0]=command.h;
+    d.command.depth=1;d.command.command[0]=true;d.command.header[0]=command.h;
     d.command.callbacks[0]=complete_set_digital_out_mode;
     d.command.cookies[0]=&wait;d.command.output[0]=&command.status;
     d.memdesc[1]=(struct dcp_mem_descriptor){.buf=&d,.dva=0x8000,.size=4096,.map={.sgl=&d}};
@@ -369,7 +370,7 @@ struct dcp_modeset_cookie {struct dcp_wait_cookie wait;bool vrr;};
     /* A fresh channel has an A413 outstanding; inject a valid but unknown D. */
     d.crashed=false;desktop.modeset_active=true;desktop.modeset_callback_error=false;
     struct dcp_modeset_cookie mode={.wait={.status=~0U,.refcount=2},.vrr=true};
-    d.command.depth=1;d.command.header[0]=command.h;
+    d.command.depth=1;d.command.command[0]=true;d.command.header[0]=command.h;
     d.command.callbacks[0]=dcp_modeset_actual_done;
     d.command.cookies[0]=&mode;d.command.output[0]=&command.status;
     case_tag=499;h->in_len=4;h->out_len=4;
@@ -385,7 +386,7 @@ struct dcp_modeset_cookie {struct dcp_wait_cookie wait;bool vrr;};
     /* The next fixed modeset is independent and completes normally. */
     desktop.modeset_active=false;desktop.modeset_callback_error=false;
     mode=(struct dcp_modeset_cookie){.wait={.status=~0U,.refcount=2}};
-    d.command.depth=1;d.command.header[0]=command.h;
+    d.command.depth=1;d.command.command[0]=true;d.command.header[0]=command.h;
     d.command.callbacks[0]=dcp_modeset_actual_done;
     d.command.cookies[0]=&mode;d.command.output[0]=&command.status;
     dcpep_handle_ack(&d,DCP_CONTEXT_CMD);

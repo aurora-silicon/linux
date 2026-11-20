@@ -43,6 +43,7 @@ static int apple_rtkit_start_ep(void *r, int ep) {
 static void *dma_alloc_coherent(void *d,int n,dma_addr_t *a,int flags) {*a=0; return (void *)1;}
 static int dcpep_set_shmem(dma_addr_t a) {return 0;}
 static void dcp_send_message(struct apple_dcp *d,int ep,int m) {}
+static int dcp_cb_shadow_alloc(struct apple_dcp *d) {return 0;}
 '''
 main = r'''
 int main(void) {

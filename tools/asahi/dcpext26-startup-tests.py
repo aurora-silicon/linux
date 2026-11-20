@@ -240,7 +240,7 @@ static void dcp_push(struct apple_dcp *,bool,const struct dcp_method_entry *,u32
 static void boot_done(struct apple_dcp *,void *,void *);
 static unsigned commands,callback_acks;static int bad_status,corrupt;static bool byte_reply;static u8 memory[0x100000];
 '''
-for name in ['dcp_tx_offset','dcp_call_context','dcp_get_channel','dcp_packet_start','dcp_push_depth','dcp_pop_depth','dcpep_msg','dcpep_ack','dcp_push_context','dcp_push','dcp_ack','dcpep_handle_ack']:
+for name in ['dcp_tx_offset','dcp_call_context','dcp_get_channel','dcp_packet_start','dcp_push_depth','dcp_pop_depth','dcp_cb_reply_commit','dcpep_msg','dcpep_ack','dcp_push_context','dcp_push','dcp_ack','dcpep_handle_ack']:
     code=fn(iom,name)
     if name in ['dcp_push','dcp_ack']:code='static '+code
     transport+=code+'\n'
