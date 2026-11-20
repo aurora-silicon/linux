@@ -2808,6 +2808,15 @@ static int apple_nvme_sleep_shutdown(void *data)
  * brings it back, so a failure goes on to the commit: what a flush acknowledged is on
  * flash, and the watchdog is the net.
  */
+/* T8122 trial: ANS's ASC state at each step from its idle to the commit. */
+static void apple_nvme_ans_trace(struct apple_nvme *anv, const char *step)
+{
+	if (anv->hw->sleep_idle && anv->sleep_stop)
+		dev_info(anv->dev, "ANS at %s: control %#x status %#x\n", step,
+			 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL),
+			 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS));
+}
+
 static int apple_nvme_sleep_last_stop(void *data)
 {
 	struct apple_nvme *anv = data;
@@ -2820,10 +2829,17 @@ static int apple_nvme_sleep_last_stop(void *data)
 
 	/* T8122: already idled in the suspend; the sleep driver clears RUN after this. */
 	if (anv->hw->sleep_idle && anv->sleep_idled) {
+		int wret;
+
+		apple_nvme_ans_trace(anv, "the last stop");
 		apple_rtkit_mailbox_recv_off(anv->rtk);
-		if (anv->sleep_pmp_entry &&
-		    apple_pmp_report_entry_withdraw_polled(anv->sleep_pmp_entry))
-			dev_err(anv->dev, "ANS's PMP request not withdrawn at the last stop\n");
+		apple_nvme_ans_trace(anv, "mailbox receive off");
+		wret = apple_pmp_report_entry_withdraw_polled(anv->sleep_pmp_entry);
+		apple_nvme_ans_trace(anv, "the PMP withdraw");
+		if (wret) {
+			dev_err(anv->dev, "ANS's PMP request not withdrawn at the last stop: %d\n", wret);
+			return 1;
+		}
 		return 0;
 	}
 	anv->sleep_idled = true;
@@ -3330,9 +3346,8 @@ static int apple_nvme_suspend(struct device *dev)
 		 */
 		if (anv->sleep_registered && anv->hw->sleep_idle &&
 		    pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware() &&
-		    !anv->legacy_shn_ret &&
-		    (!anv->sleep_pmp_entry ||
-		     !apple_pmp_report_entry_commit_owned(anv->sleep_pmp_entry, true))) {
+		    !anv->legacy_shn_ret && anv->sleep_pmp_entry &&
+		    !apple_pmp_report_entry_commit_owned(anv->sleep_pmp_entry, true)) {
 			int idle = apple_rtkit_idle(anv->rtk);
 
 			anv->sleep_stop = true;
@@ -3346,8 +3361,8 @@ static int apple_nvme_suspend(struct device *dev)
 		}
 		/* Registered but not idled at the commit: the sleep driver refuses the sleep. */
 		if (anv->sleep_registered && pm_suspend_via_firmware())
-			dev_warn(dev, "ANS shut down for the sleep instead (notification %d): the sleep will be refused\n",
-				 anv->legacy_shn_ret);
+			dev_warn(dev, "ANS shut down for the sleep instead (notification %d, PMP request %s): the sleep will be refused\n",
+				 anv->legacy_shn_ret, anv->sleep_pmp_entry ? "found" : "not found");
 		ret = apple_rtkit_shutdown(anv->rtk);
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
@@ -3356,9 +3371,22 @@ static int apple_nvme_suspend(struct device *dev)
 	return ret;
 }
 
+static int apple_nvme_suspend_late(struct device *dev)
+{
+	apple_nvme_ans_trace(dev_get_drvdata(dev), "suspend_late");
+	return 0;
+}
+
+static int apple_nvme_suspend_noirq(struct device *dev)
+{
+	apple_nvme_ans_trace(dev_get_drvdata(dev), "suspend_noirq");
+	return 0;
+}
+
 static const struct dev_pm_ops apple_nvme_pm_ops = {
 	SYSTEM_SLEEP_PM_OPS(apple_nvme_suspend, apple_nvme_resume)
-	LATE_SYSTEM_SLEEP_PM_OPS(NULL, apple_nvme_resume_early)
+	LATE_SYSTEM_SLEEP_PM_OPS(apple_nvme_suspend_late, apple_nvme_resume_early)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_nvme_suspend_noirq, NULL)
 };
 
 static const struct apple_nvme_hw apple_nvme_t8015_hw = {
