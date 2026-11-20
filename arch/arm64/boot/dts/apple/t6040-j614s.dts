@@ -131,7 +131,6 @@
 };
 
 &usb4_0_acio {
-	/delete-property/ apple,pcie-tunnel;
 	status = "okay";
 };
 
@@ -166,7 +165,6 @@
 };
 
 &usb4_1_acio {
-	/delete-property/ apple,pcie-tunnel;
 	status = "okay";
 };
 
@@ -201,7 +199,6 @@
 };
 
 &usb4_2_acio {
-	/delete-property/ apple,pcie-tunnel;
 	status = "okay";
 };
 
@@ -216,3 +213,4 @@
 };
 
 #include "t6040-j614s-extdisp-hdmi.dtsi"
+#include "t6040-j614s-pciec.dtsi"
