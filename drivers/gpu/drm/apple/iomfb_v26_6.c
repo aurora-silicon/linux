@@ -1946,37 +1946,74 @@ void iomfb_v26_6_poweroff(struct apple_dcp *dcp)
 }
 
 /*
- * J613 trial: the calls the 26.6 firmware receives at the start of a system sleep, in the order
- * and with the inputs observed on its mailbox and RPC memory during macOS's sleep entry (capture
- * run 68, 49 ms before the first commit write, the panel already off): A478 (no input, 4-byte
- * reply 1), A476 (u32 1), A473 (16 bytes: byte 8, 11 and 12 set to 1; 8-byte reply 0; the DCP
- * calls back D300 during it), A115 (no input, 4-byte reply 0), A500 (two bytes 0, 1). What each
- * call does is not known beyond that; the replies are logged, not checked.
+ * J613 trial: calls the 26.6 firmware receives from macOS before a system sleep, in the order and
+ * with the inputs observed on its mailbox and RPC memory (capture run 68, n=1). Group 1, the
+ * panel going off (6.9 s before the commit): A414 (8 zero bytes; reply 1), A478 (reply 1) twice,
+ * A476(1), A478, A412 (reply 1), A473 (16 zero bytes; reply 8 zero bytes), A500 (0, 0). Group 2,
+ * the sleep entry (49 ms before the commit): A478, A476(1), A473 (bytes 8, 11 and 12 set to 1),
+ * A115 (reply 0), A500 (0, 1). What each call does is not known beyond that. @groups: 1 sends
+ * group 2 only, 2 sends both. Every reply is compared with macOS's; a mismatch is -EPROTO.
  */
-int dcp_v26_j613_sleep_calls(struct apple_dcp *dcp)
+static int dcp_v26_j613_call(struct apple_dcp_v26 *v26, u32 tag, const void *in, u32 in_size,
+			     const void *want, u32 want_size, bool *same)
 {
-	static const u8 a473_in[16] = { [8] = 1, [11] = 1, [12] = 1 };
-	static const u8 a500_in[4] = { 0, 1 };
-	struct apple_dcp_v26 *v26 = dcp->v26;
-	__le32 one = cpu_to_le32(1), r478 = 0, r115 = 0;
-	u8 r473[8] = {};
+	u8 out[8] = {};
 	int ret;
+
+	ret = dcp_v26_call(v26, tag, in, in_size, want_size ? out : NULL, want_size, 0);
+	if (!ret && want_size && memcmp(out, want, want_size)) {
+		dev_warn(v26->dev, "J613 sleep call %#x reply %*ph, macOS %*ph\n", tag, want_size, out,
+			 want_size, want);
+		*same = false;
+	}
+	return ret;
+}
+
+int dcp_v26_j613_sleep_calls(struct apple_dcp *dcp, int groups)
+{
+	static const u8 zero16[16], one[4] = { 1 }, one8[8] = { 1 };
+	static const u8 a473_entry[16] = { [8] = 1, [11] = 1, [12] = 1 };
+	static const u8 a500_off[4] = { 0, 0 }, a500_entry[4] = { 0, 1 };
+	struct apple_dcp_v26 *v26 = dcp->v26;
+	bool same = true;
+	int ret = 0;
 
 	if (!v26 || !v26->started)
 		return -ENODEV;
 	mutex_lock(&v26->lock);
-	ret = dcp_v26_call(v26, A(478), NULL, 0, &r478, sizeof(r478), 0);
+	if (groups >= 2) {
+		ret = dcp_v26_j613_call(v26, A(414), zero16, 8, one8, 8, &same);
+		if (!ret)
+			ret = dcp_v26_j613_call(v26, A(478), NULL, 0, one, 4, &same);
+		if (!ret)
+			ret = dcp_v26_j613_call(v26, A(478), NULL, 0, one, 4, &same);
+		if (!ret)
+			ret = dcp_v26_j613_call(v26, A(476), one, 4, NULL, 0, &same);
+		if (!ret)
+			ret = dcp_v26_j613_call(v26, A(478), NULL, 0, one, 4, &same);
+		if (!ret)
+			ret = dcp_v26_j613_call(v26, A(412), NULL, 0, one, 4, &same);
+		if (!ret)
+			ret = dcp_v26_j613_call(v26, A(473), zero16, 16, zero16, 8, &same);
+		if (!ret)
+			ret = dcp_v26_j613_call(v26, A(500), a500_off, 4, NULL, 0, &same);
+		dev_warn(v26->dev, "J613 panel-off calls: %d\n", ret);
+	}
 	if (!ret)
-		ret = dcp_v26_call(v26, A(476), &one, sizeof(one), NULL, 0, 0);
+		ret = dcp_v26_j613_call(v26, A(478), NULL, 0, one, 4, &same);
 	if (!ret)
-		ret = dcp_v26_call(v26, A(473), a473_in, sizeof(a473_in), r473, sizeof(r473), 0);
+		ret = dcp_v26_j613_call(v26, A(476), one, 4, NULL, 0, &same);
 	if (!ret)
-		ret = dcp_v26_call(v26, A(115), NULL, 0, &r115, sizeof(r115), 0);
+		ret = dcp_v26_j613_call(v26, A(473), a473_entry, 16, zero16, 8, &same);
 	if (!ret)
-		ret = dcp_v26_call(v26, A(500), a500_in, sizeof(a500_in), NULL, 0, 0);
+		ret = dcp_v26_j613_call(v26, A(115), NULL, 0, zero16, 4, &same);
+	if (!ret)
+		ret = dcp_v26_j613_call(v26, A(500), a500_entry, 4, NULL, 0, &same);
 	mutex_unlock(&v26->lock);
-	dev_warn(v26->dev, "J613 sleep calls: %d (A478 %#x, A473 %8ph, A115 %#x)\n", ret,
-		 le32_to_cpu(r478), r473, le32_to_cpu(r115));
+	if (!ret && !same)
+		ret = -EPROTO;
+	dev_warn(v26->dev, "J613 sleep calls (groups %d): %d, replies %s macOS's\n", groups, ret,
+		 same ? "as" : "NOT as");
 	return ret;
 }
 

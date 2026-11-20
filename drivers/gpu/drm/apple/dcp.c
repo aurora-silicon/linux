@@ -9487,14 +9487,14 @@ static void dcp_dpms_power_off(struct apple_dcp *dcp)
  * J613 trial: the generic end of macOS's DCP shutdown before the cold stop. macOS ends it with AP
  * then IOP idle and the run bit off twice (capture run 51); Linux only clears the run bit. This
  * asks RTKit for idle first (the secure port's AP idle as in dcp_s2r_quiesce), logs the result,
- * and stops cold either way. j613_sleep_calls sends, before it, the 26.6 firmware's sleep-entry
- * calls as observed on macOS (capture run 68; dcp_v26_j613_sleep_calls()).
+ * and stops cold either way. j613_sleep_calls sends, before it, the 26.6 firmware's calls
+ * observed before macOS's sleep (capture run 68; dcp_v26_j613_sleep_calls()).
  */
 static bool j613_rtkit_idle;
 module_param(j613_rtkit_idle, bool, 0444);
-static bool j613_sleep_calls;
-module_param(j613_sleep_calls, bool, 0444);
-MODULE_PARM_DESC(j613_sleep_calls, "J613 trial: the 26.6 firmware's sleep-entry calls (observed on macOS) before the RTKit idle and cold stop");
+static int j613_sleep_calls;
+module_param(j613_sleep_calls, int, 0444);
+MODULE_PARM_DESC(j613_sleep_calls, "J613 trial: the 26.6 firmware's calls observed before macOS's sleep, sent before the RTKit idle and cold stop (1: the sleep-entry group, 2: the panel-off group first)");
 MODULE_PARM_DESC(j613_rtkit_idle, "J613 trial: RTKit AP and IOP idle before the DCP's cold stop for a sleep, as macOS ends its shutdown");
 
 static bool dcp_j613_sleep_owned(struct apple_dcp *dcp)
@@ -9550,8 +9550,8 @@ static int dcp_platform_suspend(struct device *dev)
 		/* The 26.6 path keeps its firmware session's RTKit in dcp->v26, not in dcp->rtk (n28). */
 		struct apple_rtkit *rtk = dcp->rtk ?: dcp_v26_rtkit(dcp);
 
-		if (READ_ONCE(j613_sleep_calls))
-			dcp_v26_j613_sleep_calls(dcp);
+		if (READ_ONCE(j613_sleep_calls) > 0)
+			dcp_v26_j613_sleep_calls(dcp, READ_ONCE(j613_sleep_calls));
 		dev_warn(dev, "J613: RTKit idle switch %d, rtk %s%s\n", READ_ONCE(j613_rtkit_idle),
 			 !rtk ? "NULL" : IS_ERR(rtk) ? "error" : "present",
 			 dcp->rtk ? "" : " (the 26.6 session's)");
