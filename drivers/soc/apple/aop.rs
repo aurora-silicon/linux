@@ -1475,7 +1475,11 @@ impl AopData {
         order.extend_from_slice(default, GFP_KERNEL)?;
         Ok(order)
     }
-    fn new(dev: &platform::Device<Core<'_>>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
+    fn new(
+        dev: &platform::Device<Core<'_>>,
+        cfg: &AopHwConfig,
+        setup_port: bool,
+    ) -> Result<Arc<AopData>> {
         let sleep_endpoints = Self::endpoint_order(
             dev.as_ref(),
             c_str!("apple,sleep-endpoints"),
@@ -1487,7 +1491,7 @@ impl AopData {
             cfg.wake_endpoints,
         )?;
         let registration_queue = OwnedQueue::new_ordered(c_str!("apple-aop"))?;
-        let setup_queue = if cfg.setup_port {
+        let setup_queue = if setup_port {
             Some(OwnedQueue::new_ordered(c_str!("apple-aop-setup"))?)
         } else {
             None
@@ -3281,7 +3285,14 @@ impl platform::Driver for AopDriver {
         } else {
             None
         };
-        let data = AopData::new(pdev, cfg)?;
+        // The setup-port boot opens the mailbox named "setup"; a device tree
+        // that gives the AOP no such mailbox gets the boot without it.
+        let setup_port = cfg.setup_port
+            && pdev.as_ref().fwnode().is_some_and(|node| {
+                node.property_match_string(c_str!("mbox-names"), c_str!("setup"))
+                    .is_ok()
+            });
+        let data = AopData::new(pdev, cfg, setup_port)?;
         // Whatever fails below leaves the AOP running and its children
         // registering; the same teardown as unbind's cleans that up.
         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
@@ -3307,12 +3318,12 @@ impl platform::Driver for AopDriver {
             rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?
         };
         data.rtkit.lock().as_mut().set(Some(rtkit));
-        if cfg.setup_port {
+        if setup_port {
             AopData::setup_open(&data, pdev.as_ref())?;
         }
         asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         data.cpu_started.store(true, Release);
-        let started = if cfg.setup_port {
+        let started = if setup_port {
             // The RTKit handshake up to AP power on comes first, then the
             // setup port's own power state and endpoint buffers, and only
             // then the AFK endpoints.
