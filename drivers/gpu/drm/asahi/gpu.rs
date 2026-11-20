@@ -323,6 +323,8 @@ pub(crate) struct GpuManager {
     ids: SequenceIDs,
     #[pin]
     garbage_contexts: Mutex<KVec<workqueue::RetiredContext>>,
+    /// The firmware maps kernel objects uncached (no cache flush needed before reuse).
+    fw_uncached: bool,
     #[pin]
     fault_log: SpinLock<FaultLogState>,
 }
@@ -714,13 +716,17 @@ impl GpuManager::ver {
             IOVA_KERN_PRIV_RANGE.end
         };
 
+        // T8103/T8112 on 27.2: no firmware cache flush is available that writes dirty lines
+        // back, so keep the firmware's view of kernel objects uncached; freed objects can then
+        // be reused without one.
+        let fw_uncached = matches!(cfg.chip_id, 0x8103 | 0x8112) && _trial_version == Some(0x0c8a_8342_8392_04c8);
         let mut alloc = KernelAllocators {
             private: alloc::DefaultAllocator::new(
                 dev,
                 uat.kernel_vm(),
                 IOVA_KERN_PRIV_RANGE.start..private_end,
                 0x80,
-                mmu::PROT_FW_PRIV_RW,
+                if fw_uncached { mmu::PROT_FW_SHARED_RW } else { mmu::PROT_FW_PRIV_RW },
                 1024 * 1024,
                 true,
                 fmt!("Kernel Private"),
@@ -764,7 +770,7 @@ impl GpuManager::ver {
                 uat.kernel_vm(),
                 IOVA_KERN_GPU_RO_RANGE,
                 0x80,
-                mmu::PROT_GPU_RO_FW_PRIV_RW,
+                if fw_uncached { mmu::PROT_GPU_RO_FW_SHARED_RW } else { mmu::PROT_GPU_RO_FW_PRIV_RW },
                 1024 * 1024,
                 true,
                 fmt!("Kernel GPU RO Shared"),
@@ -790,7 +796,7 @@ impl GpuManager::ver {
                 false,
             )?);
 
-        let mut mgr = Self::make_mgr(dev, cfg, dyncfg, uat, alloc, event_manager, initdata)?;
+        let mut mgr = Self::make_mgr(dev, cfg, dyncfg, uat, alloc, event_manager, initdata, fw_uncached)?;
 
         {
             let fwctl = mgr.fwctl_channel.lock();
@@ -990,6 +996,7 @@ impl GpuManager::ver {
         mut alloc: KernelAllocators,
         event_manager: Arc<event::EventManager>,
         initdata: KBox<fw::types::GpuObject<fw::initdata::InitData::ver>>,
+        fw_uncached: bool,
     ) -> Result<Pin<UniqueArc<GpuManager::ver>>> {
         let mut pipes = PipeChannels::ver {
             vtx: KVec::new(),
@@ -1107,6 +1114,7 @@ impl GpuManager::ver {
                 buffer_mgr,
                 ids: Default::default(),
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
+                fw_uncached,
                 fault_log <- new_spinlock!(FaultLogState::default(), "fault_log"),
             }),
             GFP_KERNEL,
@@ -1849,7 +1857,8 @@ impl GpuManager for GpuManager::ver {
         // nothing services this manager's device control channel: sending would wait for
         // ring space forever. Keep the garbage instead.
         if self.rtkit.lock().is_none() {
-            return Err(ENODEV);
+            // Nothing of the firmware's view of kernel objects is cached: nothing to flush.
+            return if self.fw_uncached { Ok(()) } else { Err(ENODEV) };
         }
 
         // ctx_0 == 0xff or ctx_1 == 0xff cause no effect on context,

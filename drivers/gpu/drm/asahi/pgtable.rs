@@ -334,6 +334,8 @@ pub(crate) mod prot {
     pub(crate) const PROT_GPU_FW_PRIV_RW: Prot = PROT_FW_GPU_RW.memattr(MEMATTR_CACHED);
     /// Firmware-RW/GPU-RO shared (private) RW
     pub(crate) const PROT_GPU_RO_FW_PRIV_RW: Prot = PROT_FW_RW_GPU_RO.memattr(MEMATTR_CACHED);
+    /// Firmware-RW/GPU-RO shared (uncached) RW
+    pub(crate) const PROT_GPU_RO_FW_SHARED_RW: Prot = PROT_FW_RW_GPU_RO.memattr(MEMATTR_UNCACHED);
     /// GPU shared/coherent RW
     pub(crate) const PROT_GPU_SHARED_RW: Prot = PROT_GPU_RW.memattr(MEMATTR_UNCACHED);
     /// GPU shared/coherent RO

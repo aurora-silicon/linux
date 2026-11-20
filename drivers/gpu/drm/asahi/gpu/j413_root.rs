@@ -438,7 +438,8 @@ impl G14StartupFence {
             Ok(())
         };
         for owner in [&queue, &pointers, &scheduler, &stream, &command] {
-            check(owner.gpu_va().get(), owner.as_slice().len(), mmu::PROT_FW_PRIV_RW)?;
+            // Private firmware objects are uncached on 27.2 (no flush that writes them back).
+            check(owner.gpu_va().get(), owner.as_slice().len(), mmu::PROT_FW_SHARED_RW)?;
         }
         for owner in [&positions, &timestamps] {
             check(owner.gpu_va().get(), owner.as_slice().len(), mmu::PROT_FW_SHARED_RW)?;
