@@ -182,16 +182,49 @@ static int __regmap_sn201202x_write(void *context, const void *data,
 	return err;
 }
 
+static int sn201202x_wake(struct sn201202x *sn);
+
+/*
+ * J714s: from the SLEEP at the prepare to the wake nothing reaches the controller, as on
+ * macOS (sn201202x_prepare()). A register access that does all the same is logged, with its
+ * caller the first time in a sleep, and gets the controller woken for it: a sleeping
+ * controller ACKs a register selection but never completes it. Before the suspend the
+ * controller then stays awake, and the suspend sends SLEEP as without the macOS entry; after
+ * it, nothing would, so it is put back to sleep after the access (*resleep).
+ */
+static int sn201202x_entry_stray(struct sn201202x *sn, bool *resleep)
+{
+	int err;
+
+	*resleep = false;
+	if (likely(!READ_ONCE(sn->entry_asleep)))
+		return 0;
+	if (!sn->entry_strays++) {
+		dev_warn(&sn->sdev->dev,
+			 "sleep entry: register access while asleep since the prepare: woken for it\n");
+		dump_stack();
+	}
+	err = sn201202x_wake(sn);
+	if (err)
+		return err;
+	if (READ_ONCE(sn->entry_suspended))
+		*resleep = true;
+	else
+		WRITE_ONCE(sn->entry_asleep, false);
+	return 0;
+}
+
 /*
  * A register access wakes a controller that sleeps idle, and lets it sleep
  * again SN201202X_AUTOSUSPEND_MS after the last one, with its tries to sleep
  * counted afresh. In system sleep the event path wakes it and puts it back
  * to sleep itself.
  */
-static int sn201202x_access_get(struct tps6598x *tps, bool *rpm)
+static int sn201202x_access_get(struct tps6598x *tps, bool *rpm, bool *resleep)
 {
 	int err;
 
+	*resleep = false;
 	*rpm = !READ_ONCE(tps_to_sn(tps)->atomic);
 	if (!*rpm)
 		return 0;
@@ -200,13 +233,20 @@ static int sn201202x_access_get(struct tps6598x *tps, bool *rpm)
 		return err;
 	/* Held awake, so no runtime suspend runs meanwhile */
 	tps_to_sn(tps)->sleep_tries = 0;
-	return 0;
+	err = sn201202x_entry_stray(tps_to_sn(tps), resleep);
+	if (err)
+		pm_runtime_put_autosuspend(tps->dev);
+	return err;
 }
 
-static void sn201202x_access_put(struct tps6598x *tps, bool rpm)
+static void sn201202x_access_put(struct tps6598x *tps, bool rpm, bool resleep)
 {
-	if (rpm)
-		pm_runtime_put_autosuspend(tps->dev);
+	if (!rpm)
+		return;
+	/* Back to sleep after an access sn201202x_entry_stray() woke it for after the suspend */
+	if (resleep)
+		spmi_command_sleep(tps_to_sn(tps)->sdev);
+	pm_runtime_put_autosuspend(tps->dev);
 }
 
 static int regmap_sn201202x_read(void *context,
@@ -214,14 +254,14 @@ static int regmap_sn201202x_read(void *context,
 				 void *val, size_t val_size)
 {
 	struct tps6598x *tps = spmi_device_get_drvdata(context);
-	bool rpm;
+	bool rpm, resleep;
 	int err;
 
-	err = sn201202x_access_get(tps, &rpm);
+	err = sn201202x_access_get(tps, &rpm, &resleep);
 	if (err)
 		return err;
 	err = __regmap_sn201202x_read(context, reg, reg_size, val, val_size);
-	sn201202x_access_put(tps, rpm);
+	sn201202x_access_put(tps, rpm, resleep);
 	return err;
 }
 
@@ -229,14 +269,14 @@ static int regmap_sn201202x_write(void *context, const void *data,
 				  size_t count)
 {
 	struct tps6598x *tps = spmi_device_get_drvdata(context);
-	bool rpm;
+	bool rpm, resleep;
 	int err;
 
-	err = sn201202x_access_get(tps, &rpm);
+	err = sn201202x_access_get(tps, &rpm, &resleep);
 	if (err)
 		return err;
 	err = __regmap_sn201202x_write(context, data, count);
-	sn201202x_access_put(tps, rpm);
+	sn201202x_access_put(tps, rpm, resleep);
 	return err;
 }
 
@@ -739,7 +779,7 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
  * hpm5) is probed as any other: it registers its Type-C port and power supply, and with
  * apple,sleep-ssps it follows the system's sleep as the USB-C ports' controllers do (woken and
  * switched to S3 at the prepare, SLEEP at the suspend, woken at the resume and switched to S0
- * at the complete).
+ * at the complete; on the J714s as macOS does it, see sn201202x_prepare_macos()).
  */
 static bool sn201202x_sleep_board(void)
 {
@@ -996,6 +1036,35 @@ static void sn201202x_remove(struct spmi_device *device)
 	spmi_command_sleep(sn->sdev);
 }
 
+/*
+ * J714s: macOS's wake of a controller it sent SLEEP at the entry: WAKEUP,
+ * INT_EVENT1 read and the same bits cleared, the status read, then SSPS back to S0, all before
+ * the rest of the resume, which goes on as before. Linux's S0 used to wait for the complete,
+ * whose own S0 now finds it done. For an empty USB-C port macOS uses 0x02, for an
+ * attached one and MagSafe 0x00; Linux has only S0, which this keeps.
+ */
+static void sn201202x_wake_macos(struct sn201202x *sn, int wake_err)
+{
+	struct tps6598x *tps = &sn->cd.tps;
+	u8 event[CD321X_WAKE_EVENT_LEN] = {};
+	u32 status = 0, data_status = 0;
+	ktime_t start = ktime_get();
+	int ret, s0;
+
+	if (wake_err) {
+		dev_info(tps->dev, "sleep wake: WAKEUP failed: %d, nothing read; %u register accesses while asleep\n",
+			 wake_err, sn->entry_strays);
+		return;
+	}
+	scoped_guard(mutex, &tps->lock) {
+		ret = cd321x_wake_events(tps, event, &status, &data_status);
+		s0 = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+	}
+	dev_info(tps->dev, "sleep wake: events %*phN cleared: %d; status %#010x, data status %#010x; S0: %d, %lld ms after the WAKEUP; %u register accesses while asleep\n",
+		 CD321X_WAKE_EVENT_LEN, event, ret, status, data_status, s0,
+		 ktime_ms_delta(ktime_get(), start), sn->entry_strays);
+}
+
 VISIBLE_IF_KUNIT int __maybe_unused sn201202x_resume(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
@@ -1007,6 +1076,9 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_resume(struct device *dev)
 		disable_irq(tps->irq);
 		WRITE_ONCE(sn->sleep_watch, false);
 	}
+	/* J714s: asleep since the prepare, until the WAKEUP below */
+	WRITE_ONCE(sn->entry_asleep, false);
+	WRITE_ONCE(sn->entry_suspended, false);
 	/* One that slept on from idle sleep wakes through runtime PM */
 	if (pm_runtime_status_suspended(dev)) {
 		err = pm_runtime_resume(dev);
@@ -1015,6 +1087,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_resume(struct device *dev)
 	} else {
 		err = sn201202x_wake(sn);
 	}
+	if (sn->macos_sleep)
+		sn201202x_wake_macos(sn, err);
 	if (!err) {
 		/* Registered before xHCI, so this is before the root port resumes. */
 		tipd_usb_wake(tps, false);
@@ -1071,6 +1145,11 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	}
 	/* Registered before xHCI, so its root port has suspended by now. */
 	tipd_usb_wake(tps, true);
+	/* J714s: asleep since the prepare, as on macOS */
+	if (READ_ONCE(sn->entry_asleep)) {
+		WRITE_ONCE(sn->entry_suspended, true);
+		return 0;
+	}
 	reinit_completion(&sn->sleep_completion);
 	err = spmi_command_sleep(sn->sdev);
 	if (pm_suspend_via_firmware() && sn201202x_sleep_board())
@@ -1103,6 +1182,85 @@ out_put:
 }
 EXPORT_SYMBOL_IF_KUNIT(sn201202x_suspend);
 
+/*
+ * J714s: enter the sleep as macOS does (its sleeps traced on the J714s). There, each
+ * port controller gets, before any USB or PHY stop: WAKEUP, a read of its system power state,
+ * SSPS 0x03 read to its end, and SPMI SLEEP straight after its result is read, and then nothing
+ * until the wake (sn201202x_wake_macos()). No events are read or cleared, no LDCM and no LOCK.
+ * Linux sent S3 at the prepare but SLEEP only at the suspend. In between its 500 ms poll, on a
+ * workqueue the freezer leaves running, read and cleared INT_EVENT1 and read the status of a
+ * controller already in S3. And the prepare first read the liquid detector and could send LDCM,
+ * a command of up to 5 s, which these controllers have been seen to run for over 3 s with SPMI
+ * parity faults and NACKs after it (sn201202x_init()); right after a replug a measurement can
+ * still be running. Here the poll stops first (one already running finishes, and its own
+ * liquid-detection handling with it), the prepare neither reads the detector nor sends LDCM
+ * (sn201202x_macos_dry() takes only a port last known dry or mitigated), S3 goes as before,
+ * and SLEEP right after it. The port's other work is freezable and stays frozen until after the
+ * complete. Outside tipd only apple-sleep's debug link cut talks to a port controller during a
+ * sleep, at the noirq suspend, and it sends its own WAKEUP first.
+ * The switch is read at each sleep's prepare; 0 enters as before.
+ */
+static bool macos_entry = true;
+module_param(macos_entry, bool, 0644);
+MODULE_PARM_DESC(macos_entry, "J714s: enter the sleep as macOS does: poll stopped, no liquid detection, SLEEP right after S3 at the prepare; events cleared and S0 at the resume (0: as before)");
+
+static bool sn201202x_macos_entry(struct sn201202x *sn)
+{
+	struct device *dev = sn->cd.tps.dev;
+
+	/* A port that arms USB wake (none on the J714s) needs the controller at the suspend */
+	return READ_ONCE(macos_entry) && sn201202x_j714s() && sn->polled &&
+	       pm_suspend_via_firmware() &&
+	       device_property_read_bool(dev, "apple,sleep-ssps") &&
+	       !device_property_read_bool(dev, "apple,usb-remote-wake");
+}
+
+/*
+ * The detector isn't read at the macOS entry, so it is taken only from a port last known dry or
+ * mitigated, read once the poll (whose events can change that) has stopped; any other enters as
+ * before, whose reading or mitigation can refuse the sleep.
+ */
+static bool sn201202x_macos_dry(struct sn201202x *sn)
+{
+	struct tps6598x *tps = &sn->cd.tps;
+
+	guard(mutex)(&tps->lock);
+	return !tps->contaminant_ops || tps->contaminant == TYPEC_CONTAMINANT_NONE ||
+	       sn->ldcm_mitigated;
+}
+
+static int sn201202x_prepare_macos(struct sn201202x *sn)
+{
+	struct tps6598x *tps = &sn->cd.tps;
+	ktime_t start, s3_end;
+	int ret, err;
+
+	/* The poll stopped already, then the port's work and S3: woken, read, commanded, its end read */
+	start = ktime_get();
+	ret = tipd_prepare(tps->dev);
+	s3_end = ktime_get();
+	if (ret) {
+		/* Completed again there, and no complete follows: poll back, detector read */
+		sn->macos_sleep = false;
+		tipd_poll_start(tps);
+		scoped_guard(mutex, &tps->lock)
+			sn201202x_ldcm_refresh(tps);
+		dev_info(tps->dev, "sleep entry: poll and port work stopped, LDCM skipped; S3 refused the sleep: %d after %lld ms; no SLEEP, poll started again\n",
+			 ret, ktime_ms_delta(s3_end, start));
+		return ret;
+	}
+	scoped_guard(mutex, &tps->lock) {
+		err = spmi_command_sleep(sn->sdev);
+		WRITE_ONCE(sn->entry_asleep, !err);
+	}
+	/* The S3 command's own line comes just before this one */
+	dev_info(tps->dev, "sleep entry: poll and port work stopped, LDCM skipped (last result %d); S3 at the prepare, %lld ms; SLEEP: %d, %lld us after it%s; no sleep confirmation on the polled bus\n",
+		 tps->contaminant_ops ? (int)tps->contaminant : -1,
+		 ktime_ms_delta(s3_end, start), err, ktime_us_delta(ktime_get(), s3_end),
+		 err ? ", sent again at the suspend" : "");
+	return 0;
+}
+
 static int sn201202x_prepare(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
@@ -1110,6 +1268,16 @@ static int sn201202x_prepare(struct device *dev)
 	int ret;
 
 	cancel_delayed_work_sync(&sn->ldcm_work);
+	sn->entry_strays = 0;
+	WRITE_ONCE(sn->entry_suspended, false);
+	sn->macos_sleep = sn201202x_macos_entry(sn);
+	if (sn->macos_sleep) {
+		tipd_poll_stop(tps);
+		if (sn201202x_macos_dry(sn))
+			return sn201202x_prepare_macos(sn);
+		sn->macos_sleep = false;
+		tipd_poll_start(tps);
+	}
 	mutex_lock(&tps->lock);
 	ret = sn201202x_ldcm_update(tps);
 	mutex_unlock(&tps->lock);
@@ -1137,11 +1305,26 @@ static int sn201202x_prepare(struct device *dev)
 static void sn201202x_complete(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
+	struct sn201202x *sn = tps_to_sn(tps);
+	int err;
 
+	/* J714s: a sleep given up after the prepare's SLEEP, with no resume: woken here */
+	WRITE_ONCE(sn->entry_suspended, false);
+	if (READ_ONCE(sn->entry_asleep)) {
+		WRITE_ONCE(sn->entry_asleep, false);
+		err = sn201202x_wake(sn);
+		dev_info(dev, "sleep wake: sleep given up after the entry: WAKEUP %d at the complete; %u register accesses while asleep\n",
+			 err, sn->entry_strays);
+	}
 	/* Refresh the detector snapshot before cable revalidation is thawed. */
 	scoped_guard(mutex, &tps->lock)
 		sn201202x_ldcm_refresh(tps);
 	tipd_complete(dev);
+	/* J714s: the poll stopped at the prepare, if no resume started it again */
+	if (sn->macos_sleep) {
+		sn->macos_sleep = false;
+		tipd_poll_start(tps);
+	}
 }
 
 MODULE_DEVICE_TABLE(of, sn201202x_of_match);
