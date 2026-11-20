@@ -364,7 +364,10 @@ impl Registry {
 
     /// Tell admission whether another render pair can still be built.
     pub(super) fn note_build_room(&self) {
-        self.admission.note_build_room(self.qids.render_pair_fits());
+        self.admission.note_build_room(
+            self.qids.render_pair_fits(),
+            self.qids.render_pair_capacity(),
+        );
     }
 
     pub(super) fn ensure_render_ids(&mut self, slot: u8, owner: u64) -> Result {
