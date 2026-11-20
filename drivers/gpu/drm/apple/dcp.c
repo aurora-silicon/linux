@@ -7022,6 +7022,17 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			return ret;
 	}
 
+	/*
+	 * Every address this processor's firmware is given is a DVA it reaches
+	 * through its DART. A processor that names a DART but was left without
+	 * an IOMMU domain (the IOMMU driver did not take it) would get physical
+	 * addresses from the DMA API's direct path, which its DART would then
+	 * translate as DVAs, into whatever those happen to map: refuse it.
+	 */
+	if (of_property_present(dev->of_node, "iommus") && !device_iommu_mapped(dev))
+		return dev_err_probe(dev, -ENODEV,
+				     "no IOMMU domain; not handing the firmware untranslated DMA addresses\n");
+
 	/* Check for "apple,bw-scratch" to avoid probing appledrm with outdated
 	 * device trees. This prevents replacing simpledrm and ending up without
 	 * display.
