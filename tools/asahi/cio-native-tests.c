@@ -52,6 +52,11 @@ static bool of_machine_is_compatible(const char *compat)
 	assert(!strcmp(compat, "apple,j714s"));
 	return j714s;
 }
+/* The J714s describes the T6050 sleep (apple,t6050-sleep); the other modelled board does not. */
+static bool apple_t6050_sleep_described(void)
+{
+	return j714s;
+}
 #define list_is_singular(l) ((l)->count == 1)
 #define list_first_entry(l, t, m) ((void)sizeof(#m), (t *)(l)->first)
 static unsigned int next_set_bit(unsigned long long m, unsigned int n, unsigned int i)
