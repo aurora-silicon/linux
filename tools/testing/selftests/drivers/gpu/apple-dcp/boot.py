@@ -445,8 +445,43 @@ int main(void)
     node.fw[2] = 0; assert(apple_t8132_dcpext_v27_2(&node));
     machine_j773g = false;
 
+    /*
+     * The M3 Air's (T8122) internal DCP handed over with its 27.2 image runs
+     * the 27.2 table, on any T8122 board; its dcpext, another image, its
+     * 14.x image and other releases do not.
+     */
+    static struct apple_dcp_hw_data hw_t8122;
+    dev.hw = &hw_t8122;
+    reset_t6041_26b123(false);
+    node.compatible = "apple,t8122-dcp";
+    node.uuid = APPLE_T8122_DCP_26B123_UUID;
+    assert(apple_t8122_dcp_v27_2(&node));
+    assert(!apple_t6041_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
+    node.compatible = "apple,t8122-dcpext";
+    assert(!apple_t8122_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    node.compatible = "apple,t8122-dcp";
+    node.uuid = APPLE_T6041_DCP_26B123_UUID;
+    assert(!apple_t8122_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    node.uuid = APPLE_T8122_DCP_26B123_UUID;
+    node.uuid_count = 0; assert(!apple_t8122_dcp_v27_2(&node));
+    node.uuid_count = 2; assert(!apple_t8122_dcp_v27_2(&node));
+    node.uuid_count = 1;
+    node.fw[0] = 14; node.fw[1] = 7; node.fw[2] = 0;
+    node.compat[0] = 14; node.compat[1] = 7; node.compat[2] = 0;
+    assert(!apple_t8122_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    node.fw[0] = 27; node.fw[1] = 2; node.fw[2] = 1;
+    node.compat[0] = 27; node.compat[1] = 2; node.compat[2] = 1;
+    assert(!apple_t8122_dcp_v27_2(&node));
+    node.fw[2] = 0; node.compat[2] = 0;
+    assert(apple_t8122_dcp_v27_2(&node));
+
     dev.hw = &hw_t6041;
     puts("PASS T6041 26B123 v27.2 internal/external admission, refusal controls, and desktop 26.x preservation");
+    puts("PASS T8122 internal DCP on its 27.2 image alone runs the 27.2 table");
     puts("PASS T8132 M4 backend only on its firmware path; the J773g dcpext on 27.2 alone runs the 27.2 table");
     return 0;
 }

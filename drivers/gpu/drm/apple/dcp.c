@@ -5924,6 +5924,18 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		return dcp_v27_method_table(dev, compat_str);
 	}
 
+	/*
+	 * The T8122 (M3 MacBook Air) internal DCP on the 27.2 (26B123) image
+	 * runs the firmware-27 backend with the 27.2 table, as the T6041's
+	 * 27.2 internal DCP does. Its 14.x image keeps the native 14.7 path
+	 * and the 25G83 profile its own, below.
+	 */
+	if (apple_t8122_dcp_v27_2(dev->of_node)) {
+		/* Checked by apple_t8122_dcp_v27_2(). */
+		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		return dcp_v27_method_table(dev, compat_str);
+	}
+
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
 		if (ret < 0) {
@@ -6202,8 +6214,13 @@ clocks:
 	 * (376 at 712 MHz and 460 at 0 Hz). Expose the same two-entry table
 	 * when apple,clock-ids is absent so getClockFrequency(0/1) matches.
 	 */
+	/*
+	 * The T8122 /arm-io/disp0 names the same pair (345 at 712 MHz, the
+	 * device tree's disp0 clock, and 416 at 0 Hz).
+	 */
 	if (!of_property_present(dev->of_node, "apple,clock-ids") &&
-	    of_device_is_compatible(dev->of_node, "apple,t6041-dcp")) {
+	    (of_device_is_compatible(dev->of_node, "apple,t6041-dcp") ||
+	     of_device_is_compatible(dev->of_node, "apple,t8122-dcp"))) {
 		struct clk *clk = devm_clk_get_optional(dev, NULL);
 
 		if (IS_ERR(clk))
@@ -7261,6 +7278,17 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	 */
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t6041-dcp")) {
+		dcp->hw.firmware_dma_bits = 41;
+		dcp->hw.num_dptx_ports = 0;
+		dcp->hw.adopt_live_session = true;
+	}
+	/*
+	 * The same for the T8122 internal panel on firmware 27: its DART
+	 * window is 0x100_0000_0000 + 64 GiB, and dcpext drives the external
+	 * ports.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t8122-dcp")) {
 		dcp->hw.firmware_dma_bits = 41;
 		dcp->hw.num_dptx_ports = 0;
 		dcp->hw.adopt_live_session = true;
