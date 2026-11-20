@@ -1890,11 +1890,16 @@ impl Gpu {
         let others = builds
             .iter()
             .filter(|build| Some(build.os_version) != version);
+        // Measure the loaded TEXT once and try each build against it. A build that is not this
+        // image is not an error while another one may be: only when none is, say what was
+        // measured and what is supported.
+        let mut measured = Self::measure_text(dev)?;
         let mut identified = None;
         for build in Iterator::chain(preferred, others) {
-            if Self::identify_image(dev, build).is_err() {
+            let Some(image) = measured.find(build.images) else {
                 continue;
-            }
+            };
+            dev_info!(dev.as_ref(), "GPU firmware build: {}\n", image.name);
             let admits = build.config.is_none_or(|config| {
                 config
                     .core_layout
@@ -1913,25 +1918,37 @@ impl Gpu {
         }
         dev_err!(
             dev.as_ref(),
+            "unsupported GPU firmware build: {}\n",
+            measured.identity(builds.iter().flat_map(|build| build.images))
+        );
+        for image in builds.iter().flat_map(|build| build.images) {
+            dev_err!(dev.as_ref(), "supported: {}\n", image.name);
+        }
+        dev_err!(
+            dev.as_ref(),
             "Unsupported GPU firmware image (reported macOS version {:?})\n",
             version
         );
         Err(ENODEV)
     }
 
-    /// Checks that the loaded TEXT (the `fw-text` region) is one of `build`'s images, with the DATA size
-    /// of the `fw-data` region. The version property is only a selection hint.
-    fn identify_image(dev: &AsahiDrmDevice, build: &'static fw::variant::Build) -> Result {
+    /// Measures the loaded TEXT (the `fw-text` region), with the DATA size of the `fw-data`
+    /// region, for [`Self::firmware_variant`] to identify among the builds. The version
+    /// property is only a selection hint.
+    fn measure_text(dev: &AsahiDrmDevice) -> Result<crate::fwid::Measured> {
         let node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
         let text = node.reserved_mem_region_to_resource_byname(c_str!("fw-text"))?;
         let data = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
         let start = text.start();
         let end = start.checked_add(text.size()).ok_or(EINVAL)?;
-        crate::fwid::identify(dev.as_ref().as_ref(), start..end, data.size(), build.images)
-            .inspect_err(|e| {
-                dev_err!(dev.as_ref(), "GPU firmware image not admitted: {:?}\n", e)
-            })?;
-        Ok(())
+        crate::fwid::measure(start..end, data.size()).inspect_err(|e| {
+            if *e == EAGAIN {
+                dev_err!(
+                    dev.as_ref(),
+                    "GPU firmware TEXT changed while it was measured\n"
+                );
+            }
+        })
     }
 
     /// The macOS version the boot loader reports for the boot firmware that loaded the GPU
