@@ -182,12 +182,11 @@ pub(crate) mod t8132 {
         (0x5ce63, 1),
         (0x5ce64, 0x34c),
     ];
-}
 
-/// What iBoot writes into the 26B123 build b000 TEXT it loads: the same two header words and
-/// the same 39 boot parameter records and two tunable tables as 25G83, which the 26B123 image
-/// places 0x413c bytes later (`_rtk_patchbay` at 0x60a1b, `_rtk_tunables` at 0x60c4c).
-pub(crate) const BOOT_FILLED_26B123_B000: &[(u32, u32)] = &[
+    /// What iBoot writes into the 26B123 build b000 TEXT it loads: the same two header words and
+    /// the same 39 boot parameter records and two tunable tables as 25G83, which the 26B123 image
+    /// places 0x413c bytes later (`_rtk_patchbay` at 0x60a1b, `_rtk_tunables` at 0x60c4c).
+    pub(crate) const BOOT_FILLED_26B123_B000: &[(u32, u32)] = &[
         (0x224, 4),
         (0x23c, 8),
         (0x60a23, 8),
@@ -233,7 +232,8 @@ pub(crate) const BOOT_FILLED_26B123_B000: &[(u32, u32)] = &[
         (0x60c50, 0x34c),
         (0x60f9f, 1),
         (0x60fa0, 0x34c),
-];
+    ];
+}
 
 /// Which part of the loaded image a firmware page-table leaf maps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

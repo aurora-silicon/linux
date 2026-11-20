@@ -20,6 +20,13 @@ def body(source, marker):
         i += 1
     return source[start:i]
 uat = (ROOT/'drivers/gpu/drm/asahi/g16/uat.rs').read_text()
+hw = (ROOT/'drivers/gpu/drm/asahi/g16/hw.rs').read_text()
+# The production 25G83 firmware page-table leaves, admitted against the frozen C oracle below.
+layout = hw[hw.index('pub(crate) const FW_25G83: FwLayout = FwLayout {'):]
+leaves = layout[layout.index('leaves: Some(&[') + len('leaves: Some('):layout.index(']),') + 1]
+hw_leaves = '\n'.join([body(hw, '#[derive(Clone, Copy, PartialEq, Eq, Debug)]\npub(crate) enum Segment {'),
+                       body(hw, 'pub(crate) struct Leaves {'),
+                       'pub const LEAVES_25G83: &[Leaves] = ' + leaves + ';'])
 vm = (ROOT/'drivers/gpu/drm/asahi/g16/vm.rs').read_text()
 pt = (ROOT/'drivers/gpu/drm/asahi/pgtable.rs').read_text()
 methods = '\n'.join(body(uat, m) for m in [
@@ -41,7 +48,9 @@ const ENTRIES:usize=2048; const ROOT_ENTRIES:usize=64; const VALID:u64=3; const 
 mod hw { pub const PAGE:u64=0x4000; pub const TABLES_SIZE:u64=0x40000;
  pub const UPPER:u64=0xfffffc0000000000; pub const HOST:u64=0xfffffc2000000000;
  pub const HOST_SIZE:u64=0x1000000000; pub const PPL_MAGIC:u64=0x4b1d000000000002;
- pub const PA_MASK:u64=0x3ffffffc000; }
+ pub const PA_MASK:u64=0x3ffffffc000;
+ use std::ops::Range;
+ __HW_LEAVES__ }
 mod device { pub struct Device; }
 // The common PPL lease is modeled here; test-ppl.py executes its actual guard with
 // concurrency and timeout injection. This harness tests Window's graph operations.
@@ -75,8 +84,8 @@ fn with_table<R>(pa:u64,count:usize,f:impl FnOnce(&[AtomicU64])->R)->Result<R>{l
 fn entry(pa:u64,index:usize)->Result<u64>{with_table(pa,index+1,|e|e[index].load(Ordering::Acquire))}
 fn clean_entries(pa:u64,first:usize,count:usize)->Result{with_table(pa,first+count,|_|())?;note(format!("clean:{pa:x}:{first}:{count}"));Ok(())}
 fn clean_page(pa:u64)->Result{clean_entries(pa,0,ENTRIES)}
-struct Window{handoff:Mapping,ttbs:Mapping,root:Mapping,shared_l2:Mapping,image:Vec<u64>,snapshot:Vec<u64>,published:bool,firmware_root:[u64;2],text_pa:u64,data_pa:u64}
-impl Window{fn blank()->Self{Self{handoff:Mapping::new(0x807000000,0x4000,"handoff"),ttbs:Mapping::new(0x808000000,0x4000,"ttbs"),root:Mapping::new(0x800000000,0x40000,"root"),shared_l2:Mapping::new(0x801000000,0x4000,"shared"),image:vec![0;2048],snapshot:vec![0;2048],published:false,firmware_root:[0;2],text_pa:0x802000000,data_pa:0x803000000}}
+struct Window{handoff:Mapping,ttbs:Mapping,root:Mapping,shared_l2:Mapping,image:Vec<u64>,snapshot:Vec<u64>,published:bool,firmware_root:[u64;2],text_pa:u64,data_pa:u64,leaves:&'static [hw::Leaves]}
+impl Window{fn blank()->Self{Self{handoff:Mapping::new(0x807000000,0x4000,"handoff"),ttbs:Mapping::new(0x808000000,0x4000,"ttbs"),root:Mapping::new(0x800000000,0x40000,"root"),shared_l2:Mapping::new(0x801000000,0x4000,"shared"),image:vec![0;2048],snapshot:vec![0;2048],published:false,firmware_root:[0;2],text_pa:0x802000000,data_pa:0x803000000,leaves:hw::LEAVES_25G83}}
 '''
 post = r'''
 }
@@ -119,7 +128,7 @@ fn prot_and_va_tests(){
 }
 fn main(){let args:Vec<_>=std::env::args().collect();for id in 0..12{assert_c_parity(&mutation(id),id,&args[1],&args[2]);}root_admission_tests();publication_tests();prot_and_va_tests();println!("12 C/Rust firmware-graph parity fixtures; 195 flush, 128 TTBAT ownership rejections; stopped publication ordering; live link ownership/global TLBI; exact M4 leaf classes/VA reservations passed (mock hardware; PPL lease mocked and tested separately)");}
 '''
-harness = pre + methods + post + prot_constants + prot_impl + reserved
+harness = pre.replace('__HW_LEAVES__', hw_leaves) + methods + post + prot_constants + prot_impl + reserved
 (OUT/'check-vm.rs').write_text(harness)
 
 golden = OUT/'golden'
