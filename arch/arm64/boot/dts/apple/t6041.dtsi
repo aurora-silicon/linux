@@ -382,6 +382,113 @@
 	};
 };
 
+/*
+ * The two ProRes engines, from the J616c ADT. apr0 sits in the SCODEC block
+ * at the T6040's addresses and has its SCODEC system window (aux). apr1 is
+ * outside it: only its engine and wrapper windows, its own DART (one stream,
+ * sid 0) and the PRORES power domain, which also resets it.
+ */
+&pmgr_aux {
+	ps_fab1_soc: power-controller@2d0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2d0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fab1_soc";
+		power-domains = <&ps_afi>;
+		apple,always-on;
+		status = "disabled";
+	};
+
+	ps_scodec: power-controller@328 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x328 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "scodec";
+		power-domains = <&ps_fab1_soc>;
+		status = "disabled";
+	};
+
+	ps_scodec_streaming: power-controller@330 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x330 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "scodec_streaming";
+		power-domains = <&ps_scodec>;
+		status = "disabled";
+	};
+};
+
+/* PMGR group 1 is the main bank at 0x502280000. */
+&pmgr {
+	ps_prores: power-controller@3a8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "prores";
+		power-domains = <&ps_fab6_soc>;
+		status = "disabled";
+	};
+};
+
+/ {
+	/* ADT /arm-io/dart-apr0. */
+	apr0_dart: iommu@301020000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x01020000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1959 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_scodec>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/apr0. */
+	apr0: video-codec@301000000 {
+		compatible = "apple,t6041-prores", "apple,prores";
+		reg = <0x3 0x01000000 0x0 0x4000>,
+		      <0x3 0x00000000 0x0 0x1000000>,
+		      <0x3 0x010c0000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1960 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_scodec_streaming>;
+		iommus = <&apr0_dart 1>;
+		resets = <&ps_scodec>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/dart-apr1. */
+	apr1_dart: iommu@585020000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x5 0x85020000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 2007 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_prores>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/apr1: no SCODEC system window. */
+	apr1: video-codec@585000000 {
+		compatible = "apple,t6041-prores", "apple,prores";
+		reg = <0x5 0x85000000 0x0 0x4000>,
+		      <0x5 0x84000000 0x0 0x1000000>;
+		reg-names = "core", "wrapper";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 2010 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_prores>;
+		iommus = <&apr1_dart 0>;
+		resets = <&ps_prores>;
+		status = "disabled";
+	};
+};
+
 &ps_afr {
 	apple,always-on;
 	apple,no-auto-pm;
