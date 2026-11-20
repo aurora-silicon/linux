@@ -35,7 +35,6 @@
 #define IND_FILL		0xff34c759
 #define IND_EDGE		0xff000000
 #define IND_PRESENT_TIMEOUT	msecs_to_jiffies(1000)
-#define IND_RETRY		msecs_to_jiffies(50)
 
 static void dcp_indicator_watch(struct work_struct *work);
 static void dcp_indicator_resume(struct work_struct *work);
@@ -50,7 +49,7 @@ int dcp_indicator_probe(struct apple_dcp *dcp)
 	mutex_init(&ci->ctl);
 	INIT_DELAYED_WORK(&ci->watch, dcp_indicator_watch);
 	INIT_WORK(&ci->resume, dcp_indicator_resume);
-	INIT_DELAYED_WORK(&ci->retry, dcp_indicator_retry);
+	INIT_WORK(&ci->retry, dcp_indicator_retry);
 
 	if (of_property_read_u32(dcp->dev->of_node, "apple,camera-indicator-surface", &surf))
 		return 0;
@@ -94,7 +93,7 @@ void dcp_indicator_release(struct apple_dcp *dcp)
 	}
 	/* With no fb nothing queues them again, and all take ctl, so cancel after dropping it. */
 	cancel_delayed_work_sync(&ci->watch);
-	cancel_delayed_work_sync(&ci->retry);
+	cancel_work_sync(&ci->retry);
 	cancel_work_sync(&ci->resume);
 }
 
@@ -169,7 +168,7 @@ int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
 }
 
 /* The atomic state the kernel itself commits: the square, or nothing. */
-static int dcp_indicator_commit(struct apple_dcp *dcp, bool on)
+static int dcp_indicator_commit(struct apple_dcp *dcp, bool on, bool wait)
 {
 	struct dcp_camera_indicator *ci = &dcp->camera_ind;
 	struct drm_crtc *crtc;
@@ -231,7 +230,7 @@ retry:
 		drm_atomic_set_fb_for_plane(ps, NULL);
 	}
 	WRITE_ONCE(to_apple_plane(ci->plane)->indicator_commit, state);
-	ret = drm_atomic_nonblocking_commit(state);
+	ret = wait ? drm_atomic_commit(state) : drm_atomic_nonblocking_commit(state);
 	WRITE_ONCE(to_apple_plane(ci->plane)->indicator_commit, NULL);
 out:
 	if (ret == -EDEADLK) {
@@ -256,16 +255,16 @@ static void dcp_indicator_end(struct apple_dcp *dcp)
 	spin_unlock_irqrestore(&ci->lock, flags);
 }
 
-static int dcp_indicator_do_commit(void *ctx, bool on)
+static int dcp_indicator_do_commit(void *ctx, bool on, bool wait)
 {
-	return dcp_indicator_commit(ctx, on);
+	return dcp_indicator_commit(ctx, on, wait);
 }
 
 static void dcp_indicator_queue_retry(void *ctx)
 {
 	struct apple_dcp *dcp = ctx;
 
-	queue_delayed_work(system_percpu_wq, &dcp->camera_ind.retry, IND_RETRY);
+	schedule_work(&dcp->camera_ind.retry);
 }
 
 static const struct dcp_ind_ops dcp_indicator_ops = {
@@ -273,10 +272,7 @@ static const struct dcp_ind_ops dcp_indicator_ops = {
 	.queue_retry = dcp_indicator_queue_retry,
 };
 
-/*
- * ctl held. The square must come off, so a commit refused for a pending flip
- * is retried from a work item until it lands.
- */
+/* ctl held. A pending flip defers removal to the blocking work item. */
 static void dcp_indicator_off(struct apple_dcp *dcp)
 {
 	int ret = dcp_ind_apply(&dcp->camera_ind.state, false, &dcp_indicator_ops, dcp);
@@ -288,7 +284,7 @@ static void dcp_indicator_off(struct apple_dcp *dcp)
 static void dcp_indicator_retry(struct work_struct *work)
 {
 	struct dcp_camera_indicator *ci =
-		container_of(work, struct dcp_camera_indicator, retry.work);
+		container_of(work, struct dcp_camera_indicator, retry);
 	struct apple_dcp *dcp = container_of(ci, struct apple_dcp, camera_ind);
 	int ret;
 
@@ -416,11 +412,9 @@ static void dcp_indicator_resume(struct work_struct *work)
 }
 
 /*
- * on: requests the square and returns 0 once the request is committed, or
- * queued after a pending flip refused it; the present that carries it is
- * confirmed, or withdrawn, within 1 s without blocking the caller. An error
- * means no indicator. off: always succeeds, and a commit refused for a pending
- * flip is retried until it lands. The caller streams either way.
+ * Return when the request is submitted or queued. The camera does not wait
+ * for the present that confirms the indicator. On stop, a pending flip defers
+ * the removal to the work item.
  */
 int apple_dcp_camera_indicator_set(struct device *dev, bool on)
 {

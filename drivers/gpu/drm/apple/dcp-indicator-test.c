@@ -91,14 +91,15 @@ static void indicator_resumes_only_a_kept_request(struct kunit *test)
 struct fake_drm {
 	int results[4];
 	int commits, queued;
-	bool last_on;
+	bool last_on, last_wait;
 };
 
-static int fake_commit(void *ctx, bool on)
+static int fake_commit(void *ctx, bool on, bool wait)
 {
 	struct fake_drm *d = ctx;
 
 	d->last_on = on;
+	d->last_wait = wait;
 	return d->results[d->commits++];
 }
 
@@ -109,11 +110,7 @@ static void fake_queue(void *ctx)
 
 static const struct dcp_ind_ops fake_ops = { fake_commit, fake_queue };
 
-/*
- * A flip still pending refuses the nonblocking commit with -EBUSY, on or off.
- * The request stands, so the commit is queued again until it lands, and the
- * camera never waits for it. Any other error is final and returned.
- */
+/* A refused nonblocking commit gets one work item, even if the work item fails. */
 static void indicator_refused_commit_is_retried(struct kunit *test)
 {
 	struct dcp_indicator ind = {};
@@ -123,16 +120,16 @@ static void indicator_refused_commit_is_retried(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
 	dcp_ind_end(&ind);
 	KUNIT_EXPECT_EQ(test, dcp_ind_apply(&ind, false, &fake_ops, &d), 0);
+	KUNIT_EXPECT_FALSE(test, d.last_wait);
 	KUNIT_EXPECT_EQ(test, d.queued, 1);
-	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), 0);
-	KUNIT_EXPECT_EQ(test, d.queued, 2);
+	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), -EBUSY);
+	KUNIT_EXPECT_TRUE(test, d.last_wait);
+	KUNIT_EXPECT_EQ(test, d.queued, 1);
 	KUNIT_EXPECT_FALSE(test, d.last_on);
+	KUNIT_EXPECT_EQ(test, d.commits, 2);
 	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), 0);
-	KUNIT_EXPECT_EQ(test, d.commits, 3);
-	/* Landed: nothing left to retry. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), 0);
-	KUNIT_EXPECT_EQ(test, d.commits, 3);
-	KUNIT_EXPECT_EQ(test, d.queued, 2);
+	KUNIT_EXPECT_EQ(test, d.commits, 2);
+	KUNIT_EXPECT_EQ(test, d.queued, 1);
 
 	/* On: the request stands, so the square is asked for again. */
 	d = (struct fake_drm){ .results = { -EBUSY, 0 } };
