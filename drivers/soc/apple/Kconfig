@@ -115,6 +115,7 @@ config APPLE_SOC_SLEEP
 	  Only SoCs whose sleep has been measured and tested are supported,
 	  each by its match data: today T8140, T8132 and T6050. On every other
 	  SoC the driver doesn't bind, and s2idle stays the only system sleep.
+	  A SoC still in qualification has an option of its own below.
 
 config APPLE_SOC_SLEEP_KUNIT_TEST
 	bool "KUnit tests for the Apple SoC sleep match data" if !KUNIT_ALL_TESTS
@@ -125,6 +126,28 @@ config APPLE_SOC_SLEEP_KUNIT_TEST
 	  suspend, that every list names only words of the SoC's full lists,
 	  with no duplicates, and that the lists fit the driver's books. The
 	  tests touch no hardware.
+
+	  If unsure, say N.
+
+config APPLE_SOC_SLEEP_T8122
+	bool "Apple SoC system sleep: J613 (T8122) match data, in qualification"
+	depends on APPLE_SOC_SLEEP
+	help
+	  Adds the MacBook Air (13-inch, M3) to the SoCs the Apple SoC sleep
+	  driver matches. Its entry sequence was measured from a macOS sleep on
+	  that machine; no sleep entered by Linux has yet powered the SoC down
+	  or come back, so the match is left out of a kernel built without this.
+
+	  The driver binds only on J613, only with the sleep node enabled in
+	  the device tree, and only when the boot object published
+	  /chosen/aurora,s2r-mailbox. Deep sleep is offered only with
+	  apple_sleep.deep=1, and a sleep is then a dry run that refuses before
+	  it stops anything unless apple_sleep.untested_commit=1. A sleep is
+	  refused, with the system left running, unless every coprocessor it
+	  must stop is ready and the tree enables the wake source of the PMU's
+	  RTC alarm. No wake is qualified, and the display and the GPU have no
+	  restart on this machine: both stay down after a sleep that commits
+	  until a reboot.
 
 	  If unsure, say N.
 

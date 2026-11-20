@@ -6,6 +6,7 @@
  */
 #include <linux/bitfield.h>
 #include <linux/bits.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/io.h>
@@ -550,6 +551,9 @@ static void __iomem *asahi_g17_map(struct device_node *np, const char *name, int
 	    offset + size > resource_size(&res))
 		return NULL;
 
+	/* Where the bus says so (T8122: a posted write loses the machine), non-posted writes. */
+	if (res.flags & IORESOURCE_MEM_NONPOSTED)
+		return ioremap_np(res.start + offset, size);
 	return ioremap(res.start + offset, size);
 }
 
@@ -739,4 +743,128 @@ bool asahi_g17_commit_finish(struct asahi_g17_commit *c, u32 *saved)
 	asahi_g17_commit_free(c);
 
 	return stopped;
+}
+
+/*
+ * The M3 (T8122, G15G): no firmware restart exists, so a sleep is entry qualification only.
+ * Its idle policy has GFX off between jobs, and a GPU whose domain is off has nothing left
+ * running: .prepare waits for that and refuses otherwise. The stop registered for the sleep's
+ * first pass then only has to find the domain still off. If it is on after all, nothing can
+ * idle the firmware with interrupts off here, so its run bit is cleared cold and the word
+ * lowered, and the stop reports that.
+ */
+#define M3_GFX_OFF_POLL_MS	20
+#define M3_GFX_OFF_WAIT_MS	3000
+
+static struct asahi_m3_sleep {
+	struct device *dev;
+	void __iomem *cpu;
+	void __iomem *ps;
+	bool registered, ran, cold;
+	u32 before, control, status, lowered;
+	int lower_ret;
+} asahi_m3_sleep;
+
+static int asahi_m3_commit_stop(void *data)
+{
+	struct asahi_m3_sleep *c = data;
+	u32 val;
+
+	c->ran = true;
+	c->before = readl(c->ps);
+	if (!FIELD_GET(PS_ACTUAL, c->before)) {
+		c->lowered = c->before;
+		return 0;
+	}
+	/* Its registers only answer with the domain up. */
+	c->cold = true;
+	c->status = readl(c->cpu + ASC_CPU_STATUS);
+	c->control = readl(c->cpu);
+	writel(c->control & ~ASC_CPU_CONTROL_RUN, c->cpu);
+	writel(c->before & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
+	val = readl(c->ps);
+	writel((val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) | PS_FLAGS, c->ps);
+	c->lower_ret = readl_poll_timeout_atomic(c->ps, c->lowered,
+						 !FIELD_GET(PS_ACTUAL, c->lowered) &&
+						 !(c->lowered & PS_BUSY),
+						 10, PS_TIMEOUT_US);
+	return 1;
+}
+
+static void asahi_m3_sleep_free(struct asahi_m3_sleep *c)
+{
+	if (c->registered)
+		apple_sleep_coproc_unregister(c->dev);
+	if (c->cpu)
+		iounmap(c->cpu);
+	if (c->ps)
+		iounmap(c->ps);
+	memset(c, 0, sizeof(*c));
+}
+
+int asahi_m3_sleep_prepare(struct device *dev)
+{
+	struct asahi_m3_sleep *c = &asahi_m3_sleep;
+	struct device_node *np;
+	unsigned int waited = 0;
+	u32 offset, val;
+	int ret = -ENODEV;
+
+	/* Without the sleep driver nothing stops the GPU at the commit. */
+	if (!apple_sleep_commit_stops_coprocs())
+		return -EBUSY;
+	if (c->dev)
+		asahi_m3_sleep_free(c);
+	c->dev = dev;
+	/* As G16's: control at the mapping's start, status in the next word. */
+	c->cpu = asahi_g17_map(dev->of_node, "asc", 0, ASC_CPU_CONTROL, 8);
+	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (np) {
+		if (!of_property_read_u32(np, "reg", &offset) && np->parent)
+			c->ps = asahi_g17_map(np->parent, NULL, 0, offset, 4);
+		of_node_put(np);
+	}
+	if (!c->cpu || !c->ps)
+		goto err;
+
+	for (;;) {
+		val = readl(c->ps);
+		if (!FIELD_GET(PS_ACTUAL, val) || waited >= M3_GFX_OFF_WAIT_MS)
+			break;
+		msleep(M3_GFX_OFF_POLL_MS);
+		waited += M3_GFX_OFF_POLL_MS;
+	}
+	if (FIELD_GET(PS_ACTUAL, val)) {
+		dev_warn(dev, "M3: GFX still on (%#x) after %u ms: refusing the sleep\n", val, waited);
+		ret = -EBUSY;
+		goto err;
+	}
+	ret = apple_sleep_coproc_register_first(dev, asahi_m3_commit_stop, c);
+	if (ret)
+		goto err;
+	c->registered = true;
+	apple_sleep_coproc_set_ready(dev, true);
+	dev_info(dev, "M3: GFX off (%#x) after %u ms; stop left to the sleep's commit, no restart exists\n",
+		 val, waited);
+
+	return 0;
+
+err:
+	asahi_m3_sleep_free(c);
+	return ret;
+}
+
+void asahi_m3_sleep_complete(struct device *dev)
+{
+	struct asahi_m3_sleep *c = &asahi_m3_sleep;
+
+	if (c->dev != dev)
+		return;
+	if (c->ran)
+		dev_info(dev, "M3: commit stop ran: GFX %#x -> %#x%s, control %#x status %#x (%d)\n",
+			 c->before, c->lowered, c->cold ? ", stopped cold" : ", already off",
+			 c->control, c->status, c->lower_ret);
+	if (c->cold)
+		dev_err(dev, "M3: GPU firmware was stopped cold and cannot restart: reboot\n");
+	asahi_m3_sleep_free(c);
 }
