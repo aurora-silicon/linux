@@ -705,6 +705,33 @@ static void isp_test_call_size_capabilities(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, isp->presets[8].output_dim.y, 1536);
 }
 
+static void isp_test_sensor_names(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_capture_alloc(test);
+	struct isp_format *fmt = isp_get_current_format(isp);
+
+	mutex_init(&isp->video_lock);
+	for (unsigned int i = 0; i < ARRAY_SIZE(isp_setfiles); i++) {
+		KUNIT_ASSERT_NOT_NULL_MSG(test, isp_setfiles[i].sensor,
+					  "setfile %u", i);
+		KUNIT_EXPECT_NE_MSG(test, isp_setfiles[i].sensor[0], '\0',
+				    "setfile %u", i);
+	}
+	KUNIT_EXPECT_STREQ(test, isp_setfiles[ISP_IMX248_1820_01].sensor,
+			   "imx248");
+	KUNIT_EXPECT_STREQ(test, isp_setfiles[ISP_IMX558_1925_03].sensor,
+			   "imx558");
+	KUNIT_EXPECT_STREQ(test, isp_setfiles[ISP_IMX958_2224_01].sensor,
+			   "imx958-uw");
+	KUNIT_EXPECT_STREQ(test, isp_setfiles[ISP_VD56G0_6221_01].sensor,
+			   "vd56g0");
+
+	KUNIT_EXPECT_NULL(test, apple_isp_sensor_name(isp));
+	fmt->id = ISP_IMX958_2224_01;
+	isp->camera_detected = true;
+	KUNIT_EXPECT_STREQ(test, apple_isp_sensor_name(isp), "imx958-uw");
+}
+
 static struct kunit_case isp_cam_test_cases[] = {
 	KUNIT_CASE(isp_test_call_crop),
 	KUNIT_CASE(isp_test_call_crop_bounds),
@@ -715,6 +742,7 @@ static struct kunit_case isp_cam_test_cases[] = {
 	KUNIT_CASE(isp_test_command_ack_failures),
 	KUNIT_CASE(isp_test_stop_key_on_debug),
 	KUNIT_CASE(isp_test_sensor_geometry),
+	KUNIT_CASE(isp_test_sensor_names),
 	KUNIT_CASE(isp_test_sensor_config_list),
 	KUNIT_CASE(isp_test_sensor_config_failure),
 	KUNIT_CASE(isp_test_preview_stream),
