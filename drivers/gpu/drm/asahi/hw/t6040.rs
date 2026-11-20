@@ -110,6 +110,7 @@ pub(crate) const CONFIG: Config = Config {
         variant: &fw::variant::V25G83,
         config: None,
     }]),
+    light_effort: Some(crate::g17::power::LIGHT_DEFAULT),
     // Measured on the 20-core M4 Pro; the alternative below remains experimental.
     core_layout: CoreLayout {
         cores: Some((2, 20)),

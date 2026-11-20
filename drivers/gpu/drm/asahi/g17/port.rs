@@ -529,7 +529,9 @@ impl Port {
     pub(super) fn note_submission(&self) -> bool {
         self.submissions.fetch_add(1, Ordering::SeqCst);
         self.note_gpu_activity();
+        // Take the slow path when the governor wants a different effort.
         self.effort_full.load(Ordering::SeqCst)
+            && super::power::submission_effort() == super::power::FULL_EFFORT
     }
 
     pub(super) fn submissions(&self) -> u64 {
@@ -564,6 +566,7 @@ impl Port {
         self.last_submission_ns
             .store(super::now_ns(), Ordering::Relaxed);
         self.demand.set_active(true);
+        self.demand.report_busy(super::now_ns());
     }
 
     pub(super) fn write_power(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
