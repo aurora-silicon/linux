@@ -355,6 +355,36 @@ static void t8122_wake208_apply(struct apple_sleep *s)
 	t8122_dc_putc('\n');
 }
 
+/*
+ * J613 trial, with t8122_keep_debug_link (no port-controller cold reset): macOS's own release of
+ * the debug link at its commit. Under the capture hypervisor the ATC0 debug-link words at mini
+ * PMGR +0xb0..+0xc8 drop to 0x300 (XNU's 0x3f0 requests) just before the commit, while
+ * debug_gated (+0x00) and the debug switch (+0xa8) stay fully on (capture 63). macos_state
+ * already lowers +0xb8 and +0xc8; this lowers +0xb0 and +0xc0 as well, last.
+ */
+static bool t8122_link_release;
+module_param(t8122_link_release, bool, 0600);
+MODULE_PARM_DESC(t8122_link_release, "J613 trial: with keep_debug_link, lower the ATC0 debug-link words (mini PMGR +0xb0, +0xc0) just before the commit, as macOS; debug_gated and the switch stay on");
+
+static void t8122_link_release_apply(void)
+{
+	static const u16 off[] = { 0xb0, 0xc0 };
+	unsigned int i;
+
+	if (!t8122_link_release || !t8122.dump_aon)
+		return;
+	for (i = 0; i < ARRAY_SIZE(off); i++)
+		writel(0x3f0, t8122.dump_aon + off[i]);
+	t8122_dc_puts("\nL ");
+	for (i = 0x00; i <= 0xc8; i += 8) {
+		if (i != 0x00 && i != 0xa8 && i < 0xb0)
+			continue;
+		t8122_dc_hex(readl(t8122.dump_aon + i));
+		t8122_dc_putc(' ');
+	}
+	t8122_dc_putc('\n');
+}
+
 static void t8122_macos_state_apply(struct apple_sleep *s)
 {
 	unsigned int i;
@@ -1294,6 +1324,7 @@ static void t8122_sleep_commit_regs(struct apple_sleep *s)
 	t8122_mcc_stop(s);
 	if (t8122_macos_state)
 		t8122_macos_state_apply(s);
+	t8122_link_release_apply();
 
 	writel(PWRGATE_ON, s->pwrgate + T8122_PWRGATE_E);
 	writel(PWRGATE_ON, s->pwrgate + T8122_PWRGATE_P);
