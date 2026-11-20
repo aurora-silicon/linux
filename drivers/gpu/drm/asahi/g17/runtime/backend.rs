@@ -97,25 +97,33 @@ impl Backend {
         self.release_outer(Engine::Compute);
         self.release_outer(Engine::Render);
         let mut state = self.shared.state.lock();
+        // The client closes its queue itself now (see `Context::held_by_open_client`).
+        self.context.note_open_client(false);
         let Some(firmware) = (*state).as_deref_mut() else {
             return Ok(());
         };
         // A pair of this context that holds guilty work counts for a kill only after a restart
-        // since this close (`Pair::guilty_for_kill`).
-        self.context.note_closed(firmware.recovery.generation());
-        // Retain a published scheduler before a never-kicked physical graph is
-        // removed. The teardown entry owns its root until control consumption.
-        firmware
-            .queues
-            .teardown
-            .close(&self.context, super::now_ns())?;
-        firmware.queues.release_compute(self.owner)?;
-        firmware.queues.release_render(self.owner)?;
-        // The armed release holds the owner's pairs from every other owner until it is
-        // consumed. Hold them before admission releases the owner: admission does not take
-        // the device mutex, so a slot released first could be taken in between.
-        firmware.queues.sync_render_holds();
-        firmware.queues.admission.release_owner(self.owner);
+        // since this close (`Pair::guilty_for_kill`). Only the first close counts: the kernel
+        // may have closed this queue on its client's behalf already (`Firmware::close_failed_owners`),
+        // and its teardown entry may be released and reclaimed since. Closing it again would
+        // release its scheduler twice.
+        if !self.context.is_closed() {
+            // Retain a published scheduler before a never-kicked physical graph is
+            // removed. The teardown entry owns its root until control consumption.
+            firmware
+                .queues
+                .teardown
+                .close(&self.context, super::now_ns())?;
+            // Only now: a close that could not reserve its teardown entry is redone by the next.
+            self.context.note_closed(firmware.recovery.generation());
+            firmware.queues.release_compute(self.owner)?;
+            firmware.queues.release_render(self.owner)?;
+            // The armed release holds the owner's pairs from every other owner until it is
+            // consumed. Hold them before admission releases the owner: admission does not take
+            // the device mutex, so a slot released first could be taken in between.
+            firmware.queues.sync_render_holds();
+            firmware.queues.admission.release_owner(self.owner);
+        }
         drop(state);
         // Its idle channel, or its slot and never-published QID, is free.
         self.shared.channels.notify();

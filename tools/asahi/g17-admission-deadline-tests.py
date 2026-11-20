@@ -45,6 +45,7 @@ struct State {owners:[u64;cfg::RENDER_SLOTS],quarantined:u64,spared:u64,next_tic
 impl State {
  fn exhausted(&self)->bool {false}
 ''' + item(source, 'fn owner_quarantine(') + r'''
+ fn owner_released(&self,_:u64)->bool {false}
  fn refusal(&self,_:u64)->Result {Ok(())}
  fn plan(&self,_:u64,_:Option<Request<'_>>,_:Option<u64>)->Plan {if self.conflict {Plan::Conflict}else{Plan::Any}}
  fn pick(&mut self,_:u64,_:usize,_:Plan)->Option<u8> {if self.ready{Some(1)}else{None}}

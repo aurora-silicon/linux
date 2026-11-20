@@ -210,6 +210,7 @@ impl Firmware {
             return Ok(());
         }
         let now = now_ns();
+        self.close_failed_owners(now)?;
         // Publication has already retained each kill. Retry only the doorbell;
         // failed attempts do not extend its bounded polling window.
         for entry in self.queues.compute.iter_mut().flatten() {
@@ -417,6 +418,51 @@ impl Firmware {
     /// kills a context on its render pairs' behalf.
     fn kill_releases_render(&self, context: &Arc<Context>) -> bool {
         !self.init.is_m5() && !context.kill_published() && self.queues.render.kill_slots(context, self.recovery.generation()) != 0
+    }
+
+    /// Closes, on its client's behalf, each queue whose VM a GPU recovery failed as guilty
+    /// (`Pair::failed_guilty`), as its client's close (`release_queue`) would. Nothing of that
+    /// VM can run again: its status refuses every later submission and publication. But a client
+    /// that keeps the queue open after the lost device (a process that ignores it, or waits in an
+    /// error dialog) would keep its guilty work published, and that work hangs the GPU again after
+    /// every restart until the storm limit stops the GPU for every client: a guilty pair is killed
+    /// only once its owner closed (`Pair::guilty_unretired`). Closed here, its context takes the
+    /// same kill, release and detach as an exited client's. The client's own close later finds the
+    /// queue closed (`Context::note_closed`) and leaves the teardown entry alone; the scheduler
+    /// release waits for that close (`Context::held_by_open_client`). Not on M5, which
+    /// takes published work back through its recovery target.
+    fn close_failed_owners(&mut self, now: u64) -> Result {
+        if self.init.is_m5() {
+            return Ok(());
+        }
+        let generation = self.recovery.generation();
+        for slot in 0..crate::hw::t8140::queues::RENDER_SLOTS {
+            let Some((owner, context)) = self.queues.render.failed_open_owner(slot) else {
+                continue;
+            };
+            if context.is_closed() {
+                continue;
+            }
+            // In the order of the client's own close (`release_queue`): the context counts as
+            // closed only once its teardown entry is reserved. A close that could not reserve it
+            // closed nothing, and the next service pass retries it.
+            if let Err(error) = self.queues.teardown.close(&context, now) {
+                pr_err!("G17: scheduler {} close for its open client failed: {:?}\n", context.id(), error);
+                continue;
+            }
+            context.note_closed(generation);
+            context.note_open_client(true);
+            // Closed now, so no later close releases the owner: an error from here fails the
+            // event service, which stops the device, as the client's own close does.
+            self.queues.release_compute(owner)?;
+            self.queues.release_render(owner)?;
+            // As at a client's close: hold the owner's pairs before admission releases it.
+            self.queues.sync_render_holds();
+            self.queues.admission.release_owner(owner);
+            pr_warn!("G17: scheduler {} closed for its open client at recovery gen {}: a GPU recovery failed its VM as guilty\n",
+                context.id(), generation);
+        }
+        Ok(())
     }
 
     /// Logs a published kill that releases guilty pairs (`Pair::guilty_for_kill`), with the

@@ -217,9 +217,12 @@ pub(crate) struct Context {
     /// The host's recovery generation when it first saw the kill of this context done (its
     /// scheduler page's killed state), `u64::MAX` before ([`Self::restarted_since_kill`]).
     kill_seen: AtomicU64,
-    /// The host's recovery generation at this context's latest close, `u64::MAX` while open
-    /// ([`Self::restarted_since_close`]).
+    /// The host's recovery generation at this context's first close, `u64::MAX` while open
+    /// ([`Self::note_closed`], [`Self::restarted_since_close`]).
     closed_generation: AtomicU64,
+    /// The kernel closed this context's queue on its client's behalf
+    /// (`Firmware::close_failed_owners`) and the client has not closed it yet.
+    closed_for_open_client: AtomicBool,
     /// Advisory only: publication still checks the physical binding under the
     /// device mutex. False skips an inline attempt known to need admission.
     compute_binding_hint: AtomicBool,
@@ -354,6 +357,7 @@ impl Context {
             kill_published: AtomicBool::new(false),
             kill_seen: AtomicU64::new(u64::MAX),
             closed_generation: AtomicU64::new(u64::MAX),
+            closed_for_open_client: AtomicBool::new(false),
             compute_binding_hint: AtomicBool::new(false),
             render_seen: AtomicBool::new(false),
             qos,
@@ -543,13 +547,32 @@ impl Context {
         self.kill_published.load(Ordering::Acquire)
     }
 
-    /// A queue of this context closed at the host's recovery `generation` (under the device
-    /// mutex). The latest close counts.
+    /// This context's queue closed at the host's recovery `generation`, under the device mutex:
+    /// by its client (`release_queue`), or on its behalf once a GPU recovery failed its VM as
+    /// guilty (`Firmware::close_failed_owners`). Only the first close counts. A close notes it
+    /// only after its teardown entry is reserved, so a close that failed there can be redone.
     pub(crate) fn note_closed(&self, generation: u64) {
-        self.closed_generation.store(generation, Ordering::Release);
+        close_once(&self.closed_generation, generation);
     }
 
-    /// The host accepted a GPU restart (`generation`) after this context's latest close.
+    /// This context's queue closed already ([`Self::note_closed`]). Under the device mutex.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed_generation.load(Ordering::Acquire) != u64::MAX
+    }
+
+    /// The kernel closed this context's queue for its still open client (`true`), or the client
+    /// closed it (`false`, `release_queue`). Under the device mutex.
+    pub(crate) fn note_open_client(&self, open: bool) {
+        self.closed_for_open_client.store(open, Ordering::Release);
+    }
+
+    /// See [`Self::note_open_client`]: until the client closes its queue, that queue still holds
+    /// this context, so its scheduler is not released and the context not reclaimed.
+    pub(crate) fn held_by_open_client(&self) -> bool {
+        self.closed_for_open_client.load(Ordering::Acquire)
+    }
+
+    /// The host accepted a GPU restart (`generation`) after this context's first close.
     pub(crate) fn restarted_since_close(&self, generation: u64) -> bool {
         restarted_after(self.closed_generation.load(Ordering::Acquire), generation)
     }
@@ -865,6 +888,11 @@ fn restarted_after(at: u64, generation: u64) -> bool {
     at != u64::MAX && generation > at
 }
 
+/// Records the recovery `generation` of a context's first close in `at`; true for that close.
+fn close_once(at: &AtomicU64, generation: u64) -> bool {
+    at.compare_exchange(u64::MAX, generation, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
 /// Records in `seen` the recovery `generation` of the first call that sees a kill done
 /// (`killed`), and reports whether a later generation was accepted since. A restart accepted
 /// after that sighting was raised after the firmware had finished the kill, so it dropped
@@ -898,6 +926,17 @@ mod capacity_tests {
         // The next accepted restart.
         assert!(restarted_since(&seen, true, 5));
         assert_eq!(seen.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn only_the_first_close_counts() {
+        let at = AtomicU64::new(u64::MAX);
+        // Closed on its client's behalf at generation 5, then by the client at 9.
+        assert!(close_once(&at, 5));
+        assert!(!close_once(&at, 9));
+        assert_eq!(at.load(Ordering::Relaxed), 5);
+        // So the restart at 6 still counts for its kill.
+        assert!(restarted_after(at.load(Ordering::Relaxed), 6));
     }
 
     #[test]

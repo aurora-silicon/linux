@@ -68,7 +68,7 @@ def fixture():
     firmware = '\n'.join(item(control, signature) for signature in [
         'fn kill_route_for(', 'fn kill_releases_render(', 'fn kill_waits_as_failed(',
         'fn render_kill_candidate(', 'fn foreign_compute_running(', 'fn compute_exit_pending(',
-        'fn compute_failed('])
+        'fn compute_failed(', 'fn close_failed_owners('])
     queue = '\n'.join([item(exit, signature) for signature in [
         'fn active_traversal(', 'pub(crate) fn exit_candidate(', 'fn holds_only_owed_stamp(',
         'pub(crate) fn running_commands(', 'pub(crate) fn timed_out(', 'pub(crate) fn exit_published(']]
@@ -85,6 +85,12 @@ use std::sync::Arc;
 pub struct Error(i32);
 pub const ETIMEDOUT: Error = Error(-110);
 pub const ECANCELED: Error = Error(-125);
+pub const EIO: Error = Error(-5);
+pub const ENOMEM: Error = Error(-12);
+pub type Result<T = (), E = Error> = std::result::Result<T, E>;
+macro_rules! pr_err { ($($t:tt)*) => {} }
+macro_rules! pr_warn { ($($t:tt)*) => {} }
+mod hw { pub mod t8140 { pub mod queues { pub const RENDER_SLOTS: usize = 4; } } }
 
 const LIVENESS_NS: u64 = 5_000_000_000;
 const MS: u64 = 1_000_000;
@@ -102,8 +108,14 @@ mod g17 {
     }
 }
 
-pub struct Context { killed: Cell<bool> }
-impl Context { fn kill_published(&self) -> bool { self.killed.get() } }
+pub struct Context { killed: Cell<bool>, closed: Cell<bool>, open_client: Cell<bool> }
+impl Context {
+    fn kill_published(&self) -> bool { self.killed.get() }
+    fn id(&self) -> u32 { 0 }
+    fn is_closed(&self) -> bool { self.closed.get() }
+    fn note_closed(&self, _generation: u64) { self.closed.set(true); }
+    fn note_open_client(&self, open: bool) { self.open_client.set(open); }
+}
 
 pub struct Packet { command: g17::command::Validated, context: Arc<Context> }
 pub struct Active { packet: Arc<Packet>, stamps_owed: bool }
@@ -142,7 +154,13 @@ impl Queue {
 pub struct ComputeSlot(Option<Box<Queue>>);
 impl ComputeSlot { fn as_deref(&self) -> Option<&Queue> { self.0.as_deref() } }
 pub struct ComputeEntry { queue: ComputeSlot }
-pub struct Render { executed: Vec<(Arc<Context>, u64)>, guilty: Vec<(Arc<Context>, u64)>, pools_released: Vec<Arc<Context>> }
+pub struct Render {
+    executed: Vec<(Arc<Context>, u64)>,
+    guilty: Vec<(Arc<Context>, u64)>,
+    pools_released: Vec<Arc<Context>>,
+    /// (slot, owner, context) of each open owner whose VM a recovery failed as guilty.
+    failed: Vec<(usize, u64, Arc<Context>)>,
+}
 fn slots_of(pairs: &[(Arc<Context>, u64)], context: &Arc<Context>) -> u64 {
     pairs.iter().filter(|(owner, _)| Arc::ptr_eq(owner, context)).fold(0, |slots, (_, slot)| slots | 1u64 << slot)
 }
@@ -155,12 +173,33 @@ impl Render {
     fn teardown_pools_released(&self, context: &Arc<Context>) -> bool {
         self.pools_released.iter().any(|owner| Arc::ptr_eq(owner, context))
     }
+    fn failed_open_owner(&self, slot: usize) -> Option<(u64, Arc<Context>)> {
+        self.failed.iter().find(|(at, ..)| *at == slot).map(|(_, owner, context)| (*owner, context.clone()))
+    }
 }
-pub struct Teardown { render_kills: Vec<bool> }
-impl Teardown { fn render_kill_published(&self, index: usize) -> bool { self.render_kills[index] } }
+/// `fail_close`: the next teardown entry cannot be allocated.
+pub struct Teardown { render_kills: Vec<bool>, fail_close: bool, entries: usize }
+impl Teardown {
+    fn render_kill_published(&self, index: usize) -> bool { self.render_kills[index] }
+    fn close(&mut self, _context: &Arc<Context>, _now: u64) -> Result {
+        if std::mem::take(&mut self.fail_close) {
+            return Err(ENOMEM);
+        }
+        self.entries += 1;
+        Ok(())
+    }
+}
+pub struct Admission { released: Vec<u64> }
+impl Admission { fn release_owner(&mut self, owner: u64) { self.released.push(owner); } }
 pub struct Init { m5: bool }
 impl Init { fn is_m5(&self) -> bool { self.m5 } }
-pub struct Queues { compute: Vec<Option<ComputeEntry>>, render: Render, teardown: Teardown }
+/// `release_error`: what releasing the owner's compute queue returns.
+pub struct Queues { compute: Vec<Option<ComputeEntry>>, render: Render, teardown: Teardown, admission: Admission, release_error: Option<Error> }
+impl Queues {
+    fn release_compute(&mut self, _owner: u64) -> Result { self.release_error.map_or(Ok(()), Err) }
+    fn release_render(&mut self, _owner: u64) -> Result { Ok(()) }
+    fn sync_render_holds(&mut self) {}
+}
 pub struct Recovery;
 impl Recovery { fn generation(&self) -> u64 { 1 } }
 pub struct Firmware { queues: Queues, init: Init, recovery: Recovery }
@@ -173,7 +212,9 @@ impl Firmware {
 mod tests {
     use super::*;
 
-    fn context() -> Arc<Context> { Arc::new(Context { killed: Cell::new(false) }) }
+    fn context() -> Arc<Context> {
+        Arc::new(Context { killed: Cell::new(false), closed: Cell::new(false), open_client: Cell::new(false) })
+    }
 
     /// A queue bound to `context`, its owner open, holding no command.
     fn queue(context: &Arc<Context>) -> Queue {
@@ -233,8 +274,10 @@ mod tests {
         Firmware {
             queues: Queues {
                 compute: queues.into_iter().map(|q| Some(ComputeEntry { queue: ComputeSlot(Some(Box::new(q))) })).collect(),
-                render: Render { executed: Vec::new(), guilty: Vec::new(), pools_released: Vec::new() },
-                teardown: Teardown { render_kills: vec![false; 4] },
+                render: Render { executed: Vec::new(), guilty: Vec::new(), pools_released: Vec::new(), failed: Vec::new() },
+                teardown: Teardown { render_kills: vec![false; 4], fail_close: false, entries: 0 },
+                admission: Admission { released: Vec::new() },
+                release_error: None,
             },
             init: Init { m5: false },
             recovery: Recovery,
@@ -391,6 +434,38 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_owner_close_is_retried_before_its_latch_and_fails_the_pass_after() {
+        // The first owner's teardown entry cannot be allocated: it stays open for the next pass,
+        // and the other failed owner is still closed in this one.
+        let (a, b) = (context(), context());
+        let mut fw = firmware(vec![]);
+        fw.queues.render.failed = vec![(0, 100, a.clone()), (1, 101, b.clone())];
+        fw.queues.teardown.fail_close = true;
+        assert_eq!(fw.close_failed_owners(0), Ok(()));
+        assert!(!a.is_closed() && !a.open_client.get());
+        assert!(b.is_closed() && b.open_client.get());
+        assert_eq!(fw.queues.admission.released, [101]);
+        assert_eq!(fw.close_failed_owners(0), Ok(()));
+        assert!(a.is_closed());
+        assert_eq!((fw.queues.teardown.entries, &fw.queues.admission.released[..]), (2, &[101, 100][..]));
+        // Once latched, no later close releases the owner: a failed release fails the pass
+        // (the event service then stops the device) instead of leaking its slot and admission.
+        let c = context();
+        let mut fw = firmware(vec![]);
+        fw.queues.render.failed = vec![(2, 102, c.clone())];
+        fw.queues.release_error = Some(EIO);
+        assert_eq!(fw.close_failed_owners(0), Err(EIO));
+        assert!(c.is_closed());
+        assert!(fw.queues.admission.released.is_empty());
+        // Never on M5.
+        let mut fw = firmware(vec![]);
+        fw.init.m5 = true;
+        fw.queues.render.failed = vec![(0, 103, context())];
+        assert_eq!(fw.close_failed_owners(0), Ok(()));
+        assert_eq!(fw.queues.teardown.entries, 0);
+    }
+
+    #[test]
     fn a_kill_does_not_wait_for_another_closed_contexts_owed_compute() {
         let (c5, c11, live) = (context(), context(), context());
         let now = 10_000 * MS;
@@ -443,6 +518,12 @@ MUTATIONS = {
     'no-guilty-input': [('            self.queues.render.guilty_slots(context, self.recovery.generation()) != 0,\n',
                          '            false,\n')],
     'owed-blocks-kill': [('queue.running_commands() && !queue.context()', 'queue.in_flight() && !queue.context()')],
+    # A failed release after the latch is logged and skipped: its slot and admission leak.
+    'post-latch-swallowed': [('            self.queues.release_compute(owner)?;\n',
+                              '            if self.queues.release_compute(owner).is_err() { continue; }\n')],
+    # A failed teardown reservation aborts the pass for the other failed owners.
+    'reserve-fails-pass': [('            if let Err(error) = self.queues.teardown.close(&context, now) {',
+                            '            if let Err(error) = self.queues.teardown.close(&context, now) {\n                return Err(error);')],
     'open-owed-skipped': [('self.in_flight() && !self.holds_only_owed_stamp()',
                            'self.in_flight() && !self.active.iter().all(|active| active.stamps_owed)')],
 }

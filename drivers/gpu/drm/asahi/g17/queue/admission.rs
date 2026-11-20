@@ -132,6 +132,13 @@ impl State {
         let quarantined = self.quarantined & owned;
         (quarantined != 0).then_some(quarantined & !self.spared == 0)
     }
+    /// Released means closed: by its client, or by the kernel for a client that keeps it open
+    /// (`Firmware::close_failed_owners`), which then never releases it again. A pair taken
+    /// back, or a sibling claimed, would clear `released` and leak. Owner IDs are never reused.
+    /// Checked where a lease is made only, so `admits_render` lets such a job fail at once.
+    fn owner_released(&self, owner: u64) -> bool {
+        (0..cfg::RENDER_SLOTS).any(|slot| self.owners[slot] == owner && self.released & (1u64 << slot) != 0)
+    }
     fn refusal(&self, owner: u64) -> Result {
         if self.exhausted() {
             return Err(EIO);
@@ -676,6 +683,9 @@ impl Pool {
                 }
                 continue;
             }
+            if state.owner_released(owner) {
+                return Err(ECANCELED);
+            }
             state.refusal(owner)?;
             expired |= now >= conflict_deadline;
             let plan = if expired {
@@ -733,7 +743,7 @@ impl Pool {
             return Ok(None);
         }
         let mut state = self.state.lock();
-        if state.refusal(owner).is_err() || !state.owners.contains(&owner) {
+        if state.owner_released(owner) || state.refusal(owner).is_err() || !state.owners.contains(&owner) {
             return Ok(None);
         }
         let plan = state.plan(owner, request, None);
@@ -1308,6 +1318,30 @@ mod fault_capacity_tests {
         drop(queue);
         let state = pool.state.lock();
         assert_eq!(state.quarantined | state.spared, 0);
+    }
+
+    #[test]
+    fn a_released_owner_takes_no_pair_again() {
+        // The kernel closed a guilty owner for its open client, and its pair drained: an
+        // early publication that passed the status check before the failure asks again.
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        let queue = pool.reserve_queue().unwrap();
+        let lease = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
+        let slot = lease.slot();
+        drop(lease);
+        pool.release_owner(1);
+        assert!(pool.try_acquire_render(1, 2, None).unwrap().is_none());
+        assert!(matches!(pool.acquire_render(1, 2, None, u64::MAX, || Ok(())), Err(ECANCELED)));
+        // The scheduler's prepare step does not wait for it: publication fails the job at once.
+        assert!(pool.admits_render(1, None));
+        let state = pool.state.lock();
+        // Its pair stays released, and it claims no sibling.
+        assert_ne!(state.released & (1u64 << slot), 0);
+        assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 1);
+        drop(state);
+        // Another owner takes the pair.
+        assert_eq!(pool.acquire_render(2, 1, None, u64::MAX, || Ok(())).unwrap().slot(), slot);
+        drop(queue);
     }
 
     #[test]
