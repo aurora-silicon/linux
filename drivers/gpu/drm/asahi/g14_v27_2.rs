@@ -6,7 +6,8 @@
 //! installs the driver's kernel window in the loader's UAT regions, starts the ASC, holds the
 //! GPU powered and retires one kernel-owned compute job. [`Backend`] then serves clients
 //! through the 26.x submission front end (`m3_submit`): each compute command is encoded in the
-//! 27.2 layout and published, in order, on the root's queue. Render commands are refused.
+//! 27.2 layout and published, in order, on the root's queue. Render commands are refused, and the device
+//! reports `DRM_ASAHI_FEATURE_COMPUTE_ONLY`.
 //!
 //! The runtime is driven by the firmware's endpoint-0x20 notifications, which it sends after
 //! publishing records on its event, statistics and log rings: each one runs the service, which
@@ -862,9 +863,12 @@ impl gpu::Gpu for Backend {
         Ok(())
     }
     fn supports_vm_status(&self) -> bool { true }
+    /// Render commands are refused (`m3_submit`), so the device also reports itself
+    /// compute-only: graphics userspace then leaves it alone instead of failing its first render.
     fn feature_flags(&self) -> u64 {
         uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS as u64
             | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SCHEDULED_QUEUES as u64
+            | uapi::DRM_ASAHI_FEATURE_COMPUTE_ONLY as u64
     }
     fn tracked_submission(&self) -> bool { true }
     fn base_clock_hz(&self) -> u32 { <GpuManagerG14V13_5 as gpu::Gpu>::base_clock_hz(&self.graph) }
