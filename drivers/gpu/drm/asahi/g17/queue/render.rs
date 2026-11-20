@@ -227,6 +227,9 @@ pub(crate) struct Pair {
     /// the kill unlinked, so the pair is released and detached on that proof
     /// (`counts_idle`, `Pair::can_keep`), never parked for reuse while those entries remain.
     guilty_released: bool,
+    /// The recovery generation of the first restart that blamed this pair's spared work as
+    /// collateral, until a group of it retires (`recovery::Queues::note_collateral`).
+    collateral_at: Option<u64>,
     terminal: Option<(Arc<VmStatus>, Error)>,
     previous: Option<RetiredBinding>,
     displaced: Option<RetiredBinding>,
@@ -382,6 +385,7 @@ impl Pair {
             outer_started: 0,
             quarantined: false,
             guilty_released: false,
+            collateral_at: None,
             terminal: None,
             previous: None,
             displaced: None,
@@ -1872,6 +1876,14 @@ impl Pair {
         }
     }
 
+    /// A restart before `generation` blamed this pair's spared work as collateral, and none of
+    /// it retired since.
+    pub(crate) fn collateral_before(&self, generation: u64) -> bool {
+        self.collateral_at.is_some_and(|at| at < generation)
+    }
+    pub(crate) fn note_collateral(&mut self, generation: u64) {
+        self.collateral_at.get_or_insert(generation);
+    }
     pub(crate) fn oldest_spared(&self) -> Option<bool> {
         self.active
             .front()
@@ -2140,6 +2152,8 @@ impl Pair {
             retirement::note_stampless(u16::from(self.slot), ordinal);
         }
         self.note_retirement(ordinal, context_update);
+        // Work of this pair retires: a later blame on it is collateral again.
+        self.collateral_at = None;
         let front = self.active.front_mut().ok_or(EIO)?;
         if !front.flist_completed {
             host.complete_render(
@@ -3350,6 +3364,9 @@ impl Pair {
             self.previous = Some(retired);
         }
         self.memory.context = binding.context.clone();
+        // The pair is reused in place: the collateral mark of a previous owner, which may have
+        // closed without retiring anything, must not make the next owner's first blame its second.
+        self.collateral_at = rebound_collateral(self.collateral_at, self.owner == Some(binding.owner));
         self.owner = Some(binding.owner);
         self.initial_packet = binding.initial_packet;
         if foreign {
@@ -3407,6 +3424,13 @@ mod completion_noted_tests {
         both[1] |= bit(68)[1];
         assert!(completion_noted([3, 68], both));
     }
+}
+
+/// A pair's collateral mark (`Pair::collateral_at`) when it is bound to an owner: kept for the
+/// same owner (a pool rebind), dropped for a new one. Not at the owner's close: an exited
+/// culprit's spared work stays published, and dropping its mark then would cost a restart.
+pub(crate) fn rebound_collateral(mark: Option<u64>, same_owner: bool) -> Option<u64> {
+    mark.filter(|_| same_owner)
 }
 
 /// See `Pair::guilty_killed`: a guilty pair (`guilty`) goes only with no restart in progress

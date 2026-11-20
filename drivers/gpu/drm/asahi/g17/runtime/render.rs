@@ -1054,6 +1054,29 @@ impl Registry {
             .find(|pair| pair.qids().contains(&qid))
             .and_then(|pair| pair.oldest_spared())
     }
+    /// See `recovery::Queues::collateral_before`.
+    pub(in crate::g17) fn render_collateral_before(&self, qid: u8, generation: u64) -> bool {
+        self.render
+            .entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_ref())
+            .find(|pair| pair.qids().contains(&qid))
+            .is_some_and(|pair| pair.collateral_before(generation))
+    }
+    /// See `recovery::Queues::note_collateral`.
+    pub(in crate::g17) fn note_render_collateral(&mut self, qid: u8, generation: u64) {
+        if let Some(pair) = self
+            .render
+            .entries
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_mut())
+            .find(|pair| pair.qids().contains(&qid))
+        {
+            pair.note_collateral(generation);
+        }
+    }
     /// Marks the interrupted group of the pair that owns `qid`.
     pub(in crate::g17) fn note_render_interrupted(
         &self,

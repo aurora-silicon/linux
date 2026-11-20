@@ -158,6 +158,15 @@ pub(super) trait Queues {
     fn note_interrupted(&mut self, qid: u8, stamp: u32) -> Interrupted;
     /// Optional diagnostics only; absence cannot alter attribution or release.
     fn report_blamed_render(&self, _qid: u8) {}
+    /// Read while firmware is halted: a restart before `generation` blamed the spared work of the
+    /// render pair that holds `qid` as collateral already, and none of that pair's work retired
+    /// since (`note_collateral`). Its spared work hung the GPU again after the restart that blamed
+    /// it, so the hang is its own. Never for a compute queue.
+    fn collateral_before(&self, _qid: u8, _generation: u64) -> bool { false }
+    /// The restart `generation` blamed the spared work of the render pair that holds `qid` as
+    /// collateral. Marks that pair, not the QID: a QID is reused once its owner closes, and the
+    /// next owner starts unmarked. A retirement of the pair's work clears the mark.
+    fn note_collateral(&mut self, _qid: u8, _generation: u64) {}
     /// Read while firmware is halted for the restart the host accepted after `generation`:
     /// every killed context whose kill the firmware finished counts as first seen done at
     /// `generation` at the latest, so this restart releases its guilty pairs
@@ -365,7 +374,7 @@ pub(super) fn service<H: Host>(
     report_clients(host, request.generation, &entries, request.blamed);
 
     let (listed, exact, fallback) = (entries.listed, entries.exact, entries.fallback);
-    let (cancelled, blame, leftover) = classify(host, entries, request.blamed, attribution);
+    let (cancelled, blame, leftover) = classify(host, entries, request.blamed, attribution, request.generation);
     if listed != 0 && host.is_m5() {
         // The M5 table only classifies (read_entries): each command is retired from its own
         // queue's records, replayed when it never ran.
@@ -479,13 +488,25 @@ fn read_entries<H: Host>(host: &mut H) -> Entries {
 
 /// Resolves guilty QIDs before changing any completion's classification. Unknown ownership or
 /// too many distinct guilty VMs leaves all prior classifications intact. The oldest spared work
-/// of a QID makes later blame collateral to its previous recovery, rather than new VM guilt.
+/// of a QID makes later blame collateral to its previous recovery, rather than new VM guilt, once:
+/// the restart `generation` marks the render pair it blamed so (`Queues::note_collateral`), and
+/// when a later restart blames that pair again with none of its work retired in between, the
+/// hang is its own and its VM is guilty (`Queues::collateral_before`). Otherwise a first blame
+/// that landed on a starved bystander would leave the real culprit's spared work immune: never
+/// guilty, never poisoned, never forgiven and never killed, until the restart storm limit
+/// (2026-11-19 19:12 UTC, 2026-11-20 15:03 UTC).
 /// Also returns whether the firmware's blamed QID is still guilty after attribution: a blamed
 /// render that had not started while others had (or with no culprit at all) is innocent, and its
 /// work is spared like that of every other innocent VM instead of failing with EIO.
 /// Last, whether every guilty VM had failed before this restart and it dropped one of their
 /// commands: a failed VM publishes nothing new, so such restarts end with its queued work.
-fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, attribution: Attribution) -> (u128, bool, bool) {
+fn classify<Q: Queues>(
+    queues: &mut Q,
+    entries: Entries,
+    blamed: Option<u8>,
+    attribution: Attribution,
+    generation: u64,
+) -> (u128, bool, bool) {
     let mut guilty_qids = entries.guilty | blamed.map_or(0, |qid| 1u128 << qid);
     let cancelled = entries.cancelled;
     match attribution {
@@ -508,8 +529,8 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, att
         }
         match queues.oldest_spared(qid) {
             None => unresolved = true,
-            Some(true) => collateral |= 1u128 << qid,
-            Some(false) => {
+            Some(true) if !queues.collateral_before(qid, generation) => collateral |= 1u128 << qid,
+            Some(_) => {
                 let mut found = false;
                 queues.visit_owners(qid, &mut |status| {
                     found = true;
@@ -533,6 +554,9 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, att
     }
     if unresolved || (count == 0 && collateral == 0 && !no_culprit) {
         return (0, blame, false);
+    }
+    for qid in (0..QIDS).filter(|qid| collateral & (1u128 << qid) != 0) {
+        queues.note_collateral(qid, generation);
     }
     let known = |status: &Arc<VmStatus>| guilty[..count].iter().flatten().any(|known| Arc::ptr_eq(known, status));
     let mut dropped = false;
@@ -790,7 +814,7 @@ mod tests {
 
     fn leftover(queues: &mut Owners, exact_qid: u8) -> bool {
         let entries = Entries { exact_qids: 1u128 << exact_qid, ..Entries::default() };
-        classify(queues, entries, Some(40), Attribution::Queues(3u128 << 60)).2
+        classify(queues, entries, Some(40), Attribution::Queues(3u128 << 60), 1).2
     }
 
     #[test]
@@ -810,12 +834,232 @@ mod tests {
         let entries = || Entries { exact_qids: 1u128 << 40, ..Entries::default() };
         // b failing for its own client does not make it guilty in a's recovery.
         queues.0[2].1.record(EIO);
-        classify(&mut queues, entries(), Some(40), Attribution::Queues(3u128 << 40));
+        classify(&mut queues, entries(), Some(40), Attribution::Queues(3u128 << 40), 1);
         assert_eq!(queues.1, [Some(Class::Guilty), Some(Class::Guilty), Some(Class::Spared), Some(Class::Spared)]);
         // Once a recovery finds b guilty, a later recovery that blames a keeps b guilty.
-        classify(&mut queues, entries(), Some(60), Attribution::Queues(3u128 << 60));
-        classify(&mut queues, entries(), Some(40), Attribution::Queues(3u128 << 40));
+        classify(&mut queues, entries(), Some(60), Attribution::Queues(3u128 << 60), 1);
+        classify(&mut queues, entries(), Some(40), Attribution::Queues(3u128 << 40), 1);
         assert_eq!(queues.1, [Some(Class::Guilty); 4]);
+    }
+
+    /// A render pair in a cascade of restarts (see [`Cascade`]).
+    struct CascadePair {
+        qids: [u8; 2],
+        status: Arc<VmStatus>,
+        class: Option<Class>,
+        collateral: Option<u64>,
+    }
+
+    /// The render pairs across a cascade of restarts, with state: each pair keeps the class the
+    /// last recovery gave its work (`Pair::classify`) and its collateral mark
+    /// (`Pair::note_collateral`), which a retirement of its work clears. A blamed render fails as
+    /// `settle_blamed_render` fails it: guilty work poisons its VM, work an earlier recovery
+    /// spared fails without poisoning it (`Completion::poisons`).
+    struct Cascade([Option<CascadePair>; 4], u64);
+
+    impl Cascade {
+        fn new(pairs: [([u8; 2], &Arc<VmStatus>); 4]) -> Self {
+            Self(
+                pairs.map(|(qids, status)| {
+                    Some(CascadePair { qids, status: status.clone(), class: None, collateral: None })
+                }),
+                0,
+            )
+        }
+        fn pair(&self, qid: u8) -> Option<&CascadePair> {
+            self.0.iter().flatten().find(|pair| pair.qids.contains(&qid))
+        }
+        fn pair_mut(&mut self, qid: u8) -> Option<&mut CascadePair> {
+            self.0.iter_mut().flatten().find(|pair| pair.qids.contains(&qid))
+        }
+        /// The pair that holds `qid` is bound to `status`'s owner in place, as `Pair::bind_owner`
+        /// rebinds a reusable pair: its mark goes as there (`rebound_collateral`), its work is new.
+        fn bind(&mut self, qid: u8, status: &Arc<VmStatus>) {
+            if let Some(pair) = self.pair_mut(qid) {
+                let same = Arc::ptr_eq(&pair.status, status);
+                pair.collateral = crate::g17::queue::render::rebound_collateral(pair.collateral, same);
+                pair.status = status.clone();
+                pair.class = None;
+            }
+        }
+        /// Work of the pair that holds `qid` retired (`Pair::retire_front_command`).
+        fn retire(&mut self, qid: u8) {
+            if let Some(pair) = self.pair_mut(qid) {
+                pair.collateral = None;
+            }
+        }
+        /// One restart as `service` runs it: the firmware blames `blamed`, its table drops
+        /// `dropped` by exact stamp, the blamed render fails. Returns whether it was forgiven.
+        fn restart(&mut self, blamed: u8, dropped: u128) -> bool {
+            let entries = Entries { exact_qids: dropped, ..Entries::default() };
+            self.1 += 1;
+            let generation = self.1;
+            let (_, blame, leftover) = classify(self, entries, Some(blamed), Attribution::Firmware, generation);
+            if blame {
+                self.settle_blamed_render(blamed, EIO);
+            }
+            leftover
+        }
+    }
+
+    impl Queues for Cascade {
+        fn render_scheduler_active(&self) -> bool { true }
+        fn render_pass_started(&self, _qid: u8, _stamp: u64) -> Option<bool> { None }
+        fn publish_recovery_targets(&self) -> Option<Error> { None }
+        fn oldest_spared(&self, qid: u8) -> Option<bool> {
+            self.pair(qid).map(|pair| pair.class == Some(Class::Spared))
+        }
+        fn collateral_before(&self, qid: u8, generation: u64) -> bool {
+            self.pair(qid).is_some_and(|pair| pair.collateral.is_some_and(|at| at < generation))
+        }
+        fn note_collateral(&mut self, qid: u8, generation: u64) {
+            if let Some(pair) = self.pair_mut(qid) {
+                pair.collateral.get_or_insert(generation);
+            }
+        }
+        fn visit_owners(&self, qid: u8, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
+            if let Some(pair) = self.pair(qid) {
+                visit(&pair.status);
+            }
+        }
+        fn classify_work(&mut self, class: &dyn Fn(&Arc<VmStatus>) -> Class) -> u128 {
+            let mut spared = 0;
+            for pair in self.0.iter_mut().flatten() {
+                pair.class = Some(class(&pair.status));
+                if pair.class == Some(Class::Spared) {
+                    spared |= (1u128 << pair.qids[0]) | (1u128 << pair.qids[1]);
+                }
+            }
+            spared
+        }
+        fn note_interrupted(&mut self, _qid: u8, _stamp: u32) -> Interrupted { Interrupted::Exact }
+        fn settle_blamed_render(&mut self, qid: u8, error: Error) {
+            let Some(pair) = self.pair_mut(qid) else { return };
+            if pair.class == Some(Class::Spared) {
+                pair.status.report_failure(error);
+            } else {
+                pair.class = Some(Class::Guilty);
+                pair.status.record(error);
+            }
+        }
+        fn settle_cancelled_renders(&mut self, _qids: u128) {}
+        fn rescan_compute(&mut self) -> Result { Ok(()) }
+        fn release_retired_compute(&mut self) {}
+    }
+
+    fn vm() -> Arc<VmStatus> {
+        Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap()
+    }
+
+    #[test]
+    fn a_culprit_spared_by_a_misattributed_first_restart_turns_guilty() {
+        // 11-20 15:03 UTC (m4.174), the 11-19 19:12 storm's shape: c spins on 40/41, and the
+        // first restart blames b (44/45), whose work c starved. b fails; c's work is spared.
+        let (c, b, x) = (vm(), vm(), vm());
+        let mut queues = Cascade::new([([40, 41], &c), ([44, 45], &b), ([60, 61], &x), ([62, 63], &x)]);
+        assert!(!queues.restart(45, (1 << 41) | (1 << 45)));
+        assert!(b.recovery_guilty() && b.get() != 0);
+        // The next restart blames b again and only drops b's work: forgiven.
+        assert!(queues.restart(45, 1 << 45));
+        // Then every restart blames c's queue 41 and drops its running group by exact stamp.
+        // The first blame on work an earlier restart spared is collateral: c fails without
+        // poisoning its VM, and the restart counts.
+        assert!(!queues.restart(41, 1 << 41));
+        assert!(!c.recovery_guilty() && c.get() == 0);
+        // Blamed again with nothing of it retired since: the hang is c's own.
+        assert!(!queues.restart(41, 1 << 41));
+        assert!(c.recovery_guilty());
+        assert_ne!(c.get(), 0);
+        // From now on a restart that only drops failed c's work is forgiven.
+        assert!(queues.restart(41, 1 << 41));
+    }
+
+    #[test]
+    fn a_bystander_that_retires_between_blames_stays_collateral() {
+        // c is blamed first; b's work is spared, then blamed while it waits behind c's.
+        let (c, b, x) = (vm(), vm(), vm());
+        let mut queues = Cascade::new([([40, 41], &c), ([44, 45], &b), ([60, 61], &x), ([62, 63], &x)]);
+        queues.restart(41, 1 << 41);
+        assert!(c.recovery_guilty());
+        queues.restart(45, 1 << 45);
+        assert!(!b.recovery_guilty() && b.get() == 0);
+        // b's next command retires: blamed again, it is collateral again, its VM unpoisoned.
+        queues.retire(44);
+        queues.restart(45, 1 << 45);
+        assert!(!b.recovery_guilty() && b.get() == 0);
+        // Blamed a third time with nothing retired since: guilty. Its client already saw a
+        // lost device at each blame; now its VM is poisoned too.
+        queues.restart(45, 1 << 45);
+        assert!(b.recovery_guilty());
+        assert_ne!(b.get(), 0);
+    }
+
+    #[test]
+    fn a_retirement_on_another_queue_of_the_culprit_does_not_reset_it() {
+        // c owns two pairs, 40/41 (spinning) and 50/51; the first restart blames b.
+        let (c, b, x) = (vm(), vm(), vm());
+        let mut queues = Cascade::new([([40, 41], &c), ([50, 51], &c), ([44, 45], &b), ([60, 61], &x)]);
+        queues.restart(45, (1 << 41) | (1 << 45));
+        queues.restart(41, 1 << 41);
+        assert!(!c.recovery_guilty());
+        // c's other pair keeps retiring: the blamed pair's mark stays.
+        queues.retire(50);
+        queues.restart(41, 1 << 41);
+        assert!(c.recovery_guilty());
+    }
+
+    #[test]
+    fn a_new_owner_of_a_reused_queue_starts_with_a_fresh_collateral() {
+        let (c, b, d, x) = (vm(), vm(), vm(), vm());
+        let mut queues = Cascade::new([([40, 41], &c), ([44, 45], &b), ([60, 61], &x), ([62, 63], &x)]);
+        queues.restart(45, (1 << 41) | (1 << 45));
+        queues.restart(41, 1 << 41);
+        assert!(!c.recovery_guilty());
+        // c closes without retiring anything; its pair, reused in place, is bound to d.
+        queues.bind(41, &d);
+        // A restart that blames b again spares d's work; then one blames d's queue 41.
+        queues.restart(45, 1 << 45);
+        queues.restart(41, 1 << 41);
+        assert!(!d.recovery_guilty() && d.get() == 0);
+        // A rebind for the same owner (a pool change) keeps the mark: blamed again, d is guilty.
+        queues.bind(41, &d);
+        queues.restart(45, 1 << 45);
+        queues.restart(41, 1 << 41);
+        assert!(d.recovery_guilty());
+    }
+
+    #[test]
+    fn the_11_19_storm_ends_with_its_culprit_guilty_before_the_limit() {
+        // 2026-11-19 19:12 UTC (m4.171): deqp-vk (40/41) spins. Gen 0 blamed chromium (62/63),
+        // gen 1 deqp, gen 2 quickshell (42/43), gens 3-7 deqp again; every one counted until
+        // the storm limit stopped the GPU (8 in 30 s).
+        let (deqp, chromium, quickshell, x) = (vm(), vm(), vm(), vm());
+        let mut queues =
+            Cascade::new([([40, 41], &deqp), ([62, 63], &chromium), ([42, 43], &quickshell), ([60, 61], &x)]);
+        let mut counted = 0;
+        for (blamed, dropped) in [(63, 1u128 << 63), (41, 1 << 41), (42, 1 << 42)] {
+            counted += usize::from(!queues.restart(blamed, dropped));
+        }
+        // quickshell's first blame was collateral: it saw one failed command, its VM stays usable.
+        assert!(!quickshell.recovery_guilty() && quickshell.get() == 0);
+        // deqp's second blame makes it guilty, and later restarts that drop its work are forgiven.
+        for _ in 3..8 {
+            counted += usize::from(!queues.restart(41, 1 << 41));
+        }
+        assert!(deqp.recovery_guilty() && deqp.get() != 0);
+        assert_eq!(counted, 4);
+    }
+
+    #[test]
+    fn a_culprit_blamed_first_is_guilty_at_once_as_before() {
+        // 2026-11-20 02:18 UTC (m4.173, T72 run 2): the first restart blamed deqp's 59.
+        let (deqp, b, x) = (vm(), vm(), vm());
+        let mut queues = Cascade::new([([58, 59], &deqp), ([44, 45], &b), ([60, 61], &x), ([62, 63], &x)]);
+        assert!(!queues.restart(59, 1 << 45));
+        assert!(deqp.recovery_guilty() && deqp.get() != 0);
+        assert!(queues.restart(59, 1 << 59));
+        assert!(queues.restart(59, 1 << 59));
+        assert!(!b.recovery_guilty() && b.get() == 0);
     }
 
     #[test]

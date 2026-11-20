@@ -296,6 +296,7 @@ impl ParkedPair {
             outer_started: self.outer_started,
             quarantined: false,
             guilty_released: false,
+            collateral_at: None,
             terminal: None,
             previous: self.previous.take(),
             displaced: None,
