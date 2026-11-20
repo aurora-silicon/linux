@@ -1394,8 +1394,35 @@ static void t8122_commit_page_dc(struct apple_sleep *s)
 	t8122_dc_puts("\nP end\n");
 }
 
+/*
+ * J613 trial (single variable): SIO_CPU at macOS's commit state, auto-idle (0x1400024f in capture
+ * 63, just before the first commit write); Linux reads 0x1f0002ff there (n21: t8122_match bit 2's
+ * write does not stick). Written just before the commit and polled 2 ms; 'S' before/after.
+ */
+static bool t8122_sio_auto;
+module_param(t8122_sio_auto, bool, 0600);
+MODULE_PARM_DESC(t8122_sio_auto, "J613 trial: SIO_CPU auto-idle just before the commit, as macOS (0x1400024f)");
+
+static void t8122_sio_auto_apply(struct apple_sleep *s)
+{
+	u32 before = readl(s->ps + T8122_PS_SIO_CPU), after;
+	u64 t0 = read_sysreg(cntpct_el0), hz = arch_timer_get_cntfrq();
+
+	writel(T8122_PS_AUTO_IDLE, s->ps + T8122_PS_SIO_CPU);
+	do {
+		after = readl(s->ps + T8122_PS_SIO_CPU);
+	} while (FIELD_GET(PS_ACTUAL, after) == 0xf && read_sysreg(cntpct_el0) - t0 < hz / 500);
+	t8122_dc_puts("\nS sio ");
+	t8122_dc_hex(before);
+	t8122_dc_putc('/');
+	t8122_dc_hex(after);
+	t8122_dc_putc('\n');
+}
+
 static void t8122_sleep_pre_commit(struct apple_sleep *s)
 {
+	if (READ_ONCE(t8122_sio_auto))
+		t8122_sio_auto_apply(s);
 	if (READ_ONCE(t8122_commit_page))
 		t8122_commit_page_dc(s);
 	if (READ_ONCE(t8122_dump))
