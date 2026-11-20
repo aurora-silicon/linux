@@ -130,6 +130,10 @@ pub(crate) struct Layout {
     pub(crate) pstate_selectors: [usize; 3],
     /// MAIN offset of the u64 size of the host's crash copy buffer, where the build has one.
     pub(crate) coredump_copy: Option<usize>,
+    /// The retention pointer names the FenderRegsScratchRam window (main config +0x18) and
+    /// `coredump_copy` holds that window's size, as the T6041 26B123 path does on hardware;
+    /// otherwise it names the host's RETENTION object.
+    pub(crate) retention_window: bool,
 }
 
 /// Size of the host's crash copy buffer (`coredump-copy-buffer` in the 27.2 nub); macOS 27.2
@@ -203,6 +207,7 @@ pub(crate) const V25G83: Layout = Layout {
     },
     pstate_selectors: [0x88, 0x8c, 0x98],
     coredump_copy: None,
+    retention_window: false,
 };
 
 /// The 26B123 InitData ABI (macOS 27.2): the same 31 objects and pointers, with
@@ -254,13 +259,13 @@ pub(crate) const V26B123: Layout = Layout {
         snapshot_entries: 448,
     },
     pstate_selectors: [0x8c, 0x90, 0x9c],
-    // HW data +0xfa8 stays zero on G16G. Non-zero, it turns on the firmware's RTKit power
-    // path method (0x2c7a8 -> the auth pointer at DATA 0x8c0c8, TEXT 0x43e4c): on the J713 the
-    // firmware then faulted on resume at fw-text PA + 0x6f8, the start code's first fetch
-    // after MMU-on, as soon as a doorbell woke it. The T6041 build pairs 0x8000 there with a
-    // dedicated 0x8000 window at +0xfa0, where G16G keeps its RAM retention object; what macOS
-    // writes here on J773g is open (trace list).
-    coredump_copy: None,
+    // The T6041 26B123 pair (linux#1954, hardware): +0xfa0 names the 0x8000-byte
+    // FenderRegsScratchRam window (T6041's "GPTBAT" at its Fender base + 0x60000, as G16G's
+    // slot 37 at 0x300d60000) and +0xfa8 holds 0x8000. Non-zero, +0xfa8 turns on the
+    // firmware's RTKit power method (0x2c7a8 -> TEXT 0x43e4c). Candidate for the J713 crash
+    // after the first device-control doorbell; what macOS writes on J773g is open.
+    coredump_copy: Some(0xfa8),
+    retention_window: true,
 };
 
 /// Runs are ordered, disjoint and land inside an object of `size` bytes.
@@ -785,7 +790,12 @@ pub(crate) fn encode_for(
     let runs = layout.main;
     let main = &mut objects[id::MAIN];
     put64(main, remap(runs, 0x28, 8)?, HOST_END)?;
-    put64(main, remap(runs, 0xe88, 8)?, input.va[id::RETENTION])?;
+    let retention = if layout.retention_window {
+        input.scratch
+    } else {
+        input.va[id::RETENTION]
+    };
+    put64(main, remap(runs, 0xe88, 8)?, retention)?;
     if let Some(at) = layout.coredump_copy {
         put64(main, at, COREDUMP_COPY_SIZE)?;
     }

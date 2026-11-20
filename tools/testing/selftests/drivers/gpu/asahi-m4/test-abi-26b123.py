@@ -109,6 +109,11 @@ def expect_initdata(old_image):
         for at, value in NEW_26B123.get(index, []):
             assert not any(after[at:at + 8]), f'object {index} +{at:#x}'
             struct.pack_into('<Q', after, at, value)
+        if index == MAIN:
+            # The T6041 26B123 pair: the retention pointer names the FenderRegsScratchRam
+            # window (main config +0x18) and +0xfa8 holds its size (MAP section 8).
+            struct.pack_into('<Q', after, 0xfa0, struct.unpack_from('<Q', old[RUNTIME], 0x18)[0])
+            struct.pack_into('<Q', after, 0xfa8, 0x8000)
         new.append(bytes(after))
     return b''.join(new)
 
