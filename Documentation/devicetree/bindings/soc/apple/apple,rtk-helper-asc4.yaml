@@ -63,7 +63,8 @@ properties:
     maxItems: 1
 
   iommus:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
 
   apple,rtkit-handoff:
     enum:
