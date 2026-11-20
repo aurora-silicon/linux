@@ -555,36 +555,60 @@ int apr_build_decode_desc(const struct apr_decode_frame *f, u8 *desc)
 }
 EXPORT_SYMBOL_IF_KUNIT(apr_build_decode_desc);
 
+/*
+ * The decode descriptor carries no input length: the engine follows the
+ * frame's own sizes. Every size it consumes must therefore be checked against
+ * the payload here, before the engine is programmed. Each field is read once
+ * into a local so that the parse itself stays in bounds even if the buffer
+ * changes under it.
+ */
 static int apr_parse_picture(const u8 *data, u32 bytes, u32 width,
-			     u32 height, bool interlaced, u32 max_slices,
-			     u32 *picture_size, u32 *slices)
+			     u32 height, bool interlaced, bool alpha,
+			     u32 max_slices, u32 *picture_size, u32 *slices)
 {
-	u32 header, size, table_bytes, data_bytes = 0, min_size;
-	u32 log2_slice, field_height, i;
+	u32 header, size, table_bytes, pos, min_size, coded, count;
+	u32 log2_slice, field_height, slice_header, i;
 
 	if (bytes < 8)
 		return -EINVAL;
 	header = data[0] >> 3;
 	size = get_unaligned_be32(data + 1);
+	count = get_unaligned_be16(data + 5);
 	log2_slice = data[7] >> 4;
 	if (header < 8 || header > size || size > bytes || log2_slice > 3 ||
 	    (data[7] & 0xf))
 		return -EINVAL;
 	field_height = interlaced ? DIV_ROUND_UP(height, 2) : height;
 	*slices = apr_slice_count(width, field_height, log2_slice);
+	/* Our encoder writes 0 here; anything else must match the geometry. */
+	if (count && count != *slices)
+		return -EINVAL;
 	if (*slices < 9 || *slices > max_slices ||
 	    check_mul_overflow(*slices, 2U, &table_bytes) ||
 	    check_add_overflow(header, table_bytes, &min_size) ||
 	    min_size > size)
 		return -EINVAL;
+	/*
+	 * A slice header gives the coded Y and Cb sizes, and the Cr size too
+	 * when the frame has alpha; the rest of the slice is Cr (or alpha).
+	 */
+	slice_header = alpha ? 8 : 6;
+	pos = min_size;
 	for (i = 0; i < *slices; i++) {
+		const u8 *s = data + pos;
 		u32 slice = get_unaligned_be16(data + header + 2 * i);
+		u32 hdr;
 
-		if (slice < 6 || check_add_overflow(data_bytes, slice, &data_bytes))
+		if (slice < slice_header || slice > size - pos)
 			return -EINVAL;
+		hdr = s[0] >> 3;
+		coded = get_unaligned_be16(s + 2) + get_unaligned_be16(s + 4);
+		if (alpha)
+			coded += get_unaligned_be16(s + 6);
+		if (hdr < slice_header || hdr > slice || coded > slice - hdr)
+			return -EINVAL;
+		pos += slice;
 	}
-	if (data_bytes > size - min_size)
-		return -EINVAL;
 	*picture_size = size;
 	return 0;
 }
@@ -635,7 +659,7 @@ int apr_parse_frame(const u8 *data, size_t bytes, struct apr_prores_info *info)
 		info->picture_offset[i] = offset;
 		ret = apr_parse_picture(data + offset, frame_size - offset,
 					info->width, info->height,
-					info->pictures == 2,
+					info->pictures == 2, info->alpha,
 					i ? 16384 : 262144,
 					&info->picture_size[i], &info->slices[i]);
 		if (ret)

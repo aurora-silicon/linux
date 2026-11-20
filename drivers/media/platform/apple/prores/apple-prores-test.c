@@ -593,8 +593,11 @@ static u8 *apr_test_bitstream(struct kunit *test, bool interlaced, size_t *bytes
 		put_unaligned_be32(picture_size, picture + 1);
 		put_unaligned_be16(slices, picture + 5);
 		picture[7] = 3 << 4;
-		for (i = 0; i < slices; i++)
+		for (i = 0; i < slices; i++) {
 			put_unaligned_be16(6, picture + 8 + 2 * i);
+			/* A 6-byte slice header with empty Y and Cb data. */
+			picture[8 + 2 * slices + 6 * i] = 6 << 3;
+		}
 		offset += picture_size;
 	}
 	*bytes = frame_size;
