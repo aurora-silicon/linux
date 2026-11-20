@@ -367,6 +367,7 @@ static struct apple_sleep_coproc {
 	struct device *dev;
 	void __iomem *asc;
 	bool pcie_ans;
+	bool ans;	/* ANS's own stop, its domain and PCIe left up (T8122) */
 	int (*last_check)(void *data);
 	int (*last_stop)(void *data);
 	void *data;
@@ -1679,6 +1680,24 @@ void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
 	c->stopped = false;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_ready);
+
+/*
+ * apple_sleep_coproc_set_ans() - mark a registered stop as ANS's own
+ *
+ * For a SoC whose sleep commits with ANS's domain and PCIe up and its CPU idled (T8122, as
+ * macOS): ANS's driver stops it at the commit, so the sleep is not refused for ANS being on,
+ * and nothing lowers its domain or PCIe here (unlike a pcie_ans stop).
+ */
+void apple_sleep_coproc_set_ans(struct device *dev)
+{
+	struct apple_sleep_coproc *c;
+
+	guard(mutex)(&apple_sleep_coprocs_lock);
+	c = apple_sleep_coproc_find(dev);
+	if (c)
+		c->ans = true;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_ans);
 
 bool apple_sleep_coproc_stopped(struct device *dev)
 {
@@ -3330,7 +3349,7 @@ static bool apple_sleep_wake_admitted(const struct apple_sleep_soc *soc, const u
 static int apple_sleep_refuse(struct apple_sleep *s)
 {
 	const struct apple_sleep_domains *d = &s->soc->ps;
-	bool refused = false, idled = false;
+	bool refused = false, idled = false, ans_stop = false;
 	int i;
 
 	sleep_note(s, 0x20);
@@ -3341,6 +3360,7 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 			continue;
 		if (c->ready) {
 			idled |= c->pcie_ans;
+			ans_stop |= c->ans;
 		} else {
 			/* Nothing may lower a coprocessor's domain under its driver. */
 			dev_err(s->dev, "refused: %s is running and its driver has not quiesced it\n",
@@ -3401,7 +3421,7 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 	}
 
 	/* Only ANS's driver can stop it, and it doesn't come back without a real sleep. */
-	if (!idled && (sleep_ps_on(s, d->ans) || sleep_ps_on(s, d->apcie_sys_gp))) {
+	if (!idled && !ans_stop && (sleep_ps_on(s, d->ans) || sleep_ps_on(s, d->apcie_sys_gp))) {
 		dev_err(s->dev, "refused: ANS or PCIe is on with no driver to stop it\n");
 		refused = true;
 	}

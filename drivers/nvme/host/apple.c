@@ -2930,6 +2930,8 @@ static int apple_nvme_probe(struct platform_device *pdev)
 			!apple_sleep_coproc_register(anv->dev, anv->mmio_coproc, false,
 						     apple_nvme_sleep_last_stop, anv);
 		/* The shutdown notification is checked in the suspend, not at the commit. */
+		if (anv->sleep_registered)
+			apple_sleep_coproc_set_ans(anv->dev);
 		if (anv->sleep_registered) {
 			int i = of_property_match_string(anv->dev->of_node, "power-domain-names", "ans");
 			struct device_node *e = i < 0 ? NULL :

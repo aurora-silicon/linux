@@ -102,6 +102,7 @@ void apple_sleep_enclave_unregister(struct device *dev);
 
 /* Its driver has quiesced it for that last step, or has taken it back. */
 void apple_sleep_coproc_set_ready(struct device *dev, bool ready);
+void apple_sleep_coproc_set_ans(struct device *dev);
 void apple_sleep_coproc_set_early(struct device *dev);
 
 /* Whether the last step stopped it: after a refused sleep, false means it still runs. */
@@ -322,6 +323,7 @@ static inline void apple_sleep_coproc_set_early(struct device *dev)
 static inline void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
 {
 }
+static inline void apple_sleep_coproc_set_ans(struct device *dev) { }
 
 static inline bool apple_sleep_coproc_stopped(struct device *dev)
 {
