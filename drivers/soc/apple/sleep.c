@@ -6098,7 +6098,8 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 		if (ret)
 			panic("Apple committed SMC notice failed after peer stop: %d", ret);
 	} else if (apple_sleep_j613_notice_after_stops()) {
-		ret = apple_sleep_smc_commit_notice(s);
+		/* J613 registers J813's saved ops: late_notice (slpa, AP idle), no commit_notice. */
+		ret = apple_sleep_smc_late_notice(s);
 		dev_info(s->dev, "TEST: J613 SMC notice after coprocessor stops: %d\n", ret);
 		if (ret)
 			panic("Apple J613 SMC notice failed after coprocessor stops: %d", ret);
