@@ -41,6 +41,8 @@
 			compatible = "apple,simple-framebuffer", "simple-framebuffer";
 			reg = <0 0 0 0>; /* To be filled by the loader */
 			/* Format properties will be added by the loader */
+			/* Scanned out by the internal DCP, handed off or not. */
+			display = <&dcp>;
 			status = "disabled";
 		};
 	};
