@@ -2818,6 +2818,14 @@ static int apple_nvme_sleep_last_stop(void *data)
 	/* T8122: the NVMe window is unreachable at the commit (n36); ANS's own pages are not. */
 	cc = anv->hw->sleep_idle ? 0 : readl(anv->mmio_nvme + NVME_REG_CC);
 
+	/* T8122: already idled in the suspend; the sleep driver clears RUN after this. */
+	if (anv->hw->sleep_idle && anv->sleep_idled) {
+		apple_rtkit_mailbox_recv_off(anv->rtk);
+		if (anv->sleep_pmp_entry &&
+		    apple_pmp_report_entry_withdraw_polled(anv->sleep_pmp_entry))
+			dev_err(anv->dev, "ANS's PMP request not withdrawn at the last stop\n");
+		return 0;
+	}
 	anv->sleep_idled = true;
 	ret = apple_rtkit_sleep_idle_polled(anv->rtk,
 					    anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL, &us);
@@ -3325,10 +3333,14 @@ static int apple_nvme_suspend(struct device *dev)
 		    !anv->legacy_shn_ret &&
 		    (!anv->sleep_pmp_entry ||
 		     !apple_pmp_report_entry_commit_owned(anv->sleep_pmp_entry, true))) {
+			int idle = apple_rtkit_idle(anv->rtk);
+
 			anv->sleep_stop = true;
-			anv->sleep_idled = false;
+			/* Idled here, with interrupts on (at the commit it never answered, n36-n42). */
+			anv->sleep_idled = !idle;
 			apple_sleep_coproc_set_ready(dev, true);
-			dev_info(dev, "ANS left running for the sleep's last stop (notification %d)\n",
+			dev_info(dev, "ANS idled for the sleep: %d (status %#x), its run bit left to the commit (notification %d)\n",
+				 idle, readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS),
 				 anv->legacy_shn_ret);
 			return 0;
 		}
