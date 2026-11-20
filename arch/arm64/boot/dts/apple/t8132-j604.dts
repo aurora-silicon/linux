@@ -266,7 +266,6 @@
 };
 
 &dwc3_3 {
-	dr_mode = "host";
 	maximum-speed = "super-speed";
 	phys = <&atcphy3 PHY_TYPE_USB2>, <&atcphy3 PHY_TYPE_USB3>;
 	phy-names = "usb2-phy", "usb3-phy";
