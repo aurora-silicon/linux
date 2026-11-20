@@ -309,6 +309,42 @@ static const u32 t8122_macos_wake_masks[] = {
 static const u16 t8122_macos_ps_off[] = { 0x1e8, 0x220, 0x238, 0x240, 0x248, 0x2a8, 0x2c8, 0x3a8 };
 static const u16 t8122_macos_aon_off[] = { 0x80, 0x88, 0xb8, 0xc8 };
 
+/*
+ * J613 trial: wake source 208 (SMC.OutboxNotEmpty, status +0x3c bit 16) reads pending after
+ * Linux's commit with the SMC's mailbox empty (n14, n15); at macOS's commit it reads 0 and
+ * macOS leaves it unmasked. 1: mask it (a diagnostic: macOS does not); 2: write the bit back to
+ * its status word before the commit, as a write-one-to-clear. Both print S208 before/after.
+ */
+static void t8122_dc_putc(unsigned char c);
+static void t8122_dc_puts(const char *str);
+static void t8122_dc_hex(u32 v);
+
+static unsigned int t8122_wake208;
+module_param(t8122_wake208, uint, 0600);
+MODULE_PARM_DESC(t8122_wake208,
+		 "J613 trial: wake source 208 pending at the commit: 1 mask it, 2 write-one-to-clear its status");
+
+static void t8122_wake208_apply(struct apple_sleep *s)
+{
+	u32 before, after;
+
+	if (!s->wake || !t8122_wake208)
+		return;
+	before = readl(s->wake + 0x3c);
+	if (t8122_wake208 == 1)
+		writel(readl(s->wake + 0x20) | BIT(16), s->wake + 0x20);
+	else if (t8122_wake208 == 2 && (before & BIT(16)))
+		writel(BIT(16), s->wake + 0x3c);
+	after = readl(s->wake + 0x3c);
+	t8122_dc_puts("\nS208 ");
+	t8122_dc_hex(before);
+	t8122_dc_putc('/');
+	t8122_dc_hex(after);
+	t8122_dc_puts(" m=");
+	t8122_dc_hex(readl(s->wake + 0x20));
+	t8122_dc_putc('\n');
+}
+
 static void t8122_macos_state_apply(struct apple_sleep *s)
 {
 	unsigned int i;
@@ -316,6 +352,7 @@ static void t8122_macos_state_apply(struct apple_sleep *s)
 	if (s->wake)
 		for (i = 0; i < ARRAY_SIZE(t8122_macos_wake_masks); i++)
 			writel(t8122_macos_wake_masks[i], s->wake + 0x08 + i * 4);
+	t8122_wake208_apply(s);
 	for (i = 0; i < ARRAY_SIZE(t8122_macos_ps_off); i++) {
 		u32 v = readl(s->ps + t8122_macos_ps_off[i]);
 
