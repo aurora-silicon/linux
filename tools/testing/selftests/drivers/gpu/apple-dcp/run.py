@@ -66,6 +66,7 @@ def main():
         ('display', 'panel-backlight-ramp', display.backlight, ((),), ()),
         ('display', 'panel-takeover-registration', desktop.brightness_takeover, ((),), ()),
         ('display', 'panel-brightness-commit', display.brightness_commit, ((),), ()),
+        ('display', 'camera-indicator-dpms', display.indicator_dpms, ((),), ()),
         ('display', 'panel-brightness-takeover', display.takeover, ((),), ()),
         ('display', 'panel-mode-catalog', display.modes, ((),), ()),
         ('display', 'desktop-brightness-notifications', desktop.brightness_notifications, ((),), ()),

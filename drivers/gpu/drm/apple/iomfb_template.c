@@ -3502,6 +3502,9 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 			dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
+#if DCP_FW_H17(DCP_FW_VER)
+	iomfb_prepare_indicator_h17p(dcp);
+#endif
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	if (dcp_peer_start_second(dcp, resp))
 		return;

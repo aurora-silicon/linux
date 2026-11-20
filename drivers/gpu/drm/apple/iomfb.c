@@ -3817,6 +3817,61 @@ iomfb_scanout_prepare_h17p(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	return scanout;
 }
 
+static void iomfb_null_surface_h17p(struct dcp_swap_submit_req_h17p *request,
+				   unsigned int slot)
+{
+	request->surf_null[slot] = true;
+	request->surf_iova[slot] = 0;
+	memset(&request->surf[slot], 0, sizeof(request->surf[slot]));
+	memset(&request->swap.src_rect[slot], 0, sizeof(request->swap.src_rect[slot]));
+	memset(&request->swap.dst_rect[slot], 0, sizeof(request->swap.dst_rect[slot]));
+	request->swap.surf_ids[slot] = 0;
+	request->swap.surf_flags[slot] = 0;
+	request->swap.surf_unk[slot] = 0;
+}
+
+/* DPMS-off commits can detach the plane without flushing its retained surface. */
+void iomfb_prepare_indicator_h17p(struct apple_dcp *dcp)
+{
+	struct dcp_camera_indicator *ci = &dcp->camera_ind;
+	struct dcp_swap_submit_req_h17p *request = &dcp->swap.h17p;
+	struct iomfb_scanout_h17p *scanout = dcp->iomfb.scanout;
+	unsigned int slot;
+
+	if (!ci->has_surf)
+		return;
+	lockdep_assert_held(&dcp->iomfb.lock);
+	slot = ci->surf;
+	if (request->surf_null[slot] && (!scanout || !scanout->fb[slot]))
+		return;
+	scoped_guard(spinlock_irqsave, &ci->lock) {
+		if (ci->state.wanted)
+			return;
+	}
+
+	iomfb_null_surface_h17p(request, slot);
+	request->swap.swap_enabled |= BIT(slot);
+	request->swap.swap_completed |= BIT(slot);
+}
+
+/* Only a completed null-layer update retires the retained indicator. */
+static void iomfb_retire_indicator_h17p(struct apple_dcp *dcp,
+				      struct iomfb_scanout_h17p *scanout)
+{
+	const struct dcp_swap_submit_req_h17p *sent = &dcp->swap.h17p;
+	unsigned int slot = dcp->camera_ind.surf;
+
+	if (!dcp->camera_ind.has_surf || !scanout || !scanout->fb[slot] ||
+	    !(sent->swap.swap_enabled & BIT(slot)) || !sent->surf_null[slot])
+		return;
+
+	drm_framebuffer_put(scanout->fb[slot]);
+	scanout->fb[slot] = NULL;
+	iomfb_null_surface_h17p(&scanout->request, slot);
+	scanout->request.swap.swap_enabled &= ~BIT(slot);
+	scanout->request.swap.swap_completed &= ~BIT(slot);
+}
+
 void iomfb_scanout_complete_h17p(struct apple_dcp *dcp)
 {
 	struct iomfb_scanout_h17p *scanout = dcp->iomfb.next_scanout;
@@ -3830,6 +3885,7 @@ void iomfb_scanout_complete_h17p(struct apple_dcp *dcp)
 
 	/* Keep common present arguments, including the null output pointers. */
 	scanout->request = *request;
+	iomfb_retire_indicator_h17p(dcp, scanout);
 	/* Preserve unchanged planes when only a subset was presented. */
 	for (i = 0; i < SWAP_SURFACES; i++) {
 		if (!(request->swap.swap_enabled & BIT(i)) && previous) {
@@ -3960,8 +4016,10 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 			dcp_backlight_complete(dcp, transaction->backlight.sequence, true);
 			transaction->backlight_reserved = false;
 		}
-		if (transaction->brightness_only)
+		if (transaction->brightness_only) {
+			iomfb_retire_indicator_h17p(dcp, dcp->iomfb.scanout);
 			return false;
+		}
 	}
 	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		atomic_cmpxchg(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING,

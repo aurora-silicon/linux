@@ -1201,6 +1201,7 @@ bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation);
 const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation,
 					 u32 *defaults);
 
+void iomfb_prepare_indicator_h17p(struct apple_dcp *dcp);
 void iomfb_scanout_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_backlight_h17p(struct apple_dcp *dcp);
 void iomfb_present_matrix_h17p(struct apple_dcp *dcp);
