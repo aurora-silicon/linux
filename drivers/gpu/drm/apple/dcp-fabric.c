@@ -5167,8 +5167,6 @@ static void dcp_reclaim_publish(void *data, bool restore)
 
 	/* Connected on a fresh attachment; no CRTC is on yet. */
 	scoped_guard(mutex, &to->hpd_mutex) {
-		WRITE_ONCE(to->typec_cable_connected, true);
-		to->typec_generation++;
 		to->typec_follow_start = false;
 		WRITE_ONCE(to->typec_crtc_off, false);
 	}

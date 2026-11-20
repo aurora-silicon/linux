@@ -3448,9 +3448,6 @@ bool dcp_hold_resume_event(struct platform_device *pdev)
 static void dcp_typec_attach_locked(struct apple_dcp *dcp)
 {
 	lockdep_assert_held(&dcp->hpd_mutex);
-	if (dcp->typec_cable_connected)
-		return;
-
 	dcp->typec_generation++;
 	WRITE_ONCE(dcp->typec_cable_connected, true);
 	dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);

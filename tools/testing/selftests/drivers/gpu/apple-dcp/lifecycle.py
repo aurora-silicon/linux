@@ -580,6 +580,18 @@ def bounce(root):
     swap('static bool dcp_is_external_h17p(struct apple_dcp *d) { (void)d; return true; }',
          'static bool h17p = true;\n'
          'static bool dcp_is_external_h17p(struct apple_dcp *d) { (void)d; return h17p; }')
+    if 'dcp_dptx_release_locked(' in raw:
+        swap(block(unit, 'static void dcp_typec_attach_locked('),
+             apple_function(root, 'dcp_typec_attach_locked'))
+        swap(block(unit, 'static int dcp_dptx_connect_attached('),
+             'static int dcp_dptx_connect_attached(struct apple_dcp *d, u32 port)\n'
+             '{ assert(!h17p); return dcp_dptx_connect_raw(d, port, NULL, NULL, false, false); }')
+        swap(block(unit, 'static void dcp_relink_attach('),
+             'static void dcp_relink_attach(int *s, u64 generation)\n'
+             '{ assert(!h17p); (void)s; (void)generation; }')
+        swap(block(unit, 'static void __attribute__((unused)) dcp_relink_link_up('),
+             'static void dcp_relink_link_up(int *s, u64 generation, unsigned long now)\n'
+             '{ assert(!h17p); (void)s; (void)generation; (void)now; }')
     swap('int main(void)\n{', 'static int __attribute__((unused)) prior_main(void)\n{')
     firmware = r'''
 typedef uint8_t u8;
@@ -716,23 +728,21 @@ int main(void)
  CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT && connects == 0);
  printf("case live-failure complete\n");
 
- /* A connect that finds the old display still attached drops it and connects: its unplug never reached us. */
- bounced(); link_trains = true;
- display.typec_generation = 2;
- display.dptxport[0].connected = fw_display = true;
- display.dptxport[0].connected_generation = 1;
- {
-  int before = releases;
-  CHECK(dcp_dptx_connect_oob(&device, 0) == 0);
-  CHECK(releases == before + 1 && connects == 1);
-  CHECK(display.dptxport[0].connected && fw_hpd && fw_display);
- }
+ /* A new Type-C attachment arrives while the DCP still owns the old display. */
+ init(); h17p = false; display.phy = (void *)1;
+ link_trains = fw_display = fw_hpd = true;
+ connects = 0;
+ display.dptxport[0].connected_generation = display.typec_generation;
+ CHECK(dcp_dptx_connect_oob(&device, 0) == 0);
+ CHECK(releases == 1 && connects == 1);
+ CHECK(display.dptxport[0].connected && fw_hpd && fw_display);
  /* A repeated connect in the same generation must not replace the live display. */
  {
   int before = releases, connected = connects;
-  CHECK(dcp_dptx_connect_oob(&device, 0) == 0);
+  CHECK(dcp_dptx_connect_raw(&display, 0, NULL, NULL, false, false) == 0);
   CHECK(releases == before && connects == connected);
  }
+ h17p = true;
  /* An old display that will not release fails the connect and stays attached: nothing new is started on it. */
  bounced(); link_trains = true;
  display.typec_generation = 2;
