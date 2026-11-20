@@ -565,8 +565,10 @@ impl J313RenderPool {
         put64(frag, 0x8ac, r.sampler_heap);
         put32(frag, 0x8b4, u32::from(r.sampler_count));
         put32(frag, 0x8b8, u32::from(r.sampler_count) + 1);
-        put32(frag, 0x8bc, u32::from(r.flags & RENDER_PROCESS_EMPTY_TILES != 0));
-        put32(frag, 0x8c0, 1);
+        // 27.2 moves the 13.5 tail flags by 0x14 (0x8bc..0x8cb is an optional buffer
+        // descriptor, left empty): process empty tiles, then no-clear for the final run.
+        put32(frag, 0x8d0, u32::from(r.flags & RENDER_PROCESS_EMPTY_TILES != 0));
+        put32(frag, 0x8d4, 1);
         put64(frag, 0x8e8, u64::from(frag_ev.stamp_pointer()));
         put64(frag, 0x8f0, u64::from(frag_ev.fw_stamp_pointer()));
         put32(frag, 0x8f8, i.values[1]);

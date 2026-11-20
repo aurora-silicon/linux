@@ -435,8 +435,17 @@ impl Runtime {
                 }
             }
         } else {
-            // Tiler stage.
-            let slot = render.next_slot;
+            // Tiler stage. Take the next render slot the firmware has unlinked: it unlinks a
+            // retired slot only when it next processes work, so one can stay listed for a while.
+            let mut slot = render.next_slot;
+            for k in 0..J313_RENDER_SLOTS {
+                let candidate = (render.next_slot + k) % J313_RENDER_SLOTS;
+                if render.pool.registered(candidate).ok() == Some(false) {
+                    slot = candidate;
+                    render.next_slot = candidate;
+                    break;
+                }
+            }
             match render.pool.registered(slot) {
                 Ok(false) => {}
                 Ok(true) => {
