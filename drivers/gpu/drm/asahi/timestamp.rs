@@ -2,15 +2,15 @@
 
 //! Prepared timestamp destinations shared by native command completion paths.
 
-use crate::{gem, mmu};
+use crate::{gem, mmu, no_debug};
 #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 use crate::file;
 use core::ops::Range;
 #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 use core::sync::atomic::{fence as barrier, Ordering};
-use kernel::{prelude::*, sync::Arc};
+use kernel::prelude::*;
 #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
-use kernel::{uapi, xarray};
+use kernel::{sync::Arc, uapi, xarray};
 
 /// The size of a bound range: whole pages, not empty, inside an object of `object_size` bytes.
 fn bound_size(range: &Range<usize>, object_size: usize) -> Result<usize> {
@@ -21,10 +21,20 @@ fn bound_size(range: &Range<usize>, object_size: usize) -> Result<usize> {
     Ok(size)
 }
 
+/// The object offset of the timestamp at `offset` of a host buffer bound at `start` for `size`
+/// bytes: the whole stamp must lie inside the bound range, which lies inside the object
+/// ([`Buffer::host`]).
+fn host_offset(start: usize, size: usize, offset: usize) -> Result<usize> {
+    if offset.checked_add(size_of::<u64>()).ok_or(EOVERFLOW)? > size {
+        return Err(ERANGE);
+    }
+    start.checked_add(offset).ok_or(EOVERFLOW)
+}
+
 /// A firmware-mapped timestamp buffer with a kernel CPU mapping of its backing, kept for the
 /// buffer's lifetime so that commands need no mapping of their own.
 pub(crate) struct FirmwareBuffer {
-    mapping: Arc<mmu::KernelMapping>,
+    mapping: mmu::KernelMapping,
     cpu: mmu::TimestampVmap,
     /// Mapped in the firmware's timestamp window: the firmware may write stamps itself.
     window: bool,
@@ -56,7 +66,42 @@ pub(crate) enum Buffer {
     },
 }
 
+/// A timestamp buffer bound to a file, holding the charge for the kernel memory its records take
+/// (see `file::BOUND_OBJECT_BYTES`), so the charge is given back with the last reference.
+pub(crate) struct Bound {
+    buffer: Buffer,
+    _charge: crate::memacct::Commit,
+}
+
+impl Bound {
+    pub(crate) fn new(buffer: Buffer, charge: crate::memacct::Commit) -> Self {
+        Self { buffer, _charge: charge }
+    }
+}
+
+impl core::ops::Deref for Bound {
+    type Target = Buffer;
+
+    fn deref(&self) -> &Buffer {
+        &self.buffer
+    }
+}
+
+no_debug!(Bound);
+
+/// The larger of two sizes, for the heap bound below.
+const fn max(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
 impl Buffer {
+    /// Kernel heap bytes a buffer's own records take, at most: its deferred-release item. A CPU
+    /// buffer keeps its records inline.
+    pub(crate) const HEAP_BYTES: usize = max(
+        crate::cleanup::Deferred::<FirmwareBuffer>::HEAP_BYTES,
+        crate::cleanup::Deferred::<HostBuffer>::HEAP_BYTES,
+    );
+
     pub(crate) fn firmware(mapping: mmu::KernelMapping) -> Result<Self> {
         Self::new_firmware(mapping, false)
     }
@@ -85,7 +130,7 @@ impl Buffer {
     fn new_firmware(mapping: mmu::KernelMapping, window: bool) -> Result<Self> {
         let cpu = mapping.timestamp_vmap()?;
         Ok(Self::Firmware(crate::cleanup::Deferred::new(FirmwareBuffer {
-            mapping: Arc::new(mapping, GFP_KERNEL)?,
+            mapping,
             cpu,
             window,
         })?))
@@ -153,13 +198,7 @@ impl Buffer {
     pub(crate) fn timestamp_offset(&self, offset: usize) -> Result<usize> {
         match self {
             Self::Firmware(buffer) => buffer.mapping.timestamp_offset(offset),
-            // The bound range lies inside the object (Self::host).
-            Self::Host(buffer) => {
-                if offset.checked_add(size_of::<u64>()).ok_or(EOVERFLOW)? > buffer.size {
-                    return Err(ERANGE);
-                }
-                buffer.start.checked_add(offset).ok_or(EOVERFLOW)
-            }
+            Self::Host(buffer) => host_offset(buffer.start, buffer.size, offset),
             #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { .. } => Err(EINVAL),
         }
@@ -176,10 +215,12 @@ impl Buffer {
         }
     }
 
-    /// Legacy command encoders publish firmware pointers and must never accept a CPU-only buffer.
-    pub(crate) fn firmware_mapping(&self) -> Result<Arc<mmu::KernelMapping>> {
+    /// Firmware-aliased command encoders publish firmware pointers and must never accept a
+    /// host- or CPU-only buffer. Returning a borrow keeps the mapping tied to [`Bound`] so no
+    /// command can retain the mapping without also keeping its bind charge alive.
+    pub(crate) fn firmware_mapping(&self) -> Result<&mmu::KernelMapping> {
         match self {
-            Self::Firmware(buffer) => Ok(buffer.mapping.clone()),
+            Self::Firmware(buffer) => Ok(&buffer.mapping),
             Self::Host(_) => Err(EINVAL),
             #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { .. } => Err(EINVAL),
@@ -203,7 +244,7 @@ fn checked_offset(offset: u64, size: usize, aligned: bool) -> Result<usize> {
 #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 struct Destination {
     // Retain the bound range and backing along with its prepared CPU view.
-    _mapping: Arc<Buffer>,
+    _mapping: Arc<Bound>,
     cpu: mmu::TimestampMapping,
 }
 
@@ -322,5 +363,17 @@ mod tests {
         assert_eq!(bound_size(&(PAGE / 2..PAGE + PAGE / 2), 2 * PAGE), Err(EINVAL));
         assert_eq!(bound_size(&(0..2 * PAGE), PAGE), Err(EINVAL));
         assert_eq!(bound_size(&(PAGE..usize::MAX & !(PAGE - 1)), 2 * PAGE), Err(EINVAL));
+    }
+
+    #[test]
+    fn a_host_stamp_lies_inside_the_bound_range() {
+        // A host buffer bound at the object's second page: offsets are within the bound range
+        // and come back as object offsets.
+        assert_eq!(host_offset(PAGE, PAGE, 0), Ok(PAGE));
+        assert_eq!(host_offset(PAGE, PAGE, PAGE - 8), Ok(2 * PAGE - 8));
+        // A stamp reaching past the bound range is refused, even if the object goes on.
+        assert_eq!(host_offset(PAGE, PAGE, PAGE - 4), Err(ERANGE));
+        assert_eq!(host_offset(PAGE, PAGE, PAGE), Err(ERANGE));
+        assert_eq!(host_offset(0, PAGE, usize::MAX - 2), Err(EOVERFLOW));
     }
 }
