@@ -570,6 +570,8 @@ struct apple_dcp_afkep {
 	const struct apple_epic_service_ops *unmatched_ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];
 	u32 num_channels;
+	/* Woken once a service has opened and its init callback has run. */
+	wait_queue_head_t service_wq;
 
 	struct dentry *debugfs_entry;
 
@@ -589,6 +591,7 @@ static inline void afk_ep_init_state(struct apple_dcp_afkep *ep)
 	spin_lock_init(&ep->lock);
 	INIT_LIST_HEAD(&ep->compact_cmds);
 	init_waitqueue_head(&ep->compact_orphan_wq);
+	init_waitqueue_head(&ep->service_wq);
 	mutex_init(&ep->compact_tx_lock);
 	init_completion(&ep->started);
 	init_completion(&ep->stopped);
