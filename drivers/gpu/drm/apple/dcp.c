@@ -8040,6 +8040,7 @@ static int dcp_platform_prepare(struct device *dev)
 }
 
 static void dcp_s2r_dark_finish(struct apple_dcp *dcp);
+static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp);
 
 static void dcp_platform_complete(struct device *dev)
 {
@@ -9205,8 +9206,10 @@ static int dcp_s2r_pm_notify(struct notifier_block *nb, unsigned long action, vo
 {
 	struct apple_dcp *dcp = container_of(nb, struct apple_dcp, s2r_pm_nb);
 
-	if (action == PM_POST_SUSPEND)
+	if (action == PM_POST_SUSPEND) {
 		dcp_s2r_dark_finish(dcp);
+		dcp_v27_dark_replug_owed(dcp);
+	}
 	/*
 	 * A J714s external display processor that has crashed cannot take its sleep calls, and
 	 * the SoC cannot power down around it: the sleep is refused here, before the tasks

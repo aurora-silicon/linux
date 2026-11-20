@@ -3062,7 +3062,12 @@ static void apple_nhi_complete(struct device *dev)
 
 	apple_nhi_cio_complete(anhi);
 	tb_domain_complete(anhi->tb);
-	apple_dpin_resume_retries(acio);
+	/*
+	 * A dark wake sleeps again at once and lights no display: DP IN admission, paused again by
+	 * the next .prepare, stays paused through the gap and reopens at the final wake.
+	 */
+	if (!pm_dark_wake())
+		apple_dpin_resume_retries(acio);
 
 	guard(mutex)(&acio->pcie_tunnel_lock);
 	acio->pcie_pm_prepared = false;
