@@ -93,6 +93,9 @@ const OPC_UPDATE_IOREG: u64 = 0x36;
 const OPC_CONFIRM_IOREG: u64 = 0x37;
 const OPC_ACK_MASK: u64 = 0x1;
 const OPC_SHIFT: u32 = 48;
+/// The value macOS 27.2 sends with every CONFIRM_IOREG on the J773g (A2I 0x0037000000000008,
+/// hv22/hv23: UPDATE_IOREG for ioregs 0x17c, 0x17f, 0x182 and 0x18a).
+const CONFIRM_IOREG_272: u64 = 8;
 const MALLOC_SIZE_MASK: u64 = 0xFFFFFF;
 const MSG_IOVA_MASK: u64 = 0xFFFFFFFFFFFF;
 const SET_IOREG_INDEX_MASK: u64 = 0xFFFF;
@@ -587,6 +590,15 @@ impl PmpData {
         // and `control` is inside the ASC mapping held by `self`.
         to_result(unsafe { bindings::apple_rtkit_sleep_return(rtk, control) })
     }
+    /// CONFIRM_IOREG's value: 8 on the T8132 27.2 PMP image, as macOS sends it; 0 elsewhere.
+    fn confirm_ioreg_value() -> u64 {
+        // SAFETY: the predicate only reads the machine's compatible and /chosen.
+        if unsafe { apple_pmp_t8132_self_starts() } {
+            CONFIRM_IOREG_272
+        } else {
+            0
+        }
+    }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
@@ -615,7 +627,7 @@ impl PmpData {
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
             // Firmware waits for this confirmation before publishing reports.
             // Do not echo the registry index/payload or add a generic ACK bit.
-            OPC_UPDATE_IOREG => OPC_CONFIRM_IOREG << OPC_SHIFT,
+            OPC_UPDATE_IOREG => OPC_CONFIRM_IOREG << OPC_SHIFT | Self::confirm_ioreg_value(),
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
                 return Err(EIO);
