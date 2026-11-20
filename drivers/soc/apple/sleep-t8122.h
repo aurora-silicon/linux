@@ -863,8 +863,35 @@ static void t8122_asc_census_log(struct apple_sleep *s)
 	}
 }
 
+/*
+ * J613 diagnostic: the commit word's page. n18 read the commit word back 0 straight after each
+ * write (k0-k2); macOS's reads 1 after a real sleep. Logs 0x2e42d4000..+0xff at the entry.
+ */
+static bool t8122_commit_page;
+module_param(t8122_commit_page, bool, 0600);
+MODULE_PARM_DESC(t8122_commit_page, "J613 diagnostic: log the commit word's page (0x2e42d4000, 256 bytes) at the entry");
+
+static void t8122_commit_page_log(struct apple_sleep *s)
+{
+	void __iomem *r = ioremap_np(0x2e42d4000, 0x100);
+	char line[160];
+	unsigned int i, n;
+
+	if (!r)
+		return;
+	for (i = 0; i < 0x100; i += 0x20) {
+		n = scnprintf(line, sizeof(line), "+%02x:", i);
+		for (unsigned int j = 0; j < 0x20; j += 4)
+			n += scnprintf(line + n, sizeof(line) - n, " %08x", readl(r + i + j));
+		dev_info(s->dev, "J613 commit page %s\n", line);
+	}
+	iounmap(r);
+}
+
 static int t8122_sleep_begin(struct apple_sleep *s)
 {
+	if (t8122_commit_page)
+		t8122_commit_page_log(s);
 	if (t8122_asc_census)
 		t8122_asc_census_log(s);
 	t8122_witness_reset();
