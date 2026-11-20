@@ -75,6 +75,8 @@ ASAHI_TESTS = {
 
     'dcpext26-startup-tests.py': [([], PASS)],
     'iomfb-startup-tests.py': [([], PASS)],
+    'dcp-v27-dptx-layout-tests.py': [([], PASS)] + mutations(
+        '--mutation', ['ignore-advertisement', 'ignore-pinned', 'ignore-dcpext'], []),
     'dcpext26-wire-tests.py': [([], PASS)],
     'pmp-native26-tests.py': [([], PASS)],
 
