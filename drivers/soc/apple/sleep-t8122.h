@@ -1439,6 +1439,29 @@ static void t8122_commit_page_dc(struct apple_sleep *s)
  * 63, just before the first commit write); Linux reads 0x1f0002ff there (n21: t8122_match bit 2's
  * write does not stick). Written just before the commit and polled 2 ms; 'S' before/after.
  */
+/*
+ * J613 trial (single variable): DISP_CPU (0x2d0710000) reads 0x0f040300 just before Linux's
+ * commit; macOS's commit snapshot has 0x0f000300 (run 31). The only difference is bit 18.
+ * Written back without it just before the commit (the W1C flags left alone); 'D' before/after.
+ */
+static bool t8122_disp_bit18;
+module_param(t8122_disp_bit18, bool, 0600);
+MODULE_PARM_DESC(t8122_disp_bit18, "J613 trial: clear DISP_CPU's bit 18 just before the commit, as macOS's 0x0f000300");
+
+static void t8122_disp_bit18_apply(struct apple_sleep *s)
+{
+	u32 before = readl(s->ps + T8122_PS_DISP_CPU), after;
+
+	if (before & BIT(18))
+		writel(before & ~(BIT(18) | PS_FLAGS), s->ps + T8122_PS_DISP_CPU);
+	after = readl(s->ps + T8122_PS_DISP_CPU);
+	t8122_dc_puts("\nD disp ");
+	t8122_dc_hex(before);
+	t8122_dc_putc('/');
+	t8122_dc_hex(after);
+	t8122_dc_putc('\n');
+}
+
 static bool t8122_sio_auto;
 module_param(t8122_sio_auto, bool, 0600);
 MODULE_PARM_DESC(t8122_sio_auto, "J613 trial: SIO_CPU auto-idle just before the commit, as macOS (0x1400024f)");
@@ -1461,6 +1484,8 @@ static void t8122_sio_auto_apply(struct apple_sleep *s)
 
 static void t8122_sleep_pre_commit(struct apple_sleep *s)
 {
+	if (READ_ONCE(t8122_disp_bit18))
+		t8122_disp_bit18_apply(s);
 	if (READ_ONCE(t8122_sio_auto))
 		t8122_sio_auto_apply(s);
 	if (READ_ONCE(t8122_commit_page))
