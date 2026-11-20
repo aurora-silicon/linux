@@ -2592,6 +2592,13 @@ impl Pair {
         Arc::ptr_eq(context, &self.memory.context) && self.guilty_unretired(generation)
     }
 
+    /// A GPU recovery failed the pair's VM as guilty (its status records the failure, so every
+    /// later submission and publication of it is refused) and quarantined the pair. Not on M5.
+    pub(crate) fn failed_guilty(&self) -> bool {
+        let status = self.memory.context.status();
+        !self.memory.graph.is_m5() && self.quarantined && status.recovery_guilty() && status.get() != 0
+    }
+
     /// A closed owner's quarantined pair holding published work of a VM that a GPU recovery
     /// found guilty. Its started group hangs the GPU again after every restart, with its queued
     /// groups behind it, so its work never retires like other work: on 25G83 the host cannot

@@ -42,6 +42,16 @@ impl RenderState {
         self.slots_where(|pair| pair.releasable_by_kill(context, generation))
     }
 
+    /// The owner and context of `slot`'s pair while that owner is still open, its VM failed as
+    /// guilty (`Pair::failed_guilty`), and no builder or owner switch holds the slot.
+    pub(in crate::g17::runtime) fn failed_open_owner(&self, slot: usize) -> Option<(u64, Arc<Context>)> {
+        let entry = self.entries.get(slot)?.as_ref()?;
+        let pair = entry.pair.as_deref()?;
+        let open = !entry.closed && entry.preparing.is_none() && entry.pending_owner.is_none();
+        (open && pair.owner() == Some(entry.reservation.owner) && pair.failed_guilty())
+            .then(|| (entry.reservation.owner, pair.context().clone()))
+    }
+
     fn slots_where(&self, matches: impl Fn(&crate::g17::queue::render::Pair) -> bool) -> u64 {
         let mut slots = 0;
         for (slot, entry) in self.entries.iter().enumerate() {

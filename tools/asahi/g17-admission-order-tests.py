@@ -403,11 +403,15 @@ mod g17 {
 """ + backlog + r"""
     }
     pub mod context {
-        pub struct Context { pub published: bool, pub scheduler: u64 }
+        pub struct Context { pub published: bool, pub scheduler: u64, pub closed: std::sync::atomic::AtomicBool }
         impl Context {
             pub fn is_published(&self) -> bool { self.published }
             pub fn scheduler_va(&self) -> u64 { self.scheduler }
-            pub fn note_closed(&self, _generation: u64) {}
+            /// First close wins, as `Context::note_closed`.
+            pub fn note_closed(&self, _generation: u64) -> bool {
+                !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel)
+            }
+            pub fn note_open_client(&self, _open: bool) {}
         }
     }
     pub mod teardown {
@@ -542,7 +546,9 @@ const SLOTS: usize = cfg::RENDER_SLOTS;
 const NEW: u64 = 5000;
 fn bit(slot: usize) -> u64 { 1u64 << slot }
 fn owner(slot: usize) -> u64 { 1000 + slot as u64 }
-fn context(scheduler: u64) -> Arc<Context> { Arc::new(Context { published: true, scheduler }) }
+fn context(scheduler: u64) -> Arc<Context> {
+    Arc::new(Context { published: true, scheduler, closed: std::sync::atomic::AtomicBool::new(false) })
+}
 /// Every slot is retained by an open owner and no new graph fits; `pairs` are installed.
 fn device(pairs: &[(usize, &Arc<Context>)]) -> Arc<Shared> {
     let mut state = State::new();
@@ -688,6 +694,12 @@ fn closed_owner_release() {
     assert_eq!(state.held & bit(31), 0, "a consumed release returns its parked pair's slot");
     assert!(wakes(&shared) > before, "and wakes the publications waiting for render capacity");
     assert_eq!(state.clone().acquire(NEW, 1), Some(31), "a new owner takes the parked pair, not the one whose release is pending");
+    // A queue the kernel closed for its client (`Firmware::close_failed_owners`) is closed by that
+    // client later: its released scheduler gets no second teardown entry, its slot no new hold.
+    backend(&shared, 31, &healthy).release_queue().unwrap();
+    with(&shared, |firmware| assert!(!firmware.queues.teardown.releasing(&healthy),
+                                     "a second close of a released context arms no second scheduler release"));
+    assert_eq!(admission(&shared).held & bit(31), 0, "and holds its parked pair's slot no more");
     assert_ne!(state.held & bit(30), 0);
     // Once the stuck release is consumed too, its slot returns, as the older one.
     consume(&shared, &stuck, 9);
@@ -760,10 +772,13 @@ fn main() {
 RELEASE_MUTATIONS = {
     'hold-ignores-release': ('pair.unreusable_work() || teardown.releasing(pair.context())', 'pair.unreusable_work()'),
     'hold-ignores-work': ('pair.unreusable_work() || teardown.releasing(pair.context())', 'teardown.releasing(pair.context())'),
-    'close-unheld': ('firmware.queues.sync_render_holds();\n        firmware.queues.admission.release_owner(self.owner);',
+    'close-unheld': ('firmware.queues.sync_render_holds();\n            firmware.queues.admission.release_owner(self.owner);',
                      'firmware.queues.admission.release_owner(self.owner);'),
-    'hold-after-release': ('firmware.queues.sync_render_holds();\n        firmware.queues.admission.release_owner(self.owner);',
-                           'firmware.queues.admission.release_owner(self.owner);\n        firmware.queues.sync_render_holds();'),
+    # The client's close after the kernel's repeats the firmware side.
+    'close-twice': ('if self.context.note_closed(firmware.recovery.generation()) {',
+                    'if { self.context.note_closed(firmware.recovery.generation()); true } {'),
+    'hold-after-release': ('firmware.queues.sync_render_holds();\n            firmware.queues.admission.release_owner(self.owner);',
+                           'firmware.queues.admission.release_owner(self.owner);\n            firmware.queues.sync_render_holds();'),
     'put-back-own-work': ('self.queues.hold_render_slot(slot);\n        result',
                           'let held = self.queues.render.entries[slot].as_ref().and_then(|entry| entry.pair.as_ref())'
                           '.is_some_and(|pair| pair.unreusable_work());\n        self.queues.admission.set_held(slot, held);\n        result'),
