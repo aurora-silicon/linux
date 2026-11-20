@@ -810,6 +810,61 @@ fn run(
         dev_info!(dev, "G16: 27.2 boot: no boot NOP, IMPORT_GLOBALS right after InitData\n");
         0
     };
+    if kind == hw::Start::MacOs27_2 && base == 0 {
+        // LAB lever 4 (J713-GPU2): IMPORT_GLOBALS + START in slots 0/1 behind ONE doorbell, so the
+        // firmware takes both in one wake (every record alone in slot 1 crashed it on 26B123).
+        let scheduler = init.control.as_ref().ok_or(EINVAL)?;
+        let scheduler_word = init.firmware_data().scheduler;
+        let pending = scheduler.r32(scheduler_word)?;
+        dev_info!(dev, "LAB: pair post: scheduler request {} pending before IMPORT_GLOBALS+START\n", pending);
+        if pending > 1 {
+            return Err(EBUSY);
+        }
+        if pending == 0 {
+            scheduler.w32(scheduler_word, 1)?;
+        }
+        regs::wmb();
+        channel::devctl_post_pair(session, channels, &DevCtl::op(devctl.import_globals), &DevCtl::op(devctl.start))?;
+        let t0 = Instant::<Monotonic>::now();
+        let mut last = (u32::MAX, u32::MAX);
+        loop {
+            channels.drain_rings(&dev, events)?;
+            session.check()?;
+            let (r, c) = (channels.devctl.read()?, channels.devctl.completion()?);
+            if (r, c) != last {
+                dev_info!(dev, "LAB: pair: read{} completion{} write{} ready{} halted{} scheduler{:#x} at {} us\n",
+                    r, c, channels.devctl.write()?, init.readiness()?, init.halted()? as u32,
+                    scheduler.r32(scheduler_word)?, t0.elapsed().as_micros_ceil());
+                last = (r, c);
+            }
+            if r == 2 && c == 2 {
+                break;
+            }
+            if t0.elapsed() > Delta::from_millis(3000) {
+                dev_err!(dev, "LAB: pair: timeout read{} completion{}\n", r, c);
+                return Err(ETIMEDOUT);
+            }
+            fsleep(Delta::from_micros(200));
+        }
+        wait_boot_control(session, channels, events, init, 2, 2000)?;
+        dev_info!(dev, "LAB: pair: both boot controls retired\n");
+        session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
+        for _ in 0..10 {
+            fsleep(Delta::from_millis(10));
+            channels.drain_rings(&dev, events)?;
+            session.check()?;
+            if init.readiness()? != 1 {
+                return Err(eproto());
+            }
+        }
+        if channels.devctl.read()? != 2 || channels.devctl.completion()? != 2 || channels.devctl.write()? != 2 {
+            channels.log_stop(session, init, "LAB pair: boot controls not settled after START");
+            return Err(EBUSY);
+        }
+        dev_info!(dev, "M4 firmware accepted owned initdata root{:#x} (LAB pair post); READY (scheduler {})\n",
+            root, scheduler.r32(scheduler_word)?);
+        return Ok(());
+    }
     devctl_op(session, channels, events, init, devctl.import_globals)?;
     wait_boot_control(session, channels, events, init, base + 1, 5000)?;
     let scheduler = init.control.as_ref().ok_or(EINVAL)?;

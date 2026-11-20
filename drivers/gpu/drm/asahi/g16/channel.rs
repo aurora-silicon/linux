@@ -277,6 +277,30 @@ impl Channels {
 /// with `wait`, waits for its consumption and completion. A firmware halted for recovery consumes
 /// nothing until the host's resume: EBUSY then, so the caller can answer the halt instead of
 /// timing out. Callers serialize (the device lock once the backend runs).
+/// LAB (J713-GPU2): post two device-control records behind ONE doorbell (slots p and p+1).
+pub(crate) fn devctl_post_pair(
+    session: &mut Session,
+    channels: &mut Channels,
+    a: &DevCtl,
+    b: &DevCtl,
+) -> Result {
+    let p = channels.devctl_producer;
+    if channels.devctl.read()? != p || channels.devctl.write()? != p {
+        return Err(super::boot::eproto());
+    }
+    let q = (p + 1) % RING_SLOTS;
+    let next = (p + 2) % RING_SLOTS;
+    channels.devctl.ring.write(p as usize * rings::DEVCTL_RECORD, &a.to_bytes())?;
+    channels.devctl.ring.write(q as usize * rings::DEVCTL_RECORD, &b.to_bytes())?;
+    wmb();
+    session.regs.set_generation(next)?;
+    channels.devctl.state.w32(STATE_WRITE, next)?;
+    wmb();
+    channels.devctl_producer = next;
+    session.send(hw::ep::DOORBELL, hw::engine::DEVCTL_DOORBELL)?;
+    Ok(())
+}
+
 pub(crate) fn devctl_submit(
     session: &mut Session,
     channels: &mut Channels,
