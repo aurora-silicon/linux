@@ -105,9 +105,8 @@ enum apple_clpc_rail {
  * @idle_on_time: sample every period even with no vote held, instead of
  *	from a deferrable timer
  * @low_power_khz: CPU frequency ceiling of the low-power platform profile,
- *	taken up to the next table frequency; 0 for no platform profile
- * @low_power_machine: the machine compatible @low_power_khz was read for; SoCs
- *	sharing this CLPC without it get no low-power profile. NULL for any
+ *	taken up to the next table frequency, for a machine whose CLPC node has
+ *	no apple,low-power-frequency-max-mhz; 0 for no platform profile then
  * @low_power_mw: package power (the SMC's PHPC key) the low-power profile
  *	holds the CPU clusters to; 0 for none
  * @high_power_machine: the machine compatible on which the performance
@@ -131,7 +130,6 @@ struct apple_clpc_hw {
 	const char *ane_cluster_machine;
 	bool idle_on_time;
 	unsigned int low_power_khz;
-	const char *low_power_machine;
 	unsigned int low_power_mw;
 	const char *high_power_machine;
 };
@@ -237,7 +235,10 @@ struct apple_clpc {
 	/* The platform profile and, for its power target, the SMC */
 	enum platform_profile_option profile;
 	bool low_power;
-	/* hw->low_power_khz where it applies to this machine, else 0 */
+	/*
+	 * The low-power ceiling: the CLPC node's apple,low-power-frequency-max-mhz,
+	 * else hw->low_power_khz; 0 for no low-power profile
+	 */
 	unsigned int low_power_khz;
 	struct device_node *smc_np;
 	struct apple_smc *smc;
@@ -1362,6 +1363,7 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	struct device_node *gpu = NULL;
 	struct apple_clpc *clpc;
 	unsigned int rail, i;
+	u32 mhz;
 	int ret;
 
 	clpc = devm_kzalloc(dev, sizeof(*clpc), GFP_KERNEL);
@@ -1499,7 +1501,10 @@ static int apple_clpc_probe(struct platform_device *pdev)
 
 	clpc->profile = PLATFORM_PROFILE_BALANCED;
 	clpc->power_next = jiffies;
-	if (!clpc->hw->low_power_machine || of_machine_is_compatible(clpc->hw->low_power_machine))
+	/* The machine's own ceiling, its ADT's cpu-low-power-frequency-max */
+	if (!of_property_read_u32(dev->of_node, "apple,low-power-frequency-max-mhz", &mhz))
+		clpc->low_power_khz = mhz * 1000;
+	else
 		clpc->low_power_khz = clpc->hw->low_power_khz;
 	if (clpc->low_power_khz && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
 		struct device *ppdev;
@@ -1659,13 +1664,13 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.ane_cluster_khz = 3756000,
 	.ane_cluster_machine = "apple,t6040",
 	/*
-	 * The M4 Max's ADT has macOS's Low Power mode CPU ceiling,
-	 * cpu-low-power-frequency-max = 2808 MHz, as T6050's does. macOS's package
-	 * target in that mode is not measured here, so the profile has the
-	 * ceiling only. The M4 Pro's value is not checked: not for it yet.
+	 * macOS's Low Power mode CPU ceiling is each machine's own, its ADT's
+	 * cpu-low-power-frequency-max: the boards' apple,low-power-frequency-max-mhz
+	 * (2616 MHz on the 14-inch J614s and J614c, 2808 MHz on the 16-inch J616s
+	 * and J616c). macOS's package target in that mode is not measured here,
+	 * so the profile has the ceiling only. A machine without the property
+	 * gets no low-power profile.
 	 */
-	.low_power_khz = 2808000,
-	.low_power_machine = "apple,t6041",
 };
 
 /*
@@ -2039,6 +2044,10 @@ static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
 	.sustain = 3,
 	.gpu_input = true,
 	.idle_on_time = true,
+	/*
+	 * The T6050 ADT's cpu-low-power-frequency-max, for the boards that don't
+	 * give their own in apple,low-power-frequency-max-mhz
+	 */
 	.low_power_khz = 2808000,
 	.low_power_mw = 15000,
 	/* High Power mode's record, as macOS 27.0 writes it on the 14-inch M5 Pro */
