@@ -46,9 +46,9 @@ pub(crate) mod tune {
     /// Host phase timers (the `prof:` statistics line) on.
     pub(crate) static PROF: AtomicU32 = AtomicU32::new(0);
     /// Renders of one VM in flight at most (1: a render runs alone).
-    pub(crate) static RENDER_FLIGHTS: AtomicU32 = AtomicU32::new(1);
+    pub(crate) static RENDER_FLIGHTS: AtomicU32 = AtomicU32::new(4);
     /// Each render allocator in its own hardware UMA slot (render arenas created later).
-    pub(crate) static RENDER_UMA_SPLIT: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static RENDER_UMA_SPLIT: AtomicU32 = AtomicU32::new(1);
     /// A queued render's TA waits for the previous FS with the predecessor hold (type 1).
     pub(crate) static RENDER_HOLD: AtomicU32 = AtomicU32::new(1);
     /// Jobs of a logical queue admitted to the engine at once (queues created later).
@@ -60,10 +60,12 @@ pub(crate) mod tune {
     /// one 32 MiB pool each (compute arenas created later).
     pub(crate) static COMPUTE_POOL_SHARE: AtomicU32 = AtomicU32::new(0);
     /// Pass slots (with render allocators) of render arenas created later.
-    pub(crate) static RENDER_SLOTS: AtomicU32 = AtomicU32::new(2);
+    pub(crate) static RENDER_SLOTS: AtomicU32 = AtomicU32::new(4);
     /// 2 MiB rows of each render allocator's UMA pool (render arenas created later; 16 = 32 MiB).
     pub(crate) static RENDER_POOL_ROWS: AtomicU32 = AtomicU32::new(16);
-    const NAMES: [(&str, &AtomicU32, u32, u32); 14] = [
+    /// A render takes the pass slot its predecessor used when that one is free again.
+    pub(crate) static RENDER_REUSE_LAST: AtomicU32 = AtomicU32::new(1);
+    const NAMES: [(&str, &AtomicU32, u32, u32); 15] = [
         ("compute_units", &COMPUTE_UNITS, 2, super::hw::sizes::COMPUTE_UNITS as u32),
         ("compute_flights", &COMPUTE_FLIGHTS, 1, super::hw::sizes::FLIGHTS as u32),
         ("resnap_us", &RESNAP_US, 0, 1000),
@@ -78,6 +80,7 @@ pub(crate) mod tune {
         ("compute_pool_share", &COMPUTE_POOL_SHARE, 0, 1),
         ("render_slots", &RENDER_SLOTS, 2, super::hw::sizes::RENDER_SLOTS as u32),
         ("render_pool_rows", &RENDER_POOL_ROWS, 3, 16),
+        ("render_reuse_last", &RENDER_REUSE_LAST, 0, 1),
     ];
 
     /// Applies one `name=value` line.
@@ -144,6 +147,13 @@ pub(crate) fn render_slots() -> usize {
 /// Whether new render arenas put each allocator in its own hardware UMA slot.
 pub(crate) fn render_uma_split() -> bool {
     tune::RENDER_UMA_SPLIT.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Whether a render takes the pass slot its predecessor used when that one is free again: with
+/// [`render_uma_split`] each pass slot's allocator has its own hardware UMA slot, and moving to
+/// another slot on every render costs about 60 us a render at depth 1 (M4, 2026-11-19).
+pub(crate) fn render_reuse_last() -> bool {
+    tune::RENDER_REUSE_LAST.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
 /// Whether a queued render's TA waits on the previous FS with the predecessor hold.

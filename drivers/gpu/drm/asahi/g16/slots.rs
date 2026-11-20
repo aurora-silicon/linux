@@ -555,18 +555,23 @@ impl Slots {
         split: bool,
     ) -> Option<usize> {
         let n = arena.passes.len().min(sizes::RENDER_SLOTS);
-        for i in 0..n {
-            let k = (self.pass_cursor as usize + i) % n;
+        let fits = |k: usize| {
             let p = &arena.passes[k];
-            if (self.pass_busy | picked) & (1 << k) == 0
+            (self.pass_busy | picked) & (1 << k) == 0
                 && self.pass_claimable(arena, k, split)
                 && geo.tpc_bytes <= p.tpc.size as u64
                 && geo.tilemap_bytes <= p.tilemap.size as u64
-            {
-                return Some(k);
+        };
+        // The slot the previous render took, once free again: its allocator's UMA slot stays
+        // the one the firmware last used (see `params::render_reuse_last`). Only split arenas
+        // may take a retired slot of their own back, so this changes nothing otherwise.
+        if split && n > 0 && super::params::render_reuse_last() {
+            let last = (self.pass_cursor as usize + n - 1) % n;
+            if fits(last) {
+                return Some(last);
             }
         }
-        None
+        (0..n).map(|i| (self.pass_cursor as usize + i) % n).find(|&k| fits(k))
     }
     pub(crate) fn claim_pass(
         &mut self,

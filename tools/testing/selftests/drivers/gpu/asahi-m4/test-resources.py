@@ -160,7 +160,7 @@ pub mod g16 {
     }
     pub mod boot {pub fn eproto()->crate::Error{crate::Error(71)}}
     // Arenas here have the two base units.
-    pub mod params {pub fn render_pool_rows()->u32{16}pub fn render_uma_split()->bool{false}pub fn compute_pool_share()->bool{false}pub fn compute_units()->usize{2}pub fn pb_heap_blocks()->u32{2048}pub fn pb_posted_blocks(heap:u32)->u32{heap}}
+    pub mod params {pub fn render_pool_rows()->u32{16}pub fn render_uma_split()->bool{false}pub fn render_reuse_last()->bool{true}pub fn compute_pool_share()->bool{false}pub fn compute_units()->usize{2}pub fn pb_heap_blocks()->u32{2048}pub fn pb_posted_blocks(heap:u32)->u32{heap}}
     pub struct Events{pub grow:crate::KVec<[u32;18]>}
     pub struct Firmware{pub pools:pools::Pools,pub events:Events}
     pub mod budget{__BUDGET__}
