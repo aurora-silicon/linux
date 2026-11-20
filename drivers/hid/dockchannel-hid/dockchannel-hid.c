@@ -29,9 +29,9 @@
 
 #define COMMAND_TIMEOUT_MS 1000
 #define START_TIMEOUT_MS 2000
-/* The MTP bootloader writes the 1.3 MB kiwi image over the touch IC SPI: seconds, not 1 s. */
-#define KIWI_CMD_TIMEOUT_MS 10000
-#define KIWI_START_TIMEOUT_MS 10000
+/* The MTP bootloader needs longer for a firmware image written over SPI. */
+#define PM2_CMD_TIMEOUT_MS 10000
+#define PM2_START_TIMEOUT_MS 10000
 
 #define MAX_INTERFACES 16
 #define MAX_IFACE_GPIOS 4
@@ -218,8 +218,8 @@ struct dockchannel_hid {
 	struct device_link *helper_link;
 	struct apple_smc *afe_smc;
 	bool stopping;
-	/* The kiwi firmware load is running: comm commands get the long timeout */
-	bool kiwi_loading;
+	/* Commands share the extended timeout during a power method 2 upload. */
+	bool slow_fw_loading;
 	bool inherited_mtp;
 	/* Between the system sleep suspend and resume callbacks */
 	bool suspended;
@@ -487,8 +487,8 @@ static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 	if (ret < 0)
 		goto done;
 
-	timeout_ms = READ_ONCE(iface->dchid->kiwi_loading) ?
-		     KIWI_CMD_TIMEOUT_MS : COMMAND_TIMEOUT_MS;
+	timeout_ms = READ_ONCE(iface->dchid->slow_fw_loading) ?
+		     PM2_CMD_TIMEOUT_MS : COMMAND_TIMEOUT_MS;
 	if (!wait_for_completion_timeout(&iface->out_complete, msecs_to_jiffies(timeout_ms))) {
 		dev_err(iface->dchid->dev, "output report 0x%x to iface  %d (%s) timed out\n",
 			report_id, iface->index, iface->name);
@@ -825,7 +825,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 {
 	void *fw;
 	size_t size;
-	bool kiwi_own;
+	bool own_lines;
 	int ret;
 
 	if (iface->starting) {
@@ -833,11 +833,10 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		return -EINPROGRESS;
 	}
 
-	/* Only a kiwi with a reset line of its own may power-cycle it; the AFE reset is shared. */
-	kiwi_own = !strcmp(iface->name, "kiwi") &&
-		   iface->power_method == DCHID_POWER_METHOD_2 &&
-		   !iface->firmware_managed_reset &&
-		   iface->reset != iface->dchid->afe_reset;
+	/* Only an interface with its own reset line may power-cycle it. */
+	own_lines = iface->power_method == DCHID_POWER_METHOD_2 &&
+		    !iface->firmware_managed_reset &&
+		    iface->reset != iface->dchid->afe_reset;
 
 	dev_dbg(iface->dchid->dev, "Starting interface %s\n", iface->name);
 
@@ -865,8 +864,8 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		 * before its firmware goes out (its reset line is active low
 		 * in the device tree).
 		 */
-		if (kiwi_own) {
-			WRITE_ONCE(iface->dchid->kiwi_loading, true);
+		if (own_lines) {
+			WRITE_ONCE(iface->dchid->slow_fw_loading, true);
 			ret = dchid_set_own_lines(iface, DCHID_POWER_STATE_OFF);
 			if (ret < 0)
 				goto err;
@@ -881,7 +880,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		dev_dbg(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
 		/* Retained MTP must see AFE reset throughout firmware upload. */
 		if (iface->dchid->inherited_mtp &&
-		    !kiwi_own &&
+		    !own_lines &&
 		    iface->power_method == DCHID_POWER_METHOD_2) {
 			if (iface->firmware_managed_reset) {
 				ret = -EINVAL;
@@ -905,7 +904,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 			 * The retained session is already off while reset is asserted;
 			 * kiwi always power-cycles its own lines.
 			 */
-			if (!iface->dchid->inherited_mtp || kiwi_own) {
+			if (!iface->dchid->inherited_mtp || own_lines) {
 				ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
 				if (ret < 0)
 					goto err;
@@ -921,13 +920,13 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		}
 	}
 
-	if (kiwi_own)
-		WRITE_ONCE(iface->dchid->kiwi_loading, false);
+	if (own_lines)
+		WRITE_ONCE(iface->dchid->slow_fw_loading, false);
 	return 0;
 
 err:
-	if (kiwi_own)
-		WRITE_ONCE(iface->dchid->kiwi_loading, false);
+	if (own_lines)
+		WRITE_ONCE(iface->dchid->slow_fw_loading, false);
 	iface->starting = false;
 	return ret;
 }
@@ -969,8 +968,8 @@ static int dchid_open(struct hid_device *hdev)
 		if (ret < 0)
 			return ret;
 
-		timeout_ms = !strcmp(iface->name, "kiwi") ?
-			     KIWI_START_TIMEOUT_MS : START_TIMEOUT_MS;
+		timeout_ms = iface->power_method == DCHID_POWER_METHOD_2 ?
+			     PM2_START_TIMEOUT_MS : START_TIMEOUT_MS;
 		if (!wait_for_completion_timeout(&iface->ready, msecs_to_jiffies(timeout_ms))) {
 			dev_err(iface->dchid->dev, "iface %s start timed out\n", iface->name);
 			return -ETIMEDOUT;
@@ -1137,6 +1136,7 @@ static void dchid_create_interface_work(struct work_struct *ws)
 	}
 
 	hid->dev.parent = iface->dchid->dev;
+	device_set_node(&hid->dev, of_fwnode_handle(iface->of_node));
 	hid->driver_data = iface;
 
 	iface->hid = hid;
