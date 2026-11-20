@@ -5905,6 +5905,20 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	 * 27.2 driving the mini's dcpext0 has to confirm the A4xx/A5xx IDs
 	 * before this is relied on.
 	 */
+	/*
+	 * The T8132 internal panel's processor on the macOS 27.2 stub, handed
+	 * over by the boot loader with the 26B123 image (see
+	 * apple_t8132_dcp_v27_2()): the firmware-27 backend with the 27.2
+	 * method table. That this image numbers its IOMFB methods as the
+	 * T6041 and T8142 26B123 images do is the same assumption the J773g
+	 * dcpext case below makes.
+	 */
+	if (apple_t8132_dcp_v27_2(dev->of_node)) {
+		/* Checked by apple_t8132_dcp_v27_2(). */
+		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		return dcp_v27_method_table(dev, compat_str);
+	}
+
 	if (apple_t8132_dcpext_v27_2(dev->of_node)) {
 		/* Checked by apple_t8132_dcpext_v27_2(). */
 		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
@@ -7086,6 +7100,23 @@ static int dcp_s2r_pm_register(struct apple_dcp *dcp);
  * No sleep support: neither a firmware-27 sleep nor a link release has run
  * on this processor.
  */
+/*
+ * T8132 internal display processor on firmware 27.2, admitted by
+ * dcp_check_firmware_version(), whatever hw data its compatible matched:
+ * - firmware_dma_bits 41: its firmware DART's window (apple,dma-range
+ *   <0x100 0 0x10 0>, 1 TiB + 64 GiB) takes 41 bits, as the dcpext's does.
+ * - num_dptx_ports 0: it drives the panel only.
+ * - adopt_live_session: iBoot leaves it running with the 27.2 image and the
+ *   panel lit; Linux never starts its CPU.
+ * No sleep support: no firmware-27 sleep has run on this processor.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8132_v27 = {
+	.firmware_dma_bits = 41,
+	.num_dptx_ports = 0,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_V_27_0,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext_v27 = {
 	.firmware_dma_bits = 41,
 	.num_dptx_ports = 2,
@@ -7272,6 +7303,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t8132-dcpext"))
 		dcp->hw = apple_dcp_hw_t8132_dcpext_v27;
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t8132-dcp"))
+		dcp->hw = apple_dcp_hw_t8132_v27;
 	/*
 	 * A SoC with derived power words is offered the stop only when asked for, and only on
 	 * firmware 27.0, whose calls are the ones that ran with them.
