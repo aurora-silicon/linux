@@ -559,7 +559,9 @@ impl SgSegments {
 ///
 /// VM operations may require allocating new GPUVA objects to track mappings.
 /// To avoid allocation failures during the operation, preallocate the
-/// maximum number of GPUVAs that might be needed.
+/// maximum number of GPUVAs that might be needed. They are charged to the
+/// memory cgroup of the task that asks for the operation: a GPUVA lasts as
+/// long as the mapping it records.
 struct VmOpResources {
     /// Preallocated GPUVA objects for remap operations.
     ///
@@ -579,9 +581,9 @@ impl VmOpResources {
     fn for_unmap() -> Result<Self> {
         Ok(Self {
             preallocated_gpuvas: [
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
             ],
         })
     }
@@ -3071,9 +3073,9 @@ impl Vm {
 
         let mut resources = VmOpResources {
             preallocated_gpuvas: [
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
             ],
         };
 
