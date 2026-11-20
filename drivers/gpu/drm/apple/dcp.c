@@ -9486,7 +9486,7 @@ static void dcp_dpms_power_off(struct apple_dcp *dcp)
 static bool dcp_j613_sleep_owned(struct apple_dcp *dcp)
 {
 	return IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) && dcp->fw_compat == DCP_FIRMWARE_V_26_6 &&
-	       !dcp->external && of_machine_is_compatible("apple,j613") &&
+	       !dcp->external &&
 	       apple_sleep_commit_stops_coprocs() && !apple_sleep_dry_run();
 }
 
