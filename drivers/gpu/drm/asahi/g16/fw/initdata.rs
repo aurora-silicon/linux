@@ -132,9 +132,8 @@ pub(crate) struct Layout {
     pub(crate) coredump_copy: Option<usize>,
 }
 
-/// Size of the host's crash copy buffer (`coredump-copy-buffer` in the 27.2 nub). The G14
-/// firmware-27.2 path (linux#2544) and the T6041 26B123 path (linux#1954) publish it at
-/// HW data +0xfa8 on hardware; macOS 27.2 hands the J773g firmware a buffer of this size.
+/// Size of the host's crash copy buffer (`coredump-copy-buffer` in the 27.2 nub); macOS 27.2
+/// hands the J773g firmware a buffer of this size on the crash-log endpoint.
 pub(crate) const COREDUMP_COPY_SIZE: u64 = 0x8000;
 
 impl Layout {
@@ -255,7 +254,13 @@ pub(crate) const V26B123: Layout = Layout {
         snapshot_entries: 448,
     },
     pstate_selectors: [0x8c, 0x90, 0x9c],
-    coredump_copy: Some(0xfa8),
+    // HW data +0xfa8 stays zero on G16G. Non-zero, it turns on the firmware's RTKit power
+    // path method (0x2c7a8 -> the auth pointer at DATA 0x8c0c8, TEXT 0x43e4c): on the J713 the
+    // firmware then faulted on resume at fw-text PA + 0x6f8, the start code's first fetch
+    // after MMU-on, as soon as a doorbell woke it. The T6041 build pairs 0x8000 there with a
+    // dedicated 0x8000 window at +0xfa0, where G16G keeps its RAM retention object; what macOS
+    // writes here on J773g is open (trace list).
+    coredump_copy: None,
 };
 
 /// Runs are ordered, disjoint and land inside an object of `size` bytes.
