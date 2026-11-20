@@ -2,7 +2,6 @@
 # Install the aurora custom/sep kernel and Touch ID on an Omarchy Mac.
 #
 #   curl -fsSL https://github.com/omacom/linux-aurora/releases/latest/download/install-aurora-sep.sh | bash
-#   ... | bash -s -- --read-only      install, but never let the driver write to the enclave
 #   ... | bash -s -- --uninstall      go back to the kernel this Mac had before
 #   ... | bash -s -- --reset-touchid  start Touch ID over: new keybag, enrol again
 #   ... | bash -s -- --m3-report      M3: write a bring-up report to attach to an issue (read-only)
@@ -203,6 +202,10 @@
 # waiting for a finger at lid close can't leave the sensor claimed), and
 # this Mac's own sensor calibration. After the reboot, run
 # aurora-touchid-setup to enrol a finger and use it for sudo and the lock screen.
+# SEP writes are always on: the driver provisions its identity keybag and writes
+# to the enclave's anti-replay store (xART) on the first boot. --read-only was
+# removed (aurora-silicon/linux#2591), and an install deletes the file an
+# earlier --read-only install left in /etc/modprobe.d.
 #
 # m1n1: one m1n1-aurora (M1N1_PACKAGE) for every Mac. It builds
 # AsahiLinux/m1n1 main (3e354a24), which knows the macOS 26.5 to 27.0 firmware
@@ -297,9 +300,13 @@ PIN_BEGIN="# >>> aurora-sep pin (remove with: install-aurora-sep.sh --uninstall)
 PIN_END="# <<< aurora-sep pin"
 STATE=/var/lib/aurora-sep
 FALLBACK_ID=aurora-sep-previous-kernel
-# Written only by --read-only; keeps the driver from writing to the enclave.
+# Written only by --read-only, which was removed: SEP writes are always on
+# (aurora-silicon/linux#2591). An install deletes the file that option wrote
+# (read_only_conf_cleanup), and --uninstall removes this path.
 MODPROBE_CONF=/etc/modprobe.d/aurora-sep.conf
-READ_ONLY=0
+# What --read-only wrote there: this first line, comments and the options line.
+READ_ONLY_CONF_HEADER="# aurora-sep --read-only:"
+READ_ONLY_CONF_OPTIONS="options apple_sep xart_writes=0 provision_keybag=0"
 DESKTOP_FIXES=0
 DESKTOP_FIXES_DATA=""
 DESKTOP_FIXES_PACKAGES=""
@@ -3655,12 +3662,50 @@ sep_block_line() {
   return 0
 }
 
-# With its defaults the driver provisions an identity keybag and writes to the
-# enclave's anti-replay store (xART) on the first boot of a Mac that has a
-# Touch ID profile -- no enrolment needed. That is the intended behaviour, but
-# the owner has to be able to opt out, and a block they already set must win.
+# Whether FILE is the one an earlier --read-only install wrote: its first line
+# is READ_ONLY_CONF_HEADER, and every other line is blank, a comment or
+# READ_ONLY_CONF_OPTIONS. Anything else there is the owner's own.
+read_only_conf_is_ours() { # FILE
+  local line first=1
+  [[ -f $1 && ! -L $1 && -r $1 ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    if ((first)); then
+      [[ $line == "$READ_ONLY_CONF_HEADER"* ]] || return 1
+      first=0
+      continue
+    fi
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    [[ -z $line || $line == \#* || $line == "$READ_ONLY_CONF_OPTIONS" ]] || return 1
+  done <"$1"
+  ((!first))
+}
+
+# --read-only was removed: SEP writes are always on (aurora-silicon/linux#2591).
+# The file an earlier --read-only install wrote goes, on an install, a re-run
+# and --reset-touchid: on a kernel from before #2591 it still kept the driver
+# from writing. Any other file at that path is the owner's and stays.
+read_only_conf_cleanup() {
+  [[ -e $MODPROBE_CONF || -L $MODPROBE_CONF ]] || return 0
+  if read_only_conf_is_ours "$MODPROBE_CONF"; then
+    $sudo rm -f -- "$MODPROBE_CONF" || die "could not remove $MODPROBE_CONF, left by an earlier --read-only install"
+    say "Removed $MODPROBE_CONF, left by an earlier --read-only install: SEP writes are always on (aurora-silicon/linux#2591)"
+  else
+    warn "$MODPROBE_CONF is not the file an earlier --read-only install wrote, so it stays as it is.
+    Kernels from aurora-silicon/linux#2591 on ignore xart_writes and provision_keybag
+    there: SEP writes are always on. Its other settings still apply."
+  fi
+  return 0
+}
+
+# The driver provisions an identity keybag and writes to the enclave's
+# anti-replay store (xART) on the first boot of a Mac that has a Touch ID
+# profile -- no enrolment needed. SEP writes are always on; the driver has no
+# switch that turns them off. An owner who does not want the driver loaded at
+# all blocks it in modprobe.d, and a block they already set must win.
 sep_policy() {
   local block
+  read_only_conf_cleanup
   block=$(sep_block_line)
   if [[ -n $block ]]; then
     warn "apple_sep is blocked on this Mac ($block).
@@ -3670,27 +3715,15 @@ sep_policy() {
     $sudo systemctl disable apple-sep.path apple-sep.service 2>/dev/null || true
     return 0
   fi
-  if (( READ_ONLY )); then
-    printf '%s\n' \
-      "# aurora-sep --read-only: the driver attaches and reports, but never writes" \
-      "# to the enclave. Delete this file to allow enrolment." \
-      "options apple_sep xart_writes=0 provision_keybag=0" |
-      $sudo tee "$MODPROBE_CONF" >/dev/null
-    say "Read-only: the SEP driver will attach but not write to the enclave ($MODPROBE_CONF)"
-  elif [[ -f $MODPROBE_CONF ]]; then
-    # Re-running to update must never quietly turn writes back on.
-    say "Still read-only from an earlier --read-only install; delete $MODPROBE_CONF to allow enrolment"
-  fi
   $sudo systemctl enable apple-sep.path apple-sep.service
 }
 
 sep_write_notice() {
-  (( READ_ONLY )) && return 0
-  [[ -f $MODPROBE_CONF || -n $(sep_block_line) ]] && return 0
+  [[ -n $(sep_block_line) ]] && return 0
   warn "on the first boot of a Mac with a Touch ID profile, the SEP driver creates
-    an identity keybag and writes to the enclave's anti-replay store. Use a Mac
-    you can DFU-restore. If you cannot, press Ctrl-C now and run with --read-only:
-      curl -fsSL $LATEST_URL | bash -s -- --read-only"
+    an identity keybag and writes to the enclave's anti-replay store (xART).
+    SEP writes are always on. Use a Mac you can DFU-restore; if you cannot,
+    press Ctrl-C now."
   return 0
 }
 
@@ -4218,7 +4251,6 @@ install_all() {
   release_source
   require_supported_soc
   if ((ESP_ARCHIVE_HISTORY)); then
-    ((!READ_ONLY)) || die "--archive-esp-history changes the EFI partition and cannot be combined with --read-only"
     esp_history_run archive
   fi
   neo_gpu_plan
@@ -4472,9 +4504,6 @@ install_all() {
     say "Done. Reboot: expect the desktop on the boot framebuffer. Touch ID is not supported
     on M3 yet. How to help bring this M3 further: step 11 of the test plan that the
     --agent-prompt command below prints."
-  elif [[ -f $MODPROBE_CONF ]]; then
-    say "Done, read-only. Reboot; the SEP driver will attach and report without writing."
-    echo "   Enrolling a finger needs writes: delete $MODPROBE_CONF, reboot, then run aurora-touchid-setup."
   else
     say "Done. Reboot, then run:  aurora-touchid-setup"
   fi
@@ -4684,8 +4713,6 @@ reset_touchid() {
     esac
   done
   grep -qa 'apple,' /proc/device-tree/compatible 2>/dev/null || die "this is not an Apple Silicon Mac"
-  [[ -f $MODPROBE_CONF ]] &&
-    die "this Mac was installed read-only ($MODPROBE_CONF): a new keybag needs enclave writes. Delete that file first if you mean to allow them."
   for f in "${TOUCHID_STATE_FILES[@]}"; do [[ -e $f ]] && found=1; done
   ((found)) || die "no Touch ID state on this Mac; nothing to reset"
 
@@ -4723,6 +4750,11 @@ reset_touchid() {
     read -r answer </dev/tty || true
     [[ $answer == RESET ]] || die "not reset"
   fi
+
+  # The new keybag needs enclave writes, which a kernel from before
+  # aurora-silicon/linux#2591 still left off under an earlier --read-only
+  # install's file. SEP writes are always on: that file goes.
+  read_only_conf_cleanup
 
   # Until the reboot nothing may touch the sensor: a match or enrolment would
   # write new state behind the move. The runtime mask goes away at boot. A
@@ -6406,12 +6438,11 @@ was not pinned down.
 SAFETY, NON-NEGOTIABLE
   - This touches the Secure Enclave. Confirm the owner can DFU-restore this Mac
     before you start.
-  - A default install is NOT read-only. On the first boot of a Mac with a
-    Touch ID profile, the SEP driver loads automatically, creates an identity
-    keybag and writes to the enclave's anti-replay store (xART) -- before
-    anyone enrols a finger. If the owner cannot DFU-restore, install with
-    --read-only instead, before the first reboot:
-      curl -fsSL https://github.com/omacom/linux-aurora/releases/latest/download/install-aurora-sep.sh | bash -s -- --read-only
+  - SEP writes are always on; there is no read-only install. On the first
+    boot of a Mac with a Touch ID profile, the SEP driver loads automatically,
+    creates an identity keybag and writes to the enclave's anti-replay store
+    (xART) -- before anyone enrols a finger. If the owner cannot DFU-restore,
+    do not install.
     A 'blacklist apple_sep' line does not prevent this on its own; the
     installer detects one and leaves the driver off.
   - Do not run any enrol/delete/re-provision loop unless the owner asks for
@@ -10859,11 +10890,12 @@ m3max_kit_runner() { # ACTION
 # Tests source this file for its functions only.
 if [[ ${AURORA_SEP_SOURCE_ONLY:-} == 1 ]]; then return 0; fi
 
-# --m3-handoff, --m3-gpu-experiment and --no-m3-mesa go with an install, alone, together or
-# with --read-only.
+# --m3-handoff, --m3-gpu-experiment and --no-m3-mesa go with an install, alone or together.
+# --read-only was removed: SEP writes are always on.
 args=()
 for a in "$@"; do
   case $a in
+    --read-only) die "--read-only was removed: SEP writes are always on (aurora-silicon/linux#2591)" ;;
     --archive-esp-history) ESP_ARCHIVE_HISTORY=1 ;;
     --neo-gpu) NEO_GPU=1 ;;
     --m3-handoff) M3_TRY=1 ;;
@@ -10882,23 +10914,23 @@ set -- "${args[@]}"
 if ((ESP_ARCHIVE_HISTORY)) && [[ -n ${1:-} ]]; then
   die "--archive-esp-history goes with an install; use --esp-history for a read-only inventory"
 fi
-if ((NEO_GPU)) && [[ -n ${1:-} && $1 != --read-only ]]; then
+if ((NEO_GPU)) && [[ -n ${1:-} ]]; then
   die "--neo-gpu goes with an install, not with $1"
 fi
 if ((M3_GPU_AUTO && M3_GPU_EXPLICIT_PROFILE)); then
   die "use --m3-gpu by itself to detect the profile, or choose one explicit GPU profile"
 fi
-if ((DESKTOP_FIXES)) && [[ -n ${1:-} && $1 != --read-only ]]; then
-  die "--desktop-fixes goes with an install (alone or with --read-only), not with $1"
+if ((DESKTOP_FIXES)) && [[ -n ${1:-} ]]; then
+  die "--desktop-fixes goes with an install, not with $1"
 fi
-if ((M3_TRY)) && [[ -n ${1:-} && $1 != --read-only ]]; then
-  die "--m3-handoff goes with an install (alone or with --read-only), not with $1"
+if ((M3_TRY)) && [[ -n ${1:-} ]]; then
+  die "--m3-handoff goes with an install, not with $1"
 fi
-if ((M3_GPU_EXPERIMENT || M3_GPU_PERSISTENT)) && [[ -n ${1:-} && $1 != --read-only ]]; then
-  die "M3 GPU options go with an install (alone, with --m3-handoff or with --read-only), not with $1"
+if ((M3_GPU_EXPERIMENT || M3_GPU_PERSISTENT)) && [[ -n ${1:-} ]]; then
+  die "M3 GPU options go with an install (alone or with --m3-handoff), not with $1"
 fi
-if ((!M3_PRO_MESA)) && [[ -n ${1:-} && $1 != --read-only ]]; then
-  die "--no-m3-mesa goes with an install (alone, with another install option or with --read-only), not with $1"
+if ((!M3_PRO_MESA)) && [[ -n ${1:-} ]]; then
+  die "--no-m3-mesa goes with an install (alone or with another install option), not with $1"
 fi
 # One option at a time; these commands take arguments of their own.
 if (($# > 1)) && [[ $1 != --reset-touchid && $1 != --m3-gpu-check && $1 != --m3max-kit && $1 != --m3max-kit-runner ]]; then
@@ -10908,7 +10940,6 @@ fi
 if preflight_needed "${1:-}"; then preflight; fi
 case ${1:-} in
   "") install_all ;;
-  --read-only) READ_ONLY=1; install_all ;;
   --uninstall) uninstall_all ;;
   --reset-touchid) shift; reset_touchid "$@" ;;
   --esp-history) esp_history_run report ;;
@@ -10921,5 +10952,5 @@ case ${1:-} in
   --m3max-kit-stop) m3max_kit_from_release --stop ;;
   --m3max-kit-restore) m3max_kit_from_release --restore ;;
   --agent-prompt) release_source >&2; prompt_notice; agent_prompt ;;
-  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --neo-gpu, --m3-handoff, --m3-gpu, --m3-gpu-check, --m3-gpu-experiment, --m3-gpu-persistent, --m3-profile=j613-25g83, --m3-profile=j615-25g83, --no-m3-mesa, --archive-esp-history, --esp-history, --desktop-fixes, --m3max-kit or --m3max-kit-status, -stop, -restore)" ;;
+  *) die "unknown option $1 (--uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --neo-gpu, --m3-handoff, --m3-gpu, --m3-gpu-check, --m3-gpu-experiment, --m3-gpu-persistent, --m3-profile=j613-25g83, --m3-profile=j615-25g83, --no-m3-mesa, --archive-esp-history, --esp-history, --desktop-fixes, --m3max-kit or --m3max-kit-status, -stop, -restore)" ;;
 esac
