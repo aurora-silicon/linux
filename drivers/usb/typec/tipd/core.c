@@ -2077,6 +2077,56 @@ int cd321x_sleep_events(struct tps6598x *tps, struct cd321x_sleep_state *st)
 }
 EXPORT_SYMBOL_GPL(cd321x_sleep_events);
 
+/**
+ * cd321x_wake_events - The first reads at the wake, as macOS makes them (J714s)
+ * @tps: The controller, just woken with its bus's wake command, still in S3
+ * @event: Its INT_EVENT1, which is cleared as read
+ * @status: Its status
+ * @data_status: Its data status
+ *
+ * At every wake macOS reads INT_EVENT1, writes the same bits, all CD321X_WAKE_EVENT_LEN bytes,
+ * to INT_CLEAR1 (even none), then reads the status registers, and only then switches the
+ * controller back to S0 (traced on the J714s). Nothing is applied here: the resume's
+ * revalidation reads the whole port state again. What the poll would have kept of these events
+ * is kept, as cd321x_sleep_events() keeps it: a plug event takes away the wake's quiet first read
+ * (see cd321x_connect()), a controller found reset is set up again by the resume, and a new
+ * DisplayPort status is noted for it. A liquid-detection result is read at the complete.
+ *
+ * Context: tps->lock held.
+ * Return: 0, or a negative error code.
+ */
+int cd321x_wake_events(struct tps6598x *tps, u8 event[CD321X_WAKE_EVENT_LEN], u32 *status,
+		       u32 *data_status)
+{
+	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	u64 low;
+	int ret;
+
+	lockdep_assert_held(&tps->lock);
+	ret = tps6598x_block_read(tps, TPS_REG_INT_EVENT1, event, CD321X_WAKE_EVENT_LEN);
+	if (!ret)
+		ret = tps6598x_block_write(tps, TPS_REG_INT_CLEAR1, event, CD321X_WAKE_EVENT_LEN);
+	if (ret)
+		return ret;
+	low = get_unaligned_le64(event);
+	if (low & APPLE_CD_REG_INT_PLUG_EVENT)
+		cd321x->sleep_plug = false;
+	cd321x_check_setup(cd321x, low);
+
+	ret = tps6598x_read32(tps, TPS_REG_STATUS, status);
+	if (ret)
+		return ret;
+	if (low & cd321x_irq_mask(tps) & SN201202X_INT_DP_SID_UPDATE) {
+		if (!tps->data->read_data_status(tps))
+			return -EIO;
+		cd321x_dp_sid_event(cd321x);
+		*data_status = tps->data_status;
+		return 0;
+	}
+	return tps6598x_read32(tps, TPS_REG_DATA_STATUS, data_status);
+}
+EXPORT_SYMBOL_GPL(cd321x_wake_events);
+
 static irqreturn_t cd321x_interrupt(int irq, void *data)
 {
 	struct tps6598x *tps = data;
@@ -4028,6 +4078,23 @@ int tipd_resume(struct tps6598x *tps)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(tipd_resume);
+
+/* The poll of a controller without an interrupt, stopped for the sleep's entry (J714s) */
+void tipd_poll_stop(struct tps6598x *tps)
+{
+	if (!tps->irq)
+		cancel_delayed_work_sync(&tps->wq_poll);
+}
+EXPORT_SYMBOL_GPL(tipd_poll_stop);
+
+/* ... and started again: a poll already queued, by tipd_resume() for one, stays as it is */
+void tipd_poll_start(struct tps6598x *tps)
+{
+	if (!tps->irq)
+		queue_delayed_work(system_power_efficient_wq, &tps->wq_poll,
+				   msecs_to_jiffies(POLL_INTERVAL));
+}
+EXPORT_SYMBOL_GPL(tipd_poll_start);
 
 /* Freezable cable work has drained before device PM calls prepare. */
 int tipd_prepare(struct device *dev)

@@ -524,6 +524,14 @@ struct sn201202x {
 	bool ldcm_mitigation_known;
 	/* A mitigation was requested since the controller's last reset */
 	bool ldcm_requested;
+	/* J714s: this sleep is entered and left as macOS does, see sn201202x_prepare() */
+	bool macos_sleep;
+	/* ... and the controller has been sent SLEEP at the prepare and not woken since */
+	bool entry_asleep;
+	/* ... and its suspend has run since: nothing sends SLEEP again before the wake */
+	bool entry_suspended;
+	/* Register accesses that reached it meanwhile */
+	unsigned int entry_strays;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
@@ -535,6 +543,8 @@ int tipd_prepare(struct device *dev);
 void tipd_complete(struct device *dev);
 int tipd_suspend(struct tps6598x *tps);
 int tipd_resume(struct tps6598x *tps);
+void tipd_poll_stop(struct tps6598x *tps);
+void tipd_poll_start(struct tps6598x *tps);
 
 /* Internal to tps6598x-core */
 int tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len);
@@ -548,6 +558,10 @@ struct cd321x_sleep_state {
 };
 
 int cd321x_sleep_events(struct tps6598x *tps, struct cd321x_sleep_state *st);
+/* INT_EVENT1 and INT_CLEAR1 as macOS reads and clears them at the wake: 13 bytes */
+#define CD321X_WAKE_EVENT_LEN	13
+int cd321x_wake_events(struct tps6598x *tps, u8 event[CD321X_WAKE_EVENT_LEN], u32 *status,
+		       u32 *data_status);
 void tipd_usb_wake(struct tps6598x *tps, bool asleep);
 int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
 			  size_t in_len, const u8 *in_data,
