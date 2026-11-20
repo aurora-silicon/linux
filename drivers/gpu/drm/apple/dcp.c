@@ -59,6 +59,7 @@
 
 #include "afk.h"
 #include "av.h"
+#include "cec.h"
 #include "dcp.h"
 #include "dcp-edr.h"
 #include "dcp-panel-adt.h"
@@ -4396,6 +4397,19 @@ static int dcp_start_desktop_external(struct apple_dcp *dcp, u32 map)
 			d->graph_started |= BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20);
 	}
 #endif
+#if IS_ENABLED(CONFIG_DRM_APPLE_CEC)
+	if (IS_ERR_OR_NULL(dcp->avep) &&
+	    dcp->fixed_connector_type == DRM_MODE_CONNECTOR_HDMIA &&
+	    (map & BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20))) {
+		ret = dcp_cec_init_avep(dcp);
+		if (ret)
+			dcp_desktop_graph_skip(dcp, AV_AUDIO_ENDPOINT_DESKTOP,
+					       "CEC", "CEC init failed", ret);
+		else if (dcp->avep)
+			d->graph_started |= BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20);
+	}
+	dcp_cec_register(dcp);
+#endif
 	ret = dcp_desktop_start_ext_ep(dcp, map, DPTX_HDCP_ENDPOINT,
 				       "DPTXHDCP");
 	if (ret)
@@ -4727,6 +4741,17 @@ int dcp_start(struct platform_device *pdev)
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start AV endpoint: %d", ret);
 		ret = 0;
+	}
+#endif
+#if IS_ENABLED(CONFIG_DRM_APPLE_CEC)
+	if (!dcp_is_ext26(dcp) && !dcp->external_native) {
+		if (IS_ERR_OR_NULL(dcp->avep)) {
+			ret = dcp_cec_init_avep(dcp);
+			if (ret)
+				dev_warn(dcp->dev, "Failed to start AV CEC endpoint: %d\n", ret);
+			ret = 0;
+		}
+		dcp_cec_register(dcp);
 	}
 #endif
 
@@ -6025,6 +6050,7 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	disable_delayed_work_sync(&dcp->announce_wq);
 	cancel_work_sync(&dcp->external_stop_work);
 	cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
+	dcp_hdmi_disable(dcp);
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
 	disable_delayed_work_sync(&dcp->link_recovery_wq);
@@ -6035,7 +6061,6 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 		dcp->tb_event_generation = 0;
 	}
 	disable_delayed_work_sync(&dcp->hybrid_wq);
-	dcp_hdmi_disable(dcp);
 }
 
 VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
@@ -6666,6 +6691,9 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 	 */
 	if (dcp->external_native)
 		disable_work_sync(&dcp->external_audio_work);
+#if IS_ENABLED(CONFIG_DRM_APPLE_CEC)
+	dcp_cec_unregister(dcp);
+#endif
 	av_audiosrv_quiesce(dcp);
 	if (READ_ONCE(dcp->ext_dead))
 		return;

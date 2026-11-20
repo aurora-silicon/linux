@@ -502,6 +502,12 @@ static bool dcp_v27_ext_busy(struct apple_dcp *dcp, char *what, size_t len)
 		strscpy(what, "hotplug work", len);
 		return true;
 	}
+#if IS_ENABLED(CONFIG_DRM_APPLE_CEC)
+	if (dcp_cec_busy(dcp)) {
+		strscpy(what, "CEC work", len);
+		return true;
+	}
+#endif
 	if (!apple_rtkit_v27_rx_drained(dcp->rtk)) {
 		strscpy(what, "messages from the processor", len);
 		return true;
@@ -941,9 +947,7 @@ static const struct apple_epic_service_ops dcp_v27_ext_av_services[] = {
 	{ .name = "dcpav-audio-interface-epic", .compact_full = "dcpav-audio-interface-epic:0",
 	  .singleton = true, .init = dcp_v27_ext_service_init,
 	  .teardown = dcp_v27_ext_av_teardown },
-	{ .name = "dcpav-cec-interface-epic", .compact_full = "dcpav-cec-interface-epic:0",
-	  .singleton = true, .init = dcp_v27_ext_service_init,
-	  .teardown = dcp_v27_ext_av_teardown },
+	DCP_CEC_COMPACT_SERVICE_OPS,
 	{},
 };
 
