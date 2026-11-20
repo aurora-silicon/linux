@@ -331,15 +331,22 @@ impl CommandPool {
 
     /// Retirement: advance slot `i`'s cursor to the value the firmware recorded at
     /// tracking +0xc, so its retirement scan unlinks the slot from the queue's list.
-    pub(crate) fn retire(&self, i: usize) -> Result {
+    ///
+    /// The firmware records +0xc in its post-processing, which can run after the queue's
+    /// retired position has advanced. Until then +0xc reads 0 (the slot is cleared for each
+    /// use) and nothing is written: the cursor would stay behind and the firmware would keep
+    /// the slot linked for good. Returns whether the cursor was advanced; the caller retries a
+    /// slot that returned `false` on the firmware's next notification.
+    pub(crate) fn retire(&self, i: usize) -> Result<bool> {
         if i >= POOL_SLOTS { return Err(EINVAL); }
         crate::pgtable::clean_invalidate_poc(self.tracking.as_slice()[i * 0x100..].as_ptr(), 0x100);
         crate::pgtable::poc_barrier();
         let expected = self.tracking.shared_index(i * 0x100 + 0xc)?.load(Ordering::Acquire);
+        if expected == 0 { return Ok(false); }
         self.cursors.shared_index(i * 0x40)?.store(expected, Ordering::Release);
         crate::pgtable::clean_poc(self.cursors.as_slice()[i * 0x40..].as_ptr(), 0x40);
         crate::pgtable::poc_barrier();
-        Ok(())
+        Ok(true)
     }
 
     /// Whether the firmware still holds slot `i` in the queue's tracking list (+0x94).

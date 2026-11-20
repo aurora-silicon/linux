@@ -325,6 +325,11 @@ struct State {
     busy: u64,
     /// Free slots passed over because the firmware still held them.
     skipped: u64,
+    /// Retired slots whose cursor is not advanced yet: the firmware had not recorded the
+    /// value to advance it to (`CommandPool::retire`). One bit each.
+    unacked: u64,
+    /// Retirements whose cursor had to wait for the firmware's record.
+    deferred: u64,
     retired_total: u64,
     retired_raw: u32,
     capacity: u32,
@@ -419,12 +424,31 @@ impl Runtime {
         }
     }
 
+    /// Advances the cursors of retired slots that were waiting for the firmware's record.
+    fn acknowledge(&self, state: &mut State) {
+        let mut pending = state.unacked;
+        while pending != 0 {
+            let slot = pending.trailing_zeros() as usize;
+            pending &= pending - 1;
+            match state.pool.retire(slot) {
+                Ok(false) => {}
+                Ok(true) => state.unacked &= !(1 << slot),
+                Err(e) => {
+                    dev_err!(self.dev, "GPU: tracking retirement failed {:?}\n", e);
+                    state.unacked &= !(1 << slot);
+                }
+            }
+        }
+    }
+
     /// Publishes pending commands while pool slots are free.
     fn pump(&self, state: &mut State) {
+        self.acknowledge(state);
         while state.inflight.len() < POOL_SLOTS - 1 && !state.pending.is_empty() {
             // A slot is reused only once the firmware has unlinked it from its tracking list
-            // (+0x94). It normally has by the time the pool comes round to it, but the firmware
-            // can link a retired slot again and keep it; take the next free slot instead.
+            // (+0x94), which its retirement scan does after the slot's cursor is advanced.
+            // Slots retire in order but are unlinked whenever the scan runs; take the next
+            // free slot that is unlinked.
             let mut chosen = None;
             for k in 0..POOL_SLOTS {
                 let slot = (state.next_slot + k) % POOL_SLOTS;
@@ -447,6 +471,8 @@ impl Runtime {
             };
             state.next_slot = slot;
             state.waiting_unlink = false;
+            // Unlinked already: its cursor needs no further advance.
+            state.unacked &= !(1 << slot);
             let (packet, index) = (state.pending[0].0.clone(), state.pending[0].1);
             let Command::Compute(control) = packet.commands[index] else {
                 // Queues of this backend accept only compute commands (Queue::submit).
@@ -550,8 +576,15 @@ impl Runtime {
             let front = &state.inflight[0];
             if state.retired_total >= front.ordinal {
                 if let Ok(done) = state.inflight.remove(0) {
-                    if let Err(e) = state.pool.retire(done.slot) {
-                        dev_err!(self.dev, "GPU: tracking retirement failed {:?}\n", e);
+                    match state.pool.retire(done.slot) {
+                        Ok(true) => {}
+                        // The firmware has not recorded the cursor value yet; `acknowledge`
+                        // retries on its next notification.
+                        Ok(false) => {
+                            state.unacked |= 1 << done.slot;
+                            state.deferred += 1;
+                        }
+                        Err(e) => dev_err!(self.dev, "GPU: tracking retirement failed {:?}\n", e),
                     }
                     state.busy &= !(1 << done.slot);
                     state.retired += 1;
@@ -603,9 +636,9 @@ impl Runtime {
             kernel::error::to_result(unsafe { kernel::bindings::apple_rtkit_poweroff(state.peer.as_raw()) })
         });
         state.asc.halt();
-        dev_info!(self.dev, "GPU stopped: allow-off={:?} running={:?} forced-off={:?} submitted={} completed={} notifications={} late={} skipped-slots={}\n",
+        dev_info!(self.dev, "GPU stopped: allow-off={:?} running={:?} forced-off={:?} submitted={} completed={} notifications={} late={} skipped-slots={} deferred-cursors={}\n",
                   allowed, running, forced, state.submitted, state.retired,
-                  self.notify.messages.load(Ordering::Relaxed), state.late, state.skipped);
+                  self.notify.messages.load(Ordering::Relaxed), state.late, state.skipped, state.deferred);
         if running != Ok(0) && forced != Some(Ok(())) {
             dev_err!(self.dev, "GPU firmware did not stop; a reset is required\n");
         }
@@ -692,6 +725,8 @@ impl Backend {
             late: 0,
             busy: 0,
             skipped: 0,
+            unacked: 0,
+            deferred: 0,
             retired_total: 0,
             retired_raw: head,
             capacity,
