@@ -54,7 +54,7 @@ pub(crate) type Event = slotalloc::Guard<EventInner>;
 pub(crate) struct EventValue(u32);
 
 impl EventValue {
-    #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     pub(crate) fn raw(self) -> u32 {
         self.0
     }
@@ -205,7 +205,7 @@ impl EventManager {
     }
 
     /// Reserve the normal stamp pair for a kernel queue that polls its own completion.
-    #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     pub(crate) fn try_get_polled(&self) -> Result<Event> {
         self.alloc.try_get(None)
     }

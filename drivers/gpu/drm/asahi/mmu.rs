@@ -4523,13 +4523,13 @@ mod execution_context_tests {
 }
 
 /// The word GPU firmware 27.2 on G14 exchanges through the handoff region's magic fields.
-#[cfg(CONFIG_DRM_ASAHI_G15)]
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 const MAGIC_G14_V27_2: u64 = 0x4b1d000000000003;
 
 /// The loader's UAT regions as GPU firmware 27.2 on G14 uses them. The driver mirrors its
 /// kernel window into the firmware's shared second-level table and names its own trees in
 /// TTBAT context 0 before the ASC starts.
-#[cfg(CONFIG_DRM_ASAHI_G15)]
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 pub(crate) struct FirmwareWindow {
     handoff: UatRegion,
     ttbs: UatRegion,
@@ -4540,7 +4540,7 @@ pub(crate) struct FirmwareWindow {
     pa_mask: u64,
 }
 
-#[cfg(CONFIG_DRM_ASAHI_G15)]
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 impl FirmwareWindow {
     /// Maps the four regions. Fails with `EBUSY` unless the handoff is idle and the shared
     /// table and context 0 are empty.

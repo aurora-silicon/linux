@@ -123,7 +123,7 @@ pub(crate) struct PowerZone {
 }
 
 /// Base of a window in the firmware 27.2 register table.
-#[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum RegisterBaseV27_2 {
     /// A fixed physical address.
@@ -133,7 +133,7 @@ pub(crate) enum RegisterBaseV27_2 {
 }
 
 /// One record of the firmware 27.2 register table: 60 slots, each naming one window.
-#[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct RegisterV27_2 {
     pub(crate) slot: usize,
