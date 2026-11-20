@@ -581,3 +581,8 @@
 			<&ps_atc2_cio_usb>, <&ps_atc2_cio_auss>, <&ps_atc2_pcie>;
 	apple,pcie-tunnel = <&acio2_pcie_tunnel>;
 };
+
+/* This MacBook Pro offers macOS's High Power mode. */
+&clpc {
+	apple,high-power-mode;
+};
