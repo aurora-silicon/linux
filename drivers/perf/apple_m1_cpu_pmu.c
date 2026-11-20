@@ -273,6 +273,24 @@ static const unsigned int t6050_pmu_perf_map[PERF_COUNT_HW_MAX] = {
 	[PERF_COUNT_HW_BRANCH_MISSES]		= T6050_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC,
 };
 
+/*
+ * The generic L1D read-miss event, for in-kernel users such as the
+ * scheduler: the same counter as each core's l1d-load-misses event.
+ */
+static const unsigned int t6050_pmu_cache_map[PERF_COUNT_HW_CACHE_MAX]
+					     [PERF_COUNT_HW_CACHE_OP_MAX]
+					     [PERF_COUNT_HW_CACHE_RESULT_MAX] = {
+	PERF_CACHE_MAP_ALL_UNSUPPORTED,
+	[C(L1D)][C(OP_READ)][C(RESULT_MISS)]	= T6050_PMU_PERFCTR_L1D_CACHE_MISS_LD,
+};
+
+static const unsigned int m4_pmu_cache_map[PERF_COUNT_HW_CACHE_MAX]
+					  [PERF_COUNT_HW_CACHE_OP_MAX]
+					  [PERF_COUNT_HW_CACHE_RESULT_MAX] = {
+	PERF_CACHE_MAP_ALL_UNSUPPORTED,
+	[C(L1D)][C(OP_READ)][C(RESULT_MISS)]	= M4_PMU_PERFCTR_L1D_CACHE_MISS_LD,
+};
+
 static const unsigned int m4_pmu_perf_map[PERF_COUNT_HW_MAX] = {
 	PERF_MAP_ALL_UNSUPPORTED,
 	[PERF_COUNT_HW_CPU_CYCLES]		= M4_PMU_PERFCTR_CORE_ACTIVE_CYCLE,
@@ -806,13 +824,15 @@ static int m4_pmu_map_event(struct perf_event *event)
 {
 	/* 64bit counters, overflow flag on bit 63, as on M2. */
 	event->hw.flags |= ARMPMU_EVT_63BIT;
-	return armpmu_map_event(event, &m4_pmu_perf_map, NULL, M4_PMU_CFG_EVENT);
+	return armpmu_map_event(event, &m4_pmu_perf_map, &m4_pmu_cache_map,
+				M4_PMU_CFG_EVENT);
 }
 
 static int t6050_pmu_map_event(struct perf_event *event)
 {
 	event->hw.flags |= ARMPMU_EVT_63BIT;
-	return armpmu_map_event(event, &t6050_pmu_perf_map, NULL, M4_PMU_CFG_EVENT);
+	return armpmu_map_event(event, &t6050_pmu_perf_map, &t6050_pmu_cache_map,
+				M4_PMU_CFG_EVENT);
 }
 
 static int __m1_pmu_map_pmuv3_event(const u16 *map, unsigned int eventsel)
