@@ -118,6 +118,7 @@ struct apple_qspi_board {
 #define APPLE_QSPI_JEDEC_W25Q16		{ 0xef, 0x65, 0x15 }
 #define APPLE_QSPI_JEDEC_MX_2B27	{ 0xc2, 0x2b, 0x27 }
 #define APPLE_QSPI_JEDEC_GD25UF16E	{ 0xc8, 0x83, 0x15 }
+#define APPLE_QSPI_JEDEC_GD25UF64E	{ 0xc8, 0x83, 0x17 }
 
 static const struct apple_qspi_board apple_qspi_boards[] = {
 	{ "apple,t8122-qspi", "apple,j613", 0x2a1118000ULL,
@@ -128,8 +129,8 @@ static const struct apple_qspi_board apple_qspi_boards[] = {
 	{ "apple,t8132-qspi", "apple,j715", 0x3ad118000ULL,
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
 	/*
-	 * The J773g ADT has the same nvram; the J604's dump omits it and the
-	 * iMacs have no ADT yet. All are assumed to carry the J713's part.
+	 * The J604's dump omits the nvram and the iMacs have no ADT yet, so
+	 * they are assumed to carry the J713's part.
 	 */
 	{ "apple,t8132-qspi", "apple,j604", 0x3ad118000ULL,
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
@@ -137,8 +138,14 @@ static const struct apple_qspi_board apple_qspi_boards[] = {
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
 	{ "apple,t8132-qspi", "apple,j624", 0x3ad118000ULL,
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
+	/*
+	 * The J773g ADT has the J713's nvram. A J773g reads a GigaDevice
+	 * GD25UF64E with no block protection set (SR1 0x00, SR2 0x02: QE
+	 * only); others may carry the J713's part.
+	 */
 	{ "apple,t8132-qspi", "apple,j773g", 0x3ad118000ULL,
-	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
+	  0x700000, 0x100000, APPLE_QSPI_JEDEC_GD25UF64E, 0,
+	  APPLE_QSPI_JEDEC_W25Q64 },
 	/* Macronix is the ID macOS reports; a J616s also reads W25Q64 on the bus. */
 	{ "apple,t6041-qspi", "apple,j616s", 0x429118000ULL,
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_MX_2B27, 0,
