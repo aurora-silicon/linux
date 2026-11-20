@@ -13,6 +13,7 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
+#include <linux/hrtimer.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
@@ -48,6 +49,8 @@
 #define APR_MAX_H		8192
 #define APR_TIMEOUT_MS		1000
 #define APR_POLL_MS		4
+/* Completion poll for an engine whose interrupt never arrives. */
+#define APR_FAST_POLL_US	100
 #define APR_AUTOSUSPEND_MS	500
 
 struct apr_fmt {
@@ -881,8 +884,10 @@ struct apr_dev {
 	u32 head;		/* next free ring offset */
 	bool ring_ready;	/* engine registers programmed since power-up */
 	bool broken;		/* timed out with no way to reset */
+	bool irq_missing;	/* a job finished without its interrupt */
 	unsigned long started;	/* jiffies at submission */
 	struct delayed_work watchdog;
+	struct hrtimer poll;	/* completion poll while irq_missing */
 };
 
 struct apr_ctx {
@@ -942,9 +947,22 @@ static void apr_hw_init(struct apr_dev *apr)
 			  apr->num_tunables[APRI_CONTROL_BLOCK]);
 	apr_apply(apr->regs, apr->tunables[APRI_CORE_BLOCK],
 		  apr->num_tunables[APRI_CORE_BLOCK]);
-	if (apr->wrapper)
+	if (apr->wrapper) {
 		apr_apply(apr->wrapper, apr->tunables[APRI_WRAPPER_BLOCK],
 			  apr->num_tunables[APRI_WRAPPER_BLOCK]);
+		/*
+		 * A wrapper outside the SCODEC block (no aux window: T6041's
+		 * apr1) reads back 0 after one pass in rows that come before
+		 * 0xc00 in the table (0x338-0x350, 0x430-0x448, 0x948, 0xa50),
+		 * and 0xc00 itself reads 0xf instead of 0x7fffffff. Apply the
+		 * rows a second time so a row that only takes once a later
+		 * row is set gets written again. The values are the same, so
+		 * a wrapper that took them the first time is unchanged.
+		 */
+		if (!apr->aux)
+			apr_apply(apr->wrapper, apr->tunables[APRI_WRAPPER_BLOCK],
+				  apr->num_tunables[APRI_WRAPPER_BLOCK]);
+	}
 	apr_write(apr, APR_REG_RING_HEAD, 0);
 	apr_write(apr, APR_REG_RING_TAIL, 0);
 	apr_write(apr, APR_REG_RING_SIZE, v->ring_bytes);
@@ -1138,6 +1156,34 @@ static irqreturn_t apr_irq(int irq, void *data)
 }
 
 /*
+ * Runs in hard interrupt context like apr_irq(). Used only once a job has
+ * finished without its interrupt, so such an engine is not held to the
+ * watchdog's jiffy-granular poll.
+ */
+static enum hrtimer_restart apr_poll(struct hrtimer *t)
+{
+	struct apr_dev *apr = container_of(t, struct apr_dev, poll);
+	struct apr_ctx *ctx;
+	unsigned long flags;
+	bool active;
+	int err = 0;
+
+	spin_lock_irqsave(&apr->hw_lock, flags);
+	ctx = apr_take_done(apr, &err);
+	active = apr->active;
+	spin_unlock_irqrestore(&apr->hw_lock, flags);
+	if (ctx) {
+		cancel_delayed_work(&apr->watchdog);
+		apr_finish_job(apr, ctx, err);
+		return HRTIMER_NORESTART;
+	}
+	if (!active)
+		return HRTIMER_NORESTART;
+	hrtimer_forward_now(t, us_to_ktime(APR_FAST_POLL_US));
+	return HRTIMER_RESTART;
+}
+
+/*
  * Backstop for a lost interrupt and for hangs. A hung engine is reset
  * through its power domain and reprogrammed; without a reset line the
  * device refuses further jobs rather than reuse memory it may still own.
@@ -1152,8 +1198,11 @@ static void apr_watchdog(struct work_struct *work)
 	spin_lock_irqsave(&apr->hw_lock, flags);
 	ctx = apr_take_done(apr, &err);
 	if (ctx) {
+		apr->irq_missing = true;
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
-		dev_warn_once(apr->dev, "completion found without an interrupt\n");
+		dev_warn_once(apr->dev,
+			      "completion found without an interrupt, polling every %u us\n",
+			      APR_FAST_POLL_US);
 		apr_finish_job(apr, ctx, err);
 		return;
 	}
@@ -1238,6 +1287,9 @@ static void apr_device_run(void *priv)
 	/* Descriptor and buffers must be visible before the head moves. */
 	dma_wmb();
 	writel(apr->head, apr->regs + APR_REG_RING_HEAD);
+	if (apr->irq_missing)
+		hrtimer_start(&apr->poll, us_to_ktime(APR_FAST_POLL_US),
+			      HRTIMER_MODE_REL);
 	spin_unlock_irqrestore(&apr->hw_lock, flags);
 	schedule_delayed_work(&apr->watchdog, msecs_to_jiffies(APR_POLL_MS));
 }
@@ -1717,6 +1769,7 @@ static void apr_cleanup(void *data)
 {
 	struct apr_dev *apr = data;
 
+	hrtimer_cancel(&apr->poll);
 	cancel_delayed_work_sync(&apr->watchdog);
 	if (apr->m2m_dev)
 		v4l2_m2m_release(apr->m2m_dev);
@@ -1801,6 +1854,7 @@ static int apr_probe(struct platform_device *pdev)
 	mutex_init(&apr->vdev_lock);
 	spin_lock_init(&apr->hw_lock);
 	INIT_DELAYED_WORK(&apr->watchdog, apr_watchdog);
+	hrtimer_setup(&apr->poll, apr_poll, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	platform_set_drvdata(pdev, apr);
 
 	for (i = 0; i < apr->variant->num_regs; i++) {
