@@ -69,6 +69,13 @@ properties:
       apple,no-data-below-millicelsius adds no channel; that child supplies
       the zone, and its readings below the threshold are left out of it.
 
+  apple,soc-die-keys-complete:
+    type: boolean
+    description:
+      The firmware of this board provides every key in apple,soc-die-keys.
+      The macsmc_soc_die thermal zone is then registered only when all listed
+      keys are found, instead of skipping absent keys.
+
   apple,thermal-pressure-key:
     $ref: /schemas/types.yaml#/definitions/string
     pattern: "^[A-Za-z0-9]{4}$"
