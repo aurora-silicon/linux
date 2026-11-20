@@ -593,6 +593,30 @@ def bounce(root):
              'static void dcp_relink_link_up(int *s, u64 generation, unsigned long now)\n'
              '{ assert(!h17p); (void)s; (void)generation; (void)now; }')
     swap('int main(void)\n{', 'static int __attribute__((unused)) prior_main(void)\n{')
+    fabric = root / 'drivers/gpu/drm/apple'
+    effects = (fabric / 'dcp-fabric-effects.h').read_text()
+    core = (fabric / 'dcp-fabric-core.c').read_text()
+    core_header = (fabric / 'dcp-fabric-core.h').read_text()
+    queue_attach = apple_function(root, 'dcp_typec_attach_reconnect')
+    if queue_attach:
+        unit += ('\n#define dcp_queue_typec_reconnect_locked dcp_queue_typec_reconnect\n' +
+                 queue_attach)
+    swap('static void __attribute__((unused)) dcp_queue_typec_reconnect(struct apple_dcp *d, unsigned long delay)\n'
+         '{ (void)d; (void)delay; assert(!"Type-C session reconnect for H17P"); }',
+         'static u64 queued_generation;\n'
+         'static void dcp_queue_typec_reconnect(struct apple_dcp *d, unsigned long delay)\n'
+         '{ assert(!delay && d->typec_cable_connected); queued_generation = d->typec_generation;'
+         ' d->typec_reconnect_wq.work.pending = true; }')
+    attach = (block(core_header, 'enum dcp_fabric_attach_action {') + ';\n' +
+              block(core, 'enum dcp_fabric_attach_action dcp_fabric_attach_action(') + '\n' +
+              block(effects, 'struct dcp_fabric_attach_ops {') + ';\n' +
+              block(effects, 'static inline int dcp_fabric_run_attach(') + '\n' + r'''
+struct dcp_tb_attach_context { struct { struct apple_dcp *dcp; } *best; };
+static int admit_tunnel(void *data) { (void)data; return 0; }
+static void reject_path(void *data) { (void)data; assert(!"unexpected attach path"); }
+static void claim_tunnel(void *data) { (void)data; display.typec_cable_connected = true; }
+static bool attach_from_work(void *data) { (void)data; return true; }
+''' + apple_function(root, 'dcp_tb_queue_reconnect'))
     firmware = r'''
 typedef uint8_t u8;
 #define dev_dbg(...) ((void)0)
@@ -742,6 +766,26 @@ int main(void)
   CHECK(dcp_dptx_connect_raw(&display, 0, NULL, NULL, false, false) == 0);
   CHECK(releases == before && connects == connected);
  }
+ /* The external fabric action queues work for a new tunnel despite the lost unplug. */
+ init(); display.phy = (void *)1; link_trains = fw_display = fw_hpd = true;
+ connects = 0;
+ display.dptxport[0].connected_generation = display.typec_generation;
+ struct dcp_tb_attach_context ctx;
+ __typeof__(*ctx.best) route = { .dcp = &display };
+ ctx.best = &route;
+ const struct dcp_fabric_attach_ops tunnel_ops = {
+  .candidate = admit_tunnel, .activate = admit_tunnel, .rollback = reject_path,
+  .claim = claim_tunnel, .external = attach_from_work,
+  .queue_reconnect = dcp_tb_queue_reconnect, .connect_oob = reject_path,
+ };
+ CHECK(dcp_fabric_run_attach(&tunnel_ops, &ctx) == 0);
+ CHECK(display.typec_reconnect_wq.work.pending && releases == 0 && connects == 0);
+ CHECK(queued_generation > display.dptxport[0].connected_generation);
+ CHECK(dcp_dptx_connect_raw(&display, 0, NULL, NULL, false, false) == 0);
+ CHECK(releases == 1 && connects == 1);
+ CHECK(display.dptxport[0].connected_generation == queued_generation && fw_display);
+ CHECK(dcp_dptx_connect_raw(&display, 0, NULL, NULL, false, false) == 0);
+ CHECK(releases == 1 && connects == 1);
  h17p = true;
  /* An old display that will not release fails the connect and stays attached: nothing new is started on it. */
  bounced(); link_trains = true;
@@ -825,7 +869,7 @@ int main(void)
     clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
     if clock in unit:
         firmware = firmware.replace(clock, '')
-    return unit + firmware + raw + '\n' + tests
+    return unit + firmware + raw + '\n' + attach + tests
 
 
 def poweroff_replug(root):

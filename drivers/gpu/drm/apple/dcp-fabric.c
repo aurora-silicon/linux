@@ -2992,10 +2992,8 @@ static bool dcp_tb_has_connector(void *data)
 static void dcp_tb_queue_reconnect(void *data)
 {
 	struct dcp_tb_attach_context *ctx = data;
-	struct apple_dcp *dcp = ctx->best->dcp;
 
-	dcp->typec_reconnect_tries = 0;
-	dcp_queue_typec_reconnect(dcp, 0);
+	dcp_typec_attach_reconnect(ctx->best->dcp);
 }
 
 static void dcp_tb_connect_oob(void *data)

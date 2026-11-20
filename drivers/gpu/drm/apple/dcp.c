@@ -3461,6 +3461,13 @@ static void dcp_typec_attach_locked(struct apple_dcp *dcp)
 	}
 }
 
+void dcp_typec_attach_reconnect(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp->hpd_mutex);
+	dcp_typec_attach_locked(dcp);
+	dcp_queue_typec_reconnect_locked(dcp, 0);
+}
+
 /* Connect the link of an attached display, retrying later if that fails. */
 static int dcp_dptx_connect_attached(struct apple_dcp *dcp, u32 port)
 {
