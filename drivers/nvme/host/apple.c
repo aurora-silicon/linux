@@ -2902,10 +2902,28 @@ static int apple_nvme_probe(struct platform_device *pdev)
 			struct device_node *e = i < 0 ? NULL :
 				of_parse_phandle(anv->dev->of_node, "power-domains", i);
 
-			if (e && of_device_is_compatible(e, "apple,t6000-pmp-v2-report-entry"))
-				anv->sleep_pmp_entry = e;
-			else
-				of_node_put(e);
+			/*
+			 * The "ans" domain is the PMP report entry itself (APPLE_USE_PMP), or the
+			 * power state the entry sits on: then the entry is the one on that state.
+			 */
+			if (e && !of_device_is_compatible(e, "apple,t6000-pmp-v2-report-entry")) {
+				struct device_node *r, *ps = e;
+
+				e = NULL;
+				for_each_compatible_node(r, NULL, "apple,t6000-pmp-v2-report-entry") {
+					struct device_node *d = of_parse_phandle(r, "power-domains", 0);
+
+					of_node_put(d);
+					if (d == ps && of_device_is_available(r)) {
+						e = of_node_get(r);
+						of_node_put(r);
+						break;
+					}
+				}
+				of_node_put(ps);
+			}
+			anv->sleep_pmp_entry = e;
+			dev_info(anv->dev, "ANS's PMP request for the sleep: %pOF\n", e);
 		}
 	}
 
