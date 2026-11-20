@@ -122,6 +122,8 @@ struct dcp_v27_sleep {
 	bool display_early;	/* the display DART's lease taken and stopped at the prepare */
 	/* External: the wake's two calls are owed; the pipe state the driver tracked before. */
 	bool ext_wake, ext_pipe;
+	/* External: a dark wake skipped the wake's replug; the next resume, or the sleep's end, owes it. */
+	bool ext_dark_owed;
 	/* External: the queue of the calls that follow an interface's opening. */
 	struct workqueue_struct *ext_wq;
 	bool ext_wq_owned;
@@ -261,6 +263,13 @@ static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
 	u32 status, run_status = 0;
 	int ret;
 
+	/*
+	 * A cancelled suspend must keep the inherited firmware session running, unless the
+	 * processor already took its sleep step: that session neither reports a display plugged
+	 * again nor completes the panel's power-on until it is restarted, as after a real wake.
+	 */
+	if (!pm_resume_via_firmware() && !(s && s->phase == V27_PREPARED))
+		return -EPERM;
 	if (s && s->cycle_failed)
 		return -ECANCELED;
 	dcp_v27_sessions(dcp, false);
@@ -388,7 +397,7 @@ static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
 
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp)
 {
-	return apple_sleep_v27_late() &&
+	return apple_sleep_v27_late() && dcp->v27_sleep_transport &&
 		(of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcp") ||
 		 of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcpext")) &&
 		dcp->hw.adopt_live_session && dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
@@ -579,7 +588,7 @@ static unsigned long dcp_v27_ext_round(struct apple_dcp *dcp)
 	 * sessions opened. Here with its DART, PMC bits and power words as there
 	 * (dcp_v27_rtkit_cycle()), and without the pause.
 	 */
-	if (v27_ext_cycles) {
+	if ((pm_resume_via_firmware() || dcp->sleep_v27->phase == V27_PREPARED) && v27_ext_cycles) {
 		int ret = dcp_v27_ext_cycle_ready(dcp);
 
 		if (!ret) {
@@ -722,9 +731,14 @@ static void dcp_v27_ext_replug(struct apple_dcp *dcp, bool wake)
 
 	if (!dcp_v27_external(dcp))
 		return;
-	/* A dark wake sleeps again at once: nothing is plugged for it. */
-	if (wake && pm_dark_wake())
+	/* A dark wake sleeps again at once: nothing is plugged for it, until a resume or the end. */
+	if (wake && pm_dark_wake()) {
+		if (s)
+			s->ext_dark_owed = true;
 		return;
+	}
+	if (s && wake)
+		s->ext_dark_owed = false;
 	dcp_fabric_sleep_done(dcp);
 	if (!s || !(wake ? s->ext_wake : s->ext_torn))
 		return;
@@ -909,6 +923,30 @@ static const struct apple_epic_service_ops dcp_v27_ext_services[] = {
 	{},
 };
 
+static void dcp_v27_ext_av_teardown(struct apple_epic_service *service)
+{
+	afk_service_disable(service);
+}
+
+/*
+ * The same holds for the AV interfaces (compact, cut to "dcpav-video-interface-" and
+ * so on) on endpoint 0x2b, which the sleep step starts when no audio did: left
+ * unanswered, the firmware never reports a display plugged after the sleep. One of
+ * each is live, re-announced at every plug.
+ */
+static const struct apple_epic_service_ops dcp_v27_ext_av_services[] = {
+	{ .name = "dcpav-video-interface-epic", .compact_full = "dcpav-video-interface-epic:0",
+	  .singleton = true, .init = dcp_v27_ext_service_init,
+	  .teardown = dcp_v27_ext_av_teardown },
+	{ .name = "dcpav-audio-interface-epic", .compact_full = "dcpav-audio-interface-epic:0",
+	  .singleton = true, .init = dcp_v27_ext_service_init,
+	  .teardown = dcp_v27_ext_av_teardown },
+	{ .name = "dcpav-cec-interface-epic", .compact_full = "dcpav-cec-interface-epic:0",
+	  .singleton = true, .init = dcp_v27_ext_service_init,
+	  .teardown = dcp_v27_ext_av_teardown },
+	{},
+};
+
 static void dcp_v27_ext_wq_destroy(void *data)
 {
 	destroy_workqueue(data);
@@ -928,8 +966,9 @@ static int dcp_v27_sleep_endpoints_open(struct apple_dcp *dcp)
 
 	for (i = 0; i < ARRAY_SIZE(v27_sleep_endpoints); i++) {
 		u8 id = v27_sleep_endpoints[i];
-		bool served = s && dcp_v27_external(dcp) && t6050_ext_services &&
-			      (id == 0x29 || id == 0x2a);
+		bool ext = s && dcp_v27_external(dcp) && t6050_ext_services;
+		bool served = ext && (id == 0x29 || id == 0x2a);
+		const struct apple_epic_service_ops *ops = no_services;
 
 		if (!apple_rtkit_has_endpoint(dcp->rtk, id))
 			return -ENODEV;
@@ -942,7 +981,11 @@ static int dcp_v27_sleep_endpoints_open(struct apple_dcp *dcp)
 			if (!s->ext_wq)
 				return -ENOMEM;
 		}
-		ep = afk_init(dcp, id, served ? dcp_v27_ext_services : no_services);
+		if (served)
+			ops = dcp_v27_ext_services;
+		else if (ext && id == AV_AUDIO_ENDPOINT_DESKTOP)
+			ops = dcp_v27_ext_av_services;
+		ep = afk_init(dcp, id, ops);
 		if (IS_ERR(ep))
 			return PTR_ERR(ep);
 		if (served) {
@@ -1058,10 +1101,13 @@ static int dcp_v27_disp_dart_release(struct dcp_v27_sleep *s)
 	return ret;
 }
 
-/* Normal process-context cancellation: firmware was NEVER idled or stopped. */
+/* Reopen after cancellation, or after restarting the firmware on a real wake. */
 static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 {
 	struct dcp_v27_sleep *s = dcp->sleep_v27;
+	/* Undoing a partial preparation never stops the firmware; a completed sleep step does. */
+	unsigned int cycles = pm_resume_via_firmware() || s->phase == V27_PREPARED ?
+			      v27_rtkit_cycles : 0;
 	unsigned int i;
 	bool per_call;
 	int ret;
@@ -1086,7 +1132,7 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 			/* A500's wake form first; its failure does not stop the power-on. */
 			iomfb_v27_sleep_rpc(dcp, true, true);
 			/* The wake's one restart: the rest of the wake runs in the session it starts. */
-			if (s->soft_off && v27_rtkit_cycles >= 1)
+			if (s->soft_off && cycles >= 1)
 				dcp_v27_rtkit_cycle(dcp, 0);
 			if (s->soft_off && v27_a115)
 				iomfb_v27_sleep_call(dcp, "A489", NULL, 0, 4);
@@ -1101,7 +1147,7 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 						dev_warn(dcp->dev, "V27 wake: A115(1): %d\n", ret);
 				}
 				/* The dark-wake forms only: a restart, or a pause, before the display stage. */
-				if (v27_rtkit_cycles >= 2) {
+				if (cycles >= 2) {
 					iomfb_v27_sleep_rpc(dcp, true, true);
 					dcp_v27_rtkit_cycle(dcp, v27_lit_delay_ms);
 				} else if (v27_lit_delay_ms) {
@@ -1115,7 +1161,7 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 				 * Back to back with the hard power-on; only the dark-to-lit form idles
 				 * the DCP, with A500 first, between the calls.
 				 */
-				per_call = v27_rtkit_cycles >= 3;
+				per_call = cycles >= 3;
 				if (!per_call)
 					dcp_v27_sessions(dcp, true);
 				dcp_v27_display_stage(dcp, per_call, per_call && v27_session_rounds, per_call);
@@ -1422,6 +1468,11 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	}
 	if (!dcp_v27_external(dcp) && !dcp->crtc)
 		return -ENODEV;
+	/* The sleep turns the panel's backlight off: without a level it stays off after it. */
+	if (!dcp_v27_external(dcp) && dcp_has_panel(dcp) && !dcp_backlight_level_known(dcp)) {
+		dev_info(dcp->dev, "V27 sleep: no backlight level to light the panel again\n");
+		return -EBUSY;
+	}
 	if (!dcp_v27_external(dcp) && !READ_ONCE(dcp->pipe_enabled_h17p))
 		return -EAGAIN; /* require the actual normal driver pipe-on ACK */
 	s->scanout = dcp->crtc ? dcp->crtc->base.dev->dev : NULL;
@@ -1627,7 +1678,23 @@ static int dcp_v27_sleep_resume(struct apple_dcp *dcp)
 	dcp_v27_ext_replug(dcp, !ret);
 	return ret;
 }
+
+/*
+ * The sleep is over, and the last wake was a dark one whose re-entry was refused before this
+ * processor suspended again: no resume made the replug the dark wake skipped. Make it now.
+ */
+static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp)
+{
+	struct dcp_v27_sleep *s = dcp->sleep_v27;
+
+	if (!s || !s->ext_dark_owed || pm_dark_wake())
+		return;
+	dev_info(dcp->dev, "ext %u: a dark wake ended without sleeping again: the wake's replug now\n",
+		 dcp_v27_ext_nr(dcp));
+	dcp_v27_ext_replug(dcp, true);
+}
 #else
+static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp) { }
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp) { return false; }
 static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp) { }
 static int dcp_v27_sleep_suspend(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
