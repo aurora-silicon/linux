@@ -10112,8 +10112,6 @@ unlock:
 	return ret;
 }
 
-void dcp_backlight_s2r_restore(struct apple_dcp *dcp);
-
 static int dcp_t6041_start_one(struct device *dev, void *data)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
