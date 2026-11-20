@@ -234,6 +234,7 @@ struct device_node {
     int fw_cells;
     u32 compat[3];
     int compat_cells;
+    bool clock_ids;
 };
 struct device {
     struct device_node *of_node;
@@ -242,6 +243,11 @@ struct device {
 static int of_device_is_compatible(const struct device_node *np, const char *s)
 {
     return np && np->compatible && !strcmp(np->compatible, s);
+}
+static bool of_property_present(const struct device_node *np, const char *name)
+{
+    assert(!strcmp(name, "apple,clock-ids"));
+    return np && np->clock_ids;
 }
 static int of_property_count_strings(const struct device_node *np, const char *name)
 {
@@ -445,9 +451,45 @@ int main(void)
     node.fw[2] = 0; assert(apple_t8132_dcpext_v27_2(&node));
     machine_j773g = false;
 
+    /*
+     * The internal DCP handed over with the T8132 27.2 image and its
+     * firmware-27 clocks (the M4 Air's on the 27.2 stub) runs the 27.2
+     * table on any board and either firmware path; without the clocks it is
+     * the M4 backend's on its path and nobody's off it, as above.
+     */
+    reset_t6041_26b123(false);
+    node.compatible = "apple,t8132-dcp";
+    node.uuid = APPLE_T8132_DCP_26B123_UUID;
+    node.clock_ids = true;
+    for (unsigned path = 0; path < 2; path++) {
+        t8132_firmware_path = path;
+        assert(apple_t8132_dcp_v27_2(&node));
+        assert(!apple_t8132_dcpext_v27_2(&node));
+        assert(!apple_t6041_dcp_v27_2(&node));
+        assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
+        node.clock_ids = false;
+        assert(!apple_t8132_dcp_v27_2(&node));
+        assert(dcp_check_firmware_version(&dev) == (path ? DCP_FIRMWARE_M4 : DCP_FIRMWARE_UNKNOWN));
+        node.clock_ids = true;
+    }
+    t8132_firmware_path = true;
+    /* Not on a dcpext, nor with the T6041 image, a missing UUID or another release. */
+    node.compatible = "apple,t8132-dcpext"; assert(!apple_t8132_dcp_v27_2(&node));
+    node.compatible = "apple,t8132-dcp";
+    node.uuid = APPLE_T6041_DCP_26B123_UUID; assert(!apple_t8132_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_M4);
+    node.uuid = APPLE_T8132_DCP_26B123_UUID;
+    node.uuid_count = 0; assert(!apple_t8132_dcp_v27_2(&node));
+    node.uuid_count = 1;
+    node.compat[1] = 0; assert(!apple_t8132_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_M4);
+    node.compat[1] = 2; assert(apple_t8132_dcp_v27_2(&node));
+    t8132_firmware_path = false;
+
     dev.hw = &hw_t6041;
     puts("PASS T6041 26B123 v27.2 internal/external admission, refusal controls, and desktop 26.x preservation");
     puts("PASS T8132 M4 backend only on its firmware path; the J773g dcpext on 27.2 alone runs the 27.2 table");
+    puts("PASS T8132 internal DCP with the 27.2 image and its firmware-27 clocks runs the 27.2 table; without them nothing changes");
     return 0;
 }
 '''
