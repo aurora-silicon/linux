@@ -189,17 +189,20 @@ properties:
     items:
       enum: [0, 1]
     description: |
-      Per-slot enable flags, in slot order. The legacy J700 bootloader
-      supplies a single zero to select surface zero instead.
+      Per-slot enable flags, in slot order. A list that enables no slot is
+      the older single-index form (a single 0 naming slot 0), still found in
+      device trees from before the per-slot flags; it is read as slot 0.
 
   apple,power-lut-data-x:
     $ref: /schemas/types.yaml#/definitions/uint8-array
     minItems: 4
     maxItems: 4
     description: |
-      First dimension of the display firmware power lookup table. The
-      bootloader copies the disp0 ADT property verbatim, as a little-endian
-      32-bit word, for transfer to the display firmware.
+      First dimension of the display firmware power lookup table: the disp0
+      ADT property verbatim, as a little-endian 32-bit word, for transfer to
+      the display firmware. The table is the panel's; the board device tree
+      carries it, and a bootloader may replace it with the ADT's copy. The
+      driver has no built-in default for any of these tables.
 
   apple,power-lut-data-y:
     $ref: /schemas/types.yaml#/definitions/uint8-array

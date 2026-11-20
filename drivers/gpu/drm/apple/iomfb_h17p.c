@@ -394,49 +394,23 @@ struct dcp_h17p_provider_property {
 	const char *name;
 	const char *dt_name;
 	u32 length;
-	const u8 *legacy_data;
 };
 
 static_assert(sizeof(struct dcp_h17p_provider_request) == 0x4c);
 static_assert(sizeof(struct dcp_h17p_provider_reply) == 0xc04);
 
-/* Compatibility data matches the independently decoded J700 disp0 ADT. */
-static const u8 j700_provider_data_0[] = {
-	0x0d, 0x00, 0x00, 0x00
-};
-
-static const u8 j700_provider_data_1[] = {
-	0x01, 0x00, 0x00, 0x00
-};
-
-static const u8 j700_provider_data_2[] = {
-	0x02, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00,
-	0x64, 0x00, 0x00, 0x00, 0x96, 0x00, 0x00, 0x00, 0xc8, 0x00, 0x00, 0x00,
-	0xfa, 0x00, 0x00, 0x00, 0x2c, 0x01, 0x00, 0x00, 0x5e, 0x01, 0x00, 0x00,
-	0x90, 0x01, 0x00, 0x00, 0xc2, 0x01, 0x00, 0x00, 0xf4, 0x01, 0x00, 0x00,
-	0x0d, 0x02, 0x00, 0x00
-};
-
-static const u8 j700_provider_data_3[] = {
-	0x64, 0x00, 0x00, 0x00
-};
-
-static const u8 j700_provider_data_4[] = {
-	0x34, 0x03, 0x00, 0x00, 0x84, 0x03, 0x00, 0x00, 0x24, 0x05, 0x00, 0x00,
-	0x52, 0x07, 0x00, 0x00, 0x11, 0x09, 0x00, 0x00, 0xde, 0x0a, 0x00, 0x00,
-	0xd2, 0x0c, 0x00, 0x00, 0xe2, 0x0e, 0x00, 0x00, 0xfb, 0x10, 0x00, 0x00,
-	0x64, 0x13, 0x00, 0x00, 0xd5, 0x15, 0x00, 0x00, 0x68, 0x18, 0x00, 0x00,
-	0xa2, 0x19, 0x00, 0x00
-};
-
-/* Only these provider transfers are known to match the disp0 ADT. */
+/*
+ * Only these provider transfers are known to match the disp0 ADT. The tables
+ * describe the panel's power model, so they come from the device tree: the
+ * board's DT carries them, and a loader may refresh them from the ADT.
+ */
 static const struct dcp_h17p_provider_property provider_properties[] = {
-	{ "power-lut-data-x", "apple,power-lut-data-x", 4, j700_provider_data_0 },
-	{ "power-lut-data-y", "apple,power-lut-data-y", 4, j700_provider_data_1 },
-	{ "power-lut-data-xindex", "apple,power-lut-data-xindex", 52, j700_provider_data_2 },
-	{ "power-lut-data-yindex", "apple,power-lut-data-yindex", 4, j700_provider_data_3 },
-	{ "power-lut-data-lut", "apple,power-lut-data-lut", 52, j700_provider_data_4 },
-	{ "power-lut-vbatt-cur-nominal", "apple,power-lut-vbatt-cur-nominal", 0, NULL },
+	{ "power-lut-data-x", "apple,power-lut-data-x", 4 },
+	{ "power-lut-data-y", "apple,power-lut-data-y", 4 },
+	{ "power-lut-data-xindex", "apple,power-lut-data-xindex", 52 },
+	{ "power-lut-data-yindex", "apple,power-lut-data-yindex", 4 },
+	{ "power-lut-data-lut", "apple,power-lut-data-lut", 52 },
+	{ "power-lut-vbatt-cur-nominal", "apple,power-lut-vbatt-cur-nominal", 0 },
 };
 
 static const struct dcp_h17p_provider_property *
@@ -482,19 +456,10 @@ static bool trampoline_provider_property_h17p(struct apple_dcp *dcp, int tag,
 		/* Only this absent property has a known empty reply. */
 		if (of_property_present(node, property->dt_name))
 			goto fail;
-	} else if (!of_property_present(node, property->dt_name) &&
-		   of_machine_is_compatible("apple,j700") &&
-		   (of_device_is_compatible(node, "apple,t8140-dcp") ||
-		    (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
-		     of_device_is_compatible(node, "apple,t8140-dcpext")))) {
-		/* Older loaders lack the newly described table properties. */
-		memset(reply, 0, sizeof(*reply));
-		memcpy(reply->data, property->legacy_data, property->length);
-		reply->length = cpu_to_le32(property->length);
-		dev_info_once(dcp->dev,
-			      "missing provider property %s (%u bytes); using the J700 defaults\n",
-			      property->dt_name, property->length);
-		return true;
+	} else if (length < 0) {
+		dev_err(dcp->dev, "missing provider property %s (%u bytes) in the device tree\n",
+			property->dt_name, property->length);
+		goto fail;
 	} else if (length != (int)property->length) {
 		dev_err(dcp->dev, "invalid provider property %s: %d bytes\n",
 			property->dt_name, length);
