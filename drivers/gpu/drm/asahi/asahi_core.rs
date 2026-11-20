@@ -429,6 +429,10 @@ module! {
             default: 1,
             description: "T8103 27.2 bring-up: dump the published images when built (1) or after the firmware stops (2)",
         },
+        t8112_g13_idle_ms: u32 {
+            default: 3000,
+            description: "T8103 27.2 bring-up: how long the first idle-policy round may take (ms)",
+        },
         t8112_g13_wc: u32 {
             default: 0,
             description: "T8103 27.2 bring-up: map uncached firmware allocations write-combined on the host (1)",

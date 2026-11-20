@@ -1830,8 +1830,9 @@ impl G13TrialRoot {
                                     (0x1050, 1), (0x1068, 0x31), (0x1088, 1), (0x10a4, 8), (0x10a8, 1),
                                     (0x10cc, 0), (0x10d0, 0), (0x10d4, 2),
                                     (0x2664, 4), (0x2668, 3), (0x266c, 7), (0x2670, 7), (0x267c, 0),
-                                    (0x268c, 1), (0x2690, 0x3e9f_ee5c), (0x2694, 0xffff_fffe),
-                                    (0x2698, 0x3e9f_ee5c), (0x269c, 0xffff_fffe), (0x26a8, 0xe_0000),
+                                    // +0x2690/+0x2698 are the host's time-base offsets for the
+                                    // firmware clock: left at zero, the firmware counts the timer.
+                                    (0x268c, 1), (0x26a8, 0xe_0000),
                                     (0x26b0, 1), (0x26b4, 1), (0x26b8, 0), (0x26c0, 1), (0x26c4, 1),
                                     (0x277c, 0x1_0000), (0x2780, 0x1_0000)] {
                         put(hw, at, v);

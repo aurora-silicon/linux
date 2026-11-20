@@ -12,7 +12,8 @@ impl Uat {
         let phase = module_parameters::t8112_handshake.value();
         let followup = module_parameters::t8112_active_followup.value();
         if followup > 2 || (followup != 0 && (phase != 14
-            || !module_parameters::t8112_power_filter.value() || !module_parameters::t8112_idle_policy.value()
+            // T8103 builds its own power images, so the T8112 power filter is not required.
+            || !module_parameters::t8112_idle_policy.value()
             || module_parameters::t8112_post_power_job.value() || module_parameters::t8112_ram_slots.value() != 0)) {
             return Err(EINVAL);
         }
@@ -426,7 +427,7 @@ impl Uat {
                                             }
                                             // G13G's first scheduler pass follows its first DVFS
                                             // transition and power-controller start.
-                                            if start.elapsed() >= Delta::from_millis(3000) {
+                                            if start.elapsed() >= Delta::from_millis(i64::from(module_parameters::t8112_g13_idle_ms.value().max(500))) {
                                                 return Err(ETIMEDOUT);
                                             }
                                             fsleep(Delta::from_millis(1));
@@ -535,7 +536,7 @@ impl Uat {
                                                             sampled += 1;
                                                             root.report_job_gates("second")?;
                                                         }
-                                                        if start.elapsed() >= Delta::from_millis(3000) { return Err(ETIMEDOUT); }
+                                                        if start.elapsed() >= Delta::from_millis(i64::from(module_parameters::t8112_g13_idle_ms.value().max(500))) { return Err(ETIMEDOUT); }
                                                         fsleep(Delta::from_millis(1));
                                                     }
                                                     Ok(())
