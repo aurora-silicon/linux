@@ -39,7 +39,8 @@ int centauri_t6050_boot_phase_for_control_stage(u32 control_stage,
 		return 0;
 	case 2:
 	case 3:
-		return -EOPNOTSUPP;
+		*phase = CEN_BOOT_REWAKE;
+		return 0;
 	default:
 		return -EINVAL;
 	}
@@ -94,7 +95,8 @@ void centauri_t6050_schedule_transport_recover(struct centauri_t6050 *c)
 		return;
 
 	mutex_lock(&c->boot_lock);
-	if (c->boot_phase == CEN_BOOT_STOPPED || c->boot_phase == CEN_BOOT_FAILED)
+	if (READ_ONCE(c->removing) || c->boot_phase == CEN_BOOT_STOPPED ||
+	    c->boot_phase == CEN_BOOT_FAILED)
 		goto out_unlock;
 
 	control = readl(c->bar + 0x8000);
@@ -105,6 +107,11 @@ void centauri_t6050_schedule_transport_recover(struct centauri_t6050 *c)
 			control, ret);
 		c->boot_phase = CEN_BOOT_FAILED;
 		goto out_unlock;
+	}
+	if (phase == CEN_BOOT_REWAKE) {
+		mutex_unlock(&c->boot_lock);
+		centauri_t6050_request_rewake(c->pdev, -EIO, true);
+		return;
 	}
 
 	WRITE_ONCE(c->ready, false);
@@ -151,16 +158,15 @@ static void recover_phase_cycle(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, phase, CEN_BOOT_CYCLE);
 }
 
-static void recover_phase_stop23(struct kunit *test)
+static void recover_phase_rewake23(struct kunit *test)
 {
 	enum centauri_t6050_boot_phase phase = CEN_BOOT_READY;
 
-	KUNIT_EXPECT_EQ(test,
-			centauri_t6050_boot_phase_for_control_stage(2, &phase),
-			-EOPNOTSUPP);
-	KUNIT_EXPECT_EQ(test,
-			centauri_t6050_boot_phase_for_control_stage(3, &phase),
-			-EOPNOTSUPP);
+	KUNIT_ASSERT_EQ(test, centauri_t6050_boot_phase_for_control_stage(2, &phase), 0);
+	KUNIT_EXPECT_EQ(test, phase, CEN_BOOT_REWAKE);
+	phase = CEN_BOOT_READY;
+	KUNIT_ASSERT_EQ(test, centauri_t6050_boot_phase_for_control_stage(3, &phase), 0);
+	KUNIT_EXPECT_EQ(test, phase, CEN_BOOT_REWAKE);
 }
 
 static void recover_phase_null(struct kunit *test)
@@ -204,7 +210,7 @@ static struct kunit_case centauri_recovery_cases[] = {
 	KUNIT_CASE(recover_phase_rom),
 	KUNIT_CASE(recover_phase_ipc),
 	KUNIT_CASE(recover_phase_cycle),
-	KUNIT_CASE(recover_phase_stop23),
+	KUNIT_CASE(recover_phase_rewake23),
 	KUNIT_CASE(recover_phase_null),
 	KUNIT_CASE(control_idle_no_event),
 	KUNIT_CASE(control_idle_settled),

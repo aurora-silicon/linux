@@ -32,7 +32,7 @@ struct centauri_t6050_rewake {
 	struct work_struct work;
 	struct pci_dev *bridge;
 	unsigned int slot;
-	bool active, rerun;
+	bool active, rerun, force_reset;
 	unsigned int generation, work_generation;
 	int error;
 	struct pci_dev *control;
@@ -159,7 +159,7 @@ void apple_centauri_sleep_unregister(struct pci_dev *fn)
 }
 EXPORT_SYMBOL_GPL(apple_centauri_sleep_unregister);
 
-void apple_centauri_sleep_recovery_needed(struct pci_dev *fn, int error)
+void centauri_t6050_request_rewake(struct pci_dev *fn, int error, bool force_reset)
 {
 	struct centauri_t6050_rewake *rw;
 
@@ -171,6 +171,7 @@ void apple_centauri_sleep_recovery_needed(struct pci_dev *fn, int error)
 			continue;
 		if (error && !rw->error)
 			rw->error = error;
+		rw->force_reset |= force_reset;
 		/* One owner and one work reference even while the work is running. */
 		if (rw->active && rw->generation != rw->work_generation)
 			rw->rerun = true;
@@ -182,6 +183,11 @@ void apple_centauri_sleep_recovery_needed(struct pci_dev *fn, int error)
 		}
 		return;
 	}
+}
+
+void apple_centauri_sleep_recovery_needed(struct pci_dev *fn, int error)
+{
+	centauri_t6050_request_rewake(fn, error, false);
 }
 EXPORT_SYMBOL_GPL(apple_centauri_sleep_recovery_needed);
 
@@ -873,6 +879,19 @@ out:
 	return ret;
 }
 
+static bool centauri_t6050_rewake_already_reset(struct centauri_t6050_rewake *rw)
+{
+	bool force_reset;
+
+	mutex_lock(&cen_recovery_lock);
+	force_reset = rw->force_reset;
+	rw->force_reset = false;
+	mutex_unlock(&cen_recovery_lock);
+
+	/* A prior wake's reset does not recover a subsequent runtime wedge. */
+	return !force_reset && apple_pcie_t6050_warm_reset_done(rw->bridge);
+}
+
 /*
  * The functions are removed while their link is still up, then the warm reset, then the link
  * (if it went down, until it is back), then a new enumeration, all under the rescan lock: no
@@ -915,7 +934,7 @@ static void centauri_t6050_rewake_worker(struct work_struct *work)
 	 * here, on a trained link, would take the link down for good: after a suspend that kept the
 	 * link the host takes the port down and up around the reset instead.
 	 */
-	if (apple_pcie_t6050_warm_reset_done(bridge)) {
+	if (centauri_t6050_rewake_already_reset(rw)) {
 		pci_dbg(bridge, "N1 after the sleep: reset by the host before its port came up\n");
 		ret = 0;
 	} else {
@@ -994,6 +1013,7 @@ out:
 	}
 	rw->active = false;
 	rw->error = 0;
+	rw->force_reset = false;
 	mutex_unlock(&cen_recovery_lock);
 	kref_put(&rw->ref, centauri_t6050_owner_free);
 }
