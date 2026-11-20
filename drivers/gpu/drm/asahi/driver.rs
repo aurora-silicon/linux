@@ -393,6 +393,11 @@ impl platform::Driver for AsahiPlatformDriver {
                 return Err(ENODEV);
             }
             ProbeConfig::T8103Identify => {
+                #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+                if crate::module_parameters::t8112_g13_layout.value() == 1 {
+                    crate::gpu::j313_layout::dump_layouts(pdev.as_ref());
+                    return Err(ENODEV);
+                }
                 let node = pdev.as_ref().fwnode().ok_or(ENODEV)?;
                 let version: KVec<u32> = node
                     .property_read_array_vec(c"apple,firmware-version", 3)?
