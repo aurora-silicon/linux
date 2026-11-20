@@ -301,6 +301,19 @@ static int sn201202x_ldcm_set_mitigation(void *ctx, bool enable)
 		return 0;
 
 	/*
+	 * As macOS, which reads a dry port's status but sends it no LDCM
+	 * command: only a mitigation this driver requested since the
+	 * controller's last reset needs removing.
+	 */
+	if (!enable && !sn->ldcm_requested) {
+		sn->ldcm_mitigation_known = true;
+		sn->ldcm_mitigated = false;
+		return 0;
+	}
+	if (enable)
+		sn->ldcm_requested = true;
+
+	/*
 	 * Successful task completion is the controller's mitigation ACK.
 	 * Startup commands can take more than a second on SN201202x. Wait for
 	 * completion before a retry can request the opposite mitigation state.
@@ -310,6 +323,8 @@ static int sn201202x_ldcm_set_mitigation(void *ctx, bool enable)
 	sn->ldcm_mitigation_known = !ret;
 	if (!ret)
 		sn->ldcm_mitigated = enable;
+	if (!ret && !enable)
+		sn->ldcm_requested = false;
 	return ret;
 }
 
@@ -465,6 +480,7 @@ static void sn201202x_ldcm_invalidate(struct tps6598x *tps)
 	tps->contaminant = TYPEC_CONTAMINANT_UNKNOWN;
 	sn->ldcm_mitigated = false;
 	sn->ldcm_mitigation_known = false;
+	sn->ldcm_requested = false;
 	sn201202x_ldcm_event(tps);
 }
 
@@ -628,12 +644,12 @@ EXPORT_SYMBOL_IF_KUNIT(sn201202x_runtime_resume);
 /*
  * The SPMI bus holds a runtime PM reference while the driver is bound.
  * Probe gives it to idle sleep only where the event interrupt stays live
- * while the controller sleeps, as the system sleep event filter has it;
- * elsewhere the controller stays awake.
+ * while the controller sleeps (sn->idle_sleep); elsewhere the controller
+ * stays awake.
  */
 VISIBLE_IF_KUNIT void sn201202x_idle_sleep_start(struct tps6598x *tps)
 {
-	if (!tps->sleep_event)
+	if (!tps_to_sn(tps)->idle_sleep)
 		return;
 	pm_runtime_set_autosuspend_delay(tps->dev, SN201202X_AUTOSUSPEND_MS);
 	pm_runtime_use_autosuspend(tps->dev);
@@ -644,7 +660,7 @@ EXPORT_SYMBOL_IF_KUNIT(sn201202x_idle_sleep_start);
 /* On remove, once the bus has woken it: take back the reference */
 VISIBLE_IF_KUNIT void sn201202x_idle_sleep_stop(struct tps6598x *tps)
 {
-	if (!tps->sleep_event)
+	if (!tps_to_sn(tps)->idle_sleep)
 		return;
 	pm_runtime_get_noresume(tps->dev);
 	pm_runtime_dont_use_autosuspend(tps->dev);
@@ -718,13 +734,18 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 }
 
 /*
- * On the J714s, the board the sleep has run on, the probe and the sleep's SLEEP command print a
- * line; on every other machine they don't. A controller without a connector (the J714s's
- * MagSafe one, hpm5) is probed as any other: it registers its Type-C port and power supply, and
- * with apple,sleep-ssps it follows the system's sleep as the USB-C ports' controllers do (woken
- * and switched to S3 at the prepare, SLEEP at the suspend, woken at the resume and switched to
- * S0 at the complete).
+ * On the T6050 boards that sleep (J714s, J716c), the probe and the sleep's SLEEP command print a
+ * line; on every other machine they don't. A controller without a connector (the MagSafe one,
+ * hpm5) is probed as any other: it registers its Type-C port and power supply, and with
+ * apple,sleep-ssps it follows the system's sleep as the USB-C ports' controllers do (woken and
+ * switched to S3 at the prepare, SLEEP at the suspend, woken at the resume and switched to S0
+ * at the complete).
  */
+static bool sn201202x_sleep_board(void)
+{
+	return of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c");
+}
+
 static bool sn201202x_j714s(void)
 {
 	return of_machine_is_compatible("apple,j714s");
@@ -927,6 +948,17 @@ static int sn201202x_probe(struct spmi_device *device)
 	 */
 	if (!sn->polled && sn->select_polled)
 		tps->sleep_event = sn201202x_sleep_event;
+	/*
+	 * Idle sleep needs only the event interrupt to stay live while the
+	 * controller sleeps. T8132's select-polled controllers have that, as
+	 * the system sleep filter above relies on; elsewhere the DT says so
+	 * (apple,event-irq-in-sleep). A register access then wakes the
+	 * controller through runtime PM, select notification or not. Those
+	 * controllers keep their own system sleep path (a wake IRQ).
+	 */
+	sn->idle_sleep = !sn->polled &&
+			 (sn->select_polled ||
+			  device_property_read_bool(&device->dev, "apple,event-irq-in-sleep"));
 
 	tps->wake = sn201202x_cmd_wake;
 	spmi_device_set_drvdata(device, tps);
@@ -949,7 +981,7 @@ static int sn201202x_probe(struct spmi_device *device)
 	tps->data->irq_handler(tps->irq, tps);
 
 	sn201202x_idle_sleep_start(tps);
-	if (sn201202x_j714s())
+	if (sn201202x_sleep_board())
 		dev_info(tps->dev, "port controller ready%s\n", sn->polled ? ", polled" : "");
 	return 0;
 }
@@ -1041,7 +1073,7 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	tipd_usb_wake(tps, true);
 	reinit_completion(&sn->sleep_completion);
 	err = spmi_command_sleep(sn->sdev);
-	if (pm_suspend_via_firmware() && sn201202x_j714s())
+	if (pm_suspend_via_firmware() && sn201202x_sleep_board())
 		dev_info(dev, "SLEEP: %d\n", err);
 	if (err)
 		goto out_resume;

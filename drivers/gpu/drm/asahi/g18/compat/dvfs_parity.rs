@@ -10,7 +10,7 @@
 //! A change takes effect at the next submission or completion service.
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use kernel::{bindings, module_param::KernelParam};
+use kernel::bindings;
 
 use crate::g18::compat::g17p::{self as policy, Config};
 
@@ -110,16 +110,10 @@ unsafe extern "C" fn parity_get(buf: *mut core::ffi::c_char,
 static PARITY_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(parity_set), get: Some(parity_get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static PARITY_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_dvfs_parity"
-    } else { c"aurora.g17p_dvfs_parity" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&PARITY_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    PARITY_PARAM,
+    "g17p_dvfs_parity",
+    ops: core::ptr::from_ref(&PARITY_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);
