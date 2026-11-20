@@ -7,6 +7,11 @@ def oslog(root):
     source = (root / 'drivers/soc/apple/rtkit.c').read_text()
     constants = '\n'.join(line for line in source.splitlines()
                           if line.startswith('#define APPLE_RTKIT_OSLOG_'))
+    # The echo's predicate, where the receiver is built on one.
+    helpers = ''.join(block(source, marker) + '\n'
+                      for marker in ('static bool apple_rtkit_oslog_unanswered(',
+                                     'static bool apple_rtkit_oslog_echoed(')
+                      if marker in source)
     return r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -37,7 +42,7 @@ static int __attribute__((unused)) apple_rtkit_send_message(struct apple_rtkit *
 { (void)rtk; assert(ep==8 && !completion && !atomic); acks++; observed=msg; return 0; }
 static void apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk, struct buffer *b, u8 ep, u64 msg)
 { assert(b==&rtk->oslog_buffer && ep==8); requests++; observed=msg; }
-''' + constants + '\n' + block(source, 'static void apple_rtkit_oslog_rx(') + r'''
+''' + constants + '\n' + helpers + block(source, 'static void apple_rtkit_oslog_rx(') + r'''
 static void reset(void) { warnings=notifications=requests=acks=errors=0; observed=0; }
 int main(void)
 {

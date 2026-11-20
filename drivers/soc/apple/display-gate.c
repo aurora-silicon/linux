@@ -3301,7 +3301,7 @@ static void __init gate_t6041_max_run(void)
 	if (!internal)
 		internal = of_find_compatible_node(NULL, NULL, gate_soc->dcp_compat);
 	if (gate_t6041_v27_unapproved(internal, false)) {
-		staged_info("firmware 27 internal display only, external displays left off\n");
+		staged_info("unapproved firmware 27 on internal dcp, external displays left off\n");
 		of_node_put(internal);
 		of_node_put(display);
 		return;
