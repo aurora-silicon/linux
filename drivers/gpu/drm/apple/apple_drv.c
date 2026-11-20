@@ -1718,6 +1718,13 @@ static int apple_drm_init(struct device *dev)
 	apple->drm.mode_config.funcs = &apple_mode_config_funcs;
 	apple->drm.mode_config.helper_private = &apple_mode_config_helpers;
 
+	/*
+	 * Dumb buffers are DMA memory, write-combined in the CPU's mapping:
+	 * a client that renders into them in software (a compositor without
+	 * a GPU driver) should draw into a cached shadow buffer and copy.
+	 */
+	apple->drm.mode_config.prefer_shadow = true;
+
 	ret = component_bind_all(dev, apple);
 	if (ret)
 		return ret;
