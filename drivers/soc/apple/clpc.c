@@ -314,7 +314,8 @@ int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
 	    !of_device_is_compatible(np, "apple,t6050-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8132-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8140-clpc") &&
-	    !of_device_is_compatible(np, "apple,t8142-clpc")) {
+	    !of_device_is_compatible(np, "apple,t8142-clpc") &&
+	    !of_device_is_compatible(np, "apple,t8152-clpc")) {
 		of_node_put(np);
 		return -EINVAL;
 	}
@@ -1993,13 +1994,20 @@ static struct kunit_suite apple_clpc_suite = {
 kunit_test_suite(apple_clpc_suite);
 #endif
 
-/* T8152: DCS states 0-7 and fabric states 0-4. */
+/*
+ * T8152: DCS states 0-7 and fabric states 0-4. The G18 GPU driver reports its
+ * work in flight, as on T8142, and gets the top of the map while it has some.
+ * Without that input only busy CPU clusters raised the floor: on the J873g a
+ * GPU-bound render ran 34% faster with it (783 against 585 frames/s), and
+ * before, the GPU ran faster the more CPU time its own job waits used.
+ */
 static const struct apple_clpc_hw apple_clpc_hw_t8152 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
 	.map = {
 		[APPLE_CLPC_DCS] = { 2, 4, 6, 7 },
 		[APPLE_CLPC_SOC] = { 1, 2, 3, 4 },
 	},
+	.gpu_input = true,
 };
 
 /*
