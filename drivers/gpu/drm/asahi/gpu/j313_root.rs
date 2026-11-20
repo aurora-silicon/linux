@@ -852,6 +852,12 @@ impl G13TrialRoot {
         let state = &self._channels[2 * 16];
         let write = state.shared_index(0x20)?.load(Ordering::Acquire);
         let read = state.shared_index(0)?;
+        static POLLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let poll = POLLS.fetch_add(1, Ordering::Relaxed);
+        if poll % 250 == 0 {
+            dev_info!(self.graph.dev.as_ref(), "G13G stats drain poll={} va={:#x} read={} write={} before\n",
+                      poll, state.gpu_va().get(), read.load(Ordering::Acquire), write);
+        }
         if write < 256 && read.load(Ordering::Acquire) != write {
             read.store(write, Ordering::Release);
             crate::pgtable::poc_barrier();
