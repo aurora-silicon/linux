@@ -363,6 +363,16 @@ MODULE_PARM_DESC(flush_interval,
  * default: the root disk stays up through a sleep the SoC refuses.
  */
 static bool sleep_untested;
+/*
+ * J613 trial: macOS idles ANS before its sleep (AP then IOP power state 0x201, capture run 68,
+ * -23 to -22 ms before the commit) and its ASC reads control 0, status 0x2e at the commit
+ * (runs 48, 49); Linux's T8103-style suspend shuts it down (AP quiesced, IOP sleep, AP off) and
+ * it reads status 0x2a. This idles it as macOS does, then stops the CPU as before.
+ */
+static bool j613_ans_idle;
+module_param(j613_ans_idle, bool, 0444);
+MODULE_PARM_DESC(j613_ans_idle, "J613 trial: idle ANS (AP and IOP idle) for a firmware sleep instead of shutting it down");
+
 module_param(sleep_untested, bool, 0444);
 MODULE_PARM_DESC(sleep_untested,
 		 "Stop ANS for a deep sleep where that path is untested (default 0)");
@@ -3238,7 +3248,14 @@ static int apple_nvme_suspend(struct device *dev)
 	}
 
 	if (apple_rtkit_is_running(anv->rtk)) {
-		ret = apple_rtkit_shutdown(anv->rtk);
+		if (READ_ONCE(j613_ans_idle) && pm_suspend_via_firmware() &&
+		    of_machine_is_compatible("apple,j613")) {
+			ret = apple_rtkit_idle(anv->rtk);
+			dev_warn(anv->dev, "J613: ANS AP and IOP idle for the sleep: %d (status %#x)\n",
+				 ret, readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS));
+		} else {
+			ret = apple_rtkit_shutdown(anv->rtk);
+		}
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 	}
