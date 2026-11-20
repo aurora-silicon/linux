@@ -643,6 +643,258 @@ static void apr_test_parse_interlaced(struct kunit *test)
 			info.picture_offset[0] + info.picture_size[0]);
 }
 
+/*
+ * The decode descriptor has no input length, so the engine reads as far as the
+ * frame's own sizes say. Each of these frames points past its payload and
+ * must be rejected before a descriptor is built. Every frame is parsed from an
+ * allocation exactly as long as the payload, so an over-read is a KASAN error.
+ *
+ * Progressive fixture: frame header at 8, picture at 28 (8-byte header,
+ * 45-entry slice table, 45 slices of 6 bytes), 396 bytes in all.
+ */
+#define APR_TP_PIC	28U
+#define APR_TP_SLICES	45U
+#define APR_TP_TABLE	(APR_TP_PIC + 8)
+#define APR_TP_DATA	(APR_TP_TABLE + 2 * APR_TP_SLICES)
+#define APR_TP_SIZE	(8 + 8 * APR_TP_SLICES)
+#define APR_TP_BYTES	(APR_TP_PIC + APR_TP_SIZE)
+
+/* Parse the first @bytes of @frame from a buffer exactly that long. */
+static int apr_test_parse_at(struct kunit *test, const u8 *frame, size_t bytes)
+{
+	struct apr_prores_info info;
+	u8 *copy = kunit_kmalloc(test, bytes, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	memcpy(copy, frame, bytes);
+	return apr_parse_frame(copy, bytes, &info);
+}
+
+/* A progressive fixture with @extra zero bytes of room after it. */
+static u8 *apr_test_room(struct kunit *test, size_t extra, size_t *bytes)
+{
+	u8 *frame = apr_test_bitstream(test, false, bytes);
+	u8 *room;
+
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_EQ(test, *bytes, (size_t)APR_TP_BYTES);
+	room = kunit_kzalloc(test, *bytes + extra, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, room);
+	memcpy(room, frame, *bytes);
+	return room;
+}
+
+static void apr_test_oob_exact_fit(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 1, &bytes);
+	struct apr_prores_info info;
+	u8 *last = frame + APR_TP_TABLE + 2 * (APR_TP_SLICES - 1);
+
+	/* Header, table and slices fill the picture and the frame exactly. */
+	KUNIT_ASSERT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.picture_offset[0] + info.picture_size[0],
+			info.frame_size);
+	KUNIT_EXPECT_EQ(test, info.picture_size[0], APR_TP_SIZE);
+
+	/* One more byte in the last slice, the picture and the frame fits too. */
+	put_unaligned_be16(7, last);
+	put_unaligned_be32(APR_TP_SIZE + 1, frame + APR_TP_PIC + 1);
+	put_unaligned_be32(APR_TP_BYTES + 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes + 1), 0);
+
+	/* An encoder may leave the deprecated slice count at 0. */
+	put_unaligned_be16(0, frame + APR_TP_PIC + 5);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes + 1), 0);
+}
+
+static void apr_test_oob_frame_size(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 4096, &bytes);
+
+	/* The frame claims more bytes than were queued. */
+	put_unaligned_be32(bytes + 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be32(bytes + 4096, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be32(U32_MAX, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/* bytesused one short of an otherwise valid frame. */
+	put_unaligned_be32(bytes, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes - 1), -EINVAL);
+
+	/* Truncated by one byte with the frame size rewritten to match. */
+	put_unaligned_be32(bytes - 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes - 1), -EINVAL);
+
+	/* Shorter than any frame header. */
+	put_unaligned_be32(27, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, 27), -EINVAL);
+}
+
+static void apr_test_oob_frame_header(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 0, &bytes);
+
+	/* Frame header one byte past the frame, then filling it entirely. */
+	put_unaligned_be16(bytes - 8 + 1, frame + 8);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(bytes - 8, frame + 8);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(U16_MAX, frame + 8);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/* Quantisation matrices flagged but not inside the frame header. */
+	put_unaligned_be16(20, frame + 8);
+	frame[8 + 19] = 3;
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	frame[8 + 19] = 0;
+
+	/* Picture header shorter than its fixed fields. */
+	frame[APR_TP_PIC] = 7 << 3;
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+}
+
+static void apr_test_oob_picture_size(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 0, &bytes);
+	u8 *size = frame + APR_TP_PIC + 1;
+
+	/* The picture runs one byte, 64 KiB and 4 GiB past the payload. */
+	put_unaligned_be32(APR_TP_SIZE + 1, size);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be32(APR_TP_SIZE + SZ_64K, size);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be32(U32_MAX, size);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/* Its slices must fit a picture one byte shorter. */
+	put_unaligned_be32(APR_TP_SIZE - 1, size);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/* Pictures must account for every byte of the frame. */
+	frame = apr_test_room(test, 1, &bytes);
+	put_unaligned_be32(bytes + 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes + 1), -EINVAL);
+}
+
+static void apr_test_oob_slice_table(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 0, &bytes);
+	u32 table_end = 8 + 2 * APR_TP_SLICES;
+
+	/* The slice table ends one byte past the picture (and the frame). */
+	put_unaligned_be32(table_end - 1, frame + APR_TP_PIC + 1);
+	put_unaligned_be32(APR_TP_PIC + table_end - 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, APR_TP_PIC + table_end - 1),
+			-EINVAL);
+
+	/* The in-band slice count asks for one more table entry. */
+	frame = apr_test_room(test, 0, &bytes);
+	put_unaligned_be16(APR_TP_SLICES + 1, frame + APR_TP_PIC + 5);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(U16_MAX, frame + APR_TP_PIC + 5);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/*
+	 * Smaller slices mean more of them (75 at 320x240): the table the
+	 * engine walks grows with log2_slice even with no in-band count.
+	 */
+	put_unaligned_be16(0, frame + APR_TP_PIC + 5);
+	frame[APR_TP_PIC + 7] = 2 << 4;
+	KUNIT_EXPECT_EQ(test, apr_slice_count(320, 240, 2), 75U);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+}
+
+static void apr_test_oob_slice_sizes(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 0, &bytes);
+	u8 *table = frame + APR_TP_TABLE;
+
+	/* The last slice ends one byte past the picture and the payload. */
+	put_unaligned_be16(7, table + 2 * (APR_TP_SLICES - 1));
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(U16_MAX, table + 2 * (APR_TP_SLICES - 1));
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/* A large early slice pushes every later one past the end. */
+	put_unaligned_be16(6, table + 2 * (APR_TP_SLICES - 1));
+	put_unaligned_be16(U16_MAX, table);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/* A slice too short for its own header. */
+	put_unaligned_be16(5, table);
+	put_unaligned_be16(7, table + 2);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+}
+
+static void apr_test_oob_slice_headers(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 0, &bytes);
+	u8 *last = frame + APR_TP_DATA + 6 * (APR_TP_SLICES - 1);
+
+	/* Coded Y and Cb data run one byte past the last slice. */
+	put_unaligned_be16(1, last + 2);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(0, last + 2);
+	put_unaligned_be16(U16_MAX, last + 4);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(0, last + 4);
+
+	/* A slice header longer than the slice. */
+	last[0] = 7 << 3;
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	last[0] = 6 << 3;
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), 0);
+
+	/* With alpha the Cr size is in the header too: 6 bytes is too short. */
+	frame[8 + 12] = 3 << 6;
+	frame[8 + 17] = 1;
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+}
+
+static void apr_test_oob_second_field(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_bitstream(test, true, &bytes);
+	struct apr_prores_info info;
+	u32 second;
+
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+	second = info.picture_offset[1];
+
+	/* The bottom field runs one byte past the payload. */
+	put_unaligned_be32(info.picture_size[1] + 1, frame + second + 1);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be32(U32_MAX, frame + second + 1);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be32(info.picture_size[1], frame + second + 1);
+
+	/* Its last slice ends one byte past the payload. */
+	put_unaligned_be16(7, frame + second + 8 + 2 * (info.slices[1] - 1));
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(6, frame + second + 8 + 2 * (info.slices[1] - 1));
+
+	/* The frame stops one byte into, and right at, the bottom field. */
+	put_unaligned_be32(second + 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, second + 1), -EINVAL);
+	put_unaligned_be32(second, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, second), -EINVAL);
+	put_unaligned_be32(bytes, frame);
+
+	/* The top field grows by a byte, so the bottom one is misplaced. */
+	put_unaligned_be32(info.picture_size[0] + 1, frame + info.picture_offset[0] + 1);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+}
+
 static void apr_test_ring_accounting(struct kunit *test)
 {
 	u8 *ring = kunit_kzalloc(test, APR_RING_BYTES, GFP_KERNEL);
@@ -689,6 +941,14 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_decode_desc),
 	KUNIT_CASE(apr_test_parse_frame),
 	KUNIT_CASE(apr_test_parse_interlaced),
+	KUNIT_CASE(apr_test_oob_exact_fit),
+	KUNIT_CASE(apr_test_oob_frame_size),
+	KUNIT_CASE(apr_test_oob_frame_header),
+	KUNIT_CASE(apr_test_oob_picture_size),
+	KUNIT_CASE(apr_test_oob_slice_table),
+	KUNIT_CASE(apr_test_oob_slice_sizes),
+	KUNIT_CASE(apr_test_oob_slice_headers),
+	KUNIT_CASE(apr_test_oob_second_field),
 	KUNIT_CASE(apr_test_ring_accounting),
 	{}
 };
