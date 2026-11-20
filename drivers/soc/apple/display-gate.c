@@ -1906,6 +1906,51 @@ static bool __init gate_node_in(struct device_node *const *nodes, int n,
 	return false;
 }
 
+/*
+ * On the 27.2 image the T8122 external processor and its scanout use the
+ * panel's DMA window (the 1 TiB alias): the display subsystem takes the
+ * window all its display DARTs share, and the device tree's 14.7 windows for
+ * the external DARTs (from 0) share none with the panel's. Give @dart and
+ * @disp_dart the window of the internal processor's DART.
+ */
+static int __init gate_t8122_dcpext_alias(struct of_changeset *cs,
+					  struct device_node *dart,
+					  struct device_node *disp_dart)
+{
+	struct device_node *dcp, *panel_dart;
+	struct device_node *targets[] = { dart, disp_dart };
+	const struct property *window;
+	int i, ret = 0;
+
+	dcp = of_find_compatible_node(NULL, NULL, "apple,t8122-dcp");
+	panel_dart = dcp ? of_parse_phandle(dcp, "iommus", 0) : NULL;
+	of_node_put(dcp);
+	window = panel_dart ? of_find_property(panel_dart, "apple,dma-range", NULL) : NULL;
+	if (!window || !window->length) {
+		of_node_put(panel_dart);
+		return -ENODEV;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(targets) && !ret; i++) {
+		/* Kept for good: the live tree refers to it once applied. */
+		struct property *prop = kzalloc_obj(*prop);
+		void *value = kmemdup(window->value, window->length, GFP_KERNEL);
+
+		if (!prop || !value) {
+			kfree(prop);
+			kfree(value);
+			ret = -ENOMEM;
+			break;
+		}
+		prop->name = "apple,dma-range";
+		prop->length = window->length;
+		prop->value = value;
+		ret = of_changeset_update_property(cs, targets[i], prop);
+	}
+	of_node_put(panel_dart);
+	return ret;
+}
+
 static void __init gate_t8122_dcpext_one(struct device_node *np)
 {
 	struct device_node *dart = NULL, *mbox = NULL, *piodma = NULL;
@@ -1927,8 +1972,8 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		gate_ext_refuse(np, "the boot loader did not reserve its firmware");
 		return;
 	}
-	if (!gate_ext_firmware_ok(np)) {
-		gate_ext_refuse(np, "its firmware-compat is not 14.7.0");
+	if (!gate_ext_firmware_ok(np) && !apple_t8122_dcpext_v27_2(np)) {
+		gate_ext_refuse(np, "its firmware is neither 14.7.0 nor the 27.2 image");
 		return;
 	}
 	if (!of_property_present(np, "memory-region")) {
@@ -2010,6 +2055,8 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		ret = gate_add_bool(cs, entry, "apple,soc-device-record");
 	if (!ret)
 		ret = gate_add_bool(cs, entry, "apple,defer-startup-ack");
+	if (!ret && apple_t8122_dcpext_v27_2(np))
+		ret = gate_t8122_dcpext_alias(cs, dart, disp_dart);
 	if (!ret)
 		ret = of_changeset_update_prop_string(cs, dart, "status", "okay");
 	if (!ret)
