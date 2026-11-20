@@ -9543,6 +9543,8 @@ static int dcp_platform_suspend(struct device *dev)
 		dev_warn(dev, "J613: display coprocessor stopped cold for the sleep (control %#x); it stays dark until reboot\n",
 			 control);
 		WRITE_ONCE(dcp->quiescing, true);
+		dev_warn(dev, "J613: RTKit idle switch %d, rtk %s\n", READ_ONCE(j613_rtkit_idle),
+			 !dcp->rtk ? "NULL" : IS_ERR(dcp->rtk) ? "error" : "present");
 		if (READ_ONCE(j613_rtkit_idle) && !IS_ERR_OR_NULL(dcp->rtk)) {
 			int ret = apple_rtkit_idle_with(dcp->rtk, dcp_secure_port_idle, dcp);
 
