@@ -908,6 +908,26 @@ static void t8122_asc_census_log(struct apple_sleep *s)
  */
 static bool t8122_commit_page;
 static void __iomem *t8122_cp_page, *t8122_cp_mini;
+
+/*
+ * J613 trial (read only): each ASC's CPU_CONTROL (+0x44) and CPU_STATUS (+0x48) just before the
+ * commit, where its power domain is up, to compare with macOS's at its commit (Aura's stop
+ * snapshot, runs 48 and 49: PMP, ANS and SIO control 0 status 0x2e; DCP and GFX domains off; SMC
+ * control 0x10 status 0x28). Mapped at the sleep's begin; one "A" line per ASC on the debug
+ * console.
+ */
+static bool t8122_asc_commit;
+module_param(t8122_asc_commit, bool, 0600);
+MODULE_PARM_DESC(t8122_asc_commit, "J613 trial: every ASC's control and status just before the commit (reads only)");
+
+static const struct { const char *name; phys_addr_t asc; u32 ps; } t8122_ascs[] = {
+	{ "pmp", 0x2d0c00000, T8122_PS_PMP }, { "ans", 0x309400000, T8122_PS_ANS },
+	{ "sio", 0x2a1c00000, T8122_PS_SIO_CPU }, { "dcp", 0x28ec00000, T8122_PS_DISP_CPU },
+	{ "gfx", 0x292400000, T8122_PS_GFX }, { "smc", 0x2ec400000, 0 },
+	{ "aop", 0x2f4400000, 0 }, { "mtp", 0x2fa400000, 0 },
+	{ "dcpext", 0x31ac00000, T8122_PS_DISPEXT_CPU },
+};
+static void __iomem *t8122_asc_map[ARRAY_SIZE(t8122_ascs)];
 module_param(t8122_commit_page, bool, 0600);
 MODULE_PARM_DESC(t8122_commit_page, "J613 diagnostic: log the commit word's page (0x2e42d4000, 256 bytes) at the entry");
 
@@ -940,6 +960,13 @@ static int t8122_sleep_begin(struct apple_sleep *s)
 	}
 	if (t8122_asc_census)
 		t8122_asc_census_log(s);
+	if (t8122_asc_commit) {
+		unsigned int i;
+
+		for (i = 0; i < ARRAY_SIZE(t8122_ascs); i++)
+			if (!t8122_asc_map[i])
+				t8122_asc_map[i] = ioremap_np(t8122_ascs[i].asc, 0x100);
+	}
 	t8122_witness_reset();
 	t8122.wfi_returns = 0;
 	t8122.dc_stalled = false;
@@ -1525,6 +1552,29 @@ static void t8122_sio_auto_apply(struct apple_sleep *s)
 	t8122_dc_putc('\n');
 }
 
+static void t8122_asc_commit_dc(struct apple_sleep *s)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(t8122_ascs); i++) {
+		u32 ps = t8122_ascs[i].ps ? readl(s->ps + t8122_ascs[i].ps) : 0;
+
+		t8122_dc_puts("\nA ");
+		t8122_dc_puts(t8122_ascs[i].name);
+		t8122_dc_putc(' ');
+		t8122_dc_hex(ps);
+		if ((t8122_ascs[i].ps && !FIELD_GET(PS_ACTUAL, ps)) || !t8122_asc_map[i]) {
+			t8122_dc_puts(" off");
+			continue;
+		}
+		t8122_dc_putc(' ');
+		t8122_dc_hex(readl(t8122_asc_map[i] + 0x44));
+		t8122_dc_putc(' ');
+		t8122_dc_hex(readl(t8122_asc_map[i] + 0x48));
+	}
+	t8122_dc_putc('\n');
+}
+
 static void t8122_sleep_pre_commit(struct apple_sleep *s)
 {
 	if (READ_ONCE(t8122_sio_off))
@@ -1539,6 +1589,8 @@ static void t8122_sleep_pre_commit(struct apple_sleep *s)
 		t8122_commit_page_dc(s);
 	if (READ_ONCE(t8122_dump))
 		t8122_dump_macos(s);
+	if (READ_ONCE(t8122_asc_commit))
+		t8122_asc_commit_dc(s);
 	t8122_dc_putc('c');
 	/*
 	 * Control for t8122_wfi_timer_s (with the hold only, so no commit): the boot core arms the
