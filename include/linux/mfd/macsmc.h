@@ -140,6 +140,12 @@ struct apple_smc {
 	bool polled;
 	/* MBSW at the last wake: what the SMC had woken the AP for. */
 	u64 wake_record;
+	/*
+	 * J714s: dark wakes since the last full wake (for a port or the radio alone), those for the
+	 * radio alone among them, and when the last sleep began.
+	 */
+	unsigned int dark_wakes, radio_dark_wakes;
+	ktime_t sleep_entry_boot, sleep_entry_mono;
 	/* MBSW's bits as this SoC numbers them, from the probe. */
 	const struct apple_smc_wake_reason *wake_reasons;
 

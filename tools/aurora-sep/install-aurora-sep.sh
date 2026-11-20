@@ -6566,7 +6566,7 @@ fingerprint.
        (pcie_apple.tunnel_kernel_init=0 turns that off). Displays, and USB on
        USB4 docks, do not need the PCIe tunnel. On the M2 MacBook Air/Pro 13"
        and on M3 the tunnel isn't supported yet, so this line is normal there:
-         PCIe-C tunnel disabled: not initialized by m1n1 or the kernel
+         PCIe-C tunnel disabled: not initialized by aura or the kernel
        Report it if you see it on an M1, M1 Pro/Max or M2 Pro/Max.
 
    6b. With a dock or a DisplayPort monitor, in this order:

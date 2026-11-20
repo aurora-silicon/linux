@@ -7,6 +7,11 @@ def oslog(root):
     source = (root / 'drivers/soc/apple/rtkit.c').read_text()
     constants = '\n'.join(line for line in source.splitlines()
                           if line.startswith('#define APPLE_RTKIT_OSLOG_'))
+    # The echo's predicate, where the receiver is built on one.
+    helpers = ''.join(block(source, marker) + '\n'
+                      for marker in ('static bool apple_rtkit_oslog_unanswered(',
+                                     'static bool apple_rtkit_oslog_echoed(')
+                      if marker in source)
     return r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -37,7 +42,7 @@ static int __attribute__((unused)) apple_rtkit_send_message(struct apple_rtkit *
 { (void)rtk; assert(ep==8 && !completion && !atomic); acks++; observed=msg; return 0; }
 static void apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk, struct buffer *b, u8 ep, u64 msg)
 { assert(b==&rtk->oslog_buffer && ep==8); requests++; observed=msg; }
-''' + constants + '\n' + block(source, 'static void apple_rtkit_oslog_rx(') + r'''
+''' + constants + '\n' + helpers + block(source, 'static void apple_rtkit_oslog_rx(') + r'''
 static void reset(void) { warnings=notifications=requests=acks=errors=0; observed=0; }
 int main(void)
 {
@@ -97,9 +102,10 @@ def syslog(root):
     dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
     header = (root / 'drivers/gpu/drm/apple/dcp-syslog.h').read_text()
     helper = header[header.index('static inline bool'):header.index('\n#endif')]
-    # The policy belongs only to the external H17P transport. Other RTKit
-    # clients, including the panel and older DCP firmware, keep info logging.
-    assert '.syslog_is_debug' not in block(dcp, 'static struct apple_rtkit_ops rtkit_ops =')
+    # The policy covers both DCP transports, the internal panel's and the
+    # external H17P one. It demotes only the known records it matches, so other
+    # records, other firmware and other RTKit clients keep info logging.
+    assert '.syslog_is_debug = dcp_rtk_syslog_is_debug' in block(dcp, 'static struct apple_rtkit_ops rtkit_ops =')
     assert '.syslog_is_debug = dcp_rtk_syslog_is_debug' in block(dcp, 'static const struct apple_rtkit_ops external_h17p_rtkit_ops =')
     return r'''
 #include <assert.h>
