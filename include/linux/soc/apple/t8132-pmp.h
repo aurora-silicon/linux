@@ -46,4 +46,20 @@ static inline bool apple_t8132_pmp_board(void)
 	return apple_t8132_pmp_path() && of_machine_is_compatible("apple,t8132");
 }
 
+/*
+ * The 27.2 (26B123) PMP image, also in 27.2.1, starts on its own once its CPU
+ * runs: it acknowledges IOP power ON about 0.13 ms later, without a host
+ * request. Asking it again (an RTKit wake) times out, so the host only waits
+ * for it to report in, as the G16 27.2 start does. 26.6.2 keeps the wake.
+ */
+static inline bool apple_t8132_pmp_self_starts(void)
+{
+	const char *version;
+
+	if (!of_machine_is_compatible("apple,t8132") ||
+	    of_property_read_string(of_chosen, "asahi,os-fw-version", &version))
+		return false;
+	return !strcmp(version, "27.2") || !strcmp(version, "27.2.1");
+}
+
 #endif

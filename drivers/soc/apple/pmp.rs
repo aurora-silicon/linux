@@ -64,6 +64,12 @@ use kernel::{
     types::ForeignOwnable, //
 };
 
+unsafe extern "C" {
+    /// `pmp-export.c`, in this module: the PMP firmware acknowledges IOP power ON on its own
+    /// once its CPU runs (T8132, 27.2 and 27.2.1).
+    fn apple_pmp_t8132_self_starts() -> bool;
+}
+
 const PMP_MIN_MMIO_SIZE: usize = 0x80000;
 const ASC_MMIO_SIZE: usize = 0x4000;
 const BOOTARGS_UUID: usize = 0x204;
@@ -215,7 +221,17 @@ impl PmpData {
     fn start(&self) -> Result<()> {
         let mut guard = self.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().unwrap();
-        rtk.as_mut().wake()?;
+        // SAFETY: the predicate only reads the machine's compatible and /chosen.
+        if unsafe { apple_pmp_t8132_self_starts() } {
+            // 27.2: the firmware has acknowledged IOP power ON by itself. A wake would ask
+            // again and time out (-ETIME); as the G16 27.2 start does, only wait for it to
+            // report in (endpoint map, CoreAnalytics if started, that acknowledgment), then
+            // set the AP on.
+            dev_info!(self.dev, "27.2 PMP firmware: RTKit boot without an IOP power request\n");
+            rtk.as_mut().boot()?;
+        } else {
+            rtk.as_mut().wake()?;
+        }
         rtk.start_endpoint(PMP_ENDPOINT)
     }
     fn patch_bootargs(

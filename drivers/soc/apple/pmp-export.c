@@ -11,6 +11,7 @@
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sleep.h>
+#include <linux/soc/apple/t8132-pmp.h>
 #include <linux/suspend.h>
 
 /* Join removal and serialize the firmware's untagged power reply stream. */
@@ -157,6 +158,16 @@ static int apple_pmp_commit_stop_fn(void *unused)
 bool apple_pmp_keep_bound(void)
 {
 	return apple_pmp_display_retained_board() || of_machine_is_compatible("apple,t8140");
+}
+
+/*
+ * Module-internal, for pmp.rs: the built-in Rust bindings can't gain a declaration on a
+ * running kernel, so pmp.rs declares this itself. See apple_t8132_pmp_self_starts().
+ */
+bool apple_pmp_t8132_self_starts(void);
+bool apple_pmp_t8132_self_starts(void)
+{
+	return apple_t8132_pmp_self_starts();
 }
 
 /* Whether the sleep's last step takes the PMP: registered with the sleep driver, once. */
