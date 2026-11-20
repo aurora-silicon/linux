@@ -16,6 +16,7 @@
 #include <linux/refcount.h>
 #include <linux/gpio/consumer.h>
 #include <linux/regulator/consumer.h>
+#include <linux/suspend.h>
 #include <linux/regmap.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -399,9 +400,36 @@ static int tas2764_codec_suspend(struct snd_soc_component *component)
 	return 0;
 }
 
+/*
+ * Whether the amp came back from a power-on reset, read from the amp itself:
+ * PWR_CTRL resets to 0x1a with BOP_SRC clear, and the probe sets BOP_SRC on
+ * every SN012776. A failed read counts as lost too. Bypasses the cache, which
+ * still holds the probe's value.
+ */
+static bool tas2764_lost_state(struct tas2764_priv *tas2764)
+{
+	unsigned int val;
+	int ret;
+
+	if (tas2764->devid != DEVID_SN012776)
+		return false;
+	regcache_cache_bypass(tas2764->regmap, true);
+	ret = regmap_read(tas2764->regmap, TAS2764_PWR_CTRL, &val);
+	regcache_cache_bypass(tas2764->regmap, false);
+	return ret || !(val & TAS2764_PWR_CTRL_BOP_SRC);
+}
+
 static int tas2764_codec_resume(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
+	/*
+	 * A firmware-driven (deep) sleep powers the SoC's pin controller off,
+	 * so the group's SDZ line drops while asleep and every amp comes back
+	 * from a power-on reset when the pin controller restores the line
+	 * (its resume_noirq, before this). s2idle keeps the line and the
+	 * amps' registers and stays on the path below.
+	 */
+	bool power_on = tas2764->sdz_group && pm_resume_via_firmware();
 	int ret;
 
 	if (!tas2764->sdz_group) {
@@ -419,6 +447,36 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 
 	regcache_cache_only(tas2764->regmap, false);
 
+	/*
+	 * Any other sleep that cut the line or the supply (an s2idle wake
+	 * after a deep sleep that failed half way) leaves the same reset
+	 * state without the firmware saying so; a stream started on it
+	 * latches an over-current on a woofer amp. Check the amp itself.
+	 */
+	if (tas2764->sdz_group && !power_on && tas2764_lost_state(tas2764)) {
+		dev_warn(tas2764->dev, "registers lost in a sleep: restoring as from power-on\n");
+		power_on = true;
+	}
+
+	if (power_on) {
+		/* SDZ high to the first I2C access, as at probe */
+		usleep_range(1000, 2000);
+		/*
+		 * Start from the reset state the cache sync assumes. The page
+		 * register is back at 0 while the cache may hold another page:
+		 * drop it, so the next page switch is read from the amp.
+		 */
+		ret = regmap_write(tas2764->regmap, TAS2764_SW_RST, TAS2764_RST);
+		if (ret) {
+			dev_err(tas2764->dev,
+				"no answer on I2C after a deep sleep (%d): SDZ or supply not back\n",
+				ret);
+			goto out_irq;
+		}
+		usleep_range(1000, 2000);
+		regcache_drop_region(tas2764->regmap, TAS2764_PAGE, TAS2764_PAGE);
+	}
+
 	ret = regcache_sync(tas2764->regmap);
 	/*
 	 * An amp whose SDZ went low came back from a power-on reset, and the
@@ -428,8 +486,11 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 	 * over-current at the first stream after a resume. Apply them again,
 	 * as the probe does.
 	 */
-	if (ret >= 0 && !tas2764->sdz_group && tas2764->devid == DEVID_SN012776)
+	if (ret >= 0 && (!tas2764->sdz_group || power_on) &&
+	    tas2764->devid == DEVID_SN012776)
 		ret = tas2764_apply_init_quirks(tas2764);
+	if (ret < 0 && power_on)
+		dev_err(tas2764->dev, "restore after a deep sleep failed: %d\n", ret);
 	if (ret >= 0)
 		ret = tas2764_update_pwr_ctrl(tas2764);
 
