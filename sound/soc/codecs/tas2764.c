@@ -419,6 +419,19 @@ static bool tas2764_lost_state(struct tas2764_priv *tas2764)
 	return ret || !(val & TAS2764_PWR_CTRL_BOP_SRC);
 }
 
+/*
+ * An amp back from a power-on reset that could not be restored keeps its
+ * reset defaults (gain, brownout, interrupt masks, no quirk page), while the
+ * cache holds the restored values. ASoC ignores the resume's error, so a
+ * later unmute would set it active as it is. Fail the group closed, as for a
+ * latched fault: its supply goes off and every stream is refused.
+ */
+static void tas2764_restore_failed(struct tas2764_priv *tas2764)
+{
+	if (!tas2764_group_failed(tas2764))
+		tas2764_group_shutdown(tas2764, 0);
+}
+
 static int tas2764_codec_resume(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
@@ -471,6 +484,7 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 			dev_err(tas2764->dev,
 				"no answer on I2C after a deep sleep (%d): SDZ or supply not back\n",
 				ret);
+			tas2764_restore_failed(tas2764);
 			goto out_irq;
 		}
 		usleep_range(1000, 2000);
@@ -489,8 +503,10 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 	if (ret >= 0 && (!tas2764->sdz_group || power_on) &&
 	    tas2764->devid == DEVID_SN012776)
 		ret = tas2764_apply_init_quirks(tas2764);
-	if (ret < 0 && power_on)
+	if (ret < 0 && power_on) {
 		dev_err(tas2764->dev, "restore after a deep sleep failed: %d\n", ret);
+		tas2764_restore_failed(tas2764);
+	}
 	if (ret >= 0)
 		ret = tas2764_update_pwr_ctrl(tas2764);
 
