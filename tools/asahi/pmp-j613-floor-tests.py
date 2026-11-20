@@ -38,6 +38,23 @@ MUTANTS = {
     'no-sum': ('(c->cpu_sum_pct && cluster_sum_pct >= c->cpu_sum_pct)', '(cluster_sum_pct && 0)'),
     # Skip the CPU-client name check.
     'no-names': ('return "CPU clients EACC0/PACC0 not named once";', '(void)0;'),
+    # J613 would accept the J615 14.x firmware.
+    'j613-takes-j615-uuid': ('return !strcmp(uuid, PMP_FLOOR_J613_UUID);',
+                             'return !strcmp(uuid, PMP_FLOOR_J613_UUID) || !strcmp(uuid, PMP_FLOOR_J615_UUID);'),
+    # J615 would accept any firmware.
+    'j615-any-uuid': ('return !strcmp(uuid, PMP_FLOOR_J615_UUID);', 'return (void)uuid, true;'),
+    # J615 would accept the J613 firmware.
+    'j615-takes-j613-uuid': ('return !strcmp(uuid, PMP_FLOOR_J615_UUID);',
+                             'return !strcmp(uuid, PMP_FLOOR_J615_UUID) || !strcmp(uuid, PMP_FLOOR_J613_UUID);'),
+    # J615 would be admitted on the native J613 report (the untested 25G83 tree).
+    'j615-native': ('return j615 && !native_default && legacy_report && allowed && opted_in;',
+                    'return j615 && (native_default || legacy_report) && allowed && opted_in;'),
+    # The parameter would not veto the J615.
+    'j615-no-disable': ('return j615 && !native_default && legacy_report && allowed && opted_in;',
+                        'return (void)allowed, j615 && !native_default && legacy_report && opted_in;'),
+    # The J615 would run the floor without its opt-in.
+    'j615-no-optin': ('return j615 && !native_default && legacy_report && allowed && opted_in;',
+                      'return (void)opted_in, j615 && !native_default && legacy_report && allowed;'),
 }
 
 HARNESS = r'''
@@ -79,6 +96,21 @@ static int words(void)
 	CHECK(pmp_floor_raise_confirmed(0x3204, 4, 0) && !pmp_floor_raise_confirmed(0x3200, 4, 0));
 	CHECK(!pmp_floor_raise_confirmed(0x3204, 4, 1) && pmp_floor_raise_confirmed(0x3224, 4, 2));
 	CHECK(pmp_floor_drop_confirmed(0x3200, 0x3204) && !pmp_floor_drop_confirmed(0x3204, 0x3204));
+	/* J615 only on the generic report of a legacy tree, never the native one. */
+	for (unsigned int j615 = 0; j615 <= 1; j615++)
+		for (unsigned int native = 0; native <= 1; native++)
+			for (unsigned int legacy = 0; legacy <= 1; legacy++)
+				for (unsigned int allowed = 0; allowed <= 1; allowed++)
+					for (unsigned int opt = 0; opt <= 1; opt++)
+						CHECK(pmp_floor_j615_enabled(j615, native, legacy, allowed, opt) ==
+						      (bool)(j615 && !native && legacy && allowed && opt));
+	/* J613 runs only on its qualified firmware, J615 only on its 14.x image. */
+	CHECK(pmp_floor_uuid_ok(PMP_FLOOR_J613_UUID, false) && !pmp_floor_uuid_ok(PMP_FLOOR_J613_UUID, true));
+	CHECK(!pmp_floor_uuid_ok(PMP_FLOOR_J615_UUID, false) && pmp_floor_uuid_ok(PMP_FLOOR_J615_UUID, true));
+	CHECK(!pmp_floor_uuid_ok("3b18c886-4c70-349b-b1c4-70f35de2c5cd", true));
+	CHECK(!pmp_floor_uuid_ok("", false) && !pmp_floor_uuid_ok("", true));
+	/* Measured on J615 with the 14.x image: 0x24 held (DCS4 SOC2), 0x0 released. */
+	CHECK(pmp_floor_raise_confirmed(0x24, 4, 2) && pmp_floor_drop_confirmed(0x0, 0x24));
 	return 0;
 }
 
@@ -377,6 +409,35 @@ def static_checks():
     assert 'pmp_floor_enabled(of_machine_is_compatible("apple,j613"),' in probe
     assert 'rep->offsets->j613_floor_default, j613_floor)' in probe
     assert 'module_param(j613_floor, bool, 0444);' in floor
+    # J615: its own board check behind the same parameter veto, admitted only
+    # on the generic T8122 report of a legacy tree and never on the native
+    # J613 report of the experimental J615 25G83 tree. J613's gate, link and
+    # fatal identity refusal are unchanged.
+    assert '&& !j615)' in probe
+    j615 = ' '.join(block(floor, 'static bool j615_floor_eligible(').split())
+    assert ('return pmp_floor_j615_enabled(of_machine_is_compatible("apple,j615"), '
+            'rep->offsets->j613_floor_default, of_device_is_compatible(rep->dev->of_node, '
+            '"apple,t8122-pmp-v2-report"), j613_floor, j615_floor);') in j615
+    # J615 stays opt-in: its parameter defaults to off.
+    assert re.search(r'^static bool j615_floor;$', floor, re.M)
+    assert 'module_param(j615_floor, bool, 0444);' in floor
+    assert floor.count('of_machine_is_compatible("apple,j615")') == 1
+    assert src.count('pmp_floor_j615_enabled(') == 1
+    # J613 takes the PMP that names its report, J615 only the PMP its report names.
+    link = block(floor, 'static bool j613_floor_linked(')
+    j615_link, j613_link = link[link.index('if (j615) {'):].split('} else {')
+    assert 'of_parse_phandle(report, "apple,pmp", 0);' in j615_link and 'linked = link == pmp;' in j615_link
+    assert 'apple,pmp-report' not in j615_link
+    assert 'of_parse_phandle(pmp, "apple,pmp-report", 0);' in j613_link and 'linked = link == report;' in j613_link
+    assert 'j613_floor_linked(pmp, dev->of_node, j615)' in probe
+    # Only a J615 report that starts its own PMP may take it while it is still
+    # disabled at probe (the legacy tree); every other PMP must be available.
+    assert 'if (!of_device_is_available(pmp) && !(j615 && rep->offsets->starts_pmp))' in probe
+    assert probe.count('of_device_is_available(pmp)') == 1
+    assert '!pmp_floor_uuid_ok(uuid, j615)) {' in probe
+    refusal = probe[probe.index('!pmp_floor_uuid_ok(uuid, j615)) {'):]
+    assert refusal.index('if (j615) {') < refusal.index('return 0;') < \
+        refusal.index('return dev_err_probe(dev, -EINVAL, "J613 floor PMP identity refused\\n");')
     print('pmp-j613-floor: static source checks passed')
 
 
