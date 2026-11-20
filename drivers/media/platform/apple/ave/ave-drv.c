@@ -109,10 +109,17 @@ const struct ave_variant ave_t6041 = {
 	.boot_qualified = true,
 };
 
-static const struct ave_variant ave_t8140 = {
+static const struct ave_fw_build ave_t8140_builds[] = {
+	{ "25G83", 0x14c000, 0x130000, AVE_FW_TEXT_CRC_9003_78_0 },
+	{ "26B123", 0x154000, 0x130000, AVE_FW_TEXT_CRC_T8140_26B123 },
+};
+
+const struct ave_variant ave_t8140 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x14c000,
 	.fw_data_size = 0x130000,
+	.builds = ave_t8140_builds,
+	.build_count = ARRAY_SIZE(ave_t8140_builds),
 	.boot_device_id = 29,
 	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
 	.timebase_multiplier = 1,

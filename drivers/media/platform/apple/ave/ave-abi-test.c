@@ -1496,8 +1496,28 @@ static void ave_t6041_text_boot_word(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, size - 2, &a), -EINVAL);
 }
 
+static void ave_t8140_fw272_build(struct kunit *test)
+{
+	KUNIT_ASSERT_EQ(test, ave_t8140.build_count, 2U);
+	KUNIT_EXPECT_EQ(test, ave_t8140.builds[0].text_size, 0x14c000U);
+	KUNIT_EXPECT_EQ(test, ave_t8140.builds[0].data_size, 0x130000U);
+	KUNIT_EXPECT_EQ(test, ave_t8140.builds[0].text_crc,
+			AVE_FW_TEXT_CRC_9003_78_0);
+	KUNIT_EXPECT_EQ(test, ave_t8140.builds[1].text_size, 0x154000U);
+	KUNIT_EXPECT_EQ(test, ave_t8140.builds[1].data_size, 0x130000U);
+	KUNIT_EXPECT_EQ(test, ave_t8140.builds[1].text_crc,
+			AVE_FW_TEXT_CRC_T8140_26B123);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    ave_layout_for_crc(AVE_FW_TEXT_CRC_9003_78_0),
+			    &ave_layout_9003_78_0);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    ave_layout_for_crc(AVE_FW_TEXT_CRC_T8140_26B123),
+			    &ave_layout_26a428);
+}
+
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_t6041_text_boot_word),
+	KUNIT_CASE(ave_t8140_fw272_build),
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
 	KUNIT_CASE(ave_9003_speed),	    KUNIT_CASE(ave_cq_table),
 	KUNIT_CASE(ave_6070_images),
