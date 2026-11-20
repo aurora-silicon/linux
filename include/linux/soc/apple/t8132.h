@@ -56,6 +56,23 @@ static inline bool apple_t8132_firmware_path(void)
 }
 
 /*
+ * The available internal display processor was handed over with the 27.2
+ * image and its firmware-27 clocks (apple_t8132_dcp_v27_2()): it runs the
+ * firmware-27 backend, whose DMA needs ordinary IOMMU domains.
+ */
+static inline bool apple_t8132_internal_dcp_v27_2(void)
+{
+	struct device_node *np;
+	bool v27 = false;
+
+	for_each_compatible_node(np, NULL, "apple,t8132-dcp") {
+		if (of_device_is_available(np) && apple_t8132_dcp_v27_2(np))
+			v27 = true;
+	}
+	return v27;
+}
+
+/*
  * A T8132 external display processor on the Mac mini (J773g) handed over
  * with the 27.2 image: it runs the firmware-27 backend (iomfb_v27.c), not
  * the M4 26.6.2 one (iomfb_m4.c). Other T8132 boards and images are not

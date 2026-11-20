@@ -5348,7 +5348,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	bool tunneled = dev->of_node->parent &&
 			 of_node_name_prefix(dev->of_node->parent,
 					     "usb4-pcie-tunnel-");
-	bool j713_display, j713_dcpext, j713_dispext, j713_radio;
+	bool j713_display, j713_dcpext, j713_dispext, j713_radio, j713_display_v27 = false;
 
 	/*
 	 * The M4 internal display DARTs are live: DCP firmware (SID23)
@@ -5359,6 +5359,18 @@ static int apple_dart_probe(struct platform_device *pdev)
 	j713_display = res && !tunneled && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x30a300000ULL || res->start == 0x30a340000ULL);
+	/*
+	 * The internal DCP handed over with the 27.2 image runs the firmware-27
+	 * backend, which DMAs through ordinary domains (RTKit and IOMFB shared
+	 * memory, PIODMA maps) as on T6041. Its two display DARTs are then not
+	 * borrowed: they keep their firmware's locked roots the way T6041's do
+	 * (fw_mirror below). The borrowed path admits only the 26.6.2 layout
+	 * and reserves its whole SID23 window from generic DMA.
+	 */
+	if (j713_display && apple_t8132_internal_dcp_v27_2()) {
+		j713_display = false;
+		j713_display_v27 = true;
+	}
 	/* The external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
 	j713_dcpext = res && !tunneled && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
@@ -5873,7 +5885,15 @@ params_done:
 		(of_device_is_compatible(dev->of_node, "apple,t6041-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t6050-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
-		 of_device_is_compatible(dev->of_node, "apple,t8142-dart"));
+		 of_device_is_compatible(dev->of_node, "apple,t8142-dart") ||
+		 j713_display_v27);
+	if (j713_display_v27)
+		dev_info(dev, "J713 internal display DART on the 27.2 image: locked roots kept (%s)\n",
+			 dart->fw_mirror ? "mirror" : "NOT locked: refusing");
+	if (j713_display_v27 && !dart->fw_mirror) {
+		ret = -EINVAL;
+		goto err_clk_disable;
+	}
 	/*
 	 * J614s may arrive with the MTP live after the boot keyboard used it.
 	 * Do not reset its DART unless there is no advertised handoff.
