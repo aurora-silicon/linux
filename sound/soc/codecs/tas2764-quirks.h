@@ -7,7 +7,7 @@
 #include "tas2764.h"
 
 /* Bitmask of enabled Apple quirks */
-#define ENABLED_APPLE_QUIRKS	0x7f
+#define ENABLED_APPLE_QUIRKS	0x17f
 
 /*
  * Disable noise gate and flip down reserved bit in NS_CFG0
@@ -104,6 +104,17 @@ static const struct reg_sequence tas2764_shutdown_dance_init_seq[] = {
 	REG_SEQ0(TAS2764_REG(0x0, 0x7), 0x60),
 };
 
+/*
+ * macOS writes 0x68 here at initialisation: SDZ_MODE=01 (immediate),
+ * as the shutdown dance sets it, plus bit 3. Unlike the dance, this
+ * applies whether or not the dance is enabled, and runs after it.
+ */
+#define TAS2764_SDZ_MODE_INIT		BIT(8)
+
+static const struct reg_sequence tas2764_sdz_mode_init_seq[] = {
+	REG_SEQ0(TAS2764_REG(0x0, 0x7), 0x68),
+};
+
 static const struct reg_sequence tas2764_pre_shutdown_seq[] = {
 	REG_SEQ0(TAS2764_REG(0xfd, 0x0d), 0xd), /* switch hidden page */
 	REG_SEQ0(TAS2764_REG(0xfd, 0x64), 0x4), /* do write (unknown semantics) */
@@ -175,6 +186,7 @@ static const struct tas2764_quirk_init_sequence {
 	{ tas2764_unk_seq2, ARRAY_SIZE(tas2764_unk_seq2) },
 	{ tas2764_thermal_th1_dis_seq, ARRAY_SIZE(tas2764_thermal_th1_dis_seq) },
 	{ tas2764_shutdown_dance_init_seq, ARRAY_SIZE(tas2764_shutdown_dance_init_seq) },
+	{ tas2764_sdz_mode_init_seq, ARRAY_SIZE(tas2764_sdz_mode_init_seq) },
 };
 
 #endif /* __TAS2764_QUIRKS__ */
