@@ -5817,6 +5817,8 @@
 	};
 
 	pcie0: pcie@1cb0000000 {
+		/* s2idle with the boot-loader-trained links left running (pcie-apple.c, #2488) */
+		apple,s2idle-retain-adopted-links;
 		compatible = "apple,t6050-pcie";
 		device_type = "pci";
 		reg = <0x1c 0xb0000000 0x00 0x10000000>, <0x04 0x14000000 0x00 0x4000>, <0x04
