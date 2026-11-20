@@ -757,6 +757,29 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 		 h->resume_restarts);
 }
 
+/*
+ * The cold cycle powers the engine off and boots the firmware again from the
+ * preload, so nothing of the old firmware has to survive the transition. That
+ * holds for an image as well: hibernation and restore take the suspend path.
+ * A warm sleep keeps firmware state across it that an image cannot carry, so
+ * there they stay refused.
+ */
+static unsigned long ane_h16_sleep_event(const struct ane_h16_device *h, unsigned long event)
+{
+	if (h->boot.soc->sleep_warm)
+		return event;
+	switch (event) {
+	case PM_HIBERNATION_PREPARE:
+	case PM_RESTORE_PREPARE:
+		return PM_SUSPEND_PREPARE;
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		return PM_POST_SUSPEND;
+	default:
+		return event;
+	}
+}
+
 static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
 {
 	struct ane_h16_device *h = container_of(nb, struct ane_h16_device, pm_notifier);
@@ -775,6 +798,7 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 			dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
 		return ane_fw_sleep_event(event, pinned);
 	}
+	event = ane_h16_sleep_event(h, event);
 	if (event == PM_POST_SUSPEND) {
 		ane_h16_sleep_resume(h);
 		WRITE_ONCE(h->recover_blocked, false);
@@ -790,7 +814,7 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 		dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
 		return NOTIFY_BAD;
 	}
-	/* Hibernation and restore stay refused. */
+	/* With a warm sleep, hibernation and restore stay refused. */
 	if (ane_fw_sleep_refused_cycle(event, pinned, true)) {
 		dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
 		return NOTIFY_BAD;
