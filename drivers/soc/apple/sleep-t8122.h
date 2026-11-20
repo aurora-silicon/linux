@@ -1203,8 +1203,6 @@ static void t8122_deep_wfi_arm(void)
 {
 	if (t8122_quiet)
 		sleep_core_fiq_quiet();
-	if (READ_ONCE(sleep_j613_ed))
-		t8142_ed_release();
 	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
 	/* The boot core's, last: 'Z' going in. */
 	if (apple_sleep && (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) == apple_sleep->mbox->boot_mpidr) {

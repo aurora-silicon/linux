@@ -569,15 +569,6 @@ static bool apple_pmp_report_of(const struct apple_pmp_report *rep, const struct
  * knows whether their devices have stopped.
  */
 /*
- * J613 trial: macOS, about 6 ms before each commit, writes the valid bit at level 0 to the CPU
- * DVFS clients 0, 1 (PACC0) and 3 (update aliases +0x10880, +0x10888, +0x10898; capture run 58).
- */
-static bool j613_sleep_dvfs_zero;
-module_param(j613_sleep_dvfs_zero, bool, 0600);
-MODULE_PARM_DESC(j613_sleep_dvfs_zero,
-		 "J613 trial: at the sleep, level 0 with the valid bit on CPU DVFS clients 0, 1 and 3, as macOS");
-
-/*
  * J613 trial: macOS keeps SoC-device request bit 19 (ADT soc-device id 0x14, IOA1) set through
  * every sleep and writes it first at each wake (capture run 58); no Linux entry owns it, and
  * Linux reaches its commit with the request word at 0.
@@ -587,13 +578,8 @@ module_param(j613_sleep_ioa1, bool, 0600);
 MODULE_PARM_DESC(j613_sleep_ioa1,
 		 "J613 trial: keep the IOA1 request (bit 19) set at the sleep, as macOS");
 
-static void apple_pmp_report_j613_sleep_dvfs(struct apple_pmp_report *rep)
+static void apple_pmp_report_j613_sleep_ioa1(struct apple_pmp_report *rep)
 {
-	static const unsigned int client[] = { 0x110, 0x111, 0x113 };
-	u64 before[ARRAY_SIZE(client)];
-	struct resource *res;
-	unsigned int i;
-
 	if (!of_machine_is_compatible("apple,j613"))
 		return;
 	if (READ_ONCE(j613_sleep_ioa1)) {
@@ -603,18 +589,6 @@ static void apple_pmp_report_j613_sleep_dvfs(struct apple_pmp_report *rep)
 		rep->sleep_request |= BIT_ULL(19);
 		dev_info(rep->dev, "J613 sleep: IOA1 request kept, request word %#llx\n", req);
 	}
-	if (!READ_ONCE(j613_sleep_dvfs_zero))
-		return;
-	res = platform_get_resource(to_platform_device(rep->dev), IORESOURCE_MEM, 0);
-	if (!res || resource_size(res) < 0x10000 + 8 * 0x114)
-		return;
-	for (i = 0; i < ARRAY_SIZE(client); i++)
-		before[i] = readq(rep->base + 16 * client[i]);
-	for (i = 0; i < ARRAY_SIZE(client); i++)
-		writeq(BIT_ULL(61), rep->base + 0x10000 + 8 * client[i]);
-	dev_info(rep->dev, "J613 sleep: CPU DVFS requests %#llx/%#llx/%#llx set to level 0; request word %#llx, ack %#llx\n",
-		 before[0], before[1], before[2], readq(rep->base + rep->offsets->tgt_read),
-		 readq(rep->base + rep->offsets->actual));
 }
 
 void apple_pmp_report_sleep(struct device *pmp, bool at_commit)
@@ -641,7 +615,7 @@ void apple_pmp_report_sleep(struct device *pmp, bool at_commit)
 						    !(val & withdrawn), 100, 50000))
 			dev_warn(rep->dev, "PMP still acknowledges withdrawn requests %#llx (ack %#llx)\n",
 				 withdrawn, val);
-		apple_pmp_report_j613_sleep_dvfs(rep);
+		apple_pmp_report_j613_sleep_ioa1(rep);
 	}
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_sleep);

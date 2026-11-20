@@ -1859,16 +1859,6 @@ MODULE_PARM_DESC(j813_smc_late,
  * stage's locked RVBAR to its spin-table release target, the holding pen; spinning there it
  * would keep its cluster from powering down. macOS's parked cores take the same deep WFI.
  */
-/*
- * J613 trial: T8142's external debug handling on J613, whose per-core CoreSight windows sit at
- * the same addresses (ADT coresight-reg 0x210010000 + core * 0x100000, cluster 0x1000000): map
- * them and log every core's EDPRCR/EDPRSR at probe, and EDLAR unlock + EDPRCR := 0 (CORENPDRQ,
- * "no power-down", cleared) before each core's last WFI.
- */
-static bool sleep_j613_ed;
-module_param_named(j613_ed, sleep_j613_ed, bool, 0444);
-MODULE_PARM_DESC(j613_ed, "J613 trial: external debug windows: report EDPRCR/EDPRSR, clear EDPRCR before each last WFI");
-
 static bool sleep_j613_pen_deep;
 module_param_named(j613_pen_deep, sleep_j613_pen_deep, bool, 0444);
 MODULE_PARM_DESC(j613_pen_deep,
@@ -8015,11 +8005,6 @@ static int apple_sleep_probe(struct platform_device *pdev)
 			mem_sleep_current = PM_SUSPEND_TO_IDLE;
 		if (s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm && is_kernel_in_hyp_mode())
 			t8142_c1_6_report(dev);
-		if (s->soc->ops->deep_wfi_arm != t8142_deep_wfi_arm && READ_ONCE(sleep_j613_ed) &&
-		    of_machine_is_compatible("apple,j613")) {
-			t8142_ed_map(dev);
-			t8142_ed_report(dev);
-		}
 		if (s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm) {
 			t8142_ed_map(dev);
 			dcache_clean_poc((unsigned long)t8142_el1_wfi_stub,
