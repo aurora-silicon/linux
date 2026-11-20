@@ -8,24 +8,26 @@
 //! through the 26.x submission front end (`m3_submit`): each compute command is encoded in the
 //! 27.2 layout and published, in order, on the root's queue. Render commands are refused.
 //!
-//! Completion follows the queue's retired position, which the firmware advances in order.
-//! The firmware's event, statistics, log and trace rings are consumed as they fill, since
-//! the firmware waits for space in them.
+//! The runtime is driven by the firmware's endpoint-0x20 notifications, which it sends after
+//! publishing records on its event, statistics and log rings: each one runs the service, which
+//! consumes those rings (the firmware waits for space in them) and retires completed commands.
+//! Completion follows the queue's retired position, which the firmware advances in order. There
+//! is no timer: the DRM scheduler's job timeout runs the service as the backstop for a hang.
 
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kernel::{
     device,
     drm::sched,
-    new_delayed_work, new_mutex,
+    new_condvar, new_mutex, new_spinlock, new_work,
     platform,
     prelude::*,
     soc::apple::rtkit,
-    sync::{aref::ARef, Arc, Mutex},
+    sync::{aref::ARef, Arc, ArcBorrow, CondVar, Mutex, SpinLock},
     time::{delay::fsleep, msecs_to_jiffies, Delta, Instant, Monotonic},
     uapi,
-    workqueue::{self, impl_has_delayed_work, DelayedWork, WorkItem},
+    workqueue::{impl_has_work, OwnedQueue, Work, WorkItem},
 };
 
 use crate::{
@@ -45,8 +47,10 @@ const ASC_RUN: u32 = 0x10;
 
 /// Commands slower than this are a hang; the firmware state is then not trusted.
 const COMMAND_TIMEOUT_MS: i64 = 5000;
-/// Idle polling keeps the firmware's rings drained and bounds completion latency.
-const IDLE_POLL_MS: u64 = 20;
+/// How long `stop` lets published work retire before it fails what is left.
+const STOP_DRAIN_MS: u32 = 2000;
+/// Bound on the wait between a command's completion stamp and its retired position.
+const RETIRE_WAIT_US: i64 = 2000;
 
 /// The ASC control page, kept mapped until the firmware is stopped.
 pub(crate) struct AscControl(*mut u8);
@@ -83,37 +87,87 @@ impl Drop for AscControl {
     }
 }
 
+/// Where the firmware's messages go: the runtime once it exists, nowhere before or after.
+#[pin_data]
+pub(crate) struct Notify {
+    dev: ARef<device::Device>,
+    #[pin]
+    runtime: SpinLock<Option<Arc<Runtime>>>,
+    /// Endpoint-0x20 messages received, reported when the firmware stops.
+    messages: AtomicU64,
+}
+
+impl Notify {
+    fn new(dev: &device::Device) -> Result<Arc<Self>> {
+        Arc::pin_init(pin_init!(Self {
+            dev: dev.into(),
+            runtime <- new_spinlock!(None, "g14_v27_2::Notify::runtime"),
+            messages: AtomicU64::new(0),
+        }), GFP_KERNEL)
+    }
+
+    /// Queues one service run if a runtime is attached. A run already queued covers this one.
+    fn wake(&self) {
+        if let Some(runtime) = self.runtime.lock().as_ref() {
+            let _ = runtime.queue.enqueue::<Arc<Runtime>, 0>(runtime.clone());
+        }
+    }
+
+    fn attach(&self, runtime: Arc<Runtime>) {
+        *self.runtime.lock() = Some(runtime);
+    }
+
+    /// After this returns, nothing queues service work.
+    fn detach(&self) -> Option<Arc<Runtime>> {
+        self.runtime.lock().take()
+    }
+}
+
 /// RTKit operations of the GPU firmware: its crash log lives in the loader's data segment.
 pub(crate) struct Firmware;
 
 #[vtable]
 impl rtkit::Operations for Firmware {
-    type Data = Arc<ARef<device::Device>>;
+    type Data = Arc<Notify>;
     type Buffer = crate::g17::CrashLog;
 
     const COPROC_PLACES_BUFFERS: bool = true;
 
-    fn shmem_map(dev: kernel::sync::ArcBorrow<'_, ARef<device::Device>>, iova: usize, size: usize) -> Result<Self::Buffer> {
-        crate::g17::CrashLog::from_firmware(&dev, iova, size)
+    fn shmem_map(notify: ArcBorrow<'_, Notify>, iova: usize, size: usize) -> Result<Self::Buffer> {
+        crate::g17::CrashLog::from_firmware(&notify.dev, iova, size)
     }
 
-    fn crashed(dev: kernel::sync::ArcBorrow<'_, ARef<device::Device>>, log: Option<&[u8]>) {
+    fn crashed(notify: ArcBorrow<'_, Notify>, log: Option<&[u8]>) {
         unsafe extern "C" {
             fn asahi_save_rtkit_dump(dev: *mut core::ffi::c_void, data: *const u8, size: usize);
         }
-        dev_err!(&**dev, "GPU firmware crashed\n");
+        dev_err!(&*notify.dev, "GPU firmware crashed\n");
         if let Some(log) = log {
             // SAFETY: RTKit and the device remain live throughout this synchronous copy.
-            unsafe { asahi_save_rtkit_dump(dev.as_raw().cast(), log.as_ptr(), log.len()) };
+            unsafe { asahi_save_rtkit_dump(notify.dev.as_raw().cast(), log.as_ptr(), log.len()) };
         }
+        // The service sees the crash and fails outstanding work.
+        notify.wake();
     }
 
-    fn recv_message(_dev: kernel::sync::ArcBorrow<'_, ARef<device::Device>>, _ep: u8, _message: u64) {}
+    /// The firmware sends endpoint 0x20 a message after it publishes event, statistics or log
+    /// records. Whatever the message, the service reads every ring and the queue's position,
+    /// so each one is a wakeup.
+    fn recv_message(notify: ArcBorrow<'_, Notify>, ep: u8, _message: u64) {
+        if ep == EP_FIRMWARE {
+            notify.messages.fetch_add(1, Ordering::Relaxed);
+            notify.wake();
+        }
+    }
 }
 
 type Peer = Pin<KBox<rtkit::RtKit<Firmware>>>;
 
-/// Polls `done` every millisecond, draining the firmware's rings, for at most `ms`.
+/// Waits for a shared-word acknowledgement, checking `done` every millisecond and draining the
+/// firmware's rings, for at most `ms`. Only for the start/stop handshakes whose acknowledgement
+/// is a word the firmware writes with no message: the ready status, the command-service
+/// installation, device-control (idle-policy) consumption and the running flag. The existing G14
+/// path waits for its device-control channel the same way (`channel::TxChannel::wait_for`).
 fn wait(root: &RootV27_2, ms: i64, mut done: impl FnMut() -> Result<bool>) -> Result {
     let start = Instant::<Monotonic>::now();
     loop {
@@ -170,8 +224,9 @@ pub(crate) fn start<'a>(pdev: &'a platform::Device<device::Core<'_>>, cfg: &'sta
     let asc = AscControl::new(pdev.resource_by_name(c"asc").ok_or(EINVAL)?.start())?;
     let control = asc.read(ASC_CPU_CONTROL);
     if control & ASC_RUN != 0 { return Err(EBUSY); }
+    let notify = Notify::new(dev)?;
     let mut peer = KBox::pin(
-        rtkit::RtKit::<Firmware>::new(dev, None, 0, Arc::new(ARef::from(dev), GFP_KERNEL)?)?,
+        rtkit::RtKit::<Firmware>::new(dev, None, 0, notify.clone())?,
         GFP_KERNEL)?;
     let resources = crate::regs::Resources::new(pdev)?;
     let sgx = pdev.resource_by_name(c"sgx").ok_or(EINVAL)?;
@@ -198,29 +253,37 @@ pub(crate) fn start<'a>(pdev: &'a platform::Device<device::Core<'_>>, cfg: &'sta
 
     // From here the firmware may read everything the window names: nothing is freed.
     let mut booted = false;
+    let mut step = "loader handoff";
     let result = (|| -> Result {
         let start = Instant::<Monotonic>::now();
         while !window.answered() {
             if start.elapsed() >= Delta::from_millis(1000) { return Err(ETIMEDOUT); }
             fsleep(Delta::from_millis(1));
         }
+        step = "RTKit boot";
         peer.as_mut().boot()?;
         booted = true;
         peer.as_mut().start_endpoint(EP_FIRMWARE)?;
         peer.as_mut().start_endpoint(EP_DOORBELL)?;
         if !window.intact() { return Err(EIO); }
+        step = "initialization";
         peer.as_mut().send_message(EP_FIRMWARE, gpu::init_message(root.gpu_va().get()))?;
-        // Let initialization settle before the first control record.
-        let _ = wait(&root, 1000, || Ok(false));
+        // The firmware sets status +0x14 when it has initialized; the first control record
+        // waits for it.
+        wait(&root, 2000, || root.initialized())?;
+        step = "keep-powered policy";
         set_idle_policy(&root, &mut peer, false)?;
-        // Command-handler installation completes during powered initialization.
-        let _ = wait(&root, 500, || Ok(root.command_service()? == (2, 0)));
+        // Powered initialization installs the command handlers and then clears the
+        // installation request the root set (+0x4c24).
+        step = "command-handler installation";
+        wait(&root, 500, || root.commands_installed())?;
+        step = "boot job";
         root.publish_boot_job(resources.operating_point())?;
         peer.as_mut().send_message(EP_DOORBELL, gpu::COMPUTE_KICK)?;
         wait(&root, 3000, || root.boot_job_complete())
     })();
     if let Err(e) = result {
-        dev_err!(dev, "GPU firmware 27.2 did not start: {:?}\n", e);
+        dev_err!(dev, "GPU firmware 27.2 did not start: {}: {:?}\n", step, e);
         halt_unowned(dev, peer, root, asc, booted);
         core::mem::forget(window);
         core::mem::forget(pool);
@@ -229,7 +292,7 @@ pub(crate) fn start<'a>(pdev: &'a platform::Device<device::Core<'_>>, cfg: &'sta
     }
     // The firmware keeps using the window until it is stopped; it stays for the life of the boot.
     core::mem::forget(window);
-    let backend = Backend::start(&drm, dev, peer, root, graph, pool, asc, cfg)?;
+    let backend = Backend::start(&drm, dev, notify, peer, root, graph, pool, asc, cfg)?;
     Ok(Started { backend, drm, binding, resources })
 }
 
@@ -256,6 +319,12 @@ struct State {
     waiting_unlink: bool,
     /// Publications and retirements counted on the queue's position block.
     published: u64,
+    /// Completion stamps seen before the retired position they precede.
+    late: u64,
+    /// Pool slots holding a published command, one bit each.
+    busy: u64,
+    /// Free slots passed over because the firmware still held them.
+    skipped: u64,
     retired_total: u64,
     retired_raw: u32,
     capacity: u32,
@@ -270,64 +339,56 @@ pub(crate) struct Runtime {
     dev: ARef<device::Device>,
     graph: Arc<GpuManagerG14V13_5>,
     healthy: AtomicBool,
-    /// Poll work queued or running; `stop` waits for zero so no work outlives the module.
-    queued: AtomicU32,
+    notify: Arc<Notify>,
+    /// Runs the service; only `Notify::wake` queues on it, and `stop` drains it.
+    queue: OwnedQueue,
     #[pin]
     state: Mutex<Option<State>>,
+    /// Signalled when no work is pending or published, or the runtime fails.
     #[pin]
-    poll: DelayedWork<Runtime>,
+    idle: CondVar,
+    #[pin]
+    work: Work<Runtime>,
 }
 
-impl_has_delayed_work! {
-    impl HasDelayedWork<Runtime> for Runtime { self.poll }
+impl_has_work! {
+    impl HasWork<Runtime> for Runtime { self.work }
 }
 
 impl WorkItem for Runtime {
     type Pointer = Arc<Runtime>;
     fn run(this: Arc<Runtime>) {
-        let busy = this.service();
-        if this.healthy.load(Ordering::Acquire) {
-            this.schedule(if busy { 1 } else { IDLE_POLL_MS });
-        }
-        this.queued.fetch_sub(1, Ordering::AcqRel);
+        this.service();
     }
 }
 
 #[pinned_drop]
 impl PinnedDrop for Runtime {
     fn drop(self: Pin<&mut Self>) {
-        // The poll work holds a reference while scheduled, so this runs only once the
-        // runtime is idle; stop the firmware first if no one has.
+        // `Notify` holds a reference until `stop`, so this runs only after it, or for a
+        // runtime that never took over the firmware.
         if self.state.lock().is_some() { self.stop(); }
     }
 }
 
 impl Runtime {
-    fn schedule(self: &Arc<Self>, ms: u64) {
-        if !self.healthy() { return; }
-        self.queued.fetch_add(1, Ordering::AcqRel);
-        if workqueue::system_highpri()
-            .enqueue_delayed::<Arc<Self>, 0>(self.clone(), msecs_to_jiffies(ms as u32)).is_err() {
-            // Already queued: that run accounts for itself.
-            self.queued.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-
     pub(crate) fn healthy(&self) -> bool { self.healthy.load(Ordering::Acquire) }
 
-    /// Queues a packet; the poll work publishes and retires it.
+    /// Runs the service once more: the DRM scheduler's job timeout calls this, so a command the
+    /// firmware never completes still reaches the command timeout.
+    pub(crate) fn wake(&self) { self.notify.wake(); }
+
+    /// Queues a packet and publishes what the pool has room for; the firmware's completion
+    /// notifications run the service, which retires it and publishes the rest.
     pub(crate) fn submit(self: &Arc<Self>, packet: Arc<Packet>) -> Result {
         if !self.healthy() { return Err(EIO); }
         if packet.commands.is_empty() {
             return Err(ENOTSUPP);
         }
-        {
-            let mut guard = self.state.lock();
-            let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
-            state.pending.push((packet, 0), GFP_KERNEL)?;
-            self.pump(state);
-        }
-        self.schedule(1);
+        let mut guard = self.state.lock();
+        let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
+        state.pending.push((packet, 0), GFP_KERNEL)?;
+        self.pump(state);
         Ok(())
     }
 
@@ -346,6 +407,7 @@ impl Runtime {
 
     fn fail_all(&self, state: &mut State, error: Error) {
         self.healthy.store(false, Ordering::Release);
+        self.idle.notify_all();
         for (packet, _) in state.pending.drain(..) {
             packet.release_guard();
             packet.finish(Err(error));
@@ -360,19 +422,30 @@ impl Runtime {
     /// Publishes pending commands while pool slots are free.
     fn pump(&self, state: &mut State) {
         while state.inflight.len() < POOL_SLOTS - 1 && !state.pending.is_empty() {
-            // A slot is reused only once the firmware has unlinked it from its tracking list.
-            match state.pool.registered(state.next_slot) {
-                Ok(false) => {}
-                Ok(true) => {
-                    if !state.waiting_unlink {
-                        // Wake the firmware's service once so its retirement scan runs.
-                        state.waiting_unlink = true;
-                        let _ = state.peer.as_mut().send_message(EP_DOORBELL, gpu::COMPUTE_KICK);
-                    }
-                    return;
+            // A slot is reused only once the firmware has unlinked it from its tracking list
+            // (+0x94). It normally has by the time the pool comes round to it, but the firmware
+            // can link a retired slot again and keep it; take the next free slot instead.
+            let mut chosen = None;
+            for k in 0..POOL_SLOTS {
+                let slot = (state.next_slot + k) % POOL_SLOTS;
+                if state.busy & (1 << slot) != 0 { continue; }
+                match state.pool.registered(slot) {
+                    Ok(false) => { chosen = Some(slot); break; }
+                    Ok(true) => state.skipped += 1,
+                    Err(e) => { self.fail_all(state, e); return; }
                 }
-                Err(e) => { self.fail_all(state, e); return; }
             }
+            let Some(slot) = chosen else {
+                if !state.waiting_unlink {
+                    // Every free slot is held: wake the firmware's service once so its
+                    // retirement scan runs. The scan sends nothing; the next notification,
+                    // submission or scheduler timeout retries.
+                    state.waiting_unlink = true;
+                    let _ = state.peer.as_mut().send_message(EP_DOORBELL, gpu::COMPUTE_KICK);
+                }
+                return;
+            };
+            state.next_slot = slot;
             state.waiting_unlink = false;
             let (packet, index) = (state.pending[0].0.clone(), state.pending[0].1);
             let Command::Compute(control) = packet.commands[index] else {
@@ -405,6 +478,7 @@ impl Runtime {
                     state.last = stamp;
                     state.sequence += 1;
                     let slot = state.next_slot;
+                    state.busy |= 1 << slot;
                     state.published += 1;
                     let ordinal = state.published;
                     state.next_slot = (state.next_slot + 1) % POOL_SLOTS;
@@ -430,26 +504,47 @@ impl Runtime {
         }
     }
 
-    /// Retires completed commands, publishes more and keeps the firmware's rings drained.
-    /// Returns whether work remains.
-    fn service(&self) -> bool {
+    /// Reads the queue's retired position into `retired_total`.
+    fn advance(&self, state: &mut State) -> Result {
+        let (_, raw) = state.root.progress()?;
+        if state.capacity != 0 && raw < state.capacity {
+            let delta = (raw + state.capacity - state.retired_raw) % state.capacity;
+            state.retired_total += u64::from(delta);
+            state.retired_raw = raw;
+        }
+        Ok(())
+    }
+
+    /// Retires completed commands, publishes more and consumes the firmware's rings.
+    fn service(&self) {
         let mut guard = self.state.lock();
-        let Some(state) = Option::as_mut(&mut *guard) else { return false; };
+        let Some(state) = Option::as_mut(&mut *guard) else { return; };
+        self.service_locked(state);
+        if state.inflight.is_empty() && state.pending.is_empty() { self.idle.notify_all(); }
+    }
+
+    fn service_locked(&self, state: &mut State) {
         let _ = state.root.drain();
         if state.peer.is_crashed() {
             dev_err!(self.dev, "GPU firmware crashed; failing {} pending and {} published commands\n",
                      state.pending.len(), state.inflight.len());
             self.fail_all(state, EIO);
-            return false;
+            return;
         }
-        let raw = match state.root.progress() {
-            Ok((_, raw)) => raw,
-            Err(e) => { self.fail_all(state, e); return false; }
-        };
-        if state.capacity != 0 && raw < state.capacity {
-            let delta = (raw + state.capacity - state.retired_raw) % state.capacity;
-            state.retired_total += u64::from(delta);
-            state.retired_raw = raw;
+        if let Err(e) = self.advance(state) { self.fail_all(state, e); return; }
+        // The completion stamp is written before the firmware's post-processing advances the
+        // retired position, and that advance sends no message. If the front command's stamp
+        // is there but its position is not, the advance is imminent: wait for it, bounded,
+        // rather than for a notification that does not come.
+        if let Some((ordinal, stamp)) = state.inflight.first().map(|f| (f.ordinal, f.stamp)) {
+            if state.retired_total < ordinal && state.root.queue().1 >= stamp {
+                state.late += 1;
+                let start = Instant::<Monotonic>::now();
+                while state.retired_total < ordinal && start.elapsed() < Delta::from_micros(RETIRE_WAIT_US) {
+                    fsleep(Delta::from_micros(20));
+                    if let Err(e) = self.advance(state) { self.fail_all(state, e); return; }
+                }
+            }
         }
         while !state.inflight.is_empty() {
             let front = &state.inflight[0];
@@ -458,6 +553,7 @@ impl Runtime {
                     if let Err(e) = state.pool.retire(done.slot) {
                         dev_err!(self.dev, "GPU: tracking retirement failed {:?}\n", e);
                     }
+                    state.busy &= !(1 << done.slot);
                     state.retired += 1;
                     if done.last {
                         done.packet.retired();
@@ -469,30 +565,32 @@ impl Runtime {
                 dev_err!(self.dev, "GPU: compute command timed out: stamp={:#x} expected={:#x} submitted={} completed={}\n",
                          state.queue_stamp(), front.stamp.raw(), state.submitted, state.retired);
                 self.fail_all(state, ETIMEDOUT);
-                return false;
+                return;
             }
             break;
         }
-        if self.healthy() { self.pump(state); }
-        !state.inflight.is_empty() || !state.pending.is_empty()
+        if !self.healthy() { return; }
+        self.pump(state);
     }
 
     /// Stops the firmware: retire or fail outstanding work, allow power-off, then halt the ASC
     /// with every mapping still in place (RTKit power-off if the firmware does not stop).
     pub(crate) fn stop(&self) {
-        let start = Instant::<Monotonic>::now();
-        while start.elapsed() < Delta::from_millis(2000) {
-            if !self.service() { break; }
-            fsleep(Delta::from_millis(1));
+        // Let published work retire; the service signals `idle` when nothing is left.
+        {
+            let mut guard = self.state.lock();
+            let start = Instant::<Monotonic>::now();
+            while self.healthy() && start.elapsed() < Delta::from_millis(STOP_DRAIN_MS.into()) {
+                let Some(state) = guard.as_ref() else { break; };
+                if state.inflight.is_empty() && state.pending.is_empty() { break; }
+                let _ = self.idle.wait_timeout(&mut guard, msecs_to_jiffies(STOP_DRAIN_MS));
+            }
         }
         self.healthy.store(false, Ordering::Release);
-        // No poll work may remain queued or running once this returns.
-        let start = Instant::<Monotonic>::now();
-        while self.queued.load(Ordering::Acquire) != 0 && start.elapsed() < Delta::from_millis(2000) {
-            fsleep(Delta::from_millis(5));
-        }
-        // Let a run that just accounted for itself return out of this module.
-        fsleep(Delta::from_millis(20));
+        // Nothing queues service work after the detach, and none is queued or running once the
+        // drain returns, so no work outlives the module.
+        drop(self.notify.detach());
+        self.queue.drain();
         let mut guard = self.state.lock();
         let Some(mut state) = guard.take() else { return; };
         self.fail_all(&mut state, ENODEV);
@@ -505,8 +603,9 @@ impl Runtime {
             kernel::error::to_result(unsafe { kernel::bindings::apple_rtkit_poweroff(state.peer.as_raw()) })
         });
         state.asc.halt();
-        dev_info!(self.dev, "GPU stopped: allow-off={:?} running={:?} forced-off={:?} submitted={} completed={}\n",
-                  allowed, running, forced, state.submitted, state.retired);
+        dev_info!(self.dev, "GPU stopped: allow-off={:?} running={:?} forced-off={:?} submitted={} completed={} notifications={} late={} skipped-slots={}\n",
+                  allowed, running, forced, state.submitted, state.retired,
+                  self.notify.messages.load(Ordering::Relaxed), state.late, state.skipped);
         if running != Ok(0) && forced != Some(Ok(())) {
             dev_err!(self.dev, "GPU firmware did not stop; a reset is required\n");
         }
@@ -537,6 +636,7 @@ impl Backend {
     fn start(
         drm: &crate::driver::AsahiDrmDevice,
         dev: &device::Device,
+        notify: Arc<Notify>,
         peer: Peer,
         root: crate::fw::types::GpuObject<RootV27_2>,
         graph: Arc<GpuManagerG14V13_5>,
@@ -548,14 +648,18 @@ impl Backend {
         // state. Every failure after the state is moved in goes through Runtime::stop, which
         // halts the firmware and keeps all of its memory.
         let runtime_graph = graph.clone();
-        let runtime = match Arc::pin_init(try_pin_init!(Runtime {
-            dev: dev.into(),
-            graph: runtime_graph,
-            healthy: AtomicBool::new(true),
-            queued: AtomicU32::new(0),
-            state <- new_mutex!(None, "g14_v27_2::Runtime::state"),
-            poll <- new_delayed_work!("g14_v27_2::Runtime::poll"),
-        }), GFP_KERNEL) {
+        let runtime_notify = notify.clone();
+        let runtime = match OwnedQueue::new_ordered(c"asahi-g14-v27-2").and_then(|queue|
+            Arc::pin_init(try_pin_init!(Runtime {
+                dev: dev.into(),
+                graph: runtime_graph,
+                healthy: AtomicBool::new(true),
+                notify: runtime_notify,
+                queue,
+                state <- new_mutex!(None, "g14_v27_2::Runtime::state"),
+                idle <- new_condvar!("g14_v27_2::Runtime::idle"),
+                work <- new_work!("g14_v27_2::Runtime::work"),
+            }), GFP_KERNEL)) {
             Ok(runtime) => runtime,
             Err(e) => {
                 halt_unowned(dev, peer, root, asc, true);
@@ -585,6 +689,9 @@ impl Backend {
             next_slot: 0,
             waiting_unlink: false,
             published: 0,
+            late: 0,
+            busy: 0,
+            skipped: 0,
             retired_total: 0,
             retired_raw: head,
             capacity,
@@ -593,7 +700,10 @@ impl Backend {
             submitted: 0,
             retired: 0,
         });
-        runtime.schedule(IDLE_POLL_MS);
+        // From here the firmware's messages run the service; one run consumes anything it
+        // published before.
+        notify.attach(runtime.clone());
+        notify.wake();
         // One run queue per DRM scheduler priority (the front end maps queue priorities 0-3).
         let scheduler = match sched::Scheduler::new(drm.as_ref().as_ref(), 4, POOL_SLOTS as u32 - 1, 0, 10000,
             c"asahi_g14_sched").and_then(|s| Arc::new(s, GFP_KERNEL).map_err(Into::into)) {
