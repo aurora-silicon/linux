@@ -22,7 +22,10 @@ use kernel::{
     platform,
     prelude::*,
     sync::{aref::ARef, Arc, ArcBorrow},
-    time::{delay::fsleep, Delta, Instant, Monotonic},
+    time::{
+        delay::{fsleep, udelay},
+        Delta, Instant, Monotonic,
+    },
 };
 
 use super::adt::{self, GpuAdt};
@@ -634,6 +637,48 @@ fn devctl_op(
     channel::devctl_submit(session, channels, events, init, &DevCtl::op(opcode), true)
 }
 
+/// 27.2: waits for one posted boot control to retire, polling the indices every 5 us without
+/// draining or printing the rings, and returns how long it took. The firmware powers down about
+/// 0.5 ms after its last work, so a boot control posted later wakes it from idle first.
+fn await_boot_control_prompt(
+    session: &Session,
+    channels: &Channels,
+    init: &InitData,
+    target: u32,
+) -> Result<Delta> {
+    let start = Instant::<Monotonic>::now();
+    loop {
+        session.check()?;
+        let read = channels.devctl.read()?;
+        let done = channels.devctl.completion()?;
+        if read == target && done == target && init.readiness()? == 1 {
+            return Ok(start.elapsed());
+        }
+        if read > target || done > target || channels.devctl.write()? != target {
+            dev_err!(session.dev, "G16 boot control {}: unexpected indices\n", target);
+            channels.log_stop(session, init, "boot control indices");
+            return Err(eproto());
+        }
+        if init.halted()? {
+            dev_err!(session.dev, "G16 boot control {}: firmware halted\n", target);
+            channels.log_stop(session, init, "halted awaiting boot control");
+            return Err(EBUSY);
+        }
+        if start.elapsed() > Delta::from_millis(20) {
+            dev_err!(
+                session.dev,
+                "G16 boot control {} not retired in 20 ms (read {} completion {})\n",
+                target,
+                read,
+                done
+            );
+            channels.log_stop(session, init, "boot control timeout");
+            return Err(ETIMEDOUT);
+        }
+        udelay(Delta::from_micros(5));
+    }
+}
+
 /// Wait for one boot control to retire, requiring stable consumer+completion indices.
 fn wait_boot_control(
     session: &Session,
@@ -810,8 +855,27 @@ fn run(
         dev_info!(dev, "G16: 27.2 boot: no boot NOP, IMPORT_GLOBALS right after InitData\n");
         0
     };
-    devctl_op(session, channels, events, init, devctl.import_globals)?;
-    wait_boot_control(session, channels, events, init, base + 1, 5000)?;
+    // 27.2 (candidate): the boot controls go out back to back. Waiting 50 ms for stable
+    // indices after IMPORT_GLOBALS let the firmware power down before START, and on the J713
+    // and the J773g it took an SError on the wake that START caused (the J713's crash needed a
+    // doorbell at least ~0.5 ms after the firmware's last work).
+    let prompt = kind == hw::Start::MacOs27_2;
+    let import_retired = if prompt {
+        channel::devctl_submit(
+            session,
+            channels,
+            events,
+            init,
+            &DevCtl::op(devctl.import_globals),
+            false,
+        )?;
+        await_boot_control_prompt(session, channels, init, base + 1)?
+    } else {
+        devctl_op(session, channels, events, init, devctl.import_globals)?;
+        wait_boot_control(session, channels, events, init, base + 1, 5000)?;
+        Delta::from_micros(0)
+    };
+    let import_done = Instant::<Monotonic>::now();
     let scheduler = init.control.as_ref().ok_or(EINVAL)?;
     let scheduler_word = init.firmware_data().scheduler;
     let pending = scheduler.r32(scheduler_word)?;
@@ -824,7 +888,6 @@ fn run(
             channels.log_stop(session, init, "scheduler word unexpected after IMPORT_GLOBALS");
             return Err(EBUSY);
         }
-        dev_info!(dev, "G16: 27.2 scheduler request {} pending at START\n", pending);
         if pending == 0 {
             scheduler.w32(scheduler_word, 1)?;
         }
@@ -836,9 +899,26 @@ fn run(
         scheduler.w32(scheduler_word, 1)?;
     }
     regs::wmb();
-    devctl_op(session, channels, events, init, devctl.start)?;
-    wait_boot_control(session, channels, events, init, base + 2, 2000)?;
-    session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
+    if prompt {
+        let posted = import_done.elapsed();
+        channel::devctl_submit(session, channels, events, init, &DevCtl::op(devctl.start), false)?;
+        let start_retired = await_boot_control_prompt(session, channels, init, base + 2)?;
+        session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
+        dev_info!(
+            dev,
+            "G16: 27.2 boot controls back to back: IMPORT_GLOBALS retired in {} us, START posted {} us later with scheduler request {} pending, retired in {} us\n",
+            import_retired.as_micros_ceil(),
+            posted.as_micros_ceil(),
+            pending,
+            start_retired.as_micros_ceil()
+        );
+        // Settled: the same stable-index check as 25G83, now with no boot doorbell left.
+        wait_boot_control(session, channels, events, init, base + 2, 2000)?;
+    } else {
+        devctl_op(session, channels, events, init, devctl.start)?;
+        wait_boot_control(session, channels, events, init, base + 2, 2000)?;
+        session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
+    }
     for _ in 0..10 {
         fsleep(Delta::from_millis(10));
         channels.drain_rings(&dev, events)?;
