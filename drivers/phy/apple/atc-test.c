@@ -1493,8 +1493,8 @@ static void atcphy_test_t8152_lanes(struct kunit *test)
 	atcphy_lanes_up_t8152(atcphy, APPLE_ATCPHY_MODE_USB3);
 	KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_LANE0), ATCPHY_TEST_T8152_LANE0_UP);
 	KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_SLEEP_CTRL2),
-			ACIOPHY_T8152_AON_SLEEP_CTRL2_RXA_LFPS_SMALL_LN0 |
-			ACIOPHY_T8152_AON_SLEEP_CTRL2_RXA_LFPS_BIG_LN0);
+			ACIOPHY_T8152_AON_SLEEP_CTRL2_RXA_LFPS_SMALL(0) |
+			ACIOPHY_T8152_AON_SLEEP_CTRL2_RXA_LFPS_BIG(0));
 	KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_CROSSBAR_T8103), 0x110U);
 
 	KUNIT_EXPECT_EQ(test, atcphy_configure_lanes(atcphy, APPLE_ATCPHY_MODE_USB3), 0);
@@ -1575,11 +1575,136 @@ static void atcphy_test_t8152_no_tunables(struct kunit *test)
 	atcphy_test_t8152_untouched(test, atcphy);
 }
 
+/* Both LFPS receivers of a lane on */
+static u32 atcphy_test_t8152_lfps(unsigned int lane)
+{
+	return ACIOPHY_T8152_AON_SLEEP_CTRL2_RXA_LFPS_SMALL(lane) |
+	       ACIOPHY_T8152_AON_SLEEP_CTRL2_RXA_LFPS_BIG(lane);
+}
+
+/*
+ * CIO on a rear port: both lanes powered up one after the other, the USB4
+ * crossbar by the orientation, the lane swap for a reversed plug too, and on
+ * the way down both lanes clamped, their LFPS receivers off and AUX clamped.
+ */
+static void atcphy_test_t8152_cio_lanes(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_t8152(test);
+	void __iomem *core = atcphy->regs.core;
+	u32 ctrl = ATCPHY_T8152_CFG_OFFSET + ATCPHY_POWER_CTRL;
+	u32 misc = ATCPHY_T8152_CFG_OFFSET + ATCPHY_MISC;
+
+	atcphy->fixed_usb3 = false;
+	atcphy->cio_only = true;
+	for (int reversed = 0; reversed < 2; reversed++) {
+		atcphy->swap_lanes = reversed;
+		writel(ACIOPHY_T8152_AON_LANE_CLAMP_EN, core + ACIOPHY_T8152_AON_LANE(0));
+		writel(ACIOPHY_T8152_AON_LANE_CLAMP_EN, core + ACIOPHY_T8152_AON_LANE(1));
+		writel(ACIOPHY_T8152_AON_SLEEP_CTRL2_AUX_CLAMP_EN,
+		       core + ACIOPHY_T8152_AON_SLEEP_CTRL2);
+		writel(reversed ? 0 : ATCPHY_T8152_MISC_LANE_SWAP, core + misc);
+		writel(ACIOPHY_CROSSBAR_DP_SINGLE_PMA_UNK100 << 5 | ACIOPHY_CROSSBAR_DP_BOTH_PMA,
+		       core + ACIOPHY_CROSSBAR_T8103);
+
+		atcphy_lanes_up_t8152(atcphy, APPLE_ATCPHY_MODE_USB4);
+		KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_LANE(0)),
+				ATCPHY_TEST_T8152_LANE0_UP);
+		KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_LANE(1)),
+				ATCPHY_TEST_T8152_LANE0_UP);
+		KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_SLEEP_CTRL2),
+				ACIOPHY_T8152_AON_SLEEP_CTRL2_AUX_CLAMP_EN |
+				atcphy_test_t8152_lfps(0) | atcphy_test_t8152_lfps(1));
+		KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_CROSSBAR_T8103),
+				(u32)ACIOPHY_CROSSBAR_DP_BOTH_PMA | reversed);
+
+		KUNIT_EXPECT_EQ(test, atcphy_configure_lanes(atcphy, APPLE_ATCPHY_MODE_USB4), 0);
+		KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_CROSSBAR_T8103), (u32)reversed);
+		KUNIT_EXPECT_EQ(test, readl(core + misc),
+				reversed ? ATCPHY_T8152_MISC_LANE_SWAP : 0U);
+
+		atcphy->mode = APPLE_ATCPHY_MODE_USB4;
+		writel(ATCPHY_POWER_APB_RESET_N, core + ctrl);
+		atcphy_lanes_down_t8152(atcphy);
+		KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_LANE(0)),
+				ACIOPHY_T8152_AON_LANE_CLAMP_EN);
+		KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_LANE(1)),
+				ACIOPHY_T8152_AON_LANE_CLAMP_EN);
+		KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_SLEEP_CTRL2),
+				ACIOPHY_T8152_AON_SLEEP_CTRL2_AUX_CLAMP_EN);
+		atcphy->mode = APPLE_ATCPHY_MODE_OFF;
+		atcphy_test_t8152_untouched(test, atcphy);
+	}
+}
+
+/* A lane power-down with the register bus in reset leaves the lanes alone */
+static void atcphy_test_t8152_lanes_bus_reset(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_t8152(test);
+	void __iomem *core = atcphy->regs.core;
+
+	writel(ATCPHY_TEST_T8152_LANE0_UP, core + ACIOPHY_T8152_AON_LANE0);
+	writel(ATCPHY_POWER_CLAMP_EN, core + ATCPHY_T8152_CFG_OFFSET + ATCPHY_POWER_CTRL);
+	atcphy_lanes_down_t8152(atcphy);
+	KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_LANE0), ATCPHY_TEST_T8152_LANE0_UP);
+}
+
+/* Only USB4 in its own mode, and Thunderbolt, ask a CIO-only PHY for CIO */
+static void atcphy_test_cio_target_mode(struct kunit *test)
+{
+	struct typec_altmode dp = { .svid = USB_TYPEC_DP_SID };
+	struct typec_altmode tbt = { .svid = USB_TYPEC_TBT_SID };
+	struct enter_usb_data usb4 = { .eudo = FIELD_PREP(EUDO_USB_MODE_MASK, EUDO_USB_MODE_USB4) };
+	struct enter_usb_data usb3 = { .eudo = FIELD_PREP(EUDO_USB_MODE_MASK, EUDO_USB_MODE_USB3) };
+	struct typec_mux_state state = { .mode = TYPEC_MODE_USB4, .data = &usb4 };
+
+	KUNIT_EXPECT_EQ(test, atcphy_cio_target_mode(&state), APPLE_ATCPHY_MODE_USB4);
+	state.data = &usb3;
+	KUNIT_EXPECT_EQ(test, atcphy_cio_target_mode(&state), APPLE_ATCPHY_MODE_OFF);
+	state.data = NULL;
+	KUNIT_EXPECT_EQ(test, atcphy_cio_target_mode(&state), APPLE_ATCPHY_MODE_OFF);
+	state.alt = &tbt;
+	state.mode = TYPEC_TBT_MODE;
+	KUNIT_EXPECT_EQ(test, atcphy_cio_target_mode(&state), APPLE_ATCPHY_MODE_TBT);
+	state.alt = &dp;
+	state.mode = TYPEC_DP_STATE_D;
+	KUNIT_EXPECT_EQ(test, atcphy_cio_target_mode(&state), APPLE_ATCPHY_MODE_OFF);
+	state.alt = NULL;
+	state.mode = TYPEC_STATE_USB;
+	KUNIT_EXPECT_EQ(test, atcphy_cio_target_mode(&state), APPLE_ATCPHY_MODE_OFF);
+	state.mode = TYPEC_STATE_SAFE;
+	KUNIT_EXPECT_EQ(test, atcphy_cio_target_mode(&state), APPLE_ATCPHY_MODE_OFF);
+}
+
+/* The PHY is idle only as its power-up leaves it */
+static void atcphy_test_t8152_cio_idle(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_t8152(test);
+	void __iomem *core = atcphy->regs.core;
+	u32 ctrl = ATCPHY_T8152_CFG_OFFSET + ATCPHY_POWER_CTRL;
+	u32 stat = ATCPHY_T8152_CFG_OFFSET + ATCPHY_POWER_STAT;
+
+	writel(ATCPHY_POWER_CLAMP_EN, core + ctrl);
+	KUNIT_EXPECT_TRUE(test, atcphy_cio_idle(atcphy));
+	/* the display driver's DisplayPort setup */
+	writel(0x1b, core + ctrl);
+	KUNIT_EXPECT_FALSE(test, atcphy_cio_idle(atcphy));
+	writel(ATCPHY_POWER_CLAMP_EN, core + ctrl);
+	writel(ATCPHY_POWER_SLEEP_SMALL, core + stat);
+	KUNIT_EXPECT_FALSE(test, atcphy_cio_idle(atcphy));
+	writel(0, core + stat);
+	writel(ATCPHY_MISC_RESET_N, core + ATCPHY_T8152_SYNC_RESET);
+	KUNIT_EXPECT_FALSE(test, atcphy_cio_idle(atcphy));
+}
+
 static struct kunit_case atcphy_t8152_test_cases[] = {
 	KUNIT_CASE(atcphy_test_t8152_lanes),
 	KUNIT_CASE(atcphy_test_t8152_no_tunables),
 	KUNIT_CASE(atcphy_test_t8152_power),
 	KUNIT_CASE(atcphy_test_t8152_pipe_lock),
+	KUNIT_CASE(atcphy_test_t8152_cio_lanes),
+	KUNIT_CASE(atcphy_test_t8152_lanes_bus_reset),
+	KUNIT_CASE(atcphy_test_cio_target_mode),
+	KUNIT_CASE(atcphy_test_t8152_cio_idle),
 	{}
 };
 
