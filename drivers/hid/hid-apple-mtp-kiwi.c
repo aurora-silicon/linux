@@ -36,6 +36,7 @@
 #include <linux/hid.h>
 #include <linux/input/mt.h>
 #include <linux/module.h>
+#include <linux/property.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 
@@ -48,11 +49,6 @@
 #define KIWI_MIN_FRAME		(KIWI_HDR_LEN + 2 * KIWI_CELLS)
 #define KIWI_MAGIC		0x5a
 #define KIWI_MAX_SLOTS		10
-/* eDP-1 panel of the k114c, 3024x1986. */
-#define KIWI_MAX_X		3023
-#define KIWI_MAX_Y		1985
-/* Panel is about 10 units per mm. */
-#define KIWI_RES		10
 #define KIWI_FP			256
 /* counts: reference frames shift the mean by 137 to 899, idle frames by under 10 */
 #define KIWI_GLITCH		64
@@ -96,6 +92,8 @@ struct kiwi_contact {
 
 struct kiwi {
 	struct input_dev *input;
+	int size_x, size_y;
+	int res_x, res_y;
 	bool have_base;
 	int rowmean[KIWI_ROWS];	/* per-row mean of the last frame, pre-removal */
 	u8 cand_hot[(KIWI_CELLS + 7) / 8];	/* hot-cell map of the first baseline candidate */
@@ -546,11 +544,11 @@ static void kiwi_report(struct kiwi *k)
 		input_mt_report_slot_state(input, MT_TOOL_FINGER, c->on);
 		if (!c->on)
 			continue;
-		x = div_s64((s64)c->x * (KIWI_MAX_X + 1), KIWI_COLS * KIWI_FP);
-		y = div_s64((s64)c->y * (KIWI_MAX_Y + 1), KIWI_ROWS * KIWI_FP);
+		x = div_s64((s64)c->x * k->size_x, KIWI_COLS * KIWI_FP);
+		y = div_s64((s64)c->y * k->size_y, KIWI_ROWS * KIWI_FP);
 		/* Row 0 is the bottom edge of the panel. */
-		x = clamp(x, 0, KIWI_MAX_X);
-		y = clamp(KIWI_MAX_Y - y, 0, KIWI_MAX_Y);
+		x = clamp(x, 0, k->size_x - 1);
+		y = clamp(k->size_y - 1 - y, 0, k->size_y - 1);
 		input_report_abs(input, ABS_MT_POSITION_X, x);
 		input_report_abs(input, ABS_MT_POSITION_Y, y);
 		input_report_abs(input, ABS_MT_TOUCH_MAJOR, c->size * 16);
@@ -789,10 +787,10 @@ static struct input_dev *kiwi_alloc_input(struct hid_device *hdev, struct kiwi *
 	input->close = kiwi_input_close;
 	input_set_drvdata(input, k);
 	__set_bit(INPUT_PROP_DIRECT, input->propbit);
-	input_set_abs_params(input, ABS_MT_POSITION_X, 0, KIWI_MAX_X, 0, 0);
-	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, KIWI_MAX_Y, 0, 0);
-	input_abs_set_res(input, ABS_MT_POSITION_X, KIWI_RES);
-	input_abs_set_res(input, ABS_MT_POSITION_Y, KIWI_RES);
+	input_set_abs_params(input, ABS_MT_POSITION_X, 0, k->size_x - 1, 0, 0);
+	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, k->size_y - 1, 0, 0);
+	input_abs_set_res(input, ABS_MT_POSITION_X, k->res_x);
+	input_abs_set_res(input, ABS_MT_POSITION_Y, k->res_y);
 	input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
 	if (input_mt_init_slots(input, KIWI_MAX_SLOTS, INPUT_MT_DIRECT))
 		return NULL;
@@ -802,11 +800,24 @@ static struct input_dev *kiwi_alloc_input(struct hid_device *hdev, struct kiwi *
 static int kiwi_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
 	struct kiwi *kiwi;
+	u32 size_x, size_y, mm_x, mm_y;
 	int ret;
+
+	if (device_property_read_u32(&hdev->dev, "touchscreen-size-x", &size_x) ||
+	    device_property_read_u32(&hdev->dev, "touchscreen-size-y", &size_y) ||
+	    device_property_read_u32(&hdev->dev, "touchscreen-x-mm", &mm_x) ||
+	    device_property_read_u32(&hdev->dev, "touchscreen-y-mm", &mm_y) ||
+	    size_x < 2 || size_x > INT_MAX || size_y < 2 || size_y > INT_MAX ||
+	    !mm_x || mm_x > size_x || !mm_y || mm_y > size_y)
+		return dev_err_probe(&hdev->dev, -EINVAL, "invalid touchscreen geometry\n");
 
 	kiwi = devm_kzalloc(&hdev->dev, sizeof(*kiwi), GFP_KERNEL);
 	if (!kiwi)
 		return -ENOMEM;
+	kiwi->size_x = size_x;
+	kiwi->size_y = size_y;
+	kiwi->res_x = DIV_ROUND_CLOSEST(size_x, mm_x);
+	kiwi->res_y = DIV_ROUND_CLOSEST(size_y, mm_y);
 	hid_set_drvdata(hdev, kiwi);
 
 	ret = hid_parse(hdev);
