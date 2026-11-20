@@ -512,7 +512,7 @@ pub(crate) fn admit(
     for what in adt.layout.unknown() {
         dev_err!(
             dev,
-            "G16: the {} firmware cannot be started yet: {} is not known\n",
+            "G16: the {} firmware cannot be started yet; not known: {}\n",
             adt.layout.name,
             what
         );
@@ -670,9 +670,11 @@ fn run(
     session.regs.set_generation(0)?;
     channels.stage_boot_nop(session, devctl.nop)?;
     match session.adt.layout.loader_table {
-        LoaderTable::Host(offset) => publish_loader_table(session, init, offset)?,
+        Some(LoaderTable::Host(offset)) => publish_loader_table(session, init, offset)?,
         // The firmware copies the register map from HW data while it parses InitData.
-        LoaderTable::Firmware(_) => {}
+        Some(LoaderTable::Firmware) => {}
+        // Admission refuses such a layout; never guess here.
+        None => return Err(ENOTSUPP),
     }
     let root = init.root_va()?;
     session.send(

@@ -27,7 +27,7 @@ mod fw;
 #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/encode.rs"]
 mod encode;
 
-use backend_hw::{FwAbi, LoaderTable, FW_25G83, FW_26B123, UPPER};
+use backend_hw::{FwAbi, LoaderTable, PplMagic, FW_25G83, FW_26B123, PPL_MAGIC, UPPER};
 use fw::initdata::{self as wire, id};
 use fw::work::{compute, fs, ta};
 
@@ -215,13 +215,18 @@ fn catalog() {
     assert!(!FW_26B123.matches(2, &[UPPER, UPPER + 0x64000], &[1, 0x10]));
     assert_eq!((FW_25G83.abi, FW_26B123.abi), (FwAbi::V25G83, FwAbi::V26B123));
     assert_eq!(FW_25G83.unknown().count(), 0);
+    // Only how the firmware's register table is filled still refuses a 26B123 start.
     let unknown: Vec<_> = FW_26B123.unknown().collect();
-    assert_eq!(unknown.len(), 2, "{unknown:?}");
-    assert!(unknown[0].contains("page tables") && unknown[1].contains("PPL"));
-    assert_eq!(FW_25G83.loader_table, LoaderTable::Host(0x1332f0));
-    assert_eq!(FW_26B123.loader_table, LoaderTable::Firmware(0xc72e8));
-    assert_eq!((FW_25G83.ppl_magic, FW_26B123.ppl_magic), (Some(0x4b1d000000000002), None));
-    assert!(FW_26B123.leaves.is_none());
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert!(unknown[0].contains("register map"));
+    assert_eq!(FW_25G83.loader_table, Some(LoaderTable::Host(0x1332f0)));
+    assert_eq!(FW_26B123.loader_table, None);
+    assert_eq!(PPL_MAGIC, 0x4b1d000000000002);
+    assert_eq!(FW_25G83.ppl_magic, Some(PplMagic { ap: PPL_MAGIC, firmware: PPL_MAGIC }));
+    assert_eq!(FW_26B123.ppl_magic, Some(PplMagic { ap: PPL_MAGIC, firmware: 0x4b1d000000000003 }));
+    // The 26B123 firmware builds its own page-table tree: the boot loader builds no leaf.
+    assert_eq!(FW_25G83.leaves.map(|l| l.len()), Some(5));
+    assert_eq!(FW_26B123.leaves.map(|l| l.len()), Some(0));
     // Device control.
     let (a, b) = (FwAbi::V25G83.devctl(), FwAbi::V26B123.devctl());
     assert_eq!((a.import_globals, a.start, a.nop, a.grow_reply), (0x34, 0x0a, 0x1a, 7));

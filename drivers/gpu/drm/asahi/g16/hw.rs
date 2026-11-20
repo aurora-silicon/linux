@@ -242,7 +242,7 @@ pub(crate) enum Segment {
     Data,
 }
 
-/// One range of the firmware's own page tables as the boot loader builds them: offsets from
+/// One range of leaves the boot loader builds in the firmware's own page tables: offsets from
 /// [`UPPER`], the segment whose physical pages back them (at the same offset from the segment's
 /// start), and the exact leaf attribute bits.
 pub(crate) struct Leaves {
@@ -267,12 +267,22 @@ pub(crate) enum LoaderTable {
     Host(u64),
     /// The host leaves loaded DATA alone: the firmware copies every named register-map slot
     /// and the SGX window from HW data itself while it parses InitData, as the T6041 and M5
-    /// G16-family firmware do. Its table is at this DATA offset.
-    Firmware(u64),
+    /// G16-family firmware do.
+    Firmware,
+}
+
+/// The two magic words of the PPL handoff page.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct PplMagic {
+    /// What the AP publishes at +0.
+    pub(crate) ap: u64,
+    /// The only non-zero value +8 may hold at cold admission: what the firmware leaves there
+    /// once it has run.
+    pub(crate) firmware: u64,
 }
 
 /// The loaded-image layout of one firmware ABI: the boot loader's handoff for it, the regions
-/// it reserves, the firmware page tables it builds, and where the boot path writes.
+/// it reserves, the leaves it builds in the firmware page tables, and where the boot path writes.
 pub(crate) struct FwLayout {
     pub(crate) name: &'static str,
     /// `apple,g16-handoff-version`, `apple,firmware-segment-vas` and `-flags`.
@@ -285,15 +295,15 @@ pub(crate) struct FwLayout {
     pub(crate) data_size: u64,
     /// The firmware ABI of the builds this layout holds.
     pub(crate) abi: FwAbi,
-    /// Every leaf of the firmware's own page tables, in VA order; `None` until known, which
-    /// refuses the firmware.
+    /// Every leaf the boot loader builds in the firmware's own page tables, in VA order, and
+    /// the only leaves cold admission accepts (none: the firmware builds its own tree at
+    /// start); `None` until known, which refuses the firmware.
     pub(crate) leaves: Option<&'static [Leaves]>,
-    /// The magic the AP publishes at +0 of the PPL handoff page, and the only non-zero value
-    /// either magic word may hold at cold admission; `None` until known, which refuses the
-    /// firmware.
-    pub(crate) ppl_magic: Option<u64>,
-    /// The firmware's register table in loaded DATA.
-    pub(crate) loader_table: LoaderTable,
+    /// The PPL handoff page's magic words; `None` until known, which refuses the firmware.
+    pub(crate) ppl_magic: Option<PplMagic>,
+    /// How the firmware's register table in loaded DATA is filled; `None` until known, which
+    /// refuses the firmware.
+    pub(crate) loader_table: Option<LoaderTable>,
 }
 
 impl FwLayout {
@@ -306,13 +316,15 @@ impl FwLayout {
     /// firmware can be started.
     pub(crate) fn unknown(&self) -> impl Iterator<Item = &'static str> {
         [
-            self.leaves.is_none().then_some(
-                "the leaf attributes of the firmware page tables the boot loader builds \
-                 (DATA with segment flag 0x10, the shared read-only segment)",
-            ),
-            self.ppl_magic.is_none().then_some(
-                "the PPL handoff magic the AP publishes (the firmware stores \
-                 0x4b1d000000000003 at +8)",
+            self.leaves
+                .is_none()
+                .then_some("the leaves the boot loader builds in the firmware page tables"),
+            self.ppl_magic
+                .is_none()
+                .then_some("the PPL handoff magic words"),
+            self.loader_table.is_none().then_some(
+                "whether the host writes the register map into the firmware's table in \
+                 loaded DATA or the firmware copies it from HW data",
             ),
         ]
         .into_iter()
@@ -356,20 +368,26 @@ pub(crate) const FW_25G83: FwLayout = FwLayout {
             attrs: 0x0460000000000443,
         },
     ]),
-    ppl_magic: Some(PPL_MAGIC),
-    loader_table: LoaderTable::Host(0x1332f0),
+    // The 25G83 firmware never writes +8; the AP's magic there is accepted.
+    ppl_magic: Some(PplMagic {
+        ap: PPL_MAGIC,
+        firmware: PPL_MAGIC,
+    }),
+    loader_table: Some(LoaderTable::Host(0x1332f0)),
 };
 
 /// 26B123 (macOS 27.2, also 26B131): __TEXT 0x64000, __DATA 0xd0000 and a __DATA_SHARED_RO
 /// 0x8000 right after it (aura's handoff version 2; `fw-data` covers both, so the RTKit crash
 /// log at the start of the shared read-only segment lies inside it).
 ///
-/// The page tables iBoot builds for it are expected to map TEXT below 0x64000 (GXF code
-/// 0x54000..0x5c000), DATA at 0x64000..0x134000 (its GXF window still the first 0xc000) and the
-/// shared read-only segment at 0x134000..0x13c000, but their leaf attributes are not known.
-/// Neither is the AP's PPL handoff magic: this firmware stores 0x4b1d000000000003 at +8 of the
-/// page when it sets up its MMU, which the 25G83 firmware never did. The firmware's register
-/// table is at DATA + 0xc72e8 (60 slots).
+/// The boot loader leaves the page-table region zero: the RTKit start code takes the tables
+/// base from a boot-filled patchbay record, builds root[0], the L2 at +0x4000 and the L3 at
+/// +0x8000 with the TEXT and DATA leaves itself and sets TTBR1_EL1. So only an empty tree is
+/// admitted. When it sets up its MMU the firmware stores 0x4b1d000000000003 at +8 of the PPL
+/// handoff page (the 25G83 firmware never wrote there); nothing in it compares the AP's +0
+/// word, which keeps the 25G83 value (provisional). Whether macOS still writes the register
+/// map into the firmware's table (DATA + 0xc72e8, 60 slots) before the start or leaves it to
+/// the firmware's own copy from HW data is not known yet.
 pub(crate) const FW_26B123: FwLayout = FwLayout {
     name: "26B123",
     handoff_version: 2,
@@ -378,9 +396,13 @@ pub(crate) const FW_26B123: FwLayout = FwLayout {
     text_size: 0x64000,
     data_size: 0xd8000,
     abi: FwAbi::V26B123,
-    leaves: None,
-    ppl_magic: None,
-    loader_table: LoaderTable::Firmware(0xc72e8),
+    // The firmware builds its own tree at start; admit only an empty tree.
+    leaves: Some(&[]),
+    ppl_magic: Some(PplMagic {
+        ap: PPL_MAGIC,
+        firmware: 0x4b1d000000000003,
+    }),
+    loader_table: None,
 };
 
 /// The firmware layouts this backend knows, newest last.

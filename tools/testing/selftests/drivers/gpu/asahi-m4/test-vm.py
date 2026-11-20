@@ -26,6 +26,7 @@ layout = hw[hw.index('pub(crate) const FW_25G83: FwLayout = FwLayout {'):]
 leaves = layout[layout.index('leaves: Some(&[') + len('leaves: Some('):layout.index(']),') + 1]
 hw_leaves = '\n'.join([body(hw, '#[derive(Clone, Copy, PartialEq, Eq, Debug)]\npub(crate) enum Segment {'),
                        body(hw, 'pub(crate) struct Leaves {'),
+                       body(hw, '#[derive(Clone, Copy, PartialEq, Eq, Debug)]\npub(crate) struct PplMagic {'),
                        'pub const LEAVES_25G83: &[Leaves] = ' + leaves + ';'])
 vm = (ROOT/'drivers/gpu/drm/asahi/g16/vm.rs').read_text()
 pt = (ROOT/'drivers/gpu/drm/asahi/pgtable.rs').read_text()
@@ -84,8 +85,8 @@ fn with_table<R>(pa:u64,count:usize,f:impl FnOnce(&[AtomicU64])->R)->Result<R>{l
 fn entry(pa:u64,index:usize)->Result<u64>{with_table(pa,index+1,|e|e[index].load(Ordering::Acquire))}
 fn clean_entries(pa:u64,first:usize,count:usize)->Result{with_table(pa,first+count,|_|())?;note(format!("clean:{pa:x}:{first}:{count}"));Ok(())}
 fn clean_page(pa:u64)->Result{clean_entries(pa,0,ENTRIES)}
-struct Window{handoff:Mapping,ttbs:Mapping,root:Mapping,shared_l2:Mapping,image:Vec<u64>,snapshot:Vec<u64>,published:bool,firmware_root:[u64;2],text_pa:u64,data_pa:u64,leaves:&'static [hw::Leaves],ppl_magic:u64}
-impl Window{fn blank()->Self{Self{handoff:Mapping::new(0x807000000,0x4000,"handoff"),ttbs:Mapping::new(0x808000000,0x4000,"ttbs"),root:Mapping::new(0x800000000,0x40000,"root"),shared_l2:Mapping::new(0x801000000,0x4000,"shared"),image:vec![0;2048],snapshot:vec![0;2048],published:false,firmware_root:[0;2],text_pa:0x802000000,data_pa:0x803000000,leaves:hw::LEAVES_25G83,ppl_magic:hw::PPL_MAGIC}}
+struct Window{handoff:Mapping,ttbs:Mapping,root:Mapping,shared_l2:Mapping,image:Vec<u64>,snapshot:Vec<u64>,published:bool,firmware_root:[u64;2],text_pa:u64,data_pa:u64,leaves:&'static [hw::Leaves],ppl:hw::PplMagic}
+impl Window{fn blank()->Self{Self{handoff:Mapping::new(0x807000000,0x4000,"handoff"),ttbs:Mapping::new(0x808000000,0x4000,"ttbs"),root:Mapping::new(0x800000000,0x40000,"root"),shared_l2:Mapping::new(0x801000000,0x4000,"shared"),image:vec![0;2048],snapshot:vec![0;2048],published:false,firmware_root:[0;2],text_pa:0x802000000,data_pa:0x803000000,leaves:hw::LEAVES_25G83,ppl:hw::PplMagic{ap:hw::PPL_MAGIC,firmware:hw::PPL_MAGIC}}}
 '''
 post = r'''
 }
@@ -112,6 +113,24 @@ fn root_admission_tests(){
  for i in 0..195{w.handoff.try_write64(1,0x20+i*8).unwrap();assert_eq!(w.admit_cold(),Err(EBUSY));w.handoff.try_write64(0,0x20+i*8).unwrap();}
  for i in 0..128{w.ttbs.try_write64(1,i*8).unwrap();assert_eq!(w.admit_cold(),Err(EBUSY));w.ttbs.try_write64(0,i*8).unwrap();}
 }
+// 26B123: the firmware builds its own tree at start, so only an empty tree is admitted, and it
+// leaves its own magic at +8 of the handoff page once it has run.
+fn firmware_built_tree_tests(){
+ const FW:u64=0x4b1d000000000003;
+ let fresh=||{let mut w=Window::blank();w.leaves=&[];w.ppl=hw::PplMagic{ap:hw::PPL_MAGIC,firmware:FW};w};
+ assert!(fresh().admit_cold().is_ok());
+ let mut built=seeded();built.leaves=&[];assert_eq!(built.admit_cold(),Err(EINVAL));
+ let mut w=fresh();w.root.try_write64(fw_word(0,&w),0).unwrap();assert_eq!(w.admit_cold(),Err(EINVAL));
+ let mut w=fresh();
+ w.handoff.try_write64(FW,8).unwrap();assert!(w.admit_cold().is_ok());
+ w.handoff.try_write64(hw::PPL_MAGIC,8).unwrap();assert_eq!(w.admit_cold(),Err(EBUSY));
+ w.handoff.try_write64(0,8).unwrap();w.handoff.try_write64(FW,0).unwrap();assert_eq!(w.admit_cold(),Err(EBUSY));
+ w.handoff.try_write64(hw::PPL_MAGIC,0).unwrap();assert!(w.admit_cold().is_ok());
+ let uat=mmu::Uat{lower:0x804000000,shadow:0x805000000};let l2=0x805004000;let l3=0x805008000;
+ {let mut ram=RAM.lock().unwrap();for pa in [uat.shadow,l2,l3]{ram.insert(pa,(0..2048).map(|_|AtomicU64::new(0)).collect());}ram[&uat.shadow][2].store(l2|3,Ordering::Release);}
+ for firmware_magic in [0,FW]{let mut w=fresh();w.handoff.try_write64(firmware_magic,8).unwrap();w.bootstrap(&device::Device,&uat).unwrap();
+  assert_eq!(w.handoff.try_read64(0).unwrap(),hw::PPL_MAGIC);assert_eq!(w.handoff.try_read8(0x638).unwrap(),u8::from(firmware_magic==0));}
+}
 fn publication_tests(){
  let uat=mmu::Uat{lower:0x804000000,shadow:0x805000000};let l2=0x805004000;let l3=0x805008000;
  {let mut ram=RAM.lock().unwrap();for pa in [uat.shadow,l2,l3]{ram.insert(pa,(0..2048).map(|_|AtomicU64::new(0)).collect());}ram[&uat.shadow][2].store(l2|3,Ordering::Release);ram[&l2][4].store(l3|3,Ordering::Release);ram[&l3][0].store(0x806000000|0x00e000000000040b,Ordering::Release);}
@@ -126,7 +145,7 @@ fn prot_and_va_tests(){
  for p in [0x00c000000000044bu64,0x00e000000000040b,0x00c0000000000443,0x00e0000000000403,0x00c0000000000447,0x0080000000000447,0x00200000000004c7]{assert_eq!(Prot::from_pte(p).leaf_bits()|3,p);}
  let ranges=reserved_ranges();assert_eq!(ranges,[0x1000000000..0x1000010000,0x7000000000..0x7100000000]);assert_eq!(ranges[1].end-ranges[1].start,4u64<<30);
 }
-fn main(){let args:Vec<_>=std::env::args().collect();for id in 0..12{assert_c_parity(&mutation(id),id,&args[1],&args[2]);}root_admission_tests();publication_tests();prot_and_va_tests();println!("12 C/Rust firmware-graph parity fixtures; 195 flush, 128 TTBAT ownership rejections; stopped publication ordering; live link ownership/global TLBI; exact M4 leaf classes/VA reservations passed (mock hardware; PPL lease mocked and tested separately)");}
+fn main(){let args:Vec<_>=std::env::args().collect();for id in 0..12{assert_c_parity(&mutation(id),id,&args[1],&args[2]);}root_admission_tests();publication_tests();firmware_built_tree_tests();prot_and_va_tests();println!("12 C/Rust firmware-graph parity fixtures; 195 flush, 128 TTBAT ownership rejections; stopped publication ordering; live link ownership/global TLBI; exact M4 leaf classes/VA reservations; empty firmware-built tree and +8 firmware magic passed (mock hardware; PPL lease mocked and tested separately)");}
 '''
 harness = pre.replace('__HW_LEAVES__', hw_leaves) + methods + post + prot_constants + prot_impl + reserved
 (OUT/'check-vm.rs').write_text(harness)

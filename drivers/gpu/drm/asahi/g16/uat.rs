@@ -177,10 +177,11 @@ pub(crate) struct Window {
     firmware_root: [u64; 2],
     text_pa: u64,
     data_pa: u64,
-    /// The firmware page-table leaves the boot loader builds for this firmware.
+    /// The leaves the boot loader builds in this firmware's page tables (none for a firmware
+    /// that builds its own tree at start).
     leaves: &'static [hw::Leaves],
-    /// The PPL handoff magic of this firmware's layout.
-    ppl_magic: u64,
+    /// The PPL handoff magic words of this firmware's layout.
+    ppl: hw::PplMagic,
 }
 
 impl Window {
@@ -199,7 +200,7 @@ impl Window {
             data_pa: adt.data.start,
             // Admission refuses a layout with either unknown; never guess them here.
             leaves: adt.layout.leaves.ok_or(ENOTSUPP)?,
-            ppl_magic: adt.layout.ppl_magic.ok_or(ENOTSUPP)?,
+            ppl: adt.layout.ppl_magic.ok_or(ENOTSUPP)?,
         };
         window.admit_cold()?;
         Ok(window)
@@ -227,9 +228,9 @@ impl Window {
             return Err(EBUSY);
         }
         let h = self.handoff.io();
-        for offset in [0, 8] {
+        for (offset, expected) in [(0, self.ppl.ap), (8, self.ppl.firmware)] {
             let magic = h.try_read64(offset)?;
-            if magic != 0 && magic != self.ppl_magic {
+            if magic != 0 && magic != expected {
                 return Err(EBUSY);
             }
         }
@@ -360,11 +361,11 @@ impl Window {
         let shadow_l2 = Self::shadow_l2(uat)?;
         let handoff = uat.lock_m4_handoff()?;
         let fw_magic = self.handoff.io().try_read64(8)?;
-        self.handoff.io().try_write64(self.ppl_magic, 0)?;
+        self.handoff.io().try_write64(self.ppl.ap, 0)?;
         // Cold admission proved both interests clear. The common guard now owns AP
         // interest; never reset either participant's lock words behind that guard.
         self.handoff.io().try_write32(0xffff, 0x18)?;
-        if fw_magic != self.ppl_magic {
+        if fw_magic != self.ppl.firmware {
             self.handoff.io().try_write8(1, 0x638)?;
         }
         for index in 0..65 * 3 {
