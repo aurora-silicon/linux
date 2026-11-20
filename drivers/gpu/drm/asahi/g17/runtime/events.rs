@@ -229,6 +229,12 @@ impl recovery::Queues for Service<'_> {
                 .and_then(|queue| queue.oldest_spared())
         })
     }
+    fn collateral_before(&self, qid: u8, generation: u64) -> bool {
+        self.firmware.queues.render_collateral_before(qid, generation)
+    }
+    fn note_collateral(&mut self, qid: u8, generation: u64) {
+        self.firmware.queues.note_render_collateral(qid, generation);
+    }
     fn visit_owners(&self, qid: u8, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
         self.firmware.queues.visit_render_owners(qid, visit);
         for queue in self
