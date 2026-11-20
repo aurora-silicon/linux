@@ -257,15 +257,17 @@ impl Regs {
         Ok(())
     }
 
-    /// macOS 27.2 before RUN: sets bit 0 of the two GFXCAXI2AF enables, each read first.
-    pub(crate) fn enable_axi2af(&self) -> Result {
+    /// macOS 27.2 before RUN: reads, then writes the two GFXCAXI2AF words with macOS's literal
+    /// values. Returns the values read, for the log.
+    pub(crate) fn enable_axi2af(&self) -> Result<[u32; 2]> {
         let r = self.axi2af.io();
-        for offset in super::hw::start_27_2::AXI2AF_ENABLES {
-            let value = r.try_read32(offset)?;
-            r.try_write32(value | 1, offset)?;
+        let mut before = [0; 2];
+        for (i, (offset, value)) in super::hw::start_27_2::AXI2AF_WORDS.into_iter().enumerate() {
+            before[i] = r.try_read32(offset)?;
+            r.try_write32(value, offset)?;
         }
         mb();
-        Ok(())
+        Ok(before)
     }
 
     /// macOS 27.2 after AP power-on and before the GPU endpoints start: zeroes the host block

@@ -283,7 +283,8 @@ pub(crate) enum Start {
 }
 
 /// The macOS 27.2 (26B123) start, copied from its trace up to the InitData doorbell:
-/// 1. before RUN, bit 0 of GFXCAXI2AF `+0x104` and `+0x108` is set (read, then written);
+/// 1. before RUN, GFXCAXI2AF `+0x104` and `+0x108` are read, then written with
+///    [`AXI2AF_WORDS`] (0x10001, 0x41331);
 /// 2. RTKit boots without an IOP power request: HELLO 12, the crash-log endpoint starts while
 ///    the endpoint map is handled, the firmware's own crash buffer request (its shared RO
 ///    segment) is sent back unchanged, the host hands it a 0x8000-byte log buffer of its own
@@ -294,8 +295,9 @@ pub(crate) enum Start {
 pub(crate) mod start_27_2 {
     /// GFXCAXI2AF registers (register-map slot 22, PA 0x301000000), from SGX.
     pub(crate) const AXI2AF: usize = 0x1000000;
-    /// The two GFXCAXI2AF words whose bit 0 the host sets before RUN.
-    pub(crate) const AXI2AF_ENABLES: [usize; 2] = [0x104, 0x108];
+    /// The two GFXCAXI2AF words the host writes before RUN, with macOS 27.2's literal values
+    /// (hv20 and hv22 on J773g: read 0x10000 / 0x41330, written 0x10001 / 0x41331).
+    pub(crate) const AXI2AF_WORDS: [(usize, u32); 2] = [(0x104, 0x10001), (0x108, 0x41331)];
     /// The 32-bit writes of zero to the host block (SGX+0xd60000), in macOS's order.
     pub(crate) const HOST_BLOCK_ZERO_ORDER: [usize; 13] = [
         0x00, 0x20, 0x40, 0x08, 0x28, 0x48, 0x10, 0x30, 0x50, 0x18, 0x38, 0x58, 0x60,

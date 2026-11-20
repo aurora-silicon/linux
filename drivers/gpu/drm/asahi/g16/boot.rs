@@ -885,7 +885,15 @@ pub(crate) fn start(
     }
     let kind = adt.layout.start;
     if kind == hw::Start::MacOs27_2 {
-        regs.enable_axi2af()?;
+        let before = regs.enable_axi2af()?;
+        dev_info!(
+            d,
+            "G16: 27.2 AXI2AF +0x104 {:#x} -> {:#x}, +0x108 {:#x} -> {:#x}\n",
+            before[0],
+            hw::start_27_2::AXI2AF_WORDS[0].1,
+            before[1],
+            hw::start_27_2::AXI2AF_WORDS[1].1
+        );
     }
     let id = regs.identity()?;
     dev_info!(
