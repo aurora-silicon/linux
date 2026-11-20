@@ -225,7 +225,7 @@ struct dwc3_apple {
 	struct completion sleep_stop_done;
 	int sleep_stop_ret;
 	ktime_t sleep_stop_start, sleep_stop_end;
-	struct work_struct sleep_start_work;
+	struct delayed_work sleep_start_work;
 	/* The start after a sleep may find its Type-C PHY not started yet: the role switch follows. */
 	bool sleep_phy_wait;
 	/* The start after a sleep was left to the role switch, which may also come too early. */
@@ -1085,6 +1085,9 @@ core_exit:
 
 static int dwc3_apple_exit(struct dwc3_apple *appledwc);
 
+/* Delay of the start after a sleep that stopped the host, see dwc3_apple_pm_notify(). */
+#define DWC3_APPLE_SLEEP_START_MS 250
+
 /* A hub that hasn't enumerated by then didn't come back. */
 #define DWC3_APPLE_HUB_CHECK_MS 5000
 
@@ -1817,7 +1820,8 @@ static void dwc3_apple_sleep_stop_work(struct work_struct *work)
 
 static void dwc3_apple_sleep_start_work(struct work_struct *work)
 {
-	struct dwc3_apple *appledwc = container_of(work, struct dwc3_apple, sleep_start_work);
+	struct dwc3_apple *appledwc = container_of(to_delayed_work(work), struct dwc3_apple,
+						   sleep_start_work);
 	bool finish = false, kept = false;
 	unsigned long flags;
 	int ret = 0;
@@ -1885,8 +1889,17 @@ static int dwc3_apple_pm_notify(struct notifier_block *nb, unsigned long action,
 			start = true;
 		}
 		spin_unlock_irqrestore(&appledwc->sleep_pm_lock, flags);
+		/*
+		 * A host stopped for the sleep starts again a little after the resume. Started
+		 * within ~30 ms of it, the J700's USB3 port lost the SuperSpeed side of a dock in
+		 * DP alt mode in about a third of the deep sleeps (receiver detection never
+		 * found the dock again until the controller was reset); started 100 ms or more
+		 * later, it never did in 40. A host kept in place resumes at once.
+		 */
 		if (start)
-			queue_work(system_dfl_wq, &appledwc->sleep_start_work);
+			queue_delayed_work(system_dfl_wq, &appledwc->sleep_start_work,
+					   READ_ONCE(appledwc->sleep_stopped) ?
+					   msecs_to_jiffies(DWC3_APPLE_SLEEP_START_MS) : 0);
 		return NOTIFY_DONE;
 	}
 	if (action != PM_SUSPEND_PREPARE || !READ_ONCE(appledwc->sleep_pm_online))
@@ -1976,7 +1989,7 @@ static void dwc3_apple_pm_quiesce(struct dwc3_apple *appledwc)
 	devm_release_action(appledwc->dev, dwc3_apple_pm_notifier_remove, appledwc);
 	scoped_guard(mutex, &appledwc->lock)
 		appledwc->shutting_down = true;
-	cancel_work_sync(&appledwc->sleep_start_work);
+	cancel_delayed_work_sync(&appledwc->sleep_start_work);
 	cancel_work_sync(&appledwc->sleep_stop_work);
 	cancel_delayed_work_sync(&appledwc->hub_check);
 	guard(mutex)(&appledwc->lock);
@@ -2092,7 +2105,8 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	ret = devm_work_autocancel(dev, &appledwc->sleep_stop_work, dwc3_apple_sleep_stop_work);
 	if (ret)
 		return ret;
-	ret = devm_work_autocancel(dev, &appledwc->sleep_start_work, dwc3_apple_sleep_start_work);
+	ret = devm_delayed_work_autocancel(dev, &appledwc->sleep_start_work,
+					   dwc3_apple_sleep_start_work);
 	if (ret)
 		return ret;
 	ret = devm_work_autocancel(dev, &appledwc->sleep_tunnel_work, dwc3_apple_tunnel_work);
