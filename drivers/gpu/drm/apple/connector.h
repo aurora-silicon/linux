@@ -19,6 +19,7 @@ bool dcp_connector_connected(struct apple_connector *connector);
 void dcp_queue_hotplug(struct apple_connector *connector);
 void dcp_route_failure_notify(struct apple_connector *connector);
 void dcp_retrain_oob(struct apple_connector *connector);
+void dcp_retrain_sink_irq(struct apple_connector *connector);
 enum drm_connector_status apple_connector_detect(struct drm_connector *connector, bool force);
 
 void apple_connector_backlight_init(struct apple_connector *connector);
