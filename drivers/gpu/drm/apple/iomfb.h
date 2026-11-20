@@ -240,8 +240,18 @@ struct dcp_method_entry {
 	{ tag[0], tag[1], tag[2], tag[3] }, {0}, \
 	{ native[0], native[1], native[2], native[3] } }
 
-/* The IOMFB method table of a firmware 27.x build, by its compat string; NULL if unknown. */
-const struct dcp_method_entry *iomfb_v27_methods(const char *compat);
+struct iomfb_v27_build {
+	const char *compat;
+	const struct dcp_method_entry *methods;
+	u16 swap_req_size;
+	u16 callback_from;
+	u16 callback_to;
+	u16 callback_in_len;
+	u16 callback_out_len;
+};
+
+/* Return the IOMFB data for an exact firmware build, or NULL. */
+const struct iomfb_v27_build *iomfb_v27_methods(const char *compat);
 bool iomfb_v27_methods_renumbered(const struct dcp_method_entry *methods);
 int iomfb_v27_tag(const struct dcp_method_entry *methods, const char *tag, char *out);
 bool iomfb_v27_sleep_methods_complete(const struct dcp_method_entry *methods);

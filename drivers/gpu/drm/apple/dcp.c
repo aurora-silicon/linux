@@ -6190,16 +6190,16 @@ static bool dcp_v27_sleep_transport_supported(struct apple_dcp *dcp)
 static enum dcp_firmware_version dcp_v27_method_table(struct device *dev,
 							const char *compat_str)
 {
-	const struct dcp_method_entry *methods = iomfb_v27_methods(compat_str);
+	const struct iomfb_v27_build *build = iomfb_v27_methods(compat_str);
 	unsigned int num_missing;
 	const char *missing;
 
-	if (!methods) {
+	if (!build) {
 		dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
 			compat_str);
 		return DCP_FIRMWARE_UNKNOWN;
 	}
-	missing = iomfb_v27_missing_method(methods, &num_missing);
+	missing = iomfb_v27_missing_method(build->methods, &num_missing);
 	if (missing) {
 		dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
 			compat_str, num_missing, missing);
@@ -6221,6 +6221,7 @@ enum dcp_v27_admission dcp_v27_admission(const char *compat,
 					 const char **missing,
 					 unsigned int *num_missing)
 {
+	const struct iomfb_v27_build *build;
 	unsigned int major;
 
 	*methods = NULL;
@@ -6228,9 +6229,10 @@ enum dcp_v27_admission dcp_v27_admission(const char *compat,
 	*num_missing = 0;
 	if (sscanf(compat, "%u.", &major) != 1 || major < 27)
 		return DCP_V27_NOT_V27;
-	*methods = iomfb_v27_methods(compat);
-	if (!*methods)
+	build = iomfb_v27_methods(compat);
+	if (!build)
 		return DCP_V27_NO_TABLE;
+	*methods = build->methods;
 	*missing = iomfb_v27_missing_method(*methods, num_missing);
 	if (*missing)
 		return DCP_V27_INCOMPLETE;
@@ -8054,7 +8056,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 		/* Checked by dcp_check_firmware_version(). */
 		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		dcp->v27_methods = iomfb_v27_methods(compat_str);
+		dcp->v27_build = iomfb_v27_methods(compat_str);
+		dcp->v27_methods = dcp->v27_build ? dcp->v27_build->methods : NULL;
 		if (dcp->v27_j714s) {
 			const struct dcp_method_entry *own =
 				iomfb_v27_methods_j714s(dev, dcp->v27_methods);
@@ -8064,7 +8067,6 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 				dcp->v27_a407 = true;
 			}
 		}
-		dcp->swap_v27_3 = !strcmp(compat_str, "27.3.0");
 	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);

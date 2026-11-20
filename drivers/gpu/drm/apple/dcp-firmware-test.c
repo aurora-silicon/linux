@@ -40,11 +40,18 @@ static void dcp_firmware_13_5_compat(struct kunit *test)
 static void dcp_firmware_27_method_admission(struct kunit *test)
 {
 	struct device dev = { .init_name = "dcp-firmware-test" };
-	const struct dcp_method_entry *methods = iomfb_v27_methods("27.2.0");
-	const struct dcp_method_entry *earlier = iomfb_v27_methods("27.0.0");
+	const struct iomfb_v27_build *build = iomfb_v27_methods("27.2.0");
+	const struct iomfb_v27_build *earlier_build =
+		iomfb_v27_methods("27.0.0");
+	const struct dcp_method_entry *methods;
+	const struct dcp_method_entry *earlier;
 	struct dcp_method_entry *incomplete;
 	unsigned int missing;
 
+	KUNIT_ASSERT_NOT_NULL(test, build);
+	KUNIT_ASSERT_NOT_NULL(test, earlier_build);
+	methods = build->methods;
+	earlier = earlier_build->methods;
 	KUNIT_ASSERT_NOT_NULL(test, methods);
 	KUNIT_ASSERT_NOT_NULL(test, earlier);
 	KUNIT_EXPECT_PTR_NE(test, methods, earlier);
@@ -52,7 +59,7 @@ static void dcp_firmware_27_method_admission(struct kunit *test)
 				     earlier[dcpep_swap_submit].tag,
 				     sizeof(methods[dcpep_swap_submit].tag)), 0);
 	KUNIT_EXPECT_EQ(test, dcp_v27_method_table(&dev, "27.2.0"), DCP_FIRMWARE_V_27_0);
-	KUNIT_EXPECT_EQ(test, dcp_v27_method_table(&dev, "27.3.0"), DCP_FIRMWARE_UNKNOWN);
+	KUNIT_EXPECT_EQ(test, dcp_v27_method_table(&dev, "27.3.0"), DCP_FIRMWARE_V_27_0);
 	KUNIT_EXPECT_EQ(test, dcp_v27_method_table(&dev, "27.2.1"), DCP_FIRMWARE_UNKNOWN);
 
 	incomplete = kunit_kmalloc(test, sizeof(*methods) * dcpep_num_methods, GFP_KERNEL);

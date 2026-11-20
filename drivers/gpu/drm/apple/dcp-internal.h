@@ -641,8 +641,7 @@ struct apple_dcp {
 	u32 afk_live_endpoints;
 	/* Firmware 27.x: the method IDs of this build (iomfb_v27_methods()). */
 	const struct dcp_method_entry *v27_methods;
-	/* Firmware 27.3 takes a larger swap_submit request (iomfb_v27_3_swap.h). */
-	bool swap_v27_3;
+	const struct iomfb_v27_build *v27_build;
 	bool external;
 	/* Any external processor (apple,dcpext), whatever its SoC; set at probe. */
 	bool dcpext;
