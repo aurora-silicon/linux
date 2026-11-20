@@ -22,7 +22,10 @@
 	firmware-name = "apple/tpmtfw-k114c.bin";
 };
 
-#include "t6050-peripherals.dtsi"
+&panel {
+	width-mm = <302>;
+	height-mm = <199>;
+};
 
 / {
 	aliases {

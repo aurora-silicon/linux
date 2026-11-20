@@ -9,6 +9,7 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#define T6050_K114S
 #include "t6050-k114-k116.dtsi"
 
 / {
@@ -20,5 +21,7 @@
 	firmware-name = "apple/tpmtfw-k114s.bin";
 };
 
-#define T6050_K114S
-#include "t6050-peripherals.dtsi"
+&panel {
+	width-mm = <302>;
+	height-mm = <199>;
+};

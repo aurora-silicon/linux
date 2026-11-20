@@ -47,6 +47,7 @@
 			reg = <0 0 0 0>; /* To be filled by the loader */
 			/* Format properties will be added by the loader */
 			status = "disabled";
+			panel = <&panel>;
 		};
 	};
 
@@ -242,4 +243,12 @@
  */
 &smc_pcio {
 	apple,output-commands = /bits/ 64 <0x001a000000000000 0x000f000000800000 0x011c000000010000>;
+};
+
+#include "t6050-peripherals.dtsi"
+
+&dcp {
+	panel: panel {
+		compatible = "apple,panel";
+	};
 };
