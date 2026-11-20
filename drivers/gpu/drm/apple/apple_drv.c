@@ -24,6 +24,7 @@
 #include <linux/workqueue.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/display.h>
+#include <linux/soc/apple/t8132.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -1454,7 +1455,13 @@ static bool apple_dcp_usable(struct device_node *np)
 		dcp_h17p_external_supported(np)) &&
 	       /* t6041_dcpext=0 keeps the T6041 external processors out. */
 	       (!of_device_is_compatible(np, "apple,t6041-dcpext") ||
-		dcp_t6041_ext_enabled());
+		dcp_t6041_ext_enabled()) &&
+	       /*
+		* The T8132 main DCP is the M4 backend's, on its 26.6.2
+		* firmware path only (see dcp_check_firmware_version()).
+		*/
+	       (!of_device_is_compatible(np, "apple,t8132-dcp") ||
+		apple_t8132_firmware_path());
 }
 
 static void apple_drm_quiesce_connectors(struct drm_device *drm)
