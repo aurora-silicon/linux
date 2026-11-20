@@ -5,9 +5,10 @@
  * AOP's audio services. The card waits for its CPU component, the AOP audio
  * node, which exists only after the boot loader's AOP handoff.
  *
- * The speaker is described but stays off: the ADT's audio-speaker stream has
- * no RX (sense) slot, and macaudio admits the speaker only once a protection
- * owner for a speaker without sense exists for these machines.
+ * The speaker's stream has one TX slot and no RX (sense) slot (ADT
+ * iop-audio-controller/audio-speaker), so the audio node names no "sense"
+ * channel, and macaudio admits speaker playback only under a protection lease
+ * held by speakerguardd with a model for a speaker without sense.
  *
  * The board sets the card's compatible and model.
  *
@@ -45,6 +46,12 @@
 			};
 		};
 	};
+};
+
+&aop_audio {
+	apple,speaker-amps = <1>;
+	dmas = <&admac_base_ns 4>, <&admac_base_ns 5>, <&admac_base_ns 0>;
+	dma-names = "cout", "cin", "spkr";
 };
 
 /* Amp IRQ 106 and shutdown 107; jack IRQ 134 and codec reset 139 (pinctrl_ap) */
