@@ -477,14 +477,15 @@ static bool dcp_j714s_ext(struct device *dev)
 }
 
 /*
- * The firmware stop on a SoC whose display power words were derived from its macOS device
- * tree instead of measured (T8142). J813 supports DPMS off and system sleep with this
- * opt-in. Off by default: such a DCP keeps its firmware running.
+ * The firmware stop on a SoC whose display power words were not measured from macOS around
+ * a display power cycle: T8142's, derived from its macOS device tree, and the T8132 internal
+ * DCP's on firmware 27.2, taken from its deep sleep. J813 supports DPMS off and system sleep
+ * with this opt-in. Off by default: such a DCP keeps its firmware running.
  */
 static bool s2r_untested;
 module_param(s2r_untested, bool, 0444);
 MODULE_PARM_DESC(s2r_untested,
-		 "Stop the DCP firmware on DPMS off and J813 system sleep using derived T8142 power words (default 0)");
+		 "Stop the DCP firmware on DPMS off and system sleep where its power words are not measured: T8142, T8132 on 27.2 (default 0)");
 
 bool dcp_t6041_ext_enabled(void)
 {
@@ -7122,13 +7123,22 @@ static int dcp_s2r_pm_register(struct apple_dcp *dcp);
  * - num_dptx_ports 0: it drives the panel only.
  * - adopt_live_session: iBoot leaves it running with the 27.2 image and the
  *   panel lit; Linux never starts its CPU.
- * No sleep support: no firmware-27 sleep has run on this processor.
+ * - s2r: the firmware-27 stop (iomfb_v27.c) for DPMS off and deep sleep,
+ *   with the 27.2 table's calls and T8132's power words (dcp_s2r_t8132).
+ *   Off unless appledrm.s2r_untested is set: it has not run on this
+ *   processor yet. It has no secure mailbox.
  */
+static const struct dcp_s2r_layout dcp_s2r_t8132;
+
 static const struct apple_dcp_hw_data apple_dcp_hw_t8132_v27 = {
 	.firmware_dma_bits = 41,
 	.num_dptx_ports = 0,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
+	.s2r = true,
+	.s2r_untested = true,
+	.s2r_no_secure_port = true,
+	.s2r_layout = &dcp_s2r_t8132,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext_v27 = {
@@ -8263,6 +8273,25 @@ static const struct dcp_s2r_layout dcp_s2r_t8142 = {
 	.dcp_streams = BIT(23) | BIT(24),
 	.disp_streams = BIT(0) | BIT(16),
 	.pmc_dcp = false,
+};
+
+/*
+ * T8132's internal display, the words its deep sleep already lowers (the T8132 sleep
+ * profile, drivers/soc/apple/sleep.c): DISP_CPU, DISP_FE and DISP_SYS at 0x10000, 0x248
+ * and 0x240, DISP_CPU's power-gate retention words at 0x104c and 0x1070 of the pwrgate
+ * block (the J713's apple,retention-workaround on ps_disp_cpu, 0x2504c and 0x25070 of the
+ * pmgr), the streams from the ADT's dart-dcp (sid 23 and vm-base-24) and dart-disp0
+ * (sids 0 and 16), and pmc-dcp, which counts the powered DCPs as on T8140.
+ */
+static const struct dcp_s2r_layout dcp_s2r_t8132 = {
+	.disp_cpu = 0x10000,
+	.disp_fe = 0x248,
+	.disp_sys = 0x240,
+	.ret_ff = 0x104c,
+	.ret_mem = 0x1070,
+	.dcp_streams = BIT(23) | BIT(24),
+	.disp_streams = BIT(0) | BIT(16),
+	.pmc_dcp = true,
 };
 
 /* TEST: J813 external processors, ADT DISPEXT0/1 power words. */
