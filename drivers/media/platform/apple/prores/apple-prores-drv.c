@@ -758,6 +758,12 @@ struct apr_variant {
 	/* SCODEC control rows (T6050), applied to "ctrl" after the system rows. */
 	const struct apr_tunable *ctrl_tunables;
 	size_t num_ctrl_tunables;
+	/*
+	 * "core" and "wrapper" come first and every instance has them. The
+	 * SCODEC windows after them ("aux", "ctrl") are mapped only when the
+	 * node names them: an instance outside the SCODEC block has none, and
+	 * its system and control rows are not applied.
+	 */
 	const char *reg_names[4];
 	unsigned int num_regs;
 	unsigned int num_irqs;
@@ -1798,8 +1804,12 @@ static int apr_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, apr);
 
 	for (i = 0; i < apr->variant->num_regs; i++) {
-		regs[i] = devm_platform_ioremap_resource_byname(pdev,
-							     apr->variant->reg_names[i]);
+		const char *name = apr->variant->reg_names[i];
+
+		if (i >= 2 &&
+		    of_property_match_string(dev->of_node, "reg-names", name) < 0)
+			continue;
+		regs[i] = devm_platform_ioremap_resource_byname(pdev, name);
 		if (IS_ERR(regs[i]))
 			return PTR_ERR(regs[i]);
 	}
