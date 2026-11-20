@@ -76,4 +76,14 @@ static inline int apple_dcp_camera_indicator_set(struct device *dcp, bool on)
 }
 #endif
 
+/* T8122 internal DCP image shipped with macOS 27.2 (26B123). */
+#define APPLE_T8122_DCP_26B123_UUID "93FA4B31-BB97-3B2A-8673-49EA489EE9C1"
+
+/* The T8122 internal display processor, handed over on the 27.2 image. */
+static inline bool apple_t8122_dcp_v27_2(const struct device_node *np)
+{
+	return apple_dcp_image_v27_2(np, "apple,t8122-dcp",
+				     APPLE_T8122_DCP_26B123_UUID);
+}
+
 #endif
