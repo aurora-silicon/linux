@@ -279,6 +279,8 @@ pub(crate) struct PplMagic {
     /// The only non-zero value +8 may hold at cold admission: what the firmware leaves there
     /// once it has run.
     pub(crate) firmware: u64,
+    /// The firmware stores `firmware` at +8 from its MMU setup, before the RTKit handshake.
+    pub(crate) answers: bool,
 }
 
 /// The loaded-image layout of one firmware ABI: the boot loader's handoff for it, the regions
@@ -372,6 +374,7 @@ pub(crate) const FW_25G83: FwLayout = FwLayout {
     ppl_magic: Some(PplMagic {
         ap: PPL_MAGIC,
         firmware: PPL_MAGIC,
+        answers: false,
     }),
     loader_table: Some(LoaderTable::Host(0x1332f0)),
 };
@@ -384,8 +387,10 @@ pub(crate) const FW_25G83: FwLayout = FwLayout {
 /// base from a boot-filled patchbay record, builds root[0], the L2 at +0x4000 and the L3 at
 /// +0x8000 with the TEXT and DATA leaves itself and sets TTBR1_EL1. So only an empty tree is
 /// admitted. When it sets up its MMU the firmware stores 0x4b1d000000000003 at +8 of the PPL
-/// handoff page (the 25G83 firmware never wrote there); nothing in it compares the AP's +0
-/// word, which keeps the 25G83 value (provisional). Whether macOS still writes the register
+/// handoff page (the 25G83 firmware never wrote there). The AP announces the same word at +0
+/// before RUN, as the G14 firmware-27.2 path does on hardware (linux#2544: AP and firmware
+/// exchange 0x4b1d000000000003 through these two words, the firmware answering before the
+/// RTKit handshake). Whether macOS still writes the register
 /// map into the firmware's table (DATA + 0xc72e8, 60 slots) before the start or leaves it to
 /// the firmware's own copy from HW data is not known yet.
 pub(crate) const FW_26B123: FwLayout = FwLayout {
@@ -399,8 +404,9 @@ pub(crate) const FW_26B123: FwLayout = FwLayout {
     // The firmware builds its own tree at start; admit only an empty tree.
     leaves: Some(&[]),
     ppl_magic: Some(PplMagic {
-        ap: PPL_MAGIC,
-        firmware: 0x4b1d000000000003,
+        ap: PPL_MAGIC_27_2,
+        firmware: PPL_MAGIC_27_2,
+        answers: true,
     }),
     loader_table: None,
 };
@@ -451,6 +457,8 @@ pub(crate) mod pte {
 
 /// PPL handoff magic the AP publishes for the 25G83 firmware.
 pub(crate) const PPL_MAGIC: u64 = 0x4b1d000000000002;
+/// The PPL handoff magic of the 27.2 (26B123) GPU firmware, published by both sides.
+pub(crate) const PPL_MAGIC_27_2: u64 = 0x4b1d000000000003;
 
 /// UAT handoff region sizes of this firmware ABI (TTBAT page, TTBAT tables (the firmware kernel
 /// root), PPL handoff page, shared L2 page); the addresses come from the ADT.

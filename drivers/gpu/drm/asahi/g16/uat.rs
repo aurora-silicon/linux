@@ -16,7 +16,13 @@
 use core::ops::Range;
 use core::sync::atomic::Ordering;
 
-use kernel::{device, io::Io, prelude::*, sync::Arc};
+use kernel::{
+    device,
+    io::Io,
+    prelude::*,
+    sync::Arc,
+    time::{delay::fsleep, Delta, Instant, Monotonic},
+};
 
 use super::hw;
 use super::regs::{mb, Mapping};
@@ -332,6 +338,33 @@ impl Window {
             }
         }
         Ok(())
+    }
+
+    /// After RUN, waits up to 1 s for a firmware that answers at start ([`hw::PplMagic::answers`])
+    /// to store its magic at +8, as GPU firmware 27.2 does on G14 (linux#2544). Logs the
+    /// outcome; a missing answer is not yet fatal, until a G16 26B123 start confirms the order.
+    pub(crate) fn await_firmware_magic(&self, dev: &device::Device) -> Result {
+        if !self.ppl.answers {
+            return Ok(());
+        }
+        let start = Instant::<Monotonic>::now();
+        loop {
+            let magic = self.handoff.io().try_read64(8)?;
+            if magic == self.ppl.firmware {
+                dev_info!(
+                    dev,
+                    "G16: firmware PPL magic {:#x} after {} us\n",
+                    magic,
+                    start.elapsed().as_micros_ceil()
+                );
+                return Ok(());
+            }
+            if start.elapsed() >= Delta::from_millis(1000) {
+                dev_warn!(dev, "G16: no firmware PPL magic within 1 s (+8 = {:#x})\n", magic);
+                return Ok(());
+            }
+            fsleep(Delta::from_millis(1));
+        }
     }
 
     /// Cold-start check: all 128 TTBAT words are zero.

@@ -86,7 +86,7 @@ fn entry(pa:u64,index:usize)->Result<u64>{with_table(pa,index+1,|e|e[index].load
 fn clean_entries(pa:u64,first:usize,count:usize)->Result{with_table(pa,first+count,|_|())?;note(format!("clean:{pa:x}:{first}:{count}"));Ok(())}
 fn clean_page(pa:u64)->Result{clean_entries(pa,0,ENTRIES)}
 struct Window{handoff:Mapping,ttbs:Mapping,root:Mapping,shared_l2:Mapping,image:Vec<u64>,snapshot:Vec<u64>,published:bool,firmware_root:[u64;2],text_pa:u64,data_pa:u64,leaves:&'static [hw::Leaves],ppl:hw::PplMagic}
-impl Window{fn blank()->Self{Self{handoff:Mapping::new(0x807000000,0x4000,"handoff"),ttbs:Mapping::new(0x808000000,0x4000,"ttbs"),root:Mapping::new(0x800000000,0x40000,"root"),shared_l2:Mapping::new(0x801000000,0x4000,"shared"),image:vec![0;2048],snapshot:vec![0;2048],published:false,firmware_root:[0;2],text_pa:0x802000000,data_pa:0x803000000,leaves:hw::LEAVES_25G83,ppl:hw::PplMagic{ap:hw::PPL_MAGIC,firmware:hw::PPL_MAGIC}}}
+impl Window{fn blank()->Self{Self{handoff:Mapping::new(0x807000000,0x4000,"handoff"),ttbs:Mapping::new(0x808000000,0x4000,"ttbs"),root:Mapping::new(0x800000000,0x40000,"root"),shared_l2:Mapping::new(0x801000000,0x4000,"shared"),image:vec![0;2048],snapshot:vec![0;2048],published:false,firmware_root:[0;2],text_pa:0x802000000,data_pa:0x803000000,leaves:hw::LEAVES_25G83,ppl:hw::PplMagic{ap:hw::PPL_MAGIC,firmware:hw::PPL_MAGIC,answers:false}}}
 '''
 post = r'''
 }
@@ -117,19 +117,19 @@ fn root_admission_tests(){
 // leaves its own magic at +8 of the handoff page once it has run.
 fn firmware_built_tree_tests(){
  const FW:u64=0x4b1d000000000003;
- let fresh=||{let mut w=Window::blank();w.leaves=&[];w.ppl=hw::PplMagic{ap:hw::PPL_MAGIC,firmware:FW};w};
+ let fresh=||{let mut w=Window::blank();w.leaves=&[];w.ppl=hw::PplMagic{ap:FW,firmware:FW,answers:true};w};
  assert!(fresh().admit_cold().is_ok());
  let mut built=seeded();built.leaves=&[];assert_eq!(built.admit_cold(),Err(EINVAL));
  let mut w=fresh();w.root.try_write64(fw_word(0,&w),0).unwrap();assert_eq!(w.admit_cold(),Err(EINVAL));
  let mut w=fresh();
  w.handoff.try_write64(FW,8).unwrap();assert!(w.admit_cold().is_ok());
  w.handoff.try_write64(hw::PPL_MAGIC,8).unwrap();assert_eq!(w.admit_cold(),Err(EBUSY));
- w.handoff.try_write64(0,8).unwrap();w.handoff.try_write64(FW,0).unwrap();assert_eq!(w.admit_cold(),Err(EBUSY));
- w.handoff.try_write64(hw::PPL_MAGIC,0).unwrap();assert!(w.admit_cold().is_ok());
+ w.handoff.try_write64(0,8).unwrap();w.handoff.try_write64(hw::PPL_MAGIC,0).unwrap();assert_eq!(w.admit_cold(),Err(EBUSY));
+ w.handoff.try_write64(FW,0).unwrap();assert!(w.admit_cold().is_ok());
  let uat=mmu::Uat{lower:0x804000000,shadow:0x805000000};let l2=0x805004000;let l3=0x805008000;
  {let mut ram=RAM.lock().unwrap();for pa in [uat.shadow,l2,l3]{ram.insert(pa,(0..2048).map(|_|AtomicU64::new(0)).collect());}ram[&uat.shadow][2].store(l2|3,Ordering::Release);}
  for firmware_magic in [0,FW]{let mut w=fresh();w.handoff.try_write64(firmware_magic,8).unwrap();w.bootstrap(&device::Device,&uat).unwrap();
-  assert_eq!(w.handoff.try_read64(0).unwrap(),hw::PPL_MAGIC);assert_eq!(w.handoff.try_read8(0x638).unwrap(),u8::from(firmware_magic==0));}
+  assert_eq!(w.handoff.try_read64(0).unwrap(),FW);assert_eq!(w.handoff.try_read8(0x638).unwrap(),u8::from(firmware_magic==0));}
 }
 fn publication_tests(){
  let uat=mmu::Uat{lower:0x804000000,shadow:0x805000000};let l2=0x805004000;let l3=0x805008000;

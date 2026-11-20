@@ -833,6 +833,7 @@ pub(crate) fn start(
         if session.regs.asc_control()? & regs::ASC_RUN == 0 {
             return Err(EIO);
         }
+        objects.window.lock().await_firmware_magic(&d)?;
         run(&mut session, &mut events, built.as_mut().ok_or(EINVAL)?)
     })();
     if let Err(e) = result {

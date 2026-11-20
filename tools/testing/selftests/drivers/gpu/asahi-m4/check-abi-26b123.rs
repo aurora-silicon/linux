@@ -222,8 +222,8 @@ fn catalog() {
     assert_eq!(FW_25G83.loader_table, Some(LoaderTable::Host(0x1332f0)));
     assert_eq!(FW_26B123.loader_table, None);
     assert_eq!(PPL_MAGIC, 0x4b1d000000000002);
-    assert_eq!(FW_25G83.ppl_magic, Some(PplMagic { ap: PPL_MAGIC, firmware: PPL_MAGIC }));
-    assert_eq!(FW_26B123.ppl_magic, Some(PplMagic { ap: PPL_MAGIC, firmware: 0x4b1d000000000003 }));
+    assert_eq!(FW_25G83.ppl_magic, Some(PplMagic { ap: PPL_MAGIC, firmware: PPL_MAGIC, answers: false }));
+    assert_eq!(FW_26B123.ppl_magic, Some(PplMagic { ap: 0x4b1d000000000003, firmware: 0x4b1d000000000003, answers: true }));
     // The 26B123 firmware builds its own page-table tree: the boot loader builds no leaf.
     assert_eq!(FW_25G83.leaves.map(|l| l.len()), Some(5));
     assert_eq!(FW_26B123.leaves.map(|l| l.len()), Some(0));
