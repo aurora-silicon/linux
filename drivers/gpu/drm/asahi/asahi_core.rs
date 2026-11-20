@@ -441,6 +441,14 @@ module! {
             default: true,
             description: "T8103 27.2: accept render commands on the DRM device",
         },
+        t8112_g13_buffer_slots: u32 {
+            default: 1,
+            description: "T8103 27.2 render: tile buffer slots handed to the firmware",
+        },
+        t8112_g13_min_blocks: u32 {
+            default: 0,
+            description: "T8103 27.2 render: minimum tile buffer blocks per queue (0 = as the pass needs)",
+        },
         t8112_g13_render_log: u32 {
             default: 4,
             description: "T8103 27.2 render: log the first n render passes",

@@ -54,10 +54,15 @@ pub(crate) mod raw {
         pub(crate) cur_id: i32,
         pub(crate) unk_10: u32,
         pub(crate) gpu_counter2: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_18: u32,
 
         #[ver(V < V13_0B4 || G >= G14X)]
         pub(crate) unk_1c: u32,
+
+        /// 27.2: a second page list pointer, read by the firmware's buffer setup.
+        #[ver(V >= V27_2)]
+        pub(crate) page_list_fw: GpuPointer<'a, &'a [u32]>,
 
         pub(crate) page_list: GpuPointer<'a, &'a [u32]>,
         pub(crate) page_list_size: u32,
@@ -68,21 +73,47 @@ pub(crate) mod raw {
         pub(crate) block_list: GpuPointer<'a, &'a [u32]>,
         pub(crate) block_ctl: GpuPointer<'a, super::BlockControl>,
         pub(crate) last_page: AtomicU32,
+        #[ver(V < V27_2)]
         pub(crate) gpu_page_ptr1: u32,
+        #[ver(V < V27_2)]
         pub(crate) gpu_page_ptr2: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_58: u32,
         pub(crate) block_size: u32,
+        #[ver(V >= V27_2)]
+        pub(crate) unk_54: u32,
+        #[ver(V >= V27_2)]
+        pub(crate) unk_58_27: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_60: U64,
         pub(crate) counter: GpuPointer<'a, super::Counter>,
+        #[ver(V < V27_2)]
         pub(crate) unk_70: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_74: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_78: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_7c: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_80: u32,
+        /// 27.2: selects `max_pages` (set) or `max_pages_nomemless` (clear).
+        #[ver(V >= V27_2)]
+        pub(crate) memless: u32,
+        #[ver(V >= V27_2)]
+        pub(crate) unk_68: Array<0xc, u8>,
         pub(crate) max_pages: u32,
         pub(crate) max_pages_nomemless: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_8c: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_90: Array<0x30, u8>,
+        #[ver(V >= V27_2)]
+        pub(crate) discard_page: U64,
+        #[ver(V >= V27_2)]
+        pub(crate) unk_84: u32,
+        #[ver(V >= V27_2)]
+        pub(crate) unk_88: Array<0x38, u8>,
     }
 
     #[versions(AGX_ROOT)]
@@ -98,14 +129,27 @@ pub(crate) mod raw {
         pub(crate) unk_8: U64,
         pub(crate) unk_10: U64,
         pub(crate) user_buffer: GpuPointer<'a, &'a [u8]>,
+        #[ver(V < V27_2)]
         pub(crate) unk_20: u32,
-        #[ver(V >= V13_3)]
+        #[ver(V >= V13_3 && V < V27_2)]
         pub(crate) unk_28: U64,
+        #[ver(V >= V27_2)]
+        pub(crate) unk_20_27: U64,
+        /// 27.2: non-zero makes the firmware skip the pass.
+        #[ver(V >= V27_2)]
+        pub(crate) skip: u32,
+        /// 27.2: set by the firmware while the tiler runs.
+        #[ver(V >= V27_2)]
+        pub(crate) fw_flag: u32,
         pub(crate) stats: GpuWeakPointer<super::Stats>,
         pub(crate) total_page_count: AtomicU32,
-        #[ver(G < G14X)]
+        #[ver(V >= V27_2)]
+        pub(crate) tvb_overflow: u32,
+        #[ver(V >= V27_2)]
+        pub(crate) unk_40: U64,
+        #[ver(G < G14X && V < V27_2)]
         pub(crate) unk_30: U64, // pad
-        #[ver(G < G14X)]
+        #[ver(G < G14X && V < V27_2)]
         pub(crate) unk_38: U64, // pad
     }
 

@@ -474,6 +474,8 @@ impl Runtime {
                     dev_info!(self.dev, "J313 render: slot={} ctx={} vm={} {}x{} layers={} samples={} init={:?} tiler={:#x} fragment={:#x} values={:#x}/{:#x} new-tables={}\n",
                               slot, bind.slot(), packet.vm.id(), command.width, command.height, command.layers,
                               command.samples, job.init, job.tiler, job.fragment, values[0].raw(), values[1].raw(), added);
+                    dev_info!(self.dev, "J313 render: setup why (rebind, grown, autogrown, buffer slot, blocks)={:?} info={:x?}\n",
+                              job.why, ctx.buffer.info_words());
                 }
                 packet.mark_published();
                 if let Some(init) = job.init {
@@ -731,6 +733,8 @@ pub(crate) struct Backend {
     runtime: Arc<Runtime>,
     scheduler: Arc<sched::Scheduler<crate::m3::m3_submit::Job>>,
     ids: gpu::SequenceIDs,
+    /// Buffer slots of the 27.2 tile buffers.
+    buffer_mgr: crate::buffer::BufferManagerG13V27_2,
 }
 
 impl Backend {
@@ -839,7 +843,11 @@ impl Backend {
                 return Err(e);
             }
         };
-        match Arc::new(Self { graph, runtime: runtime.clone(), scheduler, ids: gpu::SequenceIDs::default() }, GFP_KERNEL) {
+        let buffer_mgr = match crate::buffer::BufferManagerG13V27_2::with_slots(crate::module_parameters::t8112_g13_buffer_slots.value()) {
+            Ok(mgr) => mgr,
+            Err(e) => { runtime.stop(); return Err(e); }
+        };
+        match Arc::new(Self { graph, runtime: runtime.clone(), scheduler, ids: gpu::SequenceIDs::default(), buffer_mgr }, GFP_KERNEL) {
             Ok(backend) => Ok(backend),
             Err(e) => { runtime.stop(); Err(e.into()) }
         }
@@ -882,7 +890,7 @@ impl gpu::Gpu for Backend {
         usc_exec_base: u64, _usage: Arc<crate::usage::Client>) -> Result<KBox<dyn queue::Queue>> {
         let render = if crate::module_parameters::t8112_g13_render.value() {
             let id = (self.ids.queue.next() & 0xffff_ffff) as u32;
-            Some(Arc::new(crate::gpu::J313RenderContext::new(&self.graph, id, ualloc, ualloc_priv.clone())?, GFP_KERNEL)?)
+            Some(Arc::new(crate::gpu::J313RenderContext::new(&self.graph, &self.buffer_mgr, id, ualloc, ualloc_priv.clone())?, GFP_KERNEL)?)
         } else {
             None
         };

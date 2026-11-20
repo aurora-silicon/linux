@@ -370,9 +370,12 @@ impl Buffer::ver {
                     cur_id: -1,
                     unk_10: 0x0,
                     gpu_counter2: 0x0,
+                    #[ver(V < V27_2)]
                     unk_18: 0x0,
                     #[ver(V < V13_0B4 || G >= G14X)]
                     unk_1c: 0x0,
+                    #[ver(V >= V27_2)]
+                    page_list_fw: inner.page_list.gpu_pointer(),
                     page_list: inner.page_list.gpu_pointer(),
                     page_list_size: (4 * max_pages).try_into()?,
                     page_count: AtomicU32::new(0),
@@ -382,21 +385,46 @@ impl Buffer::ver {
                     block_list: inner.block_list.gpu_pointer(),
                     block_ctl: inner.block_ctl.gpu_pointer(),
                     last_page: AtomicU32::new(0),
+                    #[ver(V < V27_2)]
                     gpu_page_ptr1: 0x0,
+                    #[ver(V < V27_2)]
                     gpu_page_ptr2: 0x0,
+                    #[ver(V < V27_2)]
                     unk_58: 0x0,
                     block_size: BLOCK_SIZE as u32,
+                    #[ver(V >= V27_2)]
+                    unk_54: 0,
+                    #[ver(V >= V27_2)]
+                    unk_58_27: 0,
+                    #[ver(V < V27_2)]
                     unk_60: U64(0x0),
                     counter: inner.counter.gpu_pointer(),
+                    #[ver(V < V27_2)]
                     unk_70: 0x0,
+                    #[ver(V < V27_2)]
                     unk_74: 0x0,
+                    #[ver(V < V27_2)]
                     unk_78: 0x0,
+                    #[ver(V < V27_2)]
                     unk_7c: 0x0,
+                    #[ver(V < V27_2)]
                     unk_80: 0x1,
+                    #[ver(V >= V27_2)]
+                    memless: 0,
+                    #[ver(V >= V27_2)]
+                    unk_68: Default::default(),
                     max_pages: max_pages.try_into()?,
                     max_pages_nomemless: max_pages_nomemless.try_into()?,
+                    #[ver(V < V27_2)]
                     unk_8c: 0x0,
+                    #[ver(V < V27_2)]
                     unk_90: Default::default(),
+                    #[ver(V >= V27_2)]
+                    discard_page: U64(0),
+                    #[ver(V >= V27_2)]
+                    unk_84: 0,
+                    #[ver(V >= V27_2)]
+                    unk_88: Default::default(),
                 })
             },
         )?;
@@ -438,6 +466,17 @@ impl Buffer::ver {
     }
 
     /// Returns the total block count allocated to this Buffer.
+    /// Diagnostic: the first 0xc0 bytes of the firmware-visible Info, as words.
+    pub(crate) fn info_words(&self) -> [u32; 0x30] {
+        let inner = self.inner.lock();
+        inner.info.with(|raw, _inner| {
+            let p = core::ptr::from_ref(raw).cast::<u32>();
+            let n = (core::mem::size_of_val(raw) / 4).min(0x30);
+            // SAFETY: `raw` is a live plain-data firmware struct of at least `n` words.
+            core::array::from_fn(|i| if i < n { unsafe { p.add(i).read_volatile() } } else { 0 })
+        })
+    }
+
     pub(crate) fn block_count(&self) -> u32 {
         self.inner.lock().blocks.len() as u32
     }
@@ -666,14 +705,25 @@ impl Buffer::ver {
                     unk_8: U64(0),
                     unk_10: U64(0),
                     user_buffer: inner.user_buffer.gpu_pointer(),
+                    #[ver(V < V27_2)]
                     unk_20: 0,
-                    #[ver(V >= V13_3)]
+                    #[ver(V >= V13_3 && V < V27_2)]
                     unk_28: U64(0),
+                    #[ver(V >= V27_2)]
+                    unk_20_27: U64(0),
+                    #[ver(V >= V27_2)]
+                    skip: 0,
+                    #[ver(V >= V27_2)]
+                    fw_flag: 0,
                     stats: stats_pointer,
                     total_page_count: AtomicU32::new(0),
-                    #[ver(G < G14X)]
+                    #[ver(V >= V27_2)]
+                    tvb_overflow: 0,
+                    #[ver(V >= V27_2)]
+                    unk_40: U64(0),
+                    #[ver(G < G14X && V < V27_2)]
                     unk_30: U64(0),
-                    #[ver(G < G14X)]
+                    #[ver(G < G14X && V < V27_2)]
                     unk_38: U64(0),
                 })
             },
@@ -693,6 +743,11 @@ impl Buffer::ver {
             mod_pr_debug!("Buffer: assigning slot {} (rebind={})", slot.slot(), rebind);
 
             inner.last_token = Some(slot.token());
+            #[ver(V >= V27_2)]
+            {
+                let id = slot.slot() as i32;
+                inner.info.with_mut(|raw, _inner| raw.last_id = id);
+            }
             inner.active_slot = Some(slot);
         }
 
@@ -764,12 +819,18 @@ pub(crate) struct BufferManager(slotalloc::SlotAllocator<BufferSlotInner::ver>);
 #[versions(AGX_ROOT)]
 impl BufferManager::ver {
     pub(crate) fn new() -> Result<BufferManager::ver> {
+        Self::with_slots(NUM_BUFFERS)
+    }
+
+    /// A manager handing out only the first `count` buffer slots.
+    pub(crate) fn with_slots(count: u32) -> Result<BufferManager::ver> {
+        let count = count.clamp(1, NUM_BUFFERS);
         let mut owners = KVec::new();
-        for _i in 0..(NUM_BUFFERS as usize) {
+        for _i in 0..(count as usize) {
             owners.push(None, GFP_KERNEL)?;
         }
         Ok(BufferManager::ver(slotalloc::SlotAllocator::new(
-            NUM_BUFFERS,
+            count,
             BufferManagerInner::ver { owners },
             |_inner, _slot| Some(BufferSlotInner::ver()),
             c_str!("BufferManager::SlotAllocator"),

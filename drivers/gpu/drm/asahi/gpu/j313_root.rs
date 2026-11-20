@@ -332,6 +332,7 @@ impl G13StartupFence {
             put64(cmd, 0x298, stamp);
             put64(cmd, 0x2a0, fw_stamp);
             put32(cmd, 0x2a8, stamp_value);
+            cmd[0x2ac] = slot as u8;
             put32(cmd, 0x2b0, slot);
             // Tail: timestamp slots B/C name the start/end words.
             put64(cmd, 0x2cc, timestamps_va);
@@ -555,6 +556,7 @@ impl J313Pool {
         put64(cmd, 0x298, q.stamp);
         put64(cmd, 0x2a0, q.fw_stamp);
         put32(cmd, 0x2a8, stamp_value);
+        cmd[0x2ac] = q.slot as u8;
         put32(cmd, 0x2b0, q.slot);
         put64(cmd, 0x2cc, timestamps_va);
         put64(cmd, 0x2d4, timestamps_va + 8);
@@ -874,10 +876,12 @@ impl G13TrialRoot {
         let mut at = read.load(Ordering::Acquire);
         if write < 256 && at < 256 && at != write {
             while at != write {
-                if EVENTS.fetch_add(1, Ordering::Relaxed) < 4 {
-                    let words: [u32; 6] = core::array::from_fn(|i|
-                        ring.shared_index(at as usize * 0x38 + 4 * i).map(|w| w.load(Ordering::Acquire)).unwrap_or(u32::MAX));
-                    dev_info!(self.graph.dev.as_ref(), "G13G event[{}] {:x?}\n", at, words);
+                // Extended-format records are 0x48 bytes, kind first.
+                let words: [u32; 10] = core::array::from_fn(|i|
+                    ring.shared_index(at as usize * 0x48 + 4 * i).map(|w| w.load(Ordering::Acquire)).unwrap_or(u32::MAX));
+                let n = EVENTS.fetch_add(1, Ordering::Relaxed);
+                if words[0] != 1 && (n < 32 || n.is_power_of_two()) {
+                    dev_info!(self.graph.dev.as_ref(), "G13G event[{}] #{} kind={} {:x?}\n", at, n, words[0], &words[1..]);
                 }
                 at = (at + 1) % 256;
             }

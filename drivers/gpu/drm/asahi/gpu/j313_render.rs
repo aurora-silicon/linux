@@ -13,8 +13,8 @@ use crate::m3::agx_attachments::Attachments;
 use crate::m3::agx_uapi::UapiRenderCommand;
 use crate::{alloc::Allocator, buffer};
 
-type Buffer = buffer::BufferG13V13_5;
-type Scene = buffer::SceneG13V13_5;
+type Buffer = buffer::BufferG13V27_2;
+type Scene = buffer::SceneG13V27_2;
 
 /// Render slots, reused in order once the firmware has unlinked both commands of a slot.
 pub(crate) const J313_RENDER_SLOTS: usize = 8;
@@ -48,17 +48,17 @@ fn put_struct<T>(b: &mut [u8], at: usize, size: usize, v: &T) -> Result {
 
 /// Per client queue: the 13.5 tile buffer and the queue's identity.
 pub(crate) struct J313RenderContext {
-    buffer: Buffer,
+    pub(crate) buffer: Buffer,
     ualloc: Arc<Mutex<crate::alloc::DefaultAllocator>>,
     id: u32,
 }
 
 impl J313RenderContext {
-    pub(crate) fn new(graph: &GpuManagerG13V13_5, id: u32,
+    pub(crate) fn new(graph: &GpuManagerG13V13_5, mgr: &buffer::BufferManagerG13V27_2, id: u32,
         ualloc: Arc<Mutex<crate::alloc::DefaultAllocator>>,
         ualloc_priv: Arc<Mutex<crate::alloc::DefaultAllocator>>) -> Result<Self> {
         let mut alloc = GpuManager::alloc(graph);
-        let buffer = Buffer::new(graph, &mut alloc, ualloc.clone(), ualloc_priv, &graph.buffer_mgr)?;
+        let buffer = Buffer::new(graph, &mut alloc, ualloc.clone(), ualloc_priv, mgr)?;
         Ok(Self { buffer, ualloc, id })
     }
 }
@@ -146,6 +146,8 @@ pub(crate) struct J313RenderJob {
     pub(crate) init: Option<u64>,
     pub(crate) tiler: u64,
     pub(crate) fragment: u64,
+    /// Why the buffer setup was emitted: (rebind, grown, auto-grown), buffer slot, blocks.
+    pub(crate) why: (bool, bool, bool, u32, u32),
     _scene: Scene,
     _aux_fb: fw::types::GpuArray<u8>,
 }
@@ -229,7 +231,8 @@ impl J313RenderPool {
         let tile_info = tiling(r)?;
         let buffer = &ctx.buffer;
         let autogrown = buffer.auto_grow()?;
-        let grown = buffer.ensure_blocks(tile_info.min_tvb_blocks)?;
+        let grown = buffer.ensure_blocks(tile_info.min_tvb_blocks
+            .max(crate::module_parameters::t8112_g13_min_blocks.value() as usize))?;
         let scene = buffer.new_scene(alloc, &tile_info)?;
         let aux_fb = ctx.ualloc.lock().array_empty_tagged(0x8000, b"AXFB")?;
 
@@ -351,6 +354,9 @@ impl J313RenderPool {
         put64(ta, 0x584, u64::from(ta_ev.stamp_pointer()));
         put64(ta, 0x58c, u64::from(ta_ev.fw_stamp_pointer()));
         put32(ta, 0x594, i.values[0]);
+        // Queue slot: the firmware registers the queue under this byte when it links the
+        // command and wakes the slot named by the submission entry.
+        ta[0x598] = u8::try_from(ta_ev.slot()).map_err(|_| EINVAL)?;
         put32(ta, 0x59c, ta_ev.slot());
         put64(ta, 0x5a4, uuid);
         put32(ta, 0x5ac, i.sequence[0] as u32);
@@ -377,6 +383,7 @@ impl J313RenderPool {
         }
         seq[0x80..0x80 + crate::m3::agx_attachments::SIZE].copy_from_slice(&ta_attach.0);
         Self::timestamps(seq, 0x19c, 0x1ec, ta_va, ta_ring.va(), [0x5cc, 0x5d4, 0x5e4, 0x61c, 0x538], uuid);
+        seq[0x190] = u8::try_from(ta_ev.slot()).map_err(|_| EINVAL)?;
         put32(seq, 0x1e8, 0x100);
         let fin = 0x238;
         put32(seq, fin, 6);
@@ -542,6 +549,7 @@ impl J313RenderPool {
         put64(frag, 0x8e8, u64::from(frag_ev.stamp_pointer()));
         put64(frag, 0x8f0, u64::from(frag_ev.fw_stamp_pointer()));
         put32(frag, 0x8f8, i.values[1]);
+        frag[0x8fc] = u8::try_from(frag_ev.slot()).map_err(|_| EINVAL)?;
         put32(frag, 0x900, frag_ev.slot());
         put64(frag, 0x908, uuid);
         put32(frag, 0x910, i.sequence[1] as u32);
@@ -568,6 +576,7 @@ impl J313RenderPool {
         }
         seq[0xa0..0xa0 + crate::m3::agx_attachments::SIZE].copy_from_slice(&frag_attach.0);
         Self::timestamps(seq, 0x1b4, 0x204, frag_va, frag_ring.va(), [0x930, 0x938, 0x948, 0x980, 0x89c], uuid);
+        seq[0x1b0] = u8::try_from(frag_ev.slot()).map_err(|_| EINVAL)?;
         put32(seq, 0x200, 0x10000);
         let fin = 0x250;
         put32(seq, fin, 8);
@@ -583,11 +592,13 @@ impl J313RenderPool {
         put32(seq, fin + 0x98, (-(fin as i32)) as u32);
         seq[fin + 0x9c] = u8::from(frag_attach.count() > 0);
         put64(seq, fin + 0xa5, frag_latch);
+        seq[fin + 0xb5] = u8::try_from(frag_ev.slot()).map_err(|_| EINVAL)?;
         put64(seq, fin + 0xad, frag_va + 0x970);
         put32(seq, fin + 0xbc, 0x4000_0002);
         crate::pgtable::clean_poc(seq.as_ptr(), seq.len());
 
         // Buffer initialization ahead of the tiler command, as 13.5 does.
+        let why = (scene.rebind(), grown, autogrown, buffer_slot, buffer.block_count());
         let init = if scene.rebind() || grown || autogrown {
             let b = &mut self.init.as_mut_slice()[slot * INIT_BYTES..(slot + 1) * INIT_BYTES];
             b.fill(0);
@@ -604,7 +615,7 @@ impl J313RenderPool {
         };
         crate::pgtable::poc_barrier();
         buffer.increment();
-        Ok(J313RenderJob { slot, init, tiler: ta_va, fragment: frag_va, _scene: scene, _aux_fb: aux_fb })
+        Ok(J313RenderJob { slot, init, why, tiler: ta_va, fragment: frag_va, _scene: scene, _aux_fb: aux_fb })
     }
 
     /// The start and end timestamp operations of a stage (kext `encodeTimeStamp` layout):
