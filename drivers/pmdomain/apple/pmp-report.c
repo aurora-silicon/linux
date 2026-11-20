@@ -577,6 +577,16 @@ module_param(j613_sleep_dvfs_zero, bool, 0600);
 MODULE_PARM_DESC(j613_sleep_dvfs_zero,
 		 "J613 trial: at the sleep, level 0 with the valid bit on CPU DVFS clients 0, 1 and 3, as macOS");
 
+/*
+ * J613 trial: macOS keeps SoC-device request bit 19 (ADT soc-device id 0x14, IOA1) set through
+ * every sleep and writes it first at each wake (capture run 58); no Linux entry owns it, and
+ * Linux reaches its commit with the request word at 0.
+ */
+static bool j613_sleep_ioa1;
+module_param(j613_sleep_ioa1, bool, 0600);
+MODULE_PARM_DESC(j613_sleep_ioa1,
+		 "J613 trial: keep the IOA1 request (bit 19) set at the sleep, as macOS");
+
 static void apple_pmp_report_j613_sleep_dvfs(struct apple_pmp_report *rep)
 {
 	static const unsigned int client[] = { 0x110, 0x111, 0x113 };
@@ -584,7 +594,16 @@ static void apple_pmp_report_j613_sleep_dvfs(struct apple_pmp_report *rep)
 	struct resource *res;
 	unsigned int i;
 
-	if (!READ_ONCE(j613_sleep_dvfs_zero) || !of_machine_is_compatible("apple,j613"))
+	if (!of_machine_is_compatible("apple,j613"))
+		return;
+	if (READ_ONCE(j613_sleep_ioa1)) {
+		u64 req = readq(rep->base + rep->offsets->tgt_read) | BIT_ULL(19);
+
+		writeq(req, rep->base + rep->offsets->tgt_write);
+		rep->sleep_request |= BIT_ULL(19);
+		dev_info(rep->dev, "J613 sleep: IOA1 request kept, request word %#llx\n", req);
+	}
+	if (!READ_ONCE(j613_sleep_dvfs_zero))
 		return;
 	res = platform_get_resource(to_platform_device(rep->dev), IORESOURCE_MEM, 0);
 	if (!res || resource_size(res) < 0x10000 + 8 * 0x114)
