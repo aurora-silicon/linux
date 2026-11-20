@@ -1532,10 +1532,6 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state);
  * 0x00 at an attach and USBw 0x00 at the update after the attach's debounce (500 ms), on every
  * SN201202x of the J714s, only while running (not in a sleep's phases).
  */
-static bool macos_attach = true;
-module_param(macos_attach, bool, 0644);
-MODULE_PARM_DESC(macos_attach, "J714s SN201202x: SSPS 2 at a detach, SSPS 0 and USBw 0 at an attach, as macOS does (0: neither)");
-
 #define TIPD_SSPS_MACOS_DETACHED	0x02
 /*
  * 28 ms after the detach and before its SSPS, macOS writes register 0x50 with 64 bytes, 00 20 and
@@ -1550,7 +1546,7 @@ static bool cd321x_macos_cable_port(struct cd321x *cd321x)
 	struct device *dev = cd321x->tps.dev;
 	struct fwnode_handle *con;
 
-	if (!READ_ONCE(macos_attach) || !device_is_compatible(dev, "apple,sn201202x") ||
+	if (!device_is_compatible(dev, "apple,sn201202x") ||
 	    !of_machine_is_compatible("apple,j714s"))
 		return false;
 	con = device_get_named_child_node(dev, "connector");

@@ -1226,13 +1226,9 @@ EXPORT_SYMBOL_IF_KUNIT(sn201202x_suspend);
  * the port's PHY has stopped and 54-73 ms after its SSPS 0x03: (WAKEUP) CMD1 idle read, DATA1 =
  * 0x09, USBw, its end read, DATA1 read, SLEEP; no SYS_PWR_STATE read and nothing else. At the
  * wake, in the same window as its SSPS 0x00: USBw 0x80, then USBw 0x00. Linux armed none (no
- * apple,usb-remote-wake). With macos_usbw on and the macOS entry, apple-sleep's .prepare_late
- * (after every noirq suspend) calls sn201202x_usbw_notify().
+ * apple,usb-remote-wake). With the macOS entry, apple-sleep's .prepare_late (after every noirq
+ * suspend) calls sn201202x_usbw_notify().
  */
-static bool macos_usbw = true;
-module_param(macos_usbw, bool, 0644);
-MODULE_PARM_DESC(macos_usbw, "J714s: USBw 0x09 after the PHYs' stop for a port with a partner, 0x80 and 0x00 at the wake, as macOS does (0: none)");
-
 static int sn201202x_usbw_notify(struct notifier_block *nb, unsigned long usb_asleep, void *unused)
 {
 	struct sn201202x *sn = container_of(nb, struct sn201202x, usbw_nb);
@@ -1240,7 +1236,7 @@ static int sn201202x_usbw_notify(struct notifier_block *nb, unsigned long usb_as
 	ktime_t start;
 	int ret;
 
-	if (!READ_ONCE(macos_usbw) || !sn->macos_sleep || !sn->usbw_port)
+	if (!sn->macos_sleep || !sn->usbw_port)
 		return NOTIFY_DONE;
 	guard(mutex)(&tps->lock);
 	sn->usbw_macos = false;
@@ -1281,18 +1277,13 @@ static int sn201202x_usbw_notify(struct notifier_block *nb, unsigned long usb_as
  * and SLEEP right after it. The port's other work is freezable and stays frozen until after the
  * complete. Outside tipd only apple-sleep's debug link cut talks to a port controller during a
  * sleep, at the noirq suspend, and it sends its own WAKEUP first.
- * The switch is read at each sleep's prepare; 0 enters as before.
  */
-static bool macos_entry = true;
-module_param(macos_entry, bool, 0644);
-MODULE_PARM_DESC(macos_entry, "J714s: enter the sleep as macOS does: poll stopped, no liquid detection, SLEEP right after S3 at the prepare; events cleared and S0 at the resume (0: as before)");
-
 static bool sn201202x_macos_entry(struct sn201202x *sn)
 {
 	struct device *dev = sn->cd.tps.dev;
 
 	/* A port that arms USB wake (none on the J714s) needs the controller at the suspend */
-	return READ_ONCE(macos_entry) && sn201202x_j714s() && sn->polled &&
+	return sn201202x_j714s() && sn->polled &&
 	       pm_suspend_via_firmware() &&
 	       device_property_read_bool(dev, "apple,sleep-ssps") &&
 	       !device_property_read_bool(dev, "apple,usb-remote-wake");
