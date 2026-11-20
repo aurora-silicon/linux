@@ -459,6 +459,21 @@ impl Runtime {
                         render.waiting_unlink = true;
                         dev_info!(self.dev, "J313: render slot {} still in the firmware's tracking lists (owned={}); waiting\n", slot, owned);
                         render.pool.dump(&self.dev, slot);
+                        // The firmware unlinks retired commands when it next processes a queue:
+                        // give both render queues an already-satisfied barrier when idle.
+                        let idle = !state.inflight.iter().any(|f| f.engine != 2) && render.staged.is_none();
+                        if !owned && idle {
+                            for e in 0..2 {
+                                let ev = &render.rings[e].event;
+                                let last = render.last[e].raw();
+                                let published = render.pool.nop_barrier(slot, e, u64::from(ev.fw_stamp_pointer()), last, ev.slot())
+                                    .and_then(|va| state.root.j313_ring_publish(&render.rings[e], va));
+                                match published {
+                                    Ok(_) => render.published[e] += 1,
+                                    Err(err) => dev_err!(self.dev, "J313: unlink barrier on queue {} failed {:?}\n", e, err),
+                                }
+                            }
+                        }
                     }
                     for engine in 0..2 {
                         let _ = state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick_engine(engine));

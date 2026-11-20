@@ -1500,7 +1500,7 @@ impl GpuManager::ver {
         mod_dev_dbg!(self.dev, "GPU: run_job: ring doorbell\n");
 
         let mut guard = self.rtkit.lock();
-        let rtk = guard.as_mut().as_pin_mut().unwrap();
+        let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
         rtk.send_message(
             EP_DOORBELL,
             MSG_TX_DOORBELL | pipe_type as u64 | ((index as u64) << 2),
@@ -1542,6 +1542,11 @@ impl GpuManager::ver {
         if self.is_crashed() {
             return Err(ENODEV);
         }
+        // A manager whose firmware runs under another backend (T8103/T8112 on 27.2) has no
+        // RTKit of its own; its firmware never saw this context, so there is nothing to destroy.
+        if self.rtkit.lock().is_none() {
+            return Ok(());
+        }
 
         let mut guard = self.alloc.lock();
         let (garbage_count, _) = guard.private.garbage();
@@ -1575,7 +1580,7 @@ impl GpuManager::ver {
 
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
             rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
         }
 
@@ -1650,7 +1655,7 @@ impl Gpu for GpuManager::ver {
 
         let initdata = self.initdata.gpu_va().get();
         let mut guard = self.rtkit.lock();
-        let mut rtk = guard.as_mut().as_pin_mut().unwrap();
+        let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
 
         rtk.as_mut().boot()?;
         rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
@@ -1806,7 +1811,9 @@ impl GpuManager for GpuManager::ver {
                 ro_garbage_bytes
             );
             if self.flush_fw_cache().is_err() {
-                dev_err!(self.dev.as_ref(), "Failed to flush FW cache\n");
+                if self.rtkit.lock().is_some() {
+                    dev_err!(self.dev.as_ref(), "Failed to flush FW cache\n");
+                }
             } else {
                 guard.private.collect_garbage(garbage_count);
                 guard.gpu_ro.collect_garbage(ro_garbage_count);
@@ -1826,7 +1833,7 @@ impl GpuManager for GpuManager::ver {
         }
 
         let mut guard = self.rtkit.lock();
-        let rtk = guard.as_mut().as_pin_mut().unwrap();
+        let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
         rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_KICKFW)?;
 
         Ok(())
@@ -1836,6 +1843,12 @@ impl GpuManager for GpuManager::ver {
         mod_dev_dbg!(self.dev, "Flushing coprocessor data cache\n");
 
         if self.is_crashed() {
+            return Err(ENODEV);
+        }
+        // Without an RTKit of its own (firmware run by another backend, T8103/T8112 27.2)
+        // nothing services this manager's device control channel: sending would wait for
+        // ring space forever. Keep the garbage instead.
+        if self.rtkit.lock().is_none() {
             return Err(ENODEV);
         }
 
@@ -1867,7 +1880,7 @@ impl GpuManager for GpuManager::ver {
         let token = txch.device_control.send(&dc);
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
             rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
         }
 
@@ -2000,10 +2013,11 @@ impl GpuManager for GpuManager::ver {
         mod_dev_dbg!(self.dev, "Recover Channel command: {:?}\n", &dc);
         let mut txch = self.tx_channels.lock();
 
+        if self.rtkit.lock().is_none() { return; }
         let token = txch.device_control.send(&dc);
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let Some(rtk) = guard.as_mut().as_pin_mut() else { return };
             if rtk
                 .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
                 .is_err()
@@ -2047,10 +2061,11 @@ impl GpuManager for GpuManager::ver {
 
         let mut txch = self.tx_channels.lock();
 
+        if self.rtkit.lock().is_none() { return; }
         txch.device_control.send(&dc);
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let Some(rtk) = guard.as_mut().as_pin_mut() else { return };
             if rtk
                 .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
                 .is_err()
@@ -2065,11 +2080,12 @@ impl GpuManager for GpuManager::ver {
             return Err(ENODEV);
         }
 
+        if self.rtkit.lock().is_none() { return Err(ENODEV); }
         let mut fwctl = self.fwctl_channel.lock();
         let token = fwctl.send(&msg);
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
             rtk.send_message(EP_DOORBELL, MSG_FWCTL)?;
         }
         fwctl.wait_for(token)?;

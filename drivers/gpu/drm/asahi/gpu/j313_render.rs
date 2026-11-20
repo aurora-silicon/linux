@@ -204,6 +204,27 @@ impl J313RenderPool {
         Ok(Self { ta, frag, seqs, init, barriers, tracking, cursors, stamps })
     }
 
+    /// Writes a barrier that is already satisfied (waits for `wait` on a stamp the queue has
+    /// reached) into the unused command storage of retired `slot`, for queue `which` (0 tiler,
+    /// 1 fragment). Publishing it makes the firmware process the queue, which unlinks retired
+    /// commands from its tracking lists.
+    pub(crate) fn nop_barrier(&mut self, slot: usize, which: usize, stamp: u64, wait: u32, event: u32) -> Result<u64> {
+        if slot >= J313_RENDER_SLOTS || which > 1 { return Err(EINVAL); }
+        let (area, bytes) = if which == 0 { (&mut self.init, INIT_BYTES) } else { (&mut self.barriers, BARRIER_BYTES) };
+        let va = area.gpu_va().get() + (slot * bytes) as u64;
+        let b = &mut area.as_mut_slice()[slot * bytes..(slot + 1) * bytes];
+        b.fill(0);
+        put32(b, 0, 4);
+        put64(b, 4, stamp);
+        put64(b, 0xc, stamp);
+        put32(b, 0x14, wait);
+        put32(b, 0x20, event);
+        put32(b, 0x24, wait);
+        crate::pgtable::clean_poc(b.as_ptr(), b.len());
+        crate::pgtable::poc_barrier();
+        Ok(va)
+    }
+
     /// Whether the firmware still holds either command of `slot` in a queue's tracking list.
     pub(crate) fn registered(&self, slot: usize) -> Result<bool> {
         for k in [2 * slot, 2 * slot + 1] {
