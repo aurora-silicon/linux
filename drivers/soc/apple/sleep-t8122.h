@@ -162,6 +162,59 @@ static bool t8122_c1_3;
 module_param(t8122_c1_3, bool, 0600);
 MODULE_PARM_DESC(t8122_c1_3, "J613 trial: S3_5_C15_C1_3 |= 0x3 before each core's last WFI (macOS reads 0xf, Linux 0xc)");
 
+/*
+ * J613 diagnostic: at the hold (untested_hold, just before the commit word), every 32-bit word
+ * of these ranges, the ones Aura's crumb bit 28 reads at macOS's withheld commit, so the two
+ * diff word for word. t8122_wide_dump is a mask over the table (bit n = range n). The lines:
+ * "W <addr> <64 words>". Mapped at probe; reads at the hold only.
+ */
+static const struct {
+	u64 base, size;
+} t8122_wide[] = {
+	{ 0x2d0700000, 0x14000 }, { 0x2d0724000, 0x4000 }, { 0x2d0734000, 0x10 },
+	{ 0x2d0768000, 0x40 }, { 0x2d0780000, 0x8 }, { 0x2e42d4000, 0x100 },
+	{ 0x2e42b0000, 0x30 }, { 0x2e4714000, 0x100 }, { 0x2e4908000, 0x100 },
+	{ 0x2e4280000, 0x4000 }, { 0x2e4004000, 0x48 },
+};
+static unsigned int t8122_wide_dump;
+module_param(t8122_wide_dump, uint, 0400);
+MODULE_PARM_DESC(t8122_wide_dump, "J613 DIAGNOSTIC: with the hold, dump these ranges (mask) at the commit point, as Aura's crumb bit 28");
+static void __iomem *t8122_wide_map[ARRAY_SIZE(t8122_wide)];
+static void t8122_dc_putc(unsigned char c);
+static void t8122_dc_puts(const char *str);
+static void t8122_dc_hex(u32 v);
+
+static void t8122_wide_setup(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(t8122_wide); i++)
+		if (t8122_wide_dump & BIT(i))
+			t8122_wide_map[i] = ioremap_np(t8122_wide[i].base, t8122_wide[i].size);
+}
+
+static void t8122_wide_print(void)
+{
+	unsigned int i;
+	u32 off;
+
+	t8122_dc_puts("\nWIDE begin");
+	for (i = 0; i < ARRAY_SIZE(t8122_wide); i++) {
+		if (!t8122_wide_map[i])
+			continue;
+		for (off = 0; off < t8122_wide[i].size; off += 4) {
+			if (!(off % 256)) {
+				t8122_dc_puts("\nW ");
+				t8122_dc_hex(upper_32_bits(t8122_wide[i].base + off));
+				t8122_dc_hex(lower_32_bits(t8122_wide[i].base + off));
+			}
+			t8122_dc_putc(' ');
+			t8122_dc_hex(readl(t8122_wide_map[i] + off));
+		}
+	}
+	t8122_dc_puts("\nWIDE end\n");
+}
+
 static unsigned int t8122_wfi_regs;
 module_param(t8122_wfi_regs, uint, 0600);
 MODULE_PARM_DESC(t8122_wfi_regs, "J613 DIAGNOSTIC: print every core's state at its last WFI (bit 0 architectural, bit 1 also three IMPDEF words)");
@@ -813,6 +866,8 @@ static int t8122_sleep_map_regs(struct apple_sleep *s)
 		if (IS_ERR(t8122.dump_aon))
 			t8122.dump_aon = NULL;
 	}
+	if (t8122_wide_dump)
+		t8122_wide_setup();
 	t8122.hpm_notify = t8122_map(s, "spmi-hpm", NULL);
 	if (IS_ERR(t8122.hpm_notify))
 		return dev_err_probe(s->dev, PTR_ERR(t8122.hpm_notify), "no spmi-hpm registers\n");
@@ -1707,8 +1762,11 @@ static void t8122_sleep_pre_commit(struct apple_sleep *s)
 		t8122_dc_hex((u32)div64_u64((read_sysreg(cntpct_el0) - t0) * 1000, hz));
 	}
 	/* The hold: the commit word is not written, and the next thing is a reset from outside. */
-	if (READ_ONCE(sleep_untested_hold))
+	if (READ_ONCE(sleep_untested_hold)) {
+		if (t8122_wide_dump)
+			t8122_wide_print();
 		t8122_dc_puts(" HOLD before commit\n");
+	}
 }
 
 /*
