@@ -1019,6 +1019,8 @@ static void apple_smc_sleep_wake(struct apple_smc *smc)
 	}
 	smc->sleep_warned = false;
 	apple_smc_lid_wake(smc);
+	if (apple_smc_port_reasons_only(smc, smc->wake_record))
+		apple_sleep_port_wake(apple_sleep_lid_closed_at_wake() > 0);
 	/* With a sleep policy (the J714s), the record is only named and the lid read. */
 	if (smc->sleep_policy)
 		return;
@@ -1479,8 +1481,8 @@ static int apple_smc_prepare(struct device *dev)
 		int ret = 0;
 
 		if (smc->saved_enabled) {
-			if (!mutex_trylock(&smc->mutex))
-				return -EBUSY;
+			/* A sleep right after a dark wake finds the wake's commands in flight */
+			mutex_lock(&smc->mutex);
 			ret = apple_smc_saved_guard(smc);
 			mutex_unlock(&smc->mutex);
 		}
