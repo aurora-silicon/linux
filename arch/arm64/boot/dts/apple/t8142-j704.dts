@@ -322,3 +322,4 @@
 #include "t8142-j704-pcie.dtsi"
 #include "t8142-j704-power.dtsi"
 #include "t8142-j704-hwmon.dtsi"
+#include "t8142-j704-hdmi.dtsi"
