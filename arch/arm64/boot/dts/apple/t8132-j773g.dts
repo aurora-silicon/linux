@@ -89,58 +89,25 @@
 	};
 };
 
-&soc {
-	dptx_phy: phy@39a700000 {
-		compatible = "apple,t8122-dptx-phy", "apple,dptx-phy";
-		reg = <0x3 0x9a700000 0x0 0x4000>,
-		      <0x3 0x9a740000 0x0 0x10000>;
-		reg-names = "core", "dptx";
-		power-domains = <&ps_dptx_phy>;
-		#phy-cells = <0>;
-		status = "okay";
-	};
-};
-
-&dcp_mbox {
-	/* iBoot leaves DISP_CPU in auto mode; Linux must not switch it. */
-	/delete-property/ power-domains;
-	status = "okay";
-};
-
-&dcp_dart {
-	status = "okay";
-};
-
-&disp0_dart {
-	status = "okay";
-};
-
-&dcp {
-	/* iBoot leaves DISP_CPU in auto mode; Linux must not switch it. */
-	/delete-property/ power-domains;
-	/* Its PIODMA child owns iommu-addresses entries in /reserved-memory. */
-	#address-cells = <2>;
-	#size-cells = <2>;
-	apple,connector-type = "HDMI-A";
-	apple,dptx-phy = <4>;
-	phys = <&dptx_phy>;
-	phy-names = "dp-phy";
-	hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
-	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
-	status = "okay";
-};
-
-&disp0_piodma {
-	status = "okay";
-};
-
-&display {
-	status = "okay";
+/*
+ * iBoot scans out through dispext0 to the HDMI port (the LPDPTX PHY and the
+ * PS190 DP-to-HDMI converter, hot-plug on AOP GPIO 41): the boot framebuffer
+ * holds the power domains used for it.
+ *
+ * On macOS 27.2 the main DCP is started and then parked, as macOS leaves it:
+ * nothing hands it over, its nodes stay as t8132-dcp.dtsi has them
+ * (disabled), and the M4 backend refuses it there anyway. The 26.6.2 HDMI
+ * path through it (main-DCP HDMI with the T8122-style PHY at the same
+ * address) is not described here: the HDMI port is dcpext0's below.
+ */
+&framebuffer0 {
+	power-domains = <&ps_dispext0_fe>, <&ps_dptx_phy>;
 };
 
 /*
- * The DPTX PHY's domain: the J713 PMGR policy keeps it from Linux, and the
- * PHY (and the DCP that waits on it) would never probe. It stays on through
+ * The DPTX PHY's domain: the J713 PMGR policy, which runs on every T8132
+ * firmware, keeps it from Linux, and the PHY (and dcpext0, which waits on
+ * it) would never probe. It stays on through
  * suspend-to-idle: the PHY keeps no state across a power-off, and the link to
  * the HDMI converter faults when the display comes back after one.
  */
