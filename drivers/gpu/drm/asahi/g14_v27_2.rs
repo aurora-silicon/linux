@@ -345,6 +345,9 @@ pub(crate) struct Runtime {
     dev: ARef<device::Device>,
     graph: Arc<GpuManagerG14V13_5>,
     healthy: AtomicBool,
+    /// Set between [`Runtime::sleep_prepare`] and [`Runtime::sleep_complete`]: nothing is
+    /// published across a system sleep.
+    asleep: AtomicBool,
     notify: Arc<Notify>,
     /// Runs the service; only `Notify::wake` queues on it, and `stop` drains it.
     queue: OwnedQueue,
@@ -445,6 +448,7 @@ impl Runtime {
     /// Publishes pending commands while pool slots are free.
     fn pump(&self, state: &mut State) {
         self.acknowledge(state);
+        if self.asleep.load(Ordering::Acquire) { return; }
         while state.inflight.len() < POOL_SLOTS - 1 && !state.pending.is_empty() {
             // A slot is reused only once the firmware has unlinked it from its tracking list
             // (+0x94), which its retirement scan does after the slot's cursor is advanced.
@@ -607,6 +611,51 @@ impl Runtime {
         self.pump(state);
     }
 
+    /// Before a suspend-to-idle: holds new publications and lets published work retire, so the
+    /// sleep starts with nothing in flight. The firmware keeps running with its keep-powered
+    /// policy: its GPU power domain is kept through the sleep (`apple,sleep-retained`), and the
+    /// ASC, its memory and the root stay as they are. Refuses the sleep (EBUSY) if published work
+    /// does not retire within the stop drain time.
+    ///
+    /// The firmware's own power-off handshake (idle policy allow-off, then keep-powered again
+    /// after the wake) is not used: on phellos the firmware crashed in the wake that followed it.
+    pub(crate) fn sleep_prepare(&self) -> Result {
+        let mut guard = self.state.lock();
+        if !self.healthy() || guard.is_none() { return Ok(()); }
+        // Hold publications first, then let what is published retire. User space is frozen by
+        // now; only the scheduler's queued jobs can still arrive, and they wait in `pending`.
+        self.asleep.store(true, Ordering::Release);
+        let start = Instant::<Monotonic>::now();
+        loop {
+            let Some(state) = Option::as_mut(&mut *guard) else { return Ok(()); };
+            if !self.healthy() { return Ok(()); }
+            if state.inflight.is_empty() {
+                dev_info!(self.dev, "GPU held for sleep: submitted={} completed={} pending={}\n",
+                          state.submitted, state.retired, state.pending.len());
+                return Ok(());
+            }
+            if start.elapsed() >= Delta::from_millis(STOP_DRAIN_MS.into()) {
+                dev_err!(self.dev, "GPU: sleep refused, {} commands still running\n", state.inflight.len());
+                self.asleep.store(false, Ordering::Release);
+                self.pump(state);
+                return Err(EBUSY);
+            }
+            // The service retires on notifications; `idle` is signalled only when nothing at all
+            // is left, so look again every 50 ms.
+            let _ = self.idle.wait_timeout(&mut guard, msecs_to_jiffies(50));
+        }
+    }
+
+    /// After the sleep: publishes the work held during it.
+    pub(crate) fn sleep_complete(&self) {
+        let mut guard = self.state.lock();
+        if !self.asleep.swap(false, Ordering::AcqRel) { return; }
+        let Some(state) = Option::as_mut(&mut *guard) else { return; };
+        dev_info!(self.dev, "GPU released after sleep: running={:?} pending={}\n",
+                  state.root.firmware_running(), state.pending.len());
+        if self.healthy() { self.pump(state); }
+    }
+
     /// Stops the firmware: retire or fail outstanding work, allow power-off, then halt the ASC
     /// with every mapping still in place (RTKit power-off if the firmware does not stop).
     pub(crate) fn stop(&self) {
@@ -688,6 +737,7 @@ impl Backend {
                 dev: dev.into(),
                 graph: runtime_graph,
                 healthy: AtomicBool::new(true),
+                asleep: AtomicBool::new(false),
                 notify: runtime_notify,
                 queue,
                 state <- new_mutex!(None, "g14_v27_2::Runtime::state"),
@@ -758,6 +808,8 @@ impl Backend {
     }
 
     pub(crate) fn stop(&self) { self.runtime.stop(); }
+    pub(crate) fn sleep_prepare(&self) -> Result { self.runtime.sleep_prepare() }
+    pub(crate) fn sleep_complete(&self) { self.runtime.sleep_complete() }
 }
 
 impl Drop for Backend {
