@@ -28,7 +28,7 @@ properties:
       - const: apple,t6050-aop-audio
 
   dmas:
-    minItems: 4
+    minItems: 3
     items:
       - description: Headset jack output
       - description: Headset microphone input
@@ -37,13 +37,21 @@ properties:
       - description: High-quality microphone array input
 
   dma-names:
-    minItems: 4
-    items:
-      - const: cout
-      - const: cin
-      - const: spkr
-      - const: sense
-      - const: hpai
+    oneOf:
+      - minItems: 4
+        items:
+          - const: cout
+          - const: cin
+          - const: spkr
+          - const: sense
+          - const: hpai
+      - description:
+          A speaker stream that carries no voltage/current sense (the ADT's
+          audio-speaker stream has no RX slot).
+        items:
+          - const: cout
+          - const: cin
+          - const: spkr
 
   power-domains:
     minItems: 1
@@ -66,11 +74,12 @@ properties:
 
   apple,speaker-amps:
     $ref: /schemas/types.yaml#/definitions/uint32
-    enum: [4, 6]
+    enum: [1, 4, 6]
     description:
       Number of speaker amplifiers on the firmware's speaker stream (one
-      playback slot and a voltage/current sense pair each), when it differs
-      from the SoC's default (T8142 - 4).
+      playback slot each, and a voltage/current sense pair each where the
+      stream carries sense), when it differs from the SoC's default (T8142 -
+      4, T6050 - 6). T8142 takes 4 or 6, T6050 takes 1 (with no sense).
 
 required:
   - compatible
