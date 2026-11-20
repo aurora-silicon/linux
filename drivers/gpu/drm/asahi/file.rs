@@ -400,6 +400,12 @@ pub(crate) type DrmFile = drm::File<File>;
 /// Minimum reserved AS for kernel mappings
 const VM_KERNEL_MIN_SIZE: u64 = 0x20000000;
 
+/// Most objects one file may bind with `GEM_BIND_OBJECT` at a time. Each bind keeps a record in
+/// the file's object table and, for a timestamp buffer, a CPU mapping of its backing; neither is
+/// charged to the client's memory limit. Mesa binds one per GL context, one per timestamped query
+/// pool and one debug buffer, so 4096 leaves room for hundreds of pools.
+const MAX_BOUND_OBJECTS_PER_FILE: u32 = 4096;
+
 impl drm::file::DriverFile for File {
     type Driver = driver::AsahiDrmDriver;
 
@@ -1586,14 +1592,14 @@ impl File {
 
         let mapping = Arc::new(
             reg_data.gpu.map_timestamp_buffer(bo, offset..end_offset)?,
-            GFP_KERNEL,
+            GFP_KERNEL_ACCOUNT,
         )?;
-        let obj = KBox::new(Object::TimestampBuffer(mapping), GFP_KERNEL)?;
+        let obj = KBox::new(Object::TimestampBuffer(mapping), GFP_KERNEL_ACCOUNT)?;
         let handle = file
             .inner()
             .objects()
             .lock()
-            .insert_limit(1..=u32::MAX, obj, GFP_KERNEL);
+            .insert_limit(1..=MAX_BOUND_OBJECTS_PER_FILE, obj, GFP_KERNEL_ACCOUNT);
         // StoreError owns the rejected object. Convert it only after the
         // temporary XArray guard is gone: dropping a mapping may sleep.
         let handle = handle? as u64;
