@@ -109,6 +109,27 @@ const struct ave_variant ave_t6041 = {
 	.boot_qualified = true,
 };
 
+/*
+ * The M4 (T8132) with the macOS 27.2 (26B123) stub, as on the MacBook Air
+ * (J713): the bootloader preloads TEXT 0x154000 and DATA 0x12c000, TEXT CRC
+ * 99fc929a, the same on every boot. The coprocessor and its start are the
+ * M4 Pro's; this build boots as device 23 and takes handshake type 23.
+ */
+static const struct ave_variant ave_t8132 = {
+	.regs = &ave_coproc_v40,
+	.fw_text_size = 0x154000,
+	.fw_data_size = 0x12c000,
+	.boot_device_id = 23,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1,
+	.vcbar_mask = U64_MAX,
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
+	.device_type = 23,
+	.lfs_ref_scale = 2,
+	.text_crc = AVE_FW_TEXT_CRC_T8132_26B123,
+	.boot_qualified = true,
+};
+
 static const struct ave_variant ave_t8140 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x14c000,
@@ -639,6 +660,7 @@ static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6050-ave", .data = &ave_t6050 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
 	{ .compatible = "apple,t8122-ave", .data = &ave_m3 },
+	{ .compatible = "apple,t8132-ave", .data = &ave_t8132 },
 	{ .compatible = "apple,t8140-ave", .data = &ave_t8140 },
 	{ .compatible = "apple,t8142-ave", .data = &ave_t8142 },
 	{}
