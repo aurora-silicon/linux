@@ -15,8 +15,9 @@ static void macaudio_admission_needs_a_safe_level(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j714_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j813_cfg));
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j873_cfg));
-	/* The Mac Studio M5: no sense and no protection owner yet, speaker off */
-	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j775_cfg));
+	/* The Mac Studio M5: no sense, admitted behind the lease, never a fixed ceiling */
+	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j775_cfg));
+	KUNIT_EXPECT_FALSE(test, macaudio_j775_cfg.spk_fixed_ceiling);
 	cfg = macaudio_j413_cfg;
 	cfg.safe_vol = 0;
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&cfg));
