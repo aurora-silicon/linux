@@ -854,12 +854,14 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	t8132 = of_device_is_compatible(node, "apple,t8132-pmgr-pwrstate");
 	/*
-	 * On the M4 firmware path some domains are the firmware's, which Linux
-	 * cannot access. The early compatibility adapter supplies the explicit
-	 * status and ownership before population; fail closed if it was not
-	 * enabled. Other firmware keeps the tree's own domain descriptions.
+	 * Some T8132 power states are the firmware's, which Linux cannot
+	 * access. The platform handoff supplies the explicit status and
+	 * ownership of every one before population, on any firmware: fail
+	 * closed on a state it did not mark. A kernel built without the
+	 * handoff keeps the tree's own domain descriptions.
 	 */
-	if (t8132 && apple_t8132_firmware_path() && !of_property_present(node, "status"))
+	if (t8132 && IS_ENABLED(CONFIG_APPLE_T8132_PLATFORM_HANDOFF) &&
+	    !of_property_present(node, "status"))
 		return dev_err_probe(dev, -ENODEV, "missing M4 power-domain policy\n");
 
 	tvm = of_parse_phandle(node, "power-domains", 0);
