@@ -177,6 +177,8 @@ impl sched::JobImpl for Job {
             #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             Sink::G14V27_2(runtime)=>{
                 // The runtime's own command timeout fails a hung GPU; a healthy one is late.
+                // Run its service once, so a hang is found without a notification.
+                runtime.wake();
                 if runtime.healthy() {return sched::Status::NoHang;}
                 runtime.withdraw(&job.packet);
                 job.packet.finish(Err(EIO));

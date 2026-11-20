@@ -450,7 +450,7 @@ impl RootV27_2 {
         if operating_point & 0x10 != 0 || index == 0 || index > self.graph.dyncfg.pwr.perf_max_pstate
             || self.idle_progress()? != [1; 3]
             || self.idle_acknowledgement()? != Self::word(&self.globals, 0xe40)?
-            || self.command_service()?.1 != 0 {
+            || !self.commands_installed()? {
             return Err(EAGAIN);
         }
         let producer = self.channels[2 * SUBMISSION_RING].shared_index(0x20)?;
@@ -500,15 +500,21 @@ impl RootV27_2 {
         consume(&self.channels[2 * TRACE_RING], 0, TRACE_RECORDS)
     }
 
+    /// Shared status +0x14: the firmware sets it to 1 once it has initialized.
+    pub(crate) fn initialized(&self) -> Result<bool> {
+        Ok(Self::word(&self.status, 0x14)? == 1)
+    }
+
     /// Shared status +0x10: nonzero while the firmware reports itself running.
     pub(crate) fn firmware_running(&self) -> Result<u32> {
         Self::word(&self.status, 0x10)
     }
 
-    /// Command-service state: (powered stage, pending installation request).
-    /// Engine entries may be published only at (2, 0).
-    pub(crate) fn command_service(&self) -> Result<(u32, u32)> {
-        Ok((Self::word(&self.control, 0x4c00)?, Self::word(&self.control, 0x4c24)?))
+    /// Whether the firmware has installed its command handlers: it clears the installation
+    /// request (+0x4c24), which the root sets, once powered initialization has copied them.
+    /// Engine entries may be published only after that.
+    pub(crate) fn commands_installed(&self) -> Result<bool> {
+        Ok(Self::word(&self.control, 0x4c24)? == 0)
     }
 
     pub(crate) fn idle_acknowledgement(&self) -> Result<u32> {
