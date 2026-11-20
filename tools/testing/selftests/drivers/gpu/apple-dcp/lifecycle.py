@@ -801,8 +801,8 @@ int main(void)
         # display has no T6030 dcpext, T6030 crossbar or T8132 teardown for that release to reach.
         firmware += ('static void dcpext_scanout_invalidate(struct apple_dcp *d)\n'
                      '{ (void)d; assert(!"T6030 dcpext path in an H17P scenario"); }\n'
-                     'static void dcp_direct_crossbar_link(struct apple_dcp *d, bool on)\n'
-                     '{ (void)d; (void)on; assert(!"T6030 crossbar in an H17P scenario"); }\n'
+                     'static int dcp_direct_crossbar_link(struct apple_dcp *d, bool on)\n'
+                     '{ (void)d; (void)on; assert(!"T6030 crossbar in an H17P scenario"); return -ENODEV; }\n'
                      'static void iomfb_m4_external_link_gone(struct apple_dcp *d)\n'
                      '{ (void)d; assert(!"T8132 dcpext in an H17P scenario"); }\n'
                      'static void dcp_t8132_dptx_teardown_log(struct apple_dcp *d, u32 port, const char *what, int err)\n'
