@@ -131,18 +131,17 @@
 	status = "disabled";
 };
 
-&i2c2 {
-	status = "disabled";
-};
+/* The headphone jack's CS42L84 on i2c2 (t6050-jack.dtsi) */
+#include "t6050-jack.dtsi"
 
 /*
  * As on J716c, where reading pin 112 takes an SError, only the pins a node
- * here names are exposed, and none is yet. The N1 on PCIe port 0 needs its
- * board's platform ID, which the static ADT does not carry, so the port and
- * its PERST# pin stay unused for now.
+ * here names are exposed: 134 and 139, the jack codec's interrupt and reset.
+ * The N1 on PCIe port 0 needs its board's platform ID, which the static ADT
+ * does not carry, so the port and its PERST# pin stay unused for now.
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 221>;
+	gpio-reserved-ranges = <0 134>, <135 4>, <140 81>;
 };
 
 /*
