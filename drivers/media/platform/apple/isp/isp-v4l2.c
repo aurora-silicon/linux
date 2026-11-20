@@ -1256,13 +1256,16 @@ int apple_isp_setup_video(struct apple_isp *isp)
 	}
 
 	/*
-	 * Auto exposure is always on. By default it holds the frame rate, as
-	 * V4L2 specifies; with exposure priority it may slow down in low light.
+	 * Auto exposure is always on. V4L2 has it hold the frame rate by
+	 * default. On H17 firmware it may by default slow the frame rate down
+	 * to 15 fps in low light rather than raise the gain, which lowers
+	 * the noise; clearing exposure priority holds the frame rate.
 	 */
 	v4l2_ctrl_handler_init(&isp->ctrl_handler, 4);
 	isp->exposure_priority =
 		v4l2_ctrl_new_std(&isp->ctrl_handler, NULL,
-				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
+				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1,
+				  isp->hw->fw_abi == ISP_FW_ABI_H17);
 	/*
 	 * The H17 firmware's auto exposure avoids mains flicker at the given
 	 * frequency. 50 Hz is the default, as on macOS when it does not know
