@@ -202,7 +202,12 @@ impl Object {
             let mapped = size.checked_add(mmu::UAT_PGSZ).ok_or(EOVERFLOW)?;
             super::BlockGeometry::check_m5_room(vm, mapped, mapped)?;
         }
-        let backing = KernelObject::backing(dev, size, CpuMap::WriteCombined)?;
+        // An M5 target is sized by the client's pass: charge it to the client.
+        let backing = if m5 {
+            KernelObject::client_backing(dev, size, vm.memory_client())?
+        } else {
+            KernelObject::backing(dev, size, CpuMap::WriteCombined)?
+        };
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let mapping = if m5 {
             backing.map_range(vm, 0..size, super::BlockGeometry::M5_COMPACT,
