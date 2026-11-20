@@ -456,6 +456,14 @@
 	};
 };
 
+/*
+ * All twelve die keys are readable floats on J615. The Tg readings rose
+ * during a GPU workload and fell after it stopped.
+ */
+&smc_hwmon {
+	apple,soc-die-keys-complete;
+};
+
 &mtp_mt {
 	firmware-name = "apple/tpmtfw-j615.bin";
 };
