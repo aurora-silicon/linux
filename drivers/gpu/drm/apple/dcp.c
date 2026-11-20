@@ -271,6 +271,36 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
 
+	/*
+	 * The secure mailbox named outside mboxes, which the boot loader wants to be the one ASC
+	 * mailbox (it refuses the display handoff otherwise). Added to the live node here.
+	 */
+	if (of_property_match_string(dev->of_node, "mbox-names", "secure") < 0 &&
+	    of_property_present(dev->of_node, "apple,secure-mbox")) {
+		static const char names[] = "mbox\0secure";
+		struct property *boxes, *nm;
+		const __be32 *main_box, *sec;
+		__be32 *v;
+		int len;
+
+		main_box = of_get_property(dev->of_node, "mboxes", &len);
+		sec = of_get_property(dev->of_node, "apple,secure-mbox", NULL);
+		boxes = devm_kzalloc(dev, sizeof(*boxes), GFP_KERNEL);
+		nm = devm_kzalloc(dev, sizeof(*nm), GFP_KERNEL);
+		v = devm_kcalloc(dev, 2, sizeof(*v), GFP_KERNEL);
+		if (main_box && len == 4 && sec && boxes && nm && v) {
+			v[0] = main_box[0];
+			v[1] = sec[0];
+			boxes->name = "mboxes";
+			boxes->value = v;
+			boxes->length = 8;
+			nm->name = "mbox-names";
+			nm->value = (void *)names;
+			nm->length = sizeof(names);
+			if (!of_update_property(dev->of_node, boxes))
+				of_update_property(dev->of_node, nm);
+		}
+	}
 	if (of_property_match_string(dev->of_node, "mbox-names", "secure") < 0)
 		return 0;
 
@@ -466,12 +496,13 @@ MODULE_PARM_DESC(t6050_ext_sleep,
 /*
  * What a T6050 external display processor gained outside the firmware 27 sleep itself (the
  * Type-C reconnect skipped for a crashed one, a crashed one refusing a deep sleep before
- * anything is stopped, the link line) is in force on the board it has run on, the J714s.
- * Elsewhere, other boards with the same SoC included, these are as before.
+ * anything is stopped, the link line) is in force where the sleep's description has the
+ * display coprocessors sleep by their method table (apple,display-method-sleep). Elsewhere,
+ * other boards with the same SoC included, these are as before.
  */
 static bool dcp_j714s_ext(struct device *dev)
 {
-	return of_machine_is_compatible("apple,j714s") &&
+	return apple_t6050_sleep_property("apple,display-method-sleep") &&
 	       of_device_is_compatible(dev->of_node, "apple,t6050-dcpext");
 }
 
@@ -5799,9 +5830,12 @@ static bool dcp_v27_sleep_transport_supported(struct apple_dcp *dcp)
 	    dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		return false;
 
-	/* The enum also covers later 27.x method tables. */
+	/*
+	 * The enum also covers later 27.x method tables. 27.2 keeps the endpoint
+	 * transport; its renumbered IOMFB calls go through iomfb_v27_tag().
+	 */
 	return dcp_read_fw_version(dev, "apple,firmware-compat", compat) >= 0 &&
-	       !strcmp(compat, "27.0.0");
+	       (!strcmp(compat, "27.0.0") || !strcmp(compat, "27.2.0"));
 }
 
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
@@ -7055,6 +7089,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
 	mutex_init(&dcp->swapped_out_fbs_lock);
+	init_completion(&dcp->v27_wake_video);
+	init_completion(&dcp->v27_wake_hotplug);
 	ret = dcp_backlight_init(dcp, dev);
 	if (ret)
 		return ret;
@@ -7062,7 +7098,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	dcp->fw_compat = fw_compat;
 	dcp->v27_j714s = fw_compat == DCP_FIRMWARE_V_27_0 &&
-			 of_machine_is_compatible("apple,j714s");
+			 apple_t6050_sleep_property("apple,display-method-sleep");
 	/*
 	 * Probe-lifetime like the desktop state: component bind opens a devres
 	 * group on this device and releases it on failure or unbind.

@@ -623,8 +623,9 @@ static int t6050_sleep_check_alarm(struct apple_sleep *s)
 	ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &control, 1);
 	if (!ret)
 		ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_MASK, NULL, &mask, 1);
+	/* No armed alarm is no refusal: the SMC's wake sources (lid, keys) do not need it */
 	if (!ret && (!(control & T6050_RTC_CTL_ARMED) || (mask & BIT(0))))
-		ret = -EBUSY;
+		return 0;
 	if (!ret)
 		ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_COMPARE, NULL,
 					   r->alarm_compare, 4);
@@ -2750,6 +2751,9 @@ static int t6050_sleep_final_check(struct apple_sleep *s)
 	ret = t6050_sleep_check_alarm(s);
 	if (ret)
 		return ret;
+	/* No alarm armed: nothing to hold against the sleep timer */
+	if (!r->alarm_valid)
+		return 0;
 	ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_COUNTER, NULL, ticks, 6);
 	if (ret)
 		return ret;

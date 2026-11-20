@@ -558,11 +558,9 @@ static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 }
 
-static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
-				   struct apple_rtkit_shmem *buffer)
+static int apple_rtkit_alloc_first_shmem(struct apple_rtkit *rtk, u8 ep,
+					 struct apple_rtkit_shmem *buffer)
 {
-	if (READ_ONCE(rtk->ans_hold))
-		return apple_rtkit_ans_fail(rtk, -EBUSY);
 	/* The crash log's buffer is asked for only at a crash: serve it after a strict restart too. */
 	if (READ_ONCE(rtk->strict_retained_buffers) && ep != APPLE_RTKIT_EP_CRASHLOG)
 		return -EPROTO;
@@ -575,6 +573,14 @@ static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
 	buffer->buffer = dma_alloc_coherent(rtk->dev, buffer->size,
 					    &buffer->iova, GFP_KERNEL);
 	return buffer->buffer ? 0 : -ENOMEM;
+}
+
+static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
+				   struct apple_rtkit_shmem *buffer)
+{
+	if (READ_ONCE(rtk->ans_hold))
+		return apple_rtkit_ans_fail(rtk, -EBUSY);
+	return apple_rtkit_alloc_first_shmem(rtk, ep, buffer);
 }
 
 static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
@@ -650,7 +656,8 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 		goto error;
 	}
 
-	err = apple_rtkit_alloc_shmem(rtk, ep, &request);
+	/* The endpoint has no buffer yet: a first one replaces nothing the ANS hold protects */
+	err = apple_rtkit_alloc_first_shmem(rtk, ep, &request);
 	if (err)
 		goto error;
 	*buffer = request;
@@ -2308,8 +2315,7 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 		goto free_rtk;
 	rtk->pmp_registry_v2 =
 		of_device_is_compatible(dev->of_node, "apple,t6050-pmp-v2");
-	rtk->pmp_ca_event_ack = rtk->pmp_registry_v2 &&
-				of_machine_is_compatible("apple,j714s");
+	rtk->pmp_ca_event_ack = rtk->pmp_registry_v2;
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->coreanalytics_completion);
@@ -2812,6 +2818,13 @@ static int apple_rtkit_strict_idle_state(struct apple_rtkit *rtk, bool ap)
 
 int apple_rtkit_idle_strict(struct apple_rtkit *rtk)
 {
+	return apple_rtkit_idle_strict_with(rtk, NULL, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_idle_strict);
+
+/* As apple_rtkit_idle_strict(), with a step between the AP state's and the IOP state's. */
+int apple_rtkit_idle_strict_with(struct apple_rtkit *rtk, void (*after_ap)(void *data), void *data)
+{
 	int ret;
 
 	if (rtk->strict_idle_poisoned || rtk->crashed ||
@@ -2821,6 +2834,8 @@ int apple_rtkit_idle_strict(struct apple_rtkit *rtk)
 	reinit_completion(&rtk->strict_idle_done);
 	WRITE_ONCE(rtk->strict_idle_waiting, true);
 	ret = apple_rtkit_strict_idle_state(rtk, true);
+	if (!ret && after_ap)
+		after_ap(data);
 	if (!ret)
 		ret = apple_rtkit_strict_idle_state(rtk, false);
 	if (!ret && !wait_for_completion_timeout(&rtk->strict_idle_done,
@@ -2833,7 +2848,7 @@ int apple_rtkit_idle_strict(struct apple_rtkit *rtk)
 		rtk->strict_idle_poisoned = true;
 	return ret;
 }
-EXPORT_SYMBOL_GPL(apple_rtkit_idle_strict);
+EXPORT_SYMBOL_GPL(apple_rtkit_idle_strict_with);
 
 int apple_rtkit_warm_restart_strict(struct apple_rtkit *rtk)
 {

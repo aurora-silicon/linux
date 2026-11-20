@@ -55,6 +55,7 @@
 #include <linux/jump_label.h>
 #include <linux/limits.h>
 #include <linux/of_address.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
 #include <linux/syscore_ops.h>
@@ -286,8 +287,8 @@ struct aic_info {
 	bool siq_cfg_routing;
 	/* A firmware-driven suspend powers the controller down: aic_syscore_ops keep it. */
 	bool fw_suspend;
-	/* If set, fw_suspend holds on these boards only */
-	const char *const *fw_suspend_boards;
+	/* If set, fw_suspend holds only where this says the sleep is described */
+	bool (*fw_suspend_described)(void);
 };
 
 static const struct aic_info aic1_info __initconst = {
@@ -336,12 +337,9 @@ static const struct aic_info aic3_info __initconst = {
 
 /*
  * The M5 Pro's sleep: the last steps mask every interrupt and acknowledge events by hand. The
- * save and restore are set up on the boards with a T6050 sleep, the J714s and the J716c;
+ * save and restore are set up on the boards whose device tree describes a T6050 sleep;
  * another T6050 board is as one without them.
  */
-static const char *const aic3_t6050_sleep_boards[] __initconst = {
-	"apple,j714s", "apple,j716c", NULL
-};
 
 static const struct aic_info aic3_t6050_info __initconst = {
 	.version = 3,
@@ -349,7 +347,7 @@ static const struct aic_info aic3_t6050_info __initconst = {
 	.fast_ipi = true,
 	.local_fast_ipi = true,
 	.fw_suspend = true,
-	.fw_suspend_boards = aic3_t6050_sleep_boards,
+	.fw_suspend_described = apple_t6050_sleep_described,
 };
 
 static const struct aic_info aic3_t8140_info __initconst = {
@@ -1280,8 +1278,7 @@ static struct syscore aic_syscore = {
 static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 {
 	if (!irqc->info.fw_suspend ||
-	    (irqc->info.fw_suspend_boards &&
-	     !of_machine_compatible_match(irqc->info.fw_suspend_boards)))
+	    (irqc->info.fw_suspend_described && !irqc->info.fw_suspend_described()))
 		return;
 
 	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);

@@ -2,6 +2,7 @@
 /* Copyright The Asahi Linux Contributors */
 /* Copyright 2026 Aurora Silicon */
 
+#include <linux/ctype.h>
 #include <linux/unaligned.h>
 #include <linux/spinlock.h>
 
@@ -270,6 +271,47 @@ const struct dcp_method_entry *iomfb_v27_methods(const char *compat)
 }
 
 /*
+ * @tag, a 27.0 ID the paired-mode calls name directly, in the build of @methods
+ * (into @out, 4 bytes). A method the tables name takes this build's ID; on 27.2,
+ * which moved IOMobileFramebufferAP up by 50, another A4xx ID (and A500) does too.
+ * Anything else keeps its 27.0 ID.
+ */
+void iomfb_v27_tag(const struct dcp_method_entry *methods, const char *tag, char *out)
+{
+	unsigned int i, id;
+	char in[4];
+
+	memcpy(in, tag, 4);
+	tag = in;
+	memcpy(out, tag, 4);
+	if (!iomfb_v27_methods_renumbered(methods))
+		return;
+	for (i = 0; i < dcpep_num_methods; i++) {
+		if (dcp_methods_27_0[i].tag[0] && !memcmp(dcp_methods_27_0[i].tag, tag, 4) &&
+		    methods[i].tag[0]) {
+			memcpy(out, methods[i].tag, 4);
+			return;
+		}
+	}
+	if (methods != dcp_methods_27_2 || tag[0] != 'A' || !isdigit(tag[1]) ||
+	    !isdigit(tag[2]) || !isdigit(tag[3]))
+		return;
+	id = (tag[1] - '0') * 100 + (tag[2] - '0') * 10 + (tag[3] - '0');
+	if (id < 400 || id > 500)
+		return;
+	id += 50;
+	out[1] = '0' + id / 100;
+	out[2] = '0' + id / 10 % 10;
+	out[3] = '0' + id % 10;
+}
+
+/* Whether @methods is a build's table whose AP method IDs differ from 27.0's. */
+bool iomfb_v27_methods_renumbered(const struct dcp_method_entry *methods)
+{
+	return methods && (methods == dcp_methods_27_2 || methods == dcp_methods_27_3);
+}
+
+/*
  * The 27.0 table for the J714s, the board the firmware 27 sleep has run on (dcp->v27_j714s): a
  * copy with the sleep's A500 added. The shared table keeps the methods it had, so every other
  * machine sends what it sent, and a 27.2 or 27.3 build is judged against the same list as
@@ -406,6 +448,9 @@ static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
 	if (!(request->tiled_display_null & 1))
 		memcpy(out, request->tiled_display,
 		       sizeof(request->tiled_display));
+	/* The V27 wake's mode set waits for the firmware's report of the panel */
+	if (request->connected && dcp->v27_j714s)
+		complete(&dcp->v27_wake_hotplug);
 	return trampoline_hotplug(dcp, tag, out, in);
 }
 

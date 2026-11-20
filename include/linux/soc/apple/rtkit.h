@@ -285,6 +285,7 @@ int apple_rtkit_idle(struct apple_rtkit *rtk);
 /* The mailbox's receive-enable bit (I2A_CONTROL bit 0): off once a slept firmware has answered its idle. */
 void apple_rtkit_set_recv_enabled(struct apple_rtkit *rtk, bool enabled);
 int apple_rtkit_idle_strict(struct apple_rtkit *rtk);
+int apple_rtkit_idle_strict_with(struct apple_rtkit *rtk, void (*after_ap)(void *data), void *data);
 int apple_rtkit_warm_restart_strict(struct apple_rtkit *rtk);
 int apple_rtkit_warm_restart_stopped(struct apple_rtkit *rtk);
 
