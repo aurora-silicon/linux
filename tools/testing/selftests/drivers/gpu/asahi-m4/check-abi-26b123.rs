@@ -215,12 +215,11 @@ fn catalog() {
     assert!(!FW_26B123.matches(2, &[UPPER, UPPER + 0x64000], &[1, 0x10]));
     assert_eq!((FW_25G83.abi, FW_26B123.abi), (FwAbi::V25G83, FwAbi::V26B123));
     assert_eq!(FW_25G83.unknown().count(), 0);
-    // Only how the firmware's register table is filled still refuses a 26B123 start.
+    // Nothing known to be missing refuses a 26B123 start any more.
     let unknown: Vec<_> = FW_26B123.unknown().collect();
-    assert_eq!(unknown.len(), 1, "{unknown:?}");
-    assert!(unknown[0].contains("register map"));
+    assert!(unknown.is_empty(), "{unknown:?}");
     assert_eq!(FW_25G83.loader_table, Some(LoaderTable::Host(0x1332f0)));
-    assert_eq!(FW_26B123.loader_table, None);
+    assert_eq!(FW_26B123.loader_table, Some(LoaderTable::Firmware));
     assert_eq!(PPL_MAGIC, 0x4b1d000000000002);
     assert_eq!(FW_25G83.ppl_magic, Some(PplMagic { ap: PPL_MAGIC, firmware: PPL_MAGIC, answers: false }));
     assert_eq!(FW_26B123.ppl_magic, Some(PplMagic { ap: 0x4b1d000000000003, firmware: 0x4b1d000000000003, answers: true }));
