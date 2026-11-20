@@ -2115,6 +2115,16 @@ impl AopData {
         Ok((phys, iova, size))
     }
 
+    /// Whether the bootloader listed firmware segments in `memory-region`. It
+    /// does where the firmware runs some of them from DRAM, such as the macOS
+    /// 27.2 firmware on T8112; older firmware on those SoCs gets none.
+    fn lists_fw_regions(dev: &device::Device) -> bool {
+        // SAFETY: `dev` is a live device being probed.
+        let np = unsafe { (*dev.as_raw()).of_node };
+        // SAFETY: `np` is checked non-null and is the device's node, valid while it is bound.
+        !np.is_null() && unsafe { bindings::of_reserved_mem_region_count(np) } > 0
+    }
+
     /// Checks the firmware segments the AOP runs from DRAM (T6040). The
     /// bootloader reserves them and lists them in `memory-region`, and each
     /// one's `iommu-addresses` gives the IOVA the firmware uses for it. The
@@ -3020,7 +3030,8 @@ struct AopHwConfig {
     required_endpoints: &'static [u8],
     /// The firmware runs segments from DRAM, which the bootloader reserves
     /// and lists in `memory-region`; check their IOMMU mappings before
-    /// starting it (T6040).
+    /// starting it (T6040). Other SoCs check them when the bootloader lists
+    /// them (`AopData::lists_fw_regions`).
     fw_regions: bool,
     bootargs_word_access: bool,
     /// Halt the co-processor again when its start fails (T6040).
@@ -3295,7 +3306,7 @@ impl platform::Driver for AopDriver {
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
         let asc_mmio = asc_mmio.as_view().relaxed();
         let aop_mmio = aop_mmio.as_view();
-        let ed0p = if cfg.fw_regions {
+        let ed0p = if cfg.fw_regions || AopData::lists_fw_regions(pdev.as_ref()) {
             // Before anything is written to the AOP: no mapping, no start.
             let allow_ed0p = cfg.patch_bootargs
                 && AopData::bootargs_has_ed0p(&aop_mmio, cfg.bootargs_word_access)?;
