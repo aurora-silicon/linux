@@ -46,7 +46,7 @@
 #define KIWI_COLS		82
 #define KIWI_ROWS		54
 #define KIWI_CELLS		(KIWI_COLS * KIWI_ROWS)
-#define KIWI_MIN_FRAME		(KIWI_HDR_LEN + 2 * KIWI_CELLS)
+#define KIWI_FRAME_SIZE		17861
 #define KIWI_MAGIC		0x5a
 #define KIWI_MAX_SLOTS		10
 #define KIWI_FP			256
@@ -748,7 +748,7 @@ static int kiwi_raw_event(struct hid_device *hdev, struct hid_report *report,
 {
 	struct kiwi *k = hid_get_drvdata(hdev);
 
-	if (size >= KIWI_MIN_FRAME && data[0] == KIWI_MAGIC)
+	if (size == KIWI_FRAME_SIZE && data[0] == KIWI_MAGIC)
 		kiwi_frame(k, data);
 	return 0;
 }
