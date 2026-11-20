@@ -515,6 +515,8 @@ struct apple_isp {
 	 * resident firmware cannot be started again before the next boot.
 	 */
 	bool ipc_failed;
+	/* A power-down of ours left the coprocessor control word as it was */
+	bool coproc_left;
 };
 
 struct isp_chan_ops {
