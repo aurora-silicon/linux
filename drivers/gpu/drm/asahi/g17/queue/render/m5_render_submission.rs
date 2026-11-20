@@ -127,12 +127,20 @@ pub(crate) fn parameter_geometry(blocks: usize) -> Result<crate::g17::buffer::Bl
 /// The target layout of a render: G17P's for a command without an M5 plan.
 pub(crate) fn layout(command: &Validated, clusters: u32, programs: RegisterPrograms)
     -> Result<target::Layout> {
+    Ok(layout_and_window(command, clusters, programs)?.0)
+}
+
+/// The target layout of a render and, for an M5 render, the bytes of the client's compact
+/// window that each render pair built for it reserves.
+pub(crate) fn layout_and_window(command: &Validated, clusters: u32, programs: RegisterPrograms)
+    -> Result<(target::Layout, Option<usize>)> {
     let Validated::Render { pass, plan, .. } = command else { return Err(EINVAL); };
     let layout = target::Layout::new(pass, clusters, programs)?;
-    if plan.is_none() { return Ok(layout); }
+    if plan.is_none() { return Ok((layout, None)); }
     validate(pass)?;
     let geometry = parameter_geometry(layout.tvb_blocks)?;
-    Ok(m5_layout(layout, pass, clusters, geometry)?.0)
+    let (layout, reserved) = m5_layout(layout, pass, clusters, geometry)?;
+    Ok((layout, Some(reserved)))
 }
 
 /// The M5 layout of `pass` from its G17P layout, and the compact-window bytes a pair built for
