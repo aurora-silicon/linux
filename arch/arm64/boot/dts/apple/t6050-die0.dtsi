@@ -1020,6 +1020,13 @@
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x180 4>;
 		label = "atc2_usb";
+		/*
+		 * System sleep must not power this domain off: on J775c, resume then
+		 * hangs in the noirq power-on of the USB-C domains (USB, ACIO and ATC
+		 * PHY), and kept on, s2idle resumes. It also keeps its AON and
+		 * common parents, which the wake path needs, powered.
+		 */
+		apple,always-on;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		power-domains = <&ps_atc2_common>, <&ps_atc2_usb_aon>;
@@ -1040,6 +1047,13 @@
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x198 4>;
 		label = "atc3_usb";
+		/*
+		 * System sleep must not power this domain off: on J775c, resume then
+		 * hangs in the noirq power-on of the USB-C domains (USB, ACIO and ATC
+		 * PHY), and kept on, s2idle resumes. It also keeps its AON and
+		 * common parents, which the wake path needs, powered.
+		 */
+		apple,always-on;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		power-domains = <&ps_atc3_common>, <&ps_atc3_usb_aon>;
