@@ -606,6 +606,20 @@ static HW_CFG_T6050: HwConfig = HwConfig {
     ap_leap: false,
 };
 
+/// J775c/J775d (Mac Studio, M5 Max and M5 Ultra): the T6050 stream with one
+/// amplifier in one 32-bit slot and nothing sent back (ADT audio-speaker reg:
+/// 1 slot, mask 0x1; no sense words), the J873 shape. The sense capture's
+/// DAI keeps the J873's description, but the audio node names no `sense`
+/// channel, so it cannot be opened. Selected by `apple,speaker-amps = <1>`.
+static HW_CFG_T6050_1AMP: HwConfig = HwConfig {
+    spkr_channels: 1,
+    sense_channels: 2,
+    sense_formats: FORMATS,
+    realign_sense: false,
+    ap_mca: false,
+    ap_leap: false,
+};
+
 /// J815 (MacBook Air 15-inch, M5): the same T8142 speaker stream with six
 /// amplifiers (ADT audio-speaker reg: 6 slots, mask 0x3f; 12 sense words,
 /// mask 0xfff), in ADT speaker-config order: left woofer 1, right woofer 1,
@@ -1468,9 +1482,13 @@ impl platform::Driver for T8152AopAudioDriver {
             .fwnode()
             .and_then(|n| n.property_read::<u32>(c_str!("apple,speaker-amps")).optional())
         {
-            cfg = match (amps, ptr::eq(cfg, &HW_CFG_T8142)) {
-                (4, true) => &HW_CFG_T8142,
-                (6, true) => &HW_CFG_T8142_6AMP,
+            let t8142 = ptr::eq(cfg, &HW_CFG_T8142);
+            let t6050 = ptr::eq(cfg, &HW_CFG_T6050);
+            cfg = match amps {
+                4 if t8142 => &HW_CFG_T8142,
+                6 if t8142 => &HW_CFG_T8142_6AMP,
+                1 if t6050 => &HW_CFG_T6050_1AMP,
+                6 if t6050 => &HW_CFG_T6050,
                 _ => {
                     dev_err!(dev, "unsupported apple,speaker-amps {}\n", amps);
                     return Err(EINVAL);
