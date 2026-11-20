@@ -1864,6 +1864,13 @@ bool apple_sleep_smc_defer_notice(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_smc_defer_notice);
 
+/* J613 trial: slpa and AP idle after the final coprocessor stops, through .commit_notice. */
+static bool apple_sleep_j613_notice_after_stops(void)
+{
+	return READ_ONCE(sleep_j613_smc_late) && of_machine_is_compatible("apple,j613") &&
+	       apple_sleep_smc_defer_notice();
+}
+
 int apple_sleep_smc_register(struct device *dev,
 		int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data)
 {
@@ -6044,7 +6051,7 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 		step = "coprocessor checks";
 		ret = apple_sleep_coprocs_check(s);
 	}
-	if (!ret && !s->soc->ops->commit_notice) {
+	if (!ret && !s->soc->ops->commit_notice && !apple_sleep_j613_notice_after_stops()) {
 		step = "SMC notice";
 		ret = apple_sleep_smc_late_notice(s);
 	}
@@ -6090,6 +6097,11 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 		ret = s->soc->ops->commit_notice(s);
 		if (ret)
 			panic("Apple committed SMC notice failed after peer stop: %d", ret);
+	} else if (apple_sleep_j613_notice_after_stops()) {
+		ret = apple_sleep_smc_commit_notice(s);
+		dev_info(s->dev, "TEST: J613 SMC notice after coprocessor stops: %d\n", ret);
+		if (ret)
+			panic("Apple J613 SMC notice failed after coprocessor stops: %d", ret);
 	}
 	if (s->soc->ops->stopped)
 		s->soc->ops->stopped(s);
