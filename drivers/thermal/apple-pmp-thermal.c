@@ -64,6 +64,8 @@ static struct {
 	int power_error;
 	u64 gpu_epoch;
 	bool power_polling;
+	/* The shared measured-rail power budget restricts the CPUs and the GPU. */
+	bool power_budget;
 	unsigned int guard_level;
 	bool enabled;
 	long cached_mc;
@@ -91,6 +93,30 @@ static struct {
 module_param_named(sample_count, pmp_thermal.sample_count, ullong, 0444);
 module_param_named(governor_count, pmp_thermal.governor_count, ullong, 0444);
 module_param_named(ready, pmp_thermal.ready, bool, 0444);
+
+/*
+ * The shared measured-rail power budget below is the fanless Airs' policy:
+ * 8 W sustained for the CPU and GPU rails together, a 600 J burst, and a
+ * slow climb toward a die temperature target. The Mac mini (J773g) has a fan
+ * and runs from mains. Under render.heavy fill at 1080p macOS 27.2 holds its
+ * GPU at the top state (1578 MHz) at 100% active with 8-10 W of GPU power,
+ * while the budget held the same load at S9 or S8 every second or two at a
+ * 58-61 C die. On the J773g the rails are reported but restrict nothing; the
+ * die protection, the thermal governor and the critical shutdown still apply.
+ *
+ * power_budget: -1 (default) follows the board, 0 turns the budget off and
+ * 1 on. It can change at run time.
+ */
+static int power_budget = -1;
+module_param(power_budget, int, 0644);
+MODULE_PARM_DESC(power_budget, "Shared CPU/GPU rail power budget: -1 board default (off on J773g), 0 off, 1 on");
+
+static bool apple_pmp_power_budget(void)
+{
+	int v = READ_ONCE(power_budget);
+
+	return v < 0 ? pmp_thermal.power_budget : v > 0;
+}
 
 static int apple_pmp_power_status(char *buffer, const struct kernel_param *kp)
 {
@@ -181,8 +207,14 @@ static void apple_pmp_power_work(struct work_struct *work)
 	 * for a read started in its own epoch, even if detach/attach was brief.
 	 */
 	u64 epoch = apple_pmp_gpu_epoch(pmp_thermal.sensors);
+	bool budget = apple_pmp_power_budget();
 	u64 now;
-	int ret = apple_pmp_power_read_rails(mw);
+	int ret;
+
+	/* Without a budget a slow SMC read must not let the GPU's level go stale. */
+	if (!budget && epoch)
+		apple_pmp_gpu_publish(pmp_thermal.sensors, epoch, 0, ktime_get_ns());
+	ret = apple_pmp_power_read_rails(mw);
 	/* The running reader cannot read zero on both CPU rails. A firmware
 	 * reset/all-zero image must not refill the energy bucket; an idle
 	 * system may still draw well under 0.1 W on all three rails.
@@ -208,14 +240,20 @@ static void apple_pmp_power_work(struct work_struct *work)
 		active |= BIT(2);
 	apple_pmp_power_set_active(p, active);
 	apple_pmp_power_sample(p, now, mw, pmp_thermal.cached_mc, ret);
+	if (!budget) {
+		/* Reported only: the samples still fill the hwmon channels. */
+		p->level[0] = 0;
+		p->level[1] = 0;
+		p->level[2] = 0;
+	}
 	apple_pmp_gpu_publish(pmp_thermal.sensors, epoch, p->level[2],
-			      active & BIT(2) ? p->last_ns : 0);
+			      active & BIT(2) ? (budget ? p->last_ns : now) : 0);
 	pr_debug("apple-pmp-thermal: power ns=%llu mc=%ld p_mw=%u e_mw=%u gpu_mw=%u total_mw=%d sustainable_mw=%d allowed_mw=%d credit_mj=%lld p_level=%u e_level=%u gpu_level=%u error=%d\n",
 		now, pmp_thermal.cached_mc, mw[0], mw[1], mw[2], p->total_mw,
 		p->sustainable_mw, p->allowed_mw, p->credit_mj,
 		p->level[0], p->level[1], p->level[2], ret);
 	mutex_unlock(&pmp_thermal.lock);
-	if (ret)
+	if (ret && budget)
 		pr_warn_ratelimited("apple-pmp-thermal: power telemetry error %d, retaining minimum CPU/GPU ceilings\n",
 				    ret);
 	schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
@@ -338,8 +376,10 @@ static int apple_pmp_guard(unsigned int level)
 		unsigned int power_level = pmp_thermal.power.level[i];
 		unsigned int effective;
 
-		if (!pmp_thermal.power.last_ns || ktime_get_ns() -
-		    pmp_thermal.power.last_ns > APPLE_PMP_POWER_STALE_NS)
+		if (!apple_pmp_power_budget())
+			power_level = 0;
+		else if (!pmp_thermal.power.last_ns || ktime_get_ns() -
+			 pmp_thermal.power.last_ns > APPLE_PMP_POWER_STALE_NS)
 			power_level = 8;
 		effective = max(level, power_level);
 
@@ -724,6 +764,7 @@ static int apple_pmp_thermal_setup(void)
 	if (ret)
 		return ret;
 	apple_pmp_power_init(&pmp_thermal.power);
+	pmp_thermal.power_budget = !of_machine_is_compatible("apple,j773g");
 	apple_pmp_cooling_init(&pmp_thermal.cooling);
 	pmp_thermal.guard_level = 8;
 	ret = apple_pmp_add_cluster(0, p_cpu, p_members);
@@ -772,7 +813,9 @@ static int apple_pmp_thermal_setup(void)
 		if (ret)
 			goto fail;
 	}
-	pr_info("apple-pmp-thermal: T8132 provisional policy: CPU/GPU cooling from 106 C, target 110 C, full protection 115 C, three >=120 C samples for shutdown, 5 ms sampling from 95 C or while cooling (100 ms below), 100 ms governor, shared measured-rail power budget\n");
+	pr_info("apple-pmp-thermal: T8132 provisional policy: CPU/GPU cooling from 106 C, target 110 C, full protection 115 C, three >=120 C samples for shutdown, 5 ms sampling from 95 C or while cooling (100 ms below), 100 ms governor, %s\n",
+		apple_pmp_power_budget() ? "shared measured-rail power budget" :
+		"rail power reported, no power budget");
 	pmp_thermal.ready = true;
 	return 0;
 fail:
