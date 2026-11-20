@@ -306,6 +306,24 @@ static const struct hw_info t602x_hw = {
 };
 
 /*
+ * T8132 (M4) uses the t602x register layout. A root port with no DT node (the J773g's empty port
+ * 1) is never set up, and once an earlier stage has powered the controller off and back on for
+ * ANS it no longer answers: macOS's first read of its windows is an LLC SLVERR. Keep the bus 0
+ * scan off such ports (apple_pcie_map_bus()). The same layout as t602x_hw, kept as its own object
+ * so that struct hw_info, and with it the kernel's BTF, stays as it is.
+ */
+static const struct hw_info t8132_hw = {
+	.phy_lane_ctl		= 0,
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_msiaddr_hi	= PORT_T602X_MSIADDR_HI,
+	.port_refclk		= 0,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.max_rid2sid		= 512,
+};
+
+/*
  * T8140 uses the newer port register layout and a SID-indexed RID table.
  * Keep the PHY and application clock policy established by the bootloader;
  * runtime clock gating has not been qualified on this controller.
@@ -3869,8 +3887,15 @@ static void __iomem *apple_pcie_map_bus(struct pci_bus *bus,
 		}
 		return NULL;
 	}
-	if (!pcie->hw->root_bus_only)
+	if (!pcie->hw->root_bus_only) {
+		if (pcie->hw == &t8132_hw && bus->number == cfg->busr.start) {
+			list_for_each_entry(port, &pcie->ports, entry)
+				if (port->idx == PCI_SLOT(devfn))
+					return pci_ecam_map_bus(bus, devfn, where);
+			return NULL;
+		}
 		return pci_ecam_map_bus(bus, devfn, where);
+	}
 
 	/* Nothing answers on a host that has lost power and isn't set up again. */
 	if (READ_ONCE(pcie->neo_rc_down))
@@ -6558,7 +6583,7 @@ static const struct of_device_id apple_pcie_of_match[] = {
 	{ .compatible = "apple,t8103-pciec",	.data = &t8103_pciec_hw },
 	{ .compatible = "apple,t6000-pciec",	.data = &t8112_pciec_hw },
 	/* T8132 currently inherits controller and PHY setup from m1n1. */
-	{ .compatible = "apple,t8132-pcie",	.data = &t602x_hw },
+	{ .compatible = "apple,t8132-pcie",	.data = &t8132_hw },
 	{ .compatible = "apple,t8152-pcie",	.data = &t8152_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t8140-pcie",	.data = &t8140_hw },
