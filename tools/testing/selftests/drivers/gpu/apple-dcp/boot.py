@@ -290,7 +290,7 @@ static bool apple_t8132_firmware_path(void)
 {
     return t8132_firmware_path;
 }
-static void *devm_kmemdup(struct device *dev, const void *src, size_t len, unsigned int gfp)
+static __attribute__((unused)) void *devm_kmemdup(struct device *dev, const void *src, size_t len, unsigned int gfp)
 {
     (void)dev; (void)src; (void)len; (void)gfp;
     return NULL;
