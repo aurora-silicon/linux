@@ -85,10 +85,16 @@ void __init apple_wfi_quirk_init(void)
 	     model == MIDR_APPLE_T6050_068 || model == MIDR_APPLE_T6050_069)) {
 		/*
 		 * WFI naps during early boot gate unclaimed root domains on
-		 * the T6050 (nub_gpio was already off at the 76 ms probe and
-		 * stayed write-refused, trial 2026-11-17 20:57). Keep the
-		 * spinning idle for bring-up and enable WFI only after all
-		 * drivers have probed.
+		 * the T6050: on the measured machine (an M5 Max, parts
+		 * 068/069, chip-id 0x6050) nub_gpio was already off at the
+		 * 76 ms pmgr probe and stayed write-refused until WFI was
+		 * deferred (2026-11-17 20:57 trial). T6051 is untested: no
+		 * machine is available in either lab, so this list is a
+		 * documented hardware exception, not a tested-machines list;
+		 * drop it when a T6051 row shows the nub_gpio node path
+		 * works with the deferral off. Keep the spinning idle for
+		 * bring-up and enable WFI only after all drivers have
+		 * probed.
 		 */
 		apple_wfi_deferred = true;
 		pr_info("Apple: WFI idling deferred until always-on domains assert\n");
