@@ -1201,6 +1201,9 @@ static void t8122_sleep_undo_regs(struct apple_sleep *s)
  * WFI returns, the boot core writes 'w', the engine's words once (QT), and masks the timer.
  */
 static unsigned int t8122_wfi_timer_s;
+static unsigned int t8122_wfi_timer_ctrl;
+module_param(t8122_wfi_timer_ctrl, uint, 0600);
+MODULE_PARM_DESC(t8122_wfi_timer_ctrl, "J613 DIAGNOSTIC: with the hold, one timer-ended WFI first: 1 with the deep-sleep bits, 2 without");
 module_param(t8122_wfi_timer_s, uint, 0600);
 MODULE_PARM_DESC(t8122_wfi_timer_s,
 		 "J613 DIAGNOSTIC: the boot core's own timer, this many s after its last WFI starts, shows whether it kept its power (0 = off)");
@@ -1398,6 +1401,28 @@ static void t8122_sleep_pre_commit(struct apple_sleep *s)
 	if (READ_ONCE(t8122_dump))
 		t8122_dump_macos(s);
 	t8122_dc_putc('c');
+	/*
+	 * Control for t8122_wfi_timer_s (with the hold only, so no commit): the boot core arms the
+	 * same timer 2 s ahead, sets the deep-sleep bits (1) or not (2) and takes one WFI. 'W' and
+	 * the elapsed ms if it returns: the timer can end such a WFI on a core with its power.
+	 */
+	if (READ_ONCE(sleep_untested_hold) && READ_ONCE(t8122_wfi_timer_ctrl)) {
+		u64 t0 = read_sysreg(cntpct_el0), hz = arch_timer_get_cntfrq();
+		u64 deep = read_sysreg_s(SYS_APL_DEEP_SLEEP);
+
+		if (t8122_wfi_timer_ctrl == 1)
+			write_sysreg_s(deep | DEEP_SLEEP_ENABLE, SYS_APL_DEEP_SLEEP);
+		write_sysreg(t0 + 2 * hz, cntp_cval_el0);
+		write_sysreg(ARCH_TIMER_CTRL_ENABLE, cntp_ctl_el0);
+		isb();
+		dsb(sy);
+		wfi();
+		write_sysreg(ARCH_TIMER_CTRL_ENABLE | ARCH_TIMER_CTRL_IT_MASK, cntp_ctl_el0);
+		write_sysreg_s(deep, SYS_APL_DEEP_SLEEP);
+		isb();
+		t8122_dc_puts(" W");
+		t8122_dc_hex((u32)div64_u64((read_sysreg(cntpct_el0) - t0) * 1000, hz));
+	}
 	/* The hold: the commit word is not written, and the next thing is a reset from outside. */
 	if (READ_ONCE(sleep_untested_hold))
 		t8122_dc_puts(" HOLD before commit\n");
