@@ -6365,7 +6365,7 @@ static inline int task_fits_cpu(struct task_struct *p, int cpu)
  * per task over samples with weight 2^-shift, and classified with
  * hysteresis (memory-bound at high, no longer below low). Tasks inherit
  * their parent's state at fork. The counters exist only while MEM_SPREAD
- * (on by default) is on or debugfs sched/mem_spread/sample is set; the
+ * (off by default) is on or debugfs sched/mem_spread/sample is set; the
  * sample setting classifies without changing placement.
  */
 static DEFINE_STATIC_KEY_FALSE(sched_mem_sample);
@@ -6564,7 +6564,7 @@ void sched_mem_spread_update(void)
 }
 
 /*
- * MEM_SPREAD is on from boot: set the counters up once the CPU PMU drivers
+ * If MEM_SPREAD is on from boot, set the counters up once the CPU PMU drivers
  * have probed (device initcalls, deferred probes in late initcalls), and
  * follow CPUs that come and go from then on.
  */

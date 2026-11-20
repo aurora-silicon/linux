@@ -122,7 +122,7 @@ SCHED_FEAT(ASYM_SPREAD, false)
  * classified from a per-CPU PMU count of L1D load misses, see
  * mem_spread_tick(); without such a counter nothing changes.
  */
-SCHED_FEAT(MEM_SPREAD, true)
+SCHED_FEAT(MEM_SPREAD, false)
 
 /*
  * Issue a WARN when we do multiple update_rq_clock() calls
