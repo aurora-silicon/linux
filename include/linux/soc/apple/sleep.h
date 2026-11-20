@@ -34,6 +34,9 @@ struct apple_sleep_smc_saved_ops {
 	int (*end)(void *data);
 	/* Optional, after the irreversible stops: pmVC alone, before late_notice (which then skips it). */
 	int (*pmvc)(void *data);
+	/* Optional, J613 trial: after the debug link's cut, take the SMC's messages off its mailbox
+	 * (notifications kept for the resume's replay); returns how many, or a negative error. */
+	int (*drain)(void *data);
 };
 
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)

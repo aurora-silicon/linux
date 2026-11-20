@@ -1515,10 +1515,33 @@ out:
 	return ret;
 }
 
+/* J613 trial: what the SMC sends the AP after the debug link's cut, for up to 20 ms. */
+static int apple_smc_sleep_saved_drain_after(void *data)
+{
+	struct apple_smc *smc = data;
+	u64 t0 = __arch_counter_get_cntpct(), hz = arch_timer_get_cntfrq();
+	int got = 0, r;
+
+	lockdep_assert_held(&smc->mutex);
+	if (!smc->saved_scope || !irqs_disabled())
+		return -EINVAL;
+	do {
+		r = apple_rtkit_m5_saved_poll(smc->rtk);
+		if (r < 0)
+			return r;
+		if (r > 0)
+			got++;
+		else
+			udelay(50);
+	} while (got < 64 && __arch_counter_get_cntpct() - t0 < hz / 50);
+	return got;
+}
+
 static const struct apple_sleep_smc_saved_ops apple_smc_j813_saved_ops = {
 	.begin = apple_smc_sleep_saved_begin,
 	.late_notice = apple_smc_sleep_after_peers,
 	.end = apple_smc_j813_saved_end,
+	.drain = apple_smc_sleep_saved_drain_after,
 };
 
 static int apple_smc_prepare_policy(struct apple_smc *smc)

@@ -332,6 +332,15 @@ static void t8122_wake208_apply(struct apple_sleep *s)
 	if (!s->wake || !t8122_wake208)
 		return;
 	before = readl(s->wake + 0x3c);
+	/* 3: report only (with the drain after the cut: how many it took, +1000 if the cut ran) */
+	if (t8122_wake208 == 3) {
+		t8122_dc_puts("\nS208 ");
+		t8122_dc_hex(before);
+		t8122_dc_puts(" drained ");
+		t8122_dc_hex((u32)s->smc_drained);
+		t8122_dc_putc('\n');
+		return;
+	}
 	if (t8122_wake208 == 1)
 		writel(readl(s->wake + 0x20) | BIT(16), s->wake + 0x20);
 	else if (t8122_wake208 == 2 && (before & BIT(16)))

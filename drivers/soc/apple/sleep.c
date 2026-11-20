@@ -936,6 +936,7 @@ struct apple_sleep {
 	u64 dvfm_saved[SLEEP_CLUSTERS][ARRAY_SIZE(sleep_dvfm_words)];
 	bool dvfm_parked;
 	u64 resumes_before;
+	int smc_drained;	/* J613 trial: messages drained after the cut, +1000 if it ran */
 	u64 resumes_after;
 	/* T8132: ATC0's words as they were before the commit path lowered them. */
 	u32 atc0_saved[3];
@@ -1859,6 +1860,15 @@ MODULE_PARM_DESC(j813_smc_late,
  * stage's locked RVBAR to its spin-table release target, the holding pen; spinning there it
  * would keep its cluster from powering down. macOS's parked cores take the same deep WFI.
  */
+/*
+ * J613 trial: after the debug link's cut (the port controller's cold reset, which the SMC sees
+ * as a cable pulled after AP IDLE), take the SMC's messages off its mailbox before the commit.
+ * The keep-link watch run (n=1) read no wake source 208 (SMC.OutboxNotEmpty) after the commit.
+ */
+static bool sleep_j613_smc_drain_after_cut;
+module_param_named(j613_smc_drain_after_cut, sleep_j613_smc_drain_after_cut, bool, 0444);
+MODULE_PARM_DESC(j613_smc_drain_after_cut, "J613 trial: empty the SMC's mailbox to the AP after the debug link's cut");
+
 static bool sleep_j613_pen_deep;
 module_param_named(j613_pen_deep, sleep_j613_pen_deep, bool, 0444);
 MODULE_PARM_DESC(j613_pen_deep,
@@ -6121,8 +6131,13 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 	}
 	if (s->soc->ops->stopped)
 		s->soc->ops->stopped(s);
-	if (!s->soc->regions)
-		apple_sleep_usb_down(s);
+	if (!s->soc->regions) {
+		bool cut = apple_sleep_usb_down(s);
+
+		if (READ_ONCE(sleep_j613_smc_drain_after_cut) && of_machine_is_compatible("apple,j613") &&
+		    s->smc.held && s->smc.saved_ops && s->smc.saved_ops->drain)
+			s->smc_drained = s->smc.saved_ops->drain(s->smc.data) + (cut ? 1000 : 0);
+	}
 	s->deep_once = READ_ONCE(sleep_deep_requested);
 	if (s->deep_once)
 		sleep_slp_ddr_set_deep_once(true);
