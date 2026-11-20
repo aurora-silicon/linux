@@ -5291,9 +5291,12 @@ void dcp_poweroff(struct platform_device *pdev)
 			disconnected_hpd_event(dcp->connector);
 		}
 		/*
-		 * T6050 keeps the fixed HDMI DPTX link trained after the pipe is
-		 * blanked. Release it so the PHY can power down. dcp_poweron()
-		 * retrains the link before it enables the pipe again.
+		 * With the firmware-27 interface (DCP_FIRMWARE_V_27_0), DCP keeps
+		 * a fixed HDMI port's DPTX link trained after the pipe is
+		 * blanked, so the PHY stays powered while the display is off.
+		 * Release it; dcp_poweron() retrains the link before it enables
+		 * the pipe again. Earlier interfaces keep the old rule: release
+		 * the link only once the cable is gone.
 		 */
 		if (!connected || dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 			dcp_dptx_disconnect(dcp, 0);

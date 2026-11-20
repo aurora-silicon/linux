@@ -788,6 +788,7 @@ struct completion { int done; };
 struct apple_connector { bool connected; };
 struct dptx_port { bool enabled, connected, available; void *service; };
 #define DCP_FIRMWARE_H17P 1
+#define DCP_FIRMWARE_V_27_0 2
 #define DCP_IOMFB_METHODS_H17G 7
 #define DRM_MODE_CONNECTOR_eDP 14
 struct apple_dcp {
@@ -833,7 +834,8 @@ static int dcp_dptx_disconnect(struct apple_dcp *d, u32 port)
 { disconnects++; d->dptxport[port].connected = false; return 0; }
 static void dcp_external_retry(struct apple_dcp *d, const char *why, int error, int delay)
 { (void)d; (void)why; (void)error; (void)delay; retries++; }
-static bool gpiod_get_value_cansleep(void *gpio) { (void)gpio; return false; }
+static bool hdmi_gpio;
+static bool gpiod_get_value_cansleep(void *gpio) { (void)gpio; return hdmi_gpio; }
 static void disconnected_hpd_event(struct apple_connector *connector) { (void)connector; }
 ''' + panel_predicate + '\n' + poweroff + r'''
 static struct apple_dcp dcp;
@@ -869,6 +871,20 @@ int main(void)
  /* A successful replacement modeset refreshes the token before later DPMS. */
  init(5, 4); dcp.crtc_unplugs = dcp.typec_unplugs; dcp_poweroff(&pdev);
  assert(poweroffs == 1 && hpd_drops == 1 && disconnects == 1);
+
+ /* Fixed HDMI, cable attached: firmware 27 releases the link on DPMS off. */
+ init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
+ dcp.fw_compat = DCP_FIRMWARE_V_27_0; dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && hpd_drops == 0 && disconnects == 1);
+ assert(!dcp.dptxport[0].connected);
+ /* Other firmware keeps it while the cable is attached... */
+ init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
+ dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && disconnects == 0 && dcp.dptxport[0].connected);
+ /* ...and every firmware releases it once the cable is gone. */
+ hdmi_gpio = false; init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp;
+ dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && disconnects == 1);
  puts("stale CRTC power-off ownership passed");
  return 0;
 }
