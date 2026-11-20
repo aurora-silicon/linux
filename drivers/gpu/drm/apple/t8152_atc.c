@@ -14,6 +14,11 @@
  * route, and with the display off or unplugged a full power down and a cold
  * start. A DCP drives one USB-C port at a time: the one it claims from the
  * shared ports once their Type-C state shows a sink (t8152_typec.c).
+ *
+ * The ATC PHY driver powers the PHY: it holds the PHY's power domains while
+ * the port's DP PHY is on, and keeps the PHY out of USB4 meanwhile. So the DP
+ * PHY goes on before any PHY register access of a cold start, and off once
+ * the PHY is powered down, and a bootloader display's PHY stays on with it.
  */
 
 #include <linux/bits.h>
@@ -24,6 +29,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/phy/phy.h>
 
 #include "dptxep.h"
 #include "t8152_display.h"
@@ -55,11 +61,11 @@ struct t8152_atc_port {
 	u32 dfp;
 	/* AP DisplayPort AUX controller aux0 (shared), for the EDID */
 	struct t8152_aux *aux;
-	/* PMGR power states of the four ATC dependencies */
+	/* PMGR power states of the ATC dependencies, read to tell if it runs */
 	void __iomem *ps;
 	void __iomem *psd;
-	/* the dependencies this driver powered up, and may power down */
-	u8 owned;
+	/* the port's DP PHY of the ATC PHY driver, which powers the PHY */
+	struct phy *phy;
 	/* {offset, mask, value} tunables, before and after the lane setup */
 	const __be32 *tunable[2];
 	int tunable_len[2];
@@ -382,50 +388,7 @@ static int atc_dp_start(struct t8152_display *disp, struct t8152_atc_port *atc, 
 	return 0;
 }
 
-/*
- * The power dependencies, in order: the ATC's USB AON (PS +0x100), its common
- * PSD, then its two DP PS registers (+0, +0x20), with the values they idle at
- * (ATC3: PS 0x1c0, PSD 58, PS 0xc0, 0xe0).
- */
-#define ATC_PSD_TARGET	0x90
 #define ATC_PSD_STATE	0x80
-static const u32 atc_ps_offset[] = { 0x100, 0, 0x0, 0x20 };
-static const u32 atc_ps_idle[] = { 0x300, 6, 0x244, 0x244 };
-
-static int atc_psd_wait(struct t8152_atc_port *atc, u32 state)
-{
-	u32 reg;
-
-	/*
-	 * Only the state: the acknowledge bit stays clear when Linux switches
-	 * the PSD, in either direction.
-	 */
-	return readl_poll_timeout(atc->psd + ATC_PSD_STATE, reg,
-				  (reg & 7) == state, 1, ATC_TIMEOUT_US);
-}
-
-static int atc_gate(struct t8152_atc_port *atc, unsigned int i, bool on)
-{
-	u32 value = on ? (atc_ps_idle[i] & 0xfffffcf0) | 15 : atc_ps_idle[i];
-	u32 reg;
-
-	/* Already up (the bootloader's or an earlier activation's). */
-	if (on && (i == 1 ? !(readl(atc->psd + ATC_PSD_STATE) & 7) :
-			    (readl(atc->ps + atc_ps_offset[i]) & 0xf0) == 0xf0))
-		return 0;
-	if (on)
-		atc->owned |= BIT(i);
-	else
-		atc->owned &= ~BIT(i);
-	if (i == 1) {
-		writel(on ? 0 : atc_ps_idle[i], atc->psd + ATC_PSD_TARGET);
-		return atc_psd_wait(atc, on ? 0 : atc_ps_idle[i]);
-	}
-	writel(value, atc->ps + atc_ps_offset[i]);
-	return readl_poll_timeout(atc->ps + atc_ps_offset[i], reg,
-				  (reg & 0xf0) == ((value & 15) << 4), 1,
-				  ATC_TIMEOUT_US);
-}
 
 static void atc_apply_tunables(struct t8152_atc_port *atc, unsigned int which)
 {
@@ -436,13 +399,13 @@ static void atc_apply_tunables(struct t8152_atc_port *atc, unsigned int which)
 			   be32_to_cpu(t[i + 2]));
 }
 
-/* Cold start: the power dependencies, the common block and AUX, then the lanes at HBR. */
+/* Cold start: the PHY's power, the common block and AUX, then the lanes at HBR. */
 static int atc_activate(struct t8152_display *disp)
 {
 	struct t8152_atc_port *atc = atc_cur(disp);
 	void __iomem *cfg = atc->base + ATC_CFG;
-	unsigned int gates = 0;
 	u32 reg;
+	int ret;
 
 	if (READ_ONCE(atc_owner[atc->index]) != disp->dev)
 		return -EBUSY;
@@ -450,9 +413,12 @@ static int atc_activate(struct t8152_display *disp)
 		return 0;
 	if (!atc->tunable[0] || !atc->tunable[1])
 		return -EOPNOTSUPP;
-	for (; gates < ARRAY_SIZE(atc_ps_idle); gates++)
-		if (atc_gate(atc, gates, true))
-			goto fail;
+	/* -EBUSY while the PHY runs USB4 */
+	ret = phy_power_on(atc->phy);
+	if (ret) {
+		dev_err(disp->dev, "ATC%u: PHY not powered: %d\n", atc->index, ret);
+		return ret;
+	}
 	if (readl(cfg) != 4 || (readl(cfg + 4) & 3) || readl(cfg + 0x30))
 		goto fail;
 	writel(readl(cfg + 0x30) | BIT(0), cfg + 0x30);
@@ -494,14 +460,13 @@ static int atc_activate(struct t8152_display *disp)
 	 */
 	return atc_dp_start(disp, atc, 1);
 fail:
-	dev_err(disp->dev, "ATC%u: cold start failed (gates %u, cfg %#x/%#x)\n",
-		atc->index, gates,
-		gates == ARRAY_SIZE(atc_ps_idle) ? readl(cfg) : 0,
-		gates == ARRAY_SIZE(atc_ps_idle) ? readl(cfg + 4) : 0);
+	dev_err(disp->dev, "ATC%u: cold start failed (cfg %#x/%#x)\n",
+		atc->index, readl(cfg), readl(cfg + 4));
+	phy_power_off(atc->phy);
 	return -EIO;
 }
 
-/* Power the PHY down, dependencies included. */
+/* Power the PHY down, its power included. */
 static int atc_deactivate(struct t8152_display *disp)
 {
 	struct t8152_atc_port *atc = atc_cur(disp);
@@ -538,13 +503,9 @@ static int atc_deactivate(struct t8152_display *disp)
 	}
 	writel(readl(cfg + 0x30) & ~BIT(0), cfg + 0x30);
 	atc->active = false;
-	/*
-	 * Then the power dependencies it powered up: the next activation starts
-	 * it cold. The USB controller of a port keeps the ones it uses.
-	 */
-	for (int i = ARRAY_SIZE(atc_ps_idle) - 1; i >= 0; i--)
-		if ((atc->owned & BIT(i)) && atc_gate(atc, i, false))
-			ret = -ETIMEDOUT;
+	/* Then its power: the next activation starts it cold. */
+	if (phy_power_off(atc->phy))
+		ret = -ETIMEDOUT;
 	dev_info(disp->dev, "ATC%u: powered down: %d\n", atc->index, ret);
 	return ret;
 }
@@ -796,6 +757,9 @@ static int atc_port_init(struct t8152_display *disp, struct t8152_atc *atc,
 	port->psd = atc_map(disp, np, "atc-psd");
 	if (!port->base || !port->ps || !port->psd)
 		return -ENOMEM;
+	port->phy = devm_of_phy_optional_get(disp->dev, np, NULL);
+	if (IS_ERR(port->phy))
+		return dev_err_probe(disp->dev, PTR_ERR(port->phy), "%pOF: no PHY\n", np);
 	/* The node without ports is ATC3's (J873g back-right). */
 	port->dfp = 3;
 	of_property_read_u32(np, "apple,dfp-endpoint", &port->dfp);
@@ -831,6 +795,15 @@ static int atc_port_init(struct t8152_display *disp, struct t8152_atc *atc,
 	/* Common block out of reset and AUX up, as the bootloader leaves it. */
 	cfg = readl(port->base + ATC_CFG);
 	port->active = (cfg & 0x1f) == 0x1b;
+	/*
+	 * The bootloader's display keeps the PHY powered through its DP PHY. The
+	 * common block runs the same way in USB4, whose PHY refuses the DP PHY.
+	 */
+	if (port->active && phy_power_on(port->phy)) {
+		dev_info(disp->dev, "ATC%u: runs USB4\n", port->index);
+		port->active = false;
+		return 0;
+	}
 	if ((readl(port->base + 0x4c) & 0x1f) == 0x10 ||
 	    (readl(port->base + 0x4c) & 0x1f) == 0x11) {
 		port->lanes = 2;
@@ -844,9 +817,6 @@ static int atc_port_init(struct t8152_display *disp, struct t8152_atc *atc,
 	if (port->active && (readl(port->base + 0x2040) & BIT(16)) &&
 	    r < ARRAY_SIZE(atc_rates))
 		port->link_rate = atc_rates[r];
-	/* The bootloader's display: its dependencies are the display's. */
-	if (port->active)
-		port->owned = GENMASK(ARRAY_SIZE(atc_ps_idle) - 1, 0);
 	dev_info(disp->dev,
 		 "ATC%u: inherited state: active %d, rate %#x, route %d, reversed %d (cfg %#x)\n",
 		 port->index, port->active, port->link_rate, port->route_started,
