@@ -3361,6 +3361,12 @@ static int apple_nvme_suspend(struct device *dev)
 			int idle = apple_rtkit_idle(anv->rtk);
 
 			anv->sleep_stop = true;
+			/*
+			 * As on post-M4: keep genpd from switching ANS's domains off in the noirq
+			 * phase; macOS commits with ANS's domain up, its CPU idle (n45: with it off,
+			 * the last stop's ASC read took an external abort).
+			 */
+			apple_nvme_keep_link_powered(anv);
 			/* Idled here, with interrupts on (at the commit it never answered, n36-n42). */
 			anv->sleep_idled = !idle;
 			apple_sleep_coproc_set_ready(dev, true);
