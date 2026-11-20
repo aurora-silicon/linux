@@ -16,7 +16,13 @@
 use core::ops::Range;
 use core::sync::atomic::Ordering;
 
-use kernel::{device, io::Io, prelude::*, sync::Arc};
+use kernel::{
+    device,
+    io::Io,
+    prelude::*,
+    sync::Arc,
+    time::{delay::fsleep, Delta, Instant, Monotonic},
+};
 
 use super::hw;
 use super::regs::{mb, Mapping};
@@ -177,6 +183,11 @@ pub(crate) struct Window {
     firmware_root: [u64; 2],
     text_pa: u64,
     data_pa: u64,
+    /// The leaves the boot loader builds in this firmware's page tables (none for a firmware
+    /// that builds its own tree at start).
+    leaves: &'static [hw::Leaves],
+    /// The PPL handoff magic words of this firmware's layout.
+    ppl: hw::PplMagic,
 }
 
 impl Window {
@@ -193,6 +204,9 @@ impl Window {
             firmware_root: [0; 2],
             text_pa: adt.text.start,
             data_pa: adt.data.start,
+            // Admission refuses a layout with either unknown; never guess them here.
+            leaves: adt.layout.leaves.ok_or(ENOTSUPP)?,
+            ppl: adt.layout.ppl_magic.ok_or(ENOTSUPP)?,
         };
         window.admit_cold()?;
         Ok(window)
@@ -220,9 +234,9 @@ impl Window {
             return Err(EBUSY);
         }
         let h = self.handoff.io();
-        for offset in [0, 8] {
+        for (offset, expected) in [(0, self.ppl.ap), (8, self.ppl.firmware)] {
             let magic = h.try_read64(offset)?;
-            if magic != 0 && magic != hw::PPL_MAGIC {
+            if magic != 0 && magic != expected {
                 return Err(EBUSY);
             }
         }
@@ -293,24 +307,23 @@ impl Window {
             } else {
                 let address = va | ((index as u64) << shift);
                 let off = address.checked_sub(hw::UPPER).ok_or(EINVAL)?;
-                let expected = if off < 0x60000 {
-                    (self.text_pa + off)
-                        | if (0x50000..0x58000).contains(&off) {
-                            0x483
-                        } else {
-                            0x4c3
-                        }
-                } else if off < 0x19c000 {
-                    let data_offset = off - 0x60000;
-                    (self.data_pa + data_offset)
-                        | if data_offset < 0xc000 {
-                            0x00200000000004c3
-                        } else {
-                            0x0460000000000443
-                        }
-                } else {
-                    return Err(EINVAL);
-                };
+                let leaf = self
+                    .leaves
+                    .iter()
+                    .find(|leaf| leaf.range.contains(&off))
+                    .ok_or(EINVAL)?;
+                // TEXT starts at UPPER; every later segment is in DATA, contiguously.
+                let text_end = self
+                    .leaves
+                    .iter()
+                    .filter(|l| l.segment == hw::Segment::Text)
+                    .map(|l| l.range.end)
+                    .max()
+                    .ok_or(EINVAL)?;
+                let expected = match leaf.segment {
+                    hw::Segment::Text => self.text_pa + off,
+                    hw::Segment::Data => self.data_pa + (off - text_end),
+                } | leaf.attrs;
                 if pte != expected {
                     return Err(EINVAL);
                 }
@@ -325,6 +338,33 @@ impl Window {
             }
         }
         Ok(())
+    }
+
+    /// After RUN, waits up to 1 s for a firmware that answers at start ([`hw::PplMagic::answers`])
+    /// to store its magic at +8, as GPU firmware 27.2 does on G14 (linux#2544). Logs the
+    /// outcome; a missing answer is not yet fatal, until a G16 26B123 start confirms the order.
+    pub(crate) fn await_firmware_magic(&self, dev: &device::Device) -> Result {
+        if !self.ppl.answers {
+            return Ok(());
+        }
+        let start = Instant::<Monotonic>::now();
+        loop {
+            let magic = self.handoff.io().try_read64(8)?;
+            if magic == self.ppl.firmware {
+                dev_info!(
+                    dev,
+                    "G16: firmware PPL magic {:#x} after {} us\n",
+                    magic,
+                    start.elapsed().as_micros_ceil()
+                );
+                return Ok(());
+            }
+            if start.elapsed() >= Delta::from_millis(1000) {
+                dev_warn!(dev, "G16: no firmware PPL magic within 1 s (+8 = {:#x})\n", magic);
+                return Ok(());
+            }
+            fsleep(Delta::from_millis(1));
+        }
     }
 
     /// Cold-start check: all 128 TTBAT words are zero.
@@ -354,11 +394,11 @@ impl Window {
         let shadow_l2 = Self::shadow_l2(uat)?;
         let handoff = uat.lock_m4_handoff()?;
         let fw_magic = self.handoff.io().try_read64(8)?;
-        self.handoff.io().try_write64(hw::PPL_MAGIC, 0)?;
+        self.handoff.io().try_write64(self.ppl.ap, 0)?;
         // Cold admission proved both interests clear. The common guard now owns AP
         // interest; never reset either participant's lock words behind that guard.
         self.handoff.io().try_write32(0xffff, 0x18)?;
-        if fw_magic != hw::PPL_MAGIC {
+        if fw_magic != self.ppl.firmware {
             self.handoff.io().try_write8(1, 0x638)?;
         }
         for index in 0..65 * 3 {

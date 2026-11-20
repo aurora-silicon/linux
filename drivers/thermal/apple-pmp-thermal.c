@@ -748,27 +748,56 @@ static int apple_pmp_add_cluster(unsigned int index, unsigned int cpu,
 	return 0;
 }
 
+/*
+ * The logical CPU numbers follow the boot CPU and the device tree order, so
+ * they differ between boot paths; the cores' own nodes say which cluster each
+ * one is in. Fill each cluster's members and its first CPU from them.
+ */
+static int apple_pmp_cluster_members(unsigned long *p_members, unsigned long *e_members,
+				     unsigned int *p_cpu, unsigned int *e_cpu)
+{
+	unsigned int n;
+
+	*p_members = 0;
+	*e_members = 0;
+	for_each_possible_cpu(n) {
+		struct device_node *np = of_cpu_device_node_get(n);
+		bool p, e;
+
+		if (!np)
+			return -ENODEV;
+		p = of_device_is_compatible(np, "apple,donan-p");
+		e = of_device_is_compatible(np, "apple,donan-e");
+		of_node_put(np);
+		if (p == e || n >= BITS_PER_LONG)
+			return -EINVAL;
+		*(p ? p_members : e_members) |= BIT(n);
+	}
+	if (!*p_members || !*e_members)
+		return -EINVAL;
+	*p_cpu = __ffs(*p_members);
+	*e_cpu = __ffs(*e_members);
+	return 0;
+}
+
 static int apple_pmp_thermal_setup(void)
 {
 	struct thermal_zone_device *zone;
-	unsigned long p_members = BIT(0) | GENMASK(9, 7);
-	unsigned long e_members = GENMASK(6, 1);
-	unsigned int i;
+	unsigned long p_members, e_members;
+	unsigned int i, p_cpu, e_cpu;
 	int ret;
 
-	/* J773g numbers the four P cores 0,3-5 and the six E cores 1-2,6-9. */
-	if (of_machine_is_compatible("apple,j773g")) {
-		p_members = BIT(0) | GENMASK(5, 3);
-		e_members = GENMASK(2, 1) | GENMASK(9, 6);
-	}
+	ret = apple_pmp_cluster_members(&p_members, &e_members, &p_cpu, &e_cpu);
+	if (ret)
+		return ret;
 	apple_pmp_power_init(&pmp_thermal.power);
 	pmp_thermal.power_budget = !of_machine_is_compatible("apple,j773g");
 	apple_pmp_cooling_init(&pmp_thermal.cooling);
 	pmp_thermal.guard_level = 8;
-	ret = apple_pmp_add_cluster(0, 0, p_members);
+	ret = apple_pmp_add_cluster(0, p_cpu, p_members);
 	if (ret)
 		goto fail;
-	ret = apple_pmp_add_cluster(1, 1, e_members);
+	ret = apple_pmp_add_cluster(1, e_cpu, e_members);
 	if (ret)
 		goto fail;
 	zone = thermal_zone_device_register_with_trips("apple-pmp-die", apple_pmp_trips,

@@ -545,6 +545,49 @@ mod tests {
         assert!(measured(builds, 0x13c000, &[[0x5c8df, 0x5c9c2]], [0; 32]).is_none());
     }
 
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[test]
+    fn j773g_accepts_its_loaded_image() {
+        let builds = crate::g16::hw::t8132::CONFIG.firmware;
+        let digest = [
+            0x91, 0x54, 0xc7, 0xf8, 0x4b, 0xce, 0x32, 0x15, 0x1e, 0x8a, 0x97, 0x41, 0x7d, 0x6a,
+            0x20, 0x7a, 0x9e, 0xaf, 0x03, 0x54, 0xb4, 0xb8, 0xd6, 0xf0, 0x2a, 0xf5, 0x29, 0x95,
+            0x40, 0xd3, 0xe8, 0x5a,
+        ];
+        let found = measured(builds, 0x13c000, &[[0x5c8df, 0x5c9c2]], digest).unwrap();
+        assert_eq!(found.name, "Apple GFX 25G83 (normalized loaded image, J773g)");
+        assert_eq!(found.boot_filled, &[(0x224, 4), (0x5c917, 8)]);
+        assert!(measured(builds, 0x138000, &[[0x5c8df, 0x5c9c2]], digest).is_none());
+    }
+
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[test]
+    fn t8132_25g83_b000_zeroes_what_iboot_fills() {
+        let builds = crate::g16::hw::t8132::CONFIG.firmware;
+        let filled = crate::g16::hw::t8132::BOOT_FILLED_25G83_B000;
+        let build = builds.iter().find(|b| b.boot_filled == filled).unwrap();
+        let [gkts, ecap] = build.entropy[0];
+        // The header's per-boot word and DATA address, then one value per parameter record:
+        // each follows its 8-byte tag and length, back to back from the GKTS record.
+        assert_eq!(filled[..2], [(0x224, 4), (0x23c, 8)]);
+        let mut next = gkts;
+        for &(off, len) in &filled[2..filled.len() - 4] {
+            assert_eq!(off, next + 8);
+            next = off + len;
+        }
+        assert_eq!(next, 0x5c8df + 0x231);
+        assert!(filled.contains(&(gkts + 8, 8)));
+        assert!(filled.contains(&(ecap + 8, 8)));
+        // Then each tunable table's count byte and body, 0x350 bytes from its header.
+        for (i, table) in [next, next + 0x350].into_iter().enumerate() {
+            let at = filled.len() - 4 + 2 * i;
+            assert_eq!(filled[at..at + 2], [(table + 3, 1), (table + 4, 0x34c)]);
+        }
+        let found = measured(builds, 0x13c000, &[[gkts, ecap]], build.text_sha256).unwrap();
+        assert!(core::ptr::eq(found, build));
+        assert!(measured(builds, 0x138000, &[[gkts, ecap]], build.text_sha256).is_none());
+    }
+
     #[test]
     fn t6050_admits_only_its_pinned_image() {
         for cfg in [

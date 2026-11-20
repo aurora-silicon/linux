@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Bounded two-owner displacement ledger. A completion alone never makes an M4 UMA owner
-//! reusable: a distinct, fully retired owner must replace it in the same hardware slot.
+//! Bounded displacement ledger of the retained owners of one hardware UMA slot. A completion
+//! alone never makes an M4 UMA owner reusable: a later, fully retired publication must have
+//! replaced it in the same hardware slot.
+//!
+//! The firmware runs one queue's commands strictly in order, each to its Finalize, so a
+//! publication that retired started after every earlier one finished and displaced it. Owners
+//! therefore retire in publication order and an owner is reusable once any owner published
+//! after it retired. With `pipelined`, owners may be published while earlier ones are still
+//! in flight (the compute queue); without it, publication stays serialized against every
+//! owner (the render pass slots).
+//!
 //! Core-only so the transition system is executable in host tests.
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -30,16 +39,19 @@ pub(crate) struct Counts {
     pub(crate) retired: u32,
     pub(crate) quarantined: u32,
     pub(crate) reusable: u32,
+    /// Owners abandoned after a firmware recovery passed them ([`Lifetime::abandon`]).
+    pub(crate) abandoned: u32,
 }
 
 #[derive(Clone)]
-pub(crate) struct Lifetime {
-    units: [Unit; 2],
+pub(crate) struct Lifetime<const N: usize> {
+    units: [Unit; N],
     sequence: u64,
-    last_owner: Option<usize>,
+    pipelined: bool,
+    abandoned: u32,
 }
-impl Lifetime {
-    pub(crate) const fn new() -> Self {
+impl<const N: usize> Lifetime<N> {
+    pub(crate) const fn new(pipelined: bool) -> Self {
         let unit = Unit {
             state: State::Fresh,
             previous: State::Fresh,
@@ -47,9 +59,10 @@ impl Lifetime {
             publication: 0,
         };
         Self {
-            units: [unit; 2],
+            units: [unit; N],
             sequence: 0,
-            last_owner: None,
+            pipelined,
+            abandoned: 0,
         }
     }
     #[allow(dead_code)]
@@ -57,7 +70,10 @@ impl Lifetime {
         self.units[k].generation
     }
     pub(crate) fn counts(&self) -> Counts {
-        let mut counts = Counts::default();
+        let mut counts = Counts {
+            abandoned: self.abandoned,
+            ..Counts::default()
+        };
         for (k, unit) in self.units.iter().enumerate() {
             match unit.state {
                 State::Fresh => counts.fresh += 1,
@@ -70,16 +86,23 @@ impl Lifetime {
         }
         counts
     }
+    /// Published owners.
+    pub(crate) fn published(&self) -> u32 {
+        self.units
+            .iter()
+            .filter(|u| u.state == State::Published)
+            .count() as u32
+    }
     pub(crate) fn available(&self, k: usize) -> bool {
         let Some(u) = self.units.get(k) else {
             return false;
         };
         match u.state {
             State::Fresh => true,
-            State::Retired => self.last_owner.is_some_and(|b| {
-                b != k
-                    && self.units[b].state == State::Retired
-                    && self.units[b].publication > u.publication
+            // A later publication retired: it started only after this owner finished, and
+            // its load displaced this owner from the hardware slot.
+            State::Retired => self.units.iter().enumerate().any(|(b, other)| {
+                b != k && other.state == State::Retired && other.publication > u.publication
             }),
             _ => false,
         }
@@ -87,7 +110,11 @@ impl Lifetime {
     /// No amount of firmware progress can make a unit claimable. The caller must fail
     /// pending work rather than wait forever after abort/quarantine or sequence exhaustion.
     pub(crate) fn exhausted(&self) -> bool {
-        (0..2).all(|k| !self.available(k))
+        self.exhausted_within(N)
+    }
+    /// [`Self::exhausted`] when only owners `0..n` exist.
+    pub(crate) fn exhausted_within(&self, n: usize) -> bool {
+        (0..n.min(N)).all(|k| !self.available(k))
             && !self
                 .units
                 .iter()
@@ -113,30 +140,57 @@ impl Lifetime {
         }
     }
     pub(crate) fn publish(&mut self, k: usize) -> bool {
-        if self.units[k].state != State::Preparing || self.sequence == u64::MAX {
+        if k >= N || self.units[k].state != State::Preparing || self.sequence == u64::MAX {
             return false;
         }
-        // Publication must be serialized against every owner of this hardware slot.
-        if self.units.iter().any(|u| u.state == State::Published) {
+        // Without pipelining, publication is serialized against every owner of the slot.
+        if !self.pipelined && self.units.iter().any(|u| u.state == State::Published) {
             return false;
         }
         self.sequence += 1;
         self.units[k].publication = self.sequence;
         self.units[k].state = State::Published;
-        self.last_owner = Some(k);
         true
     }
-    /// Called only after the caller has established complete, exact wire retirement.
+    /// Called only after the caller has established complete, exact wire retirement. Owners
+    /// retire in publication order: `k` must be the oldest published owner.
     pub(crate) fn retire(&mut self, k: usize) -> bool {
-        if self.units[k].state != State::Published || self.last_owner != Some(k) {
+        if k >= N || self.units[k].state != State::Published {
+            return false;
+        }
+        let publication = self.units[k].publication;
+        if self
+            .units
+            .iter()
+            .any(|u| u.state == State::Published && u.publication < publication)
+        {
             return false;
         }
         self.units[k].state = State::Retired;
         true
     }
-    /// A firmware-aborted owner is retained forever and cannot grant a displacement lease.
+    /// An owner whose storage can no longer be trusted (corrupt identity or a failed
+    /// retirement) is retained forever and cannot grant a displacement lease.
     pub(crate) fn quarantine(&mut self, k: usize) {
         self.units[k].state = State::Quarantined;
+    }
+    /// An owner a firmware recovery passed without completing it (an aborted receipt). The
+    /// firmware no longer runs it, so its index returns to service for other storage, as a
+    /// fresh owner. Its own storage is never used again: its job failed, which leaves its VM
+    /// a sticky error (no later publication), and the engine retains the job and so keeps the
+    /// storage mapped. It is not a retired owner: it never proves that an owner published
+    /// before it was displaced, which still takes a later full retirement.
+    pub(crate) fn abandon(&mut self, k: usize) {
+        let Some(u) = self.units.get_mut(k) else {
+            return;
+        };
+        if u.state != State::Published {
+            return;
+        }
+        u.state = State::Fresh;
+        u.previous = State::Fresh;
+        u.generation = 0;
+        self.abandoned = self.abandoned.saturating_add(1);
     }
 }
 
@@ -144,8 +198,26 @@ impl Lifetime {
 mod tests {
     use super::*;
     #[test]
+    fn an_abandoned_owner_returns_to_service_but_displaces_nothing() {
+        let mut l = Lifetime::<2>::new(false);
+        assert!(l.claim(0));
+        assert!(l.publish(0));
+        assert!(l.retire(0));
+        assert!(l.claim(1));
+        assert!(l.publish(1));
+        l.abandon(1);
+        assert!(!l.exhausted());
+        assert!(!l.claim(0)); // The abort is no displacement of owner 0.
+        assert!(l.claim(1)); // Its index serves other storage.
+        assert!(l.publish(1));
+        assert!(l.retire(1));
+        assert!(l.claim(0)); // A later full retirement displaced owner 0.
+        assert_eq!(l.counts().abandoned, 1);
+        assert_eq!(l.counts().quarantined, 0);
+    }
+    #[test]
     fn distinct_retired_displacement_is_required() {
-        let mut l = Lifetime::new();
+        let mut l = Lifetime::<2>::new(false);
         assert!(l.claim(0));
         assert!(l.publish(0));
         assert!(!l.claim(0));
@@ -164,7 +236,7 @@ mod tests {
     }
     #[test]
     fn abort_does_not_recycle_or_authorize_displacement() {
-        let mut l = Lifetime::new();
+        let mut l = Lifetime::<2>::new(false);
         assert!(l.claim(0));
         assert!(l.publish(0));
         assert!(l.retire(0));
@@ -185,7 +257,7 @@ mod tests {
     }
     #[test]
     fn preparation_cancel_preserves_retirement() {
-        let mut l = Lifetime::new();
+        let mut l = Lifetime::<2>::new(false);
         assert!(l.claim(0));
         l.cancel(0);
         assert_eq!(l.generation(0), 0);
@@ -202,7 +274,7 @@ mod tests {
     }
     #[test]
     fn publication_is_serialized_and_command_count_is_not_binding_generation() {
-        let mut l = Lifetime::new();
+        let mut l = Lifetime::<2>::new(false);
         assert!(l.claim(0));
         assert!(l.publish(0));
         assert!(l.claim(1));
@@ -218,5 +290,57 @@ mod tests {
         assert_eq!(l.generation(0), 1);
         assert_eq!(l.generation(1), 1);
         assert!(l.claim(0));
+    }
+    #[test]
+    fn pipelined_owners_keep_n_minus_one_in_flight() {
+        let mut l = Lifetime::<4>::new(true);
+        // Fresh owners publish back to back.
+        for k in 0..4 {
+            assert!(l.claim(k));
+            assert!(l.publish(k));
+        }
+        assert_eq!(l.published(), 4);
+        // Out of order retirement is refused.
+        assert!(!l.retire(1));
+        assert!(l.retire(0));
+        // Owner 0 retired but nothing after it has: not displaced yet.
+        assert!(!l.claim(0));
+        assert!(l.retire(1));
+        assert!(l.claim(0)); // displaced by 1
+        assert!(!l.claim(1)); // 2 still in flight
+        assert!(l.publish(0));
+        assert!(l.retire(2));
+        assert!(l.claim(1));
+        assert!(l.publish(1));
+        // Steady state: round robin with up to three in flight.
+        let mut next = 2;
+        for _ in 0..1000 {
+            let oldest = (0..4)
+                .filter(|&k| l.units[k].state == State::Published)
+                .min_by_key(|&k| l.units[k].publication)
+                .unwrap();
+            assert!(l.retire(oldest));
+            assert!(l.claim(next));
+            assert!(l.publish(next));
+            assert!(l.published() <= 3);
+            next = (next + 1) % 4;
+        }
+    }
+    #[test]
+    fn pipelined_newest_retired_owner_is_never_reusable() {
+        let mut l = Lifetime::<3>::new(true);
+        for k in 0..3 {
+            assert!(l.claim(k));
+            assert!(l.publish(k));
+        }
+        for k in 0..3 {
+            assert!(l.retire(k));
+        }
+        assert!(l.available(0) && l.available(1));
+        assert!(!l.available(2));
+        assert!(l.claim(1));
+        // 2 still proves 0 displaced although 1 is being prepared again.
+        assert!(l.available(0));
+        assert!(!l.available(2));
     }
 }

@@ -290,7 +290,12 @@ impl Job {
             .completed
             .each_ref()
             .map(|value| value.load(Ordering::Acquire));
-        if !order.ready(completed) {
+        let published = self
+            .queue
+            .published
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        if !order.ready(completed, published) {
             return Err(EAGAIN);
         }
         Ok(())
@@ -299,6 +304,14 @@ impl Job {
     /// Advances exactly one queue-local engine ordinal after a full successful wire receipt.
     /// Called under the device lock before another command is considered. No allocation,
     /// fence callback or aggregate-job completion occurs here.
+    /// Advances the queue's published frontier past command `index` (under the device
+    /// lock, when its first producer became visible).
+    pub(crate) fn command_published(&self, index: u32) {
+        if let Some(order) = self.orders.get(index as usize) {
+            self.queue.published[order.engine].fetch_max(order.sequence, Ordering::AcqRel);
+        }
+    }
+
     pub(crate) fn command_retired(&self, index: u32) -> Result {
         let order = self.orders.get(index as usize).ok_or(EINVAL)?;
         let previous = order.sequence.checked_sub(1).ok_or(EINVAL)?;

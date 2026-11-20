@@ -13,6 +13,7 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/soc/apple/pmp-temps.h>
 #include <linux/soc/apple/pmp-power-policy.h>
@@ -20,7 +21,7 @@
 
 bool apple_pmp_telemetry_retained_board(void)
 {
-	return apple_t8132_firmware_path() && of_machine_is_compatible("apple,t8132");
+	return apple_pmp_t8132_retained_board();
 }
 
 static LIST_HEAD(apple_pmp_telemetry_list);

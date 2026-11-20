@@ -203,6 +203,14 @@ pub(crate) struct Destinations(Option<crate::cleanup::Deferred<[Option<Destinati
 
 #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 impl Destinations {
+    /// No timestamp is written for this command.
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0
+            .as_deref()
+            .is_none_or(|destinations| destinations.iter().all(Option::is_none))
+    }
+
     /// G16 retains its eight-byte destination alignment and EINVAL contract.
     #[cfg(CONFIG_DRM_ASAHI_G16)]
     pub(crate) fn resolve_aligned(

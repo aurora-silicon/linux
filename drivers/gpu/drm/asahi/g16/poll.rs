@@ -56,6 +56,25 @@ impl HrTimerCallback for Shared {
     }
 }
 
+/// The `aurora-g16/tune` debugfs file: current tunables.
+fn tune_show(_shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    super::params::tune::show(f)
+}
+
+/// The `aurora-g16/tune` debugfs file: `name=value` lines.
+fn tune_write(_shared: &Arc<Shared>, reader: &mut kernel::uaccess::UserSliceReader) -> Result {
+    let mut buf = [0u8; 128];
+    let len = reader.len().min(buf.len());
+    reader.read_slice(&mut buf[..len])?;
+    let text = core::str::from_utf8(&buf[..len]).map_err(|_| EINVAL)?;
+    for line in text.split(|c| c == '\n' || c == ' ' || c == ',') {
+        if !line.trim().is_empty() {
+            super::params::tune::set(line)?;
+        }
+    }
+    Ok(())
+}
+
 /// The `aurora-g16/stats` debugfs file contents.
 fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let state = shared.state.lock();
@@ -119,7 +138,11 @@ impl Shared {
                 firmware.engine.shared = Some(self.clone());
             }
             let accepted = firmware.enqueue(job);
-            if accepted.is_ok() {
+            // Nothing is published while a render is in flight: the poll pass after its
+            // retirement publishes this job. Skipping the pass here keeps queued submissions
+            // from holding the device lock (ring drains, health checks) on that path.
+            let render_busy = firmware.engine.flights.iter().any(|f| f.renders != 0);
+            if accepted.is_ok() && !render_busy {
                 if let Err(error) = firmware.publish(&mut done) {
                     firmware.fail_stop(error, &mut done);
                     self.fail_stop(error);
@@ -198,10 +221,15 @@ impl Shared {
             dir.read_callback_file(c_str!("stats"), self.clone(), &stats_show),
             GFP_KERNEL,
         )?;
+        let tune = KBox::pin_init(
+            dir.read_write_callback_file(c_str!("tune"), self.clone(), &tune_show, &tune_write),
+            GFP_KERNEL,
+        )?;
         let mut state = self.state.lock();
         let firmware = state.as_deref_mut().ok_or(ENODEV)?;
         firmware.engine.shared = Some(self.clone());
         firmware.engine.debugfs = Some(file);
+        firmware.engine.tune_file = Some(tune);
         Ok(())
     }
 }
@@ -212,7 +240,6 @@ pub(crate) fn stamp_reached(obs: u32, own: u32, tail: u32) -> bool {
 }
 
 /// Cursor `c` of a ring of `m` entries passed end `h` of entries from `b`, within tail `t`.
-#[allow(dead_code)]
 pub(crate) fn ring_passed(c: u32, b: u32, h: u32, t: u32, m: u32) -> bool {
     let d = |x: u32| x.wrapping_add(m).wrapping_sub(b) % m;
     let (dc, dh, dt) = (d(c), d(h), d(t));
@@ -341,6 +368,40 @@ impl Firmware {
         Ok(true)
     }
 
+    /// In-order receipt of compute flight `f` with later flights queued behind it: the NC
+    /// READ cursor (and with uncached queue info its consumers) passed its ring entries,
+    /// and the submit pipe's read and completion cursors passed its record.
+    fn queue_passed(
+        &self,
+        channel: Channel,
+        state: &super::object::FwObject,
+        info: &super::object::FwObject,
+        f: &Flight,
+    ) -> Result<bool> {
+        let cap = super::hw::sizes::QUEUE_CAP;
+        let tail = self.engine.head;
+        if f.head >= cap || f.c_start >= cap || tail >= cap {
+            return Err(EINVAL);
+        }
+        if !ring_passed(state.r32(qstate::READ)?, f.c_start, f.head, tail, cap) {
+            return Ok(false);
+        }
+        if !super::hw::tuning::FW_CACHED {
+            for offset in [0x20, 0x24, 0x28] {
+                if !ring_passed(info.r32(offset)?, f.c_start, f.head, tail, cap) {
+                    return Ok(false);
+                }
+            }
+        }
+        let slots = super::fw::channels::RING_SLOTS;
+        let record = f.rec[2];
+        let first = (record + slots - 1) % slots;
+        let producer = self.channels.producer(channel);
+        let pipe = self.channels.channel(channel);
+        Ok(ring_passed(pipe.read()?, first, record, producer, slots)
+            && ring_passed(pipe.completion()?, first, record, producer, slots))
+    }
+
     /// A full receipt includes stage and notifier stamps, every physical consumer,
     /// the private allocator completion and the internal timestamp pair. An aborted
     /// receipt omits only the writes firmware does not make for an aborted command,
@@ -359,7 +420,33 @@ impl Firmware {
         };
         rmb();
         let mut full = true;
-        if f.computes != 0 {
+        // Later compute flights queued behind this one: the queue, pipe and stamp cells
+        // already moved on, so their receipt is "passed", in order; the newest flight keeps
+        // the exact receipt.
+        let behind = self.engine.flights.len() > 1;
+        if f.computes != 0 && behind {
+            let g = &self.graph.compute;
+            let e = &self.engine;
+            if !stamp_reached(g.fw_stamp.r32(0)?, f.target, e.target)
+                || !self.queue_passed(Channel::Compute, &g.qstate, &g.qinfo, f)?
+            {
+                return Ok(Retirement::Pending);
+            }
+            let k = f.claims.slot[0] as usize;
+            let unit = f.job.resources.compute_unit(k)?;
+            let submitted = unit.counter.r64(0)?;
+            let start = unit.its.r64(0)?;
+            let end = unit.its.r64(8)?;
+            let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
+            full &= stamp_reached(stamp, f.target, e.target)
+                && (stamp != f.target
+                    || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot)
+                && submitted != 0
+                && unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted
+                && unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va
+                && start != 0
+                && end > start;
+        } else if f.computes != 0 {
             let g = &self.graph.compute;
             if g.fw_stamp.r32(0)? != f.target
                 || !self.queue_receipt(Channel::Compute, &g.qstate, &g.qinfo, f.head, f.rec[2])?
@@ -367,7 +454,7 @@ impl Firmware {
                 return Ok(Retirement::Pending);
             }
             let k = f.claims.slot[0] as usize;
-            let unit = f.job.resources.compute()?.compute.get(k).ok_or(EINVAL)?;
+            let unit = f.job.resources.compute_unit(k)?;
             let submitted = unit.counter.r64(0)?;
             let start = unit.its.r64(0)?;
             let end = unit.its.r64(8)?;
@@ -494,9 +581,13 @@ impl Firmware {
             if f.renders != 0 {
                 self.recovery.last_retired[1] = Some(f.ta_target);
                 self.recovery.last_retired[2] = Some(f.fs_target);
-                let committed = f.job.resources.pb(f.first).and_then(|epoch| {
+                let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
+                    let k = timestamp_claims.pass[0] as usize;
+                    self.pools.retire_binding(k, epoch)?;
+                    let enabled = params::pb_reuse();
                     self.pools
-                        .retire_binding(timestamp_claims.pass[0] as usize, epoch)
+                        .retire_epoch(enabled, k, f.pb_binding, result.is_ok());
+                    Ok(())
                 });
                 if let Err(error) = committed {
                     self.retain(&f.job);
@@ -518,8 +609,19 @@ impl Firmware {
         } else {
             // Only an actual passed abort lacks the full owner receipt. An affected job
             // with a full normal receipt fails its fence without poisoning healthy storage.
-            self.slots.quarantine(&mut f.claims);
+            // The aborted storage stays mapped with its retained job and is never used again
+            // (its VM keeps a sticky error); its units serve other storage, so one client's
+            // fault does not take compute or rendering away from every other client.
+            if f.renders != 0 {
+                // Keep no epoch of the aborted render for reuse.
+                self.pools.forget(timestamp_claims.pass[0] as usize);
+            }
+            // Its VM's sticky error before its units return to service: from here on no job
+            // of that VM is published (`publish` refuses it), so nothing loads the aborted
+            // storage again, also not before the job's own completion runs.
+            f.job.latch_failure(EIO);
             self.retain(&f.job);
+            self.slots.abandon(&mut f.claims);
             self.recovery.aborted_receipts = self.recovery.aborted_receipts.saturating_add(1);
         }
         if self.slots.compute_exhausted() {
@@ -556,6 +658,15 @@ impl Firmware {
         let job = f.job.clone();
         let p = &job.progress;
         p.next.store(p.next() + f.count as u32, Ordering::Relaxed);
+        if result.is_err() {
+            // Its queue's later commands queued behind it fail with it, as unpublished ones
+            // are cancelled: they never report a successful receipt after this hole.
+            for later in self.engine.flights.iter_mut() {
+                if Arc::ptr_eq(&later.job.queue, &job.queue) {
+                    later.doomed = true;
+                }
+            }
+        }
         if let Err(error) = result {
             if p.is_pending() {
                 // Drop its unpublished commands.
@@ -654,13 +765,7 @@ impl Firmware {
             match command {
                 super::command::Command::Compute(command) => {
                     let index = *slots.get(compute).ok_or(EINVAL)? as usize;
-                    let unit = flight
-                        .job
-                        .resources
-                        .compute()?
-                        .compute
-                        .get(index)
-                        .ok_or(EINVAL)?;
+                    let unit = flight.job.resources.compute_unit(index)?;
                     let ticks = [unit.its.r64(0)?, unit.its.r64(8)?, 0, 0];
                     command
                         .timestamp_outputs
@@ -750,10 +855,9 @@ impl Firmware {
             );
         }
         for k in 0..(f.computes as usize).min(f.claims.slot_count as usize) {
-            let Some(arena) = f.job.resources.compute.as_ref() else {
+            let Ok(c) = f.job.resources.compute_unit(f.claims.slot[k] as usize) else {
                 return;
             };
-            let c = &arena.compute[f.claims.slot[k] as usize];
             stage(&c.its, 0, &mut s.cdm_ticks, crate::usage::Engine::Compute);
         }
         if hi > lo {
@@ -908,9 +1012,9 @@ impl Firmware {
         {
             writeln!(
                 f,
-                "{}_owners: fresh {} preparing {} published {} retired {} quarantined {} reusable {}",
+                "{}_owners: fresh {} preparing {} published {} retired {} quarantined {} reusable {} abandoned {}",
                 name, owners.fresh, owners.preparing, owners.published, owners.retired,
-                owners.quarantined, owners.reusable
+                owners.quarantined, owners.reusable, owners.abandoned
             )?;
         }
         for (kind, name) in ["compute", "render"].iter().enumerate() {
@@ -990,6 +1094,20 @@ impl Firmware {
             s.span_ticks / 24
         )?;
         // The phase timers of debug_flags bit 49, and the scrub flush waits.
+        {
+            let s = &self.engine.stats;
+            writeln!(
+                f,
+                "pipeline: behind {} max_flights {} compute_published {} hold {}/{}/{}",
+                s.behind,
+                s.max_flights,
+                self.slots.compute_published(),
+                s.hold[0],
+                s.hold[1],
+                s.hold[2]
+            )?;
+            super::params::tune::show(f)?;
+        }
         let p = &self.engine.prof;
         writeln!(
             f,

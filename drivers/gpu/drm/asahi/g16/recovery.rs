@@ -126,7 +126,7 @@ impl Firmware {
     }
 
     pub(crate) fn recovery_pending(&self) -> Result<bool> {
-        Ok(self.recovery.running || self.new_recovery() || self.firmware_r32(logic::PHASE)? != 0)
+        Ok(self.recovery.running || self.new_recovery() || self.firmware_r32(self.init.firmware_data().phase)? != 0)
     }
 
     pub(crate) fn recovery_idle(&self) -> Result<bool> {
@@ -288,16 +288,18 @@ impl Firmware {
 
     fn firmware_generation(&self) -> Result<u64> {
         // The firmware is stopped while its published generation is consumed.
-        let lo = self.firmware_r32(logic::GENERATION)?;
-        let hi = self.firmware_r32(logic::GENERATION + 4)?;
+        let generation = self.init.firmware_data().generation;
+        let lo = self.firmware_r32(generation)?;
+        let hi = self.firmware_r32(generation + 4)?;
         Ok(u64::from(lo) | (u64::from(hi) << 32))
     }
 
     /// Resolve the snapshot while the firmware is stopped. A missing retained
     /// owner prevents acknowledgement: its failure cannot safely be attributed.
     fn mark_recovery(&mut self, stage: [u32; 3], event: u32, asid: Option<u32>) -> Result {
-        for i in 0..logic::SNAPSHOT_ENTRIES {
-            let offset = logic::SNAPSHOT + i * 8;
+        let data = self.init.firmware_data();
+        for i in 0..data.snapshot_entries {
+            let offset = data.snapshot + i * 8;
             let flags = self.firmware_r32(offset)?;
             let target = self.firmware_r32(offset + 4)?;
             let Some(entry) = SnapshotEntry::decode(flags, target) else {
@@ -320,6 +322,9 @@ impl Firmware {
         }
         self.recovery.running = true;
         self.engine.frozen = true;
+        // A recovery may reset what the firmware keeps for a bound PB epoch, also one whose
+        // render was not affected: start the next render on each pass slot fresh.
+        self.pools.invalidate();
         self.events.grow.clear();
         // These frontiers must be captured before the host answers 2: the
         // firmware can force the stage target while aborting a work item.
@@ -343,7 +348,7 @@ impl Firmware {
                 dev_err!(self.dev(), "M4 GPU recovery exceeded 1000 ms\n");
                 return Err(ETIMEDOUT);
             }
-            let phase = self.firmware_r32(logic::PHASE)?;
+            let phase = self.firmware_r32(self.init.firmware_data().phase)?;
             let current_generation = if phase == 1 || phase == 3 {
                 self.firmware_generation()?
             } else {
@@ -373,13 +378,13 @@ impl Firmware {
                     self.mark_recovery(stage, event, asid)?;
                     // Snapshot reads and all TPC repairs precede acknowledgement.
                     barrier();
-                    self.firmware_w32(logic::PHASE, 2)?;
+                    self.firmware_w32(self.init.firmware_data().phase, 2)?;
                     barrier();
                     answered = true;
                 }
                 RecoveryAction::Resume => {
                     barrier();
-                    self.firmware_w32(logic::PHASE, 0)?;
+                    self.firmware_w32(self.init.firmware_data().phase, 0)?;
                     barrier();
                     self.recovery.recoveries += 1;
                     self.recovery.errors_seen = self.events.errors;

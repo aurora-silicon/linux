@@ -167,6 +167,10 @@ module! {
             // permissions: 0o644,
             description: "Initial TVB size in blocks",
         },
+        g16_pb_reuse: u32 {
+            default: 1,
+            description: "G16 parameter buffer: 1 = reuse a pass slot's last retired epoch for the same VM while the slot is still bound to it (default), 0 = a fresh epoch and InitBM per render",
+        },
         robust_isolation: u32 {
             default: 0,
             // permissions: 0o644,

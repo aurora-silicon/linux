@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! M4/J713 cold admission and the qualified 25G83 firmware start sequence.
+//! M4/J713 cold admission and the firmware start sequence (25G83; 26B123 once its unknowns are
+//! known).
 //!
 //! The Rust owner validates firmware identity and all inherited regions before publication,
 //! holds the PMP AGX vote, prepares owned objects and publishes context0 while ASC RUN is clear.
 //! It negotiates RTKit protocol12, accepts only the inherited EP1 crash buffer, then submits
-//! initdata plus NOP0x1a and policy0x34/0x0a. Control+0x14 and exact retired indices qualify
-//! READY; no M3 firmware constants or device-control sequence are reused.
+//! initdata plus the consume-only NOP and policy (re-import Globals, start; 0x1a, 0x34 and
+//! 0x0a on 25G83, 0x19, 0x35 and 0x0a on 26B123). Control+0x14 and exact retired indices
+//! qualify READY; no M3 firmware constants or device-control sequence are reused.
 //! Firmware-reachable backing and the RTKit cookie remain retained until reboot.
 
 use core::ffi::c_void;
@@ -25,9 +27,8 @@ use kernel::{
 use super::adt::{self, GpuAdt};
 use super::channel::{self, Channel, Channels};
 use super::event::Events;
-use super::fw::channels::{devctl, DevCtl};
-use super::fw::initdata::control;
-use super::hw;
+use super::fw::channels::DevCtl;
+use super::hw::{self, LoaderTable};
 use super::initdata::{self, InitData};
 use super::object::Objects;
 use super::{regs, uat, Config, Shared};
@@ -43,6 +44,7 @@ pub(crate) mod glue {
     extern "C" {
         fn asahi_g16_board() -> bool;
         fn asahi_g16_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+        fn asahi_g16_perf_rows() -> core::ffi::c_uint;
         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
         fn asahi_g16_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
@@ -60,7 +62,7 @@ pub(crate) mod glue {
         ) -> core::ffi::c_int;
     }
 
-    /// A qualified J713/T8132 board.
+    /// A qualified T8132 board (J713, J773g).
     pub(crate) fn board() -> bool {
         // SAFETY: Reads the machine compatible strings only.
         unsafe { asahi_g16_board() }
@@ -70,6 +72,12 @@ pub(crate) mod glue {
     pub(crate) fn display_prepare(dev: &device::Device) -> Result {
         // SAFETY: `dev` is the bound GPU device; the helper only adds a device link.
         kernel::error::to_result(unsafe { asahi_g16_display_prepare(dev.as_raw().cast()) })
+    }
+
+    /// The firmware DVFS row count qualified for this board, or zero.
+    pub(crate) fn perf_rows() -> usize {
+        // SAFETY: Reads the machine compatible strings only.
+        unsafe { asahi_g16_perf_rows() as usize }
     }
 
     /// Holds the GFX power domain for the retained session.
@@ -409,7 +417,7 @@ impl Session {
         self.shared.check()?;
         if !self.rtkit.running()
             || self.regs.asc_control()? & regs::ASC_RUN == 0
-            || self.regs.pstate()? > 9
+            || self.regs.pstate()? > self.regs.top()
         {
             return Err(EIO);
         }
@@ -495,7 +503,25 @@ pub(crate) fn admit(
         cfg.firmware,
     )
     .inspect_err(|e| dev_err!(dev, "loaded GFX TEXT identity mismatch: {:?}\n", e))?;
-    dev_info!(dev, "M4: firmware identity accepted\n");
+    dev_info!(
+        dev,
+        "M4: firmware identity accepted ({} layout)\n",
+        adt.layout.name
+    );
+    // Refuse a firmware whose start needs something not known yet before anything is held.
+    let mut unknown = false;
+    for what in adt.layout.unknown() {
+        dev_err!(
+            dev,
+            "G16: the {} firmware cannot be started yet; not known: {}\n",
+            adt.layout.name,
+            what
+        );
+        unknown = true;
+    }
+    if unknown {
+        return Err(ENOTSUPP);
+    }
     // Firmware objects are cleaned to the point of coherency by their DMA mapping: that needs
     // a device that is not DMA-coherent, as the synthesized node is.
     if glue::dma_unsupported(dev) {
@@ -584,6 +610,28 @@ fn wait_boot_control(
     }
 }
 
+/// Writes the register-map records into the firmware's table in loaded DATA, which must be
+/// empty on cold entry. This is the only host write to the loaded DATA segment.
+fn publish_loader_table(session: &Session, init: &InitData, offset: u64) -> Result {
+    let table = init.loader_bytes();
+    let loader = regs::Mapping::write_combined(session.adt.data.start + offset, table.len())?;
+    for _ in 0..2 {
+        for offset in (0..table.len()).step_by(4) {
+            if loader.io().try_read32(offset)? != 0 {
+                return Err(EBUSY);
+            }
+        }
+        regs::rmb();
+    }
+    for (i, word) in table.chunks_exact(4).enumerate() {
+        loader
+            .io()
+            .try_write32(u32::from_le_bytes(word.try_into().unwrap()), i * 4)?;
+    }
+    regs::wmb();
+    Ok(())
+}
+
 /// Wake the sole firmware instance, publish its loader table, then qualify NOP and policy.
 fn run(
     session: &mut Session,
@@ -619,25 +667,16 @@ fn run(
         channels.drain_rings(&dev, events)?;
         session.check()?;
     }
+    let devctl = init.abi.devctl();
     session.regs.set_generation(0)?;
-    channels.stage_boot_nop(session)?;
-    // This table is the only host write to the loaded DATA segment. It is empty on cold entry.
-    let table = init.loader_bytes();
-    let loader = regs::Mapping::write_combined(session.adt.data.start + 0x1332f0, table.len())?;
-    for _ in 0..2 {
-        for offset in (0..table.len()).step_by(4) {
-            if loader.io().try_read32(offset)? != 0 {
-                return Err(EBUSY);
-            }
-        }
-        regs::rmb();
+    channels.stage_boot_nop(session, devctl.nop)?;
+    match session.adt.layout.loader_table {
+        Some(LoaderTable::Host(offset)) => publish_loader_table(session, init, offset)?,
+        // The firmware copies the register map from HW data while it parses InitData.
+        Some(LoaderTable::Firmware) => {}
+        // Admission refuses such a layout; never guess here.
+        None => return Err(ENOTSUPP),
     }
-    for (i, word) in table.chunks_exact(4).enumerate() {
-        loader
-            .io()
-            .try_write32(u32::from_le_bytes(word.try_into().unwrap()), i * 4)?;
-    }
-    regs::wmb();
     let root = init.root_va()?;
     session.send(
         hw::ep::FIRMWARE,
@@ -645,15 +684,16 @@ fn run(
     )?;
     session.send(hw::ep::DOORBELL, 0x0083000000000011)?;
     wait_boot_control(session, channels, events, init, 1, 5000)?;
-    devctl_op(session, channels, events, init, devctl::IMPORT_GLOBALS)?;
+    devctl_op(session, channels, events, init, devctl.import_globals)?;
     wait_boot_control(session, channels, events, init, 2, 2000)?;
     let scheduler = init.control.as_ref().ok_or(EINVAL)?;
-    if scheduler.r32(control::SCHEDULER)? != 0 {
+    let scheduler_word = init.firmware_data().scheduler;
+    if scheduler.r32(scheduler_word)? != 0 {
         return Err(EBUSY);
     }
-    scheduler.w32(control::SCHEDULER, 1)?;
+    scheduler.w32(scheduler_word, 1)?;
     regs::wmb();
-    devctl_op(session, channels, events, init, devctl::START)?;
+    devctl_op(session, channels, events, init, devctl.start)?;
     wait_boot_control(session, channels, events, init, 3, 2000)?;
     session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
     for _ in 0..10 {
@@ -667,7 +707,7 @@ fn run(
     if channels.devctl.read()? != 3
         || channels.devctl.completion()? != 3
         || channels.devctl.write()? != 3
-        || scheduler.r32(control::SCHEDULER)? != 0
+        || scheduler.r32(scheduler_word)? != 0
     {
         return Err(EBUSY);
     }
@@ -730,7 +770,7 @@ pub(crate) fn start(
         "M4 G16G: {} cores enabled\n",
         id.core_masks[0].count_ones()
     );
-    if regs.pstate()? > 9 {
+    if regs.pstate()? > regs.top() {
         return Err(eproto());
     }
     // Cold only: ASC RUN clear and an all-zero TTBAT before ownership.
@@ -779,6 +819,10 @@ pub(crate) fn start(
         events.reserve()?;
         // Every host object and every context-0 alias is prepared before RUN is set.
         built = Some(initdata::build(&d, &session.adt, &mut objects)?);
+        if let Some((init, _, _)) = built.as_ref() {
+            // The running firmware may report any state of the board's table, up to S10 on J773g.
+            session.regs.set_table(init.rows);
+        }
         objects.window.lock().bootstrap(&d, &session.uat)?;
         uat::tlbi_all();
         if session.regs.asc_control()? & regs::ASC_RUN != 0 {
@@ -790,6 +834,7 @@ pub(crate) fn start(
         if session.regs.asc_control()? & regs::ASC_RUN == 0 {
             return Err(EIO);
         }
+        objects.window.lock().await_firmware_magic(&d)?;
         run(&mut session, &mut events, built.as_mut().ok_or(EINVAL)?)
     })();
     if let Err(e) = result {
