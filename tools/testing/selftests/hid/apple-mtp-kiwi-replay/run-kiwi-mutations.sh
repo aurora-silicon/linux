@@ -17,12 +17,10 @@ elif [ -f "$H/shim/linux-shim.h" ]; then
 elif [ -f "$H/../shim/linux-shim.h" ]; then
 	SHIM=$H/../shim
 else
-	echo "cannot locate replay.c under $H" >&2
+	echo "cannot locate linux-shim.h near $H" >&2
 	exit 2
 fi
-R=${R:-$(cd "$H/../.." && pwd)/kiwi}
-DRIVE=${DRIVE:-$R/drv/hid-apple-mtp-kiwi.c}
-[ -f "$DRIVE" ] || DRIVE=$(cd "$H/.." && pwd)/hid-apple-mtp-kiwi.c
+DRIVE=${DRIVE:-$(cd "$H/../../../../.." && pwd)/drivers/hid/hid-apple-mtp-kiwi.c}
 RUN=${RUN:-/tmp/kiwi-mut}
 BASE=${BASE:-$H/baseline2.c}   # frozen unhardened driver, sha in the log
 mkdir -p "$RUN"

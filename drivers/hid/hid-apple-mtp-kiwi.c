@@ -36,6 +36,7 @@
 #include <linux/hid.h>
 #include <linux/input/mt.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 
@@ -45,10 +46,10 @@
 #define KIWI_COLS		82
 #define KIWI_ROWS		54
 #define KIWI_CELLS		(KIWI_COLS * KIWI_ROWS)
-#define KIWI_MIN_FRAME		(KIWI_HDR_LEN + 2 * KIWI_CELLS)
+#define KIWI_FRAME_SIZE		17861
 #define KIWI_MAGIC		0x5a
 #define KIWI_MAX_SLOTS		10
-/* eDP-1 panel of the k114c, 3024x1986. */
+/* K114c is the only qualified panel and frame format. */
 #define KIWI_MAX_X		3023
 #define KIWI_MAX_Y		1985
 /* Panel is about 10 units per mm. */
@@ -120,7 +121,8 @@ struct kiwi {
 
 static bool kiwi_match(struct hid_device *hdev, bool ignore_special_drivers)
 {
-	return hdev->bus == BUS_HOST && !strcmp(hdev->name, "Apple MTP kiwi");
+	return hdev->bus == BUS_HOST && !strcmp(hdev->name, "Apple MTP kiwi") &&
+	       of_machine_is_compatible("apple,k114c");
 }
 
 /*
@@ -703,7 +705,7 @@ static int kiwi_raw_event(struct hid_device *hdev, struct hid_report *report,
 {
 	struct kiwi *k = hid_get_drvdata(hdev);
 
-	if (size >= KIWI_MIN_FRAME && data[0] == KIWI_MAGIC)
+	if (size == KIWI_FRAME_SIZE && data[0] == KIWI_MAGIC)
 		kiwi_frame(k, data);
 	return 0;
 }

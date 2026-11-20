@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # kiwi replay harness: build and run against a given driver file.
 # usage: run-kiwi-replay.sh /path/to/hid-apple-mtp-kiwi.c [OUTDIR]
-# works from the committed tree dir (drivers/hid/apple-mtp-kiwi-replay) and
-# from the scratch layout (kiwi/replay with a sibling shim/); real captures
-# come from $CAPS when that directory exists, else only the synthetics run.
+# Use CAPS to supply real captures. Without it, run synthetic captures only.
 set -e
 DRV=$1
 OUT=${2:-/tmp/kiwi-replay}
@@ -20,7 +18,7 @@ elif [ -f "$H/shim/linux-shim.h" ]; then
 elif [ -f "$H/../shim/linux-shim.h" ]; then
 	SHIM=$H/../shim
 else
-	echo "cannot locate replay.c under $H" >&2
+	echo "cannot locate linux-shim.h near $H" >&2
 	exit 2
 fi
 CAPS=${CAPS:-$H/../kiwi-caps}

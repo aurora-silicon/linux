@@ -156,6 +156,16 @@ config HID_APPLE_MTP_HAPTIC
 	  This driver can also be built as a module. If so, it will be called
 	  hid-apple-mtp-haptic.
 
+config HID_APPLE_MTP_KIWI
+	tristate "Apple MTP Kiwi touchscreen"
+	depends on HID_DOCKCHANNEL
+	help
+	  Support the K114c touchscreen on the DockChannel HID transport.
+	  Decode the K114c sensor grid and report direct multitouch events
+	  through the input subsystem. Other board layouts are not supported.
+
+	  The module is called hid-apple-mtp-kiwi.
+
 config HID_APPLEIR
 	tristate "Apple infrared receiver"
 	depends on (USB_HID)
