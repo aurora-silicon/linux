@@ -1136,6 +1136,8 @@ static bool cd321x_identity_known(const struct usb_pd_identity *id)
 	return memchr_inv(id, 0, sizeof(*id));
 }
 
+static void cd321x_macos_usbw(struct cd321x *cd321x);
+
 static void cd321x_update_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
@@ -1151,6 +1153,7 @@ static void cd321x_update_work(struct work_struct *work)
 	guard(mutex)(&tps->lock);
 	if (!cd321x_pm_can_update(&cd321x->pm))
 		return;
+	cd321x_macos_usbw(cd321x);
 
 	st = cd321x->update_status;
 	cd321x->update_status.status_changed = 0;
@@ -1518,6 +1521,73 @@ static void cd321x_queue_status(struct cd321x *cd321x)
 	cd321x->update_status.usb4_status = cd321x->usb4_status;
 }
 
+static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state);
+
+/*
+ * J714s: what macOS sends a port controller when its cable goes and comes (traced on the Dell
+ * monitor's port). 60 ms after the detach: SYS_PWR_STATE read (0x00), DATA1 = 0x02 and SSPS. At
+ * the attach: the events and status read, then DATA1 = 0x00 and SSPS; ~530 ms later
+ * SYS_PWR_STATE read twice, DATA1 = 0x00 and USBw. Linux sent neither outside a sleep, so after a
+ * cable change the controller was left as the change left it. Here: SSPS 0x02 at a detach, SSPS
+ * 0x00 at an attach and USBw 0x00 at the update after the attach's debounce (500 ms), on every
+ * SN201202x of the J714s, only while running (not in a sleep's phases).
+ */
+static bool macos_attach = true;
+module_param(macos_attach, bool, 0644);
+MODULE_PARM_DESC(macos_attach, "J714s SN201202x: SSPS 2 at a detach, SSPS 0 and USBw 0 at an attach, as macOS does (0: neither)");
+
+#define TIPD_SSPS_MACOS_DETACHED	0x02
+/*
+ * 28 ms after the detach and before its SSPS, macOS writes register 0x50 with 64 bytes, 00 20 and
+ * 62 zeros, and reads it back as all zeros from 3 ms later. Its function is not known; it is
+ * written as macOS writes it.
+ */
+#define TIPD_REG_MACOS_DETACH		0x50
+
+static bool cd321x_macos_cable_on(struct cd321x *cd321x)
+{
+	return READ_ONCE(macos_attach) && cd321x->pm.phase == CD321X_PM_RUNNING &&
+	       device_is_compatible(cd321x->tps.dev, "apple,sn201202x") &&
+	       of_machine_is_compatible("apple,j714s");
+}
+
+static void cd321x_macos_cable(struct cd321x *cd321x, bool attached)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	int ret;
+
+	if (!cd321x_macos_cable_on(cd321x))
+		return;
+	lockdep_assert_held(&tps->lock);
+	if (!attached) {
+		u8 reg50[TPS_MAX_LEN] = { 0x00, 0x20 };
+
+		ret = tps6598x_block_write(tps, TIPD_REG_MACOS_DETACH, reg50, sizeof(reg50));
+		dev_info(tps->dev, "cable detach: register 0x50 = 00 20 + 62 zeros: %d\n", ret);
+	}
+	ret = cd321x_switch_power_state(tps, attached ? TPS_SYSTEM_POWER_STATE_S0 :
+							TIPD_SSPS_MACOS_DETACHED);
+	cd321x->macos_usbw_due = attached;
+	dev_info(tps->dev, "cable %s: SSPS %#x: %d\n", attached ? "attach" : "detach",
+		 attached ? TPS_SYSTEM_POWER_STATE_S0 : TIPD_SSPS_MACOS_DETACHED, ret);
+}
+
+static void cd321x_macos_usbw(struct cd321x *cd321x)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	u8 mode = 0x00;
+	int ret;
+
+	lockdep_assert_held(&tps->lock);
+	if (!cd321x->macos_usbw_due)
+		return;
+	cd321x->macos_usbw_due = false;
+	if (!cd321x_macos_cable_on(cd321x))
+		return;
+	ret = tipd_usbw_locked(tps, mode);
+	dev_info(tps->dev, "cable attach: USBw %#x after the debounce: %d\n", mode, ret);
+}
+
 static int cd321x_connect(struct tps6598x *tps, u32 status)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
@@ -1547,6 +1617,8 @@ static int cd321x_connect(struct tps6598x *tps, u32 status)
 
 	if (plug_changed)
 		cd321x_pm_new_connection(&cd321x->pm);
+	if (plug_changed)
+		cd321x_macos_cable(cd321x, status & TPS_STATUS_PLUG_PRESENT);
 	tps->status = status;
 	cd321x_queue_status(cd321x);
 	/* A plug or power IRQ alone does not refresh the cached cable metadata. */
@@ -3956,6 +4028,18 @@ EXPORT_SYMBOL_GPL(tipd_remove);
 #define TIPD_USBW_HIGH_SPEED	0x09
 #define TIPD_USBW_HAND_BACK	0x80
 #define TIPD_USBW_OFF		0x00
+
+/*
+ * USBw with the port lock held. CMD1 is read with the sleep's SSPS gaps (CD321X_SSPS_READ_GAP_US):
+ * read back to back, a J714s controller's USBw ends late or not within its limit (1 s), where
+ * macOS sees it end in 9-16 ms.
+ */
+int tipd_usbw_locked(struct tps6598x *tps, u8 mode)
+{
+	lockdep_assert_held(&tps->lock);
+	return tps6598x_exec_cmd_gap(tps, "USBw", sizeof(mode), &mode, 0, NULL, 1000, 0,
+				     CD321X_SSPS_READ_GAP_US);
+}
 
 static void tipd_usbw(struct tps6598x *tps, u8 mode)
 {

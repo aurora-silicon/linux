@@ -489,6 +489,8 @@ struct cd321x {
 	/* A plug was in when the sleep began, and a wake's first port state is still to be applied */
 	bool sleep_plug;
 	bool wake_apply;
+	/* J714s: macOS's USBw 0x00 after an attach is due at the next update */
+	bool macos_usbw_due;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
@@ -543,6 +545,7 @@ int tipd_suspend(struct tps6598x *tps);
 int tipd_resume(struct tps6598x *tps);
 void tipd_poll_stop(struct tps6598x *tps);
 void tipd_poll_start(struct tps6598x *tps);
+int tipd_usbw_locked(struct tps6598x *tps, u8 mode);
 
 /* Internal to tps6598x-core */
 int tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len);
