@@ -52,6 +52,7 @@ use crate::{
 };
 
 use core::sync::atomic::{
+    AtomicBool,
     AtomicU64,
     Ordering, //
 };
@@ -66,6 +67,107 @@ mod render;
 
 fn can_submit_inline(dependencies_ready: bool, previous_status: Option<i32>) -> bool {
     dependencies_ready && previous_status.is_none_or(|status| status != 0)
+}
+
+/// TVB state that a queue shares with its render jobs.
+struct TvbShared {
+    /// Sequence number of the last render job that carried a slot init and failed in `run()`
+    /// before any of its commands reached the firmware, or 0.
+    lost_init: AtomicU64,
+}
+
+/// What a render job knows about the TVB buffer it uses.
+struct TvbJob {
+    shared: Arc<TvbShared>,
+    /// This job's render sequence number on its queue (from 1).
+    seq: u64,
+    /// Sequence number of the render job whose slot init this job relies on (`seq` if it carries
+    /// the init itself), or 0 if no init was needed since the queue was created.
+    init_seq: u64,
+    /// Set by `run()` before the job's first command is published to the firmware.
+    published: AtomicBool,
+}
+
+impl TvbJob {
+    fn carries_init(&self) -> bool {
+        self.init_seq != 0 && self.init_seq == self.seq
+    }
+
+    /// Whether the slot init this job relies on never reached the firmware.
+    fn init_lost(&self) -> bool {
+        init_was_lost(self.shared.lost_init.load(Ordering::Acquire), self.init_seq)
+    }
+
+    /// Called when `run()` fails. An init carrier that published nothing lost its init.
+    fn note_run_failed(&self) {
+        if self.carries_init() && !self.published.load(Ordering::Acquire) {
+            self.shared.lost_init.store(self.seq, Ordering::Release);
+        }
+    }
+}
+
+/// Whether the init carried by render job `init_seq` is the one that `lost_init` reports lost.
+fn init_was_lost(lost_init: u64, init_seq: u64) -> bool {
+    init_seq != 0 && lost_init == init_seq
+}
+
+/// A render submission as the TVB grow sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TvbUse {
+    /// Its finished fence has not signalled.
+    Pending,
+    /// It completed without error: it and every render before it are done.
+    Done,
+    /// It failed in `run()` before any command reached the firmware.
+    FailedUnpublished,
+    /// It failed after some of its commands reached the firmware. Nothing signals when those
+    /// retire (the job's other commands were rolled back), so only a later clean completion
+    /// proves them done.
+    FailedPublished,
+}
+
+impl TvbUse {
+    fn from_status(status: i32, published: bool) -> Self {
+        match status {
+            0 => Self::Pending,
+            1.. => Self::Done,
+            _ if published => Self::FailedPublished,
+            _ => Self::FailedUnpublished,
+        }
+    }
+}
+
+/// Drops the entries of `users` (oldest first, as classified by `seen`) that cannot hold the TVB
+/// any more: a clean completion proves itself and every older entry done (renders complete in
+/// order on the fragment queue), an entry that failed before reaching the firmware never held it.
+/// Pending entries stay, and of the entries that failed after reaching the firmware the newest one
+/// stays (it stands in for the older ones, since whatever proves it done proves them done too).
+fn prune_tvb_uses<T>(users: &mut KVec<T>, seen: impl Fn(&T) -> TvbUse) {
+    if let Some(done) = users.iter().rposition(|u| seen(u) == TvbUse::Done) {
+        users.drain(..=done);
+    }
+    let newest_failed = users
+        .iter()
+        .rposition(|u| seen(u) == TvbUse::FailedPublished);
+    let mut index = 0;
+    users.retain(|u| {
+        let keep = match seen(u) {
+            TvbUse::Pending => true,
+            TvbUse::FailedPublished => Some(index) == newest_failed,
+            TvbUse::Done | TvbUse::FailedUnpublished => false,
+        };
+        index += 1;
+        keep
+    });
+}
+
+/// An entry of [`Queue::ver::tvb_users`].
+struct TvbUser {
+    /// Finished fence of the submission.
+    fence: Fence,
+    job: Arc<TvbJob>,
+    /// The state last read by [`Queue::ver::prune_tvb_users`].
+    seen: TvbUse,
 }
 
 /// Trait implemented by all versioned queues.
@@ -163,12 +265,19 @@ pub(crate) struct Queue {
     stats: Arc<stats::StatsSnapshot>,
     /// Finished fence of the last submitted job, waited for when the queue goes away.
     last_out: Option<Fence>,
-    /// Finished fences of the submissions with a render that may still use the TVB buffer: those
-    /// after the newest one that completed without error. See [`Queue::ver::wait_tvb_idle`].
-    tvb_users: KVec<Fence>,
-    /// The TVB grew since the last render this queue published, so the next render must
-    /// re-initialise the buffer slot. Cleared only once a render with that init is pushed.
+    /// The submissions with a render that may still use the TVB buffer: those after the newest one
+    /// that completed without error. See [`Queue::ver::wait_tvb_idle`].
+    tvb_users: KVec<TvbUser>,
+    /// The TVB grew (or the render that re-initialised its slot never reached the firmware), so the
+    /// next render must re-initialise the buffer slot. Cleared once a render with that init is
+    /// pushed.
     tvb_init_pending: bool,
+    /// Shared with this queue's render jobs: reports a slot init that never reached the firmware.
+    tvb_shared: Arc<TvbShared>,
+    /// Sequence number of the last render job pushed (0 before the first).
+    tvb_seq: u64,
+    /// Sequence number of the render job that carried the newest slot init, or 0.
+    tvb_init_seq: u64,
 }
 
 #[versions(AGX)]
@@ -242,6 +351,8 @@ pub(crate) struct QueueJob {
     /// Zero until the ioctl tries publication, one for success, or a negative
     /// errno for a failed attempt. The scheduler consumes the recorded result.
     inline_result: i32,
+    /// For a job with a render: the TVB slot init it relies on and whether it reached the firmware.
+    tvb: Option<Arc<TvbJob>>,
     id: u64,
 }
 
@@ -365,6 +476,17 @@ impl sched::JobImpl for QueueJob::ver {
             };
         }
 
+        // A render that relies on a slot init which never reached the firmware would tile with a
+        // stale slot. Fail it before publishing anything; the next submission re-initialises.
+        if job.tvb.as_ref().is_some_and(|tvb| tvb.init_lost()) {
+            cls_pr_debug!(
+                Errors,
+                "QueueJob {}: Cancelled, its TVB slot init never reached the firmware\n",
+                job.id
+            );
+            return Err(ECANCELED);
+        }
+
         mod_dev_dbg!(job.dev, "QueueJob {}: Running Job\n", job.id);
 
         // We can only increase the notifier threshold here, now that we are
@@ -413,10 +535,13 @@ impl sched::JobImpl for QueueJob::ver {
         // above. Deferring the increment to submit solves the race.
         let dev = job.dev.clone();
         let Some(guard) = dev.registration_guard() else {
+            if let Some(tvb) = job.tvb.as_ref() {
+                tvb.note_run_failed();
+            }
             return Err(ENODEV);
         };
 
-        guard.registration_data_with(|reg_data| {
+        let ret = guard.registration_data_with(|reg_data| {
             let gpu = match reg_data
                 .gpu
                 .clone()
@@ -473,7 +598,11 @@ impl sched::JobImpl for QueueJob::ver {
                 raw.increase(job.notification_count);
             });
 
-            // Now we fully commit to running the job
+            // Now we fully commit to running the job. From here on the firmware may see the
+            // job's commands (`run_job()` publishes them before it rings the doorbell).
+            if let Some(tvb) = job.tvb.as_ref() {
+                tvb.published.store(true, Ordering::Release);
+            }
             mod_dev_dbg!(job.dev, "QueueJob {}: Run fragment\n", job.id);
             frag_sub.map(|a| gpu.run_job(a)).transpose()?;
 
@@ -491,7 +620,13 @@ impl sched::JobImpl for QueueJob::ver {
             core::mem::drop(frag_job);
 
             Ok(Some(Fence::from_fence(&job.fence)))
-        })
+        });
+        if ret.is_err() {
+            if let Some(tvb) = job.tvb.as_ref() {
+                tvb.note_run_failed();
+            }
+        }
+        ret
     }
 
     fn timed_out(job: &mut QueueTimeout, _finished: bool) -> sched::Status {
@@ -606,6 +741,14 @@ impl Queue::ver {
             last_out: None,
             tvb_users: KVec::new(),
             tvb_init_pending: false,
+            tvb_shared: Arc::new(
+                TvbShared {
+                    lost_init: AtomicU64::new(0),
+                },
+                GFP_KERNEL,
+            )?,
+            tvb_seq: 0,
+            tvb_init_seq: 0,
             inner: QueueInner::ver {
                 dev: dev.clone(),
                 ualloc,
@@ -774,19 +917,16 @@ impl Queue::ver {
         }
     }
 
-    /// Drops the entries of [`Self::tvb_users`] that no longer show a possible TVB user.
-    ///
-    /// Renders complete in order on the fragment queue, and a submission's finished fence covers
-    /// all of its commands, so a submission that completed without error proves that every render
-    /// submitted before it is done: it and all older entries go. A fence that signalled with an
-    /// error proves nothing about the submissions before it (it may have failed in `run()` before
-    /// reaching the firmware while they still run), so only that entry goes and the older ones
-    /// stay. What is left is pending.
+    /// Drops the entries of [`Self::tvb_users`] that can no longer be using the TVB buffer (see
+    /// [`prune_tvb_uses`]). Each entry's fence status is read once per call.
     fn prune_tvb_users(&mut self) {
-        if let Some(done) = self.tvb_users.iter().rposition(|f| fence_status(f) == 1) {
-            self.tvb_users.drain(..=done);
+        for user in self.tvb_users.iter_mut() {
+            user.seen = TvbUse::from_status(
+                fence_status(&user.fence),
+                user.job.published.load(Ordering::Acquire),
+            );
         }
-        self.tvb_users.retain(|f| fence_status(f) == 0);
+        prune_tvb_uses(&mut self.tvb_users, |user| user.seen);
     }
 
     /// Waits until no earlier submission of this queue can still be using its TVB buffer.
@@ -795,12 +935,25 @@ impl Queue::ver {
     /// run long (or wait on its own in-fences), and the scheduler's timeout covers a hung job. A
     /// signal returns `ERESTARTSYS`. Nothing of the current submission is published yet when this
     /// runs, so the ioctl restarts cleanly.
+    ///
+    /// If the newest such submission failed after some of its work reached the firmware, nothing
+    /// will signal when that work retires, so the buffer cannot be proven idle and this returns
+    /// `ECANCELED` (the submission that needs the growth fails, the buffer is left alone).
     fn wait_tvb_idle(&mut self) -> Result {
         loop {
             self.prune_tvb_users();
-            let Some(fence) = self.tvb_users.last().cloned() else {
+            let Some(user) = self.tvb_users.last() else {
                 return Ok(());
             };
+            if user.seen == TvbUse::FailedPublished {
+                cls_pr_debug!(
+                    Errors,
+                    "submit: TVB cannot grow: render {} failed after reaching the firmware\n",
+                    user.job.seq
+                );
+                return Err(ECANCELED);
+            }
+            let fence = user.fence.clone();
             wait_fence(&fence, true, kernel::task::MAX_SCHEDULE_TIMEOUT)?;
         }
     }
@@ -924,6 +1077,15 @@ impl Queue for Queue::ver {
         // The size the overflow statistics ask for is folded in, so that growth from them also
         // happens on a busy queue, with one wait per growth step (3x each).
         if nr_render > 0 {
+            // The render that carried the newest slot init failed before reaching the firmware,
+            // and the renders after it that rely on that init fail in `run()` too. Nothing on the
+            // firmware uses the slot since then, so this render initialises it again.
+            if init_was_lost(
+                self.tvb_shared.lost_init.load(Ordering::Acquire),
+                self.tvb_init_seq,
+            ) {
+                self.tvb_init_pending = true;
+            }
             let cur_blocks = self.inner.buffer.block_count() as usize;
             let stats_blocks = self.inner.buffer.stats_target_blocks();
             let want_blocks = max_tvb_blocks.max(stats_blocks.unwrap_or(0));
@@ -993,6 +1155,20 @@ impl Queue for Queue::ver {
             .into();
 
         let mut init_slot = self.tvb_init_pending;
+        let tvb = if nr_render > 0 {
+            let seq = self.tvb_seq + 1;
+            Some(Arc::new(
+                TvbJob {
+                    shared: self.tvb_shared.clone(),
+                    seq,
+                    init_seq: if init_slot { seq } else { self.tvb_init_seq },
+                    published: AtomicBool::new(false),
+                },
+                GFP_KERNEL,
+            )?)
+        } else {
+            None
+        };
 
         let mut job = self.entity.new_job(
             1,
@@ -1022,6 +1198,8 @@ impl Queue for Queue::ver {
                 notification_count: (2 * nr_render) + nr_compute,
 
                 inline_result: 0,
+
+                tvb: tvb.clone(),
 
                 id,
             },
@@ -1210,11 +1388,20 @@ impl Queue for Queue::ver {
         );
         job.push();
 
-        if nr_render > 0 {
-            // The first render of the job carries the slot init, if one was pending.
-            self.tvb_init_pending = false;
+        if let Some(tvb) = tvb {
+            self.tvb_seq = tvb.seq;
+            if tvb.carries_init() {
+                // The first render of the job carries the slot init.
+                self.tvb_init_pending = false;
+                self.tvb_init_seq = tvb.seq;
+            }
             self.prune_tvb_users();
-            if self.tvb_users.push_within_capacity(out_fence.clone()).is_err() {
+            let user = TvbUser {
+                fence: out_fence.clone(),
+                job: tvb,
+                seen: TvbUse::Pending,
+            };
+            if self.tvb_users.push_within_capacity(user).is_err() {
                 // The space was reserved above and pruning only removes entries.
                 unreachable!("push_within_capacity() failed after reserve()");
             }
@@ -1241,7 +1428,63 @@ impl Queue for Queue::ver {
 
 #[kunit_tests(asahi_legacy_inline_queue)]
 mod tests {
-    use super::can_submit_inline;
+    use super::{can_submit_inline, init_was_lost, prune_tvb_uses, TvbUse};
+    use kernel::prelude::*;
+
+    use TvbUse::{Done, FailedPublished as FailPub, FailedUnpublished as FailUnpub, Pending};
+
+    fn pruned(uses: &[TvbUse]) -> KVec<TvbUse> {
+        let mut v = KVec::new();
+        for u in uses {
+            v.push(*u, GFP_KERNEL).expect("alloc");
+        }
+        prune_tvb_uses(&mut v, |u| *u);
+        v
+    }
+
+    #[test]
+    fn tvb_use_from_fence_status() {
+        assert_eq!(TvbUse::from_status(0, false), Pending);
+        assert_eq!(TvbUse::from_status(0, true), Pending);
+        assert_eq!(TvbUse::from_status(1, true), Done);
+        assert_eq!(TvbUse::from_status(-125, false), FailUnpub);
+        assert_eq!(TvbUse::from_status(-22, true), FailPub);
+    }
+
+    #[test]
+    fn tvb_clean_completion_proves_older_renders() {
+        assert_eq!(&pruned(&[FailPub, Pending, Done, Pending])[..], &[Pending]);
+        assert!(pruned(&[Pending, Done]).is_empty());
+    }
+
+    #[test]
+    fn tvb_unpublished_failure_drops_only_itself() {
+        assert_eq!(
+            &pruned(&[Pending, FailUnpub, Pending])[..],
+            &[Pending, Pending]
+        );
+        assert!(pruned(&[FailUnpub]).is_empty());
+    }
+
+    #[test]
+    fn tvb_published_failure_stays_until_proven() {
+        // Never dropped on its own, and the newest one stands in for the older ones.
+        assert_eq!(&pruned(&[FailPub])[..], &[FailPub]);
+        assert_eq!(
+            &pruned(&[FailPub, Pending, FailPub, FailUnpub])[..],
+            &[Pending, FailPub]
+        );
+        // A later clean completion proves it done.
+        assert!(pruned(&[FailPub, Done]).is_empty());
+    }
+
+    #[test]
+    fn tvb_lost_init_matches_only_its_carrier() {
+        assert!(!init_was_lost(0, 0));
+        assert!(!init_was_lost(5, 0));
+        assert!(init_was_lost(5, 5));
+        assert!(!init_was_lost(5, 7));
+    }
 
     #[test]
     fn depth_192_only_publishes_the_idle_head_inline() {
