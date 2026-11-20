@@ -3107,6 +3107,10 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
 /// the DART's DAPF programmed and its windows reserved alongside the firmware
 /// segments.
 const HW_CFG_T8132: AopHwConfig = HW_CFG_T6040;
+/// T8122 (M3): as T6040. iBoot leaves the AOP halted with its external code,
+/// data and log in DRAM, which the bootloader reserves in `memory-region`;
+/// the 27.2 firmware reads its `__EDATA` base from `ED0p`.
+const HW_CFG_T8122: AopHwConfig = HW_CFG_T6040;
 /// T8140: the firmware is started with the boot arguments the bootloader
 /// left, boots through the setup port and speaks EPIC version 4. Of the
 /// advertised AFK endpoints, the application map is 0x20 misc, 0x21
@@ -3233,6 +3237,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t8103-aop")), &HW_CFG_T8103),
         (of::DeviceId::new(c_str!("apple,t8112-aop")), &HW_CFG_T8112),
         (of::DeviceId::new(c_str!("apple,t6000-aop")), &HW_CFG_T6000),
+        (of::DeviceId::new(c_str!("apple,t8122-aop")), &HW_CFG_T8122),
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
         (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6040),
