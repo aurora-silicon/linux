@@ -2612,8 +2612,13 @@ impl Vm {
     }
 
     /// Status shared by every queue using this VM, if enabled by its GPU.
-    /// Charges kernel memory sized by this VM's client to `client` ([`Self::memory_client`]).
+    /// Charges kernel memory sized by this VM's client to `client` ([`Self::memory_client`]),
+    /// starting with the VM's page tables.
     pub(crate) fn with_memory_client(mut self, client: Arc<crate::memacct::Client>) -> Self {
+        self.gpuvm.lock_inner().page_table.charge_to(crate::memacct::Usage::new(
+            &crate::memacct::LEDGER,
+            client.clone(),
+        ));
         self.memory = Some(client);
         self
     }
