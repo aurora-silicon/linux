@@ -239,10 +239,15 @@ allOf:
                 then:
                   properties:
                     reg:
-                      minItems: 3
+                      minItems: 2
                       maxItems: 3
+                      description:
+                        The engine inside the SCODEC block also has the
+                        SCODEC system window (aux). A second engine outside
+                        it, such as apr1 on T6041, has only core and
+                        wrapper.
                     reg-names:
-                      minItems: 3
+                      minItems: 2
                       maxItems: 3
                     interrupts:
                       maxItems: 1
