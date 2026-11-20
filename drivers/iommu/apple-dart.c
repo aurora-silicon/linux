@@ -4562,9 +4562,9 @@ static void apple_dart_get_fw_resv_regions(struct device *dev,
  * there, map elsewhere or disagree keeps its protection, and the attach then
  * refuses it as before.
  */
-static void apple_dart_j713_v27_fw_prot(struct device *dev, struct list_head *head)
+static void __apple_dart_j713_v27_fw_prot(struct apple_dart_master_cfg *cfg, struct device *dev,
+					  struct list_head *head)
 {
-	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	const int mask = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE;
 	struct iommu_resv_region *region;
 	struct apple_dart *dart;
@@ -4639,6 +4639,11 @@ static void apple_dart_j713_v27_fw_prot(struct device *dev, struct list_head *he
 		}
 	}
 	memunmap(root);
+}
+
+static void apple_dart_j713_v27_fw_prot(struct device *dev, struct list_head *head)
+{
+	__apple_dart_j713_v27_fw_prot(dev_iommu_priv_get(dev), dev, head);
 }
 
 static void apple_dart_get_resv_regions(struct device *dev,
