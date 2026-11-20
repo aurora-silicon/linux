@@ -217,6 +217,8 @@ struct apple_soc_cpufreq_info {
 	u64 cur_pstate_shift;
 	u64 ps1_mask;
 	u64 ps1_shift;
+	/* Report the clock the cluster PLL runs at, see apple_soc_cpufreq_pll_rate() */
+	bool cur_from_pll;
 };
 
 struct apple_cpu_priv {
@@ -284,6 +286,21 @@ static const struct apple_soc_cpufreq_info soc_t8112_info = {
 	.cur_pstate_shift = APPLE_DVFS_STATUS_CUR_PS_SHIFT_T8112,
 	.ps1_mask = APPLE_DVFS_CMD_PS1,
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+};
+
+/*
+ * T8122 has T8112's DVFS block, but the status register's current-state field
+ * keeps the requested state while the hardware holds the P cores below it with
+ * three or four of them busy. The PLL factor follows the real clock.
+ */
+static const struct apple_soc_cpufreq_info soc_t8122_info = {
+	.has_ps2 = false,
+	.max_pstate = 31,
+	.cur_pstate_mask = APPLE_DVFS_STATUS_CUR_PS_T8112,
+	.cur_pstate_shift = APPLE_DVFS_STATUS_CUR_PS_SHIFT_T8112,
+	.ps1_mask = APPLE_DVFS_CMD_PS1,
+	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+	.cur_from_pll = true,
 };
 
 /*
@@ -374,6 +391,10 @@ static const struct of_device_id apple_soc_cpufreq_of_match[] __maybe_unused = {
 		.data = &soc_t8112_info,
 	},
 	{
+		.compatible = "apple,t8122-cluster-cpufreq",
+		.data = &soc_t8122_info,
+	},
+	{
 		.compatible = "apple,t8132-cluster-cpufreq",
 		.data = &soc_t8132_info,
 	},
@@ -405,6 +426,30 @@ static u32 apple_soc_cpufreq_timeout(const struct apple_soc_cpufreq_info *info)
 	return info->transition_timeout_us ?: APPLE_DVFS_TRANSITION_TIMEOUT;
 }
 
+/*
+ * The frequency-table entry nearest to the cluster PLL's output: the 12 MHz
+ * reference times the factor's multiplier over its divider plus one. 0 when
+ * the factor reads as unprogrammed.
+ */
+static unsigned int apple_soc_cpufreq_pll_rate(struct cpufreq_policy *policy,
+					       struct apple_cpu_priv *priv)
+{
+	u32 reg = readl_relaxed(priv->reg_base + APPLE_DVFS_PLL_FACTOR);
+	u32 mult = FIELD_GET(APPLE_DVFS_PLL_FACTOR_MULT, reg);
+	u32 div = FIELD_GET(APPLE_DVFS_PLL_FACTOR_DIV, reg) + 1;
+	struct cpufreq_frequency_table *p;
+	unsigned int khz, best = 0;
+
+	if (!mult)
+		return 0;
+	khz = 12000 * mult / div;
+	cpufreq_for_each_valid_entry(p, policy->freq_table)
+		if (!best || abs((int)p->frequency - (int)khz) <
+			     abs((int)best - (int)khz))
+			best = p->frequency;
+	return best;
+}
+
 static unsigned int apple_soc_cpufreq_get_rate(unsigned int cpu)
 {
 	struct cpufreq_policy *policy;
@@ -417,6 +462,13 @@ static unsigned int apple_soc_cpufreq_get_rate(unsigned int cpu)
 		return 0;
 
 	priv = policy->driver_data;
+
+	if (priv->info->cur_from_pll) {
+		unsigned int freq = apple_soc_cpufreq_pll_rate(policy, priv);
+
+		if (freq)
+			return freq;
+	}
 
 	if (priv->info->cur_pstate_mask) {
 		u32 reg = readl_relaxed(priv->reg_base + APPLE_DVFS_STATUS);
