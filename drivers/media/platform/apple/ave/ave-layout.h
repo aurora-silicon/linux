@@ -387,7 +387,7 @@ extern const struct ave_fw_abi ave_abi_9003, ave_abi_6070;
 extern const struct ave_fw_layout ave_layout_9003_78_0;
 extern const struct ave_fw_layout ave_layout_6070_11_1;
 /* Not selectable until its loader TEXT CRC is measured and qualified. */
-extern const struct ave_fw_layout ave_layout_26a428;
+extern const struct ave_fw_layout ave_layout_26a428, ave_layout_26b123;
 const struct ave_fw_layout *ave_layout_for_crc(u32 crc);
 
 #endif
