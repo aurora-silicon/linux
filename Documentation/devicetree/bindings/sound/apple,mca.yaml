@@ -110,6 +110,17 @@ properties:
   '#sound-dai-cells':
     const: 1
 
+  apple,rx-bclk-inverted-clusters:
+    description:
+      Indices of clusters whose receive serializers sample on the opposite
+      bit clock edge to the one selected by the DAI format. The transmit
+      serializers keep the edge specified by the DAI format.
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 6
+    items:
+      maximum: 5
+
 required:
   - compatible
   - reg
