@@ -447,8 +447,7 @@ This governor exposes two tunables:
 ``busy_boost_us``
 	Time (in microseconds) a CPU has to run without entering its idle loop
 	before the governor requests the highest frequency for it, until it
-	idles again (default: as the scaling driver suggests, 0 if it does not;
-	0 means never).
+	idles again (default: 0, which means never).
 
 	Frequency-invariant utilization of a task that starts running flat out
 	grows only as fast as the CPU it runs on is clocked, so from a low
