@@ -2336,25 +2336,18 @@ impl SepData {
     }
 
     pub(crate) fn finish_keystore_bringup(&self) {
-        if module_parameters::provision_keybag.value() != 0 {
-            if module_parameters::xart_writes.value() == 0 {
-                dev_err_ratelimited!(
-                    self.dev,
-                    "bringup: provision_keybag=1 requires xart_writes=1\n"
-                );
-                return;
-            }
-            if !self.sks_provision_identity_keybag() {
-                dev_err_ratelimited!(
-                    self.dev,
-                    "bringup: identity-keybag provisioning failed; no retry this boot\n"
-                );
-                diag::keybag(diag::Keybag::Failed);
-                return;
-            }
-            // Either one was already persisted or one has just been.
-            diag::keybag(diag::Keybag::Present);
+        // Always: an existing identity keybag is kept and nothing is written;
+        // a missing one is created.
+        if !self.sks_provision_identity_keybag() {
+            dev_err_ratelimited!(
+                self.dev,
+                "bringup: identity-keybag provisioning failed; no retry this boot\n"
+            );
+            diag::keybag(diag::Keybag::Failed);
+            return;
         }
+        // Either one was already persisted or one has just been.
+        diag::keybag(diag::Keybag::Present);
         if let Err(e) = self.register_bio() {
             dev_err_ratelimited!(
                 self.dev,
@@ -5829,7 +5822,8 @@ impl SepData {
             self.write_lockout_state(arg)?;
             return bio::ok();
         }
-        // With xART writes off the enclave cannot persist what an enrolment or
+        // With the xART store read-only (the key-store-only initrd phase, or a
+        // failed writable reopen) the enclave cannot persist what an enrolment or
         // a match changes. It saves anti-replay state after every match, and a
         // refused save has left it unresponsive until reboot. Refuse the
         // capture instead; attach and the read-only ioctls still work.
@@ -5837,7 +5831,7 @@ impl SepData {
             if !self.capture_refusal_logged().xchg(true, Relaxed) {
                 dev_warn_ratelimited!(
                     self.dev,
-                    "Touch ID: enrol and verify need xart_writes=1; the enclave saves anti-replay state after every match and stops responding when that save is refused\n"
+                    "Touch ID: enrol and verify need a writable xART store, and it is read-only now; the enclave saves anti-replay state after every match and stops responding when that save is refused\n"
                 );
             }
             return Err(EROFS);
@@ -5884,12 +5878,12 @@ impl SepData {
 
         if handled.delete_identity.is_some() || !handled.delete_identities.is_empty() {
             // A deletion is made durable by saving the Catacombs, and with
-            // xART writes off that save would be refused. Refuse before 0x57
+            // the xART store read-only that save would be refused. Refuse before 0x57
             // rather than report a deletion that the next boot undoes.
             if !self.xart_writable() {
                 dev_warn_ratelimited!(
                     self.dev,
-                    "Touch ID: deleting a fingerprint needs xart_writes=1; with writes off the deletion would not survive a reboot\n"
+                    "Touch ID: deleting a fingerprint needs a writable xART store, and it is read-only now; the deletion would not survive a reboot\n"
                 );
                 return Err(EROFS);
             }

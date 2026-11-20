@@ -3601,6 +3601,32 @@ static void t6050_wake_source_report(struct apple_sleep *s)
 			dev_info(s->dev, "wake status set: GFX %u\n", b);
 }
 
+/* Only the SMC's lines are latched: its own wake, whatever else was armed. */
+static bool t6050_smc_woke_alone(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	u32 smc[T6050_WAKE_WORDS] = {};
+	unsigned int i;
+	bool any = false;
+
+	if (!r || !r->wake || !r->wake_gfx || r->wake_status[T6050_WAKE_WORDS])
+		return false;
+	for (i = 0; i < ARRAY_SIZE(t6050_wake_names); i++) {
+		u32 id = t6050_wake_names[i].id;
+
+		if (strstarts(t6050_wake_names[i].name, "SMC.") &&
+		    id / 32 < T6050_WAKE_WORDS)
+			smc[id / 32] |= BIT(id % 32);
+	}
+	for (i = 0; i < T6050_WAKE_WORDS; i++) {
+		if (r->wake_status[i] & ~smc[i])
+			return false;
+		any |= !!r->wake_status[i];
+	}
+
+	return any;
+}
+
 static void t6050_sleep_wake_regs(struct apple_sleep *s)
 {
 	struct apple_sleep_region_state *r = s->region;

@@ -122,6 +122,8 @@ struct dcp_v27_sleep {
 	bool display_early;	/* the display DART's lease taken and stopped at the prepare */
 	/* External: the wake's two calls are owed; the pipe state the driver tracked before. */
 	bool ext_wake, ext_pipe;
+	/* External: a dark wake skipped the wake's replug; the next resume, or the sleep's end, owes it. */
+	bool ext_dark_owed;
 	/* External: the queue of the calls that follow an interface's opening. */
 	struct workqueue_struct *ext_wq;
 	bool ext_wq_owned;
@@ -729,9 +731,14 @@ static void dcp_v27_ext_replug(struct apple_dcp *dcp, bool wake)
 
 	if (!dcp_v27_external(dcp))
 		return;
-	/* A dark wake sleeps again at once: nothing is plugged for it. */
-	if (wake && pm_dark_wake())
+	/* A dark wake sleeps again at once: nothing is plugged for it, until a resume or the end. */
+	if (wake && pm_dark_wake()) {
+		if (s)
+			s->ext_dark_owed = true;
 		return;
+	}
+	if (s && wake)
+		s->ext_dark_owed = false;
 	dcp_fabric_sleep_done(dcp);
 	if (!s || !(wake ? s->ext_wake : s->ext_torn))
 		return;
@@ -1671,7 +1678,23 @@ static int dcp_v27_sleep_resume(struct apple_dcp *dcp)
 	dcp_v27_ext_replug(dcp, !ret);
 	return ret;
 }
+
+/*
+ * The sleep is over, and the last wake was a dark one whose re-entry was refused before this
+ * processor suspended again: no resume made the replug the dark wake skipped. Make it now.
+ */
+static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp)
+{
+	struct dcp_v27_sleep *s = dcp->sleep_v27;
+
+	if (!s || !s->ext_dark_owed || pm_dark_wake())
+		return;
+	dev_info(dcp->dev, "ext %u: a dark wake ended without sleeping again: the wake's replug now\n",
+		 dcp_v27_ext_nr(dcp));
+	dcp_v27_ext_replug(dcp, true);
+}
 #else
+static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp) { }
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp) { return false; }
 static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp) { }
 static int dcp_v27_sleep_suspend(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
