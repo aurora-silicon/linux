@@ -1022,6 +1022,14 @@ static void apple_smc_dark_wake(struct apple_smc *smc)
 	const char *why = is_radio ? "wifibt" : "USB-C_plug";
 	s64 asleep_ms;
 
+	/* The J714s's rule alone: other boards with a sleep policy keep these wakes full. */
+	if (smc->wake_reasons != apple_smc_j714s_wake_reasons)
+		return;
+	/* Already dark (a port's wake with the lid closed): counted, so the re-entry waits as after ours. */
+	if (pm_dark_wake()) {
+		smc->dark_wakes++;
+		return;
+	}
 	if (!is_radio && (port < 0 || smc->wake_record != BIT_ULL(port)))
 		return;
 	asleep_ms = ktime_ms_delta(ktime_get_boottime(), smc->sleep_entry_boot) -
