@@ -5503,6 +5503,42 @@ err_destroy_pdev:
 	return ret;
 }
 
+/*
+ * The realtime bandwidth slot: usually a window of its own, at index
+ * @expected right after the "disp-N" ones (returns 1). A T8132 DCP describes
+ * the PMC window that holds its slot as its last display window instead
+ * (disp-4, the ADT's dispN reg[4]), and apple,bw-scratch names that index:
+ * the slot is then an offset into that window, which the firmware already
+ * maps, and no window is added (returns 0).
+ */
+static int dcp_get_bw_scratch_in_window(struct apple_dcp *dcp,
+					struct of_phandle_args *ph_args,
+					u32 addr_idx, u32 disp_idx, u32 offset)
+{
+	struct resource *win = dcp->disp_registers[disp_idx];
+	struct resource slot;
+	u64 addr;
+	int ret;
+
+	ret = of_address_to_resource(ph_args->np, addr_idx, &slot);
+	if (ret < 0) {
+		dev_err(dcp->dev, "Failed to get 'apple,bw-scratch' resource %d from %pOF\n",
+			addr_idx, ph_args->np);
+		return ret;
+	}
+	addr = slot.start + offset;
+	if (offset > resource_size(&slot) - 4 || addr < win->start ||
+	    addr + 4 > win->end + 1) {
+		dev_err(dcp->dev, "'apple,bw-scratch' %#llx is outside display window %u %pR\n",
+			addr, disp_idx, win);
+		return -EINVAL;
+	}
+	dcp->disp_bw_scratch_res = *win;
+	dcp->disp_bw_scratch_index = disp_idx;
+	dcp->disp_bw_scratch_offset = addr - win->start;
+	return 0;
+}
+
 static int dcp_get_bw_scratch_reg(struct apple_dcp *dcp, u32 expected)
 {
 	struct of_phandle_args ph_args;
@@ -5527,6 +5563,11 @@ static int dcp_get_bw_scratch_reg(struct apple_dcp *dcp, u32 expected)
 	disp_idx = ph_args.args[1];
 	offset = ph_args.args[2];
 
+	if (disp_idx && disp_idx < expected) {
+		ret = dcp_get_bw_scratch_in_window(dcp, &ph_args, addr_idx,
+						   disp_idx, offset);
+		goto err_of_node_put;
+	}
 	if (disp_idx != expected || disp_idx >= MAX_DISP_REGISTERS) {
 		dev_err(dcp->dev, "Unexpected disp_reg value in 'apple,bw-scratch': %d\n",
 			disp_idx);
@@ -5548,7 +5589,7 @@ static int dcp_get_bw_scratch_reg(struct apple_dcp *dcp, u32 expected)
 	dcp->disp_registers[disp_idx] = &dcp->disp_bw_scratch_res;
 	dcp->disp_bw_scratch_index = disp_idx;
 	dcp->disp_bw_scratch_offset = offset;
-	ret = 0;
+	ret = 1;
 
 err_of_node_put:
 	of_node_put(ph_args.np);
@@ -5680,7 +5721,7 @@ static int dcp_get_disp_regs(struct apple_dcp *dcp)
 	ret = dcp_get_bw_scratch_reg(dcp, count);
 	if (ret < 0)
 		return ret;
-	count += 1;
+	count += ret;
 
 	/* load pmgr bandwidth doorbell resource if present (only on t8103) */
 	if (of_property_present(dcp->dev->of_node, "apple,bw-doorbell")) {
