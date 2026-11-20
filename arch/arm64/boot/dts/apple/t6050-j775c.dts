@@ -4469,6 +4469,7 @@
 			status = "disabled";
 		};
 
+		/* Not on J775c: its ADT has no /arm-io/mtp and no MTP dockchannel (there is no internal keyboard or trackpad). */
 		mailbox@294608000 {
 			compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
 			reg = <0x02 0x94608000 0x00 0x4000>;
@@ -4477,6 +4478,7 @@
 			interrupt-names = "send-empty" , "send-not-empty" , "recv-empty" ,
 				"recv-not-empty" ;
 			#mbox-cells = <0x00>;
+			status = "disabled";
 		};
 
 		/* Keep disabled: activating this MTP DART failed board qualification. */
@@ -4489,6 +4491,7 @@
 			status = "disabled";
 		};
 
+		/* Not on J775c: its ADT has no /arm-io/mtp and no MTP dockchannel (there is no internal keyboard or trackpad). */
 		mtp@294600000 {
 			compatible = "apple,t6050-mtp" , "apple,t6050-rtk-helper-asc4" , "apple,mtp"
 				, "apple,rtk-helper-asc4" ;
@@ -4497,8 +4500,10 @@
 			mboxes = <&{/soc/mailbox@294608000}>;
 			iommus = <&{/soc/iommu@294800000} 0x00>;
 			#helper-cells = <0x00>;
+			status = "disabled";
 		};
 
+		/* Not on J775c: its ADT has no /arm-io/mtp and no MTP dockchannel (there is no internal keyboard or trackpad). */
 		fifo@294b14000 {
 			compatible = "apple,t6050-dockchannel", "apple,dockchannel";
 			reg = <0x02 0x94b14000 0x00 0x1000>;
@@ -4510,6 +4515,7 @@
 			#size-cells = <0x01>;
 			interrupt-controller;
 			#interrupt-cells = <0x02>;
+			status = "disabled";
 		};
 
 		sep@502600000 {
