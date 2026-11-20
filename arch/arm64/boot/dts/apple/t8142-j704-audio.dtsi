@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Pro (14-inch, M5) J704: sound through the AOP firmware, the
+ * headphone jack and the microphone array only.
+ *
+ * The J704 ADT matches J813's audio wiring: the AOP (ascwrap-v6, mailbox
+ * IRQs 490-493), dart-aop, admac-base-ns (IRQ 549) and admac-leap-s
+ * (IRQ 551) at the same addresses, the CS42L84 jack codec at i2c1 0x4b
+ * (IRQ AP pin 100, reset nub pin 18) and the three-microphone "audio-hp-mic"
+ * LEAP stream. So this reuses J813's description, as J815 does.
+ *
+ * The speakers are six SN012776 on i2c3 (0x38-0x3d), but in a different
+ * order than J815's (ADT: 0x39 left woofer 2, 0x3a left tweeter, 0x3c right
+ * woofer 2, 0x3d right tweeter). Until their slots and a speaker protection
+ * profile are verified, neither the amplifiers nor their i2c3 bus are
+ * described: their driver never binds and they stay in shutdown.
+ */
+
+#include "t8142-j813-audio.dtsi"
+
+&aop_audio {
+	/* The microphone card's name: AppleJ704HPAI. */
+	apple,chassis-name = "J704";
+	apple,machine-kind = "MacBook Pro";
+};
+
+/delete-node/ &speaker_left_woofer;
+/delete-node/ &speaker_left_tweeter;
+/delete-node/ &speaker_right_woofer;
+/delete-node/ &speaker_right_tweeter;
+/* Nothing else is on the speakers' bus. */
+/delete-node/ &i2c3;
+
+/ {
+	sound {
+		compatible = "apple,j704-macaudio", "apple,macaudio";
+		model = "MacBook Pro J704";
+
+		/delete-node/ dai-link@1;
+	};
+};
