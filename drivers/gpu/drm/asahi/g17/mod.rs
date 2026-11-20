@@ -2569,13 +2569,18 @@ impl gpu::Gpu for Gpu {
         true
     }
 
-    /// The G17 runtime never programs fault_control into the firmware, so unmapped reads are not
-    /// guaranteed to return zero. Advertising soft faults made Mesa point out-of-bounds vec3/vec4
-    /// vertex fetches at address 0 and skip bounds checks on bounded loads; on T6040 those reads
-    /// returned non-zero data (2026-10-19: every robustness2 rgba32 vertex_attribute_fetch case
-    /// failed; all pass with soft faults off).
+    /// T6040 (M4 Pro) does not program `fault_control` into the firmware, so unmapped reads can
+    /// return non-zero data and every robustness2 rgba32 vertex_attribute_fetch case failed there
+    /// with soft faults enabled. On T6050 G17C (M5 Max), queues enable soft-fault zeroing in the
+    /// queue configuration (`m5::queue::ConfigProfile::soft_fault_enabled` and `QueueConfig::UNK_66`),
+    /// and unmapped reads return zero without faulting.
+    ///
+    /// On G17, `aurora.fault_control` is only an advertisement override: setting it to a value
+    /// other than `0xb` clears `DRM_ASAHI_FEATURE_SOFT_FAULTS` without changing queue records.
     fn supports_soft_faults(&self) -> bool {
-        false
+        self.cfg.chip_id == 0x6050
+            && self.cfg.identity.gpu_variant == crate::hw::GpuVariant::C
+            && crate::module_parameters::fault_control.value() == 0xb
     }
 
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {

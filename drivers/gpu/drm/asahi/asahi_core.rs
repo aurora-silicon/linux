@@ -160,7 +160,7 @@ module! {
         fault_control: u32 {
             default: 0xb,
             // permissions: 0,
-            description: "Fault control (0x0: hard faults, 0xb: macOS default)",
+            description: "Fault control (0x0: hard faults, 0xb: default; on G17 overrides only SOFT_FAULTS advertisement)",
         },
         initial_tvb_size: usize {
             default: 0x8,
