@@ -18,7 +18,11 @@ were built with DTC_FLAGS=-@.
 
 Without --baseline-dtb-dir every finding fails. With it, only findings that the
 baseline DTBs do not have fail, so the existing ones can be burnt down while no
-new DART lands without its domain.
+new DART lands without its domain. A DTB that the baseline does not have (a new
+board, or a variant such as t8112-j413-fw27 that includes its board's .dts)
+inherits the findings of the baseline DTBs of its SoC: a finding with the same
+node path, DART compatible and problem in any of them is not new. Anything the
+new DTB adds still is.
 """
 
 import argparse
@@ -28,6 +32,7 @@ import struct
 import sys
 
 DART = re.compile(r"apple,.*dart")
+SOC = re.compile(r"apple,[st]\d{4}$")
 EXEMPT = (
     (re.compile(r"apple,sep$"), "SEP"),
     (re.compile(r"apple,(t\d+-)?aop$"), "AOP"),
@@ -35,7 +40,8 @@ EXEMPT = (
 
 
 def findings(filename):
-    """Yield (path, label, compatible, status, problem) for one DTB."""
+    """Yield the DTB's SoC compatible (or None), then (path, label, compatible,
+    status, problem) for each finding."""
     import libfdt
 
     NF = (libfdt.NOTFOUND,)
@@ -63,6 +69,9 @@ def findings(filename):
 
     def status(offset):
         return (strings(prop(offset, "status")) or ["okay"])[0]
+
+    soc = [c for c in strings(prop(0, "compatible")) if SOC.match(c)]
+    yield soc[0] if soc else None
 
     phandles = {fdt.get_phandle(o): o for o in nodes if fdt.get_phandle(o)}
     labels = {}
@@ -120,11 +129,13 @@ def collect(directory):
     dtbs = sorted(Path(directory).glob("*.dtb"))
     if not dtbs:
         raise SystemExit("%s: no DTBs" % directory)
-    result = {}
+    result, socs = {}, {}
     for dtb in dtbs:
-        for path, label, compatible, status, problem in findings(dtb):
+        found = findings(dtb)
+        socs[dtb.stem] = next(found)
+        for path, label, compatible, status, problem in found:
             result[(dtb.stem, path, problem)] = (label, compatible, status)
-    return result
+    return result, socs
 
 
 def main():
@@ -137,23 +148,36 @@ def main():
                         help="list every finding and exemption, never fail")
     args = parser.parse_args()
 
-    head = collect(args.dtb_dir)
-    base = collect(args.baseline_dtb_dir) if args.baseline_dtb_dir else {}
-    failing = 0
+    head, head_socs = collect(args.dtb_dir)
+    base, base_socs = collect(args.baseline_dtb_dir) if args.baseline_dtb_dir else ({}, {})
+    # What a DTB the baseline lacks may inherit: the baseline findings of its SoC.
+    inheritable = {}
+    for (board, path, problem), (_, compatible, _) in sorted(base.items()):
+        if base_socs[board]:
+            inheritable.setdefault((base_socs[board], path, compatible, problem), board)
+    failing = inherited = 0
     for key in sorted(head):
         board, path, problem = key
         label, compatible, status = head[key]
         exempt = problem.startswith("exempt")
         new = not exempt and (not args.baseline_dtb_dir or key not in base)
+        origin = None
+        if new and args.baseline_dtb_dir and board not in base_socs and head_socs[board]:
+            origin = inheritable.get((head_socs[board], path, compatible, problem))
+        if origin:
+            new = False
+            inherited += 1
         if args.report or new:
             print("%s %s %s %s %s: %s%s" % (board, path, label, compatible, status, problem,
-                                            " (new)" if new and args.baseline_dtb_dir else ""))
+                                            " (new)" if new and args.baseline_dtb_dir else
+                                            " (inherited from %s)" % origin if origin else ""))
         failing += new
     counted = ("exempt",)
     gone = [k for k in base if k not in head and not k[2].startswith(counted)]
     total = sum(1 for k in head if not k[2].startswith(counted))
-    print("DARTs without a usable power domain: %d, new: %d, fixed: %d" %
-          (total, failing if args.baseline_dtb_dir else total, len(gone)),
+    print("DARTs without a usable power domain: %d, new: %d, inherited by new DTBs: %d, "
+          "fixed: %d" % (total, failing if args.baseline_dtb_dir else total, inherited,
+                         len(gone)),
           file=sys.stderr)
     return 0 if args.report or not failing else 1
 
