@@ -60,10 +60,14 @@ pub(crate) mod raw {
         #[ver(V < V13_0B4 || G >= G14X)]
         pub(crate) unk_1c: u32,
 
-        /// 27.2: a second page list pointer, read by the firmware's buffer setup.
+        /// 27.2: the page list as the firmware sees it (it fills the list from `block_list`).
         #[ver(V >= V27_2)]
-        pub(crate) page_list_fw: GpuPointer<'a, &'a [u32]>,
+        pub(crate) page_list_fw: U64,
+        /// 27.2: the same page list in the client's address space, for the hardware.
+        #[ver(V >= V27_2)]
+        pub(crate) page_list_gpu: U64,
 
+        #[ver(V < V27_2)]
         pub(crate) page_list: GpuPointer<'a, &'a [u32]>,
         pub(crate) page_list_size: u32,
         pub(crate) page_count: AtomicU32,

@@ -293,6 +293,9 @@ impl Drop for Scene::ver {
 #[versions(AGX_ROOT)]
 struct BufferInner {
     info: GpuObject<buffer::Info::ver>,
+    /// 27.2: the page list object and its firmware and client mappings.
+    #[ver(V >= V27_2)]
+    _page_list: (crate::gem::ObjectRef, mmu::KernelMapping, mmu::KernelMapping),
     ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
     ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
     blocks: KVec<GpuOnlyArray<u8>>,
@@ -311,6 +314,9 @@ struct BufferInner {
     preempt3_size: usize,
     num_clusters: usize,
 }
+
+/// Kernel addresses for 27.2 page lists (above the timestamp range, below MMIO).
+const PAGE_LIST_KERNEL_RANGE: core::ops::Range<u64> = 0xffffffae20000000..0xffffffae80000000;
 
 /// Locked and reference counted TVB buffer.
 #[versions(AGX_ROOT)]
@@ -349,11 +355,31 @@ impl Buffer::ver {
         let preempt2_size = num_clusters_adj * gpu.get_cfg().preempt2_size;
         let preempt3_size = num_clusters_adj * gpu.get_cfg().preempt3_size;
 
-        // Firmware 27.2 rebuilds the page list itself, so both lists must be visible to it, not
-        // only to the GPU in the client's address space.
+        // Firmware 27.2 builds the page list itself from the block list and hands the list's
+        // address to the hardware: one object, mapped for the firmware (kernel) and for the
+        // hardware (the client's address space, below 2^40).
+        #[ver(V >= V27_2)]
+        let page_list_dual = {
+            let bytes = (max_pages * 4 + mmu::UAT_PGMSK) & !mmu::UAT_PGMSK;
+            let dev = alloc.shared.device();
+            let mut obj = crate::gem::new_kernel_object(&dev, bytes)?;
+            {
+                let vmap = obj.vmap()?;
+                use kernel::io::Io;
+                for off in (0..bytes).step_by(4) { vmap.try_write32(0, off)?; }
+            }
+            let (kvm, _krange, kprot) = alloc.shared.placement();
+            let kmap = obj.map_into_range(&kvm, PAGE_LIST_KERNEL_RANGE, mmu::UAT_PGSZ as u64, kprot, true)?;
+            let (uvm, urange, uprot) = ualloc_priv.lock().placement();
+            // The top of the client's firmware-private range, which its heap reaches last.
+            let top = urange.end.saturating_sub(0x400_0000).max(urange.start);
+            let umap = obj.map_into_range(&uvm, top..urange.end, mmu::UAT_PGSZ as u64, uprot, true)?;
+            if umap.iova() >= 1 << 40 { return Err(EINVAL); }
+            (obj, kmap, umap)
+        };
         #[ver(V >= V27_2)]
         let (page_list, block_list) = (
-            alloc.shared.array_empty_tagged(max_pages, b"PLST")?,
+            alloc.shared.array_empty_tagged(1, b"PLST")?,
             alloc.shared.array_empty_tagged(max_blocks * 2, b"BLST")?,
         );
         #[ver(V < V27_2)]
@@ -361,6 +387,11 @@ impl Buffer::ver {
             ualloc_priv.lock().array_empty_tagged(max_pages, b"PLST")?,
             ualloc_priv.lock().array_empty_tagged(max_blocks * 2, b"BLST")?,
         );
+        #[ver(V >= V27_2)]
+        let page_list_va = (page_list_dual.1.iova(), page_list_dual.2.iova());
+        #[ver(V < V27_2)]
+        let page_list_va = (0u64, 0u64);
+        let _ = page_list_va;
         let shared = &mut alloc.shared;
         let info = alloc.private.new_init(
             {
@@ -384,7 +415,10 @@ impl Buffer::ver {
                     #[ver(V < V13_0B4 || G >= G14X)]
                     unk_1c: 0x0,
                     #[ver(V >= V27_2)]
-                    page_list_fw: inner.page_list.gpu_pointer(),
+                    page_list_fw: U64(page_list_va.0),
+                    #[ver(V >= V27_2)]
+                    page_list_gpu: U64(page_list_va.1),
+                    #[ver(V < V27_2)]
                     page_list: inner.page_list.gpu_pointer(),
                     page_list_size: (4 * max_pages).try_into()?,
                     page_count: AtomicU32::new(0),
@@ -393,7 +427,10 @@ impl Buffer::ver {
                     unk_38: 0x0,
                     block_list: inner.block_list.gpu_pointer(),
                     block_ctl: inner.block_ctl.gpu_pointer(),
+                    #[ver(V < V27_2)]
                     last_page: AtomicU32::new(0),
+                    #[ver(V >= V27_2)]
+                    last_page: AtomicU32::new(u32::MAX),
                     #[ver(V < V27_2)]
                     gpu_page_ptr1: 0x0,
                     #[ver(V < V27_2)]
@@ -451,6 +488,8 @@ impl Buffer::ver {
             inner: Arc::pin_init(
                 new_mutex!(BufferInner::ver {
                     info,
+                    #[ver(V >= V27_2)]
+                    _page_list: page_list_dual,
                     ualloc,
                     ualloc_priv,
                     blocks: KVec::new(),
@@ -565,6 +604,8 @@ impl Buffer::ver {
                 .push(block, GFP_KERNEL)
                 .expect("push() failed after reserve()");
             inner.info.block_list[2 * (cur_count + i)] = page_num;
+            // 27.2: the firmware fills the page list from the block list.
+            #[ver(V < V27_2)]
             for j in 0..PAGES_PER_BLOCK {
                 inner.info.page_list[(cur_count + i) * PAGES_PER_BLOCK + j] = page_num + j as u32;
             }
@@ -576,7 +617,13 @@ impl Buffer::ver {
         });
 
         /* Only do this update if the buffer manager is idle (which means we own it) */
-        if inner.active_scenes == 0 {
+        // 27.2: the firmware advances the page count itself when the setup command sees new
+        // blocks in the block control.
+        #[ver(V >= V27_2)]
+        let host_counts = false;
+        #[ver(V < V27_2)]
+        let host_counts = true;
+        if host_counts && inner.active_scenes == 0 {
             let page_count = (new_count * PAGES_PER_BLOCK) as u32;
             inner.info.with(|raw, _inner| {
                 raw.page_count.store(page_count, Ordering::Relaxed);

@@ -706,6 +706,16 @@ pub(crate) struct HeapAllocator {
 }
 
 impl HeapAllocator {
+    /// The `Vm`, address range and protection this heap maps into.
+    pub(crate) fn placement(&self) -> (mmu::Vm, Range<u64>, mmu::Prot) {
+        (self.vm.clone(), self.range.clone(), self.prot)
+    }
+
+    /// The device this heap allocates for.
+    pub(crate) fn device(&self) -> AsahiDevRef {
+        self.dev.clone()
+    }
+
     /// Create a new HeapAllocator for a given `Vm` and address range.
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
