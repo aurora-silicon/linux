@@ -1610,6 +1610,68 @@ static void program_pool_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->count, sent + 2);
 }
 
+/* The add-128 source 1 base record: [0x4d10, 0x4d14], relocated on BAR slot 6. */
+#define ADD128_SRC1 (0x4d10 / 4 | 1 << 15 | BIT(29) | 6 << 23)
+
+/*
+ * Run the LOAD checks of the add-128 program with its source 1 base record
+ * header and offset replaced. The operation section binds x, y, z to slots
+ * 6, 7, 8; source 1 reads 128 rows of 0x100 bytes, all 32 KiB of x.
+ */
+static int add128_dma_load(struct kunit *test, u32 header, u64 offset)
+{
+	struct ane_h16_process_binding bindings[ANE_H16_SURFACES], scratch = {};
+	struct ane_h16_hwx_snapshot *snapshot = kunit_kzalloc(test, sizeof(*snapshot),
+							      GFP_KERNEL);
+	u8 *hwx = sparse_bytes(test, add128_hwx_runs, ARRAY_SIZE(add128_hwx_runs),
+			       ADD128_HWX_SIZE);
+	u8 *generic = sparse_bytes(test, add128_generic_runs, ARRAY_SIZE(add128_generic_runs),
+				   ADD128_GENERIC_SIZE);
+	u8 *operation = sparse_bytes(test, add128_operation_runs,
+				     ARRAY_SIZE(add128_operation_runs), ADD128_OPERATION_SIZE);
+	unsigned int count;
+	size_t at;
+	int ret;
+
+	if (!snapshot || !hwx || !generic || !operation)
+		return -ENOMEM;
+	for (at = 0; at + 12 <= ADD128_HWX_SIZE; at += 4)
+		if (get_unaligned_le32(hwx + at) == ADD128_SRC1)
+			break;
+	if (at + 12 > ADD128_HWX_SIZE)
+		return -ENOENT;
+	put_unaligned_le32(header, hwx + at);
+	put_unaligned_le64(offset, hwx + at + 4);
+	ret = ane_h16_hwx_snapshot_create(hwx, ADD128_HWX_SIZE, snapshot);
+	if (ret)
+		return ret;
+	ret = kunit_add_action_or_reset(test, snapshot_free, snapshot);
+	if (ret)
+		return ret;
+	ret = ane_h16_process_bindings(&snapshot->info, generic, ADD128_GENERIC_SIZE, bindings,
+				       &count, &scratch);
+	if (!ret)
+		ret = ane_h16_operation_validate(snapshot, &snapshot->info, operation,
+						 ADD128_OPERATION_SIZE, bindings, count, &scratch);
+	return ret;
+}
+
+/* Each DMA base stays inside the buffer its slot binds, at LOAD and before any mapping. */
+static void program_add128_dma_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1, 0), 0);
+	/* One 64-byte line past the end of x, into z's place, and before x. */
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1, 0x40), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1, 0x10000), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1, -0x8000), -ENOEXEC);
+	/* Slot 9, which the operation section does not bind. */
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, (ADD128_SRC1 & ~(0x3f << 23)) | 9 << 23, 0),
+			-ENOEXEC);
+	/* The base without its relocation: an absolute DVA. */
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1 & ~(BIT(29) | 0x3f << 23), 0),
+			-ENOEXEC);
+}
+
 static u8 *fw_sparse_large(struct kunit *test, const struct ane_h16_sparse_run *runs,
 			   unsigned int count, size_t size)
 {
@@ -3395,6 +3457,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_add128_slots_test),
 	KUNIT_CASE(program_kernel_slots_test),
 	KUNIT_CASE(program_add128_hwx_test),
+	KUNIT_CASE(program_add128_dma_test),
 	KUNIT_CASE(program_replies_test),
 	KUNIT_CASE(program_deny_list_test),
 	KUNIT_CASE(program_custom_bar_test),

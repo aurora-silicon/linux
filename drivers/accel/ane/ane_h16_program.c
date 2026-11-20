@@ -8,6 +8,7 @@
 #include <linux/slab.h>
 
 #include "ane_h16_program.h"
+#include "ane_h16_tasks.h"
 
 /*
  * The one LOAD slot table. Slot 1 carries the HWX kernel section, or the
@@ -355,6 +356,22 @@ int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 }
 EXPORT_SYMBOL_GPL(ane_h16_process_bindings);
 
+/* The kernel slot runs to the end of the section's last 16 KiB page of its region. */
+static u64 h16_kernel_reach(const struct ane_h16_hwx *hwx)
+{
+	unsigned int i;
+
+	for (i = 0; i < hwx->region_count; i++) {
+		const struct ane_h16_hwx_region *r = &hwx->regions[i];
+		u64 offset = hwx->kernel.vm - r->vm;
+
+		if (r->kind == ANE_H16_REGION_KERNEL && hwx->kernel.vm >= r->vm &&
+		    offset < r->size && hwx->kernel.size <= r->size - offset)
+			return ALIGN(offset + hwx->kernel.size, SZ_16K) - offset;
+	}
+	return hwx->kernel.size;
+}
+
 /*
  * The operation section binds BAR slots to resources: per record, a count at
  * +8 and (slot, tag) pairs from +0xc. A tag is a generic-section ID, or the
@@ -363,6 +380,12 @@ EXPORT_SYMBOL_GPL(ane_h16_process_bindings);
  * name the resource whose HWX address is that base. Kernel programs must bind
  * the kernel: the legacy tag 2 instead makes the H17 firmware assert and stop
  * answering (H17 harness facts, kernel-table programs).
+ *
+ * Each DMA base offset in the task stream is taken relative to the DVA of
+ * the buffer bound to its slot, so every base must name a bound slot and
+ * stay inside that buffer with the extent of its transfer: a surface's
+ * declared size, the scratch's __bss size, or the kernel section to the end
+ * of its last 16 KiB page, which is what the kernel slot maps.
  */
 int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 			       const struct ane_h16_hwx *hwx, const void *operation,
@@ -374,6 +397,7 @@ int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 	const u8 *o = operation, *c;
 	unsigned int r, records, i, j;
 	bool kernel_bound = false;
+	u64 *bound;
 	int ret;
 
 	if (!hwx || !o || !bindings || count != hwx->surface_count ||
@@ -390,8 +414,13 @@ int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 		return -ENOEXEC;
 	records = get_unaligned_le32(o);
 	if (!records || records > ANE_H16_OPERATION_RECORDS_MAX ||
-	    operation_size != 4 + (size_t)records * ANE_H16_OPERATION_RECORD)
+	    operation_size != 4 + (size_t)records * ANE_H16_OPERATION_RECORD ||
+	    hwx->text.offset > snapshot->size || hwx->text.size > snapshot->size - hwx->text.offset)
 		return -ENOEXEC;
+	bound = kcalloc(ANE_HX_DMA_SLOTS, sizeof(*bound), GFP_KERNEL);
+	if (!bound)
+		return -ENOMEM;
+	ret = -ENOEXEC;
 	for (r = 0; r < records; r++) {
 		const u8 *rec = o + 4 + r * ANE_H16_OPERATION_RECORD;
 		u32 refs = get_unaligned_le32(rec + 8);
@@ -399,31 +428,42 @@ int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 
 		if (get_unaligned_le32(rec) || get_unaligned_le32(rec + 4) ||
 		    refs > ANE_H16_OPERATION_REFS_MAX)
-			return -ENOEXEC;
+			goto out;
 		for (i = 0; i < refs; i++) {
 			u32 slot = get_unaligned_le32(rec + 0xc + i * 8);
 			u32 tag = get_unaligned_le32(rec + 0x10 + i * 8);
-			u64 base, want = 0;
+			u64 base, want = 0, size = 0;
 
-			if (slot >= 64 || (seen & BIT_ULL(slot)))
-				return -ENOEXEC;
+			if (slot >= ANE_HX_DMA_SLOTS || (seen & BIT_ULL(slot)))
+				goto out;
 			seen |= BIT_ULL(slot);
 			base = get_unaligned_le64(c + 0x10 * (slot + 1));
 			if (tag == ANE_H16_RESOURCE_KERNEL && hwx->kernel.size) {
 				want = hwx->kernel.vm;
+				size = h16_kernel_reach(hwx);
 				kernel_bound = true;
 			} else if (scratch && hwx->scratch.size && tag == scratch->index) {
 				want = scratch->hwx_vm;
+				size = hwx->scratch.size;
 			} else {
 				for (j = 0; j < count; j++)
-					if (tag == bindings[j].index)
+					if (tag == bindings[j].index) {
 						want = bindings[j].hwx_vm;
+						size = bindings[j].bytes;
+					}
 			}
 			if (!want || base != want)
-				return -ENOEXEC;
+				goto out;
+			bound[slot] = size;
 		}
 	}
-	return hwx->kernel.size && !kernel_bound ? -ENOEXEC : 0;
+	if (hwx->kernel.size && !kernel_bound)
+		goto out;
+	ret = ane_hx_task_stream_dma_validate((const u8 *)snapshot->bytes + hwx->text.offset,
+					      hwx->text.size, bound);
+out:
+	kfree(bound);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(ane_h16_operation_validate);
 
