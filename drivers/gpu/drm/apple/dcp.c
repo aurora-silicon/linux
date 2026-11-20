@@ -1956,6 +1956,11 @@ static const struct apple_rtkit_ops link_report_rtkit_ops = {
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
 
+/* LAB ONLY: see the RTKit start; default on so a lab module never reaches IOMFB by accident. */
+static bool lab_t8132_v27_stop = true;
+module_param(lab_t8132_v27_stop, bool, 0644);
+MODULE_PARM_DESC(lab_t8132_v27_stop, "LAB: stop the T8132 27.2 DCP once RTKit is up (default: on)");
+
 static const struct apple_rtkit_ops firmware_crashlog_rtkit_ops = {
 	.flags = APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG,
 	.syslog_is_debug = dcp_rtk_syslog_is_debug,
@@ -6695,6 +6700,12 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		ret = apple_rtkit_wake(dcp->rtk);
 	if (ret) {
 		ret = dev_err_probe(dev, ret, "Failed to boot RTKit: %d\n", ret);
+		goto err_piodma;
+	}
+	/* LAB ONLY (J713 27.2 bring-up): stop once RTKit is up, before any IOMFB call. */
+	if (lab_t8132_v27_stop && dcp->hw.firmware_crashlog) {
+		dev_warn(dev, "lab: T8132 27.2 RTKit up (IOP power acknowledged); stopping before IOMFB\n");
+		ret = -ENODEV;
 		goto err_piodma;
 	}
 	dcp_secure_port_start(dcp);
