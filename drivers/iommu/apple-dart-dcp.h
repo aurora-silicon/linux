@@ -1058,16 +1058,6 @@ static const struct attribute_group apple_dart_frontend_group = {
 	.attrs = apple_dart_frontend_attrs,
 };
 
-/* The inherited DCP layout is the 26.6.2 firmware's, on every M4 Mac. */
-static bool apple_dart_dcp_firmware(const struct device_node *np)
-{
-	u32 version[3];
-
-	return of_property_count_u32_elems(np, "apple,firmware-version") == 3 &&
-	       !of_property_read_u32_array(np, "apple,firmware-version", version, 3) &&
-	       version[0] == 26 && version[1] == 6 && version[2] == 2;
-}
-
 static int apple_dart_dcp_validate(struct apple_dart_dcp *dcp, struct device *dev)
 {
 	struct device_node *node;
@@ -1088,11 +1078,25 @@ static int apple_dart_dcp_validate(struct apple_dart_dcp *dcp, struct device *de
 		return ret;
 	}
 
+	/*
+	 * Whether the handoff is the borrowed one is decided from what it
+	 * holds, not from the firmware version it names. Its layout is the
+	 * ADT's: apple_dart_dcp_prepare() imported this DART's nub segments
+	 * with the names and kinds of its instance (dcp_adt_parse_common()),
+	 * and the live table they are mapped by. The node's firmware memory
+	 * must be exactly that: one physical OS log region, and every other
+	 * region one of those segments at its DVA, mapped by the live table to
+	 * the same pages with the segment kind's protection, each segment but
+	 * the log covered once (below). A handoff of another form, such as a
+	 * firmware-27 processor's text/data/heap regions with no OS log region,
+	 * is not admitted here.
+	 */
 	if (!of_device_is_compatible(dev->of_node,
 				     (dcp->dart->dcp_instance == &dcp_adt_internal ||
 				      dcp->dart->dcp_instance == &dcp_adt_main_external) ?
 				     "apple,t8132-dcp" : "apple,t8132-dcpext") ||
-	    !apple_dart_dcp_firmware(dev->of_node) ||
+	    !dcp->firmware.num_segments ||
+	    dcp->firmware.num_segments != dcp->dart->dcp_instance->num_segments ||
 	    (dcp->owner && dcp->owner != dev))
 		return -ENODEV;
 	/* Do not silently skip malformed ranges or allocation failures in a list helper. */
