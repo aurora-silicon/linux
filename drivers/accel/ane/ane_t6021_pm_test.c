@@ -13,6 +13,7 @@ struct ane_sleep_test {
 	struct ane_t6021_pm pm;
 	unsigned int stops, restarts, deferred_restarts, parks;
 	int stop_error, restart_error, deferred_error, park_error;
+	enum ane_t6021_pm_state deferred_state;
 };
 
 static struct ane_t6021_pm *ane_sleep_get_pm(struct device *dev)
@@ -51,6 +52,7 @@ static int ane_sleep_restart_deferred(void *data)
 	KUNIT_EXPECT_TRUE(ctx->test, mutex_is_locked(&ctx->fw_lock));
 	KUNIT_EXPECT_EQ(ctx->test, ane_t6021_pm_submit_error(ctx->pm.state), -EHOSTDOWN);
 	ctx->deferred_restarts++;
+	ctx->deferred_state = ctx->pm.state;
 	return ctx->deferred_error;
 }
 
@@ -211,6 +213,8 @@ static void ane_sleep_deferred_test(struct kunit *test)
 	mutex_unlock(&ctx->fw_lock);
 	KUNIT_EXPECT_EQ(test, ctx->deferred_restarts, 1U);
 	KUNIT_EXPECT_EQ(test, ctx->pm.state, ANE_T6021_PM_ACTIVE);
+	/* Not reported as failed while the deferred restart runs. */
+	KUNIT_EXPECT_EQ(test, ctx->deferred_state, ANE_T6021_PM_SUSPENDED);
 	KUNIT_EXPECT_EQ(test, ane_t6021_pm_submit_error(ctx->pm.state), 0);
 
 	/* A failed deferred restart leaves the device out but sleep working. */

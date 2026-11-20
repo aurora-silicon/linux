@@ -350,13 +350,17 @@ struct tipd_data {
 	bool (*read_power_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
-	void (*prepare)(struct tps6598x *tps);
+	int (*prepare)(struct tps6598x *tps);
 	void (*complete)(struct tps6598x *tps);
 };
 
 struct tps6598x {
 	/* Native H17 routes retain ENOSPC admission and their own HPD path. */
 	u8 h17_display:1;
+	/* On the list tipd_port_replug() looks a port up on, by its role switch; its replug. */
+	struct list_head port_node;
+	struct work_struct replug_work;
+	u8 replug_seconds;
 	struct device *dev;
 	struct regmap *regmap;
 	struct mutex lock; /* device lock */
@@ -384,6 +388,8 @@ struct tps6598x {
 	int wakeup;
 	/* Handles events while the system sleeps, if the variant can filter them */
 	bool (*sleep_event)(struct tps6598x *tps);
+	/* Wakes the controller, where its bus has a command for that */
+	int (*wake)(struct tps6598x *tps);
 	u32 status; /* status reg */
 	u32 data_status;
 	u16 pwr_status;
@@ -464,6 +470,9 @@ struct cd321x {
 	struct notifier_block tbt_watch;
 	struct work_struct tbt_attach_work;
 	bool tbt_watch_registered;
+	/* Closes the USB4/Thunderbolt session before device_shutdown() */
+	struct notifier_block reboot_nb;
+	bool reboot_nb_registered;
 	atomic_t link_event;
 	atomic_t ready_event;
 	atomic_t restore_event;
@@ -477,6 +486,9 @@ struct cd321x {
 	unsigned int rearm_resets;
 	bool dp_sink_reported;
 	bool dp_irq_hpd;
+	/* A plug was in when the sleep began, and a wake's first port state is still to be applied */
+	bool sleep_plug;
+	bool wake_apply;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
@@ -493,6 +505,8 @@ struct sn201202x {
 	struct cd321x cd;
 	bool polled;
 	bool select_polled;
+	/* Sleeps while idle: its event interrupt stays live while it sleeps */
+	bool idle_sleep;
 	struct completion select_completion;
 	struct completion sleep_completion;
 	struct completion wake_completion;
@@ -508,6 +522,8 @@ struct sn201202x {
 	bool ldcm_mitigated;
 	/* ldcm_mitigated matches the controller (unknown after a reset) */
 	bool ldcm_mitigation_known;
+	/* A mitigation was requested since the controller's last reset */
+	bool ldcm_requested;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
@@ -565,6 +581,9 @@ void cd321x_mux_gave_up(struct cd321x *cd321x, unsigned int retries, unsigned in
 void cd321x_init_work(struct cd321x *cd321x);
 int cd321x_init_mux(struct cd321x *cd321x);
 void cd321x_stop_work(struct cd321x *cd321x);
+int cd321x_reboot_close(struct cd321x *cd321x);
+int cd321x_reboot_notify(struct notifier_block *nb, unsigned long action,
+			 void *data);
 bool cd321x_tbt_switch_keep_waiting(struct device *dev);
 struct typec_thunderbolt_switch *
 cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,

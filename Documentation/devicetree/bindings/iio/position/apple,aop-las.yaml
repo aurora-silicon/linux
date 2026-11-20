@@ -20,19 +20,27 @@ select:
       contains:
         enum:
           - apple,t6020-aop-las
+          - apple,t6030-aop-las
           - apple,t6050-aop-las
           - apple,t8112-aop-las
+          - apple,t8142-aop-las
   required:
     - compatible
 
 properties:
   compatible:
-    items:
-      - enum:
-          - apple,t6020-aop-las
-          - apple,t6050-aop-las
-          - apple,t8112-aop-las
-      - const: apple,aop-las
+    oneOf:
+      - items:
+          - enum:
+              - apple,t6020-aop-las
+              - apple,t6050-aop-las
+              - apple,t8112-aop-las
+              - apple,t8142-aop-las
+          - const: apple,aop-las
+      - items:
+          - const: apple,t6030-aop-las
+          - const: apple,t6020-aop-las
+          - const: apple,aop-las
 
 required:
   - compatible

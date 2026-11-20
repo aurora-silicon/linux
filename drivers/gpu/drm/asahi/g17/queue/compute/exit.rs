@@ -125,6 +125,14 @@ impl Queue {
     fn holds_only_owed_stamp(&self) -> bool {
         self.released && self.active.len != 0 && self.active.iter().all(|active| active.stamps_owed)
     }
+    /// Commands of this queue may still run: it is in flight (`Queue::in_flight`), and not only
+    /// with its closed owner's commands that all retired on their completion records and wait
+    /// for stamps that no later command brings (`holds_only_owed_stamp`). Such a queue stays in
+    /// flight until its own context is killed. An open owner's queue counts as long as it holds
+    /// a command.
+    pub(crate) fn running_commands(&self) -> bool {
+        self.in_flight() && !self.holds_only_owed_stamp()
+    }
     /// M5: the watchdog failed this queue's command, and nothing has killed it yet. Its
     /// commands may never retire on their own (a dispatch that does not terminate), so a kill
     /// of its context treats it as failed work, like a command the firmware reported failed.

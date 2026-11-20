@@ -15,6 +15,9 @@ NATIVE_DIRECTORIES = (
     'drivers/gpu/drm/apple/', 'drivers/gpu/drm/asahi/', 'sound/soc/apple/',
     'drivers/net/wireless/apple/',
 )
+# Native options that stay off until their stated prerequisites ship; the fragment must say
+# so with "# CONFIG_<name> is not set".
+DELIBERATELY_OFF = {'MT7932_AWDL'}
 BLOCK = re.compile(r'^(?:menuconfig|config) ([A-Z0-9_]+)\n(.*?)(?=^(?:menuconfig|config) |\Z)',
                    re.M | re.S)
 
@@ -23,7 +26,7 @@ def hardware_options(path, text):
     for name, body in BLOCK.findall(text):
         native = ('ARCH_APPLE' in body or path.startswith(NATIVE_DIRECTORIES)
                   or name.startswith(('PCIE_APPLE', 'MT7932')))
-        if not native or re.search(r'KUNIT|DEBUG|TEST|DIAG|TRACE|RESEARCH', name):
+        if not native or name in DELIBERATELY_OFF or re.search(r'KUNIT|DEBUG|TEST|DIAG|TRACE|RESEARCH', name):
             continue
         if re.search(r'depends on.*\b(?:X86|PPC|PPC_PMAC|MAC)\b', body):
             continue
@@ -48,6 +51,12 @@ class HardwareDefaultsTests(unittest.TestCase):
         self.assertGreater(len(options), 40)
         fragment = (ROOT / 'arch/arm64/configs/asahi.config').read_text()
         self.assertEqual(missing_requests(options, fragment), [])
+
+    def test_deliberately_off_options_are_explicitly_off(self):
+        fragment = (ROOT / 'arch/arm64/configs/asahi.config').read_text()
+        for name in sorted(DELIBERATELY_OFF):
+            self.assertIn(f'# CONFIG_{name} is not set\n', fragment)
+            self.assertNotRegex(fragment, rf'(?m)^CONFIG_{name}=')
 
     def test_a_new_driver_cannot_be_forgotten_even_with_a_kconfig_default(self):
         text = 'config NEW_APPLE_DRIVER\n\ttristate "New hardware"\n\tdepends on ARCH_APPLE\n\tdefault m\n'

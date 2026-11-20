@@ -13,8 +13,10 @@
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of.h>
+#include <linux/soc/apple/j613-display.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
+#include <linux/reboot.h>
 #include <linux/unaligned.h>
 #include <linux/usb/pd.h>
 #include <linux/soc/apple/sleep.h>
@@ -350,12 +352,33 @@ static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
 	return 0;
 }
 
-int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
-			  size_t in_len, const u8 *in_data,
-			  size_t out_len, u8 *out_data,
-			  u32 cmd_timeout_ms, u32 res_delay_ms)
+/*
+ * The sleep's rules for the port controllers' system power state command (the controller is
+ * woken first, the command's end is read at intervals, a failed S3 refuses the sleep, the
+ * command's limit and its lines) apply on the J714s, J716c, J813 and J815.
+ * These boards send the command (apple,sleep-ssps) during firmware-driven
+ * sleep. Other boards retain the original command behavior.
+ */
+static bool tipd_sleep_ssps_rules(void)
 {
-	unsigned long timeout;
+	return of_machine_is_compatible("apple,j714s") ||
+	       of_machine_is_compatible("apple,j716c") ||
+	       of_machine_is_compatible("apple,j813") ||
+	       of_machine_is_compatible("apple,j815");
+}
+
+/*
+ * With a gap, the command register is read once per gap until the command has ended, the first
+ * time a quarter of a gap after the command was written, and the caller may sleep. Without one
+ * it is read back to back, as before.
+ */
+static int tps6598x_exec_cmd_gap(struct tps6598x *tps, const char *cmd,
+				 size_t in_len, const u8 *in_data,
+				 size_t out_len, u8 *out_data,
+				 u32 cmd_timeout_ms, u32 res_delay_ms, u32 read_gap_us)
+{
+	unsigned long timeout, note;
+	bool first = true;
 	u32 val;
 	int ret;
 
@@ -377,16 +400,36 @@ int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
 		return ret;
 
 	timeout = jiffies + msecs_to_jiffies(cmd_timeout_ms);
+	note = jiffies + HZ;
 
 	do {
+		if (read_gap_us) {
+			u32 gap = first ? read_gap_us / 4 : read_gap_us;
+
+			usleep_range(gap, gap + gap / 4);
+			first = false;
+		}
 		ret = tps6598x_read32(tps, TPS_REG_CMD1, &val);
 		if (ret)
 			return ret;
 		if (INVALID_CMD(val))
 			return -EINVAL;
 
-		if (time_is_before_jiffies(timeout))
+		/*
+		 * Under the sleep's rules a command that has ended has ended, whatever the time
+		 * its last read was made at. Elsewhere a read made past the limit is a timeout,
+		 * as before.
+		 */
+		if ((val || !tipd_sleep_ssps_rules()) && time_is_before_jiffies(timeout))
 			return -ETIMEDOUT;
+		/* A command with a long limit is not waited for in silence: a line each second */
+		if (val && cmd_timeout_ms > 1000 && time_is_before_jiffies(note) &&
+		    tipd_sleep_ssps_rules()) {
+			dev_info(tps->dev, "command %.4s not done after %u ms (limit %u ms)\n", cmd,
+				 jiffies_to_msecs(jiffies - (timeout - msecs_to_jiffies(cmd_timeout_ms))),
+				 cmd_timeout_ms);
+			note += HZ;
+		}
 	} while (val);
 
 	/* some commands require delay for the result to be available */
@@ -414,6 +457,15 @@ int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
 	}
 
 	return 0;
+}
+
+int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
+			  size_t in_len, const u8 *in_data,
+			  size_t out_len, u8 *out_data,
+			  u32 cmd_timeout_ms, u32 res_delay_ms)
+{
+	return tps6598x_exec_cmd_gap(tps, cmd, in_len, in_data, out_len, out_data,
+				     cmd_timeout_ms, res_delay_ms, 0);
 }
 EXPORT_SYMBOL_GPL(tps6598x_exec_cmd_tmo);
 
@@ -1028,6 +1080,7 @@ static void cd321x_retry_revalidation(struct cd321x *cd321x, bool reconnect)
 
 	/* Keep a later physical event retryable if the automatic budget expires. */
 	cd321x->state_valid = false;
+	cd321x->wake_apply = false;
 	if (cd321x_pm_retry(&cd321x->pm, reconnect))
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
 				 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
@@ -1046,6 +1099,7 @@ static void cd321x_retry_held_mux(struct cd321x *cd321x)
 	retries = cd321x->pm.mux_retries;
 	held_ms = now_ms - cd321x->pm.mux_since_ms;
 	cd321x->state_valid = false;
+	cd321x->wake_apply = false;
 	if (!cd321x->pm.mux_retry_ms)
 		dev_info(cd321x->tps.dev, "Type-C mux held up, retrying\n");
 	delay = cd321x_pm_mux_held(&cd321x->pm, now_ms);
@@ -1467,13 +1521,31 @@ static void cd321x_queue_status(struct cd321x *cd321x)
 static int cd321x_connect(struct tps6598x *tps, u32 status)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	bool plug_changed;
+	unsigned int delay = CD321X_DEBOUNCE_DELAY_MS;
 
 	/* Keep every local role and data path down until the connector is dry. */
 	if (tps->contaminant_ops &&
 	    tps->contaminant != TYPEC_CONTAMINANT_NONE)
 		status &= ~TPS_STATUS_PLUG_PRESENT;
 
-	if ((tps->status ^ status) & TPS_STATUS_PLUG_PRESENT)
+	/*
+	 * The resume's first fresh read, with a plug that was in when the sleep began, is in now,
+	 * and raised no plug event and no change since: nothing was plugged in just now, so its
+	 * state is applied at once, not after the debounce of a plug. The external display and the
+	 * port's USB then come back that much sooner. Any plug change on the way, in any phase,
+	 * and every later read keep the debounce.
+	 */
+	plug_changed = (tps->status ^ status) & TPS_STATUS_PLUG_PRESENT;
+	if (plug_changed)
+		cd321x->wake_apply = false;
+	if (cd321x->pm.phase == CD321X_PM_APPLY) {
+		if (cd321x->wake_apply && (status & TPS_STATUS_PLUG_PRESENT))
+			delay = 0;
+		cd321x->wake_apply = false;
+	}
+
+	if (plug_changed)
 		cd321x_pm_new_connection(&cd321x->pm);
 	tps->status = status;
 	cd321x_queue_status(cd321x);
@@ -1493,8 +1565,7 @@ static int cd321x_connect(struct tps6598x *tps, u32 status)
 	 * event in that window because the latter sees the running work as busy.
 	 * The worker consumes every accumulated status change on its next pass.
 	 */
-	mod_delayed_work(system_freezable_wq, &cd321x->update_work,
-			 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
+	mod_delayed_work(system_freezable_wq, &cd321x->update_work, msecs_to_jiffies(delay));
 
 	return 0;
 }
@@ -1506,6 +1577,7 @@ static int cd321x_connect(struct tps6598x *tps, u32 status)
  */
 static int cd321x_ack_events(struct tps6598x *tps)
 {
+	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 	u64 event;
 	int ret;
 
@@ -1513,6 +1585,9 @@ static int cd321x_ack_events(struct tps6598x *tps)
 	if (ret || !event)
 		return ret;
 	trace_cd321x_irq(event);
+	/* A plug event latched while asleep: a cable came or went, see cd321x_connect() */
+	if (event & APPLE_CD_REG_INT_PLUG_EVENT)
+		cd321x->wake_apply = false;
 
 	return tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
 }
@@ -1521,6 +1596,7 @@ static int cd321x_ack_events(struct tps6598x *tps)
 static void cd321x_event_lost(struct cd321x *cd321x)
 {
 	lockdep_assert_held(&cd321x->tps.lock);
+	cd321x->wake_apply = false;
 	if (cd321x_pm_event_lost(&cd321x->pm))
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
 				 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
@@ -1563,8 +1639,10 @@ static void cd321x_resume_work(struct work_struct *work)
 		dev_warn_ratelimited(tps->dev,
 				     "tunnel link recovery budget exhausted\n");
 	if (notes & (CD321X_PM_FAULT_ACCEPTED | CD321X_PM_READY_ACCEPTED |
-		     CD321X_PM_RESTORE_ACCEPTED))
+		     CD321X_PM_RESTORE_ACCEPTED)) {
 		cd321x->state_valid = false;
+		cd321x->wake_apply = false;
+	}
 	if (!cd321x_pm_begin_read(&cd321x->pm))
 		return;
 
@@ -1603,13 +1681,38 @@ retry:
 	cd321x_retry_revalidation(cd321x, true);
 }
 
-static void cd321x_prepare(struct tps6598x *tps)
+/*
+ * A port controller that did not take S3 refuses the sleep. The one sleep entered after such a
+ * failure (J714s: the command ended after 3.6 s with the controller not answering on its bus)
+ * went on to the commit, where the SMC did not answer the sleep notice: a reset instead of a
+ * sleep. Refused here, nothing has been stopped yet and the controller is set up again.
+ */
+static bool sleep_s3_refuse = true;
+module_param(sleep_s3_refuse, bool, 0644);
+MODULE_PARM_DESC(sleep_s3_refuse, "A port controller that does not take system power state S3 refuses the sleep (0: the sleep goes on, as before)");
+
+/*
+ * The limit of an SN201202x's system power state command under the sleep's rules. The
+ * controller raises no interrupt for a command's end, so the end is read from the command
+ * register. Woken first and read at intervals, the controller ends this command within the
+ * first few reads; the limit is the one every other command of this driver has. A controller
+ * that has not ended it by then is not answering: the sleep is refused (S3), or the controller
+ * is set up again by its next event (S0). A longer limit says so on the console each second.
+ */
+static unsigned int sleep_ssps_ms = 1000;
+module_param(sleep_ssps_ms, uint, 0644);
+MODULE_PARM_DESC(sleep_ssps_ms, "Limit of an SN201202x's system power state command under the sleep's rules, in ms (1000 to 5000)");
+
+static int cd321x_prepare(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	int ret = 0;
 
 	scoped_guard(mutex, &tps->lock) {
 		cd321x_pm_prepare(&cd321x->pm);
 		cd321x->state_valid = false;
+		cd321x->wake_apply = false;
+		cd321x->sleep_plug = tps->status & TPS_STATUS_PLUG_PRESENT;
 	}
 	/* Gate scheduling first; no worker may be drained under its mutex. */
 	cancel_delayed_work_sync(&cd321x->resume_work);
@@ -1618,15 +1721,26 @@ static void cd321x_prepare(struct tps6598x *tps)
 
 	/* As macOS does a second or so before the commit, measured on the same controller. */
 	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps")) {
-		int ret;
+		ktime_t start = ktime_get();
 
 		guard(mutex)(&tps->lock);
 		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S3);
-		if (ret)
+		/* Without the rules: the lines and their levels as they were */
+		if (!tipd_sleep_ssps_rules() && ret)
 			dev_warn(tps->dev, "didn't take system power state S3: %d\n", ret);
-		else
+		else if (!tipd_sleep_ssps_rules())
 			dev_dbg(tps->dev, "system power state S3\n");
+		else if (ret)
+			dev_warn(tps->dev, "didn't take system power state S3: %d after %lld ms%s\n", ret,
+				 ktime_ms_delta(ktime_get(), start),
+				 sleep_s3_refuse ? ": sleep refused" : "");
+		else
+			dev_info(tps->dev, "system power state S3 in %lld ms\n",
+				 ktime_ms_delta(ktime_get(), start));
 	}
+	if (ret && sleep_s3_refuse && tipd_sleep_ssps_rules())
+		return -EBUSY;
+	return 0;
 }
 
 /* A try every 250 ms for 10 s */
@@ -1803,8 +1917,22 @@ static void cd321x_complete(struct tps6598x *tps)
 		cd321x->pm.setup_pending = true;
 		cd321x->reset_by_cut = true;
 	}
-	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps"))
-		tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps")) {
+		ktime_t start = ktime_get();
+		int ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+
+		/* After a sleep or a refused one: never waited for in silence, and never longer */
+		if (!tipd_sleep_ssps_rules())
+			ret = 0;
+		else if (ret)
+			dev_warn(tps->dev, "didn't take system power state S0: %d after %lld ms; set up again by its next event\n",
+				 ret, ktime_ms_delta(ktime_get(), start));
+		else
+			dev_info(tps->dev, "system power state S0 in %lld ms\n",
+				 ktime_ms_delta(ktime_get(), start));
+		if (ret)
+			cd321x->pm.setup_pending = true;
+	}
 	/*
 	 * A link still down from an earlier sleep isn't cut again, so it stays pending. A dark
 	 * wake sleeps again at once: the link stays down for it, and the full wake rearms it.
@@ -1816,8 +1944,12 @@ static void cd321x_complete(struct tps6598x *tps)
 		cd321x->rearm_resets = 0;
 		cd321x_rearm_debug_link(cd321x);
 	}
-	if (cd321x_pm_resume(&cd321x->pm))
+	if (cd321x_pm_resume(&cd321x->pm)) {
+		/* Not after a dark wake, which sleeps again at once, or a controller set up again */
+		cd321x->wake_apply = cd321x->sleep_plug && !pm_dark_wake() &&
+				     !cd321x->pm.setup_pending;
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
+	}
 }
 
 static int cd321x_setup_read_state(void *ctx, u8 *state)
@@ -1927,6 +2059,9 @@ int cd321x_sleep_events(struct tps6598x *tps, struct cd321x_sleep_state *st)
 	if (ret)
 		return ret;
 	st->contaminant_event = event & SN201202X_INT_LDCM_UPDATE;
+	/* A cable came or went while asleep: the wake's read gets the debounce, see cd321x_connect() */
+	if (event & APPLE_CD_REG_INT_PLUG_EVENT)
+		container_of(tps, struct cd321x, tps)->sleep_plug = false;
 	/* A controller that was reset is set up again on resume */
 	cd321x_check_setup(container_of(tps, struct cd321x, tps), event);
 
@@ -1964,6 +2099,9 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 
 	if (!event)
 		goto err_unlock;
+	/* A cable came or went: a wake's first read is no longer a quiet one, see cd321x_connect() */
+	if (event & APPLE_CD_REG_INT_PLUG_EVENT)
+		cd321x->wake_apply = false;
 
 	ret = tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
 	if (ret) {
@@ -2240,10 +2378,29 @@ static int tps6598x_psy_get_prop(struct power_supply *psy,
 	return ret;
 }
 
+/*
+ * The gap between the reads that wait for the end of an SN201202x's system power state command,
+ * under the sleep's rules. Each read of the command register is a register selection of its
+ * own, which the controller answers by loading the register again: read back to back there is
+ * nothing between the loads, and on the J714s the command then ended late, or not within its
+ * limit.
+ */
+#define CD321X_SSPS_READ_GAP_US	5000
+
 static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state)
 {
 	u8 state;
 	int ret;
+
+	/*
+	 * Under the sleep's rules the command goes to a controller that has just been sent its
+	 * bus's wake command and has answered it, whatever it was doing: woken, read, commanded.
+	 */
+	if (tps->wake && tipd_sleep_ssps_rules()) {
+		ret = tps->wake(tps);
+		if (ret)
+			return ret;
+	}
 
 	ret = tps6598x_read8(tps, TPS_REG_SYSTEM_POWER_STATE, &state);
 	if (ret)
@@ -2252,11 +2409,18 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state)
 	if (state == target_state)
 		return 0;
 
-	/* SN201202x can still be negotiating an attached dock while waking. */
-	if (target_state == TPS_SYSTEM_POWER_STATE_S0 &&
+	/*
+	 * SN201202x can still be negotiating an attached dock while waking: 5 s for S0 outside
+	 * the sleep's rules. Under them S0 and S3 have the sleep's own limit and are read with
+	 * gaps.
+	 */
+	if ((target_state == TPS_SYSTEM_POWER_STATE_S0 || tipd_sleep_ssps_rules()) &&
 	    device_is_compatible(tps->dev, "apple,sn201202x"))
-		ret = tps6598x_exec_cmd_tmo(tps, "SSPS", sizeof(target_state),
-					  &target_state, 0, NULL, 5000, 0);
+		ret = tps6598x_exec_cmd_gap(tps, "SSPS", sizeof(target_state),
+					  &target_state, 0, NULL,
+					  tipd_sleep_ssps_rules() ?
+					  clamp(sleep_ssps_ms, 1000U, 5000U) : 5000, 0,
+					  tipd_sleep_ssps_rules() ? CD321X_SSPS_READ_GAP_US : 0);
 	else
 		ret = tps6598x_exec_cmd(tps, "SSPS", sizeof(target_state),
 				      &target_state, 0, NULL);
@@ -2444,6 +2608,45 @@ VISIBLE_IF_KUNIT void cd321x_stop_work(struct cd321x *cd321x)
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_stop_work);
 
+/*
+ * Close the port's USB4/Thunderbolt session while the system still runs. A
+ * cable event that closes it inside device_shutdown() makes pid 1 wait for the
+ * PCIe-C reset handshake of an ACIO that is already going down. Stopping the
+ * work first keeps every later event away from the router.
+ */
+VISIBLE_IF_KUNIT int cd321x_reboot_close(struct cd321x *cd321x)
+{
+	struct typec_thunderbolt_switch_data off = {
+		.state = TYPEC_THUNDERBOLT_SWITCH_OFF,
+	};
+
+	cd321x_stop_work(cd321x);
+	return typec_thunderbolt_switch_set(cd321x->tbt_switch, &off);
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_reboot_close);
+
+VISIBLE_IF_KUNIT int cd321x_reboot_notify(struct notifier_block *nb,
+					  unsigned long action, void *data)
+{
+	struct cd321x *cd321x = container_of(nb, struct cd321x, reboot_nb);
+	struct tps6598x *tps = &cd321x->tps;
+	int ret;
+
+	if (action != SYS_RESTART && action != SYS_HALT && action != SYS_POWER_OFF)
+		return NOTIFY_DONE;
+
+	if (tps->irq)
+		disable_irq(tps->irq);
+	if (cd321x->tbt_switch)
+		dev_info(tps->dev, "closing the USB4/Thunderbolt session before shutdown\n");
+	ret = cd321x_reboot_close(cd321x);
+	if (cd321x->tbt_switch)
+		dev_info(tps->dev, "closed the USB4/Thunderbolt session before shutdown: %d\n",
+			 ret);
+	return NOTIFY_OK;
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_reboot_notify);
+
 /* Separate so that the KUnit tests can choose the driver core's answer. */
 VISIBLE_IF_KUNIT bool cd321x_tbt_switch_keep_waiting(struct device *dev)
 {
@@ -2601,6 +2804,12 @@ VISIBLE_IF_KUNIT int cd321x_init_mux(struct cd321x *cd321x)
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_init_mux);
 
+/* The J613 profile enables its disabled DCP routes during DRM coldplug. */
+static bool cd321x_display_gate_pending(struct tps6598x *tps)
+{
+	return apple_j613_display_pending(tps->dev);
+}
+
 static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
@@ -2663,6 +2872,13 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	    cd321x_tbt_watch_late(cd321x, fwnode))
 		dev_warn(tps->dev, "cannot watch for the USB4/Thunderbolt router\n");
 
+	cd321x->reboot_nb.notifier_call = cd321x_reboot_notify;
+	cd321x->reboot_nb.priority = INT_MAX;
+	if (register_reboot_notifier(&cd321x->reboot_nb))
+		dev_warn(tps->dev, "cannot close the USB4/Thunderbolt session at shutdown\n");
+	else
+		cd321x->reboot_nb_registered = true;
+
 	return 0;
 
 err_put_switch:
@@ -2693,6 +2909,11 @@ static void
 cd321x_unregister_port(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+
+	if (cd321x->reboot_nb_registered) {
+		unregister_reboot_notifier(&cd321x->reboot_nb);
+		cd321x->reboot_nb_registered = false;
+	}
 
 	cd321x_stop_work(cd321x);
 	fwnode_handle_put(cd321x->connector_fwnode);
@@ -3306,6 +3527,143 @@ static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 	return 0;
 }
 
+/* The ports tipd_port_replug() looks up by the USB role switch their data role drives. */
+static LIST_HEAD(tipd_ports);
+static DEFINE_MUTEX(tipd_ports_lock);
+
+static void tipd_replug_work(struct work_struct *work);
+
+static void tipd_port_list_add(struct tps6598x *tps)
+{
+	INIT_LIST_HEAD(&tps->port_node);
+	INIT_WORK(&tps->replug_work, tipd_replug_work);
+	if (!tps->role_sw)
+		return;
+	mutex_lock(&tipd_ports_lock);
+	list_add_tail(&tps->port_node, &tipd_ports);
+	mutex_unlock(&tipd_ports_lock);
+}
+
+static void tipd_port_list_del(struct tps6598x *tps)
+{
+	if (!tps->port_node.next)
+		return;
+	mutex_lock(&tipd_ports_lock);
+	list_del_init(&tps->port_node);
+	mutex_unlock(&tipd_ports_lock);
+	cancel_work_sync(&tps->replug_work);
+}
+
+/* The J714s's port controllers take "DISC" unlocked with this key, the reversed target identifier. */
+static const u8 tipd_replug_key_j714s[4] = { '4', '1', '7', 'J' };
+
+static bool tipd_replug_supported(struct tps6598x *tps)
+{
+	return of_machine_is_compatible("apple,j714s") &&
+	       device_is_compatible(tps->dev, "apple,sn201202x");
+}
+
+/*
+ * As cd321x_reset_inherited_connection() does it: unlocked, "DISC", the app mode back, locked
+ * again. The port lock is held only for the commands: meanwhile the interrupt handler sees the
+ * partner go and come back, and sets the mux, the alternate modes and the data role again.
+ * The commands are read with the gap the sleep's own command is (CD321X_SSPS_READ_GAP_US): read
+ * back to back while the partner attaches again, the relock ended late, or in SPMI parity faults
+ * and -EIO. A relock that fails is tried once more.
+ */
+#define TIPD_REPLUG_RELOCK_TRIES	2
+static void tipd_replug_work(struct work_struct *work)
+{
+	struct tps6598x *tps = container_of(work, struct tps6598x, replug_work);
+	static const u8 locked[4];
+	u8 seconds = tps->replug_seconds, result = 0;
+	unsigned long timeout;
+	int ret, lock_ret, mode = -1;
+	unsigned int tries;
+
+	mutex_lock(&tps->lock);
+	ret = tps6598x_exec_cmd_gap(tps, "LOCK", sizeof(tipd_replug_key_j714s), tipd_replug_key_j714s,
+				    sizeof(result), &result, 1000, 0, CD321X_SSPS_READ_GAP_US);
+	if (!ret && result)
+		ret = -EIO;
+	if (!ret)
+		ret = tps6598x_exec_cmd_gap(tps, "DISC", sizeof(seconds), &seconds, 0, NULL, 5000, 0,
+					    CD321X_SSPS_READ_GAP_US);
+	mutex_unlock(&tps->lock);
+
+	if (!ret) {
+		msleep(seconds * 1000 + 100);
+		timeout = jiffies + msecs_to_jiffies(2000);
+		do {
+			mutex_lock(&tps->lock);
+			mode = tps6598x_check_mode(tps);
+			mutex_unlock(&tps->lock);
+			if (mode == TPS_MODE_APP || mode == TPS_MODE_APP1)
+				break;
+			msleep(20);
+		} while (time_before(jiffies, timeout));
+		if (mode != TPS_MODE_APP && mode != TPS_MODE_APP1)
+			ret = mode < 0 ? mode : -ETIMEDOUT;
+	}
+
+	for (tries = 1; ; tries++) {
+		mutex_lock(&tps->lock);
+		lock_ret = tps6598x_exec_cmd_gap(tps, "LOCK", sizeof(locked), locked, 0, NULL, 5000, 0,
+						 CD321X_SSPS_READ_GAP_US);
+		mutex_unlock(&tps->lock);
+		if (!lock_ret || tries >= TIPD_REPLUG_RELOCK_TRIES)
+			break;
+		msleep(500);
+	}
+
+	if (ret || lock_ret)
+		dev_warn(tps->dev, "port replug for its partner failed: %d (unlock result %u), locked again: %d (try %u)\n",
+			 ret, result, lock_ret, tries);
+	else
+		dev_info(tps->dev, "port replugged for its partner (%u s disconnected), locked again (try %u)\n",
+			 seconds, tries);
+}
+
+/**
+ * tipd_port_replug - disconnect and reattach a port, as a cable pulled and plugged back does
+ * @sw: the USB role switch the port drives
+ * @seconds: how long the port stays disconnected
+ *
+ * The controller's "DISC" command: it detaches the partner for @seconds and attaches it again
+ * on its own, with a new contract, its alternate modes entered and the mux and the data role set
+ * again. For a partner that a system sleep left in a state only a replug ends: on the J714s a
+ * DP alt mode hub whose SuperSpeed side does not come back after some wakes (dwc3-apple). A
+ * display on the port goes dark meanwhile. The replug runs on the port's own work, after this
+ * returns: 0 when it is queued, -EBUSY if one already is, -EOPNOTSUPP on a controller that is
+ * not known to take it (the J714s's SN201202x only), -ENODEV if no port drives @sw.
+ */
+int tipd_port_replug(struct usb_role_switch *sw, u8 seconds)
+{
+	struct tps6598x *tps;
+	int ret = -ENODEV;
+
+	mutex_lock(&tipd_ports_lock);
+	list_for_each_entry(tps, &tipd_ports, port_node) {
+		if (tps->role_sw != sw)
+			continue;
+		ret = -EOPNOTSUPP;
+		if (!tipd_replug_supported(tps))
+			break;
+		ret = -EBUSY;
+		if (work_pending(&tps->replug_work))
+			break;
+		tps->replug_seconds = seconds;
+		ret = queue_work(system_freezable_wq, &tps->replug_work) ? 0 : -EBUSY;
+		dev_info(tps->dev, "port replug for its partner requested (%u s disconnected): %d\n",
+			 seconds, ret);
+		break;
+	}
+	mutex_unlock(&tipd_ports_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(tipd_port_replug);
+
 int tipd_init(struct tps6598x *tps)
 {
 	struct fwnode_handle *fwnode;
@@ -3314,6 +3672,10 @@ int tipd_init(struct tps6598x *tps)
 	u32 vid = 0;
 	int ret, cleanup_ret;
 	bool reset_allowed = true;
+
+	/* Do not retain a PHY-only mux handle before the route changeset runs. */
+	if (cd321x_display_gate_pending(tps))
+		return -EPROBE_DEFER;
 
 	dev_dbg(tps->dev, "Type-C probe start\n");
 	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);
@@ -3467,6 +3829,7 @@ int tipd_init(struct tps6598x *tps)
 	}
 
 	tipd_debugfs_register(tps);
+	tipd_port_list_add(tps);
 	if (tps->data->ready)
 		tps->data->ready(tps);
 
@@ -3500,6 +3863,7 @@ void tipd_remove(struct tps6598x *tps)
 {
 	int ret = 0;
 
+	tipd_port_list_del(tps);
 	tipd_debugfs_unregister(tps);
 
 	if (!tps->irq)
@@ -3669,11 +4033,15 @@ EXPORT_SYMBOL_GPL(tipd_resume);
 int tipd_prepare(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
+	int ret = 0;
 
 	if (tps->data->prepare)
-		tps->data->prepare(tps);
+		ret = tps->data->prepare(tps);
+	/* A device whose prepare fails gets no .complete: what was prepared is undone here. */
+	if (ret && tps->data->complete)
+		tps->data->complete(tps);
 
-	return 0;
+	return ret;
 }
 EXPORT_SYMBOL_GPL(tipd_prepare);
 
