@@ -2821,6 +2821,8 @@ static int apple_nvme_sleep_last_stop(void *data)
 					    anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL, &us);
 	if (ret)
 		dev_err(anv->dev, "ANS did not idle: %d\n", ret);
+	else if (anv->hw->sleep_idle)
+		dev_info(anv->dev, "ANS idle at the last stop, acknowledged in about %u us\n", us);
 	else
 		dev_dbg(anv->dev, "ANS idle, acknowledged in about %u us, CC %#x CSTS %#x\n",
 			us, cc, csts);
@@ -3271,9 +3273,14 @@ static int apple_nvme_suspend(struct device *dev)
 			anv->sleep_stop = true;
 			anv->sleep_idled = false;
 			apple_sleep_coproc_set_ready(dev, true);
-			dev_info(dev, "ANS left running for the sleep's last stop\n");
+			dev_info(dev, "ANS left running for the sleep's last stop (notification %d)\n",
+				 anv->legacy_shn_ret);
 			return 0;
 		}
+		/* Registered but not idled at the commit: the sleep driver refuses the sleep. */
+		if (anv->sleep_registered && pm_suspend_via_firmware())
+			dev_warn(dev, "ANS shut down for the sleep instead (notification %d): the sleep will be refused\n",
+				 anv->legacy_shn_ret);
 		ret = apple_rtkit_shutdown(anv->rtk);
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
