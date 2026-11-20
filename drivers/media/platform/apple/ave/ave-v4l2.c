@@ -839,6 +839,11 @@ static int ave_session_attach(struct ave_ctx *ctx)
 	} else if (ave->fw_state != AVE_FW_RUNNING) {
 		dev_err(ave->dev, "firmware state %d, cannot add a session\n", ave->fw_state);
 		return -EIO;
+	} else if (ave->quarantined >= AVE_QUARANTINE_MAX) {
+		dev_warn_ratelimited(ave->dev,
+				     "%u stopped sessions wait for a power cycle; close every stream first\n",
+				     ave->quarantined);
+		return -EBUSY;
 	}
 
 	sess->index = idx;

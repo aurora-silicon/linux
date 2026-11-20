@@ -87,7 +87,15 @@ static void ave_config_6070(struct ave_dev *ave, u8 *cmd)
 	ave_write_global(ave, cmd, AVE_OP_CONFIG);
 	cmd[0x41] = 1;
 	put_unaligned_le64(ave->extra0_dma, cmd + 0x48);
-	/* No MCC, host heap, shared area or optional firmware log. */
+	/* No MCC, host heap or optional firmware log. */
+	/*
+	 * A shared area at +0x60, its size at +0x68. T6021 does not answer
+	 * Config without one; the area passed is 64 KiB, 16 KiB aligned.
+	 */
+	if (ave->config_shared.cpu) {
+		put_unaligned_le64(ave->config_shared.dma, cmd + 0x60);
+		put_unaligned_le32(ave->config_shared.size, cmd + 0x68);
+	}
 }
 
 static int ave_reply_9003(const struct ave_fw_abi *abi, const u8 *msg, u32 len,

@@ -44,6 +44,11 @@ struct ave_mctf_layout;
 #define AVE_MAX_SLOTS 7
 /* Sessions one firmware boot serves at once (macOS was seen running two). */
 #define AVE_MAX_SESSIONS 2
+/*
+ * Stopped sessions whose memory may wait for a power cycle while another
+ * session keeps the firmware up. A session beyond this is refused instead.
+ */
+#define AVE_QUARANTINE_MAX 4
 
 /*
  * Coprocessor memory every firmware boot uses, all inside one allocation.
@@ -178,6 +183,11 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_T6050_26C5035 0xc25b4ddb
 /* The M5 (T8142) build of the same 26A428 firmware (AppleAVE2FW 9013.45.1). */
 #define AVE_FW_TEXT_CRC_T8142_26A428 0x8a3784bd
+/*
+ * The M2 Max (T6021) build of AppleAVE2FW 6070.11.1, macOS 13.5 22G74, with
+ * the link cell at TEXT 0x423c zero.
+ */
+#define AVE_FW_TEXT_CRC_T6021_6070 0x0d56db87
 
 struct ave_ctx;
 
@@ -243,6 +253,8 @@ struct ave_variant {
 	size_t extra0_size;
 	/* Register sequence and boot/hello configuration have been qualified. */
 	bool boot_qualified;
+	/* 6070 Config carries a 64 KiB shared area. */
+	bool config_shared;
 };
 
 /* Start surfaces of an MCTF session, aliases included */
@@ -277,6 +289,7 @@ struct ave_dev {
 	struct ave_recovery_history recovery;
 	unsigned int recovery_count;
 	struct ave_session *failed_sessions;
+	unsigned int quarantined;
 	bool inject_wedge;
 
 	/* debugfs: the last Start and first Process built, per codec */
@@ -293,6 +306,8 @@ struct ave_dev {
 	dma_addr_t extra0_dma;
 	size_t extra0_map_size;
 	bool extra0_mapped;
+	/* Config's shared area, for a variant with config_shared */
+	struct ave_buf config_shared;
 	bool module_pinned;
 	/* A 6070 lifecycle command is serialized per logical operation. */
 	struct ave_reply expected[AVE_OP_COUNT];
@@ -551,7 +566,7 @@ static inline struct ave_ctx *ave_file_to_ctx(struct file *file)
 	return container_of(file_to_v4l2_fh(file), struct ave_ctx, fh);
 }
 
-extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112;
+extern const struct ave_variant ave_t6000, ave_t6021, ave_t6041, ave_t8112;
 
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);

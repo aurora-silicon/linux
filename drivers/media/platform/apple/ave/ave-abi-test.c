@@ -376,6 +376,17 @@ static void ave_6070_images(struct kunit *test)
 	expected[0x41] = 1;
 	put_unaligned_le64(ave->extra0_dma, expected + 0x48);
 	KUNIT_EXPECT_MEMEQ(test, actual, expected, sizeof(actual));
+	/* T6021: the shared area goes at +0x60/+0x68, byte 0x40 stays clear. */
+	ave->config_shared.cpu = ave;
+	ave->config_shared.dma = 0x100000000ULL;
+	ave->config_shared.size = SZ_64K;
+	memset(actual, 0, sizeof(actual));
+	abi->write_config(ave, actual);
+	ave_stamp_command(abi, actual, 3000000, 0x123456);
+	put_unaligned_le64(0x100000000ULL, expected + 0x60);
+	put_unaligned_le32(SZ_64K, expected + 0x68);
+	KUNIT_EXPECT_MEMEQ(test, actual, expected, sizeof(actual));
+	ave->config_shared.cpu = NULL;
 	for (unsigned int codec = AVE_CODEC_H264; codec <= AVE_CODEC_HEVC;
 	     codec++) {
 		static const enum ave_opcode ops[] = { AVE_OP_OPEN,
@@ -1186,6 +1197,8 @@ static void ave_6070_gate(struct kunit *test)
 			    &ave_layout_6070_11_1);
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(0x25bfd039),
 			    &ave_layout_6070_11_1);
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T6021_6070),
+			    &ave_layout_6070_11_1);
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(0), NULL);
 	/* H.264 low delay is qualified; a short command buffer is still refused. */
 	KUNIT_EXPECT_TRUE(test, ave_layout_6070_11_1.encode_ready);
@@ -1412,6 +1425,20 @@ static void ave_6070_variants(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_t8112.timebase_multiplier, 1U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.text_crc, 0x25bfd039U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.mbox_idle, 0x38U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.fw_text_size, 0xf0000U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.fw_data_size, 0x134000U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.text_crc, AVE_FW_TEXT_CRC_T6021_6070);
+	KUNIT_EXPECT_EQ(test, ave_t6021.boot_device_id, 20U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.device_type, 17U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.text_link_cell, 0x423cU);
+	KUNIT_EXPECT_EQ(test, ave_t6021.extra0_size, 0x3dfcU);
+	KUNIT_EXPECT_EQ(test, ave_t6021.boot_arg_value, 0x10000U);
+	/* Only T6021 gives Config a shared area. */
+	KUNIT_EXPECT_TRUE(test, ave_t6021.config_shared);
+	KUNIT_EXPECT_FALSE(test, ave_t6000.config_shared);
+	KUNIT_EXPECT_FALSE(test, ave_t8112.config_shared);
+	/* One 6070.11.1 boot serves two sessions, on every SoC. */
+	KUNIT_EXPECT_EQ(test, ave_layout_6070_11_1.max_sessions, 2U);
 	KUNIT_EXPECT_EQ(test, ave_t6000.regs->ctrl, 0x400044U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.regs->timebase, 0x178000U);
 	KUNIT_EXPECT_GE(test, t->command_bytes, 0x32dc8U);
@@ -1496,6 +1523,97 @@ static void ave_t6041_text_boot_word(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, size - 2, &a), -EINVAL);
 }
 
+/*
+ * T6000 and T8112 run the 6070 commands upstream qualified byte for byte.
+ * These CRCs pin the Start and first two Process commands the builder
+ * produces for them, so a change meant for another chip cannot alter
+ * those bytes unnoticed.
+ */
+static void ave_6070_qualified_bytes(struct kunit *test)
+{
+	static const struct {
+		enum ave_codec codec;
+		u32 width, height, fps_num, fps_den;
+		u32 start_crc, process_crc[2];
+	} cases[] = {
+		{ AVE_CODEC_H264, 1280, 720, 30, 1,
+		  0x0a894c73, { 0xbaecc863, 0x3da7ba31 } },
+		{ AVE_CODEC_H264, 1920, 1080, 30000, 1001,
+		  0xd87cabff, { 0x3147b186, 0xb60cc3d4 } },
+		{ AVE_CODEC_HEVC, 1280, 720, 30, 1,
+		  0x90dd39ba, { 0x27b4ba17, 0x852da142 } },
+		{ AVE_CODEC_HEVC, 1920, 1080, 30000, 1001,
+		  0x55b40bc0, { 0xd96b85f9, 0x7bf29eac } },
+	};
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+		struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+		struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+		enum ave_codec codec = cases[i].codec;
+		size_t start_len, process_len;
+		u8 *start, *process;
+		u32 crc;
+
+		KUNIT_ASSERT_NOT_NULL(test, ave);
+		KUNIT_ASSERT_NOT_NULL(test, ctx);
+		KUNIT_ASSERT_NOT_NULL(test, sess);
+		ave_test_6070_session(test, ave, ctx, sess, codec, cases[i].width,
+				      cases[i].height);
+		sess->p.fps_num = cases[i].fps_num;
+		sess->p.fps_den = cases[i].fps_den;
+		start_len = ave->layout->bytes[codec - 1][AVE_IMAGE_START];
+		process_len = ave->layout->bytes[codec - 1][AVE_IMAGE_PROCESS];
+		start = kunit_kzalloc(test, start_len, GFP_KERNEL);
+		process = kunit_kzalloc(test, process_len, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, start);
+		KUNIT_ASSERT_NOT_NULL(test, process);
+
+		KUNIT_ASSERT_EQ(test, ave_build_start(ctx, start, start_len), 0);
+		crc = crc32_le(~0, start, start_len);
+		KUNIT_EXPECT_EQ(test, crc, cases[i].start_crc);
+		for (unsigned int slot = 0; slot < 2; slot++) {
+			memset(process, 0, process_len);
+			KUNIT_ASSERT_EQ(test,
+					ave_build_process(ctx, process, process_len,
+							  slot, 0x8f0000000ULL,
+							  4000000, false, false),
+					0);
+			crc = crc32_le(~0, process, process_len);
+			KUNIT_EXPECT_EQ(test, crc, cases[i].process_crc[slot]);
+		}
+	}
+}
+
+/*
+ * A session the firmware saw counts toward the quarantine bound until a reap;
+ * one it never saw is freed at once.
+ */
+static void ave_quarantine_count(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+
+	KUNIT_ASSERT_TRUE(test, ave && ctx);
+	ave->dev = kunit_device_register(test, "apple-ave-quarantine");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(ave->dev));
+	mutex_init(&ave->hw_lock);
+	ctx->ave = ave;
+	for (unsigned int i = 0; i <= AVE_QUARANTINE_MAX; i++) {
+		ctx->sess = kzalloc_obj(*ctx->sess);
+		KUNIT_ASSERT_NOT_NULL(test, ctx->sess);
+		ctx->sess->handed = i < AVE_QUARANTINE_MAX;
+		ave_sess_destroy(ctx);
+		KUNIT_EXPECT_NULL(test, ctx->sess);
+	}
+	KUNIT_EXPECT_EQ(test, ave->quarantined, AVE_QUARANTINE_MAX);
+	mutex_lock(&ave->hw_lock);
+	ave_sess_reap(ave);
+	mutex_unlock(&ave->hw_lock);
+	KUNIT_EXPECT_EQ(test, ave->quarantined, 0U);
+	KUNIT_EXPECT_NULL(test, ave->failed_sessions);
+}
+
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_t6041_text_boot_word),
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
@@ -1504,6 +1622,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_frame_result),
 	KUNIT_CASE(ave_6070_split_surfaces),
 	KUNIT_CASE(ave_6070_start_process_fields),
+	KUNIT_CASE(ave_6070_qualified_bytes),
 	KUNIT_CASE(ave_6070_reordered_pictures),
 	KUNIT_CASE(ave_6070_hevc_contract),
 	KUNIT_CASE(ave_6070_entropy_interleave),
@@ -1511,6 +1630,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
 	KUNIT_CASE(ave_6070_variants),	    KUNIT_CASE(ave_6070_text_id),
 	KUNIT_CASE(ave_6070_smalloc),
+	KUNIT_CASE(ave_quarantine_count),
 	{}
 };
 
