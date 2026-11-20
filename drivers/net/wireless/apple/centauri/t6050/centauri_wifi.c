@@ -703,19 +703,28 @@ static s64 fw_event_gap_ms(struct centauri_t6050_wifi *wifi)
 	return ktime_to_ms(ktime_sub(ktime_get(), wifi->last_fw_event_at));
 }
 
-static void wait_fw_event_before_scan(struct centauri_t6050_wifi *wifi)
+/* Firmware events have no separate completion reply; sample the control and command ring. */
+static int centauri_wait_control_idle(struct centauri_t6050_wifi *wifi)
 {
-	s64 remainder;
+	unsigned long deadline = jiffies + msecs_to_jiffies(1500);
 
 	for (;;) {
-		remainder = centauri_fw_event_scan_settle_remainder_ms(
-			wifi->last_fw_event_valid, wifi->last_fw_event_at,
-			ktime_get(), CEN_FW_EVENT_SCAN_SETTLE_MS);
-		if (remainder <= 0)
-			break;
-		drain(wifi);
-		if (remainder > 0)
-			msleep(remainder);
+		u32 first, stage;
+
+		if (READ_ONCE(wifi->stopping) || READ_ONCE(wifi->control->removing))
+			return -ECANCELED;
+		if (!wifi->last_fw_event_valid)
+			return 0;
+		first = readl(wifi->control->bar + 0x8000);
+		usleep_range(1000, 2000);
+		if (READ_ONCE(wifi->stopping) || READ_ONCE(wifi->control->removing))
+			return -ECANCELED;
+		stage = readl(wifi->control->bar + 0x8000);
+		if (centauri_control_idle_ready(true, first, stage,
+						index_read(wifi, 1, 1) == wifi->command_head))
+			return 0;
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
 	}
 }
 
@@ -773,11 +782,11 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 			 const void *payload, size_t size, void *reply,
 			 size_t *reply_size, bool *submitted)
 {
-	u16 slot = wifi->command_head, sequence = ++wifi->sequence;
+	u16 slot = wifi->command_head, sequence;
 	int ret;
 	u32 stage;
 	u8 *packet, *descriptor;
-	unsigned long deadline = jiffies + msecs_to_jiffies(1500);
+	unsigned long deadline;
 
 	if (submitted)
 		*submitted = false;
@@ -785,8 +794,16 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 		return -EIO;
 	if (size > BUFFER_SIZE - 24)
 		return -EMSGSIZE;
+	ret = centauri_wait_control_idle(wifi);
+	if (ret) {
+		if (ret == -ETIMEDOUT)
+			command_fault(wifi, id, readl(wifi->a.bar + 8), "control idle timeout");
+		return ret;
+	}
 	if ((slot + 1) % ring_size[1] == index_read(wifi, 1, 1))
 		return -ENOSPC;
+	sequence = ++wifi->sequence;
+	deadline = jiffies + msecs_to_jiffies(1500);
 	packet = wifi->a.window + TX_BUFFER + slot * BUFFER_SIZE;
 	memset(packet, 0, 24 + size);
 	put_unaligned_le16(24 + size, packet + 0x10);
@@ -1208,7 +1225,6 @@ static int scan_profile27(struct centauri_t6050_wifi *wifi)
 			memcpy(scan + size + 6, ssid->ssid, ssid->ssid_len);
 			size += 6 + ssid->ssid_len;
 		}
-		wait_fw_event_before_scan(wifi);
 		ret = command(wifi, 65551, scan, size);
 		if (ret) {
 			command_refused(wifi, "scan", ret);

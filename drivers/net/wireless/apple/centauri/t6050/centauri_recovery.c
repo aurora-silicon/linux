@@ -9,21 +9,17 @@
 
 #include "centauri_recovery.h"
 
-s64 centauri_fw_event_scan_settle_remainder_ms(bool event_valid, ktime_t event_at,
-					       ktime_t now, unsigned settle_ms)
+bool centauri_control_idle_ready(bool event_valid, u32 stage_first,
+				 u32 stage_second, bool ring_drained)
 {
-	s64 elapsed;
-
-	if (!event_valid || !settle_ms)
-		return 0;
-	elapsed = ktime_to_ms(ktime_sub(now, event_at));
-	if (elapsed < 0)
-		elapsed = 0;
-	if (elapsed >= settle_ms)
-		return 0;
-	return settle_ms - elapsed;
+	if (!event_valid)
+		return true;
+	/* Settled: the control stage reads running twice in a row and the
+	 * command ring has drained, so no slot is in flight from a pre-event
+	 * command. */
+	return stage_first == 2 && stage_first == stage_second && ring_drained;
 }
-EXPORT_SYMBOL_GPL(centauri_fw_event_scan_settle_remainder_ms);
+EXPORT_SYMBOL_GPL(centauri_control_idle_ready);
 
 int centauri_t6050_boot_phase_for_control_stage(u32 control_stage,
 						enum centauri_t6050_boot_phase *phase)
@@ -174,53 +170,34 @@ static void recover_phase_null(struct kunit *test)
 			-EINVAL);
 }
 
-static void scan_settle_remainder_inside(struct kunit *test)
+static void control_idle_no_event(struct kunit *test)
 {
-	ktime_t event = ktime_set(1000, 0);
-	ktime_t now = ktime_add_ms(event, 2);
-
-	KUNIT_EXPECT_EQ(test,
-			centauri_fw_event_scan_settle_remainder_ms(true, event,
-								   now, 15),
-			13);
+	KUNIT_EXPECT_TRUE(test,
+			  centauri_control_idle_ready(false, 0, 0, false));
 }
 
-static void scan_settle_remainder_waits_out(struct kunit *test)
+static void control_idle_settled(struct kunit *test)
 {
-	ktime_t event = ktime_set(0, 0);
-	ktime_t now = ktime_add_ms(event, 10);
-
-	KUNIT_EXPECT_EQ(test,
-			centauri_fw_event_scan_settle_remainder_ms(true, event,
-								   now, 15),
-			5);
+	KUNIT_EXPECT_TRUE(test,
+			  centauri_control_idle_ready(true, 2, 2, true));
 }
 
-static void scan_settle_remainder_outside(struct kunit *test)
+static void control_idle_unstable_stage(struct kunit *test)
 {
-	ktime_t event = ktime_set(0, 0);
-	ktime_t now = ktime_add_ms(event, 15);
-
-	KUNIT_EXPECT_EQ(test,
-			centauri_fw_event_scan_settle_remainder_ms(true, event,
-								   now, 15),
-			0);
-	now = ktime_add_ms(event, 20);
-	KUNIT_EXPECT_EQ(test,
-			centauri_fw_event_scan_settle_remainder_ms(true, event,
-								   now, 15),
-			0);
+	KUNIT_EXPECT_FALSE(test,
+			   centauri_control_idle_ready(true, 2, 3, true));
 }
 
-static void scan_settle_remainder_no_event(struct kunit *test)
+static void control_idle_transitional_stage(struct kunit *test)
 {
-	ktime_t event = ktime_set(0, 0);
-	ktime_t now = ktime_add_ms(event, 2);
+	KUNIT_EXPECT_FALSE(test,
+			   centauri_control_idle_ready(true, 3, 3, true));
+}
 
-	KUNIT_EXPECT_EQ(test,
-			centauri_fw_event_scan_settle_remainder_ms(false, event,
-								   now, 15),
-			0);
+static void control_idle_slot_in_flight(struct kunit *test)
+{
+	KUNIT_EXPECT_FALSE(test,
+			   centauri_control_idle_ready(true, 2, 2, false));
 }
 
 static struct kunit_case centauri_recovery_cases[] = {
@@ -229,10 +206,11 @@ static struct kunit_case centauri_recovery_cases[] = {
 	KUNIT_CASE(recover_phase_cycle),
 	KUNIT_CASE(recover_phase_stop23),
 	KUNIT_CASE(recover_phase_null),
-	KUNIT_CASE(scan_settle_remainder_inside),
-	KUNIT_CASE(scan_settle_remainder_waits_out),
-	KUNIT_CASE(scan_settle_remainder_outside),
-	KUNIT_CASE(scan_settle_remainder_no_event),
+	KUNIT_CASE(control_idle_no_event),
+	KUNIT_CASE(control_idle_settled),
+	KUNIT_CASE(control_idle_unstable_stage),
+	KUNIT_CASE(control_idle_transitional_stage),
+	KUNIT_CASE(control_idle_slot_in_flight),
 	{}
 };
 
