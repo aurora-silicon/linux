@@ -271,6 +271,50 @@ pub(crate) enum LoaderTable {
     Firmware,
 }
 
+/// How the host starts a firmware build: RTKit and the MMIO around RUN and the endpoints.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Start {
+    /// 25G83, as qualified on hardware: RTKit wake (IOP power INIT first), the firmware's crash
+    /// buffer mapped without a reply, the host generation word zeroed after the endpoints start
+    /// and a 100 ms receive-ring drain before InitData.
+    Wake25G83,
+    /// macOS 27.2 on J773g (aura HV trace hv20, 11-20): see [`start_27_2`].
+    MacOs27_2,
+}
+
+/// The macOS 27.2 (26B123) start, copied from its trace up to the InitData doorbell:
+/// 1. before RUN, bit 0 of GFXCAXI2AF `+0x104` and `+0x108` is set (read, then written);
+/// 2. RTKit boots without an IOP power request: HELLO 12, the crash-log endpoint starts while
+///    the endpoint map is handled, the firmware's own crash buffer request (its shared RO
+///    segment) is sent back unchanged, the host hands it a 0x8000-byte log buffer of its own
+///    ([`MSG_LOG_BUFFER`], 8 pages at a host-window VA), then AP power state ON (0x20);
+/// 3. the host block at SGX+0xd60000 is zeroed in [`HOST_BLOCK_ZERO_ORDER`], the scratch word
+///    at SGX+0xd640c0 is read, [`HOST_READY`] is read and set to 1;
+/// 4. endpoints 0x20 and 0x21 start and the InitData doorbell follows at once.
+pub(crate) mod start_27_2 {
+    /// GFXCAXI2AF registers (register-map slot 22, PA 0x301000000), from SGX.
+    pub(crate) const AXI2AF: usize = 0x1000000;
+    /// The two GFXCAXI2AF words whose bit 0 the host sets before RUN.
+    pub(crate) const AXI2AF_ENABLES: [usize; 2] = [0x104, 0x108];
+    /// The 32-bit writes of zero to the host block (SGX+0xd60000), in macOS's order.
+    pub(crate) const HOST_BLOCK_ZERO_ORDER: [usize; 13] = [
+        0x00, 0x20, 0x40, 0x08, 0x28, 0x48, 0x10, 0x30, 0x50, 0x18, 0x38, 0x58, 0x60,
+    ];
+    /// The host block word macOS reads and then sets to 1 before the endpoints start.
+    pub(crate) const HOST_READY: usize = 0x60;
+    /// The scratch word macOS reads between the two (SGX offset; 0x77895175 in hv20).
+    pub(crate) const SCRATCH_PROBE: usize = 0xd640c0;
+    /// RTKit crash-log endpoint.
+    pub(crate) const EP_CRASHLOG: u8 = 1;
+    /// Host log buffer message on the crash-log endpoint: the size in 4 KiB pages at bit 44
+    /// and the buffer's address below it (0x00908c20c0540000 in hv20).
+    pub(crate) const MSG_LOG_BUFFER: u64 = 0x9 << 52;
+    pub(crate) const MSG_LOG_BUFFER_PAGES_SHIFT: u32 = 44;
+    pub(crate) const MSG_LOG_BUFFER_ADDR_MASK: u64 = (1 << 44) - 1;
+    /// The host log buffer's size (`coredump-copy-buffer` in the 27.2 nub).
+    pub(crate) const LOG_BUFFER_SIZE: usize = 0x8000;
+}
+
 /// The two magic words of the PPL handoff page.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct PplMagic {
@@ -306,6 +350,8 @@ pub(crate) struct FwLayout {
     /// How the firmware's register table in loaded DATA is filled; `None` until known, which
     /// refuses the firmware.
     pub(crate) loader_table: Option<LoaderTable>,
+    /// How the host starts this firmware.
+    pub(crate) start: Start,
 }
 
 impl FwLayout {
@@ -377,6 +423,7 @@ pub(crate) const FW_25G83: FwLayout = FwLayout {
         answers: false,
     }),
     loader_table: Some(LoaderTable::Host(0x1332f0)),
+    start: Start::Wake25G83,
 };
 
 /// 26B123 (macOS 27.2, also 26B131): __TEXT 0x64000, __DATA 0xd0000 and a __DATA_SHARED_RO
@@ -411,6 +458,7 @@ pub(crate) const FW_26B123: FwLayout = FwLayout {
         answers: true,
     }),
     loader_table: Some(LoaderTable::Firmware),
+    start: Start::MacOs27_2,
 };
 
 /// The firmware layouts this backend knows, newest last.

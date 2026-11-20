@@ -30,7 +30,7 @@ use super::event::Events;
 use super::fw::channels::DevCtl;
 use super::hw::{self, LoaderTable};
 use super::initdata::{self, InitData};
-use super::object::Objects;
+use super::object::{Class, Objects, Placement, Request};
 use super::{regs, uat, Config, Shared};
 use crate::driver::AsahiDrmDevice;
 use crate::{mmu, regs as shared_regs};
@@ -288,7 +288,7 @@ unsafe extern "C" fn rtkit_shmem_destroy(
 }
 
 /// The GPU's RTKit callbacks.
-static RTKIT_OPS: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+const RTKIT_OPS_BASE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
     flags: 0,
     crashed: Some(rtkit_crashed),
     recv_message: Some(rtkit_recv),
@@ -299,6 +299,62 @@ static RTKIT_OPS: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
     syslog_is_debug: None,
     protocol_version: 12,
 };
+
+/// 25G83: the firmware's crash buffer is mapped without a reply.
+static RTKIT_OPS: bindings::apple_rtkit_ops = RTKIT_OPS_BASE;
+
+/// macOS 27.2: the crash-log endpoint starts while the endpoint map is handled, and the
+/// firmware's request for its own crash buffer is sent back unchanged.
+static RTKIT_OPS_27_2: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+    flags: bindings::APPLE_RTKIT_COPROC_PLACES_BUFFERS,
+    ..RTKIT_OPS_BASE
+};
+
+// The log buffer the 27.2 start hands over is the crash copy buffer HW data sizes.
+const _: () = assert!(hw::start_27_2::LOG_BUFFER_SIZE as u64 == super::fw::initdata::COREDUMP_COPY_SIZE);
+
+/// The host log buffer message the 27.2 start sends from RTKit's `before_ap` hook.
+struct LogBuffer {
+    rtk: *mut bindings::apple_rtkit,
+    shared: *const Shared,
+    message: u64,
+    result: core::ffi::c_int,
+}
+
+/// RTKit `before_ap` hook of the 27.2 start: once the firmware's own crash buffer has been
+/// set up (and its request sent back), hands it the host log buffer, as macOS does right
+/// before AP power-on.
+///
+/// # Safety
+///
+/// `data` must point to a live [`LogBuffer`] exclusively borrowed for this call, whose `rtk`
+/// is the RTKit instance running the hook and whose `shared` outlives it.
+unsafe extern "C" fn publish_log_buffer(data: *mut c_void) {
+    // SAFETY: By the function's contract.
+    let log = unsafe { &mut *data.cast::<LogBuffer>() };
+    // SAFETY: By the function's contract.
+    let shared = unsafe { &*log.shared };
+    let start = Instant::<Monotonic>::now();
+    while matches!(shared.rtkit_buffer.load(Ordering::Acquire), 0 | u64::MAX) {
+        if start.elapsed() > Delta::from_millis(1000) {
+            log.result = ETIMEDOUT.to_errno();
+            return;
+        }
+        fsleep(Delta::from_millis(1));
+    }
+    // The request is sent back right after its setup returns; keep macOS's order.
+    fsleep(Delta::from_millis(1));
+    // SAFETY: `log.rtk` is the live RTKit instance running this hook.
+    log.result = unsafe {
+        bindings::apple_rtkit_send_message(
+            log.rtk,
+            hw::start_27_2::EP_CRASHLOG,
+            log.message,
+            core::ptr::null_mut(),
+            false,
+        )
+    };
+}
 
 /// The GPU's RTKit client. Never freed: the firmware session lasts until reboot.
 ///
@@ -316,11 +372,15 @@ unsafe impl Sync for Rtkit {}
 
 impl Rtkit {
     /// Initializes the sole RTKit owner on the default mailbox (retained).
-    fn new(dev: &device::Device, shared: &Arc<Shared>) -> Result<Self> {
+    fn new(
+        dev: &device::Device,
+        shared: &Arc<Shared>,
+        ops: &'static bindings::apple_rtkit_ops,
+    ) -> Result<Self> {
         let cookie = Arc::into_raw(shared.clone()) as *mut c_void;
         // SAFETY: `dev` is valid, the name is a NUL-terminated string and the ops are static.
         let rtk = from_err_ptr(unsafe {
-            bindings::apple_rtkit_init(dev.as_raw(), cookie, core::ptr::null(), 0, &RTKIT_OPS)
+            bindings::apple_rtkit_init(dev.as_raw(), cookie, core::ptr::null(), 0, ops)
         });
         match rtk {
             // INVARIANT: The cookie stays leaked from here on.
@@ -347,6 +407,21 @@ impl Rtkit {
     pub(crate) fn warm_restart(&mut self) -> Result {
         // SAFETY: `rtk` is live by the type invariant.
         to_result(unsafe { bindings::apple_rtkit_warm_restart(self.rtk) })
+    }
+
+    /// Waits for the firmware to report in without an IOP power request, runs `before_ap`, then
+    /// sets the AP on.
+    ///
+    /// # Safety
+    ///
+    /// `before_ap` must be safe to call with `data`, from this thread, during this call.
+    unsafe fn boot_with(
+        &mut self,
+        before_ap: unsafe extern "C" fn(*mut c_void),
+        data: *mut c_void,
+    ) -> Result {
+        // SAFETY: `rtk` is live by the type invariant; the caller vouches for the hook.
+        to_result(unsafe { bindings::apple_rtkit_boot_with(self.rtk, Some(before_ap), data) })
     }
 
     /// Waits for the firmware to report in, and sets the AP on.
@@ -636,10 +711,34 @@ fn run(
     session: &mut Session,
     events: &mut Events,
     built: &mut (InitData, Channels, u32),
+    log_buffer: Option<u64>,
 ) -> Result {
     let dev = session.dev.clone();
     let (init, channels, _) = built;
-    session.rtkit.wake()?;
+    let kind = session.adt.layout.start;
+    match kind {
+        hw::Start::Wake25G83 => session.rtkit.wake()?,
+        hw::Start::MacOs27_2 => {
+            use hw::start_27_2 as s;
+            let va = log_buffer.ok_or(EINVAL)?;
+            let mut log = LogBuffer {
+                rtk: session.rtkit.as_raw(),
+                shared: &*session.shared,
+                message: s::MSG_LOG_BUFFER
+                    | (((s::LOG_BUFFER_SIZE >> 12) as u64) << s::MSG_LOG_BUFFER_PAGES_SHIFT)
+                    | (va & s::MSG_LOG_BUFFER_ADDR_MASK),
+                result: 0,
+            };
+            // SAFETY: `log` lives on this stack frame across the call and nothing else
+            // borrows it; the hook runs on this thread before `boot_with` returns.
+            unsafe {
+                session
+                    .rtkit
+                    .boot_with(publish_log_buffer, (&raw mut log).cast())?
+            };
+            to_result(log.result)?;
+        }
+    }
     let start = Instant::<Monotonic>::now();
     while matches!(
         session.shared.rtkit_buffer.load(Ordering::Acquire),
@@ -659,15 +758,23 @@ fn run(
     {
         return Err(eproto());
     }
+    if kind == hw::Start::MacOs27_2 {
+        let probe = session.regs.publish_host_block()?;
+        dev_info!(dev, "G16: 27.2 host block published, scratch {:#x}\n", probe);
+    }
     session.rtkit.start_endpoint(hw::ep::FIRMWARE)?;
     session.rtkit.start_endpoint(hw::ep::DOORBELL)?;
-    for _ in 0..10 {
-        fsleep(Delta::from_millis(10));
-        channels.drain_rings(&dev, events)?;
-        session.check()?;
-    }
     let devctl = init.abi.devctl();
-    session.regs.set_generation(0)?;
+    if kind == hw::Start::Wake25G83 {
+        for _ in 0..10 {
+            fsleep(Delta::from_millis(10));
+            channels.drain_rings(&dev, events)?;
+            session.check()?;
+        }
+        session.regs.set_generation(0)?;
+    }
+    // Kept from 25G83 on 27.2 too: whether macOS stages a device-control record before the
+    // InitData doorbell is not visible in its MMIO trace (no host generation write there).
     channels.stage_boot_nop(session, devctl.nop)?;
     match session.adt.layout.loader_table {
         Some(LoaderTable::Host(offset)) => publish_loader_table(session, init, offset)?,
@@ -738,6 +845,10 @@ pub(crate) fn start(
         dev_err!(d, "PMP AGX vote failed: {}\n", ret);
         return Err(Error::from_errno(ret));
     }
+    let kind = adt.layout.start;
+    if kind == hw::Start::MacOs27_2 {
+        regs.enable_axi2af()?;
+    }
     let id = regs.identity()?;
     dev_info!(
         d,
@@ -797,7 +908,11 @@ pub(crate) fn start(
         core::mem::forget(objects);
         return Err(e);
     }
-    let rtkit = match Rtkit::new(&d, shared) {
+    let ops = match kind {
+        hw::Start::Wake25G83 => &RTKIT_OPS,
+        hw::Start::MacOs27_2 => &RTKIT_OPS_27_2,
+    };
+    let rtkit = match Rtkit::new(&d, shared, ops) {
         Ok(rtkit) => rtkit,
         Err(e) => {
             core::mem::forget(objects);
@@ -822,6 +937,22 @@ pub(crate) fn start(
             // The running firmware may report any state of the board's table, up to S10 on J773g.
             session.regs.set_table(init.rows);
         }
+        let log_buffer = match kind {
+            hw::Start::MacOs27_2 => Some(
+                objects
+                    .alloc(Request {
+                        size: hw::start_27_2::LOG_BUFFER_SIZE,
+                        class: Class::Fw,
+                        placement: Placement::Anywhere,
+                        offset: 0,
+                        client: None,
+                        lower: None,
+                        cpu: true,
+                    })?
+                    .va,
+            ),
+            hw::Start::Wake25G83 => None,
+        };
         objects.window.lock().bootstrap(&d, &session.uat)?;
         uat::tlbi_all();
         if session.regs.asc_control()? & regs::ASC_RUN != 0 {
@@ -834,7 +965,12 @@ pub(crate) fn start(
             return Err(EIO);
         }
         objects.window.lock().await_firmware_magic(&d)?;
-        run(&mut session, &mut events, built.as_mut().ok_or(EINVAL)?)
+        run(
+            &mut session,
+            &mut events,
+            built.as_mut().ok_or(EINVAL)?,
+            log_buffer,
+        )
     })();
     if let Err(e) = result {
         dev_err!(
