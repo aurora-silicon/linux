@@ -532,6 +532,9 @@ struct sn201202x {
 	bool entry_asleep;
 	/* Register accesses that reached it meanwhile */
 	unsigned int entry_strays;
+	/* J714s: macOS's USBw 0x09 after the PHYs' stop, handed back at the wake */
+	struct notifier_block usbw_nb;
+	bool usbw_macos;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];

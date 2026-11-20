@@ -9,6 +9,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/spmi.h>
 #include <linux/suspend.h>
 #include <linux/usb/role.h>
@@ -880,6 +881,8 @@ static int sn201202x_init(struct sn201202x *sn)
 	return -EPROBE_DEFER;
 }
 
+static int sn201202x_usbw_notify(struct notifier_block *nb, unsigned long usb_asleep, void *unused);
+
 static int sn201202x_probe(struct spmi_device *device)
 {
 	const struct of_device_id *match;
@@ -1008,6 +1011,12 @@ static int sn201202x_probe(struct spmi_device *device)
 	tps->data->irq_handler(tps->irq, tps);
 
 	sn201202x_idle_sleep_start(tps);
+	if (sn201202x_j714s()) {
+		sn->usbw_nb.notifier_call = sn201202x_usbw_notify;
+		ret = apple_sleep_usb_asleep_notifier_register(&sn->usbw_nb);
+		if (ret)
+			dev_warn(tps->dev, "USB wake arm: not registered: %d\n", ret);
+	}
 	if (sn201202x_sleep_board())
 		dev_info(tps->dev, "port controller ready%s\n", sn->polled ? ", polled" : "");
 	return 0;
@@ -1018,6 +1027,8 @@ static void sn201202x_remove(struct spmi_device *device)
 	struct tps6598x *tps = spmi_device_get_drvdata(device);
 	struct sn201202x *sn = tps_to_sn(tps);
 
+	if (sn->usbw_nb.notifier_call)
+		apple_sleep_usb_asleep_notifier_unregister(&sn->usbw_nb);
 	sn201202x_idle_sleep_stop(tps);
 	tipd_remove(tps);
 	spmi_command_sleep(sn->sdev);
@@ -1030,6 +1041,11 @@ static void sn201202x_remove(struct spmi_device *device)
  * whose own S0 now finds it done. For an empty USB-C port macOS uses 0x02, for an
  * attached one and MagSafe 0x00; Linux has only S0, which this keeps.
  */
+/* J714s: macOS's USBw modes, see sn201202x_usbw_notify() */
+#define SN201202X_USBW_ARM		0x09
+#define SN201202X_USBW_HAND_BACK	0x80
+#define SN201202X_USBW_OFF		0x00
+
 static void sn201202x_wake_macos(struct sn201202x *sn, int woken)
 {
 	struct tps6598x *tps = &sn->cd.tps;
@@ -1046,6 +1062,15 @@ static void sn201202x_wake_macos(struct sn201202x *sn, int woken)
 	scoped_guard(mutex, &tps->lock) {
 		ret = cd321x_wake_events(tps, event, &status, &data_status);
 		s0 = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+		/* macOS's hand-back in the same window, see sn201202x_usbw_notify() */
+		if (sn->usbw_macos) {
+			int back = tipd_usbw_locked(tps, SN201202X_USBW_HAND_BACK);
+			int off = tipd_usbw_locked(tps, SN201202X_USBW_OFF);
+
+			sn->usbw_macos = false;
+			dev_info(tps->dev, "sleep wake: USBw %#x: %d, USBw %#x: %d\n",
+				 SN201202X_USBW_HAND_BACK, back, SN201202X_USBW_OFF, off);
+		}
 	}
 	dev_info(tps->dev, "sleep wake: events %*phN cleared: %d; status %#010x, data status %#010x; S0: %d, %lld ms after the WAKEUP; %u register accesses while asleep\n",
 		 CD321X_WAKE_EVENT_LEN, event, ret, status, data_status, s0,
@@ -1165,6 +1190,57 @@ out_put:
 	return err;
 }
 EXPORT_SYMBOL_IF_KUNIT(sn201202x_suspend);
+
+/*
+ * J714s (macOS's sleeps traced with and without a partner): macOS arms USB wake on every USB-C
+ * port controller with a partner, never on MagSafe's, in a window of its own 0.5 ms after
+ * the port's PHY has stopped and 54-73 ms after its SSPS 0x03: (WAKEUP) CMD1 idle read, DATA1 =
+ * 0x09, USBw, its end read, DATA1 read, SLEEP; no SYS_PWR_STATE read and nothing else. At the
+ * wake, in the same window as its SSPS 0x00: USBw 0x80, then USBw 0x00. Linux armed none (no
+ * apple,usb-remote-wake). With macos_usbw on and the macOS entry, apple-sleep's .prepare_late
+ * (after every noirq suspend) calls sn201202x_usbw_notify().
+ */
+static bool macos_usbw = true;
+module_param(macos_usbw, bool, 0644);
+MODULE_PARM_DESC(macos_usbw, "J714s: USBw 0x09 after the PHYs' stop for a port with a partner, 0x80 and 0x00 at the wake, as macOS does (0: none)");
+
+static int sn201202x_usbw_notify(struct notifier_block *nb, unsigned long usb_asleep, void *unused)
+{
+	struct sn201202x *sn = container_of(nb, struct sn201202x, usbw_nb);
+	struct tps6598x *tps = &sn->cd.tps;
+	struct fwnode_handle *con;
+	ktime_t start;
+	int ret;
+
+	sn->usbw_macos = false;
+	if (!READ_ONCE(macos_usbw) || !sn->macos_entry || !pm_suspend_via_firmware())
+		return NOTIFY_DONE;
+	/* MagSafe's controller has no connector and never gets it */
+	con = device_get_named_child_node(tps->dev, "connector");
+	fwnode_handle_put(con);
+	if (!con)
+		return NOTIFY_DONE;
+	guard(mutex)(&tps->lock);
+	if (!tps->partner)
+		return NOTIFY_DONE;
+	start = ktime_get();
+	WRITE_ONCE(sn->atomic, true);
+	ret = sn201202x_wake_poll(sn, true);
+	if (!ret) {
+		ret = tipd_usbw_locked(tps, SN201202X_USBW_ARM);
+		/*
+		 * Even a USBw whose end wasn't seen can have taken the USB2 lines (seen with plain
+		 * CMD1 reads: every USB device on both USB-C ports gone after the wake, the dock's
+		 * until a reboot): the wake hands them back whenever it went out.
+		 */
+		sn->usbw_macos = true;
+	}
+	spmi_command_sleep(sn->sdev);
+	WRITE_ONCE(sn->atomic, false);
+	dev_info(tps->dev, "sleep entry: USBw %#x after the PHYs' stop (a USB host asleep in place: %lu): %d, %lld us\n",
+		 SN201202X_USBW_ARM, usb_asleep, ret, ktime_us_delta(ktime_get(), start));
+	return NOTIFY_DONE;
+}
 
 /*
  * J714s: enter the sleep as macOS does (its sleeps traced on the J714s). There, each

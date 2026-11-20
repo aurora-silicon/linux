@@ -4040,6 +4040,7 @@ int tipd_usbw_locked(struct tps6598x *tps, u8 mode)
 	return tps6598x_exec_cmd_gap(tps, "USBw", sizeof(mode), &mode, 0, NULL, 1000, 0,
 				     CD321X_SSPS_READ_GAP_US);
 }
+EXPORT_SYMBOL_GPL(tipd_usbw_locked);
 
 static void tipd_usbw(struct tps6598x *tps, u8 mode)
 {
