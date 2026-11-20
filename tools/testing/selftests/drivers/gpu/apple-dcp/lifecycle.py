@@ -520,6 +520,11 @@ static void __attribute__((unused)) dcp_relink_link_up(int *s, u64 generation, u
  CHECK(!roles && port.pm.phase == CD321X_PM_REVALIDATE);
  CHECK(sink.connected && !notices && !port.display_route_active);
 ''')
+    # The J714s's macOS USBw after an attach is a port controller command, not part of these
+    # display scenarios: the update calls it, and here it does nothing.
+    if 'cd321x_macos_usbw(cd321x);' in funcs:
+        shim += ('\nstruct cd321x;\n'
+                 'static void cd321x_macos_usbw(struct cd321x *cd321x) { (void)cd321x; }\n')
     # How long a held mux has been retried is measured on the driver's clock.
     if 'jiffies_to_msecs(jiffies)' in funcs:
         shim += ('\nstatic unsigned long jiffies;\n'
