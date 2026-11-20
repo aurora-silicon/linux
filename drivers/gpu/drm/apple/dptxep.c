@@ -1654,7 +1654,13 @@ int dptxep_init(struct apple_dcp *dcp)
 			 * kIOReturnNoDevice (0xe00002c0). Leave the endpoint
 			 * up so a later announce can still bind.
 			 */
-			if (dcp_fw_is_14_7(dcp) || dcp_is_ext26(dcp)) {
+			/*
+			 * A firmware-27 external processor on the M1/M2 generation
+			 * (T8112's 27.2 dcpext) does not announce it at boot either.
+			 */
+			if (dcp_fw_is_14_7(dcp) || dcp_is_ext26(dcp) ||
+			    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+			     of_device_is_compatible(dcp->dev->of_node, "apple,dcpext"))) {
 				dev_info(dcp->dev,
 					 "DPTX port %u not announced yet\n", port);
 				return 0;
