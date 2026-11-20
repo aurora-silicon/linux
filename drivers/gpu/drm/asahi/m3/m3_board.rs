@@ -446,12 +446,7 @@ pub(crate) fn admit(pdev: &platform::Device<Core<'_>>, soc: &Soc) -> Result<Reso
         .map_err(|e| refuse("no firmware handoff description", e))?;
     let vas: KVec<u64> = node.get_property(c_str!("apple,firmware-segment-vas"))?;
     let flags: KVec<u32> = node.get_property(c_str!("apple,firmware-segment-flags"))?;
-    Resources::validate(
-        version,
-        regions,
-        vas.as_slice().try_into().map_err(|_| EINVAL)?,
-        flags.as_slice().try_into().map_err(|_| EINVAL)?,
-    )
+    Resources::validate_segments(version, regions, vas.as_slice(), flags.as_slice())
     .map_err(|e| {
         dev_info!(dev, "M3: not admitted: handoff description rejected ({:?})\n", e);
         EINVAL

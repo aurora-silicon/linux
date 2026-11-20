@@ -481,7 +481,7 @@ mod tests {
             let mut regions = [Region { base: 0, size: 0 }; 6];
             regions[4].size = layout.text_size;
             regions[5].size = layout.data_size;
-            let mut resources = Resources { regions, firmware_vas: layout.vas };
+            let mut resources = Resources { regions, firmware_vas: layout.vas, shared_ro_size: 0 };
             assert!(Firmware::matching_layout(layout, &resources));
             assert!(!Firmware::matching_layout(other, &resources));
             resources.firmware_vas[1] += 0x4000;
