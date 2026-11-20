@@ -215,6 +215,68 @@ static void t8122_wide_print(void)
 	t8122_dc_puts("\nWIDE end\n");
 }
 
+/*
+ * J613 trial: macOS's values for words the whole-range diff found different at the commit
+ * (macOS capture run 77 against n52's hold), written in the given order just before the power
+ * gates. "addr:val,addr:val,..." (hex), at most 64. A main-PMGR power word written to a lower
+ * target is then polled (up to 1 ms) for its actual state to follow.
+ */
+#define T8122_WIDE_SET_MAX	64
+static char *t8122_wide_set;
+module_param(t8122_wide_set, charp, 0400);
+MODULE_PARM_DESC(t8122_wide_set, "J613 trial: addr:val,... (hex) written at the commit, before the gates (macOS's values from the wide diff)");
+static struct {
+	u64 addr;
+	u32 val;
+	void __iomem *reg;
+} t8122_wset[T8122_WIDE_SET_MAX];
+static unsigned int t8122_nwset;
+
+static void t8122_wide_set_setup(struct device *dev)
+{
+	char *buf, *p, *tok;
+
+	if (!t8122_wide_set || !*t8122_wide_set)
+		return;
+	buf = kstrdup(t8122_wide_set, GFP_KERNEL);
+	if (!buf)
+		return;
+	p = buf;
+	while ((tok = strsep(&p, ",")) && t8122_nwset < T8122_WIDE_SET_MAX) {
+		char *colon = strchr(tok, ':');
+		u64 a;
+		u32 v;
+
+		if (!colon)
+			continue;
+		*colon = 0;
+		if (kstrtou64(tok, 16, &a) || kstrtou32(colon + 1, 16, &v) || (a & 3) ||
+		    a < 0x200000000ULL || a >= 0x300000000ULL)
+			continue;
+		t8122_wset[t8122_nwset].reg = ioremap_np(a, 4);
+		if (!t8122_wset[t8122_nwset].reg)
+			continue;
+		t8122_wset[t8122_nwset].addr = a;
+		t8122_wset[t8122_nwset].val = v;
+		t8122_nwset++;
+	}
+	kfree(buf);
+	dev_info(dev, "J613 trial: %u words set to macOS's at the commit\n", t8122_nwset);
+}
+
+static void t8122_wide_set_apply(void)
+{
+	unsigned int i;
+	u32 v;
+
+	for (i = 0; i < t8122_nwset; i++) {
+		writel(t8122_wset[i].val, t8122_wset[i].reg);
+		if (t8122_wset[i].addr >= 0x2d0700000ULL && t8122_wset[i].addr < 0x2d0714000ULL)
+			readl_poll_timeout_atomic(t8122_wset[i].reg, v,
+						  ((v >> 4) & 0xf) <= (t8122_wset[i].val & 0xf), 1, 1000);
+	}
+}
+
 static unsigned int t8122_wfi_regs;
 module_param(t8122_wfi_regs, uint, 0600);
 MODULE_PARM_DESC(t8122_wfi_regs, "J613 DIAGNOSTIC: print every core's state at its last WFI (bit 0 architectural, bit 1 also three IMPDEF words)");
@@ -868,6 +930,7 @@ static int t8122_sleep_map_regs(struct apple_sleep *s)
 	}
 	if (t8122_wide_dump)
 		t8122_wide_setup();
+	t8122_wide_set_setup(s->dev);
 	t8122.hpm_notify = t8122_map(s, "spmi-hpm", NULL);
 	if (IS_ERR(t8122.hpm_notify))
 		return dev_err_probe(s->dev, PTR_ERR(t8122.hpm_notify), "no spmi-hpm registers\n");
@@ -1499,6 +1562,7 @@ static void t8122_sleep_commit_regs(struct apple_sleep *s)
 	if (t8122_macos_state)
 		t8122_macos_state_apply(s);
 	t8122_link_release_apply();
+	t8122_wide_set_apply();
 
 	writel(PWRGATE_ON, s->pwrgate + T8122_PWRGATE_E);
 	writel(PWRGATE_ON, s->pwrgate + T8122_PWRGATE_P);
