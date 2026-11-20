@@ -887,15 +887,19 @@ static struct platform_driver apple_dart_driver;
 static const struct iommu_ops apple_dart_iommu_ops;
 static bool apple_dart_fault_pending(struct apple_dart *dart);
 
-/* READY bring-up only: userspace must arm its watchdog before probing SID23. */
-static bool apple_dart_dcp_enabled;
+/*
+ * On the qualified T8132 firmware path the kernel adopts the internal display
+ * DARTs that iBoot leaves live, after checking their inherited state. Boot with
+ * apple_dart.j713_dcp=0 or apple_dart.j713_display=0 to leave them untouched.
+ */
+static bool apple_dart_dcp_enabled = true;
 
 module_param_named(j713_dcp, apple_dart_dcp_enabled, bool, 0600);
-MODULE_PARM_DESC(j713_dcp, "Enable explicit J713 DCP DART probe after arming watchdog");
+MODULE_PARM_DESC(j713_dcp, "Adopt the inherited T8132 internal DCP DART (default: on; 0 leaves it untouched)");
 
-static bool apple_dart_frontend_enabled;
+static bool apple_dart_frontend_enabled = true;
 module_param_named(j713_display, apple_dart_frontend_enabled, bool, 0600);
-MODULE_PARM_DESC(j713_display, "Enable explicit J713 display DART admission after arming watchdog");
+MODULE_PARM_DESC(j713_display, "Adopt the inherited T8132 internal display DART (default: on; 0 leaves it untouched)");
 
 static int apple_dart_dcp_invalidate_tlb(struct apple_dart_stream_map *stream_map);
 
@@ -5352,8 +5356,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 
 	/*
 	 * The M4 internal display DARTs are live: DCP firmware (SID23)
-	 * and the scanout/PIODMA frontend (SID0/SID16) keep using them. Leave
-	 * both untouched until userspace, with its watchdog armed, opts in.
+	 * and the scanout/PIODMA frontend (SID0/SID16) keep using them. They
+	 * are adopted unless j713_dcp=0 or j713_display=0 says otherwise.
 	 */
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	j713_display = res && !tunneled && apple_t8132_firmware_path() &&
@@ -5389,7 +5393,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (j713_display &&
 	    ((res->start == 0x30a300000ULL && !READ_ONCE(apple_dart_frontend_enabled)) ||
 	     (res->start == 0x30a340000ULL && !READ_ONCE(apple_dart_dcp_enabled)))) {
-		dev_info(dev, "Leaving inherited display DART untouched; explicit guarded probe required\n");
+		dev_info(dev, "Leaving inherited display DART untouched (j713_dcp/j713_display=0)\n");
 		return -ENODEV;
 	}
 	if (j713_dcpext) {
