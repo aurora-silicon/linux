@@ -30,6 +30,7 @@ const char *iomfb_v26_6_board_name(const struct dcp_v26_board *board);
 int iomfb_v26_6_probe(struct apple_dcp *dcp);
 /* J613 trial: the firmware session's RTKit (the 26.6 path keeps it here, not in dcp->rtk). */
 struct apple_rtkit *dcp_v26_rtkit(struct apple_dcp *dcp);
+int dcp_v26_j613_sleep_calls(struct apple_dcp *dcp);
 /* Component bind: the running DCP's RTKit session. */
 int iomfb_v26_6_bind(struct apple_dcp *dcp);
 /* Component unbind: KMS goes away; the firmware session is kept until reboot. */

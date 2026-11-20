@@ -1929,6 +1929,41 @@ void iomfb_v26_6_poweroff(struct apple_dcp *dcp)
 	}
 }
 
+/*
+ * J613 trial: the calls the 26.6 firmware receives at the start of a system sleep, in the order
+ * and with the inputs observed on its mailbox and RPC memory during macOS's sleep entry (capture
+ * run 68, 49 ms before the first commit write, the panel already off): A478 (no input, 4-byte
+ * reply 1), A476 (u32 1), A473 (16 bytes: byte 8, 11 and 12 set to 1; 8-byte reply 0; the DCP
+ * calls back D300 during it), A115 (no input, 4-byte reply 0), A500 (two bytes 0, 1). What each
+ * call does is not known beyond that; the replies are logged, not checked.
+ */
+int dcp_v26_j613_sleep_calls(struct apple_dcp *dcp)
+{
+	static const u8 a473_in[16] = { [8] = 1, [11] = 1, [12] = 1 };
+	static const u8 a500_in[4] = { 0, 1 };
+	struct apple_dcp_v26 *v26 = dcp->v26;
+	__le32 one = cpu_to_le32(1), r478 = 0, r115 = 0;
+	u8 r473[8] = {};
+	int ret;
+
+	if (!v26 || !v26->started)
+		return -ENODEV;
+	mutex_lock(&v26->lock);
+	ret = dcp_v26_call(v26, A(478), NULL, 0, &r478, sizeof(r478), 0);
+	if (!ret)
+		ret = dcp_v26_call(v26, A(476), &one, sizeof(one), NULL, 0, 0);
+	if (!ret)
+		ret = dcp_v26_call(v26, A(473), a473_in, sizeof(a473_in), r473, sizeof(r473), 0);
+	if (!ret)
+		ret = dcp_v26_call(v26, A(115), NULL, 0, &r115, sizeof(r115), 0);
+	if (!ret)
+		ret = dcp_v26_call(v26, A(500), a500_in, sizeof(a500_in), NULL, 0, 0);
+	mutex_unlock(&v26->lock);
+	dev_warn(v26->dev, "J613 sleep calls: %d (A478 %#x, A473 %8ph, A115 %#x)\n", ret,
+		 le32_to_cpu(r478), r473, le32_to_cpu(r115));
+	return ret;
+}
+
 struct apple_rtkit *dcp_v26_rtkit(struct apple_dcp *dcp)
 {
 	return dcp->v26 ? dcp->v26->rtk : NULL;
