@@ -193,6 +193,22 @@ static void t8122_wide_setup(void)
 			t8122_wide_map[i] = ioremap_np(t8122_wide[i].base, t8122_wide[i].size);
 }
 
+/*
+ * The 0x80-byte controller blocks at 0x2d0725000..0x2d0726fff: bit 30 of each +0x10 word.
+ * macOS has it set in six blocks (1, 2, 4, 5, 6, 7) where Linux's hold reads it clear, and
+ * writing it doesn't stick (n53). One bit per block, block 0 in bit 0.
+ */
+static u64 t8122_ctl_active(void __iomem *pwrgate)
+{
+	u64 m = 0;
+	unsigned int i;
+
+	for (i = 0; i < 64; i++)
+		if (readl(pwrgate + 0x1000 + i * 0x80 + 0x10) & BIT(30))
+			m |= BIT_ULL(i);
+	return m;
+}
+
 static void t8122_wide_print(void)
 {
 	unsigned int i;
@@ -928,8 +944,11 @@ static int t8122_sleep_map_regs(struct apple_sleep *s)
 		if (IS_ERR(t8122.dump_aon))
 			t8122.dump_aon = NULL;
 	}
-	if (t8122_wide_dump)
+	if (t8122_wide_dump) {
 		t8122_wide_setup();
+		dev_info(s->dev, "J613 diagnostic: controller blocks active at probe %016llx\n",
+			 t8122_ctl_active(s->pwrgate));
+	}
 	t8122_wide_set_setup(s->dev);
 	t8122.hpm_notify = t8122_map(s, "spmi-hpm", NULL);
 	if (IS_ERR(t8122.hpm_notify))
@@ -1827,8 +1846,12 @@ static void t8122_sleep_pre_commit(struct apple_sleep *s)
 	}
 	/* The hold: the commit word is not written, and the next thing is a reset from outside. */
 	if (READ_ONCE(sleep_untested_hold)) {
-		if (t8122_wide_dump)
+		if (t8122_wide_dump) {
+			t8122_dc_puts("\nCTL ");
+			t8122_dc_hex(upper_32_bits(t8122_ctl_active(s->pwrgate)));
+			t8122_dc_hex(lower_32_bits(t8122_ctl_active(s->pwrgate)));
 			t8122_wide_print();
+		}
 		t8122_dc_puts(" HOLD before commit\n");
 	}
 }
