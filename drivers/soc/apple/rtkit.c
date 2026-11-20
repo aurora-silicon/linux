@@ -10,6 +10,7 @@
 
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/jiffies.h>
 #include <linux/of.h>
 #include <linux/overflow.h>
@@ -146,6 +147,7 @@ struct apple_rtkit_rx_work {
 	struct apple_rtkit *rtk;
 	u8 ep;
 	u64 msg;
+	u64 received_ns;
 	struct work_struct work;
 };
 
@@ -1348,6 +1350,25 @@ static void apple_rtkit_syslog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 }
 
+/* Where a counter has only ever run unanswered: nothing is echoed. */
+static bool apple_rtkit_oslog_unanswered(struct apple_rtkit *rtk)
+{
+	return !rtk->oslog_echo &&
+	       (rtk->sync_syslog_ack || of_machine_is_compatible("apple,t8140") ||
+		of_machine_is_compatible("apple,t8142"));
+}
+
+/* An OSLOG counter that is answered with its echo, on any lane. */
+static bool apple_rtkit_oslog_echoed(struct apple_rtkit *rtk, u64 msg)
+{
+	if (rtk->oslog_echo)
+		return true;
+	if (apple_rtkit_oslog_unanswered(rtk))
+		return false;
+	return (rtk->oslog_buffer.size || rtk->oslog_inherited) &&
+	       !(msg & APPLE_RTKIT_OSLOG_LOG_RESERVED);
+}
+
 static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_OSLOG_TYPE, msg);
@@ -1371,11 +1392,12 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 		return;
 	}
 
-	/* Preserve the tested Neo/M5 and synchronous-log no-ACK policy. */
-	if (type == APPLE_RTKIT_OSLOG_LOG &&
-	    (rtk->sync_syslog_ack || of_machine_is_compatible("apple,t8140") ||
-	     of_machine_is_compatible("apple,t8142"))) {
-		dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
+	if (type == APPLE_RTKIT_OSLOG_LOG && !apple_rtkit_oslog_echoed(rtk, msg)) {
+		/* Preserve the tested Neo/M5 and synchronous-log no-ACK policy. */
+		if (apple_rtkit_oslog_unanswered(rtk))
+			dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
+		else
+			dev_warn(rtk->dev, "RTKit: invalid oslog notification: %llx\n", msg);
 		return;
 	}
 
@@ -1390,13 +1412,9 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 		 * AppleDCP waits for its log transport to drain before AP sleep.
 		 * This is not a buffer offset and may wrap. Other channels do not
 		 * have a buffer admitted by this endpoint implementation. An inherited
-		 * channel zero needs no buffer mapping to acknowledge its counter.
+		 * channel zero needs no buffer mapping to acknowledge its counter
+		 * (apple_rtkit_oslog_echoed()).
 		 */
-		if ((!rtk->oslog_buffer.size && !rtk->oslog_inherited) ||
-		    (msg & APPLE_RTKIT_OSLOG_LOG_RESERVED)) {
-			dev_warn(rtk->dev, "RTKit: invalid oslog notification: %llx\n", msg);
-			break;
-		}
 		err = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_OSLOG,
 					       msg, NULL, false);
 		if (err)
@@ -1452,7 +1470,7 @@ static void apple_rtkit_pmp_aux_rx(struct apple_rtkit *rtk, u64 msg)
 }
 
 static void apple_rtkit_rx_dispatch(struct apple_rtkit *rtk, u8 ep, u64 msg,
-				    bool retained)
+				    bool retained, u64 received_ns)
 {
 	if (READ_ONCE(rtk->shutting_down)) {
 		if (retained) {
@@ -1494,9 +1512,13 @@ static void apple_rtkit_rx_dispatch(struct apple_rtkit *rtk, u8 ep, u64 msg,
 		apple_rtkit_oslog_rx(rtk, msg);
 		break;
 	case APPLE_RTKIT_APP_ENDPOINT_START ... 0xff:
-		if (rtk->ops->recv_message)
-			rtk->ops->recv_message(rtk->cookie, ep,
-					       msg);
+		/* Buffered sleep packets have no original receive timestamp. */
+		if (received_ns && rtk->ops->recv_message_timed)
+			rtk->ops->recv_message_timed(rtk->cookie, ep, msg, received_ns);
+		else if (rtk->ops->recv_message)
+			rtk->ops->recv_message(rtk->cookie, ep, msg);
+		else if (rtk->ops->recv_message_timed)
+			rtk->ops->recv_message_timed(rtk->cookie, ep, msg, 0);
 		else
 			dev_warn(
 				rtk->dev,
@@ -1542,7 +1564,7 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 {
 	struct apple_rtkit_rx_work *w = container_of(work, struct apple_rtkit_rx_work, work);
 
-	apple_rtkit_rx_dispatch(w->rtk, w->ep, w->msg, false);
+	apple_rtkit_rx_dispatch(w->rtk, w->ep, w->msg, false, w->received_ns);
 	apple_rtkit_saved_job_done(w->rtk);
 	kfree(w);
 }
@@ -1553,7 +1575,7 @@ static void apple_rtkit_m5_saved_work(struct work_struct *work)
 	struct apple_mbox_msg msg;
 
 	while (kfifo_get(&rtk->m5_saved.deferred, &msg))
-		apple_rtkit_rx_dispatch(rtk, msg.msg1, msg.msg0, true);
+		apple_rtkit_rx_dispatch(rtk, msg.msg1, msg.msg0, true, 0);
 	apple_rtkit_saved_job_done(rtk);
 }
 
@@ -1629,6 +1651,7 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	struct apple_rtkit *rtk = cookie;
 	struct apple_rtkit_rx_work *work;
 	u8 ep = msg.msg1;
+	u64 received_ns = ktime_get_ns();
 
 	if (READ_ONCE(rtk->shutting_down))
 		return;
@@ -1669,9 +1692,14 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 				     msg.msg0);
 	}
 
-	if (!test_bit(ep, rtk->endpoints))
+	/*
+	 * Firmware that leaves the crashlog endpoint out of its map (the AOP)
+	 * still reports a crash there, and apple_rtkit_crashlog_rx() says so.
+	 * Warning about it here too reads as if the AP sent the message.
+	 */
+	if (!test_bit(ep, rtk->endpoints) && ep != APPLE_RTKIT_EP_CRASHLOG)
 		dev_warn(rtk->dev,
-			 "RTKit: Message to undiscovered endpoint 0x%02x\n",
+			 "RTKit: Message from undiscovered endpoint 0x%02x\n",
 			 ep);
 
 	if (ep >= APPLE_RTKIT_APP_ENDPOINT_START &&
@@ -1691,6 +1719,7 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	work->rtk = rtk;
 	work->ep = ep;
 	work->msg = msg.msg0;
+	work->received_ns = received_ns;
 	INIT_WORK(&work->work, apple_rtkit_rx_work);
 	apple_rtkit_saved_queue(rtk, rtk->wq, &work->work);
 }
@@ -1792,6 +1821,16 @@ bool apple_rtkit_m5_saved_unresolved(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_m5_saved_unresolved);
 
+/* A log word the ordinary handler answers with its echo and nothing else. */
+static bool apple_rtkit_log_word(struct apple_rtkit *rtk, u8 ep, u64 msg)
+{
+	if (ep == APPLE_RTKIT_EP_SYSLOG)
+		return apple_rtkit_notification_msg(ep, msg);
+	return ep == APPLE_RTKIT_EP_OSLOG &&
+	       FIELD_GET(APPLE_RTKIT_OSLOG_TYPE, msg) == APPLE_RTKIT_OSLOG_LOG &&
+	       apple_rtkit_oslog_echoed(rtk, msg);
+}
+
 int apple_rtkit_m5_saved_poll(struct apple_rtkit *rtk)
 {
 	struct apple_mbox_msg msg;
@@ -1815,6 +1854,10 @@ int apple_rtkit_m5_saved_poll(struct apple_rtkit *rtk)
 	if (msg.msg1 == rtk->m5_saved.endpoint &&
 	    rtk->ops->recv_message_early &&
 	    rtk->ops->recv_message_early(rtk->cookie, msg.msg1, msg.msg0))
+		return 1;
+	/* Echoed here, its record unread: the firmware takes no AP idle notice with one owed. */
+	if (apple_rtkit_log_word(rtk, msg.msg1, msg.msg0) &&
+	    !apple_mbox_send_nowait(rtk->mbox, msg))
 		return 1;
 	/* SMC notifications remain ordered for the ordinary notifier worker.
 	 * Every other packet is retained, and refuses this attempt. In

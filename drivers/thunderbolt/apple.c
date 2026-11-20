@@ -1878,7 +1878,7 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 		return apple_cio_pcie_tunnel_ready_locked(acio);
 	if (!acio->pcie_tunnel_preinitialized)
 		return dev_err_probe(acio->dev, -ENODEV,
-				     "PCIe-C is not initialized by m1n1 or the kernel\n");
+				     "PCIe-C is not initialized by aura or the kernel\n");
 
 	if (acio->pd_list->num_pds < 4 || !acio->pd_list->pd_links[3])
 		return dev_err_probe(acio->dev, -ENODEV,
@@ -3063,7 +3063,12 @@ static void apple_nhi_complete(struct device *dev)
 
 	apple_nhi_cio_complete(anhi);
 	tb_domain_complete(anhi->tb);
-	apple_dpin_resume_retries(acio);
+	/*
+	 * A dark wake sleeps again at once and lights no display: DP IN admission, paused again by
+	 * the next .prepare, stays paused through the gap and reopens at the final wake.
+	 */
+	if (!pm_dark_wake())
+		apple_dpin_resume_retries(acio);
 
 	guard(mutex)(&acio->pcie_tunnel_lock);
 	acio->pcie_pm_prepared = false;
@@ -3989,7 +3994,8 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 /* The T6050 firmware sleep, selected by the sleep driver's profile and mem_sleep. */
 static bool apple_cio_t6050_sleep(struct apple_cio *acio)
 {
-	return of_machine_is_compatible("apple,j714s") &&
+	return (of_machine_is_compatible("apple,j714s") ||
+		of_machine_is_compatible("apple,j716c")) &&
 	       READ_ONCE(t6050_sleep_teardown) && acio->hw == &apple_cio_t6050_hw &&
 	       apple_sleep_v27_late() && !pm_suspend_default_s2idle();
 }
@@ -4195,6 +4201,9 @@ static bool apple_cio_sleep_tears_down(struct apple_cio *acio)
 {
 	if (READ_ONCE(s2idle_teardown))
 		return true;
+	/* A "freeze" is a suspend-to-idle with deep as the default too: the port stays up. */
+	if (pm_suspend_no_platform())
+		return false;
 	/* A port whose router sleeps in place keeps its tunnels: its NHI owns the sleep. */
 	return apple_cio_t6050_sleep(acio) && !READ_ONCE(acio->sleep_in_place);
 }
@@ -4369,11 +4378,16 @@ static int apple_cio_sleep_dp_entry(struct apple_cio *acio, bool *paused)
 
 	*paused = false;
 	guard(mutex)(&acio->lock);
-	/* A restart owed from a sleep given up is this sleep's own from here. */
+	/*
+	 * A restart owed from a sleep given up is this sleep's own from here, if it powers
+	 * the port off. A suspend-to-idle doesn't: it is refused until the undo's work has run.
+	 */
+	if (acio->sleep_dp_undo && !apple_cio_sleep_tears_down(acio))
+		return -EBUSY;
 	acio->sleep_dp_undo = false;
 	acio->sleep_dp_released = 0;
 	if (!READ_ONCE(t6050_sleep_dp_all_first) || !READ_ONCE(t6050_sleep_dp_first) ||
-	    !apple_cio_t6050_sleep(acio) ||
+	    !apple_cio_t6050_sleep(acio) || pm_suspend_no_platform() ||
 	    acio->removing || acio->resume_recovery_failed || !acio->current_cable_info)
 		return 0;
 	if (!apple_cio_sleep_tears_down(acio)) {
@@ -4533,7 +4547,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 				acio->pcie_tunnel_np);
 		if (!acio->pcie_tunnel_preinitialized) {
 			dev_info(dev,
-				 "PCIe-C tunnel disabled: not initialized by m1n1 or the kernel\n");
+				 "PCIe-C tunnel disabled: not initialized by aura or the kernel\n");
 		} else {
 			ret = apple_cio_map_pcie_intr2axi(acio);
 			if (ret)

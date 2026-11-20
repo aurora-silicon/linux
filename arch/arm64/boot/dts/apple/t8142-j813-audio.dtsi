@@ -210,13 +210,6 @@
 	 * (setup port) and 11 (admac-leap-s) on the raw boot. As on T8140, the
 	 * firmware's own mappings own the first slot, host buffers go above it.
 	 */
-	aop_dart: iommu@390fc0000 {
-		compatible = "apple,t8142-dart", "apple,t8110-dart";
-		reg = <0x3 0x90fc0000 0x0 0xc000>;
-		#iommu-cells = <1>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 528 IRQ_TYPE_LEVEL_HIGH>;
-	};
 
 	admac_base_ns: dma-controller@393800000 {
 		compatible = "apple,t8140-admac";
@@ -414,4 +407,8 @@
 			};
 		};
 	};
+};
+
+&aop_dart {
+	status = "okay";
 };

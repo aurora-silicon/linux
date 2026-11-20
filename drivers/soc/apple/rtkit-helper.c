@@ -299,7 +299,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 			helper->preserved = true;
 	}
 
-	if (!live && apple_t8132_live_mtp() && of_machine_is_compatible("apple,t8132")) {
+	if (!live && apple_t8132_live_mtp()) {
 		struct property *prop;
 		u32 inherited;
 		int len;

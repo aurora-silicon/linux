@@ -41,6 +41,14 @@ module_param(host_setup, bool, 0644);
 MODULE_PARM_DESC(host_setup,
 		 "Before a join, tell the firmware the host is awake (command 6) and apply the reference TX defaults (commands 43 and 52); 1 = on (default)");
 
+/* A command reply is separate from the uncorrelated disconnect event. */
+struct centauri_wifi_disconnect_receipt {
+	bool seen, stopping_skip, submitted, replied, waited;
+	u16 status;
+	u32 reply_command;
+	int command_error, error;
+};
+
 struct centauri_t6050_wifi {
 	struct centauri_t6050 *control;
 	struct cen_alpha_resources a;
@@ -67,6 +75,9 @@ struct centauri_t6050_wifi {
 	u8 scan_sequence;
 	bool connecting, connected, connect_event, disconnect_event;
 	bool disconnect_pending;
+	/* PM callbacks and the normal disconnect producer serialize on lock. */
+	bool pm_prepared;
+	struct centauri_wifi_disconnect_receipt pm_disconnect;
 	u16 connect_status, scan_status, disconnect_status;
 	struct ieee80211_channel *connect_channel;
 	u8 bssid[ETH_ALEN], connect_payload[1024], request_ie[256];
@@ -664,11 +675,12 @@ static bool command_payload_consumed(struct centauri_t6050_wifi *wifi, u16 slot)
 /*
  * Send one command and wait for its reply. With a reply buffer, the reply's
  * payload is copied there (up to *reply_size bytes) and *reply_size becomes
- * the payload's length.
+ * the payload's length. If supplied, submitted records descriptor publication
+ * and the doorbell, including commands that subsequently fail.
  */
 static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 			 const void *payload, size_t size, void *reply,
-			 size_t *reply_size)
+			 size_t *reply_size, bool *submitted)
 {
 	u16 slot = wifi->command_head, sequence = ++wifi->sequence;
 	int ret;
@@ -676,6 +688,8 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 	u8 *packet, *descriptor;
 	unsigned long deadline = jiffies + msecs_to_jiffies(1500);
 
+	if (submitted)
+		*submitted = false;
 	if (wifi->command_failed)
 		return -EIO;
 	if (size > BUFFER_SIZE - 24)
@@ -696,6 +710,9 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 	put_unaligned_le32(slot + 1, descriptor + 12);
 	dma_wmb();
 	wifi->command_head = (slot + 1) % ring_size[1];
+	/* Publishing the producer index may transfer ownership before the doorbell. */
+	if (submitted)
+		*submitted = true;
 	index_write(wifi, 3, 1, wifi->command_head);
 	wifi->reply_valid = false;
 	wifi->reply_buffer = reply;
@@ -749,7 +766,7 @@ out:
 static int command(struct centauri_t6050_wifi *wifi, u32 id, const void *payload,
 		   size_t size)
 {
-	return command_reply(wifi, id, payload, size, NULL, NULL);
+	return command_reply(wifi, id, payload, size, NULL, NULL, NULL);
 }
 
 /* Caller holds wifi->lock; ret is what command() returned for the request. */
@@ -789,7 +806,7 @@ static void firmware_report(struct centauri_t6050_wifi *wifi, u32 id, u8 *buffer
 	size_t size = REPLY_SIZE;
 	int ret;
 
-	ret = command_reply(wifi, id, NULL, 0, buffer, &size);
+	ret = command_reply(wifi, id, NULL, 0, buffer, &size, NULL);
 	if (ret) {
 		command_refused(wifi, id == 19 ? "channel list" : "capabilities",
 				ret);
@@ -1914,9 +1931,9 @@ static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 {
 	struct centauri_t6050_wifi *wifi =
 		*(struct centauri_t6050_wifi **)wiphy_priv(wiphy);
+	struct centauri_wifi_disconnect_receipt receipt = { .seen = true };
 	u8 payload[16] = {};
 	bool connected;
-	u16 reply_status;
 	int ret;
 
 	WRITE_ONCE(wifi->connect_abort, true);
@@ -1929,15 +1946,27 @@ static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 	put_unaligned_le16(4, payload + 10);
 
 	put_unaligned_le32(10, payload + 12);
-	wifi->disconnect_pending = !READ_ONCE(wifi->stopping);
-	ret = READ_ONCE(wifi->stopping) ?
-		      0 :
-		      command(wifi, 131073, payload, sizeof(payload));
-	reply_status = wifi->reply_status;
-	if (!ret && wifi->disconnect_pending && (wifi->reply_command & BIT(30)))
+	receipt.stopping_skip = READ_ONCE(wifi->stopping);
+	wifi->disconnect_pending = !receipt.stopping_skip;
+	ret = receipt.stopping_skip ? 0 :
+		command_reply(wifi, 131073, payload, sizeof(payload), NULL, NULL,
+			      &receipt.submitted);
+	receipt.command_error = ret;
+	receipt.replied = receipt.submitted && (!ret || ret == -EREMOTEIO);
+	if (receipt.replied) {
+		receipt.status = wifi->reply_status;
+		receipt.reply_command = wifi->reply_command;
+	}
+	if (!ret && wifi->disconnect_pending && (wifi->reply_command & BIT(30))) {
+		receipt.waited = true;
 		ret = wait_disconnect(wifi);
-	else if (ret != -EIO && ret != -ETIMEDOUT)
+	} else if (ret != -EIO && ret != -ETIMEDOUT) {
 		wifi->disconnect_pending = false;
+	}
+	receipt.error = ret == -EREMOTEIO && receipt.status == 326 ? 0 : ret;
+	/* Preserve the first failure, including its original command evidence. */
+	if (wifi->pm_prepared && !wifi->pm_disconnect.error)
+		wifi->pm_disconnect = receipt;
 
 	connected = wifi->connected;
 	wifi->connected = false;
@@ -1949,7 +1978,69 @@ static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 				      GFP_KERNEL);
 	mutex_unlock(&wifi->lock);
 	cancel_work_sync(&wifi->link_work);
-	return ret == -EREMOTEIO && reply_status == 326 ? 0 : ret;
+	return receipt.error;
+}
+
+/* Control PM callbacks hold the bound control instance alive. */
+void centauri_t6050_wifi_pm_prepare(struct centauri_t6050 *c)
+{
+	struct centauri_t6050_wifi *wifi = c->wifi;
+
+	if (!wifi)
+		return;
+	mutex_lock(&wifi->lock);
+	wifi->pm_disconnect = (struct centauri_wifi_disconnect_receipt) {};
+	wifi->pm_prepared = true;
+	mutex_unlock(&wifi->lock);
+}
+
+int centauri_t6050_wifi_pm_error(struct centauri_t6050 *c)
+{
+	struct centauri_t6050_wifi *wifi = c->wifi;
+	int ret = 0;
+
+	if (!wifi)
+		return 0;
+	mutex_lock(&wifi->lock);
+	if (wifi->pm_prepared)
+		ret = wifi->pm_disconnect.error;
+	mutex_unlock(&wifi->lock);
+	return ret;
+}
+
+void centauri_t6050_wifi_pm_complete(struct centauri_t6050 *c)
+{
+	struct centauri_t6050_wifi *wifi = c->wifi;
+
+	if (!wifi)
+		return;
+	mutex_lock(&wifi->lock);
+	/* Keep the receipt until the next prepare; it is not a sleep proof. */
+	wifi->pm_prepared = false;
+	mutex_unlock(&wifi->lock);
+}
+
+static int wifi_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wowlan)
+{
+	struct centauri_t6050_wifi *wifi =
+		*(struct centauri_t6050_wifi **)wiphy_priv(wiphy);
+	int ret = 0;
+
+	if (wowlan)
+		return -EOPNOTSUPP;
+	mutex_lock(&wifi->lock);
+	/* cfg80211 already called normal leave; do not send another command. */
+	if (wifi->pm_prepared)
+		ret = wifi->pm_disconnect.error;
+	mutex_unlock(&wifi->lock);
+	return ret;
+}
+
+static int wifi_resume(struct wiphy *wiphy)
+{
+	/* Control owns recovery and fresh registration; old Wi-Fi state may be gone. */
+	(void)wiphy;
+	return 0;
 }
 
 static int wifi_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
@@ -2054,6 +2145,8 @@ static int wifi_dump_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 }
 
 static const struct cfg80211_ops wifi_ops = {
+	.suspend = wifi_suspend,
+	.resume = wifi_resume,
 	.scan = wifi_scan,
 	.abort_scan = wifi_abort_scan,
 	.connect = wifi_connect,
@@ -2302,7 +2395,7 @@ static int query_link_status(struct centauri_t6050_wifi *wifi)
 
 	if (!wifi->configured)
 		return -ENETDOWN;
-	ret = command_reply(wifi, 20, NULL, 0, wifi->link_status, &size);
+	ret = command_reply(wifi, 20, NULL, 0, wifi->link_status, &size, NULL);
 	if (!ret)
 		wifi->station_signal_valid =
 			link_signal_read(wifi->link_status,
@@ -2342,6 +2435,15 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	set_wiphy_dev(wifi->wiphy, &c->pdev->dev);
 	wifi->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 	wifi->wiphy->max_scan_ssids = 1;
+	/*
+	 * cfg80211 refuses a scan whose IEs exceed this. wpa_supplicant 2.11
+	 * adds 15 bytes to every scan (Extended Capabilities and an empty
+	 * Mesh ID); 512, wl1251's limit for the same reason, leaves room for
+	 * optional ones such as WPS or Interworking. The scan command has no
+	 * known field for IEs (only channels, options and SSID), so
+	 * scan_profile27() drops them.
+	 */
+	wifi->wiphy->max_scan_ie_len = 512;
 	wifi->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	wifi->wiphy->reg_notifier = wifi_regulatory;
 	wifi->wiphy->cipher_suites = cipher_suites;

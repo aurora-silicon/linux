@@ -77,8 +77,11 @@ struct cen_bt {
 	u16 le_rx_head, le_rx_post;
 	struct cen_aux_state aux[ARRAY_SIZE(cen_aux_specs)];
 	bool ipc_requested, running;
-	/* Released for a sleep: the N1 is reset and Function 2 enumerated again after it */
+	bool hci_registered, quiescing, host_quiesced;
+	bool sleep_registered;
+	/* Host quiesced for sleep; arena ownership is tracked independently. */
 	bool asleep;
+	int suspend_error;
 	u8 native_startup_steps;
 	bool connection_command_supported, connection_status_pending;
 };
@@ -323,10 +326,11 @@ static int cen_start(struct cen_bt *bt)
 	bt->arena[0x53] = 4;
 	put_unaligned_le64(bt->dma + 0x10000, bt->arena + 0x58);
 	pci_set_master(bt->pdev);
+	/* Account for publication before the first address reaches the device. */
+	bt->ipc_requested = true;
 	writel(lower_32_bits(bt->dma), bt->bar + 0xc);
 	writel(upper_32_bits(bt->dma), bt->bar + 0x10);
 	writel(CEN_ARENA_SIZE, bt->bar + 0x14);
-	bt->ipc_requested = true;
 	writel(1, bt->bar + 0x107c);
 	ret = readl_poll_timeout(bt->bar, status, status == 1, 100, 2000000);
 	if (ret)
@@ -546,6 +550,10 @@ static int cen_hci_open(struct hci_dev *hdev)
 	struct cen_bt *bt = hci_get_drvdata(hdev);
 
 	mutex_lock(&bt->lock);
+	if (bt->quiescing || !bt->arena) {
+		mutex_unlock(&bt->lock);
+		return -ENETDOWN;
+	}
 	bt->running = true;
 	schedule_work(&bt->io_work);
 	mutex_unlock(&bt->lock);
@@ -804,24 +812,116 @@ static int cen_request_irqs(struct cen_bt *bt)
 	return 0;
 }
 
-static void cen_stop(struct cen_bt *bt)
+/*
+ * Called with the participant device locked, outside Control's boot_lock. Keep
+ * the transport alive through HCI unregister: its close may send final commands.
+ * HCI_UNREGISTER withdraws external HCI admission and drains HCI producers before
+ * we close transport admission and settle the remaining IRQ/work users.
+ */
+static int cen_quiesce(void *data)
+{
+	struct cen_bt *bt = data;
+
+	if (bt->host_quiesced)
+		return 0;
+	mutex_lock(&bt->lock);
+	bt->quiescing = true;
+	mutex_unlock(&bt->lock);
+	if (bt->hci_registered) {
+		hci_unregister_dev(bt->hdev);
+		bt->hci_registered = false;
+	}
+	if (bt->hdev)
+		cen_hci_close(bt->hdev);
+	else {
+		mutex_lock(&bt->lock);
+		bt->running = false;
+		mutex_unlock(&bt->lock);
+	}
+	cen_free_irqs(bt);
+	/* free_irq synchronizes handlers which could still have queued I/O. */
+	cancel_work_sync(&bt->io_work);
+	skb_queue_purge(&bt->txq);
+	skb_queue_purge(&bt->acl_txq);
+	skb_queue_purge(&bt->le_txq);
+	if (bt->hdev) {
+		hci_free_dev(bt->hdev);
+		bt->hdev = NULL;
+	}
+	bt->host_quiesced = true;
+	return 0;
+}
+
+static int cen_dma_stopped(struct cen_bt *bt)
 {
 	u16 command;
 	int ret;
 
-	pci_clear_master(bt->pdev);
-	cen_free_irqs(bt);
-	cancel_work_sync(&bt->io_work);
+	ret = pcibios_err_to_errno(pci_read_config_word(bt->pdev, PCI_COMMAND,
+						      &command));
+	if (ret)
+		return ret;
+	if (command & PCI_COMMAND_MASTER)
+		return -EBUSY;
+	if (!pci_wait_for_pending_transaction(bt->pdev))
+		return -EBUSY;
+	return 0;
+}
 
-	ret = pci_read_config_word(bt->pdev, PCI_COMMAND, &command);
-	if (bt->ipc_requested || ret || (command & PCI_COMMAND_MASTER) ||
-	    !pci_wait_for_pending_transaction(bt->pdev))
-		dev_warn(
-			&bt->pdev->dev,
-			"Beta detach requires fresh firmware boot; retaining DMA arena\n");
-	else
-		dma_free_coherent(&bt->pdev->dev, CEN_ARENA_SIZE, bt->arena,
-				  bt->dma);
+/*
+ * For published arenas only the Control owner calls this after ALL functions
+ * have been fenced, while this original binding and DMA environment are live.
+ * A local Command check is revalidation, not the all-function fence receipt.
+ */
+static int cen_release(void *data)
+{
+	struct cen_bt *bt = data;
+	int ret;
+
+	if (!bt->arena)
+		return 0;
+	if (!bt->host_quiesced || bt->hdev || bt->running || bt->irq_count ||
+	    bt->irq_vectors || work_busy(&bt->io_work))
+		return -EBUSY;
+	if (bt->ipc_requested) {
+		ret = cen_dma_stopped(bt);
+		if (ret)
+			return ret;
+	}
+	dma_free_coherent(&bt->pdev->dev, CEN_ARENA_SIZE, bt->arena, bt->dma);
+	/* The allocation tuple remains authoritative until the actual free. */
+	bt->arena = NULL;
+	bt->dma = 0;
+	bt->ipc_requested = false;
+	return 0;
+}
+
+static bool cen_retained(void *data)
+{
+	struct cen_bt *bt = data;
+
+	return bt->arena != NULL;
+}
+
+static const struct apple_centauri_sleep_ops cen_sleep_ops = {
+	.owner = THIS_MODULE,
+	.quiesce = cen_quiesce,
+	.release = cen_release,
+	.retained = cen_retained,
+};
+
+/* An unpublished allocation needs no all-function publication fence. */
+static int cen_stop(struct cen_bt *bt)
+{
+	int ret;
+
+	ret = cen_quiesce(bt);
+	if (ret)
+		return ret;
+	pci_clear_master(bt->pdev);
+	if (bt->ipc_requested)
+		return -EBUSY;
+	return cen_release(bt);
 }
 
 static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -882,6 +982,12 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 				       GFP_KERNEL);
 	if (!bt->arena)
 		return -ENOMEM;
+	pci_set_drvdata(pdev, bt);
+	ret = apple_centauri_sleep_register(pdev, &cen_sleep_ops, bt,
+					    bt->arena, bt->dma, CEN_ARENA_SIZE);
+	if (ret)
+		goto stop;
+	bt->sleep_registered = true;
 	memset(bt->arena, 0, CEN_ARENA_SIZE);
 	ret = cen_request_irqs(bt);
 	if (ret)
@@ -910,64 +1016,74 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hci_set_quirk(hdev, HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY);
 	SET_HCIDEV_DEV(hdev, &pdev->dev);
 	hci_set_drvdata(hdev, bt);
-	pci_set_drvdata(pdev, bt);
 	ret = hci_register_dev(hdev);
-	if (ret) {
-		hci_free_dev(hdev);
+	if (ret < 0)
 		goto stop;
-	}
+	bt->hci_registered = true;
 	return 0;
 stop:
-	cen_stop(bt);
+	if (cen_stop(bt))
+		apple_centauri_sleep_recovery_needed(pdev, ret);
+	if (bt->sleep_registered) {
+		/* Transfer any retained tuple before devm destroys this binding. */
+		apple_centauri_sleep_unregister(pdev);
+		bt->sleep_registered = false;
+		bt->arena = NULL;
+		bt->dma = 0;
+	}
 	return ret;
 }
 
 static void cen_remove(struct pci_dev *pdev)
 {
 	struct cen_bt *bt = pci_get_drvdata(pdev);
+	int ret;
 
-	if (bt->asleep)
-		return;
-	hci_unregister_dev(bt->hdev);
-	cen_hci_close(bt->hdev);
-	cen_free_irqs(bt);
-	cancel_work_sync(&bt->io_work);
-	hci_free_dev(bt->hdev);
-	cen_stop(bt);
+	/* Reconcile actual ownership even if suspend already stopped the HCI. */
+	ret = cen_stop(bt);
+	if (ret)
+		apple_centauri_sleep_recovery_needed(pdev, bt->suspend_error ?: ret);
+	if (bt->sleep_registered) {
+		/*
+		 * The independent owner takes any unreleased tuple and its explicit
+		 * default-domain lease before our devm state goes away. That lease
+		 * covers driver unbind, not arbitrary external physical device_del;
+		 * managed recovery must release it before PCI function removal.
+		 */
+		apple_centauri_sleep_unregister(pdev);
+		bt->sleep_registered = false;
+		bt->arena = NULL;
+		bt->dma = 0;
+	}
 }
 
-/*
- * A firmware sleep (every N1 DMA mapping is released before the link goes down, the firmware
- * told nothing): the HCI device goes away and the arena is freed. The firmware never masters this
- * arena again: Function 2's bus mastering stays off (the PCI core saves Command after this), and
- * the N1 is warm-reset after the wake before any new boot hands out a new arena.
- */
+/* Retain the arena until Control has fenced the complete old DMA set. */
 static int cen_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct cen_bt *bt = pci_get_drvdata(pdev);
-	u16 command;
-	int ret;
+	int ret, save_ret;
 
+	ret = bt->suspend_error;
 	if (!bt->asleep && apple_centauri_sleep_reboot(pdev)) {
-		hci_unregister_dev(bt->hdev);
-		cen_hci_close(bt->hdev);
-		cen_free_irqs(bt);
-		cancel_work_sync(&bt->io_work);
-		hci_free_dev(bt->hdev);
-		bt->hdev = NULL;
-		pci_clear_master(pdev);
-		ret = pci_read_config_word(pdev, PCI_COMMAND, &command);
-		if (ret || (command & PCI_COMMAND_MASTER) ||
-		    !pci_wait_for_pending_transaction(pdev))
-			dev_warn(dev, "Beta before the sleep: DMA not stopped; retaining DMA arena\n");
-		else
-			dma_free_coherent(dev, CEN_ARENA_SIZE, bt->arena, bt->dma);
-		bt->arena = NULL;
+		ret = cen_quiesce(bt);
+		if (ret)
+			return ret;
 		bt->asleep = true;
-		dev_dbg(dev, "Beta down for the sleep\n");
+		pci_clear_master(pdev);
+		ret = cen_dma_stopped(bt);
+		if (ret)
+			dev_warn(dev, "Beta before sleep: DMA fence failed: %d; retaining arena\n",
+				 ret);
 	}
-	return pci_save_state(pdev);
+	save_ret = pci_save_state(pdev);
+	/* A failed suspend is not guaranteed to receive its own resume callback. */
+	if (bt->asleep && (ret || save_ret)) {
+		if (!bt->suspend_error)
+			bt->suspend_error = ret ?: save_ret;
+		apple_centauri_sleep_recovery_needed(pdev, bt->suspend_error);
+	}
+	return ret ?: save_ret;
 }
 
 static int cen_resume(struct device *dev)
