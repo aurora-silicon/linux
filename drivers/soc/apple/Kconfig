@@ -46,8 +46,12 @@ config APPLE_MAILBOX
 
 	  Say Y here if you have an Apple SoC.
 
+config APPLE_MCC_BOOT_DMA
+	bool
+
 config APPLE_MCC
 	tristate "Apple T8140, T6040 and T6050 system level cache"
+	select APPLE_MCC_BOOT_DMA
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on OF
 	default ARCH_APPLE
