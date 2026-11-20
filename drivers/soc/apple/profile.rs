@@ -703,7 +703,10 @@ fn select(
     // a sensor node the board's device tree describes is used as it is, and
     // a board without a sensor (a Mac mini, Studio or iMac) has nothing on
     // that bus, so the sensor probe finds no part and the SEP runs without
-    // biometrics, as on the M1 and M2 Mac minis.
+    // biometrics, as on the M1 and M2 Mac minis. Whether a board has an
+    // enclave to attach to is the board device tree's call:
+    // `dt::enable_sep_and_dart` leaves the SEP disabled where the board keeps
+    // the SEP mailbox disabled.
     if has(b"apple,t8122") {
         return Ok(&T8122);
     }
@@ -793,6 +796,8 @@ mod tests {
         assert_eq!(picked(&[b"apple,j713", b"apple,t8132"]), Some(T8132.name));
         assert_eq!(picked(&[b"apple,j715", b"apple,t8132"]), Some(T8132.name));
         assert_eq!(picked(&[b"apple,j604", b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,j773g", b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,j613", b"apple,t8132"]), Some(T8132.name));
         assert_eq!(picked(&[b"apple,t8132"]), Some(T8132.name));
         assert_eq!(picked(&[b"apple,j713", b"apple,t8122"]), Some(T8122.name));
         assert_eq!(picked(&[b"apple,j613", b"apple,t8122"]), Some(T8122.name));
@@ -809,11 +814,24 @@ mod tests {
         assert_eq!(picked(&[b"apple,k116s", b"apple,t6050"]), Some(T6050.name));
         assert_eq!(picked(&[b"apple,j716c", b"apple,t6050"]), Some(T6050.name));
         assert_eq!(picked(&[b"apple,j716s", b"apple,t6050"]), Some(T6050.name));
+        assert_eq!(picked(&[b"apple,k114s", b"apple,t6050"]), Some(T6050.name));
         assert_eq!(picked(&[b"apple,j716c", b"apple,t6041"]), Some(T6041.name));
         assert_eq!(picked(&[b"apple,j813", b"apple,t8142"]), Some(T8142.name));
+        assert_eq!(picked(&[b"apple,j815", b"apple,t8142"]), Some(T8142.name));
         assert_eq!(picked(&[b"apple,j704", b"apple,t8142"]), Some(T8142.name));
+        assert_eq!(picked(&[b"apple,j316s", b"apple,t6000"]), Some(T6000.name));
+        assert_eq!(picked(&[b"apple,j413", b"apple,t8112"]), Some(T8112.name));
         assert_eq!(picked(&[b"apple,j713"]), None);
         assert_eq!(picked(&[b"apple,t6002"]), None);
+    }
+
+    /// SoCs without a profile are still refused, whatever the board.
+    #[test]
+    fn unprofiled_socs_are_refused() {
+        assert_eq!(picked(&[b"apple,j375d", b"apple,t6002"]), None);
+        assert_eq!(picked(&[b"apple,j514c", b"apple,t6031"]), None);
+        assert_eq!(picked(&[b"apple,j804", b"apple,t8152"]), None);
+        assert_eq!(picked(&[]), None);
     }
 
     /// Touch ID has one path for every Mac. The retry limits, the lock
