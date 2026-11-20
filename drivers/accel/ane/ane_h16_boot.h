@@ -116,6 +116,7 @@ struct ane_h16_profile {
 	const char *identity;
 	const struct ane_h16_preload_rule *preload;
 	const struct ane_h16_build *build;
+	bool require_dart_unlocked;
 };
 
 struct ane_h16_boot;
@@ -148,6 +149,7 @@ struct ane_h16_boot_ops {
 struct ane_h16_boot {
 	const struct ane_fw_platform *soc;
 	const struct ane_h16_build *build;
+	bool require_dart_unlocked;
 	/* Chosen from the DART revision in preflight. */
 	const struct ane_h16_mmio *mmio;
 	const struct ane_h16_boot_ops *ops;
