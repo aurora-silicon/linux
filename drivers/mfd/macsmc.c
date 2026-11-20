@@ -858,7 +858,7 @@ static void apple_smc_sleep_warn(struct apple_smc *smc)
 	apple_smc_write_mbse(smc, SMC_KEY(slpw));
 	smc->sleep_warned = true;
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
-	if (j613_wktp2 && of_machine_is_compatible("apple,j613")) {
+	if (j613_wktp2) {
 		int ret;
 
 		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), 2);

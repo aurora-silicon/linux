@@ -551,8 +551,8 @@ static void __iomem *asahi_g17_map(struct device_node *np, const char *name, int
 	    offset + size > resource_size(&res))
 		return NULL;
 
-	/* T8122's on-chip MMIO takes non-posted writes only: a posted one loses the machine. */
-	if (of_machine_is_compatible("apple,t8122"))
+	/* Where the bus says so (T8122: a posted write loses the machine), non-posted writes. */
+	if (res.flags & IORESOURCE_MEM_NONPOSTED)
 		return ioremap_np(res.start + offset, size);
 	return ioremap(res.start + offset, size);
 }
