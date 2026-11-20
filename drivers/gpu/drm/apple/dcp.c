@@ -21,6 +21,7 @@
 #include <linux/module.h>
 #include <linux/mux/driver.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/display.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/moduleparam.h>
 #include <linux/of.h>
@@ -1931,7 +1932,13 @@ static bool dcp_rtk_syslog_mode_set(void *cookie, const char *context, const cha
 	return false;
 }
 
+static bool dcp_rtk_syslog_is_debug(void *cookie, const char *context, const char *message)
+{
+	return dcp_h17p_syslog_is_debug(context, message);
+}
+
 static struct apple_rtkit_ops rtkit_ops = {
+	.syslog_is_debug = dcp_rtk_syslog_is_debug,
 	.crashed = dcp_rtk_crashed,
 	.recv_message = dcp_recv_msg,
 	.recv_message_timed = dcp_recv_msg_timed,
@@ -1947,11 +1954,6 @@ static const struct apple_rtkit_ops link_report_rtkit_ops = {
 	.shmem_setup = dcp_rtk_shmem_setup,
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
-
-static bool dcp_rtk_syslog_is_debug(void *cookie, const char *context, const char *message)
-{
-	return dcp_h17p_syslog_is_debug(context, message);
-}
 
 static const struct apple_rtkit_ops external_h17p_rtkit_ops = {
 	.flags = APPLE_RTKIT_COPROC_PLACES_BUFFERS,
@@ -5853,9 +5855,10 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	ret = dcp_read_fw_version(dev, "apple,firmware-version", fw_str);
 
 	/*
-	 * T6041 (M4 Pro/Max) is driven only with the 26.5.2 and 26.6.2 firmware
-	 * its desktop IOMFB instance was written for: the boot firmware and its
-	 * compatibility version must both be exactly the same one of those.
+	 * T6041 (M4 Pro/Max) uses its desktop IOMFB instance on 26.5.2 and
+	 * 26.6.2 firmware, where boot firmware and compatibility versions must
+	 * match. The pinned 27.2 (26B123) T6041 DCP image uses the firmware-27
+	 * backend on internal and external display processors.
 	 */
 	if (of_device_is_compatible(dev->of_node, "apple,t6041-dcp") ||
 	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext")) {
@@ -5865,7 +5868,23 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		if (ret >= 0 && compat_ret >= 0 && !strcmp(fw_str, compat_str) &&
 		    (!strcmp(fw_str, "26.5.2") || !strcmp(fw_str, "26.6.2")))
 			return DCP_FIRMWARE_V_26_6_DESKTOP;
-		dev_err(dev, "T6041 display not started: DCP firmware %s (compat %s) is not 26.5.2 or 26.6.2\n",
+		if (apple_t6041_dcp_v27_2(dev->of_node) ||
+		    apple_t6041_dcpext_v27_2(dev->of_node)) {
+			if (!iomfb_v27_methods(compat_str)) {
+				dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
+					compat_str);
+				return DCP_FIRMWARE_UNKNOWN;
+			}
+			missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
+							   &num_missing);
+			if (missing) {
+				dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
+					compat_str, num_missing, missing);
+				return DCP_FIRMWARE_UNKNOWN;
+			}
+			return DCP_FIRMWARE_V_27_0;
+		}
+		dev_err(dev, "T6041 display not started: unsupported DCP firmware %s (compat %s)\n",
 			ret >= 0 ? fw_str : "missing",
 			compat_ret >= 0 ? compat_str : "missing");
 		return DCP_FIRMWARE_UNKNOWN;
@@ -6088,6 +6107,32 @@ static int dcp_firmware_metadata_v27(struct apple_dcp *dcp)
 		return -EINVAL;
 
 clocks:
+	/*
+	 * T6041 device trees carry the single 712 MHz disp0 clock unless the
+	 * boot loader publishes the two /arm-io/disp0 provider clocks
+	 * (376 at 712 MHz and 460 at 0 Hz). Expose the same two-entry table
+	 * when apple,clock-ids is absent so getClockFrequency(0/1) matches.
+	 */
+	if (!of_property_present(dev->of_node, "apple,clock-ids") &&
+	    of_device_is_compatible(dev->of_node, "apple,t6041-dcp")) {
+		struct clk *clk = devm_clk_get_optional(dev, NULL);
+
+		if (IS_ERR(clk))
+			return PTR_ERR(clk);
+		if (!clk)
+			return 0;
+		dcp->firmware_clocks = devm_kcalloc(dev, 2,
+						    sizeof(*dcp->firmware_clocks),
+						    GFP_KERNEL);
+		if (!dcp->firmware_clocks)
+			return -ENOMEM;
+		dcp->firmware_clocks[0].clk = clk;
+		dcp->num_firmware_clocks = 2;
+		return 0;
+	}
+	if (!of_property_present(dev->of_node, "apple,clock-ids") &&
+	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext"))
+		return 0;
 	clocks = of_property_count_u32_elems(dev->of_node, "apple,clock-ids");
 	if (clocks == -ENODATA &&
 	    of_property_present(dev->of_node, "apple,clock-ids"))
@@ -6794,10 +6839,13 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
 	}
-	devm_clk_put(dev, dcp->clk);
+	if (dcp->clk)
+		devm_clk_put(dev, dcp->clk);
 	dcp->clk = NULL;
 	/* optional and possibly NULL, released with the bind's devres group */
 	dcp->clk_194 = NULL;
+	dcp->firmware_clocks = NULL;
+	dcp->num_firmware_clocks = 0;
 }
 
 static const struct component_ops dcp_comp_ops = {
@@ -6966,7 +7014,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	fw_compat = dcp_check_firmware_version(dev);
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
 		return -ENODEV;
-	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	    (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	     of_device_is_compatible(dev->of_node, "apple,t6041-dcp"))) {
 		ret = dcp_validate_t6041_dt(dev);
 		if (ret)
 			return ret;
@@ -7051,6 +7101,17 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
 	dcp->desktop_external = of_device_is_compatible(dev->of_node, "apple,t6041-dcpext");
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
+	/*
+	 * J714s: the internal panel's processor suspends and resumes asynchronously, not in
+	 * the device list's order. After a deep sleep, its restart and its first frame wait only
+	 * for its suppliers (DARTs, mailbox, power domains) through their device links, not for
+	 * every device that happens to resume before it. The DRM device is a consumer of every
+	 * DCP (apple_drv.c), so it still suspends before this processor and resumes after it.
+	 * The external processors stay in order: their sleep steps reach Type-C, the PHYs and
+	 * the tunnels without device links.
+	 */
+	if (dcp->v27_j714s && dcp->panel_identity && !dcp->external)
+		device_enable_async_suspend(dev);
 	dcp_external_audio_init(dcp);
 	dcp->dev = dev;
 	/*
@@ -7086,6 +7147,24 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t8142-dcp"))
 		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
+	/*
+	 * T6041 internal panel on firmware 27 adopts the running DCP session
+	 * with 41-bit firmware DMA addressing and no DPTX port services,
+	 * matching the H17-generation internal-panel profile.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t6041-dcp")) {
+		dcp->hw.firmware_dma_bits = 41;
+		dcp->hw.num_dptx_ports = 0;
+		dcp->hw.adopt_live_session = true;
+	}
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext")) {
+		dcp->hw.firmware_dma_bits = 41;
+		dcp->hw.num_dptx_ports = 2;
+		dcp->hw.adopt_live_session = true;
+		dcp->hw.sink_metadata_edid = true;
+	}
 	/*
 	 * A SoC with derived power words is offered the stop only when asked for, and only on
 	 * firmware 27.0, whose calls are the ones that ran with them.
@@ -7235,7 +7314,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	}
 	dcp->fixed_phy = dcp->phy;
 
-	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	    (fw_compat == DCP_FIRMWARE_V_27_0 && dcp->desktop_external)) {
 		ret = dcp_desktop_probe_routes(dcp);
 		if (ret)
 			return ret;
@@ -7357,7 +7437,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		if (IS_ERR(dcp->dp2hdmi_pwren))
 			return PTR_ERR(dcp->dp2hdmi_pwren);
 		/* The converter rails must be stable before DCP requests the link. */
-		if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+		if ((fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+		     (fw_compat == DCP_FIRMWARE_V_27_0 && dcp->desktop_external)) &&
 		    (dcp->hdmi_pwren || dcp->dp2hdmi_pwren))
 			msleep(100);
 
@@ -7493,7 +7574,8 @@ static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when)
 }
 
 /*
- * Whether the DP PHY and display crossbar of every Type-C route are there.
+ * Whether the DP PHY and display crossbar of every Type-C route are there,
+ * but for a route whose PHY or crossbar node is disabled, which is left out.
  * Routes register one at a time, and one registered cannot be taken back,
  * since a port controller may hold it: a later route waiting for its
  * supplier would leave the dcpext unusable for the boot. Returns
@@ -7516,6 +7598,12 @@ static int dcp_ext_route_suppliers(struct device *dev)
 		if (of_property_read_u32(route_np, "reg", &index))
 			continue;
 		snprintf(name, sizeof(name), "typec%u", index);
+		/*
+		 * A disabled PHY or crossbar never registers: probe skips its
+		 * route (dcp_register_typec_routes()), so do not wait for it.
+		 */
+		if (dcp_typec_route_supplier_disabled(dev, name))
+			continue;
 		phy = of_phy_get(dev->of_node, name);
 		if (PTR_ERR_OR_ZERO(phy) == -EPROBE_DEFER)
 			return -EPROBE_DEFER;
@@ -7953,6 +8041,7 @@ static int dcp_platform_prepare(struct device *dev)
 }
 
 static void dcp_s2r_dark_finish(struct apple_dcp *dcp);
+static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp);
 
 static void dcp_platform_complete(struct device *dev)
 {
@@ -9118,8 +9207,10 @@ static int dcp_s2r_pm_notify(struct notifier_block *nb, unsigned long action, vo
 {
 	struct apple_dcp *dcp = container_of(nb, struct apple_dcp, s2r_pm_nb);
 
-	if (action == PM_POST_SUSPEND)
+	if (action == PM_POST_SUSPEND) {
 		dcp_s2r_dark_finish(dcp);
+		dcp_v27_dark_replug_owed(dcp);
+	}
 	/*
 	 * A J714s external display processor that has crashed cannot take its sleep calls, and
 	 * the SoC cannot power down around it: the sleep is refused here, before the tasks
