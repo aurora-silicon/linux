@@ -262,6 +262,7 @@ struct apple_nvme {
 	bool sleep_stop;
 	bool sleep_idled;
 	u32 sleep_csts;
+	int legacy_shn_ret;	/* the last legacy disable's shutdown notification */
 	/* ANS came back across a sleep, or failed to. reset_work picks these up. */
 	bool sleep_restarted;
 	bool sleep_failed;
@@ -1299,6 +1300,7 @@ static void apple_nvme_disable_legacy(struct apple_nvme *anv, bool shutdown)
 	bool dead = false, freeze = false;
 	unsigned long flags;
 
+	anv->legacy_shn_ret = -ENODATA;
 	if (apple_rtkit_is_crashed(anv->rtk))
 		dead = true;
 	if (!(csts & NVME_CSTS_RDY))
@@ -1341,8 +1343,8 @@ static void apple_nvme_disable_legacy(struct apple_nvme *anv, bool shutdown)
 		 * NVMe controller is handed off with firmware shut down, in an
 		 * NVMe disabled state, after a clean shutdown).
 		 */
-		if (shutdown)
-			nvme_disable_ctrl(&anv->ctrl, shutdown);
+		/* The notification's own result: CC.EN cleared below resets CSTS.SHST. */
+		anv->legacy_shn_ret = shutdown ? nvme_disable_ctrl(&anv->ctrl, shutdown) : -ENODATA;
 		nvme_disable_ctrl(&anv->ctrl, false);
 	}
 
@@ -3258,14 +3260,14 @@ static int apple_nvme_suspend(struct device *dev)
 		/*
 		 * T8122: as macOS leaves ANS before its sleep, the sleep driver idles it last of
 		 * all (AP then IOP idle, polled, apple_nvme_sleep_last_stop()) and clears its RUN
-		 * bit; the shutdown notification above must have completed (checked here: the NVMe
-		 * window is unreachable at the commit on J613). Resume finds RUN
+		 * bit; the shutdown notification above must have completed (its result is kept: the
+		 * NVMe window is unreachable at the commit on J613, and CC.EN cleared after it resets
+		 * CSTS.SHST). Otherwise it is shut down as before. Resume finds RUN
 		 * clear and resets and boots ANS, as after a shutdown.
 		 */
-		anv->sleep_csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
 		if (anv->sleep_registered && anv->hw->sleep_idle &&
 		    pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware() &&
-		    (anv->sleep_csts & NVME_CSTS_SHST_MASK) == NVME_CSTS_SHST_CMPLT) {
+		    !anv->legacy_shn_ret) {
 			anv->sleep_stop = true;
 			anv->sleep_idled = false;
 			apple_sleep_coproc_set_ready(dev, true);
