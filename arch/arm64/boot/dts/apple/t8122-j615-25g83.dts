@@ -21,3 +21,8 @@
 &nvram_qspi {
 	read-only;
 };
+
+/* The two-stage trackpad power command is for the 27.x firmware. */
+&mtp_mt {
+	apple,power-method = <1>;
+};
