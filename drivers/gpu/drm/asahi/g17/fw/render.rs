@@ -388,8 +388,6 @@ pub(crate) struct RenderArgs<'a> {
     pub(crate) resources: &'a RenderResources,
     /// Submission ordinal of the render queue pair, from zero.
     pub(crate) ordinal: u64,
-    /// No earlier render of the queue pair is in flight at submit.
-    pub(crate) pair_idle: bool,
     /// Tiling stage.
     pub(crate) ta: RenderStage,
     /// Fragment stage.
@@ -1203,11 +1201,26 @@ pub(crate) struct TaDescriptor {
     /// QID of the tiling queue.
     pub(crate) qid: u32,
     pub(crate) unk_8be: u32,
-    /// Non-zero on the first kick of a queue pair, like the fragment descriptor's word at the
-    /// same position. Set on every kick, the firmware also notifies the host of each pass's
-    /// tiling completion, which no retirement needs. On 25G83 a render submitted to an idle
-    /// pair keeps it set: without the notification such a render completes later (render d1
-    /// +12%, two clients at depth 1 +18-24%), while queued renders gain 5-7% without it.
+    /// Non-zero on the first kick of a queue pair, like the fragment descriptor's word at the same
+    /// position. Set on every kick, the firmware also notifies the host of each pass's tiling
+    /// completion. That is a retirement policy, not a descriptor layout, so every firmware build
+    /// that uses [`TaDescriptor::write`] (25G83, 25F84, 26B123, and 26A428; M5 does not use this
+    /// descriptor) keeps it set on every kick. A render queued beyond the 32-render in-flight
+    /// window raises no other firmware event when it completes, so these notifications are the
+    /// events that retire the queued renders and publish the next ones; without them those renders
+    /// wait for the poll, a jiffy later. On the J616C (HZ=250), 100 near-empty passes per frame
+    /// with two frames in flight take 1.6 ms with it, 8.8 ms without it on queued kicks and 4.2 ms
+    /// with it only on an idle pair or the kick that fills the window. A render submitted to an
+    /// idle pair also completes later without it (M4 Pro: render d1 +12%, two clients at depth 1
+    /// +18-24%). The cost of the notification on queued kicks: on the M4 Pro (25G83, HZ=1000) a
+    /// single queue of one-render submissions is 4-8% slower at depths 4-64 while frames of 32-200
+    /// passes take 36-39% less time; on the A18 Pro (J700, 26A428, HZ=1000) frames of 32-200
+    /// passes take 13-24% less time (200-pass p99 -20.7%), while 16-pass frames are 10.8% slower
+    /// on the mean with p99 frame interval 0.495 to 1.378 ms (+178%), one-render submissions are
+    /// 6-9% slower at depths 4-64, two and four processes are 7.6% and 8.2% slower, two queues are
+    /// 6.7% slower, and firmware IRQs rise 14x. The render kick entry's event mask
+    /// ([`RENDER_KICK_EVENT_MASK`]) is no substitute: it lists events the kick waits on
+    /// ([`super::m5::compute::kick_event_mask`]), not one its completion raises.
     pub(crate) first_kick: u32,
     /// Completion value of the tiling kick (see
     /// [`KickTimestamp::completion_value`]).
@@ -1314,10 +1327,7 @@ impl TaDescriptor {
         self.aux_stamp_va = args.ta.aux_stamp_va;
         self.stamp_value_2 = stamp_value;
         self.qid = args.ta.qid.into();
-        self.first_kick = match args.programs == RegisterPrograms::V25G83 {
-            true => u32::from(args.ordinal == 0 || args.pair_idle),
-            false => u32::from(args.ordinal == 0),
-        };
+        self.first_kick = 1;
         self.current_id = resources.ta_ids.current.into();
         self.ordinal = args.ordinal as u32;
         self.timestamp_start_va = resources.timestamp_va;
@@ -1883,7 +1893,6 @@ mod ta_mode_tests {
             resources,
             ray_query: [ray; 2],
             ordinal: 0,
-            pair_idle: true,
             ta: stage,
             fragment: stage,
             programs: RegisterPrograms::V25G83,
