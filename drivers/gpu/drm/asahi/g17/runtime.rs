@@ -1598,6 +1598,7 @@ impl compute::Host for ComputeHost<'_> {
     }
     fn note_submission(&mut self) -> Result {
         self.shared.note_submitter();
+        self.port.note_gpu_activity();
         self.shared.note_gpu_activity();
         self.effort.submit();
         self.effort.note_waiters(super::now_ns(), super::fence::waiters());

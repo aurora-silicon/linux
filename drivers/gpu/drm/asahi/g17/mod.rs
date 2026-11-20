@@ -1076,12 +1076,14 @@ impl Firmware {
             }
             power::IdleAction::Recheck(delay) => Some(delay),
         };
-        Ok(
-            match (effort, self.idle_hold(now_ns, in_flight || submitted)) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            },
-        )
+        let busy_recheck = if in_flight {
+            self.port.report_busy(now_ns);
+            self.port.busy_recheck_delay(now_ns)
+        } else {
+            None
+        };
+        let hold = self.idle_hold(now_ns, in_flight || submitted);
+        Ok([effort, hold, busy_recheck].into_iter().flatten().min())
     }
 
     /// Drives the idle hold (see power::Hold); returns the delay in ns for its next check. A
