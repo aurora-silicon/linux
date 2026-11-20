@@ -40,9 +40,9 @@
 
 	/*
 	 * An OLED, so the generic panel node only, not the mini-LED compatible. The
-	 * K114c ADT carries no panel dimensions: the 14.2-inch 3024x1964 panel is
-	 * the size of J714s (ADT disp0 dot-pitch 254.6 ppi). The ADT backlight
-	 * node's user-accessible-max-nits is 1000 (0x03e80000 in 16.16).
+	 * DCP reports 3024x1986. The K114c ADT does not give the panel dimensions;
+	 * the values below use the J714s panel size. The K114c ADT backlight node
+	 * gives a user-accessible maximum of 1000 nits (0x03e80000 in 16.16).
 	 */
 	panel {
 		compatible = "apple,panel";
