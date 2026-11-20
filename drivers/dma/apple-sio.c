@@ -683,6 +683,18 @@ static const struct sio_hw_data sio_hw_t8140 = {
 };
 
 /*
+ * T8122 (M3): only the firmware runs, so that a sleep can stop it; its tables and DMA service
+ * have not been traced. macOS idles it about 6 ms before its commit (AP then IOP idle) and its
+ * ASC reads control 0, status 0x2e at the commit (Aura captures 51 and 73).
+ */
+static const struct sio_hw_data sio_hw_t8122 = {
+	.firmware_only = true,
+	.stop_at_commit = true,
+	.fifo_threshold = 0x800,
+	.cfg_word4 = 0x800,
+};
+
+/*
  * T6041's, less the tunables (sio_t6041_check_node), and stopped by the sleep's commit. Its
  * channel words come from the device tree, else they are the generic ones.
  */
@@ -709,6 +721,7 @@ static const struct of_device_id sio_of_match[] = {
 	{ .compatible = "apple,t6050-sio", .data = &sio_hw_t6050 },
 	{ .compatible = "apple,t6041-sio", .data = &sio_hw_t6041 },
 	{ .compatible = "apple,t8140-sio", .data = &sio_hw_t8140 },
+	{ .compatible = "apple,t8122-sio", .data = &sio_hw_t8122 },
 	{ .compatible = "apple,t6030-sio", .data = &sio_hw_t6030 },
 	{ .compatible = "apple,sio", .data = &sio_hw_generic },
 	{ }
