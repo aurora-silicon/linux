@@ -66,6 +66,7 @@ ASAHI_TESTS = {
                               (['--final-skips-unresolved'], KILL),
                               (['--detach-retired-only'], KILL),
                               (['--resume-after-detach'], KILL)],
+    'dcp-peer-shown-tests.py': [([], PASS), (['--always-shown'], KILL), (['--owner-only'], KILL)],
     'dcpext26-queue-tests.py': [([], PASS), (['--drop-v27-close'], KILL)],
     'dcpext26-retrain-tests.py': [([], PASS), (['--negative-control'], KILL)],
     'dcpext26-lifecycle-tests.py': [([], PASS)],

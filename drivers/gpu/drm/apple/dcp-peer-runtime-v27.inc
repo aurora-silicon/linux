@@ -325,11 +325,12 @@ void dcp_peer_swap_failed_v27(struct apple_dcp *dcp)
 	dcp_mode_invalidate(&dcp->mode_state);
 }
 
-bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now,
-		void (*report)(struct apple_dcp *, u32, ktime_t))
+bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now, bool shown,
+		void (*report)(struct apple_dcp *, u32, ktime_t, bool))
 {
 	struct apple_dcp *owner;
 	u32 watermark;
+	bool both_shown;
 
 	/* Independent CRTCs must not serialize through the pair's mutex. */
 	if (!peer_scanout || (!READ_ONCE(dcp->peer_frames.active) &&
@@ -339,9 +340,10 @@ bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now,
 	owner = dcp->peer_owner ?: dcp;
 	if (!peer_scanout || !owner->peer_frames.active)
 		return false;
-	if (dcp_peer_frame_complete_v27(&owner->peer_frames, dcp != owner, id, &watermark))
+	if (dcp_peer_frame_complete_v27(&owner->peer_frames, dcp != owner, id, shown,
+					&watermark, &both_shown))
 		/* Queue the combined watermark to the primary IOMFB owner. */
-		report(owner, watermark, now);
+		report(owner, watermark, now, both_shown);
 	return true;
 }
 
