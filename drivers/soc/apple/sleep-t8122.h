@@ -948,6 +948,8 @@ static int t8122_sleep_map_regs(struct apple_sleep *s)
 		t8122_wide_setup();
 		dev_info(s->dev, "J613 diagnostic: controller blocks active at probe %016llx\n",
 			 t8122_ctl_active(s->pwrgate));
+		t8122_ctl_s = s;
+		schedule_delayed_work(&t8122_ctl_timeline, HZ);
 	}
 	t8122_wide_set_setup(s->dev);
 	t8122.hpm_notify = t8122_map(s, "spmi-hpm", NULL);
@@ -1113,8 +1115,26 @@ static void t8122_commit_page_log(struct apple_sleep *s)
 	iounmap(r);
 }
 
+/* J613 diagnostic (with t8122_wide_dump): the controller table's mask over the first minute. */
+static struct apple_sleep *t8122_ctl_s;
+static void t8122_ctl_timeline_fn(struct work_struct *w);
+static DECLARE_DELAYED_WORK(t8122_ctl_timeline, t8122_ctl_timeline_fn);
+static void t8122_ctl_timeline_fn(struct work_struct *w)
+{
+	static const unsigned int at_s[] = { 1, 2, 3, 5, 8, 12, 20, 30, 45, 60 };
+	static unsigned int n;
+
+	dev_info(t8122_ctl_s->dev, "J613 diagnostic: controller blocks active %016llx (sample %u)\n",
+		 t8122_ctl_active(t8122_ctl_s->pwrgate), n);
+	if (++n < ARRAY_SIZE(at_s))
+		schedule_delayed_work(&t8122_ctl_timeline, (at_s[n] - at_s[n - 1]) * HZ);
+}
+
 static int t8122_sleep_begin(struct apple_sleep *s)
 {
+	if (t8122_wide_dump)
+		dev_info(s->dev, "J613 diagnostic: controller blocks active at suspend begin %016llx\n",
+			 t8122_ctl_active(s->pwrgate));
 	if (t8122_commit_page) {
 		t8122_commit_page_log(s);
 		/* Process context here; the pre-commit dump runs with interrupts off. Kept mapped. */
@@ -1385,6 +1405,11 @@ static void t8122_sleep_match_undo(struct apple_sleep *s)
  */
 static void t8122_sleep_stopped(struct apple_sleep *s)
 {
+	if (t8122_wide_dump) {
+		t8122_dc_puts("\nCTLS ");
+		t8122_dc_hex(upper_32_bits(t8122_ctl_active(s->pwrgate)));
+		t8122_dc_hex(lower_32_bits(t8122_ctl_active(s->pwrgate)));
+	}
 	t8122_witness_take(s, 2);
 	t8122_witness_dc(2);
 }
