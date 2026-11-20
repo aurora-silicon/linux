@@ -5,6 +5,7 @@
 #include <linux/module.h>
 #include <linux/crc32.h>
 #include <linux/errno.h>
+#include <linux/hex.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 
@@ -376,6 +377,17 @@ static void ave_6070_images(struct kunit *test)
 	expected[0x41] = 1;
 	put_unaligned_le64(ave->extra0_dma, expected + 0x48);
 	KUNIT_EXPECT_MEMEQ(test, actual, expected, sizeof(actual));
+	/* T6021: the shared area goes at +0x60/+0x68, byte 0x40 stays clear. */
+	ave->config_shared.cpu = ave;
+	ave->config_shared.dma = 0x100000000ULL;
+	ave->config_shared.size = SZ_64K;
+	memset(actual, 0, sizeof(actual));
+	abi->write_config(ave, actual);
+	ave_stamp_command(abi, actual, 3000000, 0x123456);
+	put_unaligned_le64(0x100000000ULL, expected + 0x60);
+	put_unaligned_le32(SZ_64K, expected + 0x68);
+	KUNIT_EXPECT_MEMEQ(test, actual, expected, sizeof(actual));
+	ave->config_shared.cpu = NULL;
 	for (unsigned int codec = AVE_CODEC_H264; codec <= AVE_CODEC_HEVC;
 	     codec++) {
 		static const enum ave_opcode ops[] = { AVE_OP_OPEN,
@@ -1186,6 +1198,8 @@ static void ave_6070_gate(struct kunit *test)
 			    &ave_layout_6070_11_1);
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(0x25bfd039),
 			    &ave_layout_6070_11_1);
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T6021_6070),
+			    &ave_layout_6070_11_1);
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(0), NULL);
 	/* H.264 low delay is qualified; a short command buffer is still refused. */
 	KUNIT_EXPECT_TRUE(test, ave_layout_6070_11_1.encode_ready);
@@ -1412,6 +1426,22 @@ static void ave_6070_variants(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_t8112.timebase_multiplier, 1U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.text_crc, 0x25bfd039U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.mbox_idle, 0x38U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.fw_text_size, 0xf0000U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.fw_data_size, 0x134000U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.text_crc, AVE_FW_TEXT_CRC_T6021_6070);
+	KUNIT_EXPECT_EQ(test, ave_t6021.boot_device_id, 20U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.device_type, 17U);
+	KUNIT_EXPECT_EQ(test, ave_t6021.text_link_cell, 0x423cU);
+	KUNIT_EXPECT_EQ(test, ave_t6021.extra0_size, 0x3dfcU);
+	KUNIT_EXPECT_EQ(test, ave_t6021.boot_arg_value, 0x10000U);
+	/* Only T6021 gives Config a shared area. */
+	KUNIT_EXPECT_TRUE(test, ave_t6021.config_shared);
+	KUNIT_EXPECT_FALSE(test, ave_t6000.config_shared);
+	KUNIT_EXPECT_FALSE(test, ave_t8112.config_shared);
+	/* One 6070.11.1 boot serves two sessions, on every SoC. */
+	KUNIT_EXPECT_EQ(test, ave_layout_6070_11_1.max_sessions, 2U);
+	/* One frame at a time by default. */
+	KUNIT_EXPECT_TRUE(test, ave_layout_6070_11_1.low_delay);
 	KUNIT_EXPECT_EQ(test, ave_t6000.regs->ctrl, 0x400044U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.regs->timebase, 0x178000U);
 	KUNIT_EXPECT_GE(test, t->command_bytes, 0x32dc8U);
@@ -1496,6 +1526,372 @@ static void ave_t6041_text_boot_word(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, size - 2, &a), -EINVAL);
 }
 
+/* The process timescale the qualified 6070 image writes. */
+#define AVE_TEST_PROC_TIMESCALE 14400000ULL
+
+/* Build the Start image and the first Process image of @sess. */
+static void ave_test_6070_build(struct kunit *test, struct ave_ctx *ctx,
+				u8 *start, u8 *process, u32 bitrate)
+{
+	const struct ave_fw_layout *fw = ctx->ave->layout;
+	enum ave_codec codec = ctx->sess->p.codec;
+	size_t start_len = fw->bytes[codec - 1][AVE_IMAGE_START];
+	size_t process_len = fw->bytes[codec - 1][AVE_IMAGE_PROCESS];
+
+	memset(start, 0, start_len);
+	memset(process, 0, process_len);
+	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, start, start_len), 0);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, process, process_len, 0,
+					  0x8f0000000ULL, bitrate, false, false),
+			0);
+}
+
+/* h264_inter: P pictures stay references, inter decisions are weighted. */
+static void ave_6070_h264_inter(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+	u8 *start = kunit_kzalloc(test, 0x32dc8, GFP_KERNEL);
+	u8 *process = kunit_kzalloc(test, 0x6838, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, sess);
+	KUNIT_ASSERT_NOT_NULL(test, start);
+	KUNIT_ASSERT_NOT_NULL(test, process);
+	KUNIT_EXPECT_TRUE(test, ave_layout_6070_11_1.h264_inter);
+
+	for (unsigned int codec = AVE_CODEC_H264; codec <= AVE_CODEC_HEVC;
+	     codec++) {
+		const struct ave_start_layout *sl;
+		const struct ave_proc_layout *pl;
+		bool h264 = codec == AVE_CODEC_H264;
+
+		ave_test_6070_session(test, ave, ctx, sess, codec, 1280, 720);
+		sl = &ave->layout->start[codec - 1];
+		pl = &ave->layout->process[codec - 1];
+		for (unsigned int on = 0; on < 2; on++) {
+			sess->p.h264_inter = on;
+			ave_test_6070_build(test, ctx, start, process, 4000000);
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le64(process + pl->timescale),
+					on && h264 ? 0 : AVE_TEST_PROC_TIMESCALE);
+			if (!h264)
+				continue;
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le32(start +
+							   sl->h264_me_fullpel_lambda),
+					on ? 64U : 0U);
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le32(start +
+							   sl->h264_md_inter_lambda),
+					on ? 256U : 0U);
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le32(start +
+							   sl->h264_md_intra_lambda),
+					on ? 64U : 0U);
+			/* The other H.264 inter words are not touched. */
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le16(start + sl->h264_skip_mode),
+					(u16)AVE_AVC_RECON_SKIP_MODE);
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le32(process +
+							   pl->static_area_mask),
+					(u32)AVE_AVC_STATIC_AREA_MASK_ALL);
+		}
+	}
+}
+
+/*
+ * rate_control: CBR and VBR are firmware mode 1, the frame rate is an
+ * integer, and a frame rate set while streaming scales the Process bit rate.
+ * The neighbour bank keeps its DMA addresses.
+ */
+static void ave_6070_rate_control(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+	u8 *start = kunit_kzalloc(test, 0x32dc8, GFP_KERNEL);
+	u8 *process = kunit_kzalloc(test, 0x6838, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, sess);
+	KUNIT_ASSERT_NOT_NULL(test, start);
+	KUNIT_ASSERT_NOT_NULL(test, process);
+	KUNIT_EXPECT_TRUE(test, ave_layout_6070_11_1.rate_control);
+
+	for (unsigned int codec = AVE_CODEC_H264; codec <= AVE_CODEC_HEVC;
+	     codec++) {
+		const struct ave_start_layout *sl;
+		const struct ave_proc_layout *pl;
+
+		ave_test_6070_session(test, ave, ctx, sess, codec, 1280, 720);
+		sl = &ave->layout->start[codec - 1];
+		pl = &ave->layout->process[codec - 1];
+		sess->p.rate_control = true;
+		sess->p.fps_num = 30;
+		sess->p.fps_den = 1;
+		sess->p.fps_int = 30;
+
+		/* Constant quality stays constant QP. */
+		ctx->fps_now = 0;
+		ave_test_6070_build(test, ctx, start, process, 1200000);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->rc_mode),
+				ave->layout->start[codec - 1].rc_mode_fixed_qp);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->bitrate), 0U);
+
+		sess->p.rc_mode = AVE_RC_CBR;
+		ave_test_6070_build(test, ctx, start, process, 1200000);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->rc_mode),
+				(u32)AVE_6070_RC_ON);
+		KUNIT_EXPECT_EQ(test,
+				get_unaligned_le64(start + sl->neighbour_fw.address),
+				sess->neighbour_fw[0].dma);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->bitrate),
+				1200000U);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->fps_int),
+				30U);
+
+		/* 60 fps after Start: half the bits per frame, same clock. */
+		ctx->fps_now = 60;
+		ave_test_6070_build(test, ctx, start, process, 1200000);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->bitrate),
+				600000U);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->fps_int),
+				30U);
+
+		/* VBR's limit follows the live rate: twice it, per second. */
+		sess->p.rc_mode = AVE_RC_VBR;
+		ctx->fps_now = 30;
+		ctx->bitrate_peak = 0;
+		ave_test_6070_build(test, ctx, start, process, 2000000);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->rc_mode),
+				(u32)AVE_6070_RC_ON);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->limits), 1U);
+		/* 500000.0 as an IEEE 754 double */
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(process + pl->limit_bytes),
+				0x411e848000000000ULL);
+
+		/* Without rate_control nothing is scaled. */
+		sess->p.rate_control = false;
+		sess->p.rc_mode = AVE_RC_CBR;
+		ctx->fps_now = 60;
+		ave_test_6070_build(test, ctx, start, process, 1200000);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->rc_mode),
+				(u32)AVE_RC_CBR);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->bitrate),
+				1200000U);
+	}
+}
+
+/*
+ * The 6070 commands upstream qualified on T6000 and T8112, byte for byte.
+ * These CRCs pin the Start and first two Process commands the builder
+ * produces with the layout's encode settings (struct ave_fw_layout) off,
+ * so nothing else can alter those bytes unnoticed. The tests above check
+ * what each setting writes.
+ */
+static void ave_6070_qualified_bytes(struct kunit *test)
+{
+	static const struct {
+		enum ave_codec codec;
+		u32 width, height, fps_num, fps_den;
+		u32 start_crc, process_crc[2];
+	} cases[] = {
+		{ AVE_CODEC_H264, 1280, 720, 30, 1,
+		  0x0a894c73, { 0xbaecc863, 0x3da7ba31 } },
+		{ AVE_CODEC_H264, 1920, 1080, 30000, 1001,
+		  0xd87cabff, { 0x3147b186, 0xb60cc3d4 } },
+		{ AVE_CODEC_HEVC, 1280, 720, 30, 1,
+		  0x90dd39ba, { 0x27b4ba17, 0x852da142 } },
+		{ AVE_CODEC_HEVC, 1920, 1080, 30000, 1001,
+		  0x55b40bc0, { 0xd96b85f9, 0x7bf29eac } },
+	};
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+		struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+		struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+		enum ave_codec codec = cases[i].codec;
+		size_t start_len, process_len;
+		u8 *start, *process;
+		u32 crc;
+
+		KUNIT_ASSERT_NOT_NULL(test, ave);
+		KUNIT_ASSERT_NOT_NULL(test, ctx);
+		KUNIT_ASSERT_NOT_NULL(test, sess);
+		ave_test_6070_session(test, ave, ctx, sess, codec, cases[i].width,
+				      cases[i].height);
+		sess->p.fps_num = cases[i].fps_num;
+		sess->p.fps_den = cases[i].fps_den;
+		start_len = ave->layout->bytes[codec - 1][AVE_IMAGE_START];
+		process_len = ave->layout->bytes[codec - 1][AVE_IMAGE_PROCESS];
+		start = kunit_kzalloc(test, start_len, GFP_KERNEL);
+		process = kunit_kzalloc(test, process_len, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, start);
+		KUNIT_ASSERT_NOT_NULL(test, process);
+
+		KUNIT_ASSERT_EQ(test, ave_build_start(ctx, start, start_len), 0);
+		crc = crc32_le(~0, start, start_len);
+		KUNIT_EXPECT_EQ(test, crc, cases[i].start_crc);
+		for (unsigned int slot = 0; slot < 2; slot++) {
+			memset(process, 0, process_len);
+			KUNIT_ASSERT_EQ(test,
+					ave_build_process(ctx, process, process_len,
+							  slot, 0x8f0000000ULL,
+							  4000000, false, false),
+					0);
+			crc = crc32_le(~0, process, process_len);
+			KUNIT_EXPECT_EQ(test, crc, cases[i].process_crc[slot]);
+		}
+	}
+}
+
+/*
+ * A session the firmware saw counts toward the quarantine bound until a reap;
+ * one it never saw is freed at once.
+ */
+static void ave_quarantine_count(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+
+	KUNIT_ASSERT_TRUE(test, ave && ctx);
+	ave->dev = kunit_device_register(test, "apple-ave-quarantine");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(ave->dev));
+	mutex_init(&ave->hw_lock);
+	ctx->ave = ave;
+	for (unsigned int i = 0; i <= AVE_QUARANTINE_MAX; i++) {
+		ctx->sess = kzalloc_obj(*ctx->sess);
+		KUNIT_ASSERT_NOT_NULL(test, ctx->sess);
+		ctx->sess->handed = i < AVE_QUARANTINE_MAX;
+		ave_sess_destroy(ctx);
+		KUNIT_EXPECT_NULL(test, ctx->sess);
+	}
+	KUNIT_EXPECT_EQ(test, ave->quarantined, AVE_QUARANTINE_MAX);
+	mutex_lock(&ave->hw_lock);
+	ave_sess_reap(ave);
+	mutex_unlock(&ave->hw_lock);
+	KUNIT_EXPECT_EQ(test, ave->quarantined, 0U);
+	KUNIT_EXPECT_NULL(test, ave->failed_sessions);
+}
+
+/*
+ * The SPS timing rewrite, on parameter sets the T6021 firmware wrote. The
+ * rate is the client's timeperframe, num/den frames per second. The expected
+ * bytes for rates other than 30/1 are the 30/1 bytes with the two timing
+ * words replaced (num_units_in_tick, time_scale), then escaped again.
+ */
+static void ave_sps_timing(struct kunit *test)
+{
+	static const struct {
+		bool hevc;
+		u32 num, den;
+		const char *in, *out;
+	} cases[] = {
+		/* H.264 without VUI: a minimal VUI with timing is added. */
+		{ false, 30, 1, "274d001fda014016e4",
+		  "274d001fda014016e840000003004000000f21" },
+		/* H.264 with VUI: timing goes in, the rest of the VUI moves. */
+		{ false, 30, 1, "274d0028e5603c0113f2c03c20104e",
+		  "274d0028e5603c0113f2c2000003000200000300791e100827" },
+		/* HEVC without VUI. */
+		{
+			true, 30, 1,
+			"420101016000000300b0000003000003005da00280802d165aee4522ae5cb97040",
+			"420101016000000300b0000003000003005da00280802d165aee4522ae5cb9710080000003008000000f04",
+		},
+		/* A PPS is left alone. */
+		{ false, 30, 1, "68ee3c80", "68ee3c80" },
+		/* So is an SPS that already carries timing. */
+		{ false, 30, 1, "274d001fda014016e840000003004000000f21",
+		  "274d001fda014016e840000003004000000f21" },
+		{ false, 30, 1, "274d0028e5603c0113f2c2000003000200000300791e100827",
+		  "274d0028e5603c0113f2c2000003000200000300791e100827" },
+		{
+			true, 30, 1,
+			"420101016000000300b0000003000003005da00280802d165aee4522ae5cb9710080000003008000000f04",
+			"420101016000000300b0000003000003005da00280802d165aee4522ae5cb9710080000003008000000f04",
+		},
+		/*
+		 * 30000/1001: num_units_in_tick 1001 and time_scale 60000 for
+		 * H.264 (0x3e9, 0xea60), 1001 and 30000 for HEVC.
+		 */
+		{ false, 30000, 1001, "274d001fda014016e4",
+		  "274d001fda014016e8400000fa40003a9821" },
+		{ false, 30000, 1001, "274d0028e5603c0113f2c03c20104e",
+		  "274d0028e5603c0113f2c2000007d20001d4c11e100827" },
+		{
+			true, 30000, 1001,
+			"420101016000000300b0000003000003005da00280802d165aee4522ae5cb97040",
+			"420101016000000300b0000003000003005da00280802d165aee4522ae5cb97100800001f480003a9804",
+		},
+		/* Lowest terms: 60/2 and 1000/30000 s give the 30/1 bytes. */
+		{ false, 60, 2, "274d001fda014016e4",
+		  "274d001fda014016e840000003004000000f21" },
+		{ false, 30000, 1000, "274d0028e5603c0113f2c03c20104e",
+		  "274d0028e5603c0113f2c2000003000200000300791e100827" },
+		{
+			true, 60, 2,
+			"420101016000000300b0000003000003005da00280802d165aee4522ae5cb97040",
+			"420101016000000300b0000003000003005da00280802d165aee4522ae5cb9710080000003008000000f04",
+		},
+		/*
+		 * 32-bit limits. H.264's time_scale is twice the numerator:
+		 * 3000000001/2 does not fit, so the even denominator is halved
+		 * (num_units_in_tick 1, time_scale 3000000001); 3000000001/3
+		 * has no such form and the SPS is left as written. HEVC takes
+		 * the numerator as it is.
+		 */
+		{ false, 3000000001U, 2, "274d001fda014016e4",
+		  "274d001fda014016e840000003006cb4178061" },
+		{ false, 3000000001U, 3, "274d001fda014016e4", "274d001fda014016e4" },
+		{
+			true, 4000000000U, 3,
+			"420101016000000300b0000003000003005da00280802d165aee4522ae5cb97040",
+			"420101016000000300b0000003000003005da00280802d165aee4522ae5cb971008000000301f735940004",
+		},
+		/* A zero rate stamps nothing. */
+		{ false, 0, 1, "274d001fda014016e4", "274d001fda014016e4" },
+		{ false, 30, 0, "274d001fda014016e4", "274d001fda014016e4" },
+	};
+	u8 *buf = kunit_kzalloc(test, 256, GFP_KERNEL);
+	u8 *want = kunit_kzalloc(test, 256, GFP_KERNEL);
+	size_t short_len;
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_ASSERT_NOT_NULL(test, want);
+	for (unsigned int i = 0; i < ARRAY_SIZE(cases); i++) {
+		size_t in = strlen(cases[i].in) / 2;
+		size_t out = strlen(cases[i].out) / 2;
+		size_t len = 4 + in;
+
+		memset(buf, 0, 256);
+		buf[3] = 1;
+		KUNIT_ASSERT_EQ(test, hex2bin(buf + 4, cases[i].in, in), 0);
+		KUNIT_ASSERT_EQ(test, hex2bin(want, cases[i].out, out), 0);
+		if (cases[i].hevc)
+			ave_hevc_stamp_timing(buf, 256, &len, cases[i].num,
+					      cases[i].den);
+		else
+			ave_h264_stamp_timing(buf, 256, &len, cases[i].num,
+					      cases[i].den);
+		KUNIT_EXPECT_EQ(test, len, 4 + out);
+		KUNIT_EXPECT_MEMEQ(test, buf + 4, want, out);
+	}
+	/* No room to grow: the buffer is not touched. */
+	memset(buf, 0, 256);
+	buf[3] = 1;
+	short_len = 4 + strlen(cases[0].in) / 2;
+	KUNIT_ASSERT_EQ(test, hex2bin(buf + 4, cases[0].in, short_len - 4), 0);
+	ave_h264_stamp_timing(buf, short_len, &short_len, 30, 1);
+	KUNIT_EXPECT_EQ(test, short_len, 4 + strlen(cases[0].in) / 2);
+}
+
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_t6041_text_boot_word),
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
@@ -1504,6 +1900,10 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_frame_result),
 	KUNIT_CASE(ave_6070_split_surfaces),
 	KUNIT_CASE(ave_6070_start_process_fields),
+	KUNIT_CASE(ave_6070_qualified_bytes),
+	KUNIT_CASE(ave_6070_h264_inter),
+	KUNIT_CASE(ave_6070_rate_control),
+	KUNIT_CASE(ave_sps_timing),
 	KUNIT_CASE(ave_6070_reordered_pictures),
 	KUNIT_CASE(ave_6070_hevc_contract),
 	KUNIT_CASE(ave_6070_entropy_interleave),
@@ -1511,6 +1911,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
 	KUNIT_CASE(ave_6070_variants),	    KUNIT_CASE(ave_6070_text_id),
 	KUNIT_CASE(ave_6070_smalloc),
+	KUNIT_CASE(ave_quarantine_count),
 	{}
 };
 

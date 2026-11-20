@@ -33,9 +33,13 @@ The encoder runs firmware on its own coprocessor. The bootloader loads it into
 two reserved, DART-mapped segments (TEXT and DATA) but does not start it. The
 Aurora Stage 2 loader passes both regions in the device's ``memory-region``
 property and records their CRC32 under ``/chosen`` as
-``aurora,ave-text-crc32`` and ``aurora,ave-data-crc32``. The driver only binds
-while DATA still matches the recorded checksum, and keeps a copy of DATA that
-it restores before every firmware boot.
+``aurora,ave-text-crc32`` and ``aurora,ave-data-crc32``. The loader may also
+record each segment's CRC32 as ``aurora,crc32`` on its reservation, as it
+must when two encoders' DATA differ, and a segment shared by two encoders
+has one ``iommu-addresses`` entry per encoder; the driver prefers the
+reservation's value. The driver only binds while DATA still matches the
+recorded checksum, and keeps a copy of DATA that it restores before every
+firmware boot.
 
 No firmware files are needed. The driver builds every command itself,
 including the two large session commands (Start and Process), from the
@@ -113,7 +117,7 @@ checkout, add ``--compare-baseline /path/to/old/drivers/media/platform/apple/ave
 Private capture comparisons must keep captured images outside the source tree
 and mask only addresses, session tokens, clocks and host bookkeeping fields.
 
-With debugfs mounted, ``apple-ave/last_start_h264``,
+With debugfs mounted, ``apple-ave-<device>/last_start_h264``,
 ``last_start_hevc``, ``last_process0_h264`` and ``last_process0_hevc`` hold the
 last Start command built and the first Process command of the last session,
 for comparison with reference captures.
@@ -124,6 +128,10 @@ Sessions and power management
 The firmware boots when the first stream starts and is halted when the last
 one ends, as macOS does; the next stream starts it from reset. Runtime PM
 powers the encoder down two seconds after the last stream.
+
+A stream's buffers are freed only after that power cycle. While one stream
+stays open, up to four streams that ended keep their buffers; a further
+stream then fails to start with ``EBUSY`` until every stream has closed.
 
 Up to five frames per stream are inside the firmware at once (three without
 B-frames). The firmware reorders B-frames itself, so CAPTURE buffers come

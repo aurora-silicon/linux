@@ -552,8 +552,11 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 	.process_timeout_us = 46400000,
 	.process_subtype = 0x15,
 	.max_slots = 5,
-	.max_sessions = 1,
+	.max_sessions = 2,
 	.codec_state_bytes = { 0x984, 0x5884 },
+	.h264_inter = true,
+	.rate_control = true,
+	.low_delay = true,
 	.start = {
 		[0] = {
 			.header = AVE_SURFACE(0x40, 0x10),
@@ -644,6 +647,9 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 			.h264_pixel_packing = 0xfce8,
 			.h264_transform_mode = 0xfcec,
 			.h264_skip_mode = 0xfcf0,
+			.h264_me_fullpel_lambda = 0xff98,
+			.h264_md_inter_lambda = 0xffa4,
+			.h264_md_intra_lambda = 0xffa8,
 			.h264_input_bit_depth = 0xfd20,
 			.h264_parameter_set_count = 0xfda4,
 			.h264_slice_map_count = 0xfdac,
@@ -957,7 +963,12 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 	if (crc == AVE_FW_TEXT_CRC_9003_78_0 || crc == AVE_FW_TEXT_CRC_T6040_25G83 ||
 	    crc == AVE_FW_TEXT_CRC_T6041_25G83)
 		return &ave_layout_9003_78_0;
-	if (crc == 0x460c7a7c || crc == 0x25bfd039)
+	/*
+	 * T6000 (H13S), T8112 (H14G) and T6021 (H14C) are one 6070.11.1
+	 * command layout. H14C is a larger link of the same version.
+	 */
+	if (crc == 0x460c7a7c || crc == 0x25bfd039 ||
+	    crc == AVE_FW_TEXT_CRC_T6021_6070)
 		return &ave_layout_6070_11_1;
 	/*
 	 * The macOS 27.0 build for the M5 Pro and Max, and the M5's build of the
