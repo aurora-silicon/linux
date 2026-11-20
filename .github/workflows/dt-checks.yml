@@ -100,6 +100,7 @@ jobs:
         if: ${{ !cancelled() && steps.dt.outputs.base != '' }}
         run: |
           set -o pipefail
+          python3 scripts/dtc/apple-dart-pd-check-test.py
           python3 scripts/dtc/apple-dart-pd-check.py \
             --dtb-dir "$RUNNER_TEMP/dt/out-head/arch/arm64/boot/dts/apple" \
             --baseline-dtb-dir "$RUNNER_TEMP/dt/out-base/arch/arm64/boot/dts/apple" \
