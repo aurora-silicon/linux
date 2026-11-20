@@ -296,9 +296,9 @@ pub(crate) struct GpuManager {
     ids: SequenceIDs,
     #[pin]
     garbage_contexts: Mutex<KVec<workqueue::RetiredContext>>,
-    /// Contexts invalidated by firmware but still potentially referenced by a running data master.
+    /// Queue structures of invalidated contexts that a running data master may still read.
     #[pin]
-    powered_contexts: Mutex<KVec<workqueue::RetiredContext>>,
+    powered_contexts: Mutex<KVec<KVec<workqueue::RetainedObject>>>,
     #[pin]
     fault_log: SpinLock<FaultLogState>,
 }
@@ -510,7 +510,8 @@ pub(crate) trait GpuManager: Send + Sync {
     fn get_dyncfg(&self) -> &hw::DynConfig;
     /// Register an unused context, with the objects it retains, for invalidation.
     fn free_context(&self, ctx: workqueue::RetiredContext);
-    /// Release invalidated contexts after firmware reports that all data masters are powered off.
+    /// Release the queue structures of invalidated contexts after firmware reports that all data
+    /// masters are powered off.
     fn fw_power_off(&self);
 }
 
@@ -1727,6 +1728,11 @@ impl GpuManager for GpuManager::ver {
                 continue;
             }
 
+            // Only the queue structures can still be read after the invalidation. The context data,
+            // with the TVB buffer it holds, goes now, so a retired context costs only its queues.
+            let workqueue::RetiredContext { data, retained } = ctx;
+            core::mem::drop(data);
+
             // Device-control completion and statistics use separate receive rings. Drain the
             // latter under its lock before publishing this context, so a PowerOff that was
             // already pending before invalidation cannot release it. A concurrent later
@@ -1740,12 +1746,12 @@ impl GpuManager for GpuManager::ver {
                     self.dev.as_ref(),
                     "Failed to reserve invalidated context, leaking it for safety.\n"
                 );
-                core::mem::forget(ctx);
+                core::mem::forget(retained);
                 continue;
             }
             // This cannot fail after the successful reservation. Preserve the object even if
             // the vector implementation ever violates that contract.
-            if let Err(err) = powered.push_within_capacity(ctx) {
+            if let Err(err) = powered.push_within_capacity(retained) {
                 core::mem::forget(err.0);
             }
         }
