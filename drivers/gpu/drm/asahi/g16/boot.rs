@@ -814,11 +814,27 @@ fn run(
     wait_boot_control(session, channels, events, init, base + 1, 5000)?;
     let scheduler = init.control.as_ref().ok_or(EINVAL)?;
     let scheduler_word = init.firmware_data().scheduler;
-    if scheduler.r32(scheduler_word)? != 0 {
-        channels.log_stop(session, init, "scheduler word set after IMPORT_GLOBALS");
-        return Err(EBUSY);
+    let pending = scheduler.r32(scheduler_word)?;
+    if kind == hw::Start::MacOs27_2 {
+        // 26B123: only the firmware's GPU power-up path (0x36ec4, scheduler re-init 0x1d9b4) and
+        // its recovery path consume the scheduler request, so the InitData request (1) can
+        // still be pending here: the boot records need not have powered the GPU up. Post START
+        // with it pending; never stack a second request.
+        if pending > 1 {
+            channels.log_stop(session, init, "scheduler word unexpected after IMPORT_GLOBALS");
+            return Err(EBUSY);
+        }
+        dev_info!(dev, "G16: 27.2 scheduler request {} pending at START\n", pending);
+        if pending == 0 {
+            scheduler.w32(scheduler_word, 1)?;
+        }
+    } else {
+        if pending != 0 {
+            channels.log_stop(session, init, "scheduler word set after IMPORT_GLOBALS");
+            return Err(EBUSY);
+        }
+        scheduler.w32(scheduler_word, 1)?;
     }
-    scheduler.w32(scheduler_word, 1)?;
     regs::wmb();
     devctl_op(session, channels, events, init, devctl.start)?;
     wait_boot_control(session, channels, events, init, base + 2, 2000)?;
@@ -834,15 +850,16 @@ fn run(
     if channels.devctl.read()? != base + 2
         || channels.devctl.completion()? != base + 2
         || channels.devctl.write()? != base + 2
-        || scheduler.r32(scheduler_word)? != 0
+        || (kind == hw::Start::Wake25G83 && scheduler.r32(scheduler_word)? != 0)
     {
         channels.log_stop(session, init, "boot controls not settled after START");
         return Err(EBUSY);
     }
     dev_info!(
         dev,
-        "M4 firmware accepted owned initdata root{:#x}, NOP and policy; READY\n",
-        root
+        "M4 firmware accepted owned initdata root{:#x}, NOP and policy; READY (scheduler {})\n",
+        root,
+        scheduler.r32(scheduler_word)?
     );
     Ok(())
 }
