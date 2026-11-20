@@ -378,6 +378,42 @@
 	status = "okay";
 };
 
+&ps_venc_sys {
+	status = "okay";
+};
+
+&ps_venc_dma {
+	status = "okay";
+};
+
+&ps_venc_pipe4 {
+	status = "okay";
+};
+
+&ps_venc_pipe5 {
+	status = "okay";
+};
+
+&ps_venc_me0 {
+	status = "okay";
+};
+
+&ps_venc_me1 {
+	status = "okay";
+};
+
+&dart_ave0 {
+	status = "okay";
+};
+
+&dart_ave1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
 #include "t8132-j604-atcphy-tunables.dtsi"
 
 /*
