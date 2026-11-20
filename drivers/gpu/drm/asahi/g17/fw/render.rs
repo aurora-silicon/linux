@@ -388,8 +388,6 @@ pub(crate) struct RenderArgs<'a> {
     pub(crate) resources: &'a RenderResources,
     /// Submission ordinal of the render queue pair, from zero.
     pub(crate) ordinal: u64,
-    /// No earlier render of the queue pair is in flight at submit.
-    pub(crate) pair_idle: bool,
     /// Tiling stage.
     pub(crate) ta: RenderStage,
     /// Fragment stage.
@@ -1183,11 +1181,20 @@ pub(crate) struct TaDescriptor {
     /// QID of the tiling queue.
     pub(crate) qid: u32,
     pub(crate) unk_8be: u32,
-    /// Non-zero on the first kick of a queue pair, like the fragment descriptor's word at the
-    /// same position. Set on every kick, the firmware also notifies the host of each pass's
-    /// tiling completion, which no retirement needs. On 25G83 a render submitted to an idle
-    /// pair keeps it set: without the notification such a render completes later (render d1
-    /// +12%, two clients at depth 1 +18-24%), while queued renders gain 5-7% without it.
+    /// Non-zero on the first kick of a queue pair, like the fragment descriptor's word at the same
+    /// position. Set on every kick, the firmware also notifies the host of each pass's tiling
+    /// completion. 25G83 keeps it set on every kick. A render queued beyond the 32-render in-flight
+    /// window raises no other firmware event when it completes, so these notifications are the
+    /// events that retire the queued renders and publish the next ones; without them those renders
+    /// wait for the poll, a jiffy later. On the J616C (HZ=250), 100 near-empty passes per frame
+    /// with two frames in flight take 1.6 ms with it, 8.8 ms without it on queued kicks and 4.2 ms
+    /// with it only on an idle pair or the kick that fills the window. A render submitted to an
+    /// idle pair also completes later without it (M4 Pro: render d1 +12%, two clients at depth 1
+    /// +18-24%). The cost of the notification on queued kicks: on the M4 Pro (HZ=1000) a single
+    /// queue of one-render submissions is 4-8% slower at depths 4-64, while frames of 32-200 passes
+    /// take 36-39% less time. The render kick entry's event mask ([`RENDER_KICK_EVENT_MASK`]) is no
+    /// substitute: it lists events the kick waits on ([`super::m5::compute::kick_event_mask`]), not
+    /// one its completion raises.
     pub(crate) first_kick: u32,
     /// Completion value of the tiling kick (see
     /// [`KickTimestamp::completion_value`]).
@@ -1295,7 +1302,7 @@ impl TaDescriptor {
         self.stamp_value_2 = stamp_value;
         self.qid = args.ta.qid.into();
         self.first_kick = match args.programs == RegisterPrograms::V25G83 {
-            true => u32::from(args.ordinal == 0 || args.pair_idle),
+            true => 1,
             false => u32::from(args.ordinal == 0),
         };
         self.current_id = resources.ta_ids.current.into();
@@ -1837,7 +1844,6 @@ mod ta_mode_tests {
             resources,
             ray_query: [ray; 2],
             ordinal: 0,
-            pair_idle: true,
             ta: stage,
             fragment: stage,
             programs: RegisterPrograms::V25G83,
