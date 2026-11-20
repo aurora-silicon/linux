@@ -60,7 +60,7 @@ pub(crate) mod glue {
         ) -> core::ffi::c_int;
     }
 
-    /// A qualified J713/T8132 board.
+    /// A qualified T8132 board (J713, J773g).
     pub(crate) fn board() -> bool {
         // SAFETY: Reads the machine compatible strings only.
         unsafe { asahi_g16_board() }
@@ -409,7 +409,7 @@ impl Session {
         self.shared.check()?;
         if !self.rtkit.running()
             || self.regs.asc_control()? & regs::ASC_RUN == 0
-            || self.regs.pstate()? > 9
+            || self.regs.pstate()? > self.regs.top()
         {
             return Err(EIO);
         }
@@ -730,7 +730,7 @@ pub(crate) fn start(
         "M4 G16G: {} cores enabled\n",
         id.core_masks[0].count_ones()
     );
-    if regs.pstate()? > 9 {
+    if regs.pstate()? > regs.top() {
         return Err(eproto());
     }
     // Cold only: ASC RUN clear and an all-zero TTBAT before ownership.
@@ -779,6 +779,10 @@ pub(crate) fn start(
         events.reserve()?;
         // Every host object and every context-0 alias is prepared before RUN is set.
         built = Some(initdata::build(&d, &session.adt, &mut objects)?);
+        if let Some((init, _, _)) = built.as_ref() {
+            // The running firmware may report any state of the board's table, up to S10 on J773g.
+            session.regs.set_table(init.rows);
+        }
         objects.window.lock().bootstrap(&d, &session.uat)?;
         uat::tlbi_all();
         if session.regs.asc_control()? & regs::ASC_RUN != 0 {

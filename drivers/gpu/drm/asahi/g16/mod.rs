@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G16 GPU support (T8132, M4: J713; the qualified 25G83 firmware).
+//! G16 GPU support (T8132, M4: J713 and J773g; the qualified 25G83 firmware).
 //!
 //! G16 firmware is *classic*: one ring per engine (TA, FS, compute) and ordering expressed by
 //! in-ring barrier records that wait on another queue's stamp, unlike the G17 kick-ring/QID
@@ -456,7 +456,7 @@ impl Firmware {
         dev: &AsahiDrmDevice,
         booted: boot::Booted,
         shared: &Arc<Shared>,
-        power: power::Power,
+        mut power: power::Power,
     ) -> Result<KBox<Firmware>> {
         let boot::Booted {
             session,
@@ -470,6 +470,7 @@ impl Firmware {
             dev.as_ref(),
             "G16: firmware at READY, starting the backend\n"
         );
+        power.set_table(init.rows);
         let orphan = |session: boot::Session,
                       objects: object::Objects,
                       channels: channel::Channels,
