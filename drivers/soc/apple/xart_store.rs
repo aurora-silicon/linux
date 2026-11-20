@@ -465,6 +465,42 @@ impl Store {
         Ok(())
     }
 
+    /// As [`Store::set_guard`], and first lists `carried`, the records the
+    /// initrd's guard adopted, as Linux's.
+    pub(crate) fn set_guard_carrying(&mut self, level: u8, carried: &[Key]) -> Result<()> {
+        self.set_guard(level)?;
+        if let Some(guard) = self.guard.as_mut() {
+            guard.carry(carried);
+        }
+        Ok(())
+    }
+
+    /// The initrd's guard: an in-memory list that protects every session
+    /// record that exists now. See [`crate::xart_guard::Guard::open_initrd`].
+    pub(crate) fn set_initrd_guard(&mut self, level: u8) -> Result<()> {
+        let keys = self.live_keys()?;
+        self.guard = Some(crate::xart_guard::Guard::open_initrd(level, keys));
+        Ok(())
+    }
+
+    /// The records the initrd's guard adopted that are still live, for
+    /// complete_attach to carry to the real root's list. Empty for any other
+    /// store.
+    pub(crate) fn initrd_adopted(&self) -> Result<KVec<Key>> {
+        let mut keys = KVec::new();
+        if let Some(adopted) = self.guard.as_ref().and_then(|guard| guard.initrd_adopted()) {
+            for key in adopted.iter().filter(|key| self.find(key).is_some()) {
+                keys.push(*key, GFP_KERNEL)?;
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Every enclave write or delete the guard has refused, 0 without one.
+    pub(crate) fn guard_refusals(&self) -> usize {
+        self.guard.as_ref().map_or(0, |guard| guard.refusals())
+    }
+
     /// Entries in the guard's list now, or `None` without a guarded list.
     pub(crate) fn guard_listed_now(&self) -> Option<u64> {
         self.guard.as_ref().and_then(|guard| guard.listed_now())

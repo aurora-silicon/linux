@@ -69,12 +69,15 @@ pub(crate) fn user_bags_requested() -> bool {
 }
 
 /// Whether the initrd phase may let the enclave write the gigalocker. A
-/// per-user bag cannot be loaded or unlocked without those writes, but the
-/// xART guard keeps its record list in host files on the real root, which
-/// the initrd must not write. So writes are allowed only for user bags and
-/// only when no guard runs; with a guard the bags wait for complete_attach.
-pub(crate) fn initrd_xart_writes(xart_writes: bool, user_bags: bool, guard: Option<u8>) -> bool {
-    xart_writes && user_bags && guard.is_none()
+/// per-user bag cannot be loaded or unlocked without those writes, so they
+/// are allowed only for user bags. The xART guard keeps its record list in
+/// host files on the real root, which the initrd must not write; with a
+/// guard the initrd runs the guard's in-memory form instead
+/// ([`crate::xart_guard::Guard::open_initrd`]), which protects every record
+/// that existed before the initrd, and complete_attach carries what it
+/// adopted to the real list.
+pub(crate) fn initrd_xart_writes(xart_writes: bool, user_bags: bool) -> bool {
+    xart_writes && user_bags
 }
 
 /// Holds the callback context alive until sysfs has drained all writers.
@@ -165,12 +168,10 @@ mod tests {
     }
 
     #[test]
-    fn initrd_writes_only_for_user_bags_without_a_guard() {
-        assert!(initrd_xart_writes(true, true, None));
-        assert!(!initrd_xart_writes(false, true, None));
-        assert!(!initrd_xart_writes(true, false, None));
-        assert!(!initrd_xart_writes(true, true, Some(1)));
-        assert!(!initrd_xart_writes(true, true, Some(2)));
+    fn initrd_writes_only_for_user_bags() {
+        assert!(initrd_xart_writes(true, true));
+        assert!(!initrd_xart_writes(false, true));
+        assert!(!initrd_xart_writes(true, false));
     }
 
     #[test]
