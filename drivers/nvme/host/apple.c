@@ -2811,7 +2811,8 @@ static int apple_nvme_sleep_last_stop(void *data)
 	u32 cc, csts = anv->sleep_csts;
 	int ret;
 
-	cc = readl(anv->mmio_nvme + NVME_REG_CC);
+	/* T8122: the NVMe window is unreachable at the commit (n36); ANS's own pages are not. */
+	cc = anv->hw->sleep_idle ? 0 : readl(anv->mmio_nvme + NVME_REG_CC);
 
 	anv->sleep_idled = true;
 	ret = apple_rtkit_sleep_idle_polled(anv->rtk,
@@ -2878,12 +2879,7 @@ static int apple_nvme_probe(struct platform_device *pdev)
 		anv->sleep_registered =
 			!apple_sleep_coproc_register(anv->dev, anv->mmio_coproc, false,
 						     apple_nvme_sleep_last_stop, anv);
-		/* Never idled without its shutdown notification. */
-		if (anv->sleep_registered &&
-		    apple_sleep_coproc_set_last_check(anv->dev, apple_nvme_sleep_shutdown)) {
-			apple_sleep_coproc_unregister(anv->dev);
-			anv->sleep_registered = false;
-		}
+		/* The shutdown notification is checked in the suspend, not at the commit. */
 	}
 
 	apple_nvme_set_reset_ready(anv, true);
@@ -3262,11 +3258,14 @@ static int apple_nvme_suspend(struct device *dev)
 		/*
 		 * T8122: as macOS leaves ANS before its sleep, the sleep driver idles it last of
 		 * all (AP then IOP idle, polled, apple_nvme_sleep_last_stop()) and clears its RUN
-		 * bit; the shutdown notification above is checked at the commit. Resume finds RUN
+		 * bit; the shutdown notification above must have completed (checked here: the NVMe
+		 * window is unreachable at the commit on J613). Resume finds RUN
 		 * clear and resets and boots ANS, as after a shutdown.
 		 */
+		anv->sleep_csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
 		if (anv->sleep_registered && anv->hw->sleep_idle &&
-		    pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware()) {
+		    pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware() &&
+		    (anv->sleep_csts & NVME_CSTS_SHST_MASK) == NVME_CSTS_SHST_CMPLT) {
 			anv->sleep_stop = true;
 			anv->sleep_idled = false;
 			apple_sleep_coproc_set_ready(dev, true);
