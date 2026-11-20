@@ -7,7 +7,8 @@
 //! (`+0x1500` core mask, `+0x1000` pstate), status `+0xc000`
 //! (`+0x20`/`+0x120` busy, `+0x1800` bank select, `+0x18c0` fault status, `+0x18c8` fault
 //! address >> 6). ASC `+0x44` bit 4 is RUN (mapped from `asc` here; the shared layer does not
-//! map it). No blind reads of unpowered blocks: read only after the AGX vote.
+//! map it). No blind reads of unpowered blocks: read only after the AGX vote (25G83) or, on 27.2,
+//! where macOS reads them with no vote, after admission holds the GPU's power domain.
 //!
 //! The status window needs 64-bit stores (the fault bank select), which the shared accessors do
 //! not offer, so it is mapped here, as is `asc`. This module also holds the [`Mapping`] type the
@@ -211,7 +212,7 @@ impl Regs {
         })
     }
 
-    /// Reads the identification words and the enabled-core mask (after the AGX vote).
+    /// Reads the identification words and the enabled-core mask (after the AGX vote on 25G83).
     pub(crate) fn identity(&self) -> Result<Identity> {
         let version = self.res.sgx_read32_at(SGX_ID)?;
         let counts = self.res.sgx_read32_at(SGX_ID + 0x10)?;
