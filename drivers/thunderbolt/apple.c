@@ -95,6 +95,7 @@
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/notifier.h>
+#include <linux/reboot.h>
 #include <linux/pci-apple.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
@@ -173,6 +174,8 @@ struct apple_cio_hw {
 	bool host_tmu;
 	/* Drain PSD runtime power-off before the PHY is reset or reused. */
 	bool psd_power_cycle;
+	/* Stop a started router before a reboot shuts its PCIe and DARTs down. */
+	bool stop_at_reboot;
 	const struct apple_dpin_policy *dp;
 };
 
@@ -211,6 +214,7 @@ static const struct apple_cio_hw apple_cio_t8132_hw = {
 /* MXWrap-v2p3 is started by reconfiguration, using its counted mailbox. */
 static const struct apple_cio_hw apple_cio_t8152_hw = {
 	.psd_power_cycle = true,
+	.stop_at_reboot = true,
 	.type7 = true,
 	.lstx_after_boot = true,
 	.strict_fw_ready = true,
@@ -513,6 +517,7 @@ struct apple_cio {
 	u64 link_lost_cycle_activity; /* remote activity at the last cycle */
 	bool link_lost_restart; /* protected by lock: cycle requested */
 	struct notifier_block pm_notifier;
+	struct notifier_block reboot_notifier;
 	/*
 	 * T6050: the displays behind this port go at the start of the sleep's entry, before any
 	 * port's power-off. @sleep_dp_paused: this entry closed the DP IN admission;
@@ -4484,6 +4489,24 @@ static int apple_cio_pcie_notify(struct notifier_block *nb,
 	return NOTIFY_OK;
 }
 
+/*
+ * A reboot or power-off shuts the PCIe-C host and the router's and the
+ * tunnel's DARTs down before this device, with the router still running
+ * over them. Stop a started router first, as the port driver does for an
+ * unplugged cable, and refuse a new start from then on.
+ */
+static int apple_cio_reboot_notify(struct notifier_block *nb, unsigned long action,
+				   void *data)
+{
+	struct apple_cio *acio = container_of(nb, struct apple_cio, reboot_notifier);
+
+	guard(mutex)(&acio->lock);
+	acio->removing = true;
+	if (acio->current_cable_info)
+		apple_cio_stop(acio);
+	return NOTIFY_DONE;
+}
+
 static int apple_cio_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -4745,6 +4768,10 @@ static int apple_cio_probe(struct platform_device *pdev)
 	acio->pm_notifier_dp.notifier_call = apple_cio_dp_pm_notify;
 	acio->pm_notifier_dp.priority = 20;
 	register_pm_notifier(&acio->pm_notifier_dp);
+	if (acio->hw->stop_at_reboot) {
+		acio->reboot_notifier.notifier_call = apple_cio_reboot_notify;
+		register_reboot_notifier(&acio->reboot_notifier);
+	}
 	return 0;
 }
 
@@ -4752,6 +4779,8 @@ static void apple_cio_remove(struct platform_device *pdev)
 {
 	struct apple_cio *acio = platform_get_drvdata(pdev);
 
+	if (acio->hw->stop_at_reboot)
+		unregister_reboot_notifier(&acio->reboot_notifier);
 	/* Refuse new activation before draining callbacks and workers. */
 	scoped_guard(mutex, &acio->lock)
 		acio->removing = true;
