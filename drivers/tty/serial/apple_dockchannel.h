@@ -24,13 +24,20 @@
  */
 #define DOCKCHANNEL_NEVER_WAIT	"apple,tx-never-wait"
 
-/* Waiting for room, at most DOCKCHANNEL_TX_RETRIES reads per character. */
-static inline void dockchannel_wait_putc(void __iomem *data, unsigned char c)
+/*
+ * Waiting for room, at most DOCKCHANNEL_TX_RETRIES reads per character. With the
+ * debug host gone the FIFO stays full: after one character timed out, the next
+ * are tried once each (*@no_reader) until there's room again, so printing on the
+ * way into and out of a sleep doesn't hold anything up.
+ */
+static inline void dockchannel_wait_putc(void __iomem *data, bool *no_reader,
+					 unsigned char c)
 {
-	unsigned int retries = DOCKCHANNEL_TX_RETRIES;
+	unsigned int retries = *no_reader ? 1 : DOCKCHANNEL_TX_RETRIES;
 
 	while (readl(data + DOCKCHANNEL_TX_FREE) == 0 && --retries)
 		cpu_relax();
+	*no_reader = !retries;
 	if (!retries)
 		return;
 

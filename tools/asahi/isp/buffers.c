@@ -63,6 +63,11 @@ static void set_bit(unsigned int bit, unsigned long *state)
 	*state |= 1UL << bit;
 }
 
+static void clear_bit(unsigned int bit, unsigned long *state)
+{
+	*state &= ~(1UL << bit);
+}
+
 #define dev_err(...) ((void)0)
 #define dev_err_ratelimited(...) ((void)0)
 #define dev_warn_ratelimited(...) ((void)0)
@@ -301,6 +306,8 @@ static void apple_isp_stop_capture(struct apple_isp *isp);
 
 /* These fixtures exercise the non-P010/J613 path. P010 has kernel KUnit coverage. */
 #define ISP_FW_DEAD 3
+/* The zero-initialized fixtures run the firmware (#1445's stop checks for it). */
+#define ISP_FW_RUNNING 0
 #define __set_bit set_bit
 static bool isp_is_p010(struct apple_isp *isp) { return false; }
 static bool isp_supports_p010(struct apple_isp *isp) { return false; }

@@ -23,6 +23,7 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/suspend.h>
 #include <linux/types.h>
 
 #define APPLE_SART_MAX_ENTRIES 16
@@ -90,6 +91,15 @@ struct apple_sart {
 
 	unsigned long protected_entries;
 	unsigned long used_entries;
+	/* The registers as they stood before a firmware-driven suspend */
+	struct {
+		u8 flags;
+		phys_addr_t paddr;
+		size_t size;
+	} saved[APPLE_SART_MAX_ENTRIES];
+	bool saved_valid;
+	/* saved[] still holds the last sleep's entries, for apple_sart_replay() */
+	bool replay_valid;
 };
 
 static void sart0_get_entry(struct apple_sart *sart, int index, u8 *flags,
@@ -398,6 +408,168 @@ static void apple_sart_shutdown(struct platform_device *pdev)
 	}
 }
 
+/* Neither the bootloader's nor a driver's */
+static bool apple_sart_entry_idle(struct apple_sart *sart, int i)
+{
+	return !test_bit(i, &sart->protected_entries) && !test_bit(i, &sart->used_entries);
+}
+
+/*
+ * Whether the wake writes entry i back from the snapshot. Before SARTv4: the ones that held
+ * something. SARTv4: every entry but the last, used or not: an idle one left as the power left
+ * it need not read empty. The last entry reads flags with no address and no size after a sleep
+ * without Linux having written them, so it is written back only when it is in use or holds a
+ * whole entry; idle, its flags stay as they were found.
+ */
+static bool apple_sart_wake_writes(struct apple_sart *sart, int i)
+{
+	if (sart->ops != &sart_ops_v4)
+		return sart->saved[i].size || sart->saved[i].flags;
+	if (i != APPLE_SART_MAX_ENTRIES - 1 || !apple_sart_entry_idle(sart, i))
+		return true;
+	return sart->saved[i].size && sart->saved[i].flags;
+}
+
+/*
+ * A SART in a domain that a firmware-driven suspend powers off comes back empty,
+ * and its coprocessor can't reach its firmware or buffers until the entries are
+ * back. This includes the bootloader's, which Linux otherwise never writes.
+ */
+static int apple_sart_suspend_late(struct device *dev)
+{
+	struct apple_sart *sart = dev_get_drvdata(dev);
+	int i;
+
+	sart->saved_valid = false;
+	sart->replay_valid = false;
+	if (pm_suspend_target_state != PM_SUSPEND_MEM || !pm_suspend_via_firmware())
+		return 0;
+
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++)
+		sart->ops->get_entry(sart, i, &sart->saved[i].flags,
+				     &sart->saved[i].paddr, &sart->saved[i].size);
+	sart->saved_valid = true;
+
+	return 0;
+}
+
+static int apple_sart_resume_noirq(struct device *dev)
+{
+	struct apple_sart *sart = dev_get_drvdata(dev);
+	unsigned int restored = 0;
+	int i;
+
+	if (!sart->saved_valid || !pm_resume_via_firmware())
+		return 0;
+	sart->saved_valid = false;
+
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
+		if (!apple_sart_wake_writes(sart, i))
+			continue;
+		sart->ops->set_entry(sart, i, sart->saved[i].flags,
+				     sart->saved[i].paddr >> sart->ops->paddr_shift,
+				     sart->saved[i].size >> sart->ops->size_shift);
+		restored++;
+	}
+	dev_dbg(dev, "%u entries restored after sleep\n", restored);
+	sart->replay_valid = true;
+
+	return 0;
+}
+
+/*
+ * A coprocessor's driver calls this right before its run bit. macOS writes the entries back
+ * there, config first, then address, then size, so this does the same on SARTv3 and SARTv4.
+ * Which entries: apple_sart_wake_writes().
+ */
+int apple_sart_replay(struct apple_sart *sart)
+{
+	int i, bad = 0;
+
+	if ((sart->ops != &sart_ops_v3 && sart->ops != &sart_ops_v4) ||
+	    !sart->replay_valid)
+		return -EOPNOTSUPP;
+
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
+		phys_addr_t paddr;
+		size_t size;
+		u8 flags;
+
+		if (!apple_sart_wake_writes(sart, i))
+			continue;
+		writel(sart->saved[i].flags, sart->regs + APPLE_SART3_CONFIG(i));
+		writel(sart->saved[i].paddr >> APPLE_SART3_PADDR_SHIFT,
+		       sart->regs + sart->ops->paddr_reg + 4 * i);
+		writel(sart->saved[i].size >> APPLE_SART3_SIZE_SHIFT,
+		       sart->regs + sart->ops->size_reg + 4 * i);
+		sart->ops->get_entry(sart, i, &flags, &paddr, &size);
+		if (flags == sart->saved[i].flags && paddr == sart->saved[i].paddr &&
+		    size == sart->saved[i].size)
+			continue;
+		bad++;
+		dev_warn(sart->dev, "entry %d reads %#x %pa+%#zx, wrote %#x %pa+%#zx\n",
+			 i, flags, &paddr, size, sart->saved[i].flags, &sart->saved[i].paddr,
+			 sart->saved[i].size);
+	}
+
+	return bad;
+}
+EXPORT_SYMBOL_GPL(apple_sart_replay);
+
+int apple_sart_sleep_validate(struct apple_sart *sart)
+{
+	int i, ret = 0;
+
+	if (sart->ops != &sart_ops_v4 || !sart->saved_valid)
+		return -EOPNOTSUPP;
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
+		phys_addr_t paddr;
+		size_t size;
+		u8 flags;
+
+		const char *why = NULL;
+		bool refused = true;
+
+		sart->ops->get_entry(sart, i, &flags, &paddr, &size);
+		if (flags != sart->saved[i].flags || paddr != sart->saved[i].paddr ||
+		    size != sart->saved[i].size) {
+			why = "changed since the snapshot";
+		} else if (apple_sart_entry_idle(sart, i) && flags && !paddr && !size) {
+			/*
+			 * Nobody's entry, as it stood at the snapshot, with flags and no range: it
+			 * admits nothing, and it is what an idle last entry reads after a sleep
+			 * (apple_sart_wake_writes()). Named, not refused. An entry of the
+			 * bootloader's or of a driver's in that state is still half set.
+			 */
+			why = "flags without a range, accepted";
+			refused = false;
+		} else if (!!flags != !!size) {
+			why = "half set";
+		} else if (!apple_sart_entry_idle(sart, i) && (!flags || !size)) {
+			why = "in use and empty";
+		}
+		if (!why)
+			continue;
+		/* The line names its entry: the caller only has the number */
+		dev_printk(refused ? KERN_WARNING : KERN_DEBUG, sart->dev,
+			   "sleep check: entry %d %s: reads %#x %pa+%#zx, snapshot %#x %pa+%#zx, %s%s\n",
+			   i, why, flags, &paddr, size, sart->saved[i].flags, &sart->saved[i].paddr,
+			   sart->saved[i].size,
+			   test_bit(i, &sart->protected_entries) ? "bootloader's" : "",
+			   test_bit(i, &sart->used_entries) ? "driver's" :
+			   test_bit(i, &sart->protected_entries) ? "" : "unused");
+		if (refused)
+			ret = -ESTALE;
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_sart_sleep_validate);
+
+static const struct dev_pm_ops apple_sart_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(apple_sart_suspend_late, NULL)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, apple_sart_resume_noirq)
+};
+
 static const struct of_device_id apple_sart_of_match[] = {
 	{
 		.compatible = "apple,t6050-sart",
@@ -423,6 +595,7 @@ static struct platform_driver apple_sart_driver = {
 	.driver = {
 		.name = "apple-sart",
 		.of_match_table = apple_sart_of_match,
+		.pm = pm_sleep_ptr(&apple_sart_pm_ops),
 	},
 	.probe = apple_sart_probe,
 	.shutdown = apple_sart_shutdown,

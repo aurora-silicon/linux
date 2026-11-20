@@ -90,6 +90,7 @@ config APPLE_ADMAC
 	depends on ARCH_APPLE || COMPILE_TEST
 	select DMA_ENGINE
 	select DMA_VIRTUAL_CHANNELS
+	select APPLE_TUNABLE
 	help
 	  Enable support for Audio DMA Controller found on Apple Silicon SoCs.
 

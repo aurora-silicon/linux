@@ -73,7 +73,8 @@ void afk_service_retry(struct apple_dcp_afkep *ep)
 {
 	unsigned long flags;
 
-	if (!ep || !ep->wire_v2 || ep != ep->dcp->dcpavservep)
+	if (!ep || !ep->wire_v2 ||
+	    (!dcp_is_ext26(ep->dcp) && ep != ep->dcp->dcpavservep))
 		return;
 	spin_lock_irqsave(&ep->lock, flags);
 	if (!ep->stopping)
@@ -92,6 +93,10 @@ static void afk_release_context(void *data)
 	struct apple_dcp_afkep *afkep = data;
 
 	afk_quiesce(afkep);
+	/* A superseded endpoint's devres must not erase its replacement route. */
+	if (afkep->dcp->v27_sleep_transport &&
+	    afkep->endpoint >= 0x20 && afkep->endpoint < 0x40)
+		cmpxchg(&afkep->dcp->sleep_v27_ep[afkep->endpoint - 0x20], afkep, NULL);
 	if (!afkep->dcp->retain_dma) {
 		kvfree(afkep->command_tags);
 		kfree(afkep);
@@ -110,7 +115,7 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 
 	afkep->ops = ops;
 	afkep->dcp = dcp;
-	afkep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+	afkep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 || dcp_is_ext26(dcp);
 	afkep->endpoint = endpoint;
 	afkep->wq = alloc_ordered_workqueue("apple-dcp-afkep%02x",
 					    WQ_MEM_RECLAIM, endpoint);
@@ -135,6 +140,8 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 	if (ret)
 		return ERR_PTR(ret);
 
+	if (dcp->v27_sleep_transport && endpoint >= 0x20 && endpoint < 0x40)
+		WRITE_ONCE(dcp->sleep_v27_ep[endpoint - 0x20], afkep);
 	return afkep;
 
 out_free_afkep:
@@ -459,12 +466,13 @@ static bool afk_compact_capable(struct apple_dcp_afkep *ep)
 {
 	/*
 	 * An adopted J713 external DCP runs compact EPIC on its auxiliary
-	 * endpoints too, and the J700 (H17P) external processor on its audio
-	 * endpoint, as the desktop 26.x one does.
+	 * endpoints too, and the J700 (H17P) and firmware 27 external
+	 * processors on their audio endpoint, as the desktop 26.x one does.
 	 */
 	return ep->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
 	       (ep->dcp->fw_compat == DCP_FIRMWARE_M4 && ep->dcp->afk_alloc) ||
-	       (ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	       ((ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
+		 dcp_is_v27_external(ep->dcp)) &&
 		ep->endpoint == AV_AUDIO_ENDPOINT_DESKTOP);
 }
 
@@ -823,10 +831,15 @@ afk_compact_slot(struct apple_dcp_afkep *ep,
 	 * the previous one. The DPDEV, DPAVSERV and AV endpoints (0x27-0x29)
 	 * also do so after an external hotplug without a poweron. Replace an
 	 * enabled service with the same binding, name and unit in place when
-	 * it comes from an earlier poweron, or from any announcement on the
-	 * hotplug endpoints. Services announced since the latest poweron stay:
-	 * DPAVCTRL announces several services with the same name and no unit
-	 * in one generation, and those are siblings, not replacements.
+	 * it comes from an earlier poweron, from any announcement on the
+	 * hotplug endpoints, or when the service is a singleton (one that is
+	 * re-announced on every DP relink and of which only one is ever live,
+	 * such as the external DCP's AV interfaces on AV_AUDIO_ENDPOINT_DESKTOP
+	 * (0x2b), which a relink across suspend would otherwise pile up until
+	 * the endpoint has no slot left). Services announced since the latest
+	 * poweron stay: DPAVCTRL announces several services with the same name
+	 * and no unit in one generation, and those are siblings, not
+	 * replacements.
 	 */
 	hotplug = ep->endpoint >= 0x27 && ep->endpoint <= 0x29;
 	for (i = 0; i < ep->num_channels; i++) {
@@ -834,7 +847,7 @@ afk_compact_slot(struct apple_dcp_afkep *ep,
 		if (!service->enabled || service->ops != ops ||
 		    service->unit != unit || strcmp(service->name, name))
 			continue;
-		if (!hotplug && service->power_gen == gen)
+		if (!hotplug && !ops->singleton && service->power_gen == gen)
 			continue;
 		dev_info(ep->dcp->dev,
 			 "AFK[ep:%02x]: replacing compact service %s interface %u\n",
@@ -1104,6 +1117,11 @@ static void afk_compact_reply_worker(struct work_struct *work)
 		dev_err(r->ep->dcp->dev,
 			"AFK[ep:%02x]: failed to reply to compact service call: %d\n",
 			r->ep->endpoint, ret);
+	if (ret && r->ep->dcp->v27_sleep_transport) {
+		guard(spinlock_irqsave)(&r->ep->lock);
+		r->ep->sleep_poisoned = true;
+	}
+	atomic_dec_return_release(&r->ep->sleep_jobs);
 	kvfree(r);
 }
 
@@ -1170,6 +1188,7 @@ static void afk_recv_handle_compact_call(struct apple_dcp_afkep *ep,
 	if (ret)
 		reply_desc->status = cpu_to_le32(ret);
 
+	atomic_inc(&ep->sleep_jobs);
 	queue_work(ep->tx_wq, &r->work);
 }
 
@@ -1427,6 +1446,149 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 			       enum epic_type etype, enum epic_category ecat, u8 stype,
 			       const void *payload, size_t payload_len, u64 token);
 
+/* Caller has closed host publication and settled ordinary commands first. */
+int afk_v27_sleep_check(struct apple_dcp_afkep *ep)
+{
+	unsigned long flags;
+	unsigned int i;
+	int ret = 0;
+
+	if (!ep || !ep->wire_v2 || !ep->txbfr.ready || !ep->rxbfr.ready ||
+	    !ep->txbfr.buf || !ep->txbfr.rptr || !ep->txbfr.wptr ||
+	    !ep->rxbfr.buf || !ep->rxbfr.rptr || !ep->rxbfr.wptr)
+		return -ENODEV;
+	spin_lock_irqsave(&ep->lock, flags);
+	if (ep->stopping || ep->sleep_waiting || ep->sleep_poisoned ||
+	    ep->compact_tx_desync || ep->compact_rx.received ||
+	    atomic_read_acquire(&ep->sleep_jobs) || work_busy(&ep->service_work) ||
+	    !list_empty(&ep->compact_cmds) || ep->compact_orphans)
+		ret = -EBUSY;
+	if (!ret && ep->sleep_closed) {
+		dma_rmb();
+		if (READ_ONCE(*ep->rxbfr.rptr) != READ_ONCE(*ep->rxbfr.wptr) ||
+		    READ_ONCE(*ep->txbfr.rptr) != READ_ONCE(*ep->txbfr.wptr))
+			ret = -EBUSY;
+	}
+	spin_unlock_irqrestore(&ep->lock, flags);
+	/*
+	 * An external processor's AV and DP interfaces are the firmware's to end: one that has
+	 * not answered does not hold the sleep (afk_v27_sleep_unanswered() counts them).
+	 */
+	for (i = 0; !ret && !ep->v27_closed_teardown && i < ep->num_channels; i++) {
+		struct apple_epic_service *srv = &ep->services[i];
+
+		spin_lock_irqsave(&srv->lock, flags);
+		if (!bitmap_empty(srv->cmd_map, MAX_PENDING_CMDS) ||
+		    srv->pending_open)
+			ret = -EBUSY;
+		spin_unlock_irqrestore(&srv->lock, flags);
+	}
+	return ret;
+}
+
+/* The interfaces of @ep with a call not answered or an opening not finished. */
+unsigned int afk_v27_sleep_unanswered(struct apple_dcp_afkep *ep)
+{
+	unsigned long flags;
+	unsigned int i, n = 0;
+
+	if (!ep)
+		return 0;
+	for (i = 0; i < ep->num_channels; i++) {
+		struct apple_epic_service *srv = &ep->services[i];
+
+		spin_lock_irqsave(&srv->lock, flags);
+		if (!bitmap_empty(srv->cmd_map, MAX_PENDING_CMDS) || srv->pending_open)
+			n++;
+		spin_unlock_irqrestore(&srv->lock, flags);
+	}
+	return n;
+}
+
+int afk_v27_sleep_control(struct apple_dcp_afkep *ep, bool open)
+{
+	struct afk_qe *hdr;
+	unsigned long flags;
+	u32 rptr, wptr, next, old;
+	u8 payload[12] = {};
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) ||
+	    !ep || !ep->dcp->v27_sleep_transport ||
+	    ep->dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		return -EOPNOTSUPP;
+	ret = afk_v27_sleep_check(ep);
+	if (ret)
+		return ret;
+	spin_lock_irqsave(&ep->lock, flags);
+	/* A callback reply may have failed since the inventory check. */
+	if (ep->stopping || ep->sleep_poisoned || ep->sleep_waiting) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (ep->sleep_closed == !open) {
+		ret = -EALREADY;
+		goto out;
+	}
+	dma_rmb();
+	rptr = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr));
+	old = wptr = le32_to_cpu(READ_ONCE(*ep->txbfr.wptr));
+	if (!afk_ring_ptrs_valid(rptr, wptr, ep->txbfr.bufsz, ep->txbfr.stride) ||
+	    ep->txbfr.bufsz > 0x10000 || ep->txbfr.stride < 32 ||
+	    (ep->txbfr.stride & (ep->txbfr.stride - 1)) ||
+	    ep->txbfr.bufsz % ep->txbfr.stride ||
+	    ep->txbfr.bufsz - wptr < sizeof(*hdr)) {
+		ret = -EPROTO;
+		goto out;
+	}
+	/* Use the existing dummy-header wrap format and keep one slot empty. */
+	next = ALIGN(wptr + sizeof(*hdr) + sizeof(payload), ep->txbfr.stride);
+	if (next > ep->txbfr.bufsz)
+		next = ep->txbfr.stride;
+	else if (next == ep->txbfr.bufsz)
+		next = 0;
+	if ((wptr < rptr && next >= rptr) ||
+	    (wptr >= rptr && next <= wptr && next >= rptr)) {
+		ret = -EAGAIN;
+		goto out;
+	}
+	hdr = ep->txbfr.buf + wptr;
+	hdr->magic = cpu_to_le32(QE_MAGIC);
+	hdr->size = cpu_to_le32(sizeof(payload));
+	hdr->channel = 0;
+	hdr->type = 0;
+	if (sizeof(*hdr) + sizeof(payload) > ep->txbfr.bufsz - wptr) {
+		memcpy(ep->txbfr.buf, hdr, sizeof(*hdr));
+		hdr = ep->txbfr.buf;
+	}
+	payload[0] = ep->qe_seq++;
+	put_unaligned_le32(4, payload + 4);
+	put_unaligned_le32(open ? 4 : 2, payload + 8);
+	memcpy(hdr->data, payload, sizeof(payload));
+	reinit_completion(&ep->sleep_done);
+	ep->sleep_expected = open ? 5 : 3;
+	ep->sleep_waiting = true;
+	dma_wmb();
+	WRITE_ONCE(*ep->txbfr.wptr, cpu_to_le32(next));
+	dma_wmb();
+	/* Return the transport's send error; a published entry still poisons it. */
+	ret = apple_rtkit_send_message(ep->dcp->rtk, ep->endpoint,
+		FIELD_PREP(RBEP_TYPE, RBEP_RECV) | (u64)rptr << 32 |
+		(u64)next << 16 | old, NULL, true);
+	spin_unlock_irqrestore(&ep->lock, flags);
+	if (!ret && !wait_for_completion_timeout(&ep->sleep_done,
+						 msecs_to_jiffies(250)))
+		ret = -ETIMEDOUT;
+	spin_lock_irqsave(&ep->lock, flags);
+	if (ret) {
+		ep->sleep_poisoned = true;
+		ep->sleep_waiting = false;
+	}
+ out:
+	spin_unlock_irqrestore(&ep->lock, flags);
+	return ret;
+}
+
 /* Pending identities are owned only by the ordered endpoint workqueue. */
 static void afk_discard_pending_open(struct apple_epic_service *service)
 {
@@ -1449,8 +1611,12 @@ static void afk_retry_service_init(struct apple_dcp_afkep *ep)
 
 		if (!service->pending_open)
 			continue;
-		ret = ops->revalidate(service, service->pending_name,
-				      service->pending_class, service->pending_unit);
+		if (dcp_is_ext26(ep->dcp) &&
+		    (!READ_ONCE(ep->dcp->ext26_services_open) ||
+		     (ep == ep->dcp->dptxep && !dptx_native_controllers_ready(ep->dcp))))
+			continue;
+		ret = ops->revalidate ? ops->revalidate(service, service->pending_name,
+				      service->pending_class, service->pending_unit) : 0;
 		if (ret) {
 			afk_discard_pending_open(service);
 			continue;
@@ -1468,8 +1634,9 @@ static void afk_retry_service_init(struct apple_dcp_afkep *ep)
 		}
 		service->pending_open = false;
 		afk_service_publish(service);
-		ops->init(service, service->pending_name, service->pending_class,
-			  service->pending_unit);
+		if (ops->init)
+			ops->init(service, service->pending_name, service->pending_class,
+				  service->pending_unit);
 		if (service->enabled)
 			afk_populate_service_debugfs(service);
 		kfree(service->pending_name);
@@ -1502,8 +1669,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	const char *epic_name = NULL, *epic_class = NULL;
 	const struct apple_epic_service_ops *ops;
 	struct dcp_parse_ctx ctx;
-	u8 *props = payload + sizeof(name);
-	size_t props_size = payload_size - sizeof(name);
+	u8 *props;
+	size_t props_size;
 
 	previous = afk_epic_find_service(ep, channel);
 	/*
@@ -1528,7 +1695,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 
 		if (!pending->pending_open || pending->channel != channel)
 			continue;
-		if (!pending->ops->revalidate(pending, pending->pending_name,
+		if (!pending->ops->revalidate ||
+		    !pending->ops->revalidate(pending, pending->pending_name,
 					      pending->pending_class, pending->pending_unit))
 			return;
 		afk_discard_pending_open(pending);
@@ -1541,6 +1709,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	}
 
 	strscpy(name, payload, sizeof(name));
+	props = payload + sizeof(name);
+	props_size = payload_size - sizeof(name);
 
 	/*
 	 * in DCP firmware 13.2 DCP reports interface-name as name which starts
@@ -1557,14 +1727,29 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			return;
 		}
 		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit,
-					      (ep->dcp->fw_compat == DCP_FIRMWARE_H17P || ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0),
+					      (ep->dcp->fw_compat == DCP_FIRMWARE_H17P &&
+					       !dcp_is_ext26(ep->dcp)) ||
+					      ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0,
 					      ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0);
+		/* These native infrastructure reports have no EPIC identity. */
+		if (dcp_is_ext26(ep->dcp) && ret == -ENOENT &&
+		    (ep->endpoint == SYSTEM_ENDPOINT ||
+		     ep->endpoint == DISP0_ENDPOINT)) {
+			dev_dbg(ep->dcp->dev,
+				 "native26 AFK ep=%#x interface=%u report=%s has no EPIC identity; ignored\n",
+				 ep->endpoint, channel, name);
+			return;
+		}
 		if (ret == -ENOENT &&
-		    ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) {
+		    (ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
+		     (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		      ep->dcp->hw.firmware_compat == DCP_FIRMWARE_H17P) ||
+		     ep->dcp->v27_j714s ||
+		     (ep->dcp->v27_sleep_transport && !strcmp(name, "md-manager")))) {
 			/*
-			 * M5 (H17G) announces powerlog-service with only
-			 * ep-has-desc-mgr and interface-id; match it by the
-			 * announced name, as for props-less announces.
+			 * H17G and firmware-27 T8142 can omit EPIC identity
+			 * for powerlog-service. J716c's sleep transport
+			 * admits only md-manager by name here.
 			 */
 			epic_name = NULL;
 			epic_class = NULL;
@@ -1584,6 +1769,10 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		ops = afk_match_service(ep, epic_name);
 	else
 		ops = afk_match_service(ep, service_name);
+	if (dcp_is_ext26(ep->dcp))
+		dev_dbg(ep->dcp->dev,
+			 "native26 AFK identity ep=%#x interface=%u name=%s class=%s unit=%lld\n",
+			 ep->endpoint, channel, epic_name ?: name, epic_class ?: "", epic_unit);
 
 	/* T6030 14.7: the DPAV controller endpoint binds whatever it announces. */
 	if (!ops && ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 && ep->ops &&
@@ -1594,6 +1783,9 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		ops = ep->ops;
 	}
 
+	if (!ops && dcp_is_ext26(ep->dcp) && ep->ops &&
+	    !strcmp(ep->ops->name, "native26-observer"))
+		ops = ep->ops;
 	if (!ops) {
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: unable to match service %s on channel %d\n",
@@ -1624,13 +1816,19 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 					 "AFK optional %s (%s) is unsupported on channel %u\n",
 					 ops->name, service_name, channel);
 			else
-				dev_err(ep->dcp->dev, "AFK service %s admission failed: %d\n",
-					service_name, ret);
+				dev_err(ep->dcp->dev,
+					"AFK service %s admission failed: %d (ep=%#x interface=%u name=%s unit=%lld)\n",
+					service_name, ret, ep->endpoint, channel, epic_name ?: name, epic_unit);
 			afk_service_discard(service);
 			goto free;
 		}
 	}
-	if (previous && retired && ops->revalidate) {
+	if ((previous && retired && ops->revalidate) ||
+	    (dcp_is_ext26(ep->dcp) &&
+	     (!READ_ONCE(ep->dcp->ext26_services_open) ||
+	      (ep == ep->dcp->dptxep && !dptx_native_controllers_ready(ep->dcp))))) {
+		/* No reader may use a native interface before its deferred OPEN. */
+		WRITE_ONCE(service->enabled, false);
 		/* Preserve the admitted identity and its original provider ticket. */
 		service->pending_open = true;
 		service->pending_name = epic_name;
@@ -1639,7 +1837,7 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		afk_service_retry(ep);
 		return;
 	}
-	if (ep->wire_v2) {
+	if (ep->wire_v2 && !ops->open_later) {
 		int ret = afk_send_epic(ep, channel, 0, EPIC_TYPE_NOTIFY,
 					EPIC_CAT_REPORT, AFKV2_OPEN, NULL, 0);
 
@@ -2168,6 +2366,13 @@ reject:
 	afk_v2_status(ep, frame, command, status);
 }
 
+/* A firmware 27 panel's AV and DP service endpoint (epic/panelavep.c). */
+static bool afk_is_panelav(struct apple_dcp_afkep *ep)
+{
+	return ep->dcp->v27_j714s && ep->endpoint >= 0x20 && ep->endpoint < 0x40 &&
+	       READ_ONCE(ep->dcp->panelav[ep->endpoint - 0x20]) == ep;
+}
+
 static void afk_v2_receive(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 			   const void *data, size_t size)
 {
@@ -2187,7 +2392,9 @@ static void afk_v2_receive(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 			afk_recv_handle_init(ep, frame.interface, (void *)frame.payload,
 					     frame.payload_size);
 		else if ((frame.type == AFKV2_CLOSE && frame.interface_flags == 1) ||
-			 (ep == ep->dcp->dcpavservep && afkv2_closed_report(&frame)))
+			 ((ep == ep->dcp->dcpavservep || afk_is_panelav(ep) ||
+			   ep->v27_closed_teardown) &&
+			  afkv2_closed_report(&frame)))
 			afk_recv_handle_teardown(ep, frame.interface);
 		return;
 	}
@@ -2239,6 +2446,35 @@ static void afk_v2_receive(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	afk_service_put(service);
 }
 
+/* Channel/type zero, three words, length four, code 2/3 or 4/5.
+ * The sender's sequence is NOT echoed; there is no transaction ID. Never
+ * retry a timed-out exchange in the same endpoint lifetime.
+ */
+static bool afk_v27_sleep_reply(struct apple_dcp_afkep *ep, u32 channel,
+			       u32 type, const u8 *data, size_t size)
+{
+	unsigned long flags;
+	u8 code;
+
+	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) ||
+	    !ep->dcp->v27_sleep_transport || channel || type ||
+	    size != 12 || get_unaligned_le32(data + 4) != 4 ||
+	    get_unaligned_le16(data + 2))
+		return false;
+	code = data[8];
+	if (code != 3 && code != 5)
+		return false;
+	spin_lock_irqsave(&ep->lock, flags);
+	if (!ep->stopping && !ep->sleep_poisoned &&
+	    ep->sleep_waiting && code == ep->sleep_expected) {
+		ep->sleep_waiting = false;
+		ep->sleep_closed = code == 3;
+		complete(&ep->sleep_done);
+	}
+	spin_unlock_irqrestore(&ep->lock, flags);
+	return true;
+}
+
 static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 			    u8 *data, size_t data_size)
 {
@@ -2252,9 +2488,16 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	u8 *payload;
 	size_t payload_size;
 
-	if (afk_recv_handle_compact(ep, channel, type, data, data_size))
+	/*
+	 * The sleep exchange's answer first: its three words read as a compact header with
+	 * four bytes behind it, which no compact message is, and a compact endpoint that has
+	 * carried traffic would drop it as a broken fragment.
+	 */
+	if (afk_v27_sleep_reply(ep, channel, type, data, data_size))
 		return;
 
+	if (afk_recv_handle_compact(ep, channel, type, data, data_size))
+		return;
 	if (ep->wire_v2) {
 		afk_v2_receive(ep, channel, type, data, data_size);
 		return;
@@ -2559,6 +2802,7 @@ unknown:
 			"Received unknown AFK message type: 0x%x\n", type);
 	}
 
+	atomic_dec_return_release(&work->ep->sleep_jobs);
 	kfree(work);
 }
 
@@ -2584,6 +2828,7 @@ int afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
 		kfree(work);
 		return -ESHUTDOWN;
 	}
+	atomic_inc(&ep->sleep_jobs);
 	queue_work(ep->wq, &work->work);
 	spin_unlock_irqrestore(&ep->lock, flags);
 
@@ -2653,6 +2898,10 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	}
 
 	spin_lock_irqsave(&ep->lock, flags);
+	if (READ_ONCE(ep->dcp->sleep_v27_closed) && ecat != EPIC_CAT_REPLY) {
+		ret = -EBUSY;
+		goto out;
+	}
 	if (ep->stopping || !ep->txbfr.ready) {
 		ret = -ESHUTDOWN;
 		goto out;
@@ -2850,6 +3099,15 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 				   payload, payload_len, 0);
 }
 
+/* AFKV2: the OPEN of a service whose provider sends it itself (open_later). */
+int afk_service_open(struct apple_epic_service *service)
+{
+	if (!service->ep->wire_v2)
+		return -EOPNOTSUPP;
+	return afk_send_epic(service->ep, service->channel, 0, EPIC_TYPE_NOTIFY,
+			     EPIC_CAT_REPORT, AFKV2_OPEN, NULL, 0);
+}
+
 int afk_send_command(struct apple_epic_service *service, u8 type,
 		     const void *payload, size_t payload_len, void *output,
 		     size_t output_len, u32 *retcode)
@@ -2972,6 +3230,22 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 		goto err_put_service;
 	}
 
+	if (dcp_is_ext26(ep->dcp)) {
+		size_t charge = ALIGN(payload_len, SZ_16K) + ALIGN(output_len, SZ_16K);
+
+		spin_lock_irqsave(&ep->lock, flags);
+		ret = READ_ONCE(ep->dcp->crashed) ? -EIO :
+			(ep->ext26_command_count >= 255 ||
+			 charge > SZ_16M - ep->ext26_command_bytes) ? -ENOSPC : 0;
+		if (!ret) {
+			ep->ext26_command_bytes += charge;
+			ep->ext26_command_count++;
+		}
+		spin_unlock_irqrestore(&ep->lock, flags);
+		if (ret)
+			goto err_put_service;
+	}
+
 	rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
 				   GFP_KERNEL);
 	if (!rxbuf) {
@@ -3065,7 +3339,9 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 		 */
 		if (!service->cmds[idx].done) {
 			service->cmds[idx].completion = NULL;
-			service->cmds[idx].free_on_ack = true;
+			service->cmds[idx].free_on_ack = !dcp_is_ext26(ep->dcp);
+			if (dcp_is_ext26(ep->dcp))
+				WRITE_ONCE(ep->dcp->crashed, true);
 			spin_unlock_irqrestore(&service->lock, flags);
 			dev_warn(ep->dcp->dev,
 				 "AFK[ep:%02x]: %s (chan:%u) command type 0x%x tag 0x%04x timed out after %u ms\n",
@@ -3129,9 +3405,11 @@ err_unlock:
 	spin_unlock_irqrestore(&service->lock, flags);
 err_free_txbuf:
 	kfree(inline_command);
-	dma_free_coherent(ep->dcp->dev, payload_len, txbuf, txbuf_dma);
+	if (!dcp_is_ext26(ep->dcp))
+		dma_free_coherent(ep->dcp->dev, payload_len, txbuf, txbuf_dma);
 err_free_rxbuf:
-	dma_free_coherent(ep->dcp->dev, output_len, rxbuf, rxbuf_dma);
+	if (!dcp_is_ext26(ep->dcp))
+		dma_free_coherent(ep->dcp->dev, output_len, rxbuf, rxbuf_dma);
 err_put_service:
 	afk_service_put(service);
 	return ret;
@@ -3490,3 +3768,26 @@ static void afk_remove_service_debugfs(struct apple_epic_service *srv)
 #if IS_ENABLED(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST)
 #include "afk-parser-test.c"
 #endif
+
+/* Called after RX and the ordered endpoint worker have been joined. */
+bool afk_host_idle(struct apple_dcp_afkep *ep)
+{
+	unsigned long flags;
+	unsigned int i;
+	bool idle = true;
+
+	spin_lock_irqsave(&ep->lock, flags);
+	if (ep->rxbfr.ready)
+		idle = READ_ONCE(*ep->rxbfr.rptr) == READ_ONCE(*ep->rxbfr.wptr);
+	if (ep->txbfr.ready)
+		idle &= READ_ONCE(*ep->txbfr.rptr) == READ_ONCE(*ep->txbfr.wptr);
+	spin_unlock_irqrestore(&ep->lock, flags);
+	for (i = 0; i < AFK_MAX_CHANNEL && idle; i++) {
+		struct apple_epic_service *service = &ep->services[i];
+
+		spin_lock_irqsave(&service->lock, flags);
+		idle = bitmap_empty(service->cmd_map, MAX_PENDING_CMDS);
+		spin_unlock_irqrestore(&service->lock, flags);
+	}
+	return idle;
+}

@@ -250,6 +250,9 @@ impl crate::g17::Firmware {
         if !packet.is_published() {
             pair.discard_prepared(packet)?;
         }
+        // A failed publication may have quarantined the lent pair, and its owner may have
+        // closed while it was lent.
+        self.queues.hold_render_slot(usize::from(slot));
         if let Some((id, generation)) = activation {
             if self.queues.render.pools.activate(id, generation).is_err() {
                 self.primary.state.shared.lose_device_quietly();
@@ -284,6 +287,9 @@ impl Backend {
             || packet.cancel_requested()
             || packet.completion.status().get() != 0
             || packet.order.wait_through[1].unwrap_or(0) != 0
+            // Only the device-mutex path resolves a staged render's tiling prefixes.
+            || matches!(&packet.command, crate::g17::command::Validated::Render { pass, .. }
+                if pass.stage_prefixes)
             || self.admission_open().is_err()
         {
             return None;

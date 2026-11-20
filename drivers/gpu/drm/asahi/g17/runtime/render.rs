@@ -503,7 +503,10 @@ impl Registry {
         error: Error,
         deferred: &mut DeferredBatch,
     ) -> Result {
-        for entry in self.render.entries.iter_mut().flatten() {
+        for (slot, entry) in self.render.entries.iter_mut().enumerate() {
+            let Some(entry) = entry.as_mut() else {
+                continue;
+            };
             if !entry
                 .context
                 .as_ref()
@@ -513,12 +516,67 @@ impl Registry {
             }
             if let Some(pair) = entry.pair.as_mut() {
                 pair.quarantine(error, &mut |event| deferred.push(event))?;
+                // An idle pair has no lease to carry the quarantine into admission.
+                self.admission.set_held(slot, render_hold(&self.teardown, pair));
             } else if entry.preparing.is_some() || entry.growing {
                 entry.pending_error = Some((status.clone(), error));
             }
         }
         Ok(())
     }
+
+    /// Under the device mutex: sets the admission hold of `slot` from its entry
+    /// ([`render_hold`]). A pair lent out keeps its bit until it is put back, which calls this
+    /// again, but is held at once if the release of its context is armed meanwhile (its owner
+    /// closed during a growth, which takes no lease). A slot without an installed pair (none
+    /// yet, parked, or no entry) is not held.
+    pub(super) fn hold_render_slot(&self, slot: usize) {
+        if let Some(held) = self.render_slot_held(slot) {
+            self.admission.set_held(slot, held);
+        }
+    }
+
+    /// [`Self::hold_render_slot`] for every slot: where a scheduler release is armed (an owner
+    /// closes or a rebind displaces a context), where consumed releases park their pairs, and
+    /// on each housekeeping pass.
+    pub(super) fn sync_render_holds(&self) {
+        let (mut slots, mut held) = (0u64, 0u64);
+        for slot in 1..RENDER_SLOTS {
+            if let Some(hold) = self.render_slot_held(slot) {
+                slots |= 1u64 << slot;
+                held |= u64::from(hold) << slot;
+            }
+        }
+        self.admission.sync_held(slots, held);
+    }
+
+    /// The hold of `slot`, or None to keep it while its pair is lent out.
+    fn render_slot_held(&self, slot: usize) -> Option<bool> {
+        let Some(entry) = self.render.entries.get(slot).and_then(Option::as_ref) else {
+            return Some(false);
+        };
+        match entry.pair.as_ref() {
+            Some(pair) => Some(render_hold(&self.teardown, pair)),
+            None if entry.preparing.is_some() || entry.growing => entry
+                .context
+                .as_ref()
+                .is_some_and(|context| self.teardown.releasing(context))
+                .then_some(true),
+            None => Some(false),
+        }
+    }
+}
+
+/// Whether admission gives the slot of `pair` to no owner but its own open one
+/// ([`crate::g17::queue::admission::Pool::set_held`]). Another owner can bind the pair only
+/// when it keeps no work nobody else can bind past ([`Pair::unreusable_work`]) and the scheduler
+/// release of the context it is bound to is not pending: from its owner's close until the
+/// firmware consumed that release and the teardown parked the pair, `build_render_pair` and
+/// `rebind_pair` refuse every other owner (`teardown::Pending::releasing`). A closed context
+/// waiting for its compute, its pools or its kill stays there for as long, and every client
+/// given such a slot waited out its publication bound and lost its device.
+fn render_hold(teardown: &crate::g17::teardown::Pending, pair: &Pair) -> bool {
+    pair.unreusable_work() || teardown.releasing(pair.context())
 }
 
 struct Host<'a> {
@@ -823,6 +881,9 @@ impl crate::g17::Firmware {
         let result = operation(&mut pair, &mut host);
         host.release_registration();
         self.queues.render.entries[slot].as_mut().ok_or(EIO)?.pair = Some(pair);
+        // Still under the device mutex: the retirements this pass deferred drop their leases
+        // only after it is released, so another owner never sees the slot free in between.
+        self.queues.hold_render_slot(slot);
         result
     }
 
@@ -1125,9 +1186,9 @@ impl Registry {
 
     /// Gives back the USC backing of render pools whose client VM pressure
     /// reclaim evicted (an idle VM) and whose final free-list release was
-    /// consumed. The vacated backings go to the worker's deferred batch, which
-    /// frees them after the device mutex; a later job of that client re-arms
-    /// the pool first.
+    /// consumed, and of the pools that kept graphs still hold. The vacated
+    /// backings go to the worker's deferred batch, which frees them after the
+    /// device mutex; a later job of an evicted client re-arms its pool first.
     pub(in crate::g17) fn vacate_evicted_render_pools(
         &mut self,
         init: &crate::g17::initdata::InitData,
@@ -1152,8 +1213,44 @@ impl Registry {
                 deferred.defer_render_backing(backing);
             }
         }
+        // A kept graph's pool is never staged again; its pages go back once
+        // its final free-list release is consumed.
+        for graph in render.kept_graphs.iter() {
+            if !deferred.render_backing_room() {
+                break;
+            }
+            let pool = graph.pool();
+            if pool.vacant() || !render.pools.released(u32::from(pool.id()), pool.control_va()) {
+                continue;
+            }
+            if let Some(backing) = pool.vacate() {
+                deferred.defer_render_backing(backing);
+            }
+        }
         Ok(())
     }
+    /// No graph is being built or grown.
+    pub(in crate::g17) fn render_settled(&self) -> bool {
+        self.render
+            .entries
+            .iter()
+            .flatten()
+            .all(|entry| entry.preparing.is_none() && !entry.growing)
+    }
+
+    /// The firmware restarted with no power on the cores: nothing it was told about a pair through
+    /// their registers can be relied on, so the next command installs it again.
+    pub(in crate::g17) fn forget_render_registrations(&mut self) {
+        for entry in self.render.entries.iter_mut().flatten() {
+            if let Some(pair) = entry.pair.as_mut() {
+                pair.forget_registration();
+            }
+            if let Some(parked) = entry.parked.as_mut() {
+                parked.forget_registration();
+            }
+        }
+    }
+
     pub(in crate::g17) fn render_in_flight(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {
             entry.pair.as_ref().map_or(
@@ -1249,6 +1346,7 @@ impl Registry {
         &self,
         packet: &Arc<Packet>,
         renewals: u8,
+        excuse: crate::g17::timeout::Excuse,
     ) -> Option<crate::g17::timeout::Verdict> {
         let own = self
             .render
@@ -1269,6 +1367,7 @@ impl Registry {
             crate::g17::timeout::attribute(
                 own,
                 renewals,
+                excuse,
                 Iterator::chain(self.render_timeout_heads(), computes),
             )
         })
@@ -1280,7 +1379,18 @@ impl RenderState {
         writeln!(f, "retired_render_bindings used={} total={}", self.retired.len(), self.retired.capacity())?;
         writeln!(f, "firmware_linked_render_graphs kept={} leaked={}", self.kept_graphs.len(),
                  teardown::LEAKED_GRAPHS.load(core::sync::atomic::Ordering::Relaxed))?;
+        let unsettled = self.entries.iter().flatten()
+            .filter_map(|entry| entry.pair.as_ref())
+            .filter(|pair| pair.drain_failures() != 0)
+            .count();
+        writeln!(f, "drained_render_pairs unsettled={} failures={} recovered={} out_of_service={}", unsettled,
+                 settle::SETTLE_FAILURES.load(core::sync::atomic::Ordering::Relaxed),
+                 settle::SETTLE_RECOVERED.load(core::sync::atomic::Ordering::Relaxed),
+                 settle::SETTLE_PARKED.load(core::sync::atomic::Ordering::Relaxed))?;
         self.pools.write_capacity(f)?;
+        for pair in self.entries.iter().flatten().filter_map(|entry| entry.pair.as_ref()) {
+            pair.write_hold(f)?;
+        }
         for (slot, entry) in self.entries.iter().enumerate() {
             if let Some(context) = entry.as_ref().and_then(|entry| entry.context.as_ref()) {
                 context.write_capacity(f, "render", slot)?;

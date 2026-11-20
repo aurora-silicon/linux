@@ -1002,18 +1002,47 @@ static void ave_6070_hevc_contract(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, start, 0x32dc8), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_input_format),
 			16U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_chroma_format),
+			1U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start +
+					   sl->hevc_log2_max_poc_lsb_minus4),
+			4U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_num_views[0]),
 			1U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_sve_count), 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(start + sl->multi_me), 1U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_vps_temporal_nesting], 1U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_temporal_nesting], 1U);
+	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_tmvp], 0U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_fw_header], 1U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_pps_fw_header], 1U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps), 8U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps + 4 + 0xbc),
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start +
+					   sl->hevc_pps_l0_default_active_minus1),
 			0U);
 	KUNIT_EXPECT_EQ(test,
-			get_unaligned_le32(start + sl->hevc_rps + 4 + 0x164 + 0xbc),
+			get_unaligned_le32(start +
+					   sl->hevc_pps_l1_default_active_minus1),
+			0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps), 8U);
+	KUNIT_EXPECT_EQ(test, start[sl->hevc_rps + 0x5a68], 0U);
+	/* IbP set 2 is P {-2}; set 3 is B {-1, +1}. */
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le16(start + sl->hevc_rps + 4 +
+					   2 * 0x164 + 0x38),
+			1U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start + sl->hevc_rps + 4 +
+					   2 * 0x164 + 0xe0),
+			(u32)-2);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start + sl->hevc_rps + 4 +
+					   3 * 0x164 + 0xbc),
+			1U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start + sl->hevc_rps + 4 +
+					   3 * 0x164 + 0x120),
 			1U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(start + sl->recon.address + 8),
 			sess->ref_a[0].dma + recon.luma_metadata_offset);
@@ -1031,13 +1060,73 @@ static void ave_6070_hevc_contract(struct kunit *test)
 					  false),
 			0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->frame_type), 2U);
+	KUNIT_EXPECT_EQ(test, process[pl->hevc_single_transcoder], 1U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x68), 1U);
 	KUNIT_EXPECT_EQ(test, process[0x15d], 1U);
 	KUNIT_EXPECT_EQ(test, process[0x15e], 1U);
+	KUNIT_EXPECT_EQ(test, process[0x15f], 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x414), 3U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(process + pl->hevc_use_explicit_rps), 0U);
 	KUNIT_EXPECT_EQ(test, process[0x6524], 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x6528), 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x652c + 0x30), 0U);
 	KUNIT_EXPECT_EQ(test,
 			get_unaligned_le64(process + pl->list1_recon.luma_data),
 			sess->ref_a[2].dma);
+
+	/* The P after a B also selects the firmware-indexed SPS table. */
+	sess->frames = 2;
+	memset(process, 0, 0x6838);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, process, 0x6838, 2,
+					  0x8f0000000ULL, 4000000, false,
+					  false),
+			0);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(process + pl->hevc_use_explicit_rps), 0U);
+	KUNIT_EXPECT_EQ(test, process[0x6524], 1U);
+
+	/* IDR syntax has no short-term RPS selector at all. */
+	sess->frames = 0;
+	memset(process, 0, 0x6838);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, process, 0x6838, 0,
+					  0x8f0000000ULL, 4000000, false,
+					  false),
+			0);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(process + pl->hevc_use_explicit_rps), 0U);
+	KUNIT_EXPECT_EQ(test, process[pl->hevc_single_transcoder], 1U);
+	KUNIT_EXPECT_EQ(test, process[0x6524], 0U);
+
+	/* Low delay advertises four equivalent {-1} SPS sets. */
+	sess->p.bframes = false;
+	sess->p.reorder_off = true;
+	sess->p.refs = 2;
+	sess->p.slots = 3;
+	memset(start, 0, 0x32dc8);
+	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, start, 0x32dc8), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps), 4U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(start + sl->multi_me), 0U);
+	for (u32 i = 0; i < 4; i++) {
+		u32 entry = sl->hevc_rps + 4 + i * 0x164;
+
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + entry + 0x30), 1U);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + entry + 0xb8), 1U);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + entry + 0xe0),
+				(u32)-1);
+	}
+	sess->frames = 1;
+	memset(process, 0, 0x6838);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, process, 0x6838, 1,
+					  0x8f0000000ULL, 4000000, false,
+					  false),
+			0);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(process + pl->hevc_use_explicit_rps), 0U);
+	KUNIT_EXPECT_EQ(test, process[0x6524], 1U);
 }
 
 static void ave_6070_alignment_refusal(struct kunit *test)
@@ -1375,7 +1464,40 @@ static void ave_6070_text_id(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, size - 4, 0, &crc), -EINVAL);
 }
 
+/*
+ * The M4 Max loader sets one TEXT word every boot: the identity hashes it as
+ * zero, so two boots give one CRC, and it leaves the rest of TEXT counted.
+ */
+static void ave_t6041_text_boot_word(struct kunit *test)
+{
+	const u32 off = ave_t6041.text_boot_word, size = off + 0x100;
+	u8 *text = kunit_kzalloc(test, size, GFP_KERNEL);
+	u32 image, a, b;
+
+	KUNIT_ASSERT_NOT_NULL(test, text);
+	KUNIT_EXPECT_EQ(test, off, 0x4224U);
+	KUNIT_EXPECT_EQ(test, ave_t6041.fw_data_size_alt, 0x130000U);
+	KUNIT_EXPECT_EQ(test, ave_t6041.text_link_cell, 0U);
+	for (u32 i = 0; i < size; i++)
+		text[i] = i * 7 + 3;
+	memset(text + off, 0, 4);
+	image = crc32_le(~0U, text, size) ^ ~0U;
+
+	put_unaligned_le32(0x00dd0000, text + off);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &a), 0);
+	put_unaligned_le32(0x007d0000, text + off);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &b), 0);
+	KUNIT_EXPECT_EQ(test, a, image);
+	KUNIT_EXPECT_EQ(test, b, image);
+	/* A change anywhere else is a different TEXT. */
+	text[off + 4] ^= 1;
+	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &a), 0);
+	KUNIT_EXPECT_NE(test, a, image);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, size - 2, &a), -EINVAL);
+}
+
 static struct kunit_case ave_abi_cases[] = {
+	KUNIT_CASE(ave_t6041_text_boot_word),
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
 	KUNIT_CASE(ave_9003_speed),	    KUNIT_CASE(ave_cq_table),
 	KUNIT_CASE(ave_6070_images),

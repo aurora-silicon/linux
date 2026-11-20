@@ -16,7 +16,7 @@ use super::{
 use crate::{
     driver::AsahiDrmDevice,
     file,
-    hw::t8140::{dynamic, resources as cfg},
+    hw::t8140::resources as cfg,
     mmu,
 };
 use core::sync::atomic::{
@@ -247,7 +247,7 @@ impl ComputeTimestamps {
             vm,
             // Canonical shared queue aliases may be installed in this VM later.
             // Private timestamp pages must never occupy their retained addresses.
-            dynamic::CLIENT_LOWER,
+            vm.client_private_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
@@ -380,7 +380,7 @@ pub(crate) struct Completion {
     /// `compute` alone does not identify the engine.
     is_compute: bool,
     feed: Option<Arc<super::feed::Feed>>,
-    usage: Arc<crate::usage::Client>,
+    usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>,
     sources: Option<Arc<super::sync_input::Sources>>,
     #[pin]
     vm_job: Mutex<Option<mmu::VmJobGuard>>,
@@ -418,7 +418,7 @@ impl Completion {
         host_predecessors: bool,
         feed: Option<Arc<super::feed::Feed>>,
         sources: Option<Arc<super::sync_input::Sources>>,
-        usage: Arc<crate::usage::Client>,
+        usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>,
     ) -> Result<Arc<Self>> {
         let fence = fence::independent(contexts)?;
         let ordered = !compute && (host_predecessors || destinations.iter().any(Option::is_some));

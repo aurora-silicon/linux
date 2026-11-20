@@ -241,6 +241,8 @@ pub(crate) struct RenderPass {
     pub(crate) depth_bias_is_int: bool,
     /// At most four known primitives; sets the auxiliary framebuffer bit 0.
     pub(crate) few_primitives: bool,
+    /// Host-only: the render contains mesh shading (DRM_ASAHI_RENDER_MESH_OUTPUT).
+    pub(crate) mesh_output: bool,
     /// Host-only: the resolved barriers order the fragment kick, not the tiling kick.
     pub(crate) fragment_barriers: bool,
     /// Host-only: the tiling kick waits on its own render and compute prefixes
@@ -386,6 +388,8 @@ pub(crate) struct RenderArgs<'a> {
     pub(crate) resources: &'a RenderResources,
     /// Submission ordinal of the render queue pair, from zero.
     pub(crate) ordinal: u64,
+    /// No earlier render of the queue pair is in flight at submit.
+    pub(crate) pair_idle: bool,
     /// Tiling stage.
     pub(crate) ta: RenderStage,
     /// Fragment stage.
@@ -1181,8 +1185,9 @@ pub(crate) struct TaDescriptor {
     pub(crate) unk_8be: u32,
     /// Non-zero on the first kick of a queue pair, like the fragment descriptor's word at the
     /// same position. Set on every kick, the firmware also notifies the host of each pass's
-    /// tiling completion, which no retirement needs. The 25G83 firmware keeps it set on every
-    /// kick until this is measured there.
+    /// tiling completion, which no retirement needs. On 25G83 a render submitted to an idle
+    /// pair keeps it set: without the notification such a render completes later (render d1
+    /// +12%, two clients at depth 1 +18-24%), while queued renders gain 5-7% without it.
     pub(crate) first_kick: u32,
     /// Completion value of the tiling kick (see
     /// [`KickTimestamp::completion_value`]).
@@ -1290,7 +1295,7 @@ impl TaDescriptor {
         self.stamp_value_2 = stamp_value;
         self.qid = args.ta.qid.into();
         self.first_kick = match args.programs == RegisterPrograms::V25G83 {
-            true => 1,
+            true => u32::from(args.ordinal == 0 || args.pair_idle),
             false => u32::from(args.ordinal == 0),
         };
         self.current_id = resources.ta_ids.current.into();
@@ -1748,30 +1753,33 @@ mod ta_mode_tests {
         }
     }
 
-    /// The variants of the builds T6041 admits: 25F84, then 25G83, which the 40- and the
-    /// 32-core configurations run with the same rules.
-    fn t6041_variants() -> [&'static Variant; 2] {
+    /// The variants of the builds T6041 admits: 25F84, then 25G83 and 26B123, each of which the
+    /// 40- and the 32-core configurations run with the same rules.
+    fn t6041_variants() -> [&'static Variant; 3] {
         let Firmware::Identified(builds) = crate::hw::t6041::CONFIG.firmware else {
             panic!("T6041 must identify its loaded firmware");
         };
-        assert_eq!(builds.len(), 3);
-        let (g83, g83_32) = (builds[1].variant, builds[2].variant);
-        assert_eq!(g83.ta_mode_1, g83_32.ta_mode_1);
-        assert_eq!(g83.compute, g83_32.compute);
-        assert_eq!(g83.programs, g83_32.programs);
-        [builds[0].variant, g83]
+        assert_eq!(builds.len(), 5);
+        for (full, cut) in [(1, 2), (3, 4)] {
+            let (full, cut) = (builds[full].variant, builds[cut].variant);
+            assert_eq!(full.ta_mode_1, cut.ta_mode_1);
+            assert_eq!(full.compute, cut.compute);
+            assert_eq!(full.programs, cut.programs);
+        }
+        [builds[0].variant, builds[1].variant, builds[3].variant]
     }
 
     /// The TA mode of every admitted T6041 build.
     fn t6041_ta_mode_1() -> bool {
-        let [f84, g83] = t6041_variants();
+        let [f84, g83, b123] = t6041_variants();
         assert_eq!(f84.ta_mode_1, g83.ta_mode_1);
+        assert_eq!(f84.ta_mode_1, b123.ta_mode_1);
         f84.ta_mode_1
     }
 
     #[test]
     fn policy_is_local_to_the_admitted_t6041_builds() {
-        let [f84, g83] = t6041_variants();
+        let [f84, g83, b123] = t6041_variants();
         let pro = selected(&crate::hw::t6040::CONFIG.firmware);
         assert_eq!(f84.compute, crate::g17::fw::compute::ComputeProgram::V25F84);
         assert!(f84.split_firmware_area);
@@ -1781,7 +1789,10 @@ mod ta_mode_tests {
         assert_eq!(g83.opening_record, pro.opening_record);
         assert_eq!(g83.qid_floor, pro.qid_floor);
         assert_eq!(g83.registration, pro.registration);
-        for max in [f84, g83] {
+        // 26B123 runs 25F84's compute program with one firmware area.
+        assert_eq!(b123.compute, f84.compute);
+        assert!(!b123.split_firmware_area);
+        for max in [f84, g83, b123] {
             assert_eq!(max.programs, RegisterPrograms::V25G83);
             assert!(max.ta_mode_1);
         }
@@ -1832,6 +1843,7 @@ mod ta_mode_tests {
             resources,
             ray_query: [ray; 2],
             ordinal: 0,
+            pair_idle: true,
             ta: stage,
             fragment: stage,
             programs: RegisterPrograms::V25G83,

@@ -54,6 +54,7 @@ PI_EXPORT_SYM(id_aa64mmfr2_override);
 PI_EXPORT_SYM(id_aa64mmfr4_override);
 PI_EXPORT_SYM(id_aa64pfr0_override);
 PI_EXPORT_SYM(id_aa64pfr1_override);
+PI_EXPORT_SYM(id_aa64pfr2_override);
 PI_EXPORT_SYM(id_aa64smfr0_override);
 PI_EXPORT_SYM(id_aa64zfr0_override);
 PI_EXPORT_SYM(arm64_sw_feature_override);

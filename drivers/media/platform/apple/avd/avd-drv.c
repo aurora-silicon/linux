@@ -21,6 +21,7 @@
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
 
+#include "../apple-video-nr.h"
 #include "avd.h"
 #include "avd-inst.h"
 #include "avd-regs.h"
@@ -294,7 +295,7 @@ static int avd_v4l2_init(struct avd_dev *avd)
 	video_set_drvdata(&avd->vdev, avd);
 	strscpy(avd->vdev.name, "avd", sizeof(avd->vdev.name));
 
-	ret = video_register_device(&avd->vdev, VFL_TYPE_VIDEO, -1);
+	ret = video_register_device(&avd->vdev, VFL_TYPE_VIDEO, APPLE_M2M_VIDEO_NR);
 	if (ret) {
 		v4l2_err(&avd->v4l2_dev, "Failed to register video device\n");
 		goto err_cleanup_mc;
@@ -553,23 +554,22 @@ static const struct avd_variant avd_t6041_variant = {
 };
 
 /*
- * M5 (Hibiscus, macOS CAvdMcpuHibiscus): T8140's VP block layout and HEVC
- * header; avd-fw's v5 tier 2 tunables match macOS's Hibiscus table.
+ * M5 (Hibiscus): AppleAVD (macOS 27.2.1) starts T8142 as device type 0x1a8
+ * ("H17", avd-version 4) and moves it to 0x1b0, the Hibiscus classes, when
+ * the low half of ctrl+0 (AVD+0x1100000) reads 0x20; the J815 reads
+ * 0x40020 there ("booting hw version"). CAvdApCommHibiscus asks for 15
+ * instruction FIFOs (7 is T8140's Tansy), and avd-fw's v5 tier 2 build
+ * (Hibiscus IMEM layout) reports 15 FIFOs and a 4/4/1/3 VP pool. The VP
+ * bases stay at 0/4/8/9. T8140's HEVC header is kept.
  */
 static const struct avd_variant avd_t8142_variant = {
 	.vp_slots = {
-		[AVD_CODEC_HEVC] = 2,
-		[AVD_CODEC_H264] = 1,
-		[AVD_CODEC_VP9] = 1,
-		[AVD_CODEC_AV1] = 1,
-	},
-	.vp_slot_base = {
-		[AVD_CODEC_HEVC] = 0,
+		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
-		[AVD_CODEC_VP9] = 8,
-		[AVD_CODEC_AV1] = 9,
+		[AVD_CODEC_VP9] = 1,
+		[AVD_CODEC_AV1] = 3,
 	},
-	.fifo_slots = 7,
+	.fifo_slots = 15,
 	.configure_stream = t8122_configure_stream,
 	.capabilities = AVD_CAPABILITY_HEVC |
 			AVD_CAPABILITY_H264 |

@@ -21,6 +21,7 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6041-dptx-phy
           - apple,t6050-dptx-phy
           - apple,t8122-dptx-phy
   required:
@@ -34,6 +35,9 @@ properties:
               - apple,t8122-dptx-phy
           - const: apple,dptx-phy
       - const: apple,t6050-dptx-phy
+      - items:
+          - const: apple,t6041-dptx-phy
+          - const: apple,t6050-dptx-phy
 
   reg:
     minItems: 2

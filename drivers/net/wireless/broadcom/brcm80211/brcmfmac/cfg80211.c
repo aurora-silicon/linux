@@ -7,6 +7,7 @@
 
 #include <linux/kernel.h>
 #include <linux/etherdevice.h>
+#include <linux/inetdevice.h>
 #include <linux/module.h>
 #include <linux/vmalloc.h>
 #include <net/cfg80211.h>
@@ -89,6 +90,20 @@
 #define BRCMF_ND_INFO_TIMEOUT		msecs_to_jiffies(2000)
 
 #define BRCMF_PS_MAX_TIMEOUT_MS		2000
+
+#define BRCMF_LPAS_UNICAST_FILTER_ID	100
+#define BRCMF_LPAS_MAGIC_FILTER_ID	101
+#define BRCMF_LPAS_MAGIC_ETH_FILTER_ID	102
+#define BRCMF_LPAS_IP4_FILTER_ID	103
+#define BRCMF_LPAS_IP6_FILTER_ID	(BRCMF_LPAS_IP4_FILTER_ID + \
+					 BRCMF_LPAS_MAX_IP4)
+/* The start of a magic packet: six 0xff bytes and the station address. */
+#define BRCMF_LPAS_MAGIC_PREFIX_LEN	(ETH_ALEN * 2)
+/* Magic packet: six 0xff bytes, then the station address sixteen times. */
+#define BRCMF_LPAS_MAGIC_LEN		(ETH_ALEN * 17)
+#define BRCMF_LPAS_PKT_FILTER_MODE	1
+#define BRCMF_LPAS_PKT_FILTER_PATTERN	0	/* fixed-offset pattern match */
+#define BRCMF_LPAS_PKT_FILTER_MAGIC	1	/* magic pattern, offset or later */
 
 /* Dump obss definitions */
 #define ACS_MSRMNT_DELAY		80
@@ -4310,6 +4325,652 @@ static s32 brcmf_wowl_nd_results(struct brcmf_if *ifp,
 
 #ifdef CONFIG_PM
 
+static int brcmf_lpas_eventmask_get(struct brcmf_if *ifp, u8 *mask,
+				    size_t mask_len)
+{
+	struct brcmf_eventmsgs_ext_le *eventmsgs;
+	size_t size;
+	int err;
+
+	if (!brcmf_feat_is_enabled(ifp, BRCMF_FEAT_EVENT_MSGS_EXT))
+		return brcmf_fil_iovar_data_get(ifp, "event_msgs", mask,
+						 mask_len);
+
+	size = sizeof(*eventmsgs) + mask_len;
+	eventmsgs = kzalloc(size, GFP_KERNEL);
+	if (!eventmsgs)
+		return -ENOMEM;
+
+	eventmsgs->version = EVENTMSGS_VER;
+	eventmsgs->command = EVENTMSGS_NONE;
+	eventmsgs->len = mask_len;
+	eventmsgs->maxgetsize = mask_len;
+	err = brcmf_fil_iovar_data_get(ifp, "event_msgs_ext", eventmsgs,
+					      size);
+	if (!err && eventmsgs->len < mask_len)
+		err = -EMSGSIZE;
+	if (!err)
+		memcpy(mask, eventmsgs->mask, mask_len);
+
+	kfree(eventmsgs);
+	return err;
+}
+
+static int brcmf_lpas_eventmask_set(struct brcmf_if *ifp, const u8 *mask,
+				    size_t mask_len)
+{
+	struct brcmf_eventmsgs_ext_le *eventmsgs;
+	size_t size;
+	int err;
+
+	if (!brcmf_feat_is_enabled(ifp, BRCMF_FEAT_EVENT_MSGS_EXT))
+		return brcmf_fil_iovar_data_set(ifp, "event_msgs", mask,
+						 mask_len);
+
+	size = sizeof(*eventmsgs) + mask_len;
+	eventmsgs = kzalloc(size, GFP_KERNEL);
+	if (!eventmsgs)
+		return -ENOMEM;
+
+	eventmsgs->version = EVENTMSGS_VER;
+	eventmsgs->command = EVENTMSGS_SET_MASK;
+	eventmsgs->len = mask_len;
+	memcpy(eventmsgs->mask, mask, mask_len);
+	err = brcmf_fil_iovar_data_set(ifp, "event_msgs_ext", eventmsgs,
+					      size);
+
+	kfree(eventmsgs);
+	return err;
+}
+
+static int brcmf_lpas_eventmask_enable(u8 *mask, size_t mask_len,
+				       enum brcmf_fweh_event_code event)
+{
+	if (event / 8 >= mask_len)
+		return -EOVERFLOW;
+
+	setbit(mask, event);
+	return 0;
+}
+
+static int brcmf_lpas_filter_add(struct brcmf_if *ifp, u32 id, u32 type,
+				 u32 offset, const u8 *mask, const u8 *pattern,
+				 size_t len)
+{
+	struct brcmf_pkt_filter_le *filter;
+	size_t head = offsetof(struct brcmf_pkt_filter_le,
+			       u.pattern.mask_and_pattern);
+	int err;
+
+	filter = kzalloc(head + 2 * len, GFP_KERNEL);
+	if (!filter)
+		return -ENOMEM;
+
+	filter->id = cpu_to_le32(id);
+	filter->type = cpu_to_le32(type);
+	filter->negate_match = cpu_to_le32(0);
+	filter->u.pattern.offset = cpu_to_le32(offset);
+	filter->u.pattern.size_bytes = cpu_to_le32(len);
+	/* mask_and_pattern[] is the protocol's variable-length wire tail:
+	 * len mask bytes followed by len pattern bytes.
+	 */
+	memcpy((u8 *)filter + head, mask, len);
+	memcpy((u8 *)filter + head + len, pattern, len);
+
+	err = brcmf_fil_iovar_data_set(ifp, "pkt_filter_add", filter,
+				       head + 2 * len);
+	kfree(filter);
+	return err;
+}
+
+static int brcmf_lpas_filter_enable(struct brcmf_if *ifp, u32 id, bool enable)
+{
+	struct brcmf_pkt_filter_enable_le filter = {
+		.id = cpu_to_le32(id),
+		.enable = cpu_to_le32(enable),
+	};
+
+	return brcmf_fil_iovar_data_set(ifp, "pkt_filter_enable", &filter,
+					 sizeof(filter));
+}
+
+static int brcmf_lpas_filter_remove(struct brcmf_if *ifp, u32 id)
+{
+	int err, ret;
+
+	ret = brcmf_lpas_filter_enable(ifp, id, false);
+	err = brcmf_fil_iovar_int_set(ifp, "pkt_filter_delete", id);
+	return ret ? ret : err;
+}
+
+/* Install one filter and enable it; on failure leave nothing behind. */
+static int brcmf_lpas_filter_install(struct brcmf_if *ifp, u32 id, u32 type,
+				     u32 offset, const u8 *mask,
+				     const u8 *pattern, size_t len)
+{
+	int err;
+
+	err = brcmf_lpas_filter_add(ifp, id, type, offset, mask, pattern, len);
+	if (err)
+		return err;
+	err = brcmf_lpas_filter_enable(ifp, id, true);
+	if (err)
+		brcmf_fil_iovar_int_set(ifp, "pkt_filter_delete", id);
+	return err;
+}
+
+static void brcmf_lpas_filter_track(struct brcmf_cfg80211_wowl *wowl, u32 id)
+{
+	if (!WARN_ON(wowl->n_lpas_filters >= BRCMF_LPAS_MAX_FILTERS))
+		wowl->lpas_filter_ids[wowl->n_lpas_filters++] = id;
+}
+
+static int brcmf_lpas_filters_remove(struct brcmf_if *ifp,
+				     struct brcmf_cfg80211_wowl *wowl)
+{
+	int i, err, ret = 0;
+
+	for (i = 0; i < wowl->n_lpas_filters; i++) {
+		err = brcmf_lpas_filter_remove(ifp, wowl->lpas_filter_ids[i]);
+		if (err && !ret)
+			ret = err;
+	}
+	wowl->n_lpas_filters = 0;
+	return ret;
+}
+
+/* One element of a pattern-list filter, matched with an all-ones mask. */
+struct brcmf_lpas_el {
+	u16 base;
+	u16 rel;
+	u16 len;
+	bool neg;
+	const void *data;
+};
+
+/* Install a type 2 filter that matches when every element matches. The
+ * offsets count from protocol headers the firmware finds itself, so IPv4
+ * options and the LLC/SNAP header of the 802.11 frame do not move them.
+ */
+static int brcmf_lpas_list_filter_install(struct brcmf_if *ifp, u32 id,
+					  const struct brcmf_lpas_el *el,
+					  int n)
+{
+	size_t head = offsetof(struct brcmf_pkt_filter_le, u);
+	struct brcmf_pkt_filter_listel_le *e;
+	struct brcmf_pkt_filter_list_le *list;
+	struct brcmf_pkt_filter_le *filter;
+	size_t size = sizeof(*list);
+	u8 *buf, *p;
+	int i, err;
+
+	for (i = 0; i < n; i++)
+		size += sizeof(*e) + 2 * el[i].len;
+
+	buf = kzalloc(head + size, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	filter = (struct brcmf_pkt_filter_le *)buf;
+	filter->id = cpu_to_le32(id);
+	filter->type = cpu_to_le32(BRCMF_PKT_FILTER_TYPE_PATTERN_LIST);
+	filter->negate_match = cpu_to_le32(0);
+
+	list = (struct brcmf_pkt_filter_list_le *)(buf + head);
+	list->list_cnt = n;
+	list->totsize = cpu_to_le16(size);
+	p = list->elements;
+	for (i = 0; i < n; i++) {
+		e = (struct brcmf_pkt_filter_listel_le *)p;
+		e->rel_offs = cpu_to_le16(el[i].rel);
+		e->base_offs = cpu_to_le16(el[i].base);
+		e->size_bytes = cpu_to_le16(el[i].len);
+		e->match_flags = cpu_to_le16(el[i].neg ?
+					     BRCMF_PKT_FILTER_MFLAG_NEG : 0);
+		memset(e->mask_and_data, 0xff, el[i].len);
+		memcpy(e->mask_and_data + el[i].len, el[i].data, el[i].len);
+		p += sizeof(*e) + 2 * el[i].len;
+	}
+
+	err = brcmf_fil_iovar_data_set(ifp, "pkt_filter_add", buf, head + size);
+	kfree(buf);
+	if (err)
+		return err;
+	err = brcmf_lpas_filter_enable(ifp, id, true);
+	if (err)
+		brcmf_fil_iovar_int_set(ifp, "pkt_filter_delete", id);
+	return err;
+}
+
+static int brcmf_lpas_own_ip4(struct net_device *ndev, __be32 *ip4, int max)
+{
+	const struct in_ifaddr *ifa;
+	struct in_device *in_dev;
+	int n = 0;
+
+	rcu_read_lock();
+	in_dev = __in_dev_get_rcu(ndev);
+	if (in_dev) {
+		in_dev_for_each_ifa_rcu(ifa, in_dev) {
+			if (n == max)
+				break;
+			ip4[n++] = ifa->ifa_local;
+		}
+	}
+	rcu_read_unlock();
+	return n;
+}
+
+/*
+ * On unicast frames the firmware matches only patterns near the
+ * headers: the whole magic sequence after the UDP header never matches,
+ * at a fixed offset or with the magic filter type. Unicast magic packets
+ * are matched instead by addressing and the start of the sequence: UDP
+ * to one of our addresses whose payload starts with six 0xff bytes and
+ * the station address, and the same start right after an EtherType
+ * 0x0842 header. Each filter is optional; an address the firmware has no
+ * room for only loses its unicast wake.
+ */
+static void brcmf_lpas_ucast_filters_install(struct brcmf_if *ifp,
+					     struct brcmf_cfg80211_wowl *wowl,
+					     const __be32 *ip4, int n_ip4)
+{
+	static const u8 ethertype_wol[] = { 0x08, 0x42 };
+	static const u8 proto_udp = IPPROTO_UDP;
+	u8 prefix[BRCMF_LPAS_MAGIC_PREFIX_LEN];
+	struct brcmf_lpas_el el[3];
+	int i, n = 0, err;
+	u32 id;
+
+	memset(prefix, 0xff, ETH_ALEN);
+	memcpy(prefix + ETH_ALEN, ifp->ndev->dev_addr, ETH_ALEN);
+
+	el[0] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_ETH_H, 12,
+					sizeof(ethertype_wol), false,
+					ethertype_wol };
+	el[1] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_ETH_D, 0,
+					sizeof(prefix), false, prefix };
+	err = brcmf_lpas_list_filter_install(ifp,
+					     BRCMF_LPAS_MAGIC_ETH_FILTER_ID,
+					     el, 2);
+	if (!err) {
+		brcmf_lpas_filter_track(wowl, BRCMF_LPAS_MAGIC_ETH_FILTER_ID);
+		n++;
+	}
+
+	el[2] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_UDP_D, 0,
+					sizeof(prefix), false, prefix };
+
+	for (i = 0; i < n_ip4; i++) {
+		id = BRCMF_LPAS_IP4_FILTER_ID + i;
+		/* IPv4 destination address, then protocol. */
+		el[0] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_IP4_H, 16,
+						4, false, &ip4[i] };
+		el[1] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_IP4_H, 9,
+						1, false, &proto_udp };
+		err = brcmf_lpas_list_filter_install(ifp, id, el, 3);
+		if (err)
+			break;
+		brcmf_lpas_filter_track(wowl, id);
+		n++;
+	}
+
+	for (i = 0; i < ifp->ipv6addr_idx && i < NDOL_MAX_ENTRIES; i++) {
+		id = BRCMF_LPAS_IP6_FILTER_ID + i;
+		/* IPv6 destination address, then next header. */
+		el[0] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_IP6_H, 24,
+						sizeof(struct in6_addr), false,
+						&ifp->ipv6_addr_tbl[i] };
+		el[1] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_IP6_H, 6,
+						1, false, &proto_udp };
+		err = brcmf_lpas_list_filter_install(ifp, id, el, 3);
+		if (err)
+			break;
+		brcmf_lpas_filter_track(wowl, id);
+		n++;
+	}
+
+	brcmf_dbg(INFO, "%d unicast magic filters (%d IPv4, %d IPv6 addresses)\n",
+		  n, n_ip4, ifp->ipv6addr_idx);
+}
+
+/*
+ * Forward-on-match filters decide which frames reach (and so wake) the
+ * host during the associated sleep. "any" passes every unicast frame
+ * with a fixed-offset pattern filter, as public DHD's minimal suspend
+ * policy does. A magic-packet trigger uses the firmware's magic pattern
+ * filter for broadcast frames, which matches the sequence at the given
+ * offset or anywhere later, so one filter from the start of the Ethernet
+ * payload covers UDP over IPv4 and IPv6 and EtherType 0x0842; unicast
+ * magic packets get the address filters above. ARP, neighbour discovery
+ * and ICMP echo are answered by their offloads.
+ */
+static int brcmf_lpas_filters_install(struct brcmf_if *ifp,
+				      struct cfg80211_wowlan *trig,
+				      struct brcmf_cfg80211_wowl *wowl,
+				      const __be32 *ip4, int n_ip4)
+{
+	static const u8 ucast_mask[] = { 0x01 }, ucast_pattern[] = { 0x00 };
+	u8 mask[BRCMF_LPAS_MAGIC_LEN], magic[BRCMF_LPAS_MAGIC_LEN];
+	int i, err;
+
+	if (trig->any) {
+		err = brcmf_lpas_filter_install(ifp,
+						BRCMF_LPAS_UNICAST_FILTER_ID,
+						BRCMF_LPAS_PKT_FILTER_PATTERN, 0,
+						ucast_mask, ucast_pattern, 1);
+		if (err)
+			return err;
+		brcmf_lpas_filter_track(wowl, BRCMF_LPAS_UNICAST_FILTER_ID);
+		return 0;
+	}
+
+	memset(mask, 0xff, sizeof(mask));
+	memset(magic, 0xff, ETH_ALEN);
+	for (i = 1; i <= 16; i++)
+		memcpy(magic + i * ETH_ALEN, ifp->ndev->dev_addr, ETH_ALEN);
+
+	err = brcmf_lpas_filter_install(ifp, BRCMF_LPAS_MAGIC_FILTER_ID,
+					BRCMF_LPAS_PKT_FILTER_MAGIC, ETH_HLEN,
+					mask, magic, sizeof(magic));
+	if (err)
+		return err;
+	brcmf_lpas_filter_track(wowl, BRCMF_LPAS_MAGIC_FILTER_ID);
+
+	brcmf_lpas_ucast_filters_install(ifp, wowl, ip4, n_ip4);
+	return 0;
+}
+
+/*
+ * Power save of the associated sleep: PM_FAST, listening to every DTIM
+ * beacon and staying awake long enough after one for the buffered
+ * broadcast frames, so a single broadcast magic packet reaches the
+ * firmware. The firmware keeps its own value for any it does not know.
+ */
+static const struct {
+	const char *name;
+	u32 val;
+} brcmf_lpas_sleep_params[] = {
+	{ "bcn_li_dtim", 1 },
+	{ "bcn_li_bcn", 0 },
+	{ "pm2_sleep_ret", 15 },
+	{ "pm2_bcn_sleep_ret", 50 },
+	{ "pm_bcmc_wait", 65000 },
+	{ "pm_bcmc_moredata_wait", 30000 },
+};
+
+static_assert(ARRAY_SIZE(brcmf_lpas_sleep_params) <=
+	      BRCMF_LPAS_MAX_SLEEP_PARAMS);
+
+static void brcmf_lpas_sleep_params_set(struct brcmf_if *ifp,
+					struct brcmf_cfg80211_wowl *wowl)
+{
+	int i;
+
+	wowl->sleep_params_set = 0;
+	for (i = 0; i < ARRAY_SIZE(brcmf_lpas_sleep_params); i++) {
+		if (brcmf_fil_iovar_int_get(ifp, brcmf_lpas_sleep_params[i].name,
+					    &wowl->pre_sleep_params[i]))
+			continue;
+		if (brcmf_fil_iovar_int_set(ifp, brcmf_lpas_sleep_params[i].name,
+					    brcmf_lpas_sleep_params[i].val))
+			continue;
+		__set_bit(i, &wowl->sleep_params_set);
+	}
+}
+
+static int brcmf_lpas_sleep_params_restore(struct brcmf_if *ifp,
+					   struct brcmf_cfg80211_wowl *wowl)
+{
+	int i, err, ret = 0;
+
+	for (i = 0; i < ARRAY_SIZE(brcmf_lpas_sleep_params); i++) {
+		if (!test_and_clear_bit(i, &wowl->sleep_params_set))
+			continue;
+		err = brcmf_fil_iovar_int_set(ifp,
+					      brcmf_lpas_sleep_params[i].name,
+					      wowl->pre_sleep_params[i]);
+		if (err && !ret)
+			ret = err;
+	}
+	return ret;
+}
+
+/* Answer ICMP echo to our IPv4 address in the firmware, if it can. */
+static void brcmf_lpas_icmp_offload(struct brcmf_if *ifp,
+				    struct brcmf_cfg80211_wowl *wowl,
+				    const __be32 *ip4, int n_ip4)
+{
+	wowl->icmp_changed = false;
+	if (!n_ip4 || brcmf_fil_iovar_int_get(ifp, "icmp", &wowl->pre_icmp))
+		return;
+	if (brcmf_fil_iovar_data_set(ifp, "icmp_hostip", &ip4[0],
+				     sizeof(ip4[0])))
+		return;
+	if (brcmf_fil_iovar_int_set(ifp, "icmp", 1))
+		return;
+	wowl->icmp_changed = true;
+}
+
+static int brcmf_lpas_icmp_restore(struct brcmf_if *ifp,
+				   struct brcmf_cfg80211_wowl *wowl)
+{
+	if (!wowl->icmp_changed)
+		return 0;
+	wowl->icmp_changed = false;
+	return brcmf_fil_iovar_int_set(ifp, "icmp", wowl->pre_icmp);
+}
+
+static void brcmf_lpas_restore_offloads(struct brcmf_if *ifp,
+					struct brcmf_cfg80211_wowl *wowl)
+{
+	brcmf_fil_iovar_int_set(ifp, "ndoe", wowl->pre_ndoe);
+	brcmf_fil_iovar_int_set(ifp, "arpoe", wowl->pre_arpoe);
+	brcmf_fil_iovar_int_set(ifp, "arp_ol", wowl->pre_arp_ol);
+}
+
+static int brcmf_restore_lpas(struct brcmf_cfg80211_info *cfg,
+			      struct brcmf_if *ifp)
+{
+	struct brcmf_cfg80211_wowl *wowl = &cfg->wowl;
+	int err, ret = 0;
+
+#define BRCMF_LPAS_RESTORE(_expr) do { \
+	err = (_expr); \
+	if (err && !ret) \
+		ret = err; \
+} while (0)
+
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "lpas", 0));
+	BRCMF_LPAS_RESTORE(brcmf_lpas_eventmask_set(ifp,
+						    wowl->lpas_event_mask,
+						    wowl->lpas_event_mask_len));
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "nolinkup",
+						      wowl->pre_nolinkup));
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode",
+						      wowl->pre_pkt_filter_mode));
+	BRCMF_LPAS_RESTORE(brcmf_lpas_filters_remove(ifp, wowl));
+	BRCMF_LPAS_RESTORE(brcmf_lpas_icmp_restore(ifp, wowl));
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "ndoe",
+						      wowl->pre_ndoe));
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "arpoe",
+						      wowl->pre_arpoe));
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "arp_ol",
+						      wowl->pre_arp_ol));
+	BRCMF_LPAS_RESTORE(brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
+						    wowl->pre_pmmode));
+	BRCMF_LPAS_RESTORE(brcmf_lpas_sleep_params_restore(ifp, wowl));
+
+#undef BRCMF_LPAS_RESTORE
+
+	brcmf_bus_wowl_config(cfg->pub->bus_if, false);
+	kfree(wowl->lpas_event_mask);
+	wowl->lpas_event_mask = NULL;
+	wowl->lpas_event_mask_len = 0;
+	wowl->lpas = false;
+	wowl->active = false;
+
+	if (ret)
+		bphy_err(cfg->pub, "LPAS restore failed (%d)\n", ret);
+	return ret;
+}
+
+static int brcmf_configure_lpas(struct brcmf_cfg80211_info *cfg,
+				struct brcmf_if *ifp,
+				struct cfg80211_wowlan *trig)
+{
+	struct brcmf_cfg80211_wowl *wowl = &cfg->wowl;
+	u8 *saved_mask = NULL, *sleep_mask = NULL;
+	size_t mask_len = cfg->pub->fweh->event_mask_len;
+	bool offloads_changed = false;
+	bool filter_mode_changed = false;
+	bool nolinkup_changed = false;
+	bool events_changed = false;
+	bool pm_changed = false;
+	bool lpas_attempted = false;
+	__be32 ip4[BRCMF_LPAS_MAX_IP4];
+	int n_ip4, err;
+
+	if (!test_bit(BRCMF_VIF_STATUS_CONNECTED, &ifp->vif->sme_state)) {
+		err = -ENOTCONN;
+		goto fail;
+	}
+	if (brcmf_is_apmode_operating(cfg->wiphy)) {
+		err = -EOPNOTSUPP;
+		goto fail;
+	}
+
+	err = brcmf_fil_cmd_int_get(ifp, BRCMF_C_GET_PM, &wowl->pre_pmmode);
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_get(ifp, "arp_ol", &wowl->pre_arp_ol);
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_get(ifp, "arpoe", &wowl->pre_arpoe);
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_get(ifp, "ndoe", &wowl->pre_ndoe);
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_get(ifp, "nolinkup", &wowl->pre_nolinkup);
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_get(ifp, "pkt_filter_mode",
+					&wowl->pre_pkt_filter_mode);
+	if (err)
+		goto fail;
+
+	saved_mask = kzalloc(mask_len, GFP_KERNEL);
+	sleep_mask = kzalloc(mask_len, GFP_KERNEL);
+	if (!saved_mask || !sleep_mask) {
+		err = -ENOMEM;
+		goto fail;
+	}
+	err = brcmf_lpas_eventmask_get(ifp, saved_mask, mask_len);
+	if (err)
+		goto fail;
+	/*
+	 * Every event the firmware sends during the sleep is an interrupt and
+	 * so a wake: keep only the link loss and supplicant events.
+	 */
+	err = brcmf_lpas_eventmask_enable(sleep_mask, mask_len, BRCMF_E_LINK);
+	if (err)
+		goto fail;
+	err = brcmf_lpas_eventmask_enable(sleep_mask, mask_len,
+					  BRCMF_E_DEAUTH);
+	if (err)
+		goto fail;
+	err = brcmf_lpas_eventmask_enable(sleep_mask, mask_len,
+					  BRCMF_E_DEAUTH_IND);
+	if (err)
+		goto fail;
+	err = brcmf_lpas_eventmask_enable(sleep_mask, mask_len,
+					  BRCMF_E_DISASSOC_IND);
+	if (err)
+		goto fail;
+	err = brcmf_lpas_eventmask_enable(sleep_mask, mask_len,
+					  BRCMF_E_PSK_SUP);
+	if (err)
+		goto fail;
+
+	n_ip4 = brcmf_lpas_own_ip4(ifp->ndev, ip4, ARRAY_SIZE(ip4));
+
+	pm_changed = true;
+	brcmf_lpas_sleep_params_set(ifp, wowl);
+	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, PM_FAST);
+	if (err)
+		goto rollback;
+
+	offloads_changed = true;
+	err = brcmf_configure_arp_nd_offload(ifp, true);
+	if (err)
+		goto rollback;
+	brcmf_lpas_icmp_offload(ifp, wowl, ip4, n_ip4);
+
+	err = brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode",
+					   BRCMF_LPAS_PKT_FILTER_MODE);
+	if (err)
+		goto rollback;
+	filter_mode_changed = true;
+
+	/* The firmware arms a sleep filter as a host-wake source only when it
+	 * is added and enabled while LPAS is already on.
+	 */
+	lpas_attempted = true;
+	err = brcmf_fil_iovar_int_set(ifp, "lpas", 1);
+	if (err)
+		goto rollback;
+
+	err = brcmf_lpas_filters_install(ifp, trig, wowl, ip4, n_ip4);
+	if (err)
+		goto rollback;
+
+	err = brcmf_fil_iovar_int_set(ifp, "nolinkup", 1);
+	if (err)
+		goto rollback;
+	nolinkup_changed = true;
+	err = brcmf_lpas_eventmask_set(ifp, sleep_mask, mask_len);
+	if (err)
+		goto rollback;
+	events_changed = true;
+
+	wowl->lpas_event_mask = saved_mask;
+	wowl->lpas_event_mask_len = mask_len;
+	wowl->lpas = true;
+	wowl->active = true;
+	brcmf_bus_wowl_config(cfg->pub->bus_if, true);
+	kfree(sleep_mask);
+	return 0;
+
+rollback:
+	if (lpas_attempted)
+		brcmf_fil_iovar_int_set(ifp, "lpas", 0);
+	if (events_changed)
+		brcmf_lpas_eventmask_set(ifp, saved_mask, mask_len);
+	if (nolinkup_changed)
+		brcmf_fil_iovar_int_set(ifp, "nolinkup", wowl->pre_nolinkup);
+	if (filter_mode_changed)
+		brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode",
+					wowl->pre_pkt_filter_mode);
+	brcmf_lpas_filters_remove(ifp, wowl);
+	if (offloads_changed) {
+		brcmf_lpas_icmp_restore(ifp, wowl);
+		brcmf_lpas_restore_offloads(ifp, wowl);
+	}
+	if (pm_changed) {
+		brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, wowl->pre_pmmode);
+		brcmf_lpas_sleep_params_restore(ifp, wowl);
+	}
+fail:
+	kfree(sleep_mask);
+	kfree(saved_mask);
+	wowl->lpas = false;
+	wowl->active = false;
+	bphy_err(cfg->pub, "LPAS setup failed (%d), using disconnect fallback\n",
+		 err);
+	return err;
+}
+
 static void brcmf_report_wowl_wakeind(struct wiphy *wiphy, struct brcmf_if *ifp)
 {
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
@@ -4381,6 +5042,19 @@ static void brcmf_report_wowl_wakeind(struct wiphy *wiphy, struct brcmf_if *ifp)
 
 #else
 
+static int brcmf_restore_lpas(struct brcmf_cfg80211_info *cfg,
+			      struct brcmf_if *ifp)
+{
+	return -EOPNOTSUPP;
+}
+
+static int brcmf_configure_lpas(struct brcmf_cfg80211_info *cfg,
+				struct brcmf_if *ifp,
+				struct cfg80211_wowlan *trig)
+{
+	return -EOPNOTSUPP;
+}
+
 static void brcmf_report_wowl_wakeind(struct wiphy *wiphy, struct brcmf_if *ifp)
 {
 }
@@ -4394,10 +5068,17 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct net_device *ndev = cfg_to_ndev(cfg);
 	struct brcmf_if *ifp = netdev_priv(ndev);
+	s32 err = 0;
 
 	brcmf_dbg(TRACE, "Enter\n");
 
 	if (cfg->wowl.active) {
+		if (cfg->wowl.lpas) {
+			cfg80211_report_wowlan_wakeup(&ifp->vif->wdev, NULL,
+						GFP_KERNEL);
+			err = brcmf_restore_lpas(cfg, ifp);
+			goto out;
+		}
 		brcmf_report_wowl_wakeind(wiphy, ifp);
 		brcmf_fil_iovar_int_set(ifp, "wowl_clear", 0);
 		brcmf_config_wowl_pattern(ifp, "clr", NULL, 0, NULL, 0);
@@ -4405,6 +5086,7 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 			brcmf_configure_arp_nd_offload(ifp, true);
 		brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
 				      cfg->wowl.pre_pmmode);
+		brcmf_bus_wowl_config(cfg->pub->bus_if, false);
 		cfg->wowl.active = false;
 		if (cfg->wowl.nd_enabled) {
 			brcmf_cfg80211_sched_scan_stop(cfg->wiphy, ifp->ndev, 0);
@@ -4414,25 +5096,44 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 			cfg->wowl.nd_enabled = false;
 		}
 	}
+out:
 	cfg->suspended = false;
 	brcmf_cfg80211_update_country(cfg);
-	return 0;
+	return err;
 }
 
-static void brcmf_configure_wowl(struct brcmf_cfg80211_info *cfg,
-				 struct brcmf_if *ifp,
-				 struct cfg80211_wowlan *wowl)
+static int brcmf_keepalive_start(struct brcmf_if *ifp,
+				 unsigned int interval);
+
+static int brcmf_configure_wowl(struct brcmf_cfg80211_info *cfg,
+				struct brcmf_if *ifp,
+				struct cfg80211_wowlan *wowl)
 {
+	struct brcmf_pub *drvr = cfg->pub;
 	u32 wowl_config;
 	struct brcmf_wowl_wakeind_le wowl_wakeind;
+	bool arp_nd_disabled = false;
+	bool pm_saved = false;
+	int err;
 	u32 i;
 
 	brcmf_dbg(TRACE, "Suspend, wowl config.\n");
 
-	if (!brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL_ARP_ND))
-		brcmf_configure_arp_nd_offload(ifp, false);
-	brcmf_fil_cmd_int_get(ifp, BRCMF_C_GET_PM, &cfg->wowl.pre_pmmode);
-	brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, PM_MAX);
+	if (!brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL_ARP_ND)) {
+		err = brcmf_configure_arp_nd_offload(ifp, false);
+		if (err)
+			goto fail;
+		arp_nd_disabled = true;
+	}
+
+	err = brcmf_fil_cmd_int_get(ifp, BRCMF_C_GET_PM,
+					&cfg->wowl.pre_pmmode);
+	if (err)
+		goto fail;
+	pm_saved = true;
+	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, PM_MAX);
+	if (err)
+		goto fail;
 
 	wowl_config = 0;
 	if (wowl->disconnect)
@@ -4442,24 +5143,34 @@ static void brcmf_configure_wowl(struct brcmf_cfg80211_info *cfg,
 	if ((wowl->patterns) && (wowl->n_patterns)) {
 		wowl_config |= BRCMF_WOWL_NET;
 		for (i = 0; i < wowl->n_patterns; i++) {
-			brcmf_config_wowl_pattern(ifp, "add",
+			err = brcmf_config_wowl_pattern(ifp, "add",
 				(u8 *)wowl->patterns[i].pattern,
 				wowl->patterns[i].pattern_len,
 				(u8 *)wowl->patterns[i].mask,
 				wowl->patterns[i].pkt_offset);
+			if (err)
+				goto fail;
 		}
 	}
 	if (wowl->nd_config) {
-		brcmf_cfg80211_sched_scan_start(cfg->wiphy, ifp->ndev,
-						wowl->nd_config);
+		err = brcmf_cfg80211_sched_scan_start(cfg->wiphy, ifp->ndev,
+						       wowl->nd_config);
+		if (err)
+			goto fail;
 		wowl_config |= BRCMF_WOWL_PFN_FOUND;
 
 		cfg->wowl.nd_data_completed = false;
-		cfg->wowl.nd_enabled = true;
 		/* Now reroute the event for PFN to the wowl function. */
 		brcmf_fweh_unregister(cfg->pub, BRCMF_E_PFN_NET_FOUND);
-		brcmf_fweh_register(cfg->pub, BRCMF_E_PFN_NET_FOUND,
-				    brcmf_wowl_nd_results);
+		err = brcmf_fweh_register(cfg->pub, BRCMF_E_PFN_NET_FOUND,
+					  brcmf_wowl_nd_results);
+		if (err) {
+			brcmf_fweh_register(cfg->pub, BRCMF_E_PFN_NET_FOUND,
+					    brcmf_notify_sched_scan_results);
+			brcmf_cfg80211_sched_scan_stop(cfg->wiphy, ifp->ndev, 0);
+			goto fail;
+		}
+		cfg->wowl.nd_enabled = true;
 	}
 	if (wowl->gtk_rekey_failure)
 		wowl_config |= BRCMF_WOWL_GTK_FAILURE;
@@ -4467,12 +5178,47 @@ static void brcmf_configure_wowl(struct brcmf_cfg80211_info *cfg,
 		wowl_config |= BRCMF_WOWL_UNASSOC;
 
 	memcpy(&wowl_wakeind, "clear", 6);
-	brcmf_fil_iovar_data_set(ifp, "wowl_wakeind", &wowl_wakeind,
-				 sizeof(wowl_wakeind));
-	brcmf_fil_iovar_int_set(ifp, "wowl", wowl_config);
-	brcmf_fil_iovar_int_set(ifp, "wowl_activate", 1);
+	err = brcmf_fil_iovar_data_set(ifp, "wowl_wakeind", &wowl_wakeind,
+				       sizeof(wowl_wakeind));
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_set(ifp, "wowl", wowl_config);
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_set(ifp, "wowl_activate", 1);
+	if (err)
+		goto fail;
+	err = brcmf_keepalive_start(ifp, 30);
+	if (err)
+		goto fail;
 	brcmf_bus_wowl_config(cfg->pub->bus_if, true);
 	cfg->wowl.active = true;
+	return 0;
+
+fail:
+	/* Undo partial setup before asking cfg80211 to take its normal
+	 * disconnect path. Rollback is best effort; the setup error is the
+	 * reason retention was refused.
+	 */
+	brcmf_bus_wowl_config(cfg->pub->bus_if, false);
+	brcmf_fil_iovar_int_set(ifp, "wowl_clear", 0);
+	brcmf_config_wowl_pattern(ifp, "clr", NULL, 0, NULL, 0);
+	if (cfg->wowl.nd_enabled) {
+		brcmf_cfg80211_sched_scan_stop(cfg->wiphy, ifp->ndev, 0);
+		brcmf_fweh_unregister(cfg->pub, BRCMF_E_PFN_NET_FOUND);
+		brcmf_fweh_register(cfg->pub, BRCMF_E_PFN_NET_FOUND,
+				    brcmf_notify_sched_scan_results);
+		cfg->wowl.nd_enabled = false;
+	}
+	if (pm_saved)
+		brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
+				      cfg->wowl.pre_pmmode);
+	if (arp_nd_disabled)
+		brcmf_configure_arp_nd_offload(ifp, true);
+	cfg->wowl.active = false;
+	bphy_err(drvr, "WoWLAN setup failed (%d), using disconnect fallback\n",
+		 err);
+	return err;
 }
 
 static int brcmf_keepalive_start(struct brcmf_if *ifp, unsigned int interval)
@@ -4500,6 +5246,7 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 	struct net_device *ndev = cfg_to_ndev(cfg);
 	struct brcmf_if *ifp = netdev_priv(ndev);
 	struct brcmf_cfg80211_vif *vif;
+	int err;
 
 	brcmf_dbg(TRACE, "Enter\n");
 
@@ -4536,12 +5283,25 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 		/* Configure MPC */
 		brcmf_set_mpc(ifp, 1);
 
-	} else {
+	} else if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL)) {
 		/* Configure WOWL parameters */
-		brcmf_configure_wowl(cfg, ifp, wowl);
-
-		/* Prevent disassociation due to inactivity with keep-alive */
-		brcmf_keepalive_start(ifp, 30);
+		err = brcmf_configure_wowl(cfg, ifp, wowl);
+		if (err) {
+			cfg->scan_status = 0;
+			return 1;
+		}
+	} else if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_LPAS) &&
+		   cfg->pub->bus_if->wowl_transport &&
+		   cfg->pub->bus_if->wowl_wake &&
+		   (wowl->any || wowl->magic_pkt)) {
+		err = brcmf_configure_lpas(cfg, ifp, wowl);
+		if (err) {
+			cfg->scan_status = 0;
+			return 1;
+		}
+	} else {
+		cfg->scan_status = 0;
+		return 1;
 	}
 
 exit:
@@ -7237,6 +7997,8 @@ static void brcmf_deinit_priv_mem(struct brcmf_cfg80211_info *cfg)
 	cfg->wowl.nd = NULL;
 	kfree(cfg->wowl.nd_info);
 	cfg->wowl.nd_info = NULL;
+	kfree(cfg->wowl.lpas_event_mask);
+	cfg->wowl.lpas_event_mask = NULL;
 	kfree(cfg->escan_info.escan_buf);
 	cfg->escan_info.escan_buf = NULL;
 }
@@ -8242,6 +9004,10 @@ static const struct wiphy_wowlan_support brcmf_wowlan_support = {
 	.pattern_min_len = 1,
 	.max_pkt_offset = 1500,
 };
+
+static const struct wiphy_wowlan_support brcmf_lpas_wowlan_support = {
+	.flags = WIPHY_WOWLAN_ANY | WIPHY_WOWLAN_MAGIC_PKT,
+};
 #endif
 
 static void brcmf_wiphy_wowl_params(struct wiphy *wiphy, struct brcmf_if *ifp)
@@ -8250,6 +9016,11 @@ static void brcmf_wiphy_wowl_params(struct wiphy *wiphy, struct brcmf_if *ifp)
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct brcmf_pub *drvr = cfg->pub;
 	struct wiphy_wowlan_support *wowl;
+
+	if (!brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL)) {
+		wiphy->wowlan = &brcmf_lpas_wowlan_support;
+		return;
+	}
 
 	wowl = kmemdup(&brcmf_wowlan_support, sizeof(brcmf_wowlan_support),
 		       GFP_KERNEL);
@@ -8369,7 +9140,10 @@ static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 				   BRCMF_VNDR_CMDS_LAST - 1 :
 				   BRCMF_VNDR_CMDS_AWDL - 1;
 
-	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL))
+	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL) ||
+	    (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_LPAS) &&
+	     ifp->drvr->bus_if->wowl_transport &&
+	     ifp->drvr->bus_if->wowl_wake))
 		brcmf_wiphy_wowl_params(wiphy, ifp);
 	err = brcmf_fil_cmd_data_get(ifp, BRCMF_C_GET_BANDLIST, &bandlist,
 				     sizeof(bandlist));
@@ -9001,7 +9775,8 @@ static void brcmf_free_wiphy(struct wiphy *wiphy)
 		kfree(wiphy->bands[NL80211_BAND_6GHZ]);
 	}
 #if IS_ENABLED(CONFIG_PM)
-	if (wiphy->wowlan != &brcmf_wowlan_support)
+	if (wiphy->wowlan != &brcmf_wowlan_support &&
+	    wiphy->wowlan != &brcmf_lpas_wowlan_support)
 		kfree(wiphy->wowlan);
 #endif
 }

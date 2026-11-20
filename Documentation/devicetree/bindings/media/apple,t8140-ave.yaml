@@ -33,6 +33,7 @@ select:
           - apple,t8132-ave
           - apple,t6050-ave
           - apple,t8140-ave
+          - apple,t8142-ave
   required:
     - compatible
 
@@ -129,6 +130,7 @@ allOf:
                       - apple,t6050-ave
                       - apple,t8112-ave
                       - apple,t8140-ave
+                      - apple,t8142-ave
                   - items:
                       - enum:
                           - apple,t6020-ave
@@ -234,6 +236,7 @@ allOf:
                           - apple,t6041-ave
                           - apple,t6050-ave
                           - apple,t8140-ave
+                          - apple,t8142-ave
                 then:
                   properties:
                     reg:

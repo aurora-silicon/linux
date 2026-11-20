@@ -103,6 +103,8 @@ impl kernel::InPlaceModule for DriverModule {
         unsafe { binding::init() };
         // SAFETY: Module init runs once, before either adapter is registered below.
         unsafe { queue_share::init() };
+        // SAFETY: Module init runs once, before either adapter is registered below.
+        unsafe { g17::exec_share::init() };
         try_pin_init!(Self {
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,
@@ -181,6 +183,10 @@ module! {
         legacy_rx_util_min: u32 {
             default: 512,
             description: "G13/G14: GPU event-drain utilization minimum (0..1024)",
+        },
+        compute_timeout_max_ms: u32 {
+            default: 30000,
+            description: "G17: longest compute watchdog allowance a queue may set, ms (floor 2000)",
         },
         g15_deadline_ms: u32 {
             default: 5000,

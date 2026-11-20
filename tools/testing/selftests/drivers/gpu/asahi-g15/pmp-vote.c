@@ -19,12 +19,13 @@ struct device { void *of_node; };
 static struct device owner;
 static struct device *pmp_device = &owner;
 static const void *pmp_data = &owner;
+/* Set only while the PMP is stopped for a system sleep, which this test never does. */
+static bool pmp_asleep;
 static bool t6030, requested;
 static int ready, check, power_result[2], report_result[3], powers, reports;
 static char calls[16];
 static unsigned int used;
 static void called(char c) { assert(used < sizeof(calls) - 1); calls[used++] = c; }
-static bool of_machine_is_compatible(const char *s) { (void)s; return t6030; }
 static bool of_device_is_compatible(void *p, const char *s)
 {
 	(void)p; (void)s; return t6030;

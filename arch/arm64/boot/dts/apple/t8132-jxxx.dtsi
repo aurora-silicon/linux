@@ -25,6 +25,8 @@
 		nvram = &nvram;
 		pmu-primary = &pmic1;
 		pmp = &pmp;
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		sart-ans = &sart;
 		spmi-primary = &nub_spmi;
 		wifi0 = &wifi0;
@@ -184,7 +186,7 @@
 		compatible = "apple,smc-hwmon";
 	};
 
-	rtc {
+	smc_rtc: rtc {
 		compatible = "apple,smc-rtc";
 		nvmem-cells = <&rtc_offset>;
 		nvmem-cell-names = "rtc_offset";
@@ -209,6 +211,15 @@
 	pmic1: pmic@0 {
 		compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
 		reg = <0x0 SPMI_USID>; /* To be filled by loader */
+
+		pmu_rtc: rtc {
+			compatible = "apple,t8132-pmu-rtc", "apple,t6041-pmu-rtc";
+			interrupt-parent = <&nub_spmi>;
+			interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+			nvmem-cells = <&rtc_offset>;
+			nvmem-cell-names = "rtc_offset";
+			wakeup-source;
+		};
 
 		nvmem-layout {
 			compatible = "fixed-layout";

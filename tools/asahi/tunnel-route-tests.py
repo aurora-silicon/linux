@@ -22,6 +22,8 @@ FUNCTIONS = {
 MUTATIONS = {
     'clock-ignored': ('& BIT(dpin)))', '& 0))'),
     'snapshot-ignores-yield': ('port->dp_wanted && !port->typec_yielded;', 'port->dp_wanted;'),
+    'snapshot-two-slots': ('i < ARRAY_SIZE(port->slots); i++)\n\t\tport->core.owner[i]',
+                           'i < 2; i++)\n\t\tport->core.owner[i]'),
 }
 
 

@@ -169,21 +169,28 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	/*
 	 * HEVC Main 10 encodes P010 input; Main encodes NV12. The firmware
 	 * takes 16-bit samples for Main 10 (macOS converts 8-bit input to that
-	 * first), so other pairings are refused rather than converted.
+	 * first), so other pairings are refused rather than converted. S_FMT
+	 * sets the profile from the raw format, so only a profile set after it
+	 * gets here.
 	 */
 	if ((p->codec == AVE_CODEC_HEVC &&
 	     ctx->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10) !=
-	    (p->sample_bytes == 2))
+	    (p->sample_bytes == 2)) {
+		dev_info_ratelimited(ctx->ave->dev, "%s%s does not take %s input\n",
+				     p->codec == AVE_CODEC_HEVC ? "HEVC " : "H.264",
+				     p->codec != AVE_CODEC_HEVC ? "" :
+				     p->sample_bytes == 2 ? "Main" : "Main 10",
+				     p->sample_bytes == 2 ? "10-bit P010" : "8-bit NV12");
 		return -EINVAL;
+	}
 	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->sample_bytes != 1)
 		return -EOPNOTSUPP;
 	/*
-	 * The 6070 path is qualified for 8-bit H.264 (low delay and one B per
-	 * P) with frame widths in whole macroblocks; HEVC and wider-than-coded
-	 * widths are not yet.
+	 * The 6070 path supports 8-bit H.264 and HEVC Main, including one B per
+	 * P, with frame widths in whole macroblocks. Wider-than-coded widths are
+	 * not yet supported.
 	 */
-	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 &&
-	    (p->codec != AVE_CODEC_H264 || p->width % 16))
+	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->width % 16)
 		return -EOPNOTSUPP;
 	p->bit_depth = 8;
 	if (p->sample_bytes == 2) {
@@ -261,14 +268,13 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->coded_cap = max_t(u32, p->coded_cap, AVE_CODED_MIN);
 	if (ctx->ave->layout->counted &&
 	    (p->fps_num != 30ULL * p->fps_den ||
-	     (!p->bframes && (p->codec == AVE_CODEC_HEVC || (!baseline && !p->intra_only)))))
+	     (!p->bframes && (p->codec == AVE_CODEC_HEVC || (!baseline && !p->intra_only))))) {
+		dev_info(ctx->ave->dev,
+			 "%s layout: only 30 fps with 3 B-frames is qualified (asked %u/%u fps, %s B-frames)\n",
+			 ctx->ave->layout->name, p->fps_num, p->fps_den,
+			 p->bframes ? "with" : "no");
 		return -EOPNOTSUPP;
-	/*
-	 * Where the 26A428 firmware leaves an HEVC slice header is not known: its
-	 * slots have no slice-header buffer, so refuse HEVC there.
-	 */
-	if (ctx->ave->layout->counted && p->codec == AVE_CODEC_HEVC)
-		return -EOPNOTSUPP;
+	}
 	return 0;
 }
 
@@ -986,17 +992,28 @@ int ave_sess_free_slot(struct ave_session *sess)
 }
 
 /*
+ * The buffer an HEVC slot's slice header comes back in. 26A428 slots have no
+ * slice-header buffer: that layout's Process command carries only the slot's
+ * 16 KiB buffer.
+ */
+static struct ave_buf *ave_slot_shdr(struct ave_slot *s)
+{
+	return s->extra.cpu ? &s->extra : &s->aux;
+}
+
+/*
  * Clear what the firmware reports through, so a stale value is never taken
  * for a new one: the whole metadata buffer and the first slice header.
  */
 void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot)
 {
 	struct ave_slot *s = &sess->slot[slot];
+	struct ave_buf *shdr = ave_slot_shdr(s);
 
 	if (s->meta.cpu)
 		memset(s->meta.cpu, 0, s->meta.size);
-	if (sess->p.codec == AVE_CODEC_HEVC && s->aux.cpu)
-		memset(s->aux.cpu, 0, AVE_SHDR_ENTRY_BYTES);
+	if (sess->p.codec == AVE_CODEC_HEVC && shdr->cpu)
+		memset(shdr->cpu, 0, min_t(size_t, shdr->size, AVE_SHDR_ENTRY_BYTES));
 }
 
 /* Route one ABI-decoded frame reply to its session and output slot. */
@@ -1134,6 +1151,9 @@ static void ave_sess_dump(struct ave_ctx *ctx, struct ave_slot *s, const char *w
 	print_hex_dump_debug("ave meta: ", DUMP_PREFIX_OFFSET, 16, 4, meta, 0x200, false);
 	print_hex_dump_debug("ave meta b200: ", DUMP_PREFIX_OFFSET, 16, 1, meta + 0xb200,
 			     0x200, false);
+	if (s->extra.cpu)
+		print_hex_dump_debug("ave extra: ", DUMP_PREFIX_OFFSET, 16, 1, s->extra.cpu,
+				     0x100, false);
 	ps = ave_find_params(meta, meta_bytes, sess->p.codec == AVE_CODEC_HEVC);
 	if (ps >= 0) {
 		dev_dbg(ctx->ave->dev, "parameter sets at metadata +%#x\n", ps);
@@ -1327,8 +1347,18 @@ int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 		ave_sess_dump(ctx, s, "bad sizes");
 		return -EPROTO;
 	}
-	if (hevc)
-		memcpy(out + ps, s->aux.cpu, result.slice_header_bytes);
+	if (hevc) {
+		const struct ave_buf *shdr = ave_slot_shdr(s);
+
+		/* The slice header is a NAL unit of its own. */
+		if (!shdr->cpu || result.slice_header_bytes > shdr->size ||
+		    (result.slice_header_bytes &&
+		     !ave_starts_annexb(shdr->cpu, result.slice_header_bytes))) {
+			ave_sess_dump(ctx, s, "no slice header");
+			return -EPROTO;
+		}
+		memcpy(out + ps, shdr->cpu, result.slice_header_bytes);
+	}
 	memcpy(out + ps + result.slice_header_bytes, s->coded.cpu,
 	       result.coded_bytes);
 	len = ps + result.slice_header_bytes + result.coded_bytes;

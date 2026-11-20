@@ -421,19 +421,19 @@
 };
 
 &ps_msr {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_msr_ase_core {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_ane_sys {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_jpg {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_avd_sys {
@@ -517,19 +517,19 @@
 };
 
 &ps_ane_mpm {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_ane_cpu {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_ane_td {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_ane_base {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_disp_cpu {

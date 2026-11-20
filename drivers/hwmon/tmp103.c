@@ -16,6 +16,7 @@
 #include <linux/hwmon.h>
 #include <linux/err.h>
 #include <linux/device.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 
 #define TMP103_TEMP_REG		0x00
@@ -38,6 +39,12 @@
 #define TMP103_CONFIG_MASK	(TMP103_CONF_CR0 | TMP103_CONF_CR1 | \
 				 TMP103_CONF_M0 | TMP103_CONF_M1)
 
+struct tmp103_data {
+	struct regmap *regmap;
+	/* Never write the configuration or limit registers. */
+	bool read_only;
+};
+
 static inline int tmp103_reg_to_mc(s8 val)
 {
 	return val * 1000;
@@ -51,7 +58,8 @@ static inline u8 tmp103_mc_to_reg(int val)
 static int tmp103_read(struct device *dev, enum hwmon_sensor_types type,
 		       u32 attr, int channel, long *temp)
 {
-	struct regmap *regmap = dev_get_drvdata(dev);
+	struct tmp103_data *data = dev_get_drvdata(dev);
+	struct regmap *regmap = data->regmap;
 	unsigned int regval;
 	int err, reg;
 
@@ -81,8 +89,12 @@ static int tmp103_read(struct device *dev, enum hwmon_sensor_types type,
 static int tmp103_write(struct device *dev, enum hwmon_sensor_types type,
 			u32 attr, int channel, long temp)
 {
-	struct regmap *regmap = dev_get_drvdata(dev);
+	struct tmp103_data *data = dev_get_drvdata(dev);
+	struct regmap *regmap = data->regmap;
 	int reg;
+
+	if (data->read_only)
+		return -EPERM;
 
 	switch (attr) {
 	case hwmon_temp_min:
@@ -99,9 +111,12 @@ static int tmp103_write(struct device *dev, enum hwmon_sensor_types type,
 	return regmap_write(regmap, reg, tmp103_mc_to_reg(temp));
 }
 
-static umode_t tmp103_is_visible(const void *data, enum hwmon_sensor_types type,
+static umode_t tmp103_is_visible(const void *drvdata,
+				 enum hwmon_sensor_types type,
 				 u32 attr, int channel)
 {
+	const struct tmp103_data *data = drvdata;
+
 	if (type != hwmon_temp)
 		return 0;
 
@@ -110,7 +125,7 @@ static umode_t tmp103_is_visible(const void *data, enum hwmon_sensor_types type,
 		return 0444;
 	case hwmon_temp_min:
 	case hwmon_temp_max:
-		return 0644;
+		return data->read_only ? 0 : 0644;
 	default:
 		return 0;
 	}
@@ -150,26 +165,39 @@ static const struct regmap_config tmp103_regmap_config = {
 static int tmp103_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
+	struct tmp103_data *data;
 	struct device *hwmon_dev;
-	struct regmap *regmap;
 	int ret;
 
-	regmap = devm_regmap_init_i2c(client, &tmp103_regmap_config);
-	if (IS_ERR(regmap)) {
+	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	data->read_only = device_property_read_bool(dev, "read-only");
+
+	data->regmap = devm_regmap_init_i2c(client, &tmp103_regmap_config);
+	if (IS_ERR(data->regmap)) {
 		dev_err(dev, "failed to allocate register map\n");
-		return PTR_ERR(regmap);
+		return PTR_ERR(data->regmap);
 	}
 
-	ret = regmap_update_bits(regmap, TMP103_CONF_REG, TMP103_CONFIG_MASK,
-				 TMP103_CONFIG);
-	if (ret < 0) {
-		dev_err(&client->dev, "error writing config register\n");
-		return ret;
+	/*
+	 * In read-only mode the sensor keeps the configuration its owner
+	 * set: no conversion rate or mode change here, and no shutdown
+	 * across system sleep.
+	 */
+	if (!data->read_only) {
+		ret = regmap_update_bits(data->regmap, TMP103_CONF_REG,
+					 TMP103_CONFIG_MASK, TMP103_CONFIG);
+		if (ret < 0) {
+			dev_err(&client->dev, "error writing config register\n");
+			return ret;
+		}
 	}
 
-	i2c_set_clientdata(client, regmap);
+	i2c_set_clientdata(client, data);
 	hwmon_dev = devm_hwmon_device_register_with_info(dev, client->name,
-							 regmap,
+							 data,
 							 &tmp103_chip_info,
 							 NULL);
 	return PTR_ERR_OR_ZERO(hwmon_dev);
@@ -177,17 +205,23 @@ static int tmp103_probe(struct i2c_client *client)
 
 static int tmp103_suspend(struct device *dev)
 {
-	struct regmap *regmap = dev_get_drvdata(dev);
+	struct tmp103_data *data = dev_get_drvdata(dev);
 
-	return regmap_update_bits(regmap, TMP103_CONF_REG,
+	if (data->read_only)
+		return 0;
+
+	return regmap_update_bits(data->regmap, TMP103_CONF_REG,
 				  TMP103_CONF_SD_MASK, 0);
 }
 
 static int tmp103_resume(struct device *dev)
 {
-	struct regmap *regmap = dev_get_drvdata(dev);
+	struct tmp103_data *data = dev_get_drvdata(dev);
 
-	return regmap_update_bits(regmap, TMP103_CONF_REG,
+	if (data->read_only)
+		return 0;
+
+	return regmap_update_bits(data->regmap, TMP103_CONF_REG,
 				  TMP103_CONF_SD_MASK, TMP103_CONF_SD);
 }
 

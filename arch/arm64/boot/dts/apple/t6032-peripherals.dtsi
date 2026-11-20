@@ -8,6 +8,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 559 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_debug_gated>;
 		status = "disabled";
 	};
 
@@ -17,6 +18,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1292 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_msr0>;
 		status = "disabled";
 	};
 
@@ -26,6 +28,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1298 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_msr1>;
 		status = "disabled";
 	};
 
@@ -35,6 +38,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1737 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_scodec>;
 		status = "disabled";
 	};
 
@@ -44,6 +48,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1737 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_scodec>;
 		status = "disabled";
 	};
 
@@ -53,6 +58,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1782 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_prores>;
 		status = "disabled";
 	};
 
@@ -62,7 +68,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1283 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		power-domains = <&ps_jpg>;
+		status = "okay";
 	};
 
 	ultra_dart_jpeg10: iommu@2cf00c000 {
@@ -71,7 +78,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1288 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		power-domains = <&ps_jpg>;
+		status = "okay";
 	};
 
 	ultra_dart_ave00: iommu@285030000 {
@@ -80,6 +88,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1204 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_venc0_sys>;
 		status = "disabled";
 	};
 
@@ -89,6 +98,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1204 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_venc0_sys>;
 		status = "disabled";
 	};
 
@@ -96,6 +106,7 @@
 		compatible = "apple,t6032-dart-smmu", "apple,dart-smmu";
 		reg = <0x2 0x85020000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_venc0_sys>;
 	};
 
 	ultra_dart_ave03: filter@285044000 {
@@ -110,6 +121,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1216 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_venc1_sys>;
 		status = "disabled";
 	};
 
@@ -119,6 +131,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1216 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_venc1_sys>;
 		status = "disabled";
 	};
 
@@ -126,6 +139,7 @@
 		compatible = "apple,t6032-dart-smmu", "apple,dart-smmu";
 		reg = <0x3 0xc5020000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_venc1_sys>;
 	};
 
 	ultra_dart_ave13: filter@3c5044000 {
@@ -461,7 +475,7 @@
 		power-domains = <&ps_jpg>;
 		iommus = <&ultra_dart_jpeg00 0>;
 		clocks = <&ultra_clocks 350>, <&ultra_clocks 351>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ultra_jpeg1: jpeg@2cf008000 {
@@ -472,7 +486,7 @@
 		power-domains = <&ps_jpg>;
 		iommus = <&ultra_dart_jpeg10 0>;
 		clocks = <&ultra_clocks 350>, <&ultra_clocks 351>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ultra_ave0: video-encoder@285100000 {
@@ -520,6 +534,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1292 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_msr0_die1>;
 		status = "disabled";
 	};
 
@@ -529,6 +544,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1298 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_msr1_die1>;
 		status = "disabled";
 	};
 
@@ -538,6 +554,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1737 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_scodec_die1>;
 		status = "disabled";
 	};
 
@@ -547,6 +564,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1737 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_scodec_die1>;
 		status = "disabled";
 	};
 
@@ -556,6 +574,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1782 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_prores_die1>;
 		status = "disabled";
 	};
 
@@ -565,7 +584,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1283 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		power-domains = <&ps_jpg_die1>;
+		status = "okay";
 	};
 
 	ultra_dart_jpeg30: iommu@2cf00c000 {
@@ -574,7 +594,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1288 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		power-domains = <&ps_jpg_die1>;
+		status = "okay";
 	};
 
 	ultra_dart_ave20: iommu@285030000 {
@@ -583,6 +604,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1204 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_venc0_sys_die1>;
 		status = "disabled";
 	};
 
@@ -592,6 +614,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1204 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_venc0_sys_die1>;
 		status = "disabled";
 	};
 
@@ -599,6 +622,7 @@
 		compatible = "apple,t6032-dart-smmu", "apple,dart-smmu";
 		reg = <0x2 0x85020000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_venc0_sys_die1>;
 	};
 
 	ultra_dart_ave23: filter@285044000 {
@@ -613,6 +637,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1216 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_venc1_sys_die1>;
 		status = "disabled";
 	};
 
@@ -622,6 +647,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1216 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_venc1_sys_die1>;
 		status = "disabled";
 	};
 
@@ -629,6 +655,7 @@
 		compatible = "apple,t6032-dart-smmu", "apple,dart-smmu";
 		reg = <0x3 0xc5020000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_venc1_sys_die1>;
 	};
 
 	ultra_dart_ave33: filter@3c5044000 {
@@ -772,7 +799,7 @@
 		power-domains = <&ps_jpg_die1>;
 		iommus = <&ultra_dart_jpeg20 0>;
 		clocks = <&ultra_clocks 268435806>, <&ultra_clocks 268435807>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ultra_jpeg3: jpeg@2cf008000 {
@@ -783,7 +810,7 @@
 		power-domains = <&ps_jpg_die1>;
 		iommus = <&ultra_dart_jpeg30 0>;
 		clocks = <&ultra_clocks 268435806>, <&ultra_clocks 268435807>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ultra_ave2: video-encoder@285100000 {

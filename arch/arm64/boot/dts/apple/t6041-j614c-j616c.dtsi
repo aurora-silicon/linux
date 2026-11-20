@@ -2477,12 +2477,30 @@
 	};
 };
 
-&aop_als {
-	status = "disabled";
-};
+/*
+ * The AOP's sensors, as on the M4 Pro boards (t6040.dtsi, t604x-j614-j616.dtsi).
+ * The J614c's ADT has the J614s's als, accel and gyro services under
+ * /arm-io/aop/iop-aop-nub; the loader copies the accelerometer's and
+ * gyroscope's calibration into the nodes of the same names.
+ */
+&aop {
+	aop_accel: accel {
+		compatible = "apple,t6041-aop-accel", "apple,aop-accel";
+		/* The sensor is on the logic board, in the base. */
+		label = "accel-base";
+	};
 
-&aop_las {
-	status = "disabled";
+	aop_gyro: gyro {
+		compatible = "apple,t6041-aop-gyro", "apple,aop-gyro";
+	};
+
+	aop_devmotion: devmotion6 {
+		compatible = "apple,t6041-aop-devmotion6", "apple,aop-devmotion6";
+	};
+
+	aop_temp: als-temp {
+		compatible = "apple,t6041-aop-als-temp", "apple,aop-als-temp";
+	};
 };
 
 / {
@@ -2526,11 +2544,9 @@
 
 #include "t604x-extdisp.dtsi"
 
-/delete-node/ &atcphy0_xbar;
-/delete-node/ &atcphy2_xbar;
-
 #include "t6041-j616c-hdmi.dtsi"
 #include "t6041-j616c-usbc.dtsi"
+#include "t6041-j616c-usbc-dcpext2.dtsi"
 
 /*
  * Keyboard backlight, as on the M4 Pro boards: the ADT /arm-io/pwm0 has one
@@ -2842,5 +2858,47 @@
 };
 
 &sio_mbox {
+	status = "okay";
+};
+
+/*
+ * The Neural Engine, as on the M4 Pro boards. The J614c's ADT has ane0 with
+ * pre-loaded firmware (__TEXT;__DATA); the loader fills the reservations of
+ * t6041-j616c-ane.dtsi and the firmware IOVAs from it.
+ */
+&ane0_dart0 {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};
+
+/* Both JPEG engines, as on the M4 Pro boards; they have no board wiring. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
 	status = "okay";
 };

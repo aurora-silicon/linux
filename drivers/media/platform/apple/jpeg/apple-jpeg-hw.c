@@ -326,6 +326,183 @@ static const struct apple_jpeg_reg_layout aj_wide64 = {
 	.num_defaults = ARRAY_SIZE(aj_wide64_defaults),
 };
 
+/*
+ * T6050's reset image, as AppleJPEGDriver writes it between MODE setup and
+ * open: T8140's register map with its own default set.
+ */
+static const struct apple_jpeg_write aj_t6050_defaults[] = {
+	{ 0x000, 0x0 },
+	{ 0x004, 0x0 },
+	{ 0x028, 0x0 },
+	{ 0x02c, 0x0 },
+	{ 0x034, 0x1 },
+	{ 0x038, 0x1 },
+	{ 0x1d8, 0x0 },
+	{ 0x03c, 0x0 },
+	{ 0x040, 0x0 },
+	{ 0x044, 0x0 },
+	{ 0x048, 0x0 },
+	{ 0x04c, 0x0 },
+	{ 0x050, 0x0 },
+	{ 0x054, 0x0 },
+	{ 0x198, 0x0 },
+	{ 0x08c, 0x0 },
+	{ 0x058, 0x0 },
+	{ 0x05c, 0x1 },
+	{ 0x060, 0x1 },
+	{ 0x06c, 0x1 },
+	{ 0x070, 0x1 },
+	{ 0x074, 0x1 },
+	{ 0x080, 0x1 },
+	{ 0x084, 0x1 },
+	{ 0x088, 0x1 },
+	{ 0x1c8, 0x0 },
+	{ 0x1cc, 0x0 },
+	{ 0x090, 0x0 },
+	{ 0x0a0, 0x0 },
+	{ 0x094, 0x0 },
+	{ 0x0a4, 0x0 },
+	{ 0x0b8, 0x7f },
+	{ 0x0bc, 0x7f },
+	{ 0x0b0, 0xffffffff },
+	{ 0x0b4, 0xf },
+	{ 0x0c0, 0x0 },
+	{ 0x0d0, 0x0 },
+	{ 0x0c4, 0x0 },
+	{ 0x0d4, 0x0 },
+	{ 0x0e0, 0xffffffff },
+	{ 0x0e4, 0xf },
+	{ 0x410, 0x0 },
+	{ 0x414, 0x0 },
+	{ 0x444, 0x0 },
+	{ 0x420, 0x0 },
+	{ 0x424, 0x0 },
+	{ 0x428, 0x0 },
+	{ 0x418, 0x0 },
+	{ 0x448, 0x0 },
+	{ 0x42c, 0x0 },
+	{ 0x430, 0x0 },
+	{ 0x434, 0x0 },
+	{ 0x41c, 0x0 },
+	{ 0x44c, 0x0 },
+	{ 0x438, 0x0 },
+	{ 0x43c, 0x0 },
+	{ 0x440, 0x0 },
+	{ 0x13c, 0x0 },
+	{ 0x400, 0x0 },
+	{ 0x404, 0x0 },
+	{ 0x140, 0x0 },
+	{ 0x144, 0x0 },
+	{ 0x148, 0x0 },
+	{ 0x14c, 0x0 },
+	{ 0x154, 0x0 },
+	{ 0x158, 0x0 },
+	{ 0x16c, 0x0 },
+	{ 0x170, 0x0 },
+	{ 0x184, 0x0 },
+	{ 0x188, 0x0 },
+	{ 0x408, 0x0 },
+	{ 0x40c, 0x0 },
+	{ 0x18c, 0x0 },
+	{ 0x190, 0x0 },
+	{ 0x194, 0x0 },
+	{ 0x174, 0x0 },
+	{ 0x178, 0x0 },
+	{ 0x17c, 0x0 },
+	{ 0x180, 0x0 },
+	{ 0x238, 0x0 },
+	{ 0x240, 0x0 },
+	{ 0x248, 0x0 },
+	{ 0x250, 0x0 },
+	{ 0x24c, 0x0 },
+	{ 0x254, 0x0 },
+	{ 0x23c, 0x0 },
+	{ 0x244, 0x0 },
+	{ 0x260, 0x0 },
+	{ 0x264, 0x0 },
+	{ 0x268, 0x0 },
+	{ 0x26c, 0x0 },
+	{ 0x270, 0x0 },
+	{ 0x274, 0x0 },
+	{ 0x278, 0x0 },
+	{ 0x27c, 0x0 },
+	{ 0x280, 0x1eaa },
+	{ 0x288, 0x0 },
+	{ 0x28c, 0x0 },
+	{ 0x2a4, 0x0 },
+	{ 0x2a8, 0x0 },
+	{ 0x218, 0x0 },
+	{ 0x220, 0x0 },
+	{ 0x224, 0x0 },
+	{ 0x21c, 0x0 },
+	{ 0x228, 0x0 },
+	{ 0x230, 0x0 },
+	{ 0x234, 0x0 },
+	{ 0x22c, 0x0 },
+	{ 0x1dc, 0x0 },
+	{ 0x1e4, 0x0 },
+	{ 0x1e8, 0x0 },
+	{ 0x1ec, 0x0 },
+	{ 0x1f0, 0x0 },
+	{ 0x1f8, 0x0 },
+	{ 0x1fc, 0x0 },
+	{ 0x200, 0x0 },
+	{ 0x204, 0x0 },
+	{ 0x208, 0x0 },
+	{ 0x20c, 0x0 },
+	{ 0x210, 0x0 },
+	{ 0x1d0, 0x2 },
+	{ 0x19c, 0x0 },
+	{ 0x1c0, 0x0 },
+	{ 0x020, 0xff },
+};
+
+/* After the handshake, in AppleJPEGDriver's order; jpeg0 gets 1-8, jpeg1 9-16. */
+static const struct apple_jpeg_dma_id aj_t6050_dma_ids[] = {
+	{ 0x098, 1, true },
+	{ 0x0a8, 2, true },
+	{ 0x0b8, 0x7f, false },
+	{ 0x0bc, 0x7f, false },
+	{ 0x0c8, 3, true },
+	{ 0x0d8, 4, true },
+	{ 0x294, 8, false },
+	{ 0x298, 5, true },
+	{ 0x29c, 6, true },
+	{ 0x2b0, 8, false },
+	{ 0x2b4, 7, true },
+	{ 0x2b8, 8, true },
+};
+
+static const struct apple_jpeg_reg_layout aj_wide64_t6050 = {
+	.input_plane0 = 0x090,
+	.input_plane1 = 0x0a0,
+	.input_end = 0x0b0,
+	.pipe_limit0 = 0x0b8,
+	.pipe_limit1 = 0x0bc,
+	.output_start0 = 0x0c0,
+	.output_start1 = 0x0d0,
+	.output_end = 0x0e0,
+	.matrix_base = 0x0e8,
+	.encode_format = 0x13c,
+	.component_pos_base = 0x140,
+	.convert_cs = 0x150,
+	.prefetch_read = 0x154,
+	.prefetch_write = 0x158,
+	.tiling = 0x19c,
+	.timeout = 0x1c0,
+	.hwrev = 0x1c4,
+	.image_width = 0x258,
+	.image_height = 0x25c,
+	.decode_block_base = 0x16c,
+	.dma_addr_bits = 64,
+	.reset_complete = true,
+	.defaults = aj_t6050_defaults,
+	.num_defaults = ARRAY_SIZE(aj_t6050_defaults),
+	.dma_ids = aj_t6050_dma_ids,
+	.num_dma_ids = ARRAY_SIZE(aj_t6050_dma_ids),
+	.t6050_job = true,
+};
+
 static const struct apple_jpeg_reg_layout aj_legacy32 = {
 	.input_plane0 = 0x08c,
 	.input_plane1 = 0x090,
@@ -369,6 +546,14 @@ const struct apple_jpeg_variant apple_jpeg_t6041 = {
 };
 EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_t6041);
 
+const struct apple_jpeg_variant apple_jpeg_t6050 = {
+	.layout = &aj_wide64_t6050,
+	.hwrev_mask = AJ_HWREV_MASK,
+	.hwrev = AJ_HWREV_T6050,
+	.int_done_mask = AJ_INT_STATUS_DONE,
+};
+EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_t6050);
+
 const struct apple_jpeg_variant apple_jpeg_t8112 = {
 	.layout = &aj_wide64,
 	.hwrev_mask = AJ_HWREV_MASK,
@@ -376,6 +561,14 @@ const struct apple_jpeg_variant apple_jpeg_t8112 = {
 	.int_done_mask = BIT(31) | BIT(30),
 };
 EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_t8112);
+
+const struct apple_jpeg_variant apple_jpeg_t8122 = {
+	.layout = &aj_wide64,
+	.hwrev_mask = AJ_HWREV_MASK,
+	.hwrev = AJ_HWREV_T8122,
+	.int_done_mask = BIT(31) | BIT(30),
+};
+EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_t8122);
 
 const struct apple_jpeg_variant apple_jpeg_t8140 = {
 	.layout = &aj_wide64,
@@ -410,15 +603,41 @@ static void aj_put_addr(struct aj_list *l, const struct apple_jpeg_reg_layout *l
 		aj_put(l, offset + 4, upper_32_bits(value));
 }
 
+/* Tiling is set for a job and clear for a reset: in place, or appended. */
 static void aj_defaults(struct aj_list *l, const struct apple_jpeg_reg_layout *layout,
 			bool encode)
 {
-	for (unsigned int i = 0; i < layout->num_defaults; i++)
-		aj_put(l, layout->defaults[i].offset, layout->defaults[i].value);
-	aj_put(l, layout->tiling, encode);
+	bool tiling = false;
+
+	for (unsigned int i = 0; i < layout->num_defaults; i++) {
+		const struct apple_jpeg_write *d = &layout->defaults[i];
+
+		if (d->offset == layout->tiling) {
+			aj_put(l, d->offset, encode);
+			tiling = true;
+		} else {
+			aj_put(l, d->offset, d->value);
+		}
+	}
+	if (!tiling)
+		aj_put(l, layout->tiling, encode);
 }
 
 /* The reset image, as written between the mode changes of a reset. */
+int apple_jpeg_dma_ids(const struct apple_jpeg_reg_layout *layout, u32 stream,
+		       struct apple_jpeg_write *w, unsigned int max)
+{
+	struct aj_list l = { .w = w, .max = max };
+
+	for (unsigned int i = 0; i < layout->num_dma_ids; i++) {
+		const struct apple_jpeg_dma_id *id = &layout->dma_ids[i];
+
+		aj_put(&l, id->offset, id->value + (id->per_stream ? 8 * stream : 0));
+	}
+	return l.error ?: (l.n <= max ? l.n : -ENOSPC);
+}
+EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_dma_ids);
+
 int apple_jpeg_defaults(const struct apple_jpeg_reg_layout *layout, bool encode,
 			struct apple_jpeg_write *w, unsigned int max)
 {
@@ -428,6 +647,90 @@ int apple_jpeg_defaults(const struct apple_jpeg_reg_layout *layout, bool encode,
 	return l.error ?: (l.n <= max ? l.n : -ENOSPC);
 }
 EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_defaults);
+
+/*
+ * The T6050 sequence, in AppleJPEGDriver's order (per the macOS register
+ * trace). Unlike the earlier revisions it has no plane size or pipe limit
+ * registers, takes 16-bit quantisation tables and two-bit Huffman table
+ * selectors, and needs 0x08c, 0x334 and IO flag bit 7. Only 4:2:0 is known.
+ */
+static int aj_build_t6050(struct aj_list *l, const struct apple_jpeg_reg_layout *layout,
+			  const struct apple_jpeg_job *job, u64 output_end)
+{
+	const struct apple_jpeg_write addr[] = {
+		{ layout->input_plane0, lower_32_bits(job->luma) },
+		{ layout->input_plane1, lower_32_bits(job->chroma) },
+		{ layout->input_end, lower_32_bits(job->input_end | 7) },
+		{ layout->output_start0, lower_32_bits(job->output) },
+		{ layout->output_start1, lower_32_bits(job->output) },
+		{ layout->output_end, lower_32_bits(output_end) },
+	};
+	const u64 high[] = {
+		job->luma, job->chroma, job->input_end, job->output, job->output, output_end,
+	};
+	u32 width = job->width, height = job->height;
+	u8 q[2][64];
+
+	if (job->is422)
+		return -EOPNOTSUPP;
+
+	aj_put(l, AJ_MODE, AJ_MODE_SETUP);
+	aj_put(l, AJ_MAIN_RUN, 0);
+	aj_defaults(l, layout, true);
+	aj_put(l, AJ_MODE, AJ_MODE_OPEN);
+
+	aj_put(l, AJ_ENCODE_ENABLE, 1);
+	aj_put(l, AJ_CODEC_MODE, 1);
+	aj_put(l, AJ_DECODE_ENABLE, 0);
+	aj_put(l, AJ_CODEC, AJ_CODEC_420);
+	aj_put(l, layout->image_width, width);
+	aj_put(l, layout->image_height, height);
+	aj_put(l, AJ_T6050_PX_MODE, AJ_CODEC_420);
+	aj_put(l, AJ_PX_USE_PLANE1, 1);
+	aj_put(l, layout->timeout, apple_jpeg_timeout(width, height));
+	aj_put(l, AJ_PX_MCUS_W, DIV_ROUND_UP(width, 16));
+	aj_put(l, AJ_PX_MCUS_H, DIV_ROUND_UP(height, 16));
+	aj_put(l, AJ_PX_PLANE0_TILE_H, 2);
+	aj_put(l, AJ_PX_PLANE0_TILE_V, 16);
+	aj_put(l, AJ_PX_PLANE1_TILE_H, 2);
+	aj_put(l, AJ_PX_PLANE1_TILE_V, 8);
+	aj_put(l, AJ_T6050_ENC_CTRL, AJ_T6050_ENC_CTRL_ENCODE);
+
+	/* Two planes, Y then interleaved Cb, Cr. */
+	aj_put(l, layout->encode_format, AJ_PIXEL_FORMAT_YUV_PLANES);
+	aj_put(l, layout->component_pos_base, 0);
+	aj_put(l, layout->component_pos_base + 4, 0);
+	aj_put(l, layout->component_pos_base + 8, 1);
+
+	/* Every low address word, then every high one. */
+	for (unsigned int i = 0; i < ARRAY_SIZE(addr); i++)
+		aj_put(l, addr[i].offset, addr[i].value);
+	for (unsigned int i = 0; i < ARRAY_SIZE(addr); i++)
+		aj_put(l, addr[i].offset + 4, upper_32_bits(high[i]));
+	aj_put(l, AJ_PX_PLANE0_STRIDE, job->luma_stride);
+	aj_put(l, AJ_PX_PLANE1_STRIDE, job->chroma_stride);
+	aj_put(l, layout->prefetch_read, 1);
+	aj_put(l, layout->prefetch_write, 0);
+	aj_put(l, AJ_T6050_PRE_ENCODE, 0);
+
+	aj_put(l, AJ_MODE, AJ_MODE_ENCODE);
+	aj_put(l, AJ_JPEG_IO_FLAGS, AJ_IO_FLAGS_T6050 | AJ_IO_FLAGS_ORDER | AJ_IO_FLAGS_420);
+	aj_put(l, AJ_JPEG_WIDTH, width);
+	aj_put(l, AJ_JPEG_HEIGHT, height);
+	aj_put(l, AJ_RST_INTERVAL, job->restart_interval);
+	aj_put(l, AJ_OUTPUT_FLAGS, 0);
+
+	apple_jpeg_quant_tables(job->quality, q[0], q[1]);
+	for (unsigned int t = 0; t < 2; t++)
+		for (unsigned int i = 0; i < 32; i++)
+			aj_put(l, AJ_QTBL16(t) + 4 * i, q[t][2 * i] << 16 | q[t][2 * i + 1]);
+	aj_put(l, AJ_HUFFMAN_TABLE, AJ_HUFFMAN_T6050);
+	aj_put(l, AJ_QTBL_SEL, AJ_QTBL_SEL_LUMA_CHROMA);
+
+	aj_put(l, AJ_MAIN_RUN, 1);
+	aj_put(l, AJ_COMMAND, 1);
+	return 0;
+}
 
 /*
  * Every register write of one baseline encode of two-plane (NV12 or NV16)
@@ -443,6 +746,7 @@ int apple_jpeg_build_job(const struct apple_jpeg_reg_layout *layout,
 	struct aj_list l = { .w = w, .max = max };
 	u8 luma[64], chroma[64];
 	u64 output_end, addr_mask = DMA_BIT_MASK(layout->dma_addr_bits);
+	int ret;
 
 	if (!width || !height || width > U16_MAX || height > U16_MAX)
 		return -EINVAL;
@@ -459,6 +763,13 @@ int apple_jpeg_build_job(const struct apple_jpeg_reg_layout *layout,
 	    ((job->luma | job->chroma | (job->input_end | 7) | job->output |
 	      output_end) & ~addr_mask))
 		return -ERANGE;
+
+	if (layout->t6050_job) {
+		ret = aj_build_t6050(&l, layout, job, output_end);
+		if (ret)
+			return ret;
+		return l.error ?: (l.n <= max ? l.n : -ENOSPC);
+	}
 
 	aj_put(&l, AJ_MODE, AJ_MODE_SETUP);
 	aj_put(&l, AJ_MAIN_RUN, 0);

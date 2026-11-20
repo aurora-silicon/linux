@@ -532,6 +532,9 @@ int suspend_devices_and_enter(suspend_state_t state)
 	do {
 		error = suspend_enter(state, &wakeup);
 	} while (!error && !wakeup && platform_suspend_again(state));
+	/* Only a wake from the sleep state can be dark. */
+	if (error)
+		pm_suspend_global_flags &= ~PM_SUSPEND_FLAG_DARK_WAKE;
 
  Resume_devices:
 	suspend_test_start();
@@ -606,6 +609,9 @@ static int enter_state(suspend_state_t state)
 
 	pm_pr_dbg("Preparing system for sleep (%s)\n", mem_sleep_labels[state]);
 	pm_suspend_clear_flags();
+	/* Ahead of the PM notifiers: "freeze" is no platform sleep whatever "mem" stands for. */
+	if (state == PM_SUSPEND_TO_IDLE)
+		pm_set_suspend_no_platform();
 	error = suspend_prepare(state);
 	if (error)
 		goto Unlock;
@@ -616,6 +622,15 @@ static int enter_state(suspend_state_t state)
 	trace_suspend_resume(TPS("suspend_enter"), state, false);
 	pm_pr_dbg("Suspending system (%s)\n", mem_sleep_labels[state]);
 	error = suspend_devices_and_enter(state);
+	/*
+	 * Every device has resumed, but nothing woke the system that user space
+	 * needs to see: go back to sleep with user space still frozen.
+	 */
+	while (!error && pm_dark_wake()) {
+		pr_info("dark wake: suspending again (%s)\n", mem_sleep_labels[state]);
+		pm_suspend_clear_flags();
+		error = suspend_devices_and_enter(state);
+	}
 
  Finish:
 	events_check_enabled = false;

@@ -4,7 +4,7 @@
 from pathlib import Path
 import os, re, shlex, shutil, subprocess
 import phy
-from common import block, tipd_pm_header, atc_function, ATC_RPM
+from common import block, tipd_pm_header, atc_function, atc_mux_noop, ATC_RPM
 
 def ownership(root, usb_unreachable=False):
     ns=phy.parking(root)
@@ -424,10 +424,14 @@ int main(void)
      # delayed work functions themselves are left to the KUnit tests.
      helpers+=''.join(atc_function(s,name) for name in
        ('atcphy_usb3_port_off','atcphy_usb3_port_on','atcphy_usb3_port_retry_delay',
-        'atcphy_usb3_port_retry','atcphy_mux_in_mode'))
-     helpers+=ns['function'](s,'atcphy_mux_is_noop')+'\n'
+        'atcphy_usb3_port_retry'))
+     # Unless the lane fixture's atcphy_mux_set_locked() already needed them.
+     if not atc_mux_noop(s):
+      helpers+=atc_function(s,'atcphy_mux_in_mode')+ns['function'](s,'atcphy_mux_is_noop')+'\n'
      helpers+=''.join(atc_function(s,name) for name in
        ('atcphy_park_retry_delay','atcphy_park_retry','atcphy_park_due','atcphy_mux_change'))
+     # The mux callback's body, split out so the wake can set the mode it had.
+     helpers+=''.join(atc_function(s,name) for name in ('atcphy_mux_done','atcphy_mux_update_to'))
      helpers+=ns['function'](s,'atcphy_mux_update')+'\n'
      # Lane fixtures provide the target mapping and locked body; use the real callback here.
      # The mux callback powers an idle-power-off PHY first; this PHY is not one.
@@ -495,7 +499,7 @@ struct notifier_block { int (*notifier_call)(struct notifier_block *,unsigned lo
     mocks = r'''
 struct cd321x {
  struct tps6598x tps;
- struct work update_work,resume_work;
+ struct work update_work,resume_work,rearm_work;
  int link_event,ready_event,restore_event;
  struct cd321x_pm_state pm;
  void *mux,*tbt_switch,*port_altmode_dp,*port_altmode_tbt;

@@ -110,6 +110,7 @@ struct apple_clpc {
  struct freq_qos_request ane_qos;
  unsigned int ane_qos_khz;
  unsigned long ane_until;
+ bool low_power;
 };
 static unsigned long jiffies;
 static u64 ktime_get_mono_fast_ns(void) { return jiffies * 1000000ull; }
@@ -131,6 +132,8 @@ static int apple_pmc_floor_update(void *pmc, unsigned int agent, u32 mask, u32 f
  (void)pmc; assert(agent==1 && mask==3); published=floor; return vote_error;
 }
 static void apple_clpc_queue(struct apple_clpc *c, bool idle) { (void)c; queued_idle=idle; }
+#define READ_ONCE(x) (x)
+static void apple_clpc_profile_limit(struct apple_clpc *c) { (void)c; }
 ''' + dense_samples + '\n' + reasons + '\n' + tables + '\n' + methods + r'''
 // T8140 ANE work holds its DRAM and fabric states while it runs, a request
 // shorter than one sample is still seen once, and the hold then expires.

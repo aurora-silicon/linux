@@ -447,6 +447,9 @@ struct tb_path {
 	bool clear_fc;
 	int path_length;
 	bool alloc_hopid;
+	struct tb_regs_hop *sleep_hops;
+	bool sleep_valid;
+	bool sleep_lost;
 
 	struct tb_path_hop hops[] __counted_by(path_length);
 };
@@ -799,6 +802,10 @@ void tb_domain_remove(struct tb *tb);
 int tb_domain_suspend_noirq(struct tb *tb);
 int tb_domain_resume_noirq(struct tb *tb);
 int tb_domain_suspend(struct tb *tb);
+int tb_cio_sleep_prepare(struct tb *tb);
+int tb_cio_sleep(struct tb *tb);
+int tb_cio_wake(struct tb *tb, bool *host_pci_lost);
+void tb_cio_sleep_complete(struct tb *tb);
 int tb_domain_freeze_noirq(struct tb *tb);
 int tb_domain_thaw_noirq(struct tb *tb);
 void tb_domain_complete(struct tb *tb);
@@ -875,6 +882,10 @@ int tb_switch_configuration_valid(struct tb_switch *sw);
 int tb_switch_add(struct tb_switch *sw);
 void tb_switch_remove(struct tb_switch *sw);
 void tb_switch_suspend(struct tb_switch *sw, bool runtime);
+int tb_switch_suspend_cio(struct tb_switch *sw);
+int tb_switch_cio_pm_roles(struct tb_switch *sw);
+void tb_switch_cio_test_dock(u64 *route, ktime_t *bit, ktime_t *ready, int *ret);
+void tb_switch_cio_test_host(struct tb *tb, bool slept);
 int tb_switch_resume(struct tb_switch *sw, bool runtime);
 int tb_switch_reset(struct tb_switch *sw);
 int tb_switch_wait_for_bit(struct tb_switch *sw, u32 offset, u32 bit,
@@ -1097,6 +1108,11 @@ bool tb_port_clx_is_enabled(struct tb_port *port, unsigned int clx);
 int tb_switch_clx_init(struct tb_switch *sw);
 int tb_switch_clx_enable(struct tb_switch *sw, unsigned int clx);
 int tb_switch_clx_disable(struct tb_switch *sw);
+int tb_switch_clx_pm_roles(struct tb_switch *sw);
+int tb_switch_clx_macos_cycle(struct tb_switch *sw);
+void tb_clx_test_set_caller(void *caller);
+void tb_clx_test_fw_log(unsigned int from, unsigned int to);
+void tb_clx_test_sleep_report(struct tb *tb, ktime_t entry);
 
 /**
  * tb_switch_clx_is_enabled() - Checks if the CLx is enabled
@@ -1165,6 +1181,13 @@ static inline bool tb_port_is_apple_host_dpin(const struct tb_port *port)
 }
 
 bool tb_has_apple_host_dp_tunnel(struct tb *tb);
+
+/* Host DP IN adapter whose bandwidth allocation runs as TB_HOST_DP_BW_HELD_ACK says. */
+static inline bool tb_port_dp_bw_held_ack(const struct tb_port *port)
+{
+	return tb_port_is_apple_host_dpin(port) &&
+	       (port->sw->tb->nhi->host_dp_policy & TB_HOST_DP_BW_HELD_ACK);
+}
 
 static inline bool tb_port_needs_host_dp_credits(const struct tb_port *port)
 {
@@ -1247,6 +1270,10 @@ struct tb_path *tb_path_alloc(struct tb *tb, struct tb_port *src, int src_hopid,
 void tb_path_free(struct tb_path *path);
 int tb_path_activate(struct tb_path *path);
 void tb_path_deactivate(struct tb_path *path);
+int tb_path_sleep_prepare(struct tb_path *path);
+int tb_path_sleep(struct tb_path *path);
+int tb_path_wake(struct tb_path *path);
+void tb_path_sleep_complete(struct tb_path *path);
 int tb_path_deactivate_hop(struct tb_port *port, int hop_index);
 bool tb_path_is_invalid(struct tb_path *path);
 bool tb_path_port_on_path(const struct tb_path *path,

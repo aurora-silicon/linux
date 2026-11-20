@@ -19,6 +19,8 @@
 #define AVE_MBOX_TIME_LO		AVE_MBOX_SCRATCH(4)
 #define AVE_MBOX_TIME_HI		AVE_MBOX_SCRATCH(5)
 #define AVE_MBOX_TIMEOUT_US		5000000
+/* A firmware that already missed a deadline gets less time to confirm a Halt. */
+#define AVE_HUNG_HALT_TIMEOUT_US	500000
 
 /* Coprocessor window */
 #define AVE_COPROC_VCBAR		0x50000

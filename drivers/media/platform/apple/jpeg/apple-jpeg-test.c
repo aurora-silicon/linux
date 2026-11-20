@@ -19,6 +19,9 @@ static void apple_jpeg_hwrev_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6041, 0x10f008));
 	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6041, 0x101009));
 	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, 0x101008));
+	KUNIT_EXPECT_TRUE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6050, 0x111010));
+	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6050, 0x110000));
+	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, 0x111010));
 	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(NULL, 0x110000));
 }
 
@@ -162,6 +165,7 @@ static void apple_jpeg_layout_test(struct kunit *test)
 
 	KUNIT_EXPECT_PTR_EQ(test, apple_jpeg_t8112.layout, wide);
 	KUNIT_EXPECT_PTR_EQ(test, apple_jpeg_t6041.layout, wide);
+	KUNIT_EXPECT_PTR_EQ(test, apple_jpeg_t8122.layout, wide);
 	KUNIT_EXPECT_PTR_NE(test, legacy, wide);
 	KUNIT_EXPECT_TRUE(test, wide->reset_complete);
 	KUNIT_EXPECT_TRUE(test, legacy->reset_complete);
@@ -209,17 +213,121 @@ static void apple_jpeg_layout_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, legacy->image_height, 0x210);
 	KUNIT_EXPECT_EQ(test, legacy->decode_block_base, 0x130);
 	KUNIT_EXPECT_EQ(test, apple_jpeg_t8140.int_done_mask, BIT(31));
+	KUNIT_EXPECT_EQ(test, apple_jpeg_t6050.int_done_mask, BIT(31));
 	KUNIT_EXPECT_EQ(test, apple_jpeg_t8112.int_done_mask, BIT(31) | BIT(30));
+	KUNIT_EXPECT_EQ(test, apple_jpeg_t8122.int_done_mask, BIT(31) | BIT(30));
 	KUNIT_EXPECT_EQ(test, apple_jpeg_t6000.int_done_mask, BIT(31));
+}
+
+/* T6050: T8140's register map, its own reset image and per-engine DMA identifiers. */
+static void apple_jpeg_t6050_layout_test(struct kunit *test)
+{
+	const struct apple_jpeg_reg_layout *wide = apple_jpeg_t8140.layout;
+	const struct apple_jpeg_reg_layout *l = apple_jpeg_t6050.layout;
+	struct apple_jpeg_write w[16];
+	int n;
+
+	KUNIT_EXPECT_PTR_NE(test, l, wide);
+	KUNIT_EXPECT_EQ(test, l->input_plane0, wide->input_plane0);
+	KUNIT_EXPECT_EQ(test, l->output_start0, wide->output_start0);
+	KUNIT_EXPECT_EQ(test, l->output_end, wide->output_end);
+	KUNIT_EXPECT_EQ(test, l->hwrev, wide->hwrev);
+	KUNIT_EXPECT_EQ(test, l->image_height, wide->image_height);
+	KUNIT_EXPECT_EQ(test, l->dma_addr_bits, 64);
+	KUNIT_EXPECT_EQ(test, l->num_defaults, 124);
+	KUNIT_EXPECT_EQ(test, l->defaults[l->num_defaults - 1].offset, 0x020);
+	KUNIT_EXPECT_EQ(test, wide->num_dma_ids, 0);
+
+	n = apple_jpeg_dma_ids(l, 0, w, ARRAY_SIZE(w));
+	KUNIT_ASSERT_EQ(test, n, 12);
+	KUNIT_EXPECT_EQ(test, w[0].offset, 0x098);
+	KUNIT_EXPECT_EQ(test, w[0].value, 1);
+	KUNIT_EXPECT_EQ(test, w[11].value, 8);
+	n = apple_jpeg_dma_ids(l, 1, w, ARRAY_SIZE(w));
+	KUNIT_ASSERT_EQ(test, n, 12);
+	KUNIT_EXPECT_EQ(test, w[0].value, 9);
+	KUNIT_EXPECT_EQ(test, w[2].value, 0x7f);	/* shared, not per engine */
+	KUNIT_EXPECT_EQ(test, w[6].value, 8);
+	KUNIT_EXPECT_EQ(test, w[11].value, 16);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_dma_ids(l, 0, w, 11), -ENOSPC);
+	KUNIT_EXPECT_FALSE(test, apple_jpeg_has_422(l));
+	KUNIT_EXPECT_TRUE(test, apple_jpeg_has_422(wide));
+}
+
+/* The first write to @offset at or after @from, or -1. */
+static int apple_jpeg_index(const struct apple_jpeg_write *w, int n, int from, u32 offset)
+{
+	for (int i = from; i < n; i++)
+		if (w[i].offset == offset)
+			return i;
+	return -1;
+}
+
+/* T6050 jobs: macOS's sequence, with 16-bit tables and no plane size registers. */
+static void apple_jpeg_t6050_job_test(struct kunit *test)
+{
+	struct apple_jpeg_write *w = kunit_kcalloc(test, APPLE_JPEG_MAX_WRITES, sizeof(*w),
+						   GFP_KERNEL);
+	const struct apple_jpeg_reg_layout *l = apple_jpeg_t6050.layout;
+	struct apple_jpeg_job job = apple_jpeg_test_job();
+	static const u32 absent[] = { 0x064, 0x068, 0x078, 0x07c, 0x150, AJ_QTBL16(2) };
+	int n;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	job.quality = 50;
+	/* Tiling sits inside this reset image: set in place, nothing appended. */
+	n = apple_jpeg_defaults(l, true, w, APPLE_JPEG_MAX_WRITES);
+	KUNIT_ASSERT_EQ(test, n, 124);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, l->tiling), 1);
+	n = apple_jpeg_defaults(l, false, w, APPLE_JPEG_MAX_WRITES);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, l->tiling), 0);
+
+	n = apple_jpeg_build_job(l, &job, w, APPLE_JPEG_MAX_WRITES);
+	KUNIT_ASSERT_EQ(test, n, 238);
+	KUNIT_EXPECT_EQ(test, w[0].offset, AJ_MODE);
+	KUNIT_EXPECT_EQ(test, w[0].value, AJ_MODE_SETUP);
+	KUNIT_EXPECT_EQ(test, w[126].offset, AJ_MODE);
+	KUNIT_EXPECT_EQ(test, w[126].value, AJ_MODE_OPEN);
+	KUNIT_EXPECT_EQ(test, w[n - 2].offset, AJ_MAIN_RUN);
+	KUNIT_EXPECT_EQ(test, w[n - 1].offset, AJ_COMMAND);
+	for (unsigned int i = 0; i < ARRAY_SIZE(absent); i++)
+		KUNIT_EXPECT_EQ(test, apple_jpeg_index(w, n, 0, absent[i]), -1);
+
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_CODEC), AJ_CODEC_420);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_T6050_PX_MODE), 3);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_T6050_ENC_CTRL), 0x35);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_MCUS_H), 68);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_PLANE0_STRIDE), 1920);
+	/* The pipe limits keep the reset image's value. */
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x0b8), 0x7f);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x0bc), 0x7f);
+	/* Low address words first, then the high ones. */
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x0e0), 0x017fffff);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x0e4), 0x100);
+	KUNIT_EXPECT_LT(test, apple_jpeg_index(w, n, 127, 0x0e0),
+			apple_jpeg_index(w, n, 127, 0x094));
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_JPEG_IO_FLAGS), 0xb2);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_HUFFMAN_TABLE), 0x550);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_QTBL_SEL), 0x14);
+	/* Annex K at quality 50, two entries per word, the first one high. */
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_QTBL16(0)), 0x0010000b);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_QTBL16(0) + 0x7c), 0x00670063);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_QTBL16(1)), 0x00110012);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_QTBL16(1) + 0x7c), 0x00630063);
+
+	job.is422 = true;
+	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(l, &job, w, APPLE_JPEG_MAX_WRITES),
+			-EOPNOTSUPP);
 }
 
 static void apple_jpeg_older_hwrev_test(struct kunit *test)
 {
 	const struct apple_jpeg_variant *variants[] = {
-		&apple_jpeg_t6000, &apple_jpeg_t6041,
+		&apple_jpeg_t6000, &apple_jpeg_t6041, &apple_jpeg_t6050,
 		&apple_jpeg_t8112, &apple_jpeg_t8140,
+		&apple_jpeg_t8122,
 	};
-	const u32 raw[] = { 0x0d1013, 0x101008, 0x0e0008, 0x110000 };
+	const u32 raw[] = { 0x0d1013, 0x101008, 0x111010, 0x0e0008, 0x110000, 0x0f0008 };
 
 	for (unsigned int i = 0; i < ARRAY_SIZE(variants); i++) {
 		KUNIT_EXPECT_EQ(test, variants[i]->hwrev_mask, 0xffff0fff);
@@ -458,6 +566,8 @@ static struct kunit_case apple_jpeg_cases[] = {
 	KUNIT_CASE(apple_jpeg_hwrev_test),
 	KUNIT_CASE(apple_jpeg_layout_test),
 	KUNIT_CASE(apple_jpeg_older_hwrev_test),
+	KUNIT_CASE(apple_jpeg_t6050_layout_test),
+	KUNIT_CASE(apple_jpeg_t6050_job_test),
 	KUNIT_CASE(apple_jpeg_legacy_job_test),
 	KUNIT_CASE(apple_jpeg_address_reject_test),
 	KUNIT_CASE(apple_jpeg_defaults_test),

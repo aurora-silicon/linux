@@ -93,6 +93,12 @@ impl event::Queues for Service<'_> {
     fn flush_tvb_reply(&mut self) -> Result<bool> {
         self.firmware.flush_tvb_reply()
     }
+    fn channel_error(&mut self, engine: crate::g17::fw::channels::Engine, qid: u8, stamp: u32) -> Result {
+        self.firmware.queue_channel_error(engine, qid, stamp)
+    }
+    fn flush_channel_errors(&mut self) -> Result<bool> {
+        self.firmware.flush_channel_errors()
+    }
     fn flush_freelist_release(&mut self) -> Result<bool> {
         self.firmware.flush_freelist_release()
     }
@@ -348,6 +354,59 @@ impl Firmware {
         }
     }
 
+    /// A step of the event pass is waiting on the firmware with no event to wake it.
+    fn runtime_polling(&self, now: u64) -> bool {
+        self.render_control_backpressured()
+            || self.init.outer_waiting()
+            || self.queues.replay_outer_wait.is_some()
+            || self.queues.replay_consumer_wait.is_some()
+            || self.queues.render.replay_polling()
+            || self.queues.teardown.polling(now)
+            || self.compute_exit_polling(now)
+            || self
+                .queues
+                .compute
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .any(|queue| queue.retirement_polling() || queue.pool_release_pending())
+    }
+
+    /// Nothing is published that hasn't retired, nothing is waiting on the firmware, its rings
+    /// are empty, and the idle check has taken the effort and power holds down.
+    pub(in crate::g17) fn sleep_quiet(&self, now: u64) -> Result<bool> {
+        use crate::g17::recovery::Memory;
+        let compute = self
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| queue.in_flight());
+        if compute
+            || self.queues.render_in_flight()
+            || !self.queues.render_settled()
+            || self.recovery.pending()
+            || self.init.recovery_state()? != 0
+            || self.runtime_polling(now)
+            || self.hold.active()
+            || self.registration_power_release_pending
+            || self.effort.applied() != 0
+        {
+            return Ok(false);
+        }
+        let [consumer, unknown, producer] = self.init.control_counters()?;
+        if consumer != producer || unknown != producer {
+            return Ok(false);
+        }
+        for &role in self.roles() {
+            if channel::Events::pending(&self.init, role)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) fn service_runtime_events(
         &mut self,
         deferred: &mut DeferredBatch,
@@ -424,6 +483,10 @@ impl crate::g17::Shared {
     /// callbacks are finished. Shutdown can detach Firmware during an off-lock
     /// boundary; the collector itself still owns every deferred completion.
     pub(in crate::g17) fn run_runtime_events(self: &Arc<Self>) {
+        // The way back queues a pass, which also handles a crash noticed meanwhile.
+        if self.sleeping() {
+            return;
+        }
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
             self.stop_runtime();
             return;
@@ -493,7 +556,9 @@ impl crate::g17::Shared {
         }
         if recover {
             firmware.service_runtime_recovery(deferred)?;
-            if !firmware.recovery.pending() {
+            if !firmware.recovery.pending()
+                && !self.sleep_gate.load(core::sync::atomic::Ordering::Acquire)
+            {
                 if !self.preparations.reopen() {
                     return Ok(());
                 }
@@ -544,6 +609,8 @@ impl crate::g17::Shared {
                     .load(core::sync::atomic::Ordering::Relaxed),
             ) >= HOUSEKEEPING_NS;
         let mut lingers = None;
+        let mut drains = None;
+        let mut kills = None;
         let mut pools = None;
         let mut shrinking = false;
         if housekeeping {
@@ -552,8 +619,9 @@ impl crate::g17::Shared {
             if !firmware.recovery.pending() {
                 lingers = firmware.expire_render_lingers(now)?;
             }
-            firmware.reclaim_drained_renders(deferred)?;
+            drains = firmware.reclaim_drained_renders(deferred)?;
             firmware.service_compute_exit(deferred)?;
+            kills = firmware.kill_retry_delay();
             pools = firmware.service_compute_pools(deferred, now)?;
             if !firmware.recovery.pending() {
                 firmware
@@ -572,21 +640,7 @@ impl crate::g17::Shared {
         // The firmware may consume M5 work-ring slots without a completion interrupt: while
         // a preparation waits for unclaimed room, every pass polls the consumers.
         let outer = firmware.init.poll_outer_progress()?;
-        let backpressured = firmware.render_control_backpressured();
-        let polling = backpressured
-            || firmware.init.outer_waiting()
-            || firmware.queues.replay_outer_wait.is_some()
-            || firmware.queues.replay_consumer_wait.is_some()
-            || firmware.queues.render.replay_polling()
-            || firmware.queues.teardown.polling(now)
-            || firmware.compute_exit_polling(now)
-            || firmware
-                .queues
-                .compute
-                .iter()
-                .flatten()
-                .filter_map(|entry| entry.queue.as_deref())
-                .any(|queue| queue.retirement_polling() || queue.pool_release_pending());
+        let polling = firmware.runtime_polling(now);
         if polling {
             self.queue_poll();
         }
@@ -598,8 +652,10 @@ impl crate::g17::Shared {
             idle
         };
         // A retained compute pool gives its backing back when it expires, and
-        // so does an idle render free-list registration.
-        let idle = [pools, lingers]
+        // so does an idle render free-list registration. A drained render pair
+        // whose settlement failed is retried when its backoff ends, and a closed
+        // context's kill that waited for other work is looked at again.
+        let idle = [pools, lingers, drains, kills]
             .into_iter()
             .fold(idle, |idle, expiry| match (idle, expiry) {
                 (Some(delay), Some(expiry)) => Some(delay.min(expiry)),

@@ -66,6 +66,7 @@ impl Vm {
             _gem: None,
             offset: 0,
             mapped_size: size,
+            private: None,
         };
         let node = match iova {
             Some(iova) => inner.mm.reserve_node(payload, iova, size as u64, 0)?,

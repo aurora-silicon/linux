@@ -19,15 +19,23 @@
 #include <linux/types.h>
 
 struct apple_sep_fv_new_file_key;
+struct dev_pm_ops;
 
 void sep_cancel_work_sync(void *work);
 void sep_cancel_delayed_work_sync(void *work);
 
 /* -- pm_shim.c ---------------------------------------------------------- */
 
-int sep_pm_register(void (*event)(bool entering));
+int sep_pm_register(void *dev, void (*event)(bool entering), int (*sleep)(void),
+		    void (*wake)(void), bool (*told)(void));
 void sep_pm_unregister(void);
 int sep_pm_keep_domains(void *dev);
+int sep_pm_wait_gated(void *dev, unsigned int timeout_ms);
+int sep_pm_clear_dev_disable(void *dev);
+void sep_pm_dart_restore(void *dev);
+int sep_pm_commit_prepare(void *dev, void *mbox, u64 msg0, u32 msg1, u64 reply, u64 mask);
+int sep_pm_commit_finish(void *dev);
+extern const struct dev_pm_ops sep_pm_ops;
 
 /* -- hwrng_shim.c ------------------------------------------------------- */
 
@@ -185,6 +193,27 @@ int sep_sensor_irq_wait(unsigned int timeout_ms);
 #define SEP_DIAG_HWRNG_REGISTERED	1
 #define SEP_DIAG_HWRNG_FAILED		2
 
+/* Mirrored by diag.rs (Stac). */
+#define SEP_DIAG_STAC_PENDING		0
+#define SEP_DIAG_STAC_ONLINE		1
+#define SEP_DIAG_STAC_ABSENT		2
+#define SEP_DIAG_STAC_FAILED		3
+
+/* Mirrored by diag.rs (Pnon). */
+#define SEP_DIAG_PNON_PENDING		0
+#define SEP_DIAG_PNON_READ		1
+#define SEP_DIAG_PNON_ABSENT		2
+#define SEP_DIAG_PNON_FAILED		3
+#define SEP_DIAG_PNON_DIGEST_LEN	48
+
+/* Mirrored by diag.rs (Offer): endpoints checked at bring-up, sent nothing. */
+#define SEP_DIAG_OFFER_PENDING		0
+#define SEP_DIAG_OFFER_IDLE		1
+#define SEP_DIAG_OFFER_ABSENT		2
+#define SEP_DIAG_EP_SSE			0x0c
+#define SEP_DIAG_EP_HIBE		0x14
+#define SEP_DIAG_EP_SKDL		0x17
+
 struct device;
 
 int sep_diag_register(struct device *dev, const char *profile,
@@ -211,6 +240,10 @@ void sep_diag_bringup_ended(void);
 void sep_diag_set_endpoint(u8 id, u32 name);
 void sep_diag_set_os_identity(int source);
 void sep_diag_set_hwrng(bool registered);
+void sep_diag_set_stac(int state);
+void sep_diag_set_pnon(int state, const u8 *digest, size_t len);
+void sep_diag_set_offer(u8 endpoint, int state);
+unsigned int sep_diag_sse_event(void);
 unsigned int sep_diag_xarm_failed(void);
 unsigned int sep_diag_unhandled(void);
 void sep_diag_sleep(bool entering);
