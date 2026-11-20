@@ -551,7 +551,7 @@ def bounce(root):
         unit = unit.replace(old, new)
 
     swap(' struct { bool connected; void *service; } dptxport[1];',
-         ' struct { bool connected, closed, tile_hint; void *service, *atcphy; int linkcfg_completion; } dptxport[1];\n'
+         ' struct { bool connected, closed, tile_hint; u64 connected_generation; void *service, *atcphy; int linkcfg_completion; } dptxport[1];\n'
          ' void *phy, *dev, *active_typec_route;\n'
          ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;\n'
          ' bool external, external_link_ready, crashed;\n'
@@ -577,6 +577,9 @@ def bounce(root):
          '{ (void)p; releases++; if (release_error) return release_error;\n'
          ' if (release_error_once) { int r = release_error_once; release_error_once = 0; return r; }\n'
          ' fw_display = false; return 0; }')
+    swap('static bool dcp_is_external_h17p(struct apple_dcp *d) { (void)d; return true; }',
+         'static bool h17p = true;\n'
+         'static bool dcp_is_external_h17p(struct apple_dcp *d) { (void)d; return h17p; }')
     swap('int main(void)\n{', 'static int __attribute__((unused)) prior_main(void)\n{')
     firmware = r'''
 typedef uint8_t u8;
@@ -715,20 +718,43 @@ int main(void)
 
  /* A connect that finds the old display still attached drops it and connects: its unplug never reached us. */
  bounced(); link_trains = true;
+ display.typec_generation = 2;
  display.dptxport[0].connected = fw_display = true;
+ display.dptxport[0].connected_generation = 1;
  {
   int before = releases;
   CHECK(dcp_dptx_connect_oob(&device, 0) == 0);
   CHECK(releases == before + 1 && connects == 1);
   CHECK(display.dptxport[0].connected && fw_hpd && fw_display);
  }
+ /* A repeated connect in the same generation must not replace the live display. */
+ {
+  int before = releases, connected = connects;
+  CHECK(dcp_dptx_connect_oob(&device, 0) == 0);
+  CHECK(releases == before && connects == connected);
+ }
  /* An old display that will not release fails the connect and stays attached: nothing new is started on it. */
  bounced(); link_trains = true;
+ display.typec_generation = 2;
  display.dptxport[0].connected = fw_display = true; release_error = -ETIMEDOUT;
+ display.dptxport[0].connected_generation = 1;
  CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT);
  CHECK(connects == 0 && display.dptxport[0].connected);
  release_error = 0;
  printf("case stale-display complete\n");
+
+ /* The provider may disappear with a held request even if no sink trained. */
+ for (int refused = 0; refused < 2; refused++) {
+  int before;
+
+  h17p = true; bounced(); h17p = false; tunnel_gone = true;
+  before = releases;
+  release_error = refused ? -ETIMEDOUT : 0;
+  CHECK(dcp_dptx_connect_raw(&display, 0, NULL, NULL, false, false) == -ENOLINK);
+  CHECK(!fw_hpd && hpd_drops == 1 && releases == before + 1);
+  CHECK(display.dptxport[0].connected == !!refused && fw_display == !!refused);
+ }
+ printf("case withdrawn-tunnel complete\n");
 
  printf("%d assertions, %d failures\n", checks, failures); return !!failures;
 }
@@ -760,14 +786,15 @@ int main(void)
     if 'static unsigned long jiffies;' not in unit:
         firmware += '\nstatic unsigned long jiffies;\n'
     if 'dcp_dptx_wait_linkcfg(' in raw:
-        # Only T6050 watches the tunnel: this H17P link waits as before.
+        # The last bounce case selects the T6050 tunnel watch without H17P.
         firmware += ('#define DCP_LINKCFG_POLL_MS 50\n'
                      '#ifndef min_t\n#define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))\n#endif\n'
                      '#ifndef max_t\n#define max_t(t, a, b) ((t)(a) > (t)(b) ? (t)(a) : (t)(b))\n#endif\n'
                      '#ifndef msecs_to_jiffies\n#define msecs_to_jiffies(x) (x)\n#endif\n'
-                     'static bool dcp_watches_tunnel_withdrawal(void) { return false; }\n'
+                     'static bool tunnel_gone;\n'
+                     'static bool dcp_watches_tunnel_withdrawal(void) { return tunnel_gone; }\n'
                      'static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *d, u32 port)\n'
-                     '{ (void)d; (void)port; assert(!"tunnel watch in an H17P scenario"); return false; }\n' +
+                     '{ (void)d; assert(!port); return tunnel_gone; }\n' +
                      apple_function(root, 'dcp_dptx_wait_linkcfg'))
     if 'dcp_dptx_release_locked(' in raw:
         # A connect that finds the old display still attached drops it with the production release. This H17P

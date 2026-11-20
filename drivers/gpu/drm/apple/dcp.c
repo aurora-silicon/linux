@@ -2195,6 +2195,10 @@ static unsigned long dcp_dptx_wait_linkcfg(struct apple_dcp *dcp, u32 port,
 		return wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
 						   timeout);
 	for (;;) {
+		if (dcp_tb_tunnel_withdrawn(dcp, port)) {
+			*withdrawn = true;
+			return 0;
+		}
 		left = (long)(deadline - jiffies);
 		if (left <= 0)
 			return 0;
@@ -2202,10 +2206,6 @@ static unsigned long dcp_dptx_wait_linkcfg(struct apple_dcp *dcp, u32 port,
 						min_t(unsigned long, left,
 						      msecs_to_jiffies(DCP_LINKCFG_POLL_MS))))
 			return max_t(long, (long)(deadline - jiffies), 1);
-		if (dcp_tb_tunnel_withdrawn(dcp, port)) {
-			*withdrawn = true;
-			return 0;
-		}
 	}
 }
 
@@ -2226,7 +2226,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	/* T8122 dcpext: HPD only after the link wait, see dcp_ext_dptx_607() */
 	bool late_hpd = dcp_ext_dptx_607(dcp);
 	bool t8132 = dcp_is_t8132_ext(dcp);
-	bool compact, withdrawn;
+	bool compact, withdrawn = false;
 	unsigned long timeout;
 	u64 generation;
 	u8 dfp_port;
@@ -2290,19 +2290,12 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	}
 
 	if (dcp->dptxport[port].connected) {
-		/*
-		 * Being told a display showed up while we still think one is
-		 * attached means the disconnect never reached us. It is
-		 * reported on the controller the Type-C connector names, which
-		 * is the one driving the port's PHY rather than this one when
-		 * the display came over a tunnel; and a tunnel whose block
-		 * simply loses power never reaches the teardown path that
-		 * would report it either.
-		 *
-		 * Trust the event: the old display is gone. Drop it here
-		 * rather than silently ignoring the new one, which left every
-		 * later hotplug dead until reboot.
-		 */
+		if (!dcp_is_typec_output(dcp) ||
+		    generation <= dcp->dptxport[port].connected_generation) {
+			dev_dbg(dcp->dev, "DPTX port %u already connected for this attachment\n",
+				port);
+			goto out_unlock;
+		}
 		dev_info(dcp->dev,
 			 "connect while still connected, dropping stale display\n");
 		ret = dcp_dptx_release_locked(dcp, port);
@@ -2365,6 +2358,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_release;
 	}
 	dcp->dptxport[port].connected = true;
+	dcp->dptxport[port].connected_generation = generation;
 	if (dcp_is_typec_output(dcp) && !late_hpd) {
 		if (dcp_uses_t6020_tunnel_flow(dcp))
 			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
@@ -2475,6 +2469,20 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 
 out_withdraw:
 	mutex_lock(&dcp->hpd_mutex);
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery) ||
+	    dcp->typec_generation != generation) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
+	if (withdrawn && !dcp_is_external_h17p(dcp)) {
+		if (dptx_service_available(&dcp->dptxport[port]))
+			dptxport_set_hpd(dcp->dptxport[port].service, false);
+		err = dcp_dptx_release_locked(dcp, port);
+		if (err)
+			dev_warn(dcp->dev, "DPTX port %u tunnel withdrawal release failed: %d\n",
+				 port, err);
+		goto out_unlock;
+	}
 	/*
 	 * A T8132 dcpext's release lowers only the HPD of a connected port, so
 	 * a withdrawn one lowers its HPD here.
@@ -3440,6 +3448,9 @@ bool dcp_hold_resume_event(struct platform_device *pdev)
 static void dcp_typec_attach_locked(struct apple_dcp *dcp)
 {
 	lockdep_assert_held(&dcp->hpd_mutex);
+	if (dcp->typec_cable_connected)
+		return;
+
 	dcp->typec_generation++;
 	WRITE_ONCE(dcp->typec_cable_connected, true);
 	dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);

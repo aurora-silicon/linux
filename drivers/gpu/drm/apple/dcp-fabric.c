@@ -3273,13 +3273,12 @@ static int dcp_tb_release_locked(struct apple_dcp_typec_port *port,
 	dcp_tb_events_retire(dcp);
 	/*
 	 * A refused display release keeps the route and its binding owned.
-	 * port->hpd is the port's, and stays set while the other DP IN
-	 * still has an owner. A T8132 dcpext releases what it connected itself:
-	 * its cable, or a port left connected by a release that failed.
+	 * Port HPD may already be low when the provider withdraws a tunnel.
+	 * Release any display still held by the owner of this DP IN.
 	 */
-	if (dcp_is_t8132_ext(dcp) ?
-	    READ_ONCE(dcp->typec_cable_connected) || READ_ONCE(dcp->dptxport[0].connected) :
-	    port->hpd || dcp->typec_cable_connected) {
+	if (READ_ONCE(dcp->dptxport[0].connected) ||
+	    READ_ONCE(dcp->typec_cable_connected) ||
+	    (!dcp_is_t8132_ext(dcp) && port->hpd)) {
 		ret = dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
 		if (ret)
 			return ret;
