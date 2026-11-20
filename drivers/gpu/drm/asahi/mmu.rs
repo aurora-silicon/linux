@@ -3861,6 +3861,13 @@ impl Uat {
                 uat_inner.owned_user_roots[idx] = ttb;
                 binding.generation = binding_wire_generation(incarnation);
                 uat_inner.publish_slot(idx);
+                if self.inner.clean_poc && !uat_inner.quirks.clean_tables {
+                    // A table walker that does not snoop the CPU caches must also see the new
+                    // TTBAT words, not only the new tables.
+                    let slot = core::ptr::from_ref(&uat_inner.ttbs()[idx]).cast::<u8>();
+                    pgtable::clean_poc(slot, size_of::<SlotTTBS>());
+                    pgtable::poc_barrier();
+                }
                 drop(transaction);
 
                 // Make sure all TLB entries from the previous owner of this ASID are gone
