@@ -691,7 +691,20 @@ EXPORT_SYMBOL_GPL(macsmc_hwmon_fans_request);
 static int macsmc_hwmon_write_fan(struct device *dev, u32 attr, int channel,
 				  long val)
 {
-	return macsmc_hwmon_set_fan(dev_get_drvdata(dev), channel, val);
+	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
+	int ret;
+
+	/*
+	 * Unlocking or releasing system fan control polls the SMC for up to
+	 * MACSMC_FAN_MODE_TIMEOUT_MS. Drop the chip-wide hwmon lock so thermal
+	 * zones and sensor reads are not stalled while waiting on the SMC;
+	 * hwmon->fan.lock and smc->mutex serialize fan state and SMC accesses.
+	 */
+	hwmon_unlock(dev);
+	ret = macsmc_hwmon_set_fan(hwmon, channel, val);
+	hwmon_lock(dev);
+
+	return ret;
 }
 
 /* Hand every manual fan back to the firmware. */
