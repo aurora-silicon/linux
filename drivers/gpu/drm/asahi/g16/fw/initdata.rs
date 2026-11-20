@@ -130,6 +130,9 @@ pub(crate) struct Layout {
     pub(crate) pstate_selectors: [usize; 3],
     /// MAIN offset of the u64 size of the host's crash copy buffer, where the build has one.
     pub(crate) coredump_copy: Option<usize>,
+    /// The host requests a scheduler re-initialisation (FirmwareData scheduler word = 1) in
+    /// InitData and before START.
+    pub(crate) scheduler_request: bool,
 }
 
 /// Size of the host's crash copy buffer (`coredump-copy-buffer` in the 27.2 nub); macOS 27.2
@@ -203,6 +206,7 @@ pub(crate) const V25G83: Layout = Layout {
     },
     pstate_selectors: [0x88, 0x8c, 0x98],
     coredump_copy: None,
+    scheduler_request: true,
 };
 
 /// The 26B123 InitData ABI (macOS 27.2): the same 31 objects and pointers, with
@@ -261,6 +265,10 @@ pub(crate) const V26B123: Layout = Layout {
     // dedicated 0x8000 window at +0xfa0, where G16G keeps its RAM retention object; what macOS
     // writes here on J773g is open (trace list).
     coredump_copy: None,
+    // Candidate: no scheduler request on G16G 26B123. Its only consumers are the GPU power-up
+    // path (0x36ec4 -> scheduler re-init 0x1d9b4) and recovery; on the J713 the firmware
+    // crashed at the first power-up after the boot records, whatever slot-1 record it was.
+    scheduler_request: false,
 };
 
 /// Runs are ordered, disjoint and land inside an object of `size` bytes.
@@ -759,7 +767,7 @@ pub(crate) fn encode_for(
     let fw = &mut objects[id::FIRMWARE_DATA];
     put64(fw, fd.fwctl, input.va[id::FWCTL])?;
     put64(fw, fd.fwctl + 8, input.va[id::FWCTL] + 0x40)?;
-    put32(fw, fd.scheduler, 1)?;
+    put32(fw, fd.scheduler, u32::from(layout.scheduler_request))?;
     put32(objects[id::CONTROL], 0, input.ktrace_mask)?;
     put32(objects[id::ACTIVITY_FRAGMENT], 0xc18, 0xffffffff)?;
     put32(objects[id::ACTIVITY_FRAGMENT], 0xc30, 0xffffffff)?;

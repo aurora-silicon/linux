@@ -824,7 +824,7 @@ fn run(
             return Err(EBUSY);
         }
         dev_info!(dev, "G16: 27.2 scheduler request {} pending at START\n", pending);
-        if pending == 0 {
+        if pending == 0 && init.abi.initdata().scheduler_request {
             scheduler.w32(scheduler_word, 1)?;
         }
     } else {

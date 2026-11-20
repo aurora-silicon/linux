@@ -106,6 +106,9 @@ def expect_initdata(old_image):
             after = bytearray(size)
         else:
             after = bytearray(before)
+        if index == FIRMWARE_DATA:
+            # 26B123 makes no InitData scheduler request (MAP section 10).
+            struct.pack_into('<I', after, 0x51b4, 0)
         for at, value in NEW_26B123.get(index, []):
             assert not any(after[at:at + 8]), f'object {index} +{at:#x}'
             struct.pack_into('<Q', after, at, value)

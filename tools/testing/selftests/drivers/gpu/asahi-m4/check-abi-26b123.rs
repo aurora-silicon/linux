@@ -278,7 +278,7 @@ fn main() {
     assert!(runtime[0x469..0x479].iter().all(|&b| b == 0));
     let data = object(&v26, l, id::FIRMWARE_DATA);
     assert_eq!((r64(data, 0x5168), r64(data, 0x5170), r32(data, 0x51b4)),
-               (input().va[id::FWCTL], input().va[id::FWCTL] + 0x40, 1));
+               (input().va[id::FWCTL], input().va[id::FWCTL] + 0x40, 0));
     let main = object(&v26, l, id::MAIN);
     assert_eq!(r64(main, 0xfa0), input().va[id::RETENTION]);
     assert_eq!(r64(main, 0xfa8), 0);
