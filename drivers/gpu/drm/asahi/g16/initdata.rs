@@ -1,22 +1,24 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Owned J713 initdata: 31 inventory objects, 12 submit channel pairs and the
-//! exact 42-entry MMIO loader. All bytes are encoded in fresh GEM backing before
-//! the boot owner publishes a root or loader address. Firmware-reachable
-//! backing and mappings are retained by `Objects` until reboot.
+//! exact MMIO register map, in the layout of the admitted firmware's ABI. All bytes are
+//! encoded in fresh GEM backing before the boot owner publishes a root or loader address.
+//! Firmware-reachable backing and mappings are retained by `Objects` until reboot.
 
 use kernel::{device, prelude::*, sync::Arc};
 
 use super::adt::GpuAdt;
 use super::board;
 use super::channel::{Channels, Ring};
-use super::fw::initdata::{self as wire, control, globals, id, ready_control};
-use super::hw;
+use super::fw::initdata::{self as wire, id, ready_control};
+use super::hw::{self, FwAbi};
 use super::object::{Class, FwObject, Objects, Placement, Request};
 
 /// Firmware graph handles. The small root.Control and large FirmwareData are
 /// intentionally separate: only the former carries the READY acknowledgement.
 pub(crate) struct InitData {
+    /// The firmware ABI these objects were encoded for.
+    pub(crate) abi: FwAbi,
     pub(crate) globals: Option<Arc<FwObject>>,
     /// Recovery/scheduler owner: root.FirmwareData, not the small Control.
     pub(crate) control: Option<Arc<FwObject>>,
@@ -40,7 +42,8 @@ pub(crate) struct InitData {
     root: Arc<FwObject>,
     /// Rows of the board's firmware performance table, including off.
     pub(crate) rows: u32,
-    loader: [u8; wire::LOADER_BYTES],
+    /// The register-map records, slot 0 through the highest filled one.
+    loader: KVec<u8>,
     /// The complete inventory, including firmware-only log and retention data.
     _graph: KVec<Arc<FwObject>>,
 }
@@ -50,14 +53,24 @@ impl InitData {
         Ok(self.root.va)
     }
 
-    /// Exact Main loader records which the boot owner publishes to firmware DATA.
-    pub(crate) fn loader_bytes(&self) -> &[u8; wire::LOADER_BYTES] {
+    /// Exact Main register-map records, which the boot owner publishes to firmware DATA when
+    /// the layout has the host write them.
+    pub(crate) fn loader_bytes(&self) -> &[u8] {
         &self.loader
+    }
+
+    /// The FirmwareData words of this ABI.
+    pub(crate) fn firmware_data(&self) -> &'static wire::FirmwareData {
+        &self.abi.initdata().firmware_data
     }
 
     /// A phase 1 or 3 stop is owned by the M4 recovery handshake.
     pub(crate) fn halted(&self) -> Result<bool> {
-        let phase = self.control.as_ref().ok_or(ENODEV)?.r32(control::PHASE)?;
+        let phase = self
+            .control
+            .as_ref()
+            .ok_or(ENODEV)?
+            .r32(self.firmware_data().phase)?;
         Ok(phase == 1 || phase == 3)
     }
 
@@ -84,13 +97,15 @@ pub(crate) fn build(
     adt: &GpuAdt,
     objects: &mut Objects,
 ) -> Result<(InitData, Channels, u32)> {
+    let abi = adt.layout.abi;
+    let layout = abi.initdata();
     let performance = board::qualify(dev, adt)?;
     // The top row: S9 on J713, S10 on J773g.
     let ceiling = performance.count as u32 - 1;
     let rows = performance.count as u32;
     let max_khz = performance.frequency[ceiling as usize] * 1000;
     let mut graph = KVec::with_capacity(wire::OBJECT_COUNT, GFP_KERNEL)?;
-    for (i, size) in wire::OBJECT_SIZE.iter().copied().enumerate() {
+    for (i, size) in layout.object_size.iter().copied().enumerate() {
         let lower = match i {
             id::UMA => Some(wire::BOOTSTRAP_START),
             id::PARAMETER => Some(wire::BOOTSTRAP_START + 0x8000),
@@ -179,7 +194,7 @@ pub(crate) fn build(
     // Private CPU-side staging keeps the pure encoder independent of raw GEM
     // pointers. No staging references survive publication.
     let mut images = KVec::with_capacity(wire::OBJECT_COUNT, GFP_KERNEL)?;
-    for size in wire::OBJECT_SIZE {
+    for size in layout.object_size {
         images.push(KVVec::from_elem(0u8, size, GFP_KERNEL)?, GFP_KERNEL)?;
     }
     {
@@ -189,13 +204,19 @@ pub(crate) fn build(
         }
         let array: &mut [&mut [u8]; wire::OBJECT_COUNT] =
             (&mut slices[..]).try_into().map_err(|_| EINVAL)?;
-        wire::encode(array, &input, ceiling).map_err(|()| EINVAL)?;
+        wire::encode_for(layout, array, &input, ceiling).map_err(|()| EINVAL)?;
     }
-    let mut loader = [0u8; wire::LOADER_BYTES];
-    loader.copy_from_slice(&images[id::MAIN][0x640..0x640 + wire::LOADER_BYTES]);
+    let records = layout.loader_records();
+    let mut loader = KVec::with_capacity(records * wire::LOADER_STRIDE, GFP_KERNEL)?;
+    loader.extend_from_slice(
+        images[id::MAIN]
+            .get(0x640..0x640 + records * wire::LOADER_STRIDE)
+            .ok_or(EINVAL)?,
+        GFP_KERNEL,
+    )?;
     // Host startup policy: Main and PowerPerformance contain the top row, but the
     // published selectors remain S1 until the thermal owner admits a raise.
-    for at in globals::PSTATE_SELECTORS {
+    for at in layout.pstate_selectors {
         images[id::GLOBALS][at..at + 4].copy_from_slice(&100u32.to_le_bytes());
     }
     for i in 0..wire::OBJECT_COUNT {
@@ -204,11 +225,14 @@ pub(crate) fn build(
 
     dev_info!(
         dev,
-        "M4 initdata: 31 objects, 12 submit channel pairs, 42 loader records, S1 startup (S{} tables)\n",
+        "M4 initdata ({}): 31 objects, 12 submit channel pairs, {} register-map slots, S1 startup (S{} tables)\n",
+        layout.name,
+        records,
         ceiling
     );
     Ok((
         InitData {
+            abi,
             globals: Some(graph[id::GLOBALS].clone()),
             control: Some(graph[id::FIRMWARE_DATA].clone()),
             ready_control: Some(graph[id::CONTROL].clone()),

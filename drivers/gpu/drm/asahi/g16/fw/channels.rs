@@ -46,7 +46,12 @@ impl SubmitRecord {
     }
 }
 
-/// Device-control opcodes of the qualified 25G83 M4 firmware.
+/// Device-control opcodes of the qualified 25G83 M4 firmware, and of each firmware ABI.
+///
+/// Before each record the firmware compares its power tally (FirmwareData) with the host's
+/// generation word and stays in its power-up path while they differ; a record bumps the tally
+/// only if its opcode's tally byte is set. The host sets the generation to the device-control
+/// producer, so every opcode here has its tally byte set in every ABI.
 pub(crate) mod devctl {
     /// Re-import Globals.
     pub(crate) const IMPORT_GLOBALS: u32 = 0x34;
@@ -56,6 +61,33 @@ pub(crate) mod devctl {
     pub(crate) const NOP: u32 = 0x1a;
     /// PB growth reply.
     pub(crate) const GROW_REPLY: u32 = 7;
+
+    /// The opcodes the host sends, in one firmware ABI.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Opcodes {
+        pub(crate) import_globals: u32,
+        pub(crate) start: u32,
+        pub(crate) nop: u32,
+        pub(crate) grow_reply: u32,
+    }
+
+    pub(crate) const V25G83: Opcodes = Opcodes {
+        import_globals: IMPORT_GLOBALS,
+        start: START,
+        nop: NOP,
+        grow_reply: GROW_REPLY,
+    };
+
+    /// 26B123 removed 25G83's 0x0f, so 0x10..0x1b moved down by one (the consume-only no-op
+    /// 0x1a is 0x19; 26B123's 0x1a is the old 0x1b, which leaves the tally alone and must
+    /// never be the boot no-op), and inserted one before the old 0x2f, so 0x2f..0x37 moved up
+    /// by one (re-import Globals is 0x35). Start and the growth reply keep their numbers.
+    pub(crate) const V26B123: Opcodes = Opcodes {
+        import_globals: 0x35,
+        start: 0x0a,
+        nop: 0x19,
+        grow_reply: 7,
+    };
 }
 
 /// A device-control record (0x40 bytes, opcode first).

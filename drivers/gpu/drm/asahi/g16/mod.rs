@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G16 GPU support (T8132, M4: J713 and J773g; the qualified 25G83 firmware).
+//! G16 GPU support (T8132, M4: J713 and J773g; the qualified 25G83 firmware, and the 26B123
+//! firmware's ABI, whose start is refused until its remaining unknowns are known).
 //!
 //! G16 firmware is *classic*: one ring per engine (TA, FS, compute) and ordering expressed by
 //! in-ring barrier records that wait on another queue's stamp, unlike the G17 kick-ring/QID

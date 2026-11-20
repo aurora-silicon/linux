@@ -1331,7 +1331,7 @@ impl Firmware {
             fw_stamp: g.fw_stamp.va,
             work: s.work.va,
             work_gva: s.work.lower_gva.ok_or(EINVAL)?,
-            // Exact embedded sequence: every self-reference then matches the 25G83 layout.
+            // Exact embedded sequence: every self-reference then matches the qualified layout.
             seq: s.work.va + 0x900,
             preempt_gva: s.preempt.gva.ok_or(EINVAL)?,
             its: s.its.va,
@@ -1361,7 +1361,8 @@ impl Firmware {
         let w = image(&mut scratch.cw)?;
         // User results are published coherently after the complete retirement receipt.
         // The firmware's internal timestamp pair remains enabled.
-        encode::encode_compute(
+        encode::encode_compute_for(
+            self.init.abi.compute(),
             &refs,
             &cmd.cmd,
             &cmd.attachments,
@@ -1427,7 +1428,8 @@ impl Firmware {
             .render()?
             .set_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes)?;
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
-        encode::encode_ta(
+        encode::encode_ta_for(
+            self.init.abi.ta(),
             &refs,
             &pass,
             &cmd.cmd,
@@ -1439,7 +1441,8 @@ impl Firmware {
             image(&mut scratch.ta)?,
             image(&mut scratch.tas)?,
         );
-        encode::encode_fs(
+        encode::encode_fs_for(
+            self.init.abi.fs(),
             &refs,
             &pass,
             &cmd.cmd,

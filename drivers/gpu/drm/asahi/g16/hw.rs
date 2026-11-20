@@ -251,6 +251,26 @@ pub(crate) struct Leaves {
     pub(crate) attrs: u64,
 }
 
+/// The firmware ABI a build speaks to the host: its InitData, device-control, queue-info and
+/// work-item layouts (`fw::{initdata, channels, graph, work}`, selected in `fw/mod.rs`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FwAbi {
+    V25G83,
+    V26B123,
+}
+
+/// How the firmware's MMIO register table in loaded DATA is filled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LoaderTable {
+    /// The host writes the HW data register-map records at this DATA offset before the
+    /// initdata doorbell (the firmware's table must be empty on cold entry).
+    Host(u64),
+    /// The host leaves loaded DATA alone: the firmware copies every named register-map slot
+    /// and the SGX window from HW data itself while it parses InitData, as the T6041 and M5
+    /// G16-family firmware do. Its table is at this DATA offset.
+    Firmware(u64),
+}
+
 /// The loaded-image layout of one firmware ABI: the boot loader's handoff for it, the regions
 /// it reserves, the firmware page tables it builds, and where the boot path writes.
 pub(crate) struct FwLayout {
@@ -263,18 +283,40 @@ pub(crate) struct FwLayout {
     /// after TEXT).
     pub(crate) text_size: u64,
     pub(crate) data_size: u64,
+    /// The firmware ABI of the builds this layout holds.
+    pub(crate) abi: FwAbi,
     /// Every leaf of the firmware's own page tables, in VA order; `None` until known, which
     /// refuses the firmware.
     pub(crate) leaves: Option<&'static [Leaves]>,
-    /// DATA offset of the loader table, the only host write to the loaded DATA; `None` until
-    /// known, which refuses the firmware start.
-    pub(crate) loader_table: Option<u64>,
+    /// The magic the AP publishes at +0 of the PPL handoff page, and the only non-zero value
+    /// either magic word may hold at cold admission; `None` until known, which refuses the
+    /// firmware.
+    pub(crate) ppl_magic: Option<u64>,
+    /// The firmware's register table in loaded DATA.
+    pub(crate) loader_table: LoaderTable,
 }
 
 impl FwLayout {
     /// Whether a boot loader's handoff describes this layout.
     pub(crate) fn matches(&self, version: u32, vas: &[u64], flags: &[u32]) -> bool {
         version == self.handoff_version && vas == self.segment_vas && flags == self.segment_flags
+    }
+
+    /// What a firmware start needs that is not known for this layout yet; empty when the
+    /// firmware can be started.
+    pub(crate) fn unknown(&self) -> impl Iterator<Item = &'static str> {
+        [
+            self.leaves.is_none().then_some(
+                "the leaf attributes of the firmware page tables the boot loader builds \
+                 (DATA with segment flag 0x10, the shared read-only segment)",
+            ),
+            self.ppl_magic.is_none().then_some(
+                "the PPL handoff magic the AP publishes (the firmware stores \
+                 0x4b1d000000000003 at +8)",
+            ),
+        ]
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -286,6 +328,7 @@ pub(crate) const FW_25G83: FwLayout = FwLayout {
     segment_flags: &[1, 0],
     text_size: 0x60000,
     data_size: 0x13c000,
+    abi: FwAbi::V25G83,
     leaves: Some(&[
         Leaves {
             range: 0..0x50000,
@@ -313,11 +356,20 @@ pub(crate) const FW_25G83: FwLayout = FwLayout {
             attrs: 0x0460000000000443,
         },
     ]),
-    loader_table: Some(0x1332f0),
+    ppl_magic: Some(PPL_MAGIC),
+    loader_table: LoaderTable::Host(0x1332f0),
 };
 
 /// 26B123 (macOS 27.2, also 26B131): __TEXT 0x64000, __DATA 0xd0000 and a __DATA_SHARED_RO
-/// 0x8000 right after it (aura's handoff version 2; `fw-data` covers both).
+/// 0x8000 right after it (aura's handoff version 2; `fw-data` covers both, so the RTKit crash
+/// log at the start of the shared read-only segment lies inside it).
+///
+/// The page tables iBoot builds for it are expected to map TEXT below 0x64000 (GXF code
+/// 0x54000..0x5c000), DATA at 0x64000..0x134000 (its GXF window still the first 0xc000) and the
+/// shared read-only segment at 0x134000..0x13c000, but their leaf attributes are not known.
+/// Neither is the AP's PPL handoff magic: this firmware stores 0x4b1d000000000003 at +8 of the
+/// page when it sets up its MMU, which the 25G83 firmware never did. The firmware's register
+/// table is at DATA + 0xc72e8 (60 slots).
 pub(crate) const FW_26B123: FwLayout = FwLayout {
     name: "26B123",
     handoff_version: 2,
@@ -325,8 +377,10 @@ pub(crate) const FW_26B123: FwLayout = FwLayout {
     segment_flags: &[1, 0x10, 0],
     text_size: 0x64000,
     data_size: 0xd8000,
+    abi: FwAbi::V26B123,
     leaves: None,
-    loader_table: None,
+    ppl_magic: None,
+    loader_table: LoaderTable::Firmware(0xc72e8),
 };
 
 /// The firmware layouts this backend knows, newest last.
@@ -373,7 +427,7 @@ pub(crate) mod pte {
     pub(crate) const LEAF_PB_LIST: u64 = 0x00e0000000000c03;
 }
 
-/// PPL handoff magic.
+/// PPL handoff magic the AP publishes for the 25G83 firmware.
 pub(crate) const PPL_MAGIC: u64 = 0x4b1d000000000002;
 
 /// UAT handoff region sizes of this firmware ABI (TTBAT page, TTBAT tables (the firmware kernel
