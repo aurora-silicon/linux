@@ -30,6 +30,7 @@
 
 &wifi0 {
 	brcm,board-type = "apple,tuzla";
+	wakeup-source;
 };
 
 &bluetooth0 {
