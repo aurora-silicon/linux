@@ -5828,14 +5828,16 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	}
 
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
+		const struct iomfb_v27_build *build;
+
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret < 0 || !iomfb_v27_methods(compat_str)) {
+		build = ret < 0 ? NULL : iomfb_v27_methods(compat_str);
+		if (!build) {
 			dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
 				ret < 0 ? "missing" : compat_str);
 			return DCP_FIRMWARE_UNKNOWN;
 		}
-		missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
-						   &num_missing);
+		missing = iomfb_v27_missing_method(build->methods, &num_missing);
 		if (missing) {
 			dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
 				compat_str, num_missing, missing);
@@ -7085,7 +7087,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 		/* Checked by dcp_check_firmware_version(). */
 		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		dcp->v27_methods = iomfb_v27_methods(compat_str);
+		dcp->v27_build = iomfb_v27_methods(compat_str);
+		dcp->v27_methods = dcp->v27_build ? dcp->v27_build->methods : NULL;
 		if (dcp->v27_j714s) {
 			const struct dcp_method_entry *own =
 				iomfb_v27_methods_j714s(dev, dcp->v27_methods);
