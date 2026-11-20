@@ -65,6 +65,7 @@ fn wait_slice_ms(deadline_ns: u64, now_ns: u64) -> Result<u32> {
 struct State {
     active: u64,
     refs: [u8; cfg::RENDER_SLOTS],
+    /// The owner of each slot. Written only by [`Self::set_owner`], which keeps `wide` with it.
     owners: [u64; cfg::RENDER_SLOTS],
     epochs: [u64; cfg::RENDER_SLOTS],
     quarantined: u64,
@@ -90,6 +91,11 @@ struct State {
     /// The physical queue table still has room for a pair built in an unowned slot. The
     /// runtime updates this whenever the table changes.
     build_room: bool,
+    /// Slots that take their owner's renders that run on one of a two-pair queue's pairs
+    /// ([`crate::g17::pairs::for_window`]), so the objects of a layout too large for two pairs
+    /// exist in that pair only: at most one per owner ([`Self::mark_wide`]). A mark belongs to its
+    /// owner's tenure of the slot: [`Self::set_owner`] drops it whenever the slot changes hands.
+    wide: u64,
     released: u64,
     epoch: u64,
     footprints: KVec<InFlight>,
@@ -112,6 +118,7 @@ impl State {
             killed_at: [0; cfg::RENDER_SLOTS],
             held: 0,
             build_room: true,
+            wide: 0,
             released: 0,
             epoch: 0,
             footprints: KVec::new(),
@@ -158,6 +165,14 @@ impl State {
         self.epoch = self.epoch.wrapping_add(1);
         self.epochs[slot] = self.epoch;
     }
+    /// Gives `slot` to `owner` (0: to nobody): the one writer of `owners`. A new owner starts
+    /// without the slot's one-pair mark.
+    fn set_owner(&mut self, slot: usize, owner: u64) {
+        if self.owners[slot] != owner {
+            self.wide &= !(1u64 << slot);
+        }
+        self.owners[slot] = owner;
+    }
     fn take_idle(&mut self, slot: usize, owner: u64) -> u8 {
         if self.owners[slot] != owner {
             crate::g17::trace::teardown(
@@ -171,7 +186,7 @@ impl State {
         self.refs[slot] += 1;
         self.active |= 1u64 << slot;
         self.released &= !(1u64 << slot);
-        self.owners[slot] = owner;
+        self.set_owner(slot, owner);
         self.advance(slot);
         slot as u8
     }
@@ -277,7 +292,7 @@ impl State {
             });
         if let Some(slot) = sibling {
             self.released &= !(1u64 << slot);
-            self.owners[slot] = owner;
+            self.set_owner(slot, owner);
             // A speculative sibling has no GPU-use recency yet.
             self.epochs[slot] = 0;
         }
@@ -321,7 +336,7 @@ impl State {
         {
             return false;
         }
-        self.owners[slot] = owner.unwrap_or(0);
+        self.set_owner(slot, owner.unwrap_or(0));
         self.released &= !bit;
         self.epochs[slot] = 0;
         true
@@ -353,7 +368,7 @@ impl State {
             && self.refs[slot] == 1
             && (self.quarantined | self.kill_hold | self.held) & bit == 0
         {
-            self.owners[slot] = 0;
+            self.set_owner(slot, 0);
             self.released &= !bit;
             self.epochs[slot] = 0;
             true
@@ -402,8 +417,49 @@ impl State {
         }
     }
 
+    /// The one pair a one-pair render (`pairs` 1) of an owner holding two pairs goes to: the pair
+    /// its previous one-pair render took, while the owner holds it (`wide`). Its layout's objects
+    /// then exist in that pair only.
+    fn wide(&self, owner: u64, pairs: usize) -> Option<usize> {
+        if pairs != 1 || self.owners.iter().filter(|id| **id == owner).count() < 2 {
+            return None;
+        }
+        (0..cfg::RENDER_SLOTS)
+            .find(|slot| self.wide & (1u64 << slot) != 0 && self.owners[*slot] == owner)
+    }
+
+    /// Marks `slot` as taking its owner's one-pair renders, instead of any other slot.
+    fn mark_wide(&mut self, slot: usize) {
+        for other in 0..cfg::RENDER_SLOTS {
+            if self.owners[other] == self.owners[slot] {
+                self.wide &= !(1u64 << other);
+            }
+        }
+        self.wide |= 1u64 << slot;
+    }
+
+    /// [`Self::can_pick`] for a render that may use `pairs` of the owner's pairs.
+    fn can_pick_render(&self, owner: u64, pairs: usize, plan: Plan) -> bool {
+        match (self.wide(owner, pairs), plan) {
+            (None, plan) => self.can_pick(owner, plan),
+            (Some(_), Plan::Wait) => false,
+            (Some(wide), Plan::Pair(slot)) if usize::from(slot) != wide => false,
+            (Some(wide), _) => self.usable(owner, wide),
+        }
+    }
+
     fn pick(&mut self, owner: u64, pairs: usize, plan: Plan) -> Option<u8> {
-        match plan {
+        // A one-pair render of an owner holding two pairs goes only to the pair its previous
+        // one-pair render took, while the owner holds it (see `wide`).
+        if let Some(wide) = self.wide(owner, pairs) {
+            return match plan {
+                Plan::Wait => None,
+                Plan::Pair(slot) if usize::from(slot) != wide => None,
+                // The publication barrier orders a Join's overlap from this pair.
+                Plan::Any | Plan::Pair(_) | Plan::Join(_) => self.join(owner, wide),
+            };
+        }
+        let slot = match plan {
             Plan::Any => self.acquire(owner, pairs),
             Plan::Wait => None,
             Plan::Pair(slot) => self.join(owner, usize::from(slot)),
@@ -415,7 +471,11 @@ impl State {
                     .min_by_key(|other| (self.refs[*other], u64::MAX - self.epochs[*other]))?;
                 self.join(owner, other)
             }),
+        }?;
+        if pairs == 1 {
+            self.mark_wide(usize::from(slot));
         }
+        Some(slot)
     }
     fn usable(&self, owner: u64, slot: usize) -> bool {
         self.owners.get(slot) == Some(&owner)
@@ -630,7 +690,8 @@ impl Pool {
         self.state.lock().owner_quarantine(owner) == Some(true)
     }
 
-    /// For an owner that may hold `pairs` render pairs.
+    /// For an owner that may hold `pairs` render pairs: its queue's count, or 1 for a render
+    /// that runs on one of a two-pair queue's pairs ([`crate::g17::pairs::for_window`]).
     pub(crate) fn acquire_render(
         self: &Arc<Self>,
         owner: u64,
@@ -749,7 +810,7 @@ impl Pool {
     }
     /// Whether `acquire_render` would admit this request now, without
     /// admitting it: the scheduler's prepare step waits for this.
-    pub(crate) fn admits_render(&self, owner: u64, request: Option<Request<'_>>) -> bool {
+    pub(crate) fn admits_render(&self, owner: u64, pairs: usize, request: Option<Request<'_>>) -> bool {
         let state = self.state.lock();
         if owner == 0 || state.refusal(owner).is_err() {
             return false;
@@ -758,7 +819,7 @@ impl Pool {
             return false;
         }
         let plan = state.plan(owner, request, None);
-        state.can_pick(owner, plan)
+        state.can_pick_render(owner, pairs, plan)
     }
     pub(crate) fn warmable_sibling(
         self: &Arc<Self>,
@@ -805,7 +866,7 @@ impl Pool {
         let released = state.released & !state.active;
         for slot in 1..cfg::RENDER_SLOTS {
             if released & (1u64 << slot) != 0 {
-                state.owners[slot] = 0;
+                state.set_owner(slot, 0);
                 state.epochs[slot] = 0;
             }
         }
@@ -1448,16 +1509,16 @@ mod owner_pair_tests {
         state.owners[1] = 1;
         state.owners[2] = 1;
         for _ in 0..cfg::RENDER_DEPTH {
-            assert_eq!(state.pick(1, 1, Plan::Pair(1)), Some(1));
+            assert_eq!(state.pick(1, 2, Plan::Pair(1)), Some(1));
         }
         assert!(!state.can_pick(1, Plan::Pair(1)));
-        assert_eq!(state.pick(1, 1, Plan::Pair(1)), None);
+        assert_eq!(state.pick(1, 2, Plan::Pair(1)), None);
         assert!(state.can_pick(1, Plan::Join(1)));
-        assert_eq!(state.pick(1, 1, Plan::Join(1)), Some(2));
+        assert_eq!(state.pick(1, 2, Plan::Join(1)), Some(2));
         // With one pair a preference is the pair.
         state.owners[2] = 0;
         assert!(!state.can_pick(1, Plan::Join(1)));
-        assert_eq!(state.pick(1, 1, Plan::Join(1)), None);
+        assert_eq!(state.pick(1, 2, Plan::Join(1)), None);
     }
 
     #[test]
@@ -1574,6 +1635,99 @@ mod two_pair_tests {
         state.released |= 1u64 << 6;
         assert!(!state.reassign_unused_spare(6, Some(3), Some(1)));
         assert!(state.reassign_unused_spare(6, Some(3), Some(2)));
+    }
+
+    #[test]
+    fn a_one_pair_render_of_a_two_pair_owner_stays_on_one_pair() {
+        crate::g17::pairs::set_sibling_backlog(1);
+        let mut state = State::new();
+        // Small renders take the first pair and, with a backlog there, the sibling.
+        let first = state.pick(1, 2, Plan::Any).unwrap();
+        assert_eq!(state.pick(1, 2, Plan::Any), Some(first));
+        let sibling = state.pick(1, 2, Plan::Any).unwrap();
+        assert_ne!(sibling, first);
+        // A render whose layout the window holds once takes one of them, and every later such
+        // render goes there too, even when the other pair is idle or less loaded.
+        let wide = state.pick(1, 1, Plan::Any).unwrap();
+        let other = if wide == first { sibling } else { first };
+        state.release(other);
+        for _ in state.refs[usize::from(wide)]..cfg::RENDER_DEPTH {
+            assert_eq!(state.pick(1, 1, Plan::Any), Some(wide));
+        }
+        // At full depth it waits for that pair instead of taking the other.
+        assert!(state.can_pick(1, Plan::Any));
+        assert!(!state.can_pick_render(1, 1, Plan::Any));
+        assert!(state.can_pick_render(1, 2, Plan::Any));
+        assert_eq!(state.pick(1, 1, Plan::Any), None);
+        assert_eq!(state.pick(1, 1, Plan::Join(other)), None);
+        state.release(wide);
+        assert_eq!(state.pick(1, 1, Plan::Join(other)), Some(wide));
+        assert_eq!(state.pick(1, 1, Plan::Pair(other)), None);
+        state.release(wide);
+        assert_eq!(state.pick(1, 1, Plan::Pair(wide)), Some(wide));
+        // A small render may still use either pair.
+        assert_eq!(state.pick(1, 2, Plan::Pair(other)), Some(other));
+    }
+
+    #[test]
+    fn a_two_pair_owner_whose_first_render_needs_one_pair_claims_no_sibling() {
+        let mut state = State::new();
+        // Two large renders in flight on a new queue share its one pair.
+        let first = state.pick(1, 1, Plan::Any).unwrap();
+        assert_eq!(state.pick(1, 1, Plan::Any), Some(first));
+        assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 1);
+    }
+
+    #[test]
+    fn a_slot_lost_and_claimed_back_drops_its_one_pair_mark() {
+        let mut state = State::new();
+        // A one-pair render of owner 1 takes slot `a`; its build fails before publication and
+        // the slot goes back unowned.
+        let a = state.pick(1, 1, Plan::Any).unwrap();
+        assert!(state.cancel_empty_slot(a, 1));
+        state.release(a);
+        // Owner 2 takes `a` meanwhile, so owner 1's next one-pair render, which builds its
+        // large layout's objects there, takes a slot `b` above it.
+        state.build_room = false;
+        assert_eq!(state.pick(2, 2, Plan::Any), Some(a));
+        state.build_room = true;
+        let b = state.pick(1, 1, Plan::Any).unwrap();
+        assert!(b > a);
+        state.release(b);
+        // Owner 2 closes, and a small render of owner 1 claims `a` back as its sibling.
+        state.release(a);
+        state.released |= 1u64 << a;
+        assert_eq!(state.pick(1, 2, Plan::Any), Some(b));
+        assert_eq!(state.owners[usize::from(a)], 1);
+        state.release(b);
+        // The large layout's objects are in `b` alone, and its one-pair renders stay there.
+        assert_eq!(state.pick(1, 1, Plan::Any), Some(b));
+        assert!(state.can_pick_render(1, 1, Plan::Pair(b)));
+        assert!(!state.can_pick_render(1, 1, Plan::Pair(a)));
+        assert_eq!(state.pick(1, 1, Plan::Join(a)), Some(b));
+    }
+
+    #[test]
+    fn a_slot_given_to_another_owner_drops_its_one_pair_mark() {
+        let mut state = State::new();
+        // Owner 1 holds two pairs, and its one-pair renders went to the lower one.
+        state.owners[1] = 1;
+        state.owners[2] = 1;
+        assert_eq!(state.pick(1, 1, Plan::Pair(1)), Some(1));
+        state.release(1);
+        // That pair is given to owner 2 as its spare, and owner 1's next one-pair render, with
+        // one pair left, builds its layout in the other.
+        assert!(state.reassign_unused_spare(1, Some(1), Some(2)));
+        assert_eq!(state.pick(1, 1, Plan::Any), Some(2));
+        state.release(2);
+        // Owner 2 closes, owner 1 claims the pair back, and its one-pair renders stay on the
+        // pair that holds the layout.
+        state.released |= 1u64 << 1;
+        assert_eq!(state.pick(1, 2, Plan::Any), Some(2));
+        assert_eq!(state.owners[1], 1);
+        state.release(2);
+        assert_eq!(state.pick(1, 1, Plan::Any), Some(2));
+        assert!(!state.can_pick_render(1, 1, Plan::Pair(1)));
     }
 
     #[test]

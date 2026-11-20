@@ -161,9 +161,9 @@ def held_fixture():
     backlog = pairs[at:pairs.index('\n}\n', pairs.index('fn sibling_backlog', at)) + 3]
     state = '\n'.join(item(source, name) for name in [
         'const fn new(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
-        'fn take_idle(', 'fn acquire(', 'fn claim_sibling(', 'fn reassign_unused_spare(',
-        'fn cancel_empty_slot(', 'fn can_pick(', 'fn pick(', 'fn usable(', 'fn join(', 'fn release(',
-        'fn set_held(', 'fn retained(', 'fn used('])
+        'fn set_owner(', 'fn take_idle(', 'fn acquire(', 'fn claim_sibling(', 'fn reassign_unused_spare(',
+        'fn cancel_empty_slot(', 'fn can_pick(', 'fn wide(', 'fn mark_wide(', 'fn pick(', 'fn usable(',
+        'fn join(', 'fn release(', 'fn set_held(', 'fn retained(', 'fn used('])
     pool = '\n'.join(item(source, name) for name in [
         'pub(crate) fn set_held(', 'pub(crate) fn release_retained_owners_after_processor_stop(',
         'pub(crate) fn killed_pair_free('])
@@ -355,7 +355,7 @@ def release_fixture():
     backlog = pairs[at:pairs.index('\n}\n', pairs.index('fn sibling_backlog', at)) + 3]
     state = '\n'.join(item(source, name) for name in [
         'const fn new(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
-        'fn take_idle(', 'fn acquire(', 'fn claim_sibling(', 'fn usable(', 'fn set_held(',
+        'fn set_owner(', 'fn take_idle(', 'fn acquire(', 'fn claim_sibling(', 'fn usable(', 'fn set_held(',
         'fn sync_held(', 'fn retained(', 'fn used('])
     pool = '\n'.join(item(source, name) for name in [
         'pub(crate) fn set_held(', 'pub(crate) fn sync_held(', 'pub(crate) fn release_owner('])

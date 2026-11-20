@@ -466,6 +466,9 @@ pub(crate) enum Validated {
         ray_query: [RayQueryStage; 2],
         resources: Option<Arc<Programs>>,
         plan: Option<super::render_resources::Plan>,
+        /// Bytes of the client's M5 compact window that each render pair built for this render
+        /// reserves, from the layout SUBMIT derives with the plan (`None` without an M5 plan).
+        pair_window: Option<usize>,
         attachments: [Attachments; 2],
         timestamps: [uapi::drm_asahi_timestamps; 2],
     },
@@ -508,6 +511,14 @@ impl Validated {
     pub(crate) fn long_job(&self) -> bool {
         match self {
             Self::Render { long_job, .. } | Self::Compute { long_job, .. } => *long_job,
+        }
+    }
+    /// The compact-window bytes of each render pair kept by SUBMIT (`Render::pair_window`);
+    /// `None` for a compute command.
+    pub(crate) fn pair_window(&self) -> Option<usize> {
+        match self {
+            Self::Render { pair_window, .. } => *pair_window,
+            Self::Compute { .. } => None,
         }
     }
     pub(crate) fn allow_long_job(&mut self) {
@@ -738,6 +749,7 @@ impl Payload {
                     ray_query: *ray_query,
                     resources: resources.clone(),
                     plan: None,
+                    pair_window: None,
                     attachments: *attachments,
                     timestamps: [cmd.ts_vtx, cmd.ts_frag],
                 })

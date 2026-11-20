@@ -129,15 +129,24 @@ pub(crate) fn parameter_geometry(blocks: usize) -> Result<crate::g17::buffer::Bl
 /// board, which an M5 plan needs.
 pub(crate) fn layout(command: &Validated, clusters: u32, programs: RegisterPrograms,
     board: Option<&'static crate::g17::fw::m5::initdata::Board>) -> Result<target::Layout> {
+    Ok(layout_and_window(command, clusters, programs, board)?.0)
+}
+
+/// The target layout of a render and, for an M5 render, the bytes of the client's compact
+/// window that each render pair built for it reserves.
+pub(crate) fn layout_and_window(command: &Validated, clusters: u32, programs: RegisterPrograms,
+    board: Option<&'static crate::g17::fw::m5::initdata::Board>)
+    -> Result<(target::Layout, Option<usize>)> {
     let Validated::Render { pass, plan, .. } = command else { return Err(EINVAL); };
     let layout = target::Layout::new(pass, clusters, programs)?;
-    if plan.is_none() { return Ok(layout); }
+    if plan.is_none() { return Ok((layout, None)); }
     validate(pass)?;
     let geometry = parameter_geometry(layout.tvb_blocks)?;
     let mesh_storage = compact::mesh_storage()?.map(|(_, bytes)| bytes);
     // The context state a pair allocates for each command slot (`Generation::allocate_state`).
     let state = super::generation::Layout::m5(board.ok_or(EINVAL)?).bytes;
-    Ok(m5_layout(layout, pass, clusters, geometry, mesh_storage, state)?.0)
+    let (layout, reserved) = m5_layout(layout, pass, clusters, geometry, mesh_storage, state)?;
+    Ok((layout, Some(reserved)))
 }
 
 /// The M5 layout of `pass` from its G17P layout, and the compact-window bytes a pair built for
@@ -312,6 +321,12 @@ mod tests {
         reserved_with(size, layers, utile, few, MESH)
     }
 
+    /// The pairs a two-pair queue uses for that pass.
+    fn pairs(size: u32, layers: u16, utile: u8, few: bool, mesh: Option<usize>) -> u8 {
+        let bytes = reserved_with(size, layers, utile, few, mesh).unwrap() as u64;
+        crate::g17::pairs::for_window(2, Some(bytes), compact::WINDOW_BYTES)
+    }
+
     #[test]
     fn borealis_32x32_passes_of_more_than_four_primitives() {
         assert!(reserved(16384, 21, 32, false).unwrap() <= WINDOW);
@@ -349,6 +364,14 @@ mod tests {
         let without = reserved_with(16384, 21, 32, false, None).unwrap();
         assert_eq!(with - without, PairObject::MeshStorage.window_bytes(MESH.unwrap()).unwrap());
         assert!(with - without >= 32 * MIB);
+    }
+
+    #[test]
+    fn mesh_storage_counts_at_the_2_gib_edge() {
+        // A pass whose pair the window holds twice only without mesh storage runs on one pair.
+        assert_eq!(pairs(16384, 17, 32, true, None), 2);
+        assert_eq!(pairs(16384, 17, 32, true, MESH), 1);
+        assert_eq!(pairs(16384, 16, 32, true, MESH), 2);
     }
 
     #[test]
