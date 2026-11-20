@@ -881,7 +881,14 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	ps->reset_time_us = t8132 ? APPLE_PMGR_T8132_RESET_TIME : APPLE_PMGR_RESET_TIME;
 	ps->needs_reset_idle_wait = t8132;
 	ps->macos_lower = of_device_is_compatible(node, "apple,t8140-pmgr-pwrstate");
-	ps->no_auto_enable = t8132 && !strict_state;
+	/*
+	 * T8132 domains run without hardware auto-PM, except the GFX domain on the
+	 * qualified 26.6.2 firmware. On other firmware (27.2, 26B123) the GPU
+	 * firmware goes idle right after its boot records, and with AUTO_ENABLE
+	 * set the next host doorbell found it dead with an SError (J713): keep
+	 * GFX in the state Linux requests there.
+	 */
+	ps->no_auto_enable = t8132 && (!strict_state || !apple_t8132_qualified_firmware());
 	ps->strict_state = strict_state;
 
 	ret = of_property_read_string(node, "label", &name);
@@ -1029,6 +1036,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (active && !ps->firmware_owned && !ps->inherited_on && !ps->no_auto_enable)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   ps->no_auto_pm ? 0 : APPLE_PMGR_AUTO_ENABLE);
+	/* GFX off the qualified firmware: drop an AUTO_ENABLE the boot loader left. */
+	else if (active && strict_state && ps->no_auto_enable)
+		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE, 0);
 
 	ret = pm_genpd_init(&ps->genpd, NULL, !active);
 	if (ret < 0) {
