@@ -116,13 +116,12 @@ Build
 On an arm64 Linux build host with the usual kernel build dependencies::
 
   out="$PWD/../j813-build"
-  make ARCH=arm64 O="$out" \
-      KCONFIG_ALLCONFIG=arch/arm64/configs/j813.config allnoconfig
-  make ARCH=arm64 O="$out" -j"$(nproc)" W=1 Image apple/t8142-j813.dtb
+  make ARCH=arm64 LLVM=1 O="$out" aurora_defconfig
+  make ARCH=arm64 LLVM=1 O="$out" -j"$(nproc)" W=1 Image modules apple/t8142-j813.dtb
 
-The fragment does not enable KVM or storage drivers. Add
-``CROSS_COMPILE=aarch64-linux-gnu-`` to both commands when
-cross-compiling with GCC from another architecture.
+``aurora_defconfig`` is the configuration every supported Mac uses. Many
+drivers are modules, so a RAM-only initramfs must carry the ones it needs
+(for a display and keyboard: the DCP and dockchannel HID modules).
 
 With dtschema installed, check the affected bindings and DTB::
 
