@@ -6718,6 +6718,26 @@ static int atcphy_probe_sleep_power(struct apple_atcphy *atcphy)
 }
 
 /*
+ * The AXI2AF bridge in front of the PHY keeps its reset values until its
+ * tunables are written, and until then the fabric branch behind it does not
+ * clock gate. atcphy_apply_tunables() only writes them on the first mode
+ * change, so a port that never sees a cable keeps the reset values for good.
+ * On the T8103 generation, write them as soon as the PHY is reset at probe,
+ * and again on resume in case the bridge lost them in system sleep. A port
+ * behind a fixed hub keeps them for its first SuperSpeed mode change, as in
+ * atcphy_apply_tunables().
+ */
+static void atcphy_apply_axi2af_tunables(struct apple_atcphy *atcphy)
+{
+	lockdep_assert_held(&atcphy->lock);
+
+	if (atcphy->hw->gen != ATCPHY_GENERATION_T8103 || atcphy->fixed_usb2)
+		return;
+
+	apple_tunable_apply(atcphy->regs.axi2af, atcphy->tunables.axi2af);
+}
+
+/*
  * A DisplayPort-only instance has no USB controller to reset and no PIPE: put
  * the PHY in its off state and register the mux, switch and DP PHY.
  */
@@ -6761,6 +6781,7 @@ static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
 	if (!atcphy->hw->usb2_only)
 		atcphy_power_off(atcphy);
 	atcphy_setup_pipehandler(atcphy);
+	atcphy_apply_axi2af_tunables(atcphy);
 
 	/*
 	 * Powering only the USB2 PHY when the controller initialises its PHYs is
@@ -7888,6 +7909,7 @@ static int atcphy_resume(struct device *dev)
 	if (atcphy->idle_rpm && pm_runtime_status_suspended(dev))
 		return 0;
 	atcphy_restore_after_pd_off(atcphy);
+	atcphy_apply_axi2af_tunables(atcphy);
 
 	return 0;
 }

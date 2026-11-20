@@ -205,6 +205,7 @@ static const struct atcphy_mode_configuration *
 atcphy_get_mode_config(struct apple_atcphy *a, enum atcphy_mode m) { (void)a; (void)m; assert(0); return 0; }
 static inline bool pm_runtime_status_suspended(struct device *d) { (void)d; return rpm_suspended; }
 static inline void atcphy_restore_after_pd_off(struct apple_atcphy *a) { (void)a; }
+static inline void atcphy_apply_axi2af_tunables(struct apple_atcphy *a) { (void)a; }
 static void apple_tunable_apply(void *regs, struct apple_tunable *t)
 {
     (void)regs;
