@@ -3045,6 +3045,9 @@ impl SepData {
                     module_parameters::xart_start_sector.value(),
                 )
                 .ok();
+                // diag/xart must not keep reading "enabled" (keystore_only=2
+                // without a guard opened the store writable at probe).
+                diag::xart_state(false, None);
                 return Err(e);
             }
         };

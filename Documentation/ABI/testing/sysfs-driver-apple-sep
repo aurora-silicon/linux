@@ -383,8 +383,8 @@ Contact:        Aurora Silicon maintainers
 Description:
                 Write-only, root-only (0200). Writing 1 completes an attach
                 started with apple_sep.keystore_only=1: opens host state and
-                the identity index on the real root, reopens xART with the
-                configured write and guard policy, and publishes the biometric
+                the identity index on the real root, reopens xART writable
+                with the guard policy, and publishes the biometric
                 devices. Sensor activation still occurs on first device open,
                 just as with a normal attach. No SEP registration is repeated.
                 Successful completion is idempotent. Failed store opens may
