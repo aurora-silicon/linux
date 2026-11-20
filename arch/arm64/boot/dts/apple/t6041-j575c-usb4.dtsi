@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Mac Studio (M4 Max) USB4/Thunderbolt on the fourth back Type-C port.
+ *
+ * ATC0-2 have the routers of t604x-usb4.dtsi, linked to typec0-2 by
+ * t604x-usb4-typec.dtsi. The J575c also wires a fourth router, behind ATC3
+ * (ADT acio3, dart-acio3, acio-cpu3, apciec3, dart-apciec3): the same
+ * blocks as ACIO0-2, 0x8000000 above ACIO2, with their own interrupts. Its
+ * port controller hpm3 (back left, typec3) names acio3 as its router. The
+ * laptops use ATC3 for HDMI and have no acio3.
+ */
+
+/ {
+	aliases {
+		usb4-3-acio = &usb4_3_acio;
+		usb4-3-nhi = &usb4_3_nhi;
+		usb4-3-pcie = &usb4_3_pcie;
+		usb4-3-pcie-adapter = &usb4_3_acio;
+	};
+
+	/* ADT acio-cpu3: the mailbox of the router's coprocessor. */
+	usb4_3_mbox: mailbox@399108000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x99108000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 964 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 965 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 966 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 967 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_atc3_cio>;
+	};
+
+	usb4_3_acio: cio@399ac0000 {
+		compatible = "apple,t6040-usb4-acio";
+		reg = <0x3 0x99ac0000 0x0 0xc000>,
+		      <0x3 0x99080000 0x0 0x26000>,
+		      <0x3 0x99e44000 0x0 0x4000>,
+		      <0x3 0x99100000 0x0 0x4000>;
+		reg-names = "rc", "sram", "pcie-adapter", "cpu";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1935 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "sram-parity";
+		mboxes = <&usb4_3_mbox>;
+		resets = <&cio_reset 3>;
+		pinctrl-names = "lstx";
+		pinctrl-0 = <&usb4_3_lstx_pins>;
+		lstx-gpios = <&pinctrl_aop 55 GPIO_ACTIVE_HIGH>;
+		power-domains = <&ps_atc3_cio>, <&ps_atc3_cio_pcie>,
+				<&ps_atc3_cio_usb>, <&ps_atc3_pcie>;
+		thunderbolt-switch;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x3 0x98000000 0x2000000>;
+		nonposted-mmio;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@1 {
+				reg = <1>;
+				usb4_3_acio_tbt: endpoint {
+					remote-endpoint = <&typec3_con_tbt>;
+				};
+			};
+		};
+
+		usb4_3_dart: iommu@1a80000 {
+			compatible = "apple,t6041-dart", "apple,t8110-dart";
+			reg = <0x1a80000 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1933 IRQ_TYPE_LEVEL_HIGH>;
+			/* ADT dart-acio3 vm-base: NHI rings below 1 TiB + 4 GiB. */
+			apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+		};
+
+		usb4_3_nhi: nhi@1f00000 {
+			compatible = "apple,t6040-usb4-nhi";
+			reg = <0x1f00000 0x100000>;
+			reg-names = "nhi";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1906 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1907 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1908 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1909 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1910 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1911 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1912 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1913 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1914 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1915 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1916 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1917 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1918 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1919 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1920 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1921 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1922 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1923 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1924 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1925 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1926 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1927 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1928 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1929 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "txring0", "txring1", "txring2", "txring3",
+					  "txring4", "txring5", "txring6", "txring7",
+					  "txring8", "txring9", "txring10", "txring11",
+					  "rxring0", "rxring1", "rxring2", "rxring3",
+					  "rxring4", "rxring5", "rxring6", "rxring7",
+					  "rxring8", "rxring9", "rxring10", "rxring11";
+			iommus = <&usb4_3_dart 0>, <&usb4_3_dart 1>,
+				 <&usb4_3_dart 2>, <&usb4_3_dart 3>,
+				 <&usb4_3_dart 4>, <&usb4_3_dart 5>,
+				 <&usb4_3_dart 6>, <&usb4_3_dart 7>,
+				 <&usb4_3_dart 8>, <&usb4_3_dart 9>,
+				 <&usb4_3_dart 10>, <&usb4_3_dart 11>,
+				 <&usb4_3_dart 16>, <&usb4_3_dart 17>,
+				 <&usb4_3_dart 18>, <&usb4_3_dart 19>,
+				 <&usb4_3_dart 20>, <&usb4_3_dart 21>,
+				 <&usb4_3_dart 22>, <&usb4_3_dart 23>,
+				 <&usb4_3_dart 24>, <&usb4_3_dart 25>,
+				 <&usb4_3_dart 26>, <&usb4_3_dart 27>;
+			/* To be filled by the loader. */
+			apple,thunderbolt-drom = [00];
+		};
+	};
+
+	/* Not used yet: the routers run without PCIe tunnels. */
+	usb4_3_pcie_tunnel: usb4-pcie-tunnel-3 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+		status = "disabled";
+
+		apciec3_dart: iommu@39c000000 {
+			compatible = "apple,t6041-dart", "apple,t8110-dart";
+			reg = <0x3 0x9c000000 0x0 0x20000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1702 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+
+		usb4_3_pcie: pcie@1c80000000 {
+			compatible = "apple,t6040-pciec";
+			device_type = "pci";
+			reg = <0x1c 0x80000000 0x0 0x10000000>,
+			      <0x3 0x9c034000 0x0 0x4000>,
+			      <0x3 0x9c020000 0x0 0x8000>,
+			      <0x3 0x9c038000 0x0 0x4000>,
+			      <0x3 0x9c060000 0x0 0x4000>,
+			      <0x3 0x98020000 0x0 0x4000>,
+			      <0x3 0x9c02c000 0x0 0x4000>,
+			      <0x3 0x9c028000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "fabric", "debug",
+				    "ioa", "ltssm", "intr2axi";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1701 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1704 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1705 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1706 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1707 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1708 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "port", "intx-a", "intx-b", "intx-c",
+					  "intx-d", "parity";
+			power-domains = <&ps_atc3_pcie>;
+			msi-controller;
+			msi-parent = <&usb4_3_pcie>;
+			msi-ranges = <&aic AIC_IRQ 2199 IRQ_TYPE_EDGE_RISING 32>;
+			apple,msi-vector-base = <0x80>;
+			iommu-map = <0x0 &apciec3_dart 0x0 0x100>;
+			iommu-map-mask = <0xff>;
+			bus-range = <0x0 0x80>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x14 0x0 0x14 0x0 0x2 0x0>,
+				 <0x02000000 0x0 0x100000 0x16 0x100000 0x0 0x3ff00000>,
+				 <0x42000000 0x0 0x40000000 0x16 0x40000000 0x0 0x40000000>;
+			status = "disabled";
+
+			usb4_3_pcie_port: pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				external-facing;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &usb4_3_pcie_port 0 0 0 0>,
+						<0 0 0 2 &usb4_3_pcie_port 0 0 0 1>,
+						<0 0 0 3 &usb4_3_pcie_port 0 0 0 2>,
+						<0 0 0 4 &usb4_3_pcie_port 0 0 0 3>;
+			};
+		};
+	};
+};
+
+&pinctrl_aop {
+	/* ADT acio3 gpio-lstx. */
+	usb4_3_lstx_pins: usb4-3-lstx-pins {
+		pinmux = <APPLE_PINMUX(55, 1)>;
+	};
+};
+
+&ps_atc3_cio {
+	status = "okay";
+};
+
+&ps_atc3_pcie {
+	status = "okay";
+};
+
+&ps_atc3_cio_pcie {
+	status = "okay";
+};
+
+&ps_atc3_cio_usb {
+	status = "okay";
+};
+
+&typec3 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec3_con_tbt: endpoint {
+				remote-endpoint = <&usb4_3_acio_tbt>;
+			};
+		};
+	};
+};

@@ -1,8 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * T6040 USB4/PCIe-C resource description.
+ * T6040/T6041 USB4/PCIe-C resource description: the routers behind ATC0-2.
  *
- * Every node is disabled here; a board enables the routers it has qualified.
+ * The M4 Pro and M4 Max have the same ACIO, NHI, DART, mailbox and PCIe-C
+ * blocks behind ATC0-2, at the same addresses and interrupts, and every
+ * board of both (J614s, J616s, J773s, J614c, J616c, J575c) wires ACIO0-2 to
+ * three of its Thunderbolt ports. So the routers, their DARTs and NHIs,
+ * mailboxes and power domains are enabled here; t604x-usb4-typec.dtsi links
+ * them to the board's Type-C connectors. The loader hands each router its
+ * router, adapter and NHI tuning and its DROM over. No PCIe tunnels yet: the
+ * routers carry no apple,pcie-tunnel link, so only host-to-host (XDomain,
+ * thunderbolt-net) and USB4 links come up, and the tunnel nodes stay
+ * disabled.
  */
 
 / {
@@ -19,6 +28,52 @@
 		usb4-2-nhi = &usb4_2_nhi;
 		usb4-2-pcie = &usb4_2_pcie;
 		usb4-2-pcie-adapter = &usb4_2_acio;
+	};
+
+	/* ADT acio-cpuN: the mailbox of each router's coprocessor. */
+	usb4_0_mbox: mailbox@381108000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x81108000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 934 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 935 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 936 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 937 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_atc0_cio>;
+		status = "okay";
+	};
+
+	usb4_1_mbox: mailbox@389108000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x89108000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 944 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 945 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 946 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 947 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_atc1_cio>;
+		status = "okay";
+	};
+
+	usb4_2_mbox: mailbox@391108000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x91108000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 954 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 955 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 956 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 957 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_atc2_cio>;
+		status = "okay";
 	};
 
 	usb4_0_acio: cio@381ac0000 {
@@ -39,12 +94,11 @@
 		power-domains = <&ps_atc0_cio>, <&ps_atc0_cio_pcie>,
 				<&ps_atc0_cio_usb>, <&ps_atc0_pcie>;
 		thunderbolt-switch;
-		apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
 		#address-cells = <1>;
 		#size-cells = <1>;
 		ranges = <0x0 0x3 0x80000000 0x2000000>;
 		nonposted-mmio;
-		status = "disabled";
+		status = "okay";
 
 		ports {
 			#address-cells = <1>;
@@ -62,7 +116,9 @@
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1789 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
+			/* ADT dart-acio0 vm-base: the NHI addresses its rings below 1 TiB + 4 GiB. */
+			apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+			status = "okay";
 		};
 
 		usb4_0_nhi: nhi@1f00000 {
@@ -114,7 +170,7 @@
 				 <&usb4_0_dart 26>, <&usb4_0_dart 27>;
 			/* To be filled by the loader. */
 			apple,thunderbolt-drom = [00];
-			status = "disabled";
+			status = "okay";
 		};
 	};
 
@@ -136,12 +192,11 @@
 		power-domains = <&ps_atc1_cio>, <&ps_atc1_cio_pcie>,
 				<&ps_atc1_cio_usb>, <&ps_atc1_pcie>;
 		thunderbolt-switch;
-		apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
 		#address-cells = <1>;
 		#size-cells = <1>;
 		ranges = <0x0 0x3 0x88000000 0x2000000>;
 		nonposted-mmio;
-		status = "disabled";
+		status = "okay";
 
 		ports {
 			#address-cells = <1>;
@@ -159,7 +214,9 @@
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1837 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
+			/* The same DVA window as the ACIO0 router DART. */
+			apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+			status = "okay";
 		};
 
 		usb4_1_nhi: nhi@1f00000 {
@@ -211,7 +268,7 @@
 				 <&usb4_1_dart 26>, <&usb4_1_dart 27>;
 			/* To be filled by the loader. */
 			apple,thunderbolt-drom = [00];
-			status = "disabled";
+			status = "okay";
 		};
 	};
 
@@ -233,12 +290,11 @@
 		power-domains = <&ps_atc2_cio>, <&ps_atc2_cio_pcie>,
 				<&ps_atc2_cio_usb>, <&ps_atc2_pcie>;
 		thunderbolt-switch;
-		apple,pcie-tunnel = <&usb4_2_pcie_tunnel>;
 		#address-cells = <1>;
 		#size-cells = <1>;
 		ranges = <0x0 0x3 0x90000000 0x2000000>;
 		nonposted-mmio;
-		status = "disabled";
+		status = "okay";
 
 		ports {
 			#address-cells = <1>;
@@ -256,7 +312,9 @@
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1885 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
+			/* The same DVA window as the ACIO0 router DART. */
+			apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+			status = "okay";
 		};
 
 		usb4_2_nhi: nhi@1f00000 {
@@ -308,7 +366,7 @@
 				 <&usb4_2_dart 26>, <&usb4_2_dart 27>;
 			/* To be filled by the loader. */
 			apple,thunderbolt-drom = [00];
-			status = "disabled";
+			status = "okay";
 		};
 	};
 
@@ -533,8 +591,7 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 		reg = <0x5 0x02820000 0 0x4000>;
-		/* Enabled together with the routers. */
-		status = "disabled";
+		status = "okay";
 
 		cio_reset: reset-controller@2024 {
 			compatible = "apple,t6041-cio-reset";
@@ -557,4 +614,53 @@
 	usb4_2_lstx_pins: usb4-2-lstx-pins {
 		pinmux = <APPLE_PINMUX(53, 1)>;
 	};
+};
+
+/* The routers' power domains. */
+&ps_atc0_cio {
+	status = "okay";
+};
+
+&ps_atc0_pcie {
+	status = "okay";
+};
+
+&ps_atc0_cio_pcie {
+	status = "okay";
+};
+
+&ps_atc0_cio_usb {
+	status = "okay";
+};
+
+&ps_atc1_cio {
+	status = "okay";
+};
+
+&ps_atc1_pcie {
+	status = "okay";
+};
+
+&ps_atc1_cio_pcie {
+	status = "okay";
+};
+
+&ps_atc1_cio_usb {
+	status = "okay";
+};
+
+&ps_atc2_cio {
+	status = "okay";
+};
+
+&ps_atc2_pcie {
+	status = "okay";
+};
+
+&ps_atc2_cio_pcie {
+	status = "okay";
+};
+
+&ps_atc2_cio_usb {
+	status = "okay";
 };

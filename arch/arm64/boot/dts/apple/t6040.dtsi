@@ -459,55 +459,6 @@
 		apple,sw-drain;
 		status = "disabled";
 	};
-
-	/* ACIO 0 remains disabled until its host-router handoff is supported. */
-	usb4_0_mbox: mailbox@381108000 {
-		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
-		reg = <0x3 0x81108000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 934 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 935 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 936 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 937 IRQ_TYPE_LEVEL_HIGH>;
-		interrupt-names = "send-empty", "send-not-empty",
-				  "recv-empty", "recv-not-empty";
-		#mbox-cells = <0>;
-		power-domains = <&ps_atc0_cio>;
-		status = "disabled";
-	};
-
-	/* ACIO 1 remains disabled until its host-router handoff is supported. */
-	usb4_1_mbox: mailbox@389108000 {
-		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
-		reg = <0x3 0x89108000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 944 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 945 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 946 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 947 IRQ_TYPE_LEVEL_HIGH>;
-		interrupt-names = "send-empty", "send-not-empty",
-				  "recv-empty", "recv-not-empty";
-		#mbox-cells = <0>;
-		power-domains = <&ps_atc1_cio>;
-		status = "disabled";
-	};
-
-	/* ACIO 2 remains disabled until its host-router handoff is supported. */
-	usb4_2_mbox: mailbox@391108000 {
-		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
-		reg = <0x3 0x91108000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 954 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 955 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 956 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 957 IRQ_TYPE_LEVEL_HIGH>;
-		interrupt-names = "send-empty", "send-not-empty",
-				  "recv-empty", "recv-not-empty";
-		#mbox-cells = <0>;
-		power-domains = <&ps_atc2_cio>;
-		status = "disabled";
-	};
-
 };
 
 &avd {
@@ -672,5 +623,3 @@
 				     0x504824000 0x504824004
 				     0x5003c0000 0x5003e4000>;
 };
-
-#include "t6040-usb4.dtsi"
