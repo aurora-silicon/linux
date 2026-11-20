@@ -41,28 +41,73 @@ fn checked_offset(base: usize, bytes: usize, address: usize, size: usize) -> Res
 
 /// `size` bytes at `offset` of the firmware's data segment, mapped write-back.
 pub(super) struct DataSegmentLog {
-    mem: io::mem::Mem,
+    mem: Mapping,
     offset: usize,
     size: usize,
 }
+
+/// The CPU mapping behind a [`DataSegmentLog`].
+enum Mapping {
+    /// The described `fw-data` region.
+    Region(io::mem::Mem),
+    /// Firmware memory outside the kernel's RAM where no region is described (T8103 on 27.2).
+    Raw(*mut u8),
+}
+
+unsafe extern "C" {
+    fn asahi_map_fw_buffer(phys: kernel::bindings::phys_addr_t, size: usize) -> *mut core::ffi::c_void;
+    fn asahi_unmap_fw_buffer(ptr: *mut core::ffi::c_void);
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        if let Mapping::Raw(ptr) = self {
+            // SAFETY: `ptr` came from asahi_map_fw_buffer and is unmapped once.
+            unsafe { asahi_unmap_fw_buffer(ptr.cast()) };
+        }
+    }
+}
+
+// SAFETY: The raw mapping is plain memory owned by this value.
+unsafe impl Send for Mapping {}
+// SAFETY: As above; access goes through `&mut self`.
+unsafe impl Sync for Mapping {}
 
 impl DataSegmentLog {
     /// Maps the `size` bytes at physical address `iova` that the firmware asked for, which
     /// must lie inside the `fw-data` region of `dev`.
     pub(super) fn map(dev: &device::Device, iova: usize, size: usize) -> Result<Self> {
         let node = dev.of_node().ok_or(EINVAL)?;
-        let res = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
+        let res = match node.reserved_mem_region_to_resource_byname(c_str!("fw-data")) {
+            Ok(res) => res,
+            Err(_) => {
+                if size == 0 || size > 0x10_0000 {
+                    return Err(EINVAL);
+                }
+                // SAFETY: The helper refuses ranges that touch the kernel's RAM.
+                let ptr = unsafe { asahi_map_fw_buffer(iova as kernel::bindings::phys_addr_t, size) };
+                if ptr.is_null() {
+                    return Err(ENODATA);
+                }
+                return Ok(Self { mem: Mapping::Raw(ptr.cast()), offset: 0, size });
+            }
+        };
         let offset = checked_offset(res.start().try_into()?, res.size().try_into()?, iova, size)?;
         // SAFETY: The boot loader reserved this RAM for the loaded GPU firmware, which keeps
         // it until reboot; only the requested subrange is exposed.
         let mem = unsafe { io::mem::Mem::try_new(res, io::mem::MemFlag::WB.into())? };
-        Ok(Self { mem, offset, size })
+        Ok(Self { mem: Mapping::Region(mem), offset, size })
     }
 
     /// The CPU view of the buffer.
     pub(super) fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
         // SAFETY: map() checked that the range lies inside the mapping.
-        let base = unsafe { self.mem.ptr().add(self.offset) };
+        let base = unsafe {
+            match &self.mem {
+                Mapping::Region(mem) => mem.ptr().add(self.offset),
+                Mapping::Raw(ptr) => ptr.add(self.offset),
+            }
+        };
         let ptr = Region::<0>::ptr_try_from_raw_parts_mut(base, self.size)?;
         // SAFETY: The range is mapped RAM for as long as this borrow of the mapping.
         Ok(IoSysMap::Sys(unsafe { io::SysMem::new(ptr) }))
