@@ -803,6 +803,16 @@ impl Buffer::ver {
             {
                 let id = slot.slot() as i32;
                 inner.info.with_mut(|raw, _inner| raw.last_id = id);
+                // A slot the hardware last used for another buffer: start this buffer's
+                // descriptor over, so the setup command rebuilds it from the block list
+                // instead of finding nothing new and keeping the other buffer's.
+                if rebind {
+                    inner.info.with(|raw, _inner| {
+                        raw.page_count.store(0, Ordering::Relaxed);
+                        raw.block_count.store(0, Ordering::Relaxed);
+                        raw.last_page.store(u32::MAX, Ordering::Relaxed);
+                    });
+                }
             }
             inner.active_slot = Some(slot);
         }
