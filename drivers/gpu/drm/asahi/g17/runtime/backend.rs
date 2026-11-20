@@ -209,7 +209,8 @@ impl job::Backend for Backend {
                 // The M5 target layout refuses the passes the M5 path cannot run. Derive it
                 // here, so that SUBMIT returns the refusal before anything is queued.
                 crate::g17::queue::render::m5_render_submission::layout(
-                    command, self.shared.clusters, self.shared.variant.programs)?;
+                    command, self.shared.clusters, self.shared.variant.programs,
+                    self.shared.m5_board)?;
             }
             Validated::Compute { resources, plan, m5_scratch, cdm_auxiliary_allocation, .. } => {
                 if let Some(programs) = resources {
