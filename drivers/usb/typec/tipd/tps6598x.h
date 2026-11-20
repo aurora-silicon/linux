@@ -357,6 +357,10 @@ struct tipd_data {
 struct tps6598x {
 	/* Native H17 routes retain ENOSPC admission and their own HPD path. */
 	u8 h17_display:1;
+	/* On the list tipd_port_replug() looks a port up on, by its role switch; its replug. */
+	struct list_head port_node;
+	struct work_struct replug_work;
+	u8 replug_seconds;
 	struct device *dev;
 	struct regmap *regmap;
 	struct mutex lock; /* device lock */
@@ -498,6 +502,8 @@ struct sn201202x {
 	struct cd321x cd;
 	bool polled;
 	bool select_polled;
+	/* Sleeps while idle: its event interrupt stays live while it sleeps */
+	bool idle_sleep;
 	struct completion select_completion;
 	struct completion sleep_completion;
 	struct completion wake_completion;
