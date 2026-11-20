@@ -163,6 +163,12 @@ pub(crate) struct Queue {
     stats: Arc<stats::StatsSnapshot>,
     /// Finished fence of the last submitted job, waited for when the queue goes away.
     last_out: Option<Fence>,
+    /// Finished fences of the submissions with a render that may still use the TVB buffer: those
+    /// after the newest one that completed without error. See [`Queue::ver::wait_tvb_idle`].
+    tvb_users: KVec<Fence>,
+    /// The TVB grew since the last render this queue published, so the next render must
+    /// re-initialise the buffer slot. Cleared only once a render with that init is pushed.
+    tvb_init_pending: bool,
 }
 
 #[versions(AGX)]
@@ -598,6 +604,8 @@ impl Queue::ver {
             fence_ctx: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
             stats,
             last_out: None,
+            tvb_users: KVec::new(),
+            tvb_init_pending: false,
             inner: QueueInner::ver {
                 dev: dev.clone(),
                 ualloc,
@@ -727,6 +735,26 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
     Ok(attachments)
 }
 
+/// Status of `fence`: 0 while pending, 1 once signalled without error, a negative errno once
+/// signalled with an error.
+fn fence_status(fence: &Fence) -> i32 {
+    // SAFETY: `fence` owns a live dma_fence reference for the duration of the call.
+    unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) }
+}
+
+/// Waits for `fence` to signal. Returns `Ok(false)` if `timeout` (in jiffies) ran out first, and
+/// `ERESTARTSYS` if `interruptible` and a signal arrived.
+fn wait_fence(fence: &Fence, interruptible: bool, timeout: kernel::ffi::c_long) -> Result<bool> {
+    // SAFETY: `fence` holds a reference for the duration of the call. The callers hold no lock
+    // that its completion needs.
+    let ret = unsafe { kernel::bindings::dma_fence_wait_timeout(fence.raw(), interruptible, timeout) };
+    if ret < 0 {
+        Err(Error::from_errno(ret as i32))
+    } else {
+        Ok(ret > 0)
+    }
+}
+
 #[versions(AGX)]
 impl Queue::ver {
     /// Waits, for at most [`QUEUE_CLOSE_WAIT_MS`], for the last submitted job to finish. The
@@ -735,16 +763,8 @@ impl Queue::ver {
         let Some(fence) = self.last_out.as_ref() else {
             return;
         };
-        // SAFETY: `fence` holds a reference for the duration of the call. No lock is held,
-        // so completion can signal it.
-        let left = unsafe {
-            kernel::bindings::dma_fence_wait_timeout(
-                fence.raw(),
-                false,
-                kernel::time::msecs_to_jiffies(QUEUE_CLOSE_WAIT_MS) as _,
-            )
-        };
-        if left == 0 {
+        let timeout = kernel::time::msecs_to_jiffies(QUEUE_CLOSE_WAIT_MS) as kernel::ffi::c_long;
+        if let Ok(false) = wait_fence(fence, false, timeout) {
             dev_warn!(
                 self.dev.as_ref(),
                 "[Queue {}] Closing with work still running after {} ms\n",
@@ -753,35 +773,36 @@ impl Queue::ver {
             );
         }
     }
-}
 
-#[versions(AGX)]
-impl Queue::ver {
-    /// Waits, for at most [`QUEUE_CLOSE_WAIT_MS`], for this queue's earlier work to complete before
-    /// its TVB buffer is grown.
-    fn wait_last_out_for_grow(&self) -> Result {
-        let Some(fence) = self.last_out.as_ref() else {
-            return Ok(());
-        };
-        // SAFETY: `fence` holds a reference for the duration of the call. No lock is held that its
-        // completion needs.
-        let left = unsafe {
-            kernel::bindings::dma_fence_wait_timeout(
-                fence.raw(),
-                false,
-                kernel::time::msecs_to_jiffies(QUEUE_CLOSE_WAIT_MS) as _,
-            )
-        };
-        if left <= 0 {
-            dev_err!(
-                self.dev.as_ref(),
-                "[Queue {}] Earlier work still running after {} ms, cannot grow the TVB\n",
-                self.inner.id,
-                QUEUE_CLOSE_WAIT_MS
-            );
-            return Err(ETIMEDOUT);
+    /// Drops the entries of [`Self::tvb_users`] that no longer show a possible TVB user.
+    ///
+    /// Renders complete in order on the fragment queue, and a submission's finished fence covers
+    /// all of its commands, so a submission that completed without error proves that every render
+    /// submitted before it is done: it and all older entries go. A fence that signalled with an
+    /// error proves nothing about the submissions before it (it may have failed in `run()` before
+    /// reaching the firmware while they still run), so only that entry goes and the older ones
+    /// stay. What is left is pending.
+    fn prune_tvb_users(&mut self) {
+        if let Some(done) = self.tvb_users.iter().rposition(|f| fence_status(f) == 1) {
+            self.tvb_users.drain(..=done);
         }
-        Ok(())
+        self.tvb_users.retain(|f| fence_status(f) == 0);
+    }
+
+    /// Waits until no earlier submission of this queue can still be using its TVB buffer.
+    ///
+    /// The wait is interruptible and has no time limit of its own: earlier work may legitimately
+    /// run long (or wait on its own in-fences), and the scheduler's timeout covers a hung job. A
+    /// signal returns `ERESTARTSYS`. Nothing of the current submission is published yet when this
+    /// runs, so the ioctl restarts cleanly.
+    fn wait_tvb_idle(&mut self) -> Result {
+        loop {
+            self.prune_tvb_users();
+            let Some(fence) = self.tvb_users.last().cloned() else {
+                return Ok(());
+            };
+            wait_fence(&fence, true, kernel::task::MAX_SCHEDULE_TIMEOUT)?;
+        }
     }
 }
 
@@ -823,47 +844,6 @@ impl Queue for Queue::ver {
             );
             return Err(ENODEV);
         }
-
-        let op_guard = if in_sync_count > 0 {
-            Some(gpu.start_op()?)
-        } else {
-            None
-        };
-
-        let mut events: [KVec<Option<workqueue::QueueEventInfo::ver>>; SQ_COUNT] =
-            Default::default();
-
-        events[SQ_RENDER].push(
-            self.q_frag.as_ref().and_then(|a| a.wq.event_info()),
-            GFP_KERNEL,
-        )?;
-        events[SQ_COMPUTE].push(
-            self.q_comp.as_ref().and_then(|a| a.wq.event_info()),
-            GFP_KERNEL,
-        )?;
-
-        let vm_bind = gpu.bind_vm(&self.vm)?;
-        let vm_slot = vm_bind.slot();
-
-        mod_dev_dbg!(self.dev, "[Submission {}] Creating job\n", id);
-
-        // FIXME: I think this can violate the fence seqno ordering contract.
-        // If we have e.g. a render submission with no barriers and then a compute submission
-        // with no barriers, it's possible for the compute submission to complete first, and
-        // therefore its fence. Maybe we should have separate fence contexts for render
-        // and compute, and then do a ? (Vert+frag should be fine since there is no vert
-        // without frag, and frag always serializes.)
-        let fence: UserFence<JobFence::ver> = self
-            .fence_ctx
-            .new_fence::<JobFence::ver>(
-                0,
-                JobFence::ver {
-                    id,
-                    pending: Default::default(),
-                    stats: Some(self.stats.clone()),
-                },
-            )?
-            .into();
 
         let mut cmdbuf = Reader::new(cmdbuf_raw);
 
@@ -924,30 +904,95 @@ impl Queue for Queue::ver {
             }
         }
 
+        // Validate the number of hardware commands, ignoring software commands
+        let nr_hw_commands = nr_render + nr_compute;
+        if nr_hw_commands == 0 || nr_hw_commands > MAX_COMMANDS_PER_SUBMISSION {
+            cls_pr_debug!(
+                Errors,
+                "submit: Command count {} out of valid range [1, {}]\n",
+                nr_hw_commands,
+                MAX_COMMANDS_PER_SUBMISSION - 1
+            );
+            return Err(EINVAL);
+        }
+
         // The firmware buffer manager owns a TVB buffer while scenes on it are in flight. Growing
         // it then (new blocks in its block list plus an InitBuffer of its bound slot) corrupts the
         // tiling of those scenes: on G13 clustered rendering the tiler writes to VA 0. So size the
         // buffer for every render of this submission before any of it is published, and only once
-        // this queue's earlier work, the only other user of the buffer, has completed. A required
-        // grow waits for that work. A grow from the overflow statistics is only an optimisation
-        // (the firmware handles a full heap itself), so it waits for an idle queue instead.
-        let mut tvb_grown = false;
+        // no earlier render of this queue (the only other user of the buffer) can still use it.
+        // The size the overflow statistics ask for is folded in, so that growth from them also
+        // happens on a busy queue, with one wait per growth step (3x each).
         if nr_render > 0 {
-            let busy = self.last_out.as_ref().is_some_and(|fence| {
-                // SAFETY: `last_out` owns the live dma_fence reference used for this query.
-                unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) == 0 }
-            });
-            let need = max_tvb_blocks > self.inner.buffer.block_count() as usize;
-            if need && busy {
-                self.wait_last_out_for_grow()?;
-            }
-            if need || !busy {
-                if !busy {
-                    tvb_grown |= self.inner.buffer.auto_grow_idle()?;
+            let cur_blocks = self.inner.buffer.block_count() as usize;
+            let stats_blocks = self.inner.buffer.stats_target_blocks();
+            let want_blocks = max_tvb_blocks.max(stats_blocks.unwrap_or(0));
+            if want_blocks > cur_blocks {
+                self.wait_tvb_idle()?;
+                if self.inner.buffer.ensure_blocks_idle(want_blocks)? {
+                    self.tvb_init_pending = true;
+                    if stats_blocks.is_some() {
+                        self.inner.buffer.reset_stats();
+                    }
+                    cls_dev_dbg!(
+                        TVBStats,
+                        &self.dev,
+                        "[Submission {}] TVB grew from {} to {} blocks ({} bytes): dimensions need {}, overflows ask {}\n",
+                        id,
+                        cur_blocks,
+                        want_blocks,
+                        want_blocks * buffer::BLOCK_SIZE,
+                        max_tvb_blocks,
+                        stats_blocks.unwrap_or(0),
+                    );
                 }
-                tvb_grown |= self.inner.buffer.ensure_blocks_idle(max_tvb_blocks)?;
             }
+            // Room for this submission's entry, so that recording it cannot fail once published.
+            self.tvb_users.reserve(1, GFP_KERNEL)?;
         }
+
+        let op_guard = if in_sync_count > 0 {
+            Some(gpu.start_op()?)
+        } else {
+            None
+        };
+
+        let mut events: [KVec<Option<workqueue::QueueEventInfo::ver>>; SQ_COUNT] =
+            Default::default();
+
+        events[SQ_RENDER].push(
+            self.q_frag.as_ref().and_then(|a| a.wq.event_info()),
+            GFP_KERNEL,
+        )?;
+        events[SQ_COMPUTE].push(
+            self.q_comp.as_ref().and_then(|a| a.wq.event_info()),
+            GFP_KERNEL,
+        )?;
+
+        let vm_bind = gpu.bind_vm(&self.vm)?;
+        let vm_slot = vm_bind.slot();
+
+        mod_dev_dbg!(self.dev, "[Submission {}] Creating job\n", id);
+
+        // FIXME: I think this can violate the fence seqno ordering contract.
+        // If we have e.g. a render submission with no barriers and then a compute submission
+        // with no barriers, it's possible for the compute submission to complete first, and
+        // therefore its fence. Maybe we should have separate fence contexts for render
+        // and compute, and then do a ? (Vert+frag should be fine since there is no vert
+        // without frag, and frag always serializes.)
+        let fence: UserFence<JobFence::ver> = self
+            .fence_ctx
+            .new_fence::<JobFence::ver>(
+                0,
+                JobFence::ver {
+                    id,
+                    pending: Default::default(),
+                    stats: Some(self.stats.clone()),
+                },
+            )?
+            .into();
+
+        let mut init_slot = self.tvb_init_pending;
 
         let mut job = self.entity.new_job(
             1,
@@ -997,18 +1042,6 @@ impl Queue for Queue::ver {
                     unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) != 0 };
                 job.add_dependency(fence)?;
             }
-        }
-
-        // Validate the number of hardware commands, ignoring software commands
-        let nr_hw_commands = nr_render + nr_compute;
-        if nr_hw_commands == 0 || nr_hw_commands > MAX_COMMANDS_PER_SUBMISSION {
-            cls_pr_debug!(
-                Errors,
-                "submit: Command count {} out of valid range [1, {}]\n",
-                nr_hw_commands,
-                MAX_COMMANDS_PER_SUBMISSION - 1
-            );
-            return Err(EINVAL);
         }
 
         cmdbuf.rewind();
@@ -1082,7 +1115,7 @@ impl Queue for Queue::ver {
                         objects,
                         id,
                         command_index == last_render,
-                        core::mem::take(&mut tvb_grown),
+                        core::mem::take(&mut init_slot),
                     )?;
                     events[SQ_RENDER].push(
                         Some(
@@ -1176,6 +1209,16 @@ impl Queue for Queue::ver {
             job.id
         );
         job.push();
+
+        if nr_render > 0 {
+            // The first render of the job carries the slot init, if one was pending.
+            self.tvb_init_pending = false;
+            self.prune_tvb_users();
+            if self.tvb_users.push_within_capacity(out_fence.clone()).is_err() {
+                // The space was reserved above and pruning only removes entries.
+                unreachable!("push_within_capacity() failed after reserve()");
+            }
+        }
 
         mod_dev_dbg!(
             self.dev,

@@ -442,18 +442,17 @@ impl Buffer::ver {
         self.inner.lock().blocks.len() as u32
     }
 
-    /// Grow the Buffer based on feedback from the statistics, while the firmware is not using it.
+    /// Size the overflow statistics ask for, in blocks, or `None` if the buffer is big enough.
     ///
-    /// The caller guarantees that all work that used this buffer has completed, so the new size is
-    /// published to the firmware even though scenes of completed jobs may still be held.
-    pub(crate) fn auto_grow_idle(&self) -> Result<bool> {
+    /// This only reads the statistics: the firmware keeps accumulating them until
+    /// [`Self::reset_stats`], so a caller that cannot grow the buffer yet sees the same request
+    /// again on its next submission. If the buffer needs more than twice the pages it peaked at,
+    /// this asks for three times that (same logic as macOS).
+    pub(crate) fn stats_target_blocks(&self) -> Option<usize> {
         let inner = self.inner.lock();
 
-        let used_pages = inner.stats.with(|raw, _inner| {
-            let used = raw.max_pages.load(Ordering::Relaxed);
-            raw.reset.store(1, Ordering::Release);
-            used as usize
-        });
+        let used_pages =
+            inner.stats.with(|raw, _inner| raw.max_pages.load(Ordering::Relaxed) as usize);
 
         let need_blocks = (used_pages * 2)
             .div_ceil(PAGES_PER_BLOCK)
@@ -462,16 +461,13 @@ impl Buffer::ver {
             .div_ceil(PAGES_PER_BLOCK)
             .min(inner.max_blocks_nomemless);
 
-        let cur_count = inner.blocks.len();
+        (need_blocks > inner.blocks.len()).then_some(want_blocks)
+    }
 
-        if need_blocks <= cur_count {
-            Ok(false)
-        } else {
-            // Grow to 3x requested size (same logic as macOS)
-            core::mem::drop(inner);
-            self.ensure_blocks_idle(want_blocks)?;
-            Ok(true)
-        }
+    /// Asks the firmware to restart the overflow statistics, after the buffer grew for them.
+    pub(crate) fn reset_stats(&self) {
+        let inner = self.inner.lock();
+        inner.stats.with(|raw, _inner| raw.reset.store(1, Ordering::Release));
     }
 
     /// Synchronously grow the Buffer.
