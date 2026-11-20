@@ -6,9 +6,12 @@ A DART probes as a device of its own. Without its engine's power state it can be
 probed, and read, while the block it sits in is off, which takes an SError. The
 DART has no power gate of its own; the engine's covers it. So every node with an
 "apple,*dart*" compatible must have power-domains, and no DART may name a power
-state that is disabled in that DTB, whatever the DART's own status: the boot
-loader enables DARTs (the display's, for one) that the DTB leaves disabled, and
-such a DART would then wait for its state forever.
+state that is disabled in that DTB. That holds for a disabled DART too when a
+device that uses it is enabled: the boot loader enables such DARTs (the
+display's, for one) when it hands their device over, and the DART would then
+wait for its state forever. A disabled DART that no enabled device uses (a
+device is enabled when it and every node above it are okay) is skipped: the
+block is off as a whole, which is consistent.
 
 Exempt: the DARTs of the SEP and of the AOP. Those coprocessors run from
 before the handoff on states the AP never switches off.
@@ -70,6 +73,18 @@ def findings(filename):
     def status(offset):
         return (strings(prop(offset, "status")) or ["okay"])[0]
 
+    offsets = {path: offset for offset, path in nodes.items()}
+
+    def enabled(offset):
+        """The node and every node above it are okay."""
+        path = nodes[offset]
+        while True:
+            if status(offsets[path]) != "okay":
+                return False
+            if path == "/":
+                return True
+            path = path.rsplit("/", 1)[0] or "/"
+
     soc = [c for c in strings(prop(0, "compatible")) if SOC.match(c)]
     yield soc[0] if soc else None
 
@@ -103,6 +118,9 @@ def findings(filename):
     for offset, path in nodes.items():
         compatible = strings(prop(offset, "compatible"))
         if not any(DART.match(c) for c in compatible):
+            continue
+        # A disabled DART that no enabled device uses stays off with its block.
+        if status(offset) != "okay" and not any(enabled(o) for o in consumers.get(offset, [])):
             continue
         label = labels.get(path, "-")
         domains = cells(prop(offset, "power-domains"))
