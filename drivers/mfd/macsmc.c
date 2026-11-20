@@ -73,8 +73,11 @@ MODULE_PARM_DESC(j613_wktp2,
  * info and writes it, four bytes, 0x00000100, about 241 ms after slpw and 3.2 ms before WKTP=2.
  * It writes the same value again 16 ms after a wake, after MBSE=waka.
  */
+static bool j613_saved;
+module_param(j613_saved, bool, 0444);
 static bool j613_pmvc;
 module_param(j613_pmvc, bool, 0600);
+MODULE_PARM_DESC(j613_saved, "J613 trial: the bounded, IRQ-independent SMC transport J813's late notice uses");
 MODULE_PARM_DESC(j613_pmvc,
 		 "J613: write pmVC=0x100 after the SMC's sleep warning and after waka, as macOS does");
 #define J613_PMVC	0x00000100
@@ -680,6 +683,10 @@ static int apple_smc_probe(struct platform_device *pdev)
 	/* J813's late notice needs the bounded, IRQ-independent transport too. */
 	if (of_machine_is_compatible("apple,j813"))
 		smc->saved_enabled = true;
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
+	if (j613_saved && of_machine_is_compatible("apple,j613"))
+		smc->saved_enabled = true;
+#endif
 	smc->sram_base = devm_platform_get_and_ioremap_resource(pdev, 1, &smc->sram);
 	if (IS_ERR(smc->sram_base))
 		return dev_err_probe(dev, PTR_ERR(smc->sram_base), "Failed to map SRAM region");

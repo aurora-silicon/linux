@@ -1846,10 +1846,21 @@ module_param_named(j813_smc_late, sleep_j813_smc_late, bool, 0444);
 MODULE_PARM_DESC(j813_smc_late,
 		 "TEST ONLY: J813 final SMC sleep notice after peer stops");
 
+/*
+ * J613 trial: macOS sends MBSE=slpa and the AP-idle notice after every coprocessor stop, about
+ * 3 ms before the commit (capture run 51); the default path sends them in the SMC's noirq
+ * suspend, before the stops. This takes J813's deferred notice (with macsmc.j613_saved).
+ */
+static bool sleep_j613_smc_late;
+module_param_named(j613_smc_late, sleep_j613_smc_late, bool, 0444);
+MODULE_PARM_DESC(j613_smc_late,
+		 "J613 trial: the final SMC sleep notice after the coprocessor stops, as macOS (J813's path)");
+
 bool apple_sleep_smc_defer_notice(void)
 {
-	return apple_sleep && READ_ONCE(sleep_j813_smc_late) &&
-		of_machine_is_compatible("apple,j813") && pm_suspend_via_firmware();
+	return apple_sleep && pm_suspend_via_firmware() &&
+		((READ_ONCE(sleep_j813_smc_late) && of_machine_is_compatible("apple,j813")) ||
+		 (READ_ONCE(sleep_j613_smc_late) && of_machine_is_compatible("apple,j613")));
 }
 EXPORT_SYMBOL_GPL(apple_sleep_smc_defer_notice);
 
