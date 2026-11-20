@@ -1458,19 +1458,18 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 
 /*
  * Whether this DRM device has no DCP components, only T8132 external outputs:
- * a main DCP or a dcpext serves the fixed HDMI port (the Mac mini).
+ * the fixed HDMI port, driven by the main DCP or by a handed-over dcpext (the
+ * Mac mini).
  */
 static bool apple_t8132_main_external_present(void)
 {
-	struct device_node *np = of_find_compatible_node(NULL, NULL,
-							 "apple,t8132-dcp");
-	bool present = dcp_t8132_main_external(np) && of_device_is_available(np);
+	struct device_node *np;
+	bool present = false;
 
-	of_node_put(np);
-	for_each_compatible_node(np, NULL, "apple,t8132-dcpext") {
-		if (!present && dcp_t8132_fixed_hdmi(np) && of_device_is_available(np))
-			present = true;
-	}
+	for_each_compatible_node(np, NULL, "apple,t8132-dcp")
+		present = present || (dcp_t8132_main_external(np) && of_device_is_available(np));
+	for_each_compatible_node(np, NULL, "apple,t8132-dcpext")
+		present = present || dcp_t8132_fixed_hdmi(np);
 	return present;
 }
 
@@ -1483,6 +1482,7 @@ static bool apple_t8132_main_external_present(void)
 static bool apple_dcp_usable(struct device_node *np)
 {
 	return of_device_is_available(np) && !dcp_t8132_main_external(np) &&
+	       !dcp_t8132_main_hdmi_idle(np) &&
 	       (!of_device_is_compatible(np, "apple,t6030-dcpext") ||
 		dcp_t6030_ext_native(np)) &&
 	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
