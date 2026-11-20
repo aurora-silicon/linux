@@ -863,6 +863,8 @@ struct apple_dcp {
 
 	/* clear all surfaces on init */
 	bool surfaces_cleared;
+	bool boot_surface_pending;
+	bool boot_scanout_reserved;
 
 	/* enable CRC calculation */
 	bool crc_enabled;

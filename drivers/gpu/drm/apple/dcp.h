@@ -82,8 +82,8 @@ int dcp_peer_stop_v27(struct apple_dcp *dcp);
 struct apple_dcp *dcp_peer_scanout_v27(struct apple_dcp *dcp);
 void dcp_peer_swap_armed_v27(struct apple_dcp *dcp, u32 id);
 void dcp_peer_swap_failed_v27(struct apple_dcp *dcp);
-bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now,
-		void (*report)(struct apple_dcp *, u32, ktime_t));
+bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now, bool shown,
+				void (*report)(struct apple_dcp *, u32, ktime_t, bool));
 int dcp_set_crc(struct drm_crtc *crtc, bool enabled);
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
 int dcp_get_connector_type(struct platform_device *pdev);
@@ -105,6 +105,7 @@ void dcp_ext26_open_services(struct apple_dcp *dcp);
 int dcp_ext26_layout_stop(struct apple_dcp *dcp);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
+bool dcp_boot_surface_pending(struct platform_device *pdev);
 bool dcp_hdr_metadata_live(struct platform_device *pdev);
 bool dcp_edr_live(struct platform_device *pdev);
 void dcp_retain_framebuffer(struct platform_device *pdev,

@@ -23,6 +23,7 @@
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/display.h>
 #include <linux/soc/apple/dp-tunnel.h>
+#include <linux/soc/apple/mcc.h>
 #include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -6104,6 +6105,19 @@ static int dcp_firmware_metadata_v27(struct apple_dcp *dcp)
 	dcp->dfb_region_size = resource_size(&resource);
 	if (!dcp->dfb_region_size)
 		return -EINVAL;
+	/*
+	 * The boot surface is on screen until a displayed swap of ours
+	 * replaces it. Reserve its retirement record before any present.
+	 * Without the record the display still takes over, and a cache
+	 * controller waiting on it keeps allocation off.
+	 */
+	ret = apple_mcc_boot_scanout_reserve(dev->of_node);
+	if (ret == -ENOMEM)
+		dev_warn(dev, "no boot scanout record: system cache allocation stays off\n");
+	else if (ret)
+		return ret;
+	dcp->boot_scanout_reserved = !ret;
+	WRITE_ONCE(dcp->boot_surface_pending, true);
 
 clocks:
 	/*
