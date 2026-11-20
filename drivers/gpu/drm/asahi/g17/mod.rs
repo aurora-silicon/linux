@@ -1009,7 +1009,7 @@ impl Firmware {
         effort: u32,
     ) -> Result {
         // The performance-controller demand follows the requested effort; the firmware is
-        // given, and the state records, the M5 value (InitData::submission_effort).
+        // given, and the state records, the published value (InitData::submission_effort).
         let published = init.submission_effort(effort, state.waited());
         port.set_effort_full(effort == power::FULL_EFFORT);
         if state.applied() == published {

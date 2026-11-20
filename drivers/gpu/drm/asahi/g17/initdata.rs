@@ -1671,13 +1671,19 @@ impl InitData {
         self.m5
     }
 
-    /// The effort value the firmware is given for a requested `effort`. M5 publishes none while
-    /// work streams, except while a host thread waits for it (`waited`): then the full effort,
-    /// which the firmware takes as a floor for its performance state, so a submit-and-wait loop
-    /// runs at the top state.
+    /// The effort value the firmware is given for a requested `effort`. The firmware takes the
+    /// effort as a floor for its performance state. M5 publishes none while work streams, except
+    /// while a host thread waits for it (`waited`): then the full effort, so a submit-and-wait
+    /// loop runs at the top state.
+    ///
+    /// The other G17 SoCs publish none at all and leave the state to the firmware's own
+    /// controller. On T6041 (25G83), the full effort held the top state whatever the load: in
+    /// CS2 capped at 120 fps the GPU stayed at state 10 with it and ran at states 4-7 without
+    /// it, at the same frame rate. The wait exception doesn't help there, because a game always
+    /// has a host thread waiting on one of its fences.
     pub(super) fn submission_effort(&self, effort: u32, waited: bool) -> u32 {
-        if self.m5 && !waited { 0 }
-        else { effort }
+        if self.m5 && waited { effort }
+        else { 0 }
     }
 
     /// Writes the effort input in firmware order, then cleans its cache line to coherency.
