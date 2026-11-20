@@ -535,7 +535,13 @@ impl Allocator for SimpleAllocator {
             offset
         );
 
-        let mut obj = crate::gem::new_kernel_object(&self.dev, size_aligned)?;
+        let mut obj = if self.prot.is_uncached() && crate::module_parameters::t8112_g13_wc.value() != 0 {
+            // T8103 27.2 bring-up: that firmware reads its uncached mappings without snooping,
+            // so the host side must not keep them in its caches.
+            crate::gem::new_kernel_object_wc(&self.dev, size_aligned)?
+        } else {
+            crate::gem::new_kernel_object(&self.dev, size_aligned)?
+        };
         let p = obj.vmap()?.addr.cast::<u8>();
         if debug_enabled(DebugFlags::FillAllocations) {
             let obj_size = obj.size();
@@ -789,7 +795,13 @@ impl HeapAllocator {
             );
         }
 
-        let mut obj = crate::gem::new_kernel_object(&self.dev, size_aligned)?;
+        let mut obj = if self.prot.is_uncached() && crate::module_parameters::t8112_g13_wc.value() != 0 {
+            // T8103 27.2 bring-up: that firmware reads its uncached mappings without snooping,
+            // so the host side must not keep them in its caches.
+            crate::gem::new_kernel_object_wc(&self.dev, size_aligned)?
+        } else {
+            crate::gem::new_kernel_object(&self.dev, size_aligned)?
+        };
         if self.cpu_maps && debug_enabled(DebugFlags::FillAllocations) {
             let obj_size = obj.size();
             if let Ok(vmap) = obj.vmap() {

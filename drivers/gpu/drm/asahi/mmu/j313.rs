@@ -182,7 +182,9 @@ impl Uat {
                             word, r.runtime_pointers, r.status_record);
                         pgtable::clean_poc(core::ptr::from_ref(r).cast(), core::mem::size_of_val(r));
                     });
-                    candidate.dump_images(device);
+                    if module_parameters::t8112_g13_dump.value() == 1 {
+                        candidate.dump_images(device);
+                    }
                     let address = candidate.gpu_va().get();
                     modern = Some(candidate);
                     address
@@ -422,7 +424,9 @@ impl Uat {
                                             if state.0 == [target; 3] && root.idle_acknowledgement()? == generation {
                                                 return Ok(());
                                             }
-                                            if start.elapsed() >= Delta::from_millis(500) {
+                                            // G13G's first scheduler pass follows its first DVFS
+                                            // transition and power-controller start.
+                                            if start.elapsed() >= Delta::from_millis(3000) {
                                                 return Err(ETIMEDOUT);
                                             }
                                             fsleep(Delta::from_millis(1));
@@ -623,6 +627,9 @@ impl Uat {
                 dev_info!(device, "G13G stopped command service (stage, request)={:?}\n", root.command_service());
                 root.report_stopped_fence();
                 root.report_stopped_receive();
+                        if module_parameters::t8112_g13_dump.value() == 2 {
+                            root.dump_images(device);
+                        }
                 let (cold, started, ready) = root.stopped_status();
                 dev_info!(device, "G13G final shared status cold={} started={} ready={}\n",
                           cold, started, ready);

@@ -1616,8 +1616,9 @@ impl G13TrialRoot {
                     let page_end = page_start.checked_add(span as u64).ok_or(EOVERFLOW)?;
                     // The admission-only profile can describe shared SoC registers.
                     // On live bring-up give write access only to full pages owned by SGX. On T8103
-                    // the PMP telemetry window ("dashboard") is slot 5.
-                    if live && writable && (page_start < sgx || page_end > sgx_end) && !(real_dashboard && slot == 5) {
+                    // the PMP telemetry window ("dashboard") is slot 5 and the PMP's own registers
+                    // slot 2.
+                    if live && writable && (page_start < sgx || page_end > sgx_end) && !(real_dashboard && matches!(slot, 2 | 5)) {
                         continue;
                     }
                     // Place the optional read-only mapping after the fixed SGX register set

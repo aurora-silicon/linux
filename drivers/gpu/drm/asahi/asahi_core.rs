@@ -425,6 +425,14 @@ module! {
             default: false,
             description: "J413 idle trial: request and release GPU power through the idle policy",
         },
+        t8112_g13_dump: u32 {
+            default: 1,
+            description: "T8103 27.2 bring-up: dump the published images when built (1) or after the firmware stops (2)",
+        },
+        t8112_g13_wc: u32 {
+            default: 0,
+            description: "T8103 27.2 bring-up: map uncached firmware allocations write-combined on the host (1)",
+        },
         t8112_g13_seed: u32 {
             default: 0,
             description: "T8103 27.2 bring-up: seed the power controller with the host's static words (1)",

@@ -414,6 +414,10 @@ impl Prot {
         self.ap != AP_GPU && self.memattr == MEMATTR_CACHED
     }
 
+    pub(crate) const fn is_uncached(&self) -> bool {
+        self.memattr == MEMATTR_UNCACHED
+    }
+
     pub(crate) const fn as_uncached(&self) -> Self {
         self.memattr(MEMATTR_UNCACHED)
     }
