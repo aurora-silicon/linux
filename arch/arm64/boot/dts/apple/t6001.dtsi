@@ -21,6 +21,7 @@
 #endif
 
 #define APPLE_T600X_NON_ULTRA
+#define APPLE_USE_PMP
 
 #include "t600x-common.dtsi"
 

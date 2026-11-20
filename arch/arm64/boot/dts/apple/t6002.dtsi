@@ -20,6 +20,8 @@
 # define GPU_REPEAT(x) <x x x x x x x x>
 #endif
 
+#define APPLE_USE_PMP
+
 #include "t600x-common.dtsi"
 
 / {

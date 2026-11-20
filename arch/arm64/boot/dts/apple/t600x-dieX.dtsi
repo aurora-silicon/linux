@@ -30,8 +30,9 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ DIE_NO 1011 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ DIE_NO 1012 IRQ_TYPE_LEVEL_HIGH>;
-		#ifdef APPLE_USE_PMP
-		power-domains = <&DIE_NODE(pmp_report_avd_sys)>;
+		/* Only die 0 has a PMP report entry for AVD. */
+		#if defined(APPLE_USE_PMP) && DIE_NO == 0
+		power-domains = <&pmp_report_avd_sys>;
 		#else
 		power-domains = <&DIE_NODE(ps_avd_sys)>;
 		#endif
