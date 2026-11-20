@@ -1851,6 +1851,17 @@ MODULE_PARM_DESC(j813_smc_late,
  * 3 ms before the commit (capture run 51); the default path sends them in the SMC's noirq
  * suspend, before the stops. This takes J813's deferred notice (with macsmc.j613_saved).
  */
+/*
+ * J613 trial: the holding pen's deep-sleep WFI for a secondary the sleep sequencer restarts
+ * after the commit, as T6050 (pen_deep). On J613 such a core comes back through the boot
+ * stage's locked RVBAR to its spin-table release target, the holding pen; spinning there it
+ * would keep its cluster from powering down. macOS's parked cores take the same deep WFI.
+ */
+static bool sleep_j613_pen_deep;
+module_param_named(j613_pen_deep, sleep_j613_pen_deep, bool, 0444);
+MODULE_PARM_DESC(j613_pen_deep,
+		 "J613 trial: a CPU restarted after the commit takes the deep-sleep WFI in the holding pen, as T6050");
+
 static bool sleep_j613_smc_late;
 module_param_named(j613_smc_late, sleep_j613_smc_late, bool, 0444);
 MODULE_PARM_DESC(j613_smc_late,
@@ -7973,8 +7984,12 @@ static int apple_sleep_probe(struct platform_device *pdev)
 				       &sleep_cpu_power_ops);
 	if (ret)
 		return dev_err_probe(dev, ret, "cannot control CPU power\n");
-	if (s->soc->pen_deep)
+	if (s->soc->pen_deep ||
+	    (READ_ONCE(sleep_j613_pen_deep) && of_machine_is_compatible("apple,j613"))) {
 		spin_table_pen_deep_arm(true);
+		if (!s->soc->pen_deep)
+			dev_info(dev, "J613 trial: holding pen's deep-sleep WFI armed\n");
+	}
 
 	/* Last: the exported helpers take it as a probed driver, and a failure frees s. */
 	apple_sleep = s;
