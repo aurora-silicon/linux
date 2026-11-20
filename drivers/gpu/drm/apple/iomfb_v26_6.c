@@ -1928,3 +1928,9 @@ void iomfb_v26_6_poweroff(struct apple_dcp *dcp)
 		dcp_v26_present(dcp->v26, NULL, 0, NULL, NULL);
 	}
 }
+
+struct apple_rtkit *dcp_v26_rtkit(struct apple_dcp *dcp)
+{
+	return dcp->v26 ? dcp->v26->rtk : NULL;
+}
+

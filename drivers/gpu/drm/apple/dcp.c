@@ -9543,14 +9543,20 @@ static int dcp_platform_suspend(struct device *dev)
 		dev_warn(dev, "J613: display coprocessor stopped cold for the sleep (control %#x); it stays dark until reboot\n",
 			 control);
 		WRITE_ONCE(dcp->quiescing, true);
-		dev_warn(dev, "J613: RTKit idle switch %d, rtk %s\n", READ_ONCE(j613_rtkit_idle),
-			 !dcp->rtk ? "NULL" : IS_ERR(dcp->rtk) ? "error" : "present");
-		if (READ_ONCE(j613_rtkit_idle) && !IS_ERR_OR_NULL(dcp->rtk)) {
-			int ret = apple_rtkit_idle_with(dcp->rtk, dcp_secure_port_idle, dcp);
+		{
+		/* The 26.6 path keeps its firmware session's RTKit in dcp->v26, not in dcp->rtk (n28). */
+		struct apple_rtkit *rtk = dcp->rtk ?: dcp_v26_rtkit(dcp);
+
+		dev_warn(dev, "J613: RTKit idle switch %d, rtk %s%s\n", READ_ONCE(j613_rtkit_idle),
+			 !rtk ? "NULL" : IS_ERR(rtk) ? "error" : "present",
+			 dcp->rtk ? "" : " (the 26.6 session's)");
+		if (READ_ONCE(j613_rtkit_idle) && !IS_ERR_OR_NULL(rtk)) {
+			int ret = apple_rtkit_idle_with(rtk, dcp_secure_port_idle, dcp);
 
 			dev_warn(dev, "J613: RTKit idle before the cold stop: %d (control %#x status %#x)\n",
 				 ret, readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL),
 				 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
+		}
 		}
 		WRITE_ONCE(dcp->j613_sleep_down, true);
 		dcp_s2r_cpu_stop(dcp);

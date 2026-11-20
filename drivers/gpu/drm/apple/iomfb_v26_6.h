@@ -11,6 +11,7 @@
 #include <linux/types.h>
 
 struct apple_dcp;
+struct apple_rtkit;
 struct apple_dcp_v26;
 struct dcp_v26_board;
 struct device;
@@ -27,6 +28,8 @@ const char *iomfb_v26_6_board_name(const struct dcp_v26_board *board);
 
 /* Platform probe: firmware identity, boot loader handoff, PMP acknowledgment. */
 int iomfb_v26_6_probe(struct apple_dcp *dcp);
+/* J613 trial: the firmware session's RTKit (the 26.6 path keeps it here, not in dcp->rtk). */
+struct apple_rtkit *dcp_v26_rtkit(struct apple_dcp *dcp);
 /* Component bind: the running DCP's RTKit session. */
 int iomfb_v26_6_bind(struct apple_dcp *dcp);
 /* Component unbind: KMS goes away; the firmware session is kept until reboot. */
