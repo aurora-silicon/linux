@@ -193,16 +193,32 @@ static ssize_t profile_show(struct device *dev,
 
 static const struct attribute_group platform_profile_group;
 
-/* The legacy /sys/firmware/acpi files exist only where ACPI firmware runs. */
+/*
+ * The legacy /sys/firmware/acpi files exist only where ACPI firmware runs,
+ * and never in a kernel built without ACPI.
+ */
+static struct kobject *platform_profile_legacy_kobj(void)
+{
+#ifdef CONFIG_ACPI
+	return acpi_kobj;
+#else
+	return NULL;
+#endif
+}
+
 static void platform_profile_legacy_notify(void)
 {
-	if (acpi_kobj)
-		sysfs_notify(acpi_kobj, NULL, "platform_profile");
+	struct kobject *kobj = platform_profile_legacy_kobj();
+
+	if (kobj)
+		sysfs_notify(kobj, NULL, "platform_profile");
 }
 
 static int platform_profile_legacy_update(void)
 {
-	return acpi_kobj ? sysfs_update_group(acpi_kobj, &platform_profile_group) : 0;
+	struct kobject *kobj = platform_profile_legacy_kobj();
+
+	return kobj ? sysfs_update_group(kobj, &platform_profile_group) : 0;
 }
 
 /**
@@ -702,6 +718,7 @@ EXPORT_SYMBOL_GPL(devm_platform_profile_register);
 
 static int __init platform_profile_init(void)
 {
+	struct kobject *kobj = platform_profile_legacy_kobj();
 	int err;
 
 	err = class_register(&platform_profile_class);
@@ -709,10 +726,10 @@ static int __init platform_profile_init(void)
 		return err;
 
 	/* Without ACPI firmware (a device tree boot) only the class interface exists. */
-	if (!acpi_kobj)
+	if (!kobj)
 		return 0;
 
-	err = sysfs_create_group(acpi_kobj, &platform_profile_group);
+	err = sysfs_create_group(kobj, &platform_profile_group);
 	if (err)
 		class_unregister(&platform_profile_class);
 
@@ -721,8 +738,10 @@ static int __init platform_profile_init(void)
 
 static void __exit platform_profile_exit(void)
 {
-	if (acpi_kobj)
-		sysfs_remove_group(acpi_kobj, &platform_profile_group);
+	struct kobject *kobj = platform_profile_legacy_kobj();
+
+	if (kobj)
+		sysfs_remove_group(kobj, &platform_profile_group);
 	class_unregister(&platform_profile_class);
 }
 module_init(platform_profile_init);
