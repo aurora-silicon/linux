@@ -966,8 +966,14 @@ EXPORT_SYMBOL_GPL(ane_h16_export_get);
 
 /*
  * Drop a reference. The last one returns a released surface to the spares
- * from a work item: a mapping's last put runs under the process mmap lock,
- * which an EXECUTE may wait for while holding the node lock.
+ * from a work item, because the spares need the node lock and the last put
+ * can come from two places that cannot take it: h16_give_back(), which
+ * already holds it, and a mapping's close in munmap() or process exit, which
+ * would then wait under the process mmap lock for a running request to end.
+ * Taking the node lock under the mmap lock is the order ane_h16_mmap() uses;
+ * the order that must not happen is the reverse, so nothing that faults user
+ * memory or takes the mmap lock runs under the node lock (EXECUTE pins or
+ * bounces its buffers before taking it).
  */
 void ane_h16_export_put(struct ane_h16_export *e)
 {
