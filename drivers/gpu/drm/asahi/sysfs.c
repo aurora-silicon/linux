@@ -53,9 +53,7 @@ struct asahi_stats_attribute {
 	struct device_attribute memory_attr;
 	struct device_attribute limit_attr;
 	const struct asahi_stats_snapshot *snapshot;
-	struct asahi_gpu_memory *memory;
-	u64 boot_limit;
-	u64 boot_client_limit;
+	const struct asahi_gpu_memory *memory;
 	bool export_enabled;
 	asahi_stats_read_fn read;
 	asahi_stats_suspend_fn suspend;
@@ -233,15 +231,6 @@ static ssize_t gpu_memory_show(struct device *dev,
 	return n;
 }
 
-/*
- * gpu_mem_limit_pct: the per-process GPU memory limit in percent of RAM, changeable while the
- * GPU runs. A write of 1..95 sets the per-client and the device-wide limit to that share of RAM
- * (a larger value is clamped to 95); the next allocation uses it. Memory already held stays held,
- * so a lower value only refuses new objects. A write of 0 restores the limits the driver booted
- * with. A read gives the per-client limit in percent (0: no limit).
- */
-#define ASAHI_GPU_MEM_LIMIT_PCT_MAX 95
-
 static DEFINE_MUTEX(asahi_limit_lock);
 
 static ssize_t gpu_mem_limit_pct_show(struct device *dev,
@@ -260,33 +249,14 @@ static ssize_t gpu_mem_limit_pct_store(struct device *dev,
 				       struct device_attribute *attr,
 				       const char *buf, size_t count)
 {
-	struct asahi_stats_attribute *stats =
-		container_of(attr, struct asahi_stats_attribute, limit_attr);
-	struct asahi_gpu_memory *mem = stats->memory;
-	u64 total = (u64)totalram_pages() << PAGE_SHIFT;
-	u64 device_limit, client_limit;
 	u32 pct;
 
 	if (kstrtou32(buf, 0, &pct))
 		return -EINVAL;
-	if (pct > ASAHI_GPU_MEM_LIMIT_PCT_MAX)
-		pct = ASAHI_GPU_MEM_LIMIT_PCT_MAX;
-
-	if (pct) {
-		device_limit = mul_u64_u32_div(total, pct, 100);
-		client_limit = device_limit;
-	} else {
-		device_limit = stats->boot_limit;
-		client_limit = stats->boot_client_limit;
-	}
 
 	mutex_lock(&asahi_limit_lock);
-	WRITE_ONCE(mem->limit, device_limit);
-	WRITE_ONCE(mem->client_limit, client_limit);
+	asahi_set_mem_limit_pct(pct);
 	mutex_unlock(&asahi_limit_lock);
-
-	dev_info(dev, "GPU memory limits set: device %llu MiB, per client %llu MiB (0 = none)\n",
-		 (unsigned long long)(device_limit >> 20), (unsigned long long)(client_limit >> 20));
 	return count;
 }
 
@@ -345,10 +315,8 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	stats->memory_attr.attr.name = "gpu_memory";
 	stats->memory_attr.attr.mode = 0444;
 	stats->memory_attr.show = gpu_memory_show;
-	/* `memory` is the Rust static `memacct::LEDGER`, made of atomics, which this file may write. */
-	stats->memory = (struct asahi_gpu_memory *)memory;
-	stats->boot_limit = READ_ONCE(stats->memory->limit);
-	stats->boot_client_limit = READ_ONCE(stats->memory->client_limit);
+	/* Rust owns the ledger and changes its limits. */
+	stats->memory = memory;
 
 	sysfs_attr_init(&stats->limit_attr.attr);
 	stats->limit_attr.attr.name = "gpu_mem_limit_pct";
