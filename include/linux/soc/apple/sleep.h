@@ -32,6 +32,11 @@ struct apple_sleep_smc_saved_ops {
 	int (*commit_notice)(void *data, u64 *sent, u64 *ack);
 	int (*late_notice)(void *data, u64 *sent, u64 *ack);
 	int (*end)(void *data);
+	/*
+	 * Optional, right after a clean .end at the platform wake, before the SoC's PMU wake steps:
+	 * the SMC's first wake commands (its wake record, waka).
+	 */
+	void (*woken)(void *data);
 	/* Optional, after the irreversible stops: pmVC alone, before late_notice (which then skips it). */
 	int (*pmvc)(void *data);
 };
