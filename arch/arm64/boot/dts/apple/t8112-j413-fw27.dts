@@ -16,3 +16,12 @@
 		apple,power-method = <2>;
 	};
 };
+
+/*
+ * The 27.2 GPU firmware keeps running through suspend-to-idle. Gating the GFX
+ * domain under it leaves the domain unable to power on at the wake (as on T8132
+ * and T6050).
+ */
+&ps_gfx {
+	apple,sleep-retained;
+};
