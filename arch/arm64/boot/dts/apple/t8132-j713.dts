@@ -195,6 +195,15 @@
 
 &dcp {
 	apple,pmc-interface = <&pmc_disp0>;
+
+	panel: panel {
+		compatible = "apple,panel-j713", "apple,panel";
+		/* 2560x1664 at 224 ppi; 64 notch rows above the desktop. */
+		width-mm = <290>;
+		height-mm = <189>;
+		adj-height-mm = <181>;
+		apple,max-brightness = <500>;
+	};
 };
 
 /*
