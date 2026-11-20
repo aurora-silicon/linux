@@ -29,6 +29,7 @@
 		/* kboot fills the N1's factory addresses from /chosen through these */
 		wifi0 = &n1_alpha;
 		bluetooth0 = &n1_beta;
+		sio = &sio;
 	};
 };
 
@@ -388,16 +389,6 @@
 		};
 	};
 
-	/*
-	 * The MagSafe 3 port's PD controller (ADT hpm5, port-type 0x11). It has no USB data
-	 * path, so it gets no connector node; tipd registers a Type-C port and a power supply
-	 * for it. Its ADT features-supported is <3>, "Power In" only: no liquid detection.
-	 */
-	hpm5: usb-pd@8 {
-		compatible = "apple,sn201202x";
-		reg = <0x8 SPMI_USID>;
-		apple,no-liquid-detection;
-	};
 };
 
 &atc1_phy_mbox {
@@ -580,4 +571,11 @@
 	power-domains = <&ps_atc2_cio>, <&ps_atc2_cio_pcie>,
 			<&ps_atc2_cio_usb>, <&ps_atc2_cio_auss>, <&ps_atc2_pcie>;
 	apple,pcie-tunnel = <&acio2_pcie_tunnel>;
+};
+
+/* Keep J716c's unqualified sleep description disabled. */
+#include "t6050-j716c-sleep.dtsi"
+
+&hpm5 {
+	status = "okay";
 };
