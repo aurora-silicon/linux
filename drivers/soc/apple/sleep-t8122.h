@@ -1466,6 +1466,27 @@ static void t8122_phy_off_apply(struct apple_sleep *s)
 	t8122_dc_putc('\n');
 }
 
+/*
+ * J613 trial (single variable): SIO_CPU, the other domain whose state differs at the commit
+ * (n29's diff: macOS 0x1400024f, Linux 0x1f0002ff; an auto-idle write does not stick, n23).
+ * Lowered (off) just before the commit; 'O' before/after.
+ */
+static bool t8122_sio_off;
+module_param(t8122_sio_off, bool, 0600);
+MODULE_PARM_DESC(t8122_sio_off, "J613 trial: lower SIO_CPU just before the commit (macOS has it clock-gated there)");
+
+static void t8122_sio_off_apply(struct apple_sleep *s)
+{
+	u32 before = readl(s->ps + T8122_PS_SIO_CPU);
+
+	sleep_ps_lower(s, T8122_PS_SIO_CPU);
+	t8122_dc_puts("\nO sio ");
+	t8122_dc_hex(before);
+	t8122_dc_putc('/');
+	t8122_dc_hex(readl(s->ps + T8122_PS_SIO_CPU));
+	t8122_dc_putc('\n');
+}
+
 static bool t8122_disp_bit18;
 module_param(t8122_disp_bit18, bool, 0600);
 MODULE_PARM_DESC(t8122_disp_bit18, "J613 trial: clear DISP_CPU's bit 18 just before the commit, as macOS's 0x0f000300");
@@ -1506,6 +1527,8 @@ static void t8122_sio_auto_apply(struct apple_sleep *s)
 
 static void t8122_sleep_pre_commit(struct apple_sleep *s)
 {
+	if (READ_ONCE(t8122_sio_off))
+		t8122_sio_off_apply(s);
 	if (READ_ONCE(t8122_phy_off))
 		t8122_phy_off_apply(s);
 	if (READ_ONCE(t8122_disp_bit18))
