@@ -774,9 +774,13 @@ fn run(
         }
         session.regs.set_generation(0)?;
     }
-    // Kept from 25G83 on 27.2 too: whether macOS stages a device-control record before the
-    // InitData doorbell is not visible in its MMIO trace (no host generation write there).
-    channels.stage_boot_nop(session, devctl.nop)?;
+    // 27.2 (candidate): no boot NOP. macOS writes no host generation before the InitData
+    // doorbell, and on the J713 the firmware crashed at the first device-control doorbell after
+    // idling behind the NOP; IMPORT_GLOBALS goes out right after InitData instead.
+    let nop = kind == hw::Start::Wake25G83;
+    if nop {
+        channels.stage_boot_nop(session, devctl.nop)?;
+    }
     match session.adt.layout.loader_table {
         Some(LoaderTable::Host(offset)) => publish_loader_table(session, init, offset)?,
         // The firmware copies the register map from HW data while it parses InitData.
@@ -790,9 +794,15 @@ fn run(
         hw::ep::INITDATA | (root & hw::ep::INITDATA_ADDR_MASK),
     )?;
     session.send(hw::ep::DOORBELL, 0x0083000000000011)?;
-    wait_boot_control(session, channels, events, init, 1, 5000)?;
+    let base = if nop {
+        wait_boot_control(session, channels, events, init, 1, 5000)?;
+        1
+    } else {
+        dev_info!(dev, "G16: 27.2 boot: no boot NOP, IMPORT_GLOBALS right after InitData\n");
+        0
+    };
     devctl_op(session, channels, events, init, devctl.import_globals)?;
-    wait_boot_control(session, channels, events, init, 2, 2000)?;
+    wait_boot_control(session, channels, events, init, base + 1, 5000)?;
     let scheduler = init.control.as_ref().ok_or(EINVAL)?;
     let scheduler_word = init.firmware_data().scheduler;
     if scheduler.r32(scheduler_word)? != 0 {
@@ -801,7 +811,7 @@ fn run(
     scheduler.w32(scheduler_word, 1)?;
     regs::wmb();
     devctl_op(session, channels, events, init, devctl.start)?;
-    wait_boot_control(session, channels, events, init, 3, 2000)?;
+    wait_boot_control(session, channels, events, init, base + 2, 2000)?;
     session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
     for _ in 0..10 {
         fsleep(Delta::from_millis(10));
@@ -811,9 +821,9 @@ fn run(
             return Err(eproto());
         }
     }
-    if channels.devctl.read()? != 3
-        || channels.devctl.completion()? != 3
-        || channels.devctl.write()? != 3
+    if channels.devctl.read()? != base + 2
+        || channels.devctl.completion()? != base + 2
+        || channels.devctl.write()? != base + 2
         || scheduler.r32(scheduler_word)? != 0
     {
         return Err(EBUSY);
