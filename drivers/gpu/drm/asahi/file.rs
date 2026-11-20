@@ -380,6 +380,18 @@ pub(crate) type DrmFile = drm::File<File>;
 /// Minimum reserved AS for kernel mappings
 const VM_KERNEL_MIN_SIZE: u64 = 0x20000000;
 
+/// Most VMs one file may hold at a time. Mesa creates one per file. Each VM holds kernel memory
+/// that is not charged to the client (its GPUVM, allocators and per-VM objects).
+const MAX_VMS_PER_FILE: u32 = 64;
+
+/// Takes a slot for a new VM in a file's VM table, or fails with EBUSY past
+/// [`MAX_VMS_PER_FILE`], as the ID allocator reports a full range.
+fn reserve_vm_slot<'a>(
+    vms: &'a xarray::XArray<KBox<Vm>>,
+) -> Result<xarray::Reservation<'a, KBox<Vm>>> {
+    vms.lock().reserve_limit(1..=MAX_VMS_PER_FILE, GFP_KERNEL)
+}
+
 impl drm::file::DriverFile for File {
     type Driver = driver::AsahiDrmDriver;
 
@@ -662,6 +674,11 @@ impl File {
             // Every other runtime here reports DRM_ASAHI_GPU_HAL_LEGACY.
             return Err(EINVAL);
         }
+        // Take the table slot first, so that a VM past the cap is refused before anything of it
+        // is built.
+        let vm_xa = file.inner().vms();
+        let resv = reserve_vm_slot(vm_xa.get_ref())?;
+        let id: u32 = resv.index().try_into()?;
         reg_data.gpu.admit_vm(
             device.as_ref().as_ref(),
             file.inner()
@@ -711,10 +728,6 @@ impl File {
                 }
             },
         );
-
-        let vm_xa = file.inner().vms();
-        let resv = vm_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
-        let id: u32 = resv.index().try_into()?;
 
         mod_dev_dbg!(device, "[File {} VM {}]: VM Create\n", file_id, id);
         mod_dev_dbg!(
@@ -1921,5 +1934,37 @@ impl Drop for File {
         // SAFETY: `drop` runs on the pinned file in place, and nothing here moves it.
         let this = unsafe { Pin::new_unchecked(&*self) };
         Self::mark_clients_closed(this, |_| true);
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_vm_table)]
+mod vm_table_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_holds_at_most_max_vms_per_file() -> Result {
+        let vms = KBox::pin_init(
+            xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1),
+            GFP_KERNEL,
+        )?;
+        let mut held = KVec::new();
+        for _ in 0..MAX_VMS_PER_FILE {
+            held.push(reserve_vm_slot(&vms)?, GFP_KERNEL)?;
+        }
+        assert_eq!(reserve_vm_slot(&vms).err(), Some(EBUSY));
+        // A destroyed VM frees its slot for the next.
+        held.pop();
+        held.push(reserve_vm_slot(&vms)?, GFP_KERNEL)?;
+        assert_eq!(reserve_vm_slot(&vms).err(), Some(EBUSY));
+        // Another file's VM table has its own budget while the first is full.
+        let other = KBox::pin_init(
+            xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1),
+            GFP_KERNEL,
+        )?;
+        let _other_slot = reserve_vm_slot(&other)?;
+        // Closing the first file releases every slot for reuse.
+        held.clear();
+        let _reused = reserve_vm_slot(&vms)?;
+        Ok(())
     }
 }
