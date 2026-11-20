@@ -969,6 +969,13 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc0-usb";
+		/*
+		 * System sleep must not power this domain off: on J775c, resume then
+		 * hangs in the noirq power-on of the USB-C domains (USB, ACIO and ATC
+		 * PHY), and kept on, s2idle resumes. It also keeps its AON and
+		 * common parents, which the wake path needs, powered.
+		 */
+		apple,always-on;
 		power-domains = <&ps_atc0_common>, <&ps_atc0_usb_aon>;
 		status = "disabled";
 	};
