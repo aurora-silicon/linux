@@ -11,8 +11,10 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Engine time charged across all clients, in ns, for the GPU busy share.
+/// Engine time charged across all clients and engines, in ns, for the light-effort governor.
 pub(crate) static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+/// Engine time charged across all clients per [`Engine`], in ns, for the GPU busy share.
+pub(crate) static ENGINE_NS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Longest single stage charged since the governor last read it, in ns.
 pub(crate) static MAX_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -44,6 +46,7 @@ impl Client {
         }
         let ns = ticks_to_ns(end - start, frequency_hz);
         TOTAL_NS.fetch_add(ns, Ordering::Relaxed);
+        ENGINE_NS[engine as usize].fetch_add(ns, Ordering::Relaxed);
         MAX_NS.fetch_max(ns, Ordering::Relaxed);
         let counter = &self.ns[engine as usize];
         let mut old = counter.load(Ordering::Relaxed);

@@ -360,6 +360,7 @@ const BUSY_WINDOW_NS: u64 = 200_000_000;
 const BUSY_WINDOW_MAX_NS: u64 = 2_000_000_000;
 static BUSY_WINDOW_START: AtomicU64 = AtomicU64::new(0);
 static BUSY_WINDOW_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BUSY_WINDOW_ENGINE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// A window under this share (permille) with no long job is quiet.
 /// Consecutive quiet windows needed to go light.
@@ -470,7 +471,10 @@ impl Demand {
         unsafe { asahi_clpc_gpu_set_active(self.0, active) };
     }
 
-    /// Reports the share of the last window the GPU spent executing, once a window has run.
+    /// Reports the share of the last window the GPU spent executing, once a window has run:
+    /// that of its busiest engine. The vertex, fragment and compute engines run at the same
+    /// time, so their summed time is not a share of the window: a game whose fragment and
+    /// compute engines are each about 60 % busy sums to more than 100 %.
     /// Of submitters racing at the end of a window, only the one that moves its start reports.
     pub(super) fn report_busy(&self, now_ns: u64) {
         let start = BUSY_WINDOW_START.load(Ordering::Relaxed);
@@ -484,17 +488,23 @@ impl Demand {
         }
         let total = crate::usage::TOTAL_NS.load(Ordering::Relaxed);
         let busy = total.saturating_sub(BUSY_WINDOW_TOTAL.swap(total, Ordering::Relaxed));
+        let mut busiest = 0u64;
+        for (engine, window) in crate::usage::ENGINE_NS.iter().zip(BUSY_WINDOW_ENGINE.iter()) {
+            let now = engine.load(Ordering::Relaxed);
+            busiest = busiest.max(now.saturating_sub(window.swap(now, Ordering::Relaxed)));
+        }
         if start == 0 || elapsed > BUSY_WINDOW_MAX_NS {
             return;
         }
-        let permille = busy.saturating_mul(1000) / elapsed;
-        light_step(permille, crate::usage::MAX_NS.swap(0, Ordering::Relaxed));
-        // Where light effort is configured, full effort does the same work in about half the
-        // time; report the share in light effort's terms so that one memory ladder fits both.
-        let light = LIGHT_EFFORT.load(Ordering::Relaxed) != 0;
-        let scaled = if !light || LIGHT.load(Ordering::Relaxed) { permille } else { permille * 2 };
+        // The light-effort governor keeps its own measure: all engines' time.
+        light_step(busy.saturating_mul(1000) / elapsed, crate::usage::MAX_NS.swap(0, Ordering::Relaxed));
+        // The memory ladder gets the busiest engine's share as measured. It is not scaled for
+        // full effort: on the J616C (T6041, 25G83) the effort word does not change the GPU's
+        // clock under load (the same compute rate, and the firmware reports its top
+        // performance state, at every effort from 0x10000 down to 0x1).
+        let permille = busiest.saturating_mul(1000) / elapsed;
         // SAFETY: the retained reference is live; NULL denotes no DT provider.
-        unsafe { asahi_clpc_gpu_set_busy(self.0, scaled.min(1000) as core::ffi::c_uint) };
+        unsafe { asahi_clpc_gpu_set_busy(self.0, permille.min(1000) as core::ffi::c_uint) };
     }
 }
 
