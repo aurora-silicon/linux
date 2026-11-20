@@ -585,6 +585,8 @@ impl File {
         gpu.get_params(&mut params)?;
 
         params.features |= gpu.feature_flags();
+        // Every backend admits the USC cache invalidate in the VDM root barrier.
+        params.features |= uapi::DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE as u64;
         if Self::supports_user_memory(reg_data) {
             params.features |= uapi::DRM_ASAHI_FEATURE_USERPTR as u64;
         }
