@@ -405,3 +405,5 @@
 			      "shared-l2", "gfx-data", "gfx1-data", "fw-data",
 			      "fw-text";
 };
+
+#include "t8142-j813-usb4.dtsi"
