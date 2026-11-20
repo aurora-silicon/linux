@@ -302,7 +302,7 @@ STATE=/var/lib/aurora-sep
 FALLBACK_ID=aurora-sep-previous-kernel
 # Written only by --read-only, which was removed: SEP writes are always on
 # (aurora-silicon/linux#2591). An install deletes the file that option wrote
-# (read_only_conf_cleanup), and --uninstall removes this path.
+# (read_only_conf_cleanup), as --uninstall does; any other file there is the owner's.
 MODPROBE_CONF=/etc/modprobe.d/aurora-sep.conf
 # What --read-only wrote there: this first line, comments and the options line.
 READ_ONLY_CONF_HEADER="# aurora-sep --read-only:"
@@ -3650,14 +3650,21 @@ calibration() {
     warn "could not extract the calibration; Touch ID will not work until it is present at $out"
 }
 
-# The first line in modprobe.d that blacklists or redirects apple_sep, other
-# than our own file. Either spelling is the owner saying "do not load this".
+# The modprobe.d directories sep_block_line reads (the tests point it elsewhere).
+SEP_MODPROBE_DIRS=${SEP_MODPROBE_DIRS:-"/etc/modprobe.d /run/modprobe.d /usr/lib/modprobe.d"}
+
+# The first line in modprobe.d that blacklists or redirects apple_sep. Either
+# spelling is the owner saying "do not load this". $MODPROBE_CONF counts too:
+# this script no longer writes it, so whatever is there now is the owner's (the
+# file an earlier --read-only install wrote had no such line).
 sep_block_line() {
-  local f
-  for f in /etc/modprobe.d/*.conf /run/modprobe.d/*.conf /usr/lib/modprobe.d/*.conf; do
-    [[ -f $f && $f != "$MODPROBE_CONF" ]] || continue
-    grep -m1 -HnE '^[[:space:]]*(blacklist|install)[[:space:]]+apple[-_]sep([[:space:]]|$)' "$f" 2>/dev/null &&
-      return 0
+  local d f
+  for d in $SEP_MODPROBE_DIRS; do
+    for f in "$d"/*.conf; do
+      [[ -f $f ]] || continue
+      grep -m1 -HnE '^[[:space:]]*(blacklist|install)[[:space:]]+apple[-_]sep([[:space:]]|$)' "$f" 2>/dev/null &&
+        return 0
+    done
   done
   return 0
 }
@@ -3688,14 +3695,31 @@ read_only_conf_is_ours() { # FILE
 read_only_conf_cleanup() {
   [[ -e $MODPROBE_CONF || -L $MODPROBE_CONF ]] || return 0
   if read_only_conf_is_ours "$MODPROBE_CONF"; then
-    $sudo rm -f -- "$MODPROBE_CONF" || die "could not remove $MODPROBE_CONF, left by an earlier --read-only install"
-    say "Removed $MODPROBE_CONF, left by an earlier --read-only install: SEP writes are always on (aurora-silicon/linux#2591)"
+    if $sudo rm -f -- "$MODPROBE_CONF"; then
+      say "Removed $MODPROBE_CONF, left by an earlier --read-only install: SEP writes are always on (aurora-silicon/linux#2591)"
+    else
+      warn "could not remove $MODPROBE_CONF, left by an earlier --read-only install; remove it by hand"
+    fi
   else
     warn "$MODPROBE_CONF is not the file an earlier --read-only install wrote, so it stays as it is.
     Kernels from aurora-silicon/linux#2591 on ignore xart_writes and provision_keybag
-    there: SEP writes are always on. Its other settings still apply."
+    there: SEP writes are always on. Kernels from before it still honour a 0, so remove
+    any xart_writes=0 or provision_keybag=0 it sets. Its other settings still apply."
   fi
   return 0
+}
+
+# Whether the owner's own file at $MODPROBE_CONF still turns writes or keybag
+# provisioning off: it sets xart_writes=0 or provision_keybag=0, and the
+# installed apple_sep (a kernel from before aurora-silicon/linux#2591) still
+# has those parameters. The file an earlier --read-only install wrote does not
+# count: read_only_conf_cleanup removes it.
+kept_conf_turns_writes_off() {
+  [[ -f $MODPROBE_CONF ]] || return 1
+  read_only_conf_is_ours "$MODPROBE_CONF" && return 1
+  grep -qE '^[[:space:]]*options[[:space:]]+apple[-_]sep[[:space:]](.*[[:space:]])?(xart[-_]writes|provision[-_]keybag)=0+([[:space:]]|$)' \
+    "$MODPROBE_CONF" 2>/dev/null || return 1
+  modinfo -F parm apple_sep 2>/dev/null | grep -qE '^(xart_writes|provision_keybag):'
 }
 
 # The driver provisions an identity keybag and writes to the enclave's
@@ -4644,7 +4668,8 @@ uninstall_all() {
       ;;
     handoff) m3_restore_bringup ;;
   esac
-  $sudo rm -f "$MODPROBE_CONF"
+  # Only the file an earlier --read-only install wrote; an owner's own stays.
+  read_only_conf_cleanup
   # Keep recovery state and modules if the checked entry cannot be removed.
   if [[ $(boot_chain) == limine ]] && m3_limine_cleanup_needed; then
     m3_limine_remove_check remove
@@ -4715,6 +4740,8 @@ reset_touchid() {
   grep -qa 'apple,' /proc/device-tree/compatible 2>/dev/null || die "this is not an Apple Silicon Mac"
   for f in "${TOUCHID_STATE_FILES[@]}"; do [[ -e $f ]] && found=1; done
   ((found)) || die "no Touch ID state on this Mac; nothing to reset"
+  kept_conf_turns_writes_off &&
+    die "$MODPROBE_CONF sets xart_writes=0 or provision_keybag=0, and this kernel, from before aurora-silicon/linux#2591, still honours it: the next boot could not create a new keybag. Remove that setting first."
 
   # Ask for sudo now, in the foreground: a password prompt under timeout
   # below could not read the terminal. Not sudo -v, which wants a password

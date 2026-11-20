@@ -90,8 +90,14 @@ class PackagedModprobeTest(unittest.TestCase):
         self.assertNotIn("bash -s -- --read-only", SRC)
         for line in code_lines(SRC):
             if "xart_writes" in line or "provision_keybag" in line:
-                # Only to recognise the old file, and to say these are ignored.
-                self.assertTrue(line.startswith("READ_ONLY_CONF_OPTIONS=") or "ignore xart_writes" in line,
+                # Only to recognise the old file, to say these are ignored, and to find
+                # (and tell the owner to remove) a leftover 0 a kernel from before
+                # linux#2591 still honours. Never to set one.
+                allowed = ("READ_ONLY_CONF_OPTIONS=", "ignore xart_writes",
+                           "any xart_writes=0 or provision_keybag=0 it sets",
+                           "modinfo -F parm apple_sep",
+                           "sets xart_writes=0 or provision_keybag=0, and this kernel")
+                self.assertTrue(line.startswith(allowed[0]) or any(a in line for a in allowed[1:]),
                                 line)
 
 
@@ -114,13 +120,16 @@ class InstallerTest(unittest.TestCase):
         self.env = {**os.environ, "NO_COLOR": "1", "CALLS": str(self.calls),
                     "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}"}
 
-    def sh(self, body):
+    def sh(self, body, real_block=False):
+        # The real sep_block_line reads only this test's modprobe.d, never the host's.
+        block = (f"SEP_MODPROBE_DIRS='{self.conf.parent}'" if real_block
+                 else "sep_block_line() { :; }")
         script = f"""set -euo pipefail
 AURORA_SEP_SOURCE_ONLY=1 source '{INSTALLER}'
 sudo=""
 MODPROBE_CONF='{self.conf}'
 systemctl() {{ echo "systemctl $*" >>"$CALLS"; }}
-sep_block_line() {{ :; }}
+{block}
 {body}
 """
         # A session of its own: no controlling terminal, so nothing can prompt on it.
@@ -214,6 +223,31 @@ sep_block_line() {{ :; }}
         self.assertIn("systemctl disable apple-sep.path apple-sep.service", self.log())
         self.assertNotIn("systemctl enable", self.log())
 
+    def test_an_owners_block_in_the_kept_file_wins(self):
+        # The script no longer writes $MODPROBE_CONF, so a block an owner put there counts too.
+        for line in ("blacklist apple_sep", "install apple-sep /bin/false"):
+            with self.subTest(line=line):
+                self.conf.write_text(OLD_READ_ONLY_CONF + line + "\n")
+                self.calls.write_text("")
+                proc = self.sh("sep_policy", real_block=True)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertTrue(self.conf.exists())
+                self.assertIn(f"apple_sep is blocked on this Mac ({self.conf}:4:{line})", flat(proc.stderr))
+                self.assertIn("systemctl disable apple-sep.path apple-sep.service", self.log())
+                self.assertNotIn("systemctl enable", self.log())
+
+    def test_the_real_block_check_ignores_options_lines(self):
+        self.conf.write_text("options apple_sep xart_guard=0\n")
+        proc = self.sh("sep_policy", real_block=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("systemctl enable apple-sep.path apple-sep.service", self.log())
+
+    def test_uninstall_removes_only_the_read_only_file(self):
+        proc = self.sh("declare -f uninstall_all")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^\s+read_only_conf_cleanup;?$")
+        self.assertNotIn('rm -f "$MODPROBE_CONF"', proc.stdout)
+
     def test_the_write_notice_offers_no_read_only_install(self):
         self.conf.write_text(OLD_READ_ONLY_CONF)
         proc = self.sh("sep_write_notice")
@@ -269,6 +303,43 @@ mv() { echo "mv $*" >>"$CALLS"; }
         self.assertIn("no terminal to confirm on; run again with --reset-touchid --yes", proc.stderr)
         self.assertEqual(self.conf.read_text(), OLD_READ_ONLY_CONF)
         self.assertEqual(self.log(), "")
+
+    def modinfo(self, parms):
+        (self.bin / "modinfo").write_text("#!/bin/sh\nprintf '%s' \"$PARMS\"\n")
+        (self.bin / "modinfo").chmod(0o755)
+        self.env["PARMS"] = parms
+
+    OLD_PARMS = "xart_writes:Allow shared xART writes (u8)\nprovision_keybag:Create the keybag (u8)\n"
+    NEW_PARMS = "xart_guard:-1: the platform's level (i8)\n"
+
+    def test_kept_conf_turns_writes_off(self):
+        cases = [("options apple_sep xart_writes=0 provision_keybag=0\n", self.OLD_PARMS, True),
+                 ("options apple-sep provision-keybag=0\n", self.OLD_PARMS, True),
+                 ("options apple_sep xart_guard=0 xart_writes=00\n", self.OLD_PARMS, True),
+                 ("options apple_sep xart_writes=0 provision_keybag=0\n", self.NEW_PARMS, False),
+                 ("options apple_sep xart_guard=0\n", self.OLD_PARMS, False),
+                 ("options apple_sep xart_writes=1\n", self.OLD_PARMS, False),
+                 ("# options apple_sep xart_writes=0\n", self.OLD_PARMS, False),
+                 (OLD_READ_ONLY_CONF, self.OLD_PARMS, False)]
+        for content, parms, off in cases:
+            with self.subTest(content=content, parms=parms):
+                self.conf.write_text(content)
+                self.modinfo(parms)
+                proc = self.sh("kept_conf_turns_writes_off && echo OFF || echo ON")
+                self.assertEqual(proc.stdout.strip(), "OFF" if off else "ON", proc.stderr)
+
+    def test_reset_touchid_refuses_an_owners_off_setting_on_an_old_kernel(self):
+        self.conf.write_text("options apple_sep xart_writes=0 provision_keybag=0\n")
+        self.modinfo(self.OLD_PARMS)
+        proc = self.reset("--yes")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("still honours it: the next boot could not create a new keybag", flat(proc.stderr))
+        self.assertEqual(self.log(), "")
+        # The same file under a kernel without the parameters: the reset goes ahead.
+        self.modinfo(self.NEW_PARMS)
+        proc = self.reset("--yes")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Moved the Touch ID state", proc.stdout)
 
     def test_reset_touchid_keeps_an_owners_file(self):
         self.conf.write_text("options apple_sep xart_guard=0\n")

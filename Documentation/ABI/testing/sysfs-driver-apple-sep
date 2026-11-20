@@ -99,14 +99,17 @@ KernelVersion:	7.1
 Contact:	Chris Kearney <chris@kearneymail.com>
 Description:
 		(RO) Whether the SEP's writes to the shared xART store reach
-		the disk. Fixed at probe, when the driver opens the store.
+		the disk. Set at probe, when the driver opens the store;
+		complete_attach updates it when it reopens the store, and a
+		failed writable reopen there sets it to disabled.
 
 		========	=============================================
 		enabled		Writes reach the store (it validated for
 				writing).
 		disabled	Writes are refused: the key-store-only
-				initrd phase, before complete_attach, or a
-				failed writable reopen. Touch ID enrol and
+				initrd phase before complete_attach
+				(keystore_only=1, or 2 with the xART
+				guard), or a failed writable reopen. Touch ID enrol and
 				verify are refused too, since the SEP must
 				save state after each. There is no
 				parameter that turns writes off.
@@ -392,8 +395,9 @@ Description:
                 was loaded without keystore_only. The read-only module
                 parameter retains its load-time value after completion.
 
-                In keystore-only mode, xART is read-only until
-                complete_attach, provisioning waits for it, and no host-state or
+                With keystore_only=1, xART is read-only until
+                complete_attach (keystore_only=2 below), provisioning waits for
+                it, and no host-state or
                 guard files are opened for writing. The initrd must carry the
                 existing identity keybag and machine ref-key at their usual
                 /var/lib paths; both are cached on first trusted-key use.
