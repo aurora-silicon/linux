@@ -1028,6 +1028,44 @@ static void macaudio_spk_j700_does_not_ramp(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, macaudio_test_vol(t.vols[0])->hist[0], (long)MAX98360A_DB(-20));
 }
 
+/* A fixed ceiling: the grant runs the amps at it, the ramp starts below it */
+static void macaudio_spk_fixed_ceiling(struct kunit *test)
+{
+	struct macaudio_platform_cfg *cfg = kunit_kzalloc(test, sizeof(*cfg), GFP_KERNEL);
+	const long ceiling = SN012776_DB(-15);
+	struct macaudio_test_vol *vol;
+	struct macaudio_test_spk t;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, cfg);
+	*cfg = macaudio_j316_cfg;
+	cfg->safe_vol = -15;
+	cfg->spk_fixed_ceiling = true;
+	macaudio_test_spk_card(test, &t, cfg, SN012776_0DB);
+
+	/* The limit the lease leaves on the volumes (macaudio_spk_enter_lease()) */
+	mutex_lock(&t.ma->volume_lock_mutex);
+	macaudio_vlimit_unlock(t.ma, true);
+	mutex_unlock(&t.ma->volume_lock_mutex);
+	for (i = 0; i < MACAUDIO_TEST_NR_SPK; i++)
+		KUNIT_EXPECT_EQ(test, (long)macaudio_test_vol(t.vols[i])->mc.platform_max,
+				ceiling);
+
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, SPEAKER_LEASE_MAX_MS), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 1L);
+	macaudio_test_expect_vols(test, &t, ceiling);
+
+	macaudio_test_record(&t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 0), 0);
+	for (i = 0; i < MACAUDIO_TEST_NR_SPK; i++) {
+		vol = macaudio_test_vol(t.vols[i]);
+		macaudio_test_expect_ramp(test, &t, i);
+		KUNIT_EXPECT_LT(test, vol->hist[0], ceiling);
+	}
+	macaudio_test_expect_vols(test, &t, 0);
+}
+
 struct macaudio_test_unlock {
 	struct snd_kcontrol *spk;
 	struct completion done;
@@ -1316,6 +1354,7 @@ static struct kunit_case macaudio_protection_cases[] = {
 	KUNIT_CASE(macaudio_spk_ramp_ends_with_the_lease),
 	KUNIT_CASE(macaudio_spk_hard_withdrawals_do_not_ramp),
 	KUNIT_CASE(macaudio_spk_j700_does_not_ramp),
+	KUNIT_CASE(macaudio_spk_fixed_ceiling),
 	KUNIT_CASE(macaudio_spk_floor_waits_for_the_resume),
 	KUNIT_CASE(macaudio_spk_grant_needs_d0),
 	{}

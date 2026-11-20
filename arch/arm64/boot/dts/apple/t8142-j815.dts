@@ -174,6 +174,16 @@
 	aop_als: als {
 		compatible = "apple,t8142-aop-als", "apple,aop-als";
 	};
+
+	/*
+	 * Lid angle: the J815 AOP firmware announces a "las" service, which
+	 * macOS 27.2 on this machine binds as an AppleSPUHIDDevice (usage page
+	 * 0x20, usage 0x8a), as on T6050. The ADT's i2c1 "mogul-las" is the
+	 * sensor's authentication chip, not the angle.
+	 */
+	aop_las: las {
+		compatible = "apple,t8142-aop-las", "apple,aop-las";
+	};
 };
 
 /* Names as in speakersafetyd's j815.conf; slots from ADT speaker-config. */
@@ -466,5 +476,46 @@
 };
 
 &ave {
+	status = "okay";
+};
+
+/*
+ * The Neural Engine. It stays off until the first request: the firmware is
+ * started then, from the preload, and system sleep cycles it cold.
+ */
+&ps_ane_sys {
+	status = "okay";
+};
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};
+
+/* Both JPEG engines and their DART. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1 {
 	status = "okay";
 };

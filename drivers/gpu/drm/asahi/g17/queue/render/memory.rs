@@ -14,7 +14,7 @@ use crate::g17::{
     object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
 };
 use crate::{
-    hw::t8140::{dynamic, kernel_window, low, queues, resources as cfg},
+    hw::t8140::{kernel_window, low, queues, resources as cfg},
     mmu,
 };
 use core::sync::atomic::Ordering;
@@ -417,7 +417,7 @@ impl NeoGeneration {
         KernelObject::new(
             alloc.dev,
             vm,
-            crate::g17::object::Placement::In(dynamic::CLIENT_LOWER, cfg::TVB_PAGE),
+            crate::g17::object::Placement::In(vm.client_private_range(), cfg::TVB_PAGE),
             storage::STATE_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
@@ -622,7 +622,7 @@ impl Memory {
         let registers = if m5 { None } else { Some(KernelObject::new(
             alloc.dev,
             vm,
-            crate::g17::object::Placement::In(dynamic::CLIENT_LOWER, mmu::UAT_PGSZ as u64),
+            crate::g17::object::Placement::In(vm.client_private_range(), mmu::UAT_PGSZ as u64),
             mmu::UAT_PGSZ,
             mmu::PROT_GPU_SHARED_RO,
             CpuMap::WriteCombined,
@@ -637,7 +637,7 @@ impl Memory {
         let fragment_view = if m5 { None } else { Some(graph.descriptors.map_range(
             vm,
             TA_BYTES..TA_BYTES + mmu::UAT_PGSZ,
-            dynamic::CLIENT_LOWER,
+            vm.client_private_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RO,
             0,

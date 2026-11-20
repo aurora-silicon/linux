@@ -129,6 +129,13 @@ properties:
   phy-names:
     const: cio
 
+  apple,cio-phy:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The combo PHY whose CIO mode carries the router's link, for a router
+      that sleeps in place (T6050). Its host stops the PHY's CIO mode after
+      the router, and starts it again before the router at the wake.
+
   apple,pcie-tunnel:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:

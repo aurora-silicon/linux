@@ -85,10 +85,11 @@ properties:
           Shared global variables, preserved firmware data or text segment of
           the loaded GPU firmware
       - description: Additional firmware crash-log data on T8142
+      - description: Combined firmware text on T8142
 
   memory-region-names:
     minItems: 3
-    maxItems: 7
+    maxItems: 8
 
   apple,clpc:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -103,6 +104,24 @@ properties:
       PMP report entry that tells the PMP the GPU is in use. The driver withdraws
       this request before it lowers the GPU's power state for a system sleep, and
       makes it again after raising it.
+
+  apple,sleep-ps-auto:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 15
+    description:
+      The automatic power state (bits 27:24 of the power state word) the GPU's
+      power domain is raised with after a system sleep. Without it the domain
+      keeps the automatic state it had before the sleep. Set by the boot
+      loader.
+
+  apple,sleep-ps-min:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 15
+    description:
+      The floor (bits 19:16 of the power state word) the GPU's power domain is
+      raised with after a system sleep, the lowest state its automatic power
+      management may take between jobs. Without it the domain keeps the floor
+      the sleep's wake left in the word.
 
   apple,idle-off-delay-ms:
     minimum: 2
@@ -577,6 +596,7 @@ allOf:
             - description: GFX coprocessor mailbox
             - description: GFX1 coprocessor mailbox
         memory-region:
+          minItems: 7
           items:
             - description: GPU MMU TTBs
             - description: GPU MMU page tables
@@ -585,7 +605,9 @@ allOf:
             - description: GFX firmware data
             - description: GFX1 firmware data
             - description: Combined firmware data and shared read-only crash logs
+            - description: Combined GFX and GFX1 firmware text
         memory-region-names:
+          minItems: 7
           items:
             - const: ttbs
             - const: pagetables
@@ -594,6 +616,18 @@ allOf:
             - const: gfx-data
             - const: gfx1-data
             - const: fw-data
+            - const: fw-text
+      oneOf:
+        - properties:
+            memory-region:
+              maxItems: 7
+            memory-region-names:
+              maxItems: 7
+        - properties:
+            memory-region:
+              minItems: 8
+            memory-region-names:
+              minItems: 8
       required:
         - reg-names
         - mboxes

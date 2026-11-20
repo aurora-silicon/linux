@@ -1617,6 +1617,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1011 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <5>;
+				power-domains = <&ps_atc0_cio>;
 			};
 
 			usb4_0_nhi: nhi@f00000 {
@@ -1784,6 +1785,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1069 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <5>;
+				power-domains = <&ps_atc1_cio>;
 			};
 
 			usb4_1_nhi: nhi@f00000 {

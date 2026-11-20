@@ -25,7 +25,7 @@ struct hwx_parser {
 	u32 tensors[ANE_H16_SURFACES], refs[ANE_H16_SURFACES];
 	u32 tensor_count, ref_count, segment_count, file_count, section_count;
 	u32 symoff, nsyms, stroff, strsize;
-	bool guard, symtab, metadata;
+	bool guard, symtab, metadata, note;
 };
 
 static bool hwx_fits(u64 start, u64 length, u64 size)
@@ -73,7 +73,7 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 {
 	struct ane_h16_hwx_section *dest;
 	u64 vm, size, file, filesz;
-	u32 nsects, prot, i;
+	u32 nsects, prot, flags, i;
 	bool text, kernel, scratch, surface, guard;
 
 	if (length < 72)
@@ -112,9 +112,17 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 		   hwx_file_add(p, file, filesz)) {
 		return -ENOEXEC;
 	}
-	if (get_unaligned_le32(c + 68) != (surface ? 6 : text ?
-		(p->info.scratch.size ? 4 : 0) : 4))
+	/*
+	 * __TEXT is SG_NORELOC (4) beside a scratch segment in the MobileNet program; Apple's
+	 * zin_ane_compiler 10.205 marks it 0 there too on H17 (relocations are checked below).
+	 */
+	flags = get_unaligned_le32(c + 68);
+	if (text && p->info.subtype == ANE_HWX_SUBTYPE_H17 && p->info.scratch.size) {
+		if (flags != 4 && flags)
+			return -ENOEXEC;
+	} else if (flags != (surface ? 6 : text ? (p->info.scratch.size ? 4 : 0) : 4)) {
 		return -ENOEXEC;
+	}
 	if ((text && (prot != 5 || nsects != 2 || p->info.text.size)) ||
 	    (kernel && (prot != 1 || nsects != 1 || p->info.kernel.size)) ||
 	    (scratch && (prot != 3 || p->info.scratch.size)) ||
@@ -210,11 +218,16 @@ static int hwx_program(struct hwx_parser *p)
 {
 	const u8 *c = p->bytes + p->info.program_offset;
 	struct ane_h16_hwx *info = &p->info;
-	u32 length = get_unaligned_le32(c + 4), records, record_limit, i;
-	u32 prologue = info->subtype == ANE_HWX_SUBTYPE_H17 ? 0 : 1;
+	u32 length = get_unaligned_le32(c + 4), records, record_limit, table, i;
+	u32 prologue = 1;
 	size_t final_end = 0;
 	u64 work_limit = 0;
 	bool mixed = length == 0x8c0;
+
+	/* H17 streams open with 0 (linked programs) or 1 (Apple's matmul and add output). */
+	if (info->subtype == ANE_HWX_SUBTYPE_H17 && info->text.size >= 4 &&
+	    !get_unaligned_le32(p->bytes + info->text.offset))
+		prologue = 0;
 	/* Nonzero cells only; every other byte is checked below. */
 	static const u16 common[] = {
 		0, 4, 8, 0xc, 0x10, 0x14, 0x20, 0x24, 0x40, 0x44,
@@ -250,12 +263,18 @@ static int hwx_program(struct hwx_parser *p)
 		   get_unaligned_le32(c + 0x858)) {
 		return -ENOEXEC;
 	}
+	/*
+	 * BAR slot s takes its base from the qword at +0x10 * (s + 1). The surfaces then the
+	 * kernel fill consecutive slots from slot 6 (+0x70); Apple's zin_ane_compiler 10.205
+	 * starts the same run at slot 5 (+0x60) on H17, the task stream naming slots 5, 6, 7.
+	 */
+	table = info->subtype == ANE_HWX_SUBTYPE_H17 && get_unaligned_le64(c + 0x60) ? 0x60 : 0x70;
 	for (i = 0; i < 5; i++) {
 		u64 base = i < info->surface_count ? info->surfaces[i].section.vm :
 			   i == info->surface_count ? info->kernel.vm : 0;
 
-		if (get_unaligned_le64(c + 0x70 + i * 16) != base ||
-		    get_unaligned_le64(c + 0x78 + i * 16))
+		if (get_unaligned_le64(c + table + i * 16) != base ||
+		    get_unaligned_le64(c + table + 8 + i * 16))
 			return -ENOEXEC;
 	}
 	/*
@@ -275,7 +294,7 @@ static int hwx_program(struct hwx_parser *p)
 	for (i = 0; i < ARRAY_SIZE(common); i++)
 		memcpy(expected + common[i], c + common[i], 4);
 	for (i = 0; i < 5; i++)
-		memcpy(expected + 0x70 + i * 16, c + 0x70 + i * 16, 8);
+		memcpy(expected + table + i * 16, c + table + i * 16, 8);
 	put_unaligned_le32(4, expected + 0x868);
 	put_unaligned_le32(mixed ? 4 : 2, expected + 0x870);
 	put_unaligned_le32(mixed ? 2 : 7, expected + 0x878);
@@ -423,9 +442,18 @@ static int hwx_symbols(struct hwx_parser *p)
 		u64 value = get_unaligned_le64(s + 8);
 		const struct ane_h16_hwx_section *section;
 		const char *name;
+		/*
+		 * zin_ane_compiler 10.205 (H17) adds stabs type records (N_GSYM 0x20 for each
+		 * surface, N_LSYM 0x80 for each element type) with no section and value 0.
+		 * n_desc holds the stabs type number. They name no address; their strings are
+		 * still checked below.
+		 */
+		bool h17 = p->info.subtype == ANE_HWX_SUBTYPE_H17;
+		bool stab = h17 && (s[4] == 0x20 || s[4] == 0x80);
 
-		if (strx >= p->strsize || !s[5] || s[5] > p->section_count ||
-		    (s[4] & ~1) != 0xe)
+		if (strx >= p->strsize ||
+		    (stab ? s[5] || value :
+			    !s[5] || s[5] > p->section_count || (s[4] & ~1) != 0xe))
 			return -ENOEXEC;
 		name = p->bytes + p->stroff + strx;
 		if (!*name || strnlen(name, min_t(u32, 256, p->strsize - strx)) ==
@@ -437,8 +465,12 @@ static int hwx_symbols(struct hwx_parser *p)
 			if (!strcmp(name, p->bytes + p->stroff + previous))
 				return -ENOEXEC;
 		}
+		if (stab)
+			continue;
 		section = &p->sections[s[5] - 1];
-		if (value < section->vm || value - section->vm >= section->size)
+		/* H17 places the empty per-core kernel objects (…_ne_N) at the section end. */
+		if (value < section->vm || value - section->vm > section->size ||
+		    (value - section->vm == section->size && !h17))
 			return -ENOEXEC;
 		for (j = 0; j < p->info.surface_count; j++) {
 			const struct ane_h16_hwx_surface *b = &p->info.surfaces[j];
@@ -575,6 +607,17 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 			p->metadata = true;
 			break;
 		}
+		case 0x31:
+			/*
+			 * LC_NOTE: zin_ane_compiler 10.205 (H17) records its runtime version
+			 * inline, offset 40 into this command, 4 bytes. It maps nothing.
+			 */
+			if (p->info.subtype != ANE_HWX_SUBTYPE_H17 || p->note || len != 48 ||
+			    !hwx_name(c + 8, "rt.version") || get_unaligned_le64(c + 24) != 40 ||
+			    get_unaligned_le64(c + 32) != 4 || !hwx_zero(c, 44, len))
+				goto invalid;
+			p->note = true;
+			break;
 		default:
 			goto invalid;
 		}

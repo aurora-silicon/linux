@@ -1552,8 +1552,9 @@
 				compatible = "apple,smc-hwmon";
 				#thermal-sensor-cells = <1>;
 				/*
-				 * The GPU keys read a fixed low value while the GPU
-				 * is idle, then the CPU die keys.
+				 * The GPU keys, then the CPU die keys. The GPU keys
+				 * join the zone through their channels below, which
+				 * read no data while the GPU is off.
 				 */
 				apple,soc-die-keys = "Tg0f", "Tg0n", "Tg0r", "Te05",
 						     "Tp01", "Tp05", "Tp09", "Tp0D";
@@ -1587,6 +1588,24 @@
 				temperature-Tp0D {
 					apple,key-id = "Tp0D";
 					label = "P-core 3 Temperature";
+				};
+
+				temperature-Tg0f {
+					apple,key-id = "Tg0f";
+					label = "GPU Tg0f";
+					apple,no-data-below-millicelsius = <10000>;
+				};
+
+				temperature-Tg0n {
+					apple,key-id = "Tg0n";
+					label = "GPU Tg0n";
+					apple,no-data-below-millicelsius = <10000>;
+				};
+
+				temperature-Tg0r {
+					apple,key-id = "Tg0r";
+					label = "GPU Tg0r";
+					apple,no-data-below-millicelsius = <10000>;
 				};
 			};
 
@@ -2092,6 +2111,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1065 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <1>;
+				power-domains = <&ps_atc0_cio>;
 			};
 
 			usb4_0_nhi: nhi@f00000 {
@@ -2151,6 +2171,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1025 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <1>;
+				power-domains = <&ps_atc0_pcie>;
 			};
 
 			apciec0: pcie@3b0000000 {
@@ -2313,6 +2334,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1146 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <1>;
+				power-domains = <&ps_atc1_cio>;
 			};
 
 			usb4_1_nhi: nhi@f00000 {
@@ -2372,6 +2394,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1025 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <1>;
+				power-domains = <&ps_atc1_pcie>;
 			};
 
 			apciec1: pcie@530000000 {

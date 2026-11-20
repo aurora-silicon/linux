@@ -28,6 +28,10 @@ def fixture():
     preparation = (ROOT / 'preparation.rs').read_text()
     admission = (item(preparation, "pub(super) struct Admission<'a>") + '\n' +
                  item(preparation, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()').replace('super::timeout::', '')
+    # The admission's wait kinds and their count, which its struct names.
+    admission = ('#[derive(Clone,Copy,Debug,PartialEq)]\n' + item(preparation, 'pub(super) enum AdmissionWait').replace('pub(super) ', '') + '\n'
+                 + next(line for line in preparation.splitlines() if 'const ADMISSION_WAITS:' in line).replace('pub(super) ', '')
+                 + '\n' + admission)
     methods = '\n'.join(item(runtime, sig) for sig in ['    fn shared_compute(', '    fn compute_scheduler('])
     methods = methods.replace('super::object::Allocator', 'Allocator').replace('super::preparation::Lease', 'Lease').replace('super::initdata::', '')
     return r'''

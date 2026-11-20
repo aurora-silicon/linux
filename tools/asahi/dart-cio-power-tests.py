@@ -18,6 +18,9 @@ MUTATIONS = {
     'ignore-lock': ('if (locked)\n\t\treturn -EUCLEAN;', 'if (false)\n\t\treturn -EUCLEAN;'),
     'wrong-outstanding': ('regs + 0x230 + 4 * i', 'regs + 0x6000 + 4 * i'),
     'skip-params': ('if (readl(regs + 4 * i) != s->params[i])', 'if (false)'),
+    'admit-newer-layout': ('version > DART_CIO_VERSION_T6050 ||', 'version > 0x205 ||'),
+    'skip-v24-error-status': ('writel(~0U, regs + 0x4204);', '(void)0;'),
+    'check-never-quiesced': ('if (!quiesced)\n\t\treturn 0;', 'if (true)\n\t\treturn 0;'),
 }
 
 
