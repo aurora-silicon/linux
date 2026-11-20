@@ -1211,6 +1211,13 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 	struct ane_fw_backend *b = container_of(nb, struct ane_fw_backend, pm_notifier);
 	bool retained = READ_ONCE(b->retained);
 
+	/*
+	 * Registered at init, before anything is retained: until then there
+	 * is nothing to cycle or refuse. Retaining happens under the system
+	 * sleep lock, so it never changes in the middle of a transition.
+	 */
+	if (!retained)
+		return NOTIFY_DONE;
 	if (event == PM_POST_SUSPEND) {
 		ane_fw_sleep_resume(b);
 		WRITE_ONCE(b->in_sleep, false);
@@ -1253,15 +1260,13 @@ static int ane_fw_retain(struct ane_fw_backend *b)
 		if (ret)
 			return ret;
 	}
-	b->pm_notifier.notifier_call = ane_fw_pm_event;
-	ret = register_pm_notifier(&b->pm_notifier);
-	if (ret) {
-		if (IS_BUILTIN(CONFIG_DRM_ACCEL_ANE))
-			kexec_unblock(&ane_fw_kexec);
-		return ret;
-	}
+	/*
+	 * The PM notifier was registered at init: registering it here, under
+	 * b->lock, would order the PM chain rwsem after b->lock, while
+	 * ane_fw_pm_event() takes them the other way round.
+	 */
 	__module_get(THIS_MODULE);
-	b->retained = true;
+	WRITE_ONCE(b->retained, true);
 	return 0;
 }
 
@@ -2439,6 +2444,14 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 		ane_backend = NULL;
 		goto fail;
 	}
+	/* Once, outside b->lock (see ane_fw_retain()); it acts once retained. */
+	b->pm_notifier.notifier_call = ane_fw_pm_event;
+	ret = register_pm_notifier(&b->pm_notifier);
+	if (ret) {
+		device_remove_file(&pdev->dev, &dev_attr_firmware_stage);
+		ane_backend = NULL;
+		goto fail;
+	}
 	dev_info(&pdev->dev, "H17 ANE: loader hand-off verified; starting the engine\n");
 	INIT_WORK(&b->start, ane_fw_start_work);
 	return 0;
@@ -2550,6 +2563,7 @@ bool ane_fw_staged_exit(void)
 	/* A retained backend pins the module. No unload or in-place retry. */
 	if (WARN_ON(b->retained))
 		return true;
+	unregister_pm_notifier(&b->pm_notifier);
 	device_remove_file(&b->pdev->dev, &dev_attr_firmware_stage);
 	ane_backend = NULL;
 	ane_fw_observer_free(b);

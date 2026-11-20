@@ -78,7 +78,11 @@ struct ane_h16_device {
 	bool claimed;
 	bool attached;
 	bool pinned;
-	/* While pinned: refuse system sleep (ane_fw_sleep.h). */
+	/*
+	 * Registered at probe, outside ane_h16_lock: the PM chain calls it with
+	 * its rwsem held and it takes ane_h16_lock. Until pinned it does nothing.
+	 * While pinned: refuse system sleep (ane_fw_sleep.h).
+	 */
 	struct notifier_block pm_notifier;
 	int irq;
 	/*
@@ -758,6 +762,13 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 	struct ane_h16_device *h = container_of(nb, struct ane_h16_device, pm_notifier);
 	bool pinned = READ_ONCE(h->pinned);
 
+	/*
+	 * Registered at probe, before the device is pinned: until then there
+	 * is nothing to cycle or refuse. Pinning happens under the system
+	 * sleep lock (ane_h16_start_work()), never inside a transition.
+	 */
+	if (!pinned)
+		return NOTIFY_DONE;
 	/* Without a sleep path on this platform, every sleep is refused as before. */
 	if (!h->boot.soc->sleep_warm && !h->boot.soc->sleep_cold) {
 		if (ane_fw_sleep_refused(event, pinned))
@@ -790,21 +801,18 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 static int ane_h16_pin(void *ctx)
 {
 	struct ane_h16_device *h = ctx;
-	int ret;
 
 	/* A cold boot after sleep runs the boot again; pinned once for good. */
 	if (h->pinned)
 		return 0;
 	if (!try_module_get(THIS_MODULE))
 		return -ENODEV;
-	/* Pinned for good: the notifier stays registered until reboot. */
-	h->pm_notifier.notifier_call = ane_h16_pm_event;
-	ret = register_pm_notifier(&h->pm_notifier);
-	if (ret) {
-		module_put(THIS_MODULE);
-		return ret;
-	}
-	h->pinned = true;
+	/*
+	 * Pinned for good. The PM notifier was registered at probe: registering
+	 * it here, under ane_h16_lock, would order the PM chain rwsem after
+	 * ane_h16_lock, while ane_h16_pm_event() takes them the other way round.
+	 */
+	WRITE_ONCE(h->pinned, true);
 	ane_h16_released = true;
 	return 0;
 }
@@ -953,6 +961,10 @@ static int ane_h16_map(void *ctx)
 	unsigned int count = 0, i;
 	int ret;
 
+	/* Unmanaged domains can otherwise attach retained, firmware-owned roots. */
+	ret = ane_h16_dart_protection(b, true);
+	if (ret)
+		return ret;
 	if (of_count_phandle_with_args(h->dev->of_node, "iommus", "#iommu-cells") != 3) {
 		dev_err(h->dev, "H16 map requires only SID 0 on three DARTs; refusing extra streams\n");
 		return -EOPNOTSUPP;
@@ -1617,6 +1629,8 @@ static void ane_h16_release(struct ane_h16_device *h)
 		dev_pm_domain_detach(pd, true);
 	}
 	h->acquired = false;
+	vfree(h->pristine_data);
+	h->pristine_data = NULL;
 	dev_info(h->dev, "H16 pre-RUN rollback complete; no CPU release\n");
 }
 
@@ -2036,6 +2050,7 @@ static ssize_t ane_h16_stage_write(struct file *file, const char __user *ubuf,
 				   size_t count, loff_t *ppos)
 {
 	struct ane_h16_device *h = file->private_data;
+	unsigned int flags;
 	char buf[16];
 	int stage, ret;
 
@@ -2048,9 +2063,12 @@ static ssize_t ane_h16_stage_write(struct file *file, const char __user *ubuf,
 	stage = ane_h16_stage_parse(buf);
 	if (stage <= ANE_H16_REFUSE)
 		return -EINVAL;
+	/* As the start work: a stage that pins never lands inside a sleep transition. */
+	flags = lock_system_sleep();
 	mutex_lock(&ane_h16_lock);
 	ret = ane_h16_advance(h, stage);
 	mutex_unlock(&ane_h16_lock);
+	unlock_system_sleep(flags);
 	return ret ? ret : count;
 }
 
@@ -2185,9 +2203,29 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	platform_set_drvdata(pdev, h);
 	INIT_WORK(&h->recover, ane_h16_recover_work);
 	INIT_WORK(&h->start, ane_h16_start_work);
+	mutex_unlock(&ane_h16_lock);
+
+	/*
+	 * Outside ane_h16_lock (see pm_notifier), and before the start work
+	 * that can pin the device, so a pinned device always has it.
+	 */
+	h->pm_notifier.notifier_call = ane_h16_pm_event;
+	ret = register_pm_notifier(&h->pm_notifier);
+	if (ret) {
+		dev_err(h->dev, "H16 PM notifier refused, error %d\n", ret);
+		debugfs_remove_recursive(h->debugfs);
+		mutex_lock(&ane_h16_lock);
+		if (!--ane_h16_debugfs_users) {
+			debugfs_remove_recursive(ane_h16_debugfs);
+			ane_h16_debugfs = NULL;
+		}
+		mutex_unlock(&ane_h16_lock);
+		platform_set_drvdata(pdev, NULL);
+		kfree(h);
+		return ret;
+	}
 	schedule_work(&h->start);
-	ret = 0;
-	goto unlock;
+	return 0;
 free:
 	dev_err(h->dev, "H16 DT description refused, error %d\n", ret);
 	drm_mm_takedown(&h->program_window);
@@ -2200,6 +2238,7 @@ unlock:
 void ane_h16_backend_remove(struct platform_device *pdev)
 {
 	struct ane_h16_device *h = platform_get_drvdata(pdev);
+	bool keep;
 
 	if (!h)
 		return;
@@ -2212,12 +2251,21 @@ void ane_h16_backend_remove(struct platform_device *pdev)
 		flush_work(&h->session.export_work);
 	}
 	debugfs_remove_recursive(h->debugfs);
+	/*
+	 * Nothing can pin the device any more: the start work, the recovery
+	 * and the stage file are gone. An unpinned device drops its PM
+	 * notifier here, outside ane_h16_lock; a pinned one keeps it.
+	 */
+	scoped_guard(mutex, &ane_h16_lock)
+		keep = h->boot.ran || h->pinned;
+	if (!keep)
+		unregister_pm_notifier(&h->pm_notifier);
 	mutex_lock(&ane_h16_lock);
 	if (!--ane_h16_debugfs_users) {
 		debugfs_remove_recursive(ane_h16_debugfs);
 		ane_h16_debugfs = NULL;
 	}
-	if (h->boot.ran || h->pinned) {
+	if (keep) {
 		/* The module reference taken before RUN makes this unreachable by rmmod. */
 		dev_warn(h->dev, "H16 remove held; reboot reclaims firmware DMA\n");
 	} else {
