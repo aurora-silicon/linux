@@ -132,6 +132,11 @@ module_param(t8122_mcc, bool, 0600);
 MODULE_PARM_DESC(t8122_mcc,
 		 "J613 trial: step the memory controller down after the watchdog-control clear, as macOS");
 
+static bool t8122_macos_commit;
+module_param(t8122_macos_commit, bool, 0600);
+MODULE_PARM_DESC(t8122_macos_commit,
+		 "J613 trial: after the commit word, macOS's tail: PMU RTC alarm unmask and arm, then CLLT and the commit word twice more");
+
 static bool t8122_macos_state;
 module_param(t8122_macos_state, bool, 0600);
 MODULE_PARM_DESC(t8122_macos_state,
@@ -1249,8 +1254,29 @@ static void t8122_sleep_pre_commit(struct apple_sleep *s)
 		t8122_dc_puts(" HOLD before commit\n");
 }
 
+/*
+ * macOS's commit tail (capture run 51, both cycles): after the first commit write it writes the
+ * PMU RTC alarm itself (f80e mask <- 0, f800 control <- 0x41, around its compare write), then
+ * CLLT 0, 0, 0x1c17 and the commit word, twice. The alarm's compare stays as the RTC driver set it.
+ */
+static void t8122_macos_commit_tail(struct apple_sleep *s)
+{
+	int n;
+
+	t8122_pmu_write(s, 0xf80e, 0);
+	t8122_pmu_write(s, 0xf800, 0x41);
+	for (n = 0; n < 2; n++) {
+		writel(0, s->cllt + T8122_CLLT_CTL);
+		writel(0, s->cllt + T8122_CLLT_CTL);
+		writel(0x1c17, s->cllt + T8122_CLLT_LAST);
+		writel(1, s->commit);
+	}
+}
+
 static void t8122_sleep_post_timer(struct apple_sleep *s)
 {
+	if (READ_ONCE(t8122_macos_commit))
+		t8122_macos_commit_tail(s);
 	t8122_dc_putc('C');
 }
 
