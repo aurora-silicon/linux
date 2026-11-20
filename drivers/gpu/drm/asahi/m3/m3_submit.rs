@@ -59,7 +59,7 @@ pub(crate) struct Packet {
 }
 /// The runtime a queue's packets go to: the M3 runtime or the J413 27.2 compute runtime.
 #[derive(Clone)]
-pub(crate) enum Sink { M3(Shared), J413(Arc<crate::j413::Runtime>) }
+pub(crate) enum Sink { M3(Shared), J413(Arc<crate::j413::Runtime>), J313(Arc<crate::j313::Runtime>) }
 /// The process and thread that submitted a packet, recorded in the submit ioctl. Only logged:
 /// a renamed task leaves a stale name, which is harmless.
 #[derive(Copy,Clone)]
@@ -138,6 +138,7 @@ impl sched::JobImpl for Job {
         let submitted=match &job.shared {
             Sink::M3(shared)=>crate::m3::m3_runtime::Runtime::submit(shared,job.packet.clone()),
             Sink::J413(runtime)=>runtime.submit(job.packet.clone()),
+            Sink::J313(runtime)=>runtime.submit(job.packet.clone()),
         };
         if let Err(e)=submitted {
             pr_err!("M3 scheduler: submission failed {:?}\n",e);
@@ -151,6 +152,12 @@ impl sched::JobImpl for Job {
             Sink::M3(shared)=>shared.clone(),
             Sink::J413(runtime)=>{
                 // The runtime's own command timeout fails a hung GPU; a healthy one is late.
+                if runtime.healthy() {return sched::Status::NoHang;}
+                runtime.withdraw(&job.packet);
+                job.packet.finish(Err(EIO));
+                return sched::Status::NoDevice;
+            }
+            Sink::J313(runtime)=>{
                 if runtime.healthy() {return sched::Status::NoHang;}
                 runtime.withdraw(&job.packet);
                 job.packet.finish(Err(EIO));
@@ -182,6 +189,7 @@ impl sched::JobImpl for Job {
         match &job.shared {
             Sink::M3(shared)=>{crate::m3::m3_runtime::Runtime::withdraw(shared,&job.packet);}
             Sink::J413(runtime)=>runtime.withdraw(&job.packet),
+            Sink::J313(runtime)=>runtime.withdraw(&job.packet),
         }
         job.packet.finish(Err(ECANCELED));
     }
@@ -227,6 +235,16 @@ impl Queue {
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
             shared:Sink::J413(runtime),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_j413_queue"),kernel::static_lock_class!())?,
+            early_tiling:false,wide_visibility:false,urgency,j413_alloc:Some(ualloc_priv)})
+    }
+    pub(crate) fn new_j313(runtime:Arc<crate::j313::Runtime>,scheduler:Arc<sched::Scheduler<Job>>,vm:mmu::Vm,priority:u32,usc:u64,
+        ualloc_priv:Arc<Mutex<crate::alloc::DefaultAllocator>>)->Result<Self> {
+        agx_uapi::QueueUscWindow{base:usc,user_start:0x4000,user_end:(1u64<<42)-0x8000}.validate().map_err(|_|EINVAL)?;
+        let urgency=3u8.saturating_sub(priority.min(3) as u8);
+        let priority=match priority {3=>sched::Priority::Low,2=>sched::Priority::Normal,
+            1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
+        Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
+            shared:Sink::J313(runtime),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_j313_queue"),kernel::static_lock_class!())?,
             early_tiling:false,wide_visibility:false,urgency,j413_alloc:Some(ualloc_priv)})
     }
 }

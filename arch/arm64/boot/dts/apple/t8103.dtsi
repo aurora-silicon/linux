@@ -477,6 +477,11 @@
 		uat_ttbs: uat-ttbs@30 {
 			reg = <0 0x30 0 0>;
 		};
+
+		/* Filled in by the boot loader for GPU firmware 27.2. */
+		uat_pagetables_l2: uat-pagetables-l2 {
+			status = "disabled";
+		};
 	};
 
 	soc {
@@ -497,9 +502,11 @@
 			mboxes = <&agx_mbox>;
 			power-domains = <&ps_gfx>;
 			memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
-					<&gpu_hw_cal_a>, <&gpu_hw_cal_b>, <&gpu_globals>;
+					<&gpu_hw_cal_a>, <&gpu_hw_cal_b>, <&gpu_globals>,
+					<&uat_pagetables_l2>;
 			memory-region-names = "ttbs", "pagetables", "handoff",
-					      "hw-cal-a", "hw-cal-b", "globals";
+					      "hw-cal-a", "hw-cal-b", "globals",
+					      "shared-l2";
 
 			apple,firmware-abi = <0 0 0>;
 

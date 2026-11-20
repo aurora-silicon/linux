@@ -276,7 +276,8 @@ fn filter_versions(
 }
 
 pub(crate) fn versions(attr: TokenStream, item: TokenStream) -> TokenStream {
-    // AGX_ROOT is AGX plus G14/V27_2, which only the T8112 27.2 bring-up types instantiate.
+    // AGX_ROOT is AGX plus G13/V27_2 and G14/V27_2, which only the T8103 and T8112 27.2
+    // bring-up types instantiate.
     let group = attr.to_string();
     let config = match group.as_str() {
         "AGX" | "AGX_ROOT" => &AGX_VERSIONS,
@@ -323,8 +324,12 @@ pub(crate) fn versions(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     body.extend(it);
 
-    let candidate = (group == "AGX_ROOT").then_some(&["G14", "V27_2"][..]);
-    for ver in config.versions.iter().copied().chain(candidate) {
+    let candidates: &[&[&str]] = if group == "AGX_ROOT" {
+        &[&["G13", "V27_2"], &["G14", "V27_2"]]
+    } else {
+        &[]
+    };
+    for ver in config.versions.iter().copied().chain(candidates.iter().copied()) {
         let tag = ver.join("");
         let mut ver_num = Vec::<usize>::new();
         for (i, comp) in ver.iter().enumerate() {

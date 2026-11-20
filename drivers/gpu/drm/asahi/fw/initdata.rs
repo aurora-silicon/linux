@@ -1319,6 +1319,19 @@ pub(crate) mod raw {
         assert!(core::mem::offset_of!(Root, extra) == 0xc0);
         assert!(core::mem::size_of::<Root>() == 0xc8);
     };
+
+    // T8103 (G13G) on 27.2 takes the same root and the same inline hardware block.
+    const _: () = {
+        assert!(core::mem::offset_of!(HwDataBG13V27_2, io_mappings) == 0x640);
+        assert!(core::mem::offset_of!(HwDataBG13V27_2, sgx_sram_ptr) == 0xfa0);
+        assert!(core::mem::offset_of!(HwDataBG13V27_2, coredump_copy_buffer_size) == 0xfa8);
+        assert!(core::mem::offset_of!(HwDataBG13V27_2, chip_id) == 0xfb0);
+        type Root = InitDataG13V27_2<'static>;
+        assert!(core::mem::offset_of!(Root, role) == 0x28);
+        assert!(core::mem::offset_of!(Root, status_record) == 0xa8);
+        assert!(core::mem::offset_of!(Root, extra) == 0xc0);
+        assert!(core::mem::size_of::<Root>() == 0xc8);
+    };
 }
 
 #[derive(Debug)]

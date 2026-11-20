@@ -28,6 +28,8 @@ mod g18;
 mod m5;
 mod gpu;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod j313;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod j413;
 
 mod hw;

@@ -119,6 +119,10 @@ pub(crate) fn version_words(word: u64) -> fw::types::Array<4, u16> {
 mod j413_root;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 pub(crate) use j413_root::*;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod j313_root;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+pub(crate) use j313_root::*;
 
 const RX_WORK_PENDING: u32 = 1 << 0;
 const RX_WORK_RUNNING: u32 = 1 << 1;
@@ -696,7 +700,7 @@ impl GpuManager::ver {
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
         // The 26B123 timestamp aperture falls inside the legacy private range.
         // Keep normal allocations below it in the J413 construction profile.
-        let private_end = if cfg.chip_id == 0x8112 && _trial_version == Some(0x0c8a_8342_8392_04c8) {
+        let private_end = if matches!(cfg.chip_id, 0x8103 | 0x8112) && _trial_version == Some(0x0c8a_8342_8392_04c8) {
             G14G_TIMESTAMP_RANGE.start
         } else {
             IOVA_KERN_PRIV_RANGE.end

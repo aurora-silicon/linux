@@ -119,6 +119,8 @@ mod lifetime;
 mod m5_context;
 mod ppl;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod j313;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod m3;
 mod residency;
 mod shared;
