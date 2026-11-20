@@ -229,7 +229,6 @@ static int apple_pmgr_ps_verify_bringup(struct apple_pmgr_ps *ps,
 		dev_warn_ratelimited(ps->dev,
 				     "PS %s: bring-up write swallowed (readback 0x%x), retry %d\n",
 				     genpd->name, rb, try + 1);
-		udelay(1000);
 		/* rewrite: the swallowed write must actually land this time */
 		if (regmap_write(ps->regmap, ps->offset, reg))
 			break;
