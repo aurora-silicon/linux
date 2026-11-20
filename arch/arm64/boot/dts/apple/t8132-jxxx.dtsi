@@ -443,6 +443,11 @@
 &dart_apcie0 {
 	apple,managed-sids = <1 2>;
 	apple,dma-range = <0x100 0x00100000 0x0 0x3fe00000>;
+	/*
+	 * Limit the static SID16 stream to this SoC page instead of keeping
+	 * it in bypass. The radio's SID16 writes on the J713 reach only it.
+	 */
+	apple,sid16-page = /bits/ 64 <0x381204000>;
 	status = "okay";
 };
 
