@@ -189,7 +189,7 @@ impl Firmware {
                 .engine
                 .oldest()
                 .is_some_and(|flight| flight.computes != 0 && flight.renders == 0);
-            // Ray traversal: every flight of such a job (`Job::long`).
+            // Ray traversal and AS builds: every flight of such a job (`Job::long`).
             let long = self.engine.oldest().is_some_and(|flight| flight.job.long());
             let deadline = self.recovery.deadlines.select(compute_only, long);
             if logic::expired(now, deadline) {

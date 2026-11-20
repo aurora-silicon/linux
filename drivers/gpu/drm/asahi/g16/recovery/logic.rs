@@ -133,10 +133,10 @@ pub(crate) fn renew(now: u64, deadline_ms: u32, compute_deadline_ms: u32) -> (u6
     )
 }
 
-/// Ray traversal can run past one administrative deadline (CTS stress). As on the M4 Pro
-/// (g17 `timeout::select`: two-second polls plus four extra ones), a job with such a command
-/// gets at least ten seconds per flight. Still bounded: this is an allowance, not evidence of
-/// GPU progress.
+/// Ray traversal and acceleration-structure builds can run past one administrative deadline
+/// (CTS stress). As on the M4 Pro (g17 `timeout::select`: two-second polls plus four extra
+/// ones), a job with such a command gets at least ten seconds per flight. Still bounded:
+/// this is an allowance, not evidence of GPU progress.
 pub(crate) const LONG_DEADLINE_MS: u32 = 10_000;
 
 /// The administrative deadline of a long job, ms: at least [`LONG_DEADLINE_MS`], unless the

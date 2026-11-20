@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""Host-check the G16G ray-query command set (RENDER_RAY_QUERY).
+"""Host-check the G16G ray-tracing command set (RENDER_RAY_QUERY, BOUNDED_AS_BUILD).
 
 Compiles the production g16/rt.rs, recovery/logic.rs and the TA/FS/compute encoders, plus the
 command admission and engine conversion functions copied verbatim from command.rs and
@@ -20,10 +20,10 @@ Failure modes this guards against (written before the code):
     (E2BIG); zero cores is accepted.
  5. A render whose scratch exceeds its queue's reservation is accepted, or one within it
     refused; an unmapped intersection pool or default program is accepted.
- 6. The long allowance misses a ray job, applies to plain work, re-enables a disabled
+ 6. The long allowance misses a ray/AS-build job, applies to plain work, re-enables a disabled
     (zero) deadline, or shortens a deadline already longer than 10 s.
- 7. Scratch alone counts as ray traversal.
- 8. The feature word loses a bit or gains another than RENDER_RAY_QUERY.
+ 7. A compute flag other than AS_BUILD is accepted; scratch alone counts as ray traversal.
+ 8. The feature word loses a bit or gains another than RENDER_RAY_QUERY and BOUNDED_AS_BUILD.
  9. A UMA manager image or compute descriptor reports seeds that are not whole rows inside the
     freelist.
 """
@@ -90,10 +90,10 @@ with tempfile.TemporaryDirectory(prefix='m4-rt-features-') as name:
     subprocess.run(shlex.split(os.environ.get('CC', 'cc')) + ['-std=gnu11', '-Wall', '-Werror', '-D__user=',
                    '-idirafter', str(header.parents[1]), str(source), '-o', str(binary)], check=True)
     features = int(subprocess.run([str(binary)], check=True, capture_output=True, text=True).stdout, 16)
-assert features == 0x9c02, hex(features)
+assert features == 0x19c02, hex(features)
 assert sorted(names) == sorted(['DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS', 'DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS',
-                                'DRM_ASAHI_FEATURE_RENDER_RAY_QUERY']), names
-print(f'feature word {features:#x} (RENDER_RAY_QUERY added to 0x1c02)')
+                                'DRM_ASAHI_FEATURE_RENDER_RAY_QUERY', 'DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD']), names
+print(f'feature word {features:#x} (RENDER_RAY_QUERY | BOUNDED_AS_BUILD added to 0x1c02)')
 
 harness = r'''
 #![allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals, unused_imports)]
@@ -129,7 +129,7 @@ struct Context<'a> { vm: &'a mmu::Vm, usc_base: u64, active_cores: u32, render_s
 @CONVERSION@
 type KBox<T> = Box<T>;
 struct RenderCommand { ray_query: [rt::RayQueryStage; 2] }
-struct ComputeCommand { ray: rt::ComputeRay }
+struct ComputeCommand { ray: rt::ComputeRay, as_build: bool }
 enum Command { Render(KBox<RenderCommand>), Compute(KBox<ComputeCommand>) }
 @LONG@
 
@@ -343,7 +343,7 @@ fn scs_sizing_is_the_m4_pro_formula_in_whole_rows() {
 }
 
 #[test]
-fn ray_admission() {
+fn ray_and_as_build_admission() {
     let vm = mmu::Vm { mapped: vec![(POOL, POOL + 0x4000), (0x10010020000, 0x10010020040)] };
     let context = Context { vm: &vm, usc_base: 0, active_cores: 10, render_scs: [791, 0] };
     assert_eq!(check_compute_ray(&context, &ray(LAYOUTS[0].0)), Ok(()));
@@ -365,16 +365,19 @@ fn ray_admission() {
     assert_eq!(check_render_ray(&context, &[stage(LAYOUTS[1].0), none]), Err(E2BIG));
     assert_eq!(check_render_ray(&Context { vm: &unmapped, ..context }, &[stage(LAYOUTS[0].0), none]), Err(ENOENT));
     assert_eq!(check_render_ray(&Context { render_scs: [0, 0], ..context }, &[none, none]), Ok(()));
+    // Flags: AS_BUILD alone.
+    assert_eq!(rt::as_build(0), Some(false)); assert_eq!(rt::as_build(4), Some(true));
+    for flag in [1, 2, 8, 1 << 16, 1 << 17, 1 << 20, 5, 6] { assert_eq!(rt::as_build(flag), None); }
 }
 
 #[test]
 fn long_allowance_follows_g17_select_per_job() {
     let render = |stages: [rt::RayQueryStage; 2]| Command::Render(Box::new(RenderCommand { ray_query: stages }));
-    let compute = |ray: rt::ComputeRay, _: bool| Command::Compute(Box::new(ComputeCommand { ray }));
+    let compute = |ray: rt::ComputeRay, as_build: bool| Command::Compute(Box::new(ComputeCommand { ray, as_build }));
     let none = rt::RayQueryStage::NONE;
     assert!(render([stage(LAYOUTS[0].0), none]).long() && render([none, stage(LAYOUTS[0].0)]).long());
     assert!(!render([none, none]).long() && !render([none, none]).scs());
-    assert!(compute(ray(LAYOUTS[0].0), false).long());
+    assert!(compute(ray(LAYOUTS[0].0), false).long() && compute(rt::ComputeRay::NONE, true).long());
     assert!(!compute(rt::ComputeRay::NONE, false).long());
     // Scratch alone is not traversal (as on the M4 Pro), but it needs an SCS pool.
     let scratch = rt::ComputeRay::new(LAYOUTS[0].0, 0, 0, 0, 0, 0, 0, 0, 0).unwrap();

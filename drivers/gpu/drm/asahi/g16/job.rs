@@ -94,8 +94,9 @@ pub(crate) struct Job {
     pub(crate) vm: Arc<VmState>,
     /// Validated commands, in submission order (at most 64).
     pub(crate) commands: KVec<Command>,
-    /// Some command traces rays: every command of the job gets the long execution allowance,
-    /// so an ordered helper cannot time out waiting for it.
+    /// Some command traces rays or builds acceleration structures: every command of the job
+    /// gets the long execution allowance, so an ordered helper cannot time out waiting for it
+    /// (DRM_ASAHI_COMPUTE_AS_BUILD).
     long: bool,
     pub(crate) resources: super::resources::Prepared,
     /// Immutable dependency/order ledger, one entry for every accepted command.

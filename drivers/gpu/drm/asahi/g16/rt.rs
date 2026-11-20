@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Hardware ray tracing on G16G (RENDER_RAY_QUERY).
+//! Hardware ray tracing on G16G (RENDER_RAY_QUERY and BOUNDED_AS_BUILD).
 //!
 //! The command state is the shared G17P UAPI: a compute command's packed shader-context
-//! scratch (SCS) layout and intersection tables, and a render's per-stage ray-query
-//! state. The validation, the register words they become and the SCS memory
+//! scratch (SCS) layout and intersection tables, a render's per-stage ray-query state, and the
+//! compute AS-build flag. The validation, the register words they become and the SCS memory
 //! sizing are those of the M4 Pro (T6041, the same G16 GPU generation) on its 26B123 firmware
 //! (`g17::fw::variant::V26B123`): its compute program is 25F84's (`compute_registers_25f84`),
 //! which writes the intersection and scratch words but neither 0x017d9 nor 0x1a141, the shape
@@ -374,6 +374,17 @@ impl RayQueryStage {
     /// Whether the stage carries intersection tables.
     pub(crate) fn traces(self) -> bool {
         self.intersection.enabled()
+    }
+}
+
+/// Only the explicit AS-build bit (bit 2) is accepted; reserved and unrelated compute flags
+/// stay invalid on G16G, as on the M4 Pro (g17 `timeout::as_build`).
+pub(crate) fn as_build(flags: u32) -> Option<bool> {
+    const AS_BUILD: u32 = 1 << 2;
+    if flags & !AS_BUILD != 0 {
+        None
+    } else {
+        Some(flags & AS_BUILD != 0)
     }
 }
 
