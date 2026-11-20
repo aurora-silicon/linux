@@ -75,14 +75,6 @@ MODULE_PARM_DESC(j613_wktp2,
  */
 static bool j613_saved;
 module_param(j613_saved, bool, 0444);
-/*
- * J613 trial: after AP IDLE, take what the SMC sent the AP off its mailbox. Capture run 58's
- * Linux counterpart (n14's post-commit watch) found wake source 208, SMC.OutboxNotEmpty, pending
- * after the commit; macOS leaves 208 unmasked and reads the SMC's inbox before its commit.
- */
-static bool j613_drain;
-module_param(j613_drain, bool, 0444);
-MODULE_PARM_DESC(j613_drain, "J613 trial: empty the SMC's mailbox to the AP after AP IDLE, before the commit");
 static bool j613_pmvc;
 module_param(j613_pmvc, bool, 0600);
 MODULE_PARM_DESC(j613_saved, "J613 trial: the bounded, IRQ-independent SMC transport J813's late notice uses");
@@ -1518,20 +1510,6 @@ static int apple_smc_sleep_after_peers(void *data, u64 *sent, u64 *ack)
 	ret = apple_rtkit_m5_saved_ap_power(smc->rtk, false, sent, ack);
 	if (!ret)
 		mdelay(SMC_SLEEP_IDLE_MS);
-	if (!ret && READ_ONCE(j613_drain) && of_machine_is_compatible("apple,j613")) {
-		int i, got = 0, r = 0;
-
-		/* Committed: a notification is kept for the resume's replay, not a cancel. */
-		for (i = 0; i < 64; i++) {
-			r = apple_rtkit_m5_saved_poll(smc->rtk);
-			if (r <= 0)
-				break;
-			got++;
-		}
-		dev_info(smc->dev, "J613 sleep: %d message(s) taken off the SMC's mailbox after AP IDLE (last poll %d, fault %d)\n",
-			 got, r, smc->saved_fault);
-		/* Logged only: the trial wants the commit and the watch after it either way. */
-	}
 out:
 	smc->saved_notice_error = ret;
 	return ret;
