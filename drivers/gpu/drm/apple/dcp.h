@@ -92,6 +92,19 @@ bool dcp_fw_compat_is_14_7(struct platform_device *pdev);
 bool dcp_fw_compat_is_desktop(struct platform_device *pdev);
 bool dcp_fw_compat_panel_edr(struct platform_device *pdev);
 unsigned int dcp_gamma_lut_size(struct platform_device *pdev);
+/* Whether a DCP reporting firmware-compat @compat runs the firmware-27 instance. */
+enum dcp_v27_admission {
+	DCP_V27_NOT_V27,	/* older than 27: the older interfaces decide */
+	DCP_V27_NO_TABLE,	/* 27 or later, no method table for the build */
+	DCP_V27_INCOMPLETE,	/* 27 or later, a method has no known ID */
+	DCP_V27_ADMITTED,
+};
+
+struct dcp_method_entry;
+enum dcp_v27_admission dcp_v27_admission(const char *compat,
+					 const struct dcp_method_entry **methods,
+					 const char **missing,
+					 unsigned int *num_missing);
 /* T6041 external display processors may join the DRM device. */
 bool dcp_t6041_ext_enabled(void);
 void dcp_backlight_takeover_registered(struct platform_device *pdev);

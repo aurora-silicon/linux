@@ -4487,7 +4487,9 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 	if ((dcp->fw_compat == DCP_FIRMWARE_H17P ||
 	     dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL &&
-	    !dcp_is_ext26(dcp)) {
+	    !dcp_is_ext26(dcp) &&
+	    /* The M1's firmware-27 DCP doesn't advertise it. */
+	    apple_rtkit_has_endpoint(dcp->rtk, REMOTE_ALLOC_ENDPOINT)) {
 		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
 		if (ret)
 			return ret;

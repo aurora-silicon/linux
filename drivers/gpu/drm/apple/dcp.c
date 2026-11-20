@@ -5803,44 +5803,90 @@ static bool dcp_v27_sleep_transport_supported(struct apple_dcp *dcp)
 	       !strcmp(compat, "27.0.0");
 }
 
+/*
+ * Firmware 27 is selected by the ABI the DCP reports, the same on every SoC:
+ * a DCP or dcpext whose firmware-compat is 27 or later runs the common
+ * firmware-27 instance with the method table of that build. The interfaces
+ * written for older firmware make it panic (T8142 on 27.0 with H17P: "ap_link:
+ * callback failed with: 0x5"), so a 27 or later build without a complete
+ * table is not started at all. Pure, so the host test runs the same rule.
+ */
+enum dcp_v27_admission dcp_v27_admission(const char *compat,
+					 const struct dcp_method_entry **methods,
+					 const char **missing,
+					 unsigned int *num_missing)
+{
+	unsigned int major;
+
+	*methods = NULL;
+	*missing = NULL;
+	*num_missing = 0;
+	if (sscanf(compat, "%u.", &major) != 1 || major < 27)
+		return DCP_V27_NOT_V27;
+	*methods = iomfb_v27_methods(compat);
+	if (!*methods)
+		return DCP_V27_NO_TABLE;
+	*missing = iomfb_v27_missing_method(*methods, num_missing);
+	if (*missing)
+		return DCP_V27_INCOMPLETE;
+	return DCP_V27_ADMITTED;
+}
+
+/*
+ * Returns true if the DCP reports firmware 27 or later, with @version the
+ * firmware-27 instance or DCP_FIRMWARE_UNKNOWN if this build cannot be started.
+ */
+static bool dcp_firmware_27(struct device *dev,
+			    enum dcp_firmware_version *version)
+{
+	char compat[DCP_FW_VERSION_STR_LEN];
+	const struct dcp_method_entry *methods;
+	unsigned int num_missing;
+	const char *missing;
+
+	if (dcp_read_fw_version(dev, "apple,firmware-compat", compat) < 0)
+		return false;
+
+	switch (dcp_v27_admission(compat, &methods, &missing, &num_missing)) {
+	case DCP_V27_NOT_V27:
+		return false;
+	case DCP_V27_NO_TABLE:
+		dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
+			compat);
+		*version = DCP_FIRMWARE_UNKNOWN;
+		return true;
+	case DCP_V27_INCOMPLETE:
+		dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
+			compat, num_missing, missing);
+		*version = DCP_FIRMWARE_UNKNOWN;
+		return true;
+	case DCP_V27_ADMITTED:
+		break;
+	}
+	*version = DCP_FIRMWARE_V_27_0;
+	return true;
+}
+
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(dev);
 	const struct dcp_v14_board *v14_board;
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
+	enum dcp_firmware_version version;
 	unsigned int num_missing;
 	const char *missing;
 	int ret;
 
-	/*
-	 * T8142 (J813) on macOS 27.0: the H17P interface written for its 26.x
-	 * firmware makes the 27.0 DCP firmware panic right after the first
-	 * hotplug ("ap_link: callback failed with: 0x5"). It runs the T6050's
-	 * firmware-27 generation, and so does 27.2, with the 27.2 method table.
-	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcp")) {
-		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret >= 0 && (!strcmp(compat_str, "27.0.0") ||
-				 !strcmp(compat_str, "27.2.0")))
-			return DCP_FIRMWARE_V_27_0;
-	}
+	if (dcp_firmware_27(dev, &version))
+		return version;
 
+	/* The T6050 was introduced on firmware 27 and has no older interface. */
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret < 0 || !iomfb_v27_methods(compat_str)) {
-			dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
-				ret < 0 ? "missing" : compat_str);
-			return DCP_FIRMWARE_UNKNOWN;
-		}
-		missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
-						   &num_missing);
-		if (missing) {
-			dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
-				compat_str, num_missing, missing);
-			return DCP_FIRMWARE_UNKNOWN;
-		}
-		return DCP_FIRMWARE_V_27_0;
+		dev_err(dev, "DCP firmware-compat %s is not 27 or later\n",
+			ret < 0 ? "missing" : compat_str);
+		return DCP_FIRMWARE_UNKNOWN;
 	}
 
 	/*
@@ -6132,9 +6178,20 @@ clocks:
 	if (!of_property_present(dev->of_node, "apple,clock-ids") &&
 	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext"))
 		return 0;
+	/*
+	 * An M1/M2/M3 device tree has no apple,clock-ids: the ADT lists no DCP
+	 * firmware clocks, but the firmware-27 DCP still asks for clock index 0,
+	 * the display clock (getClockFrequency(0)). Give it the node's clocks.
+	 */
+	if (!of_property_present(dev->of_node, "apple,clock-ids")) {
+		ret = devm_clk_bulk_get_all(dev, &dcp->firmware_clocks);
+		if (ret < 0)
+			return ret;
+		dcp->num_firmware_clocks = ret;
+		return 0;
+	}
 	clocks = of_property_count_u32_elems(dev->of_node, "apple,clock-ids");
-	if (clocks == -ENODATA &&
-	    of_property_present(dev->of_node, "apple,clock-ids"))
+	if (clocks == -ENODATA)
 		clocks = 0;
 	if (clocks < 0 || clocks > 64)
 		return -EINVAL;
@@ -7162,6 +7219,15 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			     (!s2r_untested || fw_compat != DCP_FIRMWARE_V_27_0))))
 		dcp->hw.s2r = false;
 	dcp->v27_sleep_transport = dcp_v27_sleep_transport_supported(dcp);
+	/*
+	 * Every processor on firmware 27 inherits the live session the boot
+	 * loader handed over. Its match data keeps the per-SoC port count,
+	 * tunnel-flow flag and DART resources; only the session adoption follows
+	 * the firmware. (The T8140 dcpext, the one processor whose match data
+	 * does not adopt, is refused above on anything but 26.6.2.)
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0)
+		dcp->hw.adopt_live_session = true;
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
 		dcp_desktop_metadata_new_sink(dcp);

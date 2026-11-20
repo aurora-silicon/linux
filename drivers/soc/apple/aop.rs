@@ -2902,6 +2902,9 @@ impl rtkit::Operations for AopData {
 struct AopDriver(Arc<dyn AOP>);
 
 struct AopHwConfig {
+    /// Check and map the firmware segments only when the bootloader reserved
+    /// some (M1 on macOS 27: `__ETEXT` and `__EDATA` in DRAM; none on 13.5).
+    fw_regions_if_present: bool,
     ec0p: u64,
     /// The `nCal` boot argument, or `None` to keep the firmware's own value.
     ncal: Option<u64>,
@@ -2937,6 +2940,7 @@ struct AopHwConfig {
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
+    fw_regions_if_present: true,
     ec0p: 0x020000,
     ncal: Some(0),
     aopt: 1,
@@ -2957,6 +2961,7 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
 /// `nCal` keeps the firmware's own value, as on T6040: the J413 image carries 1,
 /// and with 0 the firmware never announces its accelerometer and gyroscope.
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
+    fw_regions_if_present: false,
     ec0p: 0x020000,
     ncal: None,
     aopt: 0,
@@ -2976,6 +2981,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
 };
 /// `nCal` keeps the firmware's own value, as on T8112.
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
+    fw_regions_if_present: false,
     ec0p: 0x020000,
     ncal: None,
     aopt: 0,
@@ -2994,6 +3000,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     halt_on_failed_start: false,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
+    fw_regions_if_present: false,
     ec0p: 0x0100_00000000,
     ncal: Some(0),
     aopt: 0,
@@ -3017,6 +3024,7 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
 /// with 0 the accelerometer and gyroscope services accept their calibration
 /// and report interval but never send a report.
 const HW_CFG_T6040: AopHwConfig = AopHwConfig {
+    fw_regions_if_present: false,
     ec0p: 0x0100_00000000,
     ncal: Some(1),
     aopt: 0,
@@ -3044,6 +3052,7 @@ const HW_CFG_T8132: AopHwConfig = HW_CFG_T6040;
 /// aop-audio, 0x22 aop-voicetrigger, 0x23 als and 0x2b aop-audprov; the rest
 /// are started if they will.
 const HW_CFG_T8140: AopHwConfig = AopHwConfig {
+    fw_regions_if_present: false,
     ec0p: 0,
     ncal: Some(0),
     aopt: 0,
@@ -3064,6 +3073,7 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
 /// T8152: like T8140, but the setup port (mailbox 1 of the AOP bank, and the
 /// ADT aop-exclave-mailbox) is not reachable from the AP: both bus-error.
 const HW_CFG_T8152: AopHwConfig = AopHwConfig {
+    fw_regions_if_present: false,
     ec0p: 0,
     ncal: None,
     aopt: 0,
@@ -3088,6 +3098,7 @@ const HW_CFG_T8152: AopHwConfig = AopHwConfig {
 /// MacBook Air J813, not T8140's set). EPIC and AFK as on T8152; the
 /// firmware runs with the boot arguments iBoot left.
 const HW_CFG_T8142: AopHwConfig = AopHwConfig {
+    fw_regions_if_present: false,
     ec0p: 0,
     ncal: None,
     aopt: 0,
@@ -3109,6 +3120,7 @@ const HW_CFG_T8142: AopHwConfig = AopHwConfig {
 /// AOP ASC + 0x4007c000. Its EPMAP also names system endpoint 4, which never
 /// asks for a buffer, so boot doesn't wait for it.
 const HW_CFG_T6050: AopHwConfig = AopHwConfig {
+    fw_regions_if_present: false,
     setup_wait_system_endpoints: false,
     ..HW_CFG_T8142
 };
@@ -3203,7 +3215,10 @@ impl platform::Driver for AopDriver {
         let asc_req = pdev.io_request_by_index(1).ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
         let asc_mmio = asc_mmio.as_view().relaxed();
-        let ed0p = if cfg.fw_regions {
+        // SAFETY: `pdev` is the device being probed; its node outlives the probe.
+        let has_fw_regions = cfg.fw_regions_if_present
+            && unsafe { bindings::of_reserved_mem_region_count((*pdev.as_ref().as_raw()).of_node) } > 0;
+        let ed0p = if cfg.fw_regions || has_fw_regions {
             // Before anything is written to the AOP: no mapping, no start.
             AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p)?.map(|(iova, _)| iova)
         } else {
