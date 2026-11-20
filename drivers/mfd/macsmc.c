@@ -646,6 +646,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
 	smc->dev = &pdev->dev;
+	smc->wktp = of_device_is_compatible(dev->of_node, "apple,t6041-smc");
 	smc->saved_enabled = of_machine_is_compatible("apple,t6050") &&
 		(of_machine_is_compatible("apple,j714s") ||
 		 of_machine_is_compatible("apple,j716c")) &&
@@ -839,6 +840,34 @@ static void apple_smc_write_mbse(struct apple_smc *smc, smc_key value)
 		dev_err(smc->dev, "Failed to issue MBSE = %p4ch: %d\n", &value, ret);
 }
 
+/*
+ * SMC key pmVC, the request for the VDD_CIO rail: the enable mask | 0x100 (0x101 on the T6040's
+ * J616s). Linux never asks for the rail, which is power-gated otherwise (ADT vdd-cio-rail-pg), and
+ * a rail the SMC drops during the sleep transition races the sleep engine's hand-over of the ATC
+ * ports.
+ */
+#define SMC_PMVC_REQUEST	0x101
+
+/**
+ * apple_smc_request_pmvc() - ask the SMC to keep the VDD_CIO rail up
+ * @smc: the SMC
+ *
+ * Writes pmVC at the moment the caller picks, for a sleep controller that issues it ahead of
+ * the device suspend phase.
+ *
+ * Return: 0 on success, a negative errno otherwise.
+ */
+int apple_smc_request_pmvc(struct apple_smc *smc)
+{
+	int ret;
+
+	ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), SMC_PMVC_REQUEST);
+	if (ret < 0)
+		dev_warn(smc->dev, "pmVC: write %#x failed: %d\n", SMC_PMVC_REQUEST, ret);
+	return ret;
+}
+EXPORT_SYMBOL(apple_smc_request_pmvc);
+
 static void apple_smc_sleep_warn(struct apple_smc *smc)
 {
 	apple_smc_write_mbse(smc, SMC_KEY(slpw));
@@ -869,10 +898,26 @@ static int apple_smc_notice_idle(struct apple_smc *smc)
 	return ret;
 }
 
+/*
+ * WKTP, one byte, the value for power state 0. It goes first at the sleep request, ahead of
+ * the other sleep keys (slpa among them) and the AP idle notice. Only for an SMC known to take
+ * it: the T6041's.
+ */
+#define SMC_WKTP_SLEEP		2
+/* And once a wake is a full one: see apple_smc_wake_full(). */
+#define SMC_WKTP_AWAKE		0
+
 static int apple_smc_sleep_commit(struct apple_smc *smc)
 {
 	int ret;
 
+	/* Whatever is written here, the SMC runs the wake after this silent until it is told. */
+	smc->wake_silent = true;
+	if (smc->wktp) {
+		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_SLEEP);
+		if (ret)
+			dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_SLEEP, ret);
+	}
 	apple_smc_write_mbse(smc, SMC_KEY(slpa));
 	/* Device interrupts are off here. */
 	mdelay(SMC_SLEEP_ARM_MS);
@@ -1499,11 +1544,30 @@ static int apple_smc_suspend(struct device *dev)
 }
 
 /* Warned, and a refusal came before the notice: tell it the sleep is off. */
+/*
+ * WKTP once a wake is a full one: 0, where a wake that stays dark keeps the key nonzero.
+ * Without the 0 the SMC treats all the time awake as a power nap.
+ */
+static void apple_smc_wake_full(struct apple_smc *smc)
+{
+	int ret;
+
+	if (!smc->wake_silent)
+		return;
+	smc->wake_silent = false;
+	if (!smc->wktp)
+		return;
+	ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_AWAKE);
+	if (ret)
+		dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_AWAKE, ret);
+}
+
 static void apple_smc_complete(struct device *dev)
 {
 	struct apple_smc *smc = dev_get_drvdata(dev);
 
 	apple_sleep_smc_unregister(dev);
+	apple_smc_wake_full(smc);
 
 	/* Not saved_pending: an ordinary command may be in flight here, and it is read without the mutex. */
 	if (smc->saved_enabled && (smc->saved_recovery || smc->saved_fault)) {
