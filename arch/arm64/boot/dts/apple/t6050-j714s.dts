@@ -311,12 +311,13 @@
 
 /*
  * Type-C, from the ADT:
- *   ATC0 usb-drd0 left-back  hpm0 nub-spmi-a0 0x0c (the debug port, not described)
+ *   ATC0 usb-drd0 left-back  hpm0 nub-spmi-a0 0x0c (the debug port)
  *   ATC1 usb-drd1 left-front hpm1 nub-spmi-a0 0x0a
  *   ATC2 usb-drd2 right      hpm2 nub-spmi-a1 0x0c
  *   hpm5 nub-spmi-a0 0x08 (MagSafe 3, power in only: no connector node)
  * There is no usb-drd3 and no nub-spmi-a2, so ATC3's USB chain and that bus stay
- * off. Both described ports are wired as on J716s.
+ * off. The left-front and right ports are wired as on J716s; the left-back port is in
+ * t6050-j714s-left-back.dtsi.
  */
 &atc3_phy_mbox {
 	status = "disabled";
@@ -438,6 +439,14 @@
 
 /* Left-front port (ATC1): the USB4/Thunderbolt router and its PCIe tunnel */
 #include "t6050-j714s-left-usb4.dtsi"
+
+/* Left-back port (ATC0) */
+#include "t6050-j714s-left-back.dtsi"
+
+/* Reserve ATC0 LSTX until aura hands it over; ATC1/2 retain their pins. */
+&pinctrl_aop {
+	gpio-reserved-ranges = <0 79>, <80 1>, <82 3>;
+};
 
 /*
  * The PMP (ADT pmp0, /chosen, /arm-io/pmgr). iBoot loads its firmware and the driver starts it
