@@ -110,17 +110,20 @@
 	};
 
 	dcp_dart: iommu@286340000 {
-		compatible = "apple,t8152-dart", "apple,t8110-dart";
-		reg = <0x2 0x86340000 0x0 0x20000>;
+		compatible = "apple,t8152-dart-gen3";
+		reg = <0x2 0x86340000 0x0 0x20000>,
+		      <0x2 0x00000400 0x0 0x10>;
+		reg-names = "dart", "tlbi";
 		interrupts = <AIC_IRQ 884 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
 
 	disp0_dart: iommu@286300000 {
-		compatible = "apple,t8152-dart", "apple,t8110-dart";
+		compatible = "apple,t8152-dart-gen3";
 		reg = <0x2 0x86300000 0x0 0xc000>,
-		      <0x2 0x86314000 0x0 0x4000>;
+		      <0x2 0x00000400 0x0 0x10>;
+		reg-names = "dart", "tlbi";
 		interrupts = <AIC_IRQ 884 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		status = "disabled";
@@ -135,17 +138,20 @@
 	};
 
 	dcpext0_dart: iommu@32a340000 {
-		compatible = "apple,t8152-dart", "apple,t8110-dart";
-		reg = <0x3 0x2a340000 0x0 0x20000>;
+		compatible = "apple,t8152-dart-gen3";
+		reg = <0x3 0x2a340000 0x0 0x20000>,
+		      <0x2 0x00000480 0x0 0x10>;
+		reg-names = "dart", "tlbi";
 		interrupts = <AIC_IRQ 1022 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
 
 	dispext0_dart: iommu@32a300000 {
-		compatible = "apple,t8152-dart", "apple,t8110-dart";
+		compatible = "apple,t8152-dart-gen3";
 		reg = <0x3 0x2a300000 0x0 0xc000>,
-		      <0x3 0x2a314000 0x0 0x4000>;
+		      <0x2 0x00000480 0x0 0x10>;
+		reg-names = "dart", "tlbi";
 		interrupts = <AIC_IRQ 1022 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		status = "disabled";
