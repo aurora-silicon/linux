@@ -868,6 +868,7 @@ static void t8122_asc_census_log(struct apple_sleep *s)
  * write (k0-k2); macOS's reads 1 after a real sleep. Logs 0x2e42d4000..+0xff at the entry.
  */
 static bool t8122_commit_page;
+static void __iomem *t8122_cp_page, *t8122_cp_mini;
 module_param(t8122_commit_page, bool, 0600);
 MODULE_PARM_DESC(t8122_commit_page, "J613 diagnostic: log the commit word's page (0x2e42d4000, 256 bytes) at the entry");
 
@@ -890,8 +891,14 @@ static void t8122_commit_page_log(struct apple_sleep *s)
 
 static int t8122_sleep_begin(struct apple_sleep *s)
 {
-	if (t8122_commit_page)
+	if (t8122_commit_page) {
 		t8122_commit_page_log(s);
+		/* Process context here; the pre-commit dump runs with interrupts off. Kept mapped. */
+		if (!t8122_cp_page)
+			t8122_cp_page = ioremap_np(0x2e42d4000, 0x100);
+		if (!t8122_cp_mini)
+			t8122_cp_mini = ioremap_np(0x2e4280000, 0x108);
+	}
 	if (t8122_asc_census)
 		t8122_asc_census_log(s);
 	t8122_witness_reset();
@@ -1363,8 +1370,31 @@ static void t8122_dump_macos(struct apple_sleep *s)
 }
 
 /* The mailbox is armed: 'c' before the commit word, 'C' once every line is masked after it. */
+/* The same words as capture crumb bit 26's J613CPG, just before the first commit write. */
+static void t8122_commit_page_dc(struct apple_sleep *s)
+{
+	void __iomem *page = t8122_cp_page, *mini = t8122_cp_mini;
+	unsigned int i;
+
+	t8122_dc_puts("\nP page");
+	for (i = 0; page && i < 0x100; i += 4) {
+		t8122_dc_putc(' ');
+		t8122_dc_hex(readl(page + i));
+	}
+	t8122_dc_puts("\nP mini");
+	for (i = 0; mini && i <= 0x100; i += 8) {
+		t8122_dc_putc(' ');
+		t8122_dc_hex(readl(mini + i));
+	}
+	t8122_dc_puts("\nP sio ");
+	t8122_dc_hex(readl(s->ps + T8122_PS_SIO_CPU));
+	t8122_dc_puts("\nP end\n");
+}
+
 static void t8122_sleep_pre_commit(struct apple_sleep *s)
 {
+	if (READ_ONCE(t8122_commit_page))
+		t8122_commit_page_dc(s);
 	if (READ_ONCE(t8122_dump))
 		t8122_dump_macos(s);
 	t8122_dc_putc('c');
