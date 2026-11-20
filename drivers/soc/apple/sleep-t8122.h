@@ -153,6 +153,15 @@ MODULE_PARM_DESC(t8122_el1_wfi, "J613 trial: take the last WFI at EL1, as macOS:
  * CurrentEL; bit 1 also S3_1_C15_C0_0, S3_5_C15_C1_1 and S3_5_C15_C1_3 (macOS: 0, 0, 0xf). The
  * boot core prints them ("R" lines) after its 'Z'.
  */
+/*
+ * J613 trial: S3_5_C15_C1_3 at the last WFI as macOS's. macOS's cores read 0xf there (capture run
+ * 50), Linux's 0xc (n50 witness e-20261120T200502Z): this sets the two low bits, on each core,
+ * right before its last WFI. Nothing restores it; a reset or the wake follows.
+ */
+static bool t8122_c1_3;
+module_param(t8122_c1_3, bool, 0600);
+MODULE_PARM_DESC(t8122_c1_3, "J613 trial: S3_5_C15_C1_3 |= 0x3 before each core's last WFI (macOS reads 0xf, Linux 0xc)");
+
 static unsigned int t8122_wfi_regs;
 module_param(t8122_wfi_regs, uint, 0600);
 MODULE_PARM_DESC(t8122_wfi_regs, "J613 DIAGNOSTIC: print every core's state at its last WFI (bit 0 architectural, bit 1 also three IMPDEF words)");
@@ -1346,6 +1355,10 @@ static void t8122_deep_wfi_arm(void)
 	if (t8122_quiet)
 		sleep_core_fiq_quiet();
 	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
+	if (READ_ONCE(t8122_c1_3)) {
+		sysreg_clear_set_s(sys_reg(3, 5, 15, 1, 3), 0, 0x3);
+		isb();
+	}
 	if (READ_ONCE(t8122_wfi_regs))
 		t8122_wfi_record();
 	if (!boot && el1 >= 2 && is_kernel_in_hyp_mode()) {
