@@ -167,14 +167,112 @@ unsafe fn shared<'a>(cookie: *mut c_void) -> ArcBorrow<'a, Shared> {
 /// # Safety
 ///
 /// `cookie` must be the live Shared cookie registered with these RTKit operations.
-unsafe extern "C" fn rtkit_crashed(cookie: *mut c_void, _log: *const c_void, _size: usize) {
+unsafe extern "C" fn rtkit_crashed(cookie: *mut c_void, log: *const c_void, size: usize) {
     // SAFETY: RTKit passes back the registered cookie.
     let shared = unsafe { shared(cookie) };
     dev_err!(
         shared.dev,
         "GPU firmware crashed; retaining session until reboot\n"
     );
+    if !log.is_null() && size != 0 {
+        // SAFETY: RTKit passes its shadow copy of the crash log, `size` bytes, valid and not
+        // written for the duration of this call.
+        let log = unsafe { core::slice::from_raw_parts(log.cast::<u8>(), size) };
+        dump_crashlog(&shared.dev, log);
+    }
     shared.fail_stop(EIO);
+}
+
+const fn fourcc(tag: &[u8; 4]) -> u32 {
+    u32::from_be_bytes(*tag)
+}
+
+/// Crash log sections RTKit's parser does not decode on the 27.2 GPU firmware, and its
+/// register section, whose fixed layout reads the 27.2 ESR as `0xfffffc00be000000`: the
+/// context the SError interrupted is not in the registers it prints (those are
+/// `__rtk_arch_exception`'s own frame).
+const CRASHLOG_DUMP: [u32; 7] = [
+    fourcc(b"Crg8"),
+    fourcc(b"Csts"),
+    fourcc(b"CasC"),
+    fourcc(b"Crtk"),
+    fourcc(b"Ccdp"),
+    fourcc(b"Cpct"),
+    fourcc(b"Csta"),
+];
+const CRASHLOG_HEADER: u32 = fourcc(b"CLHE");
+/// Bytes printed per section; all-zero rows are counted, not printed.
+const CRASHLOG_DUMP_MAX: usize = 0x800;
+
+fn le32(log: &[u8], at: usize) -> Option<u32> {
+    let b = log.get(at..at.checked_add(4)?)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Hex-dumps the undecoded sections of the crash log: the first `CLHE` log in the buffer
+/// (inside any container), walked as RTKit walks it (fourcc at +0, size at +12, from +0x20).
+fn dump_crashlog(dev: &kernel::device::Device, log: &[u8]) {
+    let Some(start) = (0..log.len().saturating_sub(0x20))
+        .step_by(4)
+        .find(|&at| le32(log, at) == Some(CRASHLOG_HEADER))
+    else {
+        dev_err!(dev, "G16 crashlog: no CLHE log in {:#x} bytes\n", log.len());
+        return;
+    };
+    let end = match le32(log, start + 8) {
+        Some(len) if len as usize >= 0x20 && start + len as usize <= log.len() => {
+            start + len as usize
+        }
+        _ => log.len(),
+    };
+    dev_err!(dev, "G16 crashlog: CLHE at {:#x}, end {:#x}\n", start, end);
+    let mut at = start + 0x20;
+    while at + 16 <= end {
+        let (Some(tag), Some(len)) = (le32(log, at), le32(log, at + 12)) else {
+            break;
+        };
+        let len = len as usize;
+        if tag == CRASHLOG_HEADER || len < 16 || len > end - at {
+            break;
+        }
+        let name = tag.to_be_bytes().map(|c| if c.is_ascii_graphic() { c } else { b'?' });
+        let name = core::str::from_utf8(&name).unwrap_or("????");
+        dev_err!(dev, "G16 crashlog {} at {:#x}, {:#x} bytes\n", name, at, len);
+        if CRASHLOG_DUMP.contains(&tag) {
+            let mut zeros = 0;
+            let shown = len.min(CRASHLOG_DUMP_MAX);
+            for row in (0..shown).step_by(32) {
+                let w = |i: usize| le32(log, at + row + i * 4).unwrap_or(0);
+                let words = [w(0), w(1), w(2), w(3), w(4), w(5), w(6), w(7)];
+                if words.iter().all(|&x| x == 0) {
+                    zeros += 1;
+                    continue;
+                }
+                if zeros != 0 {
+                    dev_err!(dev, "G16 crashlog {}: {} zero rows\n", name, zeros);
+                    zeros = 0;
+                }
+                dev_err!(
+                    dev,
+                    "G16 crashlog {} +{:#05x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}\n",
+                    name,
+                    row,
+                    words[0],
+                    words[1],
+                    words[2],
+                    words[3],
+                    words[4],
+                    words[5],
+                    words[6],
+                    words[7]
+                );
+            }
+            if zeros != 0 {
+                dev_err!(dev, "G16 crashlog {}: {} zero rows\n", name, zeros);
+            }
+        }
+        at += len;
+    }
 }
 
 /// RTKit message callback.
