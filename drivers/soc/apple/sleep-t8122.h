@@ -133,6 +133,7 @@ MODULE_PARM_DESC(t8122_mcc,
 		 "J613 trial: step the memory controller down after the watchdog-control clear, as macOS");
 
 static bool t8122_macos_commit;
+static bool t8122_post_commit_watch;
 module_param(t8122_macos_commit, bool, 0600);
 MODULE_PARM_DESC(t8122_macos_commit,
 		 "J613 trial: after the commit word, macOS's tail: PMU RTC alarm unmask and arm, then CLLT and the commit word twice more");
@@ -1342,11 +1343,22 @@ static void t8122_macos_commit_tail(struct apple_sleep *s)
 		writel(0, s->cllt + T8122_CLLT_CTL);
 		writel(0x1c17, s->cllt + T8122_CLLT_LAST);
 		writel(1, s->commit);
+		if (READ_ONCE(t8122_post_commit_watch)) {
+			t8122_dc_puts(" k");
+			t8122_dc_putc('1' + n);
+			t8122_dc_putc('=');
+			t8122_dc_hex(readl(s->commit));
+		}
 	}
 }
 
 static void t8122_sleep_post_timer(struct apple_sleep *s)
 {
+	/* The first commit write's readback, before anything else touches the engine */
+	if (READ_ONCE(t8122_post_commit_watch)) {
+		t8122_dc_puts("\nk0=");
+		t8122_dc_hex(readl(s->commit));
+	}
 	if (READ_ONCE(t8122_macos_commit))
 		t8122_macos_commit_tail(s);
 	t8122_dc_putc('C');
@@ -1422,7 +1434,6 @@ static const struct apple_sleep_wake_name t8122_wake_names[] = {
 
 static const u32 t8122_wake_required[] = { 155 };
 
-static bool t8122_post_commit_watch;
 module_param(t8122_post_commit_watch, bool, 0600);
 MODULE_PARM_DESC(t8122_post_commit_watch,
 		 "J613 DIAGNOSTIC: after the commit and the other cores' release, this core spins 3 s and writes the sleep engine's words to the DockChannel at 5, 50, 500 and 3000 ms, then takes its WFI");
