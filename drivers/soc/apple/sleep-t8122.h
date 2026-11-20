@@ -1383,7 +1383,61 @@ static const struct apple_sleep_wake_name t8122_wake_names[] = {
 
 static const u32 t8122_wake_required[] = { 155 };
 
+static bool t8122_post_commit_watch;
+module_param(t8122_post_commit_watch, bool, 0600);
+MODULE_PARM_DESC(t8122_post_commit_watch,
+		 "J613 DIAGNOSTIC: after the commit and the other cores' release, this core spins 3 s and writes the sleep engine's words to the DockChannel at 5, 50, 500 and 3000 ms, then takes its WFI");
+
+/*
+ * After the commit: what the engine has done with the other cores while this one stays up.
+ * Q<n>: commit word, E/P cluster words, E/P power gates, CPU-start's four words, CLLT control
+ * and last, and the wake block's 0x24..0x44 status. macOS, read at its wake (run 56): gates
+ * 0x80000000, clusters 0 / 0xf, CPU-start 0xef, CLLT last 0x31c17, status +0x34 = 0x08000000.
+ */
+static void t8122_sleep_post_release(struct apple_sleep *s)
+{
+	static const unsigned int at_ms[] = { 5, 50, 500, 3000 };
+	unsigned int n, i, done = 0;
+
+	if (!READ_ONCE(t8122_post_commit_watch))
+		return;
+	for (n = 0; n < ARRAY_SIZE(at_ms); n++) {
+		mdelay(at_ms[n] - done);
+		done = at_ms[n];
+		t8122_dc_puts("\nQ");
+		t8122_dc_putc('0' + n);
+		t8122_dc_puts(" c=");
+		t8122_dc_hex(readl(s->commit));
+		t8122_dc_puts(" cl=");
+		t8122_dc_hex(readl(s->cluster + T8122_CLUSTER_E));
+		t8122_dc_putc('/');
+		t8122_dc_hex(readl(s->cluster + T8122_CLUSTER_P));
+		t8122_dc_puts(" g=");
+		t8122_dc_hex(readl(s->pwrgate + T8122_PWRGATE_E));
+		t8122_dc_putc('/');
+		t8122_dc_hex(readl(s->pwrgate + T8122_PWRGATE_P));
+		t8122_dc_puts(" s=");
+		for (i = 0; i < 4; i++) {
+			t8122_dc_hex(readl(s->cpu_start + 4 * i));
+			t8122_dc_putc(i < 3 ? '/' : ' ');
+		}
+		t8122_dc_puts("l=");
+		t8122_dc_hex(readl(s->cllt + T8122_CLLT_CTL));
+		t8122_dc_putc('/');
+		t8122_dc_hex(readl(s->cllt + T8122_CLLT_LAST));
+		if (s->wake) {
+			t8122_dc_puts(" w=");
+			for (i = 0x24; i <= 0x44; i += 4) {
+				t8122_dc_hex(readl(s->wake + i));
+				t8122_dc_putc(i < 0x44 ? '/' : ' ');
+			}
+		}
+	}
+	t8122_dc_puts("\nQ end\n");
+}
+
 static const struct apple_sleep_ops t8122_sleep_ops = {
+	.post_release = t8122_sleep_post_release,
 	.deep_wfi_arm = t8122_deep_wfi_arm,
 	.resume = cpu_resume,
 	.aic_mask_all = aic_sleep_mask_all,

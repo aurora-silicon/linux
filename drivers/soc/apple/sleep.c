@@ -618,6 +618,8 @@ struct apple_sleep_ops {
 	int (*check)(struct apple_sleep *s);
 	/* Optional traffic strictly after timer, before AIC/release/DEEP. */
 	void (*post_timer)(struct apple_sleep *s);
+	/* Optional: after the other cores' release, before this core's last WFI */
+	void (*post_release)(struct apple_sleep *s);
 	/* Optional: every coprocessor has stopped and the debug link is still up. */
 	void (*stopped)(struct apple_sleep *s);
 	/* The dry run's list: does macOS have this ps word off at its commit? */
@@ -5537,6 +5539,8 @@ static int apple_sleep_commit(unsigned long unused)
 	}
 	if (s->soc->boot_wfi_delay_ms)
 		mdelay(s->soc->boot_wfi_delay_ms);
+	if (s->soc->ops->post_release)
+		s->soc->ops->post_release(s);
 	if (s->soc->ops->last_mile == t8142_last_mile && READ_ONCE(sleep_post_commit_ms))
 		t8142_post_commit_probe(s, READ_ONCE(sleep_post_commit_ms));
 	sleep_boot_wfi(s);
