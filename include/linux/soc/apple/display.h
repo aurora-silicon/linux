@@ -74,4 +74,32 @@ static inline bool apple_t8122_dcp_v27_2(const struct device_node *np)
 				     APPLE_T8122_DCP_26B123_UUID);
 }
 
+/*
+ * The T8122 external display processor on the 27.2 image. The boot loader
+ * publishes its firmware version and compatibility but no image UUID; it
+ * runs the internal processor's image (its text segment is the internal
+ * DCP's region). So it qualifies when both of its own are 27.2.0 and the
+ * internal DCP was handed over on the 27.2 image.
+ */
+static inline bool apple_t8122_dcpext_v27_2(const struct device_node *np)
+{
+	struct device_node *dcp;
+	u32 fw[3], compat[3];
+	bool internal;
+
+	if (!np || !of_device_is_compatible(np, "apple,t8122-dcpext") ||
+	    of_property_count_u32_elems(np, "apple,firmware-version") != 3 ||
+	    of_property_count_u32_elems(np, "apple,firmware-compat") != 3 ||
+	    of_property_read_u32_array(np, "apple,firmware-version", fw, 3) ||
+	    of_property_read_u32_array(np, "apple,firmware-compat", compat, 3) ||
+	    fw[0] != 27 || fw[1] != 2 || fw[2] != 0 ||
+	    compat[0] != 27 || compat[1] != 2 || compat[2] != 0)
+		return false;
+
+	dcp = of_find_compatible_node(NULL, NULL, "apple,t8122-dcp");
+	internal = apple_t8122_dcp_v27_2(dcp);
+	of_node_put(dcp);
+	return internal;
+}
+
 #endif

@@ -6028,11 +6028,15 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 
 	/*
 	 * The T8122 external processor: Linux starts it and drives 14.7
-	 * firmware through the classic IOMFB template, as on M1/M2.
+	 * firmware through the classic IOMFB template, as on M1/M2. On the
+	 * 27.2 image it runs the firmware-27 backend with the 27.2 table, as
+	 * the internal processor does.
 	 */
 	if (of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")) {
 		if (dcp_ext26_admitted(dev->of_node))
 			return DCP_FIRMWARE_H17P;
+		if (apple_t8122_dcpext_v27_2(dev->of_node))
+			return dcp_v27_method_table(dev, compat_str);
 		if (!strcmp(compat_str, "14.7.0"))
 			return DCP_FIRMWARE_V_14_7_TEMPLATE;
 		dev_err(dev, "T8122 external display not started: DCP firmware-compat %s is not 14.7.0\n",
@@ -6236,8 +6240,10 @@ clocks:
 		dcp->num_firmware_clocks = 2;
 		return 0;
 	}
+	/* External processors without a provider clock table (T6041, T8122). */
 	if (!of_property_present(dev->of_node, "apple,clock-ids") &&
-	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext"))
+	    (of_device_is_compatible(dev->of_node, "apple,t6041-dcpext") ||
+	     of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")))
 		return 0;
 	clocks = of_property_count_u32_elems(dev->of_node, "apple,clock-ids");
 	if (clocks == -ENODATA &&
@@ -7292,6 +7298,18 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp->hw.firmware_dma_bits = 41;
 		dcp->hw.num_dptx_ports = 0;
 		dcp->hw.adopt_live_session = true;
+	}
+	/*
+	 * The T8122 external processor on firmware 27: the boot loader leaves
+	 * it unpowered (its DISPEXT domains are off at handoff), so Linux
+	 * starts it as on 14.7, with the firmware-27 endpoints and both DPTX
+	 * port services. Its DART window is the one the device tree describes.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")) {
+		dcp->hw.num_dptx_ports = 2;
+		dcp->hw.fw_14_7_endpoints = false;
+		dcp->hw.adopt_live_session = false;
 	}
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext")) {
