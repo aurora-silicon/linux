@@ -77,7 +77,82 @@
 	phy-names = "dp-phy";
 	hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
 	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+	/*
+	 * The main pipe's realtime bandwidth request slot (D003), as macOS
+	 * gives it on this Mac ("IOMFB Int RTBandwidth: 0x382820000"). Without
+	 * it the firmware runs with "IOMFB Int RTBandwidth: DISABLED".
+	 */
+	apple,bw-scratch = <&pmgr_dcp_bw 0 4 0>;
+	/* D408 getClockFrequency(0): /arm-io/disp0 clock-id 364's ADT rate. */
+	clocks = <&dcp_fw_clk364>;
 	status = "okay";
+};
+
+/*
+ * The HDMI port as macOS drives it, from dispext0 (4K60, and 4K120 with DSC,
+ * on that pipe alone; the main DCP booted and idle), through the same PHY
+ * (source select = its dcp-index 1) and converter rails as the main DCP. It is
+ * used when the boot loader hands dispext0 over (aura: boot.bin line
+ * chosen.asahi,j713-dcpext=1); otherwise the main DCP above drives the port.
+ * iBoot leaves DISPEXT0 running: Linux must not switch its domains, as for the
+ * main DCP.
+ */
+&dcpext0_mbox {
+	/delete-property/ power-domains;
+	status = "okay";
+};
+
+&dcpext0_dart {
+	/delete-property/ power-domains;
+	status = "okay";
+};
+
+&dispext0_dart {
+	/delete-property/ power-domains;
+	status = "okay";
+};
+
+&dcpext0 {
+	/delete-property/ power-domains;
+	apple,connector-type = "HDMI-A";
+	apple,dptx-phy = <4>;
+	phys = <&dptx_phy>;
+	phy-names = "dp-phy";
+	hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
+	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+	clocks = <&dcp_fw_clk369>;
+	status = "okay";
+};
+
+/ {
+	/*
+	 * The display pipes' firmware clocks, from the ADT's /arm-io
+	 * clock-frequencies at their first clock-id (disp0 364, dispext0 369),
+	 * the same in the 26.6.2 and 27.2 trees. Their second clock-ids (431,
+	 * 432) have no rate.
+	 */
+	dcp_fw_clk364: clock-dcp-firmware-364 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <300000000>;
+		clock-output-names = "dcp_firmware_364";
+	};
+
+	dcp_fw_clk369: clock-dcp-firmware-369 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <533333328>;
+		clock-output-names = "dcp_firmware_369";
+	};
+};
+
+&soc {
+	/* 0x20000 into the window the main DCP has as disp-4. */
+	pmgr_dcp_bw: power-management@382820000 {
+		reg = <0x3 0x82820000 0x0 0x8>;
+		reg-names = "dcp-bw-scratch";
+		#apple,bw-scratch-cells = <3>;
+	};
 };
 
 &disp0_piodma {

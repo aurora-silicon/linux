@@ -910,6 +910,18 @@ static bool apple_dart_t8132_main_external(void)
 		!of_property_read_string(dcp, "apple,connector-type", &connector) &&
 		!strcmp(connector, "HDMI-A");
 	of_node_put(dcp);
+	/*
+	 * The fixed HDMI port on dispext0 instead (as macOS drives it): the main
+	 * DCP stays booted and idle, its tables as the boot loader handed them
+	 * over for the port, and its display DART still serves the display
+	 * device's imports, as when the main DCP drives the port.
+	 */
+	for_each_compatible_node(dcp, NULL, "apple,t8132-dcpext") {
+		if (!qualified && of_device_is_available(dcp) &&
+		    !of_property_read_string(dcp, "apple,connector-type", &connector) &&
+		    !strcmp(connector, "HDMI-A"))
+			qualified = true;
+	}
 	return qualified;
 }
 

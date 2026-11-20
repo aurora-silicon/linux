@@ -8,6 +8,7 @@
  * completion; an uncertain transaction stays pinned until reboot.
  */
 #include <linux/atomic.h>
+#include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
@@ -163,6 +164,9 @@ struct iomfb_m4 {
 	size_t coproc_size;
 	/* The realtime bandwidth mailbox from the DT (0: none), see dcp_m4_bw_mailbox() */
 	u64 bw_mailbox;
+	/* D408: the firmware clock rate from the DT, see dcp_m4_fw_clock() */
+	bool fw_clock;
+	u64 fw_clock_hz;
 	struct work_struct backlight_work;
 	void __iomem *coproc;
 	struct apple_rtkit *rtkit;
@@ -1424,8 +1428,19 @@ static int dcp_m4_runtime_bandwidth(void *cookie, void *output)
 	return 0;
 }
 
+static int dcp_m4_runtime_clock_rate(void *cookie, u32 index, u64 *rate)
+{
+	struct dcp_m4_runtime *r = cookie;
+
+	if (!r->dcp->fw_clock)
+		return -ENOENT;
+	*rate = index ? 0 : r->dcp->fw_clock_hz;
+	return 0;
+}
+
 static const struct dcp_m4_callback_ops dcp_m4_runtime_ops = {
 	.call = dcp_m4_runtime_call,
+	.clock_rate = dcp_m4_runtime_clock_rate,
 	.property = dcp_m4_runtime_property,
 	.memory = dcp_m4_runtime_memory,
 	.event = dcp_m4_runtime_event,
@@ -2568,6 +2583,27 @@ static bool iomfb_m4_firmware_property(struct device_node *np, const char *name)
 }
 
 /*
+ * The rate the firmware asks for with D408 getClockFrequency(0): the DCP's
+ * own clock in the device tree (a fixed clock at the rate of the display's
+ * first ADT clock-id, as macOS answers), getClockFrequency(1) then 0, the
+ * rate of its second. Without one, the qualified J713 answers stand.
+ */
+static void dcp_m4_fw_clock(struct iomfb_m4 *dcp)
+{
+	struct clk *clk = of_clk_get(dcp->dev->of_node, 0);
+
+	if (IS_ERR(clk)) {
+		if (PTR_ERR(clk) != -ENOENT)
+			dev_warn(dcp->dev, "firmware clock: %pe: the default rates stand\n", clk);
+		return;
+	}
+	dcp->fw_clock_hz = clk_get_rate(clk);
+	dcp->fw_clock = true;
+	clk_put(clk);
+	dev_dbg(dcp->dev, "firmware clock %llu Hz\n", dcp->fw_clock_hz);
+}
+
+/*
  * The realtime bandwidth mailbox the DT gives @dev, or 0: apple,bw-scratch
  * names the provider's reg range, the firmware's display register index and
  * an offset into the range. The mailbox is DCP_M4_BW_MAILBOX_SIZE bytes, and
@@ -2677,6 +2713,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	dcp->owner = owner;
 	dcp->dev = dev;
 	dcp->bw_mailbox = dcp_m4_bw_mailbox(dev);
+	dcp_m4_fw_clock(dcp);
 	mutex_init(&dcp->lock);
 	mutex_init(&dcp->ext_modes_lock);
 	spin_lock_init(&dcp->state_lock);

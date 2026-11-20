@@ -26,6 +26,12 @@ struct dcp_m4_callback_ops {
 	 * Absent: the optional service is declined (status 1).
 	 */
 	int (*bandwidth)(void *cookie, void *output);
+	/*
+	 * D408 getClockFrequency(@index): the DCP's own firmware clock rate, 0
+	 * if the device tree gives it. Absent or failing: the answers the J713
+	 * handoff was qualified with.
+	 */
+	int (*clock_rate)(void *cookie, u32 index, u64 *rate);
 };
 
 struct dcp_m4_callback_shape {
@@ -120,6 +126,7 @@ static inline int dcp_m4_callback_dispatch(const struct dcp_m4_callback_ops *ops
 	u8 *out = output;
 	int method, ret;
 	u32 value;
+	u64 rate;
 
 	method = dcp_m4_callback_shape(tag, input_size, output_size);
 	if (method < 0)
@@ -186,7 +193,10 @@ static inline int dcp_m4_callback_dispatch(const struct dcp_m4_callback_ops *ops
 		value = get_unaligned_le32(in + 4);
 		if (memcmp(in, "VORP", 4) || value > 1)
 			return -EINVAL;
-		put_unaligned_le64(value ? 24000000 : 48000000, out);
+		if (ops->clock_rate && !ops->clock_rate(cookie, value, &rate))
+			put_unaligned_le64(rate, out);
+		else
+			put_unaligned_le64(value ? 24000000 : 48000000, out);
 		return 0;
 	case 590:
 		value = get_unaligned_le32(in);
