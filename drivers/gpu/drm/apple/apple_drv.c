@@ -1459,6 +1459,8 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	{ .compatible = "apple,t8132-dcp" },
 #endif
+	/* apple_dcp_usable(): only a J773g one on firmware 27.2. */
+	{ .compatible = "apple,t8132-dcpext" },
 	{},
 };
 
@@ -1483,7 +1485,13 @@ static bool apple_dcp_usable(struct device_node *np)
 		* firmware path only (see dcp_check_firmware_version()).
 		*/
 	       (!of_device_is_compatible(np, "apple,t8132-dcp") ||
-		apple_t8132_firmware_path());
+		apple_t8132_firmware_path()) &&
+	       /*
+		* A T8132 dcpext the M4 backend adopts is no component: its
+		* outputs are t8132_ext_drm.c's. The J773g's on 27.2 is a pipe.
+		*/
+	       (!of_device_is_compatible(np, "apple,t8132-dcpext") ||
+		apple_t8132_dcpext_v27_2(np));
 }
 
 static void apple_drm_quiesce_connectors(struct drm_device *drm)
