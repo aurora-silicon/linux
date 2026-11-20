@@ -349,17 +349,26 @@ impl Buffer::ver {
         let preempt2_size = num_clusters_adj * gpu.get_cfg().preempt2_size;
         let preempt3_size = num_clusters_adj * gpu.get_cfg().preempt3_size;
 
+        // Firmware 27.2 rebuilds the page list itself, so both lists must be visible to it, not
+        // only to the GPU in the client's address space.
+        #[ver(V >= V27_2)]
+        let (page_list, block_list) = (
+            alloc.shared.array_empty_tagged(max_pages, b"PLST")?,
+            alloc.shared.array_empty_tagged(max_blocks * 2, b"BLST")?,
+        );
+        #[ver(V < V27_2)]
+        let (page_list, block_list) = (
+            ualloc_priv.lock().array_empty_tagged(max_pages, b"PLST")?,
+            ualloc_priv.lock().array_empty_tagged(max_blocks * 2, b"BLST")?,
+        );
         let shared = &mut alloc.shared;
         let info = alloc.private.new_init(
             {
-                let ualloc_priv = &ualloc_priv;
                 try_init!(buffer::Info::ver {
                     block_ctl: shared.new_default::<buffer::BlockControl>()?,
                     counter: shared.new_default::<buffer::Counter>()?,
-                    page_list: ualloc_priv.lock().array_empty_tagged(max_pages, b"PLST")?,
-                    block_list: ualloc_priv
-                        .lock()
-                        .array_empty_tagged(max_blocks * 2, b"BLST")?,
+                    page_list: page_list,
+                    block_list: block_list,
                 })
             },
             |inner, _p| {

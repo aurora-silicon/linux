@@ -399,19 +399,14 @@ impl Runtime {
         let Some(render) = state.render.as_mut() else { return false; };
         let ctx = match packet.j313_render.as_ref() { Some(c) => c.clone(), None => return false };
         if let Some(job) = render.staged.take() {
-            // Fragment stage: the tiler command has retired.
+            // Fragment stage: the tiler command has retired; the fragment command was queued
+            // with it (behind a barrier on the tiler's stamp) and is tracked from here.
             let result = (|| -> Result<(mmu::VmBind, event::EventValue)> {
                 let bind = self.graph.trial_uat().bind(&packet.vm)?;
-                let stamp = render.last[1].next();
-                state.root.j313_ring_publish(&render.rings[1], job.fragment)?;
-                state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick_engine(1))?;
-                Ok((bind, stamp))
+                Ok((bind, render.last[1]))
             })();
             match result {
                 Ok((bind, stamp)) => {
-                    render.last[1] = stamp;
-                    render.sequence[1] += 1;
-                    render.published[1] += 1;
                     let ordinal = render.published[1];
                     let slot = job.slot;
                     render.next_slot = (render.next_slot + 1) % J313_RENDER_SLOTS;
@@ -484,7 +479,16 @@ impl Runtime {
                 }
                 state.root.j313_ring_publish(&render.rings[0], job.tiler)?;
                 render.published[0] += 1;
+                // The fragment queue gets the pass right away: a barrier on the tiler's stamp,
+                // then the fragment command, which a partial render may run early.
+                state.root.j313_ring_publish(&render.rings[1], job.barrier)?;
+                render.published[1] += 1;
+                state.root.j313_ring_publish(&render.rings[1], job.fragment)?;
+                render.published[1] += 1;
+                render.last[1] = values[1];
+                render.sequence[1] += 1;
                 state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick_engine(0))?;
+                state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick_engine(1))?;
                 Ok((bind, values[0], KBox::new(job, GFP_KERNEL)?))
             })();
             match result {

@@ -23,6 +23,7 @@ const TA_BYTES: usize = 0x800;
 const FRAG_BYTES: usize = 0xc00;
 const SEQ_BYTES: usize = 0x400;
 const INIT_BYTES: usize = 0x40;
+const BARRIER_BYTES: usize = 0x40;
 const TRACK_BYTES: usize = 0x100;
 const CURSOR_BYTES: usize = 0x40;
 const STAMP_BYTES: usize = 0x80;
@@ -144,6 +145,8 @@ pub(crate) struct J313RenderInputs<'a> {
 pub(crate) struct J313RenderJob {
     pub(crate) slot: usize,
     pub(crate) init: Option<u64>,
+    /// Barrier ahead of the fragment command: waits for the tiler's stamp.
+    pub(crate) barrier: u64,
     pub(crate) tiler: u64,
     pub(crate) fragment: u64,
     /// Why the buffer setup was emitted: (rebind, grown, auto-grown), buffer slot, blocks.
@@ -157,6 +160,7 @@ pub(crate) struct J313RenderPool {
     frag: fw::types::GpuArray<u8>,
     seqs: fw::types::GpuArray<u8>,
     init: fw::types::GpuArray<u8>,
+    barriers: fw::types::GpuArray<u8>,
     tracking: fw::types::GpuArray<u8>,
     cursors: fw::types::GpuArray<u8>,
     stamps: fw::types::GpuArray<u8>,
@@ -169,6 +173,7 @@ impl J313RenderPool {
         let frag = alloc.private.array_empty::<u8>(n * FRAG_BYTES)?;
         let seqs = alloc.private.array_empty::<u8>(n * 2 * SEQ_BYTES)?;
         let init = alloc.private.array_empty::<u8>(n * INIT_BYTES)?;
+        let barriers = alloc.private.array_empty::<u8>(n * BARRIER_BYTES)?;
         let mut tracking = alloc.private.array_empty::<u8>(n * 2 * TRACK_BYTES)?;
         let cursors = alloc.shared.array_empty::<u8>(n * 2 * CURSOR_BYTES)?;
         let stamps = alloc.shared.array_empty::<u8>(n * STAMP_BYTES)?;
@@ -178,7 +183,7 @@ impl J313RenderPool {
         }
         crate::pgtable::clean_poc(tracking.as_slice().as_ptr(), tracking.as_slice().len());
         crate::pgtable::poc_barrier();
-        Ok(Self { ta, frag, seqs, init, tracking, cursors, stamps })
+        Ok(Self { ta, frag, seqs, init, barriers, tracking, cursors, stamps })
     }
 
     /// Whether the firmware still holds either command of `slot` in a queue's tracking list.
@@ -613,9 +618,23 @@ impl J313RenderPool {
         } else {
             None
         };
+        // Tiler-to-fragment barrier (extended layout). The fragment command is queued with the
+        // tiler so that a partial render, which runs it while the tiler is still going, finds it.
+        let barrier_va = self.barriers.gpu_va().get() + (slot * BARRIER_BYTES) as u64;
+        {
+            let b = &mut self.barriers.as_mut_slice()[slot * BARRIER_BYTES..(slot + 1) * BARRIER_BYTES];
+            b.fill(0);
+            put32(b, 0, 4);
+            put64(b, 4, u64::from(ta_ev.fw_stamp_pointer()));
+            put64(b, 0xc, u64::from(ta_ev.fw_stamp_pointer()));
+            put32(b, 0x14, i.values[0]);
+            put32(b, 0x20, ta_ev.slot());
+            put32(b, 0x24, i.values[1]);
+            crate::pgtable::clean_poc(b.as_ptr(), b.len());
+        }
         crate::pgtable::poc_barrier();
         buffer.increment();
-        Ok(J313RenderJob { slot, init, why, tiler: ta_va, fragment: frag_va, _scene: scene, _aux_fb: aux_fb })
+        Ok(J313RenderJob { slot, init, barrier: barrier_va, why, tiler: ta_va, fragment: frag_va, _scene: scene, _aux_fb: aux_fb })
     }
 
     /// The start and end timestamp operations of a stage (kext `encodeTimeStamp` layout):
