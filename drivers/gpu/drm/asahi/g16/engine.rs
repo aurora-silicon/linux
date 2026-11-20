@@ -20,7 +20,7 @@ use kernel::{prelude::*, sync::Arc};
 
 use super::channel::Channel;
 use super::command::{Command, ComputeCommand, RenderCommand};
-use super::encode::{self, ComputeRefs, Geometry, RenderRefs};
+use super::encode::{self, ComputeRefs, ComputeRt, Geometry, RenderRefs, StageRt};
 use super::fw::channels::{SubmitRecord, RING_SLOTS};
 use super::fw::graph::{notifier_page, qstate};
 use super::fw::work::{self, BarrierType};
@@ -977,8 +977,8 @@ impl Firmware {
         draw: u64,
     ) -> Result<(RenderRefs, bool, Arc<super::pools::PbEpoch>, u64)> {
         let generation = job.vm.generation;
-        let arena = job.resources.render()?;
-        let mut a = arena.pools.prepare(k, draw)?;
+        let pools = job.resources.render_pools()?;
+        let mut a = pools.prepare(k, draw)?;
         // g16_pb_reuse: reuse this VM's retired epoch of the slot: no reseed, no InitBM.
         let (epoch, reused) = match self.pools.reusable(params::pb_reuse(), k, &job.vm) {
             Some(e) => {
@@ -988,7 +988,7 @@ impl Firmware {
             }
             None => {
                 let e = job.resources.pb(job.progress.sent() as usize)?.clone();
-                e.prepare(k, arena.pools.heap_gva(k)?, arena.pools.heap_blocks())?;
+                e.prepare(k, pools.heap_gva(k)?, pools.heap_blocks())?;
                 self.pools.stats.fresh += 1;
                 (e, false)
             }
@@ -1183,7 +1183,7 @@ impl Firmware {
             if render {
                 let k = f.claims.pass[0] as usize;
                 f.pb.as_ref().ok_or(EINVAL)?.expose();
-                job.resources.render()?.pools.publish(k, f.uma_submitted)?;
+                job.resources.render_pools()?.publish(k, f.uma_submitted)?;
                 // Notifier service dereferences u32 counters; the host ordering ledger
                 // remains u64. Eight-byte spacing is retained allocation padding.
                 self.graph.render.threshold.w32(0, prefix.draw as u32)?;
@@ -1357,11 +1357,12 @@ impl Firmware {
             target_stamp: target,
             submitted,
         };
+        let rt = compute_rt(&cmd.ray, s.seeds);
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
         let w = image(&mut scratch.cw)?;
         // User results are published coherently after the complete retirement receipt.
         // The firmware's internal timestamp pair remains enabled.
-        encode::encode_compute_for(
+        encode::encode_compute_rt(
             self.init.abi.compute(),
             &refs,
             &cmd.cmd,
@@ -1370,6 +1371,7 @@ impl Firmware {
             job.vm.slot,
             n,
             1,
+            &rt,
             w,
             image(&mut scratch.cq)?,
         )
@@ -1428,7 +1430,8 @@ impl Firmware {
             .render()?
             .set_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes)?;
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
-        encode::encode_ta_for(
+        let [vertex_rt, fragment_rt] = cmd.ray_query.map(|stage| stage_rt(&stage));
+        encode::encode_ta_rt(
             self.init.abi.ta(),
             &refs,
             &pass,
@@ -1438,10 +1441,11 @@ impl Firmware {
             target,
             &geometry,
             None,
+            &vertex_rt,
             image(&mut scratch.ta)?,
             image(&mut scratch.tas)?,
         );
-        encode::encode_fs_for(
+        encode::encode_fs_rt(
             self.init.abi.fs(),
             &refs,
             &pass,
@@ -1452,6 +1456,7 @@ impl Firmware {
             draw,
             target,
             &geometry,
+            &fragment_rt,
             image(&mut scratch.fs)?,
             &mut scratch.fss[..],
         );
@@ -1529,5 +1534,35 @@ impl Firmware {
         s.starve_from_ns = 0;
         let now = s.pub_ns;
         self.power.utilization.busy(now);
+    }
+}
+
+/// The compute register words of a validated command's ray state ([`super::rt`]) in a unit
+/// whose UMA pool has `seeds` freelist entries. Without ray state these are the words of
+/// [`ComputeRt::DISABLED`].
+fn compute_rt(ray: &super::rt::ComputeRay, seeds: u32) -> ComputeRt {
+    ComputeRt {
+        intersection: ray.intersection.words(),
+        size: ray.scratch.size_word(),
+        tail: ray.scratch.tail_word(),
+        stack: ray.scratch.stack_word(),
+        window: ray.scratch.window_word(),
+        driver: ray.scratch.driver_word(),
+        scs: ray.scratch.enabled(),
+        seeds,
+    }
+}
+
+/// The TA or FS register words of a validated render stage's ray state. As the M4 Pro's
+/// render programs, a stage's tail word is its scratch tail; its auxiliary intersection word
+/// is validated but not written.
+fn stage_rt(stage: &super::rt::RayQueryStage) -> StageRt {
+    StageRt {
+        intersection: stage.intersection.words(),
+        size: stage.scratch.size_word(),
+        tail: stage.scratch.tail_word(),
+        stack: stage.scratch.stack_word(),
+        window: stage.scratch.window_word(),
+        scs: stage.scratch.enabled(),
     }
 }

@@ -46,8 +46,8 @@ pub(crate) fn push_completion(done: &mut Completions, job: &Arc<Job>, result: Re
 }
 
 pub(crate) struct Recovery {
-    pub(crate) deadline_ns: u64,
-    pub(crate) compute_deadline_ns: u64,
+    /// Host deadlines of the oldest flight, renewed together ([`logic::Deadlines`]).
+    pub(crate) deadlines: logic::Deadlines,
     /// A long command warning is diagnostic, not evidence that the GPU has stopped.
     warning_deadline_ns: u64,
     pub(crate) long_commands: u64,
@@ -74,8 +74,7 @@ pub(crate) struct Recovery {
 impl Recovery {
     pub(crate) fn new() -> Self {
         Self {
-            deadline_ns: logic::EXPIRED,
-            compute_deadline_ns: logic::EXPIRED,
+            deadlines: logic::Deadlines::EXPIRED,
             warning_deadline_ns: u64::MAX,
             long_commands: 0,
             publication_wait_deadline: None,
@@ -110,13 +109,11 @@ impl Firmware {
     }
 
     pub(crate) fn renew_deadlines(&mut self) {
-        let (deadline, compute) = logic::renew(
+        self.recovery.deadlines = logic::Deadlines::renew(
             now_ns(),
             params::deadline_ms(),
             params::compute_deadline_ms(),
         );
-        self.recovery.deadline_ns = deadline;
-        self.recovery.compute_deadline_ns = compute;
         self.recovery.warning_deadline_ns = now_ns().saturating_add(5_000_000_000);
     }
 
@@ -192,11 +189,9 @@ impl Firmware {
                 .engine
                 .oldest()
                 .is_some_and(|flight| flight.computes != 0 && flight.renders == 0);
-            let deadline = if compute_only {
-                self.recovery.compute_deadline_ns
-            } else {
-                self.recovery.deadline_ns
-            };
+            // Ray traversal: every flight of such a job (`Job::long`).
+            let long = self.engine.oldest().is_some_and(|flight| flight.job.long());
+            let deadline = self.recovery.deadlines.select(compute_only, long);
             if logic::expired(now, deadline) {
                 dev_err!(
                     self.dev(),

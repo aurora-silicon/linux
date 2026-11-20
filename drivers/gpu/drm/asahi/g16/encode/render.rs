@@ -66,6 +66,58 @@ pub(crate) struct PassRefs {
     pub(crate) ta_scratch: u64,
 }
 
+/// Write the SCS enable 0x017d9 = 1 in the register list of a stage with scratch: first in the
+/// TA list, after 0x1739 in the FS list, as the M4 Pro's 25G83 render programs (which its
+/// 26B123 firmware runs) do. Off: whether G16G's TA/FS lists take it, and whether its
+/// firmware inserts it itself, is open. Trace questions T5/T6.
+pub(crate) const RENDER_SCS_ENABLE: bool = false;
+
+/// The ray-query words of one render stage (the M4 Pro's 25G83 render programs).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StageRt {
+    /// TA 0x1a099, 0x1a0a1, 0x1a069, 0x1a071, 0x1a0c9, 0x1a0d1; FS 0x1a0a9, 0x1a0b1, 0x1a079,
+    /// 0x1a081, 0x1a0d9, 0x1a0e1.
+    pub(crate) intersection: [u64; 6],
+    /// TA 0x101c9, FS 0x101c1.
+    pub(crate) size: u64,
+    /// TA 0xd471, FS 0xd469.
+    pub(crate) tail: u64,
+    /// TA 0x1a0f1, FS 0x1a0f9.
+    pub(crate) stack: u64,
+    /// TA 0x10799; FS 0x10791 with bit 9.
+    pub(crate) window: u64,
+    /// The stage has scratch (the gated register applies).
+    pub(crate) scs: bool,
+}
+
+impl StageRt {
+    /// A stage without ray queries: the words G16G has always written.
+    pub(crate) const DISABLED: Self = Self {
+        intersection: [0; 6],
+        size: 0,
+        tail: 0,
+        stack: 8,
+        window: 0xff0000,
+        scs: false,
+    };
+}
+
+/// Register records, with the gated SCS enable before record `at` when `scs`; returns the
+/// record count.
+fn stage_regs(dst: &mut [u8], sel: &[u32], val: &[u64], scs: bool, at: usize) -> u16 {
+    if !(RENDER_SCS_ENABLE && scs) {
+        regs(dst, sel, val);
+        return sel.len() as u16;
+    }
+    regs(dst, &sel[..at], &val[..at]);
+    put32(dst, REG_RECORD * at, 0x017d9);
+    put64(dst, REG_RECORD * at + 4, 1);
+    if let Some(rest) = dst.get_mut(REG_RECORD * (at + 1)..) {
+        regs(rest, &sel[at..], &val[at..]);
+    }
+    sel.len() as u16 + 1
+}
+
 fn metadata(w: &mut [u8], off: usize, r: &RenderRefs, engine: usize, target: u32) {
     put64(w, off, r.user_stamp[engine]);
     put64(w, off + 8, r.fw_stamp[engine]);
@@ -147,7 +199,7 @@ pub(crate) fn encode_ta(
 
 /// Encode the 66-record single-cluster tiler work of `layout`'s ABI and its exact 0x300
 /// sequence.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn encode_ta_for(
     layout: &ta::Layout,
     r: &RenderRefs,
@@ -157,7 +209,40 @@ pub(crate) fn encode_ta_for(
     ctx: u32,
     target: u32,
     geo: &Geometry,
+    cl: Option<&ClusterLayout>,
+    w: &mut [u8; ta::WORK_SIZE],
+    q: &mut [u8; ta::SEQ_SIZE],
+) {
+    encode_ta_rt(
+        layout,
+        r,
+        p,
+        u,
+        ts_va,
+        ctx,
+        target,
+        geo,
+        cl,
+        &StageRt::DISABLED,
+        w,
+        q,
+    )
+}
+
+/// [`encode_ta_for`] with the vertex stage's ray-query words. With [`StageRt::DISABLED`] the
+/// bytes are [`encode_ta_for`]'s.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_ta_rt(
+    layout: &ta::Layout,
+    r: &RenderRefs,
+    p: &PassRefs,
+    u: &uapi::drm_asahi_cmd_render,
+    ts_va: &[u64; 4],
+    ctx: u32,
+    target: u32,
+    geo: &Geometry,
     _cl: Option<&ClusterLayout>,
+    rt: &StageRt,
     w: &mut [u8; ta::WORK_SIZE],
     q: &mut [u8; ta::SEQ_SIZE],
 ) {
@@ -218,16 +303,16 @@ pub(crate) fn encode_ta_for(
         0,
         0x1c,
         0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        8,
-        0xff0000,
+        rt.intersection[0],
+        rt.intersection[1],
+        rt.intersection[2],
+        rt.intersection[3],
+        rt.intersection[4],
+        rt.intersection[5],
+        rt.size,
+        rt.tail,
+        rt.stack,
+        rt.window,
         u64::from(r.parameter_id),
         compact(r.scene_list),
         compact(r.scene_list),
@@ -240,7 +325,7 @@ pub(crate) fn encode_ta_for(
         // USC base is a shared queue property carried by the render refs.
         r.usc_base,
     ];
-    regs(&mut w[ta::REGS..], &ta::SEL, &val);
+    let count = stage_regs(&mut w[ta::REGS..], &ta::SEL, &val, rt.scs, 0);
     put64(w, 4, r.counter[0]);
     put32(w, 0xc, ctx);
     put64(w, 0x10, r.notifier);
@@ -249,8 +334,8 @@ pub(crate) fn encode_ta_for(
     put64(w, 0x28, p.scene);
     put64(w, 0x30, p.scene + 0x100);
     put64(w, 0x740, p.ta_work_gva + 0x40);
-    put16(w, 0x748, 66);
-    put16(w, 0x74a, 66 * 12);
+    put16(w, 0x748, count);
+    put16(w, 0x74a, count * 12);
     put64(w, 0x760, p.tpc_fw);
     put64(w, ta::TPC_BYTES, geo.tpc_bytes);
     put64(w, 0x770, p.ta_seq);
@@ -329,8 +414,42 @@ pub(crate) fn encode_fs(
 }
 
 /// Encode the 82-record fragment work of `layout`'s ABI and base 0x380 sequence.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn encode_fs_for(
+    layout: &fs::Layout,
+    r: &RenderRefs,
+    p: &PassRefs,
+    u: &uapi::drm_asahi_cmd_render,
+    ts_va: &[u64; 4],
+    ctx: u32,
+    usc: u64,
+    n: u64,
+    target: u32,
+    geo: &Geometry,
+    w: &mut [u8; fs::WORK_SIZE],
+    q: &mut [u8],
+) {
+    encode_fs_rt(
+        layout,
+        r,
+        p,
+        u,
+        ts_va,
+        ctx,
+        usc,
+        n,
+        target,
+        geo,
+        &StageRt::DISABLED,
+        w,
+        q,
+    )
+}
+
+/// [`encode_fs_for`] with the fragment stage's ray-query words. With [`StageRt::DISABLED`]
+/// the bytes are [`encode_fs_for`]'s.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_fs_rt(
     layout: &fs::Layout,
     r: &RenderRefs,
     p: &PassRefs,
@@ -341,6 +460,7 @@ pub(crate) fn encode_fs_for(
     _n: u64,
     target: u32,
     geo: &Geometry,
+    rt: &StageRt,
     w: &mut [u8; fs::WORK_SIZE],
     q: &mut [u8],
 ) {
@@ -364,7 +484,7 @@ pub(crate) fn encode_fs_for(
         u64::from(geo.isp_blocks),
         u64::from(geo.screen),
         0,
-        0xff0200,
+        rt.window | 1 << 9,
         p.heap_gva & !63,
         u.isp_scissor_base & !3,
         u.isp_dbias_base & !3,
@@ -412,15 +532,15 @@ pub(crate) fn encode_fs_for(
         0x1c,
         0,
         geo.native_tiles,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        8,
+        rt.intersection[0],
+        rt.intersection[1],
+        rt.intersection[2],
+        rt.intersection[3],
+        rt.intersection[4],
+        rt.intersection[5],
+        rt.size,
+        rt.tail,
+        rt.stack,
         0x6000400020,
         0x200000001,
         u64::from(r.uuid),
@@ -430,7 +550,7 @@ pub(crate) fn encode_fs_for(
         compact(r.scene_list),
         usc,
     ];
-    regs(&mut w[fs::REGS..], &fs::SEL, &val);
+    let count = stage_regs(&mut w[fs::REGS..], &fs::SEL, &val, rt.scs, 1);
     put32(w, 0, 1);
     put64(w, 4, r.counter[1]);
     put32(w, 0xc, ctx);
@@ -448,8 +568,8 @@ pub(crate) fn encode_fs_for(
     put32(w, 0x68, geo.blocks);
     put32(w, 0x78, geo.tiles);
     put64(w, 0x780, p.fs_work_gva + 0x80);
-    put16(w, 0x788, 82);
-    put16(w, 0x78a, 82 * 12);
+    put16(w, 0x788, count);
+    put16(w, 0x78a, count * 12);
     put64(w, 0x7a0, u.isp_dbias_base);
     put64(w, 0x7b0, u.isp_scissor_base);
     put64(w, 0x7c0, u.isp_oclqry_base);

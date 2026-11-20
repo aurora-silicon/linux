@@ -76,7 +76,8 @@ extern crate self as kernel;
 // The parser logs why it refuses a command; check the format arguments, print nothing.
 macro_rules! pr_warn { ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }}; }
 pub mod bindings { pub const EOPNOTSUPP:i32=95; }
-pub mod prelude { pub type Result<T=()> = core::result::Result<T,i32>; pub const E2BIG:i32=-7; }
+pub mod prelude { pub type Result<T=()> = core::result::Result<T,i32>; pub const E2BIG:i32=-7;
+    pub const EINVAL:i32=-22; pub const EOVERFLOW:i32=-75; }
 mod uapi { include!("FULL_UAPI"); }
 mod file { pub const MAX_COMMANDS_PER_SUBMISSION: u32 = 64; }
 mod hw {
@@ -89,6 +90,7 @@ mod fw {
     #[path="FW_WORK"] pub mod work;
 }
 #[path="FULL_ENCODER"] mod encode;
+#[path="RT_SOURCE"] mod rt;
 READER
 IMPLS
 PRODUCTION_CONSTANTS
@@ -188,14 +190,91 @@ fn render_high_resource_words_are_preserved() {
     r.flags=0;
     assert!(check_stream(&entry(CMD_RENDER,&data(&r)[..256],[NONE;2]),false).is_err());
 }
+// Mesa's G16G/G17P layout: depth 112, 96 cliques, 40 driver bytes (791 pages).
+const LAYOUT: u64 = 0x0028000060000070;
+fn stage() -> uapi::drm_asahi_render_ray_query_stage {
+    uapi::drm_asahi_render_ray_query_stage { scs_layout: LAYOUT, intersection_pool: 0x10000,
+        intersection_pool_bytes: 0x4000, intersection_first: 1, intersection_count: 112,
+        intersection_default: 0x10010020000, intersection_default_control: 0x16000000000,
+        ..Default::default() }
+}
+fn ray_compute() -> uapi::drm_asahi_cmd_compute {
+    uapi::drm_asahi_cmd_compute { scs_layout: LAYOUT, intersection_pool: 0x10000,
+        intersection_pool_bytes: 0x4000, intersection_first: 1, intersection_count: 112,
+        intersection_default_program: 0x10010020000,
+        intersection_default_control: 0x16000000000, ..compute() }
+}
 #[test]
-fn ray_query_and_unknown_extension_bytes_are_refused() {
+fn ray_query_stages_and_compute_tables_are_accepted() {
+    // RENDER_RAY_QUERY: either stage, both stages, and a payload-free layout (no scratch).
+    for (vertex, fragment) in [(true,false),(false,true),(true,true)] {
+        let mut r=render();
+        if vertex { r.ray_query[0]=stage(); }
+        if fragment { r.ray_query[1]=stage(); }
+        assert!(check_stream(&entry(CMD_RENDER,&data(&r),[NONE;2]),false).is_ok());
+        let parsed=render_ray_query(&data(&r)).unwrap();
+        assert_eq!([parsed[0].scratch.pages(),parsed[1].scratch.pages()],
+            [if vertex {791} else {0}, if fragment {791} else {0}]);
+    }
     let mut r=render(); r.ray_query[0].scs_layout=1;
-    assert!(check_stream(&entry(CMD_RENDER,&data(&r),[NONE;2]),false).is_err());
+    assert!(check_stream(&entry(CMD_RENDER,&data(&r),[NONE;2]),false).is_ok());
+    let mut r=render(); r.ray_query[1]=stage(); r.ray_query[1].intersection_aux=8;
+    assert!(check_stream(&entry(CMD_RENDER,&data(&r),[NONE;2]),false).is_ok());
+    // An older render payload without the stages.
+    assert!(check_stream(&entry(CMD_RENDER,&data(&render())[..336],[NONE;2]),false).is_ok());
+    // Compute: tables and scratch, each alone.
+    assert!(check_stream(&entry(CMD_COMPUTE,&data(&ray_compute()),[NONE;2]),false).is_ok());
+    let c=uapi::drm_asahi_cmd_compute {scs_layout:0,..ray_compute()};
+    assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_ok());
+    let c=uapi::drm_asahi_cmd_compute {scs_layout:LAYOUT,..compute()};
+    assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_ok());
+    let ray=compute_ray(&ray_compute()).unwrap();
+    assert_eq!(ray.intersection.words(),[0x10080,0xc0003800,0x6f00000000,0x3feff,0x10010020000,0x16000000000]);
+    assert_eq!(ray.scratch.pages(),791);
+}
+#[test]
+fn malformed_ray_state_and_unknown_extension_bytes_are_refused() {
+    let refused=|r:&uapi::drm_asahi_cmd_render| check_stream(&entry(CMD_RENDER,&data(r),[NONE;2]),false);
+    for index in 0..2 {
+        // Scratch without tables, tables without scratch.
+        let mut r=render(); r.ray_query[index].scs_layout=LAYOUT; assert_eq!(refused(&r),Err(EINVAL));
+        let mut r=render(); r.ray_query[index]=stage(); r.ray_query[index].scs_layout=0; assert_eq!(refused(&r),Err(EINVAL));
+        let bad: [fn(&mut uapi::drm_asahi_render_ray_query_stage); 12] = [
+            |s| s.intersection_pad=1, |s| s.intersection_aux=7, |s| s.intersection_aux=33,
+            |s| s.intersection_pool|=0x1000, |s| s.intersection_pool_bytes=0x2000,
+            |s| s.intersection_count=0, |s| s.intersection_count=1<<18,
+            |s| s.intersection_first=128, |s| s.intersection_default|=32,
+            |s| s.intersection_default_control&=!(1<<40), |s| s.intersection_default_control|=1<<20,
+            |s| s.intersection_pool=1<<48,
+        ];
+        for mutate in bad {
+            let mut r=render(); r.ray_query[index]=stage(); mutate(&mut r.ray_query[index]);
+            assert_eq!(refused(&r),Err(EINVAL));
+        }
+        // Scratch whose region exceeds 16-bit pages.
+        let mut r=render(); r.ray_query[index]=stage(); r.ray_query[index].scs_layout=0xffff_0000_ff00_ffff;
+        assert_eq!(refused(&r),Err(EINVAL));
+    }
     let mut raw=data(&compute()); raw.extend([0u8;8]);
     assert!(check_stream(&entry(CMD_COMPUTE,&raw,[NONE;2]),false).is_ok());
     *raw.last_mut().unwrap()=1;
     assert!(check_stream(&entry(CMD_COMPUTE,&raw,[NONE;2]),false).is_err());
+    let mut raw=data(&render()); raw.extend([0u8;8]);
+    assert!(check_stream(&entry(CMD_RENDER,&raw,[NONE;2]),false).is_ok());
+    *raw.last_mut().unwrap()=1;
+    assert!(check_stream(&entry(CMD_RENDER,&raw,[NONE;2]),false).is_err());
+    // Compute: the M5 auxiliary allocation and the reserved word stay MBZ; malformed tables.
+    let bad: [fn(&mut uapi::drm_asahi_cmd_compute); 7] = [
+        |c| c.cdm_auxiliary_allocation=8, |c| c.reserved=1, |c| c.intersection_pool=0,
+        |c| c.intersection_pool_bytes=0, |c| c.intersection_default_program|=1,
+        |c| c.intersection_default_control=0, |c| c.intersection_count=200,
+    ];
+    for mutate in bad {
+        let mut c=ray_compute(); mutate(&mut c);
+        assert_eq!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false),Err(EINVAL));
+    }
+    let c=uapi::drm_asahi_cmd_compute {scs_layout:0xffff_0000_ff00_ffff,..compute()};
+    assert_eq!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false),Err(EINVAL));
 }
 #[test]
 fn canonical_prior_offsets_and_reserved_timestamp_copies() {
@@ -310,10 +389,13 @@ fn unsupported_flags_and_compute_fields() {
         let mut r=render(); r.flags=flag;
         assert!(check_stream(&entry(CMD_RENDER,&data(&r)[..256],[NONE;2]),false).is_err());
     }
+    // Every compute flag is refused.
+    for flag in [1u32,2,4,8,1<<16,1<<17,1<<20,1<<31] {
+        let c=uapi::drm_asahi_cmd_compute {flags:flag,..compute()};
+        assert_eq!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false),Err(EINVAL));
+    }
     let mut c=compute();
-    c.scs_layout=1;
-    assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());
-    c.scs_layout=0; c.cdm_auxiliary_allocation=8;
+    c.cdm_auxiliary_allocation=8;
     assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());
     let mut c=compute(); c.cdm_ctrl_stream_end=c.cdm_ctrl_stream_base;
     assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());
@@ -406,7 +488,9 @@ replacements = {'FULL_UAPI': str(BINDINGS), 'READER': reader,
                 'CAPACITIES': capacities, 'FW_GRAPH': str(SOURCE.parent/'fw/graph.rs'),
                 'FW_WORK': str(SOURCE.parent/'fw/work.rs'), 'FULL_ENCODER': str(SOURCE.parent/'encode.rs'),
                 'IMPLS': '\n'.join('unsafe impl AnyBitPattern for uapi::' + name + ' {}' for name in names),
-                'PRODUCTION_CONSTANTS': constants, 'PRODUCTION_PARSER': parser.replace('super::encode::', 'encode::'),
+                'PRODUCTION_CONSTANTS': constants,
+                'PRODUCTION_PARSER': parser.replace('super::encode::', 'encode::').replace('super::rt::', 'rt::'),
+                'RT_SOURCE': str(SOURCE.parent/'rt.rs'),
                 'G17_CONSTANTS': g17_constants, 'G17_PARSER': g17_parser}
 for key in sorted(replacements,key=len,reverse=True):
     harness = harness.replace(key,replacements[key])
@@ -425,6 +509,6 @@ with tempfile.TemporaryDirectory(prefix='m4-rust-command-') as directory:
         'g17_source':str(ROOT/'drivers/gpu/drm/asahi/g17/command.rs'),
         'g17_sha256':hashlib.sha256(g17.encode()).hexdigest(),
         'uapi_generated':str(BINDINGS),'uapi_sha256':hashlib.sha256(BINDINGS.read_bytes()).hexdigest(),
-        'result':'pass','test_groups':16,
+        'result':'pass','test_groups':17,
         'limitations':'Links complete production encoder/firmware helper modules; compiles isolated production G16 structural parser/reader and G17 framing/prefix parser with generated UAPI structs. G17 extension validators are stand-ins; does not exercise kernel VM/scheduler or hardware.'
     },indent=2)+'\n')

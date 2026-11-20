@@ -63,6 +63,54 @@ pub(crate) struct ComputeRefs {
     pub(crate) submitted: u64,
 }
 
+/// Write the SCS enable 0x017d9 = 1 first in the register list of a command with scratch, as
+/// g17's G17P compute program does. Off: the M4 Pro's 26B123 compute program (25F84's) runs
+/// ray traversal without it, the shape of this list. Trace question T1/T6.
+pub(crate) const COMPUTE_SCS_ENABLE: bool = false;
+/// Write the SCS driver word 0x1a141 after 0x1a0e9 for a command with scratch, as g17's G17P
+/// compute program does (zero on Gen1). Off: 25F84's program does not write it. Trace
+/// question T1.
+pub(crate) const COMPUTE_SCS_DRIVER_WORD: bool = false;
+
+/// The ray-tracing words of one compute work item, and the UMA pool it runs with.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ComputeRt {
+    /// 0x1a089, 0x1a091, 0x1a059, 0x1a061, 0x1a0b9, 0x1a0c1.
+    pub(crate) intersection: [u64; 6],
+    /// 0x101d1.
+    pub(crate) size: u64,
+    /// 0xd479.
+    pub(crate) tail: u64,
+    /// 0x1a0e9.
+    pub(crate) stack: u64,
+    /// 0x107a1.
+    pub(crate) window: u64,
+    /// 0x1a141, with [`COMPUTE_SCS_DRIVER_WORD`].
+    pub(crate) driver: u64,
+    /// The command has scratch (the gated registers apply).
+    pub(crate) scs: bool,
+    /// Freelist entries of the unit's UMA pool, published in a fresh descriptor (SEEDS_A/B).
+    pub(crate) seeds: u32,
+}
+
+impl ComputeRt {
+    /// A command without ray state in a base UMA pool: the words G16G has always written.
+    pub(crate) const DISABLED: Self = Self {
+        intersection: [0; 6],
+        size: 0,
+        tail: 0,
+        stack: 8,
+        window: 0xff0000,
+        driver: 0,
+        scs: false,
+        seeds: 8192,
+    };
+}
+
+/// Register records of a compute work item at most: the 24 of [`compute::SEL`], 0x10071 and
+/// the two gated SCS registers.
+const MAX_REGS: usize = compute::SEL.len() + 3;
+
 const FW_START: u64 = 0xfffffc2000000000;
 const FW_END: u64 = 0xfffffc2ffc000000;
 const VM_START: u64 = 0x4000;
@@ -183,8 +231,38 @@ pub(crate) fn encode_compute(
 }
 
 /// [`encode_compute`] for the work layout of another firmware ABI.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn encode_compute_for(
+    layout: &compute::Layout,
+    r: &ComputeRefs,
+    c: &uapi::drm_asahi_cmd_compute,
+    att: &[uapi::drm_asahi_attachment],
+    ts_va: &[u64; 2],
+    ctx: u32,
+    n: u64,
+    fault_mask: u32,
+    w: &mut [u8; compute::WORK_SIZE],
+    q: &mut [u8; compute::SEQ_SIZE],
+) -> Result<(), ComputeEncodeError> {
+    encode_compute_rt(
+        layout,
+        r,
+        c,
+        att,
+        ts_va,
+        ctx,
+        n,
+        fault_mask,
+        &ComputeRt::DISABLED,
+        w,
+        q,
+    )
+}
+
+/// [`encode_compute_for`] with the command's ray-tracing words and its unit's UMA pool. With
+/// [`ComputeRt::DISABLED`] the bytes are [`encode_compute_for`]'s.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_compute_rt(
     layout: &compute::Layout,
     r: &ComputeRefs,
     c: &uapi::drm_asahi_cmd_compute,
@@ -193,9 +271,14 @@ pub(crate) fn encode_compute_for(
     ctx: u32,
     _n: u64,
     fault_mask: u32,
+    rt: &ComputeRt,
     w: &mut [u8; compute::WORK_SIZE],
     q: &mut [u8; compute::SEQ_SIZE],
 ) -> Result<(), ComputeEncodeError> {
+    // Whole 2-MiB pool rows within the freelist the manager reports.
+    if rt.seeds == 0 || rt.seeds % 512 != 0 || rt.seeds > manager::UNK_1C_VALUE {
+        return Err(ComputeEncodeError::Storage);
+    }
     if ctx == 0 || ctx >= 64 {
         return Err(ComputeEncodeError::Context);
     }
@@ -268,6 +351,7 @@ pub(crate) fn encode_compute_for(
         }
     }
     let pre = r.preempt_gva;
+    let [i0, i1, i2, i3, i4, i5] = rt.intersection;
     let values = [
         pre,
         base,
@@ -278,16 +362,16 @@ pub(crate) fn encode_compute_for(
         0x154024201,
         0x10c08860,
         0x1c,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        8,
-        0xff0000,
+        i0,
+        i1,
+        i2,
+        i3,
+        i4,
+        i5,
+        rt.size,
+        rt.tail,
+        rt.stack,
+        rt.window,
         0x13200400020,
         0x200000001,
         1,
@@ -296,15 +380,29 @@ pub(crate) fn encode_compute_for(
     ];
     w.fill(0);
     q.fill(0);
-    for (i, (&sel, &value)) in compute::SEL.iter().zip(values.iter()).enumerate() {
+    let mut records = [(0u32, 0u64); MAX_REGS];
+    let mut count = 0;
+    let mut push = |sel: u32, value: u64| {
+        records[count] = (sel, value);
+        count += 1;
+    };
+    if COMPUTE_SCS_ENABLE && rt.scs {
+        push(0x017d9, 1);
+    }
+    for (&sel, &value) in compute::SEL.iter().zip(values.iter()) {
+        push(sel, value);
+        if sel == 0x1a0e9 && COMPUTE_SCS_DRIVER_WORD && rt.scs {
+            push(0x1a141, rt.driver);
+        }
+    }
+    if r.usc_base != 0 {
+        push(0x10071, r.usc_base);
+    }
+    for (i, &(sel, value)) in records[..count].iter().enumerate() {
         put32(w, compute::REGS + i * 12, sel);
         put64(w, compute::REGS + i * 12 + 4, value);
     }
-    let count = if r.usc_base == 0 { 24 } else { 25 };
-    if r.usc_base != 0 {
-        put32(w, compute::REGS + 24 * 12, 0x10071);
-        put64(w, compute::REGS + 24 * 12 + 4, r.usc_base);
-    }
+    let count = count as u16;
     put32(w, 0, 3);
     put32(w, 0xc, ctx);
     put64(
@@ -409,8 +507,8 @@ pub(crate) fn encode_compute_for(
     put32(w, d + manager::ONE, 2);
     put64(w, d + manager::FREELIST, r.pool_state_gva);
     put32(w, d + manager::UNK_1C, manager::UNK_1C_VALUE);
-    put32(w, d + manager::SEEDS_A, 8192);
-    put32(w, d + manager::SEEDS_B, 8192);
+    put32(w, d + manager::SEEDS_A, rt.seeds);
+    put32(w, d + manager::SEEDS_B, rt.seeds);
     put64(w, d + manager::POOL_TABLE, r.page_list_gva);
     put32(w, d + 0x40, 4);
     put32(w, d + 0x48, 128);

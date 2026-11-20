@@ -499,7 +499,7 @@ impl Firmware {
                 && g.notifier
                     .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
                     == f.job.vm.slot
-                && f.job.resources.render()?.pools.retired(k)?
+                && f.job.resources.render_pools()?.retired(k)?
                 && ta_start != 0
                 && ta_end > ta_start
                 && fs_start != 0

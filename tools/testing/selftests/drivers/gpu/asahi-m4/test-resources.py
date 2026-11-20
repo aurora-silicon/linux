@@ -164,6 +164,7 @@ pub mod g16 {
     pub struct Events{pub grow:crate::KVec<[u32;18]>}
     pub struct Firmware{pub pools:pools::Pools,pub events:Events}
     pub mod budget{__BUDGET__}
+    #[path="__ROOT__/rt.rs"]pub mod rt;
     #[path="__ROOT__/slots.rs"]pub mod slots;
     #[path="__ROOT__/pools.rs"]pub mod pools;
 }
@@ -172,7 +173,7 @@ pub mod g16 {
     struct Arenas{compute:g16::resources::ComputeArena,render:g16::resources::RenderArena}
     fn arenas(o:&mut Objects)->Arenas{
         let mut compute=KVec::new();let mut passes=KVec::new();
-        for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
+        for k in 0..2{compute.push(g16::slots::ComputeSlot::new_in(o,k,g16::slots::Placement::Base).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
         Arenas{compute:g16::resources::ComputeArena{compute},render:g16::resources::RenderArena{passes,tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};2],tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};2]}}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&c).unwrap();s.retire(&mut c).unwrap();}
@@ -228,6 +229,51 @@ pub mod g16 {
         for (k,s) in arena.compute.compute.iter().enumerate(){assert_eq!(s.work.lower_gva.unwrap()&0x3fff,0);assert_eq!(s.work.size,0x2000);assert_eq!(s.pool.size,0x2000000);assert_eq!(s.pool_state.size,0x20000);assert_eq!(s.page_list.size,0x4000);assert_eq!(s.context_store.size,0x40000);assert_eq!(s.pool_state.r32(0).unwrap()as u64 |((s.pool_state.r32(4).unwrap()as u64)<<32),s.pool.gva.unwrap());assert_eq!(pools.allocator_refs_for(k).unwrap().parameter_id,k as u32);}
         // One PB heap per VM, shared by both render allocators.
         assert_eq!(aliases.len(),42);
+    }
+    #[test]fn scs_units_and_allocators_are_disjoint_fully_seeded_and_share_the_heap(){
+        // Failure modes: SCS storage overlapping the base units, another VM-fixed range or the
+        // Mesa hole's end; a pool larger than its freelist seeds or rows; base pools changing.
+        let mut o=Objects::new();let arena=arenas(&mut o);let pools=PoolSet::new(&mut o).unwrap();
+        let mut scs=Vec::new();
+        for k in 0..2{scs.push(g16::slots::ComputeSlot::new_in(&mut o,k,g16::slots::Placement::Scs).unwrap());}
+        let render=pools.scs(&mut o).unwrap();
+        let mut aliases=Vec::new();
+        for a in &o.objects{if let Some(g)=a.gva{assert_eq!(a.client_leaf,Some(__PRIVATE_RW__));let base=g-a.offset as u64;assert_eq!(base&0x3fff,0);assert!(base>=0x7000000000);assert!(base+a.mapped as u64<=0x7100000000);aliases.push((base,base+a.mapped as u64));}}
+        aliases.push((0x1000000000,0x1000010000));
+        aliases.sort();for a in aliases.windows(2){assert!(a[0].1<=a[1].0,"overlap {:x?} {:x?}",a[0],a[1]);}
+        // Six aliases per SCS unit and five per SCS allocator; the PB heap is shared.
+        assert_eq!(aliases.len(),42+2*6+2*5);
+        let read64=|obj:&g16::object::FwObject,at:usize|->u64{obj.r32(at).unwrap()as u64|((obj.r32(at+4).unwrap()as u64)<<32)};
+        for (unit,seeds) in arena.compute.compute.iter().map(|u|(u,8192usize)).chain(scs.iter().map(|u|(u,16384))) {
+            assert_eq!(unit.seeds as usize,seeds);assert_eq!(unit.pool.size,seeds*0x1000);
+            let pool=unit.pool.gva.unwrap();
+            assert_eq!(read64(&unit.pool_state,0),pool);
+            assert_eq!(read64(&unit.pool_state,(seeds-1)*8),pool+(seeds as u64-1)*0x1000);
+            if seeds<16384 {assert_eq!(read64(&unit.pool_state,seeds*8),0);}
+            let rows=seeds/512;
+            assert_eq!(read64(&unit.page_list,(rows-1)*64),(1<<61)|(pool+(rows as u64-1)*0x200000));
+            assert_eq!(read64(&unit.page_list,rows*64),0);
+        }
+        assert_eq!(scs[0].pool.gva,Some(0x70a8000000));assert_eq!(scs[1].pool_state.gva,Some(0x70b4000000));
+        for k in 0..2 {
+            assert_eq!(render.heap_gva(k).unwrap(),pools.heap_gva(k).unwrap());
+            assert_eq!(render.heap_blocks(),pools.heap_blocks());
+            for (set,seeds) in [(&pools,8192u32),(&render,16384)] {
+                let refs=set.allocator_refs_for(k).unwrap();
+                let descriptor=o.objects.iter().find(|obj|obj.va==refs.uma_mgr[0]).unwrap();
+                assert_eq!((descriptor.r32(0x1c).unwrap(),descriptor.r32(0x24).unwrap(),descriptor.r32(0x2c).unwrap()),(16384,seeds,seeds));
+                assert_eq!(refs.parameter_id,k as u32);
+                let state=o.objects.iter().find(|obj|obj.gva==Some(read64(descriptor,0x14))).unwrap();
+                let pool=o.objects.iter().find(|obj|obj.gva==Some(read64(state,0))).unwrap();
+                assert_eq!(pool.size,seeds as usize*0x1000);
+                assert_eq!(read64(state,(seeds as usize-1)*8),read64(state,0)+(seeds as u64-1)*0x1000);
+            }
+        }
+        assert_eq!(render.allocator_refs_for(0).unwrap().scene_list,0x7012170000);
+        // Each SCS unit shares ledger index k (UMA slot 1 + k) with base unit k.
+        let mut s=Slots::new().unwrap();let scs_arena=g16::resources::ComputeArena{compute:KVec(scs)};
+        let mut c=Claims::new();assert_eq!(s.claim_compute(&scs_arena,&mut c,0).unwrap(),Some(0));s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        assert_eq!(s.claim_compute(&arena.compute,&mut c,0).unwrap(),Some(1));
     }
     #[test]fn work_has_kernel_lower_alias_without_application_alias(){
         let mut o=Objects::new();let slots=Slots::new().unwrap();let arena=arenas(&mut o);
@@ -453,9 +499,9 @@ for command in [
     (out/'resource-host.log').write_text(log)
     if result.returncode:
         raise SystemExit(result.returncode)
-files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs']
+files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs', 'rt.rs']
 (out/'resource-host.json').write_text(json.dumps({
-    'result': 'pass', 'tests': 26,
+    'result': 'pass', 'tests': 27,
     'scope': 'Actual production allocation, initialization and lifetime code against a CPU-only backing recorder; no hardware qualification.',
     'private_rw_pte': hex(private_rw),
     'private_rw_reference': 'Qualified J713 NC read/write leaf attributes',
