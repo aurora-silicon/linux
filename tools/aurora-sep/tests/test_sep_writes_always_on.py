@@ -341,6 +341,23 @@ mv() { echo "mv $*" >>"$CALLS"; }
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Moved the Touch ID state", proc.stdout)
 
+    def test_reset_touchid_stops_if_the_read_only_file_stays(self):
+        # rm fails (a read-only /etc, say): nothing is moved, and the reset says why.
+        self.conf.write_text(OLD_READ_ONLY_CONF)
+        state = self.tmp / "aurora-sep-keybag.bin"
+        state.write_text("keybag")
+        proc = self.sh(f"{self.RESET_STUBS}\nrm() {{ return 1; }}\nTOUCHID_STATE_FILES=('{state}')\n"
+                       "reset_touchid --yes")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("could not be removed; nothing was reset", flat(proc.stderr))
+        self.assertEqual(self.conf.read_text(), OLD_READ_ONLY_CONF)
+        self.assertNotIn("systemctl mask", self.log())
+        self.assertNotIn("mv ", self.log())
+
+    def test_the_modprobe_dirs_override_is_test_only(self):
+        self.assertIn('SEP_MODPROBE_DIRS=${AURORA_SEP_TEST_MODPROBE_DIRS:-', SRC)
+        self.assertNotIn("${SEP_MODPROBE_DIRS:-", SRC)
+
     def test_reset_touchid_keeps_an_owners_file(self):
         self.conf.write_text("options apple_sep xart_guard=0\n")
         proc = self.reset("--yes")

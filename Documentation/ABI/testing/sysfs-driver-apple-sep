@@ -109,10 +109,11 @@ Description:
 		disabled	Writes are refused: the key-store-only
 				initrd phase before complete_attach
 				(keystore_only=1, or 2 with the xART
-				guard), or a failed writable reopen. Touch ID enrol and
-				verify are refused too, since the SEP must
-				save state after each. There is no
-				parameter that turns writes off.
+				guard), or a failed writable reopen.
+				Touch ID enrol and verify are refused
+				too, since the SEP must save state after
+				each. There is no parameter that turns
+				writes off.
 		========	=============================================
 
 What:		/sys/bus/platform/devices/<unit>.sep/diag/attach
@@ -396,9 +397,9 @@ Description:
                 parameter retains its load-time value after completion.
 
                 With keystore_only=1, xART is read-only until
-                complete_attach (keystore_only=2 below), provisioning waits for
-                it, and no host-state or
-                guard files are opened for writing. The initrd must carry the
+                complete_attach (keystore_only=2 below), provisioning waits
+                for it, and no host-state or guard files are opened for
+                writing. The initrd must carry the
                 existing identity keybag and machine ref-key at their usual
                 /var/lib paths; both are cached on first trusted-key use.
                 An unseal needing an xART write fails with EBADMSG so userspace

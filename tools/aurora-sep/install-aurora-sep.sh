@@ -3650,8 +3650,9 @@ calibration() {
     warn "could not extract the calibration; Touch ID will not work until it is present at $out"
 }
 
-# The modprobe.d directories sep_block_line reads (the tests point it elsewhere).
-SEP_MODPROBE_DIRS=${SEP_MODPROBE_DIRS:-"/etc/modprobe.d /run/modprobe.d /usr/lib/modprobe.d"}
+# The modprobe.d directories sep_block_line reads. Tests point it elsewhere
+# with AURORA_SEP_TEST_MODPROBE_DIRS; nothing else should set that.
+SEP_MODPROBE_DIRS=${AURORA_SEP_TEST_MODPROBE_DIRS:-"/etc/modprobe.d /run/modprobe.d /usr/lib/modprobe.d"}
 
 # The first line in modprobe.d that blacklists or redirects apple_sep. Either
 # spelling is the owner saying "do not load this". $MODPROBE_CONF counts too:
@@ -4780,8 +4781,12 @@ reset_touchid() {
 
   # The new keybag needs enclave writes, which a kernel from before
   # aurora-silicon/linux#2591 still left off under an earlier --read-only
-  # install's file. SEP writes are always on: that file goes.
+  # install's file. SEP writes are always on: that file goes, and if it cannot
+  # be removed nothing else is changed (the next boot of such a kernel would
+  # create no keybag).
   read_only_conf_cleanup
+  read_only_conf_is_ours "$MODPROBE_CONF" &&
+    die "$MODPROBE_CONF, left by an earlier --read-only install, could not be removed; nothing was reset. Remove it and run again."
 
   # Until the reboot nothing may touch the sensor: a match or enrolment would
   # write new state behind the move. The runtime mask goes away at boot. A
