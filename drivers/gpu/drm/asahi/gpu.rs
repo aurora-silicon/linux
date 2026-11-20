@@ -112,9 +112,9 @@ pub(crate) const fn init_message(address: u64) -> u64 {
 }
 
 /// The G14 firmware-27.2 root and the records only it uses.
-#[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 mod v27_2;
-#[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 pub(crate) use v27_2::*;
 
 const RX_WORK_PENDING: u32 = 1 << 0;
@@ -140,7 +140,7 @@ const DOORBELL_DEVCTRL: u64 = 0x11;
 const IOVA_KERN_PRIV_RANGE: Range<u64> = 0xffffffa000000000..0xffffffa600000000;
 /// The G14 firmware-27.2 timestamp aperture, inside the private range: the private allocator
 /// stays below it in that profile.
-#[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 const IOVA_G14_V27_2_TIMESTAMP_RANGE: Range<u64> = 0xffffffa181400000..0xffffffa185400000;
 /// Private (cached) GPU-RO firmware structure VA range base.
 const IOVA_KERN_GPU_RO_RANGE: Range<u64> = 0xffffffa600000000..0xffffffa800000000;
@@ -200,7 +200,7 @@ pub(crate) enum GraphProfile {
     Native,
     /// The G14 firmware-27.2 root (gpu/v27_2.rs) built on these records: no register
     /// mappings, and the private range ends below that firmware's timestamp aperture.
-    #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     G14V27_2,
 }
 
@@ -705,7 +705,7 @@ impl GpuManager::ver {
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
         let private_end = match profile {
             GraphProfile::Native => IOVA_KERN_PRIV_RANGE.end,
-            #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             GraphProfile::G14V27_2 => IOVA_G14_V27_2_TIMESTAMP_RANGE.start,
         };
 

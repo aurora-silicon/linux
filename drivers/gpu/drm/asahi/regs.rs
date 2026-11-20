@@ -351,7 +351,7 @@ impl Resources<'_> {
 
     /// The G14 Fender operating-point word: requested index in bits 3:0, request pending in
     /// bit 4. Sampled while the firmware holds the GPU powered.
-    #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     pub(crate) fn operating_point(&self) -> u32 {
         self.sgx_read32::<0xd01000>()
     }
