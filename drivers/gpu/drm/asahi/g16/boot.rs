@@ -659,11 +659,19 @@ fn wait_boot_control(
             || done > target
             || write != target
         {
+            dev_err!(session.dev, "G16 boot control {}: unexpected indices\n", target);
+            channels.log_stop(session, init, "boot control indices");
             return Err(eproto());
         }
         if ready == 1 && read == target && done == target {
             let at = stable.get_or_insert_with(Instant::<Monotonic>::now);
             if at.elapsed() >= Delta::from_millis(50) {
+                dev_info!(
+                    session.dev,
+                    "G16 boot control {} retired ({} ms)\n",
+                    target,
+                    start.elapsed().as_millis()
+                );
                 return Ok(());
             }
         } else {
@@ -679,6 +687,7 @@ fn wait_boot_control(
                 done,
                 write
             );
+            channels.log_stop(session, init, "boot control timeout");
             return Err(ETIMEDOUT);
         }
         fsleep(Delta::from_micros(1000));
@@ -806,6 +815,7 @@ fn run(
     let scheduler = init.control.as_ref().ok_or(EINVAL)?;
     let scheduler_word = init.firmware_data().scheduler;
     if scheduler.r32(scheduler_word)? != 0 {
+        channels.log_stop(session, init, "scheduler word set after IMPORT_GLOBALS");
         return Err(EBUSY);
     }
     scheduler.w32(scheduler_word, 1)?;
@@ -826,6 +836,7 @@ fn run(
         || channels.devctl.write()? != base + 2
         || scheduler.r32(scheduler_word)? != 0
     {
+        channels.log_stop(session, init, "boot controls not settled after START");
         return Err(EBUSY);
     }
     dev_info!(
