@@ -18,6 +18,15 @@ description: |
 
 allOf:
   - $ref: rtc.yaml#
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,t6050-pmu-rtc
+    then:
+      required:
+        - interrupts
 
 properties:
   compatible:
@@ -28,11 +37,18 @@ properties:
           - apple,t6041-pmu-rtc
           - apple,t8112-pmu-rtc
       - items:
-          - const: apple,t8132-pmu-rtc
+          - enum:
+              - apple,t6050-pmu-rtc
+              - apple,t8132-pmu-rtc
           - const: apple,t6041-pmu-rtc
 
   interrupts:
     maxItems: 1
+    description:
+      The alarm's event in the SPMI controller's interrupt domain. It may be
+      left out on T6050, whose SPMI controllers are not described as
+      interrupt controllers. The host is then not told of an alarm while it
+      runs; the alarm still wakes the SoC from a sleep.
 
   nvmem-cells:
     maxItems: 1
@@ -46,7 +62,6 @@ properties:
 
 required:
   - compatible
-  - interrupts
   - nvmem-cells
   - nvmem-cell-names
 

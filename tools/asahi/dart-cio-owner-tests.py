@@ -31,7 +31,8 @@ def main():
     owner = sources[paths[2]]
     struct = re.search(r'^struct apple_dart_cio \{.*?\n\};', sources[paths[4]],
                        re.M | re.S).group()
-    names = ['apple_dart_cio_prepare', 'apple_dart_cio_gapf', 'apple_dart_cio_reopen',
+    names = ['apple_dart_cio_bank', 'apple_dart_cio_check',
+             'apple_dart_cio_prepare', 'apple_dart_cio_gapf', 'apple_dart_cio_reopen',
              'apple_dart_cio_off', 'apple_dart_cio_on', 'apple_dart_cio_finish']
     methods = '\n'.join(function(owner, n) for n in names)
     gate = '\n'.join(function(sources[paths[3]], n) for n in [
@@ -41,7 +42,7 @@ def main():
     fixture += Path(__file__).with_suffix('.c').read_text().replace('/* ACTUAL_OWNER */', struct + '\n' + gate + methods)
     mutations = {
         'allocator-is-not-hardware-size': (
-            'streams = FIELD_GET(GENMASK(8, 0), params3);', 'streams = dart->num_streams;'),
+            '*streams = FIELD_GET(GENMASK(8, 0), params3);', '*streams = dart->num_streams;'),
         'skip-writer-close': ('ret = apple_dart_sleep_close(dart);', 'ret = 0;'),
         'ignore-gapf-policy': ('if (!ret && !(value & BIT(1)))', 'if (false)'),
         'forget-partial-off': ('s->changed = true;', 's->changed = false;'),
@@ -57,6 +58,8 @@ def main():
         'reopen-unrestored': ('\tif (s->changed && !s->restored) {', '\tif (false) {'),
         'overwrite-gapf-neighbors': ('APPLE_PS_PROT_SLICE(s->slice), BIT(4),',
                                     'APPLE_PS_PROT_SLICE(s->slice), ~0U,'),
+        'prepare-skips-check': ('ret = apple_dart_cio_check(s, false);', 'ret = 0;'),
+        'skip-v24-error-enables': ('apple_dart_t8110_enable_errors(s->dart);', '(void)0;'),
     }
     variants = {'real': fixture}
     for name, (old, new) in mutations.items():

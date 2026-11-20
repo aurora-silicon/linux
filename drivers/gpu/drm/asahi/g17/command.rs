@@ -41,11 +41,12 @@ const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRA
 const STAGE_PREFIXES: u32 = crate::file::DRM_ASAHI_RENDER_STAGE_PREFIXES;
 const WHOLE_ATTACHMENTS: u32 = crate::file::DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS;
 const SHADER_WRITES: u32 = crate::file::DRM_ASAHI_RENDER_SHADER_WRITES;
+const MESH_OUTPUT: u32 = crate::file::DRM_ASAHI_RENDER_MESH_OUTPUT;
 /// Render flags only the M5 runtime implements.
 const M5_RENDER_FLAGS: u32 = SHADER_WRITES | STAGE_PREFIXES | WHOLE_ATTACHMENTS;
 const RENDER_FLAGS: u32 =
     PROCESS_EMPTY | RSRC_SPEC_HI | DBIAS_INT | FEW_PRIMITIVES | FRAGMENT_BARRIERS | SHADER_WRITES
-        | STAGE_PREFIXES | WHOLE_ATTACHMENTS;
+        | STAGE_PREFIXES | WHOLE_ATTACHMENTS | MESH_OUTPUT;
 
 /// Attachment settings persist until replaced, including by an empty list.
 #[derive(Clone, Copy)]
@@ -492,6 +493,8 @@ pub(crate) enum Validated {
         sampler_heap_va: u64,
         sampler_count: u32,
         timestamps: uapi::drm_asahi_timestamps,
+        /// The buffers the dispatch writes, from the compute attachment list.
+        attachments: Attachments,
     },
 }
 
@@ -504,6 +507,21 @@ impl Validated {
     pub(crate) fn allow_long_job(&mut self) {
         match self {
             Self::Render { long_job, .. } | Self::Compute { long_job, .. } => *long_job = true,
+        }
+    }
+    /// The command traces rays: it carries intersection tables or traversal scratch, in
+    /// either stage of a render or as a compute command.
+    pub(crate) fn traces_rays(&self) -> bool {
+        match self {
+            Self::Render { ray_query, .. } => ray_query
+                .iter()
+                .any(|stage| stage.intersection.enabled() || stage.scratch.enabled()),
+            Self::Compute { intersection, scratch, m5_intersection, m5_scratch, .. } => {
+                intersection.enabled()
+                    || scratch.enabled()
+                    || m5_intersection.enabled()
+                    || m5_scratch.enabled()
+            }
         }
     }
 }
@@ -647,6 +665,7 @@ impl Payload {
                     depth_bias_va: cmd.isp_dbias_base,
                     depth_bias_is_int: cmd.flags & DBIAS_INT != 0,
                     few_primitives: cmd.flags & FEW_PRIMITIVES != 0 && variant.few_primitives,
+                    mesh_output: cmd.flags & MESH_OUTPUT != 0,
                     fragment_barriers: cmd.flags & FRAGMENT_BARRIERS != 0,
                     stage_prefixes: cmd.flags & STAGE_PREFIXES != 0,
                     whole_attachments: cmd.flags & WHOLE_ATTACHMENTS != 0,
@@ -795,6 +814,7 @@ impl Payload {
                     sampler_heap_va: cmd.sampler_heap,
                     sampler_count: cmd.sampler_count,
                     timestamps: cmd.ts,
+                    attachments: *attachments,
                 })
             }
         }

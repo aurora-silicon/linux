@@ -988,6 +988,7 @@ static const struct apple_epic_service_ops av_desktop_ops[] = {
 		.name = "dcpav-audio-interface-epic",
 		.compact_full = "dcpav-audio-interface-epic:0",
 		.reusable = true,
+		.singleton = true,
 		.prepare = av_desktop_audio_prepare,
 		.init = av_audiosrv_init,
 		.report = av_audiosrv_report,
@@ -1001,6 +1002,7 @@ static const struct apple_epic_service_ops av_desktop_ops[] = {
 		 */
 		.name = "dcpav-cec-interface-epic",
 		.compact_full = "dcpav-cec-interface-epic:0",
+		.singleton = true,
 		.init = av_cec_init,
 		.report = av_cec_report,
 		.teardown = av_cec_teardown,
@@ -1014,6 +1016,7 @@ static const struct apple_epic_service_ops av_desktop_ops[] = {
 		 */
 		.name = "dcpav-video-interface-epic",
 		.compact_full = "dcpav-video-interface-epic:0",
+		.singleton = true,
 		.init = av_video_init,
 		.report = av_cec_report,
 		.teardown = av_video_teardown,

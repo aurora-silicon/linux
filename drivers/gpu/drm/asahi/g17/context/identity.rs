@@ -3,8 +3,8 @@
 //! Context-local work-state identities. The low six bits address a node;
 //! the complete sequence distinguishes its owner until exact retirement.
 
-use core::sync::atomic::{AtomicU32, Ordering};
-use kernel::prelude::*;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use kernel::{prelude::*, sync::Arc};
 
 pub(super) const FREE: u32 = u32::MAX;
 pub(super) const STATE_COUNT: usize = 63;
@@ -32,6 +32,9 @@ pub(super) struct WorkStates {
     live: [AtomicU32; 64],
     /// Nodes taken by each engine's admissions and not yet released.
     held: [AtomicU32; ENGINES],
+    /// Indices claimed by every context sharing this one's execution context
+    /// (`super::super::exec_share`), whose work keys would otherwise collide.
+    claims: Option<Arc<AtomicU64>>,
 }
 impl WorkStates {
     pub(super) const fn new() -> Self {
@@ -41,7 +44,12 @@ impl WorkStates {
             next: AtomicU32::new(0x40),
             live: [const { AtomicU32::new(FREE) }; 64],
             held: [const { AtomicU32::new(0) }; ENGINES],
+            claims: None,
         }
+    }
+    /// Work states whose indices are unique among `claims`' sharers.
+    pub(super) fn shared(claims: Arc<AtomicU64>) -> Self {
+        Self { claims: Some(claims), ..Self::new() }
     }
     /// Takes a node for `engine`, or none when [`may_take`] refuses. Callers serialize
     /// allocations of one context; releases may run concurrently.
@@ -58,6 +66,12 @@ impl WorkStates {
                     .compare_exchange(FREE, word, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
+                if let Some(claims) = &self.claims {
+                    if claims.fetch_or(1 << index, Ordering::AcqRel) & (1 << index) != 0 {
+                        self.live[index].store(FREE, Ordering::Release);
+                        continue;
+                    }
+                }
                 held.fetch_add(1, Ordering::AcqRel);
                 return Some(word);
             }
@@ -71,6 +85,9 @@ impl WorkStates {
                 .compare_exchange(word, FREE, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok();
         if released {
+            if let Some(claims) = &self.claims {
+                claims.fetch_and(!(1 << index), Ordering::AcqRel);
+            }
             if let Some(held) = self.held.get(engine) {
                 held.fetch_sub(1, Ordering::AcqRel);
             }
@@ -266,6 +283,9 @@ impl WorkStates {
     }
 
     pub(super) fn used(&self) -> usize {
+        if let Some(claims) = &self.claims {
+            return claims.load(Ordering::Acquire).count_ones() as usize;
+        }
         self.live.iter().filter(|word| word.load(Ordering::Acquire) != FREE).count()
     }
 }

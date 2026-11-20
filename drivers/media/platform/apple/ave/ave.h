@@ -505,6 +505,8 @@ struct ave_ctx {
 	struct v4l2_fh fh;
 	struct ave_dev *ave;
 	struct v4l2_ctrl_handler hdl;
+	struct v4l2_ctrl *hevc_profile_ctrl;
+	bool hevc_profile_auto; /* Main 10 was set by S_FMT, not the client */
 	struct v4l2_pix_format_mplane src_fmt;
 	struct v4l2_pix_format_mplane dst_fmt;
 	struct v4l2_fract timeperframe;

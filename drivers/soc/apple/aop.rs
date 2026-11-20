@@ -217,18 +217,18 @@ mod aop_ring;
 /// Index into the AFK endpoint tables for RTKit endpoint `ep`, if it is one
 /// of the endpoints this driver drives.
 /// Iterates over `list`, or over every AFK endpoint if `list` is empty.
-struct AfkOrder {
-    list: &'static [u8],
+struct AfkOrder<'a> {
+    list: &'a [u8],
     next: usize,
 }
 
-impl AfkOrder {
-    fn new(list: &'static [u8]) -> AfkOrder {
+impl<'a> AfkOrder<'a> {
+    fn new(list: &'a [u8]) -> AfkOrder<'a> {
         AfkOrder { list, next: 0 }
     }
 }
 
-impl Iterator for AfkOrder {
+impl Iterator for AfkOrder<'_> {
     type Item = u8;
 
     fn next(&mut self) -> Option<u8> {
@@ -1321,10 +1321,11 @@ struct AopData {
     /// Answers to the stop and start of each endpoint around a system sleep.
     #[pin]
     ep_sleep: [FutureValue<()>; AFK_ENDPOINT_COUNT as usize],
-    /// The order endpoints stop for a system sleep and start after it. Empty
-    /// means all started ones in endpoint order.
-    sleep_endpoints: &'static [u8],
-    wake_endpoints: &'static [u8],
+    /// The order endpoints stop for a system sleep and start after it, from
+    /// the device tree where it gives one. Empty means all started ones in
+    /// endpoint order.
+    sleep_endpoints: KVec<u8>,
+    wake_endpoints: KVec<u8>,
     /// No call starts until the system has resumed.
     sleeping: Atomic<bool>,
     /// RTKit reported the firmware crashed. Nothing restarts it short of a reboot.
@@ -1438,7 +1439,53 @@ impl WorkItem for AopServiceRegisterWork {
 }
 
 impl AopData {
+    /// The order the device tree gives in `name` for the endpoints around a
+    /// system sleep, or `default` where it gives none. A list naming anything
+    /// but an AFK endpoint, or one twice, is not used.
+    fn endpoint_order(dev: &device::Device, name: &CStr, default: &[u8]) -> Result<KVec<u8>> {
+        let mut order = KVec::new();
+        let listed = dev.fwnode().and_then(|node| {
+            let len = node.property_count_elem::<u32>(name).ok()?;
+            node.property_read_array_vec::<u32>(name, len)
+                .ok()?
+                .optional()
+        });
+        if let Some(listed) = listed {
+            let mut seen = 0u32;
+            let distinct = listed.iter().all(|&ep| {
+                let index = u8::try_from(ep).ok().and_then(afk_endpoint_index);
+                index.is_some_and(|index| {
+                    let first = seen & (1 << index) == 0;
+                    seen |= 1 << index;
+                    first
+                })
+            });
+            if distinct {
+                for &ep in listed.iter() {
+                    order.push(ep as u8, GFP_KERNEL)?;
+                }
+                return Ok(order);
+            }
+            dev_warn!(
+                dev,
+                "{}: not a list of distinct endpoints; not used\n",
+                name
+            );
+        }
+        order.extend_from_slice(default, GFP_KERNEL)?;
+        Ok(order)
+    }
     fn new(dev: &platform::Device<Core<'_>>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
+        let sleep_endpoints = Self::endpoint_order(
+            dev.as_ref(),
+            c_str!("apple,sleep-endpoints"),
+            cfg.sleep_endpoints,
+        )?;
+        let wake_endpoints = Self::endpoint_order(
+            dev.as_ref(),
+            c_str!("apple,wake-endpoints"),
+            cfg.wake_endpoints,
+        )?;
         let registration_queue = OwnedQueue::new_ordered(c_str!("apple-aop"))?;
         let setup_queue = if cfg.setup_port {
             Some(OwnedQueue::new_ordered(c_str!("apple-aop-setup"))?)
@@ -1471,8 +1518,8 @@ impl AopData {
                     call_turn <- pin_init::pin_init_array_from_fn(|_| new_mutex!(())),
                     ep_shutdown <- pin_init::pin_init_array_from_fn(|_| FutureValue::pin_init()),
                     ep_sleep <- pin_init::pin_init_array_from_fn(|_| FutureValue::pin_init()),
-                    sleep_endpoints: cfg.sleep_endpoints,
-                    wake_endpoints: cfg.wake_endpoints,
+                    sleep_endpoints,
+                    wake_endpoints,
                     sleeping: Atomic::new(false),
                     crashed: Atomic::new(false),
                     sleep_stopped: Atomic::new(0),
@@ -1739,7 +1786,7 @@ impl AopData {
                 dev_err!(self.dev, "Wake notice not answered ({:?})", e);
             }
         }
-        let order = AfkOrder::new(self.wake_endpoints);
+        let order = AfkOrder::new(&self.wake_endpoints);
         for endpoint in order {
             let Some(index) = afk_endpoint_index(endpoint) else {
                 continue;
@@ -1776,7 +1823,7 @@ impl AopData {
         }
 
         let mut result = Ok(());
-        for endpoint in AfkOrder::new(self.sleep_endpoints) {
+        for endpoint in AfkOrder::new(&self.sleep_endpoints) {
             let Some(index) = afk_endpoint_index(endpoint) else {
                 continue;
             };
@@ -1805,6 +1852,60 @@ impl AopData {
             dev_dbg!(self.dev, "Endpoints stopped and AP idle notice answered for a sleep\n");
         }
         result
+    }
+
+    fn bootargs_has_ed0p(
+        aop_mmio: &Mmio<'_, Region<AOP_MMIO_SIZE>>,
+        word_access: bool,
+    ) -> Result<bool> {
+        let offset = aop_mmio.read32(BOOTARGS_OFFSET) as usize;
+        let size = aop_mmio.read32(BOOTARGS_SIZE) as usize;
+        if offset > aop_mmio.size() || size > aop_mmio.size() - offset {
+            return Err(EINVAL);
+        }
+        let start = if word_access { offset & !3 } else { offset };
+        let end = if word_access {
+            (offset + size).checked_add(3).ok_or(EINVAL)? & !3
+        } else {
+            offset + size
+        };
+        if end > aop_mmio.size() || (word_access && size == 0) {
+            return Err(EINVAL);
+        }
+        let mut bytes = KVec::<u8>::from_elem(0, end - start, GFP_KERNEL)?;
+        let aop_io_array: Mmio<'_, [u8; AOP_MMIO_SIZE]> = aop_mmio.try_cast()?;
+        let bootargs = io_project!(aop_io_array, [try: offset .. offset+size]);
+        if word_access {
+            for (i, chunk) in bytes.chunks_exact_mut(4).enumerate() {
+                chunk.copy_from_slice(&aop_mmio.try_read32(start + i * 4)?.to_le_bytes());
+            }
+        } else {
+            bootargs.copy_to_slice(&mut bytes);
+        }
+        let ed0p_key = from_fourcc(b"ED0p");
+        let mut seen = false;
+        let first = offset - start;
+        let arg_bytes = &bytes[first..first + size];
+        let mut idx = 0;
+        while idx < size {
+            if size - idx < 8 {
+                return Err(EINVAL);
+            }
+            let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
+            let len = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
+            idx += 8;
+            if len > size - idx {
+                return Err(EINVAL);
+            }
+            if key == ed0p_key {
+                if seen || len != mem::size_of::<u64>() {
+                    return Err(EINVAL);
+                }
+                seen = true;
+            }
+            idx += len;
+        }
+        Ok(seen)
     }
 
     fn patch_bootargs(
@@ -1837,6 +1938,9 @@ impl AopData {
         } else {
             bootargs.copy_to_slice(&mut bytes);
         }
+        let ed0p_key = from_fourcc(b"ED0p");
+        let need_ed0p = patches.iter().any(|&(k, v)| k == ed0p_key && v.is_some());
+        let mut seen_ed0p = false;
         let first = offset - start;
         let arg_bytes = &mut bytes[first..first + size];
         let mut idx = 0;
@@ -1854,10 +1958,17 @@ impl AopData {
                 if *k != key {
                     continue;
                 }
-                // `None` keeps the value the firmware image carries.
+                // `None` keeps the value the firmware image carries (including
+                // an unused `ED0p` entry on firmware without `__EDATA`).
                 let Some(v) = v else {
                     break;
                 };
+                if key == ed0p_key {
+                    if seen_ed0p || len != mem::size_of::<u64>() {
+                        return Err(EINVAL);
+                    }
+                    seen_ed0p = true;
+                }
                 if len > mem::size_of::<u64>() {
                     return Err(EINVAL);
                 }
@@ -1865,6 +1976,9 @@ impl AopData {
                 break;
             }
             idx += len;
+        }
+        if need_ed0p && !seen_ed0p {
+            return Err(EINVAL);
         }
         if word_access {
             for (i, chunk) in bytes.chunks_exact(4).enumerate() {
@@ -1982,9 +2096,15 @@ impl AopData {
     /// IOMMU core maps them in the default domain when the device is added
     /// (one to one when the IOVA is the physical address, translated
     /// otherwise), so they are only checked here. Every page has to be mapped
-    /// where the DT says, the external code (`__ETEXT`) at `ec0p` and any
-    /// other segment (`__OS_LOG`) at its physical address.
-    fn check_fw_regions(dev: &device::Device, ec0p: u64) -> Result<()> {
+    /// where the DT says, with the external code (`__ETEXT`) at `ec0p`.
+    /// When the firmware bootargs declare `ED0p` (`allow_ed0p`), macOS 27
+    /// firmware may also supply one translated `__EDATA` segment after
+    /// `__ETEXT`, while `__OS_LOG` remains identity-mapped.
+    fn check_fw_regions(
+        dev: &device::Device,
+        ec0p: u64,
+        allow_ed0p: bool,
+    ) -> Result<Option<(u64, u64)>> {
         // SAFETY: `dev` is a live device being probed.
         let np = unsafe { (*dev.as_raw()).of_node };
         if np.is_null() {
@@ -2009,11 +2129,14 @@ impl AopData {
             return Err(ENODEV);
         }
         let mut etext = false;
+        let mut etext_end = 0;
+        let mut external_data = None;
         for idx in 0..count {
             let (phys, iova, size) = Self::fw_region(np, idx).inspect_err(|e| {
                 dev_err!(dev, "Invalid firmware memory-region {} ({:?})", idx, e);
             })?;
             if phys % FW_REGION_PAGE != 0
+                || size == 0
                 || size % FW_REGION_PAGE != 0
                 || size > FW_REGION_MAX_SIZE
                 || iova % FW_REGION_PAGE != 0
@@ -2029,15 +2152,22 @@ impl AopData {
                     return Err(EINVAL);
                 }
                 etext = true;
+                etext_end = iova + size;
             } else if iova != phys {
-                dev_err!(
-                    dev,
-                    "Firmware memory-region {} at IOVA {:#x}, neither EC0p {:#x} nor its physical address",
-                    idx,
-                    iova,
-                    ec0p
-                );
-                return Err(EINVAL);
+                if !allow_ed0p {
+                    dev_err!(
+                        dev,
+                        "Firmware memory-region {} is translated without ED0p ({:#x} != {:#x})",
+                        idx,
+                        iova,
+                        phys
+                    );
+                    return Err(EINVAL);
+                }
+                if external_data.replace((iova, size)).is_some() {
+                    dev_err!(dev, "Multiple translated external data regions");
+                    return Err(EINVAL);
+                }
             }
             let mut off = 0;
             while off < size {
@@ -2060,7 +2190,22 @@ impl AopData {
             dev_err!(dev, "No firmware memory-region at EC0p {:#x}", ec0p);
             return Err(ENOENT);
         }
-        Ok(())
+        if let Some((iova, size)) = external_data {
+            if iova < etext_end {
+                dev_err!(
+                    dev,
+                    "External data region precedes or overlaps the external code"
+                );
+                return Err(EINVAL);
+            }
+            dev_info!(
+                dev,
+                "Validated external data region at IOVA {:#x}, size {:#x}",
+                iova,
+                size
+            );
+        }
+        Ok(external_data)
     }
 
     /// Leaks every allocation the firmware may still access. Called when the
@@ -2837,9 +2982,10 @@ struct AopHwConfig {
     epic_v4: bool,
     /// The firmware boots through a second, "setup", mailbox as well.
     setup_port: bool,
-    /// The order endpoints stop for a system sleep; empty means endpoint order.
+    /// The order endpoints stop for a system sleep where the device tree
+    /// gives none (`apple,sleep-endpoints`); empty means endpoint order.
     sleep_endpoints: &'static [u8],
-    /// The order they start after one.
+    /// The order they start after one (`apple,wake-endpoints`).
     wake_endpoints: &'static [u8],
     /// Its service endpoints are the ones its EPMAP announces, not T8140's.
     setup_epmap_endpoints: bool,
@@ -3126,20 +3272,25 @@ impl platform::Driver for AopDriver {
         let asc_req = pdev.io_request_by_index(1).ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
         let asc_mmio = asc_mmio.as_view().relaxed();
-        if cfg.fw_regions {
+        let aop_mmio = aop_mmio.as_view();
+        let ed0p = if cfg.fw_regions {
             // Before anything is written to the AOP: no mapping, no start.
-            AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p)?;
-        }
+            let allow_ed0p = cfg.patch_bootargs
+                && AopData::bootargs_has_ed0p(&aop_mmio, cfg.bootargs_word_access)?;
+            AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p, allow_ed0p)?.map(|(iova, _)| iova)
+        } else {
+            None
+        };
         let data = AopData::new(pdev, cfg)?;
         // Whatever fails below leaves the AOP running and its children
         // registering; the same teardown as unbind's cleans that up.
         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
-        let aop_mmio = aop_mmio.as_view();
         if cfg.patch_bootargs {
             data.patch_bootargs(
                 &aop_mmio,
                 &[
                     (from_fourcc(b"EC0p"), Some(cfg.ec0p)),
+                    (from_fourcc(b"ED0p"), ed0p),
                     (from_fourcc(b"nCal"), cfg.ncal),
                     (from_fourcc(b"alig"), Some(cfg.alig)),
                     (from_fourcc(b"AOPt"), Some(cfg.aopt)),

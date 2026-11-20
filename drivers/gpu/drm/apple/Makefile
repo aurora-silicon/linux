@@ -23,6 +23,7 @@ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_external_hdr_hints_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_resume_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_boot_display_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-syslog-test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-route-supplier-test.dtbo.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += parser_mode_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_resume_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_ready_test.o
@@ -32,6 +33,7 @@ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_dropped_swap_test.o
 appledrm-y += iomfb_v26_6.o iomfb_v26_6_link.o j613_dcp_activate.o
 appledrm-y += iomfb_v27.o
 appledrm-y += epic/dpavservep.o
+appledrm-y += epic/panelavep.o
 appledrm-y += plane.o
 
 

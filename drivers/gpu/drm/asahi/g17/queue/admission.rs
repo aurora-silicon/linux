@@ -2,8 +2,9 @@
 
 //! Logical queue and physical render-pair admission. A retained pair belongs
 //! to one logical owner even while idle. Closing that owner makes it reusable
-//! only after every active lease retires. Quarantine retains these leases until
-//! a firmware drain witness or both processors stopping makes reuse safe.
+//! only after every active lease retires. Quarantine keeps the slot from any new
+//! lease until the runtime's drain witness of its pair or both processors stopping
+//! makes reuse safe.
 //!
 //! The pool lock protects host accounting only and is never held while building
 //! a graph or waiting for GPU work. Capacity waiters sleep on the release event.
@@ -70,11 +71,22 @@ struct State {
     /// Quarantined slots whose failed work is all spared (innocent): waiting publications fail
     /// their own fence with EBUSY instead of a device-loss error, so the VM stays usable.
     spared: u64,
+    /// Quarantined slots whose pair the runtime's drain witness released while leases of the
+    /// slot were still held ([`Pool::pair_drained`]): the quarantine ends when the last of them
+    /// is dropped. A quarantined slot takes no new lease, and a new failure clears the bit.
+    drained: u64,
     kill_hold: u64,
     /// Slots whose kill hold ended at their killed context's consumed scheduler release,
     /// and when. A new owner takes such a pair last, the one released longest ago first.
     killed: u64,
     killed_at: [u64; cfg::RENDER_SLOTS],
+    /// Slots whose pair no other owner can bind: it keeps work nobody else can bind past (a
+    /// quarantine, or a group whose stamps are still owed), or the scheduler release of the
+    /// context it is bound to is pending. The slot's own live owner keeps using its pair, but no
+    /// new or other owner is given it, even once it is released and has no lease left, until
+    /// the runtime clears the bit (the pair drained, or the release was consumed and the pair
+    /// parked) or both processors stop.
+    held: u64,
     /// The physical queue table still has room for a pair built in an unowned slot. The
     /// runtime updates this whenever the table changes.
     build_room: bool,
@@ -94,9 +106,11 @@ impl State {
             epochs: [0; cfg::RENDER_SLOTS],
             quarantined: 0,
             spared: 0,
+            drained: 0,
             kill_hold: 0,
             killed: 0,
             killed_at: [0; cfg::RENDER_SLOTS],
+            held: 0,
             build_room: true,
             released: 0,
             epoch: 0,
@@ -131,6 +145,7 @@ impl State {
                     & !self.active
                     & !self.quarantined
                     & !self.kill_hold
+                    & !self.held
                     & Self::MASK
                     == 0 =>
             {
@@ -214,7 +229,7 @@ impl State {
             self.advance(slot);
             return Some(slot as u8);
         }
-        let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold;
+        let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold & !self.held;
         let eligible = |slot: usize| free & (1u64 << slot) != 0;
         let released = |slot: usize| self.released & (1u64 << slot) != 0;
         let unowned = || (0..cfg::RENDER_SLOTS).find(|slot| eligible(*slot) && self.owners[*slot] == 0);
@@ -243,7 +258,8 @@ impl State {
             return;
         }
         // A speculative sibling never takes a killed context's pair.
-        let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold & !self.killed;
+        let free =
+            !self.active & Self::MASK & !self.quarantined & !self.kill_hold & !self.killed & !self.held;
         let eligible = |slot: usize| free & (1u64 << slot) != 0;
         let sibling = (0..cfg::RENDER_SLOTS)
             .filter(|slot| {
@@ -295,12 +311,12 @@ impl State {
             || owner == Some(old)
             || expected.is_some_and(|expected| expected != old)
             || self.refs[slot] != 0
-            || (self.active | self.quarantined | self.kill_hold) & bit != 0
+            || (self.active | self.quarantined | self.kill_hold | self.held) & bit != 0
             || (self.released & bit == 0
                 && !self.owners.iter().enumerate().any(|(other, value)| {
                     other != slot
                         && *value == old
-                        && (self.quarantined | self.kill_hold) & (1u64 << other) == 0
+                        && (self.quarantined | self.kill_hold | self.held) & (1u64 << other) == 0
                 }))
         {
             return false;
@@ -335,7 +351,7 @@ impl State {
         let bit = 1u64 << slot;
         if self.owners[slot] == owner
             && self.refs[slot] == 1
-            && (self.quarantined | self.kill_hold) & bit == 0
+            && (self.quarantined | self.kill_hold | self.held) & bit == 0
         {
             self.owners[slot] = 0;
             self.released &= !bit;
@@ -377,7 +393,7 @@ impl State {
             Plan::Any if owner == 0 => false,
             Plan::Any if self.owners.contains(&owner) => (0..cfg::RENDER_SLOTS).any(usable),
             Plan::Any => {
-                let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold;
+                let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold & !self.held;
                 (0..cfg::RENDER_SLOTS).any(|slot| {
                     free & (1u64 << slot) != 0
                         && (self.released & (1u64 << slot) != 0 || self.owners[slot] == 0)
@@ -461,8 +477,78 @@ impl State {
             self.refs[slot] -= 1;
         }
         if self.refs[slot] == 0 {
-            self.active &= !(1u64 << slot);
+            let bit = 1u64 << slot;
+            self.active &= !bit;
+            // The last lease of a slot whose pair has drained ends its quarantine
+            // (see `pair_drained`).
+            if self.drained & bit != 0 {
+                self.quarantined &= !bit;
+                self.spared &= !bit;
+                self.drained &= !bit;
+            }
         }
+    }
+
+    /// Ends the quarantine of `slot`.
+    fn rehabilitate(&mut self, slot: usize) {
+        let bit = 1u64 << slot;
+        self.quarantined &= !bit;
+        self.spared &= !bit;
+        self.drained &= !bit;
+    }
+
+    /// The runtime's drain witness released every group of the pair in `slot`. A quarantine
+    /// that no lease of the slot is left to end ends now; returns whether it did. While leases
+    /// remain, it ends with the last of them, so that a drained command still gives its VM
+    /// pin back before its slot returns ([`RenderLease::rehabilitate_after_firmware_drain`]).
+    fn pair_drained(&mut self, slot: usize) -> bool {
+        let bit = (1u64 << slot) & Self::MASK;
+        if self.quarantined & bit == 0 {
+            return false;
+        }
+        if self.refs[slot] != 0 {
+            self.drained |= bit;
+            return false;
+        }
+        self.rehabilitate(slot);
+        true
+    }
+
+    /// Returns whether the slot stopped being held.
+    fn set_held(&mut self, slot: usize, held: bool) -> bool {
+        if slot >= cfg::RENDER_SLOTS {
+            return false;
+        }
+        let bit = (1u64 << slot) & Self::MASK;
+        let was = self.held & bit != 0;
+        if held {
+            self.held |= bit;
+        } else {
+            self.held &= !bit;
+        }
+        was && !held
+    }
+
+    /// [`Self::set_held`] for every slot in `slots`, whose bits in `held` are the new ones.
+    /// Returns whether a slot stopped being held.
+    fn sync_held(&mut self, slots: u64, held: u64) -> bool {
+        let slots = slots & Self::MASK;
+        let cleared = self.held & slots & !held != 0;
+        self.held = (self.held & !slots) | (held & slots);
+        cleared
+    }
+
+    fn retained(&self) -> u64 {
+        self.owners.iter().enumerate().fold(0u64, |bits, (slot, owner)| {
+            bits | if *owner != 0 { 1u64 << slot } else { 0 }
+        }) & Self::MASK
+    }
+
+    /// Slots a new owner cannot take now: leased, quarantined, kill-held, held, or retained by
+    /// an open owner.
+    fn used(&self) -> u64 {
+        (self.active | self.quarantined | self.kill_hold | self.held | (self.retained() & !self.released))
+            & Self::MASK
     }
 }
 
@@ -728,8 +814,52 @@ impl Pool {
         state.spared &= !released;
         state.kill_hold = 0;
         state.killed = 0;
+        // The stop settled every pair's work.
+        state.held = 0;
         drop(state);
         self.returned();
+    }
+
+    /// Under the device mutex, each time the runtime puts a pair back: `held` while no other
+    /// owner can bind the pair in `slot` (`render_hold` in the runtime). Set before that pass's
+    /// retirements drop their leases, and before a closing owner's slots are released, so the
+    /// slot is never free for another owner in between; clearing it wakes the waiters.
+    pub(crate) fn set_held(&self, slot: usize, held: bool) {
+        let cleared = self.state.lock().set_held(slot, held);
+        if cleared {
+            self.returned();
+        }
+    }
+
+    /// [`Self::set_held`] for every slot in `slots` under one lock: the runtime re-derives
+    /// them all where a scheduler release is armed or consumed, and on housekeeping passes.
+    pub(crate) fn sync_held(&self, slots: u64, held: u64) {
+        let cleared = self.state.lock().sync_held(slots, held);
+        if cleared {
+            self.returned();
+        }
+    }
+
+    /// Under the device mutex, once the runtime's drain witness released every group of the
+    /// pair in `slot` (`Pair::release_witnessed`): the firmware consumed the pair's ring
+    /// entries and returned its free-list blocks, and either stored stamps that cover its last
+    /// publication or acknowledged the kill of its context. It runs nothing of the pair and
+    /// stores through none of its records, so the slot's quarantine ends.
+    ///
+    /// Otherwise only a lease a drained command still holds ends it
+    /// ([`RenderLease::rehabilitate_after_firmware_drain`]). A group that retired on its pass
+    /// record (`stamps_owed`) gave its lease back with its result, and a quarantine can reach
+    /// the slot through that lease while the retirement is still deferred (a watchdog expiry
+    /// retires the group, then fails its pair, in one pass): the quarantine then outlived every
+    /// lease, and the slot stayed out of service until the processors stopped.
+    pub(crate) fn pair_drained(&self, slot: usize) {
+        if slot >= cfg::RENDER_SLOTS {
+            return;
+        }
+        let ended = self.state.lock().pair_drained(slot);
+        if ended {
+            self.returned();
+        }
     }
 
     /// Whether the physical queue table can hold another pair (see `State::build_room`).
@@ -745,7 +875,9 @@ impl Pool {
     /// A killed context's pair is free for a new owner.
     pub(crate) fn killed_pair_free(&self) -> bool {
         let state = self.state.lock();
-        state.killed & state.released & !state.active & !state.quarantined & !state.kill_hold & State::MASK != 0
+        state.killed & state.released & !state.active & !state.quarantined & !state.kill_hold & !state.held
+            & State::MASK
+            != 0
     }
 
 }
@@ -780,6 +912,31 @@ mod accounting_tests {
     }
 
     #[test]
+    fn a_drained_pair_ends_a_quarantine_no_lease_is_left_to_end() {
+        let mut state = State::new();
+        let slot = state.acquire(1, 1).unwrap();
+        let (index, bit) = (usize::from(slot), 1u64 << slot);
+        // Its lease carried a failure into admission, then went with a retirement on the
+        // pass record; the owner closed.
+        state.quarantined |= bit;
+        state.release(slot);
+        state.released |= bit;
+        assert_ne!(state.used() & bit, 0);
+        assert!(state.pair_drained(index));
+        assert_eq!(state.used() & bit, 0);
+        assert!(!state.pair_drained(index));
+        // With leases left, the last of them ends it.
+        state.refs[index] = 2;
+        state.active |= bit;
+        state.quarantined |= bit;
+        assert!(!state.pair_drained(index));
+        state.release(slot);
+        assert_ne!(state.quarantined & bit, 0);
+        state.release(slot);
+        assert_eq!(state.quarantined | state.drained, 0);
+    }
+
+    #[test]
     fn warming_quarantine_and_exit_hold_exclude_reassignment() {
         let mut state = State::new();
         let primary = state.acquire(1, 1).unwrap();
@@ -799,6 +956,38 @@ mod accounting_tests {
         assert!(!state.reassign_unused_spare(primary, Some(1), None));
         state.release(primary);
         assert!(!state.reassign_unused_spare(primary, Some(1), None));
+    }
+
+    #[test]
+    fn a_held_slot_goes_to_no_other_owner() {
+        let mut state = State::new();
+        state.build_room = false;
+        for slot in 1..cfg::RENDER_SLOTS {
+            state.owners[slot] = 100 + slot as u64;
+        }
+        // Two closed owners' pairs; the held one was released first.
+        state.released = (1u64 << 5) | (1u64 << 9);
+        state.epochs[5] = 1;
+        state.epochs[9] = 2;
+        assert!(!state.set_held(5, true));
+        assert_ne!(state.used() & (1u64 << 5), 0);
+        assert_eq!(state.acquire(1, 1), Some(9));
+        assert!(state.refusal(2).is_err());
+        assert_eq!(state.acquire(2, 1), None);
+        assert!(state.set_held(5, false));
+        assert_eq!(state.acquire(2, 1), Some(5));
+    }
+
+    #[test]
+    fn a_sync_changes_only_the_slots_it_names() {
+        let mut state = State::new();
+        state.held = (1u64 << 3) | (1u64 << 4);
+        // Slot 4 is lent out (not named): its bit stays. Slot 0 is no render slot.
+        assert!(!state.sync_held((1u64 << 3) | (1u64 << 7) | 1, (1u64 << 3) | (1u64 << 7) | 1));
+        assert_eq!(state.held, (1u64 << 3) | (1u64 << 4) | (1u64 << 7));
+        assert!(state.sync_held((1u64 << 3) | (1u64 << 7), 1u64 << 7));
+        assert_eq!(state.held, (1u64 << 4) | (1u64 << 7));
+        assert!(!state.sync_held(1u64 << 3, 0));
     }
 
     #[test]
@@ -882,15 +1071,15 @@ impl RenderLease {
             state.spared |= bit;
         }
         state.quarantined |= bit;
+        // A drain witnessed before this failure does not cover it.
+        state.drained &= !bit;
         drop(state);
         self.pool.returned();
     }
     /// The VM pin must be retired first. Keep this lease until after clearing
     /// quarantine; its drop is what permits waiting publications to proceed.
     pub(crate) fn rehabilitate_after_processor_stop(&self) {
-        let mut state = self.pool.state.lock();
-        state.quarantined &= !(1u64 << self.slot);
-        state.spared &= !(1u64 << self.slot);
+        self.pool.state.lock().rehabilitate(usize::from(self.slot));
     }
     /// Requires the runtime's closed-recovery, exact pair-drain witness.
     pub(crate) fn rehabilitate_after_firmware_drain(&self) {
@@ -1045,14 +1234,10 @@ impl Pool {
     pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         writeln!(f, "logical_queues used={} total={}", self.queues.load(Ordering::Acquire), self.max_queues)?;
         let state = self.state.lock();
-        let retained = state.owners.iter().enumerate().fold(0u64, |bits, (slot, owner)| {
-            bits | if *owner != 0 { 1u64 << slot } else { 0 }
-        }) & State::MASK;
-        let used = (state.active | state.quarantined | state.kill_hold | (retained & !state.released)) & State::MASK;
-        writeln!(f, "render_slots used={} total={} retained={} active={} quarantined={} kill_held={}",
-                 used.count_ones(), State::MASK.count_ones(), retained.count_ones(),
+        writeln!(f, "render_slots used={} total={} retained={} active={} quarantined={} kill_held={} held={}",
+                 state.used().count_ones(), State::MASK.count_ones(), state.retained().count_ones(),
                  (state.active & State::MASK).count_ones(), (state.quarantined & State::MASK).count_ones(),
-                 (state.kill_hold & State::MASK).count_ones())
+                 (state.kill_hold & State::MASK).count_ones(), (state.held & State::MASK).count_ones())
     }
 }
 
