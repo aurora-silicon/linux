@@ -461,7 +461,21 @@ bool dcp_t6041_ext_enabled(void)
 
 static bool dcp_desktop_external(struct apple_dcp *dcp)
 {
-	return of_device_is_compatible(dcp->dev->of_node, "apple,t6041-dcpext");
+	return dcp->desktop_external;
+}
+
+/*
+ * The T6041 external processors, and the Mac mini's (J773g) T8132 ones on
+ * macOS 27.2: macOS drives the mini's HDMI port from dcpext0 alone, through
+ * the LPDPTX PHY (source select = dcp-index 1) and a PS190 DP-to-HDMI
+ * converter on the same SMC rails (gP0f, gP1a) as the M4 Max Mac Studio's
+ * (J575c), whose dcpext0 drives its HDMI port the same way. Its fixed PHY is
+ * powered at probe and its converter rails settle before the link, as there.
+ */
+static bool dcp_desktop_external_node(const struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t6041-dcpext") ||
+	       apple_t8132_dcpext_v27_2(np);
 }
 
 /*
@@ -6455,8 +6469,9 @@ static void dcp_desktop_phy_off(void *data)
 }
 
 /*
- * The fixed HDMI output of a desktop 26.x external processor (T6041 dcpext0):
- * its DP PHY is powered here, as the boot loader's working sequence does. A
+ * The fixed HDMI output of a desktop external processor (T6041 dcpext0, and
+ * the J773g's T8132 dcpext0 on 27.2): its DP PHY is powered here, as the
+ * boot loader's working sequence does. A
  * Type-C output (dcpext1) has no fixed PHY; the display fabric powers the
  * PHY of the route a port claims (see dcp_typec_phy_on()).
  */
@@ -6688,7 +6703,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	}
 	dcp->ext_failsafe = dcp_ext_is_failsafe(dev->of_node);
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
-	dcp->desktop_external = of_device_is_compatible(dev->of_node, "apple,t6041-dcpext");
+	dcp->desktop_external = dcp_desktop_external_node(dev->of_node);
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
 	dcp_external_audio_init(dcp);
 	dcp->dev = dev;
