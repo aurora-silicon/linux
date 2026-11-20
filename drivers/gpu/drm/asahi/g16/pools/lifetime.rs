@@ -39,6 +39,8 @@ pub(crate) struct Counts {
     pub(crate) retired: u32,
     pub(crate) quarantined: u32,
     pub(crate) reusable: u32,
+    /// Owners abandoned after a firmware recovery passed them ([`Lifetime::abandon`]).
+    pub(crate) abandoned: u32,
 }
 
 #[derive(Clone)]
@@ -46,6 +48,7 @@ pub(crate) struct Lifetime<const N: usize> {
     units: [Unit; N],
     sequence: u64,
     pipelined: bool,
+    abandoned: u32,
 }
 impl<const N: usize> Lifetime<N> {
     pub(crate) const fn new(pipelined: bool) -> Self {
@@ -59,6 +62,7 @@ impl<const N: usize> Lifetime<N> {
             units: [unit; N],
             sequence: 0,
             pipelined,
+            abandoned: 0,
         }
     }
     #[allow(dead_code)]
@@ -66,7 +70,10 @@ impl<const N: usize> Lifetime<N> {
         self.units[k].generation
     }
     pub(crate) fn counts(&self) -> Counts {
-        let mut counts = Counts::default();
+        let mut counts = Counts {
+            abandoned: self.abandoned,
+            ..Counts::default()
+        };
         for (k, unit) in self.units.iter().enumerate() {
             match unit.state {
                 State::Fresh => counts.fresh += 1,
@@ -162,15 +169,52 @@ impl<const N: usize> Lifetime<N> {
         self.units[k].state = State::Retired;
         true
     }
-    /// A firmware-aborted owner is retained forever and cannot grant a displacement lease.
+    /// An owner whose storage can no longer be trusted (corrupt identity or a failed
+    /// retirement) is retained forever and cannot grant a displacement lease.
     pub(crate) fn quarantine(&mut self, k: usize) {
         self.units[k].state = State::Quarantined;
+    }
+    /// An owner a firmware recovery passed without completing it (an aborted receipt). The
+    /// firmware no longer runs it, so its index returns to service for other storage, as a
+    /// fresh owner. Its own storage is never used again: its job failed, which leaves its VM
+    /// a sticky error (no later publication), and the engine retains the job and so keeps the
+    /// storage mapped. It is not a retired owner: it never proves that an owner published
+    /// before it was displaced, which still takes a later full retirement.
+    pub(crate) fn abandon(&mut self, k: usize) {
+        let Some(u) = self.units.get_mut(k) else {
+            return;
+        };
+        if u.state != State::Published {
+            return;
+        }
+        u.state = State::Fresh;
+        u.previous = State::Fresh;
+        u.generation = 0;
+        self.abandoned = self.abandoned.saturating_add(1);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn an_abandoned_owner_returns_to_service_but_displaces_nothing() {
+        let mut l = Lifetime::<2>::new(false);
+        assert!(l.claim(0));
+        assert!(l.publish(0));
+        assert!(l.retire(0));
+        assert!(l.claim(1));
+        assert!(l.publish(1));
+        l.abandon(1);
+        assert!(!l.exhausted());
+        assert!(!l.claim(0)); // The abort is no displacement of owner 0.
+        assert!(l.claim(1)); // Its index serves other storage.
+        assert!(l.publish(1));
+        assert!(l.retire(1));
+        assert!(l.claim(0)); // A later full retirement displaced owner 0.
+        assert_eq!(l.counts().abandoned, 1);
+        assert_eq!(l.counts().quarantined, 0);
+    }
     #[test]
     fn distinct_retired_displacement_is_required() {
         let mut l = Lifetime::<2>::new(false);
