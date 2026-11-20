@@ -70,12 +70,23 @@ properties:
       normal streams and their exact-RID entries may be adopted by the OS.
       Other streams and RID entries remain inherited. The documented static
       SID16 bypass role may be initialized only from a disabled stream with
-      no valid root; an existing bypass remains unchanged. PIODMA and other
+      no valid root; an existing bypass remains unless apple,sid16-page
+      narrows it to one page. PIODMA and other
       reserved roles are not modified. This does not authorize a controller
       reset or takeover of active page tables. Both the radio DART and PCI
       host describe the same two ordinary streams. Error reporting must
       already be unmasked at admission; the OS preserves the inherited global
       error-mask policy rather than changing it for these streams.
+
+  apple,sid16-page:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description: >
+      Physical address of the one 16 KiB page the radio's static SID16
+      stream needs to reach. When present, the OS translates SID16 through a
+      table that maps only this page, identity, instead of keeping its
+      bypass. It applies only with apple,managed-sids, when the DART is
+      admitted as the managed radio DART. It must be 16 KiB aligned and below
+      2^36.
 
   reg:
     minItems: 1
@@ -328,6 +339,7 @@ required:
 
 dependencies:
   apple,gapf-slice-values: [ 'apple,gapf-slice' ]
+  apple,sid16-page: [ 'apple,managed-sids' ]
 
 allOf:
   - if:
