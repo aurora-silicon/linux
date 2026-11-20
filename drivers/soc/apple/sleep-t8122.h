@@ -132,11 +132,30 @@ module_param(t8122_mcc, bool, 0600);
 MODULE_PARM_DESC(t8122_mcc,
 		 "J613 trial: step the memory controller down after the watchdog-control clear, as macOS");
 
-static bool t8122_macos_commit;
+static unsigned int t8122_macos_commit;
 static bool t8122_post_commit_watch;
-module_param(t8122_macos_commit, bool, 0600);
+module_param(t8122_macos_commit, uint, 0600);
 MODULE_PARM_DESC(t8122_macos_commit,
-		 "J613 trial: after the commit word, macOS's tail: PMU RTC alarm unmask and arm, then CLLT and the commit word twice more");
+		 "J613 trial: after the commit word, macOS's tail: 1 the PMU RTC alarm unmask and arm, then CLLT and the commit word twice more; 2 the same writes in macOS's order (CLLT and commit, the alarm, CLLT and commit)");
+
+/*
+ * J613 trial: the cores' last WFI at EL1, as macOS's (capture run 50: every core traps its final
+ * WFI from EL1). Linux runs at EL2 (VHE); the drop is the existing t8142_el1_wfi(): EL1h, MMU off,
+ * every exception masked, no traps, stage 2 off. 0 = EL2 (default), 1 = the boot core, 2 = every core.
+ */
+static unsigned int t8122_el1_wfi;
+module_param(t8122_el1_wfi, uint, 0600);
+MODULE_PARM_DESC(t8122_el1_wfi, "J613 trial: take the last WFI at EL1, as macOS: 0 no, 1 boot core, 2 every core");
+
+/*
+ * J613 diagnostic: each core records its own state at its last WFI, for the per-core list macOS's
+ * capture has (run 50): bit 0 the deep-sleep word, the EL1 timers' controls, ISR_EL1 and
+ * CurrentEL; bit 1 also S3_1_C15_C0_0, S3_5_C15_C1_1 and S3_5_C15_C1_3 (macOS: 0, 0, 0xf). The
+ * boot core prints them ("R" lines) after its 'Z'.
+ */
+static unsigned int t8122_wfi_regs;
+module_param(t8122_wfi_regs, uint, 0600);
+MODULE_PARM_DESC(t8122_wfi_regs, "J613 DIAGNOSTIC: print every core's state at its last WFI (bit 0 architectural, bit 1 also three IMPDEF words)");
 
 static bool t8122_macos_state;
 module_param(t8122_macos_state, bool, 0600);
@@ -1275,13 +1294,66 @@ MODULE_PARM_DESC(t8122_wfi_timer_s,
 		 "J613 DIAGNOSTIC: the boot core's own timer, this many s after its last WFI starts, shows whether it kept its power (0 = off)");
 static bool t8122_wfi_timer_armed;
 
+#define T8122_WFI_WORDS	8
+static u64 t8122_wfi_state[8][T8122_WFI_WORDS] __aligned(64);
+
+/* One core's record, cleaned to memory: a core that powers off takes its L1 with it. */
+static void t8122_wfi_record(void)
+{
+	u64 mpidr = read_cpuid_mpidr();
+	unsigned int idx = (MPIDR_AFFINITY_LEVEL(mpidr, 2) & 1) * 4 + (MPIDR_AFFINITY_LEVEL(mpidr, 0) & 3);
+	unsigned int mode = READ_ONCE(t8122_wfi_regs);
+	u64 *w = t8122_wfi_state[idx];
+	bool hyp = is_kernel_in_hyp_mode();
+
+	w[0] = 0x100 | read_sysreg(CurrentEL);
+	w[1] = read_sysreg_s(SYS_APL_DEEP_SLEEP);
+	w[2] = hyp ? read_sysreg_s(SYS_CNTP_CTL_EL02) : read_sysreg(cntp_ctl_el0);
+	w[3] = hyp ? read_sysreg_s(SYS_CNTV_CTL_EL02) : read_sysreg(cntv_ctl_el0);
+	w[4] = read_sysreg(isr_el1);
+	if (mode & 2) {
+		w[5] = read_sysreg_s(sys_reg(3, 1, 15, 0, 0));
+		w[6] = read_sysreg_s(sys_reg(3, 5, 15, 1, 1));
+		w[7] = read_sysreg_s(sys_reg(3, 5, 15, 1, 3));
+	}
+	dcache_clean_inval_poc((unsigned long)w, (unsigned long)(w + T8122_WFI_WORDS));
+}
+
+static void t8122_wfi_print(void)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < 8; i++) {
+		dcache_inval_poc((unsigned long)t8122_wfi_state[i],
+				 (unsigned long)(t8122_wfi_state[i] + T8122_WFI_WORDS));
+		t8122_dc_puts("\nR");
+		t8122_dc_putc('0' + i);
+		for (j = 0; j < T8122_WFI_WORDS; j++) {
+			t8122_dc_putc(' ');
+			t8122_dc_hex(upper_32_bits(t8122_wfi_state[i][j]));
+			t8122_dc_hex(lower_32_bits(t8122_wfi_state[i][j]));
+		}
+	}
+	t8122_dc_puts("\nR end\n");
+}
+
 static void t8122_deep_wfi_arm(void)
 {
+	bool boot = apple_sleep &&
+		    (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) == apple_sleep->mbox->boot_mpidr;
+	unsigned int el1 = READ_ONCE(t8122_el1_wfi);
+
 	if (t8122_quiet)
 		sleep_core_fiq_quiet();
 	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
+	if (READ_ONCE(t8122_wfi_regs))
+		t8122_wfi_record();
+	if (!boot && el1 >= 2 && is_kernel_in_hyp_mode()) {
+		dsb(sy);
+		t8142_el1_wfi();
+	}
 	/* The boot core's, last: 'Z' going in. */
-	if (apple_sleep && (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) == apple_sleep->mbox->boot_mpidr) {
+	if (boot) {
 		unsigned int secs = READ_ONCE(t8122_wfi_timer_s);
 
 		if (secs) {
@@ -1292,6 +1364,13 @@ static void t8122_deep_wfi_arm(void)
 			t8122_wfi_timer_armed = true;
 		}
 		t8122_dc_putc('Z');
+		if (READ_ONCE(t8122_wfi_regs))
+			t8122_wfi_print();
+		if (el1 && is_kernel_in_hyp_mode()) {
+			t8122_dc_puts("E1");
+			dsb(sy);
+			t8142_el1_wfi();
+		}
 	}
 }
 
@@ -1628,9 +1707,16 @@ static void t8122_macos_commit_tail(struct apple_sleep *s)
 {
 	int n;
 
-	t8122_pmu_write(s, 0xf80e, 0);
-	t8122_pmu_write(s, 0xf800, 0x41);
+	if (t8122_macos_commit == 1) {
+		t8122_pmu_write(s, 0xf80e, 0);
+		t8122_pmu_write(s, 0xf800, 0x41);
+	}
 	for (n = 0; n < 2; n++) {
+		/* macOS's order: the alarm between the second and the third commit writes */
+		if (t8122_macos_commit == 2 && n == 1) {
+			t8122_pmu_write(s, 0xf80e, 0);
+			t8122_pmu_write(s, 0xf800, 0x41);
+		}
 		writel(0, s->cllt + T8122_CLLT_CTL);
 		writel(0, s->cllt + T8122_CLLT_CTL);
 		writel(0x1c17, s->cllt + T8122_CLLT_LAST);

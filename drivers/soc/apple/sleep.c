@@ -5491,6 +5491,15 @@ static void apple_sleep_wait_still_on(struct apple_sleep *s)
  *  - The RTC alarm: macOS arms it after the commit. rtcwake has armed it long
  *    before this, with no SPMI traffic near the engine.
  */
+/*
+ * The boot core's wait between the others' release and its own last WFI, in us, instead of
+ * the SoC's boot_wfi_delay_ms (-1 = the SoC's). J613's macOS: the others' final WFI 17-22 us
+ * after the third commit write, the boot core's 33 us after it (capture run 50).
+ */
+static int sleep_boot_wfi_us = -1;
+module_param_named(boot_wfi_us, sleep_boot_wfi_us, int, 0644);
+MODULE_PARM_DESC(boot_wfi_us, "The boot core's wait before its last WFI after the others' release, in us (-1: the SoC's)");
+
 static bool sleep_v27_selected_for(struct apple_sleep *s);
 static void t8142_last_mile(struct apple_sleep *s);
 static void t8142_post_commit_probe(struct apple_sleep *s, unsigned int ms);
@@ -5567,7 +5576,9 @@ static int apple_sleep_commit(unsigned long unused)
 					is_kernel_in_hyp_mode() && READ_ONCE(sleep_el1_wfi) >= 2);
 		spin_table_release_stopped();
 	}
-	if (s->soc->boot_wfi_delay_ms)
+	if (READ_ONCE(sleep_boot_wfi_us) >= 0)
+		udelay(READ_ONCE(sleep_boot_wfi_us));
+	else if (s->soc->boot_wfi_delay_ms)
 		mdelay(s->soc->boot_wfi_delay_ms);
 	if (s->soc->ops->post_release)
 		s->soc->ops->post_release(s);
