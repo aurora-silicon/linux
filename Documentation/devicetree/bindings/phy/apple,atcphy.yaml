@@ -59,7 +59,7 @@ allOf:
             - description: Common controls for USB and DisplayPort
             - description: DisplayPort alternate mode PHY
             - description: AXI to Apple Fabric interface
-            - description: USB2 PHY
+            - description: USB2 PHY, or LIOA on a DisplayPort-only T8142 PHY
             - description: USB3 PIPE interface
             - description: Local IO address translation controls (T8142)
         reg-names:
@@ -68,7 +68,7 @@ allOf:
             - const: core
             - const: lpdptx
             - const: axi2af
-            - const: usb2phy
+            - enum: [ usb2phy, lioa ]
             - const: pipehandler
             - const: lioa
       oneOf:
@@ -82,6 +82,18 @@ allOf:
               minItems: 5
             reg-names:
               minItems: 5
+        # T8142 ATC2 drives only the fixed DisplayPort link (the J704's HDMI
+        # port): it has no USB controller and no USB banks.
+        - properties:
+            reg:
+              minItems: 4
+              maxItems: 4
+            reg-names:
+              items:
+                - const: core
+                - const: lpdptx
+                - const: axi2af
+                - const: lioa
       required:
         - power-domains
     else:
@@ -156,10 +168,10 @@ allOf:
     then:
       properties:
         reg:
-          minItems: 5
+          minItems: 4
           maxItems: 6
         reg-names:
-          minItems: 5
+          minItems: 4
           maxItems: 6
     else:
       properties:
