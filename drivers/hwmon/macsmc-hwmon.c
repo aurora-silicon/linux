@@ -1417,12 +1417,12 @@ static int macsmc_hwmon_die_register(struct macsmc_hwmon *hwmon)
 		return 0;
 	}
 	/*
-	 * MacBook Air (15-inch, M3): all twelve keys are readable floats on
-	 * J615. The Tg readings rose during a GPU workload and fell after
-	 * it stopped. Require the complete CPU/GPU set, not a CPU-only zone
-	 * if discovery of a GPU key fails.
+	 * A board that marks its key list complete has every listed key in
+	 * its firmware. A missing key there is a discovery failure, so there
+	 * is no zone rather than one that leaves out part of the die, such
+	 * as a CPU-only zone when a GPU key is missing.
 	 */
-	if (of_machine_is_compatible("apple,j615") &&
+	if (of_property_read_bool(hwmon->dev->of_node, "apple,soc-die-keys-complete") &&
 	    hwmon->die_count != hwmon->die_listed) {
 		dev_warn(hwmon->dev, "no SoC die temperature zone: only %u of %u required keys is present\n",
 			 hwmon->die_count, hwmon->die_listed);
