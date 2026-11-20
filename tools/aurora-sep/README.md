@@ -56,7 +56,9 @@ Environment=AURORA_SEP_READY_TIMEOUT=180
 SEP writes are always on: xART writes and identity-keybag provisioning have
 no switch. The driver's `xart_writes` and `provision_keybag` parameters were
 removed (aurora-silicon/linux#2591), and a stale value on the kernel command
-line or in modprobe.d is ignored. The driver exports no module alias, so udev
+line or in modprobe.d is ignored. Kernels from before that change still honour a
+`0`, so remove any `xart_writes=0` or `provision_keybag=0` left from an earlier
+read-only install. The driver exports no module alias, so udev
 never loads it on its own: the service above loads it, once the iBoot system
 container is reachable. Writes are accepted only when the APFS `.gl`
 extent passes the driver's narrow ownership checks: one physical extent, no snapshots or revert

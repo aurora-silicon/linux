@@ -14,6 +14,12 @@ it.
 The historical evidence below records the earlier opt-in deployments and
 does not establish qualification on every supported Mac or APFS layout.
 
+Kernels from before linux#2591 still have both parameters. They default to 1
+there, but a `0` is still honoured. So remove any `xart_writes=0` or
+`provision_keybag=0` that an earlier read-only install or an old version of
+these docs left in `/etc/modprobe.d/` or on the kernel command line.
+`aurora-xart status` names each one.
+
 ## Other OSes' records: `xart_guard`
 
 The gigalocker is shared by every OS on the Mac, and nothing in a session
