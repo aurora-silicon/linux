@@ -41,6 +41,7 @@
 #include <linux/pm_domain.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sart.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
 #include <linux/reset.h>
@@ -263,6 +264,7 @@ struct apple_nvme {
 	bool sleep_idled;
 	u32 sleep_csts;
 	int legacy_shn_ret;	/* the last legacy disable's shutdown notification */
+	struct device_node *sleep_pmp_entry; /* T8122: ANS's PMP request, held to the last stop */
 	/* ANS came back across a sleep, or failed to. reset_work picks these up. */
 	bool sleep_restarted;
 	bool sleep_failed;
@@ -2827,6 +2829,17 @@ static int apple_nvme_sleep_last_stop(void *data)
 		dev_dbg(anv->dev, "ANS idle, acknowledged in about %u us, CC %#x CSTS %#x\n",
 			us, cc, csts);
 	apple_rtkit_mailbox_recv_off(anv->rtk);
+	/*
+	 * T8122: ANS's PMP request was kept for this idle (macOS idles ANS well before its PMP
+	 * stops); with the CPU stopped, give it up, as the G17 GPU's last stop does.
+	 */
+	if (anv->hw->sleep_idle && anv->sleep_pmp_entry) {
+		writel(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
+		       ~APPLE_ANS_COPROC_CPU_CONTROL_RUN,
+		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
+		if (apple_pmp_report_entry_withdraw_polled(anv->sleep_pmp_entry))
+			dev_err(anv->dev, "ANS's PMP request not withdrawn at the last stop\n");
+	}
 
 	return ret ? 1 : 0;
 }
@@ -2884,6 +2897,16 @@ static int apple_nvme_probe(struct platform_device *pdev)
 			!apple_sleep_coproc_register(anv->dev, anv->mmio_coproc, false,
 						     apple_nvme_sleep_last_stop, anv);
 		/* The shutdown notification is checked in the suspend, not at the commit. */
+		if (anv->sleep_registered) {
+			int i = of_property_match_string(anv->dev->of_node, "power-domain-names", "ans");
+			struct device_node *e = i < 0 ? NULL :
+				of_parse_phandle(anv->dev->of_node, "power-domains", i);
+
+			if (e && of_device_is_compatible(e, "apple,t6000-pmp-v2-report-entry"))
+				anv->sleep_pmp_entry = e;
+			else
+				of_node_put(e);
+		}
 	}
 
 	apple_nvme_set_reset_ready(anv, true);
@@ -3098,6 +3121,18 @@ static int apple_nvme_resume(struct device *dev)
 		apple_sleep_coproc_set_ready(dev, false);
 		anv->sleep_stop = false;
 		anv->sleep_idled = false;
+		if (anv->sleep_pmp_entry) {
+			int ret;
+
+			apple_pmp_report_entry_commit_owned(anv->sleep_pmp_entry, false);
+			/* The last stop gave up ANS's request; nothing touches NVMe until it's back. */
+			ret = apple_pmp_report_entry_request(anv->sleep_pmp_entry, true);
+			if (ret) {
+				dev_crit(dev, "holding all I/O: ANS's PMP request not acknowledged after the sleep (%d), reboot to recover\n",
+					 ret);
+				return 0;
+			}
+		}
 	}
 	return nvme_reset_ctrl(&anv->ctrl);
 }
@@ -3269,7 +3304,9 @@ static int apple_nvme_suspend(struct device *dev)
 		 */
 		if (anv->sleep_registered && anv->hw->sleep_idle &&
 		    pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware() &&
-		    !anv->legacy_shn_ret) {
+		    !anv->legacy_shn_ret &&
+		    (!anv->sleep_pmp_entry ||
+		     !apple_pmp_report_entry_commit_owned(anv->sleep_pmp_entry, true))) {
 			anv->sleep_stop = true;
 			anv->sleep_idled = false;
 			apple_sleep_coproc_set_ready(dev, true);
