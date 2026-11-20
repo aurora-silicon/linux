@@ -73,25 +73,18 @@ static inline void dcp_ind_suspend(struct dcp_indicator *ind)
 }
 
 struct dcp_ind_ops {
-	int (*commit)(void *ctx, bool on);
+	int (*commit)(void *ctx, bool on, bool wait);
 	void (*queue_retry)(void *ctx);
 };
 
-/*
- * Commits the square on or off. The commit is nonblocking, so a flip still
- * pending on the CRTC refuses it with -EBUSY. The request stands, so that
- * refusal is queued to be asked again, never waited for. A panel that is not
- * ready (-ENODEV: suspended, CRTC not active, DRM not bound) keeps the request
- * too, with the square OFF, for the display resuming to ask again. 0 means
- * committed, queued or kept. Any other error is final and returned.
- */
-static inline int dcp_ind_apply(struct dcp_indicator *ind, bool on,
-				const struct dcp_ind_ops *ops, void *ctx)
+/* A pending flip gets one blocking commit from the work item. */
+static inline int dcp_ind_commit(struct dcp_indicator *ind, bool on,
+				 const struct dcp_ind_ops *ops, void *ctx, bool wait)
 {
-	int ret = ops->commit(ctx, on);
+	int ret = ops->commit(ctx, on, wait);
 
 	ind->retry = DCP_IND_RETRY_NONE;
-	if (ret == -EBUSY) {
+	if (ret == -EBUSY && !wait) {
 		ind->retry = on ? DCP_IND_RETRY_ON : DCP_IND_RETRY_OFF;
 		ops->queue_retry(ctx);
 		return 0;
@@ -104,13 +97,19 @@ static inline int dcp_ind_apply(struct dcp_indicator *ind, bool on,
 	return ret;
 }
 
-/* The retry work: asks again for whatever was refused, if the plane is still there. */
+static inline int dcp_ind_apply(struct dcp_indicator *ind, bool on,
+				const struct dcp_ind_ops *ops, void *ctx)
+{
+	return dcp_ind_commit(ind, on, ops, ctx, false);
+}
+
+/* Do not poll or requeue if the blocking commit fails. */
 static inline int dcp_ind_retry(struct dcp_indicator *ind, bool plane,
 				const struct dcp_ind_ops *ops, void *ctx)
 {
 	if (!plane || ind->retry == DCP_IND_RETRY_NONE)
 		return 0;
-	return dcp_ind_apply(ind, ind->retry == DCP_IND_RETRY_ON, ops, ctx);
+	return dcp_ind_commit(ind, ind->retry == DCP_IND_RETRY_ON, ops, ctx, true);
 }
 
 /*
