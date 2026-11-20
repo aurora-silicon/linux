@@ -431,6 +431,7 @@ struct dcp_desktop_state {
 /* TODO: move IOMFB members to its own struct */
 struct dcpext_scanout;
 struct dcp_hdmi;
+struct dcp_cec;
 
 bool dcp_desktop_present_complete(struct apple_dcp *dcp, u32 id);
 void dcp_panel_metadata_replace(struct apple_dcp *dcp,
@@ -1146,6 +1147,7 @@ struct apple_dcp {
 	struct dcp_desktop_state *desktop;
 	/* Internal panel identity; NULL without an internal panel. */
 	struct dcp_panel_identity *panel_identity;
+	struct dcp_cec *cec;
 };
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
