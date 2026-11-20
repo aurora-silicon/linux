@@ -58,6 +58,8 @@ pub(crate) struct KernelObject {
     obj: gem::ObjectRef,
     ptr: NonNull<u8>,
     size: usize,
+    /// The client charge of backing from [`Self::client_backing`], released with the object.
+    charge: Option<crate::memacct::Charge>,
 }
 
 // SAFETY: The object only refers to kernel memory; concurrent access goes through `&self`
@@ -108,6 +110,29 @@ impl KernelObject {
         }, size)
     }
 
+    /// Write-combined [`Self::backing`] that a client's commands size, charged to that client
+    /// (`client`) as a user buffer of the same size would be: admitted against its and the
+    /// device's memory limits before it is allocated, failing with ENOMEM over either, and then
+    /// counted as its held memory instead of kernel memory, until the object is dropped.
+    /// Without a client (a kernel VM's object) it is kernel memory, as [`Self::backing`].
+    pub(crate) fn client_backing(
+        dev: &AsahiDrmDevice,
+        size: usize,
+        client: Option<&kernel::sync::Arc<crate::memacct::Client>>,
+    ) -> Result<Self> {
+        let Some(client) = client else {
+            return Self::backing(dev, size, CpuMap::WriteCombined);
+        };
+        let bytes = gem::checked_object_size(size)? as u64;
+        let commit = crate::memacct::LEDGER.admit(client, bytes)?;
+        let mut object =
+            Self::with_object(gem::new_kernel_object_wc_user_charged(dev, size)?, size)?;
+        let charge = crate::memacct::Charge::user(commit, None);
+        charge.set_held(true);
+        object.charge = Some(charge);
+        Ok(object)
+    }
+
     fn with_object(mut obj: gem::ObjectRef, size: usize) -> Result<Self> {
         let vmap = obj.vmap()?;
         let ptr = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
@@ -121,6 +146,7 @@ impl KernelObject {
             obj,
             ptr,
             size,
+            charge: None,
         })
     }
 

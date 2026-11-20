@@ -416,14 +416,16 @@ impl Tvb {
         geometry.backing_bytes(blocks)
     }
     /// Backing for `blocks` blocks to be mapped into `vm`. M5 blocks are mapped one by one in
-    /// the compact window, which is checked for room for all of them first.
+    /// the compact window, which is checked for room for all of them first, and the client's
+    /// passes and geometry size them, so they are charged to the client.
     fn allocate(dev: &AsahiDrmDevice, vm: &mmu::Vm, geometry: BlockGeometry, blocks: usize)
         -> Result<KernelObject> {
         let bytes = Self::backing_bytes(geometry, blocks)?;
-        if geometry != BlockGeometry::NEO {
-            compact::PairObject::ParameterBlock.check_room(vm, geometry.block_bytes, blocks)?;
+        if geometry == BlockGeometry::NEO {
+            return KernelObject::backing(dev, bytes, CpuMap::WriteCombined);
         }
-        KernelObject::backing(dev, bytes, CpuMap::WriteCombined)
+        compact::PairObject::ParameterBlock.check_room(vm, geometry.block_bytes, blocks)?;
+        KernelObject::client_backing(dev, bytes, vm.memory_client())
     }
     fn map_block(
         object: &KernelObject,

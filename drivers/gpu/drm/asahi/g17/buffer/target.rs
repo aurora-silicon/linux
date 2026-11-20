@@ -244,7 +244,12 @@ impl Object {
         if let Some(object) = m5 {
             object.check_room(vm, size, 1)?;
         }
-        let backing = KernelObject::backing(dev, size, CpuMap::WriteCombined)?;
+        // An M5 target is sized by the client's pass: charge it to the client.
+        let backing = if m5.is_some() {
+            KernelObject::client_backing(dev, size, vm.memory_client())?
+        } else {
+            KernelObject::backing(dev, size, CpuMap::WriteCombined)?
+        };
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let mapping = match m5 {
             Some(object) => object.map(&backing, vm, 0..size, prot)?,
