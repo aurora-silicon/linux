@@ -2,16 +2,24 @@
 
 //! Prepared timestamp destinations shared by native command completion paths.
 
-use crate::mmu;
+use crate::{gem, mmu};
 #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
-use crate::{file, gem};
-#[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
+use crate::file;
 use core::ops::Range;
 #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 use core::sync::atomic::{fence as barrier, Ordering};
 use kernel::{prelude::*, sync::Arc};
 #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 use kernel::{uapi, xarray};
+
+/// The size of a bound range: whole pages, not empty, inside an object of `object_size` bytes.
+fn bound_size(range: &Range<usize>, object_size: usize) -> Result<usize> {
+    let size = range.end.checked_sub(range.start).ok_or(EINVAL)?;
+    if size == 0 || (range.start | size) & mmu::UAT_PGMSK != 0 || range.end > object_size {
+        return Err(EINVAL);
+    }
+    Ok(size)
+}
 
 /// A firmware-mapped timestamp buffer with a kernel CPU mapping of its backing, kept for the
 /// buffer's lifetime so that commands need no mapping of their own.
@@ -22,6 +30,15 @@ pub(crate) struct FirmwareBuffer {
     window: bool,
 }
 
+/// A timestamp buffer only the host writes, through a kernel CPU mapping of its backing. It has
+/// no firmware alias, so binding it takes no firmware address space.
+pub(crate) struct HostBuffer {
+    cpu: mmu::TimestampVmap,
+    /// The bound range of the object.
+    start: usize,
+    size: usize,
+}
+
 /// A bound timestamp destination. Only backends which publish firmware writes need a UAT alias.
 /// CPU-retired timestamps retain their backing without consuming global firmware address space.
 pub(crate) enum Buffer {
@@ -29,6 +46,8 @@ pub(crate) enum Buffer {
     /// releasing the CPU mapping takes the reservation lock: the deferral runs the release
     /// on the cleanup queue.
     Firmware(crate::cleanup::Deferred<FirmwareBuffer>),
+    /// Host-written, with the same deferred release as [`Self::Firmware`].
+    Host(crate::cleanup::Deferred<HostBuffer>),
     #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
     Cpu {
         // The GEM pin keeps the object's held SG table alive through CPU publication.
@@ -45,6 +64,22 @@ impl Buffer {
     /// A buffer aliased in the firmware's timestamp window.
     pub(crate) fn firmware_window(mapping: mmu::KernelMapping) -> Result<Self> {
         Self::new_firmware(mapping, true)
+    }
+
+    /// A buffer whose stamps the host writes: the bound range of a firmware-shareable object,
+    /// as for a firmware alias, with only a CPU mapping. Not under the device mutex (the CPU
+    /// mapping takes the reservation lock).
+    pub(crate) fn host(bo: &gem::ObjectRef, range: Range<usize>) -> Result<Self> {
+        let size = bound_size(&range, bo.size())?;
+        // A firmware alias refuses VM-private objects (gem::validate_vm_binding); so does this.
+        if bo.gem.is_vm_private() {
+            return Err(EINVAL);
+        }
+        Ok(Self::Host(crate::cleanup::Deferred::new(HostBuffer {
+            cpu: mmu::TimestampVmap::new(&bo.gem)?,
+            start: range.start,
+            size,
+        })?))
     }
 
     fn new_firmware(mapping: mmu::KernelMapping, window: bool) -> Result<Self> {
@@ -72,6 +107,7 @@ impl Buffer {
     pub(crate) fn read_timestamp(&self, offset: usize) -> Option<u64> {
         match self {
             Self::Firmware(buffer) => buffer.cpu.read(offset),
+            Self::Host(buffer) => buffer.cpu.read(offset),
             #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { .. } => None,
         }
@@ -80,10 +116,7 @@ impl Buffer {
     /// Retain a CPU-written byte range without publishing any firmware address.
     #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
     pub(crate) fn cpu(bo: gem::ObjectRef, range: Range<usize>) -> Result<Self> {
-        let size = range.end.checked_sub(range.start).ok_or(EINVAL)?;
-        if size == 0 || (range.start | size) & mmu::UAT_PGMSK != 0 || range.end > bo.size() {
-            return Err(EINVAL);
-        }
+        bound_size(&range, bo.size())?;
         let gem = gem::KernelMappingPin::new(&bo.gem);
         let registered = bo.gem.dev().registration_guard().ok_or(ENODEV)?;
         let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
@@ -94,6 +127,7 @@ impl Buffer {
     pub(crate) fn size(&self) -> usize {
         match self {
             Self::Firmware(buffer) => buffer.mapping.size(),
+            Self::Host(buffer) => buffer.size,
             #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { range, .. } => range.end - range.start,
         }
@@ -103,6 +137,7 @@ impl Buffer {
     pub(crate) fn timestamp_mapping(&self, offset: usize) -> Result<mmu::TimestampMapping> {
         match self {
             Self::Firmware(buffer) => buffer.mapping.timestamp_mapping(offset),
+            Self::Host(_) => Err(EINVAL),
             #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { gem, range, .. } => {
                 if offset.checked_add(size_of::<u64>()).ok_or(EOVERFLOW)? > self.size() {
@@ -113,11 +148,18 @@ impl Buffer {
         }
     }
 
-    /// The object offset of the timestamp at `offset` of a firmware buffer, for
+    /// The object offset of the timestamp at `offset` of a firmware or host buffer, for
     /// [`Self::write_timestamp`].
     pub(crate) fn timestamp_offset(&self, offset: usize) -> Result<usize> {
         match self {
             Self::Firmware(buffer) => buffer.mapping.timestamp_offset(offset),
+            // The bound range lies inside the object (Self::host).
+            Self::Host(buffer) => {
+                if offset.checked_add(size_of::<u64>()).ok_or(EOVERFLOW)? > buffer.size {
+                    return Err(ERANGE);
+                }
+                buffer.start.checked_add(offset).ok_or(EOVERFLOW)
+            }
             #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { .. } => Err(EINVAL),
         }
@@ -128,6 +170,7 @@ impl Buffer {
     pub(crate) fn write_timestamp(&self, offset: usize, value: u64) {
         match self {
             Self::Firmware(buffer) => buffer.cpu.write(offset, value),
+            Self::Host(buffer) => buffer.cpu.write(offset, value),
             #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { .. } => {}
         }
@@ -137,6 +180,7 @@ impl Buffer {
     pub(crate) fn firmware_mapping(&self) -> Result<Arc<mmu::KernelMapping>> {
         match self {
             Self::Firmware(buffer) => Ok(buffer.mapping.clone()),
+            Self::Host(_) => Err(EINVAL),
             #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { .. } => Err(EINVAL),
         }
@@ -259,5 +303,24 @@ impl Destinations {
             .as_deref()
             .map_or(&[], |destinations| destinations.as_slice());
         destinations.iter()
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_timestamp_buffer)]
+mod tests {
+    use super::*;
+
+    const PAGE: usize = mmu::UAT_PGSZ;
+
+    #[test]
+    fn a_bound_range_is_whole_pages_inside_the_object() {
+        assert_eq!(bound_size(&(0..PAGE), PAGE), Ok(PAGE));
+        assert_eq!(bound_size(&(PAGE..3 * PAGE), 3 * PAGE), Ok(2 * PAGE));
+        assert_eq!(bound_size(&(0..0), PAGE), Err(EINVAL));
+        assert_eq!(bound_size(&(PAGE..0), PAGE), Err(EINVAL));
+        assert_eq!(bound_size(&(0..PAGE / 2), PAGE), Err(EINVAL));
+        assert_eq!(bound_size(&(PAGE / 2..PAGE + PAGE / 2), 2 * PAGE), Err(EINVAL));
+        assert_eq!(bound_size(&(0..2 * PAGE), PAGE), Err(EINVAL));
+        assert_eq!(bound_size(&(PAGE..usize::MAX & !(PAGE - 1)), 2 * PAGE), Err(EINVAL));
     }
 }
