@@ -109,13 +109,6 @@ SCHED_FEAT(WAKE_SHORT_LOCAL, true)
 SCHED_FEAT(FORK_LOCAL, true)
 
 /*
- * On asymmetric CPU capacity systems, balance load across all CPUs as if
- * their capacities were equal while at least as many CPUs are saturated as
- * there are CPUs of the highest capacity. See update_asym_spread().
- */
-SCHED_FEAT(ASYM_SPREAD, false)
-
-/*
  * Spread memory-bound tasks evenly across LLCs (on Apple SoCs, clusters,
  * whose memory bandwidth is limited per cluster) instead of packing them
  * onto the biggest CPUs; other tasks are placed as usual. Tasks are
