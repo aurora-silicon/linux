@@ -202,6 +202,36 @@ impl Channels {
         Ok(())
     }
 
+    /// Bring-up diagnostics for a stop during the boot sequence: the device-control indices, the
+    /// GPU fault registers and the FirmwareData recovery state.
+    pub(crate) fn log_stop(&self, session: &Session, init: &InitData, why: &str) {
+        let d = &session.dev;
+        let ix = |r: Result<u32>| r.unwrap_or(u32::MAX);
+        dev_err!(
+            d,
+            "G16 {}: devctl read {} completion {} write {} producer {}\n",
+            why,
+            ix(self.devctl.read()),
+            ix(self.devctl.completion()),
+            ix(self.devctl.write()),
+            self.devctl_producer
+        );
+        match session.regs.engine_state() {
+            Ok(e) => dev_err!(
+                d,
+                "G16 {}: engine busy {} fault {:#x}/{:#x} address {:#x}/{:#x}\n",
+                why,
+                e.busy,
+                e.status[0],
+                e.status[1],
+                e.address[0],
+                e.address[1]
+            ),
+            Err(err) => dev_err!(d, "G16 {}: engine state unreadable: {:?}\n", why, err),
+        }
+        init.log_firmware_state(d, why);
+    }
+
     /// Consumes a receive ring to its firmware producer.
     fn drain_one(ring: &Ring, offset: usize, capacity: u32) -> Result {
         let producer = ring.state.r32(offset + STATE_WRITE)?;
@@ -265,6 +295,8 @@ pub(crate) fn devctl_submit(
         channels.drain_rings(&dev, events)?;
         session.check()?;
         if init.halted()? {
+            dev_err!(dev, "control {:#x}: firmware halted before posting\n", opcode);
+            channels.log_stop(session, init, "halted before posting");
             return Err(EBUSY);
         }
         if expired() {
@@ -299,6 +331,8 @@ pub(crate) fn devctl_submit(
             return Ok(());
         }
         if init.halted()? {
+            dev_err!(dev, "control {:#x}: firmware halted awaiting record {}\n", opcode, next);
+            channels.log_stop(session, init, "halted awaiting control");
             return Err(EBUSY);
         }
         if expired() {

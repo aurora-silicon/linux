@@ -64,6 +64,47 @@ impl InitData {
         &self.abi.initdata().firmware_data
     }
 
+    /// Bring-up diagnostics: the FirmwareData recovery words (phase, generation, the cause word
+    /// 0x10 after the phase, the scheduler word) and the 0x130 bytes from 0x100 below the phase
+    /// word, which hold the fault record the firmware's recovery path writes before it sets
+    /// phase 1 (26B123: +0x509c..+0x50c0, +0x50b0 a u64).
+    pub(crate) fn log_firmware_state(&self, dev: &device::Device, why: &str) {
+        let fd = self.firmware_data();
+        let Some(c) = self.control.as_ref() else {
+            dev_err!(dev, "G16 {}: no FirmwareData\n", why);
+            return;
+        };
+        let r32 = |o: usize| c.r32(o).unwrap_or(u32::MAX);
+        dev_err!(
+            dev,
+            "G16 {}: phase {:#x} generation {:#x} cause {:#x} scheduler {:#x} ready {:#x}\n",
+            why,
+            r32(fd.phase),
+            c.r64(fd.generation).unwrap_or(u64::MAX),
+            r32(fd.phase + 0x10),
+            r32(fd.scheduler),
+            self.readiness().unwrap_or(u32::MAX)
+        );
+        let base = fd.phase - 0x100;
+        for row in 0..(0x130 / 0x20) {
+            let at = base + row * 0x20;
+            dev_err!(
+                dev,
+                "G16 {}: FD+{:#06x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}\n",
+                why,
+                at,
+                r32(at),
+                r32(at + 4),
+                r32(at + 8),
+                r32(at + 12),
+                r32(at + 16),
+                r32(at + 20),
+                r32(at + 24),
+                r32(at + 28)
+            );
+        }
+    }
+
     /// A phase 1 or 3 stop is owned by the M4 recovery handshake.
     pub(crate) fn halted(&self) -> Result<bool> {
         let phase = self
