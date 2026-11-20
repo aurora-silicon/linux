@@ -2873,6 +2873,19 @@ static int apple_nvme_probe(struct platform_device *pdev)
 		apple_rtkit_set_warm_epmap_mask(anv->rtk, anv->hw->sleep_epmap_last_mask);
 	}
 
+	if (anv->hw->sleep_idle && (!anv->hw->sleep_untested || sleep_untested)) {
+		dev_warn(anv->dev, "idle for sleep enabled, untested through a resume\n");
+		anv->sleep_registered =
+			!apple_sleep_coproc_register(anv->dev, anv->mmio_coproc, false,
+						     apple_nvme_sleep_last_stop, anv);
+		/* Never idled without its shutdown notification. */
+		if (anv->sleep_registered &&
+		    apple_sleep_coproc_set_last_check(anv->dev, apple_nvme_sleep_shutdown)) {
+			apple_sleep_coproc_unregister(anv->dev);
+			anv->sleep_registered = false;
+		}
+	}
+
 	apple_nvme_set_reset_ready(anv, true);
 	nvme_reset_ctrl(&anv->ctrl);
 	async_schedule(apple_nvme_async_probe, anv);
@@ -3081,6 +3094,11 @@ static int apple_nvme_resume(struct device *dev)
 		WRITE_ONCE(anv->suspended, false);
 		return nvme_try_sched_reset(&anv->ctrl);
 	}
+	if (anv->hw->sleep_idle && anv->sleep_stop) {
+		apple_sleep_coproc_set_ready(dev, false);
+		anv->sleep_stop = false;
+		anv->sleep_idled = false;
+	}
 	return nvme_reset_ctrl(&anv->ctrl);
 }
 
@@ -3242,17 +3260,20 @@ static int apple_nvme_suspend(struct device *dev)
 
 	if (apple_rtkit_is_running(anv->rtk)) {
 		/*
-		 * As macOS leaves ANS before its sleep: AP then IOP idle, the CPU stopped. The
-		 * resume finds RUN clear and resets and boots ANS, as after a shutdown.
+		 * T8122: as macOS leaves ANS before its sleep, the sleep driver idles it last of
+		 * all (AP then IOP idle, polled, apple_nvme_sleep_last_stop()) and clears its RUN
+		 * bit; the shutdown notification above is checked at the commit. Resume finds RUN
+		 * clear and resets and boots ANS, as after a shutdown.
 		 */
-		if (anv->hw->sleep_idle && (!anv->hw->sleep_untested || sleep_untested) &&
+		if (anv->sleep_registered && anv->hw->sleep_idle &&
 		    pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware()) {
-			ret = apple_rtkit_idle(anv->rtk);
-			dev_info(anv->dev, "ANS idle for the sleep: %d (status %#x)\n", ret,
-				 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS));
-		} else {
-			ret = apple_rtkit_shutdown(anv->rtk);
+			anv->sleep_stop = true;
+			anv->sleep_idled = false;
+			apple_sleep_coproc_set_ready(dev, true);
+			dev_info(dev, "ANS left running for the sleep's last stop\n");
+			return 0;
 		}
+		ret = apple_rtkit_shutdown(anv->rtk);
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 	}
