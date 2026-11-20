@@ -202,16 +202,29 @@ int asahi_g16_tvm_enable(struct device *dev)
 	return ret;
 }
 
+/*
+ * The 27.2 (26B123) PMP firmware, also in 27.2.1, which runs the same M4 PMP
+ * session as 26.6.2 (be28e323's apple_t8132_pmp_path()).
+ */
+static bool asahi_g16_pmp_272(void)
+{
+	const char *version;
+
+	return of_machine_is_compatible("apple,t8132") &&
+	       !of_property_read_string(of_chosen, "asahi,os-fw-version", &version) &&
+	       (!strcmp(version, "27.2") || !strcmp(version, "27.2.1"));
+}
+
 /* Whether this T8132 board's retained PMP carries the GPU's AGX vote. */
 bool asahi_g16_board(void)
 {
-	return apple_pmp_t8132_retained_board();
+	return apple_pmp_t8132_retained_board() || asahi_g16_pmp_272();
 }
 
 /* Preserve the existing ten-row table except for the qualified J773g layout. */
 unsigned int asahi_g16_perf_rows(void)
 {
-	if (!apple_pmp_t8132_retained_board())
+	if (!asahi_g16_board())
 		return 0;
 	return of_machine_is_compatible("apple,j773g") ? 11 : 10;
 }
