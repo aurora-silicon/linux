@@ -256,12 +256,7 @@ struct tb_nhi_ops {
  * and routers are enumerated with a 10 ms notification timeout.
  */
 #define QUIRK_CIO_MACOS_FRAMES				BIT(14)
-/*
- * Every device router runs its TMU in bi-directional HiFi mode, as macOS does,
- * with the host's time posted to it; a router that already reads as bi-directional
- * HiFi is otherwise left without the time. The host router's TMU stays with its
- * firmware where QUIRK_HOST_TMU is set.
- */
+/* Reinitialize device-router TMUs in bi-directional HiFi mode. */
 #define QUIRK_TMU_HIFI_BI				BIT(15)
 
 /* Host display policies are independent of which optional hooks are installed. */

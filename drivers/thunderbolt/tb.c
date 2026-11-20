@@ -231,6 +231,10 @@ static int tb_enable_clx(struct tb_switch *sw)
 	const struct tb_tunnel *tunnel;
 	int ret;
 
+	/* Bi-directional HiFi does not support CL states. */
+	if (sw->tb->nhi->quirks & QUIRK_TMU_HIFI_BI)
+		return 0;
+
 	/*
 	 * Currently only enable CLx for the first link. This is enough
 	 * to allow the CPU to save energy at least on Intel hardware
@@ -363,22 +367,14 @@ static int tb_enable_tmu(struct tb_switch *sw)
 {
 	int ret;
 
-	/*
-	 * Bi-directional HiFi everywhere (host router set in tb_start()). A
-	 * device router may already read as bi-directional HiFi without the
-	 * host's time: enable it from scratch with the time posted.
-	 */
 	if ((sw->tb->nhi->quirks & QUIRK_TMU_HIFI_BI) && tb_route(sw)) {
+		ret = tb_switch_clx_disable(sw);
+		if (ret < 0)
+			return ret;
 		ret = tb_switch_tmu_configure(sw, TB_SWITCH_TMU_MODE_HIFI_BI);
 		if (ret)
 			return ret;
-		ret = tb_switch_tmu_disable(sw);
-		if (ret)
-			return ret;
-		ret = tb_switch_tmu_post_time(sw);
-		if (ret)
-			return ret;
-		return tb_switch_tmu_enable(sw);
+		goto reenable;
 	}
 
 	/* The host router's firmware runs its TMU on these hosts. */
@@ -427,6 +423,7 @@ static int tb_enable_tmu(struct tb_switch *sw)
 	if (tb_switch_tmu_is_enabled(sw))
 		return 0;
 
+reenable:
 	ret = tb_switch_tmu_disable(sw);
 	if (ret)
 		return ret;
@@ -4003,13 +4000,10 @@ static int tb_start(struct tb *tb, bool reset)
 
 	/*
 	 * To support highest CLx state, we set host router's TMU to
-	 * Normal mode, unless the host runs bi-directional HiFi.
+	 * Normal mode.
 	 */
 	if (!tb_switch_tmu_host_managed(tb->root_switch)) {
-		tb_switch_tmu_configure(tb->root_switch,
-					(tb->nhi->quirks & QUIRK_TMU_HIFI_BI) ?
-					TB_SWITCH_TMU_MODE_HIFI_BI :
-					TB_SWITCH_TMU_MODE_LOWRES);
+		tb_switch_tmu_configure(tb->root_switch, TB_SWITCH_TMU_MODE_LOWRES);
 		/* Enable TMU if it is off */
 		tb_switch_tmu_enable(tb->root_switch);
 	}
