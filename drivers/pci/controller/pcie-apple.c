@@ -81,6 +81,13 @@ static int link_up_timeout = 500;
 module_param(link_up_timeout, int, 0644);
 MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 
+/* DEBUG (hvtrace, J773g 27.2 bisect, not for merging): log and sleep at each marked probe phase, so
+ * a crash's time names the phase when no console is available. */
+static unsigned int phase_delay_ms;
+module_param(phase_delay_ms, uint, 0444);
+MODULE_PARM_DESC(phase_delay_ms, "Debug: log and sleep this long at each marked probe phase");
+#define APPLE_PCIE_PHASE(n) do { if (phase_delay_ms) { pr_info("apple-pcie: phase %d\n", (n)); msleep(phase_delay_ms); } } while (0)
+
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
 #define   CORE_RC_PHYIF_CTL_RUN		BIT(0)
@@ -3056,12 +3063,14 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (pcie->hw->tunneled)
 		res->flags |= IORESOURCE_MEM_NONPOSTED;
 
+	APPLE_PCIE_PHASE(6);
 	port->base = devm_ioremap_resource(&platform->dev, res);
 	if (IS_ERR(port->base)) {
 		ret = PTR_ERR(port->base);
 		port->base = NULL;
 		goto err_teardown;
 	}
+	APPLE_PCIE_PHASE(7);
 	if (pcie->managed_sids) {
 		ret = apple_pcie_managed_admit(port);
 		if (ret)
@@ -3156,6 +3165,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 			goto err_teardown;
 		}
 		/* U-Boot may already have brought up a conventional root port. */
+		APPLE_PCIE_PHASE(8);
 		link_stat = apple_pcie_port_readl(port, PORT_LINKSTS);
 		if (!(link_stat & PORT_LINKSTS_UP)) {
 			if (pcie->managed_sids) {
@@ -3169,6 +3179,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		}
 	}
 
+	APPLE_PCIE_PHASE(9);
 	if (!pcie->hw->retain_clocks) {
 		if (pcie->hw->port_refclk)
 			rmw_clear(PORT_REFCLK_CGDIS,
@@ -3182,6 +3193,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 			rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
 	}
 
+	APPLE_PCIE_PHASE(10);
 	ret = apple_pcie_port_setup_irq(port);
 	if (ret)
 		goto err_teardown;
@@ -3190,6 +3202,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		goto rid2sid_ready;
 
 	/* Reset all RID/SID mappings, and check for RAZ/WI registers */
+	APPLE_PCIE_PHASE(11);
 	for (i = 0; i < pcie->hw->max_rid2sid; i++) {
 		if (apple_pcie_rid2sid_write(port, i, 0xbad1d) != 0xbad1d)
 			break;
@@ -3203,10 +3216,12 @@ rid2sid_ready:
 	list_add_tail(&port->entry, &pcie->ports);
 	init_completion(&pcie->event);
 
+	APPLE_PCIE_PHASE(12);
 	ret = apple_pcie_port_register_irqs(port);
 	if (ret)
 		goto err_teardown;
 
+	APPLE_PCIE_PHASE(13);
 	link_stat = apple_pcie_port_readl(port, PORT_LINKSTS);
 	if (!(link_stat & PORT_LINKSTS_UP)) {
 		unsigned long timeout, left = 0;
@@ -3831,6 +3846,7 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 	if (WARN_ON(!pcie))
 		return -ENOENT;
 	pcie->cfg = cfg;
+	APPLE_PCIE_PHASE(5);
 
 	for_each_available_child_of_node_scoped(dev->of_node, of_port) {
 		ret = apple_pcie_setup_port(pcie, of_port);
@@ -3845,6 +3861,7 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 		return -ENODEV;
 
 	/* The bus scan follows this callback. */
+	APPLE_PCIE_PHASE(14);
 	apple_pcie_tunnel_wait_ready(pcie);
 
 	return 0;
@@ -4967,6 +4984,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	hw = of_device_get_match_data(dev);
 	if (!hw)
 		return -ENODEV;
+	APPLE_PCIE_PHASE(1);
 
 	/*
 	 * A tunneled PCIe-C port has no host GPIO for PERST#: the tunnel
@@ -5025,6 +5043,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	pcie = pci_host_bridge_priv(bridge);
 	pcie->dev = dev;
 	pcie->hw = hw;
+	APPLE_PCIE_PHASE(2);
 	ret = apple_pcie_attach_domains(pcie);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to attach power domains\n");
@@ -5057,6 +5076,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	}
 	if (hw->root_bus_only && !piodma_supplier)
 		dev_info(dev, "root-port probe only; downstream config is blocked\n");
+	APPLE_PCIE_PHASE(3);
 	pcie->base = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(pcie->base))
 		return PTR_ERR(pcie->base);
@@ -5121,6 +5141,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 
 	if (hw->adopt_link)
 		bridge->reset_root_port = apple_pcie_t6050_reset_root_port;
+	APPLE_PCIE_PHASE(4);
 	ret = pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
 	if (ret) {
 		apple_pcie_cleanup(pcie);
