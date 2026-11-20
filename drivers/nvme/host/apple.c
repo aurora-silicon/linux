@@ -223,6 +223,8 @@ struct apple_nvme_hw {
 	bool sleep_traced;
 	/* ... or derived and never run: only with nvme_apple.sleep_untested */
 	bool sleep_untested;
+	/* A firmware sleep idles ANS (AP then IOP idle) instead of shutting it down. */
+	bool sleep_idle;
 	/* The last endpoint map reply from that trace */
 	u32 sleep_epmap_last_mask;
 	/* Higher namespaces are the firmware's, and a Flush to one faults the controller. */
@@ -359,20 +361,11 @@ MODULE_PARM_DESC(flush_interval,
 		 "Grace period in msecs between flushes (ignored on post-M4 ANS)");
 
 /*
- * Stop ANS for a deep sleep on a controller whose sleep path was never run (T8142). Off by
+ * Stop ANS for a deep sleep on a controller whose sleep path was never run (T8142), or idle it
+ * as macOS does where that was never run through a resume (T8122). Off by
  * default: the root disk stays up through a sleep the SoC refuses.
  */
 static bool sleep_untested;
-/*
- * J613 trial: macOS idles ANS before its sleep (AP then IOP power state 0x201, capture run 68,
- * -23 to -22 ms before the commit) and its ASC reads control 0, status 0x2e at the commit
- * (runs 48, 49); Linux's T8103-style suspend shuts it down (AP quiesced, IOP sleep, AP off) and
- * it reads status 0x2a. This idles it as macOS does, then stops the CPU as before.
- */
-static bool j613_ans_idle;
-module_param(j613_ans_idle, bool, 0444);
-MODULE_PARM_DESC(j613_ans_idle, "J613 trial: idle ANS (AP and IOP idle) for a firmware sleep instead of shutting it down");
-
 module_param(sleep_untested, bool, 0444);
 MODULE_PARM_DESC(sleep_untested,
 		 "Stop ANS for a deep sleep where that path is untested (default 0)");
@@ -3248,11 +3241,15 @@ static int apple_nvme_suspend(struct device *dev)
 	}
 
 	if (apple_rtkit_is_running(anv->rtk)) {
-		if (READ_ONCE(j613_ans_idle) && pm_suspend_via_firmware() &&
-		    of_machine_is_compatible("apple,j613")) {
+		/*
+		 * As macOS leaves ANS before its sleep: AP then IOP idle, the CPU stopped. The
+		 * resume finds RUN clear and resets and boots ANS, as after a shutdown.
+		 */
+		if (anv->hw->sleep_idle && (!anv->hw->sleep_untested || sleep_untested) &&
+		    pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware()) {
 			ret = apple_rtkit_idle(anv->rtk);
-			dev_warn(anv->dev, "J613: ANS AP and IOP idle for the sleep: %d (status %#x)\n",
-				 ret, readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS));
+			dev_info(anv->dev, "ANS idle for the sleep: %d (status %#x)\n", ret,
+				 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS));
 		} else {
 			ret = apple_rtkit_shutdown(anv->rtk);
 		}
@@ -3278,6 +3275,19 @@ static const struct apple_nvme_hw apple_nvme_t8103_hw = {
 	.has_lsq_nvmmu = true,
 	.has_queue_count = true,
 	.max_queue_depth = 64,
+};
+
+/*
+ * T8122 (M3) is laid out like T8103. macOS idles its ANS before a sleep (AP then IOP power
+ * state 0x201) and leaves the CPU stopped, where the T8103 path shuts it down. Untested through
+ * a resume: off unless sleep_untested is set.
+ */
+static const struct apple_nvme_hw apple_nvme_t8122_hw = {
+	.has_lsq_nvmmu = true,
+	.has_queue_count = true,
+	.max_queue_depth = 64,
+	.sleep_idle = true,
+	.sleep_untested = true,
 };
 
 /*
@@ -3371,6 +3381,7 @@ static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t6050-nvme-ans2", .data = &apple_nvme_t6050_hw },
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
+	{ .compatible = "apple,t8122-nvme-ans2", .data = &apple_nvme_t8122_hw },
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,t8140-nvme-ans2", .data = &apple_nvme_t8140_hw },
 	{ .compatible = "apple,t8142-nvme-ans2", .data = &apple_nvme_t8142_hw },
