@@ -717,11 +717,12 @@ impl super::super::Backend {
                     return Err(crate::g17::capacity::refused(crate::g17::capacity::Site::RetiredRenderBindings));
                 }
                 // A rebind of the same context (a render that needs a bigger pool) keeps its
-                // live scheduler state; only another context's is displaced.
+                // live scheduler state; only another context's is displaced. A detached sibling
+                // of a still-open owner stays in Deferred until that owner closes.
                 if !pair.matches(self.owner, &self.context)? {
                     firmware.queues.teardown.displace(
                         pair.context(),
-                        true,
+                        entry.closed,
                         super::super::now_ns(),
                     )?;
                 }

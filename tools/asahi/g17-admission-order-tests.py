@@ -160,10 +160,14 @@ def held_fixture():
     at = pairs.index('const SIBLING_BACKLOG')
     backlog = pairs[at:pairs.index('\n}\n', pairs.index('fn sibling_backlog', at)) + 3]
     state = '\n'.join(item(source, name) for name in [
-        'const fn new(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
-        'fn take_idle(', 'fn acquire(', 'fn claim_sibling(', 'fn reassign_unused_spare(',
-        'fn cancel_empty_slot(', 'fn can_pick(', 'fn pick(', 'fn usable(', 'fn join(', 'fn release(',
-        'fn set_held(', 'fn retained(', 'fn used('])
+        'const fn new(', 'fn owns_live(', 'fn has_live_owner(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
+        'fn take_idle(', 'fn acquire(', 'fn acquire_for(', 'fn live_owners(', 'fn live_siblings(',
+        'fn reclaimable_siblings_in(', 'fn reclaimable_siblings(', 'fn promotes_reclaimable_sibling(',
+        'fn can_lease_slot(', 'fn unavailable_released(', 'fn total_pair_demand(', 'fn pair_demand(',
+        'fn claim_sibling(', 'fn can_reassign_unused_spare(', 'fn reassign_unused_spare(',
+        'fn cancel_empty_slot(', 'fn can_pick(',
+        'fn can_pick_for(', 'fn pick(', 'fn pick_for(', 'fn usable(', 'fn join(', 'fn join_for(',
+        'fn release(', 'fn set_held(', 'fn retained(', 'fn used('])
     pool = '\n'.join(item(source, name) for name in [
         'pub(crate) fn set_held(', 'pub(crate) fn release_retained_owners_after_processor_stop(',
         'pub(crate) fn killed_pair_free('])
@@ -229,8 +233,18 @@ fn new_owners() {
     assert_eq!(state.refusal(2), Err(ENOSPC), "a new owner facing only held slots is refused for capacity");
     assert!(!state.can_pick(2, Plan::Any), "scheduler admission counts no held slot");
     assert_eq!(state.pick(2, 1, Plan::Any), None, "a held slot goes to no new owner");
-    state.claim_sibling(1, cfg::RENDER_PAIRS_MAX);
+    state.claim_sibling(1, cfg::RENDER_PAIRS_MAX, 0);
     assert_eq!(state.owners[5], 1005, "a sibling never comes from a held slot");
+    // With pair capacity to spare a sibling is claimed, but from the next
+    // released slot: slot 5 is the oldest release and stays held.
+    let mut spare = crowded(&[5, 9, 2]);
+    assert!(!spare.set_held(5, true));
+    spare.owners[9] = 1;
+    spare.released &= !bit(9);
+    spare.render_capacity = SLOTS;
+    spare.claim_sibling(1, cfg::RENDER_PAIRS_MAX, 0);
+    assert_eq!(spare.owners[5], 1005, "a sibling never comes from a held slot");
+    assert_eq!(spare.owners[2], 1, "a sibling comes from a released, unheld slot");
     assert!(!state.reassign_unused_spare(5, Some(1005), Some(3)), "a held slot is no spare for another owner");
     assert!(!state.reassign_unused_spare(5, Some(1005), None), "a held slot is not freed for compute");
     assert_eq!(state.owners[5], 1005);
@@ -354,9 +368,11 @@ def release_fixture():
     at = pairs.index('const SIBLING_BACKLOG')
     backlog = pairs[at:pairs.index('\n}\n', pairs.index('fn sibling_backlog', at)) + 3]
     state = '\n'.join(item(source, name) for name in [
-        'const fn new(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
-        'fn take_idle(', 'fn acquire(', 'fn claim_sibling(', 'fn usable(', 'fn set_held(',
-        'fn sync_held(', 'fn retained(', 'fn used('])
+        'const fn new(', 'fn owns_live(', 'fn has_live_owner(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
+        'fn take_idle(', 'fn acquire(', 'fn acquire_for(', 'fn live_owners(', 'fn live_siblings(',
+        'fn reclaimable_siblings_in(', 'fn reclaimable_siblings(', 'fn promotes_reclaimable_sibling(',
+        'fn can_lease_slot(', 'fn unavailable_released(', 'fn total_pair_demand(', 'fn pair_demand(',
+        'fn claim_sibling(', 'fn usable(', 'fn set_held(', 'fn sync_held(', 'fn retained(', 'fn used('])
     pool = '\n'.join(item(source, name) for name in [
         'pub(crate) fn set_held(', 'pub(crate) fn sync_held(', 'pub(crate) fn release_owner('])
     pending = '\n'.join(item(teardown, name) for name in [
