@@ -3119,8 +3119,8 @@
 			compatible = "apple,t6050-aop", "apple,t8152-aop";
 			reg = <0x02 0x90c00000 0x00 0x1e0000>, <0x02 0x90600000 0x00 0x4000>;
 			reg-names = "mmio", "asc";
-			mboxes = <&aop_mbox>;
-			mbox-names = "mbox";
+			mboxes = <&aop_mbox>, <&aop_setup_mbox>;
+			mbox-names = "mbox", "setup";
 			iommus = <&aop_dart 0x00>;
 			apple,dma-range = <0x110 0x00 0x10 0x00>;
 			status = "disabled";
@@ -4944,11 +4944,19 @@
 			status = "disabled";
 		};
 
-		mailbox@4d067c000 {
-			compatible = "apple,t6050-secure-mailbox", "apple,secure-mailbox";
-			reg = <0x04 0xd067c000 0x00 0x4000>;
-			interrupts = <0x00 0x00 0x249 0x04 0x00 0x00 0x246 0x04>;
+		/*
+		 * The AOP's setup port: ADT /arm-io/aop-exclave-mailbox, reg
+		 * 0x2d067c000 size 0x4000, interrupts 0x249 and 0x246. The tip's
+		 * apple-aop opens it by name ("setup") on T6050.
+		 */
+		aop_setup_mbox: mailbox@2d067c000 {
+			compatible = "apple,t6050-aop-setup-mailbox", "apple,t8140-aop-setup-mailbox";
+			reg = <0x02 0xd067c000 0x00 0x4000>;
+			interrupts = <0x00 0x00 0x246 0x04>, <0x00 0x00 0x249 0x04>;
+			interrupt-names = "send-empty", "recv-not-empty";
 			iommus = <&aop_dart 0x01>;
+			apple,dma-range = <0x200 0x00 0x20 0x00>;
+			#mbox-cells = <0x00>;
 			status = "disabled";
 		};
 
