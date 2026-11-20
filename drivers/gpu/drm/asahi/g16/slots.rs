@@ -2,11 +2,13 @@
 
 //! Per-VM M4 command storage and device-wide displacement lifetime tracking.
 //!
-//! The compute units share hardware UMA slot 1 and may be in flight together, in publication
-//! order; both render units alternate slot 33, one at a time. Firmware retirement and a later
-//! distinct retired owner are both required before reuse.
+//! Compute unit k owns hardware UMA slot 1 + k; the units may be in flight together, in
+//! publication order. Both render units alternate slot 33, one at a time. Firmware retirement
+//! and a later distinct retired owner are both required before reuse.
 //! Private backing and old VM leases survive until a distinct replacement fully retires.
-//! Aborted storage remains mapped and quarantined. Pool cursors are never scrubbed.
+//! Storage a firmware recovery aborted remains mapped for good (its job is retained) and is
+//! never used again; its unit returns to service for other storage (`abandon`). Storage that
+//! cannot be trusted is quarantined. Pool cursors are never scrubbed.
 
 use core::sync::atomic::Ordering;
 use kernel::{prelude::*, sync::Arc};
@@ -751,7 +753,32 @@ impl Slots {
         f.pass_mask = 0;
         f.ct_count = 0;
     }
-    /// Cancels preparation only. Published units require retire() or quarantine().
+    /// The firmware's recovery passed the flight of `f` without completing it: its units return
+    /// to service ([`Lifetime::abandon`]). The flight's own storage leases are dropped; the
+    /// caller retains its job, which keeps that storage mapped. Each unit's previous owner
+    /// keeps its lease until a later owner fully retires, as after any publication.
+    pub(crate) fn abandon(&mut self, f: &mut Claims) {
+        for &k in &f.slot[..f.slot_count as usize] {
+            let k = k as usize;
+            self.compute.lifetime.abandon(k);
+            self.compute.pending_retarget[k] = None;
+            self.compute.pending_owner[k] = None;
+            self.compute.pending_arena[k] = None;
+        }
+        for k in 0..2 {
+            if f.pass_mask & (1 << k) != 0 {
+                self.pass_lifetime.abandon(k);
+                self.pending_pass_retarget[k] = None;
+                self.pending_pass_owner[k] = None;
+                self.pending_pass_arena[k] = None;
+            }
+        }
+        self.pass_busy &= !f.pass_mask;
+        f.slot_count = 0;
+        f.pass_mask = 0;
+        f.ct_count = 0;
+    }
+    /// Cancels preparation only. Published units require retire(), abandon() or quarantine().
     pub(crate) fn release(&mut self, f: &mut Claims) {
         for &k in &f.slot[..f.slot_count as usize] {
             self.compute.lifetime.cancel(k as usize);

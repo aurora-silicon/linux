@@ -712,12 +712,19 @@ impl Firmware {
         } else {
             // Only an actual passed abort lacks the full owner receipt. An affected job
             // with a full normal receipt fails its fence without poisoning healthy storage.
+            // The aborted storage stays mapped with its retained job and is never used again
+            // (its VM keeps a sticky error); its units serve other storage, so one client's
+            // fault does not take compute or rendering away from every other client.
             if f.renders != 0 {
-                // The quarantined slot is not picked again, but keep no epoch of it for reuse.
+                // Keep no epoch of the aborted render for reuse.
                 self.pools.forget(timestamp_claims.pass[0] as usize);
             }
-            self.slots.quarantine(&mut f.claims);
+            // Its VM's sticky error before its units return to service: from here on no job
+            // of that VM is published (`publish` refuses it), so nothing loads the aborted
+            // storage again, also not before the job's own completion runs.
+            f.job.latch_failure(EIO);
             self.retain(&f.job);
+            self.slots.abandon(&mut f.claims);
             self.recovery.aborted_receipts = self.recovery.aborted_receipts.saturating_add(1);
         }
         if self.slots.compute_exhausted() {
@@ -1167,9 +1174,9 @@ impl Firmware {
         {
             writeln!(
                 f,
-                "{}_owners: fresh {} preparing {} published {} retired {} quarantined {} reusable {}",
+                "{}_owners: fresh {} preparing {} published {} retired {} quarantined {} reusable {} abandoned {}",
                 name, owners.fresh, owners.preparing, owners.published, owners.retired,
-                owners.quarantined, owners.reusable
+                owners.quarantined, owners.reusable, owners.abandoned
             )?;
         }
         for (kind, name) in ["compute", "render"].iter().enumerate() {
