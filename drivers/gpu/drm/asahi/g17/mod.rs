@@ -2690,11 +2690,11 @@ impl gpu::Gpu for Gpu {
         mut bo: gem::ObjectRef,
         range: Range<usize>,
     ) -> Result<crate::timestamp::Buffer> {
-        let (mapping, window) = {
+        let windowed = {
             let state = self.shared.state.lock();
             let firmware = (*state).as_ref().ok_or(ENODEV)?;
             // The timestamp window is part of the older firmware graph, not M5's graph.
-            let windowed = if firmware.uat.is_m5() {
+            if firmware.uat.is_m5() {
                 None
             } else {
                 bo.map_range_into_range(
@@ -2706,27 +2706,15 @@ impl gpu::Gpu for Gpu {
                     false,
                 )
                 .ok()
-            };
-            match windowed {
-                Some(mapping) => (mapping, true),
-                // A full window: this buffer's stamps are all host-written.
-                None => (
-                    bo.map_range_into_range(
-                        firmware.uat.kernel_vm(),
-                        range,
-                        firmware.uat.kernel_dynamic_range(),
-                        mmu::UAT_PGSZ as u64,
-                        mmu::PROT_FW_SHARED_RW,
-                        false,
-                    )?,
-                    false,
-                ),
             }
         };
         // The buffer's CPU mapping takes the reservation lock: not under the device mutex.
-        match window {
-            true => crate::timestamp::Buffer::firmware_window(mapping),
-            false => crate::timestamp::Buffer::firmware(mapping),
+        match windowed {
+            Some(mapping) => crate::timestamp::Buffer::firmware_window(mapping),
+            // Outside the window the host writes every stamp, and the firmware never sees the
+            // buffer: give it no firmware alias, which would take kernel address space shared
+            // with every firmware object (queues, rings, pools) for as long as it is bound.
+            None => crate::timestamp::Buffer::host(&bo, range),
         }
     }
 }
