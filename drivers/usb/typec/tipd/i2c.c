@@ -58,6 +58,11 @@ static void tps6598x_remove_i2c(struct i2c_client *client)
 	tipd_remove(tps);
 }
 
+static void tps6598x_shutdown_i2c(struct i2c_client *client)
+{
+	tipd_shutdown(i2c_get_clientdata(client));
+}
+
 /*
  * The I2C adapter suspends right after its clients and resumes right before
  * them, and cannot transfer in between. Keep the event handler out of that
@@ -122,6 +127,7 @@ static struct i2c_driver tps6598x_i2c_driver = {
 	},
 	.probe = tps6598x_probe_i2c,
 	.remove = tps6598x_remove_i2c,
+	.shutdown = tps6598x_shutdown_i2c,
 	.id_table = tps6598x_id,
 };
 module_i2c_driver(tps6598x_i2c_driver);
