@@ -5833,9 +5833,12 @@ params_done:
 			ret = -EINVAL;
 			goto err_clk_disable;
 		}
-		if (stream && (!of_machine_is_compatible("apple,j613") ||
-		    !of_device_is_compatible(dev->of_node, "apple,t8122-dart") ||
-		    res->start != 0x2fa808000ULL || !dart->supports_bypass ||
+		/*
+		 * Inherit the stream only if this DART can bypass and the boot
+		 * stage really left that stream in bypass: the TCR read back is
+		 * the hardware's own statement of the handoff, on any board.
+		 */
+		if (stream && (!dart->supports_bypass ||
 		    stream != 1 || stream >= dart->num_streams ||
 		    apple_dart_readl(dart, DART_TCR(dart, stream)) != dart->hw->tcr_bypass)) {
 			ret = -EINVAL;
