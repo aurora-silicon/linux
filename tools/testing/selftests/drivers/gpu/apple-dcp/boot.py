@@ -214,6 +214,7 @@ enum dcp_firmware_version {
     DCP_FIRMWARE_UNKNOWN,
     DCP_FIRMWARE_V_26_6_DESKTOP,
     DCP_FIRMWARE_V_27_0,
+    DCP_FIRMWARE_M4,
 };
 struct dcp_v14_board;
 struct apple_dcp_hw_data { enum dcp_firmware_version firmware_compat; };
@@ -280,6 +281,13 @@ static int of_property_read_u32_array(const struct device_node *np, const char *
 #define DCP_FW_VERSION_STR_LEN 32
 #define GFP_KERNEL 0
 #define dev_err(...) ((void)0)
+#define dev_info(...) ((void)0)
+/* linux/soc/apple/t8132.h: the M4 backend's 26.6.2 firmware path (or an Air) */
+static bool t8132_firmware_path;
+static bool apple_t8132_firmware_path(void)
+{
+    return t8132_firmware_path;
+}
 static void *devm_kmemdup(struct device *dev, const void *src, size_t len, unsigned int gfp)
 {
     (void)dev; (void)src; (void)len; (void)gfp;
@@ -374,7 +382,24 @@ int main(void)
             assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_26_6_DESKTOP);
         }
     }
+    /*
+     * A T8132 processor of the M4 backend keeps it on the M4 firmware path
+     * only; off it (a Mac mini booted from 27.2) nobody adopts or touches it.
+     */
+    static struct apple_dcp_hw_data hw_m4 = { .firmware_compat = DCP_FIRMWARE_M4 };
+    dev.hw = &hw_m4;
+    for (unsigned ext = 0; ext < 2; ext++) {
+        reset_t6041_26b123(ext);
+        node.compatible = ext ? "apple,t8132-dcpext" : "apple,t8132-dcp";
+        node.uuid = "other";
+        t8132_firmware_path = true;
+        assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_M4);
+        t8132_firmware_path = false;
+        assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    }
+    dev.hw = &hw_t6041;
     puts("PASS T6041 26B123 v27.2 internal/external admission, refusal controls, and desktop 26.x preservation");
+    puts("PASS T8132 M4 backend only on its firmware path");
     return 0;
 }
 '''

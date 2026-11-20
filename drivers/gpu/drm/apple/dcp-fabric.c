@@ -12,7 +12,9 @@
 #include <linux/phy/phy.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
+#include <linux/soc/apple/display.h>
 #include <linux/soc/apple/dp-tunnel.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/workqueue.h>
@@ -225,6 +227,17 @@ bool dcp_hdmi_port_attached(struct apple_dcp *dcp)
 	       gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0;
 }
 
+bool dcp_t8132_ext_m4_node(const struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t8132-dcpext") &&
+	       !apple_t8132_dcpext_v27_2(np);
+}
+
+bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
+{
+	return dcp_t8132_ext_m4_node(dcp->dev->of_node);
+}
+
 /*
  * A route of an adopted T8132 dcpext whose PHY has no DP alt mode: the
  * crossbar's DP PHY output has nothing behind it. The board marks the PHYs
@@ -233,15 +246,10 @@ bool dcp_hdmi_port_attached(struct apple_dcp *dcp)
  */
 static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route)
 {
-	if (!of_device_is_compatible(route->dcp->dev->of_node, "apple,t8132-dcpext"))
+	if (!dcp_is_t8132_ext(route->dcp))
 		return false;
 	return IS_ERR_OR_NULL(route->phy) ||
 	       !of_property_read_bool(route->phy->dev.of_node, "apple,dp-alt-mode");
-}
-
-bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
-{
-	return of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext");
 }
 
 /*
