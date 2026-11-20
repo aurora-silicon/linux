@@ -1102,6 +1102,24 @@ static bool magicmouse_mtp_hand_class(u8 class)
 	return (class >= 6 && class <= 8) || class == 12;
 }
 
+/*
+ * A hand on a pad with apple,palm-tool-area, for the host-derived click: a
+ * contact marked as a palm, or one in a hand class past the palm tool area
+ * already in its first report (the palm mark waits for a second one), or one
+ * on the surface wider than any finger.
+ */
+static bool magicmouse_mtp_hand(const struct magicmouse_sc *msc,
+				const struct tp_finger *f)
+{
+	int tool = le16_to_int(f->tool_major);
+
+	/* The same tests as magicmouse_mtp_update_palms(), without the wait. */
+	return test_bit(magicmouse_mtp_contact_id(f), msc->mtp_palm_ids) ||
+	       (tool > msc->mtp_palm_area[1] && magicmouse_mtp_on_surface(msc, f)) ||
+	       (magicmouse_mtp_hand_class(le16_to_cpu(f->unknown2) & 0xff) &&
+		tool > msc->mtp_palm_area[0]);
+}
+
 static void magicmouse_mtp_update_palms(struct magicmouse_sc *msc,
 					const u8 *records, int count)
 {
@@ -1484,7 +1502,15 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 				tool = MT_TOOL_PALM;
 			report_finger_data(input, msc->tracking_ids[i], &msc->pos[i],
 					   f, tool);
-			pressure += le16_to_int(f->pressure);
+			/*
+			 * J815: a resting palm presses hard enough to reach the
+			 * click threshold on its own. As on macOS, a resting
+			 * hand neither clicks nor deepens a click, while a
+			 * finger of the other hand still does: the hand's own
+			 * force never counts.
+			 */
+			if (!(msc->mtp_palm_large && magicmouse_mtp_hand(msc, f)))
+				pressure += le16_to_int(f->pressure);
 		}
 	}
 
