@@ -201,45 +201,89 @@ const struct ane_fw_platform ane_h17_platform = {
 };
 
 /*
- * The M5 Pro (J714s) ANE: the H17 engine and firmware protocol (ADT
- * "ane,t8132exclave", ane-type 0x220), exclave-assigned and preloaded by
+ * The M5 Pro and Max (J714s, J716c) ANE: the H17 engine and firmware protocol
+ * (ADT "ane,t8132exclave", ane-type 0x220), exclave-assigned and preloaded by
  * iBoot. From the ADT and macOS's own bring-up on this machine: ANE_SYS at
  * PMGR +0x3a8, then ANE_CPU (+0x3c8) and ANE_TDBASE (+0x3d0) behind it; the
  * scratch cells start at +0x1880028; the DARTs are revision 0x204; five DAPF
  * records. System sleep cycles the engine cold, as on T8140.
  */
+#define ANE_T6050_PLATFORM						\
+	.soc = 0x6050,							\
+	.chip_family = 17,						\
+	.ane_type = 0x220,						\
+	.hwx_subtype = 9,						\
+	.task_generation = 19,						\
+	.interrupt_count = 2,						\
+	.owner = ANE_FW_OWNER_EXCLAVE,					\
+	.reg_names = ane_h17_reg_names,					\
+	.reg_sizes = ane_h17_reg_sizes,					\
+	.reg_count = ARRAY_SIZE(ane_h17_reg_names),			\
+	.wrapper = 0x1600000,						\
+	.mailbox = 0x1608000,						\
+	.scratch = 0x1880028,						\
+	.doorbell = 0x1884000,						\
+	.irq_status = 0x188c000,					\
+	.irq_ack = 0x1890000,						\
+	.stream_mask = BIT(0),						\
+	.boot_qualified = true,						\
+	.firmware_preloaded = true,					\
+	.safe_reset = false,						\
+	.sleep_warm = false,						\
+	.pmgr_sys = 0x3a8,						\
+	.pmgr_cpu = 0x3c8,						\
+	.pmgr_subblock = 0x3d0,						\
+	/* Normal T6050 DARTs, as on T6041; SID0 is the host's. */	\
+	.dart_compatible = "apple,t6050-dart",				\
+	.dart_revision = 0x204,						\
+	.dapf_count = 5
+
+/*
+ * The macOS 27.2 (26B123) firmware (h17_ane0_fw_hyperion_j71y, RTKit
+ * 3514.41.1): iBoot preloads TEXT 0xbc000 and DATA 0x2b0000, DATA at
+ * 0x100_000b_c000, as on T8142. The loader fills ce_env (0x4000 at 0xb4f80)
+ * and text_env (0x20 at 0xb8f80); the code pin is from the image with both
+ * zeroed.
+ */
+static const u8 ane_t6050_code_26b123[] = {
+	0x9f, 0x3c, 0xc8, 0x2b, 0x43, 0xc6, 0x16, 0x80,
+	0xdf, 0x68, 0x06, 0x47, 0x10, 0x50, 0xc3, 0xd4,
+	0x69, 0xd6, 0x94, 0x7c, 0x6d, 0x7b, 0x9d, 0x84,
+	0x56, 0x63, 0xff, 0xe5, 0x89, 0x1a, 0xc7, 0x19,
+};
+
+static const struct ane_fw_platform ane_t6050_platform_26b123 = {
+	ANE_T6050_PLATFORM,
+	.build_name = "27.2 26B123",
+	.preload_dva = { 0x10000000000, 0x100000bc000 },
+	.preload_size = { 0xbc000, 0x2b0000 },
+	.text_code_pin = ane_t6050_code_26b123,
+	.text_env = { { 0xb4f80, 0x4000 }, { 0xb8f80, 0x20 } },
+};
+
+/*
+ * The macOS 27.0 (26A428) firmware (h17_ane0_fw_hyperion_j71y): TEXT 0xc0000
+ * and DATA 0x2ac000. The loader fills ce_env (0x4000 at 0xb8280; it carries
+ * a board table, so the J714s and the J716c load different TEXT) and
+ * text_env (0x20 at 0xbc280). text_pin is the J714s's TEXT as loaded; the
+ * code pin, from the image with both sections zeroed, admits either board.
+ */
+static const u8 ane_t6050_code_26a428[] = {
+	0xf8, 0x14, 0x14, 0x39, 0x08, 0x71, 0xd7, 0xd5,
+	0xeb, 0x1b, 0x4f, 0x7d, 0xdd, 0x5b, 0xdb, 0x25,
+	0x8b, 0xd9, 0x41, 0x44, 0x6e, 0xcc, 0xe1, 0x98,
+	0x3c, 0xe8, 0x70, 0x12, 0x48, 0x82, 0xdb, 0x29,
+};
+
 const struct ane_fw_platform ane_t6050_platform = {
-	.soc = 0x6050,
-	.chip_family = 17,
-	.ane_type = 0x220,
-	.hwx_subtype = 9,
-	.task_generation = 19,
-	.interrupt_count = 2,
-	.owner = ANE_FW_OWNER_EXCLAVE,
-	.reg_names = ane_h17_reg_names,
-	.reg_sizes = ane_h17_reg_sizes,
-	.reg_count = ARRAY_SIZE(ane_h17_reg_names),
-	.wrapper = 0x1600000,
-	.mailbox = 0x1608000,
-	.scratch = 0x1880028,
-	.doorbell = 0x1884000,
-	.irq_status = 0x188c000,
-	.irq_ack = 0x1890000,
+	ANE_T6050_PLATFORM,
+	.build_name = "27.0 26A428",
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
-	.stream_mask = BIT(0),
-	.boot_qualified = true,
-	.firmware_preloaded = true,
-	.safe_reset = false,
-	.sleep_warm = false,
-	.pmgr_sys = 0x3a8,
-	.pmgr_cpu = 0x3c8,
-	.pmgr_subblock = 0x3d0,
-	/* Normal T6050 DARTs, as on T6041; SID0 is the host's. */
-	.dart_compatible = "apple,t6050-dart",
-	.dart_revision = 0x204,
-	.dapf_count = 5,
 	.text_pin = ane_t6050_text_pin_27_0,
+	.text_code_pin = ane_t6050_code_26a428,
+	.text_env = { { 0xb8280, 0x4000 }, { 0xbc280, 0x20 } },
+	.next_build = &ane_t6050_platform_26b123,
 };
 
 /*
