@@ -802,7 +802,7 @@ struct apple_dcp {
  struct apple_connector *connector;
  struct { bool active; } split;
  bool external_h17p, external_stop_deferred, soft_dpms, typec_output;
- bool typec_cable_connected, typec_crtc_off, external_native;
+ bool typec_cable_connected, typec_crtc_off, external_native, hdmi_crtc_off;
  u64 external_crtc_generation, typec_unplugs, crtc_unplugs;
 };
 struct platform_device { struct apple_dcp *data; };
@@ -876,15 +876,16 @@ int main(void)
  init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
  dcp.fw_compat = DCP_FIRMWARE_V_27_0; dcp_poweroff(&pdev);
  assert(poweroffs == 1 && hpd_drops == 0 && disconnects == 1);
- assert(!dcp.dptxport[0].connected);
+ assert(!dcp.dptxport[0].connected && dcp.hdmi_crtc_off);
  /* Other firmware keeps it while the cable is attached... */
  init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
  dcp_poweroff(&pdev);
  assert(poweroffs == 1 && disconnects == 0 && dcp.dptxport[0].connected);
+ assert(!dcp.hdmi_crtc_off);
  /* ...and every firmware releases it once the cable is gone. */
  hdmi_gpio = false; init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp;
  dcp_poweroff(&pdev);
- assert(poweroffs == 1 && disconnects == 1);
+ assert(poweroffs == 1 && disconnects == 1 && !dcp.hdmi_crtc_off);
  puts("stale CRTC power-off ownership passed");
  return 0;
 }
