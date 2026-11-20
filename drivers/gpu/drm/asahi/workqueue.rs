@@ -113,6 +113,91 @@ impl From<WorkError> for kernel::error::Error {
 /// An object the firmware may still reference while its GPU context is live.
 pub(crate) type RetainedObject = KBox<dyn Any + Send>;
 
+/// REFFLAKE4 test: a retained queue info with the CPU views of its firmware structures.
+pub(crate) struct Watched {
+    pub(crate) obj: RetainedObject,
+    regions: [(*const u8, usize); 3],
+    snap: KVec<u8>,
+    buf_hash: u64,
+    acked_ns: u64,
+}
+
+// SAFETY: the raw pointers point into `obj`, which is owned by this struct and moves with it.
+unsafe impl Send for Watched {}
+
+static WATCH_LOGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static WATCH_CHANGED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static WATCH_SAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn fnv(p: *const u8, len: usize) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for i in 0..len {
+        // SAFETY: caller passes a live region of `len` bytes.
+        let b = unsafe { core::ptr::read_volatile(p.add(i)) };
+        h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+impl Watched {
+    fn read(&self) -> KVec<u8> {
+        let mut v = KVec::new();
+        for &(p, len) in &self.regions[..2] {
+            for i in 0..len {
+                // SAFETY: the regions are live while `obj` is owned by self.
+                let _ = v.push(unsafe { core::ptr::read_volatile(p.add(i)) }, GFP_KERNEL);
+            }
+        }
+        v
+    }
+
+    /// Called right after the DestroyContext ack.
+    pub(crate) fn snapshot(&mut self) {
+        self.snap = self.read();
+        self.buf_hash = fnv(self.regions[2].0, self.regions[2].1);
+        // SAFETY: ktime_get() may be called from any context.
+        self.acked_ns = unsafe { kernel::bindings::ktime_get() as u64 };
+    }
+
+    /// Called when the entry leaves the quarantine.
+    pub(crate) fn compare(&self) {
+        use core::sync::atomic::Ordering;
+        if self.snap.is_empty() {
+            return;
+        }
+        let now = self.read();
+        let buf_changed = fnv(self.regions[2].0, self.regions[2].1) != self.buf_hash;
+        let info_len = self.regions[0].1;
+        let mut diffs = 0;
+        for i in (0..now.len().min(self.snap.len()).saturating_sub(3)).step_by(4) {
+            let a = u32::from_le_bytes([self.snap[i], self.snap[i + 1], self.snap[i + 2], self.snap[i + 3]]);
+            let b = u32::from_le_bytes([now[i], now[i + 1], now[i + 2], now[i + 3]]);
+            if a != b {
+                diffs += 1;
+                if WATCH_LOGS.fetch_add(1, Ordering::Relaxed) < 60 {
+                    // SAFETY: as above.
+                    let age = unsafe { kernel::bindings::ktime_get() as u64 }.saturating_sub(self.acked_ns) / 1000;
+                    let (which, off) = if i < info_len { ("QueueInfo", i) } else { ("RingState", i - info_len) };
+                    pr_err!("rf4watch: {} +{:#x}: {:#x} -> {:#x} ({} us after the DestroyContext ack)\n", which, off, a, b, age);
+                }
+            }
+        }
+        if buf_changed && WATCH_LOGS.fetch_add(1, Ordering::Relaxed) < 60 {
+            pr_err!("rf4watch: GPBF contents changed after the DestroyContext ack\n");
+        }
+        let n = if diffs > 0 || buf_changed {
+            WATCH_CHANGED.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            WATCH_SAME.fetch_add(1, Ordering::Relaxed);
+            WATCH_CHANGED.load(Ordering::Relaxed)
+        };
+        let s = WATCH_SAME.load(Ordering::Relaxed);
+        if (n + s) % 512 == 0 {
+            pr_info!("rf4watch: evicted queue infos: {} changed after the ack, {} unchanged\n", n, s);
+        }
+    }
+}
+
 /// Objects retained by every context: the notifier and the vertex, fragment and compute work
 /// queues of the owning queue.
 const CONTEXT_RETAINED_OBJECTS: usize = 4;
@@ -676,9 +761,12 @@ impl Drop for Job::ver {
             if let Some(last_cmd) = inner.last_completed_work.take() {
                 workqueue::system_dfl().enqueue(last_cmd);
             }
-            inner.event = None;
-            inner.last_submitted = None;
-            inner.last_completed = None;
+            if true {
+                crate::queue::subtrace::mark(6, inner.event.as_ref().map_or(0xffff, |e| e.0.slot() as u64));
+                inner.event = None;
+                inner.last_submitted = None;
+                inner.last_completed = None;
+            }
         }
         mod_pr_debug!("WorkQueue({:?}): Dropped Job\n", inner.pipe_type);
     }
@@ -724,6 +812,23 @@ impl Drop for WorkQueueInner::ver {
         // queue's owner went away with work in flight, the queue is dropped as soon as that work
         // completes, which can be well before the invalidation.
         if let Some(info) = self.info.take() {
+            let info: RetainedObject = if crate::module_parameters::rf4_quarantine.value() == 5 {
+                let regions = info.with(|raw, inner| {
+                    let r0 = (raw as *const _ as *const u8, core::mem::size_of_val(raw));
+                    let r1 = inner.state.with(|s, _| (s as *const _ as *const u8, core::mem::size_of_val(s)));
+                    let b = inner.gpu_buf.as_slice();
+                    [r0, r1, (b.as_ptr(), b.len())]
+                });
+                match KBox::new(Watched { obj: info, regions, snap: KVec::new(), buf_hash: 0, acked_ns: 0 }, GFP_KERNEL) {
+                    Ok(w) => w,
+                    Err(_) => {
+                        pr_err!("rf4watch: no memory\n");
+                        return;
+                    }
+                }
+            } else {
+                info
+            };
             if self.gpu_context.retain(info).is_err() {
                 pr_err!(
                     "WorkQueue({:?}): Failed to keep the queue until its context is invalidated\n",
@@ -1101,9 +1206,12 @@ impl WorkQueue for WorkQueue::ver {
             if let Some(last_cmd) = inner.last_completed_work.take() {
                 workqueue::system_dfl().enqueue(last_cmd);
             }
-            inner.event = None;
-            inner.last_submitted = None;
-            inner.last_completed = None;
+            if true {
+                crate::queue::subtrace::mark(6, inner.event.as_ref().map_or(0xffff, |e| e.0.slot() as u64));
+                inner.event = None;
+                inner.last_submitted = None;
+                inner.last_completed = None;
+            }
         }
 
         empty

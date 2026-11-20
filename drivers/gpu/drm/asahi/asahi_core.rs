@@ -160,6 +160,14 @@ module! {
             // permissions: 0,
             description: "Fault control (0x0: hard faults, 0xb: macOS default)",
         },
+        rf4_quarantine: u32 {
+            default: 0,
+            description: "REFFLAKE4 TEST: keep invalidated contexts (0 off, 1 all, 2 data, 3 retained, 4 retained[0] notifier, 5 retained[1..] queue infos)",
+        },
+        rf4_qdepth: u32 {
+            default: 256,
+            description: "REFFLAKE4 TEST: contexts kept by rf4_quarantine",
+        },
         initial_tvb_size: usize {
             default: 0x8,
             // permissions: 0o644,

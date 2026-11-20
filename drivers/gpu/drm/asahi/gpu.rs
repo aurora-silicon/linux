@@ -296,6 +296,11 @@ pub(crate) struct GpuManager {
     ids: SequenceIDs,
     #[pin]
     garbage_contexts: Mutex<KVec<workqueue::RetiredContext>>,
+    /// REFFLAKE4 test (bit 56): recently invalidated contexts kept alive.
+    #[pin]
+    quarantine_contexts: Mutex<KVec<workqueue::RetiredContext>>,
+    #[pin]
+    quarantine_retained: Mutex<KVec<KVec<workqueue::RetainedObject>>>,
     #[pin]
     fault_log: SpinLock<FaultLogState>,
 }
@@ -568,6 +573,7 @@ impl rtkit::Operations for GpuManager::ver {
         let dev = &data.dev;
 
         data.crashed.store(true, Ordering::Relaxed);
+        crate::queue::subtrace::dump(None, None);
 
         if debug_enabled(DebugFlags::OopsOnGpuCrash) {
             panic!("GPU firmware crashed");
@@ -1043,6 +1049,8 @@ impl GpuManager::ver {
                 buffer_mgr,
                 ids: Default::default(),
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
+                quarantine_contexts <- new_mutex!(KVec::new(), "quarantine_contexts"),
+                quarantine_retained <- new_mutex!(KVec::new(), "quarantine_retained"),
                 fault_log <- new_spinlock!(FaultLogState::default(), "fault_log"),
             }),
             GFP_KERNEL,
@@ -1470,6 +1478,7 @@ impl GpuManager::ver {
             "Invalidating GPU context @ {:?}\n",
             context.weak_pointer()
         );
+        crate::queue::subtrace::mark(1, context.gpu_va().get());
 
         if self.is_crashed() {
             return Err(ENODEV);
@@ -1518,6 +1527,7 @@ impl GpuManager::ver {
             "GPU context invalidated: {:?}\n",
             context.weak_pointer()
         );
+        crate::queue::subtrace::mark(2, context.gpu_va().get());
 
         // The invalidation does a cache flush, so it is okay to collect garbage
         guard.private.collect_garbage(garbage_count);
@@ -1706,7 +1716,10 @@ impl GpuManager for GpuManager::ver {
         core::mem::swap(&mut *self.garbage_contexts.lock(), &mut garbage_ctx);
 
         for ctx in garbage_ctx {
-            if self.invalidate_context(&ctx.data).is_err() {
+            let held = crate::queue::firstgate::enter_teardown();
+            let res = self.invalidate_context(&ctx.data);
+            crate::queue::firstgate::leave_teardown(held);
+            if res.is_err() {
                 dev_err!(
                     self.dev.as_ref(),
                     "GpuContext: Failed to invalidate GPU context!\n"
@@ -1714,6 +1727,77 @@ impl GpuManager for GpuManager::ver {
                 if debug_enabled(DebugFlags::OopsOnGpuCrash) {
                     panic!("GPU firmware timed out");
                 }
+            }
+            // REFFLAKE4 test: rf4_quarantine mode (debug bits 56-59 still select modes 1-3 / depth 4).
+            let mut mode = crate::module_parameters::rf4_quarantine.value();
+            if mode == 0 && debug_enabled(DebugFlags::Debug8) {
+                mode = if debug_enabled(DebugFlags::Debug9) {
+                    2
+                } else if debug_enabled(DebugFlags::Debug10) {
+                    3
+                } else {
+                    1
+                };
+            }
+            let depth = if debug_enabled(DebugFlags::Debug11) {
+                4
+            } else {
+                crate::module_parameters::rf4_qdepth.value().max(1) as usize
+            };
+            if mode != 0 {
+                let mut ctx = ctx;
+                for obj in ctx.retained.iter_mut() {
+                    if let Some(w) = (**obj).downcast_mut::<workqueue::Watched>() {
+                        w.snapshot();
+                    }
+                }
+                let mut keep_retained: KVec<workqueue::RetainedObject> = KVec::new();
+                let mut drop_retained: KVec<workqueue::RetainedObject> = KVec::new();
+                for (i, obj) in core::mem::take(&mut ctx.retained).into_iter().enumerate() {
+                    let keep = match mode {
+                        1 | 3 => true,
+                        4 => i == 0,
+                        5 => i != 0,
+                        _ => false,
+                    };
+                    let _ = if keep { keep_retained.push(obj, GFP_KERNEL) } else { drop_retained.push(obj, GFP_KERNEL) };
+                }
+                core::mem::drop(drop_retained);
+                ctx.retained = keep_retained;
+                let keep_data = matches!(mode, 1 | 2);
+                let mut q = self.quarantine_contexts.lock();
+                let mut old = None;
+                if q.len() >= depth {
+                    old = q.remove(0).ok();
+                }
+                if keep_data {
+                    let _ = q.push(ctx, GFP_KERNEL);
+                    drop(q);
+                } else {
+                    let workqueue::RetiredContext { data, retained } = ctx;
+                    drop(q);
+                    let mut qr = self.quarantine_retained.lock();
+                    let mut oldr = None;
+                    if qr.len() >= depth {
+                        oldr = qr.remove(0).ok();
+                    }
+                    let _ = qr.push(retained, GFP_KERNEL);
+                    drop(qr);
+                    if let Some(oldr) = oldr.as_ref() {
+                        for obj in oldr.iter() {
+                            if let Some(w) = (**obj).downcast_ref::<workqueue::Watched>() {
+                                w.compare();
+                            }
+                        }
+                    }
+                    drop(oldr);
+                    core::mem::drop(data);
+                }
+                if let Some(old) = old {
+                    core::mem::drop(old.retained);
+                    core::mem::drop(old.data);
+                }
+                continue;
             }
             // The firmware no longer knows the context's queues, so their structures may go now,
             // ahead of the context data they point to.
@@ -1830,7 +1914,9 @@ impl GpuManager for GpuManager::ver {
         }
 
         // If we have fault info, consider it a fault.
-        let error = match self.get_fault_info(log) {
+        let finfo = self.get_fault_info(log);
+        crate::queue::subtrace::dump(event_slot.try_into().ok(), finfo.as_ref().map(|f| f.vm_slot));
+        let error = match finfo {
             Some(info) => workqueue::WorkError::Fault(info),
             None => workqueue::WorkError::Timeout,
         };
@@ -1856,7 +1942,9 @@ impl GpuManager for GpuManager::ver {
             dev_err!(self.dev.as_ref(), "  |________|  \n");
             dev_err!(self.dev.as_ref(), "GPU fault nya~!!!!!\n");
         }
-        let error = match self.get_fault_info(log) {
+        let finfo = self.get_fault_info(log);
+        crate::queue::subtrace::dump(None, finfo.as_ref().map(|f| f.vm_slot));
+        let error = match finfo {
             Some(info) => workqueue::WorkError::Fault(info),
             None => workqueue::WorkError::Unknown,
         };

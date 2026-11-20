@@ -126,7 +126,14 @@ impl slotalloc::SlotItem for EventInner {
 
     fn release(&mut self, data: &mut Self::Data, slot: u32) {
         mod_pr_debug!("EventManager: Released slot {}\n", slot);
-        data.owners[slot as usize] = None;
+        let prev = data.owners[slot as usize].take();
+        if crate::debug::debug_enabled(crate::debug::DebugFlags::Debug2) {
+            // REFFLAKE4 test: the firmware's slot entry still points at this queue until the slot
+            // gets a new owner. Moved, not dropped, under the slot lock.
+            data.prev_owners[slot as usize] = prev;
+        } else {
+            drop(prev);
+        }
     }
 }
 
@@ -136,6 +143,8 @@ pub(crate) struct EventManagerInner {
     fw_stamps: GpuArray<FwStamp>,
     // Note: Use dyn to avoid having to version this entire module.
     owners: KVec<Option<Arc<dyn workqueue::WorkQueue + Send + Sync>>>,
+    /// REFFLAKE4 test: last owner of a released slot, kept until the slot is reassigned.
+    prev_owners: KVec<Option<Arc<dyn workqueue::WorkQueue + Send + Sync>>>,
 }
 
 /// Top-level EventManager object.
@@ -148,13 +157,16 @@ impl EventManager {
     #[inline(never)]
     pub(crate) fn new(alloc: &mut gpu::KernelAllocators) -> Result<EventManager> {
         let mut owners = KVec::new();
+        let mut prev_owners = KVec::new();
         for _i in 0..(NUM_EVENTS as usize) {
             owners.push(None, GFP_KERNEL)?;
+            prev_owners.push(None, GFP_KERNEL)?;
         }
         let inner = EventManagerInner {
             stamps: alloc.shared.array_empty(NUM_EVENTS as usize)?,
             fw_stamps: alloc.private.array_empty(NUM_EVENTS as usize)?,
             owners,
+            prev_owners,
         };
 
         for slot in 0..NUM_EVENTS {
@@ -187,7 +199,9 @@ impl EventManager {
         token: Option<Token>,
         owner: Arc<dyn workqueue::WorkQueue + Send + Sync>,
     ) -> Result<Event> {
+        let mut prev = None;
         let ev = self.alloc.get_inner(token, |inner, ev| {
+            prev = inner.prev_owners[ev.slot() as usize].take();
             mod_pr_debug!(
                 "EventManager: Registered owner {:p} on slot {}\n",
                 &*owner,
@@ -196,6 +210,8 @@ impl EventManager {
             inner.owners[ev.slot() as usize] = Some(owner);
             Ok(())
         })?;
+        // The previous owner goes now, outside the slot lock (its drop may return another slot).
+        drop(prev);
         Ok(ev)
     }
 

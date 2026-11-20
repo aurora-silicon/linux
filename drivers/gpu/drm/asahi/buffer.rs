@@ -122,6 +122,8 @@ pub(crate) struct Scene {
     object: GpuObject<buffer::Scene::ver>,
     slot: u32,
     rebind: bool,
+    /// REFFLAKE4: no other scene of this buffer was active when this one was created.
+    exclusive: bool,
     preempt2_off: usize,
     preempt3_off: usize,
     // Note: these are dead code only on some version variants.
@@ -142,6 +144,11 @@ impl Scene::ver {
     /// command before a render.
     pub(crate) fn rebind(&self) -> bool {
         self.rebind
+    }
+
+    /// REFFLAKE4: true if no other scene of this buffer was in flight when this one was created.
+    pub(crate) fn exclusive(&self) -> bool {
+        self.exclusive
     }
 
     /// Returns the buffer manager slot this scene's buffer was bound to.
@@ -279,7 +286,8 @@ impl Drop for Scene::ver {
         assert_ne!(inner.active_scenes, 0);
         inner.active_scenes -= 1;
 
-        if inner.active_scenes == 0 {
+        if inner.active_scenes == 0 && !crate::debug::debug_enabled(crate::debug::DebugFlags::Debug3) {
+            crate::queue::subtrace::mark(3, inner.active_slot.as_ref().map_or(0xffff, |s| s.slot() as u64));
             mod_pr_debug!(
                 "Buffer: no scenes left, dropping slot {}",
                 inner.active_slot.take().unwrap().slot()
@@ -300,6 +308,8 @@ struct BufferInner {
     max_blocks_nomemless: usize,
     mgr: BufferManager::ver,
     active_scenes: usize,
+    /// REFFLAKE4: the buffer grew since the firmware last got an InitBuffer for it.
+    init_pending: bool,
     active_slot: Option<slotalloc::Guard<BufferSlotInner::ver>>,
     last_token: Option<slotalloc::SlotToken>,
     tpc: Option<Arc<GpuArray<u8>>>,
@@ -421,6 +431,7 @@ impl Buffer::ver {
                     max_blocks_nomemless,
                     mgr: mgr.clone(),
                     active_scenes: 0,
+                    init_pending: false,
                     active_slot: None,
                     last_token: None,
                     tpc: None,
@@ -437,13 +448,41 @@ impl Buffer::ver {
         })
     }
 
+    /// REFFLAKE4: whether the buffer grew since the last InitBuffer.
+    pub(crate) fn init_pending(&self) -> bool {
+        self.inner.lock().init_pending
+    }
+
+    /// REFFLAKE4: an InitBuffer for the current size has been queued.
+    pub(crate) fn clear_init_pending(&self) {
+        self.inner.lock().init_pending = false;
+    }
+
     /// Returns the total block count allocated to this Buffer.
     pub(crate) fn block_count(&self) -> u32 {
         self.inner.lock().blocks.len() as u32
     }
 
+    /// REFFLAKE4: (max_pages, overflow_count, block count) as the firmware left them.
+    pub(crate) fn peek_stats(&self) -> (u32, u32, u32) {
+        let inner = self.inner.lock();
+        let (m, o) = inner.stats.with(|raw, _inner| {
+            (raw.max_pages.load(Ordering::Relaxed), raw.overflow_count.load(Ordering::Relaxed))
+        });
+        (m, o, inner.blocks.len() as u32)
+    }
+
     /// Automatically grow the Buffer based on feedback from the statistics.
     pub(crate) fn auto_grow(&self) -> Result<bool> {
+        self.auto_grow_inner(false)
+    }
+
+    /// [`Self::auto_grow`] for a caller that knows the firmware is not using the buffer.
+    pub(crate) fn auto_grow_idle(&self) -> Result<bool> {
+        self.auto_grow_inner(true)
+    }
+
+    fn auto_grow_inner(&self, fw_idle: bool) -> Result<bool> {
         let inner = self.inner.lock();
 
         let used_pages = inner.stats.with(|raw, _inner| {
@@ -466,7 +505,7 @@ impl Buffer::ver {
         } else {
             // Grow to 3x requested size (same logic as macOS)
             core::mem::drop(inner);
-            self.ensure_blocks(want_blocks)?;
+            self.ensure_blocks_inner(want_blocks, fw_idle)?;
             Ok(true)
         }
     }
@@ -484,6 +523,17 @@ impl Buffer::ver {
 
     /// Ensure that the buffer has at least a certain minimum size in blocks.
     pub(crate) fn ensure_blocks(&self, min_blocks: usize) -> Result<bool> {
+        self.ensure_blocks_inner(min_blocks, false)
+    }
+
+    /// [`Self::ensure_blocks`] for a caller that knows the firmware is not using the buffer (all
+    /// work that used it has completed), so the new size may be published although scenes of
+    /// completed jobs are still held.
+    pub(crate) fn ensure_blocks_idle(&self, min_blocks: usize) -> Result<bool> {
+        self.ensure_blocks_inner(min_blocks, true)
+    }
+
+    fn ensure_blocks_inner(&self, min_blocks: usize, fw_idle: bool) -> Result<bool> {
         let mut inner = self.inner.lock();
 
         let cur_count = inner.blocks.len();
@@ -522,13 +572,14 @@ impl Buffer::ver {
             }
         }
 
+        inner.init_pending = true;
         inner.info.block_ctl.with(|raw, _inner| {
             raw.total.store(new_count as u32, Ordering::SeqCst);
             raw.wptr.store(new_count as u32, Ordering::SeqCst);
         });
 
         /* Only do this update if the buffer manager is idle (which means we own it) */
-        if inner.active_scenes == 0 {
+        if inner.active_scenes == 0 || fw_idle {
             let page_count = (new_count * PAGES_PER_BLOCK) as u32;
             inner.info.with(|raw, _inner| {
                 raw.page_count.store(page_count, Ordering::Relaxed);
@@ -680,14 +731,29 @@ impl Buffer::ver {
         )?;
 
         let mut rebind = false;
+        let exclusive = inner.active_scenes == 0;
+        if exclusive && crate::debug::debug_enabled(crate::debug::DebugFlags::Debug6) {
+            // The buffer manager is idle: publish a size that grew while scenes were in flight.
+            let new_count = inner.blocks.len();
+            let page_count = (new_count * PAGES_PER_BLOCK) as u32;
+            inner.info.with(|raw, _inner| {
+                raw.page_count.store(page_count, Ordering::Relaxed);
+                raw.block_count.store(new_count as u32, Ordering::Relaxed);
+                raw.last_page.store(page_count - 1, Ordering::Relaxed);
+            });
+        }
 
         if inner.active_slot.is_none() {
             assert_eq!(inner.active_scenes, 0);
 
+            let mut prev = None;
             let slot = inner.mgr.0.get_inner(inner.last_token, |inner, mgr| {
+                prev = inner.prev_owners[mgr.slot() as usize].take();
                 inner.owners[mgr.slot() as usize] = Some(self.clone());
                 Ok(())
             })?;
+            // The previous owner goes now, outside the slot lock.
+            drop(prev);
             rebind = slot.changed();
 
             mod_pr_debug!("Buffer: assigning slot {} (rebind={})", slot.slot(), rebind);
@@ -702,6 +768,7 @@ impl Buffer::ver {
             object: scene,
             slot: inner.active_slot.as_ref().unwrap().slot(),
             rebind,
+            exclusive,
             preempt2_off: inner.preempt1_size,
             preempt3_off: inner.preempt1_size + inner.preempt2_size,
             meta1_off: clmeta_size,
@@ -747,7 +814,14 @@ impl slotalloc::SlotItem for BufferSlotInner::ver {
 
     fn release(&mut self, data: &mut Self::Data, slot: u32) {
         mod_pr_debug!("BufferManager: Released slot {}\n", slot);
-        data.owners[slot as usize] = None;
+        let prev = data.owners[slot as usize].take();
+        if crate::debug::debug_enabled(crate::debug::DebugFlags::Debug12) {
+            // REFFLAKE4 test: the firmware's slot entry still points at this buffer until an
+            // InitBuffer for a new owner replaces it. Moved, not dropped, under the slot lock.
+            data.prev_owners[slot as usize] = prev;
+        } else {
+            drop(prev);
+        }
     }
 }
 
@@ -755,6 +829,8 @@ impl slotalloc::SlotItem for BufferSlotInner::ver {
 #[versions(AGX)]
 pub(crate) struct BufferManagerInner {
     owners: KVec<Option<Buffer::ver>>,
+    /// REFFLAKE4 test: last owner of a released slot, kept until the slot is reassigned.
+    prev_owners: KVec<Option<Buffer::ver>>,
 }
 
 /// The GPU-global buffer manager, used to allocate and release buffer slots from the pool.
@@ -765,12 +841,14 @@ pub(crate) struct BufferManager(slotalloc::SlotAllocator<BufferSlotInner::ver>);
 impl BufferManager::ver {
     pub(crate) fn new() -> Result<BufferManager::ver> {
         let mut owners = KVec::new();
+        let mut prev_owners = KVec::new();
         for _i in 0..(NUM_BUFFERS as usize) {
             owners.push(None, GFP_KERNEL)?;
+            prev_owners.push(None, GFP_KERNEL)?;
         }
         Ok(BufferManager::ver(slotalloc::SlotAllocator::new(
             NUM_BUFFERS,
-            BufferManagerInner::ver { owners },
+            BufferManagerInner::ver { owners, prev_owners },
             |_inner, _slot| Some(BufferSlotInner::ver()),
             c_str!("BufferManager::SlotAllocator"),
             static_lock_class!(),
