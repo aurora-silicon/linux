@@ -752,12 +752,13 @@ EXPORT_SYMBOL_IF_KUNIT(cd321x_mux_gave_up);
  * converter can keep DATA_STATUS at HPD high while the display behind it is
  * unplugged, and report that only in its DP status. Once the controller has
  * signalled a DP status for this connection, that status must show HPD too.
+ * A display route with its own HPD path (apple,display-native-hpd) takes the
+ * DATA_STATUS level only.
  */
 static bool cd321x_uses_dp_sid(const struct tps6598x *tps)
 {
 	return device_is_compatible(tps->dev, "apple,sn201202x") &&
-	       !of_machine_is_compatible("apple,t8140") &&
-	       !of_machine_is_compatible("apple,t8142");
+	       !tps->display_native_hpd;
 }
 
 static u64 cd321x_irq_mask(const struct tps6598x *tps)
@@ -924,7 +925,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		 * reference reports the pulse out of band instead, as a
 		 * disconnect and a connect (see cd321x_update_work()).
 		 */
-		hpd_pulse = !tps->h17_display &&
+		hpd_pulse = !tps->display_native_hpd &&
 			    !(IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode) &&
 			    (st->data_status_changed & CD321X_DATA_STATUS_HPD_LEVEL) &&
 			    (dp_data.status & DP_STATUS_HPD_STATE) &&
@@ -1414,10 +1415,12 @@ static void cd321x_update_work(struct work_struct *work)
 	if (ret)
 		goto retry;
 
-	/* A new USB4 route can disturb another port on the shared fabric. */
+	/*
+	 * A new USB4 route can disturb another port on the shared fabric. A display
+	 * route with its own HPD path is not sent the hint.
+	 */
 	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
-	    !of_machine_is_compatible("apple,t8140") &&
-	    !of_machine_is_compatible("apple,t8142") &&
+	    !tps->display_native_hpd &&
 	    usb4_started && !cd321x->display_route_active)
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
 						connector_status_unknown);
@@ -3489,6 +3492,7 @@ int tipd_init(struct tps6598x *tps)
 		return -EPROBE_DEFER;
 
 	dev_dbg(tps->dev, "Type-C probe start\n");
+	tps->display_native_hpd = device_property_read_bool(tps->dev, "apple,display-native-hpd");
 	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(tps->reset))
 		return dev_err_probe(tps->dev, PTR_ERR(tps->reset),
@@ -3806,9 +3810,6 @@ EXPORT_SYMBOL_GPL(tipd_suspend);
 int tipd_resume(struct tps6598x *tps)
 {
 	int ret;
-
-	tps->h17_display = of_machine_is_compatible("apple,t8140") ||
-			   of_machine_is_compatible("apple,t8142");
 
 	ret = tps6598x_check_mode(tps);
 	if (ret < 0)

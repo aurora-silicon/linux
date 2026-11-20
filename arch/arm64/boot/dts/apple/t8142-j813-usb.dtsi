@@ -64,6 +64,7 @@
 		hpm0: usb-pd@c {
 			compatible = "apple,sn201202x";
 			reg = <0xc SPMI_USID>;
+			apple,display-native-hpd;
 
 			typec0: connector {
 				compatible = "usb-c-connector";
@@ -210,6 +211,7 @@
 	hpm1: usb-pd@a {
 		compatible = "apple,sn201202x";
 		reg = <0xa SPMI_USID>;
+		apple,display-native-hpd;
 
 		typec1: connector {
 			compatible = "usb-c-connector";
