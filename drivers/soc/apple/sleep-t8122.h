@@ -1164,6 +1164,8 @@ static void t8122_deep_wfi_arm(void)
 {
 	if (t8122_quiet)
 		sleep_core_fiq_quiet();
+	if (READ_ONCE(sleep_j613_ed))
+		t8142_ed_release();
 	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
 	/* The boot core's, last: 'Z' going in. */
 	if (apple_sleep && (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) == apple_sleep->mbox->boot_mpidr)
@@ -1462,6 +1464,17 @@ static void t8122_sleep_post_release(struct apple_sleep *s)
 		t8122_dc_hex(readl(s->cllt + T8122_CLLT_CTL));
 		t8122_dc_putc('/');
 		t8122_dc_hex(readl(s->cllt + T8122_CLLT_LAST));
+		if (READ_ONCE(sleep_j613_ed)) {
+			unsigned int c, k;
+
+			t8122_dc_puts(" ed=");
+			for (c = 0; c < 2; c++)
+				for (k = 0; k < 4; k++) {
+					t8122_dc_hex(t8142_ed[c][k] ?
+						     readl_relaxed(t8142_ed[c][k] + T8142_ED_EDPRSR) : ~0U);
+					t8122_dc_putc(c == 1 && k == 3 ? ' ' : '/');
+				}
+		}
 		if (s->wake) {
 			t8122_dc_puts(" w=");
 			for (i = 0x24; i <= 0x44; i += 4) {
