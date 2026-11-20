@@ -133,6 +133,8 @@ pub(crate) struct Layout {
     /// GLOBALS (region C) words of this build that have no 25G83 position, at their own
     /// offsets: the M4 Pro 26B123 cold-start policy (`g17::fw::initdata::v26b123::RegionCPrefix`).
     pub(crate) globals_policy: &'static [(usize, u32)],
+    /// GLOBALS (region C) words this build writes in place of the 25G83 value at that position.
+    pub(crate) globals_override: &'static [(usize, u32)],
 }
 
 /// Size of the host's crash copy buffer (`coredump-copy-buffer` in the 27.2 nub); macOS 27.2
@@ -211,6 +213,7 @@ pub(crate) const V25G83: Layout = Layout {
     pstate_selectors: [0x88, 0x8c, 0x98],
     coredump_copy: None,
     globals_policy: &[],
+    globals_override: &[],
 };
 
 /// The 26B123 InitData ABI (macOS 27.2): the same 31 objects and pointers, with
@@ -273,7 +276,16 @@ pub(crate) const V26B123: Layout = Layout {
     // them on this firmware (linux#1954, on hardware). The power-up path (0x3434) reads
     // 0x9dc; zero there is the candidate for the J713's SError on the first wake from idle.
     globals_policy: &[(0x38, 1), (0x9dc, 50), (0xe0c, 250)],
+    // 27.2 (candidate): the GPU is never powered off when idle; see IDLE_OFF_KEEP_POWERED_MS.
+    globals_override: &[(0x9c0, IDLE_OFF_KEEP_POWERED_MS)],
 };
+
+/// 27.2 (candidate): the idle power-off delay in ms (region C 25G83 0x9bc = 40, 26B123 0x9c0).
+/// The firmware's idle path (fn 0x37f48) arms a delay * 1000 us timer (x10 while its state
+/// +0xeb8 is set) and powers the GPU off when it fires, or at once for 0. On 27.2 the wake from
+/// that power-off dies with an SError (J713, J773g), so keep the GPU powered: about 3.1 days,
+/// whose x10 still fits a u32.
+pub(crate) const IDLE_OFF_KEEP_POWERED_MS: u32 = 0x1000_0000;
 
 /// Runs are ordered, disjoint and land inside an object of `size` bytes.
 const fn runs_fit(runs: &[Run], size: usize) -> bool {
@@ -794,7 +806,7 @@ pub(crate) fn encode_for(
     for at in layout.pstate_selectors {
         put32(g, at, 100 * ceiling)?;
     }
-    for &(at, value) in layout.globals_policy {
+    for &(at, value) in layout.globals_policy.iter().chain(layout.globals_override) {
         put32(g, at, value)?;
     }
     let runs = layout.main;

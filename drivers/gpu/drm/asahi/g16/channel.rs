@@ -311,6 +311,50 @@ impl Channels {
 /// with `wait`, waits for its consumption and completion. A firmware halted for recovery consumes
 /// nothing until the host's resume: EBUSY then, so the caller can answer the halt instead of
 /// timing out. Callers serialize (the device lock once the backend runs).
+/// 27.2: posts `records` behind one doorbell (one generation and write-index update), without
+/// waiting. The caller waits for the last one to retire.
+pub(crate) fn devctl_submit_batch(
+    session: &mut Session,
+    channels: &mut Channels,
+    events: &mut Events,
+    init: &InitData,
+    records: &[DevCtl],
+) -> Result {
+    let dev = session.dev.clone();
+    let producer = channels.devctl_producer;
+    let count = records.len() as u32;
+    if count == 0 || count >= RING_SLOTS {
+        return Err(EINVAL);
+    }
+    let start = Instant::<Monotonic>::now();
+    while channels.devctl.read()? != producer {
+        channels.drain_rings(&dev, events)?;
+        session.check()?;
+        if init.halted()? {
+            channels.log_stop(session, init, "halted before posting");
+            return Err(EBUSY);
+        }
+        if start.elapsed() > Delta::from_millis(2000) {
+            return Err(ETIMEDOUT);
+        }
+        fsleep(Delta::from_micros(1000));
+    }
+    for (i, record) in records.iter().enumerate() {
+        let slot = (producer + i as u32) % RING_SLOTS;
+        channels
+            .devctl
+            .ring
+            .write(slot as usize * rings::DEVCTL_RECORD, &record.to_bytes())?;
+    }
+    let next = (producer + count) % RING_SLOTS;
+    wmb();
+    session.regs.set_generation(next)?;
+    channels.devctl.state.w32(STATE_WRITE, next)?;
+    wmb();
+    channels.devctl_producer = next;
+    session.send(hw::ep::DOORBELL, hw::engine::DEVCTL_DOORBELL)
+}
+
 pub(crate) fn devctl_submit(
     session: &mut Session,
     channels: &mut Channels,
