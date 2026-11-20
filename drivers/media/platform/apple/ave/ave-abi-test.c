@@ -1496,6 +1496,30 @@ static void ave_t6041_text_boot_word(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, size - 2, &a), -EINVAL);
 }
 
+/*
+ * The M3 generation binds probe-only: no build is pinned, the coprocessor
+ * is never started, and nothing is encoded, whatever layout a TEXT CRC
+ * might select.
+ */
+static void ave_m3_probe_only(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	KUNIT_EXPECT_FALSE(test, ave_m3.boot_qualified);
+	KUNIT_EXPECT_NULL(test, ave_m3.regs);
+	KUNIT_EXPECT_EQ(test, ave_m3.fw_text_size, 0U);
+	KUNIT_EXPECT_EQ(test, ave_m3.build_count, 0U);
+	KUNIT_EXPECT_EQ(test, ave_m3.boot_device_id, 0U);
+	KUNIT_EXPECT_EQ(test, ave_m3.device_type, 0U);
+
+	ave->variant = &ave_m3;
+	ave->text_crc = 0x25bfd039;
+	ave->layout = ave_layout_for_crc(ave->text_crc);
+	KUNIT_ASSERT_NOT_NULL(test, ave->layout);
+	KUNIT_EXPECT_EQ(test, ave_fw_check_boot(ave), -EOPNOTSUPP);
+}
+
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_t6041_text_boot_word),
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
@@ -1511,6 +1535,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
 	KUNIT_CASE(ave_6070_variants),	    KUNIT_CASE(ave_6070_text_id),
 	KUNIT_CASE(ave_6070_smalloc),
+	KUNIT_CASE(ave_m3_probe_only),
 	{}
 };
 

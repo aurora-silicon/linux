@@ -257,6 +257,8 @@ int ave_fw_probe(struct ave_dev *ave)
 					     "unexpected firmware segment sizes (TEXT %#zx DATA %#zx)\n",
 					     ave->text.size, ave->data.size);
 		want_crc = build->text_crc;
+	} else if (!ave->variant->boot_qualified && !ave->variant->fw_text_size) {
+		/* A probe-only variant that pins no build takes any segment sizes. */
 	} else if (ave->text.size != ave->variant->fw_text_size ||
 		   (ave->data.size != ave->variant->fw_data_size &&
 		    (!ave->variant->fw_data_size_alt ||
@@ -334,8 +336,8 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (!ave->variant->boot_qualified || !ave->layout)
 		dev_info(
 			dev,
-			"probe only: firmware TEXT %08x DATA %08x needs qualification\n",
-			text_crc, data_crc);
+			"probe only: firmware TEXT %#zx CRC %08x, DATA %#zx CRC %08x needs qualification\n",
+			ave->text.size, text_crc, ave->data.size, data_crc);
 	else if (!ave->layout->encode_ready)
 		dev_info(
 			dev,
