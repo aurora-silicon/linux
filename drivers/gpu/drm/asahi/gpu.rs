@@ -168,6 +168,13 @@ const MAX_FW_ALLOC_GARBAGE_BYTES: usize = 16 * 1024 * 1024;
 /// within the safe range for kmalloc (on 16K page systems).
 const MAX_FW_ALLOC_GARBAGE_OBJECTS: usize = 2048;
 
+/// Maximum number of invalidated contexts whose queue structures wait for a firmware PowerOff.
+///
+/// Under sustained load the firmware may report every PowerOff in the same statistics batch as the
+/// following PowerOn, so the release boundary can be minutes away. The contexts invalidated
+/// longest ago are released once more than this many wait. Each one costs roughly 60 KiB.
+const MAX_POWERED_CONTEXTS: usize = 1024;
+
 /// Global allocators used for kernel-half structures.
 pub(crate) struct KernelAllocators {
     pub(crate) private: alloc::DefaultAllocator,
@@ -1753,6 +1760,12 @@ impl GpuManager for GpuManager::ver {
             // the vector implementation ever violates that contract.
             if let Err(err) = powered.push_within_capacity(retained) {
                 core::mem::forget(err.0);
+            }
+
+            // Bound the memory held when no PowerOff boundary arrives, oldest first.
+            let excess = powered.len().saturating_sub(MAX_POWERED_CONTEXTS);
+            if excess != 0 {
+                core::mem::drop(powered.drain(..excess));
             }
         }
 
