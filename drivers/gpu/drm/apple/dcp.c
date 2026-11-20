@@ -7363,6 +7363,17 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	    of_device_is_compatible(dev->of_node, "apple,t8132-dcp"))
 		dcp->hw = apple_dcp_hw_t8132_v27;
 	/*
+	 * T8112's external processor on firmware 27 (the 27.2 dcpext beside the
+	 * internal DCP) advertises both DPTX endpoints, but announces nothing
+	 * on DPTX_ENDPOINT_V2: as on T8142's dcpext, its port services are on
+	 * DPTX_ENDPOINT, behind the DPTX controller service.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t8112-dcpext")) {
+		dcp->hw.dptx_endpoint = DPTX_ENDPOINT;
+		dcp->hw.dptx_controller = true;
+	}
+	/*
 	 * A SoC with derived power words is offered the stop only when asked for, and only on
 	 * firmware 27.0, whose calls are the ones that ran with them.
 	 */
