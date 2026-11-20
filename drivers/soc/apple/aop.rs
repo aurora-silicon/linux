@@ -211,6 +211,9 @@ const SETUP_SET_SOURCE_BUFFER: u64 = 0x6b80_3ce4_92bd_9547;
 const ALS_CALIBRATION_LEN: usize = 80;
 const ALS_CALIBRATION_OPERATION: u64 = 0x0746_b8d6_6515_2e31;
 const ALS_CALIBRATION_BODY_LEN: u64 = 56;
+/// The VD6286's calibration blob and the message that carries it (see `als_calibration_message`).
+const ALS_SENSOR_BLOB_LEN: usize = 193;
+const ALS_SENSOR_MESSAGE_LEN: usize = 216;
 
 mod aop_ring;
 
@@ -261,6 +264,28 @@ fn le_u32(b: &[u8], off: usize) -> u32 {
 /// Reads the little-endian `u64` at `off`; `b` must hold it.
 fn le_u64(b: &[u8], off: usize) -> u64 {
     u64::from(le_u32(b, off)) | u64::from(le_u32(b, off + 4)) << 32
+}
+
+/// The calibration file as the message the firmware takes on the ALS endpoint. T8140's file is
+/// that 80-byte message already. The 14-inch M5 Max's sensor takes the 193-byte blob its
+/// firmware keeps for the VD6286 in a longer one: the operation code, the blob's length, the
+/// blob and zeros, 216 bytes in all. Returns the message and its length.
+fn als_calibration_message(data: &[u8]) -> Option<([u8; ALS_SENSOR_MESSAGE_LEN], usize)> {
+    let mut message = [0u8; ALS_SENSOR_MESSAGE_LEN];
+    if data.len() == ALS_CALIBRATION_LEN
+        && le_u64(data, 0) == ALS_CALIBRATION_OPERATION
+        && le_u64(data, 8) == ALS_CALIBRATION_BODY_LEN
+    {
+        message[..ALS_CALIBRATION_LEN].copy_from_slice(data);
+        Some((message, ALS_CALIBRATION_LEN))
+    } else if data.len() == ALS_SENSOR_BLOB_LEN {
+        message[..8].copy_from_slice(&ALS_CALIBRATION_OPERATION.to_le_bytes());
+        message[8..16].copy_from_slice(&(ALS_SENSOR_BLOB_LEN as u64).to_le_bytes());
+        message[16..16 + ALS_SENSOR_BLOB_LEN].copy_from_slice(data);
+        Some((message, ALS_SENSOR_MESSAGE_LEN))
+    } else {
+        None
+    }
 }
 
 #[inline(always)]
@@ -2859,22 +2884,19 @@ impl AopData {
                 return Ok(());
             }
         };
-        let data = calibration.data();
-        if data.len() != ALS_CALIBRATION_LEN
-            || le_u64(data, 0) != ALS_CALIBRATION_OPERATION
-            || le_u64(data, 8) != ALS_CALIBRATION_BODY_LEN
-        {
+        let Some((message, message_len)) = als_calibration_message(calibration.data()) else {
             dev_err!(
                 self.dev,
-                "ALS calibration {:?} is not an {}-byte calibration message",
+                "ALS calibration {:?} is neither an {}-byte calibration message nor a {}-byte sensor blob",
                 &*name,
-                ALS_CALIBRATION_LEN
+                ALS_CALIBRATION_LEN,
+                ALS_SENSOR_BLOB_LEN
             );
             return Err(EINVAL);
-        }
+        };
         let status = self.setup_request(
             SETUP_ALS_EP,
-            data,
+            &message[..message_len],
             &[SETUP_REPLY_READY, SETUP_REPLY_READY_ALT],
         )?;
         if status != 0 {
