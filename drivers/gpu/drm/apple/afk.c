@@ -1024,6 +1024,7 @@ static void afk_recv_handle_compact_init(struct apple_dcp_afkep *ep,
 
 	if (ops->init)
 		ops->init(service, service_name, service_name, unit);
+	wake_up_all(&ep->service_wq);
 
 	dev_info(ep->dcp->dev,
 		 "AFK[ep:%02x]: new compact service %s on interface %u%s\n",
@@ -1713,6 +1714,7 @@ static void afk_retry_service_init(struct apple_dcp_afkep *ep)
 		if (ops->init)
 			ops->init(service, service->pending_name, service->pending_class,
 				  service->pending_unit);
+		wake_up_all(&ep->service_wq);
 		if (service->enabled)
 			afk_populate_service_debugfs(service);
 		kfree(service->pending_name);
@@ -1951,6 +1953,7 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		ops->init_props(service, epic_unit, props, props_size);
 	if (ops->init)
 		ops->init(service, epic_name, epic_class, epic_unit);
+	wake_up_all(&ep->service_wq);
 	dev_info(ep->dcp->dev, "AFK[ep:%02x]: new service %s on channel %d\n",
 		 ep->endpoint, service_name, channel);
 
