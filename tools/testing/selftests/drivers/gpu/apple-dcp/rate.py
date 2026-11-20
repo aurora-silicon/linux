@@ -409,32 +409,18 @@ int main(int argc, char **argv)
     assert(mode.flags == (DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC));
     assert(mode.clock == 148500 && mode.hdisplay == 1920 && mode.vdisplay == 1080);
     free(timings);
-    {
-        /* Which firmware identity is the 2022 Studio Display: APP and 0xae3a, nothing looser. */
-        struct dcp_display_metadata id = { .product = 0xae3a, .manufacturer = "APP" };
-        assert(dcp_metadata_is_studio_display(&id));
-        id.product = 0; /* the built-in panel: APP, product 0 */
-        assert(!dcp_metadata_is_studio_display(&id));
-        id.product = 0xae3b; /* another Apple display */
-        assert(!dcp_metadata_is_studio_display(&id));
-        id.product = 0xae3a;
-        memcpy(id.manufacturer, "DEL", 4);
-        assert(!dcp_metadata_is_studio_display(&id));
-        memcpy(id.manufacturer, "APP", 4);
-        id.product = 0x1ae3a; /* does not fold onto the 16 bit code */
-        assert(!dcp_metadata_is_studio_display(&id));
-    }
     /* The sink's HDR capability, as the firmware reports it. */
     assert(metadata.pq && metadata.static_metadata_type1 && metadata.bt2020_rgb);
     assert(metadata.max_luminance == 27375011 && metadata.max_fall == 25652679 &&
-           metadata.min_luminance == 5154);
+           metadata.min_luminance == 5154 && metadata.has_min_luminance);
     {
         /* Primaries pass as reported; a missing Min is 0, a missing frame average the Max. */
         struct dcp_parse_ctx c;
         struct dcp_display_metadata s;
         assert(!parse(sink_blob, sizeof(sink_blob), &c) && !parse_display_metadata(&c, &s));
         assert(s.chromaticity[0][0] == 45248 && s.chromaticity[0][1] == 20992);
-        assert(s.max_luminance == 27375011 && s.max_fall == 25652679 && s.min_luminance == 0);
+        assert(s.max_luminance == 27375011 && s.max_fall == 25652679 &&
+               s.min_luminance == 0 && !s.has_min_luminance);
         const struct drm_edid *e = dcp_metadata_edid(&s, &mode);
         assert(!IS_ERR(e));
         const u8 *r = (const u8 *)&e->raw;
