@@ -24,6 +24,9 @@ use super::object::{Class, FwObject, Objects, Placement, Request};
 use super::regs::{rmb, wmb};
 use super::Firmware;
 
+/// Firmware log records printed per module load (bring-up diagnostics).
+static BOOT_LOG_RECORDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(256);
+
 /// A submit channel.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Channel {
@@ -202,6 +205,41 @@ impl Channels {
         Ok(())
     }
 
+    /// Bring-up diagnostics: prints the firmware's new log records of thread `thread` (0x48
+    /// bytes each, its format pointer and arguments), at most [`BOOT_LOG_RECORDS`] per load.
+    fn print_log_records(&self, dev: &kernel::device::Device, thread: usize) {
+        let at = thread * 0x30;
+        let (Ok(producer), Ok(mut consumer)) = (
+            self.log.state.r32(at + STATE_WRITE),
+            self.log.state.r32(at + STATE_READ),
+        ) else {
+            return;
+        };
+        if producer >= 256 || consumer >= 256 {
+            return;
+        }
+        rmb();
+        while consumer != producer {
+            if BOOT_LOG_RECORDS
+                .fetch_update(
+                    core::sync::atomic::Ordering::Relaxed,
+                    core::sync::atomic::Ordering::Relaxed,
+                    |n| n.checked_sub(1),
+                )
+                .is_err()
+            {
+                return;
+            }
+            let base = (thread * 256 + consumer as usize) * 0x48;
+            let mut w = [0u32; 18];
+            for (i, word) in w.iter_mut().enumerate() {
+                *word = self.log.ring.r32(base + i * 4).unwrap_or(u32::MAX);
+            }
+            dev_info!(dev, "G16 fw log t{} #{}: {:08x?}\n", thread, consumer, w);
+            consumer = (consumer + 1) % 256;
+        }
+    }
+
     /// Bring-up diagnostics for a stop during the boot sequence: the device-control indices, the
     /// GPU fault registers and the FirmwareData recovery state.
     pub(crate) fn log_stop(&self, session: &Session, init: &InitData, why: &str) {
@@ -251,6 +289,7 @@ impl Channels {
     pub(crate) fn drain_rings(&self, dev: &kernel::device::Device, events: &mut Events) -> Result {
         events.drain(dev, &self.event)?;
         for i in 0..rings::LOG_RINGS {
+            self.print_log_records(dev, i);
             Self::drain_one(&self.log, i * 0x30, 256)?;
         }
         // Ktrace has twice the capacity of the other receive rings.
