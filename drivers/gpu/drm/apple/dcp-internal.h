@@ -540,6 +540,8 @@ struct apple_dcp {
 	/* Firmware 27.x: the method IDs of this build (iomfb_v27_methods()). */
 	const struct dcp_method_entry *v27_methods;
 	bool external;
+	/* Any external processor (apple,dcpext), whatever its SoC; set at probe. */
+	bool dcpext;
 	/*
 	 * A desktop external processor: apple,t6041-dcpext (26.x or 27.2), or
 	 * the J773g's apple,t8132-dcpext on 27.2 (apple_t8132_dcpext_v27_2()),
