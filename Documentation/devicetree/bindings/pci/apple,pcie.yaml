@@ -99,6 +99,9 @@ properties:
       - items:
           - const: apple,t8112-pciec
           - const: apple,t8103-pciec
+      - items:
+          - const: apple,t8122-pciec
+          - const: apple,t8103-pciec
       - const: apple,t6000-pciec
       - const: apple,t6050-pciec
       - items:
@@ -528,6 +531,15 @@ allOf:
                 - const: port0
                 - const: fabric
                 - const: debug
+                - const: ltssm
+                - const: oe-fabric
+                - const: intr2axi
+            - items:
+                - const: config
+                - const: rc
+                - const: port0
+                - const: fabric
+                - const: debug
                 - const: ioa
                 - const: ltssm
                 - const: intr2axi
@@ -547,6 +559,27 @@ allOf:
           minItems: 3
           maxItems: 3
       allOf:
+        - if:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t8122-pciec
+                  - const: apple,t8103-pciec
+          then:
+            properties:
+              reg:
+                minItems: 8
+                maxItems: 8
+              reg-names:
+                items:
+                  - const: config
+                  - const: rc
+                  - const: port0
+                  - const: fabric
+                  - const: debug
+                  - const: ltssm
+                  - const: oe-fabric
+                  - const: intr2axi
         - if:
             properties:
               compatible:
