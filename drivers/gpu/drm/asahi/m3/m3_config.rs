@@ -305,12 +305,9 @@ impl Config {
         let state=kind*2;let ring=state+1;
         let w=self.objects[state].read_u32(0x20)?;
         if w>=256 || self.objects[state].read_u32(0)?!=w { return Err(EBUSY); }
-        let mut message=[0u8;0x18];
-        message[8..16].copy_from_slice(&queue.to_le_bytes());
-        message[16..20].copy_from_slice(&(kind as u32).to_le_bytes());
-        message[20..22].copy_from_slice(&head.to_le_bytes());
-        message[22]=event;message[23]=u8::from(new); // New queue; caller selected the event slot.
-        self.objects[ring].write(w as usize*0x18,&message)?;
+        let message = super::m3_channel_format::submission_entry(kind as u32, queue, head, event, new)
+            .map_err(|_| EINVAL)?;
+        self.objects[ring].write(w as usize * message.len(), &message)?;
         agx_memory::publish();
         self.objects[state].u32(0x20,(w+1)%256)?;
         agx_memory::publish();

@@ -42,7 +42,7 @@ mid=r'''
 struct Quirks{handoff_lock:bool,clean_tables:bool}
 struct SlotTTBS{ttb0:AtomicU64,ttb1:AtomicU64}struct UatShared{handoff:Handoff,ttbs:[SlotTTBS;64],map_kernel_to_user:bool,kernel_ttb1:u64,binding_generations:[u64;64],binding_published:[bool;64],owned_user_roots:[u64;64],quirks:Quirks}
 impl UatShared{fn handoff(&self)->&Handoff{&self.handoff}fn ttbs(&self)->&[SlotTTBS;64]{&self.ttbs}}
-struct UatInner{firmware:UatFirmware,m4_adopted:bool,failed:AtomicBool,shared:Mutex<UatShared>}
+struct UatInner{firmware:UatFirmware,m4_adopted:bool,clean_poc:bool,failed:AtomicBool,shared:Mutex<UatShared>}
 '''
 mid=mid.replace('impl UatShared{','impl UatShared{'+''.join(body(mm,m) for m in ['fn handoff_lock(', 'fn handoff_unlock(', 'fn publish_slot(']))
 raii='#[path="'+str(ROOT/'drivers/gpu/drm/asahi/mmu/ppl.rs')+'"]mod ppl;\n'+'\n'.join(body(mm,m) for m in [
@@ -51,7 +51,7 @@ raii='#[path="'+str(ROOT/'drivers/gpu/drm/asahi/mmu/ppl.rs')+'"]mod ppl;\n'+'\n'
 ])
 inner='impl UatInner{\n'+'\n'.join(body(mm,m) for m in ['fn lock(&self) -> Guard', 'fn check_m4(', 'fn lock_handoff(', 'fn lock_m4_upper('])+'\n}\n'
 models=r'''
-fn uat(m4:bool,firmware:UatFirmware)->Rc<UatInner>{Rc::new(UatInner{firmware,m4_adopted:m4,failed:AtomicBool::new(false),shared:Mutex::new(UatShared{handoff:Handoff::new(),ttbs:std::array::from_fn(|_|SlotTTBS{ttb0:AtomicU64::new(0),ttb1:AtomicU64::new(0)}),map_kernel_to_user:!m4,kernel_ttb1:0x800000000,binding_generations:[0;64],binding_published:[false;64],owned_user_roots:[0;64],quirks:Quirks{handoff_lock:true,clean_tables:false}})})}
+fn uat(m4:bool,firmware:UatFirmware)->Rc<UatInner>{Rc::new(UatInner{firmware,m4_adopted:m4,clean_poc:false,failed:AtomicBool::new(false),shared:Mutex::new(UatShared{handoff:Handoff::new(),ttbs:std::array::from_fn(|_|SlotTTBS{ttb0:AtomicU64::new(0),ttb1:AtomicU64::new(0)}),map_kernel_to_user:!m4,kernel_ttb1:0x800000000,binding_generations:[0;64],binding_published:[false;64],owned_user_roots:[0;64],quirks:Quirks{handoff_lock:true,clean_tables:false}})})}
 #[derive(Clone,Copy)]struct Prot{cached:bool}impl Prot{fn is_cached_noncoherent(&self)->bool{self.cached}}
 struct Mutation;impl Drop for Mutation{fn drop(&mut self){MUTATIONS.fetch_sub(1,Ordering::Relaxed);}}
 struct MapTable{fail:bool}impl MapTable{fn unmap_pages(&mut self,_r:Range<u64>)->Result{LEAF_CLEARS.fetch_add(1,Ordering::Relaxed);if self.fail{Err(EIO)}else{Ok(())}}}
