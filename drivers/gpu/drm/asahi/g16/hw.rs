@@ -313,6 +313,9 @@ pub(crate) mod start_27_2 {
     pub(crate) const MSG_LOG_BUFFER_ADDR_MASK: u64 = (1 << 44) - 1;
     /// The host log buffer's size (`coredump-copy-buffer` in the 27.2 nub).
     pub(crate) const LOG_BUFFER_SIZE: usize = 0x8000;
+    /// Longest wait for the firmware's IOP power report before AP power-on goes out without
+    /// it: hv20 has 49 ms from the crash-buffer echo to the log buffer and AP power-on.
+    pub(crate) const IOP_REPORT_WINDOW_MS: u32 = 50;
 }
 
 /// The two magic words of the PPL handoff page.

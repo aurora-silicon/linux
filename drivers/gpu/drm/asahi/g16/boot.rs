@@ -332,6 +332,9 @@ struct LogBuffer {
 unsafe extern "C" fn publish_log_buffer(data: *mut c_void) {
     // SAFETY: By the function's contract.
     let log = unsafe { &mut *data.cast::<LogBuffer>() };
+    // Only the IOP power report waits within the short window; AP power-on gets the default.
+    // SAFETY: `log.rtk` is the live RTKit instance running this hook.
+    unsafe { bindings::apple_rtkit_set_handshake_timeout(log.rtk, 0) };
     // SAFETY: By the function's contract.
     let shared = unsafe { &*log.shared };
     let start = Instant::<Monotonic>::now();
@@ -422,6 +425,18 @@ impl Rtkit {
     ) -> Result {
         // SAFETY: `rtk` is live by the type invariant; the caller vouches for the hook.
         to_result(unsafe { bindings::apple_rtkit_boot_with(self.rtk, Some(before_ap), data) })
+    }
+
+    /// Caps each RTKit handshake wait at `ms`; zero restores the default (1 s).
+    fn set_handshake_timeout(&mut self, ms: u32) {
+        // SAFETY: `rtk` is live by the type invariant.
+        unsafe { bindings::apple_rtkit_set_handshake_timeout(self.rtk, ms) };
+    }
+
+    /// Sets the AP power state ON and waits for its acknowledgement.
+    fn ap_power_on(&mut self) -> Result {
+        // SAFETY: `rtk` is live by the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_ap_power(self.rtk, true) })
     }
 
     /// Waits for the firmware to report in, and sets the AP on.
@@ -729,14 +744,69 @@ fn run(
                     | (va & s::MSG_LOG_BUFFER_ADDR_MASK),
                 result: 0,
             };
+            // hv20: the endpoint map and the crash-buffer echo, 49 ms, then the log buffer and
+            // AP power-on. Wait for the map, then at most that long for the firmware's IOP power
+            // report; without one, AP power-on goes out anyway.
+            let begin = Instant::<Monotonic>::now();
+            while !(session.rtkit.has_endpoint(hw::ep::FIRMWARE)
+                && session.rtkit.has_endpoint(hw::ep::DOORBELL))
+            {
+                if begin.elapsed() > Delta::from_millis(1000) {
+                    dev_err!(dev, "G16: 27.2 RTKit endpoint map incomplete after 1 s\n");
+                    return Err(ETIMEDOUT);
+                }
+                fsleep(Delta::from_millis(1));
+            }
+            session.rtkit.set_handshake_timeout(s::IOP_REPORT_WINDOW_MS);
             // SAFETY: `log` lives on this stack frame across the call and nothing else
             // borrows it; the hook runs on this thread before `boot_with` returns.
-            unsafe {
+            let booted = unsafe {
                 session
                     .rtkit
-                    .boot_with(publish_log_buffer, (&raw mut log).cast())?
+                    .boot_with(publish_log_buffer, (&raw mut log).cast())
             };
-            to_result(log.result)?;
+            session.rtkit.set_handshake_timeout(0);
+            match booted {
+                Ok(()) => {
+                    to_result(log.result)?;
+                    dev_info!(
+                        dev,
+                        "G16: 27.2 RTKit path: IOP power reported, AP on after it ({} ms)\n",
+                        begin.elapsed().as_millis()
+                    );
+                }
+                // The hook restores the default wait first, so this is the IOP report's.
+                Err(e) if e == ETIME => {
+                    dev_info!(
+                        dev,
+                        "G16: 27.2 RTKit path: no IOP power report within {} ms, AP on without it\n",
+                        s::IOP_REPORT_WINDOW_MS
+                    );
+                    // SAFETY: `log` is live on this frame and not borrowed elsewhere; the hook
+                    // sends on this thread and returns before `log` is used again.
+                    unsafe { publish_log_buffer((&raw mut log).cast()) };
+                    to_result(log.result)?;
+                    session.rtkit.ap_power_on()?;
+                    // The endpoints start only once RTKit has both power states ON.
+                    let after = Instant::<Monotonic>::now();
+                    while !session.rtkit.running() {
+                        if after.elapsed() > Delta::from_millis(1000) {
+                            dev_err!(
+                                dev,
+                                "G16: 27.2 RTKit: no IOP power report 1 s after AP power-on\n"
+                            );
+                            return Err(ETIMEDOUT);
+                        }
+                        fsleep(Delta::from_millis(1));
+                    }
+                    dev_info!(
+                        dev,
+                        "G16: 27.2 RTKit: running {} ms after AP power-on\n",
+                        after.elapsed().as_millis()
+                    );
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
     let start = Instant::<Monotonic>::now();
