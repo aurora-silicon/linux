@@ -2199,6 +2199,9 @@ static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 		 * reads the display again if it changed; elsewhere the active
 		 * mode is applied again. H17P always applies it again. A running
 		 * relink connects the sink anew; see dcp_typec_sink_relink().
+		 * A request that comes again soon after a replay takes the link
+		 * down and up, for a firmware that keeps the link of an unchanged
+		 * mode (firmware 27); see dcp_sink_irq_power_cycle().
 		 */
 		if (dcp->typec_connector && dcp->fw_compat == DCP_FIRMWARE_H17P)
 			dcp_retrain_oob(dcp->typec_connector);
@@ -2210,7 +2213,7 @@ static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 				if (ret)
 					return ret;
 			} else {
-				dcp_retrain_oob(dcp->typec_connector);
+				dcp_retrain_sink_irq(dcp->typec_connector);
 			}
 		}
 	}
