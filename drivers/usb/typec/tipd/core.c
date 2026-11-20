@@ -4041,18 +4041,6 @@ void tipd_remove(struct tps6598x *tps)
 EXPORT_SYMBOL_GPL(tipd_remove);
 
 /*
- * macOS tells the port controller of a USB root port with dock-remote-wake when that port
- * sleeps, and the controller then watches the USB2 lines for a remote wakeup (static; what its
- * firmware does with it isn't known). The J700's root port has none, but measured on a J700,
- * a USB keyboard on a connector wakes it this way. The mode goes by the speed on the port: 0x09
- * for full and high speed. At the wake the controller hands the lines back before the port
- * resumes. Only a firmware-driven sleep needs this, and a failure only logs.
- */
-#define TIPD_USBW_HIGH_SPEED	0x09
-#define TIPD_USBW_HAND_BACK	0x80
-#define TIPD_USBW_OFF		0x00
-
-/*
  * USBw with the port lock held. CMD1 is read with the sleep's SSPS gaps (CD321X_SSPS_READ_GAP_US):
  * read back to back, a J714s controller's USBw ends late or not within its limit (1 s), where
  * macOS sees it end in 9-16 ms.
@@ -4063,7 +4051,16 @@ int tipd_usbw_locked(struct tps6598x *tps, u8 mode)
 	return tps6598x_exec_cmd_gap(tps, "USBw", sizeof(mode), &mode, 0, NULL, 1000, 0,
 				     CD321X_SSPS_READ_GAP_US);
 }
+EXPORT_SYMBOL_GPL(tipd_usbw_locked);
 
+/*
+ * macOS tells the port controller of a USB root port with dock-remote-wake when that port
+ * sleeps, and the controller then watches the USB2 lines for a remote wakeup (static; what its
+ * firmware does with it isn't known). The J700's root port has none, but measured on a J700,
+ * a USB keyboard on a connector wakes it this way. The mode goes by the speed on the port: 0x09
+ * for full and high speed. At the wake the controller hands the lines back before the port
+ * resumes. Only a firmware-driven sleep needs this, and a failure only logs.
+ */
 static void tipd_usbw(struct tps6598x *tps, u8 mode)
 {
 	int ret;

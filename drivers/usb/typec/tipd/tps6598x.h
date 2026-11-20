@@ -536,6 +536,12 @@ struct sn201202x {
 	bool entry_suspended;
 	/* Register accesses that reached it meanwhile */
 	unsigned int entry_strays;
+	/* J714s: macOS's USBw 0x09 after the PHYs' stop, handed back at the wake */
+	struct notifier_block usbw_nb;
+	/* ... for a controller with a connector (not MagSafe's) */
+	bool usbw_port;
+	/* ... and sent in this sleep, not yet handed back */
+	bool usbw_macos;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
@@ -550,6 +556,10 @@ int tipd_resume(struct tps6598x *tps);
 void tipd_poll_stop(struct tps6598x *tps);
 void tipd_poll_start(struct tps6598x *tps);
 int tipd_usbw_locked(struct tps6598x *tps, u8 mode);
+/* USBw modes: the USB2 lines watched for a full/high-speed remote wakeup, handed back, off */
+#define TIPD_USBW_HIGH_SPEED	0x09
+#define TIPD_USBW_HAND_BACK	0x80
+#define TIPD_USBW_OFF		0x00
 
 /* Internal to tps6598x-core */
 int tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len);
