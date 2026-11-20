@@ -817,16 +817,22 @@
 			#iommu-cells = <1>;
 			apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
 			apple,dma-offset = /bits/ 64 <0x0>;
-			status = "disabled";
 		};
 
+		/*
+		 * Every M4 has the enclave. Its driver must bind on every board:
+		 * the enclave takes the deep-sleep request, and Touch ID and the
+		 * secure storage paths go through it. Without a domain the driver
+		 * tells the enclave at .suspend, and a sleep refused after that
+		 * finds it gated with its mailbox gone.
+		 */
 		sep: sep@3aa600000 {
 			compatible = "apple,sep";
 			reg = <0x3 0xaa600000 0x0 0x88000>;
 			mboxes = <&sep_mbox>;
 			mbox-names = "mbox";
 			iommus = <&sep_dart 0>;
-			status = "disabled";
+			power-domains = <&ps_sep>, <&ps_gpio>;
 		};
 
 		sep_mbox: mbox@3aa608000 {
