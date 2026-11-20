@@ -4074,6 +4074,36 @@ struct macaudio_platform_cfg macaudio_j873_cfg = {
 };
 
 /*
+ * J775c and J775d (T6050, Mac Studio M5 Max and M5 Ultra): as on J714s, the
+ * AOP firmware owns the audio fabric and the CPU component is the AOP audio
+ * driver. The jack is a CS42L84 on "cout", the speaker one SN012776 on
+ * "spkr" in a frame of 250 BCLKs of 12 MHz.
+ *
+ * The amp's description in the ADT is the J575c's (M4 Max Mac Studio), but
+ * on these machines the speaker is fed through the AOP, and no voltage or
+ * current sense from it has been seen to reach the AP. With no sense there
+ * is no protection model to run, so the speaker has a fixed ceiling
+ * instead: its volume stays at or below the -20 dB safe level in every
+ * state (locked, unlocked or granted), the level every SN012776 Mac sits at
+ * before a protection daemon takes it, and there is no sense PCM for a
+ * daemon to take. If the sense turns out to reach the AP through the AOP,
+ * the J575 protection model can replace the ceiling.
+ */
+struct macaudio_platform_cfg macaudio_j775_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W,
+	.stereo = false,
+	.safe_vol = -20,
+	.spk_fixed_ceiling = true,
+	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
+	.spk_dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		       SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.spk_secondary_only = true,
+};
+
+/*
  * J813 (T8142, MacBook Air M5 13"): as on J873, the AOP firmware owns the
  * audio fabric and the CPU component is the T8152-style AOP audio driver.
  * The jack is a CS42L84 on "cout"; the speakers are four SN012776 (one
@@ -4445,6 +4475,10 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j773-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j873    AID48   sn012776    15      1x 1W    (AOP-fed, no protection) */
 	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
+	/* j775c   -       sn012776    -       1x 1W    (AOP-fed, no sense: fixed -20 dB ceiling) */
+	{ .compatible = "apple,j775c-macaudio", .data = &macaudio_j775_cfg },
+	/* j775d   -       sn012776    -       1x 1W    (AOP-fed, no sense: fixed -20 dB ceiling) */
+	{ .compatible = "apple,j775d-macaudio", .data = &macaudio_j775_cfg },
 	/* j813    AID?    sn012776    15      2x 1W+1T (AOP-fed, V/I sense) */
 	{ .compatible = "apple,j813-macaudio", .data = &macaudio_j813_cfg },
 	/* j815    AID43   sn012776    15      2x 2W+1T (AOP-fed, V/I sense) */

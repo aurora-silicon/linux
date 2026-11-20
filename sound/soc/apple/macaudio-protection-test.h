@@ -1029,18 +1029,14 @@ static void macaudio_spk_j700_does_not_ramp(struct kunit *test)
 }
 
 /* A fixed ceiling: the grant runs the amps at it, the ramp starts below it */
-static void macaudio_spk_fixed_ceiling(struct kunit *test)
+static void macaudio_test_fixed_ceiling(struct kunit *test,
+					const struct macaudio_platform_cfg *cfg)
 {
-	struct macaudio_platform_cfg *cfg = kunit_kzalloc(test, sizeof(*cfg), GFP_KERNEL);
-	const long ceiling = SN012776_DB(-15);
+	const long ceiling = SN012776_DB(cfg->safe_vol);
 	struct macaudio_test_vol *vol;
 	struct macaudio_test_spk t;
 	unsigned int i;
 
-	KUNIT_ASSERT_NOT_NULL(test, cfg);
-	*cfg = macaudio_j316_cfg;
-	cfg->safe_vol = -15;
-	cfg->spk_fixed_ceiling = true;
 	macaudio_test_spk_card(test, &t, cfg, SN012776_0DB);
 
 	/* The limit the lease leaves on the volumes (macaudio_spk_enter_lease()) */
@@ -1064,6 +1060,25 @@ static void macaudio_spk_fixed_ceiling(struct kunit *test)
 		KUNIT_EXPECT_LT(test, vol->hist[0], ceiling);
 	}
 	macaudio_test_expect_vols(test, &t, 0);
+}
+
+static void macaudio_spk_fixed_ceiling(struct kunit *test)
+{
+	struct macaudio_platform_cfg *cfg = kunit_kzalloc(test, sizeof(*cfg), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, cfg);
+	*cfg = macaudio_j316_cfg;
+	cfg->safe_vol = -15;
+	cfg->spk_fixed_ceiling = true;
+	macaudio_test_fixed_ceiling(test, cfg);
+}
+
+/* The Mac Studio M5 speaker, with no sense, never goes above -20 dB */
+static void macaudio_j775_fixed_ceiling(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, macaudio_j775_cfg.spk_fixed_ceiling);
+	KUNIT_EXPECT_EQ(test, macaudio_j775_cfg.safe_vol, -20);
+	macaudio_test_fixed_ceiling(test, &macaudio_j775_cfg);
 }
 
 struct macaudio_test_unlock {
@@ -1355,6 +1370,7 @@ static struct kunit_case macaudio_protection_cases[] = {
 	KUNIT_CASE(macaudio_spk_hard_withdrawals_do_not_ramp),
 	KUNIT_CASE(macaudio_spk_j700_does_not_ramp),
 	KUNIT_CASE(macaudio_spk_fixed_ceiling),
+	KUNIT_CASE(macaudio_j775_fixed_ceiling),
 	KUNIT_CASE(macaudio_spk_floor_waits_for_the_resume),
 	KUNIT_CASE(macaudio_spk_grant_needs_d0),
 	{}
