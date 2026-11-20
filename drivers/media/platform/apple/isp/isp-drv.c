@@ -689,7 +689,7 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 /* Preview only; processing and image quality need separate qualification. */
 static bool preview_26 = true;
 module_param(preview_26, bool, 0400);
-MODULE_PARM_DESC(preview_26, "Enable J613 preview on ISP firmware 26.6.2 (default: true; false disables)");
+MODULE_PARM_DESC(preview_26, "Enable the preview setup on J613 ISP firmware 26.6.2 and T8122 27.2 (default: true; false disables)");
 
 static const char * isp_fw2str(enum isp_firmware_version version)
 {
@@ -797,6 +797,18 @@ static bool isp_preview26_admitted(struct device *dev,
 		ISP_FIRMWARE_V_26_6_2;
 }
 
+/*
+ * T8122 firmware with compatibility version 27.2 takes the same preview
+ * setup as 26.6.2 (MBNR and the temporal filter off): with the full setup it
+ * accepts the stream but delivers no frames.
+ */
+static bool isp_preview27_admitted(struct device *dev,
+				   enum isp_firmware_version compat)
+{
+	return preview_26 && compat == ISP_FIRMWARE_V_27_2 &&
+	       of_device_is_compatible(dev->of_node, "apple,t8122-isp");
+}
+
 /* After a system sleep, see apple_isp_resume(). */
 static void apple_isp_resume_work(struct work_struct *work)
 {
@@ -860,6 +872,9 @@ static int apple_isp_probe(struct platform_device *pdev)
 					    "26.6.2 preview requires J613/T8122; preview_26=0 disables it\n");
 			goto free_isp;
 		}
+		isp->preview_26 = true;
+	} else if (isp->hw->fw_abi != ISP_FW_ABI_H17 &&
+		   isp_preview27_admitted(dev, isp->fw_compat)) {
 		isp->preview_26 = true;
 	}
 
