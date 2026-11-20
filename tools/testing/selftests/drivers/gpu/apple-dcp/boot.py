@@ -197,6 +197,14 @@ def t6041_v27_admission(root):
     selector_full = block(dcp_c, 'static enum dcp_firmware_version dcp_check_firmware_version(')
     cutoff = '\n\tret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);\n\tif (ret < 0)'
     selector = selector_full[:selector_full.index(cutoff)] + '\n\t(void)v14_board;\n\treturn DCP_FIRMWARE_UNKNOWN;\n}\n'
+    method_table = block(dcp_c, 'static enum dcp_firmware_version dcp_v27_method_table(')
+    # The J773g's admission, with its machine check as a flag: no of_machine_is_compatible()
+    # exists in this translation unit, so the T6041 helpers cannot depend on the machine.
+    t8132_h = (root / 'include/linux/soc/apple/t8132.h').read_text()
+    t8132_admission = block(t8132_h, 'static inline bool apple_t8132_dcpext_v27_2(')
+    assert t8132_admission.count('of_machine_is_compatible("apple,j773g")') == 1
+    t8132_admission = ('static bool machine_j773g;\n' +
+                       t8132_admission.replace('of_machine_is_compatible("apple,j773g")', 'machine_j773g'))
     return r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -300,7 +308,7 @@ static int dcp_read_fw_version(struct device *dev, const char *name, char *out)
     snprintf(out, DCP_FW_VERSION_STR_LEN, "%u.%u.%u", v[0], v[1], v[2]);
     return 3;
 }
-''' + helper + '\n' + methods_decl + '\n' + v27_tables + '\n' + selector + r'''
+''' + helper + '\n' + methods_decl + '\n' + v27_tables + '\n' + t8132_admission + '\n' + method_table + '\n' + selector + r'''
 static struct device_node node;
 static struct apple_dcp_hw_data hw_t6041;
 static struct device dev = { .of_node = &node, .hw = &hw_t6041 };
@@ -391,9 +399,49 @@ int main(void)
         t8132_firmware_path = false;
         assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
     }
+
+    /*
+     * The Mac mini's (J773g) dcpext handed over with the T8132 27.2 image runs
+     * the 27.2 table; nothing else of T8132 does, whatever the firmware path.
+     */
+    reset_t6041_26b123(true);
+    node.compatible = "apple,t8132-dcpext";
+    node.uuid = APPLE_T8132_DCP_26B123_UUID;
+    assert(!apple_t6041_dcpext_v27_2(&node));
+    for (unsigned path = 0; path < 2; path++) {
+        t8132_firmware_path = path;
+        machine_j773g = true;
+        assert(apple_t8132_dcpext_v27_2(&node));
+        assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
+        /* Another M4 Mac (J713, J604): the M4 backend's, as before. */
+        machine_j773g = false;
+        assert(!apple_t8132_dcpext_v27_2(&node));
+        assert(dcp_check_firmware_version(&dev) == (path ? DCP_FIRMWARE_M4 : DCP_FIRMWARE_UNKNOWN));
+    }
+    t8132_firmware_path = false;
+    machine_j773g = true;
+    /* The internal DCP is never admitted: macOS parks it; aura hands it to nobody. */
+    node.compatible = "apple,t8132-dcp";
+    assert(!apple_t8132_dcpext_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    /* The T6041 image, a missing or second UUID, and other releases are refused. */
+    node.compatible = "apple,t8132-dcpext";
+    node.uuid = APPLE_T6041_DCP_26B123_UUID;
+    assert(!apple_t8132_dcpext_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    node.uuid = APPLE_T8132_DCP_26B123_UUID;
+    node.uuid_count = 0; assert(!apple_t8132_dcpext_v27_2(&node));
+    node.uuid_count = 2; assert(!apple_t8132_dcpext_v27_2(&node));
+    node.uuid_count = 1;
+    node.compat[1] = 0; assert(!apple_t8132_dcpext_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    node.compat[1] = 2; node.fw[2] = 1; assert(!apple_t8132_dcpext_v27_2(&node));
+    node.fw[2] = 0; assert(apple_t8132_dcpext_v27_2(&node));
+    machine_j773g = false;
+
     dev.hw = &hw_t6041;
     puts("PASS T6041 26B123 v27.2 internal/external admission, refusal controls, and desktop 26.x preservation");
-    puts("PASS T8132 M4 backend only on its firmware path");
+    puts("PASS T8132 M4 backend only on its firmware path; the J773g dcpext on 27.2 alone runs the 27.2 table");
     return 0;
 }
 '''

@@ -5309,14 +5309,37 @@ static int dcp_read_fw_version(struct device *dev, const char *name,
 	return len;
 }
 
+/*
+ * Firmware 27, if firmware-compat @compat_str has a 27.x method table with an
+ * ID for every method the driver calls: the firmware panics on an unknown tag.
+ */
+static enum dcp_firmware_version dcp_v27_method_table(struct device *dev,
+							const char *compat_str)
+{
+	const struct dcp_method_entry *methods = iomfb_v27_methods(compat_str);
+	unsigned int num_missing;
+	const char *missing;
+
+	if (!methods) {
+		dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
+			compat_str);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+	missing = iomfb_v27_missing_method(methods, &num_missing);
+	if (missing) {
+		dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
+			compat_str, num_missing, missing);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+	return DCP_FIRMWARE_V_27_0;
+}
+
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(dev);
 	const struct dcp_v14_board *v14_board;
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
-	unsigned int num_missing;
-	const char *missing;
 	int ret;
 
 	/*
@@ -5331,21 +5354,32 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 			return DCP_FIRMWARE_V_27_0;
 	}
 
+	/*
+	 * T8132 external processors: the Mac mini's (J773g) on macOS 27.2
+	 * (26B123), handed over as the T6041's 27.2 ones are, run the
+	 * firmware-27 backend with the 27.2 method table, as on T6041; any
+	 * other is the M4 backend's (below). Both need
+	 * CONFIG_DRM_APPLE_DCP_T8132, which matches the T8132 nodes.
+	 *
+	 * ASSUMED, NOT TRACED: the T8132 26B123 image (B3BA603C) numbers its
+	 * IOMFB methods as the T6041 (964EDE5B) and T8142 26B123 images do
+	 * (dcp_methods_27_2), and calls the same D-callbacks. A trace of macOS
+	 * 27.2 driving the mini's dcpext0 has to confirm the A4xx/A5xx IDs
+	 * before this is relied on.
+	 */
+	if (apple_t8132_dcpext_v27_2(dev->of_node)) {
+		/* Checked by apple_t8132_dcpext_v27_2(). */
+		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		return dcp_v27_method_table(dev, compat_str);
+	}
+
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret < 0 || !iomfb_v27_methods(compat_str)) {
-			dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
-				ret < 0 ? "missing" : compat_str);
+		if (ret < 0) {
+			dev_err(dev, "DCP firmware-compat missing has no 27.x method table\n");
 			return DCP_FIRMWARE_UNKNOWN;
 		}
-		missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
-						   &num_missing);
-		if (missing) {
-			dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
-				compat_str, num_missing, missing);
-			return DCP_FIRMWARE_UNKNOWN;
-		}
-		return DCP_FIRMWARE_V_27_0;
+		return dcp_v27_method_table(dev, compat_str);
 	}
 
 	/*
@@ -5386,21 +5420,8 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		    (!strcmp(fw_str, "26.5.2") || !strcmp(fw_str, "26.6.2")))
 			return DCP_FIRMWARE_V_26_6_DESKTOP;
 		if (apple_t6041_dcp_v27_2(dev->of_node) ||
-		    apple_t6041_dcpext_v27_2(dev->of_node)) {
-			if (!iomfb_v27_methods(compat_str)) {
-				dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
-					compat_str);
-				return DCP_FIRMWARE_UNKNOWN;
-			}
-			missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
-							   &num_missing);
-			if (missing) {
-				dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
-					compat_str, num_missing, missing);
-				return DCP_FIRMWARE_UNKNOWN;
-			}
-			return DCP_FIRMWARE_V_27_0;
-		}
+		    apple_t6041_dcpext_v27_2(dev->of_node))
+			return dcp_v27_method_table(dev, compat_str);
 		dev_err(dev, "T6041 display not started: unsupported DCP firmware %s (compat %s)\n",
 			ret >= 0 ? fw_str : "missing",
 			compat_ret >= 0 ? compat_str : "missing");
@@ -6090,15 +6111,17 @@ static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when);
 
 /*
  * The external processors whose failure must not take the DRM device down:
- * T8122's, T6041's and T6050's dcpext. One that fails to probe or bind joins
- * as an unusable pipe (ext_dead), and the other displays go on without it.
+ * T8122's, T6041's and T6050's dcpext, and the J773g's on 27.2. One that
+ * fails to probe or bind joins as an unusable pipe (ext_dead), and the other
+ * displays go on without it.
  * With every processor failed the DRM device has no pipe and does not bind.
  */
 static bool dcp_ext_is_failsafe(struct device_node *np)
 {
 	return of_device_is_compatible(np, "apple,t8122-dcpext") ||
 	       of_device_is_compatible(np, "apple,t6041-dcpext") ||
-	       of_device_is_compatible(np, "apple,t6050-dcpext");
+	       of_device_is_compatible(np, "apple,t6050-dcpext") ||
+	       apple_t8132_dcpext_v27_2(np);
 }
 
 /*
@@ -6500,6 +6523,32 @@ static void dcp_t8132_ext_routes(struct apple_dcp *dcp)
 
 static int dcp_s2r_pm_register(struct apple_dcp *dcp);
 
+/*
+ * T8132 (Mac mini, J773g) external processor on firmware 27.2, admitted by
+ * dcp_check_firmware_version(): what the T6041 dcpext gets on that firmware
+ * (see dcp_platform_probe_pipe()), whatever hw data the compatible matched.
+ * - firmware_dma_bits 41: its firmware DART's window (ADT dart-dcpext0
+ *   vm-base 1 TiB, vm-size-23 64 GiB; apple,dma-range <0x100 0 0x10 0>)
+ *   ends at 1 TiB + 64 GiB, which takes 41 bits, as on T6041.
+ * - num_dptx_ports 2: the dcpdptx-port-epic units 0 and 1 every external
+ *   processor of this generation has (T6041's, and T8132's own on the M4
+ *   path); the fixed HDMI port is unit 0.
+ * - adopt_live_session: iBoot leaves it running with the 27.2 image
+ *   loaded (ADT pre-loaded = running = 1), as the boot loader hands it
+ *   over; Linux never starts its CPU.
+ * - sink_metadata_edid: the display it finds at boot is its first sink,
+ *   as on the T6041 dcpext.
+ * No sleep support: neither a firmware-27 sleep nor a link release has run
+ * on this processor.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext_v27 = {
+	.firmware_dma_bits = 41,
+	.num_dptx_ports = 2,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_V_27_0,
+	.sink_metadata_edid = true,
+};
+
 static int dcp_platform_probe_pipe(struct platform_device *pdev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
@@ -6650,6 +6699,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp->hw.adopt_live_session = true;
 		dcp->hw.sink_metadata_edid = true;
 	}
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t8132-dcpext"))
+		dcp->hw = apple_dcp_hw_t8132_dcpext_v27;
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
 		dcp_desktop_metadata_new_sink(dcp);
@@ -9092,7 +9144,10 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	{ .compatible = "apple,t8132-dcp", .data = &apple_dcp_hw_t8132, },
-	/* Same firmware as the internal DCP; adopted from the boot loader. */
+	/*
+	 * Same firmware as the internal DCP; adopted from the boot loader. The
+	 * J773g's on 27.2 is a firmware-27 pipe (apple_dcp_hw_t8132_dcpext_v27).
+	 */
 	{ .compatible = "apple,t8132-dcpext", .data = &apple_dcp_hw_t8132_dcpext, },
 #endif
 	{ .compatible = "apple,t6030-dcp", .data = &apple_dcp_hw_t6030, },
