@@ -8,11 +8,17 @@
 
 static void v27_3_tags_test(struct kunit *test)
 {
-	const struct dcp_method_entry *m = iomfb_v27_methods("27.3.0");
-	const struct dcp_method_entry *old = iomfb_v27_methods("27.0.0");
+	const struct iomfb_v27_build *build = iomfb_v27_methods("27.3.0");
+	const struct iomfb_v27_build *previous = iomfb_v27_methods("27.0.0");
+	const struct dcp_method_entry *m, *old;
 
-	KUNIT_ASSERT_NOT_NULL(test, m);
-	KUNIT_ASSERT_NOT_NULL(test, old);
+	KUNIT_ASSERT_NOT_NULL(test, build);
+	KUNIT_ASSERT_NOT_NULL(test, previous);
+	m = build->methods;
+	old = previous->methods;
+	KUNIT_EXPECT_EQ(test, build->swap_req_size, DCP_V27_3_REQ_SIZE);
+	KUNIT_EXPECT_EQ(test, previous->swap_req_size, 0);
+	KUNIT_EXPECT_NULL(test, iomfb_v27_methods("27.3.1"));
 	KUNIT_EXPECT_MEMEQ(test, m[dcpep_swap_start].tag, "A456", 4);
 	KUNIT_EXPECT_MEMEQ(test, m[dcpep_swap_submit].tag, "A458", 4);
 	KUNIT_EXPECT_MEMEQ(test, m[dcpep_set_display_device].tag, "A461", 4);

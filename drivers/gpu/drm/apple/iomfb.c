@@ -1238,7 +1238,7 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 			     u32 out_len, void *data, dcp_callback_t cb, void *cookie)
 {
 	struct dcp_method_entry resolved = *call;
-	u8 *swap_27_3 = NULL;
+	bool expand_swap = false;
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
 	/* A KUnit test answers for the firmware. */
@@ -1256,16 +1256,10 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 		memcpy(resolved.tag, call->tag_h17g, sizeof(resolved.tag));
 	if (dcp_is_ext26(dcp) && call->tag_ext26[0])
 		memcpy(resolved.tag, call->tag_ext26, sizeof(resolved.tag));
-	if (dcp->swap_v27_3 && in_len == DCP_V27_REQ_SIZE &&
+	if (dcp->v27_build && dcp->v27_build->swap_req_size && in_len == DCP_V27_REQ_SIZE &&
 	    !memcmp(call->tag, dcp->v27_methods[dcpep_swap_submit].tag, sizeof(call->tag))) {
-		swap_27_3 = kmalloc(DCP_V27_3_REQ_SIZE, GFP_ATOMIC);
-		if (!swap_27_3) {
-			WRITE_ONCE(dcp->crashed, true);
-			return;
-		}
-		dcp_v27_3_swap_req(swap_27_3, data);
-		data = swap_27_3;
-		in_len = DCP_V27_3_REQ_SIZE;
+		expand_swap = true;
+		in_len = dcp->v27_build->swap_req_size;
 	}
 	call = &resolved;
 
@@ -1293,7 +1287,6 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 			       DCP_PACKET_ALIGNMENT))) {
 		dev_err(dcp->dev, "invalid IOMFB command envelope\n");
 		WRITE_ONCE(dcp->crashed, true);
-		kfree(swap_27_3);
 		return;
 	}
 	depth = dcp_push_depth(&ch->depth);
@@ -1305,9 +1298,10 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 
 	memcpy(out, &header, sizeof(header));
 
-	if (in_len > 0)
+	if (expand_swap)
+		dcp_v27_3_swap_req(out_data, data);
+	else if (in_len)
 		memcpy(out_data, data, in_len);
-	kfree(swap_27_3);
 	/* An unwritten status must not look like a successful response. */
 	if (out_len && dcp->push_out_prefill)
 		memcpy(out_data + in_len, dcp->push_out_prefill, out_len);
@@ -2109,9 +2103,11 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	}
 
 	tag = dcp_parse_tag(hdr->tag);
-	/* 27.3 reports the intent-gated swap completion (27.0 D596, in 20 out 0) as D590 */
-	if (dcp->swap_v27_3 && tag == 590 && hdr->in_len == 0x14 && !hdr->out_len)
-		tag = 596;
+	if (dcp->v27_build && dcp->v27_build->callback_to &&
+	    tag == dcp->v27_build->callback_from &&
+	    hdr->in_len == dcp->v27_build->callback_in_len &&
+	    hdr->out_len == dcp->v27_build->callback_out_len)
+		tag = dcp->v27_build->callback_to;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    (!iomfb_check_callback_v26_6_desktop(tag, hdr->in_len, hdr->out_len) ||
