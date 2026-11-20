@@ -1878,7 +1878,7 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 		return apple_cio_pcie_tunnel_ready_locked(acio);
 	if (!acio->pcie_tunnel_preinitialized)
 		return dev_err_probe(acio->dev, -ENODEV,
-				     "PCIe-C is not initialized by m1n1 or the kernel\n");
+				     "PCIe-C is not initialized by aura or the kernel\n");
 
 	if (acio->pd_list->num_pds < 4 || !acio->pd_list->pd_links[3])
 		return dev_err_probe(acio->dev, -ENODEV,
@@ -4546,7 +4546,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 				acio->pcie_tunnel_np);
 		if (!acio->pcie_tunnel_preinitialized) {
 			dev_info(dev,
-				 "PCIe-C tunnel disabled: not initialized by m1n1 or the kernel\n");
+				 "PCIe-C tunnel disabled: not initialized by aura or the kernel\n");
 		} else {
 			ret = apple_cio_map_pcie_intr2axi(acio);
 			if (ret)
