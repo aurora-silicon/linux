@@ -46,11 +46,6 @@ pub(crate) enum RootProfile {
     /// The M5 graph of the macOS 27.2 firmware (26B123): the 26A428 graph with a larger power
     /// policy and status config ([`ABI_ALLOCATION_SIZES_26B123_M5`]).
     J714G17S26B123,
-
-    /// The M5 graph of the macOS 27.3 beta 1 firmware (26C5035r): the 26B123 graph with one more
-    /// HW data word ([`M5_26C5035_HW_DATA_BANDS`]). It takes the same interface version word as
-    /// 26B123's, so only the firmware's identity tells them apart.
-    J714G17S26C5035,
 }
 
 impl RootProfile {
@@ -60,7 +55,6 @@ impl RootProfile {
         match layouts {
             M5Layouts::V26A428 => Self::J714G17S26A428,
             M5Layouts::V26B123 => Self::J714G17S26B123,
-            M5Layouts::V26C5035 => Self::J714G17S26C5035,
         }
     }
 
@@ -69,7 +63,6 @@ impl RootProfile {
         match self {
             Self::J714G17S26A428 => Some(&M5_LAYOUT_26A428),
             Self::J714G17S26B123 => Some(&M5_LAYOUT_26B123),
-            Self::J714G17S26C5035 => Some(&M5_LAYOUT_26C5035),
             Self::J700G17P
             | Self::J813G17G25G76
             | Self::J873G18G26A428
@@ -84,7 +77,7 @@ impl RootProfile {
             Self::J873G18G26A428 => COMMON26_INITDATA_VERSION_WORD,
             Self::J873G18G26B123 => COMMON26B123_INITDATA_VERSION_WORD,
             Self::J714G17S26A428 => M5_INITDATA_VERSION_WORD,
-            Self::J714G17S26B123 | Self::J714G17S26C5035 => M5_26B123_INITDATA_VERSION_WORD,
+            Self::J714G17S26B123 => M5_26B123_INITDATA_VERSION_WORD,
         }
     }
 
@@ -101,15 +94,14 @@ impl RootProfile {
             Self::J700G17P
             | Self::J813G17G25G76
             | Self::J714G17S26A428
-            | Self::J714G17S26B123
-            | Self::J714G17S26C5035 => None,
+            | Self::J714G17S26B123 => None,
         }
     }
 
     pub(crate) const fn root_size(self, role: InstanceRole) -> usize {
         match self {
             Self::J873G18G26A428 | Self::J873G18G26B123 => COMMON26_ROOT_SIZE,
-            Self::J714G17S26A428 | Self::J714G17S26B123 | Self::J714G17S26C5035 => M5_ROOT_SIZE,
+            Self::J714G17S26A428 | Self::J714G17S26B123 => M5_ROOT_SIZE,
             Self::J700G17P | Self::J813G17G25G76 => root_size(role),
         }
     }
@@ -123,11 +115,11 @@ impl RootProfile {
                 COMMON26_CONTROL_OPENING_OPCODE_SECONDARY
             }
             (
-                Self::J714G17S26A428 | Self::J714G17S26B123 | Self::J714G17S26C5035,
+                Self::J714G17S26A428 | Self::J714G17S26B123,
                 InstanceRole::Primary,
             ) => M5_CONTROL_OPENING_OPCODE_PRIMARY,
             (
-                Self::J714G17S26A428 | Self::J714G17S26B123 | Self::J714G17S26C5035,
+                Self::J714G17S26A428 | Self::J714G17S26B123,
                 InstanceRole::Secondary,
             ) => M5_CONTROL_OPENING_OPCODE_SECONDARY,
             (_, InstanceRole::Primary) => CONTROL_OPENING_OPCODE_PRIMARY,
@@ -140,8 +132,7 @@ impl RootProfile {
             Self::J873G18G26A428
             | Self::J873G18G26B123
             | Self::J714G17S26A428
-            | Self::J714G17S26B123
-            | Self::J714G17S26C5035 => None,
+            | Self::J714G17S26B123 => None,
             Self::J700G17P | Self::J813G17G25G76 => Some(CONTROL_OPENING_PRIMARY_REGISTER_OPCODE),
         }
     }
@@ -175,8 +166,7 @@ impl RootProfile {
             Self::J700G17P
             | Self::J813G17G25G76
             | Self::J714G17S26A428
-            | Self::J714G17S26B123
-            | Self::J714G17S26C5035 => REGION_VIEW_LOW_ADDRS,
+            | Self::J714G17S26B123 => REGION_VIEW_LOW_ADDRS,
         }
     }
 
@@ -208,7 +198,6 @@ impl RootProfile {
         match self {
             Self::J714G17S26A428 => Some(M5Layouts::V26A428),
             Self::J714G17S26B123 => Some(M5Layouts::V26B123),
-            Self::J714G17S26C5035 => Some(M5Layouts::V26C5035),
             _ => None,
         }
     }
@@ -216,7 +205,7 @@ impl RootProfile {
     /// Status-config layout of the M5 graph built for this profile.
     pub(crate) const fn m5_status_config(self) -> &'static M5StatusConfigMap {
         match self {
-            Self::J714G17S26B123 | Self::J714G17S26C5035 => &M5_26B123_STATUS_CONFIG,
+            Self::J714G17S26B123 => &M5_26B123_STATUS_CONFIG,
             Self::J700G17P
             | Self::J813G17G25G76
             | Self::J873G18G26A428
@@ -983,8 +972,7 @@ pub(crate) fn encode_main_config_for_profile(
                 RootProfile::J813G17G25G76 => 0xc,
 
                 RootProfile::J873G18G26A428 | RootProfile::J873G18G26B123
-                | RootProfile::J714G17S26A428 | RootProfile::J714G17S26B123
-                | RootProfile::J714G17S26C5035 => COMMON26_MAIN_SECONDARY_KIND,
+                | RootProfile::J714G17S26A428 | RootProfile::J714G17S26B123 => COMMON26_MAIN_SECONDARY_KIND,
             });
             if profile == RootProfile::J714G17S26A428 {
 
@@ -2652,38 +2640,10 @@ pub(crate) const M5_GRAPH_26B123: Graph = Graph {
     power_assert_tally: super::power::POWER_ASSERT_TALLY,
 };
 
-/// The M5 graph of the macOS 27.3 beta 1 (26C5035r) firmware build: 26B123's, with one more HW
-/// data word ([`M5_26C5035_HW_DATA_BANDS`]) and the same interface version word, so only the
-/// firmware's identity tells them apart.
-pub(crate) const M5_GRAPH_26C5035: Graph = Graph {
-    profile: RootProfile::J714G17S26C5035,
-    private: M5_PRIVATE_LAYOUT,
-    shared: M5_SHARED_LAYOUT,
-    policy_size: M5_26B123_POLICY_SIZE,
-    bundle_view_offsets: M5_BUNDLE_VIEW_OFFSETS,
-    bundle_view_extents: M5_BUNDLE_VIEW_EXTENTS,
-    work_ring_offsets: M5_WORK_RING_BUNDLE_OFFSETS,
-    state_grids: M5_PRIVATE_STATE_GRIDS,
-    power_assert_tally: super::power::POWER_ASSERT_TALLY,
-};
-
 /// The J714 on its macOS 27.2 (26B123) firmware: the same board on the larger-policy M5 graph.
 pub(crate) const J714_26B123: Board = Board {
     graph: &M5_GRAPH_26B123,
     ..J714
-};
-
-/// The J714 on the macOS 27.3 beta 1 (26C5035r) firmware: the 26B123 graph with one more HW data
-/// word ([`M5_26C5035_HW_DATA_BANDS`]).
-pub(crate) const J714_26C5035: Board = Board {
-    graph: &M5_GRAPH_26C5035,
-    ..J714
-};
-
-/// The M5 Max on the macOS 27.3 beta 1 (26C5035r) firmware: the J716C on the same build's graph.
-pub(crate) const J716C_26C5035: Board = Board {
-    graph: &M5_GRAPH_26C5035,
-    ..J716C
 };
 
 const _: () = {
@@ -3752,7 +3712,7 @@ pub(crate) fn encode_m5_policy_controller_defaults_j775d(out: &mut [u8]) -> Resu
     Ok(())
 }
 
-/// Status config 26A428 -> 26B123 (macOS 27.2; 27.3 beta 1 has the same layout), in 26A428
+/// Status config 26A428 -> 26B123 (macOS 27.2), in 26A428
 /// offsets. The status config grows from 0x780 to 0x790 bytes (allocation size table entry 13).
 ///
 /// From +0x5b4 the object holds two controller blocks, at +0x5b4 and +0x610, of 0x5c bytes
@@ -3779,11 +3739,11 @@ pub(crate) const M5_26B123_STATUS_CONFIG_SIZE: usize =
 pub(crate) const M5_26B123_STATUS_CONFIG_INSERTED: &[(usize, u32)] =
     &[(0x5dc, 0), (0x60c, 5000), (0x640, 0), (0x670, 0)];
 
-/// The interface version word, at root+0, of the 27.2 (26B123) and 27.3 beta 1 (26C5035r) M5
+/// The interface version word, at root+0, of the 27.2 (26B123) M5
 /// firmware: the 26A428 word with bit 46 set. It is not yet confirmed from captured InitData.
 pub(crate) const M5_26B123_INITDATA_VERSION_WORD: u64 = 0x0c8e_4339_8728_04c0;
 
-/// The allocation size table of the 27.2 (26B123) and 27.3 beta 1 (26C5035r) M5 firmware, indexed
+/// The allocation size table of the 27.2 (26B123) M5 firmware, indexed
 /// like [`ABI_ALLOCATION_SIZES_26A428_M5`]. Only two entries differ from it: the power policy
 /// (index 4, 0x126b0 -> 0x12728) and the status config (index 13, 0x780 -> 0x790). The sizes are
 /// not yet confirmed from captured InitData.
@@ -3792,20 +3752,6 @@ pub(crate) const ABI_ALLOCATION_SIZES_26B123_M5: [usize; 24] = [
     0x0030, 0xe730, 0x0790, 0x0020, 0x01b0, 0x4800, 0x28800, 0x79800, 0x9000, 0x00a8, 0x0008,
     0x1ca0, 0x00e4,
 ];
-
-/// The HW data of the 27.3 beta 1 firmware (26C5035r) is 26A428's with one u32 inserted at 0x2720
-/// ([`M5_26C5035_HW_FORCED_IDLE_TIMEOUT`]): every later field moves by 4 (the kick-shared pointer
-/// from 0x27dc to 0x27e0, the last moved word from 0x2846 to 0x284a), and the four zero bytes past
-/// 0x284c fall off the end. The layout is not yet confirmed from captured InitData.
-pub(crate) const M5_26C5035_HW_DATA_BANDS: &[LayoutBand] = &[
-    band(0x0000, 0x2720, 0, Evidence::Inferred),
-    band(0x2720, 0x284c, 4, Evidence::Inferred),
-];
-
-/// The 26C5035r HW data word for the time the GPU may take to reach a forced idle after a sleep
-/// request, ms; 0 disables the wait. 26A428 and 26B123 HW data have no such word. Its meaning and
-/// the value written to it are not yet confirmed from captured InitData.
-pub(crate) const M5_26C5035_HW_FORCED_IDLE_TIMEOUT: usize = 0x2720;
 
 /// The forced-idle wait written to the HW data, in seconds (5000 ms). The value is not yet
 /// confirmed from captured InitData.
@@ -3923,16 +3869,6 @@ pub(crate) const M5_LAYOUT_26A428: M5Layout =
 pub(crate) const M5_LAYOUT_26B123: M5Layout =
     M5Layout::new(ABI_ALLOCATION_SIZES_26B123_M5, &[], &[]);
 
-/// The 27.3 beta 1 (26C5035r) M5 layout.
-pub(crate) const M5_LAYOUT_26C5035: M5Layout = M5Layout::new(
-    ABI_ALLOCATION_SIZES_26B123_M5,
-    M5_26C5035_HW_DATA_BANDS,
-    &[(
-        M5_26C5035_HW_FORCED_IDLE_TIMEOUT,
-        m5_forced_idle_timeout_ms(M5_GPU_TIMEOUT_SECONDS),
-    )],
-);
-
 /// Submission-history period and slot count (two u64), its generation word and its per-slot
 /// bytes in the status config, at 26A428 offsets.
 pub(crate) const M5_STATUS_CONFIG_HISTORY: usize = 0x73c;
@@ -3979,7 +3915,7 @@ pub(crate) const M5_26B123_STATUS_CONFIG: M5StatusConfigMap = M5StatusConfigMap 
     inserted: M5_26B123_STATUS_CONFIG_INSERTED,
 };
 
-/// Power policy 26A428 -> 26B123 (macOS 27.2; 27.3 beta 1 has the same layout), in 26A428
+/// Power policy 26A428 -> 26B123 (macOS 27.2), in 26A428
 /// offsets. The policy grows from 0x126b0 to 0x12728 bytes (allocation size table entry 4); five
 /// inserts move the words above them:
 ///
@@ -4301,32 +4237,15 @@ const _: () = {
     }
 };
 
-/// The HW data of the 27.3 beta 1 firmware (26C5035r) is 26A428's with one u32 inserted at 0x2720
-/// ([`M5_26C5035_HW_FORCED_IDLE_TIMEOUT`]): every later field moves by 4 (the kick-shared pointer
-/// from 0x27dc to 0x27e0, the last moved word from 0x2846 to 0x284a), and the four zero bytes past
-/// 0x284c fall off the end. The layout is not yet confirmed from captured InitData.
-
 const _: () = {
     // The bundle and the private cluster keep the sizes of their fixed windows.
     assert!(M5_LAYOUT_26B123.shared.total == M5_LAYOUT_26A428.shared.total);
     assert!(M5_LAYOUT_26B123.private.total == M5_LAYOUT_26A428.private.total);
-    // The kick-shared pointer and the last word the 26C5035r layout moves.
+    // The kick-shared pointer offset.
     let kick = M5_KICK_SHARED_POINTER;
     assert!(matches!(
         M5_LAYOUT_26A428.hw_data_offset(kick),
         Some(0x27dc)
-    ));
-    assert!(matches!(
-        M5_LAYOUT_26C5035.hw_data_offset(kick),
-        Some(0x27e0)
-    ));
-    assert!(matches!(
-        M5_LAYOUT_26C5035.hw_data_offset(0x2846),
-        Some(0x284a)
-    ));
-    assert!(matches!(
-        M5_LAYOUT_26C5035.hw_data_offset(0x271c),
-        Some(0x271c)
     ));
 };
 
@@ -4334,7 +4253,7 @@ const _: () = {
     use super::super::variant::M5Layouts;
     // Every M5 build's policy map and status-config map fill the allocations of its size table,
     // and the policy starts where the encoders write its 26A428 form.
-    let builds = [M5Layouts::V26A428, M5Layouts::V26B123, M5Layouts::V26C5035];
+    let builds = [M5Layouts::V26A428, M5Layouts::V26B123];
     let mut index = 0;
     while index < builds.len() {
         let profile = RootProfile::for_m5_layouts(builds[index]);

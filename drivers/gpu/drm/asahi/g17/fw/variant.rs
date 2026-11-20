@@ -28,9 +28,7 @@ pub(crate) enum InitAck {
 }
 
 /// The InitData layouts of an M5 firmware build ([`super::m5::initdata`]). The 27.2 and later
-/// layouts are not yet confirmed from captured InitData. Observed so far: the 27.3 beta 1
-/// firmware (26C5035r) on a J716s acknowledged the primary and secondary InitData built with the
-/// `V26C5035` layouts and ran without a coprocessor fault; the 27.2 firmware has not run.
+/// layouts are not yet confirmed from captured InitData.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum M5Layouts {
     /// The 26A428 graph: version word 0x0c8e_0339_8728_04c0 and its allocation sizes.
@@ -38,9 +36,6 @@ pub(crate) enum M5Layouts {
     /// The 27.2 (26B123) graph: version word 0x0c8e_4339_8728_04c0, a larger power policy
     /// (0x12728) and status config (0x790), the 26A428 HW data.
     V26B123,
-    /// The 27.3 beta 1 (26C5035r) graph: 26B123's, the same version word included, with a HW
-    /// data word inserted at 0x2720. Only the firmware's identity tells it from 26B123.
-    V26C5035,
 }
 
 /// The initialization graph of a firmware build.

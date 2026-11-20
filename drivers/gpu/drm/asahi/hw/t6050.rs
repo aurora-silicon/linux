@@ -45,37 +45,10 @@ pub(crate) const CONFIG: Config = Config {
     gpu_generation: GpuGen::G17,
     // The firmware in `fw-text` must be one of these builds. iBoot loads the G17S build of both
     // roles back to back: the primary's text at 0x50000 of `fw-text`, then the secondary's at
-    // 0x54000, with the same entropy records and boot-filled ranges as the M5 Max (27.2 and 27.3
-    // move the primary's records by a few bytes). Each digest is that of the firmware's text with
+    // 0x54000, with the same entropy records and boot-filled ranges as the M5 Max (27.2
+    // moves the primary's records by a few bytes). Each digest is that of the firmware's text with
     // those ranges zeroed, a loaded copy normalizing to it on every boot. Newest first.
     firmware: crate::g17::fw::variant::Firmware::Identified(&[
-        crate::g17::fw::variant::Build {
-            os_version: [27, 3, 0],
-            name: "27.3 (26C5035r), G17S",
-            images: &[crate::fwid::FirmwareBuild {
-                name: "26C5035r for T6050 G17S, primary then secondary",
-                text_size: 0xa4000,
-                data_size: 0x184000,
-                entropy: &[[0x49eac, 0x49f8f], [0x9d92c, 0x9da0f]],
-                boot_filled: &[
-                    (0x224, 4),
-                    (0x23c, 8),
-                    (0x4976c, 0x740),
-                    (0x49eac, 0x231),
-                    (0x50224, 4),
-                    (0x5023c, 8),
-                    (0x9d1ec, 0x740),
-                    (0x9d92c, 0x231),
-                ],
-                text_sha256: [
-                    0xb5, 0x53, 0x7c, 0x8f, 0x06, 0xbd, 0x19, 0xeb, 0xf0, 0xef, 0xd0, 0xcb, 0xfb,
-                    0x65, 0x52, 0x33, 0x9a, 0x10, 0xd4, 0xaf, 0xc4, 0xed, 0xa9, 0xd2, 0x1c, 0xbe,
-                    0xdc, 0x36, 0x66, 0x76, 0x36, 0x00,
-                ],
-            }],
-            variant: &crate::g17::fw::variant::V26A428_M5,
-            config: Some(&CONFIG_26C5035),
-        },
         crate::g17::fw::variant::Build {
             os_version: [27, 2, 0],
             name: "27.2 (26B123), G17S",
@@ -174,8 +147,8 @@ pub(crate) const CONFIG_26B123: Config = Config {
     gpu_generation: GpuGen::G17,
     // The firmware in `fw-text` must be one of these builds. iBoot loads the G17S build of both
     // roles back to back: the primary's text at 0x50000 of `fw-text`, then the secondary's at
-    // 0x54000, with the same entropy records and boot-filled ranges as the M5 Max (27.2 and 27.3
-    // move the primary's records by a few bytes). Each digest is that of the firmware's text with
+    // 0x54000, with the same entropy records and boot-filled ranges as the M5 Max (27.2
+    // moves the primary's records by a few bytes). Each digest is that of the firmware's text with
     // those ranges zeroed, a loaded copy normalizing to it on every boot. Newest first.
 
 
@@ -232,33 +205,6 @@ pub(crate) const CONFIG_MAX: Config = Config {
     // digests measured from the G17C text on the M5 Max.
     firmware: crate::g17::fw::variant::Firmware::Identified(&[
         crate::g17::fw::variant::Build {
-            os_version: [27, 3, 0],
-            name: "27.3 (26C5035r), G17C",
-            images: &[crate::fwid::FirmwareBuild {
-                name: "26C5035r for T6050 G17C, primary then secondary",
-                text_size: 0xa4000,
-                data_size: 0x184000,
-                entropy: &[[0x49eac, 0x49f8f], [0x9d92c, 0x9da0f]],
-                boot_filled: &[
-                    (0x224, 4),
-                    (0x23c, 8),
-                    (0x4976c, 0x740),
-                    (0x49eac, 0x231),
-                    (0x50224, 4),
-                    (0x5023c, 8),
-                    (0x9d1ec, 0x740),
-                    (0x9d92c, 0x231),
-                ],
-                text_sha256: [
-                    0x54, 0x3f, 0x7c, 0xf9, 0xbd, 0xa3, 0x72, 0xd9, 0xbc, 0x24, 0xb3, 0x40, 0x13,
-                    0xb0, 0x58, 0x54, 0x40, 0x9e, 0xce, 0xd9, 0xf8, 0x01, 0x93, 0x34, 0xf5, 0x09,
-                    0xce, 0x64, 0x72, 0xc9, 0xe9, 0x12,
-                ],
-            }],
-            variant: &crate::g17::fw::variant::V26A428_M5,
-            config: Some(&CONFIG_MAX_26C5035),
-        },
-        crate::g17::fw::variant::Build {
             os_version: [27, 0, 0],
             name: "27.0 (26A428), G17C",
             images: &[crate::fwid::FirmwareBuild {
@@ -297,114 +243,6 @@ pub(crate) const CONFIG_MAX: Config = Config {
 /// this board has run with: every table change written back, page-by-page TLB invalidation, and
 /// the handoff values its firmware expects (current slot 0xffff, the byte after the flush records
 /// 1, the lock never taken).
-/// CONFIG_26C5035: the M5 Pro configuration for the per-build override. Its build list is empty: the driver picks builds off the chip configuration and never reads them here, and an inherited list would make the const graph cyclic.
-pub(crate) const CONFIG_26C5035: Config = Config {
-    firmware: crate::g17::fw::variant::Firmware::Identified(&[]),
-    chip_id: 0x6050,
-    identity: Identity {
-        family: 0xb,
-        variant: 3,
-        num_dies: 1,
-        gpu_variant: GpuVariant::S,
-        usc_generation: 3,
-        hal_generation: 300,
-    },
-    uat_ias: 42,
-    uat_oas: 42,
-    // Both roles publish their kernel roots. The boot arguments iBoot writes into each role's
-    // TEXT give the primary's tables at `pagetables` (BPTP, the ADT gfx-shared-region) and the
-    // secondary's 0x40000 above it, 0x40000 each (SPTP).
-    secondary_root_offset: Some(0x40000),
-    // Each role places its own buffers. Its crash log goes in its __DATA_SHARED_RO, inside
-    // `fw-data`, as on the M5 Max, whose data segments have the same layout.
-    crash_buffers: CrashBuffers::FirmwareData,
-    profile: FirmwareProfile::M5PublishedRoots,
-    pm_metrics: None,
-    windows: &[],
-    reserved_slots: &[],
-    perf: None,
-    opps: 0,
-    // The M5 Max and Ultra's UAT policy, for the same firmware family.
-    uat_quirks: CONFIG_ULTRA.uat_quirks,
-    region_c: None,
-    chip: None,
-    m5: Some(&crate::g17::fw::m5::initdata::J714_26C5035),
-    adopt_root_entries: true,
-    fabric_bridge: false,
-    sleep_restart: false,
-    recovery_slot_keys: None,
-    gpu_generation: GpuGen::G17,
-    // The firmware in `fw-text` must be one of these builds. iBoot loads the G17S build of both
-    // roles back to back: the primary's text at 0x50000 of `fw-text`, then the secondary's at
-    // 0x54000, with the same entropy records and boot-filled ranges as the M5 Max (27.2 and 27.3
-    // move the primary's records by a few bytes). Each digest is that of the firmware's text with
-    // those ranges zeroed, a loaded copy normalizing to it on every boot. Newest first.
-
-
-    // Two clusters of ten cores. The buffers are sized for every core slot of the board, so the
-    // board's cluster and slot counts admit the GPU, whichever cores are fused off.
-    core_layout: CoreLayout {
-        cores: None,
-        alternate_core_masks: None,
-        operand_state: crate::g17::fw::compute::OperandState::TWO_BY_TEN,
-        deflake: crate::g17::fw::render::Deflake::TWO_CLUSTERS,
-        compute_blocks: crate::g17::fw::freelist::COMPUTE_BLOCKS,
-    },
-};
-
-/// CONFIG_MAX_26C5035: the M5 Max configuration for the per-build override. Its build list is empty: the driver picks builds off the chip configuration and never reads them here, and an inherited list would make the const graph cyclic.
-pub(crate) const CONFIG_MAX_26C5035: Config = Config {
-    firmware: crate::g17::fw::variant::Firmware::Identified(&[]),
-    chip_id: 0x6050,
-    identity: Identity {
-        family: 0xb,
-        variant: 4,
-        num_dies: 1,
-        gpu_variant: GpuVariant::C,
-        usc_generation: 3,
-        hal_generation: 300,
-    },
-    uat_ias: 42,
-    uat_oas: 42,
-    // Bare metal, as the M5 Ultra: both roles publish their kernel roots, the secondary's
-    // 0x40000 into `pagetables`, and each asks for its crash log inside `fw-data`.
-    secondary_root_offset: Some(0x40000),
-    crash_buffers: CrashBuffers::FirmwareData,
-    profile: FirmwareProfile::M5PublishedRoots,
-    pm_metrics: None,
-    windows: &[],
-    reserved_slots: &[],
-    perf: None,
-    opps: 0,
-    // The M5 Ultra's UAT policy, which this board's firmware expects too.
-    uat_quirks: CONFIG_ULTRA.uat_quirks,
-    region_c: None,
-    chip: None,
-    m5: Some(&crate::g17::fw::m5::initdata::J716C_26C5035),
-    adopt_root_entries: true,
-    fabric_bridge: false,
-    sleep_restart: false,
-    recovery_slot_keys: None,
-    gpu_generation: GpuGen::G17,
-    // As on the M5 Ultra, the firmware in `fw-text` must be this build. The boot loader loads
-    // the G17C build of both roles back to back: the primary's TEXT 0x50000, then the
-    // secondary's 0x54000. The digest is that of the firmware's TEXT with the boot-filled ranges
-    // zeroed.
-    // The G17C builds of the M5 Max, newest first; the same sizes as the G17S builds, the
-    // digests measured from the G17C text on the M5 Max.
-
-
-    // Four clusters of ten cores. The buffers are sized for every core slot of the board, so the
-    // board's cluster and slot counts admit the GPU, whichever cores are fused off.
-    core_layout: CoreLayout {
-        cores: None,
-        alternate_core_masks: None,
-        operand_state: crate::g17::fw::compute::OperandState::FOUR_BY_TEN,
-        deflake: crate::g17::fw::render::Deflake::FOUR_CLUSTERS,
-        compute_blocks: crate::g17::fw::freelist::COMPUTE_BLOCKS,
-    },
-};
-
 pub(crate) const CONFIG_ULTRA: Config = Config {
     chip_id: 0x6050,
     // Family 0xb (G17), variant 6 (G17D), revision 0x11.
