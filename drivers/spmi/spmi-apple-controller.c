@@ -515,14 +515,6 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 		 * pending for its unmask: it isn't a bad interrupt either.
 		 */
 		stray = val & ~spmi->irq_used[offset / sizeof(val)];
-		if (stray && !spmi->hw->legacy_irqs && spmi->faults &&
-		    offset == (APPLE_SPMI_GEN4_FAULT_IRQ / 32) * sizeof(val) &&
-		    (stray & BIT(APPLE_SPMI_GEN4_FAULT_IRQ % 32))) {
-			/* Same rule as above: read the queued records first. */
-			apple_spmi_drain_faults(spmi->dev, spmi);
-			stray &= ~BIT(APPLE_SPMI_GEN4_FAULT_IRQ % 32);
-			handled = true;
-		}
 		if (stray) {
 			writel(lower_32_bits(stray), spmi->regs + spmi->hw->irq_ack + offset);
 			writel(upper_32_bits(stray), spmi->regs + spmi->hw->irq_ack + offset + 4);
