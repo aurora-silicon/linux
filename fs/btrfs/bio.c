@@ -591,15 +591,24 @@ static void btrfs_submit_bio(struct bio *bio, struct btrfs_io_context *bioc,
 	}
 }
 
+/*
+ * Data writes at least this large generate their checksums in a worker while
+ * the bio is already in flight.  Below it the checksum costs less than the
+ * work item hand-off, so it is computed inline before submission.
+ */
+#define BTRFS_ASYNC_CSUM_MIN_SIZE	SZ_512K
+
 static int btrfs_bio_csum(struct btrfs_bio *bbio)
 {
 	if (bbio->bio.bi_opf & REQ_META)
 		return btree_csum_one_bio(bbio);
-#ifdef CONFIG_BTRFS_EXPERIMENTAL
-	return btrfs_csum_one_bio(bbio, true);
-#else
-	return btrfs_csum_one_bio(bbio, false);
-#endif
+	/*
+	 * Data that needs a checksum is stable while the bio is in flight
+	 * (stable writes for buffered I/O, bounce buffers for direct I/O), so
+	 * the checksum can be generated in parallel with the device write.
+	 */
+	return btrfs_csum_one_bio(bbio,
+			bbio->bio.bi_iter.bi_size >= BTRFS_ASYNC_CSUM_MIN_SIZE);
 }
 
 /*
@@ -684,6 +693,15 @@ static bool should_async_write(struct btrfs_bio *bbio)
 	 */
 	return false;
 #endif
+
+	/*
+	 * Large data writes generate their checksums in parallel with the
+	 * device write anyway (see btrfs_bio_csum()), there is nothing to gain
+	 * from also deferring the submission.
+	 */
+	if (!(bbio->bio.bi_opf & REQ_META) &&
+	    bbio->bio.bi_iter.bi_size >= BTRFS_ASYNC_CSUM_MIN_SIZE)
+		return false;
 
 	/* Submit synchronously if the checksum implementation is fast. */
 	if (auto_csum_mode && test_bit(BTRFS_FS_CSUM_IMPL_FAST, &fs_info->flags))
