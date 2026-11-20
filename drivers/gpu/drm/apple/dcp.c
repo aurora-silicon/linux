@@ -7100,6 +7100,17 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
 	dcp->desktop_external = of_device_is_compatible(dev->of_node, "apple,t6041-dcpext");
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
+	/*
+	 * J714s: the internal panel's processor suspends and resumes asynchronously, not in
+	 * the device list's order. After a deep sleep, its restart and its first frame wait only
+	 * for its suppliers (DARTs, mailbox, power domains) through their device links, not for
+	 * every device that happens to resume before it. The DRM device is a consumer of every
+	 * DCP (apple_drv.c), so it still suspends before this processor and resumes after it.
+	 * The external processors stay in order: their sleep steps reach Type-C, the PHYs and
+	 * the tunnels without device links.
+	 */
+	if (dcp->v27_j714s && dcp->panel_identity && !dcp->external)
+		device_enable_async_suspend(dev);
 	dcp_external_audio_init(dcp);
 	dcp->dev = dev;
 	/*
@@ -7562,7 +7573,8 @@ static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when)
 }
 
 /*
- * Whether the DP PHY and display crossbar of every Type-C route are there.
+ * Whether the DP PHY and display crossbar of every Type-C route are there,
+ * but for a route whose PHY or crossbar node is disabled, which is left out.
  * Routes register one at a time, and one registered cannot be taken back,
  * since a port controller may hold it: a later route waiting for its
  * supplier would leave the dcpext unusable for the boot. Returns
@@ -7585,6 +7597,12 @@ static int dcp_ext_route_suppliers(struct device *dev)
 		if (of_property_read_u32(route_np, "reg", &index))
 			continue;
 		snprintf(name, sizeof(name), "typec%u", index);
+		/*
+		 * A disabled PHY or crossbar never registers: probe skips its
+		 * route (dcp_register_typec_routes()), so do not wait for it.
+		 */
+		if (dcp_typec_route_supplier_disabled(dev, name))
+			continue;
 		phy = of_phy_get(dev->of_node, name);
 		if (PTR_ERR_OR_ZERO(phy) == -EPROBE_DEFER)
 			return -EPROBE_DEFER;
@@ -8022,6 +8040,7 @@ static int dcp_platform_prepare(struct device *dev)
 }
 
 static void dcp_s2r_dark_finish(struct apple_dcp *dcp);
+static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp);
 
 static void dcp_platform_complete(struct device *dev)
 {
@@ -9187,8 +9206,10 @@ static int dcp_s2r_pm_notify(struct notifier_block *nb, unsigned long action, vo
 {
 	struct apple_dcp *dcp = container_of(nb, struct apple_dcp, s2r_pm_nb);
 
-	if (action == PM_POST_SUSPEND)
+	if (action == PM_POST_SUSPEND) {
 		dcp_s2r_dark_finish(dcp);
+		dcp_v27_dark_replug_owed(dcp);
+	}
 	/*
 	 * A J714s external display processor that has crashed cannot take its sleep calls, and
 	 * the SoC cannot power down around it: the sleep is refused here, before the tasks

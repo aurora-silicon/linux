@@ -34,6 +34,11 @@ struct isp_setfile {
 	/* bytes present in the file if fewer than size; the rest is zero */
 	size_t file_size;
 	enum isp_temporal_filter temporal_filter;
+	/*
+	 * Optical centre, in shading-frame pixels below the frame's, for the
+	 * noise filter gains. The setfile does not carry it.
+	 */
+	int snf_centre_dy;
 };
 
 // clang-format off
@@ -83,11 +88,12 @@ static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX772_3721_11] = {0x772, "imx772", 0x37211106, "apple/isp_3721_11XX.dat", 0xfe14},
 	[ISP_IMX772_3722_01] = {0x772, "imx772", 0x37220104, "apple/isp_3722_01XX.dat", 0xfca4},
 	[ISP_IMX772_3723_01] = {0x772, "imx772", 0x37230106, "apple/isp_3723_01XX.dat", 0xfca4},
-	[ISP_IMX814_2123_01] = {0x814, "imx814", 0x21230101, "apple/isp_2123_01XX.dat", 0xed54},
+	[ISP_IMX814_2123_01] = {0x814, "imx814", 0x21230101, "apple/isp_2123_01XX.dat", 0xed54,
+				.snf_centre_dy = -156},
 	[ISP_IMX853_7622_01] = {0x853, "imx853", 0x76220112, "apple/isp_7622_01XX.dat", 0x247f8},
 	[ISP_IMX913_7523_01] = {0x913, "imx913", 0x75230107, "apple/isp_7523_01XX.dat", 0x247f8},
 	[ISP_IMX958_2224_01] = {0x958, "imx958-uw", 0x22240106, "apple/isp_2224_01XX.dat", 0x6ff4,
-				0, ISP_TEMPORAL_FILTER_BAND0},
+				0, ISP_TEMPORAL_FILTER_BAND0, -156},
 	[ISP_VD56G0_6221_01] = {0xd56, "vd56g0", 0x62210102, "apple/isp_6221_01XX.dat", 0x1b80},
 	[ISP_VD56G0_6222_01] = {0xd56, "vd56g0", 0x62220102, "apple/isp_6222_01XX.dat", 0x1b80},
 };
@@ -654,6 +660,149 @@ static void isp_setfile_fixup_h17(void *data, size_t len)
 	}
 }
 
+/* Section payload offset of the first section with this tag, or 0. */
+static size_t isp_setfile_find(const void *data, size_t len, u32 tag, u32 *size)
+{
+	size_t off = 0x14;
+
+	while (off + 12 <= len) {
+		u32 sz = get_unaligned_le32(data + off);
+
+		if (sz < 8 || off + 4 + sz > len)
+			return 0;
+		if (get_unaligned_le32(data + off + 8) == tag) {
+			*size = sz - 8;
+			return off + 12;
+		}
+		off += 4 + sz;
+	}
+	return 0;
+}
+
+#define SNF_POINTS	257
+#define SNF_ONE		4096	/* Q12, as the lens shading and SNF gains */
+
+/*
+ * The spatial noise filter (section 0xc404: u32 0, u16 log2 radius step,
+ * 257 Q12 gains by radius) ships flat. Replace it with the inverse of the
+ * lens shading gain at each radius, averaged over the four colour tables
+ * and the four directions to the frame corners, so that the filter
+ * follows the noise that shading correction amplifies towards the edges.
+ * With the flat table the filter barely acts and a dim scene is several
+ * times grainier.
+ *
+ * Only a flat 0xc404 is replaced, and only when there is no 0xc407
+ * section; a 0xc404 that a setfile ships tuned is kept.
+ *
+ * Section 0xc003 holds the shading header (frame width and height at
+ * +6), four 18-byte table records from +0xa ({ ?, step x, step y,
+ * offset lo, offset hi, 0, 0, width, height }; the offset counts u16
+ * entries, its high half cleared by the H17 fixup or absent) and the
+ * Q12 tables from +0x54. The centre is @centre_dy shading-frame pixels
+ * below the frame's.
+ */
+static void isp_setfile_snf_radial(struct apple_isp *isp, void *data,
+				   size_t len, int centre_dy)
+{
+	u32 lsc_size, snf_size, sz;
+	size_t lsc = isp_setfile_find(data, len, 0xc003, &lsc_size);
+	size_t snf = isp_setfile_find(data, len, 0xc404, &snf_size);
+	u16 gains[SNF_POINTS];
+	s64 cx, cy, rmax = 0, dist[4];
+	u32 w, h, step = 0;
+	int c, k, t;
+
+	if (!lsc || !snf || isp_setfile_find(data, len, 0xc407, &sz))
+		return;
+	if (snf_size != 6 + 2 * SNF_POINTS || lsc_size < 0x54)
+		goto bad;
+	for (k = 0; k < SNF_POINTS; k++)
+		if (get_unaligned_le16(data + snf + 6 + 2 * k) != SNF_ONE)
+			return;
+
+	w = get_unaligned_le16(data + lsc + 6);
+	h = get_unaligned_le16(data + lsc + 8);
+	/* centre and corners in 1/256 pixel */
+	cx = (s64)w * 128;
+	cy = (s64)h * 128 + (s64)centre_dy * 256;
+	/* The limits keep the products below within s64. */
+	if (!w || !h || w > 16384 || h > 16384 || cy <= 0 || cy >= (s64)h * 256)
+		goto bad;
+
+	/* Each table must cover its colour plane, half the frame. */
+	for (t = 0; t < 4; t++) {
+		const void *rec = data + lsc + 0xa + 18 * t;
+		u64 sx = get_unaligned_le16(rec + 2);
+		u64 sy = get_unaligned_le16(rec + 4);
+		u64 tab = 0x54 + 2ULL * get_unaligned_le16(rec + 6);
+		u64 gw = get_unaligned_le16(rec + 14);
+		u64 gh = get_unaligned_le16(rec + 16);
+
+		if (!sx || !sy || sx > 1024 || sy > 1024 || gw < 2 || gh < 2 ||
+		    tab + 2 * gw * gh > lsc_size ||
+		    (gw - 1) * sx * 2 < w || (gh - 1) * sy * 2 < h)
+			goto bad;
+	}
+
+	for (c = 0; c < 4; c++) {
+		s64 dx = ((c & 1) ? (s64)w * 256 : 0) - cx;
+		s64 dy = ((c & 2) ? (s64)h * 256 : 0) - cy;
+
+		dist[c] = int_sqrt64(dx * dx + dy * dy);
+		rmax = max(rmax, dist[c]);
+	}
+	while ((256LL << (8 + step)) < rmax)
+		step++;
+
+	for (k = 0; k < SNF_POINTS; k++) {
+		s64 r = min((s64)k << (8 + step), rmax);
+		s64 sum = 0;
+
+		for (t = 0; t < 4; t++) {
+			const void *rec = data + lsc + 0xa + 18 * t;
+			s64 sx = get_unaligned_le16(rec + 2) * 256;
+			s64 sy = get_unaligned_le16(rec + 4) * 256;
+			const void *tab = data + lsc + 0x54 +
+					  2 * get_unaligned_le16(rec + 6);
+			u32 gw = get_unaligned_le16(rec + 14);
+			u32 gh = get_unaligned_le16(rec + 16);
+
+			for (c = 0; c < 4; c++) {
+				s64 ex = ((c & 1) ? (s64)w * 256 : 0) - cx;
+				s64 ey = ((c & 2) ? (s64)h * 256 : 0) - cy;
+				/* the tables cover one colour plane: half size */
+				s64 px = (cx + div64_s64(r * ex, dist[c])) / 2;
+				s64 py = (cy + div64_s64(r * ey, dist[c])) / 2;
+				u32 ix = clamp_t(s64, div64_s64(px, sx), 0, gw - 2);
+				u32 iy = clamp_t(s64, div64_s64(py, sy), 0, gh - 2);
+				s64 fx = px - ix * sx, fy = py - iy * sy;
+				const void *v = tab + 2 * (iy * gw + ix);
+				s64 top = get_unaligned_le16(v) * (sx - fx) +
+					  get_unaligned_le16(v + 2) * fx;
+				s64 bot = get_unaligned_le16(v + 2 * gw) * (sx - fx) +
+					  get_unaligned_le16(v + 2 * gw + 2) * fx;
+
+				/* Q12 gain, interpolated */
+				sum += div64_s64(top * (sy - fy) + bot * fy, sx * sy);
+			}
+		}
+		/* A table falling outwards extrapolates below 0 past a corner. */
+		if (sum <= 0)
+			goto bad;
+		/* 16 samples: gain = 1 / mean shading gain, in Q12 */
+		gains[k] = min_t(s64, div64_s64(16LL * SNF_ONE * SNF_ONE, sum),
+				 U16_MAX);
+	}
+
+	put_unaligned_le32(0, data + snf);
+	put_unaligned_le16(step, data + snf + 4);
+	for (k = 0; k < SNF_POINTS; k++)
+		put_unaligned_le16(gains[k], data + snf + 6 + 2 * k);
+	return;
+bad:
+	dev_warn_once(isp->dev, "setfile: noise filter gains not computed, keeping the stock ones\n");
+}
+
 static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
@@ -701,6 +850,9 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 	/* Seen on T6040 only; T8140 runs its setfiles as they are. */
 	if (isp->hw->gen == ISP_GEN_T6040 || isp->hw->setfile_stride_fixup)
 		isp_setfile_fixup_h17(isp->data_surf->virt, len);
+
+	isp_setfile_snf_radial(isp, isp->data_surf->virt, len,
+			       setfile->snf_centre_dy);
 
 	err = isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
 				       setfile->size);
