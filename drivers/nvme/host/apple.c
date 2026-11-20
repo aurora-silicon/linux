@@ -370,6 +370,13 @@ MODULE_PARM_DESC(flush_interval,
  */
 static bool sleep_untested;
 module_param(sleep_untested, bool, 0444);
+/*
+ * T8122: hold ANS's PMP request through the sleep to the last stop (commit-owned). macOS holds
+ * none in that window (capture run 72): off, the PMP report withdraws it with the rest.
+ */
+static bool sleep_hold;
+module_param(sleep_hold, bool, 0444);
+MODULE_PARM_DESC(sleep_hold, "T8122: hold ANS's PMP request to the sleep's last stop (default 0, as macOS)");
 MODULE_PARM_DESC(sleep_untested,
 		 "Stop ANS for a deep sleep where that path is untested (default 0)");
 
@@ -2834,7 +2841,9 @@ static int apple_nvme_sleep_last_stop(void *data)
 		apple_nvme_ans_trace(anv, "the last stop");
 		apple_rtkit_mailbox_recv_off(anv->rtk);
 		apple_nvme_ans_trace(anv, "mailbox receive off");
-		wret = apple_pmp_report_entry_withdraw_polled(anv->sleep_pmp_entry);
+		/* Without the hold the PMP report withdrew it in its suspend_late, as on macOS. */
+		wret = READ_ONCE(sleep_hold) ?
+			apple_pmp_report_entry_withdraw_polled(anv->sleep_pmp_entry) : 0;
 		apple_nvme_ans_trace(anv, "the PMP withdraw");
 		if (wret) {
 			dev_err(anv->dev, "ANS's PMP request not withdrawn at the last stop: %d\n", wret);
@@ -3347,7 +3356,8 @@ static int apple_nvme_suspend(struct device *dev)
 		if (anv->sleep_registered && anv->hw->sleep_idle &&
 		    pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware() &&
 		    !anv->legacy_shn_ret && anv->sleep_pmp_entry &&
-		    !apple_pmp_report_entry_commit_owned(anv->sleep_pmp_entry, true)) {
+		    (!READ_ONCE(sleep_hold) ||
+		     !apple_pmp_report_entry_commit_owned(anv->sleep_pmp_entry, true))) {
 			int idle = apple_rtkit_idle(anv->rtk);
 
 			anv->sleep_stop = true;
