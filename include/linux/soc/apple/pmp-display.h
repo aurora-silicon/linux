@@ -6,10 +6,10 @@
 #include <linux/soc/apple/t8132.h>
 #include <linux/types.h>
 
-/* The retained M4 bridge and raw thermal records: the M4 firmware path. */
+/* The retained M4 bridge and raw thermal records: the M4 PMP path. */
 static inline bool apple_pmp_j713_board(void)
 {
-	return apple_t8132_firmware_path() && of_machine_is_compatible("apple,t8132");
+	return apple_t8132_pmp_path() && of_machine_is_compatible("apple,t8132");
 }
 
 struct device;

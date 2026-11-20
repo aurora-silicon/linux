@@ -55,6 +55,32 @@ static inline bool apple_t8132_firmware_path(void)
 }
 
 /*
+ * The OS firmware whose PMP image the M4 PMP path runs: 26.6.2 (25G83), and
+ * 27.2 (26B123), whose PMP image 27.2.1 (26B131) carries unchanged. The 27.2
+ * image adds one boot argument (BWWD), left at the firmware's default, and
+ * moves its data segment and heap; the PMP driver finds both from the image.
+ */
+static inline bool apple_t8132_pmp_firmware(void)
+{
+	const char *version;
+
+	if (!of_machine_is_compatible("apple,t8132") ||
+	    of_property_read_string(of_chosen, "asahi,os-fw-version", &version))
+		return false;
+	return !strcmp(version, "26.6.2") || !strcmp(version, "27.2") ||
+	       !strcmp(version, "27.2.1");
+}
+
+/*
+ * The M4 PMP session with its telemetry, thermal policy and power-vote
+ * bridge: every M4 Mac on a PMP firmware above, and the Airs on any.
+ */
+static inline bool apple_t8132_pmp_path(void)
+{
+	return apple_t8132_air() || apple_t8132_pmp_firmware();
+}
+
+/*
  * The radio port the Airs have: reg-on on the SMC's gP13 with the same
  * template, and the radio's two ordinary streams managed on port 0 of the
  * built-in PCIe controller. The J604 and J773g ADTs match; the iMacs are
