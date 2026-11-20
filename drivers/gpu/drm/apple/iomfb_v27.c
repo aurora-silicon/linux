@@ -177,6 +177,15 @@ static const struct dcp_method_entry dcp_methods_27_0[dcpep_num_methods] = {
  * an unknown tag with a panic ("link_rpc_lookup callback not found").
  * dfb_ready_query is A385, one above its 27.0 ID: the 27.3 trace sends it
  * there, and the J813's DCP answers it at A385 on 27.2.
+ *
+ * A static read of the T6050 public 27.2.1 restore image confirms the
+ * framebuffer and DCP method layout and the v27 swap shapes (0xff4 request,
+ * 0x6e0 response). The pbl fence-notify and swap-complete methods and the
+ * trace-source swap-wait parameter are new in 27.3. The kernelcache does not
+ * confirm the tags that firmware registers.
+ *
+ * The 27.3 pbl fence-notify row has no 27.2 method. The 27.2 image has no
+ * MemDescRelay thunk symbol, so that row remains based on its offset.
  */
 static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
@@ -282,14 +291,25 @@ static const struct dcp_method_entry dcp_methods_27_3[dcpep_num_methods] = {
 	IOMFB_METHOD("A534", dcpep_register_dfb_surface),
 };
 
-const struct dcp_method_entry *iomfb_v27_methods(const char *compat)
+const struct iomfb_v27_build *iomfb_v27_methods(const char *compat)
 {
-	if (!strcmp(compat, "27.0.0"))
-		return dcp_methods_27_0;
-	if (!strcmp(compat, "27.2.0"))
-		return dcp_methods_27_2;
-	if (!strcmp(compat, "27.3.0"))
-		return dcp_methods_27_3;
+	static const struct iomfb_v27_build builds[] = {
+		{ .compat = "27.0.0", .methods = dcp_methods_27_0 },
+		{ .compat = "27.2.0", .methods = dcp_methods_27_2 },
+		{
+			.compat = "27.3.0",
+			.methods = dcp_methods_27_3,
+			.swap_req_size = DCP_V27_3_REQ_SIZE,
+			.callback_from = 590,
+			.callback_to = 596,
+			.callback_in_len = 0x14,
+		},
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(builds); i++)
+		if (!strcmp(compat, builds[i].compat))
+			return &builds[i];
 	return NULL;
 }
 
