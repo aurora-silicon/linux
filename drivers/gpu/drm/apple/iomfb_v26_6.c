@@ -554,6 +554,22 @@ static int dcp_v26_callback(void *cookie, u32 tag,
 	}
 	if (tag == D(576) && SHAPE(4, 0))
 		return 0;
+	/*
+	 * Callbacks the firmware sends when the display is powered down (A473, observed in
+	 * macOS's panel-off and in Linux's sleep calls), answered as the H17P and M4 drivers
+	 * answer them: a no-op (D2), swap_complete_intent_gated (D592, a no-op),
+	 * powerUpDART (D572, success) and get_calendar_time_ms (D209).
+	 */
+	if ((tag == D(2) && SHAPE(0, 0)) || (tag == D(592) && SHAPE(20, 0)))
+		return 0;
+	if (tag == D(572) && SHAPE(4, 4)) {
+		memset(out, 0, 4);
+		return 0;
+	}
+	if (tag == D(209) && SHAPE(0, 8)) {
+		put_unaligned_le64(ktime_get_real_ns() / NSEC_PER_MSEC, out);
+		return 0;
+	}
 	if (tag == D(300) && SHAPE(16, 0)) {
 		dcp_v26_publish(v26, in);
 		return 0;
