@@ -2897,11 +2897,13 @@ static void atcphy_configure_post_tunable_all_modes(struct apple_atcphy *atcphy,
  * without touching the lane mux. Based on Oliver Lukschander's t6020 tunnel
  * clock patch (asahi-j416s-display).
  */
-/* t600x (M1 Pro/Max) has the t8103 generation ATC. */
-static bool apple_atc_tunnel_is_t600x(void)
+/*
+ * The T600x ATC (M1 Pro/Max/Ultra, "apple,t6000-atcphy" on every die) is the
+ * t8103 generation with a second pixel clock and a DP IN clock to run.
+ */
+static bool apple_atc_tunnel_is_t600x(const struct apple_atcphy *atcphy)
 {
-	return of_machine_is_compatible("apple,t6000") ||
-	       of_machine_is_compatible("apple,t6001");
+	return of_device_is_compatible(atcphy->np, "apple,t6000-atcphy");
 }
 
 /*
@@ -3135,7 +3137,7 @@ static void atc_tunnel_pclk_t8103(struct apple_atcphy *atcphy, u32 selector)
 {
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N);
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N_OV);
-	if (apple_atc_tunnel_is_t600x()) {
+	if (apple_atc_tunnel_is_t600x(atcphy)) {
 		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPRX_PCLK_ENABLE);
 		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK2_ENABLE);
 		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPRX_PCLK_SELECT,
@@ -4993,13 +4995,15 @@ static const struct phy_ops apple_atc_dp_phy_ops = {
  * Thunderbolt DP IN adapter @dpin (rate is the DP link rate code, 0 = stop).
  */
 /*
- * t600x (M1 Pro/Max) and t8112 (M2, whose ATC PHY is t8103-compatible) run
- * the t8103 tunnel clock sequence unchanged.
+ * Every t8103 generation ATC (t8103, t8112 and t6000 nodes, all with the
+ * "apple,t8103-atcphy" fallback) runs the t8103 tunnel clock sequence, except
+ * the T602x one: it also carries the fallback but has a pixel clock per DP IN
+ * adapter (atc_tunnel_set_t602x()).
  */
-static bool apple_atc_tunnel_is_t8103_style(void)
+static bool apple_atc_tunnel_is_t8103_style(const struct apple_atcphy *atcphy)
 {
-	return of_machine_is_compatible("apple,t8103") ||
-	       of_machine_is_compatible("apple,t8112") || apple_atc_tunnel_is_t600x();
+	return of_device_is_compatible(atcphy->np, "apple,t8103-atcphy") &&
+	       !of_device_is_compatible(atcphy->np, "apple,t6020-atcphy");
 }
 
 int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
@@ -5116,8 +5120,8 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 	 */
 	if (apple_atc_tunnel_t8122_clock(atcphy))
 		return apple_atc_dp_tunnel_rate_source(phy, 0, dpin, rate);
-	if (!apple_atc_tunnel_is_t8103_style()) {
-		bool valid_core = apple_atc_t602x_core_valid(atcphy->np, atcphy->res.core->start,
+	if (!apple_atc_tunnel_is_t8103_style(atcphy)) {
+		bool valid_core = apple_atc_t602x_core_valid(atcphy->np,
 							     resource_size(atcphy->res.core));
 
 		ret = apple_atc_t602x_gate(atcphy->tunnel_dual_stream,
@@ -5127,7 +5131,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 	}
 	guard(mutex)(&atcphy->lock);
 	if (!rate) {
-		if (apple_atc_tunnel_is_t8103_style()) {
+		if (apple_atc_tunnel_is_t8103_style(atcphy)) {
 			/*
 			 * One pixel clock feeds both DP IN adapters: a stream
 			 * that ends must not stop the other one's clock.
@@ -5142,7 +5146,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 	}
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
 		return -EBUSY;
-	if (apple_atc_tunnel_is_t8103_style()) {
+	if (apple_atc_tunnel_is_t8103_style(atcphy)) {
 		ret = atc_tunnel_start_t8103(atcphy, rate);
 		if (!ret)
 			atcphy->tunnel_users |= BIT(dpin);
@@ -5168,11 +5172,11 @@ int apple_atc_dp_tunnel_open(struct phy *phy)
 	 * the PHY: T6050's tunnel clocks belong to atc-t6050-dp.c, whose PHY
 	 * this driver does not know, and start from the link rate alone.
 	 */
-	if (!apple_atc_tunnel_is_t600x())
-		return -EOPNOTSUPP;
 	if (phy->ops != &apple_atc_dp_phy_ops)
-		return -EINVAL;
+		return -EOPNOTSUPP;
 	atcphy = phy_get_drvdata(phy);
+	if (!apple_atc_tunnel_is_t600x(atcphy))
+		return -EOPNOTSUPP;
 	guard(mutex)(&atcphy->lock);
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
 		return -EBUSY;
@@ -6810,7 +6814,7 @@ static void apple_atc_tunnel_wiring(struct apple_atcphy *atcphy)
 	struct device_node *connector __free(device_node) = NULL;
 	struct device_node *candidate;
 
-	if (!apple_atc_t602x_qualified(of_root))
+	if (!apple_atc_t602x_qualified(atcphy->np))
 		return;
 	connector = of_graph_get_remote_node(atcphy->np, 0, -1);
 	atcphy->tunnel_dual_stream = apple_dp_tunnel_dual_stream(connector);

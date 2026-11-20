@@ -266,6 +266,11 @@
 
 #include "t600x-die0.dtsi"
 #include "t600x-dieX.dtsi"
+
+&SOC_NODE {
+#include "t600x-pciec.dtsi"
+};
+
 #include "t600x-pmgr.dtsi"
 #include "t600x-gpio-pins.dtsi"
 
@@ -278,6 +283,11 @@
 #define SOC_NODE die1
 
 #include "t600x-dieX.dtsi"
+
+&SOC_NODE {
+#include "t600x-pciec.dtsi"
+};
+
 #include "t600x-nvme.dtsi"
 #include "t600x-pmgr.dtsi"
 

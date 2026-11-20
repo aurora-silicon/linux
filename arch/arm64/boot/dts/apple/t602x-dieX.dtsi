@@ -1177,6 +1177,10 @@
 				<&DIE_NODE(ps_atc3_cio_usb)>;
 
 		thunderbolt-switch;
+#ifndef APPLE_T602X_NON_ULTRA
+		/* Pro/Max boards with a fourth port wire this tunnel themselves. */
+		apple,pcie-tunnel = <&DIE_NODE(usb4_3_pcie_tunnel)>;
+#endif
 
 		pinctrl-0 = <&DIE_NODE(acio3_pins)>;
 		pinctrl-names = "default";
@@ -1254,7 +1258,6 @@
 		/* Identity-map the controller and PCIe memory windows. */
 		ranges = <0x13 0x20000000 0x13 0x20000000 0x0 0x20000000>,
 			 <0x14 0x0 0x14 0x0 0x2 0x80000000>;
-		status = "disabled";
 #endif
 
 		DIE_NODE(apciec3_dart): iommu@1321008000 {
@@ -1265,9 +1268,6 @@
 			#iommu-cells = <1>;
 			apple,dma-range = <0x0 0x80000000 0x0 0x80000000>;
 			apple,dma-offset = <0x100 0x0>;
-#ifndef APPLE_T602X_NON_ULTRA
-			status = "disabled";
-#endif
 		};
 
 		DIE_NODE(apciec3): pcie@1330000000 {
@@ -1287,9 +1287,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1318 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&DIE_NODE(ps_atc3_pcie)>;
-#ifndef APPLE_T602X_NON_ULTRA
-			status = "disabled";
-#endif
 
 			msi-controller;
 			msi-parent = <&DIE_NODE(apciec3)>;
