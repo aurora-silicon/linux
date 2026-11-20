@@ -11,8 +11,11 @@ pub(crate) const SUBMISSION_BYTES: usize = 0x18;
 /// Two firmware engine classes for each of the three data masters.
 pub(crate) const ENGINE_CLASSES: u32 = 6;
 
-/// Wire entry shared by G15G 26.6.2 and G14G 26B123. The caller owns the queue
-/// and publishes its contents before advancing the channel's shared write index.
+/// Submission-channel wire entry. The M3 runtime writes it for both of its
+/// profiles (14.8.3 Legacy and 26.6.2 Extended) through `m3_config::submit_queue`,
+/// which has no per-profile layout; the G14G firmware-27.2 path (26B123) writes the
+/// same entry. The caller owns the queue and publishes its contents before
+/// advancing the channel's shared write index.
 pub(crate) fn submission_entry(
     selector: u32, queue: u64, position: u16, stamp: u8, first: bool,
 ) -> Result<[u8; SUBMISSION_BYTES], Error> {
