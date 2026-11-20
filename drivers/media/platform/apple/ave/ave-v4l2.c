@@ -77,17 +77,20 @@ static bool ave_fmt_listed(const u32 *list, unsigned int n, u32 fourcc)
 	return false;
 }
 
-/* HEVC Main 10 (P010 input) is mapped for the 9003 layout only. */
+/*
+ * HEVC Main 10 (P010 input): the 9003 and the counted (26A428) layouts,
+ * whose Starts map every field that changes with bit depth. The 6070
+ * layout has none.
+ */
 static bool ave_main10_supported(const struct ave_dev *ave)
 {
-	return ave->layout && ave->layout->kind == AVE_LAYOUT_9003 &&
-	       !ave->layout->counted;
+	return ave->layout && (ave->layout->counted ||
+			       ave->layout->kind == AVE_LAYOUT_9003);
 }
 
 /*
  * Whether raw @fourcc can be encoded to @coded on @ave. P010 is only the
- * input of HEVC Main 10: H.264 has no 10-bit profile here, and the 6070
- * and 26A428 layouts have no Main 10 fields.
+ * input of HEVC Main 10: H.264 has no 10-bit profile here.
  */
 static bool ave_raw_fmt_ok(const struct ave_dev *ave, u32 coded, u32 fourcc)
 {

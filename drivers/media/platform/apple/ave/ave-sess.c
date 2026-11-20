@@ -194,9 +194,6 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 		return -EOPNOTSUPP;
 	p->bit_depth = 8;
 	if (p->sample_bytes == 2) {
-		/* Only the 9003 layout's Main 10 fields are mapped. */
-		if (ctx->ave->layout->counted)
-			return -EOPNOTSUPP;
 		p->profile = AVE_HEVC_MAIN_10;
 		p->bit_depth = 10;
 		p->min_qp -= AVE_QP_BD_OFFSET_10;

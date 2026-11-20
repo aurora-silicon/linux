@@ -269,6 +269,51 @@ static void ave_9003_hevc_main10(struct kunit *test)
 	}
 }
 
+/*
+ * HEVC Main 10 on the counted (26A428) layout, which T8142 encodes with: the
+ * words that change with bit depth take the 9003 capture's Main 10 values
+ * (the host tests in tests/test.c check the same words).
+ */
+static void ave_26a428_hevc_main10(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+	u8 *main8, *main10;
+	size_t len;
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, sess);
+	ave->layout = &ave_layout_26a428;
+	ctx->ave = ave;
+	ctx->sess = sess;
+	len = ave->layout->bytes[AVE_CODEC_HEVC - 1][AVE_IMAGE_START];
+	main8 = kunit_kzalloc(test, len, GFP_KERNEL);
+	main10 = kunit_kzalloc(test, len, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, main8);
+	KUNIT_ASSERT_NOT_NULL(test, main10);
+
+	ave_test_session(sess, AVE_CODEC_HEVC, 1920, 1080, true);
+	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, main8, len), 0);
+	ave_test_session(sess, AVE_CODEC_HEVC, 1920, 1080, true);
+	sess->p.min_qp = -12;
+	sess->p.profile = 2;
+	sess->p.bit_depth = 10;
+	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, main10, len), 0);
+
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x35e8), 0x10040);
+	KUNIT_EXPECT_NE(test, get_unaligned_le32(main8 + 0x35e8), 0x10040);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main8 + 0x37c0), 8);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x37c0), 10);
+	KUNIT_EXPECT_EQ(test, (s32)get_unaligned_le32(main10 + 0x3678), -12);
+	KUNIT_EXPECT_EQ(test, (s32)get_unaligned_le32(main10 + 0x3740), -12);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x3a60), 0x01000101);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x6530), 0x01000000);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x66dc), 2);
+	KUNIT_EXPECT_NE(test, get_unaligned_le32(main8 + 0x66dc), 2);
+}
+
 /* One 1080p HEVC Start or first Process image, with speed mode @speed. */
 static void ave_speed_image(struct kunit *test, struct ave_ctx *ctx,
 			    enum ave_image image, bool bframes, bool main10,
@@ -1591,6 +1636,7 @@ static void ave_m3_probe_only(struct kunit *test)
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_t6041_text_boot_word),
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
+	KUNIT_CASE(ave_26a428_hevc_main10),
 	KUNIT_CASE(ave_9003_speed),	    KUNIT_CASE(ave_cq_table),
 	KUNIT_CASE(ave_6070_images),
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_frame_result),
