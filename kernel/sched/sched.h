@@ -1038,6 +1038,7 @@ struct root_domain {
 	/* Indicate one or more CPUs over-utilized (tipping point) */
 	bool			overutilized;
 
+
 	/*
 	 * The bit corresponding to a CPU gets set here if such CPU has more
 	 * than one runnable -deadline task (as it is below for RT tasks).
@@ -2454,7 +2455,7 @@ enum {
  * To support run-time toggling of sched features, all the translation units
  * (but core.c) reference the sysctl_sched_features defined in core.c.
  */
-extern __read_mostly unsigned int sysctl_sched_features;
+extern __read_mostly unsigned long sysctl_sched_features;
 
 #ifdef CONFIG_JUMP_LABEL
 
@@ -2478,6 +2479,15 @@ extern struct static_key sched_feat_keys[__SCHED_FEAT_NR];
 
 extern struct static_key_false sched_numa_balancing;
 extern struct static_key_false sched_schedstats;
+
+struct dentry;
+#ifdef CONFIG_PERF_EVENTS
+extern void sched_mem_spread_update(void);
+extern void sched_mem_spread_debugfs(struct dentry *parent);
+#else
+static inline void sched_mem_spread_update(void) { }
+static inline void sched_mem_spread_debugfs(struct dentry *parent) { }
+#endif
 
 static inline u64 global_rt_period(void)
 {

@@ -584,7 +584,10 @@ struct sched_entity {
 	unsigned char			sched_delayed;
 	unsigned char			rel_deadline;
 	unsigned char			custom_slice;
-					/* hole */
+	/* MEM_SPREAD: classified memory-bound, see mem_spread_tick() */
+	unsigned char			mem_bound;
+	/* MEM_SPREAD: L1D load misses per us of running, moving average */
+	unsigned short			mem_rate;
 
 	u64				exec_start;
 	u64				sum_exec_runtime;
