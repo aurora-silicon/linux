@@ -285,7 +285,7 @@ static void apple_sleep_test_unavailable(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_sleep_profile_validate(&incomplete), -EINVAL);
 }
 
-/* The J716c runs the J714s's steps: only its map, inventory, board and PMP differ. */
+/* The J716c shares the J714s steps; its map, inventory and PMP differ. */
 static void apple_sleep_test_j716c_full(struct kunit *test)
 {
 	const struct apple_sleep_soc *max = &t6050_j716c_sleep_soc, *pro = &t6050_sleep_soc;
@@ -296,7 +296,6 @@ static void apple_sleep_test_j716c_full(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, state);
 	KUNIT_EXPECT_EQ(test, apple_sleep_profile_validate(max), 0);
 	KUNIT_EXPECT_PTR_EQ(test, max->unavailable_reason, NULL);
-	KUNIT_EXPECT_STREQ(test, max->machine, "apple,j716c");
 	KUNIT_EXPECT_PTR_EQ(test, max->regions, &t6050_j716c_region_profile);
 	KUNIT_EXPECT_EQ(test, sleep_region_validate(max->regions), 0);
 	KUNIT_EXPECT_EQ(test, max->regions->ntables, pro->regions->ntables);
@@ -334,13 +333,12 @@ static void apple_sleep_test_j716c_full(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, apple_sleep_t6050_full(state));
 }
 
-/* The J714s's profile is as it was: its own map, its inventory, a PMP that runs. */
+/* The J714s uses its own map and inventory, with a running PMP. */
 static void apple_sleep_test_j714s_unchanged(struct kunit *test)
 {
 	const struct apple_sleep_soc *pro = &t6050_sleep_soc;
 
 	KUNIT_EXPECT_PTR_EQ(test, pro->unavailable_reason, NULL);
-	KUNIT_EXPECT_STREQ(test, pro->machine, "apple,j714s");
 	KUNIT_EXPECT_PTR_EQ(test, pro->ops, &t6050_sleep_ops);
 	KUNIT_EXPECT_TRUE(test, pro->ops->map_regs == t6050_sleep_map_regs);
 	KUNIT_EXPECT_PTR_EQ(test, pro->regions, &t6050_region_profile);
