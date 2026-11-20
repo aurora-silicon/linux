@@ -448,3 +448,11 @@
 };
 
 #include "t8142-j813-j815-sleep.dtsi"
+
+/*
+ * The external display processors (dispext0/1), their DARTs, the display
+ * crossbars and the USB-C ports' DisplayPort routes: the same two ports and
+ * blocks as the J813. The loader hands both processors over and enables
+ * them; without its hand-off they stay disabled.
+ */
+#include "t8142-j813-dcpext.dtsi"
