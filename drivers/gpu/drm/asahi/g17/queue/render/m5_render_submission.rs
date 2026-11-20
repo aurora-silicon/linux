@@ -131,14 +131,81 @@ pub(crate) fn layout(command: &Validated, clusters: u32, programs: RegisterProgr
     let layout = target::Layout::new(pass, clusters, programs)?;
     if plan.is_none() { return Ok(layout); }
     validate(pass)?;
+    let geometry = parameter_geometry(layout.tvb_blocks)?;
+    Ok(m5_layout(layout, pass, clusters, geometry)?.0)
+}
+
+/// The M5 layout of `pass` from its G17P layout, and the compact-window bytes a pair built for
+/// it reserves ([`pair_window_bytes`]).
+fn m5_layout(layout: target::Layout, pass: &RenderPass, clusters: u32,
+    geometry: crate::g17::buffer::BlockGeometry) -> Result<(target::Layout, usize)> {
     // One target group per cluster unless the pass asks for few primitives.
     // Both target storage and the segment controls use the physical cluster count.
-    let geometry = parameter_geometry(layout.tvb_blocks)?;
     // The auxiliary tables cover the complete parameter inventory, including
     // future growth, rather than just the initially resident physical blocks.
     let bytes = geometry.capacity.checked_mul(geometry.block_bytes).ok_or(EOVERFLOW)?;
     let groups = if pass.few_primitives { 1 } else { clusters };
-    layout.with_m5_slices(pass, clusters, groups, 64, bytes)
+    let layout = layout.with_m5_slices(pass, clusters, groups, 64, bytes)?;
+    // A pair maps its objects in the client's compact window, whose 32-bit offsets make it
+    // 4 GiB. A layout whose pair does not fit there on its own can never be mapped: refuse it
+    // as memory that cannot be had, before any of it is allocated. SUBMIT derives the layout,
+    // so the refusal is the ioctl's.
+    let reserved = pair_window_bytes(&layout, geometry, clusters)?;
+    let window = crate::g17::buffer::BlockGeometry::M5_COMPACT;
+    if reserved as u64 > window.end - window.start {
+        return Err(ENOMEM);
+    }
+    Ok((layout, reserved))
+}
+
+/// Bytes of the client's M5 compact window that a render pair built for `layout` reserves: its
+/// target records (a page-rounded record for each command slot), its TPC object and its initial
+/// parameter blocks, which the layout sizes, and the objects of [`pair_fixed_bytes`].
+fn pair_window_bytes(layout: &target::Layout, geometry: crate::g17::buffer::BlockGeometry,
+    clusters: u32) -> Result<usize> {
+    let depth = crate::hw::t8140::queues::RENDER_DEPTH as usize;
+    let records = placed(layout.record_stride()?.checked_mul(depth).ok_or(EOVERFLOW)?, true)?;
+    let tpc = placed(layout.tpc_capacity()?, true)?;
+    // Each block is mapped at the geometry's stride, which includes its guard.
+    let parameters = layout.tvb_blocks.checked_mul(geometry.stride).ok_or(EOVERFLOW)?;
+    [tpc, parameters, pair_fixed_bytes(geometry, clusters)?]
+        .into_iter()
+        .try_fold(records, |sum, bytes| sum.checked_add(bytes))
+        .ok_or(EOVERFLOW)
+}
+
+/// Bytes of the client's M5 compact window that every render pair reserves whatever its
+/// layout: the context state of each command slot, its parameter buffer's scene scratch and
+/// discard, its block manager's page list, its metrics entry, and its queue's pool page list.
+fn pair_fixed_bytes(geometry: crate::g17::buffer::BlockGeometry, clusters: u32)
+    -> Result<usize> {
+    use crate::g17::fw::m5::pool;
+    let depth = crate::hw::t8140::queues::RENDER_DEPTH as usize;
+    let page = crate::mmu::UAT_PGSZ;
+    let state = placed(super::generation::Layout::m5_bytes(clusters as usize), true)?
+        .checked_mul(depth).ok_or(EOVERFLOW)?;
+    let scratch = placed(pool::parameter_scratch_stride(geometry.capacity, 0)
+        .map_err(|_| EINVAL)?.checked_mul(pool::SCENE_TABLE_ENTRIES).ok_or(EOVERFLOW)?, true)?;
+    let discard = placed(0x8000, true)?;
+    let page_list = placed(crate::g17::buffer::m5_page_list_bytes(geometry)?, true)?;
+    let metrics = placed(page, false)?;
+    let pool_pages = placed(page, false)?;
+    [scratch, discard, page_list, metrics, pool_pages]
+        .into_iter()
+        .try_fold(state, |sum, bytes| sum.checked_add(bytes))
+        .ok_or(EOVERFLOW)
+}
+
+/// The compact-window reservation of an object of `bytes`: page-rounded, with its guard page if
+/// it has one, and rounded to the 32 KiB alignment such objects are placed at.
+fn placed(bytes: usize, guard: bool) -> Result<usize> {
+    let page = crate::mmu::UAT_PGSZ;
+    let alignment = crate::hw::t8140::resources::TVB_PAGE as usize;
+    bytes.checked_add(page - 1).map(|n| n & !(page - 1))
+        .and_then(|n| n.checked_add(if guard { page } else { 0 }))
+        .and_then(|n| n.checked_add(alignment - 1))
+        .map(|n| n & !(alignment - 1))
+        .ok_or(EOVERFLOW)
 }
 
 pub(crate) fn controls(
@@ -215,4 +282,70 @@ pub(crate) fn inputs(args: &RenderArgs<'_>, usage: [u64; 2]) -> Result<cmd::M5Re
     fields.ta.tail_flag = 1;
     fields.fragment.tail_flag = 1;
     Ok(fields)
+}
+
+
+#[kernel::macros::kunit_tests(asahi_g17_m5_pair_window)]
+mod tests {
+    use super::*;
+    use crate::g17::buffer::BlockGeometry;
+
+    /// The J775D (M5 Ultra, eight clusters) of the measured boot, 98970480 KiB of memory.
+    const RAM: u64 = 98970480 << 10;
+    const WINDOW: usize = 1 << 32;
+    const MIB: usize = 1 << 20;
+
+    /// A single-sample pass as Borealis sends it: `utile` tiles, and few-primitives for a pass
+    /// of at most four primitives.
+    fn reserved(size: u32, layers: u16, utile: u8, few: bool) -> Result<usize> {
+        // SAFETY: RenderPass and its nested surfaces/programs contain only
+        // integers and bools, for which the all-zero representation is valid.
+        let mut pass: RenderPass = unsafe { core::mem::zeroed() };
+        pass.width = size;
+        pass.height = size;
+        pass.layers = layers;
+        pass.utile_width = utile;
+        pass.utile_height = utile;
+        pass.few_primitives = few;
+        let layout = target::Layout::new(&pass, 8, RegisterPrograms::G17P)?;
+        let geometry = BlockGeometry::m5(RAM, (layout.tvb_blocks * 0x80000) as u64)?;
+        m5_layout(layout, &pass, 8, geometry).map(|(_, bytes)| bytes)
+    }
+
+    #[test]
+    fn borealis_32x32_passes_of_more_than_four_primitives() {
+        assert!(reserved(16384, 22, 32, false).unwrap() <= WINDOW);
+        assert_eq!(reserved(16384, 23, 32, false), Err(ENOMEM));
+        assert!(reserved(512, 2048, 32, false).unwrap() <= WINDOW);
+        assert!(reserved(1024, 2048, 32, false).unwrap() <= WINDOW);
+        assert_eq!(reserved(1152, 2048, 32, false), Err(ENOMEM));
+    }
+
+    #[test]
+    fn borealis_32x32_passes_of_few_primitives() {
+        assert!(reserved(16384, 53, 32, true).unwrap() <= WINDOW);
+        assert_eq!(reserved(16384, 54, 32, true), Err(ENOMEM));
+        assert!(reserved(2048, 2047, 32, true).unwrap() <= WINDOW);
+        assert!(reserved(2048, 2048, 32, true).unwrap() <= WINDOW);
+        assert_eq!(reserved(2112, 2048, 32, true), Err(ENOMEM));
+        assert!(reserved(1152, 2048, 32, true).unwrap() <= WINDOW);
+    }
+
+    #[test]
+    fn passes_with_16x16_tiles() {
+        assert!(reserved(16384, 5, 16, false).unwrap() <= WINDOW);
+        assert_eq!(reserved(16384, 6, 16, false), Err(ENOMEM));
+        assert!(reserved(512, 2048, 16, false).unwrap() <= WINDOW);
+        assert_eq!(reserved(1024, 2048, 16, false), Err(ENOMEM));
+    }
+
+    #[test]
+    fn a_pair_counts_the_objects_its_layout_does_not_size() {
+        // A trace of a pair on the J775D found 3824 KiB of these objects, guards included and
+        // alignment holes not.
+        let geometry = BlockGeometry::m5(RAM, 32 * 0x80000).unwrap();
+        let fixed = pair_fixed_bytes(geometry, 8).unwrap();
+        assert!(fixed >= 3824 * 1024);
+        assert!(fixed <= 5 * MIB);
+    }
 }

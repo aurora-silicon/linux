@@ -47,6 +47,21 @@ impl BlockGeometry {
         })
     }
 
+    /// Refuses, as the mapping would and before any backing is allocated, M5 compact-window
+    /// mappings that `vm`'s window has no room for: one of `contiguous` bytes and `total` bytes
+    /// in all. The window is shared, so room seen here is no placement promise: the mapping can
+    /// still fail, but only after allocating backing that could fit.
+    pub(crate) fn check_m5_room(vm: &crate::mmu::Vm, contiguous: usize, total: usize) -> Result {
+        let window = Self::M5_COMPACT;
+        let (used, largest) = vm.capacity(window.clone())?;
+        if contiguous as u64 > largest
+            || total as u64 > (window.end - window.start).saturating_sub(used)
+        {
+            return Err(ENOSPC);
+        }
+        Ok(())
+    }
+
     pub(crate) const fn pages(self) -> usize { self.block_bytes / Self::PAGE }
     pub(crate) const fn max_blocks(self) -> usize { self.capacity - 1 }
 

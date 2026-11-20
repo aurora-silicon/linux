@@ -198,6 +198,10 @@ struct Object {
 }
 impl Object {
     fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, size: usize, m5: bool) -> Result<Self> {
+        if m5 {
+            let mapped = size.checked_add(mmu::UAT_PGSZ).ok_or(EOVERFLOW)?;
+            super::BlockGeometry::check_m5_room(vm, mapped, mapped)?;
+        }
         let backing = KernelObject::backing(dev, size, CpuMap::WriteCombined)?;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let mapping = if m5 {

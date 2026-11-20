@@ -11,6 +11,12 @@ use crate::hw::t8140::resources as cfg;
 pub(crate) mod target;
 mod geometry;
 pub(crate) use geometry::BlockGeometry;
+
+/// Bytes of an M5 block manager's page list, which a render pair maps in the client's compact
+/// window.
+pub(crate) fn m5_page_list_bytes(geometry: BlockGeometry) -> Result<usize> {
+    Ok(layout::Layout::m5(geometry)?.page_bytes)
+}
 mod layout;
 
 use kernel::prelude::*;
@@ -397,6 +403,17 @@ impl Tvb {
         }
         geometry.backing_bytes(blocks)
     }
+    /// Backing for `blocks` blocks to be mapped into `vm`. M5 blocks are mapped one by one in
+    /// the compact window, which is checked for room for all of them first.
+    fn allocate(dev: &AsahiDrmDevice, vm: &mmu::Vm, geometry: BlockGeometry, blocks: usize)
+        -> Result<KernelObject> {
+        let bytes = Self::backing_bytes(geometry, blocks)?;
+        if geometry != BlockGeometry::NEO {
+            let total = blocks.checked_mul(geometry.stride).ok_or(EOVERFLOW)?;
+            BlockGeometry::check_m5_room(vm, geometry.stride, total)?;
+        }
+        KernelObject::backing(dev, bytes, CpuMap::WriteCombined)
+    }
     fn map_block(
         object: &KernelObject,
         vm: &mmu::Vm,
@@ -441,8 +458,7 @@ impl Tvb {
         if blocks == 0 || blocks > geometry.max_blocks() {
             return Err(ERANGE);
         }
-        let backing = KernelObject::backing(dev, Self::backing_bytes(geometry, blocks)?,
-            CpuMap::WriteCombined)?;
+        let backing = Self::allocate(dev, vm, geometry, blocks)?;
         let mut mappings = KVec::with_capacity(blocks, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(blocks, GFP_KERNEL)?;
         for index in 0..blocks {
@@ -494,8 +510,7 @@ impl Tvb {
         let added = target - self.blocks();
         self.extensions.reserve(1, GFP_KERNEL)?;
         self.addresses.reserve(added, GFP_KERNEL)?;
-        let backing = KernelObject::backing(dev, Self::backing_bytes(self.geometry, added)?,
-            CpuMap::WriteCombined)?;
+        let backing = Self::allocate(dev, vm, self.geometry, added)?;
         let mut mappings = KVec::with_capacity(added, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(added, GFP_KERNEL)?;
         for relative in 0..added {
