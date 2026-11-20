@@ -1188,6 +1188,17 @@ static void t8122_sleep_undo_regs(struct apple_sleep *s)
 	t8122.notify_staged = false;
 }
 
+/*
+ * J613 diagnostic: the boot core arms its own physical timer this many seconds ahead before its
+ * last WFI. A core that lost its power cannot take it: no 'w' means the SoC went down. If the
+ * WFI returns, the boot core writes 'w', the engine's words once (QT), and masks the timer.
+ */
+static unsigned int t8122_wfi_timer_s;
+module_param(t8122_wfi_timer_s, uint, 0600);
+MODULE_PARM_DESC(t8122_wfi_timer_s,
+		 "J613 DIAGNOSTIC: the boot core's own timer, this many s after its last WFI starts, shows whether it kept its power (0 = off)");
+static bool t8122_wfi_timer_armed;
+
 static void t8122_deep_wfi_arm(void)
 {
 	if (t8122_quiet)
@@ -1196,8 +1207,18 @@ static void t8122_deep_wfi_arm(void)
 		t8142_ed_release();
 	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
 	/* The boot core's, last: 'Z' going in. */
-	if (apple_sleep && (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) == apple_sleep->mbox->boot_mpidr)
+	if (apple_sleep && (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) == apple_sleep->mbox->boot_mpidr) {
+		unsigned int secs = READ_ONCE(t8122_wfi_timer_s);
+
+		if (secs) {
+			write_sysreg(read_sysreg(cntpct_el0) + (u64)secs * arch_timer_get_cntfrq(),
+				     cntp_cval_el0);
+			write_sysreg(ARCH_TIMER_CTRL_ENABLE, cntp_ctl_el0);
+			isb();
+			t8122_wfi_timer_armed = true;
+		}
 		t8122_dc_putc('Z');
+	}
 }
 
 static void t8122_aon_lower(struct apple_sleep *s, u32 off)
@@ -1392,10 +1413,19 @@ static void t8122_sleep_post_timer(struct apple_sleep *s)
 }
 
 /* 'w' each time the boot core's WFI returns: a core still awake, not a SoC that slept. */
+static void t8122_q_line(struct apple_sleep *s, char tag);
+
 static u32 t8122_aic_ack(void)
 {
 	if (t8122.wfi_returns++ < 32)
 		t8122_dc_putc('w');
+	if (t8122_wfi_timer_armed && apple_sleep) {
+		t8122_wfi_timer_armed = false;
+		write_sysreg(ARCH_TIMER_CTRL_ENABLE | ARCH_TIMER_CTRL_IT_MASK, cntp_ctl_el0);
+		isb();
+		t8122_q_line(apple_sleep, 'T');
+		t8122_dc_puts("\nQT end\n");
+	}
 
 	return aic_sleep_ack();
 }
@@ -1471,55 +1501,51 @@ MODULE_PARM_DESC(t8122_post_commit_watch,
  * and last, and the wake block's 0x24..0x44 status. macOS, read at its wake (run 56): gates
  * 0x80000000, clusters 0 / 0xf, CPU-start 0xef, CLLT last 0x31c17, status +0x34 = 0x08000000.
  */
+static void t8122_q_line(struct apple_sleep *s, char tag)
+{
+	unsigned int i;
+
+	t8122_dc_puts("\nQ");
+	t8122_dc_putc(tag);
+	t8122_dc_puts(" c=");
+	t8122_dc_hex(readl(s->commit));
+	t8122_dc_puts(" cl=");
+	t8122_dc_hex(readl(s->cluster + T8122_CLUSTER_E));
+	t8122_dc_putc('/');
+	t8122_dc_hex(readl(s->cluster + T8122_CLUSTER_P));
+	t8122_dc_puts(" g=");
+	t8122_dc_hex(readl(s->pwrgate + T8122_PWRGATE_E));
+	t8122_dc_putc('/');
+	t8122_dc_hex(readl(s->pwrgate + T8122_PWRGATE_P));
+	t8122_dc_puts(" s=");
+	for (i = 0; i < 4; i++) {
+		t8122_dc_hex(readl(s->cpu_start + 4 * i));
+		t8122_dc_putc(i < 3 ? '/' : ' ');
+	}
+	t8122_dc_puts("l=");
+	t8122_dc_hex(readl(s->cllt + T8122_CLLT_CTL));
+	t8122_dc_putc('/');
+	t8122_dc_hex(readl(s->cllt + T8122_CLLT_LAST));
+	if (s->wake) {
+		t8122_dc_puts(" w=");
+		for (i = 0x24; i <= 0x44; i += 4) {
+			t8122_dc_hex(readl(s->wake + i));
+			t8122_dc_putc(i < 0x44 ? '/' : ' ');
+		}
+	}
+}
+
 static void t8122_sleep_post_release(struct apple_sleep *s)
 {
 	static const unsigned int at_ms[] = { 5, 50, 500, 3000 };
-	unsigned int n, i, done = 0;
+	unsigned int n, done = 0;
 
 	if (!READ_ONCE(t8122_post_commit_watch))
 		return;
 	for (n = 0; n < ARRAY_SIZE(at_ms); n++) {
 		mdelay(at_ms[n] - done);
 		done = at_ms[n];
-		t8122_dc_puts("\nQ");
-		t8122_dc_putc('0' + n);
-		t8122_dc_puts(" c=");
-		t8122_dc_hex(readl(s->commit));
-		t8122_dc_puts(" cl=");
-		t8122_dc_hex(readl(s->cluster + T8122_CLUSTER_E));
-		t8122_dc_putc('/');
-		t8122_dc_hex(readl(s->cluster + T8122_CLUSTER_P));
-		t8122_dc_puts(" g=");
-		t8122_dc_hex(readl(s->pwrgate + T8122_PWRGATE_E));
-		t8122_dc_putc('/');
-		t8122_dc_hex(readl(s->pwrgate + T8122_PWRGATE_P));
-		t8122_dc_puts(" s=");
-		for (i = 0; i < 4; i++) {
-			t8122_dc_hex(readl(s->cpu_start + 4 * i));
-			t8122_dc_putc(i < 3 ? '/' : ' ');
-		}
-		t8122_dc_puts("l=");
-		t8122_dc_hex(readl(s->cllt + T8122_CLLT_CTL));
-		t8122_dc_putc('/');
-		t8122_dc_hex(readl(s->cllt + T8122_CLLT_LAST));
-		if (READ_ONCE(sleep_j613_ed)) {
-			unsigned int c, k;
-
-			t8122_dc_puts(" ed=");
-			for (c = 0; c < 2; c++)
-				for (k = 0; k < 4; k++) {
-					t8122_dc_hex(t8142_ed[c][k] ?
-						     readl_relaxed(t8142_ed[c][k] + T8142_ED_EDPRSR) : ~0U);
-					t8122_dc_putc(c == 1 && k == 3 ? ' ' : '/');
-				}
-		}
-		if (s->wake) {
-			t8122_dc_puts(" w=");
-			for (i = 0x24; i <= 0x44; i += 4) {
-				t8122_dc_hex(readl(s->wake + i));
-				t8122_dc_putc(i < 0x44 ? '/' : ' ');
-			}
-		}
+		t8122_q_line(s, '0' + n);
 	}
 	t8122_dc_puts("\nQ end\n");
 }
