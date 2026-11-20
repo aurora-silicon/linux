@@ -209,6 +209,21 @@ static u64 t8122_ctl_active(void __iomem *pwrgate)
 	return m;
 }
 
+/* J613 diagnostic (with t8122_wide_dump): the controller table's mask over the first minute. */
+static struct apple_sleep *t8122_ctl_s;
+static void t8122_ctl_timeline_fn(struct work_struct *w);
+static DECLARE_DELAYED_WORK(t8122_ctl_timeline, t8122_ctl_timeline_fn);
+static void t8122_ctl_timeline_fn(struct work_struct *w)
+{
+	static const unsigned int at_s[] = { 1, 2, 3, 5, 8, 12, 20, 30, 45, 60 };
+	static unsigned int n;
+
+	dev_info(t8122_ctl_s->dev, "J613 diagnostic: controller blocks active %016llx (sample %u)\n",
+		 t8122_ctl_active(t8122_ctl_s->pwrgate), n);
+	if (++n < ARRAY_SIZE(at_s))
+		schedule_delayed_work(&t8122_ctl_timeline, (at_s[n] - at_s[n - 1]) * HZ);
+}
+
 static void t8122_wide_print(void)
 {
 	unsigned int i;
@@ -1113,21 +1128,6 @@ static void t8122_commit_page_log(struct apple_sleep *s)
 		dev_info(s->dev, "J613 commit page %s\n", line);
 	}
 	iounmap(r);
-}
-
-/* J613 diagnostic (with t8122_wide_dump): the controller table's mask over the first minute. */
-static struct apple_sleep *t8122_ctl_s;
-static void t8122_ctl_timeline_fn(struct work_struct *w);
-static DECLARE_DELAYED_WORK(t8122_ctl_timeline, t8122_ctl_timeline_fn);
-static void t8122_ctl_timeline_fn(struct work_struct *w)
-{
-	static const unsigned int at_s[] = { 1, 2, 3, 5, 8, 12, 20, 30, 45, 60 };
-	static unsigned int n;
-
-	dev_info(t8122_ctl_s->dev, "J613 diagnostic: controller blocks active %016llx (sample %u)\n",
-		 t8122_ctl_active(t8122_ctl_s->pwrgate), n);
-	if (++n < ARRAY_SIZE(at_s))
-		schedule_delayed_work(&t8122_ctl_timeline, (at_s[n] - at_s[n - 1]) * HZ);
 }
 
 static int t8122_sleep_begin(struct apple_sleep *s)
