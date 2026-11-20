@@ -1327,11 +1327,12 @@ static void apple_dart_test_host_power_tables(struct kunit *test)
 #endif
 
 /*
- * A 27.2 J713 display DART: re-exported firmware segments take the protection
- * of the live leaves that map them (read-only text, cacheable data); a region
- * whose leaf maps another page keeps what it asked for.
+ * A firmware-27 display DART with locked roots (fw_live_prot): re-exported
+ * firmware segments take the protection of the live leaves that map them
+ * (read-only text, cacheable data); a region whose leaf maps another page
+ * keeps what it asked for.
  */
-static void apple_dart_test_j713_v27_fw_prot(struct kunit *test)
+static void apple_dart_test_fw_live_prot(struct kunit *test)
 {
 	const u64 fields = GENMASK_ULL(51, 40) | BIT_ULL(0);
 	const phys_addr_t text_pa = 0x80000000ULL, data_pa = 0x80100000ULL;
@@ -1358,7 +1359,7 @@ static void apple_dart_test_j713_v27_fw_prot(struct kunit *test)
 	dart->num_streams = 32;
 	dart->locked = true;
 	dart->fw_mirror = true;
-	dart->j713_v27 = true;
+	dart->fw_live_prot = true;
 	root = kunit_kzalloc(test, SZ_16K, GFP_KERNEL);
 	leaf = kunit_kzalloc(test, SZ_16K, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, root);
@@ -1385,15 +1386,15 @@ static void apple_dart_test_j713_v27_fw_prot(struct kunit *test)
 	pm_runtime_set_active(dart->dev);
 	pm_runtime_enable(dart->dev);
 
-	__apple_dart_j713_v27_fw_prot(&master, dart->dev, &head);
+	__apple_dart_fw_live_prot(&master, dart->dev, &head);
 	KUNIT_EXPECT_EQ(test, text.prot, IOMMU_READ | IOMMU_CACHE);
 	KUNIT_EXPECT_EQ(test, data.prot, IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
 	KUNIT_EXPECT_EQ(test, moved.prot, IOMMU_READ | IOMMU_WRITE);
 
-	/* Not a 27.2 J713 display DART: nothing changes. */
+	/* Not such a DART: nothing changes. */
 	text.prot = IOMMU_READ | IOMMU_WRITE;
-	dart->j713_v27 = false;
-	__apple_dart_j713_v27_fw_prot(&master, dart->dev, &head);
+	dart->fw_live_prot = false;
+	__apple_dart_fw_live_prot(&master, dart->dev, &head);
 	KUNIT_EXPECT_EQ(test, text.prot, IOMMU_READ | IOMMU_WRITE);
 	pm_runtime_disable(dart->dev);
 }
@@ -1407,7 +1408,7 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_locked_handoff),
 	KUNIT_CASE(apple_dart_test_sync_unknown_roots),
 	KUNIT_CASE(apple_dart_test_firmware_roots),
-	KUNIT_CASE(apple_dart_test_j713_v27_fw_prot),
+	KUNIT_CASE(apple_dart_test_fw_live_prot),
 	KUNIT_CASE(apple_dart_test_unmap_flush_after_publish_failure),
 	KUNIT_CASE(apple_dart_test_gated_commands),
 	KUNIT_CASE(apple_dart_test_resume_commands_failure),
