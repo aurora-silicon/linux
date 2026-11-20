@@ -303,10 +303,12 @@ int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 	    hwx->surface_count > ANE_H16_SURFACES || (hwx->scratch.size && !scratch))
 		return -EINVAL;
 	entries = hwx->surface_count + !!hwx->scratch.size;
+	/* The firmware reads the whole section: every byte has its one value. */
 	if (generic_size != ANE_H16_GENERIC_HEADER + entries * ANE_H16_GENERIC_ENTRY ||
 	    get_unaligned_le32(g) != ANE_H16_GENERIC_MAGIC ||
 	    !get_unaligned_le32(g + 4) ||
 	    get_unaligned_le32(g + 4) > ANE_H16_GENERIC_VERSION ||
+	    memchr_inv(g + 8, 0, ANE_H16_GENERIC_COUNT - 8) ||
 	    get_unaligned_le32(g + ANE_H16_GENERIC_COUNT) != entries)
 		return -ENOEXEC;
 	for (i = 0; i < entries; i++) {
@@ -321,7 +323,11 @@ int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 		if (get_unaligned_le32(e) != 1 || id == 2 || id == 3 ||
 		    id > ANE_H16_GENERIC_ID_MAX ||
 		    get_unaligned_le32(e + 8) != direction - 1 ||
-		    get_unaligned_le32(e + 0x10) != direction)
+		    get_unaligned_le32(e + 0xc) ||
+		    get_unaligned_le32(e + 0x10) != direction ||
+		    memchr_inv(e + 0x14, 0, 0xc) ||
+		    get_unaligned_le32(e + 0x28) != ANE_H16_GENERIC_ENTRY_TAIL ||
+		    get_unaligned_le32(e + 0x2c))
 			return -ENOEXEC;
 		/* The scratch entry may round __bss up to its 16 KiB mapping. */
 		if (is_scratch ? bytes < hwx->scratch.size ||
@@ -427,7 +433,8 @@ int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 		u64 seen = 0;
 
 		if (get_unaligned_le32(rec) || get_unaligned_le32(rec + 4) ||
-		    refs > ANE_H16_OPERATION_REFS_MAX)
+		    refs > ANE_H16_OPERATION_REFS_MAX ||
+		    memchr_inv(rec + 0xc + refs * 8, 0, ANE_H16_OPERATION_RECORD - 0xc - refs * 8))
 			goto out;
 		for (i = 0; i < refs; i++) {
 			u32 slot = get_unaligned_le32(rec + 0xc + i * 8);
@@ -466,6 +473,53 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(ane_h16_operation_validate);
+
+/*
+ * The procedure and text-properties sections have one form each, which the
+ * kernel derives from the validated program: one procedure, and one text
+ * segment of the whole task stream with its task count. The firmware takes
+ * the stream's framing (segment offset, size, task count) from the text
+ * properties, so any other form would describe a stream other than the one
+ * the task validator checked.
+ */
+void ane_h16_fixed_sections(const struct ane_h16_hwx *hwx,
+			    u8 procedure[ANE_H16_PROCEDURE_SIZE],
+			    u8 properties[ANE_H16_PROPERTIES_SIZE])
+{
+	static const u32 call[] = { 1, 3, 0, 0, 1, 0, U32_MAX, 4 };
+	unsigned int i;
+
+	memset(procedure, 0, ANE_H16_PROCEDURE_SIZE);
+	put_unaligned_le32(1, procedure);
+	put_unaligned_le64(0x18, procedure + 8);
+	put_unaligned_le64(sizeof(call), procedure + 0x10);
+	for (i = 0; i < ARRAY_SIZE(call); i++)
+		put_unaligned_le32(call[i], procedure + 0x18 + i * 4);
+	memset(properties, 0, ANE_H16_PROPERTIES_SIZE);
+	put_unaligned_le32(1, properties);
+	put_unaligned_le32(hwx->tasks, properties + 0xc);
+	put_unaligned_le64(hwx->text.size, properties + 0x20);
+}
+EXPORT_SYMBOL_GPL(ane_h16_fixed_sections);
+
+int ane_h16_fixed_sections_validate(const struct ane_h16_hwx *hwx,
+				    const void *const aux[ANE_H16_AUX_COUNT],
+				    const size_t aux_size[ANE_H16_AUX_COUNT])
+{
+	u8 procedure[ANE_H16_PROCEDURE_SIZE], properties[ANE_H16_PROPERTIES_SIZE];
+
+	if (!hwx || !aux || !aux_size || !aux[ANE_H16_AUX_PROCEDURE] ||
+	    !aux[ANE_H16_AUX_TEXT_PROPERTIES])
+		return -EINVAL;
+	ane_h16_fixed_sections(hwx, procedure, properties);
+	if (aux_size[ANE_H16_AUX_PROCEDURE] != sizeof(procedure) ||
+	    aux_size[ANE_H16_AUX_TEXT_PROPERTIES] != sizeof(properties) ||
+	    memcmp(aux[ANE_H16_AUX_PROCEDURE], procedure, sizeof(procedure)) ||
+	    memcmp(aux[ANE_H16_AUX_TEXT_PROPERTIES], properties, sizeof(properties)))
+		return -ENOEXEC;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_fixed_sections_validate);
 
 /*
  * The mcache custom-BAR records come from the program descriptor relocation
@@ -987,9 +1041,11 @@ static int h16_program_bind(const struct ane_h16_program *p,
 {
 	int ret;
 
-	ret = ane_h16_process_bindings(&p->hwx, aux[ANE_H16_AUX_GENERIC],
-				       aux_size[ANE_H16_AUX_GENERIC], b->bindings,
-				       &b->count, &b->scratch);
+	ret = ane_h16_fixed_sections_validate(&p->hwx, aux, aux_size);
+	if (!ret)
+		ret = ane_h16_process_bindings(&p->hwx, aux[ANE_H16_AUX_GENERIC],
+					       aux_size[ANE_H16_AUX_GENERIC], b->bindings,
+					       &b->count, &b->scratch);
 	if (!ret)
 		ret = ane_h16_operation_validate(&p->snapshot, &p->hwx,
 						 aux[ANE_H16_AUX_OPERATION],
