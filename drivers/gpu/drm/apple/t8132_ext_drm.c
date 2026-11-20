@@ -1045,7 +1045,7 @@ static int t8132_ext_out_init(struct drm_device *drm, struct platform_device *pd
 		goto err_crtc;
 	out->encoder.possible_crtcs = drm_crtc_mask(&out->crtc);
 	ret = drm_connector_init(drm, &out->connector, &t8132_ext_connector_funcs,
-				 dcp_t8132_main_external(pdev->dev.of_node) ?
+				 dcp_t8132_fixed_hdmi(pdev->dev.of_node) ?
 				 DRM_MODE_CONNECTOR_HDMIA : DRM_MODE_CONNECTOR_DisplayPort);
 	if (ret)
 		goto err_encoder;
