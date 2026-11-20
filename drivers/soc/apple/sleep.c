@@ -685,7 +685,6 @@ struct apple_sleep_soc {
 	unsigned int cpu_clusters;
 	unsigned int cpu_cores_per_cluster;
 	bool (*cpu_valid)(u64 mpidr);
-	const char *machine;
 	u64 boot_mpidr;
 	unsigned int cpu_count;
 	struct apple_sleep_domains ps;
@@ -1916,10 +1915,10 @@ static int apple_sleep_validate_cpu_topology(struct apple_sleep *s)
 		    soc->cpu_cores_per_cluster > 32)
 		return dev_err_probe(s->dev, -EINVAL, "invalid CPU-start geometry\n");
 
-	if (soc->machine && (!of_machine_is_compatible(soc->machine) ||
-	    cpu_logical_map(0) != soc->boot_mpidr ||
-	    num_possible_cpus() != soc->cpu_count))
-		return dev_err_probe(s->dev, -EINVAL, "unsupported board/CPU inventory\n");
+	if ((soc->boot_mpidr || soc->cpu_count) &&
+	    (cpu_logical_map(0) != soc->boot_mpidr ||
+	     num_possible_cpus() != soc->cpu_count))
+		return dev_err_probe(s->dev, -EINVAL, "unsupported CPU inventory\n");
 
 	index = of_property_match_string(np, "reg-names", "cpu-start");
 	if (index < 0)
