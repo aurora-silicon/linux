@@ -624,7 +624,7 @@ void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,
 
 #define SCALE_FACTOR (1 << 10)
 
-static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
+static u32 interpolate(int val, int min, int max, const u32 *tbl, size_t tbl_size)
 {
 	u32 frac;
 	u64 low, high;
