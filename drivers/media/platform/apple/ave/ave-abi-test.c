@@ -1468,6 +1468,32 @@ static void ave_6070_text_id(struct kunit *test)
  * The M4 Max loader sets one TEXT word every boot: the identity hashes it as
  * zero, so two boots give one CRC, and it leaves the rest of TEXT counted.
  */
+/* The 27.2 build differs from 26A428 only in its Process command sizes. */
+static void ave_26b123_layout(struct kunit *test)
+{
+	const struct ave_fw_layout *a = &ave_layout_26a428;
+	const struct ave_fw_layout *b = ave_layout_for_crc(0x99fc929a);
+
+	KUNIT_ASSERT_PTR_EQ(test, b, &ave_layout_26b123);
+	KUNIT_EXPECT_TRUE(test, b->encode_ready);
+	KUNIT_EXPECT_EQ(test, b->kind, AVE_LAYOUT_26A428);
+	KUNIT_EXPECT_PTR_EQ(test, b->abi, a->abi);
+	for (unsigned int c = 0; c < 2; c++) {
+		KUNIT_EXPECT_EQ(test, b->bytes[c][AVE_IMAGE_START],
+				a->bytes[c][AVE_IMAGE_START]);
+		KUNIT_EXPECT_EQ(test, b->bytes[c][AVE_IMAGE_PROCESS],
+				a->bytes[c][AVE_IMAGE_PROCESS] + 0x10);
+	}
+	KUNIT_EXPECT_EQ(test, b->bytes[0][AVE_IMAGE_PROCESS], 0x6e08);
+	KUNIT_EXPECT_EQ(test, b->bytes[1][AVE_IMAGE_PROCESS], 0x78c8);
+	KUNIT_EXPECT_EQ(test, memcmp(b->start, a->start, sizeof(a->start)), 0);
+	KUNIT_EXPECT_EQ(test, memcmp(b->process, a->process, sizeof(a->process)), 0);
+	KUNIT_EXPECT_EQ(test, memcmp(b->result, a->result, sizeof(a->result)), 0);
+	KUNIT_EXPECT_EQ(test, b->hdr_bytes, a->hdr_bytes);
+	KUNIT_EXPECT_EQ(test, b->max_slots, a->max_slots);
+	KUNIT_EXPECT_EQ(test, b->process_subtype, a->process_subtype);
+}
+
 static void ave_t6041_text_boot_word(struct kunit *test)
 {
 	const u32 off = ave_t6041.text_boot_word, size = off + 0x100;
@@ -1511,6 +1537,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
 	KUNIT_CASE(ave_6070_variants),	    KUNIT_CASE(ave_6070_text_id),
 	KUNIT_CASE(ave_6070_smalloc),
+	KUNIT_CASE(ave_26b123_layout),
 	{}
 };
 
