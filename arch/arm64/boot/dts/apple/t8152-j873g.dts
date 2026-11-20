@@ -504,3 +504,4 @@
 #include "t8152-j873-audio.dtsi"
 #include "t8152-j873-dcp.dtsi"
 #include "t8152-j873-avd.dtsi"
+#include "t8152-j873-usb4.dtsi"
