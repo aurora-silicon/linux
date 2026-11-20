@@ -120,7 +120,8 @@ def findings(filename):
         if not any(DART.match(c) for c in compatible):
             continue
         # A disabled DART that no enabled device uses stays off with its block.
-        if status(offset) != "okay" and not any(enabled(o) for o in consumers.get(offset, [])):
+        # A DART inside a disabled node is disabled too: it is never populated.
+        if not enabled(offset) and not any(enabled(o) for o in consumers.get(offset, [])):
             continue
         label = labels.get(path, "-")
         domains = cells(prop(offset, "power-domains"))

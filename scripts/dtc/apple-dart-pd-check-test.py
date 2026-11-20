@@ -126,6 +126,29 @@ class DartPdTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("iommu@5000", result.stdout)
 
+    def test_dart_inside_a_disabled_node_is_skipped(self):
+        # A router's DART, okay itself, inside the disabled router that is its only
+        # user, on the router's disabled domain: it is never populated.
+        disabled = DOMAIN.replace("{", '{ status = "disabled";')
+        router = ('acio@5000 { #address-cells = <1>; #size-cells = <0>; status = "disabled"; '
+                  'iommus = <&dart_x 0>; dart_x: iommu@a00 { compatible = "apple,t8110-dart"; '
+                  '#iommu-cells = <1>; power-domains = <&ps_x>; }; };')
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", disabled, GAP, router))
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("iommu@a00", result.stdout)
+
+    def test_dart_inside_an_enabled_node_on_a_disabled_domain_fails(self):
+        disabled = DOMAIN.replace("{", '{ status = "disabled";')
+        router = ('acio@5000 { #address-cells = <1>; #size-cells = <0>; '
+                  'iommus = <&dart_x 0>; dart_x: iommu@a00 { compatible = "apple,t8110-dart"; '
+                  '#iommu-cells = <1>; power-domains = <&ps_x>; }; };')
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", disabled, GAP, router))
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("/soc/acio@5000/iommu@a00 dart_x apple,t8110-dart okay: "
+                      "power domain /soc/power-controller@3000 is disabled (new)", result.stdout)
+
     def test_enabled_dart_on_disabled_or_missing_domain_fails(self):
         disabled = DOMAIN.replace("{", '{ status = "disabled";')
         on_disabled = ('iommu@5000 { compatible = "apple,t8110-dart"; '
