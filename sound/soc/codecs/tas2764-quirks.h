@@ -7,7 +7,7 @@
 #include "tas2764.h"
 
 /* Bitmask of enabled Apple quirks */
-#define ENABLED_APPLE_QUIRKS	0x3f
+#define ENABLED_APPLE_QUIRKS	0x7f
 
 /*
  * Disable noise gate and flip down reserved bit in NS_CFG0
