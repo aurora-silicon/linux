@@ -40,10 +40,20 @@ struct ave_mctf_layout;
 #define AVE_RC_CBR 2
 #define AVE_RC_CQ 3
 #define AVE_RC_VBR 4
+/*
+ * 6070 rate-control modes: 1 runs the rate controller, for CBR and VBR
+ * alike; 2 (the 9003 CBR value) holds the Start QP.
+ */
+#define AVE_6070_RC_ON 1
 
 #define AVE_MAX_SLOTS 7
 /* Sessions one firmware boot serves at once (macOS was seen running two). */
 #define AVE_MAX_SESSIONS 2
+/*
+ * Stopped sessions whose memory may wait for a power cycle while another
+ * session keeps the firmware up. A session beyond this is refused instead.
+ */
+#define AVE_QUARANTINE_MAX 4
 
 /*
  * Coprocessor memory every firmware boot uses, all inside one allocation.
@@ -178,6 +188,11 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_T6050_26C5035 0xc25b4ddb
 /* The M5 (T8142) build of the same 26A428 firmware (AppleAVE2FW 9013.45.1). */
 #define AVE_FW_TEXT_CRC_T8142_26A428 0x8a3784bd
+/*
+ * The M2 Max (T6021) build of AppleAVE2FW 6070.11.1, macOS 13.5 22G74, with
+ * the link cell at TEXT 0x423c zero.
+ */
+#define AVE_FW_TEXT_CRC_T6021_6070 0x0d56db87
 
 struct ave_ctx;
 
@@ -243,6 +258,8 @@ struct ave_variant {
 	size_t extra0_size;
 	/* Register sequence and boot/hello configuration have been qualified. */
 	bool boot_qualified;
+	/* 6070 Config carries a 64 KiB shared area. */
+	bool config_shared;
 };
 
 /* Start surfaces of an MCTF session, aliases included */
@@ -277,6 +294,7 @@ struct ave_dev {
 	struct ave_recovery_history recovery;
 	unsigned int recovery_count;
 	struct ave_session *failed_sessions;
+	unsigned int quarantined;
 	bool inject_wedge;
 
 	/* debugfs: the last Start and first Process built, per codec */
@@ -293,6 +311,8 @@ struct ave_dev {
 	dma_addr_t extra0_dma;
 	size_t extra0_map_size;
 	bool extra0_mapped;
+	/* Config's shared area, for a variant with config_shared */
+	struct ave_buf config_shared;
 	bool module_pinned;
 	/* A 6070 lifecycle command is serialized per logical operation. */
 	struct ave_reply expected[AVE_OP_COUNT];
@@ -378,8 +398,13 @@ struct ave_params {
 	u32 stride; /* NV12 or P010 line stride in bytes, both planes */
 	u32 sample_bytes; /* 1 for NV12, 2 for P010 */
 	u32 mbs; /* 16x16 macroblocks */
-	u32 fps_num, fps_den; /* frames per second = num / den */
+	u32 fps_num, fps_den; /* frames per second = num / den, as the firmware gets it */
 	u32 fps_int; /* the same, rounded */
+	u32 client_fps_num, client_fps_den; /* the client's timeperframe, exactly */
+	/* The layout's encode settings, see struct ave_fw_layout. */
+	bool h264_inter;
+	bool rate_control;
+	bool low_delay;
 	u32 slots;
 	u32 refs; /* max_num_ref_frames + 1 */
 	bool bframes;
@@ -515,6 +540,11 @@ struct ave_ctx {
 
 	u32 bitrate_mode;
 	u32 quality; /* V4L2 constant quality, 0..100 */
+	/*
+	 * Frame rate from the last S_PARM, rounded, with rate_control. It is
+	 * kept here because the worker frees the session without vdev_lock.
+	 */
+	u32 fps_now;
 	u32 bitrate;
 	u32 bitrate_peak;
 	u32 gop_size;
@@ -551,7 +581,7 @@ static inline struct ave_ctx *ave_file_to_ctx(struct file *file)
 	return container_of(file_to_v4l2_fh(file), struct ave_ctx, fh);
 }
 
-extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112;
+extern const struct ave_variant ave_t6000, ave_t6021, ave_t6041, ave_t8112;
 
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
@@ -643,6 +673,11 @@ int ave_sess_free_slot(struct ave_session *sess);
 void ave_sess_reply(struct ave_dev *ave, const struct ave_reply *reply);
 int ave_sess_input(struct ave_ctx *ctx, unsigned int slot,
 		   struct vb2_v4l2_buffer *src, dma_addr_t *input);
+/* Add VUI timing to the SPS at the start of an Annex B buffer. */
+void ave_h264_stamp_timing(u8 *buf, size_t room, size_t *len, u32 fps_num,
+			   u32 fps_den);
+void ave_hevc_stamp_timing(u8 *buf, size_t room, size_t *len, u32 fps_num,
+			   u32 fps_den);
 int ave_sess_output(struct ave_ctx *ctx, unsigned int slot,
 		    struct vb2_v4l2_buffer *dst, bool *keyframe);
 void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot);

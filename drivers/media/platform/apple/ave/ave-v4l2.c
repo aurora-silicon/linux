@@ -406,6 +406,13 @@ static int ave_s_parm(struct file *file, void *priv, struct v4l2_streamparm *a)
 		*t = (struct v4l2_fract){ 1, 1 };
 	ctx->timeperframe = *t;
 	a->parm.output.capability = V4L2_CAP_TIMEPERFRAME;
+	/*
+	 * The firmware keeps the frame rate from Start. A rate set while
+	 * streaming scales the bit rate each Process asks for instead.
+	 */
+	if (ctx->ave->layout && ctx->ave->layout->rate_control)
+		WRITE_ONCE(ctx->fps_now,
+			   max(DIV_ROUND_CLOSEST(t->denominator, t->numerator), 1U));
 	return 0;
 }
 
@@ -576,11 +583,19 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 	v4l2_ctrl_handler_init(hdl, 19);
 
 	/*
-	 * The 6070 firmware path (M1 Pro/Max, M2) is qualified for constant
-	 * quality only: offer just that mode, so a client that keeps the
-	 * defaults (GStreamer, FFmpeg) gets a session instead of a refusal.
+	 * A 6070 layout without rate_control runs constant quality only:
+	 * offer just that mode, so a client that keeps the defaults
+	 * (GStreamer, FFmpeg) gets a session instead of a refusal. With
+	 * rate_control it also offers CBR and VBR; the default stays CQ.
 	 */
-	if (ctx->ave->layout && ctx->ave->layout->kind == AVE_LAYOUT_6070)
+	if (ctx->ave->layout && ctx->ave->layout->rate_control)
+		v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+				       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
+				       ~(BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_VBR) |
+					 BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CBR) |
+					 BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CQ)),
+				       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ);
+	else if (ctx->ave->layout && ctx->ave->layout->kind == AVE_LAYOUT_6070)
 		v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
 				       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
 				       ~BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CQ),
@@ -604,8 +619,10 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 	/*
 	 * The firmware either uses up to three B-frames (reordering them
 	 * itself) or none. Baseline and intra-only H.264 never have any.
+	 * A low_delay layout defaults to none.
 	 */
-	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_B_FRAMES, 0, 3, 3, 3);
+	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_B_FRAMES, 0, 3, 3,
+			  ctx->ave->layout && ctx->ave->layout->low_delay ? 0 : 3);
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEADER_MODE,
 			       V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
 			       BIT(V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE),
@@ -839,6 +856,11 @@ static int ave_session_attach(struct ave_ctx *ctx)
 	} else if (ave->fw_state != AVE_FW_RUNNING) {
 		dev_err(ave->dev, "firmware state %d, cannot add a session\n", ave->fw_state);
 		return -EIO;
+	} else if (ave->quarantined >= AVE_QUARANTINE_MAX) {
+		dev_warn_ratelimited(ave->dev,
+				     "%u stopped sessions wait for a power cycle; close every stream first\n",
+				     ave->quarantined);
+		return -EBUSY;
 	}
 
 	sess->index = idx;
@@ -1227,12 +1249,17 @@ static int ave_encode_one(struct ave_ctx *ctx)
 		return ret;
 	}
 
-	/* Like macOS: the first frame goes alone, then a Complete. */
-	if (sess->frames == 1) {
+	/*
+	 * Like macOS: the first frame goes alone, then a Complete. Without
+	 * B-frames a low_delay layout waits for every frame, so each one is
+	 * answered before the next goes in; a second session on the same
+	 * core waits behind it.
+	 */
+	if (sess->frames == 1 || (sess->p.low_delay && !sess->p.bframes)) {
 		ret = ave_ipc_pump(ave, AVE_FRAME_WAIT_MS, ave_frame_answered, &sess->slot[slot]);
-		if (!ret)
+		if (!ret && sess->frames == 1)
 			ret = ave_cmd_complete(ctx, 1);
-		if (!ret)
+		if (!ret && sess->frames == 1)
 			ret = ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
 		if (ret)
 			return ret;
