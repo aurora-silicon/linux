@@ -139,10 +139,26 @@ extern const struct apple_jpeg_variant apple_jpeg_t8112;
 extern const struct apple_jpeg_variant apple_jpeg_t8122;
 extern const struct apple_jpeg_variant apple_jpeg_t8140;
 
-/* T6050's 4:2:2 job programming is not known yet. */
-static inline bool apple_jpeg_has_422(const struct apple_jpeg_reg_layout *layout)
+/*
+ * The JPEG's chroma subsampling, which is also the raw input's: NV12 4:2:0,
+ * NV16 4:2:2, NV24 4:4:4, GREY 4:0:0.
+ */
+enum apple_jpeg_chroma {
+	AJ_CHROMA_420,
+	AJ_CHROMA_422,
+	AJ_CHROMA_444,
+	AJ_CHROMA_GRAY,
+};
+
+/*
+ * The earlier revisions' job programming is known for 4:2:0 and 4:2:2 (from
+ * register traces). T6050 (and T8142, programmed as T6050) has all four,
+ * from AppleJPEGDriver's V14 encode setup run under an emulator (27.2.1).
+ */
+static inline bool apple_jpeg_has_chroma(const struct apple_jpeg_reg_layout *layout,
+					 enum apple_jpeg_chroma chroma)
 {
-	return !layout->t6050_job;
+	return chroma == AJ_CHROMA_420 || layout->t6050_job || chroma == AJ_CHROMA_422;
 }
 
 static inline bool
@@ -156,7 +172,7 @@ apple_jpeg_hwrev_supported(const struct apple_jpeg_variant *variant, u32 hwrev)
 struct apple_jpeg_job {
 	u32 width;
 	u32 height;
-	bool is422;		/* NV16: 4:2:2; NV12: 4:2:0 */
+	enum apple_jpeg_chroma subsampling;
 	u32 luma_stride;
 	u32 chroma_stride;
 	u64 luma;
@@ -170,27 +186,44 @@ struct apple_jpeg_job {
 
 /*
  * Raw input: one buffer, the luma rows, then the interleaved CbCr rows at
- * the same stride (V4L2 NV12/NV16). The engine prefetches its input up to
+ * the same stride (V4L2 NV12/NV16), twice the stride for NV24 and none for
+ * GREY. The engine prefetches its input up to
  * AJ_INPUT_END, so both planes must sit in one buffer that ends there: with
  * separate plane buffers it read past the end of whichever plane lies lower
- * and faulted. It also fetches whole MCU rows (16 for 4:2:0, 8 for 4:2:2);
+ * and faulted. It also fetches whole MCU rows (16 for 4:2:0, 8 otherwise);
  * the luma overrun lands in the chroma rows, and the buffer carries the
- * chroma rows up to the MCU boundary after the visible ones.
+ * chroma rows up to the MCU boundary after the visible ones. GREY has no
+ * chroma, so its luma rows go up to the MCU boundary.
  */
 struct apple_jpeg_layout {
 	u32 bytesperline;
+	u32 chroma_stride;
 	u32 chroma_offset;
 	u32 sizeimage;
 };
 
-static inline void apple_jpeg_raw_layout(u32 width, u32 height, bool is422,
+static inline void apple_jpeg_raw_layout(u32 width, u32 height,
+					 enum apple_jpeg_chroma chroma,
 					 struct apple_jpeg_layout *l)
 {
-	u32 rows = ALIGN(height, is422 ? 8 : 16);
+	u32 rows = ALIGN(height, chroma == AJ_CHROMA_420 ? 16 : 8);
 
 	l->bytesperline = ALIGN(width, 16);
-	l->chroma_offset = l->bytesperline * height;
-	l->sizeimage = l->chroma_offset + l->bytesperline * (is422 ? rows : rows / 2);
+	l->chroma_stride = l->bytesperline * (chroma == AJ_CHROMA_444 ? 2 : 1);
+	switch (chroma) {
+	case AJ_CHROMA_GRAY:
+		l->chroma_offset = 0;
+		l->sizeimage = l->bytesperline * rows;
+		break;
+	case AJ_CHROMA_420:
+		l->chroma_offset = l->bytesperline * height;
+		l->sizeimage = l->chroma_offset + l->chroma_stride * (rows / 2);
+		break;
+	default:
+		l->chroma_offset = l->bytesperline * height;
+		l->sizeimage = l->chroma_offset + l->chroma_stride * rows;
+		break;
+	}
 }
 
 /* A kept CAPTURE size above the worst case is honoured up to this. */
