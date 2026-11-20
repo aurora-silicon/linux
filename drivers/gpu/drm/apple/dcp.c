@@ -4597,6 +4597,35 @@ static int dcp_ext26_start_services(struct apple_dcp *dcp)
 	return 0;
 }
 
+/*
+ * Where a firmware-27 external processor's DPTX services are, from the
+ * endpoints its firmware advertises. The 27.2 dcpext beside an M2 or M3
+ * internal DCP (J413, J615) advertises 0x20-0x2c, so both DPTX endpoints,
+ * but announces nothing on DPTX_ENDPOINT_V2: it serves AppleDCPDPTXController
+ * on DPTX_CONTROLLER_ENDPOINT and AppleDCPDPTXRemotePort on DPTX_ENDPOINT,
+ * the layout macOS 27.2 binds on T8142's dcpext. So a dcpext on firmware 27
+ * whose firmware advertises both of those gets the controller and its ports
+ * there.
+ *
+ * Decided here, not at probe: RTKit is woken at bind, and its endpoint map is
+ * known only from then on. Hardware data that names an endpoint keeps it:
+ * T8142's dcpext (the same layout), and the T6050 and firmware-27 T6041
+ * dcpexts, whose ports have been opened on DPTX_ENDPOINT_V2 so far.
+ */
+static void dcp_v27_dptx_layout(struct apple_dcp *dcp)
+{
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !dcp->dcpext ||
+	    dcp->hw.dptx_endpoint)
+		return;
+	if (!apple_rtkit_has_endpoint(dcp->rtk, DPTX_CONTROLLER_ENDPOINT) ||
+	    !apple_rtkit_has_endpoint(dcp->rtk, DPTX_ENDPOINT))
+		return;
+	dcp->hw.dptx_endpoint = DPTX_ENDPOINT;
+	dcp->hw.dptx_controller = true;
+	dev_info(dcp->dev, "firmware 27: DPTX controller on %#x, ports on %#x (advertised)\n",
+		 DPTX_CONTROLLER_ENDPOINT, DPTX_ENDPOINT);
+}
+
 int dcp_start(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -4639,6 +4668,7 @@ int dcp_start(struct platform_device *pdev)
 		return -ENODEV;
 	if (dcp_is_ext26(dcp))
 		return dcp_ext26_start_services(dcp);
+	dcp_v27_dptx_layout(dcp);
 
 	/* Make the H17P allocator available before external service discovery. */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
@@ -7153,17 +7183,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp->hw.num_dptx_ports = 2;
 		dcp->hw.adopt_live_session = true;
 		dcp->hw.sink_metadata_edid = true;
-	}
-	/*
-	 * T8112's external processor on firmware 27 (the 27.2 dcpext beside the
-	 * internal DCP) advertises both DPTX endpoints, but announces nothing
-	 * on DPTX_ENDPOINT_V2: as on T8142's dcpext, its port services are on
-	 * DPTX_ENDPOINT, behind the DPTX controller service.
-	 */
-	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
-	    of_device_is_compatible(dev->of_node, "apple,t8112-dcpext")) {
-		dcp->hw.dptx_endpoint = DPTX_ENDPOINT;
-		dcp->hw.dptx_controller = true;
+		/* Its ports where they have been opened so far, see dcp_v27_dptx_layout(). */
+		dcp->hw.dptx_endpoint = DPTX_ENDPOINT_V2;
 	}
 	/*
 	 * A SoC with derived power words is offered the stop only when asked for, and only on
@@ -9813,6 +9834,8 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
 	.sink_metadata_edid = true,
 	.link_report = true,
+	/* Its ports are announced on firmware 27's default endpoint. */
+	.dptx_endpoint = DPTX_ENDPOINT_V2,
 };
 
 /*
