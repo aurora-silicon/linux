@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The K114c, K114s, K116c and K116s USB-C ports ATC1 (left-front) and ATC2 (right):
+ * USB 2/3 and the PD controllers. A board file includes this after
+ * t6050-peripherals.dtsi, which describes nub-spmi-a1 for these boards.
+ *
+ * From the boards' ADT, the same on all four:
+ *   ATC0 usb-drd0 left-back  hpm0 nub-spmi-a0 0x0c (the boot link's debug port, not described)
+ *   ATC1 usb-drd1 left-front hpm1 nub-spmi-a0 0x0a, port-number 2, acio-parent acio1
+ *   ATC2 usb-drd2 right      hpm2 nub-spmi-a1 0x0c, port-number 3, acio-parent acio2
+ *   hpm5 nub-spmi-a0 0x08 (MagSafe, not a USB-C connector)
+ * The PD controllers are SN201202x. The USB4/Thunderbolt routers (acio1, acio2) and the
+ * DisplayPort routes are not described here; the PHYs run in USB mode. The combo PHY driver
+ * leaves ATC0 alone on purpose (apple,port-index 0).
+ *
+ * The boot loader fills the PHYs' tunables from the ADT through the atcphy aliases.
+ */
+/ {
+	aliases {
+		atcphy1 = &atc1_phy;
+		atcphy2 = &atc2_phy;
+	};
+};
+
+/* ==== The left-front USB-C port (ATC1) ==== */
+&nub_spmi_a0 {
+	status = "okay";
+
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left-front";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm1_hs: endpoint {
+						remote-endpoint = <&usb_drd1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm1_ss: endpoint {
+						remote-endpoint = <&atc1_phy_ep>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&atc1_phy_mbox {
+	status = "okay";
+};
+
+&atc1_phy {
+	status = "okay";
+
+	port {
+		atc1_phy_ep: endpoint {
+			remote-endpoint = <&hpm1_ss>;
+		};
+	};
+};
+
+&usb_drd1 {
+	status = "okay";
+
+	port {
+		usb_drd1_hs: endpoint {
+			remote-endpoint = <&hpm1_hs>;
+		};
+	};
+};
+
+&usb_drd1_dart_0 {
+	status = "okay";
+};
+
+&usb_drd1_dart_1 {
+	status = "okay";
+};
+
+/*
+ * ==== The right USB-C port (ATC2) ====
+ *
+ * The HPM is on its own bus, nub-spmi-a1, and nothing hands the port off, so the power
+ * domains, the PHY mailbox, the PHY, the DWC3 and its DARTs are enabled outright. The driver
+ * polls the generation 4 bus and refuses an interrupt on it.
+ */
+&ps_atc2_common {
+	status = "okay";
+};
+
+&ps_atc2_usb_aon {
+	status = "okay";
+};
+
+&ps_atc2_phymxwrap {
+	status = "okay";
+};
+
+&ps_atc2_usb {
+	status = "okay";
+};
+
+&atc2_phy_mbox {
+	status = "okay";
+};
+
+&atc2_phy {
+	status = "okay";
+
+	port {
+		atc2_phy_ep: endpoint {
+			remote-endpoint = <&hpm2_ss>;
+		};
+	};
+};
+
+&usb_drd2 {
+	status = "okay";
+
+	port {
+		usb_drd2_hs: endpoint {
+			remote-endpoint = <&hpm2_hs>;
+		};
+	};
+};
+
+&usb_drd2_dart_0 {
+	status = "okay";
+};
+
+&usb_drd2_dart_1 {
+	status = "okay";
+};
+
+&nub_spmi_a1 {
+	/delete-property/ interrupts;
+	status = "okay";
+
+	hpm2: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm2_hs: endpoint {
+						remote-endpoint = <&usb_drd2_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm2_ss: endpoint {
+						remote-endpoint = <&atc2_phy_ep>;
+					};
+				};
+			};
+		};
+	};
+};
