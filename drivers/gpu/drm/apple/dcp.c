@@ -5286,10 +5286,17 @@ void dcp_poweroff(struct platform_device *pdev)
 		}
 	} else if (dcp->hdmi_hpd) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+
 		if (!connected) {
 			disconnected_hpd_event(dcp->connector);
-			dcp_dptx_disconnect(dcp, 0);
 		}
+		/*
+		 * T6050 keeps the fixed HDMI DPTX link trained after the pipe is
+		 * blanked. Release it so the PHY can power down. dcp_poweron()
+		 * retrains the link before it enables the pipe again.
+		 */
+		if (!connected || dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			dcp_dptx_disconnect(dcp, 0);
 	}
 }
 
