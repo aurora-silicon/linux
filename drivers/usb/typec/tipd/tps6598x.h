@@ -470,6 +470,9 @@ struct cd321x {
 	struct notifier_block tbt_watch;
 	struct work_struct tbt_attach_work;
 	bool tbt_watch_registered;
+	/* Closes the USB4/Thunderbolt session before device_shutdown() */
+	struct notifier_block reboot_nb;
+	bool reboot_nb_registered;
 	atomic_t link_event;
 	atomic_t ready_event;
 	atomic_t restore_event;
@@ -578,6 +581,9 @@ void cd321x_mux_gave_up(struct cd321x *cd321x, unsigned int retries, unsigned in
 void cd321x_init_work(struct cd321x *cd321x);
 int cd321x_init_mux(struct cd321x *cd321x);
 void cd321x_stop_work(struct cd321x *cd321x);
+int cd321x_reboot_close(struct cd321x *cd321x);
+int cd321x_reboot_notify(struct notifier_block *nb, unsigned long action,
+			 void *data);
 bool cd321x_tbt_switch_keep_waiting(struct device *dev);
 struct typec_thunderbolt_switch *
 cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
