@@ -279,7 +279,13 @@ impl Drop for Scene::ver {
         assert_ne!(inner.active_scenes, 0);
         inner.active_scenes -= 1;
 
-        if inner.active_scenes == 0 {
+        // 27.2: a buffer keeps its slot for its lifetime. The hardware's descriptor for a slot
+        // is only rebuilt cleanly for a buffer it has not served before.
+        #[ver(V >= V27_2)]
+        let release = false;
+        #[ver(V < V27_2)]
+        let release = true;
+        if release && inner.active_scenes == 0 {
             mod_pr_debug!(
                 "Buffer: no scenes left, dropping slot {}",
                 inner.active_slot.take().unwrap().slot()
@@ -293,9 +299,6 @@ impl Drop for Scene::ver {
 #[versions(AGX_ROOT)]
 struct BufferInner {
     info: GpuObject<buffer::Info::ver>,
-    /// 27.2: the page list object and its firmware and client mappings.
-    #[ver(V >= V27_2)]
-    _page_list: (crate::gem::ObjectRef, mmu::KernelMapping, mmu::KernelMapping),
     ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
     ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
     blocks: KVec<GpuOnlyArray<u8>>,
@@ -313,6 +316,145 @@ struct BufferInner {
     preempt2_size: usize,
     preempt3_size: usize,
     num_clusters: usize,
+}
+
+/// 27.2: CPU address of the hardware PB descriptor table (16 bytes per buffer slot), published
+/// by the backend that owns it.
+static PB_DESCRIPTORS: core::sync::atomic::AtomicPtr<u8> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Publishes the PB descriptor table's CPU address (0x4000 bytes).
+pub(crate) fn set_pb_descriptors(table: *mut u8) {
+    PB_DESCRIPTORS.store(table, Ordering::Release);
+}
+
+/// Diagnostic: logs the non-zero PB descriptor table entries (27.2).
+pub(crate) fn dump_pb_descriptors(dev: &kernel::device::Device) {
+    let table = PB_DESCRIPTORS.load(Ordering::Acquire);
+    if table.is_null() {
+        return;
+    }
+    for slot in 0..64usize {
+        // SAFETY: the table is a live 0x4000-byte kernel mapping.
+        let d: [u32; 4] = unsafe {
+            let p = table.add(slot * 16).cast::<u32>();
+            crate::pgtable::clean_invalidate_poc(p.cast::<u8>(), 16);
+            crate::pgtable::poc_barrier();
+            core::array::from_fn(|i| p.add(i).read_volatile())
+        };
+        if d.iter().any(|w| *w != 0) {
+            dev_info!(dev, "PB descriptor[{}] = {:08x?}\n", slot, d);
+        }
+    }
+}
+
+/// 27.2: the page lists of all tile buffers, one region per buffer slot, mapped at the same
+/// address in every client address space that renders (and once for the firmware). The
+/// hardware keeps tiling with the last committed descriptor until the next setup command
+/// commits another, and touches that list in whatever address space it switches to: with
+/// every list mapped everywhere, a stale one is always readable.
+#[pin_data]
+pub(crate) struct PageListArena {
+    kmap: mmu::KernelMapping,
+    stride: usize,
+    slots: usize,
+    client_va: core::sync::atomic::AtomicU64,
+    /// The arena object and its client mappings (address space id, uses, mapping).
+    #[pin]
+    maps: Mutex<(crate::gem::ObjectRef, KVec<(u64, u32, mmu::KernelMapping)>)>,
+}
+
+// SAFETY: the object and mappings are only used through the mutex or immutable addresses.
+unsafe impl Send for PageListArena {}
+// SAFETY: as above.
+unsafe impl Sync for PageListArena {}
+
+static ARENA: core::sync::atomic::AtomicPtr<PageListArena> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+fn arena() -> Option<&'static PageListArena> {
+    let p = ARENA.load(Ordering::Acquire);
+    // SAFETY: published once from a leaked allocation that lives until module unload.
+    if p.is_null() { None } else { Some(unsafe { &*p }) }
+}
+
+/// Bytes of one slot's page list.
+fn page_list_stride() -> usize {
+    let max_blocks = 862_322_688 / BLOCK_SIZE;
+    (max_blocks * PAGES_PER_BLOCK * 4 + mmu::UAT_PGMSK) & !mmu::UAT_PGMSK
+}
+
+/// Creates the page list arena for `slots` buffer slots, mapped for the firmware in `kvm`.
+pub(crate) fn init_page_list_arena(dev: &crate::driver::AsahiDrmDevice, kvm: &mmu::Vm, kprot: mmu::Prot,
+    slots: usize) -> Result {
+    if !ARENA.load(Ordering::Acquire).is_null() {
+        return Ok(());
+    }
+    let stride = page_list_stride();
+    let mut obj = crate::gem::new_kernel_object(dev, stride * slots)?;
+    {
+        let vmap = obj.vmap()?;
+        use kernel::io::Io;
+        for off in (0..stride * slots).step_by(4) { vmap.try_write32(0, off)?; }
+    }
+    let kmap = obj.map_into_range(kvm, PAGE_LIST_KERNEL_RANGE, mmu::UAT_PGSZ as u64, kprot, true)?;
+    let arena = KBox::pin_init(try_pin_init!(PageListArena {
+        kmap,
+        stride,
+        slots,
+        client_va: core::sync::atomic::AtomicU64::new(0),
+        maps <- kernel::new_mutex!((obj, KVec::new())),
+    }), GFP_KERNEL)?;
+    // SAFETY: the arena is never moved out of its allocation, which is leaked.
+    let raw = KBox::into_raw(unsafe { core::pin::Pin::into_inner_unchecked(arena) });
+    ARENA.store(raw, Ordering::Release);
+    Ok(())
+}
+
+/// Maps the arena into a client address space (counted per address space).
+pub(crate) fn arena_acquire(vm: &mmu::Vm, range: core::ops::Range<u64>, prot: mmu::Prot) -> Result {
+    let Some(a) = arena() else { return Err(ENODEV) };
+    let size = (a.stride * a.slots) as u64;
+    let mut guard = a.maps.lock();
+    let (obj, maps) = &mut *guard;
+    if let Some(e) = maps.iter_mut().find(|e| e.0 == vm.id()) {
+        e.1 += 1;
+        return Ok(());
+    }
+    let want = (range.end.saturating_sub(0x100_0000 + size)) & !(mmu::UAT_PGMSK as u64);
+    let va = match a.client_va.compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => want,
+        Err(v) => v,
+    };
+    if va < range.start || va + size > range.end || va + size > 1 << 40 {
+        return Err(EINVAL);
+    }
+    let map = obj.map_at(vm, va, prot, true)?;
+    maps.push((vm.id(), 1, map), GFP_KERNEL)?;
+    Ok(())
+}
+
+/// Drops one use of the arena's mapping in `vm`.
+pub(crate) fn arena_release(vm: &mmu::Vm) {
+    let Some(a) = arena() else { return };
+    let mut guard = a.maps.lock();
+    let maps = &mut guard.1;
+    if let Some(i) = maps.iter().position(|e| e.0 == vm.id()) {
+        maps[i].1 -= 1;
+        if maps[i].1 == 0 {
+            let _ = maps.remove(i);
+        }
+    }
+}
+
+/// The firmware and client addresses of `slot`'s page list.
+fn arena_addrs(slot: u32) -> Option<(u64, u64)> {
+    let a = arena()?;
+    if slot as usize >= a.slots { return None; }
+    let va = a.client_va.load(Ordering::Acquire);
+    if va == 0 { return None; }
+    let off = (a.stride * slot as usize) as u64;
+    Some((a.kmap.iova() + off, va + off))
 }
 
 /// Kernel addresses for 27.2 page lists (above the timestamp range, below MMIO).
@@ -355,28 +497,6 @@ impl Buffer::ver {
         let preempt2_size = num_clusters_adj * gpu.get_cfg().preempt2_size;
         let preempt3_size = num_clusters_adj * gpu.get_cfg().preempt3_size;
 
-        // Firmware 27.2 builds the page list itself from the block list and hands the list's
-        // address to the hardware: one object, mapped for the firmware (kernel) and for the
-        // hardware (the client's address space, below 2^40).
-        #[ver(V >= V27_2)]
-        let page_list_dual = {
-            let bytes = (max_pages * 4 + mmu::UAT_PGMSK) & !mmu::UAT_PGMSK;
-            let dev = alloc.shared.device();
-            let mut obj = crate::gem::new_kernel_object(&dev, bytes)?;
-            {
-                let vmap = obj.vmap()?;
-                use kernel::io::Io;
-                for off in (0..bytes).step_by(4) { vmap.try_write32(0, off)?; }
-            }
-            let (kvm, _krange, kprot) = alloc.shared.placement();
-            let kmap = obj.map_into_range(&kvm, PAGE_LIST_KERNEL_RANGE, mmu::UAT_PGSZ as u64, kprot, true)?;
-            let (uvm, urange, uprot) = ualloc_priv.lock().placement();
-            // The top of the client's firmware-private range, which its heap reaches last.
-            let top = urange.end.saturating_sub(0x400_0000).max(urange.start);
-            let umap = obj.map_into_range(&uvm, top..urange.end, mmu::UAT_PGSZ as u64, uprot, true)?;
-            if umap.iova() >= 1 << 40 { return Err(EINVAL); }
-            (obj, kmap, umap)
-        };
         #[ver(V >= V27_2)]
         let (page_list, block_list) = (
             alloc.shared.array_empty_tagged(1, b"PLST")?,
@@ -387,9 +507,7 @@ impl Buffer::ver {
             ualloc_priv.lock().array_empty_tagged(max_pages, b"PLST")?,
             ualloc_priv.lock().array_empty_tagged(max_blocks * 2, b"BLST")?,
         );
-        #[ver(V >= V27_2)]
-        let page_list_va = (page_list_dual.1.iova(), page_list_dual.2.iova());
-        #[ver(V < V27_2)]
+        // 27.2: the page list pointers are set when the buffer gets its slot.
         let page_list_va = (0u64, 0u64);
         let _ = page_list_va;
         let shared = &mut alloc.shared;
@@ -488,8 +606,6 @@ impl Buffer::ver {
             inner: Arc::pin_init(
                 new_mutex!(BufferInner::ver {
                     info,
-                    #[ver(V >= V27_2)]
-                    _page_list: page_list_dual,
                     ualloc,
                     ualloc_priv,
                     blocks: KVec::new(),
@@ -513,7 +629,55 @@ impl Buffer::ver {
         })
     }
 
-    /// Returns the total block count allocated to this Buffer.
+    /// 27.2: before a tiler pass, point the slot's descriptor entry at this buffer (its page
+    /// list base and page count, from Info), keeping the hardware's ring positions; the host
+    /// side of a buffer becoming active, as the hardware does not do it itself.
+    pub(crate) fn load_pb_desc(&self, slot: u32) {
+        #[ver(V >= V27_2)]
+        {
+            let table = PB_DESCRIPTORS.load(Ordering::Acquire);
+            if table.is_null() || slot as usize >= 0x4000 / 16 {
+                return;
+            }
+            let inner = self.inner.lock();
+            let Some((_, list)) = arena_addrs(slot) else { return };
+            let page_count = inner.info.with(|raw, _inner| raw.page_count.load(Ordering::Acquire));
+            // SAFETY: the table is a live 0x4000-byte kernel mapping; nothing uses this slot while
+            // the pass is being built (the tiler queue is serialized).
+            unsafe {
+                let p = table.add(slot as usize * 16).cast::<u32>();
+                crate::pgtable::clean_invalidate_poc(p.cast::<u8>(), 16);
+                crate::pgtable::poc_barrier();
+                let d0 = p.read_volatile();
+                let d4 = p.add(1).read_volatile();
+                let d0 = (((list >> 4) as u32) & !7) | (d0 & 7);
+                let d4 = ((((list >> 36) & 0xf) as u32) << 28) | (d4 & 0x0fc0_0000) | (page_count & 0x3f_ffff);
+                p.write_volatile(d0);
+                p.add(1).write_volatile(d4);
+                crate::pgtable::clean_poc(p.cast::<u8>(), 16);
+            }
+            crate::pgtable::poc_barrier();
+        }
+        let _ = slot;
+    }
+
+    /// 27.2: make the next setup command rebuild this buffer's page list and commit its
+    /// descriptor (the hardware runs a tiler pass with the last committed descriptor).
+    pub(crate) fn recommit_pb(&self) {
+        #[ver(V >= V27_2)]
+        {
+            let inner = self.inner.lock();
+            if inner.active_scenes > 1 {
+                return;
+            }
+            inner.info.with(|raw, _inner| {
+                raw.page_count.store(0, Ordering::Relaxed);
+                raw.block_count.store(0, Ordering::Relaxed);
+                raw.last_page.store(u32::MAX, Ordering::Relaxed);
+            });
+        }
+    }
+
     /// Diagnostic: the first 0xc0 bytes of the firmware-visible Info, as words.
     pub(crate) fn info_words(&self) -> [u32; 0x30] {
         let inner = self.inner.lock();
@@ -525,6 +689,7 @@ impl Buffer::ver {
         })
     }
 
+    /// Returns the total block count allocated to this Buffer.
     pub(crate) fn block_count(&self) -> u32 {
         self.inner.lock().blocks.len() as u32
     }
@@ -790,10 +955,22 @@ impl Buffer::ver {
         if inner.active_slot.is_none() {
             assert_eq!(inner.active_scenes, 0);
 
-            let slot = inner.mgr.0.get_inner(inner.last_token, |inner, mgr| {
-                inner.owners[mgr.slot() as usize] = Some(self.clone());
+            // 27.2 buffers hold their slot for their lifetime, so the manager must not hold
+            // them (it would keep them alive); 27.2 sends no grow requests that need it.
+            #[ver(V >= V27_2)]
+            let owner: Option<Buffer::ver> = None;
+            #[ver(V < V27_2)]
+            let owner = Some(self.clone());
+            let fill = |inner: &mut BufferManagerInner::ver, mgr: &mut slotalloc::Guard<BufferSlotInner::ver>| {
+                inner.owners[mgr.slot() as usize] = owner;
                 Ok(())
-            })?;
+            };
+            // 27.2 slots are held for a buffer's lifetime: never wait for one (the caller may
+            // hold locks a slot's release needs).
+            #[ver(V >= V27_2)]
+            let slot = inner.mgr.0.try_get_inner(inner.last_token, fill)?;
+            #[ver(V < V27_2)]
+            let slot = inner.mgr.0.get_inner(inner.last_token, fill)?;
             rebind = slot.changed();
 
             mod_pr_debug!("Buffer: assigning slot {} (rebind={})", slot.slot(), rebind);
@@ -802,16 +979,48 @@ impl Buffer::ver {
             #[ver(V >= V27_2)]
             {
                 let id = slot.slot() as i32;
-                inner.info.with_mut(|raw, _inner| raw.last_id = id);
+                let (fw_list, gpu_list) = arena_addrs(slot.slot()).ok_or(ENOSPC)?;
+                inner.info.with_mut(|raw, _inner| {
+                    raw.last_id = id;
+                    raw.page_list_fw = U64(fw_list);
+                    raw.page_list_gpu = U64(gpu_list);
+                });
                 // A slot the hardware last used for another buffer: start this buffer's
                 // descriptor over, so the setup command rebuilds it from the block list
                 // instead of finding nothing new and keeping the other buffer's.
+                // The buffer is idle here, so put back everything the firmware and hardware
+                // advanced during its earlier use, as a new buffer starts.
                 if rebind {
-                    inner.info.with(|raw, _inner| {
+                    inner.info.with_mut(|raw, _inner| {
+                        raw.gpu_counter = 0;
+                        raw.unk_4 = 0;
+                        raw.cur_id = -1;
+                        raw.unk_10 = 0;
+                        raw.gpu_counter2 = 0;
+                        raw.unk_38 = 0;
                         raw.page_count.store(0, Ordering::Relaxed);
                         raw.block_count.store(0, Ordering::Relaxed);
                         raw.last_page.store(u32::MAX, Ordering::Relaxed);
                     });
+                    inner.info.block_ctl.with(|raw, _inner| raw.unk.store(0, Ordering::Relaxed));
+                    inner.info.counter.with(|raw, _inner| raw.count.store(0, Ordering::Relaxed));
+                    // The slot's hardware descriptor still names the previous owner's page list
+                    // and ring positions: point it at this buffer's empty list, so the setup
+                    // command appends from the start.
+                    let table = PB_DESCRIPTORS.load(Ordering::Acquire);
+                    let slot_no = id as usize;
+                    if !table.is_null() && slot_no < 0x4000 / 16 {
+                        let list = gpu_list;
+                        let d = [(((list >> 4) as u32) & !7) | 1, (((list >> 36) & 0xf) as u32) << 28, 0, 0];
+                        // SAFETY: the table is a live 0x4000-byte kernel mapping; this slot is
+                        // assigned to this buffer, which is idle.
+                        unsafe {
+                            let p = table.add(slot_no * 16).cast::<u32>();
+                            for (i, w) in d.iter().enumerate() { p.add(i).write_volatile(*w); }
+                            crate::pgtable::clean_poc(p.cast::<u8>(), 16);
+                        }
+                        crate::pgtable::poc_barrier();
+                    }
                 }
             }
             inner.active_slot = Some(slot);

@@ -201,6 +201,11 @@ impl ObjectRef {
         self.vmap.as_ref().ok_or(EINVAL)
     }
 
+    /// The CPU address of an existing kernel mapping, if `vmap` was called before.
+    pub(crate) fn vmapped_ptr(&self) -> Option<*mut u8> {
+        self.vmap.as_ref().map(|v| v.addr.cast::<u8>())
+    }
+
     /// Returns the size of an object in bytes
     pub(crate) fn size(&self) -> usize {
         self.gem.size()

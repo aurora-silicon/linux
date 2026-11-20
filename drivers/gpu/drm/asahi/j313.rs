@@ -336,13 +336,20 @@ impl Runtime {
         match state.pool.registered(state.next_slot) {
             Ok(false) => {}
             Ok(true) => {
+                let slot = state.next_slot;
+                // No published command owns the slot any more but its retirement never reached
+                // the firmware: retire it now, so the next scan unlinks it.
+                let owned = state.inflight.iter().any(|f| f.engine == 2 && f.slot == slot);
+                if !owned {
+                    let _ = state.pool.retire(slot);
+                }
                 if !state.waiting_unlink {
                     state.waiting_unlink = true;
-                    dev_info!(self.dev, "J313: slot {} still in the firmware's tracking list; waiting\n", state.next_slot);
-                    state.pool.dump(&self.dev, state.next_slot);
-                    // Wake the firmware's service so its retirement scan runs.
-                    let _ = state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick());
+                    dev_info!(self.dev, "J313: slot {} still in the firmware's tracking list (owned={}); waiting\n", slot, owned);
+                    state.pool.dump(&self.dev, slot);
                 }
+                // Wake the firmware's service so its retirement scan runs.
+                let _ = state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick());
                 return false;
             }
             Err(e) => { self.fail_all(state, e); return false; }
@@ -433,13 +440,19 @@ impl Runtime {
             match render.pool.registered(slot) {
                 Ok(false) => {}
                 Ok(true) => {
+                    let owned = state.inflight.iter().any(|f| f.engine != 2 && f.slot == slot)
+                        || render.staged.as_ref().is_some_and(|j| j.slot == slot);
+                    if !owned {
+                        let _ = render.pool.retire(slot, 0);
+                        let _ = render.pool.retire(slot, 1);
+                    }
                     if !render.waiting_unlink {
                         render.waiting_unlink = true;
-                        dev_info!(self.dev, "J313: render slot {} still in the firmware's tracking lists; waiting\n", slot);
+                        dev_info!(self.dev, "J313: render slot {} still in the firmware's tracking lists (owned={}); waiting\n", slot, owned);
                         render.pool.dump(&self.dev, slot);
-                        for engine in 0..2 {
-                            let _ = state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick_engine(engine));
-                        }
+                    }
+                    for engine in 0..2 {
+                        let _ = state.peer.as_mut().send_message(0x21, G13TrialRoot::j313_kick_engine(engine));
                     }
                     return false;
                 }
@@ -600,6 +613,7 @@ impl Runtime {
                              render.rings[0].event.current().raw(), render.last[0].raw(),
                              render.rings[1].event.current().raw(), render.last[1].raw());
                 }
+                crate::buffer::dump_pb_descriptors(&self.dev);
                 let _ = state.root.j313_trace_tail(64);
                 let _ = state.root.report_job_gates("drm-render-timeout");
                 self.fail_all(state, ETIMEDOUT);
@@ -847,7 +861,19 @@ impl Backend {
                 return Err(e);
             }
         };
-        let buffer_mgr = match crate::buffer::BufferManagerG13V27_2::with_slots(crate::module_parameters::t8112_g13_buffer_slots.value()) {
+        crate::buffer::set_pb_descriptors(graph.initdata.runtime_pointers.buffer_mgr_ctl.vmapped_ptr()
+            .unwrap_or(core::ptr::null_mut()));
+        {
+            let slots = crate::module_parameters::t8112_g13_buffer_slots.value().clamp(1, 63) as usize;
+            let alloc = crate::gpu::GpuManager::alloc(&*graph);
+            let (kvm, _range, kprot) = alloc.shared.placement();
+            let dev = alloc.shared.device();
+            drop(alloc);
+            if let Err(e) = crate::buffer::init_page_list_arena(&dev, &kvm, kprot, slots) {
+                pr_err!("J313: page list arena failed {:?}; rendering will fail\n", e);
+            }
+        }
+        let buffer_mgr = match crate::buffer::BufferManagerG13V27_2::with_slots(crate::module_parameters::t8112_g13_buffer_slots.value().min(63)) {
             Ok(mgr) => mgr,
             Err(e) => { runtime.stop(); return Err(e); }
         };

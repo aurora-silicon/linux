@@ -52,15 +52,28 @@ pub(crate) struct J313RenderContext {
     pub(crate) buffer: Buffer,
     ualloc: Arc<Mutex<crate::alloc::DefaultAllocator>>,
     id: u32,
+    /// The client address space the shared page list arena is mapped into for this context.
+    arena_vm: crate::mmu::Vm,
 }
 
 impl J313RenderContext {
     pub(crate) fn new(graph: &GpuManagerG13V13_5, mgr: &buffer::BufferManagerG13V27_2, id: u32,
         ualloc: Arc<Mutex<crate::alloc::DefaultAllocator>>,
         ualloc_priv: Arc<Mutex<crate::alloc::DefaultAllocator>>) -> Result<Self> {
+        let (vm, range, prot) = ualloc_priv.lock().placement();
+        buffer::arena_acquire(&vm, range, prot)?;
         let mut alloc = GpuManager::alloc(graph);
-        let buffer = Buffer::new(graph, &mut alloc, ualloc.clone(), ualloc_priv, mgr)?;
-        Ok(Self { buffer, ualloc, id })
+        let buffer = match Buffer::new(graph, &mut alloc, ualloc.clone(), ualloc_priv, mgr) {
+            Ok(b) => b,
+            Err(e) => { buffer::arena_release(&vm); return Err(e); }
+        };
+        Ok(Self { buffer, ualloc, id, arena_vm: vm })
+    }
+}
+
+impl Drop for J313RenderContext {
+    fn drop(&mut self) {
+        buffer::arena_release(&self.arena_vm);
     }
 }
 
@@ -240,6 +253,9 @@ impl J313RenderPool {
             .max(crate::module_parameters::t8112_g13_min_blocks.value() as usize))?;
         let scene = buffer.new_scene(alloc, &tile_info)?;
         let aux_fb = ctx.ualloc.lock().array_empty_tagged(0x8000, b"AXFB")?;
+        // The slot's descriptor entry may still describe another buffer (the last one a setup
+        // command committed): make it this buffer's, as the pass starts.
+        buffer.load_pb_desc(scene.slot());
 
         let ta_va = self.ta.gpu_va().get() + (slot * TA_BYTES) as u64;
         let frag_va = self.frag.gpu_va().get() + (slot * FRAG_BYTES) as u64;
@@ -382,7 +398,7 @@ impl J313RenderPool {
                         (0x188, i.sequence[0])] {
             put64(seq, at, v);
         }
-        for (at, v) in [(0x3c, vm_slot), (0x40, 1), (0x44, ctx.id), (0x48, buffer_slot),
+        for (at, v) in [(0x3c, vm_slot), (0x40, 1), (0x44, buffer_slot), (0x48, buffer_slot),
                         (0x50, i.sequence[0] as u32), (0x54, ta_ev.slot())] {
             put32(seq, at, v);
         }
@@ -575,7 +591,7 @@ impl J313RenderPool {
                         (0x98, uuid), (0x1a8, i.sequence[1])] {
             put64(seq, at, v);
         }
-        for (at, v) in [(0x54, vm_slot), (0x58, 1), (0x5c, ctx.id), (0x60, buffer_slot),
+        for (at, v) in [(0x54, vm_slot), (0x58, 1), (0x5c, buffer_slot), (0x60, buffer_slot),
                         (0x68, i.sequence[1] as u32), (0x6c, frag_ev.slot())] {
             put32(seq, at, v);
         }
@@ -604,7 +620,13 @@ impl J313RenderPool {
 
         // Buffer initialization ahead of the tiler command, as 13.5 does.
         let why = (scene.rebind(), grown, autogrown, buffer_slot, buffer.block_count());
-        let init = if scene.rebind() || grown || autogrown {
+        // The hardware tiles with the descriptor the last setup command committed, whatever
+        // slot the pass names: commit this buffer's before every pass.
+        let every = crate::module_parameters::t8112_g13_init_every.value();
+        if every && !(scene.rebind() || grown || autogrown) {
+            buffer.recommit_pb();
+        }
+        let init = if every || scene.rebind() || grown || autogrown {
             let b = &mut self.init.as_mut_slice()[slot * INIT_BYTES..(slot + 1) * INIT_BYTES];
             b.fill(0);
             put32(b, 0, 6);

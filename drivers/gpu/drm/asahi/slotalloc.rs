@@ -220,6 +220,15 @@ impl<T: SlotItem> SlotAllocator<T> {
         self.get_inner_impl(token, cb, true)
     }
 
+    /// As [`Self::get_inner`], without waiting; returns ENOSPC when every slot is held.
+    pub(crate) fn try_get_inner(
+        &self,
+        token: Option<SlotToken>,
+        cb: impl FnOnce(&mut T::Data, &mut Guard<T>) -> Result<()>,
+    ) -> Result<Guard<T>> {
+        self.get_inner_impl(token, cb, false)
+    }
+
     /// Gets a slot without waiting; returns ENOSPC when every slot is held.
     pub(crate) fn try_get(&self, token: Option<SlotToken>) -> Result<Guard<T>> {
         self.get_inner_impl(token, |_a, _b| Ok(()), false)

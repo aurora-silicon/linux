@@ -433,6 +433,10 @@ module! {
             default: 0,
             description: "T8103 27.2 bring-up: print the legacy command layouts and stop (1)",
         },
+        t8112_g13_init_every: bool {
+            default: true,
+            description: "T8103 27.2 render: send the buffer setup (descriptor commit) before every tiler pass",
+        },
         t8112_g13_init_blocks: bool {
             default: true,
             description: "T8103 27.2 render: buffer initialization carries the block count (13.5) instead of zero",
@@ -442,7 +446,7 @@ module! {
             description: "T8103 27.2: accept render commands on the DRM device",
         },
         t8112_g13_buffer_slots: u32 {
-            default: 1,
+            default: 63,
             description: "T8103 27.2 render: tile buffer slots handed to the firmware",
         },
         t8112_g13_min_blocks: u32 {
