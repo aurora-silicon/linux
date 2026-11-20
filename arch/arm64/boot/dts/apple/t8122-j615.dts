@@ -146,6 +146,13 @@
 
 &mtp_mt {
 	firmware-name = "apple/tpmtfw-j615.bin";
+	/* The 27.x trackpad firmware answers only the two-stage power command. */
+	apple,power-method = <2>;
+};
+
+/* The J615 MTP firmware cannot be restarted once quiesced: hand it over running. */
+&mtp {
+	apple,rtkit-keep-running;
 };
 
 &mesa {
