@@ -318,3 +318,17 @@
 &ane {
 	status = "okay";
 };
+
+/*
+ * Both USB-C ports are wired for DisplayPort alt mode (the ADT's dcpext0/1
+ * dp-switch-ufp-port and the ATC crossbars): a partner entering it keeps four
+ * DP lanes (pin assignments C and E) or two beside USB3 (D) instead of falling
+ * back to USB2. The PHYs take the usb3-dp calibration from the boot loader.
+ */
+&atcphy0 {
+	apple,dp-alt-mode;
+};
+
+&atcphy1 {
+	apple,dp-alt-mode;
+};
