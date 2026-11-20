@@ -74,6 +74,7 @@
 			compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 			reg = <0x160 4>;
 			label = DIE_ATC1_LABEL(_usb_aon);
+			apple,always-on; /* The ATC PHY loses its state without it */
 			#power-domain-cells = <0>;
 			#reset-cells = <0>;
 		};

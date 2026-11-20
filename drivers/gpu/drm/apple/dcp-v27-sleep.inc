@@ -16,14 +16,65 @@ module_param(v27_two_stage, bool, 0644);
 MODULE_PARM_DESC(v27_two_stage, "V27 sleep: the panel's soft power state off before the hard one, on after it (macOS's display stage)");
 static bool v27_soft_first = true;
 module_param(v27_soft_first, bool, 0644);
+static unsigned int v27_lit_delay_ms;
+module_param(v27_lit_delay_ms, uint, 0644);
+MODULE_PARM_DESC(v27_lit_delay_ms, "V27 wake: a pause between the hard power-on and the display stage, the domain off through it with v27_rtkit_cycles >= 2 (default 0: a full wake goes on at once; macOS waits there only in a dark wake)");
 MODULE_PARM_DESC(v27_soft_first, "V27 sleep: the display's soft off (display stage, plain A484) before the hard off, as macOS's display sleep");
+static bool v27_a115 = true;
+module_param(v27_a115, bool, 0644);
+MODULE_PARM_DESC(v27_a115, "V27 sleep: A489 before and A115 after each flags-form A484, as macOS");
+/* An external processor's wake: the rest of macOS's sequence, each step with its switch. */
+static bool v27_ext_a442 = true;
+module_param(v27_ext_a442, bool, 0644);
+MODULE_PARM_DESC(v27_ext_a442, "V27 wake: an external processor's A442 on the out-of-band context right behind A489, as macOS (needs v27_a115)");
+static bool v27_ext_a500_again;
+module_param(v27_ext_a500_again, bool, 0644);
+MODULE_PARM_DESC(v27_ext_a500_again, "V27 wake: A500's wake form again after an external processor's A115, with its stop or session round (default 0: macOS's dark wake only; a full wake has one A500)");
+static bool v27_ext_cycles = true;
+module_param(v27_ext_cycles, bool, 0644);
+MODULE_PARM_DESC(v27_ext_cycles, "V27 wake: an external processor is stopped and restarted after each A500 (once by default, as macOS's full wake); 0: only its sessions are closed and opened");
+static bool v27_ext_rounds = true;
+module_param(v27_ext_rounds, bool, 0644);
+MODULE_PARM_DESC(v27_ext_rounds, "V27 wake: an external processor's sessions closed and opened again after each A500, as macOS");
+static bool v27_session_rounds = true;
+module_param(v27_session_rounds, bool, 0644);
+MODULE_PARM_DESC(v27_session_rounds, "V27 wake: macOS's session rounds, closed in the dark wake, open and closed around each display-stage call");
+
+static bool v27_cycle_power = true;
+module_param(v27_cycle_power, bool, 0644);
+MODULE_PARM_DESC(v27_cycle_power, "V27 wake: each DCP stop/restart also turns the DCP's DART streams and the internal display's domain off and on, as macOS");
+static unsigned int v27_rtkit_cycles = 1;
+module_param(v27_rtkit_cycles, uint, 0644);
+MODULE_PARM_DESC(v27_rtkit_cycles, "V27 wake: DCP stop/restart cycles: 0 none; 1 (default) one, after the first A500, the hard power-on, display stage and plain power-on then back to back in that session (macOS's full wake); 2 also A500 and a restart after the hard power-on; 3 also A500, a session round and a restart after each display-stage call (macOS's dark-to-lit wake)");
+static unsigned int v27_cycle_hold_ms = 12;
+module_param(v27_cycle_hold_ms, uint, 0644);
+MODULE_PARM_DESC(v27_cycle_hold_ms, "V27 wake: the least time the display's domain stays off in a DCP cycle (macOS: about 10 ms)");
+static bool v27_cycle_pmc = true;
+module_param(v27_cycle_pmc, bool, 0644);
+MODULE_PARM_DESC(v27_cycle_pmc, "V27 wake: the display PMC handshake before each DCP cycle's power off and after its power on, as macOS");
+static bool v27_cycle_disp_rewrite = true;
+module_param(v27_cycle_disp_rewrite, bool, 0644);
+MODULE_PARM_DESC(v27_cycle_disp_rewrite, "V27 wake: after each DCP cycle's power on, the display pipe DART's Linux-owned streams written back (the scanout stream does not survive the power cycle)");
+
+/* The display PMC words in disp-4 that macOS writes around each DCP power cycle. */
+#define V27_PMC_BASE	0x106000
+#define V27_PMC_REQ	(0x106154 - V27_PMC_BASE)
+#define V27_PMC_ACK	(0x106158 - V27_PMC_BASE)
+#define V27_PMC_EN0	(0x108020 - V27_PMC_BASE)
+#define V27_PMC_EN1	(0x108028 - V27_PMC_BASE)
+#define V27_PMC_SIZE	0x2030
+static void __iomem *v27_pmc;
+
+static void dcp_v27_sessions(struct apple_dcp *dcp, bool open);
+static bool dcp_v27_external(struct apple_dcp *dcp);
+static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms);
 
 /*
  * The calls made before A484's plain form in either direction, at the wake and at the display's
  * sleep: A414, A489, A489, A487, A489, A412. At the wake each is followed by A500's wake form, at
  * the display's sleep none is. Their arguments come from the DT; their replies are not needed.
  */
-static void dcp_v27_display_stage(struct apple_dcp *dcp, bool a500)
+static void dcp_v27_display_stage(struct apple_dcp *dcp, bool a500, bool rounds, bool cycle)
 {
 	u8 args[IOMFB_V27_STAGE_ARGS];
 	const struct {
@@ -44,11 +95,19 @@ static void dcp_v27_display_stage(struct apple_dcp *dcp, bool a500)
 	if (iomfb_v27_display_args(dcp, true, args))
 		return;
 	for (i = 0; i < ARRAY_SIZE(seq); i++) {
+		/* macOS's wake: every endpoint's session open around each call, closed after its A500 */
+		if (rounds && !cycle)
+			dcp_v27_sessions(dcp, true);
 		ret = iomfb_v27_sleep_call(dcp, seq[i].tag, seq[i].data, seq[i].in, seq[i].out);
 		if (ret)
 			dev_warn(dcp->dev, "V27 display stage: %.4s: %d\n", seq[i].tag, ret);
 		if (a500)
 			iomfb_v27_sleep_rpc(dcp, true, true);
+		/* And its own DCP stop/restart after each call; the next call runs in a fresh session */
+		if (cycle)
+			dcp_v27_rtkit_cycle(dcp, 0);
+		else if (rounds)
+			dcp_v27_sessions(dcp, false);
 	}
 }
 struct dcp_v27_sleep {
@@ -59,9 +118,12 @@ struct dcp_v27_sleep {
 	enum v27_phase phase;
 	unsigned long closed;
 	bool workers_disabled, paused, power_off, registered, restore_on, soft_off;
+	bool cycle_failed;	/* a DCP cycle failed this wake: no more cycles until the next one */
 	bool display_early;	/* the display DART's lease taken and stopped at the prepare */
 	/* External: the wake's two calls are owed; the pipe state the driver tracked before. */
 	bool ext_wake, ext_pipe;
+	/* External: a dark wake skipped the wake's replug; the next resume, or the sleep's end, owes it. */
+	bool ext_dark_owed;
 	/* External: the queue of the calls that follow an interface's opening. */
 	struct workqueue_struct *ext_wq;
 	bool ext_wq_owned;
@@ -82,9 +144,260 @@ static bool dcp_v27_two_stage(struct dcp_v27_sleep *s)
 {
 	return s->restore_on && v27_two_stage && iomfb_v27_display_described(s->dcp);
 }
+/* Every V27 endpoint's session open (code 4) or closed (code 2), in macOS's order; a refusal is logged only. */
+static void dcp_v27_sessions(struct apple_dcp *dcp, bool open)
+{
+	struct dcp_v27_sleep *s = dcp->sleep_v27;
+	unsigned int i, n = ARRAY_SIZE(v27_sleep_endpoints);
+	int ret;
+
+	if (!s)
+		return;
+	for (i = 0; i < n; i++) {
+		unsigned int j = open ? i : n - 1 - i;
+
+		if (!!(s->closed & BIT(j)) != open)
+			continue;
+		ret = afk_v27_sleep_control(dcp->sleep_v27_ep[v27_sleep_endpoints[j] - 0x20], open);
+		if (ret) {
+			dev_warn_ratelimited(dcp->dev, "V27 wake: session %02x %s: %d\n",
+					     v27_sleep_endpoints[j], open ? "open" : "close", ret);
+			continue;
+		}
+		if (open)
+			s->closed &= ~BIT(j);
+		else
+			s->closed |= BIT(j);
+	}
+}
+
+/*
+ * macOS's display PMC handshake around each DCP power cycle (every cycle, on the DCP's
+ * thread): before the power off, bit 0 cleared at +0x108028 and +0x108020, then the request word
+ * written with bit 2 cleared and bit 10 set; after the power on, both bits set again and the request
+ * word given bit 2 back. Each request is polled until its status reads 0xf.
+ */
+static int dcp_v27_cycle_pmc(struct apple_dcp *dcp, bool on)
+{
+	u32 v;
+	int ret;
+
+	if (!v27_pmc) {
+		struct resource *res = platform_get_resource_byname(to_platform_device(dcp->dev),
+								    IORESOURCE_MEM, "disp-4");
+
+		if (!res || res->start != 0x286700000ULL ||
+		    resource_size(res) < V27_PMC_BASE + V27_PMC_SIZE)
+			return -ENODEV;
+		v27_pmc = ioremap(res->start + V27_PMC_BASE, V27_PMC_SIZE);
+		if (!v27_pmc)
+			return -ENOMEM;
+	}
+	if (on) {
+		writel(readl(v27_pmc + V27_PMC_EN1) | BIT(0), v27_pmc + V27_PMC_EN1);
+		writel(readl(v27_pmc + V27_PMC_EN0) | BIT(0), v27_pmc + V27_PMC_EN0);
+		v = readl(v27_pmc + V27_PMC_REQ);
+		writel(v | BIT(2), v27_pmc + V27_PMC_REQ);
+	} else {
+		writel(readl(v27_pmc + V27_PMC_EN1) & ~BIT(0), v27_pmc + V27_PMC_EN1);
+		writel(readl(v27_pmc + V27_PMC_EN0) & ~BIT(0), v27_pmc + V27_PMC_EN0);
+		v = readl(v27_pmc + V27_PMC_REQ);
+		writel((v & ~BIT(2)) | BIT(10), v27_pmc + V27_PMC_REQ);
+	}
+	ret = readl_poll_timeout(v27_pmc + V27_PMC_ACK, v, (v & 0xf) == 0xf, 1, 2000);
+	if (ret)
+		dev_warn(dcp->dev, "V27 wake: RTKit cycle: PMC %s: status %#x\n", on ? "on" : "off", v);
+	return ret;
+}
+
+/* An external processor's time off before the one retry of a restart that got no HELLO. */
+#define V27_EXT_RETRY_MS	20
+
+/*
+ * An external processor's power words and PMC bits around its stop, as macOS's. The display
+ * pipe DART's own streams are remembered before the words go off and written back after they
+ * come on, as around the internal processor's cycle.
+ */
+static void dcp_v27_ext_power(struct apple_dcp *dcp, bool on)
+{
+	int ret;
+
+	if (!on && v27_cycle_disp_rewrite && dcp->s2r_disp_dart)
+		apple_dart_m5_display_snapshot(dcp->s2r_disp_dart);
+	ret = apple_sleep_m5_dispext_power(dcp->dev, on);
+	if (ret)
+		dev_warn(dcp->dev, "V27 wake: RTKit cycle: external power %s %d\n",
+			 on ? "on" : "off", ret);
+	if (on && v27_cycle_disp_rewrite && dcp->s2r_disp_dart) {
+		ret = apple_dart_m5_display_rewrite(dcp->s2r_disp_dart);
+		if (ret)
+			dev_warn(dcp->dev, "V27 wake: RTKit cycle: external display DART rewrite %d\n",
+				 ret);
+	}
+}
+
+/*
+ * Whether an external processor can be stopped and started again: its power cycle is on and its
+ * DART is found. Checked before anything is stopped: without the power cycle a stopped processor
+ * gives no HELLO.
+ */
+static int dcp_v27_ext_cycle_ready(struct apple_dcp *dcp)
+{
+	if (!v27_cycle_power)
+		return -ENODEV;
+	if (!dcp->s2r_dcp_dart)
+		dcp_s2r_find_darts(dcp);
+	return dcp->s2r_dcp_dart ? 0 : -ENODEV;
+}
+
+/*
+ * macOS's DCP stop/restart between its wake steps: sessions closed, AP and IOP
+ * idle, IDLE_DONE, receive off, CPU_CONTROL RUN off; dart-dcp stopped, the display's domain off and,
+ * at least v27_cycle_hold_ms later, on; dart-dcp started, receive on, RUN on, HELLO, EPMAP, IOP and
+ * AP on, sessions open. A failure is logged; the wake goes on.
+ */
+static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
+{
+	struct dcp_v27_sleep *s = dcp->sleep_v27;
+	bool powered_off = false, ext = dcp_v27_external(dcp);
+	u32 status, run_status = 0;
+	int ret;
+
+	/*
+	 * A cancelled suspend must keep the inherited firmware session running, unless the
+	 * processor already took its sleep step: that session neither reports a display plugged
+	 * again nor completes the panel's power-on until it is restarted, as after a real wake.
+	 */
+	if (!pm_resume_via_firmware() && !(s && s->phase == V27_PREPARED))
+		return -EPERM;
+	if (s && s->cycle_failed)
+		return -ECANCELED;
+	dcp_v27_sessions(dcp, false);
+	ret = apple_rtkit_idle_strict(dcp->rtk);
+	if (ret) {
+		dev_warn(dcp->dev, "V27 wake: RTKit cycle: idle %d\n", ret);
+		dcp_v27_sessions(dcp, true);
+		return ret;
+	}
+	ret = readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS, status,
+		(status & (APPLE_DCP_COPROC_CPU_STATUS_IDLE | APPLE_DCP_COPROC_CPU_STATUS_STOPPED)) ==
+		(APPLE_DCP_COPROC_CPU_STATUS_IDLE | APPLE_DCP_COPROC_CPU_STATUS_STOPPED), 10, 5000);
+	if (ret)
+		dev_warn(dcp->dev, "V27 wake: RTKit cycle: CPU status %#x\n", status);
+	/* The receive side off (I2A_CTRL bit 0) before RUN off; the warm restart turns it on again */
+	apple_rtkit_set_recv_enabled(dcp->rtk, false);
+	dcp_s2r_cpu_stop(dcp);
+	/* dart-dcp's streams 23 and 24 off right after RUN off, then the domain's words off */
+	if (v27_cycle_power) {
+		if (!dcp->s2r_dcp_dart)
+			dcp_s2r_find_darts(dcp);
+		/* The DART's stop writes, while dart-dcp is still powered */
+		ret = dcp->s2r_dcp_dart ?
+			apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, false) : -ENODEV;
+		if (ret) {
+			/* Never power the domain off under a live DART */
+			dev_warn(dcp->dev, "V27 wake: RTKit cycle: DART stop %d; no power cycle\n", ret);
+		} else if (ext) {
+			/*
+			 * Every external processor's stop, as macOS's: its DART as the internal one's,
+			 * then its two PMC bits and its CPU, FE and SYS words off.
+			 */
+			dcp_v27_ext_power(dcp, false);
+			powered_off = true;
+		} else {
+			/* The PMC handshake between the DART stop and the power words */
+			if (v27_cycle_pmc)
+				dcp_v27_cycle_pmc(dcp, false);
+			ret = apple_sleep_m5_display_power(false);
+			if (ret)
+				dev_warn(dcp->dev, "V27 wake: RTKit cycle: display power off %d\n", ret);
+			powered_off = true;
+		}
+	}
+	/* The domain stays off for a while, as macOS's: with no time off there is no HELLO */
+	if (powered_off)
+		pause_ms = max(pause_ms, v27_cycle_hold_ms);
+	if (pause_ms)
+		msleep(min(pause_ms, 10000U));
+	/* The words on, then the streams on again just before RUN on */
+	if (v27_cycle_power && powered_off) {
+		if (ext) {
+			/* SYS, FE and CPU on, the two PMC bits, then the DART and RUN */
+			dcp_v27_ext_power(dcp, true);
+		} else {
+			ret = apple_sleep_m5_display_power(true);
+			if (ret)
+				dev_warn(dcp->dev, "V27 wake: RTKit cycle: display power on %d\n", ret);
+			/* The PMC handshake after DISP_CPU's AUTO_ENABLE, before the DART start */
+			if (v27_cycle_pmc)
+				dcp_v27_cycle_pmc(dcp, true);
+		}
+		ret = dcp->s2r_dcp_dart ?
+			apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, true) : -ENODEV;
+		if (ret)
+			dev_warn(dcp->dev, "V27 wake: RTKit cycle: DART start %d\n", ret);
+		/*
+		 * The display pipe DART keeps its firmware-locked streams through the power
+		 * cycle but loses the Linux-owned scanout stream (SID 0: CTE invalid at the first scanout).
+		 */
+		/* An external processor's was written back with its power words. */
+		if (v27_cycle_disp_rewrite && !ext) {
+			ret = dcp->s2r_disp_dart ?
+				apple_dart_m5_display_rewrite(dcp->s2r_disp_dart) :
+				-ENODEV;
+			if (ret)
+				dev_warn(dcp->dev, "V27 wake: RTKit cycle: display DART rewrite %d\n", ret);
+		}
+	}
+	ret = apple_rtkit_warm_restart_strict(dcp->rtk);
+	if (!ret) {
+		writel(readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL) |
+		       APPLE_DCP_COPROC_CPU_CONTROL_RUN, dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+		run_status = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
+		ret = apple_rtkit_boot(dcp->rtk);
+	}
+	/*
+	 * An external processor that did not start is not left down: its DART, power words and
+	 * RUN bit once more, with a longer time off, before it is given up.
+	 */
+	if (ret && ext && powered_off) {
+		dev_warn(dcp->dev, "V27 wake: RTKit cycle: restart %d (CPU status %#x at RUN); once more with %u ms off\n",
+			 ret, run_status, V27_EXT_RETRY_MS);
+		apple_rtkit_set_recv_enabled(dcp->rtk, false);
+		dcp_s2r_cpu_stop(dcp);
+		ret = apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, false);
+		if (!ret) {
+			dcp_v27_ext_power(dcp, false);
+			msleep(V27_EXT_RETRY_MS);
+			dcp_v27_ext_power(dcp, true);
+			ret = apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, true);
+		}
+		if (!ret)
+			ret = apple_rtkit_warm_restart_stopped(dcp->rtk);
+		if (!ret) {
+			writel(readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL) |
+			       APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+			run_status = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
+			ret = apple_rtkit_boot(dcp->rtk);
+		}
+	}
+	if (ret) {
+		dev_warn(dcp->dev, "V27 wake: RTKit cycle: restart %d (CPU status %#x at RUN)\n",
+			 ret, run_status);
+		if (s)
+			s->cycle_failed = true;
+	} else {
+		dev_info(dcp->dev, "V27 wake: DCP stopped and restarted (CPU status %#x at RUN)\n",
+			 run_status);
+	}
+	dcp_v27_sessions(dcp, true);
+	return ret;
+}
+
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp)
 {
-	return apple_sleep_v27_late() &&
+	return apple_sleep_v27_late() && dcp->v27_sleep_transport &&
 		(of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcp") ||
 		 of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcpext")) &&
 		dcp->hw.adopt_live_session && dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
@@ -260,15 +573,73 @@ busy:
  * plugged in afterwards stays dark. The pipe state the driver tracks stays what it was: the
  * display's own power-on follows with the display.
  */
+/* The key of an external processor's A442 at the wake. */
+#define V27_EXT_A442_KEY	0x79
+
+/*
+ * macOS ends a wake stage with A500's wake form and closes every session behind it; the next
+ * stage opens them again. Returns the sessions left closed (none, if all went well).
+ */
+static unsigned long dcp_v27_ext_round(struct apple_dcp *dcp)
+{
+	/*
+	 * macOS also stops the processor between the stages: sessions closed, AP and IOP idle,
+	 * RUN off and its DART's streams 23 and 24 off; then the streams and RUN on again and the
+	 * sessions opened. Here with its DART, PMC bits and power words as there
+	 * (dcp_v27_rtkit_cycle()), and without the pause.
+	 */
+	if ((pm_resume_via_firmware() || dcp->sleep_v27->phase == V27_PREPARED) && v27_ext_cycles) {
+		int ret = dcp_v27_ext_cycle_ready(dcp);
+
+		if (!ret) {
+			ret = dcp_v27_rtkit_cycle(dcp, 0);
+			dev_info(dcp->dev, "ext %u: stopped and restarted between the wake's stages: %d\n",
+				 dcp_v27_ext_nr(dcp), ret);
+			return dcp->sleep_v27->closed;
+		}
+		/* Not stopped at all: the sessions' round below, as with the switch off. */
+		dev_warn(dcp->dev, "ext %u: not stopped between the wake's stages (%d: no DART, or no power cycle); its sessions closed and opened instead\n",
+			 dcp_v27_ext_nr(dcp), ret);
+	}
+	if (!v27_ext_rounds)
+		return 0;
+	dcp_v27_sessions(dcp, false);
+	dcp_v27_sessions(dcp, true);
+	return dcp->sleep_v27->closed;
+}
+
 static int dcp_v27_ext_wake_calls(struct dcp_v27_sleep *s)
 {
 	struct apple_dcp *dcp = s->dcp;
-	int ret, a500;
+	/* A442 only on a processor that had a display, as macOS: not on an idle one. */
+	bool a442 = v27_a115 && v27_ext_a442 && s->ext_torn;
+	int ret, a500, a489 = 0, a115 = 0, again = 0;
+	unsigned long round[2] = {};
 
+	/*
+	 * macOS, every external processor, idle or not: sessions open, A500, sessions closed and
+	 * open again, A489 and (out of band) A442, the flagged A484, A115, later A500 again,
+	 * sessions closed, and open again for the plug. The second A500, and the pauses, are
+	 * macOS's dark wake: a full wake restarts the processor once, after the first A500.
+	 */
 	a500 = iomfb_v27_sleep_rpc(dcp, true, true);
+	round[0] = dcp_v27_ext_round(dcp);
+	/* A489 before and A115 after the flagged power call, as on every external processor. */
+	if (a442)
+		a489 = iomfb_v27_sleep_call_a442(dcp, "A489", 4, V27_EXT_A442_KEY);
+	else if (v27_a115)
+		a489 = iomfb_v27_sleep_call(dcp, "A489", NULL, 0, 4);
 	ret = iomfb_v27_sleep_rpc(dcp, false, true);
+	if (!ret && v27_a115)
+		a115 = iomfb_v27_sleep_a115(dcp, true);
+	if (!ret && v27_ext_a500_again) {
+		again = iomfb_v27_sleep_rpc(dcp, true, true);
+		round[1] = dcp_v27_ext_round(dcp);
+	}
 	WRITE_ONCE(dcp->pipe_enabled_h17p, s->ext_pipe);
-	dev_dbg(dcp->dev, "ext %u: wake calls: A500 %d, A484 %d\n", dcp_v27_ext_nr(dcp), a500, ret);
+	dev_dbg(dcp->dev, "ext %u: wake calls: A500 %d, sessions left closed %#lx, A489 %d, A442 %s, A484 %d, A115 %d, A500 %d, sessions left closed %#lx\n",
+		dcp_v27_ext_nr(dcp), a500, round[0], a489, a442 ? "sent" : "none", ret, a115,
+		again, round[1]);
 	/* Answered with an error: nothing is outstanding, the processor is as before the call. */
 	if (ret == -EREMOTEIO) {
 		dev_warn(dcp->dev, "ext %u: the wake's power call was refused\n",
@@ -360,9 +731,14 @@ static void dcp_v27_ext_replug(struct apple_dcp *dcp, bool wake)
 
 	if (!dcp_v27_external(dcp))
 		return;
-	/* A dark wake sleeps again at once: nothing is plugged for it. */
-	if (wake && pm_dark_wake())
+	/* A dark wake sleeps again at once: nothing is plugged for it, until a resume or the end. */
+	if (wake && pm_dark_wake()) {
+		if (s)
+			s->ext_dark_owed = true;
 		return;
+	}
+	if (s && wake)
+		s->ext_dark_owed = false;
 	dcp_fabric_sleep_done(dcp);
 	if (!s || !(wake ? s->ext_wake : s->ext_torn))
 		return;
@@ -547,6 +923,30 @@ static const struct apple_epic_service_ops dcp_v27_ext_services[] = {
 	{},
 };
 
+static void dcp_v27_ext_av_teardown(struct apple_epic_service *service)
+{
+	afk_service_disable(service);
+}
+
+/*
+ * The same holds for the AV interfaces (compact, cut to "dcpav-video-interface-" and
+ * so on) on endpoint 0x2b, which the sleep step starts when no audio did: left
+ * unanswered, the firmware never reports a display plugged after the sleep. One of
+ * each is live, re-announced at every plug.
+ */
+static const struct apple_epic_service_ops dcp_v27_ext_av_services[] = {
+	{ .name = "dcpav-video-interface-epic", .compact_full = "dcpav-video-interface-epic:0",
+	  .singleton = true, .init = dcp_v27_ext_service_init,
+	  .teardown = dcp_v27_ext_av_teardown },
+	{ .name = "dcpav-audio-interface-epic", .compact_full = "dcpav-audio-interface-epic:0",
+	  .singleton = true, .init = dcp_v27_ext_service_init,
+	  .teardown = dcp_v27_ext_av_teardown },
+	{ .name = "dcpav-cec-interface-epic", .compact_full = "dcpav-cec-interface-epic:0",
+	  .singleton = true, .init = dcp_v27_ext_service_init,
+	  .teardown = dcp_v27_ext_av_teardown },
+	{},
+};
+
 static void dcp_v27_ext_wq_destroy(void *data)
 {
 	destroy_workqueue(data);
@@ -566,8 +966,9 @@ static int dcp_v27_sleep_endpoints_open(struct apple_dcp *dcp)
 
 	for (i = 0; i < ARRAY_SIZE(v27_sleep_endpoints); i++) {
 		u8 id = v27_sleep_endpoints[i];
-		bool served = s && dcp_v27_external(dcp) && t6050_ext_services &&
-			      (id == 0x29 || id == 0x2a);
+		bool ext = s && dcp_v27_external(dcp) && t6050_ext_services;
+		bool served = ext && (id == 0x29 || id == 0x2a);
+		const struct apple_epic_service_ops *ops = no_services;
 
 		if (!apple_rtkit_has_endpoint(dcp->rtk, id))
 			return -ENODEV;
@@ -580,7 +981,11 @@ static int dcp_v27_sleep_endpoints_open(struct apple_dcp *dcp)
 			if (!s->ext_wq)
 				return -ENOMEM;
 		}
-		ep = afk_init(dcp, id, served ? dcp_v27_ext_services : no_services);
+		if (served)
+			ops = dcp_v27_ext_services;
+		else if (ext && id == AV_AUDIO_ENDPOINT_DESKTOP)
+			ops = dcp_v27_ext_av_services;
+		ep = afk_init(dcp, id, ops);
 		if (IS_ERR(ep))
 			return PTR_ERR(ep);
 		if (served) {
@@ -696,11 +1101,15 @@ static int dcp_v27_disp_dart_release(struct dcp_v27_sleep *s)
 	return ret;
 }
 
-/* Normal process-context cancellation: firmware was NEVER idled or stopped. */
+/* Reopen after cancellation, or after restarting the firmware on a real wake. */
 static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 {
 	struct dcp_v27_sleep *s = dcp->sleep_v27;
+	/* Undoing a partial preparation never stops the firmware; a completed sleep step does. */
+	unsigned int cycles = pm_resume_via_firmware() || s->phase == V27_PREPARED ?
+			      v27_rtkit_cycles : 0;
 	unsigned int i;
+	bool per_call;
 	int ret;
 
 	ret = dcp_v27_disp_dart_release(s);
@@ -718,20 +1127,46 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 		s->closed &= ~BIT(i);
 	}
 	if (s->power_off) {
+		s->cycle_failed = false;
 		if (s->restore_on) {
 			/* A500's wake form first; its failure does not stop the power-on. */
 			iomfb_v27_sleep_rpc(dcp, true, true);
-			if (s->soft_off)
+			/* The wake's one restart: the rest of the wake runs in the session it starts. */
+			if (s->soft_off && cycles >= 1)
+				dcp_v27_rtkit_cycle(dcp, 0);
+			if (s->soft_off && v27_a115)
 				iomfb_v27_sleep_call(dcp, "A489", NULL, 0, 4);
 			ret = iomfb_v27_sleep_rpc(dcp, false, true);
 			if (ret)
 				return ret;
 			/* The hard state is on again; the display comes on with the soft one, as macOS's wake. */
 			if (s->soft_off) {
-				ret = iomfb_v27_sleep_a115(dcp, true);
-				if (ret)
-					dev_warn(dcp->dev, "V27 wake: A115(1): %d\n", ret);
-				dcp_v27_display_stage(dcp, true);
+				if (v27_a115) {
+					ret = iomfb_v27_sleep_a115(dcp, true);
+					if (ret)
+						dev_warn(dcp->dev, "V27 wake: A115(1): %d\n", ret);
+				}
+				/* The dark-wake forms only: a restart, or a pause, before the display stage. */
+				if (cycles >= 2) {
+					iomfb_v27_sleep_rpc(dcp, true, true);
+					dcp_v27_rtkit_cycle(dcp, v27_lit_delay_ms);
+				} else if (v27_lit_delay_ms) {
+					if (v27_session_rounds) {
+						iomfb_v27_sleep_rpc(dcp, true, true);
+						dcp_v27_sessions(dcp, false);
+					}
+					msleep(min(v27_lit_delay_ms, 10000U));
+				}
+				/*
+				 * Back to back with the hard power-on; only the dark-to-lit form idles
+				 * the DCP, with A500 first, between the calls.
+				 */
+				per_call = cycles >= 3;
+				if (!per_call)
+					dcp_v27_sessions(dcp, true);
+				dcp_v27_display_stage(dcp, per_call, per_call && v27_session_rounds, per_call);
+				if (v27_session_rounds)
+					dcp_v27_sessions(dcp, true);
 				ret = iomfb_v27_sleep_plain(dcp, true);
 				if (ret)
 					return ret;
@@ -749,7 +1184,7 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 		s->power_off = false;
 	} else if (s->soft_off) {
 		/* An entry refused between the display's soft off and the hard one. */
-		dcp_v27_display_stage(dcp, true);
+		dcp_v27_display_stage(dcp, true, false, false);
 		ret = iomfb_v27_sleep_plain(dcp, true);
 		if (ret)
 			return ret;
@@ -910,10 +1345,51 @@ static const struct apple_sleep_v27_ops dcp_v27_late_ops = {
 	.stop = dcp_v27_late_stop, .disarm = dcp_v27_late_disarm,
 };
 
+/*
+ * A merged mode's peer reservation at the sleep. A pair that is stopped (its
+ * display released with the pair stopped first, dcp_peer_unplug_v27(), or its
+ * CRTC powered off with the pair's own stop) gives the reservation back, from
+ * whichever of its two engines suspends first, so that both sleep as idle
+ * processors: macOS tears its dual pipe down before the sleep too. The display's
+ * return after the wake reserves a peer again (dcp_peer_hints_v27()). False
+ * while the pair still runs, which refuses the sleep as before.
+ */
+/* A refusal before any sleep call is made, with its reason: each is a state that must not sleep. */
+static int dcp_v27_refuse(struct apple_dcp *dcp, const char *why)
+{
+	dev_info(dcp->dev, "V27 sleep: refused before its calls: %s\n", why);
+	return -EBUSY;
+}
+
+static bool dcp_v27_peer_released(struct apple_dcp *dcp)
+{
+	struct apple_dcp *owner, *peer;
+
+	guard(mutex)(&dcp_peer_lock);
+	owner = dcp->peer_reserved ? dcp : dcp->peer_owner;
+	if (!owner)
+		return true;
+	peer = owner->peer_reserved;
+	if (!peer || (owner != dcp && peer != dcp) || owner->peer_frames.active ||
+	    owner->peer_tiling.vftg || owner->peer_tiling.member ||
+	    peer->peer_tiling.vftg || peer->peer_tiling.member) {
+		dev_info(dcp->dev, "V27 sleep: pair still runs: peer %s, frames %d, vftg %d/%d, member %d/%d\n",
+			 peer ? dev_name(peer->dev) : "none", owner->peer_frames.active,
+			 owner->peer_tiling.vftg, peer ? peer->peer_tiling.vftg : 0,
+			 owner->peer_tiling.member, peer ? peer->peer_tiling.member : 0);
+		return false;
+	}
+	dev_info(owner->dev, "peer %s no longer reserved: the pair is stopped for the sleep\n",
+		 dev_name(peer->dev));
+	dcp_peer_release_locked(owner);
+	return !dcp->peer_reserved && !dcp->peer_owner;
+}
+
 static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 {
 	struct dcp_v27_sleep *s;
 	unsigned int i;
+	bool soft_first;
 	int ret;
 
 	dcp_v27_sleep_invalidate(dcp);
@@ -923,16 +1399,19 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 		return -EOPNOTSUPP;
 	}
 	if (!dcp->retain_dma || IS_ERR_OR_NULL(dcp->rtk) || !dcp->active || dcp->crashed || dcp->quiescing ||
-	    dcp->peer_owner || dcp->peer_reserved || dcp->secure_rtk)
-		return -EBUSY;
+	    dcp->secure_rtk)
+		return dcp_v27_refuse(dcp, "coprocessor not live (dma, rtkit, active, crashed, quiescing, secure)");
 	/* Mode-config suspend is the actual DRM scanout-owner boundary. No HPD
 	 * shortcut: external firmware still executes A484/A500/AFK and late IDLE.
 	 */
 	if (dcp->crtc && !dcp->crtc->base.dev->mode_config.suspend_state)
-		return -EBUSY;
+		return dcp_v27_refuse(dcp, "no saved mode-config state");
 	/* Nothing is released for a sleep an earlier failure refuses anyway. */
 	if (dcp->sleep_v27 && dcp->sleep_v27->phase != V27_LIVE)
 		return -EUCLEAN;
+	/* A pair that still runs refuses; a stopped one's reservation goes. */
+	if (!dcp_v27_peer_released(dcp))
+		return dcp_v27_refuse(dcp, "its pair still runs");
 	/* Before the release: a refusal after it reports the display's return. */
 	if (!dcp->sleep_v27) {
 		dcp->sleep_v27 = devm_kzalloc(dcp->dev, sizeof(*s), GFP_KERNEL);
@@ -965,11 +1444,12 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	/* What is still connected after that, or with the release switched off, refuses. */
 	for (i = 0; i < dcp->hw.num_dptx_ports; i++)
 		if (READ_ONCE(dcp->dptxport[i].connected))
-			return -EBUSY;
-	if (dcp_v27_external(dcp) && (READ_ONCE(dcp->active_typec_route) ||
-	    READ_ONCE(dcp->typec_cable_connected) ||
+			return dcp_v27_refuse(dcp, "a DPTX port still connected");
+	if (dcp_v27_external(dcp) && READ_ONCE(dcp->active_typec_route))
+		return dcp_v27_refuse(dcp, "a display route still active");
+	if (dcp_v27_external(dcp) && (READ_ONCE(dcp->typec_cable_connected) ||
 	    (dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0)))
-		return -EBUSY;
+		return dcp_v27_refuse(dcp, "a cable still connected");
 	if (dcp_v27_external(dcp) && dcp->crtc) {
 		/* The saved copy is the duplicated state's new state; its old
 		 * state is stale once disable_all has committed.
@@ -981,11 +1461,18 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 		 * A released display's CRTC was lit: it resumes disabled (see
 		 * dcp_crtc_mode_fixup()) and the display's return sets its mode again.
 		 */
-		if (!saved || (saved->active && !READ_ONCE(dcp->sleep_v27_torn)))
-			return -EBUSY;
+		if (!saved)
+			return dcp_v27_refuse(dcp, "no saved CRTC state");
+		if (saved->active && !READ_ONCE(dcp->sleep_v27_torn))
+			return dcp_v27_refuse(dcp, "its CRTC was lit and its display not released");
 	}
 	if (!dcp_v27_external(dcp) && !dcp->crtc)
 		return -ENODEV;
+	/* The sleep turns the panel's backlight off: without a level it stays off after it. */
+	if (!dcp_v27_external(dcp) && dcp_has_panel(dcp) && !dcp_backlight_level_known(dcp)) {
+		dev_info(dcp->dev, "V27 sleep: no backlight level to light the panel again\n");
+		return -EBUSY;
+	}
 	if (!dcp_v27_external(dcp) && !READ_ONCE(dcp->pipe_enabled_h17p))
 		return -EAGAIN; /* require the actual normal driver pipe-on ACK */
 	s->scanout = dcp->crtc ? dcp->crtc->base.dev->dev : NULL;
@@ -1013,18 +1500,33 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	if (ret)
 		goto undo;
 	/*
+	 * The display DART stops once the pipe has stopped fetching. With the display's sleep first
+	 * that is after its plain A484(0), answered when the display is off, and before A500: stopped
+	 * before the display stage, the still-lit pipe can read through it (a bus error at A414).
+	 */
+	soft_first = dcp_v27_two_stage(s) && v27_soft_first;
+	/*
 	 * macOS's display sleep first (the display stage, the plain A484(0), answered when the
 	 * display is off, then A500's wake form), and the system's hard off after it.
 	 */
-	if (dcp_v27_two_stage(s) && v27_soft_first) {
-		dcp_v27_display_stage(dcp, false);
+	if (soft_first) {
+		dcp_v27_display_stage(dcp, false, false, false);
 		ret = iomfb_v27_sleep_plain(dcp, false);
 		if (ret)
 			goto undo;
 		s->soft_off = true;
+		if (!dcp_v27_external(dcp)) {
+			ret = dcp_v27_disp_dart_stop_early(s);
+			if (ret) {
+				/* The refused sleep leaves the display as it found it. */
+				s->soft_off = false;
+				iomfb_v27_sleep_plain(dcp, true);
+				goto undo;
+			}
+		}
 		iomfb_v27_sleep_rpc(dcp, true, true);
 	}
-	if (dcp_v27_two_stage(s))
+	if (dcp_v27_two_stage(s) && v27_a115)
 		iomfb_v27_sleep_call(dcp, "A489", NULL, 0, 4);
 	/* A484, actual state/status */
 	ret = dcp_v27_step(s, "A484", iomfb_v27_sleep_rpc(dcp, false, false));
@@ -1032,7 +1534,7 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 		goto uncertain;
 	s->power_off = true;
 	/* The AP's state word for the sleep, right after the hard off, as macOS. */
-	if (dcp_v27_two_stage(s)) {
+	if (dcp_v27_two_stage(s) && v27_a115) {
 		ret = iomfb_v27_sleep_a115(dcp, false);
 		if (ret)
 			dev_warn(dcp->dev, "V27 sleep: A115(0): %d\n", ret);
@@ -1050,9 +1552,10 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	/*
 	 * The display's DART stops once the pipe has stopped fetching: after the A484s, answered
 	 * when the display is off, and before A500. Stopped before A484, a pipe that is still lit
-	 * can read through it and the firmware dies of a bus error.
+	 * can read through it and the firmware dies of a bus error. With the display's sleep first
+	 * it has stopped already.
 	 */
-	if (!dcp_v27_external(dcp)) {
+	if (!dcp_v27_external(dcp) && !soft_first) {
 		ret = dcp_v27_disp_dart_stop_early(s);
 		if (ret)
 			goto undo; /* nothing stopped: the display back on, the sleep refused */
@@ -1175,7 +1678,23 @@ static int dcp_v27_sleep_resume(struct apple_dcp *dcp)
 	dcp_v27_ext_replug(dcp, !ret);
 	return ret;
 }
+
+/*
+ * The sleep is over, and the last wake was a dark one whose re-entry was refused before this
+ * processor suspended again: no resume made the replug the dark wake skipped. Make it now.
+ */
+static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp)
+{
+	struct dcp_v27_sleep *s = dcp->sleep_v27;
+
+	if (!s || !s->ext_dark_owed || pm_dark_wake())
+		return;
+	dev_info(dcp->dev, "ext %u: a dark wake ended without sleeping again: the wake's replug now\n",
+		 dcp_v27_ext_nr(dcp));
+	dcp_v27_ext_replug(dcp, true);
+}
 #else
+static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp) { }
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp) { return false; }
 static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp) { }
 static int dcp_v27_sleep_suspend(struct apple_dcp *dcp) { return -EOPNOTSUPP; }

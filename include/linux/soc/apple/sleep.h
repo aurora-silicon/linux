@@ -38,6 +38,8 @@ struct apple_sleep_smc_saved_ops {
 
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
 const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void);
+/* J813 experiment: send the final SMC notice after the peer idle handshakes. */
+bool apple_sleep_smc_defer_notice(void);
 int apple_sleep_smc_register(struct device *dev,
 	int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data);
 int apple_sleep_smc_register_saved(struct device *dev,
@@ -47,6 +49,10 @@ void apple_sleep_smc_unregister(struct device *dev);
 void apple_sleep_display_quiesced(struct device *dev, bool quiesced);
 /* Read-only handoff: provider restored domains/gates, prior errors refuse. */
 int apple_sleep_display_v27_power_ready(struct device *dev);
+/* T6050: the internal display's power words around its coprocessor's restart after a wake. */
+int apple_sleep_m5_display_power(bool on);
+/* T6050: one external display coprocessor's, by its device. */
+int apple_sleep_m5_dispext_power(struct device *dev, bool on);
 
 /*
  * A coprocessor that can't be stopped until a sleep is certain, and can't be
@@ -103,6 +109,12 @@ bool apple_sleep_coproc_stopped(struct device *dev);
  * registered refuses the sleep: stopped any earlier, a later refusal would strand it.
  */
 bool apple_sleep_commit_stops_coprocs(void);
+
+/*
+ * Untested SoCs: a coprocessor's last stop notes its own step in PMU scratch (kept across a
+ * WD2 reset), next to the sleep driver's step and the coprocessor's slot.
+ */
+void apple_sleep_note_sub(u8 step);
 
 /*
  * The USB host sleeps in place for this sleep, as macOS's does: its always-on domain stays
@@ -165,6 +177,7 @@ bool apple_sleep_debug_link_up(void);
  * device has resumed, as macOS does from a dark wake.
  */
 void apple_sleep_lid_closed_wake(void);
+void apple_sleep_port_wake(bool lid_closed);
 
 /*
  * From the SMC's driver, in its noirq resume: the lid as it reads now, after every
@@ -231,6 +244,7 @@ void apple_sleep_restore_pins(void);
 int apple_sleep_engine_reset(struct device *dev);
 #else
 static inline const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void) { return NULL; }
+static inline bool apple_sleep_smc_defer_notice(void) { return false; }
 static inline int apple_sleep_smc_register(struct device *dev,
 	int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data) { return -EOPNOTSUPP; }
 static inline int apple_sleep_smc_register_saved(struct device *dev,
@@ -248,6 +262,9 @@ static inline int apple_sleep_display_v27_power_ready(struct device *dev)
 {
 	return -EOPNOTSUPP;
 }
+
+static inline int apple_sleep_m5_display_power(bool on) { return -ENODEV; }
+static inline int apple_sleep_m5_dispext_power(struct device *dev, bool on) { return -ENODEV; }
 
 static inline int apple_sleep_coproc_register_first(struct device *dev,
 						    int (*last_stop)(void *data), void *data)
@@ -292,6 +309,8 @@ static inline bool apple_sleep_coproc_stopped(struct device *dev)
 {
 	return false;
 }
+
+static inline void apple_sleep_note_sub(u8 step) {}
 
 static inline bool apple_sleep_commit_stops_coprocs(void)
 {
@@ -356,6 +375,10 @@ static inline bool apple_sleep_debug_link_up(void)
 }
 
 static inline void apple_sleep_lid_closed_wake(void)
+{
+}
+
+static inline void apple_sleep_port_wake(bool lid_closed)
 {
 }
 

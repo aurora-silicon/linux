@@ -38,6 +38,10 @@ static void combo_sleep(void *ctx, unsigned int msec) { msleep(msec); }
 static int combo_wrapper(void *ctx, unsigned int active)
 {
 	struct t6050_dp *dp = ctx;
+
+	/* A router's sleep in place: no runtime PM there, the wrapper's reference stays. */
+	if (dp->cio_sleep_hold)
+		return 0;
 	return atc_domain_set(&dp->domain[2], active);
 }
 static int combo_firmware(void *ctx, unsigned int active)
@@ -118,12 +122,13 @@ static void combo_pipe_fault(struct t6050_dp *dp, const char *what, int ret)
 /*
  * What the combo PHY gained for a deep sleep outside its sleep callbacks (a wrapper domain
  * still held at a stop is released, a safe state with a domain still held is stopped again,
- * the always-on domain's hold over the sleep) is in force on the board it has run on, the
- * J714s. On another T6050 board the stop, the safe state and the probe are as before.
+ * the always-on domain's hold over the sleep) is in force on the boards with a T6050 sleep,
+ * the J714s and the J716c. On another T6050 board the stop, the safe state and the probe are
+ * as before.
  */
 static bool combo_sleep_board(void)
 {
-	return of_machine_is_compatible("apple,j714s");
+	return of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c");
 }
 
 static bool combo_domains_held(struct t6050_dp *dp)
@@ -180,6 +185,8 @@ static int combo_start(struct t6050_dp *dp, enum combo_mode mode)
 		return -EIO;
 	if (dp->orientation == TYPEC_ORIENTATION_NONE)
 		return -ENOLINK;
+	/* A new start of the port's mode: what a router lost over a sleep is not carried on. */
+	dp->cio_tunnel_lost = false;
 	ret = atc_domain_set(&dp->domain[0], true);
 	if (!ret)
 		ret = atc_domain_set(&dp->domain[1], true);
@@ -407,16 +414,17 @@ static void combo_pm_notifier_remove(void *data)
 	unregister_pm_notifier(&dp->pm_nb);
 }
 
-static int combo_usb2_mode(struct phy *phy, enum phy_mode mode, int submode)
+/*
+ * USB2 as a mode's start brings it up (combo_start()), for a port whose mode is up. A USB
+ * controller's power-off stops USB2 with its PIPE (combo_usb3_poweroff()); while the mode
+ * runs on, no mode request comes that would start it again. Without a mode, -ENOLINK: the
+ * port controller's next mode request starts USB2 with it.
+ */
+static int combo_usb2_start(struct t6050_dp *dp)
 {
-	struct t6050_dp *dp = phy_get_drvdata(phy);
 	int ret;
 
-	guard(mutex)(&dp->lock);
-	if (dp->faulted)
-		return -EIO;
-	if (mode != PHY_MODE_USB_HOST)
-		return -EOPNOTSUPP;
+	lockdep_assert_held(&dp->lock);
 	if (!dp->usb_prepared && !dp->cio_prepared && !dp->enabled)
 		return -ENOLINK;
 	if (dp->usb2_active)
@@ -429,6 +437,18 @@ static int combo_usb2_mode(struct phy *phy, enum phy_mode mode, int submode)
 		dp->usb2_active = true;
 	}
 	return ret;
+}
+
+static int combo_usb2_mode(struct phy *phy, enum phy_mode mode, int submode)
+{
+	struct t6050_dp *dp = phy_get_drvdata(phy);
+
+	guard(mutex)(&dp->lock);
+	if (dp->faulted)
+		return -EIO;
+	if (mode != PHY_MODE_USB_HOST)
+		return -EOPNOTSUPP;
+	return combo_usb2_start(dp);
 }
 
 static int combo_usb2_reset(struct phy *phy)
@@ -491,6 +511,18 @@ static int combo_usb3_mode(struct phy *phy, enum phy_mode mode, int submode)
 	 * uses its independent D+/D- PHY. Do not switch USB3 onto DP lanes. */
 	if (dp->combo_mode == COMBO_DP4 && dp->enabled)
 		return 0;
+	/*
+	 * TEST: the router woke from a sleep in place without its dock, and its USB3 tunnel was
+	 * retired. A DWC3 moved to the tunnel's PIPE producer then takes its clock from a router
+	 * that the port controller stops next with the host still running (run sv6t4: this line's
+	 * "USB3 PIPE on the USB4 tunnel" at the resume, the router's domains off 3.1 s later with
+	 * the host up, an SError in that power-off). DWC3 stays on its dummy producer, as with
+	 * four DP lanes; USB2 is not touched. The port's next start gives the tunnel back.
+	 */
+	if (dp->combo_mode == COMBO_CIO && dp->cio_prepared && dp->cio_tunnel_lost) {
+		dev_info(dp->dev, "USB3 PIPE left on its dummy producer: the router's dock did not come back from the sleep\n");
+		return 0;
+	}
 	if (dp->combo_mode == COMBO_CIO && dp->cio_prepared)
 		return combo_pipe_tunnel(dp);
 	if (!dp->usb_prepared && !(dp->combo_mode == COMBO_DP2 && dp->enabled))
@@ -569,12 +601,25 @@ static int combo_reset_assert(struct reset_controller_dev *reset, unsigned long 
 static int combo_reset_deassert(struct reset_controller_dev *reset, unsigned long id)
 {
 	struct t6050_dp *dp = container_of(reset, struct t6050_dp, reset);
+	int ret;
 
 	guard(mutex)(&dp->lock);
 	if (id)
 		return -EINVAL;
-	if (dp->faulted || !dp->usb2_active)
+	if (dp->faulted)
 		return -ENOLINK;
+	/*
+	 * A controller that starts again while the port's mode still runs finds USB2 stopped by
+	 * its own power-off, and no mode request follows to start it: a system sleep given up
+	 * after the controllers stopped at its entry but before the PHY's own stop at its last
+	 * step (combo_suspend_late()), which therefore has nothing to bring back, or a role
+	 * change on the same plug. Start it here, before the reset goes, as the mode's start
+	 * does. After a real sleep no mode is up yet (combo_resume_noirq()): still -ENOLINK,
+	 * and the mode request starts USB2 as before.
+	 */
+	ret = combo_usb2_start(dp);
+	if (ret)
+		return ret == -ENOLINK ? ret : -EIO;
 	/*
 	 * The PIPE lock that starts the USB3 handoff is acknowledged only while the dummy PHY
 	 * behind the mux is enabled (NONSELECTED_OVERRIDE bit 15), as on the earlier ATC PHYs.

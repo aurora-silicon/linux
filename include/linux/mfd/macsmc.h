@@ -140,6 +140,12 @@ struct apple_smc {
 	bool polled;
 	/* MBSW at the last wake: what the SMC had woken the AP for. */
 	u64 wake_record;
+	/*
+	 * J714s: dark wakes since the last full wake (for a port or the radio alone), those for the
+	 * radio alone among them, and when the last sleep began.
+	 */
+	unsigned int dark_wakes, radio_dark_wakes;
+	ktime_t sleep_entry_boot, sleep_entry_mono;
 	/* MBSW's bits as this SoC numbers them, from the probe. */
 	const struct apple_smc_wake_reason *wake_reasons;
 
@@ -184,14 +190,14 @@ int apple_smc_read(struct apple_smc *smc, smc_key key, void *buf, size_t size);
 int apple_smc_write(struct apple_smc *smc, smc_key key, const void *buf, size_t size);
 
 /**
- * apple_smc_write_noirq - apple_smc_write() from another device's noirq resume
+ * apple_smc_write_noirq - apple_smc_write() from another device's noirq callbacks
  * @smc: Pointer to apple_smc struct
  * @key: smc_key data will be written to
  * @buf: Buffer from which size bytes of data will be written to SMC
  * @size: Number of bytes to be written
  *
  * The reply is polled for: device interrupts are off. Only for a caller that a
- * device link orders after the SMC's own noirq resume.
+ * device link orders before the SMC's noirq suspend and after its noirq resume.
  *
  * Return: Zero on success, negative errno on error
  */

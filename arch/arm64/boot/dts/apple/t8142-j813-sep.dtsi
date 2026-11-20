@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The J813's Secure Enclave, for the sleep: only its driver can ask it to sleep, which it
+ * has to before the SoC goes down (at macOS's commit its domain reads DEV_DISABLE, actual 0).
+ * From the J813 ADT: /arm-io/sep 0xfa600000 (+0x210000000), ascwrap v6, IRQs 445-448,
+ * dart-sep; PMGR SEP word +0xc00 (always on, the enclave gates it itself), GPIO +0x120.
+ */
+
+/ {
+	aliases {
+		/* aura's dt_set_sep(): sepfw reserved, the boot-object manifests published */
+		sep = &sep;
+	};
+};
+
+&pmgr {
+	ps_gpio: power-controller@120 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x120 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "gpio";
+		apple,always-on;
+	};
+
+	ps_sep: power-controller@c00 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xc00 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sep";
+		apple,always-on;
+	};
+};
+
+&{/soc} {
+	sep: sep@30a600000 {
+		compatible = "apple,sep";
+		reg = <0x3 0x0a600000 0x0 0x88000>;
+		mboxes = <&sep_mbox>;
+		mbox-names = "mbox";
+		iommus = <&sep_dart 0>;
+		power-domains = <&ps_sep>, <&ps_gpio>;
+	};
+
+	sep_mbox: mailbox@30a608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x0a608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 445 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 446 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 447 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 448 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+};
+
+/*
+ * The SEP consumes the high IOVA on the wire, as in the ADT's vm-base-0.
+ * An offset on a low DMA window moves only the DART mapping, not the address
+ * sent in the shared-memory registration. Leave the DART disabled until
+ * apple-sep enables it (dt.rs), with this window already described.
+ */
+&sep_dart {
+	apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+	apple,dma-offset = /bits/ 64 <0x0>;
+};

@@ -23,6 +23,7 @@ properties:
           - apple,t6050-cluster-pwrgate
           - apple,t8132-cluster-pwrgate
           - apple,t8140-cluster-pwrgate
+          - apple,t8142-cluster-pwrgate
       - const: apple,cluster-pwrgate
 
   reg:

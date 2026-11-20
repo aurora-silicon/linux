@@ -364,6 +364,7 @@ pub(crate) trait Backend: Send + Sync {
     /// against other VMs' older work ([`super::timeout::decide`]). `renewals` and `excused`
     /// count the job's earlier [`super::timeout::Decision::Defer`] and
     /// [`super::timeout::Decision::Excuse`] results; the job is renewed on either.
+    /// [`super::timeout::Decision::Retire`] only once its completion has been signalled.
     fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8, excused: u32)
         -> super::timeout::Decision;
     /// A long job of another queue is running beside `packet`.
@@ -466,6 +467,8 @@ impl<B: Backend> sched::JobImpl for Job<B> {
                 job.excused = job.excused.saturating_add(1);
                 true
             }
+            // The backend retired the job on its completion record: its fence has signalled.
+            super::timeout::Decision::Retire => true,
             decision @ (super::timeout::Decision::Own | super::timeout::Decision::Spare) => {
                 // The sharing inputs are the ones the renewal above was decided on.
                 job.backend.gave_up(&job.packet, &super::timeout::GaveUp::new(

@@ -357,6 +357,10 @@ struct tipd_data {
 struct tps6598x {
 	/* Native H17 routes retain ENOSPC admission and their own HPD path. */
 	u8 h17_display:1;
+	/* On the list tipd_port_replug() looks a port up on, by its role switch; its replug. */
+	struct list_head port_node;
+	struct work_struct replug_work;
+	u8 replug_seconds;
 	struct device *dev;
 	struct regmap *regmap;
 	struct mutex lock; /* device lock */
@@ -479,6 +483,9 @@ struct cd321x {
 	unsigned int rearm_resets;
 	bool dp_sink_reported;
 	bool dp_irq_hpd;
+	/* A plug was in when the sleep began, and a wake's first port state is still to be applied */
+	bool sleep_plug;
+	bool wake_apply;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
@@ -510,8 +517,8 @@ struct sn201202x {
 	bool ldcm_mitigated;
 	/* ldcm_mitigated matches the controller (unknown after a reset) */
 	bool ldcm_mitigation_known;
-	/* J714s, no connector (its MagSafe controller): only its system sleep state is driven */
-	bool sleep_only;
+	/* A mitigation was requested since the controller's last reset */
+	bool ldcm_requested;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
