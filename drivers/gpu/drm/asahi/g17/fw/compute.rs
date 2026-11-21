@@ -180,9 +180,16 @@ pub(crate) struct OperandState {
     r0a5c9: u64,
     /// Size of the buffer.
     pub(crate) size: usize,
+    /// The first 0x0a599 write of a G17P compute program (device policy).
+    r0a599_first: u64,
 }
 
 impl OperandState {
+    /// This state with `value` as the first 0x0a599 write of the G17P program.
+    pub(crate) const fn with_ptc_first(self, value: u64) -> Self {
+        Self { r0a599_first: value, ..self }
+    }
+
     /// Size of one preemption bank, the region the M5 program exchanges.
     pub(crate) const fn bank_bytes(&self) -> u32 {
         self.r0a5c9 as u32
@@ -202,6 +209,7 @@ impl OperandState {
         r0a5c1: 0x0005,
         r0a5c9: 0x9000,
         size: 0x14000,
+        r0a599_first: UNK_0A599,
     };
     /// One cluster of ten cores (M5, J813), by ONE_BY_SIX's and TWO_BY_TEN's pattern: a bank of
     /// ten slots of 0x1800, one tail of 0x800, the end rounded up to 16 KiB.
@@ -213,6 +221,7 @@ impl OperandState {
         r0a5c1: 0x0005,
         r0a5c9: 0xf000,
         size: 0x20000,
+        r0a599_first: UNK_0A599,
     };
     /// Two clusters of ten cores (M4 Pro): bank stride 0x1e400, tails 0x1000.
     pub(crate) const TWO_BY_TEN: OperandState = OperandState {
@@ -223,6 +232,7 @@ impl OperandState {
         r0a5c1: 0x0005,
         r0a5c9: 0x1e000,
         size: 0x44000,
+        r0a599_first: UNK_0A599,
     };
     pub(crate) const FOUR_BY_TEN: OperandState = OperandState {
         r10229: 0x78800,
@@ -232,6 +242,7 @@ impl OperandState {
         r0a5c1: 0x0005,
         r0a5c9: 0x3c000,
         size: 0x80000,
+        r0a599_first: UNK_0A599,
     };
     /// Eight clusters of ten cores (M5 Ultra): bank stride 0x78400, tails 0x4000. The size is
     /// the M5 compute queues' operand buffer, the tails' end rounded up to 16 KiB.
@@ -243,6 +254,7 @@ impl OperandState {
         r0a5c1: 0x0005,
         r0a5c9: 0x78000,
         size: 0xf8000,
+        r0a599_first: UNK_0A599,
     };
 }
 
@@ -430,7 +442,7 @@ fn compute_registers(args: &ComputeArgs) -> Result<[RegisterWrite; COMPUTE_REGIS
         RegisterWrite::new(0x1a0e9, args.scratch.stack_word()),
         RegisterWrite::new(0x1a141, args.scratch.driver_word()),
         RegisterWrite::new(0x107a1, args.scratch.window_word()),
-        RegisterWrite::new(0x0a599, UNK_0A599),
+        RegisterWrite::new(0x0a599, state.r0a599_first),
         RegisterWrite::new(0x0d411, UNK_0D411),
         RegisterWrite::new(0x1a540, ids),
         RegisterWrite::new(0x014a9, ids),

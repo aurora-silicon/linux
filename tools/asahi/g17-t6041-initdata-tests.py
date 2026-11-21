@@ -122,6 +122,7 @@ J616C_ITEMS = [
     "const REGION_C",
     "const AON_TABLE",
     "const CHIP: ",
+    "const HW_DATA_WORDS: ",
     "const POWER_CONFIG_WORDS",
 ]
 
@@ -235,9 +236,9 @@ fn main() {
                "the 25G83 hardware data differs only in its register map and +0x2610");
     assert_eq!((hw[0x2610], hw_g83[0x2610]), (1, 0), "+0x2610: 1 on 25F84, 0 on 25G83");
     std::fs::write(format!("{}/t6041-25g83-hwdata.bin", out), &hw_g83).unwrap();
-    // The 32-core J616C on 25G83, from its operating points. What it ran with since October
-    // 2026, hashed without the runtime words (FNV-1a 64), from a dump of 25 Oct 2026.
-    let (hw32, power32, region32) = build(t6041::CHIP_ID, &t6041_25g83::REGISTER_WINDOWS, &[],
+    // The 32-core J616C on 25G83, from its operating points: its hardware data is what macOS
+    // 26.6.2 writes (16 Nov 2026 capture), hashed without the runtime words (FNV-1a 64).
+    let (hw32, power32, region32) = build(t6041::CHIP_ID, &t6041_25g83::REGISTER_WINDOWS, &t6041::RESERVED_SLOTS,
         &t6041_25g83::PERF, &J616C_OPPS, &J616C_AUX, &t6041_25g83::CHIP,
         &t6041_25g83::REGION_C, 32);
     println!("T6041 25G83 32-core initialization objects built");
@@ -245,13 +246,25 @@ fn main() {
         bytes.iter().enumerate().filter(|(i, _)| !skip.iter().any(|&(at, n)| (at..at + n).contains(i)))
             .fold(0xcbf2_9ce4_8422_2325u64, |h, (_, &b)| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
     };
-    assert_eq!(fnv(&hw32, &[(0x2620, 0x80), (0x26b8, 8)]), 0xd781_973f_9983_1e35,
+    assert_eq!(fnv(&hw32, &[(0x2620, 0x80), (0x26b8, 8)]), 0x2e42_8e20_88de_9e06,
                "the J616C hardware data");
-    assert_eq!(fnv(&power32, &[(0x3b50, 8), (0x6318, 8), (0x63d4, 4)]), 0xc36d_7dba_a597_aac4,
+    // macOS 26.6.2 on the J616C (captured 16 Nov 2026): equal except runtime addresses and
+    // +0x2610, which this driver keeps 0.
+    let hw = |at: usize| u32::from_le_bytes(hw32[at..at + 4].try_into().unwrap());
+    for (at, value) in [(0xf6c, 1), (0xf88, 0x28), (0xf8c, 0x3f), (0xfac, 1), (0xfb8, 0x1d),
+                        (0xfc0, 0x28), (0x2570, 32), (0x2594, 0x2e_0000), (0x2610, 0),
+                        (0x3d98, 0xffff_ffff), (0x3db0, 0xffff_ffff)] {
+        assert_eq!(hw(at), value, "J616C hardware data +{:#x}", at);
+    }
+    // Equal to what macOS 26.6.2 writes on the J616C (16 Nov 2026 capture) except the two
+    // addresses and the entropy word skipped here, +0x2a04 and +0x0.
+    assert_eq!(fnv(&power32, &[(0x3b50, 8), (0x6318, 8), (0x63d4, 4)]), 0x912f_6adb_4a7e_2900,
                "the J616C power configuration");
-    assert_eq!(fnv(&region32, &[]), 0x91a4_c670_17e3_0a24, "the J616C region C");
+    assert_eq!(fnv(&region32, &[]), 0x5a52_acf2_8086_67c4, "the J616C region C");
     let word = |at: usize| u32::from_le_bytes(power32[at..at + 4].try_into().unwrap());
     assert_eq!(word(0x9ec), (-1000.0 / t6041_25g83::MAX_POWER_MW as f32).to_bits());
+    // +0x2a04 is the power ceiling, not the runtime budget macOS had there.
+    assert_eq!(word(0x2a04), (t6041_25g83::MAX_POWER_MW as f32).to_bits());
     println!("T6041 25G83 32-core objects match the J616C's");
     std::fs::write(format!("{}/t6041-25g83-32-hwdata.bin", out), &hw32).unwrap();
     std::fs::write(format!("{}/t6041-25g83-32-power-config.bin", out), &power32).unwrap();
