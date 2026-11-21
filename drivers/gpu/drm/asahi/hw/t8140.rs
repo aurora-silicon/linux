@@ -10,8 +10,14 @@ use crate::g17::{
 };
 use crate::hw::{GpuGen, GpuVariant};
 
-/// Static configuration of the T8140 GPU.
+/// Static configuration of the T8140 GPU. The exact loaded firmware selects the graph below.
 pub(crate) const CONFIG: Config = Config {
+    firmware: crate::g17::fw::variant::Firmware::Identified(&BUILDS),
+    ..BASE
+};
+
+/// The J700 hardware before a firmware build has been selected.
+const BASE: Config = Config {
     chip_id: CHIP_ID,
     identity: Identity {
         family: 0xa,
@@ -58,6 +64,8 @@ pub(crate) const CONFIG: Config = Config {
     adopt_root_entries: true,
     fabric_bridge: true,
     sleep_restart: true,
+    // Replaced by CONFIG. Keeping the old graph here makes every field of the 25G83
+    // configuration explicit and gives the 26B123 override a non-recursive base.
     firmware: crate::g17::fw::variant::Firmware::Fixed(&crate::g17::fw::variant::V26A428),
     // The layouts the A18 Pro has always run with.
     core_layout: crate::g17::CoreLayout {
@@ -67,6 +75,88 @@ pub(crate) const CONFIG: Config = Config {
         deflake: crate::g17::fw::render::Deflake::ONE_CLUSTER,
         compute_blocks: crate::g17::fw::freelist::COMPUTE_BLOCKS,
     },
+};
+
+/// J700 on the common macOS 27.2 graph. Only the exactly identified 26B123 image selects it;
+/// the current 25G83 image continues to use [`BASE`] unchanged.
+const CONFIG_26B123: Config = Config {
+    profile: crate::g17::FirmwareProfile::M5PublishedRoots,
+    pm_metrics: None,
+    windows: &[],
+    reserved_slots: &[],
+    perf: None,
+    opps: 0,
+    region_c: None,
+    m5: Some(&crate::g17::fw::m5::initdata::J700_26B123),
+    firmware: crate::g17::fw::variant::Firmware::Identified(&[BUILD_26B123]),
+    ..BASE
+};
+
+/// Exact J700 builds, newest first. iBoot loads the primary and secondary b100 TEXT segments
+/// back to back. The digest excludes each role's load fields, boot arguments and entropy records,
+/// the same normalization used by the M5 build table.
+const BUILDS: [crate::g17::fw::variant::Build; 2] = [
+    crate::g17::fw::variant::Build {
+        config: Some(&CONFIG_26B123),
+        ..BUILD_26B123
+    },
+    BUILD_25G83,
+];
+
+const BUILD_25G83: crate::g17::fw::variant::Build = crate::g17::fw::variant::Build {
+    os_version: [26, 6, 2],
+    name: "26.6.2 (25G83), G17P",
+    images: &[crate::fwid::FirmwareBuild {
+        name: "25G83 for T8140 G17P, primary then secondary",
+        text_size: 0x98000,
+        data_size: 0x260000,
+        entropy: &[[0x46251, 0x46334], [0x91bd9, 0x91cbc]],
+        boot_filled: &[
+            (0x224, 4),
+            (0x23c, 8),
+            (0x45b11, 0x740),
+            (0x46251, 0x231),
+            (0x4c224, 4),
+            (0x4c23c, 8),
+            (0x91499, 0x740),
+            (0x91bd9, 0x231),
+        ],
+        text_sha256: [
+            0xc8, 0x8c, 0x3f, 0x28, 0x72, 0xd5, 0xfc, 0x12, 0x35, 0x5f, 0x42, 0x14, 0x86, 0xd0,
+            0xdb, 0x9d, 0xe0, 0x88, 0x87, 0x65, 0xab, 0xe9, 0x62, 0x0d, 0x28, 0x87, 0x17, 0x9f,
+            0x67, 0x98, 0x92, 0x06,
+        ],
+    }],
+    variant: &crate::g17::fw::variant::V26A428,
+    config: None,
+};
+
+const BUILD_26B123: crate::g17::fw::variant::Build = crate::g17::fw::variant::Build {
+    os_version: [27, 2, 0],
+    name: "27.2 (26B123), G17P",
+    images: &[crate::fwid::FirmwareBuild {
+        name: "26B123 for T8140 G17P, primary then secondary",
+        text_size: 0x9c000,
+        data_size: 0x188000,
+        entropy: &[[0x4629c, 0x4637f], [0x95bcc, 0x95caf]],
+        boot_filled: &[
+            (0x224, 4),
+            (0x23c, 8),
+            (0x45b5c, 0x740),
+            (0x4629c, 0x231),
+            (0x4c224, 4),
+            (0x4c23c, 8),
+            (0x9548c, 0x740),
+            (0x95bcc, 0x231),
+        ],
+        text_sha256: [
+            0xfd, 0xec, 0xca, 0x8b, 0x92, 0x35, 0x8d, 0x89, 0x13, 0x6f, 0x69, 0xda, 0x5e, 0x90,
+            0xe5, 0xbd, 0xe5, 0x0a, 0x64, 0x78, 0xf6, 0x47, 0x45, 0x6c, 0x79, 0xac, 0x47, 0x84,
+            0x68, 0x5a, 0x36, 0xe1,
+        ],
+    }],
+    variant: &crate::g17::fw::variant::V26B123,
+    config: None,
 };
 
 use crate::g17::fw::initdata::{PerfConfig, RegisterWindow, PERF_STATES};
