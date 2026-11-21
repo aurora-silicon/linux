@@ -245,9 +245,100 @@
 	pmgr_disp: power-management@502290000 {
 		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 		reg = <0x5 0x02290000 0x0 0x4000>;
+		/* DISP_CPU's power word takes non-posted accesses (nGnRnE). */
+		nonposted-mmio;
 		#address-cells = <1>;
 		#size-cells = <1>;
 	};
+
+	t6040_sleep: sleep-controller@502888000 {
+		compatible = "apple,t6040-sleep";
+		/*
+		 * The SoC blocks the commit and wake write, all shared with
+		 * their owning drivers and touched only once no blocker remains:
+		 *   cpu-start   pmgr reg0 + 0x88000 (misc-cores): CPU start/stop
+		 *   wdt         the AON watchdog, the sleep's WD2 safety net
+		 *   cluster     0x502820000: the three CPU complexes E/P0/P1
+		 *   pwrgate     0x50282c000: wake + CPM retention voters
+		 *   spmi        0x509014000: the PMU boot-stage + NOTIFY + go-hib
+		 *   spmi-a0     0x509188000: the second SPMI NOTIFY
+		 *   mastermini  0x508900000: the S2R timer at +0x4000 (the commit)
+		 *   soc-east    0x502280000: SOC-East page, retention + east power words
+		 *   soc-ps      0x502800000: SOC page, the west axi2af power words
+		 *   wake        0x508004000: the S2R control + wake masks/status
+		 *   aop-ps      0x508304000: MiniPMGR AOP + audio island power states
+		 *   disp-dart   0x402340000: the internal display's DART
+		 *   disp-pwrgate 0x5022a1000: the internal display's power gate
+		 *   pmc-dcp     0x5048a9c14: the PMC's DCP voters
+		 *   pmc-bwr     0x5048ac020: the display pipes' bandwidth + boost enables
+		 *   keep-alive-soc, keep-alive-east: the keep-alive enables
+		 *   smc-wdt     0x508330008: the SMC's AP watchdog deadline
+		 *   agx-gate    0x508375010: MiniPMGR GPU residency gate
+		 *   s2r-count   0x508370970: MiniPMGR S2R entry counter
+		 *   gfx-ps      0x288e80100: the GPU's AFR power state
+		 *   cpu-debug   0x210010000: the cores' external debug windows
+		 * The handler refuses before touching any of them.
+		 */
+		reg = <0x5 0x02888000 0x0 0x20>,
+		      <0x5 0x0836c000 0x0 0x4000>,
+		      <0x5 0x02820000 0x0 0x20>,
+		      <0x5 0x0282c000 0x0 0x1000>,
+		      <0x5 0x09014000 0x0 0x1000>,
+		      <0x5 0x09188000 0x0 0x1000>,
+		      <0x5 0x08900000 0x0 0x8000>,
+		      <0x5 0x02280000 0x0 0xd000>,
+		      <0x5 0x02800000 0x0 0x9000>,
+		      <0x5 0x08004000 0x0 0x1000>,
+		      <0x5 0x08304000 0x0 0x160>,
+		      <0x4 0x02340000 0x0 0x1000>,
+		      <0x5 0x022a1000 0x0 0x100>,
+		      <0x5 0x048a9c14 0x0 0xc>,
+		      <0x5 0x048ac020 0x0 0x10>,
+		      <0x5 0x029dc000 0x0 0x880>,
+		      <0x5 0x022d0000 0x0 0x880>,
+		      <0x5 0x08330008 0x0 0x4>,
+		      <0x5 0x08375010 0x0 0x4>,
+		      <0x5 0x08370970 0x0 0x4>,
+		      <0x2 0x88e80100 0x0 0x4>,
+		      <0x2 0x10010000 0x0 0x3000000>;
+		reg-names = "cpu-start", "wdt", "cluster", "pwrgate",
+			    "spmi", "spmi-a0", "mastermini", "soc-east",
+			    "soc-ps", "wake", "aop-ps", "disp-dart",
+			    "disp-pwrgate", "pmc-dcp", "pmc-bwr",
+			    "keep-alive-soc", "keep-alive-east", "smc-wdt",
+			    "agx-gate", "s2r-count", "gfx-ps", "cpu-debug";
+		/*
+		 * ADT pmgr device-check-ps-b4-sleep (check-ps-b4-sleep = 0x1f): per
+		 * display pipe its CPU and its last sub-block, 8 bytes apart.
+		 */
+		apple,check-ps-b4-sleep = <&pmgr_disp 0x0 0x58>, <&pmgr_aux 0x350 0x388>,
+					  <&pmgr_aux 0x4a0 0x4d8>, <&pmgr_aux 0x4f0 0x528>,
+					  <&pmgr_aux 0x2e8 0x320>;
+		apple,check-ps-b4-sleep-names = "disp", "dispext0", "dispext1", "dispext2",
+						"dispext3";
+		/*
+		 * apple,apcie, for the sleep of ANS's storage PCIe link (two ST lanes
+		 * and a shared PHY), comes from the boot loader. From the ADT's
+		 * /arm-io/apcie0 it adds it here and puts the axi2af, cio3pll, clkgen,
+		 * phy-block and phy-ip windows and the apple,tunable-* arrays on the
+		 * internal PCIe host (apple,t6020-pcie, the one with an "rc"
+		 * reg-name), in the single-lane T8140 shape. It leaves a node that
+		 * already has apple,apcie alone, so this tree must give neither
+		 * apple,apcie nor an apcie-storage node. Without it a sleep with ANS
+		 * stopped is refused, and suspend-to-idle stays the default. The ST
+		 * power words (ps_ans, ps_apcie_st0/st1, ps_apcie_sys_st0/st1) are in
+		 * SOC-East and are driven through the soc-east window.
+		 */
+		apple,pinctrl = <&pinctrl>;
+		apple,pinctrl-skip-pins = <190 191 192>;
+		/* Only on a board whose sleep has been tested. */
+		status = "disabled";
+	};
+};
+
+&pmp {
+	/* The PMP firmware's SRAM kept over a sleep: offset, size */
+	apple,sram-keep = <0x61000 0x7d000>;
 };
 
 &pmc {
@@ -588,6 +679,12 @@
 };
 
 #include "t6040-pmgr.dtsi"
+
+/* Two external display pipes in the display power complex, not T6041's four. */
+&dcp_power {
+	compatible = "apple,t6040-display-power";
+};
+
 #include "t6040-peripherals.dtsi"
 
 /* The M4 Pro has five cores in each P cluster. */
@@ -671,6 +768,23 @@
 				     0x226004000 0x2261d62fc
 				     0x504824000 0x504824004
 				     0x5003c0000 0x5003e4000>;
+};
+
+/ {
+	/*
+	 * disp0's first clock in the boot loader's device tree, as on T6041. The
+	 * DCP firmware checks a mode's pixel clock against it.
+	 */
+	clk_disp0: clock-disp0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <712000000>;
+		clock-output-names = "disp0";
+	};
+};
+
+&dcp {
+	clocks = <&clk_disp0>;
 };
 
 #include "t6040-usb4.dtsi"
