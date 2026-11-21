@@ -1190,7 +1190,8 @@ struct apr_dev {
 	bool resetting;		/* the watchdog is resetting the engine */
 	unsigned long progress;	/* jiffies of the last start or completion */
 	struct delayed_work watchdog;
-	bool irq_missing;	/* a job finished without its interrupt */
+	bool irq_seen;		/* the interrupt line has fired since probe */
+	bool irq_missing;	/* jobs finish, but the line has never fired */
 	bool wrapper_checked;	/* wrapper rows read back once since probe */
 	bool wrapper_recheck;	/* some did not take: check again after a job */
 	struct hrtimer poll;	/* completion poll while irq_missing */
@@ -1675,10 +1676,11 @@ static struct apr_ctx *apr_take_held(struct apr_dev *apr)
 
 /*
  * Give back the jobs the engine has finished. Runs in hard interrupt context,
- * from apr_irq() and from the completion poll. Returns whether the engine
- * raised anything.
+ * from apr_irq() (@irq) and from the completion poll. Returns whether the
+ * engine raised anything. An interrupt proves the line works, so it ends the
+ * poll.
  */
-static bool apr_service(struct apr_dev *apr)
+static bool apr_service(struct apr_dev *apr, bool irq)
 {
 	struct apr_job done[APR_MAX_INFLIGHT];
 	struct apr_ctx *held = NULL;
@@ -1687,6 +1689,10 @@ static bool apr_service(struct apr_dev *apr)
 	bool handled = false, hung;
 
 	spin_lock_irqsave(&apr->hw_lock, flags);
+	if (irq) {
+		apr->irq_seen = true;
+		apr->irq_missing = false;
+	}
 	/* Registers are only reachable while the engine is powered. */
 	if (apr->ring_ready)
 		handled = apr_take_done(apr, done, &n);
@@ -1708,12 +1714,12 @@ static bool apr_service(struct apr_dev *apr)
 
 static irqreturn_t apr_irq(int irq, void *data)
 {
-	return apr_service(data) ? IRQ_HANDLED : IRQ_NONE;
+	return apr_service(data, true) ? IRQ_HANDLED : IRQ_NONE;
 }
 
 /*
- * Completion poll for an engine that finished a job without its interrupt,
- * so it is not held to the watchdog's jiffy-granular poll. The interrupt
+ * Completion poll for an engine whose jobs finish but whose interrupt line
+ * has never fired, so it is not held to the watchdog's jiffy-granular poll. The interrupt
  * stays requested and is served the same way when it does arrive. Every arm
  * of the timer is an hrtimer_start() under hw_lock (here through
  * apr_service()), so the timer is never forwarded while someone else has
@@ -1721,7 +1727,7 @@ static irqreturn_t apr_irq(int irq, void *data)
  */
 static enum hrtimer_restart apr_poll(struct hrtimer *t)
 {
-	apr_service(container_of(t, struct apr_dev, poll));
+	apr_service(container_of(t, struct apr_dev, poll), false);
 	return HRTIMER_NORESTART;
 }
 
@@ -1744,11 +1750,15 @@ static void apr_watchdog(struct work_struct *work)
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		return;
 	}
+	/*
+	 * On a working line the watchdog still finds a finished job before its
+	 * interrupt now and then; only a line that has never fired is polled.
+	 */
 	if (apr->ring_ready && apr_take_done(apr, done, &n) && n &&
-	    !apr->irq_missing) {
+	    !apr->irq_seen && !apr->irq_missing) {
 		apr->irq_missing = true;
 		dev_warn(apr->dev,
-			 "completion found without an interrupt, polling every %u us\n",
+			 "jobs finish without an interrupt, polling every %u us\n",
 			 APR_FAST_POLL_US);
 	}
 	if (!apr->hung && (!apr->njobs ||
