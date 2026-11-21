@@ -20,7 +20,7 @@
 
 bool apple_pmp_telemetry_retained_board(void)
 {
-	return apple_t8132_firmware_path();
+	return apple_t8132_pmp_path();
 }
 
 static LIST_HEAD(apple_pmp_telemetry_list);

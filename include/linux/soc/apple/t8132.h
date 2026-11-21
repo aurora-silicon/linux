@@ -55,6 +55,20 @@ static inline bool apple_t8132_firmware_path(void)
 }
 
 /*
+ * The M4 PMP session's pieces: its power-vote bridge, its telemetry and
+ * thermal policy, and the PMP report's readiness. They take what they depend
+ * on from the PMP firmware itself, not from the OS firmware's version: the
+ * data segment from the image's header (the PMP driver refuses an image whose
+ * header names none), the temperature records by name, the IOP power
+ * handshake the firmware starts, and each registry entry's length as the
+ * firmware registered it. So every M4 Mac takes them on any firmware.
+ */
+static inline bool apple_t8132_pmp_path(void)
+{
+	return of_machine_is_compatible("apple,t8132");
+}
+
+/*
  * The radio port the Airs have: reg-on on the SMC's gP13 with the same
  * template, and the radio's two ordinary streams managed on port 0 of the
  * built-in PCIe controller. The J604 and J773g ADTs match; the iMacs are
