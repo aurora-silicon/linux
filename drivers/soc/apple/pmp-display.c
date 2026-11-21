@@ -20,6 +20,7 @@
 #include <linux/workqueue.h>
 #include <linux/unaligned.h>
 #include <linux/soc/apple/pmp-display.h>
+#include <linux/soc/apple/pmp-report.h>
 
 /* AGX: command 0x0f, logical device 5, state 1. The reply carries no tag. */
 #define PMP_AGX_REQUEST		0x0020f50100000000ULL
@@ -559,3 +560,59 @@ int apple_pmp_j713_gpu_get(struct device *consumer)
 	return apple_pmp_j713_board() ? pmp_power_get(consumer, PMP_POWER_AGX) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_get);
+
+/* Size of one record of the PMP's soc-device tunable, and where its name is. */
+#define PMP_SOC_DEVICE_RECORD	0x7c
+#define PMP_SOC_DEVICE_NAME	0x74
+
+/* The record of the PMP's soc-device table named @name: its index is its power request bit. */
+static int pmp_soc_device_record(const struct device_node *pmp, const char *name)
+{
+	const u8 *table;
+	int size, i;
+
+	table = of_get_property(pmp, "apple,tunable-soc-device", &size);
+	if (!table || size <= 0 || size % PMP_SOC_DEVICE_RECORD)
+		return -ENODEV;
+	for (i = 0; i < size / PMP_SOC_DEVICE_RECORD; i++) {
+		const u8 *rec = table + i * PMP_SOC_DEVICE_RECORD;
+
+		if (!strncmp(rec + PMP_SOC_DEVICE_NAME, name,
+			     PMP_SOC_DEVICE_RECORD - PMP_SOC_DEVICE_NAME))
+			return i;
+	}
+	return -ENODEV;
+}
+
+/*
+ * The GPU's power request in the PMP report, as macOS 27.2 makes it: the PS-REQ
+ * bit of the AGX soc-device record, set when the GPU driver starts the firmware
+ * and held. Without it the PMP treats a busy GPU as idle: it computes none of
+ * its AGX floors (its own DCS and SoC fabric votes stay at 0) and leaves the
+ * GPU's memory traffic at its idle setting. The bit is the record's index in the
+ * PMP's soc-device table, found by the record's name.
+ */
+int apple_pmp_j713_gpu_request(struct device *consumer)
+{
+	struct apple_pmp_display *p;
+	struct device_node *report;
+	int record, ret;
+
+	if (!apple_pmp_j713_board())
+		return -ENODEV;
+	p = pmp_power_consumer(consumer, PMP_POWER_AGX);
+	if (IS_ERR(p))
+		return PTR_ERR(p);
+	record = pmp_soc_device_record(p->dev->of_node, "AGX");
+	if (record < 0)
+		return record;
+	report = of_parse_phandle(p->dev->of_node, "apple,pmp-report", 0);
+	if (!report)
+		return -ENODEV;
+	ret = apple_pmp_report_set_request(report, record, true, false);
+	of_node_put(report);
+	if (!ret)
+		dev_info(p->dev, "AGX power request (PS-REQ bit %d) acknowledged\n", record);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_request);

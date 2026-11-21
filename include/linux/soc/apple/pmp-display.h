@@ -44,6 +44,8 @@ int apple_pmp_j713_display_check(struct device *consumer);
 int apple_pmp_j713_display_check_release(struct device *consumer);
 int apple_pmp_j713_gpu_prepare(struct device *consumer);
 int apple_pmp_j713_gpu_get(struct device *consumer);
+/* The GPU's power request in the PMP report (PS-REQ), held from the call on. */
+int apple_pmp_j713_gpu_request(struct device *consumer);
 int apple_pmp_j713_gpu_check(struct device *consumer);
 
 #endif
