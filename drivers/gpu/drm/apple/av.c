@@ -253,10 +253,13 @@ int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)
 
 int dcp_audiosrv_startlink(struct device *dev, struct dcp_sound_cookie *cookie)
 {
-	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_dcp *dcp;
+	struct audiosrv_data *asrv;
 	int ret;
 
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_startlink, dev, cookie);
+	dcp = dev_get_drvdata(dev);
+	asrv = dcp->audiosrv;
 	down_write(&asrv->srv_rwsem);
 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.start_link, cookie,
 			       sizeof(*cookie), 64 - sizeof(*cookie), NULL, 0,
@@ -268,10 +271,13 @@ int dcp_audiosrv_startlink(struct device *dev, struct dcp_sound_cookie *cookie)
 
 int dcp_audiosrv_stoplink(struct device *dev)
 {
-	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_dcp *dcp;
+	struct audiosrv_data *asrv;
 	int ret;
 
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_stoplink, dev);
+	dcp = dev_get_drvdata(dev);
+	asrv = dcp->audiosrv;
 	down_write(&asrv->srv_rwsem);
 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.stop_link, NULL, 0, 64,
 			       NULL, 0, 64);
@@ -617,12 +623,12 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 	static_assert(sizeof(*hdr) == 48);
 	size_t received = 0, used;
 	size_t bfr_len = output_maxsize + sizeof(*hdr);
-	void *bfr __free(kfree) = NULL;
+	void *bfr __free(kvfree) = NULL;
 	int ret;
 
 	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_osobject_call, service, group, command, output,
 				   output_maxsize, output_size);
-	bfr = kzalloc(bfr_len, GFP_KERNEL);
+	bfr = kvzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
 		return -ENOMEM;
 
@@ -686,13 +692,16 @@ static bool av_elements_need_more(int ret, size_t size, size_t cap, bool empty)
 
 int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize)
 {
-	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_dcp *dcp;
+	struct audiosrv_data *asrv;
 	struct apple_epic_service *srv;
 	size_t size = 0, cap;
 	bool compact, empty;
 	int ret;
 
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_get_elements, dev, elements, maxsize);
+	dcp = dev_get_drvdata(dev);
+	asrv = dcp->audiosrv;
 	if (!asrv)
 		return -ENODEV;
 	scoped_guard(rwsem_read, &asrv->srv_rwsem)
@@ -740,12 +749,15 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 
 int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsize)
 {
-	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_dcp *dcp;
+	struct audiosrv_data *asrv;
 	struct apple_epic_service *srv;
 	size_t size;
 	int ret;
 
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_get_product_attrs, dev, attrs, maxsize);
+	dcp = dev_get_drvdata(dev);
+	asrv = dcp->audiosrv;
 	if (!asrv)
 		return -ENODEV;
 	scoped_guard(rwsem_read, &asrv->srv_rwsem)
