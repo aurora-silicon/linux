@@ -89,10 +89,6 @@ static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *d)
 {
 	return DCP_FABRIC_ABSENT;
 }
-static bool dcpext_scanout_terminal(struct apple_dcp *d)
-{
-	return false;
-}
 static bool dcp_tb_services_ready(struct apple_dcp *d)
 {
 	return true;
