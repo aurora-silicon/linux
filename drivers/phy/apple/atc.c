@@ -7850,10 +7850,13 @@ static int atcphy_suspend(struct device *dev)
 	/*
 	 * An active one survives suspend-to-idle while a host runs on it: DWC3
 	 * then keeps the power domain on across system sleep, so the link stays
-	 * as it is. Without a host, or in a deeper sleep state, it is lost.
+	 * as it is. So does one in CIO mode, under its running USB4 router, whose
+	 * power states stay on across suspend-to-idle. Without either, or in a
+	 * deeper sleep state, it is lost.
 	 */
 	if (atcphy->t8132_common_owned &&
-	    (!atcphy->host_active || pm_suspend_target_state != PM_SUSPEND_TO_IDLE))
+	    (pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
+	     !(atcphy->host_active || atcphy_mode_is_cio(atcphy->mode))))
 		return -EBUSY;
 	/* Do not admit a new epoch after this check and before resume. */
 	atcphy->t8132_suspended = true;
