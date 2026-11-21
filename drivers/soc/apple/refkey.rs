@@ -13,6 +13,23 @@ use kernel::sync::atomic::Relaxed;
 
 pub(crate) const REFKEY_ENVELOPE_VERSION: u32 = 2;
 
+fn refkey_target(key_store: profile::KeyStore, keybag: i32) -> Result<(i32, u32)> {
+    match key_store {
+        // Explicit user designations retain their own bag on the 13.5 protocol.
+        profile::KeyStore::Sepos13 { .. } if keybag <= -crate::sks::SKS_DESIGNATE_USER_MIN => {
+            Ok((keybag, 3))
+        }
+        profile::KeyStore::Sepos13 { .. } => {
+            // Identity calls use the designated session. A loaded source
+            // handle and class F with -1 did not persist correctly on J313.
+            let user = crate::sks::DesignateUser::new(crate::SBIO_PROBE_USER_ID)
+                .ok_or(EINVAL)?;
+            Ok((user.special_handle().value(), 3))
+        }
+        profile::KeyStore::Variant5 => Ok((keybag, REFKEY_ENVELOPE_VERSION)),
+    }
+}
+
 impl SepData {
     /// Keep only decoded bytes across switch-root, never an open initrd file.
     fn with_identity_keybag<T>(
@@ -37,17 +54,7 @@ impl SepData {
     }
 
     fn sks_req_refkey(&self, keybag: i32, der_set: &[u8]) -> Result<SksRequest> {
-        let (keybag, envelope) = match self.profile.key_store {
-            // The 13.5 operation envelope is 3. Use the designated identity
-            // session rather than the source handle; class F with -1 expired
-            // at the next boot on J313.
-            profile::KeyStore::Sepos13 { .. } => {
-                let user = crate::sks::DesignateUser::new(crate::SBIO_PROBE_USER_ID)
-                    .ok_or(EINVAL)?;
-                (user.special_handle().value(), 3)
-            }
-            profile::KeyStore::Variant5 => (keybag, REFKEY_ENVELOPE_VERSION),
-        };
+        let (keybag, envelope) = refkey_target(self.profile.key_store, keybag)?;
         let mut body = image::Body::new();
         body.put_u32(0)?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
@@ -530,18 +537,24 @@ impl SepData {
     }
 
     /// Test only (`key_selftest`): a ref-key under the designated user bag
-    /// `user` (outer handle `-uid`), which the caller has unlocked. Variant-5
-    /// key store only.
+    /// `user` (outer handle `-uid`), which the caller has unlocked. The key
+    /// type follows the key store, as for identity-bag keys: the 13.5 store
+    /// makes EC type 4 under a designated user bag as it does under the
+    /// identity bag.
     pub(crate) fn user_key_create_in_bag(
         &self,
         user: crate::sks::DesignateUser,
         acl: Option<&[u8]>,
     ) -> Result<KVec<u8>> {
-        if self.profile.key_store != profile::KeyStore::Variant5 {
+        if !self.profile.per_user_keybags {
             return Err(EOPNOTSUPP);
         }
+        let key_type = match self.profile.key_store {
+            profile::KeyStore::Sepos13 { .. } => 4,
+            profile::KeyStore::Variant5 => 5,
+        };
         crate::xart_guard::close_policy_window();
-        self.sks_create_refkey_at(user.special_handle().value(), 9, 5, acl).ok_or(EIO)
+        self.sks_create_refkey_at(user.special_handle().value(), 9, key_type, acl).ok_or(EIO)
     }
 
     /// Unseal (enclave `ock` + kernel decrypt, as `user_key_unseal`) with a
@@ -601,7 +614,7 @@ impl SepData {
     /// caller has unlocked the bag with the user's password. Variant-5 key
     /// store only.
     pub(crate) fn fde_key_create(&self, user: crate::sks::DesignateUser) -> Result<KVec<u8>> {
-        if self.profile.key_store != profile::KeyStore::Variant5 {
+        if !self.profile.per_user_keybags {
             return Err(EOPNOTSUPP);
         }
         crate::xart_guard::close_policy_window();
@@ -651,7 +664,7 @@ impl SepData {
         record: &[u8],
         sealed: &[u8],
     ) -> Result<KVec<u8>> {
-        if self.profile.key_store != profile::KeyStore::Variant5 {
+        if !self.profile.per_user_keybags {
             return Err(EOPNOTSUPP);
         }
         Self::refkey_pub(record).ok_or(EINVAL)?;
@@ -803,5 +816,29 @@ impl SepData {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_refkey_target)]
+mod target_tests {
+    use super::*;
+
+    #[test]
+    fn user_designations_keep_their_bag_on_each_protocol() -> Result<()> {
+        let old = profile::KeyStore::Sepos13 { cpx_encryption_mode: 2 };
+        let identity = crate::sks::DesignateUser::new(crate::SBIO_PROBE_USER_ID)
+            .ok_or(EINVAL)?.special_handle().value();
+        for handle in [0, 7, -1, -(crate::sks::SKS_DESIGNATE_USER_MIN - 1)] {
+            assert_eq!(refkey_target(old, handle)?, (identity, 3));
+        }
+        for handle in [-crate::sks::SKS_DESIGNATE_USER_MIN, -0x0100_03e8] {
+            assert_eq!(refkey_target(old, handle)?, (handle, 3));
+        }
+        for handle in [0, 7, -1, -0x0100_03e8] {
+            assert_eq!(refkey_target(profile::KeyStore::Variant5, handle)?,
+                (handle, REFKEY_ENVELOPE_VERSION));
+        }
+        Ok(())
     }
 }

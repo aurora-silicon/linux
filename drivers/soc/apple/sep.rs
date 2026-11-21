@@ -294,6 +294,35 @@ enum LockState {
     Unlocked,
 }
 
+/// A Unix user's own biometric user: the designation of its key bag
+/// (`userbag::bag_designation`) and the uid whose catacomb file it uses.
+/// A Touch ID match for one of that bag's keys runs in this user's domain,
+/// as macOS matches against the logged-in user's catacomb: a match against
+/// another user's templates does not satisfy the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BioSubject {
+    pub(crate) user: i32,
+    pub(crate) uid: u32,
+}
+
+/// Routes Touch ID to a bag user while a touch-gated call or an enrolment
+/// runs, under `catacomb_writer`; the configured user again when it ends, on
+/// every path.
+pub(crate) struct SubjectScope<'a>(&'a SepData);
+
+impl<'a> SubjectScope<'a> {
+    pub(crate) fn new(sep: &'a SepData, subject: BioSubject) -> Self {
+        *sep.bio_subject.lock() = Some(subject);
+        SubjectScope(sep)
+    }
+}
+
+impl Drop for SubjectScope<'_> {
+    fn drop(&mut self) {
+        *self.0.bio_subject.lock() = None;
+    }
+}
+
 impl LockState {
     const fn wire(self) -> i32 {
         match self {
@@ -707,6 +736,10 @@ struct SepData {
     templates_restored: Atomic<bool>,
     // Provisional cold restore; COMPLETE_INIT must still prove the device view.
     cold_restore_candidate: Atomic<bool>,
+    /// Every attach step of the cold restore succeeded, whatever the
+    /// configured user's identity count: enough for a match in a bag user's
+    /// own domain, whose catacomb is loaded and checked on its own.
+    components_restored: Atomic<bool>,
 
     sensor_calibrated: Atomic<bool>,
     sensor_key_loaded: Atomic<bool>,
@@ -737,6 +770,16 @@ struct SepData {
     // all before it sets up the new one, as a restart does.
     #[pin]
     cold_match_contexts: Mutex<KVec<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>>,
+
+    // Per-user bags the 13.5 key store keeps loaded between import and
+    // logout (see `userbag::LoadedBags`).
+    #[pin]
+    user_bags: Mutex<userbag::LoadedBags>,
+
+    // The biometric user a match addresses while a touch-gated call on a
+    // user-bag key waits (see `BioSubject`); none means the configured user.
+    #[pin]
+    bio_subject: Mutex<Option<BioSubject>>,
 
     // The sensor stayed powered and registered after the last verify, so the
     // next verify captures without a new bring-up, as macOS does. Cleared by
@@ -880,6 +923,8 @@ struct SepData {
     key_touch_active: Atomic<bool>,
     /// `SEP_KEY_CANCEL`: ends the touch-gated operation that is waiting.
     key_touch_cancel: Atomic<bool>,
+    /// An unconfirmed credential disposal disables private key operations.
+    key_context_failed: Atomic<bool>,
     // The enclave status of the last /dev/sep-key signature (self-test).
     last_key_status: Atomic<u32>,
 
@@ -1209,10 +1254,13 @@ impl SepData {
                 sensor_key_loaded: Atomic::new(false),
                 templates_restored: Atomic::new(false),
                 cold_restore_candidate: Atomic::new(false),
+                components_restored: Atomic::new(false),
                 enrol_material <- new_mutex!(None),
                 match_context <- new_mutex!(None),
                 match_context_generation: Atomic::new(0),
                 cold_match_contexts <- new_mutex!(KVec::new()),
+                user_bags <- new_mutex!(userbag::LoadedBags::new()),
+                bio_subject <- new_mutex!(None),
                 sensor_kept: Atomic::new(false),
                 sensor_reset_in_capture: Atomic::new(false),
                 bg_ops_ready: Atomic::new(false),
@@ -1266,6 +1314,7 @@ impl SepData {
                 key_touch <- new_mutex!(None),
                 key_touch_active: Atomic::new(false),
                 key_touch_cancel: Atomic::new(false),
+                key_context_failed: Atomic::new(false),
                 last_key_status: Atomic::new(0),
                 bio_lockout: Atomic::new(false),
                 bio_after_boot: Atomic::new(false),
@@ -2769,13 +2818,21 @@ impl SepData {
     }
 
     pub(crate) fn close_unlock_evaluation(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+        let _ = self.delete_unlock_evaluation(handle);
+    }
+
+    pub(crate) fn delete_unlock_evaluation(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) -> Result<()> {
         match self.scrd_command(&crate::scrd::scrd_context_delete(handle)) {
-            Some((0, _)) => {}
-            other => dev_warn_ratelimited!(
-                self.dev,
-                "scrd: deleting the unlock evaluation answered {:?}\n",
-                other.map(|(status, _)| status)
-            ),
+            Some((0, _)) => Ok(()),
+            other => {
+                self.key_context_failed.store(true, Relaxed);
+                dev_warn_ratelimited!(
+                    self.dev,
+                    "scrd: deleting the unlock evaluation answered {:?}; private key operations disabled until reboot\n",
+                    other.map(|(status, _)| status)
+                );
+                Err(EIO)
+            }
         }
     }
 

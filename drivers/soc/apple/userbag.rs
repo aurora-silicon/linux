@@ -30,7 +30,6 @@ const CLIENT: u64 = crate::sks::SKS_CLIENT_ID;
 const CREATE_VARIANT: u32 = 4;
 const CREATE_BAG_TYPE: u32 = 0;
 const CREATE_ARG: i32 = -1;
-const DESIGNATE_VARIANT: u32 = 1;
 const CHANGE_VARIANT: u32 = 3;
 const LOCK_STATE_VARIANT: u32 = 1;
 const DEVICE_STATE_VARIANT: u32 = 0;
@@ -200,28 +199,169 @@ fn decode_create_reply(body: &[u8]) -> Option<crate::sks::KeyBagHandle> {
     Some(crate::sks::KeyBagHandle::from_create_reply(handle))
 }
 
-fn encode_designate(source_handle: i32, user_handle: i32) -> Result<crate::image::Body> {
+// The 13.5 key store (M1/M2 generation, `KeyStore::Sepos13`) takes older
+// forms of create and of the loaded-bag lock-state change. Both are the
+// hardware-tested J293 encodings: the generic DeviceBag constructor and the
+// version-0 CHANGE_LOCK_STATE with no flags trailer. The device-state
+// transition and designation are shared with variant 5 (see
+// `encode_transition`, `crate::sks::designate_variant`).
+const CREATE_VARIANT_13: u32 = 1;
+const LOCK_STATE_VARIANT_13: u32 = 0;
+
+fn encode_create_13(secret: &[u8]) -> Result<crate::image::Body> {
+    let mut body = crate::image::Body::new();
+    body.put_u32(CREATE_VARIANT_13)?;
+    body.put_u64(CLIENT)?;
+    body.put_u32(0)?;
+    body.put_u32(0)?;
+    body.put_blob(secret)?;
+    body.put_blob(&[])?;
+    Ok(body)
+}
+
+fn decode_create_reply_13(body: &[u8]) -> Option<crate::sks::KeyBagHandle> {
+    let mut c = Cursor::new(body);
+    if c.u32()? != CREATE_VARIANT_13 {
+        return None;
+    }
+    let handle = c.i32()?;
+    if handle < 0 || !c.done() {
+        return None;
+    }
+    Some(crate::sks::KeyBagHandle::from_create_reply(handle))
+}
+
+/// Changes a loaded bag's lock state by its handle: unlocked (0) with the
+/// secret, or locked (1) with none. On the 13.5 store the unlock precedes the
+/// designated-session transition; neither alone lets a key under the bag
+/// run, and the session transition alone does not lock it either.
+fn encode_loaded_lock_state_13(bag: i32, state: TransitionState, secret: &[u8]) -> Result<crate::image::Body> {
+    if bag < 0 || (state == TransitionState::Unlocked) == secret.is_empty() {
+        return Err(EINVAL);
+    }
+    let mut body = crate::image::Body::new();
+    body.put_u32(LOCK_STATE_VARIANT_13)?;
+    body.put_u64(CLIENT)?;
+    body.put_i32(bag)?;
+    body.put_i32(state.wire() as i32)?;
+    body.put_blob(secret)?;
+    Ok(body)
+}
+
+/// Bags the 13.5 store holds loaded for designated users. Variant 5 keeps a
+/// designation after its temporary handle is unloaded; on the 13.5 store the
+/// loaded-bag unlock needs the handle, so a user's bag stays loaded from
+/// import or create until logout. Keyed by the designation's special handle.
+///
+/// An entry also holds the user's Touch ID preparation once a password
+/// unlock has made it: an SCRD context the enclave verified with the bag's
+/// password and found TouchIdEnrollment-satisfied. It stays live until the
+/// bag locks, and lets a match in that user's domain satisfy the bag's keys
+/// without the password, as on macOS after the first unlock. The password
+/// itself is never kept.
+pub(crate) struct LoadedBags(KVec<LoadedBag>);
+
+struct LoadedBag {
+    user: i32,
+    handle: crate::sks::KeyBagHandle,
+    touch: Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    /// The user's catacomb was loaded since this bag was (see
+    /// `userbag_restore_13`).
+    restored: bool,
+}
+
+impl LoadedBags {
+    pub(crate) const fn new() -> Self {
+        LoadedBags(KVec::new())
+    }
+
+    fn entry(&mut self, user: i32) -> Option<&mut LoadedBag> {
+        self.0.iter_mut().find(|b| b.user == user)
+    }
+
+    fn get(&self, user: i32) -> Option<crate::sks::KeyBagHandle> {
+        self.0.iter().find(|b| b.user == user).map(|b| b.handle)
+    }
+
+    fn touch(&self, user: i32) -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
+        self.0.iter().find(|b| b.user == user).and_then(|b| b.touch)
+    }
+
+    fn insert(&mut self, user: i32, handle: crate::sks::KeyBagHandle) -> Result<()> {
+        if self.get(user).is_some() {
+            return Err(EBUSY);
+        }
+        self.0.push(LoadedBag { user, handle, touch: None, restored: false }, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    /// Tracks a variant-5 bag, which the store addresses by its designation
+    /// `user` once designated. Already tracked is not an error: a designation
+    /// is kept until logout.
+    fn track_designated(&mut self, user: i32) -> Result<()> {
+        if self.get(user).is_some() {
+            return Ok(());
+        }
+        self.insert(user, crate::sks::KeyBagHandle::from_load_reply(user))
+    }
+
+    /// Removes the entry; the caller disposes of any touch preparation.
+    fn remove(&mut self, user: i32) -> Option<(crate::sks::KeyBagHandle, Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>)> {
+        let at = self.0.iter().position(|b| b.user == user)?;
+        let b = self.0.remove(at).ok()?;
+        Some((b.handle, b.touch))
+    }
+}
+
+/// What a bag's restore does, from whether the enclave lists a catacomb
+/// component for its user, whether a saved file exists, and whether the
+/// shared master is loaded (so a missing component means something).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BagRestore {
+    /// Never enrolled: nothing to load.
+    Nothing,
+    Load,
+    /// The loaded master forgot this user: the file is stale.
+    StartFresh,
+    /// A file but no loaded master to judge it by.
+    Refuse,
+}
+
+fn bag_restore_plan(component: bool, file: bool, master_active: bool) -> BagRestore {
+    match (component, file) {
+        (true, _) => BagRestore::Load,
+        (false, false) => BagRestore::Nothing,
+        (false, true) if master_active => BagRestore::StartFresh,
+        (false, true) => BagRestore::Refuse,
+    }
+}
+
+fn encode_designate(key_store: crate::profile::KeyStore, source_handle: i32, user_handle: i32) -> Result<crate::image::Body> {
     if source_handle < 0 || user_handle >= 0 {
         return Err(EINVAL);
     }
     let mut body = crate::image::Body::new();
-    body.put_u32(DESIGNATE_VARIANT)?;
+    body.put_u32(crate::sks::designate_variant(key_store))?;
     body.put_u64(CLIENT)?;
     body.put_i32(source_handle)?;
     body.put_i32(user_handle)?;
     body.put_blob(&[])?;
-    body.put_u64(0)?;
+    // The 13.5 structure ends after the empty blob, as in sks_req_designate.
+    if key_store == crate::profile::KeyStore::Variant5 {
+        body.put_u64(0)?;
+    }
     Ok(body)
 }
 
-fn decode_designate(body: &[u8]) -> Option<Designate> {
+fn decode_designate(key_store: crate::profile::KeyStore, body: &[u8]) -> Option<Designate> {
     let mut c = Cursor::new(body);
-    if c.u32()? != DESIGNATE_VARIANT || c.u64()? != CLIENT {
+    if c.u32()? != crate::sks::designate_variant(key_store) || c.u64()? != CLIENT {
         return None;
     }
     let source_handle = c.i32()?;
     let user_handle = c.i32()?;
-    if source_handle < 0 || user_handle >= 0 || !c.blob()?.is_empty() || c.u64()? != 0 || !c.done()
+    if source_handle < 0 || user_handle >= 0 || !c.blob()?.is_empty()
+        || (key_store == crate::profile::KeyStore::Variant5 && c.u64()? != 0) || !c.done()
     {
         return None;
     }
@@ -231,8 +371,8 @@ fn decode_designate(body: &[u8]) -> Option<Designate> {
     })
 }
 
-fn decode_designate_reply(body: &[u8]) -> bool {
-    body == DESIGNATE_VARIANT.to_le_bytes()
+fn decode_designate_reply(key_store: crate::profile::KeyStore, body: &[u8]) -> bool {
+    body == crate::sks::designate_variant(key_store).to_le_bytes()
 }
 
 fn encode_transition(
@@ -351,6 +491,37 @@ fn decode_change_secret(body: &[u8]) -> Option<ChangeSecret<'_>> {
         old,
         new,
     })
+}
+
+/// The 13.5 store's change-secret request (opcode 7): version 1, then the
+/// variant-5 fields without its last word, as macOS 13 sends it: client,
+/// handle, the old and new secrets, two further blobs (empty, as in the
+/// variant-5 capture), a u8 flag widened to a word (0xff, as captured) and
+/// the generation option (0).
+const CHANGE_VARIANT_13: u32 = 1;
+
+fn encode_change_secret_13(user_handle: i32, old: &[u8], new: &[u8]) -> Result<crate::image::Body> {
+    if user_handle >= 0 || old.is_empty() || new.is_empty() {
+        return Err(EINVAL);
+    }
+    let mut body = crate::image::Body::new();
+    body.put_u32(CHANGE_VARIANT_13)?;
+    body.put_u64(CLIENT)?;
+    body.put_i32(user_handle)?;
+    body.put_blob(old)?;
+    body.put_blob(new)?;
+    body.put_blob(&[])?;
+    body.put_blob(&[])?;
+    body.put_u32(CHANGE_TRAILER)?;
+    body.put_u32(0)?;
+    Ok(body)
+}
+
+/// The 13.5 reply: version 1, then zero words (the generation out-value).
+fn decode_change_secret_reply_13(body: &[u8]) -> bool {
+    body.len() >= 4
+        && body[..4] == CHANGE_VARIANT_13.to_le_bytes()
+        && body[4..].iter().all(|b| *b == 0)
 }
 
 fn decode_change_secret_reply(body: &[u8]) -> bool {
@@ -1090,13 +1261,374 @@ impl crate::SepData {
         .ok_or(EACCES)
     }
 
-    /// Opens a user's bag through the captured device-state transition.
+    /// Whether `user`'s designation slot already names the loaded `bag`.
+    fn userbag_designation_names(&self, user: crate::sks::DesignateUser, bag: crate::sks::KeyBagHandle) -> bool {
+        let Some(loaded) = self.sks_read_uuid(bag) else {
+            return false;
+        };
+        let Some(out) = self.sks_send(self.sks_req_copy_uuid_special(user.special_handle())) else {
+            return false;
+        };
+        out.reply.status == 0 && self.sks_uuid_from_reply(&out) == Some(loaded)
+    }
+
+    /// Ends a bag user's Touch ID preparation: deletes its unlock evaluation
+    /// in the enclave and wipes the handle.
+    fn userbag_dispose_touch(&self, mut handle: [u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+        let _ = self.delete_unlock_evaluation(&handle);
+        crate::image::wipe(&mut handle);
+    }
+
+    pub(crate) fn userbag_sepos13(&self) -> bool {
+        matches!(self.profile.key_store, crate::profile::KeyStore::Sepos13 { .. })
+    }
+
+    /// Variant 5 unloads a bag once it is designated and addresses it by its
+    /// designation from then on. Its entry in `user_bags` holds only the
+    /// user's Touch ID preparation and catacomb state; nothing unloads it.
+    fn userbag_track_designated(&self, user: crate::sks::DesignateUser) -> Result<()> {
+        self.user_bags.lock().track_designated(user.special_handle().value())
+    }
+
+    /// A lock of `user`'s bag (variant 5): its Touch ID preparation ends
+    /// before the store is asked, whatever it answers.
+    fn userbag_end_touch(&self, user: crate::sks::DesignateUser) {
+        let touch = self.user_bags.lock().entry(user.special_handle().value()).and_then(|e| e.touch.take());
+        if let Some(t) = touch {
+            self.userbag_dispose_touch(t);
+        }
+    }
+
+    /// Opens a user's bag through the captured device-state transition. The
+    /// 13.5 store first unlocks the loaded bag itself.
     pub(crate) fn userbag_unlock(
         &self,
         user: crate::sks::DesignateUser,
         secret: &[u8],
     ) -> Result<()> {
-        self.userbag_transition(user, TransitionState::Unlocked, 0, secret)
+        if !self.userbag_sepos13() {
+            self.userbag_transition(user, TransitionState::Unlocked, 0, secret)?;
+            self.userbag_refresh_touch_13(user, secret);
+            return Ok(());
+        }
+        {
+            let bags = self.user_bags.lock();
+            let bag = bags.get(user.special_handle().value()).ok_or(ENOENT)?;
+            self.userbag_loaded_lock_state_13(bag, TransitionState::Unlocked, secret)?;
+            self.userbag_transition(user, TransitionState::Unlocked, 0, secret)?;
+        }
+        // The password is accepted; Touch ID for this user is a bonus that
+        // never fails the unlock.
+        self.userbag_refresh_touch_13(user, secret);
+        Ok(())
+    }
+
+    /// Makes a fresh Touch ID preparation for `user` after its password was
+    /// accepted (a bag unlock, or a bag context's password authentication).
+    ///
+    /// Loading the user's catacomb resets the enclave's biometry lockout for
+    /// that user, which invalidates a preparation made before it. So the
+    /// catacomb is loaded first (`userbag_writer_for_restore`); only if that
+    /// fails does the first touch find the preparation stale (see
+    /// `userbag_touch_subject`).
+    pub(crate) fn userbag_refresh_touch_13(&self, user: crate::sks::DesignateUser, secret: &[u8]) {
+        if !self.profile.per_user_keybags {
+            return;
+        }
+        let uid = u32::try_from(-user.special_handle().value())
+            .ok()
+            .and_then(|id| id.checked_sub(USER_BAG_BASE));
+        if let Some(uid) = uid {
+            if let Some(_writer) = self.userbag_writer_for_restore(user, uid) {
+                let mut bags = self.user_bags.lock();
+                let _ = self.userbag_restore_13(&mut bags, user, uid);
+            }
+        }
+        // Prepared without `user_bags` held: a touch takes `catacomb_writer`
+        // before `user_bags`, so this must not take them the other way round.
+        let touch = self.userbag_prepare_touch_13(user, secret);
+        let mut bags = self.user_bags.lock();
+        if let Some(entry) = bags.entry(user.special_handle().value()) {
+            if let Some(old) = core::mem::replace(&mut entry.touch, touch) {
+                self.userbag_dispose_touch(old);
+            }
+        } else if let Some(t) = touch {
+            self.userbag_dispose_touch(t);
+        }
+    }
+
+    /// `catacomb_writer`, to load `uid`'s catacomb before a password makes
+    /// their Touch ID preparation. A fingerprint wait holds the lock for as
+    /// long as its prompt lasts, and a lock screen runs that prompt beside
+    /// the password one; loading the catacomb later, at the first touch,
+    /// makes the preparation stale, and that touch would need the password
+    /// once more. So on the first password since the bag was loaded, a
+    /// waiting capture is ended as a cancel ends it (fprintd may retry) and
+    /// the lock is awaited for at most `WORKER_EXIT_WAIT_MS`. A key's touch
+    /// is not ended. None when nothing is left to load or the lock stayed
+    /// held.
+    fn userbag_writer_for_restore(&self, user: crate::sks::DesignateUser, uid: u32) -> Option<kernel::sync::MutexGuard<'_, ()>> {
+        let pending = self.user_bags.lock().entry(user.special_handle().value()).is_some_and(|e| !e.restored);
+        if !pending {
+            return None;
+        }
+        if let Some(writer) = self.catacomb_writer.try_lock() {
+            return Some(writer);
+        }
+        if crate::catacomb::is_absent(crate::catacomb::Slot::BagUser(uid)) || self.key_touch_active.load(kernel::sync::atomic::Relaxed) {
+            return None;
+        }
+        if self.bio_cancel_capture() {
+            dev_dbg!(self.dev, "userbag: ended a waiting fingerprint prompt to load uid {}'s templates\n", uid);
+        }
+        let mut waited: u32 = 0;
+        while waited < crate::WORKER_EXIT_WAIT_MS {
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(20));
+            waited += 20;
+            if let Some(writer) = self.catacomb_writer.try_lock() {
+                return Some(writer);
+            }
+        }
+        dev_info_ratelimited!(self.dev,
+            "userbag: a capture still held Touch ID after {} ms; uid {} needs the password once more\n",
+            crate::WORKER_EXIT_WAIT_MS, uid);
+        None
+    }
+
+    /// After a password unlock on the 13.5 store: loads the user's catacomb
+    /// from its file and makes the Touch ID preparation (see `LoadedBags`).
+    /// None when the user has no templates or the enclave refuses.
+    fn userbag_prepare_touch_13(
+        &self,
+        user: crate::sks::DesignateUser,
+        secret: &[u8],
+    ) -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
+        // The catacomb was loaded before this (`userbag_refresh_touch_13`),
+        // or is loaded at the first Touch ID use under `catacomb_writer`.
+        let id = -user.special_handle().value();
+        let uid = u32::try_from(id).ok()?.checked_sub(USER_BAG_BASE)?;
+        let (handle, status) = self.key_context_for(id, Some((user.special_handle(), secret))).ok()?;
+        let ready = status == 0
+            && matches!(self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&handle)),
+                Some((0, ref reply)) if reply.get(..4) == Some(&1u32.to_le_bytes()));
+        if !ready {
+            self.userbag_dispose_touch(handle);
+            dev_info_ratelimited!(self.dev, "userbag: no Touch ID for uid {}: the preparation was refused\n", uid);
+            return None;
+        }
+        dev_dbg!(self.dev, "userbag: Touch ID and enrolment ready for uid {}\n", uid);
+        Some(handle)
+    }
+
+    /// Loads a bag user's catacomb from its file once per load of their bag.
+    /// Called with `catacomb_writer` held, before their first match or
+    /// enrolment. A user who never enrolled has neither a component nor a
+    /// file: nothing to load. Either one without the other is not that.
+    fn userbag_restore_13(&self, bags: &mut LoadedBags, user: crate::sks::DesignateUser, uid: u32) -> bool {
+        // Only reached after the bag's password (a Touch ID preparation
+        // exists), so starting a bag afresh never lets a finger in: it only
+        // costs the owner their enrolled fingers.
+        let Some(entry) = bags.entry(user.special_handle().value()) else {
+            return false;
+        };
+        if entry.restored {
+            return true;
+        }
+        let id = -user.special_handle().value();
+        let Some(raw) = self.read_component_states() else {
+            return false;
+        };
+        let states = crate::sbio::ComponentStates::new(&raw);
+        let state = states.state_for(id);
+        let slot = crate::catacomb::Slot::BagUser(uid);
+        let master_active = states
+            .state_for(crate::sbio::CatacombUser::MASTER.value())
+            .is_some_and(|s| s & crate::sbio::COMPONENT_STATE_ACTIVE != 0);
+        let plan = bag_restore_plan(state.is_some(), !crate::catacomb::is_absent(slot), master_active);
+        if plan == BagRestore::StartFresh {
+            // The loaded master lists nothing for this user, so its saved
+            // file predates the enclave's current templates: a kernel without
+            // per-user bags saved the master since, or the enclave was reset.
+            // Nothing in it can load; the next enrolment replaces it.
+            dev_info_ratelimited!(
+                self.dev,
+                "userbag: uid {}'s saved fingerprints are not in the enclave's templates any more (another kernel saved them since); its Touch ID starts afresh: enrol again\n",
+                uid
+            );
+        } else if plan == BagRestore::Refuse {
+            dev_info_ratelimited!(self.dev, "userbag: no Touch ID for uid {}: a saved catacomb but no loaded master to check it against\n", uid);
+            return false;
+        } else if plan == BagRestore::Load {
+            let outcome = self.restore_catacomb(state, id, slot, c"bag user catacomb");
+            if !matches!(outcome, crate::RestoreOutcome::AlreadyActive | crate::RestoreOutcome::Restored) {
+                if matches!(outcome, crate::RestoreOutcome::NoStoredFile) {
+                    dev_info_ratelimited!(
+                        self.dev,
+                        "userbag: no Touch ID for uid {}: the enclave expects its saved catacomb and the file is missing; restore the file (it is not recreated)\n",
+                        uid
+                    );
+                } else {
+                    dev_info_ratelimited!(self.dev, "userbag: no Touch ID for uid {}: its catacomb did not load ({:?})\n", uid, outcome);
+                }
+                return false;
+            }
+            // Loading it resets the enclave's biometry lockout for the user,
+            // which invalidates a Touch ID preparation made before it: that
+            // one goes, and the next password makes a valid one
+            // (`userbag_refresh_touch_13`).
+            if matches!(outcome, crate::RestoreOutcome::Restored) {
+                if let Some(t) = entry.touch.take() {
+                    self.userbag_dispose_touch(t);
+                    dev_info_ratelimited!(self.dev,
+                        "userbag: Touch ID for uid {} needs the password once more: its templates loaded after the unlock\n", uid);
+                }
+            }
+        }
+        entry.restored = true;
+        true
+    }
+
+    /// The subject of an enrolment or a verify for the Unix account `uid`
+    /// (a store with per-user bags): that user's own domain when their bag
+    /// is loaded. Refused while it is loaded but not unlocked by the password
+    /// since its last lock, as macOS asks for the password then. None (no
+    /// bag) keeps the configured user.
+    pub(crate) fn userbag_bio_subject(&self, uid: u32) -> Result<Option<crate::BioSubject>> {
+        if !self.profile.per_user_keybags || uid < MIN_UID {
+            return Ok(None);
+        }
+        let user = bag_designation(uid)?;
+        let mut bags = self.user_bags.lock();
+        if bags.get(user.special_handle().value()).is_none() {
+            return Ok(None);
+        }
+        if bags.touch(user.special_handle().value()).is_none() || !self.userbag_restore_13(&mut bags, user, uid) {
+            return Err(EACCES);
+        }
+        Ok(Some(crate::BioSubject { user: -user.special_handle().value(), uid }))
+    }
+
+    /// The current subject's password-verified credential, for BEGIN_ENROL.
+    pub(crate) fn userbag_subject_credential(&self) -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
+        let subject = (*self.bio_subject.lock())?;
+        self.user_bags.lock().touch(-subject.user)
+    }
+
+    /// Touch ID for a key under `uid`'s bag (a store with per-user bags): the
+    /// preparation must exist, i.e. the password has unlocked the bag since
+    /// it last locked, and the enclave must still find it
+    /// TouchIdEnrollment-satisfied.
+    pub(crate) fn userbag_touch_subject(&self, uid: u32) -> Result<Option<crate::BioSubject>> {
+        if !self.profile.per_user_keybags {
+            return Ok(None);
+        }
+        let user = bag_designation(uid)?;
+        let handle = {
+            let mut bags = self.user_bags.lock();
+            let Some(handle) = bags.touch(user.special_handle().value()) else {
+                return Err(EACCES);
+            };
+            if !self.userbag_restore_13(&mut bags, user, uid) {
+                return Err(EACCES);
+            }
+            // Loading the catacomb just now dropped a preparation it made
+            // stale (`userbag_restore_13`).
+            if bags.touch(user.special_handle().value()).is_none() {
+                return Err(EACCES);
+            }
+            handle
+        };
+        let ready = matches!(self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&handle)),
+            Some((0, ref reply)) if reply.get(..4) == Some(&1u32.to_le_bytes()));
+        if !ready {
+            return Err(EACCES);
+        }
+        Ok(Some(crate::BioSubject { user: -user.special_handle().value(), uid }))
+    }
+
+    fn userbag_loaded_lock_state_13(
+        &self,
+        bag: crate::sks::KeyBagHandle,
+        state: TransitionState,
+        secret: &[u8],
+    ) -> Result<()> {
+        let out = self
+            .sks_step(crate::sks::SKS_LOCK_STATE_NAME, |_healthy| {
+                self.userbag_request(
+                    crate::sks::SKS_LOCK_STATE_NAME,
+                    encode_loaded_lock_state_13(bag.value(), state, secret)?,
+                    |seq, len| crate::sks::encode_sks_change_lock_state(seq, len).ok_or(EINVAL),
+                )
+            })
+            .ok_or(EACCES)?;
+        let body = self.userbag_body(crate::sks::SKS_LOCK_STATE_NAME, &out)?;
+        if body.len() != 16 || crate::image::operation_status(body) != Some(0) {
+            return Err(self.userbag_refused("loaded-bag lock state", body));
+        }
+        Ok(())
+    }
+
+    /// Locks the session and the loaded bag itself (13.5 store), then sends
+    /// grace-timer fires, as the Mac's kernel does, until the store reports
+    /// the bag locked. Both lock requests are accepted with the bag still
+    /// usable: the store locks only when its timer fires, about 10 s later
+    /// even for an immediate lock on M1.
+    fn userbag_lock_13(&self, user: crate::sks::DesignateUser, flags: u64) -> Result<()> {
+        const FIRES: u32 = 15;
+        // Not held across the requests and the waits between fires: every
+        // other bag and Touch ID path takes this lock.
+        let (bag, touch) = {
+            let mut bags = self.user_bags.lock();
+            let bag = bags.get(user.special_handle().value()).ok_or(ENOENT)?;
+            (bag, bags.entry(user.special_handle().value()).and_then(|e| e.touch.take()))
+        };
+        // Touch ID ends with the lock, whatever the store answers.
+        if let Some(t) = touch {
+            self.userbag_dispose_touch(t);
+        }
+        self.userbag_transition(user, TransitionState::Locked, flags, &[])?;
+        self.userbag_loaded_lock_state_13(bag, TransitionState::Locked, &[])?;
+        for fire in 0..FIRES {
+            let out = self
+                .sks_step(crate::sks::SKS_HANDLE_TIMER_FIRE_NAME, |_healthy| {
+                    self.userbag_request(
+                        crate::sks::SKS_HANDLE_TIMER_FIRE_NAME,
+                        encode_timer_fire()?,
+                        |seq, len| Ok(crate::sks::encode_sks_handle_timer_fire(seq, len)),
+                    )
+                })
+                .ok_or(EACCES)?;
+            let body = self.userbag_body(crate::sks::SKS_HANDLE_TIMER_FIRE_NAME, &out)?;
+            match decode_timer_fire_reply(body) {
+                Some(h) if h == user.special_handle().value() => {
+                    dev_dbg!(self.dev, "userbag: {}'s bag locked after {} timer fires\n", h, fire + 1);
+                    return Ok(());
+                }
+                Some(_) => {}
+                None => return Err(self.userbag_refused("13.5 timer fire", body)),
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1000));
+        }
+        dev_info_ratelimited!(self.dev, "userbag: the store did not lock {}'s bag within {} s\n", user.special_handle().value(), FIRES);
+        Err(ETIMEDOUT)
+    }
+
+    /// Logout on the 13.5 store: lock the session, then unload the bag. The
+    /// caller exports it first; the next login imports it again.
+    fn userbag_logout_13(&self, user: crate::sks::DesignateUser) -> Result<()> {
+        let locked = self.userbag_lock_13(user, 0);
+        let removed = self.user_bags.lock().remove(user.special_handle().value());
+        if let Some((bag, touch)) = removed {
+            if let Some(t) = touch {
+                self.userbag_dispose_touch(t);
+            }
+            let unloaded = self.sks_send(self.sks_req_unload_keybag(bag));
+            if !matches!(unloaded, Some(ref out) if out.reply.status == 0) {
+                dev_info_ratelimited!(self.dev, "userbag: unloading {}'s bag at logout failed\n", user.special_handle().value());
+                return Err(EIO);
+            }
+        }
+        locked
     }
 
     pub(crate) fn userbag_lock(
@@ -1105,6 +1637,24 @@ impl crate::SepData {
         screen_lock: bool,
         immediate: bool,
     ) -> Result<()> {
+        // The 13.5 store locks as it unlocks: the device-state transition
+        // (the variant-5 layout; flags 1 for a screen lock, 0 at once), then
+        // the loaded bag. The transition alone leaves the bag usable.
+        if self.userbag_sepos13() {
+            // A screen lock that keeps the class keys for a grace period has
+            // not been captured on this store: refuse it rather than wait.
+            if screen_lock && !immediate {
+                dev_info_ratelimited!(
+                    self.dev,
+                    "userbag: a screen lock with a grace period is not supported on the 13.5 key store yet\n"
+                );
+                return Err(EOPNOTSUPP);
+            }
+            return self.userbag_lock_13(user, 0);
+        }
+        // Variant 5: this bag's Touch ID ends with any lock, including one
+        // with a grace period.
+        self.userbag_end_touch(user);
         if immediate {
             let handle = user.special_handle().value();
             return self
@@ -1132,18 +1682,24 @@ impl crate::SepData {
         new: &[u8],
     ) -> Result<()> {
         let handle = user.special_handle().value();
+        let sepos13 = self.userbag_sepos13();
         let out = self
             .sks_step(crate::sks::SKS_CHANGE_SECRET_NAME, |_healthy| {
                 self.userbag_request(
                     crate::sks::SKS_CHANGE_SECRET_NAME,
-                    encode_change_secret(handle, old, new)?,
+                    if sepos13 {
+                        encode_change_secret_13(handle, old, new)?
+                    } else {
+                        encode_change_secret(handle, old, new)?
+                    },
                     |seq, len| Ok(crate::sks::encode_sks_change_secret(seq, len)),
                 )
             })
             .ok_or(EACCES)?;
         let body = self.userbag_body(crate::sks::SKS_CHANGE_SECRET_NAME, &out)?;
-        if !decode_change_secret_reply(body) {
-            return Err(EPROTO);
+        let ok = if sepos13 { decode_change_secret_reply_13(body) } else { decode_change_secret_reply(body) };
+        if !ok {
+            return Err(self.userbag_refused("change secret", body));
         }
         Ok(())
     }
@@ -1165,23 +1721,41 @@ impl crate::SepData {
     /// handle, in macOS's order.
     pub(crate) fn userbag_import(&self, user: crate::sks::DesignateUser, wrapped: &[u8]) -> Result<()> {
         let handle = self.sks_load_wrapped(wrapped).ok_or(EACCES)?;
+        // The 13.5 store keeps a designation after its bag is unloaded and
+        // refuses to designate the slot again: a second login in one boot
+        // finds it already naming this bag.
+        if self.userbag_sepos13() && self.userbag_designation_names(user, handle) {
+            if let Err(e) = self.user_bags.lock().insert(user.special_handle().value(), handle) {
+                let _ = self.sks_send(self.sks_req_unload_keybag(handle));
+                return Err(e);
+            }
+            return Ok(());
+        }
         let designated = self.sks_step(crate::sks::SKS_DESIGNATE_NAME, |_healthy| {
             self.userbag_request(
                 crate::sks::SKS_DESIGNATE_NAME,
-                encode_designate(handle.value(), user.special_handle().value())?,
+                encode_designate(self.profile.key_store, handle.value(), user.special_handle().value())?,
                 |seq, len| crate::sks::encode_sks_designate(seq, len).ok_or(EINVAL),
             )
         });
         let valid = designated.as_ref().is_some_and(|out| {
             self.sks_report_response(crate::sks::SKS_DESIGNATE_NAME, out)
-                .is_some_and(decode_designate_reply)
+                .is_some_and(|body| decode_designate_reply(self.profile.key_store, body))
         });
+        if valid && self.userbag_sepos13() {
+            // Kept loaded for the session (see `LoadedBags`).
+            if let Err(e) = self.user_bags.lock().insert(user.special_handle().value(), handle) {
+                let _ = self.sks_send(self.sks_req_unload_keybag(handle));
+                return Err(e);
+            }
+            return Ok(());
+        }
         let _ = self.sks_send(self.sks_req_unload_keybag(handle));
         if !valid {
             dev_info_ratelimited!(self.dev, "userbag: designating the imported bag as {} failed\n", user.special_handle().value());
             return Err(EACCES);
         }
-        Ok(())
+        self.userbag_track_designated(user)
     }
 
     pub(crate) fn userbag_create(
@@ -1192,9 +1766,13 @@ impl crate::SepData {
         let _healthy = self
             .sks_health_check(crate::sks::SKS_CREATE_NAME)
             .ok_or(EACCES)?;
+        let sepos13 = self.userbag_sepos13();
+        if sepos13 && self.user_bags.lock().get(user.special_handle().value()).is_some() {
+            return Err(EBUSY);
+        }
         let request = self.userbag_request(
             crate::sks::SKS_CREATE_NAME,
-            encode_create(secret)?,
+            if sepos13 { encode_create_13(secret)? } else { encode_create(secret)? },
             |seq, len| crate::sks::encode_sks_create(seq, len).ok_or(EINVAL),
         )?;
         let created = crate::xart_guard::keybag_create_window(|| self.sks_send(Ok(request)))
@@ -1203,22 +1781,31 @@ impl crate::SepData {
             return Err(EACCES);
         }
         let body = self.userbag_body(crate::sks::SKS_CREATE_NAME, &created)?;
-        let handle = decode_create_reply(body).ok_or(EPROTO)?;
+        let handle = if sepos13 { decode_create_reply_13(body) } else { decode_create_reply(body) }
+            .ok_or_else(|| self.userbag_refused("create", body))?;
 
         let designated = self.sks_step(crate::sks::SKS_DESIGNATE_NAME, |_healthy| {
             self.userbag_request(
                 crate::sks::SKS_DESIGNATE_NAME,
-                encode_designate(handle.value(), user.special_handle().value())?,
+                encode_designate(self.profile.key_store, handle.value(), user.special_handle().value())?,
                 |seq, len| crate::sks::encode_sks_designate(seq, len).ok_or(EINVAL),
             )
         });
         let valid = designated.as_ref().is_some_and(|out| {
             self.sks_report_response(crate::sks::SKS_DESIGNATE_NAME, out)
-                .is_some_and(decode_designate_reply)
+                .is_some_and(|body| decode_designate_reply(self.profile.key_store, body))
         });
         if !valid {
             let _ = self.sks_send(self.sks_req_unload_keybag(handle));
             return Err(EACCES);
+        }
+        if sepos13 {
+            if let Err(e) = self.user_bags.lock().insert(user.special_handle().value(), handle) {
+                let _ = self.sks_send(self.sks_req_unload_keybag(handle));
+                return Err(e);
+            }
+        } else {
+            self.userbag_track_designated(user)?;
         }
         // Copying the wrapped bag into a per-user durable store is phase 2.
         // Until then this ioctl establishes only the live designated bag.
@@ -1304,18 +1891,42 @@ impl crate::SepData {
 
     pub(crate) fn userbag_ioctl(&self, cmd: u32, arg: usize) -> Result<crate::bio::Handled> {
         crate::bio::require_admin()?;
-        if self.profile.key_store != crate::profile::KeyStore::Variant5 {
-            // The user-bag layouts were captured on the variant-5 key store
-            // (macOS 26 on the Neo). The 13.x key store of M1/M2-generation
-            // Macs has not been captured, so nothing is sent there.
+        if !self.profile.per_user_keybags {
+            // Gate on the proven-hardware capability, NOT the create-encoding
+            // variant: the warm macOS-shared enclaves (T8112/M2, T8122/M3) use
+            // the variant-5 identity encoding yet never reply to a user-bag
+            // DESIGNATE_KEYBAG, which condemns the SKS endpoint for the boot.
+            // User-bag create/designate is proven only on the Neo (T8140) and
+            // the J616s/M4-Pro family; everything else refuses cleanly here so
+            // the enclave is never wedged. Touch ID / identity are untouched.
             dev_info_ratelimited!(
                 self.dev,
-                "userbag: per-user key bags are not supported on this key store yet (only variant 5 has been captured)\n"
+                "userbag: per-user key bags are not supported on this Mac's Secure Enclave key store\n"
+            );
+            return Err(EOPNOTSUPP);
+        }
+        // Variant 5 (macOS 26 on the Neo) has every layout. The 13.5 store of
+        // M1/M2-generation Macs has create, import/export, unlock, lock and
+        // password change; its state query and FDE sealing are not captured.
+        let supported = match self.profile.key_store {
+            crate::profile::KeyStore::Variant5 => true,
+            crate::profile::KeyStore::Sepos13 { .. } => {
+                matches!(cmd, IOC_CREATE | IOC_IMPORT | IOC_EXPORT | IOC_UNLOCK | IOC_LOCK | IOC_CHANGE)
+            }
+        };
+        if !supported {
+            dev_info_ratelimited!(
+                self.dev,
+                "userbag: this request is not supported on this key store yet\n"
             );
             return Err(EOPNOTSUPP);
         }
         let user_ptr = UserPtr::from_addr(arg);
-        if cmd != IOC_STATE && !crate::bio::idle_for_mutation(&self.bio_session.lock()) {
+        // Create, import, export, unlock and lock leave the Touch ID session
+        // alone. A lock screen runs its password and fingerprint prompts at
+        // once, so a login must not wait for a fingerprint wait to end.
+        let reads_or_opens = matches!(cmd, IOC_STATE | IOC_CREATE | IOC_EXPORT | IOC_IMPORT | IOC_UNLOCK | IOC_LOCK);
+        if !reads_or_opens && !crate::bio::idle_for_mutation(&self.bio_session.lock()) {
             return Err(EBUSY);
         }
         match cmd {
@@ -1441,7 +2052,19 @@ impl crate::SepData {
                 let (uid, reason, grace_s) = parse_lock(&request)?;
                 let user = bag_designation(uid)?;
                 let screen = reason == LOCK_REASON_SCREEN;
-                self.userbag_lock(user, screen, lock_is_immediate(reason, grace_s))?;
+                if reason == LOCK_REASON_LOGOUT && self.userbag_sepos13() {
+                    self.userbag_logout_13(user)?;
+                    return crate::bio::ok();
+                }
+                let locked = self.userbag_lock(user, screen, lock_is_immediate(reason, grace_s));
+                if reason == LOCK_REASON_LOGOUT {
+                    // Variant 5: the next login imports the bag again.
+                    let removed = self.user_bags.lock().remove(user.special_handle().value());
+                    if let Some((_, Some(t))) = removed {
+                        self.userbag_dispose_touch(t);
+                    }
+                }
+                locked?;
                 crate::bio::ok()
             }
             IOC_CHANGE => {
@@ -1539,8 +2162,106 @@ mod tests {
     }
 
     #[test]
+    fn sepos13_create_layout_golden() {
+        let body = encode_create_13(b"pw").expect("create");
+        let mut golden = [0u8; 32];
+        golden[0..4].copy_from_slice(&1u32.to_le_bytes());
+        golden[4..12].copy_from_slice(&CLIENT_LE);
+        golden[20..24].copy_from_slice(&2u32.to_le_bytes());
+        golden[24..26].copy_from_slice(b"pw");
+        assert_eq!(body.as_slice(), &golden);
+        assert_eq!(decode_create_reply_13(&[1, 0, 0, 0, 7, 0, 0, 0]).unwrap().value(), 7);
+        // The variant-5 reply, a negative handle and a trailer are refused.
+        assert!(decode_create_reply_13(&[4, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]).is_none());
+        assert!(decode_create_reply_13(&[1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]).is_none());
+        assert!(decode_create_reply_13(&[1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]).is_none());
+        assert!(decode_create_reply(&[1, 0, 0, 0, 7, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn sepos13_change_secret_layout_golden() {
+        let body = encode_change_secret_13(USER_HANDLE, b"ol", b"nw").expect("change");
+        let mut golden = [0u8; 52];
+        golden[0..4].copy_from_slice(&1u32.to_le_bytes());
+        golden[4..12].copy_from_slice(&CLIENT_LE);
+        golden[12..16].copy_from_slice(&USER_HANDLE.to_le_bytes());
+        golden[16..20].copy_from_slice(&2u32.to_le_bytes());
+        golden[20..22].copy_from_slice(b"ol");
+        golden[24..28].copy_from_slice(&2u32.to_le_bytes());
+        golden[28..30].copy_from_slice(b"nw");
+        // two empty blobs at 32 and 36
+        golden[40..44].copy_from_slice(&0xffu32.to_le_bytes());
+        assert_eq!(&body.as_slice()[..44], &golden[..44]);
+        assert_eq!(body.as_slice().len(), 48);
+        assert!(decode_change_secret_reply_13(&[1, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(!decode_change_secret_reply_13(&[3, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(!decode_change_secret_reply_13(&[1, 0, 0, 0, 5, 0, 0, 0]));
+    }
+
+    #[test]
+    fn sepos13_loaded_unlock_layout_golden() {
+        let body = encode_loaded_lock_state_13(5, TransitionState::Unlocked, b"pw").expect("unlock");
+        let mut golden = [0u8; 28];
+        golden[4..12].copy_from_slice(&CLIENT_LE);
+        golden[12..16].copy_from_slice(&5i32.to_le_bytes());
+        golden[20..24].copy_from_slice(&2u32.to_le_bytes());
+        golden[24..26].copy_from_slice(b"pw");
+        assert_eq!(body.as_slice(), &golden);
+        assert_eq!(encode_loaded_lock_state_13(-5, TransitionState::Unlocked, b"pw").err(), Some(EINVAL));
+        assert_eq!(encode_loaded_lock_state_13(5, TransitionState::Unlocked, b"").err(), Some(EINVAL));
+        let body = encode_loaded_lock_state_13(5, TransitionState::Locked, b"").expect("lock");
+        let mut golden = [0u8; 24];
+        golden[4..12].copy_from_slice(&CLIENT_LE);
+        golden[12..16].copy_from_slice(&5i32.to_le_bytes());
+        golden[16..20].copy_from_slice(&1i32.to_le_bytes());
+        assert_eq!(body.as_slice(), &golden);
+        assert_eq!(encode_loaded_lock_state_13(5, TransitionState::Locked, b"pw").err(), Some(EINVAL));
+    }
+
+    #[test]
+    fn loaded_bags_hold_one_bag_per_user() {
+        let mut bags = LoadedBags::new();
+        let h = crate::sks::KeyBagHandle::from_load_reply(3);
+        bags.insert(USER_HANDLE, h).expect("insert");
+        assert_eq!(bags.insert(USER_HANDLE, h).unwrap_err(), EBUSY);
+        assert_eq!(bags.get(USER_HANDLE).unwrap().value(), 3);
+        assert!(bags.get(USER_HANDLE - 1).is_none());
+        assert_eq!(bags.remove(USER_HANDLE).unwrap().0.value(), 3);
+        assert!(bags.remove(USER_HANDLE).is_none());
+    }
+
+    #[test]
+    fn a_stale_bag_file_starts_afresh_only_against_a_loaded_master() {
+        // A component the enclave lists is loaded, file or not (a missing
+        // file is then refused by the load).
+        assert_eq!(bag_restore_plan(true, true, true), BagRestore::Load);
+        assert_eq!(bag_restore_plan(true, false, false), BagRestore::Load);
+        assert_eq!(bag_restore_plan(false, false, true), BagRestore::Nothing);
+        assert_eq!(bag_restore_plan(false, false, false), BagRestore::Nothing);
+        // A file the loaded master no longer knows is stale.
+        assert_eq!(bag_restore_plan(false, true, true), BagRestore::StartFresh);
+        // Without a loaded master, nothing proves that.
+        assert_eq!(bag_restore_plan(false, true, false), BagRestore::Refuse);
+    }
+
+    #[test]
+    fn a_designated_bag_is_tracked_once_under_its_designation() {
+        let mut bags = LoadedBags::new();
+        bags.track_designated(USER_HANDLE).expect("track");
+        assert_eq!(bags.get(USER_HANDLE).unwrap().value(), USER_HANDLE);
+        // Tracking again (a second import before logout) keeps the entry and
+        // its Touch ID preparation.
+        bags.entry(USER_HANDLE).unwrap().touch = Some([7; crate::scrd::SCRD_ACM_HANDLE_LEN]);
+        bags.track_designated(USER_HANDLE).expect("again");
+        assert_eq!(bags.touch(USER_HANDLE), Some([7; crate::scrd::SCRD_ACM_HANDLE_LEN]));
+        assert_eq!(bags.remove(USER_HANDLE).unwrap().1, Some([7; crate::scrd::SCRD_ACM_HANDLE_LEN]));
+        assert!(bags.get(USER_HANDLE).is_none());
+    }
+
+    #[test]
     fn designate_layout_golden_and_round_trip() {
-        let body = encode_designate(1, USER_HANDLE).expect("designate");
+        let key_store = crate::profile::KeyStore::Variant5;
+        let body = encode_designate(key_store, 1, USER_HANDLE).expect("designate");
         let mut golden = [0u8; 32];
         golden[0..4].copy_from_slice(&1u32.to_le_bytes());
         golden[4..12].copy_from_slice(&CLIENT_LE);
@@ -1548,13 +2269,32 @@ mod tests {
         golden[16..20].copy_from_slice(&USER_HANDLE.to_le_bytes());
         assert_eq!(body.as_slice(), &golden);
         assert_eq!(
-            decode_designate(body.as_slice()),
+            decode_designate(key_store, body.as_slice()),
             Some(Designate {
                 source_handle: 1,
                 user_handle: USER_HANDLE
             })
         );
-        assert!(decode_designate_reply(&1u32.to_le_bytes()));
+        assert!(decode_designate_reply(key_store, &1u32.to_le_bytes()));
+    }
+
+    #[test]
+    fn sepos13_designation_has_no_flags_trailer() {
+        let key_store = crate::profile::KeyStore::Sepos13 { cpx_encryption_mode: 0 };
+        let body = encode_designate(key_store, 1, USER_HANDLE).expect("designate");
+        let mut golden = [0u8; 24];
+        golden[4..12].copy_from_slice(&CLIENT_LE);
+        golden[12..16].copy_from_slice(&1i32.to_le_bytes());
+        golden[16..20].copy_from_slice(&USER_HANDLE.to_le_bytes());
+        assert_eq!(body.as_slice(), &golden);
+        assert_eq!(decode_designate(key_store, body.as_slice()),
+            Some(Designate { source_handle: 1, user_handle: USER_HANDLE }));
+        assert!(decode_designate_reply(key_store, &0u32.to_le_bytes()));
+        assert!(!decode_designate_reply(key_store, &1u32.to_le_bytes()));
+        assert!(decode_designate(crate::profile::KeyStore::Variant5, body.as_slice()).is_none());
+        let mut extra = [0u8; 32];
+        extra[..24].copy_from_slice(body.as_slice());
+        assert!(decode_designate(key_store, &extra).is_none());
     }
 
     #[test]

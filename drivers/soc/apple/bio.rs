@@ -161,9 +161,14 @@ struct EnrolPoll {
 #[repr(C)]
 struct VerifyStart {
     flags: u32,
-    reserved: u32,
+    account_uid: u32,
     nonce: [u8; NONCE_LEN],
 }
+
+/// `VerifyStart.flags`: `account_uid` is the Unix account to match for.
+const VERIFY_ACCOUNT: u32 = 1;
+/// `Info.reserved[0]`: this kernel takes `VERIFY_ACCOUNT`.
+const INFO_VERIFY_ACCOUNT: u32 = 2;
 
 #[repr(C)]
 #[derive(Default)]
@@ -319,7 +324,7 @@ const IOC_ENROL_POLL: u32 = _IOR::<EnrolPoll>(MAGIC, 0x04);
 const IOC_VERIFY_START: u32 = _IOW::<VerifyStart>(MAGIC, 0x05);
 const IOC_VERIFY_POLL: u32 = _IOR::<VerifyPoll>(MAGIC, 0x06);
 const IOC_CANCEL: u32 = _IO(MAGIC, 0x07);
-const IOC_DELETE: u32 = _IOW::<Delete>(MAGIC, 0x08);
+pub(crate) const IOC_DELETE: u32 = _IOW::<Delete>(MAGIC, 0x08);
 const IOC_DELETE_ALL: u32 = _IO(MAGIC, 0x09);
 pub(crate) const IOC_ATTEST: u32 = _IOWR::<Attest>(MAGIC, 0x0a);
 pub(crate) const IOC_LIST_ENCLAVE: u32 = _IOR::<EnclaveList>(MAGIC, 0x0b);
@@ -520,6 +525,8 @@ enum Op {
     Idle,
     Enrol {
         label: [u8; LABEL_LEN],
+        /// The resolved Unix account the enrolment is for.
+        account_uid: u32,
         stage: u32,
         terminal: Option<EnrolOutcome>,
         guidance: Guidance,
@@ -527,6 +534,8 @@ enum Op {
     },
     Verify {
         nonce: [u8; NONCE_LEN],
+        /// The Unix account to match for (`VERIFY_ACCOUNT`), if named.
+        account: Option<u32>,
         terminal: Option<VerifyOutcome>,
         guidance: Guidance,
     },
@@ -606,6 +615,18 @@ pub(crate) struct Context<'a> {
     pub(crate) index: &'a IdentityIndex,
     pub(crate) sensor_present: bool,
     pub(crate) live_identity_count: Option<usize>,
+    /// Whether a verify may name a Unix account: only where per-user key
+    /// bags exist (`PlatformProfile::per_user_keybags`).
+    pub(crate) verify_account: bool,
+    /// Identities enrolled in a Unix account's own key bag, which a verify
+    /// naming that account matches. Listed with the index's, so a list
+    /// holds every identity a match can answer.
+    pub(crate) account_identities: &'a [[u8; UUID_LEN]],
+}
+
+/// Whether `cmd` lists identities, which then needs the accounts' own.
+pub(crate) fn lists_identities(cmd: u32) -> bool {
+    cmd == IOC_LIST
 }
 
 pub(crate) struct Handled {
@@ -678,7 +699,8 @@ fn get_info(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         // when SEP itself successfully answered LIST_IDENTITIES; older
         // kernels and unavailable SEP contexts leave this flag clear.
         reserved: [
-            u32::from(ctx.live_identity_count.is_some()),
+            u32::from(ctx.live_identity_count.is_some())
+                | if ctx.verify_account { INFO_VERIFY_ACCOUNT } else { 0 },
             ctx.live_identity_count.unwrap_or(0) as u32,
             0,
         ],
@@ -689,19 +711,38 @@ fn get_info(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     ok()
 }
 
-fn list(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
+/// The index's identities, then each account's own not already among them
+/// (without a label: the account's records are fprintd's, by identity).
+/// fprintd deletes any of its prints a list lacks, so a list without the
+/// accounts' identities would delete prints a match still answers.
+fn listed(index: &IdentityIndex, accounts: &[[u8; UUID_LEN]]) -> List {
     let mut out = List {
         count: 0,
         reserved: 0,
         id: [Identity::ZERO; MAX_IDENTITIES],
     };
-    for entry in ctx.index.entries.iter() {
+    for entry in index.entries.iter() {
         if out.count as usize >= MAX_IDENTITIES {
             break;
         }
         out.id[out.count as usize] = *entry;
         out.count += 1;
     }
+    for uuid in accounts {
+        if out.count as usize >= MAX_IDENTITIES {
+            break;
+        }
+        if *uuid == [0; UUID_LEN] || out.id[..out.count as usize].iter().any(|id| id.uuid == *uuid) {
+            continue;
+        }
+        out.id[out.count as usize] = Identity { uuid: *uuid, label: [0; LABEL_LEN] };
+        out.count += 1;
+    }
+    out
+}
+
+fn list(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
+    let out = listed(ctx.index, ctx.account_identities);
 
     UserSlice::new(user, core::mem::size_of::<List>())
         .writer()
@@ -733,6 +774,28 @@ pub(crate) fn validate_enrol_start_arg(arg: usize) -> Result<()> {
 }
 
 #[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_list_accounts)]
+mod list_accounts_tests {
+    use super::*;
+
+    #[test]
+    fn a_list_holds_the_accounts_identities_once_after_the_index() {
+        let mut index = IdentityIndex::new();
+        let shared = Identity { uuid: [1; UUID_LEN], label: [b'x'; LABEL_LEN] };
+        assert!(index.insert(shared).is_ok());
+        let accounts = [[2; UUID_LEN], [1; UUID_LEN], [0; UUID_LEN], [2; UUID_LEN], [3; UUID_LEN]];
+        let out = listed(&index, &accounts);
+        assert_eq!(out.count, 3);
+        assert_eq!(out.id[0].uuid, [1; UUID_LEN]);
+        assert_eq!(out.id[0].label, [b'x'; LABEL_LEN]);
+        assert_eq!(out.id[1].uuid, [2; UUID_LEN]);
+        assert_eq!(out.id[1].label, [0; LABEL_LEN]);
+        assert_eq!(out.id[2].uuid, [3; UUID_LEN]);
+        assert_eq!(listed(&index, &[]).count, 1);
+    }
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
 #[::kernel::macros::kunit_tests(apple_sep_enrol_request)]
 mod enrol_request_tests {
     use super::*;
@@ -757,6 +820,7 @@ mod enrol_request_tests {
         session.start_worker().unwrap();
         session.op = Op::Enrol {
             label: [0; LABEL_LEN],
+            account_uid: 1000,
             stage: 0,
             terminal: None,
             guidance: Guidance::Place,
@@ -835,6 +899,7 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     ctx.session.start_worker()?;
     ctx.session.op = Op::Enrol {
         label: request.label,
+        account_uid: request.account_uid,
         stage: 0,
         terminal: None,
         guidance: Guidance::Place,
@@ -851,6 +916,22 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         delete_identity: None,
         delete_identities: KVec::new(),
     })
+}
+
+/// The account of the enrolment the worker runs, if it runs one.
+/// The account a running verify names (`VERIFY_ACCOUNT`), if any.
+pub(crate) fn verify_account(session: &Session) -> Option<u32> {
+    match session.op {
+        Op::Verify { account, terminal: None, .. } => account,
+        _ => None,
+    }
+}
+
+pub(crate) fn enrol_account(session: &Session) -> Option<u32> {
+    match session.op {
+        Op::Enrol { account_uid, terminal: None, .. } => Some(account_uid),
+        _ => None,
+    }
 }
 
 pub(crate) fn enrol_advance(
@@ -1035,19 +1116,26 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     let request: VerifyStart = UserSlice::new(user, core::mem::size_of::<VerifyStart>())
         .reader()
         .read()?;
-    if request.flags != 0 || request.reserved != 0 {
-        return Err(EINVAL);
-    }
+    // VERIFY_ACCOUNT names the Unix account in `account_uid`: the match runs
+    // in that user's own domain when their key bag is loaded.
+    let account = match request.flags {
+        0 if request.account_uid == 0 => None,
+        VERIFY_ACCOUNT if ctx.verify_account && request.account_uid != u32::MAX => Some(request.account_uid),
+        _ => return Err(EINVAL),
+    };
     require_sensor(ctx.sensor_present)?;
 
     if ctx.session.worker_epoch.is_some() || !ctx.session.op.may_start() {
         return Err(EBUSY);
     }
 
-    if ctx.index.total() == 0 {
+    // The index holds the configured user's templates only; an account's
+    // own templates are in the enclave, so it is never empty for them here.
+    if account.is_none() && ctx.index.total() == 0 {
         ctx.session.token = None;
         ctx.session.op = Op::Verify {
             nonce: request.nonce,
+            account: None,
             terminal: Some(VerifyOutcome::NoMatch),
             guidance: Guidance::None,
         };
@@ -1066,6 +1154,7 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     ctx.session.token = None;
     ctx.session.op = Op::Verify {
         nonce: request.nonce,
+        account,
         terminal: None,
         guidance: Guidance::Place,
     };
@@ -1143,7 +1232,7 @@ fn verify_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     match &ctx.session.op {
         Op::Idle => out.state = State::Idle,
         Op::Enrol { .. } => return Err(EBUSY),
-        Op::Verify { nonce, terminal, guidance } => {
+        Op::Verify { nonce, terminal, guidance, .. } => {
             out.guidance = *guidance;
             match terminal {
                 None => {
@@ -1349,6 +1438,8 @@ pub unsafe extern "C" fn sep_kunit_bio_ioctl(bio: *mut c_void, cmd: c_uint, arg:
         index: &bio.index,
         sensor_present: true,
         live_identity_count: Some(0),
+        verify_account: true,
+        account_identities: &[],
     };
     match ioctl(&mut ctx, cmd, arg as usize) {
         Ok(h) => h.ret as c_long,
