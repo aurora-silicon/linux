@@ -301,14 +301,31 @@ pub(crate) fn encode_compute_for(
         put64(w, compute::REGS + i * 12 + 4, value);
     }
     let mut count: usize = compute::SEL.len();
+    if layout.slot_record {
+        // The context key: the context and a per-unit submission count (mod 64).
+        let key = u64::from(ctx) << 8 | (r.submitted & 0x3f);
+        let cs = r.context_store_gva;
+        let host = [
+            key,
+            key,
+            u64::from(r.uma_slot),
+            r.auxiliary_gva | 1,
+            cs + 0xf405,
+            cs + 0x1e400,
+            cs + 0x5,
+            cs + 0xf000,
+            cs + 0x1e800,
+            cs + 0x1f000,
+        ];
+        for (&sel, &value) in compute::HOST_RECORDS.iter().zip(host.iter()) {
+            put32(w, compute::REGS + count * 12, sel);
+            put64(w, compute::REGS + count * 12 + 4, value);
+            count += 1;
+        }
+    }
     if r.usc_base != 0 {
         put32(w, compute::REGS + count * 12, 0x10071);
         put64(w, compute::REGS + count * 12 + 4, r.usc_base);
-        count += 1;
-    }
-    if layout.slot_record {
-        put32(w, compute::REGS + count * 12, compute::SLOT_REG);
-        put64(w, compute::REGS + count * 12 + 4, u64::from(r.uma_slot));
         count += 1;
     }
     put32(w, 0, 3);

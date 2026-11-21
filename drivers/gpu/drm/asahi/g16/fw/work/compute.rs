@@ -44,8 +44,8 @@ pub(crate) struct Layout {
     pub(crate) target: usize,
     /// Bytes of the work the firmware caches; the host's private parts lie beyond them.
     pub(crate) cached: usize,
-    /// Whether the register list carries the unit's free-list slot ([`SLOT_REG`]). macOS 27.2
-    /// sends it in every compute work item on the 26B123 firmware.
+    /// Whether the register list carries the records macOS 27.2 sends after the shared ones in
+    /// every compute work item on the 26B123 firmware ([`HOST_RECORDS`]).
     pub(crate) slot_record: bool,
 }
 
@@ -80,6 +80,13 @@ const _: () = assert!(valid(&V25G83) && valid(&V26B123));
 /// Register that names the free-list slot of the UMA pool the work runs with: the value the
 /// pool descriptor holds at its slot word.
 pub(crate) const SLOT_REG: u32 = 0x14028;
+
+/// The records macOS 27.2 sends after the shared ones on 26B123, in its order (our hypervisor
+/// captures on the Mac mini): the context key twice, the slot, a per-dispatch record, and six
+/// operand-state bases inside the context store.
+pub(crate) const HOST_RECORDS: [u32; 10] = [
+    0x10201, 0x10428, SLOT_REG, 0x14070, 0x10099, 0x10091, 0xa5c1, 0xa5c9, 0x10229, 0x140a8,
+];
 
 pub(crate) const SEL: [u32; 24] = [
     0x1a510, 0x1a420, 0x1a4d0, 0x1a4d8, 0x1a4e0, 0x1a4e8, 0x1a440, 0x1a458, 0x101d9, 0x1a089,

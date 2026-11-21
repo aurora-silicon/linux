@@ -264,11 +264,27 @@ def expect_compute(old):
     for at in (0x1a8, 0x1bc + 0x2c, 0x20c + 0x2c, 0x258 + 0x69, 0x258 + 0x71):
         plus7(q, at)
         plus7(w, embedded + at)
-    # 26B123 appends the free-list slot record {0x14028, the descriptor's slot word} to the
-    # register list at +0x20, as macOS 27.2 sends it.
+    # 26B123 inserts macOS 27.2's ten records after the 24 shared ones, before the USC base
+    # record: the context key twice, the descriptor's slot word, the auxiliary record and six
+    # context-store bases. Harness values: ctx 1 (w+0xc), submitted 5, auxiliary at seq +0x178,
+    # context store at seq +0x188.
     count = struct.unpack_from('<H', w, 0x728)[0]
-    struct.pack_into('<IQ', w, 0x20 + count * 12, 0x14028, struct.unpack_from('<I', w, 0xe00 + 8)[0])
-    struct.pack_into('<HH', w, 0x728, count + 1, (count + 1) * 12)
+    tail = bytes(w[0x20 + 24 * 12:0x20 + count * 12])
+    ctx = struct.unpack_from('<I', w, 0xc)[0]
+    key = ctx << 8 | 5
+    aux = struct.unpack_from('<Q', q, 0x178)[0]
+    cs = struct.unpack_from('<Q', q, 0x188)[0]
+    slot = struct.unpack_from('<I', w, 0xe00 + 8)[0]
+    records = [(0x10201, key), (0x10428, key), (0x14028, slot), (0x14070, aux | 1),
+               (0x10099, cs + 0xf405), (0x10091, cs + 0x1e400), (0xa5c1, cs + 0x5),
+               (0xa5c9, cs + 0xf000), (0x10229, cs + 0x1e800), (0x140a8, cs + 0x1f000)]
+    at = 0x20 + 24 * 12
+    for sel, value in records:
+        struct.pack_into('<IQ', w, at, sel, value)
+        at += 12
+    w[at:at + len(tail)] = tail
+    total = count + len(records)
+    struct.pack_into('<HH', w, 0x728, total, total * 12)
     return bytes(w + q)
 
 
