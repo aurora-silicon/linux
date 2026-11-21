@@ -6,7 +6,10 @@
 use super::DeferredBatch;
 use crate::g17::{
     channel, event,
-    fw::channels::{Event, FreeListCompletion, TvbGrowRequest},
+    fw::{
+        channels::{Event, FreeListCompletion, TvbGrowRequest},
+        variant::InitGraph,
+    },
     recovery,
     status::VmStatus,
     Firmware, Role,
@@ -173,6 +176,12 @@ impl recovery::Memory for Service<'_> {
         if mmu_fault && sources.reason.is_none() {
             sources.reason = Some(recovery::PAGE_FAULT);
         }
+        // Only the banks show that the 25G83 firmware's reason word is this restart's.
+        if self.firmware.primary.state.shared.variant.graph == InitGraph::V25G83 {
+            if let Ok(banks) = self.firmware.port.fault_banks() {
+                sources.check_fault_banks(&banks);
+            }
+        }
         Ok(sources)
     }
 
@@ -196,6 +205,9 @@ impl recovery::Queues for Service<'_> {
     }
     fn render_culprit(&self, blamed: u8) -> Option<u128> {
         self.firmware.queues.render_culprit(blamed)
+    }
+    fn fault_culprit(&self, slots: u64) -> Option<u128> {
+        self.firmware.queues.fault_culprit(slots)
     }
     fn publish_recovery_targets(&self) -> Option<Error> {
         let mut failure = self.firmware.queues.publish_render_recovery_targets();
@@ -278,27 +290,32 @@ impl recovery::Queues for Service<'_> {
             .queues
             .report_render_recovery(qid, &self.firmware.port);
     }
-    fn report_mmu_fault(&self) {
+    fn report_mmu_fault(&self) -> u64 {
         let banks = match self.firmware.port.fault_banks() {
             Ok(banks) => banks,
             Err(error) => {
                 pr_warn!("G17: recovery MMU fault banks unreadable: {:?}\n", error);
-                return;
+                return 0;
             }
         };
+        let mut slots = 0u64;
         for (bank, &(status, address)) in banks.iter().enumerate() {
             match crate::regs::decode_fault(status, address, true) {
-                Some(info) => pr_warn!(
-                    "G17: recovery MMU fault bank {}: address {:#x} {} {:?} unit {:?} ({:#x}) level {} vm_slot {} sideband {:#x} (status {:#x})\n",
-                    bank, info.address, if info.read { "read" } else { "write" }, info.reason,
-                    info.unit, info.unit_code, info.level, info.vm_slot, info.sideband, status
-                ),
-                None => pr_info!(
-                    "G17: recovery MMU fault bank {}: no fault (status {:#x})\n",
-                    bank, status
-                ),
+                Some(info) => {
+                    pr_warn!(
+                        "G17: recovery MMU fault bank {}: address {:#x} {} {:?} unit {:?} ({:#x}) level {} vm_slot {} sideband {:#x} (status {:#x})\n",
+                        bank, info.address, if info.read { "read" } else { "write" }, info.reason,
+                        info.unit, info.unit_code, info.level, info.vm_slot, info.sideband, status
+                    );
+                    // Slot 0 is the firmware's own context, never a client's.
+                    if info.vm_slot != 0 {
+                        slots |= 1u64.checked_shl(info.vm_slot).unwrap_or(0);
+                    }
+                }
+                None => pr_info!("G17: recovery MMU fault bank {}: no fault (status {:#x})\n", bank, status),
             }
         }
+        slots
     }
     fn settle_blamed_render(&mut self, qid: u8, error: Error) {
         let result = self
