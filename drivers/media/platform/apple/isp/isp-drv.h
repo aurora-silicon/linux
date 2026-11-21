@@ -157,6 +157,8 @@ struct isp_preset {
 	struct coord crop_size;
 	/* Processed P010 geometry established by preview or a config reply. */
 	bool p010;
+	/* TEST: moved off its DT sensor config by the sensor_config knob */
+	bool remapped;
 };
 
 struct apple_isp_hw {
