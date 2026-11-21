@@ -100,10 +100,13 @@ pub(crate) struct Queue<B: Backend> {
     variant: &'static crate::g17::fw::Variant,
     proof: Proof,
     sequence: [u64; 2],
-    frontiers: [KVec<(u64, Fences)>; 2],
+    /// One entry per unfinished command, so as long as userspace keeps work queued
+    /// (thousands under vkd3d-proton). Neither it nor `finished` needs
+    /// contiguous pages, and their growth must not fail a submit on fragmentation.
+    frontiers: [KVVec<(u64, Fences)>; 2],
     /// Finished frontier entries pruned during this ioctl. Their last references
     /// can tear a whole completion down; that waits until the ioctl has published.
-    finished: KVec<Fences>,
+    finished: KVVec<Fences>,
     failures: [FailureRecord<Fences>; 2],
     // Closing the userspace queue releases admission even if firmware still
     // retains one of its execution contexts or installed physical graphs.
@@ -152,8 +155,8 @@ impl<B: Backend> Queue<B> {
             variant,
             proof: Proof::new(),
             sequence: [0; 2],
-            frontiers: core::array::from_fn(|_| KVec::new()),
-            finished: KVec::new(),
+            frontiers: core::array::from_fn(|_| KVVec::new()),
+            finished: KVVec::new(),
             failures: [FailureRecord::new(), FailureRecord::new()],
             _slot: slot,
         })
@@ -179,7 +182,7 @@ impl<B: Backend> Queue<B> {
         // Without room the entries are released here, as they always could be.
         let mut finished = if self
             .finished
-            .reserve(self.frontiers[index].len(), GFP_KERNEL)
+            .reserve(self.frontiers[index].len(), GFP_KERNEL_ACCOUNT)
             .is_ok()
         {
             Some(&mut self.finished)
@@ -213,10 +216,7 @@ impl<B: Backend> Queue<B> {
         inputs: &[file::SyncItem],
         destinations: Destinations,
     ) -> Result {
-        let engine = match &command {
-            Validated::Render { .. } => Engine::Render,
-            Validated::Compute { .. } => Engine::Compute,
-        };
+        let engine = Engine::of(&command);
         let index = engine.index();
         if let Validated::Render { ray_query, .. } = &command {
             let blocks = self
@@ -227,7 +227,6 @@ impl<B: Backend> Queue<B> {
             }
         }
         self.prune_frontier(index);
-        self.frontiers[index].reserve(1, GFP_KERNEL)?;
         if engine == Engine::Compute {
             self.ensure_compute(&command)?;
         }
@@ -475,10 +474,7 @@ impl<B: Backend> Queue<B> {
                     &command.payload,
                 )
                 .map_err(|error| refused("the command's requirements", error))?;
-            let engine = match &payload {
-                Validated::Render { .. } => Engine::Render,
-                Validated::Compute { .. } => Engine::Compute,
-            };
+            let engine = Engine::of(&payload);
             if !self.backend.supports_engine(engine) { return Err(ENOTSUPP); }
             self.backend
                 .prepare_command(&mut payload)
@@ -595,6 +591,16 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 for (command, _, _) in pending.iter_mut() {
                     command.allow_long_job();
                 }
+            }
+            // Room for every command's frontier entry, so that running out of memory fails
+            // the submission before any of it is queued. Userspace sets the frontier's
+            // length, so its memory is charged to the caller.
+            let mut room = [0; 2];
+            for (command, _, _) in pending.iter() {
+                room[Engine::of(command).index()] += 1;
+            }
+            for (frontier, room) in self.frontiers.iter_mut().zip(room) {
+                frontier.reserve(room, GFP_KERNEL_ACCOUNT)?;
             }
             let mut guards = guards.into_iter();
             // Where a firmware wait reports completion before a weak stream tail's writes are

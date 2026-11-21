@@ -37,6 +37,13 @@ pub(crate) enum Engine {
 }
 
 impl Engine {
+    pub(crate) fn of(command: &Validated) -> Self {
+        match command {
+            Validated::Render { .. } => Self::Render,
+            Validated::Compute { .. } => Self::Compute,
+        }
+    }
+
     pub(crate) fn index(self) -> usize {
         match self {
             Self::Render => 0,
@@ -176,10 +183,7 @@ impl Packet {
     }
 
     pub(crate) fn engine(&self) -> Engine {
-        match &self.command {
-            Validated::Render { .. } => Engine::Render,
-            Validated::Compute { .. } => Engine::Compute,
-        }
+        Engine::of(&self.command)
     }
 
     /// Replay holds the device mutex. Its original inputs were satisfied before
