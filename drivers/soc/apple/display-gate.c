@@ -3415,20 +3415,42 @@ static const struct gate_staged t8132_j773g_hdmi = {
 	"/soc/iommu@286300000", t8132_j773g_hdmi_nodes, ARRAY_SIZE(t8132_j773g_hdmi_nodes),
 };
 
+/*
+ * dcpext1's chain, where the boot loader handed it over too: its firmware and
+ * display DARTs, mailbox, PIODMA child, then dcpext1. macOS 27.2 runs it as
+ * dcpext0's partner for the HDMI modes one pipe cannot carry; it drives no
+ * port of its own here.
+ */
+static const char *const t8132_j773g_peer_nodes[] = {
+	"/soc/iommu@48a340000",
+	"/soc/iommu@48a300000",
+	"/soc/mailbox@48ae08000",
+	"/soc/dcp@48ae00000/piodma",
+	"/soc/dcp@48ae00000",
+};
+
+static const struct gate_staged t8132_j773g_peer = {
+	"/soc/iommu@48a300000", t8132_j773g_peer_nodes, ARRAY_SIZE(t8132_j773g_peer_nodes),
+};
+
 /* Applied, it stays: the live tree refers to it. */
 static struct of_changeset t8132_j773g_cs;
 
-/* The display subsystem's iommus become <@dart 0>, whatever they were. */
+/*
+ * The display subsystem's iommus become <@dart 0>, and <@peer 0> after it
+ * where @peer is given, whatever they were.
+ */
 static int __init gate_iommus_set(struct of_changeset *cs, struct device_node *display,
-				  struct device_node *dart)
+				  struct device_node *dart, struct device_node *peer)
 {
+	unsigned int cells = peer ? 4 : 2;
 	struct property *prop;
 	__be32 *value;
 
-	if (!dart->phandle)
+	if (!dart->phandle || (peer && !peer->phandle))
 		return -EINVAL;
 	prop = kzalloc_obj(*prop);
-	value = kmalloc(2 * sizeof(*value), GFP_KERNEL);
+	value = kmalloc_array(cells, sizeof(*value), GFP_KERNEL);
 	if (!prop || !value) {
 		kfree(prop);
 		kfree(value);
@@ -3436,10 +3458,34 @@ static int __init gate_iommus_set(struct of_changeset *cs, struct device_node *d
 	}
 	value[0] = cpu_to_be32(dart->phandle);
 	value[1] = cpu_to_be32(0);
+	if (peer) {
+		value[2] = cpu_to_be32(peer->phandle);
+		value[3] = cpu_to_be32(0);
+	}
 	prop->name = "iommus";
-	prop->length = 2 * sizeof(*value);
+	prop->length = cells * sizeof(*value);
 	prop->value = value;
 	return of_changeset_update_property(cs, display, prop);
+}
+
+/* dcpext1 was handed over with the 27.2 image too, and its chain is still off. */
+static bool __init gate_t8132_j773g_peer_ready(void)
+{
+	const struct gate_staged *st = &t8132_j773g_peer;
+	struct device_node *np;
+	bool approved;
+
+	np = of_find_node_by_path(st->nodes[st->nr - 1]);
+	if (!np)
+		return false;
+	approved = apple_t8132_dcpext_v27_2(np);
+	of_node_put(np);
+	if (!approved) {
+		staged_info("%s: not handed over with the 27.2 image, left off\n",
+			    st->nodes[st->nr - 1]);
+		return false;
+	}
+	return staged_ready(st);
 }
 
 /*
@@ -3460,7 +3506,8 @@ static void __init gate_t8132_j773g_run(void)
 {
 	const struct gate_staged *st = &t8132_j773g_hdmi;
 	const char *dcp_path = st->nodes[st->nr - 1];
-	struct device_node *display, *np;
+	const struct gate_staged *peer;
+	struct device_node *display, *np, *peer_dart;
 	bool approved;
 	unsigned int i;
 	int ret;
@@ -3494,13 +3541,23 @@ static void __init gate_t8132_j773g_run(void)
 		of_node_put(display);
 		return;
 	}
+	peer = gate_t8132_j773g_peer_ready() ? &t8132_j773g_peer : NULL;
 
 	of_changeset_init(&t8132_j773g_cs);
 	np = of_find_node_by_path(st->dart);
-	ret = np ? gate_iommus_set(&t8132_j773g_cs, display, np) : -ENODEV;
+	peer_dart = peer ? of_find_node_by_path(peer->dart) : NULL;
+	ret = np && (!peer || peer_dart) ?
+		gate_iommus_set(&t8132_j773g_cs, display, np, peer_dart) : -ENODEV;
+	of_node_put(peer_dart);
 	of_node_put(np);
 	for (i = 0; !ret && i < st->nr; i++) {
 		np = of_find_node_by_path(st->nodes[i]);
+		ret = np ? of_changeset_update_prop_string(&t8132_j773g_cs, np, "status", "okay") :
+			   -ENODEV;
+		of_node_put(np);
+	}
+	for (i = 0; !ret && peer && i < peer->nr; i++) {
+		np = of_find_node_by_path(peer->nodes[i]);
 		ret = np ? of_changeset_update_prop_string(&t8132_j773g_cs, np, "status", "okay") :
 			   -ENODEV;
 		of_node_put(np);
@@ -3510,6 +3567,9 @@ static void __init gate_t8132_j773g_run(void)
 	if (ret) {
 		of_changeset_destroy(&t8132_j773g_cs);
 		staged_err("%s: could not enable the HDMI chain: %d\n", dcp_path, ret);
+	} else if (peer) {
+		staged_info("%s enabled for HDMI, %s as its partner; display subsystem on %s and %s\n",
+			    dcp_path, peer->nodes[peer->nr - 1], st->dart, peer->dart);
 	} else {
 		staged_info("%s enabled for HDMI; display subsystem on %s only\n", dcp_path,
 			    st->dart);
