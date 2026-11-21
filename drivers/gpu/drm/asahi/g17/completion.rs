@@ -733,7 +733,7 @@ impl Completion {
 
     /// A non-poisoning ECANCELED or ENODATA (work a recovery discarded or dropped) stays out of
     /// the VM status, as the UAPI documents for work another VM's recovery discarded:
-    /// Honeykrisp reads any status error as a lost device. Every other failure reaches the client.
+    /// Borealis reads any status error as a lost device. Every other failure reaches the client.
     fn report(&self, error: Error) {
         if self.poisons(error) {
             self.status.record(error);
