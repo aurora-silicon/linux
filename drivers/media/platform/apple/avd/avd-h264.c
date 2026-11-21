@@ -908,11 +908,8 @@ static bool avd_h264_refs_valid(const struct avd_h264_run *run)
  * SPS control geometry is not trusted). Interlaced pictures use a negotiated
  * buffer tall enough for both fields; do not scale again from FRAME_MBS_ONLY.
  */
-static size_t avd_h264_max_slices(const struct v4l2_pix_format_mplane *pix,
-				  const struct v4l2_ctrl_h264_sps *sps)
+static size_t avd_h264_max_slices(const struct v4l2_pix_format_mplane *pix)
 {
-	(void)sps;
-
 	return DIV_ROUND_UP((size_t)pix->width, 16) *
 	       DIV_ROUND_UP((size_t)pix->height, 16);
 }
@@ -924,11 +921,10 @@ static size_t avd_h264_max_slices(const struct v4l2_pix_format_mplane *pix,
  * picture may hold leaves room for small pictures cut into many slices.
  */
 static size_t avd_h264_slice_budget(const struct v4l2_pix_format_mplane *pix,
-				    const struct v4l2_ctrl_h264_sps *sps,
 				    size_t decoded_size)
 {
 	return max_t(size_t, 2 * decoded_size,
-		     avd_h264_max_slices(pix, sps) * PAGE_SIZE);
+		     avd_h264_max_slices(pix) * PAGE_SIZE);
 }
 
 /* Check that one more slice of len bytes fits in the current picture. */
@@ -937,9 +933,9 @@ VISIBLE_IF_KUNIT bool avd_h264_slice_fits(const struct v4l2_pix_format_mplane *p
 					  size_t held, size_t held_bytes,
 					  u32 len, size_t decoded_size)
 {
-	return held < avd_h264_max_slices(pix, sps) &&
+	return held < avd_h264_max_slices(pix) &&
 	       held_bytes + PAGE_ALIGN((size_t)len) <=
-	       avd_h264_slice_budget(pix, sps, decoded_size);
+	       avd_h264_slice_budget(pix, decoded_size);
 }
 
 /*
@@ -1061,8 +1057,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 
 	if (h264_ctx->b->slice_num >= h264_ctx->b->alloc_slice_num) {
 		ret = avd_h264_realloc_slices(ctx,
-					      avd_h264_max_slices(&ctx->decoded_fmt.fmt.pix_mp,
-								  run.sps));
+					      avd_h264_max_slices(&ctx->decoded_fmt.fmt.pix_mp));
 		if (ret)
 			goto err_free_jobs;
 	}
