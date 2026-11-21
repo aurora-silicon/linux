@@ -2182,6 +2182,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->idle_rpm = of_device_is_compatible(dev->of_node, "apple,t6040-dwc3") ||
 			     of_device_is_compatible(dev->of_node, "apple,t8132-dwc3");
 	mutex_init(&appledwc->lock);
+	/*
+	 * Its xHCI child is asynchronous, but can't start to resume before the PM core has
+	 * reached this device in its list, behind the display's 320 ms resume.
+	 */
+	device_enable_async_suspend(dev);
 	spin_lock_init(&appledwc->sleep_pm_lock);
 	/* A never-connected port has no generic core probe to publish this. */
 	appledwc->dwc.dev = dev;
