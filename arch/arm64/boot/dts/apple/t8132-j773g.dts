@@ -153,6 +153,28 @@
 			no-map;
 			status = "disabled";
 		};
+
+		/* dcpext1's, filled the same way (aura publishes both). */
+		dcpext1_text: dcpext1-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext1_data: dcpext1-data {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext1_heap: dcpext1-heap {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
 	};
 };
 
@@ -224,6 +246,39 @@
 	/* the crossbar's output 4 (ADT dptx-phy dp-switch-dfp-endpoint) */
 	apple,dptx-phy = <4>;
 	memory-region = <&dcpext0_text>, <&dcpext0_data>, <&dcpext0_heap>;
+	memory-region-names = "text", "data", "heap";
+};
+
+/*
+ * dcpext1 (dispext1): iBoot leaves it running with the same 27.2 image, and
+ * macOS 27.2 runs it only as dcpext0's partner for the HDMI modes one pipe
+ * cannot carry (4K240: "is_dual=1 ... paired=1"); it drives no port of its
+ * own here. Handed over like dcpext0: no power domains on the pipe, its
+ * mailbox and DARTs (DISPEXT1_CPU is under hardware control), and its front
+ * end kept on, as no boot framebuffer holds DISPEXT1. Every node stays
+ * disabled; the display gate enables it with the HDMI chain.
+ */
+&ps_dispext1_fe {
+	apple,always-on;
+};
+
+&dcpext1_mbox {
+	/delete-property/ power-domains;
+};
+
+&dcpext1_dart {
+	/delete-property/ power-domains;
+};
+
+&dispext1_dart {
+	/delete-property/ power-domains;
+};
+
+&dcpext1 {
+	/delete-property/ power-domains;
+	apple,iomfb-surfaces = <1 1 0 0>;
+	apple,connector-type = "USB-C";
+	memory-region = <&dcpext1_text>, <&dcpext1_data>, <&dcpext1_heap>;
 	memory-region-names = "text", "data", "heap";
 };
 
