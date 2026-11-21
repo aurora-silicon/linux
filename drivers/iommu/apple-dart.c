@@ -6012,9 +6012,10 @@ params_done:
 		 of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8142-dart") ||
 		 j713_display_v27);
-	if (j713_display_v27)
-		dev_info(dev, "J713 internal display DART on the 27.2 image: locked roots kept (%s)\n",
-			 dart->fw_mirror ? "mirror" : "NOT locked: refusing");
+	if (j713_display_v27 && dart->fw_mirror)
+		dev_info(dev, "J713 internal display DART on the 27.2 image: locked roots kept (mirror)\n");
+	else if (j713_display_v27)
+		dev_err(dev, "J713 internal display DART on the 27.2 image: NOT locked: refusing\n");
 	dart->j713_v27 = j713_display_v27;
 	if (j713_display_v27 && !dart->fw_mirror) {
 		ret = -EINVAL;
