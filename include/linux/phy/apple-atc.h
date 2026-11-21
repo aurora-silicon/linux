@@ -125,7 +125,8 @@ int apple_t6050_phy_cio_lost(struct device *dev);
  * sleep in place. The router's host BINDs and UNBINDs, the USB controller asks to KEEP its
  * host at the sleep's start, the router's host PARKs it once the router firmware has taken
  * its sleep (or once a refused sleep has woken the router), and the USB controller takes the
- * RESULT after the wake: one of APPLE_T6050_CIO_USB_* or an error.
+ * RESULT after the wake: one of APPLE_T6050_CIO_USB_* or an error, then, after a LOST one,
+ * asks whether the controller's bank was RETAINED.
  */
 enum apple_t6050_cio_usb {
 	APPLE_T6050_CIO_USB_BIND,
@@ -133,8 +134,14 @@ enum apple_t6050_cio_usb {
 	APPLE_T6050_CIO_USB_KEEP,
 	APPLE_T6050_CIO_USB_PARK,
 	APPLE_T6050_CIO_USB_RESULT,
+	/*
+	 * After a LOST RESULT: the controller's bank checked for the state the router's sleep left
+	 * (the PIPE gated on the tunnel producer): then the PIPE gets its clock back on the tunnel,
+	 * the controller comes out of hibernation and KEPT is returned (J714s).
+	 */
+	APPLE_T6050_CIO_USB_RETAINED,
 };
-/* Kept on the tunnel's PIPE, untouched: xHCI resumes with its state. */
+/* Kept on the tunnel's PIPE (gated and given back on J714s): xHCI resumes with its state. */
 #define APPLE_T6050_CIO_USB_KEPT	0
 /* PIPE parked on its dummy producer, the controller kept its registers: USB3 restarts later. */
 #define APPLE_T6050_CIO_USB_PARKED	1
