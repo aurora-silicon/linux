@@ -114,6 +114,14 @@ properties:
       must not enter software shutdown until the bus has stopped. One shut
       down while the bus still runs can leave garbage in its sense slots.
 
+  apple,shutdown-dance:
+    type: boolean
+    description:
+      SN012776 only. Around every entry to software shutdown, write the
+      vendor's hidden page (0xfd) as Apple's driver does on this machine.
+      Register 0x64 is set to 4 before the shutdown and back to 0 after it,
+      with immediate SDZ mode set at initialisation.
+
   ti,imon-slot-no:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: TDM TX current sense time slot.
