@@ -2155,6 +2155,10 @@ static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, 
 static const struct dev_pm_ops apple_platform_pm_ops = {
 	.suspend	= apple_platform_suspend,
 	.resume		= apple_platform_resume,
+	.freeze		= apple_platform_suspend,
+	.thaw		= apple_platform_resume,
+	.poweroff	= apple_platform_suspend,
+	.restore	= apple_platform_resume,
 	.complete	= apple_platform_complete,
 };
 #else
