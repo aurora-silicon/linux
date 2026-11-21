@@ -741,15 +741,15 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 			return ISP_FIRMWARE_V_14_7;
 
 		/*
-		 * Firmware newer than 26.6.2 keeps the 26.6.2 command layout
-		 * (T8122 on 27.2). Treating it as unknown selects the 12.x
-		 * layout, whose set file load carries a 32-bit address that
-		 * the firmware refuses.
+		 * 27.2.0 keeps the 26.6.2 command layout (run on T8122). Any
+		 * other newer build stays unknown until it has been run: an
+		 * unknown version selects the 12.x layout, whose 32-bit set
+		 * file load such firmware refuses, so it fails closed.
 		 */
-		if (ver[0] > 26 ||
-		    (ver[0] == 26 && (ver[1] > 6 || (ver[1] == 6 && ver[2] > 2)))) {
-			dev_info(dev, "%s %d.%d.%d is newer than 26.6.2, using its layout\n",
-				 name, ver[0], ver[1], ver[2]);
+		if (ver[0] == 27 && ver[1] == 2 && ver[2] == 0) {
+			if (!strcmp(name, "apple,firmware-compat"))
+				dev_info(dev, "%s %d.%d.%d uses the 26.6.2 layout\n",
+					 name, ver[0], ver[1], ver[2]);
 			return ISP_FIRMWARE_V_26_6_2;
 		}
 
