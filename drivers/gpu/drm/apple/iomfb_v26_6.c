@@ -782,6 +782,8 @@ static void dcp_v26_idle(struct work_struct *work)
 	if (ret && ret != -ETIMEDOUT && ret != -EAGAIN) {
 		v26->failed = true;
 		dev_err(v26->dev, "DCP notification failed: %d; recovery requires a reboot\n", ret);
+		/* Nothing pumps the link again: stop it queueing events. */
+		dcp_v26_link_fail(&v26->link);
 	}
 	mutex_unlock(&v26->lock);
 }
