@@ -1490,6 +1490,9 @@ static int dcp_set_crtc_active(struct drm_crtc *crtc,
 	return ret;
 }
 
+static bool dcp_mode_settable(struct apple_dcp *dcp,
+			      const struct drm_display_mode *mode);
+
 /*
  * @power_cycle: the firmware powered the pipe down with the lost link, so a
  * modeset alone cannot bring it back. Turn the CRTC off and on instead, which
@@ -1531,6 +1534,15 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector,
 		   (READ_ONCE(dcp->mode_state.valid) ||
 		    !dcp_has_mode(dcp, &crtc->state->mode))) {
 		ret = 0;
+	} else if (crtc && crtc->state && crtc->state->active &&
+		   !dcp_mode_settable(dcp, &crtc->state->mode) &&
+		   !dcp_typec_follows_crtc(dcp)) {
+		/*
+		 * The display's mode list lacks the CRTC's mode: a sink just woken
+		 * lists its base modes first. Its own HPD pulse or the link recovery
+		 * reads the full list; until then a reset is refused by mode_fixup.
+		 */
+		ret = -ENOENT;
 	} else if (crtc && crtc->state && crtc->state->active &&
 		   dcp_crtc_can_retrain(crtc, connector) && power_cycle) {
 		/* A commit that held the locks first may have set the mode. */
@@ -1951,8 +1963,17 @@ void dcp_hotplug(struct work_struct *work)
 	dcp = platform_get_drvdata(pdev);
 	dev_info(dcp->dev, "%s() connected:%d valid_mode:%d nr_modes:%u\n", __func__,
 		 connector->connected, READ_ONCE(dcp->mode_state.valid), dcp->nr_modes);
+	if (READ_ONCE(connector->connected) && READ_ONCE(dcp->mode_state.valid))
+		complete(&dcp->t6041_plugged);
 	if (READ_ONCE(dcp->mode_state.valid))
 		dcp->tunnel_power_cycles = 0;
+	/*
+	 * HPD went low, as when a sink just woken asserts it again with its full
+	 * mode list: the plug that follows reads that list, so a link recovery
+	 * pending for the old one would only take the new link down.
+	 */
+	if (!READ_ONCE(connector->connected))
+		cancel_delayed_work(&dcp->link_recovery_wq);
 
 	scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
 		if (READ_ONCE(connector->dcp) == pdev)
@@ -2006,6 +2027,8 @@ void dcp_hotplug(struct work_struct *work)
 		    */
 		   !READ_ONCE(dcp->typec_enable_pending) &&
 		   !READ_ONCE(dcp->mode_state.changing) &&
+		   /* T6040 S2R: applied again once the link work is through. */
+		   !READ_ONCE(dcp->t6040_relinking) &&
 		   (!dcp_uses_t6020_tunnel_flow(dcp) ||
 		    dcp->tunnel_power_cycles < DCP_TUNNEL_POWER_CYCLES)) {
 		bool power_cycle = dcp_uses_t6020_tunnel_flow(dcp);
@@ -2028,7 +2051,10 @@ void dcp_hotplug(struct work_struct *work)
 		 * callback has completed.
 		 */
 		ret = dcp_retrain_active_crtc(connector, dcp, power_cycle);
-		if (ret) {
+		if (ret == -ENOENT) {
+			dev_dbg(dcp->dev, "active CRTC mode not listed yet, retrain deferred\n");
+			dcp_link_recovery_schedule(dcp);
+		} else if (ret) {
 			dev_warn(dcp->dev,
 				 "failed to retrain active CRTC after hotplug: %d\n",
 				 ret);
@@ -4340,6 +4366,12 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6) {
 		iomfb_v26_6_flush(dcp, crtc, commit);
+		return;
+	}
+
+	/* T6040 S2R: no swap until the external link work is through. */
+	if (READ_ONCE(dcp->t6040_relinking)) {
+		schedule_work(&dcp->vblank_wq);
 		return;
 	}
 
