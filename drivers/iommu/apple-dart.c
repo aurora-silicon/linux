@@ -7968,14 +7968,19 @@ static int apple_dart_system_suspend(struct device *dev)
 
 	if (!dart->live_mtp)
 		return pm_suspend_via_firmware() ? 0 : pm_runtime_force_suspend(dev);
-	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+	/*
+	 * A firmware-driven sleep keeps the MTP running too (see the rtkit
+	 * helper's suspend): its DART is kept exactly as through s2idle, and
+	 * the resume below checks that the bypass is still in place.
+	 */
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE && !pm_suspend_via_firmware())
 		return -EBUSY;
 	if (apple_dart_readl(dart, DART_TCR(dart, 1)) != dart->hw->tcr_bypass)
 		return -EIO;
 	/* PMGR's ACTIVE_WAKEUP domains and their ancestors must stay powered. */
 	device_set_awake_path(dev);
 	dart->live_mtp_sleep = true;
-	dev_dbg(dev, "live MTP s2idle: retaining clocks, supplier power and bypass stream 1\n");
+	dev_dbg(dev, "live MTP sleep: retaining clocks, supplier power and bypass stream 1\n");
 	return 0;
 }
 
@@ -7989,10 +7994,10 @@ static int apple_dart_system_resume(struct device *dev)
 		return 0;
 	dart->live_mtp_sleep = false;
 	if (apple_dart_readl(dart, DART_TCR(dart, 1)) != dart->hw->tcr_bypass) {
-		dev_err(dev, "live MTP bypass lost across s2idle; refusing reset of inherited DMA\n");
+		dev_err(dev, "live MTP bypass lost across the sleep; refusing reset of inherited DMA\n");
 		return -EIO;
 	}
-	dev_dbg(dev, "live MTP s2idle: bypass retained; no reset or invalidate\n");
+	dev_dbg(dev, "live MTP sleep: bypass retained; no reset or invalidate\n");
 	return 0;
 }
 
@@ -8004,6 +8009,9 @@ static __maybe_unused int apple_dart_sys_suspend_noirq(struct device *dev)
 		dart->v27_noirq_skip = true;
 		return 0;
 	}
+	/* Kept running by .suspend above: no runtime suspend, which refuses a live MTP. */
+	if (dart->live_mtp_sleep)
+		return 0;
 
 	return pm_suspend_via_firmware() ? pm_runtime_force_suspend(dev) : 0;
 }
@@ -8016,6 +8024,8 @@ static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
 		dart->v27_noirq_skip = false;
 		return 0;
 	}
+	if (dart->live_mtp_sleep)
+		return 0;
 	return pm_suspend_via_firmware() ? apple_dart_resume_noirq(dev) : 0;
 }
 
