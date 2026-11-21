@@ -800,7 +800,9 @@ struct atcphy_cio_sleep {
  *              it when the PHY is brought back up after a power-off
  * @host_active: dwc3 has selected host mode on the USB3 PHY; a fixed-hub port
  *               then routes the PIPE itself on later Type-C mode changes
- * @dwc3_running: dwc3 is out of the reset this PHY provides, in either role
+ * @dwc3_running: dwc3 is out of the reset this PHY provides, in either role; follows
+ *                the reset controller's assert/deassert only, not the register (the
+ *                sleep hibernation steps toggle DWC3_RESET_N within one controller run)
  * @usb3_port_off: The SuperSpeed root port of a fixed-hub controller was powered
  *                 off for a PIPE or lane change and is not powered on again yet
  * @usb3_port_work: Retries the power-on of @usb3_port_off after a USB failure
