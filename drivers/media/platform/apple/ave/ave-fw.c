@@ -183,7 +183,7 @@ int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
 
 /*
  * A known TEXT CRC (the M4 Pro build) stays as it is; any other is retried
- * with the per-boot word zeroed (the M4 Max build).
+ * with the per-boot word zeroed (the M4 Max and M4 27.2 builds).
  */
 static int ave_fw_text_boot_id(struct ave_dev *ave, u32 *crc)
 {

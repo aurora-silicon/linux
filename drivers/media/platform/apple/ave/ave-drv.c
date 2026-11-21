@@ -137,12 +137,14 @@ static const struct ave_variant ave_t8122 = {
 };
 
 /*
- * The M4 (T8132) with the macOS 27.2 (26B123) stub, as on the MacBook Air
- * (J713): the bootloader preloads TEXT 0x154000 and DATA 0x12c000, TEXT CRC
- * 99fc929a, the same on every boot. The coprocessor and its start are the
- * M4 Pro's; this build boots as device 23 and takes handshake type 23.
+ * The M4 (T8132) with the macOS 27.2 (26B123) stub: the bootloader preloads
+ * TEXT 0x154000 and DATA 0x12c000, TEXT CRC 99fc929a with the per-boot word
+ * at 0x4224 zeroed. Some loaders leave that word zero (the MacBook Air, J713),
+ * others set it on every boot (the Mac mini, J773g, raw CRC f641c64b), so an
+ * unknown CRC is retried with it zeroed. The coprocessor and its start are
+ * the M4 Pro's; this build boots as device 23 and takes handshake type 23.
  */
-static const struct ave_variant ave_t8132 = {
+const struct ave_variant ave_t8132 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x154000,
 	.fw_data_size = 0x12c000,
@@ -154,6 +156,7 @@ static const struct ave_variant ave_t8132 = {
 	.device_type = 23,
 	.lfs_ref_scale = 2,
 	.text_crc = AVE_FW_TEXT_CRC_T8132_26B123,
+	.text_boot_word = 0x4224,
 	.boot_qualified = true,
 };
 
