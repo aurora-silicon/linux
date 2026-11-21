@@ -48,6 +48,20 @@ static inline bool apple_dcp_image_v27_2(const struct device_node *np,
 	       compat[0] == 27 && compat[1] == 2 && compat[2] == 0;
 }
 
+/*
+ * A T8132 internal display processor that the boot loader handed over with
+ * the 27.2 (26B123) image and the firmware-27 clock metadata (apple,clock-ids
+ * from the ADT's /arm-io/disp0): the firmware-27 backend's, not the M4
+ * 26.6.2 one's. Keyed on the processor, the image and the handoff, so a main
+ * DCP a boot loader leaves running idle (a Mac mini's) is never adopted.
+ */
+static inline bool apple_t8132_dcp_v27_2(const struct device_node *np)
+{
+	return apple_dcp_image_v27_2(np, "apple,t8132-dcp",
+				     APPLE_T8132_DCP_26B123_UUID) &&
+	       of_property_present(np, "apple,clock-ids");
+}
+
 static inline bool apple_t6041_dcp_any_v27_2(const struct device_node *np,
 					     const char *compat_name)
 {
