@@ -58,7 +58,9 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
+#include <linux/of_pci.h>
 #include <linux/of_platform.h>
+#include <linux/pci.h>
 #include <linux/percpu.h>
 #include <linux/sched/task_stack.h>
 #include <asm/sections.h>
@@ -7293,11 +7295,16 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 	of_node_put(np);
 }
 
-/* The radio port's PERST# on the AP pins @np, from the ports of the SoC's enabled PCIe host. */
+/*
+ * The radio port's PERST# on the AP pins @np, from the radio's own port node (device 0) of the
+ * SoC's enabled PCIe host. A radio port without the line (released by the port's own PERST
+ * register) has none, whatever its sibling ports carry.
+ */
 static void apple_sleep_find_radio_perst(struct apple_sleep *s, struct device_node *np)
 {
 	struct device_node *host, *port;
 	struct of_phandle_args args;
+	int devfn;
 
 	host = of_parse_phandle(s->dev->of_node, "apple,apcie", 0);
 	if (!host)
@@ -7307,8 +7314,10 @@ static void apple_sleep_find_radio_perst(struct apple_sleep *s, struct device_no
 			if (of_parse_phandle_with_args(port, "reset-gpios", "#gpio-cells", 0,
 						       &args))
 				continue;
+			devfn = of_pci_get_devfn(port);
 			if (args.np == np && args.args_count >= 2 && args.args[0] < s->npins &&
-			    !test_bit(args.args[0], s->pins_skip)) {
+			    !test_bit(args.args[0], s->pins_skip) && devfn >= 0 &&
+			    PCI_SLOT(devfn) == 0) {
 				s->radio_perst = args.args[0];
 				s->radio_perst_low = args.args[1] & GPIO_ACTIVE_LOW;
 			}
