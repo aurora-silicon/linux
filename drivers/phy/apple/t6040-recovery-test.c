@@ -21,8 +21,12 @@ static void t6040_recovery_failed_tune_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, t6040_recovery_retry(&state));
 	KUNIT_EXPECT_TRUE(test, state.cycle_pending);
 	KUNIT_EXPECT_EQ(test, state.retries, (u8)1);
+	KUNIT_EXPECT_EQ(test, state.retried, 1U);
 	t6040_recovery_complete(&state);
 	KUNIT_EXPECT_FALSE(test, state.cycle_pending);
+	/* The counts outlive the bring-up they were taken in. */
+	KUNIT_EXPECT_EQ(test, state.retried, 1U);
+	KUNIT_EXPECT_EQ(test, state.exhausted, 0U);
 }
 
 static void t6040_recovery_retry_exhaustion_test(struct kunit *test)
@@ -33,6 +37,12 @@ static void t6040_recovery_retry_exhaustion_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, t6040_recovery_retry(&state));
 	KUNIT_EXPECT_TRUE(test, state.cycle_pending);
 	KUNIT_EXPECT_EQ(test, state.retries, (u8)T6040_RECOVERY_RETRIES);
+	KUNIT_EXPECT_EQ(test, state.retried, (u32)T6040_RECOVERY_RETRIES);
+	KUNIT_EXPECT_EQ(test, state.exhausted, 1U);
+	/* A new bring-up starts its retries over, but not the counts. */
+	KUNIT_EXPECT_TRUE(test, t6040_recovery_start(&state));
+	KUNIT_EXPECT_TRUE(test, t6040_recovery_retry(&state));
+	KUNIT_EXPECT_EQ(test, state.retried, (u32)T6040_RECOVERY_RETRIES + 1);
 }
 
 static struct kunit_case t6040_recovery_test_cases[] = {
