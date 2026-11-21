@@ -15,6 +15,7 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 962 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			power-domains = <&ps_atc0_cio_pcie>;
 			/* No bootloader fills this one; the tunnel's cold init needs it. */
 			apple,tunable =
 				<0x20c 0x800001b7 0x800001b7>,
@@ -115,6 +116,7 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1020 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			power-domains = <&ps_atc1_cio_pcie>;
 			/* No bootloader fills this one; the tunnel's cold init needs it. */
 			apple,tunable =
 				<0x20c 0x800001b7 0x800001b7>,
