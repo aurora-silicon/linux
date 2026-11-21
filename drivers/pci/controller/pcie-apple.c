@@ -1963,6 +1963,7 @@ static int apple_pcie_adopt_link(struct apple_pcie_port *port)
 	void __iomem *rp, *ep;
 	char name[16];
 	u32 value, bus;
+	u16 tls;
 	u8 cap;
 	bool msi = false;
 	int ret, i;
@@ -2029,7 +2030,7 @@ static int apple_pcie_adopt_link(struct apple_pcie_port *port)
 		port->perst = NULL;
 	}
 
-	/* The currently qualified handoff is Gen3 x1, with no retrain in progress. */
+	/* The qualified handoff is x1, with no retrain in progress. */
 	cap = readb(rp + PCI_CAPABILITY_LIST);
 	for (i = 0; cap && i < 48; i++) {
 		if (cap < 0x40 || (cap & 3))
@@ -2041,13 +2042,17 @@ static int apple_pcie_adopt_link(struct apple_pcie_port *port)
 	if (!cap || i == 48)
 		return -EINVAL;
 	/*
-	 * x1 at up to the Gen3 target the bootloader set. The endpoint picks the speed: the N1's
-	 * ROM personality links at Gen1 and comes back at Gen3 after its root-port reset.
+	 * x1 at up to the target link speed the bootloader set in the root port, which
+	 * it takes from the port's ADT bridge: 8 GT/s where that sets 3 (the N1, the
+	 * USB-A controller), the root port's fastest where it sets none (the J775D's
+	 * 10 Gb Ethernet). The endpoint picks the speed within it: the N1's ROM
+	 * personality links at Gen1 and comes back at Gen3 after its root-port reset.
 	 */
 	value = readw(rp + cap + PCI_EXP_LNKSTA);
+	tls = readw(rp + cap + PCI_EXP_LNKCTL2) & PCI_EXP_LNKCTL2_TLS;
 	if ((value & (PCI_EXP_LNKSTA_NLW | PCI_EXP_LNKSTA_LT)) != (1 << PCI_EXP_LNKSTA_NLW_SHIFT) ||
 	    (value & PCI_EXP_LNKSTA_CLS) < PCI_EXP_LNKSTA_CLS_2_5GB ||
-	    (value & PCI_EXP_LNKSTA_CLS) > PCI_EXP_LNKSTA_CLS_8_0GB)
+	    (value & PCI_EXP_LNKSTA_CLS) > tls)
 		return -ENOLINK;
 
 	/* Refuse an active endpoint or malformed capability chain. */
