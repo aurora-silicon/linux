@@ -1050,6 +1050,14 @@ static int tas2764_apply_init_quirks(struct tas2764_priv *tas2764)
 			return ret;
 	}
 
+	if (ENABLED_APPLE_QUIRKS & TAS2764_DVC_RAMP_INIT) {
+		ret = regmap_update_bits(tas2764->regmap, TAS2764_MISC_CFG2,
+					 TAS2764_MISC_CFG2_DVC_RAMP_RATE,
+					 TAS2764_MISC_CFG2_DVC_RAMP_8_SAMPLES);
+		if (ret < 0)
+			return ret;
+	}
+
 	return 0;
 }
 
