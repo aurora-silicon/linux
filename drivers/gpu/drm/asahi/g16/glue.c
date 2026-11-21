@@ -200,10 +200,10 @@ int asahi_g16_tvm_enable(struct device *dev)
 	return ret;
 }
 
-/* Whether this is a qualified J713/T8132 board. */
+/* Whether this T8132 board's retained PMP carries the GPU's AGX vote. */
 bool asahi_g16_board(void)
 {
-	return apple_pmp_j713_board();
+	return apple_pmp_t8132_retained_board();
 }
 
 /*
