@@ -129,8 +129,7 @@ def expect_initdata(old_image):
         if index == MAIN:
             # The retention pointer names the FenderRegsScratchRam window (slot 37's VA), not
             # the RETENTION object: the 27.2 G16G kext's "Fender Scratch Region".
-            struct.pack_into('<Q', after, 0xfa0,
-                             struct.unpack_from('<Q', after, 0x640 + 37 * 0x28 + 8)[0])
+            struct.pack_into('<Q', after, 0xfa0, struct.unpack_from('<Q', old[RUNTIME], 0x18)[0])
         new.append(bytes(after))
     return b''.join(new)
 

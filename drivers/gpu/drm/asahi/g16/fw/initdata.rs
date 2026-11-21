@@ -840,10 +840,9 @@ pub(crate) fn encode_for(
     put64(main, remap(runs, 0x28, 8)?, HOST_END)?;
     let retention = match layout.retention {
         Retention::Object => input.va[id::RETENTION],
-        Retention::ScratchRam => match input.loader_va[SCRATCH_RAM_SLOT] {
-            0 => return Err(()),
-            va => va,
-        },
+        // C1b: the main-config +0x18 alias of the same 0x8000 bytes (firmware RAM attrs)
+        // instead of the slot-37 register window.
+        Retention::ScratchRam => input.scratch,
     };
     put64(main, remap(runs, 0xe88, 8)?, retention)?;
     if let Some(at) = layout.coredump_copy {
