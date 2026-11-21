@@ -49,6 +49,11 @@ pub(crate) struct InitData {
 }
 
 impl InitData {
+    /// One InitData object of the inventory (`wire::id`), for diagnostics.
+    pub(crate) fn object(&self, id: usize) -> Option<&Arc<FwObject>> {
+        self._graph.get(id)
+    }
+
     pub(crate) fn root_va(&self) -> Result<u64> {
         Ok(self.root.va)
     }

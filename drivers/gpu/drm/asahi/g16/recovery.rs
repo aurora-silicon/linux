@@ -187,6 +187,7 @@ impl Firmware {
                 self.recovery.warning_deadline_ns = u64::MAX;
                 self.recovery.long_commands = self.recovery.long_commands.saturating_add(1);
                 dev_warn!(self.dev(), "M4 GPU command has no completion-stamp progress for 5s; execution may still be active\n");
+                self.stall_snapshot();
             }
             let compute_only = self
                 .engine
@@ -275,6 +276,107 @@ impl Firmware {
         }
         if self.engine.retained.push(job.clone(), GFP_NOWAIT).is_err() {
             core::mem::forget(job.clone());
+        }
+    }
+
+    /// 27.2 bring-up diagnostic, once, at the first 5 s without completion-stamp progress:
+    /// the host-visible ring indices (a full event ring stalls the firmware quietly: its
+    /// writer 0x36330 spins, holding the event lock, while `(write + 1) & 0xff == read`),
+    /// the FirmwareData and power-config words the firmware keeps there, then a device-control
+    /// record that makes the firmware abort (op 0x25 with DM type 3: "Invalid DM type", 26B123
+    /// 0x5098 -> 0x57ec), so that its crash log shows every task's frames. No crash within the
+    /// deadline means the device-control drain itself no longer runs.
+    fn stall_snapshot(&mut self) {
+        let dev = self.session.dev.clone();
+        let ix = |r: Result<u32>| r.unwrap_or(u32::MAX);
+        self.channels.log_stop(&self.session, &self.init, "stall");
+        let ch = &self.channels;
+        dev_err!(
+            dev,
+            "G16 stall: event read {} write {}; stats read {} write {}; trace read {} write {}\n",
+            ix(ch.event.read()),
+            ix(ch.event.write()),
+            ix(ch.stats.read()),
+            ix(ch.stats.write()),
+            ix(ch.trace.read()),
+            ix(ch.trace.write())
+        );
+        for i in 0..super::hw::rings::LOG_RINGS {
+            let r = |o: usize| ix(ch.log.state.r32(i * 0x30 + o));
+            dev_err!(
+                dev,
+                "G16 stall: log {} read {} write {}\n",
+                i,
+                r(0),
+                r(0x20)
+            );
+        }
+        for (i, ring) in ch.submit.iter().enumerate() {
+            dev_err!(
+                dev,
+                "G16 stall: submit {} read {} completion {} write {}\n",
+                i,
+                ix(ring.read()),
+                ix(ring.completion()),
+                ix(ring.write())
+            );
+        }
+        for (name, id, ranges) in [
+            (
+                "power config",
+                super::fw::initdata::id::POWER_PERFORMANCE,
+                &[(0usize, usize::MAX)][..],
+            ),
+            (
+                "FirmwareData",
+                super::fw::initdata::id::FIRMWARE_DATA,
+                &[(0x4000, 0x5300), (0xed00, usize::MAX)][..],
+            ),
+            (
+                "region C",
+                super::fw::initdata::id::GLOBALS,
+                &[(0, usize::MAX)][..],
+            ),
+        ] {
+            let Some(o) = self.init.object(id) else {
+                continue;
+            };
+            for &(start, end) in ranges {
+                let end = end.min(o.size) & !0x1f;
+                for row in (start..end).step_by(0x20) {
+                    let w: [u32; 8] = core::array::from_fn(|k| ix(o.r32(row + k * 4)));
+                    if w.iter().all(|&x| x == 0) {
+                        continue;
+                    }
+                    dev_err!(
+                        dev,
+                        "G16 stall: {} +{:#06x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}\n",
+                        name,
+                        row,
+                        w[0],
+                        w[1],
+                        w[2],
+                        w[3],
+                        w[4],
+                        w[5],
+                        w[6],
+                        w[7]
+                    );
+                }
+            }
+        }
+        let mut abort = super::fw::channels::DevCtl::op(0x25);
+        abort.words[1] = 3;
+        match self.devctl(&abort, false) {
+            Ok(()) => dev_err!(
+                dev,
+                "G16 stall: posted the firmware abort record (devctl 0x25, DM type 3)\n"
+            ),
+            Err(e) => dev_err!(
+                dev,
+                "G16 stall: firmware abort record not posted: {:?}\n",
+                e
+            ),
         }
     }
 
