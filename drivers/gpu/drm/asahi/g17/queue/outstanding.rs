@@ -4,10 +4,17 @@
 //!
 //! Commands mostly finish in order, so a prune takes finished entries from the front and stops at
 //! the first unfinished one: it costs what it removes, not the length of the list. An entry that
-//! finishes behind an older unfinished one stays until it reaches the front; every reader skips it
-//! by its status. A failure must not wait like that, because later commands whose prefix covers it
-//! are cancelled: a prune is given its VM's failure counts and scans the whole list from when a
-//! failure starts until it has finished and one scan has run after that.
+//! finishes behind an older unfinished one stays until it reaches the front or a full scan, and
+//! every reader skips it by its status. While it stays it keeps its command's resources, such as
+//! a compute command's timestamp page, so a full scan also runs once there have been as many
+//! prunes as entries were held after the last one. That target is fixed at each scan, as a stuck
+//! front with one new entry per prune would otherwise keep the length ahead of the count. It
+//! costs at most two more status reads per prune, amortized, and nothing finished waits longer
+//! than one queue length of submissions.
+//!
+//! A failure must not wait at all, because later commands whose prefix covers it are cancelled:
+//! a prune is given its VM's failure counts and scans the whole list from when a failure starts
+//! until it has finished and one scan has run after that.
 
 use crate::g17::{job::Order, status::Failures};
 use kernel::prelude::*;
@@ -26,6 +33,8 @@ pub(crate) struct Outstanding<T> {
     head: usize,
     /// [`Failures::finished`] at the last full scan.
     failures: u64,
+    /// Front-only prunes left before the next full scan: the length after the last one.
+    scan_in: usize,
 }
 
 impl<T: Status> Outstanding<T> {
@@ -35,6 +44,7 @@ impl<T: Status> Outstanding<T> {
             entries: KVVec::new(),
             head: 0,
             failures,
+            scan_in: 0,
         }
     }
 
@@ -82,9 +92,10 @@ impl<T: Status> Outstanding<T> {
 
     /// Removes finished entries and hands each to `finished` with its status, oldest first.
     /// While no failure has started since the last full scan, only entries in front of the
-    /// oldest unfinished one leave.
+    /// oldest unfinished one leave, until there have been as many prunes as entries were held
+    /// after the last full scan.
     pub(crate) fn prune(&mut self, failures: Failures, mut finished: impl FnMut(u64, i32, T)) {
-        if failures.started != self.failures {
+        if failures.started != self.failures || self.scan_in == 0 {
             // Only a finished failure is sure to be seen by this scan. One still being signalled
             // keeps `started` ahead, so the scans stay full until it has finished.
             self.failures = failures.finished;
@@ -101,8 +112,10 @@ impl<T: Status> Outstanding<T> {
                 false
             });
             self.head = 0;
+            self.scan_in = self.len();
             return;
         }
+        self.scan_in -= 1;
         while let Some((sequence, entry)) = self.entries.get_mut(self.head) {
             let Some(status) = entry.as_ref().map(Status::status) else {
                 break;
@@ -163,6 +176,8 @@ mod tests {
             let command = push(&mut queue, sequence);
             commands.push(command, GFP_KERNEL).unwrap();
         }
+        // As a queue in use: every enqueue prunes before it pushes, so it has been scanned.
+        assert!(prune(&mut queue, 0).is_empty());
         (queue, commands)
     }
 
@@ -211,6 +226,43 @@ mod tests {
         commands[0].finish(1);
         assert_eq!(prune(&mut queue, 0), [(1u64, 1i32), (2, 1)]);
         assert_eq!(sequences(queue.iter()), [3u64]);
+    }
+
+    #[test]
+    fn a_command_finished_behind_an_unfinished_one_leaves_within_a_queue_length() {
+        let (mut queue, commands) = queue(4);
+        commands[2].finish(1);
+        let mut prunes = 0;
+        while prune(&mut queue, 0).is_empty() {
+            prunes += 1;
+            assert!(prunes <= 4);
+        }
+        assert_eq!(sequences(queue.iter()), [1u64, 2, 4]);
+    }
+
+    #[test]
+    fn a_stuck_front_does_not_hold_finished_commands_past_a_queue_length() {
+        let (mut queue, commands) = queue(4);
+        commands[1].finish(1);
+        commands[2].finish(1);
+        commands[3].finish(1);
+        // Command 1 never finishes, and each prune comes with a new unfinished command, as a
+        // long command at the front of a busy queue.
+        let mut left = KVec::new();
+        let mut prunes = 0;
+        for sequence in 5..=16u64 {
+            prunes += 1;
+            for (sequence, _) in prune(&mut queue, 0) {
+                left.push(sequence, GFP_KERNEL).unwrap();
+            }
+            push(&mut queue, sequence);
+            if !left.is_empty() {
+                break;
+            }
+        }
+        // The 4 held at the last scan, then the scan itself.
+        assert_eq!(left, [2u64, 3, 4]);
+        assert_eq!(prunes, 4 + 1);
     }
 
     #[test]
@@ -269,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deep_steady_queue_reads_only_what_leaves_and_never_grows() {
+    fn a_deep_steady_queue_reads_a_few_entries_per_prune_and_never_grows() {
         // Commands queued deep, then one finishing for each new one, as under vkd3d-proton.
         // A little over half of the room is held: moving down only once as many have left
         // as are held would double it.
@@ -285,7 +337,8 @@ mod tests {
             assert_eq!(queue.len(), DEPTH as usize);
             assert_eq!(queue.entries.capacity(), capacity);
         }
-        // Each prune read the one that left and the unfinished one behind it.
-        assert_eq!(READS.load(Ordering::Relaxed), 2 * 9 * DEPTH as usize);
+        // Each prune read the one that left and the unfinished one behind it, and once per
+        // queue length a full scan read them all.
+        assert!(READS.load(Ordering::Relaxed) <= 3 * 9 * DEPTH as usize);
     }
 }
