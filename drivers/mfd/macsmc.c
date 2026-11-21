@@ -642,6 +642,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	smc->wake_reasons = of_device_is_compatible(dev->of_node, "apple,t8132-smc") ?
 			    apple_smc_t8132_wake_reasons : apple_smc_t8140_wake_reasons;
+	smc->sleep_wake_type = of_property_read_bool(dev->of_node, "apple,sleep-wake-type");
 
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
@@ -897,11 +898,12 @@ static int apple_smc_sleep_commit(struct apple_smc *smc)
 	int ret;
 
 	/*
-	 * T6041: macOS's last SMC writes before MBSE (trace of its sleep under aura's hypervisor):
-	 * WKTP = 2 (AppleSMCEmbedded, going to sleep), and pmVC = 0x100, AppleT6041PMGR's
-	 * enableVddCio with every port's CIO rail off.
+	 * apple,sleep-wake-type (T6041): macOS's last SMC writes before MBSE (trace of its sleep
+	 * under aura's hypervisor): WKTP = 2, going to sleep, and pmVC, the CIO rail word. macOS
+	 * wrote 0x100 there, every port's rail off, but it slept with ATC0 held up by the
+	 * hypervisor; 0x101 is what the sleep that works here has written since 9 Nov.
 	 */
-	if (of_machine_is_compatible("apple,t6041")) {
+	if (smc->sleep_wake_type) {
 		int r1 = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_SLEEP);
 		int r2 = apple_smc_write_u32(smc, SMC_KEY(pmVC), 0x101);
 
