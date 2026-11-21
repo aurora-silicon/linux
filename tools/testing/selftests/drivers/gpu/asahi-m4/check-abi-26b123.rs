@@ -294,7 +294,11 @@ fn main() {
     assert_eq!((r64(data, 0x5168), r64(data, 0x5170), r32(data, 0x51b4)),
                (input().va[id::FWCTL], input().va[id::FWCTL] + 0x40, 1));
     let main = object(&v26, l, id::MAIN);
-    assert_eq!(r64(main, 0xfa0), input().va[id::RETENTION]);
+    // The retention pointer names the FenderRegsScratchRam window (slot 37), as the 27.2
+    // G16G kext names its Fender + 0x60000 mapping; +0xfa8 stays zero there too.
+    assert_eq!(r64(main, 0xfa0), input().loader_va[wire::SCRATCH_RAM_SLOT]);
+    assert_eq!(r64(main, 0xfa0), r64(main, 0x640 + 37 * 0x28 + 8));
+    assert_eq!(r64(main, 0x640 + 37 * 0x28), 0x300d60000);
     assert_eq!(r64(main, 0xfa8), 0);
     // CRE (25G83 slot 28) is register-map slot 33 in 26B123.
     assert_eq!(r64(main, 0x640 + 33 * 0x28), 0x300d58000);
