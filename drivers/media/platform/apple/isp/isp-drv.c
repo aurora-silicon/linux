@@ -1191,6 +1191,7 @@ static const struct apple_isp_hw apple_isp_hw_t8122 = {
 	.scl1 = true,
 	.lpdp = true,
 	.meta_size = ISP_META_SIZE_T6031,
+	.meta_exposure = true,
 };
 
 static const struct apple_isp_hw apple_isp_hw_t6030 = {
