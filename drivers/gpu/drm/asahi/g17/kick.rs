@@ -565,7 +565,7 @@ impl Queue {
         if id.engine != DataMaster::Compute {
             return Err(EINVAL);
         }
-        let low = alloc.lower(
+        let low = alloc.lower_small(
             KICK_RING_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RW,
