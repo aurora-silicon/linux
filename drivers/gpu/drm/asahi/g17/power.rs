@@ -3,7 +3,7 @@
 //! Work-based firmware performance effort. Idle power gating is managed separately by the
 //! device-control ring; this input never keeps an otherwise idle GPU powered.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::AtomicU32;
 
 pub(super) const FULL_EFFORT: u32 = 0x10000;
 pub(super) const IDLE_HOLD_NS: u64 = 16_000_000;
@@ -155,8 +155,8 @@ impl Effort {
     }
 }
 
-/// How long the GPU has been running without going idle, from the start and end timestamps the
-/// firmware writes for every command it executes.
+/// How long each client's commands have kept the GPU running without going idle, from the start
+/// and end timestamps the firmware writes for every command it executes.
 ///
 /// The firmware raises its performance state for work that queues up behind the running command,
 /// not for how busy the GPU is: a client that submits one command and waits for it before the
@@ -169,45 +169,101 @@ impl Effort {
 /// bottleneck and gets the full effort ([`Effort::note_bound`]). A shorter run would not be worth
 /// a floor that outlasts it.
 ///
-/// Completions note their intervals without the device lock, in any order; a late completion
-/// can only lengthen the run it belongs to.
-pub(super) struct BusyRun {
-    /// The latest end noted, in firmware timestamp ticks.
-    last_end: AtomicU64,
-    /// Start of the run that `last_end` belongs to.
-    start: AtomicU64,
+/// Runs are kept per client (DRM context). Commands of different clients run side by side and
+/// complete in any order: a short command of one client that starts part-way through another
+/// client's long render completes first, while the render that keeps the GPU busy through the
+/// gap before it has not been noted yet. One run for the whole GPU took that for idle and
+/// restarted, the more often the longer the commands, and could lock a GPU-bound client at the
+/// floor. A client's own commands follow each other, so its own gaps are real.
+///
+/// A run counts while its client is still running: until it has been silent for longer than its
+/// last command took plus the idle power-off delay, measured on the clock the firmware stamps
+/// commands with. A client that stops submitting does not keep the full effort for others.
+pub(super) struct BusyRuns {
+    runs: [BusyRun; CLIENT_RUNS],
+}
+
+/// Clients followed at once; a new client takes the place of the one that ran least recently.
+const CLIENT_RUNS: usize = 16;
+
+#[derive(Copy, Clone)]
+struct BusyRun {
+    /// The entry follows a client.
+    used: bool,
+    /// The client's execution context id.
+    client: u32,
+    /// Start of the run, in firmware timestamp ticks.
+    start: u64,
+    /// The latest end noted.
+    last_end: u64,
+    /// How long the client's latest command ran.
+    last_busy: u64,
 }
 
 impl BusyRun {
+    const EMPTY: Self = Self {
+        used: false,
+        client: 0,
+        start: 0,
+        last_end: 0,
+        last_busy: 0,
+    };
+}
+
+impl BusyRuns {
     pub(super) const fn new() -> Self {
         Self {
-            last_end: AtomicU64::new(0),
-            start: AtomicU64::new(0),
+            runs: [BusyRun::EMPTY; CLIENT_RUNS],
         }
     }
 
-    /// Notes a command that executed from `start` to `end`. A start at least `idle_ticks` after
-    /// every end noted so far (the firmware's idle power-off delay) begins a new run.
-    pub(super) fn note(&self, start: u64, end: u64, idle_ticks: u64) {
+    /// Notes a command of `client` that executed from `start` to `end`. A start at least
+    /// `idle_ticks` (the firmware's idle power-off delay) after every end noted for the client
+    /// begins a new run.
+    pub(super) fn note(&mut self, client: u32, start: u64, end: u64, idle_ticks: u64) {
         if start == 0 || end <= start {
             return;
         }
-        let previous = self.last_end.fetch_max(end, Ordering::AcqRel);
-        if previous == 0 || start >= previous.saturating_add(idle_ticks) {
-            self.start.store(start, Ordering::Release);
+        let index = self
+            .runs
+            .iter()
+            .position(|run| run.used && run.client == client)
+            .or_else(|| {
+                (0..CLIENT_RUNS).min_by_key(|&index| {
+                    let run = &self.runs[index];
+                    (run.used, run.last_end)
+                })
+            })
+            .unwrap_or(0);
+        let run = &mut self.runs[index];
+        if !run.used || run.client != client || start >= run.last_end.saturating_add(idle_ticks) {
+            *run = BusyRun {
+                used: true,
+                client,
+                start,
+                last_end: end,
+                last_busy: end - start,
+            };
+            return;
         }
+        run.last_end = run.last_end.max(end);
+        run.last_busy = end - start;
     }
 
-    /// Whether the current run has lasted at least `hold_ticks`.
-    pub(super) fn bound(&self, hold_ticks: u64) -> bool {
-        let start = self.start.load(Ordering::Acquire);
-        start != 0 && self.last_end.load(Ordering::Acquire).saturating_sub(start) >= hold_ticks
+    /// Whether some client, still running at `now`, has kept the GPU running for at least
+    /// `hold_ticks`.
+    pub(super) fn bound(&self, now: u64, hold_ticks: u64, idle_ticks: u64) -> bool {
+        self.runs.iter().any(|run| {
+            run.used
+                && run.last_end.saturating_sub(run.start) >= hold_ticks
+                && now.saturating_sub(run.last_end) < run.last_busy.saturating_add(idle_ticks)
+        })
     }
 
-    /// The GPU went idle for longer than the effort hold: the next command begins a new run.
-    pub(super) fn end(&self) {
-        self.start.store(0, Ordering::Release);
-        self.last_end.store(0, Ordering::Release);
+    /// The GPU went idle for longer than the effort hold: every client's next command begins a
+    /// new run.
+    pub(super) fn end(&mut self) {
+        *self = Self::new();
     }
 }
 
@@ -368,11 +424,23 @@ pub(super) fn release<C: Control>(control: &mut C) -> kernel::error::Result {
 mod tests {
     use super::*;
 
-    /// `count` commands of `busy` ticks from `start`, each `gap` ticks after the previous one
-    /// ended. Returns where the next command would start.
-    fn commands(run: &BusyRun, mut start: u64, count: u64, busy: u64, gap: u64, idle: u64) -> u64 {
+    // 24 MHz ticks: a millisecond, the 2 ms idle power-off delay and the 16 ms hold.
+    const MS: u64 = 24_000;
+    const IDLE: u64 = 2 * MS;
+    const HOLD: u64 = 16 * MS;
+
+    /// `count` commands of `client` of `busy` ticks from `start`, each `gap` ticks after the
+    /// previous one ended. Returns where the next one would start.
+    fn commands(
+        runs: &mut BusyRuns,
+        client: u32,
+        mut start: u64,
+        count: u64,
+        busy: u64,
+        gap: u64,
+    ) -> u64 {
         for _ in 0..count {
-            run.note(start, start + busy, idle);
+            runs.note(client, start, start + busy, IDLE);
             start += busy + gap;
         }
         start
@@ -380,40 +448,71 @@ mod tests {
 
     #[test]
     fn a_submit_and_wait_loop_becomes_bound_once_it_outlasts_the_hold() {
-        // 24 MHz ticks: 1 ms commands, 100 us host turnarounds, 2 ms idle power-off delay.
-        let (ms, idle, hold) = (24_000, 48_000, 16 * 24_000);
-        let run = BusyRun::new();
-        let next = commands(&run, 1000, 10, ms, ms / 10, idle);
-        assert!(!run.bound(hold));
-        commands(&run, next, 20, ms, ms / 10, idle);
-        assert!(run.bound(hold));
+        // 1 ms commands, 100 us host turnarounds.
+        let mut runs = BusyRuns::new();
+        let next = commands(&mut runs, 1, 1000, 10, MS, MS / 10);
+        assert!(!runs.bound(next, HOLD, IDLE));
+        let next = commands(&mut runs, 1, next, 20, MS, MS / 10);
+        assert!(runs.bound(next, HOLD, IDLE));
     }
 
     #[test]
     fn paced_work_never_becomes_bound() {
         // 2 ms of work every 16.7 ms: each gap is longer than the idle power-off delay.
-        let (ms, idle, hold) = (24_000, 48_000, 16 * 24_000);
-        let run = BusyRun::new();
-        let next = commands(&run, 1000, 100, 2 * ms, 14 * ms, idle);
-        assert!(!run.bound(hold));
+        let mut runs = BusyRuns::new();
+        let next = commands(&mut runs, 1, 1000, 100, 2 * MS, 14 * MS);
+        assert!(!runs.bound(next, HOLD, IDLE));
         // A frame whose work leaves less idle than the power-off delay is bound: the GPU is.
-        commands(&run, next + 14 * ms, 20, 15 * ms, ms, idle);
-        assert!(run.bound(hold));
+        let next = commands(&mut runs, 1, next + 14 * MS, 20, 15 * MS, MS);
+        assert!(runs.bound(next, HOLD, IDLE));
     }
 
     #[test]
-    fn overlapping_and_late_completions_extend_the_run_and_end_resets_it() {
-        let (idle, hold) = (48_000, 100);
-        let run = BusyRun::new();
-        run.note(1000, 1100, idle);
-        // Completes after a later command but started inside the run.
-        run.note(1050, 1060, idle);
-        assert!(run.bound(hold));
-        run.end();
-        assert!(!run.bound(hold));
-        run.note(0, 10, idle);
-        run.note(20, 20, idle);
-        assert!(!run.bound(0));
+    fn another_clients_command_does_not_end_a_run() {
+        // Back-to-back 6 ms renders of client 1 keep the GPU busy. 4 ms into each, a 0.2 ms
+        // command of client 2 starts and completes first, more than the power-off delay after
+        // client 1's previous render ended.
+        let mut runs = BusyRuns::new();
+        let mut at = 1000;
+        for _ in 0..4 {
+            runs.note(2, at + 4 * MS, at + 4 * MS + MS / 5, IDLE);
+            assert!(!runs.bound(at + 4 * MS + MS / 5, 4 * 6 * MS, IDLE));
+            runs.note(1, at, at + 6 * MS, IDLE);
+            at += 6 * MS;
+        }
+        assert!(runs.bound(at, HOLD, IDLE));
+        // Still bound while the next render runs and client 2's command completes.
+        runs.note(2, at + 4 * MS, at + 4 * MS + MS / 5, IDLE);
+        assert!(runs.bound(at + 5 * MS, HOLD, IDLE));
+    }
+
+    #[test]
+    fn a_client_that_stops_does_not_stay_bound() {
+        let mut runs = BusyRuns::new();
+        let next = commands(&mut runs, 1, 1000, 30, MS, MS / 10);
+        assert!(runs.bound(next, HOLD, IDLE));
+        // Silent for its last command plus the power-off delay while another client streams.
+        let quiet = next + MS + IDLE;
+        commands(&mut runs, 2, next, 4, MS, 4 * MS);
+        assert!(!runs.bound(quiet, HOLD, IDLE));
+    }
+
+    #[test]
+    fn the_least_recent_client_is_replaced_and_end_resets_every_run() {
+        let mut runs = BusyRuns::new();
+        let next = commands(&mut runs, 1, 1000, 30, MS, MS / 10);
+        for client in 2..=CLIENT_RUNS as u32 + 1 {
+            runs.note(client, next, next + 1, IDLE);
+        }
+        // Client 1's entry was the least recent and went to the last new client.
+        assert!(!runs.bound(next, HOLD, IDLE));
+        let next = commands(&mut runs, 1, next, 30, MS, MS / 10);
+        assert!(runs.bound(next, HOLD, IDLE));
+        runs.end();
+        assert!(!runs.bound(next, 0, IDLE));
+        runs.note(1, 0, 10, IDLE);
+        runs.note(1, 20, 20, IDLE);
+        assert!(!runs.bound(20, 0, IDLE));
     }
 
     #[test]
