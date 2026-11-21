@@ -778,6 +778,9 @@ pub(crate) struct Session {
     pub(crate) regs: regs::Regs,
     pub(crate) adt: GpuAdt,
     uat: Arc<mmu::Uat>,
+    /// The PPL handoff page, mapped here only to read the firmware's powered flag
+    /// ([`hw::FwLayout::powered`]); `None` when the firmware keeps the GPU powered.
+    handoff: Option<regs::Mapping>,
     /// The last host mailbox sends (CLOCK_MONOTONIC ns, endpoint, message), for stall dumps.
     pub(crate) sent: [(u64, u8, u64); SENT_LOG],
     pub(crate) sent_next: usize,
@@ -797,11 +800,39 @@ impl Session {
         self.shared.check()?;
         if !self.rtkit.running()
             || self.regs.asc_control()? & regs::ASC_RUN == 0
-            || self.regs.pstate()? > self.regs.top()
+            || self.pstate()?.is_some_and(|state| state > self.regs.top())
         {
             return Err(EIO);
         }
         self.uat.check_adopted_bindings()
+    }
+
+    /// Whether the firmware has the GPU powered. A firmware that powers it down while idle
+    /// says so on the PPL handoff page; reading a GPU register while it is off takes an
+    /// SError, so every runtime GPU register read goes through this.
+    pub(crate) fn gpu_powered(&self) -> Result<bool> {
+        match (&self.handoff, self.adt.layout.powered) {
+            (Some(page), Some(offset)) => Ok(page.io().try_read8(offset)? != 0),
+            _ => Ok(true),
+        }
+    }
+
+    /// The firmware's current performance state, or `None` while the GPU is powered down.
+    pub(crate) fn pstate(&self) -> Result<Option<u32>> {
+        if self.gpu_powered()? {
+            self.regs.pstate().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The engine receipts, or `None` while the GPU is powered down.
+    pub(crate) fn engine_state(&self) -> Result<Option<regs::EngineState>> {
+        if self.gpu_powered()? {
+            self.regs.engine_state().map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Sends a mailbox message.
@@ -1308,6 +1339,13 @@ pub(crate) fn start(
     if !window.ttbat_is_clear()? {
         return Err(EBUSY);
     }
+    let handoff = match adt.layout.powered {
+        Some(_) => Some(regs::Mapping::write_combined(
+            adt.handoff.start,
+            hw::HANDOFF_SIZE as usize,
+        )?),
+        None => None,
+    };
     // Adopt the UAT and prove the leaf words before anything firmware-visible is written: no
     // context names the shadow window or the lower root yet.
     let uat = uat::adopt(dev, cfg, &adt)?;
@@ -1342,6 +1380,7 @@ pub(crate) fn start(
         regs,
         adt,
         uat,
+        handoff,
         sent: [(0, 0, 0); SENT_LOG],
         sent_next: 0,
     };

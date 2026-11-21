@@ -249,8 +249,9 @@ impl Channels {
             ix(self.devctl.write()),
             self.devctl_producer
         );
-        match session.regs.engine_state() {
-            Ok(e) => dev_err!(
+        match session.engine_state() {
+            Ok(None) => dev_err!(d, "G16 {}: engine state not read: GPU powered down\n", why),
+            Ok(Some(e)) => dev_err!(
                 d,
                 "G16 {}: engine busy {} fault {:#x}/{:#x} address {:#x}/{:#x}\n",
                 why,

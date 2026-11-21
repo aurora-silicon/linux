@@ -352,6 +352,10 @@ pub(crate) struct FwLayout {
     pub(crate) loader_table: Option<LoaderTable>,
     /// How the host starts this firmware.
     pub(crate) start: Start,
+    /// Where on the PPL handoff page the firmware records whether the GPU is powered, for a
+    /// firmware that powers it down while idle; `None` for one that keeps it powered while it
+    /// runs. While that byte is 0 the host reads no GPU register.
+    pub(crate) powered: Option<usize>,
 }
 
 impl FwLayout {
@@ -424,6 +428,8 @@ pub(crate) const FW_25G83: FwLayout = FwLayout {
     }),
     loader_table: Some(LoaderTable::Host(0x1332f0)),
     start: Start::Wake25G83,
+    // GFX stays powered from START until the firmware stops.
+    powered: None,
 };
 
 /// 26B123 (macOS 27.2, also 26B131): __TEXT 0x64000, __DATA 0xd0000 and a __DATA_SHARED_RO
@@ -459,6 +465,10 @@ pub(crate) const FW_26B123: FwLayout = FwLayout {
     }),
     loader_table: Some(LoaderTable::Firmware),
     start: Start::MacOs27_2,
+    // The firmware powers GFX down after its idle delay (region C 0x9c0) and back up for the
+    // next work, under the PPL handoff lock, and sets this byte to 1 after each power-up and
+    // to 0 after each power-down.
+    powered: Some(0x648),
 };
 
 /// The firmware layouts this backend knows, newest last.

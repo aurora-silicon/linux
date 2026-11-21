@@ -974,7 +974,12 @@ impl Firmware {
         let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
         let ch = &self.channels;
         let rd = |o: &super::object::FwObject, off| o.r32(off).unwrap_or(0xdeadbeef);
-        let state = self.session.regs.engine_state().unwrap_or_default();
+        let state = self
+            .session
+            .engine_state()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let f = e.oldest();
         let ms = f.map_or(0, |f| now_ns().wrapping_sub(f.published_ns) / 1_000_000);
 

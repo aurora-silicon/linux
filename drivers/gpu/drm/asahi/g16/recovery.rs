@@ -148,7 +148,7 @@ impl Firmware {
             "G16 {}: host generation {:?}, GPU pstate {:?} (top {}), host ceiling S{}, {} flights, {} pending, {} long commands\n",
             why,
             self.session.regs.generation(),
-            self.session.regs.pstate(),
+            self.session.pstate(),
             self.session.regs.top(),
             self.power.effective,
             self.engine.flights.len(),
@@ -367,7 +367,7 @@ impl Firmware {
             self.dev(),
             "G16: fail-stop ({:?}): GPU pstate {:?} (top {}), host ceiling S{} -> {}, temperature {} mC\n",
             error,
-            self.session.regs.pstate(),
+            self.session.pstate(),
             self.session.regs.top(),
             before,
             if floored { "S1" } else { "unchanged (Globals unwritable)" },
@@ -556,7 +556,8 @@ impl Firmware {
         // These frontiers must be captured before the host answers 2: the
         // firmware can force the stage target while aborting a work item.
         let stage = self.recovery_snapshot()?;
-        let fault = self.session.regs.engine_state()?;
+        // Powered down, the GPU holds no fault to read.
+        let fault = self.session.engine_state()?.unwrap_or_default();
         let asid = fault
             .status
             .iter()
