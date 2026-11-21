@@ -39,6 +39,25 @@ pub(crate) mod t8132 {
         }],
         firmware: &[
             FirmwareBuild {
+                // 25G83 (build 2 of armfw_g16g.im4p) as iBoot loads it on a T8132 Air. Besides
+                // the entropy, iBoot fills a header field, the record block the header points at
+                // (0x5c8df, 0x231) and the tunables block its TUNS/TUNZ records describe
+                // (0x5cb10, 0x6a0). With those zeroed, the loaded image hashes the same as the
+                // TEXT of the firmware file.
+                name: "Apple GFX 25G83 (normalized loaded image, boot-filled ranges)",
+                text_size: 0x60000,
+                data_size: 0x13c000,
+                entropy: &[[0x5c8df, 0x5c9c2]],
+                boot_filled: &[(0x23c, 8), (0x5c8df, 0x231), (0x5cb10, 0x6a0)],
+                text_sha256: [
+                    0x3a, 0x41, 0xe4, 0x77, 0xb1, 0x2d, 0x48, 0x8d, 0x0c, 0x27, 0x7d, 0x1d, 0x30,
+                    0x6b, 0x60, 0x88, 0x5e, 0x67, 0x5e, 0xc7, 0x98, 0x54, 0xca, 0xaf, 0x90, 0x29,
+                    0x35, 0xc2, 0x7e, 0xf8, 0x76, 0x5e,
+                ],
+            },
+            // The per-board entries below stay until an 8-core and a 10-core J713 on 26.6.2
+            // have booted with only the normalized entry above.
+            FirmwareBuild {
                 name: "Apple GFX 25G83 (normalized loaded image)",
                 text_size: 0x60000,
                 data_size: 0x13c000,
