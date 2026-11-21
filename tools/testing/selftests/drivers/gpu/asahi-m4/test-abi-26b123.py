@@ -117,7 +117,7 @@ def expect_initdata(old_image):
             after = bytearray(before)
         if index == GLOBALS:
             # The M4 Pro 26B123 region C cold-start policy words (no 25G83 position).
-            for at, value in ((0x38, 1), (0x9dc, 50), (0xe0c, 250)):
+            for at, value in ((0x38, 1), (0x9dc, 50), (0xe0c, 250), (0x7f0, 1)):
                 assert not any(after[at:at + 4]), f'GLOBALS +{at:#x}'
                 struct.pack_into('<I', after, at, value)
             # 27.2 candidate: the idle power-off delay (25G83 0x9bc = 40) kept effectively off.
@@ -131,9 +131,13 @@ def expect_initdata(old_image):
                               (0xaa8, 0x47800000), (0xaac, 0x3ecf2e49), (0xad8, 0x10),
                               (0xae0, 0x5dc00), (0x44, 1), (0x29e4, 124),
                               (0x29f0, 0x3f77bdef), (0x29f8, 0x3d042108), (0x2bbc, 0x45fa0000),
-                              (0x2c10, 8000), (0x2f34, 1), (0x6ac8, 1)):
+                              (0x2c10, 8000), (0x2f34, 1), (0x6ac8, 1), (0x84, 1),
+                              (0x2b74, 50)):
                 assert not any(after[at:at + 4]), f'POWER_PERFORMANCE +{at:#x}'
                 struct.pack_into('<I', after, at, value)
+            # The 27.2 kext writes 0 where the 25G83 run puts G16's word 0x2c88.
+            assert struct.unpack_from('<I', after, 0x2cb0)[0] != 0, 'POWER_PERFORMANCE +0x2cb0'
+            struct.pack_into('<I', after, 0x2cb0, 0)
         for at, value in NEW_26B123.get(index, []):
             assert not any(after[at:at + 8]), f'object {index} +{at:#x}'
             struct.pack_into('<Q', after, at, value)
