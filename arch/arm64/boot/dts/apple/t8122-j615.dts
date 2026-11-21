@@ -161,3 +161,16 @@
 	/* Per-device factory data from this Mac's own iBoot system container. */
 	firmware-name = "apple/mesacal-j615.bin";
 };
+
+/* The bootloader hands the encoder's preloaded firmware over. */
+&dart_ave0 {
+	status = "okay";
+};
+
+&dart_ave1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
