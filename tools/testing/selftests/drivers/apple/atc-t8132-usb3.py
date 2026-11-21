@@ -103,7 +103,7 @@ struct atcphy_mode_configuration { u32 crossbar, crossbar_dp_single_pma; bool cr
 struct apple_atcphy {
     const struct atcphy_hw *hw;
     struct device *dev;
-    bool t8132_ss, t8132_common_owned, t8132_suspended, t8132_failed, host_active;
+    bool t8132_ss, t8132_common_owned, t8132_suspended, t8132_failed, host_active, dwc3_running;
     bool ss_tunables, mode_dirty, pipe_pending, swap_lanes;
     bool cio_tunables, t8132_dp_alt, fixed_usb2, hibernated, pd_was_off, idle_rpm;
     bool t8103_dummy_pending, t8103_usb3_workaround;
@@ -327,14 +327,23 @@ int main(void)
     assert(!atcphy_configure_t8132(&a,APPLE_ATCPHY_MODE_USB3));
     assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
     /* A running host keeps the epoch through suspend-to-idle only (cda0923e3d56). */
-    a.host_active=true; pm_suspend_target_state=PM_SUSPEND_MEM;
+    a.host_active=a.dwc3_running=true; pm_suspend_target_state=PM_SUSPEND_MEM;
     assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
     pm_suspend_target_state=PM_SUSPEND_TO_IDLE;
     unsigned kept=writes;
     assert(!atcphy_suspend(&dev) && a.t8132_suspended && a.t8132_common_owned);
     assert(atcphy_configure_t8132(&a,APPLE_ATCPHY_MODE_USB3)==-EBUSY && writes==kept);
     assert(!atcphy_resume(&dev) && !a.t8132_suspended && a.t8132_common_owned);
-    a.host_active=false; pm_suspend_target_state=0;
+    /* So does a running device: the glue keeps the shared domain on for either role. */
+    a.host_active=false; pm_suspend_target_state=PM_SUSPEND_MEM;
+    assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
+    pm_suspend_target_state=PM_SUSPEND_TO_IDLE; kept=writes;
+    assert(!atcphy_suspend(&dev) && a.t8132_suspended && a.t8132_common_owned && writes==kept);
+    assert(!atcphy_resume(&dev) && !a.t8132_suspended && a.t8132_common_owned);
+    /* A controller held in reset has nothing keeping the domain on. */
+    a.dwc3_running=false;
+    assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
+    pm_suspend_target_state=0;
     assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
     assert(!atcphy_configure_t8132(&a,APPLE_ATCPHY_MODE_OFF));
     assert(!a.t8132_common_owned && !a.mode_dirty && !atcphy_suspend(&dev));
@@ -420,9 +429,17 @@ int main(void)
 '''
         run(Path(directory), "dwc3-t8132", role_program)
         permissive = program.replace(
-            "(!atcphy->host_active || pm_suspend_target_state != PM_SUSPEND_TO_IDLE)", "false", 1)
+            "(!atcphy->dwc3_running || pm_suspend_target_state != PM_SUSPEND_TO_IDLE)", "false", 1)
         assert permissive != program
         run(Path(directory), "suspend-deep-negative-control", permissive, expect_failure=True)
+        host_only = program.replace(
+            "(!atcphy->dwc3_running || pm_suspend_target_state", "(!atcphy->host_active || pm_suspend_target_state", 1)
+        assert host_only != program
+        run(Path(directory), "suspend-host-only-negative-control", host_only, expect_failure=True)
+        no_reset = program.replace(
+            "(!atcphy->dwc3_running || pm_suspend_target_state", "(!atcphy->t8132_ss || pm_suspend_target_state", 1)
+        assert no_reset != program
+        run(Path(directory), "suspend-reset-negative-control", no_reset, expect_failure=True)
         permissive = program.replace(
             "if (atcphy->mode_dirty)\n\t\treturn -EBUSY;", "if (false)\n\t\treturn -EBUSY;", 1)
         assert permissive != program
@@ -673,7 +690,7 @@ struct dwc3_probe_data { struct dwc3 *dwc; void *res; bool ignore_clocks_and_res
 struct atcphy_hw { int gen; };
 struct apple_atcphy {
     const struct atcphy_hw *hw;struct device *dev;int lock,pipe_state;
-    bool t8132_ss,t8132_suspended,t8132_common_owned,t8132_failed,host_active,pipe_pending;
+    bool t8132_ss,t8132_suspended,t8132_common_owned,t8132_failed,host_active,dwc3_running,pipe_pending;
 };
 #define APPLE_ATCPHY_MODE_OFF 0
 static struct apple_atcphy atc;
