@@ -3411,7 +3411,7 @@ static void __init gate_j713_dcpext_routes(void)
  * once the internal handoff has enabled the display subsystem; a dcpext
  * without firmware memory or with another image is left as it is.
  */
-static int __init gate_j713_v27_dispext_dart(struct device_node *dcp, struct device_node **dart)
+static int __init gate_t8132_v27_dispext_dart(struct device_node *dcp, struct device_node **dart)
 {
 	struct of_phandle_args args;
 	struct device_node *piodma;
@@ -3429,7 +3429,7 @@ static int __init gate_j713_v27_dispext_dart(struct device_node *dcp, struct dev
 }
 
 /* Its PIODMA child is disabled in the SoC tree, as for the J773g: enable it. */
-static int __init gate_j713_v27_piodma(struct of_changeset *cs, struct device_node *dcp)
+static int __init gate_t8132_v27_piodma(struct of_changeset *cs, struct device_node *dcp)
 {
 	struct device_node *piodma;
 	int ret = 0;
@@ -3443,7 +3443,7 @@ static int __init gate_j713_v27_piodma(struct of_changeset *cs, struct device_no
 	return ret;
 }
 
-static bool __init gate_j713_v27_memory(struct device_node *dcp)
+static bool __init gate_t8132_v27_memory(struct device_node *dcp)
 {
 	struct device_node *region;
 	int i, n;
@@ -3588,7 +3588,7 @@ static void __init gate_t8132_dcpext_v27(void)
 	else if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only())
 		why = "nomodeset is on the command line";
 	if (why) {
-		pr_info("apple-j713-display: 27.2 dcpext Type-C routes left disabled: %s\n", why);
+		pr_info("apple-t8132-display: 27.2 dcpext Type-C routes left disabled: %s\n", why);
 		of_node_put(display);
 		return;
 	}
@@ -3603,13 +3603,13 @@ static void __init gate_t8132_dcpext_v27(void)
 		/* A fixed-PHY (HDMI) dcpext has its own chain. */
 		if (!gate_has_typec_routes(np))
 			continue;
-		if (!gate_j713_v27_memory(np)) {
-			pr_info("apple-j713-display: %pOF: 27.2 image without firmware memory, left off\n",
+		if (!gate_t8132_v27_memory(np)) {
+			pr_info("apple-t8132-display: %pOF: 27.2 image without firmware memory, left off\n",
 				np);
 			continue;
 		}
 		if (!of_device_is_available(display)) {
-			pr_info("apple-j713-display: %pOF: display subsystem not enabled, left off\n",
+			pr_info("apple-t8132-display: %pOF: display subsystem not enabled, left off\n",
 				np);
 			continue;
 		}
@@ -3618,9 +3618,9 @@ static void __init gate_t8132_dcpext_v27(void)
 			of_node_put(np);
 			break;
 		}
-		ret = gate_j713_v27_dispext_dart(np, &darts[n]);
+		ret = gate_t8132_v27_dispext_dart(np, &darts[n]);
 		if (!ret)
-			ret = gate_j713_v27_piodma(cs, np);
+			ret = gate_t8132_v27_piodma(cs, np);
 		if (!ret)
 			ret = gate_ext_routes(cs, np, "okay");
 		if (ret) {
@@ -3638,9 +3638,9 @@ static void __init gate_t8132_dcpext_v27(void)
 		of_node_put(darts[i]);
 	of_node_put(display);
 	if (ret)
-		pr_err("apple-j713-display: 27.2 dcpext Type-C routes left disabled: %d\n", ret);
+		pr_err("apple-t8132-display: 27.2 dcpext Type-C routes left disabled: %d\n", ret);
 	else if (n)
-		pr_info("apple-j713-display: 27.2: Type-C routes and display DARTs enabled for %u dcpext(s)\n",
+		pr_info("apple-t8132-display: 27.2: Type-C routes and display DARTs enabled for %u dcpext(s)\n",
 			n);
 	/* Applied, it stays: the live tree refers to it. */
 	if (ret || !n)
