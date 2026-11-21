@@ -7,9 +7,11 @@ use crate::{g18::fw::render_params::G17pRenderParameters, g18::address_map as va
 /// PB blocks backed before the first render (the native initial size).
 pub(crate) const PB_BLOCKS: u32 = 8;
 /// Blocks added per firmware TVB grow request (event 6), up to
-/// PB_MAX_BLOCKS: the block table holds 256 ring slots and one stays empty.
+/// PB_MAX_BLOCKS: the ring the firmware is given holds PB_CAPACITY slots and
+/// one stays empty. A request refused below what the firmware was given leaves
+/// the tiler waiting until the job watchdog.
 pub(crate) const PB_GROW_BLOCKS: u32 = 16;
-pub(crate) const PB_MAX_BLOCKS: u32 = 254;
+pub(crate) const PB_MAX_BLOCKS: u32 = PB_CAPACITY - 2;
 pub(crate) const PB_CAPACITY: u32 = 1650;
 pub(crate) const UMA_BLOCKS: u32 = 24; // 24 MiB > sum of both M5 budgets.
 pub(crate) const USC_REQUIRED: [u64; 2] = [0x7d4000, 0x934000]; // M5 DRM hardware path.
