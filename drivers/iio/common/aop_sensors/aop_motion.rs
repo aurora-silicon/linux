@@ -40,6 +40,21 @@ const SUBTYPE_SET_PROPERTY: u16 = 4;
 const PROP_INTERVAL: u32 = 0;
 /// 50 Hz.
 const INTERVAL_US: u32 = 20_000;
+/// 100 Hz, the interval macOS sends on the M5 (10000 us, from the AOP message trace).
+const INTERVAL_US_T8142: u32 = 10_000;
+/// The properties macOS 27.2.1 sends an M5 (T8142) service around the report
+/// interval: 0x3d = 2 after the calibration, and 0x16 = 1, 0x5c = 0 before
+/// it; to stop, 0x16 = 0, 0x5c = 0 before the zero interval. Without them
+/// an M5 service takes the calibration and the interval and never reports.
+const PROP_MODE: u32 = 0x3d;
+const MODE_ON: u32 = 2;
+const PROP_BATCH: u32 = 0x16;
+const PROP_RAW: u32 = 0x5c;
+/// The services that need those properties.
+const T8142_SERVICES: [&CStr; 2] = [
+    c_str!("apple,t8142-aop-accel"),
+    c_str!("apple,t8142-aop-gyro"),
+];
 /// How long a direct read waits for the first report of a fresh start.
 const FIRST_SAMPLE_MS: i64 = 200;
 const FIRST_SAMPLE_POLL_MS: i64 = 5;
@@ -160,6 +175,8 @@ struct Control {
     aop: Arc<dyn AOP>,
     service: EPICService,
     packets: [KVec<u8>; 3],
+    /// An M5 service: sends macOS's companion properties, at 100 Hz.
+    t8142: bool,
     /// Serializes starting and stopping the reports.
     #[pin]
     stream: Mutex<Stream>,
@@ -184,12 +201,17 @@ impl Control {
             };
             packet.extend_from_slice(data, GFP_KERNEL)?;
         }
+        let t8142 = T8142_SERVICES.iter().any(|compatible| {
+            node.property_match_string(c_str!("compatible"), compatible)
+                .is_ok()
+        });
         Arc::pin_init(
             pin_init!(Self {
                 dev: dev.into(),
                 aop,
                 service,
                 packets,
+                t8142,
                 stream <- new_mutex!(Stream::default()),
             }),
             GFP_KERNEL,
@@ -235,18 +257,44 @@ impl Control {
             }
         }
         if held > 0 {
-            dev_info!(
+            dev_dbg!(
                 self.dev,
                 "{} of {} calibration packets kept from an earlier start\n",
                 held,
                 CALIBRATION.len()
             );
         }
-        self.set(PROP_INTERVAL, &INTERVAL_US.to_le_bytes())
+        if !self.t8142 {
+            return self.set(PROP_INTERVAL, &INTERVAL_US.to_le_bytes());
+        }
+        self.companion(PROP_MODE, MODE_ON);
+        self.companion(PROP_BATCH, 1);
+        self.companion(PROP_RAW, 0);
+        self.set(PROP_INTERVAL, &INTERVAL_US_T8142.to_le_bytes())
     }
 
     fn stop(&self) -> Result {
+        if self.t8142 {
+            self.companion(PROP_BATCH, 0);
+            self.companion(PROP_RAW, 0);
+        }
         self.set(PROP_INTERVAL, &0u32.to_le_bytes())
+    }
+
+    /// Writes one of the M5's companion properties. Its status is only
+    /// logged: the interval that follows decides whether the reports run.
+    fn companion(&self, prop: u32, value: u32) {
+        match self.write(prop, &value.to_le_bytes()) {
+            Ok(0) => {}
+            Ok(status) => dev_dbg!(
+                self.dev,
+                "property {:#x} = {}: status {:#x}\n",
+                prop,
+                value,
+                status
+            ),
+            Err(e) => dev_dbg!(self.dev, "property {:#x} = {}: {:?}\n", prop, value, e),
+        }
     }
 
     /// Starts or stops the buffer's reports to match their users. The caller
