@@ -91,7 +91,6 @@ impl CsTiming {
 pub(crate) enum PowerSource {
     None,
     NodeProperty,
-    ChipLine,
     /// Rails switched by the SMC on J700.
     SmcRails,
 }
@@ -100,7 +99,6 @@ impl PowerSource {
     fn from_wire(v: c_int) -> PowerSource {
         match v {
             1 => PowerSource::NodeProperty,
-            2 => PowerSource::ChipLine,
             3 => PowerSource::SmcRails,
             _ => PowerSource::None,
         }
@@ -110,7 +108,6 @@ impl PowerSource {
         match self {
             PowerSource::None => c"none — no power line was taken",
             PowerSource::NodeProperty => c"the sensor node's own gpios property",
-            PowerSource::ChipLine => c"/soc/pinctrl@39b028000 line 122, taken by device-tree node",
             PowerSource::SmcRails => c"the sensor node's SMC-switched rails (apple,smc-power-key)",
         }
     }
