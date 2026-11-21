@@ -6,7 +6,7 @@
 
 use kernel::{
     bindings, c_str,
-    device::Core,
+    device::{self, Core},
     firmware::Firmware,
     iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor, MICRO},
     module_platform_driver, of, platform,
@@ -98,20 +98,21 @@ fn enable_als(
     }
 
     // The CT817 gets its calibration from the AOP driver over the setup port,
-    // not as an ALS property. Only the transport can fail here; the sensor's
-    // status words are logged, see the property comments above. Do not fetch
-    // the HID report descriptor (subtype 0x01) on this endpoint: the AOP never
-    // answers it, and do not write the MODE (0xd7) or 0xe4 properties: either
-    // wedges the AOP for the rest of the boot.
+    // not as an ALS property.
+    arm_ct817(aop, dev.as_ref(), svc)
+}
+
+/// Writes the CT817's properties in the order that arms it, ending with the
+/// zero to non-zero interval transition. The interval must be zero before.
+fn arm_ct817(aop: &dyn AOP, dev: &device::Device, svc: &EPICService) -> Result<()> {
+    // Only the transport can fail here; the sensor's status words are logged,
+    // see the property comments above. Do not fetch the HID report descriptor
+    // (subtype 0x01) on this endpoint: the AOP never answers it, and do not
+    // write the MODE (0xd7) or 0xe4 properties: either wedges the AOP for the
+    // rest of the boot.
     let set = |tag: u32, val: u32, what: &str| -> Result<()> {
         let status = set_als_property(aop, svc, tag, &val.to_le_bytes())?;
-        dev_dbg!(
-            dev.as_ref(),
-            "{} = {:#x}: status {:#x}\n",
-            what,
-            val,
-            status
-        );
+        dev_dbg!(dev, "{} = {:#x}: status {:#x}\n", what, val, status);
         Ok(())
     };
     set(ALS_PROP_VERBOSITY, ALS_VERBOSITY, "verbosity")?;
@@ -121,8 +122,8 @@ fn enable_als(
         "batch interval",
     )?;
     set(ALS_PROP_RAW_INTERVAL, ALS_RAW_INTERVAL, "raw interval")?;
-    // The interval is zero at probe, so this is the transition that arms the
-    // sensor.
+    // The interval is zero at probe and after a suspend, so this is the
+    // transition that arms the sensor.
     set(ALS_PROP_INTERVAL, ALS_INTERVAL_US, "interval")
 }
 
@@ -209,7 +210,80 @@ struct IIOAopAlsDriver {
     /// Declared first: the subscription ends before the IIO device goes.
     listener: FakehidRegistration,
     _iio: AlsIio,
+    aop: Arc<dyn AOP>,
+    service: EPICService,
+    /// The report layout, which also names the sensor part.
+    offset: usize,
 }
+
+impl IIOAopAlsDriver {
+    /// Sets the report interval. Zero stops the reports; the sensor starts
+    /// again on the next non-zero value.
+    fn set_interval(&self, interval_us: u32) -> Result<()> {
+        set_als_property(
+            self.aop.as_ref(),
+            &self.service,
+            ALS_PROP_INTERVAL,
+            &interval_us.to_le_bytes(),
+        )
+        .map(|_| ())
+    }
+
+    /// Starts the reports again after `set_interval(0)`. The CT817 may not
+    /// keep its batch and raw properties across a sleep, so it gets the
+    /// probe's whole sequence; the other parts need only the interval.
+    fn start_reports(&self, dev: &device::Device) -> Result<()> {
+        if self.offset == LUX_OFFSET_CT817 {
+            arm_ct817(self.aop.as_ref(), dev, &self.service)
+        } else {
+            self.set_interval(ALS_INTERVAL_US)
+        }
+    }
+}
+
+/*
+ * The sensor reports on its own every ALS_INTERVAL_US, and each report is an
+ * AOP mailbox interrupt. Nothing reads the channel while the system sleeps,
+ * and in suspend-to-idle those interrupts wake a CPU five times a second. So
+ * the reports stop for a system sleep and start again after it.
+ */
+
+/// # Safety
+///
+/// Called by the PM core with a bound ALS service device.
+unsafe extern "C" fn als_suspend(dev: *mut bindings::device) -> c_int {
+    // SAFETY: by this function's contract, drvdata is the driver data probe set.
+    let this = unsafe { &*bindings::dev_get_drvdata(dev).cast::<IIOAopAlsDriver>() };
+    // A sensor that keeps reporting only costs power: never block the sleep.
+    let _ = this.set_interval(0);
+    0
+}
+
+/// # Safety
+///
+/// Called by the PM core with a bound ALS service device.
+unsafe extern "C" fn als_resume(dev: *mut bindings::device) -> c_int {
+    // SAFETY: by this function's contract, drvdata is the driver data probe set.
+    let this = unsafe { &*bindings::dev_get_drvdata(dev).cast::<IIOAopAlsDriver>() };
+    // SAFETY: the PM core holds a reference to `dev` for this call.
+    let dev: &device::Device = unsafe { device::Device::from_raw(dev) };
+    if let Err(e) = this.start_reports(dev) {
+        // The channel keeps its last value until the driver is bound again.
+        dev_warn!(
+            dev,
+            "could not restart the reports after the sleep: {:?}\n",
+            e
+        );
+    }
+    0
+}
+
+static ALS_PM_OPS: bindings::dev_pm_ops = bindings::dev_pm_ops {
+    suspend: Some(als_suspend),
+    resume: Some(als_resume),
+    // SAFETY: all-zero is a valid `dev_pm_ops`: no callbacks.
+    ..unsafe { core::mem::zeroed() }
+};
 
 fn register_channels<const N: usize>(
     pdev: &platform::Device,
@@ -243,6 +317,10 @@ impl platform::Driver for IIOAopAlsDriver {
     type Data<'bound> = IIOAopAlsDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        Some(&ALS_PM_OPS)
+    }
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
@@ -288,10 +366,15 @@ impl platform::Driver for IIOAopAlsDriver {
         Ok(IIOAopAlsDriver {
             listener,
             _iio: iio,
+            aop: adata,
+            service,
+            offset,
         })
     }
 
     fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
+        // Without this the sensor keeps reporting to nobody.
+        let _ = this.set_interval(0);
         this.listener.unregister();
     }
 }
