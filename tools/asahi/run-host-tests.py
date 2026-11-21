@@ -299,6 +299,7 @@ ASAHI_TESTS = {
                               (out() + ['--old-classifier', 'dcp'], PASS)],
     't6040-calibration-tests.py': [([], PASS)],
     't604x-cpu-order-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
+    't6050-combo-join-tests.py': [([], PASS)],
     't8132-usb4-policy-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     'tb-cio-sleep-tests.py': [(out('--output'), PASS)],
     'tb-dock-pm-tests.py': [(out('--output'), PASS)],
