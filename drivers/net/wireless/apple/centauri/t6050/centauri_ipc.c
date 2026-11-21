@@ -378,7 +378,8 @@ unlock:
 	return 0;
 }
 
-static int centauri_t6050_start_ipc_locked(struct centauri_t6050 *c)
+static int centauri_t6050_start_ipc_locked(struct centauri_t6050 *c,
+					   struct pci_dev **beta)
 {
 	struct centauri_t6050_ipc *ipc;
 	u32 stage;
@@ -450,9 +451,7 @@ static int centauri_t6050_start_ipc_locked(struct centauri_t6050 *c)
 
 	/* Publish usable shared firmware before the Beta consumer probes. */
 	smp_store_release(&c->ready, true);
-	ret = device_attach(&ipc->function[2]->dev);
-	if (ret < 0)
-		dev_warn(&c->pdev->dev, "Beta driver attachment failed: %d\n", ret);
+	*beta = pci_dev_get(ipc->function[2]);
 	return 0;
 failed:
 	dev_err(&c->pdev->dev, "IPC bootstrap failed: %d (Control stage=%#x)\n",
@@ -470,13 +469,25 @@ failed:
 
 int centauri_t6050_start_ipc(struct centauri_t6050 *c)
 {
+	struct pci_dev *beta = NULL;
 	int ret;
 
 	if (!pci_trylock_rescan_remove())
 		return -EAGAIN;
-	ret = READ_ONCE(c->removing) ? -ECANCELED : centauri_t6050_start_ipc_locked(c);
+	ret = READ_ONCE(c->removing) ? -ECANCELED :
+	      centauri_t6050_start_ipc_locked(c, &beta);
 	pci_unlock_rescan_remove();
-	return ret;
+	if (!beta)
+		return ret;
+	/*
+	 * Not under the rescan lock: the Beta driver's probe registers a PM
+	 * notifier, and a suspend's notifiers wait for a rescan.
+	 */
+	ret = device_attach(&beta->dev);
+	if (ret < 0)
+		dev_warn(&c->pdev->dev, "Beta driver attachment failed: %d\n", ret);
+	pci_dev_put(beta);
+	return 0;
 }
 
 void centauri_t6050_free_ipc(struct centauri_t6050 *c)
