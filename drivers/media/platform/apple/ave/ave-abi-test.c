@@ -269,6 +269,51 @@ static void ave_9003_hevc_main10(struct kunit *test)
 	}
 }
 
+/*
+ * HEVC Main 10 on the counted (26A428) layout, which T8142 encodes with: the
+ * words that change with bit depth take the 9003 capture's Main 10 values
+ * (the host tests in tests/test.c check the same words).
+ */
+static void ave_26a428_hevc_main10(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+	u8 *main8, *main10;
+	size_t len;
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, sess);
+	ave->layout = &ave_layout_26a428;
+	ctx->ave = ave;
+	ctx->sess = sess;
+	len = ave->layout->bytes[AVE_CODEC_HEVC - 1][AVE_IMAGE_START];
+	main8 = kunit_kzalloc(test, len, GFP_KERNEL);
+	main10 = kunit_kzalloc(test, len, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, main8);
+	KUNIT_ASSERT_NOT_NULL(test, main10);
+
+	ave_test_session(sess, AVE_CODEC_HEVC, 1920, 1080, true);
+	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, main8, len), 0);
+	ave_test_session(sess, AVE_CODEC_HEVC, 1920, 1080, true);
+	sess->p.min_qp = -12;
+	sess->p.profile = 2;
+	sess->p.bit_depth = 10;
+	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, main10, len), 0);
+
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x35e8), 0x10040);
+	KUNIT_EXPECT_NE(test, get_unaligned_le32(main8 + 0x35e8), 0x10040);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main8 + 0x37c0), 8);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x37c0), 10);
+	KUNIT_EXPECT_EQ(test, (s32)get_unaligned_le32(main10 + 0x3678), -12);
+	KUNIT_EXPECT_EQ(test, (s32)get_unaligned_le32(main10 + 0x3740), -12);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x3a60), 0x01000101);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x6530), 0x01000000);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x66dc), 2);
+	KUNIT_EXPECT_NE(test, get_unaligned_le32(main8 + 0x66dc), 2);
+}
+
 /* One 1080p HEVC Start or first Process image, with speed mode @speed. */
 static void ave_speed_image(struct kunit *test, struct ave_ctx *ctx,
 			    enum ave_image image, bool bframes, bool main10,
@@ -1473,6 +1518,8 @@ static void ave_26b123_layout(struct kunit *test)
 {
 	const struct ave_fw_layout *a = &ave_layout_26a428;
 	const struct ave_fw_layout *b = ave_layout_for_crc(0x99fc929a);
+	struct ave_start_layout *start = kunit_kzalloc(test, sizeof(a->start), GFP_KERNEL);
+	struct ave_proc_layout *process = kunit_kzalloc(test, sizeof(a->process), GFP_KERNEL);
 
 	KUNIT_ASSERT_PTR_EQ(test, b, &ave_layout_26b123);
 	KUNIT_EXPECT_TRUE(test, b->encode_ready);
@@ -1486,17 +1533,52 @@ static void ave_26b123_layout(struct kunit *test)
 	}
 	KUNIT_EXPECT_EQ(test, b->bytes[0][AVE_IMAGE_PROCESS], 0x6e08);
 	KUNIT_EXPECT_EQ(test, b->bytes[1][AVE_IMAGE_PROCESS], 0x78c8);
-	KUNIT_EXPECT_EQ(test, memcmp(b->start, a->start, sizeof(a->start)), 0);
-	KUNIT_EXPECT_EQ(test, memcmp(b->process, a->process, sizeof(a->process)), 0);
+	/* Apart from the two words only the M5 26A428 sessions were run with. */
+	KUNIT_ASSERT_NOT_NULL(test, start);
+	KUNIT_ASSERT_NOT_NULL(test, process);
+	memcpy(start, a->start, sizeof(a->start));
+	memcpy(process, a->process, sizeof(a->process));
+	for (unsigned int c = 0; c < 2; c++) {
+		KUNIT_EXPECT_EQ(test, b->start[c].fps_int_copy, 0U);
+		start[c].fps_int_copy = 0;
+	}
+	KUNIT_EXPECT_EQ(test, b->process[1].low_delay, 0U);
+	process[1].low_delay = 0;
+	KUNIT_EXPECT_EQ(test, memcmp(b->start, start, sizeof(a->start)), 0);
+	KUNIT_EXPECT_EQ(test, memcmp(b->process, process, sizeof(a->process)), 0);
 	KUNIT_EXPECT_EQ(test, memcmp(b->result, a->result, sizeof(a->result)), 0);
 	KUNIT_EXPECT_EQ(test, b->hdr_bytes, a->hdr_bytes);
 	KUNIT_EXPECT_EQ(test, b->max_slots, a->max_slots);
 	KUNIT_EXPECT_EQ(test, b->process_subtype, a->process_subtype);
-	/* Both counted; only the 27.2 build runs sessions without B-frames and at any rate. */
+	/* Both counted, and both run sessions without B-frames and at any rate. */
 	KUNIT_EXPECT_TRUE(test, a->counted && b->counted);
-	KUNIT_EXPECT_FALSE(test, a->any_gop);
+	KUNIT_EXPECT_TRUE(test, a->any_gop);
 	KUNIT_EXPECT_TRUE(test, b->any_gop);
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T8122_26B123), b);
+}
+
+/*
+ * HEVC B flag with a PPS whose num_extra_slice_header_bits is 2. The PPS
+ * comes with the IDR access unit; the B slice after it has two extra bits
+ * before slice_type, and reads as an I slice if they are not skipped.
+ */
+static void ave_hevc_bframe_extra_bits(struct kunit *test)
+{
+	static const u8 idr_au[] = {
+		0, 0, 0, 1, 0x44, 0x01, 0xc5, 0x80,	/* PPS: ids 0/0, 2 extra bits */
+		0, 0, 1, 0x26, 0x01, 0xa3, 0x80,	/* IDR_W_RADL slice, I */
+	};
+	static const u8 b_au[] = {
+		0, 0, 0, 1, 0x02, 0x01, 0xdc, 0x80,	/* TRAIL_R slice, extra bits 01, B */
+	};
+	u8 bits = 0;
+
+	KUNIT_EXPECT_FALSE(test, ave_au_bframe(idr_au, sizeof(idr_au), true, true, &bits));
+	KUNIT_EXPECT_EQ(test, bits, 2);
+	KUNIT_EXPECT_TRUE(test, ave_au_bframe(b_au, sizeof(b_au), true, false, &bits));
+	/* Without the PPS's bits the same slice reads as I. */
+	bits = 0;
+	KUNIT_EXPECT_FALSE(test, ave_au_bframe(b_au, sizeof(b_au), true, false, &bits));
 }
 
 static void ave_t6041_text_boot_word(struct kunit *test)
@@ -1554,6 +1636,7 @@ static void ave_m3_probe_only(struct kunit *test)
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_t6041_text_boot_word),
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
+	KUNIT_CASE(ave_26a428_hevc_main10),
 	KUNIT_CASE(ave_9003_speed),	    KUNIT_CASE(ave_cq_table),
 	KUNIT_CASE(ave_6070_images),
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_frame_result),
@@ -1568,6 +1651,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_smalloc),
 	KUNIT_CASE(ave_m3_probe_only),
 	KUNIT_CASE(ave_26b123_layout),
+	KUNIT_CASE(ave_hevc_bframe_extra_bits),
 	{}
 };
 
