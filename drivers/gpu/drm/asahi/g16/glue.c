@@ -146,26 +146,25 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool id
 			    long *temperature, u32 *governor, u32 *power,
 			    u32 *backstop)
 {
-	int ret;
-
 	long limit = 0;
+	int ret;
 
 	*temperature = 0;
 	/* The GPU's own record and limit, from the firmware's sensor table. Until it
-	 * has given a first sample (the GPU starts powered off), and on a machine whose
-	 * table names none, the die hotspot under the package envelope stands in.
+	 * has given a first sample (the 27.2 firmware leaves it dark under this driver),
+	 * the die hotspot stands in, against its record's own limit from the same table;
+	 * a machine whose table gives neither keeps the package envelope.
 	 */
 	ret = apple_pmp_telemetry_get_gpu(cooling->pmp_node, temperature, &limit);
 	if (!ret && !cooling->gpu_record) {
 		cooling->gpu_record = true;
 		cooling->valid_ns = 0;
 	}
-	if (!cooling->gpu_record) {
-		limit = 0;
-		ret = apple_pmp_telemetry_get_hotspot(cooling->pmp_node, temperature);
-	}
-	apple_pmp_cooling_set_limit(&cooling->policy, limit);
+	if (!cooling->gpu_record)
+		ret = apple_pmp_telemetry_get_hotspot_limit(cooling->pmp_node, temperature, &limit);
 	if (!ret) {
+		/* A held reading below keeps the reference it was taken against. */
+		apple_pmp_cooling_set_limit(&cooling->policy, limit);
 		cooling->valid_ns = now;
 		cooling->valid_mc = *temperature;
 	} else if (ret == -ENODATA && cooling->valid_ns &&

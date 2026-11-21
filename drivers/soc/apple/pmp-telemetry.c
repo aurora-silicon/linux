@@ -118,6 +118,32 @@ static int apple_pmp_gpu_record_desc(const struct device_node *np, unsigned int 
 	return -ENOENT;
 }
 
+/* The lower limit the firmware's sensor table gives the record called @name; 0 if none. */
+static long apple_pmp_record_limit(const struct device_node *np, const char *name)
+{
+	const u8 *table;
+	const char *entry;
+	unsigned int i, n;
+	u32 a, b, limit;
+	int bytes;
+
+	table = of_get_property(np, "apple,tunable-temp-sensor", &bytes);
+	if (!table || bytes < PMP_TEMP_DT_RECORD_SIZE || bytes % PMP_TEMP_DT_RECORD_SIZE)
+		return 0;
+	n = bytes / PMP_TEMP_DT_RECORD_SIZE;
+	for (i = 0; i < n; i++) {
+		entry = (const char *)table + i * PMP_TEMP_DT_RECORD_SIZE;
+		if (strnlen(entry + PMP_TEMP_DT_NAME_OFFSET, PMP_TEMP_NAME_SIZE) == PMP_TEMP_NAME_SIZE ||
+		    strcasecmp(entry + PMP_TEMP_DT_NAME_OFFSET, name))
+			continue;
+		a = get_unaligned_le32(entry + PMP_TEMP_DT_LIMIT_OFFSET);
+		b = get_unaligned_le32(entry + PMP_TEMP_DT_LIMIT_OFFSET + 4);
+		limit = a && b ? min(a, b) : max(a, b);
+		return limit && limit * 64 <= 9600 ? limit * 1000L : 0;
+	}
+	return 0;
+}
+
 /* In step with the located die records (as apple_pmp_temp_locate disambiguates), else unique. */
 static void apple_pmp_gpu_record_locate(struct apple_pmp_telemetry *sensors,
 					const struct apple_pmp_temp_map *map, size_t start)
@@ -227,6 +253,43 @@ int apple_pmp_telemetry_get_hotspot(const struct device_node *np, long *value)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_telemetry_get_hotspot);
+
+/**
+ * apple_pmp_telemetry_get_hotspot_limit() - the die hotspot and its record's own limit
+ * @np: the PMP node
+ * @value: the hottest valid die record, in mC
+ * @limit_mc: that record's lower limit from the firmware's sensor table, in mC; 0 when the
+ *	machine gives none (the caller keeps its package envelope)
+ *
+ * Return: as apple_pmp_telemetry_get_hotspot().
+ */
+int apple_pmp_telemetry_get_hotspot_limit(const struct device_node *np, long *value, long *limit_mc)
+{
+	struct apple_pmp_telemetry *sensors;
+	int ret = -EPROBE_DEFER, channel = -1;
+
+	if (!np || !value || !limit_mc)
+		return -EINVAL;
+	*limit_mc = 0;
+	rcu_read_lock();
+	list_for_each_entry_rcu(sensors, &apple_pmp_telemetry_list, list) {
+		if (sensors->dev->of_node != np)
+			continue;
+		if (!apple_pmp_telemetry_online(sensors)) {
+			ret = -ENODEV;
+			break;
+		}
+		ret = apple_pmp_temp_hotspot_channel_map(sensors->sram, &sensors->temps, value, &channel);
+		if (!apple_pmp_telemetry_online(sensors))
+			ret = -ENODEV;
+		break;
+	}
+	rcu_read_unlock();
+	if (!ret && channel >= 0)
+		*limit_mc = apple_pmp_record_limit(np, apple_pmp_temp_records[channel].name);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_telemetry_get_hotspot_limit);
 
 static int apple_pmp_gpu_record_read(struct apple_pmp_telemetry *sensors, long *value)
 {
