@@ -389,9 +389,10 @@ pub(crate) const FW_25G83: FwLayout = FwLayout {
 /// 0x4b1d000000000003 at +8 of the PPL handoff page (the 25G83 firmware never wrote there).
 /// The AP announces the same word at +0 before RUN, as the G14 firmware-27.2 path does on
 /// hardware (linux#2544: AP and firmware exchange 0x4b1d000000000003 through these two words,
-/// the firmware answering before the RTKit handshake). Whether the register map is written
-/// into the firmware's table (DATA + 0xc72e8, 60 slots) before the start or left to the
-/// firmware's own copy from HW data is not known yet.
+/// the firmware answering before the RTKit handshake). The host leaves loaded DATA alone: the
+/// firmware takes the register map from HW data while it parses InitData, the T6041 build of
+/// this firmware starts on hardware without any DATA write (linux#1954), and 27.2 marks DATA
+/// data-isolated. Its register table is at DATA + 0xc72e8 (60 slots).
 pub(crate) const FW_26B123: FwLayout = FwLayout {
     name: "26B123",
     handoff_version: 2,
@@ -407,7 +408,7 @@ pub(crate) const FW_26B123: FwLayout = FwLayout {
         firmware: PPL_MAGIC_27_2,
         answers: true,
     }),
-    loader_table: None,
+    loader_table: Some(LoaderTable::Firmware),
 };
 
 /// The firmware layouts this backend knows, newest last.
