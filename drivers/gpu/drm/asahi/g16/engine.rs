@@ -936,6 +936,10 @@ impl Firmware {
     /// [`params::compute_flights`]. Renders, another VM's commands and every failure path
     /// need an empty engine: under several clients, compute queued behind another VM's
     /// lost its writes and stalled the firmware compute queue.
+    ///
+    /// Timed compute commands pipeline freely: each flight owns a private `ComputeSlot`
+    /// (`its`/`work`) and `retire_oldest` publishes timestamps in FIFO publication order
+    /// before signalling the flight's fence.
     fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
         let e = &self.engine;
         if e.flights.len() >= params::compute_flights()
@@ -944,7 +948,6 @@ impl Firmware {
                     || f.doomed
                     || f.recovery_suspect
                     || !Arc::ptr_eq(&f.job.vm, &job.vm)
-                    || Self::writes_timestamps(f)
             })
             || job.vm.status.get() != 0
             || self.slots.compute_exhausted()
@@ -959,21 +962,6 @@ impl Firmware {
         let sent = job.progress.sent();
         matches!(command(job, sent), Some(Command::Compute(_)))
             && job.check_command_dependencies(sent).is_ok()
-    }
-
-    /// Whether a flight's commands have user timestamps. The host writes them when the
-    /// command retires, so a command queued behind it (a query copy, possibly waiting on
-    /// availability) could run before they exist; it waits for the retirement instead.
-    fn writes_timestamps(f: &Flight) -> bool {
-        f.job
-            .commands
-            .get(f.first..f.first + f.count)
-            .is_none_or(|commands| {
-                commands.iter().any(|command| match command {
-                    Command::Compute(c) => !c.timestamp_outputs.is_empty(),
-                    Command::Render(r) => !r.timestamp_outputs.is_empty(),
-                })
-            })
     }
 
     /// Whether some of `job`'s commands were published: such a job is retained after a

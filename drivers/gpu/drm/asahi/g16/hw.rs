@@ -573,14 +573,14 @@ pub(crate) mod client {
 
     // Persistent compute units, each in its own 64 MiB interval and reused across
     // application queues. Units 0 and 1 keep their original placement below the render
-    // allocators; further units (up to [`super::sizes::COMPUTE_UNITS`]) live between the
-    // unused CT window and the PB heap, clear of the dynamic PB page-list range
-    // 0x7040000000..0x7080000000. Every alias is inside Mesa's reserved driver hole.
+    // allocators; further units (up to [`super::sizes::COMPUTE_UNITS`]) live from
+    // 0x7080000000 up to the PB heap (0x70c0000000), clear of the dynamic PB page-list
+    // range 0x7040000000..0x7080000000. Every alias is inside Mesa's reserved driver hole.
     pub(crate) const fn compute_base(k: u64) -> u64 {
         if k < 2 {
             0x7001000000 + k * 0x04000000
         } else {
-            0x7090000000 + (k - 2) * 0x04000000
+            0x7080000000 + (k - 2) * 0x04000000
         }
     }
     pub(crate) const fn compute_pool(k: u64) -> u64 {
@@ -683,7 +683,7 @@ pub(crate) mod sizes {
     /// Retained compute units per VM at most; each unit owns its own hardware UMA slot
     /// (`COMPUTE_UMA_SLOT + index`). A unit is reused only after a later publication retired
     /// (it displaced the unit), so `n` units keep up to `n - 1` compute commands in flight.
-    pub(crate) const COMPUTE_UNITS: usize = 8;
+    pub(crate) const COMPUTE_UNITS: usize = 16;
     const _: () = assert!(super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP);
     /// Inherited diagnostic histogram width; M4 does not fold jobs into a compute horizon.
     pub(crate) const HORIZON_JOBS: u32 = 1;

@@ -237,6 +237,50 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     }
 
 }
+struct QueueBehindJob{id:u32,vm:Arc<Vm>,progress:Progress,commands:Vec<Command>,dependency:Result,resources:Resources}
+impl QueueBehindJob{fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}}
+struct QueueBehindFlight{job:Arc<QueueBehindJob>,renders:u32,doomed:bool,recovery_suspect:bool}
+struct QueueBehindEngine{ordinal:u64,flights:Vec<QueueBehindFlight>}
+struct QueueBehindSlots{exhausted:bool,available:bool}
+impl QueueBehindSlots{fn compute_exhausted(&self)->bool{self.exhausted}fn compute_available(&self,_n:usize)->bool{self.available}}
+struct QueueBehindHost{engine:QueueBehindEngine,slots:QueueBehindSlots}
+mod queue_behind_scope {
+    use super::*;
+    type Job = QueueBehindJob;
+    fn command(job:&Job,k:u32)->Option<&Command>{job.commands.get(k as usize)}
+    mod params { pub fn compute_flights()->usize{16} }
+    impl QueueBehindHost {
+        __CAN_QUEUE_BEHIND__
+    }
+    #[test]fn timed_compute_queues_behind_same_vm_and_blocks_cross_vm_or_render(){
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let vm2=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:2});
+        let mk=|id:u32,vm:Arc<Vm>,render:bool|Arc::new(QueueBehindJob{
+            id,vm,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![if render{Command::Render(())}else{Command::Compute(())}],
+            dependency:Ok(()),resources:Resources,
+        });
+        let j1=mk(1,vm1.clone(),false);
+        let j2=mk(2,vm1.clone(),false);
+        let j_other_vm=mk(3,vm2.clone(),false);
+        let j_render=mk(4,vm1.clone(),true);
+        let mut p=QueueBehindHost{
+            engine:QueueBehindEngine{ordinal:1,flights:vec![QueueBehindFlight{job:j1,renders:0,doomed:false,recovery_suspect:false}]},
+            slots:QueueBehindSlots{exhausted:false,available:true},
+        };
+        assert!(p.can_queue_behind(&j2));
+        assert!(!p.can_queue_behind(&j_other_vm));
+        assert!(!p.can_queue_behind(&j_render));
+        p.engine.flights[0].doomed=true;
+        assert!(!p.can_queue_behind(&j2));
+        p.engine.flights[0].doomed=false;
+        p.engine.flights[0].renders=1;
+        assert!(!p.can_queue_behind(&j2));
+        p.engine.flights[0].renders=0;
+        p.slots.available=false;
+        assert!(!p.can_queue_behind(&j2));
+    }
+}
 '''
 harness = harness.replace('__LOGIC__', str(production.parent / 'recovery/logic.rs'))
 for token, declaration in {
@@ -248,6 +292,7 @@ for token, declaration in {
     '__PUBLISH_CHECKED__': 'pub(crate) fn publish_checked(&mut self',
     '__DESCRIPTOR_CONTAINMENT__': 'if encode::preserve_compute_descriptor(',
     '__PUBLISH_PRODUCER__': 'fn publish_producer(',
+    '__CAN_QUEUE_BEHIND__': 'fn can_queue_behind(',
 }.items():
     harness = harness.replace(token, item(declaration).replace("super::command::", "crate::command::").replace("super::recovery::", "crate::recovery::"))
 unit = output / 'publication.rs'

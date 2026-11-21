@@ -40,7 +40,7 @@ pub(crate) fn pb_posted_blocks(heap_blocks: u32) -> u32 {
 
 /// Compute units of a VM that submits compute back to back.
 pub(crate) fn compute_units() -> usize {
-    6usize.clamp(2, hw::sizes::COMPUTE_UNITS)
+    16usize.clamp(2, hw::sizes::COMPUTE_UNITS)
 }
 
 /// Compute commands in flight at most.
