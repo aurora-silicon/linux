@@ -497,8 +497,8 @@ impl PmpData {
         };
         if self.sram_backup_data {
             let data = io.as_view().relaxed().read32(SRAM_DATA_START) as usize;
-            // The segment starts on a 16 KiB page.
-            if data % 0x4000 != 0 {
+            // The segment starts on a 4 KiB page: 0x3c000 in 26.6.2, 0x3d000 in 27.2.
+            if data % 0x1000 != 0 {
                 dev_err!(self.dev, "firmware data segment at {:#x}\n", data);
                 return Err(EINVAL);
             }
