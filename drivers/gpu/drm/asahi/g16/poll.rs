@@ -358,7 +358,7 @@ impl Firmware {
             x32(g.qinfo.r32(0x20)),
             x32(g.qinfo.r32(0x24)),
             x32(g.qinfo.r32(0x28)),
-            x32(g.qinfo.r32(0x80)),
+            x32(g.qinfo.r32(self.init.abi.qinfo().busy)),
             x32(g.notifier.r32(notifier_page::COMPUTE_STAMP)),
             x32(g.notifier.r32(notifier_page::COMPUTE_CONTEXT)),
             f.job.vm.slot,
@@ -411,7 +411,7 @@ impl Firmware {
                     return Ok(false);
                 }
             }
-            if info.r32(0x80)? != 0 {
+            if info.r32(self.init.abi.qinfo().busy)? != 0 {
                 return Ok(false);
             }
         }
