@@ -14,6 +14,7 @@
 #include <linux/kvm_host.h>
 #include <linux/pm.h>
 #include <linux/sched.h>
+#include <linux/set_memory.h>
 #include <linux/suspend.h>
 #include <linux/utsname.h>
 
@@ -87,6 +88,29 @@ static inline void arch_hdr_invariants(struct arch_hibernate_hdr_invariants *i)
 {
 	memset(i, 0, sizeof(*i));
 	memcpy(i->uts_version, init_utsname()->version, sizeof(i->uts_version));
+}
+
+/*
+ * Most image pages are loaded straight into their original frames through the
+ * cacheable linear map. Non-coherent DMA masters (on Apple SoCs: the GPU page
+ * table walker, DCP, every RTKit co-processor, the NVMe queues) read DRAM, and
+ * a later eviction of a dirty line would overwrite what a device wrote since.
+ * Clean and invalidate the page to the PoC before the jump.
+ *
+ * A frame that is not in the boot kernel's linear map (for example the linear
+ * alias of the kernel image, which faults when touched) had nothing loaded
+ * through the linear map: such frames are restored by the restore_pblist copy,
+ * which cleans each copied page itself.
+ */
+int arch_hibernate_clean_image_page(unsigned long pfn)
+{
+	unsigned long va;
+
+	if (!kernel_page_present(pfn_to_page(pfn)))
+		return 0;
+	va = (unsigned long)page_address(pfn_to_page(pfn));
+	dcache_clean_inval_poc(va, va + PAGE_SIZE);
+	return 1;
 }
 
 int pfn_is_nosave(unsigned long pfn)
