@@ -25,10 +25,15 @@ extern "C" {
  *   %DRM_ANE_ABI_V3: GET_CAPS, H16_LOAD and H16_EXEC. The node exists only
  *   after the staged opt-in reached its program stage. DRM_IOCTL_VERSION
  *   minor 1 adds surface mappings (%DRM_ANE_H16_MMAP_OFFSET) and
- *   %DRM_ANE_H16_EXEC_IN_PLACE. Minor 2 adds H16_LOAD_WIDE for programs
- *   with more than %DRM_ANE_H16_SURFACES surfaces (several outputs), up to
- *   %DRM_ANE_H16_SURFACES_WIDE; H16_EXEC and the surface mappings take
- *   that many surfaces too.
+ *   %DRM_ANE_H16_EXEC_IN_PLACE. Minor 2 adds:
+ *   - programs with several outputs: H16_LOAD may now report more than one
+ *     surface with direction 2 (minor 0 and 1 load exactly one output, and
+ *     refuse a program with more);
+ *   - H16_LOAD_WIDE, for programs with more than %DRM_ANE_H16_SURFACES
+ *     surfaces, up to %DRM_ANE_H16_SURFACES_WIDE; H16_EXEC and the surface
+ *     mappings take that many surfaces too.
+ *   Userspace that runs a program with several outputs checks for minor 2,
+ *   not only for minor 1.
  *
  * The DRM_IOCTL_VERSION major and &drm_ane_get_caps.abi_version both give
  * the ABI version. The two versions share the ioctl numbers and the

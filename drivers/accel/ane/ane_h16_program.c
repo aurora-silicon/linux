@@ -1950,7 +1950,14 @@ EXPORT_SYMBOL_GPL(ane_h16_session_close);
 
 /*
  * One control command outside any program (the ISP link): prepared, sent and
- * its reply checked (same command echoed, zero acknowledgment). The arena it
+ * its reply checked (same command echoed, zero acknowledgment).
+ *
+ * Kernel-only: no ioctl reaches it. Its one caller is the ISP link in
+ * ane_fw_cold.c (ane_isp_endpoint_enable() and _disable()), which builds the
+ * whole command itself: LOAD_AFPP and UNLOAD_AFPP, IPC_ENDPOINT_SET2 and
+ * UNSET2, MCACHE_SIZE_GET and DEFAULT_SETTING_SET. A client cannot choose
+ * the opcode or the body. It is exported only because that caller is in
+ * the ane_t6021 module. The arena it
  * used is given back once the firmware answered. Caller holds the session
  * lock (ane_h16_session_enter()). On success the reply is copied back into
  * @command, for the commands that answer in their body.
