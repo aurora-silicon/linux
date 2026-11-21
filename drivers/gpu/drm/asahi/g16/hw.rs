@@ -578,8 +578,8 @@ pub(crate) mod client {
     // Persistent compute units, each in its own 64 MiB interval and reused across
     // application queues. Units 0 and 1 keep their original placement below the render
     // allocators; further units (up to [`super::sizes::COMPUTE_UNITS`]) live between the
-    // unused CT window and the PB heap, clear of the dynamic PB page-list range
-    // 0x7040000000..0x7080000000. Every alias is inside Mesa's reserved driver hole.
+    // unused CT window and the PB heap, clear of [`DYNAMIC`] and [`SCS_POOLS`]. Every alias
+    // is inside Mesa's reserved driver hole.
     pub(crate) const fn compute_base(k: u64) -> u64 {
         if k < 2 {
             0x7001000000 + k * 0x04000000
@@ -609,14 +609,12 @@ pub(crate) mod client {
     pub(crate) const WORK_OFF: u64 = 0;
     pub(crate) const CWORK_STRIDE: u64 = 0x4000;
 
-    // SCS-capable compute units (ray-query scratch), one 128 MiB interval each after the
-    // last compute unit: a 64 MiB UMA pool, then the unit's state, list, preempt, auxiliary
-    // and context records at the base units' offsets from their state.
-    pub(crate) const fn scs_compute_pool(k: u64) -> u64 {
-        0x70a8000000 + k * 0x08000000
-    }
-    pub(crate) const fn scs_compute_state(k: u64) -> u64 {
-        scs_compute_pool(k) + 0x4000000
+    // SCS-capable compute units (ray-query scratch), one 64 MiB interval each after the last
+    // compute unit, holding the unit's list, preempt, auxiliary and context records at the
+    // base units' offsets from their state. Its UMA pool and freelist are in its SCS pool
+    // window ([`scs_compute_pool`]).
+    pub(crate) const fn scs_compute_records(k: u64) -> u64 {
+        0x70a8000000 + k * 0x04000000
     }
     /// Offsets of a compute unit's records from its state.
     pub(crate) const COMPUTE_LIST_OFF: u64 = compute_list(0) - compute_state(0);
@@ -643,14 +641,25 @@ pub(crate) mod client {
     pub(crate) const fn render_pb_pages(k: u64) -> u64 {
         render_base(k) + 0x2040000
     }
-    // SCS-capable render allocators, in their render unit's interval past its records: a
-    // 64 MiB UMA pool in its upper half, and the state, list, auxiliary and scene list at the
-    // base allocator's offsets from its state.
-    pub(crate) const fn scs_render_pool(k: u64) -> u64 {
-        render_base(k) + 0x4000000
-    }
-    pub(crate) const fn scs_render_state(k: u64) -> u64 {
+    // SCS-capable render allocators: the list, descriptor and scene list in their render
+    // unit's interval past its records, at the base allocator's offsets from its state. The
+    // UMA pool and freelist are in the allocator's SCS pool window ([`scs_render_pool`]).
+    pub(crate) const fn scs_render_records(k: u64) -> u64 {
         render_base(k) + 0x2100000
+    }
+    /// Kernel-placed client objects (PB page lists, `Objects::alloc_dynamic_client`).
+    pub(crate) const DYNAMIC: Range<u64> = 0x7040000000..0x7060000000;
+    /// SCS pool windows, after [`DYNAMIC`] and up to the CT window: each holds one
+    /// SCS-capable UMA pool and, right after it, its freelist (`rt::window_bytes`). Windows 0
+    /// and 1 are the SCS compute units', 2 and 3 the SCS render allocators'.
+    pub(crate) const SCS_POOLS: u64 = 0x7060000000;
+    pub(crate) const SCS_POOL_WINDOW: u64 = 0x8000000;
+    pub(crate) const SCS_POOL_WINDOWS: u64 = 4;
+    pub(crate) const fn scs_compute_pool(k: u64) -> u64 {
+        SCS_POOLS + k * SCS_POOL_WINDOW
+    }
+    pub(crate) const fn scs_render_pool(k: u64) -> u64 {
+        SCS_POOLS + (2 + k) * SCS_POOL_WINDOW
     }
     /// Offsets of a render allocator's records from its state.
     pub(crate) const RENDER_LIST_OFF: u64 = render_list(0) - render_state(0);
@@ -720,25 +729,35 @@ pub(crate) mod sizes {
     /// SCS-capable compute units per VM, which share ledger indices (and UMA slots) with the
     /// first base units.
     pub(crate) const SCS_COMPUTE_UNITS: usize = 2;
-    /// Bytes of an SCS-capable UMA pool (its seeds of 4 KiB) and of a base one.
-    pub(crate) const SCS_POOL_SIZE: u64 = 0x4000000;
+    /// Bytes of a base UMA pool (its seeds of 4 KiB).
     pub(crate) const POOL_BYTES: u64 = 0x2000000;
     const _: () = assert!(
-        super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::scs_compute_pool(0)
-            && super::client::scs_compute_state(SCS_COMPUTE_UNITS as u64 - 1)
+        super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::scs_compute_records(0)
+            && super::client::scs_compute_records(SCS_COMPUTE_UNITS as u64 - 1)
                 + super::client::COMPUTE_CONTEXT_OFF
                 + 0x40000
-                <= super::client::scs_compute_pool(SCS_COMPUTE_UNITS as u64)
-            && super::client::scs_compute_pool(SCS_COMPUTE_UNITS as u64) <= super::client::PB_HEAP
-            && super::client::scs_compute_pool(0) + SCS_POOL_SIZE
-                <= super::client::scs_compute_state(0)
+                <= super::client::scs_compute_records(SCS_COMPUTE_UNITS as u64)
+            && super::client::scs_compute_records(SCS_COMPUTE_UNITS as u64)
+                <= super::client::PB_HEAP
     );
     const _: () = assert!(
-        super::client::render_base(0) + 0x2070000 + 0x4000 <= super::client::scs_render_state(0)
-            && super::client::scs_render_state(0) + super::client::RENDER_SCENE_LIST_OFF + 0x4000
-                <= super::client::scs_render_pool(0)
-            && super::client::scs_render_pool(1) + SCS_POOL_SIZE <= super::client::render_base(2)
+        super::client::render_base(0) + 0x2070000 + 0x4000 <= super::client::scs_render_records(0)
+            && super::client::scs_render_records(1) + super::client::RENDER_SCENE_LIST_OFF + 0x4000
+                <= super::client::render_base(2)
             && super::client::render_base(2) <= super::client::FS_WORK_PAGE
+    );
+    // One window per SCS compute unit and render allocator, between the dynamic range and the
+    // CT window.
+    const _: () = assert!(
+        super::client::DYNAMIC.end <= super::client::scs_compute_pool(0)
+            && super::client::scs_compute_pool(SCS_COMPUTE_UNITS as u64)
+                == super::client::scs_render_pool(0)
+            && super::client::scs_render_pool(RENDER_SLOTS as u64)
+                == super::client::SCS_POOLS
+                    + super::client::SCS_POOL_WINDOWS * super::client::SCS_POOL_WINDOW
+            && super::client::scs_render_pool(RENDER_SLOTS as u64) <= super::client::CT
+            && super::client::FS_WORK_PAGE + RENDER_SLOTS as u64 * super::client::PASS_STRIDE
+                <= super::client::DYNAMIC.start
     );
     /// Inherited diagnostic histogram width; M4 does not fold jobs into a compute horizon.
     pub(crate) const HORIZON_JOBS: u32 = 1;

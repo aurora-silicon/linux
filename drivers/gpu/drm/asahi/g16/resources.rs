@@ -7,10 +7,14 @@
 //!
 //! Shader-context scratch (ray queries) takes its pages from the UMA pool of the unit that
 //! runs it, on top of the pool's base pages ([`super::rt::required_seeds`]). A job with
-//! scratch therefore runs on SCS-capable storage, created with its first such job: two
-//! compute units ([`Placement::Scs`]) for its compute commands, and a second set of render
-//! allocators ([`PoolSet::scs`]) for its renders. Jobs without scratch keep the base
-//! storage, bytes and addresses unchanged.
+//! scratch therefore runs on SCS-capable storage, created with its VM's first such job and
+//! sized for it: two compute units ([`Placement::Scs`]) for its compute commands, with pools
+//! for its largest compute scratch, and a second set of render allocators ([`PoolSet::scs`])
+//! for its renders, with pools for both stages of the queue's reservation
+//! ([`super::rt::render_pool_seeds`]). SCS storage cannot grow once the hardware may hold it:
+//! a later job that needs more is refused (E2BIG). Mesa's ray-query layout is fixed per
+//! device, so its jobs never do. Jobs without scratch keep the base storage, bytes and
+//! addresses unchanged.
 
 use super::{
     command::Command,
@@ -58,6 +62,10 @@ const BURST_GAP_NS: u64 = 2_000_000;
 const BURST_COMMANDS: usize = 3;
 
 impl ComputeArena {
+    /// Freelist entries of the arena's UMA pools (all its units share a placement).
+    pub(crate) fn seeds(&self) -> u32 {
+        self.compute.first().map_or(0, |unit| unit.seeds)
+    }
     /// Units `units` (their index and `placement` fix their client addresses; the index fixes
     /// their hardware UMA slot).
     fn new(
@@ -142,14 +150,19 @@ impl RenderArena {
             GFP_KERNEL,
         )?)
     }
-    /// Creates the SCS-capable render allocators unless they exist. Called under the VM
-    /// cache's construction mutex, before any job uses them.
-    fn ensure_scs(&self, factory: &Factory, vm: &mmu::Vm) -> Result {
-        if self.scs.as_ref().is_some() {
-            return Ok(());
+    /// Creates the SCS-capable render allocators with pools of `seeds` entries unless they
+    /// exist. Existing ones must hold `needed`: once the hardware may hold them they cannot
+    /// grow (E2BIG). Called under the VM cache's construction mutex, before any job uses them.
+    fn ensure_scs(&self, factory: &Factory, vm: &mmu::Vm, seeds: u32, needed: u32) -> Result {
+        if let Some(scs) = self.scs.as_ref() {
+            return if scs.pools.seeds() >= needed {
+                Ok(())
+            } else {
+                Err(E2BIG)
+            };
         }
         let mut objects = factory.objects(vm);
-        let pools = self.pools.scs(&mut objects)?;
+        let pools = self.pools.scs(&mut objects, seeds.max(needed))?;
         objects.finish_private()?;
         // The construction mutex excludes a second populate.
         if !self.scs.populate(ScsPools {
@@ -245,10 +258,14 @@ impl Cache {
         drop(ready);
     }
 
+    /// The backing of a job of `commands`. `render_pool_seeds` sizes the VM's SCS-capable
+    /// render pools if this job creates them ([`super::rt::render_pool_seeds`] of the queue's
+    /// reservation); SCS-capable compute units are sized for the job's largest compute scratch.
     pub(crate) fn prepare(
         self: &Arc<Self>,
         vm: &Arc<VmState>,
         commands: &[Command],
+        render_pool_seeds: u32,
     ) -> Result<Prepared> {
         let computes = commands
             .iter()
@@ -261,13 +278,21 @@ impl Cache {
             .count();
         let render = render_count != 0;
         // Scratch is sized on top of a pool's base pages: such a job runs on SCS-capable
-        // storage, for all its commands of that engine.
-        let compute_scs = commands
+        // storage, for all its commands of that engine, whose pools hold the largest of them.
+        let compute_seeds = commands
             .iter()
-            .any(|c| matches!(c, Command::Compute(_)) && c.scs());
-        let render_scs = commands
+            .filter(|c| matches!(c, Command::Compute(_)))
+            .map(Command::scs_seeds)
+            .max()
+            .unwrap_or(0);
+        let render_seeds = commands
             .iter()
-            .any(|c| matches!(c, Command::Render(_)) && c.scs());
+            .filter(|c| matches!(c, Command::Render(_)))
+            .map(Command::scs_seeds)
+            .max()
+            .unwrap_or(0);
+        let compute_scs = compute_seeds != 0;
+        let render_scs = render_seeds != 0;
         let mut epochs = super::budget::Budget::reserve(&self.budget, render_count.try_into()?)?;
         let (compute, compute_ext, render) = {
             // Never held by publication, completion, recovery or fence signalling.
@@ -285,15 +310,24 @@ impl Cache {
                     Placement::Base,
                 )?);
             }
-            if compute_scs && ready.compute_scs.is_none() {
-                ready.compute_scs = Some(ComputeArena::new(
-                    &self.factory,
-                    &self.bind,
-                    &vm.vm,
-                    &self.live,
-                    0..super::hw::sizes::SCS_COMPUTE_UNITS,
-                    Placement::Scs,
-                )?);
+            if compute_scs {
+                match ready.compute_scs.as_ref().map(|arena| arena.seeds()) {
+                    None => {
+                        ready.compute_scs = Some(ComputeArena::new(
+                            &self.factory,
+                            &self.bind,
+                            &vm.vm,
+                            &self.live,
+                            0..super::hw::sizes::SCS_COMPUTE_UNITS,
+                            Placement::Scs {
+                                seeds: compute_seeds,
+                            },
+                        )?);
+                    }
+                    // The units cannot grow once the hardware may hold them.
+                    Some(seeds) if seeds < compute_seeds => return Err(E2BIG),
+                    Some(_) => {}
+                }
             }
             if compute && !compute_scs {
                 // SAFETY: ktime_get has no preconditions.
@@ -330,11 +364,12 @@ impl Cache {
                 )?);
             }
             if render_scs {
-                ready
-                    .render
-                    .as_ref()
-                    .ok_or(EINVAL)?
-                    .ensure_scs(&self.factory, &vm.vm)?;
+                ready.render.as_ref().ok_or(EINVAL)?.ensure_scs(
+                    &self.factory,
+                    &vm.vm,
+                    render_pool_seeds,
+                    render_seeds,
+                )?;
             }
             // A concurrent fault retains even newly constructed backing in this VM cache.
             if vm.status.get() != 0 || vm.vm.is_closed() {

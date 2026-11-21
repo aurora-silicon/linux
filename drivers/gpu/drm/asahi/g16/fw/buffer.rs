@@ -51,6 +51,8 @@ pub(crate) mod uma_manager {
     pub(crate) const SIZE: usize = 0xa0;
     pub(crate) const COMPLETED: usize = 0x54;
     pub(crate) const SEEDS: u32 = 8192;
+    /// Freelist records of a base pool (+0x1c), its 0x20000-byte freelist.
+    pub(crate) const RECORDS: u32 = 16384;
 }
 pub(crate) mod uma_pools {
     pub(crate) const POOLS: usize = 16;
@@ -112,8 +114,8 @@ pub(crate) fn pb_manager_image(
 }
 
 /// One retained M4 UMA descriptor shared by TA and FS (slot 33..64).
-/// A UMA manager whose freelist holds `seeds` entries (available and total): [`uma_manager::SEEDS`]
-/// for a base pool.
+/// A UMA manager whose freelist of `records` records (+0x1c) holds `seeds` entries (available
+/// and total): [`uma_manager::SEEDS`] in [`uma_manager::RECORDS`] for a base pool.
 pub(crate) fn uma_manager_image(
     descriptor: u64,
     slot: u32,
@@ -121,13 +123,14 @@ pub(crate) fn uma_manager_image(
     list_gpu: u64,
     submitted_fw: u64,
     seeds: u32,
+    records: u32,
 ) -> [u8; uma_manager::SIZE] {
     let mut m = [0; uma_manager::SIZE];
     put64(&mut m, 0, descriptor);
     put32(&mut m, 8, slot);
     put32(&mut m, 0x10, 2);
     put64(&mut m, 0x14, state_gpu);
-    put32(&mut m, 0x1c, 16384);
+    put32(&mut m, 0x1c, records);
     put32(&mut m, 0x24, seeds);
     put32(&mut m, 0x2c, seeds);
     put64(&mut m, 0x30, list_gpu);
@@ -196,8 +199,12 @@ mod tests {
             0x7012020000,
             0xfffffc2000700000,
             uma_manager::SEEDS,
+            uma_manager::RECORDS,
         );
-        assert_eq!((r32(&m, 0x24), r32(&m, 0x2c)), (8192, 8192));
+        assert_eq!(
+            (r32(&m, 0x1c), r32(&m, 0x24), r32(&m, 0x2c)),
+            (16384, 8192, 8192)
+        );
         assert_eq!(r64(&m, 0), 0xfffffc2000400000);
         assert_eq!(r32(&m, 8), 33);
         assert_eq!(r64(&m, 0x14), 0x7012000000);

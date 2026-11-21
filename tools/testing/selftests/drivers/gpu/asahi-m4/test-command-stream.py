@@ -51,7 +51,7 @@ if errors:
     raise RuntimeError('Kernel UAPI ABI differs from the M5 bindings: ' + json.dumps(errors))
 command = SOURCE.read_text()
 hardware = (SOURCE.parent / 'hw.rs').read_text()
-capacities = '\n'.join(re.findall(r'pub\(crate\) const (?:TPC_SIZE|TILEMAP_SIZE): u64 = .*?;', hardware))
+capacities = '\n'.join(re.findall(r'pub\(crate\) const (?:TPC_SIZE|TILEMAP_SIZE|SCS_POOL_WINDOW): u64 = .*?;', hardware))
 names = ['drm_asahi_cmd_header', 'drm_asahi_attachment', 'drm_asahi_cmd_render',
          'drm_asahi_cmd_compute', 'drm_asahi_bg_eot', 'drm_asahi_zls_buffer',
          'drm_asahi_timestamp', 'drm_asahi_timestamps', 'drm_asahi_helper_program',

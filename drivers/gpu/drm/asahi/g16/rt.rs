@@ -21,7 +21,8 @@
 //!   known, so nothing is written.
 //! - A traversal exclusion between clients (T8): the A18 Pro needs one (`g17::traversal`), the
 //!   M4 Pro's variants do not set it; G16G adds none.
-//! - Growing a UMA freelist beyond its [`FREELIST_RECORDS`] records (manager +0x1c) (T3).
+//! - How macOS sizes the SCS pool and its freelist (T3). An SCS-capable pool here is sized from
+//!   the request and its freelist holds every seed ([`freelist_records`]).
 
 use kernel::prelude::*;
 
@@ -396,15 +397,52 @@ pub(crate) fn select(compute_ray: bool, render_ray: [bool; 2], as_build: bool) -
 
 /// Freelist entries (4-KiB pages) of a UMA pool without SCS, the value G16G seeds today.
 pub(crate) const BASE_SEEDS: u32 = 8192;
-/// Records of a UMA freelist, the capacity its manager reports at +0x1c (`UNK_1C_VALUE`).
-/// Nothing grows it: what larger value G16G accepts is open (T3).
+/// Records of a base UMA freelist: the capacity G16G's managers report at +0x1c for their
+/// 0x20000-byte freelist (`UNK_1C_VALUE`).
 pub(crate) const FREELIST_RECORDS: u32 = 16384;
+/// Bytes of one freelist record, the 64-bit address of one 4-KiB seed.
+pub(crate) const RECORD_BYTES: u64 = 8;
+/// Bytes of one seed.
+pub(crate) const SEED_BYTES: u64 = 0x1000;
 /// Freelist entries of one 2-MiB pool-table row.
 pub(crate) const SEEDS_PER_ROW: u32 = 512;
-/// Freelist entries of an SCS-capable UMA pool: every record of the freelist (64 MiB).
-pub(crate) const SCS_SEEDS: u32 = FREELIST_RECORDS;
-const _: () = assert!(BASE_SEEDS % SEEDS_PER_ROW == 0 && SCS_SEEDS % SEEDS_PER_ROW == 0);
-const _: () = assert!(BASE_SEEDS < SCS_SEEDS && SCS_SEEDS <= FREELIST_RECORDS);
+/// The most freelist entries of an SCS-capable UMA pool: the whole rows whose pool and
+/// freelist fit one SCS pool window (63 rows, 126 MiB). The 256-row pool table holds more.
+pub(crate) const MAX_SCS_SEEDS: u32 = max_window_seeds(super::hw::client::SCS_POOL_WINDOW);
+const _: () = assert!(BASE_SEEDS % SEEDS_PER_ROW == 0 && MAX_SCS_SEEDS % SEEDS_PER_ROW == 0);
+const _: () = assert!(BASE_SEEDS < FREELIST_RECORDS && FREELIST_RECORDS < MAX_SCS_SEEDS);
+const _: () = assert!(freelist_records(BASE_SEEDS) as u64 * RECORD_BYTES == 0x20000);
+
+/// The freelist records of a UMA pool with `seeds` entries: every seed, and never fewer than a
+/// base freelist. +0x1c is the record count of the freelist +0x14 points at, as M3's manager
+/// of the same format shows (g15 `UNK_1C_VALUE` 0x80000 for its 4-MiB freelist); a base pool
+/// keeps the 16384 G16G writes.
+pub(crate) const fn freelist_records(seeds: u32) -> u32 {
+    if seeds > FREELIST_RECORDS {
+        seeds
+    } else {
+        FREELIST_RECORDS
+    }
+}
+
+/// Bytes of the freelist of a pool with `seeds` entries, in whole 16-KiB pages.
+pub(crate) const fn freelist_bytes(seeds: u32) -> u64 {
+    (freelist_records(seeds) as u64 * RECORD_BYTES).next_multiple_of(0x4000)
+}
+
+/// Bytes an SCS pool window needs for a pool of `seeds` entries and, after it, its freelist.
+pub(crate) const fn window_bytes(seeds: u32) -> u64 {
+    seeds as u64 * SEED_BYTES + freelist_bytes(seeds)
+}
+
+/// The most whole-row seeds whose pool and freelist fit `window` bytes.
+const fn max_window_seeds(window: u64) -> u32 {
+    let mut seeds = (window / SEED_BYTES) as u32 / SEEDS_PER_ROW * SEEDS_PER_ROW;
+    while seeds != 0 && window_bytes(seeds) > window {
+        seeds -= SEEDS_PER_ROW;
+    }
+    seeds
+}
 
 /// The 4-KiB pages one SCS request adds to a UMA pool for `active_cores` cores, as the M4 Pro
 /// sizes its free list (g17 `fw::compute_pool::extra_bytes`): per core the request's pages,
@@ -426,8 +464,8 @@ pub(crate) fn extra_pages(active_cores: u32, scs_pages: u16) -> Result<u64> {
 
 /// Freelist entries a UMA pool needs to serve SCS requests of `pages` per stage at once (one
 /// compute dispatch, or the two stages of one render): the base pool plus every stage's extra
-/// pages, rounded up to whole pool-table rows. E2BIG beyond an SCS-capable pool
-/// ([`SCS_SEEDS`]); without SCS it is [`BASE_SEEDS`].
+/// pages, rounded up to whole pool-table rows. E2BIG beyond the largest SCS-capable pool
+/// ([`MAX_SCS_SEEDS`]); without SCS it is [`BASE_SEEDS`].
 pub(crate) fn required_seeds(active_cores: u32, pages: &[u16]) -> Result<u32> {
     let mut seeds = u64::from(BASE_SEEDS);
     for &stage in pages {
@@ -437,8 +475,19 @@ pub(crate) fn required_seeds(active_cores: u32, pages: &[u16]) -> Result<u32> {
     }
     let row = u64::from(SEEDS_PER_ROW);
     let seeds = seeds.checked_add(row - 1).ok_or(EOVERFLOW)? / row * row;
-    if seeds > u64::from(SCS_SEEDS) {
+    if seeds > u64::from(MAX_SCS_SEEDS) {
         return Err(E2BIG);
     }
     u32::try_from(seeds).map_err(|_| E2BIG)
+}
+
+/// Freelist entries of the SCS-capable render pools a queue reserving `pages` per stage
+/// creates for its VM. The pools serve every queue of the VM and cannot grow once the hardware
+/// may hold them, while a later queue can reserve the other stage too (Mesa replaces its queue
+/// to add one): they are sized for both stages at the larger reserved one where a window holds
+/// that, otherwise for the reservation itself. E2BIG if neither fits.
+pub(crate) fn render_pool_seeds(active_cores: u32, pages: [u16; 2]) -> Result<u32> {
+    let largest = pages[0].max(pages[1]);
+    required_seeds(active_cores, &[largest, largest])
+        .or_else(|_| required_seeds(active_cores, &pages))
 }

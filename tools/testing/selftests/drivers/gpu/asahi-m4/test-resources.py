@@ -232,11 +232,16 @@ pub mod g16 {
     }
     #[test]fn scs_units_and_allocators_are_disjoint_fully_seeded_and_share_the_heap(){
         // Failure modes: SCS storage overlapping the base units, another VM-fixed range or the
-        // Mesa hole's end; a pool larger than its freelist seeds or rows; base pools changing.
+        // Mesa hole's end; a pool larger than its freelist seeds or rows, or its window; a
+        // freelist (+0x1c) that does not hold its pool; base pools changing.
+        // Seeds: Mesa's 0x0130000060010070 layout on a 10-core M4, one compute stage (18432)
+        // and both render stages (28672).
+        let (compute_seeds,render_seeds)=(18432usize,28672u32);
         let mut o=Objects::new();let arena=arenas(&mut o);let pools=PoolSet::new(&mut o).unwrap();
         let mut scs=Vec::new();
-        for k in 0..2{scs.push(g16::slots::ComputeSlot::new_in(&mut o,k,g16::slots::Placement::Scs).unwrap());}
-        let render=pools.scs(&mut o).unwrap();
+        for k in 0..2{scs.push(g16::slots::ComputeSlot::new_in(&mut o,k,g16::slots::Placement::Scs{seeds:compute_seeds as u32}).unwrap());}
+        let render=pools.scs(&mut o,render_seeds).unwrap();
+        assert_eq!((pools.seeds(),render.seeds()),(8192,render_seeds));
         let mut aliases=Vec::new();
         for a in &o.objects{if let Some(g)=a.gva{assert_eq!(a.client_leaf,Some(__PRIVATE_RW__));let base=g-a.offset as u64;assert_eq!(base&0x3fff,0);assert!(base>=0x7000000000);assert!(base+a.mapped as u64<=0x7100000000);aliases.push((base,base+a.mapped as u64));}}
         aliases.push((0x1000000000,0x1000010000));
@@ -244,8 +249,9 @@ pub mod g16 {
         // Six aliases per SCS unit and five per SCS allocator; the PB heap is shared.
         assert_eq!(aliases.len(),42+2*6+2*5);
         let read64=|obj:&g16::object::FwObject,at:usize|->u64{obj.r32(at).unwrap()as u64|((obj.r32(at+4).unwrap()as u64)<<32)};
-        for (unit,seeds) in arena.compute.compute.iter().map(|u|(u,8192usize)).chain(scs.iter().map(|u|(u,16384))) {
+        for (unit,seeds) in arena.compute.compute.iter().map(|u|(u,8192usize)).chain(scs.iter().map(|u|(u,compute_seeds))) {
             assert_eq!(unit.seeds as usize,seeds);assert_eq!(unit.pool.size,seeds*0x1000);
+            assert_eq!(unit.pool_state.size,seeds.max(16384)*8);
             let pool=unit.pool.gva.unwrap();
             assert_eq!(read64(&unit.pool_state,0),pool);
             assert_eq!(read64(&unit.pool_state,(seeds-1)*8),pool+(seeds as u64-1)*0x1000);
@@ -254,26 +260,51 @@ pub mod g16 {
             assert_eq!(read64(&unit.page_list,(rows-1)*64),(1<<61)|(pool+(rows as u64-1)*0x200000));
             assert_eq!(read64(&unit.page_list,rows*64),0);
         }
-        assert_eq!(scs[0].pool.gva,Some(0x70a8000000));assert_eq!(scs[1].pool_state.gva,Some(0x70b4000000));
+        // Each SCS pool starts its 128 MiB window, its freelist right after it; the records
+        // keep the base units' offsets from their state.
+        assert_eq!(scs[0].pool.gva,Some(0x7060000000));assert_eq!(scs[1].pool.gva,Some(0x7068000000));
+        assert_eq!(scs[1].pool_state.gva,Some(0x7068000000+compute_seeds as u64*0x1000));
+        assert_eq!(scs[0].page_list.gva,Some(0x70a8020000));assert_eq!(scs[1].context_store.gva,Some(0x70ac080000));
         for k in 0..2 {
             assert_eq!(render.heap_gva(k).unwrap(),pools.heap_gva(k).unwrap());
             assert_eq!(render.heap_blocks(),pools.heap_blocks());
-            for (set,seeds) in [(&pools,8192u32),(&render,16384)] {
+            for (set,seeds) in [(&pools,8192u32),(&render,render_seeds)] {
                 let refs=set.allocator_refs_for(k).unwrap();
                 let descriptor=o.objects.iter().find(|obj|obj.va==refs.uma_mgr[0]).unwrap();
-                assert_eq!((descriptor.r32(0x1c).unwrap(),descriptor.r32(0x24).unwrap(),descriptor.r32(0x2c).unwrap()),(16384,seeds,seeds));
+                assert_eq!((descriptor.r32(0x1c).unwrap(),descriptor.r32(0x24).unwrap(),descriptor.r32(0x2c).unwrap()),(seeds.max(16384),seeds,seeds));
                 assert_eq!(refs.parameter_id,k as u32);
                 let state=o.objects.iter().find(|obj|obj.gva==Some(read64(descriptor,0x14))).unwrap();
+                assert_eq!(state.size,seeds.max(16384) as usize*8);
                 let pool=o.objects.iter().find(|obj|obj.gva==Some(read64(state,0))).unwrap();
                 assert_eq!(pool.size,seeds as usize*0x1000);
                 assert_eq!(read64(state,(seeds as usize-1)*8),read64(state,0)+(seeds as u64-1)*0x1000);
+                if seeds>8192 {assert_eq!(pool.gva,Some(0x7070000000+k as u64*0x8000000));assert_eq!(state.gva,Some(pool.gva.unwrap()+seeds as u64*0x1000));}
             }
         }
         assert_eq!(render.allocator_refs_for(0).unwrap().scene_list,0x7012170000);
+        // Pools are whole rows that, with their freelist, fit a window.
+        for seeds in [0u32,512*63+1,512*64] {
+            assert_eq!(g16::slots::ComputeSlot::new_in(&mut o,0,g16::slots::Placement::Scs{seeds}).err(),Some(E2BIG),"{seeds}");
+            assert_eq!(pools.scs(&mut o,seeds).err(),Some(E2BIG),"{seeds}");
+        }
         // Each SCS unit shares ledger index k (UMA slot 1 + k) with base unit k.
         let mut s=Slots::new().unwrap();let scs_arena=g16::resources::ComputeArena{compute:KVec(scs)};
         let mut c=Claims::new();assert_eq!(s.claim_compute(&scs_arena,&mut c,0).unwrap(),Some(0));s.publish(&c).unwrap();s.retire(&mut c).unwrap();
         assert_eq!(s.claim_compute(&arena.compute,&mut c,0).unwrap(),Some(1));
+    }
+    #[test]fn the_largest_scs_pools_fill_their_windows_disjointly(){
+        let max=g16::rt::MAX_SCS_SEEDS;
+        let mut o=Objects::new();let pools=PoolSet::new(&mut o).unwrap();
+        let mut scs=Vec::new();
+        for k in 0..2{scs.push(g16::slots::ComputeSlot::new_in(&mut o,k,g16::slots::Placement::Scs{seeds:max}).unwrap());}
+        let _render=pools.scs(&mut o,max).unwrap();
+        let mut aliases:Vec<(u64,u64)>=o.objects.iter().filter_map(|a|a.gva.map(|g|{let base=g-a.offset as u64;(base,base+a.mapped as u64)})).collect();
+        aliases.sort();for a in aliases.windows(2){assert!(a[0].1<=a[1].0,"overlap {:x?} {:x?}",a[0],a[1]);}
+        for w in 0..4u64 {
+            let (start,end)=(0x7060000000+w*0x8000000,0x7068000000+w*0x8000000);
+            assert_eq!(aliases.iter().filter(|a|a.0>=start&&a.1<=end).count(),2,"window {w}");
+            assert!(aliases.iter().all(|a|a.1<=start||a.0>=end||(a.0>=start&&a.1<=end)));
+        }
     }
     #[test]fn work_has_kernel_lower_alias_without_application_alias(){
         let mut o=Objects::new();let slots=Slots::new().unwrap();let arena=arenas(&mut o);

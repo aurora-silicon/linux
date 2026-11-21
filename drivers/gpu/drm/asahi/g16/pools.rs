@@ -16,7 +16,8 @@ pub(crate) mod lifetime;
 
 use super::fw::buffer::{self, uma_manager};
 use super::hw::{client, engine, pte};
-use super::object::{Class, FwObject, Objects, Placement, Request};
+use super::object::{Class, FwObject, Objects, Request};
+use super::slots::Placement;
 use super::Firmware;
 use crate::driver::AsahiDrmDevice;
 use core::{
@@ -82,6 +83,8 @@ pub(crate) struct PoolSet {
     units: KVec<Allocator>,
     /// Blocks of the shared heap (the PB managers' lists cover the whole 256 MiB window).
     heap_blocks: u32,
+    /// Freelist entries of every allocator's UMA pool.
+    seeds: u32,
 }
 
 fn alloc(
@@ -94,7 +97,7 @@ fn alloc(
     o.alloc(Request {
         size,
         class,
-        placement: Placement::Anywhere,
+        placement: super::object::Placement::Anywhere,
         offset: 0,
         client,
         lower: None,
@@ -133,21 +136,24 @@ fn write_records<const N: usize>(
     Ok(())
 }
 impl Allocator {
-    /// Render allocator `k`: the base one (32 MiB pool) or, with `scs`, the SCS-capable one
-    /// (64 MiB, [`super::rt::SCS_SEEDS`]) at its own client addresses.
-    fn new(o: &mut Objects, k: u64, heap: &Arc<FwObject>, scs: bool) -> Result<Self> {
-        let (pool_va, state_va, placement) = if scs {
-            (
-                client::scs_render_pool(k),
-                client::scs_render_state(k),
-                super::slots::Placement::Scs,
-            )
-        } else {
-            (
+    /// Render allocator `k`: the base one (32 MiB pool) or, at [`Placement::Scs`], an
+    /// SCS-capable one whose pool and, after it, freelist are in its SCS pool window.
+    fn new(o: &mut Objects, k: u64, heap: &Arc<FwObject>, placement: Placement) -> Result<Self> {
+        placement.check()?;
+        let (pool_va, state_va, freelist_va) = match placement {
+            Placement::Base => (
                 client::render_pool(k),
                 client::render_state(k),
-                super::slots::Placement::Base,
-            )
+                client::render_state(k),
+            ),
+            Placement::Scs { .. } => {
+                let pool = client::scs_render_pool(k);
+                (
+                    pool,
+                    client::scs_render_records(k),
+                    pool + placement.pool_bytes() as u64,
+                )
+            }
         };
         let nc = |va| Some((va, pte::LEAF_NC));
         // Native UMA software metadata is ASC-owned and never needs a client GPU alias.
@@ -162,7 +168,13 @@ impl Allocator {
             false,
         )?;
         let pool = alloc(o, placement.pool_bytes(), Class::Shared, nc(pool_va), false)?;
-        let state = alloc(o, 0x20000, Class::Shared, nc(state_va), true)?;
+        let state = alloc(
+            o,
+            placement.freelist_bytes(),
+            Class::Shared,
+            nc(freelist_va),
+            true,
+        )?;
         let list = alloc(
             o,
             0x4000,
@@ -189,6 +201,7 @@ impl Allocator {
                 gva(&list)?,
                 submitted.va,
                 placement.seeds(),
+                super::rt::freelist_records(placement.seeds()),
             ),
         )?;
         Ok(Self {
@@ -245,23 +258,34 @@ impl PoolSet {
         )?;
         let mut units = KVec::with_capacity(2, GFP_KERNEL)?;
         for k in 0..2 {
-            units.push(Allocator::new(o, k, &heap, false)?, GFP_KERNEL)?;
+            units.push(Allocator::new(o, k, &heap, Placement::Base)?, GFP_KERNEL)?;
         }
-        Ok(Self { units, heap_blocks })
+        Ok(Self {
+            units,
+            heap_blocks,
+            seeds: Placement::Base.seeds(),
+        })
     }
     /// The SCS-capable allocators of this set's VM (ray-query scratch): one per pass slot,
-    /// sharing this set's PB heap, each with a 64 MiB pool. A render uses either set's
-    /// allocator `k` with pass slot `k`; both alternate the one hardware UMA slot 33.
-    pub(crate) fn scs(&self, o: &mut Objects) -> Result<Self> {
+    /// sharing this set's PB heap, each with a pool of `seeds` entries
+    /// ([`super::rt::render_pool_seeds`]). A render uses either set's allocator `k` with pass
+    /// slot `k`; both alternate the one hardware UMA slot 33.
+    pub(crate) fn scs(&self, o: &mut Objects, seeds: u32) -> Result<Self> {
         let heap = &self.units.first().ok_or(EINVAL)?.heap;
+        let placement = Placement::Scs { seeds };
         let mut units = KVec::with_capacity(2, GFP_KERNEL)?;
         for k in 0..2 {
-            units.push(Allocator::new(o, k, heap, true)?, GFP_KERNEL)?;
+            units.push(Allocator::new(o, k, heap, placement)?, GFP_KERNEL)?;
         }
         Ok(Self {
             units,
             heap_blocks: self.heap_blocks,
+            seeds,
         })
+    }
+    /// Freelist entries of the set's UMA pools.
+    pub(crate) fn seeds(&self) -> u32 {
+        self.seeds
     }
     #[allow(dead_code)]
     pub(crate) fn allocator_refs_for(&self, k: usize) -> Result<AllocatorRefs> {

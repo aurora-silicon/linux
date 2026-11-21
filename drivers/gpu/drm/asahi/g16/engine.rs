@@ -1538,7 +1538,8 @@ impl Firmware {
 }
 
 /// The compute register words of a validated command's ray state ([`super::rt`]) in a unit
-/// whose UMA pool has `seeds` freelist entries. Without ray state these are the words of
+/// whose UMA pool has `seeds` freelist entries, in a freelist of
+/// [`super::rt::freelist_records`]. Without ray state in a base unit these are the words of
 /// [`ComputeRt::DISABLED`].
 fn compute_rt(ray: &super::rt::ComputeRay, seeds: u32) -> ComputeRt {
     ComputeRt {
@@ -1550,6 +1551,7 @@ fn compute_rt(ray: &super::rt::ComputeRay, seeds: u32) -> ComputeRt {
         driver: ray.scratch.driver_word(),
         scs: ray.scratch.enabled(),
         seeds,
+        records: super::rt::freelist_records(seeds),
     }
 }
 

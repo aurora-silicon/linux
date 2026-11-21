@@ -91,6 +91,8 @@ pub(crate) struct ComputeRt {
     pub(crate) scs: bool,
     /// Freelist entries of the unit's UMA pool, published in a fresh descriptor (SEEDS_A/B).
     pub(crate) seeds: u32,
+    /// Records of the unit's freelist, published in a fresh descriptor (+0x1c).
+    pub(crate) records: u32,
 }
 
 impl ComputeRt {
@@ -104,6 +106,7 @@ impl ComputeRt {
         driver: 0,
         scs: false,
         seeds: 8192,
+        records: manager::UNK_1C_VALUE,
     };
 }
 
@@ -275,8 +278,13 @@ pub(crate) fn encode_compute_rt(
     w: &mut [u8; compute::WORK_SIZE],
     q: &mut [u8; compute::SEQ_SIZE],
 ) -> Result<(), ComputeEncodeError> {
-    // Whole 2-MiB pool rows within the freelist the manager reports.
-    if rt.seeds == 0 || rt.seeds % 512 != 0 || rt.seeds > manager::UNK_1C_VALUE {
+    // Whole 2-MiB pool rows within the freelist the manager reports, which is never smaller
+    // than a base unit's.
+    if rt.seeds == 0
+        || rt.seeds % 512 != 0
+        || rt.seeds > rt.records
+        || rt.records < manager::UNK_1C_VALUE
+    {
         return Err(ComputeEncodeError::Storage);
     }
     if ctx == 0 || ctx >= 64 {
@@ -309,7 +317,12 @@ pub(crate) fn encode_compute_rt(
             compute::CONTEXT_STORE_SIZE as u64,
             0x4000,
         )
-        || !gpu(r.pool_state_gva, compute::POOL_STATE_SIZE as u64, 0x4000)
+        // The freelist: one u64 seed address per record.
+        || !gpu(
+            r.pool_state_gva,
+            u64::from(rt.records) * core::mem::size_of::<u64>() as u64,
+            0x4000,
+        )
         || !gpu(r.page_list_gva, compute::PAGE_LIST_SIZE as u64, 0x4000)
         || (r.usc_base != 0 && !gpu(r.usc_base, 0x100000000, 0x100000000))
     {
@@ -506,7 +519,7 @@ pub(crate) fn encode_compute_rt(
     put32(w, d + manager::INDEX, r.uma_slot);
     put32(w, d + manager::ONE, 2);
     put64(w, d + manager::FREELIST, r.pool_state_gva);
-    put32(w, d + manager::UNK_1C, manager::UNK_1C_VALUE);
+    put32(w, d + manager::UNK_1C, rt.records);
     put32(w, d + manager::SEEDS_A, rt.seeds);
     put32(w, d + manager::SEEDS_B, rt.seeds);
     put64(w, d + manager::POOL_TABLE, r.page_list_gva);

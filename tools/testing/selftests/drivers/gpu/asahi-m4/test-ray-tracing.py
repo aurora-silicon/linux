@@ -16,8 +16,8 @@ Failure modes this guards against (written before the code):
  3. The fragment window word loses bit 9; a render stage's tail word takes the auxiliary
     intersection word (the M4 Pro's render programs use the scratch tail).
  4. SCS sizing differs from the M4 Pro's formula ((pages + pages/256 + 8) x cores pages), is not
-    rounded to whole 2-MiB rows, overflows silently, or admits a pool larger than the freelist
-    (E2BIG); zero cores is accepted.
+    rounded to whole 2-MiB rows, overflows silently, or admits a pool whose pages and freelist do
+    not fit an SCS pool window (E2BIG); zero cores is accepted.
  5. A render whose scratch exceeds its queue's reservation is accepted, or one within it
     refused; an unmapped intersection pool or default program is accepted.
  6. The long allowance misses a ray/AS-build job, applies to plain work, re-enables a disabled
@@ -25,7 +25,11 @@ Failure modes this guards against (written before the code):
  7. A compute flag other than AS_BUILD is accepted; scratch alone counts as ray traversal.
  8. The feature word loses a bit or gains another than RENDER_RAY_QUERY and BOUNDED_AS_BUILD.
  9. A UMA manager image or compute descriptor reports seeds that are not whole rows inside the
-    freelist.
+    freelist, or a freelist (+0x1c) that does not hold its pool or is smaller than a base one.
+10. Mesa's G16G ray-query commands (layout 0x0130000060010070 on 10 cores, compute and either or
+    both render stages, and their QUEUE_CREATE reservations) are refused, which Mesa reports as
+    VK_ERROR_DEVICE_LOST; or the render pools a queue creates cannot take a queue that later
+    reserves the other stage too.
 """
 from common import kernel_root, output_dir, rustc, flat_bindings
 import hashlib
@@ -69,6 +73,8 @@ engine = (BACKEND / 'engine.rs').read_text()
 admission = '\n'.join(function(command, name) for name in
                       ['check_intersection', 'check_render_ray', 'check_compute_ray'])
 conversion = '\n'.join(function(engine, name) for name in ['compute_rt', 'stage_rt'])
+# The client address map, which bounds SCS pools (SCS_POOL_WINDOW).
+client = block((BACKEND / 'hw.rs').read_text(), 'pub(crate) mod client {')
 long = block(command, 'impl Command {')
 for text in ('admission', 'conversion', 'long'):
     globals()[text] = globals()[text].replace('super::rt::', 'rt::')
@@ -107,7 +113,7 @@ const ENOENT: i32 = -2;
 mod uapi { include!("@FLAT@"); }
 mod hw {
     pub mod engine { pub const COMPUTE_SEED: u32 = 0x100; }
-    pub mod client { pub const PB_HEAP_SIZE: u64 = 0x10000000; }
+    @CLIENT@
 }
 mod fw {
     #[path = "@BACKEND@/fw/graph.rs"] pub mod graph;
@@ -128,8 +134,8 @@ struct Context<'a> { vm: &'a mmu::Vm, usc_base: u64, active_cores: u32, render_s
 @ADMISSION@
 @CONVERSION@
 type KBox<T> = Box<T>;
-struct RenderCommand { ray_query: [rt::RayQueryStage; 2] }
-struct ComputeCommand { ray: rt::ComputeRay, as_build: bool }
+struct RenderCommand { ray_query: [rt::RayQueryStage; 2], scs_seeds: u32 }
+struct ComputeCommand { ray: rt::ComputeRay, scs_seeds: u32, as_build: bool }
 enum Command { Render(KBox<RenderCommand>), Compute(KBox<ComputeCommand>) }
 @LONG@
 
@@ -189,7 +195,7 @@ fn compute_rt_words_land_in_the_25f84_register_slots_only() {
     for layout in [&compute::V25G83, &compute::V26B123] {
         let plain = encode_compute(layout, &ComputeRt::DISABLED).unwrap();
         for (layout_word, pages) in LAYOUTS {
-            let words = compute_rt(&ray(layout_word), rt::SCS_SEEDS);
+            let words = compute_rt(&ray(layout_word), rt::FREELIST_RECORDS);
             let w = encode_compute(layout, &words).unwrap();
             assert_eq!((u16_at(&w, 0x728), u16_at(&w, 0x72a)), (25, 25 * 12));
             let got = records(&w, compute::REGS, 25);
@@ -212,12 +218,24 @@ fn compute_rt_words_land_in_the_25f84_register_slots_only() {
                     || (d + 0x24..d + 0x28).contains(&i) || (d + 0x2c..d + 0x30).contains(&i)
             }), "unexpected bytes {:x?}", differ);
         }
-        // Seeds are whole rows within the freelist.
+        // Seeds are whole rows within the freelist, which is never smaller than a base one.
         for seeds in [0, 8191, 8704 + 64, 16896] {
             let words = ComputeRt { seeds, ..ComputeRt::DISABLED };
             assert!(encode_compute(layout, &words).is_err(), "seeds {seeds}");
         }
         assert!(encode_compute(layout, &ComputeRt { seeds: 8704, ..ComputeRt::DISABLED }).is_ok());
+        assert!(encode_compute(layout, &ComputeRt { seeds: 8192, records: 8192, ..ComputeRt::DISABLED }).is_err());
+        // A pool larger than a base freelist publishes its own freelist's records at +0x1c,
+        // and only the seed counts and +0x1c move with it.
+        let base = encode_compute(layout, &compute_rt(&ray(LAYOUTS[2].0), rt::FREELIST_RECORDS)).unwrap();
+        let words = compute_rt(&ray(LAYOUTS[2].0), 18432);
+        assert_eq!((words.seeds, words.records), (18432, 18432));
+        let w = encode_compute(layout, &words).unwrap();
+        let d = compute::DESCRIPTOR;
+        assert_eq!((u32_at(&w, d + 0x1c), u32_at(&w, d + 0x24), u32_at(&w, d + 0x2c)), (18432, 18432, 18432));
+        for (i, (a, b)) in base.iter().zip(w.iter()).enumerate() {
+            if a != b { assert!([0x1c, 0x24, 0x2c].iter().any(|&o| (d + o..d + o + 4).contains(&i)), "byte {i:#x}"); }
+        }
     }
 }
 
@@ -321,15 +339,25 @@ fn scs_sizing_is_the_m4_pro_formula_in_whole_rows() {
     assert_eq!(rt::extra_pages(0, 791), Err(EINVAL));
     assert_eq!(rt::required_seeds(10, &[]), Ok(8192));
     assert_eq!(rt::required_seeds(10, &[0, 0]), Ok(8192));
-    // Mesa's smallest T1 layout fits a 10-core M4's SCS pool exactly; the larger two do not.
+    // Mesa's three T1 layouts on a 10-core M4: base 8192 + 10 x (pages + pages/256 + 8).
     assert_eq!(rt::required_seeds(10, &[791]), Ok(16384));
-    assert_eq!(rt::required_seeds(10, &[827]), Err(E2BIG));
-    assert_eq!(rt::required_seeds(10, &[989]), Err(E2BIG));
+    assert_eq!(rt::required_seeds(10, &[827]), Ok(16896));
+    assert_eq!(rt::required_seeds(10, &[989]), Ok(18432));
     assert_eq!(rt::required_seeds(8, &[827]), Ok(15360));
     assert_eq!(rt::required_seeds(1, &[89]), Ok(8704));
     // Both stages of one render add up.
     assert_eq!(rt::required_seeds(10, &[89, 89]), Ok(8192 + 2048));
-    assert_eq!(rt::required_seeds(10, &[791, 89]), Err(E2BIG));
+    assert_eq!(rt::required_seeds(10, &[791, 89]), Ok(17408));
+    assert_eq!(rt::required_seeds(10, &[989, 989]), Ok(28672));
+    // The largest pool: 63 2-MiB rows, whose 126 MiB and 252-KiB freelist fill a 128 MiB window
+    // (64 rows and their freelist would not).
+    assert_eq!(rt::MAX_SCS_SEEDS, 63 * 512);
+    assert!(rt::window_bytes(rt::MAX_SCS_SEEDS) <= hw::client::SCS_POOL_WINDOW);
+    assert!(rt::window_bytes(rt::MAX_SCS_SEEDS + 512) > hw::client::SCS_POOL_WINDOW);
+    assert_eq!(rt::required_seeds(10, &[2388]), Ok(32256));
+    assert_eq!(rt::required_seeds(10, &[2389]), Err(E2BIG));
+    assert_eq!(rt::required_seeds(10, &[1190, 1190]), Ok(32256));
+    assert_eq!(rt::required_seeds(10, &[1191, 1190]), Err(E2BIG));
     // Extremes: refused, never wrapped (overflow checks are on).
     assert_eq!(rt::required_seeds(u32::MAX, &[u16::MAX, u16::MAX]), Err(E2BIG));
     assert_eq!(rt::required_seeds(u32::MAX, &[u16::MAX; 64]), Err(E2BIG));
@@ -337,7 +365,7 @@ fn scs_sizing_is_the_m4_pro_formula_in_whole_rows() {
     for cores in 1..=10 { for pages in [89u16, 200, 500, 791, 1000] {
         if let Ok(seeds) = rt::required_seeds(cores, &[pages]) {
             assert_eq!(seeds % rt::SEEDS_PER_ROW, 0);
-            assert!(u64::from(seeds) >= 8192 + rt::extra_pages(cores, pages).unwrap() && seeds <= rt::SCS_SEEDS);
+            assert!(u64::from(seeds) >= 8192 + rt::extra_pages(cores, pages).unwrap() && seeds <= rt::MAX_SCS_SEEDS);
         }
     }}
 }
@@ -346,43 +374,94 @@ fn scs_sizing_is_the_m4_pro_formula_in_whole_rows() {
 fn ray_and_as_build_admission() {
     let vm = mmu::Vm { mapped: vec![(POOL, POOL + 0x4000), (0x10010020000, 0x10010020040)] };
     let context = Context { vm: &vm, usc_base: 0, active_cores: 10, render_scs: [791, 0] };
-    assert_eq!(check_compute_ray(&context, &ray(LAYOUTS[0].0)), Ok(()));
-    assert_eq!(check_compute_ray(&context, &ray(LAYOUTS[1].0)), Err(E2BIG));
+    // Admission returns the freelist entries the command's pool needs.
+    assert_eq!(check_compute_ray(&context, &ray(LAYOUTS[0].0)), Ok(16384));
+    assert_eq!(check_compute_ray(&context, &ray(LAYOUTS[1].0)), Ok(16896));
+    // 4 KiB of driver bytes per thread: 3833 pages per core, more than a window holds.
+    let huge = 0x1000_0000_6000_0070;
+    assert_eq!(rt::ScratchRequest::new(huge).unwrap().pages(), 3833);
+    assert_eq!(check_compute_ray(&context, &ray(huge)), Err(E2BIG));
     let unmapped = mmu::Vm { mapped: vec![(POOL, POOL + 0x3000), (0x10010020000, 0x10010020040)] };
     let narrow = Context { vm: &unmapped, ..context };
     assert_eq!(check_compute_ray(&narrow, &ray(LAYOUTS[0].0)), Err(ENOENT));
     let no_program = mmu::Vm { mapped: vec![(POOL, POOL + 0x4000)] };
     assert_eq!(check_compute_ray(&Context { vm: &no_program, ..context }, &ray(LAYOUTS[0].0)), Err(ENOENT));
     let tables_only = rt::ComputeRay::new(0, 0, 0, POOL, 0x4000, 1, 112, 0, 0).unwrap();
-    assert_eq!(check_compute_ray(&Context { vm: &no_program, ..context }, &tables_only), Ok(()));
+    assert_eq!(check_compute_ray(&Context { vm: &no_program, ..context }, &tables_only), Ok(0));
     // Renders: within the queue's reservation, either stage; beyond it EINVAL.
     let none = rt::RayQueryStage::NONE;
     let small = stage(1 << 32 | 0x6000_0000);
-    assert_eq!(check_render_ray(&context, &[stage(LAYOUTS[0].0), none]), Ok(()));
-    assert_eq!(check_render_ray(&context, &[none, small]), Ok(()));
+    assert_eq!(check_render_ray(&context, &[stage(LAYOUTS[0].0), none]), Ok(16384));
+    assert_eq!(check_render_ray(&context, &[none, small]), Ok(9216));
     assert_eq!(check_render_ray(&Context { render_scs: [0, 0], ..context }, &[none, small]), Err(EINVAL));
-    assert_eq!(check_render_ray(&Context { render_scs: [89, 89], ..context }, &[small, small]), Ok(()));
-    assert_eq!(check_render_ray(&context, &[stage(LAYOUTS[1].0), none]), Err(E2BIG));
+    assert_eq!(check_render_ray(&Context { render_scs: [89, 89], ..context }, &[small, small]), Ok(10240));
+    assert_eq!(check_render_ray(&context, &[stage(LAYOUTS[1].0), none]), Err(EINVAL));
+    assert_eq!(check_render_ray(&Context { render_scs: [3833, 0], ..context }, &[stage(huge), none]), Err(E2BIG));
     assert_eq!(check_render_ray(&Context { vm: &unmapped, ..context }, &[stage(LAYOUTS[0].0), none]), Err(ENOENT));
-    assert_eq!(check_render_ray(&Context { render_scs: [0, 0], ..context }, &[none, none]), Ok(()));
+    assert_eq!(check_render_ray(&Context { render_scs: [0, 0], ..context }, &[none, none]), Ok(0));
     // Flags: AS_BUILD alone.
     assert_eq!(rt::as_build(0), Some(false)); assert_eq!(rt::as_build(4), Some(true));
     for flag in [1, 2, 8, 1 << 16, 1 << 17, 1 << 20, 5, 6] { assert_eq!(rt::as_build(flag), None); }
 }
 
+// The commands Mesa's G16G ray-query path (ASAHI_MESA_DEBUG=g16grt, mesa 3ff3d359) submits on a
+// 10-core M4: hk_gen1_ray_query_scs_layout() is 0x0130000060010070 with the candidate profile,
+// the intersection pool is one 16-KiB IFT (first 1, count 112), the default program
+// 0x10010020000 with control 0x16000000000. dEQP-VK.ray_query.* compute, chit/ahit and
+// dynamic-indexing cases submit the compute shape; .vert/.frag/.tesc cases reserve the render
+// stage at QUEUE_CREATE (hk_queue_ensure_drm) and submit a render with it. Before SCS pools were
+// sized from the request, every one of them was refused with E2BIG, which Mesa reports as
+// VK_ERROR_DEVICE_LOST at vkQueueSubmit.
+#[test]
+fn mesa_g16grt_ray_query_commands_are_admitted() {
+    let mesa = LAYOUTS[2].0;
+    let vm = mmu::Vm { mapped: vec![(POOL, POOL + 0x4000), (0x10010020000, 0x10010020040)] };
+    let pages = rt::ScratchRequest::new(mesa).unwrap().pages();
+    assert_eq!(pages, 989);
+    // QUEUE_CREATE render_scs_layout: the vertex stage, the fragment stage, or both. The VM's
+    // SCS render pools a queue creates hold both stages, so a queue Mesa replaces to add the
+    // other stage still fits them.
+    for reservation in [[pages, 0], [0, pages], [pages, pages]] {
+        assert!(rt::required_seeds(10, &reservation).is_ok(), "QUEUE_CREATE {reservation:?}");
+        assert_eq!(rt::render_pool_seeds(10, reservation), Ok(28672), "{reservation:?}");
+    }
+    // A single stage too large to double is sized as reserved; one that does not fit at all
+    // is refused at QUEUE_CREATE.
+    assert_eq!(rt::render_pool_seeds(10, [2000, 0]), rt::required_seeds(10, &[2000]));
+    assert_eq!(rt::render_pool_seeds(10, [2389, 0]), Err(E2BIG));
+    assert_eq!(rt::render_pool_seeds(10, [0, 0]), Ok(8192));
+    let context = Context { vm: &vm, usc_base: 0, active_cores: 10, render_scs: [pages, pages] };
+    assert_eq!(check_compute_ray(&context, &ray(mesa)), Ok(18432));
+    let none = rt::RayQueryStage::NONE;
+    for (stages, seeds) in [([stage(mesa), none], 18432), ([none, stage(mesa)], 18432), ([stage(mesa), stage(mesa)], 28672)] {
+        assert_eq!(check_render_ray(&context, &stages), Ok(seeds));
+        assert!(seeds <= rt::render_pool_seeds(10, [pages, 0]).unwrap());
+    }
+    // Their pools fit an SCS window, freelist included.
+    assert_eq!((rt::freelist_records(18432), rt::freelist_records(28672)), (18432, 28672));
+    assert!(rt::window_bytes(28672) <= hw::client::SCS_POOL_WINDOW);
+}
+
 #[test]
 fn long_allowance_follows_g17_select_per_job() {
-    let render = |stages: [rt::RayQueryStage; 2]| Command::Render(Box::new(RenderCommand { ray_query: stages }));
-    let compute = |ray: rt::ComputeRay, as_build: bool| Command::Compute(Box::new(ComputeCommand { ray, as_build }));
+    let render = |stages: [rt::RayQueryStage; 2]| Command::Render(Box::new(RenderCommand { ray_query: stages, scs_seeds: 0 }));
+    let compute = |ray: rt::ComputeRay, as_build: bool| Command::Compute(Box::new(ComputeCommand { ray, scs_seeds: 0, as_build }));
     let none = rt::RayQueryStage::NONE;
     assert!(render([stage(LAYOUTS[0].0), none]).long() && render([none, stage(LAYOUTS[0].0)]).long());
-    assert!(!render([none, none]).long() && !render([none, none]).scs());
+    assert!(!render([none, none]).long() && render([none, none]).scs_seeds() == 0);
     assert!(compute(ray(LAYOUTS[0].0), false).long() && compute(rt::ComputeRay::NONE, true).long());
     assert!(!compute(rt::ComputeRay::NONE, false).long());
-    // Scratch alone is not traversal (as on the M4 Pro), but it needs an SCS pool.
+    // Scratch alone is not traversal (as on the M4 Pro), but it needs an SCS pool; tables
+    // alone do not.
     let scratch = rt::ComputeRay::new(LAYOUTS[0].0, 0, 0, 0, 0, 0, 0, 0, 0).unwrap();
-    assert!(!compute(scratch, false).long() && compute(scratch, false).scs());
-    assert!(!compute(rt::ComputeRay::new(0, 0, 0, POOL, 0x4000, 1, 112, 0, 0).unwrap(), false).scs());
+    let vm = mmu::Vm { mapped: vec![(POOL, POOL + 0x4000)] };
+    let context = Context { vm: &vm, usc_base: 0, active_cores: 10, render_scs: [0, 0] };
+    assert!(!compute(scratch, false).long() && check_compute_ray(&context, &scratch) == Ok(16384));
+    let tables = rt::ComputeRay::new(0, 0, 0, POOL, 0x4000, 1, 112, 0, 0).unwrap();
+    assert_eq!(check_compute_ray(&context, &tables), Ok(0));
+    // A command's SCS seeds are what admission recorded.
+    let admitted = Command::Compute(Box::new(ComputeCommand { ray: scratch, scs_seeds: 16384, as_build: false }));
+    assert_eq!((admitted.scs_seeds(), compute(rt::ComputeRay::NONE, false).scs_seeds()), (16384, 0));
     // Deadlines: at least ten seconds for a long job, never re-enabling a disabled one.
     assert_eq!(logic::long_deadline_ms(5000), 10_000);
     assert_eq!(logic::long_deadline_ms(10_000), 10_000);
@@ -418,7 +497,7 @@ with tempfile.TemporaryDirectory(prefix='m4-rust-rt-') as name:
     (staged / 'encode.rs').write_text(encode_source + gates)
     source = harness
     for key, value in {'@FLAT@': str(FLAT), '@ADMISSION@': admission, '@CONVERSION@': conversion,
-                       '@LONG@': long}.items():
+                       '@LONG@': long, '@CLIENT@': client}.items():
         source = source.replace(key, value)
     source = source.replace('#[path = "@BACKEND@/encode.rs"]', '#[path = "' + str(staged / 'encode.rs') + '"]')
     source = source.replace('@BACKEND@', str(BACKEND))
@@ -438,6 +517,6 @@ with tempfile.TemporaryDirectory(prefix='m4-rust-rt-') as name:
     'scope': 'Production rt.rs, recovery/logic.rs and TA/FS/compute encoders, with command.rs admission and '
              'engine.rs conversion copied verbatim; VM spans mocked. No GPU, firmware or Mesa.',
     'source_sha256': {name: hashlib.sha256((BACKEND / name).read_bytes()).hexdigest() for name in
-                      ['rt.rs', 'recovery/logic.rs', 'command.rs', 'engine.rs', 'params.rs', 'encode.rs',
+                      ['rt.rs', 'recovery/logic.rs', 'command.rs', 'engine.rs', 'params.rs', 'encode.rs', 'hw.rs',
                        'encode/compute.rs', 'encode/render.rs']},
 }, indent=2) + '\n')
