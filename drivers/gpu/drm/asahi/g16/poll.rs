@@ -344,7 +344,7 @@ impl Firmware {
         let g = &self.graph.compute;
         dev_err!(
             dev,
-            "G16 {}: oldest flight target {} (engine {}) head {} rec {:?} computes {} renders {}; fw_stamp {}; qstate read {} write {}; qinfo {} {} {} busy {}; notifier stamp {} context {} (vm slot {}); compute pipe read {} completion {} write {}\n",
+            "G16 {}: oldest flight target {} (engine {}) head {} rec {:?} computes {} renders {}; fw_stamp {}; qstate read {} write {}; qinfo {} {} {} busy {} (+0x80 {:#x}); notifier stamp {} context {} (vm slot {}); compute pipe read {} completion {} write {}\n",
             why,
             f.target,
             self.engine.target,
@@ -359,6 +359,7 @@ impl Firmware {
             x32(g.qinfo.r32(0x24)),
             x32(g.qinfo.r32(0x28)),
             x32(g.qinfo.r32(self.init.abi.qinfo().busy)),
+            x32(g.qinfo.r32(0x80)),
             x32(g.notifier.r32(notifier_page::COMPUTE_STAMP)),
             x32(g.notifier.r32(notifier_page::COMPUTE_CONTEXT)),
             f.job.vm.slot,
