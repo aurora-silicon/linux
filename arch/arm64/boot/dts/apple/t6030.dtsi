@@ -1053,6 +1053,33 @@
 			interrupts = <AIC_IRQ 480 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
+		/*
+		 * The sleep's registers in other blocks (the PMGR, the CPU complex, the AON
+		 * watchdog, nub-spmi0..), shared with their drivers. Untested, so disabled: an
+		 * available node also changes the PMP's suspend path (pmp-export registers its
+		 * commit stop when it finds one). The board adds apple,wake-enable.
+		 */
+		t6030_sleep: sleep-controller@3642d4000 {
+			compatible = "apple,t6030-sleep";
+			reg = <0x3 0x642d4000 0x0 0x4>,
+			      <0x3 0x50700000 0x0 0x14000>,
+			      <0x3 0x50724000 0x0 0x100>,
+			      <0x3 0x50734000 0x0 0x10>,
+			      <0x3 0x50780000 0x0 0x40>,
+			      <0x3 0x642b0000 0x0 0x100>,
+			      <0x3 0x64004000 0x0 0x100>,
+			      <0x3 0x64714000 0x0 0x100>,
+			      <0x3 0x64908000 0x0 0x100>,
+			      <0x3 0x642b8008 0x0 0x4>,
+			      <0x3 0x50040000 0x0 0x100>,
+			      <0x3 0x50768000 0x0 0x100>,
+			      <0x3 0x5005c000 0x0 0x4>;
+			reg-names = "commit", "ps", "pwrgate", "cpu-start", "cluster",
+				    "wdt", "wake", "spmi", "spmi-a0", "aon-deadline",
+				    "clk-mux", "cllt", "soc-perf";
+			status = "disabled";
+		};
+
 		nub_spmi: spmi@364714000 {
 			compatible = "apple,t6030-spmi", "apple,t8103-spmi";
 			reg = <0x3 0x64714000 0x0 0x100>;
