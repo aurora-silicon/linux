@@ -116,6 +116,7 @@ struct ane_h16_profile {
 	const char *identity;
 	const struct ane_h16_preload_rule *preload;
 	const struct ane_h16_build *build;
+	bool require_dart_unlocked;
 };
 
 struct ane_h16_boot;
@@ -148,6 +149,7 @@ struct ane_h16_boot_ops {
 struct ane_h16_boot {
 	const struct ane_fw_platform *soc;
 	const struct ane_h16_build *build;
+	bool require_dart_unlocked;
 	/* Chosen from the DART revision in preflight. */
 	const struct ane_h16_mmio *mmio;
 	const struct ane_h16_boot_ops *ops;
@@ -275,6 +277,25 @@ static inline int ane_h16_select_mmio(struct ane_h16_boot *b)
 	return -ENODEV;
 }
 
+/* TTBR/TCR protection is bit 0, separate from the DAPF lock at +0x208. */
+static inline int ane_h16_dart_protection(struct ane_h16_boot *b, bool require_unlocked)
+{
+	unsigned int i;
+	u32 protected = 0;
+
+	if (!b->mmio)
+		return -ENODEV;
+	for (i = 0; i < 3; i++) {
+		u32 value = b->ops->read32(b->ctx, ANE_H16_DART0 + i,
+					 b->mmio->dart_protect);
+
+		b->ops->log(b->ctx, require_unlocked ? "DART map protect" :
+			   "DART preflight protect", i, value);
+		protected |= value & BIT(0);
+	}
+	return require_unlocked && protected ? -EPERM : 0;
+}
+
 static inline int ane_h16_preflight(struct ane_h16_boot *b)
 {
 	const struct ane_h16_build *f = b->build;
@@ -300,6 +321,9 @@ static inline int ane_h16_preflight(struct ane_h16_boot *b)
 	if (control || rvbar != f->expected_rvbar)
 		return -EBUSY;
 	ret = ane_h16_select_mmio(b);
+	if (ret)
+		return ret;
+	ret = ane_h16_dart_protection(b, false);
 	if (ret)
 		return ret;
 	ret = ane_h16_faults(b, true);

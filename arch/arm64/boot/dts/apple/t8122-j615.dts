@@ -30,6 +30,7 @@
 
 &wifi0 {
 	brcm,board-type = "apple,tuzla";
+	wakeup-source;
 };
 
 &bluetooth0 {
@@ -108,6 +109,14 @@
 		ti,imon-slot-no = <20>;
 		ti,vmon-slot-no = <22>;
 	};
+};
+
+/*
+ * The six amps' voltage and current sense words reach the speaker ports one
+ * bit clock later than the I2S format places them.
+ */
+&mca {
+	apple,rx-delay-bclks = <1 1 0 0 0 0>;
 };
 
 / {

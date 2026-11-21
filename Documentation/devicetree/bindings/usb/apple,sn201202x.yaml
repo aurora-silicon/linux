@@ -53,6 +53,13 @@ properties:
       The four-character key that unlocks the controller's debug mode, for
       rearming the debug link after a sleep ended it.
 
+  apple,event-irq-in-sleep:
+    type: boolean
+    description:
+      The controller's event interrupt stays live while the controller
+      sleeps, so it can sleep while its port is idle and still report a
+      port event. A register access wakes it first.
+
   apple,usb-remote-wake:
     type: boolean
     description:
