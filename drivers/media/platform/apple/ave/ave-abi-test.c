@@ -1505,9 +1505,9 @@ static void ave_26b123_layout(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, b->hdr_bytes, a->hdr_bytes);
 	KUNIT_EXPECT_EQ(test, b->max_slots, a->max_slots);
 	KUNIT_EXPECT_EQ(test, b->process_subtype, a->process_subtype);
-	/* Both counted; only the 27.2 build runs sessions without B-frames and at any rate. */
+	/* Both counted, and both run sessions without B-frames and at any rate. */
 	KUNIT_EXPECT_TRUE(test, a->counted && b->counted);
-	KUNIT_EXPECT_FALSE(test, a->any_gop);
+	KUNIT_EXPECT_TRUE(test, a->any_gop);
 	KUNIT_EXPECT_TRUE(test, b->any_gop);
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T8122_26B123), b);
 }
