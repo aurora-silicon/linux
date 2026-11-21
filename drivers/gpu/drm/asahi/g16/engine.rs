@@ -423,6 +423,8 @@ pub(crate) struct Engine {
     pub(crate) ta_registered: bool,
     /// A ready prefix waits only for a record's consumption: repoll sooner.
     pub(crate) chan_wait: bool,
+    /// An EP 0x20 event arrived with a flight still settling its final receipt: repoll sooner.
+    pub(crate) short_repoll: bool,
     /// Progress tracking of the oldest prefix.
     pub(crate) progress_flight: u64,
     pub(crate) progress: [Option<u32>; 3],
@@ -460,6 +462,7 @@ impl Engine {
             render_registered: false,
             ta_registered: false,
             chan_wait: false,
+            short_repoll: false,
             progress_flight: 0,
             progress: [None; 3],
             stats: KBox::new(Stats::default(), GFP_KERNEL)?,

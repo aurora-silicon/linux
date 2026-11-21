@@ -36,8 +36,15 @@ use super::fw::work::compute;
 use super::job::{self, Completions, Job};
 use super::recovery::logic::Retirement;
 use super::regs::EngineState;
-use super::{params, Firmware, Shared, POLL_WORK};
+use super::{params, Firmware, Shared, FAST_POLL_WORK, POLL_WORK};
 use crate::module_parameters;
+
+/// Cadence of periodic housekeeping (power governor, window health, administrative hang check).
+const HOUSEKEEPING_NS: u64 = 1_000_000;
+/// Maximum trailing 5 us receipt polls after an EP 0x20 event (50 us covers firmware WC tails).
+const EVENT_RETIRE_POLLS: u32 = 10;
+/// Minimum interval between 1-jiffy delayed-work safety backup rearms (2 ms).
+const BACKUP_REARM_NS: u64 = 2_000_000;
 
 impl_has_hr_timer! {
     impl HasHrTimer<Self> for Shared {
@@ -51,6 +58,7 @@ impl HrTimerCallback for Shared {
     /// Runs the poll now.
     fn run(this: ArcBorrow<'_, Self>, _ctx: HrTimerCallbackContext<'_, Self>) -> HrTimerRestart {
         let this: Arc<Self> = this.into();
+        this.resnap_deadline_ns.store(0, Ordering::Release);
         this.poll_now();
         HrTimerRestart::NoRestart
     }
@@ -76,13 +84,18 @@ impl Shared {
         let mut done = Completions::new();
         {
             let mut state = self.state.lock();
+            if self.sleeping.load(Ordering::Acquire) {
+                return;
+            }
             if let Some(firmware) = state.as_deref_mut() {
                 if firmware.engine.shared.is_none() {
                     firmware.engine.shared = Some(self.clone());
                 }
                 let evented = self.evented.swap(false, Ordering::AcqRel);
                 match firmware.poll(evented, &mut done) {
-                    Ok(true) => self.rearm(firmware.engine.chan_wait),
+                    Ok(true) => {
+                        self.rearm(firmware.engine.chan_wait || firmware.engine.short_repoll)
+                    }
                     // Idle: one more pass after a window gives the state back. A failed
                     // engine's poll no longer services power, so it has nothing to give back.
                     Ok(false)
@@ -91,10 +104,12 @@ impl Shared {
                     {
                         self.mod_poll(kernel::time::msecs_to_jiffies(
                             (super::power::policy::WINDOW_NS / 1_000_000) as u32,
-                        ))
+                        ));
+                        self.cancel_resnap();
                     }
-                    Ok(false) => {}
+                    Ok(false) => self.cancel_resnap(),
                     Err(error) => {
+                        self.cancel_resnap();
                         firmware.fail_stop(error, &mut done);
                         self.fail_stop(error);
                     }
@@ -106,6 +121,48 @@ impl Shared {
         self.notify_wedged();
     }
 
+    fn submit_locked(
+        self: &Arc<Self>,
+        firmware: &mut Firmware,
+        job: Arc<Job>,
+        done: &mut Completions,
+    ) -> Result {
+        if firmware.engine.shared.is_none() {
+            firmware.engine.shared = Some(self.clone());
+        }
+        let accepted = firmware.enqueue(job);
+        // Nothing is published while a render is in flight: the poll pass after its
+        // retirement publishes this job. Skipping the pass here keeps queued submissions
+        // from holding the device lock (ring drains, health checks) on that path.
+        let render_busy = firmware.engine.flights.iter().any(|f| f.renders != 0);
+        if accepted.is_ok() && !render_busy && !self.sleeping.load(Ordering::Acquire) {
+            let now = now_ns();
+            let full = now.wrapping_sub(firmware.last_housekeeping_ns) >= HOUSEKEEPING_NS
+                || self.evented.load(Ordering::Acquire)
+                || firmware.recovery_pending().unwrap_or(true);
+            let pub_res = if full {
+                let r = firmware.publish(done);
+                if r.is_ok() {
+                    firmware.last_housekeeping_ns = now;
+                }
+                r
+            } else {
+                firmware
+                    .session
+                    .transport()
+                    .and_then(|()| firmware.publish_checked(done))
+            };
+            if let Err(error) = pub_res {
+                firmware.fail_stop(error, done);
+                self.fail_stop(error);
+            }
+            if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
+                self.rearm(firmware.engine.chan_wait);
+            }
+        }
+        accepted
+    }
+
     /// Hands a job to the engine and publishes what can be published. Err: the job was not
     /// accepted (the engine failed: EIO) and the caller fails it; once accepted, its fence is
     /// signalled by the engine, also on failure.
@@ -115,29 +172,33 @@ impl Shared {
         let accepted = {
             let mut state = self.state.lock();
             let firmware = state.as_deref_mut().ok_or(ENODEV)?;
-            if firmware.engine.shared.is_none() {
-                firmware.engine.shared = Some(self.clone());
-            }
-            let accepted = firmware.enqueue(job);
-            // Nothing is published while a render is in flight: the poll pass after its
-            // retirement publishes this job. Skipping the pass here keeps queued submissions
-            // from holding the device lock (ring drains, health checks) on that path.
-            let render_busy = firmware.engine.flights.iter().any(|f| f.renders != 0);
-            if accepted.is_ok() && !render_busy {
-                if let Err(error) = firmware.publish(&mut done) {
-                    firmware.fail_stop(error, &mut done);
-                    self.fail_stop(error);
-                }
-                if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
-                    self.rearm(firmware.engine.chan_wait);
-                }
-            }
-            accepted
+            self.submit_locked(firmware, job, &mut done)
         };
         job::complete_all(done);
         drop(signalling);
         self.notify_wedged();
         accepted
+    }
+
+    /// Non-blocking variant of [`Self::submit`] for inline SUBMIT ioctl publication: returns
+    /// `None` without sleeping when `Shared::state` is contended so `drm_sched` publishes instead.
+    pub(crate) fn try_submit_inline(self: &Arc<Self>, job: Arc<Job>) -> Option<Result> {
+        let signalling = kernel::dma_fence::SignallingGuard::new();
+        let mut done = Completions::new();
+        let accepted = {
+            let mut state = self.state.try_lock()?;
+            if self.sleeping.load(Ordering::Acquire) {
+                return None;
+            }
+            match state.as_deref_mut() {
+                Some(firmware) => self.submit_locked(firmware, job, &mut done),
+                None => Err(ENODEV),
+            }
+        };
+        job::complete_all(done);
+        drop(signalling);
+        self.notify_wedged();
+        Some(accepted)
     }
 
     /// Deliver userspace notification outside the device mutex and fence completion path.
@@ -154,12 +215,25 @@ impl Shared {
         }
     }
 
-    /// Queues the poll work now, or brings a pending one forward. Callable from any context.
+    /// Queues the fast poll work immediately on the submitting CPU. Callable from any context.
     pub(crate) fn poll_now(self: &Arc<Self>) {
-        self.mod_poll(0);
+        let _ = match self.submitter_cpu() {
+            Some(cpu) => self
+                .events
+                .enqueue_on::<Arc<Shared>, FAST_POLL_WORK>(cpu, self.clone()),
+            None => self
+                .events
+                .enqueue::<Arc<Shared>, FAST_POLL_WORK>(self.clone()),
+        };
     }
 
-    /// Queues the poll on `system_highpri_wq` after `delay` jiffies, or moves an already
+    /// Disarms the completion hrtimer when idle or entering system sleep.
+    pub(crate) fn cancel_resnap(&self) {
+        self.resnap_deadline_ns.store(0, Ordering::Release);
+        drop(self.resnap_handle.lock().take());
+    }
+
+    /// Queues the backup poll on `system_highpri_wq` after `delay` jiffies, or moves an already
     /// pending one to that expiry.
     fn mod_poll(self: &Arc<Self>, delay: Jiffies) {
         // SAFETY: The closure returns false only when `mod_delayed_work_on` found the work
@@ -178,21 +252,28 @@ impl Shared {
         };
     }
 
-    /// Re-checks a published command soon: hrtimer, with a one-jiffy backup; sooner while a
-    /// ready prefix waits for a channel record's consumption.
-    pub(crate) fn rearm(self: &Arc<Self>, chan_wait: bool) {
+    /// Re-checks a published command soon: hrtimer, with a throttled 1-jiffy backup; sooner while
+    /// a ready prefix waits for record consumption or a post-event receipt tail is settling.
+    pub(crate) fn rearm(self: &Arc<Self>, soon: bool) {
         let mut us = params::resnap_us();
-        if chan_wait && module_parameters::g16_repoll_us.value() != 0 {
+        if soon && module_parameters::g16_repoll_us.value() != 0 {
             us = params::repoll_us();
         }
-        {
+        let now = now_ns();
+        let target_ns = now.saturating_add(u64::from(us) * 1000);
+        let armed_ns = self.resnap_deadline_ns.load(Ordering::Acquire);
+        if armed_ns == 0 || armed_ns <= now || target_ns.saturating_add(5_000) < armed_ns {
             let mut handle = self.resnap_handle.lock();
-            // Dropping the previous handle cancels a still pending expiry before the timer
-            // is started again.
             drop(handle.take());
+            self.resnap_deadline_ns.store(target_ns, Ordering::Release);
             *handle = Some(self.clone().start(Delta::from_micros(i64::from(us))));
         }
-        self.mod_poll(1);
+        let backup_ns = self.backup_deadline_ns.load(Ordering::Acquire);
+        if now >= backup_ns {
+            self.backup_deadline_ns
+                .store(now.saturating_add(BACKUP_REARM_NS), Ordering::Release);
+            self.mod_poll(1);
+        }
     }
 
     /// Starts what the engine needs besides the firmware state: the `aurora-g16/stats` file.
@@ -228,9 +309,17 @@ impl Firmware {
         if self.recovery.failed().is_some() {
             return Ok(false);
         }
-        self.session.check()?;
-        self.objects.health()?;
-        self.service_power()?;
+        self.engine.short_repoll = false;
+        self.session.transport()?;
+        let now = now_ns();
+        let housekeeping = self.engine.flights.is_empty()
+            || now.wrapping_sub(self.last_housekeeping_ns) >= HOUSEKEEPING_NS;
+        if housekeeping {
+            self.session.check()?;
+            self.objects.health()?;
+            self.service_power()?;
+            self.last_housekeeping_ns = now;
+        }
         // With nothing published only a pending firmware recovery notification needs this
         // pass: one that arrived after its prefix's receipts is answered
         // here (the firmware halted and waits for the resume) instead of being taken for a
@@ -248,10 +337,14 @@ impl Firmware {
         self.retire(evented, done)?;
         lap.lap(&mut self.engine.prof.retire_ns);
         self.answer_growth()?;
-        self.check_hangs(done)?;
-        let published = self
-            .service_power()
-            .and_then(|()| self.publish_checked(done));
+        if housekeeping || self.recovery.receipt_fault || self.recovery_pending()? {
+            self.check_hangs(done)?;
+        }
+        let published = if self.engine.pending.is_empty() {
+            Ok(())
+        } else {
+            self.publish_checked(done)
+        };
         let s = &mut self.engine.stats;
         if self.engine.flights.is_empty() && s.idle_from_ns != 0 {
             // Idle with nothing ready is not a gap: the clients are late.
@@ -263,18 +356,22 @@ impl Firmware {
             self.engine.prof.poll_ns += now_ns().wrapping_sub(start);
         }
         published?;
+        // If an EP 0x20 event arrived and a flight still did not finish its final receipt
+        // within the trailing spin, repoll at `repoll_us` instead of sleeping `resnap_us`.
+        self.engine.short_repoll = evented && !self.engine.flights.is_empty();
         Ok(!self.engine.flights.is_empty()
             || self.engine.chan_wait
             || self.recovery.needs_repoll()
             || self.engine.frozen)
     }
 
-    /// Drains the rings and retires finished flights, with up to four trailing 5 us polls
-    /// after an event. A receipt fault is left in `Recovery::receipt_fault` for the hang
-    /// checks.
+    /// Drains the rings and retires finished flights, with up to [`EVENT_RETIRE_POLLS`]
+    /// trailing 5 us polls after an event. A receipt fault is left in
+    /// `Recovery::receipt_fault` for the hang checks.
     pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result {
-        // After an event, a few short trailing polls catch the final receipts.
-        let mut tail = if evented { 4 } else { 0 };
+        // After an event, short trailing polls catch firmware's final WC receipt writes
+        // before falling back to a timer repoll.
+        let mut tail = if evented { EVENT_RETIRE_POLLS } else { 0 };
         let mut ret;
 
         loop {
@@ -282,7 +379,9 @@ impl Firmware {
             self.drain_rings()?;
             lap.lap(&mut self.engine.prof.drain_ns);
             // Recovery may force stage progress: authenticate it before any receipt.
-            self.check_hangs(done)?;
+            if self.recovery.receipt_fault || self.recovery_pending()? {
+                self.check_hangs(done)?;
+            }
             ret = self.retired();
             while let Ok(receipt) = ret {
                 if !receipt.complete() {

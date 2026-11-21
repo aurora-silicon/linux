@@ -232,10 +232,45 @@ impl Job {
         self.fence.signal(result);
     }
 
+    /// Whether this job has already been handed to the engine (inline or by drm_sched).
+    pub(crate) fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    /// Attempts to submit a ready job directly from SUBMIT ioctl context without waiting for
+    /// the drm_sched worker wakeup. Only runs when all input fences are already signalled,
+    /// the device and VM are healthy, and `Shared::state` is uncontended (`try_lock`); on
+    /// contention or pending dependencies it returns without setting `started` so drm_sched
+    /// runs the job in queue order.
+    pub(crate) fn try_start_inline(self: &Arc<Self>, shared: &Arc<Shared>) {
+        if shared.crashed.load(Ordering::Acquire)
+            || shared.sleeping.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+        {
+            return;
+        }
+        if let Some(order) = self.orders.first() {
+            if self.queue.check(order).is_err() {
+                return;
+            }
+        }
+        if super::fence::check_dependencies(&self.inputs).is_err() {
+            return;
+        }
+        if let Some(result) = shared.try_submit_inline(self.clone()) {
+            self.started.store(true, Ordering::Release);
+            if let Err(error) = result {
+                self.finish(Err(if error == ENODEV { EIO } else { error }), false);
+            }
+        }
+    }
+
     /// Hands the job to the engine, or refuses a failed GPU or VM. A queued
     /// job may have been accepted before another command made its VM sticky.
     fn start(self: &Arc<Self>, shared: &Arc<Shared>) {
-        self.started.store(true, Ordering::Release);
+        if self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if shared.crashed.load(Ordering::Acquire) {
             self.finish(Err(EIO), false);
             return;
@@ -474,6 +509,9 @@ pub(crate) struct Scheduler {
     // drains), and only then the scheduler is finalized.
     entity: sched::Entity<SchedJob>,
     _scheduler: sched::Scheduler<SchedJob>,
+    /// Most recently accepted job of this queue; an inline submit is permitted only once
+    /// this predecessor has already started so queue-local ordering is strictly preserved.
+    last_job: Option<Arc<Job>>,
 }
 
 impl Scheduler {
@@ -491,19 +529,26 @@ impl Scheduler {
         Ok(Self {
             entity,
             _scheduler: scheduler,
+            last_job: None,
         })
     }
 
     /// Pushes a job that waits for its retained inputs. On failure the job is cancelled (not counted as
     /// submitted work of its VM) and the error is returned.
     pub(crate) fn push(&mut self, job: Arc<Job>, shared: Arc<Shared>) -> Result {
+        shared.note_submitter();
+        let prev_started = self.last_job.as_ref().is_none_or(|prev| prev.is_started());
         let handle = job.clone();
-        let mut pending = self.entity.new_job(1, SchedJob { job, shared })?;
+        let mut pending = self.entity.new_job(1, SchedJob { job, shared: shared.clone() })?;
         for fence in handle.inputs.iter() {
             pending.add_dependency(fence.clone())?;
         }
         let armed = pending.arm();
         handle.accepted.store(true, Ordering::Release);
+        if prev_started {
+            handle.try_start_inline(&shared);
+        }
+        self.last_job = Some(handle);
         armed.push();
         Ok(())
     }

@@ -81,12 +81,12 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64,
 use kernel::{
     c_str,
     device::{self, Core},
-    impl_has_delayed_work, new_delayed_work, new_mutex, of, platform,
+    impl_has_delayed_work, impl_has_work, new_delayed_work, new_mutex, new_work, of, platform,
     prelude::*,
     sync::{aref::ARef, Arc, Mutex},
     time::hrtimer::{ArcHrTimerHandle, HrTimer},
     uapi,
-    workqueue::{DelayedWork, WorkItem},
+    workqueue::{DelayedWork, OwnedQueue, Work, WorkItem},
 };
 
 use crate::driver::{AsahiDrmDevice, AsahiPlatformDriver};
@@ -187,8 +187,10 @@ impl platform::Driver for Driver {
     }
 }
 
-/// Work item ID of the poll work.
+/// Work item ID of the backup delayed poll work.
 const POLL_WORK: u64 = 0;
+/// Work item ID of the submitter-pinned fast event poll work.
+const FAST_POLL_WORK: u64 = 1;
 
 /// Device state shared with the RTKit callbacks and the poll work.
 #[pin_data]
@@ -204,6 +206,12 @@ pub(crate) struct Shared {
     pub(crate) crashed: AtomicBool,
     /// Set by the firmware's EP 0x20 event message; consumed by the poll work.
     pub(crate) evented: AtomicBool,
+    /// CPU that last submitted work, for placing the per-CPU completion worker.
+    pub(crate) submitter: AtomicU32,
+    /// Next armed hrtimer expiry (monotonic ns, 0 when disarmed).
+    pub(crate) resnap_deadline_ns: AtomicU64,
+    /// Next 1-jiffy backup delayed-work schedule bound (monotonic ns).
+    pub(crate) backup_deadline_ns: AtomicU64,
     // --- RTKit callback state and a retained failed session. ---
     /// The first latched error, as a negative errno.
     pub(crate) error: AtomicI32,
@@ -222,10 +230,14 @@ pub(crate) struct Shared {
     sleep_ps: AtomicU32,
     /// The stop left to a system sleep's commit, until `.complete` finishes it.
     sleep_commit: AtomicPtr<core::ffi::c_void>,
+    /// Dedicated high-priority per-CPU workqueue for immediate completion polling.
+    pub(crate) events: OwnedQueue,
     #[pin]
     pub(crate) orphan: Mutex<Option<KBox<boot::Orphan>>>,
     #[pin]
     pub(crate) poll: DelayedWork<Shared, POLL_WORK>,
+    #[pin]
+    pub(crate) fast_poll: Work<Shared, FAST_POLL_WORK>,
     // --- The completion/repoll hrtimer and the handle of its current expiry (dropping it
     // cancels the expiry; see `Shared::rearm`). ---
     #[pin]
@@ -241,6 +253,10 @@ impl_has_delayed_work! {
     impl HasDelayedWork<Shared, POLL_WORK> for Shared { self.poll }
 }
 
+impl_has_work! {
+    impl HasWork<Shared, FAST_POLL_WORK> for Shared { self.fast_poll }
+}
+
 impl WorkItem<POLL_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
@@ -252,12 +268,32 @@ impl WorkItem<POLL_WORK> for Shared {
     }
 }
 
+impl WorkItem<FAST_POLL_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        if this.orphaned.load(Ordering::Acquire) {
+            this.drain_orphan();
+            return;
+        }
+        this.run_poll();
+    }
+}
+
 impl Shared {
+    /// Records the submitting CPU so completion work runs on the same core.
+    pub(crate) fn note_submitter(&self) {
+        self.submitter
+            .store(kernel::cpu::CpuId::current().as_u32(), Ordering::Relaxed);
+    }
+
+    /// Last recorded submitting CPU, if valid.
+    pub(crate) fn submitter_cpu(&self) -> Option<kernel::cpu::CpuId> {
+        kernel::cpu::CpuId::from_u32(self.submitter.load(Ordering::Relaxed))
+    }
+
     /// Queues the poll work immediately. Callable from any context.
     pub(crate) fn kick(self: &Arc<Self>) {
         self.evented.store(true, Ordering::Release);
-        // `mod_delayed_work(.., 0)` so that a kick also runs a poll whose 1-jiffy backup is
-        // pending (a plain enqueue is refused then).
         self.poll_now();
     }
 
@@ -355,6 +391,8 @@ pub(crate) struct Firmware {
     pub(crate) pools: pools::Pools,
     /// Live VMs and their exclusive TTBAT slots, and the client aliases of every user VM.
     pub(crate) vms: Arc<vm::Registry>,
+    /// Monotonic timestamp (ns) of the last full housekeeping pass (power, health, hang poll).
+    pub(crate) last_housekeeping_ns: u64,
 }
 
 /// A G16 GPU.
@@ -390,6 +428,7 @@ impl Gpu {
         // pin_init exposes initialized fields by name, so `dev` is shadowed after
         // the platform-device field. Retain the typed DRM device before that point.
         let drm_device: ARef<AsahiDrmDevice> = dev.into();
+        let events = OwnedQueue::new_percpu_reclaim(c_str!("aurora_g16_events"), true)?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 dev: dev.as_ref().as_ref().into(),
@@ -398,6 +437,9 @@ impl Gpu {
                 wedged_notified: AtomicBool::new(false),
                 crashed: AtomicBool::new(false),
                 evented: AtomicBool::new(false),
+                submitter: AtomicU32::new(u32::MAX),
+                resnap_deadline_ns: AtomicU64::new(0),
+                backup_deadline_ns: AtomicU64::new(0),
                 error: AtomicI32::new(0),
                 started: AtomicBool::new(false),
                 data,
@@ -406,8 +448,10 @@ impl Gpu {
                 sleeping: AtomicBool::new(false),
                 sleep_ps: AtomicU32::new(0),
                 sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
+                events,
                 orphan <- new_mutex!(None, "g16::Shared::orphan"),
                 poll <- new_delayed_work!("g16::Shared::poll"),
+                fast_poll <- new_work!("g16::Shared::fast_poll"),
                 resnap <- HrTimer::new(),
                 resnap_handle <- new_mutex!(None, "g16::Shared::resnap_handle"),
                 state <- new_mutex!(None, "g16::Shared::state"),
@@ -527,6 +571,7 @@ impl Firmware {
                 power,
                 pools,
                 vms,
+                last_housekeeping_ns: 0,
             },
         );
         if let Err(e) = firmware.init_graphs() {
