@@ -9976,15 +9976,28 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 		 * "HPD is 0 link_status is 0" (10 Nov). No display sleep transition after the
 		 * power-off either.
 		 */
+		/*
+		 * The firmware's D572(0) after the power-off says it is done with the display, and
+		 * dcp_s2r_dart_power() turns the display DART's streams off right there, as macOS
+		 * does. Turned off while the pipe still scanned out, they crashed the firmware
+		 * (axi_rd_err, 11 Nov).
+		 */
+		reinit_completion(&dcp->s2r_dart_done);
+		WRITE_ONCE(dcp->s2r_active, true);
 		_dcp_poweroff(dcp);
+		idle = wait_for_completion_timeout(&dcp->s2r_dart_done,
+						   msecs_to_jiffies(DCP_S2R_D572_TIMEOUT_MS));
+		WRITE_ONCE(dcp->s2r_active, false);
+		/* D572 itself is still being answered, and a busy channel can't be sent on. */
+		usleep_range(5000, 6000);
+		if (!idle) {
+			dev_warn(dev, "no D572 after the power-off\n");
+			if (dcp->s2r_disp_dart)
+				apple_dart_display_streams(dcp->s2r_disp_dart,
+							   DCP_S2R_DISP_STREAMS, false, false);
+		}
 		if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp))
 			dev_warn(dev, "display calls still in flight after the power-off\n");
-		msleep(100);
-		/* The firmware's D572(0), only answered here: its display DART streams off now. */
-		if (dcp->s2r_disp_dart)
-			apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS,
-						   false, false);
-		usleep_range(5000, 6000);
 	}
 	iomfb_s2r_500_v26_6_desktop(dcp);
 	usleep_range(4000, 5000);
@@ -10019,7 +10032,6 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 	apple_rtkit_mailbox_off(dcp->rtk);
 	dcp_s2r_cpu_stop(dcp);
 	dcp_s2r_stop_streams(dcp);
-	msleep(20);
 
 	return 0;
 }
@@ -10133,10 +10145,13 @@ static void dcp_t6041_word_try(const char *name, u32 slice, unsigned long cpu, u
 	if (val & BIT(28))
 		writel(val & ~(BIT(28) | GENMASK(9, 8)), rsys);
 	writel((readl(rsys) & ~GENMASK(3, 0)) | GENMASK(9, 8), rsys);
-	msleep(50);
+	/*
+	 * SYS reports its state once the domains under it are down; macOS polls it for up to 50 ms
+	 * here. The internal one must also not have latched PARENT_OFF (bit 11), see above.
+	 */
+	if (readl_poll_timeout(rsys, cur, !(cur & (rfab ? 0xf0 | BIT(11) : 0xf0)), 50, 100000))
+		pr_warn("dcp %s: sys still %#x\n", name, cur);
 	if (rfab) {
-		if (readl_poll_timeout(rsys, cur, !(cur & (0xf0 | BIT(11))), 50, 50000))
-			pr_warn("dcp %s: sys still %#x with fab6_soc held\n", name, cur);
 		/* Back to automatic, as it was; the flag bits are write-one-to-clear, left alone. */
 		writel((readl(rfab) & ~(GENMASK(9, 8) | BIT(28))) | (fab & BIT(28)), rfab);
 		msleep(5);

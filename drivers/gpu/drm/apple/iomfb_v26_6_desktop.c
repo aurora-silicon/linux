@@ -54,6 +54,21 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 #include "iomfb_template.c"
 
 /*
+ * D572: 0 when the firmware is done with the display, 1 when it wants it back. Only a
+ * sleep path waiting for it (s2r_active) acts on it; the firmware takes a zero status.
+ */
+static bool trampoline_dart_power_v26_6_desktop(struct apple_dcp *dcp, int tag, void *out,
+						void *in)
+{
+	const struct dcp_packet_header *header = in - sizeof(*header);
+
+	if (header->in_len >= sizeof(u32))
+		dcp_s2r_dart_power(dcp, get_unaligned_le32(in));
+
+	return trampoline_zero(dcp, tag, out, in);
+}
+
+/*
  * D114 periodically publishes dictionary-valued statistics: the analytics
  * event, answered by dcp_dict_passthrough_reply().
  */
@@ -230,7 +245,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[565] = trampoline_true, /* set_property_bool */
 	[567] = trampoline_true, /* set_property_str */
 	/* a zero status for both its start and stop events */
-	[572] = trampoline_zero,
+	[572] = trampoline_dart_power_v26_6_desktop,
 	[575] = trampoline_hotplug,
 	[576] = trampoline_nop,
 	[581] = trampoline_nop,
