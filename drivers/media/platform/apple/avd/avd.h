@@ -34,16 +34,31 @@
 #define AVD_CAPABILITY_VP9	BIT(2)
 #define AVD_CAPABILITY_AV1	BIT(3)
 
-/* Shifts addreses right and bytesperline?? */
+/*
+ * Shifted addressing of the first decoders (T8103, T6000, T8112): every
+ * address in the instruction stream is one word in 256-byte units (addr >> 8),
+ * a compressed-plane address one word in 128-byte units (addr >> 7), the
+ * instruction FIFO base one register (addr >> 8, no IOVA_HI), and
+ * a plane pitch is in 16-byte units (bytesperline >> 4). Later decoders take
+ * byte addresses as two words and byte pitches.
+ */
 #define AVD_QUIRK_LSR	BIT(0)
+/*
+ * The decoder takes no pipe state buffer (T8103, T6000): the frame header
+ * carries no pipe_state address, its PIPE_STATE op flag and H.264/HEVC
+ * PIPE_STATE_EN feature field stay clear, and H.264 and VP9 allocate no
+ * pipe_state buffer.
+ */
 #define AVD_QUIRK_NO_PIPE_STATE	 BIT(1)
 /* HEVC DMA configuration and extended scratch-address table. */
 #define AVD_QUIRK_HEVC_V5_HEADER	BIT(2)
-/* T8140: pace only HEVC submissions, with a shorter back-off. */
-#define AVD_QUIRK_V5_QUEUE_PACING	BIT(3)
 /* H.264 co-located motion vectors take 128 bytes per macroblock, not 64. */
 #define AVD_QUIRK_H264_MV_128	BIT(4)
-/* A reset after a timeout hangs the machine: stay parked and retire the decoder */
+/*
+ * A reset after a timeout hangs the machine: stay parked and retire the
+ * decoder. Cause unknown, see avd_pm_recover() and
+ * https://github.com/aurora-silicon/linux/issues/2450.
+ */
 #define AVD_QUIRK_NO_RECOVERY_RESET BIT(5)
 
 #define VP_SLOT_NONE		255
