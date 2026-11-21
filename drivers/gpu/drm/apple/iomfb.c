@@ -3593,6 +3593,22 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (crtc_state->mode.hdisplay == 0 && crtc_state->mode.vdisplay == 0)
 		return 0;
 
+	/*
+	 * The DCP of an HDMI output plugs the display in only some time after
+	 * its link came up (dcp_poweron() connects it): a second or more after
+	 * a system resume, as the converter and the display wake up. A mode set
+	 * before that fails in the firmware ("setmode failed", the pipe not
+	 * enabled) after a 200 ms wait. Leave the mode unset instead: the
+	 * hotplug that connects the display finds the mode invalid with the
+	 * CRTC active, and sets it again (dcp_hotplug()).
+	 */
+	if (dcp->hdmi_hpd && !dcp_is_typec_output(dcp) && dcp->connector &&
+	    !READ_ONCE(dcp->connector->connected)) {
+		dev_dbg(dcp->dev, "HDMI display not plugged in yet: mode set deferred to its hotplug\n");
+		dcp_mode_set_valid(&dcp->mode_state, false);
+		return -EAGAIN;
+	}
+
 	dcp->pq_requested = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084;
 	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp) &&
 			  dcp_crtc_bt2020(dcp, crtc, commit);
