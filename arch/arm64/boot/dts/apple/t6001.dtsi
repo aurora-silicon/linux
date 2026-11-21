@@ -170,4 +170,25 @@
 &ave {
 	status = "okay";
 };
+
+/*
+ * Both ProRes codecs are the same APR a0 block as the M1 Pro's APR0
+ * (compatible apple,t6000-prores, same DART and SCODEC/PRORES power
+ * domains), so they are enabled wherever the SoC has them.
+ */
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
+&apr1_dart {
+	status = "okay";
+};
+
+&apr1 {
+	status = "okay";
+};
 #endif
