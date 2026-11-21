@@ -151,7 +151,7 @@
  * The port controllers' system power state (SSPS 3 before the commit, 0 at the wake), as
  * macOS's AppleHPM sends it on the J700 and J714s, measured there on the same SN201202x;
  * not traced on an M5 Air. Only a firmware-driven sleep sends it, and a controller that
- * does not take S3 refuses the sleep (tipd sleep_s3_refuse).
+ * does not take S3 refuses the sleep (tipd's cd321x_prepare()).
  */
 &hpm0 {
 	apple,sleep-ssps;

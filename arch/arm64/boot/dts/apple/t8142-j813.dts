@@ -405,3 +405,62 @@
 			      "shared-l2", "gfx-data", "gfx1-data", "fw-data",
 			      "fw-text";
 };
+
+/* Touch ID uses SPI2, with power on NUB GPIO 36 and data ready on AP GPIO 200. */
+&pmgr {
+	ps_spi2: power-controller@440 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x440 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_spi_p>;
+		label = "spi2";
+	};
+};
+
+&{/soc} {
+	spi2: spi@3a5108000 {
+		compatible = "apple,t8142-spi", "apple,t8103-spi";
+		reg = <0x3 0xa5108000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1241 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
+		power-domains = <&ps_spi2>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "okay";
+
+		mesa: fingerprint@0 {
+			compatible = "apple,mesa-fingerprint";
+			reg = <0>;
+			spi-max-frequency = <8000000>;
+			spi-cpol;
+			spi-cs-setup-delay-ns = <20>;
+			spi-cs-hold-delay-ns = <20>;
+			enable-gpios = <&pinctrl_nub 36 GPIO_ACTIVE_HIGH>;
+			interrupt-parent = <&pinctrl_ap>;
+			interrupts = <200 IRQ_TYPE_EDGE_RISING>;
+			/* Per-device files, built from the Mac's own factory records. */
+			firmware-name = "apple/mesacal-j813.bin", "apple/msrk-j813.bin";
+			status = "okay";
+		};
+	};
+};
+
+/* Expose the sensor's two pins next to the ones sound uses. */
+&pinctrl_ap {
+	gpio-reserved-ranges = <0 100>, <101 49>, <152 48>, <201 23>;
+};
+
+&pinctrl_nub {
+	gpio-reserved-ranges = <0 18>, <19 17>, <37 3>;
+};
+
+/* The port controllers follow the sleep's command rules (tipd: woken first, read at intervals) */
+&hpm0 {
+	apple,sleep-ssps-rules;
+};
+
+&hpm1 {
+	apple,sleep-ssps-rules;
+};

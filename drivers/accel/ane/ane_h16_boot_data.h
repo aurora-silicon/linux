@@ -528,6 +528,7 @@ static const struct ane_h16_profile ane_h16_profiles[] __maybe_unused = {
 		.identity = "H16 27.2 26B123",
 		.preload = &ane_h16_preload_26b123,
 		.build = &ane_h16_build_26a428,
+		.require_dart_unlocked = true,
 	},
 	{
 		.identity = "H16 26.6.2 25G83",

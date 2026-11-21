@@ -59,6 +59,7 @@
 
 #include "afk.h"
 #include "av.h"
+#include "cec.h"
 #include "dcp.h"
 #include "dcp-edr.h"
 #include "dcp-panel-adt.h"
@@ -1932,7 +1933,13 @@ static bool dcp_rtk_syslog_mode_set(void *cookie, const char *context, const cha
 	return false;
 }
 
+static bool dcp_rtk_syslog_is_debug(void *cookie, const char *context, const char *message)
+{
+	return dcp_h17p_syslog_is_debug(context, message);
+}
+
 static struct apple_rtkit_ops rtkit_ops = {
+	.syslog_is_debug = dcp_rtk_syslog_is_debug,
 	.crashed = dcp_rtk_crashed,
 	.recv_message = dcp_recv_msg,
 	.recv_message_timed = dcp_recv_msg_timed,
@@ -1948,11 +1955,6 @@ static const struct apple_rtkit_ops link_report_rtkit_ops = {
 	.shmem_setup = dcp_rtk_shmem_setup,
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
-
-static bool dcp_rtk_syslog_is_debug(void *cookie, const char *context, const char *message)
-{
-	return dcp_h17p_syslog_is_debug(context, message);
-}
 
 static const struct apple_rtkit_ops external_h17p_rtkit_ops = {
 	.flags = APPLE_RTKIT_COPROC_PLACES_BUFFERS,
@@ -4396,6 +4398,19 @@ static int dcp_start_desktop_external(struct apple_dcp *dcp, u32 map)
 			d->graph_started |= BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20);
 	}
 #endif
+#if IS_ENABLED(CONFIG_DRM_APPLE_CEC)
+	if (IS_ERR_OR_NULL(dcp->avep) &&
+	    dcp->fixed_connector_type == DRM_MODE_CONNECTOR_HDMIA &&
+	    (map & BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20))) {
+		ret = dcp_cec_init_avep(dcp);
+		if (ret)
+			dcp_desktop_graph_skip(dcp, AV_AUDIO_ENDPOINT_DESKTOP,
+					       "CEC", "CEC init failed", ret);
+		else if (dcp->avep)
+			d->graph_started |= BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20);
+	}
+	dcp_cec_register(dcp);
+#endif
 	ret = dcp_desktop_start_ext_ep(dcp, map, DPTX_HDCP_ENDPOINT,
 				       "DPTXHDCP");
 	if (ret)
@@ -4727,6 +4742,17 @@ int dcp_start(struct platform_device *pdev)
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start AV endpoint: %d", ret);
 		ret = 0;
+	}
+#endif
+#if IS_ENABLED(CONFIG_DRM_APPLE_CEC)
+	if (!dcp_is_ext26(dcp) && !dcp->external_native) {
+		if (IS_ERR_OR_NULL(dcp->avep)) {
+			ret = dcp_cec_init_avep(dcp);
+			if (ret)
+				dev_warn(dcp->dev, "Failed to start AV CEC endpoint: %d\n", ret);
+			ret = 0;
+		}
+		dcp_cec_register(dcp);
 	}
 #endif
 
@@ -6025,6 +6051,7 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	disable_delayed_work_sync(&dcp->announce_wq);
 	cancel_work_sync(&dcp->external_stop_work);
 	cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
+	dcp_hdmi_disable(dcp);
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
 	disable_delayed_work_sync(&dcp->link_recovery_wq);
@@ -6035,7 +6062,6 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 		dcp->tb_event_generation = 0;
 	}
 	disable_delayed_work_sync(&dcp->hybrid_wq);
-	dcp_hdmi_disable(dcp);
 }
 
 VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
@@ -6658,6 +6684,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		return;
 	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
 		apple_sleep_v27_unregister(dev);
+	dcp_indicator_release(dcp);
 	dcp_peer_forget(dcp);
 	/*
 	 * Stop the native initializer before looking up its owner, including
@@ -6666,6 +6693,9 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 	 */
 	if (dcp->external_native)
 		disable_work_sync(&dcp->external_audio_work);
+#if IS_ENABLED(CONFIG_DRM_APPLE_CEC)
+	dcp_cec_unregister(dcp);
+#endif
 	av_audiosrv_quiesce(dcp);
 	if (READ_ONCE(dcp->ext_dead))
 		return;
@@ -7021,6 +7051,17 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			return ret;
 	}
 
+	/*
+	 * Every address this processor's firmware is given is a DVA it reaches
+	 * through its DART. A processor that names a DART but was left without
+	 * an IOMMU domain (the IOMMU driver did not take it) would get physical
+	 * addresses from the DMA API's direct path, which its DART would then
+	 * translate as DVAs, into whatever those happen to map: refuse it.
+	 */
+	if (of_property_present(dev->of_node, "iommus") && !device_iommu_mapped(dev))
+		return dev_err_probe(dev, -ENODEV,
+				     "no IOMMU domain; not handing the firmware untranslated DMA addresses\n");
+
 	/* Check for "apple,bw-scratch" to avoid probing appledrm with outdated
 	 * device trees. This prevents replacing simpledrm and ending up without
 	 * display.
@@ -7359,6 +7400,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	    !of_property_read_u32(dev->of_node, "apple,iomfb-surfaces", &surf_en) &&
 	    surf_en == 0)
 		set_bit(0, dcp->iomfb_surfaces);
+
+	{
+		int ret_ind = dcp_indicator_probe(dcp);
+
+		if (ret_ind)
+			return ret_ind;
+	}
 
 	if (dcp->phy) {
 		int ret;

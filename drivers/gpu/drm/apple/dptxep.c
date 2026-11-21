@@ -15,6 +15,7 @@
 #include <linux/soc/apple/dp-tunnel.h>
 
 #include "afk.h"
+#include "cec.h"
 #include "dcp.h"
 #include "dcp-hdmi.h"
 #include "dptxep.h"
@@ -232,6 +233,7 @@ int dptxport_release_display(struct apple_epic_service *service)
 {
 	dcp_180hz_invalidate(service->ep->dcp);
 	dcpavserv_v14_close(service->ep->dcp);
+	dcp_cec_close_port(service->ep->dcp, service);
 	return afk_service_call(service, 0, 7, NULL, 0, 16, NULL, 0, 16);
 }
 
@@ -242,9 +244,11 @@ int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 	size_t received;
 	int ret;
 
-	/* The 14.7 external role completes an HPD low only once its AV client closed. */
-	if (!hpd)
+	/* Close active AV and CEC clients before telling firmware HPD went low. */
+	if (!hpd) {
 		dcpavserv_v14_close(service->ep->dcp);
+		dcp_cec_close_port(service->ep->dcp, service);
+	}
 	memset(&cmd, 0, sizeof(cmd));
 
 	if (hpd)

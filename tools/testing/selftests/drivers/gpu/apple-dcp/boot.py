@@ -102,9 +102,10 @@ def syslog(root):
     dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
     header = (root / 'drivers/gpu/drm/apple/dcp-syslog.h').read_text()
     helper = header[header.index('static inline bool'):header.index('\n#endif')]
-    # The policy belongs only to the external H17P transport. Other RTKit
-    # clients, including the panel and older DCP firmware, keep info logging.
-    assert '.syslog_is_debug' not in block(dcp, 'static struct apple_rtkit_ops rtkit_ops =')
+    # The policy covers both DCP transports, the internal panel's and the
+    # external H17P one. It demotes only the known records it matches, so other
+    # records, other firmware and other RTKit clients keep info logging.
+    assert '.syslog_is_debug = dcp_rtk_syslog_is_debug' in block(dcp, 'static struct apple_rtkit_ops rtkit_ops =')
     assert '.syslog_is_debug = dcp_rtk_syslog_is_debug' in block(dcp, 'static const struct apple_rtkit_ops external_h17p_rtkit_ops =')
     return r'''
 #include <assert.h>
@@ -196,8 +197,12 @@ int main(void)
 
 def t6041_v27_admission(root):
     display_h = (root / 'include/linux/soc/apple/display.h').read_text()
-    helper = display_h[display_h.index('#define APPLE_T6041_DCP_26B123_UUID'):
-                       display_h.index('\n#endif')]
+    uuid_define = next(line for line in display_h.splitlines()
+                       if line.startswith('#define APPLE_T6041_DCP_26B123_UUID '))
+    helper = '\n'.join((uuid_define, *(
+        block(display_h, 'static inline bool ' + name + '(') for name in (
+            'apple_t6041_dcp_any_v27_2', 'apple_t6041_dcp_v27_2',
+            'apple_t6041_dcpext_v27_2'))))
     iomfb_h = (root / 'drivers/gpu/drm/apple/iomfb.h').read_text()
     methods_decl = iomfb_h[iomfb_h.index('enum dcpep_method {'):
                            iomfb_h.index('#define IOMFB_MAX_CB')]

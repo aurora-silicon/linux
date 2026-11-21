@@ -703,8 +703,8 @@ three DART fault status/address words, version/protect/lock headers and four
 DAPF records per instance against ``apple,dapf-ranges``. The ANE backend
 writes no engine, DART or DAPF register at this rung. Genpd owns power writes.
 
-``map`` verifies that none of the three DARTs has TTBR/TCR protection (bit 0)
-set before claiming an exclusive, singleton IOMMU group and an unmanaged domain
+``map`` logs all three DART protection words (enforcing bit 0 clear on the
+27.2 26B123 profile) before claiming an exclusive, singleton IOMMU group and an unmanaged domain
 covering the three SID-0 DART instances. Private surfaces currently require
 a DMA-coherent client; noncoherent clients refuse pool allocation before RUN. No
 unexported architecture cache helper is called from the module. It checks
