@@ -31,6 +31,9 @@ static const struct {
 	{ "ABOI", 8, false }, { "ZSOI", 4, false }, { "ARcM", 4, true },
 };
 
+/* Large enough for every layout: 27.2 on T8132 has 0x2b0000 bytes of DATA. */
+#define PRELOAD_DATA_ALLOC 0x2b0000
+
 struct preload_fixture {
 	u8 *text;
 	u8 *data;
@@ -79,7 +82,7 @@ static int preload_fixture_init(struct kunit *test)
 		return -ENOMEM;
 	if (kunit_add_action_or_reset(test, preload_free, f->text))
 		return -ENOMEM;
-	f->data = kvmalloc(ANE_H16_PRELOAD_DATA_SIZE, GFP_KERNEL);
+	f->data = kvmalloc(PRELOAD_DATA_ALLOC, GFP_KERNEL);
 	if (!f->data)
 		return -ENOMEM;
 	if (kunit_add_action_or_reset(test, preload_free, f->data))
@@ -299,6 +302,7 @@ static void preload_profiles_check(struct kunit *test, const struct ane_h16_prof
 				   unsigned int count)
 {
 	struct preload_fixture *f = test->priv;
+	size_t text_size, data_size;
 	unsigned int i, j, k;
 
 	KUNIT_ASSERT_GT(test, count, 0);
@@ -310,19 +314,27 @@ static void preload_profiles_check(struct kunit *test, const struct ane_h16_prof
 		KUNIT_ASSERT_NOT_NULL(test, p->build);
 		KUNIT_ASSERT_NOT_NULL(test, p->identity);
 		KUNIT_ASSERT_NOT_NULL(test, r);
-		memset(f->data, 0xa5, ANE_H16_PRELOAD_DATA_SIZE);
+		text_size = ane_h16_preload_text_size(r);
+		data_size = ane_h16_preload_data_size(r);
+		KUNIT_ASSERT_LE(test, text_size, ANE_H16_PRELOAD_TEXT_SIZE);
+		KUNIT_ASSERT_LE(test, data_size, PRELOAD_DATA_ALLOC);
+		memset(f->data, 0xa5, data_size);
 		for (k = 0; k < r->cell_count; k++) {
 			memcpy(f->data + r->cells[k].value - 8, r->cells[k].tag, 4);
 			put_unaligned_le32(r->cells[k].width, f->data + r->cells[k].value - 4);
 		}
-		KUNIT_EXPECT_EQ(test, ane_h16_preload_digest(r, f->text,
-							     ANE_H16_PRELOAD_TEXT_SIZE, f->data,
-							     ANE_H16_PRELOAD_DATA_SIZE, digest),
+		KUNIT_EXPECT_EQ(test, ane_h16_preload_digest(r, f->text, text_size, f->data,
+							     data_size, digest),
 				0);
-		KUNIT_EXPECT_EQ(test, ane_h16_preload_validate(r, f->text,
-							       ANE_H16_PRELOAD_TEXT_SIZE, f->data,
-							       ANE_H16_PRELOAD_DATA_SIZE),
+		KUNIT_EXPECT_EQ(test, ane_h16_preload_validate(r, f->text, text_size, f->data,
+							       data_size),
 				-ENOEXEC);
+		/* A rule only frames its own layout. */
+		if (text_size != ANE_H16_PRELOAD_TEXT_SIZE)
+			KUNIT_EXPECT_EQ(test, ane_h16_preload_digest(r, f->text,
+								     ANE_H16_PRELOAD_TEXT_SIZE,
+								     f->data, data_size, digest),
+					-EINVAL);
 		for (j = 0; j < i; j++) {
 			KUNIT_EXPECT_NE(test, memcmp(r->digest, profiles[j].preload->digest,
 						     SHA256_DIGEST_SIZE), 0);
@@ -337,6 +349,24 @@ static void preload_profiles_test(struct kunit *test)
 
 	preload_profiles_check(test, ane_h16_profiles, ARRAY_SIZE(ane_h16_profiles));
 	preload_profiles_check(test, ane_t8132_profiles, ARRAY_SIZE(ane_t8132_profiles));
+	preload_profiles_check(test, ane_t8132_profiles_26b123,
+			       ARRAY_SIZE(ane_t8132_profiles_26b123));
+	/* T8132 27.2: its own layout and digest, behind unlocked DARTs as on T6041 27.2. */
+	for (i = 0; i < ARRAY_SIZE(ane_t8132_profiles_26b123); i++) {
+		const struct ane_h16_profile *p = &ane_t8132_profiles_26b123[i];
+
+		KUNIT_EXPECT_TRUE(test, p->require_dart_unlocked);
+		KUNIT_EXPECT_EQ(test, ane_h16_preload_text_size(p->preload), 0xbc000U);
+		KUNIT_EXPECT_EQ(test, ane_h16_preload_data_size(p->preload), 0x2b0000U);
+		for (j = 0; j < ARRAY_SIZE(ane_t8132_profiles); j++)
+			KUNIT_EXPECT_NE(test, memcmp(p->preload->digest,
+						     ane_t8132_profiles[j].preload->digest,
+						     SHA256_DIGEST_SIZE), 0);
+		for (j = 0; j < ARRAY_SIZE(ane_h16_profiles); j++)
+			KUNIT_EXPECT_NE(test, memcmp(p->preload->digest,
+						     ane_h16_profiles[j].preload->digest,
+						     SHA256_DIGEST_SIZE), 0);
+	}
 	/* The T6041 and the T8132 never accept each other's firmware. */
 	for (i = 0; i < ARRAY_SIZE(ane_t8132_profiles); i++) {
 		KUNIT_EXPECT_FALSE(test, ane_t8132_profiles[i].require_dart_unlocked);

@@ -503,6 +503,53 @@ static const struct ane_h16_profile ane_t8132_profiles[] __maybe_unused = {
 	},
 };
 
+/*
+ * 27.2 (26B123) on T8132: a new image (h16_ane_fw_leto_j7x, LC_UUID
+ * fd35429f-6556-353e-b863-a26a02a71cdf, the ADT ane uuid) with TEXT 0xbc000
+ * and DATA 0x2b0000, whose firmware VM base is 0xbc000. Its DATA has the
+ * 25G83 records and the rewritten _rtk_tunables range 0x4480 earlier. As
+ * loaded on a J773g, it differs from the image in the CE script (__TEXT,
+ * ce_env), which stays in the identity, in fixed patchbay values (_COS
+ * 0x8132, RCOS, dApC, dArW, GLFp), in GKTS, ECAP and ARcM, which normalize,
+ * and in _rtk_tunables, which is zeroed.
+ */
+static const struct ane_h16_preload_cell ane_h16_patchbay_26b123_t8132[] = {
+	{ "GKTS", 0x5a30, 8, true },
+	{ "ECAP", 0x5b23, 8, true },
+	{ "ABOI", 0x5c49, 8, false },
+	{ "ZSOI", 0x5c59, 4, false },
+	{ "ARcM", 0x5c65, 4, true },
+};
+
+static const struct ane_h16_preload_rule ane_h16_preload_26b123_t8132 = {
+	.cells = ane_h16_patchbay_26b123_t8132,
+	.cell_count = ARRAY_SIZE(ane_h16_patchbay_26b123_t8132),
+	.zero_start = 0x17c70,
+	.zero_end = 0x18310,
+	.digest = {
+		0xb6, 0x88, 0x93, 0xc9, 0x55, 0x8a, 0xa0, 0xd3,
+		0xbc, 0x15, 0xe5, 0x9a, 0x69, 0xa1, 0x7a, 0x34,
+		0xf1, 0x5b, 0x6e, 0x38, 0x7d, 0xb0, 0x92, 0xca,
+		0x8c, 0xc4, 0x19, 0x5a, 0xf7, 0x0a, 0x87, 0x21,
+	},
+	.text_size = 0xbc000,
+	.data_size = 0x2b0000,
+};
+
+/*
+ * The 27.2 build keeps the 25G83 boot values: the firmware span still ends
+ * at TEXT + 0x36c000, and the host pool, IPC, heap and shared windows lie
+ * past it, as on T6041, whose 27.2 build boots with its 27.0 values.
+ */
+static const struct ane_h16_profile ane_t8132_profiles_26b123[] __maybe_unused = {
+	{
+		.identity = "H16 T8132 27.2 26B123",
+		.preload = &ane_h16_preload_26b123_t8132,
+		.build = &ane_h16_build_t8132_25g83,
+		.require_dart_unlocked = true,
+	},
+};
+
 /* 27.2 (26B123) preload on T6041 (J616c): 26A428 DATA layout and zeroed range. */
 static const struct ane_h16_preload_rule ane_h16_preload_26b123 = {
 	.cells = ane_h16_patchbay_26a428,

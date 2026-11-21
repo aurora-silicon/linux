@@ -31,7 +31,23 @@ struct ane_h16_preload_rule {
 	u32 zero_start;
 	u32 zero_end;
 	u8 digest[SHA256_DIGEST_SIZE];
+	/*
+	 * The build's TEXT and DATA sizes; 0 for ANE_H16_PRELOAD_TEXT_SIZE and
+	 * ANE_H16_PRELOAD_DATA_SIZE, the 26.x and 27.0 layout.
+	 */
+	u32 text_size;
+	u32 data_size;
 };
+
+static inline size_t ane_h16_preload_text_size(const struct ane_h16_preload_rule *rule)
+{
+	return rule->text_size ?: ANE_H16_PRELOAD_TEXT_SIZE;
+}
+
+static inline size_t ane_h16_preload_data_size(const struct ane_h16_preload_rule *rule)
+{
+	return rule->data_size ?: ANE_H16_PRELOAD_DATA_SIZE;
+}
 
 /* Inputs are stable, host-owned snapshots of the reserved live pages.
  * Computing a digest validates the rule's framing but not the identity.
