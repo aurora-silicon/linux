@@ -792,7 +792,11 @@ static unsigned int apple_clpc_step_khz(struct cpufreq_policy *policy,
 	return best;
 }
 
-/* The SMC of the apple,smc phandle, once its driver is bound; NULL before. */
+/*
+ * The SMC of the apple,smc phandle, once its driver is bound; NULL before.
+ * Callers test IS_ENABLED(CONFIG_MFD_MACSMC) first, so a kernel without the
+ * SMC driver links without the apple_smc_*() calls.
+ */
 static struct apple_smc *apple_clpc_smc(struct apple_clpc *clpc)
 {
 	struct platform_device *pdev;
@@ -815,7 +819,7 @@ static int apple_clpc_read_power(struct apple_clpc *clpc)
 	u64 mw;
 	u32 f;
 
-	if (!apple_clpc_smc(clpc))
+	if (!IS_ENABLED(CONFIG_MFD_MACSMC) || !apple_clpc_smc(clpc))
 		return -ENODEV;
 	ret = apple_smc_read_u32(clpc->smc, SMC_KEY(PHPC), &f);
 	if (ret)
@@ -1294,7 +1298,7 @@ static int apple_clpc_send_high_power(struct apple_clpc *clpc, bool on)
 	u8 rec[APPLE_CLPC_ZETM_SIZE] = { APPLE_CLPC_ZETM_TYPE, APPLE_CLPC_ZETM_VERSION };
 	int ret;
 
-	if (!apple_clpc_smc(clpc))
+	if (!IS_ENABLED(CONFIG_MFD_MACSMC) || !apple_clpc_smc(clpc))
 		return -ENODEV;
 	rec[2] = ++clpc->high_power_seq;
 	put_unaligned_le32(on ? APPLE_CLPC_FLOAT_ONE : 0, rec + APPLE_CLPC_ZETM_HIGH_POWER);
