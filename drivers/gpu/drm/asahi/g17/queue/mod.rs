@@ -559,6 +559,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             syncs,
             input_count,
             &self.allocation_failure,
+            self.context.status(),
         ) {
             Ok(outputs) => outputs,
             Err(error) => {

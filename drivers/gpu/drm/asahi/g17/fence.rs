@@ -6,6 +6,7 @@
 //! Signalling belongs outside the device lock, after timestamp and VM-status writes.
 
 use super::context::{Context, WorkStateLease};
+use super::status::VmStatus;
 use crate::file::SyncItem;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use kernel::{
@@ -190,6 +191,8 @@ pub(crate) struct Submission {
     error: AtomicI32,
     /// Live Member objects, plus the enqueue guard, independently of signalling.
     owners: AtomicU8,
+    /// The VM's status, captured at publication: it counts this fence if it fails.
+    status: Arc<VmStatus>,
     firmware_source: bool,
     /// Set under the device mutex when the only member's successful retirement
     /// is queued, before its fence is signalled off-lock: a consumer published
@@ -199,16 +202,22 @@ pub(crate) struct Submission {
 
 impl Submission {
     fn new(context: Arc<Context>, firmware_source: bool) -> Result<Arc<Self>> {
+        let status = context.status().clone();
         let work = Arc::new(WorkStateLease::deferred(context)?, GFP_KERNEL)?;
-        Self::with_work(Some(work), firmware_source)
+        Self::with_work(Some(work), status, firmware_source)
     }
-    fn with_work(work: Option<Arc<WorkStateLease>>, firmware_source: bool) -> Result<Arc<Self>> {
+    fn with_work(
+        work: Option<Arc<WorkStateLease>>,
+        status: Arc<VmStatus>,
+        firmware_source: bool,
+    ) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
                 state <- new_mutex!(State { work, ready: None }, "G17 submission work state"),
                 remaining: AtomicU8::new(1),
                 error: AtomicI32::new(0),
                 owners: AtomicU8::new(1),
+                status,
                 firmware_source,
                 retired: AtomicBool::new(false),
             }),
@@ -267,8 +276,13 @@ impl Submission {
             self.note_error(error);
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // The final error: note_error may have set it before any member completed.
             let error = self.error.load(Ordering::Acquire);
             if error != 0 {
+                // The only place a published submission's output fence takes an error, so
+                // every failed one is counted, once, before it signals below. A submission
+                // that fails before publication is counted in Outputs instead.
+                self.status.count_fence_error();
                 fence.set_error(Error::from_errno(error));
             } else {
                 self.release_state();
@@ -366,10 +380,16 @@ mod tests {
     fn contexts() -> FenceContexts {
         FenceContexts::new(1, c_str!("asahi_promise_test"), KEY).unwrap()
     }
-    fn aggregate(contexts: &FenceContexts) -> Aggregate {
+    fn status() -> Arc<VmStatus> {
+        Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap()
+    }
+    fn aggregate_for(contexts: &FenceContexts, status: Arc<VmStatus>) -> Aggregate {
         let mut fence = export_fallback(contexts).unwrap();
-        fence.source = Some(Submission::with_work(None, true).unwrap());
+        fence.source = Some(Submission::with_work(None, status, true).unwrap());
         Aggregate(fence.into())
+    }
+    fn aggregate(contexts: &FenceContexts) -> Aggregate {
+        aggregate_for(contexts, status())
     }
 
     #[test]
@@ -415,6 +435,50 @@ mod tests {
             super::super::job::fence_status(&aggregate.fence()),
             ENOMEM.to_errno()
         );
+    }
+
+    #[test]
+    fn failed_output_fences_are_counted_once_before_they_signal() {
+        let contexts = contexts();
+        let status = status();
+        let fence_status =
+            |aggregate: &Aggregate| super::super::job::fence_status(&aggregate.fence());
+        // Success: no count.
+        let ok = aggregate_for(&contexts, status.clone());
+        let member = ok.member();
+        ok.finish_enqueue(Ok(()));
+        member.complete(Ok(()));
+        assert!(fence_status(&ok) > 0);
+        assert_eq!(status.fence_errors(), 0);
+        // Two failed members of one submission: one failed fence, counted once.
+        let failed = aggregate_for(&contexts, status.clone());
+        let (a, b) = (failed.member(), failed.member());
+        failed.finish_enqueue(Ok(()));
+        a.complete(Err(ECANCELED));
+        // Another member still holds the fence.
+        assert_eq!(status.fence_errors(), 0);
+        b.complete(Err(ENODATA));
+        assert_eq!(fence_status(&failed), ECANCELED.to_errno());
+        assert_eq!(status.fence_errors(), 1);
+        // An error noted early fails the fence even if every member then succeeds.
+        let noted = aggregate_for(&contexts, status.clone());
+        let member = noted.member();
+        noted.finish_enqueue(Ok(()));
+        member.note_error(EIO);
+        member.complete(Ok(()));
+        assert_eq!(fence_status(&noted), EIO.to_errno());
+        assert_eq!(status.fence_errors(), 2);
+        // A member dropped without completing cancels its fence; so does an enqueue error.
+        let dropped = aggregate_for(&contexts, status.clone());
+        drop(dropped.member());
+        dropped.finish_enqueue(Ok(()));
+        assert_eq!(status.fence_errors(), 3);
+        let rejected = aggregate_for(&contexts, status.clone());
+        rejected.finish_enqueue(Err(ENOMEM));
+        assert_eq!(status.fence_errors(), 4);
+        // The reported VM status ignores these collateral errors; the count does not.
+        assert_eq!(status.reported_error(), 0);
+        drop((a, b, member));
     }
 
     #[test]
@@ -471,6 +535,9 @@ pub(crate) struct Outputs {
     submission: Option<Aggregate>,
     result: Result,
     cumulative: Option<super::sync_output::SignalBundle>,
+    /// The queue's VM status. An error fence installed instead of a published submission's
+    /// is counted in it first, as `Submission::member_done` counts a published one.
+    status: Arc<VmStatus>,
 }
 impl Outputs {
     pub(crate) fn new(
@@ -478,6 +545,7 @@ impl Outputs {
         mut syncs: KVec<SyncItem>,
         input_count: usize,
         allocation_failure: &Fence,
+        status: &Arc<VmStatus>,
     ) -> Result<Self> {
         if input_count > syncs.len() {
             return Err(EINVAL);
@@ -486,6 +554,8 @@ impl Outputs {
         let fallback = match export_fallback(contexts) {
             Ok(fence) => fence,
             Err(error) => {
+                // The outputs end with the queue's failed fence: count it before installing.
+                status.count_fence_error();
                 if let Some(bundle) = &mut cumulative {
                     bundle.fail(allocation_failure);
                 } else {
@@ -501,6 +571,7 @@ impl Outputs {
             submission: None,
             result: Err(ECANCELED),
             cumulative,
+            status: status.clone(),
         })
     }
     pub(crate) fn inputs(&self) -> &[SyncItem] {
@@ -548,6 +619,9 @@ impl Drop for Outputs {
         }
         if let Some(fallback) = self.fallback.take() {
             if let Err(error) = self.result {
+                // Counted before the fallback is installed or signals. A restarted SUBMIT
+                // installs it at the same timeline points again, and the count tells.
+                self.status.count_fence_error();
                 fallback.set_error(error);
             }
             if let Some(bundle) = &mut self.cumulative {
