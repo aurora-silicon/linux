@@ -25,7 +25,22 @@ unsigned int apple_j613_25g83_clock_hz(void)
 	return display_clock_hz;
 }
 
-/* Require one Air board identity and the explicit J615 experimental switch. */
+/* The panel the board device tree puts under the internal T8122 DCP. */
+static bool t8122_25g83_panel_is(const char *compat)
+{
+	struct device_node *dcp __free(device_node) = of_find_node_by_path("dcp");
+	struct device_node *panel __free(device_node) = NULL;
+
+	if (!dcp || !of_device_is_compatible(dcp, "apple,t8122-dcp"))
+		return false;
+	panel = of_get_child_by_name(dcp, "panel");
+	return panel && of_device_is_compatible(panel, compat);
+}
+
+/*
+ * Require one of the two panels the 25G83 profile was checked with, and the
+ * explicit experimental switch for the J615 one.
+ */
 bool apple_t8122_25g83_board(void)
 {
 	struct device_node *chosen = of_find_node_by_path("/chosen");
@@ -35,8 +50,8 @@ bool apple_t8122_25g83_board(void)
 
 	if (chosen)
 		optin = of_get_property(chosen, J615_25G83_OPT_IN, &len);
-	ok = t8122_25g83_board(of_machine_is_compatible("apple,j613"),
-			       of_machine_is_compatible("apple,j615"), optin, len);
+	ok = t8122_25g83_board(t8122_25g83_panel_is("apple,panel-j613"),
+			       t8122_25g83_panel_is("apple,panel-j615"), optin, len);
 	of_node_put(chosen);
 	return ok;
 }
@@ -355,8 +370,11 @@ static int __init j613_external_gate(struct device_node *display)
 	else
 		pr_info("J613 native26 external loader result: absent or malformed\n");
 	of_node_put(chosen);
-	if (!of_machine_is_compatible("apple,j613"))
-		return -ENODEV;
+	/*
+	 * Which external processor this is, and that its firmware and boot
+	 * state are the ones the native 26.x path was written for, is checked
+	 * on the node below; the board does not enter into it.
+	 */
 	ext = of_find_node_by_path("dcpext");
 	if (!ext)
 		ext = of_find_node_by_path("dcpext0");
