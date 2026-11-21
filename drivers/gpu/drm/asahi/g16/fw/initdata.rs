@@ -334,6 +334,23 @@ pub(crate) const V26B123: Layout = Layout {
         (0xaac, 0x3ecf_2e49),
         (0xad8, 0x10),
         (0xae0, 0x5_dc00),
+        // 27.2 (candidate): the words the 27.2 AGXG16G kext's power-config fill
+        // (0xfffffe0008ba4b74) writes as constants or from the J773g ADT, which G16 left zero;
+        // each equals the M4 Pro's 26B123 value (linux#1954, hardware):
+        // - 0x44 and 0x2f34: the constant 1;
+        // - 0x6ac8: bit 17 of the G16G accelerator flags (set by its G16G setup, 1);
+        // - 0x29e4, 0x29f0, 0x29f8: an averaging filter of n = 248 ms / 8 ms = 31 samples
+        //   (G16G tc 0xf8 over gpu-power-sample-period 8): n * 4, (n - 1) / n, 1 / n;
+        // - 0x2bbc, 0x2c10: the power sample period in us (gpu-power-sample-period * 1000), as
+        //   f32 and u32. The power accounting (0x2b4xx) clamps each sample to 0x2c10.
+        (0x44, 1),
+        (0x29e4, 124),
+        (0x29f0, 0x3f77_bdef),
+        (0x29f8, 0x3d04_2108),
+        (0x2bbc, 0x45fa_0000),
+        (0x2c10, 8000),
+        (0x2f34, 1),
+        (0x6ac8, 1),
     ],
 };
 
