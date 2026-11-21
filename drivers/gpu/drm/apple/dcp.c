@@ -6831,8 +6831,17 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp->hw.dptx_endpoint = DPTX_ENDPOINT_V2;
 	}
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
-	    of_device_is_compatible(dev->of_node, "apple,t8132-dcpext"))
+	    of_device_is_compatible(dev->of_node, "apple,t8132-dcpext")) {
 		dcp->hw = apple_dcp_hw_t8132_dcpext_v27;
+		/*
+		 * An external processor, though its node has no apple,dcpext: on
+		 * the M4 firmware it is adopted outside the DRM device, see
+		 * dcp_platform_probe_t8132_ext(). On firmware 27 it is an
+		 * ordinary external pipe, with its DPTX services where its
+		 * firmware advertises them (dcp_v27_dptx_layout()).
+		 */
+		dcp->dcpext = true;
+	}
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t8132-dcp"))
 		dcp->hw = apple_dcp_hw_t8132_v27;
