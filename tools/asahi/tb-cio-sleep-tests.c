@@ -927,7 +927,7 @@ int main(void)
 		add_xdomain(0);
 		assert(!tb_cio_sleep_prepare(&tb));
 		check_released(0);
-		assert(xd_unconfigured == 1);
+		assert(!xd_unconfigured);
 		clients_awake = false;
 		assert(!tb_cio_sleep(&tb));
 		poweroff();
@@ -937,7 +937,7 @@ int main(void)
 		complete();
 		/* Released once: neither the wake nor complete touches it again. */
 		check_released(0);
-		assert(xd_unconfigured == 1);
+		assert(!xd_unconfigured);
 		cases++;
 	}
 	/* One behind the device router: the release follows the link down. */
@@ -945,7 +945,7 @@ int main(void)
 	add_xdomain(1);
 	assert(!tb_cio_sleep_prepare(&tb));
 	check_released(1);
-	assert(xd_unconfigured == 1);
+	assert(!xd_unconfigured);
 	complete();
 	cases++;
 	/* Both at once. */
@@ -955,7 +955,7 @@ int main(void)
 	assert(!tb_cio_sleep_prepare(&tb));
 	check_released(0);
 	check_released(1);
-	assert(xd_unconfigured == 2);
+	assert(!xd_unconfigured);
 	complete();
 	cases++;
 	/* A tunnel's prepare refused after the release: the release stands. */

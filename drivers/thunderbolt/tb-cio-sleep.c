@@ -63,7 +63,13 @@ static void tb_cio_release_xdomains(struct tb *tb, struct tb_switch *sw)
 			port->xdomain = NULL;
 		__tb_disconnect_xdomain_paths(tb, xd, -1, -1, -1, -1);
 		tb_xdomain_put(xd);
-		tb_port_unconfigure_xdomain(port);
+		/*
+		 * Unlike an unplug the link is still up, and the other host still has its
+		 * end configured: the port stays marked as connected to another domain
+		 * (PORT_CS_19 PID). The router's power cycle clears it; a sleep refused after
+		 * this keeps it, and the rescan finds the peer on a port marked the way it
+		 * was. Clearing it under a live link dropped that link on the rescan.
+		 */
 	}
 }
 

@@ -68,6 +68,7 @@ def main():
         'refused-skips-rescan': ('\t\ttb_scan_switch(tb->root_switch);\n}', '\t\t(void)0;\n}'),
         'rescan-while-stopping': ('if (tcm->hotplug_active && !tcm->stopping)\n\t\ttb_scan_switch', 'if (true)\n\t\ttb_scan_switch'),
         'refused-keeps-cleanup': ('\t\t\ttcm->resume_cleanup_pending = false;\n\t\t}\n\t}\n\ttb_domain_unregister', '\t\t}\n\t}\n\ttb_domain_unregister'),
+        'unconfigure-live-link': ('\t\ttb_xdomain_put(xd);\n\t\t/*\n\t\t * Unlike an unplug', '\t\ttb_xdomain_put(xd);\n\t\ttb_port_unconfigure_xdomain(port);\n\t\t/*\n\t\t * Unlike an unplug'),
         'keep-xdomain-port': ('\t\tif (port->xdomain == xd)\n\t\t\tport->xdomain = NULL;\n', ''),
     }
     variants = {'real': unit}
