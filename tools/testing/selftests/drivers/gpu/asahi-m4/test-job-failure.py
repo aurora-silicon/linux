@@ -43,7 +43,7 @@ impl Error { fn from_errno(error: i32)->Self { Self(error) } }
 type Result<T=()> = core::result::Result<T,Error>;
 const EIO:Error=Error(-5); const ENODEV:Error=Error(-19); const ECANCELED:Error=Error(-125);
 const ETIMEDOUT:Error=Error(-110);const ENOMEM:Error=Error(-12);const EAGAIN:Error=Error(-11); const EINVAL:Error=Error(-22);
-const EOVERFLOW:Error=Error(-75); const NONE:u16=u16::MAX;
+const EOVERFLOW:Error=Error(-75); const NONE:u16=u16::MAX; const COMPUTE:usize=1;
 ORDER_SOURCE
 pub mod task { pub const MAX_SCHEDULE_TIMEOUT:i64=i64::MAX; }
 struct InputState { status:AtomicI32,waits:AtomicUsize,interrupted:AtomicI64,gate:Mutex<()>,changed:Condvar }
@@ -96,7 +96,7 @@ impl Fence {
     }
 }
 mod command { pub(crate) use super::Order; }
-struct QueueState { completed:[AtomicU64;2],cancelled_at:[AtomicU64;2] }
+struct QueueState { completed:[AtomicU64;2],published:[AtomicU64;2],cancelled_at:[AtomicU64;2] }
 impl QueueState { QUEUE_METHODS }
 struct Job { id:u64,vm:Vm,_guard:Guard,progress:Progress,started:AtomicBool,accepted:AtomicBool,fence:Fence,commands:Vec<()>,inputs:Vec<InputFence>,orders:Vec<Order>,queue:Arc<QueueState>,full_retired:AtomicU32,terminal_retired:AtomicBool }
 struct Shared { crashed:AtomicBool,submitted:Mutex<Vec<u64>>,submit_result:Result }
@@ -116,7 +116,7 @@ fn job(id:u64,status:Arc<Status>)->Arc<Job> {
 }
 fn job_with_inputs(id:u64,status:Arc<Status>,inputs:Vec<InputFence>)->Arc<Job> {
     let orders=vec![Order::new([0,0],[0,0],[NONE;2],[0;2],1).unwrap(),Order::new([0,0],[0,1],[NONE;2],[0;2],1).unwrap()];
-    job_with_orders(id,status,inputs,orders,Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2]}))
+    job_with_orders(id,status,inputs,orders,Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2]}))
 }
 fn job_with_orders(id:u64,status:Arc<Status>,inputs:Vec<InputFence>,orders:Vec<Order>,queue:Arc<QueueState>)->Arc<Job> {
     Arc::new(Job{id,vm:Vm{status:status.clone()},_guard:Guard(AtomicBool::new(false)),
@@ -278,7 +278,7 @@ fn younger_failed_input_does_not_cancel_older_multi_command_job() {
 }
 #[test]
 fn cancellation_checks_both_command_ordinal_and_cross_engine_failed_prefix() {
-    let queue=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2]});
+    let queue=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2]});
     let cutoff=Order::new([0,2],[0,0],[NONE;2],[0;2],1).unwrap();queue.cancel(&[cutoff],0);
     let earlier=Order::new([0,1],[0,0],[NONE;2],[0;2],1).unwrap();
     let independent_render=Order::new([0,3],[0,0],[NONE;2],[0;2],0).unwrap();
@@ -292,7 +292,7 @@ fn cancellation_checks_both_command_ordinal_and_cross_engine_failed_prefix() {
 }
 #[test]
 fn exact_prefix_does_not_wait_for_the_aggregate_or_next_ordinal() {
-    let queue=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2]});
+    let queue=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2]});
     let status=Arc::new(Status::new());
     let old=job_with_orders(1,status.clone(),vec![],vec![
         Order::new([0,0],[0,0],[NONE;2],[0;2],1).unwrap(),

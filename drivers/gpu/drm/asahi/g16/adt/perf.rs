@@ -24,6 +24,9 @@ pub(crate) struct Source {
     pub(crate) core_mv: [u32; MAX_STATES],
     pub(crate) sram_frequency_mhz: [u32; MAX_STATES],
     pub(crate) sram_mv: [u32; MAX_STATES],
+    /// The sgx node's `gpu-pwr-sample-period-aic-clks`: the GPU power sample period in ticks of
+    /// the system counter, where the tree has it.
+    pub(crate) power_sample_clks: Option<u32>,
 }
 
 fn u32_at(data: &[u8], at: usize) -> Result<u32, Error> {
@@ -174,12 +177,19 @@ pub(crate) fn parse(data: &[u8]) -> Result<Source, Error> {
     if core.len() != count * 8 || sram.len() != count * 8 {
         return Err(Error::Shape);
     }
+    let power_sample_clks = match tree.cell(sgx, b"gpu-pwr-sample-period-aic-clks") {
+        Ok(0) => return Err(Error::Range),
+        Ok(clks) => Some(clks),
+        Err(Error::Missing) => None,
+        Err(error) => return Err(error),
+    };
     let mut source = Source {
         count,
         frequency_mhz: [0; MAX_STATES],
         core_mv: [0; MAX_STATES],
         sram_frequency_mhz: [0; MAX_STATES],
         sram_mv: [0; MAX_STATES],
+        power_sample_clks,
     };
     for i in 0..count {
         (source.frequency_mhz[i], source.core_mv[i]) = decode_record(core, i)?;
