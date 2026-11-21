@@ -3414,6 +3414,7 @@ static int sleep_display_off(struct apple_sleep *s)
 		 */
 		if (i != 0 && !s->display[i].bound && !s->soc->lower_unbound_displays)
 			continue;
+		sleep_note_at(s, 5, 0xb0 | i);	/* LAB row T: lowering display i */
 		/*
 		 * Otherwise writing its CPU word faults. A bound one is stopped by now (a running
 		 * one refused the sleep), but with no stop of its own in its driver (T8132's
@@ -3482,6 +3483,7 @@ static int sleep_display_off(struct apple_sleep *s)
 		sleep_ps_lower(s, domains[i][0]);
 		sleep_ps_lower(s, domains[i][1]);
 		sleep_ps_lower(s, domains[i][2]);
+		sleep_note_at(s, 5, 0xc0 | i);	/* LAB row T: display i lowered */
 	}
 
 	for (i = 0; i < n; i++) {
