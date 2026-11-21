@@ -155,8 +155,9 @@
 #include "t6001-display-extra.dtsi"
 
 /*
- * The die 0 video encoder is the M1 Pro's: the bootloader hands it the
- * firmware iBoot preloads, and without that handoff the driver refuses
+ * Both video encoders run the firmware iBoot preloads, each its own copy.
+ * The bootloader hands each one its copy, matched by address, and leaves
+ * an encoder off when it cannot; without that handoff the driver refuses
  * the reservation and the encoder stays off.
  */
 &ave_dart0 {
@@ -168,6 +169,18 @@
 };
 
 &ave {
+	status = "okay";
+};
+
+&ave1_dart0 {
+	status = "okay";
+};
+
+&ave1_dart1 {
+	status = "okay";
+};
+
+&ave1 {
 	status = "okay";
 };
 #endif
