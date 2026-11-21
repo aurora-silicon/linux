@@ -16,7 +16,9 @@ description:
 properties:
   compatible:
     oneOf:
-      - description: T8152 SMC with read-only hardware monitoring.
+      - description:
+          T8152 SMC. Read-only hardware monitoring, plus notifications,
+          power and input on the J804 laptop.
         const: apple,t8152-smc
       - const: apple,t6050-smc
       - items:
