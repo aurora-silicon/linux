@@ -18,8 +18,20 @@ int apple_drm_t8132_link_device(struct device *consumer);
 /* T6041 DCP image shipped with macOS 27.2 (26B123). */
 #define APPLE_T6041_DCP_26B123_UUID "964EDE5B-8F78-38C2-A727-519CC9F0AF27"
 
-static inline bool apple_t6041_dcp_any_v27_2(const struct device_node *np,
-					     const char *compat_name)
+/*
+ * T8132 DCP image shipped with macOS 27.2 (26B123), as the J773g's 27.2 ADT
+ * names it for dcp, dcpext0 and dcpext1 alike (they share its __TEXT).
+ */
+#define APPLE_T8132_DCP_26B123_UUID "B3BA603C-3CA7-3E21-B393-44EB20BD2AEF"
+
+/*
+ * @np is a @compat_name display processor that the boot loader handed over
+ * with the 27.2 (26B123) image @image_uuid: firmware version and
+ * compatibility 27.2.0, as aura writes them from the ADT.
+ */
+static inline bool apple_dcp_image_v27_2(const struct device_node *np,
+					 const char *compat_name,
+					 const char *image_uuid)
 {
 	const char *uuid;
 	u32 fw[3], compat[3];
@@ -27,7 +39,7 @@ static inline bool apple_t6041_dcp_any_v27_2(const struct device_node *np,
 	if (!np || !of_device_is_compatible(np, compat_name) ||
 	    of_property_count_strings(np, "apple,firmware-uuid") != 1 ||
 	    of_property_read_string(np, "apple,firmware-uuid", &uuid) ||
-	    strcmp(uuid, APPLE_T6041_DCP_26B123_UUID) ||
+	    strcmp(uuid, image_uuid) ||
 	    of_property_count_u32_elems(np, "apple,firmware-version") != 3 ||
 	    of_property_count_u32_elems(np, "apple,firmware-compat") != 3 ||
 	    of_property_read_u32_array(np, "apple,firmware-version", fw, 3) ||
@@ -36,6 +48,26 @@ static inline bool apple_t6041_dcp_any_v27_2(const struct device_node *np,
 
 	return fw[0] == 27 && fw[1] == 2 && fw[2] == 0 &&
 	       compat[0] == 27 && compat[1] == 2 && compat[2] == 0;
+}
+
+/*
+ * A T8132 internal display processor that the boot loader handed over with
+ * the 27.2 (26B123) image and the firmware-27 clock metadata (apple,clock-ids
+ * from the ADT's /arm-io/disp0): the firmware-27 backend's, not the M4
+ * 26.6.2 one's. Keyed on the processor, the image and the handoff, so a main
+ * DCP a boot loader leaves running idle (a Mac mini's) is never adopted.
+ */
+static inline bool apple_t8132_dcp_v27_2(const struct device_node *np)
+{
+	return apple_dcp_image_v27_2(np, "apple,t8132-dcp",
+				     APPLE_T8132_DCP_26B123_UUID) &&
+	       of_property_present(np, "apple,clock-ids");
+}
+
+static inline bool apple_t6041_dcp_any_v27_2(const struct device_node *np,
+					     const char *compat_name)
+{
+	return apple_dcp_image_v27_2(np, compat_name, APPLE_T6041_DCP_26B123_UUID);
 }
 
 static inline bool apple_t6041_dcp_v27_2(const struct device_node *np)

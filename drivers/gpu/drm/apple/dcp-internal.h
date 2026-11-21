@@ -562,7 +562,11 @@ struct apple_dcp {
 	bool external;
 	/* Any external processor (apple,dcpext), whatever its SoC; set at probe. */
 	bool dcpext;
-	/* A desktop 26.x external processor (apple,t6041-dcpext) */
+	/*
+	 * A desktop external processor: apple,t6041-dcpext (26.x or 27.2), or
+	 * the J773g's apple,t8132-dcpext on 27.2 (apple_t8132_dcpext_v27_2()),
+	 * which drives the HDMI port the same way.
+	 */
 	bool desktop_external;
 	/*
 	 * A failsafe dcpext (dcp_ext_is_failsafe(): T8122's, T6041's, T6050's):

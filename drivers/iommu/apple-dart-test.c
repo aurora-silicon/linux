@@ -1326,6 +1326,118 @@ static void apple_dart_test_host_power_tables(struct kunit *test)
 }
 #endif
 
+/* A zeroed 16 KiB page marked reserved, as the firmware's tables are. */
+static void apple_dart_test_free_reserved(void *data)
+{
+	struct page *page = data;
+
+	ClearPageReserved(page);
+	__free_pages(page, get_order(SZ_16K));
+}
+
+static u64 *apple_dart_test_reserved_table(struct kunit *test)
+{
+	struct page *page = alloc_pages(GFP_KERNEL | __GFP_ZERO, get_order(SZ_16K));
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	SetPageReserved(page);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, apple_dart_test_free_reserved, page),
+			0);
+	return page_address(page);
+}
+
+/*
+ * A 27.2 J713 display DART: re-exported firmware segments take the protection
+ * of the live leaves that map them (read-only text, cacheable data); a region
+ * whose leaf maps another page keeps what it asked for.
+ */
+static void apple_dart_test_j713_v27_fw_prot(struct kunit *test)
+{
+	const u64 fields = GENMASK_ULL(51, 40) | BIT_ULL(0);
+	const phys_addr_t text_pa = 0x80000000ULL, data_pa = 0x80100000ULL;
+	const u64 dva = 0x10000000000ULL + (3ULL << 25);
+	struct iommu_resv_region text = {}, data = {}, moved = {}, mixed = {}, outside = {};
+	struct apple_dart_master_cfg master = {};
+	struct apple_dart *dart;
+	LIST_HEAD(head);
+	u64 *root, *leaf;
+	void *regs;
+
+	if (PAGE_SIZE < SZ_16K)
+		kunit_skip(test, "needs kernel pages of at least 16 KiB");
+	dart = kunit_kzalloc(test, sizeof(*dart), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart);
+	dart->dev = kunit_device_register(test, "apple-dart-j713-v27-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dart->dev);
+	regs = vzalloc(APPLE_DART_TEST_REGS_SIZE);
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, apple_dart_test_vfree, regs), 0);
+	dart->regs = (__force void __iomem *)regs;
+	dart->hw = &apple_dart_hw_t8110;
+	dart->pgsize = SZ_16K;
+	dart->num_streams = 32;
+	dart->oas = 42;
+	dart->locked = true;
+	dart->fw_mirror = true;
+	dart->j713_v27 = true;
+	/* The display DARTs' window: 64 GiB at 1 TiB. */
+	dart->locked_window[23] = 0x10000000000ULL;
+	root = apple_dart_test_reserved_table(test);
+	leaf = apple_dart_test_reserved_table(test);
+	KUNIT_ASSERT_TRUE(test, IS_ALIGNED(virt_to_phys(root) | virt_to_phys(leaf), SZ_16K));
+	writel(((virt_to_phys(root) >> dart->hw->ttbr_shift) << dart->hw->ttbr_addr_field_shift) |
+	       dart->hw->ttbr_valid, dart->regs + DART_TTBR(dart, 23, 0));
+	root[3] = (virt_to_phys(leaf) >> 4) | BIT_ULL(0);
+	/* Text: two read-only pages; data: one read-write page; all cacheable. */
+	leaf[0] = fields | (text_pa >> 4) | BIT_ULL(2);
+	leaf[1] = fields | ((text_pa + SZ_16K) >> 4) | BIT_ULL(2);
+	leaf[2] = fields | (data_pa >> 4);
+	/* Two pages that disagree: one read-only, one read-write. */
+	leaf[4] = fields | ((data_pa + SZ_32K) >> 4) | BIT_ULL(2);
+	leaf[5] = fields | ((data_pa + SZ_32K + SZ_16K) >> 4);
+	text = (struct iommu_resv_region){ .start = text_pa, .dva = dva, .length = SZ_32K,
+		.prot = IOMMU_READ | IOMMU_WRITE, .type = IOMMU_RESV_TRANSLATED };
+	data = (struct iommu_resv_region){ .start = data_pa, .dva = dva + SZ_32K, .length = SZ_16K,
+		.prot = IOMMU_READ | IOMMU_WRITE, .type = IOMMU_RESV_TRANSLATED };
+	moved = (struct iommu_resv_region){ .start = data_pa + SZ_16K, .dva = dva + SZ_32K,
+		.length = SZ_16K, .prot = IOMMU_READ | IOMMU_WRITE, .type = IOMMU_RESV_TRANSLATED };
+	mixed = (struct iommu_resv_region){ .start = data_pa + SZ_32K, .dva = dva + SZ_64K,
+		.length = SZ_32K, .prot = IOMMU_READ | IOMMU_WRITE, .type = IOMMU_RESV_TRANSLATED };
+	/* 64 GiB higher: the same slot bits, outside the window. */
+	outside = (struct iommu_resv_region){ .start = text_pa, .dva = dva + SZ_64G,
+		.length = SZ_32K, .prot = IOMMU_READ | IOMMU_WRITE, .type = IOMMU_RESV_TRANSLATED };
+	list_add_tail(&text.list, &head);
+	list_add_tail(&data.list, &head);
+	list_add_tail(&moved.list, &head);
+	list_add_tail(&mixed.list, &head);
+	list_add_tail(&outside.list, &head);
+	master.stream_maps[0].dart = dart;
+	__set_bit(23, master.stream_maps[0].sidmap);
+	pm_runtime_set_active(dart->dev);
+	pm_runtime_enable(dart->dev);
+
+	__apple_dart_j713_v27_fw_prot(&master, dart->dev, &head);
+	KUNIT_EXPECT_EQ(test, text.prot, IOMMU_READ | IOMMU_CACHE);
+	KUNIT_EXPECT_EQ(test, data.prot, IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
+	KUNIT_EXPECT_EQ(test, moved.prot, IOMMU_READ | IOMMU_WRITE);
+	KUNIT_EXPECT_EQ(test, mixed.prot, IOMMU_READ | IOMMU_WRITE);
+	KUNIT_EXPECT_EQ(test, outside.prot, IOMMU_READ | IOMMU_WRITE);
+
+	/* A leaf table outside reserved RAM is never mapped: nothing changes. */
+	text.prot = IOMMU_READ | IOMMU_WRITE;
+	ClearPageReserved(virt_to_page(leaf));
+	__apple_dart_j713_v27_fw_prot(&master, dart->dev, &head);
+	SetPageReserved(virt_to_page(leaf));
+	KUNIT_EXPECT_EQ(test, text.prot, IOMMU_READ | IOMMU_WRITE);
+
+	/* Not a 27.2 J713 display DART: nothing changes. */
+	text.prot = IOMMU_READ | IOMMU_WRITE;
+	dart->j713_v27 = false;
+	__apple_dart_j713_v27_fw_prot(&master, dart->dev, &head);
+	KUNIT_EXPECT_EQ(test, text.prot, IOMMU_READ | IOMMU_WRITE);
+	pm_runtime_disable(dart->dev);
+}
+
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_strict_engines),
 	KUNIT_CASE(apple_dart_test_topology),
@@ -1335,6 +1447,7 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_locked_handoff),
 	KUNIT_CASE(apple_dart_test_sync_unknown_roots),
 	KUNIT_CASE(apple_dart_test_firmware_roots),
+	KUNIT_CASE(apple_dart_test_j713_v27_fw_prot),
 	KUNIT_CASE(apple_dart_test_unmap_flush_after_publish_failure),
 	KUNIT_CASE(apple_dart_test_gated_commands),
 	KUNIT_CASE(apple_dart_test_resume_commands_failure),
