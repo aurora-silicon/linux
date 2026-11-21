@@ -3655,6 +3655,25 @@ out_wifi:
 	return ret;
 }
 
+/*
+ * An adopted port with an endpoint power GPIO (pwren-gpios) is trained by
+ * Linux. Match the root port itself as well as functions below it.
+ * If no port matches, neither kind of training can be established.
+ */
+static bool apple_pcie_adopted_link_trained_by(struct apple_pcie *pcie,
+					      struct pci_dev *pdev, bool bootloader)
+{
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+	struct apple_pcie_port *port;
+
+	if (!pcie->hw->adopt_link || !rp)
+		return false;
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (port->idx == PCI_SLOT(rp->devfn))
+			return bootloader == !port->pwren;
+	return false;
+}
+
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
@@ -3673,6 +3692,14 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 
 	/* Also cover functions discovered by a later hotplug or rescan. */
 	if (pcie->hw->tunneled)
+		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
+
+	/*
+	 * Firmware owns the power of a boot-trained adopted link, and s2idle
+	 * requires the port and everything below it to stay accessible in D0.
+	 * Keep the PCI core's suspend paths from putting them in D3hot.
+	 */
+	if (apple_pcie_adopted_link_trained_by(pcie, pdev, true))
 		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
 
 	/*
@@ -6710,22 +6737,6 @@ static void apple_pcie_stop_for_sleep(struct device *dev)
 
 static void apple_pcie_neo_save_functions(struct apple_pcie *pcie);
 
-/* Whether Linux trained the port above pdev itself (cold train), rather than adopting it */
-static bool apple_pcie_below_kernel_trained_port(struct pci_dev *pdev)
-{
-	struct pci_config_window *cfg = pdev->sysdata;
-	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
-	struct pci_dev *rp = pcie_find_root_port(pdev);
-	struct apple_pcie_port *port;
-
-	if (!rp)
-		return false;
-	list_for_each_entry(port, &pcie->ports, entry)
-		if (port->idx == PCI_SLOT(rp->devfn))
-			return !!port->pwren;
-	return false;
-}
-
 /*
  * The J716c radio drivers save PCI state without entering D3. The PCI core
  * keeps the root port in D0 as well. Its host and DART have no switchable
@@ -6737,6 +6748,8 @@ static bool apple_pcie_below_kernel_trained_port(struct pci_dev *pdev)
  */
 static int apple_pcie_check_d0(struct pci_dev *pdev, void *data)
 {
+	struct pci_config_window *cfg = pdev->sysdata;
+	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
 	int *error = data;
 	u16 value;
 
@@ -6747,7 +6760,7 @@ static int apple_pcie_check_d0(struct pci_dev *pdev, void *data)
 	 * asked to stay awake need to remain in D0.
 	 */
 	if (!device_awake_path(&pdev->dev) &&
-	    apple_pcie_below_kernel_trained_port(pdev))
+	    apple_pcie_adopted_link_trained_by(pcie, pdev, false))
 		return 0;
 
 	if (pci_read_config_word(pdev, PCI_VENDOR_ID, &value) ||
