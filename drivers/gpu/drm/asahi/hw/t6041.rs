@@ -51,6 +51,7 @@ pub(super) const BASE: Config = Config {
     adopt_root_entries: false,
     fabric_bridge: false,
     sleep_restart: false,
+    oslog_echo: true,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G16,
     firmware: fw::variant::Firmware::Identified(&[]),
