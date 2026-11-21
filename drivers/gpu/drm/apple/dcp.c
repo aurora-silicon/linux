@@ -1295,10 +1295,9 @@ static void dcp_panel_read_adt(struct apple_dcp *dcp)
 	dcp->panel.color_target = ret ? NULL : dcp_panel_gamut_color_space(panel.gamut);
 	/*
 	 * Whether the panel has EDR headroom at all is the machine's to say: an
-	 * XDR panel's backlight node carries EDRPotentialHeadroom above 1.0
-	 * (16.0 on the M1 Pro and M4 Pro XDR panels), an SDR panel such as the
-	 * M3/M4 Air's has none.  Without it the panel gets no peak, so it shows
-	 * no PQ content as EDR and offers userspace no HDR (dcp_panel_edr()).
+	 * XDR panel's backlight node carries EDRPotentialHeadroom above 1.0, an
+	 * SDR panel none.  Without it the panel gets no peak, so it shows no PQ
+	 * content as EDR and offers userspace no HDR (dcp_panel_edr()).
 	 */
 	dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
 	/*
