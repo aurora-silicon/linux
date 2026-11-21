@@ -21,7 +21,12 @@ use kernel::{
 use logic::{RecoveryAction, Retirement, SnapshotEntry};
 
 use super::job::{Completions, Job};
+use super::regs::wmb;
 use super::{params, Firmware};
+
+/// S1, the lowest powered row of the firmware DVFS table, as the Globals p-state selectors
+/// express it (hundredths of a state). The host starts the firmware there too.
+const FLOOR_SELECTOR: u32 = 100;
 
 /// Monotonic time, ns.
 pub(crate) fn now_ns() -> u64 {
@@ -237,6 +242,7 @@ impl Firmware {
     pub(crate) fn fail_stop(&mut self, error: Error, done: &mut Completions) {
         if self.recovery.failed.is_none() {
             self.recovery.failed = Some(error);
+            self.floor_power(error);
         }
         self.engine.frozen = true;
         self.events.grow.clear();
@@ -249,6 +255,41 @@ impl Firmware {
                 self.retain(job);
             }
         }
+    }
+
+    /// A failed device must not stay at its last performance request: the J773g idled at 98 C
+    /// after a fail-stop, against 83 C with the GPU idle. The Globals ceiling selectors are
+    /// host-owned (`service_power` writes them at runtime and stops after a failure): drop them
+    /// to S1 and log the one fail-stop summary. Nothing firmware-owned is touched, and no GPU
+    /// register is read.
+    fn floor_power(&mut self, error: Error) {
+        let before = self.power.effective;
+        let floored = match self.init.globals.as_ref() {
+            Some(globals) => self
+                .init
+                .abi
+                .initdata()
+                .pstate_selectors
+                .iter()
+                .all(|&offset| globals.w32(offset, FLOOR_SELECTOR).is_ok()),
+            None => false,
+        };
+        if floored {
+            wmb();
+            self.power.effective = 1;
+        }
+        dev_err!(
+            self.dev(),
+            "G16: fail-stop ({:?}): host ceiling S{} -> {}, temperature {} mC\n",
+            error,
+            before,
+            if floored {
+                "S1"
+            } else {
+                "unchanged (Globals unwritable)"
+            },
+            self.power.temperature_mc
+        );
     }
 
     /// Flights own firmware-visible resources and slot claims. Failed-stop
