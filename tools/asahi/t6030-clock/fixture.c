@@ -139,8 +139,8 @@ static int apple_t6050_dp_tunnel_clock(struct phy *p, unsigned clock, u8 rate)
 	return t6050_error;
 }
 /*
- * Production: of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext").
- * These are T6030 DCPs: the T8132 dcpext paths must never be taken.
+ * Production: an apple,t8132-dcpext the M4 backend adopts (dcp_t8132_ext_m4_node():
+ * not a J773g one on firmware 27.2). These are T6030 DCPs: the T8132 dcpext paths must never be taken.
  */
 static bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
 {
