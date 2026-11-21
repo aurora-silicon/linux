@@ -3561,6 +3561,7 @@ static int __init gate_t8132_v27_display_iommus(struct of_changeset *cs,
 static void __init gate_t8132_dcpext_v27(void)
 {
 	struct device_node *darts[2] = {}, *display, *np;
+	const char *why = NULL;
 	struct of_changeset *cs;
 	unsigned int n = 0, i;
 	int ret = 0;
@@ -3568,6 +3569,21 @@ static void __init gate_t8132_dcpext_v27(void)
 	display = of_find_compatible_node(NULL, NULL, "apple,t8132-display-subsystem");
 	if (!display)
 		return;
+	/*
+	 * As for the J613 (gate_t8122_dcpext()): enabled routes make the
+	 * Type-C port controllers wait for the display driver's mode switches.
+	 * Without a T8132 display driver, not built or kept off by nomodeset,
+	 * none registers and USB is lost on both ports.
+	 */
+	if (!IS_ENABLED(CONFIG_DRM_APPLE) || !IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132))
+		why = "the T8132 display driver is not built";
+	else if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only())
+		why = "nomodeset is on the command line";
+	if (why) {
+		pr_info("apple-j713-display: 27.2 dcpext Type-C routes left disabled: %s\n", why);
+		of_node_put(display);
+		return;
+	}
 	cs = gate_cs_alloc();
 	if (!cs) {
 		of_node_put(display);
