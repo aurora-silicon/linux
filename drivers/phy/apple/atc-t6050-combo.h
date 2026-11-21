@@ -241,6 +241,8 @@ static int combo_orientation(struct t6050_dp *dp, enum typec_orientation orienta
 	int ret;
 
 	guard(mutex)(&dp->lock);
+	if (dp->s2idle_frozen)
+		return -EBUSY;
 	if (dp->faulted)
 		return -EIO;
 	if (orientation != TYPEC_ORIENTATION_NONE && orientation != TYPEC_ORIENTATION_NORMAL &&
@@ -281,6 +283,8 @@ static int combo_mux(struct t6050_dp *dp, struct typec_mux_state *state)
 		return -EOPNOTSUPP;
 	}
 	guard(mutex)(&dp->lock);
+	if (dp->s2idle_frozen)
+		return -EBUSY;
 	if (dp->faulted)
 		return -EIO;
 	/* SAFE with a domain still held: a sleep kept it, and nothing came back on the port. */
@@ -375,6 +379,61 @@ static void combo_resume(struct t6050_dp *dp)
 }
 
 /*
+ * Suspend-to-idle leaves an active combo PHY running: t6050_dp_suspend_late()
+ * only quiesces for firmware sleep. Hold the active virtual genpd devices out
+ * of genpd_suspend_noirq() so phymxwrap (and common/usb/dp gates) are not
+ * powered off under the running PHY CPU. Close PHY mode and clock changes
+ * under the same mutex as the late snapshot, including work that can still
+ * run after the freezer. Reopen after noirq on resume or suspend unwind.
+ */
+static void combo_s2idle_hold(struct t6050_dp *dp)
+{
+	guard(mutex)(&dp->lock);
+	dp->s2idle_frozen = true;
+	if (dp->faulted || dp->combo_mode == COMBO_SAFE)
+		return;
+	for (unsigned int i = 0; i < dp->ndomains; i++) {
+		if (dp->domain[i].active &&
+		    !(i == 0 && dp->aon_syscore) &&
+		    !(dp->s2idle_domain_syscore & BIT(i))) {
+			dev_pm_syscore_device(dp->domain[i].dev, true);
+			dp->s2idle_domain_syscore |= BIT(i);
+		}
+	}
+	if (dp->dp_gates) {
+		for (unsigned int i = 0; i < ATC_DP_TUNNELS; i++) {
+			if (dp->dp_gate[i].active &&
+			    !(dp->s2idle_gate_syscore & BIT(i))) {
+				dev_pm_syscore_device(dp->dp_gate[i].dev, true);
+				dp->s2idle_gate_syscore |= BIT(i);
+			}
+		}
+	}
+}
+
+static void combo_s2idle_release(struct t6050_dp *dp)
+{
+	guard(mutex)(&dp->lock);
+	if (dp->s2idle_domain_syscore) {
+		for (unsigned int i = 0; i < dp->ndomains; i++) {
+			if (dp->s2idle_domain_syscore & BIT(i))
+				dev_pm_syscore_device(dp->domain[i].dev, false);
+		}
+		dp->s2idle_domain_syscore = 0;
+	}
+	if (dp->s2idle_gate_syscore) {
+		for (unsigned int i = 0; i < ATC_DP_TUNNELS; i++) {
+			if (dp->s2idle_gate_syscore & BIT(i))
+				dev_pm_syscore_device(dp->dp_gate[i].dev, false);
+		}
+		dp->s2idle_gate_syscore = 0;
+	}
+	dp->s2idle_frozen = false;
+	if (dp->s2idle_clock_stops)
+		queue_work(system_freezable_wq, &dp->s2idle_clock_work);
+}
+
+/*
  * A port in use keeps its always-on domain through a deep sleep: held out of the system
  * transition from before its prepare to after its complete, so the power domain is not
  * counted as suspended, and asked of the sleep driver, which lowers the word otherwise.
@@ -386,35 +445,7 @@ static int combo_pm_notify(struct notifier_block *nb, unsigned long action, void
 	guard(mutex)(&dp->lock);
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
-		if (pm_suspend_no_platform()) {
-			if (dp->faulted || dp->combo_mode == COMBO_SAFE)
-				break;
-			/*
-			 * Suspend-to-idle leaves an active combo PHY running:
-			 * t6050_dp_suspend_late() only quiesces for firmware
-			 * sleep. Hold the active virtual genpd devices out of
-			 * system suspend so genpd does not power off phymxwrap
-			 * (or common/usb) under the running PHY CPU.
-			 */
-			for (unsigned int i = 0; i < dp->ndomains; i++) {
-				if (dp->domain[i].active &&
-				    !(dp->s2idle_domain_syscore & BIT(i))) {
-					dev_pm_syscore_device(dp->domain[i].dev, true);
-					dp->s2idle_domain_syscore |= BIT(i);
-				}
-			}
-			if (dp->dp_gates) {
-				for (unsigned int i = 0; i < ATC_DP_TUNNELS; i++) {
-					if (dp->dp_gate[i].active &&
-					    !(dp->s2idle_gate_syscore & BIT(i))) {
-						dev_pm_syscore_device(dp->dp_gate[i].dev, true);
-						dp->s2idle_gate_syscore |= BIT(i);
-					}
-				}
-			}
-			break;
-		}
-		if (!combo_sleep_board() || dp->faulted || dp->aon_syscore ||
+		if (pm_suspend_default_s2idle() || dp->faulted || dp->aon_syscore ||
 		    dp->combo_mode == COMBO_SAFE || !dp->domain[0].active)
 			break;
 		if (!apple_sleep_usb_aon_keep(dp->port, true))
@@ -423,26 +454,10 @@ static int combo_pm_notify(struct notifier_block *nb, unsigned long action, void
 		dp->aon_syscore = true;
 		break;
 	case PM_POST_SUSPEND:
-		if (dp->s2idle_domain_syscore) {
-			for (unsigned int i = 0; i < dp->ndomains; i++) {
-				if (dp->s2idle_domain_syscore & BIT(i))
-					dev_pm_syscore_device(dp->domain[i].dev, false);
-			}
-			dp->s2idle_domain_syscore = 0;
-		}
-		if (dp->s2idle_gate_syscore) {
-			for (unsigned int i = 0; i < ATC_DP_TUNNELS; i++) {
-				if (dp->s2idle_gate_syscore & BIT(i))
-					dev_pm_syscore_device(dp->dp_gate[i].dev, false);
-			}
-			dp->s2idle_gate_syscore = 0;
-		}
-		if (combo_sleep_board()) {
-			apple_sleep_usb_aon_keep(dp->port, false);
-			if (dp->aon_syscore) {
-				dev_pm_syscore_device(dp->domain[0].dev, false);
-				dp->aon_syscore = false;
-			}
+		apple_sleep_usb_aon_keep(dp->port, false);
+		if (dp->aon_syscore) {
+			dev_pm_syscore_device(dp->domain[0].dev, false);
+			dp->aon_syscore = false;
 		}
 		break;
 	default:
@@ -756,6 +771,13 @@ static int combo_setup(struct platform_device *pdev, struct t6050_dp *dp)
 			return PTR_ERR(dp->combo_phy[i]);
 		phy_set_drvdata(dp->combo_phy[i], dp);
 	}
+	/*
+	 * Deep-sleep hold of the always-on domain (board gate left for the
+	 * deep-sleep pass); s2idle hold runs for all T6050 combo PHYs in
+	 * t6050_dp_suspend_late() / t6050_dp_resume_early().
+	 */
+	if (!combo_sleep_board())
+		return 0;
 	dp->pm_nb.notifier_call = combo_pm_notify;
 	ret = register_pm_notifier(&dp->pm_nb);
 	if (ret)
