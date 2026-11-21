@@ -408,14 +408,16 @@ static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 		dev_info(dcp->dev, "no apple,display-power in the device tree, the firmware keeps running\n");
 		dcp->hw.s2r_ext = false;
 	}
+	/*
+	 * Without a layout from the device tree, an external DCP keeps the fixed DISPEXT0
+	 * sequence it had before (T8140); a firmware-27 one is then not dcp_s2r_ext_capable()
+	 * without the lab parameter and refuses a deep sleep instead.
+	 */
 	if (dcp->hw.s2r_ext && !dcp->hw.s2r_layout) {
 		int ret = dcp_s2r_layout_from_dt(dcp);
 
-		if (ret) {
-			dev_info(dcp->dev, "display power words not in the device tree (%d), the firmware keeps running\n",
-				 ret);
-			dcp->hw.s2r_ext = false;
-		}
+		if (ret)
+			dev_dbg(dcp->dev, "display power words not in the device tree (%d)\n", ret);
 	}
 	if (dcp->hw.s2r && dcp->hw.s2r_untested)
 		dev_info(dcp->dev, "firmware stop enabled (appledrm.s2r_untested)\n");
