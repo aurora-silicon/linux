@@ -604,12 +604,7 @@ impl AsahiPlatformDriver {
         // The G17P firmware DATA diagnostics read only the bound GPU's own data segment.
         #[cfg(CONFIG_DRM_ASAHI_G18)]
         if cfg.identity.gpu_variant == hw::GpuVariant::P {
-            let fixed = if cfg.chip_id == hw::t8140::CHIP_ID {
-                crate::g18::compat::g17p::G17P_J700_GFX_DATA_FIXED
-            } else {
-                0
-            };
-            crate::g18::compat::g17p::g17p_publish_gfx_data(pdev.as_ref(), fixed);
+            crate::g18::compat::g17p::g17p_publish_gfx_data(pdev.as_ref());
         }
         Ok(AsahiPlatformDriverData {
             binding,

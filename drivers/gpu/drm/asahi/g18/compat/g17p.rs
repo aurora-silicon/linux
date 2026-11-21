@@ -29,10 +29,6 @@ const G17P_GFX_LINK_DATA_END: u64 = 0xffff_fc00_0018_0000;
 /// bound. The module parameters that read firmware DATA exist on every Mac.
 static G17P_GFX_PHYSICAL_DATA_BASE: AtomicU64 = AtomicU64::new(0);
 
-/// Where the J700's boot loader places the GFX DATA segment (T8140), for a
-/// boot whose device tree has no `fw-data` region.
-pub(crate) const G17P_J700_GFX_DATA_FIXED: u64 = 0x0000_0100_01d7_c000;
-
 /// The `fw-data` region's start, if it holds the whole GFX DATA segment. The
 /// region holds the data segments of both firmware roles, GFX (ADT sgx
 /// gfx-data) first.
@@ -51,10 +47,11 @@ fn g17p_fw_data_start(dev: &device::Device) -> Option<u64> {
     Some(start)
 }
 
-/// Publish the GFX DATA base of a probed G17P GPU: its `fw-data` region, or
-/// else `fixed`, the address its boot loader is known to use (0 = none).
-pub(crate) fn g17p_publish_gfx_data(dev: &device::Device, fixed: u64) {
-    let base = g17p_fw_data_start(dev).unwrap_or(fixed);
+/// Publish the GFX DATA base of a probed G17P GPU from its `fw-data` region.
+/// Without a usable region nothing is published and the diagnostics that read
+/// firmware DATA report none.
+pub(crate) fn g17p_publish_gfx_data(dev: &device::Device) {
+    let base = g17p_fw_data_start(dev).unwrap_or(0);
     G17P_GFX_PHYSICAL_DATA_BASE.store(base, Ordering::Release);
 }
 

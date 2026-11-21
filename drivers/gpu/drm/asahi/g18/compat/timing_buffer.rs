@@ -396,7 +396,7 @@ unsafe extern "C" fn diag_get(buf: *mut core::ffi::c_char,
     for (name, link) in [("powerups", 0xffff_fc00_0012_4ba0u64), ("state", 0xffff_fc00_0017_71f8),
         ("idleoff", 0xffff_fc00_0017_7838), ("keepon", 0xffff_fc00_0012_8a68)] {
         let Some(physical) = crate::g18::compat::g17p::g17p_gfx_link_to_physical(link) else {
-            let _ = writeln!(out, "{} none (no G17P bound)", name);
+            let _ = writeln!(out, "{} none (no G17P fw-data region)", name);
             continue;
         };
         let value = crate::g18::compat::g17p::LiveFirmwareU64Probe::new(physical)
@@ -441,7 +441,7 @@ unsafe extern "C" fn peek_get(buf: *mut core::ffi::c_char,
     if address < PEEK_DATA_START { return 0; }
     let page = crate::pgtable::UAT_PGSZ as u64;
     let Some(physical) = crate::g18::compat::g17p::g17p_gfx_link_to_physical(address) else {
-        let _ = writeln!(out, "error: no G17P bound");
+        let _ = writeln!(out, "error: no G17P fw-data region");
         return out.used as core::ffi::c_int;
     };
     let room = ((page - (physical & (page - 1))) / 8).min(64) as usize;
