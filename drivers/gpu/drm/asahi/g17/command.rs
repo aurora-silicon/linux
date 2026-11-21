@@ -737,7 +737,14 @@ impl Payload {
                 })
             }
             Self::Compute(cmd, attachments, intersection, resources) => {
-                let as_build = if m5 { false } else { super::timeout::as_build(cmd.flags).ok_or(EINVAL)? };
+                let as_build = if m5 {
+                    false
+                } else {
+                    super::timeout::as_build(
+                        cmd.flags & !crate::file::DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS,
+                    )
+                    .ok_or(EINVAL)?
+                };
                 if (m5
                     && (cmd.flags
                         & !(crate::file::DRM_ASAHI_COMPUTE_USES_MATRIX
