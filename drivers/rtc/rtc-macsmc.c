@@ -444,6 +444,14 @@ static int macsmc_rtc_probe(struct platform_device *pdev)
 	rtc->offset_in_seconds = of_property_read_bool(pdev->dev.of_node,
 						       "apple,rtc-offset-seconds");
 
+	/*
+	 * Free-running counter + nvmem offset, not a post-write tick-up RTC.
+	 * The class default (1s + 5 ms) shrinks rtc_tv_nsec_ok to the edge fuzz
+	 * and makes sync_hw_clock retry constantly. Use a half-second systohc
+	 * phase window like CMOS, not a transport-time offset.
+	 */
+	rtc->rtc_dev->set_offset_nsec = NSEC_PER_SEC / 2;
+
 	rtc->rtc_dev->ops = &macsmc_rtc_ops;
 	ret = macsmc_rtc_init_alarm(pdev, rtc);
 	if (ret == -EPROBE_DEFER)
