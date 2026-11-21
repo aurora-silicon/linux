@@ -4639,10 +4639,41 @@ static void sleep_ps_rewake(struct apple_sleep *s)
 		s->ps_rewake_timeouts += redo_aon[i];
 }
 
+/*
+ * Which blocks lost their power across this sleep: a coprocessor whose word is listed lost its
+ * firmware as well, whatever the wake wrote back, and a driver that talks to it after the wake
+ * talks to a reset block. A line at info for the PMGR or the always-on PMGR only when one of
+ * its words was lost; the usual case, every word back on, is at debug.
+ */
+
+static void sleep_ps_report_off(struct apple_sleep *s, const char *name,
+				const struct apple_sleep_words *w, const u32 *commit,
+				const u32 *woke)
+{
+	char buf[384];
+	int i, len = 0, off = 0;
+
+	for (i = 0; i < w->count; i++) {
+		if (!FIELD_GET(PS_TARGET, commit[i]) || FIELD_GET(PS_ACTUAL, woke[i]))
+			continue;
+		off++;
+		if (len < sizeof(buf) - 8)
+			len += scnprintf(buf + len, sizeof(buf) - len, " %#x", w->offset[i]);
+	}
+	if (off)
+		dev_info(s->dev, "%s: %d words on at the commit were off at the wake:%s\n", name,
+			 off, buf);
+	else
+		dev_dbg(s->dev, "%s: all words on at the commit were on at the wake\n", name);
+}
+
 static void sleep_ps_rewake_report(struct apple_sleep *s)
 {
 	const struct apple_sleep_words *all = &s->soc->ps_all, *aon = &s->soc->ps_aon_all;
 	int i;
+
+	sleep_ps_report_off(s, "PMGR", all, s->ps_commit, s->ps_woke);
+	sleep_ps_report_off(s, "AON PMGR", aon, s->ps_aon_commit, s->ps_aon_woke);
 
 	dev_dbg(s->dev, "power words: %u written back, %u not on in time\n", s->ps_rewoken,
 		s->ps_rewake_timeouts);
