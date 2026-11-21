@@ -9,6 +9,7 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#define T6050_K116S
 #include "t6050-k114-k116.dtsi"
 
 / {
@@ -19,9 +20,6 @@
 &mtp_multitouch {
 	firmware-name = "apple/tpmtfw-k116s.bin";
 };
-
-#define T6050_K116S
-#include "t6050-peripherals.dtsi"
 
 / {
 	aliases {
@@ -422,16 +420,16 @@
 	 * over, as on the J714s, and refuses a tree that already has them.
 	 */
 	apple,clock-ids = <361 458>;
+};
 
-	/*
-	 * The 16.2-inch 3456x2234 tandem OLED panel. The ADT carries no dimensions;
-	 * these are the panel's active area, for the DPI only.
-	 */
-	panel {
-		compatible = "apple,panel-k116", "apple,panel";
-		width-mm = <345>;
-		height-mm = <223>;
-	};
+/*
+ * The 16.2-inch 3456x2234 tandem OLED panel. The ADT carries no dimensions;
+ * these are the panel's active area, for the DPI only.
+ */
+&panel {
+	compatible = "apple,panel-k116", "apple,panel";
+	width-mm = <345>;
+	height-mm = <223>;
 };
 
 /* The ADT lists no clocks for the external engines (clock-ids = []) */
