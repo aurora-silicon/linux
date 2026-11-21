@@ -3413,6 +3413,8 @@
 			power-domains = <&ps_avd_sys>;
 			resets = <&ps_avd_sys>;
 			iommus = <&avd_dart 0x00>, <&avd_dart 0x01>, <&avd_dart 0x02>;
+			/* Off with its DART and ps_avd_sys, as video-decoder@2308000000 is. */
+			status = "disabled";
 		};
 
 		avd_dart: iommu@2309020000 {
