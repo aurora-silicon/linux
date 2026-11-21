@@ -283,6 +283,9 @@ ASAHI_TESTS = {
     'radio-sleep-fence-tests.py': [([], PASS)],
     'radio-sleep-power-tests.py': [([], PASS)],
     'radio-sleep-snapshot-tests.py': [([], PASS)],
+    # cacf35543b4d serves endpoint 7 for every co-processor.
+    'rtkit-coreanalytics-tests.py': [(out(), PASS),
+                                     (out() + ['--old-ref', 'cacf35543b4d534fccef3033bd2ddbb415a325b2'], PASS)],
     'rtkit-crashlog-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
                                    'mailbox-minimum', 'version-string', 'message-string'), out()),

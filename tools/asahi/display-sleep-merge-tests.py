@@ -135,6 +135,7 @@ static u64 ktime_get_ns(void) { clock_calls++; return 37; }
 STUB(apple_rtkit_management_rx) STUB(apple_rtkit_crashlog_rx) STUB(apple_rtkit_syslog_rx)
 STUB(apple_rtkit_ioreport_rx) STUB(apple_rtkit_kdebug_rx) STUB(apple_rtkit_pmp_aux_rx)
 STUB(apple_rtkit_coreanalytics_rx) STUB(apple_rtkit_oslog_rx)
+static bool apple_rtkit_ep7_served(struct apple_rtkit *r) { return false; }
 static void timed_cb(void *c,u8 e,u64 m,u64 ns) { assert(e==0x2a && m==0x1234); timed++; observed=ns; }
 static void legacy_cb(void *c,u8 e,u64 m) { assert(e==0x2a && m==0x1234); legacy++; }
 '''

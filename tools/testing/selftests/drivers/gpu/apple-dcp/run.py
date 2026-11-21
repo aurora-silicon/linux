@@ -175,6 +175,8 @@ def main():
                     # The T6050 PMP registry-v2 buffer shares endpoint 7.
                     prefix += ('#define apple_rtkit_pmp_aux_rx(...) '
                                'assert(!"The PMP auxiliary buffer is outside this ordered-display fixture")\n')
+                    # A display co-processor doesn't take CoreAnalytics buffers.
+                    prefix += '#define apple_rtkit_ep7_served(...) false\n'
                 unit = prefix + unit
             if unit is not None:
                 result['translation_unit_sha256'] = run_unit(name, unit, output, cases, includes if name == 'service-rebind' else (), flags)

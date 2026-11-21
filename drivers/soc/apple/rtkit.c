@@ -179,6 +179,15 @@ static bool apple_rtkit_needs_coreanalytics(struct apple_rtkit *rtk)
 	return rtk->ops->flags & APPLE_RTKIT_NEEDS_COREANALYTICS;
 }
 
+/*
+ * Endpoint 7 carries CoreAnalytics, or the auxiliary buffer of registry-v2 PMP
+ * firmware. The endpoint map starts it, and the dispatcher serves it, only then.
+ */
+static bool apple_rtkit_ep7_served(struct apple_rtkit *rtk)
+{
+	return rtk->pmp_registry_v2 || apple_rtkit_needs_coreanalytics(rtk);
+}
+
 static bool apple_rtkit_firmware_owns_crashlog(struct apple_rtkit *rtk)
 {
 	return rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG;
@@ -426,7 +435,7 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 			break;
 
 		case APPLE_RTKIT_EP_COREANALYTICS:
-			if (!rtk->pmp_registry_v2 && !apple_rtkit_needs_coreanalytics(rtk))
+			if (!apple_rtkit_ep7_served(rtk))
 				break;
 			fallthrough;
 
@@ -1503,7 +1512,11 @@ static void apple_rtkit_rx_dispatch(struct apple_rtkit *rtk, u8 ep, u64 msg,
 				 ep, msg);
 		break;
 	case APPLE_RTKIT_EP_COREANALYTICS:
-		if (rtk->pmp_registry_v2)
+		if (!apple_rtkit_ep7_served(rtk))
+			dev_warn(rtk->dev,
+				 "RTKit: message to unknown endpoint %02x: %llx\n",
+				 ep, msg);
+		else if (rtk->pmp_registry_v2)
 			apple_rtkit_pmp_aux_rx(rtk, msg);
 		else
 			apple_rtkit_coreanalytics_rx(rtk, msg);
