@@ -27,6 +27,15 @@
 	};
 };
 
+/*
+ * From this board's macOS 27.2 (26B123) CLPC floor residency under one
+ * CPU-bound thread: the top of the two DCS/fabric pairs it alternates
+ * between, read as DCS 6 and fabric 3 (state order, not verified).
+ */
+&clpc {
+	apple,cpu-busy-floor = <6 3>;
+};
+
 /* PCIe port 0 is not described for this board yet */
 &pcie0 {
 	status = "disabled";
