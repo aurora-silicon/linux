@@ -36,21 +36,28 @@ static void tb_cio_release_xdomains(struct tb *tb, struct tb_switch *sw)
 	struct tb_port *port;
 
 	tb_switch_for_each_port(sw, port) {
+		struct tb_xdomain *xd;
+
 		if (tb_is_upstream_port(port))
 			continue;
-		if (port->xdomain) {
-			struct tb_xdomain *xd = tb_xdomain_get(port->xdomain);
-
-			tb_port_dbg(port, "xdomain released for the sleep\n");
-			xd->is_unplugged = true;
-			tb_xdomain_remove(xd);
-			port->xdomain = NULL;
-			__tb_disconnect_xdomain_paths(tb, xd, -1, -1, -1, -1);
-			tb_xdomain_put(xd);
-			tb_port_unconfigure_xdomain(port);
-		} else if (tb_port_has_remote(port)) {
+		if (tb_port_has_remote(port)) {
 			tb_cio_release_xdomains(tb, port->remote->sw);
+			continue;
 		}
+		/* By its route, as it was found: the bus holds it wherever the port keeps it. */
+		xd = tb_xdomain_find_by_route(tb, tb_downstream_route(port));
+		tb_port_dbg(port, "sleep: xdomain %s, port's %s\n", xd ? "found" : "none",
+			    port->xdomain ? "set" : "unset");
+		if (!xd)
+			continue;
+		tb_port_info(port, "xdomain released for the sleep\n");
+		xd->is_unplugged = true;
+		tb_xdomain_remove(xd);
+		if (port->xdomain == xd)
+			port->xdomain = NULL;
+		__tb_disconnect_xdomain_paths(tb, xd, -1, -1, -1, -1);
+		tb_xdomain_put(xd);
+		tb_port_unconfigure_xdomain(port);
 	}
 }
 
