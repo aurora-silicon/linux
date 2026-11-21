@@ -210,6 +210,11 @@ def t6041_v27_admission(root):
     t8132_h = (root / 'include/linux/soc/apple/t8132.h').read_text()
     t8132_admission = block(t8132_h, 'static inline bool apple_t8132_dcpext_v27_2(')
     assert 'of_machine_is_compatible' not in t8132_admission
+    # Which processors join the DRM device: the T8132 internal DCP on the 27.2 image joins
+    # off the M4 backend's firmware path too, decided by the same handoff, not the board.
+    drv_c = (root / 'drivers/gpu/drm/apple/apple_drv.c').read_text()
+    usable = block(drv_c, 'static bool apple_dcp_usable(')
+    assert 'of_machine_is_compatible' not in usable
     return r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -243,6 +248,17 @@ static int of_device_is_compatible(const struct device_node *np, const char *s)
 {
     return np && np->compatible && !strcmp(np->compatible, s);
 }
+static bool of_device_is_available(const struct device_node *np)
+{
+    return np != NULL;
+}
+/* apple_dcp_usable()'s other processors: never reached by a T8132 node. */
+static bool dcp_t6030_ext_native(struct device_node *np)
+{ (void)np; assert(!"T6030 dcpext in a T8132 scenario"); return false; }
+static bool dcp_h17p_external_supported(struct device_node *np)
+{ (void)np; assert(!"T8140 dcpext in a T8132 scenario"); return false; }
+static bool dcp_t6041_ext_enabled(void)
+{ assert(!"T6041 dcpext in a T8132 scenario"); return false; }
 static bool of_property_present(const struct device_node *np, const char *name)
 {
     assert(!strcmp(name, "apple,clock-ids"));
@@ -319,7 +335,7 @@ static int dcp_read_fw_version(struct device *dev, const char *name, char *out)
     snprintf(out, DCP_FW_VERSION_STR_LEN, "%u.%u.%u", v[0], v[1], v[2]);
     return 3;
 }
-''' + helper + '\n' + methods_decl + '\n' + v27_tables + '\n' + t8132_admission + '\n' + method_table + '\n' + selector + r'''
+''' + helper + '\n' + methods_decl + '\n' + v27_tables + '\n' + t8132_admission + '\n' + method_table + '\n' + selector + '\n' + usable + r'''
 static struct device_node node;
 static struct apple_dcp_hw_data hw_t6041;
 static struct device dev = { .of_node = &node, .hw = &hw_t6041 };
@@ -460,9 +476,11 @@ int main(void)
         assert(!apple_t8132_dcpext_v27_2(&node));
         assert(!apple_t6041_dcp_v27_2(&node));
         assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
+        assert(apple_dcp_usable(&node));
         node.clock_ids = false;
         assert(!apple_t8132_dcp_v27_2(&node));
         assert(dcp_check_firmware_version(&dev) == (path ? DCP_FIRMWARE_M4 : DCP_FIRMWARE_UNKNOWN));
+        assert(apple_dcp_usable(&node) == path);
         node.clock_ids = true;
     }
     t8132_firmware_path = true;
@@ -478,11 +496,25 @@ int main(void)
     assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_M4);
     node.compat[1] = 2; assert(apple_t8132_dcp_v27_2(&node));
     t8132_firmware_path = false;
+    /* Off the M4 path another release keeps the internal DCP out of the DRM device. */
+    node.compat[1] = 0; assert(!apple_dcp_usable(&node));
+    node.compat[1] = 2; assert(apple_dcp_usable(&node));
+    /* A T8132 dcpext joins only on the 27.2 image, on either path. */
+    node.compatible = "apple,t8132-dcpext";
+    for (unsigned path = 0; path < 2; path++) {
+        t8132_firmware_path = path;
+        assert(apple_dcp_usable(&node));
+        node.uuid = APPLE_T6041_DCP_26B123_UUID;
+        assert(!apple_dcp_usable(&node));
+        node.uuid = APPLE_T8132_DCP_26B123_UUID;
+    }
+    t8132_firmware_path = false;
 
     dev.hw = &hw_t6041;
     puts("PASS T6041 26B123 v27.2 internal/external admission, refusal controls, and desktop 26.x preservation");
     puts("PASS T8132 M4 backend only on its firmware path; a T8132 dcpext on the 27.2 image runs the 27.2 table on any board");
     puts("PASS T8132 internal DCP with the 27.2 image and its firmware-27 clocks runs the 27.2 table; without them nothing changes");
+    puts("PASS T8132 internal DCP on the 27.2 image joins the DRM device on any board; off the M4 path nothing else does");
     return 0;
 }
 '''
