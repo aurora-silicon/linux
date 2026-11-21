@@ -446,7 +446,7 @@ module! {
             description: "T8103 27.2: accept render commands on the DRM device",
         },
         t8112_g13_buffer_slots: u32 {
-            default: 63,
+            default: 24,
             description: "T8103 27.2 render: tile buffer slots handed to the firmware",
         },
         t8112_g13_autogrow: bool {

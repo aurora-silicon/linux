@@ -302,6 +302,12 @@ struct BufferInner {
     ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
     ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
     blocks: KVec<GpuOnlyArray<u8>>,
+    /// 27.2: blocks taken from the slot's arena chunk (`blocks` stays empty).
+    #[ver(V >= V27_2)]
+    chunk_blocks: usize,
+    /// 27.2: device, for the slot's chunk.
+    #[ver(V >= V27_2)]
+    dev: crate::driver::AsahiDevRef,
     max_blocks: usize,
     max_blocks_nomemless: usize,
     mgr: BufferManager::ver,
@@ -359,10 +365,38 @@ pub(crate) struct PageListArena {
     stride: usize,
     slots: usize,
     client_va: core::sync::atomic::AtomicU64,
-    /// The arena object and its client mappings (address space id, uses, mapping).
+    /// The page list object, the client address spaces it is mapped into, and the block
+    /// chunks of the slots.
     #[pin]
-    maps: Mutex<(crate::gem::ObjectRef, KVec<(u64, u32, mmu::KernelMapping)>)>,
+    maps: Mutex<ArenaState>,
 }
+
+/// One client address space the arena is mapped into.
+pub(crate) struct ArenaVm {
+    vm: mmu::Vm,
+    uses: u32,
+    _page_lists: mmu::KernelMapping,
+    chunks: KVec<(usize, mmu::KernelMapping)>,
+}
+
+/// One slot's tile buffer blocks: an object mapped at the slot's address in every client
+/// address space, so a page the hardware still holds from a gone buffer stays readable.
+pub(crate) struct ArenaChunk {
+    obj: crate::gem::ObjectRef,
+    /// Kept for good: its buffer ended before the firmware let go of the slot.
+    quarantined: bool,
+}
+
+pub(crate) struct ArenaState {
+    obj: crate::gem::ObjectRef,
+    vms: KVec<ArenaVm>,
+    chunks: KVec<Option<ArenaChunk>>,
+    prot: Option<mmu::Prot>,
+}
+
+/// Tile buffer blocks per slot chunk (16 MiB).
+pub(crate) const CHUNK_BLOCKS: usize = 128;
+const CHUNK_BYTES: usize = CHUNK_BLOCKS * BLOCK_SIZE;
 
 // SAFETY: the object and mappings are only used through the mutex or immutable addresses.
 unsafe impl Send for PageListArena {}
@@ -398,12 +432,14 @@ pub(crate) fn init_page_list_arena(dev: &crate::driver::AsahiDrmDevice, kvm: &mm
         for off in (0..stride * slots).step_by(4) { vmap.try_write32(0, off)?; }
     }
     let kmap = obj.map_into_range(kvm, PAGE_LIST_KERNEL_RANGE, mmu::UAT_PGSZ as u64, kprot, true)?;
+    let mut chunks = KVec::new();
+    for _ in 0..slots { chunks.push(None, GFP_KERNEL)?; }
     let arena = KBox::pin_init(try_pin_init!(PageListArena {
         kmap,
         stride,
         slots,
         client_va: core::sync::atomic::AtomicU64::new(0),
-        maps <- kernel::new_mutex!((obj, KVec::new())),
+        maps <- kernel::new_mutex!(ArenaState { obj, vms: KVec::new(), chunks, prot: None }),
     }), GFP_KERNEL)?;
     // SAFETY: the arena is never moved out of its allocation, which is leaked.
     let raw = KBox::into_raw(unsafe { core::pin::Pin::into_inner_unchecked(arena) });
@@ -411,14 +447,22 @@ pub(crate) fn init_page_list_arena(dev: &crate::driver::AsahiDrmDevice, kvm: &mm
     Ok(())
 }
 
+/// Client address of slot `slot`'s block chunk (below the page lists).
+fn chunk_va(a: &PageListArena, slot: usize) -> Option<u64> {
+    let lists = a.client_va.load(Ordering::Acquire);
+    if lists == 0 || slot >= a.slots { return None; }
+    let base = lists.checked_sub(0x100_0000 + (a.slots * CHUNK_BYTES) as u64)? & !((CHUNK_BYTES as u64) - 1);
+    Some(base + (slot * CHUNK_BYTES) as u64)
+}
+
 /// Maps the arena into a client address space (counted per address space).
 pub(crate) fn arena_acquire(vm: &mmu::Vm, range: core::ops::Range<u64>, prot: mmu::Prot) -> Result {
     let Some(a) = arena() else { return Err(ENODEV) };
     let size = (a.stride * a.slots) as u64;
     let mut guard = a.maps.lock();
-    let (obj, maps) = &mut *guard;
-    if let Some(e) = maps.iter_mut().find(|e| e.0 == vm.id()) {
-        e.1 += 1;
+    let st = &mut *guard;
+    if let Some(e) = st.vms.iter_mut().find(|e| e.vm.id() == vm.id()) {
+        e.uses += 1;
         return Ok(());
     }
     let want = (range.end.saturating_sub(0x100_0000 + size)) & !(mmu::UAT_PGMSK as u64);
@@ -429,8 +473,28 @@ pub(crate) fn arena_acquire(vm: &mmu::Vm, range: core::ops::Range<u64>, prot: mm
     if va < range.start || va + size > range.end || va + size > 1 << 40 {
         return Err(EINVAL);
     }
-    let map = obj.map_at(vm, va, prot, true)?;
-    maps.push((vm.id(), 1, map), GFP_KERNEL)?;
+    let chunks_start = chunk_va(a, 0).ok_or(EINVAL)?;
+    if chunks_start < range.start {
+        pr_err!("J313: client range {:#x}..{:#x} has no room for tile buffer chunks at {:#x}\n",
+                range.start, range.end, chunks_start);
+        return Err(EINVAL);
+    }
+    st.prot.get_or_insert(prot);
+    pr_info!("J313: arena into VM {} ({:#x}..{:#x}): page lists {:#x}, chunks {:#x}\n",
+             vm.id(), range.start, range.end, va, chunks_start);
+    let page_lists = st.obj.map_at(vm, va, prot, true)?;
+    let mut chunks = KVec::new();
+    for (slot, c) in st.chunks.iter_mut().enumerate() {
+        if let Some(c) = c {
+            let at = chunk_va(a, slot).ok_or(EINVAL)?;
+            let map = c.obj.map_at(vm, at, prot, false).inspect_err(|err| {
+                pr_err!("J313: tile buffer chunk of slot {} at {:#x} into VM {} ({:#x}..{:#x}): {:?}\n",
+                        slot, at, vm.id(), range.start, range.end, err)
+            })?;
+            chunks.push((slot, map), GFP_KERNEL)?;
+        }
+    }
+    st.vms.push(ArenaVm { vm: vm.clone(), uses: 1, _page_lists: page_lists, chunks }, GFP_KERNEL)?;
     Ok(())
 }
 
@@ -438,13 +502,45 @@ pub(crate) fn arena_acquire(vm: &mmu::Vm, range: core::ops::Range<u64>, prot: mm
 pub(crate) fn arena_release(vm: &mmu::Vm) {
     let Some(a) = arena() else { return };
     let mut guard = a.maps.lock();
-    let maps = &mut guard.1;
-    if let Some(i) = maps.iter().position(|e| e.0 == vm.id()) {
-        maps[i].1 -= 1;
-        if maps[i].1 == 0 {
-            let _ = maps.remove(i);
+    let vms = &mut guard.vms;
+    if let Some(i) = vms.iter().position(|e| e.vm.id() == vm.id()) {
+        vms[i].uses -= 1;
+        if vms[i].uses == 0 {
+            let _ = vms.remove(i);
         }
     }
+}
+
+/// Gives `slot` a block chunk mapped into every client address space; returns its address.
+fn arena_chunk(dev: &crate::driver::AsahiDrmDevice, slot: usize) -> Result<u64> {
+    let a = arena().ok_or(ENODEV)?;
+    let at = chunk_va(a, slot).ok_or(EINVAL)?;
+    let mut guard = a.maps.lock();
+    let st = &mut *guard;
+    if st.chunks.get(slot).ok_or(EINVAL)?.is_some() {
+        return Ok(at);
+    }
+    let prot = st.prot.ok_or(EINVAL)?;
+    let mut obj = crate::gem::new_kernel_object(dev, CHUNK_BYTES)?;
+    for e in st.vms.iter_mut() {
+        let map = obj.map_at(&e.vm, at, prot, false).inspect_err(|err| {
+            pr_err!("J313: tile buffer chunk of slot {} at {:#x} in VM {}: {:?}\n", slot, at, e.vm.id(), err)
+        })?;
+        e.chunks.push((slot, map), GFP_KERNEL)?;
+    }
+    st.chunks[slot] = Some(ArenaChunk { obj, quarantined: false });
+    Ok(at)
+}
+
+/// Ends `slot`'s chunk: freed, or kept mapped for good when `quarantine`.
+fn arena_chunk_end(slot: usize, quarantine: bool) {
+    let Some(a) = arena() else { return };
+    let mut guard = a.maps.lock();
+    let st = &mut *guard;
+    // The chunk stays mapped either way: the hardware can hand out a page of a buffer that
+    // has ended, even after the firmware let go of its slot, to another slot's tiler. The next
+    // buffer on this slot reuses the chunk.
+    if let Some(Some(c)) = st.chunks.get_mut(slot) { c.quarantined |= quarantine; }
 }
 
 /// The firmware and client addresses of `slot`'s page list.
@@ -459,6 +555,32 @@ fn arena_addrs(slot: u32) -> Option<(u64, u64)> {
 
 /// Kernel addresses for 27.2 page lists (above the timestamp range, below MMIO).
 const PAGE_LIST_KERNEL_RANGE: core::ops::Range<u64> = 0xffffffae20000000..0xffffffae80000000;
+
+#[versions(AGX_ROOT)]
+impl Drop for BufferInner::ver {
+    fn drop(&mut self) {
+        // 27.2: the firmware lets go of a buffer's slot (and the hardware of its pages) when
+        // the buffer's last pass completes with the pass counter equal to its completion
+        // count. A buffer that ends short of that keeps its slot and block chunk for good, so
+        // nothing the hardware may still hold is reused.
+        #[ver(V >= V27_2)]
+        {
+            let count = self.info.counter.with(|raw, _inner| raw.count.load(Ordering::Acquire));
+            let done = self.info.with(|raw, _inner| raw.gpu_counter);
+            if let Some(slot) = self.active_slot.take() {
+                let n = slot.slot() as usize;
+                if count == done {
+                    arena_chunk_end(n, false);
+                    drop(slot);
+                } else {
+                    pr_warn!("J313: tile buffer slot {} quarantined (passes {} != completed {})\n", n, count, done);
+                    arena_chunk_end(n, true);
+                    core::mem::forget(slot);
+                }
+            }
+        }
+    }
+}
 
 /// Locked and reference counted TVB buffer.
 #[versions(AGX_ROOT)]
@@ -510,6 +632,8 @@ impl Buffer::ver {
         // 27.2: the page list pointers are set when the buffer gets its slot.
         let page_list_va = (0u64, 0u64);
         let _ = page_list_va;
+        #[ver(V >= V27_2)]
+        let buffer_dev = alloc.shared.device();
         let shared = &mut alloc.shared;
         let info = alloc.private.new_init(
             {
@@ -609,6 +733,10 @@ impl Buffer::ver {
                     ualloc,
                     ualloc_priv,
                     blocks: KVec::new(),
+                    #[ver(V >= V27_2)]
+                    chunk_blocks: 0,
+                    #[ver(V >= V27_2)]
+                    dev: buffer_dev,
                     max_blocks,
                     max_blocks_nomemless,
                     mgr: mgr.clone(),
@@ -698,7 +826,12 @@ impl Buffer::ver {
 
     /// Returns the total block count allocated to this Buffer.
     pub(crate) fn block_count(&self) -> u32 {
-        self.inner.lock().blocks.len() as u32
+        let inner = self.inner.lock();
+        #[ver(V >= V27_2)]
+        let n = inner.chunk_blocks;
+        #[ver(V < V27_2)]
+        let n = inner.blocks.len();
+        n as u32
     }
 
     /// Automatically grow the Buffer based on feedback from the statistics.
@@ -744,6 +877,31 @@ impl Buffer::ver {
     /// Ensure that the buffer has at least a certain minimum size in blocks.
     pub(crate) fn ensure_blocks(&self, min_blocks: usize) -> Result<bool> {
         let mut inner = self.inner.lock();
+
+        // 27.2: blocks come from the slot's chunk, mapped in every client address space.
+        #[ver(V >= V27_2)]
+        {
+            let min_blocks = min_blocks.min(CHUNK_BLOCKS);
+            let cur_count = inner.chunk_blocks;
+            if cur_count >= min_blocks {
+                return Ok(false);
+            }
+            if inner.active_slot.is_none() {
+                self.bind_slot(&mut inner)?;
+            }
+            let slot = inner.active_slot.as_ref().ok_or(EINVAL)?.slot() as usize;
+            let base = arena_chunk(&inner.dev, slot)?;
+            for i in cur_count..min_blocks {
+                let page_num = ((base + (i * BLOCK_SIZE) as u64) >> PAGE_SHIFT) as u32;
+                inner.info.block_list[2 * i] = page_num;
+            }
+            inner.chunk_blocks = min_blocks;
+            inner.info.block_ctl.with(|raw, _inner| {
+                raw.total.store(min_blocks as u32, Ordering::SeqCst);
+                raw.wptr.store(min_blocks as u32, Ordering::SeqCst);
+            });
+            return Ok(true);
+        }
 
         let cur_count = inner.blocks.len();
         if cur_count >= min_blocks {
@@ -805,6 +963,83 @@ impl Buffer::ver {
         }
 
         Ok(true)
+    }
+
+    /// Takes a buffer slot for this buffer (27.2: for its lifetime). Returns whether the slot
+    /// last served another buffer.
+    fn bind_slot(&self, inner: &mut BufferInner::ver) -> Result<bool> {
+        assert_eq!(inner.active_scenes, 0);
+
+            // 27.2 buffers hold their slot for their lifetime, so the manager must not hold
+            // them (it would keep them alive); 27.2 sends no grow requests that need it.
+            #[ver(V >= V27_2)]
+            let owner: Option<Buffer::ver> = None;
+            #[ver(V < V27_2)]
+            let owner = Some(self.clone());
+            let fill = |inner: &mut BufferManagerInner::ver, mgr: &mut slotalloc::Guard<BufferSlotInner::ver>| {
+                inner.owners[mgr.slot() as usize] = owner;
+                Ok(())
+            };
+            // 27.2 slots are held for a buffer's lifetime: never wait for one (the caller may
+            // hold locks a slot's release needs).
+            #[ver(V >= V27_2)]
+            let slot = inner.mgr.0.try_get_inner(inner.last_token, fill)?;
+            #[ver(V < V27_2)]
+            let slot = inner.mgr.0.get_inner(inner.last_token, fill)?;
+            let rebind = slot.changed();
+
+            mod_pr_debug!("Buffer: assigning slot {} (rebind={})", slot.slot(), rebind);
+
+            inner.last_token = Some(slot.token());
+            #[ver(V >= V27_2)]
+            {
+                let id = slot.slot() as i32;
+                let (fw_list, gpu_list) = arena_addrs(slot.slot()).ok_or(ENOSPC)?;
+                inner.info.with_mut(|raw, _inner| {
+                    raw.last_id = id;
+                    raw.page_list_fw = U64(fw_list);
+                    raw.page_list_gpu = U64(gpu_list);
+                });
+                // A slot the hardware last used for another buffer: start this buffer's
+                // descriptor over, so the setup command rebuilds it from the block list
+                // instead of finding nothing new and keeping the other buffer's.
+                // The buffer is idle here, so put back everything the firmware and hardware
+                // advanced during its earlier use, as a new buffer starts.
+                if rebind {
+                    inner.info.with_mut(|raw, _inner| {
+                        raw.gpu_counter = 0;
+                        raw.unk_4 = 0;
+                        raw.cur_id = -1;
+                        raw.unk_10 = 0;
+                        raw.gpu_counter2 = 0;
+                        raw.unk_38 = 0;
+                        raw.page_count.store(0, Ordering::Relaxed);
+                        raw.block_count.store(0, Ordering::Relaxed);
+                        raw.last_page.store(u32::MAX, Ordering::Relaxed);
+                    });
+                    inner.info.block_ctl.with(|raw, _inner| raw.unk.store(0, Ordering::Relaxed));
+                    inner.info.counter.with(|raw, _inner| raw.count.store(0, Ordering::Relaxed));
+                    // The slot's hardware descriptor still names the previous owner's page list
+                    // and ring positions: point it at this buffer's empty list, so the setup
+                    // command appends from the start.
+                    let table = PB_DESCRIPTORS.load(Ordering::Acquire);
+                    let slot_no = id as usize;
+                    if !table.is_null() && slot_no < 0x4000 / 16 {
+                        let list = gpu_list;
+                        let d = [(((list >> 4) as u32) & !7) | 1, (((list >> 36) & 0xf) as u32) << 28, 0, 0];
+                        // SAFETY: the table is a live 0x4000-byte kernel mapping; this slot is
+                        // assigned to this buffer, which is idle.
+                        unsafe {
+                            let p = table.add(slot_no * 16).cast::<u32>();
+                            for (i, w) in d.iter().enumerate() { p.add(i).write_volatile(*w); }
+                            crate::pgtable::clean_poc(p.cast::<u8>(), 16);
+                        }
+                        crate::pgtable::poc_barrier();
+                    }
+                }
+            }
+            inner.active_slot = Some(slot);
+        Ok(rebind)
     }
 
     /// Create a new [`Scene::ver`] (render pass) using this buffer.
@@ -960,77 +1195,7 @@ impl Buffer::ver {
         let mut rebind = false;
 
         if inner.active_slot.is_none() {
-            assert_eq!(inner.active_scenes, 0);
-
-            // 27.2 buffers hold their slot for their lifetime, so the manager must not hold
-            // them (it would keep them alive); 27.2 sends no grow requests that need it.
-            #[ver(V >= V27_2)]
-            let owner: Option<Buffer::ver> = None;
-            #[ver(V < V27_2)]
-            let owner = Some(self.clone());
-            let fill = |inner: &mut BufferManagerInner::ver, mgr: &mut slotalloc::Guard<BufferSlotInner::ver>| {
-                inner.owners[mgr.slot() as usize] = owner;
-                Ok(())
-            };
-            // 27.2 slots are held for a buffer's lifetime: never wait for one (the caller may
-            // hold locks a slot's release needs).
-            #[ver(V >= V27_2)]
-            let slot = inner.mgr.0.try_get_inner(inner.last_token, fill)?;
-            #[ver(V < V27_2)]
-            let slot = inner.mgr.0.get_inner(inner.last_token, fill)?;
-            rebind = slot.changed();
-
-            mod_pr_debug!("Buffer: assigning slot {} (rebind={})", slot.slot(), rebind);
-
-            inner.last_token = Some(slot.token());
-            #[ver(V >= V27_2)]
-            {
-                let id = slot.slot() as i32;
-                let (fw_list, gpu_list) = arena_addrs(slot.slot()).ok_or(ENOSPC)?;
-                inner.info.with_mut(|raw, _inner| {
-                    raw.last_id = id;
-                    raw.page_list_fw = U64(fw_list);
-                    raw.page_list_gpu = U64(gpu_list);
-                });
-                // A slot the hardware last used for another buffer: start this buffer's
-                // descriptor over, so the setup command rebuilds it from the block list
-                // instead of finding nothing new and keeping the other buffer's.
-                // The buffer is idle here, so put back everything the firmware and hardware
-                // advanced during its earlier use, as a new buffer starts.
-                if rebind {
-                    inner.info.with_mut(|raw, _inner| {
-                        raw.gpu_counter = 0;
-                        raw.unk_4 = 0;
-                        raw.cur_id = -1;
-                        raw.unk_10 = 0;
-                        raw.gpu_counter2 = 0;
-                        raw.unk_38 = 0;
-                        raw.page_count.store(0, Ordering::Relaxed);
-                        raw.block_count.store(0, Ordering::Relaxed);
-                        raw.last_page.store(u32::MAX, Ordering::Relaxed);
-                    });
-                    inner.info.block_ctl.with(|raw, _inner| raw.unk.store(0, Ordering::Relaxed));
-                    inner.info.counter.with(|raw, _inner| raw.count.store(0, Ordering::Relaxed));
-                    // The slot's hardware descriptor still names the previous owner's page list
-                    // and ring positions: point it at this buffer's empty list, so the setup
-                    // command appends from the start.
-                    let table = PB_DESCRIPTORS.load(Ordering::Acquire);
-                    let slot_no = id as usize;
-                    if !table.is_null() && slot_no < 0x4000 / 16 {
-                        let list = gpu_list;
-                        let d = [(((list >> 4) as u32) & !7) | 1, (((list >> 36) & 0xf) as u32) << 28, 0, 0];
-                        // SAFETY: the table is a live 0x4000-byte kernel mapping; this slot is
-                        // assigned to this buffer, which is idle.
-                        unsafe {
-                            let p = table.add(slot_no * 16).cast::<u32>();
-                            for (i, w) in d.iter().enumerate() { p.add(i).write_volatile(*w); }
-                            crate::pgtable::clean_poc(p.cast::<u8>(), 16);
-                        }
-                        crate::pgtable::poc_barrier();
-                    }
-                }
-            }
-            inner.active_slot = Some(slot);
+            rebind = self.bind_slot(&mut inner)?;
         }
 
         inner.active_scenes += 1;
