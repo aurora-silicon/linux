@@ -11,8 +11,9 @@ static int tb_cio_check_topology(struct tb_switch *sw, bool wake)
 	if (sw->is_unplugged || !sw->uid)
 		return -ENODEV;
 	tb_switch_for_each_port(sw, port) {
+		/* Released for the sleep, see tb_cio_release_xdomains(). */
 		if (port->xdomain)
-			return -EOPNOTSUPP;
+			continue;
 		if (!tb_port_has_remote(port))
 			continue;
 		/* After a wake, a router lost in the sleep is retired at complete. */
@@ -23,6 +24,43 @@ static int tb_cio_check_topology(struct tb_switch *sw, bool wake)
 			return ret;
 	}
 	return 0;
+}
+
+/*
+ * A host at the other end of a link (an XDomain, such as a host-to-host cable to another
+ * Mac) owns its half of it, which the router's power cycle cannot keep: release it as an
+ * unplug does, its service drivers and paths with it. Nothing finds it again after the
+ * wake: the link does not train back without a plug event (both routers stay in lane
+ * init), so the peer returns only with a replug or a reboot.
+ */
+static void tb_cio_release_xdomains(struct tb *tb, struct tb_switch *sw)
+{
+	struct tb_port *port;
+
+	tb_switch_for_each_port(sw, port) {
+		struct tb_xdomain *xd;
+
+		if (tb_is_upstream_port(port))
+			continue;
+		if (tb_port_has_remote(port)) {
+			tb_cio_release_xdomains(tb, port->remote->sw);
+			continue;
+		}
+		/* By its route, as it was found: the bus holds it wherever the port keeps it. */
+		xd = tb_xdomain_find_by_route(tb, tb_downstream_route(port));
+		tb_port_dbg(port, "sleep: xdomain %s, port's %s\n", xd ? "found" : "none",
+			    port->xdomain ? "set" : "unset");
+		if (!xd)
+			continue;
+		tb_port_info(port, "xdomain released for the sleep\n");
+		xd->is_unplugged = true;
+		tb_xdomain_remove(xd);
+		if (port->xdomain == xd)
+			port->xdomain = NULL;
+		__tb_disconnect_xdomain_paths(tb, xd, -1, -1, -1, -1);
+		tb_xdomain_put(xd);
+		tb_port_unconfigure_xdomain(port);
+	}
 }
 
 int tb_cio_sleep_prepare(struct tb *tb)
@@ -56,6 +94,11 @@ int tb_cio_sleep_prepare(struct tb *tb)
 		if (ret)
 			goto out;
 	}
+	/*
+	 * Past the last refusal here. A tunnel's prepare can still fail below: the peers stay
+	 * released then too, as after an unplug.
+	 */
+	tb_cio_release_xdomains(tb, tb->root_switch);
 	tcm->hotplug_active = false;
 	tcm->cio_prepared = true;
 	/*
@@ -73,6 +116,11 @@ int tb_cio_sleep_prepare(struct tb *tb)
 	mutex_unlock(&tb->lock);
 	/* A DPRX callback already outside the lock must finish before device PM. */
 	flush_workqueue(tb->wq);
+	/*
+	 * Outside the lock, as after an unplug: the released peers' services unbind now and
+	 * give back their rings, which the host must not hold across its power cycle.
+	 */
+	tb_domain_unregister_unplugged_xdomains(tb);
 	/* Bandwidth release runs on a system queue, outside the CM workqueue. */
 	for (unsigned int i = 0; i < ARRAY_SIZE(tcm->groups); i++) {
 		if (cancel_delayed_work_sync(&tcm->groups[i].release_work)) {
