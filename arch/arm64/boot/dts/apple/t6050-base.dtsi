@@ -35,13 +35,50 @@
 #define DIE_ATC1_LABEL(suffix)	__stringify(__concat(DIE_ATC1, suffix))
 
 /*
+ * CPU caches. L1 sizes follow macOS hw.perflevelN.l1{i,d}cachesize
+ * (128 KiB I / 64 KiB D on M-tier, 192 KiB I / 128 KiB D on P-tier).
+ * Each M-tier cluster shares an 8 MiB L2. A P-tier core has
+ * a private L2 of unestablished size, and its cluster shares a 16 MiB L3:
+ * CLIDR_EL1 reports three cache levels on a P core and two on an M core,
+ * macOS reports 16 MiB and 8 MiB per six cores (hw.perflevelN.l2cachesize,
+ * cpusperl2), and dependent loads on J775c take 0.7 ns up to 128 KiB,
+ * 2.8 ns up to 512 KiB and 5-11 ns up to 8 MiB on a P core, against 1.0 ns
+ * up to 64 KiB and 4.7 ns up to 3 MiB on an M core. Every CPU must reach as
+ * many levels as CLIDR_EL1 reports, or cacheinfo drops the description for
+ * all of them. Without these nodes cacheinfo treats every level above L1 as
+ * shared by all CPUs, and the scheduler builds no per-cluster domain.
+ * A P core's L2 node is labelled l2_cache_<the CPU's label>.
+ */
+#define T6050_M_L2(label, name)				\
+	label: name {						\
+		compatible = "cache";				\
+		cache-level = <2>;				\
+		cache-unified;					\
+		cache-size = <0x800000>;			\
+	}
+#define T6050_P_L3(label, name)				\
+	label: name {						\
+		compatible = "cache";				\
+		cache-level = <3>;				\
+		cache-unified;					\
+		cache-size = <0x1000000>;			\
+	}
+#define T6050_P_L2(label, name, l3)				\
+	label: name {						\
+		compatible = "cache";				\
+		cache-level = <2>;				\
+		cache-unified;					\
+		next-level-cache = <&l3>;			\
+	}
+
+/*
  * CPU nodes. Die d, cluster c, core n has MPIDR Aff2 4 for the two M-tier
  * (apple,sawtooth) clusters and 1 for the P-tier (apple,everest) cluster,
  * Aff1 0x10 * d + c and Aff0 n; the unit address is the MPIDR. Labels
  * number the cores 18 * d + 6 * c + n. The boot loader removes the nodes of
  * the cores it did not start.
  */
-#define T6050_CPU(label, mpidr, type, opp, cluster, cpu_cap)	\
+#define T6050_CPU(label, mpidr, type, opp, cluster, cpu_cap, l2, l1i, l1d)	\
 	label: cpu@mpidr {					\
 		compatible = type;				\
 		device_type = "cpu";				\
@@ -51,6 +88,9 @@
 		performance-domains = <&cluster>;		\
 		capacity-dmips-mhz = <cpu_cap>;		\
 		cpu-release-addr = <0 0>; /* to be filled by the loader */ \
+		i-cache-size = <l1i>;				\
+		d-cache-size = <l1d>;				\
+		next-level-cache = <&l2>;			\
 	}
 
 /*
@@ -59,10 +99,11 @@
  * zstd -3 compression at 0.736, decompression at 0.871 and a Python dict loop at 0.728 of a P
  * core, geometric mean 0.776, so M 794 and P 1024. Small L1-resident loops run at 0.92-1.01.
  */
-#define T6050_M_CPU(label, mpidr, cluster) \
-	T6050_CPU(label, mpidr, "apple,sawtooth", mcluster_opp, cluster, 794)
+#define T6050_M_CPU(label, mpidr, cluster, l2) \
+	T6050_CPU(label, mpidr, "apple,sawtooth", mcluster_opp, cluster, 794, l2, 0x20000, 0x10000)
 #define T6050_P_CPU(label, mpidr, cluster) \
-	T6050_CPU(label, mpidr, "apple,everest", pcluster_opp, cluster, 1024)
+	T6050_CPU(label, mpidr, "apple,everest", pcluster_opp, cluster, 1024, \
+		  __concat(l2_cache_, label), 0x30000, 0x20000)
 
 / {
 	compatible = "apple,t6050", "apple,arm-platform";
