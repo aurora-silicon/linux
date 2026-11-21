@@ -24,6 +24,12 @@ description:
   register windows (no second-engine aux-3), and five DAPF records. Its
   virtual ANE-SYS-V gate resolves to the ANE system domain; ANE-SYS-V-PMP
   is a firmware notification gate with no physical PMGR power state.
+  The M3 generation (H15, that is T8122, T6030 and T6031, the T6031 engine also on
+  T6034 and on both dies of T6032) has an RTKit coprocessor behind an ASC
+  wrapper whose ASC mailbox is a separate node, one interrupt of its own,
+  the five ANE power domains and, after the engine and PMGR windows, the
+  auxiliary windows the hardware description lists for it, named after the
+  M4 windows of the same location and size.
 
 properties:
   compatible:
@@ -34,9 +40,12 @@ properties:
           - apple,t6020-ane
           - apple,t6021-ane
           - apple,t6022-ane
+          - apple,t6030-ane
+          - apple,t6031-ane
           - apple,t6041-ane
           - apple,t6050-ane
           - apple,t8112-ane
+          - apple,t8122-ane
           - apple,t8132-ane
           - apple,t8140-ane
           - apple,t8142-ane
@@ -101,7 +110,7 @@ properties:
     description:
       The power states the engine needs, five on T8103, six on T6000 with
       ANE level control (including PMP report SRAM), eight on
-      T602x, seven on T8112, five on T6041 and T8132 (system, CPU, MPM, TD
+      T602x, seven on T8112, five on T6041, T8132 and H15 (system, CPU, MPM, TD
       and base) and one system domain on T8140.
       T6041 may add a sixth, "perf", a performance floor (such as the SoC rail floor)
       that the driver holds only while requests are in flight.
@@ -175,7 +184,7 @@ properties:
 
   apple,ane-type:
     $ref: /schemas/types.yaml#/definitions/uint32
-    enum: [0x100, 0x110, 0x200]
+    enum: [0xb0, 0xc0, 0xe0, 0x100, 0x110, 0x200]
     description: Firmware generation identifier supplied by the bootloader
 
   apple,firmware-preloaded:
@@ -390,13 +399,15 @@ allOf:
               - apple,t6050-ane
               - apple,t8142-ane
               - apple,t8132-ane
+              - apple,t8122-ane
+              - apple,t6030-ane
+              - apple,t6031-ane
     then:
       properties:
         interrupt-names: false
         iommus:
           minItems: 3
         resets: false
-        mboxes: false
     else:
       properties:
         interrupts:
@@ -420,6 +431,83 @@ allOf:
         apple,dapf-ranges: false
       required:
         - interrupt-names
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8140-ane
+              - apple,t6041-ane
+              - apple,t6050-ane
+              - apple,t8142-ane
+              - apple,t8132-ane
+    then:
+      properties:
+        mboxes: false
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8122-ane
+              - apple,t6030-ane
+              - apple,t6031-ane
+    then:
+      properties:
+        reg:
+          minItems: 3
+          maxItems: 6
+        reg-names:
+          minItems: 3
+          maxItems: 6
+          items:
+            enum: [engine, pmgr, aux-0, aux-1, aux-2, aux-3, aux-4]
+        interrupts:
+          maxItems: 1
+        power-domains:
+          minItems: 5
+          maxItems: 5
+        memory-region: false
+        memory-region-names: false
+        apple,firmware-iovas: false
+        apple,firmware-preloaded: false
+        apple,exclave-assigned: false
+        apple,dapf-ranges: false
+      required:
+        - mboxes
+        - apple,ane-type
+  - if:
+      properties:
+        compatible:
+          const: apple,t8122-ane
+    then:
+      properties:
+        reg:
+          maxItems: 3
+        apple,ane-type:
+          const: 0xb0
+  - if:
+      properties:
+        compatible:
+          const: apple,t6030-ane
+    then:
+      properties:
+        reg:
+          minItems: 6
+        apple,ane-type:
+          const: 0xc0
+  - if:
+      properties:
+        compatible:
+          const: apple,t6031-ane
+    then:
+      properties:
+        reg:
+          minItems: 5
+        apple,ane-type:
+          const: 0xe0
 
   - if:
       properties:
@@ -671,6 +759,31 @@ examples:
                                 /bits/ 64 <0x3807273cc 0x3807273cf>,
                                 /bits/ 64 <0x302668000 0x302668003>;
             apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
+            status = "disabled";
+        };
+    };
+
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        ane@310000000 {
+            compatible = "apple,t8122-ane";
+            reg = <0x3 0x10000000 0x0 0x2000000>,
+                  <0x2 0xd0700000 0x0 0x18000>,
+                  <0x2 0xd0724000 0x0 0x4000>;
+            reg-names = "engine", "pmgr", "aux-0";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 524 IRQ_TYPE_LEVEL_HIGH>;
+            iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+            power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+                            <&ps_ane_td>, <&ps_ane_base>;
+            mboxes = <&ane_mbox>;
+            apple,ane-type = <0xb0>;
             status = "disabled";
         };
     };
