@@ -130,6 +130,32 @@ static const struct ave_variant ave_t8132 = {
 	.boot_qualified = true,
 };
 
+/*
+ * The M3 (T8122) with the macOS 27.2 (26B123) stub, as on the MacBook Air
+ * (J615): the bootloader preloads TEXT 0x134000 and DATA 0x128000, TEXT CRC
+ * 918d70d3, the same on every boot. The coprocessor registers and their start
+ * are the M2's; the firmware is the 27.2 build of the M4 generation, so it
+ * takes the boot configuration handshake, as device 17 with handshake type 17,
+ * and speaks the 26B123 command layout. Its codec clocks stay gated until the
+ * mailbox idle word is cleared, and the bootloader's code base is left as it
+ * is. DATA is restored from the boot snapshot before every start.
+ */
+static const struct ave_variant ave_t8122 = {
+	.regs = &ave_coproc_6070,
+	.fw_text_size = 0x134000,
+	.fw_data_size = 0x128000,
+	.boot_device_id = 17,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1,
+	.vcbar_mask = GENMASK_ULL(41, 11),
+	.device_type = 17,
+	.lfs_ref_scale = 2,
+	.text_crc = AVE_FW_TEXT_CRC_T8122_26B123,
+	.mbox_idle = 0x38,
+	.restore_data_first = true,
+	.boot_qualified = true,
+};
+
 static const struct ave_variant ave_t8140 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x14c000,
@@ -659,7 +685,7 @@ static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6041-ave", .data = &ave_t6041 },
 	{ .compatible = "apple,t6050-ave", .data = &ave_t6050 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
-	{ .compatible = "apple,t8122-ave", .data = &ave_m3 },
+	{ .compatible = "apple,t8122-ave", .data = &ave_t8122 },
 	{ .compatible = "apple,t8132-ave", .data = &ave_t8132 },
 	{ .compatible = "apple,t8140-ave", .data = &ave_t8140 },
 	{ .compatible = "apple,t8142-ave", .data = &ave_t8142 },
