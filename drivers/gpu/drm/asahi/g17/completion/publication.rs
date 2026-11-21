@@ -100,7 +100,7 @@ impl Publication {
                 self.status.report_failure(error);
             }
         }
-        self.output.publish(result);
+        self.output.publish(result, &self.status);
         let result = result.map(|_| ());
         let mut links = {
             let mut state = self.state.lock();

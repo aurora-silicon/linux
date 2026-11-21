@@ -31,6 +31,15 @@ use kernel::{
 static FENCE_KEY: Pin<&LockClassKey> = kernel::static_lock_class!();
 
 pub(crate) mod admission;
+mod outstanding;
+
+use outstanding::Outstanding;
+
+impl outstanding::Status for Fences {
+    fn status(&self) -> i32 {
+        Fences::status(self)
+    }
+}
 
 /// Host identities for retained physical channels, separate from firmware object generations.
 /// The device mutex protects allocation; cancelled preparations never reuse IDs.
@@ -100,12 +109,13 @@ pub(crate) struct Queue<B: Backend> {
     variant: &'static crate::g17::fw::Variant,
     proof: Proof,
     sequence: [u64; 2],
-    /// One entry per unfinished command, so as long as userspace keeps work queued
-    /// (thousands under vkd3d-proton). Neither it nor `finished` needs
-    /// contiguous pages, and their growth must not fail a submit on fragmentation.
-    frontiers: [KVVec<(u64, Fences)>; 2],
+    /// Each engine's unfinished commands, as many as userspace keeps queued (thousands
+    /// under vkd3d-proton).
+    frontiers: [Outstanding<Fences>; 2],
     /// Finished frontier entries pruned during this ioctl. Their last references
     /// can tear a whole completion down; that waits until the ioctl has published.
+    /// Like the frontiers it needs no contiguous pages, and its growth must not fail
+    /// a submit on fragmentation.
     finished: KVVec<Fences>,
     failures: [FailureRecord<Fences>; 2],
     // Closing the userspace queue releases admission even if firmware still
@@ -140,6 +150,7 @@ impl<B: Backend> Queue<B> {
             Engine::Render,
             super::timeout::DEFAULT_ALLOWANCE_MS,
         )?);
+        let failures = context.status().failures().finished;
         Ok(Self {
             dev: dev.into(),
             context,
@@ -155,7 +166,7 @@ impl<B: Backend> Queue<B> {
             variant,
             proof: Proof::new(),
             sequence: [0; 2],
-            frontiers: core::array::from_fn(|_| KVVec::new()),
+            frontiers: [Outstanding::new(failures), Outstanding::new(failures)],
             finished: KVVec::new(),
             failures: [FailureRecord::new(), FailureRecord::new()],
             _slot: slot,
@@ -178,27 +189,13 @@ impl<B: Backend> Queue<B> {
     }
 
     fn prune_frontier(&mut self, index: usize) {
+        let failures = self.context.status().failures();
         let failure = &mut self.failures[index];
-        // Without room the entries are released here, as they always could be.
-        let mut finished = if self
-            .finished
-            .reserve(self.frontiers[index].len(), GFP_KERNEL_ACCOUNT)
-            .is_ok()
-        {
-            Some(&mut self.finished)
-        } else {
-            None
-        };
-        self.frontiers[index].retain(|(sequence, fences)| {
-            let status = fences.status();
-            if status == 0 {
-                return true;
-            }
-            if let Some(finished) = finished.as_mut() {
-                let _ = finished.push_within_capacity(fences.clone());
-            }
-            failure.note(*sequence, status, fences);
-            false
+        let finished = &mut self.finished;
+        self.frontiers[index].prune(failures, |sequence, status, fences| {
+            failure.note(sequence, status, &fences);
+            // Without room the entry is released here, as it always could be.
+            let _ = finished.push(fences, GFP_KERNEL_ACCOUNT);
         });
     }
 
@@ -242,13 +239,11 @@ impl<B: Backend> Queue<B> {
             && engine == Engine::Compute
             && !inputs.is_empty()
             && !destinations.has_outputs()
-            && self.frontiers[0].iter().all(|(sequence, fences)| {
-                !Order::contains(order.wait_through[0], *sequence) || fences.status() > 0
-            })
-            && self.frontiers[1].iter().all(|(sequence, fences)| {
-                !Order::contains(order.wait_through[1], *sequence)
-                    || fences.ready.raw() != fences.completed.raw()
-                    || fences.status() > 0
+            && self.frontiers[0]
+                .prefix(order.wait_through[0])
+                .all(|(_, fences)| fences.status() > 0)
+            && self.frontiers[1].prefix(order.wait_through[1]).all(|(_, fences)| {
+                fences.ready.raw() != fences.completed.raw() || fences.status() > 0
             })
             && self.failures.iter_mut().enumerate().all(|(index, failure)| {
                 failure.earliest().is_none_or(|(sequence, _)| {
@@ -271,12 +266,11 @@ impl<B: Backend> Queue<B> {
 
         // Only earlier render ordinals covered by the explicit logical prefix
         // can delay host publication. These links never become GPU dependencies.
+        // A finished one may still be held behind an unfinished one: it delays nothing.
+        let host_prefix = if engine == Engine::Render { order.wait_through[index] } else { None };
         let host_predecessors = self.frontiers[index]
-            .iter()
-            .take_while(|(sequence, _)| {
-                engine == Engine::Render && Order::contains(order.wait_through[index], *sequence)
-            })
-            .filter_map(|(_, fences)| fences.publication.as_ref());
+            .prefix(host_prefix)
+            .filter_map(|(_, fences)| fences.publication.as_ref().filter(|_| fences.status() <= 0));
         let completion = Completion::new(
             &self.dev,
             &self.fences,
@@ -299,34 +293,30 @@ impl<B: Backend> Queue<B> {
         }
         let other = 1 - index;
         let prefix = order.wait_through[other];
-        let frontier = if prefix.is_some() {
-            let frontier = self.frontiers[other].as_slice();
-            // Accepted sequences increase from one, and retain preserves their
-            // order, so all members of a logical prefix form one slice.
-            let end = frontier.partition_point(|(sequence, _)| Order::contains(prefix, *sequence));
-            &frontier[..end]
-        } else {
-            &[]
-        };
-        let count = frontier.len();
+        let frontier = self.frontiers[other].prefix(prefix);
+        // Finished producers are skipped below. Those still held behind an unfinished one are
+        // left out here too, so the room below is not sized by them.
+        let count = frontier.clone().filter(|(_, fences)| fences.status() <= 0).count();
         // Only a command that copies or resets queries can observe timestamps the
         // host has not yet published for its predecessors.
         let query_access = match &command {
             Validated::Compute { query_access, .. } => *query_access,
             Validated::Render { .. } => true,
         };
-        let timestamp_prefix = order.wait_through[index];
-        let timestamps = if engine == Engine::Compute && query_access && timestamp_prefix.is_some() {
-            let frontier = self.frontiers[index].as_slice();
-            let end = frontier
-                .partition_point(|(sequence, _)| Order::contains(timestamp_prefix, *sequence));
-            &frontier[..end]
+        let timestamp_prefix = if engine == Engine::Compute && query_access {
+            order.wait_through[index]
         } else {
-            &[]
+            None
         };
+        // A finished publisher may still be held behind an unfinished one: its timestamps
+        // are written, so there is nothing to wait for.
+        let pending_publisher = |fences: &Fences| {
+            fences.ready.raw() == fences.completed.raw() && fences.status() <= 0
+        };
+        let timestamps = self.frontiers[index].prefix(timestamp_prefix);
         let timestamp_count = timestamps
-            .iter()
-            .filter(|(_, fences)| fences.ready.raw() == fences.completed.raw())
+            .clone()
+            .filter(|(_, fences)| pending_publisher(fences))
             .count();
         let mut failures: [Option<Fence>; 2] = [None, None];
         for (index, failure) in self.failures.iter_mut().enumerate() {
@@ -358,7 +348,7 @@ impl<B: Backend> Queue<B> {
         // writes. Only timestamp publishers need these completion waits and
         // status checks; ordinary compute keeps its existing queue ordering.
         for (_, fences) in timestamps {
-            if fences.ready.raw() == fences.completed.raw() {
+            if pending_publisher(fences) {
                 checked_inputs.push(fences.completed.clone(), GFP_KERNEL)?;
                 dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
             }
@@ -430,9 +420,7 @@ impl<B: Backend> Queue<B> {
                 .ok_or(ENODEV)?
                 .enqueue(packet, dependencies, early, publication)?;
         self.sequence[index] = order.sequence;
-        self.frontiers[index]
-            .push_within_capacity((order.sequence, fences))
-            .map_err(|_| ENOMEM)?;
+        self.frontiers[index].push_within_capacity(order.sequence, fences)?;
         Ok(())
     }
     /// Finish parsing, validation and VM pinning before entering publication.
@@ -600,7 +588,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 room[Engine::of(command).index()] += 1;
             }
             for (frontier, room) in self.frontiers.iter_mut().zip(room) {
-                frontier.reserve(room, GFP_KERNEL_ACCOUNT)?;
+                frontier.reserve(room)?;
             }
             let mut guards = guards.into_iter();
             // Where a firmware wait reports completion before a weak stream tail's writes are

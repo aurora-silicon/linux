@@ -155,7 +155,7 @@ impl Status {
     fn report_failure(&self, _: Error) {}
 }
 pub struct Output;
-impl Output { fn finish(&self, _: Result<[u64; 4]>) {} }
+impl Output { fn finish(&self, _: Result<[u64; 4]>, _: &Status) {} }
 pub struct Sources;
 impl Sources { fn release(&self) {} }
 

@@ -201,12 +201,18 @@ struct Output {
 }
 
 impl Output {
-    fn publish(&self, result: Result<[u64; 4]>) {
+    /// `status` is the command's VM status.
+    fn publish(&self, result: Result<[u64; 4]>, status: &VmStatus) {
         match result {
-            Ok(ticks) => self.destinations.write(ticks),
-            Err(error) => self.fence.set_error(error),
+            Ok(ticks) => {
+                self.destinations.write(ticks);
+                self.fence.signal();
+            }
+            Err(error) => status.signal_failure(|| {
+                self.fence.set_error(error);
+                self.fence.signal();
+            }),
         }
-        self.fence.signal();
         self.member.complete(result.map(|_| ()));
     }
 }
@@ -224,9 +230,9 @@ impl HostOutput {
         }
     }
 
-    fn finish(&self, result: Result<[u64; 4]>) {
+    fn finish(&self, result: Result<[u64; 4]>, status: &VmStatus) {
         match self {
-            Self::Immediate(output) => output.publish(result),
+            Self::Immediate(output) => output.publish(result, status),
             Self::Ordered(publication) => publication.finish(result),
         }
     }
@@ -877,7 +883,7 @@ impl Completion {
         }
         self.release_healthy();
         self.signal_terminal(result);
-        self.output.finish(result);
+        self.output.finish(result, &self.status);
     }
 
     /// A rejected, never-published command cannot poison the VM for contention.
@@ -894,7 +900,7 @@ impl Completion {
         }
         self.release_healthy();
         self.signal_terminal(Err(error));
-        self.output.finish(Err(error));
+        self.output.finish(Err(error), &self.status);
     }
 
     /// The physical queue must already be quarantined. Keep mappings pinned while
@@ -915,7 +921,7 @@ impl Completion {
             self.report(error);
         }
         self.signal_terminal(Err(error));
-        self.output.finish(Err(error));
+        self.output.finish(Err(error), &self.status);
     }
 }
 
