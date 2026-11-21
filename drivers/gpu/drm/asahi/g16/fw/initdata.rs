@@ -130,10 +130,30 @@ pub(crate) struct Layout {
     pub(crate) pstate_selectors: [usize; 3],
     /// MAIN offset of the u64 size of the host's crash copy buffer, where the build has one.
     pub(crate) coredump_copy: Option<usize>,
+    /// What the MAIN retention pointer (25G83 +0xe88) names.
+    pub(crate) retention: Retention,
     /// GLOBALS (region C) words of this build that have no 25G83 position, at their own
     /// offsets: the M4 Pro 26B123 cold-start policy (`g17::fw::initdata::v26b123::RegionCPrefix`).
     pub(crate) globals_policy: &'static [(usize, u32)],
 }
+
+/// The window behind the MAIN retention pointer (25G83 +0xe88, 26B123 +0xfa0). Both builds
+/// copy its first 0x4000 bytes into their DATA with 32-bit accesses when Fender powers down
+/// (RTK_POWER_SLEEP) and back on the next wake (25G83 0x35a60 / 0x35610, 26B123 0x37ebc /
+/// 0x37a34); zero means FenderRegsScratchRam + 0x4000 (25G83 0x340d4, 26B123 0x364a0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retention {
+    /// The host's RETENTION object (the qualified 25G83 path).
+    Object,
+    /// The FenderRegsScratchRam register window itself (logical slot 32, 0x300d60000), which
+    /// loses its contents when Fender powers down: the macOS 27.2 G16G kext points +0xfa0 at
+    /// its own mapping of Fender + 0x60000 ("Fender Scratch Region") and the M4 Pro 26B123
+    /// path (linux#1954, hardware) at its ScratchRam ("GPTBAT") register window.
+    ScratchRam,
+}
+
+/// The logical (25G83-numbered) loader record of FenderRegsScratchRam.
+pub(crate) const SCRATCH_RAM_SLOT: usize = 32;
 
 /// Size of the host's crash copy buffer (`coredump-copy-buffer` in the 27.2 nub); macOS 27.2
 /// hands the J773g firmware a buffer of this size on the crash-log endpoint.
@@ -210,6 +230,7 @@ pub(crate) const V25G83: Layout = Layout {
     },
     pstate_selectors: [0x88, 0x8c, 0x98],
     coredump_copy: None,
+    retention: Retention::Object,
     globals_policy: &[],
 };
 
@@ -262,13 +283,17 @@ pub(crate) const V26B123: Layout = Layout {
         snapshot_entries: 448,
     },
     pstate_selectors: [0x8c, 0x90, 0x9c],
-    // HW data +0xfa8 stays zero on G16G. Non-zero, it turns on the firmware's RTKit power
-    // path method (0x2c7a8 -> the auth pointer at DATA 0x8c0c8, TEXT 0x43e4c): on the J713 the
-    // firmware then faulted on resume at fw-text PA + 0x6f8, the start code's first fetch
-    // after MMU-on, as soon as a doorbell woke it. The T6041 build pairs 0x8000 there with a
-    // dedicated 0x8000 window at +0xfa0, where G16G keeps its RAM retention object; what macOS
-    // writes here on J773g is open (trace list).
+    // HW data +0xfa8 stays zero on G16G, as the 27.2 G16G kext leaves it (its value is a
+    // firmware-object method that returns 0 there; T6041 writes 0x8000). Non-zero, it turns on
+    // the firmware's RTKit power path method (0x2c7a8 -> the auth pointer at DATA 0x8c0c8,
+    // TEXT 0x43e4c).
     coredump_copy: None,
+    // Fender's power-down on this build drops FenderRegsScratchRam (host block, ring state);
+    // the firmware keeps it only if +0xfa0 names that window. The 27.2 G16G kext does
+    // (its HW data fill names the "Fender Scratch Region" mapping there and +0xfa8 stays 0);
+    // the RETENTION object here left ScratchRam unsaved, and the first wake after an idle
+    // power-down took an SError.
+    retention: Retention::ScratchRam,
     // The new u32 at 0x38 and two words in previously reserved fields, as the M4 Pro writes
     // them on this firmware (linux#1954, on hardware). The power-up path (0x3434) reads
     // 0x9dc; zero there is the candidate for the J713's SError on the first wake from idle.
@@ -487,6 +512,7 @@ const fn loaders() -> [Loader; LOADER_COUNT] {
     out
 }
 pub(crate) const LOADERS: [Loader; LOADER_COUNT] = loaders();
+const _: () = assert!(LOADERS[SCRATCH_RAM_SLOT].pa == 0x300d60000);
 
 /// Actual mapped span: slot 3 has two discontiguous physical banks.
 pub(crate) fn loader_span(slot: usize, bank: usize) -> Result<(u64, u32, u32), ()> {
@@ -800,7 +826,14 @@ pub(crate) fn encode_for(
     let runs = layout.main;
     let main = &mut objects[id::MAIN];
     put64(main, remap(runs, 0x28, 8)?, HOST_END)?;
-    put64(main, remap(runs, 0xe88, 8)?, input.va[id::RETENTION])?;
+    let retention = match layout.retention {
+        Retention::Object => input.va[id::RETENTION],
+        Retention::ScratchRam => match input.loader_va[SCRATCH_RAM_SLOT] {
+            0 => return Err(()),
+            va => va,
+        },
+    };
+    put64(main, remap(runs, 0xe88, 8)?, retention)?;
     if let Some(at) = layout.coredump_copy {
         put64(main, at, COREDUMP_COPY_SIZE)?;
     }
