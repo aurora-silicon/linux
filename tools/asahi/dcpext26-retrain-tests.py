@@ -8,7 +8,7 @@ import sys
 
 root = Path(__file__).resolve().parents[2]
 s = (root / 'drivers/gpu/drm/apple/iomfb.c').read_text()
-a = s.index('static int dcp_retrain_active_crtc(')
+a = s.index('static int dcp_release_crtc(')
 b = s.index('\nvoid dcp_handle_hotplug_actions', a)
 body = s[a:b]
 if '--negative-control' in sys.argv:

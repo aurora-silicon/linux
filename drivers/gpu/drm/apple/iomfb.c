@@ -1489,6 +1489,13 @@ static int dcp_set_crtc_active(struct drm_crtc *crtc,
 	return ret;
 }
 
+static int dcp_release_crtc(struct drm_crtc *crtc, struct drm_modeset_acquire_ctx *ctx)
+{
+	struct drm_mode_set set = { .crtc = crtc };
+
+	return drm_atomic_helper_set_config(&set, ctx);
+}
+
 /*
  * @power_cycle: the firmware powered the pipe down with the lost link, so a
  * modeset alone cannot bring it back. Turn the CRTC off and on instead, which
@@ -1523,9 +1530,7 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector,
 		 * with the pipeline that now drives it, and this pipeline's
 		 * own display with this CRTC.
 		 */
-		struct drm_mode_set set = { .crtc = crtc };
-
-		ret = drm_atomic_helper_set_config(&set, &ctx);
+		ret = dcp_release_crtc(crtc, &ctx);
 	} else if (dcp_is_ext26(dcp) && crtc && crtc->state &&
 		   (READ_ONCE(dcp->mode_state.valid) ||
 		    !dcp_has_mode(dcp, &crtc->state->mode))) {
@@ -1896,6 +1901,39 @@ static void dcp_notify_hotplug(struct apple_connector *connector)
 	if (!(connector->base.polled & DRM_CONNECTOR_POLL_HPD) ||
 	    !drm_connector_helper_hpd_irq_event(&connector->base))
 		drm_kms_helper_connector_hotplug_event(&connector->base);
+}
+
+void apple_connector_release_crtc(struct work_struct *work)
+{
+	struct apple_connector *connector =
+		container_of(work, struct apple_connector, release_crtc_wq);
+	struct drm_connector *conn = &connector->base;
+	struct drm_device *dev = conn->dev;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_crtc *crtc = NULL;
+	struct platform_device *pdev;
+	struct apple_dcp *dcp;
+	int ret;
+
+	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
+
+	pdev = READ_ONCE(connector->dcp);
+	dcp = pdev ? platform_get_drvdata(pdev) : NULL;
+	crtc = NULL;
+	if (!READ_ONCE(connector->connected) &&
+	    !(dcp && READ_ONCE(dcp->connector) == connector &&
+	      READ_ONCE(dcp->typec_cable_connected)) && conn->state)
+		crtc = conn->state->crtc;
+	if (crtc)
+		ret = dcp_release_crtc(crtc, &ctx);
+
+	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
+
+	if (ret)
+		drm_dbg_kms(dev, "[CONNECTOR:%d:%s] could not release its CRTC: %d\n",
+			    conn->base.id, conn->name, ret);
+	else if (crtc)
+		dcp_notify_hotplug(connector);
 }
 
 enum dcp_hotplug_reason {
