@@ -6860,9 +6860,12 @@ static const struct platform_suspend_ops apple_sleep_ops = {
 	.end = apple_sleep_end,
 };
 
-/* For a SoC with early_context: the same, with the scopes its entry needs held */
+/*
+ * For a SoC with early_context: the same, with the scopes its entry needs held. Deep sleep is
+ * offered as for the others: an untested profile only with apple_sleep.deep=1.
+ */
 static const struct platform_suspend_ops apple_sleep_early_ops = {
-	.valid = suspend_valid_only_mem,
+	.valid = apple_sleep_valid,
 	.begin = apple_sleep_begin,
 	.prepare = apple_sleep_prepare,
 	.prepare_late = apple_sleep_late_scope_begin,
