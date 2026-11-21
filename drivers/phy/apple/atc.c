@@ -7855,11 +7855,13 @@ static int atcphy_suspend(struct device *dev)
 	 * An active one survives suspend-to-idle while DWC3 runs on it, as a
 	 * host or as a device: the glue then keeps the controller, and with it
 	 * the power domain this PHY shares, on across system sleep, so the link
-	 * stays as it is. With the controller in reset, or in a deeper sleep
-	 * state, it is lost.
+	 * stays as it is. So does one in CIO mode, under its running USB4
+	 * router, whose power states stay on across suspend-to-idle. Without
+	 * either, or in a deeper sleep state, it is lost.
 	 */
 	if (atcphy->t8132_common_owned &&
-	    (!atcphy->dwc3_running || pm_suspend_target_state != PM_SUSPEND_TO_IDLE))
+	    (pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
+	     !(atcphy->dwc3_running || atcphy_mode_is_cio(atcphy->mode))))
 		return -EBUSY;
 	/* Do not admit a new epoch after this check and before resume. */
 	atcphy->t8132_suspended = true;
