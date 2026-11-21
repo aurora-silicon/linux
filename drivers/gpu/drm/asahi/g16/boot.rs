@@ -179,8 +179,206 @@ unsafe extern "C" fn rtkit_crashed(cookie: *mut c_void, log: *const c_void, size
         // written for the duration of this call.
         let log = unsafe { core::slice::from_raw_parts(log.cast::<u8>(), size) };
         dump_crashlog(&shared.dev, log);
+        dump_outer_frame(&shared, log);
     }
     shared.fail_stop(EIO);
+}
+
+fn le64(log: &[u8], at: usize) -> Option<u64> {
+    Some(le32(log, at)? as u64 | (le32(log, at.checked_add(4)?)? as u64) << 32)
+}
+
+/// The first `tag` section of the first `CLHE` log: (offset, length).
+fn crashlog_section(log: &[u8], tag: u32) -> Option<(usize, usize)> {
+    let start = (0..log.len().saturating_sub(0x20))
+        .step_by(4)
+        .find(|&at| le32(log, at) == Some(CRASHLOG_HEADER))?;
+    let end = match le32(log, start + 8) {
+        Some(len) if len as usize >= 0x20 && start + len as usize <= log.len() => {
+            start + len as usize
+        }
+        _ => log.len(),
+    };
+    let mut at = start + 0x20;
+    while at + 16 <= end {
+        let (t, len) = (le32(log, at)?, le32(log, at + 12)? as usize);
+        if t == CRASHLOG_HEADER || len < 16 || len > end - at {
+            return None;
+        }
+        if t == tag {
+            return Some((at, len));
+        }
+        at += len;
+    }
+    None
+}
+
+/// Firmware VAs without their pointer-authentication bits (42-bit TTBR1 space).
+const FW_VA_STRIP: u64 = !0x3ff_ffff_ffff;
+
+/// A firmware VA -> PA through the crash log's own memory map (`Ccdp`: from +0x10,
+/// 0x14-byte records {VA u64, PA u64, size u32}), only inside firmware DATA.
+fn crash_va_pa(
+    shared: &Shared,
+    log: &[u8],
+    ccdp: (usize, usize),
+    va: u64,
+    len: u64,
+) -> Option<u64> {
+    let va = va | FW_VA_STRIP;
+    let (at, size) = ccdp;
+    let mut rec = at + 0x10;
+    while rec + 0x14 <= at + size {
+        let (base, pa, n) = (
+            le64(log, rec)?,
+            le64(log, rec + 8)?,
+            le32(log, rec + 16)? as u64,
+        );
+        if base == 0 {
+            break;
+        }
+        if va >= base && va.checked_add(len)? <= base.checked_add(n)? {
+            let pa = pa + (va - base);
+            let data = &shared.data;
+            if pa >= data.start && pa.checked_add(len)? <= data.end {
+                return Some(pa);
+            }
+            return None;
+        }
+        rec += 0x14;
+    }
+    None
+}
+
+/// Reads `N` u64 words of firmware DATA at a firmware VA, after the crash.
+fn crash_read<const N: usize>(
+    shared: &Shared,
+    log: &[u8],
+    ccdp: (usize, usize),
+    va: u64,
+) -> Option<[u64; N]> {
+    let pa = crash_va_pa(shared, log, ccdp, va, (N * 8) as u64)?;
+    let page = pa & !0xfff;
+    let span = ((pa - page) as usize + N * 8 + 0xfff) & !0xfff;
+    let iomem = glue::ioremap_wc(page, span);
+    if iomem.is_null() {
+        return None;
+    }
+    let mut words = [0u64; N];
+    for (i, w) in words.iter_mut().enumerate() {
+        // SAFETY: `iomem` maps `span` bytes from `page`, which cover [pa, pa + N * 8); the
+        // firmware is crashed and halted, the words are only read.
+        *w = unsafe {
+            core::ptr::read_volatile(
+                iomem
+                    .cast::<u8>()
+                    .add((pa - page) as usize + i * 8)
+                    .cast::<u64>(),
+            )
+        };
+    }
+    // SAFETY: Mapped above, not used after this call.
+    unsafe { bindings::iounmap(iomem) };
+    Some(words)
+}
+
+/// The 27.2 GPU firmware dies of a nested SError: its first exception (an SError in a
+/// task, taken through the SP0 vector into the task's own context, `TPIDRRO_EL0`) finds no
+/// handler, `__rtk_arch_exception`'s fatal path unmasks SError (`msr DAIFClr, #4`, depth 1)
+/// and takes it again; the crash log only holds that second frame, whose x19 is the first
+/// frame. Prints the first frame (ELR/SPSR/ESR/FAR, x0-x30, SP) and its frame-pointer
+/// chain from firmware DATA. Text offsets are relative to the `Ccdp` TEXT base.
+fn dump_outer_frame(shared: &Shared, log: &[u8]) {
+    let dev = &shared.dev;
+    let (Some(crg8), Some(ccdp)) = (
+        crashlog_section(log, fourcc(b"Crg8")),
+        crashlog_section(log, fourcc(b"Ccdp")),
+    ) else {
+        return;
+    };
+    // Crg8: +0x10 kind, +0x14 frame size, the 0x348-byte frame from +0x18.
+    let Some(outer) = le64(log, crg8.0 + 0x18 + 19 * 8) else {
+        return;
+    };
+    let text = le64(log, ccdp.0 + 0x10).unwrap_or(0);
+    let off = |va: u64| (va | FW_VA_STRIP).wrapping_sub(text);
+    let Some(frame) = crash_read::<0x69>(shared, log, ccdp, outer) else {
+        dev_err!(
+            dev,
+            "G16 crash: outer frame {:#x} not in firmware DATA\n",
+            outer
+        );
+        return;
+    };
+    let (elr, spsr, sp, far, esr) = (
+        frame[0x100 / 8],
+        frame[0x108 / 8],
+        frame[0xf8 / 8],
+        frame[0x328 / 8],
+        frame[0x338 / 8] & 0xffff_ffff,
+    );
+    dev_err!(
+        dev,
+        "G16 crash: outer frame {:#x}: ELR text+{:#x} SPSR {:#x} ESR {:#x} FAR {:#x} SP {:#x} LR text+{:#x}\n",
+        outer,
+        off(elr),
+        spsr,
+        esr,
+        far,
+        sp,
+        off(frame[30])
+    );
+    for r in (0..31).step_by(4) {
+        let x = |i: usize| if i < 31 { frame[i] } else { 0 };
+        dev_err!(
+            dev,
+            "G16 crash: outer x{:02}-x{:02} = {:016x} {:016x} {:016x} {:016x}\n",
+            r,
+            (r + 3).min(30),
+            x(r),
+            x(r + 1),
+            x(r + 2),
+            x(r + 3)
+        );
+    }
+    // The task's frame records: {previous FP, LR}.
+    let mut fp = frame[29];
+    for depth in 0..16 {
+        if fp == 0 || fp & 0xf != 0 {
+            break;
+        }
+        let Some([next, lr]) = crash_read::<2>(shared, log, ccdp, fp) else {
+            dev_err!(
+                dev,
+                "G16 crash: outer #{} FP {:#x} not in firmware DATA\n",
+                depth,
+                fp
+            );
+            break;
+        };
+        dev_err!(
+            dev,
+            "G16 crash: outer #{} FP {:#x} LR text+{:#x}\n",
+            depth,
+            fp,
+            off(lr)
+        );
+        fp = next;
+    }
+    // The task stack above SP: spilled pointers and arguments.
+    if let Some(stack) = crash_read::<0x20>(shared, log, ccdp, sp) {
+        for row in (0..0x20).step_by(4) {
+            dev_err!(
+                dev,
+                "G16 crash: outer SP+{:#05x}: {:016x} {:016x} {:016x} {:016x}\n",
+                row * 8,
+                stack[row],
+                stack[row + 1],
+                stack[row + 2],
+                stack[row + 3]
+            );
+        }
+    }
 }
 
 const fn fourcc(tag: &[u8; 4]) -> u32 {
