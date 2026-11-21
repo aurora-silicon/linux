@@ -624,6 +624,7 @@ void cd321x_stop_work(struct cd321x *cd321x);
 int cd321x_reboot_close(struct cd321x *cd321x);
 int cd321x_reboot_notify(struct notifier_block *nb, unsigned long action,
 			 void *data);
+int cd321x_session_pm(struct notifier_block *nb, unsigned long event, void *unused);
 bool cd321x_tbt_switch_keep_waiting(struct device *dev);
 struct typec_thunderbolt_switch *
 cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,

@@ -2818,7 +2818,7 @@ static void cd321x_session_restore(struct cd321x *cd)
 	cd321x_complete(&cd->tps);
 }
 
-static int cd321x_session_pm(struct notifier_block *nb, unsigned long event, void *unused)
+VISIBLE_IF_KUNIT int cd321x_session_pm(struct notifier_block *nb, unsigned long event, void *unused)
 {
 	struct cd321x *cd = container_of(nb, struct cd321x, session_pm);
 	int ret;
@@ -2843,6 +2843,7 @@ static int cd321x_session_pm(struct notifier_block *nb, unsigned long event, voi
 	}
 	return NOTIFY_OK;
 }
+EXPORT_SYMBOL_IF_KUNIT(cd321x_session_pm);
 
 static void cd321x_ready(struct tps6598x *tps)
 {
