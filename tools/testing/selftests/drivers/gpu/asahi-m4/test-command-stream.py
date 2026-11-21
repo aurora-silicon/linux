@@ -222,11 +222,13 @@ fn ray_query_stages_and_compute_tables_are_accepted() {
     assert!(check_stream(&entry(CMD_RENDER,&data(&r),[NONE;2]),false).is_ok());
     // An older render payload without the stages.
     assert!(check_stream(&entry(CMD_RENDER,&data(&render())[..336],[NONE;2]),false).is_ok());
-    // Compute: tables and scratch, each alone.
+    // Compute: tables and scratch, each alone, and the AS-build flag (BOUNDED_AS_BUILD).
     assert!(check_stream(&entry(CMD_COMPUTE,&data(&ray_compute()),[NONE;2]),false).is_ok());
     let c=uapi::drm_asahi_cmd_compute {scs_layout:0,..ray_compute()};
     assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_ok());
     let c=uapi::drm_asahi_cmd_compute {scs_layout:LAYOUT,..compute()};
+    assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_ok());
+    let c=uapi::drm_asahi_cmd_compute {flags:4,..ray_compute()};
     assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_ok());
     let ray=compute_ray(&ray_compute()).unwrap();
     assert_eq!(ray.intersection.words(),[0x10080,0xc0003800,0x6f00000000,0x3feff,0x10010020000,0x16000000000]);
@@ -389,11 +391,15 @@ fn unsupported_flags_and_compute_fields() {
         let mut r=render(); r.flags=flag;
         assert!(check_stream(&entry(CMD_RENDER,&data(&r)[..256],[NONE;2]),false).is_err());
     }
-    // Every compute flag is refused.
-    for flag in [1u32,2,4,8,1<<16,1<<17,1<<20,1<<31] {
+    // Only DRM_ASAHI_COMPUTE_AS_BUILD (bit 2) is accepted.
+    for flag in [1u32,2,8,1<<16,1<<17,1<<20,1<<31] {
         let c=uapi::drm_asahi_cmd_compute {flags:flag,..compute()};
         assert_eq!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false),Err(EINVAL));
+        let c=uapi::drm_asahi_cmd_compute {flags:flag|4,..compute()};
+        assert_eq!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false),Err(EINVAL));
     }
+    let c=uapi::drm_asahi_cmd_compute {flags:4,..compute()};
+    assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_ok());
     let mut c=compute();
     c.cdm_auxiliary_allocation=8;
     assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());

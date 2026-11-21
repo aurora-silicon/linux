@@ -329,9 +329,9 @@ enum drm_asahi_feature {
 	DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY = (1UL) << 8,
 
 	/*
-	 * Bits 10 to 15 are reported by the G17P runtime. The G16G (M4) runtime
-	 * reports bits 10 to 12 and 15: its ray-query command set
-	 * (RENDER_RAY_QUERY) is the G17P one.
+	 * Bits 10 to 16 are reported by the G17P runtime. The G16G (M4) runtime
+	 * reports bits 10 to 12, 15 and 16: its ray-tracing command set
+	 * (RENDER_RAY_QUERY, BOUNDED_AS_BUILD) is the G17P one.
 	 */
 
 	/**
