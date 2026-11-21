@@ -600,10 +600,13 @@ static int mt_connect_attempt(struct mt7932 *m, bool *submitted,
 	unsigned long deadline, timeout;
 	int ret;
 
+	if (m->join_length != MT7932_JOIN_BODY && m->join_length != MT7932_JOIN_BODY_SECROAM)
+		return -EIO;
 	ret = mt_connect_prepare(m, peer_owned);
 	if (ret)
 		return ret;
-	body = kzalloc(856, GFP_KERNEL);
+	/* The secure-roaming tail stays zero: a fresh association joins no group. */
+	body = kzalloc(MT7932_JOIN_BODY_MAX, GFP_KERNEL);
 	ret = body ? 0 : -ENOMEM;
 	if (ret)
 		goto out;
@@ -617,7 +620,7 @@ static int mt_connect_attempt(struct mt7932 *m, bool *submitted,
 		if (ret)
 			goto free;
 	}
-	ret = mt7932_connect_body(body, 856, m->connect_ssid, m->connect_ssid_length,
+	ret = mt7932_connect_body(body, MT7932_JOIN_BODY_MAX, m->connect_ssid, m->connect_ssid_length,
 		m->connect_open || m->connect_owe ? NULL : m->connect_pmk, m->connect_bssid,
 		m->connect_band, m->connect_channel, 20, 2, &m->peer_ids, m->connect_open,
 		m->connect_sae_pwd_length ? m->connect_sae_pwd : NULL,
@@ -626,7 +629,7 @@ static int mt_connect_attempt(struct mt7932 *m, bool *submitted,
 		goto free;
 	if (m->connect_akm == WLAN_AKM_SUITE_PSK ||
 	    m->connect_akm == WLAN_AKM_SUITE_PSK_SHA256) {
-		ret = mt7932_connect_psk_akm(body, 856, m->connect_akm);
+		ret = mt7932_connect_psk_akm(body, MT7932_JOIN_BODY_MAX, m->connect_akm);
 		if (ret)
 			goto free;
 	}
@@ -669,7 +672,7 @@ identity:
 		ret = mt_power_init(m);
 	ret = ret ?: READ_ONCE(m->connect_error);
 	if (!ret)
-		ret = mt_request_ext(m, 0xea, 0x40, true, true, false, body, 856);
+		ret = mt_request_ext(m, 0xea, 0x40, true, true, false, body, m->join_length);
 free:
 	kfree_sensitive(body);
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));

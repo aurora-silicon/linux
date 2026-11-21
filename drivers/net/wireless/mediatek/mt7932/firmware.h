@@ -121,6 +121,36 @@ static inline int mt7932_ram_region(const u8 *data, size_t size, unsigned int in
 	return count;
 }
 
+/*
+ * The station connect request grew by twelve bytes in RAM images built from
+ * July 2026: a 32-bit secure-roaming group bitmap and eight reserved bytes
+ * follow the earlier 856-byte body, whose fields did not move. Earlier images
+ * do not start an association for the longer request, nor later ones for the
+ * shorter. The connac trailer's build date tells them apart before download:
+ * chip, ECO, region count, format version and flags, two reserved bytes, a
+ * ten-byte label, then the fifteen-byte build date and the CRC.
+ */
+#define MT7932_JOIN_BODY		856
+#define MT7932_JOIN_BODY_SECROAM	868
+#define MT7932_JOIN_BODY_MAX		MT7932_JOIN_BODY_SECROAM
+
+static inline int mt7932_join_length(const u8 *data, size_t size)
+{
+	static const char secroam[] = "20260701";
+	const u8 *date;
+	unsigned int i;
+
+	if (size < 36)
+		return -EINVAL;
+	date = data + size - 19;
+	for (i = 0; i < 14; i++)
+		if (!isdigit(date[i]))
+			return -EINVAL;
+	if (date[14])
+		return -EINVAL;
+	return memcmp(date, secroam, 8) < 0 ? MT7932_JOIN_BODY : MT7932_JOIN_BODY_SECROAM;
+}
+
 /* Validate the entire capability body before consumers use any individual TLV. */
 static inline int mt7932_capabilities(const u8 *body, size_t length)
 {
