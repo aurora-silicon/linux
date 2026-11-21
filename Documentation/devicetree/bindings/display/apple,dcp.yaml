@@ -310,6 +310,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Display coprocessor index on multi-DCP systems.
 
+  apple,sleep-host-stop:
+    type: boolean
+    description:
+      The SoC's suspend-to-RAM needs this display coprocessor and the external
+      ones stopped, and their power domains lowered, by the operating system
+      before the sleep commit, and the internal one restarted after the wake.
+      The firmware doesn't take the display down for the sleep itself.
+
   apple,typec-hybrid-first:
     type: boolean
     description:
