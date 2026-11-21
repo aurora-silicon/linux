@@ -169,7 +169,13 @@ static int secondary_init(struct centauri *c)
 	pci_write_config_dword(c->pdev, 0xf8c, upper_32_bits(c->ipc->secondary->dma));
 	pci_write_config_dword(c->pdev, 0xf90, required);
 	dev_info(&c->pdev->dev, "secondary memory: seed=%u required=%u\n", length, required);
-	debugfs_create_file("firmware_crash", 0400, c->debug, c, &firmware_crash_fops);
+	/*
+	 * Created once and kept across restarts: its reader looks up c->ipc under boot_lock,
+	 * and removing it here, under boot_lock, would wait for a reader blocked on that lock.
+	 */
+	if (!c->crash_file)
+		c->crash_file = debugfs_create_file("firmware_crash", 0400, c->debug, c,
+						    &firmware_crash_fops);
 	return 0;
 }
 
