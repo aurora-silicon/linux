@@ -64,7 +64,7 @@ def main():
         print("# SKIP: requires the matching kernel source tree")
         return 4
     source = source.read_text()
-    print("TAP version 13\n1..14", flush=True)
+    print("TAP version 13\n1..15", flush=True)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     preamble = r'''
 #include <assert.h>
@@ -1035,6 +1035,35 @@ int main(void)
     atcphy_fixed_ss_start(&a);
     assert(configures==1 && bist_phase==3 && a.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
     puts("ok 14 - fixed SuperSpeed lanes: the J773g handover before the reset release, latched failures");
+    /* Sleep lifecycle: s2idle keeps the running host; deep sleep stops then cold-restarts steps 2-7. */
+    struct device dev = { &a };
+    fixed_init(&a);
+    atcphy_fixed_ss_start(&a);
+    a.host_active = true;
+    pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+    assert(!atcphy_suspend(&dev) && a.t8132_suspended && a.t8132_common_owned);
+    assert(!atcphy_resume(&dev) && !a.t8132_suspended && a.pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3);
+    /* Deep sleep refuses an active common epoch until the host parks PIPE and powers OFF. */
+    pm_suspend_target_state = PM_SUSPEND_MEM;
+    assert(atcphy_suspend(&dev) == -EBUSY && !a.t8132_suspended);
+    a.host_active = false;
+    a.pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+    stop_response = true;
+    assert(!atcphy_configure_t8132(&a, APPLE_ATCPHY_MODE_OFF));
+    assert(!a.t8132_common_owned && a.mode == APPLE_ATCPHY_MODE_OFF);
+    assert(!atcphy_suspend(&dev) && a.t8132_suspended);
+    assert(!atcphy_resume(&dev) && !a.t8132_suspended);
+    /* After deep sleep power-off, registers read 0 (clamp cleared); fixed_ss_start restores everything. */
+    stop_response = false;
+    core[ATCPHY_POWER_CTRL/4] = 0;
+    core[ATCPHY_POWER_STAT/4] = 0;
+    core[ATCPHY_MISC/4] = 0;
+    tune_count = reset_releases = bist_phase = 0;
+    atcphy_fixed_ss_start(&a);
+    assert(configures == 2 && a.mode == APPLE_ATCPHY_MODE_USB3_DP && a.t8132_common_owned);
+    assert(!a.mode_dirty && !a.t8132_failed && tune_count == 8 && reset_releases == 1);
+    assert(bist_phase == 3 && a.pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3);
+    puts("ok 15 - fixed SuperSpeed lanes: s2idle retention and deep-sleep stop/cold-restart lifecycle");
     return 0;
 }
 '''
