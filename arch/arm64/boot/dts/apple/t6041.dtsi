@@ -339,6 +339,21 @@
 &pmc {
 	#cooling-cells = <2>;
 	apple,static-voters = <1 3>;
+
+	/*
+	 * SoC fabric rail floor (rail 1, AP voter agent 3). T6041 has four
+	 * SOC states (0-3; ADT pmp dvfs-domain and pmgr voltage-states0/28/29):
+	 * state 2 (VMAX, 815 mV) already reaches the maximum SOC_AFC clock
+	 * (2004 MHz) and matches ADT AVD-SOC-VMAX and VENC0-SOC-VMAX; state 3
+	 * (VOVD, 820 mV) only raises SOC_AFI (975 -> 1300 MHz) and is voted by
+	 * CLPC for CPU/GPU demand.
+	 */
+	pmc_soc_max: floor-soc-max {
+		label = "soc-vmax";
+		#power-domain-cells = <0>;
+		apple,rail = <1>;
+		apple,level = <2>;
+	};
 };
 
 &clpc {
