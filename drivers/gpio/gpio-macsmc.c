@@ -4,16 +4,19 @@
  * Copyright The Asahi Linux Contributors
  *
  * This driver implements basic SMC PMU GPIO support that can read inputs
- * and write outputs. Mode changes and IRQ config are not yet implemented.
+ * and write outputs, and, for a node marked interrupt-controller, the SMC's
+ * input interrupts. Pin mode changes are not implemented.
  */
 
 #include <linux/bitmap.h>
 #include <linux/device.h>
 #include <linux/gpio/driver.h>
 #include <linux/hex.h>
+#include <linux/irq.h>
 #include <linux/mfd/core.h>
 #include <linux/mfd/macsmc.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/soc/apple/t8132.h>
 #include <linux/unaligned.h>
@@ -121,6 +124,17 @@ struct macsmc_gpio {
 	struct mutex j713_reg_on_lock;
 	bool j713_reg_on_known;
 	bool j713_reg_on_level;
+
+	/* Input interrupts (macsmc_gpio_init_irq()); nb is set only with an irqchip */
+	struct notifier_block nb;
+	/* Serialises the irqchip bus lock: the mode / enable SMC writes of one line at a time */
+	struct mutex irq_lock;
+	DECLARE_BITMAP(irq_supported, MAX_GPIO);
+	DECLARE_BITMAP(irq_enable_want, MAX_GPIO);
+	DECLARE_BITMAP(irq_enable_hw, MAX_GPIO);
+	DECLARE_BITMAP(irq_enable_known, MAX_GPIO);
+	u8 irq_mode_want[MAX_GPIO];
+	u8 irq_mode_hw[MAX_GPIO];
 };
 
 static bool macsmc_gpio_is_j700_pcio(struct macsmc_gpio *smcgp,
@@ -460,6 +474,193 @@ struct macsmc_gpio_of_match_data {
 	smc_key base_key;
 };
 
+/*
+ * Input interrupts. The SMC reports an input's configured level or edge as an
+ * event of type SMC_EV_GPIO with the line number in bits 15:8, and holds the
+ * next one for that line until it is acknowledged with CMD_IRQ_ACK. Mode and
+ * enable are SMC writes, which sleep: the irqchip callbacks only record what is
+ * wanted, and macsmc_gpio_irq_bus_sync_unlock() writes what changed. Events
+ * arrive on the SMC's notifier chain in process context, so the lines are
+ * nested (threaded) interrupts. The layout follows the Asahi Linux driver's
+ * earlier interrupt support.
+ */
+#define SMC_EV_GPIO		0x7202
+#define IRQ_MODE_UNSET		0xff
+
+static int macsmc_gpio_event(struct notifier_block *nb, unsigned long event, void *data)
+{
+	struct macsmc_gpio *smcgp = container_of(nb, struct macsmc_gpio, nb);
+	unsigned int offset = (event >> 8) & 0xff;
+	smc_key key;
+	int irq;
+
+	if ((event >> 16) != SMC_EV_GPIO)
+		return NOTIFY_DONE;
+	if (offset >= MAX_GPIO) {
+		dev_err_ratelimited(smcgp->dev, "GPIO event for line %u out of range\n", offset);
+		return NOTIFY_BAD;
+	}
+
+	irq = irq_find_mapping(smcgp->gc.irq.domain, offset);
+	if (irq)
+		handle_nested_irq(irq);
+
+	key = macsmc_gpio_key(smcgp->base_key, offset);
+	if (apple_smc_write_u32(smcgp->smc, key, CMD_IRQ_ACK | 1) < 0)
+		dev_err_ratelimited(smcgp->dev, "GPIO IRQ ack failed for %p4ch\n", &key);
+
+	return NOTIFY_OK;
+}
+
+static void macsmc_gpio_irq_mask(struct irq_data *d)
+{
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	struct macsmc_gpio *smcgp = gpiochip_get_data(gc);
+	irq_hw_number_t hwirq = irqd_to_hwirq(d);
+
+	clear_bit(hwirq, smcgp->irq_enable_want);
+	gpiochip_disable_irq(gc, hwirq);
+}
+
+static void macsmc_gpio_irq_unmask(struct irq_data *d)
+{
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	struct macsmc_gpio *smcgp = gpiochip_get_data(gc);
+	irq_hw_number_t hwirq = irqd_to_hwirq(d);
+
+	gpiochip_enable_irq(gc, hwirq);
+	set_bit(hwirq, smcgp->irq_enable_want);
+}
+
+static int macsmc_gpio_irq_set_type(struct irq_data *d, unsigned int type)
+{
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	struct macsmc_gpio *smcgp = gpiochip_get_data(gc);
+	irq_hw_number_t hwirq = irqd_to_hwirq(d);
+	u8 mode;
+
+	if (!test_bit(hwirq, smcgp->irq_supported))
+		return -EINVAL;
+
+	switch (type & IRQ_TYPE_SENSE_MASK) {
+	case IRQ_TYPE_LEVEL_HIGH:
+		mode = IRQ_MODE_HIGH;
+		break;
+	case IRQ_TYPE_LEVEL_LOW:
+		mode = IRQ_MODE_LOW;
+		break;
+	case IRQ_TYPE_EDGE_RISING:
+		mode = IRQ_MODE_RISING;
+		break;
+	case IRQ_TYPE_EDGE_FALLING:
+		mode = IRQ_MODE_FALLING;
+		break;
+	case IRQ_TYPE_EDGE_BOTH:
+		mode = IRQ_MODE_BOTH;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	smcgp->irq_mode_want[hwirq] = mode;
+	return 0;
+}
+
+static void macsmc_gpio_irq_bus_lock(struct irq_data *d)
+{
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	struct macsmc_gpio *smcgp = gpiochip_get_data(gc);
+
+	mutex_lock(&smcgp->irq_lock);
+}
+
+/* Write the mode, then the enable, each only when it differs from what the SMC was last given. */
+static void macsmc_gpio_irq_bus_sync_unlock(struct irq_data *d)
+{
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	struct macsmc_gpio *smcgp = gpiochip_get_data(gc);
+	irq_hw_number_t hwirq = irqd_to_hwirq(d);
+	smc_key key = macsmc_gpio_key(smcgp->base_key, hwirq);
+	u8 mode = smcgp->irq_mode_want[hwirq];
+	bool enable = test_bit(hwirq, smcgp->irq_enable_want);
+
+	if (mode != IRQ_MODE_UNSET && mode != smcgp->irq_mode_hw[hwirq]) {
+		if (apple_smc_write_u32(smcgp->smc, key, CMD_IRQ_MODE | mode) < 0)
+			dev_err(smcgp->dev, "GPIO IRQ mode %u failed for %p4ch\n", mode, &key);
+		else
+			smcgp->irq_mode_hw[hwirq] = mode;
+	}
+
+	if (!test_bit(hwirq, smcgp->irq_enable_known) ||
+	    test_bit(hwirq, smcgp->irq_enable_hw) != enable) {
+		if (apple_smc_write_u32(smcgp->smc, key, CMD_IRQ_ENABLE | enable) < 0) {
+			dev_err(smcgp->dev, "GPIO IRQ %s failed for %p4ch\n",
+				enable ? "enable" : "disable", &key);
+		} else {
+			assign_bit(hwirq, smcgp->irq_enable_hw, enable);
+			set_bit(hwirq, smcgp->irq_enable_known);
+		}
+	}
+
+	mutex_unlock(&smcgp->irq_lock);
+}
+
+static const struct irq_chip macsmc_gpio_irqchip = {
+	.name = "macsmc-pmu-gpio",
+	.irq_mask = macsmc_gpio_irq_mask,
+	.irq_unmask = macsmc_gpio_irq_unmask,
+	.irq_set_type = macsmc_gpio_irq_set_type,
+	.irq_bus_lock = macsmc_gpio_irq_bus_lock,
+	.irq_bus_sync_unlock = macsmc_gpio_irq_bus_sync_unlock,
+	.flags = IRQCHIP_SET_TYPE_MASKED | IRQCHIP_MASK_ON_SUSPEND | IRQCHIP_IMMUTABLE,
+	GPIOCHIP_IRQ_RESOURCE_HELPERS,
+};
+
+static void macsmc_gpio_irq_valid_mask(struct gpio_chip *gc, unsigned long *valid_mask,
+				       unsigned int ngpios)
+{
+	struct macsmc_gpio *smcgp = gpiochip_get_data(gc);
+
+	bitmap_copy(valid_mask, smcgp->irq_supported, min_t(unsigned int, ngpios, MAX_GPIO));
+}
+
+/* An input whose IRQ mode reads back is one the SMC can report. */
+static int macsmc_gpio_init_irq(struct macsmc_gpio *smcgp)
+{
+	struct gpio_irq_chip *girq = &smcgp->gc.irq;
+	unsigned int i;
+	u32 val;
+
+	if (!of_property_read_bool(smcgp->dev->of_node, "interrupt-controller"))
+		return 0;
+
+	mutex_init(&smcgp->irq_lock);
+	for (i = 0; i < MAX_GPIO; i++) {
+		smcgp->irq_mode_want[i] = IRQ_MODE_UNSET;
+		smcgp->irq_mode_hw[i] = IRQ_MODE_UNSET;
+		if (!apple_smc_rw_u32(smcgp->smc, macsmc_gpio_key(smcgp->base_key, i),
+				      CMD_IRQ_MODE, &val))
+			set_bit(i, smcgp->irq_supported);
+	}
+	dev_info(smcgp->dev, "%u GPIO lines can interrupt\n",
+		 bitmap_weight(smcgp->irq_supported, MAX_GPIO));
+
+	gpio_irq_chip_set_chip(girq, &macsmc_gpio_irqchip);
+	girq->handler = handle_simple_irq;
+	girq->default_type = IRQ_TYPE_NONE;
+	girq->threaded = true;
+	girq->init_valid_mask = macsmc_gpio_irq_valid_mask;
+	smcgp->nb.notifier_call = macsmc_gpio_event;
+	return 0;
+}
+
+static void macsmc_gpio_unregister_nb(void *data)
+{
+	struct macsmc_gpio *smcgp = data;
+
+	blocking_notifier_chain_unregister(&smcgp->smc->event_handlers, &smcgp->nb);
+}
+
 static int macsmc_gpio_parse_templates(struct macsmc_gpio *smcgp)
 {
 	struct device *dev = smcgp->dev;
@@ -562,7 +763,19 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 	smcgp->gc.base = -1;
 	smcgp->gc.parent = &pdev->dev;
 
-	return devm_gpiochip_add_data(&pdev->dev, &smcgp->gc, smcgp);
+	ret = macsmc_gpio_init_irq(smcgp);
+	if (ret)
+		return ret;
+
+	ret = devm_gpiochip_add_data(&pdev->dev, &smcgp->gc, smcgp);
+	if (ret || !smcgp->nb.notifier_call)
+		return ret;
+
+	/* Events reach the lines only once their domain exists. */
+	ret = blocking_notifier_chain_register(&smc->event_handlers, &smcgp->nb);
+	if (ret)
+		return ret;
+	return devm_add_action_or_reset(&pdev->dev, macsmc_gpio_unregister_nb, smcgp);
 }
 
 static const struct macsmc_gpio_of_match_data macsmc_gpio_up_data = {
