@@ -552,6 +552,8 @@ const struct ave_fw_layout ave_layout_26a428 = {
 	 * B-frames.
 	 */
 	AVE_LAYOUT_26A428_FIELDS(0x320c, 0xce4)
+	/* 60 fps and sessions without B-frames encode on the M5 (J815). */
+	.any_gop = true,
 };
 
 /*
