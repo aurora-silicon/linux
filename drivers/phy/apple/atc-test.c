@@ -104,6 +104,36 @@ static void atcphy_test_target_mode_t8132(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_OFF);
 }
 
+/* T8132 has no SuperSpeed device mode: a device role keeps the lanes on USB2. */
+static void atcphy_test_t8132_device_role_usb2(struct kunit *test)
+{
+	struct typec_altmode dp = { .svid = USB_TYPEC_DP_SID };
+	struct typec_mux_state state = { .mode = TYPEC_STATE_USB };
+	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, false);
+
+	atcphy->hw = &atcphy_hw_t8132;
+	atcphy->t8132_ss = true;
+	atcphy->ss_tunables = true;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB3);
+	atcphy->t8132_device = true;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	state.alt = &dp;
+	state.mode = TYPEC_DP_STATE_D;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	KUNIT_EXPECT_EQ(test, atcphy_t8132_device_mode(atcphy, APPLE_ATCPHY_MODE_USB3_DP),
+			APPLE_ATCPHY_MODE_USB2);
+	atcphy->t8132_dp_alt = true;
+	KUNIT_EXPECT_EQ(test, atcphy_t8132_device_mode(atcphy, APPLE_ATCPHY_MODE_USB3_DP),
+			APPLE_ATCPHY_MODE_DP);
+	KUNIT_EXPECT_EQ(test, atcphy_t8132_device_mode(atcphy, APPLE_ATCPHY_MODE_DP),
+			APPLE_ATCPHY_MODE_DP);
+	KUNIT_EXPECT_EQ(test, atcphy_t8132_device_mode(atcphy, APPLE_ATCPHY_MODE_OFF),
+			APPLE_ATCPHY_MODE_OFF);
+	state.alt = NULL;
+	state.mode = TYPEC_STATE_SAFE;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_OFF);
+}
+
 static void atcphy_test_noop_same_mode(struct kunit *test)
 {
 	struct apple_atcphy *atcphy = atcphy_test_alloc(test, true);
@@ -1391,6 +1421,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_target_mode),
 	KUNIT_CASE(atcphy_test_target_mode_fixed_hub),
 	KUNIT_CASE(atcphy_test_target_mode_t8132),
+	KUNIT_CASE(atcphy_test_t8132_device_role_usb2),
 	KUNIT_CASE(atcphy_test_noop_same_mode),
 	KUNIT_CASE(atcphy_test_noop_needs_work),
 	KUNIT_CASE(atcphy_test_usb3_port_ready),

@@ -63,6 +63,7 @@ static unsigned reports;
 #define dev_warn(...) ((void)reports++)
 #define dev_err(...) ((void)reports++)
 #define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define lockdep_assert_held(...) ((void)0)
 #define guard(which) (void)
 #define IS_ENABLED(x) 0
@@ -101,6 +102,8 @@ struct apple_atcphy {
     bool host_active, usb3_port_off, dp_only, ss_tunables, fixed_usb2, t8140_dp_tunables, dp_tunables;
     /* T8132 ownership is tested without entering its lane-setup backend. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* T8132: the device role keeps the lanes on USB2 (no SuperSpeed device mode). */
+    bool t8132_device;
     struct { void *usb3_dp; } tunables;
 };
 struct phy { struct apple_atcphy *data; };
@@ -120,7 +123,7 @@ static unsigned usb2_power_off_calls;
 static unsigned ack_on;
 static int check_ret, bist_ret, unlock_ret, configure_ret;
 static bool concurrent_override_change;
-static bool model_t8132_off;
+static bool model_t8132_off, model_t8132_usb2;
 static u32 readl(const void *ptr) { u32 v; memcpy(&v, ptr, sizeof(v)); return v; }
 static void writel(u32 val, void *ptr) { memcpy(ptr, &val, sizeof(val)); }
 static void set32(void *ptr, u32 mask) {
@@ -179,7 +182,8 @@ static int atcphy_usb2_power_off(struct apple_atcphy *a) {
 }
 /* Only an explicitly expected T8132 OFF boundary is modeled, not lane setup. */
 static int atcphy_configure_t8132(struct apple_atcphy *a, enum atcphy_mode mode) {
-    assert(model_t8132_off && mode == APPLE_ATCPHY_MODE_OFF);
+    assert((model_t8132_off && mode == APPLE_ATCPHY_MODE_OFF) ||
+           (model_t8132_usb2 && mode == APPLE_ATCPHY_MODE_USB2));
     configure_calls++;a->mode=mode;a->mode_dirty=false;return 0;
 }
 static int atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *a) {
@@ -215,6 +219,7 @@ static void reset(enum atcphy_generation generation, bool t8140) {
     check_ret = bist_ret = unlock_ret = configure_ret = 0;
     concurrent_override_change = false;
     model_t8132_off = false;
+    model_t8132_usb2 = false;
 }
 static void reset_machine(enum atcphy_generation generation, const char *machine) {
     reset(generation, false);
@@ -425,6 +430,37 @@ static void setup_known_reset_clears_obligations(void) {
  setup_legacy_usb3();p.t8103_dummy_pending=p.t8103_usb3_retry=true;p.pipe_pending=true;
  atcphy_setup_pipehandler(&p);assert(!p.t8103_dummy_pending&&!p.t8103_usb3_retry&&!p.pipe_pending&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_DUMMY);
 }
+/* T8132 has no SuperSpeed device mode: a device role takes the lanes to USB2 and keeps them there. */
+static void t8132_device_role_runs_usb2(void) {
+ struct typec_mux_state state={.mode=TYPEC_STATE_USB};
+ reset(ATCPHY_GENERATION_T8132,false);p.t8132_ss=true;p.mode=APPLE_ATCPHY_MODE_USB3;p.typec_mode=APPLE_ATCPHY_MODE_USB3;
+ assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB3);
+ model_t8132_usb2=true;
+ assert(!atcphy_usb3_set_mode(&phy,PHY_MODE_USB_DEVICE,0));
+ assert(p.t8132_device&&p.mode==APPLE_ATCPHY_MODE_USB2&&p.typec_mode==APPLE_ATCPHY_MODE_USB2);
+ assert(configure_calls==1&&!p.host_active&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_DUMMY);
+ /* A later USB3 request from the port controller stays on USB2 while the role holds. */
+ assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB2);
+ assert(!atcphy_mux_switch(&p,atcphy_typec_target_mode(&p,&state)));assert(configure_calls==1);
+ /* The device role again on USB2: nothing to change. */
+ assert(!atcphy_usb3_set_mode(&phy,PHY_MODE_USB_DEVICE,0));assert(configure_calls==1);
+ /* USB3 beside DisplayPort keeps its four lanes only on a DP alt mode port. */
+ assert(atcphy_t8132_device_mode(&p,APPLE_ATCPHY_MODE_USB3_DP)==APPLE_ATCPHY_MODE_USB2);
+ p.t8132_dp_alt=true;
+ assert(atcphy_t8132_device_mode(&p,APPLE_ATCPHY_MODE_USB3_DP)==APPLE_ATCPHY_MODE_DP);
+ assert(atcphy_t8132_device_mode(&p,APPLE_ATCPHY_MODE_OFF)==APPLE_ATCPHY_MODE_OFF);
+ p.t8132_dp_alt=false;
+ /* The partner leaving lifts it: the next partner's USB3 request is USB3 again. */
+ model_t8132_off=true;
+ assert(!atcphy_mux_switch(&p,APPLE_ATCPHY_MODE_OFF));assert(!p.t8132_device);
+ assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB3);
+ /* So does the host role (a data role swap). */
+ reset(ATCPHY_GENERATION_T8132,false);p.t8132_ss=true;p.mode=APPLE_ATCPHY_MODE_USB2;p.t8132_device=true;
+ assert(!atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0));assert(!p.t8132_device&&p.host_active);
+ /* Without the SuperSpeed banks the port was USB2 already: no lane change. */
+ reset(ATCPHY_GENERATION_T8132,false);p.mode=APPLE_ATCPHY_MODE_USB2;
+ assert(!atcphy_usb3_set_mode(&phy,PHY_MODE_USB_DEVICE,0));assert(!p.t8132_device&&!configure_calls);
+}
 static void target_mode_table_and_dirty(void) {
  reset(ATCPHY_GENERATION_T8103,false);struct typec_mux_state state={.mode=TYPEC_DP_STATE_D};struct typec_altmode alt={.svid=USB_TYPEC_DP_SID};state.alt=&alt;
  assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB3_DP);state.mode=TYPEC_DP_STATE_C;
@@ -602,6 +638,7 @@ static void lock_timeout_left_to_caller(void) {
 }
 int main(void) {
  TEST(both_role_and_typec_orders_complete_usb3);
+ TEST(t8132_device_role_runs_usb2);
  TEST(nonusb3_commit_discharges_deferred_role);
  TEST(deferred_role_survives_configuration_failures);
  TEST(admission_requires_machine_and_generation);
@@ -717,7 +754,10 @@ def harness(source):
     # The PIPE backend of a mode, which T8132 CIO keeps on the dummy one.
     helpers = [block(source, "static bool atcphy_mode_is_cio("),
                block(source, "static bool atcphy_t8132_dp_on("),
-               block(source, "static enum atcphy_pipehandler_state\natcphy_pipe_state_for(")]
+               block(source, "static enum atcphy_mode atcphy_t8132_device_mode("),
+               block(source, "static enum atcphy_pipehandler_state\natcphy_pipe_state_for("),
+               # atcphy_usb3_set_mode() moves a T8132 device role to USB2 through it.
+               "static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode target_mode);"]
     functions = "\n".join(helpers + [block(source, "static " + kind + " " + name + "(")
                                       for kind, name in function_specs])
     configure = block(source, "static int atcphy_configure(")
@@ -731,7 +771,14 @@ def harness(source):
     return PRELUDE + defines + "\n" + "\n".join(usb_defines) + "\n" + types + "\n" + table + stubs + functions + scope_c + TESTS
 
 
-MUTATIONS = {'t8132-usb-stop-keeps-dirty-cio': ('atcphy_usb3_power_off',
+MUTATIONS = {'t8132-device-role-refused': ('atcphy_usb3_set_mode',
+ 'if (atcphy->t8132_ss && mode == PHY_MODE_USB_DEVICE) {',
+ 'if (atcphy->t8132_ss && mode == PHY_MODE_USB_DEVICE) {\n\t\treturn -EOPNOTSUPP;'),
+ 't8132-device-role-not-remembered': ('enum atcphy_mode atcphy_typec_target_mode',
+ 'if (atcphy->t8132_device)', 'if (false)'),
+ 't8132-device-role-sticks-after-unplug': ('atcphy_mux_switch',
+ '\tif (target_mode == APPLE_ATCPHY_MODE_OFF)\n\t\tatcphy->t8132_device = false;', '\t(void)0;'),
+ 't8132-usb-stop-keeps-dirty-cio': ('atcphy_usb3_power_off',
  '&&\n\t    !atcphy->mode_dirty)', ')'),
  't8132-usb-stop-drops-cio': ('atcphy_usb3_power_off',
  'atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy_mode_is_cio(atcphy->mode)', 'false'),
