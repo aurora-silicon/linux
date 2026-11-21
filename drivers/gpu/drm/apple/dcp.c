@@ -8135,6 +8135,7 @@ static bool dcp_hibernating(void)
 }
 
 static int dcp_hib_prepare(struct apple_dcp *dcp);
+static bool dcp_t6041_hib_capable(void);
 #else
 static bool dcp_hibernating(void)
 {
@@ -10964,6 +10965,9 @@ static int dcp_hib_prepare(struct apple_dcp *dcp)
 			 "refusing hibernation: firmware restart after the last resume still running\n");
 		return -EBUSY;
 	}
+	/* Taken down at .freeze with the sleep's stop instead (apple_platform_freeze()). */
+	if (dcp_t6041_hib_capable())
+		return 0;
 	if (!dcp_hib_can_restart(dcp) || !dcp_desktop_external(dcp))
 		return 0;
 	dcp_hib_stop_ext_link_work(dcp);
@@ -11003,6 +11007,37 @@ static int dcp_hib_register(struct apple_dcp *dcp)
 	if (ret)
 		return ret;
 	dcp->hib_nb_registered = true;
+	return 0;
+}
+
+/*
+ * The old firmware session dropped on the host side for the restart after
+ * PM_POST_HIBERNATION (dcp_hib_restore_work()); @release_dma once the DARTs
+ * have restored their state.
+ */
+static int dcp_hib_drop_session(struct apple_dcp *dcp, bool release_dma)
+{
+	int ret = dcp_hib_register(dcp);
+
+	if (ret) {
+		dev_err(dcp->dev, "hibernation restore: no PM notifier (%d)\n", ret);
+		return ret;
+	}
+	dcp_hib_quiesce(dcp);
+	if (dcp_desktop_external(dcp)) {
+		dcp_hib_quiesce_ext(dcp);
+		dcp->hib_ext_start_pending = true;
+		atomic_inc(&dcp_hib_ext_starting);
+		/* Counted at prepare, in the image, unless prepare did not run. */
+		if (!dcp->hib_ext_idle_pending) {
+			dcp->hib_ext_idle_pending = true;
+			atomic_inc(&dcp_hib_ext_idle);
+		}
+	}
+	if (release_dma)
+		dcp_hib_release_dma(dcp);
+	dev_info(dcp->dev,
+		 "hibernation restore: old firmware session dropped; restart after PM_POST_HIBERNATION\n");
 	return 0;
 }
 
@@ -11075,7 +11110,6 @@ static int dcp_platform_thaw(struct device *dev)
 static int dcp_platform_restore_early(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	int ret;
 
 	/* The power-off failed: .restore thaws. */
 	if (!dcp || dcp->hib_poweroff_entered)
@@ -11089,31 +11123,14 @@ static int dcp_platform_restore_early(struct device *dev)
 	if (!dcp->hib_rx_held)
 		dev_warn(dev,
 			 "hibernation restore: RTKit receive was not held in the image\n");
-	ret = dcp_hib_register(dcp);
-	if (ret) {
-		/* .restore refuses, as for a processor it cannot restart. */
-		dev_err(dev, "hibernation restore: no PM notifier (%d)\n", ret);
-		return 0;
-	}
 	/* Host side only: the DMA of the old session goes in .restore. */
-	dcp_hib_quiesce(dcp);
-	dcp_hib_quiesce_ext(dcp);
-	dcp->hib_ext_start_pending = true;
-	atomic_inc(&dcp_hib_ext_starting);
-	/* Counted at prepare, in the image, unless prepare did not run. */
-	if (!dcp->hib_ext_idle_pending) {
-		dcp->hib_ext_idle_pending = true;
-		atomic_inc(&dcp_hib_ext_idle);
-	}
-	dev_info(dev,
-		 "hibernation restore: old firmware session dropped; restart after PM_POST_HIBERNATION\n");
+	dcp_hib_drop_session(dcp, false);
 	return 0;
 }
 
 static int dcp_platform_restore(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	int ret;
 
 	/* The power-off failed: the firmware ran on, as after a thaw. */
 	if (dcp->hib_poweroff_entered) {
@@ -11136,15 +11153,8 @@ static int dcp_platform_restore(struct device *dev)
 		if (!dcp->hib_rx_held)
 			dev_warn(dev,
 				 "hibernation restore: RTKit receive was not held in the image\n");
-		ret = dcp_hib_register(dcp);
-		if (!ret) {
-			dcp_hib_quiesce(dcp);
-			dcp_hib_release_dma(dcp);
-			dev_info(dev,
-				 "hibernation restore: old firmware session dropped; restart after PM_POST_HIBERNATION\n");
+		if (!dcp_hib_drop_session(dcp, true))
 			return 0;
-		}
-		dev_err(dev, "hibernation restore: no PM notifier (%d)\n", ret);
 	}
 
 	if (READ_ONCE(dcp->retain_dma) || dcp->hw.adopt_live_session)
@@ -11660,6 +11670,12 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 	apple_rtkit_mailbox_off(dcp->rtk);
 	dcp_s2r_cpu_stop(dcp);
 	dcp_s2r_stop_streams(dcp);
+	/* The power word step takes the blocks of both DARTs down with the pipe. */
+	dcp_s2r_find_darts(dcp);
+	if (dcp->s2r_disp_dart)
+		apple_dart_display_unpowered(dcp->s2r_disp_dart);
+	if (dcp->s2r_dcp_dart)
+		apple_dart_display_unpowered(dcp->s2r_dcp_dart);
 
 	return 0;
 
@@ -11982,8 +11998,27 @@ unlock:
 	return ret;
 }
 
+/*
+ * Through a boot (hibernation .restore, dcp_t6041_hib_restore()): the boot loader started the
+ * firmware anew, so it takes the new handshake after PM_POST_HIBERNATION instead of the
+ * sleep's warm return.
+ */
+static void dcp_t6041_hib_handshake(struct apple_dcp *dcp)
+{
+	WRITE_ONCE(dcp->s2r_fw_down, false);
+	iomfb_pause_presentation(dcp, false);
+#ifdef CONFIG_HIBERNATION
+	if (dcp_hib_can_restart(dcp) && !dcp_hib_drop_session(dcp, true))
+		return;
+#endif
+	dev_err(dcp->dev, "hibernation restore: firmware started by the boot loader cannot be restarted: output stays off\n");
+	WRITE_ONCE(dcp->crashed, true);
+	WRITE_ONCE(dcp->ext_dead, true);
+}
+
 static int dcp_t6041_start_one(struct device *dev, void *data)
 {
+	bool cold = data && *(bool *)data;
 	const struct dcp_t6041_pipe *p = &dcp_t6041_pipes[DCP_T6041_MAIN];
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	void __iomem *ps = dcp_t6041_pw[DCP_PW_PS];
@@ -12040,6 +12075,11 @@ static int dcp_t6041_start_one(struct device *dev, void *data)
 		dev_warn(dev, "display domains not on after the sleep: %#x\n", to);
 
 	dcp_s2r_find_darts(dcp);
+	/* The blocks are up: a hibernation restore the DARTs deferred runs first. */
+	if (dcp->s2r_disp_dart)
+		apple_dart_display_restore(dcp->s2r_disp_dart);
+	if (dcp->s2r_dcp_dart)
+		apple_dart_display_restore(dcp->s2r_dcp_dart);
 	if (dcp->s2r_disp_dart) {
 		apple_dart_display_keep(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, false);
 		apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, true, false);
@@ -12052,6 +12092,10 @@ static int dcp_t6041_start_one(struct device *dev, void *data)
 
 	WRITE_ONCE(dcp->crashed, false);
 	WRITE_ONCE(dcp->ext_dead, false);
+	if (cold) {
+		dcp_t6041_hib_handshake(dcp);
+		return 0;
+	}
 	ret = apple_rtkit_power_cycled_return(dcp->rtk,
 					      dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	if (ret) {
@@ -12167,6 +12211,7 @@ static void dcp_t6040_dart_lit(struct device_node *np)
  */
 static int dcp_t6040_ext_start_one(struct device *dev, void *data)
 {
+	bool cold = data && *(bool *)data;
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	const struct dcp_t6041_pipe *p;
 	void __iomem *ps, *pg, *cpu;
@@ -12221,6 +12266,10 @@ static int dcp_t6040_ext_start_one(struct device *dev, void *data)
 	dcp_t6040_dart_lit(dev->of_node);
 	dcp_s2r_find_darts(dcp);
 	if (dcp->s2r_disp_dart)
+		apple_dart_display_restore(dcp->s2r_disp_dart);
+	if (dcp->s2r_dcp_dart)
+		apple_dart_display_restore(dcp->s2r_dcp_dart);
+	if (dcp->s2r_disp_dart)
 		apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, true, false);
 	if (dcp->s2r_dcp_dart)
 		apple_dart_display_streams(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS, true, false);
@@ -12228,6 +12277,11 @@ static int dcp_t6040_ext_start_one(struct device *dev, void *data)
 
 	WRITE_ONCE(dcp->crashed, false);
 	WRITE_ONCE(dcp->ext_dead, false);
+	if (cold) {
+		dcp->t6041_ext_seen = false;
+		dcp_t6041_hib_handshake(dcp);
+		return 0;
+	}
 	ret = apple_rtkit_power_cycled_return(dcp->rtk,
 					      dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	if (ret) {
@@ -12377,26 +12431,40 @@ static void dcp_t6040_plug_work(struct work_struct *work)
 enum dcp_t6041_step { DCP_S2R_FW_STOP, DCP_S2R_WORDS_DOWN, DCP_S2R_START };
 
 /* Each step once per sleep. */
+/*
+ * The display back up after dcp_t6041_s2r_all(false): the domains and DARTs as after a sleep,
+ * then the firmware's warm return, or (@cold, through a boot) the new handshake.
+ */
+static int dcp_t6041_start(bool cold)
+{
+	int ret;
+
+	if (!dcp_t6041_down)
+		return 0;
+	dcp_t6041_down = false;
+	dcp_t6041_words = false;
+	ret = driver_for_each_device(&apple_platform_driver.driver, NULL, &cold,
+				     dcp_t6041_start_one);
+	/*
+	 * The internal display runs again: its mode set has completed. Through a boot the
+	 * words are the boot loader's already.
+	 */
+	if (!cold)
+		dcp_t6041_boot_ps_io(true);
+	if (!ret && dcp_t6041_ext_restarts())
+		ret = driver_for_each_device(&apple_platform_driver.driver, NULL, &cold,
+					     dcp_t6040_ext_start_one);
+	return ret;
+}
+
 static int dcp_t6041_s2r_step(enum dcp_t6041_step step)
 {
 	bool external = true;
 	unsigned int i;
 	int ret;
 
-	if (step == DCP_S2R_START) {
-		if (!dcp_t6041_down)
-			return 0;
-		dcp_t6041_down = false;
-		dcp_t6041_words = false;
-		ret = driver_for_each_device(&apple_platform_driver.driver, NULL, NULL,
-					     dcp_t6041_start_one);
-		/* The internal display runs again: its mode set has completed. */
-		dcp_t6041_boot_ps_io(true);
-		if (!ret && dcp_t6041_ext_restarts())
-			ret = driver_for_each_device(&apple_platform_driver.driver, NULL, NULL,
-						     dcp_t6040_ext_start_one);
-		return ret;
-	}
+	if (step == DCP_S2R_START)
+		return dcp_t6041_start(false);
 	if (step == DCP_S2R_WORDS_DOWN) {
 		if (dcp_t6041_words || !dcp_t6041_down)
 			return 0;
@@ -12475,6 +12543,27 @@ int dcp_t6041_s2r_all(bool start)
 
 	return 0;
 }
+
+#ifdef CONFIG_HIBERNATION
+/* A display complex that hibernation takes down with the sleep's stop (from the DT). */
+static bool dcp_t6041_hib_capable(void)
+{
+	return dcp_t6041_power();
+}
+
+/*
+ * Hibernation .restore of a display complex that .freeze took down (dcp_t6041_s2r_all()):
+ * from the loading kernel, whose .freeze stopped it the same way, the sleep's warm return;
+ * through a boot (pm_hibernate_restored_cold() not 0), the new handshake.
+ */
+void dcp_t6041_hib_restore(void)
+{
+	if (pm_hibernate_restored_cold())
+		dcp_t6041_start(true);
+	else
+		dcp_t6041_s2r_all(true);
+}
+#endif
 
 #ifdef CONFIG_HIBERNATION
 /* Ahead of the per-DCP notifiers (priority -5). */
