@@ -12,6 +12,7 @@ static const char *const apple_sleep_test_profiles[] = {
 	"apple,t8142-sleep",
 	"apple,t6050-sleep",
 	"apple,t6050-j716c-sleep",
+	"apple,t6030-sleep",
 };
 
 static bool apple_sleep_test_has(const struct apple_sleep_words *all, u32 offset)
@@ -86,8 +87,11 @@ static void apple_sleep_test_words(struct kunit *test)
 		};
 		int i;
 
-		/* Region-based profiles keep their words in their own tables */
-		if (soc->regions)
+		/*
+		 * Region-based profiles keep their words in their own tables, and a profile with
+		 * its own commit_regs and no lists (T6030) uses none of the shared path's.
+		 */
+		if (soc->regions || (soc->ops->commit_regs && !all->count))
 			continue;
 		apple_sleep_test_full(test, c, "ps_all", all);
 		apple_sleep_test_full(test, c, "ps_aon_all", aon);
@@ -208,8 +212,12 @@ static void apple_sleep_test_layout(struct kunit *test)
 		KUNIT_EXPECT_GT(test, soc->cpu_start_stride, 0);
 		KUNIT_EXPECT_LE(test, soc->nclk_mux_parked, SLEEP_CLK_MUX_MAX);
 		KUNIT_EXPECT_LE(test, soc->ncllt, SLEEP_CLLT_MAX);
-		/* Every SoC steps its memory controller down (T8142: from the J813 trace). */
-		KUNIT_EXPECT_GE(test, soc->nmcc, 1);
+		/*
+		 * Every SoC on the shared path steps its memory controller down (T8142: from the
+		 * J813 trace). One with its own commit_regs does it there, or not yet (T6030).
+		 */
+		if (!soc->ops->commit_regs)
+			KUNIT_EXPECT_GE(test, soc->nmcc, 1);
 		KUNIT_EXPECT_LE(test, soc->nmcc, MCC_CHANNELS);
 		KUNIT_EXPECT_LE(test, soc->namcc, SLEEP_AMCC_MAX);
 		/* Each SoC NI table is mapped 0x80 bytes long (the T8142 sleep node). */
@@ -239,6 +247,22 @@ static void apple_sleep_test_t6050(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sleep_region_validate(t6050_sleep_soc.regions), 0);
 	KUNIT_EXPECT_EQ(test, t6050_sleep_soc.cpu_cluster_affinity, 1U);
 	KUNIT_EXPECT_EQ(test, t6050_sleep_soc.cpu_start_stride, 6U);
+}
+
+/* Untested, early-context, its own commit and wake, and the measured CPU-start stride */
+static void apple_sleep_test_t6030(struct kunit *test)
+{
+	const struct apple_sleep_soc *soc = &t6030_sleep_soc;
+
+	KUNIT_EXPECT_TRUE(test, soc->untested);
+	KUNIT_EXPECT_TRUE(test, soc->early_context);
+	KUNIT_EXPECT_NULL(test, soc->smc_policy);
+	KUNIT_EXPECT_NULL(test, soc->ops->commit_notice);
+	KUNIT_EXPECT_NOT_NULL(test, soc->ops->commit_regs);
+	KUNIT_EXPECT_NOT_NULL(test, soc->ops->final_check);
+	KUNIT_EXPECT_EQ(test, soc->ndisp, 0U);
+	KUNIT_EXPECT_EQ(test, soc->cpu_start_stride, 6U);
+	KUNIT_EXPECT_EQ(test, apple_sleep_profile_validate(soc), 0);
 }
 
 /* The Max extends, rather than replaces or reorders, the common inventory. */
@@ -367,6 +391,7 @@ static void apple_sleep_test_region_rejects_bad_inventory(struct kunit *test)
 static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
+	KUNIT_CASE(apple_sleep_test_t6030),
 	KUNIT_CASE(apple_sleep_test_j716c_inventory),
 	KUNIT_CASE(apple_sleep_test_unavailable),
 	KUNIT_CASE(apple_sleep_test_j716c_full),
