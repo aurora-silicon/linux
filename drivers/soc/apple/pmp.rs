@@ -138,6 +138,9 @@ struct PmpState {
     allocs: KVec<PmpAllocation>,
     value_buf: Option<u64>,
     ioreg_entries: KVec<u32>,
+    /// The firmware's own index of each entry in `ioreg_entries` (word 0x48 of its
+    /// REGISTER_IOREG buffer), by which UPDATE_IOREG names the entry.
+    ioreg_ids: KVec<u32>,
     /// Held from a system sleep's start until its end.
     sram: Option<SramCopy>,
 }
@@ -149,6 +152,7 @@ impl PmpState {
             allocs: KVec::with_capacity(10, GFP_KERNEL)?,
             value_buf: None,
             ioreg_entries: KVec::with_capacity(340, GFP_KERNEL)?,
+            ioreg_ids: KVec::with_capacity(340, GFP_KERNEL)?,
             sram: None,
         })
     }
@@ -191,6 +195,8 @@ struct PmpData {
     sram_backup_data: bool,
     /// See [`PmpHwConfig::self_ack_start`].
     self_ack_start: bool,
+    /// See [`PmpHwConfig::confirm_ioreg_len`].
+    confirm_ioreg_len: bool,
 }
 
 impl PmpData {
@@ -227,6 +233,7 @@ impl PmpData {
                     sram_backup,
                     sram_backup_data,
                     self_ack_start: cfg.self_ack_start,
+                    confirm_ioreg_len: cfg.confirm_ioreg_len,
                 }
             ),
             GFP_KERNEL,
@@ -399,6 +406,14 @@ impl PmpData {
         let mut size = u32::from_le_bytes(unsafe {
             <&[u8] as TryInto<[u8; 4]>>::try_into(&msg_buf.as_ref()[0x40..0x44]).unwrap()
         });
+        let id = if msg_buf.size() >= 0x4c {
+            // SAFETY: TODO
+            u32::from_le_bytes(unsafe {
+                <&[u8] as TryInto<[u8; 4]>>::try_into(&msg_buf.as_ref()[0x48..0x4c]).unwrap()
+            })
+        } else {
+            u32::MAX
+        };
         if size == 0 {
             let mut name_vec = KVec::with_capacity(0x31, GFP_KERNEL)?;
             name_vec
@@ -446,6 +461,7 @@ impl PmpData {
             }
         }
         state.ioreg_entries.push(size, GFP_KERNEL)?;
+        state.ioreg_ids.push(id, GFP_KERNEL)?;
         let index = state.ioreg_entries.len() as u64;
         let msg = (OPC_REGISTER_IOREG | OPC_ACK_MASK) << OPC_SHIFT | (index << 32) | size as u64;
         Ok(msg)
@@ -598,6 +614,30 @@ impl PmpData {
         // and `control` is inside the ASC mapping held by `self`.
         to_result(unsafe { bindings::apple_rtkit_sleep_return(rtk, control) })
     }
+    /// CONFIRM_IOREG's value for an UPDATE_IOREG: the length of the entry the firmware names by
+    /// its own index, as registered. macOS 27.2 answers so on the M4 Mac mini (J773g), 8 for each
+    /// of the four entries that image updates. An index that names no registered entry, which
+    /// macOS doesn't see, gets 0, the answer this driver gave before.
+    fn confirm_ioreg_value(&self, id: u64) -> u64 {
+        let state = self.state.lock();
+        let found = state
+            .ioreg_ids
+            .iter()
+            .position(|&e| u64::from(e) == id)
+            .and_then(|i| state.ioreg_entries.get(i).copied());
+        drop(state);
+        match found {
+            Some(len) => u64::from(len),
+            None => {
+                dev_warn!(
+                    self.dev,
+                    "UPDATE_IOREG {:#x} names no registered entry\n",
+                    id
+                );
+                0
+            }
+        }
+    }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
@@ -625,8 +665,15 @@ impl PmpData {
             OPC_REGISTER_IOREG => self.register_ioreg(msg & MSG_IOVA_MASK)?,
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
             // Firmware waits for this confirmation before publishing reports.
-            // Do not echo the registry index/payload or add a generic ACK bit.
-            OPC_UPDATE_IOREG => OPC_CONFIRM_IOREG << OPC_SHIFT,
+            // Do not echo the registry index or add a generic ACK bit.
+            OPC_UPDATE_IOREG => {
+                let value = if self.confirm_ioreg_len {
+                    self.confirm_ioreg_value(msg & SET_IOREG_INDEX_MASK)
+                } else {
+                    0
+                };
+                OPC_CONFIRM_IOREG << OPC_SHIFT | value
+            }
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
                 return Err(EIO);
@@ -880,6 +927,8 @@ struct PmpHwConfig {
     /// Wait briefly for the firmware to acknowledge IOP power on by itself before sending
     /// SET_IOP_PWR_STATE.
     self_ack_start: bool,
+    /// Answer UPDATE_IOREG with the registered entry's length instead of 0.
+    confirm_ioreg_len: bool,
 }
 
 /// Whether a PMP firmware needs endpoint 7 to finish its RTKit boot.
@@ -900,6 +949,7 @@ const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     sram_backup: None,
     sram_backup_data: false,
     self_ack_start: false,
+    confirm_ioreg_len: false,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
@@ -910,6 +960,7 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     sram_backup: Some((0x3c000, 0x5c000)),
     sram_backup_data: false,
     self_ack_start: false,
+    confirm_ioreg_len: false,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
@@ -922,6 +973,7 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     sram_backup: None,
     sram_backup_data: false,
     self_ack_start: false,
+    confirm_ioreg_len: false,
 };
 
 /// T8142: the DART window starts at 1 TiB as on T8140. Its registry-v2
@@ -934,6 +986,7 @@ const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
     sram_backup: None,
     sram_backup_data: false,
     self_ack_start: false,
+    confirm_ioreg_len: false,
 };
 
 /// T6050: the DART window starts at 1 TiB (ADT dart-pmp0 vm-base) and spans
@@ -946,6 +999,7 @@ const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
     sram_backup: None,
     sram_backup_data: false,
     self_ack_start: false,
+    confirm_ioreg_len: false,
 };
 
 /// T8132: over a sleep only the ADT's second segment (0x68000 bytes, starting at 0x3c000 on
@@ -959,6 +1013,7 @@ const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     sram_backup: Some((0x3c000, 0x68000)),
     sram_backup_data: true,
     self_ack_start: true,
+    confirm_ioreg_len: true,
 };
 
 impl Drop for PmpDriver {
