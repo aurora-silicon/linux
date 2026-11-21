@@ -34,7 +34,12 @@ static int of_property_read_variable_u32_array(void *n,const char *p,u32 *out,in
 #define CHECK(x) do {if (!(x)) {fprintf(stderr,"failed line %d\n",__LINE__);return 1;}} while(0)
 '''
 NEWER_CASES = r'''
- CHECK(ver(27,2,0)==ISP_FIRMWARE_V_UNKNOWN);
+ CHECK(ver(27,2,0)==ISP_FIRMWARE_V_26_6_2);
+ CHECK(ver(26,6,3)==ISP_FIRMWARE_V_26_6_2);
+ CHECK(ver(26,7,0)==ISP_FIRMWARE_V_26_6_2);
+ CHECK(ver(27,0,0)==ISP_FIRMWARE_V_26_6_2);
+ CHECK(ver(30,0,0)==ISP_FIRMWARE_V_26_6_2);
+ CHECK(ver(26,5,9)==ISP_FIRMWARE_V_UNKNOWN);
 '''
 main = r'''
 static int ver(u32 a,u32 b,u32 c) {
@@ -62,7 +67,7 @@ NEWER_CASES
   CHECK(isp_read_fw_version(&dev,"apple,firmware-compat")==ISP_FIRMWARE_V_UNKNOWN);
  }
  cells=3;bytes=13;CHECK(isp_read_fw_version(&dev,"apple,firmware-compat")==ISP_FIRMWARE_V_UNKNOWN);
- puts("PASS: known versions, unknown versions, missing/truncated/extended cells");
+ puts("PASS: known versions, newer than 26.6.2 -> 26.6.2 layout, unknown older versions, missing/truncated/extended cells");
  return 0;
 }
 '''

@@ -740,6 +740,19 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 		else if (ver[0] == 14 && ver[1] == 7 && ver[2] == 0)
 			return ISP_FIRMWARE_V_14_7;
 
+		/*
+		 * Firmware newer than 26.6.2 keeps the 26.6.2 command layout
+		 * (T8122 on 27.2). Treating it as unknown selects the 12.x
+		 * layout, whose set file load carries a 32-bit address that
+		 * the firmware refuses.
+		 */
+		if (ver[0] > 26 ||
+		    (ver[0] == 26 && (ver[1] > 6 || (ver[1] == 6 && ver[2] > 2)))) {
+			dev_info(dev, "%s %d.%d.%d is newer than 26.6.2, using its layout\n",
+				 name, ver[0], ver[1], ver[2]);
+			return ISP_FIRMWARE_V_26_6_2;
+		}
+
 		dev_warn(dev, "unknown %s: %d.%d.%d\n", name, ver[0], ver[1], ver[2]);
 		break;
 	case 4:
