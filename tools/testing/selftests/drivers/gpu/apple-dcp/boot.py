@@ -218,13 +218,12 @@ def t6041_v27_admission(root):
     selector_full = block(dcp_c, 'static enum dcp_firmware_version dcp_check_firmware_version(')
     cutoff = '\n\tret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);\n\tif (ret < 0)'
     selector = selector_full[:selector_full.index(cutoff)] + '\n\t(void)v14_board;\n\treturn DCP_FIRMWARE_UNKNOWN;\n}\n'
-    # The J773g's admission, with its machine check as a flag: no of_machine_is_compatible()
-    # exists in this translation unit, so the T6041 helpers cannot depend on the machine.
+    # The T8132 27.2 dcpext admission: by processor and image, never by board. No
+    # of_machine_is_compatible() exists in this translation unit, so neither it nor the T6041
+    # helpers can depend on the machine.
     t8132_h = (root / 'include/linux/soc/apple/t8132.h').read_text()
     t8132_admission = block(t8132_h, 'static inline bool apple_t8132_dcpext_v27_2(')
-    assert t8132_admission.count('of_machine_is_compatible("apple,j773g")') == 1
-    t8132_admission = ('static bool machine_j773g;\n' +
-                       t8132_admission.replace('of_machine_is_compatible("apple,j773g")', 'machine_j773g'))
+    assert 'of_machine_is_compatible' not in t8132_admission
     return r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -455,8 +454,9 @@ int main(void)
     }
 
     /*
-     * The Mac mini's (J773g) dcpext handed over with the T8132 27.2 image runs
-     * the 27.2 table; nothing else of T8132 does, whatever the firmware path.
+     * A T8132 dcpext handed over with the T8132 27.2 image (first the Mac
+     * mini's, J773g) runs the 27.2 table, whatever the firmware path and on
+     * any board: the selection is by processor and image.
      */
     reset_t6041_26b123(true);
     node.compatible = "apple,t8132-dcpext";
@@ -464,16 +464,10 @@ int main(void)
     assert(!apple_t6041_dcpext_v27_2(&node));
     for (unsigned path = 0; path < 2; path++) {
         t8132_firmware_path = path;
-        machine_j773g = true;
         assert(apple_t8132_dcpext_v27_2(&node));
         assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
-        /* Another M4 Mac (J713, J604): the M4 backend's, as before. */
-        machine_j773g = false;
-        assert(!apple_t8132_dcpext_v27_2(&node));
-        assert(dcp_check_firmware_version(&dev) == (path ? DCP_FIRMWARE_M4 : DCP_FIRMWARE_UNKNOWN));
     }
     t8132_firmware_path = false;
-    machine_j773g = true;
     /* The internal DCP is never admitted: macOS parks it; aura hands it to nobody. */
     node.compatible = "apple,t8132-dcp";
     assert(!apple_t8132_dcpext_v27_2(&node));
@@ -491,12 +485,11 @@ int main(void)
     assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
     node.compat[1] = 2; node.fw[2] = 1; assert(!apple_t8132_dcpext_v27_2(&node));
     node.fw[2] = 0; assert(apple_t8132_dcpext_v27_2(&node));
-    machine_j773g = false;
 
     dev.hw = &hw_t6041;
     puts("PASS T6041 26B123 v27.2 internal/external admission, refusal controls, and desktop 26.x preservation");
     puts("PASS T8122 internal DCP on its 27.2 image alone runs the 27.2 table");
-    puts("PASS T8132 M4 backend only on its firmware path; the J773g dcpext on 27.2 alone runs the 27.2 table");
+    puts("PASS T8132 M4 backend only on its firmware path; a T8132 dcpext on the 27.2 image runs the 27.2 table on any board");
     return 0;
 }
 '''

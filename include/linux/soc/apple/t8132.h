@@ -56,16 +56,16 @@ static inline bool apple_t8132_firmware_path(void)
 }
 
 /*
- * A T8132 external display processor on the Mac mini (J773g) handed over
- * with the 27.2 image: it runs the firmware-27 backend (iomfb_v27.c), not
- * the M4 26.6.2 one (iomfb_m4.c). Other T8132 boards and images are not
- * admitted until a trace of theirs says the same interface applies. Kept
- * here, not in display.h, whose T6041 helpers key on the processor alone.
+ * A T8132 external display processor handed over with the 27.2 image
+ * (first on the Mac mini, J773g): it runs the firmware-27 backend
+ * (iomfb_v27.c), not the M4 26.6.2 one (iomfb_m4.c). The firmware
+ * interface belongs to the processor and the image it runs, so both are
+ * checked and the board is not; what differs between boards (the HDMI
+ * port, its PHY, rails and hot-plug line) comes from the device tree.
  */
 static inline bool apple_t8132_dcpext_v27_2(const struct device_node *np)
 {
-	return of_machine_is_compatible("apple,j773g") &&
-	       apple_dcp_image_v27_2(np, "apple,t8132-dcpext",
+	return apple_dcp_image_v27_2(np, "apple,t8132-dcpext",
 				     APPLE_T8132_DCP_26B123_UUID);
 }
 
