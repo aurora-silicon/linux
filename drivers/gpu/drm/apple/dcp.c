@@ -9475,6 +9475,20 @@ static void dcp_dpms_power_off(struct apple_dcp *dcp)
 }
 
 /*
+ * J613 trial: the generic end of macOS's DCP shutdown before the cold stop. macOS ends it with AP
+ * then IOP idle and the run bit off twice (capture run 51); Linux only clears the run bit. This
+ * asks RTKit for idle first (the secure port's AP idle as in dcp_s2r_quiesce), logs the result,
+ * and stops cold either way. v26_sleep_calls sends, before it, the 26.6 firmware's calls
+ * observed before macOS's sleep (capture run 68; dcp_v26_sleep_calls()).
+ */
+static bool v26_sleep_rtkit_idle;
+module_param(v26_sleep_rtkit_idle, bool, 0444);
+static int v26_sleep_calls;
+module_param(v26_sleep_calls, int, 0444);
+MODULE_PARM_DESC(v26_sleep_calls, "The 26.6 firmware's calls observed before macOS's sleep, sent before the RTKit idle and cold stop (1: the sleep-entry group, 2: the panel-off group first)");
+MODULE_PARM_DESC(v26_sleep_rtkit_idle, "RTKit AP and IOP idle before the DCP's cold stop for a sleep, as macOS ends its shutdown");
+
+/*
  * J613 with the 26.6 firmware has no display sleep protocol in this driver and no restart. Under
  * the sleep driver, which refuses a sleep while a bound display coprocessor runs, its .suspend
  * stops the coprocessor cold, as macOS's last write to it does, and the sleep driver lowers
@@ -9532,6 +9546,23 @@ static int dcp_platform_suspend(struct device *dev)
 		dev_warn(dev, "J613: display coprocessor stopped cold for the sleep (control %#x); it stays dark until reboot\n",
 			 control);
 		WRITE_ONCE(dcp->quiescing, true);
+		{
+		/* The 26.6 path keeps its firmware session's RTKit in dcp->v26, not in dcp->rtk (n28). */
+		struct apple_rtkit *rtk = dcp->rtk ?: dcp_v26_rtkit(dcp);
+
+		if (READ_ONCE(v26_sleep_calls) > 0)
+			dcp_v26_sleep_calls(dcp, READ_ONCE(v26_sleep_calls));
+		dev_warn(dev, "J613: RTKit idle switch %d, rtk %s%s\n", READ_ONCE(v26_sleep_rtkit_idle),
+			 !rtk ? "NULL" : IS_ERR(rtk) ? "error" : "present",
+			 dcp->rtk ? "" : " (the 26.6 session's)");
+		if (READ_ONCE(v26_sleep_rtkit_idle) && !IS_ERR_OR_NULL(rtk)) {
+			int ret = apple_rtkit_idle_with(rtk, dcp_secure_port_idle, dcp);
+
+			dev_warn(dev, "J613: RTKit idle before the cold stop: %d (control %#x status %#x)\n",
+				 ret, readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL),
+				 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
+		}
+		}
 		WRITE_ONCE(dcp->j613_sleep_down, true);
 		dcp_s2r_cpu_stop(dcp);
 		return 0;
