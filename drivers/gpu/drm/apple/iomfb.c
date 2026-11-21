@@ -4488,9 +4488,20 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 	     dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	    !dcp_is_ext26(dcp)) {
-		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
-		if (ret)
-			return ret;
+		/*
+		 * Firmware 27 lists the endpoints its application uses. Some
+		 * builds (T8112's 27.2 DCP) have no remote allocator there, and
+		 * starting an endpoint the firmware does not advertise fails.
+		 */
+		if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		    !apple_rtkit_has_endpoint(dcp->rtk, REMOTE_ALLOC_ENDPOINT)) {
+			dev_info(dcp->dev, "remote allocator not advertised; IOMFB endpoint %sadvertised\n",
+				 apple_rtkit_has_endpoint(dcp->rtk, IOMFB_ENDPOINT) ? "" : "not ");
+		} else {
+			ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
+			if (ret)
+				return ret;
+		}
 	}
 	/* Desktop 26.x started the transport with its auxiliary endpoints. */
 	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP) {
