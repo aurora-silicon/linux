@@ -135,6 +135,9 @@ pub(crate) struct Layout {
     pub(crate) globals_policy: &'static [(usize, u32)],
     /// GLOBALS (region C) words this build writes in place of the 25G83 value at that position.
     pub(crate) globals_override: &'static [(usize, u32)],
+    /// POWER_PERFORMANCE (power config) words of this build that have no 25G83 position, at
+    /// their own offsets.
+    pub(crate) power_policy: &'static [(usize, u32)],
 }
 
 /// Size of the host's crash copy buffer (`coredump-copy-buffer` in the 27.2 ADT); macOS 27.2
@@ -215,6 +218,7 @@ pub(crate) const V25G83: Layout = Layout {
     coredump_copy: None,
     globals_policy: &[],
     globals_override: &[],
+    power_policy: &[],
 };
 
 /// The 26B123 InitData ABI (macOS 27.2): the same 31 objects and pointers, with
@@ -277,6 +281,11 @@ pub(crate) const V26B123: Layout = Layout {
     globals_policy: &[(0x38, 1), (0x9dc, 50), (0xe0c, 250)],
     // The GPU is not powered off when idle; see IDLE_OFF_KEEP_POWERED_MS.
     globals_override: &[(0x9c0, IDLE_OFF_KEEP_POWERED_MS)],
+    // The four u32s inserted at 0x9c, as the M4 Pro writes them on this firmware (1 each, on
+    // hardware, linux#1954) and as macOS 27.2's InitData on the J773g holds them. 0xa4 is the
+    // state the firmware powers the GPU up to; with 0 there (the state while off) the GPU stays
+    // unpowered, and the J713 and the J773g took an SError on every 27.2 power-up.
+    power_policy: &[(0x9c, 1), (0xa0, 1), (0xa4, 1), (0xa8, 1)],
 };
 
 /// The 26B123 idle power-off delay in ms (region C 0x9c0; 25G83 keeps 40 at 0x9bc). The
@@ -883,6 +892,9 @@ pub(crate) fn encode_for(
     let runs = layout.power_performance;
     let p = &mut objects[id::POWER_PERFORMANCE];
     put64(p, remap(runs, 0x3b50, 8)?, input.va[id::TEMPERATURE])?;
+    for &(at, value) in layout.power_policy {
+        put32(p, at, value)?;
+    }
     for (at, value) in [
         (4, 200000),
         (8, 200000),
