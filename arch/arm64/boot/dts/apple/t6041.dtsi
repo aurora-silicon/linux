@@ -374,7 +374,7 @@
 		#mbox-cells = <0>;
 	};
 
-	/* ADT aop-spmi0 (J575c), at the T6040's address and IRQ */
+	/* ADT aop-spmi0 (J575c, J616c), at the T6040's address and IRQ */
 	aop_spmi0: spmi@510914000 {
 		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
 		reg = <0x5 0x10914000 0x0 0x100>;
