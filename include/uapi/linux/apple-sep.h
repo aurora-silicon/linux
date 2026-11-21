@@ -285,6 +285,21 @@ struct sep_bio_rearm {
  * it, the count restarts with the bag after a reboot, and a PIN retry limit
  * built on it is not root-proof.
  *
+ * With SEP_KEY_FEATURE_USER_POLICIES (it comes with SEP_KEY_FEATURE_PASSWORD),
+ * SEP_KEY_CREATE_USER also takes macOS's other key policies under the bag:
+ * SEP_KEY_CREATE_BIOMETRY_CURRENT_SET or _ANY alone (Touch ID only, no
+ * password route: SIGN_PASSWORD and UNSEAL_PASSWORD refuse the key with
+ * EINVAL), and one of them with SEP_KEY_CREATE_DEVICE_PASSCODE |
+ * SEP_KEY_CREATE_AND (.biometry* | .and | .devicePasscode): every use needs
+ * a Touch ID match and the bag's password in the same credential context.
+ * The enclave enforces the conjunction from the key's list. Such a key is
+ * used only through SEP_KEY_SIGN_PASSWORD / SEP_KEY_UNSEAL_PASSWORD, which
+ * then also wait for a Touch ID match; the enclave checks the password into
+ * the matched context before the one operation (ENOKEY when it refuses the
+ * password; EACCES still means the finger did not match). SEP_KEY_SIGN and SEP_KEY_UNSEAL refuse it with EINVAL before
+ * asking for a touch. SEP_KEY_CREATE_DEVICE_PASSCODE alone and the OR form
+ * stay reserved (EOPNOTSUPP); any other combination is EINVAL.
+ *
  * Keep a second key (a backup) wherever a biometric key is trusted, as with
  * hardware security keys: no key can be exported or recovered.
  *
@@ -309,13 +324,15 @@ struct sep_bio_rearm {
 #define SEP_KEY_FEATURE_SEAL   0x2
 #define SEP_KEY_FEATURE_PASSWORD 0x4
 #define SEP_KEY_FEATURE_PERSISTENT_ATTEMPTS 0x8
+#define SEP_KEY_FEATURE_USER_POLICIES 0x10
 #define SEP_KEY_PASSWORD_MAX 256
 #define SEP_KEY_SECRET_MAX 64
 #define SEP_KEY_SEALED_MAX 256
 #define SEP_KEY_CREATE_BIOMETRY_CURRENT_SET 0x1
 #define SEP_KEY_CREATE_BIOMETRY_ANY         0x2
 #define SEP_KEY_CREATE_USER_PRESENCE        0x4  /* CREATE_USER only; CREATE: EOPNOTSUPP */
-#define SEP_KEY_CREATE_DEVICE_PASSCODE      0x8  /* reserved: EOPNOTSUPP */
+#define SEP_KEY_CREATE_DEVICE_PASSCODE      0x8  /* CREATE_USER: only with _AND; else EOPNOTSUPP */
+#define SEP_KEY_CREATE_AND                  0x10 /* CREATE_USER: BIOMETRY_* | DEVICE_PASSCODE | AND */
 #define SEP_KEY_HANDLE_MAX 2048
 #define SEP_KEY_PUB_LEN    65  /* uncompressed point, 04 || X || Y */
 #define SEP_KEY_DIGEST_LEN 32
@@ -427,6 +444,13 @@ struct sep_key_unseal_password {
  * 11 (research): make such a key under that uid's unlocked bag and return its
  * record in 'handle'. 12: sign that record with a password credential from
  * the bag; the password is the NUL-padded 'digest'.
+ * 13-15: the three-arm check of an AND key (SEP_KEY_CREATE_AND; its handle
+ * in 'handle'). 13 (finger): one Touch ID match, no password, then sign.
+ * 14 (no finger): only the bag's password credential (the NUL-padded
+ * 'digest', wiped on return) then sign a fixed digest; 'result2' = the
+ * password's verify status. 15 (no finger): neither credential. Each must
+ * be refused by the enclave ('result' < 0); SEP_KEY_SIGN_PASSWORD with a
+ * touch is the arm that signs.
  * 20 one touch: sign, then sign again in the same open context ('result2').
  * 21 one touch: sign, then unseal a secret sealed to the key in the same
  * context ('result2' 0 when it came back unchanged). 22 (no finger): unseal
