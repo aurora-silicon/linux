@@ -285,7 +285,7 @@ impl job::Backend for Backend {
         if let Some(result) = packet.early_result() {
             return result.map(|()| packet.completion.scheduler_fence());
         }
-        let mut deferred = match DeferredBatch::publication() {
+        let mut deferred = match self.publication_batch() {
             Ok(batch) => batch,
             Err(error) => {
                 self.release_backlog(&packet);

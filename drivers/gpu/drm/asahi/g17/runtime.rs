@@ -757,6 +757,10 @@ pub(super) struct Backend {
     /// Render pairs this owner may hold, fixed at creation with its scheduler's
     /// credits and its render pool's sizing.
     pairs: u8,
+    /// The publication batch of this owner's last publication, finished and kept for the
+    /// next one ([`Backend::publication_batch`]).
+    #[pin]
+    spare_batch: kernel::sync::Mutex<Option<DeferredBatch>>,
 }
 
 impl Backend {
@@ -901,11 +905,23 @@ impl Backend {
                     admission,
                     direct_slot: core::sync::atomic::AtomicU32::new(0),
                     pairs: super::pairs::per_owner(),
+                    spare_batch <- kernel::new_mutex!(None, "g17::Backend::spare_batch"),
                 }),
                 GFP_KERNEL,
             )?,
             slot,
         ))
+    }
+
+    /// A publication batch: the one the last publication left, else a new one.
+    pub(super) fn publication_batch(&self) -> Result<PublicationBatch<'_>> {
+        // Take the spare first: a new batch is allocated without the lock held.
+        let spare = self.spare_batch.lock().take();
+        let batch = match spare {
+            Some(batch) => batch,
+            None => DeferredBatch::publication()?,
+        };
+        Ok(PublicationBatch { batch, spare: &self.spare_batch })
     }
 
     /// The shared aperture has exactly one builder. Other queues sleep without
@@ -1398,6 +1414,26 @@ impl DeferredBatch {
         batch.render = KVVec::with_capacity(crate::hw::t8140::queues::RENDER_SLOTS, GFP_KERNEL)?;
         Ok(batch)
     }
+    /// No room at all: allocates nothing.
+    fn empty() -> Self {
+        Self {
+            has_source_completions: false,
+            values: KVVec::new(),
+            bindings: KVVec::new(),
+            vacated: KVVec::new(),
+            render: KVVec::new(),
+            tvb: KVVec::new(),
+        }
+    }
+    /// Holds nothing: finished, or never used.
+    fn is_idle(&self) -> bool {
+        !self.has_source_completions
+            && self.values.is_empty()
+            && self.bindings.is_empty()
+            && self.vacated.is_empty()
+            && self.render.is_empty()
+            && self.tvb.is_empty()
+    }
     fn with_capacity(capacity: usize, detached: usize) -> Result<Self> {
         let render_slots = if detached != 0 {
             crate::hw::t8140::queues::RENDER_SLOTS
@@ -1526,6 +1562,36 @@ impl DeferredBatch {
         }
         for release in self.tvb.drain_all() {
             drop(release);
+        }
+    }
+}
+
+/// A [`DeferredBatch::publication`] lent by a [`Backend`]: an idle batch goes back to it when
+/// the publication ends, so a steady stream of publications allocates none.
+pub(super) struct PublicationBatch<'a> {
+    batch: DeferredBatch,
+    spare: &'a kernel::sync::Mutex<Option<DeferredBatch>>,
+}
+impl core::ops::Deref for PublicationBatch<'_> {
+    type Target = DeferredBatch;
+    fn deref(&self) -> &DeferredBatch {
+        &self.batch
+    }
+}
+impl core::ops::DerefMut for PublicationBatch<'_> {
+    fn deref_mut(&mut self) -> &mut DeferredBatch {
+        &mut self.batch
+    }
+}
+impl Drop for PublicationBatch<'_> {
+    fn drop(&mut self) {
+        // A batch still holding work drops it here, as an unlent batch would.
+        let batch = core::mem::replace(&mut self.batch, DeferredBatch::empty());
+        if batch.is_idle() {
+            let mut spare = self.spare.lock();
+            if spare.is_none() {
+                *spare = Some(batch);
+            }
         }
     }
 }
@@ -2299,7 +2365,7 @@ impl Backend {
             packet.set_early_result(Err(ECANCELED));
             return true;
         }
-        let mut deferred = match DeferredBatch::publication() {
+        let mut deferred = match self.publication_batch() {
             Ok(deferred) => deferred,
             Err(error) => {
                 if packet.completion.status().get() != 0 {
@@ -2966,6 +3032,28 @@ mod shared_capacity_tests {
         assert_eq!(leases.len(), crate::mmu::MAX_EXECUTION_CONTEXTS as usize);
         // Every accepted logical render owner now has its physical pair; no
         // published identity was cancelled or retyped to achieve the fit.
+    }
+
+    #[test]
+    fn a_publication_batch_comes_back_only_when_idle() {
+        let spare = KBox::pin_init(kernel::new_mutex!(None::<DeferredBatch>), GFP_KERNEL).unwrap();
+        let lend = |batch| PublicationBatch { batch, spare: &spare };
+        let first = DeferredBatch::publication().unwrap();
+        let kept = first.values.as_ptr();
+        drop(lend(first));
+        let second = spare.lock().take().unwrap();
+        assert_eq!(second.values.as_ptr(), kept);
+        // Holding work: dropped with it, not kept.
+        let mut busy = lend(second);
+        busy.has_source_completions = true;
+        drop(busy);
+        assert!(spare.lock().is_none());
+        // Two lent at once: the first one back stays.
+        let (a, b) = (DeferredBatch::publication().unwrap(), DeferredBatch::publication().unwrap());
+        let kept = a.values.as_ptr();
+        drop(lend(a));
+        drop(lend(b));
+        assert_eq!(spare.lock().as_ref().unwrap().values.as_ptr(), kept);
     }
 
     #[test]
