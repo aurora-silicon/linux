@@ -104,6 +104,12 @@ struct ane_fw_backend {
 	bool pmu_base_set;
 	/* The engine's own ANE_SYS reference (b->power) is held. */
 	bool power_ref;
+	/*
+	 * In a runtime PM callback of b->power: genpd has ANE_SYS on (resume)
+	 * or turns it off after the callback (suspend), so the power steps
+	 * take and drop no reference of their own.
+	 */
+	bool in_rpm;
 	struct list_head mappings;
 	/* Serialize stage changes, command publication and retained lifetimes. */
 	struct mutex lock;
@@ -198,6 +204,12 @@ static struct kexec_blocker ane_fw_kexec = {
 	.reason = "ANE firmware retains private DMA mappings until hardware reset",
 };
 
+/* Engines that park have their power held by runtime PM between requests. */
+static bool ane_fw_rpm(const struct ane_fw_backend *b)
+{
+	return b->soc->macos_sleep;
+}
+
 static int ane_fw_quarantine(struct ane_fw_backend *b, int error)
 {
 	unsigned int i;
@@ -205,6 +217,11 @@ static int ane_fw_quarantine(struct ane_fw_backend *b, int error)
 	b->stage = ANE_STAGE_QUARANTINED;
 	dev_err(&b->pdev->dev, "ANE quarantined (%d); mappings and power retained, reboot required\n",
 		error);
+	/* Runtime PM held a powered engine between requests: pin it on. */
+	if (ane_fw_rpm(b) && b->powered && !b->power_ref) {
+		pm_runtime_get_noresume(&b->pdev->dev);
+		b->power_ref = true;
+	}
 	/* The engine and DARTs are only readable once powered. */
 	if (!b->powered)
 		return error;
@@ -557,7 +574,7 @@ static int ane_fw_ps_off(struct ane_fw_backend *b, u32 offset)
 		if (!ane_poll32(b, reg, ANE_FW_PS_OFF_MASK, 0, 1, 1000))
 			return 0;
 	}
-	if (!apple_sleep_request_deep_once())
+	if (b->in_rpm || !apple_sleep_request_deep_once())
 		return ret;
 	dev_warn(&b->pdev->dev, "H17 ANE: power word %#x still stuck, taking the deep path\n", offset);
 	return 0;
@@ -583,7 +600,7 @@ static int ane_fw_power_down_staged(struct ane_fw_backend *b)
 	if (ret)
 		return ret;
 	/* No engine or DART access from here until ANE_SYS is back on. */
-	b->powered = false;
+	WRITE_ONCE(b->powered, false);
 	b->power_ref = false;
 	pm_runtime_put_sync(b->power);
 	/*
@@ -624,16 +641,19 @@ static int ane_fw_power_down(struct ane_fw_backend *b)
 	if (ret)
 		return ret;
 	/* No engine or DART access from here until ANE_SYS is back on. */
-	b->powered = false;
-	b->power_ref = false;
+	WRITE_ONCE(b->powered, false);
 	/*
 	 * Our reference was the last one on ANE_SYS: genpd turns it off once the
 	 * ANE DARTs are idle, or at the latest in the noirq phase of the system
 	 * suspend. ane_fw_genpd_event() records that, and the resume reports a
-	 * domain that stayed on.
+	 * domain that stayed on. Between requests runtime PM holds the engine
+	 * instead, and its runtime suspend lets the domain go.
 	 */
-	pm_runtime_put_sync(b->power);
-	dev_info(&b->pdev->dev, "H17 ANE: powered down for system sleep\n");
+	if (b->power_ref) {
+		b->power_ref = false;
+		pm_runtime_put_sync_suspend(b->power);
+	}
+	dev_info(&b->pdev->dev, "H17 ANE: powered down\n");
 	return 0;
 }
 
@@ -1015,30 +1035,189 @@ static int ane_fw_cold_cycle_down(struct ane_fw_backend *b)
 	return ane_fw_power_down(b);
 }
 
-/* A request for a parked engine: boot it from the preload, as after a sleep. */
-static int ane_fw_session_wake(void *ctx)
+/*
+ * The parked engine's autosuspend delay: a request that finds it parked waits
+ * for a cold boot from the preload and the replay of its programs, ~18 ms on
+ * a J700 (~10 ms for the boot alone on H16). Two seconds keep that under 1% of
+ * a pause longer than the delay, and keep the engine from cycling its power
+ * faster than every two seconds. power/autosuspend_delay_ms changes it; a
+ * negative value keeps the engine up until the next system sleep.
+ */
+#define ANE_FW_AUTOSUSPEND_MS 2000
+
+/*
+ * After a bring-up or a boot for a request: hand the engine's ANE_SYS
+ * reference to runtime PM, which parks the engine once it has been idle for
+ * its autosuspend delay. A quarantined engine keeps its reference.
+ */
+static void ane_fw_rpm_idle(struct ane_fw_backend *b)
 {
-	struct ane_fw_backend *b = ctx;
+	lockdep_assert_held(&b->lock);
+	if (!ane_fw_rpm(b) || !b->power_ref || b->stage != ANE_STAGE_PROGRAM ||
+	    b->session.quarantined)
+		return;
+	b->power_ref = false;
+	pm_runtime_mark_last_busy(&b->pdev->dev);
+	pm_runtime_put_autosuspend(&b->pdev->dev);
+}
+
+/*
+ * Boot a parked engine from the preload, as after a sleep. ANE_SYS is on:
+ * runtime PM resumed the device, which holds the domain, so the power steps
+ * take no reference of their own.
+ */
+static void ane_fw_unpark(struct ane_fw_backend *b)
+{
 	int ret;
 
-	if (READ_ONCE(b->stage) == ANE_STAGE_PROBED)
-		return READ_ONCE(b->in_sleep) ? -EAGAIN : ane_fw_first_bringup(b);
-	guard(mutex)(&b->lock);
-	if (!b->parked)
-		return 0;
-	/* The system is going to sleep or coming back: PM_POST_SUSPEND wakes waiters. */
-	if (b->in_sleep)
-		return -EAGAIN;
+	lockdep_assert_held(&b->lock);
+	if (!b->parked || READ_ONCE(b->in_sleep))
+		return;
+	b->in_rpm = true;
 	ret = ane_fw_cold_cycle_boot(b);
+	b->in_rpm = false;
 	WRITE_ONCE(b->parked, false);
 	WRITE_ONCE(b->session.parked, false);
 	if (ret) {
+		/* Power and mappings stay for diagnosis: the quarantine pins the device. */
 		ane_fw_quarantine(b, ret);
 		b->session.quarantined = true;
 	}
 	ane_h16_session_sleep(&b->session, false);
 	dev_info(&b->pdev->dev, "H17 ANE: up for a request%s\n", ret ? " FAILED" : "");
-	return ret;
+}
+
+/*
+ * A request for a parked engine: runtime PM resumes the device, and its
+ * resume callback boots the engine. Called without b->lock, which the
+ * callback takes.
+ */
+static int ane_fw_session_wake(void *ctx)
+{
+	struct ane_fw_backend *b = ctx;
+	int ret;
+
+	if (READ_ONCE(b->stage) == ANE_STAGE_PROBED) {
+		if (READ_ONCE(b->in_sleep))
+			return -EAGAIN;
+		ret = ane_fw_first_bringup(b);
+		if (!ret) {
+			guard(mutex)(&b->lock);
+			ane_fw_rpm_idle(b);
+		}
+		return ret;
+	}
+	if (!READ_ONCE(b->parked))
+		return 0;
+	/* The system is going to sleep or coming back: PM_POST_SUSPEND wakes waiters. */
+	if (READ_ONCE(b->in_sleep))
+		return -EAGAIN;
+	ret = pm_runtime_resume_and_get(&b->pdev->dev);
+	if (ret < 0)
+		return ret;
+	/*
+	 * Still parked: either the device never suspended (runtime PM forbidden,
+	 * or a negative autosuspend delay) and a system sleep parked the engine,
+	 * or a system sleep began and prevented the resume callback from booting
+	 * it.
+	 */
+	if (READ_ONCE(b->parked)) {
+		guard(mutex)(&b->lock);
+		ane_fw_unpark(b);
+	}
+	if (READ_ONCE(b->parked)) {
+		pm_runtime_put_sync_suspend(&b->pdev->dev);
+		return -EAGAIN;
+	}
+	pm_runtime_mark_last_busy(&b->pdev->dev);
+	pm_runtime_put_autosuspend(&b->pdev->dev);
+	return READ_ONCE(b->session.quarantined) ? -EIO : 0;
+}
+
+/*
+ * Runtime suspend after the autosuspend delay: the way down a system sleep
+ * takes, then parked as after a wake, with the session left closed. There
+ * is no firmware to send anything to: a close is deferred and a request
+ * waits in ane_h16_session_enter(), which wakes the engine; the wake reopens
+ * the session, and a program closed meanwhile is lost to the new firmware
+ * and only released. Outside a system sleep there is no deep path to fall
+ * back on, so a firmware stop that fails quarantines the engine, which keeps
+ * its power, as a failed sleep does.
+ */
+int ane_fw_staged_runtime_suspend(struct device *dev)
+{
+	struct ane_fw_backend *b = ane_backend;
+	int ret;
+
+	/* Powered off by a power-down that held the reference: nothing to stop. */
+	if (!b || &b->pdev->dev != dev || !ane_fw_rpm(b) || !READ_ONCE(b->powered))
+		return 0;
+	guard(mutex)(&b->lock);
+	if (!b->powered)
+		return 0;
+	/* Bringing up, quarantined, or in a system sleep, which parks it itself. */
+	if (b->stage != ANE_STAGE_PROGRAM || READ_ONCE(b->in_sleep))
+		return -EBUSY;
+	if (READ_ONCE(b->session.quarantined)) {
+		ane_fw_quarantine(b, b->session.error ?: -EIO);
+		return -EBUSY;
+	}
+	/* Closes admission and waits for every request in flight. */
+	ane_h16_session_sleep(&b->session, true);
+	if (READ_ONCE(b->session.quarantined)) {
+		ane_fw_quarantine(b, b->session.error ?: -EIO);
+		ane_h16_session_sleep(&b->session, false);
+		return -EBUSY;
+	}
+	/*
+	 * An execute that raced the autosuspend boundary may have finished while
+	 * draining and refreshed last_busy: wait out the new delay instead of
+	 * parking right after it.
+	 */
+	if (pm_runtime_autosuspend_expiration(dev)) {
+		ane_h16_session_sleep(&b->session, false);
+		return -EBUSY;
+	}
+	for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++) {
+		if (b->transport.pending[ch].active) {
+			/* Something is still pending on a ring: autosuspend tries later. */
+			ane_h16_session_sleep(&b->session, false);
+			pm_runtime_mark_last_busy(dev);
+			return -EBUSY;
+		}
+	}
+	b->in_rpm = true;
+	ret = ane_fw_clean_stop(b) ? ane_fw_firmware_stop(b) : 0;
+	if (!ret)
+		ret = ane_fw_power_down(b);
+	b->in_rpm = false;
+	if (ret) {
+		ane_fw_quarantine(b, ret);
+		b->session.quarantined = true;
+		ane_h16_session_sleep(&b->session, false);
+		dev_err(dev, "H17 ANE: idle park failed (%d): quarantined\n", ret);
+		return -EBUSY;
+	}
+	WRITE_ONCE(b->parked, true);
+	WRITE_ONCE(b->session.parked, true);
+	wake_up_all(&b->session.wake);
+	dev_info(dev, "H17 ANE: idle: parked until the next request\n");
+	return 0;
+}
+
+/* Runtime resume for a request (ane_fw_session_wake()): boot the parked engine. */
+int ane_fw_staged_runtime_resume(struct device *dev)
+{
+	struct ane_fw_backend *b = ane_backend;
+
+	/* Only a parked engine that serves programs is booted here. */
+	if (!b || &b->pdev->dev != dev || !ane_fw_rpm(b) ||
+	    READ_ONCE(b->stage) != ANE_STAGE_PROGRAM || !READ_ONCE(b->parked))
+		return 0;
+	guard(mutex)(&b->lock);
+	ane_fw_unpark(b);
+	/* A failed boot is the quarantine's to report: the device itself is up. */
+	return 0;
 }
 
 static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
@@ -1243,7 +1422,27 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 		WRITE_ONCE(b->session.wake_blocked, true);
 	}
 	if (event == PM_SUSPEND_PREPARE && retained) {
-		if (!ane_fw_sleep_prepare(b))
+		struct device *dev = &b->pdev->dev;
+		int ret;
+
+		/*
+		 * No idle park from here on: the sleep takes the engine down
+		 * itself. A park that already began finishes first (the sleep
+		 * waits for b->lock and finds the engine parked).
+		 */
+		if (ane_fw_rpm(b))
+			pm_runtime_get_noresume(dev);
+		ret = ane_fw_sleep_prepare(b);
+		if (ane_fw_rpm(b)) {
+			if (!ret && !READ_ONCE(b->powered)) {
+				/* Off now, as before: genpd may turn ANE_SYS off. */
+				pm_runtime_put_sync_suspend(dev);
+			} else {
+				pm_runtime_mark_last_busy(dev);
+				pm_runtime_put_autosuspend(dev);
+			}
+		}
+		if (!ret)
 			return NOTIFY_DONE;
 		ane_fw_sleep_unblock(b);
 		dev_warn_once(&b->pdev->dev, ANE_FW_SLEEP_REFUSED);
@@ -1505,7 +1704,7 @@ static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_en
 	int ret;
 
 	/* Taken once; a failed attempt keeps it for the retry or the quarantine. */
-	if (!b->power_ref) {
+	if (!b->power_ref && !b->in_rpm) {
 		ret = pm_runtime_resume_and_get(b->power);
 		if (ret < 0)
 			return ret;
@@ -1535,7 +1734,7 @@ static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_en
 	ret = ane_poll32(b, b->gate + 0x30, U32_MAX, 0, 1, 100000);
 	if (ret)
 		return ret;
-	b->powered = true;
+	WRITE_ONCE(b->powered, true);
 	ane_fw_snapshot_engine(b);
 	/* A warm resume finds a suspended firmware's state, not reset values. */
 	if (cold_engine && !ane_fw_cold_engine_valid(&b->cold, b->soc)) {
@@ -2020,6 +2219,15 @@ static void ane_fw_program_busy(void *ctx, bool busy)
 	struct ane_fw_backend *b = ctx;
 
 	apple_clpc_ane_set_active(b->clpc, busy);
+	/* Under the session lock: no callback runs here, the park drains first. */
+	if (!ane_fw_rpm(b))
+		return;
+	if (busy) {
+		pm_runtime_get_noresume(&b->pdev->dev);
+	} else {
+		pm_runtime_mark_last_busy(&b->pdev->dev);
+		pm_runtime_put_autosuspend(&b->pdev->dev);
+	}
 }
 
 static const struct ane_h16_session_ops ane_fw_session_ops = {
@@ -2582,10 +2790,17 @@ int ane_fw_staged_bind(struct platform_device *pdev)
 			return ret;
 		pm_runtime_get_noresume(dev);
 		b->bind_held = true;
+		/* Idle, runtime PM parks the engine (ane_fw_staged_runtime_suspend()). */
+		if (ane_fw_rpm(b)) {
+			pm_runtime_set_autosuspend_delay(dev, ANE_FW_AUTOSUSPEND_MS);
+			pm_runtime_use_autosuspend(dev);
+		}
 	}
 	ret = devm_pm_runtime_enable(dev);
 	if (ret) {
 		if (handoff) {
+			if (ane_fw_rpm(b))
+				pm_runtime_dont_use_autosuspend(dev);
 			b->bind_held = false;
 			pm_runtime_put_noidle(dev);
 			pm_runtime_set_suspended(dev);
@@ -2615,6 +2830,8 @@ void ane_fw_staged_unbind(struct platform_device *pdev)
 
 	if (b && b->pdev == pdev) {
 		ane_fw_bind_release(b);
+		if (ane_fw_rpm(b))
+			pm_runtime_dont_use_autosuspend(&pdev->dev);
 		if (b->genpd_nb_added)
 			dev_pm_genpd_remove_notifier(&pdev->dev);
 		b->genpd_nb_added = false;

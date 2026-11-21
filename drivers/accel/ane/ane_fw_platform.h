@@ -180,6 +180,8 @@ int ane_fw_platform_probe(struct platform_device *pdev,
 void ane_fw_platform_remove(struct platform_device *pdev);
 int ane_fw_platform_suspend(struct device *dev);
 int ane_fw_platform_resume(struct device *dev);
+int ane_fw_platform_runtime_suspend(struct device *dev);
+int ane_fw_platform_runtime_resume(struct device *dev);
 int ane_fw_preload_range(struct device_node *np, unsigned int index, u64 *phys, u64 *size);
 const struct ane_fw_platform *ane_fw_platform_build(struct device_node *np,
 						    const struct ane_fw_platform *soc);
