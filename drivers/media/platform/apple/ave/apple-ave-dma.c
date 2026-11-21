@@ -41,6 +41,11 @@ static irqreturn_t apple_ave_dma_irq(int irq, void *data)
 			    readl(dma->base + AVE_DMA_ERROR_INFO4),
 			    readl(dma->base + AVE_DMA_ERROR_INFO5));
 
+	/*
+	 * Nothing here tells the encoder: a session whose DMA faulted can
+	 * complete its frame as if it were good. Tracked in
+	 * https://github.com/aurora-silicon/linux/issues/2471.
+	 */
 	/* The implemented error bits are write-one-to-clear. */
 	writel(status & AVE_DMA_ERROR_ACK_MASK,
 	       dma->base + AVE_DMA_ERROR_STATUS);
