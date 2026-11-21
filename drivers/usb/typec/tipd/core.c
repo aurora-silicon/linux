@@ -13,6 +13,7 @@
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of.h>
+#include <linux/soc/apple/j613-display.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
 #include <linux/unaligned.h>
@@ -353,12 +354,16 @@ static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
 /*
  * The sleep's rules for the port controllers' system power state command (the controller is
  * woken first, the command's end is read at intervals, a failed S3 refuses the sleep, the
- * command's limit and its lines) are in force on the board they have run on, the J714s.
- * Elsewhere, other boards with the same SoC included, the command is as it was.
+ * command's limit and its lines) apply on the J714s, J716c, J813 and J815.
+ * These boards send the command (apple,sleep-ssps) during firmware-driven
+ * sleep. Other boards retain the original command behavior.
  */
 static bool tipd_sleep_ssps_rules(void)
 {
-	return of_machine_is_compatible("apple,j714s");
+	return of_machine_is_compatible("apple,j714s") ||
+	       of_machine_is_compatible("apple,j716c") ||
+	       of_machine_is_compatible("apple,j813") ||
+	       of_machine_is_compatible("apple,j815");
 }
 
 /*
@@ -2759,6 +2764,12 @@ VISIBLE_IF_KUNIT int cd321x_init_mux(struct cd321x *cd321x)
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_init_mux);
 
+/* The J613 profile enables its disabled DCP routes during DRM coldplug. */
+static bool cd321x_display_gate_pending(struct tps6598x *tps)
+{
+	return apple_j613_display_pending(tps->dev);
+}
+
 static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
@@ -3464,6 +3475,143 @@ static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 	return 0;
 }
 
+/* The ports tipd_port_replug() looks up by the USB role switch their data role drives. */
+static LIST_HEAD(tipd_ports);
+static DEFINE_MUTEX(tipd_ports_lock);
+
+static void tipd_replug_work(struct work_struct *work);
+
+static void tipd_port_list_add(struct tps6598x *tps)
+{
+	INIT_LIST_HEAD(&tps->port_node);
+	INIT_WORK(&tps->replug_work, tipd_replug_work);
+	if (!tps->role_sw)
+		return;
+	mutex_lock(&tipd_ports_lock);
+	list_add_tail(&tps->port_node, &tipd_ports);
+	mutex_unlock(&tipd_ports_lock);
+}
+
+static void tipd_port_list_del(struct tps6598x *tps)
+{
+	if (!tps->port_node.next)
+		return;
+	mutex_lock(&tipd_ports_lock);
+	list_del_init(&tps->port_node);
+	mutex_unlock(&tipd_ports_lock);
+	cancel_work_sync(&tps->replug_work);
+}
+
+/* The J714s's port controllers take "DISC" unlocked with this key, the reversed target identifier. */
+static const u8 tipd_replug_key_j714s[4] = { '4', '1', '7', 'J' };
+
+static bool tipd_replug_supported(struct tps6598x *tps)
+{
+	return of_machine_is_compatible("apple,j714s") &&
+	       device_is_compatible(tps->dev, "apple,sn201202x");
+}
+
+/*
+ * As cd321x_reset_inherited_connection() does it: unlocked, "DISC", the app mode back, locked
+ * again. The port lock is held only for the commands: meanwhile the interrupt handler sees the
+ * partner go and come back, and sets the mux, the alternate modes and the data role again.
+ * The commands are read with the gap the sleep's own command is (CD321X_SSPS_READ_GAP_US): read
+ * back to back while the partner attaches again, the relock ended late, or in SPMI parity faults
+ * and -EIO. A relock that fails is tried once more.
+ */
+#define TIPD_REPLUG_RELOCK_TRIES	2
+static void tipd_replug_work(struct work_struct *work)
+{
+	struct tps6598x *tps = container_of(work, struct tps6598x, replug_work);
+	static const u8 locked[4];
+	u8 seconds = tps->replug_seconds, result = 0;
+	unsigned long timeout;
+	int ret, lock_ret, mode = -1;
+	unsigned int tries;
+
+	mutex_lock(&tps->lock);
+	ret = tps6598x_exec_cmd_gap(tps, "LOCK", sizeof(tipd_replug_key_j714s), tipd_replug_key_j714s,
+				    sizeof(result), &result, 1000, 0, CD321X_SSPS_READ_GAP_US);
+	if (!ret && result)
+		ret = -EIO;
+	if (!ret)
+		ret = tps6598x_exec_cmd_gap(tps, "DISC", sizeof(seconds), &seconds, 0, NULL, 5000, 0,
+					    CD321X_SSPS_READ_GAP_US);
+	mutex_unlock(&tps->lock);
+
+	if (!ret) {
+		msleep(seconds * 1000 + 100);
+		timeout = jiffies + msecs_to_jiffies(2000);
+		do {
+			mutex_lock(&tps->lock);
+			mode = tps6598x_check_mode(tps);
+			mutex_unlock(&tps->lock);
+			if (mode == TPS_MODE_APP || mode == TPS_MODE_APP1)
+				break;
+			msleep(20);
+		} while (time_before(jiffies, timeout));
+		if (mode != TPS_MODE_APP && mode != TPS_MODE_APP1)
+			ret = mode < 0 ? mode : -ETIMEDOUT;
+	}
+
+	for (tries = 1; ; tries++) {
+		mutex_lock(&tps->lock);
+		lock_ret = tps6598x_exec_cmd_gap(tps, "LOCK", sizeof(locked), locked, 0, NULL, 5000, 0,
+						 CD321X_SSPS_READ_GAP_US);
+		mutex_unlock(&tps->lock);
+		if (!lock_ret || tries >= TIPD_REPLUG_RELOCK_TRIES)
+			break;
+		msleep(500);
+	}
+
+	if (ret || lock_ret)
+		dev_warn(tps->dev, "port replug for its partner failed: %d (unlock result %u), locked again: %d (try %u)\n",
+			 ret, result, lock_ret, tries);
+	else
+		dev_info(tps->dev, "port replugged for its partner (%u s disconnected), locked again (try %u)\n",
+			 seconds, tries);
+}
+
+/**
+ * tipd_port_replug - disconnect and reattach a port, as a cable pulled and plugged back does
+ * @sw: the USB role switch the port drives
+ * @seconds: how long the port stays disconnected
+ *
+ * The controller's "DISC" command: it detaches the partner for @seconds and attaches it again
+ * on its own, with a new contract, its alternate modes entered and the mux and the data role set
+ * again. For a partner that a system sleep left in a state only a replug ends: on the J714s a
+ * DP alt mode hub whose SuperSpeed side does not come back after some wakes (dwc3-apple). A
+ * display on the port goes dark meanwhile. The replug runs on the port's own work, after this
+ * returns: 0 when it is queued, -EBUSY if one already is, -EOPNOTSUPP on a controller that is
+ * not known to take it (the J714s's SN201202x only), -ENODEV if no port drives @sw.
+ */
+int tipd_port_replug(struct usb_role_switch *sw, u8 seconds)
+{
+	struct tps6598x *tps;
+	int ret = -ENODEV;
+
+	mutex_lock(&tipd_ports_lock);
+	list_for_each_entry(tps, &tipd_ports, port_node) {
+		if (tps->role_sw != sw)
+			continue;
+		ret = -EOPNOTSUPP;
+		if (!tipd_replug_supported(tps))
+			break;
+		ret = -EBUSY;
+		if (work_pending(&tps->replug_work))
+			break;
+		tps->replug_seconds = seconds;
+		ret = queue_work(system_freezable_wq, &tps->replug_work) ? 0 : -EBUSY;
+		dev_info(tps->dev, "port replug for its partner requested (%u s disconnected): %d\n",
+			 seconds, ret);
+		break;
+	}
+	mutex_unlock(&tipd_ports_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(tipd_port_replug);
+
 int tipd_init(struct tps6598x *tps)
 {
 	struct fwnode_handle *fwnode;
@@ -3472,6 +3620,10 @@ int tipd_init(struct tps6598x *tps)
 	u32 vid = 0;
 	int ret, cleanup_ret;
 	bool reset_allowed = true;
+
+	/* Do not retain a PHY-only mux handle before the route changeset runs. */
+	if (cd321x_display_gate_pending(tps))
+		return -EPROBE_DEFER;
 
 	dev_dbg(tps->dev, "Type-C probe start\n");
 	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);
@@ -3625,6 +3777,7 @@ int tipd_init(struct tps6598x *tps)
 	}
 
 	tipd_debugfs_register(tps);
+	tipd_port_list_add(tps);
 	if (tps->data->ready)
 		tps->data->ready(tps);
 
@@ -3658,6 +3811,7 @@ void tipd_remove(struct tps6598x *tps)
 {
 	int ret = 0;
 
+	tipd_port_list_del(tps);
 	tipd_debugfs_unregister(tps);
 
 	if (!tps->irq)

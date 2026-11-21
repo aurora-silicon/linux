@@ -315,6 +315,13 @@ static void apple_gpio_irq_mask(struct irq_data *data)
 	gpiochip_disable_irq(gc, data->hwirq);
 }
 
+static void apple_gpio_irq_mask_ack(struct irq_data *data)
+{
+	/* Resume can leave the pin enabled while the IRQ core still has it masked. */
+	apple_gpio_irq_mask(data);
+	apple_gpio_irq_ack(data);
+}
+
 static void apple_gpio_irq_unmask(struct irq_data *data)
 {
 	struct gpio_chip *gc = irq_data_get_irq_chip_data(data);
@@ -382,6 +389,7 @@ static const struct irq_chip apple_gpio_irqchip = {
 	.name			= "Apple-GPIO",
 	.irq_startup		= apple_gpio_irq_startup,
 	.irq_ack		= apple_gpio_irq_ack,
+	.irq_mask_ack		= apple_gpio_irq_mask_ack,
 	.irq_mask		= apple_gpio_irq_mask,
 	.irq_unmask		= apple_gpio_irq_unmask,
 	.irq_set_type		= apple_gpio_irq_set_type,

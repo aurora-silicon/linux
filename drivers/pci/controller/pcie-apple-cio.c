@@ -200,7 +200,8 @@ static void apple_pcie_cio_t6050_reset(struct apple_pcie *pcie, struct apple_pci
  */
 static u32 apple_pcie_cio_t6050_pme_reg(void)
 {
-	return of_machine_is_compatible("apple,j714s") ? PORT_T6050_PCIEC_PME_TURN_OFF :
+	return (of_machine_is_compatible("apple,j714s") ||
+		of_machine_is_compatible("apple,j716c")) ? PORT_T6050_PCIEC_PME_TURN_OFF :
 							 PORT_PME_TURN_OFF;
 }
 
@@ -387,7 +388,8 @@ static int apple_pcie_cio_suspend(struct apple_pcie *pcie)
 	u32 stat;
 	int i, ret, recover;
 
-	if (pcie->hw == &t6050_pciec_hw && of_machine_is_compatible("apple,j714s"))
+	if (pcie->hw == &t6050_pciec_hw && (of_machine_is_compatible("apple,j714s") ||
+					    of_machine_is_compatible("apple,j716c")))
 		return apple_pcie_cio_suspend_t6050(pcie);
 	port = list_first_entry(&pcie->ports, struct apple_pcie_port, entry);
 	dev_info(pcie->dev, "CIO PCIe-C drain and reset\n");

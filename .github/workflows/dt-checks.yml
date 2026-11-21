@@ -50,7 +50,13 @@ jobs:
 
       - name: Install the tools
         run: |
-          sudo apt-get update -q
+          # Avoid the hosted runner's Azure mirror after repeated DNS failures.
+          # Keep signed Ubuntu archive/security suites and fail on update errors.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
+              sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          sudo apt-get update -q -o APT::Update::Error-Mode=any
           sudo apt-get install -y -q flex bison bc libyaml-dev clang-$CLANG_VERSION lld-$CLANG_VERSION llvm-$CLANG_VERSION swig device-tree-compiler
           echo "/usr/lib/llvm-$CLANG_VERSION/bin" >> "$GITHUB_PATH"
           pip install --quiet dtschema yamllint pylibfdt

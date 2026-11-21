@@ -38,6 +38,8 @@ struct apple_sleep_smc_saved_ops {
 
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
 const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void);
+/* J813 experiment: send the final SMC notice after the peer idle handshakes. */
+bool apple_sleep_smc_defer_notice(void);
 int apple_sleep_smc_register(struct device *dev,
 	int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data);
 int apple_sleep_smc_register_saved(struct device *dev,
@@ -109,6 +111,12 @@ bool apple_sleep_coproc_stopped(struct device *dev);
 bool apple_sleep_commit_stops_coprocs(void);
 
 /*
+ * Untested SoCs: a coprocessor's last stop notes its own step in PMU scratch (kept across a
+ * WD2 reset), next to the sleep driver's step and the coprocessor's slot.
+ */
+void apple_sleep_note_sub(u8 step);
+
+/*
  * The USB host sleeps in place for this sleep, as macOS's does: its always-on domain stays
  * up through the commit. Its PHY sets it once the controller is in its hibernation state,
  * and clears it at the wake.
@@ -169,6 +177,7 @@ bool apple_sleep_debug_link_up(void);
  * device has resumed, as macOS does from a dark wake.
  */
 void apple_sleep_lid_closed_wake(void);
+void apple_sleep_port_wake(bool lid_closed);
 
 /*
  * From the SMC's driver, in its noirq resume: the lid as it reads now, after every
@@ -235,6 +244,7 @@ void apple_sleep_restore_pins(void);
 int apple_sleep_engine_reset(struct device *dev);
 #else
 static inline const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void) { return NULL; }
+static inline bool apple_sleep_smc_defer_notice(void) { return false; }
 static inline int apple_sleep_smc_register(struct device *dev,
 	int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data) { return -EOPNOTSUPP; }
 static inline int apple_sleep_smc_register_saved(struct device *dev,
@@ -300,6 +310,8 @@ static inline bool apple_sleep_coproc_stopped(struct device *dev)
 	return false;
 }
 
+static inline void apple_sleep_note_sub(u8 step) {}
+
 static inline bool apple_sleep_commit_stops_coprocs(void)
 {
 	return false;
@@ -363,6 +375,10 @@ static inline bool apple_sleep_debug_link_up(void)
 }
 
 static inline void apple_sleep_lid_closed_wake(void)
+{
+}
+
+static inline void apple_sleep_port_wake(bool lid_closed)
 {
 }
 

@@ -286,8 +286,8 @@ struct aic_info {
 	bool siq_cfg_routing;
 	/* A firmware-driven suspend powers the controller down: aic_syscore_ops keep it. */
 	bool fw_suspend;
-	/* If set, fw_suspend holds on this board only */
-	const char *fw_suspend_board;
+	/* If set, fw_suspend holds on these boards only */
+	const char *const *fw_suspend_boards;
 };
 
 static const struct aic_info aic1_info __initconst = {
@@ -336,16 +336,20 @@ static const struct aic_info aic3_info __initconst = {
 
 /*
  * The M5 Pro's sleep: the last steps mask every interrupt and acknowledge events by hand. The
- * save and restore are set up on the board the sleep has run on; another T6050 board is as
- * one without them.
+ * save and restore are set up on the boards with a T6050 sleep, the J714s and the J716c;
+ * another T6050 board is as one without them.
  */
+static const char *const aic3_t6050_sleep_boards[] __initconst = {
+	"apple,j714s", "apple,j716c", NULL
+};
+
 static const struct aic_info aic3_t6050_info __initconst = {
 	.version = 3,
 	.irq_cfg = AIC3_IRQ_CFG,
 	.fast_ipi = true,
 	.local_fast_ipi = true,
 	.fw_suspend = true,
-	.fw_suspend_board = "apple,j714s",
+	.fw_suspend_boards = aic3_t6050_sleep_boards,
 };
 
 static const struct aic_info aic3_t8140_info __initconst = {
@@ -371,6 +375,8 @@ static const struct aic_info aic3_t8142_info __initconst = {
 	.fast_ipi = true,
 	.local_fast_ipi = true,
 	.vm_timer_fiq_readonly = true,
+	/* AIC3 as on T8132: its configuration is lost with the SoC's power in a deep sleep. */
+	.fw_suspend = true,
 };
 
 static const struct of_device_id aic_info_match[] = {
@@ -1274,8 +1280,8 @@ static struct syscore aic_syscore = {
 static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 {
 	if (!irqc->info.fw_suspend ||
-	    (irqc->info.fw_suspend_board &&
-	     !of_machine_is_compatible(irqc->info.fw_suspend_board)))
+	    (irqc->info.fw_suspend_boards &&
+	     !of_machine_compatible_match(irqc->info.fw_suspend_boards)))
 		return;
 
 	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);

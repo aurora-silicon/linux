@@ -361,8 +361,17 @@ struct apple_dart {
 
 	void __iomem *regs;
 	void __iomem *gapf;
-	/* The GAPF slice as it read at probe; a deep sleep resets it to 0 */
+	/*
+	 * The GAPF slice as the boot left it, read before the first write (U32_MAX until
+	 * then); a deep sleep resets it to 0. Stays 0 for a shared PS write-disable
+	 * register, of which only gapf_protect is ever written.
+	 */
 	u32 gapf_boot;
+	/*
+	 * The bit that protects the coprocessor's power state: bit 4 of a GAPF slice, or
+	 * this DART's bit in a shared PS write-disable register (T8142)
+	 */
+	u32 gapf_protect;
 	bool sleep_flushed;
 	/* The firmware 27 display sleep owns it: never replay locked trees. */
 	struct device *m5_sleep_owner;
@@ -5537,7 +5546,26 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->gapf = devm_platform_ioremap_resource_byname(pdev, "gapf");
 		if (IS_ERR(dart->gapf))
 			return PTR_ERR(dart->gapf);
-		dart->gapf_boot = readl(dart->gapf);
+		/* Read at its first use, a sleep's: a boot without one never touches it. */
+		dart->gapf_boot = U32_MAX;
+		dart->gapf_protect = APPLE_DART_GAPF_PROTECT;
+	} else if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "ps-wr-dis")) {
+		u32 bit;
+
+		/*
+		 * T8142: the SPTM's dart-ps-wr-dis-entries give each DART a bit in a register
+		 * of a PSWRDIS block instead of a GAPF slice. The register is shared, so
+		 * only this DART's bit is ever changed: nothing of the boot value is put
+		 * back (gapf_boot stays 0).
+		 */
+		ret = of_property_read_u32(dev->of_node, "apple,ps-wr-dis-bit", &bit);
+		if (ret || bit > 31)
+			return dev_err_probe(dev, ret ?: -EINVAL,
+					     "ps-wr-dis needs apple,ps-wr-dis-bit\n");
+		dart->gapf = devm_platform_ioremap_resource_byname(pdev, "ps-wr-dis");
+		if (IS_ERR(dart->gapf))
+			return PTR_ERR(dart->gapf);
+		dart->gapf_protect = BIT(bit);
 	}
 	/* T8132's ISP DART names its DAPF page but has no ranges to restore. */
 	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "dapf") &&
@@ -7483,9 +7511,21 @@ out:
 EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_state);
 #endif
 
+/* The slice as the boot left it is the first value read, before any write. */
+static u32 apple_dart_gapf_read(struct apple_dart *dart)
+{
+	u32 val = readl(dart->gapf);
+
+	if (dart->gapf_boot == U32_MAX)
+		dart->gapf_boot = val;
+
+	return val;
+}
+
 /*
- * Bit 4 of this DART's GAPF slice makes the fabric reject writes to its coprocessor's
- * CPU power state. It's clear from the flush until the streams come back on.
+ * Bit 4 of this DART's GAPF slice (or its PS write-disable bit) makes the fabric reject
+ * writes to its coprocessor's CPU power state. It's clear from the flush until the
+ * streams come back on.
  */
 static int apple_dart_gapf_release(struct apple_dart *dart)
 {
@@ -7494,10 +7534,10 @@ static int apple_dart_gapf_release(struct apple_dart *dart)
 	if (!dart->gapf)
 		return 0;
 
-	val = readl(dart->gapf);
-	writel(val & ~APPLE_DART_GAPF_PROTECT, dart->gapf);
-	if (readl(dart->gapf) & APPLE_DART_GAPF_PROTECT) {
-		dev_err(dart->dev, "GAPF slice stayed protected: %#x\n", val);
+	val = apple_dart_gapf_read(dart);
+	writel(val & ~dart->gapf_protect, dart->gapf);
+	if (readl(dart->gapf) & dart->gapf_protect) {
+		dev_err(dart->dev, "power state write protection stayed set: %#x\n", val);
 		return -EIO;
 	}
 	dev_dbg(dart->dev, "GAPF slice %#x -> %#x\n", val, readl(dart->gapf));
@@ -7510,11 +7550,11 @@ static void apple_dart_gapf_protect(struct apple_dart *dart)
 {
 	u32 val;
 
-	if (!dart->gapf || !dart->sleep_flushed)
+	if (!dart->gapf || !dart->sleep_flushed || dart->gapf_boot == U32_MAX)
 		return;
 
 	val = readl(dart->gapf);
-	writel(val | dart->gapf_boot | APPLE_DART_GAPF_PROTECT, dart->gapf);
+	writel(val | dart->gapf_boot | dart->gapf_protect, dart->gapf);
 	dev_dbg(dart->dev, "GAPF slice %#x -> %#x\n", val, readl(dart->gapf));
 }
 
@@ -7523,7 +7563,7 @@ int apple_dart_gapf_ready(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 
-	if (!dart->gapf || !(readl(dart->gapf) & APPLE_DART_GAPF_PROTECT))
+	if (!dart->gapf || !(apple_dart_gapf_read(dart) & dart->gapf_protect))
 		return 0;
 
 	return apple_dart_gapf_release(dart);

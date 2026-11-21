@@ -221,6 +221,8 @@ struct apple_nvme_hw {
 	bool cold_reset;
 	/* Firmware-driven suspend has been traced on this controller. */
 	bool sleep_traced;
+	/* ... or derived and never run: only with nvme_apple.sleep_untested */
+	bool sleep_untested;
 	/* The last endpoint map reply from that trace */
 	u32 sleep_epmap_last_mask;
 	/* Higher namespaces are the firmware's, and a Flush to one faults the controller. */
@@ -355,6 +357,15 @@ unsigned int flush_interval = 1000;
 module_param(flush_interval, uint, 0644);
 MODULE_PARM_DESC(flush_interval,
 		 "Grace period in msecs between flushes (ignored on post-M4 ANS)");
+
+/*
+ * Stop ANS for a deep sleep on a controller whose sleep path was never run (T8142). Off by
+ * default: the root disk stays up through a sleep the SoC refuses.
+ */
+static bool sleep_untested;
+module_param(sleep_untested, bool, 0444);
+MODULE_PARM_DESC(sleep_untested,
+		 "Stop ANS for a deep sleep where that path is untested (default 0)");
 
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
@@ -2844,7 +2855,9 @@ static int apple_nvme_probe(struct platform_device *pdev)
 
 	INIT_DELAYED_WORK(&anv->flush_dwork, apple_nvme_flush_work);
 
-	if (anv->hw->sleep_traced) {
+	if (anv->hw->sleep_traced && (!anv->hw->sleep_untested || sleep_untested)) {
+		if (anv->hw->sleep_untested)
+			dev_warn(anv->dev, "firmware stop for sleep enabled, untested on this SoC\n");
 		anv->sleep_registered =
 			!apple_sleep_coproc_register(anv->dev, anv->mmio_coproc, true,
 						     apple_nvme_sleep_last_stop, anv);
@@ -3295,6 +3308,12 @@ static const struct apple_nvme_hw apple_nvme_t8142_hw = {
 	.has_separate_nvmmu = true,
 	.needs_ioq_registers = true,
 	.max_queue_depth = 64,
+	/* T8140's values, as T8132 runs them: never run on T8142. */
+	.sleep_traced = true,
+	.sleep_untested = true,
+	.sleep_epmap_last_mask = BIT(0),
+	.sleep_flush_max_nsid = 1,
+	.sleep_shn = NVME_CC_SHN_MASK,
 	.quirks = NVME_QUIRK_BROKEN_FUA,
 };
 

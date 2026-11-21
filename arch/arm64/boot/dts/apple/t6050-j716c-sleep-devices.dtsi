@@ -1,0 +1,158 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The J716c's devices' settings for its deep sleep: what the drivers of the devices that take
+ * part in it need besides the sleep controller (t6050-j716c-sleep-full.dtsi).
+ */
+&nvme {
+	/* The storage controller's restart spacing after a deep sleep */
+	apple,sleep-wake-delay-ms = <70>;
+};
+
+/*
+ * The display coprocessors' firmware 27.0 sleep control arguments. Normal
+ * panel/swap profiles stay as-is.
+ */
+&dcp {
+	apple,sleep-power-args = [01 00 00 01 01 00 00 00];
+	apple,sleep-a500-args = [00 01 00 00 00 00 00 00];
+	apple,sleep-display-power-args = [00 00 00 00 00 00 00 00];
+	apple,sleep-display-stage-args = [00 00 00 00 00 00 00 00 01 00 00 00];
+};
+
+&dcpext0 {
+	apple,sleep-power-args = [01 00 00 01 01 00 00 00];
+	apple,sleep-a500-args = [00 01 00 00 00 00 00 00];
+};
+
+&dcpext1 {
+	apple,sleep-power-args = [01 00 00 01 01 00 00 00];
+	apple,sleep-a500-args = [00 01 00 00 00 00 00 00];
+};
+
+&dcpext2 {
+	apple,sleep-power-args = [01 00 00 01 01 00 00 00];
+	apple,sleep-a500-args = [00 01 00 00 00 00 00 00];
+};
+
+&dcpext3 {
+	apple,sleep-power-args = [01 00 00 01 01 00 00 00];
+	apple,sleep-a500-args = [00 01 00 00 00 00 00 00];
+};
+
+/* The port controllers take system power state S3 for a firmware suspend, then SLEEP. */
+&hpm0 {
+	apple,sleep-ssps;
+};
+
+&hpm1 {
+	apple,sleep-ssps;
+};
+
+&hpm2 {
+	apple,sleep-ssps;
+};
+
+/* MagSafe's controller registers its port and power supply and follows the sleep too. */
+&hpm5 {
+	apple,sleep-ssps;
+	status = "okay";
+};
+
+/*
+ * The right port's USB4 router sleeping in place (drivers/thunderbolt/apple-cio-sleep.c): its
+ * protection syscon, its combo PHY and the clock-protection slices of its NHI and tunnelled
+ * PCIe DARTs. The J716c's dart-acio2 and dart-apciec2 have slice indices 30 and 31, as on
+ * the J714s.
+ */
+&die0 {
+	ps_prot: syscon@2803f0000 {
+		compatible = "apple,t6050-ps-prot", "syscon";
+		reg = <0x2 0x803f0000 0x0 0x4000>;
+	};
+};
+
+&acio2 {
+	apple,cio-phy = <&atc2_phy>;
+};
+
+&acio2_dart {
+	apple,clock-protection = <&ps_prot 30>;
+};
+
+&apciec2_dart {
+	apple,clock-protection = <&ps_prot 31>;
+};
+
+/*
+ * The DARTs' GAPF slices, as on the J714s: the J716c's ADT gives every one of these DARTs the
+ * same clock-protection slice index (offset 0x100 + 0x40 * index). The <live off> values are
+ * the J714s's and are not yet read back on this board.
+ */
+/* Each stopped DART's GAPF slice, and the slice's live and off values */
+&sep_dart {
+	apple,gapf-slice = <0xb00>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&pmp0_dart {
+	apple,gapf-slice = <0x1c0>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&sio_dart {
+	apple,gapf-slice = <0xac0>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&dart_apcie0 {
+	apple,gapf-slice = <0x980>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+/*
+ * GAPF slices of the display coprocessors' DARTs (drivers/iommu/apple-dart-v27-late.inc):
+ * offset in the sleep controller's "gapf" region (0x2803f0000), then <live off> values.
+ * The external display DARTs (dart_dispext0, dispext1..3_dart) have none: they are retained.
+ */
+&dcp_dart {		/* 0x48a340000 -> 0x2803f0a80 */
+	apple,gapf-slice = <0xa80>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&disp0_dart {		/* 0x48a300000 -> 0x2803f0a00 */
+	apple,gapf-slice = <0xa00>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&dart_dcpext0 {		/* 0x2b2340000 -> 0x2803f0500 */
+	apple,gapf-slice = <0x500>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&dcpext1_dart {		/* 0x392340000 -> 0x2803f0840 */
+	apple,gapf-slice = <0x840>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&dcpext2_dart {		/* 0x302340000 -> 0x2803f06c0 */
+	apple,gapf-slice = <0x6c0>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&dcpext3_dart {		/* 0x306340000 -> 0x2803f0780 */
+	apple,gapf-slice = <0x780>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+/*
+ * The internal panel's size, which the driver needs to treat it as a panel (backlight level,
+ * the sleep's relighting): 3456 x 2234 pixels at the J714s's 0.1 mm pitch, 2160 rows below
+ * the camera housing.
+ */
+&dcp {
+	panel {
+		width-mm = <345>;
+		height-mm = <223>;
+		adj-height-mm = <216>;
+	};
+};
