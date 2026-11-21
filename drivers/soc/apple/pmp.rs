@@ -515,24 +515,40 @@ impl PmpData {
             .wrapping_add(ASC_CPU_CONTROL_OFFSET)
             .cast())
     }
-    /// Room for what SRAM needs kept, taken first so that running out refuses a sleep cleanly.
-    fn sram_alloc(&self, io: &Mmio<'_, Region<PMP_MIN_MMIO_SIZE>>) -> Result<Option<SramCopy>> {
-        let sram_size = io.size();
+    /// The SRAM range a system sleep keeps: with [`PmpHwConfig::sram_backup_data`], the
+    /// firmware's data segment, at the offset its header gives ([`SRAM_DATA_START`]) and on one
+    /// of its 4 KiB pages. An image whose header names no such segment is refused.
+    fn sram_range(
+        &self,
+        io: &Mmio<'_, Region<PMP_MIN_MMIO_SIZE>>,
+    ) -> Result<Option<(usize, usize)>> {
         let Some((mut offset, size)) = self.sram_backup else {
             return Ok(None);
         };
         if self.sram_backup_data {
             let data = io.as_view().relaxed().read32(SRAM_DATA_START) as usize;
-            // The segment starts on one of the image's 4 KiB pages.
-            if data % 0x1000 != 0 {
+            if data == 0 || data % 0x1000 != 0 {
                 dev_err!(self.dev, "firmware data segment at {:#x}\n", data);
                 return Err(EINVAL);
             }
             offset = data;
         }
-        if !pmp_bootargs::word_range_valid(offset, size, sram_size) {
+        if !pmp_bootargs::word_range_valid(offset, size, io.size()) {
+            dev_err!(
+                self.dev,
+                "SRAM range {:#x}+{:#x} outside the SRAM\n",
+                offset,
+                size
+            );
             return Err(EINVAL);
         }
+        Ok(Some((offset, size)))
+    }
+    /// Room for what SRAM needs kept, taken first so that running out refuses a sleep cleanly.
+    fn sram_alloc(&self, io: &Mmio<'_, Region<PMP_MIN_MMIO_SIZE>>) -> Result<Option<SramCopy>> {
+        let Some((offset, size)) = self.sram_range(io)? else {
+            return Ok(None);
+        };
         let mut words = KVVec::new();
         words.resize(size / 4, 0u32, GFP_KERNEL)?;
         Ok(Some(SramCopy { offset, words }))
@@ -1068,6 +1084,8 @@ impl platform::Driver for PmpDriver {
         let data = PmpData::new(pdev, cfg)?;
         let pmp_mmio = data.pmp_mmio.access(pdev.as_ref())?.as_view();
         let asc_mmio = data.asc_mmio.access(pdev.as_ref())?.as_view();
+        // The firmware's own header describes what a sleep keeps; refuse an image it doesn't.
+        data.sram_range(&pmp_mmio)?;
         let node = dev.fwnode().ok_or(EIO)?;
         let dvid = node
             .property_read(c"apple,dram-vendor-id")
