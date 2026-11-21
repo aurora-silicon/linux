@@ -323,7 +323,7 @@ pub(crate) trait Backend: Send + Sync {
     /// The device accepts command submission (an M5 GPU before its queues take submission
     /// does not).
     fn supports_submission(&self) -> bool { true }
-    /// Whether this backend's scheduler workers run in their queue creator's cluster (M5).
+    /// Whether this backend's scheduler workers run in their queue creator's cluster.
     fn creator_cluster_scheduling(&self) -> bool { false }
     /// Whether to keep compute input completion waits and wait on the host for other-engine
     /// prefix producers: without the G17D forms an M5 kick may start while its ring
