@@ -3328,6 +3328,13 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.needs_ioq_registers = true,
 	.lsq_in_nvmmu = true,
 	.max_queue_depth = 64,
+	/*
+	 * T8140's values, as T8132 runs them, checked on the J616s. sleep_epmap_last_mask stays
+	 * 0: after a sleep that cut the power the firmware takes the whole endpoint map echoed.
+	 */
+	.sleep_traced = true,
+	.sleep_flush_max_nsid = 1,
+	.sleep_shn = NVME_CC_SHN_MASK,
 	.quirks = NVME_QUIRK_NO_APST,
 };
 
