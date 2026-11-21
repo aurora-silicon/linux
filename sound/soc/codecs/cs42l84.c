@@ -1222,7 +1222,12 @@ static int cs42l84_apply_init_writes(struct cs42l84_private *cs42l84)
 		return ret;
 
 	for (i = 0; i < n; i += 2) {
-		if (seq[i] > CS42L84_REVID || seq[i + 1] > 0xff)
+		/*
+		 * Only registers the driver writes itself: not the device ID,
+		 * revision and status registers, whose reads must reach the chip.
+		 */
+		if (seq[i] >= CS42L84_REVID || seq[i + 1] > 0xff ||
+		    cs42l84_volatile_register(dev, seq[i]))
 			return dev_err_probe(dev, -EINVAL,
 					     "apple,init-writes: bad pair %#x %#x\n",
 					     seq[i], seq[i + 1]);
