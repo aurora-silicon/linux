@@ -1286,6 +1286,7 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	init_completion(&m->cal_response);
 	init_completion(&m->reset_retry);
 	init_completion(&m->hif_done);
+	INIT_WORK(&m->recover_work, mt_recover_work);
 	mutex_init(&m->command_mutex);
 	spin_lock_init(&m->response_lock);
 	ret = mt_ownership(m);

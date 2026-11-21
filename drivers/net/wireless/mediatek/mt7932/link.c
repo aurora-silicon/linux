@@ -440,10 +440,12 @@ static int mt_retire_connection(struct mt7932 *m)
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (!ret && (m->cal_state.active || m->cal_state.error || m->cal_request_count || m->waiting))
 		ret = -EPROTO;
-	if (!ret)
+	if (!ret) {
 		mt_peer_release(m);
-	else
+	} else {
 		m->link_failed = true; /* uncertain ownership: recovery required */
+		mt_request_recovery(m, "the firmware didn't confirm the connection's end");
+	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	mutex_unlock(&m->command_mutex);
 	dev_dbg(&m->pdev->dev, "CONNECTION_RETIRED: status=%d%s\n", ret,
@@ -1093,10 +1095,12 @@ void mt_disconnect_work(struct work_struct *work)
 	unsigned long flags;
 	int ret = mt_scan_quiesce(m);
 
-	if (!ret)
+	if (!ret) {
 		ret = mt_retire_connection(m);
-	else
+	} else {
 		WRITE_ONCE(m->link_failed, true);
+		mt_request_recovery(m, "a scan didn't end before the connection did");
+	}
 
 	/* Clear admission and queue its terminal event before a new connect can
 	 * start; both paths are serialized by response_lock.

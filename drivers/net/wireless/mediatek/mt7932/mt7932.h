@@ -89,6 +89,9 @@ struct mt7932 {
 	bool stopping;
 	/* Probe finished initialization; the Bluetooth function may start. */
 	bool ready;
+	/* Bit 0: a radio reset was asked for, once per binding. */
+	unsigned long recovery;
+	struct work_struct recover_work;
 	bool irq_requested, vectors_allocated, wiphy_registered;
 	bool dma_owned, module_pinned;
 	struct completion reset_retry;
@@ -318,6 +321,8 @@ int mt_net_open(struct net_device *netdev);
 int mt_request_input(struct mt7932 *m, const struct firmware **fw, const char *name);
 /* response_lock held; closes RF admission and reports terminal host state. */
 void mt_rf_fail_locked(struct mt7932 *m, int error);
+void mt_request_recovery(struct mt7932 *m, const char *why);
+void mt_recover_work(struct work_struct *work);
 u32 mt_read(struct mt7932 *m, u32 reg);
 void mt_write(struct mt7932 *m, u32 reg, u32 value);
 void mt_rmw(struct mt7932 *m, u32 reg, u32 mask, u32 value);
