@@ -12,6 +12,7 @@
 #include <linux/rculist.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/soc/apple/pmp-temps.h>
 #include <linux/soc/apple/pmp-power-policy.h>
@@ -35,7 +36,72 @@ struct apple_pmp_telemetry {
 	spinlock_t gpu_lock;
 	struct apple_pmp_gpu_lease gpu;
 	u64 generation;
+	size_t size;
+	/* Where the running firmware keeps each temperature record. */
+	struct apple_pmp_temp_map temps;
+	struct delayed_work locate;
+	unsigned int locate_tries;
 };
+
+/*
+ * The firmware's RTKit header names the start of its data segment, where
+ * its heap and so the temperature records are: 0x3c000 in the 26.6.2
+ * (25G83) PMP firmware, 0x3d000 in 27.2 (26B123).
+ */
+#define PMP_TEMP_DATA_START_HDR	0x234
+#define PMP_TEMP_LOCATE_MS	1000
+#define PMP_TEMP_LOCATE_TRIES	60
+
+static bool apple_pmp_temps_at(struct apple_pmp_telemetry *sensors,
+			       const struct apple_pmp_temp_map *map)
+{
+	u8 record[PMP_TEMP_RECORD_SIZE];
+	unsigned int i;
+
+	for (i = 0; i < PMP_TEMP_CHANNELS; i++) {
+		memcpy_fromio(record, sensors->sram + map->offset[i], sizeof(record));
+		if (!apple_pmp_temp_record_plausible(record, apple_pmp_temp_records[i].name))
+			return false;
+	}
+	return true;
+}
+
+/* The firmware fills its records some time after it starts: look until they are there. */
+static void apple_pmp_temps_locate(struct work_struct *work)
+{
+	struct apple_pmp_telemetry *sensors =
+		container_of(to_delayed_work(work), struct apple_pmp_telemetry, locate);
+	struct apple_pmp_temp_map map;
+	size_t start = 0;
+	u32 data;
+	unsigned int i;
+	int ret;
+
+	if (!READ_ONCE(sensors->online))
+		return;
+	apple_pmp_temp_map_default(&map);
+	if (apple_pmp_temps_at(sensors, &map))
+		return;
+	data = readl_relaxed(sensors->sram + PMP_TEMP_DATA_START_HDR);
+	if (!(data & 3) && data < sensors->size)
+		start = data;
+	ret = apple_pmp_temp_locate(sensors->sram, start, sensors->size, &map);
+	if (!ret) {
+		for (i = 0; i < PMP_TEMP_CHANNELS; i++)
+			WRITE_ONCE(sensors->temps.offset[i], map.offset[i]);
+		dev_info(sensors->dev,
+			 "temperature records at %#x %#x %#x %#x %#x %#x (data from %#zx)\n",
+			 map.offset[0], map.offset[1], map.offset[2], map.offset[3],
+			 map.offset[4], map.offset[5], start);
+		return;
+	}
+	if (++sensors->locate_tries < PMP_TEMP_LOCATE_TRIES) {
+		schedule_delayed_work(&sensors->locate, msecs_to_jiffies(PMP_TEMP_LOCATE_MS));
+		return;
+	}
+	dev_warn(sensors->dev, "temperature records not found (%d, data from %#zx)\n",
+		 ret, start);
+}
 
 static bool apple_pmp_telemetry_online(const struct apple_pmp_telemetry *sensors)
 {
@@ -58,7 +124,7 @@ int apple_pmp_telemetry_get_hotspot(const struct device_node *np, long *value)
 			ret = -ENODEV;
 			break;
 		}
-		ret = apple_pmp_temp_hotspot(sensors->sram, value);
+		ret = apple_pmp_temp_hotspot_map(sensors->sram, &sensors->temps, value);
 		/* A crash concurrent with the snapshot invalidates the result. */
 		if (!apple_pmp_telemetry_online(sensors))
 			ret = -ENODEV;
@@ -189,7 +255,7 @@ static int apple_pmp_sensor_read(void *cookie, unsigned int channel,
 		return -EINVAL;
 	if (!apple_pmp_telemetry_online(sensors))
 		return -ENODEV;
-	ret = apple_pmp_temp_sample(sensors->sram, channel, value);
+	ret = apple_pmp_temp_sample_map(sensors->sram, &sensors->temps, channel, value);
 
 	return apple_pmp_telemetry_online(sensors) ? ret : -ENODEV;
 }
@@ -265,6 +331,7 @@ static void apple_pmp_telemetry_release(void *data)
 {
 	struct apple_pmp_telemetry *sensors = data;
 
+	cancel_delayed_work_sync(&sensors->locate);
 	mutex_lock(&apple_pmp_telemetry_lock);
 	if (!list_empty(&sensors->list))
 		list_del_rcu(&sensors->list);
@@ -290,6 +357,9 @@ int apple_pmp_telemetry_register(struct device *dev, void __iomem *sram,
 	if (!sensors)
 		return -ENOMEM;
 	sensors->dev = dev;
+	sensors->size = size;
+	apple_pmp_temp_map_default(&sensors->temps);
+	INIT_DELAYED_WORK(&sensors->locate, apple_pmp_temps_locate);
 	INIT_LIST_HEAD(&sensors->list);
 	ret = devm_add_action_or_reset(dev, apple_pmp_telemetry_release,
 				       sensors);
@@ -303,6 +373,7 @@ int apple_pmp_telemetry_register(struct device *dev, void __iomem *sram,
 	mutex_lock(&apple_pmp_telemetry_lock);
 	list_add_tail_rcu(&sensors->list, &apple_pmp_telemetry_list);
 	mutex_unlock(&apple_pmp_telemetry_lock);
+	schedule_delayed_work(&sensors->locate, 0);
 	if (IS_REACHABLE(CONFIG_HWMON)) {
 		hwmon = devm_hwmon_device_register_with_info(
 			dev, "apple_pmp", sensors, &apple_pmp_hwmon_chip, NULL);
