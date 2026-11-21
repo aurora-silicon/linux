@@ -72,7 +72,14 @@ fn initdata(layout: &wire::Layout, ceiling: u32) -> Result<Vec<u8>, ()> {
     let mut buffers: [Vec<u8>; wire::OBJECT_COUNT] =
         core::array::from_fn(|i| vec![0xa5u8; layout.object_size[i]]);
     let mut slices = buffers.each_mut().map(|b| b.as_mut_slice());
-    wire::encode_for(layout, &mut slices, &input(), ceiling)?;
+    // As `build`: a record the ABI has no slot for is not mapped.
+    let mut input = input();
+    for slot in 0..wire::LOADER_COUNT {
+        if layout.slot(slot).is_none() {
+            input.loader_va[slot] = 0;
+        }
+    }
+    wire::encode_for(layout, &mut slices, &input, ceiling)?;
     Ok(buffers.into_iter().flatten().collect())
 }
 
@@ -252,10 +259,17 @@ fn catalog() {
     assert_eq!(wire::remap(v26.power_performance, 0x2e00, 4), Err(()));
     assert_eq!(wire::remap(v26.power_performance, 0x62c8, 4), Err(()));
     assert_eq!(wire::remap(v26.globals, 0x36, 4), Err(()), "a field may not straddle an insert");
-    // A filled record this ABI has no slot for refuses the encoding.
+    // A mapped record this ABI has no slot for refuses the encoding.
     let mut no_slot = wire::Layout { name: "test", ..wire::V26B123 };
     no_slot.loader_slot[3] = None;
-    assert!(initdata(&no_slot, 10).is_err());
+    let mut buffers: [Vec<u8>; wire::OBJECT_COUNT] =
+        core::array::from_fn(|i| vec![0xa5u8; no_slot.object_size[i]]);
+    let mut slices = buffers.each_mut().map(|b| b.as_mut_slice());
+    assert!(wire::encode_for(&no_slot, &mut slices, &input(), 10).is_err());
+    // The protected power-transition block (logical 36) has no 26B123 slot: slot 41 stays empty.
+    let v26 = initdata(&wire::V26B123, 10).unwrap();
+    let main = object(&v26, &wire::V26B123, id::MAIN);
+    assert!(main[0x640 + 41 * 0x28..0x640 + 42 * 0x28].iter().all(|&b| b == 0));
     let mut past_map = wire::Layout { name: "test", ..wire::V26B123 };
     past_map.loader_slot[41] = Some(60);
     assert!(initdata(&past_map, 10).is_err());

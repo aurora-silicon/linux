@@ -51,8 +51,11 @@ MAIN_MAP += fields([(0x1808 + 4 * i, 0x1924 + 4 * i) for i in range(16)])
 MAIN_MAP += fields([(0x1008 + 4 * k, 0x1124 + 4 * k) for k in range(256)])
 MAIN_MAP += fields([(0x1408 + 4 * k, 0x1524 + 4 * k) for k in range(256)])
 SLOTS = {0: 0, 3: 3, 9: 9, 10: 10, 12: 12, 14: 14, 15: 15, 17: 17, 22: 22, 26: 31, 27: 32,
-         28: 33, 29: 34, 31: 36, 32: 37, 36: 41, 39: 44, 40: 45, 41: 46}
+         28: 33, 29: 34, 31: 36, 32: 37, 39: 44, 40: 45, 41: 46}
 MAIN_MAP += [(0x640 + old * 0x28, 0x640 + new * 0x28, 0x28) for old, new in SLOTS.items()]
+# Logical 36 (the protected power-transition block, slot 41) stays empty on 26B123, as the M4
+# Pro leaves it: its 25G83 bytes are accounted for without a 26B123 position.
+DROPPED = {MAIN: [(0x640 + 36 * 0x28, 0x28)]}
 # Power config: the words the host writes and the temperature pointer.
 POWER_MAP = [(0x3b50, 0x3b98, 8)] + fields([
     (0x4, 0x4), (0x8, 0x8), (0x10, 0x10), (0x14, 0x14), (0x2c, 0x2c), (0x30, 0x30),
@@ -78,12 +81,18 @@ def split(image, sizes):
     return out
 
 
+def name_index(name):
+    return int(name.split()[1]) if name.startswith('object ') else -1
+
+
 def moved(old, size, table, name):
     """New object of `size` bytes holding `old`'s fields at their new offsets; every non-zero
     byte of `old` must belong to some field."""
     new, covered = bytearray(size), bytearray(len(old))
     for at, to, width in table:
         new[to:to + width] = old[at:at + width]
+        covered[at:at + width] = b'\1' * width
+    for at, width in DROPPED.get(name_index(name), []):
         covered[at:at + width] = b'\1' * width
     stray = [hex(i) for i, (b, c) in enumerate(zip(old, covered)) if b and not c]
     assert not stray, f'{name}: 25G83 bytes without a 26B123 position: {stray[:8]}'

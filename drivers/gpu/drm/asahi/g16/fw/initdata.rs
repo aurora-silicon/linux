@@ -174,6 +174,11 @@ const fn slots_26b123() -> [Option<u8>; LOADER_COUNT] {
     while slot < LOADER_COUNT {
         out[slot] = match slot {
             0..=7 | 9..=20 | 22..=24 => Some(slot as u8),
+            // Logical 36 (the protected power-transition block at PA 0x300e00000) stays
+            // empty, as the M4 Pro leaves it on this firmware: the firmware maps that block
+            // itself and writes its own VA into the slot during InitData, as macOS 27.2's
+            // InitData on the J773g shows.
+            36 => None,
             26..=43 => Some(slot as u8 + 5),
             _ => None,
         };
@@ -834,19 +839,23 @@ pub(crate) fn encode_for(
         }
     }
     for slot in 0..LOADER_COUNT {
+        // This ABI has no slot for the record: the host must not have mapped it (`build`
+        // skips it), and it is not described.
+        let Some(at) = layout.slot(slot) else {
+            if input.loader_va[slot] != 0 {
+                return Err(());
+            }
+            continue;
+        };
+        if at >= layout.register_slots {
+            return Err(());
+        }
         let mut record = [0u8; LOADER_STRIDE];
         loader_encode(slot, input.loader_va[slot], &mut record)?;
-        match layout.slot(slot) {
-            Some(at) if at < layout.register_slots => {
-                let at = 0x640 + at * LOADER_STRIDE;
-                main.get_mut(at..at + LOADER_STRIDE)
-                    .ok_or(())?
-                    .copy_from_slice(&record);
-            }
-            // A record this ABI has no slot for must be empty.
-            _ if record == [0; LOADER_STRIDE] => {}
-            _ => return Err(()),
-        }
+        let at = 0x640 + at * LOADER_STRIDE;
+        main.get_mut(at..at + LOADER_STRIDE)
+            .ok_or(())?
+            .copy_from_slice(&record);
     }
     let runs = layout.power_performance;
     let p = &mut objects[id::POWER_PERFORMANCE];
