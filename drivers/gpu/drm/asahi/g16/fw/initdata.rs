@@ -277,8 +277,9 @@ pub(crate) const V26B123: Layout = Layout {
     coredump_copy: None,
     // The new u32 at 0x38 and two words in previously reserved fields, as the M4 Pro writes
     // them on this firmware (linux#1954, on hardware) and as macOS 27.2's InitData on the J773g
-    // holds them. The firmware takes region C into its state when it powers the GPU up.
-    globals_policy: &[(0x38, 1), (0x9dc, 50), (0xe0c, 250)],
+    // holds them. The firmware takes region C into its state when it powers the GPU up. 0x7f0
+    // is 1 in macOS 27.2's InitData on the J773g.
+    globals_policy: &[(0x38, 1), (0x9dc, 50), (0xe0c, 250), (0x7f0, 1)],
     // The GPU is not powered off when idle; see IDLE_OFF_KEEP_POWERED_MS.
     globals_override: &[(0x9c0, IDLE_OFF_KEEP_POWERED_MS)],
     // The four u32s inserted at 0x9c, as the M4 Pro writes them on this firmware (1 each, on
@@ -303,6 +304,22 @@ pub(crate) const V26B123: Layout = Layout {
         (0xaac, 0x3ecf_2e49), // 0.40465
         (0xad8, 0x10),
         (0xae0, 0x5_dc00),
+        // Words G16 left zero, as macOS 27.2 has them in the J773g's InitData (our hypervisor
+        // capture of it):
+        // - 0x29e4, 0x29f0, 0x29f8: an averaging filter of n = 29 samples: n * 4, (n - 1) / n
+        //   and 1 / n;
+        // - 0x2bbc, 0x2c10: the power sample period, 8333 us, as f32 and u32 (the J773g ADT's
+        //   gpu-pwr-sample-period-aic-clks, 200000, at 24 MHz).
+        (0x44, 12),
+        (0x84, 1),
+        (0x29e4, 116),
+        (0x29f0, 0x3f77_2c23), // 28 / 29
+        (0x29f8, 0x3d0d_3dcb), // 1 / 29
+        (0x2b74, 50),
+        (0x2bbc, 0x4602_3400), // 8333.0
+        (0x2c10, 8333),
+        (0x2f34, 1),
+        (0x6ac8, 1),
     ],
 };
 
@@ -910,9 +927,6 @@ pub(crate) fn encode_for(
     let runs = layout.power_performance;
     let p = &mut objects[id::POWER_PERFORMANCE];
     put64(p, remap(runs, 0x3b50, 8)?, input.va[id::TEMPERATURE])?;
-    for &(at, value) in layout.power_policy {
-        put32(p, at, value)?;
-    }
     for (at, value) in [
         (4, 200000),
         (8, 200000),
@@ -929,6 +943,10 @@ pub(crate) fn encode_for(
         0x279e,
     ] {
         put32(p, remap(runs, at, 4)?, 100 * ceiling)?;
+    }
+    // Last, so that no remapped 25G83 word lands on a word of the build's own.
+    for &(at, value) in layout.power_policy {
+        put32(p, at, value)?;
     }
     Ok(())
 }
