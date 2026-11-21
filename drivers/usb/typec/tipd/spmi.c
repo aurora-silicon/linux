@@ -862,7 +862,12 @@ static int sn201202x_init(struct sn201202x *sn)
 		ret = tipd_init(tps);
 		if (ret)
 			cancel_delayed_work_sync(&sn->ldcm_work);
-		return ret;
+		/*
+		 * A command still running when the probe left the boot power state (tipd_init():
+		 * tipd_boot_power_on()) is no reason to give the port up: try again later. The
+		 * loop below tries again itself, with a cold reset for a controller stuck in one.
+		 */
+		return ret == -EBUSY ? -EPROBE_DEFER : ret;
 	}
 
 	for (try = 0; try < SN201202X_INIT_TRIES; try++) {
