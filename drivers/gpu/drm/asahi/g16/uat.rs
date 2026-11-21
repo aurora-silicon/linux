@@ -177,6 +177,8 @@ pub(crate) struct Window {
     firmware_root: [u64; 2],
     text_pa: u64,
     data_pa: u64,
+    /// The firmware page-table leaves the boot loader builds for this firmware.
+    leaves: &'static [hw::Leaves],
 }
 
 impl Window {
@@ -193,6 +195,7 @@ impl Window {
             firmware_root: [0; 2],
             text_pa: adt.text.start,
             data_pa: adt.data.start,
+            leaves: adt.layout.leaves.ok_or(ENOTSUPP)?,
         };
         window.admit_cold()?;
         Ok(window)
@@ -293,24 +296,23 @@ impl Window {
             } else {
                 let address = va | ((index as u64) << shift);
                 let off = address.checked_sub(hw::UPPER).ok_or(EINVAL)?;
-                let expected = if off < 0x60000 {
-                    (self.text_pa + off)
-                        | if (0x50000..0x58000).contains(&off) {
-                            0x483
-                        } else {
-                            0x4c3
-                        }
-                } else if off < 0x19c000 {
-                    let data_offset = off - 0x60000;
-                    (self.data_pa + data_offset)
-                        | if data_offset < 0xc000 {
-                            0x00200000000004c3
-                        } else {
-                            0x0460000000000443
-                        }
-                } else {
-                    return Err(EINVAL);
-                };
+                let leaf = self
+                    .leaves
+                    .iter()
+                    .find(|leaf| leaf.range.contains(&off))
+                    .ok_or(EINVAL)?;
+                // TEXT starts at UPPER; every later segment is in DATA, contiguously.
+                let text_end = self
+                    .leaves
+                    .iter()
+                    .filter(|l| l.segment == hw::Segment::Text)
+                    .map(|l| l.range.end)
+                    .max()
+                    .ok_or(EINVAL)?;
+                let expected = match leaf.segment {
+                    hw::Segment::Text => self.text_pa + off,
+                    hw::Segment::Data => self.data_pa + (off - text_end),
+                } | leaf.attrs;
                 if pte != expected {
                     return Err(EINVAL);
                 }
