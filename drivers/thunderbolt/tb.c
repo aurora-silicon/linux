@@ -96,8 +96,6 @@ struct tb_cm {
 	struct apple_router_sleep cio_router;
 	u64 cio_host_uid;
 	bool cio_dp_released;
-	/* Root lane adapters taken down with their XDomain peer for a native CIO sleep */
-	u64 cio_xdomain_lanes;
 	struct delayed_work remove_work;
 	struct work_struct dp_tunnel_work;
 	bool dp_tunnel_pending;

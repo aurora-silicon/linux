@@ -58,18 +58,6 @@ static void tb_cio_release_xdomains(struct tb *tb, struct tb_switch *sw)
 		__tb_disconnect_xdomain_paths(tb, xd, -1, -1, -1, -1);
 		tb_xdomain_put(xd);
 		tb_port_unconfigure_xdomain(port);
-		/*
-		 * The router's own sleep has only been seen with a router below it: take a
-		 * host's link down too, as an unplug would, and bring it back at complete.
-		 */
-		if (!tb_route(sw)) {
-			struct tb_cm *tcm = tb_priv(tb);
-
-			if (!tb_port_disable(port))
-				tcm->cio_xdomain_lanes |= BIT_ULL(port->port);
-			if (port->dual_link_port && !tb_port_disable(port->dual_link_port))
-				tcm->cio_xdomain_lanes |= BIT_ULL(port->dual_link_port->port);
-		}
 	}
 }
 
@@ -510,16 +498,6 @@ void tb_cio_sleep_complete(struct tb *tb)
 	list_for_each_entry(tunnel, &tcm->tunnel_list, list)
 		tb_tunnel_sleep_complete(tunnel);
 	tcm->cio_prepared = false;
-	/* The lanes taken down with an XDomain peer: the link trains again, the rescan finds it. */
-	if (tcm->cio_xdomain_lanes) {
-		struct tb_port *port;
-
-		tb_switch_for_each_port(tb->root_switch, port) {
-			if (tcm->cio_xdomain_lanes & BIT_ULL(port->port) && tb_port_enable(port))
-				tb_port_warn(port, "lane not enabled again after the sleep\n");
-		}
-		tcm->cio_xdomain_lanes = 0;
-	}
 	tcm->hotplug_active = true;
 	if (tcm->cio_dp_released) {
 		tcm->cio_dp_released = false;
