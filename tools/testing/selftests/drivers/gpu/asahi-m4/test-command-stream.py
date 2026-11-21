@@ -41,6 +41,7 @@ pub const drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES: drm_asahi_cmd_type 
 pub const drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_RESOURCES: drm_asahi_cmd_type = 6;
 pub const drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES_V2: drm_asahi_cmd_type = 7;
 pub const drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES: drm_asahi_render_flags = 8388608;
+pub const drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: drm_asahi_compute_flags = 131072;
 '''
 BINDINGS = OUT / 'm5-uapi.rs'
 BINDINGS.write_text('include!(' + json.dumps(str(FLAT)) + ');\n' + M5_UAPI)
@@ -317,6 +318,13 @@ fn unsupported_flags_and_compute_fields() {
     assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());
     let mut c=compute(); c.cdm_ctrl_stream_end=c.cdm_ctrl_stream_base;
     assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());
+    // The one compute flag: the command neither copies nor resets queries.
+    let mut c=compute(); c.flags=NO_QUERY_ACCESS;
+    assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_ok());
+    for flag in [1u32,1<<16,NO_QUERY_ACCESS<<1,NO_QUERY_ACCESS|1] {
+        let mut c=compute(); c.flags=flag;
+        assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());
+    }
 }
 #[test]
 fn scratch_and_helper_requests_report_unsupported() {

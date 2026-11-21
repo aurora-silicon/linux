@@ -932,16 +932,14 @@ impl Firmware {
     /// compute-only prefix of the same VM, and the compute depth is below
     /// [`params::compute_flights`]. Renders, another VM's commands and every failure path
     /// need an empty engine: under several clients, compute queued behind another VM's
-    /// lost its writes and stalled the firmware compute queue.
+    /// lost its writes and stalled the firmware compute queue. A command that may copy or
+    /// reset queries also waits for every flight with user timestamps to retire
+    /// ([`Self::writes_timestamps`]); every other compute command queues behind those.
     fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
         let e = &self.engine;
         if e.flights.len() >= params::compute_flights()
             || e.flights.iter().any(|f| {
-                f.renders != 0
-                    || f.doomed
-                    || f.recovery_suspect
-                    || !Arc::ptr_eq(&f.job.vm, &job.vm)
-                    || Self::writes_timestamps(f)
+                f.renders != 0 || f.doomed || f.recovery_suspect || !Arc::ptr_eq(&f.job.vm, &job.vm)
             })
             || job.vm.status.get() != 0
             || self.slots.compute_exhausted()
@@ -954,13 +952,18 @@ impl Firmware {
             return false;
         }
         let sent = job.progress.sent();
-        matches!(command(job, sent), Some(Command::Compute(_)))
+        let Some(Command::Compute(c)) = command(job, sent) else {
+            return false;
+        };
+        !(c.query_access && e.flights.iter().any(Self::writes_timestamps))
             && job.check_command_dependencies(sent).is_ok()
     }
 
     /// Whether a flight's commands have user timestamps. The host writes them when the
-    /// command retires, so a command queued behind it (a query copy, possibly waiting on
-    /// availability) could run before they exist; it waits for the retirement instead.
+    /// command retires, so only a command that reads or resets query memory can see them
+    /// missing: a query copy queued behind such a flight ran before they existed and never
+    /// finished. The firmware compute queue already orders every other command after it, and
+    /// its fence still signals after the timestamps are written: flights retire in order.
     fn writes_timestamps(f: &Flight) -> bool {
         f.job
             .commands
