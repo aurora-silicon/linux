@@ -133,6 +133,7 @@ struct rtkit {
 };
 struct tb {
 	bool prepared, stopped, lost, restarted;
+	int prepares, refusals;
 };
 struct apple_cio {
 	atomic_t fw_at_answers, fw_at_timeouts, fw_wake_seen, fw_lane_action;
@@ -515,6 +516,7 @@ static int apple_atcphy_cio_finish(struct phy *p)
 }
 static int tb_cio_sleep_prepare(struct tb *t)
 {
+	t->prepares++;
 	if (fail(6))
 		return -EBUSY;
 	t->prepared = true;
@@ -545,6 +547,13 @@ static void tb_cio_sleep_complete(struct tb *t)
 {
 	assert(t->prepared && !t->stopped);
 	t->prepared = false;
+}
+/* A refused prepare: complete if the transaction is open, then the CM's rescan. */
+static void tb_cio_sleep_refused(struct tb *t)
+{
+	assert(!t->stopped);
+	t->prepared = false;
+	t->refusals++;
 }
 static int apple_rtkit_poweroff(struct rtkit *r)
 {
@@ -722,9 +731,24 @@ int main(void)
 		setup();
 		inject(point);
 		assert(apple_nhi_cio_prepare(&nhi) < 0);
+		/* Every refusal after the CM's prepare rescans; none before it. */
+		assert(tb.refusals == tb.prepares);
 		clean();
 		cases++;
 	}
+	/*
+	 * T6050 without a PCIe tunnel refuses before the connection manager releases anything:
+	 * a host peer's link and services stay as they are.
+	 */
+	setup();
+	nhi.cio_t6050 = true;
+	inject(4);
+	assert(apple_nhi_cio_prepare(&nhi) == -ENODEV);
+	assert(!tb.prepares && !tb.refusals && !phy.prepared && !darts[0].active);
+	assert(pdev.dev.refs == 1 && !cio.native_sleep);
+	nhi.cio_t6050 = false;
+	clean();
+	cases++;
 	/*
 	 * A partner with no PCIe tunnel (a host-to-host cable): the router sleeps and wakes
 	 * with nothing behind it, and no PCIe callback runs.
