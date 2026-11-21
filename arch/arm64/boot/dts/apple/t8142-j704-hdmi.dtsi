@@ -29,9 +29,9 @@
 		/* aura copies the DP LIOA/common tunables by this alias */
 		atcphy2 = &atcphy2;
 		dcpext1 = &dcpext1;
-		/* aura's session names: scanout dispextN, PIODMA dispextN_piodma */
+		/* aura's session names: scanout dispextN, PIODMA dispextN-piodma */
 		dispext1 = &display;
-		dispext1_piodma = &dispext1_piodma;
+		dispext1-piodma = &dispext1_piodma;
 	};
 };
 
