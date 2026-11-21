@@ -5445,6 +5445,46 @@ static bool apple_dart_is_available(struct device_node *np)
 	return false;
 }
 
+/* Whether @consumer names @dart_np in its iommus. */
+static bool apple_dart_np_is_iommu_of(const struct device_node *consumer,
+				      const struct device_node *dart_np)
+{
+	struct of_phandle_args args;
+
+	for (int i = 0; !of_parse_phandle_with_args(consumer, "iommus", "#iommu-cells", i, &args);
+	     i++) {
+		bool match = args.np == dart_np;
+
+		of_node_put(args.np);
+		if (match)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Whether @dart_np serves an available T8132 internal display processor the
+ * boot loader handed over with the 27.2 image (apple_t8132_dcp_v27_2()): its
+ * firmware DART (the processor's iommus) or its display DART (its PIODMA's).
+ * The DART is keyed on the handoff of the processor that uses it, not on its
+ * address or on the board.
+ */
+static bool apple_dart_serves_t8132_dcp_v27(const struct device_node *dart_np)
+{
+	struct device_node *np, *child;
+	bool serves = false;
+
+	for_each_compatible_node(np, NULL, "apple,t8132-dcp") {
+		if (serves || !of_device_is_available(np) || !apple_t8132_dcp_v27_2(np))
+			continue;
+		serves = apple_dart_np_is_iommu_of(np, dart_np);
+		for_each_child_of_node(np, child)
+			if (!serves && apple_dart_np_is_iommu_of(child, dart_np))
+				serves = true;
+	}
+	return serves;
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret, sid;
@@ -5476,10 +5516,11 @@ static int apple_dart_probe(struct platform_device *pdev)
 	 * (fw_mirror below). The borrowed path admits only the 26.6.2 layout
 	 * and reserves its whole SID23 window from generic DMA.
 	 */
-	if (j713_display && apple_t8132_internal_dcp_v27_2()) {
+	j713_display_v27 = res && !tunneled &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		apple_dart_serves_t8132_dcp_v27(dev->of_node);
+	if (j713_display_v27)
 		j713_display = false;
-		j713_display_v27 = true;
-	}
 	/* The external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
 	j713_dcpext = res && !tunneled && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
@@ -5495,9 +5536,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 		res->start == 0x490000000ULL;
 	/*
 	 * Off the qualified firmware nothing hands the internal display DARTs
-	 * over, but the running DCP still uses them: never reset them.
+	 * over, but the running DCP still uses them: never reset them. A DART
+	 * whose processor was handed over with the 27.2 image is handed over.
 	 */
-	if (res && !tunneled && !apple_t8132_firmware_path() &&
+	if (res && !tunneled && !j713_display_v27 && !apple_t8132_firmware_path() &&
 	    of_machine_is_compatible("apple,t8132") &&
 	    of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 	    (res->start == 0x30a300000ULL || res->start == 0x30a340000ULL)) {
