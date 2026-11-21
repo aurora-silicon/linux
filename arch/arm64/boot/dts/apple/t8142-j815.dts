@@ -136,6 +136,13 @@
 	multi-touch {
 		/* ADT hid-merge-personality C1FD3,3 (J813: C1FD1,4). */
 		firmware-name = "apple/tpmtfw-j815.bin";
+		/* Touch states and path IDs decoded on this pad against macOS. */
+		apple,touch-states;
+		/*
+		 * Hand classes past 12 mm on two reports, any contact past 22 mm
+		 * at once (no finger on macOS passed 21 mm).
+		 */
+		apple,palm-tool-area = <1200 2200>;
 	};
 };
 
