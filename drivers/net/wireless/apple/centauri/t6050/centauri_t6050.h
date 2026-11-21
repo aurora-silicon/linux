@@ -35,6 +35,7 @@ enum centauri_t6050_boot_phase {
 	CEN_BOOT_READY,
 	CEN_BOOT_FAILED,
 	CEN_BOOT_STOPPED,
+	CEN_BOOT_REWAKE, /* Dispatch to the recovery owner, not boot_work. */
 };
 
 struct centauri_t6050 {
@@ -48,6 +49,8 @@ struct centauri_t6050 {
 	struct dentry *debug;
 	struct mutex boot_lock;
 	struct delayed_work boot_work;
+	struct work_struct transport_recover_work;
+	unsigned int transport_recover_count;
 	enum centauri_t6050_boot_phase boot_phase;
 	bool removing, ready;
 	void *firmware, *descriptor;
@@ -74,6 +77,7 @@ bool centauri_t6050_ipc_fenced(struct centauri_t6050_ipc *ipc);
 void centauri_t6050_detach_ipc(struct centauri_t6050_ipc *ipc);
 int centauri_t6050_alpha_resources(struct centauri_t6050 *c, struct cen_alpha_resources *resources);
 bool centauri_t6050_stop_dma(struct pci_dev *pdev);
+void centauri_t6050_request_rewake(struct pci_dev *fn, int error, bool force_reset);
 
 #if IS_ENABLED(CONFIG_APPLE_CENTAURI_T6050_WIFI)
 irqreturn_t centauri_t6050_alpha_irq(int irq, void *data);
