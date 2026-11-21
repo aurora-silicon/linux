@@ -376,13 +376,20 @@ int main(void)
 #define DWC3_GCTL_PRTCAP_HOST 1
 #define DWC3_GCTL_PRTCAP_DEVICE 2
 enum phy_mode { PHY_MODE_USB_HOST, PHY_MODE_USB_DEVICE };
+enum usb_device_speed { USB_SPEED_UNKNOWN, USB_SPEED_LOW, USB_SPEED_FULL, USB_SPEED_HIGH,
+    USB_SPEED_WIRELESS, USB_SPEED_SUPER, USB_SPEED_SUPER_PLUS };
 struct device { const char *of_node; };
-struct dwc3 { int dr_mode, current_dr_role; bool dis_u3_susphy_quirk; };
+struct dwc3 { int dr_mode, current_dr_role; bool dis_u3_susphy_quirk; enum usb_device_speed maximum_speed; };
 struct dwc3_apple { struct dwc3 dwc; struct device *dev; void *usb2_phy, *usb3_phy; int lock, state;
-    bool dt_dis_u3_susphy, host_only, sleep_ddr; };
-static int phy_error, host_calls, gadget_calls, stops, syscore;
+    bool dt_dis_u3_susphy, host_only, sleep_ddr; enum usb_device_speed maximum_speed; };
+static int phy_error, validate_error, host_calls, gadget_calls, stops, syscore, high_speed;
 static bool of_device_is_compatible(const char *node, const char *name) { return !strcmp(node,name); }
 static int phy_set_mode(void *phy, int mode) { (void)phy; (void)mode; return phy_error; }
+static int phy_validate(void *phy, int mode, int submode, void *opts)
+{ (void)phy; assert(mode == PHY_MODE_USB_DEVICE); (void)submode; (void)opts; return validate_error; }
+/* The GUCTL1 clock write is the controller's; the speed limit is what the role logic decides. */
+static void dwc3_apple_gadget_high_speed(struct dwc3_apple *a)
+{ if (a->dwc.maximum_speed <= USB_SPEED_HIGH) return; a->dwc.maximum_speed = USB_SPEED_HIGH; high_speed++; }
 static void dwc3_apple_set_ptrcap(struct dwc3_apple *a, int cap) { (void)a; (void)cap; }
 static void dwc3_enable_susphy(struct dwc3 *d, bool on) { (void)d; assert(on); }
 static int dwc3_host_init(struct dwc3 *d) { (void)d; host_calls++; return 0; }
@@ -399,23 +406,37 @@ static void dwc3_apple_syscore(struct dwc3_apple *a, bool on) { (void)a; assert(
 int main(void)
 {
     struct device dev = { "apple,t8132-dwc3" };
-    struct dwc3_apple a = { .dev=&dev, .usb3_phy=&dev, .state=DWC3_APPLE_NO_CABLE };
+    struct dwc3_apple a = { .dev=&dev, .usb3_phy=&dev, .state=DWC3_APPLE_NO_CABLE,
+                            .dwc.maximum_speed=USB_SPEED_SUPER };
     phy_error=-ETIMEDOUT;
     assert(dwc3_apple_init(&a,DWC3_APPLE_HOST)==-ETIMEDOUT);
     assert(!host_calls && !gadget_calls && stops==1 && a.state==DWC3_APPLE_NO_CABLE);
     /* No SuperSpeed device mode: the gadget starts at high speed instead. */
     phy_error=-EOPNOTSUPP;
     assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE));
-    assert(gadget_calls==1 && stops==1 && a.state==DWC3_APPLE_DEVICE);
+    assert(gadget_calls==1 && stops==1 && a.state==DWC3_APPLE_DEVICE && syscore==1);
+    assert(high_speed==1 && a.dwc.maximum_speed==USB_SPEED_HIGH && a.maximum_speed==USB_SPEED_SUPER);
     a.state=DWC3_APPLE_NO_CABLE;
     phy_error=0;
+    /* The next session starts from the saved maximum again. */
     assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST));
-    assert(host_calls==1 && a.state==DWC3_APPLE_HOST && syscore==1);
+    assert(host_calls==1 && a.state==DWC3_APPLE_HOST && syscore==2);
+    assert(a.dwc.maximum_speed==USB_SPEED_SUPER);
     /* A T8132 host keeps its USB3 PHY out of P3. */
     assert(a.dwc.dis_u3_susphy_quirk);
     dev.of_node="apple,t8103-dwc3"; phy_error=-ETIMEDOUT;
-    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && host_calls==2 && syscore==2);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && host_calls==2 && syscore==3);
     assert(!a.dwc.dis_u3_susphy_quirk);
+    /* A USB3 PHY that does not validate a device role: high speed although set_mode succeeds. */
+    dev.of_node="apple,t8132-dwc3"; phy_error=0; validate_error=-EOPNOTSUPP;
+    a.state=DWC3_APPLE_NO_CABLE;
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE) && gadget_calls==2 && high_speed==2);
+    assert(a.dwc.maximum_speed==USB_SPEED_HIGH && a.state==DWC3_APPLE_DEVICE);
+    /* So does a controller without a USB3 PHY. */
+    a.usb3_phy=0; validate_error=0; a.state=DWC3_APPLE_NO_CABLE;
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && a.dwc.maximum_speed==USB_SPEED_SUPER);
+    a.state=DWC3_APPLE_NO_CABLE;
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE) && high_speed==3 && a.dwc.maximum_speed==USB_SPEED_HIGH);
     puts("ok 7 - T8132 PHY failures stop before xHCI, a device role falls back to high speed, older fallback preserved");
     return 0;
 }
