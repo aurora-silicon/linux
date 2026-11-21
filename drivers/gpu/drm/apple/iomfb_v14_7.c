@@ -162,7 +162,6 @@ static const struct dcp_v14_board dcp_v14_board_j516c = {
 	.panel_height = 2234,
 	.promotion = true,
 	.log_bringup = true,
-	.swap_timestamps = true,
 	/*
 	 * The J516S panel and this image's swap carry the level block the
 	 * T6030 record uses (present byte +0x354, binary64 nits +0x35c, 500 nits
@@ -1702,9 +1701,15 @@ const char *iomfb_v14_7_board_name(const struct dcp_v14_board *board)
 	return board->name;
 }
 
+/*
+ * The internal panel's swaps carry the constant timestamp
+ * DCP_V14_SWAP_TIMESTAMP_VALUE in slots 0, 1 and 6. With zero timestamps the
+ * firmware completes at most one swap per 16.7 ms, so a 120 Hz panel would
+ * present at 60 fps: stamp wherever the panel is ProMotion.
+ */
 bool dcp_v14_board_stamps_swaps(const struct dcp_v14_board *board, bool external)
 {
-	return board && !external && board->swap_timestamps;
+	return board && !external && board->promotion;
 }
 
 int iomfb_v14_7_probe(struct apple_dcp *dcp)

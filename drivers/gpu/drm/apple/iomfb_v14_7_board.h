@@ -39,13 +39,6 @@ struct dcp_v14_board {
 	 * releases, so they are only set where tested.
 	 */
 	u32 ctm_set, ctm_get;
-	/*
-	 * The panel's swaps carry the constant timestamp
-	 * DCP_V14_SWAP_TIMESTAMP_VALUE in slots 0, 1 and 6. With zero
-	 * timestamps this board's firmware completes at most one swap per
-	 * 16.7 ms, so a 120 Hz panel presents at 60 fps.
-	 */
-	bool swap_timestamps;
 	/* This board has a qualified panel level block; machine admission is separate. */
 	bool panel_nits;
 };
