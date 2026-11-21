@@ -718,23 +718,6 @@ impl G17Resources {
         ])
     }
 
-    /// Sample only the two owned queue configuration words through the
-    /// host tag/data port. The caller holds the device mutex and power hold.
-    pub(crate) fn m5_queue_configurations(&self, qids: [u8; 2]) -> Result<[u64; 2]> {
-        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        let sgx = (&*sgx).as_view();
-        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY) & G17_HOST_POWERED == 0 {
-            return Err(EAGAIN);
-        }
-        let mut values = [0; 2];
-        for (value, qid) in values.iter_mut().zip(qids) {
-            let tag = crate::g17::fw::m5::queue::HardwareSubmission::configuration_tag(qid)?;
-            sgx.try_write64(tag, 0x4090)?;
-            *value = sgx.try_read64(0x4098)?;
-        }
-        Ok(values)
-    }
-
     /// Registers a queue KSM slot through the firmware mailbox.
     pub(crate) fn register_ksm_queue(&self, qid: u8, descriptor: u64) -> Result {
         if qid > 127 {

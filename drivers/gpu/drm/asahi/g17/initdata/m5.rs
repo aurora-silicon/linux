@@ -52,17 +52,6 @@ impl InitData {
             ring(0), ring(1), ring(2), ring(3), page(canonical.start)]
     }
 
-    /// Diagnostic-only read of an aligned word within the existing policy allocation.
-    /// Callers hold the device state mutex, retaining this mapping for the entire sample.
-    pub(crate) fn m5_policy_telemetry_word(&self, offset: usize) -> Result<u32> {
-        if !self.m5 || offset & 3 != 0
-            || offset.checked_add(4).is_none_or(|end| end > self.graph.policy_size) {
-            return Err(EINVAL);
-        }
-        let at = self.graph.shared.policy.checked_add(offset).ok_or(EINVAL)?;
-        Ok(self.object(self.bundle)?.word(at)?.load(Ordering::Relaxed))
-    }
-
     /// Counts `submissions` in the firmware's submission history, in the slot of this moment.
     pub(crate) fn note_m5_submission_history(&self, submissions: u8) -> Result {
         if !self.m5 { return Err(EINVAL); }
