@@ -3412,16 +3412,19 @@ static int sleep_display_off(struct apple_sleep *s)
 		 * T8140's engine doesn't wait for its external display. On T8132 macOS has them
 		 * all off.
 		 */
-		if (i != 0 && !s->display[i].bound) {
-			if (!s->soc->lower_unbound_displays)
-				continue;
-			/* Otherwise writing its CPU word faults. */
-			if (s->ps_prot && soc->disp_prot_slice[i]) {
-				void __iomem *slice;
+		if (i != 0 && !s->display[i].bound && !s->soc->lower_unbound_displays)
+			continue;
+		/*
+		 * Otherwise writing its CPU word faults. A bound one is stopped by now (a running
+		 * one refused the sleep), but with no stop of its own in its driver (T8132's
+		 * firmware-27 DCPEXT) nothing has released its slice either.
+		 */
+		if (i != 0 && s->ps_prot && soc->disp_prot_slice[i]) {
+			void __iomem *slice;
 
-				slice = s->ps_prot + PS_PROT_SLICE(soc->disp_prot_slice[i]);
+			slice = s->ps_prot + PS_PROT_SLICE(soc->disp_prot_slice[i]);
+			if (readl(slice) & PS_PROT_SLICE_ON)
 				writel(readl(slice) & ~PS_PROT_SLICE_ON, slice);
-			}
 		}
 		if (i != 0 && soc->dispext_optional) {
 			int k;
