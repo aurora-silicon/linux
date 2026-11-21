@@ -18,13 +18,19 @@ description: |
   The controller can be polled when interrupt resources are not supplied.
 
   T8132 omits the register-selection interrupt, so selection is polled while
-  event, standby and wakeup notifications use interrupts.
+  event, standby and wakeup notifications use interrupts. The T8152
+  controllers work as the T8132 ones do: no register-selection interrupt, and
+  the payload length of a selected register in register 0x1f.
 
 properties:
   compatible:
     oneOf:
       - const: apple,sn201202x
       - items:
+          - const: apple,t8132-sn201202x
+          - const: apple,sn201202x
+      - items:
+          - const: apple,t8152-sn201202x
           - const: apple,t8132-sn201202x
           - const: apple,sn201202x
 

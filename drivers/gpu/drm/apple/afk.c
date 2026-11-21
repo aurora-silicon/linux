@@ -83,6 +83,18 @@ void afk_service_retry(struct apple_dcp_afkep *ep)
 }
 EXPORT_SYMBOL_IF_KUNIT(afk_service_retry);
 
+/* How long the host waits for the firmware: the processor's own, or one second. */
+static unsigned int afk_timeout_ms(struct apple_dcp_afkep *ep)
+{
+	return ep->dcp->hw.afk_timeout_ms ?: MSEC_PER_SEC;
+}
+
+/* The same for a service the caller may not have; the call fails without one. */
+static unsigned int afk_service_timeout_ms(struct apple_epic_service *service)
+{
+	return service ? afk_timeout_ms(service->ep) : MSEC_PER_SEC;
+}
+
 static void afk_send(struct apple_dcp_afkep *ep, u64 message)
 {
 	dcp_send_message(ep->dcp, ep->endpoint, message);
@@ -115,7 +127,8 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 
 	afkep->ops = ops;
 	afkep->dcp = dcp;
-	afkep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 || dcp_is_ext26(dcp);
+	afkep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 || dcp_is_ext26(dcp) ||
+			  dcp->hw.afk_v2;
 	afkep->endpoint = endpoint;
 	afkep->wq = alloc_ordered_workqueue("apple-dcp-afkep%02x",
 					    WQ_MEM_RECLAIM, endpoint);
@@ -184,7 +197,8 @@ void afk_shutdown(struct apple_dcp_afkep *afkep)
 	afk_send(afkep, FIELD_PREP(RBEP_TYPE, RBEP_SHUTDOWN));
 	int ret;
 
-	ret = wait_for_completion_timeout(&afkep->stopped, msecs_to_jiffies(1000));
+	ret = wait_for_completion_timeout(&afkep->stopped,
+					  msecs_to_jiffies(afk_timeout_ms(afkep)));
 	if (ret <= 0) {
 		dev_err(afkep->dcp->dev, "Timed out shutting down AFK endpoint %02x", afkep->endpoint);
 	}
@@ -235,6 +249,36 @@ static int afk_start_polled(struct apple_dcp_afkep *ep)
 	return -ETIMEDOUT;
 }
 
+/*
+ * An endpoint the bootloader left running (afk_live_endpoints): an INIT
+ * on a live endpoint asserts in the firmware. Stop it and wait for the
+ * acknowledgment first. Its old ring stays with the bootloader, which
+ * keeps it reserved.
+ */
+static int afk_stop_live(struct apple_dcp_afkep *ep)
+{
+	u32 bit;
+
+	if (ep->endpoint < 0x20 || ep->endpoint >= 0x40)
+		return 0;
+	bit = BIT(ep->endpoint - 0x20);
+	if (!(ep->dcp->afk_live_endpoints & bit))
+		return 0;
+	reinit_completion(&ep->stopped);
+	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SHUTDOWN));
+	if (!wait_for_completion_timeout(&ep->stopped,
+					 msecs_to_jiffies(afk_timeout_ms(ep)))) {
+		dev_err(ep->dcp->dev, "AFK[ep:%02x]: inherited endpoint did not stop\n",
+			ep->endpoint);
+		return -ETIMEDOUT;
+	}
+	reinit_completion(&ep->stopped);
+	ep->dcp->afk_live_endpoints &= ~bit;
+	dev_info(ep->dcp->dev, "AFK[ep:%02x]: inherited endpoint stopped\n",
+		 ep->endpoint);
+	return 0;
+}
+
 int afk_start(struct apple_dcp_afkep *ep)
 {
 	int ret;
@@ -248,6 +292,16 @@ int afk_start(struct apple_dcp_afkep *ep)
 	}
 
 	reinit_completion(&ep->started);
+	/*
+	 * An adopted session's endpoint map went to the bootloader, and RTKit
+	 * starts only endpoints it knows. Registered before anything is sent,
+	 * the endpoint's replies are not reported as an unknown endpoint's.
+	 */
+	if (ep->dcp->hw.afk_adopt_endpoints)
+		apple_rtkit_adopt_ep(ep->dcp->rtk, ep->endpoint);
+	ret = afk_stop_live(ep);
+	if (ret)
+		return ret;
 	ret = apple_rtkit_start_ep(ep->dcp->rtk, ep->endpoint);
 	if (ret)
 		return ret;
@@ -256,7 +310,8 @@ int afk_start(struct apple_dcp_afkep *ep)
 		return afk_start_polled(ep);
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT));
 
-	ret = wait_for_completion_timeout(&ep->started, msecs_to_jiffies(1000));
+	ret = wait_for_completion_timeout(&ep->started,
+					  msecs_to_jiffies(afk_timeout_ms(ep)));
 	if (ret <= 0 && ep->dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dev_warn(ep->dcp->dev,
@@ -961,6 +1016,7 @@ static void afk_recv_handle_compact_init(struct apple_dcp_afkep *ep,
 
 	if (ops->init)
 		ops->init(service, service_name, service_name, unit);
+	wake_up_all(&ep->service_wq);
 
 	dev_info(ep->dcp->dev,
 		 "AFK[ep:%02x]: new compact service %s on interface %u%s\n",
@@ -1637,6 +1693,7 @@ static void afk_retry_service_init(struct apple_dcp_afkep *ep)
 		if (ops->init)
 			ops->init(service, service->pending_name, service->pending_class,
 				  service->pending_unit);
+		wake_up_all(&ep->service_wq);
 		if (service->enabled)
 			afk_populate_service_debugfs(service);
 		kfree(service->pending_name);
@@ -1718,7 +1775,7 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	 * EPICProviderClass was used. If the init call has props parse them and
 	 * use EPICProviderClass to match the service.
 	 */
-	if (props_size > 36) {
+	if (props_size > 36 && !ep->dcp->hw.afk_announced_names) {
 		int ret = parse(props, props_size, &ctx);
 		if (ret) {
 			dev_err(ep->dcp->dev,
@@ -1762,8 +1819,17 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			service_name = epic_class;
 		}
 	} else {
-            service_name = name;
-        }
+		service_name = name;
+		/*
+		 * hw.afk_announced_names: the announced name is the service's
+		 * identity, and its handler gets it as the EPIC name.
+		 */
+		if (ep->dcp->hw.afk_announced_names) {
+			epic_name = kstrdup(name, GFP_KERNEL);
+			if (!epic_name)
+				return;
+		}
+	}
 
 	if (ep->match_epic_name)
 		ops = afk_match_service(ep, epic_name);
@@ -1786,6 +1852,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	if (!ops && dcp_is_ext26(ep->dcp) && ep->ops &&
 	    !strcmp(ep->ops->name, "native26-observer"))
 		ops = ep->ops;
+	if (!ops)
+		ops = ep->unmatched_ops;
 	if (!ops) {
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: unable to match service %s on channel %d\n",
@@ -1863,6 +1931,7 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		ops->init_props(service, epic_unit, props, props_size);
 	if (ops->init)
 		ops->init(service, epic_name, epic_class, epic_unit);
+	wake_up_all(&ep->service_wq);
 	dev_info(ep->dcp->dev, "AFK[ep:%02x]: new service %s on channel %d\n",
 		 ep->endpoint, service_name, channel);
 
@@ -3114,7 +3183,7 @@ int afk_send_command(struct apple_epic_service *service, u8 type,
 {
 	return afk_send_command_timeout(service, type, payload, payload_len,
 					output, output_len, retcode,
-					MSEC_PER_SEC);
+					afk_service_timeout_ms(service));
 }
 
 static u16 afk_command_tag(struct apple_epic_service *service, u8 slot)
@@ -3157,6 +3226,15 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 {
 	return afk_send_command_timeout_len(service, type, payload, payload_len,
 					    output, output_len, retcode, timeout_ms, NULL);
+}
+
+int afk_send_command_len(struct apple_epic_service *service, u8 type,
+			 const void *payload, size_t payload_len, void *output,
+			 size_t output_len, u32 *retcode, size_t *received)
+{
+	return afk_send_command_timeout_len(service, type, payload, payload_len,
+					    output, output_len, retcode,
+					    afk_service_timeout_ms(service), received);
 }
 
 /*
@@ -3246,11 +3324,20 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 			goto err_put_service;
 	}
 
-	rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
-				   GFP_KERNEL);
-	if (!rxbuf) {
-		ret = -ENOMEM;
-		goto err_put_service;
+	/*
+	 * A command without output carries no reply buffer: firmware that
+	 * answers some commands with a status alone asserts when it is given
+	 * one, since it then copies an empty reply.
+	 */
+	rxbuf = NULL;
+	rxbuf_dma = 0;
+	if (output_len) {
+		rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
+					   GFP_KERNEL);
+		if (!rxbuf) {
+			ret = -ENOMEM;
+			goto err_put_service;
+		}
 	}
 	txbuf = dma_alloc_coherent(ep->dcp->dev, payload_len, &txbuf_dma,
 				   GFP_KERNEL);
@@ -3408,7 +3495,7 @@ err_free_txbuf:
 	if (!dcp_is_ext26(ep->dcp))
 		dma_free_coherent(ep->dcp->dev, payload_len, txbuf, txbuf_dma);
 err_free_rxbuf:
-	if (!dcp_is_ext26(ep->dcp))
+	if (rxbuf && !dcp_is_ext26(ep->dcp))
 		dma_free_coherent(ep->dcp->dev, output_len, rxbuf, rxbuf_dma);
 err_put_service:
 	afk_service_put(service);
@@ -3421,7 +3508,7 @@ int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 {
 	return afk_service_call_timeout(service, group, command, data, data_len,
 					data_pad, output, output_len,
-					output_pad, MSEC_PER_SEC);
+					output_pad, afk_service_timeout_ms(service));
 }
 
 int afk_service_call_len(struct apple_epic_service *service, u16 group,
@@ -3431,7 +3518,7 @@ int afk_service_call_len(struct apple_epic_service *service, u16 group,
 {
 	return afk_service_call_timeout_len(service, group, command, data, data_len,
 					    data_pad, output, output_len, output_pad,
-					    MSEC_PER_SEC, received);
+					    afk_service_timeout_ms(service), received);
 }
 
 int afk_service_call_timeout(struct apple_epic_service *service, u16 group,

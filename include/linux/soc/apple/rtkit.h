@@ -512,4 +512,14 @@ struct apple_rtkit *devm_apple_rtkit_init_m5_saved(struct device *dev, void *coo
 						 const char *mbox_name, int mbox_idx,
 						 const struct apple_rtkit_ops *ops);
 
+/*
+ * Registers an application endpoint the client started itself on a
+ * co-processor whose endpoint map the bootloader consumed, so that its
+ * messages are not reported as undiscovered
+ *
+ * @rtk:            RTKit reference
+ * @ep:             endpoint to register
+ */
+void apple_rtkit_adopt_ep(struct apple_rtkit *rtk, u8 ep);
+
 #endif /* _LINUX_APPLE_RTKIT_H_ */

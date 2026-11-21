@@ -76,6 +76,7 @@
 #include "dptx-service.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
+#include "iomfb_iboot.h"
 #include "iomfb_m4.h"
 #include "ibootep.h"
 #include "iomfb_internal.h"
@@ -113,15 +114,15 @@ static bool dcp_session_retained(struct device *dev)
 	return retained;
 }
 
-static int dcp_pin_live_session(struct apple_dcp *dcp)
+/*
+ * Keep a live session's DMA device, domain use and this driver until reboot,
+ * and refuse a new probe of its device after an unbind.
+ */
+int dcp_retain_live_session(struct apple_dcp *dcp)
 {
 	struct dcp_session_ref *session;
 
-	if ((!dcp->hw.adopt_live_session &&
-	     dcp->hw.iomfb_method_profile !=
-	     DCP_IOMFB_METHODS_H17P_EXTERNAL) ||
-	    !dcp_fail_stop(dcp) ||
-	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G || dcp->retain_dma)
+	if (dcp->retain_dma)
 		return 0;
 	session = kzalloc_obj(*session);
 	if (!session)
@@ -140,6 +141,17 @@ static int dcp_pin_live_session(struct apple_dcp *dcp)
 	mutex_unlock(&dcp_retained_sessions_lock);
 	dev_dbg(dcp->dev, "live DCP DMA resources retained until reboot\n");
 	return 0;
+}
+
+static int dcp_pin_live_session(struct apple_dcp *dcp)
+{
+	if ((!dcp->hw.adopt_live_session &&
+	     dcp->hw.iomfb_method_profile !=
+	     DCP_IOMFB_METHODS_H17P_EXTERNAL) ||
+	    !dcp_fail_stop(dcp) ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G || dcp->retain_dma)
+		return 0;
+	return dcp_retain_live_session(dcp);
 }
 
 static void dcp_release_dma_domain(void *data)
@@ -1842,7 +1854,7 @@ static int dcp_check_iova_contiguous(struct iommu_domain *domain,
 	return 0;
 }
 
-static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
+int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_dcp *dcp = cookie;
 	int ret;
@@ -1903,7 +1915,7 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 	return 0;
 }
 
-static void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
+void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_dcp *dcp = cookie;
 
@@ -7711,12 +7723,53 @@ static int dcp_platform_probe_t8132_ext(struct platform_device *pdev)
  * bind's, may still appear (bounded by the deferred probe timeout); on any
  * other failure join as an unusable pipe.
  */
+/*
+ * A DCP driven through the iBoot interface alone (DCP_FIRMWARE_IBOOT,
+ * iomfb_iboot.c): no component of a display subsystem, with a DRM device of
+ * its own. Its adopted session cannot be stopped: once the firmware is
+ * touched, its DMA and this driver stay until reboot, and a failed start
+ * leaves the device bound without a display.
+ */
+static int dcp_platform_probe_iboot(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct apple_dcp *dcp;
+	int ret;
+
+	if (dcp_session_retained(dev))
+		return dev_err_probe(dev, -EBUSY, "Previous live DCP session requires a reboot\n");
+	dcp = kzalloc_obj(*dcp);
+	if (!dcp)
+		return -ENOMEM;
+	ret = devm_add_action_or_reset(dev, dcp_release_context, dcp);
+	if (ret)
+		return ret;
+	dcp->dev = dev;
+	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	dcp->fw_compat = dcp->hw.firmware_compat;
+	ret = iommu_device_use_default_domain(dev);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, dcp_release_dma_domain, dcp);
+	if (ret)
+		return ret;
+	platform_set_drvdata(pdev, dcp);
+	return dcp_iboot_probe(dcp);
+}
+
 static int dcp_platform_probe(struct platform_device *pdev)
 {
+	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
 	void *group;
 	int ret;
+
+	if (hw->firmware_compat == DCP_FIRMWARE_IBOOT) {
+		/* The port controllers wait for the USB-C display switches. */
+		t8152_typec_register(dev);
+		return dcp_platform_probe_iboot(pdev);
+	}
 
 	/* t6041_dcpext=0: stay off the external processors' hardware. */
 	if (of_device_is_compatible(dev->of_node, "apple,t6041-dcpext") &&
@@ -7776,6 +7829,11 @@ static void dcp_platform_remove(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
+	/* No component and none of the works below; see dcp_iboot_remove(). */
+	if (dcp && dcp_is_iboot(dcp)) {
+		dcp_iboot_remove(dcp);
+		return;
+	}
 	if (dcp) {
 		cancel_work_sync(&dcp->s2r_prewarm_work);
 		cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
@@ -7834,6 +7892,9 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	if (dcp_takeover_was_aborted(dcp))
+		return;
+	/* The iBoot interface's display stays as it is: no component to remove. */
+	if (dcp && dcp_is_iboot(dcp))
 		return;
 
 	if (dcp && iomfb_is_m4(dcp)) {
@@ -8066,6 +8127,9 @@ static void dcp_platform_complete(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	/* The iBoot interface's display stays powered across system sleep. */
+	if (dcp_is_iboot(dcp))
+		return;
 	if (dcp_is_ext26(dcp)) {
 		WRITE_ONCE(dcp->ext26_pm_preparing, false);
 		if (dcp->ext26_pm_work_off && !READ_ONCE(dcp->ext26_blocked) &&
@@ -9490,6 +9554,9 @@ static int dcp_platform_suspend(struct device *dev)
 	/* Its power sequences may crash the DCP and blank the panel. */
 	if (dcp_takeover_was_aborted(dcp))
 		return -EBUSY;
+	/* The iBoot interface's display stays powered across system sleep. */
+	if (dcp_is_iboot(dcp))
+		return 0;
 
 	/*
 	 * An external DCP given up at probe may never have set up the works
@@ -9636,6 +9703,8 @@ static int dcp_platform_resume(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
 	if (dcp_takeover_was_aborted(dcp))
+		return 0;
+	if (dcp_is_iboot(dcp))
 		return 0;
 
 	if (dcp_v27_sleep_selected(dcp) && READ_ONCE(dcp->sleep_v27_closed))
@@ -9867,8 +9936,29 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142_dcpext = {
 	.s2r_layout = &dcp_s2r_t8142_ext[0],
 };
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8152)
+/*
+ * T8152 (J873g): the DCP and both DCPEXTs, driven through the firmware's
+ * iBoot interface (disp0-service, dispext-service) over AFKv2, with the
+ * DPAV controller and DPTX port endpoints opened as the firmware expects
+ * them. The bootloader leaves each session running or quiesced; a running
+ * one is taken without the RTKit handshake.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8152_iboot = {
+	.num_dptx_ports = 2,
+	.firmware_compat = DCP_FIRMWARE_IBOOT,
+	.afk_v2 = true,
+	.afk_adopt_endpoints = true,
+	.afk_announced_names = true,
+	.afk_timeout_ms = 3000,
+};
+#endif
+
 static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8142-dcpext", .data = &apple_dcp_hw_t8142_dcpext },
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8152)
+	{ .compatible = "apple,t8152-dcp-iboot", .data = &apple_dcp_hw_t8152_iboot },
+#endif
 	{ .compatible = "apple,t6041-dcp", .data = &apple_dcp_hw_t6041, },
 	{ .compatible = "apple,t6041-dcpext", .data = &apple_dcp_hw_t6041_dcpext, },
 	{ .compatible = "apple,t6050-dcp", .data = &apple_dcp_hw_t6050 },
@@ -9916,6 +10006,7 @@ int __init dcp_register(void)
 void dcp_unregister(void)
 {
 	platform_driver_unregister(&apple_platform_driver);
+	t8152_typec_unregister();
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
