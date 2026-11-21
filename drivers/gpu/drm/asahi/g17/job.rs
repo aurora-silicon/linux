@@ -315,6 +315,10 @@ pub(crate) trait Backend: Send + Sync {
     /// Device detector retained by render completions after queue teardown.
     fn input_sources(&self, _inputs: &[crate::file::SyncItem])
         -> Option<Arc<super::sync_input::Sources>> { None }
+    /// The identity this logical queue records in the submissions it publishes
+    /// ([`super::fence::Submission::origin`]): nonzero and unique on the device, so that
+    /// [`Self::input_sources`] can tell its own sources. 0 records none.
+    fn source_origin(&self) -> u64 { 0 }
 
     fn feed(&self) -> Option<Arc<super::feed::Feed>> {
         None
