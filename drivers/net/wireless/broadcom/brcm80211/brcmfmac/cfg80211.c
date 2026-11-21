@@ -6,6 +6,7 @@
 /* Toplevel file. Relies on dhd_linux.c to send commands to the dongle. */
 
 #include <linux/kernel.h>
+#include <linux/smp.h>
 #include <linux/etherdevice.h>
 #include <linux/inetdevice.h>
 #include <linux/module.h>
@@ -2471,6 +2472,62 @@ static void brcmf_connect_set_target(struct brcmf_cfg80211_profile *profile,
 		eth_zero_addr(profile->bssid);
 }
 
+static bool brcmf_join_canceling(struct brcmf_cfg80211_vif *vif)
+{
+	/* Pairs with brcmf_set_join_canceling(): observe completion setup. */
+	return smp_load_acquire(&vif->join_canceling);
+}
+
+static void brcmf_set_join_canceling(struct brcmf_cfg80211_vif *vif, bool pending)
+{
+	/* Publish preceding setup/teardown before callbacks observe the flag. */
+	smp_store_release(&vif->join_canceling, pending);
+}
+
+/*
+ * A replacement must not inherit completion of the cancelled firmware join.
+ * Keep the old profile until its terminal event. The callback signals this
+ * waiter without taking the wiphy lock held by the connect operation.
+ */
+static int brcmf_cancel_pending_join(struct brcmf_if *ifp)
+{
+	struct brcmf_cfg80211_vif *vif = ifp->vif;
+	struct brcmf_scb_val_le scb = {
+		.val = cpu_to_le32(WLAN_REASON_DEAUTH_LEAVING),
+	};
+	struct cfg80211_connect_resp_params failed = {
+		.status = WLAN_STATUS_AUTH_TIMEOUT,
+	};
+	int err;
+
+	if (!brcmf_join_canceling(vif)) {
+		reinit_completion(&vif->join_cancel_done);
+		brcmf_set_join_canceling(vif, true);
+		memcpy(scb.ea, vif->profile.bssid, ETH_ALEN);
+		err = brcmf_fil_cmd_data_set(ifp, BRCMF_C_DISASSOC, &scb, sizeof(scb));
+		if (err) {
+			brcmf_set_join_canceling(vif, false);
+			return -EBUSY;
+		}
+	}
+	if (!wait_for_completion_timeout(&vif->join_cancel_done,
+					 msecs_to_jiffies(1000))) {
+		/*
+		 * Fail the old host request once, but keep ignoring its firmware
+		 * completions until its terminal event. Never admit a new join yet.
+		 */
+		if (test_and_clear_bit(BRCMF_VIF_STATUS_CONNECTING, &vif->sme_state))
+			cfg80211_connect_done(ifp->ndev, &failed, GFP_KERNEL);
+		return -EBUSY;
+	}
+	clear_bit(BRCMF_VIF_STATUS_CONNECTING, &vif->sme_state);
+	clear_bit(BRCMF_VIF_STATUS_CONNECTED, &vif->sme_state);
+	clear_bit(BRCMF_VIF_STATUS_EAP_SUCCESS, &vif->sme_state);
+	clear_bit(BRCMF_VIF_STATUS_ASSOC_SUCCESS, &vif->sme_state);
+	brcmf_set_join_canceling(vif, false);
+	return 0;
+}
+
 static s32
 brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 		       struct cfg80211_connect_params *params)
@@ -2491,6 +2548,19 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 	s32 err = 0;
 
 	brcmf_dbg(TRACE, "Enter\n");
+	if (cfg->pub->bus_if->chip == BRCM_CC_4388_CHIP_ID &&
+	    ifp->vif->wdev.iftype == NL80211_IFTYPE_STATION &&
+	    (test_bit(BRCMF_VIF_STATUS_CONNECTING, &ifp->vif->sme_state) ||
+	     brcmf_join_canceling(ifp->vif))) {
+		if (ifp->vif->wdev.connected ||
+		    (profile->use_fwsup != BRCMF_PROFILE_FWSUP_SAE &&
+		     profile->use_fwsup != BRCMF_PROFILE_FWSUP_PSK))
+			return -EBUSY;
+		err = brcmf_cancel_pending_join(ifp);
+		if (err)
+			return err;
+	}
+
 	if (!check_vif_up(ifp->vif))
 		return -EIO;
 
@@ -7101,6 +7171,7 @@ struct brcmf_cfg80211_vif *brcmf_alloc_vif(struct brcmf_cfg80211_info *cfg,
 	vif->wdev.wiphy = cfg->wiphy;
 	vif->wdev.iftype = type;
 	init_completion(&vif->mgmt_tx);
+	init_completion(&vif->join_cancel_done);
 
 	brcmf_init_prof(&vif->profile);
 
@@ -7751,6 +7822,20 @@ brcmf_notify_connect_status(struct brcmf_if *ifp,
 		brcmf_proto_delete_peer(ifp->drvr, ifp->ifidx, (u8 *)e->addr);
 	}
 
+	if (brcmf_join_canceling(ifp->vif)) {
+		bool terminal =
+			(e->event_code == BRCMF_E_SET_SSID &&
+			 e->status != BRCMF_E_STATUS_SUCCESS) ||
+			(e->event_code == BRCMF_E_LINK && !e->flags) ||
+			e->event_code == BRCMF_E_DEAUTH ||
+			e->event_code == BRCMF_E_DEAUTH_IND ||
+			e->event_code == BRCMF_E_DISASSOC_IND;
+
+		if (terminal)
+			complete(&ifp->vif->join_cancel_done);
+		return 0;
+	}
+
 	if (brcmf_is_apmode(ifp->vif)) {
 		err = brcmf_notify_connect_status_ap(cfg, ndev, e, data);
 	} else if (brcmf_is_linkup(ifp->vif, e)) {
@@ -7809,6 +7894,9 @@ brcmf_notify_roaming_status(struct brcmf_if *ifp,
 	struct brcmf_cfg80211_info *cfg = ifp->drvr->config;
 	u32 event = e->event_code;
 	u32 status = e->status;
+
+	if (brcmf_join_canceling(ifp->vif))
+		return 0;
 
 	if (event == BRCMF_E_ROAM && status == BRCMF_E_STATUS_SUCCESS) {
 		if (test_bit(BRCMF_VIF_STATUS_CONNECTED,
