@@ -503,6 +503,22 @@ static void cd321x_tbt_sleep_router_ordered_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->last_state, TYPEC_THUNDERBOLT_SWITCH_WAKE);
 }
 
+/* A plain TPS6598x has no struct cd321x around it: its shutdown stops nothing. */
+static void cd321x_tbt_shutdown_plain_port_test(struct kunit *test)
+{
+	static const struct tipd_data plain = {
+		.tps_struct_size = sizeof(struct tps6598x),
+	};
+	struct cd321x_tbt_test *ctx = test->priv;
+	struct tps6598x *tps = kunit_kzalloc(test, sizeof(*tps), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, tps);
+	tps->data = &plain;
+	mutex_init(&tps->lock);
+	tipd_shutdown(tps);
+	KUNIT_EXPECT_EQ(test, ctx->set_calls, 0);
+}
+
 static struct kunit_case cd321x_tbt_cases[] = {
 	KUNIT_CASE(cd321x_tbt_no_router_test),
 	KUNIT_CASE(cd321x_tbt_router_bound_test),
@@ -517,6 +533,7 @@ static struct kunit_case cd321x_tbt_cases[] = {
 	KUNIT_CASE(cd321x_tbt_reboot_other_action_test),
 	KUNIT_CASE(cd321x_tbt_sleep_router_stops_itself_test),
 	KUNIT_CASE(cd321x_tbt_sleep_router_ordered_test),
+	KUNIT_CASE(cd321x_tbt_shutdown_plain_port_test),
 	{}
 };
 

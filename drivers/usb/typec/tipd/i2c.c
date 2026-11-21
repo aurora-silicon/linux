@@ -93,6 +93,12 @@ static int __maybe_unused tps6598x_resume(struct device *dev)
 	return ret;
 }
 
+/* Stops a USB4 session first when its switch asks for a PD-ordered stop. */
+static void tps6598x_shutdown_i2c(struct i2c_client *client)
+{
+	tipd_shutdown(i2c_get_clientdata(client));
+}
+
 static const struct dev_pm_ops tps6598x_pm_ops = {
 	.prepare = pm_sleep_ptr(tipd_prepare),
 	.complete = pm_sleep_ptr(tipd_complete),
@@ -122,6 +128,7 @@ static struct i2c_driver tps6598x_i2c_driver = {
 	},
 	.probe = tps6598x_probe_i2c,
 	.remove = tps6598x_remove_i2c,
+	.shutdown = tps6598x_shutdown_i2c,
 	.id_table = tps6598x_id,
 };
 module_i2c_driver(tps6598x_i2c_driver);

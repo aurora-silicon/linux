@@ -2633,8 +2633,11 @@ VISIBLE_IF_KUNIT int cd321x_session_pm(struct notifier_block *nb, unsigned long 
 		if (!cd->session_pm_armed)
 			return NOTIFY_DONE;
 		ret = cd321x_session_stop(cd, true);
-		if (ret)
+		if (ret) {
 			cd321x_session_restore(cd);
+			/* The PM core skips our POST_SUSPEND after a failed PREPARE. */
+			cd->session_pm_armed = false;
+		}
 		return notifier_from_errno(ret);
 	case PM_POST_SUSPEND:
 		if (cd->session_pm_armed)
@@ -3947,9 +3950,14 @@ EXPORT_SYMBOL_GPL(tipd_init);
 
 void tipd_shutdown(struct tps6598x *tps)
 {
-	struct cd321x *cd = container_of(tps, struct cd321x, tps);
+	struct cd321x *cd;
 	bool ordered;
 	int ret;
+
+	/* Only a port embedded in a struct cd321x has a USB4 session to stop. */
+	if (tps->data->tps_struct_size < sizeof(struct cd321x))
+		return;
+	cd = container_of(tps, struct cd321x, tps);
 
 	scoped_guard(mutex, &tps->lock)
 		ordered = typec_thunderbolt_switch_pd_ordered_stop(cd->tbt_switch);
