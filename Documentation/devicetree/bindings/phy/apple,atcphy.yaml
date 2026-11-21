@@ -354,7 +354,8 @@ properties:
     description: >
       T8132 only. The orientation of the lanes of apple,lane-config: the
       value of the PHY's atc-plug-orientation in Apple's device tree. 1 is
-      the unswapped orientation, USB3 on lane 0.
+      the normal (unswapped) orientation in Apple's device tree, USB3 on
+      lane 0.
 
   apple,tunable-usb3-axi2af:
     $ref: "#/$defs/apple,tunable"
