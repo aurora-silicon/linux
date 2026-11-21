@@ -732,3 +732,5 @@
 &ave {
 	status = "okay";
 };
+
+#include "t6041-pmgr.dtsi"
