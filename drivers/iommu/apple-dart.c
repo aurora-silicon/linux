@@ -69,6 +69,8 @@
 
 #define DART_MAX_STREAMS 256
 #define DART_MAX_TTBR 4
+/* The display streams apple_dart_display_keep() can keep: the first ENABLE_STREAMS word. */
+#define DART_KEEP_STREAMS 32
 #define MAX_DARTS_PER_DEVICE 8
 #define DART_PCIEC_PAGE_SHIFT 14
 #define DART_PCIEC_ADDR_WIDTH 42
@@ -552,6 +554,11 @@ struct apple_dart {
 
 	u32 save_tcr[DART_MAX_STREAMS];
 	u32 save_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
+
+	/* The locked display streams' words kept by apple_dart_display_keep(), under @lock. */
+	u32 keep_tcr[DART_KEEP_STREAMS];
+	u32 keep_ttbr[DART_KEEP_STREAMS][DART_MAX_TTBR];
+	u32 keep_streams;
 
 	u64 *locked_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
 	/* Values published by this driver into initially vacant root slots. */
@@ -7166,17 +7173,14 @@ static int apple_dart_tlb_command(struct apple_dart *dart, u32 command)
 					 DART_STREAM_COMMAND_BUSY_TIMEOUT);
 }
 
-/*
- * Nothing in flight: no fault (-EIO), and no TLB command or outstanding
- * transaction (-EBUSY, which can drain).
- */
-static int apple_dart_idle(struct apple_dart *dart)
+/* No TLB command and no transaction outstanding on any port: -EBUSY until then. */
+static int apple_dart_drained(struct apple_dart *dart)
 {
 	u32 params = readl(dart->regs + DART_PARAMS2);
 	unsigned int ports = max(FIELD_GET(DART_T8110_PARAMS2_READ_PORTS, params),
 				 FIELD_GET(DART_T8110_PARAMS2_WRITE_PORTS, params));
 
-	if (!ports || ports > 4 || apple_dart_fault_pending(dart))
+	if (!ports || ports > 4)
 		return -EIO;
 	if (readl(dart->regs + DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY)
 		return -EBUSY;
@@ -7184,6 +7188,17 @@ static int apple_dart_idle(struct apple_dart *dart)
 		if (readl(dart->regs + DART_T8110_OUTSTANDING(port)))
 			return -EBUSY;
 	return 0;
+}
+
+/*
+ * Nothing in flight: no fault (-EIO), and no TLB command or outstanding
+ * transaction (-EBUSY, which can drain).
+ */
+static int apple_dart_idle(struct apple_dart *dart)
+{
+	if (apple_dart_fault_pending(dart))
+		return -EIO;
+	return apple_dart_drained(dart);
 }
 
 /* Idle, giving transactions and a command just issued time to drain. */
@@ -7571,6 +7586,61 @@ int apple_dart_gapf_ready(struct device *dev)
 EXPORT_SYMBOL_GPL(apple_dart_gapf_ready);
 
 /*
+ * T6041: a display DART is locked, so the driver's suspend neither saves nor restores its TCR /
+ * TTBR words, and a real sleep loses them. Keep the words of @streams before the sleep (save),
+ * and after it write back what differs (!save), before the display firmware runs again.
+ * Returns how many words were written back, or a negative errno.
+ */
+int apple_dart_display_keep(struct device *dev, u32 streams, bool save)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	unsigned int sid, idx, n = 0;
+	unsigned long bits, flags;
+
+	if (!dart)
+		return -ENODEV;
+	if (dart->hw->ttbr_count > DART_MAX_TTBR)
+		return -EINVAL;
+	/* Only streams the DART has: no register past them is read. */
+	if (dart->num_streams < DART_KEEP_STREAMS)
+		streams &= GENMASK(dart->num_streams - 1, 0);
+	bits = streams;
+
+	spin_lock_irqsave(&dart->lock, flags);
+	if (!save && (dart->keep_streams & streams) != streams) {
+		spin_unlock_irqrestore(&dart->lock, flags);
+		return -ENOENT;
+	}
+	for_each_set_bit(sid, &bits, DART_KEEP_STREAMS) {
+		u32 tcr = readl(dart->regs + DART_TCR(dart, sid));
+
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
+			u32 ttbr = readl(dart->regs + DART_TTBR(dart, sid, idx));
+
+			if (save) {
+				dart->keep_ttbr[sid][idx] = ttbr;
+			} else if (ttbr != dart->keep_ttbr[sid][idx]) {
+				writel(dart->keep_ttbr[sid][idx],
+				       dart->regs + DART_TTBR(dart, sid, idx));
+				n++;
+			}
+		}
+		if (save) {
+			dart->keep_tcr[sid] = tcr;
+		} else if (tcr != dart->keep_tcr[sid]) {
+			writel(dart->keep_tcr[sid], dart->regs + DART_TCR(dart, sid));
+			n++;
+		}
+	}
+	if (save)
+		dart->keep_streams |= streams;
+	spin_unlock_irqrestore(&dart->lock, flags);
+
+	return n;
+}
+EXPORT_SYMBOL_GPL(apple_dart_display_keep);
+
+/*
  * What macOS writes to T8140's display DARTs around a display power cycle:
  * measured under aura, with the offsets the driver has no name for. It never
  * writes their TCR or TTBR, and reads the same values back after each power-on,
@@ -7641,6 +7711,27 @@ int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool fl
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dart_display_streams);
+
+/*
+ * After apple_dart_display_streams(@streams, off): the streams read disabled, and the DART has
+ * no TLB command and no transaction outstanding on any port, so the blocks behind it can be
+ * powered down. A pending fault doesn't hold that up. -EIO if a stream is still enabled,
+ * -ETIMEDOUT if the transactions did not drain.
+ */
+int apple_dart_display_streams_idle(struct device *dev, u32 streams)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	int ret, drained;
+
+	if (!dart)
+		return -ENODEV;
+	if (readl(dart->regs + DART_T8110_ENABLE_STREAMS) & streams)
+		return -EIO;
+	ret = read_poll_timeout_atomic(apple_dart_drained, drained, drained != -EBUSY, 1,
+				       DART_T8110_IDLE_TIMEOUT_US, false, dart);
+	return ret ?: drained;
+}
+EXPORT_SYMBOL_GPL(apple_dart_display_streams_idle);
 
 /*
  * A DART whose domain goes off with its consumer's, at runtime, while other users still map
