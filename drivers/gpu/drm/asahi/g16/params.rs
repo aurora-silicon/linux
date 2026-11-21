@@ -28,6 +28,26 @@ pub(crate) fn compute_deadline_ms() -> u32 {
     module_parameters::g16_compute_deadline_ms.value()
 }
 
+/// PB heap blocks of a new render arena (64 MiB in 128 KiB blocks).
+pub(crate) fn pb_heap_blocks() -> u32 {
+    64 * 8
+}
+
+/// PB blocks posted to a fresh epoch of a heap of `heap_blocks`.
+pub(crate) fn pb_posted_blocks(heap_blocks: u32) -> u32 {
+    2048u32.min(heap_blocks)
+}
+
+/// Compute units of a VM that submits compute back to back.
+pub(crate) fn compute_units() -> usize {
+    6usize.clamp(2, hw::sizes::COMPUTE_UNITS)
+}
+
+/// Compute commands in flight at most.
+pub(crate) fn compute_flights() -> usize {
+    16usize.clamp(1, hw::sizes::FLIGHTS)
+}
+
 /// Repoll while a ready prefix waits for record consumption, us.
 pub(crate) fn repoll_us() -> u32 {
     module_parameters::g16_repoll_us.value().clamp(5, 100)
