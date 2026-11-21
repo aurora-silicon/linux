@@ -1424,14 +1424,46 @@ static void apple_isp_fw_idle_work(struct work_struct *work)
 	mutex_unlock(&isp->video_lock);
 }
 
+/*
+ * A crashed firmware was forced off (an ISP assert, 2026-11-21: the stop
+ * command timed out, "coproc not in WFI"), so it never sent the camera module
+ * its power-down: the sensor stayed powered and its green light on until the
+ * next camera use. Firmware that starts again (hw->fw_restart) is booted once
+ * more and stopped the normal way, which powers the module down. Only once:
+ * a second crash is left as it is.
+ */
+static void apple_isp_fw_recover_work(struct work_struct *work)
+{
+	struct apple_isp *isp = container_of(to_delayed_work(work),
+					     struct apple_isp, fw_recover_work);
+	int err;
+
+	mutex_lock(&isp->video_lock);
+	if (isp->fw_state == ISP_FW_OFF) {
+		isp->fw_recovering = true;
+		err = apple_isp_firmware_boot(isp);
+		if (!err)
+			apple_isp_firmware_halt(isp);
+		isp->fw_recovering = false;
+		if (err)
+			dev_warn(isp->dev, "crashed firmware: restart to power the camera down failed (%d); the camera light may stay on until the next camera start\n",
+				 err);
+		else
+			dev_info(isp->dev, "crashed firmware: restarted and stopped it to power the camera down\n");
+	}
+	mutex_unlock(&isp->video_lock);
+}
+
 void apple_isp_firmware_init(struct apple_isp *isp)
 {
 	INIT_DELAYED_WORK(&isp->fw_idle_work, apple_isp_fw_idle_work);
+	INIT_DELAYED_WORK(&isp->fw_recover_work, apple_isp_fw_recover_work);
 }
 
 /* Stop idling firmware now, and wait for a stop that was due. */
 void apple_isp_firmware_flush(struct apple_isp *isp)
 {
+	cancel_delayed_work_sync(&isp->fw_recover_work);
 	if (!isp->hw->fw_idle_ms)
 		return;
 
@@ -1445,11 +1477,17 @@ void apple_isp_firmware_flush(struct apple_isp *isp)
 /* Stop the firmware; resident firmware without hw->fw_restart stays down. */
 void apple_isp_firmware_halt(struct apple_isp *isp)
 {
+	bool crashed;
+
 	/* Only a capture services the watchdog, but be sure. */
 	apple_isp_wdt_stop(isp);
 
 	if (isp->fw_state != ISP_FW_RUNNING)
 		return;
+
+	/* Before the shutdown, which marks every stopped firmware as failed. */
+	crashed = READ_ONCE(isp->ipc_error) && isp->hw->fw_restart &&
+		  !isp->fw_recovering;
 
 	isp_firmware_shutdown(isp);
 	pm_runtime_put_sync(isp->dev);
@@ -1457,4 +1495,7 @@ void apple_isp_firmware_halt(struct apple_isp *isp)
 	isp->fw_idle = false;
 	isp->fw_state = isp->hw->resident_fw && !isp->hw->fw_restart ?
 				ISP_FW_DEAD : ISP_FW_OFF;
+	if (crashed)
+		mod_delayed_work(system_dfl_wq, &isp->fw_recover_work,
+				 msecs_to_jiffies(500));
 }

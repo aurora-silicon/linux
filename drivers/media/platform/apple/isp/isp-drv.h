@@ -445,6 +445,12 @@ struct apple_isp {
 	/* firmware that starts again, idling until fw_idle_work stops it */
 	bool fw_idle;
 	struct delayed_work fw_idle_work;
+	/*
+	 * Firmware that crashed cannot power the camera module down (its
+	 * status light stays on): it is started once more and stopped cleanly.
+	 */
+	struct delayed_work fw_recover_work;
+	bool fw_recovering;
 	/* the camera was detected; until then a deferred start is pending */
 	bool camera_detected;
 	/* configurations the firmware has, once a deferred start detected them */
