@@ -8,8 +8,10 @@
 //! in hundredths of a performance state. Firmware power tables and policy
 //! words from other GPU generations are never modified here.
 //!
-//! The firmware runs at the published state, busy or not, so the host requests
-//! one from the GPU's busy share of each window, bounded by the ceiling.
+//! The 25G83 firmware runs at the published state, busy or not, so the host requests
+//! one from the GPU's busy share of each window, bounded by the ceiling. A firmware that
+//! powers the GPU down while idle is given the ceiling itself, which is what macOS 27.2
+//! publishes, through every idle period and wake.
 //!
 //! The firmware keeps GFX powered while the GPU idles, so the host reports
 //! when it has work in flight to the DT-selected CLPC, which holds the memory
@@ -271,10 +273,13 @@ impl Firmware {
         let now = now_ns();
         let idle = self.engine.flights.is_empty();
         let (limit, decision) = self.power.ceiling(now, idle);
-        let target = self
-            .power
-            .utilization
-            .govern(now, limit, !self.engine.flights.is_empty());
+        let target = if self.session.adt.layout.powered.is_some() {
+            limit
+        } else {
+            self.power
+                .utilization
+                .govern(now, limit, !self.engine.flights.is_empty())
+        };
         if decision {
             dev_info!(
                 self.dev(),
