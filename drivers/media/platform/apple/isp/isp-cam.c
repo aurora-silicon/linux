@@ -118,22 +118,22 @@ static const struct isp_setfile isp_setfiles[] = {
 /*
  * What macOS 27.2 sends the same H17 firmware on the J815, from a hypervisor
  * IPC trace (2026-11-20):
- * - the green camera LED's brightness, 529 at each start in a lit room. It is
- *   clamped to the range the firmware reports (CH_STATUS_LED_THR_GET,
- *   204..1023 on the J815), so the privacy LED can never be set dark;
+ * - the green camera LED's brightness, 529 at each start in a lit room (only
+ *   on T8142, where it was traced: hw->led_brightness). It is clamped to the
+ *   range the firmware reports (CH_STATUS_LED_THR_GET, 204..1023 on the
+ *   J815), so the privacy LED can never be set dark;
  * - AE stability 16 / to-stable 8 (other firmware: 32 / 20) and an AE gain
  *   cap of 96.0;
  * - on band-0 setfiles, TNR started with (1, 1, 0) and high strength on.
  * macOS ramps the LED with ambient light; the driver keeps the start value.
  */
-#define ISP_H17_LED_BRIGHTNESS 529
 
 static void isp_ch_configure_led(struct apple_isp *isp, u32 ch)
 {
 	u16 low, high, value;
 	int err;
 
-	if (isp->hw->fw_abi != ISP_FW_ABI_H17)
+	if (!isp->hw->led_brightness)
 		return;
 	err = isp_cmd_ch_status_led_thr_get(isp, ch, &low, &high);
 	if (err || !low || high < low) {
@@ -141,7 +141,7 @@ static void isp_ch_configure_led(struct apple_isp *isp, u32 ch)
 			 err, low, high);
 		return;
 	}
-	value = clamp_t(unsigned int, ISP_H17_LED_BRIGHTNESS, low, high);
+	value = clamp_t(unsigned int, isp->hw->led_brightness, low, high);
 	err = isp_cmd_ch_status_led_mbrightness_set(isp, ch, value);
 	dev_info(isp->dev, "camera LED brightness %u (range %u..%u)%s\n", value,
 		 low, high, err ? ": firmware refused" : "");

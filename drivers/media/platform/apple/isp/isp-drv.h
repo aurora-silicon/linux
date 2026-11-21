@@ -161,6 +161,8 @@ struct isp_preset {
 
 struct apple_isp_hw {
 	enum isp_generation gen;
+	/* camera LED brightness at each start (macOS's value), 0 = firmware default */
+	u16 led_brightness;
 	enum isp_fw_abi fw_abi;
 	u64 pmu_base;
 

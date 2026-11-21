@@ -1599,6 +1599,7 @@ static const struct apple_isp_hw apple_isp_hw_t8142 = {
 	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
 	.fw_mmio = apple_isp_fw_mmio_t8142,
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8142),
+	.led_brightness = 529,
 	.boot_mode = 1,
 	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
 	.resident_fw = true,
