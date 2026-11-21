@@ -770,7 +770,8 @@
 		};
 
 		dpxbar0: display-crossbar@40b04c000 {
-			compatible = "apple,t6020-display-crossbar";
+			compatible = "apple,t8140-display-crossbar",
+				     "apple,t6020-display-crossbar";
 			reg = <0x4 0x0b04c000 0x0 0x4000>;
 			#mux-control-cells = <1>;
 			status = "disabled";

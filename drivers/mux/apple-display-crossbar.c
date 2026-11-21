@@ -102,8 +102,16 @@ struct apple_dpxbar_hw {
 	const struct mux_control_ops *ops;
 	/* DP IN runs without the FIFO_RD_PCLK1 cycle-slip toggle (t600x) */
 	bool dpin_no_cycle_slip;
-	/* T6030 flow (route on select, clocks on link up) regardless of the machine */
+	/* T6030 flow: route on select, clocks on link up */
 	bool t6030_flow;
+	/*
+	 * The physical DP output (MUX_DPPHY) keeps the original T602x gate
+	 * sequence: its source and ATC gates (CROSSBAR_DISPEXT_EN,
+	 * CROSSBAR_ATC_EN) are not written, and its teardown restores the
+	 * read reset in FIFO_RD_PCLK1_EN rather than T602X_FIFO_RD_PCLK2_EN.
+	 * The DP IN outputs use the newer sequence. Set for the T8140 crossbar.
+	 */
+	bool dpphy_t602x_gates;
 	/* no UNK_TUNABLE write at probe */
 	bool no_tunable;
 	/* power domain held only while an output is selected */
@@ -377,8 +385,8 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 	unsigned int dispext_bit_en;
 	u32 atc_bit, mux_mask, mux_val;
 	bool enable;
-	/* J700 physical DP retains the original T602x clock-gate sequence. */
-	bool j700_physical = index == MUX_DPPHY && of_machine_is_compatible("apple,j700");
+	/* See apple_dpxbar_hw.dpphy_t602x_gates. */
+	bool dpphy_t602x = index == MUX_DPPHY && dpxbar->hw->dpphy_t602x_gates;
 	int ret = 0;
 
 	if (index >= MUX_MAX)
@@ -445,11 +453,11 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 		dpxbar_set32(dpxbar, T602X_REG_014, 0x4);
 
 		/* Native T602x DPIN0 teardown restores the read reset at +0x24. */
-		dpxbar_set32(dpxbar, j700_physical ? FIFO_RD_PCLK1_EN :
+		dpxbar_set32(dpxbar, dpphy_t602x ? FIFO_RD_PCLK1_EN :
 			     T602X_FIFO_RD_PCLK2_EN, atc_bit);
 
 		dpxbar_clear32(dpxbar, T602X_REG_034, atc_bit);
-		if (!j700_physical) {
+		if (!dpphy_t602x) {
 			dpxbar_clear32(dpxbar, CROSSBAR_ATC_EN, atc_bit);
 			dpxbar_clear32(dpxbar, CROSSBAR_DISPEXT_EN, prev_dispext_bit);
 		}
@@ -497,14 +505,14 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 			     index == MUX_DPIN1 ? FIFO_RD_PCLK1_EN : T602X_REG_01C,
 			     atc_bit);
 		dpxbar_set32(dpxbar, T602X_REG_034, atc_bit);
-		if (!j700_physical)
+		if (!dpphy_t602x)
 			dpxbar_set32(dpxbar, CROSSBAR_ATC_EN, atc_bit);
 		/*
 		 * t8103 enables the dispext source at 0x050. T602x left
 		 * that register at 0, so dpin0 was selected with no
 		 * source clock into the ACIO analog PHY.
 		 */
-		if (!j700_physical)
+		if (!dpphy_t602x)
 			dpxbar_set32(dpxbar, CROSSBAR_DISPEXT_EN, dispext_bit);
 
 		dpxbar_set32(dpxbar, T602X_FIFO_RD_UNK_EN, dispext_bit);
@@ -1322,7 +1330,7 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	spin_lock_init(&dpxbar->lock);
 
 	dpxbar->dev = dev;
-	dpxbar->t6030_dpin = hw->t6030_flow || of_machine_is_compatible("apple,t6030");
+	dpxbar->t6030_dpin = hw->t6030_flow;
 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpxbar->regs))
 		return PTR_ERR(dpxbar->regs);
@@ -1433,6 +1441,29 @@ static const struct apple_dpxbar_hw apple_dpxbar_hw_t6020 = {
 };
 
 /*
+ * T6030 (M3 Pro): the T6020 register map with the T6030 flow, where
+ * selecting an output only routes it and its link-up starts its clocks
+ * (apple_dpxbar_t6030_dpin_set()).
+ */
+static const struct apple_dpxbar_hw apple_dpxbar_hw_t6030 = {
+	.n_mux = MUX_MAX,
+	.n_ufp = 9,
+	.ops = &apple_dpxbar_t602x_ops,
+	.t6030_flow = true,
+};
+
+/*
+ * T8140: the T6020 register map; its physical DP output keeps the original
+ * T602x gate sequence (dpphy_t602x_gates).
+ */
+static const struct apple_dpxbar_hw apple_dpxbar_hw_t8140 = {
+	.n_mux = MUX_MAX,
+	.n_ufp = 9,
+	.ops = &apple_dpxbar_t602x_ops,
+	.dpphy_t602x_gates = true,
+};
+
+/*
  * T6040/T6041 (M4 Pro/Max): one crossbar per ATC (ADT atcN-dpxbar,
  * "atc-dpxbar,t604x"), 0x4000 bytes, no tunable. The block uses the T6030
  * compact register map and flow: the status mirrors at 0x804/0x810/0x81c
@@ -1492,6 +1523,14 @@ static const struct of_device_id apple_dpxbar_ids[] = {
 	{
 		.compatible = "apple,t6000-display-crossbar",
 		.data = &apple_dpxbar_hw_t6000,
+	},
+	{
+		.compatible = "apple,t6030-display-crossbar",
+		.data = &apple_dpxbar_hw_t6030,
+	},
+	{
+		.compatible = "apple,t8140-display-crossbar",
+		.data = &apple_dpxbar_hw_t8140,
 	},
 	{
 		.compatible = "apple,t6020-display-crossbar",
