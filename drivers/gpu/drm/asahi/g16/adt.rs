@@ -24,6 +24,8 @@ pub(crate) struct GpuAdt {
     pub(crate) text: Range<u64>,
     pub(crate) data: Range<u64>,
     pub(crate) performance: perf::Source,
+    /// The firmware layout the boot loader's handoff describes.
+    pub(crate) layout: &'static hw::FwLayout,
 }
 
 /// Find the one original-ADT phram export, with explicit 64-bit reservation cells.
@@ -118,18 +120,44 @@ fn performance_source(regions: &[Range<u64>]) -> Result<(KVVec<u8>, u64)> {
     Ok((copy?, start))
 }
 
-/// Validates the FDT contract and returns the reserved physical regions, read-only.
-pub(crate) fn read(dev: &device::Device) -> Result<GpuAdt> {
+/// The boot loader's handoff for the loaded firmware: its version, segment VAs and flags.
+fn handoff(dev: &device::Device) -> Result<(u32, KVec<u64>, KVec<u32>)> {
     let node = dev.of_node().ok_or(EINVAL)?;
     let version: u32 = node.get_property(c_str!("apple,g16-handoff-version"))?;
     let vas: KVec<u64> = node.get_property(c_str!("apple,firmware-segment-vas"))?;
     let flags: KVec<u32> = node.get_property(c_str!("apple,firmware-segment-flags"))?;
+    Ok((version, vas, flags))
+}
+
+/// The firmware layout the boot loader's handoff describes, if it describes a known one.
+pub(crate) fn layout(dev: &device::Device) -> Option<&'static hw::FwLayout> {
+    let (version, vas, flags) = handoff(dev).ok()?;
+    hw::FW_LAYOUTS
+        .iter()
+        .copied()
+        .find(|layout| layout.matches(version, &vas, &flags))
+}
+
+/// Validates the FDT contract and returns the reserved physical regions, read-only.
+pub(crate) fn read(dev: &device::Device) -> Result<GpuAdt> {
+    let node = dev.of_node().ok_or(EINVAL)?;
+    let (version, vas, flags) = handoff(dev)?;
     let names: KVec<u8> = node.get_property(c_str!("memory-region-names"))?;
     let phandles: KVec<u32> = node.get_property(c_str!("memory-region"))?;
-    if version != 1
-        || vas.as_slice() != [hw::UPPER, hw::UPPER + 0x60000]
-        || flags.as_slice() != [1, 0]
-        || phandles.len() != 6
+    let layout = hw::FW_LAYOUTS
+        .iter()
+        .copied()
+        .find(|layout| layout.matches(version, &vas, &flags));
+    let Some(layout) = layout else {
+        dev_err!(
+            dev,
+            "G16: unsupported boot-loader handoff (version {}, {} segments)\n",
+            version,
+            vas.len()
+        );
+        return Err(EINVAL);
+    };
+    if phandles.len() != 6
         || names.as_slice() != b"ttbs\0pagetables\0handoff\0shared-l2\0fw-text\0fw-data\0"
     {
         dev_err!(dev, "G16: unsupported boot-loader handoff contract\n");
@@ -148,8 +176,8 @@ pub(crate) fn read(dev: &device::Device) -> Result<GpuAdt> {
         hw::TABLES_SIZE,
         hw::HANDOFF_SIZE,
         hw::SHARED_L2_SIZE,
-        0x60000,
-        0x13c000,
+        layout.text_size,
+        layout.data_size,
     ];
     let mut regions: [Range<u64>; 6] = Default::default();
     for (index, (name, expected)) in names.iter().zip(sizes).enumerate() {
@@ -203,5 +231,6 @@ pub(crate) fn read(dev: &device::Device) -> Result<GpuAdt> {
         text,
         data,
         performance,
+        layout,
     })
 }

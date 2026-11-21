@@ -12,6 +12,12 @@ static inline bool apple_pmp_j713_board(void)
 	return apple_t8132_pmp_path();
 }
 
+/* T8132 boards on which Linux retains the PMP firmware session: every M4 Mac. */
+static inline bool apple_pmp_t8132_retained_board(void)
+{
+	return apple_t8132_pmp_path();
+}
+
 struct device;
 struct apple_pmp_display;
 

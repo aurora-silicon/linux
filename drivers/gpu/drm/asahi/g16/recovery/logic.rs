@@ -25,11 +25,8 @@ pub(crate) const fn ring_passed(c: u32, b: u32, h: u32, t: u32, m: u32) -> bool 
     dh <= dc && dc <= dt
 }
 
-/// FirmwareData words and affected-work snapshot geometry.
-pub(crate) const SNAPSHOT: usize = 0x40b8;
-pub(crate) const SNAPSHOT_ENTRIES: usize = 448;
-pub(crate) const GENERATION: usize = 0x4fa0;
-pub(crate) const PHASE: usize = 0x4fb0;
+// The FirmwareData words (phase, generation, affected-work snapshot) are per firmware ABI:
+// `fw::initdata::FirmwareData`.
 pub(crate) const RECOVERY_BUDGET_NS: u64 = 1_000_000_000;
 pub(crate) const EVENT_WAIT_NS: u64 = 50_000_000;
 pub(crate) const WINDOW_NS: u64 = 10_000_000_000;
@@ -227,8 +224,6 @@ mod tests {
                 .event,
             15
         );
-        assert_eq!(SNAPSHOT + SNAPSHOT_ENTRIES * 8, 0x4eb8);
-        assert!(SNAPSHOT + SNAPSHOT_ENTRIES * 8 <= GENERATION);
     }
 
     #[test]
@@ -246,7 +241,6 @@ mod tests {
 
     #[test]
     fn deadlines_are_absolute_and_do_not_wrap() {
-        assert_eq!(PHASE, 0x4fb0);
         let first_record_ns = 5_000_000_000;
         let deadline = first_record_ns + RECOVERY_BUDGET_NS;
         assert!(!expired(deadline, deadline));
