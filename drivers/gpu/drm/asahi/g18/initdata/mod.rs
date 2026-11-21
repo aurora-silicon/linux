@@ -501,7 +501,9 @@ impl G18FirmwareMemory {
         // bit9 (global 0x1093e5 bit1), the native stall diagnostic category.
         // audit-g18-graphics-stall.py executes that original predicate.
         let graphics_stall_trace = crate::g18::params::g18_graphics_stall_trace.value() == 1;
-        let trace_mask = if graphics_stall_trace { 0x203 } else { 3 };
+        // No per-job trace records unless asked for (g18_fw_trace).
+        let trace_mask = if graphics_stall_trace { 0x203 }
+            else if crate::g18::params::g18_fw_trace.value() != 0 { 3 } else { 0 };
         self.private.write_u32(trace, trace_mask)?;
         // b000 refresh 0x352c/0x3688 copies region-C+0x9ac into
         // global 0x109488. Its compute nibble (bits8..11) selects native

@@ -43,10 +43,21 @@ const JOB_WATCHDOG_MS: u32 = 10_000;
 const RECOVERED_RETIRE_MS: u32 = 2000;
 
 /// Poll interval for a wait that has lasted `us`: fine while a job is
-/// likely to be about to retire, coarse once it has clearly not.
+/// likely to be about to retire, coarse once it has clearly not. Full-panel
+/// jobs take 2-10 ms, so the fine interval covers them.
 pub(super) const fn poll_interval_us(us: i64) -> i64 {
-    if us < 2_000 { 20 } else if us < 50_000 { 200 } else { 1_000 }
+    if us < 20_000 { 20 } else if us < 50_000 { 200 } else { 1_000 }
 }
+
+/// Set by a job's retirement check once its stages have finished (the
+/// scheduler's completed count or the stage stamps): the conditions that
+/// remain follow within 50-150 us. One job is in flight at a time, under the
+/// session lock; wait_job clears this before its first poll.
+pub(super) static RETIRE_NEAR: AtomicBool = AtomicBool::new(false);
+/// How long wait_job re-polls without sleeping after RETIRE_NEAR, and the
+/// delay between those polls.
+const RETIRE_NEAR_SPIN_US: i64 = 200;
+const RETIRE_NEAR_STEP_US: i64 = 2;
 
 /// Upper bounds, in microseconds, of the latency buckets; the last bucket is
 /// open-ended.
@@ -392,6 +403,8 @@ impl G18Session {
         let mut recovery: Option<G18Recovery> = None;
         let mut since = Instant::<Monotonic>::now();
         let mut reported = 0u32;
+        let mut near_since: Option<i64> = None;
+        RETIRE_NEAR.store(false, Ordering::Relaxed);
         loop {
             if let Some(serviced) = self.poll_faults(label)? {
                 if recovery.is_none() {
@@ -425,6 +438,15 @@ impl G18Session {
                 recovery = Some(self.recover(label, true)?);
                 since = Instant::<Monotonic>::now();
                 reported = 0;
+            }
+            // Stages finished and no recovery: the last conditions are a few
+            // tens of microseconds away, less than one sleeping poll.
+            if recovery.is_none() && RETIRE_NEAR.load(Ordering::Relaxed) {
+                let first = *near_since.get_or_insert(us);
+                if us - first < RETIRE_NEAR_SPIN_US {
+                    kernel::time::delay::udelay(Delta::from_micros(RETIRE_NEAR_STEP_US));
+                    continue;
+                }
             }
             fsleep(Delta::from_micros(poll_interval_us(us)));
         }
