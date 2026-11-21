@@ -148,7 +148,7 @@ impl Firmware {
             "G16 {}: host generation {:?}, GPU pstate {:?} (top {}), host ceiling S{}, {} flights, {} pending, {} long commands\n",
             why,
             self.session.regs.generation(),
-            self.session.pstate(),
+            self.session.regs.pstate(),
             self.session.regs.top(),
             self.power.effective,
             self.engine.flights.len(),
@@ -367,7 +367,7 @@ impl Firmware {
             self.dev(),
             "G16: fail-stop ({:?}): GPU pstate {:?} (top {}), host ceiling S{} -> {}, temperature {} mC\n",
             error,
-            self.session.pstate(),
+            self.session.regs.pstate(),
             self.session.regs.top(),
             before,
             if floored { "S1" } else { "unchanged (Globals unwritable)" },
@@ -557,12 +557,10 @@ impl Firmware {
         // firmware can force the stage target while aborting a work item.
         let stage = self.recovery_snapshot()?;
         // Powered down, the GPU holds no fault to read.
-        let fault = self.session.engine_state()?.unwrap_or_default();
-        let asid = fault
-            .status
-            .iter()
-            .find(|status| **status & 1 != 0)
-            .map(|status| ((*status >> 17) & 0x3f) as u32)
+        let fault = self.session.fault_scan()?.unwrap_or_default();
+        let asid = Some(fault.status)
+            .filter(|status| status & 1 != 0)
+            .map(|status| ((status >> 17) & 0x3f) as u32)
             .filter(|asid| *asid >= 1);
         let deadline = start.saturating_add(logic::RECOVERY_BUDGET_NS);
         let mut answered = false;
