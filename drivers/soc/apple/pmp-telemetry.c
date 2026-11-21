@@ -16,11 +16,15 @@
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/soc/apple/pmp-temps.h>
 #include <linux/soc/apple/pmp-power-policy.h>
-#include <linux/soc/apple/t8132.h>
 
 bool apple_pmp_telemetry_retained_board(void)
 {
-	return apple_t8132_firmware_path();
+	struct device_node *np = of_find_compatible_node(NULL, NULL,
+							 "apple,t8132-pmp-v2");
+	bool match = np && of_device_is_available(np);
+
+	of_node_put(np);
+	return match;
 }
 
 static LIST_HEAD(apple_pmp_telemetry_list);
