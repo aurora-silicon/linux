@@ -208,6 +208,12 @@ struct dcp_brightness {
 	u32 fade_from;
 	u32 fade_to;
 	bool fading;
+	/*
+	 * Without the present-coupled policy: the level the last present set
+	 * (struct dcp_bl_presented), while nits is the firmware's report.
+	 * Under the backlight lock.
+	 */
+	struct dcp_bl_presented presented;
 };
 
 struct audiosrv_data;
