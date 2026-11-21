@@ -143,6 +143,9 @@ struct PmpState {
     allocs: KVec<PmpAllocation>,
     value_buf: Option<u64>,
     ioreg_entries: KVec<u32>,
+    /// The firmware's own index of each entry in `ioreg_entries` (word 0x48 of its
+    /// REGISTER_IOREG buffer), which UPDATE_IOREG names.
+    ioreg_ids: KVec<u32>,
     /// Held from a system sleep's start until its end.
     sram: Option<SramCopy>,
 }
@@ -154,6 +157,7 @@ impl PmpState {
             allocs: KVec::with_capacity(10, GFP_KERNEL)?,
             value_buf: None,
             ioreg_entries: KVec::with_capacity(340, GFP_KERNEL)?,
+            ioreg_ids: KVec::with_capacity(340, GFP_KERNEL)?,
             sram: None,
         })
     }
@@ -391,6 +395,14 @@ impl PmpData {
         let mut size = u32::from_le_bytes(unsafe {
             <&[u8] as TryInto<[u8; 4]>>::try_into(&msg_buf.as_ref()[0x40..0x44]).unwrap()
         });
+        let id = if msg_buf.size() >= 0x4c {
+            // SAFETY: TODO
+            u32::from_le_bytes(unsafe {
+                <&[u8] as TryInto<[u8; 4]>>::try_into(&msg_buf.as_ref()[0x48..0x4c]).unwrap()
+            })
+        } else {
+            u32::MAX
+        };
         if size == 0 {
             let mut name_vec = KVec::with_capacity(0x31, GFP_KERNEL)?;
             name_vec
@@ -438,6 +450,7 @@ impl PmpData {
             }
         }
         state.ioreg_entries.push(size, GFP_KERNEL)?;
+        state.ioreg_ids.push(id, GFP_KERNEL)?;
         let index = state.ioreg_entries.len() as u64;
         let msg = (OPC_REGISTER_IOREG | OPC_ACK_MASK) << OPC_SHIFT | (index << 32) | size as u64;
         Ok(msg)
@@ -590,13 +603,36 @@ impl PmpData {
         // and `control` is inside the ASC mapping held by `self`.
         to_result(unsafe { bindings::apple_rtkit_sleep_return(rtk, control) })
     }
-    /// CONFIRM_IOREG's value: 8 on the T8132 27.2 PMP image, as macOS sends it; 0 elsewhere.
-    fn confirm_ioreg_value() -> u64 {
+    /// CONFIRM_IOREG's value on the T8132 27.2 PMP image: the registered length of the entry the
+    /// firmware names by its own index (8 for the ioregs 0x17c, 0x17f, 0x182 and 0x18a it
+    /// updates on the J773g); 0 elsewhere.
+    fn confirm_ioreg_value(&self, id: u64) -> u64 {
         // SAFETY: the predicate only reads the machine's compatible and /chosen.
-        if unsafe { apple_pmp_t8132_self_starts() } {
-            CONFIRM_IOREG_272
-        } else {
-            0
+        if !unsafe { apple_pmp_t8132_self_starts() } {
+            return 0;
+        }
+        let state = self.state.lock();
+        let found = state
+            .ioreg_ids
+            .iter()
+            .position(|&e| e as u64 == id)
+            .and_then(|i| state.ioreg_entries.get(i).copied());
+        drop(state);
+        match found {
+            Some(len) => {
+                dev_dbg!(self.dev, "UPDATE_IOREG {:#x}: confirming its {} bytes\n", id, len);
+                len as u64
+            }
+            None => {
+                // Not seen on the J773g: keep confirming 8, the value the traces show.
+                dev_warn!(
+                    self.dev,
+                    "UPDATE_IOREG {:#x} names no registered entry; confirming {}\n",
+                    id,
+                    CONFIRM_IOREG_272
+                );
+                CONFIRM_IOREG_272
+            }
         }
     }
     fn recv_message(&self, msg: u64) -> Result<()> {
@@ -627,7 +663,9 @@ impl PmpData {
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
             // Firmware waits for this confirmation before publishing reports.
             // Do not echo the registry index/payload or add a generic ACK bit.
-            OPC_UPDATE_IOREG => OPC_CONFIRM_IOREG << OPC_SHIFT | Self::confirm_ioreg_value(),
+            OPC_UPDATE_IOREG => {
+                OPC_CONFIRM_IOREG << OPC_SHIFT | self.confirm_ioreg_value(msg & SET_IOREG_INDEX_MASK)
+            }
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
                 return Err(EIO);
