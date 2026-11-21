@@ -645,9 +645,83 @@ static bool presets_full;
 module_param(presets_full, bool, 0444);
 MODULE_PARM_DESC(presets_full, "TEST: same as sensor_config=7 (default: false)");
 
-static int sensor_config = 6;
+/*
+ * Default 9: on the J815 A/B of 2026-11-21 (1920x1080, frame-to-frame noise)
+ * config 6 had 2.4x the centre luma noise of the binned modes without
+ * Apple's ANE denoiser (MLVNR), and 9 + HR matched 8 with highlight recovery.
+ */
+static int sensor_config = 9;
 module_param(sensor_config, int, 0444);
-MODULE_PARM_DESC(sensor_config, "TEST: IMX958 sensor mode for the binned DT presets: 6 = full res + SIFR (macOS, default), 7 = full res, 9 = binned + SIFR, 8/0 = binned (DT)");
+MODULE_PARM_DESC(sensor_config, "TEST: IMX958 sensor mode for the binned DT presets: 9 = binned + SIFR (default), 6 = full res + SIFR (macOS), 7 = full res, 8/0 = binned (DT)");
+
+/*
+ * The IMX958's ultra-wide lens draws an image circle smaller than the
+ * sensor: outside it the picture is black. macOS never shows that part (it
+ * frames a 1.5x zoom and dewarps); the DT crops take the full sensor width
+ * and so show black corners. On a J815 (config 8 frames, 2026-11-21) the
+ * 1520x856 16:9 crop went dark at 0.855 and 0.895 of its half-diagonal at
+ * the bottom corners and 0.96 at the top: the circle's centre sits about
+ * 5 % of the height above the sensor's, radius ~0.53 of the width.
+ *
+ * lens_circle: the usable radius in per mille of the input width, about the
+ * input centre moved down by lens_center_y per mille of the input height
+ * (negative = up). A crop whose corners leave the circle is scaled about
+ * its centre, aspect kept, until they fit. The default fits the worst
+ * (bottom-left) corner with a margin and no shift, so it holds for a lens
+ * centred differently. 0 = the DT crops.
+ */
+static unsigned int lens_circle = 470;
+module_param(lens_circle, uint, 0444);
+MODULE_PARM_DESC(lens_circle, "IMX958: usable lens circle radius, per mille of the input width (default 470; 0 = DT crops)");
+
+static int lens_center_y;
+module_param(lens_center_y, int, 0444);
+MODULE_PARM_DESC(lens_center_y, "IMX958: lens circle centre below the input centre, per mille of the input height (default 0)");
+
+static bool isp_crop_in_circle(s64 ox, s64 oy, u32 w, u32 h, s64 r)
+{
+	s64 dx = abs(ox) + w / 2, dy = abs(oy) + h / 2;
+
+	return dx * dx + dy * dy <= r * r;
+}
+
+static void isp_preset_fit_lens(struct device *dev, struct isp_preset *p)
+{
+	u32 in_w = p->input_dim.x, in_h = p->input_dim.y;
+	u32 w = p->crop_size.x, h = p->crop_size.y, lo = 0, hi = 1024, s, nw, nh;
+	s64 r, ccx, ccy, ox, oy;
+
+	if (!lens_circle || p->index < 6 || p->index > 9 ||
+	    !((in_w == 1520 && in_h == 1440) || (in_w == 3040 && in_h == 2880)))
+		return;
+	r = (s64)lens_circle * in_w / 1000;
+	ccx = in_w / 2;
+	ccy = in_h / 2 + (s64)lens_center_y * in_h / 1000;
+	/* crop centre relative to the circle's, doubled to stay integer */
+	ox = 2 * (s64)p->crop_offset.x + w - 2 * ccx;
+	oy = 2 * (s64)p->crop_offset.y + h - 2 * ccy;
+	if (isp_crop_in_circle(ox, oy, 2 * w, 2 * h, 2 * r))
+		return;
+	/* largest scale s/1024 of the crop whose corners are inside */
+	while (hi - lo > 1) {
+		s = (lo + hi) / 2;
+		if (isp_crop_in_circle(ox, oy, 2 * w * s / 1024, 2 * h * s / 1024, 2 * r))
+			lo = s;
+		else
+			hi = s;
+	}
+	nw = round_down(w * lo / 1024, 2);
+	nh = round_down(h * lo / 1024, 2);
+	if (nw < 64 || nh < 64)
+		return;
+	dev_dbg(dev, "%ux%u preset: crop %ux%u+%u+%u -> %ux%u (lens circle)\n",
+		p->output_dim.x, p->output_dim.y, w, h, p->crop_offset.x,
+		p->crop_offset.y, nw, nh);
+	p->crop_offset.x = round_down(p->crop_offset.x + (w - nw) / 2, 2);
+	p->crop_offset.y = round_down(p->crop_offset.y + (h - nh) / 2, 2);
+	p->crop_size.x = nw;
+	p->crop_size.y = nh;
+}
 
 static int apple_isp_init_presets(struct apple_isp *isp)
 {
@@ -720,6 +794,7 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 			preset->crop_size.x *= 2;
 			preset->crop_size.y *= 2;
 		}
+		isp_preset_fit_lens(dev, preset);
 
 		preset++;
 	}
