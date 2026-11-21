@@ -55,6 +55,25 @@ properties:
       register 0x50, then SSPS 0x02. At an attach, SSPS 0x00, then USBw 0x00
       after the attach's debounce.
 
+  apple,sleep-ssps-rules:
+    type: boolean
+    description:
+      Talk to the controller under the sleep's rules. For its system power
+      state command, wake it on its bus first and read the command's end at
+      intervals rather than back to back. For every command, count one found
+      done on a read made past its limit as done. A controller that does not
+      take S3 refuses the sleep. The controllers that need these rules are
+      polled on their bus and miss or delay a command's end when read back to
+      back.
+
+  apple,reset-on-failed-probe:
+    type: boolean
+    description:
+      The previous boot can leave the controller in the middle of a command,
+      so its first probe can fail on the reads that follow. Probe it again a
+      few times after waits, with a cold reset before a late try, before
+      deferring the probe.
+
   apple,debug-lock-key:
     $ref: /schemas/types.yaml#/definitions/string
     pattern: "^.{4}$"
