@@ -1529,8 +1529,9 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state);
  * the attach: the events and status read, then DATA1 = 0x00 and SSPS; ~530 ms later
  * SYS_PWR_STATE read twice, DATA1 = 0x00 and USBw. Linux sent neither outside a sleep, so after a
  * cable change the controller was left as the change left it. Here: SSPS 0x02 at a detach, SSPS
- * 0x00 at an attach and USBw 0x00 at the update after the attach's debounce (500 ms), on every
- * SN201202x of the J714s, only while running (not in a sleep's phases).
+ * 0x00 at an attach and USBw 0x00 at the update after the attach's debounce (500 ms), for an
+ * SN201202x whose DT asks for it (apple,cable-change-ssps, the traced J714s's USB-C ports), only
+ * while running (not in a sleep's phases).
  */
 #define TIPD_SSPS_MACOS_DETACHED	0x02
 /*
@@ -1540,14 +1541,20 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state);
  */
 #define TIPD_REG_MACOS_DETACH		0x50
 
-/* Only the USB-C ports' controllers, as traced: MagSafe's has no connector */
+/*
+ * An SN201202x whose DT asks for macOS's cable-change sequence (apple,cable-change-ssps), and only
+ * a USB-C port's, as traced: MagSafe's has no connector. Not a controller in a debug route, from
+ * before Linux or opened through debugfs: that route is its owner's, and gets no power state
+ * commands.
+ */
 static bool cd321x_macos_cable_port(struct cd321x *cd321x)
 {
-	struct device *dev = cd321x->tps.dev;
+	struct tps6598x *tps = &cd321x->tps;
+	struct device *dev = tps->dev;
 	struct fwnode_handle *con;
 
-	if (!device_is_compatible(dev, "apple,sn201202x") ||
-	    !of_machine_is_compatible("apple,j714s"))
+	if (!device_is_compatible(dev, "apple,sn201202x") || tps->dbma_at_probe ||
+	    tipd_debugfs_dbma_held(tps) || !device_property_read_bool(dev, "apple,cable-change-ssps"))
 		return false;
 	con = device_get_named_child_node(dev, "connector");
 	fwnode_handle_put(con);
