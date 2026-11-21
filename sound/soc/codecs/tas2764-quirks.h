@@ -103,19 +103,17 @@ static const struct reg_sequence tas2764_shutdown_dance_init_seq[] = {
 	 * the shutdown is immediate and there's no grace period
 	 * followed by the codec part.
 	 */
-	REG_SEQ0(TAS2764_REG(0x0, 0x7), 0x60),
+	REG_SEQ0(TAS2764_MISC_CFG2, TAS2764_MISC_CFG2_SDZ_MODE_IMMEDIATE |
+					  TAS2764_MISC_CFG2_SDZ_TIMEOUT_6MS),
 };
 
 /*
- * macOS writes 0x68 here at initialisation: SDZ_MODE=01 (immediate),
- * as the shutdown dance sets it, plus bit 3. Unlike the dance, this
- * applies whether or not the dance is enabled, and runs after it.
+ * macOS writes 0x68 to MISC_CFG2 at initialisation: immediate SDZ as the
+ * shutdown dance sets it, the 6 ms SDZ timeout, and DVC_RAMP_RATE=10b
+ * (volume ramps 0.5 dB per 8 samples instead of per sample). Only the
+ * ramp rate field is written here; SDZ_MODE stays with the dance quirk.
  */
-#define TAS2764_SDZ_MODE_INIT		BIT(8)
-
-static const struct reg_sequence tas2764_sdz_mode_init_seq[] = {
-	REG_SEQ0(TAS2764_REG(0x0, 0x7), 0x68),
-};
+#define TAS2764_DVC_RAMP_INIT		BIT(8)
 
 static const struct reg_sequence tas2764_pre_shutdown_seq[] = {
 	REG_SEQ0(TAS2764_REG(0xfd, 0x0d), 0xd), /* switch hidden page */
@@ -188,7 +186,6 @@ static const struct tas2764_quirk_init_sequence {
 	{ tas2764_unk_seq2, ARRAY_SIZE(tas2764_unk_seq2) },
 	{ tas2764_thermal_th1_dis_seq, ARRAY_SIZE(tas2764_thermal_th1_dis_seq) },
 	{ tas2764_shutdown_dance_init_seq, ARRAY_SIZE(tas2764_shutdown_dance_init_seq) },
-	{ tas2764_sdz_mode_init_seq, ARRAY_SIZE(tas2764_sdz_mode_init_seq) },
 };
 
 #endif /* __TAS2764_QUIRKS__ */
