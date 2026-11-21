@@ -1320,6 +1320,7 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 		}
 		devinfo->wowl_irq = true;
 		bus->wowl_wake = true;
+		bus->wowl_s2idle_only = true;
 	}
 	devinfo->irq_allocated = true;
 	return 0;
@@ -1351,6 +1352,7 @@ static void brcmf_pcie_release_irq(struct brcmf_pciedev_info *devinfo)
 		devinfo->wakeup_created = false;
 	}
 	devinfo->wowl_irq = false;
+	bus->wowl_s2idle_only = false;
 	brcmf_pcie_intr_disable(devinfo);
 	free_irq(pdev->irq, devinfo);
 	pci_disable_msi(pdev);

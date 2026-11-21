@@ -9,6 +9,7 @@
 #include <linux/etherdevice.h>
 #include <linux/inetdevice.h>
 #include <linux/module.h>
+#include <linux/suspend.h>
 #include <linux/vmalloc.h>
 #include <net/cfg80211.h>
 #include <net/netlink.h>
@@ -5263,6 +5264,17 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 	/* end any scanning */
 	if (test_bit(BRCMF_SCAN_STATUS_BUSY, &cfg->scan_status))
 		brcmf_abort_scanning(cfg);
+
+	/* An in-band MSI cannot wake the host once the link goes down, so a
+	 * deeper sleep than suspend-to-idle leaves the network, as without
+	 * WoWLAN, instead of failing the whole system suspend.
+	 */
+	if (wowl && cfg->pub->bus_if->wowl_s2idle_only &&
+	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE) {
+		bphy_info_once(cfg->pub,
+			       "WoWLAN wakes only from suspend-to-idle here, sleeping without it\n");
+		wowl = NULL;
+	}
 
 	if (wowl == NULL) {
 		brcmf_bus_wowl_config(cfg->pub->bus_if, false);

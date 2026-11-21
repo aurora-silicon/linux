@@ -43,7 +43,7 @@ typedef int32_t s32; typedef uint32_t u32; typedef uint8_t u8; typedef uint32_t 
 #define smp_load_acquire(p) (*(p))
 #define brcmf_dbg(...) ((void)0)
 #define bphy_err(...) ((void)drvr)
-#define bphy_info_once(...) ((void)drvr)
+#define bphy_info_once(d, ...) ((void)(d))
 #define brcmf_info(...) ((void)0)
 #define brcmf_err(...) ((void)0)
 #define __brcmf_err(...) ((void)0)
@@ -72,6 +72,7 @@ struct brcmf_pciedev_info { bool mbdata_completed, intr, ready, timer, sleep_res
  struct { int intmask, mailboxmask; } *reginfo; };
 struct pcie_priv { struct brcmf_pciedev_info *devinfo; };
 struct brcmf_bus { enum brcmf_bus_state state; struct brcmf_pub *drvr; bool wowl_transport, wowl_wake;
+ bool wowl_s2idle_only;
  struct { struct pcie_priv *pcie; } bus_priv; };
 struct brcmf_proto { void *pd; };
 struct brcmf_pub { struct brcmf_bus *bus_if; struct brcmf_if *iflist[BRCMF_MAX_IFS];
@@ -219,7 +220,8 @@ static void brcmf_cfg80211_sched_scan_stop(struct wiphy *w,struct net_device *n,
 static void brcmf_fweh_unregister(struct brcmf_pub *p,int e) {(void)p;(void)e;}
 #define brcmf_fweh_register(p,e,f) ((void)(p),(void)(e))
 static void brcmf_abort_scanning(struct brcmf_cfg80211_info *c) {(void)c;can_command();}
-static void brcmf_bus_wowl_config(struct brcmf_bus *b,bool e) {(void)b;(void)e;}
+static unsigned wowl_offs;
+static void brcmf_bus_wowl_config(struct brcmf_bus *b,bool e) {(void)b;if(!e)wowl_offs++;}
 static void brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {(void)v;(void)r;(void)b;can_command();}
 static void brcmf_delay(int t) {(void)t;}
 static void brcmf_set_mpc(struct brcmf_if *i,int v) {(void)i;(void)v;can_command();}
@@ -351,6 +353,18 @@ for(int up=0;up<2;up++)for(int fail=0;fail<2;fail++) {
   assert(msgbuf.flowring_work.queued && msgbuf.txflow_work.queued);
   assert(!d0_informs && !removes && !probes);cases++;
  }
+ /* WoWLAN over an in-band MSI only wakes from s2idle: a deeper target sleeps
+  * as without WoWLAN (network left, WoWLAN off on the bus) instead of
+  * failing the suspend; s2idle, and a bus with a real wake line, keep it. */
+ for(int only=0;only<2;only++)for(int deep=0;deep<2;deep++) {
+  static struct cfg80211_wowlan magic={.magic_pkt=true};
+  reset();vif_up=true;wowl_offs=0;bus.wowl_s2idle_only=only;
+  pm_suspend_target_state=deep?PM_SUSPEND_ON:PM_SUSPEND_TO_IDLE;
+  int ret=brcmf_cfg80211_suspend(&wiphy,&magic);
+  if(only&&deep)assert(!ret && cfg.suspended && wowl_offs==1);
+  else assert(ret==1 && !cfg.suspended && !wowl_offs);
+  cases++;
+ }
  /* Outside s2idle (hibernation) Apple firmware still gets the D3 handshake. */
  reset();devinfo.fwseed=true;pm_suspend_target_state=PM_SUSPEND_ON;
  assert(!brcmf_pcie_pm_enter_D3(&device) && d3_informs==1 && !devinfo.s2idle_d0);
@@ -373,7 +387,7 @@ def main():
     parser.add_argument('--out', type=Path)
     parser.add_argument('--mutation', choices=['country-gate', 'queue-reasons', 'worker-gate',
                                               'resume-order', 'tx-drain', 'lpas-resume',
-                                              's2idle-d3'])
+                                              's2idle-d3', 'wowl-s2idle-only'])
     args = parser.parse_args()
     sources = {name: (DRIVER / (name + '.c')).read_text()
                for name in ('cfg80211', 'core', 'pcie', 'msgbuf')}
@@ -406,6 +420,9 @@ def main():
                             'return brcmf_restore_lpas(cfg, ifp);')
     elif args.mutation == 's2idle-d3':
         body = body.replace('if (devinfo->fwseed && pm_suspend_target_state == PM_SUSPEND_TO_IDLE)',
+                            'if (false)')
+    elif args.mutation == 'wowl-s2idle-only':
+        body = body.replace('if (wowl && cfg->pub->bus_if->wowl_s2idle_only &&\n\t    pm_suspend_target_state != PM_SUSPEND_TO_IDLE)',
                             'if (false)')
     elif args.mutation == 'tx-drain':
         body = body.replace('netif_tx_disable(ifp->ndev);', '(void)ifp;')
