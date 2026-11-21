@@ -58,6 +58,7 @@ def main():
     tests = [
         ('display', 'panel-colorimetry', lambda r: colorimetry.panel(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('audio', 'compact-audio-reply-bounds', audio.reply_bounds, ((),), ()),
+        ('audio', 'cec-only-av-endpoint', audio.cec_only_endpoint, ((),), ()),
         ('display', 'desktop-gamma', desktop.gamma, ((),), ()),
         ('display', 'hdr-static-metadata', display.hdr_metadata, ((),), ()),
         ('display', 'ctm-encoding', colorimetry.ctm, ((),), ()),
