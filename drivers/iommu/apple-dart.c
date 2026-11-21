@@ -4581,8 +4581,9 @@ static void __apple_dart_j713_v27_fw_prot(struct apple_dart_master_cfg *cfg, str
 	const int mask = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE;
 	struct iommu_resv_region *region;
 	struct apple_dart *dart;
+	phys_addr_t table;
+	u64 *root, span, base;
 	size_t entries;
-	u64 *root;
 	u32 ttbr;
 	int sid;
 
@@ -4607,9 +4608,16 @@ static void __apple_dart_j713_v27_fw_prot(struct apple_dart_master_cfg *cfg, str
 	ttbr &= ~dart->hw->ttbr_valid;
 	if (dart->hw->ttbr_addr_field_shift)
 		ttbr >>= dart->hw->ttbr_addr_field_shift;
-	root = memremap(((phys_addr_t)ttbr) << dart->hw->ttbr_shift, dart->pgsize, MEMREMAP_WB);
+	table = ((phys_addr_t)ttbr) << dart->hw->ttbr_shift;
+	/* Only a firmware table in reserved RAM is mapped write-back, as elsewhere. */
+	if (!apple_dart_fw_table_ram(dart, table))
+		return;
+	root = memremap(table, dart->pgsize, MEMREMAP_WB);
 	if (!root)
 		return;
+	/* A three-level root walks one span of the stream's window (DVA bits 14..35). */
+	span = BIT_ULL(ilog2(dart->pgsize) + 2 * ilog2(entries));
+	base = READ_ONCE(dart->locked_window[sid]) & ~(span - 1);
 
 	list_for_each_entry(region, head, list) {
 		u64 *leaf = NULL;
@@ -4618,6 +4626,10 @@ static void __apple_dart_j713_v27_fw_prot(struct apple_dart_master_cfg *cfg, str
 
 		if (region->type != IOMMU_RESV_TRANSLATED || !region->length ||
 		    !IS_ALIGNED(region->dva | region->start | region->length, dart->pgsize))
+			continue;
+		/* Outside the window the slot bits would alias another region's leaves. */
+		if (region->dva < base || region->length > span ||
+		    region->dva - base > span - region->length)
 			continue;
 		for (u64 off = 0; off < region->length; off += dart->pgsize) {
 			u64 dva = region->dva + off;	/* bits 14..35: the 1 TiB base drops out */
@@ -4630,9 +4642,8 @@ static void __apple_dart_j713_v27_fw_prot(struct apple_dart_master_cfg *cfg, str
 			if (slot != mapped_slot) {
 				if (leaf)
 					memunmap(leaf);
-				leaf = (entry & APPLE_DART_PTE_VALID) ?
-				       memremap(apple_dart_pte_to_paddr(dart, entry), dart->pgsize,
-						MEMREMAP_WB) : NULL;
+				leaf = apple_dart_fw_table_decode(dart, entry, &table) ?
+				       memremap(table, dart->pgsize, MEMREMAP_WB) : NULL;
 				mapped_slot = slot;
 			}
 			if (!leaf ||
