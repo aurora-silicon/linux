@@ -455,3 +455,12 @@
 &pinctrl_nub {
 	gpio-reserved-ranges = <0 18>, <19 17>, <37 3>;
 };
+
+/* The port controllers follow the sleep's command rules (tipd: woken first, read at intervals) */
+&hpm0 {
+	apple,sleep-ssps-rules;
+};
+
+&hpm1 {
+	apple,sleep-ssps-rules;
+};

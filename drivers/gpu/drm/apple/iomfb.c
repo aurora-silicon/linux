@@ -37,6 +37,7 @@
 #include <drm/drm_print.h>
 #include <drm/drm_vblank.h>
 
+#include "cec.h"
 #include "dcp.h"
 #include "dcp-hdr-metadata.h"
 #include "dcp-internal.h"
@@ -2036,6 +2037,8 @@ void dcp_hotplug(struct work_struct *work)
 	}
 
 	dcp_test_point(dcp, DCP_TEST_HOTPLUG_EVENT);
+	if (connected && connector == dcp->fixed_connector)
+		dcp_cec_poll_edid(dcp);
 	/* The announcement already decided what an H17P external reports. */
 	if (gated)
 		drm_kms_helper_connector_hotplug_event(&connector->base);

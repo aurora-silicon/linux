@@ -7,7 +7,8 @@
 //! (`+0x1500` core mask, `+0x1000` pstate), status `+0xc000`
 //! (`+0x20`/`+0x120` busy, `+0x1800` bank select, `+0x18c0` fault status, `+0x18c8` fault
 //! address >> 6). ASC `+0x44` bit 4 is RUN (mapped from `asc` here; the shared layer does not
-//! map it). No blind reads of unpowered blocks: read only after the AGX vote.
+//! map it). No blind reads of unpowered blocks: read only after the AGX vote (25G83) or, on 27.2,
+//! where macOS reads them with no vote, after admission holds the GPU's power domain.
 //!
 //! The status window needs 64-bit stores (the fault bank select), which the shared accessors do
 //! not offer, so it is mapped here, as is `asc`. This module also holds the [`Mapping`] type the
@@ -20,6 +21,8 @@ use kernel::{
     platform,
     prelude::*,
 };
+
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::regs::G16Resources;
 
@@ -179,6 +182,11 @@ pub(crate) struct Regs {
     status: Mapping,
     /// Host-owned generation register page (SGX +0xd60000).
     generation: Mapping,
+    /// GFXCAXI2AF registers (SGX +0x1000000), written only by the 27.2 start.
+    axi2af: Mapping,
+    /// Highest firmware performance state the board's table holds: S9 until the table is
+    /// known (the ten-row J713/J604 tables), S10 on the eleven-row J773g table.
+    top: AtomicU32,
 }
 
 impl Regs {
@@ -198,11 +206,13 @@ impl Regs {
             asc: window(c_str!("asc"), 0)?,
             status: window(c_str!("sgx"), SGX_STATUS as u64)?,
             generation: window(c_str!("sgx"), 0xd60000)?,
+            axi2af: window(c_str!("sgx"), super::hw::start_27_2::AXI2AF as u64)?,
+            top: AtomicU32::new(9),
             res,
         })
     }
 
-    /// Reads the identification words and the enabled-core mask (after the AGX vote).
+    /// Reads the identification words and the enabled-core mask (after the AGX vote on 25G83).
     pub(crate) fn identity(&self) -> Result<Identity> {
         let version = self.res.sgx_read32_at(SGX_ID)?;
         let counts = self.res.sgx_read32_at(SGX_ID + 0x10)?;
@@ -216,10 +226,22 @@ impl Regs {
         })
     }
 
-    /// Actual cold or running firmware pstate (zero is valid while stopped).
+    /// Adopts the board's firmware performance table, `rows` rows including off.
+    pub(crate) fn set_table(&self, rows: u32) {
+        let top = rows.saturating_sub(1).clamp(1, super::fw::initdata::PERF_STATES as u32 - 1);
+        self.top.store(top, Ordering::Relaxed);
+    }
+
+    /// Highest performance state the firmware may run in.
+    pub(crate) fn top(&self) -> u32 {
+        self.top.load(Ordering::Relaxed)
+    }
+
+    /// Actual cold or running firmware pstate (zero is valid while stopped). A state above the
+    /// board table's top row is a protocol error.
     pub(crate) fn pstate(&self) -> Result<u32> {
         let state = self.res.sgx_read32_at(SGX_CORE + 0x1000)? & 0xf;
-        if state > 9 {
+        if state > self.top() {
             Err(super::boot::eproto())
         } else {
             Ok(state)
@@ -234,6 +256,33 @@ impl Regs {
             return Err(EIO);
         }
         Ok(())
+    }
+
+    /// macOS 27.2 before RUN: sets bit 0 of the two GFXCAXI2AF enables, each read first.
+    pub(crate) fn enable_axi2af(&self) -> Result {
+        let r = self.axi2af.io();
+        for offset in super::hw::start_27_2::AXI2AF_ENABLES {
+            let value = r.try_read32(offset)?;
+            r.try_write32(value | 1, offset)?;
+        }
+        mb();
+        Ok(())
+    }
+
+    /// macOS 27.2 after AP power-on and before the GPU endpoints start: zeroes the host block
+    /// in macOS's order, reads the scratch word, then reads and raises the ready word. Returns
+    /// the scratch word.
+    pub(crate) fn publish_host_block(&self) -> Result<u32> {
+        use super::hw::start_27_2 as s;
+        let g = self.generation.io();
+        for offset in s::HOST_BLOCK_ZERO_ORDER {
+            g.try_write32(0, offset)?;
+        }
+        let probe = self.res.sgx_read32_at(s::SCRATCH_PROBE)?;
+        let _ = g.try_read32(s::HOST_READY)?;
+        g.try_write32(1, s::HOST_READY)?;
+        mb();
+        Ok(probe)
     }
 
     /// ASC control word (`asc + 0x44`).

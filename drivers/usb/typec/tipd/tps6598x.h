@@ -403,6 +403,10 @@ struct tps6598x {
 	struct typec_altmode *partner_altmode_dp;
 	/* USB remote wake armed on this port for the sleep (USBw). */
 	bool usbw_armed;
+	/* An SN201202x's boot power state is left at the end of the probe: tipd_boot_power_on() */
+	bool boot_s0_deferred;
+	bool boot_no_debounce;
+	bool boot_usbw_due;
 };
 
 /* TPS_REG_USB4_STATUS */

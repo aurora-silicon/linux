@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! M4/J713 cold admission and the qualified 25G83 firmware start sequence.
+//! M4/J713 cold admission and the firmware start sequence (25G83; 26B123 once its unknowns are
+//! known).
 //!
 //! The Rust owner validates firmware identity and all inherited regions before publication,
-//! holds the PMP AGX vote, prepares owned objects and publishes context0 while ASC RUN is clear.
+//! holds the PMP AGX vote (25G83; macOS 27.2 sends none), prepares owned objects and publishes
+//! context0 while ASC RUN is clear.
 //! It negotiates RTKit protocol12, accepts only the inherited EP1 crash buffer, then submits
-//! initdata plus NOP0x1a and policy0x34/0x0a. Control+0x14 and exact retired indices qualify
-//! READY; no M3 firmware constants or device-control sequence are reused.
+//! initdata plus the consume-only NOP and policy (re-import Globals, start; 0x1a, 0x34 and
+//! 0x0a on 25G83, 0x19, 0x35 and 0x0a on 26B123). Control+0x14 and exact retired indices
+//! qualify READY; no M3 firmware constants or device-control sequence are reused.
 //! Firmware-reachable backing and the RTKit cookie remain retained until reboot.
 
 use core::ffi::c_void;
@@ -19,17 +22,19 @@ use kernel::{
     platform,
     prelude::*,
     sync::{aref::ARef, Arc, ArcBorrow},
-    time::{delay::fsleep, Delta, Instant, Monotonic},
+    time::{
+        delay::{fsleep, udelay},
+        Delta, Instant, Monotonic,
+    },
 };
 
 use super::adt::{self, GpuAdt};
 use super::channel::{self, Channel, Channels};
 use super::event::Events;
-use super::fw::channels::{devctl, DevCtl};
-use super::fw::initdata::control;
-use super::hw;
+use super::fw::channels::DevCtl;
+use super::hw::{self, LoaderTable};
 use super::initdata::{self, InitData};
-use super::object::Objects;
+use super::object::{Class, Objects, Placement, Request};
 use super::{regs, uat, Config, Shared};
 use crate::driver::AsahiDrmDevice;
 use crate::{mmu, regs as shared_regs};
@@ -43,6 +48,7 @@ pub(crate) mod glue {
     extern "C" {
         fn asahi_g16_board() -> bool;
         fn asahi_g16_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+        fn asahi_g16_perf_rows() -> core::ffi::c_uint;
         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
         fn asahi_g16_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
@@ -60,7 +66,7 @@ pub(crate) mod glue {
         ) -> core::ffi::c_int;
     }
 
-    /// A qualified J713/T8132 board.
+    /// A qualified T8132 board (J713, J773g).
     pub(crate) fn board() -> bool {
         // SAFETY: Reads the machine compatible strings only.
         unsafe { asahi_g16_board() }
@@ -70,6 +76,12 @@ pub(crate) mod glue {
     pub(crate) fn display_prepare(dev: &device::Device) -> Result {
         // SAFETY: `dev` is the bound GPU device; the helper only adds a device link.
         kernel::error::to_result(unsafe { asahi_g16_display_prepare(dev.as_raw().cast()) })
+    }
+
+    /// The firmware DVFS row count qualified for this board.
+    pub(crate) fn perf_rows() -> usize {
+        // SAFETY: Reads the machine compatible strings only.
+        unsafe { asahi_g16_perf_rows() as usize }
     }
 
     /// Holds the GFX power domain for the retained session.
@@ -280,7 +292,7 @@ unsafe extern "C" fn rtkit_shmem_destroy(
 }
 
 /// The GPU's RTKit callbacks.
-static RTKIT_OPS: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+const RTKIT_OPS_BASE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
     flags: 0,
     crashed: Some(rtkit_crashed),
     recv_message: Some(rtkit_recv),
@@ -292,6 +304,63 @@ static RTKIT_OPS: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
     syslog_is_debug: None,
     protocol_version: 12,
 };
+
+/// 25G83: the firmware's crash buffer is mapped without a reply.
+static RTKIT_OPS: bindings::apple_rtkit_ops = RTKIT_OPS_BASE;
+
+/// macOS 27.2: the crash-log endpoint starts while the endpoint map is handled, and the
+/// firmware's request for its own crash buffer is sent back unchanged.
+static RTKIT_OPS_27_2: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+    flags: bindings::APPLE_RTKIT_COPROC_PLACES_BUFFERS,
+    ..RTKIT_OPS_BASE
+};
+
+// The log buffer the 27.2 start hands over is the crash copy buffer HW data sizes.
+const _: () =
+    assert!(hw::start_27_2::LOG_BUFFER_SIZE as u64 == super::fw::initdata::COREDUMP_COPY_SIZE);
+
+/// The host log buffer message the 27.2 start sends from RTKit's `before_ap` hook.
+struct LogBuffer {
+    rtk: *mut bindings::apple_rtkit,
+    shared: *const Shared,
+    message: u64,
+    result: core::ffi::c_int,
+}
+
+/// RTKit `before_ap` hook of the 27.2 start: once the firmware's own crash buffer has been
+/// set up (and its request sent back), hands it the host log buffer, as macOS does right
+/// before AP power-on.
+///
+/// # Safety
+///
+/// `data` must point to a live [`LogBuffer`] exclusively borrowed for this call, whose `rtk`
+/// is the RTKit instance running the hook and whose `shared` outlives it.
+unsafe extern "C" fn publish_log_buffer(data: *mut c_void) {
+    // SAFETY: By the function's contract.
+    let log = unsafe { &mut *data.cast::<LogBuffer>() };
+    // SAFETY: By the function's contract.
+    let shared = unsafe { &*log.shared };
+    let start = Instant::<Monotonic>::now();
+    while matches!(shared.rtkit_buffer.load(Ordering::Acquire), 0 | u64::MAX) {
+        if start.elapsed() > Delta::from_millis(1000) {
+            log.result = ETIMEDOUT.to_errno();
+            return;
+        }
+        fsleep(Delta::from_millis(1));
+    }
+    // The request is sent back right after its setup returns; keep macOS's order.
+    fsleep(Delta::from_millis(1));
+    // SAFETY: `log.rtk` is the live RTKit instance running this hook.
+    log.result = unsafe {
+        bindings::apple_rtkit_send_message(
+            log.rtk,
+            hw::start_27_2::EP_CRASHLOG,
+            log.message,
+            core::ptr::null_mut(),
+            false,
+        )
+    };
+}
 
 /// The GPU's RTKit client. Never freed: the firmware session lasts until reboot.
 ///
@@ -309,11 +378,15 @@ unsafe impl Sync for Rtkit {}
 
 impl Rtkit {
     /// Initializes the sole RTKit owner on the default mailbox (retained).
-    fn new(dev: &device::Device, shared: &Arc<Shared>) -> Result<Self> {
+    fn new(
+        dev: &device::Device,
+        shared: &Arc<Shared>,
+        ops: &'static bindings::apple_rtkit_ops,
+    ) -> Result<Self> {
         let cookie = Arc::into_raw(shared.clone()) as *mut c_void;
         // SAFETY: `dev` is valid, the name is a NUL-terminated string and the ops are static.
         let rtk = from_err_ptr(unsafe {
-            bindings::apple_rtkit_init(dev.as_raw(), cookie, core::ptr::null(), 0, &RTKIT_OPS)
+            bindings::apple_rtkit_init(dev.as_raw(), cookie, core::ptr::null(), 0, ops)
         });
         match rtk {
             // INVARIANT: The cookie stays leaked from here on.
@@ -340,6 +413,21 @@ impl Rtkit {
     pub(crate) fn warm_restart(&mut self) -> Result {
         // SAFETY: `rtk` is live by the type invariant.
         to_result(unsafe { bindings::apple_rtkit_warm_restart(self.rtk) })
+    }
+
+    /// Waits for the firmware to report in without an IOP power request, runs `before_ap`, then
+    /// sets the AP on.
+    ///
+    /// # Safety
+    ///
+    /// `before_ap` must be safe to call with `data`, from this thread, during this call.
+    unsafe fn boot_with(
+        &mut self,
+        before_ap: unsafe extern "C" fn(*mut c_void),
+        data: *mut c_void,
+    ) -> Result {
+        // SAFETY: `rtk` is live by the type invariant; the caller vouches for the hook.
+        to_result(unsafe { bindings::apple_rtkit_boot_with(self.rtk, Some(before_ap), data) })
     }
 
     /// Waits for the firmware to report in, and sets the AP on.
@@ -409,7 +497,7 @@ impl Session {
         self.shared.check()?;
         if !self.rtkit.running()
             || self.regs.asc_control()? & regs::ASC_RUN == 0
-            || self.regs.pstate()? > 9
+            || self.regs.pstate()? > self.regs.top()
         {
             return Err(EIO);
         }
@@ -468,7 +556,11 @@ pub(crate) fn admit(
     res: shared_regs::G16Resources,
 ) -> Result<Admitted> {
     let dev = pdev.as_ref();
-    if !glue::board() {
+    // The board check guards the PMP AGX vote, which only the 25G83 start sends. A firmware
+    // whose handoff names the start without the vote (26B123) rests on the firmware identity
+    // checks below instead.
+    let votes = !matches!(adt::layout(dev), Some(layout) if layout.start == hw::Start::MacOs27_2);
+    if votes && !glue::board() {
         return Err(ENODEV);
     }
     // Retain the PMP supplier (and its AGX bridge) before any vote.
@@ -495,7 +587,25 @@ pub(crate) fn admit(
         cfg.firmware,
     )
     .inspect_err(|e| dev_err!(dev, "loaded GFX TEXT identity mismatch: {:?}\n", e))?;
-    dev_info!(dev, "M4: firmware identity accepted\n");
+    dev_info!(
+        dev,
+        "M4: firmware identity accepted ({} layout)\n",
+        adt.layout.name
+    );
+    // Refuse a firmware whose start needs something not known yet before anything is held.
+    let mut unknown = false;
+    for what in adt.layout.unknown() {
+        dev_err!(
+            dev,
+            "G16: the {} firmware cannot be started yet; not known: {}\n",
+            adt.layout.name,
+            what
+        );
+        unknown = true;
+    }
+    if unknown {
+        return Err(ENOTSUPP);
+    }
     // Firmware objects are cleaned to the point of coherency by their DMA mapping: that needs
     // a device that is not DMA-coherent, as the synthesized node is.
     if glue::dma_unsupported(dev) {
@@ -533,6 +643,40 @@ fn devctl_op(
     channel::devctl_submit(session, channels, events, init, &DevCtl::op(opcode), true)
 }
 
+/// The 26B123 start: waits for one posted boot control to retire, polling the indices every
+/// 5 us without draining or printing the rings, and returns how long it took. The firmware
+/// powers down about 0.5 ms after its last work (J713), so a boot control posted later wakes it
+/// from idle first.
+fn await_boot_control_prompt(
+    session: &Session,
+    channels: &Channels,
+    init: &InitData,
+    target: u32,
+) -> Result<Delta> {
+    let start = Instant::<Monotonic>::now();
+    loop {
+        session.check()?;
+        let read = channels.devctl.read()?;
+        let done = channels.devctl.completion()?;
+        if read == target && done == target && init.readiness()? == 1 {
+            return Ok(start.elapsed());
+        }
+        if read > target || done > target || channels.devctl.write()? != target {
+            channels.log_stop(session, init, "unexpected boot-control indices");
+            return Err(eproto());
+        }
+        if init.halted()? {
+            channels.log_stop(session, init, "firmware halted awaiting a boot control");
+            return Err(EBUSY);
+        }
+        if start.elapsed() > Delta::from_millis(20) {
+            channels.log_stop(session, init, "boot control not retired in 20 ms");
+            return Err(ETIMEDOUT);
+        }
+        udelay(Delta::from_micros(5));
+    }
+}
+
 /// Wait for one boot control to retire, requiring stable consumer+completion indices.
 fn wait_boot_control(
     session: &Session,
@@ -558,6 +702,7 @@ fn wait_boot_control(
             || done > target
             || write != target
         {
+            channels.log_stop(session, init, "unexpected boot-control indices");
             return Err(eproto());
         }
         if ready == 1 && read == target && done == target {
@@ -569,19 +714,33 @@ fn wait_boot_control(
             stable = None;
         }
         if start.elapsed() > Delta::from_millis(timeout_ms) {
-            dev_err!(
-                session.dev,
-                "M4 boot control target{} ready{} indices{}/{}/{}\n",
-                target,
-                ready,
-                read,
-                done,
-                write
-            );
+            channels.log_stop(session, init, "boot control not retired in time");
             return Err(ETIMEDOUT);
         }
         fsleep(Delta::from_micros(1000));
     }
+}
+
+/// Writes the register-map records into the firmware's table in loaded DATA, which must be
+/// empty on cold entry. This is the only host write to the loaded DATA segment.
+fn publish_loader_table(session: &Session, init: &InitData, offset: u64) -> Result {
+    let table = init.loader_bytes();
+    let loader = regs::Mapping::write_combined(session.adt.data.start + offset, table.len())?;
+    for _ in 0..2 {
+        for offset in (0..table.len()).step_by(4) {
+            if loader.io().try_read32(offset)? != 0 {
+                return Err(EBUSY);
+            }
+        }
+        regs::rmb();
+    }
+    for (i, word) in table.chunks_exact(4).enumerate() {
+        loader
+            .io()
+            .try_write32(u32::from_le_bytes(word.try_into().unwrap()), i * 4)?;
+    }
+    regs::wmb();
+    Ok(())
 }
 
 /// Wake the sole firmware instance, publish its loader table, then qualify NOP and policy.
@@ -589,10 +748,34 @@ fn run(
     session: &mut Session,
     events: &mut Events,
     built: &mut (InitData, Channels, u32),
+    log_buffer: Option<u64>,
 ) -> Result {
     let dev = session.dev.clone();
     let (init, channels, _) = built;
-    session.rtkit.wake()?;
+    let kind = session.adt.layout.start;
+    match kind {
+        hw::Start::Wake25G83 => session.rtkit.wake()?,
+        hw::Start::MacOs27_2 => {
+            use hw::start_27_2 as s;
+            let va = log_buffer.ok_or(EINVAL)?;
+            let mut log = LogBuffer {
+                rtk: session.rtkit.as_raw(),
+                shared: &*session.shared,
+                message: s::MSG_LOG_BUFFER
+                    | (((s::LOG_BUFFER_SIZE >> 12) as u64) << s::MSG_LOG_BUFFER_PAGES_SHIFT)
+                    | (va & s::MSG_LOG_BUFFER_ADDR_MASK),
+                result: 0,
+            };
+            // SAFETY: `log` lives on this stack frame across the call and nothing else
+            // borrows it; the hook runs on this thread before `boot_with` returns.
+            unsafe {
+                session
+                    .rtkit
+                    .boot_with(publish_log_buffer, (&raw mut log).cast())?
+            };
+            to_result(log.result)?;
+        }
+    }
     let start = Instant::<Monotonic>::now();
     while matches!(
         session.shared.rtkit_buffer.load(Ordering::Acquire),
@@ -612,50 +795,109 @@ fn run(
     {
         return Err(eproto());
     }
+    if kind == hw::Start::MacOs27_2 {
+        let probe = session.regs.publish_host_block()?;
+        dev_info!(
+            dev,
+            "G16: 27.2 host block published, scratch {:#x}\n",
+            probe
+        );
+    }
     session.rtkit.start_endpoint(hw::ep::FIRMWARE)?;
     session.rtkit.start_endpoint(hw::ep::DOORBELL)?;
-    for _ in 0..10 {
-        fsleep(Delta::from_millis(10));
-        channels.drain_rings(&dev, events)?;
-        session.check()?;
-    }
-    session.regs.set_generation(0)?;
-    channels.stage_boot_nop(session)?;
-    // This table is the only host write to the loaded DATA segment. It is empty on cold entry.
-    let table = init.loader_bytes();
-    let loader = regs::Mapping::write_combined(session.adt.data.start + 0x1332f0, table.len())?;
-    for _ in 0..2 {
-        for offset in (0..table.len()).step_by(4) {
-            if loader.io().try_read32(offset)? != 0 {
-                return Err(EBUSY);
-            }
+    let devctl = init.abi.devctl();
+    if kind == hw::Start::Wake25G83 {
+        for _ in 0..10 {
+            fsleep(Delta::from_millis(10));
+            channels.drain_rings(&dev, events)?;
+            session.check()?;
         }
-        regs::rmb();
+        session.regs.set_generation(0)?;
     }
-    for (i, word) in table.chunks_exact(4).enumerate() {
-        loader
-            .io()
-            .try_write32(u32::from_le_bytes(word.try_into().unwrap()), i * 4)?;
+    // 26B123: no boot NOP. macOS 27.2 writes no host generation before the InitData doorbell,
+    // and on the J713 the firmware crashed at the first device-control doorbell after idling
+    // behind the NOP; IMPORT_GLOBALS goes out right after InitData instead.
+    let nop = kind == hw::Start::Wake25G83;
+    if nop {
+        channels.stage_boot_nop(session, devctl.nop)?;
     }
-    regs::wmb();
+    match session.adt.layout.loader_table {
+        Some(LoaderTable::Host(offset)) => publish_loader_table(session, init, offset)?,
+        // The firmware copies the register map from HW data while it parses InitData.
+        Some(LoaderTable::Firmware) => {}
+        // Admission refuses such a layout; never guess here.
+        None => return Err(ENOTSUPP),
+    }
     let root = init.root_va()?;
     session.send(
         hw::ep::FIRMWARE,
         hw::ep::INITDATA | (root & hw::ep::INITDATA_ADDR_MASK),
     )?;
     session.send(hw::ep::DOORBELL, 0x0083000000000011)?;
-    wait_boot_control(session, channels, events, init, 1, 5000)?;
-    devctl_op(session, channels, events, init, devctl::IMPORT_GLOBALS)?;
-    wait_boot_control(session, channels, events, init, 2, 2000)?;
+    let base = if nop {
+        wait_boot_control(session, channels, events, init, 1, 5000)?;
+        1
+    } else {
+        dev_info!(
+            dev,
+            "G16: 27.2 boot: no boot NOP, IMPORT_GLOBALS right after InitData\n"
+        );
+        0
+    };
     let scheduler = init.control.as_ref().ok_or(EINVAL)?;
-    if scheduler.r32(control::SCHEDULER)? != 0 {
-        return Err(EBUSY);
+    let scheduler_word = init.firmware_data().scheduler;
+    if kind == hw::Start::MacOs27_2 {
+        // 26B123: IMPORT_GLOBALS and START go out behind one doorbell, so the firmware does not
+        // idle between them. On the J773g the doorbell after a lone IMPORT_GLOBALS crashed the
+        // firmware in its wake, whether 29 us or 52 ms later; on the J713 the pair behind one
+        // doorbell retired both.
+        //
+        // The InitData request (1) can still be pending here (seen on the J713): the firmware
+        // consumes it when it powers the GPU up or recovers, and the boot records need not
+        // power it up. Post START with it pending; never stack a second request.
+        let pending = scheduler.r32(scheduler_word)?;
+        if pending > 1 {
+            channels.log_stop(
+                session,
+                init,
+                "scheduler word unexpected before the boot pair",
+            );
+            return Err(EBUSY);
+        }
+        if pending == 0 {
+            scheduler.w32(scheduler_word, 1)?;
+        }
+        regs::wmb();
+        channel::devctl_submit_batch(
+            session,
+            channels,
+            events,
+            init,
+            &[DevCtl::op(devctl.import_globals), DevCtl::op(devctl.start)],
+        )?;
+        let retired = await_boot_control_prompt(session, channels, init, base + 2)?;
+        session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
+        dev_info!(
+            dev,
+            "G16: 27.2 boot pair: IMPORT_GLOBALS and START behind one doorbell with scheduler request {} pending, both retired in {} us\n",
+            pending,
+            retired.as_micros_ceil()
+        );
+        // Settled: the same stable-index check as 25G83, with no boot doorbell left to send.
+        wait_boot_control(session, channels, events, init, base + 2, 2000)?;
+    } else {
+        devctl_op(session, channels, events, init, devctl.import_globals)?;
+        wait_boot_control(session, channels, events, init, base + 1, 5000)?;
+        if scheduler.r32(scheduler_word)? != 0 {
+            channels.log_stop(session, init, "scheduler word set after IMPORT_GLOBALS");
+            return Err(EBUSY);
+        }
+        scheduler.w32(scheduler_word, 1)?;
+        regs::wmb();
+        devctl_op(session, channels, events, init, devctl.start)?;
+        wait_boot_control(session, channels, events, init, base + 2, 2000)?;
+        session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
     }
-    scheduler.w32(control::SCHEDULER, 1)?;
-    regs::wmb();
-    devctl_op(session, channels, events, init, devctl::START)?;
-    wait_boot_control(session, channels, events, init, 3, 2000)?;
-    session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
     for _ in 0..10 {
         fsleep(Delta::from_millis(10));
         channels.drain_rings(&dev, events)?;
@@ -664,17 +906,19 @@ fn run(
             return Err(eproto());
         }
     }
-    if channels.devctl.read()? != 3
-        || channels.devctl.completion()? != 3
-        || channels.devctl.write()? != 3
-        || scheduler.r32(control::SCHEDULER)? != 0
+    if channels.devctl.read()? != base + 2
+        || channels.devctl.completion()? != base + 2
+        || channels.devctl.write()? != base + 2
+        || (kind == hw::Start::Wake25G83 && scheduler.r32(scheduler_word)? != 0)
     {
+        channels.log_stop(session, init, "boot controls not settled after START");
         return Err(EBUSY);
     }
     dev_info!(
         dev,
-        "M4 firmware accepted owned initdata root{:#x}, NOP and policy; READY\n",
-        root
+        "M4 firmware accepted owned initdata root{:#x}, NOP and policy; READY (scheduler {})\n",
+        root,
+        scheduler.r32(scheduler_word)?
     );
     Ok(())
 }
@@ -693,11 +937,20 @@ pub(crate) fn start(
     if regs.asc_control()? & regs::ASC_RUN != 0 {
         return Err(EBUSY);
     }
-    // SAFETY: `d` is the bound GPU device.
-    let ret = unsafe { bindings::apple_pmp_j713_gpu_get(d.as_raw()) };
-    if ret != 0 {
-        dev_err!(d, "PMP AGX vote failed: {}\n", ret);
-        return Err(Error::from_errno(ret));
+    let kind = adt.layout.start;
+    if kind == hw::Start::MacOs27_2 {
+        // macOS 27.2 sends no PMP AGX vote: it reads the identification words and starts the
+        // firmware without one, and the firmware acknowledges its own IOP power-on. A J713
+        // 27.2 boot without the vote reached the same point as one with it.
+        dev_info!(d, "G16: 27.2: no PMP AGX vote, as macOS\n");
+        regs.enable_axi2af()?;
+    } else {
+        // SAFETY: `d` is the bound GPU device.
+        let ret = unsafe { bindings::apple_pmp_j713_gpu_get(d.as_raw()) };
+        if ret != 0 {
+            dev_err!(d, "PMP AGX vote failed: {}\n", ret);
+            return Err(Error::from_errno(ret));
+        }
     }
     let id = regs.identity()?;
     dev_info!(
@@ -730,7 +983,7 @@ pub(crate) fn start(
         "M4 G16G: {} cores enabled\n",
         id.core_masks[0].count_ones()
     );
-    if regs.pstate()? > 9 {
+    if regs.pstate()? > regs.top() {
         return Err(eproto());
     }
     // Cold only: ASC RUN clear and an all-zero TTBAT before ownership.
@@ -758,7 +1011,11 @@ pub(crate) fn start(
         core::mem::forget(objects);
         return Err(e);
     }
-    let rtkit = match Rtkit::new(&d, shared) {
+    let ops = match kind {
+        hw::Start::Wake25G83 => &RTKIT_OPS,
+        hw::Start::MacOs27_2 => &RTKIT_OPS_27_2,
+    };
+    let rtkit = match Rtkit::new(&d, shared, ops) {
         Ok(rtkit) => rtkit,
         Err(e) => {
             core::mem::forget(objects);
@@ -779,6 +1036,26 @@ pub(crate) fn start(
         events.reserve()?;
         // Every host object and every context-0 alias is prepared before RUN is set.
         built = Some(initdata::build(&d, &session.adt, &mut objects)?);
+        if let Some((init, _, _)) = built.as_ref() {
+            // The running firmware may report any state of the board's table, up to S10 on J773g.
+            session.regs.set_table(init.rows);
+        }
+        let log_buffer = match kind {
+            hw::Start::MacOs27_2 => Some(
+                objects
+                    .alloc(Request {
+                        size: hw::start_27_2::LOG_BUFFER_SIZE,
+                        class: Class::Fw,
+                        placement: Placement::Anywhere,
+                        offset: 0,
+                        client: None,
+                        lower: None,
+                        cpu: true,
+                    })?
+                    .va,
+            ),
+            hw::Start::Wake25G83 => None,
+        };
         objects.window.lock().bootstrap(&d, &session.uat)?;
         uat::tlbi_all();
         if session.regs.asc_control()? & regs::ASC_RUN != 0 {
@@ -790,7 +1067,13 @@ pub(crate) fn start(
         if session.regs.asc_control()? & regs::ASC_RUN == 0 {
             return Err(EIO);
         }
-        run(&mut session, &mut events, built.as_mut().ok_or(EINVAL)?)
+        objects.window.lock().await_firmware_magic(&d)?;
+        run(
+            &mut session,
+            &mut events,
+            built.as_mut().ok_or(EINVAL)?,
+            log_buffer,
+        )
     })();
     if let Err(e) = result {
         dev_err!(
