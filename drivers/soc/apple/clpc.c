@@ -398,6 +398,7 @@ EXPORT_SYMBOL_GPL(apple_clpc_ane_put);
 static const struct of_device_id apple_clpc_ane_providers[] = {
 	{ .compatible = "apple,t6041-max-clpc" },
 	{ .compatible = "apple,t6041-clpc" },
+	{ .compatible = "apple,t8132-clpc" },
 	{ .compatible = "apple,t8140-clpc" },
 	{}
 };
@@ -1566,6 +1567,19 @@ static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
 	},
 	.gpu_demand = false,
 	.gpu_input = true,
+	/*
+	 * ANE work gets the same M5/F3 floor while it is in flight, and, as on
+	 * T6040, the engine runs at a speed set by the P cluster's frequency
+	 * (cpu-map cluster1), whatever runs on it. Measured on J713 with
+	 * MobileNetV1: no floor 0.92 ms an EXECUTE (firmware 0.70 ms), M5/F3
+	 * 0.68 ms (0.45 ms); then firmware time by P cluster frequency 0.44 ms
+	 * up to 1.512 GHz, 0.32 ms at 2.616 GHz and 0.29-0.31 ms from there to
+	 * 4.104 GHz. The cluster floor is the start of that plateau.
+	 */
+	.ane = { [APPLE_CLPC_DCS] = 5, [APPLE_CLPC_SOC] = 3 },
+	.ane_cluster = 1,
+	.ane_cluster_khz = 2616000,
+	.ane_cluster_machine = "apple,t8132",
 };
 
 /*
@@ -1945,6 +1959,10 @@ static void apple_clpc_ane_demand_hold_test(struct kunit *test)
 	KUNIT_EXPECT_GT(test, ane.updated_ns, 0ull);
 	KUNIT_EXPECT_EQ(test, ane.sequence, 4ull);
 	/* T6040 holds its top qualified DCS and fabric states for the ANE. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane[APPLE_CLPC_DCS], 5);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane[APPLE_CLPC_SOC], 3);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane_cluster, 1u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane_cluster_khz, 2616000u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_DCS], 5);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_SOC], 2);
 }
@@ -2009,7 +2027,6 @@ static void apple_clpc_ane_no_provider_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_clpc_ane_input_demand(clpc, demand));
 	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 0u);
 	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 0u);
-	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane[APPLE_CLPC_DCS], 0);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8142.ane[APPLE_CLPC_DCS], 0);
 }
 
