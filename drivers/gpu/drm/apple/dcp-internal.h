@@ -551,6 +551,28 @@ struct apple_dcp {
 	 */
 	bool ext_failsafe;
 	bool ext_dead;
+	/* T6041 S2R: this external DCP's firmware stop ran in a sleep of this boot */
+	bool t6041_ext_seen;
+	/* T6041 S2R: the firmware's D572(0) since the stop's power-off */
+	struct completion t6041_dart_off;
+	/* T6041 S2R: a display reported connected with a valid mode since the restart */
+	struct completion t6041_plugged;
+	/* T6040 S2R: this external DCP's link set up again once its firmware is back */
+	struct work_struct t6040_link_work;
+	/*
+	 * T6040 S2R: an external display's link work is through once the firmware reports the
+	 * display plugged again; this bounds the wait for that.
+	 */
+	struct delayed_work t6040_plug_wq;
+	/* T6040 S2R: the link work waits for the firmware's plug of the display. */
+	bool t6040_plug_wait;
+	/*
+	 * T6040 S2R: from this external DCP's stop until its link work is through, the DRM
+	 * entry points leave its firmware alone (see dcp_t6040_ext_link_down()).
+	 */
+	bool t6040_relinking;
+	/* T6040 S2R: the fixed HDMI output's DP PHY was given back for the sleep. */
+	bool t6040_fixed_phy_off;
 	/*
 	 * A T6030 external processor in the main DRM device: the kernel starts
 	 * its firmware on first use, its modes come from the attached display.
@@ -1249,6 +1271,7 @@ void dcp_backlight_stop(struct apple_dcp *dcp);
 void dcp_backlight_finish_fade(struct apple_dcp *dcp);
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
+void dcp_backlight_s2r_restore(struct apple_dcp *dcp);
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 extern int fw27_panel_boot_mode;

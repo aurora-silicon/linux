@@ -4610,6 +4610,8 @@ int dcp_start(struct platform_device *pdev)
 	/* Even if nothing starts, dcp_wait_ready() must find it initialised. */
 	init_completion(&dcp->start_done);
 	init_completion(&dcp->s2r_dart_done);
+	init_completion(&dcp->t6041_dart_off);
+	init_completion(&dcp->t6041_plugged);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		return iomfb_v26_6_start(dcp);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
@@ -4940,6 +4942,8 @@ static bool dcp_h17g_panel(struct apple_dcp *dcp)
 static void dcp_dpms_power_off(struct apple_dcp *dcp);
 static void dcp_dpms_power_on(struct apple_dcp *dcp);
 static void dcp_s2r_prewarm_work(struct work_struct *work);
+static void dcp_t6040_link_work(struct work_struct *work);
+static void dcp_t6040_plug_work(struct work_struct *work);
 static void dcp_s2r_prewarm_off_work(struct work_struct *work);
 
 static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
@@ -4979,6 +4983,10 @@ void dcp_poweron(struct platform_device *pdev)
 	bool wait_for_typec_hpd = false;
 	unsigned long remaining;
 	int ret;
+
+	/* T6040 S2R: powered once the link is back (dcp_t6040_ext_link_down()). */
+	if (READ_ONCE(dcp->t6040_relinking))
+		return;
 
 	/* The takeover trial powered it on before the eviction. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
@@ -5148,6 +5156,22 @@ void dcp_poweron(struct platform_device *pdev)
 		av_service_connect(dcp);
 }
 
+/*
+ * A desktop 26.x external pipe that the firmware powered off with its display: an unplug, or
+ * the link released for a sleep. A mode set alone leaves it off ("Modeset done, but pipe not
+ * enabled") and the firmware swallows every swap after it. The mode is valid from then on,
+ * so the flush that would power the pipe on for the first swap (dcp_flush()) leaves it too.
+ * A mode set on a CRTC that stayed active, as the hotplug worker's when the display is back
+ * before the compositor has flipped once, powers such a pipe on first.
+ */
+bool dcp_external_pipe_off(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !dcp->main_display &&
+	       dcp->desktop->ext_pipe_off;
+}
+
 /* Same-CRTC helper dependencies order this token refresh before later disables. */
 void dcp_external_recover(struct platform_device *pdev)
 {
@@ -5162,6 +5186,10 @@ void dcp_poweroff(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	bool display_gone = false;
 	int ret;
+
+	/* T6040 S2R: this pipe is off until its link work is through. */
+	if (READ_ONCE(dcp->t6040_relinking))
+		return;
 
 	if (iomfb_is_m4(dcp)) {
 		ret = dcp_backlight_dpms(dcp, false);
@@ -7161,6 +7189,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
 	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
 	INIT_WORK(&dcp->s2r_prewarm_work, dcp_s2r_prewarm_work);
+	INIT_WORK(&dcp->t6040_link_work, dcp_t6040_link_work);
+	INIT_DELAYED_WORK(&dcp->t6040_plug_wq, dcp_t6040_plug_work);
 	INIT_DELAYED_WORK(&dcp->s2r_prewarm_off_wq, dcp_s2r_prewarm_off_work);
 	mutex_init(&dcp->s2r_prewarm_lock);
 	INIT_WORK(&dcp->bl_register_wq, dcp_work_register_backlight);
@@ -7671,6 +7701,8 @@ static void dcp_platform_remove(struct platform_device *pdev)
 
 	if (dcp) {
 		cancel_work_sync(&dcp->s2r_prewarm_work);
+		cancel_work_sync(&dcp->t6040_link_work);
+		cancel_delayed_work_sync(&dcp->t6040_plug_wq);
 		cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
 	}
 	/* Registration pins callback/provider lifetimes until same-task scope end. */
@@ -8052,6 +8084,10 @@ static const struct dcp_s2r_layout *dcp_s2r_layout(struct apple_dcp *dcp)
 		return &dcp_s2r_t8142_ext[dcp->index - 1];
 	return dcp->hw.s2r_layout ?: &dcp_s2r_t8140;
 }
+
+/* T6041's display stop and restart for its own sleep driver, below: T8140's DART streams. */
+#define DCP_S2R_DISP_STREAMS	(dcp_s2r_t8140.disp_streams)
+#define DCP_S2R_DCP_STREAMS	(dcp_s2r_t8140.dcp_streams)
 #define DCP_PS_MIN		GENMASK(19, 16)
 
 static struct device *dcp_s2r_find_dart(struct device_node *np)
@@ -9798,6 +9834,1100 @@ static struct platform_driver apple_platform_driver = {
 	},
 };
 
+/*
+ * T6041 suspend-to-RAM: each display firmware is stopped from Linux before the sleep, from the
+ * display subsystem's own suspend, and the internal one is restarted warm after the wake.
+ */
+
+/*
+ * The most to wait after the pipe power-on for the firmware to report the internal display
+ * back before the mode set (115 ms on J616s), and for the lowered power words to read off.
+ */
+#define DCP_S2R_PANEL_MS	1000
+#define DCP_S2R_DOWN_MS		100
+/*
+ * The longest an external display's link work waits for the firmware to report the display
+ * plugged after the restart. On the J616s that came 1.0 s after the link request for a Type-C
+ * display and 6.1 s after it for a TV behind the HDMI port's converter (6.9 s at boot).
+ */
+#define DCP_S2R_PLUG_MS		10000
+
+/*
+ * The display power complex of a T604x, from the compatible of the node the DCPs name in
+ * apple,display-power:
+ * @first_pipe: the first entry of dcp_t6041_pipes[] the SoC has. T6040 has two external
+ *	pipes (ext0, ext1); T6041 has four, and its ext2 and ext3 count in the complex even
+ *	when no DCP was started on them.
+ * @ext_restart: the external DCPs come back after the wake (dcp_t6040_ext_start_one()), so
+ *	their stop is the internal one's: link and pipe down first, the firmware idled, not
+ *	shut down. Measured on T6040; on T6041 the external DCPs are shut down and stay off.
+ */
+struct dcp_t6041_power_soc {
+	u8 first_pipe;
+	bool ext_restart;
+};
+
+static const struct dcp_t6041_power_soc dcp_t6040_power_soc = {
+	.first_pipe = 2,
+	.ext_restart = true,
+};
+
+static const struct dcp_t6041_power_soc dcp_t6041_power_soc = {
+	.first_pipe = 0,
+};
+
+static const struct of_device_id dcp_t6041_power_of_match[] = {
+	{ .compatible = "apple,t6040-display-power", .data = &dcp_t6040_power_soc },
+	{ .compatible = "apple,t6041-display-power", .data = &dcp_t6041_power_soc },
+	{}
+};
+
+/* NULL without a T604x display power complex in the device tree. */
+static const struct dcp_t6041_power_soc *dcp_t6041_power(void)
+{
+	static const struct dcp_t6041_power_soc *soc;
+	const struct of_device_id *match = NULL;
+	struct device_node *dcp_np, *np;
+
+	if (READ_ONCE(soc))
+		return soc;
+	dcp_np = of_find_compatible_node(NULL, NULL, "apple,t6041-dcp");
+	np = dcp_np ? of_parse_phandle(dcp_np, "apple,display-power", 0) : NULL;
+	of_node_put(dcp_np);
+	if (np)
+		match = of_match_node(dcp_t6041_power_of_match, np);
+	of_node_put(np);
+	if (match)
+		WRITE_ONCE(soc, match->data);
+	return soc;
+}
+
+static bool dcp_t6041_ext_restarts(void)
+{
+	const struct dcp_t6041_power_soc *soc = dcp_t6041_power();
+
+	return soc && soc->ext_restart;
+}
+
+/* The fixed HDMI output of a T6040 external DCP, not lent to a Type-C display. */
+static bool dcp_t6040_fixed_hdmi(struct apple_dcp *dcp)
+{
+	return dcp_desktop_external(dcp) && dcp->fixed_phy && dcp->hdmi_hpd &&
+	       !dcp->active_typec_route;
+}
+
+/*
+ * What the generic system suspend does to an external link, before its firmware stops. The
+ * connector stays connected: a disconnect reported now reached the compositor after the thaw,
+ * which then turned the pipe off and dropped the link of a display that was still there.
+ * Until the link work is through after the wake, the CRTC's power and flips leave the firmware
+ * alone; the firmware's hotplug once the link is back has the CRTC state that DRM kept active
+ * applied again (dcp_hotplug()).
+ */
+static void dcp_t6040_ext_link_down(struct apple_dcp *dcp)
+{
+	WRITE_ONCE(dcp->t6040_relinking, true);
+	dcp_disable_typec_work(dcp, false);
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+	if (dcp->hdmi_hpd_irq)
+		disable_irq(dcp->hdmi_hpd_irq);
+	/*
+	 * A Type-C output's link too: only one released before the sleep is connected again
+	 * after it. The HDMI DCP keeps the link of a Type-C display it drives.
+	 */
+	if (dcp->hdmi_hpd_irq && dcp->active_typec_route)
+		return;
+	/* The fixed HDMI output: HPD dropped first, as at an unplug of the sink. */
+	if (dcp_t6040_fixed_hdmi(dcp)) {
+		int ret = 0;
+
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			if (dptx_service_available(&dcp->dptxport[0]) &&
+			    dcp->dptxport[0].connected)
+				ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+		}
+		if (ret)
+			dev_warn(dcp->dev, "HDMI: DPTX HPD not dropped for the sleep: %d\n", ret);
+	}
+	dcp_dptx_disconnect(dcp, 0);
+	/*
+	 * Its DP PHY and the converter's own rail go too, the PHY given back as a route
+	 * deactivation does: powered off, the PHY is shut down to its boot state and the
+	 * sleep entry leaves its port alone. A PHY left on got the sleep entry's ATCPHY_CFG
+	 * S2R writes, which its power-up after the wake does not undo, and then every link
+	 * rate failed clock recovery into the converter. The +5 V rail stays on: without it
+	 * HPD stays low.
+	 */
+	if (dcp_t6040_fixed_hdmi(dcp) && !dcp->t6040_fixed_phy_off) {
+		phy_power_off(dcp->fixed_phy);
+		phy_exit(dcp->fixed_phy);
+		dcp->t6040_fixed_phy_off = true;
+		if (dcp->dp2hdmi_pwren)
+			gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 0);
+	}
+}
+
+static int dcp_t6041_recommit(struct apple_dcp *dcp);
+
+static int dcp_t6041_stop_one(struct device *dev, void *data)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	bool external = *(bool *)data;
+	bool idle, powered_off = false, streams_off = false;
+	u32 status;
+	int ret;
+
+	/* A link still being set up after the last wake finishes first. */
+	if (dcp) {
+		flush_work(&dcp->t6040_link_work);
+		/* The stop takes the link down again (dcp_t6040_ext_link_down()). */
+		cancel_delayed_work_sync(&dcp->t6040_plug_wq);
+		WRITE_ONCE(dcp->t6040_plug_wait, false);
+	}
+	/* dcp->external is only set on T6030. */
+	if (!dcp || IS_ERR_OR_NULL(dcp->rtk) ||
+	    !!of_device_is_compatible(dev->of_node, "apple,dcpext") != external)
+		return 0;
+	/*
+	 * An external DCP stopped for an earlier sleep stays down, with its domains forced off by
+	 * the power word step: reading its registers again hung the second sleep of a boot.
+	 */
+	if (external) {
+		/* Also one never running: the power word step took its domains down too. */
+		if (READ_ONCE(dcp->ext_dead) || dcp->t6041_ext_seen)
+			return 0;
+		dcp->t6041_ext_seen = true;
+		/*
+		 * This pipe's display DART too goes dark for good, now, while its block is still
+		 * on: the power word step forces the external display domains off and nothing
+		 * raises them, but the framebuffers are mapped through all three display DARTs, so
+		 * every later unmap went to flush a DART behind a dead block and the CPU doing it
+		 * never came back (login or sddm restart after a wake, last line
+		 * DRM_IOCTL_MODE_CLOSEFB). Marked dark, the flush only publishes to memory.
+		 */
+		dcp_s2r_find_darts(dcp);
+		if (dcp->s2r_disp_dart && !dcp_t6041_ext_restarts()) {
+			apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS,
+						   false, true);
+			streams_off = true;
+		}
+	}
+	if (!apple_rtkit_is_running(dcp->rtk))
+		return 0;
+	/* The firmware may send its D572(0) as early as during the drain. */
+	reinit_completion(&dcp->t6041_dart_off);
+	dcp_drain_for_sleep(dcp);
+	if (external && dcp_t6041_ext_restarts())
+		dcp_t6040_ext_link_down(dcp);
+	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+	iomfb_pause_presentation(dcp, true);
+	if (iomfb_queue_settle(dcp, msecs_to_jiffies(500))) {
+		ret = -EBUSY;
+		dev_err(dev, "display updates still pending, refusing sleep\n");
+		goto abort;
+	}
+	dcp_s2r_find_darts(dcp);
+	if (!external || dcp_t6041_ext_restarts()) {
+		/* Two places: the internal pipe's DARTs; the external ones' come back on resume. */
+		if (dcp->s2r_disp_dart && !external)
+			apple_dart_display_keep(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, true);
+		if (dcp->s2r_dcp_dart && !external)
+			apple_dart_display_keep(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS, true);
+		/*
+		 * The pipe off through the firmware, then wait for its calls to settle. No
+		 * av_service_disconnect: the firmware answered it with an unplug (HPD removed),
+		 * and after the warm restart it refused every mode set with
+		 * "HPD is 0 link_status is 0". No display sleep transition after the power-off
+		 * either.
+		 */
+		_dcp_poweroff(dcp);
+		powered_off = true;
+		if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp))
+			dev_warn(dev, "display calls still in flight after the power-off\n");
+		/*
+		 * An external one's system power state off, as macOS's sleep sends it: the
+		 * firmware takes the same call with state 1 after the wake only after this one.
+		 */
+		if (external && iomfb_system_power_v26_6_desktop(dcp, false))
+			dev_warn(dev, "system power state not off for the sleep\n");
+		/* At most 100 ms: the internal one doesn't always send it. */
+		if (!wait_for_completion_timeout(&dcp->t6041_dart_off, msecs_to_jiffies(100)))
+			dev_dbg(dev, "no D572(0) 100 ms after the power-off\n");
+		/*
+		 * The firmware's D572(0), only answered here: its display DART streams off now.
+		 * An external one's are flushed as well, as it goes dark below.
+		 */
+		if (dcp->s2r_disp_dart) {
+			apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS,
+						   false, external);
+			streams_off = true;
+			/* Nothing may be in flight through them once their blocks go off. */
+			ret = apple_dart_display_streams_idle(dcp->s2r_disp_dart,
+							      DCP_S2R_DISP_STREAMS);
+			if (ret) {
+				dev_err(dev, "display DART not idle for the sleep: %d\n", ret);
+				goto abort;
+			}
+		}
+	}
+	/*
+	 * The A500 reply, then the AP and IOP idle handshake only once the firmware has answered
+	 * every call on every channel: the idle request must not overtake a call in flight.
+	 */
+	ret = iomfb_s2r_500_v26_6_desktop(dcp);
+	if (ret) {
+		dev_err(dev, "no A500 reply for the sleep: %d\n", ret);
+		goto abort;
+	}
+	if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp)) {
+		ret = -ETIMEDOUT;
+		dev_err(dev, "display calls still in flight after the A500\n");
+		goto abort;
+	}
+	ret = apple_rtkit_idle(dcp->rtk);
+	if (ret) {
+		dev_err(dev, "the firmware didn't go idle for the sleep: %d\n", ret);
+		goto abort;
+	}
+	apple_rtkit_poll(dcp->rtk);
+	/*
+	 * STOPPED comes only with the run bit off, below: here the coprocessor reads idle with
+	 * its run bit still set (0x6d on all three DCPs).
+	 */
+	if (readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS, status,
+			       status & APPLE_DCP_COPROC_CPU_STATUS_IDLE, 100, 50000))
+		dev_warn(dev, "coprocessor not idle after the firmware's idle: %#x\n", status);
+	/*
+	 * QUIESCED and SLEEP after idle: an external DCP reached STOPPED (0x6e) only this way.
+	 * Not for the internal DCP: it is stopped at the idle (A500, idle, mailbox off, run bit)
+	 * so that its warm restart works; after a shutdown it crashed in the restart (data abort
+	 * at 0xffffffff00000040 right after the first shmem_setup).
+	 */
+	if (external && !dcp_t6041_ext_restarts())
+		apple_rtkit_shutdown(dcp->rtk);
+	WRITE_ONCE(dcp->crashed, true);
+	WRITE_ONCE(dcp->ext_dead, true);
+	WRITE_ONCE(dcp->s2r_fw_down, true);
+	apple_rtkit_mailbox_off(dcp->rtk);
+	dcp_s2r_cpu_stop(dcp);
+	dcp_s2r_stop_streams(dcp);
+
+	return 0;
+
+abort:
+	/* The firmware still runs: the display back on, and the sleep fails. */
+	if (streams_off)
+		apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, true, false);
+	iomfb_pause_presentation(dcp, false);
+	if (external) {
+		dcp->t6041_ext_seen = false;
+		/* Its link was taken down above: up again as after a wake. */
+		if (dcp_t6041_ext_restarts())
+			queue_work(system_dfl_wq, &dcp->t6040_link_work);
+		return ret;
+	}
+	if (powered_off && dcp_t6041_recommit(dcp))
+		dev_warn(dev, "mode set after the failed stop failed\n");
+	return ret;
+}
+
+/*
+ * The power words the stop and the restart below write, from the apple,t6041-display-power
+ * node the internal DCP names in apple,display-power. Mapped at the first sleep and kept.
+ */
+enum dcp_t6041_pw {
+	DCP_PW_PMC,		/* the display voter count */
+	DCP_PW_PS,		/* the internal pipe's power states */
+	DCP_PW_PWRGATE,		/* its retention pair */
+	DCP_PW_PS_AUX,		/* the external pipes' power states and fab6_soc */
+	DCP_PW_PWRGATE_AUX,	/* their retention pairs */
+	DCP_PW_GAPF,		/* the DCP DARTs' fabric filter slices */
+	DCP_PW_BRIDGE,		/* the internal display block's bridge 4 */
+	DCP_PW_NR,
+};
+
+static const char * const dcp_t6041_pw_names[DCP_PW_NR] = {
+	[DCP_PW_PMC] = "pmc-dcp",
+	[DCP_PW_PS] = "ps",
+	[DCP_PW_PWRGATE] = "pwrgate",
+	[DCP_PW_PS_AUX] = "ps-aux",
+	[DCP_PW_PWRGATE_AUX] = "pwrgate-aux",
+	[DCP_PW_GAPF] = "gapf",
+	[DCP_PW_BRIDGE] = "bridge",
+};
+
+static void __iomem *dcp_t6041_pw[DCP_PW_NR];
+
+/* fab6_soc's power state word in ps-aux */
+#define DCP_T6041_FAB6_SOC	0x480
+
+/*
+ * A power state word's actual state (bits 7:4) and its write-one-to-clear flags: bit 9 set
+ * once the domain was clock gated, bit 8 once it was power gated, both cleared by the lowering.
+ */
+#define DCP_PS_AUTO		BIT(28)
+#define DCP_PS_BUSY		BIT(11)
+#define DCP_PS_WAS_GATED	GENMASK(9, 8)
+#define DCP_PS_ACTUAL		GENMASK(7, 4)
+#define DCP_PS_TARGET		GENMASK(3, 0)
+/* A word reads on, and on with no transition pending. */
+#define DCP_PS_ON(v)		(((v) & DCP_PS_ACTUAL) == DCP_PS_ACTUAL)
+
+static inline bool dcp_ps_up(u32 v)
+{
+	return DCP_PS_ON(v) && !(v & DCP_PS_BUSY);
+}
+
+/* @v with its target on, manual, and its write-one-to-clear flags left alone. */
+#define DCP_PS_MANUAL_ON(v)	(((v) & ~(DCP_PS_AUTO | DCP_PS_WAS_GATED)) | DCP_PS_TARGET)
+/* A slice's word in the clock protection table: set, the fabric rejects CPU word writes. */
+#define DCP_PROT_SLICE_ON	BIT(4)
+/* Bridge 4's two words in the display bridge window, and the bit the restart sets in both. */
+#define DCP_T6041_BR4_A		0x4
+#define DCP_T6041_BR4_B		0x8
+#define DCP_T6041_BR4_EN	BIT(0)
+/*
+ * The most a lowering waits for its words: on J616s they read down within 0.4 ms. A word
+ * that was already off before may not pass the gated states again and takes the whole wait.
+ */
+#define DCP_PS_DOWN_US		50000
+
+/* Each of @n words off, and through both gated states since the lowering cleared their flags. */
+static bool dcp_t6041_words_gated(void __iomem *const *w, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if ((readl(w[i]) & (DCP_PS_ACTUAL | DCP_PS_WAS_GATED)) != DCP_PS_WAS_GATED)
+			return false;
+	return true;
+}
+
+/*
+ * A pipe's words: power states in ps (the internal pipe) or ps-aux, its retention pair in
+ * pwrgate or pwrgate-aux, its DCP DART's slice in gapf, and the number of sub-block words
+ * (8 bytes apart) after its CPU word.
+ */
+struct dcp_t6041_pipe {
+	const char *name;
+	bool aux;
+	u16 gapf;
+	u32 cpu, fe, sys;
+	u16 pg_a, pg_b;
+	u8 subs;
+};
+
+#define DCP_T6041_MAX_SUBS	11
+
+/* In the order the stop lowers them: the external pipes, then the internal one. */
+static const struct dcp_t6041_pipe dcp_t6041_pipes[] = {
+	{ "ext3", true, 0x740, 0x2e8, 0x2e0, 0x2d8, 0xfb4, 0xfd8, 7 },
+	{ "ext2", true, 0xd80, 0x4f0, 0x4e8, 0x4e0, 0xb34, 0xb58, 7 },
+	{ "ext1", true, 0xd00, 0x4a0, 0x498, 0x490, 0x6b4, 0x6d8, 7 },
+	{ "ext0", true, 0x840, 0x350, 0x348, 0x340, 0x234, 0x258, 7 },
+	{ "main", false, 0x540, 0x10000, 0x368, 0x258, 0x1c, 0x60, 11 },
+};
+
+#define DCP_T6041_MAIN		(ARRAY_SIZE(dcp_t6041_pipes) - 1)
+
+static u32 dcp_t6041_sub_saved[ARRAY_SIZE(dcp_t6041_pipes)][DCP_T6041_MAX_SUBS];
+static bool dcp_t6041_sub_valid[ARRAY_SIZE(dcp_t6041_pipes)];
+
+static void dcp_t6041_unmap_power(void)
+{
+	int i;
+
+	for (i = 0; i < DCP_PW_NR; i++) {
+		if (dcp_t6041_pw[i])
+			iounmap(dcp_t6041_pw[i]);
+		dcp_t6041_pw[i] = NULL;
+	}
+}
+
+static bool dcp_t6041_map_power(void)
+{
+	struct device_node *dcp_np, *np;
+	int i;
+
+	if (dcp_t6041_pw[DCP_PW_NR - 1])
+		return true;
+	dcp_np = of_find_compatible_node(NULL, NULL, "apple,t6041-dcp");
+	np = dcp_np ? of_parse_phandle(dcp_np, "apple,display-power", 0) : NULL;
+	of_node_put(dcp_np);
+	if (!np) {
+		pr_warn_once("dcp: no apple,display-power in the device tree, the display stays up across a sleep\n");
+		return false;
+	}
+	for (i = 0; i < DCP_PW_NR; i++) {
+		dcp_t6041_pw[i] = of_iomap(np, of_property_match_string(np, "reg-names",
+									dcp_t6041_pw_names[i]));
+		if (!dcp_t6041_pw[i])
+			break;
+	}
+	of_node_put(np);
+	if (i == DCP_PW_NR)
+		return true;
+	pr_warn_once("dcp: no %s display power words, the display stays up across a sleep\n",
+		     dcp_t6041_pw_names[i]);
+	dcp_t6041_unmap_power();
+	return false;
+}
+
+/*
+ * The power words of each display CPU down, after its firmware stopped. The fabric rejects
+ * writes to a DCP's CPU word until its slice in the clock protection table (gapf) is off.
+ * Then the words children first: the sub-blocks, the CPU, FE and SYS.
+ */
+static void dcp_t6041_word_try(unsigned int idx)
+{
+	const struct dcp_t6041_pipe *p = &dcp_t6041_pipes[idx];
+	void __iomem *ps = dcp_t6041_pw[p->aux ? DCP_PW_PS_AUX : DCP_PW_PS];
+	void __iomem *pg = dcp_t6041_pw[p->aux ? DCP_PW_PWRGATE_AUX : DCP_PW_PWRGATE];
+	void __iomem *gapf = dcp_t6041_pw[DCP_PW_GAPF] + p->gapf;
+	void __iomem *rcpu = ps + p->cpu, *rfe = ps + p->fe, *rsys = ps + p->sys;
+	void __iomem *rfab = NULL, *words[3];
+	bool main = !p->aux, down;
+	u32 val, fab = 0, cur;
+	int i;
+
+	val = readl(gapf);
+	writel(val & ~DCP_PROT_SLICE_ON, gapf);
+	if (readl_poll_timeout(gapf, cur, !(cur & DCP_PROT_SLICE_ON), 50, 1000))
+		pr_warn("dcp %s: CPU word still protected: %#x\n", p->name, cur);
+	val = readl(rcpu);
+	writel(val & ~(DCP_PS_AUTO | DCP_PS_WAS_GATED), rcpu);
+	if (readl_poll_timeout(rcpu, cur, !(cur & DCP_PS_AUTO), 50, 1000))
+		pr_warn("dcp %s: CPU word still automatic: %#x\n", p->name, cur);
+	/*
+	 * Everything the sleep controller checks off under this CPU (apple,check-ps-b4-sleep),
+	 * last first: DSC, PPP, GPL, GP1, GP0, DPEXT, DBE. The boot loader leaves them on over a
+	 * DCP Linux never started.
+	 */
+	for (i = 0; i < p->subs; i++)
+		dcp_t6041_sub_saved[idx][i] = readl(rcpu + 8 * (i + 1));
+	dcp_t6041_sub_valid[idx] = true;
+	for (i = p->subs; i > 0; i--) {
+		void __iomem *sub = rcpu + 8 * i;
+
+		val = readl(sub);
+		if (val & DCP_PS_AUTO) {
+			val &= ~(DCP_PS_AUTO | DCP_PS_WAS_GATED);
+			writel(val, sub);
+		}
+		writel((val & ~DCP_PS_TARGET) | DCP_PS_WAS_GATED, sub);
+	}
+	val = readl(rcpu);
+	/*
+	 * Two things the restart sets that boot did not have, undone before the lowering: bit 0
+	 * of both words of bridge 4 (boot 0x10000 / 0x101330, after a restart 0x10001 /
+	 * 0x101331) and the display voter count in pmc-dcp (boot 0, after a restart 1). With
+	 * them left, the second lowering of a boot ends with FE 0x200 and SYS 0x800 (busy)
+	 * instead of 0x300 / 0x300.
+	 */
+	if (main) {
+		void __iomem *br = dcp_t6041_pw[DCP_PW_BRIDGE];
+
+		writel(readl(br + DCP_T6041_BR4_A) & ~DCP_T6041_BR4_EN, br + DCP_T6041_BR4_A);
+		writel(readl(br + DCP_T6041_BR4_B) & ~DCP_T6041_BR4_EN, br + DCP_T6041_BR4_B);
+		writel(0, dcp_t6041_pw[DCP_PW_PMC]);
+	}
+	/*
+	 * The internal display's SYS hangs off fab6_soc, which gates itself as soon as nothing
+	 * under it is on. Lowered while the fabric is already going (second stop of a boot, the
+	 * external pipes long off), SYS latches its busy bit (reads 0x800, FE 0x200), the sleep
+	 * engine waits on that bit and the chip resets. So: the fabric on by hand until SYS is
+	 * down.
+	 */
+	if (main) {
+		rfab = dcp_t6041_pw[DCP_PW_PS_AUX] + DCP_T6041_FAB6_SOC;
+		fab = readl(rfab);
+		writel(DCP_PS_MANUAL_ON(fab), rfab);
+		if (readl_poll_timeout(rfab, cur, DCP_PS_ON(cur), 50, 20000))
+			pr_warn("dcp %s: fab6_soc not on: %#x\n", p->name, cur);
+	}
+	writel(3, pg + p->pg_a);
+	writel(0, pg + p->pg_b);
+	writel((val & ~DCP_PS_TARGET) | DCP_PS_WAS_GATED, rcpu);
+	val = readl(rfe);
+	if (val & DCP_PS_AUTO)
+		writel(val & ~(DCP_PS_AUTO | DCP_PS_WAS_GATED), rfe);
+	writel((readl(rfe) & ~DCP_PS_TARGET) | DCP_PS_WAS_GATED, rfe);
+	val = readl(rsys);
+	if (val & DCP_PS_AUTO)
+		writel(val & ~(DCP_PS_AUTO | DCP_PS_WAS_GATED), rsys);
+	writel((readl(rsys) & ~DCP_PS_TARGET) | DCP_PS_WAS_GATED, rsys);
+	words[0] = rcpu;
+	words[1] = rfe;
+	words[2] = rsys;
+	if (read_poll_timeout(dcp_t6041_words_gated, down, down, 50, DCP_PS_DOWN_US, false,
+			      words, ARRAY_SIZE(words)))
+		pr_debug("dcp %s: words not down: cpu %#x fe %#x sys %#x\n", p->name,
+			 readl(rcpu), readl(rfe), readl(rsys));
+	if (rfab) {
+		if (readl_poll_timeout(rsys, cur, !(cur & (DCP_PS_ACTUAL | DCP_PS_BUSY)), 50,
+				       50000))
+			pr_warn("dcp %s: sys still %#x with fab6_soc held\n", p->name, cur);
+		/* Back to automatic, as it was; the write-one-to-clear flags left alone. */
+		writel((readl(rfab) & ~(DCP_PS_WAS_GATED | DCP_PS_AUTO)) | (fab & DCP_PS_AUTO),
+		       rfab);
+		/* With nothing under it on, it gates itself (within 0.4 ms on J616s). */
+		if (readl_poll_timeout(rfab, cur, !(cur & DCP_PS_ACTUAL), 50, 5000))
+			pr_debug("dcp %s: fab6_soc kept on: %#x\n", p->name, cur);
+	}
+}
+
+/*
+ * After a real wake, the internal DCP back: DISP_SYS on, the retention pair (A := 0, B := 1),
+ * DISP_FE on, the GAPF protection off, DISP_CPU on, its 11 children as the stop found them,
+ * the PMC voter, both DARTs' streams, the idled firmware restarted, the pipe powered and the
+ * mode set again.
+ */
+static int dcp_t6041_recommit(struct apple_dcp *dcp)
+{
+	struct apple_crtc *acrtc = READ_ONCE(dcp->crtc);
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_atomic_commit *state;
+	struct drm_crtc_state *cs;
+	struct drm_crtc *crtc;
+	int ret;
+
+	reinit_completion(&dcp->t6041_plugged);
+	iomfb_poweron_v26_6_desktop(dcp);
+	/*
+	 * The firmware brings its link and hotplug state back first, and reports the display
+	 * through the hotplug that follows (dcp_hotplug()). The mode set goes ahead either way.
+	 */
+	if (!wait_for_completion_timeout(&dcp->t6041_plugged,
+					 msecs_to_jiffies(DCP_S2R_PANEL_MS)))
+		dev_warn(dcp->dev, "display not reported back %u ms after the power-on\n",
+			 DCP_S2R_PANEL_MS);
+	if (!acrtc)
+		return 0;
+	crtc = &acrtc->base;
+	DRM_MODESET_LOCK_ALL_BEGIN(crtc->dev, ctx, 0, ret);
+	if (!crtc->state->active) {
+		ret = 0;
+		goto unlock;
+	}
+	state = drm_atomic_commit_alloc(crtc->dev);
+	if (!state) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+	state->acquire_ctx = &ctx;
+	cs = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(cs)) {
+		ret = PTR_ERR(cs);
+		goto put;
+	}
+	cs->mode_changed = true;
+	ret = drm_atomic_add_affected_connectors(state, crtc);
+	if (!ret)
+		ret = drm_atomic_add_affected_planes(state, crtc);
+	if (!ret)
+		ret = drm_atomic_commit(state);
+put:
+	drm_atomic_commit_put(state);
+unlock:
+	DRM_MODESET_LOCK_ALL_END(crtc->dev, ctx, ret);
+	return ret;
+}
+
+static int dcp_t6041_start_one(struct device *dev, void *data)
+{
+	const struct dcp_t6041_pipe *p = &dcp_t6041_pipes[DCP_T6041_MAIN];
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	void __iomem *ps = dcp_t6041_pw[DCP_PW_PS];
+	void __iomem *pg = dcp_t6041_pw[DCP_PW_PWRGATE];
+	void __iomem *gapf = dcp_t6041_pw[DCP_PW_GAPF] + p->gapf;
+	u32 v, cur, to = 0;
+	int ret, i;
+
+	/* Only a firmware the stop took down: after a failed stop the rest still run. */
+	if (!dcp || IS_ERR_OR_NULL(dcp->rtk) || !READ_ONCE(dcp->s2r_fw_down) ||
+	    !of_device_is_compatible(dev->of_node, "apple,t6041-dcp"))
+		return 0;
+
+	v = readl(ps + p->sys) & ~(DCP_PS_WAS_GATED | DCP_PS_TARGET | DCP_PS_AUTO);
+	/*
+	 * Target on with both flag bits clear (0xf). Raised with the flags kept (0x30f) the word
+	 * reads 0x3ff, a later write can't clear them, and the next lowering then latches the
+	 * busy bit on SYS (0x800) and leaves FE at 0x200: the sleep engine waits on that bit and
+	 * the chip resets (second sleep of a boot).
+	 */
+	writel(v | DCP_PS_TARGET, ps + p->sys);
+	if (readl_poll_timeout(ps + p->sys, cur, dcp_ps_up(cur), 50, 10000))
+		to |= BIT(0);
+	writel(0, pg + p->pg_a);
+	writel(1, pg + p->pg_b);
+	/*
+	 * Bridge 4 stays as boot has it (bit 0 of both words clear, 0x10000 / 0x101330): with it
+	 * set, the driver's own display power-off after a wake froze the whole machine right
+	 * after "dcp_poweroff() done" (login after a wake, sddm restart).
+	 */
+	v = readl(ps + p->fe) & ~(DCP_PS_WAS_GATED | DCP_PS_TARGET | DCP_PS_AUTO);
+	writel(v | DCP_PS_TARGET, ps + p->fe);
+	if (readl_poll_timeout(ps + p->fe, cur, DCP_PS_ON(cur), 50, 10000))
+		to |= BIT(1);
+	writel(readl(gapf) & ~DCP_PROT_SLICE_ON, gapf);
+	v = readl(ps + p->cpu);
+	writel(DCP_PS_MANUAL_ON(v), ps + p->cpu);
+	/* The CPU word's write reaches the PMGR before its state is polled. */
+	mb();
+	if (readl_poll_timeout(ps + p->cpu, cur, dcp_ps_up(cur), 50, 10000))
+		to |= BIT(2);
+	for (i = 0; i < p->subs && dcp_t6041_sub_valid[DCP_T6041_MAIN]; i++) {
+		void __iomem *cw = ps + p->cpu + 8 * (i + 1);
+		u32 want = dcp_t6041_sub_saved[DCP_T6041_MAIN][i];
+
+		if (!(want & DCP_PS_TARGET) || (readl(cw) & DCP_PS_ACTUAL))
+			continue;
+		writel(want, cw);
+		if (readl_poll_timeout(cw, cur, cur & DCP_PS_ACTUAL, 50, 2000))
+			to |= BIT(8 + i);
+	}
+	dcp_pmc_set(dcp, dcp_t6041_pw[DCP_PW_PMC], true);
+	if (to)
+		dev_warn(dev, "display domains not on after the sleep: %#x\n", to);
+
+	dcp_s2r_find_darts(dcp);
+	if (dcp->s2r_disp_dart) {
+		apple_dart_display_keep(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, false);
+		apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, true, false);
+	}
+	if (dcp->s2r_dcp_dart) {
+		apple_dart_display_keep(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS, false);
+		apple_dart_display_streams(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS, true, false);
+	}
+	dcp_s2r_put_darts(dcp);
+
+	WRITE_ONCE(dcp->crashed, false);
+	WRITE_ONCE(dcp->ext_dead, false);
+	ret = apple_rtkit_power_cycled_return(dcp->rtk,
+					      dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	if (ret) {
+		dev_err(dev, "the firmware's warm restart after the sleep failed: %d\n", ret);
+		WRITE_ONCE(dcp->crashed, true);
+		return 0;
+	}
+	WRITE_ONCE(dcp->s2r_fw_down, false);
+	/*
+	 * Before the mode set, not after it: the commit's swap is what hands the firmware the
+	 * console's framebuffer, and fbcon draws into that memory without committing again. With
+	 * presentation still paused the swap was dropped and the panel stayed black with everything
+	 * else up.
+	 */
+	iomfb_pause_presentation(dcp, false);
+	ret = dcp_t6041_recommit(dcp);
+	if (ret)
+		dev_warn(dev, "mode set after the sleep failed: %d\n", ret);
+	if (!READ_ONCE(dcp->crashed))
+		iomfb_pause_presentation(dcp, false);
+	dcp_backlight_s2r_restore(dcp);
+	return 0;
+}
+
+static bool dcp_t6041_down, dcp_t6041_words;
+
+/*
+ * The internal display's SYS, FE and CPU power words as they were before the stop (from boot:
+ * SYS and FE with no flags, the CPU word 0x1000030f, automatic). The restart leaves the CPU word
+ * manual (0x0f0003ff) and SYS/FE with both flags, and the first display power-off after such a
+ * wake hung the machine. Put back once the display runs again.
+ */
+static u32 dcp_t6041_boot_ps[3];
+
+static void dcp_t6041_boot_ps_io(bool restore)
+{
+	const struct dcp_t6041_pipe *p = &dcp_t6041_pipes[DCP_T6041_MAIN];
+	const u32 off[3] = { p->sys, p->fe, p->cpu };
+	void __iomem *ps = dcp_t6041_pw[DCP_PW_PS];
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		if (!restore)
+			dcp_t6041_boot_ps[i] = readl(ps + off[i]);
+		else if (dcp_t6041_boot_ps[i])
+			writel(dcp_t6041_boot_ps[i] & ~DCP_PS_ACTUAL, ps + off[i]);
+	}
+}
+
+/* @np's first DART, dark if its driver is bound. */
+static void dcp_t6041_dart_dark(struct device_node *np)
+{
+	struct device_node *dart = np ? of_parse_phandle(np, "iommus", 0) : NULL;
+	struct platform_device *pdev = dart ? of_find_device_by_node(dart) : NULL;
+
+	of_node_put(dart);
+	if (!pdev)
+		return;
+	if (device_is_bound(&pdev->dev))
+		apple_dart_power_dark(&pdev->dev, true);
+	put_device(&pdev->dev);
+}
+
+/*
+ * Every external chain's DARTs, dark before their domains go off. The display subsystem maps
+ * every framebuffer through the display DARTs, and an unmap after the wake (an sddm restart, a
+ * logout) flushed one behind a dead block and stopped the machine. By node, so a chain
+ * whose DCP never bound, which the display subsystem skips as unusable, is covered too, and so
+ * is every chain a board enables, not only the first two.
+ */
+static void dcp_t6041_ext_darts_dark(void)
+{
+	struct device_node *np, *piodma;
+
+	for_each_compatible_node(np, NULL, "apple,t6041-dcpext") {
+		if (!of_device_is_available(np))
+			continue;
+		piodma = of_get_child_by_name(np, "piodma");
+		dcp_t6041_dart_dark(piodma);
+		of_node_put(piodma);
+		dcp_t6041_dart_dark(np);
+	}
+}
+
+/* A power word to manual target on, as the internal pipe's wake writes it; true once on. */
+static bool dcp_t6040_word_up(void __iomem *w)
+{
+	u32 v = readl(w) & ~(DCP_PS_WAS_GATED | DCP_PS_TARGET | DCP_PS_AUTO), cur;
+
+	writel((v & ~(DCP_PS_WAS_GATED | DCP_PS_TARGET)) | DCP_PS_TARGET, w);
+	return !readl_poll_timeout(w, cur, dcp_ps_up(cur), 50, 10000);
+}
+
+static void dcp_t6040_dart_lit(struct device_node *np)
+{
+	struct device_node *dart = np ? of_parse_phandle(np, "iommus", 0) : NULL;
+	struct platform_device *pdev = dart ? of_find_device_by_node(dart) : NULL;
+
+	of_node_put(dart);
+	if (!pdev)
+		return;
+	if (device_is_bound(&pdev->dev))
+		apple_dart_power_dark(&pdev->dev, false);
+	put_device(&pdev->dev);
+}
+
+/*
+ * T6040: an external DCP after the wake, as the internal one: its domains in the internal
+ * pipe's order (SYS, the retention pair, FE, the GAPF protection off, CPU, its sub-blocks as
+ * the stop found them, the PMC voter), its DARTs lit and their streams on, the idled firmware
+ * restarted, then its link set up again as after any system sleep. A display on it comes
+ * back through its hotplug. One that does not come back stays stopped, as before.
+ */
+static int dcp_t6040_ext_start_one(struct device *dev, void *data)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	const struct dcp_t6041_pipe *p;
+	void __iomem *ps, *pg, *cpu;
+	struct device_node *piodma;
+	unsigned int n;
+	u32 cur, to = 0;
+	int ret, i;
+
+	if (!dcp || IS_ERR_OR_NULL(dcp->rtk) || !dcp->t6041_ext_seen ||
+	    !READ_ONCE(dcp->s2r_fw_down))
+		return 0;
+	/* Endpoint 1 is ext0, the last external pipe in the table. */
+	if (!dcp->peer_endpoint || dcp->peer_endpoint > DCP_T6041_MAIN)
+		return 0;
+	n = DCP_T6041_MAIN - dcp->peer_endpoint;
+	p = &dcp_t6041_pipes[n];
+	ps = dcp_t6041_pw[DCP_PW_PS_AUX];
+	pg = dcp_t6041_pw[DCP_PW_PWRGATE_AUX];
+	cpu = ps + p->cpu;
+
+	if (!dcp_t6040_word_up(ps + p->sys))
+		to |= BIT(0);
+	writel(0, pg + p->pg_a);
+	writel(1, pg + p->pg_b);
+	if (!dcp_t6040_word_up(ps + p->fe))
+		to |= BIT(1);
+	writel(readl(dcp_t6041_pw[DCP_PW_GAPF] + p->gapf) & ~DCP_PROT_SLICE_ON,
+	       dcp_t6041_pw[DCP_PW_GAPF] + p->gapf);
+	if (!dcp_t6040_word_up(cpu))
+		to |= BIT(2);
+	for (i = 0; i < p->subs && dcp_t6041_sub_valid[n]; i++) {
+		void __iomem *cw = cpu + 8 * (i + 1);
+		u32 want = dcp_t6041_sub_saved[n][i];
+
+		if (!(want & DCP_PS_TARGET) || (readl(cw) & DCP_PS_ACTUAL))
+			continue;
+		writel(want, cw);
+		if (readl_poll_timeout(cw, cur, cur & DCP_PS_ACTUAL, 50, 2000))
+			to |= BIT(8 + i);
+	}
+	dcp_t6041_sub_valid[n] = false;
+	if (to) {
+		dev_err(dev, "display domains not on after the sleep (%#x): the output stays off\n",
+			to);
+		return 0;
+	}
+	dcp_pmc_set(dcp, dcp_t6041_pw[DCP_PW_PMC], true);
+
+	piodma = of_get_child_by_name(dev->of_node, "piodma");
+	dcp_t6040_dart_lit(piodma);
+	of_node_put(piodma);
+	dcp_t6040_dart_lit(dev->of_node);
+	dcp_s2r_find_darts(dcp);
+	if (dcp->s2r_disp_dart)
+		apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, true, false);
+	if (dcp->s2r_dcp_dart)
+		apple_dart_display_streams(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS, true, false);
+	dcp_s2r_put_darts(dcp);
+
+	WRITE_ONCE(dcp->crashed, false);
+	WRITE_ONCE(dcp->ext_dead, false);
+	ret = apple_rtkit_power_cycled_return(dcp->rtk,
+					      dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	if (ret) {
+		dev_err(dev, "the firmware's warm restart after the sleep failed: %d\n", ret);
+		WRITE_ONCE(dcp->crashed, true);
+		WRITE_ONCE(dcp->ext_dead, true);
+		WRITE_ONCE(dcp->t6040_relinking, false);
+		return 0;
+	}
+	WRITE_ONCE(dcp->s2r_fw_down, false);
+	dcp->t6041_ext_seen = false;
+	/* The restarted firmware has no mode and its pipe is off. */
+	WRITE_ONCE(dcp->mode_state.valid, false);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		dcp->desktop->ext_pipe_off = true;
+	iomfb_pause_presentation(dcp, false);
+	/* Its link takes a second or more: not in the resume. */
+	queue_work(system_dfl_wq, &dcp->t6040_link_work);
+	return 0;
+}
+
+/* The most the converter's rails take to come up: probe's wait for them before the link. */
+#define DCP_T6040_RAILS_MS	100
+
+/*
+ * The fixed HDMI output given back before the sleep (dcp_t6040_ext_link_down()): the converter's
+ * rail on, its DP PHY set up from the start as probe does, then the converter up before the link
+ * is requested: a sink behind it raises HPD once it is powered (dcp_t6040_link_work()).
+ */
+static void dcp_t6040_fixed_phy_up(struct apple_dcp *dcp)
+{
+	ktime_t t = ktime_get();
+	int ret, hpd;
+
+	if (dcp->hdmi_pwren)
+		gpiod_set_value_cansleep(dcp->hdmi_pwren, 1);
+	if (dcp->dp2hdmi_pwren)
+		gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 1);
+	ret = phy_init(dcp->fixed_phy);
+	if (!ret) {
+		ret = phy_power_on(dcp->fixed_phy);
+		if (ret)
+			phy_exit(dcp->fixed_phy);
+	}
+	if (ret) {
+		/*
+		 * The PHY stays off (the unbind action must not power off a PHY that is not on),
+		 * and so do the converter's rails.
+		 */
+		dev_err(dcp->dev, "HDMI: DP PHY not powered again after the sleep: %d\n", ret);
+		if (dcp->dp2hdmi_pwren)
+			gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 0);
+		if (dcp->hdmi_pwren)
+			gpiod_set_value_cansleep(dcp->hdmi_pwren, 0);
+		return;
+	}
+	dcp->t6040_fixed_phy_off = false;
+	/*
+	 * Without an HPD line nothing reports the converter up: the same wait as probe's after
+	 * the rails.
+	 */
+	if (!dcp->hdmi_hpd) {
+		msleep(DCP_T6040_RAILS_MS);
+		return;
+	}
+	/* A sink raises HPD once the converter is up; without one the whole wait. */
+	ret = read_poll_timeout(gpiod_get_value_cansleep, hpd, hpd, 1000,
+				DCP_T6040_RAILS_MS * USEC_PER_MSEC, false, dcp->hdmi_hpd);
+	if (hpd < 0)
+		dev_warn(dcp->dev, "HDMI: HPD not readable after the sleep: %d\n", hpd);
+	else if (!ret)
+		dev_dbg(dcp->dev, "HDMI: HPD %lld us after the rails\n",
+			ktime_us_delta(ktime_get(), t));
+}
+
+/*
+ * An external DCP's firmware back after a T6040 S2R: the system power state on again, as
+ * macOS sends it after a wake (the controller is off until then), then the link as after the
+ * firmware start at bind (dcp_wait_ready()): a Type-C cable or the HDMI port's HPD connects it
+ * again, and the HPD interrupt is on again. The next sleep's stop waits for this.
+ */
+static void dcp_t6040_link_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, t6040_link_work);
+	bool plug;
+	int ret;
+
+	ret = iomfb_system_power_v26_6_desktop(dcp, true);
+	if (ret)
+		dev_warn(dcp->dev, "system power state not on after the sleep: %d\n", ret);
+	/*
+	 * A display is back once the firmware reports it plugged (dcpep_cb_hotplug()), which
+	 * comes seconds after its link is requested: a mode set before that leaves the pipe off
+	 * ("Modeset done, but pipe not enabled") and fails. Set before the link is requested, so
+	 * that the plug cannot come first.
+	 */
+	plug = dcp_is_typec_output(dcp) && READ_ONCE(dcp->typec_cable_connected);
+	WRITE_ONCE(dcp->t6040_plug_wait, plug);
+	dcp_enable_typec_work(dcp);
+	if (dcp->t6040_fixed_phy_off)
+		dcp_t6040_fixed_phy_up(dcp);
+	/* The HDMI port: a sink behind the converter, which its HPD shows once powered. */
+	if (!plug && dcp_t6040_fixed_hdmi(dcp) && !READ_ONCE(dcp->hdmi_yielded) &&
+	    gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0) {
+		plug = true;
+		WRITE_ONCE(dcp->t6040_plug_wait, true);
+	}
+	dcp_enable_dp2hdmi_hpd(dcp);
+	if (dcp->avep)
+		av_service_connect(dcp);
+	if (plug && READ_ONCE(dcp->t6040_plug_wait)) {
+		mod_delayed_work(system_dfl_wq, &dcp->t6040_plug_wq,
+				 msecs_to_jiffies(DCP_S2R_PLUG_MS));
+		return;
+	}
+	WRITE_ONCE(dcp->t6040_relinking, false);
+}
+
+/*
+ * The firmware reported the display plugged after the restart (plug), or never did
+ * within DCP_S2R_PLUG_MS: either way the link work is through, and the hotplug worker applies
+ * the CRTC state that DRM kept active, or the compositor learns that the display is gone.
+ */
+void dcp_t6040_plug_done(struct apple_dcp *dcp, bool plug)
+{
+	if (!xchg(&dcp->t6040_plug_wait, false))
+		return;
+	if (!plug)
+		dev_info(dcp->dev, "display not reported back after the sleep\n");
+	WRITE_ONCE(dcp->t6040_relinking, false);
+	/*
+	 * The hotplug the plug itself queues may run first and skip this output while it is
+	 * relinking, and an unchanged connector queues none: queue one now.
+	 */
+	if (dcp->connector)
+		dcp_queue_hotplug(dcp->connector);
+}
+
+static void dcp_t6040_plug_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
+					     t6040_plug_wq);
+
+	dcp_t6040_plug_done(dcp, false);
+}
+
+enum dcp_t6041_step { DCP_S2R_FW_STOP, DCP_S2R_WORDS_DOWN, DCP_S2R_START };
+
+/* Each step once per sleep. */
+static int dcp_t6041_s2r_step(enum dcp_t6041_step step)
+{
+	bool external = true;
+	unsigned int i;
+	int ret;
+
+	if (step == DCP_S2R_START) {
+		if (!dcp_t6041_down)
+			return 0;
+		dcp_t6041_down = false;
+		dcp_t6041_words = false;
+		ret = driver_for_each_device(&apple_platform_driver.driver, NULL, NULL,
+					     dcp_t6041_start_one);
+		/* The internal display runs again: its mode set has completed. */
+		dcp_t6041_boot_ps_io(true);
+		if (!ret && dcp_t6041_ext_restarts())
+			ret = driver_for_each_device(&apple_platform_driver.driver, NULL, NULL,
+						     dcp_t6040_ext_start_one);
+		return ret;
+	}
+	if (step == DCP_S2R_WORDS_DOWN) {
+		if (dcp_t6041_words || !dcp_t6041_down)
+			return 0;
+		dcp_t6041_words = true;
+		dcp_t6041_ext_darts_dark();
+		/* T6041's ext2 and ext3: never started, but the complex counts them. */
+		for (i = dcp_t6041_power()->first_pipe; i < ARRAY_SIZE(dcp_t6041_pipes); i++)
+			dcp_t6041_word_try(i);
+		return 0;
+	}
+	if (dcp_t6041_down)
+		return 0;
+	dcp_t6041_down = true;
+	dcp_t6041_boot_ps_io(false);
+	ret = driver_for_each_device(&apple_platform_driver.driver, NULL, &external,
+				     dcp_t6041_stop_one);
+	external = false;
+	return ret ?: driver_for_each_device(&apple_platform_driver.driver, NULL, &external,
+					     dcp_t6041_stop_one);
+}
+
+/*
+ * The CPU words and sub-block words of the pipes from @first on with their actual state
+ * (bits 7:4) off: what the sleep controller checks before the sleep (apple,check-ps-b4-sleep).
+ */
+static bool dcp_t6041_words_off(unsigned int first)
+{
+	unsigned int idx;
+	int i;
+
+	for (idx = first; idx < ARRAY_SIZE(dcp_t6041_pipes); idx++) {
+		const struct dcp_t6041_pipe *p = &dcp_t6041_pipes[idx];
+		void __iomem *cpu = dcp_t6041_pw[p->aux ? DCP_PW_PS_AUX : DCP_PW_PS] + p->cpu;
+
+		for (i = 0; i <= p->subs; i++)
+			if (readl(cpu + 8 * i) & DCP_PS_ACTUAL)
+				return false;
+	}
+	return true;
+}
+
+/*
+ * T6041: the display down for a real sleep (!@start) and back after it (@start). A firmware that
+ * can't be stopped fails the sleep, with every one already stopped started again.
+ */
+int dcp_t6041_s2r_all(bool start)
+{
+	const struct dcp_t6041_power_soc *soc = dcp_t6041_power();
+	unsigned int first;
+	ktime_t t;
+	bool off;
+	int ret;
+
+	if (!soc)
+		return 0;
+	first = soc->first_pipe;
+	if (start)
+		return dcp_t6041_s2r_step(DCP_S2R_START);
+	if (dcp_t6041_down || !dcp_t6041_map_power())
+		return 0;
+	ret = dcp_t6041_s2r_step(DCP_S2R_FW_STOP);
+	if (ret) {
+		dcp_t6041_s2r_step(DCP_S2R_START);
+		return ret;
+	}
+	dcp_t6041_s2r_step(DCP_S2R_WORDS_DOWN);
+	/* Until the lowered words read off, at most DCP_S2R_DOWN_MS. */
+	t = ktime_get();
+	if (read_poll_timeout(dcp_t6041_words_off, off, off, 1000,
+			      DCP_S2R_DOWN_MS * USEC_PER_MSEC, false, first))
+		pr_warn("dcp: display power words not off %lld ms after the power word step\n",
+			ktime_ms_delta(ktime_get(), t));
+	else
+		pr_debug("dcp: display power words off after %lld us\n",
+			 ktime_us_delta(ktime_get(), t));
+
+	return 0;
+}
+
 int __init dcp_register(void)
 {
 	return platform_driver_register(&apple_platform_driver);
@@ -9806,6 +10936,7 @@ int __init dcp_register(void)
 void dcp_unregister(void)
 {
 	platform_driver_unregister(&apple_platform_driver);
+	dcp_t6041_unmap_power();
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
