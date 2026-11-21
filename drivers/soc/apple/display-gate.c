@@ -3409,12 +3409,13 @@ static void __init gate_j713_dcpext_routes(void)
 }
 
 /*
- * The MacBook Air (J713) on macOS 27.2: aura hands dcpext0 and dcpext1 over
- * as it hands over the J773g's (their firmware memory, the 26B123 image and
- * their pipes' firmware clocks) beside the internal display, and writes no
- * apple,t8132-dcpext-firmware-ready: they run the firmware-27 backend as
- * pipes of the internal display's DRM device (apple_t8132_dcpext_v27_2()),
- * not the M4 one. Their nodes and DARTs are enabled in the tree already.
+ * A T8132 dcpext on its Type-C routes handed over with the 27.2 image (the
+ * MacBook Air's (J713) dcpext0 and dcpext1 on macOS 27.2): aura hands it over
+ * as it hands over the J773g's (its firmware memory, the 26B123 image and its
+ * pipe's firmware clocks) beside the internal display, and writes no
+ * apple,t8132-dcpext-firmware-ready: it runs the firmware-27 backend as a
+ * pipe of the internal display's DRM device (apple_t8132_dcpext_v27_2()),
+ * not the M4 one. Its node and DARTs are enabled in the tree already.
  *
  * Enable the Type-C routes and the PIODMA child of each such dcpext, and add
  * its display DART (its PIODMA's) to the display subsystem's iommus, in one
@@ -3477,6 +3478,15 @@ static bool __init gate_j713_v27_memory(struct device_node *dcp)
 	return true;
 }
 
+static bool __init gate_has_typec_routes(struct device_node *dcp)
+{
+	struct device_node *routes = of_get_child_by_name(dcp, "typec-routes");
+	bool has = routes && of_get_child_count(routes);
+
+	of_node_put(routes);
+	return has;
+}
+
 static void __init gate_j713_dcpext_v27(void)
 {
 	struct device_node *darts[2] = {}, *display, *np;
@@ -3486,8 +3496,6 @@ static void __init gate_j713_dcpext_v27(void)
 	__be32 *value;
 	int ret = 0;
 
-	if (!of_machine_is_compatible("apple,j713"))
-		return;
 	display = of_find_compatible_node(NULL, NULL, "apple,t8132-display-subsystem");
 	if (!display)
 		return;
@@ -3498,6 +3506,9 @@ static void __init gate_j713_dcpext_v27(void)
 	}
 	for_each_compatible_node(np, NULL, "apple,t8132-dcpext") {
 		if (!of_device_is_available(np) || !apple_t8132_dcpext_v27_2(np))
+			continue;
+		/* A fixed-PHY (HDMI) dcpext has its own chain. */
+		if (!gate_has_typec_routes(np))
 			continue;
 		if (!gate_j713_v27_memory(np)) {
 			pr_info("apple-j713-display: %pOF: 27.2 image without firmware memory, left off\n",
