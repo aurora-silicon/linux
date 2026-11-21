@@ -314,6 +314,11 @@
 	status = "okay";
 };
 
+/* aura (mcc_init_m5) turns the system level cache on; the driver confirms it and flushes on shutdown. */
+&mcc {
+	status = "okay";
+};
+
 #include "t8142-j704-display.dtsi"
 #include "t8142-j704-peripherals.dtsi"
 #include "t8142-j704-usb.dtsi"

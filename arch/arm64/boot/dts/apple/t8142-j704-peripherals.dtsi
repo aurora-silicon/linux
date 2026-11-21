@@ -60,6 +60,12 @@
 		label = "pmp";
 		/* The PMP's SRAM, which the driver reads first. */
 		power-domains = <&ps_pms_sram>;
+		/*
+		 * As on T8140/T8132 and the J813: the PMP firmware keeps running
+		 * DCS and fabric DVFS. If genpd gates this domain at s2idle, the
+		 * PMP crashes on its own MMIO.
+		 */
+		apple,always-on;
 	};
 
 	ps_pms_sram: power-controller@5a0 {
@@ -247,6 +253,13 @@
 
 			/* Layout is filled by the loader using this machine's own data. */
 			keyboard: keyboard { };
+
+			/*
+			 * The trackpad's haptic engine. The MTP firmware offers it
+			 * as interface 4 "actuator"; without this node the click
+			 * stays firmware-driven and there is no Force Touch stage.
+			 */
+			actuator { };
 		};
 	};
 };
