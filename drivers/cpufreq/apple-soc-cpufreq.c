@@ -314,12 +314,13 @@ static const struct apple_soc_cpufreq_info soc_t8142_info = {
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
 
-/* T8152 ACC uses state 2 as the first OPP and shares P/M requests. */
+/*
+ * T8152 ACC uses state 2 as the first OPP and shares P/M requests. Its
+ * board DTs throttle the higher states through SMC thermal zones.
+ */
 static const struct apple_soc_cpufreq_info soc_t8152_info = {
 	.verify_transition = true,
-	.needs_thermal_policy = true,
 	.transition_timeout_us = 2000,
-	.max_unmanaged_pstate = 3,
 	.min_pstate = 2,
 	.max_pstate = 31,
 	.ps1_mask = APPLE_DVFS_CMD_PS1,
