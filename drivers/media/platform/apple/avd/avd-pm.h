@@ -44,6 +44,7 @@ struct avd_pm {
 	bool hw_on;
 	unsigned int irq_gen;
 	void __iomem *piodma;
+	void __iomem *axi2af; /* T8132: the decoder's AXI-to-fabric bridge */
 	phys_addr_t sram_phys;
 	wait_queue_head_t idle_wait;
 	/* Protected by queue_lock; counts drain operations, not stopped streams. */
@@ -59,6 +60,11 @@ void avd_pm_init(struct avd_dev *avd, const struct avd_backend_ops *backend,
 void avd_pm_enable(struct avd_dev *avd);
 int avd_pm_map_piodma(struct avd_dev *avd);
 void avd_pm_prepare_piodma(struct avd_dev *avd);
+int avd_pm_map_axi2af(struct avd_dev *avd);
+void avd_pm_apply_axi_daisy(struct avd_dev *avd);
+/* Exposed for KUnit: program @base in macOS's order, return entries that read back. */
+unsigned int avd_pm_write_daisy_tunables(void __iomem *base);
+#define AVD_DAISY_TUNABLES 47
 /* After queue cleanup: release deferred DMA mappings before the final off. */
 void avd_pm_disable(struct avd_dev *avd);
 /* Called in process context, after the last frame has retired its mapping. */
