@@ -111,6 +111,33 @@
 		operating-points-v2 = <&gpu_opp>;
 		/* Holds the DCS and fabric floor while GPU work is in flight. */
 		apple,clpc = <&clpc>;
+
+		/*
+		 * The board's GPU power data, which the driver requires (J813 and J815, which
+		 * runs the J813's). SRAM voltage per OPP: the J813 ADT's sgx perf-states-sram.
+		 */
+		apple,sram-microvolt = <770000 770000 770000 770000 770000 770000 770000
+					790000 830000 865000 890000 945000 1010000>;
+		/*
+		 * Relative performance per OPP (IEEE single, percent), from macOS 27.0's own
+		 * hardware data on a J813 (bundle +0x19e4): 19.4 % at the lowest state up to 100.
+		 */
+		apple,m5-relative-power = <0 0x419b36eb 0x41d06202 0x4205907a 0x42274b32
+					   0x4247eae1 0x426b0873 0x428a5bac 0x42a45b3f
+					   0x42ab4981 0x42b03cd5 0x42bb20f3 0x42c80000>;
+		/* AON row RT0g (index 0x1d), as the J813's 25G76 AON block carries it. */
+		apple,m5-aon-records = <0x67305452 0x001d0001 0x00001401>;
+		/*
+		 * Words of macOS 27.0's own hardware data on the J813, read out of its bundle,
+		 * that the driver's template leaves different.
+		 */
+		apple,m5-hw-words = <0x0fa8 0x8000>, <0x0fb4 2>, <0x0fb8 0>, <0x1044 0xc>,
+				    <0x10a4 0xa>, <0x10d4 0x17>, <0x1118 0>, <0x2660 4>,
+				    <0x2720 1>, <0x2724 0>;
+		/* Region C and the power policy are the driver's template as they are. */
+		apple,m5-region-c-words = <>;
+		apple,m5-policy-words = <>;
+		apple,idleoff-standby-timer = <1250>;
 	};
 
 	gfx_mbox: mailbox@582600000 {

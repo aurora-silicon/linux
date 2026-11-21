@@ -1652,9 +1652,6 @@ const J714_AON_RECORDS: [[u32; 3]; 3] = [
     [0x7230_5452, 0x00ce_0001, 0x0000_1401],
 ];
 
-// J813's row tagged RT0g (one GPU cluster), as its 25G76 AON block carries.
-const J813_AON_RECORDS: [[u32; 3]; 1] = [[0x6730_5452, 0x001d_0001, 0x0000_1401]];
-
 // J716c's rows tagged RT0g, RT1g and RT0r.
 const J716C_AON_RECORDS: [[u32; 3]; 3] = [
     [0x6730_5452, 0x0058_0001, 0x0000_1401],
@@ -2336,6 +2333,12 @@ pub(crate) fn encode_common26_bundle_policy(
     // The AON row the policy names: the board's first record (RT0g on J813 and J873).
     let record = board.aon_records.first().ok_or(InitdataError::BufferSize)?;
     put_u32(policy, 0x64e0, record[0]);
+    for &(offset, value) in board.policy_words {
+        if offset % 4 != 0 || offset + 4 > COMMON26_POLICY_SIZE {
+            return Err(InitdataError::BufferSize);
+        }
+        put_u32(policy, offset, value);
+    }
     put_u64(policy, COMMON26_POLICY_STATE_PTR, bindings.state);
     put_u64(policy, COMMON26_POLICY_AON_PTD_PTR, bindings.aon_ptd);
     put_u64(policy, COMMON26_POLICY_BOOT_TIMESTAMP, bindings.boot_timestamp);
@@ -2361,6 +2364,22 @@ pub(crate) fn encode_common26_board_region_c(out: &mut [u8]) -> Result<(), Initd
     out.copy_within(0x38..shifted, 0x3c);
     out[0x38..0x3c].fill(0);
     for (offset, value) in COMMON26_REGION_C_NEW_WORDS {
+        put_u32(out, offset, value);
+    }
+    Ok(())
+}
+
+/// Apply the board's own region-C words ([`Board::region_c_words`]) over the common 26A428
+/// region C [`encode_common26_board_region_c`] wrote.
+pub(crate) fn set_common26_region_c_words(board: &Board, out: &mut [u8])
+    -> Result<(), InitdataError> {
+    if out.len() != REGION_C_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    for &(offset, value) in board.region_c_words {
+        if offset % 4 != 0 || offset + 4 > ABI_ALLOCATION_SIZES_26A428[ALLOC_REGION_C] {
+            return Err(InitdataError::BufferSize);
+        }
         put_u32(out, offset, value);
     }
     Ok(())
@@ -2423,6 +2442,14 @@ pub(crate) struct Board {
     pub(crate) register_slot_flags: Option<&'static [u32; COMMON26_HW_REGISTER_MAP_SLOTS]>,
     /// Region C's idle standby timer where the board's differs from the image's 1500 us, us.
     pub(crate) idle_standby_us: Option<u32>,
+    /// Words of the common 26A428 region C (offsets in its layout) where the board's own
+    /// firmware data differs from the J813-derived template [`encode_common26_board_region_c`]
+    /// writes, applied right after it.
+    pub(crate) region_c_words: &'static [(usize, u32)],
+    /// Words of the common 26A428 power policy block (offsets in that block) where the board's
+    /// own firmware data differs from the J813-derived template, applied by
+    /// [`encode_common26_bundle_policy`] before it writes the pointers and the boot timestamp.
+    pub(crate) policy_words: &'static [(usize, u32)],
     /// The active memory cache controller mask, where it differs from the inherited 0xf.
     mcc_mask: Option<u64>,
     /// The two topology words (16, and the core count), where the board sets them.
@@ -2438,6 +2465,9 @@ pub(crate) struct Board {
     /// Whether explicit waits on other kicks take the completion class
     /// ([`Board::completion_inputs`]).
     completion_inputs: bool,
+    /// Whether this is a template whose per-board power data comes from the board's GPU node
+    /// ([`Board::with_power`]).
+    power_from_node: bool,
 }
 
 /// M5 Pro: two clusters of ten cores.
@@ -2461,12 +2491,15 @@ pub(crate) const J714: Board = Board {
     render_pool: (0x40_0000, 1 << 32),
     controller_defaults: Some(encode_m5_policy_controller_defaults),
     idle_standby_us: None,
+    region_c_words: &[],
+    policy_words: &[],
     mcc_mask: None,
     topology_words: None,
     hw_words: &[],
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: true,
+    power_from_node: false,
 };
 
 /// M5 Max: four clusters of ten cores.
@@ -2491,6 +2524,8 @@ pub(crate) const J716C: Board = Board {
     // Its own controller configuration.
     controller_defaults: Some(encode_m5_policy_controller_defaults_j716c),
     idle_standby_us: None,
+    region_c_words: &[],
+    policy_words: &[],
     // The ADT GPU node's active-mcc-bit-vector: eight memory cache controllers.
     mcc_mask: Some(0xff),
     topology_words: Some((16, 40)),
@@ -2498,6 +2533,7 @@ pub(crate) const J716C: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
+    power_from_node: false,
 };
 
 /// J775D's performance controllers run from P3.
@@ -2529,6 +2565,8 @@ pub(crate) const J775D: Board = Board {
     // The power model's synthetic leakage inputs.
     controller_defaults: Some(encode_m5_policy_controller_defaults_j775d),
     idle_standby_us: Some(3500),
+    region_c_words: &[],
+    policy_words: &[],
     // The ADT GPU node's active-mcc-bit-vector: eight memory cache controllers.
     mcc_mask: Some(0xff),
     topology_words: None,
@@ -2539,12 +2577,17 @@ pub(crate) const J775D: Board = Board {
     fan_curve_start_mc: 97_000,
     g17d_forms: true,
     completion_inputs: false,
+    power_from_node: false,
 };
 
-/// M5 (T8142, MacBook Air J813): one cluster of ten core slots, eight enabled. Values from the
-/// J813 ADT (27.0) and its 25G76 HW data (core type 0x20 revision 5, twelve states).
-/// Bring-up: no policy controller configuration yet.
-pub(crate) const J813: Board = Board {
+/// M5 (T8142: MacBook Air J813 and J815, MacBook Pro 14-inch J704): one cluster of ten core
+/// slots, on the common 26A428 firmware interface. The SoC's part of the board (values from the
+/// J813 ADT (27.0) and its 25G76 HW data: core type 0x20 revision 5, register windows, MCC mask,
+/// render pool); the per-board power data (performance states, relative power, AON rows, HW,
+/// region C and power policy words, idle standby timer) is not here but in each board's GPU
+/// node, which [`Board::with_power`] reads it from ([`BoardPower`]): run as is, this template has
+/// no performance state. Bring-up: no policy controller configuration yet.
+pub(crate) const T8142: Board = Board {
     chip_id: 0x8142,
     // The J813's 26A428 firmware compares root +0x00 with 0x0c8b_4339_83a0_04c0 (movz/movk at
     // TEXT 0x21ed8 in both roles): the common 26A428 interface J873 also runs, not the M5 Pro's.
@@ -2554,13 +2597,13 @@ pub(crate) const J813: Board = Board {
     clusters: 1,
     gpu_cores: 10,
     core_revision: (0x20, 5),
-    perf_state_count: 12,
-    perf_states: &J813_GPU_PERF_STATES,
+    perf_state_count: 0,
+    perf_states: &[(0, [0; M5_PERF_LANES], [0; M5_PERF_LANES]); 14],
     perf_tables: 1,
     aux_perf_states: None,
-    relative_frequency: relative_frequency(&J813_GPU_PERF_STATES, 1),
-    relative_power: Some(&J813_GPU_RELATIVE_POWER),
-    aon_records: &J813_AON_RECORDS,
+    relative_frequency: [0; 16],
+    relative_power: None,
+    aon_records: &[],
     register_windows: &J813_REGISTER_WINDOWS,
     register_slot_flags: Some(&J813_HW_REGISTER_SLOT_FLAGS),
     min_parameter_buffer: (super::target::min_parameter_buffer_pages(1) << 15) as u32,
@@ -2568,22 +2611,311 @@ pub(crate) const J813: Board = Board {
     render_pool: (0x20_0000, 1 << 31),
     controller_defaults: None,
     idle_standby_us: None,
+    region_c_words: &[],
+    policy_words: &[],
     // One memory cache controller (/arm-io/sgx active-mcc-bit-vector; 25G76 +0xf8c = 1).
     mcc_mask: Some(0x1),
     topology_words: None,
-    // Words of macOS 27.0's own hardware data on this machine, read out of its bundle under
-    // aura, that the inherited 25G76 template and the generic encoding leave different.
-    hw_words: &[(0x0fa8, 0x8000), (0x0fb4, 2), (0x0fb8, 0), (0x1044, 0xc), (0x10a4, 0xa),
-                (0x10d4, 0x17), (0x1118, 0), (0x2660, 4), (0x2720, 1), (0x2724, 0)],
+    hw_words: &[],
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
+    power_from_node: true,
 };
 
-/// The J813 on its macOS 27.2 (26B123) firmware: the same board on the common 26B123 graph.
-pub(crate) const J813_26B123: Board = Board {
+/// [`T8142`] on the macOS 27.2 (26B123) firmware: the same board on the common 26B123 graph. The
+/// power words a board states are in the 26A428 layout: the policy encoder moves them to the
+/// 26B123 one with the rest of the block.
+pub(crate) const T8142_26B123: Board = Board {
     graph: &COMMON26B123_GRAPH,
-    ..J813
+    ..T8142
+};
+
+/// Most AON rows a board's GPU node may state.
+pub(crate) const BOARD_AON_RECORDS: usize = 8;
+/// Most HW data, region C and power policy words a board's GPU node may state (the J704 has
+/// 9, 5 and 54). They bound [`BoardPower`], which the probe builds on its stack.
+pub(crate) const BOARD_HW_WORDS: usize = 16;
+pub(crate) const BOARD_REGION_C_WORDS: usize = 16;
+pub(crate) const BOARD_POLICY_WORDS: usize = 64;
+
+const _: () = assert!(BOARD_AON_RECORDS * 12 <= M5_AON_PTD_SIZE);
+
+/// One board's power data, as its GPU node states it (`apple,m5-*`, `apple,sram-microvolt`,
+/// `apple,idleoff-standby-timer` and the operating points), checked and laid out for
+/// [`Board::with_power`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct BoardPower {
+    perf_state_count: u32,
+    perf_states: [M5PerfState; 14],
+    relative_frequency: [u32; 16],
+    relative_power: [u32; 14],
+    aon_records: [[u32; 3]; BOARD_AON_RECORDS],
+    aon_count: usize,
+    hw_words: [(usize, u32); BOARD_HW_WORDS],
+    hw_count: usize,
+    region_c_words: [(usize, u32); BOARD_REGION_C_WORDS],
+    region_c_count: usize,
+    policy_words: [(usize, u32); BOARD_POLICY_WORDS],
+    policy_count: usize,
+    idle_standby_us: u32,
+}
+
+/// The raw cells of a board's GPU node, before [`BoardPower::new`] checks them.
+pub(crate) struct BoardPowerCells<'a> {
+    /// The operating points in table order, off state first: Hz and core uV.
+    pub(crate) opps: &'a [(u64, u32)],
+    /// `apple,sram-microvolt`: each operating point's SRAM voltage, uV.
+    pub(crate) sram_microvolt: &'a [u32],
+    /// `apple,m5-relative-power`: each operating point's relative performance, IEEE single bits.
+    pub(crate) relative_power: &'a [u32],
+    /// `apple,m5-aon-records`: AON rows, three cells each.
+    pub(crate) aon_records: &'a [u32],
+    /// `apple,m5-hw-words`, `apple,m5-region-c-words`, `apple,m5-policy-words`: <offset value>
+    /// pairs.
+    pub(crate) hw_words: &'a [u32],
+    pub(crate) region_c_words: &'a [u32],
+    pub(crate) policy_words: &'a [u32],
+    /// `apple,idleoff-standby-timer`, us.
+    pub(crate) idle_standby_us: u32,
+}
+
+/// Copy <offset value> pairs into `out`, checking each offset with `fits`.
+fn board_words<const N: usize>(
+    cells: &[u32],
+    out: &mut [(usize, u32); N],
+    fits: impl Fn(usize) -> bool,
+    error: &'static str,
+) -> Result<usize, &'static str> {
+    if cells.len() % 2 != 0 || cells.len() / 2 > N {
+        return Err(error);
+    }
+    for (slot, pair) in out.iter_mut().zip(cells.chunks_exact(2)) {
+        let offset = pair[0] as usize;
+        if offset % 4 != 0 || !fits(offset) {
+            return Err(error);
+        }
+        *slot = (offset, pair[1]);
+    }
+    Ok(cells.len() / 2)
+}
+
+/// Whether the eight bytes at `field` and the word at `offset` are apart.
+const fn apart(offset: usize, field: usize) -> bool {
+    offset + 4 <= field || offset >= field + 8
+}
+
+impl BoardPower {
+    /// Check a board's GPU node cells. The error names what is wrong, for the probe's message.
+    pub(crate) fn new(cells: &BoardPowerCells<'_>) -> Result<Self, &'static str> {
+        let opps = cells.opps;
+        // The off state, then at least two states for the relative-frequency curve, at most
+        // the thirteen the HW data has rows for.
+        if opps.len() < 3 || opps.len() > 14 {
+            return Err("operating-points-v2 must list 3 to 14 operating points");
+        }
+        if cells.sram_microvolt.len() != opps.len() {
+            return Err("apple,sram-microvolt must have one cell per operating point");
+        }
+        if cells.relative_power.len() != opps.len() {
+            return Err("apple,m5-relative-power must have one cell per operating point");
+        }
+        let mut perf_states = [(0, [0; M5_PERF_LANES], [0; M5_PERF_LANES]); 14];
+        for (state, (&(hz, core_uv), &sram_uv)) in
+            opps.iter().zip(cells.sram_microvolt).enumerate()
+        {
+            if hz % 1_000_000 != 0 || hz / 1_000_000 > u32::MAX as u64 {
+                return Err("an operating point's opp-hz is not a whole number of MHz");
+            }
+            if core_uv == 0 || core_uv % 1000 != 0 || sram_uv == 0 || sram_uv % 1000 != 0 {
+                return Err("an operating point's voltage is 0 or not a whole number of mV");
+            }
+            let mhz = (hz / 1_000_000) as u32;
+            // The off state at 0 MHz, then rising frequencies (a loader that did not fill the
+            // operating points leaves them all 0).
+            if (state == 0) != (mhz == 0) || (state > 1 && mhz <= perf_states[state - 1].0) {
+                return Err("the operating points are not the off state and rising frequencies");
+            }
+            // One voltage table (`perf_tables` 1): lane 0, the rest 0.
+            perf_states[state].0 = mhz;
+            perf_states[state].1[0] = core_uv / 1000;
+            perf_states[state].2[0] = sram_uv / 1000;
+        }
+        // The table has fourteen rows: a board with fewer states repeats its top one.
+        for state in opps.len()..14 {
+            perf_states[state] = perf_states[opps.len() - 1];
+        }
+        let mut relative_power = [0; 14];
+        relative_power[..opps.len()].copy_from_slice(cells.relative_power);
+
+        if cells.aon_records.is_empty() || cells.aon_records.len() % 3 != 0
+            || cells.aon_records.len() / 3 > BOARD_AON_RECORDS {
+            return Err("apple,m5-aon-records must be 1 to 8 rows of three cells");
+        }
+        let mut aon_records = [[0; 3]; BOARD_AON_RECORDS];
+        for (row, record) in aon_records.iter_mut().zip(cells.aon_records.chunks_exact(3)) {
+            row.copy_from_slice(record);
+        }
+
+        let used = opps.len();
+        let mut hw_words = [(0, 0); BOARD_HW_WORDS];
+        let hw_count = board_words(cells.hw_words, &mut hw_words, |offset| {
+            // Never over the frequency of a state the perf-state loop wrote.
+            offset + 4 <= M5_HW_DATA_SIZE
+                && (offset < COMMON26_HW_PERF_FREQUENCY
+                    || offset >= COMMON26_HW_PERF_FREQUENCY + used * 4)
+        }, "apple,m5-hw-words must be up to 16 <offset value> pairs of aligned HW data words \
+            off the used states' frequencies")?;
+        let mut region_c_words = [(0, 0); BOARD_REGION_C_WORDS];
+        let region_c_count = board_words(cells.region_c_words, &mut region_c_words, |offset| {
+            offset + 4 <= ABI_ALLOCATION_SIZES_26A428[ALLOC_REGION_C]
+        }, "apple,m5-region-c-words must be up to 16 <offset value> pairs of aligned region C \
+            words")?;
+        let mut policy_words = [(0, 0); BOARD_POLICY_WORDS];
+        let policy_count = board_words(cells.policy_words, &mut policy_words, |offset| {
+            // The pointers and the boot timestamp are the encoder's.
+            offset + 4 <= COMMON26_POLICY_SIZE
+                && apart(offset, COMMON26_POLICY_STATE_PTR)
+                && apart(offset, COMMON26_POLICY_AON_PTD_PTR)
+                && apart(offset, COMMON26_POLICY_BOOT_TIMESTAMP)
+        }, "apple,m5-policy-words must be up to 64 <offset value> pairs of aligned policy \
+            words off its pointers")?;
+        if cells.idle_standby_us == 0 {
+            return Err("apple,idleoff-standby-timer must not be 0");
+        }
+        Ok(Self {
+            perf_state_count: (opps.len() - 1) as u32,
+            relative_frequency: relative_frequency_soft(&perf_states, 1),
+            perf_states,
+            relative_power,
+            aon_records,
+            aon_count: cells.aon_records.len() / 3,
+            hw_words,
+            hw_count,
+            region_c_words,
+            region_c_count,
+            policy_words,
+            policy_count,
+            idle_standby_us: cells.idle_standby_us,
+        })
+    }
+}
+
+impl Board {
+    /// Performance states after the off state.
+    pub(crate) const fn perf_state_count(&self) -> u32 {
+        self.perf_state_count
+    }
+
+    /// Whether the board's power data comes from its GPU node ([`Board::with_power`]).
+    pub(crate) const fn power_from_node(&self) -> bool {
+        self.power_from_node
+    }
+
+    /// This template ([`T8142`], [`T8142_26B123`]) with a board's own power data.
+    pub(crate) fn with_power(&self, power: &'static BoardPower) -> Result<Board, &'static str> {
+        if !self.power_from_node {
+            return Err("the board's power data is not the GPU node's");
+        }
+        // A later build moves the policy block: every word must have a place in its layout.
+        if let Some(relayout) = self.graph.profile.common26_layouts()
+            .and_then(|layouts| layouts.relayout.as_ref())
+        {
+            if power.policy_words[..power.policy_count].iter()
+                .any(|&(offset, _)| relocate_by_bands(relayout.policy_bands, offset).is_none())
+            {
+                return Err("an apple,m5-policy-words offset has no place in this firmware's \
+                            policy layout");
+            }
+        }
+        Ok(Board {
+            perf_state_count: power.perf_state_count,
+            perf_states: &power.perf_states,
+            relative_frequency: power.relative_frequency,
+            relative_power: Some(&power.relative_power),
+            aon_records: &power.aon_records[..power.aon_count],
+            hw_words: &power.hw_words[..power.hw_count],
+            region_c_words: &power.region_c_words[..power.region_c_count],
+            policy_words: &power.policy_words[..power.policy_count],
+            idle_standby_us: Some(power.idle_standby_us),
+            power_from_node: false,
+            ..*self
+        })
+    }
+}
+
+/// A positive binary32 as a 24-bit significand (implicit bit set) and a power of two.
+type SoftF32 = (u64, i32);
+
+/// Round `significand * 2^exponent` (nonzero) to binary32, to nearest, ties to even.
+/// `significand`'s lowest bit may be a sticky bit that only breaks ties.
+const fn soft_round(significand: u64, exponent: i32) -> SoftF32 {
+    let bits = 64 - significand.leading_zeros() as i32;
+    if bits <= 24 {
+        return (significand << (24 - bits), exponent - (24 - bits));
+    }
+    let shift = bits - 24;
+    let mut kept = significand >> shift;
+    let rest = significand & ((1u64 << shift) - 1);
+    let half = 1u64 << (shift - 1);
+    let mut exponent = exponent + shift;
+    if rest > half || (rest == half && kept & 1 == 1) {
+        kept += 1;
+        if kept == 1 << 24 {
+            kept >>= 1;
+            exponent += 1;
+        }
+    }
+    (kept, exponent)
+}
+
+const fn soft_bits(value: SoftF32) -> u32 {
+    ((((value.1 + 23 + 127) as u32) << 23) | (value.0 as u32 & 0x7f_ffff)) as u32
+}
+
+/// [`relative_frequency`] without floating point, for a board read at probe: the same IEEE
+/// single roundings (each conversion, the product and the quotient) in integer arithmetic.
+pub(crate) const fn relative_frequency_soft(states: &[M5PerfState; 14], floor: usize) -> [u32; 16] {
+    let mut values = [0; 16];
+    let base = states[floor].0 as u64 * 1_000_000;
+    let maximum = states[13].0 as u64 * 1_000_000;
+    let denominator = soft_round(maximum - base, 0);
+    let mut state = floor + 1;
+    while state < 14 {
+        let difference = states[state].0 as u64 * 1_000_000 - base;
+        if difference != 0 {
+            let numerator = soft_round(difference, 0);
+            // x 100.0, exact before its rounding (31 bits).
+            let product = soft_round(numerator.0 * 100, numerator.1);
+            // 24-bit significands: a quotient of at least 39 bits, then a sticky bit for an
+            // inexact remainder (u64 only: no 128-bit division in the kernel).
+            let dividend = product.0 << 39;
+            let quotient = dividend / denominator.0;
+            let sticky = (dividend % denominator.0 != 0) as u64;
+            values[state] = soft_bits(soft_round(quotient << 1 | sticky,
+                                                 product.1 - denominator.1 - 40));
+        }
+        state += 1;
+    }
+    values
+}
+
+// The integer curve is the floating-point one for every board that has a static table.
+const _: () = {
+    const fn same(a: [u32; 16], b: [u32; 16]) -> bool {
+        let mut i = 0;
+        while i < 16 {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    assert!(same(relative_frequency_soft(&J714_GPU_PERF_STATES, 1), J714.relative_frequency));
+    assert!(same(relative_frequency_soft(&J716C_GPU_PERF_STATES, 1), J716C.relative_frequency));
+    assert!(same(relative_frequency_soft(&J775D_GPU_PERF_STATES, J775D_PERF_FLOOR),
+                 J775D.relative_frequency));
 };
 
 const _: () = {
@@ -2654,38 +2986,6 @@ pub(crate) const J714_GPU_PERF_STATES: [M5PerfState; 14] = two_tables([
     (1182, 800, 800, 800, 800), (1278, 840, 840, 840, 840),
     (1374, 880, 880, 880, 880), (1470, 925, 925, 925, 925),
     (1578, 1000, 1000, 1000, 1000), (1620, 1025, 1040, 1025, 1040),
-]);
-
-/// One-table states (MHz, core voltage, SRAM voltage), the rest 0.
-const fn one_table(states: [(u32, u32, u32); 14]) -> [M5PerfState; 14] {
-    let mut out = [(0, [0; M5_PERF_LANES], [0; M5_PERF_LANES]); 14];
-    let mut state = 0;
-    while state < 14 {
-        let (frequency, core, sram) = states[state];
-        out[state].0 = frequency;
-        out[state].1[0] = core;
-        out[state].2[0] = sram;
-        state += 1;
-    }
-    out
-}
-
-// J813 ADT sgx perf-states and perf-states-sram (MHz, mV): twelve states after the off state.
-// The encoder's table has fourteen; the last repeats the top state, which the HW data's count
-// of twelve leaves out.
-/// The J813's per-state relative performance, read out of macOS 27.0's own hardware data under
-/// aura (bundle +0x19e4): 19.4 % at the lowest state up to 100 % at the top, state 13 unused.
-/// It is neither the frequency ratio nor f*V or f*V^2: characterization data.
-const J813_GPU_RELATIVE_POWER: [u32; 14] = [
-    0, 0x419b_36eb, 0x41d0_6202, 0x4205_907a, 0x4227_4b32, 0x4247_eae1, 0x426b_0873,
-    0x428a_5bac, 0x42a4_5b3f, 0x42ab_4981, 0x42b0_3cd5, 0x42bb_20f3, 0x42c8_0000, 0,
-];
-
-pub(crate) const J813_GPU_PERF_STATES: [M5PerfState; 14] = one_table([
-    (0, 125, 770), (338, 660, 770), (486, 675, 770), (636, 690, 770),
-    (796, 705, 770), (888, 735, 770), (988, 760, 770), (1084, 790, 790),
-    (1182, 830, 830), (1278, 865, 865), (1374, 890, 890), (1470, 945, 945),
-    (1578, 1010, 1010), (1578, 1010, 1010),
 ]);
 
 /// Four-table states (MHz, four core-voltage tables, four SRAM-voltage tables), the rest 0.

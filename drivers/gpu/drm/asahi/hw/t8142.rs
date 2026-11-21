@@ -1,23 +1,39 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-//! M5 (T8142, MacBook Air J813) on the macOS 27.0 (26A428) and 27.2 (26B123) GPU firmware.
+//! M5 (T8142: MacBook Air J813 and J815, MacBook Pro 14-inch J704) on the macOS 27.0 (26A428)
+//! and 27.2 (26B123) GPU firmware.
 //!
-//! Bring-up only: the M5 graph ([`crate::g17::fw::m5::initdata`]) has no J813 board yet, so
-//! [`PROBE`] stops at the identity check, after `get_g17_id` has logged the ID registers and
-//! core masks, before the UAT or the firmware are touched.
+//! The SoC's part of the GPU (identity, core layout, firmware builds, the M5 graph's
+//! [`T8142`](crate::g17::fw::m5::initdata::T8142) template) is here; each board's power data
+//! (performance states and voltages, relative power, AON rows, HW data, region C and power
+//! policy words, idle standby timer) is its GPU node's, which [`board`] reads at probe. A node
+//! without it is refused, so no board runs with another's power values.
 //!
 //! J813 (2026-11-07): ID registers 0xb022000 0xb0800 0x11010a 0x40404 0x1320311 0x10030302,
 //! family 0xb, variant 2, one die, one cluster of ten core slots; core mask 0x3bd (eight
 //! enabled, slots 1 and 6 fused off).
+//!
+//! J704 (m1n1 proxy reads of SGX, before this driver): the same ID registers, core mask 0x3ff
+//! (all ten slots enabled).
+use kernel::{c_str, device, of, prelude::*, sync::SetOnce};
+use crate::g17::fw::m5::initdata::{Board, BoardPower, BoardPowerCells};
 use crate::g17::{Config, CoreLayout, CrashBuffers, FirmwareProfile, Identity};
 use crate::hw::{GpuGen, GpuVariant};
 
+/// The T8142 on the M5 graph: the GPU's identity and the T8142 board template,
+/// which the probe completes with the board's GPU node ([`board`]). It runs either firmware
+/// build of [`BUILDS`]; 26B123 runs [`CONFIG_26B123`].
+pub(crate) const CONFIG: Config = Config {
+    firmware: crate::g17::fw::variant::Firmware::Identified(&BUILDS),
+    ..BASE
+};
 
-/// Refuses the GPU after logging its identity: no variant byte is 0xff.
-pub(crate) const PROBE: Config = Config {
+/// The T8142 board template and identity. [`CONFIG`] and [`CONFIG_26B123`] choose the
+/// firmware build.
+const BASE: Config = Config {
     chip_id: 0x8142,
     identity: Identity {
         family: 0xb,
-        variant: 0xff,
+        variant: 2,
         num_dies: 1,
         gpu_variant: GpuVariant::G,
         usc_generation: 3,
@@ -40,41 +56,16 @@ pub(crate) const PROBE: Config = Config {
     uat_quirks: crate::mmu::UatQuirks::DEFAULT,
     region_c: None,
     chip: None,
-    // Never reached: the identity check refuses first.
-    m5: Some(&crate::g17::fw::m5::initdata::J714),
+    m5: Some(&crate::g17::fw::m5::initdata::T8142),
     adopt_root_entries: true,
     fabric_bridge: false,
-    sleep_restart: false,
+    // TEST: the sleep's commit stops the firmware and a real wake restarts it warm, as on
+    // T8140. Not yet run through a real sleep on the J813.
+    sleep_restart: true,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
-    firmware: crate::g17::fw::variant::Firmware::Fixed(&crate::g17::fw::variant::V26A428_M5),
-    core_layout: CoreLayout {
-        cores: None,
-        alternate_core_masks: None,
-        operand_state: crate::g17::fw::compute::OperandState::TWO_BY_TEN,
-        deflake: crate::g17::fw::render::Deflake::TWO_CLUSTERS,
-        compute_blocks: crate::g17::fw::freelist::COMPUTE_BLOCKS,
-    },
-};
-
-/// The J813 on the M5 graph: [`PROBE`] with the GPU's identity and the J813 board. It runs
-/// either firmware build of [`BUILDS`]; 26B123 runs [`CONFIG_26B123`].
-pub(crate) const CONFIG: Config = Config {
-    firmware: crate::g17::fw::variant::Firmware::Identified(&BUILDS),
-    ..BASE
-};
-
-/// The J813 board and identity, before a firmware build is chosen.
-const BASE: Config = Config {
-    identity: Identity {
-        family: 0xb,
-        variant: 2,
-        num_dies: 1,
-        gpu_variant: GpuVariant::G,
-        usc_generation: 3,
-        hal_generation: 300,
-    },
-    m5: Some(&crate::g17::fw::m5::initdata::J813),
+    // No build: each CONFIG names its own (BUILDS refers back to CONFIG_26B123).
+    firmware: crate::g17::fw::variant::Firmware::Identified(&[]),
     // One cluster of ten core slots; the buffers are sized for all ten.
     core_layout: CoreLayout {
         cores: None,
@@ -83,15 +74,11 @@ const BASE: Config = Config {
         deflake: crate::g17::fw::render::Deflake::ONE_CLUSTER,
         compute_blocks: crate::g17::fw::freelist::COMPUTE_BLOCKS,
     },
-    // TEST: the sleep's commit stops the firmware and a real wake restarts it warm, as on
-    // T8140. Not yet run through a real sleep on the J813.
-    sleep_restart: true,
-    ..PROBE
 };
 
-/// The J813 on the 27.2 firmware: the board on the common 26B123 graph.
+/// The T8142 on the 27.2 firmware: the board template on the common 26B123 graph.
 pub(crate) const CONFIG_26B123: Config = Config {
-    m5: Some(&crate::g17::fw::m5::initdata::J813_26B123),
+    m5: Some(&crate::g17::fw::m5::initdata::T8142_26B123),
     firmware: crate::g17::fw::variant::Firmware::Identified(&[BUILD_26B123]),
     ..BASE
 };
@@ -158,5 +145,98 @@ const BUILD_26B123: crate::g17::fw::variant::Build = crate::g17::fw::variant::Bu
 // Each compute operand bank holds 6 KiB per core slot of the board.
 const _: () = assert!(
     CONFIG.core_layout.operand_state.bank_bytes()
-        == crate::g17::fw::m5::initdata::J813.gpu_cores * 0x1800
+        == crate::g17::fw::m5::initdata::T8142.gpu_cores * 0x1800
 );
+
+/// The board's power data, read from its GPU node by the first probe.
+static POWER: SetOnce<BoardPower> = SetOnce::new();
+/// The board: the firmware build's template ([`CONFIG`] or [`CONFIG_26B123`]) with [`POWER`].
+static BOARD: SetOnce<Board> = SetOnce::new();
+
+/// `name`, a u32 array property of `node`; an empty property is an empty array.
+fn cells(node: &of::Node, name: &CStr) -> Result<KVec<u32>> {
+    node.get_property(name)
+}
+
+/// The GPU node's operating points, off state first: Hz and one core voltage cell, uV.
+fn opps(node: &of::Node) -> Result<KVec<(u64, u32)>> {
+    let table = node.parse_phandle(c_str!("operating-points-v2"), 0).ok_or(ENOENT)?;
+    let mut opps = KVec::new();
+    for opp in table.children() {
+        let hz: u64 = opp.get_property(c_str!("opp-hz"))?;
+        let microvolt: u32 = opp.get_property(c_str!("opp-microvolt"))?;
+        opps.push((hz, microvolt), GFP_KERNEL)?;
+    }
+    Ok(opps)
+}
+
+/// The M5 board of a T8142 GPU: `template`, the firmware build's, with the power data of the
+/// board's GPU node. Fails closed: a node without every property of its power data, or with one
+/// [`BoardPower::new`] or [`Board::with_power`] refuses, fails the probe.
+pub(crate) fn board(dev: &device::Device, template: &'static Board) -> Result<&'static Board> {
+    let node = dev.of_node().ok_or(ENODEV)?;
+    // Each property the board must state, read in this order.
+    let read = |name: &'static CStr| {
+        cells(&node, name).inspect_err(|e| {
+            dev_err!(dev, "M5: GPU node has no valid {} ({:?}); the board's GPU power data must \
+                           come from the device tree\n", name.to_str().unwrap_or("?"), e)
+        })
+    };
+    let opps = opps(&node).inspect_err(|e| {
+        dev_err!(dev, "M5: GPU node has no valid operating-points-v2 table ({:?}); the board's \
+                       GPU power data must come from the device tree\n", e)
+    })?;
+    let sram_microvolt = read(c_str!("apple,sram-microvolt"))?;
+    let relative_power = read(c_str!("apple,m5-relative-power"))?;
+    let aon_records = read(c_str!("apple,m5-aon-records"))?;
+    let hw_words = read(c_str!("apple,m5-hw-words"))?;
+    let region_c_words = read(c_str!("apple,m5-region-c-words"))?;
+    let policy_words = read(c_str!("apple,m5-policy-words"))?;
+    let standby = c_str!("apple,idleoff-standby-timer");
+    let idle_standby_us: u32 = node.get_property(standby).inspect_err(|e| {
+        dev_err!(dev, "M5: GPU node has no valid {} ({:?}); the board's GPU power data must \
+                       come from the device tree\n", standby.to_str().unwrap_or("?"), e)
+    })?;
+    let power = BoardPower::new(&BoardPowerCells {
+        opps: &opps,
+        sram_microvolt: &sram_microvolt,
+        relative_power: &relative_power,
+        aon_records: &aon_records,
+        hw_words: &hw_words,
+        region_c_words: &region_c_words,
+        policy_words: &policy_words,
+        idle_standby_us,
+    })
+    .map_err(|reason| {
+        dev_err!(dev, "M5: invalid GPU power data in the device tree: {}\n", reason);
+        EINVAL
+    })?;
+    // The first probe keeps the board for the rest of the boot; a later one (a rebind) must
+    // read the same.
+    match POWER.as_ref() {
+        Some(kept) if *kept != power => {
+            dev_err!(dev, "M5: the GPU node's power data changed since the first probe\n");
+            return Err(EINVAL);
+        }
+        Some(_) => {}
+        None => {
+            POWER.populate(power);
+        }
+    }
+    let kept = POWER.as_ref().ok_or(EBUSY)?;
+    let board = template.with_power(kept).map_err(|reason| {
+        dev_err!(dev, "M5: invalid GPU power data in the device tree: {}\n", reason);
+        EINVAL
+    })?;
+    if BOARD.as_ref().is_none() {
+        BOARD.populate(board);
+    }
+    let kept = BOARD.as_ref().ok_or(EBUSY)?;
+    if !core::ptr::eq(kept.graph, template.graph) {
+        dev_err!(dev, "M5: the GPU firmware build changed since the first probe\n");
+        return Err(EINVAL);
+    }
+    dev_info!(dev, "M5: board power data from the device tree: {} performance states, top {} MHz\n",
+              kept.perf_state_count(), kept.perf_states[13].0);
+    Ok(kept)
+}

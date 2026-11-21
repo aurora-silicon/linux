@@ -1647,8 +1647,16 @@ impl Gpu {
             return Err(ENODEV);
         }
         let m5 = cfg.profile.is_m5();
+        // The M5 board: a template whose power data the GPU node states (T8142) is completed
+        // with it, and refused without it.
+        let m5_board = match cfg.m5.filter(|_| m5) {
+            Some(template) if template.power_from_node() => {
+                Some(crate::hw::t8142::board(dev.as_ref().as_ref(), template)?)
+            }
+            board => board,
+        };
         if m5 {
-            let board = cfg.m5.ok_or(EINVAL)?;
+            let board = m5_board.ok_or(EINVAL)?;
             J813_FORMS.store(board.j813_forms(), core::sync::atomic::Ordering::Relaxed);
             // Hold the J813's GFX power domain for the session, as the G15 and G16 paths do
             // for theirs. Without a hold genpd gates it once it finds no active consumer, and
@@ -1694,7 +1702,7 @@ impl Gpu {
             oas: cfg.uat_oas,
         };
         let max_frequency_khz = if m5 {
-            cfg.m5.ok_or(EINVAL)?.perf_states[13].0 * 1000
+            m5_board.ok_or(EINVAL)?.perf_states[13].0 * 1000
         } else {
             Self::max_frequency_khz(dev)?
         };
@@ -1763,7 +1771,7 @@ impl Gpu {
                 active_cores,
                 variant,
                 operand_state: &cfg.core_layout.operand_state,
-                m5_board: cfg.m5.filter(|_| m5),
+                m5_board,
                 deflake: cfg.core_layout.deflake,
                 compute_blocks: cfg.core_layout.compute_blocks,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
@@ -1830,7 +1838,8 @@ impl Gpu {
             directory.read_only_file(c"hardware_data", reports::HardwareDataView(shared.clone())),
             GFP_KERNEL,
         )?;
-        let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
+        let frequencies =
+            Self::state_frequencies(dev, cfg, m5_board, variant, id.num_clusters)?;
         let stats = Arc::new(
             crate::stats::StatsSnapshot {
                 g17_reader: Some(stats::Reader(shared.clone(), frequencies)),
@@ -1953,13 +1962,14 @@ impl Gpu {
     fn state_frequencies(
         dev: &AsahiDrmDevice,
         cfg: &'static Config,
+        m5_board: Option<&fw::m5::initdata::Board>,
         variant: &fw::variant::Variant,
         clusters: u32,
     ) -> Result<Option<stats::StateFrequencies>> {
         if !stats::reports_pstate(variant.graph, variant.m5_commands) {
             return Ok(None);
         }
-        if let Some(board) = cfg.m5 {
+        if let Some(board) = m5_board {
             return Ok(stats::StateFrequencies::new(
                 board.perf_states.iter().map(|state| state.0),
             ));
@@ -2004,7 +2014,7 @@ impl Gpu {
         if cfg.profile != FirmwareProfile::M5PublishedRoots {
             return Err(ENODEV);
         }
-        let board = cfg.m5.ok_or(EINVAL)?;
+        let board = shared.m5_board.ok_or(EINVAL)?;
         // Names the step a failed bootstrap stopped at.
         let at = |step: &'static str| {
             move |e: &Error| {

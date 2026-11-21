@@ -251,6 +251,85 @@ properties:
       Raw per-chip GPU leakage calibration words for the M5 Pro controller
       defaults. Supplied by the boot loader, never fixed in a board DT.
 
+  apple,idleoff-standby-timer:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    description:
+      Time the idle GPU waits before it goes to standby, in microseconds.
+
+  apple,sram-microvolt:
+    minItems: 3
+    maxItems: 14
+    description:
+      SRAM voltage of each operating point of operating-points-v2, in the
+      table's order, in microvolts (the ADT's sgx perf-states-sram). The
+      operating points carry the core voltage.
+
+  apple,m5-relative-power:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 14
+    description:
+      Relative performance of each operating point of operating-points-v2,
+      in percent, as the board's own GPU firmware data has it. IEEE-754
+      binary32 bit patterns in big-endian cells.
+
+  apple,m5-aon-records:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 8
+    items:
+      items:
+        - description: Row tag
+        - description: Table index and flags
+        - description: Configuration word
+    description:
+      Rows of the always-on power table the GPU firmware reads, in the order
+      the board's own firmware data has them. The power policy names the
+      first.
+
+  apple,m5-hw-words:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    maxItems: 16
+    items:
+      items:
+        - description: Byte offset in the hardware data, a multiple of 4
+        - description: Value
+    description:
+      Words of the GPU firmware's hardware data where the board's own data
+      differs from the SoC's template in the driver.
+
+  apple,m5-region-c-words:
+    oneOf:
+      - type: boolean
+        description: Empty, no words differ.
+      - $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        maxItems: 16
+        items:
+          items:
+            - description: Byte offset in region C, a multiple of 4
+            - description: Value
+    description:
+      Words of the GPU firmware's region C where the board's own data
+      differs from the SoC's template in the driver. Empty when none does.
+
+  apple,m5-policy-words:
+    oneOf:
+      - type: boolean
+        description: Empty, no words differ.
+      - $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        maxItems: 64
+        items:
+          items:
+            - description:
+                Byte offset in the power policy block, in the macOS 27.0
+                (26A428) layout, a multiple of 4
+            - description: Value
+    description:
+      Words of the GPU firmware's power policy block where the board's own
+      data differs from the SoC's template in the driver. Empty when none
+      does. The driver moves them to the layout of a later firmware build.
+
   apple,firmware-abi:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 3
@@ -628,6 +707,10 @@ allOf:
               minItems: 8
             memory-region-names:
               minItems: 8
+      description:
+        The GPU's power data differs between T8142 boards. Each board states
+        its own, which the driver requires; the operating points come from
+        the ADT's sgx perf-states and are filled in by the boot loader.
       required:
         - reg-names
         - mboxes
@@ -635,8 +718,21 @@ allOf:
         - memory-region-names
         - power-domains
         - operating-points-v2
+        - apple,sram-microvolt
+        - apple,m5-relative-power
+        - apple,m5-aon-records
+        - apple,m5-hw-words
+        - apple,m5-region-c-words
+        - apple,m5-policy-words
+        - apple,idleoff-standby-timer
     else:
       properties:
+        apple,sram-microvolt: false
+        apple,m5-relative-power: false
+        apple,m5-aon-records: false
+        apple,m5-hw-words: false
+        apple,m5-region-c-words: false
+        apple,m5-policy-words: false
         memory-region:
           maxItems: 6
         memory-region-names:
