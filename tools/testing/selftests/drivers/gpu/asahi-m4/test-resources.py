@@ -44,7 +44,11 @@ pub const EBUSY:Error=Error(16); pub const EOVERFLOW:Error=Error(75); pub const 
 pub const ETIMEDOUT:Error=Error(110);pub const ERESTARTSYS:Error=Error(512);
 pub const GFP_KERNEL:u32=0;
 pub type Result<T=()> = std::result::Result<T,Error>;
-pub mod prelude {pub use crate::{Result,KVec,GFP_KERNEL,EINVAL,EAGAIN,E2BIG,EBUSY,EOVERFLOW,EIO,ETIMEDOUT,ERESTARTSYS};}
+pub mod prelude {pub use crate::{Result,KVec,KBox,GFP_KERNEL,EINVAL,EAGAIN,E2BIG,EBUSY,EOVERFLOW,EIO,ETIMEDOUT,ERESTARTSYS};}
+pub struct KBox<T>(Box<T>);
+impl<T>KBox<T>{pub fn new(x:T,_:u32)->Result<Self>{Ok(Self(Box::new(x)))}}
+impl<T>std::ops::Deref for KBox<T>{type Target=T;fn deref(&self)->&T{&self.0}}
+impl<T>std::ops::DerefMut for KBox<T>{fn deref_mut(&mut self)->&mut T{&mut self.0}}
 pub struct KVec<T>(Vec<T>);
 impl<T>KVec<T>{pub fn new()->Self{Self(Vec::new())} pub fn with_capacity(n:usize,_:u32)->Result<Self>{Ok(Self(Vec::with_capacity(n)))} pub fn push(&mut self,x:T,_:u32)->Result{self.0.push(x);Ok(())}}
 impl<T>std::ops::Deref for KVec<T>{type Target=Vec<T>;fn deref(&self)->&Vec<T>{&self.0}}
@@ -68,7 +72,7 @@ pub mod sync {
     }
 
     pub struct Arc<T>{inner:std::sync::Arc<T>}
-    impl<T>Arc<T>{pub fn new(v:T,_:u32)->crate::Result<Self>{Ok(Self{inner:std::sync::Arc::new(v)})}pub fn strong_count(v:&Self)->usize{std::sync::Arc::strong_count(&v.inner)}}
+    impl<T>Arc<T>{pub fn new(v:T,_:u32)->crate::Result<Self>{Ok(Self{inner:std::sync::Arc::new(v)})}pub fn strong_count(v:&Self)->usize{std::sync::Arc::strong_count(&v.inner)}pub fn ptr_eq(a:&Self,b:&Self)->bool{std::sync::Arc::ptr_eq(&a.inner,&b.inner)}}
     impl<T>Clone for Arc<T>{fn clone(&self)->Self{Self{inner:self.inner.clone()}}}
     impl<T>std::ops::Deref for Arc<T>{type Target=T;fn deref(&self)->&T{&self.inner}}
     pub mod aref {pub struct ARef<T>(T);impl From<&crate::device::Device>for ARef<crate::device::Device>{fn from(v:&crate::device::Device)->Self{Self(v.clone())}}}
@@ -143,10 +147,20 @@ pub mod g16 {
     pub mod resources {
         use core::sync::atomic::{AtomicU64,Ordering};use crate::*;
         pub struct ComputeArena{pub compute:KVec<super::slots::ComputeSlot>}
+        // A job's compute units; here one arena.
+        pub type Prepared=ComputeArena;
+        impl ComputeArena{
+            pub fn compute_units(&self)->Result<usize>{Ok(self.compute.len())}
+            pub fn compute_unit(&self,k:usize)->Result<&super::slots::ComputeSlot>{self.compute.get(k).ok_or(EINVAL)}
+            pub fn compute_arena(&self,_k:usize)->Option<crate::sync::Arc<ComputeArena>>{None}
+            pub fn render_arena(&self)->Option<crate::sync::Arc<RenderArena>>{None}
+        }
         pub struct RenderArena{pub passes:KVec<super::slots::PassSlot>,pub tpc_dirty:[AtomicU64;2],pub tilemap_dirty:[AtomicU64;2]}
         impl RenderArena{ __SET_DIRTY__ }
     }
     pub mod boot {pub fn eproto()->crate::Error{crate::Error(71)}}
+    // Arenas here have the two base units.
+    pub mod params {pub fn compute_units()->usize{2}pub fn pb_heap_blocks()->u32{2048}pub fn pb_posted_blocks(heap:u32)->u32{heap}}
     pub struct Events{pub grow:crate::KVec<[u32;18]>}
     pub struct Firmware{pub pools:pools::Pools,pub events:Events}
     pub mod budget{__BUDGET__}
@@ -212,7 +226,8 @@ pub mod g16 {
         aliases.push((0x1000000000,0x1000010000)); // Per-VM context store.
         aliases.sort();for a in aliases.windows(2){assert!(a[0].1<=a[1].0,"overlap {:x?} {:x?}",a[0],a[1]);}
         for (k,s) in arena.compute.compute.iter().enumerate(){assert_eq!(s.work.lower_gva.unwrap()&0x3fff,0);assert_eq!(s.work.size,0x2000);assert_eq!(s.pool.size,0x2000000);assert_eq!(s.pool_state.size,0x20000);assert_eq!(s.page_list.size,0x4000);assert_eq!(s.context_store.size,0x40000);assert_eq!(s.pool_state.r32(0).unwrap()as u64 |((s.pool_state.r32(4).unwrap()as u64)<<32),s.pool.gva.unwrap());assert_eq!(pools.allocator_refs_for(k).unwrap().parameter_id,k as u32);}
-        assert_eq!(aliases.len(),43);
+        // One PB heap per VM, shared by both render allocators.
+        assert_eq!(aliases.len(),42);
     }
     #[test]fn work_has_kernel_lower_alias_without_application_alias(){
         let mut o=Objects::new();let slots=Slots::new().unwrap();let arena=arenas(&mut o);
@@ -362,16 +377,38 @@ pub mod g16 {
     #[test]fn pb_installations_are_fresh_and_exposed_records_cannot_be_reinitialized(){
         let vm=vm(1);let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
         let a=g16::pools::PbEpoch::new(&factory,&vm,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
-        a.prepare(0,0x70c0000000).unwrap();a.check_assignment(0).unwrap();a.expose();
+        a.prepare(0,0x70c0000000,2048).unwrap();a.check_assignment(0).unwrap();a.expose();
         a.manager.w64(0xb0,0x123456789abcdef0).unwrap();let saved=a.manager.snapshot();
-        assert_eq!(a.prepare(0,0x70c0000000),Err(EINVAL));assert_eq!(saved,a.manager.snapshot());
-        let b=g16::pools::PbEpoch::new(&factory,&vm,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();b.prepare(0,0x70c0000000).unwrap();
+        assert_eq!(a.prepare(0,0x70c0000000,2048),Err(EINVAL));assert_eq!(saved,a.manager.snapshot());
+        let b=g16::pools::PbEpoch::new(&factory,&vm,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();b.prepare(0,0x70c0000000,2048).unwrap();
         assert!(!std::ptr::eq(&a.manager.data,&b.manager.data));
         assert_eq!(b.manager.class,g16::object::Class::Fw);assert_eq!(b.manager.gva,None);
         let mut slots=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
         slots.retire_binding(0,&a).unwrap();assert_eq!(sync::Arc::strong_count(&a),2);
         b.check_assignment(0).unwrap();b.expose();assert_eq!(sync::Arc::strong_count(&a),2);
         slots.retire_binding(0,&b).unwrap();assert_eq!(sync::Arc::strong_count(&a),1);
+    }
+    #[test]fn pb_reuse_needs_the_same_binding_vm_and_a_completed_render_and_holds_nothing(){
+        let one=vm(1);let two=vm(2);let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
+        let a=g16::pools::PbEpoch::new(&factory,&one,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
+        a.prepare(0,0x70c0000000,2048).unwrap();a.check_assignment(0).unwrap();a.expose();
+        let mut p=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let n=p.bind(0,false);p.retire_binding(0,&a).unwrap();p.retire_epoch(true,0,n,true);
+        assert_eq!(sync::Arc::strong_count(&a),2,"only the owner lease");
+        let r=p.reusable(true,0,&one).unwrap();assert!(sync::Arc::ptr_eq(&r,&a));drop(r);
+        assert_eq!(sync::Arc::strong_count(&a),2);
+        assert!(p.reusable(false,0,&one).is_none(),"g16_pb_reuse=0");
+        assert!(p.reusable(true,0,&two).is_none(),"another VM");assert!(p.reusable(true,1,&one).is_none(),"another slot");
+        assert_eq!(p.bind(0,true),n);p.retire_epoch(true,0,n,true);assert!(p.reusable(true,0,&one).is_some());
+        p.retire_epoch(true,0,n,false);assert!(p.reusable(true,0,&one).is_none(),"failed render");
+        p.retire_epoch(true,0,n,true);p.forget(0);assert!(p.reusable(true,0,&one).is_none(),"aborted render");
+        let m=p.bind(0,false);assert_ne!(m,n);p.retire_epoch(true,0,n,true);
+        assert!(p.reusable(true,0,&one).is_none(),"a stale binding after a fresh one");
+        p.retire_epoch(true,0,m,true);assert!(p.reusable(true,0,&one).is_some());
+        p.invalidate();assert!(p.reusable(true,0,&one).is_none(),"recovery");
+        p.retire_epoch(true,0,m,true);assert!(p.reusable(true,0,&one).is_none(),"a render retiring after recovery");
+        assert_eq!(p.bind(0,true),m.wrapping_add(1));
+        assert_eq!(sync::Arc::strong_count(&a),2);
     }
 
 }
