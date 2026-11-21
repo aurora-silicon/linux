@@ -580,6 +580,31 @@ Description:
 		no handler for, as an unsigned decimal. The first few are
 		logged. Normally 0.
 
+What:		/sys/bus/platform/devices/<unit>.sep/diag/sensor_bringup_failures
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) How many Touch ID sensor bring-up attempts have failed
+		since probe, as an unsigned decimal: attach-time, late,
+		verify-time and restore attempts alike, whether or not a
+		later attempt brought the sensor up. Each failure is logged
+		with the step that failed. sensor_attach says whether the
+		sensor came up in the end; this says how often it took more
+		than one attempt. Normally 0.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/capture_frame_errors
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) How many Touch ID captures since probe returned a frame
+		the driver refused, for a checksum that did not match or a
+		length the sensor advertised that cannot be a frame, as an
+		unsigned decimal. Each such capture ends with a request to
+		touch again; nothing from the frame reaches the enclave.
+		Normally 0.
+
 What:		/sys/bus/platform/devices/<unit>.sep/diag/sleep
 What:		/sys/bus/platform/devices/<unit>.sep/diag/sleeps
 Date:		November 2026

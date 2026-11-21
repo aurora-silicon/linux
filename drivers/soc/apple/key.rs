@@ -911,6 +911,13 @@ pub(crate) enum TouchOp {
 /// operation with. Only an outright refusal by the enclave (`EKEYREJECTED`:
 /// it performed nothing) hands the grant back, once, for the one retry
 /// the verify makes after it completes the evaluation.
+///
+/// The retry is not one the enclave protocol asks for: the operation runs
+/// first where macOS runs it (after MATCH_CANCEL, before the evaluation is
+/// completed), and again after the completion only because which of the two
+/// the enclave accepts has not been measured. Either way at most one
+/// operation runs per match. Tracked in
+/// <https://github.com/aurora-silicon/linux/issues/2324>.
 pub(crate) struct KeyGrant {
     op: TouchOp,
     /// The user bag the record lives under (`HANDLE_USER_BAG`), if any.

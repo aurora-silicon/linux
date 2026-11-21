@@ -386,6 +386,8 @@ fn take_allowance() -> Option<Allowance> {
             "xART guard: this boot may rewrite the first existing kind-{} record the enclave asks for, once, for a boot policy change\n",
             kind
         ),
+        // Fail-closed: a damaged file grants nothing, and it is emptied
+        // above, so it cannot grant anything at a later boot either.
         None => pr_warn_ratelimited!("xART guard: ignored a damaged one-time allowance\n"),
     }
     allowance
@@ -548,6 +550,10 @@ impl<F: ListFile> Guard<F> {
                 None => torn += 1,
             }
         }
+        // Fail-closed: an entry that does not decode lists nothing as
+        // Linux's, so a record it may have named stays protected if it
+        // existed at open. It still counts towards MAX_ENTRIES and
+        // `loaded_entries`, so may_retry_create sees the list as it is.
         if torn != 0 {
             pr_warn_ratelimited!("xART guard: ignored {} unreadable list entries\n", torn);
         }
