@@ -2,9 +2,14 @@
 
 //! Private render UMA/heap backing and device-wide PB-slot leases.
 //!
-//! Each VM keeps two persistent UMA/heap units. Each render command installs a fresh
-//! PB manager with full InitBM and never reinitializes exposed cursors. The previous
-//! PB-slot lease survives until the replacement's complete normal retirement.
+//! Each VM keeps two persistent UMA units and one PB heap they share: a render is published
+//! only while no other command is in flight and retires with its blocks returned, so the two
+//! pass slots' PB managers never hand out heap blocks at the same time. With `g16_pb_reuse` (the default), a render
+//! reuses its pass slot's lease, its VM's last successfully retired epoch of the slot, while
+//! the slot is still bound to it, unchanged (the host writes nothing to it, no InitBM).
+//! Otherwise it installs a fresh PB manager with full InitBM and never reinitializes exposed
+//! cursors. The previous PB-slot lease survives until the replacement's complete normal
+//! retirement.
 
 #[path = "pools/lifetime.rs"]
 pub(crate) mod lifetime;
@@ -67,10 +72,16 @@ pub(crate) struct PbStats {
     #[allow(dead_code)]
     pub(crate) refused: u64,
     pub(crate) bad: u64,
+    /// Pass slot bindings that reused a retired epoch / started a fresh one (a deferred
+    /// render counts again when it is retried).
+    pub(crate) reused: u64,
+    pub(crate) fresh: u64,
 }
 
 pub(crate) struct PoolSet {
     units: KVec<Allocator>,
+    /// Blocks of the shared heap (the PB managers' lists cover the whole 256 MiB window).
+    heap_blocks: u32,
 }
 
 fn alloc(
@@ -122,7 +133,7 @@ fn write_records<const N: usize>(
     Ok(())
 }
 impl Allocator {
-    fn new(o: &mut Objects, k: u64) -> Result<Self> {
+    fn new(o: &mut Objects, k: u64, heap: &Arc<FwObject>) -> Result<Self> {
         let base = client::render_base(k);
         let nc = |va| Some((va, pte::LEAF_NC));
         // Native UMA software metadata is ASC-owned and never needs a client GPU alias.
@@ -146,13 +157,7 @@ impl Allocator {
         let state = alloc(o, 0x20000, Class::Shared, nc(client::render_state(k)), true)?;
         let list = alloc(o, 0x4000, Class::Shared, nc(client::render_list(k)), true)?;
         let submitted = alloc(o, 0x40, Class::Fw, None, true)?;
-        let heap = alloc(
-            o,
-            client::PB_HEAP_SIZE as usize,
-            Class::Shared,
-            nc(client::pb_heap(k)),
-            false,
-        )?;
+        let heap = heap.clone();
         let scene_list = alloc(
             o,
             buffer::SCENE_LIST_SIZE,
@@ -213,11 +218,21 @@ impl Allocator {
 }
 impl PoolSet {
     pub(crate) fn new(o: &mut Objects) -> Result<Self> {
+        // The firmware copes with a full PB without the host (its overflow counters move and
+        // the scene completes), so the heap is sized well below the 256 MiB window.
+        let heap_blocks = super::params::pb_heap_blocks().min(buffer::MAX_BLOCKS);
+        let heap = alloc(
+            o,
+            heap_blocks as usize * buffer::BLOCK_BYTES as usize,
+            Class::Shared,
+            Some((client::pb_heap(0), pte::LEAF_NC)),
+            false,
+        )?;
         let mut units = KVec::with_capacity(2, GFP_KERNEL)?;
         for k in 0..2 {
-            units.push(Allocator::new(o, k)?, GFP_KERNEL)?;
+            units.push(Allocator::new(o, k, &heap)?, GFP_KERNEL)?;
         }
-        Ok(Self { units })
+        Ok(Self { units, heap_blocks })
     }
     #[allow(dead_code)]
     pub(crate) fn allocator_refs_for(&self, k: usize) -> Result<AllocatorRefs> {
@@ -252,6 +267,9 @@ impl PoolSet {
     pub(crate) fn heap_gva(&self, k: usize) -> Result<u64> {
         gva(&self.units.get(k).ok_or(EINVAL)?.heap)
     }
+    pub(crate) fn heap_blocks(&self) -> u32 {
+        self.heap_blocks
+    }
 }
 
 /// Device-wide physical PB-slot leases. Replacement requires a complete normal receipt.
@@ -259,6 +277,11 @@ pub(crate) struct Pools {
     pub(crate) dev: ARef<device::Device>,
     pub(crate) stats: PbStats,
     owners: [Option<Arc<PbEpoch>>; 2],
+    /// Per pass slot, a binding count, bumped by each fresh epoch (its InitBM rebinds the
+    /// slot) and by a firmware recovery. It identifies a binding without holding the epoch.
+    binds: [u64; 2],
+    /// Per pass slot, with `g16_pb_reuse`: `owners[k]` may serve the next render of its VM.
+    keep: [bool; 2],
 }
 impl Pools {
     pub(crate) fn new(dev: &AsahiDrmDevice) -> Self {
@@ -266,6 +289,66 @@ impl Pools {
             dev: dev.as_ref().as_ref().into(),
             stats: PbStats::default(),
             owners: [None, None],
+            binds: [0, 0],
+            keep: [false, false],
+        }
+    }
+    /// With reuse `enabled` (`g16_pb_reuse`): slot `k`'s owner epoch, if its render retired
+    /// normally while the slot was still bound to it, it belongs to `vm` and was exposed (its
+    /// InitBM ran). InitBM binds the device-wide slot to one epoch and VM; a fresh epoch handed
+    /// to the slot rebinds it, so the owner is then stale and the render starts fresh. Adds no
+    /// reference beyond the owner lease itself.
+    pub(crate) fn reusable(
+        &self,
+        enabled: bool,
+        k: usize,
+        vm: &Arc<super::vm::VmState>,
+    ) -> Option<Arc<PbEpoch>> {
+        if !enabled || !*self.keep.get(k)? {
+            return None;
+        }
+        let owner = self.owners.get(k)?.as_ref()?;
+        (Arc::ptr_eq(&owner._vm, vm) && owner.exposed.load(Ordering::Acquire))
+            .then(|| owner.clone())
+    }
+    /// Slot `k` is handed to a render's epoch, `reused` or fresh (with InitBM). Returns the
+    /// binding the render retires with.
+    pub(crate) fn bind(&mut self, k: usize, reused: bool) -> u64 {
+        let (Some(binds), Some(keep)) = (self.binds.get_mut(k), self.keep.get_mut(k)) else {
+            return 0;
+        };
+        if !reused {
+            *binds = binds.wrapping_add(1);
+            *keep = false;
+        }
+        *binds
+    }
+    /// A render on slot `k` with `binding` retired, after its `retire_binding`. If no other
+    /// epoch was bound and no recovery started since, the next render of the same VM may reuse
+    /// its epoch with reuse `enabled` and a `completed` render; after a failed one it starts
+    /// fresh.
+    /// Renders are bound, published and retired one at a time (`sizes::FLIGHTS` is 1, enforced
+    /// in `Engine::new`), so `keep[k]` always refers to the epoch the slot is bound to:
+    /// `owners[k]`.
+    pub(crate) fn retire_epoch(&mut self, enabled: bool, k: usize, binding: u64, completed: bool) {
+        if self.binds.get(k) == Some(&binding) {
+            if let Some(keep) = self.keep.get_mut(k) {
+                *keep = enabled && completed;
+            }
+        }
+    }
+    /// Reuse nothing on slot `k` (its render was aborted).
+    pub(crate) fn forget(&mut self, k: usize) {
+        if let Some(keep) = self.keep.get_mut(k) {
+            *keep = false;
+        }
+    }
+    /// A firmware recovery started: no epoch bound so far is reused, also not by a render that
+    /// retires after it (its binding no longer matches); each slot's next render starts fresh.
+    pub(crate) fn invalidate(&mut self) {
+        for (binds, keep) in self.binds.iter_mut().zip(self.keep.iter_mut()) {
+            *binds = binds.wrapping_add(1);
+            *keep = false;
         }
     }
     pub(crate) fn retire_binding(&mut self, k: usize, epoch: &Arc<PbEpoch>) -> Result {
@@ -275,16 +358,19 @@ impl Pools {
     pub(crate) fn write_stats(&self, f: &mut impl fmt::Write) -> fmt::Result {
         writeln!(
             f,
-            "pb: M4 private allocators blocks {} requests {} bad {}",
+            "pb: M4 private allocators blocks {} requests {} bad {} reused {} fresh {}",
             buffer::MAX_BLOCKS,
             self.stats.requests,
-            self.stats.bad
+            self.stats.bad,
+            self.stats.reused,
+            self.stats.fresh
         )
     }
 }
 
-/// One never-reinitialized PB manager installation. Even a same-VM command gets a fresh
-/// manager and full InitBM; no host reset of exposed firmware cursors is required.
+/// One never-reinitialized PB manager installation. Unless `g16_pb_reuse` hands a same-VM
+/// command its retired epoch, every command gets a fresh manager and full InitBM; no host
+/// reset of exposed firmware cursors is required.
 pub(crate) struct PbEpoch(crate::cleanup::Deferred<PbEpochInner>);
 impl core::ops::Deref for PbEpoch {
     type Target = PbEpochInner;
@@ -339,18 +425,23 @@ impl PbEpoch {
 
     /// Seed only unpublished storage. A retry may choose another physical slot; after
     /// exposure neither the manager nor any of its firmware-mutated lists is reset.
-    pub(crate) fn prepare(&self, k: usize, heap: u64) -> Result {
-        if k >= 2 || self.exposed.load(Ordering::Acquire) {
+    pub(crate) fn prepare(&self, k: usize, heap: u64, heap_blocks: u32) -> Result {
+        if k >= 2 || self.exposed.load(Ordering::Acquire) || heap_blocks > buffer::MAX_BLOCKS {
             return Err(EINVAL);
         }
+        // Only the backed part of the heap is named; the rest of the lists stays zero.
+        let pages = heap_blocks * buffer::PAGES_PER_BLOCK;
         write_records(&self.pages, buffer::MAX_PAGES as usize, |i| {
-            buffer::page_record(heap, i as u32).to_le_bytes()
+            let i = i as u32;
+            (if i < pages { buffer::page_record(heap, i) } else { 0 }).to_le_bytes()
         })?;
         write_records(&self.blocks, buffer::MAX_BLOCKS as usize, |i| {
-            u64::from(buffer::block_record(heap, i as u32)).to_le_bytes()
+            let b = i as u32;
+            u64::from(if b < heap_blocks { buffer::block_record(heap, b) } else { 0 }).to_le_bytes()
         })?;
-        self.ring.w32(0, buffer::MAX_BLOCKS)?;
-        self.ring.w32(4, buffer::MAX_BLOCKS)?;
+        let posted = super::params::pb_posted_blocks(heap_blocks);
+        self.ring.w32(0, posted)?;
+        self.ring.w32(4, posted)?;
         self.counter.w64(0, 1)?;
         self.manager.write(
             0,
@@ -374,6 +465,10 @@ impl PbEpoch {
     }
     pub(crate) fn expose(&self) {
         self.exposed.store(true, Ordering::Release);
+    }
+    /// Never handed to the firmware: its storage may serve another render of its VM.
+    pub(crate) fn unexposed(&self) -> bool {
+        !self.exposed.load(Ordering::Acquire)
     }
 }
 
