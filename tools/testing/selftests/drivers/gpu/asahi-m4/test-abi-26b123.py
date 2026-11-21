@@ -41,7 +41,7 @@ GLOBALS_MAP = fields([(0x24, 0x24), (0x78, 0x7c), (0x88, 0x8c), (0x8c, 0x90), (0
 # FirmwareData: FWCTL state/ring pointers and the scheduler word.
 FIRMWARE_DATA_MAP = [(0x4f88, 0x5168, 8), (0x4f90, 0x5170, 8), (0x4fd4, 0x51b4, 4)]
 # HW data: the G16-written words, then the register map slot renumbering.
-MAIN_MAP = [(0x28, 0x28, 8), (0xe88, 0xfa0, 8), (0xf24, 0x1040, 8)] + fields([
+MAIN_MAP = [(0x28, 0x28, 8), (0xf24, 0x1040, 8)] + fields([
     (0xea0, 0xfc0), (0xea4, 0xfc4), (0xeb8, 0xfd8), (0xed0, 0xfec), (0xed4, 0xff0),
     (0xed8, 0xff4), (0xee0, 0xffc), (0xfc0, 0x10dc), (0xfc4, 0x10e0), (0x2544, 0x2660),
     (0x2548, 0x2664), (0x254c, 0x2668), (0x2550, 0x266c), (0x2554, 0x2670), (0x2568, 0x2684),
@@ -54,8 +54,10 @@ SLOTS = {0: 0, 3: 3, 9: 9, 10: 10, 12: 12, 14: 14, 15: 15, 17: 17, 22: 22, 26: 3
          28: 33, 29: 34, 31: 36, 32: 37, 39: 44, 40: 45, 41: 46}
 MAIN_MAP += [(0x640 + old * 0x28, 0x640 + new * 0x28, 0x28) for old, new in SLOTS.items()]
 # Logical 36 (the protected power-transition block, slot 41) stays empty on 26B123, as the M4
-# Pro leaves it: its 25G83 bytes are accounted for without a 26B123 position.
-DROPPED = {MAIN: [(0x640 + 36 * 0x28, 0x28)]}
+# Pro leaves it: its 25G83 bytes are accounted for without a 26B123 position. The retention
+# pointer (25G83 MAIN 0xe88) leaves MAIN: macOS 27.2 publishes none, and the object is
+# RUNTIME's 0x2c8 table.
+DROPPED = {MAIN: [(0x640 + 36 * 0x28, 0x28), (0xe88, 8)]}
 # Power config: the words the host writes and the temperature pointer.
 POWER_MAP = [(0x3b50, 0x3b98, 8)] + fields([
     (0x4, 0x4), (0x8, 0x8), (0x10, 0x10), (0x14, 0x14), (0x2c, 0x2c), (0x30, 0x30),
@@ -64,8 +66,8 @@ POWER_MAP = [(0x3b50, 0x3b98, 8)] + fields([
     (0x2210, 0x2220), (0x22b0, 0x22c0), (0x22b4, 0x22c4), (0x22f8, 0x2308), (0x279e, 0x27ae),
     (0x2870, 0x2880), (0x2a3c, 0x2a64), (0x2b84, 0x2bac), (0x2b88, 0x2bb0), (0x2b8c, 0x2bb4),
     (0x2bcc, 0x2bf4), (0x2c40, 0x2c68), (0x2c44, 0x2c6c), (0x2c88, 0x2cb0)])
-# Words new in 26B123 that the host writes (none: HW data +0xfa8 stays zero).
-NEW_26B123 = {}
+# Words new in 26B123 that the host writes: the u64 crash copy buffer size at HW data 0xfa8.
+NEW_26B123 = {MAIN: [(0xfa8, 0x8000)]}
 MOVED = {GLOBALS: GLOBALS_MAP, FIRMWARE_DATA: FIRMWARE_DATA_MAP, MAIN: MAIN_MAP,
          POWER_PERFORMANCE: POWER_MAP,
          # Main config: only the power-config pointer moves (16 bytes later).
@@ -120,6 +122,10 @@ def expect_initdata(old_image):
             for at, value in ((0x38, 1), (0x9dc, 50), (0xe0c, 250)):
                 assert not any(after[at:at + 4]), f'GLOBALS +{at:#x}'
                 struct.pack_into('<I', after, at, value)
+        if index == RUNTIME:
+            # The RETENTION object (25G83 MAIN 0xe88) is the zeroed table at RUNTIME 0x2c8.
+            assert not any(after[0x2c8:0x2d0])
+            after[0x2c8:0x2d0] = old[MAIN][0xe88:0xe90]
         for at, value in NEW_26B123.get(index, []):
             assert not any(after[at:at + 8]), f'object {index} +{at:#x}'
             struct.pack_into('<Q', after, at, value)

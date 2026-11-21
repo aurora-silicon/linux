@@ -130,9 +130,22 @@ pub(crate) struct Layout {
     pub(crate) pstate_selectors: [usize; 3],
     /// MAIN offset of the u64 size of the host's crash copy buffer, where the build has one.
     pub(crate) coredump_copy: Option<usize>,
+    /// Where the RETENTION object is published.
+    pub(crate) retention: Retention,
     /// GLOBALS (region C) words of this build that have no 25G83 position, at their own
     /// offsets: the M4 Pro 26B123 cold-start policy (`g17::fw::initdata::v26b123::RegionCPrefix`).
     pub(crate) globals_policy: &'static [(usize, u32)],
+}
+
+/// Where the RETENTION object (0x4000 zeroed bytes) is published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retention {
+    /// MAIN's retention pointer (25G83 0xe88).
+    Main,
+    /// MAIN's retention pointer stays 0, so the firmware keeps that state in its own RAM, and
+    /// the zeroed object is instead the RUNTIME table this u64 pointer names, whose counters
+    /// the firmware increments. macOS 27.2 publishes both that way on the J773g.
+    Runtime(usize),
 }
 
 /// Size of the host's crash copy buffer (`coredump-copy-buffer` in the 27.2 ADT); macOS 27.2
@@ -211,14 +224,16 @@ pub(crate) const V25G83: Layout = Layout {
     },
     pstate_selectors: [0x88, 0x8c, 0x98],
     coredump_copy: None,
+    retention: Retention::Main,
     globals_policy: &[],
 };
 
 /// The 26B123 InitData ABI (macOS 27.2): the same 31 objects and pointers, with
 /// - the main-config power-config pointer 16 bytes later;
 /// - a 60-slot register map in MAIN, then the retention pointer at 0xfa0, a new u64 at 0xfa8
-///   (left zero), the old 0xe90.. words +0x120, 0xec0.. +0x11c (one word removed at 0xebc),
-///   0x2600.. +0x120 and the last bytes +0x124 (new u32s at 0x275c and 0x277e, left zero);
+///   (the crash copy buffer size), the old 0xe90.. words +0x120, 0xec0.. +0x11c (one word
+///   removed at 0xebc), 0x2600.. +0x120 and the last bytes +0x124 (new u32s at 0x275c and
+///   0x277e, left zero);
 /// - a u32 inserted at GLOBALS 0x38 (left zero), so every later word moves by four;
 /// - POWER_PERFORMANCE with words inserted at 0x9c (0x10 bytes, left zero), 0x28b0 (0x18),
 ///   0x3b50 (0x28) and 0x63cc (0x680), 8 bytes removed between 0x2d08 and 0x2f08 and 0x20
@@ -263,11 +278,12 @@ pub(crate) const V26B123: Layout = Layout {
         snapshot_entries: 448,
     },
     pstate_selectors: [0x8c, 0x90, 0x9c],
-    // HW data +0xfa8 stays zero. With the crash copy buffer's size there, the J713's firmware
-    // faulted on its first resume from idle, at fw-text PA + 0x6f8, as soon as a doorbell woke
-    // it. The T6041 build pairs 0x8000 there with a dedicated 0x8000 window at +0xfa0, where
-    // G16 keeps its RAM retention object.
-    coredump_copy: None,
+    // As macOS 27.2 on the J773g: HW data +0xfa8 holds the crash copy buffer's size and +0xfa0
+    // no retention pointer, and the RETENTION object is the RUNTIME table at 0x2c8. With our
+    // retention object at +0xfa0 and the size at +0xfa8, the J713's firmware faulted on its
+    // first resume from an idle power-off.
+    coredump_copy: Some(0xfa8),
+    retention: Retention::Runtime(0x2c8),
     // The new u32 at 0x38 and two words in previously reserved fields, as the M4 Pro writes
     // them on this firmware (linux#1954, on hardware) and as macOS 27.2's InitData on the J773g
     // holds them. The firmware takes region C into its state when it powers the GPU up.
@@ -305,6 +321,20 @@ const fn layout_fits(layout: &Layout) -> bool {
         && runs_fit(layout.main, size[id::MAIN])
         && runs_fit(layout.globals, size[id::GLOBALS])
         && runs_fit(layout.power_performance, size[id::POWER_PERFORMANCE])
+        && retention_fits(layout)
+}
+
+/// A RUNTIME retention table pointer is aligned, inside RUNTIME and clear of the power-config
+/// pointer.
+const fn retention_fits(layout: &Layout) -> bool {
+    match layout.retention {
+        Retention::Main => true,
+        Retention::Runtime(at) => {
+            at % 8 == 0
+                && at + 8 <= layout.object_size[id::RUNTIME]
+                && (at + 8 <= layout.power_config || layout.power_config + 8 <= at)
+        }
+    }
 }
 const _: () = assert!(layout_fits(&V25G83) && layout_fits(&V26B123));
 
@@ -752,6 +782,9 @@ pub(crate) fn encode_for(
     put64(runtime, 0x2e0, input.lower_uma)?;
     put32(runtime, 0x250, 1)?;
     put32(runtime, 0x2f8, 4)?;
+    if let Retention::Runtime(at) = layout.retention {
+        put64(runtime, at, input.va[id::RETENTION])?;
+    }
     for i in 0..12 {
         encode_channel(
             &mut runtime[0x20 + i * 0x20..],
@@ -799,7 +832,9 @@ pub(crate) fn encode_for(
     let runs = layout.main;
     let main = &mut objects[id::MAIN];
     put64(main, remap(runs, 0x28, 8)?, HOST_END)?;
-    put64(main, remap(runs, 0xe88, 8)?, input.va[id::RETENTION])?;
+    if layout.retention == Retention::Main {
+        put64(main, remap(runs, 0xe88, 8)?, input.va[id::RETENTION])?;
+    }
     if let Some(at) = layout.coredump_copy {
         put64(main, at, COREDUMP_COPY_SIZE)?;
     }
