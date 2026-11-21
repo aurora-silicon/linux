@@ -67,10 +67,14 @@ those nodes. A probe with a valid handoff reports the verified CRCs without
 starting the coprocessor. An unknown layout refuses stream start before
 allocating session buffers or acquiring runtime power.
 
-The M3 generation (T8122, T6030, T6031 and both dies of T6032) is probe-only
-as well. Its encoders have the T8112 register windows, interrupt order and
-power states, but run firmware builds of their own (TEXT 0x134000 and DATA
-0x128000 bytes on a T8122 with macOS 27.2), so no build size is pinned: any
+T8122 (M3) with the macOS 27.2 firmware (TEXT 0x134000, DATA 0x128000, TEXT
+CRC ``918d70d3``) encodes H.264 and HEVC: the firmware boots on the boot
+configuration handshake as device 17 with handshake type 17 and speaks the
+26B123 command layout, while the coprocessor registers and their start are the
+T8112 ones. The rest of the M3 generation (T6030, T6031 and both dies of T6032)
+is probe-only. Its encoders have the T8112 register windows, interrupt order and
+power states, but their firmware builds have not been seen yet, so no build
+size is pinned: any
 loader-verified handoff binds, the probe logs both segment sizes and CRCs,
 and the coprocessor is never started. The nodes stay disabled until the
 loader hands their firmware over.
