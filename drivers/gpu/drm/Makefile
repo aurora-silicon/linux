@@ -229,6 +229,7 @@ obj-$(CONFIG_DRM_PANTHOR) += panthor/
 obj-$(CONFIG_DRM_TYR) += tyr/
 obj-$(CONFIG_DRM_APPLE_FABRIC_CORE) += apple/dcp-fabric-core.o
 obj-$(CONFIG_DRM_APPLE_FABRIC_KUNIT_TEST) += apple/dcp-fabric-test.o
+obj-$(CONFIG_DRM_APPLE_FABRIC_KUNIT_TEST) += apple/dptx-hints-test.o
 obj-$(CONFIG_DRM_APPLE) += apple/
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple/iomfb-state-test.o
 obj-$(CONFIG_DRM_ASPEED_GFX) += aspeed/

@@ -20,6 +20,7 @@
 #include "dcp-hdmi.h"
 #include "dptxep.h"
 #include "dcp-180hz.h"
+#include "dcp-peer-v13_5.h"
 #include "dptx-service.h"
 #include "parser.h"
 #include "trace.h"
@@ -1014,7 +1015,17 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		memcpy(reply, data, min(reply_size, data_size));
 		return 0;
 	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS: {
+		struct apple_dcp *dcp = service->ep->dcp;
 		int ret;
+
+		if (dcp->fw_compat == DCP_FIRMWARE_V_13_5 && !dptx->unit &&
+		    of_device_is_compatible(dcp->dev->of_node, "apple,t6020-dcpext") &&
+		    data_size == sizeof(struct dcp_display_hints_v13_5)) {
+			ret = dcp_no_peer_hints_v13_5(data, reply, reply_size);
+			if (!ret)
+				dptxport_note_tile_hint(service, data, data_size);
+			return ret;
+		}
 
 		/*
 		 * A tiled sink behind a Thunderbolt tunnel (Studio Display over
