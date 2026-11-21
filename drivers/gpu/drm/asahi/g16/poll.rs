@@ -355,7 +355,7 @@ impl Firmware {
                     return Ok(false);
                 }
             }
-            if info.r32(0x80)? != 0 {
+            if info.r32(self.init.abi.qinfo().busy)? != 0 {
                 return Ok(false);
             }
         }

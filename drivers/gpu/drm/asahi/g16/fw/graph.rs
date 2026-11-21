@@ -35,6 +35,9 @@ pub(crate) mod qinfo {
         pub(crate) uuid: usize,
         /// u64 scheduling context VA.
         pub(crate) sched_ctx: usize,
+        /// Firmware u32 busy flag: 1 from when the firmware takes a record until DONE (+0x20)
+        /// reaches the head (+0x28).
+        pub(crate) busy: usize,
     }
 
     pub(crate) const V25G83: Layout = Layout {
@@ -43,6 +46,7 @@ pub(crate) mod qinfo {
         unk_4c: UNK_4C,
         uuid: UUID,
         sched_ctx: SCHED_CTX,
+        busy: 0x80,
     };
 
     /// 26B123 shrinks the header to 0x80: one word goes from 0x40..0x48, so 0x48..0x54 move
@@ -55,6 +59,9 @@ pub(crate) mod qinfo {
         unk_4c: 0x48,
         uuid: 0x4c,
         sched_ctx: 0x78,
+        // The firmware-owned words move down too (0x5c -> 0x50, 0x80 -> 0x54, 0x88 -> 0x5c,
+        // 0x98 -> 0x6c); 0x80 is now the first word of the queue scratch.
+        busy: 0x54,
     };
 }
 
