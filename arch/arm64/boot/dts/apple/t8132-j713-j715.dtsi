@@ -53,6 +53,7 @@
 /* The radio's firmware island: the J713's here, the J715 overrides it. */
 &wifi0 {
 	brcm,board-type = "apple,garden";
+	wakeup-source;
 };
 
 &bluetooth0 {
