@@ -341,3 +341,78 @@
 &ane {
 	status = "okay";
 };
+
+/*
+ * Both USB-C ports are wired for DisplayPort alt mode (the ADT's dcpext0/1
+ * dp-switch-ufp-port and the ATC crossbars): a partner entering it keeps four
+ * DP lanes (pin assignments C and E) or two beside USB3 (D) instead of falling
+ * back to USB2. The PHYs take the usb3-dp calibration from the boot loader.
+ */
+&atcphy0 {
+	apple,dp-alt-mode;
+};
+
+&atcphy1 {
+	apple,dp-alt-mode;
+};
+
+/*
+ * On macOS 27.2 iBoot leaves dcpext0 and dcpext1 running the internal DCP's
+ * 26B123 image; the boot loader fills these with their firmware memory, as
+ * the J773g's, and the display gate then enables their Type-C routes.
+ */
+/ {
+	reserved-memory {
+		dcpext0_text: dcpext0-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext0_data: dcpext0-data {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext0_heap: dcpext0-heap {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext1_text: dcpext1-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext1_data: dcpext1-data {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext1_heap: dcpext1-heap {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+&dcpext0 {
+	memory-region = <&dcpext0_text>, <&dcpext0_data>, <&dcpext0_heap>;
+	memory-region-names = "text", "data", "heap";
+};
+
+&dcpext1 {
+	memory-region = <&dcpext1_text>, <&dcpext1_data>, <&dcpext1_heap>;
+	memory-region-names = "text", "data", "heap";
+};

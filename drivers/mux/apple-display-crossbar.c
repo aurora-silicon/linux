@@ -1261,6 +1261,27 @@ int apple_dpxbar_link_down(struct mux_control *mux)
 }
 EXPORT_SYMBOL_GPL(apple_dpxbar_link_down);
 
+/**
+ * apple_dpxbar_clocks_on_link() - does an output run its clocks only with the link?
+ * @mux: a display crossbar output
+ *
+ * On crossbars with the T6030 flow, selecting an output only routes it: its
+ * clocks stay off until apple_dpxbar_link_up(), which the display processor's
+ * user must call once the link is trained.
+ *
+ * Return: true for such an output, false otherwise (including %NULL).
+ */
+bool apple_dpxbar_clocks_on_link(struct mux_control *mux)
+{
+	struct apple_dpxbar *xbar;
+
+	if (!mux || mux->chip->ops != &apple_dpxbar_t602x_ops)
+		return false;
+	xbar = mux_chip_priv(mux->chip);
+	return xbar->t6030_dpin;
+}
+EXPORT_SYMBOL_GPL(apple_dpxbar_clocks_on_link);
+
 static void apple_dpxbar_domain_release(void *data)
 {
 	struct device *pd = data;

@@ -5546,25 +5546,28 @@ static int apple_dart_probe(struct platform_device *pdev)
 					  apple_t8132_dcp_v27_2);
 	if (j713_display_v27)
 		j713_display = false;
-	/* The external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
-	j713_dcpext = res && !tunneled && apple_t8132_firmware_path() &&
-		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
-		(res->start == 0x286340000ULL || res->start == 0x48a340000ULL);
-	/* The external display DARTs (SID0/SID16) of dispext0 and dispext1. */
-	j713_dispext = res && !tunneled && apple_t8132_firmware_path() &&
-		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
-		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
 	/*
 	 * A T8132 external display processor handed over with the 27.2 image
-	 * (the J773g's dcpext0) runs the same firmware-27 backend on its own
-	 * firmware and display DARTs: when the boot loader left them locked,
-	 * they keep their firmware's roots the same way (fw_mirror below). Never
-	 * an Air's borrowed external DARTs.
+	 * (the J773g's HDMI dcpext0, an Air's USB-C dcpext0 and dcpext1) runs
+	 * the firmware-27 backend on its own firmware and display DARTs,
+	 * through ordinary domains, as the internal one does on 27.2
+	 * (j713_display_v27): they keep their firmware's locked roots the same
+	 * way (fw_mirror below) and must be locked. Decided first, by the
+	 * handoff of the processor that names the DART, on any board and either
+	 * firmware path: such a DART is never a borrowed 26.6.2 one.
 	 */
-	t8132_dcpext_v27 = res && !tunneled && !j713_dcpext && !j713_dispext &&
+	t8132_dcpext_v27 = res && !tunneled &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		apple_dart_serves_v27_dcp(dev->of_node, "apple,t8132-dcpext",
 					  apple_t8132_dcpext_v27_2);
+	/* The borrowed 26.6.2 external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
+	j713_dcpext = res && !tunneled && !t8132_dcpext_v27 && apple_t8132_firmware_path() &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		(res->start == 0x286340000ULL || res->start == 0x48a340000ULL);
+	/* The borrowed 26.6.2 external display DARTs (SID0/SID16) of dispext0 and dispext1. */
+	j713_dispext = res && !tunneled && !t8132_dcpext_v27 && apple_t8132_firmware_path() &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
 	/* The radio DART's fault interrupt is not described by the loader. */
 	j713_radio = res && !tunneled && apple_t8132_managed_radio() &&
 		of_machine_is_compatible("apple,t8132") &&
@@ -6081,11 +6084,12 @@ params_done:
 		dev_info(dev, "J713 internal display DART on the 27.2 image: locked roots kept (mirror)\n");
 	else if (j713_display_v27)
 		dev_err(dev, "J713 internal display DART on the 27.2 image: NOT locked: refusing\n");
-	if (t8132_dcpext_v27)
-		dev_info(dev, "T8132 external display DART on the 27.2 image: %s\n",
-			 dart->fw_mirror ? "locked roots kept (mirror)" : "not locked");
-	dart->fw_live_prot = j713_display_v27 || (t8132_dcpext_v27 && dart->fw_mirror);
-	if (j713_display_v27 && !dart->fw_mirror) {
+	if (t8132_dcpext_v27 && dart->fw_mirror)
+		dev_info(dev, "T8132 external display DART on the 27.2 image: locked roots kept (mirror)\n");
+	else if (t8132_dcpext_v27)
+		dev_err(dev, "T8132 external display DART on the 27.2 image: NOT locked: refusing\n");
+	dart->fw_live_prot = j713_display_v27 || t8132_dcpext_v27;
+	if ((j713_display_v27 || t8132_dcpext_v27) && !dart->fw_mirror) {
 		ret = -EINVAL;
 		goto err_clk_disable;
 	}

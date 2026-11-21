@@ -214,9 +214,9 @@ def t6041_v27_admission(root):
     cutoff = '\n\tret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);\n\tif (ret < 0)'
     selector = selector_full[:selector_full.index(cutoff)] + '\n\t(void)v14_board;\n\treturn DCP_FIRMWARE_UNKNOWN;\n}\n'
     method_table = block(dcp_c, 'static enum dcp_firmware_version dcp_v27_method_table(')
-    # The T8132 27.2 dcpext admission: by processor and image, never by board. No
-    # of_machine_is_compatible() exists in this translation unit, so neither it nor the T6041
-    # helpers can depend on the machine.
+    # The T8132 dcpext admission keys on the processor and its image alone: no
+    # of_machine_is_compatible() exists in this translation unit, so neither it nor
+    # the T6041 helpers can depend on the machine.
     t8132_h = (root / 'include/linux/soc/apple/t8132.h').read_text()
     t8132_admission = block(t8132_h, 'static inline bool apple_t8132_dcpext_v27_2(')
     assert 'of_machine_is_compatible' not in t8132_admission
@@ -422,9 +422,9 @@ int main(void)
     }
 
     /*
-     * A T8132 dcpext handed over with the T8132 27.2 image (first the Mac
-     * mini's, J773g) runs the 27.2 table, whatever the firmware path and on
-     * any board: the selection is by processor and image.
+     * A T8132 dcpext handed over with the T8132 27.2 image runs the 27.2
+     * table on any board (the J773g's HDMI dcpext0, the J713's USB-C
+     * dcpexts) and on either firmware path.
      */
     reset_t6041_26b123(true);
     node.compatible = "apple,t8132-dcpext";

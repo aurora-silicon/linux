@@ -57,7 +57,8 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
-    'dcpext26-crossbar-union-tests.py': [([], PASS), (['--drop-native26'], KILL), (['--drop-t8132'], KILL)],
+    'dcpext26-crossbar-union-tests.py': [([], PASS), (['--drop-native26'], KILL), (['--drop-t8132'], KILL),
+                                         (['--drop-on-link'], KILL)],
     'dcpext26-suspend-route-tests.py': [([], PASS), (['--native-parks'], KILL), (['--drop-h17p-park'], KILL)],
     'j613-mux-order-tests.py': [([], PASS), (['--negative-control'], KILL),
                                  (['--ignore-nomodeset'], KILL), (['--drop-failed-completion'], KILL),
@@ -116,6 +117,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('m1-layout', 'cycles-anywhere', 'expose-8-9', 'flags-in-event'), []),
     'apple-dart-dapf-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('missing-guard', 'ignore-replay', 'ignore-orphan'), out()),
+    'apple-dart-dcp-placeholder-tests.py': [([], PASS), (['--keep-placeholders'], KILL)],
     'apple-dart-fw-tests.py': [(out(), PASS)],
     'apple-dart-fw-harness-tests.py': [([], PASS)],
     'apple-dart-range-tests.py': [([], PASS)],

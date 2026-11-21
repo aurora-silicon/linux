@@ -401,6 +401,27 @@ static int apple_dart_dcp_arena(struct apple_dart_dcp *dcp)
 	return slots >= DCP_DART_SCANOUT_SLOTS ? 0 : -ENOSPC;
 }
 
+/*
+ * The @i-th memory-region entry of @consumer in *@node, NULL for one whose
+ * node is disabled. A tree may carry disabled placeholders for regions only
+ * another handoff fills, as the J713's dcpextN text, data and heap for the
+ * 27.2 image, after which the 26.6.2 boot loader appends its own regions. A
+ * disabled node reserves nothing, so the borrowed path neither checks nor
+ * maps it. A phandle that resolves to no node is still refused.
+ */
+static int apple_dart_dcp_region(struct device_node *consumer, int i,
+				 struct device_node **node)
+{
+	*node = of_parse_phandle(consumer, "memory-region", i);
+	if (!*node)
+		return -EINVAL;
+	if (!of_device_is_available(*node)) {
+		of_node_put(*node);
+		*node = NULL;
+	}
+	return 0;
+}
+
 /* Snapshot only this consumer's real no-map reservations, before table admission. */
 static int apple_dart_dcp_leaf_regions(struct apple_dart_dcp *dcp)
 {
@@ -422,8 +443,11 @@ static int apple_dart_dcp_leaf_regions(struct apple_dart_dcp *dcp)
 		struct resource res;
 		struct reserved_mem *rmem;
 
-		node = of_parse_phandle(consumer, "memory-region", i);
-		if (!node) { ret = -EINVAL; break; }
+		ret = apple_dart_dcp_region(consumer, i, &node);
+		if (ret)
+			break;
+		if (!node)
+			continue;
 		rmem = of_reserved_mem_lookup(node);
 		if (!of_property_read_bool(node, "no-map") ||
 		    of_address_to_resource(node, 0, &res) || !rmem ||
@@ -435,6 +459,8 @@ static int apple_dart_dcp_leaf_regions(struct apple_dart_dcp *dcp)
 			break;
 		dcp->leaf_regions[dcp->nr_leaf_regions++] = res;
 	}
+	if (!ret && !dcp->nr_leaf_regions)
+		ret = -EINVAL;
 out:
 	of_node_put(consumer);
 	return ret;
@@ -1083,9 +1109,11 @@ static int apple_dart_dcp_validate(struct apple_dart_dcp *dcp, struct device *de
 		unsigned int matches = 0;
 		int bytes;
 
-		node = of_parse_phandle(dev->of_node, "memory-region", i);
+		ret = apple_dart_dcp_region(dev->of_node, i, &node);
+		if (ret)
+			return ret;
 		if (!node)
-			return -EINVAL;
+			continue;
 		if (!of_device_is_compatible(node, "apple,asc-mem") ||
 		    !of_property_read_bool(node, "no-map") ||
 		    of_address_to_resource(node, 0, &res)) {
