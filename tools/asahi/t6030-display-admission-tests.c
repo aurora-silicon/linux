@@ -69,10 +69,6 @@ static bool of_machine_is_compatible(const char *name)
 {
 	return !strcmp(machine, name);
 }
-static bool asahi_g15_board(void)
-{
-	return of_machine_is_compatible("apple,t6030");
-}
 static struct device *get_device(struct device *dev)
 {
 	assert(locked);
