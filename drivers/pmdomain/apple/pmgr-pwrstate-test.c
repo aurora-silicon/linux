@@ -18,6 +18,8 @@ struct pmgr_ps_test_reg {
 	bool latched;		/* bit 11 latched: on stops at clock-gated, off still reaches 0 */
 	bool latch_sticky;	/* not even a PS reset clears it */
 	unsigned int reset_writes;	/* writes with the PS reset bit */
+	unsigned int nr_writes;
+	u32 writes[8];		/* the first words written */
 };
 
 static int pmgr_ps_test_read(void *ctx, unsigned int reg, unsigned int *val)
@@ -46,6 +48,9 @@ static int pmgr_ps_test_write(void *ctx, unsigned int reg, unsigned int val)
 	u32 parent = r->val & APPLE_PMGR_BUSY;
 	u32 actual;
 
+	if (r->nr_writes < ARRAY_SIZE(r->writes))
+		r->writes[r->nr_writes] = val;
+	r->nr_writes++;
 	if (val & APPLE_PMGR_PS_RESET) {
 		r->reset_writes++;
 		if (r->latched && !r->latch_sticky) {
@@ -358,6 +363,74 @@ static void pmgr_ps_power_on_no_reset_test(struct kunit *test)
 }
 
 /*
+ * A domain under automatic power management, auto-gated (actual clock-gated,
+ * history bits set), is lowered in two steps on every SoC: automatic power
+ * management off with the target still on, then, back at full power, the
+ * off target with the history bits written to clear them.
+ */
+static void pmgr_ps_power_off_auto_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_ACTIVE, false, &r);
+	r->val = APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS |
+		 FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_ACTIVE) |
+		 FIELD_PREP(APPLE_PMGR_PS_ACTUAL, APPLE_PMGR_PS_CLKGATE);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_off(&ps->genpd), 0);
+	KUNIT_ASSERT_EQ(test, r->nr_writes, 2U);
+	KUNIT_EXPECT_EQ(test, r->writes[0] & ~APPLE_PMGR_PS_ACTUAL,
+			(u32)FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_ACTIVE));
+	KUNIT_EXPECT_EQ(test, r->writes[1] & ~APPLE_PMGR_PS_ACTUAL,
+			(u32)APPLE_PMGR_FLAGS |
+			FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_PWRGATE));
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val), APPLE_PMGR_PS_PWRGATE);
+	KUNIT_EXPECT_FALSE(test, r->val & APPLE_PMGR_AUTO_ENABLE);
+	KUNIT_EXPECT_EQ(test, r->busy_writes, 0U);
+}
+
+/* Without automatic power management, and no history bits set: one write, as before. */
+static void pmgr_ps_power_off_plain_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_ACTIVE, true, &r);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_off(&ps->genpd), 0);
+	KUNIT_ASSERT_EQ(test, r->nr_writes, 1U);
+	KUNIT_EXPECT_EQ(test, r->writes[0] & ~APPLE_PMGR_PS_ACTUAL,
+			(u32)FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_PWRGATE));
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val), APPLE_PMGR_PS_PWRGATE);
+}
+
+/*
+ * A domain that reaches off with BUSY latched gets a PS reset pulse only where
+ * a sleep engine wakes the domains; elsewhere it is left as it is.
+ */
+static void pmgr_ps_power_off_latch_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+	bool engine;
+
+	for (engine = false; ; engine = true) {
+		/* One test device per name: vary no_auto_pm (neither has AUTO_ENABLE set). */
+		ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_ACTIVE, engine, &r);
+		ps->sleep_engine_wakes = engine;
+		r->latched = true;
+		KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_off(&ps->genpd), 0);
+		KUNIT_EXPECT_EQ_MSG(test, r->reset_writes, engine ? 1U : 0U, "engine %d", engine);
+		KUNIT_EXPECT_EQ_MSG(test, !!(r->val & APPLE_PMGR_BUSY), !engine,
+				    "engine %d", engine);
+		KUNIT_EXPECT_FALSE(test, r->val & APPLE_PMGR_PS_RESET);
+		KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val),
+				APPLE_PMGR_PS_PWRGATE);
+		if (engine)
+			break;
+	}
+}
+
+/*
  * Consumer-switched states: a state word at offset 0 whose actual state
  * follows the target (the history bits are set by a power-gate and cleared
  * by writing them), retention registers as plain words, and a write log.
@@ -559,6 +632,9 @@ static struct kunit_case pmgr_ps_test_cases[] = {
 	KUNIT_CASE(pmgr_ps_power_on_latch_sleep_test),
 	KUNIT_CASE(pmgr_ps_power_on_latch_sticky_test),
 	KUNIT_CASE(pmgr_ps_power_on_no_reset_test),
+	KUNIT_CASE(pmgr_ps_power_off_auto_test),
+	KUNIT_CASE(pmgr_ps_power_off_plain_test),
+	KUNIT_CASE(pmgr_ps_power_off_latch_test),
 	KUNIT_CASE(pmgr_ps_consumer_native_test),
 	KUNIT_CASE(pmgr_ps_consumer_retention_mask_test),
 	KUNIT_CASE(pmgr_ps_consumer_plain_test),

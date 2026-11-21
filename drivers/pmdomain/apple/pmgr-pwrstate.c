@@ -69,8 +69,13 @@ struct apple_pmgr_ps {
 	bool force_reset;
 	bool externally_clocked;
 	bool system_sleep;
-	/* Lowered as macOS lowers it, and unlatched even in a system sleep. */
-	bool macos_lower;
+	/*
+	 * The SoC's sleep engine powers this domain up itself in a wake that keeps
+	 * DRAM up, and stalls on one left off with BUSY latched (T8140): unlatch it
+	 * with a PS reset even in a system sleep, and finish a loader-left power-off
+	 * before the sleep.
+	 */
+	bool sleep_engine_wakes;
 	bool firmware_owned;
 	/* apple,sleep-retained: kept on while the system sleeps */
 	bool sleep_retained;
@@ -192,7 +197,7 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 {
 	int ret;
 	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
-	u32 reg, cur;
+	u32 reg, cur, history = 0;
 	u32 timeout = ps->strict_state ? 10000 : APPLE_PMGR_PS_SET_TIMEOUT;
 
 	ret = regmap_read(ps->regmap, ps->offset, &reg);
@@ -203,6 +208,32 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	if (reg & APPLE_PMGR_RESET && pstate != APPLE_PMGR_PS_ACTIVE)
 		dev_err_ratelimited(ps->dev, "PS %s: powering off with RESET active\n",
 				    genpd->name);
+
+	/*
+	 * Lower a domain under automatic power management as macOS does (traced on
+	 * T8140 for AVD, VENC1 and JPEG): automatic power management off first,
+	 * back at full power, and only then the target. Taking both at once from
+	 * an auto-gated state can leave BUSY latched (T8140 ane_sys, about one
+	 * sleep in 80). This is the shared PS word: AUTO_ENABLE (bit 28) reads
+	 * back clear where a domain does not implement it, and then nothing
+	 * changes here. It comes before the force-disable/force-reset bits, which
+	 * only act on a powered, clocked block.
+	 *
+	 * Not for the T8132 GFX (strict_state): its word sits behind the GFX TVM
+	 * gate (apple,t8132-gfx-tvm) and each transition there is admitted on an
+	 * actual-state ACK, a contract qualified with the single write.
+	 */
+	if (pstate != APPLE_PMGR_PS_ACTIVE) {
+		history = reg & APPLE_PMGR_FLAGS;
+		if ((reg & APPLE_PMGR_AUTO_ENABLE) && !ps->strict_state) {
+			reg &= ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY);
+			regmap_write(ps->regmap, ps->offset, reg);
+			if (!regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, cur,
+							     FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) ==
+							     APPLE_PMGR_PS_ACTIVE, 1, timeout))
+				history |= cur & APPLE_PMGR_FLAGS;
+		}
+	}
 
 	if (pstate != APPLE_PMGR_PS_ACTIVE && (ps->force_disable || ps->force_reset)) {
 		u32 reg_pre = reg & ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS |
@@ -227,27 +258,16 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 					    genpd->name, cur);
 	}
 
-	/*
-	 * As macOS lowers a domain: automatic power management off first, back at full
-	 * power, and only then the target. Taking both at once from an auto-gated state
-	 * can leave BUSY latched, and a latch stalls the sleep engine's wake.
-	 */
-	if (ps->macos_lower && pstate != APPLE_PMGR_PS_ACTIVE && (reg & APPLE_PMGR_AUTO_ENABLE)) {
-		regmap_write(ps->regmap, ps->offset,
-			     reg & ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY));
-		regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, cur,
-						FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) ==
-						APPLE_PMGR_PS_ACTIVE, 1, timeout);
-	}
-
 	/* Do not replay the hardware-owned BUSY bit in this whole-word write. */
 	reg &= ~(APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_PS_RESET |
 		 APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY |
 		 APPLE_PMGR_PS_TARGET);
 	reg |= FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate);
-	/* Writing the history bits clears them. */
-	if (ps->macos_lower && pstate != APPLE_PMGR_PS_ACTIVE)
-		reg |= APPLE_PMGR_FLAGS;
+	/*
+	 * Writing the history bits clears them, as macOS does when it lowers a
+	 * domain. Only those that read set: a block without them writes 0 there.
+	 */
+	reg |= history;
 
 	dev_dbg(ps->dev, "PS %s: pwrstate = 0x%x: 0x%x\n", genpd->name, pstate, reg);
 
@@ -306,6 +326,20 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	}
 
 	/*
+	 * Off only once BUSY clears too: macOS waits for (word & 0x8ff) == 0. The
+	 * actual state reads 0 a moment before the switch is done. BUSY still set
+	 * after this is a latch. Not where bit 11 means something else: a parent
+	 * not up yet (T6000 GFX, wait_parent), the T8132 GFX's own acked contract
+	 * (strict_state), or a switch that needs a clock from outside the PMGR
+	 * (externally_clocked).
+	 */
+	if (!ret && pstate != APPLE_PMGR_PS_ACTIVE && (cur & APPLE_PMGR_BUSY) &&
+	    !ps->wait_parent && !ps->strict_state && !ps->externally_clocked)
+		regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, cur,
+						!(cur & APPLE_PMGR_BUSY), 1,
+						APPLE_PMGR_BUSY_SETTLE_US);
+
+	/*
 	 * A domain can reach off with BUSY latched: on T8140 both ISP CPU cores do,
 	 * every time they go down under Linux. macOS leaves them off with it clear,
 	 * and the sleep engine, which powers them up itself in a wake that keeps DRAM
@@ -313,25 +347,16 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	 * reset clears it, and the domain is off, so pulse one as on the power-on
 	 * path.
 	 *
-	 * T8140 only. Other SoCs do not need it: on T8112 the gfx domain reaches
-	 * off with BUSY set before every system sleep and is fine left that way,
-	 * while a PS reset of a domain whose block is still busy can reset the
+	 * Only where a sleep engine wakes the domains (sleep_engine_wakes). Elsewhere
+	 * nothing reads the latch, and the pulse is a hazard: on T8112 the gfx domain
+	 * reaches off with BUSY set before every system sleep and is fine left that
+	 * way, while a PS reset of a domain whose block is still busy can reset the
 	 * whole SoC (a hung ANE does on T8112).
 	 */
-	/*
-	 * Off only once BUSY clears too: macOS waits for (word & 0x8ff) == 0. The
-	 * actual state reads 0 a moment before the switch is done. BUSY still set
-	 * after this is a latch.
-	 */
-	if (!ret && ps->macos_lower && pstate != APPLE_PMGR_PS_ACTIVE && (cur & APPLE_PMGR_BUSY))
-		regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, cur,
-						!(cur & APPLE_PMGR_BUSY), 1,
-						APPLE_PMGR_BUSY_SETTLE_US);
-
 	if (!ret && pstate != APPLE_PMGR_PS_ACTIVE && (cur & APPLE_PMGR_BUSY) &&
 	    !FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) && !ps->wait_parent &&
 	    !ps->strict_state && !ps->externally_clocked) {
-		if (ps->macos_lower) {
+		if (ps->sleep_engine_wakes) {
 			/* macOS never needs this: say so when it does. */
 			dev_info_ratelimited(ps->dev,
 					     "PS %s: off with BUSY%s: %#x; cleared by a PS reset\n",
@@ -603,7 +628,7 @@ static int apple_pmgr_ps_suspend_noirq(struct device *dev)
 		 * doesn't touch it after the wake. Not in the always-on PMGR, whose
 		 * words the AOP raises for itself.
 		 */
-		if (ps->macos_lower && ps->genpd.status == GENPD_STATE_OFF &&
+		if (ps->sleep_engine_wakes && ps->genpd.status == GENPD_STATE_OFF &&
 		    FIELD_GET(APPLE_PMGR_PS_TARGET, reg) && FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) &&
 		    !apple_pmgr_ps_in_aon(dev->of_node)) {
 			apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_PWRGATE, false);
@@ -880,7 +905,15 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, ps);
 	ps->reset_time_us = t8132 ? APPLE_PMGR_T8132_RESET_TIME : APPLE_PMGR_RESET_TIME;
 	ps->needs_reset_idle_wait = t8132;
-	ps->macos_lower = of_device_is_compatible(node, "apple,t8140-pmgr-pwrstate");
+	/*
+	 * The T8140 sleep engine raises the domains itself in a DRAM-kept wake and
+	 * stalls on a latched BUSY (the words it polls: t8140_ps_engine_polled in
+	 * drivers/soc/apple/sleep.c). No other SoC is known to poll these words in
+	 * a wake (the other sleep SoCs describe no such list), and on T8112 a PS
+	 * reset pulse on an off but busy domain is a hazard (see
+	 * apple_pmgr_ps_set()). The lowering sequence itself is not limited by this.
+	 */
+	ps->sleep_engine_wakes = of_device_is_compatible(node, "apple,t8140-pmgr-pwrstate");
 	ps->no_auto_enable = t8132 && !strict_state;
 	ps->strict_state = strict_state;
 
