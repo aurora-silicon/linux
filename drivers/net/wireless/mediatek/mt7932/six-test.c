@@ -215,6 +215,38 @@ static void mt7932_scan_6g_golden_test(struct kunit *test)
 	KUNIT_EXPECT_GT(test, mt7932_scan_discovery_timeout(body), 32U * 220);
 }
 
+/* Unassociated, an active channel's dwell covers one 100 TU beacon interval,
+ * with the 20 ms minimum and the per-channel budget unchanged; connected scans
+ * keep the 20 ms dwell. Nothing else in the body moves.
+ */
+static void mt7932_scan_unassociated_dwell_test(struct kunit *test)
+{
+	static const u8 channels[] = {36, 40, 44, 48};
+	u8 *body = kunit_kmalloc(test, 0x4d4, GFP_KERNEL);
+	u8 *connected = kunit_kmalloc(test, 0x4d4, GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, body);
+	KUNIT_ASSERT_NOT_NULL(test, connected);
+	KUNIT_ASSERT_EQ(test, mt7932_scan_body(connected, 0x4d4, 1, NL80211_BAND_5GHZ,
+					       channels, ARRAY_SIZE(channels)), 0x4d4);
+	memcpy(body, connected, 0x4d4);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(connected + 0x9a), 20);
+	mt7932_scan_disconnected_active(body);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(body + 0x9a), MT7932_SCAN_DWELL_UNASSOC_MS);
+	/* Past one 100 TU (102.4 ms) beacon interval. */
+	KUNIT_EXPECT_GT(test, get_unaligned_le16(body + 0x9a) * 1000U, 100U * 1024);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(body + 0x33c), 20);
+	KUNIT_EXPECT_GE(test, get_unaligned_le16(body + 0x4ca),
+			get_unaligned_le16(body + 0x9a));
+	/* Still an active scan, with its fixed discovery wait. */
+	KUNIT_EXPECT_EQ(test, body[2], 1);
+	KUNIT_EXPECT_EQ(test, mt7932_scan_discovery_timeout(body), 5000U);
+	for (i = 0; i < 0x4d4; i++)
+		if (i != 0x9a && i != 0x9b)
+			KUNIT_EXPECT_EQ(test, body[i], connected[i]);
+}
+
 /* Association-start group selection does not establish runtime D7's band-2
  * procedures. Refuse before touching the container or a partial send plan.
  */
@@ -321,6 +353,7 @@ static struct kunit_case mt7932_channel_cases[] = {
 	KUNIT_CASE(mt7932_cal_6g_test),
 	KUNIT_CASE(mt7932_scan_6g_policy_test),
 	KUNIT_CASE(mt7932_scan_6g_golden_test),
+	KUNIT_CASE(mt7932_scan_unassociated_dwell_test),
 	KUNIT_CASE(mt7932_cal_6g_runtime_rejected_test),
 	{}
 };

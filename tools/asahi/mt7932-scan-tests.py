@@ -88,9 +88,10 @@ static int mt_request(struct mt7932 *m,u8 cid,bool runtime,bool set,bool reply,c
 }
 static unsigned long wait_for_completion_timeout(int *c,unsigned long timeout){
  assert(!command_locked&&c==&active->discovery_done&&commands);
- const u8 *b=bodies[commands-1];assert(!b[2]);
- assert(timeout==5000+233U*b[0x9f]);
- assert(timeout>220U*b[0x9f]+100);
+ const u8 *b=bodies[commands-1];
+ /* Passive discovery waits for every channel's listen; active, a fixed 5 s. */
+ if(b[2]){assert(timeout==5000);assert(get_unaligned_le16(b+0x9a)*b[0x9f]<timeout);}
+ else{assert(timeout==5000+233U*b[0x9f]);assert(timeout>220U*b[0x9f]+100);}
  waits++;active->discovery_finished=true;return 1;
 }
 static void *mt_connect_find_bss(struct mt7932 *m){return commands==2?m:NULL;}
@@ -132,6 +133,8 @@ int main(void){
  request.flags=request.n_6ghz_params=0;
  assert(mt_scan_submit_next(&m)==0);
  assert(bodies[0][2]==1&&bodies[0][3]==4&&bodies[0][4]==1);
+ /* Connected: the short active dwell, for the home channel. */
+ assert(get_unaligned_le16(bodies[0]+0x9a)==20&&get_unaligned_le16(bodies[0]+0x33c)==20);
  assert(!memcmp(bodies[0]+12,"hidden",6));
  assert(bodies[0][0x4cc]==5&&bodies[0][0x4cd]==3);
  /* NO_IR remains passive, even for an explicit legacy SSID. */
@@ -143,7 +146,20 @@ int main(void){
  m.band6=(struct ieee80211_supported_band){.band=NL80211_BAND_6GHZ,.n_channels=59,.channels=channels};
  assert(mt_connect_discover(&m)==0);
  assert(commands==2&&waits==2&&!m.link_failed&&!m.discovering&&command_locked);
- puts("MT7932 RNR batching, directed scans and full-band discovery: pass");return 0;
+ /* Unassociated active channels dwell past one 100 TU beacon interval, minimum unchanged. */
+ struct ieee80211_channel five[4];struct cfg80211_scan_request request5={.ssids=&ssid,.n_ssids=1,.n_channels=4};
+ for(unsigned i=0;i<4;i++){five[i]=(struct ieee80211_channel){.band=NL80211_BAND_5GHZ,.hw_value=36+4*i};request5.channels[i]=five+i;}
+ reset(&m);m.scan_request=&request5;
+ assert(mt_scan_submit_next(&m)==0&&commands==1&&bodies[0][2]==1&&bodies[0][0x9f]==4);
+ assert(get_unaligned_le16(bodies[0]+0x9a)==110&&get_unaligned_le16(bodies[0]+0x33c)==20);
+ assert(get_unaligned_le16(bodies[0]+0x9a)*1000U>100U*1024);
+ /* ...and so does connect-time discovery's active pass, before its passive one. */
+ reset(&m);m.connect_akm=0x000fac02;
+ m.band5=(struct ieee80211_supported_band){.band=NL80211_BAND_5GHZ,.n_channels=4,.channels=five};
+ assert(mt_connect_discover(&m)==0&&commands==2&&waits==2&&!m.link_failed);
+ assert(bodies[0][2]==1&&get_unaligned_le16(bodies[0]+0x9a)==110&&get_unaligned_le16(bodies[0]+0x33c)==20);
+ assert(!bodies[1][2]);
+ puts("MT7932 RNR batching, directed scans, unassociated dwell and full-band discovery: pass");return 0;
 }
 '''
 
@@ -168,6 +184,10 @@ def main():
     bad = dict(parts)
     bad['DISCOVER'] = bad['DISCOVER'].replace('mt7932_scan_discovery_timeout(body)', '5000')
     variants['mutant-short-wait'] = bad
+    bad = dict(parts)
+    bad['HEADERS'] = bad['HEADERS'].replace('put_unaligned_le16(MT7932_SCAN_DWELL_UNASSOC_MS, body + 0x9a);', '')
+    assert bad['HEADERS'] != parts['HEADERS']
+    variants['mutant-short-dwell'] = bad
     results = {}
     for name, content in variants.items():
         source = PREFIX

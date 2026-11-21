@@ -236,6 +236,8 @@ static int mt_scan_submit_next(struct mt7932 *m)
 			mt7932_scan_passive(body);
 		else
 			mt7932_scan_disconnected_passive(body);
+	} else if (ret >= 0 && !m->scan_home_channel) {
+		mt7932_scan_disconnected_active(body);
 	}
 	if (ret >= 0)
 		ret = mt7932_scan_home(body, m->scan_home_band, m->scan_home_channel);
@@ -323,6 +325,8 @@ int mt_connect_discover(struct mt7932 *m)
 			 */
 			if (passive)
 				mt7932_scan_disconnected_passive(body);
+			else
+				mt7932_scan_disconnected_active(body);
 			ret = mt7932_scan_options(body, passive ? NULL : m->connect_ssid,
 						  passive ? 0 : m->connect_ssid_length, NULL, 0);
 		}

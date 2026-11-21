@@ -111,6 +111,25 @@ static inline void mt7932_scan_disconnected_passive(u8 body[0x4d4])
 	put_unaligned_le16(233, body + 0x4ca);
 }
 
+/*
+ * An AP that answers no probe request is heard only by its beacons, one per
+ * beacon interval: 100 TU (102.4 ms) on nearly every network. A 20 ms dwell on
+ * an active channel hears such an AP in about one scan in five, so the first
+ * scan after a boot or a wake can miss the network user space waits for, and so
+ * can the next ones. Unassociated, no home channel waits for the radio: dwell
+ * past one beacon interval, keeping the 20 ms minimum. Connected scans keep the
+ * short dwell, for the home channel's sake.
+ *
+ * One beacon interval, 102.4 ms, plus margin for the beacon's own airtime and
+ * its timing jitter, to the next 10 ms.
+ */
+#define MT7932_SCAN_DWELL_UNASSOC_MS	110
+
+static inline void mt7932_scan_disconnected_active(u8 body[0x4d4])
+{
+	put_unaligned_le16(MT7932_SCAN_DWELL_UNASSOC_MS, body + 0x9a);
+}
+
 /* Wait for the whole disconnected passive batch, not just one channel.
  * Retain the existing five-second command/completion margin and active wait.
  */
