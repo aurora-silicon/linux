@@ -366,6 +366,7 @@ static const struct aic_info aic3_t8132_info __initconst = {
 	.irq_cfg = AIC3_IRQ_CFG,
 	.fast_ipi = true,
 	.local_fast_ipi = true,
+	.vm_timer_fiq_readonly = true,
 	.fw_suspend = true,
 };
 
