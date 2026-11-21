@@ -298,3 +298,23 @@
 &avd {
 	status = "okay";
 };
+
+/*
+ * ProRes: the T8132 PMGR policy has no SCODEC entries, so the domains are
+ * stated here, or it would leave them disabled.
+ */
+&ps_scodec {
+	status = "okay";
+};
+
+&ps_scodec_streaming {
+	status = "okay";
+};
+
+&dart_apr0 {
+	status = "okay";
+};
+
+&apr {
+	status = "okay";
+};

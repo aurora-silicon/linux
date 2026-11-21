@@ -438,15 +438,21 @@
 		status = "disabled";
 	};
 
+	/*
+	 * ADT /arm-io/apr. Its windows are where AppleProResHW applies its core,
+	 * AXI-to-fabric and SCODEC system rows; its reset is ARST(0x32), SCODEC.
+	 */
 	apr: video-codec@281000000 {
 		compatible = "apple,t8132-prores", "apple,prores";
 		reg = <0x2 0x81000000 0x0 0x4000>,
 		      <0x2 0x80000000 0x0 0x1000000>,
 		      <0x2 0x810c0000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1147 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 1184 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_scodec>;
+		power-domains = <&ps_scodec_streaming>;
+		resets = <&ps_scodec>;
 		iommus = <&dart_apr0 1>;
 		status = "disabled";
 	};
