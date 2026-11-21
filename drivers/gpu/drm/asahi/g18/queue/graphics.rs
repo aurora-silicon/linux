@@ -730,6 +730,8 @@ pub(crate) struct G18ParameterBuffer {
     metrics: MappedObject,
     scene_scratch: MappedObject,
     blocks: KVec<MappedObject>,
+    /// The user charges of the grown blocks ([`Self::grow`]).
+    charges: KVec<crate::memacct::Charge>,
     discard: MappedObject,
     addresses: G18PbAddresses,
     policy: G18PbPolicy,
@@ -817,7 +819,8 @@ impl G18ParameterBuffer {
         };
         let mut owner = Self {
             window_aliases: KVec::new(), low_aliases, state, graph, page_list, metrics,
-            scene_scratch, blocks, discard, addresses: a, policy, inputs, row: None,
+            scene_scratch, blocks, charges: KVec::new(), discard, addresses: a, policy,
+            inputs, row: None,
         };
         owner.encode()?;
         dev_info!(dev.as_ref(),
