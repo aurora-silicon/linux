@@ -4644,9 +4644,13 @@ static int apple_cio_probe(struct platform_device *pdev)
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
 	acio->hw = of_device_get_match_data(dev);
-	/* Only J613 has qualified the T8122 router policy and resources. */
+	/*
+	 * The T8122 router policy starts the router through its MxWrap CPU
+	 * block. A device tree (or an older loader's handoff tree) that does
+	 * not describe that block keeps the T8103 policy.
+	 */
 	if (acio->hw == &apple_cio_t8122_hw &&
-	    !of_machine_is_compatible("apple,j613"))
+	    of_property_match_string(acio->np, "reg-names", "cpu") < 0)
 		acio->hw = &apple_cio_t8103_hw;
 	if (!acio->hw)
 		return -EINVAL;
@@ -4857,6 +4861,8 @@ static int apple_cio_probe(struct platform_device *pdev)
 		.fwnode = pdev->dev.fwnode,
 		.set = apple_cio_tbt_switch_set,
 		.drvdata = acio,
+		/* A strict power cycle is ordered by the PD driver (sleep and shutdown). */
+		.pd_ordered_stop = acio->hw->strict_power_cycle,
 	};
 	/* A consumer cannot start a host before its failure listener is ready. */
 	scoped_guard(mutex, &acio->lock) {
