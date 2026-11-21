@@ -1899,7 +1899,6 @@ impl Gpu {
             let Some(image) = measured.find(build.images) else {
                 continue;
             };
-            dev_info!(dev.as_ref(), "GPU firmware build: {}\n", image.name);
             let admits = build.config.is_none_or(|config| {
                 config
                     .core_layout
@@ -1907,12 +1906,13 @@ impl Gpu {
                     .is_none_or(|measured| measured == cores)
             });
             if admits {
-                identified = Some(build);
+                identified = Some((build, image));
                 break;
             }
-            identified.get_or_insert(build);
+            identified.get_or_insert((build, image));
         }
-        if let Some(build) = identified {
+        if let Some((build, image)) = identified {
+            dev_info!(dev.as_ref(), "GPU firmware build: {}\n", image.name);
             dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
             return Ok((build.variant, build.config));
         }
@@ -1921,8 +1921,16 @@ impl Gpu {
             "unsupported GPU firmware build: {}\n",
             measured.identity(builds.iter().flat_map(|build| build.images))
         );
-        for image in builds.iter().flat_map(|build| build.images) {
-            dev_err!(dev.as_ref(), "supported: {}\n", image.name);
+        // Builds that differ only in their core layout share an image: list each image once.
+        // Compare by name and digest; the address of a `const`-promoted entry is not unique.
+        let images = || builds.iter().flat_map(|build| build.images);
+        for (i, image) in images().enumerate() {
+            if !images()
+                .take(i)
+                .any(|seen| (seen.name, seen.text_sha256) == (image.name, image.text_sha256))
+            {
+                dev_err!(dev.as_ref(), "supported: {}\n", image.name);
+            }
         }
         dev_err!(
             dev.as_ref(),
@@ -1936,16 +1944,26 @@ impl Gpu {
     /// region, for [`Self::firmware_variant`] to identify among the builds. The version
     /// property is only a selection hint.
     fn measure_text(dev: &AsahiDrmDevice) -> Result<crate::fwid::Measured> {
-        let node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
-        let text = node.reserved_mem_region_to_resource_byname(c_str!("fw-text"))?;
-        let data = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
-        let start = text.start();
-        let end = start.checked_add(text.size()).ok_or(EINVAL)?;
-        crate::fwid::measure(start..end, data.size()).inspect_err(|e| {
+        let measure = || {
+            let node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
+            let text = node.reserved_mem_region_to_resource_byname(c_str!("fw-text"))?;
+            let data = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
+            let start = text.start();
+            let end = start.checked_add(text.size()).ok_or(EINVAL)?;
+            crate::fwid::measure(start..end, data.size())
+        };
+        measure().inspect_err(|e| {
             if *e == EAGAIN {
                 dev_err!(
                     dev.as_ref(),
                     "GPU firmware TEXT changed while it was measured\n"
+                );
+            } else {
+                // A missing or bad fw-text/fw-data region: a DT or boot loader mismatch.
+                dev_err!(
+                    dev.as_ref(),
+                    "GPU firmware image not measured (fw-text/fw-data): {:?}\n",
+                    e
                 );
             }
         })
