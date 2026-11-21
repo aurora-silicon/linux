@@ -500,10 +500,23 @@ static int apple_nhi_cio_prepare(struct apple_nhi *anhi)
 			return -EBUSY;
 		WRITE_ONCE(acio->native_sleep, true);
 	}
+	/*
+	 * A partner with no PCIe tunnel (a host-to-host cable, a USB4 device that tunnels
+	 * only USB or DisplayPort) leaves the router nothing to stop behind it. T6050's
+	 * sleep has only run with a dock's tunnel: it still refuses without one, before
+	 * the connection manager releases anything (a host peer's link stays up).
+	 * pcie_pm_prepared keeps the tunnel from changing until complete.
+	 */
+	scoped_guard(mutex, &acio->pcie_tunnel_lock)
+		pcie = apple_cio_find_pcie_tunnel(acio);
+	if (!pcie && anhi->cio_t6050) {
+		ret = -ENODEV;
+		goto release_cable;
+	}
 	/* No new rings or topology may appear after the connection manager closes. */
 	ret = tb_cio_sleep_prepare(anhi->tb);
 	if (ret)
-		goto release_cable;
+		goto release_cm;
 	/* The released displays' routes go down on this queue: wait for them. */
 	if (acio->dp_wq)
 		flush_workqueue(acio->dp_wq);
@@ -520,23 +533,10 @@ static int apple_nhi_cio_prepare(struct apple_nhi *anhi)
 	ret = apple_dart_cio_prepare(anhi->cio_dart);
 	if (ret)
 		goto release_phy;
-	scoped_guard(mutex, &acio->pcie_tunnel_lock)
-		pcie = apple_cio_find_pcie_tunnel(acio);
-	/*
-	 * A partner with no PCIe tunnel (a host-to-host cable, a USB4 device that tunnels
-	 * only USB or DisplayPort) leaves the router nothing to stop behind it. T6050's
-	 * sleep has only run with a dock's tunnel: it still refuses without one.
-	 */
-	if (!pcie && anhi->cio_t6050) {
-		ret = -ENODEV;
-		goto release_dart;
-	}
 	if (pcie) {
 		ret = apple_pcie_tunnel_cio_prepare(&pcie->dev);
-		if (ret) {
-			put_device(&pcie->dev);
+		if (ret)
 			goto release_dart;
-		}
 	} else {
 		dev_info(anhi->dev, "CIO sleep with no PCIe tunnel behind the router\n");
 	}
@@ -567,7 +567,10 @@ release_phy:
 			ret, release);
 	}
 release_cm:
-	tb_cio_sleep_complete(anhi->tb);
+	/* No complete follows a refused prepare: this one finds released peers again. */
+	tb_cio_sleep_refused(anhi->tb);
+	if (pcie)
+		put_device(&pcie->dev);
 release_cable:
 	scoped_guard(mutex, &acio->lock)
 		WRITE_ONCE(acio->native_sleep, false);
