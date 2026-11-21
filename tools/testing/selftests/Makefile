@@ -26,6 +26,7 @@ TARGETS += drivers/gpu/apple-afkv2
 TARGETS += drivers/gpu/apple-dcp
 TARGETS += drivers/gpu/asahi-m4
 TARGETS += drivers/gpu/asahi-residency
+TARGETS += drivers/gpu/asahi-sigkill
 TARGETS += drivers/gpu/asahi-userptr
 TARGETS += drivers/ntsync
 TARGETS += drivers/s390x/uvdevice
