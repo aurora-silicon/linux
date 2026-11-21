@@ -171,6 +171,9 @@ struct ane_fw_backend {
 	struct delayed_work isp_service;
 	u64 isp_served, isp_up_ns;
 	u32 isp_bits;
+	/* Doorbells per bit, not rate limited; the first foreign report logged. */
+	u32 isp_rings[ANE_FW_CHANNELS];
+	bool isp_report_logged;
 	/*
 	 * The ISP surfaces mapped for the ANE firmware (ane_fw_isp_map()), each
 	 * holding a reference on its pages until the firmware frees it or the
@@ -2545,8 +2548,25 @@ static void ane_fw_isp_replay(struct ane_fw_backend *b)
 	dev_warn(&b->pdev->dev, "H17 ANE: firmware booted again under a live ISP link: MLVNR off until the camera restarts\n");
 }
 
+/* One IO_T2H report: its key and state when it is an event, and every byte. */
+static void ane_fw_isp_report_log(struct ane_fw_backend *b, const char *what,
+				  const u8 *report, size_t size)
+{
+	struct ane_h16_event e;
+
+	if (!ane_h16_event_decode(report, size, ANE_FW_IO_T2H, &e))
+		dev_info(&b->pdev->dev, "H17 ANE: ISP link: %s: event, uuid %#llx program %u process %u procedure %u state %u destination %u\n",
+			 what, e.key.uuid, e.key.program, e.key.process, e.key.procedure,
+			 e.state, e.destination);
+	else
+		dev_info(&b->pdev->dev, "H17 ANE: ISP link: %s: %zu bytes, not an event report\n",
+			 what, size);
+	print_hex_dump(KERN_INFO, "ANE T2H report: ", DUMP_PREFIX_OFFSET, 16, 4, report,
+		       min_t(size_t, size, ANE_H16_REPORT_MAX), false);
+}
+
 /*
- * The firmware's requests (SHAREDMALLOC, the terminal) while the ISP uses
+ * The firmware's requests (IO_T2H reports, SHAREDMALLOC, the terminal) while the ISP uses
  * the engine: every 2 ms, under the session lock, never blocking on it.
  */
 static void ane_fw_isp_service(struct work_struct *work)
@@ -2567,13 +2587,26 @@ static void ane_fw_isp_service(struct work_struct *work)
 	}
 	ret = ane_h16_session_serve(&b->session, &pending, NSEC_PER_MSEC);
 	if (pending) {
+		u32 reports = BIT(b->transport.channels[ANE_FW_IO_T2H].bit);
+		unsigned long bits = pending;
+		unsigned int bit;
+
+		for_each_set_bit(bit, &bits, ANE_FW_CHANNELS)
+			b->isp_rings[bit]++;
+		/* One report per frame: logged when something else rang. */
+		if ((pending & ~reports) || (pending & ~b->isp_bits))
+			dev_info_ratelimited(&b->pdev->dev, "H17 ANE: ISP link: +%llu us firmware rang %#x (seen %#x), served %d\n",
+					     div_u64(ktime_get_ns() - b->isp_up_ns, NSEC_PER_USEC),
+					     pending, b->isp_bits | pending, ret);
 		b->isp_bits |= pending;
-		dev_info_ratelimited(&b->pdev->dev, "H17 ANE: ISP link: +%llu us firmware rang %#x (seen %#x), served %d\n",
-				     div_u64(ktime_get_ns() - b->isp_up_ns, NSEC_PER_USEC), pending,
-				     b->isp_bits, ret);
 	}
 	if (ret > 0)
 		b->isp_served += ret;
+	if (b->session.serve_foreign && !b->isp_report_logged) {
+		ane_fw_isp_report_log(b, "first IO_T2H report of no host request",
+				      b->session.serve_first, b->session.serve_first_size);
+		b->isp_report_logged = true;
+	}
 	mutex_unlock(b->session.lock);
 	if (ret == -EAGAIN)
 		goto again;
@@ -2697,6 +2730,10 @@ int ane_isp_endpoint_enable(struct ane_isp_link *l, const char *afpp, struct ane
 		 ep->ane_doorbell, ep->ane_doorbell_sel);
 	b->isp_served = 0;
 	b->isp_bits = 0;
+	memset(b->isp_rings, 0, sizeof(b->isp_rings));
+	b->isp_report_logged = false;
+	b->session.serve_reports = 0;
+	b->session.serve_foreign = 0;
 	b->isp_up_ns = ktime_get_ns();
 	dev_info(dev, "H17 ANE: ISP link: surface maps %s (window %#llx+%#x, aperture end %#llx)\n",
 		 ep->surface_map ? "on" : "off", (u64)ANE_FW_ISP_MAP_DVA, ANE_FW_ISP_MAP_SPAN,
@@ -2752,6 +2789,17 @@ void ane_isp_endpoint_disable(struct ane_isp_link *l)
 				 b->transport.shared_early, b->transport.shared_count,
 				 b->transport.head[ANE_FW_IO_T2H], get_unaligned_le64(t2h),
 				 get_unaligned_le64(t2h + 8));
+			/* Each IO_T2H slot the firmware posted and the host has not taken. */
+			for (unsigned int i = 0; i < b->transport.channels[ANE_FW_IO_T2H].slots; i++) {
+				const struct ane_fw_channel *r = &b->transport.channels[ANE_FW_IO_T2H];
+				const u8 *sl = (const u8 *)b->transport.ipc.cpu + r->offset + i * ANE_FW_SLOT_SIZE;
+				u64 w0 = get_unaligned_le64(sl), w1 = get_unaligned_le64(sl + 8);
+
+				if (!w0 || (w0 & 1))
+					continue;
+				dev_info(&b->pdev->dev, "H17 ANE: ISP link: IO_T2H[%u] untaken: %#llx %#llx\n",
+					 i, w0, w1);
+			}
 			/* Every slot with anything in it, all eight words. */
 			for (unsigned int i = 0; i < c->slots; i++) {
 				const u8 *sm = (const u8 *)b->transport.ipc.cpu + c->offset + i * ANE_FW_SLOT_SIZE;
@@ -2782,6 +2830,10 @@ void ane_isp_endpoint_disable(struct ane_isp_link *l)
 		dev_info(&b->pdev->dev, "H17 ANE: ISP link down: %llu firmware requests served, doorbell bits seen %#x; ISP surfaces: %u mapped, %u refused, %u freed by the firmware\n",
 			 b->isp_served, b->isp_bits, b->isp_maps_done, b->isp_maps_failed,
 			 b->isp_maps_freed);
+		dev_info(&b->pdev->dev, "H17 ANE: ISP link down: IO_T2H reports %llu taken (%llu of no host request); doorbells by bit %u %u %u %u %u %u %u %u\n",
+			 b->session.serve_reports, b->session.serve_foreign, b->isp_rings[0],
+			 b->isp_rings[1], b->isp_rings[2], b->isp_rings[3], b->isp_rings[4],
+			 b->isp_rings[5], b->isp_rings[6], b->isp_rings[7]);
 		return;
 	}
 	/* The DARTs may be off: the stale ring mapping goes at the next enable. */

@@ -385,6 +385,17 @@ struct ane_h16_session {
 	DECLARE_BITMAP(records, ANE_H16_RECORDS);
 	/* Firmware log lines printed after the last failed EXECUTE. */
 	unsigned int fwlog_lines;
+	/*
+	 * IO_T2H reports taken by ane_h16_session_serve() (the ISP link drives
+	 * the engine and no host command waits): every report, those of no
+	 * host request (the ISP's own programs, destination 1, or a UUID no
+	 * caller waits for), and the first of those as posted, for the log.
+	 */
+	u8 serve_report[ANE_H16_REPORT_MAX];
+	u64 serve_reports;
+	u64 serve_foreign;
+	u8 serve_first[ANE_H16_REPORT_MAX];
+	size_t serve_first_size;
 	bool quarantined;
 	/*
 	 * Dynamic power gating (0x002d) held off across back-to-back requests.

@@ -2037,18 +2037,62 @@ int ane_h16_session_gate_pin(struct ane_h16_session *s, bool pin)
 EXPORT_SYMBOL_GPL(ane_h16_session_gate_pin);
 
 /*
+ * Take every IO_T2H report posted so far. The ISP's programs (MLVNR) run on
+ * the engine like a host EXECUTE and the firmware reports each of them here,
+ * one per camera frame, on the ring of the host's own reports; it waits for
+ * a free slot before it reports the next, and the ISP's next ANE command
+ * waits behind it (boot 1a050318: the ring filled 6 s into an MLVNR stream
+ * and the ISP firmware asserted on its 200 ms command timeout). A report a
+ * host request waits for goes to it, as in h16_wait_report(), which drops
+ * the lock while it pauses; the others are acknowledged and counted. A
+ * report too large for any message of this firmware stops the transport:
+ * it cannot be acknowledged unread. Returns the reports taken.
+ */
+static int h16_serve_reports(struct ane_h16_session *s)
+{
+	struct ane_fw_transport *t = s->transport;
+	int ret, n;
+
+	for (n = 0; n < 64; n++) {
+		size_t size;
+
+		ret = ane_fw_transport_consume(t, s->serve_report, sizeof(s->serve_report),
+					       &size);
+		if (ret == -EAGAIN)
+			break;
+		if (ret == -ENOSPC)
+			return ane_fw_transport_fail(t, -EPROTO);
+		if (ret)
+			return ret;
+		s->serve_reports++;
+		ret = h16_report(s, s->serve_report, size);
+		if (ret >= 0)
+			continue;
+		/* Kept for the log, also when it is what stopped the session. */
+		if (!s->serve_foreign++) {
+			memcpy(s->serve_first, s->serve_report, size);
+			s->serve_first_size = size;
+		}
+		if (ret != -ENOENT && ret != -ENOMSG)
+			return ret;
+	}
+	return n;
+}
+
+/*
  * Serve what the firmware posted while no host command waits (the ISP link
- * drives the engine): the doorbell bits it rang, then SHAREDMALLOC and the
- * terminal until quiet, for at most limit_ns per round. After a request is
- * served the next is waited for up to 100 us, so a burst is served in one
- * call: the firmware posts its next request only after the answer, and macOS
- * serves the 30 ISP surface maps of an MLVNR start within about 1 ms (the
- * ISP firmware gives an ANE command 200 ms). Nothing posted: one pass, no
- * wait. Returns the requests served. Caller holds the session lock.
+ * drives the engine): the doorbell bits it rang, the IO_T2H reports, then
+ * SHAREDMALLOC and the terminal until quiet, for at most limit_ns per round.
+ * After a request is served the next is waited for up to 100 us, so a burst
+ * is served in one call: the firmware posts its next request only after the
+ * answer, and macOS serves the 30 ISP surface maps of an MLVNR start within
+ * about 1 ms (the ISP firmware gives an ANE command 200 ms). Nothing posted:
+ * one pass, no wait. Returns the requests and reports served. Caller holds
+ * the session lock.
  */
 int ane_h16_session_serve(struct ane_h16_session *s, u32 *pending, u64 limit_ns)
 {
-	int ret, total;
+	int ret, total = 0, round;
 
 	if (!s || !pending)
 		return -EINVAL;
@@ -2060,9 +2104,18 @@ int ane_h16_session_serve(struct ane_h16_session *s, u32 *pending, u64 limit_ns)
 	ret = ane_fw_transport_irq(s->transport, pending);
 	if (ret)
 		return h16_fail(s, ret);
-	ret = ane_fw_transport_settle(s->transport, 0, limit_ns);
-	for (total = ret; ret > 0 && total < 64; total += ret)
-		ret = ane_fw_transport_settle(s->transport, 100 * NSEC_PER_USEC, limit_ns);
+	do {
+		ret = h16_serve_reports(s);
+		if (ret < 0)
+			break;
+		round = ret;
+		ret = ane_fw_transport_settle(s->transport, total ? 100 * NSEC_PER_USEC : 0,
+					      limit_ns);
+		if (ret < 0)
+			break;
+		round += ret;
+		total += round;
+	} while (round > 0 && total < 64);
 	return ret < 0 ? h16_fail(s, ret) : total;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_serve);
