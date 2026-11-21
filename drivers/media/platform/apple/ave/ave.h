@@ -182,6 +182,11 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_T8132_26B123 0x99fc929a
 /* The M3 (T8122) build preloaded by the macOS 27.2 (26B123) stub. */
 #define AVE_FW_TEXT_CRC_T8122_26B123 0x918d70d3
+/*
+ * The M5 build of macOS 27.2 (26B123; 27.2.1 26B131 ships it unchanged),
+ * AppleAVE2FW 9013.55.1: TEXT 0x154000, DATA 0x12c000, as 26A428's.
+ */
+#define AVE_FW_TEXT_CRC_T8142_26B123 0x24eb4625
 
 struct ave_ctx;
 
@@ -419,6 +424,7 @@ struct ave_slot {
 	u32 status;
 	bool busy; /* Process sent, reply pending */
 	bool done; /* reply in, output not delivered yet */
+	bool bframe; /* the delivered picture is a B picture (its slice type) */
 };
 
 struct ave_frame_result {
@@ -446,6 +452,7 @@ struct ave_frame_result {
 struct ave_session {
 	struct ave_session *failed_next;
 	struct ave_params p;
+	u8 hevc_extra_bits; /* PPS num_extra_slice_header_bits, for the B flag */
 	struct ave_buf hdr;
 	struct ave_buf client_mem;
 	/* 6070: per-session firmware-generated VPS/SPS/PPS output. */
@@ -617,6 +624,7 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 		      unsigned int slot, dma_addr_t input, u32 bitrate,
 		      bool force_key, bool last);
 int ave_init_codec_state(struct ave_session *sess);
+bool ave_au_bframe(const u8 *p, size_t len, bool hevc, bool key, u8 *extra_bits);
 
 /* ave-cmd.c */
 int ave_cmd_config(struct ave_dev *ave);
