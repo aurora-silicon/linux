@@ -38,8 +38,23 @@ struct apple_pmp_cooling {
 	long anchor_mc, previous_mc, projected_mc;
 	unsigned int good_reads, prediction, level;
 	bool hard, anchor_valid;
+	/* Added to every valid reading: places FULL_COOLING at an input's own limit
+	 * (APPLE_PMP_FULL_COOLING_MC - limit), 0 for the package policy.
+	 */
+	long shift_mc;
 	int reason; /* 0 startup, 1 sensor, 2 measured heat, 3 prediction, 4 governor, 5 recovery */
 };
+
+/* Re-reference the envelope to an input with its own limit; drops the slope anchor. */
+static inline void apple_pmp_cooling_set_limit(struct apple_pmp_cooling *s, long limit_mc)
+{
+	long shift = limit_mc ? APPLE_PMP_FULL_COOLING_MC - limit_mc : 0;
+
+	if (shift != s->shift_mc) {
+		s->shift_mc = shift;
+		s->anchor_valid = false;
+	}
+}
 
 static inline void apple_pmp_cooling_init(struct apple_pmp_cooling *s)
 {
@@ -91,6 +106,8 @@ static inline void apple_pmp_cooling_sample(struct apple_pmp_cooling *s,
 	unsigned int target;
 	bool trend_due = false;
 
+	if (!error)
+		mc += s->shift_mc;
 	s->last_ns = now;
 	if (error || mc >= APPLE_PMP_FULL_COOLING_MC) {
 		s->level = 8;

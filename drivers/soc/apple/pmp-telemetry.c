@@ -12,6 +12,9 @@
 #include <linux/rculist.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/string_helpers.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/pmp-telemetry.h>
@@ -40,6 +43,12 @@ struct apple_pmp_telemetry {
 	size_t size;
 	/* Where the running firmware keeps each temperature record. */
 	struct apple_pmp_temp_map temps;
+	/* The GPU's record, when the firmware's sensor table names one: its
+	 * offset (0 until located), name and limit, both from that table.
+	 */
+	u32 gpu_offset;
+	long gpu_limit_mc;
+	char gpu_name[PMP_TEMP_NAME_SIZE + 1];
 	struct delayed_work locate;
 	unsigned int locate_tries;
 };
@@ -67,6 +76,86 @@ static bool apple_pmp_temps_at(struct apple_pmp_telemetry *sensors,
 	return true;
 }
 
+/*
+ * The GPU's entry in the firmware's sensor table (apple,tunable-temp-sensor): its index in the
+ * live record array, its name in the firmware's (lower) case and the lower of its two limits.
+ * -ENOENT when the machine describes no GPU record: then there is no GPU input.
+ */
+static int apple_pmp_gpu_record_desc(const struct device_node *np, unsigned int *index,
+				     char *name, long *limit_mc)
+{
+	const size_t suffix = strlen(PMP_TEMP_GPU_SUFFIX);
+	const u8 *table;
+	const char *entry;
+	unsigned int i, n;
+	u32 a, b, limit;
+	size_t len;
+	int bytes;
+
+	table = of_get_property(np, "apple,tunable-temp-sensor", &bytes);
+	if (!table || bytes < PMP_TEMP_DT_RECORD_SIZE || bytes % PMP_TEMP_DT_RECORD_SIZE)
+		return -ENOENT;
+	n = bytes / PMP_TEMP_DT_RECORD_SIZE;
+	for (i = 0; i < n; i++) {
+		entry = (const char *)table + i * PMP_TEMP_DT_RECORD_SIZE;
+		len = strnlen(entry + PMP_TEMP_DT_NAME_OFFSET, PMP_TEMP_NAME_SIZE);
+		if (len <= suffix || len == PMP_TEMP_NAME_SIZE ||
+		    strncasecmp(entry + PMP_TEMP_DT_NAME_OFFSET + len - suffix,
+				PMP_TEMP_GPU_SUFFIX, suffix))
+			continue;
+		a = get_unaligned_le32(entry + PMP_TEMP_DT_LIMIT_OFFSET);
+		b = get_unaligned_le32(entry + PMP_TEMP_DT_LIMIT_OFFSET + 4);
+		limit = a && b ? min(a, b) : max(a, b);
+		/* The record's own sample range: the decoder refuses above 150 C. */
+		if (!limit || limit * 64 > 9600)
+			return -ERANGE;
+		string_lower(name, entry + PMP_TEMP_DT_NAME_OFFSET);
+		name[len] = 0;
+		*index = i;
+		*limit_mc = limit * 1000L;
+		return 0;
+	}
+	return -ENOENT;
+}
+
+/* In step with the located die records (as apple_pmp_temp_locate disambiguates), else unique. */
+static void apple_pmp_gpu_record_locate(struct apple_pmp_telemetry *sensors,
+					const struct apple_pmp_temp_map *map, size_t start)
+{
+	u8 record[PMP_TEMP_RECORD_SIZE];
+	char name[PMP_TEMP_NAME_SIZE + 1];
+	unsigned int index, count = 0, matches = 0;
+	size_t off, found = 0;
+	long limit;
+
+	if (apple_pmp_gpu_record_desc(sensors->dev->of_node, &index, name, &limit))
+		return;
+	off = map->offset[0] + (size_t)index * PMP_TEMP_RECORD_STRIDE;
+	if (off <= sensors->size - PMP_TEMP_RECORD_SIZE) {
+		memcpy_fromio(record, sensors->sram + off, sizeof(record));
+		if (apple_pmp_temp_record_plausible(record, name)) {
+			found = off;
+			count = 1;
+		}
+	}
+	for (off = start; !count && off <= sensors->size - PMP_TEMP_RECORD_SIZE; off += 4) {
+		if (readl_relaxed(sensors->sram + off) != get_unaligned_le32(name))
+			continue;
+		memcpy_fromio(record, sensors->sram + off, sizeof(record));
+		if (apple_pmp_temp_record_plausible(record, name)) {
+			found = off;
+			matches++;
+		}
+	}
+	if (!count && matches != 1)
+		return;
+	memcpy(sensors->gpu_name, name, sizeof(name));
+	WRITE_ONCE(sensors->gpu_limit_mc, limit);
+	WRITE_ONCE(sensors->gpu_offset, found);
+	dev_info(sensors->dev, "GPU temperature record %s at %#zx, limit %ld mC (firmware sensor table)\n",
+		 name, found, limit);
+}
+
 /* The firmware fills its records some time after it starts: look until they are there. */
 static void apple_pmp_temps_locate(struct work_struct *work)
 {
@@ -81,8 +170,10 @@ static void apple_pmp_temps_locate(struct work_struct *work)
 	if (!READ_ONCE(sensors->online))
 		return;
 	apple_pmp_temp_map_default(&map);
-	if (apple_pmp_temps_at(sensors, &map))
+	if (apple_pmp_temps_at(sensors, &map)) {
+		apple_pmp_gpu_record_locate(sensors, &map, 0);
 		return;
+	}
 	data = readl_relaxed(sensors->sram + PMP_TEMP_DATA_START_HDR);
 	if (!(data & 3) && data < sensors->size)
 		start = data;
@@ -94,6 +185,7 @@ static void apple_pmp_temps_locate(struct work_struct *work)
 			 "temperature records at %#x %#x %#x %#x %#x %#x (data from %#zx)\n",
 			 map.offset[0], map.offset[1], map.offset[2], map.offset[3],
 			 map.offset[4], map.offset[5], start);
+		apple_pmp_gpu_record_locate(sensors, &map, start);
 		return;
 	}
 	if (++sensors->locate_tries < PMP_TEMP_LOCATE_TRIES) {
@@ -135,6 +227,59 @@ int apple_pmp_telemetry_get_hotspot(const struct device_node *np, long *value)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_telemetry_get_hotspot);
+
+static int apple_pmp_gpu_record_read(struct apple_pmp_telemetry *sensors, long *value)
+{
+	u8 first[PMP_TEMP_RECORD_SIZE], second[PMP_TEMP_RECORD_SIZE];
+	u32 off = READ_ONCE(sensors->gpu_offset);
+	unsigned int attempt;
+
+	if (!off)
+		return -ENOENT;
+	for (attempt = 0; attempt < PMP_TEMP_READ_ATTEMPTS; attempt++) {
+		memcpy_fromio(first, sensors->sram + off, sizeof(first));
+		memcpy_fromio(second, sensors->sram + off, sizeof(second));
+		if (!memcmp(first, second, sizeof(first)))
+			return apple_pmp_temp_decode(first, sensors->gpu_name, value);
+	}
+	return -EAGAIN;
+}
+
+/**
+ * apple_pmp_telemetry_get_gpu() - the GPU's own temperature record and limit
+ * @np: the PMP node (the GPU's apple,pmp phandle)
+ * @value: the temperature in mC
+ * @limit_mc: the GPU's limit from the firmware's sensor table, in mC
+ *
+ * Return: 0, -ENODATA while the firmware publishes no sample (the GPU is
+ * powered off), -ENOENT when the machine describes no GPU record or it is not
+ * located yet, -EPROBE_DEFER before registration, -ENODEV after stop.
+ */
+int apple_pmp_telemetry_get_gpu(const struct device_node *np, long *value, long *limit_mc)
+{
+	struct apple_pmp_telemetry *sensors;
+	int ret = -EPROBE_DEFER;
+
+	if (!np || !value || !limit_mc)
+		return -EINVAL;
+	rcu_read_lock();
+	list_for_each_entry_rcu(sensors, &apple_pmp_telemetry_list, list) {
+		if (sensors->dev->of_node != np)
+			continue;
+		if (!apple_pmp_telemetry_online(sensors)) {
+			ret = -ENODEV;
+			break;
+		}
+		*limit_mc = READ_ONCE(sensors->gpu_limit_mc);
+		ret = apple_pmp_gpu_record_read(sensors, value);
+		if (!apple_pmp_telemetry_online(sensors))
+			ret = -ENODEV;
+		break;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_telemetry_get_gpu);
 
 struct apple_pmp_gpu {
 	struct device_node *node;
@@ -265,6 +410,15 @@ static umode_t apple_pmp_hwmon_visible(const void *data,
 				       enum hwmon_sensor_types type, u32 attr,
 				       int channel)
 {
+	const struct apple_pmp_telemetry *sensors = data;
+	unsigned int index;
+	char name[PMP_TEMP_NAME_SIZE + 1];
+	long limit;
+
+	if (channel == PMP_TEMP_CHANNELS)
+		return type == hwmon_temp && (attr == hwmon_temp_input || attr == hwmon_temp_label) &&
+		       !apple_pmp_gpu_record_desc(sensors->dev->of_node, &index, name, &limit) ?
+			       0444 : 0;
 	return type == hwmon_temp && channel >= 0 &&
 			       channel < PMP_TEMP_CHANNELS &&
 			       (attr == hwmon_temp_input ||
@@ -281,6 +435,11 @@ static int apple_pmp_hwmon_read(struct device *dev,
 
 	if (type != hwmon_temp || attr != hwmon_temp_input)
 		return -EOPNOTSUPP;
+	if (channel == PMP_TEMP_CHANNELS) {
+		int ret = apple_pmp_gpu_record_read(sensors, value);
+
+		return apple_pmp_telemetry_online(sensors) ? ret : -ENODEV;
+	}
 	if (channel < 0 || channel >= PMP_TEMP_CHANNELS)
 		return -EINVAL;
 	/* Preserve the original ABI: aggregate first, then five named records.
@@ -295,6 +454,10 @@ static int apple_pmp_hwmon_label(struct device *dev,
 				 enum hwmon_sensor_types type, u32 attr,
 				 int channel, const char **label)
 {
+	if (type == hwmon_temp && attr == hwmon_temp_label && channel == PMP_TEMP_CHANNELS) {
+		*label = "PMP GPU";
+		return 0;
+	}
 	if (type != hwmon_temp || attr != hwmon_temp_label || channel < 0 ||
 	    channel >= PMP_TEMP_CHANNELS)
 		return -EOPNOTSUPP;
@@ -314,7 +477,7 @@ static const struct hwmon_channel_info *const apple_pmp_hwmon_info[] = {
 		temp, HWMON_T_INPUT | HWMON_T_LABEL,
 		HWMON_T_INPUT | HWMON_T_LABEL, HWMON_T_INPUT | HWMON_T_LABEL,
 		HWMON_T_INPUT | HWMON_T_LABEL, HWMON_T_INPUT | HWMON_T_LABEL,
-		HWMON_T_INPUT | HWMON_T_LABEL),
+		HWMON_T_INPUT | HWMON_T_LABEL, HWMON_T_INPUT | HWMON_T_LABEL),
 	NULL,
 };
 

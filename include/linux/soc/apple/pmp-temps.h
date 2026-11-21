@@ -31,6 +31,20 @@ static const struct apple_pmp_temp_record {
 	{ "tp002m", "Tp002m", 0x68958 },
 };
 
+/*
+ * apple,tunable-temp-sensor on the PMP node is the firmware's own sensor table, which the boot
+ * loader copies from the PMP nub's temp-sensor property: one 56-byte entry per record the
+ * firmware publishes, in the order of its live record array (PMP_TEMP_RECORD_STRIDE apart), with
+ * two limit words in whole degrees C at +0x20 and the record's name at +0x28.
+ */
+#define PMP_TEMP_DT_RECORD_SIZE		0x38
+#define PMP_TEMP_DT_LIMIT_OFFSET	0x20
+#define PMP_TEMP_DT_NAME_OFFSET		0x28
+#define PMP_TEMP_NAME_SIZE		16
+
+/* The firmware names the GPU's record after the GPU block, AGX. */
+#define PMP_TEMP_GPU_SUFFIX		"_agx"
+
 static inline int apple_pmp_temp_decode(const u8 *record, const char *name, long *value)
 {
 	s32 sample;

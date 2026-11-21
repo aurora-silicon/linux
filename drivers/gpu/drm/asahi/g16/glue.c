@@ -47,6 +47,8 @@ struct asahi_g16_cooling {
 	/* The last reading from a sensor that was valid, and when. */
 	u64 valid_ns;
 	long valid_mc;
+	/* The GPU's own record has given a sample: from then on it is the input. */
+	bool gpu_record;
 };
 
 struct asahi_g16_cooling *asahi_g16_cooling_register(struct device *dev);
@@ -146,8 +148,23 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool id
 {
 	int ret;
 
+	long limit = 0;
+
 	*temperature = 0;
-	ret = apple_pmp_telemetry_get_hotspot(cooling->pmp_node, temperature);
+	/* The GPU's own record and limit, from the firmware's sensor table. Until it
+	 * has given a first sample (the GPU starts powered off), and on a machine whose
+	 * table names none, the die hotspot under the package envelope stands in.
+	 */
+	ret = apple_pmp_telemetry_get_gpu(cooling->pmp_node, temperature, &limit);
+	if (!ret && !cooling->gpu_record) {
+		cooling->gpu_record = true;
+		cooling->valid_ns = 0;
+	}
+	if (!cooling->gpu_record) {
+		limit = 0;
+		ret = apple_pmp_telemetry_get_hotspot(cooling->pmp_node, temperature);
+	}
+	apple_pmp_cooling_set_limit(&cooling->policy, limit);
 	if (!ret) {
 		cooling->valid_ns = now;
 		cooling->valid_mc = *temperature;

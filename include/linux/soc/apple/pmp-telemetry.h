@@ -41,4 +41,7 @@ void apple_pmp_gpu_publish(const struct apple_pmp_sensor_data *data,
  */
 int apple_pmp_telemetry_get_hotspot(const struct device_node *np, long *value);
 
+/* The GPU's own record and its limit, both named by the firmware's sensor table. */
+int apple_pmp_telemetry_get_gpu(const struct device_node *np, long *value, long *limit_mc);
+
 #endif
