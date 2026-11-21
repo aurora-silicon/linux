@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The MagSafe 3 port's PD controller on the M5 MacBooks (J704, J813, J815). Each board's
+ * ADT has it as hpm5 on nub-spmi-a0, SID 8, port-type 0x11, with the same values on all
+ * three. It has no USB data path, so it gets no connector node; tipd registers a Type-C
+ * port and a power supply for it, as on J714s. The bus is polled on T8142, so like hpm0
+ * and hpm1 it has no interrupts. Its ADT features-supported is <3>, "Power In" only: no
+ * liquid detection.
+ *
+ * Included at the end of the board's USB file, after nub_spmi_a0.
+ */
+
+#include <dt-bindings/spmi/spmi.h>
+
+&nub_spmi_a0 {
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		apple,no-liquid-detection;
+	};
+};
