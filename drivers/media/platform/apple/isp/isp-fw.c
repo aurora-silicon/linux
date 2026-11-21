@@ -365,6 +365,7 @@ static int isp_check_coproc_t6040(struct apple_isp *isp)
 	    !(isp->coproc_left && control == ISP_COPROC_CONTROL_START)) {
 		isp_err(isp, "coprocessor already started (control 0x%x)\n",
 			control);
+		isp->coproc_left = false;
 		return -EBUSY;
 	}
 
@@ -523,12 +524,6 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 	}
 
 	apple_isp_power_down_domains(isp);
-	/*
-	 * Only after a start of ours: this also runs when the boot gave up,
-	 * for example on a coprocessor found already started.
-	 */
-	if (isp->fw.started)
-		isp->coproc_left = true;
 }
 
 static int isp_firmware_boot_stage1(struct apple_isp *isp)
@@ -587,6 +582,8 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	isp_coproc_write32(isp, isp_coproc_control(isp),
 			   ISP_COPROC_CONTROL_START);
 	isp->fw.started = true;
+	/* Power-down leaves the start word, for the next boot's check */
+	isp->coproc_left = true;
 
 	/* Wait for ISP_GPIO_7 to 0x0 -> 0x8042006 */
 	if (isp_gpio_wait(isp, ISP_GPIO_7, 0x8042006)) {

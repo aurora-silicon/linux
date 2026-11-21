@@ -515,7 +515,7 @@ struct apple_isp {
 	 * resident firmware cannot be started again before the next boot.
 	 */
 	bool ipc_failed;
-	/* A power-down of ours left the coprocessor control word as it was */
+	/* The coprocessor control word holds the start word this driver wrote */
 	bool coproc_left;
 };
 
