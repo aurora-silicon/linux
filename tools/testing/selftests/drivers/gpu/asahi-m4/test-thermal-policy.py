@@ -198,7 +198,9 @@ G16 = ROOT/'drivers/gpu/drm/asahi/g16'
 for path, call in [
         ('engine.rs', 'self.power.utilization.busy(now);'),
         ('poll.rs', 'self.power.utilization.idle(self.engine.stats.idle_from_ns);'),
-        ('power.rs', '.govern(now, limit, !self.engine.flights.is_empty());'),
+        # A firmware that powers the GPU down while idle gets the ceiling itself instead.
+        ('power.rs', '.govern(now, limit, !self.engine.flights.is_empty())\n'),
+        ('power.rs', 'let target = if self.session.adt.layout.powered.is_some() {\n            limit\n'),
         ('poll.rs', 'Ok(false)\n                        if firmware.recovery.failed().is_none()\n'
                     '                            && firmware.power.utilization.decaying() =>\n'
                     '                    {\n                        self.mod_poll('),
