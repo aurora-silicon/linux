@@ -29,6 +29,9 @@ write = function(shared, 'fn write(&self, ticks: u64, frequency_hz: u64)')
 checked_offset = function(shared, 'fn checked_offset(')
 publish = function(shared, 'pub(crate) fn publish(&self, ticks: [u64; 4], frequency_hz: u64)')
 retire = function(poll, 'fn publish_timestamps(&self, flight: &Flight, claims: &super::slots::Claims)')
+ticks = function(poll, 'fn compute_ticks(&self, unit: &super::slots::ComputeSlot)')
+tick_cells = '\n'.join(line for line in poll.splitlines() if line.startswith('const WORK_TICK_'))
+assert tick_cells.count('const WORK_TICK_') == 2
 source = r'''
 #![allow(dead_code)]
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering, fence as barrier};
@@ -146,8 +149,8 @@ fn expected(ticks:u64)->u64{((ticks as u128)*125/3)as u64}
 }
 mod backend {
     use super::*;
-    pub mod hw{pub const COMMAND_TIMESTAMP_HZ:u64=24_000_000;}
-    pub mod slots{pub struct Claims{pub slot:[u8;2],pub slot_count:u32,pub pass:[u8;2]}}
+    pub mod hw{pub const COMMAND_TIMESTAMP_HZ:u64=24_000_000;#[derive(Clone,Copy,PartialEq)]pub enum Start{Earlier,MacOs27_2}}
+    pub mod slots{pub struct Claims{pub slot:[u8;2],pub slot_count:u32,pub pass:[u8;2]}pub type ComputeSlot=super::Compute;}
     pub mod command{
         use super::*;
         pub struct Compute{pub timestamp_outputs:Destinations}
@@ -157,19 +160,25 @@ mod backend {
     pub struct Cells(pub [u64;4]);impl Cells{pub fn r64(&self,offset:usize)->Result<u64>{
         match offset{0=>Ok(self.0[0]),8=>Ok(self.0[1]),0x600=>Ok(self.0[0]),0x608=>Ok(self.0[1]),0x620=>Ok(self.0[2]),0x628=>Ok(self.0[3]),_=>Err(EINVAL)}
     }}
-    pub struct Compute{pub its:Cells}pub struct Pass{pub scene:Cells}
+    // The work's 32-bit cells at the firmware's tick offsets (start low/high, end low/high).
+    pub struct Work(pub [u32;4]);impl Work{pub fn r32(&self,offset:usize)->Result<u32>{
+        match offset{0x7ec=>Ok(self.0[0]),0x7f0=>Ok(self.0[1]),0x7f4=>Ok(self.0[2]),0x7f8=>Ok(self.0[3]),_=>Err(EINVAL)}
+    }}
+    pub struct Compute{pub its:Cells,pub work:Work}pub struct Pass{pub scene:Cells}
     pub struct Scrub{pub compute:Vec<Compute>,pub passes:Vec<Pass>}
-    pub struct Slots{pub scrub:Scrub}pub struct Firmware{pub slots:Slots}
+    pub struct Layout{pub start:hw::Start}pub struct Adt{pub layout:Layout}pub struct Session{pub adt:Adt}
+    pub struct Slots{pub scrub:Scrub}pub struct Firmware{pub slots:Slots,pub session:Session}
     pub struct Resources{pub compute:Vec<Compute>,pub passes:Vec<Pass>}
     impl Resources{pub fn compute(&self)->Result<&Self>{Ok(self)}pub fn render(&self)->Result<&Self>{Ok(self)}pub fn compute_unit(&self,k:usize)->Result<&Compute>{self.compute.get(k).ok_or(super::EINVAL)}}
     pub struct Job{pub commands:Vec<command::Command>,pub resources:Resources}
     pub struct Flight{pub job:Job,pub first:usize,pub count:usize,pub renders:u32}
-    pub mod poll{use super::*;impl Firmware{ __RETIRE__ }}
+    pub mod poll{use super::*;__TICK_CELLS__ impl Firmware{ __TICKS__ __RETIRE__ }}
 }
 use backend::*;
-fn firmware()->Firmware{Firmware{slots:Slots{scrub:Scrub{compute:vec![],passes:vec![]}}}}
+fn firmware_at(start:hw::Start)->Firmware{Firmware{slots:Slots{scrub:Scrub{compute:vec![],passes:vec![]}},session:Session{adt:Adt{layout:Layout{start}}}}}
+fn firmware()->Firmware{firmware_at(hw::Start::Earlier)}
 fn resources()->Resources{Resources{
-    compute:vec![Compute{its:Cells([10,20,0,0])},Compute{its:Cells([30,40,0,0])}],
+    compute:vec![Compute{its:Cells([10,20,0,0]),work:Work([0;4])},Compute{its:Cells([30,40,0,0]),work:Work([0;4])}],
     passes:vec![Pass{scene:Cells([100,200,300,400])},Pass{scene:Cells([500,600,700,800])}]
 }}
 #[test]fn retirement_uses_claimed_hardware_cells_and_endpoint_order(){
@@ -186,6 +195,27 @@ fn resources()->Resources{Resources{
         assert_eq!(render.words[index].load(Ordering::Relaxed),expected(ticks));
     }
 }
+#[test]fn compute_publishes_the_ticks_its_receipt_proved(){
+    // 26B123 leaves the ITS pair 0/0 and the ticks in the work: those are published, as the
+    // receipt read them. An ITS interval wins on every start.
+    let flight=|its:[u64;4],memory:&Arc<Backing>|Flight{job:Job{commands:vec![
+        command::Command::Compute(command::Compute{timestamp_outputs:outputs(memory)})
+    ],resources:Resources{compute:vec![Compute{its:Cells(its),
+        work:Work([0x0000_1000,0x2,0x0000_5000,0x2])}],passes:vec![]}},first:0,count:1,renders:0};
+    let claims=slots::Claims{slot:[0,0],slot_count:1,pass:[0,0]};
+    let memory=backing();
+    firmware_at(hw::Start::MacOs27_2).publish_timestamps(&flight([0;4],&memory),&claims).unwrap();
+    assert_eq!(memory.words[0].load(Ordering::Relaxed),expected(0x2_0000_1000));
+    assert_eq!(memory.words[1].load(Ordering::Relaxed),expected(0x2_0000_5000));
+    let memory=backing();
+    firmware_at(hw::Start::MacOs27_2).publish_timestamps(&flight([10,20,0,0],&memory),&claims).unwrap();
+    assert_eq!(memory.words[0].load(Ordering::Relaxed),expected(10));
+    assert_eq!(memory.words[1].load(Ordering::Relaxed),expected(20));
+    // Before 27.2 the ITS pair is the only source.
+    let memory=backing();
+    firmware().publish_timestamps(&flight([0;4],&memory),&claims).unwrap();
+    assert_eq!(memory.words[0].load(Ordering::Relaxed),expected(0));
+}
 #[test]fn invalid_command_span_and_missing_claim_are_rejected(){
     let memory=backing();let mut flight=Flight{job:Job{commands:vec![
         command::Command::Compute(command::Compute{timestamp_outputs:outputs(&memory)})
@@ -197,7 +227,7 @@ fn resources()->Resources{Resources{
     assert_eq!(firmware().publish_timestamps(&flight,&claims),Err(EINVAL));
     assert_eq!(memory.words[0].load(Ordering::Relaxed),u64::MAX);
 }
-'''.replace('__CHECKED_OFFSET__', checked_offset).replace('__STORE__', store).replace('__VMAP_STORE__', vmap_store.replace('.timestamp_lock.lock()', '.timestamp_lock.lock().unwrap()')).replace('__CACHE_POLICY__', cache_policy).replace('__WRITE__', write).replace('__PUBLISH__', publish).replace('__RETIRE__', retire.replace('fn publish_timestamps', 'pub(crate) fn publish_timestamps'))
+'''.replace('__CHECKED_OFFSET__', checked_offset).replace('__STORE__', store).replace('__VMAP_STORE__', vmap_store.replace('.timestamp_lock.lock()', '.timestamp_lock.lock().unwrap()')).replace('__CACHE_POLICY__', cache_policy).replace('__WRITE__', write).replace('__PUBLISH__', publish).replace('__RETIRE__', retire.replace('fn publish_timestamps', 'pub(crate) fn publish_timestamps')).replace('__TICKS__', ticks).replace('__TICK_CELLS__', tick_cells)
 path = out / 'timestamps-host.rs'
 path.write_text(source)
 subprocess.run(rustc() + ['--edition=2021', '--test', str(path), '-o', str(out / 'timestamps-host')], check=True)

@@ -841,7 +841,10 @@ impl Firmware {
                 super::command::Command::Compute(command) => {
                     let index = *slots.get(compute).ok_or(EINVAL)? as usize;
                     let unit = flight.job.resources.compute_unit(index)?;
-                    let ticks = [unit.its.r64(0)?, unit.its.r64(8)?, 0, 0];
+                    // The pair the full receipt proved (`compute_ticks`): on 26B123 the
+                    // firmware may leave it in the work rather than the ITS pair.
+                    let (start, end) = self.compute_ticks(unit)?;
+                    let ticks = [start, end, 0, 0];
                     command
                         .timestamp_outputs
                         .publish(ticks, super::hw::COMMAND_TIMESTAMP_HZ);
