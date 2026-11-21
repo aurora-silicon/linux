@@ -13,6 +13,7 @@ compile_error!("apple_sep requires CONFIG_OF_DYNAMIC: the SEP and DART nodes shi
 mod ratelimit;
 mod attach;
 mod bio;
+mod capture;
 mod catacomb;
 mod control;
 mod der;
@@ -23,6 +24,13 @@ mod hibe;
 mod hwrng;
 mod image;
 mod key;
+mod key_command;
+mod key_context;
+mod key_context_state;
+mod key_device;
+mod key_request;
+mod key_result;
+mod key_wait;
 mod keybag;
 mod keybag_identity;
 mod os_identity;
@@ -292,6 +300,35 @@ const SKS_LOCK_STATE_VARIANT: u32 = 1;
 #[derive(Clone, Copy)]
 enum LockState {
     Unlocked,
+}
+
+/// A Unix user's own biometric user: the designation of its key bag
+/// (`userbag::bag_designation`) and the uid whose catacomb file it uses.
+/// A Touch ID match for one of that bag's keys runs in this user's domain,
+/// as macOS matches against the logged-in user's catacomb: a match against
+/// another user's templates does not satisfy the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BioSubject {
+    pub(crate) user: i32,
+    pub(crate) uid: u32,
+}
+
+/// Routes Touch ID to a bag user while a touch-gated call or an enrolment
+/// runs, under `catacomb_writer`; the configured user again when it ends, on
+/// every path.
+pub(crate) struct SubjectScope<'a>(&'a SepData);
+
+impl<'a> SubjectScope<'a> {
+    pub(crate) fn new(sep: &'a SepData, subject: BioSubject) -> Self {
+        *sep.bio_subject.lock() = Some(subject);
+        SubjectScope(sep)
+    }
+}
+
+impl Drop for SubjectScope<'_> {
+    fn drop(&mut self) {
+        *self.0.bio_subject.lock() = None;
+    }
 }
 
 impl LockState {
@@ -707,6 +744,10 @@ struct SepData {
     templates_restored: Atomic<bool>,
     // Provisional cold restore; COMPLETE_INIT must still prove the device view.
     cold_restore_candidate: Atomic<bool>,
+    /// Every attach step of the cold restore succeeded, whatever the
+    /// configured user's identity count: enough for a match in a bag user's
+    /// own domain, whose catacomb is loaded and checked on its own.
+    components_restored: Atomic<bool>,
 
     sensor_calibrated: Atomic<bool>,
     sensor_key_loaded: Atomic<bool>,
@@ -737,6 +778,16 @@ struct SepData {
     // all before it sets up the new one, as a restart does.
     #[pin]
     cold_match_contexts: Mutex<KVec<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>>,
+
+    // Per-user bags the 13.5 key store keeps loaded between import and
+    // logout (see `userbag::LoadedBags`).
+    #[pin]
+    user_bags: Mutex<userbag::LoadedBags>,
+
+    // The biometric user a match addresses while a touch-gated call on a
+    // user-bag key waits (see `BioSubject`); none means the configured user.
+    #[pin]
+    bio_subject: Mutex<Option<BioSubject>>,
 
     // The sensor stayed powered and registered after the last verify, so the
     // next verify captures without a new bring-up, as macOS does. Cleared by
@@ -863,7 +914,18 @@ struct SepData {
 
     // /dev/sep-key: P-256 keys created inside the SEP (see `key`).
     #[pin]
-    key_dev: Mutex<Option<shim::BioChardev>>,
+    key_dev: Mutex<Option<key_device::Registration>>,
+    key_calls: Atomic<u32>,
+    key_context_generation: Atomic<u64>,
+    #[pin]
+    key_contexts: Mutex<KVec<Arc<key_context::Context>>>,
+    key_context_queue: workqueue::OwnedQueue,
+    key_auth_queue: workqueue::OwnedQueue,
+    #[pin]
+    key_commands: Mutex<key_command::State>,
+    #[pin]
+    capture: Mutex<capture::State>,
+    key_sensor_waiting: Atomic<bool>,
 
     // /dev/sep-key: one identity-bag load, operation and unload at a time.
     // The device's ioctls run concurrently (a touch wait must not block
@@ -880,6 +942,8 @@ struct SepData {
     key_touch_active: Atomic<bool>,
     /// `SEP_KEY_CANCEL`: ends the touch-gated operation that is waiting.
     key_touch_cancel: Atomic<bool>,
+    /// An unconfirmed credential disposal disables private key operations.
+    key_context_failed: Atomic<bool>,
     // The enclave status of the last /dev/sep-key signature (self-test).
     last_key_status: Atomic<u32>,
 
@@ -1209,10 +1273,13 @@ impl SepData {
                 sensor_key_loaded: Atomic::new(false),
                 templates_restored: Atomic::new(false),
                 cold_restore_candidate: Atomic::new(false),
+                components_restored: Atomic::new(false),
                 enrol_material <- new_mutex!(None),
                 match_context <- new_mutex!(None),
                 match_context_generation: Atomic::new(0),
                 cold_match_contexts <- new_mutex!(KVec::new()),
+                user_bags <- new_mutex!(userbag::LoadedBags::new()),
+                bio_subject <- new_mutex!(None),
                 sensor_kept: Atomic::new(false),
                 sensor_reset_in_capture: Atomic::new(false),
                 bg_ops_ready: Atomic::new(false),
@@ -1262,10 +1329,19 @@ impl SepData {
                 bio_dev <- new_mutex!(None),
                 rearm_dev <- new_mutex!(None),
                 key_dev <- new_mutex!(None),
+                key_calls: Atomic::new(0),
+                key_context_generation: Atomic::new(0),
+                key_contexts <- new_mutex!(KVec::new()),
+                key_context_queue: workqueue::OwnedQueue::new_ordered(c"sep_context")?,
+                key_auth_queue: workqueue::OwnedQueue::new_ordered(c"sep_auth")?,
+                key_commands <- new_mutex!(key_command::State::new()),
+                capture <- new_mutex!(capture::State::new()),
+                key_sensor_waiting: Atomic::new(false),
                 key_bag_lock <- new_mutex!(()),
                 key_touch <- new_mutex!(None),
                 key_touch_active: Atomic::new(false),
                 key_touch_cancel: Atomic::new(false),
+                key_context_failed: Atomic::new(false),
                 last_key_status: Atomic::new(0),
                 bio_lockout: Atomic::new(false),
                 bio_after_boot: Atomic::new(false),
@@ -2769,13 +2845,21 @@ impl SepData {
     }
 
     pub(crate) fn close_unlock_evaluation(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+        let _ = self.delete_unlock_evaluation(handle);
+    }
+
+    pub(crate) fn delete_unlock_evaluation(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) -> Result<()> {
         match self.scrd_command(&crate::scrd::scrd_context_delete(handle)) {
-            Some((0, _)) => {}
-            other => dev_warn_ratelimited!(
-                self.dev,
-                "scrd: deleting the unlock evaluation answered {:?}\n",
-                other.map(|(status, _)| status)
-            ),
+            Some((0, _)) => Ok(()),
+            other => {
+                self.key_context_failed.store(true, Relaxed);
+                dev_warn_ratelimited!(
+                    self.dev,
+                    "scrd: deleting the unlock evaluation answered {:?}; private key operations disabled until reboot\n",
+                    other.map(|(status, _)| status)
+                );
+                Err(EIO)
+            }
         }
     }
 
@@ -3222,6 +3306,11 @@ impl SepData {
         self.sks_wq.notify_all();
         self.scrd_wq.notify_all();
         pm::unregister();
+        self.cancel_key(ENODEV);
+        self.cancel_context_commands(ENODEV);
+        self.revoke_key_contexts(ENODEV);
+        self.key_auth_queue.drain();
+        self.remove_key_contexts();
         // Release any capture start still held for a resume that will not be
         // reported now.
         self.sleep_finished();
@@ -3234,6 +3323,9 @@ impl SepData {
         drop(dev);
         let dev = self.key_dev.lock().take();
         drop(dev);
+        // Files outlive the registration; their calls end before the
+        // hardware goes.
+        key_device::wait_for_calls(self);
 
         self.rng_shutdown.store(true, Relaxed);
         self.control_wq.notify_all();
@@ -3712,6 +3804,10 @@ module! {
         probe_owner_export: u8 {
             default: 0,
             description: "Opt-in J414s diagnostic: with zero live identities, select the system context and try saving the missing owner Catacomb",
+        },
+        key_context_api: u8 {
+            default: 0,
+            description: "Enable the authorization-context requests on /dev/sep-key (SEP_KEY_CTX_*, a design draft; key stores with per-user bags)",
         },
         key_selftest: u8 {
             default: 0,

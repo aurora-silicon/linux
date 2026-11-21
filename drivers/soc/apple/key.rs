@@ -83,6 +83,9 @@ pub(crate) const FEATURE_PASSWORD: u32 = 4;
 /// enclave keeps no anti-replay record for it), so a FIDO PIN retry budget
 /// built on it would not be root-proof. aurora-fido offers no PIN without it.
 pub(crate) const FEATURE_PERSISTENT_ATTEMPTS: u32 = 8;
+/// `INFO.features`: the authorization-context requests (`SEP_KEY_CTX_*`)
+/// are accepted, as `key_device` gates them.
+pub(crate) const FEATURE_CONTEXTS: u32 = 0x20;
 /// The longest password `SIGN_PASSWORD` / `UNSEAL_PASSWORD` take, as the
 /// key-bag ioctls.
 pub(crate) const PASSWORD_MAX: usize = crate::userbag::SECRET_MAX;
@@ -139,7 +142,7 @@ pub(crate) fn create_policy(flags: u32) -> Result<Policy> {
 /// none until this long has passed; one capture itself waits up to a minute.
 const TOUCH_WAIT_MS: u64 = 60_000;
 
-const MAGIC: u32 = 0xB1;
+pub(crate) const MAGIC: u32 = 0xB1;
 
 /// Handle header: `"SEPK"`, version, flags, reserved u16, blob length (LE u32).
 const HANDLE_MAGIC: &[u8; 4] = b"SEPK";
@@ -706,11 +709,23 @@ pub(crate) struct Handle<'a> {
 
 /// Either handle version. Version 2 is only `HANDLE_USER_BAG`.
 pub(crate) fn decode_any_handle(handle: &[u8; HANDLE_MAX], len: u32) -> Result<Handle<'_>> {
+    let len = len as usize;
+    if len > HANDLE_MAX {
+        return Err(EINVAL);
+    }
+    decode_any_handle_bytes(&handle[..len])
+}
+
+/// As `decode_any_handle`, for a handle copied to exactly its length.
+pub(crate) fn decode_any_handle_bytes(handle: &[u8]) -> Result<Handle<'_>> {
+    if handle.len() < 5 {
+        return Err(EINVAL);
+    }
     if handle[4] != HANDLE_VERSION_USER {
-        let (blob, flags) = decode_handle(handle, len)?;
+        let (blob, flags) = decode_handle_bytes(handle)?;
         return Ok(Handle { blob, flags, uid: None });
     }
-    let len = len as usize;
+    let len = handle.len();
     if !(HANDLE_HEADER_USER + 1..=HANDLE_MAX).contains(&len)
         || &handle[..4] != HANDLE_MAGIC
         || (handle[5] != HANDLE_USER_BAG && handle[5] != HANDLE_USER_BAG | HANDLE_USER_PLAIN)
@@ -768,6 +783,12 @@ pub(crate) fn require_admin_or(uid: u32) -> Result<()> {
 /// authenticated; the enclave enforces the record's own list either way.
 pub(crate) fn decode_handle(handle: &[u8; HANDLE_MAX], len: u32) -> Result<(&[u8], u8)> {
     let len = len as usize;
+    if len > HANDLE_MAX { return Err(EINVAL); }
+    decode_handle_bytes(&handle[..len])
+}
+
+pub(crate) fn decode_handle_bytes(handle: &[u8]) -> Result<(&[u8], u8)> {
+    let len = handle.len();
     if !(HANDLE_HEADER + 1..=HANDLE_MAX).contains(&len) {
         return Err(EINVAL);
     }
@@ -957,37 +978,59 @@ impl KeyGrant {
 
 /// Deletes an enclave credential context.
 pub(crate) trait ContextDelete {
-    fn delete_context(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]);
+    fn delete_context(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) -> Result<()>;
 }
 
 impl ContextDelete for SepData {
-    fn delete_context(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
-        self.close_unlock_evaluation(handle);
+    fn delete_context(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) -> Result<()> {
+        self.delete_unlock_evaluation(handle)
     }
 }
 
-/// A credential context the kernel opened for one operation: deleted when
-/// this is dropped, on every path out of the code that owns it (success,
-/// error, cancel, timeout, signal). Its handle never leaves the kernel.
+/// An owned credential, disposed on every exit unless ownership transfers
+/// to a retained context. Its handle never leaves the kernel.
 pub(crate) struct OwnedContext<'a, D: ContextDelete + ?Sized> {
     owner: &'a D,
     handle: [u8; crate::scrd::SCRD_ACM_HANDLE_LEN],
+    disposed: bool,
 }
 
 impl<'a, D: ContextDelete + ?Sized> OwnedContext<'a, D> {
     pub(crate) fn new(owner: &'a D, handle: [u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) -> Self {
-        OwnedContext { owner, handle }
+        OwnedContext { owner, handle, disposed: false }
     }
 
     pub(crate) fn handle(&self) -> &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN] {
         &self.handle
     }
+
+    pub(crate) fn into_handle(mut self) -> [u8; crate::scrd::SCRD_ACM_HANDLE_LEN] {
+        self.disposed = true;
+        let handle = self.handle;
+        crate::image::wipe(&mut self.handle);
+        handle
+    }
+
+    fn dispose(&mut self) -> Result<()> {
+        if self.disposed {
+            return Ok(());
+        }
+        self.disposed = true;
+        let result = self.owner.delete_context(&self.handle);
+        crate::image::wipe(&mut self.handle);
+        result
+    }
+
+    /// Dispose before publishing the result. Failure drops any owned output.
+    pub(crate) fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+        self.dispose()?;
+        result
+    }
 }
 
 impl<D: ContextDelete + ?Sized> Drop for OwnedContext<'_, D> {
     fn drop(&mut self) {
-        self.owner.delete_context(&self.handle);
-        crate::image::wipe(&mut self.handle);
+        let _ = self.dispose();
     }
 }
 
@@ -1020,6 +1063,8 @@ pub(crate) struct KeyTouch {
     probe: Option<Probe>,
     again: Option<Result<crate::Secret>>,
     again_status: i32,
+    authorization: Option<kernel::sync::Arc<crate::key_request::Request>>,
+    retained: Option<crate::key_context::Credential>,
 }
 
 impl KeyTouch {
@@ -1050,6 +1095,8 @@ impl KeyTouch {
             probe: None,
             again: None,
             again_status: 0,
+            authorization: None,
+            retained: None,
         })
     }
 
@@ -1333,26 +1380,13 @@ mod tests {
 
 impl SepData {
     pub(crate) fn register_key(&self) -> Result<()> {
-        let ctx = core::ptr::from_ref(self).cast_mut().cast::<c_void>();
-        self.publish_chardev(&self.key_dev, || {
-            // SAFETY: as in `register_bio`: `remove()` drops the registration
-            // before the `Arc` that keeps `ctx` alive, and the shim's unregister
-            // waits for running ioctls and clears the stored context before
-            // any later callback. Ioctls run concurrently: a touch-gated SIGN or
-            // UNSEAL sleeps up to a minute, and CANCEL must reach it meanwhile.
-            // They serialise on `catacomb_writer`; CANCEL only sets a flag.
-            unsafe {
-                crate::shim::BioChardev::register_concurrent(
-                    DEVICE_NAME,
-                    DEVICE_MODE,
-                    ctx,
-                    key_open_trampoline,
-                    key_release_trampoline,
-                    key_ioctl_trampoline,
-                    key_ready_trampoline,
-                )
-            }
-        })?;
+        let mut device = self.key_dev.lock();
+        if self.shutting_down.load(Relaxed) { return Err(ENODEV); }
+        if device.is_none() {
+            // SAFETY: remove drops the registration before the driver Arc.
+            // Every successful open acquires its own reference.
+            *device = Some(unsafe { crate::key_device::Registration::new(self)? });
+        }
         Ok(())
     }
 
@@ -1361,11 +1395,50 @@ impl SepData {
     /// A touch-gated call runs its capture in the caller's own thread, so a
     /// signal to the caller (or its death) ends the capture at once.
     pub(crate) fn capture_live(&self) -> bool {
-        (self.key_touch_active.load(Relaxed)
-            && !self.key_touch_cancel.load(Relaxed)
-            && !self.shutting_down.load(Relaxed)
-            && !kernel::current!().signal_pending())
-            || crate::bio::capture_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
+        if self.shutting_down.load(Relaxed) || self.suspending.load(Relaxed) { return false; }
+        if self.key_touch_active.load(Relaxed) {
+            return !self.key_touch_cancel.load(Relaxed)
+                && !kernel::current!().signal_pending()
+                && self.key_authorization_request().map_or(true, |request| request.is_live());
+        }
+        crate::bio::capture_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
+    }
+
+    pub(crate) fn key_authorization_request(&self) -> Option<kernel::sync::Arc<crate::key_request::Request>> {
+        self.key_touch.lock().as_ref().and_then(|job| job.authorization.clone())
+    }
+
+    pub(crate) fn retain_key_authorization(&self, credential: OwnedContext<'_, Self>) -> Result<()> {
+        let request = self.key_authorization_request().ok_or(EIO)?;
+        let crate::key_request::Input::Authenticate(context) = &request.data.input else { return Err(EIO); };
+        let retained = crate::key_context::Credential::new(context.sep.clone(), credential.into_handle());
+        let mut guard = self.key_touch.lock();
+        let job = (&mut *guard).as_mut().ok_or(EIO)?;
+        job.retained = Some(retained);
+        Ok(())
+    }
+
+    pub(crate) fn key_authorize(&self, request: kernel::sync::Arc<crate::key_request::Request>)
+        -> Result<crate::key_context::Credential>
+    {
+        let bag = match &request.data.input {
+            crate::key_request::Input::Authenticate(context) => context.bag,
+            _ => None,
+        };
+        // A bag context authorizes that bag's user-presence keys.
+        let constraint = match bag {
+            Some(_) => presence_constraint()?,
+            None => self.key_bio_acl(true)?.constraint,
+        };
+        let mut job = KeyTouch::new(TouchOp::Sign, &[], &[0; DIGEST_LEN], &[], constraint)?;
+        job.grant = None;
+        job.authorization = Some(request.clone());
+        let result = self.key_touch_wait(job);
+        // An abandoned frame wait is not a sensor failure when its owner
+        // has cancelled or expired. Check this even if capture returned Err.
+        request.check_live()?;
+        let mut job = result?;
+        job.retained.take().ok_or(EIO)
     }
 
     fn key_bio_acl(&self, any: bool) -> Result<BioAcl> {
@@ -1585,18 +1658,42 @@ impl SepData {
         };
         let mut job = KeyTouch::new_in(op, blob, digest, sealed, constraint, bag)?;
         job.probe = probe;
+        let _capture = crate::capture::Lease::acquire(self)?;
+        self.key_touch_wait(job)
+    }
+
+    fn key_touch_wait(&self, job: KeyTouch) -> Result<KeyTouch> {
+        let op = job.op;
         // Serialises with /dev/sep-bio's enrol and verify work, as they do
         // with each other, and with every other touch-gated call: one job,
         // one grant, one context at a time.
         let _writer = self.catacomb_writer.lock();
+        // A key under a user's bag is matched in that user's domain, and
+        // only after its password unlocked the bag.
+        let bag = job.grant.as_ref().and_then(|g| g.bag()).or_else(|| {
+            job.authorization.as_ref().and_then(|request| match &request.data.input {
+                crate::key_request::Input::Authenticate(context) => context.bag,
+                _ => None,
+            })
+        });
+        let _subject = match bag {
+            Some(uid) => match self.userbag_touch_subject(uid)? {
+                Some(subject) => Some(crate::SubjectScope::new(self, subject)),
+                None => None,
+            },
+            None => None,
+        };
         *self.key_touch.lock() = Some(job);
         self.key_touch_cancel.store(false, Relaxed);
         self.key_touch_active.store(true, Relaxed);
         dev_dbg!(self.dev, "sep-key: waiting for a Touch ID match ({:?})\n", op);
         let deadline = crate::shim::boottime_ns().saturating_add(TOUCH_WAIT_MS * 1_000_000);
         let ended = loop {
-            if self.shutting_down.load(Relaxed) {
+            if self.shutting_down.load(Relaxed) || self.suspending.load(Relaxed) {
                 break Err(ENODEV);
+            }
+            if let Some(request) = self.key_authorization_request() {
+                if let Err(error) = request.check_live() { break Err(error); }
             }
             if self.key_touch_cancel.load(Relaxed) {
                 break Err(ECANCELED);
@@ -1645,6 +1742,9 @@ impl SepData {
             errno_of(&job.result)
         );
         ended?;
+        if self.key_context_failed.load(Relaxed) {
+            return Err(EIO);
+        }
         Ok(job)
     }
 
@@ -1684,7 +1784,7 @@ impl SepData {
     /// A fresh tracked context for `uid`; with `secret`, a passcode
     /// credential from `bag`'s verify-secret is added. Returns the context
     /// and the verify status (0 when none was asked).
-    fn key_context_for(
+    pub(crate) fn key_context_for(
         &self,
         uid: i32,
         cred: Option<(crate::sks::SpecialHandle, &[u8])>,
@@ -2097,7 +2197,7 @@ impl SepData {
         digest: &[u8; DIGEST_LEN],
         sealed: &[u8],
         pw: &[u8],
-    ) -> Result<KVec<u8>> {
+    ) -> Result<crate::Secret> {
         let bag = bag_user(uid)?;
         // Not under `catacomb_writer`: a touch wait holds it for up to a
         // minute, and this path needs no capture.
@@ -2107,9 +2207,9 @@ impl SepData {
             dev_info_refusal!(self.dev, "sep-key: uid {}'s password refused by the enclave (status {})\n", uid, verify);
             Err(EACCES)
         } else {
-            self.key_op_in(Some(uid), op, blob, digest, sealed, Some(ctx.handle()))
+            self.key_op_in(Some(uid), op, blob, digest, sealed, Some(ctx.handle())).map(crate::Secret)
         };
-        drop(ctx);
+        let r = ctx.finish(r);
         dev_dbg!(
             self.dev,
             "sep-key: password-gated {:?} under uid {}'s bag: {}\n",
@@ -2241,13 +2341,23 @@ impl SepData {
         Ok(())
     }
 
-    fn key_ioctl(&self, cmd: u32, arg: usize) -> Result<()> {
+    pub(crate) fn key_ioctl(&self, cmd: u32, arg: usize) -> Result<()> {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
+        if cmd != IOC_INFO && cmd != IOC_CANCEL && self.key_context_failed.load(Relaxed) {
+            return Err(EIO);
+        }
         let user = UserPtr::from_addr(arg);
         match read_request(cmd, arg)? {
-            KeyRequest::Info => write_user(user, &info_for(self.profile.key_store == crate::profile::KeyStore::Variant5)),
+            // Password keys live in per-user bags (see `userbag`).
+            KeyRequest::Info => {
+                let mut info = info_for(self.profile.per_user_keybags);
+                if crate::key_device::contexts_supported(self) {
+                    info.features |= FEATURE_CONTEXTS;
+                }
+                write_user(user, &info)
+            }
             KeyRequest::Create(mut req, policy) => {
                 may_create_machine_key(crate::shim::capable_admin(), crate::shim::current_euid())?;
                 let (acl, flags) = match policy {
@@ -2286,7 +2396,7 @@ impl SepData {
             KeyRequest::Cancel => {
                 // Ends the touch-gated call that is waiting, whoever made it:
                 // like pulling a security key, it can only make a request fail.
-                if self.key_touch_active.load(Relaxed) {
+                if self.key_touch_active.load(Relaxed) && self.key_authorization_request().is_none() {
                     self.key_touch_cancel.store(true, Relaxed);
                     dev_dbg!(self.dev, "sep-key: waiting operation cancelled\n");
                 }
@@ -2348,7 +2458,7 @@ impl SepData {
                     require_admin_or(uid)?;
                     let pw = check_password(&req.password)?;
                     let digest = req.sign.digest;
-                    crate::Secret(self.key_op_with_password(uid, h.blob, TouchOp::Sign, &digest, &[], pw)?)
+                    self.key_op_with_password(uid, h.blob, TouchOp::Sign, &digest, &[], pw)?
                 };
                 put_signature(&sig, &mut req.sign)?;
                 // `req` wipes the password when it drops.
@@ -2360,7 +2470,7 @@ impl SepData {
                     let uid = check_password_handle(&h)?;
                     require_admin_or(uid)?;
                     let pw = check_password(&req.password)?;
-                    crate::Secret(self.key_op_with_password(uid, h.blob, TouchOp::Unseal, &[0; DIGEST_LEN], sealed, pw)?)
+                    self.key_op_with_password(uid, h.blob, TouchOp::Unseal, &[0; DIGEST_LEN], sealed, pw)?
                 };
                 put_secret(&secret, &mut req.seal)?;
                 // `secret` and `req` wipe the plaintext and password when they drop.
@@ -2368,41 +2478,6 @@ impl SepData {
             }
         }
     }
-}
-
-// /dev/sep-key has no session: any number of openers, no poll.
-
-/// # Safety
-/// `ctx` is the `SepData` pointer given to `register_key`, valid while the
-/// registration lives (see `register_key`).
-unsafe extern "C" fn key_open_trampoline(ctx: *mut c_void) -> c_int {
-    // SAFETY: per the contract above.
-    let this = unsafe { &*ctx.cast::<SepData>() };
-    if this.shutting_down.load(Relaxed) {
-        return ENODEV.to_errno();
-    }
-    0
-}
-
-/// # Safety
-/// As for `key_open_trampoline`.
-unsafe extern "C" fn key_release_trampoline(_ctx: *mut c_void) {}
-
-/// # Safety
-/// As for `key_open_trampoline`.
-unsafe extern "C" fn key_ioctl_trampoline(ctx: *mut c_void, cmd: c_uint, arg: c_ulong) -> c_long {
-    // SAFETY: per the contract above.
-    let this = unsafe { &*ctx.cast::<SepData>() };
-    match this.key_ioctl(cmd, arg) {
-        Ok(()) => 0,
-        Err(e) => e.to_errno() as c_long,
-    }
-}
-
-/// # Safety
-/// As for `key_open_trampoline`.
-unsafe extern "C" fn key_ready_trampoline(_ctx: *mut c_void) -> c_int {
-    0
 }
 
 /// KUnit hook for `sep_ioctl_test.c`: [`read_request`] on user memory the
@@ -2510,9 +2585,10 @@ mod one_op_tests {
     }
 
     impl ContextDelete for Deleter {
-        fn delete_context(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+        fn delete_context(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) -> Result<()> {
             self.deleted.set(self.deleted.get() + 1);
             self.last.set(*handle);
+            Ok(())
         }
     }
 
@@ -2551,6 +2627,45 @@ mod one_op_tests {
         assert_eq!(d.deleted.get(), 0);
         drop(maybe);
         assert_eq!(d.deleted.get(), 1);
+    }
+
+    struct RefusingDeleter(Cell<u32>);
+
+    impl ContextDelete for RefusingDeleter {
+        fn delete_context(&self, _handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) -> Result<()> {
+            self.0.set(self.0.get() + 1);
+            Err(EIO)
+        }
+    }
+
+    struct PendingOutput<'a>(&'a Cell<bool>);
+
+    impl Drop for PendingOutput<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_discards_success_without_retrying_disposal() {
+        let d = RefusingDeleter(Cell::new(0));
+        let discarded = Cell::new(false);
+        let ctx = OwnedContext::new(&d, [0x51; crate::scrd::SCRD_ACM_HANDLE_LEN]);
+        let result = ctx.finish(Ok(PendingOutput(&discarded)));
+        assert!(matches!(result, Err(e) if e == EIO));
+        assert!(discarded.get());
+        assert_eq!(d.0.get(), 1);
+    }
+
+    #[test]
+    fn confirmed_disposal_preserves_the_operation_result() {
+        let d = deleter();
+        let ctx = OwnedContext::new(&d, [0x52; crate::scrd::SCRD_ACM_HANDLE_LEN]);
+        assert_eq!(ctx.finish(Ok(37)), Ok(37));
+        assert_eq!(d.deleted.get(), 1);
+        let ctx = OwnedContext::new(&d, [0x53; crate::scrd::SCRD_ACM_HANDLE_LEN]);
+        assert_eq!(ctx.finish::<()>(Err(ECANCELED)), Err(ECANCELED));
+        assert_eq!(d.deleted.get(), 2);
     }
 
     // Production kernels do not build the reuse measurements.
