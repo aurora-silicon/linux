@@ -789,6 +789,8 @@ impl Firmware {
         // ordering satisfies Mesa's barriers while slot displacement and cache ownership
         // stay explicit. Never enable G15's submit-ahead policy on the M4 wire by accident.
         let mut result = Ok(());
+        let mut pending_rings = 0u8;
+        let mut batch_published = 0u64;
 
         self.engine.chan_wait = false;
         while self.recovery.failed().is_none()
@@ -888,8 +890,9 @@ impl Firmware {
             }
             self.engine.turn += 1;
             job.queue.turn.store(self.engine.turn, Ordering::Relaxed);
-            match self.publish_prefix(&job, done) {
+            match self.publish_prefix(&job, done, &mut pending_rings) {
                 Ok(()) => {
+                    batch_published += 1;
                     self.recovery.publication_wait_deadline = None;
                     if job.progress.sent() == job.progress.count() {
                         self.engine.unpend(&job); // fully published
@@ -924,6 +927,12 @@ impl Firmware {
                                 .0
                             });
                     if super::recovery::logic::expired(now_ns(), deadline) {
+                        // `self.engine.flights.is_empty()` already implies `pending_rings == 0`
+                        // today, but flush defensively so records posted earlier in the batch
+                        // cannot be stranded if this error ever stops being fatal.
+                        if pending_rings != 0 {
+                            let _ = self.flush_doorbells(&mut pending_rings);
+                        }
                         return Err(ETIMEDOUT);
                     }
                     break;
@@ -934,6 +943,7 @@ impl Firmware {
                     complete(done, &job, Err(e));
                 }
                 Err(PublicationError::Uncertain(e)) => {
+                    pending_rings = 0;
                     self.engine.unpend(&job);
                     // A counter or producer may be visible: retain and stop globally.
                     dev_err!(
@@ -950,6 +960,24 @@ impl Firmware {
                 }
             }
         }
+        if batch_published > 1 {
+            self.engine.stats.grouped = self
+                .engine
+                .stats
+                .grouped
+                .saturating_add(batch_published - 1);
+        }
+        if pending_rings != 0 {
+            if let Err(e) = self.flush_doorbells(&mut pending_rings) {
+                dev_err!(
+                    self.graph.dev.as_ref(),
+                    "G16: batched doorbell ring failed after visibility began ({:?})\n",
+                    e
+                );
+                self.fail_stop(EIO, done);
+                result = Err(EIO);
+            }
+        }
         if !self.engine.chan_wait {
             self.recovery.publication_wait_deadline = None;
         }
@@ -957,6 +985,18 @@ impl Firmware {
         // drain; a fail-stop reports from fail_flights().
         self.power.report_work(!self.engine.flights.is_empty());
         result
+    }
+
+    /// Rings each submit channel touched during a publication batch once, preserving
+    /// FS-before-TA doorbell order for render batches.
+    fn flush_doorbells(&mut self, pending_rings: &mut u8) -> Result {
+        let mask = core::mem::take(pending_rings);
+        for channel in [Channel::Fs, Channel::Ta, Channel::Compute] {
+            if mask & (1u8 << (channel as u8)) != 0 {
+                self.session.ring(channel)?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether `job`'s next command may be published behind the flights in flight:
@@ -1112,10 +1152,11 @@ impl Firmware {
         &mut self,
         job: &Arc<Job>,
         done: &mut Completions,
+        pending_rings: &mut u8,
     ) -> core::result::Result<(), PublicationError> {
         let mut f = Flight::new(job.clone());
         let mut visible = false;
-        let result = self.publish_prefix_into(job, &mut f, &mut visible);
+        let result = self.publish_prefix_into(job, &mut f, &mut visible, pending_rings);
         match result {
             Err(e) if !visible => {
                 // Never published: its storage is free again, and horizon jobs taken into it
@@ -1136,8 +1177,9 @@ impl Firmware {
         job: &Arc<Job>,
         f: &mut Flight,
         visible: &mut bool,
+        pending_rings: &mut u8,
     ) -> Result {
-        let result = self.publish_prefix_body(job, f, visible);
+        let result = self.publish_prefix_body(job, f, visible, pending_rings);
         if result.is_err() && !*visible {
             if f.pb.is_some() {
                 self.pools.cancel_alloc(f.pb_slot as usize);
@@ -1156,6 +1198,7 @@ impl Firmware {
         job: &Arc<Job>,
         f: &mut Flight,
         visible: &mut bool,
+        pending_rings: &mut u8,
     ) -> Result {
         let behind = !self.engine.flights.is_empty();
         if behind && !self.can_queue_behind(job) {
@@ -1368,7 +1411,7 @@ impl Firmware {
                 } else {
                     self.channels.post(channel, &record)?;
                 }
-                self.session.ring(channel)?;
+                *pending_rings |= 1u8 << (channel as u8);
             }
             Ok(())
         })();

@@ -29,6 +29,7 @@ const ETIMEDOUT:Error=Error(110);const ECANCELED:Error=Error(125);const EOVERFLO
 type Result<T=()> = std::result::Result<T,Error>;
 macro_rules! dev_err {($($argument:tt)*)=>{()};}
 __PUBLICATION_ERROR__
+#[derive(Copy,Clone,Debug,PartialEq,Eq)]enum Channel { Ta = 0, Fs = 1, Compute = 2 }
 #[derive(Copy,Clone)]struct ComputeCommand { query_access: bool }
 #[derive(Copy,Clone)]enum Command { Compute(ComputeCommand), Render(()) }
 struct Status(AtomicU32);impl Status{fn get(&self)->u32{self.0.load(Ordering::Relaxed)}}
@@ -49,7 +50,7 @@ impl Job {
 fn command(job:&Job,k:u32)->Option<&Command>{job.commands.get(k as usize)}
 type Completions=Vec<(u32,Result)>;
 fn complete(done:&mut Completions,job:&Arc<Job>,result:Result){done.push((job.id,result));}
-#[derive(Default)]struct Stats{hold:[u64;3]}
+#[derive(Default)]struct Stats{hold:[u64;3],grouped:u64}
 struct Claims;
 struct Flight{claims:Claims,group:Vec<Arc<Job>>}
 impl Flight{fn new(_job:Arc<Job>)->Self{Self{claims:Claims,group:vec![]}}}
@@ -60,7 +61,15 @@ impl Engine {
 }
 struct Checks;impl Checks{fn check(&self)->Result{Ok(())}fn health(&self)->Result{Ok(())}}
 struct Shared{sleeping:AtomicBool}
-struct Session{shared:Shared}impl Session{fn check(&self)->Result{Ok(())}}
+struct Session{shared:Shared,rings:Vec<Channel>,ring_fail:bool}
+impl Session{
+    fn check(&self)->Result{Ok(())}
+    fn ring(&mut self,channel:Channel)->Result{
+        if self.ring_fail{return Err(EIO);}
+        self.rings.push(channel);
+        Ok(())
+    }
+}
 struct Recovery{error:Option<Error>,publication_wait_deadline:Option<u64>}impl Recovery{fn failed(&self)->Option<Error>{self.error}}
 struct Slots{compute_exhausted:bool,render_exhausted:bool,releases:u32,quarantines:u32}
 impl Slots{
@@ -120,12 +129,11 @@ impl Power{fn report_work(&mut self,in_flight:bool){self.work.push(in_flight);}}
 struct Firmware{
     session:Session,objects:Checks,recovery:Recovery,engine:Engine,slots:Slots,pools:Pools,power:Power,
     unavailable:Vec<(usize,Error)>,stages:VecDeque<Stage>,retained:Vec<u32>,attempted:Vec<u32>,fail_stops:u32,
+    allow_behind:bool,
 }
 impl Firmware {
     fn mark_class_unavailable(&mut self,class:usize,error:Error){self.unavailable.push((class,error));}
-    // Queuing behind in-flight compute is exercised on hardware; this recorder keeps the
-    // serialized selection and error isolation under test.
-    fn can_queue_behind(&self,_job:&Arc<Job>)->bool{false}
+    fn can_queue_behind(&self,_job:&Arc<Job>)->bool{self.allow_behind}
     fn service_power(&self)->Result{Ok(())}
     fn drain_rings(&mut self)->Result{Ok(())}
     fn check_hangs(&mut self,_done:&mut Completions)->Result{Ok(())}
@@ -139,16 +147,22 @@ impl Firmware {
     }
     // The wire encoder/transport is replaced only at this boundary. The production wrapper,
     // dependency selection and error isolation execute verbatim above and below it.
-    fn publish_prefix_into(&mut self,job:&Arc<Job>,_flight:&mut Flight,visible:&mut bool)->Result{
+    fn publish_prefix_into(&mut self,job:&Arc<Job>,_flight:&mut Flight,visible:&mut bool,pending_rings:&mut u8)->Result{
         self.attempted.push(job.id);
         let stage=self.stages.pop_front().expect("unexpected hardware publication");
         *visible=stage.visible;
         if stage.result.is_ok(){
-            assert!(stage.visible);job.progress.sent.fetch_add(1,Ordering::Relaxed);
+            assert!(stage.visible);
+            let idx=job.progress.sent.fetch_add(1,Ordering::Relaxed);
+            match command(job,idx){
+                Some(Command::Render(()))=>{*pending_rings|=(1<<(Channel::Fs as u8))|(1<<(Channel::Ta as u8));}
+                _=>{*pending_rings|=1<<(Channel::Compute as u8);}
+            }
             self.engine.flights.push(Flight::new(job.clone()));
         }
         stage.result
     }
+    __FLUSH_DOORBELLS__
     __PUBLISH_PREFIX__
     __PUBLISH__
     __PUBLISH_CHECKED__
@@ -160,11 +174,11 @@ fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
         commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false),resources:Resources})
 }
 fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
-    Firmware{session:Session{shared:Shared{sleeping:AtomicBool::new(false)}},objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
+    Firmware{session:Session{shared:Shared{sleeping:AtomicBool::new(false)},rings:vec![],ring_fail:false},objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
         engine:Engine{ordinal:0,draw:0,pending:jobs,flights:vec![],frozen:false,turn:0,stats:Stats::default(),chan_wait:false},
         slots:Slots{compute_exhausted:false,render_exhausted:false,releases:0,quarantines:0},pools:Pools{exhausted:false,exhausted_vm:None},power:Power::default(),
         unavailable:vec![],stages:stages.into_iter().map(|(result,visible)|Stage{result,visible}).collect(),
-        retained:vec![],attempted:vec![],fail_stops:0}
+        retained:vec![],attempted:vec![],fail_stops:0,allow_behind:false}
 }
 #[cfg(test)]mod tests{
     use super::*;
@@ -256,6 +270,48 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         let mut done=vec![];assert_eq!(f.publish(&mut done),Ok(()));
         assert!(done.is_empty());assert!(f.attempted.is_empty());assert_eq!(f.engine.pending.len(),1);assert!(f.power.work.is_empty());
         f.session.shared.sleeping.store(false,Ordering::Relaxed);assert_eq!(f.publish(&mut done),Ok(()));assert_eq!(f.attempted,[1]);
+    }
+    #[test]fn batched_compute_publications_coalesce_to_one_doorbell(){
+        let mut f=firmware(
+            vec![job(1,false,0,Ok(())),job(2,false,0,Ok(())),job(3,false,0,Ok(()))],
+            vec![(Ok(()),true),(Ok(()),true),(Ok(()),true)],
+        );
+        f.allow_behind=true;
+        let mut done=vec![];
+        assert_eq!(f.publish(&mut done),Ok(()));
+        assert_eq!(f.attempted,[1,2,3]);
+        assert_eq!(f.session.rings,[Channel::Compute]);
+        assert_eq!(f.engine.stats.grouped,2);
+    }
+    #[test]fn batched_render_publications_coalesce_in_fs_then_ta_order(){
+        let mut f=firmware(
+            vec![job(1,true,0,Ok(())),job(2,true,0,Ok(()))],
+            vec![(Ok(()),true),(Ok(()),true)],
+        );
+        f.allow_behind=true;
+        let mut done=vec![];
+        assert_eq!(f.publish(&mut done),Ok(()));
+        assert_eq!(f.attempted,[1,2]);
+        assert_eq!(f.session.rings,[Channel::Fs,Channel::Ta]);
+        assert_eq!(f.engine.stats.grouped,1);
+    }
+    #[test]fn batched_doorbell_flushes_after_later_deferral_and_fail_stops_on_ring_error(){
+        let mut f=firmware(
+            vec![job(1,false,0,Ok(())),job(2,false,0,Ok(()))],
+            vec![(Ok(()),true),(Err(EAGAIN),false)],
+        );
+        f.allow_behind=true;
+        let mut done=vec![];
+        assert_eq!(f.publish(&mut done),Ok(()));
+        assert_eq!(f.attempted,[1,2]);
+        assert_eq!(f.session.rings,[Channel::Compute]);
+        assert_eq!(f.fail_stops,0);
+
+        let mut f=firmware(vec![job(1,false,0,Ok(()))],vec![(Ok(()),true)]);
+        f.session.ring_fail=true;
+        let mut done=vec![];
+        assert_eq!(f.publish(&mut done),Err(EIO));
+        assert_eq!(f.fail_stops,1);
     }
 
 }
@@ -386,6 +442,7 @@ for token, declaration in {
     '__PUBLICATION_ERROR__': 'enum PublicationError {',
     '__PICK__': 'fn pick(&self)',
     '__UNPEND__': 'fn unpend(&mut self',
+    '__FLUSH_DOORBELLS__': 'fn flush_doorbells(',
     '__PUBLISH_PREFIX__': 'fn publish_prefix(',
     '__PUBLISH__': 'pub(crate) fn publish(&mut self',
     '__PUBLISH_CHECKED__': 'pub(crate) fn publish_checked(&mut self',
