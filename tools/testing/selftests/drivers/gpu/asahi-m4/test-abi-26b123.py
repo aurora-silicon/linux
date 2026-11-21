@@ -115,6 +115,11 @@ def expect_initdata(old_image):
             after = bytearray(size)
         else:
             after = bytearray(before)
+        if index == GLOBALS:
+            # The M4 Pro 26B123 region C cold-start policy words (no 25G83 position).
+            for at, value in ((0x38, 1), (0x9dc, 50), (0xe0c, 250)):
+                assert not any(after[at:at + 4]), f'GLOBALS +{at:#x}'
+                struct.pack_into('<I', after, at, value)
         for at, value in NEW_26B123.get(index, []):
             assert not any(after[at:at + 8]), f'object {index} +{at:#x}'
             struct.pack_into('<Q', after, at, value)

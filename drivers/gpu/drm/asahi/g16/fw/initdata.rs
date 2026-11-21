@@ -130,6 +130,9 @@ pub(crate) struct Layout {
     pub(crate) pstate_selectors: [usize; 3],
     /// MAIN offset of the u64 size of the host's crash copy buffer, where the build has one.
     pub(crate) coredump_copy: Option<usize>,
+    /// GLOBALS (region C) words of this build that have no 25G83 position, at their own
+    /// offsets: the M4 Pro 26B123 cold-start policy (`g17::fw::initdata::v26b123::RegionCPrefix`).
+    pub(crate) globals_policy: &'static [(usize, u32)],
 }
 
 /// Size of the host's crash copy buffer (`coredump-copy-buffer` in the 27.2 ADT); macOS 27.2
@@ -208,6 +211,7 @@ pub(crate) const V25G83: Layout = Layout {
     },
     pstate_selectors: [0x88, 0x8c, 0x98],
     coredump_copy: None,
+    globals_policy: &[],
 };
 
 /// The 26B123 InitData ABI (macOS 27.2): the same 31 objects and pointers, with
@@ -264,6 +268,10 @@ pub(crate) const V26B123: Layout = Layout {
     // it. The T6041 build pairs 0x8000 there with a dedicated 0x8000 window at +0xfa0, where
     // G16 keeps its RAM retention object.
     coredump_copy: None,
+    // The new u32 at 0x38 and two words in previously reserved fields, as the M4 Pro writes
+    // them on this firmware (linux#1954, on hardware) and as macOS 27.2's InitData on the J773g
+    // holds them. The firmware takes region C into its state when it powers the GPU up.
+    globals_policy: &[(0x38, 1), (0x9dc, 50), (0xe0c, 250)],
 };
 
 /// Runs are ordered, disjoint and land inside an object of `size` bytes.
@@ -784,6 +792,9 @@ pub(crate) fn encode_for(
     }
     for at in layout.pstate_selectors {
         put32(g, at, 100 * ceiling)?;
+    }
+    for &(at, value) in layout.globals_policy {
+        put32(g, at, value)?;
     }
     let runs = layout.main;
     let main = &mut objects[id::MAIN];
