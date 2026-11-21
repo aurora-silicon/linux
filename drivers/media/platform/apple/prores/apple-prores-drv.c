@@ -24,6 +24,7 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
+#include <linux/hrtimer.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
@@ -61,6 +62,8 @@
 #define APR_MAX_PIXELS		0x10000000
 #define APR_TIMEOUT_MS		1000
 #define APR_POLL_MS		4
+/* Completion poll for an engine whose interrupt never arrives. */
+#define APR_FAST_POLL_US	100
 #define APR_AUTOSUSPEND_MS	500
 
 struct apr_fmt {
@@ -998,6 +1001,12 @@ struct apr_variant {
 	/* SCODEC control rows (T6050), applied to "ctrl" after the system rows. */
 	const struct apr_tunable *ctrl_tunables;
 	size_t num_ctrl_tunables;
+	/*
+	 * "core" and "wrapper" come first and every instance has them. The
+	 * SCODEC windows after them ("aux", "ctrl") are mapped only when the
+	 * node names them: an instance outside the SCODEC block has none, and
+	 * its system and control rows are not applied.
+	 */
 	const char *reg_names[4];
 	unsigned int num_regs;
 	unsigned int num_irqs;
@@ -1181,6 +1190,11 @@ struct apr_dev {
 	bool resetting;		/* the watchdog is resetting the engine */
 	unsigned long progress;	/* jiffies of the last start or completion */
 	struct delayed_work watchdog;
+	bool irq_seen;		/* the interrupt line has fired since probe */
+	bool irq_missing;	/* jobs finish, but the line has never fired */
+	bool wrapper_checked;	/* wrapper rows read back once since probe */
+	bool wrapper_recheck;	/* some did not take: check again after a job */
+	struct hrtimer poll;	/* completion poll while irq_missing */
 
 	atomic_t outstanding;	/* jobs not yet given back to vb2 */
 	wait_queue_head_t idle_wq;	/* woken when jobs are given back */
@@ -1232,6 +1246,36 @@ static void apr_apply(void __iomem *base, const struct apr_tunable *t, size_t n)
 	}
 }
 
+/*
+ * Apply rows and read each one back. Returns how many did not read back as
+ * written; with @report, each of those is logged with its value before the
+ * write. Bit 31 is left out of the comparison: the wrapper's 0x000-0x044
+ * rows are written with it set and read it back as 0 on every instance.
+ */
+static unsigned int apr_apply_check(struct apr_dev *apr, void __iomem *base,
+				    const struct apr_tunable *t, size_t n,
+				    bool report)
+{
+	unsigned int bad = 0;
+
+	for (size_t i = 0; i < n; i++) {
+		u32 before = readl_relaxed(base + t[i].offset);
+		u32 want = (before & ~t[i].mask) | (t[i].value & t[i].mask);
+		u32 after;
+
+		writel_relaxed(want, base + t[i].offset);
+		after = readl_relaxed(base + t[i].offset);
+		if (!((after ^ want) & t[i].mask & ~BIT(31)))
+			continue;
+		bad++;
+		if (report)
+			dev_warn(apr->dev,
+				 "wrapper 0x%04x: was 0x%08x, wrote 0x%08x, reads 0x%08x\n",
+				 t[i].offset, before, want, after);
+	}
+	return bad;
+}
+
 static void apr_hw_init(struct apr_dev *apr)
 {
 	const struct apr_variant *v = apr->variant;
@@ -1247,9 +1291,29 @@ static void apr_hw_init(struct apr_dev *apr)
 			  apr->num_tunables[APRI_CONTROL_BLOCK]);
 	apr_apply(apr->regs, apr->tunables[APRI_CORE_BLOCK],
 		  apr->num_tunables[APRI_CORE_BLOCK]);
-	if (apr->wrapper)
-		apr_apply(apr->wrapper, apr->tunables[APRI_WRAPPER_BLOCK],
-			  apr->num_tunables[APRI_WRAPPER_BLOCK]);
+	if (apr->wrapper) {
+		size_t n = apr->num_tunables[APRI_WRAPPER_BLOCK];
+		unsigned int bad;
+
+		/*
+		 * T6041's apr1 (the wrapper outside the SCODEC block) keeps
+		 * 0x338-0x350, 0x430-0x448, 0x948 and 0xa50 at 0 and 0xc00 at
+		 * 0xf after these rows, written once or twice, and its
+		 * interrupt never reaches the AIC. Report the first time a
+		 * wrapper does not take its rows, and check again after a
+		 * completed job, when the block has certainly been clocked.
+		 */
+		bad = apr_apply_check(apr, apr->wrapper,
+				      apr->tunables[APRI_WRAPPER_BLOCK], n,
+				      !apr->wrapper_checked);
+		if (bad && !apr->wrapper_checked) {
+			dev_warn(apr->dev,
+				 "%u of %zu wrapper rows did not take at power-up\n",
+				 bad, n);
+			apr->wrapper_recheck = true;
+		}
+		apr->wrapper_checked = true;
+	}
 	apr_write(apr, APR_REG_RING_HEAD, 0);
 	apr_write(apr, APR_REG_RING_TAIL, 0);
 	apr_write(apr, APR_REG_RING_SIZE, v->ring_bytes);
@@ -1610,15 +1674,25 @@ static struct apr_ctx *apr_take_held(struct apr_dev *apr)
 	return ctx;
 }
 
-static irqreturn_t apr_irq(int irq, void *data)
+/*
+ * Give back the jobs the engine has finished. Runs in hard interrupt context,
+ * from apr_irq() (@irq) and from the completion poll. Returns whether the
+ * engine raised anything. An interrupt proves the line works, so it ends the
+ * poll.
+ */
+static bool apr_service(struct apr_dev *apr, bool irq)
 {
-	struct apr_dev *apr = data;
 	struct apr_job done[APR_MAX_INFLIGHT];
 	struct apr_ctx *held = NULL;
+	unsigned long flags;
 	unsigned int n = 0;
 	bool handled = false, hung;
 
-	spin_lock(&apr->hw_lock);
+	spin_lock_irqsave(&apr->hw_lock, flags);
+	if (irq) {
+		apr->irq_seen = true;
+		apr->irq_missing = false;
+	}
 	/* Registers are only reachable while the engine is powered. */
 	if (apr->ring_ready)
 		handled = apr_take_done(apr, done, &n);
@@ -1626,13 +1700,35 @@ static irqreturn_t apr_irq(int irq, void *data)
 	hung = apr->hung;
 	if (!apr->njobs)
 		cancel_delayed_work(&apr->watchdog);
-	spin_unlock(&apr->hw_lock);
+	else if (apr->irq_missing && !hung)
+		hrtimer_start(&apr->poll, us_to_ktime(APR_FAST_POLL_US),
+			      HRTIMER_MODE_REL);
+	spin_unlock_irqrestore(&apr->hw_lock, flags);
 	if (hung)
 		mod_delayed_work(system_wq, &apr->watchdog, 0);
 	apr_retire(apr, done, n);
 	if (held)
 		v4l2_m2m_job_finish(apr->m2m_dev, held->fh.m2m_ctx);
-	return handled ? IRQ_HANDLED : IRQ_NONE;
+	return handled;
+}
+
+static irqreturn_t apr_irq(int irq, void *data)
+{
+	return apr_service(data, true) ? IRQ_HANDLED : IRQ_NONE;
+}
+
+/*
+ * Completion poll for an engine whose jobs finish but whose interrupt line
+ * has never fired, so it is not held to the watchdog's jiffy-granular poll. The interrupt
+ * stays requested and is served the same way when it does arrive. Every arm
+ * of the timer is an hrtimer_start() under hw_lock (here through
+ * apr_service()), so the timer is never forwarded while someone else has
+ * just started it.
+ */
+static enum hrtimer_restart apr_poll(struct hrtimer *t)
+{
+	apr_service(container_of(t, struct apr_dev, poll), false);
+	return HRTIMER_NORESTART;
 }
 
 /*
@@ -1654,15 +1750,29 @@ static void apr_watchdog(struct work_struct *work)
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		return;
 	}
-	if (apr->ring_ready && apr_take_done(apr, done, &n) && n)
-		dev_warn_once(apr->dev, "completion found without an interrupt\n");
+	/*
+	 * On a working line the watchdog still finds a finished job before its
+	 * interrupt now and then; only a line that has never fired is polled.
+	 */
+	if (apr->ring_ready && apr_take_done(apr, done, &n) && n &&
+	    !apr->irq_seen && !apr->irq_missing) {
+		apr->irq_missing = true;
+		dev_warn(apr->dev,
+			 "jobs finish without an interrupt, polling every %u us\n",
+			 APR_FAST_POLL_US);
+	}
 	if (!apr->hung && (!apr->njobs ||
 			   time_before(jiffies, apr->progress +
 				       msecs_to_jiffies(APR_TIMEOUT_MS)))) {
 		held = apr_take_held(apr);
-		if (apr->njobs)
+		if (apr->njobs) {
 			schedule_delayed_work(&apr->watchdog,
 					      msecs_to_jiffies(APR_POLL_MS));
+			if (apr->irq_missing)
+				hrtimer_start(&apr->poll,
+					      us_to_ktime(APR_FAST_POLL_US),
+					      HRTIMER_MODE_REL);
+		}
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		apr_retire(apr, done, n);
 		if (held)
@@ -1774,8 +1884,19 @@ static void apr_device_run(void *priv)
 		apr_finish_job(apr, ctx, -EIO);
 		return;
 	}
-	if (!apr->ring_ready && !WARN_ON(apr->njobs))
+	if (!apr->ring_ready && !WARN_ON(apr->njobs)) {
 		apr_hw_init(apr);
+	} else if (apr->wrapper_recheck && !apr->njobs) {
+		/* The ring is empty, so the engine is idle and has finished a job. */
+		size_t n = apr->num_tunables[APRI_WRAPPER_BLOCK];
+
+		apr->wrapper_recheck = false;
+		dev_warn(apr->dev,
+			 "%u of %zu wrapper rows did not take after a completed job\n",
+			 apr_apply_check(apr, apr->wrapper,
+					 apr->tunables[APRI_WRAPPER_BLOCK], n,
+					 false), n);
+	}
 	if (WARN_ON(apr_jobs_full(apr->njobs, apr->nencodes) ||
 		    apr_ring_free(apr->done, apr->head, ring_bytes) <= desc_bytes)) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
@@ -1828,6 +1949,9 @@ static void apr_device_run(void *priv)
 	if (hold)
 		apr->held = ctx;
 	schedule_delayed_work(&apr->watchdog, msecs_to_jiffies(APR_POLL_MS));
+	if (apr->irq_missing)
+		hrtimer_start(&apr->poll, us_to_ktime(APR_FAST_POLL_US),
+			      HRTIMER_MODE_REL);
 	spin_unlock_irqrestore(&apr->hw_lock, flags);
 	if (!hold)
 		v4l2_m2m_job_finish(apr->m2m_dev, m2m);
@@ -2585,7 +2709,10 @@ static void apr_cleanup(void *data)
 {
 	struct apr_dev *apr = data;
 
+	/* Each can start the other; nothing is in flight by now. */
+	hrtimer_cancel(&apr->poll);
 	cancel_delayed_work_sync(&apr->watchdog);
+	hrtimer_cancel(&apr->poll);
 	if (apr->m2m_dev)
 		v4l2_m2m_release(apr->m2m_dev);
 	v4l2_device_unregister(&apr->v4l2_dev);
@@ -2669,14 +2796,19 @@ static int apr_probe(struct platform_device *pdev)
 	mutex_init(&apr->vdev_lock);
 	spin_lock_init(&apr->hw_lock);
 	INIT_DELAYED_WORK(&apr->watchdog, apr_watchdog);
+	hrtimer_setup(&apr->poll, apr_poll, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	init_waitqueue_head(&apr->idle_wq);
 	/* The ring always has room for every job the driver keeps in flight. */
 	BUILD_BUG_ON(APR_MAX_INFLIGHT * APR_ENCODE_DESC_BYTES >= APR_RING_BYTES);
 	platform_set_drvdata(pdev, apr);
 
 	for (i = 0; i < apr->variant->num_regs; i++) {
-		regs[i] = devm_platform_ioremap_resource_byname(pdev,
-							     apr->variant->reg_names[i]);
+		const char *name = apr->variant->reg_names[i];
+
+		if (i >= 2 &&
+		    of_property_match_string(dev->of_node, "reg-names", name) < 0)
+			continue;
+		regs[i] = devm_platform_ioremap_resource_byname(pdev, name);
 		if (IS_ERR(regs[i]))
 			return PTR_ERR(regs[i]);
 	}
