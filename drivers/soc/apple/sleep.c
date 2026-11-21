@@ -58,7 +58,9 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
+#include <linux/of_pci.h>
 #include <linux/of_platform.h>
+#include <linux/pci.h>
 #include <linux/percpu.h>
 #include <linux/sched/task_stack.h>
 #include <asm/sections.h>
@@ -961,10 +963,14 @@ struct apple_sleep {
 	void __iomem *apcie_phy;
 	void __iomem *apcie_rc;
 	bool apcie_port_stopped;
+	bool apcie_port2_stopped;
 	/* A real sleep left the radio's port down, until its host sets it up again */
 	bool apcie_port_down;
 	void __iomem *apcie_port;
 	void __iomem *apcie_port_phy;
+	/* Port 2 and its PHY glue, when the host has an enabled pci@2,0, or NULL */
+	void __iomem *apcie_port2;
+	void __iomem *apcie_port2_phy;
 	void __iomem *apcie_engine;
 	void __iomem *apcie_fabric;
 	struct apple_tunable *apcie_axi_tunable;
@@ -1002,6 +1008,9 @@ struct apple_sleep {
 	/* The radio port's PERST# among them, or -1 */
 	int radio_perst;
 	bool radio_perst_low;
+	/* The PERST# of the endpoint on port 2, or -1 */
+	int port2_perst;
+	bool port2_perst_low;
 	bool returned;
 	/* This wake came back down the deep path, not the DRAM-kept one. */
 	bool deep_ran;
@@ -3785,10 +3794,9 @@ EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut_wake);
  * the link untouched. A link that's down or a radio that's gone only makes the poll time
  * out, and the power goes next either way.
  */
-static void sleep_apcie_port_stop(struct apple_sleep *s)
+static void sleep_apcie_port_stop(struct apple_sleep *s, void __iomem *port,
+				  void __iomem *phy, int perst, bool perst_low, bool radio)
 {
-	void __iomem *port = s->apcie_port;
-	void __iomem *phy = s->apcie_port_phy;
 	u32 val;
 
 	writel(readl(port + APCIE_PORT_INTMSK) | APCIE_PORT_INT_LINK, port + APCIE_PORT_INTMSK);
@@ -3801,16 +3809,16 @@ static void sleep_apcie_port_stop(struct apple_sleep *s)
 		readl_poll_timeout_atomic(port + APCIE_PORT_L2, val, !(val & APCIE_PORT_L2_BUSY),
 					  10, APCIE_PORT_STOP_US);
 	}
-	/* The radio keeps its power and firmware, in reset until its host releases it. */
-	if (s->radio_perst >= 0 && sleep_ps_on(s, s->soc->ps.gpio)) {
-		void __iomem *reg = s->pins + PIN_REG(s->radio_perst);
+	/* The endpoint keeps its power, in reset until its host releases it. */
+	if (perst >= 0 && sleep_ps_on(s, s->soc->ps.gpio)) {
+		void __iomem *reg = s->pins + PIN_REG(perst);
 
 		val = readl(reg);
-		writel(s->radio_perst_low ? val & ~PIN_DATA : val | PIN_DATA, reg);
+		writel(perst_low ? val & ~PIN_DATA : val | PIN_DATA, reg);
 	}
 	writel(readl(phy) & ~APCIE_PORT_PHY_LINK, phy);
 
-	if (s->apcie_engine && s->apcie_fabric) {
+	if (radio && s->apcie_engine && s->apcie_fabric) {
 		writel(0, s->apcie_engine + APCIE_ENGINE_IRQ_MASK);
 		writel(3, s->apcie_fabric + APCIE_FABRIC_STOP);
 		writel(readl(s->apcie_engine + APCIE_ENGINE_CTRL) | APCIE_ENGINE_STOP,
@@ -3834,14 +3842,37 @@ static void sleep_apcie_port_stop(struct apple_sleep *s)
 	writel(readl(port + APCIE_PORT_INTSTAT), port + APCIE_PORT_INTSTAT);
 }
 
+/*
+ * The endpoint on port 2, stopped as the radio's port is, so that the block's power doesn't go
+ * with its link up while the endpoint's own rail stays on. Its host trains it again after the
+ * wake. Only a host that describes and enables port 2 has it mapped. A port with its link down
+ * or never clocked is left as it is: the power going takes nothing from it.
+ */
+static void sleep_apcie_port2_stop_once(struct apple_sleep *s)
+{
+	void __iomem *port = s->apcie_port2;
+
+	if (s->apcie_port2_stopped || !port || !s->apcie_port2_phy)
+		return;
+	s->apcie_port2_stopped = true;
+	if (!(readl(port + APCIE_PORT_APPCLK) & APCIE_PORT_APPCLK_EN) ||
+	    !(readl(port + APCIE_PORT_LINKSTS) & APCIE_PORT_LINKSTS_UP))
+		return;
+	sleep_apcie_port_stop(s, port, s->apcie_port2_phy, s->port2_perst, s->port2_perst_low,
+			      false);
+}
+
 static void sleep_apcie_port_stop_once(struct apple_sleep *s)
 {
+	if (!sleep_ps_on(s, s->soc->ps.apcie_gp) || !sleep_ps_on(s, s->soc->ps.apcie_phy_sw))
+		return;
+	sleep_apcie_port2_stop_once(s);
 	/* Only with the port set up, by the loader or by its host after a wake, or it aborts. */
-	if (s->apcie_port_stopped || s->apcie_port_down || !s->apcie_port || !s->apcie_port_phy ||
-	    !sleep_ps_on(s, s->soc->ps.apcie_gp) || !sleep_ps_on(s, s->soc->ps.apcie_phy_sw))
+	if (s->apcie_port_stopped || s->apcie_port_down || !s->apcie_port || !s->apcie_port_phy)
 		return;
 	s->apcie_port_stopped = true;
-	sleep_apcie_port_stop(s);
+	sleep_apcie_port_stop(s, s->apcie_port, s->apcie_port_phy, s->radio_perst,
+			      s->radio_perst_low, true);
 }
 
 /* A poll here only paces the steps: the power goes next whatever it reads. */
@@ -6385,6 +6416,7 @@ static int apple_sleep_begin(suspend_state_t state)
 
 	if (apple_sleep) {
 		apple_sleep->apcie_port_stopped = false;
+		apple_sleep->apcie_port2_stopped = false;
 		apple_sleep->usb_down_ran = false;
 		apple_sleep->smc_woke_alone = false;
 		sleep_pins_save(apple_sleep);
@@ -7160,6 +7192,22 @@ static void __iomem *apple_sleep_apcie_block(struct apple_sleep *s, struct devic
  * Its registers go with PCIe's node, which a test tree may have disabled, and a loader
  * publishes the tunables there. Missing ones only refuse a real sleep with ANS stopped.
  */
+/* Whether the PCIe host @np describes and enables a port at device @slot (a pci@slot,0 child). */
+static bool apple_sleep_apcie_has_port(struct device_node *np, unsigned int slot)
+{
+	struct device_node *port;
+	int devfn;
+
+	for_each_available_child_of_node(np, port) {
+		devfn = of_pci_get_devfn(port);
+		if (devfn >= 0 && PCI_SLOT(devfn) == slot) {
+			of_node_put(port);
+			return true;
+		}
+	}
+	return false;
+}
+
 static void apple_sleep_map_apcie(struct apple_sleep *s)
 {
 	struct device_node *np = of_parse_phandle(s->dev->of_node, "apple,apcie", 0);
@@ -7202,6 +7250,10 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 
 	s->apcie_port = apple_sleep_apcie_block(s, np, "port0", NULL, NULL);
 	s->apcie_port_phy = apple_sleep_apcie_block(s, np, "phy0", NULL, NULL);
+	if (of_device_is_available(np) && apple_sleep_apcie_has_port(np, 2)) {
+		s->apcie_port2 = apple_sleep_apcie_block(s, np, "port2", NULL, NULL);
+		s->apcie_port2_phy = apple_sleep_apcie_block(s, np, "phy2", NULL, NULL);
+	}
 	engine = of_parse_phandle(np, "apple,piodma", 0);
 	if (engine) {
 		s->apcie_engine = apple_sleep_apcie_block(s, engine, "engine", NULL, NULL);
@@ -7211,11 +7263,18 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 	of_node_put(np);
 }
 
-/* The radio port's PERST# on the AP pins @np, from the ports of the SoC's enabled PCIe host. */
+/*
+ * The radio port's PERST# on the AP pins @np, from the radio's own port node (device 0) of the
+ * SoC's enabled PCIe host, and the one of the endpoint on port 2 from that port's node. A port
+ * without the line (released by the port's own PERST register) has none, whatever its sibling
+ * ports carry.
+ */
 static void apple_sleep_find_radio_perst(struct apple_sleep *s, struct device_node *np)
 {
 	struct device_node *host, *port;
 	struct of_phandle_args args;
+	bool usable;
+	int devfn;
 
 	host = of_parse_phandle(s->dev->of_node, "apple,apcie", 0);
 	if (!host)
@@ -7225,10 +7284,15 @@ static void apple_sleep_find_radio_perst(struct apple_sleep *s, struct device_no
 			if (of_parse_phandle_with_args(port, "reset-gpios", "#gpio-cells", 0,
 						       &args))
 				continue;
-			if (args.np == np && args.args_count >= 2 && args.args[0] < s->npins &&
-			    !test_bit(args.args[0], s->pins_skip)) {
+			devfn = of_pci_get_devfn(port);
+			usable = args.np == np && args.args_count >= 2 && args.args[0] < s->npins &&
+				 !test_bit(args.args[0], s->pins_skip) && devfn >= 0;
+			if (usable && PCI_SLOT(devfn) == 0) {
 				s->radio_perst = args.args[0];
 				s->radio_perst_low = args.args[1] & GPIO_ACTIVE_LOW;
+			} else if (usable && PCI_SLOT(devfn) == 2) {
+				s->port2_perst = args.args[0];
+				s->port2_perst_low = args.args[1] & GPIO_ACTIVE_LOW;
 			}
 			of_node_put(args.np);
 		}
@@ -7244,6 +7308,7 @@ static void apple_sleep_map_pins(struct apple_sleep *s)
 	int i, n;
 
 	s->radio_perst = -1;
+	s->port2_perst = -1;
 	if (!np)
 		return;
 	if (!of_device_is_available(np) || of_property_read_u32(np, "apple,npins", &npins) ||
