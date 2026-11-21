@@ -300,3 +300,5 @@
 };
 
 #include "t8132-j773g-atcphy-tunables.dtsi"
+#include "t8132-j773g-usb4.dtsi"
+#include "t8132-j773g-usb4-tunables.dtsi"
