@@ -343,6 +343,13 @@ int main(void)
     /* A controller held in reset has nothing keeping the domain on. */
     a.dwc3_running=false;
     assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
+    /* A port in CIO mode runs under its USB4 router, whose power states stay on. */
+    { enum atcphy_mode m = a.mode; a.mode = APPLE_ATCPHY_MODE_USB4; kept = writes;
+      assert(!atcphy_suspend(&dev) && a.t8132_suspended && a.t8132_common_owned && writes==kept);
+      assert(!atcphy_resume(&dev) && !a.t8132_suspended);
+      pm_suspend_target_state=PM_SUSPEND_MEM;
+      assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
+      pm_suspend_target_state=PM_SUSPEND_TO_IDLE; a.mode = m; }
     pm_suspend_target_state=0;
     assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
     assert(!atcphy_configure_t8132(&a,APPLE_ATCPHY_MODE_OFF));
@@ -429,17 +436,20 @@ int main(void)
 '''
         run(Path(directory), "dwc3-t8132", role_program)
         permissive = program.replace(
-            "(!atcphy->dwc3_running || pm_suspend_target_state != PM_SUSPEND_TO_IDLE)", "false", 1)
+            "(pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||\n\t     !(atcphy->dwc3_running || atcphy_mode_is_cio(atcphy->mode)))", "false", 1)
         assert permissive != program
         run(Path(directory), "suspend-deep-negative-control", permissive, expect_failure=True)
         host_only = program.replace(
-            "(!atcphy->dwc3_running || pm_suspend_target_state", "(!atcphy->host_active || pm_suspend_target_state", 1)
+            "!(atcphy->dwc3_running ||", "!(atcphy->host_active ||", 1)
         assert host_only != program
         run(Path(directory), "suspend-host-only-negative-control", host_only, expect_failure=True)
         no_reset = program.replace(
-            "(!atcphy->dwc3_running || pm_suspend_target_state", "(!atcphy->t8132_ss || pm_suspend_target_state", 1)
+            "!(atcphy->dwc3_running ||", "!(atcphy->t8132_ss ||", 1)
         assert no_reset != program
         run(Path(directory), "suspend-reset-negative-control", no_reset, expect_failure=True)
+        no_cio = program.replace(" || atcphy_mode_is_cio(atcphy->mode))", ")", 1)
+        assert no_cio != program
+        run(Path(directory), "suspend-cio-negative-control", no_cio, expect_failure=True)
         permissive = program.replace(
             "if (atcphy->mode_dirty)\n\t\treturn -EBUSY;", "if (false)\n\t\treturn -EBUSY;", 1)
         assert permissive != program
