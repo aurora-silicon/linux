@@ -126,6 +126,12 @@ def expect_initdata(old_image):
             # The RETENTION object (25G83 MAIN 0xe88) is the zeroed table at RUNTIME 0x2c8.
             assert not any(after[0x2c8:0x2d0])
             after[0x2c8:0x2d0] = old[MAIN][0xe88:0xe90]
+        if index == POWER_PERFORMANCE:
+            # The four u32s inserted at 0x9c (0xa4 = power-up target), as the
+            # M4 Pro writes them on this firmware.
+            for at in (0x9c, 0xa0, 0xa4, 0xa8):
+                assert not any(after[at:at + 4]), f'POWER_PERFORMANCE +{at:#x}'
+                struct.pack_into('<I', after, at, 1)
         for at, value in NEW_26B123.get(index, []):
             assert not any(after[at:at + 8]), f'object {index} +{at:#x}'
             struct.pack_into('<Q', after, at, value)
