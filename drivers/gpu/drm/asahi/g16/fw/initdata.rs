@@ -138,7 +138,55 @@ pub(crate) struct Layout {
     /// POWER_PERFORMANCE (power config) words of this build that have no 25G83 position, at
     /// their own offsets.
     pub(crate) power_policy: &'static [(usize, u32)],
+    /// POWER_PERFORMANCE words derived from the GPU power sample period, where the build has
+    /// them.
+    pub(crate) power_sampling: Option<PowerSampling>,
 }
+
+/// POWER_PERFORMANCE offsets of the words derived from the GPU power sample period.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PowerSampling {
+    /// The period in us, as u32.
+    pub(crate) period: &'static [usize],
+    /// The period in us, as f32.
+    pub(crate) period_f32: usize,
+    /// The power averaging filter of `n` samples over [`AVG_POWER_FILTER_TC_MS`]: u32 `n * 4`,
+    /// f32 `(n - 1) / n` and f32 `1 / n`.
+    pub(crate) filter: [usize; 3],
+}
+
+/// Time constant of the GPU power averaging filter, in ms. macOS 27.2 on the J773g averages
+/// over 29 samples of its 8333 us period and writes 248 to the power config word the 25G83
+/// layout has at 0x2a3c; the machine's ADT gives no such value.
+pub(crate) const AVG_POWER_FILTER_TC_MS: u32 = 248;
+
+/// IEEE-754 single-precision bits of `num / den` for `num` and `den` non-zero, rounded to
+/// nearest, ties to even. The encoder runs where the kernel has no floating point. With 32-bit
+/// inputs every step fits in 64 bits.
+pub(crate) const fn f32_bits(num: u32, den: u32) -> u32 {
+    let (mut n, mut d) = (num as u64, den as u64);
+    let mut exponent: i32 = 0;
+    while n >= 2 * d {
+        d *= 2;
+        exponent += 1;
+    }
+    while n < d {
+        n *= 2;
+        exponent -= 1;
+    }
+    let scaled = n << 23;
+    let (mut mantissa, rest) = (scaled / d, scaled % d);
+    if 2 * rest > d || (2 * rest == d && mantissa & 1 == 1) {
+        mantissa += 1;
+    }
+    if mantissa == 1 << 24 {
+        mantissa >>= 1;
+        exponent += 1;
+    }
+    (((exponent + 127) as u32) << 23) | (mantissa as u32 & 0x7f_ffff)
+}
+const _: () = assert!(f32_bits(28, 29) == 0x3f77_2c23 && f32_bits(1, 29) == 0x3d0d_3dcb);
+const _: () = assert!(f32_bits(8333, 1) == 0x4602_3400 && f32_bits(65536, 1) == 0x4780_0000);
 
 /// Where the RETENTION object (0x4000 zeroed bytes) is published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +278,7 @@ pub(crate) const V25G83: Layout = Layout {
     retention: Retention::Main,
     globals_policy: &[],
     power_policy: &[],
+    power_sampling: None,
 };
 
 /// The 26B123 InitData ABI (macOS 27.2): the same 31 objects and pointers, with
@@ -323,6 +372,13 @@ pub(crate) const V26B123: Layout = Layout {
         (0x2f34, 1),
         (0x6ac8, 1),
     ],
+    // The power sample period and the averaging filter over it, which macOS 27.2 writes on the
+    // J773g as 8333 us and 29 samples.
+    power_sampling: Some(PowerSampling {
+        period: &[0x2b48, 0x2c10],
+        period_f32: 0x2bbc,
+        filter: [0x29e4, 0x29f0, 0x29f8],
+    }),
 };
 
 /// Runs are ordered, disjoint and land inside an object of `size` bytes.
@@ -673,6 +729,9 @@ pub(crate) struct Input {
     pub(crate) ktrace_mask: u32,
     pub(crate) progress_recovery: u32,
     pub(crate) performance: Performance,
+    /// The GPU power sample period in us, from the machine (see `initdata::build`); 0 when it
+    /// gave none, which a layout with [`Layout::power_sampling`] refuses.
+    pub(crate) power_sample_us: u32,
 }
 
 pub(crate) fn object_va(va: u64, size: usize) -> bool {
@@ -961,6 +1020,23 @@ pub(crate) fn encode_for(
     // Last, so that no remapped 25G83 word lands on a word of the build's own.
     for &(at, value) in layout.power_policy {
         put32(p, at, value)?;
+    }
+    if let Some(sampling) = layout.power_sampling {
+        let period = input.power_sample_us;
+        let samples = (AVG_POWER_FILTER_TC_MS * 1000)
+            .checked_div(period)
+            .ok_or(())?;
+        if samples < 2 {
+            return Err(());
+        }
+        for &at in sampling.period {
+            put32(p, at, period)?;
+        }
+        put32(p, sampling.period_f32, f32_bits(period, 1))?;
+        let [count, keep, take] = sampling.filter;
+        put32(p, count, samples * 4)?;
+        put32(p, keep, f32_bits(samples - 1, samples))?;
+        put32(p, take, f32_bits(1, samples))?;
     }
     Ok(())
 }

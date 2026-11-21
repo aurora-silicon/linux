@@ -132,8 +132,10 @@ def expect_initdata(old_image):
             for at, value in ((0x9c, 1), (0xa0, 1), (0xa4, 1), (0xa8, 1), (0xa80, 8),
                               (0xa8c, 0x3f000000), (0xa94, 0x3f000000), (0xa9c, 0x3e3bd7b3),
                               (0xaa8, 0x47800000), (0xaac, 0x3ecf2e49), (0xad8, 0x10),
-                              (0xae0, 0x5dc00), (0x44, 12), (0x84, 1), (0x2b74, 50),
-                              (0x2f34, 1), (0x6ac8, 1)):
+                              (0xae0, 0x5dc00), (0x44, 12), (0x84, 1), (0x29e4, 116),
+                              (0x29f0, 0x3f772c23), (0x29f8, 0x3d0d3dcb), (0x2b74, 50),
+                              (0x2b48, 8333), (0x2bbc, 0x46023400), (0x2c10, 8333), (0x2f34, 1),
+                              (0x6ac8, 1)):
                 assert not any(after[at:at + 4]), f'POWER_PERFORMANCE +{at:#x}'
                 struct.pack_into('<I', after, at, value)
         for at, value in NEW_26B123.get(index, []):

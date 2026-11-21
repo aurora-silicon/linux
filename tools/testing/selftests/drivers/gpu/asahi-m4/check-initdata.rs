@@ -24,6 +24,8 @@ fn input(variant: u64) -> initdata::Input {
         lower_parameter: 0x7000240000,
         ktrace_mask: [0, 0x12345678, 0xfedcba98][variant as usize],
         progress_recovery: u32::from(variant != 1),
+        // The J773g ADT's 200000 counter ticks at 24 MHz; 25G83 does not use it.
+        power_sample_us: 8333,
     };
     for (i, loader) in initdata::LOADERS.iter().enumerate() {
         if loader.length != 0 {

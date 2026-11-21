@@ -65,6 +65,8 @@ fn input() -> wire::Input {
         lower_parameter: wire::BOOTSTRAP_START + 0x240000,
         ktrace_mask: 0x12345678,
         progress_recovery: 1,
+        // The J773g ADT's 200000 counter ticks at 24 MHz.
+        power_sample_us: 8333,
     }
 }
 

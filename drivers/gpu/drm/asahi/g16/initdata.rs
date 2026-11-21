@@ -9,6 +9,7 @@ use kernel::{device, prelude::*, sync::Arc};
 
 use super::adt::GpuAdt;
 use super::board;
+use super::boot::glue;
 use super::channel::{Channels, Ring};
 use super::fw::initdata::{self as wire, id, ready_control};
 use super::hw::{self, FwAbi};
@@ -154,8 +155,23 @@ pub(crate) fn build(
         // The host never posts on this firmware-only control channel.
         pair(&graph, id::FWCTL, id::FWCTL),
     )?;
+    // The GPU power sample period: the ADT's ticks of the system counter, in us.
+    let power_sample_us = adt
+        .performance
+        .power_sample_clks
+        .and_then(|clks| (clks as u64 * 1_000_000).checked_div(glue::timebase_hz() as u64))
+        .and_then(|us| u32::try_from(us).ok())
+        .unwrap_or(0);
+    if layout.power_sampling.is_some() && power_sample_us == 0 {
+        dev_err!(
+            dev,
+            "G16: the ADT gives no GPU power sample period (gpu-pwr-sample-period-aic-clks)\n"
+        );
+        return Err(EINVAL);
+    }
     let mut input = wire::Input {
         performance,
+        power_sample_us,
         va: [0; wire::OBJECT_COUNT],
         channel_state: [0; 12],
         channel_ring: [0; 12],

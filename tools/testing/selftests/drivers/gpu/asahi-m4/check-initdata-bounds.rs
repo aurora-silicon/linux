@@ -19,7 +19,7 @@ fn input()->wire::Input {
         channel_ring:core::array::from_fn(|i|HOST+0x4004000+i as u64*0x10000),
         loader_va:core::array::from_fn(|i|if wire::LOADERS[i].length!=0 {HOST+0x5000000+i as u64*0x100000+(wire::LOADERS[i].pa&0x3fff)}else{0}),
         scratch:HOST+0xa000000,lower_uma:wire::BOOTSTRAP_START+0x200000,
-        lower_parameter:wire::BOOTSTRAP_START+0x240000,ktrace_mask:0,progress_recovery:1,
+        lower_parameter:wire::BOOTSTRAP_START+0x240000,ktrace_mask:0,progress_recovery:1,power_sample_us:8333,
     }
 }
 fn init_result(buffers:&mut[Vec<u8>;wire::OBJECT_COUNT], input:&wire::Input, ceiling:u32)->Result<(),()> {

@@ -49,6 +49,7 @@ pub(crate) mod glue {
         fn asahi_g16_board() -> bool;
         fn asahi_g16_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         fn asahi_g16_perf_rows() -> core::ffi::c_uint;
+        fn asahi_g16_timebase_hz() -> u32;
         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
         fn asahi_g16_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
@@ -76,6 +77,12 @@ pub(crate) mod glue {
     pub(crate) fn display_prepare(dev: &device::Device) -> Result {
         // SAFETY: `dev` is the bound GPU device; the helper only adds a device link.
         kernel::error::to_result(unsafe { asahi_g16_display_prepare(dev.as_raw().cast()) })
+    }
+
+    /// The system counter frequency in Hz, as the boot loader programmed it.
+    pub(crate) fn timebase_hz() -> u32 {
+        // SAFETY: Reads the system counter frequency register only.
+        unsafe { asahi_g16_timebase_hz() }
     }
 
     /// The firmware DVFS row count qualified for this board.

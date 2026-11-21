@@ -4,6 +4,7 @@
  * and macros. The module pin is retain.c's. Built only with CONFIG_DRM_ASAHI_G16.
  */
 #include <linux/device.h>
+#include <asm/arch_timer.h>
 #include <linux/atomic.h>
 #include <linux/dma-map-ops.h>
 #include <linux/io.h>
@@ -216,6 +217,15 @@ bool asahi_g16_board(void)
 unsigned int asahi_g16_perf_rows(void)
 {
 	return of_machine_is_compatible("apple,j773g") ? 11 : 10;
+}
+
+/*
+ * The system counter frequency the boot loader programmed, in Hz: the clock the
+ * ADT counts GPU power sample periods in.
+ */
+u32 asahi_g16_timebase_hz(void)
+{
+	return arch_timer_get_cntfrq();
 }
 
 /*
