@@ -1191,6 +1191,8 @@ struct apr_dev {
 	unsigned long progress;	/* jiffies of the last start or completion */
 	struct delayed_work watchdog;
 	bool irq_missing;	/* a job finished without its interrupt */
+	bool wrapper_checked;	/* wrapper rows read back once since probe */
+	bool wrapper_recheck;	/* some did not take: check again after a job */
 	struct hrtimer poll;	/* completion poll while irq_missing */
 
 	atomic_t outstanding;	/* jobs not yet given back to vb2 */
@@ -1243,6 +1245,36 @@ static void apr_apply(void __iomem *base, const struct apr_tunable *t, size_t n)
 	}
 }
 
+/*
+ * Apply rows and read each one back. Returns how many did not read back as
+ * written; with @report, each of those is logged with its value before the
+ * write. Bit 31 is left out of the comparison: the wrapper's 0x000-0x044
+ * rows are written with it set and read it back as 0 on every instance.
+ */
+static unsigned int apr_apply_check(struct apr_dev *apr, void __iomem *base,
+				    const struct apr_tunable *t, size_t n,
+				    bool report)
+{
+	unsigned int bad = 0;
+
+	for (size_t i = 0; i < n; i++) {
+		u32 before = readl_relaxed(base + t[i].offset);
+		u32 want = (before & ~t[i].mask) | (t[i].value & t[i].mask);
+		u32 after;
+
+		writel_relaxed(want, base + t[i].offset);
+		after = readl_relaxed(base + t[i].offset);
+		if (!((after ^ want) & t[i].mask & ~BIT(31)))
+			continue;
+		bad++;
+		if (report)
+			dev_warn(apr->dev,
+				 "wrapper 0x%04x: was 0x%08x, wrote 0x%08x, reads 0x%08x\n",
+				 t[i].offset, before, want, after);
+	}
+	return bad;
+}
+
 static void apr_hw_init(struct apr_dev *apr)
 {
 	const struct apr_variant *v = apr->variant;
@@ -1258,9 +1290,29 @@ static void apr_hw_init(struct apr_dev *apr)
 			  apr->num_tunables[APRI_CONTROL_BLOCK]);
 	apr_apply(apr->regs, apr->tunables[APRI_CORE_BLOCK],
 		  apr->num_tunables[APRI_CORE_BLOCK]);
-	if (apr->wrapper)
-		apr_apply(apr->wrapper, apr->tunables[APRI_WRAPPER_BLOCK],
-			  apr->num_tunables[APRI_WRAPPER_BLOCK]);
+	if (apr->wrapper) {
+		size_t n = apr->num_tunables[APRI_WRAPPER_BLOCK];
+		unsigned int bad;
+
+		/*
+		 * T6041's apr1 (the wrapper outside the SCODEC block) keeps
+		 * 0x338-0x350, 0x430-0x448, 0x948 and 0xa50 at 0 and 0xc00 at
+		 * 0xf after these rows, written once or twice, and its
+		 * interrupt never reaches the AIC. Report the first time a
+		 * wrapper does not take its rows, and check again after a
+		 * completed job, when the block has certainly been clocked.
+		 */
+		bad = apr_apply_check(apr, apr->wrapper,
+				      apr->tunables[APRI_WRAPPER_BLOCK], n,
+				      !apr->wrapper_checked);
+		if (bad && !apr->wrapper_checked) {
+			dev_warn(apr->dev,
+				 "%u of %zu wrapper rows did not take at power-up\n",
+				 bad, n);
+			apr->wrapper_recheck = true;
+		}
+		apr->wrapper_checked = true;
+	}
 	apr_write(apr, APR_REG_RING_HEAD, 0);
 	apr_write(apr, APR_REG_RING_TAIL, 0);
 	apr_write(apr, APR_REG_RING_SIZE, v->ring_bytes);
@@ -1822,8 +1874,19 @@ static void apr_device_run(void *priv)
 		apr_finish_job(apr, ctx, -EIO);
 		return;
 	}
-	if (!apr->ring_ready && !WARN_ON(apr->njobs))
+	if (!apr->ring_ready && !WARN_ON(apr->njobs)) {
 		apr_hw_init(apr);
+	} else if (apr->wrapper_recheck && !apr->njobs) {
+		/* The ring is empty, so the engine is idle and has finished a job. */
+		size_t n = apr->num_tunables[APRI_WRAPPER_BLOCK];
+
+		apr->wrapper_recheck = false;
+		dev_warn(apr->dev,
+			 "%u of %zu wrapper rows did not take after a completed job\n",
+			 apr_apply_check(apr, apr->wrapper,
+					 apr->tunables[APRI_WRAPPER_BLOCK], n,
+					 false), n);
+	}
 	if (WARN_ON(apr_jobs_full(apr->njobs, apr->nencodes) ||
 		    apr_ring_free(apr->done, apr->head, ring_bytes) <= desc_bytes)) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
