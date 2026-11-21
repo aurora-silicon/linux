@@ -29,7 +29,9 @@ static int tb_cio_check_topology(struct tb_switch *sw, bool wake)
 /*
  * A host at the other end of a link (an XDomain, such as a host-to-host cable to another
  * Mac) owns its half of it, which the router's power cycle cannot keep: release it as an
- * unplug does, its service drivers and paths with it. The wake's rescan finds it again.
+ * unplug does, its service drivers and paths with it. Nothing finds it again after the
+ * wake: the link does not train back without a plug event (both routers stay in lane
+ * init), so the peer returns only with a replug or a reboot.
  */
 static void tb_cio_release_xdomains(struct tb *tb, struct tb_switch *sw)
 {
@@ -92,7 +94,10 @@ int tb_cio_sleep_prepare(struct tb *tb)
 		if (ret)
 			goto out;
 	}
-	/* Past the last refusal here: a later one's complete rescans, and finds them again. */
+	/*
+	 * Past the last refusal here. A tunnel's prepare can still fail below: the peers stay
+	 * released then too, as after an unplug.
+	 */
 	tb_cio_release_xdomains(tb, tb->root_switch);
 	tcm->hotplug_active = false;
 	tcm->cio_prepared = true;
