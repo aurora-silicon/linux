@@ -26,6 +26,7 @@ properties:
               - apple,t8132-wdt
               - apple,t8140-wdt
               - apple,t8142-wdt
+              - apple,t8152-wdt
           - const: apple,t8103-wdt
       - items:
           - enum:
