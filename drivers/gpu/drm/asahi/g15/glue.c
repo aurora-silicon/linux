@@ -29,9 +29,6 @@ void asahi_g15_release_power(struct device *dev);
 void asahi_g15_reprobe(void);
 void asahi_g15_report_loader_gpu(void);
 int asahi_g15_adt_phram(u64 *start, u64 *size);
-bool asahi_g15_ram_disjoint(u64 start, u64 size);
-bool asahi_g15_ram_within(u64 start, u64 size);
-unsigned int asahi_g15_memory_mode(u64 start, u64 size);
 void __iomem *asahi_g15_ioremap_wc(u64 start, size_t size);
 bool asahi_g15_dma_coherent(struct device *dev);
 int asahi_g15_pmp_prepare(struct device *dev);
@@ -55,6 +52,7 @@ void asahi_g15_report_loader_gpu(void)
 		const char *compatible;
 	} socs[] = {
 		{ "asahi,t6031-gpu", "apple,agx-t6031" },
+		{ "asahi,t6034-gpu", "apple,agx-t6034" },
 		{ "asahi,t6030-gpu", "apple,agx-t6030" },
 	};
 	struct device_node *chosen, *np;
@@ -145,7 +143,7 @@ int asahi_g15_pmp_prepare(struct device *dev)
 }
 
 /*
- * T6031 has no PMP vote, but its first firmware start follows the native
+ * T6031/T6034 have no PMP vote, but its first firmware start follows the native
  * display as T6030's does: defer until that display is up. The display can
  * be off for this boot (no handoff, or not requested), so say once why. An
  * enabled display that is not published yet is said once too: if it never
@@ -155,18 +153,36 @@ int asahi_g15_pmp_prepare(struct device *dev)
 int asahi_g15_display_prepare(struct device *dev)
 {
 	struct device_node *np;
+	const char *compatible, *name;
 	int ret;
 
-	if (!dev->of_node || !of_device_is_compatible(dev->of_node, "apple,agx-t6031"))
+	if (!dev->of_node)
 		return -ENODEV;
-	ret = apple_drm_t6031_link_device(dev);
+	if (of_device_is_compatible(dev->of_node, "apple,agx-t6031")) {
+		compatible = "apple,t6031-display-subsystem";
+		name = "T6031";
+		ret = apple_drm_t6031_link_device(dev);
+	} else if (of_device_is_compatible(dev->of_node, "apple,agx-t6034")) {
+		compatible = of_machine_is_compatible("apple,j516m") ?
+			"apple,t6031-display-subsystem" : "apple,t6034-display-subsystem";
+		name = "T6034";
+		ret = apple_drm_t6034_link_device(dev);
+	} else {
+		return -ENODEV;
+	}
 	if (ret != -EPROBE_DEFER)
 		return ret;
-	np = of_find_compatible_node(NULL, NULL, "apple,t6031-display-subsystem");
+
+	np = of_find_compatible_node(NULL, NULL, compatible);
 	if (!np || !of_device_is_available(np))
-		dev_info_once(dev, "G15: waiting for the T6031 native display, which this boot did not enable (it needs the boot loader's display handoff, and apple_t6031_display.enable=1 except on the J516C)\n");
+		dev_info_once(dev,
+			      "G15: waiting for the %s native display, which this boot did not enable (it needs the boot loader's display handoff, and an admitted native-display board)\n",
+			      name);
 	else
-		dev_info_once(dev, "G15: waiting for the T6031 native display to come up: the GPU firmware starts only after the display is published\n");
+		dev_info_once(dev,
+			      "G15: waiting for the %s native display to come up: the GPU firmware starts only after the display is published\n",
+			      name);
+
 	of_node_put(np);
 	return ret;
 }
@@ -275,13 +291,6 @@ int asahi_g15_adt_phram(u64 *start, u64 *size)
 	return 0;
 }
 
-/* The range is disjoint from System RAM (ADT region admission). */
-bool asahi_g15_ram_disjoint(u64 start, u64 size)
-{
-	return region_intersects(start, size, IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE) ==
-	       REGION_DISJOINT;
-}
-
 /*
  * Whether DMA mappings of the device skip cache maintenance. The G15 firmware
  * objects rely on the DMA mapping cleaning their pages to the point of
@@ -290,42 +299,6 @@ bool asahi_g15_ram_disjoint(u64 start, u64 size)
 bool asahi_g15_dma_coherent(struct device *dev)
 {
 	return dev_is_dma_coherent(dev);
-}
-
-/*
- * Every page must be valid, System RAM and still reserved from the allocator.
- * REGION_INTERSECTS alone also accepts RAM mixed with undefined memory holes.
- */
-bool asahi_g15_ram_within(u64 start, u64 size)
-{
-	u64 end, pa;
-
-	if (!size || !IS_ALIGNED(start, PAGE_SIZE) ||
-	    !IS_ALIGNED(size, PAGE_SIZE) || check_add_overflow(start, size, &end))
-		return false;
-	for (pa = start; pa < end; pa += PAGE_SIZE) {
-		unsigned long pfn = PHYS_PFN(pa);
-
-		if (!pfn_valid(pfn) || !page_is_ram(pfn) ||
-		    !PageReserved(pfn_to_page(pfn)))
-			return false;
-	}
-	return true;
-}
-
-/* One classification for every adopted-UAT and firmware-region CPU mapping. */
-unsigned int asahi_g15_memory_mode(u64 start, u64 size)
-{
-	u64 end;
-
-	if (!size || !IS_ALIGNED(start, PAGE_SIZE) ||
-	    !IS_ALIGNED(size, PAGE_SIZE) || check_add_overflow(start, size, &end))
-		return 0;
-	if (asahi_g15_ram_within(start, size))
-		return MEMREMAP_WB;
-	if (asahi_g15_ram_disjoint(start, size))
-		return MEMREMAP_WC;
-	return 0;
 }
 
 /* The inherited RTKit buffer inside firmware DATA. */

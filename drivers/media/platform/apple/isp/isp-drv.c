@@ -894,6 +894,18 @@ static int apple_isp_probe(struct platform_device *pdev)
 	/* the sensor connection layout, for firmware that takes it at boot */
 	of_property_read_u32(dev->of_node, "apple,cam-connections-scheme",
 			     &isp->cam_connections_scheme);
+	/*
+	 * M3 MacBook Air firmware 14.7 stalls capture with temporal filter 1.
+	 * The J615 has the J613's sensor and ISP configuration; only the J613
+	 * has been tested.
+	 */
+	if ((of_machine_is_compatible("apple,j613") ||
+	     of_machine_is_compatible("apple,j615")) &&
+	    isp->fw_compat == ISP_FIRMWARE_V_14_7 &&
+	    isp->temporal_filter == 1) {
+		dev_info(dev, "using temporal filter 0 on M3 Air firmware 14.7\n");
+		isp->temporal_filter = 0;
+	}
 
 	err = apple_isp_init_presets(isp);
 	if (err) {
@@ -1187,7 +1199,7 @@ static const struct apple_isp_hw apple_isp_hw_t6020 = {
 
 static const struct apple_isp_hw apple_isp_hw_t8122 = {
 	.gen = ISP_GEN_T8112,
-	.pmu_base = 0x2d07040000,
+	.pmu_base = 0x2d0704000,
 
 	.dsid_count = 1,
 	.dsid_clr_base0 = 0x2221c4000,

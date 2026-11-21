@@ -19,6 +19,8 @@ struct dcp_v14_board {
 	const char *dcp_compatible;
 	/* The machine compatible; NULL for any machine with this DCP. */
 	const char *machine;
+	/* Optional additional root SoC restriction. */
+	const char *soc;
 	/* The firmware image whose layouts were tested on this board. */
 	const char *firmware_uuid;
 	/* Set to <1> by the boot loader on the DCP, display and PIODMA nodes. */
@@ -48,6 +50,11 @@ struct dcp_v14_board {
 	bool swap_timestamps;
 	/* This board has a qualified panel level block; machine admission is separate. */
 	bool panel_nits;
+	/*
+	 * The panel gets a base EDID (make, model and size) built from its
+	 * device-tree node, as the firmware gives none.
+	 */
+	bool base_edid;
 };
 
 /* Whether the DCP node or the machine (as @ctx gives them) has @compat. */

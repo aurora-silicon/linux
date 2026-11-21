@@ -693,6 +693,44 @@ static int apple_pmp_report_wait_t6030_14(struct device *supplier, unsigned int 
 	return ret;
 }
 
+/*
+ * The T8122 (M3 MacBook Air) GPU on its 14.8.3 firmware, for the M3 runtime
+ * (APPLE_T8122_GPU_PMP_LINK): the unique T8122 report linked to this PMP, and
+ * its display request (DISP, reg 7) READY and acknowledged before AGX, as on
+ * the 7.1.12 kernel that runtime was qualified with.
+ */
+static int apple_pmp_report_wait_t8122_14(struct device *supplier, unsigned int timeout_ms)
+{
+	struct device_node *np, *report = NULL, *pmp, *entry;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_APPLE_T8122_GPU_PMP_LINK) ||
+	    !of_machine_is_compatible("apple,t8122") ||
+	    !of_device_is_compatible(supplier->of_node, "apple,t8122-pmp-v2"))
+		return -ENODEV;
+	for_each_compatible_node(np, NULL, "apple,t8122-pmp-v2-report") {
+		if (report) {
+			of_node_put(np);
+			of_node_put(report);
+			return -ENODEV;
+		}
+		report = of_node_get(np);
+	}
+	if (!report || !of_device_is_available(report) ||
+	    of_property_count_u32_elems(report, "apple,pmp") != 1) {
+		of_node_put(report);
+		return -ENODEV;
+	}
+	pmp = of_parse_phandle(report, "apple,pmp", 0);
+	entry = apple_pmp_report_t6030_entry(report);
+	ret = pmp == supplier->of_node && entry ?
+		apple_pmp_report_wait_ready(entry, msecs_to_jiffies(timeout_ms)) : -ENODEV;
+	of_node_put(entry);
+	of_node_put(pmp);
+	of_node_put(report);
+	return ret;
+}
+
 /* The native 25G83 PMP starts through its supplier topology, after requests
  * are seeded. Its report is pinned against removal while readiness is read.
  */
@@ -707,8 +745,11 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 	int ret;
 
 	/* A declared report always takes the existing native25 path below. */
-	if (!np && !of_property_present(supplier->of_node, "apple,pmp-report"))
+	if (!np && !of_property_present(supplier->of_node, "apple,pmp-report")) {
+		if (of_machine_is_compatible("apple,t8122"))
+			return apple_pmp_report_wait_t8122_14(supplier, timeout_ms);
 		return apple_pmp_report_wait_t6030_14(supplier, timeout_ms);
+	}
 	if (!np || !of_device_is_compatible(np, t8132 ?
 		"apple,t8132-pmp-v2-report" : "apple,j613-25g83-pmp-report")) {
 		of_node_put(np);
@@ -1234,10 +1275,18 @@ static void apple_pmp_start_finish(struct apple_pmp_start *st, int result)
 			st->result = result;
 		complete_all(&st->started);
 	}
-	if (result && READ_ONCE(st->enabled))
+	if (result && READ_ONCE(st->enabled)) {
+		const char *fallback = st->rep->offsets->fallback;
+
+		/* J516M shares the T6031 report layout, but has its own display gate. */
+		if (of_machine_is_compatible("apple,t6034") &&
+		    of_machine_is_compatible("apple,j516m"))
+			fallback = "apple_t6034_display.enable=0";
+
 		dev_err(st->rep->dev,
 			"%s PMP start failed (%d) after the PMP was enabled: it may keep running until the next reboot. Reboot to stop it; to boot without starting it: %s, or nomodeset\n",
-			st->rep->offsets->name, result, st->rep->offsets->fallback);
+			st->rep->offsets->name, result, fallback);
+	}
 }
 
 /* Teardown has begun: a start still in progress gives up early. */
@@ -2594,7 +2643,26 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6031 = {
 	.status = 0x10,
 	.starts_pmp = true,
 	.name = "T6031",
-	.fallback = "leave out apple_t6031_display.enable=1",
+	.fallback = "apple_t6031_display.enable=0",
+	.pwrstate = "apple,t6031-pmgr-pwrstate",
+	.devices_ordered = true,
+};
+
+/*
+ * J514M/T6034's selected ADT ptd-range has the same request (index 0x200),
+ * acknowledge (0x208) and status (0x1) apertures. Its 35 soc-device records
+ * are in ID order; DISP is ID 17 with ACK and ANS is ID 34 without ACK.
+ * The exact T6034 display gate supplies the halted PMP and validated values.
+ * The generic T6020 fallback only observes an already-running PMP.
+ */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t6034 = {
+	.tgt_read = 0x2000,
+	.tgt_write = 0x11000,
+	.actual = 0x2080,
+	.status = 0x10,
+	.starts_pmp = true,
+	.name = "T6034",
+	.fallback = "apple_t6034_display.enable=0",
 	.pwrstate = "apple,t6031-pmgr-pwrstate",
 	.devices_ordered = true,
 };
@@ -2647,6 +2715,7 @@ static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,t6041-pmp-v2-report", .data = &apple_pmp_offsets_t6041 },
 	/* T6050: the ADT's ptd-range lists T6041's entries at the same places. */
 	{ .compatible = "apple,t6050-pmp-v2-report", .data = &apple_pmp_offsets_t6041 },
+	{ .compatible = "apple,t6034-pmp-v2-report", .data = &apple_pmp_offsets_t6034 },
 	{ .compatible = "apple,t8112-pmp-v2-report", .data = &apple_pmp_offsets_t8112 },
 	{ .compatible = "apple,t8122-pmp-v2-report", .data = &apple_pmp_offsets_t8122 },
 	{ .compatible = "apple,t8132-pmp-v2-report", .data = &apple_pmp_offsets_t8132 },
