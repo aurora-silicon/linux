@@ -124,6 +124,15 @@ void apple_sleep_note_sub(u8 step);
 void apple_sleep_usb_set_asleep(bool asleep);
 
 /*
+ * J714s: called at T6050's .prepare_late (no other SoC calls it), after every device's noirq suspend (the USB PHYs'
+ * stops) and before the SMC's scope, with whether a USB host sleeps in place: macOS arms a
+ * USB-C port controller's USB wake right after its PHY has stopped.
+ */
+struct notifier_block;
+int apple_sleep_usb_asleep_notifier_register(struct notifier_block *nb);
+void apple_sleep_usb_asleep_notifier_unregister(struct notifier_block *nb);
+
+/*
  * The USB host is up, as macOS's USB_SLP_DDR vote has it: from the host's start to its stop,
  * awake and asleep. It sets bit 0 of the wake block's word 0 for every sleep in between.
  */
@@ -318,6 +327,16 @@ static inline bool apple_sleep_commit_stops_coprocs(void)
 }
 
 static inline void apple_sleep_usb_set_asleep(bool asleep)
+{
+}
+
+struct notifier_block;
+static inline int apple_sleep_usb_asleep_notifier_register(struct notifier_block *nb)
+{
+	return 0;
+}
+
+static inline void apple_sleep_usb_asleep_notifier_unregister(struct notifier_block *nb)
 {
 }
 

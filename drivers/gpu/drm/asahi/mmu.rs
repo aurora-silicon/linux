@@ -236,8 +236,8 @@ pub(crate) struct UatQuirks {
     /// Keep the shared pool window and the client-private window at their original split
     /// (`hw::t8140::dynamic::LOWER`, `CLIENT_LOWER`) instead of the A18 Pro's
     /// (`WIDE_LOWER`, `WIDE_CLIENT_LOWER`), which holds the render pools of every execution
-    /// context at once. The M4 Pro/Max could also use the wider pool window, for its larger
-    /// compute pools.
+    /// context at once. The M4 Max uses the wider pool window too: with 40 cores its compute
+    /// pools outgrow the largest free range of the narrow one. The M4 Pro could too.
     pub(crate) narrow_pool_window: bool,
 }
 
