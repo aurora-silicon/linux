@@ -4573,8 +4573,9 @@ static void __apple_dart_fw_live_prot(struct apple_dart_master_cfg *cfg, struct 
 	const int mask = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE;
 	struct iommu_resv_region *region;
 	struct apple_dart *dart;
+	phys_addr_t table;
+	u64 *root, span, base;
 	size_t entries;
-	u64 *root;
 	u32 ttbr;
 	int sid;
 
@@ -4599,9 +4600,16 @@ static void __apple_dart_fw_live_prot(struct apple_dart_master_cfg *cfg, struct 
 	ttbr &= ~dart->hw->ttbr_valid;
 	if (dart->hw->ttbr_addr_field_shift)
 		ttbr >>= dart->hw->ttbr_addr_field_shift;
-	root = memremap(((phys_addr_t)ttbr) << dart->hw->ttbr_shift, dart->pgsize, MEMREMAP_WB);
+	table = ((phys_addr_t)ttbr) << dart->hw->ttbr_shift;
+	/* Only a firmware table in reserved RAM is mapped write-back, as elsewhere. */
+	if (!apple_dart_fw_table_ram(dart, table))
+		return;
+	root = memremap(table, dart->pgsize, MEMREMAP_WB);
 	if (!root)
 		return;
+	/* A three-level root walks one span of the stream's window (DVA bits 14..35). */
+	span = BIT_ULL(ilog2(dart->pgsize) + 2 * ilog2(entries));
+	base = READ_ONCE(dart->locked_window[sid]) & ~(span - 1);
 
 	list_for_each_entry(region, head, list) {
 		u64 *leaf = NULL;
@@ -4610,6 +4618,10 @@ static void __apple_dart_fw_live_prot(struct apple_dart_master_cfg *cfg, struct 
 
 		if (region->type != IOMMU_RESV_TRANSLATED || !region->length ||
 		    !IS_ALIGNED(region->dva | region->start | region->length, dart->pgsize))
+			continue;
+		/* Outside the window the slot bits would alias another region's leaves. */
+		if (region->dva < base || region->length > span ||
+		    region->dva - base > span - region->length)
 			continue;
 		for (u64 off = 0; off < region->length; off += dart->pgsize) {
 			u64 dva = region->dva + off;	/* bits 14..35: the 1 TiB base drops out */
@@ -4622,9 +4634,8 @@ static void __apple_dart_fw_live_prot(struct apple_dart_master_cfg *cfg, struct 
 			if (slot != mapped_slot) {
 				if (leaf)
 					memunmap(leaf);
-				leaf = (entry & APPLE_DART_PTE_VALID) ?
-				       memremap(apple_dart_pte_to_paddr(dart, entry), dart->pgsize,
-						MEMREMAP_WB) : NULL;
+				leaf = apple_dart_fw_table_decode(dart, entry, &table) ?
+				       memremap(table, dart->pgsize, MEMREMAP_WB) : NULL;
 				mapped_slot = slot;
 			}
 			if (!leaf ||
@@ -5457,17 +5468,20 @@ static bool apple_dart_np_is_iommu_of(const struct device_node *consumer,
 }
 
 /*
- * Whether @dart_np serves an available T8132 external display processor the
- * boot loader handed over with the 27.2 image (apple_t8132_dcpext_v27_2()):
- * its firmware DART (the processor's iommus) or its display DART (its PIODMA's).
+ * Whether @dart_np serves an available display processor compatible with
+ * @compat that the boot loader handed over with the 27.2 image (@v27_2): its
+ * firmware DART (the processor's iommus) or its display DART (its PIODMA's).
+ * The DART is keyed on the handoff of the processor that uses it, not on its
+ * address or on the board.
  */
-static bool apple_dart_serves_t8132_dcpext_v27(const struct device_node *dart_np)
+static bool apple_dart_serves_v27_dcp(const struct device_node *dart_np, const char *compat,
+				      bool (*v27_2)(const struct device_node *np))
 {
 	struct device_node *np, *child;
 	bool serves = false;
 
-	for_each_compatible_node(np, NULL, "apple,t8132-dcpext") {
-		if (serves || !of_device_is_available(np) || !apple_t8132_dcpext_v27_2(np))
+	for_each_compatible_node(np, NULL, compat) {
+		if (serves || !of_device_is_available(np) || !v27_2(np))
 			continue;
 		serves = apple_dart_np_is_iommu_of(np, dart_np);
 		for_each_child_of_node(np, child)
@@ -5509,10 +5523,12 @@ static int apple_dart_probe(struct platform_device *pdev)
 	 * (fw_mirror below). The borrowed path admits only the 26.6.2 layout
 	 * and reserves its whole SID23 window from generic DMA.
 	 */
-	if (j713_display && apple_t8132_internal_dcp_v27_2()) {
+	j713_display_v27 = res && !tunneled &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		apple_dart_serves_v27_dcp(dev->of_node, "apple,t8132-dcp",
+					  apple_t8132_dcp_v27_2);
+	if (j713_display_v27)
 		j713_display = false;
-		j713_display_v27 = true;
-	}
 	/* The external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
 	j713_dcpext = res && !tunneled && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
@@ -5527,7 +5543,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 	 * and display DARTs are then not borrowed either, as the internal ones
 	 * are not (j713_display_v27). They must be locked.
 	 */
-	if ((j713_dcpext || j713_dispext) && apple_dart_serves_t8132_dcpext_v27(dev->of_node)) {
+	if ((j713_dcpext || j713_dispext) && apple_dart_serves_v27_dcp(dev->of_node, "apple,t8132-dcpext",
+								      apple_t8132_dcpext_v27_2)) {
 		j713_dcpext = false;
 		j713_dispext = false;
 		j713_dcpext_v27 = true;
@@ -5541,7 +5558,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 	 */
 	t8132_dcpext_v27 = res && !tunneled && !j713_dcpext && !j713_dispext &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
-		apple_dart_serves_t8132_dcpext_v27(dev->of_node);
+		apple_dart_serves_v27_dcp(dev->of_node, "apple,t8132-dcpext",
+					  apple_t8132_dcpext_v27_2);
 	/* The radio DART's fault interrupt is not described by the loader. */
 	j713_radio = res && !tunneled && apple_t8132_managed_radio() &&
 		of_machine_is_compatible("apple,t8132") &&
@@ -5549,9 +5567,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 		res->start == 0x490000000ULL;
 	/*
 	 * Off the qualified firmware nothing hands the internal display DARTs
-	 * over, but the running DCP still uses them: never reset them.
+	 * over, but the running DCP still uses them: never reset them. A DART
+	 * whose processor was handed over with the 27.2 image is handed over.
 	 */
-	if (res && !tunneled && !apple_t8132_firmware_path() &&
+	if (res && !tunneled && !j713_display_v27 && !apple_t8132_firmware_path() &&
 	    of_machine_is_compatible("apple,t8132") &&
 	    of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 	    (res->start == 0x30a300000ULL || res->start == 0x30a340000ULL)) {
@@ -6050,9 +6069,10 @@ params_done:
 		 of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8142-dart") ||
 		 j713_display_v27 || t8132_dcpext_v27);
-	if (j713_display_v27)
-		dev_info(dev, "J713 internal display DART on the 27.2 image: locked roots kept (%s)\n",
-			 dart->fw_mirror ? "mirror" : "NOT locked: refusing");
+	if (j713_display_v27 && dart->fw_mirror)
+		dev_info(dev, "J713 internal display DART on the 27.2 image: locked roots kept (mirror)\n");
+	else if (j713_display_v27)
+		dev_err(dev, "J713 internal display DART on the 27.2 image: NOT locked: refusing\n");
 	if (t8132_dcpext_v27)
 		dev_info(dev, "T8132 external display DART on the 27.2 image: %s\n",
 			 dart->fw_mirror ? "locked roots kept (mirror)" :
