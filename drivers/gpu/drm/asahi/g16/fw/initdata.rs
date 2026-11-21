@@ -289,7 +289,27 @@ pub(crate) const V26B123: Layout = Layout {
     // 0 the GPU stays unpowered, and the register restore that follows (0xb7d4, first write
     // SGX+0xd800) takes the SError seen on the J713 and the J773g. 0x9c is what 0x13e88 copies
     // into 0xa4 while the GPU is on.
-    power_policy: &[(0x9c, 1), (0xa0, 1), (0xa4, 1), (0xa8, 1)],
+    //
+    // The power limiter (fn 0x26c0c, run by agx_power right after power-up) clamps its estimate
+    // to [+0xaa4, +0xaa8] and divides by +0xaa8; with 0 there the result is NaN, and its p-state
+    // search (0x26e04) then reads table[-1] (u32 index, no bounds check before the load; 25G83
+    // checks first) and faults: the J773g's data abort after the first 27.2 power-up. G16 left the
+    // limiter's tuning zero; these are the M4 Pro's macOS values (25G83 words + 0x10, with its
+    // 26B123 defaults for 0xa80, 0xa8c, 0xa94 and 0xae0).
+    power_policy: &[
+        (0x9c, 1),
+        (0xa0, 1),
+        (0xa4, 1),
+        (0xa8, 1),
+        (0xa80, 8),
+        (0xa8c, 0x3f00_0000),
+        (0xa94, 0x3f00_0000),
+        (0xa9c, 0x3e3b_d7b3),
+        (0xaa8, 0x4780_0000),
+        (0xaac, 0x3ecf_2e49),
+        (0xad8, 0x10),
+        (0xae0, 0x5_dc00),
+    ],
 };
 
 /// 27.2 (candidate): the idle power-off delay in ms (region C 25G83 0x9bc = 40, 26B123 0x9c0).

@@ -126,9 +126,12 @@ def expect_initdata(old_image):
         if index == POWER_PERFORMANCE:
             # 27.2 candidate: the four u32s inserted at 0x9c (0xa4 = power-up target), as the
             # M4 Pro writes them on this firmware.
-            for at in (0x9c, 0xa0, 0xa4, 0xa8):
+            for at, value in ((0x9c, 1), (0xa0, 1), (0xa4, 1), (0xa8, 1), (0xa80, 8),
+                              (0xa8c, 0x3f000000), (0xa94, 0x3f000000), (0xa9c, 0x3e3bd7b3),
+                              (0xaa8, 0x47800000), (0xaac, 0x3ecf2e49), (0xad8, 0x10),
+                              (0xae0, 0x5dc00)):
                 assert not any(after[at:at + 4]), f'POWER_PERFORMANCE +{at:#x}'
-                struct.pack_into('<I', after, at, 1)
+                struct.pack_into('<I', after, at, value)
         for at, value in NEW_26B123.get(index, []):
             assert not any(after[at:at + 8]), f'object {index} +{at:#x}'
             struct.pack_into('<Q', after, at, value)
