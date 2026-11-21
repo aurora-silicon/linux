@@ -755,6 +755,22 @@
 
 /* The Neural Engine, started only after the boot loader's preload hand-off */
 #include "t6050-j714s-ane.dtsi"
+/*
+ * The USB-C port controllers take LOCK with the board number reversed ("417J"): their debug mode
+ * and a partner replug ("DISC") need it.
+ */
+&hpm0 {
+	apple,debug-lock-key = "417J";
+};
+
+&hpm1 {
+	apple,debug-lock-key = "417J";
+};
+
+&hpm2 {
+	apple,debug-lock-key = "417J";
+};
+
 #include "t6050-j714s-sleep.dtsi"
 #include "t6050-j714s-sleep-soc.dtsi"
 #include "t6050-j714s-sleep-adt.dtsi"

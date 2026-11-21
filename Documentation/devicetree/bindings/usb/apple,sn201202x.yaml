@@ -57,9 +57,13 @@ properties:
 
   apple,debug-lock-key:
     $ref: /schemas/types.yaml#/definitions/string
+    pattern: "^.{4}$"
     description:
-      The four-character key that unlocks the controller's debug mode, for
-      rearming the debug link after a sleep ended it.
+      The four-character key (the board number, reversed, such as "417J" on
+      the J714s) that the controller's LOCK command takes to unlock the
+      commands that need it. These are its debug mode, for rearming the
+      debug link after a sleep ended it, and a disconnect and reattach of
+      its partner (DISC).
 
   apple,event-irq-in-sleep:
     type: boolean

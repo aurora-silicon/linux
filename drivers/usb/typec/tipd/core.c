@@ -3697,13 +3697,26 @@ static void tipd_port_list_del(struct tps6598x *tps)
 	cancel_work_sync(&tps->replug_work);
 }
 
-/* The J714s's port controllers take "DISC" unlocked with this key, the reversed target identifier. */
-static const u8 tipd_replug_key_j714s[4] = { '4', '1', '7', 'J' };
+/*
+ * An SN201202x takes "DISC" unlocked with the key its DT gives it (apple,debug-lock-key, the board
+ * number reversed).
+ */
+static int tipd_replug_key(struct tps6598x *tps, u8 key[4])
+{
+	const char *s;
+
+	if (!device_is_compatible(tps->dev, "apple,sn201202x") ||
+	    device_property_read_string(tps->dev, "apple,debug-lock-key", &s) || strlen(s) != 4)
+		return -EOPNOTSUPP;
+	memcpy(key, s, 4);
+	return 0;
+}
 
 bool tipd_replug_supported(struct tps6598x *tps)
 {
-	return of_machine_is_compatible("apple,j714s") &&
-	       device_is_compatible(tps->dev, "apple,sn201202x");
+	u8 key[4];
+
+	return !tipd_replug_key(tps, key);
 }
 
 /*
@@ -3723,10 +3736,13 @@ static void tipd_replug_work(struct work_struct *work)
 	unsigned long timeout;
 	int ret, lock_ret, mode = -1;
 	unsigned int tries;
+	u8 key[4];
 
 	mutex_lock(&tps->lock);
-	ret = tps6598x_exec_cmd_gap(tps, "LOCK", sizeof(tipd_replug_key_j714s), tipd_replug_key_j714s,
-				    sizeof(result), &result, 1000, 0, CD321X_SSPS_READ_GAP_US);
+	ret = tipd_replug_key(tps, key);
+	if (!ret)
+		ret = tps6598x_exec_cmd_gap(tps, "LOCK", sizeof(key), key, sizeof(result), &result,
+					    1000, 0, CD321X_SSPS_READ_GAP_US);
 	if (!ret && result)
 		ret = -EIO;
 	if (!ret)
@@ -3795,7 +3811,8 @@ static int tipd_replug_queue(struct tps6598x *tps, u8 seconds)
  * DP alt mode hub whose SuperSpeed side does not come back after some wakes (dwc3-apple). A
  * display on the port goes dark meanwhile. The replug runs on the port's own work, after this
  * returns: 0 when it is queued, -EBUSY if one already is, -EOPNOTSUPP on a controller that is
- * not known to take it (the J714s's SN201202x only), -ENODEV if no port drives @sw.
+ * not known to take it (an SN201202x whose DT gives apple,debug-lock-key), -ENODEV if no port
+ * drives @sw.
  */
 int tipd_port_replug(struct usb_role_switch *sw, u8 seconds)
 {
