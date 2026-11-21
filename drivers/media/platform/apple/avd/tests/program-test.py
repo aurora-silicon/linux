@@ -420,9 +420,10 @@ static size_t vb2_get_plane_payload(struct vb2_buffer *b,int p) { (void)b;(void)
 static void *vb2_plane_vaddr(struct vb2_buffer *b,int p) { (void)b;(void)p;static u8 data[16];return data; }
 static void avd_h264_run_preamble(struct avd_ctx *ctx,struct avd_h264_run *r) { (void)ctx;*r=fixture_run; }
 static void avd_run_postamble(struct avd_ctx *ctx,struct avd_run *r) { (void)ctx;(void)r;postambles++; }
-static bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *s,size_t n,size_t b,u32 l,size_t z)
-{ (void)s;(void)b;(void)l;(void)z;return n<20; }
-static size_t avd_h264_max_slices(const struct v4l2_ctrl_h264_sps *s) { (void)s;return 20; }
+static bool avd_h264_slice_fits(const struct v4l2_pix_format_mplane *p,const struct v4l2_ctrl_h264_sps *s,size_t n,size_t b,u32 l,size_t z)
+{ (void)p;(void)s;(void)b;(void)l;(void)z;return n<20; }
+static size_t avd_h264_max_slices(const struct v4l2_pix_format_mplane *p,const struct v4l2_ctrl_h264_sps *s)
+{ (void)s;return (size_t)((p->width/16)*(p->height/16)); }
 static int avd_h264_realloc_slices(struct avd_ctx *c,size_t n) { (void)c;(void)n;abort(); }
 static int avd_init_job(struct avd_ctx *c,unsigned int codec,size_t n) {
  free(c->job.segments);c->job.codec=codec;c->job.num=0;
