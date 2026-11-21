@@ -33,7 +33,24 @@ struct ane_isp_link;
  * @isp_doorbell_sel: in, the bitmask for @isp_doorbell
  * @ane_doorbell: out, how the ISP firmware signals the ANE firmware (a PA)
  * @ane_doorbell_sel: out, selector for @ane_doorbell
+ * @surface_get: in, optional: the ISP firmware's shared surface @id, the ID
+ *	   the ISP driver gave in its SHAREDMALLOC reply. The ANE firmware asks for such surfaces by ID and the ANE driver
+ *	   maps them into the ANE DART. Takes a reference on the surface's pages
+ *	   until @surface_put. Both are leaf calls: they take no lock of the ANE
+ *	   driver and may be called with its locks held.
+ * @surface_put: in, drops what @surface_get took (@s->cookie)
+ * @surface_ctx: in, for both
+ * @surface_map: out, true when the ANE driver serves such requests: only
+ *	   then may the ISP driver hand nonzero IDs to its firmware
  */
+struct ane_isp_surface {
+	struct sg_table *sgt;
+	u64 size;
+	u64 iova;
+	u32 tag;
+	void *cookie;
+};
+
 struct ane_isp_endpoint {
 	struct sg_table *rings;
 	u32 ring_len;
@@ -41,6 +58,10 @@ struct ane_isp_endpoint {
 	u32 isp_doorbell_sel;
 	u64 ane_doorbell;
 	u32 ane_doorbell_sel;
+	int (*surface_get)(void *ctx, u32 id, struct ane_isp_surface *s);
+	void (*surface_put)(void *ctx, void *cookie);
+	void *surface_ctx;
+	bool surface_map;
 };
 
 /*

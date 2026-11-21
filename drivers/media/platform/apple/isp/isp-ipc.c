@@ -378,10 +378,25 @@ int ipc_sm_handle(struct apple_isp *isp, struct isp_channel *chan)
 			return -ENOMEM;
 		}
 		surf->type = req->arg2;
+		/*
+		 * The reply carries an ID for the surface, and the ISP
+		 * firmware hands those IDs to the ANE firmware, which asks its
+		 * host to map the surfaces by them (MLVNR). Only while the ANE
+		 * driver serves such requests (apple_isp_ane_start()); 0
+		 * otherwise, as before.
+		 */
+		if (READ_ONCE(isp->ane_ids)) {
+			if (!++isp->ane_next_id)
+				++isp->ane_next_id;
+			surf->id = isp->ane_next_id;
+			isp->ane_ids_given++;
+			isp_dbg(isp, "shared surface %#x: iova %pad size 0x%llx tag %#llx\n",
+				surf->id, &surf->iova, surf->size, surf->type);
+		}
 
 		rsp->arg0 = surf->iova | ISP_IPC_FLAG_ACK;
 		rsp->arg1 = 0x0;
-		rsp->arg2 = 0x0; /* macOS uses this to index surfaces */
+		rsp->arg2 = surf->id;
 
 		switch (surf->type) {
 		case 0x4c4f47: /* "LOG" */
