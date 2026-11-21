@@ -36,7 +36,6 @@ for name in names:
  code+='static int '+name+'(struct apple_isp *i,...){'+effect+'return 0;}\n'
 code += 'static bool isp_is_p010(struct apple_isp *i){return false;}\n'
 # Knobs and helpers outside the order checked here (macOS-parity tuning, SIFR, camera LED, MLVNR).
-code += 'static bool isp_lpdp_macos, isp_macos_tune;\n'
 code += 'static bool isp_ch_config_is_sifr(struct apple_isp *i,u32 ch,int index){return false;}\n'
 code += 'static void isp_ch_configure_led(struct apple_isp *i,u32 ch){}\n'
 code += 'static void isp_ch_configure_sifr(struct apple_isp *i,u32 ch,int index){}\n'

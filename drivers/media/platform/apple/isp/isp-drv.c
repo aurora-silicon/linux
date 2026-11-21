@@ -629,57 +629,28 @@ static int isp_of_read_coord(struct device *dev, struct device_node *np,
 }
 
 /*
- * TEST knobs (J815, WIP). The J813/J815 DT presets run
- * from the binned IMX958 mode, config 8 (1520x1440). These knobs move them to
- * a full-resolution mode instead, with the crops doubled:
- *   sensor_config=7: 3040x2880 (as before #2237),
- *   sensor_config=6: 3040x2880 with SIFR, the mode macOS 27.2 streams (the
- *   firmware reports it as 3040x5760: a short exposure rides along with each
- *   frame, which highlight recovery uses; see the hr knob in isp-cam.c),
- *   sensor_config=9: the binned 1520x1440 frame with SIFR (reported as
- *   1520x2880): binning's lower noise plus highlight recovery, crops as in 8,
- *   sensor_config=8 or 0: the DT presets unchanged.
- * presets_full=1 is the old spelling of sensor_config=7 (the bench uses it).
- * modprobe -r apple_isp; modprobe apple_isp sensor_config=N
- */
-static bool presets_full;
-module_param(presets_full, bool, 0444);
-MODULE_PARM_DESC(presets_full, "TEST: same as sensor_config=7 (default: false)");
-
-/*
- * Default 8 (the DT): on the J815 A/B of 2026-11-21 (1920x1080, frame-to-
- * frame centre luma noise) config 8 had 1.29, 9 + HR 1.52 (brighter, with
- * highlight recovery) and 6/7 about 3.0: full resolution needs Apple's ANE
- * denoiser (MLVNR), which Linux does not run yet.
- */
-static int sensor_config = 8;
-module_param(sensor_config, int, 0444);
-MODULE_PARM_DESC(sensor_config, "TEST: IMX958 sensor mode for the binned DT presets: 8/0 = binned (DT, default), 9 = binned + SIFR, 6 = full res + SIFR (macOS), 7 = full res");
-
-/*
- * The IMX958's ultra-wide lens draws an image circle smaller than the
- * sensor: outside it the picture is black. macOS never shows that part (it
- * frames a 1.5x zoom and dewarps); the DT crops take the full sensor width
- * and so show black corners. On a J815 (config 8 frames, 2026-11-21) the
- * 1520x856 16:9 crop went dark at 0.855 and 0.895 of its half-diagonal at
- * the bottom corners and 0.96 at the top: the circle's centre sits about
- * 5 % of the height above the sensor's, radius ~0.53 of the width.
+ * Two camera properties of the sensor-presets node (DT), both optional:
  *
- * lens_circle: the usable radius in per mille of the input width, about the
- * input centre moved down by lens_center_y per mille of the input height
- * (negative = up). A crop whose corners leave the circle is scaled about
- * its centre, aspect kept, until they fit. The default fits the worst
- * (bottom-left) corner with a margin and no shift, so it holds for a lens
- * centred differently. 0 = the DT crops.
+ * apple,mlvnr-sensor-config = <binned full>: with MLVNR (apple_isp.mlvnr),
+ * the presets of the binned sensor mode move to the full-resolution one,
+ * input and crops doubled. Apple's MLVNR network takes only certain frame
+ * shapes: on the J813/J815 IMX958 the binned config 8 (1520x1440) is not
+ * one, and config 6 (3040x2880 with SIFR, what macOS 27.2 streams) is. The
+ * firmware reports a SIFR mode at twice its frame height (a short exposure
+ * rides along with each frame); highlight recovery uses it (isp-cam.c).
+ * Without MLVNR the presets keep the DT's binned mode: on the J815 its noise
+ * was 1.29 against about 3.0 for full resolution (2026-11-21).
+ *
+ * apple,lens-circle = <radius>: the lens draws an image circle smaller than
+ * the sensor, black outside. macOS never shows that part (it frames a 1.5x
+ * zoom and dewarps); crops that take the full sensor width show black
+ * corners. On a J815 (config 8 frames, 2026-11-21) the 1520x856 16:9 crop
+ * went dark at 0.855 and 0.895 of its half-diagonal at the bottom corners and
+ * 0.96 at the top: the circle's centre sits about 5 % of the height above
+ * the sensor's, radius ~0.53 of the width. The radius is per mille of the
+ * input width, about the input's centre. A crop whose corners leave the
+ * circle is scaled about its centre, aspect kept, until they fit.
  */
-static unsigned int lens_circle = 470;
-module_param(lens_circle, uint, 0444);
-MODULE_PARM_DESC(lens_circle, "IMX958: usable lens circle radius, per mille of the input width (default 470; 0 = DT crops)");
-
-static int lens_center_y;
-module_param(lens_center_y, int, 0444);
-MODULE_PARM_DESC(lens_center_y, "IMX958: lens circle centre below the input centre, per mille of the input height (default 0)");
-
 static bool isp_crop_in_circle(s64 ox, s64 oy, u32 w, u32 h, s64 r)
 {
 	s64 dx = abs(ox) + w / 2, dy = abs(oy) + h / 2;
@@ -687,18 +658,17 @@ static bool isp_crop_in_circle(s64 ox, s64 oy, u32 w, u32 h, s64 r)
 	return dx * dx + dy * dy <= r * r;
 }
 
-static void isp_preset_fit_lens(struct device *dev, struct isp_preset *p)
+static void isp_preset_fit_lens(struct device *dev, struct isp_preset *p, u32 lens_circle)
 {
 	u32 in_w = p->input_dim.x, in_h = p->input_dim.y;
 	u32 w = p->crop_size.x, h = p->crop_size.y, lo = 0, hi = 1024, s, nw, nh;
 	s64 r, ccx, ccy, ox, oy;
 
-	if (!lens_circle || p->index < 6 || p->index > 9 ||
-	    !((in_w == 1520 && in_h == 1440) || (in_w == 3040 && in_h == 2880)))
+	if (!lens_circle)
 		return;
 	r = (s64)lens_circle * in_w / 1000;
 	ccx = in_w / 2;
-	ccy = in_h / 2 + (s64)lens_center_y * in_h / 1000;
+	ccy = in_h / 2;
 	/* crop centre relative to the circle's, doubled to stay integer */
 	ox = 2 * (s64)p->crop_offset.x + w - 2 * ccx;
 	oy = 2 * (s64)p->crop_offset.y + h - 2 * ccy;
@@ -729,6 +699,7 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 {
 	struct device *dev = isp->dev;
 	struct isp_preset *preset;
+	u32 lens_circle, mlvnr_config[2] = { U32_MAX, U32_MAX };
 	int err = 0;
 
 	struct device_node *np __free(device_node) =
@@ -748,6 +719,14 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 		dev, sizeof(*isp->presets) * isp->num_presets, GFP_KERNEL);
 	if (!isp->presets)
 		return -ENOMEM;
+
+	if (of_property_read_u32(np, "apple,lens-circle", &lens_circle))
+		lens_circle = 0;
+	if (apple_isp_ane_wanted() &&
+	    of_property_read_u32_array(np, "apple,mlvnr-sensor-config", mlvnr_config, 2)) {
+		dev_info(dev, "MLVNR: no apple,mlvnr-sensor-config: the presets keep their sensor modes\n");
+		mlvnr_config[0] = U32_MAX;
+	}
 
 	preset = isp->presets;
 	for_each_child_of_node_scoped(np, child) {
@@ -779,15 +758,8 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 		preset->crop_size.x = xywh[2];
 		preset->crop_size.y = xywh[3];
 
-		if (!presets_full && sensor_config == 9 && preset->index == 8 &&
-		    preset->input_dim.x == 1520 && preset->input_dim.y == 1440) {
-			/* the same binned frame, with its SIFR exposure: crops unchanged */
-			preset->index = 9;
-			preset->remapped = true;
-		} else if ((presets_full || sensor_config == 6 || sensor_config == 7) &&
-		    preset->index == 8 &&
-		    preset->input_dim.x == 1520 && preset->input_dim.y == 1440) {
-			preset->index = presets_full ? 7 : sensor_config;
+		if (preset->index == mlvnr_config[0]) {
+			preset->index = mlvnr_config[1];
 			preset->remapped = true;
 			preset->input_dim.x *= 2;
 			preset->input_dim.y *= 2;
@@ -796,7 +768,7 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 			preset->crop_size.x *= 2;
 			preset->crop_size.y *= 2;
 		}
-		isp_preset_fit_lens(dev, preset);
+		isp_preset_fit_lens(dev, preset, lens_circle);
 
 		preset++;
 	}

@@ -159,7 +159,7 @@ struct isp_preset {
 	struct coord crop_size;
 	/* Processed P010 geometry established by preview or a config reply. */
 	bool p010;
-	/* TEST: moved off its DT sensor config by the sensor_config knob */
+	/* moved off its DT sensor config to the MLVNR one (apple,mlvnr-sensor-config) */
 	bool remapped;
 };
 
@@ -379,6 +379,8 @@ struct isp_format {
 	size_t total_size;
 };
 
+struct dentry;
+
 struct apple_isp {
 	struct device *dev;
 	const struct apple_isp_hw *hw;
@@ -404,6 +406,7 @@ struct apple_isp {
 	u32 ane_next_id, ane_ids_given;
 	u32 ane_doorbell_sel;
 	char ane_afpp[64];
+	struct dentry *ane_debugfs;
 	u32 cam_connections_scheme;
 	struct isp_preset *presets;
 	int num_presets;

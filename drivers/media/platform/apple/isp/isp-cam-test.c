@@ -312,10 +312,10 @@ static void isp_test_temporal_filter_band0(struct kunit *test)
 	test->priv = trace;
 	KUNIT_EXPECT_EQ(test, isp_ch_configure_capture(isp, 0), 0);
 	isp_test_expect_run(test, trace, run, ARRAY_SIZE(run));
-	/* The start record is (1, 0, 0) whatever the DT property says. */
+	/* The start record is (1, 1, 0) on band-0 setfiles, as macOS 27.2 sends it. */
 	i = isp_test_find(trace, 0xc100);
 	KUNIT_EXPECT_EQ(test, trace->word[i][0], 1);
-	KUNIT_EXPECT_EQ(test, trace->word[i][1], 0);
+	KUNIT_EXPECT_EQ(test, trace->word[i][1], 1);
 	KUNIT_EXPECT_EQ(test, trace->word[i][2], 0);
 	i = isp_test_find(trace, 0xc11d);
 	KUNIT_EXPECT_EQ(test, trace->word[i][0], 0x7800);
