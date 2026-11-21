@@ -2297,6 +2297,32 @@ static unsigned long dcp_dptx_wait_linkcfg(struct apple_dcp *dcp, u32 port,
 }
 
 /*
+ * A fixed HDMI port inherited from the boot loader can already have
+ * a configured default surface. It does not issue a new force-hotplug call
+ * while AP HPD is withheld. Report the converter's real GPIO level before
+ * waiting for training, as the working loader does after request_display.
+ */
+static int dcp_assert_hpd_before_link_wait(struct apple_dcp *dcp, u32 port, bool late_hpd)
+{
+	bool typec = dcp_is_typec_output(dcp);
+	bool fixed_hdmi = !typec &&
+			  dcp->fixed_connector_type == DRM_MODE_CONNECTOR_HDMIA &&
+			  dcp->hdmi_hpd;
+	int level;
+
+	if (late_hpd || (!typec && !fixed_hdmi))
+		return 0;
+	if (fixed_hdmi) {
+		level = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+		if (level <= 0)
+			return level < 0 ? level : -ENOLINK;
+	}
+	if (dcp_uses_t6020_tunnel_flow(dcp))
+		return dptxport_set_hpd_timeout(dcp->dptxport[port].service, true, 8000);
+	return dptxport_set_hpd(dcp->dptxport[port].service, true);
+}
+
+/*
  * Connect DPTX port @port. On failure, @retryable (if given) tells whether
  * the attempt left nothing outstanding in the firmware, so that a later
  * connection may simply try again: the service was not published yet, or a
@@ -2437,19 +2463,11 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_release;
 	}
 	dcp->dptxport[port].connected = true;
-	if (dcp_is_typec_output(dcp) && !late_hpd) {
-		if (dcp_uses_t6020_tunnel_flow(dcp))
-			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
-						       true, 8000);
-		else
-			ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
-		if (ret) {
-			dev_err(dcp->dev,
-				"dcp_dptx_connect: failed to assert Type-C HPD: %d\n",
-				ret);
-			dcp->dptxport[port].connected = false;
-			goto out_release;
-		}
+	ret = dcp_assert_hpd_before_link_wait(dcp, port, late_hpd);
+	if (ret) {
+		dev_err(dcp->dev, "dcp_dptx_connect: failed to assert AP HPD: %d\n", ret);
+		dcp->dptxport[port].connected = false;
+		goto out_release;
 	}
 
 	mutex_unlock(&dcp->hpd_mutex);
