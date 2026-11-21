@@ -11,7 +11,7 @@
 //! #46,#1), which the resolver used to refuse as unmodeled bits.
 use core::fmt::Write;
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use kernel::{bindings, module_param::KernelParam};
+use kernel::bindings;
 
 use crate::g18::fw::submission::SubmissionError;
 
@@ -89,16 +89,10 @@ unsafe extern "C" fn stats_set(_: *const core::ffi::c_char, _: *const bindings::
 static STATS_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(stats_set), get: Some(stats_get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static STATS_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_render_dep_stats"
-    } else { c"aurora.g17p_render_dep_stats" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&STATS_OPS), perm: 0o400, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    STATS_PARAM,
+    "g17p_render_dep_stats",
+    ops: core::ptr::from_ref(&STATS_OPS),
+    perm: 0o400,
+    arg: core::ptr::null_mut(),
+);

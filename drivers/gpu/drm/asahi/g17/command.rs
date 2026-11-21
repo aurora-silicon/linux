@@ -41,11 +41,12 @@ const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRA
 const STAGE_PREFIXES: u32 = crate::file::DRM_ASAHI_RENDER_STAGE_PREFIXES;
 const WHOLE_ATTACHMENTS: u32 = crate::file::DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS;
 const SHADER_WRITES: u32 = crate::file::DRM_ASAHI_RENDER_SHADER_WRITES;
+const MESH_OUTPUT: u32 = crate::file::DRM_ASAHI_RENDER_MESH_OUTPUT;
 /// Render flags only the M5 runtime implements.
 const M5_RENDER_FLAGS: u32 = SHADER_WRITES | STAGE_PREFIXES | WHOLE_ATTACHMENTS;
 const RENDER_FLAGS: u32 =
     PROCESS_EMPTY | RSRC_SPEC_HI | DBIAS_INT | FEW_PRIMITIVES | FRAGMENT_BARRIERS | SHADER_WRITES
-        | STAGE_PREFIXES | WHOLE_ATTACHMENTS;
+        | STAGE_PREFIXES | WHOLE_ATTACHMENTS | MESH_OUTPUT;
 
 /// Attachment settings persist until replaced, including by an empty list.
 #[derive(Clone, Copy)]
@@ -664,6 +665,7 @@ impl Payload {
                     depth_bias_va: cmd.isp_dbias_base,
                     depth_bias_is_int: cmd.flags & DBIAS_INT != 0,
                     few_primitives: cmd.flags & FEW_PRIMITIVES != 0 && variant.few_primitives,
+                    mesh_output: cmd.flags & MESH_OUTPUT != 0,
                     fragment_barriers: cmd.flags & FRAGMENT_BARRIERS != 0,
                     stage_prefixes: cmd.flags & STAGE_PREFIXES != 0,
                     whole_attachments: cmd.flags & WHOLE_ATTACHMENTS != 0,

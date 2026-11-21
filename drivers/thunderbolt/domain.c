@@ -953,6 +953,7 @@ err_acpi:
 
 void tb_domain_exit(void)
 {
+	tb_ctl_frames_exit();
 	tb_dp_pm_gate_exit();
 	bus_unregister(&tb_bus_type);
 	ida_destroy(&tb_domain_ida);

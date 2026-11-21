@@ -351,7 +351,8 @@
 
 #include "hwmon-common.dtsi"
 #include "hwmon-laptop.dtsi"
-#include "hwmon-fan-dual.dtsi"
+#include "hwmon-fan.dtsi"
+#include "t8132-j604-hwmon-rails.dtsi"
 
 /*
  * The PMGR domains of the USB-C ports this board wires beyond ATC0/ATC1, as
@@ -376,6 +377,8 @@
 &avd {
 	status = "okay";
 };
+
+#include "t8132-j604-atcphy-tunables.dtsi"
 
 /*
  * External displays over USB-C: both pipes (dcpext0/1), routed through each
@@ -616,4 +619,14 @@
 			};
 		};
 	};
+};
+
+/*
+ * Keyboard backlight on macOS's scale: its levels 0.0625..1.0 drive
+ * 69..336 of 960 PWM cycles, on = 52 + 284 * level, so the top level is
+ * 35 % duty and the line starts at 5.42 %.
+ */
+&kbd_led {
+	min-duty-cycle-bp = <542>;
+	max-duty-cycle-bp = <3500>;
 };

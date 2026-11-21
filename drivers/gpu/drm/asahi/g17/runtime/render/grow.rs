@@ -420,6 +420,7 @@ impl crate::g17::Shared {
                 entry.growing = false;
                 // The grow work item requests an event pass when it finishes.
                 entry.missed_event = false;
+                firmware.queues.hold_render_slot(slot);
             }
             if firmware.queues.render.grow.active != Some(request) {
                 return Err(EIO);

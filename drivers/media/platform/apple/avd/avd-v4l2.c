@@ -350,7 +350,8 @@ static const struct avd_ctrl_desc avd_vp9_ctrl_descs[] = {
 	{
 		.cfg.id = V4L2_CID_MPEG_VIDEO_VP9_PROFILE,
 		.cfg.min = V4L2_MPEG_VIDEO_VP9_PROFILE_0,
-		.cfg.max = V4L2_MPEG_VIDEO_VP9_PROFILE_3,
+		.cfg.max = V4L2_MPEG_VIDEO_VP9_PROFILE_2,
+		.cfg.menu_skip_mask = BIT(V4L2_MPEG_VIDEO_VP9_PROFILE_1),
 		.cfg.def = V4L2_MPEG_VIDEO_VP9_PROFILE_0,
 	},
 };
@@ -360,6 +361,7 @@ static const struct avd_ctrls avd_vp9_ctrls = {
 	.num_ctrls = ARRAY_SIZE(avd_vp9_ctrl_descs),
 };
 
+/* VP9 profiles 0 and 2 only; avd_vp9_try_ctrl() refuses the others. */
 static const struct avd_decoded_fmt_desc avd_vp9_decoded_fmts[] = {
 	{
 		.fourcc = V4L2_PIX_FMT_NV12,
@@ -369,16 +371,9 @@ static const struct avd_decoded_fmt_desc avd_vp9_decoded_fmts[] = {
 		.fourcc = V4L2_PIX_FMT_P010,
 		.image_fmt = AVD_IMG_FMT_420_10BIT,
 	},
-	{
-		.fourcc = V4L2_PIX_FMT_NV16,
-		.image_fmt = AVD_IMG_FMT_422_8BIT,
-	},
-	{
-		.fourcc = V4L2_PIX_FMT_P010,
-		.image_fmt = AVD_IMG_FMT_422_10BIT,
-	},
 };
 
+/* AV1 Main profile 4:2:0 only; avd_av1_try_ctrl() refuses the others. */
 static const struct avd_decoded_fmt_desc avd_av1_decoded_fmts[] = {
 	{
 		.fourcc = V4L2_PIX_FMT_NV12,
@@ -387,15 +382,6 @@ static const struct avd_decoded_fmt_desc avd_av1_decoded_fmts[] = {
 	{
 		.fourcc = V4L2_PIX_FMT_P010,
 		.image_fmt = AVD_IMG_FMT_420_10BIT,
-	},
-	{
-		.fourcc = V4L2_PIX_FMT_NV16,
-		.image_fmt = AVD_IMG_FMT_422_8BIT,
-	},
-	{
-		/* TODO: missing P210 */
-		.fourcc = V4L2_PIX_FMT_P010,
-		.image_fmt = AVD_IMG_FMT_422_10BIT,
 	},
 };
 

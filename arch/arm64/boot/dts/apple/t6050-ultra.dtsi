@@ -120,6 +120,7 @@
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x148 4>;
 		label = "atc4_usb_aon";
+		apple,always-on; /* The ATC PHY loses its state without it */
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 	};

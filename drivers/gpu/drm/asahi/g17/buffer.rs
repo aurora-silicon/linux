@@ -228,6 +228,10 @@ impl Scenes {
     }
 }
 
+unsafe extern "C" {
+    fn asahi_g17_mesh_tvb_floor() -> u32;
+}
+
 /// A snapshot of the block ring; all values are modulo its fixed capacity.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Cursors {
@@ -848,6 +852,14 @@ impl Manager {
     /// The most blocks this buffer's geometry can hold.
     pub(crate) fn max_blocks(&self) -> usize {
         self.tvb.geometry.max_blocks()
+    }
+    /// The blocks an A18 Pro heap holds ahead of a render with mesh shading
+    /// (`aurora.g17_mesh_tvb_floor`): the size its automatic growth reaches.
+    /// None on other heaps, or with the switch off.
+    pub(crate) fn mesh_floor(&self) -> Option<usize> {
+        // SAFETY: Reads a module parameter; no other effect.
+        let enabled = unsafe { asahi_g17_mesh_tvb_floor() } != 0;
+        (enabled && self.tvb.geometry == BlockGeometry::NEO).then_some(self.layout.normal_blocks)
     }
     /// Read-only diagnostic while firmware is halted. In particular this
     /// does not reset the high-water counter as automatic_target() does.

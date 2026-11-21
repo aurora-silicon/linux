@@ -121,6 +121,12 @@ pub(crate) const DRM_ASAHI_FEATURE_WHOLE_ATTACHMENT_RENDERS: u64 =
 #[allow(dead_code)]
 pub(crate) const DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS: u32 =
     uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS;
+/// Render commands accept DRM_ASAHI_RENDER_MESH_OUTPUT.
+pub(crate) const DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT: u64 =
+    uapi::DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT as u64;
+/// The render contains mesh shading: its tiler heap may be sized for mesh output ahead of it.
+pub(crate) const DRM_ASAHI_RENDER_MESH_OUTPUT: u32 =
+    uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_MESH_OUTPUT;
 /// DRM_ASAHI_RENDER_PROGRAM_TASK, only with DRM_ASAHI_RENDER_PROGRAM_OBJECT: the object
 /// program is an API task stage.
 pub(crate) const DRM_ASAHI_RENDER_PROGRAM_TASK: u32 = uapi::DRM_ASAHI_RENDER_PROGRAM_TASK;

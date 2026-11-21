@@ -709,7 +709,9 @@ impl crate::g17::Firmware {
         if entry.closed {
             pair.release_owner();
         }
-        if !entry.pending_timeout {
+        let pending_timeout = entry.pending_timeout;
+        self.queues.hold_render_slot(usize::from(slot));
+        if !pending_timeout {
             return Ok(());
         }
         for _ in 0..crate::hw::t8140::queues::RENDER_DEPTH {

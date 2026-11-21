@@ -87,6 +87,8 @@ pub(crate) struct Variant {
     pub(crate) compute: super::compute::ComputeProgram,
     pub(crate) opening_record: bool,
     pub(crate) split_firmware_area: bool,
+    /// Uses the 26B123 initialization layouts and scheduler-release opcode.
+    pub(crate) v26b123: bool,
     /// Command validation applies the M5 command set: resource commands, the M5 render and
     /// compute flags, 8x MSAA and the M5 tile-buffer limit.
     pub(crate) m5_commands: bool,
@@ -94,6 +96,19 @@ pub(crate) struct Variant {
     /// work. The bare-metal M5 firmware powers the cores for work by its own policy: under a
     /// hold, the M5 Ultra's core-power witness reads unpowered until the hold is released.
     pub(crate) registration_power_hold: bool,
+    /// A context takes its render pool identity when it is created, not at its first render,
+    /// so that identities held by render graphs kept until the firmware stops refuse new
+    /// contexts with an error instead of failing a context's first render. Set for the A18
+    /// Pro only: the M4 Pro and Max keep the first-render claim until the claim at creation has
+    /// been tested on that hardware.
+    pub(crate) render_id_at_create: bool,
+    /// Cached descriptor storage, queue records and queue configuration that come back
+    /// after their owner's release was consumed are reused once the firmware has consumed
+    /// every control record published before they came back, not only after a later one.
+    /// Set for the A18 Pro. Elsewhere they keep the stricter fence of 34b438de, which fixed
+    /// an M4 Pro crash on a recycled work state; extending this needs a create/destroy-heavy
+    /// queue test on that hardware.
+    pub(crate) objects_after_release: bool,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -144,8 +159,11 @@ pub(crate) const V26A428: Variant = Variant {
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
+    v26b123: false,
     m5_commands: false,
     registration_power_hold: true,
+    render_id_at_create: true,
+    objects_after_release: true,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -182,8 +200,11 @@ pub(crate) const V25G83: Variant = Variant {
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
+    v26b123: false,
     m5_commands: false,
     registration_power_hold: true,
+    render_id_at_create: false,
+    objects_after_release: false,
 };
 
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
@@ -194,6 +215,8 @@ pub(crate) const V26A428_M5: Variant = Variant {
     traversal_exclusion: false,
     render_ray_query: false,
     registration_power_hold: false,
+    render_id_at_create: false,
+    objects_after_release: false,
     ..V26A428
 };
 
@@ -206,8 +229,16 @@ pub(crate) const V25F84: Variant = Variant {
     ..V25G83
 };
 
+/// The T6041 27.2 firmware (26B123, `mBoot-20457.41.3`).
+pub(crate) const V26B123: Variant = Variant {
+    split_firmware_area: false,
+    v26b123: true,
+    ..V25F84
+};
+
 const _: () = {
     assert!(super::queue::PointerBlock::valid_layout(&V26A428.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25G83.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25F84.pointers));
+    assert!(super::queue::PointerBlock::valid_layout(&V26B123.pointers));
 };

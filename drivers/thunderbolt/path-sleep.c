@@ -30,6 +30,13 @@ int tb_path_sleep(struct tb_path *path)
 	}
 	/* Even a partial drain must be replayed on abort. Credits stay allocated. */
 	path->sleep_valid = true;
+	/*
+	 * TEST: macOS writes no PCIe or USB3 path before a T6050 router's sleep in place
+	 * (run mxt6: only the two display tunnels' paths are cleared); the hops are written
+	 * again after the wake, and after a refused sleep they are found as they were.
+	 */
+	if (path->tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES)
+		return 0;
 	for (i = 0; i < path->path_length; i++) {
 		ret = __tb_path_deactivate_hop(path->hops[i].in_port,
 					       path->hops[i].in_hop_index, false);
@@ -73,6 +80,11 @@ int tb_path_wake(struct tb_path *path)
 		/* USB4 requires a path read before its write. */
 		ret = tb_port_read(hop->in_port, &observed, TB_CFG_HOPS,
 				   2 * hop->in_hop_index, 2);
+		/* A hop left enabled over a sleep that did not happen is not written again. */
+		if (!ret && (path->tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES) &&
+		    !path->sleep_lost && observed.enable && observed.out_port == hop->out_port->port &&
+		    observed.next_hop == hop->next_hop_index)
+			continue;
 		if (!ret)
 			ret = tb_port_write(hop->in_port, &path->sleep_hops[i], TB_CFG_HOPS,
 					    2 * hop->in_hop_index, 2);

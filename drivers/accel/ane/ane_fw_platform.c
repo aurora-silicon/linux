@@ -24,9 +24,23 @@ static const u32 ane_h16_reg_sizes[] = {
 	0x2000000, 0x18000, 0x4000, 0x30000, 0xff4000, 0x2000000, 0x4000,
 };
 
+/* T8132 has no second engine (aux-3); retain the ADT window ordering. */
+static const char * const ane_t8132_reg_names[] = {
+	"engine", "pmgr", "aux-0", "aux-1", "aux-2", "aux-4",
+};
+
+static const u32 ane_t8132_reg_sizes[] = {
+	0x2000000, 0x18000, 0x4000, 0x30000, 0xff4000, 0x4000,
+};
+
 /* Offsets in reg[1]; genpd, never the ANE driver, owns transitions. */
 static const u32 ane_h16_power_words[] = {
 	0x3c0, 0xc008, 0xc000, 0xc010, 0xc018,
+};
+
+/* The same five domains; ANE_SYS sits at +0x570 in the T8132 PMGR. */
+static const u32 ane_t8132_power_words[] = {
+	0x570, 0xc008, 0xc000, 0xc010, 0xc018,
 };
 
 static const char * const ane_h17_reg_names[] = { "engine", "pmgr", "pwgate" };
@@ -59,6 +73,8 @@ const struct ane_fw_platform ane_h16_platform = {
 	.dapf_dart = 0,
 	.dapf_offset = 0x10000,
 	.dapf_size = SZ_16K,
+	.dapf_count = 4,
+	.has_xl = true,
 	/* The DT compatible is t6041 on the M4 Max and the M4 Pro (T6040) alike. */
 	.soc = 0x6040,
 	.chip_family = 16,
@@ -90,9 +106,55 @@ const struct ane_fw_platform ane_h16_platform = {
 	 * EXCLAVE_MODE_STOP.
 	 */
 	.sleep_cold = true,
+	.boot_qualified = true,
 	.firmware_preloaded = true,
 	.safe_reset = false,
 	.pmp_report = "apple,t6041-pmp-v2-report",
+};
+
+/*
+ * M4: the H16 engine and firmware interface of the T6041, with one engine
+ * (no aux-3 window), its own engine writes and firmware builds, ANE_SYS at
+ * PMGR +0x570 and five DAPF records. The backend polls the F2H channels.
+ */
+const struct ane_fw_platform ane_t8132_platform = {
+	.h16_profiles = ane_t8132_profiles,
+	.h16_profile_count = ARRAY_SIZE(ane_t8132_profiles),
+	.h16_mmio = ane_h16_mmio_t6041,
+	.h16_mmio_count = ARRAY_SIZE(ane_h16_mmio_t6041),
+	.dart_params = 0x8,
+	.soc = 0x8132,
+	.chip_family = 16,
+	.ane_type = 0x100,
+	.hwx_subtype = 7,
+	.task_generation = 17,
+	.interrupt_count = 2,
+	.irq_role = ANE_FW_IRQ_UNKNOWN,
+	.owner = ANE_FW_OWNER_AP,
+	.reg_names = ane_t8132_reg_names,
+	.reg_sizes = ane_t8132_reg_sizes,
+	.reg_count = ARRAY_SIZE(ane_t8132_reg_names),
+	.wrapper = 0x1600000,
+	.mailbox = 0x1608000,
+	.scratch = 0x1880020,
+	.doorbell = 0x1884000,
+	.irq_status = 0x188c000,
+	.irq_ack = 0x1890000,
+	.power_words = ane_t8132_power_words,
+	.power_count = ARRAY_SIZE(ane_t8132_power_words),
+	.dapf_dart = 0,
+	.dapf_offset = 0x10000,
+	.dapf_size = SZ_16K,
+	.dapf_count = 5,
+	.preload_dva = { 0x10000000000, 0x100000c0000 },
+	.preload_size = { 0xc0000, 0x2ac000 },
+	.stream_mask = BIT(0) | BIT(11),
+	/* System sleep cycles the engine cold and replays every program, as on T6041. */
+	.sleep_cold = true,
+	.boot_qualified = true,
+	.firmware_preloaded = true,
+	.safe_reset = false,
+	.pmp_report = "apple,t8132-pmp-v2-report",
 };
 
 const struct ane_fw_platform ane_h17_platform = {
@@ -115,6 +177,7 @@ const struct ane_fw_platform ane_h17_platform = {
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
 	.stream_mask = BIT(0),
+	.boot_qualified = true,
 	.firmware_preloaded = true,
 	.safe_reset = false,
 	/* 25G83 boots this firmware in Exclave mode (SPEC-ANE-SLEEP-H17.md). */
@@ -138,54 +201,96 @@ const struct ane_fw_platform ane_h17_platform = {
 };
 
 /*
- * The M5 Pro (J714s) ANE: the H17 engine and firmware protocol (ADT
- * "ane,t8132exclave", ane-type 0x220), exclave-assigned and preloaded by
+ * The M5 Pro and Max (J714s, J716c) ANE: the H17 engine and firmware protocol
+ * (ADT "ane,t8132exclave", ane-type 0x220), exclave-assigned and preloaded by
  * iBoot. From the ADT and macOS's own bring-up on this machine: ANE_SYS at
  * PMGR +0x3a8, then ANE_CPU (+0x3c8) and ANE_TDBASE (+0x3d0) behind it; the
  * scratch cells start at +0x1880028; the DARTs are revision 0x204; five DAPF
  * records. System sleep cycles the engine cold, as on T8140.
  */
+#define ANE_T6050_PLATFORM						\
+	.soc = 0x6050,							\
+	.chip_family = 17,						\
+	.ane_type = 0x220,						\
+	.hwx_subtype = 9,						\
+	.task_generation = 19,						\
+	.interrupt_count = 2,						\
+	.owner = ANE_FW_OWNER_EXCLAVE,					\
+	.reg_names = ane_h17_reg_names,					\
+	.reg_sizes = ane_h17_reg_sizes,					\
+	.reg_count = ARRAY_SIZE(ane_h17_reg_names),			\
+	.wrapper = 0x1600000,						\
+	.mailbox = 0x1608000,						\
+	.scratch = 0x1880028,						\
+	.doorbell = 0x1884000,						\
+	.irq_status = 0x188c000,					\
+	.irq_ack = 0x1890000,						\
+	.stream_mask = BIT(0),						\
+	.boot_qualified = true,						\
+	.firmware_preloaded = true,					\
+	.safe_reset = false,						\
+	.sleep_warm = false,						\
+	.pmgr_sys = 0x3a8,						\
+	.pmgr_cpu = 0x3c8,						\
+	.pmgr_subblock = 0x3d0,						\
+	/* Normal T6050 DARTs, as on T6041; SID0 is the host's. */	\
+	.dart_compatible = "apple,t6050-dart",				\
+	.dart_revision = 0x204,						\
+	.dapf_count = 5
+
+/*
+ * The macOS 27.2 (26B123) firmware (h17_ane0_fw_hyperion_j71y, RTKit
+ * 3514.41.1): iBoot preloads TEXT 0xbc000 and DATA 0x2b0000, DATA at
+ * 0x100_000b_c000, as on T8142. The loader fills ce_env (0x4000 at 0xb4f80)
+ * and text_env (0x20 at 0xb8f80); the code pin is from the image with both
+ * zeroed.
+ */
+static const u8 ane_t6050_code_26b123[] = {
+	0x9f, 0x3c, 0xc8, 0x2b, 0x43, 0xc6, 0x16, 0x80,
+	0xdf, 0x68, 0x06, 0x47, 0x10, 0x50, 0xc3, 0xd4,
+	0x69, 0xd6, 0x94, 0x7c, 0x6d, 0x7b, 0x9d, 0x84,
+	0x56, 0x63, 0xff, 0xe5, 0x89, 0x1a, 0xc7, 0x19,
+};
+
+static const struct ane_fw_platform ane_t6050_platform_26b123 = {
+	ANE_T6050_PLATFORM,
+	.build_name = "27.2 26B123",
+	.preload_dva = { 0x10000000000, 0x100000bc000 },
+	.preload_size = { 0xbc000, 0x2b0000 },
+	.text_code_pin = ane_t6050_code_26b123,
+	.text_env = { { 0xb4f80, 0x4000 }, { 0xb8f80, 0x20 } },
+};
+
+/*
+ * The macOS 27.0 (26A428) firmware (h17_ane0_fw_hyperion_j71y): TEXT 0xc0000
+ * and DATA 0x2ac000. The loader fills ce_env (0x4000 at 0xb8280; it carries
+ * a board table, so the J714s and the J716c load different TEXT) and
+ * text_env (0x20 at 0xbc280). text_pin is the J714s's TEXT as loaded; the
+ * code pin, from the image with both sections zeroed, admits either board.
+ */
+static const u8 ane_t6050_code_26a428[] = {
+	0xf8, 0x14, 0x14, 0x39, 0x08, 0x71, 0xd7, 0xd5,
+	0xeb, 0x1b, 0x4f, 0x7d, 0xdd, 0x5b, 0xdb, 0x25,
+	0x8b, 0xd9, 0x41, 0x44, 0x6e, 0xcc, 0xe1, 0x98,
+	0x3c, 0xe8, 0x70, 0x12, 0x48, 0x82, 0xdb, 0x29,
+};
+
 const struct ane_fw_platform ane_t6050_platform = {
-	.soc = 0x6050,
-	.chip_family = 17,
-	.ane_type = 0x220,
-	.hwx_subtype = 9,
-	.task_generation = 19,
-	.interrupt_count = 2,
-	.owner = ANE_FW_OWNER_EXCLAVE,
-	.reg_names = ane_h17_reg_names,
-	.reg_sizes = ane_h17_reg_sizes,
-	.reg_count = ARRAY_SIZE(ane_h17_reg_names),
-	.wrapper = 0x1600000,
-	.mailbox = 0x1608000,
-	.scratch = 0x1880028,
-	.doorbell = 0x1884000,
-	.irq_status = 0x188c000,
-	.irq_ack = 0x1890000,
+	ANE_T6050_PLATFORM,
+	.build_name = "27.0 26A428",
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
-	.stream_mask = BIT(0),
-	.firmware_preloaded = true,
-	.safe_reset = false,
-	.sleep_warm = false,
-	.pmgr_sys = 0x3a8,
-	.pmgr_cpu = 0x3c8,
-	.pmgr_subblock = 0x3d0,
-	/* Normal T6050 DARTs, as on T6041; SID0 is the host's. */
-	.dart_compatible = "apple,t6050-dart",
-	.dart_revision = 0x204,
-	.dapf_count = 5,
 	.text_pin = ane_t6050_text_pin_27_0,
+	.text_code_pin = ane_t6050_code_26a428,
+	.text_env = { { 0xb8280, 0x4000 }, { 0xbc280, 0x20 } },
+	.next_build = &ane_t6050_platform_26b123,
 };
 
 /*
  * The M5 (T8142, J813/J815) ANE: "ane,t8132exclave", ane-type 0x210,
  * exclave-assigned and preloaded by iBoot. From the T8142 ADT: ANE_SYS at
  * PMGR +0x2e8 (pmgr device 73, parent AFISOCNI3), ANE_CPU +0xc000 and
- * ANE_TDBASE +0xc008 as on T8140; four DAPF records. The macOS 27.0 (26A428)
- * stub's iBoot preloads TEXT 0xc0000 and DATA 0x2ac000 at T8140's IOVAs,
- * measured on a J815 under aura with TEXT sha256 1212c260...b6d4e3 (the 27.2
- * host's preload is 0xbc000/0x2b0000 at 0x100_000b_c000).
+ * ANE_TDBASE +0xc008 as on T8140; four DAPF records.
  *
  * Measured under aura's hypervisor on a J815 running macOS 27.2.1 (cold
  * model load, power-up and power-down traced): the PWGATE window at PMGR
@@ -195,6 +300,68 @@ const struct ane_fw_platform ane_t6050_platform = {
  * T8140's order: sub-block, PWGATE request 3, acknowledge 0, CPU, then
  * ANE_SYS. So sleep and the parked start follow T8140.
  */
+#define ANE_T8142_PLATFORM						\
+	.soc = 0x8142,							\
+	.chip_family = 17,						\
+	.ane_type = 0x210,						\
+	.hwx_subtype = 9,						\
+	.task_generation = 19,						\
+	.interrupt_count = 2,						\
+	.owner = ANE_FW_OWNER_EXCLAVE,					\
+	.reg_names = ane_h17_reg_names,					\
+	.reg_sizes = ane_h17_reg_sizes,					\
+	.reg_count = ARRAY_SIZE(ane_h17_reg_names),			\
+	.wrapper = 0x1600000,						\
+	.mailbox = 0x1608000,						\
+	.scratch = 0x1880028,						\
+	.doorbell = 0x1884000,						\
+	.irq_status = 0x188c000,					\
+	.irq_ack = 0x1890000,						\
+	.stream_mask = BIT(0),						\
+	.firmware_preloaded = true,					\
+	.safe_reset = false,						\
+	/* Exclave mode at boot, cold sleep cycle and parked start. */	\
+	.exclave_mode_stop = true,					\
+	.macos_sleep = true,						\
+	.sleep_warm = false,						\
+	.pmgr_sys = 0x2e8,						\
+	.pmgr_cpu = 0xc000,						\
+	.pmgr_subblock = 0xc008,					\
+	.dart_compatible = "apple,t8142-ane-dart",			\
+	.dart_revision = 0x204,						\
+	.dapf_count = 4
+
+/*
+ * The macOS 27.2 (26B123) firmware, which 27.2.1 (26B131) ships unchanged:
+ * the 27.2 host ADT has iBoot preload TEXT 0xbc000 and DATA 0x2b0000, DATA
+ * at 0x100_000b_c000; both end where 27.0's do. Its TEXT has two sections
+ * the loader fills: ce_env (0x4000 bytes at 0xb4f80, new in this build, all
+ * zero in the image but its first byte) and text_env (0x20 at 0xb8f80). The
+ * code pin is from the image (h17_ane_fw_theia_j73y, RTKit 3514.41.1) with
+ * both zeroed; with text_env alone the first J815 boot missed it.
+ */
+static const u8 ane_t8142_code_26b123[] = {
+	0x9b, 0x57, 0x48, 0x67, 0x90, 0xff, 0x41, 0x45,
+	0x8e, 0x1d, 0x33, 0x46, 0x34, 0xed, 0x36, 0x53,
+	0xa4, 0xb4, 0xd3, 0xcd, 0xf4, 0x43, 0xe2, 0x17,
+	0x7d, 0x95, 0x6d, 0x11, 0x1d, 0xa7, 0xf4, 0xc2,
+};
+
+static const struct ane_fw_platform ane_t8142_platform_26b123 = {
+	ANE_T8142_PLATFORM,
+	.build_name = "27.2 26B123",
+	.preload_dva = { 0x10000000000, 0x100000bc000 },
+	.preload_size = { 0xbc000, 0x2b0000 },
+	.text_code_pin = ane_t8142_code_26b123,
+	.text_env = { { 0xb4f80, 0x4000 }, { 0xb8f80, 0x20 } },
+};
+
+/*
+ * The macOS 27.0 (26A428) stub's iBoot preloads TEXT 0xc0000 and DATA
+ * 0x2ac000 at T8140's IOVAs. TEXT as loaded was measured on a J815 under
+ * aura; it differs from the image's (RTKit 3514.0.15) only by what iBoot
+ * writes into text_env (0xbc280), which the code pin leaves out.
+ */
 static const u8 ane_t8142_text_26a428[] = {
 	0x12, 0x12, 0xc2, 0x60, 0x6e, 0xf8, 0xca, 0xce,
 	0x51, 0xfd, 0x95, 0x1e, 0x60, 0xbc, 0xce, 0x75,
@@ -202,39 +369,22 @@ static const u8 ane_t8142_text_26a428[] = {
 	0xac, 0x3b, 0x58, 0x07, 0x49, 0xd6, 0xb4, 0xe3,
 };
 
+static const u8 ane_t8142_code_26a428[] = {
+	0xaa, 0x5c, 0x7b, 0xd4, 0xdb, 0x5b, 0x17, 0x25,
+	0x5d, 0x4a, 0x16, 0xa5, 0x80, 0x06, 0xca, 0x37,
+	0x96, 0x26, 0xf3, 0x91, 0x58, 0x1b, 0x9c, 0x49,
+	0x0a, 0xcd, 0x7c, 0x56, 0x6f, 0xda, 0x24, 0x9c,
+};
+
 const struct ane_fw_platform ane_t8142_platform = {
-	.soc = 0x8142,
-	.chip_family = 17,
-	.ane_type = 0x210,
-	.hwx_subtype = 9,
-	.task_generation = 19,
-	.interrupt_count = 2,
-	.owner = ANE_FW_OWNER_EXCLAVE,
-	.reg_names = ane_h17_reg_names,
-	.reg_sizes = ane_h17_reg_sizes,
-	.reg_count = ARRAY_SIZE(ane_h17_reg_names),
-	.wrapper = 0x1600000,
-	.mailbox = 0x1608000,
-	.scratch = 0x1880028,
-	.doorbell = 0x1884000,
-	.irq_status = 0x188c000,
-	.irq_ack = 0x1890000,
+	ANE_T8142_PLATFORM,
+	.build_name = "27.0 26A428",
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
-	.stream_mask = BIT(0),
-	.firmware_preloaded = true,
-	.safe_reset = false,
-	/* Exclave mode at boot, cold sleep cycle and parked start, as on T8140. */
-	.exclave_mode_stop = true,
-	.macos_sleep = true,
-	.sleep_warm = false,
-	.pmgr_sys = 0x2e8,
-	.pmgr_cpu = 0xc000,
-	.pmgr_subblock = 0xc008,
-	.dart_compatible = "apple,t8142-ane-dart",
-	.dart_revision = 0x204,
-	.dapf_count = 4,
 	.text_pin = ane_t8142_text_26a428,
+	.text_code_pin = ane_t8142_code_26a428,
+	.text_env = { { 0xbc280, 0x20 } },
+	.next_build = &ane_t8142_platform_26b123,
 };
 
 /*
@@ -266,6 +416,30 @@ int ane_fw_preload_range(struct device_node *np, unsigned int index, u64 *phys, 
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_fw_preload_range);
+
+/*
+ * The build whose preload layout the loader handed over: the SoC's own data
+ * or one of its next_build entries. Anything else (no usable hand-off, an
+ * unknown layout) keeps the SoC's own data, which then refuses as before.
+ */
+const struct ane_fw_platform *ane_fw_platform_build(struct device_node *np,
+						    const struct ane_fw_platform *soc)
+{
+	const struct ane_fw_platform *build;
+	u64 phys[2], size[2], dva[2];
+
+	if (!soc->next_build ||
+	    of_property_count_u64_elems(np, "apple,firmware-iovas") != 2 ||
+	    of_property_read_u64_array(np, "apple,firmware-iovas", dva, 2) ||
+	    ane_fw_preload_range(np, 0, &phys[0], &size[0]) ||
+	    ane_fw_preload_range(np, 1, &phys[1], &size[1]))
+		return soc;
+	for (build = soc; build; build = build->next_build)
+		if (ane_fw_preload_ranges_valid(build, phys, size, dva))
+			return build;
+	return soc;
+}
+EXPORT_SYMBOL_GPL(ane_fw_platform_build);
 
 static int ane_fw_preload_check(struct device *dev,
 				const struct ane_fw_platform *soc)
@@ -311,6 +485,12 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 	unsigned int i;
 	int ret;
 
+	/* Refuse unqualified SoCs before resources, DMA, power or MMIO. */
+	if (!soc->boot_qualified)
+		return dev_err_probe(dev, -EOPNOTSUPP,
+			"ANE boot unqualified for SoC %#x; requires owner qualification and bootloader firmware preload support\n",
+			soc->soc);
+
 	/* No backend has acquired ownership, even if DT omits the marker.
 	 * Check before resources, firmware, power, IOMMU or engine access.
 	 */
@@ -353,7 +533,8 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 			"H16 requires bootloader-reserved no-map TEXT/DATA preload ranges\n");
 
 	if (!soc->h16_profile_count || !soc->h16_mmio_count || soc->dapf_dart >= 3 ||
-	    !soc->dapf_size || of_property_count_u64_elems(np, "apple,dapf-ranges") != 8)
+	    !soc->dapf_size || !soc->dapf_count || soc->dapf_count > ANE_FW_DAPF_MAX ||
+	    of_property_count_u64_elems(np, "apple,dapf-ranges") != soc->dapf_count * 2)
 		return -ENODATA;
 	return 0;
 }

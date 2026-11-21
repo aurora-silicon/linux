@@ -46,6 +46,18 @@ $defs:
         - description: Bits to set
     description: Register initialization tuples for one controller region.
 
+  endpoint-smc-writes:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 4
+    items:
+      items:
+        - description: The SMC key
+        - description: The first four bytes written, most significant first
+        - description: The last four bytes written, most significant first
+        - description: The wait after the write, in microseconds
+    description: SMC writes, in order.
+
   t6050-tunable:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     items:
@@ -294,6 +306,46 @@ patternProperties:
         description:
           T6050 root complex tunables for the Gen5 rate shadow registers,
           applied with apple,pcie-rc-tunables.
+
+      apple,function-warm-reset:
+        $ref: /schemas/types.yaml#/definitions/phandle-array
+        items:
+          - items:
+              - description: The SMC
+              - description: The SMC key that resets the endpoint
+              - description: The function's argument, as the firmware gives it
+        description:
+          The endpoint's warm reset. An endpoint whose firmware does not
+          survive a firmware sleep is reset with it after the wake, while
+          the port is still down, and boots again once the link is up.
+
+      apple,warm-reset-writes:
+        $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        minItems: 1
+        maxItems: 4
+        items:
+          items:
+            - description:
+                The four bytes written to the warm reset's key, from the
+                cell's most significant byte down
+            - description: The wait after the write, in microseconds
+              maximum: 100000
+        description:
+          The writes that give the warm reset, in order. Set by the
+          bootloader; without it the host gives no warm reset.
+
+      apple,endpoint-sleep-smc-writes:
+        $ref: '#/$defs/endpoint-smc-writes'
+        description:
+          Written by the endpoint's driver to the warm reset's SMC once the
+          endpoint is released for a firmware sleep. Set by the bootloader.
+
+      apple,endpoint-wake-smc-writes:
+        $ref: '#/$defs/endpoint-smc-writes'
+        description:
+          Written by the endpoint's driver to the warm reset's SMC after the
+          wake, before the endpoint is enumerated again. Set by the
+          bootloader.
 
     required:
       - interrupt-controller

@@ -171,6 +171,8 @@ struct sio_hw_data {
 	bool firmware_without_tables;
 	/* macOS idles this firmware in the sleep's last step: leave it running until then. */
 	bool stop_at_commit;
+	/* Stopped by the sleep's commit, not in suspend_late */
+	bool commit_stop;
 	/* DMA arrays owned by the driver, if not protocol 9's */
 	const struct sio_dma_arrays *arrays;
 	int (*check_boot_tables)(struct device *dev);
@@ -190,6 +192,9 @@ struct sio_data {
 	bool commit_registered;
 	bool commit_used;
 	u32 protocol;
+	/* The channel configuration's threshold and limit words */
+	u32 fifo_threshold;
+	u32 cfg_word4;
 	void *shmem;
 	dma_addr_t shmem_iova;
 	void *responses;
@@ -417,6 +422,7 @@ static int sio_t6030_check_boot_tables(struct device *dev)
 #define SIO_T6041_RESPONSES		0x1cc0
 #define SIO_T6041_RESPONSE_SIZE		16
 #define SIO_T6041_KEY_CPU_POWER_GATE	0x2a
+#define SIO_T6041_KEY_TUNABLES		0x1e
 
 enum sio_t6041_kind {
 	SIO_T6041_REQUIRED,	/* an address and its exact size */
@@ -431,7 +437,7 @@ static const struct sio_t6041_param {
 } sio_t6041_params[] = {
 	{ 0x0f, SIO_T6041_REQUIRED, 0x1e000 },	/* panic buffer */
 	{ 0x1a, SIO_T6041_REQUIRED, 4 * 16 },	/* map ranges */
-	{ 0x1e, SIO_T6041_REQUIRED, 0x30 },	/* ASC-wrapper tunables */
+	{ SIO_T6041_KEY_TUNABLES, SIO_T6041_REQUIRED, 0x30 },	/* ASC-wrapper tunables */
 	{ 0x20, SIO_T6041_OPTIONAL },		/* miscellaneous tunables */
 	{ 0x24, SIO_T6041_OPTIONAL },		/* power-state registers */
 	{ 0x28, SIO_T6041_OPTIONAL },		/* SIO registers */
@@ -468,7 +474,7 @@ static int sio_t6041_param_index(u32 key, bool *size)
  */
 static int sio_t6041_collect(const u32 *params, unsigned int nparams,
 			     const struct sio_t6030_window *windows, unsigned int nwindows,
-			     u32 *addr, u32 *size)
+			     u32 *addr, u32 *size, bool no_tunables)
 {
 	unsigned long seen = 0;
 	unsigned int i, j;
@@ -501,7 +507,8 @@ static int sio_t6041_collect(const u32 *params, unsigned int nparams,
 		if (have_addr != have_size)
 			return -EINVAL;
 		if (!have_addr) {
-			if (p->kind == SIO_T6041_REQUIRED)
+			if (p->kind == SIO_T6041_REQUIRED &&
+			    !(no_tunables && p->key == SIO_T6041_KEY_TUNABLES))
 				return -EINVAL;
 			continue;
 		}
@@ -545,7 +552,9 @@ static int sio_t6041_check_node(struct device_node *np, u32 *addr, u32 *size)
 	nwindows = sio_t6030_windows(np, windows, ARRAY_SIZE(windows));
 	if (nwindows < 0)
 		return nwindows;
-	return sio_t6041_collect(params, nparams, windows, nwindows, addr, size);
+	/* T6050's ADT has no ASC-wrapper tunables. */
+	return sio_t6041_collect(params, nparams, windows, nwindows, addr, size,
+				 of_device_is_compatible(np, "apple,t6050-sio"));
 }
 
 static int sio_t6041_check_boot_tables(struct device *dev)
@@ -673,7 +682,31 @@ static const struct sio_hw_data sio_hw_t8140 = {
 	.send_dt_params = sio_t6041_send_dt_params,
 };
 
+/*
+ * T6041's, less the tunables (sio_t6041_check_node), and stopped by the sleep's commit. Its
+ * channel words come from the device tree, else they are the generic ones.
+ */
+static const struct sio_hw_data sio_hw_t6050 = {
+	.protocol = 10,
+	.cfg_six_words = true,
+	.clear_period_desc = true,
+	.commit_stop = true,
+	.arrays = &sio_t6041_arrays,
+	.check_boot_tables = sio_t6041_check_boot_tables,
+	.send_dt_params = sio_t6041_send_dt_params,
+};
+
+/*
+ * The T6050 description is in force on the board it has run on. On another T6050 board the
+ * node is taken as before: by its generic compatible.
+ */
+static bool sio_t6050_board(void)
+{
+	return of_machine_is_compatible("apple,j714s");
+}
+
 static const struct of_device_id sio_of_match[] = {
+	{ .compatible = "apple,t6050-sio", .data = &sio_hw_t6050 },
 	{ .compatible = "apple,t6041-sio", .data = &sio_hw_t6041 },
 	{ .compatible = "apple,t8140-sio", .data = &sio_hw_t8140 },
 	{ .compatible = "apple,t6030-sio", .data = &sio_hw_t6030 },
@@ -1667,13 +1700,13 @@ static int sio_device_config(struct dma_chan *chan,
 
 	cfg.timeout = 0;
 	cfg.fifo = 0x800;
-	cfg.limit = sio->hw->cfg_word4;
+	cfg.limit = sio->cfg_word4;
 	/*
 	 * The ADT records each client's channel configuration with it (the
 	 * dp-audioN dma-channels: channel, data shape, timeout, FIFO size,
 	 * threshold). T6030's DisplayPort audio channels refill at 0x600.
 	 */
-	cfg.threshold = sio->hw->fifo_threshold;
+	cfg.threshold = sio->fifo_threshold;
 
 	/*
 	 * Dmaengine prescribes we ought to apply the new configuration only
@@ -1936,7 +1969,7 @@ badprop:
 	return dev_err_probe(sio->dev, err, "failed to read '%s'\n", propname);
 }
 
-/* Interrupts off, one CPU: the idle pair and the closed mailbox. The caller clears the run bit. */
+/* Interrupts off, one CPU: the idle pair and receive off. The sleep clears the run bit twice. */
 static int sio_commit_stop(void *data)
 {
 	struct sio_data *sio = data;
@@ -1946,7 +1979,7 @@ static int sio_commit_stop(void *data)
 	ret = apple_rtkit_sleep_idle_polled(sio->rtk, sio->base + REG_CPU_CONTROL, &us);
 	apple_rtkit_mailbox_recv_off(sio->rtk);
 
-	return ret ? 1 : 0;
+	return ret;
 }
 
 static int sio_probe(struct platform_device *pdev)
@@ -1964,6 +1997,8 @@ static int sio_probe(struct platform_device *pdev)
 	if (!match)
 		return -ENODEV;
 	hw = match->data;
+	if (hw == &sio_hw_t6050 && !sio_t6050_board())
+		hw = &sio_hw_generic;
 	/* Refuse incompatible firmware tables before DMA or hardware setup. */
 	firmware_only = hw->firmware_only;
 	if (hw->check_boot_tables) {
@@ -1992,6 +2027,12 @@ static int sio_probe(struct platform_device *pdev)
 	sio->nchannels = nchannels;
 	sio->hw = hw;
 	sio->firmware_only = firmware_only;
+
+	/* The device tree's channel words if it gives them, else the SoC's, else the generic ones. */
+	sio->fifo_threshold = hw->fifo_threshold ?: sio_hw_generic.fifo_threshold;
+	sio->cfg_word4 = hw->cfg_word4 ?: sio_hw_generic.cfg_word4;
+	of_property_read_u32(np, "apple,channel-threshold", &sio->fifo_threshold);
+	of_property_read_u32(np, "apple,channel-limit", &sio->cfg_word4);
 
 	sio->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(sio->base))
@@ -2080,6 +2121,13 @@ static int sio_probe(struct platform_device *pdev)
 	if (err < 0)
 		return err;
 
+	if (hw->commit_stop) {
+		err = apple_sleep_coproc_register(&pdev->dev, sio->base, false, sio_commit_stop, sio);
+		if (err)
+			return dev_err_probe(&pdev->dev, err, "registering the sleep's stop\n");
+		apple_sleep_coproc_set_early(&pdev->dev);
+	}
+
 	err = dma_async_device_register(&sio->dma);
 	if (err)
 		return dev_err_probe(&pdev->dev, err, "failed to register DMA device\n");
@@ -2094,7 +2142,12 @@ rpm_put:
 	if (!err && hw->stop_at_commit)
 		sio->commit_registered = !apple_sleep_coproc_register(&pdev->dev, sio->base, false,
 								      sio_commit_stop, sio);
-	pm_runtime_put(&pdev->dev);
+	/*
+	 * One stopped by the sleep's commit runs until then: a runtime suspend would let its domain
+	 * go off under the firmware.
+	 */
+	if (!hw->commit_stop)
+		pm_runtime_put(&pdev->dev);
 
 	return err;
 }
@@ -2103,7 +2156,7 @@ static void sio_remove(struct platform_device *pdev)
 {
 	struct sio_data *sio = platform_get_drvdata(pdev);
 
-	if (sio->commit_registered)
+	if (sio->commit_registered || sio->hw->commit_stop)
 		apple_sleep_coproc_unregister(&pdev->dev);
 	if (sio->firmware_only)
 		return;
@@ -2138,6 +2191,21 @@ static bool sio_chan_busy(struct sio_chan *siochan)
 	return busy;
 }
 
+/* One stopped in the commit stays up through the system suspend. */
+static __maybe_unused int sio_system_suspend(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+
+	return sio->hw->commit_stop ? 0 : pm_runtime_force_suspend(dev);
+}
+
+static __maybe_unused int sio_system_resume(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+
+	return sio->hw->commit_stop ? 0 : pm_runtime_force_resume(dev);
+}
+
 static __maybe_unused int sio_suspend_late(struct device *dev)
 {
 	struct sio_data *sio = dev_get_drvdata(dev);
@@ -2156,6 +2224,11 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 	if (sio->commit_registered && apple_sleep_commit_stops_coprocs()) {
 		apple_sleep_coproc_set_ready(dev, true);
 		sio->commit_used = true;
+		sio->asleep = true;
+		return 0;
+	}
+	if (sio->hw->commit_stop) {
+		apple_sleep_coproc_set_ready(dev, true);
 		sio->asleep = true;
 		return 0;
 	}
@@ -2181,6 +2254,7 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 static __maybe_unused int sio_resume_early(struct device *dev)
 {
 	struct sio_data *sio = dev_get_drvdata(dev);
+	bool t6050;
 	int ret;
 
 	if (!sio->asleep)
@@ -2196,6 +2270,8 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 			return 0;
 		}
 	}
+	if (sio->hw->commit_stop)
+		apple_sleep_coproc_set_ready(dev, false);
 	/*
 	 * A refused sleep: an idled firmware doesn't wake with its power kept, and SIO_CPU shares
 	 * SIO's switch, so it can't be power-cycled alone. The sleep engine's own PMGR reset of it
@@ -2221,19 +2297,26 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 	}
 	/* Endpoints and parameters stay with the firmware: nothing is sent again. */
 	ret = apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL);
+	t6050 = sio->hw == &sio_hw_t6050;
 	if (ret) {
 		/* Still down: the next sleep restarts it, or resets it if refused. */
-		dev_err(dev, "firmware did not come back from sleep: %d\n", ret);
+		dev_err(dev, "%sfirmware did not come back from sleep: %d\n",
+			t6050 ? "SIO: not restarted after the sleep: " : "", ret);
 		return 0;
 	}
 	sio->asleep = false;
-	dev_dbg(dev, "firmware back from sleep\n");
+	/* T6050: one line per wake: the start reply's line is the probe's alone. */
+	if (t6050)
+		dev_info(dev, "SIO: restarted after the sleep, firmware up, protocol v%u, CPU control 0x%x\n",
+			 sio->protocol, readl(sio->base + REG_CPU_CONTROL));
+	else
+		dev_dbg(dev, "firmware back from sleep\n");
 
 	return 0;
 }
 
 static const struct dev_pm_ops sio_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	SYSTEM_SLEEP_PM_OPS(sio_system_suspend, sio_system_resume)
 	LATE_SYSTEM_SLEEP_PM_OPS(sio_suspend_late, sio_resume_early)
 	RUNTIME_PM_OPS(sio_suspend, sio_resume, NULL)
 };

@@ -524,6 +524,13 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_USERPTR ((1ULL) << 37)
 
+/*
+ * DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT: render commands accept
+ * DRM_ASAHI_RENDER_MESH_OUTPUT. A feature bit like those of enum
+ * drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT ((1ULL) << 38)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 
@@ -772,6 +779,10 @@ struct drm_asahi_gem_create {
  * mapping pins the page-cache pages themselves, which then stay resident
  * while the object lives. Device and PFN mappings, including CPU mappings of
  * other buffer objects, are refused (EFAULT).
+ *
+ * In a process whose page size is smaller than the native one, a native page
+ * is accepted only where the process maps all of it, in order at consecutive
+ * addresses; otherwise the call fails with EFAULT.
  *
  * The object cannot be mapped with DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET, exported,
  * given advice with DRM_IOCTL_ASAHI_GEM_MADVISE, bound with
@@ -1667,6 +1678,14 @@ enum drm_asahi_render_flags {
 	 * struct drm_asahi_g18_render_resources. Any bytes after it are zero.
 	 */
 	DRM_ASAHI_RENDER_G18_RESOURCES = (1U << 25),
+
+	/**
+	 * @DRM_ASAHI_RENDER_MESH_OUTPUT: The render contains mesh shading. The
+	 * kernel may size the render's tiler heap for mesh output ahead of it.
+	 * A hint only: a render without the flag is still correct to submit.
+	 * Requires DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT.
+	 */
+	DRM_ASAHI_RENDER_MESH_OUTPUT = (1U << 26),
 };
 
 /**

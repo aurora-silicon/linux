@@ -13,9 +13,13 @@ that independent rows need not describe exactly the same instant.
   An idle installed QID is reused by its existing engine, never cancelled or
   retyped. Published QIDs need not return to zero after the last client exits.
 * Render slot ``used`` excludes released, inactive slots that can be reassigned.
-  ``retained`` includes those slots; ``active``, ``quarantined`` and ``kill_held``
-  explain why a released owner can still occupy capacity. A published context
-  kill retains its render holds until processor stop under the current policy.
+  ``retained`` includes those slots; ``active``, ``quarantined``, ``kill_held``
+  and ``held`` explain why a released owner can still occupy capacity. A published
+  context kill retains its render holds until processor stop under the current
+  policy. A ``held`` slot's pair cannot be bound by another owner: it keeps work that no
+  other owner can bind past (a quarantine or owed completion stamps), or its closed
+  owner's scheduler release is not consumed yet. Only its own open owner uses it, until
+  the pair drains, the release is consumed and the pair parked, or the processors stop.
 * Compute slots include retained graphs and off-lock construction reservations.
   ``reusable`` counts graphs immediately available for another owner. A vacant
   graph still needs fresh pool backing; a populated recycled graph cannot rebind

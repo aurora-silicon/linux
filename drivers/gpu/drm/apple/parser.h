@@ -28,6 +28,8 @@ struct dcp_parse_ctx {
 	bool ambiguous_180hz;
 	/* Desktop 26.6 uses zero placeholders for an unreported VRR range. */
 	bool zero_vrr_range_fallback;
+	/* Desktop 26.6 internal panels take a deadline at every timing. */
+	bool internal_present_deadline;
 	/*
 	 * A desktop 26.x external processor: read the sink timing keys that
 	 * describe the preferred timing for the firmware-derived EDID, without

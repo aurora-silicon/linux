@@ -11,7 +11,7 @@ use crate::g17::{
     },
     object::{Allocator, CpuMap, KernelObject, Placement},
 };
-use crate::{hw::t8140::{dynamic, resources as cfg}, mmu};
+use crate::{hw::t8140::resources as cfg, mmu};
 use kernel::prelude::*;
 
 /// Offsets within a single client allocation, not fixed GPU addresses.
@@ -103,7 +103,7 @@ impl Generation {
         board: Option<&'static Board>) -> Result<KernelObject> {
         let (range, layout) = if alloc.uat.is_m5() {
             (BlockGeometry::M5_COMPACT, Layout::m5(board.ok_or(EINVAL)?))
-        } else { (dynamic::CLIENT_LOWER, Layout::NEO) };
+        } else { (vm.client_private_range(), Layout::NEO) };
         KernelObject::new(alloc.dev, vm, Placement::In(range, cfg::TVB_PAGE), layout.bytes,
             mmu::PROT_GPU_FW_SHARED_RW, CpuMap::WriteCombined)
     }

@@ -1258,6 +1258,9 @@ static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)
 	for (granularity = 250; tmp / granularity > 255 && granularity <= 1000;
 	     granularity *= 2)
 		;
+	/* The host's own OS programs these adapters at 1 Gb/s. */
+	if (tb_port_dp_bw_held_ack(in))
+		granularity = 1000;
 
 	tb_tunnel_dbg(tunnel, "granularity %d Mb/s\n", granularity);
 
@@ -3095,8 +3098,10 @@ int tb_tunnel_wake(struct tb_tunnel *tunnel)
 	tunnel->sleep_replay = true;
 	if (tunnel->pre_activate)
 		ret = tunnel->pre_activate(tunnel);
-	for (i = 0; !ret && i < tunnel->npaths; i++)
+	for (i = 0; !ret && i < tunnel->npaths; i++) {
+		tunnel->paths[i]->sleep_lost = tunnel->sleep_lost;
 		ret = tb_path_wake(tunnel->paths[i]);
+	}
 	if (!ret && tunnel->activate)
 		ret = tunnel->activate(tunnel, true);
 	tunnel->sleep_replay = false;

@@ -393,7 +393,14 @@ out:
 	if (ret)
 		aes->errors++;
 	memzero_explicit(next, sizeof(next));
+
+	/*
+	 * The request is done in the engine kthread, but crypto_finalize_*()
+	 * runs the completion callback, which expects softirq context.
+	 */
+	local_bh_disable();
 	crypto_finalize_skcipher_request(engine, req, ret);
+	local_bh_enable();
 	return 0;
 }
 

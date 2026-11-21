@@ -46,6 +46,8 @@ void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept);
 
 /* The same from the PHY's work, for after a wake; the flush waits for it. */
 void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept);
+/* Nonblocking admission query; the caller serializes finish requests into epochs. */
+bool apple_atcphy_sleep_finish_done(struct phy *usb2_phy);
 void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy);
 
 /* ACIO owns this transaction; @phy is its shared USB3 lane PHY handle. */
@@ -77,6 +79,11 @@ static inline void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool ke
 {
 }
 
+static inline bool apple_atcphy_sleep_finish_done(struct phy *usb2_phy)
+{
+	return true;
+}
+
 static inline void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy)
 {
 }
@@ -102,5 +109,37 @@ static inline int apple_atcphy_cio_finish(struct phy *phy)
 }
 
 #endif
+
+/*
+ * The T6050 combo PHY (apple-t6050-dp-phy) under a USB4 router that sleeps in place: @dev is
+ * the PHY's device. Its module may load after the caller's: take these with symbol_get().
+ */
+int apple_t6050_phy_cio_prepare(struct device *dev);
+int apple_t6050_phy_cio_off(struct device *dev);
+int apple_t6050_phy_cio_on(struct device *dev);
+int apple_t6050_phy_cio_finish(struct device *dev);
+int apple_t6050_phy_cio_lost(struct device *dev);
+
+/*
+ * TEST (J714s): the port's USB host on a USB4 router's USB3 tunnel, kept through the router's
+ * sleep in place. The router's host BINDs and UNBINDs, the USB controller asks to KEEP its
+ * host at the sleep's start, the router's host PARKs it once the router firmware has taken
+ * its sleep (or once a refused sleep has woken the router), and the USB controller takes the
+ * RESULT after the wake: one of APPLE_T6050_CIO_USB_* or an error.
+ */
+enum apple_t6050_cio_usb {
+	APPLE_T6050_CIO_USB_BIND,
+	APPLE_T6050_CIO_USB_UNBIND,
+	APPLE_T6050_CIO_USB_KEEP,
+	APPLE_T6050_CIO_USB_PARK,
+	APPLE_T6050_CIO_USB_RESULT,
+};
+/* Kept on the tunnel's PIPE, untouched: xHCI resumes with its state. */
+#define APPLE_T6050_CIO_USB_KEPT	0
+/* PIPE parked on its dummy producer, the controller kept its registers: USB3 restarts later. */
+#define APPLE_T6050_CIO_USB_PARKED	1
+/* The PHY lost the controller in a firmware sleep: set it up again, xHCI starts over. */
+#define APPLE_T6050_CIO_USB_LOST	2
+int apple_t6050_phy_cio_usb(struct device *dev, enum apple_t6050_cio_usb step);
 
 #endif

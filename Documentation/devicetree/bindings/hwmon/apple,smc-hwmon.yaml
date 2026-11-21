@@ -64,7 +64,10 @@ properties:
       unsupported format are skipped. These channels do not change the indices
       used by thermal-sensors references to temperature-* children. With
       apple,discover-temperatures, a listed key adds no channel; its
-      discovered channel (labelled with the key) supplies the zone.
+      discovered channel (labelled with the key) supplies the zone. Likewise,
+      a listed key whose temperature-* child has
+      apple,no-data-below-millicelsius adds no channel; that child supplies
+      the zone, and its readings below the threshold are left out of it.
 
   apple,thermal-pressure-key:
     $ref: /schemas/types.yaml#/definitions/string

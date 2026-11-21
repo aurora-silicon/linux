@@ -99,5 +99,7 @@ int centauri_alpha_resources(struct centauri *c, struct cen_alpha_resources *res
 int centauri_alpha_log_buffer(struct centauri *c, void **cpu, dma_addr_t *dma, size_t *size);
 int centauri_wifi_register(struct centauri *c);
 void centauri_wifi_unregister(struct centauri *c);
+int centauri_wifi_suspend(struct centauri *c);
+int centauri_wifi_resume(struct centauri *c);
 void centauri_wifi_kick(struct centauri *c);
 #endif

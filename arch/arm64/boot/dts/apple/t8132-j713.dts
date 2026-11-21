@@ -293,3 +293,19 @@
 	phys = <&atcphy1 PHY_TYPE_USB3>;
 	phy-names = "cio";
 };
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};

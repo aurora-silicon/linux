@@ -295,14 +295,15 @@ static void preload_layout_select_test(struct kunit *test)
  * records frame cleanly when written at their offsets, and an identity no
  * other profile shares. Synthetic bytes never authenticate as a profile.
  */
-static void preload_profiles_test(struct kunit *test)
+static void preload_profiles_check(struct kunit *test, const struct ane_h16_profile *profiles,
+				   unsigned int count)
 {
 	struct preload_fixture *f = test->priv;
 	unsigned int i, j, k;
 
-	KUNIT_ASSERT_GT(test, ARRAY_SIZE(ane_h16_profiles), 0);
-	for (i = 0; i < ARRAY_SIZE(ane_h16_profiles); i++) {
-		const struct ane_h16_profile *p = &ane_h16_profiles[i];
+	KUNIT_ASSERT_GT(test, count, 0);
+	for (i = 0; i < count; i++) {
+		const struct ane_h16_profile *p = &profiles[i];
 		const struct ane_h16_preload_rule *r = p->preload;
 		u8 digest[SHA256_DIGEST_SIZE];
 
@@ -323,14 +324,54 @@ static void preload_profiles_test(struct kunit *test)
 							       ANE_H16_PRELOAD_DATA_SIZE),
 				-ENOEXEC);
 		for (j = 0; j < i; j++) {
-			KUNIT_EXPECT_NE(test, memcmp(r->digest, ane_h16_profiles[j].preload->digest,
+			KUNIT_EXPECT_NE(test, memcmp(r->digest, profiles[j].preload->digest,
 						     SHA256_DIGEST_SIZE), 0);
-			KUNIT_EXPECT_STRNEQ(test, p->identity, ane_h16_profiles[j].identity);
+			KUNIT_EXPECT_STRNEQ(test, p->identity, profiles[j].identity);
 		}
 	}
 }
 
+static void preload_profiles_test(struct kunit *test)
+{
+	unsigned int i, j;
+
+	preload_profiles_check(test, ane_h16_profiles, ARRAY_SIZE(ane_h16_profiles));
+	preload_profiles_check(test, ane_t8132_profiles, ARRAY_SIZE(ane_t8132_profiles));
+	/* The T6041 and the T8132 never accept each other's firmware. */
+	for (i = 0; i < ARRAY_SIZE(ane_t8132_profiles); i++) {
+		KUNIT_EXPECT_FALSE(test, ane_t8132_profiles[i].require_dart_unlocked);
+		for (j = 0; j < ARRAY_SIZE(ane_h16_profiles); j++) {
+			KUNIT_EXPECT_EQ(test, ane_h16_profiles[j].require_dart_unlocked,
+					ane_h16_profiles[j].preload == &ane_h16_preload_26b123);
+			KUNIT_EXPECT_NE(test, memcmp(ane_t8132_profiles[i].preload->digest,
+						     ane_h16_profiles[j].preload->digest,
+						     SHA256_DIGEST_SIZE), 0);
+			KUNIT_EXPECT_STRNEQ(test, ane_t8132_profiles[i].identity,
+					    ane_h16_profiles[j].identity);
+		}
+	}
+}
+
+static void preload_26b123_ce_script_test(struct kunit *test)
+{
+	struct preload_fixture *f = test->priv;
+	u8 baseline[SHA256_DIGEST_SIZE], digest[SHA256_DIGEST_SIZE];
+	static const u32 positions[] = { 0xb9040, 0xba094, 0xbd03f };
+	unsigned int i;
+
+	f->rule = ane_h16_preload_26b123;
+	KUNIT_ASSERT_EQ(test, preload_digest(f, baseline), 0);
+	/* The entire live CE script stays in the identity, including its padding. */
+	for (i = 0; i < ARRAY_SIZE(positions); i++) {
+		f->text[positions[i]] ^= 1;
+		KUNIT_ASSERT_EQ(test, preload_digest(f, digest), 0);
+		KUNIT_EXPECT_NE(test, memcmp(digest, baseline, sizeof(digest)), 0);
+		f->text[positions[i]] ^= 1;
+	}
+}
+
 static struct kunit_case preload_cases[] = {
+	KUNIT_CASE(preload_26b123_ce_script_test),
 	KUNIT_CASE(preload_identity_test),
 	KUNIT_CASE(preload_mutable_test),
 	KUNIT_CASE(preload_framing_test),

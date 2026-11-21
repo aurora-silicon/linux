@@ -223,6 +223,8 @@ def brightness_takeover(root):
 #define DCP_FIRMWARE_H17P 1
 #define DCP_FIRMWARE_V_27_0 6
 #define DCP_IOMFB_METHODS_H17G 7
+static bool v27_keep_level = true;
+static bool pm_suspend_via_firmware(void) {return false;}
 #define MAX_BRIGHTNESS_PART2 510U
 #define BACKLIGHT_PLATFORM 1
 #define BACKLIGHT_SCALE_LINEAR 1

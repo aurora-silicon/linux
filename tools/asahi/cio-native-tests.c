@@ -8,7 +8,11 @@
 #include <string.h>
 #include <setjmp.h>
 #include <errno.h>
+typedef uint8_t u8;
+typedef uint16_t u16;
 typedef uint32_t u32;
+typedef int64_t s64;
+#define __iomem
 #define BIT(n) (1U << (n))
 #define GENMASK(h, l) ((~0U << (l)) & (~0U >> (31 - (h))))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
@@ -19,9 +23,35 @@ typedef uint32_t u32;
 #define PM_SUSPEND_MEM 3
 /* The MMIO mock records write order synchronously. */
 #define wmb() ((void)0)
-#define dev_warn(...) ((void)0)
-#define dev_info(...) ((void)0)
-#define dev_err(...) ((void)0)
+/* Arguments are not evaluated, but they are used: a diagnostic's reads change no mock. */
+static inline int dev_log(const void *dev, const char *fmt, ...)
+{
+	(void)dev;
+	(void)fmt;
+	return 0;
+}
+#define dev_warn(...) ((void)sizeof(dev_log(__VA_ARGS__)))
+#define dev_info(...) ((void)sizeof(dev_log(__VA_ARGS__)))
+#define dev_err(...) ((void)sizeof(dev_log(__VA_ARGS__)))
+#define dev_emerg(...) ((void)sizeof(dev_log(__VA_ARGS__)))
+typedef s64 ktime_t;
+static ktime_t ktime_get(void)
+{
+	return 0;
+}
+#define ktime_us_delta(a, b) ((s64)((a) - (b)))
+#define ktime_ms_delta(a, b) ((s64)((a) - (b)))
+typedef struct {
+	int counter;
+} atomic_t;
+#define atomic_read(v) ((v)->counter)
+/* Only J714s takes the T6050 paths, and only the cases that ask for them run as one. */
+static bool j714s;
+static bool of_machine_is_compatible(const char *compat)
+{
+	assert(!strcmp(compat, "apple,j714s"));
+	return j714s;
+}
 #define list_is_singular(l) ((l)->count == 1)
 #define list_first_entry(l, t, m) ((void)sizeof(#m), (t *)(l)->first)
 static unsigned int next_set_bit(unsigned long long m, unsigned int n, unsigned int i)
@@ -74,6 +104,9 @@ struct phy {
 struct hw_info {
 	u32 port_perst;
 };
+struct pci_config_window {
+	void *win;
+};
 struct apple_pcie {
 	struct device *dev;
 	struct apple_dart_cio *cio_dart;
@@ -82,6 +115,8 @@ struct apple_pcie {
 		bus_stopped, resume_failed;
 	struct list_head ports;
 	const struct hw_info *hw;
+	struct pci_config_window *cfg;
+	void *fabric_base, *intr2axi_base;
 };
 struct apple_pcie_port {
 	struct apple_pcie *pcie;
@@ -100,6 +135,7 @@ struct tb {
 	bool prepared, stopped, lost, restarted;
 };
 struct apple_cio {
+	atomic_t fw_at_answers, fw_at_timeouts, fw_wake_seen, fw_lane_action;
 	int lock, pcie_tunnel_lock;
 	bool removing, native_sleep, lstx_high;
 	u32 current_cable_info, target_cable_info;
@@ -117,6 +153,10 @@ struct apple_nhi {
 	struct apple_cio *acio;
 	struct apple_dart_cio *cio_dart;
 	struct phy *cio_phy;
+	/* T6050's combo PHY calls; this model has T8132's lane PHY, so they stay unset. */
+	struct device *cio_phy_dev;
+	int (*cio_phy_fn[5])(struct device *dev);
+	bool cio_t6050;
 	struct device *cio_pcie;
 	struct device *dev;
 	struct tb *tb;
@@ -130,6 +170,7 @@ static struct platform_device pdev;
 static struct apple_pcie pc;
 static struct apple_pcie_port port;
 static struct hw_info hw = { .port_perst = PORT_PERST };
+static const struct hw_info t6050_pciec_hw = { .port_perst = PORT_PERST };
 static struct apple_dart_cio darts[2];
 static struct phy phy;
 static struct apple_cio cio;
@@ -345,6 +386,78 @@ static void drop(int **l)
 #define scoped_guard(type, l)                                               \
 	for (int *g __attribute__((cleanup(drop))) = take(l), *once = NULL; \
 	     !once; once = g)
+#define CAT_(a, b) a##b
+#define CAT(a, b) CAT_(a, b)
+#define guard(type) int *CAT(guard_, __COUNTER__) __attribute__((cleanup(drop))) = take
+/*
+ * T6050 PCIe-C (J714s): compiled, but only its refusal before anything is touched runs here;
+ * its PME_Turn_Off, L2 and fabric registers are not modelled.
+ */
+#define PCI_COMMAND 0x04
+#define PCI_PRIMARY_BUS 0x18
+#define PCI_EXP_SLTCTL_ABPE 0x0001
+#define PCI_EXP_SLTCTL_PDCE 0x0008
+#define PCI_EXP_SLTCTL_HPIE 0x0020
+#define PCI_EXP_SLTCTL_DLLSCE 0x1000
+static u16 readw(void *p)
+{
+	assert(false);
+	return *(u16 *)p;
+}
+static void writew(u16 v, void *p)
+{
+	assert(false);
+	*(u16 *)p = v;
+}
+static u32 readl(void *p)
+{
+	return *(u32 *)p;
+}
+static void writel(u32 v, void *p)
+{
+	assert(false);
+	*(u32 *)p = v;
+}
+struct pci_bus;
+struct pci_host_bridge {
+	struct pci_bus *bus;
+};
+struct pci_dev {
+	int current_state;
+};
+static void *dev_get_drvdata(struct device *d)
+{
+	assert(false);
+	return NULL;
+}
+static void pci_walk_bus(struct pci_bus *b, int (*fn)(struct pci_dev *, void *), void *data)
+{
+	assert(false);
+}
+static const char *pci_name(struct pci_dev *p)
+{
+	return "";
+}
+static const char *pci_power_name(int state)
+{
+	return "";
+}
+static int scnprintf(char *buf, size_t size, const char *fmt, ...)
+{
+	return 0;
+}
+static unsigned int dart_checks;
+static int dart_check_error;
+static int apple_dart_cio_check(struct apple_dart_cio *d, bool quiesced)
+{
+	assert(d->active && !d->off);
+	dart_checks++;
+	return dart_check_error;
+}
+static void apple_pcie_tunnel_hierarchy_gone(struct device *d)
+{
+	assert(false);
+}
 /* ACTUAL_PCIE */
 static void put_device(struct device *d)
 {
@@ -496,12 +609,24 @@ static int apple_cio_lstx_release(struct apple_cio *a)
 {
 	return 0;
 }
-static u32 readl(void *p)
-{
-	return *(u32 *)p;
-}
 static void apple_tunable_apply(void *p, void *t)
 {
+}
+/* T6050's sleep in place (J714s) is not modelled: this NHI is T8132's (cio_t6050 unset). */
+static bool apple_nhi_cio_peer(struct apple_nhi *a)
+{
+	assert(false);
+	return true;
+}
+static int apple_nhi_cio_suspend_t6050(struct apple_nhi *a)
+{
+	assert(false);
+	return -EINVAL;
+}
+static int apple_nhi_cio_power_on_t6050(struct apple_nhi *a)
+{
+	assert(false);
+	return -EINVAL;
 }
 /* ACTUAL_NHI */
 static void setup(void)
@@ -519,6 +644,8 @@ static void setup(void)
 	memset(rid, 0, sizeof(rid));
 	fault = polls = maps = checks = resets = finished = callbacks = 0;
 	pending_fault = expect_panic = cpu_reset = false;
+	j714s = false;
+	dart_checks = dart_check_error = 0;
 	port_setup = aperture = true;
 	pdev.dev = (struct device){ .data = &pc, .refs = 1 };
 	pc.dev = &pdev.dev;
@@ -681,5 +808,23 @@ int main(void)
 		}
 		cases++;
 	}
+	/*
+	 * J714s's PCIe-C: a port DART that could not be saved refuses the sleep before anything
+	 * of the port is touched (its link, its interrupts, its functions' state).
+	 */
+	setup();
+	j714s = true;
+	pc.hw = &t6050_pciec_hw;
+	assert(!apple_nhi_cio_prepare(&nhi));
+	u32 before[ARRAY_SIZE(reg)];
+
+	memcpy(before, reg, sizeof(reg));
+	dart_check_error = -EOPNOTSUPP;
+	assert(apple_pcie_cio_suspend(&pc) == -EOPNOTSUPP && dart_checks == 1);
+	assert(!memcmp(before, reg, sizeof(reg)) && !port.irq_disabled && !callbacks);
+	assert(!pc.cio_changed && !pc.cio_stopped && !pc.cio_port_reset && !darts[1].off);
+	apple_nhi_cio_complete(&nhi);
+	clean();
+	cases++;
 	printf("PASS %u native CIO ownership cases\n", cases);
 }

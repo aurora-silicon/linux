@@ -65,16 +65,18 @@ properties:
       - items:
           - description: PMP report region
           - description: Cluster lane (0 for E, 1 for P on T8140; 0 for
-              E, 1 for P0, 2 for P1 on T6041)
+              E, 1 for P0, 2 for P1 on T6041; 0 for M0, 1 for M1, 2 for P
+              on T6050)
             enum: [0, 1, 2]
 
   apple,firmware-managed-thermal:
     type: boolean
     description:
-      The boot loader leaves the cluster's thermal limiting with the
-      firmware, which keeps the throttling, voltage and PLL control for the
-      whole time Linux runs. The T6050 driver registers DVFS only when this
-      is present.
+      The boot loader leaves the cluster's voltage and PLL control with the
+      firmware for the whole time Linux runs. The firmware does not lower
+      the requested performance state itself; where it publishes an effort,
+      apple,fast-die-effort lets the OS enforce it. The T6050 driver
+      registers DVFS only when this is present.
 
   '#performance-domain-cells':
     const: 0

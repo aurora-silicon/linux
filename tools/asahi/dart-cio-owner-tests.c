@@ -47,7 +47,7 @@ struct apple_dart {
 	struct device *dev;
 	void *regs;
 	unsigned int num_streams, sleep_writers;
-	bool managed_sids, sleep_closed, commands_gated, cio_active;
+	bool managed_sids, sleep_closed, commands_gated, cio_active, full_errors;
 	int managed_lock, lock;
 	const struct apple_dart_hw *hw;
 	struct apple_dart_cio *cio;
@@ -125,6 +125,13 @@ static int apple_dart_quiesce_commands(struct device *dev)
 	assert(dev == &provider && dart.sleep_closed && !dart.sleep_writers);
 	dart.commands_gated = true;
 	return 0;
+}
+/* A v2.4 DART's error interrupt enables: after its restore, before it opens. */
+static unsigned int error_enables;
+static void apple_dart_t8110_enable_errors(struct apple_dart *d)
+{
+	assert(d == &dart && dart.sleep_closed && dart.commands_gated);
+	error_enables++;
 }
 
 /* Arguments are evaluated: a diagnostic's register reads still happen. */
@@ -207,13 +214,17 @@ int main(void)
 		}
 	}
 	reset_owner(15, true);
-	assert(!apple_dart_cio_prepare(&state));
+	/* Prepare reads what the snapshot will need, and writes nothing. */
+	assert(!apple_dart_cio_prepare(&state) && reads && !writes);
+	unsigned int prepared = reads;
+
 	assert(!apple_dart_cio_on(&state));
-	assert(!apple_dart_cio_finish(&state) && !reads && !writes);
+	assert(!apple_dart_cio_finish(&state) && reads == prepared && !writes);
 	cases++;
 	assert(!apple_dart_cio_prepare(&state));
+	prepared = reads;
 	assert(apple_dart_sleep_writer_get(&dart) == APPLE_DART_WRITER_COUNTED);
-	assert(apple_dart_cio_off(&state) == -EBUSY && !reads && !writes);
+	assert(apple_dart_cio_off(&state) == -EBUSY && reads == prepared && !writes);
 	apple_dart_sleep_writer_put(&dart, APPLE_DART_WRITER_COUNTED);
 	assert(!apple_dart_cio_finish(&state));
 	cases++;
@@ -227,7 +238,7 @@ int main(void)
 		if (fault == 2)
 			busy = 1;
 		if (fault == 3)
-			regs[2] = 0x204;
+			regs[2] = 0x205;
 		assert(apple_dart_cio_off(&state) < 0);
 		assert(!writes && !dart.commands_gated && !dart.sleep_closed &&
 		       !state.changed);
@@ -317,7 +328,7 @@ int main(void)
 	/* A snapshot that fails after a memory-only update reopens with a flush. */
 	reset_owner(18, false);
 	assert(!apple_dart_cio_prepare(&state));
-	regs[2] = 0x204;
+	regs[2] = 0x205;
 	on_read = closed_writer;
 	assert(apple_dart_cio_off(&state) < 0 && !state.changed);
 	assert(!dart.sleep_closed && invalidations == 1 && !state.dead);
@@ -335,5 +346,64 @@ int main(void)
 	assert(!apple_dart_cio_on(&state) && gapf.value == (BIT(1) | BIT(4) | BIT(7)));
 	assert(!apple_dart_cio_finish(&state));
 	cases++;
+	/*
+	 * A DART its owner could not save refuses the sleep at prepare, with every requester
+	 * running and nothing stopped or written: a layout newer than v2.4, or a TrustZone lock
+	 * the snapshot needs and does not have. Nothing is left behind: the next prepare runs.
+	 */
+	for (unsigned int kind = 0; kind < 2; kind++) {
+		reset_owner(18, false);
+		if (kind == 0)
+			regs[2] = 0x205;
+		else
+			regs[0x208 / 4] = 0;
+		assert(apple_dart_cio_prepare(&state) == (kind ? -EPERM : -EOPNOTSUPP));
+		assert(!writes && !dart.cio_active && !provider.refs && !state.dead);
+		assert(!dart.sleep_closed && !dart.commands_gated &&
+		       gapf.value == (BIT(1) | BIT(4) | BIT(7)));
+		reset_owner(18, false);
+		assert(!apple_dart_cio_prepare(&state) && !apple_dart_cio_finish(&state));
+		cases++;
+	}
+	/*
+	 * With its requesters stopped the owner asks again, before a step it cannot take back:
+	 * a DART that is not idle refuses with nothing written, and the check's scratch state
+	 * leaves the snapshot to off().
+	 */
+	reset_owner(14, false);
+	assert(!apple_dart_cio_prepare(&state));
+	busy = 1;
+	assert(!apple_dart_cio_check(&state, false) &&
+	       apple_dart_cio_check(&state, true) == -ETIMEDOUT);
+	assert(!writes && !dart.sleep_closed && !dart.commands_gated);
+	busy = 0;
+	assert(!apple_dart_cio_check(&state, true) && !writes && !state.saved.valid);
+	assert(!apple_dart_cio_off(&state) && state.saved.valid);
+	assert(apple_dart_cio_check(&state, true) == -EINVAL);
+	lose_power();
+	assert(!apple_dart_cio_on(&state));
+	check_restored(&state.saved);
+	assert(!apple_dart_cio_finish(&state));
+	assert(apple_dart_cio_check(&state, false) == -EINVAL);
+	cases++;
+	/*
+	 * v2.4 (T6050's ACIO and PCIe-C DARTs) is saved and restored like v2.3; its error
+	 * interrupt enables, outside the saved state, are put back when it reports errors.
+	 */
+	for (unsigned int kind = 0; kind < 3; kind++) {
+		reset_owner(19, true);
+		regs[2] = kind ? 0x204 : 0x203;
+		dart.full_errors = kind != 1;
+		error_enables = 0;
+		assert(!apple_dart_cio_prepare(&state) && !apple_dart_cio_off(&state));
+		assert(state.saved.common.version == (kind ? 0x204U : 0x203U));
+		assert(regs[0x4204 / 4] == (kind ? ~0U : 0));
+		lose_power();
+		assert(!apple_dart_cio_on(&state) && state.restored);
+		assert(error_enables == (kind == 2));
+		check_restored(&state.saved);
+		assert(!apple_dart_cio_finish(&state) && !provider.refs);
+		cases++;
+	}
 	printf("PASS %u CIO DART ownership cases\n", cases);
 }

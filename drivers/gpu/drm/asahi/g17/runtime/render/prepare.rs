@@ -605,6 +605,7 @@ impl super::super::Backend {
                 entry.pair = Some(pair);
                 entry.closed = false;
                 entry.published = false;
+                firmware.queues.hold_render_slot(usize::from(slot));
                 Ok(())
             })()
         };
@@ -751,6 +752,8 @@ impl super::super::Backend {
             entry.pair = Some(pair);
             entry.borrowed_dependencies = None;
             entry.borrowed_switch = None;
+            // A displaced context's release is armed now: its other pairs are held as well.
+            firmware.queues.sync_render_holds();
             if firmware.queues.render.take_missed_event(slot) {
                 self.shared.queue_events();
             }
@@ -946,6 +949,7 @@ impl super::super::Backend {
                 .ok_or(EIO)?
                 .release_owner();
         }
+        firmware.queues.hold_render_slot(usize::from(slot));
         self.shared.note_changed();
         let published = (|| {
             let entry = firmware.queues.render.entry(slot)?;

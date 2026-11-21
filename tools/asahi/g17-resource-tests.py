@@ -344,7 +344,7 @@ mod mmu {pub const UAT_PGSZ:usize=16;pub type Prot=u8;pub type Vm=super::Vm;pub 
 #[derive(Default)] struct State {regions:Vec<Region>,allocations:u64,attempts:usize,fault:Option<usize>}
 struct Vm {id:usize,state:Rc<RefCell<State>>}
 struct Uat {lower:Vm}
-impl Uat {fn kernel_lower_vm(&self)->&Vm {&self.lower}}
+impl Uat {fn kernel_lower_vm(&self)->&Vm {&self.lower} fn kernel_lower_dynamic_range(&self)->Range<u64> {hw::t8140::dynamic::LOWER}}
 struct Device {state:Rc<RefCell<State>>}
 struct Mapping {vm:usize,address:u64,size:u64,object:u64,state:Rc<RefCell<State>>}
 impl Mapping {fn iova(&self)->u64 {self.address}}

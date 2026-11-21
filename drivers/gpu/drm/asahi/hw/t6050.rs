@@ -187,6 +187,7 @@ pub(crate) const CONFIG_ULTRA: Config = Config {
         handoff_slot: 0xffff,
         handoff_unk2: 1,
         native_gpu_permissions: false,
+        narrow_pool_window: false,
     },
     region_c: None,
     chip: None,

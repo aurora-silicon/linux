@@ -674,6 +674,32 @@ impl G17Resources {
         Ok(())
     }
 
+    /// [`Self::submit_m5_work`] with core gating held off across the transaction, reading the
+    /// control back after each change, as macOS submits every M5 compute kick (hv2, hv12): the
+    /// advance then lands on cores that cannot be gated under it, and the doorbell that follows
+    /// finds it.
+    pub(crate) fn submit_m5_work_held(
+        &self,
+        submission: &crate::g17::fw::m5::queue::HardwareSubmission,
+    ) -> Result {
+        if crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        let gating = sgx.try_read32(G17_GATING_CONTROL)?;
+        sgx.try_write32(gating | G17_GATING_HOLD, G17_GATING_CONTROL)?;
+        sgx.try_read32(G17_GATING_CONTROL)?;
+        let result = submission
+            .writes()
+            .iter()
+            .try_for_each(|&(offset, value)| sgx.try_write64(value, offset));
+        let gating = sgx.try_read32(G17_GATING_CONTROL)?;
+        sgx.try_write32(gating & !G17_GATING_HOLD, G17_GATING_CONTROL)?;
+        sgx.try_read32(G17_GATING_CONTROL)?;
+        result
+    }
+
     /// The M5 fault window, read for recovery evidence: the fault status, the MMU fault status
     /// and address, and three further fault words. The selector is observed, never changed.
     pub(crate) fn m5_fault_registers(&self) -> Result<[u64; 6]> {

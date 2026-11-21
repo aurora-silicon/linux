@@ -197,8 +197,23 @@
 	status = "okay";
 };
 
+/* The MTP and its DockChannel FIFO, which carry the keyboard and trackpad */
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp {
+	status = "okay";
+};
+
 /* The keyboard and trackpad: the HID transport on the MTP's DockChannel FIFO */
 &mtp_dockchannel {
+	status = "okay";
+
 	mtp_hid: input@8000 {
 		compatible = "apple,dockchannel-hid";
 		reg = <0x8000 0x1000>, <0xc000 0x1000>,
@@ -251,3 +266,14 @@
 
 #include "t6050-j716c-display.dtsi"
 #include "t6050-j716c-left-usb4.dtsi"
+#include "t6050-j716c-sep.dtsi"
+
+#include "t6050-j716c-sleep.dtsi"
+#include "t6050-j716c-sleep-full.dtsi"
+
+/*
+ * The Neural Engine, started only after the boot loader's preload hand-off.
+ * ANE_SYS sits behind FAB8_SOC (kept on for the SEP above) and FAB9_SOC (on for
+ * the camera).
+ */
+#include "t6050-j714s-ane.dtsi"

@@ -110,6 +110,12 @@ properties:
       adopts that RTKit session without renegotiating it. Shared firmware
       buffers must remain reserved and protected by the SART.
 
+  apple,sleep-wake-delay-ms:
+    description:
+      T6050. After a deep sleep, the time from the storage power being back
+      to the restart of the ANS2 co-processor. Set by the boot loader.
+      Without it the controller refuses the deep sleep.
+
 allOf:
   - if:
       properties:
@@ -184,6 +190,8 @@ allOf:
         power-domains: false
         power-domain-names: false
     else:
+      properties:
+        apple,sleep-wake-delay-ms: false
       required:
         - resets
         - power-domains

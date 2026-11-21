@@ -328,14 +328,27 @@ impl crate::g17::Firmware {
         {
             return Ok(());
         }
-        self.with_render(slot, |pair, host| {
-            pair.release_witnessed(host, &mut |event| deferred.push(event))
-        })
-        .map_err(at("release"))?;
+        self.release_drained_render(slot, deferred)
+            .map_err(at("release"))?;
         self.queues
             .render
             .collect_retired(slot)
             .map_err(at("binding collection"))
+    }
+
+    /// Releases the drained pair in `slot` on a fresh drain witness
+    /// ([`crate::g17::queue::render::Pair::release_witnessed`]), and with it the quarantine of
+    /// its admission slot ([`crate::g17::queue::admission::Pool::pair_drained`]). The witness,
+    /// not a lease of the pair's commands, ends that quarantine: a group that retired on its
+    /// pass record gave its lease back with its result, so no lease may be left to end it.
+    fn release_drained_render(&mut self, slot: usize, deferred: &mut DeferredBatch) -> Result {
+        let released = self.with_render(slot, |pair, host| {
+            pair.release_witnessed(host, &mut |event| deferred.push(event))
+        })?;
+        if released {
+            self.queues.admission.pair_drained(slot);
+        }
+        Ok(())
     }
 }
 

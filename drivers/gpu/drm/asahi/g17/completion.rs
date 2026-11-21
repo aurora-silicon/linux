@@ -16,7 +16,7 @@ use super::{
 use crate::{
     driver::AsahiDrmDevice,
     file,
-    hw::t8140::{dynamic, resources as cfg},
+    hw::t8140::resources as cfg,
     mmu,
 };
 use core::sync::atomic::{
@@ -247,7 +247,7 @@ impl ComputeTimestamps {
             vm,
             // Canonical shared queue aliases may be installed in this VM later.
             // Private timestamp pages must never occupy their retained addresses.
-            dynamic::CLIENT_LOWER,
+            vm.client_private_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;

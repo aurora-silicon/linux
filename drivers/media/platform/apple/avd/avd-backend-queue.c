@@ -284,6 +284,19 @@ static int avd_qfw_stream(struct avd_dev *avd, const u32 *words, u32 count)
 		if (used > q->ring_words)
 			return -EIO;
 		space = q->ring_words - used;
+		/*
+		 * Both sides place word n at n % ring_words, and ring_words does
+		 * not divide 2^32: the lap that ends at the counter wrap has only
+		 * 2^32 % ring_words slots, and the next lap starts again at slot 0.
+		 * While the writer has wrapped and the reader has not, the slots
+		 * that lap skipped do not separate them.
+		 */
+		if (rp > q->wp) {
+			u32 skip = (q->ring_words - (u32)((1ULL << 32) % q->ring_words)) %
+				   q->ring_words;
+
+			space = space > skip ? space - skip : 0;
+		}
 		if (!space) {
 			if (time_after(jiffies, timeout))
 				return -ETIMEDOUT;

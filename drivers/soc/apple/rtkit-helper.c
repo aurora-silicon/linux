@@ -40,6 +40,8 @@ struct apple_rtkit_helper {
 	 * it does not list must not replace storage the firmware still owns.
 	 */
 	bool strict_buffers;
+	/* The AP idle notice waits for .suspend_late, after the HID host's packets */
+	bool idle_late;
 	/* The firmware was told the AP is going to sleep. */
 	bool ap_idle;
 	/* It was told, gave no answer, and wasn't told otherwise. */
@@ -265,6 +267,8 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	helper->dev = dev;
+	/* The M5 Pro's macOS idles MTP after its two HID packets. */
+	helper->idle_late = of_device_is_compatible(helper->dev->of_node, "apple,t6050-mtp");
 	platform_set_drvdata(pdev, helper);
 
 	helper->asc_base = devm_platform_ioremap_resource_byname(pdev, "asc");
@@ -295,7 +299,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 			helper->preserved = true;
 	}
 
-	if (!live && apple_t8132_live_mtp() && of_machine_is_compatible("apple,t8132")) {
+	if (!live && apple_t8132_live_mtp()) {
 		struct property *prop;
 		u32 inherited;
 		int len;
@@ -458,9 +462,20 @@ static void apple_rtkit_helper_ap_on(struct apple_rtkit_helper *helper)
  */
 static int __maybe_unused apple_rtkit_helper_prepare(struct device *dev)
 {
-	if (!pm_suspend_via_firmware())
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+
+	if (!pm_suspend_via_firmware() || helper->idle_late)
 		return 0;
-	return apple_rtkit_helper_ap_idle(dev_get_drvdata(dev));
+	return apple_rtkit_helper_ap_idle(helper);
+}
+
+static int __maybe_unused apple_rtkit_helper_suspend_late(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+
+	if (!pm_suspend_via_firmware() || !helper->idle_late)
+		return 0;
+	return apple_rtkit_helper_ap_idle(helper);
 }
 
 static void apple_rtkit_helper_sleep_end(struct apple_rtkit_helper *helper)
@@ -528,7 +543,11 @@ static int __maybe_unused apple_rtkit_helper_suspend(struct device *dev)
 
 	if (helper->adopted && pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EBUSY;
-	if (!helper->adopted || !of_machine_is_compatible("apple,j613"))
+	/*
+	 * An adopted session (apple,rtkit-handoff) was handed over running
+	 * because it cannot be restarted, whatever the board.
+	 */
+	if (!helper->adopted)
 		return 0;
 	if (!(readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) & APPLE_ASC_CPU_CONTROL_RUN))
 		return -EHOSTDOWN;
@@ -544,7 +563,7 @@ static int __maybe_unused apple_rtkit_helper_resume(struct device *dev)
 
 	/* After a firmware-driven suspend's idle notice; nothing otherwise. */
 	apple_rtkit_helper_ap_on(helper);
-	if (!helper->adopted || !of_machine_is_compatible("apple,j613"))
+	if (!helper->adopted)
 		return 0;
 	if (!(readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) & APPLE_ASC_CPU_CONTROL_RUN)) {
 		dev_err(dev, "adopted MTP lost ASC RUN; refusing firmware restart\n");
@@ -564,6 +583,7 @@ static int __maybe_unused apple_rtkit_helper_freeze(struct device *dev)
 
 static const struct dev_pm_ops apple_rtkit_helper_pm_ops = {
 	.prepare = pm_sleep_ptr(apple_rtkit_helper_prepare),
+	.suspend_late = pm_sleep_ptr(apple_rtkit_helper_suspend_late),
 	.complete = pm_sleep_ptr(apple_rtkit_helper_complete),
 	.suspend = pm_sleep_ptr(apple_rtkit_helper_suspend),
 	.resume = pm_sleep_ptr(apple_rtkit_helper_resume),

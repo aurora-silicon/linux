@@ -58,7 +58,8 @@ const struct apple_dpin_policy apple_dpin_m4 = {
  * DP IN handshake writes only DPTX_INACTIVE (+0x0c bit 0) and polls its ACK
  * (+0x10 bit 0), gated on HPD. A tunnel whose DP IN block DCP never
  * activated is torn down without the inactive handshake. A DPRX that is not
- * done in time keeps the tunnel: the display may still train.
+ * done in time keeps the tunnel: the display may still train. Bandwidth
+ * allocation runs as on macOS (TB_HOST_DP_BW_HELD_ACK).
  */
 const struct apple_dpin_policy apple_dpin_m5 = {
 	.flow = APPLE_DPIN_CHANGED,
@@ -66,7 +67,8 @@ const struct apple_dpin_policy apple_dpin_m5 = {
 	.capacity_retry = true,
 	.setup_irqs = true,
 	.defer_new_bringup = true,
-	.host_policy = TB_HOST_DP_NOTIFY | TB_HOST_DP_KEEP_DPRX_TIMEOUT,
+	.host_policy = TB_HOST_DP_NOTIFY | TB_HOST_DP_KEEP_DPRX_TIMEOUT |
+		       TB_HOST_DP_BW_HELD_ACK,
 	.lazy_idle = true,
 };
 

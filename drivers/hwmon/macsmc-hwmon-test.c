@@ -75,9 +75,106 @@ static void macsmc_hwmon_test_temp_label(struct kunit *test)
 						      hwmon_temp_input, 1), 0444);
 }
 
+/* The channel a gated die key joins the zone through (see populate_sensors). */
+static void macsmc_hwmon_test_find_temp(struct kunit *test)
+{
+	struct macsmc_hwmon_sensor sensors[3] = {};
+	struct macsmc_hwmon hwmon = {
+		.temp = { .sensors = sensors },
+	};
+
+	macsmc_hwmon_test_add(&hwmon.temp, "Te05", 0);
+	macsmc_hwmon_test_add(&hwmon.temp, "Tg0e", -EINVAL);
+	macsmc_hwmon_test_add(&hwmon.temp, "Tg0f", 0);
+
+	KUNIT_EXPECT_PTR_EQ(test, macsmc_hwmon_find_temp(&hwmon, SMC_KEY(Tg0f)),
+			    &sensors[2]);
+	KUNIT_EXPECT_PTR_EQ(test, macsmc_hwmon_find_temp(&hwmon, SMC_KEY(Te05)),
+			    &sensors[0]);
+	/* A node that failed to set up has no key and takes no die key. */
+	KUNIT_EXPECT_NULL(test, macsmc_hwmon_find_temp(&hwmon, SMC_KEY(Tg0e)));
+	KUNIT_EXPECT_NULL(test, macsmc_hwmon_find_temp(&hwmon, SMC_KEY(Tp01)));
+}
+
+#if IS_ENABLED(CONFIG_THERMAL) && IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST)
+#define DIE_TEST_F4_607	0x40936c8b	/* 4.607f, a GPU key with the GPU off */
+#define DIE_TEST_F40	0x42200000	/* 40.0f */
+#define DIE_TEST_F45_5	0x42360000	/* 45.5f */
+#define DIE_TEST_F50	0x42480000	/* 50.0f */
+
+static u32 die_test_gpu;
+
+static int die_test_read(struct apple_smc *smc, smc_key key, void *buf, size_t size)
+{
+	u32 value;
+
+	switch (key) {
+	case __SMC_KEY('T', 'g', '0', 'f'):
+		value = die_test_gpu;
+		break;
+	case __SMC_KEY('T', 'e', '0', '5'):
+		value = DIE_TEST_F40;
+		break;
+	case __SMC_KEY('T', 'p', '0', '1'):
+		value = DIE_TEST_F45_5;
+		break;
+	default:
+		return -EINVAL;
+	}
+	memcpy(buf, &value, min(size, sizeof(value)));
+	return size;
+}
+
+static void die_test_sensor(struct macsmc_hwmon_sensor *sensor, smc_key key)
+{
+	sensor->macsmc_key = key;
+	sensor->info.type_code = __SMC_KEY('f', 'l', 't', ' ');
+	sensor->info.size = 4;
+	sensor->die = true;
+}
+
+/* A GPU key below its no-data threshold is left out of the SoC die zone. */
+static void macsmc_hwmon_test_die_skips_no_data(struct kunit *test)
+{
+	struct apple_smc smc = {};
+	struct macsmc_hwmon_sensor sensors[3] = {};
+	struct macsmc_hwmon hwmon = {
+		.smc = &smc,
+		.temp = { .sensors = sensors, .count = 3 },
+	};
+	int temp = 0;
+
+	die_test_sensor(&sensors[0], SMC_KEY(Tg0f));
+	sensors[0].has_no_data_below = true;
+	sensors[0].no_data_below = 10000;
+	die_test_sensor(&sensors[1], SMC_KEY(Te05));
+	die_test_sensor(&sensors[2], SMC_KEY(Tp01));
+	kunit_activate_static_stub(test, apple_smc_read, die_test_read);
+
+	/* GPU off: the placeholder neither fails the zone nor counts. */
+	die_test_gpu = DIE_TEST_F4_607;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_die_hottest(&hwmon, &temp), 0);
+	KUNIT_EXPECT_EQ(test, temp, 45500);
+
+	/* GPU on and hottest: it counts. */
+	die_test_gpu = DIE_TEST_F50;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_die_hottest(&hwmon, &temp), 0);
+	KUNIT_EXPECT_EQ(test, temp, 50000);
+
+	/* Only powered-down sensors: no data. */
+	hwmon.temp.count = 1;
+	die_test_gpu = DIE_TEST_F4_607;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_die_hottest(&hwmon, &temp), -ENODATA);
+}
+#endif
+
 static struct kunit_case macsmc_hwmon_test_cases[] = {
 	KUNIT_CASE(macsmc_hwmon_test_failed_temp_keeps_slot),
 	KUNIT_CASE(macsmc_hwmon_test_temp_label),
+	KUNIT_CASE(macsmc_hwmon_test_find_temp),
+#if IS_ENABLED(CONFIG_THERMAL) && IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST)
+	KUNIT_CASE(macsmc_hwmon_test_die_skips_no_data),
+#endif
 	{}
 };
 

@@ -8,6 +8,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 559 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_debug_gated>;
 		status = "disabled";
 	};
 
@@ -105,6 +106,7 @@
 		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
 		reg = <0x2 0x85020000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_venc0_sys>;
 	};
 
 	dart_ave03: filter@285044000 {
@@ -137,6 +139,7 @@
 		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
 		reg = <0x3 0xc5020000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_venc1_sys>;
 	};
 
 	dart_ave13: filter@3c5044000 {
@@ -155,12 +158,14 @@
 		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
 		reg = <0x3 0x8e4b0000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_isp_sys>;
 	};
 
 	dart_isp0_companion4: iommu@38e4b8000 {
 		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
 		reg = <0x3 0x8e4b8000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_isp_sys>;
 	};
 
 	dart_isp0_companion5: filter@38e4ac000 {
@@ -179,6 +184,7 @@
 		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
 		reg = <0x3 0x85300000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_disp_fe>;
 	};
 
 	dart_ane0_companion3: filter@3c9804000 {
@@ -191,24 +197,28 @@
 		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
 		reg = <0x3 0x05300000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_dispext0_cpu>;
 	};
 
 	dart_dispext1_companion1: iommu@449300000 {
 		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
 		reg = <0x4 0x49300000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_dispext1_cpu>;
 	};
 
 	dart_dispext2_companion1: iommu@44d300000 {
 		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
 		reg = <0x4 0x4d300000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_dispext2_cpu>;
 	};
 
 	dart_dispext3_companion1: iommu@2c9300000 {
 		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
 		reg = <0x2 0xc9300000 0x0 0x4000>;
 		status = "disabled";
+		power-domains = <&ps_dispext3_cpu>;
 	};
 
 	apcie0_piodma: dma-controller@594010000 {

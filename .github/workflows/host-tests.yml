@@ -1,9 +1,10 @@
 name: Host tests
 
 # Every host-side test of the Aurora drivers: tools/asahi (with their mutation
-# and old-code controls) and the apple-dcp, apple-afkv2, asahi-g15 and asahi-m4
-# selftests. They extract production code from this tree and build it on the
-# host, so a driver change can break them while the kernel build stays green.
+# and old-code controls), the apple-dcp, apple-afkv2, asahi-g15 and asahi-m4
+# selftests and the host-runnable selftests in tools/testing/selftests/drivers/apple.
+# They extract production code from this tree and build it on the host, so a
+# driver change can break them while the kernel build stays green.
 
 on:
   push:
@@ -61,7 +62,13 @@ jobs:
           command -v fdtget >/dev/null || need="$need device-tree-compiler"
           dpkg -s "libclang-rt-$CLANG_VERSION-dev" >/dev/null 2>&1 || need="$need libclang-rt-$CLANG_VERSION-dev"
           if [ -n "$need" ]; then
-            sudo apt-get update -q
+            # Avoid the hosted runner's Azure mirror after repeated DNS failures.
+            # Keep signed Ubuntu archive/security suites and fail on update errors.
+            if [ -f /etc/apt/apt-mirrors.txt ]; then
+              printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
+                sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+            fi
+            sudo apt-get update -q -o APT::Update::Error-Mode=any
             sudo apt-get install -y -q $need
           fi
           # The tests call clang, ld.lld, cc and gcc by name.

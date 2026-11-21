@@ -33,6 +33,13 @@ pub(crate) fn control_fence() -> u64 {
     CONTROL_PUBLISHED.load(Ordering::Acquire) + 1
 }
 
+/// A fence met once the firmware has consumed every record published so far. For storage
+/// whose owner's release was already consumed it needs no later record (see
+/// [`control_fence`]).
+pub(crate) fn control_published() -> u64 {
+    CONTROL_PUBLISHED.load(Ordering::Acquire)
+}
+
 /// The control-ring progress the firmware has shown so far (see [`control_fence`]).
 pub(crate) fn control_witnessed() -> u64 {
     CONTROL_CONSUMED.load(Ordering::Acquire)

@@ -54,7 +54,11 @@ struct apple_rtkit {
 	bool retained_wake, retained_on_sent;
 	int boot_result;
 	unsigned int iop_power_state;
-	int epmap_completion, iop_pwr_ack_completion;
+	int epmap_completion, iop_pwr_ack_completion, ap_pwr_ack_completion;
+	/* The ANS sleep transaction's state; none of these wakes arms it. */
+	bool ans_wake, ans_hello;
+	u8 ans_map_next;
+	int ans_error;
 };
 static bool test_bit(unsigned n, const unsigned long *b) { return b[n / 64] >> (n % 64) & 1; }
 static void set_bit(unsigned n, unsigned long *b) { b[n / 64] |= 1UL << (n % 64); }
@@ -69,6 +73,7 @@ static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type, u64 dat
 /* A fatal signal is pending for every killable wait. */
 #define ERESTARTSYS 512
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
 enum { PM_SUSPEND_ON, PM_SUSPEND_TO_IDLE, PM_SUSPEND_STANDBY, PM_SUSPEND_MEM };
 static int pm_suspend_target_state;
 struct completion { int unused; };
@@ -157,6 +162,8 @@ int main(void)
 	apple_rtkit_management_rx_iop_pwr_ack(&r, APPLE_RTKIT_PWR_STATE_QUIESCED);
 	assert(sent == 0 && r.iop_pwr_ack_completion == 1);
 	assert(r.iop_power_state == APPLE_RTKIT_PWR_STATE_QUIESCED);
+	/* No ANS sleep transaction was armed, so none failed. */
+	assert(r.ans_error == 0);
 
 	/*
 	 * A retained wake waits through a signal, and so does a wait in a system
@@ -189,6 +196,8 @@ def main():
     args = parser.parse_args()
     source = (ROOT / DRIVER).read_text()
     code = PREFIX + constants(source)
+    # The IOP acknowledgment fails an ANS sleep transaction through it.
+    code += function(source, 'apple_rtkit_ans_fail')
     code += function(source, 'apple_rtkit_management_rx_epmap_retained')
     code += function(source, 'apple_rtkit_management_rx_iop_pwr_ack')
     code += function(source, 'apple_rtkit_wait_timeout') + MAIN

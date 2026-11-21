@@ -42,7 +42,10 @@ impl Backend {
             let others = Iterator::chain(computes, firmware.queues.render_timeout_heads());
             let excuse = timeout::Excuse { used: excused, limit: timeout::excuse_limit(
                 crate::module_parameters::compute_timeout_max_ms.value()) };
-            let verdict = timeout::attribute(own, renewals, excuse, others);
+            let mut verdict = timeout::attribute(own, renewals, excuse, others);
+            if verdict.decision == Decision::Retire {
+                verdict.decision = self.retire_on_record(firmware, packet, &mut deferred)?;
+            }
             let decision = verdict.decision;
             if decision == Decision::Spare {
                 firmware.queues.compute(self.owner).ok_or(EIO)?
@@ -59,6 +62,33 @@ impl Backend {
         })();
         deferred.finish();
         result.unwrap_or(Decision::Own)
+    }
+
+    /// [`crate::g17::timeout::Decision::Retire`]: the firmware finished `packet`'s command, the
+    /// oldest of its queue still to retire, and only its completion stamp is missing. It retires
+    /// on its completion record with its stamp owed, as after the stamp fallback bound, so that
+    /// its client keeps its device and later commands of the queue retire past it. Where it
+    /// cannot (M5, ring entries not consumed, a recovery since), the watchdog fails it as before.
+    fn retire_on_record(&self, firmware: &mut crate::g17::Firmware, packet: &Arc<Packet>,
+        deferred: &mut DeferredBatch) -> Result<crate::g17::timeout::Decision> {
+        use crate::g17::timeout::Decision;
+        use core::sync::atomic::{AtomicU32, Ordering};
+        let expired = firmware.queues.compute_mut(self.owner)
+            .is_some_and(|mut queue| queue.expire_stamp_wait(packet));
+        if !expired {
+            return Ok(Decision::Own);
+        }
+        firmware.scan_compute(None, deferred)?;
+        if !firmware.queues.compute(self.owner).is_some_and(|queue| queue.retired_held(packet)) {
+            return Ok(Decision::Own);
+        }
+        static REPORTED: AtomicU32 = AtomicU32::new(0);
+        if REPORTED.fetch_add(1, Ordering::Relaxed) < 8 {
+            dev_info!(self.shared.dev.as_ref(),
+                "Compute watchdog owner={}: its command finished without a completion stamp; retired on its completion record\n",
+                self.owner);
+        }
+        Ok(Decision::Retire)
     }
 
     /// The older node of the packet's context ahead of its own, with its own word, when the
@@ -95,7 +125,8 @@ impl Backend {
             let Some(mut queue) = firmware.queues.compute_mut(self.owner) else {
                 return Ok(None);
             };
-            if !queue.owns_packet(packet) {
+            // A command that retired in this pass has its result.
+            if !queue.owns_packet(packet) || queue.retired_held(packet) {
                 return Ok(None);
             }
             queue.timeout(&mut |event| deferred.push(event))

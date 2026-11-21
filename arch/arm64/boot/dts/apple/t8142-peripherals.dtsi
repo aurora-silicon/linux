@@ -7,6 +7,7 @@
 		reg = <0x4 0x8a000000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 1481 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_apcie_sys_gp>;
 		status = "disabled";
 	};
 
@@ -226,11 +227,37 @@
 		status = "disabled";
 	};
 
+	/* ADT dart-jpeg: one DART for both engines, jpeg0 on SID 0, jpeg1 on SID 1. */
 	jpeg_dart: iommu@301020000 {
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x3 0x1020000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 1157 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		/* ADT vm-base 0x100_0000_0000, vm-size 0x300_0000_0000 */
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		power-domains = <&ps_jpg>;
+		status = "disabled";
+	};
+
+	/*
+	 * ADT jpeg0/jpeg1 ("jpeg,t8101", hw-type 0x110010). Their power-gates
+	 * JPG0-V/JPG1-V are virtual PMGR entries under JPG.
+	 */
+	jpeg0: jpeg@301000000 {
+		compatible = "apple,t8142-jpeg", "apple,jpeg";
+		reg = <0x3 0x1000000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1156 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&jpeg_dart 0>;
+		power-domains = <&ps_jpg>;
+		status = "disabled";
+	};
+
+	jpeg1: jpeg@301060000 {
+		compatible = "apple,t8142-jpeg", "apple,jpeg";
+		reg = <0x3 0x1060000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1159 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&jpeg_dart 1>;
+		power-domains = <&ps_jpg>;
 		status = "disabled";
 	};
 
@@ -238,9 +265,32 @@
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x3 0xa1020000 0x0 0xc000>,
 		      <0x3 0xa1034000 0x0 0x4000>;
+		/* ADT dart-apr instances DARTRT and SMMU. */
+		reg-names = "dart", "auxiliary";
 		interrupts = <AIC_IRQ 1381 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		power-domains = <&ps_scodec>;
+		/* ADT vm-base 0x100_0000_0000, vm-size 0x300_0000_0000 */
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
+	};
+
+	/*
+	 * ProRes encoder (ADT /arm-io/apr, "apr,l0"): T6050's five windows at the
+	 * same offsets. macOS 27.2.1 drives it through SID 1.
+	 */
+	apr: prores@3a1000000 {
+		compatible = "apple,t8142-prores", "apple,prores";
+		reg = <0x3 0xa1000000 0x0 0x4000>,
+		      <0x3 0xa0000000 0x0 0x1000000>,
+		      <0x3 0xa10c0000 0x0 0x4000>,
+		      <0x3 0xa1070000 0x0 0x4000>,
+		      <0x3 0xa1071000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux", "ctrl", "ctrl1";
+		interrupts = <AIC_IRQ 1382 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1419 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apr_dart 1>;
+		power-domains = <&ps_scodec>;
+		resets = <&ps_scodec>;
 	};
 
 	scdc_dart: iommu@3a1040000 {
@@ -529,6 +579,25 @@
 };
 
 &pmgr {
+	/* ADT pmgr device JPG (id 64), parent AFISOCNI1 (no power state). */
+	ps_jpg: power-controller@2a0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "jpg";
+		status = "disabled";
+	};
+
+	/* ADT pmgr device SCODEC (id 336): the ProRes engine and its DART. */
+	ps_scodec: power-controller@2c0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "scodec";
+	};
+
 	/* ADT pmgr device ANE_SYS (id 73), parent AFISOCNI3 (no power state). */
 	ps_ane_sys: power-controller@2e8 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
