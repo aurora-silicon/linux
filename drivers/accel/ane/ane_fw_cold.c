@@ -18,13 +18,16 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/clpc.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
+#include <linux/vmalloc.h>
 
 #include "ane_fw_cold.h"
+#include "ane_fw_pages.h"
 #include "ane_fw_sleep.h"
 #include "ane_h16_accel.h"
 
@@ -54,6 +57,13 @@ struct ane_fw_mapping {
 	dma_addr_t physical;
 	/* The DVA range, for a mapping in the window. */
 	struct drm_mm_node node;
+	/*
+	 * A cached surface: discontiguous pages (ane_fw_pages_alloc()), mapped
+	 * through b->memory for cache maintenance and at consecutive DVAs.
+	 */
+	struct page **pages;
+	struct sg_table sgt;
+	bool dma_mapped;
 };
 
 struct ane_fw_backend {
@@ -1285,20 +1295,87 @@ static int ane_fw_retain(struct ane_fw_backend *b)
 	return 0;
 }
 
+/*
+ * iommu_map and iommu_map_sgtable include the DART's normal range
+ * synchronization and propagate its timeout. Extra invalidates do not fix
+ * stale output BAR bindings between programs; the transport's queued first
+ * EXECUTE after a program change does.
+ */
+static int ane_fw_map_status(struct ane_fw_backend *b)
+{
+	for (unsigned int i = 0; i < ANE_FW_DARTS; i++)
+		if (ane_rd32(b, b->dart[i] + 0x100))
+			return -EIO;
+	return 0;
+}
+
 static int ane_fw_map(struct ane_fw_backend *b, u64 dva, phys_addr_t pa,
 		      size_t size, int prot)
 {
 	int ret = iommu_map(b->domain, dva, pa, size, prot, GFP_KERNEL);
 
+	return ret ?: ane_fw_map_status(b);
+}
+
+/*
+ * Pages, CPU alias and cache maintenance of a cached surface no longer mapped
+ * for the engine (failed allocation before mapping, or after iommu_unmap()).
+ */
+static void ane_fw_pages_release(struct ane_fw_backend *b, struct ane_fw_mapping *m)
+{
+	if (m->sgt.sgl) {
+		if (m->dma_mapped)
+			dma_unmap_sgtable(b->memory, &m->sgt, DMA_BIDIRECTIONAL,
+					  DMA_ATTR_SKIP_CPU_SYNC);
+		sg_free_table(&m->sgt);
+	}
+	if (m->surface.cpu)
+		vunmap(m->surface.cpu);
+	ane_fw_pages_free(m->pages, m->surface.size);
+}
+
+/*
+ * A cached surface from discontiguous pages: blocks of the DART granule or
+ * larger, charged to the caller's memcg, with a contiguous CPU alias (vmap)
+ * and DVA range. The firmware runs from whatever the DARTs map, so nothing
+ * needs a contiguous physical range the size of the program, which only CMA
+ * could give (a 66 MB H17 program needed cma=256M). b->memory is dma-direct;
+ * its mapping only does the cache maintenance, so its addresses must be the
+ * physical ones.
+ */
+static int ane_fw_alloc_pages(struct ane_fw_backend *b, size_t size, struct ane_fw_mapping *m)
+{
+	struct scatterlist *sg;
+	int min_order, ret;
+	unsigned int i;
+
+	min_order = ane_fw_pages_granule_order(b->domain->pgsize_bitmap);
+	if (min_order < 0)
+		return min_order;
+	m->pages = ane_fw_pages_alloc(size, min_order, get_order(SZ_2M),
+				      GFP_KERNEL_ACCOUNT | __GFP_ZERO | __GFP_RETRY_MAYFAIL);
+	if (IS_ERR(m->pages)) {
+		ret = PTR_ERR(m->pages);
+		m->pages = NULL;
+		return ret;
+	}
+	m->surface.size = size;
+	m->surface.cpu = vmap(m->pages, size >> PAGE_SHIFT, VM_MAP, PAGE_KERNEL);
+	if (!m->surface.cpu)
+		return -ENOMEM;
+	ret = sg_alloc_table_from_pages(&m->sgt, m->pages, size >> PAGE_SHIFT, 0, size,
+					GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
 	if (ret)
 		return ret;
-	/* iommu_map includes the DART's normal range synchronization and
-	 * propagates its timeout. Extra invalidates do not fix stale output
-	 * BAR bindings between programs; the transport's queued first EXECUTE
-	 * after a program change does.
-	 */
-	for (unsigned int i = 0; i < ANE_FW_DARTS; i++)
-		if (ane_rd32(b, b->dart[i] + 0x100))
+	/* Writes the zeroes back before the engine sees the pages. */
+	ret = dma_map_sgtable(b->memory, &m->sgt, DMA_BIDIRECTIONAL, 0);
+	if (ret)
+		return ret;
+	m->dma_mapped = true;
+	if (m->sgt.nents != m->sgt.orig_nents)
+		return -EIO;
+	for_each_sgtable_dma_sg(&m->sgt, sg, i)
+		if (sg_dma_address(sg) != sg_phys(sg) || sg_dma_len(sg) != sg->length)
 			return -EIO;
 	return 0;
 }
@@ -1322,21 +1399,23 @@ static int ane_fw_alloc_mem(struct ane_fw_backend *b, u64 dva, size_t size,
 	m = kzalloc_obj(*m);
 	if (!m)
 		return -ENOMEM;
-	if (cached)
-		m->surface.cpu = dma_alloc_noncoherent(b->memory, size, &m->physical,
-						       DMA_BIDIRECTIONAL, GFP_KERNEL);
-	else
+	if (cached) {
+		ret = ane_fw_alloc_pages(b, size, m);
+		if (ret) {
+			/* Never mapped for the engine: free it all now. */
+			ane_fw_pages_release(b, m);
+			kfree(m);
+			return ret;
+		}
+		/* The mapping: ane_fw_program_sync() maintains the whole of it. */
+		m->surface.handle = (uintptr_t)m;
+	} else {
 		m->surface.cpu = dma_alloc_coherent(b->memory, size, &m->physical,
 						    GFP_KERNEL);
-	if (!m->surface.cpu) {
-		kfree(m);
-		return -ENOMEM;
-	}
-	if (cached) {
-		/* Zero it and write the zeroes back before the engine sees it. */
-		memset(m->surface.cpu, 0, size);
-		dma_sync_single_for_device(b->memory, m->physical, size, DMA_BIDIRECTIONAL);
-		m->surface.handle = m->physical;
+		if (!m->surface.cpu) {
+			kfree(m);
+			return -ENOMEM;
+		}
 	}
 	mutex_lock(&b->window_lock);
 	if (dva == ANE_FW_WINDOW_ANY) {
@@ -1347,8 +1426,7 @@ static int ane_fw_alloc_mem(struct ane_fw_backend *b, u64 dva, size_t size,
 		if (ret) {
 			mutex_unlock(&b->window_lock);
 			if (cached)
-				dma_free_noncoherent(b->memory, size, m->surface.cpu,
-						     m->physical, DMA_BIDIRECTIONAL);
+				ane_fw_pages_release(b, m);
 			else
 				dma_free_coherent(b->memory, size, m->surface.cpu, m->physical);
 			kfree(m);
@@ -1364,7 +1442,13 @@ static int ane_fw_alloc_mem(struct ane_fw_backend *b, u64 dva, size_t size,
 	 */
 	list_add_tail(&m->list, &b->mappings);
 	mutex_unlock(&b->window_lock);
-	ret = ane_fw_map(b, dva, m->physical, size, prot);
+	if (cached) {
+		ssize_t mapped = iommu_map_sgtable(b->domain, dva, &m->sgt, prot);
+
+		ret = mapped < 0 ? mapped : (size_t)mapped != size ? -EIO : ane_fw_map_status(b);
+	} else {
+		ret = ane_fw_map(b, dva, m->physical, size, prot);
+	}
 	if (!ret)
 		*s = m->surface;
 	return ret;
@@ -1989,8 +2073,7 @@ static void ane_fw_program_unmap(void *ctx, const struct ane_fw_surface *s)
 		mutex_unlock(&b->window_lock);
 		return;
 	}
-	dma_free_noncoherent(b->memory, s->size, m->surface.cpu, m->physical,
-			     DMA_BIDIRECTIONAL);
+	ane_fw_pages_release(b, m);
 	mutex_lock(&b->window_lock);
 	drm_mm_remove_node(&m->node);
 	mutex_unlock(&b->window_lock);
@@ -2008,11 +2091,12 @@ static void ane_fw_program_log(void *ctx, const char *item, u64 a, u64 c)
 static void ane_fw_program_sync(void *ctx, const struct ane_fw_surface *s, bool for_device)
 {
 	struct ane_fw_backend *b = ctx;
+	struct ane_fw_mapping *m = (struct ane_fw_mapping *)(uintptr_t)s->handle;
 
 	if (for_device)
-		dma_sync_single_for_device(b->memory, s->handle, s->size, DMA_BIDIRECTIONAL);
+		dma_sync_sgtable_for_device(b->memory, &m->sgt, DMA_BIDIRECTIONAL);
 	else
-		dma_sync_single_for_cpu(b->memory, s->handle, s->size, DMA_BIDIRECTIONAL);
+		dma_sync_sgtable_for_cpu(b->memory, &m->sgt, DMA_BIDIRECTIONAL);
 }
 
 static void ane_fw_program_busy(void *ctx, bool busy)
