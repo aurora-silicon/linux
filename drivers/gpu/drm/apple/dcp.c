@@ -5551,9 +5551,15 @@ static int dcp_get_bw_scratch_in_window(struct apple_dcp *dcp,
 			addr_idx, ph_args->np);
 		return ret;
 	}
+	/* The slot's 4 bytes, inside both the PMGR range and the window. */
+	if (resource_size(&slot) < 4 || offset > resource_size(&slot) - 4 ||
+	    resource_size(win) < 4) {
+		dev_err(dcp->dev, "'apple,bw-scratch' offset %#x is outside %pR\n",
+			offset, &slot);
+		return -EINVAL;
+	}
 	addr = slot.start + offset;
-	if (offset > resource_size(&slot) - 4 || addr < win->start ||
-	    addr + 4 > win->end + 1) {
+	if (addr < win->start || addr - win->start > resource_size(win) - 4) {
 		dev_err(dcp->dev, "'apple,bw-scratch' %#llx is outside display window %u %pR\n",
 			addr, disp_idx, win);
 		return -EINVAL;
