@@ -93,8 +93,8 @@ enum apple_clpc_rail {
  * @gpu_dense: submissions per sampling period that make light GPU work
  *	dense, see apple_clpc_gpu_dense(); 0 for none
  * @ane: state of each rail while ANE work is in flight; all zero disables input
- * @ane_cluster: /cpus/cpu-map cluster whose CPUs' frequency the ANE engine
- *	speed follows
+ * @ane_cluster: the /cpus/cpu-map cluster whose CPUs' frequency the ANE
+ *	engine speed follows, used only without the node's apple,ane-cpu-opp
  * @ane_cluster_khz: minimum frequency of that cluster while ANE work is in
  *	flight; 0 for none
  * @ane_cluster_machine: the machine compatible the cluster floor was
@@ -1250,6 +1250,47 @@ static int apple_clpc_policy_notify(struct notifier_block *nb, unsigned long eve
 	return NOTIFY_OK;
 }
 
+/*
+ * The CPU whose frequency the ANE engine speed follows and the floor to hold
+ * it at while ANE work is in flight, from the CLPC node's apple,ane-cpu-opp:
+ * an OPP of that CPU cluster's table. A CPU that uses the OPP's table, or
+ * -ENOENT without the property, -ENODEV when no CPU uses it or it gives no
+ * frequency.
+ */
+static int apple_clpc_ane_cpu_opp(const struct device_node *np, unsigned int *khz)
+{
+	struct device_node *opp, *table;
+	int cpu, found = -ENODEV;
+	u64 hz;
+
+	opp = of_parse_phandle(np, "apple,ane-cpu-opp", 0);
+	if (!opp)
+		return -ENOENT;
+	table = of_get_parent(opp);
+	if (!table || of_property_read_u64(opp, "opp-hz", &hz) || hz < 1000 ||
+	    div_u64(hz, 1000) > UINT_MAX)
+		goto out;
+	for_each_possible_cpu(cpu) {
+		struct device_node *cpu_np = of_cpu_device_node_get(cpu);
+		struct device_node *cpu_table;
+
+		if (!cpu_np)
+			continue;
+		cpu_table = of_parse_phandle(cpu_np, "operating-points-v2", 0);
+		of_node_put(cpu_np);
+		of_node_put(cpu_table);
+		if (cpu_table == table) {
+			found = cpu;
+			*khz = div_u64(hz, 1000);
+			break;
+		}
+	}
+out:
+	of_node_put(table);
+	of_node_put(opp);
+	return found;
+}
+
 /* The first CPU of /cpus/cpu-map/cluster@index, or -ENODEV. */
 static int apple_clpc_cluster_cpu(unsigned int index)
 {
@@ -1401,20 +1442,26 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	}
 	clpc->ane_cpu = -ENODEV;
 	clpc->ane_until = jiffies;
-	if (clpc->ane && clpc->hw->ane_cluster_khz &&
-	    of_machine_is_compatible(clpc->hw->ane_cluster_machine)) {
-		clpc->ane_cpu = apple_clpc_cluster_cpu(clpc->hw->ane_cluster);
+	if (clpc->ane) {
+		unsigned int khz = 0;
+
+		/* The node names the cluster and its floor; else the table's. */
+		clpc->ane_cpu = apple_clpc_ane_cpu_opp(dev->of_node, &khz);
+		if (clpc->ane_cpu == -ENOENT && clpc->hw->ane_cluster_khz &&
+		    of_machine_is_compatible(clpc->hw->ane_cluster_machine)) {
+			clpc->ane_cpu = apple_clpc_cluster_cpu(clpc->hw->ane_cluster);
+			khz = clpc->hw->ane_cluster_khz;
+		}
 		if (clpc->ane_cpu >= 0) {
 			clpc->policy_nb.notifier_call = apple_clpc_policy_notify;
 			if (!cpufreq_register_notifier(&clpc->policy_nb,
 						       CPUFREQ_POLICY_NOTIFIER)) {
 				clpc->policy_nb_added = true;
-				clpc->ane_cluster_khz = clpc->hw->ane_cluster_khz;
+				clpc->ane_cluster_khz = khz;
 			}
 		}
 		if (!clpc->ane_cluster_khz)
-			dev_dbg(dev, "no ANE cluster floor (cpu-map cluster%u)\n",
-				clpc->hw->ane_cluster);
+			dev_dbg(dev, "no ANE cluster floor (%d)\n", clpc->ane_cpu);
 	}
 	/* The property is optional: without it, CPU demand alone sets the floors. */
 	if (clpc->hw->gpu_demand)
@@ -1578,12 +1625,10 @@ static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
 	 * MobileNetV1: no floor 0.92 ms an EXECUTE (firmware 0.70 ms), M5/F3
 	 * 0.68 ms (0.45 ms); then firmware time by P cluster frequency 0.44 ms
 	 * up to 1.512 GHz, 0.32 ms at 2.616 GHz and 0.29-0.31 ms from there to
-	 * 4.104 GHz. The cluster floor is the start of that plateau.
+	 * 4.104 GHz. The device tree's apple,ane-cpu-opp names the start of
+	 * that plateau as the cluster floor.
 	 */
 	.ane = { [APPLE_CLPC_DCS] = 5, [APPLE_CLPC_SOC] = 3 },
-	.ane_cluster = 1,
-	.ane_cluster_khz = 2616000,
-	.ane_cluster_machine = "apple,t8132",
 };
 
 /*
@@ -1895,8 +1940,9 @@ static void apple_clpc_ane_demand_hold_test(struct kunit *test)
 	/* T6040 holds its top qualified DCS and fabric states for the ANE. */
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane[APPLE_CLPC_DCS], 5);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane[APPLE_CLPC_SOC], 3);
-	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane_cluster, 1u);
-	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane_cluster_khz, 2616000u);
+	/* T8132's cluster floor comes from the device tree only. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane_cluster_khz, 0u);
+	KUNIT_EXPECT_NULL(test, apple_clpc_hw_t8132.ane_cluster_machine);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_DCS], 5);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_SOC], 2);
 }
