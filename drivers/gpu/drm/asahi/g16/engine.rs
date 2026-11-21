@@ -387,7 +387,7 @@ impl Scratch {
             tas: z(work::ta::SEQ_SIZE)?,
             fs: z(work::fs::WORK_SIZE)?,
             fss: z(work::fs::SEQ_SIZE)?,
-            scene: z(work::scene::SIZE)?,
+            scene: z(work::scene::ACTIVE_SIZE)?,
         })
     }
 }
@@ -1550,7 +1550,15 @@ impl Firmware {
                 return Err(EIO);
             }
         }
-        s.work.write(0, w)?;
+        if self.slots.compute_needs_full_work(index) {
+            s.work.write(0, w)?;
+        } else {
+            s.work.write(0, &w[..work::compute::HEAD_ACTIVE_SIZE])?;
+            s.work.write(
+                work::compute::BODY_ACTIVE_START,
+                &w[work::compute::BODY_ACTIVE_START..work::compute::BODY_ACTIVE_END],
+            )?;
+        }
         f.uma_submitted = submitted;
         f.has_timestamps = !cmd.timestamp_outputs.is_empty();
         wmb();

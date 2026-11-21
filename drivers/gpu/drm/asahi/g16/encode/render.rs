@@ -591,9 +591,11 @@ pub(crate) fn render_attachments(q: &mut [u8], engine: usize, att: &[uapi::drm_a
 /// Base scene metadata in caller-owned storage. A full scene belongs to the
 /// retained slot and should not be placed on the kernel stack.
 pub(crate) fn fill_scene(r: &RenderRefs, p: &PassRefs, out: &mut [u8]) {
-    let Some(out) = out.get_mut(..scene::SIZE) else {
+    if out.len() < scene::ACTIVE_SIZE {
         return;
-    };
+    }
+    let len = out.len().min(scene::SIZE);
+    let out = &mut out[..len];
     out.fill(0);
     put64(out, 0, p.scene_user_gva);
     put64(out, 8, p.scratch_fw);

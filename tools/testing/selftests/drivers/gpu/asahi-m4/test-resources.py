@@ -482,6 +482,7 @@ pub mod g16 {
         // Same-VM clean reuse of unit 0 clears ONLY its (16 B), skipping context_store/aux/preempt/seq.
         let k=s.claim_compute_for(&arena.compute,&mut c,Some(a.id)).unwrap().unwrap();
         assert_eq!(k,0);
+        assert!(!s.compute_needs_full_work(0));
         assert_eq!(arena.compute.compute[0].its.fills.lock().unwrap().len(),2);
         assert_eq!(arena.compute.compute[0].context_store.fills.lock().unwrap().len(),1);
         assert_eq!(arena.compute.compute[0].preempt.fills.lock().unwrap().len(),1);
@@ -490,6 +491,7 @@ pub mod g16 {
         // Cross-VM switch on unit 1 runs full scrub.
         let k=s.claim_compute_for(&arena.compute,&mut c,Some(b.id)).unwrap().unwrap();
         assert_eq!(k,1);
+        assert!(s.compute_needs_full_work(1));
         assert_eq!(arena.compute.compute[1].context_store.fills.lock().unwrap().len(),2);
         assert_eq!(arena.compute.compute[1].preempt.fills.lock().unwrap().len(),2);
         s.hold_vm(&c,&b).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
@@ -497,11 +499,13 @@ pub mod g16 {
         s.invalidate_scrub();
         let k=s.claim_compute_for(&arena.compute,&mut c,Some(a.id)).unwrap().unwrap();
         assert_eq!(k,0);
+        assert!(s.compute_needs_full_work(0));
         assert_eq!(arena.compute.compute[0].context_store.fills.lock().unwrap().len(),2);
         // Cancelled preparation forces full scrub on next claim.
         s.release(&mut c);
         let k=s.claim_compute_for(&arena.compute,&mut c,Some(a.id)).unwrap().unwrap();
         assert_eq!(k,0);
+        assert!(s.compute_needs_full_work(0));
         assert_eq!(arena.compute.compute[0].context_store.fills.lock().unwrap().len(),3);
         s.hold_vm(&c,&a).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
     }
@@ -521,10 +525,12 @@ pub mod g16 {
         retire(&mut s,1,&a);
         let p0=&arena.render.passes[0];
         assert_eq!(p0.aux.fills.lock().unwrap().len(),1);
+        assert_eq!(p0.scene.fills.lock().unwrap().last(),Some(&(0,0x4000)));
         assert_eq!(p0.tpc.fills.lock().unwrap().len(),1);
-        // Same-VM clean reuse of slot 0: clears tilemap/its/heap(0x1000)/pre headers only; skips aux/tpc/scratch.
+        // Same-VM clean reuse of slot 0: clears tilemap/its/heap(0x1000)/pre headers only; skips aux/tpc/scratch/scene.
         s.claim_pass_for(&arena.render,0,Some(a.id)).unwrap();
         assert_eq!(p0.aux.fills.lock().unwrap().len(),1);
+        assert_eq!(p0.scene.fills.lock().unwrap().len(),1);
         assert_eq!(p0.ta_scratch.fills.lock().unwrap().len(),1);
         assert_eq!(p0.fs_scratch.fills.lock().unwrap().len(),1);
         assert_eq!(p0.scene_user.fills.lock().unwrap().len(),1);
@@ -540,6 +546,7 @@ pub mod g16 {
         retire(&mut s,1,&a);
         s.claim_pass_for(&arena.render,0,Some(b.id)).unwrap();
         assert_eq!(p0.aux.fills.lock().unwrap().len(),2);
+        assert_eq!(p0.scene.fills.lock().unwrap().len(),2);
         assert_eq!(p0.scene_list.fills.lock().unwrap().len(),2);
         assert_eq!(p0.tpc.fills.lock().unwrap().last(),Some(&(0,0x8000)));
         assert_eq!(p0.tilemap.fills.lock().unwrap().last(),Some(&(0,0x1000)));

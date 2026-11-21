@@ -315,6 +315,7 @@ impl PassSlot {
         stats.tilemap_clear_bytes = stats.tilemap_clear_bytes.saturating_add(tilemap_dirty);
         self.aux.fill(0, 0, 0x20000)?;
         self.heap.fill(0, 0, 0x4000)?;
+        self.scene.fill(0, 0, super::fw::work::scene::SIZE)?;
         self.scene_user.fill(0, 0, 0x10000)?;
         self.scene_list
             .fill(0, 0, super::fw::buffer::SCENE_LIST_SIZE)?;
@@ -422,6 +423,8 @@ pub(crate) struct ComputeOwners {
     pending_arena: [Option<Arc<super::resources::ComputeArena>>; sizes::COMPUTE_UNITS],
     /// Force a full scrub on next claim (first use, cancel, error, or firmware recovery).
     scrub_full: [bool; sizes::COMPUTE_UNITS],
+    /// Whether the most recent claim of each compute unit required a full scrub/work write.
+    last_full: [bool; sizes::COMPUTE_UNITS],
 }
 
 /// Bitmask of valid render pass slot indices (`0..sizes::RENDER_SLOTS`).
@@ -468,6 +471,7 @@ impl Slots {
                     arena: [const { None }; sizes::COMPUTE_UNITS],
                     pending_arena: [const { None }; sizes::COMPUTE_UNITS],
                     scrub_full: [true; sizes::COMPUTE_UNITS],
+                    last_full: [true; sizes::COMPUTE_UNITS],
                 },
                 GFP_KERNEL,
             )?,
@@ -579,6 +583,13 @@ impl Slots {
         self.claim_compute_for(units, f, None)
     }
 
+    /// Whether the most recent claim of compute unit `k` requires writing the entire work
+    /// object (first use, cross-VM switch, cancelled preparation, error, or firmware recovery)
+    /// rather than only the active non-zero spans.
+    pub(crate) fn compute_needs_full_work(&self, k: usize) -> bool {
+        self.compute.last_full.get(k).copied().unwrap_or(true)
+    }
+
     pub(crate) fn claim_compute_for(
         &mut self,
         units: &super::resources::Prepared,
@@ -604,6 +615,7 @@ impl Slots {
                     self.compute.lifetime.cancel(k);
                     return Err(e);
                 }
+                self.compute.last_full[k] = full;
                 f.slot[0] = k as u32;
                 f.slot_count = 1;
                 self.cursor = ((k + 1) % n) as u32;
