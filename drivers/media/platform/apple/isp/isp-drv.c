@@ -627,6 +627,28 @@ static int isp_of_read_coord(struct device *dev, struct device_node *np,
 	return 0;
 }
 
+/*
+ * TEST knobs (J815, WIP). The J813/J815 DT presets run
+ * from the binned IMX958 mode, config 8 (1520x1440). These knobs move them to
+ * a full-resolution mode instead, with the crops doubled:
+ *   sensor_config=7: 3040x2880 (as before #2237),
+ *   sensor_config=6: 3040x2880 with SIFR, the mode macOS 27.2 streams (the
+ *   firmware reports it as 3040x5760: a short exposure rides along with each
+ *   frame, which highlight recovery uses; see the hr knob in isp-cam.c),
+ *   sensor_config=9: the binned 1520x1440 frame with SIFR (reported as
+ *   1520x2880): binning's lower noise plus highlight recovery, crops as in 8,
+ *   sensor_config=8 or 0: the DT presets unchanged.
+ * presets_full=1 is the old spelling of sensor_config=7 (the bench uses it).
+ * modprobe -r apple_isp; modprobe apple_isp sensor_config=N
+ */
+static bool presets_full;
+module_param(presets_full, bool, 0444);
+MODULE_PARM_DESC(presets_full, "TEST: same as sensor_config=7 (default: false)");
+
+static int sensor_config = 6;
+module_param(sensor_config, int, 0444);
+MODULE_PARM_DESC(sensor_config, "TEST: IMX958 sensor mode for the binned DT presets: 6 = full res + SIFR (macOS, default), 7 = full res, 9 = binned + SIFR, 8/0 = binned (DT)");
+
 static int apple_isp_init_presets(struct apple_isp *isp)
 {
 	struct device *dev = isp->dev;
@@ -680,6 +702,24 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 		preset->crop_offset.y = xywh[1];
 		preset->crop_size.x = xywh[2];
 		preset->crop_size.y = xywh[3];
+
+		if (!presets_full && sensor_config == 9 && preset->index == 8 &&
+		    preset->input_dim.x == 1520 && preset->input_dim.y == 1440) {
+			/* the same binned frame, with its SIFR exposure: crops unchanged */
+			preset->index = 9;
+			preset->remapped = true;
+		} else if ((presets_full || sensor_config == 6 || sensor_config == 7) &&
+		    preset->index == 8 &&
+		    preset->input_dim.x == 1520 && preset->input_dim.y == 1440) {
+			preset->index = presets_full ? 7 : sensor_config;
+			preset->remapped = true;
+			preset->input_dim.x *= 2;
+			preset->input_dim.y *= 2;
+			preset->crop_offset.x *= 2;
+			preset->crop_offset.y *= 2;
+			preset->crop_size.x *= 2;
+			preset->crop_size.y *= 2;
+		}
 
 		preset++;
 	}

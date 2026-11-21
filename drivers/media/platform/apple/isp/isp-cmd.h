@@ -55,10 +55,13 @@
 #define CISP_CMD_CH_AE_FRAME_RATE_MIN_SET		     0x020a
 #define CISP_CMD_CH_AE_STABILITY_SET			     0x021a
 #define CISP_CMD_CH_AE_STABILITY_TO_STABLE_SET		     0x0229
+#define CISP_CMD_CH_AE_GAIN_CAP_SET			     0x020c
 #define CISP_CMD_CH_SENSOR_NVM_GET			     0x0501
 #define CISP_CMD_CH_SENSOR_PERMODULE_LSC_INFO_GET	     0x0507
 #define CISP_CMD_CH_SENSOR_PERMODULE_LSC_GRID_GET	     0x0511
 #define CISP_CMD_CH_LPDP_HS_RECEIVER_TUNING_SET		     0x051b
+#define CISP_CMD_CH_STATUS_LED_MBRIGHTNESS_SET		     0x060f
+#define CISP_CMD_CH_STATUS_LED_THR_GET			     0x0632
 #define CISP_CMD_CH_FOCUS_LIMITS_GET			     0x0701
 #define CISP_CMD_CH_CROP_GET				     0x0800
 #define CISP_CMD_CH_CROP_SET				     0x0801
@@ -81,6 +84,8 @@
 #define CISP_CMD_CH_FACE_DETECTION_CONFIG_SET		     0x0d03
 #define CISP_CMD_CH_FACE_DETECTION_DISABLE		     0x0d04
 #define CISP_CMD_CH_FACE_DETECTION_ENABLE		     0x0d05
+#define CISP_CMD_CH_HR_ENABLE				     0x1005
+#define CISP_CMD_CH_SIFR_SKIP_INTERVAL_SET		     0x1008
 #define CISP_CMD_CH_FID_START				     0x3000
 #define CISP_CMD_CH_FID_STOP				     0x3001
 #define CISP_CMD_IPC_ENDPOINT_SET2			     0x300c
@@ -726,7 +731,7 @@ int isp_cmd_apple_ch_motion_history_start(struct apple_isp *isp, u32 chan);
 int isp_cmd_apple_ch_motion_history_stop(struct apple_isp *isp, u32 chan);
 int isp_cmd_apple_ch_temporal_filter_enable(struct apple_isp *isp, u32 chan);
 int isp_cmd_apple_ch_temporal_filter_disable(struct apple_isp *isp, u32 chan);
-int isp_cmd_apple_ch_tnr_start_h17(struct apple_isp *isp, u32 chan);
+int isp_cmd_apple_ch_tnr_start_h17(struct apple_isp *isp, u32 chan, u32 unk_10);
 int isp_cmd_apple_ch_tnr_high_strength_set(struct apple_isp *isp, u32 chan,
 					   u32 enable);
 int isp_cmd_apple_ch_tnr_band0_mod_set(struct apple_isp *isp, u32 chan,
@@ -830,5 +835,72 @@ static_assert(sizeof(struct cmd_ch_semantic_awb_enable) == 0x10);
 int isp_cmd_ch_semantic_video_enable(struct apple_isp *isp, u32 chan,
 				     u32 enable);
 int isp_cmd_ch_semantic_awb_enable(struct apple_isp *isp, u32 chan, u32 enable);
+
+/*
+ * Commands macOS 27.2 sends on the J815 (IMX958), named as the firmware
+ * prints them in its log when it receives them; layouts from the payloads
+ * in the hypervisor trace of 2026-11-20.
+ */
+struct cmd_ch_ae_gain_cap_set {
+	u64 opcode;
+	u32 chan;
+	u32 gain; /* 8.8 fixed point; macOS: 96.0 */
+} __packed;
+static_assert(sizeof(struct cmd_ch_ae_gain_cap_set) == 0x10);
+
+/* The firmware reads the value as a u16 at 0xc. */
+struct cmd_ch_status_led_mbrightness_set {
+	u64 opcode;
+	u32 chan;
+	u16 brightness;
+	u16 reserved;
+} __packed;
+static_assert(sizeof(struct cmd_ch_status_led_mbrightness_set) == 0x10);
+
+/* Reply: the range the brightness may take (J815: 204..1023). */
+struct cmd_ch_status_led_thr_get {
+	u64 opcode;
+	u32 chan;
+	u16 low;
+	u16 high;
+} __packed;
+static_assert(sizeof(struct cmd_ch_status_led_thr_get) == 0x10);
+
+/* Highlight recovery from the short exposure of a SIFR sensor config. */
+struct cmd_ch_hr_enable {
+	u64 opcode;
+	u32 chan;
+	u32 unk_c; /* 0 in every macOS call */
+	u32 enable;
+} __packed;
+static_assert(sizeof(struct cmd_ch_hr_enable) == 0x14);
+
+/* The 0x18-byte form macOS 27.2 sends on the J815: (2, 0x17, 0x10). */
+struct cmd_ch_lpdp_hs_receiver_tuning_set3 {
+	u64 opcode;
+	u32 chan;
+	u32 unk1;
+	u32 unk2;
+	u32 unk3;
+} __packed;
+static_assert(sizeof(struct cmd_ch_lpdp_hs_receiver_tuning_set3) == 0x18);
+
+struct cmd_ch_sifr_skip_interval_set {
+	u64 opcode;
+	u32 chan;
+	u32 interval; /* macOS: 1 */
+} __packed;
+static_assert(sizeof(struct cmd_ch_sifr_skip_interval_set) == 0x10);
+
+int isp_cmd_ch_ae_gain_cap_set(struct apple_isp *isp, u32 chan, u32 gain);
+int isp_cmd_ch_status_led_mbrightness_set(struct apple_isp *isp, u32 chan,
+					  u16 brightness);
+int isp_cmd_ch_status_led_thr_get(struct apple_isp *isp, u32 chan, u16 *low,
+				  u16 *high);
+int isp_cmd_ch_hr_enable(struct apple_isp *isp, u32 chan, u32 enable);
+int isp_cmd_ch_lpdp_hs_receiver_tuning_set3(struct apple_isp *isp, u32 chan,
+					    u32 unk1, u32 unk2, u32 unk3);
+int isp_cmd_ch_sifr_skip_interval_set(struct apple_isp *isp, u32 chan,
+				      u32 interval);
 
 #endif /* __ISP_CMD_H__ */
