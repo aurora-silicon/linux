@@ -117,10 +117,14 @@ impl G18ParameterBuffer {
     /// descriptor): the firmware builds the page-list entries itself. The
     /// new blocks are one object, homed in `storage` like the initial ones
     /// and aliased into the running client `vm`; the caller retains those
-    /// aliases with the client's other PB aliases. Returns the number of
-    /// blocks added (0: at the limit).
+    /// aliases with the client's other PB aliases. The blocks are the memory
+    /// of `client`, the client whose render asked: they are admitted against
+    /// its limit and the device's first, and ENOMEM refuses the growth, which
+    /// fails only that render. Returns the number of blocks added (0: at the
+    /// limit).
     pub(crate) fn grow(&mut self, dev: &AsahiDrmDevice, storage: &mmu::Vm, vm: &mmu::Vm,
-        add: u32, max: u32) -> Result<(u32, KVec<mmu::KernelMapping>)> {
+        client: Option<&kernel::sync::Arc<crate::memacct::Client>>, add: u32, max: u32)
+        -> Result<(u32, KVec<mmu::KernelMapping>)> {
         let a=self.addresses;let bias=crate::g18::address_map::COMPACT_BIAS;
         let capacity=self.policy.capacity;
         let blocks=self.backed_blocks()?;
@@ -133,8 +137,19 @@ impl G18ParameterBuffer {
         // The ring keeps one slot empty; the block table ends at SHARED.
         if retained+added>=capacity || (total+added) as usize*8>SHARED-BLOCK_TABLE {return Err(ENOSPC);}
         let address=a.blocks_low+u64::from(blocks)*G18_PB_BLOCK_BYTES;
-        let mut object=MappedObject::new_wc_at(dev,storage,address,
-            added as usize*G18_PB_BLOCK_BYTES as usize,mmu::PROT_GPU_SHARED_RW)?;
+        let bytes=added as usize*G18_PB_BLOCK_BYTES as usize;
+        // As g17 admits its pools: the PB outlives the client, so its growth
+        // would otherwise be kernel memory no limit stops.
+        let charge=match client {
+            Some(client)=>Some(crate::memacct::Charge::user(
+                crate::memacct::LEDGER.admit(client,bytes as u64)?,None)),
+            None=>None,
+        };
+        let mut object=match charge {
+            Some(_)=>MappedObject::new_wc_at_user_charged(dev,storage,address,bytes,
+                mmu::PROT_GPU_SHARED_RW)?,
+            None=>MappedObject::new_wc_at(dev,storage,address,bytes,mmu::PROT_GPU_SHARED_RW)?,
+        };
         let window=object.map_alias_at(storage,address+bias,mmu::PROT_GPU_SHARED_RW)?;
         let mut aliases=KVec::with_capacity(2,GFP_KERNEL)?;
         for at in [address,address+bias] {
@@ -146,6 +161,7 @@ impl G18ParameterBuffer {
         // Firmware owns the blocks once published: nothing below may fail
         // and drop them, so the owner vectors grow first.
         self.blocks.reserve(1,GFP_KERNEL)?;
+        self.charges.reserve(1,GFP_KERNEL)?;
         self.window_aliases.reserve(1,GFP_KERNEL)?;
         for index in 0..added {
             let slot=((total+index)%capacity) as usize;
@@ -160,6 +176,10 @@ impl G18ParameterBuffer {
         self.graph.write_u32(a.graph_high+(SHARED+4) as u64,target)?;
         fence(Ordering::SeqCst);
         let _=self.blocks.push_within_capacity(object);
+        if let Some(charge)=charge {
+            charge.set_held(true);
+            let _=self.charges.push_within_capacity(charge);
+        }
         let _=self.window_aliases.push_within_capacity(window);
         dev_info!(dev.as_ref(),"G18_PB_GROW blocks={}->{} ring total={}->{} read={}\n",
             blocks,blocks+added,total,target,read);

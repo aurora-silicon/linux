@@ -40,7 +40,9 @@ impl ApplicationJob {
             || vm_slot!=u32::from(self.job.context_id()) {return Err(ENOENT);}
         self.user_aliases.reserve(2,GFP_KERNEL)?;
         let vm=self.job.vm().clone();
-        let (added,aliases)=self.job.parameter_buffer.grow(dev,&self.storage,&vm,PB_GROW_BLOCKS,PB_MAX_BLOCKS)?;
+        let client=vm.memory_client().cloned();
+        let (added,aliases)=self.job.parameter_buffer.grow(dev,&self.storage,&vm,client.as_ref(),
+            PB_GROW_BLOCKS,PB_MAX_BLOCKS)?;
         for alias in aliases {let _=self.user_aliases.push_within_capacity(alias);}
         Ok(added)
     }
