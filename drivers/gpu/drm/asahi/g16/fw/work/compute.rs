@@ -44,6 +44,9 @@ pub(crate) struct Layout {
     pub(crate) target: usize,
     /// Bytes of the work the firmware caches; the host's private parts lie beyond them.
     pub(crate) cached: usize,
+    /// Whether the register list carries the unit's free-list slot ([`SLOT_REG`]). macOS 27.2
+    /// sends it in every compute work item on the 26B123 firmware.
+    pub(crate) slot_record: bool,
 }
 
 pub(crate) const V25G83: Layout = Layout {
@@ -52,6 +55,7 @@ pub(crate) const V25G83: Layout = Layout {
     auxiliary: 0x89c,
     target: 0x8ac,
     cached: 0x8c0,
+    slot_record: false,
 };
 
 pub(crate) const V26B123: Layout = Layout {
@@ -60,6 +64,7 @@ pub(crate) const V26B123: Layout = Layout {
     auxiliary: 0x8a3,
     target: 0x8b3,
     cached: 0x8e0,
+    slot_record: true,
 };
 
 const fn valid(l: &Layout) -> bool {
@@ -71,6 +76,10 @@ const fn valid(l: &Layout) -> bool {
         && SEQ_EMBEDDED + SEQ_SIZE <= NOTIFIER
 }
 const _: () = assert!(valid(&V25G83) && valid(&V26B123));
+
+/// Register that names the free-list slot of the UMA pool the work runs with: the value the
+/// pool descriptor holds at its slot word.
+pub(crate) const SLOT_REG: u32 = 0x14028;
 
 pub(crate) const SEL: [u32; 24] = [
     0x1a510, 0x1a420, 0x1a4d0, 0x1a4d8, 0x1a4e0, 0x1a4e8, 0x1a440, 0x1a458, 0x101d9, 0x1a089,

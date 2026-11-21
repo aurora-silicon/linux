@@ -264,6 +264,11 @@ def expect_compute(old):
     for at in (0x1a8, 0x1bc + 0x2c, 0x20c + 0x2c, 0x258 + 0x69, 0x258 + 0x71):
         plus7(q, at)
         plus7(w, embedded + at)
+    # 26B123 appends the free-list slot record {0x14028, the descriptor's slot word} to the
+    # register list at +0x20, as macOS 27.2 sends it.
+    count = struct.unpack_from('<H', w, 0x728)[0]
+    struct.pack_into('<IQ', w, 0x20 + count * 12, 0x14028, struct.unpack_from('<I', w, 0xe00 + 8)[0])
+    struct.pack_into('<HH', w, 0x728, count + 1, (count + 1) * 12)
     return bytes(w + q)
 
 

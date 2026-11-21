@@ -300,10 +300,16 @@ pub(crate) fn encode_compute_for(
         put32(w, compute::REGS + i * 12, sel);
         put64(w, compute::REGS + i * 12 + 4, value);
     }
-    let count = if r.usc_base == 0 { 24 } else { 25 };
+    let mut count: usize = compute::SEL.len();
     if r.usc_base != 0 {
-        put32(w, compute::REGS + 24 * 12, 0x10071);
-        put64(w, compute::REGS + 24 * 12 + 4, r.usc_base);
+        put32(w, compute::REGS + count * 12, 0x10071);
+        put64(w, compute::REGS + count * 12 + 4, r.usc_base);
+        count += 1;
+    }
+    if layout.slot_record {
+        put32(w, compute::REGS + count * 12, compute::SLOT_REG);
+        put64(w, compute::REGS + count * 12 + 4, u64::from(r.uma_slot));
+        count += 1;
     }
     put32(w, 0, 3);
     put32(w, 0xc, ctx);
@@ -317,8 +323,8 @@ pub(crate) fn encode_compute_for(
         },
     );
     put64(w, 0x720, r.work_gva + 0x20);
-    put16(w, 0x728, count);
-    put16(w, 0x72a, count * 12);
+    put16(w, 0x728, count as u16);
+    put16(w, 0x72a, (count * 12) as u16);
     put64(w, 0x760, r.seq);
     put32(w, 0x768, compute::SEQ_SIZE as u32);
     put64(w, 0x798, pre);
