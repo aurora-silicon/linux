@@ -2439,7 +2439,7 @@
 				#power-domain-cells = <0x00>;
 				#reset-cells = <0x00>;
 				label = "ane_sys";
-				status = "disabled";
+				status = "okay";
 			};
 
 			ps_dptx_phy: power-controller@3f8 {
@@ -2999,9 +2999,9 @@
 
 		ane: ane@508000000 {
 			compatible = "apple,t6050-ane";
-			reg = <0x05 0x8000000 0x00 0x2000000>, <0x02 0x80900000 0x00 0x18000>, <0x02
-				0x80921590 0x00 0x34>, <0x05 0x84000000 0x00 0x2000000>;
-			reg-names = "engine", "pmgr", "pwgate", "xl";
+			reg = <0x05 0x8000000 0x00 0x2000000>, <0x02 0x80900000 0x00 0x18000>,
+				<0x02 0x80921590 0x00 0x34>;
+			reg-names = "engine", "pmgr", "pwgate";
 			interrupt-parent = <&aic>;
 			interrupts = <0x00 0x00 0x3ba 0x04>, <0x00 0x00 0x3c7 0x04>;
 			iommus = <&ane_dart0 0x00>, <&ane_dart1 0x00>, <&ane_dart2 0x00>;
@@ -3016,7 +3016,7 @@
 				0x6302668000 0x6302668003>;
 			apple,clpc = <&clpc>;
 			performance-domains = <&cpufreq_pc0>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		i2c1: i2c@505014000 {
@@ -3652,7 +3652,8 @@
 			reg = <0x05 0x9800000 0x00 0xc000 0x05 0x9810000 0x00 0x4000>;
 			#iommu-cells = <0x01>;
 			interrupts = <0x00 0x00 0x3bb 0x04>;
-			status = "disabled";
+			power-domains = <&ps_ane_sys>;
+			status = "okay";
 			reg-names = "dart", "auxiliary";
 		};
 
@@ -3661,7 +3662,8 @@
 			reg = <0x05 0x9820000 0x00 0xc000>;
 			#iommu-cells = <0x01>;
 			interrupts = <0x00 0x00 0x3bb 0x04>;
-			status = "disabled";
+			power-domains = <&ps_ane_sys>;
+			status = "okay";
 		};
 
 		ane_dart2: iommu@509840000 {
@@ -3669,7 +3671,8 @@
 			reg = <0x05 0x9840000 0x00 0xc000>;
 			#iommu-cells = <0x01>;
 			interrupts = <0x00 0x00 0x3bb 0x04>;
-			status = "disabled";
+			power-domains = <&ps_ane_sys>;
+			status = "okay";
 		};
 
 		lpdptx_phy0: phy@29c200000 {
