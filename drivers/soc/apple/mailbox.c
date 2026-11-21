@@ -935,7 +935,7 @@ static void apple_mbox_apply_rx_util_min(struct apple_mbox *mbox)
 
 int apple_mbox_set_rx_util_min(struct apple_mbox *mbox, int util_min)
 {
-	if (!IS_ENABLED(CONFIG_UCLAMP_TASK) || !apple_mbox_is_g17(mbox))
+	if (!IS_ENABLED(CONFIG_UCLAMP_TASK) || !mbox->rx_threaded)
 		return -EOPNOTSUPP;
 	if (util_min < -1 || util_min > SCHED_CAPACITY_SCALE)
 		return -EINVAL;
@@ -976,8 +976,7 @@ static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
 	unsigned long flags;
 	int consumed = 0;
 
-	/* Only the G17 receive handler is threaded (see apple_mbox_probe()). */
-	if (apple_mbox_is_g17(mbox))
+	if (mbox->rx_threaded)
 		apple_mbox_apply_rx_util_min(mbox);
 
 	spin_lock_irqsave(&mbox->rx_lock, flags);
@@ -1630,7 +1629,13 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		if (!irqname)
 			return -ENOMEM;
 
-		if (apple_mbox_is_g17(mbox))
+		/*
+		 * The G17 GPU coprocessors can flood the receive FIFO; their
+		 * handler drains a bounded batch and sleeps (see
+		 * apple_mbox_recv_irq()), so it runs in an IRQ thread.
+		 */
+		mbox->rx_threaded = apple_mbox_is_g17(mbox);
+		if (mbox->rx_threaded)
 			ret = devm_request_threaded_irq(dev, mbox->irq_recv_not_empty, NULL,
 							apple_mbox_recv_irq,
 							IRQF_ONESHOT | IRQF_NO_AUTOEN |
