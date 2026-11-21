@@ -410,9 +410,21 @@
 &dcpext0 {
 	memory-region = <&dcpext0_text>, <&dcpext0_data>, <&dcpext0_heap>;
 	memory-region-names = "text", "data", "heap";
+	/*
+	 * Its deep-sleep stop writes the same words as the internal DCP's: its
+	 * DISPEXT0 power states and retention in the same blocks, and pmc-dcp,
+	 * which counts every powered DCP.
+	 */
+	apple,display-power = <&dcp_power>;
 };
 
 &dcpext1 {
 	memory-region = <&dcpext1_text>, <&dcpext1_data>, <&dcpext1_heap>;
 	memory-region-names = "text", "data", "heap";
+	/*
+	 * Its deep-sleep stop writes the same words as the internal DCP's: its
+	 * DISPEXT1 power states and retention in the same blocks, and pmc-dcp,
+	 * which counts every powered DCP.
+	 */
+	apple,display-power = <&dcp_power>;
 };

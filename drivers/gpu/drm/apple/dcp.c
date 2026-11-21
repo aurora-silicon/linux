@@ -407,6 +407,15 @@ static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 		dev_info(dcp->dev, "no apple,display-power in the device tree, the firmware keeps running\n");
 		dcp->hw.s2r_ext = false;
 	}
+	if (dcp->hw.s2r_ext && !dcp->hw.s2r_layout) {
+		int ret = dcp_s2r_layout_from_dt(dcp);
+
+		if (ret) {
+			dev_info(dcp->dev, "display power words not in the device tree (%d), the firmware keeps running\n",
+				 ret);
+			dcp->hw.s2r_ext = false;
+		}
+	}
 	if (dcp->hw.s2r && dcp->hw.s2r_untested)
 		dev_info(dcp->dev, "firmware stop enabled (appledrm.s2r_untested)\n");
 }
@@ -7237,6 +7246,9 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext_v27 = {
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
 	.sink_metadata_edid = true,
+	/* Its sleep stop and start, with the power words from the device tree. */
+	.s2r_ext = true,
+	.s2r_no_secure_port = true,
 };
 
 static int dcp_platform_probe_pipe(struct platform_device *pdev)
@@ -8379,6 +8391,15 @@ static bool dcp_s2r_is_t8142_ext(struct apple_dcp *dcp)
 	return of_device_is_compatible(dcp->dev->of_node, "apple,t8142-dcpext");
 }
 
+/*
+ * An external DCP powered by its layout's words (T8142's table, or the device tree's), not
+ * by the fixed DISPEXT0 sequence of the firmware-12 external DCPs.
+ */
+static bool dcp_s2r_ext_by_layout(struct apple_dcp *dcp)
+{
+	return dcp_s2r_is_t8142_ext(dcp) || dcp->s2r_dt_layout_ok;
+}
+
 static const struct dcp_s2r_layout *dcp_s2r_layout(struct apple_dcp *dcp)
 {
 	if (dcp_s2r_is_t8142_ext(dcp))
@@ -8664,7 +8685,8 @@ static int dcp_s2r_stop_firmware(struct apple_dcp *dcp)
 static bool dcp_s2r_ext_capable(struct apple_dcp *dcp)
 {
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
-		return dcp->hw.s2r_ext && s2r_untested && dcp->v27_methods &&
+		return dcp->hw.s2r_ext && (s2r_untested || dcp->s2r_dt_layout_ok) &&
+		       dcp->v27_methods &&
 		       dcp->v27_methods[dcpep_unnamed_500].tag[0];
 	return dcp->fw_compat == DCP_FIRMWARE_H17P && dcp->hw.s2r_ext;
 }
@@ -8992,7 +9014,7 @@ static int dcp_s2r_domains_on(struct apple_dcp *dcp)
 	val = readl(ps + l->disp_fe) & ~(GENMASK(9, 8) | GENMASK(3, 0));
 	writel(val | 0xf, ps + l->disp_fe);
 	val = readl(ps + l->disp_cpu) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
-	if (dcp_s2r_is_t8142_ext(dcp)) {
+	if (dcp_s2r_is_t8142_ext(dcp) || (dcp->hw.external_processor && dcp->s2r_dt_layout_ok)) {
 		/* Retain the CPU when idle, as in the measured J813 wake sequence. */
 		val = (val & ~DCP_PS_MIN) | FIELD_PREP(DCP_PS_MIN, 4);
 		writel(val, ps + l->disp_cpu);
@@ -9035,7 +9057,7 @@ static int dcp_s2r_ext_domains_on(struct apple_dcp *dcp)
 	u32 val;
 	int i, ret = -ENODEV;
 
-	if (dcp_s2r_is_t8142_ext(dcp))
+	if (dcp_s2r_ext_by_layout(dcp))
 		return dcp_s2r_domains_on(dcp);
 
 	np = of_parse_phandle(dcp->dev->of_node, "apple,display-power", 0);
@@ -9132,7 +9154,7 @@ static int dcp_s2r_ext_domains_off(struct apple_dcp *dcp)
 	int i, ret = -ENODEV;
 	u32 val;
 
-	if (dcp_s2r_is_t8142_ext(dcp))
+	if (dcp_s2r_ext_by_layout(dcp))
 		return dcp_s2r_domains_off(dcp);
 
 	np = of_parse_phandle(dcp->dev->of_node, "apple,display-power", 0);
@@ -9191,7 +9213,7 @@ static bool dcp_s2r_ext_cpu_on(struct apple_dcp *dcp)
 	of_node_put(np);
 	if (!ps)
 		return false;
-	on = FIELD_GET(GENMASK(7, 4), readl(ps + (dcp_s2r_is_t8142_ext(dcp) ?
+	on = FIELD_GET(GENMASK(7, 4), readl(ps + (dcp_s2r_ext_by_layout(dcp) ?
 				dcp_s2r_layout(dcp)->disp_cpu : 0x328)));
 	iounmap(ps);
 
