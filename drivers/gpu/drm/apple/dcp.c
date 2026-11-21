@@ -520,7 +520,7 @@ static bool dcp_desktop_external(struct apple_dcp *dcp)
 static bool dcp_desktop_external_node(const struct device_node *np)
 {
 	return of_device_is_compatible(np, "apple,t6041-dcpext") ||
-	       apple_t8132_dcpext_v27_2(np);
+	       apple_t8132_dcpext_hdmi_v27_2(np);
 }
 
 /*

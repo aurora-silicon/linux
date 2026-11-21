@@ -3396,6 +3396,183 @@ static void __init gate_j713_dcpext_routes(void)
 }
 
 /*
+ * A T8132 dcpext on its Type-C routes handed over with the 27.2 image (the
+ * MacBook Air's (J713) dcpext0 and dcpext1 on macOS 27.2): aura hands it over
+ * as it hands over the J773g's (its firmware memory, the 26B123 image and its
+ * pipe's firmware clocks) beside the internal display, and writes no
+ * apple,t8132-dcpext-firmware-ready: it runs the firmware-27 backend as a
+ * pipe of the internal display's DRM device (apple_t8132_dcpext_v27_2()),
+ * not the M4 one. Its node and DARTs are enabled in the tree already.
+ *
+ * Enable the Type-C routes and the PIODMA child of each such dcpext, and add
+ * its display DART (its PIODMA's) to the display subsystem's iommus, in one
+ * changeset: the scanout of every pipe goes through the display subsystem's
+ * domain. Only
+ * once the internal handoff has enabled the display subsystem; a dcpext
+ * without firmware memory or with another image is left as it is.
+ */
+static int __init gate_j713_v27_dispext_dart(struct device_node *dcp, struct device_node **dart)
+{
+	struct of_phandle_args args;
+	struct device_node *piodma;
+	int ret;
+
+	piodma = of_get_child_by_name(dcp, "piodma");
+	if (!piodma)
+		return -ENODEV;
+	ret = of_parse_phandle_with_args(piodma, "iommus", "#iommu-cells", 0, &args);
+	of_node_put(piodma);
+	if (ret)
+		return ret;
+	*dart = args.np;
+	return 0;
+}
+
+/* Its PIODMA child is disabled in the SoC tree, as for the J773g: enable it. */
+static int __init gate_j713_v27_piodma(struct of_changeset *cs, struct device_node *dcp)
+{
+	struct device_node *piodma;
+	int ret = 0;
+
+	piodma = of_get_child_by_name(dcp, "piodma");
+	if (!piodma)
+		return -ENODEV;
+	if (!of_device_is_available(piodma))
+		ret = of_changeset_update_prop_string(cs, piodma, "status", "okay");
+	of_node_put(piodma);
+	return ret;
+}
+
+static bool __init gate_j713_v27_memory(struct device_node *dcp)
+{
+	struct device_node *region;
+	int i, n;
+
+	/* text, data and heap first; the loader may add more after them */
+	n = of_count_phandle_with_args(dcp, "memory-region", NULL);
+	if (n < 3)
+		return false;
+	for (i = 0; i < 3; i++) {
+		bool ok;
+
+		region = of_parse_phandle(dcp, "memory-region", i);
+		ok = region && of_device_is_available(region) &&
+		     of_device_is_compatible(region, "apple,asc-mem");
+		of_node_put(region);
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
+static bool __init gate_has_typec_routes(struct device_node *dcp)
+{
+	struct device_node *routes = of_get_child_by_name(dcp, "typec-routes");
+	bool has = routes && of_get_child_count(routes);
+
+	of_node_put(routes);
+	return has;
+}
+
+static void __init gate_j713_dcpext_v27(void)
+{
+	struct device_node *darts[2] = {}, *display, *np;
+	struct of_changeset *cs;
+	struct property *old, *prop;
+	unsigned int n = 0, i;
+	__be32 *value;
+	int ret = 0;
+
+	display = of_find_compatible_node(NULL, NULL, "apple,t8132-display-subsystem");
+	if (!display)
+		return;
+	cs = gate_cs_alloc();
+	if (!cs) {
+		of_node_put(display);
+		return;
+	}
+	for_each_compatible_node(np, NULL, "apple,t8132-dcpext") {
+		if (!of_device_is_available(np) || !apple_t8132_dcpext_v27_2(np))
+			continue;
+		/* A fixed-PHY (HDMI) dcpext has its own chain. */
+		if (!gate_has_typec_routes(np))
+			continue;
+		if (!gate_j713_v27_memory(np)) {
+			pr_info("apple-j713-display: %pOF: 27.2 image without firmware memory, left off\n",
+				np);
+			continue;
+		}
+		if (!of_device_is_available(display)) {
+			pr_info("apple-j713-display: %pOF: display subsystem not enabled, left off\n",
+				np);
+			continue;
+		}
+		if (n == ARRAY_SIZE(darts)) {
+			ret = -E2BIG;
+			of_node_put(np);
+			break;
+		}
+		ret = gate_j713_v27_dispext_dart(np, &darts[n]);
+		if (!ret)
+			ret = gate_j713_v27_piodma(cs, np);
+		if (!ret)
+			ret = gate_ext_routes(cs, np, "okay");
+		if (ret) {
+			of_node_put(np);
+			break;
+		}
+		n++;
+	}
+	if (ret || !n)
+		goto out;
+
+	/* The display subsystem's iommus, each new display DART appended once. */
+	old = of_find_property(display, "iommus", NULL);
+	if (!old || old->length % (2 * sizeof(__be32))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	prop = kzalloc_obj(*prop);
+	value = kmalloc(old->length + n * 2 * sizeof(*value), GFP_KERNEL);
+	if (!prop || !value) {
+		kfree(prop);
+		kfree(value);
+		ret = -ENOMEM;
+		goto out;
+	}
+	memcpy(value, old->value, old->length);
+	for (i = 0; i < n; i++) {
+		value[old->length / sizeof(*value) + 2 * i] = cpu_to_be32(darts[i]->phandle);
+		value[old->length / sizeof(*value) + 2 * i + 1] = cpu_to_be32(0);
+		if (!darts[i]->phandle)
+			ret = -EINVAL;
+	}
+	prop->name = "iommus";
+	prop->length = old->length + n * 2 * sizeof(*value);
+	prop->value = value;
+	if (ret) {
+		kfree(prop);
+		kfree(value);
+		goto out;
+	}
+	ret = of_changeset_update_property(cs, display, prop);
+	if (!ret)
+		ret = of_changeset_apply(cs);
+out:
+	for (i = 0; i < ARRAY_SIZE(darts); i++)
+		of_node_put(darts[i]);
+	of_node_put(display);
+	if (ret)
+		pr_err("apple-j713-display: 27.2 dcpext Type-C routes left disabled: %d\n", ret);
+	else if (n)
+		pr_info("apple-j713-display: 27.2: Type-C routes and display DARTs enabled for %u dcpext(s)\n",
+			n);
+	/* Applied, it stays: the live tree refers to it. */
+	if (ret || !n)
+		gate_cs_free(cs);
+}
+
+/*
  * The J773g's HDMI chain on macOS 27.2 (t8132-j773g.dts): the LPDPTX PHY,
  * dcpext0's firmware and display DARTs, its mailbox, its PIODMA child, then
  * dcpext0. As on the J575c no PMP runs and no DISPEXT0 power domain is
@@ -3524,6 +3701,7 @@ static int __init apple_display_gate(void)
 
 	if (apple_t8132_firmware_path()) {
 		gate_j713_dcpext_routes();
+		gate_j713_dcpext_v27();
 		return 0;
 	}
 
