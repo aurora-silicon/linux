@@ -142,6 +142,8 @@ int apple_dp_phy_link_config(struct phy *phy, unsigned int *pclk, bool *uhbr);
 int apple_dpxbar_link_configure(struct mux_control *mux, unsigned int pclk, bool uhbr);
 int apple_dpxbar_link_down(struct mux_control *mux);
 int apple_dpxbar_link_up(struct mux_control *mux);
+/* The output routes on select and runs its clocks only between link up and down. */
+bool apple_dpxbar_clocks_on_link(struct mux_control *mux);
 int apple_dpxbar_tunnel_select_source(struct mux_control *mux, int state);
 
 /*
