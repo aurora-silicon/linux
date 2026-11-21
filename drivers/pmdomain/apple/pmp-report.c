@@ -64,6 +64,8 @@
  * @fast_die: 32-bit word holding the fast die-temperature effort of each
  *	CPU cluster, one byte per lane; 0 if the SoC has none
  * @fast_die_lanes: number of lanes at @fast_die, at most 4
+ * @fast_die_wide: read @fast_die as the low half of its entry's first 64-bit
+ *	word; the SoC's own OS reads that entry only in 64-bit words
  * @running_any: the PMP runs while any bit of the 64-bit status word is set,
  *	not only bit 0
  * @defer_requests: keep power state requests in memory until the PMP runs,
@@ -86,6 +88,7 @@ struct apple_pmp_report_offsets {
 	u32 status;
 	u32 fast_die;
 	u32 fast_die_lanes;
+	bool fast_die_wide;
 	/* Update aperture of every entry (8 bytes each) and SOC-DEV-DVFS range. */
 	u32 update;
 	u32 dvfs_first, dvfs_count;
@@ -339,6 +342,16 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_ane_perf);
 
 static struct dentry *apple_pmp_report_debugfs;
 
+/* The word holding every lane's fast die-temperature effort. */
+static u32 apple_pmp_report_fast_die_word(const struct apple_pmp_report *rep)
+{
+	const struct apple_pmp_report_offsets *offs = rep->offsets;
+
+	if (offs->fast_die_wide)
+		return lower_32_bits(readq(rep->base + offs->fast_die));
+	return readl(rep->base + offs->fast_die);
+}
+
 /**
  * apple_pmp_report_fast_die_effort() - read the fast die-temperature effort
  *	of a CPU cluster
@@ -377,7 +390,7 @@ int apple_pmp_report_fast_die_effort(const struct device_node *np,
 		} else if (!apple_pmp_report_running(rep)) {
 			ret = -EAGAIN;
 		} else {
-			*effort = readl(rep->base + offs->fast_die) >>
+			*effort = apple_pmp_report_fast_die_word(rep) >>
 				  (lane * BITS_PER_BYTE);
 			ret = 0;
 		}
@@ -406,7 +419,7 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	if (!running || !offs->fast_die)
 		return 0;
 
-	effort = readl(rep->base + offs->fast_die);
+	effort = apple_pmp_report_fast_die_word(rep);
 	for (lane = 0; lane < offs->fast_die_lanes; lane++)
 		seq_printf(s, "lane%u: %u\n", lane,
 			   (effort >> (lane * BITS_PER_BYTE)) & 0xff);
@@ -2630,12 +2643,22 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6041 = {
 	.defer_requests = true,
 };
 
+/*
+ * T8132 (M4): the PMP node's ptd-range table names PTD entries 1 (PMP-STATUS),
+ * 392 (SOC-DEV-PS-REQ), 400 (SOC-DEV-PS-ACK) and 465 (FAST-DIE-CE, two
+ * lanes). Its fast-die-ctrl-ce-map puts the EACC loop on lane 0 and the PACC
+ * and ANE loops on lane 1, and the CLPC node lists FAST-DIE-CE among the PTD
+ * ranges it reads. macOS reads every entry as 64-bit words, the fast-die one
+ * included, and decodes a byte per lane from the first word.
+ */
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132 = {
 	.tgt_read = 0x1880,
 	.tgt_write = 0x10c40,
 	.actual = 0x1900,
 	.status = 0x10,
-	/* No qualified fast-die effort on this generation. */
+	.fast_die = 0x1d10,
+	.fast_die_lanes = 2,
+	.fast_die_wide = true,
 };
 
 static const struct of_device_id apple_pmp_report_of_match[] = {
