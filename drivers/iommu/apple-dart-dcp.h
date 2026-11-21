@@ -192,8 +192,12 @@ struct apple_dart_dcp_allocation {
 
 /* SID0 slices for the retained copy surfaces; generic DMA gets the other free ones. */
 #define DCP_DART_SCANOUT_SLOTS	4
-/* An external display DART's SID0 arena: the surfaces and host windows. */
-#define DCP_DART_DISPEXT_SLOTS	10
+/*
+ * An external display DART's SID0 arena: the surfaces (DCP_DART_SCANOUT_SLOTS)
+ * and the host windows, a slice each. Under KWin the frame takes three
+ * windows and the cursor up to three more, besides a console's.
+ */
+#define DCP_DART_DISPEXT_SLOTS	16
 
 static bool apple_dart_has_borrowed(struct apple_dart *dart)
 {
