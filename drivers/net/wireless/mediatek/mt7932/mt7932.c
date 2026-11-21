@@ -1305,8 +1305,10 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = mt_initialize(m);
 	if (!ret)
 		ret = mt_register_regulatory_gate(m);
-	if (!ret)
+	if (!ret) {
 		WRITE_ONCE(m->ready, true);
+		mt_restart_done(m);
+	}
 retain:
 	if (ret) {
 		int error = ret;
@@ -1514,7 +1516,8 @@ static int mt_resume(struct device *dev)
 		dev_dbg(dev, "back after the sleep, firmware kept\n");
 		return 0;
 	}
-	dev_err(dev, "Wi-Fi didn't keep its firmware across the sleep: %d; restarting it\n", ret);
+	dev_err(dev, "Wi-Fi didn't keep its firmware across the sleep: %d; restarting it (restart %d)\n",
+		ret, mt_note_restart());
 	spin_lock_irqsave(&m->response_lock, flags);
 	mt_rf_fail_locked(m, ret);
 	spin_unlock_irqrestore(&m->response_lock, flags);

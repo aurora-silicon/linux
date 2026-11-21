@@ -328,6 +328,10 @@ int mt_request_input(struct mt7932 *m, const struct firmware **fw, const char *n
 void mt_rf_fail_locked(struct mt7932 *m, int error);
 void mt_request_recovery(struct mt7932 *m, const char *why);
 void mt_recover_work(struct work_struct *work);
+int mt_note_restart(void);
+bool mt_restart_done(struct mt7932 *m);
+int mt_restart_count(void);
+void mt_restart_debugfs_init(struct mt7932 *m);
 u32 mt_read(struct mt7932 *m, u32 reg);
 void mt_write(struct mt7932 *m, u32 reg, u32 value);
 void mt_rmw(struct mt7932 *m, u32 reg, u32 mask, u32 value);

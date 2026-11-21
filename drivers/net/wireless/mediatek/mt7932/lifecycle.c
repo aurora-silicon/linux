@@ -1,7 +1,42 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include <linux/debugfs.h>
 #include <linux/soc/apple/pci-apple-piodma.h>
 
 #include "mt7932.h"
+
+/*
+ * A restart removes the binding that asked for it, so the count of restarts and the
+ * note that the next binding comes from one belong to the module: one radio per machine.
+ */
+static atomic_t mt_restarts = ATOMIC_INIT(0);
+static atomic_t mt_restart_pending = ATOMIC_INIT(0);
+
+/* A restart of the radio is being asked for: its number since the module loaded. */
+int mt_note_restart(void)
+{
+	atomic_set(&mt_restart_pending, 1);
+	return atomic_inc_return(&mt_restarts);
+}
+
+/* Probe finished: whether this binding is the one a restart brought up, which it says. */
+bool mt_restart_done(struct mt7932 *m)
+{
+	if (!atomic_xchg(&mt_restart_pending, 0))
+		return false;
+	dev_info(&m->pdev->dev, "Wi-Fi is back after radio restart %d: firmware loaded again\n",
+		 atomic_read(&mt_restarts));
+	return true;
+}
+
+int mt_restart_count(void)
+{
+	return atomic_read(&mt_restarts);
+}
+
+void mt_restart_debugfs_init(struct mt7932 *m)
+{
+	debugfs_create_atomic_t("mt7932_restarts", 0400, m->wiphy->debugfsdir, &mt_restarts);
+}
 
 /*
  * The end of a connection or a scan that the firmware never confirmed leaves the
@@ -14,7 +49,8 @@ void mt_request_recovery(struct mt7932 *m, const char *why)
 {
 	if (!READ_ONCE(m->ready) || READ_ONCE(m->stopping) || test_and_set_bit(0, &m->recovery))
 		return;
-	dev_warn(&m->pdev->dev, "%s, which only a reset settles: restarting the radio\n", why);
+	dev_warn(&m->pdev->dev, "%s, which only a reset settles: restarting the radio (restart %d)\n",
+		 why, mt_note_restart());
 	schedule_work(&m->recover_work);
 }
 

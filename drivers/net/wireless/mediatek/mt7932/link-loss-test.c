@@ -215,6 +215,7 @@ static void mt_recovery_request_test(struct kunit *test)
 {
 	struct mt_link_loss_test *ctx = test->priv;
 	struct mt7932 *m = &ctx->m;
+	int restarts = mt_restart_count();
 
 	/* Probe's own failure path settles a radio that never finished it. */
 	KUNIT_EXPECT_EQ(test, mt_link_loss_test_recover(ctx), 0U);
@@ -222,9 +223,15 @@ static void mt_recovery_request_test(struct kunit *test)
 	m->stopping = true;
 	KUNIT_EXPECT_EQ(test, mt_link_loss_test_recover(ctx), 0U);
 	m->stopping = false;
-	/* One reset per binding, however many latches ask for it. */
+	KUNIT_EXPECT_EQ(test, mt_restart_count(), restarts);
+	KUNIT_EXPECT_FALSE(test, mt_restart_done(m));
+	/* One reset per binding, however many latches ask for it, and counted once. */
 	KUNIT_EXPECT_EQ(test, mt_link_loss_test_recover(ctx), 1U);
 	KUNIT_EXPECT_EQ(test, mt_link_loss_test_recover(ctx), 1U);
+	KUNIT_EXPECT_EQ(test, mt_restart_count(), restarts + 1);
+	/* The binding the restart brings up says it is back, once. */
+	KUNIT_EXPECT_TRUE(test, mt_restart_done(m));
+	KUNIT_EXPECT_FALSE(test, mt_restart_done(m));
 }
 
 static struct kunit_case mt_link_loss_test_cases[] = {
