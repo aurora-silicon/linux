@@ -669,9 +669,15 @@ static void dcp_external_hint_done(struct apple_dcp *dcp, void *out, void *cooki
 /*
  * After every mode set on an external display macOS sends IOMFB
  * parameters 3 and 6 (16.16): 3 at 1.0, and 6 at 1.0 for an SDR colour
- * mode or 2.0 for a PQ one.  Send the same, after the mode set.  Only the
- * H17P external path does so for now: the desktop 26.x external processors
- * have not been checked with an HDR display yet.
+ * mode or 2.0 for a PQ one.  Send the same, after the mode set.
+ *
+ * Every firmware has set_parameter_dcp, but the parameter numbers are the
+ * firmware's own, so the hints follow the firmware ABI rather than the
+ * method's presence: the H17P external firmware (26.6.2) and an unpaired
+ * external firmware 27 processor, the two on which macOS was seen sending
+ * them (iomfb_modeset()).  The desktop 26.6 firmware is built without
+ * them, and older firmware is not sent them: no macOS trace shows what
+ * those builds take under these numbers.
  */
 static void dcp_external_hdr_hints(struct apple_dcp *dcp, bool pq)
 {

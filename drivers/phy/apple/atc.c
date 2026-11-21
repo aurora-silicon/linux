@@ -6220,8 +6220,12 @@ static int atcphy_load_t8140_dp(struct apple_atcphy *atcphy)
 		{ "apple,tunable-dp-common-post", atcphy->res.core,
 		  &atcphy->tunables.dp_common_post },
 	};
-	if (!of_machine_is_compatible("apple,j700"))
-		return -EOPNOTSUPP;
+
+	/*
+	 * Only the PHY's compatible (has_t8140_dp) and the bootloader's DT
+	 * data select this bundle. A node without the lists fails below, the
+	 * caller warns, and dp_tunables stays false.
+	 */
 	for (unsigned int i = 0; i < ARRAY_SIZE(lists); i++) {
 		struct property *property = of_find_property(atcphy->np, lists[i].name, NULL);
 
