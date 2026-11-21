@@ -31,6 +31,7 @@ typedef unsigned u32;
 #define dev_dbg(...) ((void)0)
 #define dev_warn(...) ((void)0)
 #define dev_info(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define dev_name(p) "device"
 #define list_for_each_entry(p,h,m) for((void)(h),(p)=sole_port();(p);(p)=NULL)
 #define lockdep_assert_held(p) ((void)(p))
