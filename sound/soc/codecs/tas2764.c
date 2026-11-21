@@ -345,8 +345,10 @@ static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 	else
 		val = TAS2764_PWR_CTRL_SHUTDOWN;
 
-	if (tas2764_shutdown_dance(tas2764))
-		return tas2764_do_quirky_pwr_ctrl_change(tas2764, val);
+	if (tas2764_shutdown_dance(tas2764)) {
+		ret = tas2764_do_quirky_pwr_ctrl_change(tas2764, val);
+		return ret < 0 ? ret : 0;
+	}
 
 	ret = snd_soc_component_update_bits(component, TAS2764_PWR_CTRL,
 					    TAS2764_PWR_CTRL_MASK, val);
