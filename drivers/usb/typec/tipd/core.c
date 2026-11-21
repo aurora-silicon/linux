@@ -1070,6 +1070,13 @@ static int cd321x_dp_release_first(struct cd321x *cd321x, bool *held)
 	return ret;
 }
 
+/* The boot order's first update has completed, or will not come: see tipd_boot_power_on(). */
+static void tipd_boot_order_done(struct tps6598x *tps)
+{
+	tps->boot_no_debounce = false;
+	tps->boot_usbw_due = false;
+}
+
 static void cd321x_retry_revalidation(struct cd321x *cd321x, bool reconnect)
 {
 	lockdep_assert_held(&cd321x->tps.lock);
@@ -1081,12 +1088,14 @@ static void cd321x_retry_revalidation(struct cd321x *cd321x, bool reconnect)
 	/* Keep a later physical event retryable if the automatic budget expires. */
 	cd321x->state_valid = false;
 	cd321x->wake_apply = false;
-	if (cd321x_pm_retry(&cd321x->pm, reconnect))
+	if (cd321x_pm_retry(&cd321x->pm, reconnect)) {
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
 				 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
-	else
+	} else {
 		dev_err(cd321x->tps.dev, "cable revalidation failed after %u attempts\n",
 			CD321X_RESUME_ATTEMPTS);
+		tipd_boot_order_done(&cd321x->tps);
+	}
 }
 
 static void cd321x_retry_held_mux(struct cd321x *cd321x)
@@ -1113,6 +1122,7 @@ static void cd321x_retry_held_mux(struct cd321x *cd321x)
 
 static void cd321x_update_done(struct cd321x *cd321x)
 {
+	tipd_boot_order_done(&cd321x->tps);
 	if (cd321x_pm_mux_done(&cd321x->pm))
 		dev_info(cd321x->tps.dev, "Type-C mux change went through after retrying\n");
 	cd321x_pm_complete(&cd321x->pm);
@@ -1137,6 +1147,7 @@ static bool cd321x_identity_known(const struct usb_pd_identity *id)
 }
 
 static void cd321x_macos_usbw(struct cd321x *cd321x);
+static void tipd_boot_host_started(struct tps6598x *tps, enum usb_role role);
 
 static void cd321x_update_work(struct work_struct *work)
 {
@@ -1417,6 +1428,7 @@ static void cd321x_update_work(struct work_struct *work)
 	ret = usb_role_switch_set_role(tps->role_sw, new_role);
 	if (ret)
 		goto retry;
+	tipd_boot_host_started(tps, new_role);
 
 	/* A new USB4 route can disturb another port on the shared fabric. */
 	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
@@ -1485,6 +1497,7 @@ retry:
 		cd321x->pm.provider_busy = false;
 		cd321x->state_valid = false;
 		dev_err(tps->dev, "Type-C provider shut down; automatic retries stopped\n");
+		tipd_boot_order_done(tps);
 		return;
 	}
 	/* A held mux must not consume a coalesced partner edge. */
@@ -1653,6 +1666,16 @@ static int cd321x_connect(struct tps6598x *tps, u32 status)
 				 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
 	if (!cd321x_pm_can_update(&cd321x->pm))
 		return 0;
+	/*
+	 * The first update after the probe left the boot power state (queued by the ready
+	 * revalidation: the probe's own connect queues none) runs without the debounce, see
+	 * tipd_boot_power_on().
+	 */
+	if (tps->boot_no_debounce) {
+		tps->boot_no_debounce = false;
+		if (status & TPS_STATUS_PLUG_PRESENT)
+			delay = 0;
+	}
 
 	/*
 	 * Requeue even when the previous update is already running.  A separate
@@ -1805,6 +1828,7 @@ static int cd321x_prepare(struct tps6598x *tps)
 
 	scoped_guard(mutex, &tps->lock) {
 		cd321x_pm_prepare(&cd321x->pm);
+		tipd_boot_order_done(tps);
 		cd321x->state_valid = false;
 		cd321x->wake_apply = false;
 		cd321x->sleep_plug = tps->status & TPS_STATUS_PLUG_PRESENT;
@@ -3830,6 +3854,167 @@ int tipd_replug_request(struct tps6598x *tps, u8 seconds)
 	return tipd_replug_queue(tps, seconds);
 }
 
+/*
+ * SN201202x: a port controller found outside S0 at the probe (in its boot power state) leaves it as
+ * macOS has it do, at the port's host start. The macOS-HV trace of XNU's boot (11-20, a J714s with
+ * the Dell S2725QC on its Left Front port) has XNU find each of the machine's SN201202x in its boot
+ * power state (SYS_PWR_STATE 0x07) and read its
+ * status there, send it HChk (64 bytes of 0xfe) and then SSPS 0x00, have the port's xHCI running
+ * 86 ms after that SSPS and its SuperSpeed port powered at 113 ms, and send USBw 0x00 right after
+ * the xHCI runs. Only at 143 ms does the controller enter the partner's alternate mode (DP, pin
+ * assignment D). The Dell's USB3 hub resets its links when the mode comes up and again at HPD,
+ * and each time comes back about 1.2 s later onto a host that is already there, SuperSpeed first.
+ *
+ * Linux used to send SSPS 0x00 at the very start of the probe, 2.5 to 3 s before the port's host
+ * (the LDCM command, the rest of the probe, the attach debounce, the PHY's start). The hub then
+ * came back to no host: its SuperSpeed side gave up and came up only after the USB2 hub's
+ * enumeration resets (96 of 108 boots), or not at all (5 of 108: lost until a replug).
+ *
+ * So the probe keeps the boot power state until its end, the decision taken from the state the
+ * controller reports, whatever the machine. There, as XNU: HChk, then SSPS 0x00, before anything
+ * that needs S0 (an inherited connection's renegotiation). The
+ * PHY takes the pin assignment when it starts, so the mode the controller enters is waited for
+ * (at most 1.5 s, 143 ms in the trace), and the first update runs without the attach debounce;
+ * once it has set the host role, USBw 0x00.
+ */
+#define TIPD_BOOT_MODE_WAIT_MS		1500
+#define TIPD_BOOT_MODE_POLL_MS		20
+#define TIPD_BOOT_CMD1_WAIT_MS		5000
+#define TIPD_BOOT_HCHK_FILL		0xfe
+
+/* Whether the probe keeps the controller's boot power state until its end. */
+static bool tipd_boot_power_kept(struct tps6598x *tps)
+{
+	u8 state;
+
+	tps->boot_s0_deferred = false;
+	if (!device_is_compatible(tps->dev, "apple,sn201202x") ||
+	    tps6598x_read8(tps, TPS_REG_SYSTEM_POWER_STATE, &state) ||
+	    state == TPS_SYSTEM_POWER_STATE_S0)
+		return false;
+	dev_dbg(tps->dev, "boot power state %#x kept until the end of the probe\n", state);
+	tps->boot_s0_deferred = true;
+	return true;
+}
+
+/* A command still running from the probe (LDCM can take seconds) ends before HChk and SSPS. */
+static int tipd_boot_cmd1_idle(struct tps6598x *tps)
+{
+	ktime_t start = ktime_get();
+	u32 val;
+	int ret;
+
+	do {
+		ret = tps6598x_read32(tps, TPS_REG_CMD1, &val);
+		if (ret)
+			return ret;
+		if (!val || INVALID_CMD(val))
+			return 0;
+		usleep_range(CD321X_SSPS_READ_GAP_US, CD321X_SSPS_READ_GAP_US + 1000);
+	} while (ktime_ms_delta(ktime_get(), start) < TIPD_BOOT_CMD1_WAIT_MS);
+	return -ETIMEDOUT;
+}
+
+/* The probe's last step before the partner is registered, if it kept the boot power state. */
+static int tipd_boot_power_on(struct tps6598x *tps, u32 *status)
+{
+	u8 hchk[TPS_MAX_LEN], reply[TPS_MAX_LEN] = {};
+	ktime_t start;
+	u32 data = 0;
+	bool debug_port;
+	u64 mask;
+	int ret;
+
+	if (!tps->boot_s0_deferred)
+		return 0;
+	tps->boot_s0_deferred = false;
+	/*
+	 * A debug port (the boot loader's debug link: in DBMa, or described with its lock key)
+	 * gets only the SSPS, as before: no HChk, and no USBw, which moves the USB2 pair that
+	 * the debug link's route may use.
+	 */
+	debug_port = tps->dbma_at_probe ||
+		     device_property_present(tps->dev, "apple,debug-lock-key");
+	ret = tipd_boot_cmd1_idle(tps);
+	if (ret)
+		dev_dbg(tps->dev, "command still running before HChk: %d\n", ret);
+	if (!debug_port) {
+		memset(hchk, TIPD_BOOT_HCHK_FILL, sizeof(hchk));
+		ret = tps6598x_exec_cmd_gap(tps, "HChk", sizeof(hchk), hchk, sizeof(reply), reply,
+					    1000, 0, CD321X_SSPS_READ_GAP_US);
+		dev_dbg(tps->dev, "HChk: %d, %16ph\n", ret, reply);
+		if (ret)
+			tipd_boot_cmd1_idle(tps);
+	}
+
+	/* -EBUSY: a command the probe left running past both waits, see sn201202x_init() */
+	ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+	if (ret)
+		return ret;
+	start = ktime_get();
+	/* XNU writes the mask in the boot power state too; it is read back once in S0. */
+	if (tps6598x_read64(tps, TPS_REG_INT_MASK1, &mask) || mask != cd321x_irq_mask(tps)) {
+		ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, cd321x_irq_mask(tps));
+		if (ret)
+			return ret;
+	}
+	if (!tps6598x_read_status(tps, status))
+		return -EIO;
+	tps->status = *status;
+	/*
+	 * A port without USB data (MagSafe) has no mode to wait for, and a port whose inherited
+	 * connection is renegotiated next (cd321x_reset_inherited_connection()) attaches again
+	 * through the debounce, as before.
+	 */
+	if (!(*status & TPS_STATUS_PLUG_PRESENT) || !tps->role_sw ||
+	    device_property_read_bool(tps->dev, "apple,reset-inherited-usb2-connection"))
+		goto contaminant;
+
+	do {
+		if (!tps6598x_read32(tps, TPS_REG_DATA_STATUS, &data) &&
+		    data & (TPS_DATA_STATUS_DP_CONNECTION | TPS_DATA_STATUS_TBT_CONNECTION |
+			    CD321X_DATA_STATUS_USB4_CONNECTION))
+			break;
+		msleep(TIPD_BOOT_MODE_POLL_MS);
+	} while (ktime_ms_delta(ktime_get(), start) < TIPD_BOOT_MODE_WAIT_MS);
+	dev_dbg(tps->dev, "S0 at the end of the probe, data status %#x after %lld ms\n", data,
+		ktime_ms_delta(ktime_get(), start));
+
+	if (!tps6598x_read_status(tps, status))
+		return -EIO;
+	tps->status = *status;
+	tps->boot_no_debounce = true;
+	tps->boot_usbw_due = !debug_port;
+contaminant:
+	/* A connector state read in the boot power state is read again in S0. */
+	if (tps->contaminant_ops && tps->contaminant != TYPEC_CONTAMINANT_NONE)
+		tps->contaminant_ops->update(tps);
+	return 0;
+}
+
+/*
+ * From the port lock's holder, the update that set @role: after the first host role following the
+ * boot power state, USBw 0x00 (tipd_usbw_locked(), with the sleep's SSPS read gaps).
+ */
+static void tipd_boot_host_started(struct tps6598x *tps, enum usb_role role)
+{
+	u8 mode = 0x00;	/* USBw off, as XNU sends it */
+	int ret;
+
+	lockdep_assert_held(&tps->lock);
+	if (!tps->boot_usbw_due)
+		return;
+	tps->boot_usbw_due = false;
+	if (role != USB_ROLE_HOST)
+		return;
+	ret = tipd_usbw_locked(tps, mode);
+	/* -EINVAL is a firmware without the command ("!CMD"): nothing to do there. */
+	if (ret == -EINVAL)
+		dev_dbg(tps->dev, "USBw %#x not known to the firmware\n", mode);
+	else if (ret)
+		dev_warn(tps->dev, "USBw %#x after the boot's host start failed: %d\n", mode, ret);
+}
+
 int tipd_init(struct tps6598x *tps)
 {
 	struct fwnode_handle *fwnode;
@@ -3860,7 +4045,8 @@ int tipd_init(struct tps6598x *tps)
 		}
 	}
 
-	if (tps->data->switch_power_state) {
+	/* An SN201202x in its boot power state leaves it at the end: tipd_boot_power_on(). */
+	if (tps->data->switch_power_state && !tipd_boot_power_kept(tps)) {
 		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
 		if (ret)
 			return ret;
@@ -3880,9 +4066,10 @@ int tipd_init(struct tps6598x *tps)
 
 	/*
 	 * A controller found in "DBMa" is used as it is. Nothing below issues a
-	 * mode-changing 4CC command (the S0 power state switch above only does
-	 * if the controller is not in S0 already), so probing neither leaves the
-	 * debug mode nor disturbs a Debug USB or serial route set up before
+	 * mode-changing 4CC command (the S0 power state switch, above or at the end
+	 * of the probe for an SN201202x in its boot power state, only does if the
+	 * controller is not in S0 already, and HChk is skipped), so probing neither
+	 * leaves the debug mode nor disturbs a Debug USB or serial route set up before
 	 * Linux. The LDCM safety command below does not change controller mode.
 	 * Remember it, so that the debugfs interface never tears that mode down.
 	 */
@@ -3946,6 +4133,11 @@ int tipd_init(struct tps6598x *tps)
 			ret = 0;
 		}
 	}
+
+	/* Before the inherited connection's renegotiation, which runs in S0. */
+	ret = tipd_boot_power_on(tps, &status);
+	if (ret)
+		goto err_disconnect;
 
 	ret = cd321x_reset_inherited_connection(tps, &status);
 	if (ret)
