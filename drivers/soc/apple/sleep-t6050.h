@@ -2215,14 +2215,7 @@ static void t6050_late_lower(struct apple_sleep *s, unsigned int i)
  * through the suspend. Here it goes down as on macOS: the children first, AUSS last, each only
  * if on, and polled off. After a sleep the snapshot's replay raises them again, parent first;
  * after a refusal t6050_auss_restore() does.
- *
- * t6050_auss_off=0 leaves them as they are, which was the behaviour before.
  */
-static bool t6050_auss_off = true;
-module_param(t6050_auss_off, bool, 0644);
-MODULE_PARM_DESC(t6050_auss_off,
-		 "T6050: lower AUSS and the routers' CIO_AUSS words at the sleep's entry, as macOS has them (0: leave them)");
-
 static const u32 t6050_auss_words[] = {
 	SLEEP_REGION_WORD(T6050_PS0, 0x348),	/* ATC0_CIO_AUSS */
 	SLEEP_REGION_WORD(T6050_PS0, 0x360),	/* ATC1_CIO_AUSS */
@@ -2244,7 +2237,7 @@ static void t6050_auss_lower(struct apple_sleep *s)
 		u32 word = t6050_auss_words[i];
 
 		r->auss_saved[i] = readl(sleep_region_reg(s, word));
-		if (!t6050_auss_off || !t6050_late_word_on(s, word))
+		if (!t6050_late_word_on(s, word))
 			continue;
 		sleep_ps_lower(s, word);
 		r->auss_lowered |= BIT(i);
@@ -2343,10 +2336,9 @@ static int t6050_sleep_entry_lower(struct apple_sleep *s)
 		 r->late_lowered, r->late_timeouts, r->state4_set);
 	/* AUSS as the sleep's last steps find it: the engine wants it off. */
 	i = ARRAY_SIZE(t6050_auss_words) - 1;
-	dev_info(s->dev, "entry: AUSS %#x -> %#x, lowered %#x (%u timed out)%s\n",
+	dev_info(s->dev, "entry: AUSS %#x -> %#x, lowered %#x (%u timed out)\n",
 		 r->auss_saved[i], readl(sleep_region_reg(s, t6050_auss_words[i])),
-		 r->auss_lowered, r->auss_timeouts,
-		 t6050_auss_off ? "" : ", t6050_auss_off=0");
+		 r->auss_lowered, r->auss_timeouts);
 	return 0;
 }
 
