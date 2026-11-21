@@ -9,9 +9,9 @@
 //! Render/compute attachments are retained with the immutable command; the whole
 //! VM job guard protects indirect and bindless accesses through retirement.
 //! Exact historical prefixes become immutable per-command dependencies. Ray-query state
-//! (RENDER_RAY_QUERY) is the M4 Pro's G17P command set ([`super::rt`]): compute scratch
-//! layouts and intersection tables, and render ray-query stages; every compute flag and
-//! reserved word stays MBZ.
+//! (RENDER_RAY_QUERY) and the AS-build flag (BOUNDED_AS_BUILD) are the M4 Pro's G17P command
+//! set ([`super::rt`]): compute scratch layouts and intersection tables, render ray-query
+//! stages, and compute flag bit 2; every other compute flag and reserved word stays MBZ.
 
 use core::mem::{offset_of, size_of};
 use core::ops::Range;
@@ -149,6 +149,8 @@ pub(crate) struct ComputeCommand {
     pub(crate) cmd: uapi::drm_asahi_cmd_compute,
     /// The validated scratch layout and intersection tables.
     pub(crate) ray: super::rt::ComputeRay,
+    /// DRM_ASAHI_COMPUTE_AS_BUILD.
+    pub(crate) as_build: bool,
     /// The compute attachments in effect (validated writable).
     pub(crate) attachments: KVec<uapi::drm_asahi_attachment>,
     /// Retained timestamp destinations, published after full command retirement.
@@ -162,15 +164,15 @@ pub(crate) enum Command {
 }
 
 impl Command {
-    /// The command traces rays and gets the long execution allowance, as do the other
-    /// commands of its submission (`Job::long`).
+    /// The command traces rays or builds acceleration structures and gets the long execution
+    /// allowance, as do the other commands of its submission (`Job::long`).
     pub(crate) fn long(&self) -> bool {
         match self {
             Command::Render(r) => {
                 super::rt::select(false, r.ray_query.map(|stage| stage.traces()), false)
             }
             Command::Compute(c) => {
-                super::rt::select(c.ray.intersection.enabled(), [false; 2], false)
+                super::rt::select(c.ray.intersection.enabled(), [false; 2], c.as_build)
             }
         }
     }
@@ -412,7 +414,8 @@ pub(crate) fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
             CMD_COMPUTE => {
                 let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
                 let cmd = &packet;
-                if cmd.flags != 0
+                // DRM_ASAHI_COMPUTE_AS_BUILD only (BOUNDED_AS_BUILD).
+                if super::rt::as_build(cmd.flags).is_none()
                     || cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base
                     || !inside(
                         cmd.cdm_ctrl_stream_base,
@@ -716,7 +719,7 @@ fn check_compute(
 ) -> Result {
     let vm = context.vm;
     let (base, end) = (cmd.cdm_ctrl_stream_base, cmd.cdm_ctrl_stream_end);
-    if cmd.flags != 0
+    if super::rt::as_build(cmd.flags).is_none()
         || cmd.sampler_count != 0
         || cmd.sampler_heap != 0
         || !helper_is_empty(&cmd.helper)
@@ -843,12 +846,14 @@ impl Prepared<'_> {
                     check_compute(context, cmd, &compute)?;
                     let ray = compute_ray(cmd)?;
                     check_compute_ray(context, &ray)?;
+                    let as_build = super::rt::as_build(cmd.flags).ok_or(EINVAL)?;
                     let outputs = resolved.next().ok_or(EINVAL)?;
                     commands.push(
                         Command::Compute(KBox::new(
                             ComputeCommand {
                                 cmd: *cmd,
                                 ray,
+                                as_build,
                                 attachments: copy_list(&[&compute])?,
                                 timestamp_outputs: outputs,
                             },

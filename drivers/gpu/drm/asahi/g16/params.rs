@@ -3,11 +3,11 @@
 //! Module parameters and the GET_PARAMS identity.
 //!
 //! With the shared `file.rs` additions (VM_STATUS and VM_STATUS_MIRROR from `supports_vm_status`,
-//! SOFT_FAULTS suppressed by `soft_faults`), the feature word is 0x9c02: per-command input
+//! SOFT_FAULTS suppressed by `soft_faults`), the feature word is 0x19c02: per-command input
 //! readiness/errors and exact queue-local historical prefixes use explicit retained inputs
-//! and successful command receipt frontiers; RENDER_RAY_QUERY (bit 15) is the M4 Pro's
-//! ray-query command set ([`super::rt`]). No independent hardware queue reservation or
-//! fragment barriers are advertised.
+//! and successful command receipt frontiers; RENDER_RAY_QUERY (bit 15) and BOUNDED_AS_BUILD
+//! (bit 16) are the M4 Pro's ray-tracing command set ([`super::rt`]). No independent hardware
+//! queue reservation or fragment barriers are advertised.
 
 use kernel::{prelude::*, uapi};
 
@@ -147,7 +147,8 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
     }
     params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
-        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RAY_QUERY);
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RAY_QUERY)
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD);
     params.gpu_generation = GPU_GENERATION;
     params.gpu_variant = gpu.cfg.gpu_variant as u32;
     params.gpu_revision = gpu.cfg.gpu_revision;
