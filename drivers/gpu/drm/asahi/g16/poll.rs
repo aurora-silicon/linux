@@ -56,6 +56,7 @@ impl HrTimerCallback for Shared {
     /// Runs the poll now.
     fn run(this: ArcBorrow<'_, Self>, _ctx: HrTimerCallbackContext<'_, Self>) -> HrTimerRestart {
         let this: Arc<Self> = this.into();
+        this.resnapped.store(true, Ordering::Release);
         this.poll_now();
         HrTimerRestart::NoRestart
     }
@@ -105,7 +106,19 @@ impl Shared {
                     firmware.engine.shared = Some(self.clone());
                 }
                 let evented = self.evented.swap(false, Ordering::AcqRel);
-                match firmware.poll(evented, &mut done) {
+                let resnapped = self.resnapped.swap(false, Ordering::AcqRel);
+                let trigger = R3::trigger(evented, resnapped);
+                let s = &mut firmware.engine.stats;
+                let (jobs, prefixes) = (s.jobs, s.prefixes.iter().sum::<u64>());
+                s.r3.trigger = trigger;
+                s.r3.kicks = self.kicks.load(Ordering::Relaxed);
+                s.r3.kick_ns = self.kick_ns.load(Ordering::Relaxed);
+                s.r3.passes[trigger] += 1;
+                let polled = firmware.poll(evented, &mut done);
+                let s = &mut firmware.engine.stats;
+                s.r3.fences[trigger] += s.jobs - jobs;
+                s.r3.retired[trigger] += s.prefixes.iter().sum::<u64>() - prefixes;
+                match polled {
                     Ok(true) => self.rearm(firmware.engine.chan_wait),
                     // Idle: one more pass after a window gives the state back. A failed
                     // engine's poll no longer services power, so it has nothing to give back.
@@ -252,6 +265,135 @@ pub(crate) fn ring_passed(c: u32, b: u32, h: u32, t: u32, m: u32) -> bool {
     dh <= dc && dc <= dt
 }
 
+/// R3 diagnostic kit (not for merge): the receipt terms of one queue (compute, TA, FS), in
+/// the order `stats` prints them.
+const R3_TERMS: [&str; 15] = [
+    "fw_stamp",
+    "read",
+    "write",
+    "qinfo20",
+    "qinfo24",
+    "qinfo28",
+    "busy",
+    "pipe_read",
+    "pipe_completion",
+    "pipe_write",
+    "notifier_stamp",
+    "notifier_context",
+    "counter",
+    "ticks",
+    "pools",
+];
+const R3_QUEUES: [&str; 3] = ["compute", "ta", "fs"];
+const R3_TRIGGERS: [&str; 3] = ["kick", "hrtimer", "backup"];
+/// Upper bounds (us) of the kick-to-full-receipt histogram; the last bucket is open.
+const R3_HIST_US: [u64; 5] = [5, 25, 100, 250, 1000];
+
+type R3Terms = [[bool; R3_TERMS.len()]; R3_QUEUES.len()];
+
+/// R3 diagnostic kit (not for merge). Which receipt term keeps the oldest flight pending
+/// when an EP 0x20 kick starts the pass, before anything retires in it; and what starts the
+/// passes that signal fences.
+#[derive(Default)]
+pub(crate) struct R3 {
+    /// The current pass's trigger; the kick count and last kick time when it started.
+    pub(crate) trigger: usize,
+    pub(crate) kicks: u64,
+    pub(crate) kick_ns: u64,
+    /// Passes, fences signalled and flights retired, by trigger.
+    pub(crate) passes: [u64; 3],
+    pub(crate) fences: [u64; 3],
+    pub(crate) retired: [u64; 3],
+    /// Kicks whose oldest flight was pending before anything retired; of those, still
+    /// pending after the trailing polls; pending although every term read as met.
+    pub(crate) kick_pending: u64,
+    pub(crate) tail_pending: u64,
+    pub(crate) kick_unexplained: u64,
+    /// Failing terms of those flights, and those that failed alone.
+    pub(crate) terms: [[u64; R3_TERMS.len()]; R3_QUEUES.len()],
+    pub(crate) sole: [[u64; R3_TERMS.len()]; R3_QUEUES.len()],
+    /// The flight (publication time) last found pending at a kick, and that kick's time.
+    watch: u64,
+    watch_kick_ns: u64,
+    /// Kick to full receipt of those flights: count, sum, max, histogram, by the trigger of
+    /// the pass that retired them.
+    pub(crate) late: u64,
+    pub(crate) late_ns: u64,
+    pub(crate) late_max_ns: u64,
+    pub(crate) late_hist: [u64; R3_HIST_US.len() + 1],
+    pub(crate) late_by: [u64; 3],
+    /// Full receipts in kick-started passes: count, sum and max of the time since the kick.
+    pub(crate) kick_full: u64,
+    pub(crate) kick_full_ns: u64,
+    pub(crate) kick_full_max_ns: u64,
+}
+
+impl R3 {
+    /// 0: an EP 0x20 kick, 1: the repoll hrtimer, 2: the delayed-work backup or another
+    /// caller of the poll work.
+    fn trigger(evented: bool, resnapped: bool) -> usize {
+        if evented {
+            0
+        } else if resnapped {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn write(&self, f: &mut fmt::Formatter<'_>, compute: u32, stage: u32) -> fmt::Result {
+        for (name, counts) in [
+            ("passes", &self.passes),
+            ("fences", &self.fences),
+            ("retired", &self.retired),
+        ] {
+            write!(f, "r3_{}:", name)?;
+            for (trigger, n) in R3_TRIGGERS.iter().zip(counts.iter()) {
+                write!(f, " {} {}", trigger, n)?;
+            }
+            writeln!(f)?;
+        }
+        writeln!(
+            f,
+            "r3_kick: kicks {} compute_events {} stage_events {} pending {} tail_pending {} unexplained {}",
+            self.kicks,
+            compute,
+            stage,
+            self.kick_pending,
+            self.tail_pending,
+            self.kick_unexplained
+        )?;
+        for (name, table) in [("terms", &self.terms), ("sole", &self.sole)] {
+            for (queue, row) in R3_QUEUES.iter().zip(table.iter()) {
+                write!(f, "r3_{}_{}:", queue, name)?;
+                for (term, n) in R3_TERMS.iter().zip(row.iter()) {
+                    write!(f, " {} {}", term, n)?;
+                }
+                writeln!(f)?;
+            }
+        }
+        write!(
+            f,
+            "r3_late: count {} sum_ns {} max_ns {} by_kick {} by_hrtimer {} by_backup {} hist_us",
+            self.late,
+            self.late_ns,
+            self.late_max_ns,
+            self.late_by[0],
+            self.late_by[1],
+            self.late_by[2]
+        )?;
+        for (bound, n) in R3_HIST_US.iter().zip(self.late_hist.iter()) {
+            write!(f, " <{} {}", bound, n)?;
+        }
+        writeln!(f, " more {}", self.late_hist[R3_HIST_US.len()])?;
+        writeln!(
+            f,
+            "r3_kick_full: count {} sum_ns {} max_ns {}",
+            self.kick_full, self.kick_full_ns, self.kick_full_max_ns
+        )
+    }
+}
+
 impl Firmware {
     /// One poll pass under the device lock. Returns whether to re-arm the poll timers.
     pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<bool> {
@@ -306,6 +448,9 @@ impl Firmware {
         // After an event, a few short trailing polls catch the final receipts.
         let mut tail = if evented { 4 } else { 0 };
         let mut ret;
+        // R3: the flight found pending at the kick, before anything retired in this pass.
+        let mut at_kick = evented;
+        let mut kick_pending = None;
 
         loop {
             let mut lap = Lap::start();
@@ -314,6 +459,9 @@ impl Firmware {
             // Recovery may force stage progress: authenticate it before any receipt.
             self.check_hangs(done)?;
             ret = self.retired();
+            if core::mem::take(&mut at_kick) && matches!(ret, Ok(Retirement::Pending)) {
+                kick_pending = self.r3_kick();
+            }
             while let Ok(receipt) = ret {
                 if !receipt.complete() {
                     break;
@@ -328,8 +476,147 @@ impl Firmware {
             tail -= 1;
             delay::udelay(Delta::from_micros(5));
         }
+        if kick_pending.is_some() && kick_pending == self.engine.oldest().map(|f| f.published_ns) {
+            self.engine.stats.r3.tail_pending += 1;
+        }
         self.recovery.receipt_fault = ret.is_err();
         Ok(())
+    }
+
+    /// R3: counts the failing receipt terms of the oldest flight, pending at a kick, and
+    /// starts its kick-to-full-receipt timer. Returns its publication time.
+    fn r3_kick(&mut self) -> Option<u64> {
+        let f = self.engine.oldest()?;
+        let id = f.published_ns;
+        let terms = self.r3_terms(f).ok()?;
+        let r = &mut self.engine.stats.r3;
+        r.kick_pending += 1;
+        let failing = terms.iter().flatten().filter(|&&failed| failed).count();
+        if failing == 0 {
+            r.kick_unexplained += 1;
+        }
+        for (queue, row) in terms.iter().enumerate() {
+            for (term, &failed) in row.iter().enumerate() {
+                if failed {
+                    r.terms[queue][term] += 1;
+                    if failing == 1 {
+                        r.sole[queue][term] += 1;
+                    }
+                }
+            }
+        }
+        if r.watch != id {
+            r.watch = id;
+            r.watch_kick_ns = r.kick_ns;
+        }
+        Some(id)
+    }
+
+    /// R3: every term of `f`'s receipt ([`Self::retired_snapshot`]), each read separately,
+    /// true where it is not met.
+    fn r3_terms(&self, f: &Flight) -> Result<R3Terms> {
+        let mut t: R3Terms = Default::default();
+        let e = &self.engine;
+        let busy = self.init.abi.qinfo().busy;
+        if f.computes != 0 {
+            let g = &self.graph.compute;
+            let c = &mut t[0];
+            let pipe = self.channels.channel(Channel::Compute);
+            if e.flights.len() > 1 {
+                // The passed receipt of a flight with others queued behind it.
+                let cap = super::hw::sizes::QUEUE_CAP;
+                let passed = |cursor| ring_passed(cursor, f.c_start, f.head, e.head, cap);
+                c[0] = !stamp_reached(g.fw_stamp.r32(0)?, f.target, e.target);
+                c[1] = !passed(g.qstate.r32(qstate::READ)?);
+                if !super::hw::tuning::FW_CACHED {
+                    for (k, offset) in [0x20, 0x24, 0x28].into_iter().enumerate() {
+                        c[3 + k] = !passed(g.qinfo.r32(offset)?);
+                    }
+                }
+                let slots = super::fw::channels::RING_SLOTS;
+                let record = f.rec[2];
+                let first = (record + slots - 1) % slots;
+                let producer = self.channels.producer(Channel::Compute);
+                c[7] = !ring_passed(pipe.read()?, first, record, producer, slots);
+                c[8] = !ring_passed(pipe.completion()?, first, record, producer, slots);
+                let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
+                c[10] = !stamp_reached(stamp, f.target, e.target);
+                c[11] = stamp == f.target
+                    && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? != f.job.vm.slot;
+            } else {
+                c[0] = g.fw_stamp.r32(0)? != f.target;
+                c[1] = g.qstate.r32(qstate::READ)? != f.head;
+                c[2] = g.qstate.r32(qstate::WRITE)? != f.head;
+                if !super::hw::tuning::FW_CACHED {
+                    for (k, offset) in [0x20, 0x24, 0x28].into_iter().enumerate() {
+                        c[3 + k] = g.qinfo.r32(offset)? != f.head;
+                    }
+                    c[6] = g.qinfo.r32(busy)? != 0;
+                }
+                c[7] = pipe.read()? != f.rec[2];
+                c[8] = pipe.completion()? != f.rec[2];
+                c[9] = pipe.write()? != f.rec[2];
+                c[10] = g.notifier.r32(notifier_page::COMPUTE_STAMP)? != f.target;
+                c[11] = g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? != f.job.vm.slot;
+            }
+            let unit = f.job.resources.compute_unit(f.claims.slot[0] as usize)?;
+            let submitted = unit.counter.r64(0)?;
+            c[12] = submitted == 0
+                || unit.work.r64(compute::DESCRIPTOR_COMPLETED)? != submitted
+                || unit.work.r64(compute::DESCRIPTOR_COUNTER)? != unit.counter.va;
+            let (start, end) = self.compute_ticks(unit)?;
+            c[13] = start == 0 || end <= start;
+        }
+        if f.renders != 0 {
+            let g = &self.graph.render;
+            let stages = [
+                (
+                    Channel::Ta,
+                    f.ta_target,
+                    f.ta_head,
+                    f.rec[0],
+                    notifier_page::TA_STAMP,
+                    notifier::CONTEXT,
+                ),
+                (
+                    Channel::Fs,
+                    f.fs_target,
+                    f.fs_head,
+                    f.rec[1],
+                    notifier_page::FS_STAMP,
+                    notifier_page::FS_RECORD + notifier::CONTEXT,
+                ),
+            ];
+            for (q, (channel, target, head, record, stamp, context)) in
+                stages.into_iter().enumerate()
+            {
+                let r = &mut t[1 + q];
+                let pipe = self.channels.channel(channel);
+                r[0] = g.fw_stamp[q].r32(0)? != target;
+                r[1] = g.qstate[q].r32(qstate::READ)? != head;
+                r[2] = g.qstate[q].r32(qstate::WRITE)? != head;
+                if !super::hw::tuning::FW_CACHED {
+                    for (k, offset) in [0x20, 0x24, 0x28].into_iter().enumerate() {
+                        r[3 + k] = g.qinfo[q].r32(offset)? != head;
+                    }
+                    r[6] = g.qinfo[q].r32(busy)? != 0;
+                }
+                r[7] = pipe.read()? != record;
+                r[8] = pipe.completion()? != record;
+                r[9] = pipe.write()? != record;
+                r[10] = g.notifier.r32(stamp)? != target;
+                r[11] = g.notifier.r32(context)? != f.job.vm.slot;
+            }
+            let k = f.claims.pass[0] as usize;
+            let arena = f.job.resources.render()?;
+            let unit = arena.passes.get(k).ok_or(EINVAL)?;
+            for (q, base) in [(1, 0x600), (2, 0x620)] {
+                let (start, end) = (unit.scene.r64(base)?, unit.scene.r64(base + 8)?);
+                t[q][13] = start == 0 || end <= start;
+            }
+            t[2][14] = !arena.pools.retired(k)?;
+        }
+        Ok(t)
     }
 
     #[allow(dead_code)]
@@ -644,6 +931,9 @@ impl Firmware {
             self.stat_retire(&f);
         }
         if receipt.owner_retired() {
+            self.r3_full(&f);
+        }
+        if receipt.owner_retired() {
             if let Err(error) = self.slots.retire(&mut f.claims) {
                 self.slots.quarantine(&mut f.claims);
                 self.retain(&f.job);
@@ -791,6 +1081,30 @@ impl Firmware {
                 }
             }
             complete(done, j2, Ok(()));
+        }
+    }
+
+    /// R3: a full receipt: the time since the kick that found it pending, and since the kick
+    /// that started this pass.
+    fn r3_full(&mut self, f: &Flight) {
+        let now = now_ns();
+        let r = &mut self.engine.stats.r3;
+        if r.watch == f.published_ns && r.watch != 0 {
+            let ns = now.saturating_sub(r.watch_kick_ns);
+            r.late += 1;
+            r.late_ns = r.late_ns.saturating_add(ns);
+            r.late_max_ns = r.late_max_ns.max(ns);
+            let us = ns / 1000;
+            let bucket = R3_HIST_US.iter().position(|&bound| us < bound);
+            r.late_hist[bucket.unwrap_or(R3_HIST_US.len())] += 1;
+            r.late_by[r.trigger] += 1;
+            r.watch = 0;
+        }
+        if r.trigger == 0 {
+            let ns = now.saturating_sub(r.kick_ns);
+            r.kick_full += 1;
+            r.kick_full_ns = r.kick_full_ns.saturating_add(ns);
+            r.kick_full_max_ns = r.kick_full_max_ns.max(ns);
         }
     }
 
@@ -1205,6 +1519,8 @@ impl Firmware {
             us(p.poll_ns),
             slots.flushes,
             us(slots.flush_ns)
-        )
+        )?;
+        let (r3, events) = (&self.engine.stats.r3, &self.events);
+        r3.write(f, events.compute_events, events.stage_events)
     }
 }

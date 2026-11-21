@@ -204,6 +204,11 @@ pub(crate) struct Shared {
     pub(crate) crashed: AtomicBool,
     /// Set by the firmware's EP 0x20 event message; consumed by the poll work.
     pub(crate) evented: AtomicBool,
+    /// R3 diagnostic kit (not for merge): the EP 0x20 kicks, the time of the last one, and
+    /// whether the repoll hrtimer fired, so that a pass knows what started it.
+    pub(crate) kicks: AtomicU64,
+    pub(crate) kick_ns: AtomicU64,
+    pub(crate) resnapped: AtomicBool,
     // --- RTKit callback state and a retained failed session. ---
     /// The first latched error, as a negative errno.
     pub(crate) error: AtomicI32,
@@ -255,6 +260,8 @@ impl WorkItem<POLL_WORK> for Shared {
 impl Shared {
     /// Queues the poll work immediately. Callable from any context.
     pub(crate) fn kick(self: &Arc<Self>) {
+        self.kicks.fetch_add(1, Ordering::Relaxed);
+        self.kick_ns.store(engine::now_ns(), Ordering::Relaxed);
         self.evented.store(true, Ordering::Release);
         // `mod_delayed_work(.., 0)` so that a kick also runs a poll whose 1-jiffy backup is
         // pending (a plain enqueue is refused then).
@@ -395,6 +402,9 @@ impl Gpu {
                 wedged_notified: AtomicBool::new(false),
                 crashed: AtomicBool::new(false),
                 evented: AtomicBool::new(false),
+                kicks: AtomicU64::new(0),
+                kick_ns: AtomicU64::new(0),
+                resnapped: AtomicBool::new(false),
                 error: AtomicI32::new(0),
                 started: AtomicBool::new(false),
                 data,

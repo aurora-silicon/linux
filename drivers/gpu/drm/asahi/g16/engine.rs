@@ -309,6 +309,8 @@ pub(crate) struct Stats {
     pub(crate) behind: u64,
     /// Most flights in flight at once.
     pub(crate) max_flights: u64,
+    /// R3 diagnostic kit (not for merge).
+    pub(crate) r3: super::poll::R3,
 }
 
 /// Host-side phase timers of publication and polling, on with `debug_flags` bit 49
