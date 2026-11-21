@@ -179,6 +179,8 @@ pub(crate) struct Window {
     data_pa: u64,
     /// The firmware page-table leaves the boot loader builds for this firmware.
     leaves: &'static [hw::Leaves],
+    /// The PPL handoff magic of this firmware's layout.
+    ppl_magic: u64,
 }
 
 impl Window {
@@ -195,7 +197,9 @@ impl Window {
             firmware_root: [0; 2],
             text_pa: adt.text.start,
             data_pa: adt.data.start,
+            // Admission refuses a layout with either unknown; never guess them here.
             leaves: adt.layout.leaves.ok_or(ENOTSUPP)?,
+            ppl_magic: adt.layout.ppl_magic.ok_or(ENOTSUPP)?,
         };
         window.admit_cold()?;
         Ok(window)
@@ -225,7 +229,7 @@ impl Window {
         let h = self.handoff.io();
         for offset in [0, 8] {
             let magic = h.try_read64(offset)?;
-            if magic != 0 && magic != hw::PPL_MAGIC {
+            if magic != 0 && magic != self.ppl_magic {
                 return Err(EBUSY);
             }
         }
@@ -356,11 +360,11 @@ impl Window {
         let shadow_l2 = Self::shadow_l2(uat)?;
         let handoff = uat.lock_m4_handoff()?;
         let fw_magic = self.handoff.io().try_read64(8)?;
-        self.handoff.io().try_write64(hw::PPL_MAGIC, 0)?;
+        self.handoff.io().try_write64(self.ppl_magic, 0)?;
         // Cold admission proved both interests clear. The common guard now owns AP
         // interest; never reset either participant's lock words behind that guard.
         self.handoff.io().try_write32(0xffff, 0x18)?;
-        if fw_magic != hw::PPL_MAGIC {
+        if fw_magic != self.ppl_magic {
             self.handoff.io().try_write8(1, 0x638)?;
         }
         for index in 0..65 * 3 {

@@ -20,15 +20,20 @@ pub(crate) mod policy;
 use core::{ffi::c_void, ptr::NonNull};
 use kernel::{device, prelude::*, sync::aref::ARef};
 
-use super::fw::initdata::globals;
+use super::fw::initdata;
 use super::recovery::now_ns;
 use super::regs::wmb;
 use super::Firmware;
 use policy::{COOLING_MAX, TOP_DEFAULT};
 
-static_assert!(globals::PSTATE_SELECTORS[0] == 0x88);
-static_assert!(globals::PSTATE_SELECTORS[1] == 0x8c);
-static_assert!(globals::PSTATE_SELECTORS[2] == 0x98);
+// The three Globals p-state selectors: 0x88, 0x8c and 0x98 in 25G83; four bytes later in
+// 26B123, which inserted a word at 0x38.
+static_assert!(initdata::V25G83.pstate_selectors[0] == 0x88);
+static_assert!(initdata::V25G83.pstate_selectors[1] == 0x8c);
+static_assert!(initdata::V25G83.pstate_selectors[2] == 0x98);
+static_assert!(initdata::V26B123.pstate_selectors[0] == 0x8c);
+static_assert!(initdata::V26B123.pstate_selectors[1] == 0x90);
+static_assert!(initdata::V26B123.pstate_selectors[2] == 0x9c);
 
 extern "C" {
     fn asahi_g16_clpc_gpu_get(dev: *mut c_void, out: *mut *mut c_void) -> core::ffi::c_int;
@@ -287,7 +292,7 @@ impl Firmware {
             return Ok(());
         }
         let globals = self.init.globals.as_ref().ok_or(ENODEV)?;
-        for offset in globals::PSTATE_SELECTORS {
+        for offset in self.init.abi.initdata().pstate_selectors {
             globals.w32(offset, target * 100)?;
         }
         wmb();

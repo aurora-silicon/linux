@@ -13,7 +13,7 @@ use kernel::{
 
 use super::channel::Channel;
 use super::fw::graph::{self, job_list, notifier_page, qinfo, qstate, sched_ctx};
-use super::hw::{pte, sizes, tuning};
+use super::hw::{pte, sizes, tuning, FwAbi};
 use super::object::{Class, FwObject, Objects, Placement, Request};
 use super::Firmware;
 use crate::driver::AsahiDrmDevice;
@@ -137,6 +137,7 @@ impl QueueObjects {
 }
 
 fn init_queue(
+    abi: FwAbi,
     q: &FwObject,
     state: &FwObject,
     ring: &FwObject,
@@ -145,7 +146,7 @@ fn init_queue(
 ) -> Result {
     q.write(
         0,
-        &graph::queue_image(state.va, ring.va, list.va, q.va, context.va),
+        &graph::queue_image_for(abi.qinfo(), state.va, ring.va, list.va, q.va, context.va),
     )?;
     state.w32(qstate::CAP, sizes::QUEUE_CAP)
 }
@@ -179,13 +180,14 @@ impl ComputeGraph {
             fw_stamp: q.fw_stamp,
         })
     }
-    fn init(&self) -> Result {
+    fn init(&self, abi: FwAbi) -> Result {
         self.sched_ctx.write(0, &graph::context_image())?;
         init_notifier(&self.notifier, &self.threshold)?;
         self.notifier
             .w64(notifier_page::COMPUTE_RECORD, self.threshold.va)?;
         self.job_list.w64(job_list::SELF, self.job_list.va)?;
         init_queue(
+            abi,
             &self.qinfo,
             &self.qstate,
             &self.ring,
@@ -241,11 +243,12 @@ impl RenderGraph {
             )?,
         })
     }
-    fn init(&self) -> Result {
+    fn init(&self, abi: FwAbi) -> Result {
         init_notifier(&self.notifier, &self.threshold)?;
         for e in 0..2 {
             self.job_list[e].w64(job_list::SELF, self.job_list[e].va)?;
             init_queue(
+                abi,
                 &self.qinfo[e],
                 &self.qstate[e],
                 &self.ring[e],
@@ -281,8 +284,8 @@ impl Firmware {
                 return Err(Error::from_errno(-(kernel::bindings::EPROTO as i32)));
             }
         }
-        self.graph.compute.init()?;
-        self.graph.render.init()?;
+        self.graph.compute.init(self.init.abi)?;
+        self.graph.render.init(self.init.abi)?;
         self.slots.init()?;
         self.init_render_pools(false)?;
         super::engine::wmb();

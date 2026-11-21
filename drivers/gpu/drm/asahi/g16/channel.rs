@@ -183,8 +183,9 @@ impl Channels {
         Ok(producer)
     }
 
-    /// Stage the boot NOP before the initdata root is handed to the firmware.
-    pub(crate) fn stage_boot_nop(&mut self, session: &Session) -> Result {
+    /// Stage the boot NOP (the firmware ABI's consume-only `nop` opcode) before the initdata
+    /// root is handed to the firmware.
+    pub(crate) fn stage_boot_nop(&mut self, session: &Session, nop: u32) -> Result {
         if self.devctl_producer != 0
             || self.devctl.read()? != 0
             || self.devctl.completion()? != 0
@@ -192,9 +193,7 @@ impl Channels {
         {
             return Err(super::boot::eproto());
         }
-        self.devctl
-            .ring
-            .write(0, &DevCtl::op(super::fw::channels::devctl::NOP).to_bytes())?;
+        self.devctl.ring.write(0, &DevCtl::op(nop).to_bytes())?;
         wmb();
         session.regs.set_generation(1)?;
         self.devctl.state.w32(STATE_WRITE, 1)?;
