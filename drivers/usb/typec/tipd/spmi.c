@@ -775,21 +775,16 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 }
 
 /*
- * On the T6050 boards that sleep (J714s, J716c), the probe and the sleep's SLEEP command print a
- * line; on every other machine they don't. A controller without a connector (the MagSafe one,
- * hpm5) is probed as any other: it registers its Type-C port and power supply, and with
- * apple,sleep-ssps it follows the system's sleep as the USB-C ports' controllers do (woken and
- * switched to S3 at the prepare, SLEEP at the suspend, woken at the resume and switched to S0
- * at the complete; on the J714s as macOS does it, see sn201202x_prepare_macos()).
+ * For a controller that follows the sleep's rules (apple,sleep-ssps-rules), the probe and the
+ * sleep's SLEEP command print a line; for others they don't. A controller without a connector (the
+ * MagSafe one, hpm5) is probed as any other: it registers its Type-C port and power supply, and
+ * with apple,sleep-ssps it follows the system's sleep as the USB-C ports' controllers do (woken and
+ * switched to S3 at the prepare, SLEEP at the suspend, woken at the resume and switched to S0 at
+ * the complete; on the J714s as macOS does it, see sn201202x_prepare_macos()).
  */
-static bool sn201202x_sleep_board(void)
+static bool sn201202x_sleep_board(struct sn201202x *sn)
 {
-	return of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c");
-}
-
-static bool sn201202x_j714s(void)
-{
-	return of_machine_is_compatible("apple,j714s");
+	return device_property_read_bool(sn->cd.tps.dev, "apple,sleep-ssps-rules");
 }
 
 /*
@@ -858,7 +853,7 @@ static int sn201202x_init(struct sn201202x *sn)
 	void *group;
 	int ret;
 
-	if (!sn201202x_j714s()) {
+	if (!device_property_read_bool(tps->dev, "apple,reset-on-failed-probe")) {
 		ret = tipd_init(tps);
 		if (ret)
 			cancel_delayed_work_sync(&sn->ldcm_work);
@@ -1036,7 +1031,7 @@ static int sn201202x_probe(struct spmi_device *device)
 		if (ret)
 			dev_warn(tps->dev, "USB wake arm: not registered: %d\n", ret);
 	}
-	if (sn201202x_sleep_board())
+	if (sn201202x_sleep_board(sn))
 		dev_info(tps->dev, "port controller ready%s\n", sn->polled ? ", polled" : "");
 	return 0;
 }
@@ -1191,7 +1186,7 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	}
 	reinit_completion(&sn->sleep_completion);
 	err = spmi_command_sleep(sn->sdev);
-	if (pm_suspend_via_firmware() && sn201202x_sleep_board())
+	if (pm_suspend_via_firmware() && sn201202x_sleep_board(sn))
 		dev_info(dev, "SLEEP: %d\n", err);
 	if (err)
 		goto out_resume;
