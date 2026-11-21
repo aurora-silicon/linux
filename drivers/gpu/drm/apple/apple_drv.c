@@ -982,8 +982,9 @@ static int apple_connector_attach_pq_reference(struct drm_connector *connector)
 
 /*
  * External displays can take a PQ BT.2020 signal where the firmware
- * offers one, and a desktop 26.x panel PQ content it shows as EDR;
- * dcp_crtc_atomic_check() refuses it elsewhere.
+ * offers one, and an internal panel with EDR headroom PQ content it shows
+ * as EDR (dcp_panel_edr()); dcp_crtc_atomic_check() refuses it elsewhere.
+ * An SDR panel offers no HDR at all.
  */
 static int apple_connector_attach_hdr(struct drm_connector *connector,
 				      bool panel_edr)
@@ -1057,8 +1058,7 @@ static int apple_connector_create(struct drm_device *drm,
 	ret = drm_connector_attach_vrr_capable_property(&connector->base);
 	if (ret)
 		goto err_cleanup;
-	ret = apple_connector_attach_hdr(&connector->base,
-					 dcp_fw_compat_panel_edr(dcp));
+	ret = apple_connector_attach_hdr(&connector->base, dcp_panel_edr(dcp));
 	if (ret)
 		goto err_cleanup;
 
