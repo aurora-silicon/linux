@@ -1640,6 +1640,7 @@ static const struct apple_isp_hw apple_isp_hw_t8142 = {
 	.ane_isp_doorbell_sel = 0x10,
 	.ane_compatible = "apple,t8142-ane",
 	.mlvnr_mode_config = true,
+	.led_brightness = 529,
 	.boot_mode = 1,
 	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
 	.resident_fw = true,

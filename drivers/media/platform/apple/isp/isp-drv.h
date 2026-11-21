@@ -181,6 +181,8 @@ struct apple_isp_hw {
 	 * (CISP_CMD_APPLE_CH_MLVNR_MODE_CONFIG_SET), not algorithm 0x143d.
 	 */
 	bool mlvnr_mode_config;
+	/* camera LED brightness at each start (macOS's value), 0 = firmware default */
+	u16 led_brightness;
 	enum isp_fw_abi fw_abi;
 	u64 pmu_base;
 
