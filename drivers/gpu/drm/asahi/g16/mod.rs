@@ -68,6 +68,7 @@ mod queue;
 mod recovery;
 mod regs;
 mod resources;
+mod rt;
 mod sleep;
 mod slots;
 mod timestamp;

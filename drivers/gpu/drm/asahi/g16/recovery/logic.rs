@@ -133,6 +133,67 @@ pub(crate) fn renew(now: u64, deadline_ms: u32, compute_deadline_ms: u32) -> (u6
     )
 }
 
+/// Ray traversal can run past one administrative deadline (CTS stress). As on the M4 Pro
+/// (g17 `timeout::select`: two-second polls plus four extra ones), a job with such a command
+/// gets at least ten seconds per flight. Still bounded: this is an allowance, not evidence of
+/// GPU progress.
+pub(crate) const LONG_DEADLINE_MS: u32 = 10_000;
+
+/// The administrative deadline of a long job, ms: at least [`LONG_DEADLINE_MS`], unless the
+/// deadline is disabled (zero).
+pub(crate) const fn long_deadline_ms(milliseconds: u32) -> u32 {
+    if milliseconds == 0 || milliseconds >= LONG_DEADLINE_MS {
+        milliseconds
+    } else {
+        LONG_DEADLINE_MS
+    }
+}
+
+/// The four host deadlines renewed together: ordinary and compute-only, each plain and for a
+/// long job.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Deadlines {
+    pub(crate) any: u64,
+    pub(crate) compute: u64,
+    pub(crate) long_any: u64,
+    pub(crate) long_compute: u64,
+}
+
+impl Deadlines {
+    pub(crate) const EXPIRED: Self = Self {
+        any: EXPIRED,
+        compute: EXPIRED,
+        long_any: EXPIRED,
+        long_compute: EXPIRED,
+    };
+
+    /// All four from `now`.
+    pub(crate) fn renew(now: u64, deadline_ms: u32, compute_deadline_ms: u32) -> Self {
+        let (any, compute) = renew(now, deadline_ms, compute_deadline_ms);
+        let (long_any, long_compute) = renew(
+            now,
+            long_deadline_ms(deadline_ms),
+            long_deadline_ms(compute_deadline_ms),
+        );
+        Self {
+            any,
+            compute,
+            long_any,
+            long_compute,
+        }
+    }
+
+    /// The deadline of the oldest flight: compute-only or not, of a long job or not.
+    pub(crate) const fn select(&self, compute_only: bool, long: bool) -> u64 {
+        match (compute_only, long) {
+            (true, false) => self.compute,
+            (false, false) => self.any,
+            (true, true) => self.long_compute,
+            (false, true) => self.long_any,
+        }
+    }
+}
+
 /// Zero explicitly opts long-running work out of the host's administrative watchdog.
 /// Completion stamps cannot distinguish a running shader from a firmware-silent hang.
 fn host_deadline(now: u64, milliseconds: u32) -> u64 {
