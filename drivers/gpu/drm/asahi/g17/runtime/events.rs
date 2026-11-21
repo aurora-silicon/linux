@@ -431,10 +431,6 @@ impl Firmware {
     /// Preparation admission is already closed and all builders have joined.
     pub(super) fn service_runtime_recovery(&mut self, deferred: &mut DeferredBatch) -> Result {
         self.rings.invalidate_statistics();
-        if self.recovery.restart_limit(super::now_ns()) {
-            pr_warn!("G17: restart storm limit reached\n");
-            return Err(ETIMEDOUT);
-        }
         let shared = self.primary.state.shared.clone();
         let mut service = Service {
             firmware: self,
@@ -453,8 +449,19 @@ impl Firmware {
             .set_generation(service.firmware.recovery.generation());
         service.firmware.rings.invalidate_statistics();
         let result = result?;
-        if result.leftover && service.firmware.recovery.forgive_restart() {
-            pr_warn!("G17: recovery dropped queued work of an already failed VM; not counted as a restart storm\n");
+        // Counted once the restart is classified, so the restart that reaches the limit has
+        // still been serviced. One charged to its guilty clients costs them their devices and
+        // nobody else anything; counted for the device, a program that faulted the GPU eight
+        // times, opening it again each time, or that had queued eight faulting renders, stopped
+        // it for every client until reboot.
+        if !result.charged {
+            if service.firmware.recovery.restart_limit(super::now_ns()) {
+                pr_warn!("G17: restart storm limit reached\n");
+                return Err(ETIMEDOUT);
+            }
+            if result.leftover && service.firmware.recovery.forgive_restart() {
+                pr_warn!("G17: recovery dropped queued work of an already failed VM; not counted as a restart storm\n");
+            }
         }
         if let Some(error) = result.target_error {
             dev_warn!(

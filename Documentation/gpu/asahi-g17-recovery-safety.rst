@@ -45,14 +45,18 @@ reproduction is claimed here.
   A command's first expiry is charged to its own client, whose work it fails
   (or spares behind another VM's), and does not count: otherwise one process
   could spend the budget with one hung command per queue. Only an expiry of a
-  command whose earlier settlement did not end it counts. VM changes, new
-  publications, recovery generations and replay do not reset those counters;
-  terminal loss latches. The 30 s window holds the nine two-second expirations
-  of a stalled deferred timeout that cannot complete its normal per-client
-  settlement: its first, then the eight that count. This limits host recovery
-  load even when each individual handshake succeeds. Legitimate long jobs only
-  consume this budget after their independent bounded execution allowance
-  expires.
+  command whose earlier settlement did not end it counts. Likewise a restart
+  is counted only once it is classified, and not when it is charged to the VMs
+  it finds guilty: each found guilty for the first time, which costs its client
+  the device, or blamed again for no more restarts than the commands it held
+  then. A restart without a guilty VM, or one that keeps blaming a VM beyond
+  that, counts. VM changes, new publications, recovery generations and replay
+  do not reset those counters; terminal loss latches. The 30 s window holds
+  the nine two-second expirations of a stalled deferred timeout that cannot
+  complete its normal per-client settlement: its first, then the eight that
+  count. This limits host recovery load even when each individual handshake
+  succeeds. Legitimate long jobs only consume this budget after their
+  independent bounded execution allowance expires.
 
 Lock order remains stop -> state and state -> preparation wait/reclaim. All
 preparation joins and deferred fence completion/destruction run outside state.
