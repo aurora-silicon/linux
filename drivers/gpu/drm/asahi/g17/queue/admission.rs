@@ -1180,7 +1180,8 @@ impl State {
             if slots & bit == 0 {
                 continue;
             }
-            // A pair whose commands all ran is held with them (see `Pair::executed_for_kill`).
+            // A pair that only the kill releases is held with its commands (see
+            // `Pair::releasable_by_kill`: they all ran, or they are a guilty context's).
             if self.owners[slot] != owner
                 || (executed & bit == 0
                     && (self.refs[slot] != 0 || self.active & bit != 0 || self.released & bit == 0))
@@ -1207,6 +1208,16 @@ impl Pool {
         }
         self.state.lock().kill_hold &= !slots;
         self.returned();
+    }
+
+    /// Keep `slots` out of service until both processors stop: the killed guilty pairs
+    /// `detach_context` kept there still have their queues installed. The kill held only the
+    /// slots whose queues the scheduler page listed at the kill, so the hold is set here too.
+    pub(crate) fn hold_kept_slots(&self, slots: u64) {
+        if slots == 0 {
+            return;
+        }
+        self.state.lock().kill_hold |= slots & State::MASK;
     }
 
     /// End the kill hold of `slots` once their killed context's scheduler release was
@@ -1333,6 +1344,27 @@ mod fault_capacity_tests {
         assert!(!pool.reassign_unused_spare(bit.trailing_zeros() as u8, Some(1), Some(2)));
         // A failed (unpublished) control may roll back its hold. Published kills
         // keep the existing processor-stop rule; this test must not weaken it.
+        pool.release_retained_owners_after_processor_stop();
+        assert_eq!(pool.state.lock().kill_hold, 0);
+    }
+
+    #[test]
+    fn a_kept_slot_stays_out_of_service_without_a_kill_hold() {
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        let lease = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
+        let slot = lease.slot();
+        let bit = 1u64 << slot;
+        pool.release_owner(1);
+        drop(lease);
+        // The kill held nothing here (the scheduler page did not list the pair's queues).
+        assert_eq!(pool.state.lock().kill_hold, 0);
+        pool.hold_kept_slots(bit);
+        pool.release_killed_slots(0);
+        assert_eq!(pool.state.lock().kill_hold, bit);
+        assert!(!pool.reassign_unused_spare(slot, Some(1), Some(2)));
+        let next = pool.acquire_render(2, 1, None, u64::MAX, || Ok(())).unwrap();
+        assert_ne!(next.slot(), slot);
+        drop(next);
         pool.release_retained_owners_after_processor_stop();
         assert_eq!(pool.state.lock().kill_hold, 0);
     }

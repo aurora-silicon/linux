@@ -213,7 +213,7 @@ ASAHI_TESTS = {
                                    'held-blocks-owner', 'hold-ignores-release', 'hold-ignores-work',
                                    'close-unheld', 'hold-after-release', 'put-back-own-work',
                                    'sync-skips-lent', 'lent-close-unheld', 'parked-stays-held',
-                                   'sync-clobbers', 'sync-no-wake'), []),
+                                   'sync-clobbers', 'sync-no-wake', 'close-twice'), []),
     'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
@@ -226,7 +226,8 @@ ASAHI_TESTS = {
     'g17-compute-growth-deadline-tests.py': [([], PASS)],
     'g17-kill-route-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
-                                   'unsafe-wait', 'owed-blocks-kill', 'open-owed-skipped'), []),
+                                   'unsafe-wait', 'guilty-waits-delay', 'no-guilty-input', 'owed-blocks-kill',
+                                   'open-owed-skipped'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-growth-gate-tests.py': [([], PASS)],
     'g17-growth-tests.py': [([], PASS)],

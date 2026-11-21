@@ -62,10 +62,11 @@ def fixture():
         item(control, 'enum KillRoute {', True),
         item(control, 'fn kill_route('),
         item(control, 'fn hold_owner('),
+        item(control, 'fn waits_as_failed('),
         '#[cfg(test)]\n' + item(control, 'mod render_kill_target_tests {'),
     ])
     firmware = '\n'.join(item(control, signature) for signature in [
-        'fn kill_route_for(', 'fn kill_releases_executed_render(', 'fn kill_waits_as_failed(',
+        'fn kill_route_for(', 'fn kill_releases_render(', 'fn kill_waits_as_failed(',
         'fn render_kill_candidate(', 'fn foreign_compute_running(', 'fn compute_exit_pending(',
         'fn compute_failed('])
     queue = '\n'.join([item(exit, signature) for signature in [
@@ -141,10 +142,15 @@ impl Queue {
 pub struct ComputeSlot(Option<Box<Queue>>);
 impl ComputeSlot { fn as_deref(&self) -> Option<&Queue> { self.0.as_deref() } }
 pub struct ComputeEntry { queue: ComputeSlot }
-pub struct Render { executed: Vec<(Arc<Context>, u64)>, pools_released: Vec<Arc<Context>> }
+pub struct Render { executed: Vec<(Arc<Context>, u64)>, guilty: Vec<(Arc<Context>, u64)>, pools_released: Vec<Arc<Context>> }
+fn slots_of(pairs: &[(Arc<Context>, u64)], context: &Arc<Context>) -> u64 {
+    pairs.iter().filter(|(owner, _)| Arc::ptr_eq(owner, context)).fold(0, |slots, (_, slot)| slots | 1u64 << slot)
+}
 impl Render {
-    fn executed_slots(&self, context: &Arc<Context>) -> u64 {
-        self.executed.iter().filter(|(owner, _)| Arc::ptr_eq(owner, context)).fold(0, |slots, (_, slot)| slots | 1u64 << slot)
+    fn executed_slots(&self, context: &Arc<Context>) -> u64 { slots_of(&self.executed, context) }
+    fn guilty_slots(&self, context: &Arc<Context>, _generation: u64) -> u64 { slots_of(&self.guilty, context) }
+    fn kill_slots(&self, context: &Arc<Context>, generation: u64) -> u64 {
+        self.executed_slots(context) | self.guilty_slots(context, generation)
     }
     fn teardown_pools_released(&self, context: &Arc<Context>) -> bool {
         self.pools_released.iter().any(|owner| Arc::ptr_eq(owner, context))
@@ -155,7 +161,9 @@ impl Teardown { fn render_kill_published(&self, index: usize) -> bool { self.ren
 pub struct Init { m5: bool }
 impl Init { fn is_m5(&self) -> bool { self.m5 } }
 pub struct Queues { compute: Vec<Option<ComputeEntry>>, render: Render, teardown: Teardown }
-pub struct Firmware { queues: Queues, init: Init }
+pub struct Recovery;
+impl Recovery { fn generation(&self) -> u64 { 1 } }
+pub struct Firmware { queues: Queues, init: Init, recovery: Recovery }
 impl Firmware {
 ''' + firmware + r'''
 }
@@ -225,10 +233,11 @@ mod tests {
         Firmware {
             queues: Queues {
                 compute: queues.into_iter().map(|q| Some(ComputeEntry { queue: ComputeSlot(Some(Box::new(q))) })).collect(),
-                render: Render { executed: Vec::new(), pools_released: Vec::new() },
+                render: Render { executed: Vec::new(), guilty: Vec::new(), pools_released: Vec::new() },
                 teardown: Teardown { render_kills: vec![false; 4] },
             },
             init: Init { m5: false },
+            recovery: Recovery,
         }
     }
 
@@ -296,7 +305,7 @@ mod tests {
         fw.queues.render.executed.push((c.clone(), 32));
         c.killed.set(true);
         assert!(fw.compute_exit_pending(&c));
-        assert!(!fw.kill_releases_executed_render(&c));
+        assert!(!fw.kill_releases_render(&c));
         assert_eq!(fw.kill_route_for(0, &c, CLOSED), KillRoute::None);
         assert!(!fw.kill_waits_as_failed(&c));
     }
@@ -360,6 +369,28 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_guilty_context_is_killed_at_once_without_waiting_for_foreign_render() {
+        // Render-only: a pair with a spinning group and never-started groups behind it, its VM
+        // guilty (not executed). Another client's compute runs.
+        let c = context();
+        let other = context();
+        let mut fw = firmware(vec![running(&other)]);
+        fw.queues.render.guilty.push((c.clone(), 13));
+        assert_eq!(fw.kill_route_for(0, &c, 0), KillRoute::Render);
+        assert!(fw.kill_releases_render(&c));
+        assert!(fw.kill_waits_as_failed(&c));
+        // Once only, and never on M5.
+        c.killed.set(true);
+        assert_eq!(fw.kill_route_for(0, &c, CLOSED), KillRoute::None);
+        assert!(!fw.kill_releases_render(&c));
+        let c = context();
+        let mut fw = firmware(vec![running(&other)]);
+        fw.init.m5 = true;
+        fw.queues.render.guilty.push((c.clone(), 13));
+        assert!(!fw.kill_releases_render(&c));
+    }
+
+    #[test]
     fn a_kill_does_not_wait_for_another_closed_contexts_owed_compute() {
         let (c5, c11, live) = (context(), context(), context());
         let now = 10_000 * MS;
@@ -399,13 +430,18 @@ MUTATIONS = {
     # The route before this change: a compute exit only for failed compute or released pools.
     'no-executed-route': [('    if exit_pending && (failed || pools_released || executed) {',
                            '    if exit_pending && (failed || pools_released) {')],
-    'no-executed-input': [('            self.kill_releases_executed_render(context),\n', '            false,\n')],
-    'kill-twice': [('!self.init.is_m5() && !context.kill_published() && self.queues.render.executed_slots(context) != 0',
-                    '!self.init.is_m5() && self.queues.render.executed_slots(context) != 0')],
-    'executed-on-m5': [('!self.init.is_m5() && !context.kill_published() && self.queues.render.executed_slots(context) != 0',
-                        '!context.kill_published() && self.queues.render.executed_slots(context) != 0')],
-    'unsafe-wait': [('self.compute_failed(context) || self.kill_releases_executed_render(context)',
+    'no-executed-input': [('            self.kill_releases_render(context),\n', '            false,\n')],
+    'kill-twice': [('!self.init.is_m5() && !context.kill_published() && self.queues.render.kill_slots(context, self.recovery.generation()) != 0',
+                    '!self.init.is_m5() && self.queues.render.kill_slots(context, self.recovery.generation()) != 0')],
+    'executed-on-m5': [('!self.init.is_m5() && !context.kill_published() && self.queues.render.kill_slots(context, self.recovery.generation()) != 0',
+                        '!context.kill_published() && self.queues.render.kill_slots(context, self.recovery.generation()) != 0')],
+    'unsafe-wait': [('waits_as_failed(self.compute_failed(context), self.kill_releases_render(context))',
                      'self.compute_failed(context)')],
+    # A guilty pair waits for the retirement delay like an executed one, or is not a candidate.
+    'guilty-waits-delay': [('(guilty || (executed && age >= RENDER_KILL_DELAY_NS))',
+                            '((guilty || executed) && age >= RENDER_KILL_DELAY_NS)')],
+    'no-guilty-input': [('            self.queues.render.guilty_slots(context, self.recovery.generation()) != 0,\n',
+                         '            false,\n')],
     'owed-blocks-kill': [('queue.running_commands() && !queue.context()', 'queue.in_flight() && !queue.context()')],
     'open-owed-skipped': [('self.in_flight() && !self.holds_only_owed_stamp()',
                            'self.in_flight() && !self.active.iter().all(|active| active.stamps_owed)')],
