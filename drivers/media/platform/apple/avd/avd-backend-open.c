@@ -260,6 +260,7 @@ int avd_backend_boot(struct avd_dev *avd)
 {
 	int ret;
 
+	avd_pm_apply_axi_daisy(avd);
 	if (!avd_backend_is_apple(avd)) {
 		avd_pm_prepare_piodma(avd);
 		avd_qfw_prepare_boot(avd);
