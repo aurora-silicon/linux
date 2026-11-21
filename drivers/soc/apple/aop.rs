@@ -2100,6 +2100,14 @@ impl AopData {
     /// When the firmware bootargs declare `ED0p` (`allow_ed0p`), macOS 27
     /// firmware may also supply one translated `__EDATA` segment after
     /// `__ETEXT`, while `__OS_LOG` remains identity-mapped.
+    /// Whether the bootloader reserved any firmware `memory-region` for `dev`.
+    fn has_fw_regions(dev: &device::Device) -> bool {
+        // SAFETY: `dev` is a live device being probed.
+        let np = unsafe { (*dev.as_raw()).of_node };
+        // SAFETY: `np` is the device's node, valid while it is bound.
+        !np.is_null() && unsafe { bindings::of_reserved_mem_region_count(np) } > 0
+    }
+
     fn check_fw_regions(
         dev: &device::Device,
         ec0p: u64,
@@ -3003,6 +3011,11 @@ struct AopHwConfig {
     bootargs_word_access: bool,
     /// Halt the co-processor again when its start fails (T6040).
     halt_on_failed_start: bool,
+    /// The configuration to start with when the bootloader reserved no
+    /// firmware `memory-region` for a `fw_regions` block: the segments are
+    /// then not in DRAM where this one expects them, so it runs as its
+    /// fallback compatible's block did (T8122: `apple,t6020-aop`).
+    without_fw_regions: Option<&'static AopHwConfig>,
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
@@ -3022,6 +3035,7 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 /// `nCal` keeps the firmware's own value, as on T6040: the J413 image carries 1,
 /// and with 0 the firmware never announces its accelerometer and gyroscope.
@@ -3042,6 +3056,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 /// `nCal` keeps the firmware's own value, as on T8112.
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
@@ -3061,6 +3076,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
@@ -3079,6 +3095,7 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 /// T6040 (J616s): the firmware's external code and log live in DRAM, mapped
 /// through the reserved regions the bootloader describes; the RTKit firmware
@@ -3102,6 +3119,7 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     fw_regions: true,
     bootargs_word_access: true,
     halt_on_failed_start: true,
+    without_fw_regions: None,
 };
 /// T8132 (J713): as T6040. The bootloader hands the AOP over the same way, with
 /// the DART's DAPF programmed and its windows reserved alongside the firmware
@@ -3109,8 +3127,12 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
 const HW_CFG_T8132: AopHwConfig = HW_CFG_T6040;
 /// T8122 (M3): as T6040. iBoot leaves the AOP halted with its external code,
 /// data and log in DRAM, which the bootloader reserves in `memory-region`;
-/// the 27.2 firmware reads its `__EDATA` base from `ED0p`.
-const HW_CFG_T8122: AopHwConfig = HW_CFG_T6040;
+/// the 27.2 firmware reads its `__EDATA` base from `ED0p`. A bootloader that
+/// reserves none leaves it to start as `apple,t6020-aop`, as before.
+const HW_CFG_T8122: AopHwConfig = AopHwConfig {
+    without_fw_regions: Some(&HW_CFG_T6020),
+    ..HW_CFG_T6040
+};
 /// T8140: the firmware is started with the boot arguments the bootloader
 /// left, boots through the setup port and speaks EPIC version 4. Of the
 /// advertised AFK endpoints, the application map is 0x20 misc, 0x21
@@ -3133,6 +3155,7 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 /// T8152: like T8140, but the setup port (mailbox 1 of the AOP bank, and the
 /// ADT aop-exclave-mailbox) is not reachable from the AP: both bus-error.
@@ -3153,6 +3176,7 @@ const HW_CFG_T8152: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 
 /// T8142 (M5): booted through a setup port as on T8140, at the ADT's
@@ -3177,6 +3201,7 @@ const HW_CFG_T8142: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 /// T6050 (M5 Pro and Max): booted as T8142, through the setup port at
 /// AOP ASC + 0x4007c000. Its EPMAP also names system endpoint 4, which never
@@ -3262,7 +3287,16 @@ impl platform::Driver for AopDriver {
         pdev: &'bound platform::Device<Core<'_>>,
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
-        let cfg = info.ok_or(ENODEV)?;
+        let mut cfg: &AopHwConfig = info.ok_or(ENODEV)?;
+        if let Some(alt) = cfg.without_fw_regions {
+            if cfg.fw_regions && !AopData::has_fw_regions(pdev.as_ref()) {
+                dev_info!(
+                    pdev.as_ref(),
+                    "No firmware memory-region from the bootloader: starting as the fallback block"
+                );
+                cfg = alt;
+            }
+        }
         if RETIRED.load(Acquire) {
             dev_err!(
                 pdev.as_ref(),
