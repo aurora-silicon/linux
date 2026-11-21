@@ -85,6 +85,7 @@ use kernel::{
         },
         Arc,
         ArcBorrow,
+        Completion,
         Mutex,
         SpinLock, //
     },
@@ -137,11 +138,10 @@ const PD_GET_RAISED_ATTEMPTS: u32 = 60;
 const PD_GET_RETRY_MS: i64 = 10;
 /// The fabric comes up some tens to hundreds of milliseconds after the
 /// low-power microphone is asked to run (45–200 ms measured at boot); its
-/// first report proves the stream, and so the fabric, is up. Poll for it
+/// first report proves the stream, and so the fabric, is up. Wait for it
 /// before the first leaf request so that request does not time out, and
 /// log, in the PMGR driver.
-const FABRIC_RAISE_POLL_MS: i64 = 5;
-const FABRIC_RAISE_POLLS: u32 = 100;
+const FABRIC_RAISE_TIMEOUT_MS: u32 = 500;
 
 /// The low-power microphone stream: 16 kHz stereo S32 in a 512 KiB ring
 /// reported every 3,200 frames.
@@ -467,6 +467,10 @@ struct SndSocT8140AopData {
     powered: AtomicFlag,
     /// A low-power microphone report arrived since the last run request.
     reported: AtomicFlag,
+    /// Completed by the first report after a run request, see
+    /// [`SndSocT8140AopData::with_fabric_raised`].
+    #[pin]
+    first_report: Completion,
     /// The low-power microphone stream is triggered (set and cleared under
     /// the ALSA stream lock, read by the report path).
     running: AtomicFlag,
@@ -733,6 +737,8 @@ impl SndSocT8140AopData {
         let mut run = self.lpai_run.lock();
         if !run.running {
             self.reported.store(false, Relaxed);
+            // A first report of an earlier run that nobody waited for.
+            while self.first_report.try_wait_for_completion() {}
             self.set_power(POWER_STATE_RUN)?;
             run.running = true;
         }
@@ -862,13 +868,15 @@ impl SndSocT8140AopData {
     /// `runn` around `f`, once its first report has arrived.
     fn with_fabric_raised<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
         self.lpai_run_get()?;
-        let mut polls = 0;
-        while !self.reported.load(Relaxed) && polls < FABRIC_RAISE_POLLS {
-            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(FABRIC_RAISE_POLL_MS));
-            polls += 1;
-        }
-        if polls == FABRIC_RAISE_POLLS {
-            dev_warn!(self.dev, "lpai: no report while raising the fabric\n");
+        if !self.reported.load(Relaxed) {
+            let timeout = kernel::time::msecs_to_jiffies(FABRIC_RAISE_TIMEOUT_MS);
+            if self.first_report.wait_for_completion_timeout(timeout) {
+                // Hand the report on to a raise waiting beside this one; the
+                // next run request drops it.
+                self.first_report.complete();
+            } else {
+                dev_warn!(self.dev, "lpai: no report while raising the fabric\n");
+            }
         }
         let ret = f();
         if let Err(e) = self.lpai_run_put() {
@@ -1178,7 +1186,9 @@ impl ReportListener for SndSocT8140AopData {
             }
         };
         let frames = absolute / LPAI_FRAME_BYTES as u64;
-        self.reported.store(true, Relaxed);
+        if !self.reported.xchg(true, Relaxed) {
+            self.first_report.complete();
+        }
         let ring_bytes = self.ring_bytes.load(Relaxed) as usize;
         if !producer_cursor_matches(absolute, cursor, ring_bytes) {
             if !self.report_warnings[2].xchg(true, Relaxed) {
@@ -2993,6 +3003,7 @@ impl SndSocT8140AopDriver {
                 sequence: Atomic::new(0),
                 powered: AtomicFlag::new(false),
                 reported: AtomicFlag::new(false),
+                first_report <- Completion::new(),
                 running: AtomicFlag::new(false),
                 hw_ptr_frames: Atomic::new(0),
                 report_warnings: [const { AtomicFlag::new(false) }; 5],
