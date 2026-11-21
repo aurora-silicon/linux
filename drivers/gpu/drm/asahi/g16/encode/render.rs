@@ -249,8 +249,14 @@ pub(crate) fn encode_ta_for(
     put64(w, 0x28, p.scene);
     put64(w, 0x30, p.scene + 0x100);
     put64(w, 0x740, p.ta_work_gva + 0x40);
-    put16(w, 0x748, 66);
-    put16(w, 0x74a, 66 * 12);
+    let mut count = ta::SEL.len();
+    if layout.slot_record {
+        put32(w, ta::REGS + count * 12, ta::SLOT_REG);
+        put64(w, ta::REGS + count * 12 + 4, u64::from(ta::RENDER_SLOT));
+        count += 1;
+    }
+    put16(w, 0x748, count as u16);
+    put16(w, 0x74a, (count * 12) as u16);
     put64(w, 0x760, p.tpc_fw);
     put64(w, ta::TPC_BYTES, geo.tpc_bytes);
     put64(w, 0x770, p.ta_seq);
@@ -448,8 +454,14 @@ pub(crate) fn encode_fs_for(
     put32(w, 0x68, geo.blocks);
     put32(w, 0x78, geo.tiles);
     put64(w, 0x780, p.fs_work_gva + 0x80);
-    put16(w, 0x788, 82);
-    put16(w, 0x78a, 82 * 12);
+    let mut count = fs::SEL.len();
+    if layout.slot_record {
+        put32(w, fs::REGS + count * 12, fs::SLOT_REG);
+        put64(w, fs::REGS + count * 12 + 4, u64::from(ta::RENDER_SLOT));
+        count += 1;
+    }
+    put16(w, 0x788, count as u16);
+    put16(w, 0x78a, (count * 12) as u16);
     put64(w, 0x7a0, u.isp_dbias_base);
     put64(w, 0x7b0, u.isp_scissor_base);
     put64(w, 0x7c0, u.isp_oclqry_base);

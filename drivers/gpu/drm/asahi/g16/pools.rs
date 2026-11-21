@@ -16,6 +16,9 @@ pub(crate) mod lifetime;
 
 use super::fw::buffer::{self, uma_manager};
 use super::hw::{client, engine, pte};
+
+// The TA/FS slot records name the slot the render descriptor holds.
+const _: () = assert!(super::fw::work::ta::RENDER_SLOT == engine::RENDER_UMA_SLOT);
 use super::object::{Class, FwObject, Objects, Placement, Request};
 use super::Firmware;
 use crate::driver::AsahiDrmDevice;

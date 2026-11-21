@@ -88,18 +88,28 @@ pub(crate) mod ta {
         pub(crate) completion: usize,
         /// Target of the timestamp records' +0x2c ("auxiliary") pointer.
         pub(crate) auxiliary: usize,
+        /// Whether the register list names the render pool's free-list slot ([`SLOT_REG`]), as
+        /// macOS 27.2 does on the 26B123 firmware.
+        pub(crate) slot_record: bool,
     }
+
+    /// TA register naming the render UMA pool's free-list slot.
+    pub(crate) const SLOT_REG: u32 = 0x14308;
+    /// The render UMA pool's slot, as the retained render descriptor holds it (TA and FS).
+    pub(crate) const RENDER_SLOT: u32 = 33;
 
     pub(crate) const V25G83: Layout = Layout {
         generation_bytes: 1,
         completion: 0x918,
         auxiliary: 0x928,
+        slot_record: false,
     };
 
     pub(crate) const V26B123: Layout = Layout {
         generation_bytes: 8,
         completion: 0x91f,
         auxiliary: 0x92f,
+        slot_record: true,
     };
 
     const fn valid(l: &Layout) -> bool {
@@ -144,13 +154,20 @@ pub(crate) mod fs {
         pub(crate) auxiliary: usize,
         /// u8 flag the host sets to 1.
         pub(crate) flag: usize,
+        /// Whether the register list names the render pool's free-list slot ([`SLOT_REG`]), as
+        /// macOS 27.2 does on the 26B123 firmware.
+        pub(crate) slot_record: bool,
     }
+
+    /// FS register naming the render UMA pool's free-list slot.
+    pub(crate) const SLOT_REG: u32 = 0x14048;
 
     pub(crate) const V25G83: Layout = Layout {
         generation_bytes: 1,
         completion: 0xc60,
         auxiliary: 0xc70,
         flag: 0xc84,
+        slot_record: false,
     };
 
     pub(crate) const V26B123: Layout = Layout {
@@ -158,6 +175,7 @@ pub(crate) mod fs {
         completion: 0xc67,
         auxiliary: 0xc77,
         flag: 0xc8b,
+        slot_record: true,
     };
 
     const fn valid(l: &Layout) -> bool {

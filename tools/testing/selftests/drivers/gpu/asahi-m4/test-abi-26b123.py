@@ -252,6 +252,12 @@ def expect_render(old):
     fw[0xc8b], fw[0xc84] = fw[0xc84], 0
     for at in (0x288 + 0xa5, 0x1ec + 0x2c, 0x23c + 0x2c):
         plus7(fq, at)
+    # 26B123 names the render pool's free-list slot (our slot 33) after the TA and FS lists,
+    # as macOS 27.2 does (TA 0x14308, FS 0x14048).
+    for work, regs, count_at, sel in ((tw, 0x40, 0x748, 0x14308), (fw, 0x80, 0x788, 0x14048)):
+        count = struct.unpack_from('<H', work, count_at)[0]
+        struct.pack_into('<IQ', work, regs + count * 12, sel, 33)
+        struct.pack_into('<HH', work, count_at, count + 1, (count + 1) * 12)
     return bytes(tw + tq + fw + fq)
 
 
