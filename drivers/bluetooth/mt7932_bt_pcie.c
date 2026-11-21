@@ -69,6 +69,15 @@
 /* How long a wake reason may take to arrive once the transport is back. */
 #define BT7932_WAKE_REASON_MS 200
 
+/*
+ * The firmware files carry their version in their names, and a firmware
+ * update renames them. User space can install the newest image of each kind
+ * under a name that does not change; look for that first, then for the
+ * versioned names.
+ */
+#define BT7932_FW_B0_STABLE "mediatek/mt7932/bt-b0.bin"
+#define BT7932_FW_B1_STABLE "mediatek/mt7932/bt-b1.bin"
+#define BT7932_PTX_STABLE "mediatek/mt7932/bt-ptb.ptx"
 #define BT7932_FW_B0 "mediatek/MT7932B0_OS_TypeB_0.1.44.0_241001003711.bin"
 #define BT7932_FW_B1 "mediatek/MT7932B1_OS_TypeB_2.0.177.0_260706180356.bin"
 #define BT7932_FW_B1_FALLBACK "mediatek/MT7932B1_OS_TypeB_0.1.133.0_260128190103.bin"
@@ -409,9 +418,13 @@ static int bt7932_read_inputs(struct bt7932 *bt)
 	int i, ret;
 
 	if (!bt->rom) {
-		ret = request_firmware(&fw, BT7932_FW_B0, &bt->pdev->dev);
+		ret = firmware_request_nowarn(&fw, BT7932_FW_B0_STABLE, &bt->pdev->dev);
+		if (ret == -ENOENT)
+			ret = request_firmware(&fw, BT7932_FW_B0, &bt->pdev->dev);
 	} else {
-		ret = firmware_request_nowarn(&fw, BT7932_FW_B1, &bt->pdev->dev);
+		ret = firmware_request_nowarn(&fw, BT7932_FW_B1_STABLE, &bt->pdev->dev);
+		if (ret == -ENOENT)
+			ret = firmware_request_nowarn(&fw, BT7932_FW_B1, &bt->pdev->dev);
 		if (ret == -ENOENT)
 			ret = request_firmware(&fw, BT7932_FW_B1_FALLBACK, &bt->pdev->dev);
 	}
@@ -459,7 +472,9 @@ release_image:
 	release_firmware(fw);
 	if (ret)
 		return ret;
-	ret = request_firmware(&fw, BT7932_PTX, &bt->pdev->dev);
+	ret = firmware_request_nowarn(&fw, BT7932_PTX_STABLE, &bt->pdev->dev);
+	if (ret == -ENOENT)
+		ret = request_firmware(&fw, BT7932_PTX, &bt->pdev->dev);
 	if (ret)
 		return ret;
 	ret = bt7932_validate_ptx(fw->data, fw->size);
@@ -1988,6 +2003,9 @@ module_pci_driver(bt7932_driver);
 
 MODULE_DESCRIPTION("MediaTek MT7932 Bluetooth PCIe transport for the Apple MacBook Neo");
 MODULE_LICENSE("GPL");
+MODULE_FIRMWARE(BT7932_FW_B0_STABLE);
+MODULE_FIRMWARE(BT7932_FW_B1_STABLE);
+MODULE_FIRMWARE(BT7932_PTX_STABLE);
 MODULE_FIRMWARE(BT7932_FW_B0);
 MODULE_FIRMWARE(BT7932_FW_B1);
 MODULE_FIRMWARE(BT7932_FW_B1_FALLBACK);
