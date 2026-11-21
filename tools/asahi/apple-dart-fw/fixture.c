@@ -14,6 +14,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef uint64_t ph
 #define IOMMU_WRITE 2
 #define IOMMU_CACHE 4
 #define APPLE_DART_PTE_VALID 1
+#define APPLE_DART 1
 #define APPLE_DART2 2
 #define GFP_KERNEL 0
 #define MEMREMAP_WB 0
@@ -83,9 +84,8 @@ static int commands,command_error;static u64 command_start[8],command_end[8];
 static int apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map*m,int op,bool range,u64 lo,u64 hi){assert(op==1&&range&&commands<8);command_start[commands]=lo;command_end[commands++]=hi;return command_error;}
 struct list_head {int count;};
 struct iommu_resv_region {u64 start,length,dva;int prot,type;struct list_head list;};
-struct device_node {int count;u32 value;bool t8140;};
+struct device_node {int count;u32 value;};
 struct iommu_device;struct device {struct device_node*of_node;struct apple_dart_master_cfg*cfg;struct iommu_device*iommu;};
-static int of_device_is_compatible(struct device_node*np,const char*s){assert(!strcmp(s,"apple,t8140-dart"));return np->t8140;}
 static int of_property_count_u32_elems(struct device_node*np,const char*s){assert(!strcmp(s,"apple,firmware-root-handoff"));return np->count;}
 static int of_property_read_u32(struct device_node*np,const char*s,u32*v){assert(!strcmp(s,"apple,firmware-root-handoff"));*v=np->value;return np->count<1?-EINVAL:0;}
 #define dev_iommu_priv_get(d) ((d)->cfg)
@@ -188,7 +188,7 @@ int main(int argc,char**argv){
  firmware_leaf[0]=leaf(0x8000);ours_leaf[0]=leaf(0x8000);phys_addr_t phys;
  struct apple_dart_domain domain={0};domain.stream_maps[0].dart=&d;domain.fw_sidmap[0][0]=1;
  struct apple_dart_master_cfg cfg={0};cfg.stream_maps[0].dart=&d;cfg.stream_maps[0].sidmap[0]=1;
- struct iommu_device io={0};struct device_node node={1,1,true};struct device dev={&node,&cfg,&io};d.dev=&dev;struct list_head head={0};
+ struct iommu_device io={0};struct device_node node={1,1};struct device dev={&node,&cfg,&io};d.dev=&dev;struct list_head head={0};
  d.locked_ttbr[0][0]=root;static u64 shadow[2048];d.locked_owned[0][0]=shadow;d.locked_fw[0][0]=&fw;
  if(!strncmp(c,"legacy-",7)){
   d.fw_handoff=0;d.fw_mirror=1;root[0]=0x1401;
@@ -207,7 +207,7 @@ int main(int argc,char**argv){
   if(!strcmp(c,"handoff-duplicate"))node.count=2;
   if(!strcmp(c,"handoff-zero"))node.value=0;
   if(!strcmp(c,"handoff-unlocked"))d.locked=0;
-  if(!strcmp(c,"handoff-other-soc"))node.t8140=false;
+  if(!strcmp(c,"handoff-dart1-format"))hw.fmt=APPLE_DART;
   assert(apple_dart_fw_handoff_enabled(&d)==!strcmp(c,"handoff-matched"));
  }
  else if(!strncmp(c,"core-",5)){
