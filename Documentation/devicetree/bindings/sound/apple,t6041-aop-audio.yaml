@@ -70,6 +70,13 @@ properties:
           - const: sense
           - const: cout
           - const: cin
+      - description:
+          The speakers without V/I sense and the headset jack, on a Mac without
+          microphones
+        items:
+          - const: spkr
+          - const: cout
+          - const: cin
       - description: The microphones and the headset jack
         items:
           - const: dma
