@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+
+#include "t6050-isp.dtsi"
+
+/* K114c IMX958; the hardware has no camera-light GPIO. */
+&isp0 {
+	apple,dart-vm-size = /bits/ 64 <0xde600000>;
+	apple,platform-id = <0xb9>;
+	apple,temporal-filter = <1>;
+	apple,cam-connections-scheme = <0x10>;
+	apple,camera-indicator = <&dcp>;
+	sensor-presets {
+		preset0 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 2880>;
+			apple,output-size = <1920 1080>;
+			apple,crop = <320 765 2400 1350>;
+		};
+	};
+};
