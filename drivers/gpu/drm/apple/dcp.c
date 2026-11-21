@@ -5968,24 +5968,62 @@ static int dcp_connector_type_from_dt(struct device_node *np)
 	return DRM_MODE_CONNECTOR_Unknown;
 }
 
-/* A T8132 main DCP can serve a fixed external output instead of a panel. */
-bool dcp_t8132_main_external(struct device_node *np)
+/*
+ * A T8132 external DCP the board routes to the fixed HDMI port (the Mac
+ * mini's dispext0, the pipe macOS drives its HDMI port from), through the
+ * same DPTX PHY and HDMI converter rails as the main DCP, the PHY's source
+ * select being the DCP's index, and that the boot loader handed over.
+ */
+static bool dcp_t8132_hdmi_dcpext_ready(struct device_node *np)
 {
-	return np && of_device_is_compatible(np, "apple,t8132-dcp") &&
-		dcp_connector_type_from_dt(np) == DRM_MODE_CONNECTOR_HDMIA;
+	u32 ready = 0;
+
+	return np && of_device_is_compatible(np, "apple,t8132-dcpext") &&
+		of_device_is_available(np) &&
+		dcp_connector_type_from_dt(np) == DRM_MODE_CONNECTOR_HDMIA &&
+		!of_property_read_u32(np, "apple,t8132-dcpext-firmware-ready", &ready) &&
+		ready == 1;
+}
+
+/* Whether a handed-over dcpext drives the fixed HDMI port. */
+static bool dcp_t8132_hdmi_on_dcpext(void)
+{
+	struct device_node *np;
+	bool on = false;
+
+	for_each_compatible_node(np, NULL, "apple,t8132-dcpext")
+		on = on || dcp_t8132_hdmi_dcpext_ready(np);
+	return on;
 }
 
 /*
- * A T8132 DCP that drives the fixed HDMI port: the main DCP above, or an
- * external DCP the board routes to it (the Mac mini's dispext0, the pipe
- * macOS drives its HDMI port from), through the same DPTX PHY and HDMI
- * converter rails, the PHY's source select being the DCP's index.
+ * A T8132 main DCP can serve a fixed external output instead of a panel,
+ * unless a handed-over dcpext serves that port instead.
  */
+bool dcp_t8132_main_external(struct device_node *np)
+{
+	return np && of_device_is_compatible(np, "apple,t8132-dcp") &&
+		dcp_connector_type_from_dt(np) == DRM_MODE_CONNECTOR_HDMIA &&
+		!dcp_t8132_hdmi_on_dcpext();
+}
+
+/*
+ * A main DCP whose HDMI port a handed-over dcpext drives: it is left as the
+ * boot loader left it, booted and idle, as macOS leaves it on the Mac mini.
+ * Without that handoff (a boot loader that keeps dispext0), the main DCP
+ * drives the port as before.
+ */
+bool dcp_t8132_main_hdmi_idle(struct device_node *np)
+{
+	return np && of_device_is_compatible(np, "apple,t8132-dcp") &&
+		dcp_connector_type_from_dt(np) == DRM_MODE_CONNECTOR_HDMIA &&
+		dcp_t8132_hdmi_on_dcpext();
+}
+
+/* The T8132 DCP that drives the fixed HDMI port: the main DCP or a dcpext. */
 bool dcp_t8132_fixed_hdmi(struct device_node *np)
 {
-	return np && (of_device_is_compatible(np, "apple,t8132-dcp") ||
-		      of_device_is_compatible(np, "apple,t8132-dcpext")) &&
-		dcp_connector_type_from_dt(np) == DRM_MODE_CONNECTOR_HDMIA;
+	return dcp_t8132_main_external(np) || dcp_t8132_hdmi_dcpext_ready(np);
 }
 
 /*
@@ -7699,6 +7737,10 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
+	if (dcp_t8132_main_hdmi_idle(dev->of_node)) {
+		dev_info(dev, "HDMI port on a handed-over external DCP: main DCP left booted and idle\n");
+		return -ENODEV;
+	}
 	if (of_device_is_compatible(dev->of_node, "apple,t8132-dcpext"))
 		return dcp_platform_probe_t8132_ext(pdev);
 	if (!dcp_ext_is_failsafe(dev->of_node))
