@@ -436,7 +436,7 @@ static inline unsigned int v4l2_format_plane_stride(const struct v4l2_format_inf
 {
 	unsigned int hdiv = plane ? info->hdiv : 1;
 	unsigned int aligned_width =
-		ALIGN(width, v4l2_format_block_width(info, plane));
+		roundup(width, v4l2_format_block_width(info, plane));
 
 	/*
 	 * Formats with a single memory plane derive the stride of the
@@ -466,7 +466,7 @@ static inline unsigned int v4l2_format_plane_height(const struct v4l2_format_inf
 {
 	unsigned int vdiv = plane ? info->vdiv : 1;
 	unsigned int aligned_height =
-		ALIGN(height, v4l2_format_block_height(info, plane));
+		roundup(height, v4l2_format_block_height(info, plane));
 
 	return DIV_ROUND_UP(aligned_height, vdiv);
 }
