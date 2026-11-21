@@ -7132,6 +7132,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8132_v27 = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext_v27 = {
+	.external_processor = true,
 	.firmware_dma_bits = 41,
 	.num_dptx_ports = 2,
 	.adopt_live_session = true,
@@ -9647,12 +9648,11 @@ static int dcp_platform_suspend(struct device *dev)
 	if (pm_suspend_via_firmware() && dcp_s2r_ext_capable(dcp))
 		return dcp_s2r_ext_suspend(dcp);
 	/*
-	 * A firmware-27 external DCP without a stop of its own (T8132's on 27.2): a deep sleep
-	 * stops its firmware cold and nothing starts it again, so its resume would wait on a
-	 * dead firmware. Refuse the deep sleep instead; suspend-to-idle keeps it running.
+	 * A firmware-27 external display processor that none of the stops above took: a deep
+	 * sleep stops its firmware cold and nothing starts it again, so its resume would wait
+	 * on a dead firmware. Refuse the deep sleep instead; suspend-to-idle keeps it running.
 	 */
-	if (pm_suspend_via_firmware() && !dcp->hw.s2r_ext &&
-	    (dcp->external || apple_t8132_dcpext_v27_2(dev->of_node)) &&
+	if (pm_suspend_via_firmware() && dcp->hw.external_processor &&
 	    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 		dev_warn(dev, "no firmware stop for a deep sleep: refusing it\n");
 		return -EBUSY;
@@ -9845,6 +9845,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6020 = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6020_dcpext = {
+	.external_processor = true,
 	.num_dptx_ports = 2,
 	.t6020_tunnel_flow = true,
 };
@@ -9871,6 +9872,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
 
 /* Separate from the established internal-panel H17P profile. */
 static const struct apple_dcp_hw_data apple_dcp_hw_t8140_external = {
+	.external_processor = true,
 	.num_dptx_ports = 1,
 	.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL,
 	.adopt_live_session = false,
@@ -9917,15 +9919,18 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6031 = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6030_dcpext = {
+	.external_processor = true,
 	.num_dptx_ports = 1,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8122_dcpext = {
+	.external_processor = true,
 	.num_dptx_ports = 2,
 	.fw_14_7_endpoints = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
+	.external_processor = true,
 	.num_dptx_ports = 2,
 };
 
@@ -9937,6 +9942,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8132 = {
 
 /* An external DCP: two DPTX port services, dcpdptx-port-epic units 0 and 1. */
 static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext = {
+	.external_processor = true,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_M4,
 	.num_dptx_ports = 2,
@@ -9949,6 +9955,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6041 = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6041_dcpext = {
+	.external_processor = true,
 	.num_dptx_ports = 2,
 	.sink_metadata_edid = true,
 };
@@ -9965,6 +9972,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
+	.external_processor = true,
 	/* Off: an inactive display DART's and its GAPF slice's handling is not validated. */
 	.v27_sleep_protocol = false,
 	/* Off until recovery from a real and from an aborted wake is validated. */
@@ -9988,6 +9996,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
  * (dmitzsaz) opens the same ones. Type-C uses port 0.
  */
 static const struct apple_dcp_hw_data apple_dcp_hw_t8142_dcpext = {
+	.external_processor = true,
 	.num_dptx_ports = 2,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
