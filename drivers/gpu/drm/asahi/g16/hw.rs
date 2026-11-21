@@ -696,7 +696,9 @@ pub(crate) mod sizes {
     pub(crate) const SCHEDULER_CREDITS: u32 = 16;
     /// Unconsumed records per 256-entry channel ring a prefix may be posted behind.
     pub(crate) const AHEAD_RECORDS: u32 = 64;
-    /// Policy bound on logical queues reported in QUEUE_LIMITS (not a firmware limit).
+    /// Live logical queues on the device at most, reported in QUEUE_LIMITS and enforced by
+    /// QUEUE_CREATE. A policy bound, not a firmware limit (queues own no firmware state); the
+    /// bound G15 reports for the same logical-queue model.
     pub(crate) const MAX_QUEUES: u32 = 58;
     /// TTBAT user slots: user VMs hold one each for their lifetime (ASIDs 1..63).
     pub(crate) const MAX_VMS: u32 = 63;

@@ -3,10 +3,11 @@
 //! Module parameters and the GET_PARAMS identity.
 //!
 //! With the shared `file.rs` additions (VM_STATUS and VM_STATUS_MIRROR from `supports_vm_status`,
-//! SOFT_FAULTS suppressed by `soft_faults`), the feature word is 0x1c02: per-command input
-//! readiness/errors and exact queue-local historical prefixes use explicit retained inputs
-//! and successful command receipt frontiers. No independent hardware queue reservation,
-//! fragment barriers or ray queries are advertised.
+//! INDEPENDENT_QUEUES from `queue_limits`, SOFT_FAULTS suppressed by `soft_faults`), the feature
+//! word is 0x1c06: per-command input readiness/errors and exact queue-local historical prefixes
+//! use explicit retained inputs and successful command receipt frontiers. INDEPENDENT_QUEUES
+//! reports bounded logical queues with their own scheduler timelines; they reserve no firmware
+//! execution context. Fragment barriers and ray queries are not advertised.
 
 use kernel::{prelude::*, uapi};
 

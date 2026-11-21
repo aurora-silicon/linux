@@ -193,6 +193,8 @@ const POLL_WORK: u64 = 0;
 /// Device state shared with the RTKit callbacks and the poll work.
 #[pin_data]
 pub(crate) struct Shared {
+    /// Live logical queues, counted across every file and VM on this GPU.
+    pub(crate) logical_queues: AtomicU32,
     pub(crate) dev: ARef<device::Device>,
     /// Keeps the DRM device alive for a deferred wedged uevent. Firmware-visible owners
     /// already retain the session until reboot; this reference follows the same lifetime.
@@ -389,6 +391,7 @@ impl Gpu {
         let drm_device: ARef<AsahiDrmDevice> = dev.into();
         let shared = Arc::pin_init(
             pin_init!(Shared {
+                logical_queues: AtomicU32::new(0),
                 dev: dev.as_ref().as_ref().into(),
                 drm: drm_device,
                 wedged: AtomicBool::new(false),
@@ -579,8 +582,15 @@ impl gpu::Gpu for Gpu {
         true
     }
 
+    /// Logical queues are scheduling entities over the one shared graph. QUEUE_CREATE holds a
+    /// device-wide credit per live queue (`queue::QueueCredit`), so the reported bound is the
+    /// one enforced; each queue's scheduler admits `SCHEDULER_CREDITS` jobs to the engine.
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
-        None
+        Some(uapi::drm_asahi_queue_limits {
+            max_queues: hw::sizes::MAX_QUEUES,
+            max_in_flight_per_queue: hw::sizes::SCHEDULER_CREDITS,
+            ..Default::default()
+        })
     }
 
     fn base_clock_hz(&self) -> u32 {
