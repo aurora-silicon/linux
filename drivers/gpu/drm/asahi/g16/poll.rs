@@ -37,6 +37,11 @@ use super::job::{self, Completions, Job};
 use super::recovery::logic::Retirement;
 use super::regs::EngineState;
 use super::{params, Firmware, Shared, POLL_WORK};
+
+/// 26B123: where the firmware leaves a compute work's GPU start and end ticks (the TS records'
+/// +0x34 names work +0x7dc; the ticks land at its +0x10 and +0x18).
+const WORK_TICK_START: usize = 0x7ec;
+const WORK_TICK_END: usize = 0x7f4;
 use crate::module_parameters;
 
 impl_has_hr_timer! {
@@ -332,6 +337,19 @@ impl Firmware {
 
     /// Exact M4 queue and submit-pipe proof for one serialized publication. Event
     /// notifications are wakeups; neither an event nor elapsed time releases an owner.
+    /// A compute unit's GPU start/end ticks. The 26B123 firmware writes them into the work at
+    /// +0x7ec/+0x7f4 (macOS 27.2, hv25: its ITS pair stays 0/0 while those hold the 0.77 ms of
+    /// the job); 25G83 writes the ITS pair. The ITS pair is used whenever it holds an interval.
+    fn compute_ticks(&self, unit: &super::slots::ComputeSlot) -> Result<(u64, u64)> {
+        let (start, end) = (unit.its.r64(0)?, unit.its.r64(8)?);
+        if (start != 0 && end > start) || self.session.adt.layout.start != super::hw::Start::MacOs27_2 {
+            return Ok((start, end));
+        }
+        let w = &unit.work;
+        let at = |o: usize| -> Result<u64> { Ok(w.r32(o)? as u64 | (w.r32(o + 4)? as u64) << 32) };
+        Ok((at(WORK_TICK_START)?, at(WORK_TICK_END)?))
+    }
+
     /// Stall diagnostics: every input of the oldest flight's compute receipt, so a stall names
     /// the condition that keeps it pending.
     pub(crate) fn log_retirement(&self, why: &str) {
@@ -374,7 +392,7 @@ impl Firmware {
         match f.job.resources.compute_unit(k) {
             Ok(unit) => dev_err!(
                 dev,
-                "G16 {}: compute unit {}: submitted {:#x} completed {:#x} counter {:#x} (counter va {:#x}) its start {:#x} end {:#x}\n",
+                "G16 {}: compute unit {}: submitted {:#x} completed {:#x} counter {:#x} (counter va {:#x}) its start {:#x} end {:#x}; work ticks {:#x} {:#x} {:#x} {:#x}\n",
                 why,
                 k,
                 x64(unit.counter.r64(0)),
@@ -382,7 +400,11 @@ impl Firmware {
                 x64(unit.work.r64(compute::DESCRIPTOR_COUNTER)),
                 unit.counter.va,
                 x64(unit.its.r64(0)),
-                x64(unit.its.r64(8))
+                x64(unit.its.r64(8)),
+                x32(unit.work.r32(WORK_TICK_START)),
+                x32(unit.work.r32(WORK_TICK_START + 4)),
+                x32(unit.work.r32(WORK_TICK_END)),
+                x32(unit.work.r32(WORK_TICK_END + 4))
             ),
             Err(e) => dev_err!(dev, "G16 {}: compute unit {}: {:?}\n", why, k, e),
         }
@@ -492,8 +514,7 @@ impl Firmware {
             let k = f.claims.slot[0] as usize;
             let unit = f.job.resources.compute_unit(k)?;
             let submitted = unit.counter.r64(0)?;
-            let start = unit.its.r64(0)?;
-            let end = unit.its.r64(8)?;
+            let (start, end) = self.compute_ticks(unit)?;
             let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
             full &= stamp_reached(stamp, f.target, e.target)
                 && (stamp != f.target
@@ -513,8 +534,7 @@ impl Firmware {
             let k = f.claims.slot[0] as usize;
             let unit = f.job.resources.compute_unit(k)?;
             let submitted = unit.counter.r64(0)?;
-            let start = unit.its.r64(0)?;
-            let end = unit.its.r64(8)?;
+            let (start, end) = self.compute_ticks(unit)?;
             full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
                 && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot
                 && submitted != 0
