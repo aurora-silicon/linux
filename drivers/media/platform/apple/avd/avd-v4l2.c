@@ -11,6 +11,7 @@
  * Copyright (C) 2011 Samsung Electronics Co., Ltd.
  */
 
+#include <kunit/visibility.h>
 #include <linux/pm_runtime.h>
 
 #include <media/v4l2-event.h>
@@ -498,7 +499,7 @@ avd_enum_coded_fmt_desc(struct avd_ctx *ctx, int index)
 	return NULL;
 }
 
-static const struct avd_coded_fmt_desc *
+VISIBLE_IF_KUNIT const struct avd_coded_fmt_desc *
 avd_find_coded_fmt_desc(struct avd_ctx *ctx, u32 fourcc)
 {
 	unsigned int i;
@@ -511,6 +512,61 @@ avd_find_coded_fmt_desc(struct avd_ctx *ctx, u32 fourcc)
 
 	return NULL;
 }
+
+/*
+ * The picture format that @desc's stored format controls (those with
+ * avd_ctrl_ops: the H.264/HEVC SPS, the VP9 frame, the AV1 sequence) call
+ * for. A format control set while the OUTPUT queue held another codec went
+ * through that codec's try_ctrl/s_ctrl, which ignore it, so its picture
+ * format was never applied; nor does setting the same value again reach
+ * s_ctrl. Called when the OUTPUT format selects @desc.
+ *
+ * A value @desc refuses gives AVD_IMG_FMT_ANY: the codec refuses the frame
+ * when it runs. So does the picture format that ANY selects anyway (the
+ * first decoded format), which keeps every CAPTURE format enumerable for a
+ * client that has not set its controls yet.
+ */
+VISIBLE_IF_KUNIT enum avd_image_fmt
+avd_stored_image_fmt(struct avd_ctx *ctx, const struct avd_coded_fmt_desc *desc)
+{
+	enum avd_image_fmt image_fmt = AVD_IMG_FMT_ANY;
+	unsigned int i;
+
+	if (!desc->ops->get_image_fmt)
+		return AVD_IMG_FMT_ANY;
+
+	for (i = 0; i < desc->ctrls->num_ctrls; i++) {
+		const struct v4l2_ctrl_config *cfg = &desc->ctrls->ctrls[i].cfg;
+		enum avd_image_fmt fmt = AVD_IMG_FMT_ANY;
+		struct v4l2_ctrl *ctrl;
+
+		if (cfg->ops != &avd_ctrl_ops)
+			continue;
+		ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, cfg->id);
+		if (!ctrl)
+			continue;
+
+		/*
+		 * The codec ops read the new value. Outside a control operation
+		 * it may still hold a value that was only tried; give them the
+		 * stored one, as the control framework does before an operation.
+		 */
+		v4l2_ctrl_lock(ctrl);
+		memcpy(ctrl->p_new.p, ctrl->p_cur.p,
+		       ctrl->elems * ctrl->elem_size);
+		if (!desc->ops->try_ctrl || !desc->ops->try_ctrl(ctx, ctrl))
+			fmt = desc->ops->get_image_fmt(ctx, ctrl);
+		v4l2_ctrl_unlock(ctrl);
+
+		if (fmt != AVD_IMG_FMT_ANY)
+			image_fmt = fmt;
+	}
+
+	if (image_fmt == desc->decoded_fmts[0].image_fmt)
+		return AVD_IMG_FMT_ANY;
+	return image_fmt;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_stored_image_fmt);
 
 void avd_reset_coded_fmt(struct avd_ctx *ctx)
 {
@@ -693,11 +749,12 @@ static int avd_s_output_fmt(struct file *file, void *priv,
 	 * selected codec, so reset it to default just to be safe and
 	 * keep internal driver state sane. User is mandated to set
 	 * the decoded format again after we return, so we don't need
-	 * anything smarter.
+	 * anything smarter. The default follows the format controls the
+	 * codec already holds, which may have been set before this.
 	 *
 	 * Note that this will propagates any size changes to the decoded format.
 	 */
-	ctx->image_fmt = AVD_IMG_FMT_ANY;
+	ctx->image_fmt = avd_stored_image_fmt(ctx, desc);
 	avd_reset_decoded_fmt(ctx);
 
 	/* Propagate colorspace information to capture. */
