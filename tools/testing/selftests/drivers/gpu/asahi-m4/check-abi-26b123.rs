@@ -32,6 +32,8 @@ use fw::initdata::{self as wire, id};
 use fw::work::{compute, fs, ta};
 
 const HOST: u64 = wire::HOST_START;
+/// The AON temperature-source table object (test-abi-26b123.py's `AON_VA`).
+const AON_VA: u64 = HOST + 0xb000000;
 
 /// An eleven-row (J773g-sized) table so the encoder fills every performance row.
 fn input() -> wire::Input {
@@ -65,22 +67,35 @@ fn input() -> wire::Input {
         lower_parameter: wire::BOOTSTRAP_START + 0x240000,
         ktrace_mask: 0x12345678,
         progress_recovery: 1,
+        aon_table: 0,
     }
 }
 
-fn initdata(layout: &wire::Layout, ceiling: u32) -> Result<Vec<u8>, ()> {
-    let mut buffers: [Vec<u8>; wire::OBJECT_COUNT] =
-        core::array::from_fn(|i| vec![0xa5u8; layout.object_size[i]]);
-    let mut slices = buffers.each_mut().map(|b| b.as_mut_slice());
-    // As `build`: a record the ABI has no slot for is not mapped.
+/// As `build`: a record the ABI has no slot for is not mapped, and the AON table object
+/// exists only where the ABI has one.
+fn input_for(layout: &wire::Layout) -> wire::Input {
     let mut input = input();
     for slot in 0..wire::LOADER_COUNT {
         if layout.slot(slot).is_none() {
             input.loader_va[slot] = 0;
         }
     }
-    wire::encode_for(layout, &mut slices, &input, ceiling)?;
+    if layout.aon.is_some() {
+        input.aon_table = AON_VA;
+    }
+    input
+}
+
+fn encode_input(layout: &wire::Layout, input: &wire::Input, ceiling: u32) -> Result<Vec<u8>, ()> {
+    let mut buffers: [Vec<u8>; wire::OBJECT_COUNT] =
+        core::array::from_fn(|i| vec![0xa5u8; layout.object_size[i]]);
+    let mut slices = buffers.each_mut().map(|b| b.as_mut_slice());
+    wire::encode_for(layout, &mut slices, input, ceiling)?;
     Ok(buffers.into_iter().flatten().collect())
+}
+
+fn initdata(layout: &wire::Layout, ceiling: u32) -> Result<Vec<u8>, ()> {
+    encode_input(layout, &input_for(layout), ceiling)
 }
 
 fn object<'a>(image: &'a [u8], layout: &wire::Layout, object: usize) -> &'a [u8] {
@@ -304,6 +319,28 @@ fn main() {
     assert!(main[0x640 + 28 * 0x28..0x640 + 29 * 0x28].iter().all(|&b| b == 0));
     let power = object(&v26, l, id::POWER_PERFORMANCE);
     assert_eq!(r64(power, 0x3b98), input().va[id::TEMPERATURE]);
+    // The AON temperature-source table: its own object, named at power config 0x6340.
+    assert_eq!(r64(power, 0x6340), AON_VA);
+    assert!(wire::V25G83.aon.is_none());
+    let mut aon = vec![0xa5u8; wire::AON_TABLE_SIZE];
+    assert!(wire::encode_aon_table(&wire::V25G83, &mut aon).is_err());
+    assert!(wire::encode_aon_table(l, &mut aon[..wire::AON_TABLE_SIZE - 1]).is_err());
+    wire::encode_aon_table(l, &mut aon).unwrap();
+    std::fs::write(out.join("aon-26b123.bin"), &aon).unwrap();
+    // Refused: no AON object where the ABI has one, one where it has none, a misaligned or
+    // out-of-window one, and one overlapping an inventory object.
+    for (layout, va) in [
+        (l, 0),
+        (&wire::V25G83, AON_VA),
+        (l, AON_VA + 4),
+        (l, wire::HOST_END - 0x2000),
+        (l, input().va[id::MAIN] + 0x1000),
+        (l, input().va[id::POWER_PERFORMANCE] - 0x2000),
+    ] {
+        let mut i = input_for(layout);
+        i.aon_table = va;
+        assert!(encode_input(layout, &i, 10).is_err(), "AON table at {va:#x}");
+    }
     std::fs::write(out.join("initdata-25g83.bin"), &v25).unwrap();
     std::fs::write(out.join("initdata-26b123.bin"), &v26).unwrap();
     render(&out);

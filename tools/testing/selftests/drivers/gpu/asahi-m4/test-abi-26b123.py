@@ -66,8 +66,17 @@ POWER_MAP = [(0x3b50, 0x3b98, 8)] + fields([
     (0x2210, 0x2220), (0x22b0, 0x22c0), (0x22b4, 0x22c4), (0x22f8, 0x2308), (0x279e, 0x27ae),
     (0x2870, 0x2880), (0x2a3c, 0x2a64), (0x2b84, 0x2bac), (0x2b88, 0x2bb0), (0x2b8c, 0x2bb4),
     (0x2bcc, 0x2bf4), (0x2c40, 0x2c68), (0x2c44, 0x2c6c), (0x2c88, 0x2cb0)])
-# Words new in 26B123 that the host writes: the u64 crash copy buffer size at HW data 0xfa8.
-NEW_26B123 = {MAIN: [(0xfa8, 0x8000)]}
+# macOS 27.2's AON temperature-source table (power config 0x6340 points at it): a page of its
+# own holding five {key, u32, u32} rows, the rest zero.
+AON_VA = 0xfffffc2000000000 + 0xb000000  # check-abi-26b123.rs's AON_VA
+AON_TABLE = (b'BE0g' + struct.pack('<II', 0x00260001, 0x0000ff01)
+             + b'LE0g' + struct.pack('<II', 0x00240001, 0x0000ff01)
+             + b'RT0g' + struct.pack('<II', 0x00280001, 0x00001401)
+             + b'0t0g' + struct.pack('<II', 0x002d0001, 0x0000ff01)
+             + b'1t0g' + struct.pack('<II', 0x002e0001, 0x0000ff01)).ljust(0x4000, b'\0')
+# Words new in 26B123 that the host writes: the u64 crash copy buffer size at HW data 0xfa8
+# and the AON table pointer at power config 0x6340.
+NEW_26B123 = {MAIN: [(0xfa8, 0x8000)], POWER_PERFORMANCE: [(0x6340, AON_VA)]}
 # macOS 27.2 J773g InitData (hv25): {object: [(offset, count, u32)]}, `count` consecutive words.
 MACOS_27_2 = {
     3: [(0x30, 3, 0x1), (0x40, 1, 0x78), (0x58, 1, 0x28ffff), (0x5c, 1, 0xffff),
@@ -154,7 +163,9 @@ MACOS_27_2 = {
          (0x2e84, 1, 0x384), (0x2e88, 2, 0x3e8), (0x2e98, 1, 0x3e8), (0x2ecc, 1, 0x3e8),
          (0x2f0c, 1, 0x42c80000), (0x2f28, 1, 0x6958), (0x2f30, 1, 0x7d), (0x2f34, 1, 0x1),
          (0x3ba0, 1, 0x6b79), (0x3ba8, 1, 0x1), (0x5bac, 1, 0x4159999a), (0x5bb0, 1, 0x41000000),
-         (0x6348, 1, 0x67305452), (0x6388, 1, 0x1), (0x63f0, 1, 0x1), (0x6ac8, 1, 0x1)],
+         (0x6348, 1, 0x67305452), (0x6388, 1, 0x1), (0x63f0, 1, 0x1), (0x6ac8, 1, 0x1),
+         (0x63b0, 1, 0x67307430), (0x63b4, 1, 0x67307431), (0x63b8, 1, 0x67304542),
+         (0x63bc, 1, 0x6730454c), (0x63c0, 1, 0xf)],
 }
 # Unaligned and byte-wide macOS words: (object, offset, bytes).
 MACOS_27_2_BYTES = [(MAIN, 0x277e, (1).to_bytes(4, 'little')), (MAIN, 0x2782, b'\x01'),
@@ -327,6 +338,8 @@ def main():
         diff = next((i for i, (a, b) in enumerate(zip(new, wanted)) if a != b), None)
         assert diff is None, f'{name}: 26B123 byte {diff:#x} is {new[diff]:#x}, oracle {wanted[diff]:#x}'
         checked += len(new)
+    assert (out / 'aon-26b123.bin').read_bytes() == AON_TABLE, 'AON table'
+    checked += len(AON_TABLE)
     queue = (out / 'queue.bin').read_bytes()
     assert queue[0xb4:] == expect_queue(queue[:0xb4]), 'queue info'
     checked += 0xb4

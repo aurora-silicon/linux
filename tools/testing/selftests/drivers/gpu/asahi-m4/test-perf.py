@@ -56,6 +56,7 @@ fn input(performance: wire::Performance) -> wire::Input {
         loader_va: core::array::from_fn(|i| if wire::LOADERS[i].length==0 {0} else {HOST+0x5000000+i as u64*0x100000+(wire::LOADERS[i].pa&0x3fff)}),
         scratch: HOST+0xa000000, lower_uma: wire::BOOTSTRAP_START,
         lower_parameter: wire::BOOTSTRAP_START+0x8000, ktrace_mask:0, progress_recovery:1,
+        aon_table: 0,
     }
 }
 fn encode(performance: wire::Performance) -> Result<[Vec<u8>; wire::OBJECT_COUNT], ()> {

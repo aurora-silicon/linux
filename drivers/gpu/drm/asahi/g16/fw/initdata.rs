@@ -138,7 +138,21 @@ pub(crate) struct Layout {
     pub(crate) auxiliary_dvfs: bool,
     /// Literal words of this build at their own offsets, stored after everything else.
     pub(crate) policy: &'static [Fill],
+    /// The power config's AON temperature-source table, where this build has one.
+    pub(crate) aon: Option<Aon>,
 }
+
+/// An AON temperature-source table: `records` {key, u32, u32} rows from the start of a host
+/// object of [`AON_TABLE_SIZE`] zeroed bytes, whose VA ([`Input::aon_table`]) the power config
+/// holds at `pointer` (u64). Each key is a big-endian four-character code.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Aon {
+    pub(crate) pointer: usize,
+    pub(crate) records: &'static [[u32; 3]],
+}
+
+/// Size of the AON temperature-source table object: a page of its own, as macOS 27.2 gives it.
+pub(crate) const AON_TABLE_SIZE: usize = 0x4000;
 
 /// Where the RETENTION object (0x4000 zeroed bytes) is published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,6 +285,7 @@ pub(crate) const V25G83: Layout = Layout {
     retention: Retention::Main,
     auxiliary_dvfs: false,
     policy: &[],
+    aon: None,
 };
 
 /// The 26B123 InitData ABI (macOS 27.2): the same 31 objects and pointers, with
@@ -284,8 +299,9 @@ pub(crate) const V25G83: Layout = Layout {
 ///   0x6318 (positions inferred from the T6041 build of this firmware);
 /// - FirmwareData words 0x1e0 bytes later (a table was inserted before them);
 /// - POWER grown to 0x694 bytes;
-/// - and the words macOS 27.2 fills in RUNTIME, GLOBALS, POWER, MAIN and POWER_PERFORMANCE
-///   (`POLICY_26B123`).
+/// - the words macOS 27.2 fills in RUNTIME, GLOBALS, POWER, MAIN and POWER_PERFORMANCE
+///   (`POLICY_26B123`);
+/// - and the AON temperature-source table that power config 0x6340 names (`AON_26B123`).
 pub(crate) const V26B123: Layout = Layout {
     name: "26B123",
     version: 0x0c8a836f039204b8,
@@ -330,6 +346,10 @@ pub(crate) const V26B123: Layout = Layout {
     retention: Retention::Runtime(0x2c8),
     auxiliary_dvfs: true,
     policy: POLICY_26B123,
+    aon: Some(Aon {
+        pointer: 0x6340,
+        records: AON_26B123,
+    }),
 };
 
 const G: usize = id::GLOBALS;
@@ -462,8 +482,23 @@ const POLICY_26B123: &[Fill] = &[
     w32(P, 0x2f28, 0x6958), w32(P, 0x2f30, 0x7d), w32(P, 0x2f34, 0x1), w32(P, 0x3ba0, 0x6b79),
     w32(P, 0x3ba8, 0x1), w32(P, 0x5bac, 0x4159999a), w32(P, 0x5bb0, 0x41000000),
     w32(P, 0x6348, 0x67305452), w32(P, 0x6388, 0x1), w32(P, 0x63f0, 0x1), w32(P, 0x6ac8, 0x1),
+    // The four keys after the AON table pointer (g0t0, g0t1, g0EB, g0EL), and 0x63c0 = 15,
+    // which looks like their mask, as 0x6388 = 1 is for the one key at 0x6348 (g0TR).
+    w32(P, 0x63b0, 0x67307430), w32(P, 0x63b4, 0x67307431), w32(P, 0x63b8, 0x67304542),
+    w32(P, 0x63bc, 0x6730454c), w32(P, 0x63c0, 0xf),
     // RUNTIME (main config).
     w8(R, 0x3d8, 0xff),
+];
+
+/// The J773g AON temperature sources, as macOS 27.2 publishes them through power config 0x6340
+/// (our hv25 capture: a page of its own holding these five rows, the rest zero, unchanged in
+/// the later hv29 snapshots). Test kit: this board's values.
+const AON_26B123: &[[u32; 3]] = &[
+    [u32::from_be_bytes(*b"g0EB"), 0x0026_0001, 0x0000_ff01],
+    [u32::from_be_bytes(*b"g0EL"), 0x0024_0001, 0x0000_ff01],
+    [u32::from_be_bytes(*b"g0TR"), 0x0028_0001, 0x0000_1401],
+    [u32::from_be_bytes(*b"g0t0"), 0x002d_0001, 0x0000_ff01],
+    [u32::from_be_bytes(*b"g0t1"), 0x002e_0001, 0x0000_ff01],
 ];
 
 /// Runs are ordered, disjoint and land inside an object of `size` bytes.
@@ -481,8 +516,8 @@ const fn runs_fit(runs: &[Run], size: usize) -> bool {
     true
 }
 
-/// Every fill lands inside its object, and the RUNTIME retention table pointer is clear of the
-/// power-config pointer.
+/// Every fill lands inside its object and clear of the AON table pointer, the AON table fits
+/// its object, and the RUNTIME retention table pointer is clear of the power-config pointer.
 const fn fills_fit(layout: &Layout) -> bool {
     let mut i = 0;
     while i < layout.policy.len() {
@@ -494,7 +529,23 @@ const fn fills_fit(layout: &Layout) -> bool {
         {
             return false;
         }
+        if let Some(aon) = layout.aon {
+            if f.object == id::POWER_PERFORMANCE
+                && f.at < aon.pointer + 8
+                && aon.pointer < f.at + f.width * f.count
+            {
+                return false;
+            }
+        }
         i += 1;
+    }
+    if let Some(aon) = layout.aon {
+        if aon.pointer % 8 != 0
+            || aon.pointer + 8 > layout.object_size[id::POWER_PERFORMANCE]
+            || aon.records.len() * 12 > AON_TABLE_SIZE
+        {
+            return false;
+        }
     }
     match layout.retention {
         Retention::Main => true,
@@ -825,6 +876,9 @@ pub(crate) struct Input {
     pub(crate) lower_parameter: u64,
     pub(crate) ktrace_mask: u32,
     pub(crate) progress_recovery: u32,
+    /// VA of the AON temperature-source table object ([`AON_TABLE_SIZE`] bytes) when the layout
+    /// has one ([`Layout::aon`]), else 0.
+    pub(crate) aon_table: u64,
     pub(crate) performance: Performance,
 }
 
@@ -904,6 +958,20 @@ pub(crate) fn encode_channel(
     put64(out, 0x18, ring)
 }
 
+/// Encodes `layout`'s AON temperature-source table: the object whose VA is
+/// [`Input::aon_table`]. Refused for a layout without one.
+pub(crate) fn encode_aon_table(layout: &Layout, out: &mut [u8]) -> Result<(), ()> {
+    let aon = layout.aon.ok_or(())?;
+    let out = out.get_mut(..AON_TABLE_SIZE).ok_or(())?;
+    out.fill(0);
+    for (i, record) in aon.records.iter().enumerate() {
+        for (k, &word) in record.iter().enumerate() {
+            put32(out, i * 12 + k * 4, word)?;
+        }
+    }
+    Ok(())
+}
+
 /// Encodes the complete private 31-object 25G83 graph, byte-for-byte matching the
 /// working M4 C encoder. No mapping or publication is performed here.
 pub(crate) fn encode(
@@ -937,6 +1005,19 @@ pub(crate) fn encode_for(
         if obj.len() < size[i] {
             return Err(());
         }
+    }
+    // The AON table is its own host object, clear of every inventory object.
+    let aon = input.aon_table;
+    if layout.aon.is_some() {
+        let end = aon.saturating_add(AON_TABLE_SIZE as u64);
+        if !object_va(aon, AON_TABLE_SIZE)
+            || (0..OBJECT_COUNT)
+                .any(|i| aon < input.va[i].saturating_add(size[i] as u64) && input.va[i] < end)
+        {
+            return Err(());
+        }
+    } else if aon != 0 {
+        return Err(());
     }
     encode_root_for(layout, objects[id::ROOT], &input.va)?;
     for i in 1..OBJECT_COUNT {
@@ -1100,6 +1181,9 @@ pub(crate) fn encode_for(
     let runs = layout.power_performance;
     let p = &mut objects[id::POWER_PERFORMANCE];
     put64(p, remap(runs, 0x3b50, 8)?, input.va[id::TEMPERATURE])?;
+    if let Some(aon) = layout.aon {
+        put64(p, aon.pointer, input.aon_table)?;
+    }
     for (at, value) in [
         (4, 200000),
         (8, 200000),

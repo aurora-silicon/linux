@@ -189,6 +189,20 @@ pub(crate) fn build(
             GFP_KERNEL,
         )?;
     }
+    // The power config's AON temperature-source table, where the ABI has one: a page of its
+    // own, uncached like the power config that names it.
+    let aon = match layout.aon {
+        Some(_) => Some(objects.alloc(Request {
+            size: wire::AON_TABLE_SIZE,
+            class: Class::Fw,
+            placement: Placement::Anywhere,
+            offset: 0,
+            client: None,
+            lower: None,
+            cpu: true,
+        })?),
+        None => None,
+    };
     let channels = Channels::alloc_submit_and_attach(
         objects,
         pair(&graph, id::DEVCTRL_STATE, id::DEVCTRL_RING),
@@ -211,6 +225,7 @@ pub(crate) fn build(
         lower_parameter: wire::BOOTSTRAP_START + 0x8000,
         ktrace_mask: 0,
         progress_recovery: 1,
+        aon_table: aon.as_ref().map_or(0, |o| o.va),
     };
     for i in 0..wire::OBJECT_COUNT {
         input.va[i] = graph[i].va;
@@ -268,6 +283,13 @@ pub(crate) fn build(
     }
     for i in 0..wire::OBJECT_COUNT {
         graph[i].write(0, &images[i])?;
+    }
+    if let Some(aon) = aon {
+        let mut image = KVVec::from_elem(0u8, wire::AON_TABLE_SIZE, GFP_KERNEL)?;
+        wire::encode_aon_table(layout, &mut image).map_err(|()| EINVAL)?;
+        aon.write(0, &image)?;
+        // Retained with the inventory, after its 31 objects.
+        graph.push(aon, GFP_KERNEL)?;
     }
 
     dev_info!(
