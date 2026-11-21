@@ -745,8 +745,10 @@ static int command_control(struct centauri_wifi *wifi, u32 id, const void *paylo
 		return -EBUSY;
 	if (size + 24 > BUFFER_SIZE)
 		return -EMSGSIZE;
-	if ((slot + 1) % ring_size[1] == index_read(wifi, 1, 1))
+	if ((slot + 1) % ring_size[1] == index_read(wifi, 1, 1)) {
+		centauri_recovery_request(wifi->control, "command ring full");
 		return -ENOSPC;
+	}
 	packet = wifi->a.window + TX_BUFFER + slot * BUFFER_SIZE;
 	memset(packet, 0, 24 + size);
 	put_unaligned_le16(24 + size, packet + 0x10);
@@ -766,8 +768,10 @@ static int command_control(struct centauri_wifi *wifi, u32 id, const void *paylo
 	writel(1, wifi->a.bar + 0x1004);
 	do {
 		drain_control(wifi, pm_command);
-		if (readl(wifi->a.bar + 8) != 2)
+		if (readl(wifi->a.bar + 8) != 2) {
+			centauri_recovery_request(wifi->control, "command: Alpha stage");
 			return -EIO;
+		}
 		/* Bit 30 is more-data-pending, not part of the command identity.
 		 * Scan/connect replies set it before their later completion event.
 		 */
@@ -782,7 +786,24 @@ static int command_control(struct centauri_wifi *wifi, u32 id, const void *paylo
 		usleep_range(500, 1000);
 	} while (time_before(jiffies, deadline));
 	dev_err(&wifi->control->pdev->dev, "Wi-Fi command %#x timed out (rx=%u)\n", id, wifi->rx_seen[2]);
+	centauri_recovery_request(wifi->control, "command timeout");
 	return -ETIMEDOUT;
+}
+
+/*
+ * The firmware has stopped: Alpha left execution stage 2, or the command ring stays full
+ * (a running firmware drains each command before the next is queued). Not while the
+ * transport is paused for a system sleep.
+ */
+bool centauri_wifi_stalled(struct centauri *c)
+{
+	struct centauri_wifi *wifi = c->wifi;
+
+	if (!wifi || READ_ONCE(wifi->transport_paused) || READ_ONCE(wifi->stopping))
+		return false;
+	if (readl(wifi->a.bar + 8) != 2)
+		return true;
+	return (READ_ONCE(wifi->command_head) + 1) % ring_size[1] == index_read(wifi, 1, 1);
 }
 
 static int command(struct centauri_wifi *wifi, u32 id, const void *payload, size_t size)
@@ -955,6 +976,7 @@ static void scan_worker(struct work_struct *work)
 		do {
 			drain(wifi);
 			if (readl(wifi->a.bar + 8) != 2) {
+				centauri_recovery_request(wifi->control, "scan: Alpha stage");
 				ret = -EIO;
 				break;
 			}
