@@ -52,8 +52,8 @@
 
 #define APPLE_ANS_BOOT_TIMEOUT	  USEC_PER_SEC
 #define APPLE_ANS_SLEEP_SHN_TIMEOUT USEC_PER_SEC
-/* RTKit handshake timeout for the T6050 ANS, see apple_nvme_alloc() */
-#define APPLE_NVME_T6050_HANDSHAKE_TIMEOUT_MS 10000
+/* RTKit handshake timeout for ANS, see apple_nvme_alloc() */
+#define APPLE_NVME_HANDSHAKE_TIMEOUT_MS 10000
 
 #define APPLE_ANS_COPROC_CPU_CONTROL	 0x44
 #define APPLE_ANS_COPROC_CPU_CONTROL_RUN BIT(4)
@@ -2737,12 +2737,12 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	}
 
 	/*
-	 * The T6050 ANS firmware handed over by iBoot can take about 3 s to
-	 * answer the power-state and endpoint-map handshake.
+	 * The ANS firmware handed over by iBoot can take about 3 s to answer
+	 * the power-state and endpoint-map handshake (seen on T6050). A wait
+	 * ends as soon as the reply arrives, so the longer limit only delays
+	 * reporting an ANS that never answers.
 	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t6050-nvme-ans2"))
-		apple_rtkit_set_handshake_timeout(anv->rtk,
-						  APPLE_NVME_T6050_HANDSHAKE_TIMEOUT_MS);
+	apple_rtkit_set_handshake_timeout(anv->rtk, APPLE_NVME_HANDSHAKE_TIMEOUT_MS);
 
 	ret = devm_add_action_or_reset(dev, apple_nvme_free_rtkit, anv);
 	if (ret)
@@ -2968,8 +2968,11 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 	}
 }
 
-/* macOS sees the firmware report on 68 ms after HELLO. Each try waits RTKit's timeout again. */
-#define APPLE_NVME_SLEEP_ON_TRIES	15
+/*
+ * macOS sees the firmware report on 68 ms after HELLO. Each try waits up to RTKit's
+ * handshake timeout; stop trying once this long has passed since the run bit.
+ */
+#define APPLE_NVME_SLEEP_ON_MS	15000
 
 /*
  * After a real sleep ANS has lost power, and its resident firmware restarts once the run bit
@@ -3021,7 +3024,7 @@ static int apple_nvme_resume_early(struct device *dev)
 static bool apple_nvme_sleep_wait_on(struct apple_nvme *anv)
 {
 	void __iomem *control = anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL;
-	int ret, tries = 0;
+	int ret;
 
 	do {
 		ret = apple_rtkit_boot(anv->rtk);
@@ -3029,7 +3032,7 @@ static bool apple_nvme_sleep_wait_on(struct apple_nvme *anv)
 			break;
 		dev_warn(anv->dev, "ANS: not on %lld ms after the run bit, waiting again\n",
 			 ktime_ms_delta(ktime_get(), anv->sleep_run_time));
-	} while (++tries < APPLE_NVME_SLEEP_ON_TRIES);
+	} while (ktime_ms_delta(ktime_get(), anv->sleep_run_time) < APPLE_NVME_SLEEP_ON_MS);
 
 	WRITE_ONCE(anv->sleep_restarting, false);
 	if (ret) {
