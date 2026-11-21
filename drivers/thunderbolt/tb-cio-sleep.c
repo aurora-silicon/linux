@@ -11,8 +11,9 @@ static int tb_cio_check_topology(struct tb_switch *sw, bool wake)
 	if (sw->is_unplugged || !sw->uid)
 		return -ENODEV;
 	tb_switch_for_each_port(sw, port) {
+		/* Released for the sleep, see tb_cio_release_xdomains(). */
 		if (port->xdomain)
-			return -EOPNOTSUPP;
+			continue;
 		if (!tb_port_has_remote(port))
 			continue;
 		/* After a wake, a router lost in the sleep is retired at complete. */
@@ -23,6 +24,34 @@ static int tb_cio_check_topology(struct tb_switch *sw, bool wake)
 			return ret;
 	}
 	return 0;
+}
+
+/*
+ * A host at the other end of a link (an XDomain, such as a host-to-host cable to another
+ * Mac) owns its half of it, which the router's power cycle cannot keep: release it as an
+ * unplug does, its service drivers and paths with it. The wake's rescan finds it again.
+ */
+static void tb_cio_release_xdomains(struct tb *tb, struct tb_switch *sw)
+{
+	struct tb_port *port;
+
+	tb_switch_for_each_port(sw, port) {
+		if (tb_is_upstream_port(port))
+			continue;
+		if (port->xdomain) {
+			struct tb_xdomain *xd = tb_xdomain_get(port->xdomain);
+
+			tb_port_dbg(port, "xdomain released for the sleep\n");
+			xd->is_unplugged = true;
+			tb_xdomain_remove(xd);
+			port->xdomain = NULL;
+			__tb_disconnect_xdomain_paths(tb, xd, -1, -1, -1, -1);
+			tb_xdomain_put(xd);
+			tb_port_unconfigure_xdomain(port);
+		} else if (tb_port_has_remote(port)) {
+			tb_cio_release_xdomains(tb, port->remote->sw);
+		}
+	}
 }
 
 int tb_cio_sleep_prepare(struct tb *tb)
@@ -56,6 +85,8 @@ int tb_cio_sleep_prepare(struct tb *tb)
 		if (ret)
 			goto out;
 	}
+	/* Past the last refusal here: a later one's complete rescans, and finds them again. */
+	tb_cio_release_xdomains(tb, tb->root_switch);
 	tcm->hotplug_active = false;
 	tcm->cio_prepared = true;
 	/*
