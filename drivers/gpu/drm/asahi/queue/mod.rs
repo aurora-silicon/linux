@@ -179,6 +179,13 @@ pub(crate) trait Queue: Send + Sync {
         Err(EINVAL)
     }
 
+    /// Lets submissions with output syncs return once accepted
+    /// (DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT). Only queues of GPUs that advertise
+    /// DRM_ASAHI_FEATURE_ASYNC_SUBMIT take it.
+    fn set_async_submit(&mut self) -> Result {
+        Err(EINVAL)
+    }
+
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
         if layouts != [0; 2] {
             return Err(EINVAL);
