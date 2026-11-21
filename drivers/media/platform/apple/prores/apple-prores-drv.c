@@ -24,6 +24,7 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
+#include <linux/hrtimer.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
@@ -61,6 +62,8 @@
 #define APR_MAX_PIXELS		0x10000000
 #define APR_TIMEOUT_MS		1000
 #define APR_POLL_MS		4
+/* Completion poll for an engine whose interrupt never arrives. */
+#define APR_FAST_POLL_US	100
 #define APR_AUTOSUSPEND_MS	500
 
 struct apr_fmt {
@@ -1187,6 +1190,8 @@ struct apr_dev {
 	bool resetting;		/* the watchdog is resetting the engine */
 	unsigned long progress;	/* jiffies of the last start or completion */
 	struct delayed_work watchdog;
+	bool irq_missing;	/* a job finished without its interrupt */
+	struct hrtimer poll;	/* completion poll while irq_missing */
 
 	atomic_t outstanding;	/* jobs not yet given back to vb2 */
 	wait_queue_head_t idle_wq;	/* woken when jobs are given back */
@@ -1616,15 +1621,20 @@ static struct apr_ctx *apr_take_held(struct apr_dev *apr)
 	return ctx;
 }
 
-static irqreturn_t apr_irq(int irq, void *data)
+/*
+ * Give back the jobs the engine has finished. Runs in hard interrupt context,
+ * from apr_irq() and from the completion poll. Returns whether the engine
+ * raised anything.
+ */
+static bool apr_service(struct apr_dev *apr)
 {
-	struct apr_dev *apr = data;
 	struct apr_job done[APR_MAX_INFLIGHT];
 	struct apr_ctx *held = NULL;
+	unsigned long flags;
 	unsigned int n = 0;
 	bool handled = false, hung;
 
-	spin_lock(&apr->hw_lock);
+	spin_lock_irqsave(&apr->hw_lock, flags);
 	/* Registers are only reachable while the engine is powered. */
 	if (apr->ring_ready)
 		handled = apr_take_done(apr, done, &n);
@@ -1632,13 +1642,35 @@ static irqreturn_t apr_irq(int irq, void *data)
 	hung = apr->hung;
 	if (!apr->njobs)
 		cancel_delayed_work(&apr->watchdog);
-	spin_unlock(&apr->hw_lock);
+	else if (apr->irq_missing && !hung)
+		hrtimer_start(&apr->poll, us_to_ktime(APR_FAST_POLL_US),
+			      HRTIMER_MODE_REL);
+	spin_unlock_irqrestore(&apr->hw_lock, flags);
 	if (hung)
 		mod_delayed_work(system_wq, &apr->watchdog, 0);
 	apr_retire(apr, done, n);
 	if (held)
 		v4l2_m2m_job_finish(apr->m2m_dev, held->fh.m2m_ctx);
-	return handled ? IRQ_HANDLED : IRQ_NONE;
+	return handled;
+}
+
+static irqreturn_t apr_irq(int irq, void *data)
+{
+	return apr_service(data) ? IRQ_HANDLED : IRQ_NONE;
+}
+
+/*
+ * Completion poll for an engine that finished a job without its interrupt,
+ * so it is not held to the watchdog's jiffy-granular poll. The interrupt
+ * stays requested and is served the same way when it does arrive. Every arm
+ * of the timer is an hrtimer_start() under hw_lock (here through
+ * apr_service()), so the timer is never forwarded while someone else has
+ * just started it.
+ */
+static enum hrtimer_restart apr_poll(struct hrtimer *t)
+{
+	apr_service(container_of(t, struct apr_dev, poll));
+	return HRTIMER_NORESTART;
 }
 
 /*
@@ -1660,15 +1692,25 @@ static void apr_watchdog(struct work_struct *work)
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		return;
 	}
-	if (apr->ring_ready && apr_take_done(apr, done, &n) && n)
-		dev_warn_once(apr->dev, "completion found without an interrupt\n");
+	if (apr->ring_ready && apr_take_done(apr, done, &n) && n &&
+	    !apr->irq_missing) {
+		apr->irq_missing = true;
+		dev_warn(apr->dev,
+			 "completion found without an interrupt, polling every %u us\n",
+			 APR_FAST_POLL_US);
+	}
 	if (!apr->hung && (!apr->njobs ||
 			   time_before(jiffies, apr->progress +
 				       msecs_to_jiffies(APR_TIMEOUT_MS)))) {
 		held = apr_take_held(apr);
-		if (apr->njobs)
+		if (apr->njobs) {
 			schedule_delayed_work(&apr->watchdog,
 					      msecs_to_jiffies(APR_POLL_MS));
+			if (apr->irq_missing)
+				hrtimer_start(&apr->poll,
+					      us_to_ktime(APR_FAST_POLL_US),
+					      HRTIMER_MODE_REL);
+		}
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		apr_retire(apr, done, n);
 		if (held)
@@ -1834,6 +1876,9 @@ static void apr_device_run(void *priv)
 	if (hold)
 		apr->held = ctx;
 	schedule_delayed_work(&apr->watchdog, msecs_to_jiffies(APR_POLL_MS));
+	if (apr->irq_missing)
+		hrtimer_start(&apr->poll, us_to_ktime(APR_FAST_POLL_US),
+			      HRTIMER_MODE_REL);
 	spin_unlock_irqrestore(&apr->hw_lock, flags);
 	if (!hold)
 		v4l2_m2m_job_finish(apr->m2m_dev, m2m);
@@ -2591,7 +2636,10 @@ static void apr_cleanup(void *data)
 {
 	struct apr_dev *apr = data;
 
+	/* Each can start the other; nothing is in flight by now. */
+	hrtimer_cancel(&apr->poll);
 	cancel_delayed_work_sync(&apr->watchdog);
+	hrtimer_cancel(&apr->poll);
 	if (apr->m2m_dev)
 		v4l2_m2m_release(apr->m2m_dev);
 	v4l2_device_unregister(&apr->v4l2_dev);
@@ -2675,6 +2723,7 @@ static int apr_probe(struct platform_device *pdev)
 	mutex_init(&apr->vdev_lock);
 	spin_lock_init(&apr->hw_lock);
 	INIT_DELAYED_WORK(&apr->watchdog, apr_watchdog);
+	hrtimer_setup(&apr->poll, apr_poll, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	init_waitqueue_head(&apr->idle_wq);
 	/* The ring always has room for every job the driver keeps in flight. */
 	BUILD_BUG_ON(APR_MAX_INFLIGHT * APR_ENCODE_DESC_BYTES >= APR_RING_BYTES);
