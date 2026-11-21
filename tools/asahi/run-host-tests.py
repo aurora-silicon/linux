@@ -110,6 +110,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('m1-layout', 'cycles-anywhere', 'expose-8-9', 'flags-in-event'), []),
     'apple-dart-dapf-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('missing-guard', 'ignore-replay', 'ignore-orphan'), out()),
+    'apple-dart-dcp-placeholder-tests.py': [([], PASS), (['--keep-placeholders'], KILL)],
     'apple-dart-fw-tests.py': [(out(), PASS)],
     'apple-dart-fw-harness-tests.py': [([], PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
