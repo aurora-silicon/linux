@@ -274,6 +274,10 @@ static void __attribute__((unused)) typec_unregister_altmode(void *a)
 #define typec_set_orientation(...) ((void)0)
 #define typec_set_data_role(...) ((void)0)
 #define power_supply_changed(...) ((void)0)
+/* J714s only (tipd_boot_power_on()): this fixture's machine never keeps the boot power state. */
+static void __attribute__((unused)) tipd_boot_host_started(struct tps6598x *t, enum usb_role r)
+{ (void)t; (void)r; }
+static void __attribute__((unused)) tipd_boot_order_done(struct tps6598x *t) { (void)t; }
 '''
     tests = r'''
 static int failures, checks;
@@ -520,6 +524,11 @@ static void __attribute__((unused)) dcp_relink_link_up(int *s, u64 generation, u
  CHECK(!roles && port.pm.phase == CD321X_PM_REVALIDATE);
  CHECK(sink.connected && !notices && !port.display_route_active);
 ''')
+    # The J714s's macOS USBw after an attach is a port controller command, not part of these
+    # display scenarios: the update calls it, and here it does nothing.
+    if 'cd321x_macos_usbw(cd321x);' in funcs:
+        shim += ('\nstruct cd321x;\n'
+                 'static void cd321x_macos_usbw(struct cd321x *cd321x) { (void)cd321x; }\n')
     # How long a held mux has been retried is measured on the driver's clock.
     if 'jiffies_to_msecs(jiffies)' in funcs:
         shim += ('\nstatic unsigned long jiffies;\n'
@@ -1221,7 +1230,10 @@ struct device_node { bool named; unsigned count; };
 struct device { struct device_node *of_node; };
 struct platform_device { struct device dev; int num_resources; struct resource resources[10]; };
 #define to_platform_device(d) ((struct platform_device *)(d))
+/* Resource-profile tests carry, but never dereference, the sleep layout. */
+static const unsigned dcp_s2r_t8140;
 struct apple_dcp_hw_data {
+    const void *s2r_layout;
     unsigned num_dptx_ports; bool adopt_live_session;
     int iomfb_method_profile,firmware_compat;
     const struct resource *firmware_clock;
@@ -1439,7 +1451,8 @@ def readiness(root):
     # The T8122 dcpext wrapper moved the pipe's probe into dcp_platform_probe_pipe().
     probe = function(dcp, 'static int dcp_platform_probe_pipe(' if 'static int dcp_platform_probe_pipe(' in dcp
                      else 'static int dcp_platform_probe(')
-    publish = probe[probe.rindex('\tif (dcp->hw.iomfb_method_profile ==\n\t    DCP_IOMFB_METHODS_H17P_EXTERNAL) {'):]
+    publish_marker = '\tif (dcp_is_retained_external(dcp)) {' if 'dcp_is_retained_external(dcp)' in probe else '\tif (dcp->hw.iomfb_method_profile ==\n\t    DCP_IOMFB_METHODS_H17P_EXTERNAL) {'
+    publish = probe[probe.rindex(publish_marker):]
     # Which processor must come up before the boot framebuffer is taken over.
     header = root / 'drivers/gpu/drm/apple/apple_boot_display.h'
     boot_display = ''

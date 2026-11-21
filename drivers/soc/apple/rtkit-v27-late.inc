@@ -36,7 +36,7 @@ int apple_rtkit_v27_disarm(struct apple_rtkit_v27_scope *s, bool stopped)
 	 * accepted packet just because precommit admission had to refuse.
 	 */
 	while (kfifo_get(&s->deferred, &msg))
-		apple_rtkit_rx_dispatch(rtk, msg.msg1, msg.msg0, false);
+		apple_rtkit_rx_dispatch(rtk, msg.msg1, msg.msg0, false, 0);
 	apple_mbox_release_rx(rtk->mbox);
 	module_put(s->provider_module);
 	put_device(rtk->mbox->dev);

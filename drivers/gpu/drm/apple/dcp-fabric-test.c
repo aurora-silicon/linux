@@ -2447,6 +2447,32 @@ static void relink_unplug_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 7, relink_ms(t, 62000)));
 }
 
+/*
+ * A sink attached while the outputs were off gets its link trained at the
+ * CRTC's first enable, minutes later: the window starts there, and the
+ * attachment keeps its retries.
+ */
+static void relink_first_enable_test(struct kunit *test)
+{
+	unsigned long t = 100000;
+	struct dcp_relink_state s;
+	unsigned int i;
+
+	relink_fresh(&s, 5, t);
+	KUNIT_EXPECT_FALSE(test, dcp_relink_unplug(&s, 5, relink_ms(t, 137000)));
+	dcp_relink_link_up(&s, 5, relink_ms(t, 135000));
+	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 5, relink_ms(t, 137000)));
+	dcp_relink_end(&s);
+
+	/* no fresh budget: unlike a DPMS wake, the enable does not reset it */
+	for (i = s.tries; i < DCP_RELINK_RETRIES; i++) {
+		KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 5, relink_ms(t, 137000)));
+		dcp_relink_end(&s);
+	}
+	dcp_relink_link_up(&s, 5, relink_ms(t, 200000));
+	KUNIT_EXPECT_FALSE(test, dcp_relink_unplug(&s, 5, relink_ms(t, 201000)));
+}
+
 /* One relink at a time; the replay keeps the retries of its attachment. */
 static void relink_running_test(struct kunit *test)
 {
@@ -2623,6 +2649,7 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(fabric_t8132_clock_refused_test),
 	KUNIT_CASE(fabric_t6050_merged_limit_test),
 	KUNIT_CASE(relink_unplug_test),
+	KUNIT_CASE(relink_first_enable_test),
 	KUNIT_CASE(relink_running_test),
 	KUNIT_CASE(relink_budget_test),
 	KUNIT_CASE(relink_disabled_test),

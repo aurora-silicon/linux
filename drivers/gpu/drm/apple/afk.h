@@ -241,6 +241,23 @@ static inline void afk_service_retire(struct apple_epic_service *service)
 	spin_unlock_irqrestore(&service->lock, flags);
 }
 
+/*
+ * Retire @service only if it still serves @channel; a singleton slot reused
+ * in place for a later announcement keeps its new channel enabled.
+ */
+static inline void afk_service_retire_channel(struct apple_epic_service *service,
+					      u32 channel)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&service->lock, flags);
+	if (service->channel == channel) {
+		service->enabled = false;
+		service->torndown = true;
+	}
+	spin_unlock_irqrestore(&service->lock, flags);
+}
+
 static inline bool afk_service_matches(struct apple_epic_service *service,
 				       u32 channel)
 {
@@ -527,6 +544,8 @@ struct apple_dcp_afkep {
 	void *bfr;
 	u16 bfr_tag;
 	size_t bfr_size;
+	size_t ext26_command_bytes;
+	unsigned int ext26_command_count;
 	dma_addr_t bfr_dma;
 
 	struct afk_ringbuffer txbfr;
@@ -593,6 +612,7 @@ static inline void afk_ep_init_state(struct apple_dcp_afkep *ep)
 
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops);
+bool afk_compact_av_capable(struct apple_dcp *dcp);
 int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
 		      void *buffer, size_t size, bool to_peer);
 int afk_start(struct apple_dcp_afkep *ep);
@@ -602,6 +622,9 @@ unsigned int afk_v27_sleep_unanswered(struct apple_dcp_afkep *ep);
 int afk_start_service(struct apple_epic_service *service);
 int afk_service_open(struct apple_epic_service *service);
 void afk_cancel_commands(struct apple_dcp_afkep *ep);
+/* A sampled host boundary, never a remote-producer or DMA fence. */
+bool afk_host_idle(struct apple_dcp_afkep *ep);
+
 bool afk_compact_orphans_wait(struct apple_dcp_afkep *ep, unsigned long timeout);
 unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep);
 bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep);

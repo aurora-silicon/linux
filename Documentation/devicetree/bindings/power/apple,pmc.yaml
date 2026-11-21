@@ -245,7 +245,9 @@ patternProperties:
       compatible:
         oneOf:
           - items:
-              - const: apple,t6050-clpc
+              - enum:
+                  - apple,t6041-max-clpc
+                  - apple,t6050-clpc
               - const: apple,t6041-clpc
           - enum:
               - apple,t6041-clpc

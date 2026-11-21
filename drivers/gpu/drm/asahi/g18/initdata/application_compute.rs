@@ -14,30 +14,18 @@ use core::sync::atomic::Ordering;
 macro_rules! app_knob {
     ($module:ident, $name:literal, $default:expr, $description:literal) => {
         mod $module {
-            use kernel::{bindings, module_param::KernelParam};
+            use kernel::bindings;
             pub(super) static VALUE: core::sync::atomic::AtomicU32 =
                 core::sync::atomic::AtomicU32::new($default);
-            #[link_section = "__param"]
-            #[used(compiler)]
-            static PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-                name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-                    kernel::c_str!($name)
-                } else { kernel::c_str!(concat!("aurora.", $name)) }),
-                // Module lifetime and parameter serialization are managed by the
-                // kernel, identically to the kernel::module! registration. A raw
-                // address avoids a reference to the mutable extern static.
-                #[cfg(MODULE)]
-                mod_: &raw mut bindings::__this_module,
-                #[cfg(not(MODULE))]
-                mod_: core::ptr::null_mut(),
+            crate::g18::params::g18_kernel_param!(
+                PARAM,
+                $name,
                 // SAFETY: exported vmlinux ops; they access `arg` as an unsigned
                 // int under the parameter lock, which AtomicU32 represents exactly.
                 ops: unsafe { core::ptr::from_ref(&bindings::param_ops_uint) },
-                perm: 0o644, level: -1, flags: 0,
-                __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 {
-                    arg: core::ptr::from_ref(&VALUE).cast_mut().cast(),
-                },
-            });
+                perm: 0o644,
+                arg: core::ptr::from_ref(&VALUE).cast_mut().cast(),
+            );
             const TYPE: &[u8] = concat!("parmtype=", $name, ":uint\0").as_bytes();
             #[link_section = ".modinfo"]
             #[used(compiler)]

@@ -4,6 +4,7 @@
 #ifndef __APPLE_DCP_INTERNAL_H__
 #define __APPLE_DCP_INTERNAL_H__
 
+#include "dcp-indicator.h"
 #include <drm/drm_mode.h>
 #include <linux/atomic.h>
 #include <linux/backlight.h>
@@ -50,6 +51,7 @@
 
 struct apple_dcp;
 struct iomfb_m4;
+struct ext26_control;
 struct apple_dcp_afkep;
 struct dcp_method_entry;
 
@@ -227,6 +229,24 @@ struct dcp_panel {
 };
 
 /*
+ * The internal display's power words for hw.s2r, see dcp_s2r_domains_off(): its domains'
+ * offsets in "ps", its retention controls in "pwrgate" (the PMGR's per-device "retention"
+ * words: flip-flops 3 off / 0 on, memories 0 off / 1 on), and the DART streams its firmware
+ * and scanout use.
+ */
+struct dcp_s2r_layout {
+	u32 disp_cpu;
+	u32 disp_fe;
+	u32 disp_sys;
+	u32 ret_ff;
+	u32 ret_mem;
+	u32 dcp_streams;
+	u32 disp_streams;
+	/* "pmc-dcp" counts the powered DCPs: T8132 and T8140 only */
+	bool pmc_dcp;
+};
+
+/*
  * Identity of a fixed internal panel, for the EDID published on its
  * connector.  Any processor with an internal panel allocates it; the boot
  * loader's ADT supplies the fallback, and firmware metadata or a raw panel
@@ -246,6 +266,7 @@ enum dcp_iomfb_method_profile {
 	DCP_IOMFB_METHODS_DEFAULT,
 	DCP_IOMFB_METHODS_H17G,
 	DCP_IOMFB_METHODS_H17P_EXTERNAL,
+	DCP_IOMFB_METHODS_J613_EXT26,
 };
 
 struct apple_dcp_hw_data {
@@ -285,6 +306,17 @@ struct apple_dcp_hw_data {
 	 */
 	bool link_report;
 	/*
+	 * The endpoint the DPTX port services are announced on, where it is not
+	 * the firmware's default (DPTX_ENDPOINT_V2 on firmware 27): the T8142
+	 * dcpext announces them on DPTX_ENDPOINT. 0: the default.
+	 */
+	u8 dptx_endpoint;
+	/*
+	 * Open the DPTX controller endpoint before the ports, as for H17P
+	 * externals: the T8142 dcpext announces AppleDCPDPTXController there.
+	 */
+	bool dptx_controller;
+	/*
 	 * With H17P firmware: a firmware-driven system sleep stops the internal processor's
 	 * firmware and powers it down, as DPMS off does, then restarts it warm, see
 	 * dcp_s2r_suspend(). @s2r_ext: the same for an external one, see dcp_s2r_ext_suspend().
@@ -296,6 +328,15 @@ struct apple_dcp_hw_data {
 	/* A firmware 27 sleep in progress, and how it ended */
 	bool v27_sleep_protocol;
 	bool v27_sleep_recovery;
+	/* Required with @s2r */
+	const struct dcp_s2r_layout *s2r_layout;
+	/* @s2r with derived power words: off unless appledrm.s2r_untested is set */
+	bool s2r_untested;
+	/*
+	 * @s2r without a secure mailbox: the SoC's ADT has no dcp-exclave-mailbox (T8142, on
+	 * firmware 27.0 and 27.2.1), so there is no secure port to idle before the IOP.
+	 */
+	bool s2r_no_secure_port;
 };
 
 enum dcp_test_point {
@@ -391,6 +432,7 @@ struct dcp_desktop_state {
 /* TODO: move IOMFB members to its own struct */
 struct dcpext_scanout;
 struct dcp_hdmi;
+struct dcp_cec;
 
 bool dcp_desktop_present_complete(struct apple_dcp *dcp, u32 id);
 void dcp_panel_metadata_replace(struct apple_dcp *dcp,
@@ -402,7 +444,23 @@ bool dcp_panel_metadata_current(struct apple_dcp *dcp, u64 generation);
 
 void dcp_s2r_dart_power(struct apple_dcp *dcp, u32 on);
 
+/* Kernel-owned software camera indicator; see dcp-indicator.c. */
+struct dcp_camera_indicator {
+	struct dcp_indicator state;
+	spinlock_t lock;
+	struct mutex ctl;
+	struct delayed_work watch;
+	struct work_struct resume;
+	struct work_struct retry;
+	unsigned long deadline;
+	struct drm_plane *plane;
+	struct drm_framebuffer *fb;
+	u32 surf;
+	bool has_surf;
+};
+
 struct apple_dcp {
+	struct dcp_camera_indicator camera_ind;
 	/* Generation-specific wire/transaction state, sharing the common KMS owner. */
 	struct iomfb_m4 *v26_6;
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
@@ -559,6 +617,41 @@ struct apple_dcp {
 
 	/* DCP has crashed */
 	bool crashed;
+	/* Native26 control/property epochs, serialized by the IOMFB owner. */
+	struct completion ext26_link_ready;
+	bool ext26_services_open;
+	bool ext26_client_open;
+	struct apple_dcp_afkep *ext26_aux[3];
+	u32 ext26_stride;
+	u64 ext26_edid_generation;
+	bool ext26_edid_tried;
+	u64 ext26_rx_ns;
+	u64 ext26_power_ns;
+	u64 ext26_generation;
+	u64 ext26_buffer_bytes;
+	bool ext26_blocked;
+	bool ext26_pm_work_off;
+	bool ext26_stopping;
+	bool ext26_blanked;
+	bool ext26_pm_preparing;
+	bool ext26_control_pending;
+	bool ext26_early_complete;
+	u32 ext26_early_id;
+	u64 ext26_early_ns;
+	u32 ext26_control_id;
+	struct ext26_control *ext26_control;
+	struct work_struct ext26_blank_work;
+	struct list_head ext26_retained;
+	u64 ext26_retained_bytes;
+	unsigned int ext26_epochs;
+	struct drm_display_mode ext26_mode;
+	DECLARE_BITMAP(ext26_released, DCP_MAX_MAPPINGS);
+	bool ext26_power_sent;
+	bool ext26_normal;
+	struct completion ext26_ready;
+	iomfb_cb_handler *ext26_handlers;
+	u8 ext26_present[0x1bd8];
+
 	/* CoreAnalytics events dumped in full (dcpep_cb_core_analytics_v27). */
 	u32 analytics_dumps;
 
@@ -722,12 +815,10 @@ struct apple_dcp {
 
 	/* A firmware-driven suspend stops the firmware, see dcp_s2r_suspend(). */
 	struct apple_dcp_afkep *sleep_v27_ep[0x20];
-	/*
-	 * Firmware 27.0 on the J714s, the board the firmware 27 sleep and what it needs of the
-	 * shared paths have run on. Every other machine on firmware 27, other T6050 boards and
-	 * T8142 included, takes the paths it took before.
-	 */
+	/* The J714s normal method table, panel services and swap profile. */
 	bool v27_j714s;
+	/* Sleep endpoint inventory and control replies; not a normal RPC profile. */
+	bool v27_sleep_transport;
 	struct dcp_v27_sleep *sleep_v27;
 	bool sleep_v27_closed;
 	/*
@@ -948,6 +1039,8 @@ struct apple_dcp {
 	u64 typec_follow_gen;
 	/* dcp_poweron() reconnects DPTX; its own modeset follows the HPD */
 	bool typec_poweron_hpd;
+	/* A Type-C CRTC enable runs: its own mode set follows, the link is not bad */
+	bool typec_enable_pending;
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
@@ -1071,6 +1164,7 @@ struct apple_dcp {
 	struct dcp_desktop_state *desktop;
 	/* Internal panel identity; NULL without an internal panel. */
 	struct dcp_panel_identity *panel_identity;
+	struct dcp_cec *cec;
 };
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
@@ -1109,6 +1203,7 @@ bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation);
 const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation,
 					 u32 *defaults);
 
+void iomfb_prepare_indicator_h17p(struct apple_dcp *dcp);
 void iomfb_scanout_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_backlight_h17p(struct apple_dcp *dcp);
 void iomfb_present_matrix_h17p(struct apple_dcp *dcp);
@@ -1221,6 +1316,11 @@ static inline bool dcp_fw_is_14_7(const struct apple_dcp *dcp)
 		dcp->hw.fw_14_7_endpoints);
 }
 
+static inline bool dcp_is_ext26(const struct apple_dcp *dcp)
+{
+	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_J613_EXT26;
+}
+
 /*
  * The T6030 external processor (the J514S/J516S built-in HDMI port and
  * USB-C displays) driven natively through Aurora's DCPLink session: DCP
@@ -1262,8 +1362,8 @@ void dcp_external_audio_start(struct apple_dcp *dcp);
 static inline bool dcp_ext_dptx_607(const struct apple_dcp *dcp)
 {
 	/* Not the generic M1/M2 DCPs this tree also runs on the template. */
-	return dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE &&
-	       dcp->hw.fw_14_7_endpoints;
+	return (dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE &&
+		dcp->hw.fw_14_7_endpoints);
 }
 
 /*
@@ -1299,5 +1399,13 @@ void dcp_trace_panel_property(struct apple_dcp *dcp, int tag, const char *key,
 			      size_t key_len, const void *blob, size_t len);
 
 void dcp_panel_edid_receive(struct apple_dcp *dcp, const void *blob, size_t len);
+
+int dcp_indicator_probe(struct apple_dcp *dcp);
+void dcp_indicator_release(struct apple_dcp *dcp);
+int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
+			       struct drm_plane *plane);
+void dcp_indicator_swap_done(struct apple_dcp *dcp, struct drm_framebuffer *slot_fb);
+void dcp_indicator_display_resumed(struct apple_dcp *dcp);
+extern const struct drm_framebuffer_funcs dcp_indicator_fb_funcs;
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

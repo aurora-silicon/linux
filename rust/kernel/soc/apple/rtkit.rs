@@ -225,6 +225,7 @@ impl<T: Operations> RtKit<T> {
         syslog_is_debug: None,
         crashed: Some(crashed_callback::<T>),
         recv_message: Some(recv_message_callback::<T>),
+        recv_message_timed: None,
         recv_message_early: Some(recv_message_early_callback::<T>),
         shmem_setup: if T::HAS_SHMEM_ALLOC || T::HAS_SHMEM_MAP {
             Some(shmem_setup_callback::<T>)

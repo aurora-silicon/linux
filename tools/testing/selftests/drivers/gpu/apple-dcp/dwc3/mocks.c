@@ -8,11 +8,13 @@ struct apple_atcphy {
 	struct {
 		bool prepared;
 	} cio_sleep;
-    struct { void *usb3_dp; } tunables;
+	struct {
+		void *usb3_dp, *dp_lioa, *dp_common_config;
+	} tunables;
 
 	const struct atcphy_hw *hw;
 	struct {
-		unsigned char *core, *lpdptx, *pipehandler, *usb2phy;
+		unsigned char *core, *lpdptx, *lioa, *pipehandler, *usb2phy;
 	} regs;
 	struct reset_controller_dev rcdev;
 	void *dev;
@@ -100,6 +102,8 @@ struct dwc3_apple {
 	bool pre_core_rpm;
 	/* J714s only: the start after a sleep waits for its Type-C PHY; never set here. */
 	bool sleep_phy_wait, sleep_phy_pending;
+	/* J714s only: a SuperSpeed device looked for after a sleep; never set here. */
+	bool ss_retry;
 	bool dt_dis_u3_susphy;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
 	/* The PM sleep epoch (dwc3_apple_pm_notify()); the fixtures stay IDLE. */
@@ -255,11 +259,22 @@ static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(
 { (void)p; assert(false); return -EOPNOTSUPP; }
 
 
-/* USB2 power-on is outside this teardown/recovery control. */
+/* Model the USB2 power-on boundary's running state. */
+static unsigned int usb2_starts;
 static void atcphy_usb2_power_on(struct apple_atcphy *p)
 {
-	(void)p;
+	usb2_starts++;
+	writel(USB2PHY_USBCTL_RUN, p->regs.usb2phy + USB2PHY_USBCTL);
 }
+
+/* This teardown fixture never selects T8142 DP calibration. */
+static void apple_tunable_apply(void *base, void *tunable)
+{
+	(void)base;
+	(void)tunable;
+	assert(!"unexpected banked DP calibration");
+}
+
 static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode m)
 {
 	(void)p;
@@ -357,6 +372,11 @@ static void dwc3_apple_setup_cio(struct dwc3_apple *a)
 {
 	(void)a;
 	setup_cio++;
+}
+/* The check after a sleep is only for a fixed hub or a J714s SuperSpeed device; neither here. */
+static void dwc3_apple_check_hub_later(struct dwc3_apple *a)
+{
+	assert(!a->fixed_hub && !a->ss_retry);
 }
 /* The hibernation block's register setup; teardown order doesn't depend on it. */
 static void __attribute__((unused)) dwc3_apple_setup_hibernation(struct dwc3_apple *a)
