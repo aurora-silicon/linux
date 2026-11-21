@@ -133,9 +133,14 @@ void btrfs_bio_end_io(struct btrfs_bio *bbio, blk_status_t status)
 		cmpxchg(&bbio->status, BLK_STS_OK, status);
 
 	if (atomic_dec_and_test(&bbio->pending_ios)) {
-		/* Load split bio's error which might be set above. */
-		if (status == BLK_STS_OK)
-			bbio->bio.bi_status = READ_ONCE(bbio->status);
+		/*
+		 * Load the first error of all split bios.  This must be done
+		 * unconditionally: if the last completion is a split bio, the
+		 * error passed in was only stored in the split bio, while the
+		 * original bio's bi_status still holds the status of its own
+		 * earlier (possibly successful) completion.
+		 */
+		bbio->bio.bi_status = READ_ONCE(bbio->status);
 
 		if (bbio_has_ordered_extent(bbio)) {
 			struct btrfs_ordered_extent *ordered = bbio->ordered;
@@ -767,6 +772,26 @@ static u64 btrfs_append_map_length(struct btrfs_bio *bbio, u64 map_length)
 	return map_length;
 }
 
+/*
+ * Data reads are verified against their checksums once the bio has completed,
+ * so a large read adds the verification of all its blocks to its latency.
+ * Submit such reads in parts of this size instead: each part is verified as
+ * soon as it completes, in parallel with the other parts, so verification
+ * overlaps the transfer instead of following it.  256K keeps the per-part
+ * cost (one split and one checksum lookup) small next to the transfer.
+ */
+#define BTRFS_VERIFY_READ_PART		SZ_256K
+
+static bool btrfs_read_needs_verify(const struct btrfs_bio *bbio)
+{
+	const struct btrfs_inode *inode = bbio->inode;
+
+	return bio_op(&bbio->bio) == REQ_OP_READ && is_data_bbio(bbio) &&
+	       !bbio->is_scrub && !(inode->flags & BTRFS_INODE_NODATASUM) &&
+	       !test_bit(BTRFS_FS_STATE_NO_DATA_CSUMS,
+			 &inode->root->fs_info->fs_state);
+}
+
 static bool btrfs_submit_chunk(struct btrfs_bio *bbio, int mirror_num)
 {
 	struct btrfs_inode *inode = bbio->inode;
@@ -807,6 +832,8 @@ static bool btrfs_submit_chunk(struct btrfs_bio *bbio, int mirror_num)
 	map_length = min(map_length, length);
 	if (bbio->can_use_append)
 		map_length = btrfs_append_map_length(bbio, map_length);
+	if (btrfs_read_needs_verify(bbio))
+		map_length = min_t(u64, map_length, BTRFS_VERIFY_READ_PART);
 
 	if (map_length < length) {
 		struct btrfs_bio *split;
