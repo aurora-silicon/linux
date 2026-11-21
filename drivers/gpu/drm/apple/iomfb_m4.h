@@ -3,6 +3,7 @@
 #define __APPLE_IOMFB_M4_H__
 
 #include <linux/types.h>
+#include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/kconfig.h>
 
@@ -10,6 +11,7 @@ struct apple_dcp;
 struct device;
 struct dentry;
 struct drm_connector;
+struct drm_edid;
 struct drm_display_mode;
 struct drm_rect;
 struct iosys_map;
@@ -51,6 +53,7 @@ void iomfb_m4_external_link_gone(struct apple_dcp *dcp);
 /* An adopted external DCP's sink, for its DRM connector (t8132_ext_drm.c). */
 int iomfb_m4_ext_detect(struct apple_dcp *dcp);
 int iomfb_m4_ext_get_modes(struct apple_dcp *dcp, struct drm_connector *connector);
+const struct drm_edid *iomfb_m4_ext_edid(struct apple_dcp *dcp);
 /* DRM drives the external output: modeset, copied frames, disable. */
 int iomfb_m4_ext_mode_ids(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 			  struct iomfb_m4_ext_ids *ids);
@@ -101,6 +104,11 @@ static inline int iomfb_m4_ext_detect(struct apple_dcp *dcp) { return -ENODEV; }
 static inline int iomfb_m4_ext_get_modes(struct apple_dcp *dcp, struct drm_connector *connector)
 {
 	return 0;
+}
+
+static inline const struct drm_edid *iomfb_m4_ext_edid(struct apple_dcp *dcp)
+{
+	return ERR_PTR(-ENODEV);
 }
 
 static inline int iomfb_m4_ext_mode_ids(struct apple_dcp *dcp,

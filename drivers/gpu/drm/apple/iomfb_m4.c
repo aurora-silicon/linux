@@ -26,6 +26,7 @@
 #include <linux/minmax.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
+#include <drm/drm_edid.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_fourcc.h>
@@ -48,7 +49,9 @@
 
 #include "afk.h"
 #include "dcp.h"
+#include "dcp-sdr-edid.h"
 #include "dptxep.h"
+#include "epic/dpavservep.h"
 #include "iomfb_m4.h"
 
 #include "dcp-m4-profile.h"
@@ -183,6 +186,16 @@ struct iomfb_m4 {
 	bool external; /* an adopted external DCP: no panel */
 	/* AFK endpoints started on an adopted external DCP, by endpoint - 0x20. */
 	struct apple_dcp_afkep *probe_ep[0x20];
+	/*
+	 * The sink's dcpav-service-epic on EP 0x28, the one last announced,
+	 * and how many were: the firmware announces a new one for each sink
+	 * and after each restart (state_lock)
+	 */
+	struct apple_epic_service *ext_avserv;
+	unsigned int ext_avserv_gen;
+	/* Probes again while the firmware has not read the sink yet (state_lock). */
+	struct delayed_work ext_edid_retry;
+	unsigned int ext_edid_retries;
 	bool display_off; /* setPowerState(0) while blanked, until the next frame */
 	u64 display_off_cycles;
 	s64 display_off_us, display_off_us_max, display_on_us, display_on_us_max;
@@ -238,6 +251,14 @@ struct iomfb_m4 {
 	struct mutex ext_modes_lock; /* ext_modes, ext_mode_count, ext_pref*, ext_logged_* */
 	struct iomfb_m4_ext_mode *ext_modes;
 	unsigned int ext_mode_count;
+	/*
+	 * Its EDID as the connector publishes it (iomfb_m4_ext_edid()), with
+	 * the link generation (ext_link_gen) and the AV service it was read
+	 * in, also under ext_modes_lock
+	 */
+	const struct drm_edid *ext_edid;
+	int ext_edid_link_gen;
+	unsigned int ext_edid_avserv_gen;
 	/*
 	 * The sink generation, which a released route moves on (words received
 	 * before carry the old one and publish nothing); whether a
@@ -2625,6 +2646,15 @@ static int iomfb_m4_ext_bind_dart(struct iomfb_m4 *dcp, struct device_node *cons
 	return ret;
 }
 
+/* The sink's EDID was not read yet (iomfb_m4_ext_edid()): probe again. */
+static void iomfb_m4_ext_edid_retry_work(struct work_struct *work)
+{
+	struct iomfb_m4 *dcp = container_of(to_delayed_work(work), struct iomfb_m4,
+					    ext_edid_retry);
+
+	t8132_ext_drm_hotplug(dcp->dev);
+}
+
 int iomfb_m4_init(struct apple_dcp *owner)
 {
 	struct platform_device *pdev = to_platform_device(owner->dev);
@@ -2682,6 +2712,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	init_waitqueue_head(&dcp->ext_settle_wq);
 	INIT_DELAYED_WORK(&dcp->idle_cache, iomfb_m4_idle_cache_work);
 	INIT_DELAYED_WORK(&dcp->gate_work, iomfb_m4_gate_work);
+	INIT_DELAYED_WORK(&dcp->ext_edid_retry, iomfb_m4_ext_edid_retry_work);
 	if (!request_mem_region(res->start, resource_size(res), dev_name(dev))) {
 		ret = -EBUSY;
 		goto release;
@@ -2735,8 +2766,9 @@ release:
 
 /*
  * The auxiliary endpoints of an external DCP are started so that the
- * firmware finds them up, but none of their services is used: each one
- * announced is only noted.
+ * firmware finds them up. Of their services only the sink's AV service on
+ * EP 0x28 is used (dcp_m4_avserv_init()); every other one announced is only
+ * noted.
  */
 static void dcp_m4_probe_init(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit)
@@ -2746,7 +2778,42 @@ static void dcp_m4_probe_init(struct apple_epic_service *service, const char *na
 		service->ep->endpoint, service->channel, name ?: "", class ?: "", unit);
 }
 
+/* The sink's AV service, which reads its EDID (iomfb_m4_ext_edid()). */
+static void dcp_m4_avserv_init(struct apple_epic_service *service, const char *name,
+			       const char *class, s64 unit)
+{
+	struct iomfb_m4 *dcp = service->ep->dcp->v26_6;
+	unsigned long flags;
+
+	dcp_m4_probe_init(service, name, class, unit);
+	if (service->ep->endpoint != DPAVSERV_ENDPOINT)
+		return;
+	spin_lock_irqsave(&dcp->state_lock, flags);
+	dcp->ext_avserv = service;
+	dcp->ext_avserv_gen++;
+	dcp->ext_edid_retries = 0;
+	spin_unlock_irqrestore(&dcp->state_lock, flags);
+	/* get_modes may already have run without it. */
+	t8132_ext_drm_hotplug(dcp->dev);
+}
+
+static void dcp_m4_avserv_teardown(struct apple_epic_service *service)
+{
+	struct iomfb_m4 *dcp = service->ep->dcp->v26_6;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->state_lock, flags);
+	if (dcp->ext_avserv == service)
+		dcp->ext_avserv = NULL;
+	spin_unlock_irqrestore(&dcp->state_lock, flags);
+}
+
 static const struct apple_epic_service_ops dcp_m4_probe_ops[] = {
+	{
+		.name = "dcpav-service-epic",
+		.init = dcp_m4_avserv_init,
+		.teardown = dcp_m4_avserv_teardown,
+	},
 	{
 		.name = "*",
 		.init = dcp_m4_probe_init,
@@ -3226,6 +3293,128 @@ int iomfb_m4_ext_get_modes(struct apple_dcp *owner, struct drm_connector *connec
 	}
 	mutex_unlock(&dcp->ext_modes_lock);
 	return added;
+}
+
+#define IOMFB_M4_EXT_EDID_RETRIES	5
+#define IOMFB_M4_EXT_EDID_RETRY_MS	500
+
+/*
+ * The EDID the connector publishes, as native26's (dcp_edid_sdr()): this
+ * scanout is 8-bpc RGB SDR, so the sink's colour capabilities, deep colour
+ * and 4:2:0 timings go. The last would otherwise make the probe helper prune
+ * the catalog's mode of a timing the sink lists as 4:2:0 only.
+ */
+static const struct drm_edid *iomfb_m4_ext_edid_sdr(const struct drm_edid *edid)
+{
+	const struct edid *raw = drm_edid_raw(edid);
+	const struct drm_edid *sdr;
+	size_t size;
+	u8 *copy;
+
+	if (!raw)
+		return ERR_PTR(-EPROTO);
+	size = (raw->extensions + 1) * EDID_LENGTH;
+	copy = kmemdup(raw, size, GFP_KERNEL);
+	if (!copy)
+		return ERR_PTR(-ENOMEM);
+	size = dcp_edid_sdr(copy, size);
+	sdr = size ? drm_edid_alloc(copy, size) : ERR_PTR(-EPROTO);
+	kfree(copy);
+	return sdr ?: ERR_PTR(-ENOMEM);
+}
+
+/* A copy of the sink's kept EDID if it was read on link @link_gen, else NULL. */
+static const struct drm_edid *iomfb_m4_ext_edid_kept(struct iomfb_m4 *dcp, int link_gen)
+{
+	lockdep_assert_held(&dcp->ext_modes_lock);
+	if (!dcp->ext_edid || dcp->ext_edid_link_gen != link_gen)
+		return NULL;
+	return drm_edid_dup(dcp->ext_edid) ?: ERR_PTR(-ENOMEM);
+}
+
+/*
+ * The sink's EDID for the connector's properties: its name, size and the
+ * like. Its modes stay the firmware's catalog (iomfb_m4_ext_get_modes()).
+ * It is read once for each announcement of the sink's AV service and kept
+ * while the sink's link stays (ext_link_gen): when a read fails, or there is
+ * no service (none yet after a restart, or a stopped or failed session,
+ * which nothing is read from), the kept one is given, so that a relink or a
+ * resume does not take it from the connector meanwhile. -ENODEV with
+ * neither; the firmware may also not have read the sink yet.
+ */
+const struct drm_edid *iomfb_m4_ext_edid(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	struct apple_epic_service *service = NULL;
+	const struct drm_edid *edid, *read, *old = NULL;
+	struct dcp_m4_runtime *r;
+	unsigned int avserv_gen;
+	unsigned long flags;
+	int link_gen;
+
+	/* Pairs with the release store of dcp->runtime in startup. */
+	r = dcp && dcp->external ? smp_load_acquire(&dcp->runtime) : NULL;
+	if (!r)
+		return ERR_PTR(-ENODEV);
+	link_gen = atomic_read(&r->ext_link_gen);
+	spin_lock_irqsave(&dcp->state_lock, flags);
+	avserv_gen = dcp->ext_avserv_gen;
+	if (!dcp->error && !READ_ONCE(dcp->gated))
+		service = afk_service_get(dcp->ext_avserv);
+	spin_unlock_irqrestore(&dcp->state_lock, flags);
+
+	mutex_lock(&dcp->ext_modes_lock);
+	edid = (!service || dcp->ext_edid_avserv_gen == avserv_gen) ?
+	       iomfb_m4_ext_edid_kept(dcp, link_gen) : NULL;
+	mutex_unlock(&dcp->ext_modes_lock);
+	if (edid || !service) {
+		if (service)
+			afk_service_put(service);
+		return edid ?: ERR_PTR(-ENODEV);
+	}
+
+	read = dcpavserv_read_edid(service);
+	afk_service_put(service);
+	if (IS_ERR(read))
+		edid = read;
+	else if (!drm_edid_valid(read))
+		edid = ERR_PTR(-EPROTO);
+	else
+		edid = iomfb_m4_ext_edid_sdr(read);
+	if (!IS_ERR(read))
+		drm_edid_free(read);
+	/*
+	 * No EDID bytes yet: the firmware announces the service before it has
+	 * read the sink (after resume, as on the Neo). Probe again shortly.
+	 */
+	spin_lock_irqsave(&dcp->state_lock, flags);
+	if (!IS_ERR(edid)) {
+		dcp->ext_edid_retries = 0;
+	} else if (PTR_ERR(edid) == -ENODATA &&
+		   dcp->ext_edid_retries < IOMFB_M4_EXT_EDID_RETRIES) {
+		dcp->ext_edid_retries++;
+		mod_delayed_work(system_freezable_wq, &dcp->ext_edid_retry,
+				 msecs_to_jiffies(IOMFB_M4_EXT_EDID_RETRY_MS));
+	}
+	spin_unlock_irqrestore(&dcp->state_lock, flags);
+
+	mutex_lock(&dcp->ext_modes_lock);
+	if (atomic_read(&r->ext_link_gen) != link_gen) {
+		/* The sink went during the read: nothing of it is kept or given. */
+		old = IS_ERR(edid) ? NULL : edid;
+		edid = ERR_PTR(-ENODEV);
+	} else if (!IS_ERR(edid)) {
+		old = dcp->ext_edid;
+		dcp->ext_edid = edid;
+		dcp->ext_edid_link_gen = link_gen;
+		dcp->ext_edid_avserv_gen = avserv_gen;
+		edid = drm_edid_dup(edid) ?: ERR_PTR(-ENOMEM);
+	} else {
+		edid = iomfb_m4_ext_edid_kept(dcp, link_gen) ?: edid;
+	}
+	mutex_unlock(&dcp->ext_modes_lock);
+	drm_edid_free(old);
+	return edid;
 }
 
 /*
@@ -5370,6 +5559,10 @@ static int iomfb_m4_ext_stop(struct iomfb_m4 *dcp)
 	}
 	if (ret)
 		goto unwind;
+	/* The restarted firmware announces the sink's AV service anew. */
+	spin_lock_irqsave(&dcp->state_lock, flags);
+	dcp->ext_avserv = NULL;
+	spin_unlock_irqrestore(&dcp->state_lock, flags);
 	dev_info(dcp->dev, "external DCP stopped for sleep\n");
 	return 0;
 unwind:
@@ -5646,6 +5839,7 @@ void iomfb_m4_quiesce(struct apple_dcp *owner)
 	/* After the flush, as drained callbacks can queue it. */
 	cancel_delayed_work_sync(&dcp->idle_cache);
 	cancel_delayed_work_sync(&dcp->gate_work);
+	cancel_delayed_work_sync(&dcp->ext_edid_retry);
 }
 
 static int iomfb_m4_status_show(struct seq_file *s, void *unused)

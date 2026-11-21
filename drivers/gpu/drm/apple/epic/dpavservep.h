@@ -58,6 +58,7 @@ void dcpavserv_v14_close(struct apple_dcp *dcp);
 /* Its Terminate work; set up once with the DCP (dcp_platform_probe_pipe()). */
 void dcpavserv_close_work(struct work_struct *work);
 
+const struct drm_edid *dcpavserv_read_edid(struct apple_epic_service *service);
 bool dcpavserv_edid_current(struct apple_dcp *dcp, u64 generation);
 bool dcpavserv_edid_service_current(struct apple_dcp *dcp, u64 epoch);
 const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation,
