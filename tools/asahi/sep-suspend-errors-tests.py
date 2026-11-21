@@ -446,7 +446,7 @@ RUST_PREFIX = r'''
 #![allow(dead_code, unused_imports, unused_variables)]
 use std::cell::{Cell, RefCell, RefMut};
 use std::ffi::{c_int, c_void};
-use std::sync::atomic::{AtomicU32, Ordering, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering, Ordering::Relaxed};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] struct Error(i32);
 impl Error { fn from_errno(n: i32) -> Self { assert!(n < 0); Self(n) } }
 type Result<T = ()> = std::result::Result<T, Error>;
@@ -529,17 +529,25 @@ const PHASE_READY: u32 = 1;
 struct SepData {
     dev: kernel::device::Device, phase: AtomicU32, control: Lock<Control>, mbox: Lock<Option<Mbox>>,
     gate: Cell<pm::SleepGate>, sleep_rx_held: Flag, endpoint: Cell<bool>, control_wq: Wq,
+    // T6041's suspend-time path (no sleep core commit); never taken here.
+    sleep_at_suspend: AtomicBool,
 }
 impl SepData {
     fn new() -> Self {
         Self { dev: kernel::device::Device, phase: AtomicU32::new(PHASE_READY),
             control: Lock(RefCell::new(Control { busy: false, wake_ok: true })),
             mbox: Lock(RefCell::new(Some(Mbox))), gate: Cell::new(pm::SleepGate::Open),
-            sleep_rx_held: Flag(Cell::new(false)), endpoint: Cell::new(true), control_wq: Wq }
+            sleep_rx_held: Flag(Cell::new(false)), endpoint: Cell::new(true), control_wq: Wq,
+            sleep_at_suspend: AtomicBool::new(false) }
     }
     fn endpoint_present(&self, _: u32) -> bool { self.endpoint.get() }
     fn sleep_gate(&self) -> pm::SleepGate { self.gate.get() }
     fn set_sleep_gate(&self, g: pm::SleepGate) { self.gate.set(g); }
+    // T6041's suspend-time path and its mailbox check: the platform commits here, so the
+    // first is never reached, and the mailbox always drains.
+    fn sleep_enter_at_suspend(&self) -> Result<()> { unreachable!() }
+    fn sleep_exit_at_suspend(&self) -> bool { unreachable!() }
+    fn mailbox_drains(&self) -> bool { true }
     fn ring(_: &Mbox, msg: kernel::soc::apple::mailbox::Message) -> Result<()> {
         assert_eq!(msg.msg0, proto::WAKE_KICK.msg0); event(4); RING.with(|v|v.get())
     }
@@ -700,7 +708,9 @@ def sources(source, contracts, mutation):
     }
 '''
     rust += pm[gate_start:gate_end]
-    rust += '\n'.join(bodies[n] for n in names['pm']) + '\n}\nimpl SepData {\n'
+    rust += '\n'.join(bodies[n] for n in names['pm'])
+    # T6041 has no sleep core commit; every platform modelled here has one.
+    rust += '\npub(crate) fn platform_commit() -> bool { true }\n}\nimpl SepData {\n'
     rust += '\n'.join(bodies[n] for n in names['sep']) + '\n}\n' + RUST_TESTS
     return c, rust
 
