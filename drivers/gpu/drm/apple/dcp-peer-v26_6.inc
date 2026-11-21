@@ -61,27 +61,41 @@ static void dcp_peer_wait_done(struct apple_dcp *dcp, void *out, void *cookie)
 	kref_put(&wait->refs, dcp_peer_wait_free);
 }
 
-static int dcp_peer_call(struct apple_dcp *dcp, const char *tag,
-			 void *in, size_t in_size, void *out, size_t out_size)
+static struct dcp_peer_wait *dcp_peer_begin(struct apple_dcp *dcp, bool oob,
+					    const struct dcp_method_entry *method,
+					    void *in, size_t in_size, size_t out_size,
+					    u8 reply_fill)
 {
-	struct dcp_method_entry method = { .name = "peer_call" };
 	struct dcp_peer_wait *wait;
-	int ret = 0;
 
 	if (out_size > sizeof(wait->reply))
-		return -EINVAL;
+		return ERR_PTR(-EINVAL);
 	wait = kzalloc(sizeof(*wait), GFP_KERNEL);
 	if (!wait)
-		return -ENOMEM;
-	memcpy(method.tag, tag, 4);
+		return ERR_PTR(-ENOMEM);
+
 	wait->size = out_size;
+	memset(wait->reply, reply_fill, out_size);
 	init_completion(&wait->done);
 	kref_init(&wait->refs);
 	kref_get(&wait->refs);
-	dcp_push(dcp, false, &method, in_size, out_size, in,
-		 dcp_peer_wait_done, wait);
-	if (!wait_for_completion_timeout(&wait->done,
-		msecs_to_jiffies(!memcmp(tag, "A413", 4) ? 8500 : 2000)))
+	dcp_push(dcp, oob, method, in_size, out_size, in, dcp_peer_wait_done, wait);
+	return wait;
+}
+
+static int dcp_peer_call_timeout(struct apple_dcp *dcp, bool oob, const char *tag,
+				 void *in, size_t in_size, void *out, size_t out_size,
+				 unsigned int timeout_ms)
+{
+	struct dcp_method_entry method = { .name = oob ? "peer_call_oob" : "peer_call" };
+	struct dcp_peer_wait *wait;
+	int ret = 0;
+
+	memcpy(method.tag, tag, sizeof(method.tag));
+	wait = dcp_peer_begin(dcp, oob, &method, in, in_size, out_size, 0);
+	if (IS_ERR(wait))
+		return PTR_ERR(wait);
+	if (!wait_for_completion_timeout(&wait->done, msecs_to_jiffies(timeout_ms)))
 		ret = -ETIMEDOUT;
 	else if (out_size && out)
 		memcpy(out, wait->reply, out_size);
@@ -89,31 +103,17 @@ static int dcp_peer_call(struct apple_dcp *dcp, const char *tag,
 	return ret;
 }
 
+static int dcp_peer_call(struct apple_dcp *dcp, const char *tag,
+			 void *in, size_t in_size, void *out, size_t out_size)
+{
+	return dcp_peer_call_timeout(dcp, false, tag, in, in_size, out, out_size,
+				     !memcmp(tag, "A413", 4) ? 8500 : 2000);
+}
+
 static int dcp_peer_call_oob(struct apple_dcp *dcp, const char *tag,
 			     void *in, size_t in_size, void *out, size_t out_size)
 {
-	struct dcp_method_entry method = { .name = "peer_call_oob" };
-	struct dcp_peer_wait *wait;
-	int ret = 0;
-
-	if (out_size > sizeof(wait->reply))
-		return -EINVAL;
-	wait = kzalloc(sizeof(*wait), GFP_KERNEL);
-	if (!wait)
-		return -ENOMEM;
-	memcpy(method.tag, tag, 4);
-	wait->size = out_size;
-	init_completion(&wait->done);
-	kref_init(&wait->refs);
-	kref_get(&wait->refs);
-	dcp_push(dcp, true, &method, in_size, out_size, in,
-		 dcp_peer_wait_done, wait);
-	if (!wait_for_completion_timeout(&wait->done, msecs_to_jiffies(2000)))
-		ret = -ETIMEDOUT;
-	else if (out_size && out)
-		memcpy(out, wait->reply, out_size);
-	kref_put(&wait->refs, dcp_peer_wait_free);
-	return ret;
+	return dcp_peer_call_timeout(dcp, true, tag, in, in_size, out, out_size, 2000);
 }
 
 /* ---- peer release / forget ---- */
@@ -933,22 +933,23 @@ static int dcp_peer_queue_swap(struct apple_dcp *dcp, struct dcp_peer_swap *ps)
 /*
  * The part of a layer inside the tile [@tile_x, @tile_x + @tile_w), in the
  * tile's coordinates.  The shared source boundary is rounded once, so the
- * halves neither lose nor repeat a source column.
+ * halves neither lose nor repeat a source column. Absent layers and layers
+ * outside the tile emit empty rectangles.
  */
 static bool dcp_peer_clip(const struct dcp_rect *src, const struct dcp_rect *dst,
-			  u32 tile_x, u32 tile_w,
+			  bool present, u32 tile_x, u32 tile_w,
 			  struct dcp_rect *tile_src, struct dcp_rect *tile_dst)
 {
 	u64 left = max_t(u64, dst->x, tile_x);
 	u64 right = min_t(u64, (u64)dst->x + dst->w, (u64)tile_x + tile_w);
 	u64 first, last;
 
-	if (!src->w || !src->h || !dst->w || !dst->h || left >= right)
-		return false;
+	if (!present || !src->w || !src->h || !dst->w || !dst->h || left >= right)
+		goto empty;
 	first = div_u64((left - dst->x) * src->w + dst->w / 2, dst->w);
 	last = div_u64((right - dst->x) * src->w + dst->w / 2, dst->w);
 	if (first >= last || (u64)src->x + last > U32_MAX)
-		return false;
+		goto empty;
 	*tile_src = *src;
 	tile_src->x += first;
 	tile_src->w = last - first;
@@ -956,6 +957,10 @@ static bool dcp_peer_clip(const struct dcp_rect *src, const struct dcp_rect *dst
 	tile_dst->x = left - tile_x;
 	tile_dst->w = right - left;
 	return true;
+empty:
+	*tile_src = (struct dcp_rect){};
+	*tile_dst = (struct dcp_rect){};
+	return false;
 }
 
 /* Both pipes scan the same buffers: the display DARTs share one domain. */
@@ -972,18 +977,12 @@ static void dcp_peer_split_swap(struct dcp_swap_submit_req_v26_6_desktop *left,
 
 		for (unsigned int side = 0; side < 2; side++) {
 			struct dcp_swap_submit_req_v26_6_desktop *req = halves[side];
-			struct dcp_rect tile_src, tile_dst;
 
-			if (present && dcp_peer_clip(&src, &dst, side * tile_w, tile_w,
-						     &tile_src, &tile_dst)) {
-				req->swap.src_rect[i] = tile_src;
-				req->swap.dst_rect[i] = tile_dst;
-			} else {
-				req->surf_null[i] = true;
-				req->surf_iova[i] = 0;
-				memset(&req->swap.src_rect[i], 0, sizeof(struct dcp_rect));
-				memset(&req->swap.dst_rect[i], 0, sizeof(struct dcp_rect));
-			}
+			if (dcp_peer_clip(&src, &dst, present, side * tile_w, tile_w,
+					  &req->swap.src_rect[i], &req->swap.dst_rect[i]))
+				continue;
+			req->surf_null[i] = true;
+			req->surf_iova[i] = 0;
 		}
 	}
 }
