@@ -142,7 +142,6 @@ impl Shared {
             if firmware.engine.shared.is_none() {
                 firmware.engine.shared = Some(self.clone());
             }
-            firmware.note_submission(&job);
             let accepted = firmware.enqueue(job);
             // Nothing is published while a render is in flight: the poll pass after its
             // retirement publishes this job. Skipping the pass here keeps queued submissions

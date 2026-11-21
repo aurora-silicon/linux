@@ -54,9 +54,6 @@ pub(crate) struct Recovery {
     /// One stall dump per period without completion-stamp progress, after 1 s.
     stall_dump_ns: u64,
     stall_dumped: bool,
-    /// Submissions since the backend started, and the last submitting client's tgid.
-    submissions: u64,
-    last_client: i64,
     pub(crate) long_commands: u64,
     pub(crate) publication_wait_deadline: Option<u64>,
     /// Last fully retired compute/TA/FS identity, for late recovery snapshots.
@@ -86,8 +83,6 @@ impl Recovery {
             warning_deadline_ns: u64::MAX,
             stall_dump_ns: u64::MAX,
             stall_dumped: false,
-            submissions: 0,
-            last_client: -1,
             long_commands: 0,
             publication_wait_deadline: None,
             last_retired: [None; 3],
@@ -318,28 +313,6 @@ impl Firmware {
             if self.job_partly_published(job) {
                 self.retain(job);
             }
-        }
-    }
-
-    /// 27.2 bring-up: which client submitted what (to name a stall's first job): the first 64
-    /// submissions, every change of client, then one in 256.
-    pub(crate) fn note_submission(&mut self, job: &Job) {
-        let n = self.recovery.submissions;
-        self.recovery.submissions = n.wrapping_add(1);
-        let (comm, tgid) = job.vm.status.client();
-        let changed = self.recovery.last_client != tgid as i64;
-        self.recovery.last_client = tgid as i64;
-        if n < 64 || changed || n % 256 == 0 {
-            dev_info!(
-                self.dev(),
-                "G16 submit #{}: client {}[{}], {} commands; {} flights, {} pending\n",
-                n,
-                kernel::str::BStr::from_bytes(comm),
-                tgid,
-                job.commands.len(),
-                self.engine.flights.len(),
-                self.engine.pending.len()
-            );
         }
     }
 
