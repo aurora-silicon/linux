@@ -660,6 +660,7 @@ fn wait_boot_control(
             || done > target
             || write != target
         {
+            channels.log_stop(session, init, "unexpected boot-control indices");
             return Err(eproto());
         }
         if ready == 1 && read == target && done == target {
@@ -671,15 +672,7 @@ fn wait_boot_control(
             stable = None;
         }
         if start.elapsed() > Delta::from_millis(timeout_ms) {
-            dev_err!(
-                session.dev,
-                "M4 boot control target{} ready{} indices{}/{}/{}\n",
-                target,
-                ready,
-                read,
-                done,
-                write
-            );
+            channels.log_stop(session, init, "boot control not retired in time");
             return Err(ETIMEDOUT);
         }
         fsleep(Delta::from_micros(1000));
@@ -814,6 +807,7 @@ fn run(
     let scheduler = init.control.as_ref().ok_or(EINVAL)?;
     let scheduler_word = init.firmware_data().scheduler;
     if scheduler.r32(scheduler_word)? != 0 {
+        channels.log_stop(session, init, "scheduler word set after IMPORT_GLOBALS");
         return Err(EBUSY);
     }
     scheduler.w32(scheduler_word, 1)?;
@@ -834,6 +828,7 @@ fn run(
         || channels.devctl.write()? != base + 2
         || scheduler.r32(scheduler_word)? != 0
     {
+        channels.log_stop(session, init, "boot controls not settled after START");
         return Err(EBUSY);
     }
     dev_info!(

@@ -202,6 +202,26 @@ impl Channels {
         Ok(())
     }
 
+    /// The one error line for a stop during the boot sequence: why, the device-control indices
+    /// and the FirmwareData recovery words. Reads host RAM only, never a GPU register.
+    pub(crate) fn log_stop(&self, session: &Session, init: &InitData, why: &str) {
+        let ix = |r: Result<u32>| r.unwrap_or(u32::MAX);
+        let fd = init.firmware_data();
+        let word = |o: usize| init.control.as_ref().map_or(u32::MAX, |c| ix(c.r32(o)));
+        dev_err!(
+            session.dev,
+            "G16 boot stopped: {}: devctl read {} completion {} write {} producer {}; phase {:#x} scheduler {:#x} ready {:#x}\n",
+            why,
+            ix(self.devctl.read()),
+            ix(self.devctl.completion()),
+            ix(self.devctl.write()),
+            self.devctl_producer,
+            word(fd.phase),
+            word(fd.scheduler),
+            ix(init.readiness())
+        );
+    }
+
     /// Consumes a receive ring to its firmware producer.
     fn drain_one(ring: &Ring, offset: usize, capacity: u32) -> Result {
         let producer = ring.state.r32(offset + STATE_WRITE)?;
@@ -265,6 +285,7 @@ pub(crate) fn devctl_submit(
         channels.drain_rings(&dev, events)?;
         session.check()?;
         if init.halted()? {
+            channels.log_stop(session, init, "firmware halted before a control was posted");
             return Err(EBUSY);
         }
         if expired() {
@@ -299,6 +320,7 @@ pub(crate) fn devctl_submit(
             return Ok(());
         }
         if init.halted()? {
+            channels.log_stop(session, init, "firmware halted awaiting a control");
             return Err(EBUSY);
         }
         if expired() {
