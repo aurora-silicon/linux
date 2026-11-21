@@ -204,6 +204,12 @@ struct ave_fw_build {
 	u32 text_size;
 	u32 data_size;
 	u32 text_crc;
+	/*
+	 * The variant the build starts with, when its release numbers the chip
+	 * differently from the variant the device matched. A build with no
+	 * variant (NULL) keeps the platform's matched variant.
+	 */
+	const struct ave_variant *variant;
 };
 
 struct ave_variant {
