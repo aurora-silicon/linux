@@ -367,7 +367,6 @@ struct apple_isp {
 	struct device_node *dcp_np;
 	struct device *dcp;
 	enum isp_firmware_version fw_compat;
-	bool preview_26;
 	u32 platform_id;
 	u32 temporal_filter;
 	u32 cam_connections_scheme;
