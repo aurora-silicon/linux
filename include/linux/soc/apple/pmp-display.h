@@ -3,13 +3,21 @@
 #define _LINUX_SOC_APPLE_PMP_DISPLAY_H
 
 #include <linux/of.h>
-#include <linux/soc/apple/t8132.h>
 #include <linux/types.h>
 
-/* The retained M4 bridge and raw thermal records: the M4 firmware path. */
+/*
+ * The retained PMP bridge and raw thermal records: keyed on an available
+ * `apple,t8132-pmp-v2` node rather than the root SoC compatible or OS
+ * firmware version.
+ */
 static inline bool apple_pmp_j713_board(void)
 {
-	return apple_t8132_firmware_path() && of_machine_is_compatible("apple,t8132");
+	struct device_node *np = of_find_compatible_node(NULL, NULL,
+							 "apple,t8132-pmp-v2");
+	bool match = np && of_device_is_available(np);
+
+	of_node_put(np);
+	return match;
 }
 
 struct device;
