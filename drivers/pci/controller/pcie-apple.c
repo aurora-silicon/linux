@@ -6890,6 +6890,19 @@ static int apple_pcie_adopted_links_ready(struct apple_pcie *pcie)
 	return 0;
 }
 
+/*
+ * Whether apple_pcie_suspend_noirq() ends in apple_pcie_check_adopted_s2idle()
+ * for this host, given that it passed the CIO-DART refusal: not in a CIO or
+ * NEO sleep transaction, not a managed radio, an adopted host that is up, and
+ * no firmware suspend. apple_pcie_prepare() refuses on the same terms.
+ */
+static bool apple_pcie_adopted_s2idle_checked(struct apple_pcie *pcie)
+{
+	return !pcie->cio_prepared && !pcie->neo_sleep_armed && !pcie->managed_sids &&
+	       pcie->hw->adopt_link && !READ_ONCE(pcie->t6050_down) &&
+	       !pm_suspend_via_firmware();
+}
+
 /* ... and the devices below must still be in D0, before and after the sleep. */
 static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
 {
@@ -6948,20 +6961,22 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	if (!pcie->managed_sids && pcie->hw->adopt_link) {
 		int ret;
 
+		if (apple_pcie_adopted_s2idle_checked(pcie)) {
+			ret = apple_pcie_check_adopted_s2idle(pcie);
+			pcie->link_kept = !ret;
+			return ret;
+		}
 		/* Down since a wake that failed: nothing to keep or shut down, nothing read */
 		if (READ_ONCE(pcie->t6050_down))
 			return 0;
-		if (pm_suspend_via_firmware()) {
-			/* The root ports below are suspended: from here a parked port's is not read */
-			WRITE_ONCE(pcie->t6050_cold_lost, pcie->t6050_parked);
-			ret = apple_pcie_t6050_sleep_down(pcie);
-			if (!ret && pcie->t6050_reset_before_sleep)
-				ret = apple_pcie_t6050_reset_for_sleep(pcie);
-			return ret;
-		}
-		ret = apple_pcie_check_adopted_s2idle(pcie);
-
-		pcie->link_kept = !ret;
+		/*
+		 * A firmware suspend. The root ports below are suspended: from here a
+		 * parked port's is not read.
+		 */
+		WRITE_ONCE(pcie->t6050_cold_lost, pcie->t6050_parked);
+		ret = apple_pcie_t6050_sleep_down(pcie);
+		if (!ret && pcie->t6050_reset_before_sleep)
+			ret = apple_pcie_t6050_reset_for_sleep(pcie);
 		return ret;
 	}
 	if (!pcie->hw->tunneled) {
@@ -7580,15 +7595,14 @@ static int apple_pcie_prepare(struct device *dev)
 		return -EBUSY;
 	}
 	/*
-	 * An adopted link that apple_pcie_suspend_noirq() would refuse to keep:
-	 * refuse now. Refused there, the root ports and endpoints below have
+	 * An adopted link that apple_pcie_suspend_noirq() would already refuse to
+	 * keep: refuse now. Refused there, the root ports and endpoints below have
 	 * already suspended to D3hot, this host gets no noirq resume, and nothing
-	 * retrains their links before their drivers resume.
+	 * retrains their links before their drivers resume. A link that drops
+	 * after this is still refused only there.
 	 */
-	if (pcie && !pcie->cio_prepared && !pcie->neo_sleep_armed &&
-	    !pcie->managed_sids && pcie->hw->adopt_link &&
-	    !READ_ONCE(pcie->t6050_down) &&
-	    pm_suspend_target_state != PM_SUSPEND_ON && !pm_suspend_via_firmware()) {
+	if (pcie && pm_suspend_target_state != PM_SUSPEND_ON &&
+	    apple_pcie_adopted_s2idle_checked(pcie)) {
 		int ret = apple_pcie_adopted_links_ready(pcie);
 
 		if (ret) {
