@@ -199,18 +199,19 @@ static void v14_board_swap_timestamps(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, j514s_b, j516s_b);
 	KUNIT_EXPECT_STREQ(test, j514s_b->name, "T6030");
 
-	KUNIT_EXPECT_TRUE(test, j516c_b->swap_timestamps);
-	KUNIT_EXPECT_TRUE(test, j514c_b->swap_timestamps);
-	KUNIT_EXPECT_TRUE(test, j514s_b->swap_timestamps);
-	KUNIT_EXPECT_FALSE(test, j613_b->swap_timestamps);
-	KUNIT_EXPECT_FALSE(test, j615_b->swap_timestamps);
+	/* The M3 Pro/Max records are ProMotion, the M3 Air ones are not. */
+	KUNIT_EXPECT_TRUE(test, j516c_b->promotion);
+	KUNIT_EXPECT_TRUE(test, j514c_b->promotion);
+	KUNIT_EXPECT_TRUE(test, j514s_b->promotion);
+	KUNIT_EXPECT_FALSE(test, j613_b->promotion);
+	KUNIT_EXPECT_FALSE(test, j615_b->promotion);
 
 	/* A 120 Hz panel without stamps presents at 60 fps. */
-	KUNIT_EXPECT_EQ(test, j516c_b->swap_timestamps, j516c_b->promotion);
-	KUNIT_EXPECT_EQ(test, j514c_b->swap_timestamps, j514c_b->promotion);
-	KUNIT_EXPECT_EQ(test, j514s_b->swap_timestamps, j514s_b->promotion);
-	KUNIT_EXPECT_EQ(test, j613_b->swap_timestamps, j613_b->promotion);
-	KUNIT_EXPECT_EQ(test, j615_b->swap_timestamps, j615_b->promotion);
+	KUNIT_EXPECT_EQ(test, dcp_v14_board_stamps_swaps(j516c_b, false), j516c_b->promotion);
+	KUNIT_EXPECT_EQ(test, dcp_v14_board_stamps_swaps(j514c_b, false), j514c_b->promotion);
+	KUNIT_EXPECT_EQ(test, dcp_v14_board_stamps_swaps(j514s_b, false), j514s_b->promotion);
+	KUNIT_EXPECT_EQ(test, dcp_v14_board_stamps_swaps(j613_b, false), j613_b->promotion);
+	KUNIT_EXPECT_EQ(test, dcp_v14_board_stamps_swaps(j615_b, false), j615_b->promotion);
 
 	KUNIT_EXPECT_TRUE(test, dcp_v14_board_stamps_swaps(j516c_b, false));
 	KUNIT_EXPECT_TRUE(test, dcp_v14_board_stamps_swaps(j514c_b, false));
