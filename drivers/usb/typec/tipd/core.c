@@ -1773,26 +1773,15 @@ retry:
 }
 
 /*
- * A port controller that did not take S3 refuses the sleep. The one sleep entered after such a
- * failure (J714s: the command ended after 3.6 s with the controller not answering on its bus)
- * went on to the commit, where the SMC did not answer the sleep notice: a reset instead of a
- * sleep. Refused here, nothing has been stopped yet and the controller is set up again.
- */
-static bool sleep_s3_refuse = true;
-module_param(sleep_s3_refuse, bool, 0644);
-MODULE_PARM_DESC(sleep_s3_refuse, "A port controller that does not take system power state S3 refuses the sleep (0: the sleep goes on, as before)");
-
-/*
  * The limit of an SN201202x's system power state command under the sleep's rules. The
- * controller raises no interrupt for a command's end, so the end is read from the command
- * register. Woken first and read at intervals, the controller ends this command within the
- * first few reads; the limit is the one every other command of this driver has. A controller
- * that has not ended it by then is not answering: the sleep is refused (S3), or the controller
- * is set up again by its next event (S0). A longer limit says so on the console each second.
+ * controller raises no interrupt for a command's end, so the wait ends on the controller's own
+ * signal: the command register read at intervals until the command has ended, then the system
+ * power state read back. Woken first, the controller ends this command within the first few
+ * reads (7-12 ms in macOS's traces of the J714s). The limit is only the fallback, this driver's
+ * default command limit: a controller that has not ended the command by then is not answering,
+ * and the sleep is refused (S3), or the controller is set up again by its next event (S0).
  */
-static unsigned int sleep_ssps_ms = 1000;
-module_param(sleep_ssps_ms, uint, 0644);
-MODULE_PARM_DESC(sleep_ssps_ms, "Limit of an SN201202x's system power state command under the sleep's rules, in ms (1000 to 5000)");
+#define CD321X_SLEEP_SSPS_LIMIT_MS	1000
 
 static int cd321x_prepare(struct tps6598x *tps)
 {
@@ -1822,14 +1811,20 @@ static int cd321x_prepare(struct tps6598x *tps)
 		else if (!tipd_sleep_ssps_rules())
 			dev_dbg(tps->dev, "system power state S3\n");
 		else if (ret)
-			dev_warn(tps->dev, "didn't take system power state S3: %d after %lld ms%s\n", ret,
-				 ktime_ms_delta(ktime_get(), start),
-				 sleep_s3_refuse ? ": sleep refused" : "");
+			dev_warn(tps->dev, "didn't take system power state S3: %d after %lld ms: sleep refused\n",
+				 ret, ktime_ms_delta(ktime_get(), start));
 		else
 			dev_info(tps->dev, "system power state S3 in %lld ms\n",
 				 ktime_ms_delta(ktime_get(), start));
 	}
-	if (ret && sleep_s3_refuse && tipd_sleep_ssps_rules())
+	/*
+	 * A port controller that did not take S3 refuses the sleep. The one sleep entered after
+	 * such a failure (J714s: the command ended after 3.6 s with the controller not answering on
+	 * its bus) went on to the commit, where the SMC did not answer the sleep notice: a reset
+	 * instead of a sleep. Refused here, nothing has been stopped yet and the controller is set
+	 * up again.
+	 */
+	if (ret && tipd_sleep_ssps_rules())
 		return -EBUSY;
 	return 0;
 }
@@ -2560,7 +2555,7 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state)
 		ret = tps6598x_exec_cmd_gap(tps, "SSPS", sizeof(target_state),
 					  &target_state, 0, NULL,
 					  tipd_sleep_ssps_rules() ?
-					  clamp(sleep_ssps_ms, 1000U, 5000U) : 5000, 0,
+					  CD321X_SLEEP_SSPS_LIMIT_MS : 5000, 0,
 					  tipd_sleep_ssps_rules() ? CD321X_SSPS_READ_GAP_US : 0);
 	else
 		ret = tps6598x_exec_cmd(tps, "SSPS", sizeof(target_state),
