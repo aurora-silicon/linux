@@ -2627,30 +2627,57 @@ static int dcp_direct_crossbar_link_t6050(struct apple_dcp *dcp, bool up)
 	return ret ? ret : dcp_dpxbar_link(xbar, true);
 }
 
+/*
+ * Does this pipe's direct Type-C route end on a crossbar output that only
+ * routes on select and runs its clocks with the link? The crossbar says so
+ * (apple_dpxbar_clocks_on_link()). An output whose clocks were brought up
+ * that way is taken down the same way.
+ */
+static bool dcp_typec_xbar_clocks_on_link(struct apple_dcp *dcp)
+{
+	typeof(&apple_dpxbar_clocks_on_link) fn;
+	struct apple_dcp_typec_route *route;
+	bool ret;
+
+	guard(mutex)(&dcp->tb_lock);
+	if (dcp->direct_xbar_up)
+		return true;
+	route = dcp->active_typec_route;
+	if (!route || route->tunnel)
+		return false;
+	fn = symbol_get(apple_dpxbar_clocks_on_link);
+	if (!fn)
+		return false;
+	ret = fn(route->active_xbar ?: route->xbar);
+	symbol_put(apple_dpxbar_clocks_on_link);
+	return ret;
+}
+
 int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 {
 	struct apple_dcp_typec_route *route;
 	struct mux_control *xbar = NULL;
+	bool on_link = false;
 	int ret;
 
 	/*
-	 * A T8132 dcpext on the 27.2 image (the J713's, on its Type-C routes)
-	 * has the T8132 crossbar whatever its backend: like the M4 one, its
-	 * output only routes on select and needs the link-up for its clocks.
-	 * The T6050 path below would return early for it (no fixed DP PHY).
+	 * Firmware 27 drives fixed DP PHYs through the T6050 path below, which
+	 * does nothing for a Type-C route: one on a crossbar whose clocks follow
+	 * the link (the M4 Air's dcpexts on 27.2) must have its output brought up
+	 * with the link here, as on T6030 and the M4 26.6.2 dcpext.
 	 */
-	bool t8132_v27 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
-			 of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext");
-
-	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_t6041_ext_v27(dcp) && !t8132_v27)
-		return dcp_direct_crossbar_link_t6050(dcp, up);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_t6041_ext_v27(dcp)) {
+		on_link = dcp_typec_xbar_clocks_on_link(dcp);
+		if (!on_link)
+			return dcp_direct_crossbar_link_t6050(dcp, up);
+	}
 	/*
 	 * On T6030, a T6041 firmware-27 dcpext, a T8132 dcpext and the selected
 	 * native26 pipeline, selecting a crossbar output only routes it;
 	 * link-up enables clocks.
 	 */
-	if (!of_machine_is_compatible("apple,t6030") &&
-	    !dcp_t6041_ext_v27(dcp) && !t8132_v27 &&
+	if (!on_link && !of_machine_is_compatible("apple,t6030") &&
+	    !dcp_t6041_ext_v27(dcp) &&
 	    !dcp_is_t8132_ext(dcp) && !dcp_is_ext26(dcp))
 		return 0;
 	guard(mutex)(&dcp->tb_lock);
