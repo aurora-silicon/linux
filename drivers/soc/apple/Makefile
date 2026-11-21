@@ -20,7 +20,7 @@ obj-$(CONFIG_APPLE_SOC_SLEEP) += t6050-aop.o
 apple-sleep-y = sleep.o
 
 obj-$(CONFIG_APPLE_RTKIT) += apple-rtkit.o
-apple-rtkit-y = rtkit.o rtkit-crashlog.o
+apple-rtkit-y = rtkit.o rtkit-crashlog.o rtkit-hib-handoff.o
 
 obj-$(CONFIG_APPLE_RTKIT_HELPER) += apple-rtkit-helper.o
 apple-rtkit-helper-y = rtkit-helper.o
