@@ -74,6 +74,10 @@ const BOOTARGS_SIZE: usize = 0x230;
 const ASC_CPU_CONTROL_OFFSET: usize = 0x44;
 /// The RTKit header word holding the SRAM offset of the firmware's data segment.
 const SRAM_DATA_START: usize = 0x234;
+/// How long the PMP's start waits for the firmware to acknowledge IOP power on by itself before
+/// asking for it. On the M4 Mac mini (J773g) the 27.2 image's whole RTKit start, from its CPU
+/// starting to its acknowledgment and the AP going on, takes 1.3 ms; this is 15 times that.
+const PMP_SELF_ACK_MS: u32 = 20;
 const PMP_ENDPOINT: u8 = 0x20;
 const PM_COMMAND_MARKER: u64 = pmp_power::MARKER;
 const PM_COMMAND_SHIFT: u32 = pmp_power::SHIFT;
@@ -228,7 +232,11 @@ impl PmpData {
     fn start(&self) -> Result<()> {
         let mut guard = self.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().unwrap();
-        rtk.as_mut().wake()?;
+        // Some PMP images acknowledge IOP power on by themselves once they have reported in,
+        // and answer no request for it after that (the T8132 image of macOS 27.2; macOS sends
+        // it none). Others wait to be asked. Take the firmware's own acknowledgment, and ask
+        // only if none comes.
+        rtk.as_mut().boot_or_wake(PMP_SELF_ACK_MS)?;
         rtk.start_endpoint(PMP_ENDPOINT)
     }
     fn patch_bootargs(
