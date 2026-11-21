@@ -24,7 +24,6 @@ Source7:        fprintd-no-timeout.conf.in
 Source8:        logind-aurora-sep.conf
 Source9:        aurora-sep-greeter-fingerprint
 Source10:       aurora-sep-greeter-fingerprint.service
-Source14:       aurora-sep-greeter-refresh.service
 Source15:       aurora-sep-policy-change
 Source11:       aurora_sep.te
 Source12:       aurora_sep.fc
@@ -99,9 +98,7 @@ unit() {
 unit %{SOURCE0} %{SOURCE1} aurora-sep-load
 unit %{SOURCE5} %{SOURCE6} aurora-sep-ready
 unit %{SOURCE9} %{SOURCE10} aurora-sep-greeter-fingerprint
-install -Dpm 0644 %{SOURCE14} %{buildroot}%{_unitdir}/aurora-sep-greeter-refresh.service
 install -Dpm 0755 %{SOURCE15} %{buildroot}%{_sbindir}/aurora-sep-policy-change
-sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/aurora-sep-greeter-fingerprint|\1%{_libexecdir}/aurora-sep-greeter-fingerprint|" %{buildroot}%{_unitdir}/aurora-sep-greeter-refresh.service
 install -Dpm 0644 %{SOURCE2} \
     %{buildroot}%{_unitdir}/fprintd.service.d/aurora-sep.conf
 grep -qx 'ExecStart=%{_libexecdir}/fprintd' %{_unitdir}/fprintd.service
@@ -136,14 +133,14 @@ install -Dpm 0644 %{modulename}.pp.bz2 \
     %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/%{modulename}.pp.bz2
 
 %post
-%systemd_post aurora-sep.timer aurora-sep.service aurora-sep-ready.service aurora-touchid-setup.service aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service
+%systemd_post aurora-sep.timer aurora-sep.service aurora-sep-ready.service aurora-touchid-setup.service aurora-sep-greeter-fingerprint.service
 
 %preun
-%systemd_preun aurora-sep.timer aurora-sep.service aurora-sep-ready.service aurora-touchid-setup.service aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service
+%systemd_preun aurora-sep.timer aurora-sep.service aurora-sep-ready.service aurora-touchid-setup.service aurora-sep-greeter-fingerprint.service
 
 %postun
 # Never restart them: the driver attaches to the enclave once per boot.
-%systemd_postun aurora-sep.timer aurora-sep.service aurora-sep-ready.service aurora-touchid-setup.service aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service
+%systemd_postun aurora-sep.timer aurora-sep.service aurora-sep-ready.service aurora-touchid-setup.service aurora-sep-greeter-fingerprint.service
 
 %pre selinux
 %selinux_relabel_pre -s %{selinuxtype}
@@ -185,7 +182,6 @@ fi
 %{_unitdir}/aurora-sep.service
 %{_unitdir}/aurora-sep-ready.service
 %{_unitdir}/aurora-sep-greeter-fingerprint.service
-%{_unitdir}/aurora-sep-greeter-refresh.service
 %dir %{_unitdir}/fprintd.service.d
 %{_unitdir}/fprintd.service.d/aurora-sep.conf
 %{_unitdir}/fprintd.service.d/50-aurora-sep-no-timeout.conf
