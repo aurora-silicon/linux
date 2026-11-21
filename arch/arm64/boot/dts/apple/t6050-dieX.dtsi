@@ -84,6 +84,13 @@
 			compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 			reg = <0x168 4>;
 			label = DIE_ATC1_LABEL(_usb);
+			/*
+			 * System sleep must not power this domain off: on J775c, resume then
+			 * hangs in the noirq power-on of the USB-C domains (USB, ACIO and ATC
+			 * PHY), and kept on, s2idle resumes. It also keeps its AON and
+			 * common parents, which the wake path needs, powered.
+			 */
+			apple,always-on;
 			#power-domain-cells = <0>;
 			#reset-cells = <0>;
 			power-domains = <&DIE_NODE(ps_atc1_common)>, <&DIE_NODE(ps_atc1_usb_aon)>;
