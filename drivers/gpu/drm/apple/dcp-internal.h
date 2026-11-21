@@ -220,9 +220,9 @@ struct dcp_panel {
 	int height_mm;
 	/// panel has a mini-LED backlight
 	bool has_mini_led;
-	/// peak panel luminance in nits, for EDR (desktop 26.x; 0 if unknown)
+	/// peak panel luminance in nits, for EDR (0 if unknown or no EDR headroom)
 	u32 peak_nits;
-	/// EDR headroom ceiling x1000 from the ADT (desktop 26.x; 0 if none)
+	/// EDR headroom ceiling x1000 from the ADT (0: the panel has no EDR headroom)
 	u32 edr_ceiling;
 	/// calibrated colour target from the raw ADT; NULL if not given
 	const struct dcp_color_space *color_target;
@@ -1294,6 +1294,18 @@ static inline void dcp_takeover_adopt_proven(struct apple_dcp *dcp)
 {
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->desktop)
 		WRITE_ONCE(dcp->desktop->takeover_adopted, false);
+}
+
+/*
+ * Firmware interfaces whose swaps carry EDR, i.e. that the driver's EDR path
+ * implements (dcp_edr_prepare()): desktop 26.x and firmware 27.  This is the
+ * interface ABI, not the panel: whether a panel has EDR headroom comes from
+ * its ADT (dcp_panel_edr()).
+ */
+static inline bool dcp_fw_swap_has_edr(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
 }
 
 static inline bool dcp_vrr_live(struct apple_dcp *dcp)
