@@ -1567,8 +1567,7 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 					      ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0);
 		if (ret == -ENOENT &&
 		    (ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
-		     (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
-		      of_device_is_compatible(ep->dcp->dev->of_node, "apple,dcpext")))) {
+		     (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 && ep->dcp->dcpext))) {
 			/*
 			 * M5 (H17G) announces powerlog-service with only
 			 * ep-has-desc-mgr and interface-id; match it by the

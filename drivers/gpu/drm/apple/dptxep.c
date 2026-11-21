@@ -1383,7 +1383,7 @@ int dptx_controller_init(struct apple_dcp *dcp)
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	/* Controller interfaces require the same OPEN handshake as the port. */
-	ep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
+	ep->wire_v2 = (dcp->hw.dptx_controller && dcp->fw_compat == DCP_FIRMWARE_V_27_0) ||
 		dcp->hw.iomfb_method_profile ==
 		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	dcp->dptx_controller_ep = ep;
@@ -1435,12 +1435,13 @@ int dptxep_init(struct apple_dcp *dcp)
 			 * up so a later announce can still bind.
 			 */
 			/*
-			 * A firmware-27 external processor on the M1/M2 generation
-			 * (T8112's 27.2 dcpext) does not announce it at boot either.
+			 * A firmware-27 external processor whose ports are not
+			 * on this endpoint announces nothing here either (a 27.2
+			 * dcpext on DPTX_ENDPOINT_V2 where its firmware does not
+			 * advertise DPTX_ENDPOINT, see dcp_v27_dptx_layout()).
 			 */
 			if (dcp_fw_is_14_7(dcp) ||
-			    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
-			     of_device_is_compatible(dcp->dev->of_node, "apple,dcpext"))) {
+			    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->dcpext)) {
 				dev_info(dcp->dev,
 					 "DPTX port %u not announced yet\n", port);
 				return 0;
