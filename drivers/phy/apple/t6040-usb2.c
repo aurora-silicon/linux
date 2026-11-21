@@ -5,10 +5,11 @@
  * This deliberately does not share the T8103/T8122 ATC PHY compatible. T6040
  * has CIO4/TB5-era resources and a different event-bank layout. The
  * implemented operations are the USB2 host and device sequences and the USB3
- * host attach (mode 4) decoded from the paired AppleT6040TypeCPhy driver.
+ * host attach (mode 4).
  *
  * USB2 device: the same eUSB2 power-on as the host, with the device tunables
- * from the boot loader instead of the host one, the role signature cleared and
+ * from the boot loader instead of the host one (without them the port stays a
+ * host), the role signature cleared and
  * VBUS forced valid (the Type-C port controller, not this PHY, sees VBUS: the
  * controller only enters device mode once the port controller has reported a
  * USB data connection from a host). The USB3 PHY has no device sequence, so a
@@ -341,7 +342,17 @@ static inline void t6040_usb2_clear32(void __iomem *reg, u32 clear)
 static int t6040_usb2_validate(struct phy *phy, enum phy_mode mode, int submode,
 			       union phy_configure_opts *opts)
 {
-	return mode == PHY_MODE_USB_HOST || mode == PHY_MODE_USB_DEVICE ? 0 : -EOPNOTSUPP;
+	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+
+	if (mode == PHY_MODE_USB_HOST)
+		return 0;
+	/*
+	 * Device mode runs on the boot loader's device tunables. Without them
+	 * the port stays a host rather than run an untuned device mode.
+	 */
+	if (mode == PHY_MODE_USB_DEVICE && tphy->tunable_usb2_device)
+		return 0;
+	return -EOPNOTSUPP;
 }
 
 static int t6040_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode)
@@ -438,16 +449,14 @@ static int t6040_usb2_power_on(struct phy *phy)
 		 * controller's: force it valid, or the controller sees no session
 		 * (J616s USB2 device row, aura#245, 2026-11-19).
 		 */
-		if (!tphy->tunable_usb2_device)
-			dev_dbg(tphy->dev, "USB2 device mode without device tunables\n");
 		apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_default);
 		apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_device);
 		t6040_usb2_clear32(tphy->usb2 + T6040_USB2_SIG, T6040_USB2_SIG_ROLE);
 		t6040_usb2_set32(tphy->usb2 + T6040_USB2_SIG, T6040_USB2_SIG_VBUSVLDEXT);
 	} else {
 		/*
-		 * The host tunable then sets the signal fields for host mode: on
-		 * the J616s it clears SIG[14:12] again (mask 0x7003, value 0x3).
+		 * The host tunable then sets the signal fields for host mode: it
+		 * clears SIG[14:12] again.
 		 * Left at their init values the USB2 port never sees a connect.
 		 * The default tunable, when the boot loader provides it, goes
 		 * first, as for a device: fields only the device tunable writes
