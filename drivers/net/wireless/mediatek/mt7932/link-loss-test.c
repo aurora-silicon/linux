@@ -8,7 +8,7 @@ struct mt_link_loss_test {
 	struct mt7932 m;
 	u8 *packet;
 	struct mt7932_event event;
-	unsigned int ended;
+	unsigned int ended, recovered;
 };
 
 static void mt_link_loss_test_release(struct device *dev)
@@ -24,10 +24,19 @@ static void mt_link_loss_test_disconnect_work(struct work_struct *work)
 	ctx->ended++;
 }
 
+static void mt_link_loss_test_recover_work(struct work_struct *work)
+{
+	struct mt_link_loss_test *ctx = container_of(work, struct mt_link_loss_test,
+						     m.recover_work);
+
+	ctx->recovered++;
+}
+
 static void mt_link_loss_test_cleanup(void *data)
 {
 	struct mt7932 *m = data;
 
+	cancel_work_sync(&m->recover_work);
 	cancel_work_sync(&m->disconnect_work);
 	free_netdev(m->netdev);
 	put_device(&m->pdev->dev);
@@ -57,6 +66,7 @@ static int mt_link_loss_test_init(struct kunit *test)
 		return ret;
 	}
 	INIT_WORK(&m->disconnect_work, mt_link_loss_test_disconnect_work);
+	INIT_WORK(&m->recover_work, mt_link_loss_test_recover_work);
 	m->netdev = alloc_etherdev(sizeof(m));
 	if (!m->netdev) {
 		put_device(&m->pdev->dev);
@@ -194,12 +204,36 @@ static void mt_beacon_timeout_ignored_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->ended, 0U);
 }
 
+static unsigned int mt_link_loss_test_recover(struct mt_link_loss_test *ctx)
+{
+	mt_request_recovery(&ctx->m, "test");
+	flush_work(&ctx->m.recover_work);
+	return ctx->recovered;
+}
+
+static void mt_recovery_request_test(struct kunit *test)
+{
+	struct mt_link_loss_test *ctx = test->priv;
+	struct mt7932 *m = &ctx->m;
+
+	/* Probe's own failure path settles a radio that never finished it. */
+	KUNIT_EXPECT_EQ(test, mt_link_loss_test_recover(ctx), 0U);
+	m->ready = true;
+	m->stopping = true;
+	KUNIT_EXPECT_EQ(test, mt_link_loss_test_recover(ctx), 0U);
+	m->stopping = false;
+	/* One reset per binding, however many latches ask for it. */
+	KUNIT_EXPECT_EQ(test, mt_link_loss_test_recover(ctx), 1U);
+	KUNIT_EXPECT_EQ(test, mt_link_loss_test_recover(ctx), 1U);
+}
+
 static struct kunit_case mt_link_loss_test_cases[] = {
 	KUNIT_CASE(mt_beacon_loss_span_test),
 	KUNIT_CASE(mt_beacon_timeout_ends_connection_test),
 	KUNIT_CASE(mt_beacon_timeout_recent_rx_test),
 	KUNIT_CASE(mt_beacon_timeout_stale_rx_test),
 	KUNIT_CASE(mt_beacon_timeout_ignored_test),
+	KUNIT_CASE(mt_recovery_request_test),
 	{}
 };
 

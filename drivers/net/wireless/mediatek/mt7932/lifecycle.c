@@ -1,5 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include <linux/soc/apple/pci-apple-piodma.h>
+
 #include "mt7932.h"
+
+/*
+ * The end of a connection or a scan that the firmware never confirmed leaves the
+ * driver unsure what the firmware still owns, so it refuses every later scan and
+ * connection. Only a reset settles that: restart the radio, as after a wake that
+ * lost it, rather than leave Wi-Fi refusing everything until a reboot. Once per
+ * binding, from any context, and neither before probe finished nor once stopping.
+ */
+void mt_request_recovery(struct mt7932 *m, const char *why)
+{
+	if (!READ_ONCE(m->ready) || READ_ONCE(m->stopping) || test_and_set_bit(0, &m->recovery))
+		return;
+	dev_warn(&m->pdev->dev, "%s, which only a reset settles: restarting the radio\n", why);
+	schedule_work(&m->recover_work);
+}
+
+void mt_recover_work(struct work_struct *work)
+{
+	apple_piodma_radio_recover();
+}
 
 /* Join all host users before resetting hardware. No RTNL/wiphy mutex held:
  * network callbacks and workers may need command_mutex while being joined.
@@ -47,8 +69,10 @@ void mt_stop_host(struct mt7932 *m)
 	}
 	/* A service invocation already in flight may have re-enabled the mask. */
 	mt_write(m, W + 0x204, 0);
-	if (!m->interface_registered)
+	if (!m->interface_registered) {
+		cancel_work_sync(&m->recover_work);
 		return;
+	}
 	cancel_work_sync(&m->startup_work);
 	/* Let an admitted connect publish its one terminal cfg80211 result. */
 	flush_work(&m->connect_work);
@@ -58,6 +82,8 @@ void mt_stop_host(struct mt7932 *m)
 	cancel_work_sync(&m->wow_work);
 	cancel_delayed_work_sync(&m->scan_timeout_work);
 	cancel_work_sync(&m->scan_finish_work);
+	/* After every worker that may ask for it. */
+	cancel_work_sync(&m->recover_work);
 	/* With all producers joined, this is the sole owner of any remainder. */
 	scan = m->scan_request;
 	m->scan_request = NULL;
