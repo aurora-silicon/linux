@@ -5870,14 +5870,37 @@ static bool dcp_v27_sleep_transport_supported(struct apple_dcp *dcp)
 	       !strcmp(compat, "27.0.0");
 }
 
+/*
+ * Firmware 27, if firmware-compat @compat_str has a 27.x method table with an
+ * ID for every method the driver calls: the firmware panics on an unknown tag.
+ */
+static enum dcp_firmware_version dcp_v27_method_table(struct device *dev,
+							const char *compat_str)
+{
+	const struct dcp_method_entry *methods = iomfb_v27_methods(compat_str);
+	unsigned int num_missing;
+	const char *missing;
+
+	if (!methods) {
+		dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
+			compat_str);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+	missing = iomfb_v27_missing_method(methods, &num_missing);
+	if (missing) {
+		dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
+			compat_str, num_missing, missing);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+	return DCP_FIRMWARE_V_27_0;
+}
+
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(dev);
 	const struct dcp_v14_board *v14_board;
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
-	unsigned int num_missing;
-	const char *missing;
 	int ret;
 
 	/*
@@ -5895,19 +5918,11 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret < 0 || !iomfb_v27_methods(compat_str)) {
-			dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
-				ret < 0 ? "missing" : compat_str);
+		if (ret < 0) {
+			dev_err(dev, "DCP firmware-compat missing has no 27.x method table\n");
 			return DCP_FIRMWARE_UNKNOWN;
 		}
-		missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
-						   &num_missing);
-		if (missing) {
-			dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
-				compat_str, num_missing, missing);
-			return DCP_FIRMWARE_UNKNOWN;
-		}
-		return DCP_FIRMWARE_V_27_0;
+		return dcp_v27_method_table(dev, compat_str);
 	}
 
 	/*
@@ -5935,21 +5950,8 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		    (!strcmp(fw_str, "26.5.2") || !strcmp(fw_str, "26.6.2")))
 			return DCP_FIRMWARE_V_26_6_DESKTOP;
 		if (apple_t6041_dcp_v27_2(dev->of_node) ||
-		    apple_t6041_dcpext_v27_2(dev->of_node)) {
-			if (!iomfb_v27_methods(compat_str)) {
-				dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
-					compat_str);
-				return DCP_FIRMWARE_UNKNOWN;
-			}
-			missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
-							   &num_missing);
-			if (missing) {
-				dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
-					compat_str, num_missing, missing);
-				return DCP_FIRMWARE_UNKNOWN;
-			}
-			return DCP_FIRMWARE_V_27_0;
-		}
+		    apple_t6041_dcpext_v27_2(dev->of_node))
+			return dcp_v27_method_table(dev, compat_str);
 		dev_err(dev, "T6041 display not started: unsupported DCP firmware %s (compat %s)\n",
 			ret >= 0 ? fw_str : "missing",
 			compat_ret >= 0 ? compat_str : "missing");

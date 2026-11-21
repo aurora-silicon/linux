@@ -211,6 +211,7 @@ def t6041_v27_admission(root):
     v27_tables = v27_c[v27_c.index('static const struct dcp_method_entry dcp_methods_27_0'):
                        v27_c.index('/* The template\'s calls resolve through')]
     dcp_c = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    method_table = block(dcp_c, 'static enum dcp_firmware_version dcp_v27_method_table(')
     selector_full = block(dcp_c, 'static enum dcp_firmware_version dcp_check_firmware_version(')
     cutoff = '\n\tret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);\n\tif (ret < 0)'
     selector = selector_full[:selector_full.index(cutoff)] + '\n\t(void)v14_board;\n\treturn DCP_FIRMWARE_UNKNOWN;\n}\n'
@@ -309,7 +310,7 @@ static int dcp_read_fw_version(struct device *dev, const char *name, char *out)
     snprintf(out, DCP_FW_VERSION_STR_LEN, "%u.%u.%u", v[0], v[1], v[2]);
     return 3;
 }
-''' + helper + '\n' + methods_decl + '\n' + v27_tables + '\n' + selector + r'''
+''' + helper + '\n' + methods_decl + '\n' + v27_tables + '\n' + method_table + '\n' + selector + r'''
 static struct device_node node;
 static struct apple_dcp_hw_data hw_t6041;
 static struct device dev = { .of_node = &node, .hw = &hw_t6041 };
