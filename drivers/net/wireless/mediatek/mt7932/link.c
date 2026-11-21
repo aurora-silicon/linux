@@ -1116,6 +1116,61 @@ void mt_disconnect_work(struct work_struct *work)
 	dev_dbg(&m->pdev->dev, "DISCONNECTED: teardown=%d local=%u\n", ret, local);
 }
 
+/*
+ * response_lock held, connected. The host ends the connection: the worker asks the
+ * firmware to leave the AP and reports the end once the firmware has let go of it.
+ */
+static void mt_end_connection_locked(struct mt7932 *m, u16 reason, bool local)
+{
+	m->connected = false;
+	m->disconnecting = true;
+	m->disconnect_seen = false;
+	m->disconnect_event_received = false;
+	m->disconnect_local = local;
+	m->disconnect_reason = reason;
+	if (!m->roam_moving)
+		netif_carrier_off(m->netdev);
+	netif_stop_queue(m->netdev);
+	reinit_completion(&m->disconnect_done);
+	schedule_work(&m->disconnect_work);
+}
+
+/*
+ * response_lock held. The firmware doesn't end a connection whose AP it lost; the
+ * stock driver does, unless the AP was heard from within its monitor window. Left
+ * alone, the station would stay associated in name and pass nothing until user
+ * space gave up on it. This is reported as from the AP, like the firmware's own
+ * disconnect, and with the reason mac80211 gives a lost connection, so that the
+ * supplicant tries the same AP again first.
+ */
+void mt_beacon_timeout_event(struct mt7932 *m, const struct mt7932_event *event)
+{
+	const u8 *body = event->packet + 36;
+	bool rx_recent = false;
+
+	if (event->length < 36 + MT7932_BEACON_TIMEOUT_LENGTH || !m->netdev)
+		return;
+	/* BSS 0 is the station's. */
+	if (body[0] || !m->connected || m->disconnecting || m->stopping)
+		return;
+	/* Pairs with the release that publishes the data path and its lock. */
+	if (smp_load_acquire(&m->data_ready)) {
+		spin_lock(&m->data_lock);
+		rx_recent = m->station_rx_packets &&
+			    time_before(jiffies, m->station_rx_time +
+					msecs_to_jiffies(MT7932_BEACON_TIMEOUT_RX_WINDOW_MS));
+		spin_unlock(&m->data_lock);
+	}
+	if (!mt7932_beacon_timeout_lost(body[1], rx_recent)) {
+		dev_dbg(&m->pdev->dev, "beacon timeout %u: the AP was just heard from, link kept\n",
+			body[1]);
+		return;
+	}
+	dev_info(&m->pdev->dev, "connection lost: the firmware lost the AP (reason %u, deauthentication %u)\n",
+		 body[1], get_unaligned_le16(body + 2));
+	mt_end_connection_locked(m, WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY, false);
+}
+
 int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)
 {
 	struct mt7932 *m = mt_from_wiphy(wiphy);
@@ -1138,17 +1193,7 @@ int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)
 		complete(&m->assoc_done);
 		complete(&m->discovery_done);
 	} else if (m->connected) {
-		m->connected = false;
-		m->disconnecting = true;
-		m->disconnect_seen = false;
-		m->disconnect_event_received = false;
-		m->disconnect_local = true;
-		m->disconnect_reason = reason;
-		if (!m->roam_moving)
-			netif_carrier_off(m->netdev);
-		netif_stop_queue(m->netdev);
-		reinit_completion(&m->disconnect_done);
-		schedule_work(&m->disconnect_work);
+		mt_end_connection_locked(m, reason, true);
 	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	/* iwd may issue its next connect as soon as this command is ACKed.

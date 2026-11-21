@@ -189,6 +189,12 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		mt_link_event(m, &event);
 		goto unlock;
 	}
+	/* The station-record command, which AWDL sends, answers with the same ID. */
+	if (event.eid == MT7932_EID_BEACON_TIMEOUT &&
+	    !mt7932_event_matches(&event, m->waiting, m->waiting_eid)) {
+		mt_beacon_timeout_event(m, &event);
+		goto unlock;
+	}
 	if (event.eid == MT7932_EID_WOW_REASON) {
 		mt_wow_reason_event(m, &event);
 		goto unlock;

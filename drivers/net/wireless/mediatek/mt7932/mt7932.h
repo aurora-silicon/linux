@@ -216,6 +216,8 @@ struct mt7932 {
 	struct rate_info station_rx_rate;
 	unsigned long station_rx_rate_time;
 	bool station_rx_rate_valid;
+	/* The last frame from the AP, once station_rx_packets counts one. */
+	unsigned long station_rx_time;
 	/* Connection quality monitor, protected by response_lock. */
 	struct ewma_mt7932_signal cqm_signal;
 	unsigned long cqm_sample_time;
@@ -289,6 +291,24 @@ static inline bool mt7932_disconnect_local(bool local, bool landed)
 	return local && !landed;
 }
 
+/*
+ * The firmware lost a BSS's AP: its beacons, or the answers to the frames it
+ * sends to keep the link. It leaves ending the connection to the host. The body
+ * is the BSS index, the firmware's reason and a le16 deauthentication reason.
+ */
+#define MT7932_EID_BEACON_TIMEOUT		0x13
+#define MT7932_BEACON_TIMEOUT_LENGTH		4
+/* The stock driver ends the connection for this reason whatever it received. */
+#define MT7932_BEACON_TIMEOUT_NO_RESPONSE	0x0e
+/* For any other, a frame from the AP within its monitor window keeps the link. */
+#define MT7932_BEACON_TIMEOUT_RX_WINDOW_MS	2000
+
+/* Whether a beacon timeout ends the connection, as the stock driver decides it. */
+static inline bool mt7932_beacon_timeout_lost(u8 reason, bool rx_recent)
+{
+	return reason == MT7932_BEACON_TIMEOUT_NO_RESPONSE || !rx_recent;
+}
+
 bool mt_rf_allowed(struct mt7932 *m);
 void mt_retry_missing_policy(struct mt7932 *m);
 int mt_6g_connect_policy(struct mt7932 *m, const struct mt7932_6g_ap *ap);
@@ -335,6 +355,7 @@ int mt_register_interface(struct mt7932 *m);
 int mt_enable_scan(struct mt7932 *m);
 void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length);
 void mt_link_event(struct mt7932 *m, const struct mt7932_event *event);
+void mt_beacon_timeout_event(struct mt7932 *m, const struct mt7932_event *event);
 struct cfg80211_bss *mt_connect_find_bss(struct mt7932 *m);
 void mt_connect_work(struct work_struct *work);
 int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
