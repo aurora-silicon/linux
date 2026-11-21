@@ -72,6 +72,8 @@ const BOOTARGS_UUID_VERSION: u32 = 5;
 const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
 const ASC_CPU_CONTROL_OFFSET: usize = 0x44;
+/// The RTKit header word holding the SRAM offset of the firmware's data segment.
+const SRAM_DATA_START: usize = 0x234;
 const PMP_ENDPOINT: u8 = 0x20;
 const PM_COMMAND_MARKER: u64 = pmp_power::MARKER;
 const PM_COMMAND_SHIFT: u32 = pmp_power::SHIFT;
@@ -181,6 +183,8 @@ struct PmpData {
     display_error: AtomicI32,
     /// See [`PmpHwConfig::sram_backup`].
     sram_backup: Option<(usize, usize)>,
+    /// See [`PmpHwConfig::sram_backup_data`].
+    sram_backup_data: bool,
 }
 
 impl PmpData {
@@ -189,22 +193,18 @@ impl PmpData {
         let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?.into_devres()?;
         let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?.into_devres()?;
-        // The SRAM range kept over a sleep, if the SoC's config has none: from the DT, where
-        // the boot loader puts it.
-        let sram_backup = match cfg.sram_backup {
-            Some(range) => Some(range),
-            None => {
-                let node = dev.as_ref().fwnode().ok_or(EIO)?;
-                let prop_name = c"apple,sram-keep";
-                if node.property_present(prop_name) {
-                    let v = node
-                        .property_read_array_vec::<u32>(prop_name, 2)?
-                        .required_by(dev.as_ref())?;
-                    Some((v[0] as usize, v[1] as usize))
-                } else {
-                    None
-                }
-            }
+        // The SRAM range kept over a sleep: prefer the DT property (`apple,sram-keep`, where
+        // the boot loader supplies the exact offset and size from ADT segment-ranges) when
+        // present, otherwise fall back to the SoC's config.
+        let node = dev.as_ref().fwnode().ok_or(EIO)?;
+        let prop_name = c"apple,sram-keep";
+        let (sram_backup, sram_backup_data) = if node.property_present(prop_name) {
+            let v = node
+                .property_read_array_vec::<u32>(prop_name, 2)?
+                .required_by(dev.as_ref())?;
+            (Some((v[0] as usize, v[1] as usize)), false)
+        } else {
+            (cfg.sram_backup, cfg.sram_backup_data)
         };
         Arc::pin_init(
             try_pin_init!(
@@ -219,6 +219,7 @@ impl PmpData {
                     display: AtomicPtr::new(core::ptr::null_mut()),
                     display_error: AtomicI32::new(0),
                     sram_backup,
+                    sram_backup_data,
                 }
             ),
             GFP_KERNEL,
@@ -485,10 +486,20 @@ impl PmpData {
             .cast())
     }
     /// Room for what SRAM needs kept, taken first so that running out refuses a sleep cleanly.
-    fn sram_alloc(&self, sram_size: usize) -> Result<Option<SramCopy>> {
-        let Some((offset, size)) = self.sram_backup else {
+    fn sram_alloc(&self, io: &Mmio<'_, Region<PMP_MIN_MMIO_SIZE>>) -> Result<Option<SramCopy>> {
+        let sram_size = io.size();
+        let Some((mut offset, size)) = self.sram_backup else {
             return Ok(None);
         };
+        if self.sram_backup_data {
+            let data = io.as_view().relaxed().read32(SRAM_DATA_START) as usize;
+            // The segment starts on one of the image's 4 KiB pages.
+            if data % 0x1000 != 0 {
+                dev_err!(self.dev, "firmware data segment at {:#x}\n", data);
+                return Err(EINVAL);
+            }
+            offset = data;
+        }
         if !pmp_bootargs::word_range_valid(offset, size, sram_size) {
             return Err(EINVAL);
         }
@@ -502,7 +513,7 @@ impl PmpData {
         let bound_dev = unsafe { self.dev.as_bound() };
         let pmp_mmio = self.pmp_mmio.access(bound_dev)?.as_view();
         let io = pmp_mmio.as_view().relaxed();
-        let mut copy = self.sram_alloc(io.size())?;
+        let mut copy = self.sram_alloc(&pmp_mmio)?;
         let rtk = self.rtkit_handle()?;
         let control = self.asc_cpu_control()?;
         // SAFETY: the handle stays valid until unbind, which can't run during a system sleep,
@@ -529,8 +540,7 @@ impl PmpData {
         // SAFETY: the PM core only calls a bound device.
         let bound_dev = unsafe { self.dev.as_bound() };
         let pmp_mmio = self.pmp_mmio.access(bound_dev)?.as_view();
-        let size = pmp_mmio.as_view().relaxed().size();
-        let mut copy = self.sram_alloc(size)?;
+        let mut copy = self.sram_alloc(&pmp_mmio)?;
         stop.rtk = self.rtkit_handle()?;
         stop.control = self.asc_cpu_control()?;
         stop.sram = core::ptr::null_mut();
@@ -850,6 +860,9 @@ struct PmpHwConfig {
     /// The range of the firmware's SRAM, as (offset, size) in bytes, that a system sleep keeps
     /// and writes back. `None` where no sleep has been traced.
     sram_backup: Option<(usize, usize)>,
+    /// The range kept is the firmware's data segment: its offset comes from the firmware's
+    /// header ([`SRAM_DATA_START`]), and `sram_backup` gives its size.
+    sram_backup_data: bool,
 }
 
 /// Whether a PMP firmware needs endpoint 7 to finish its RTKit boot.
@@ -868,6 +881,7 @@ const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
     sram_backup: None,
+    sram_backup_data: false,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
@@ -876,6 +890,7 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
     sram_backup: Some((0x3c000, 0x5c000)),
+    sram_backup_data: false,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
@@ -886,6 +901,7 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: true,
     coreanalytics: Ep7::Always,
     sram_backup: None,
+    sram_backup_data: false,
 };
 
 /// T8142: the DART window starts at 1 TiB as on T8140. Its registry-v2
@@ -896,6 +912,7 @@ const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::Always,
     sram_backup: None,
+    sram_backup_data: false,
 };
 
 /// T6050: the DART window starts at 1 TiB (ADT dart-pmp0 vm-base) and spans
@@ -906,15 +923,19 @@ const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
     sram_backup: None,
+    sram_backup_data: false,
 };
 
-/// T8132: the sleep engine reloads `__TEXT` from DRAM at the wake, and only `__DATA`
-/// (the ADT's second segment) has to be kept.
+/// T8132: over a sleep only the ADT's second segment (0x68000 bytes, starting at 0x3c000 on
+/// 26.6.2/25G83 and 0x3d000 on 27.2/26B123 per ADT `segment-ranges` and SRAM header word 0x234)
+/// needs to be kept. When the boot loader supplies `apple,sram-keep`, both offset and size come
+/// from the DT instead of this fallback.
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
     coreanalytics: Ep7::RetainedBoard,
     sram_backup: Some((0x3c000, 0x68000)),
+    sram_backup_data: true,
 };
 
 impl Drop for PmpDriver {
