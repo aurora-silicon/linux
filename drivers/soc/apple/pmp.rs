@@ -138,6 +138,9 @@ struct PmpState {
     allocs: KVec<PmpAllocation>,
     value_buf: Option<u64>,
     ioreg_entries: KVec<u32>,
+    /// The firmware's own index of each entry in `ioreg_entries` (word 0x48 of its
+    /// REGISTER_IOREG buffer), by which UPDATE_IOREG names the entry.
+    ioreg_ids: KVec<u32>,
     /// Held from a system sleep's start until its end.
     sram: Option<SramCopy>,
 }
@@ -149,6 +152,7 @@ impl PmpState {
             allocs: KVec::with_capacity(10, GFP_KERNEL)?,
             value_buf: None,
             ioreg_entries: KVec::with_capacity(340, GFP_KERNEL)?,
+            ioreg_ids: KVec::with_capacity(340, GFP_KERNEL)?,
             sram: None,
         })
     }
@@ -393,6 +397,14 @@ impl PmpData {
         let mut size = u32::from_le_bytes(unsafe {
             <&[u8] as TryInto<[u8; 4]>>::try_into(&msg_buf.as_ref()[0x40..0x44]).unwrap()
         });
+        let id = if msg_buf.size() >= 0x4c {
+            // SAFETY: TODO
+            u32::from_le_bytes(unsafe {
+                <&[u8] as TryInto<[u8; 4]>>::try_into(&msg_buf.as_ref()[0x48..0x4c]).unwrap()
+            })
+        } else {
+            u32::MAX
+        };
         if size == 0 {
             let mut name_vec = KVec::with_capacity(0x31, GFP_KERNEL)?;
             name_vec
@@ -440,6 +452,7 @@ impl PmpData {
             }
         }
         state.ioreg_entries.push(size, GFP_KERNEL)?;
+        state.ioreg_ids.push(id, GFP_KERNEL)?;
         let index = state.ioreg_entries.len() as u64;
         let msg = (OPC_REGISTER_IOREG | OPC_ACK_MASK) << OPC_SHIFT | (index << 32) | size as u64;
         Ok(msg)
@@ -592,6 +605,30 @@ impl PmpData {
         // and `control` is inside the ASC mapping held by `self`.
         to_result(unsafe { bindings::apple_rtkit_sleep_return(rtk, control) })
     }
+    /// CONFIRM_IOREG's value for an UPDATE_IOREG: the length of the entry the firmware names by
+    /// its own index, as registered. macOS 27.2 answers so on the M4 Mac mini (J773g), 8 for each
+    /// of the four entries that image updates. An index that names no registered entry, which
+    /// macOS doesn't see, gets 0, the answer this driver gave before.
+    fn confirm_ioreg_value(&self, id: u64) -> u64 {
+        let state = self.state.lock();
+        let found = state
+            .ioreg_ids
+            .iter()
+            .position(|&e| u64::from(e) == id)
+            .and_then(|i| state.ioreg_entries.get(i).copied());
+        drop(state);
+        match found {
+            Some(len) => u64::from(len),
+            None => {
+                dev_warn!(
+                    self.dev,
+                    "UPDATE_IOREG {:#x} names no registered entry\n",
+                    id
+                );
+                0
+            }
+        }
+    }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
@@ -619,8 +656,11 @@ impl PmpData {
             OPC_REGISTER_IOREG => self.register_ioreg(msg & MSG_IOVA_MASK)?,
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
             // Firmware waits for this confirmation before publishing reports.
-            // Do not echo the registry index/payload or add a generic ACK bit.
-            OPC_UPDATE_IOREG => OPC_CONFIRM_IOREG << OPC_SHIFT,
+            // Do not echo the registry index or add a generic ACK bit.
+            OPC_UPDATE_IOREG => {
+                OPC_CONFIRM_IOREG << OPC_SHIFT
+                    | self.confirm_ioreg_value(msg & SET_IOREG_INDEX_MASK)
+            }
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
                 return Err(EIO);
