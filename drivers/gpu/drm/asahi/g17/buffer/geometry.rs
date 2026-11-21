@@ -20,6 +20,9 @@ impl BlockGeometry {
     pub(crate) const PAGE: usize = 0x8000;
     /// M5 parameter resources use 32-bit offsets from this compact base.
     pub(crate) const M5_COMPACT: core::ops::Range<u64> = 0x10_0000_0000..0x11_0000_0000;
+    /// The M5 fragment pipeline also reads compact-window objects at this base plus their
+    /// compact offset. Client VMs mirror every compact-window page here.
+    pub(crate) const M5_COMPACT_MIRROR: u64 = 0x200_0000_0000;
     pub(crate) const NEO: Self = Self {
         base: cfg::USER_BASE,
         end: cfg::USER_END,
@@ -40,8 +43,10 @@ impl BlockGeometry {
         Ok(Self {
             base: Self::M5_COMPACT.start,
             end: Self::M5_COMPACT.end,
+            // The fragment pipeline reads up to 0x6240 bytes past a block's end, so each
+            // block is mapped with 0x8000 bytes of trailing backing instead of a guard.
             block_bytes: 0x80000,
-            backing_stride: 0x80000,
+            backing_stride: 0x88000,
             stride: 0x88000,
             capacity,
         })

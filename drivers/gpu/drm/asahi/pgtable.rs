@@ -448,6 +448,9 @@ pub(crate) struct UatPageTable {
     /// Clean new tables and changed entries to the point of coherency, for a UAT walker that does
     /// not snoop the CPU caches ([`Self::enable_clean_poc`]).
     clean_poc: bool,
+    /// A window whose leaves are also written at the window address plus an offset
+    /// ([`Self::set_mirror`]).
+    mirror: Option<(Range<u64>, u64)>,
 }
 
 impl UatPageTable {
@@ -466,6 +469,7 @@ impl UatPageTable {
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
             clean_poc: false,
+            mirror: None,
         })
     }
 
@@ -487,6 +491,42 @@ impl UatPageTable {
             })
         }?;
         poc_barrier();
+        Ok(())
+    }
+
+    /// Writes every leaf of `window` also at `window + offset`: map, permission change and unmap
+    /// apply to both copies. Set before anything in `window` is mapped. The caller keeps the
+    /// mirrored range free of other mappings.
+    pub(crate) fn set_mirror(&mut self, window: Range<u64>, offset: u64) -> Result {
+        let end = window.end.checked_add(offset).ok_or(EOVERFLOW)?;
+        if window.is_empty() || (window.start | window.end | offset) & UAT_PGMSK as u64 != 0
+            || end > self.va_range.end || self.mirror.is_some()
+        {
+            return Err(EINVAL);
+        }
+        self.mirror = Some((window, offset));
+        Ok(())
+    }
+
+    /// The mirror copy of the part of `range` inside the mirrored window, and that part's
+    /// distance from `range.start`.
+    pub(crate) fn mirrored(&self, range: &Range<u64>) -> Option<(Range<u64>, u64)> {
+        let (window, offset) = self.mirror.as_ref()?;
+        let start = range.start.max(window.start);
+        let end = range.end.min(window.end);
+        (start < end).then(|| (start + offset..end + offset, start - range.start))
+    }
+
+    /// Runs `op` on `range` and then on its mirror copy, passing each part's distance from
+    /// `range.start`.
+    fn with_mirror(&mut self, range: Range<u64>,
+        mut op: impl FnMut(&mut Self, Range<u64>, u64) -> Result) -> Result
+    {
+        let mirror = self.mirrored(&range);
+        op(self, range, 0)?;
+        if let Some((copy, skip)) = mirror {
+            op(self, copy, skip)?;
+        }
         Ok(())
     }
 
@@ -548,6 +588,7 @@ impl UatPageTable {
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
             clean_poc: false,
+            mirror: None,
         })
     }
 
@@ -975,7 +1016,7 @@ impl UatPageTable {
 
     pub(crate) fn alloc_pages(&mut self, iova_range: Range<u64>) -> Result {
         mod_pr_debug!("UATPageTable::alloc_pages: {:#x?}\n", iova_range);
-        self.with_pages(iova_range, true, false, |_, _| Ok(()))
+        self.with_mirror(iova_range, |pt, range, _| pt.with_pages(range, true, false, |_, _| Ok(())))
     }
 
     /// Reserve all tables for a fixed mapping before publishing any leaves.
@@ -985,11 +1026,13 @@ impl UatPageTable {
         if range.is_empty() || (range.start | range.end) & UAT_PGMSK as u64 != 0 {
             return Err(EINVAL);
         }
-        self.with_pages(range.clone(), false, false, |_, ptes| {
-            if ptes.iter().any(|pte| pte.load(Ordering::Acquire) != 0) {
-                return Err(EBUSY);
-            }
-            Ok(())
+        self.with_mirror(range.clone(), |pt, range, _| {
+            pt.with_pages(range, false, false, |_, ptes| {
+                if ptes.iter().any(|pte| pte.load(Ordering::Acquire) != 0) {
+                    return Err(EBUSY);
+                }
+                Ok(())
+            })
         })?;
         self.alloc_pages(range)
     }
@@ -1014,6 +1057,19 @@ impl UatPageTable {
     }
 
     pub(crate) fn map_pages(
+        &mut self,
+        iova_range: Range<u64>,
+        phys: PhysicalAddr,
+        prot: Prot,
+        one_page: bool,
+    ) -> Result {
+        self.with_mirror(iova_range, |pt, range, skip| {
+            let phys = if one_page { phys } else { phys + skip as PhysicalAddr };
+            pt.map_pages_once(range, phys, prot, one_page)
+        })
+    }
+
+    fn map_pages_once(
         &mut self,
         iova_range: Range<u64>,
         mut phys: PhysicalAddr,
@@ -1064,6 +1120,10 @@ impl UatPageTable {
     /// store: its failure path clears the whole range it asked for, which would otherwise
     /// also clear the other mapping's leaves.
     pub(crate) fn ensure_unmapped(&mut self, iova_range: Range<u64>) -> Result {
+        self.with_mirror(iova_range, |pt, range, _| pt.ensure_unmapped_once(range))
+    }
+
+    fn ensure_unmapped_once(&mut self, iova_range: Range<u64>) -> Result {
         self.walk(iova_range, false, false, false, |iova, ptes| {
             match ptes.iter().position(|pte| pte.load(Ordering::Relaxed) != 0) {
                 Some(idx) => {
@@ -1080,6 +1140,10 @@ impl UatPageTable {
     }
 
     pub(crate) fn reprot_pages(&mut self, iova_range: Range<u64>, prot: Prot) -> Result {
+        self.with_mirror(iova_range, |pt, range, _| pt.reprot_pages_once(range, prot))
+    }
+
+    fn reprot_pages_once(&mut self, iova_range: Range<u64>, prot: Prot) -> Result {
         mod_pr_debug!(
             "UATPageTable::reprot_pages: {:#x?} {:?}\n",
             iova_range,
@@ -1104,6 +1168,10 @@ impl UatPageTable {
     }
 
     pub(crate) fn unmap_pages(&mut self, iova_range: Range<u64>) -> Result {
+        self.with_mirror(iova_range, |pt, range, _| pt.unmap_pages_once(range))
+    }
+
+    fn unmap_pages_once(&mut self, iova_range: Range<u64>) -> Result {
         mod_pr_debug!("UATPageTable::unmap_pages: {:#x?}\n", iova_range);
         self.walk(iova_range, false, false, true, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {
@@ -1122,6 +1190,10 @@ impl UatPageTable {
     /// Discards an aligned map operation that failed before acquiring a GPUVA owner.
     /// Missing tables and leaves are expected; existing table storage stays allocated.
     pub(crate) fn discard_partial_map(&mut self, iova_range: Range<u64>) -> Result {
+        self.with_mirror(iova_range, |pt, range, _| pt.discard_partial_map_once(range))
+    }
+
+    fn discard_partial_map_once(&mut self, iova_range: Range<u64>) -> Result {
         self.walk(iova_range, false, false, true, |_, ptes| {
             for pte in ptes {
                 pte.store(0, Ordering::Relaxed);
