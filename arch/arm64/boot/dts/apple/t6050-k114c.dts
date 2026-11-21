@@ -23,6 +23,7 @@
 };
 
 #include "t6050-peripherals.dtsi"
+#include "t6050-media.dtsi"
 
 / {
 	aliases {

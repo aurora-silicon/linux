@@ -3192,6 +3192,8 @@
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x22 0x830a0000 0x0 0xc000>,
 		      <0x22 0x830b0000 0x0 0x4000>;
+		/* No apple,dapf-ranges: the driver leaves the DAPF page alone. */
+		reg-names = "dart", "dapf";
 		interrupts = <AIC_IRQ 0 2432 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc0_sys>;
 		#iommu-cells = <1>;
@@ -3203,6 +3205,7 @@
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x22 0x83080000 0x0 0xc000>,
 		      <0x22 0x83094000 0x0 0x4000>;
+		reg-names = "dart", "auxiliary";
 		interrupts = <AIC_IRQ 0 2432 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc0_sys>;
 		#iommu-cells = <1>;
@@ -3312,6 +3315,7 @@
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x22 0x81020000 0x0 0xc000>,
 		      <0x2 0x74000000 0x0 0x4000>;
+		reg-names = "dart", "auxiliary";
 		interrupts = <AIC_IRQ 0 1356 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_jpg>;
 		#iommu-cells = <1>;
