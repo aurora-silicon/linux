@@ -1035,14 +1035,14 @@ static void apple_smc_dark_wake(struct apple_smc *smc)
 	const char *why = is_radio ? "wifibt" : "USB-C_plug";
 	s64 asleep_ms;
 
-	/* The J714s's rule alone: other boards with a sleep policy keep these wakes full. */
-	if (smc->wake_reasons != apple_smc_j714s_wake_reasons)
-		return;
 	/* Already dark (a port's wake with the lid closed): counted, so the re-entry waits as after ours. */
 	if (pm_dark_wake()) {
 		smc->dark_wakes++;
 		return;
 	}
+	/* The J714s's rule alone: other boards with a sleep policy keep these wakes full. */
+	if (smc->wake_reasons != apple_smc_j714s_wake_reasons)
+		return;
 	if (!is_radio && (port < 0 || smc->wake_record != BIT_ULL(port)))
 		return;
 	asleep_ms = ktime_ms_delta(ktime_get_boottime(), smc->sleep_entry_boot) -
@@ -1583,7 +1583,7 @@ static int apple_smc_prepare_policy(struct apple_smc *smc)
 
 /*
  * The saved-context guard, under the command mutex, without waiting for it: a sleep a user asks
- * for doesn't wait on a stuck command. The re-entry right after a J714s dark wake does, for at
+ * for doesn't wait on a stuck command. The re-entry right after a counted dark wake does, for at
  * most SMC_DARK_REENTRY_MS: the notification of the event that woke it is still being handled
  * then, its ordinary command in flight, and refusing ended every dark wake in a full one.
  */
