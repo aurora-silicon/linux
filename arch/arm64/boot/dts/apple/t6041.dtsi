@@ -334,6 +334,11 @@
 &smc {
 	reg = <0x5 0x0c600000 0x0 0x4000>,
 	      <0x5 0x0de00000 0x0 0x170000>;
+	apple,sleep-wake-type;
+};
+
+&dcp {
+	apple,sleep-host-stop;
 };
 
 &pmc {
