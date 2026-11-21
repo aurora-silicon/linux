@@ -3474,13 +3474,95 @@ static bool __init gate_has_typec_routes(struct device_node *dcp)
 	return has;
 }
 
-static void __init gate_j713_dcpext_v27(void)
+/*
+ * The display subsystem's iommus with each display DART in @darts that it
+ * does not name yet appended once, on the stream ID the subsystem uses on its
+ * own display DART (its first entry): the scanout of every pipe has the same
+ * stream layout.
+ */
+static int __init gate_t8132_v27_display_iommus(struct of_changeset *cs,
+						struct device_node *display,
+						struct device_node *const *darts, unsigned int n)
+{
+	bool present[2] = {};
+	struct of_phandle_args args;
+	unsigned int add = 0, i, k, nr = 0;
+	struct property *prop;
+	__be32 *value;
+	u32 sid = 0;
+	int ret;
+
+	if (n > ARRAY_SIZE(present))
+		return -E2BIG;
+	for (i = 0; !of_parse_phandle_with_args(display, "iommus", "#iommu-cells", i, &args); i++) {
+		bool one_cell = args.args_count == 1;
+
+		if (one_cell && !i)
+			sid = args.args[0];
+		for (k = 0; k < n; k++)
+			if (args.np == darts[k])
+				present[k] = true;
+		of_node_put(args.np);
+		if (!one_cell)
+			return -EINVAL;
+		nr++;
+	}
+	if (!nr)
+		return -EINVAL;
+	for (k = 0; k < n; k++) {
+		if (!darts[k]->phandle)
+			return -EINVAL;
+		/* Two dcpexts never share a display DART; count each once. */
+		for (i = 0; i < k; i++)
+			if (darts[i] == darts[k])
+				present[k] = true;
+		if (!present[k])
+			add++;
+	}
+	if (!add)
+		return 0;
+
+	prop = kzalloc_obj(*prop);
+	value = kmalloc_array(2 * (nr + add), sizeof(*value), GFP_KERNEL);
+	if (!prop || !value) {
+		kfree(prop);
+		kfree(value);
+		return -ENOMEM;
+	}
+	memcpy(value, of_get_property(display, "iommus", NULL), 2 * nr * sizeof(*value));
+	for (i = 2 * nr, k = 0; k < n; k++) {
+		if (present[k])
+			continue;
+		value[i++] = cpu_to_be32(darts[k]->phandle);
+		value[i++] = cpu_to_be32(sid);
+	}
+	prop->name = "iommus";
+	prop->length = 2 * (nr + add) * sizeof(*value);
+	prop->value = value;
+	ret = of_changeset_update_property(cs, display, prop);
+	/*
+	 * Once in the changeset, an applied or reverted update leaves it on the
+	 * node's dead properties, as the of_changeset_update_prop_*() helpers do.
+	 */
+	if (ret) {
+		kfree(prop);
+		kfree(value);
+	}
+	return ret;
+}
+
+/*
+ * Selected by its nodes alone, on any board and either firmware path: an
+ * available T8132 dcpext handed over with the 27.2 image
+ * (apple_t8132_dcpext_v27_2()) that has Type-C routes, its text, data and
+ * heap firmware memory, and an enabled display subsystem. A fixed-PHY dcpext
+ * (the J773g's HDMI dcpext0) has no Type-C routes and keeps its own chain.
+ */
+static void __init gate_t8132_dcpext_v27(void)
 {
 	struct device_node *darts[2] = {}, *display, *np;
 	struct of_changeset *cs;
-	struct property *old, *prop;
 	unsigned int n = 0, i;
-	__be32 *value;
 	int ret = 0;
 
 	display = of_find_compatible_node(NULL, NULL, "apple,t8132-display-subsystem");
@@ -3523,42 +3605,11 @@ static void __init gate_j713_dcpext_v27(void)
 		}
 		n++;
 	}
-	if (ret || !n)
-		goto out;
-
-	/* The display subsystem's iommus, each new display DART appended once. */
-	old = of_find_property(display, "iommus", NULL);
-	if (!old || old->length % (2 * sizeof(__be32))) {
-		ret = -EINVAL;
-		goto out;
-	}
-	prop = kzalloc_obj(*prop);
-	value = kmalloc(old->length + n * 2 * sizeof(*value), GFP_KERNEL);
-	if (!prop || !value) {
-		kfree(prop);
-		kfree(value);
-		ret = -ENOMEM;
-		goto out;
-	}
-	memcpy(value, old->value, old->length);
-	for (i = 0; i < n; i++) {
-		value[old->length / sizeof(*value) + 2 * i] = cpu_to_be32(darts[i]->phandle);
-		value[old->length / sizeof(*value) + 2 * i + 1] = cpu_to_be32(0);
-		if (!darts[i]->phandle)
-			ret = -EINVAL;
-	}
-	prop->name = "iommus";
-	prop->length = old->length + n * 2 * sizeof(*value);
-	prop->value = value;
-	if (ret) {
-		kfree(prop);
-		kfree(value);
-		goto out;
-	}
-	ret = of_changeset_update_property(cs, display, prop);
-	if (!ret)
+	if (!ret && n)
+		ret = gate_t8132_v27_display_iommus(cs, display, darts, n);
+	if (!ret && n)
 		ret = of_changeset_apply(cs);
-out:
+
 	for (i = 0; i < ARRAY_SIZE(darts); i++)
 		of_node_put(darts[i]);
 	of_node_put(display);
@@ -3694,22 +3745,20 @@ static void __init gate_t8132_j773g_run(void)
 	of_node_put(display);
 }
 
-/* Runs before of_platform_default_populate_init() at arch_initcall_sync. */
-static int __init apple_display_gate(void)
+static void __init apple_display_gate_soc(void)
 {
 	int i;
 
 	if (apple_t8132_firmware_path()) {
 		gate_j713_dcpext_routes();
-		gate_j713_dcpext_v27();
-		return 0;
+		return;
 	}
 
 	for (i = 0; i < ARRAY_SIZE(gate_socs) && !gate_soc; i++)
 		if (of_machine_is_compatible(gate_socs[i]->machine))
 			gate_soc = gate_socs[i];
 	if (!gate_soc)
-		return 0;
+		return;
 
 	/* The exact 25G83 tree (J613; J615 experimental) has its own firmware and PMP admission gate. */
 	if (of_machine_is_compatible("apple,j613") || of_machine_is_compatible("apple,j615")) {
@@ -3718,13 +3767,25 @@ static int __init apple_display_gate(void)
 
 		of_node_put(dcp);
 		if (native)
-			return 0;
+			return;
 	}
 
 	if (gate_soc->run)
 		gate_soc->run();
 	else
 		gate_run();
+}
+
+/* Runs before of_platform_default_populate_init() at arch_initcall_sync. */
+static int __init apple_display_gate(void)
+{
+	apple_display_gate_soc();
+	/*
+	 * After the SoC's own gate, which may set the display subsystem's
+	 * iommus (the J773g's HDMI chain): the 27.2 Type-C dcpexts' display
+	 * DARTs are appended to whatever it left.
+	 */
+	gate_t8132_dcpext_v27();
 	return 0;
 }
 arch_initcall(apple_display_gate);
