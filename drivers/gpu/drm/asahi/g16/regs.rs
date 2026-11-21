@@ -248,6 +248,11 @@ impl Regs {
         }
     }
 
+    /// The host-owned device-control generation as the GPU sees it (stall diagnostics).
+    pub(crate) fn generation(&self) -> Result<u32> {
+        self.generation.io().try_read32(0)
+    }
+
     /// Publishes the host-owned device-control generation and verifies the receipt.
     pub(crate) fn set_generation(&self, value: u32) -> Result {
         self.generation.io().try_write32(value, 0)?;

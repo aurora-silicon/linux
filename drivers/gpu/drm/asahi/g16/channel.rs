@@ -265,6 +265,44 @@ impl Channels {
         init.log_firmware_state(d, why);
     }
 
+    /// Stall diagnostics: every ring's indices (submit channels with the host producers, the
+    /// receive rings and the nine log sub-rings).
+    pub(crate) fn log_indices(&self, d: &kernel::device::Device, why: &str) {
+        let ix = |r: Result<u32>| r.unwrap_or(u32::MAX);
+        for (i, ring) in self.submit.iter().enumerate().take(3) {
+            dev_err!(
+                d,
+                "G16 {}: submit {} read {} completion {} write {} producer {}\n",
+                why,
+                i,
+                ix(ring.read()),
+                ix(ring.completion()),
+                ix(ring.write()),
+                self.producer[i]
+            );
+        }
+        for (name, ring) in [("event", &self.event), ("trace", &self.trace), ("stats", &self.stats)] {
+            dev_err!(
+                d,
+                "G16 {}: {} read {} write {}\n",
+                why,
+                name,
+                ix(ring.state.r32(STATE_READ)),
+                ix(ring.state.r32(STATE_WRITE))
+            );
+        }
+        for t in 0..9 {
+            dev_err!(
+                d,
+                "G16 {}: log {} read {} write {}\n",
+                why,
+                t,
+                ix(self.log.state.r32(t * 0x30 + STATE_READ)),
+                ix(self.log.state.r32(t * 0x30 + STATE_WRITE))
+            );
+        }
+    }
+
     /// Consumes a receive ring to its firmware producer.
     fn drain_one(ring: &Ring, offset: usize, capacity: u32) -> Result {
         let producer = ring.state.r32(offset + STATE_WRITE)?;

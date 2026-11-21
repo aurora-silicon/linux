@@ -21,7 +21,8 @@ use kernel::{
 use logic::{RecoveryAction, Retirement, SnapshotEntry};
 
 use super::job::{Completions, Job};
-use super::{params, Firmware};
+use super::regs::wmb;
+use super::{boot, params, Firmware};
 
 /// Monotonic time, ns.
 pub(crate) fn now_ns() -> u64 {
@@ -50,6 +51,9 @@ pub(crate) struct Recovery {
     pub(crate) compute_deadline_ns: u64,
     /// A long command warning is diagnostic, not evidence that the GPU has stopped.
     warning_deadline_ns: u64,
+    /// One stall dump per period without completion-stamp progress, after 1 s.
+    stall_dump_ns: u64,
+    stall_dumped: bool,
     pub(crate) long_commands: u64,
     pub(crate) publication_wait_deadline: Option<u64>,
     /// Last fully retired compute/TA/FS identity, for late recovery snapshots.
@@ -77,6 +81,8 @@ impl Recovery {
             deadline_ns: logic::EXPIRED,
             compute_deadline_ns: logic::EXPIRED,
             warning_deadline_ns: u64::MAX,
+            stall_dump_ns: u64::MAX,
+            stall_dumped: false,
             long_commands: 0,
             publication_wait_deadline: None,
             last_retired: [None; 3],
@@ -118,6 +124,46 @@ impl Firmware {
         self.recovery.deadline_ns = deadline;
         self.recovery.compute_deadline_ns = compute;
         self.recovery.warning_deadline_ns = now_ns().saturating_add(5_000_000_000);
+        self.recovery.stall_dump_ns = now_ns().saturating_add(1_000_000_000);
+        self.recovery.stall_dumped = false;
+    }
+
+    /// Bring-up diagnostics for work without completion-stamp progress: device control, the
+    /// engine fault registers and FirmwareData, every ring's indices, the firmware log records
+    /// still queued, the host generation, the GPU pstate and the last host mailbox sends.
+    pub(crate) fn dump_stall(&mut self, why: &str) {
+        let dev = self.session.dev.clone();
+        self.channels.log_stop(&self.session, &self.init, why);
+        self.channels.log_indices(&dev, why);
+        if let Err(e) = self.channels.drain_rings(&dev, &mut self.events) {
+            dev_err!(dev, "G16 {}: ring drain failed: {:?}\n", why, e);
+        }
+        dev_err!(
+            dev,
+            "G16 {}: host generation {:?}, GPU pstate {:?} (top {}), host ceiling S{}, {} flights, {} pending, {} long commands\n",
+            why,
+            self.session.regs.generation(),
+            self.session.regs.pstate(),
+            self.session.regs.top(),
+            self.power.effective,
+            self.engine.flights.len(),
+            self.engine.pending.len(),
+            self.recovery.long_commands
+        );
+        let now = now_ns();
+        let next = self.session.sent_next;
+        for k in next.saturating_sub(boot::SENT_LOG)..next {
+            let (at, endpoint, message) = self.session.sent[k % boot::SENT_LOG];
+            dev_err!(
+                dev,
+                "G16 {}: host send #{} {} us ago: EP {:#x} {:#018x}\n",
+                why,
+                k,
+                now.saturating_sub(at) / 1000,
+                endpoint,
+                message
+            );
+        }
     }
 
     fn new_recovery(&self) -> bool {
@@ -183,6 +229,10 @@ impl Firmware {
         if !self.engine.flights.is_empty() {
             self.progress();
             let now = now_ns();
+            if !self.recovery.stall_dumped && logic::expired(now, self.recovery.stall_dump_ns) {
+                self.recovery.stall_dumped = true;
+                self.dump_stall("no completion-stamp progress for 1 s");
+            }
             if logic::expired(now, self.recovery.warning_deadline_ns) {
                 self.recovery.warning_deadline_ns = u64::MAX;
                 self.recovery.long_commands = self.recovery.long_commands.saturating_add(1);
@@ -202,6 +252,7 @@ impl Firmware {
                     self.dev(),
                     "M4 GPU administrative command deadline exceeded without firmware recovery; retaining owners and fail-stop (not proof of quiescence)\n"
                 );
+                self.dump_stall("administrative deadline");
                 self.fail_stop(ETIMEDOUT, done);
                 return Err(ETIMEDOUT);
             }
@@ -235,6 +286,7 @@ impl Firmware {
     pub(crate) fn fail_stop(&mut self, error: Error, done: &mut Completions) {
         if self.recovery.failed.is_none() {
             self.recovery.failed = Some(error);
+            self.floor_power(error);
         }
         self.engine.frozen = true;
         self.events.grow.clear();
@@ -247,6 +299,38 @@ impl Firmware {
                 self.retain(job);
             }
         }
+    }
+
+    /// A failed device must not stay at its last performance request (the J773g idled at 98 C
+    /// after a fail-stop). The Globals ceiling selectors are host-owned (`service_power` writes
+    /// them at runtime and stops after a failure): drop them to the lowest table row, and log
+    /// what the GPU reported. Nothing firmware-owned is touched.
+    fn floor_power(&mut self, error: Error) {
+        let before = self.power.effective;
+        let floored = match self.init.globals.as_ref() {
+            Some(globals) => self
+                .init
+                .abi
+                .initdata()
+                .pstate_selectors
+                .iter()
+                .all(|&offset| globals.w32(offset, 100).is_ok()),
+            None => false,
+        };
+        if floored {
+            wmb();
+            self.power.effective = 1;
+        }
+        dev_err!(
+            self.dev(),
+            "G16: fail-stop ({:?}): GPU pstate {:?} (top {}), host ceiling S{} -> {}, temperature {} mC\n",
+            error,
+            self.session.regs.pstate(),
+            self.session.regs.top(),
+            before,
+            if floored { "S1" } else { "unchanged (Globals unwritable)" },
+            self.power.temperature_mc
+        );
     }
 
     /// Flights own firmware-visible resources and slot claims. Failed-stop

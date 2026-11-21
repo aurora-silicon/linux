@@ -778,7 +778,13 @@ pub(crate) struct Session {
     pub(crate) regs: regs::Regs,
     pub(crate) adt: GpuAdt,
     uat: Arc<mmu::Uat>,
+    /// The last host mailbox sends (CLOCK_MONOTONIC ns, endpoint, message), for stall dumps.
+    pub(crate) sent: [(u64, u8, u64); SENT_LOG],
+    pub(crate) sent_next: usize,
 }
+
+/// Host mailbox sends kept for stall diagnostics.
+pub(crate) const SENT_LOG: usize = 32;
 
 impl Session {
     /// The adopted UAT (user VMs are created and bound through it).
@@ -800,6 +806,8 @@ impl Session {
 
     /// Sends a mailbox message.
     pub(crate) fn send(&mut self, endpoint: u8, message: u64) -> Result {
+        self.sent[self.sent_next % SENT_LOG] = (super::recovery::now_ns(), endpoint, message);
+        self.sent_next = self.sent_next.wrapping_add(1);
         self.rtkit.send(endpoint, message)
     }
 
@@ -1334,6 +1342,8 @@ pub(crate) fn start(
         regs,
         adt,
         uat,
+        sent: [(0, 0, 0); SENT_LOG],
+        sent_next: 0,
     };
     let mut events = Events::new();
     let mut built = None;
