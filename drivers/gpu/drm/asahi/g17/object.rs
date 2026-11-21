@@ -525,9 +525,12 @@ pub(crate) enum Family {
     QueueConfig = 3,
     /// An M5 context's scheduler page, whose mapping the M5 firmware caches.
     Scheduler = 4,
+    /// M5 render command storage (1 MiB per pair), separated from compute
+    /// descriptor rings so render pairs do not exhaust `Descriptor` slots.
+    RenderStorage = 5,
 }
 
-const POOL_FAMILIES: usize = 5;
+const POOL_FAMILIES: usize = 6;
 const POOL_SLOTS: usize = 64;
 const POOL_BYTES: usize = 128 * 1024 * 1024;
 
@@ -809,7 +812,6 @@ impl Pool {
                 keep: None,
             });
         }
-        let object = alloc.kernel(size, mmu::UAT_PGSZ as u64, prot, cpu)?;
         let reserved = {
             let mut inner = self.inner.lock();
             if inner.stopped {
@@ -829,15 +831,30 @@ impl Pool {
                 true
             }
         };
+        // Only firmware-cached objects may use write-back CPU mappings; an unpooled
+        // capacity fallback or uncached-prefix allocation stays write-combined.
+        let alloc_cpu = if reserved && prefix > 0 {
+            cpu
+        } else {
+            CpuMap::WriteCombined
+        };
+        let object = match alloc.kernel(size, mmu::UAT_PGSZ as u64, prot, alloc_cpu) {
+            Ok(object) => object,
+            Err(error) => {
+                if reserved {
+                    let mut inner = self.inner.lock();
+                    inner.reserved[family_index] -= 1;
+                    inner.bytes -= size;
+                }
+                return Err(error);
+            }
+        };
         let mut result = PooledObject {
             object: core::mem::ManuallyDrop::new(object),
             lease: reserved.then(lease),
             keep: None,
         };
-        if !reserved {
-            return Ok(result);
-        }
-        if prefix == 0 {
+        if !reserved || prefix == 0 {
             return Ok(result);
         }
         let (proof, mutated) = match result.mapping.as_ref() {
@@ -857,11 +874,28 @@ impl Pool {
                 Err(error)
             }
             Err(_) => {
+                // The conversion was refused before any entry changed: the object stays
+                // firmware-uncached, counted as the capacity fallback is. Never keep a
+                // write-back CPU mapping on an uncached firmware mapping.
                 result.lease = None;
-                let mut inner = self.inner.lock();
-                inner.reserved[family_index] -= 1;
-                inner.bytes -= size;
-                Ok(result)
+                {
+                    let mut inner = self.inner.lock();
+                    inner.reserved[family_index] -= 1;
+                    inner.bytes -= size;
+                    inner.uncached[family_index] += 1;
+                }
+                if alloc_cpu == CpuMap::WriteBack {
+                    drop(result);
+                    let fallback =
+                        alloc.kernel(size, mmu::UAT_PGSZ as u64, prot, CpuMap::WriteCombined)?;
+                    Ok(PooledObject {
+                        object: core::mem::ManuallyDrop::new(fallback),
+                        lease: None,
+                        keep: None,
+                    })
+                } else {
+                    Ok(result)
+                }
             }
         }
     }

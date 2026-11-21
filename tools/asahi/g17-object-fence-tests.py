@@ -143,13 +143,20 @@ impl<T> core::ops::Deref for KVec<T> { type Target = Vec<T>; fn deref(&self) -> 
 impl<T> core::ops::DerefMut for KVec<T> { fn deref_mut(&mut self) -> &mut Vec<T> { &mut self.0 } }
 
 pub mod mmu {
+    use std::cell::Cell;
     pub type Prot = u8;
     pub const UAT_PGSZ: usize = 0x4000;
+    thread_local! {
+        pub static REFUSE_CACHED: Cell<bool> = const { Cell::new(false) };
+    }
     pub struct KernelMapping { pub iova: u64 }
     impl KernelMapping {
         pub fn iova(&self) -> u64 { self.iova }
         pub unsafe fn set_fw_cached_prefix(&self, prefix: usize) -> (crate::Result<[u64; 2]>, bool) {
             assert!(prefix > 0, "set_fw_cached_prefix must not be called for prefix == 0");
+            if REFUSE_CACHED.with(|r| r.get()) {
+                return (Err(crate::EINVAL), false);
+            }
             (Ok([0; 2]), true)
         }
     }
@@ -158,10 +165,12 @@ pub mod mmu {
 thread_local! {
     /// Objects whose mapping was torn down, in order.
     pub static UNMAPPED: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+    /// Inject an allocation failure from `Allocator::kernel`.
+    pub static FAIL_ALLOC: Cell<bool> = const { Cell::new(false) };
 }
 
 /// A firmware object: `id` is unique per allocation, the mapping is its address.
-pub struct KernelObject { pub id: u64, pub mapping: Option<mmu::KernelMapping>, bytes: Vec<u8> }
+pub struct KernelObject { pub id: u64, pub mapping: Option<mmu::KernelMapping>, pub cpu_map: String, bytes: Vec<u8> }
 impl KernelObject {
     pub fn size(&self) -> usize { self.bytes.len() }
     pub fn bytes_mut(&mut self) -> &mut [u8] { &mut self.bytes }
@@ -176,10 +185,13 @@ pub fn forget_unmapped() { UNMAPPED.with(|u| u.borrow_mut().clear()) }
 
 pub struct Allocator<'a> { pub next: &'a Cell<u64> }
 impl Allocator<'_> {
-    pub fn kernel(&self, size: usize, _align: u64, _prot: mmu::Prot, _cpu: impl Sized) -> Result<KernelObject> {
+    pub fn kernel(&self, size: usize, _align: u64, _prot: mmu::Prot, cpu: impl core::fmt::Debug) -> Result<KernelObject> {
+        if FAIL_ALLOC.with(|f| f.get()) {
+            return Err(ENOMEM);
+        }
         let id = self.next.get();
         self.next.set(id + 1);
-        Ok(KernelObject { id, mapping: Some(mmu::KernelMapping { iova: id << 20 }), bytes: vec![0xa5; size] })
+        Ok(KernelObject { id, mapping: Some(mmu::KernelMapping { iova: id << 20 }), cpu_map: format!("{cpu:?}"), bytes: vec![0xa5; size] })
     }
 }
 
@@ -756,17 +768,86 @@ pub mod now {
             println!("context: records, commands and retained records mark the work state; a consumed release with an empty list releases it");
         }
     }
+
+    /// Family::RenderStorage pools 1 MiB (64 UAT pages) with WriteBack when cached, and
+    /// any unpooled fallback (capacity full or refused conversion) stays WriteCombined.
+    pub fn render_storage_and_wc_fallback() {
+        let next = Cell::new(1);
+        let alloc = Allocator { next: &next };
+        let pool = Pool::new(false).unwrap();
+        let mib = 64 * crate::mmu::UAT_PGSZ;
+        crate::channel::set(5, 5);
+        let mut live: Vec<_> = (0..POOL_SLOTS)
+            .map(|_| {
+                let o = pool.allocate(&alloc, Family::RenderStorage, mib, mib, 0, CpuMap::WriteBack).unwrap();
+                assert!(o.lease.is_some());
+                assert_eq!(o.cpu_map, "WriteBack");
+                o
+            })
+            .collect();
+        let s = snapshot(&pool);
+        assert_eq!(crate::count(&s, "cached_objects_5 ", "used="), POOL_SLOTS as u64, "{s}");
+        // Capacity fallback when RenderStorage is full must stay WriteCombined.
+        let overflow = pool.allocate(&alloc, Family::RenderStorage, mib, mib, 0, CpuMap::WriteBack).unwrap();
+        assert!(overflow.lease.is_none());
+        assert_eq!(overflow.cpu_map, "WriteCombined");
+        let s = snapshot(&pool);
+        assert_eq!(crate::count(&s, "cached_objects_5 ", "uncached="), 1, "{s}");
+        drop(overflow);
+        // Returned RenderStorage reuses once its fence is met (with 0 fence overruns).
+        let returned = live.pop().unwrap();
+        let id = returned.id;
+        drop(returned);
+        crate::channel::set(6, 6);
+        let reused = pool.allocate(&alloc, Family::RenderStorage, mib, mib, 0, CpuMap::WriteBack).unwrap();
+        assert_eq!(reused.id, id);
+        assert_eq!(reused.cpu_map, "WriteBack");
+        let s = snapshot(&pool);
+        assert_eq!(crate::count(&s, "cached_objects_5 ", "overruns="), 0, "{s}");
+        drop(reused);
+        drop(live);
+        // Refused cached conversion drops the WB mapping, releases the slot, and re-allocates WC.
+        let pool2 = Pool::new(false).unwrap();
+        crate::mmu::REFUSE_CACHED.with(|r| r.set(true));
+        let refused = pool2.allocate(&alloc, Family::RenderStorage, mib, mib, 0, CpuMap::WriteBack).unwrap();
+        crate::mmu::REFUSE_CACHED.with(|r| r.set(false));
+        assert!(refused.lease.is_none());
+        assert_eq!(refused.cpu_map, "WriteCombined");
+        let s = snapshot(&pool2);
+        assert_eq!(crate::count(&s, "cached_objects_5 ", "used="), 0, "{s}");
+        assert_eq!(crate::count(&s, "cached_objects_5 ", "uncached="), 1, "{s}");
+        // `alloc.kernel` failure releases the reservation cleanly without leaking used/bytes.
+        crate::FAIL_ALLOC.with(|f| f.set(true));
+        assert!(pool2.allocate(&alloc, Family::RenderStorage, mib, mib, 0, CpuMap::WriteBack).is_err());
+        crate::FAIL_ALLOC.with(|f| f.set(false));
+        let s = snapshot(&pool2);
+        assert_eq!(crate::count(&s, "cached_objects_5 ", "used="), 0, "{s}");
+        assert_eq!(crate::count(&s, "cached_object_bytes ", "used="), 0, "{s}");
+        // `prefix == 0` stays WriteCombined even if a caller passes WriteBack.
+        let uncached_req = pool2.allocate(&alloc, Family::RenderStorage, mib, 0, 0, CpuMap::WriteBack).unwrap();
+        assert!(uncached_req.lease.is_some());
+        assert_eq!(uncached_req.cpu_map, "WriteCombined");
+        drop(uncached_req);
+        println!("render_storage: 1 MiB pooled WriteBack + WriteCombined fallbacks + failure unwind");
+    }
 }
 
 fn main() {
     now::uncached_pooled();
+    now::render_storage_and_wc_fallback();
     now::return_classes();
     now::full_family();
     let (mut allocations, mut uncached, mut overruns) = (0, 0, 0);
     for seed in 1..=24u64 {
         let ops = ops(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), 6000);
         let trace = now::differential(&ops, false);
-        assert_eq!(base::differential(&ops, false), trace,
+        let comparable: Vec<String> = trace.iter().map(|entry| {
+            entry.lines()
+                .filter(|line| *line != "cached_objects_5 used=0 total=64 returned=0 poisoned=0")
+                .collect::<Vec<_>>()
+                .join("\n")
+        }).collect();
+        assert_eq!(base::differential(&ops, false), comparable,
                    "decisions without after_release differ from the pool before #1978 (seed {seed})");
         allocations += trace.iter().filter(|line| line.starts_with("alloc")).count();
         uncached += trace.iter().filter(|line| line.ends_with("cached=false")).count();

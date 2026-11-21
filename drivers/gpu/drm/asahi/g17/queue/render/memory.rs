@@ -119,23 +119,27 @@ impl Graph {
         context: &Context,
         qids: [u8; 2],
         pointers: fw::variant::PointerLayout,
+        common26: bool,
     ) -> Result<Self> {
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let m5 = alloc.uat.is_m5();
-        // M5 selects cached firmware attributes at initial mapping creation;
-        // write-combined CPU stores also support the uncached capacity fallback.
         let cpu = if m5 { CpuMap::WriteCombined } else { CpuMap::WriteBack };
         let bytes = if m5 { RECORDS * fw::m5::render_assembly::COMMAND_STORAGE_BYTES }
             else { TA_BYTES + FRAGMENT_BYTES };
         // The GPU reads command storage only through the read-only aliases below. On M5 the
         // kernel mapping, in the upper half every execution context includes, is firmware-only.
+        // Non-common26 M5 boards cache the full 1 MiB storage in its own pool family
+        // (`RenderStorage`, separate from compute descriptor rings) with a write-back CPU map
+        // (`Pool::allocate` falls back to write-combined whenever an object stays uncached).
+        // Common26 boards insert a six-byte pre-tail field (like compute) and stay uncached.
+        let cached_storage = !m5 || !common26;
         let descriptors = pool.allocate(
             alloc,
-            Family::Descriptor,
+            if m5 { Family::RenderStorage } else { Family::Descriptor },
             bytes,
-            bytes,
+            if cached_storage { bytes } else { 0 },
             if m5 { mmu::PROT_FW_SHARED_RW } else { prot },
-            cpu,
+            if cached_storage { CpuMap::WriteBack } else { CpuMap::WriteCombined },
         )?;
         let ta = Aliases::new(&descriptors, alloc, context.vm(),
             0..if m5 { bytes } else { TA_BYTES })?;
@@ -553,7 +557,8 @@ impl Memory {
         let vm = context.vm();
         let m5 = alloc.uat.is_m5();
         if m5 != layout.is_m5() { return Err(EINVAL); }
-        let mut graph = Graph::new(alloc, pool, &context, qids, variant.pointers)?;
+        let common26 = board.is_some_and(|b| b.graph.is_common26());
+        let mut graph = Graph::new(alloc, pool, &context, qids, variant.pointers, common26)?;
         let mut target = target::Target::new(alloc.dev, vm, layout)?;
         target.prepare(ordinal, layout)?;
         let state = Generation::allocate_state(alloc, vm, board)?;

@@ -1627,7 +1627,6 @@ impl KernelMapping {
     /// The mapping must be unpublished. After mutation it must not be unmapped
     /// while a firmware instance can retain a cached translation or contents.
     pub(crate) unsafe fn set_fw_cached_prefix(&self, prefix: usize) -> (Result<[u64; 2]>, bool) {
-        const MAX_PAGES: usize = 32;
         const ATTRIBUTE_SHIFT: u32 = 2;
         const ATTRIBUTE_MASK: u64 = 7;
         const UNCACHED: u64 = 2;
@@ -1639,24 +1638,27 @@ impl KernelMapping {
                 || prefix == 0
                 || prefix > self.size()
                 || (prefix | self.size()) & UAT_PGMSK != 0
-                || self.size() > MAX_PAGES * UAT_PGSZ
             {
-                return Err(EINVAL);
-            }
-            let mut owner = lock_vm(&self.0.owner, None, false)?;
-            if !owner.is_kernel {
                 return Err(EINVAL);
             }
             let pages = self.size() / UAT_PGSZ;
             let cached_pages = prefix / UAT_PGSZ;
-            let mut before = [0; MAX_PAGES];
-            for (index, value) in before[..pages].iter_mut().enumerate() {
-                *value = owner
+            // One entry per page of this mapping, whatever its size: allocate
+            // before taking the kernel VM lock so the read-back check below
+            // never allocates under it.
+            let mut before = KVec::with_capacity(pages, GFP_KERNEL)?;
+            let mut owner = lock_vm(&self.0.owner, None, false)?;
+            if !owner.is_kernel {
+                return Err(EINVAL);
+            }
+            for index in 0..pages {
+                let value = owner
                     .page_table
                     .leaf_entry(self.iova() + (index * UAT_PGSZ) as u64)?;
-                if (*value >> ATTRIBUTE_SHIFT) & ATTRIBUTE_MASK != UNCACHED {
+                if (value >> ATTRIBUTE_SHIFT) & ATTRIBUTE_MASK != UNCACHED {
                     return Err(EINVAL);
                 }
+                before.push_within_capacity(value).map_err(|_| EFAULT)?;
             }
             let _mutation = owner.mapping_mutation();
             mutated = true;
@@ -1668,9 +1670,9 @@ impl KernelMapping {
             mem::sync();
             mem::tlbi_all();
             mem::sync();
-            let mut after = [0; MAX_PAGES];
-            for (index, value) in after[..pages].iter_mut().enumerate() {
-                *value = owner
+            let mut kept = [0; 2];
+            for (index, &old) in before.iter().enumerate() {
+                let value = owner
                     .page_table
                     .leaf_entry(self.iova() + (index * UAT_PGSZ) as u64)?;
                 let change = if index < cached_pages {
@@ -1678,11 +1680,17 @@ impl KernelMapping {
                 } else {
                     0
                 };
-                if before[index] ^ *value != change {
+                if old ^ value != change {
                     return Err(EFAULT);
                 }
+                if index == 0 {
+                    kept[0] = value;
+                }
+                if index == cached_pages.min(pages - 1) {
+                    kept[1] = value;
+                }
             }
-            Ok([after[0], after[cached_pages.min(pages - 1)]])
+            Ok(kept)
         })();
         (result, mutated)
     }
