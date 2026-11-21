@@ -209,7 +209,61 @@ struct IIOAopAlsDriver {
     /// Declared first: the subscription ends before the IIO device goes.
     listener: FakehidRegistration,
     _iio: AlsIio,
+    aop: Arc<dyn AOP>,
+    service: EPICService,
 }
+
+impl IIOAopAlsDriver {
+    /// Sets the report interval. Zero stops the reports; the sensor starts
+    /// again on the next non-zero value.
+    fn set_interval(&self, interval_us: u32) -> Result<()> {
+        set_als_property(
+            self.aop.as_ref(),
+            &self.service,
+            ALS_PROP_INTERVAL,
+            &interval_us.to_le_bytes(),
+        )
+        .map(|_| ())
+    }
+}
+
+/*
+ * The sensor reports on its own every ALS_INTERVAL_US, and each report is an
+ * AOP mailbox interrupt. Nothing reads the channel while the system sleeps,
+ * and in suspend-to-idle those interrupts wake a CPU five times a second. So
+ * the reports stop for a system sleep and start again after it.
+ */
+
+/// # Safety
+///
+/// Called by the PM core with a bound ALS service device.
+unsafe extern "C" fn als_suspend(dev: *mut bindings::device) -> c_int {
+    // SAFETY: by this function's contract, drvdata is the driver data probe set.
+    let this = unsafe { &*bindings::dev_get_drvdata(dev).cast::<IIOAopAlsDriver>() };
+    // A sensor that keeps reporting only costs power: never block the sleep.
+    let _ = this.set_interval(0);
+    0
+}
+
+/// # Safety
+///
+/// Called by the PM core with a bound ALS service device.
+unsafe extern "C" fn als_resume(dev: *mut bindings::device) -> c_int {
+    // SAFETY: by this function's contract, drvdata is the driver data probe set.
+    let this = unsafe { &*bindings::dev_get_drvdata(dev).cast::<IIOAopAlsDriver>() };
+    if let Err(e) = this.set_interval(ALS_INTERVAL_US) {
+        // The channel keeps its last value until the driver is bound again.
+        pr_warn!("could not restart the reports after the sleep: {:?}\n", e);
+    }
+    0
+}
+
+static ALS_PM_OPS: bindings::dev_pm_ops = bindings::dev_pm_ops {
+    suspend: Some(als_suspend),
+    resume: Some(als_resume),
+    // SAFETY: all-zero is a valid `dev_pm_ops`: no callbacks.
+    ..unsafe { core::mem::zeroed() }
+};
 
 fn register_channels<const N: usize>(
     pdev: &platform::Device,
@@ -243,6 +297,10 @@ impl platform::Driver for IIOAopAlsDriver {
     type Data<'bound> = IIOAopAlsDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        Some(&ALS_PM_OPS)
+    }
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
@@ -288,10 +346,14 @@ impl platform::Driver for IIOAopAlsDriver {
         Ok(IIOAopAlsDriver {
             listener,
             _iio: iio,
+            aop: adata,
+            service,
         })
     }
 
     fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
+        // Without this the sensor keeps reporting to nobody.
+        let _ = this.set_interval(0);
         this.listener.unregister();
     }
 }
