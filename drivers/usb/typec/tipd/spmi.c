@@ -1029,7 +1029,8 @@ static int sn201202x_probe(struct spmi_device *device)
 	tps->data->irq_handler(tps->irq, tps);
 
 	sn201202x_idle_sleep_start(tps);
-	if (sn201202x_j714s()) {
+	/* A controller that follows the system's power state can take macOS's USBw at its entry */
+	if (device_property_read_bool(tps->dev, "apple,sleep-ssps")) {
 		struct fwnode_handle *con = device_get_named_child_node(tps->dev, "connector");
 
 		/* MagSafe's controller has no connector and never gets macOS's USBw */
@@ -1287,8 +1288,12 @@ static bool sn201202x_macos_entry(struct sn201202x *sn)
 {
 	struct device *dev = sn->cd.tps.dev;
 
-	/* A port that arms USB wake (none on the J714s) needs the controller at the suspend */
-	return sn201202x_j714s() && sn->polled &&
+	/*
+	 * Keyed on what the controller presents: polled (no interrupt), following the system's
+	 * power state, for a firmware sleep. A port that arms USB wake itself (none on the J714s)
+	 * needs the controller at the suspend.
+	 */
+	return sn->polled &&
 	       pm_suspend_via_firmware() &&
 	       device_property_read_bool(dev, "apple,sleep-ssps") &&
 	       !device_property_read_bool(dev, "apple,usb-remote-wake");
