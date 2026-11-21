@@ -130,14 +130,58 @@ pub(crate) struct Layout {
     pub(crate) pstate_selectors: [usize; 3],
     /// MAIN offset of the u64 size of the host's crash copy buffer, where the build has one.
     pub(crate) coredump_copy: Option<usize>,
-    /// GLOBALS (region C) words of this build that have no 25G83 position, at their own
-    /// offsets: the M4 Pro 26B123 cold-start policy (`g17::fw::initdata::v26b123::RegionCPrefix`).
-    pub(crate) globals_policy: &'static [(usize, u32)],
-    /// GLOBALS (region C) words this build writes in place of the 25G83 value at that position.
-    pub(crate) globals_override: &'static [(usize, u32)],
-    /// POWER_PERFORMANCE (power config) words of this build that have no 25G83 position, at
-    /// their own offsets.
-    pub(crate) power_policy: &'static [(usize, u32)],
+    /// Where the RETENTION object is published.
+    pub(crate) retention: Retention,
+    /// MAIN carries a second DVFS table (25G83 offsets: the top row at 0x1cd8, auxiliary
+    /// frequencies from 0x1cdc, lane-0 core and SRAM voltages every 0x40 bytes from 0x1d1c and
+    /// 0x211c).
+    pub(crate) auxiliary_dvfs: bool,
+    /// Literal words of this build at their own offsets, stored after everything else.
+    pub(crate) policy: &'static [Fill],
+}
+
+/// Where the RETENTION object (0x4000 zeroed bytes) is published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retention {
+    /// MAIN's retention pointer (25G83 0xe88).
+    Main,
+    /// MAIN's retention pointer stays 0, so the firmware keeps that state in its own scratch RAM
+    /// (macOS 27.2), and the zeroed object is instead the RUNTIME table at this offset (u64
+    /// pointer; the firmware's counter path, fn 0x33300, increments `table + 8 * n + 4`).
+    Runtime(usize),
+}
+
+/// `count` little-endian copies of the low `width` bytes of `value` from byte `at` of object
+/// `object` (unaligned stores are allowed).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Fill {
+    pub(crate) object: usize,
+    pub(crate) at: usize,
+    pub(crate) width: usize,
+    pub(crate) count: usize,
+    pub(crate) value: u64,
+}
+
+const fn rep32(object: usize, at: usize, count: usize, value: u32) -> Fill {
+    Fill {
+        object,
+        at,
+        width: 4,
+        count,
+        value: value as u64,
+    }
+}
+const fn w32(object: usize, at: usize, value: u32) -> Fill {
+    rep32(object, at, 1, value)
+}
+const fn w8(object: usize, at: usize, value: u8) -> Fill {
+    Fill {
+        object,
+        at,
+        width: 1,
+        count: 1,
+        value: value as u64,
+    }
 }
 
 /// Size of the host's crash copy buffer (`coredump-copy-buffer` in the 27.2 nub); macOS 27.2
@@ -215,22 +259,24 @@ pub(crate) const V25G83: Layout = Layout {
     },
     pstate_selectors: [0x88, 0x8c, 0x98],
     coredump_copy: None,
-    globals_policy: &[],
-    globals_override: &[],
-    power_policy: &[],
+    retention: Retention::Main,
+    auxiliary_dvfs: false,
+    policy: &[],
 };
 
 /// The 26B123 InitData ABI (macOS 27.2): the same 31 objects and pointers, with
 /// - the main-config power-config pointer 16 bytes later;
-/// - a 60-slot register map in MAIN, then the retention pointer at 0xfa0, a new u64 at 0xfa8
-///   (left zero), the old 0xe90.. words +0x120, 0xec0.. +0x11c (one word removed at 0xebc),
-///   0x2600.. +0x120 and the last bytes +0x124 (new u32s at 0x275c and 0x277e, left zero);
-/// - a u32 inserted at GLOBALS 0x38 (left zero), so every later word moves by four;
-/// - POWER_PERFORMANCE with words inserted at 0x9c (0x10 bytes, left zero), 0x28b0 (0x18),
-///   0x3b50 (0x28) and 0x63cc (0x680), 8 bytes removed between 0x2d08 and 0x2f08 and 0x20
-///   between 0x62c4 and 0x6318 (positions inferred from the T6041 build of this firmware);
+/// - a 60-slot register map in MAIN, then the retention pointer at 0xfa0, a new u64 at 0xfa8,
+///   the old 0xe90.. words +0x120, 0xec0.. +0x11c (one word removed at 0xebc), 0x2600.. +0x120
+///   and the last bytes +0x124 (new u32s at 0x275c and 0x277e);
+/// - a u32 inserted at GLOBALS 0x38, so every later word moves by four;
+/// - POWER_PERFORMANCE with words inserted at 0x9c (0x10 bytes), 0x28b0 (0x18), 0x3b50 (0x28)
+///   and 0x63cc (0x680), 8 bytes removed between 0x2d08 and 0x2f08 and 0x20 between 0x62c4 and
+///   0x6318 (positions inferred from the T6041 build of this firmware);
 /// - FirmwareData words 0x1e0 bytes later (a table was inserted before them);
-/// - POWER (left all zero) grown to 0x694 bytes.
+/// - POWER grown to 0x694 bytes;
+/// - and the words macOS 27.2 fills in RUNTIME, GLOBALS, POWER, MAIN and POWER_PERFORMANCE
+///   (`POLICY_26B123`).
 pub(crate) const V26B123: Layout = Layout {
     name: "26B123",
     version: 0x0c8a836f039204b8,
@@ -269,80 +315,110 @@ pub(crate) const V26B123: Layout = Layout {
         snapshot_entries: 448,
     },
     pstate_selectors: [0x8c, 0x90, 0x9c],
-    // HW data +0xfa8 stays zero on G16G. Non-zero, it turns on the firmware's RTKit power
-    // path method (0x2c7a8 -> the auth pointer at DATA 0x8c0c8, TEXT 0x43e4c): on the J713 the
-    // firmware then faulted on resume at fw-text PA + 0x6f8, the start code's first fetch
-    // after MMU-on, as soon as a doorbell woke it. The T6041 build pairs 0x8000 there with a
-    // dedicated 0x8000 window at +0xfa0, where G16G keeps its RAM retention object; what macOS
-    // writes here on J773g is open (trace list).
-    coredump_copy: None,
-    // The new u32 at 0x38 and two words in previously reserved fields, as the M4 Pro writes
-    // them on this firmware (linux#1954, on hardware). The power-up path (0x3434) reads
-    // 0x9dc; zero there is the candidate for the J713's SError on the first wake from idle.
-    // 27.2 (candidate): 0x7f0 = 1, a constant of the 27.2 AGXG16G kext's region C fill.
-    globals_policy: &[(0x38, 1), (0x9dc, 50), (0xe0c, 250), (0x7f0, 1)],
-    // 27.2 (candidate): the GPU is never powered off when idle; see IDLE_OFF_KEEP_POWERED_MS.
-    globals_override: &[(0x9c0, IDLE_OFF_KEEP_POWERED_MS)],
-    // 27.2 (candidate): the four u32s inserted at 0x9c, as the M4 Pro writes them on this
-    // firmware (1 each). 0xa4 is the power-up target state: both 26B123 power-up sites load it
-    // (0x3ea60, 0x136f0; 25G83 passes 1) into AGFAPowerHandlePowerUp (0x123d0), whose power
-    // kick (0x305fc) returns at once when the target equals the current state, 0 while off. With
-    // 0 the GPU stays unpowered, and the register restore that follows (0xb7d4, first write
-    // SGX+0xd800) takes the SError seen on the J713 and the J773g. 0x9c is what 0x13e88 copies
-    // into 0xa4 while the GPU is on.
-    //
-    // The power limiter (fn 0x26c0c, run by agx_power right after power-up) clamps its estimate
-    // to [+0xaa4, +0xaa8] and divides by +0xaa8; with 0 there the result is NaN, and its p-state
-    // search (0x26e04) then reads table[-1] (u32 index, no bounds check before the load; 25G83
-    // checks first) and faults: the J773g's data abort after the first 27.2 power-up. G16 left the
-    // limiter's tuning zero; these are the M4 Pro's macOS values (25G83 words + 0x10, with its
-    // 26B123 defaults for 0xa80, 0xa8c, 0xa94 and 0xae0).
-    power_policy: &[
-        (0x9c, 1),
-        (0xa0, 1),
-        (0xa4, 1),
-        (0xa8, 1),
-        (0xa80, 8),
-        (0xa8c, 0x3f00_0000),
-        (0xa94, 0x3f00_0000),
-        (0xa9c, 0x3e3b_d7b3),
-        (0xaa8, 0x4780_0000),
-        (0xaac, 0x3ecf_2e49),
-        (0xad8, 0x10),
-        (0xae0, 0x5_dc00),
-        // 27.2 (candidate): the words the 27.2 AGXG16G kext's power-config fill
-        // (0xfffffe0008ba4b74) writes as constants or from the J773g ADT, which G16 left zero;
-        // each equals the M4 Pro's 26B123 value (linux#1954, hardware):
-        // - 0x44 and 0x2f34: the constant 1;
-        // - 0x6ac8: bit 17 of the G16G accelerator flags (set by its G16G setup, 1);
-        // - 0x29e4, 0x29f0, 0x29f8: an averaging filter of n = 248 ms / 8 ms = 31 samples
-        //   (G16G tc 0xf8 over gpu-power-sample-period 8): n * 4, (n - 1) / n, 1 / n;
-        // - 0x2bbc, 0x2c10: the power sample period in us (gpu-power-sample-period * 1000), as
-        //   f32 and u32. The power accounting (0x2b4xx) clamps each sample to 0x2c10.
-        (0x44, 1),
-        (0x29e4, 124),
-        (0x29f0, 0x3f77_bdef),
-        (0x29f8, 0x3d04_2108),
-        (0x2bbc, 0x45fa_0000),
-        (0x2c10, 8000),
-        (0x2f34, 1),
-        (0x6ac8, 1),
-        // The kext's other constants: 0x84 = 1 (the second {base, 1, top} p-state triple's
-        // middle word, as 0x44), 0x2b74 = 50 (the power-accounting history at 0x2b74, which
-        // 0x2bb38 passes to 0x2c124), and 0 at 0x2cb0, where the 25G83 run puts G16's
-        // 100 * top-state word 0x2c88 (the M4 Pro's 26B123 copy also ends before it).
-        (0x84, 1),
-        (0x2b74, 50),
-        (0x2cb0, 0),
-    ],
+    // HW data +0xfa8: the size of the host's crash copy buffer (macOS writes 0x8000 there and
+    // publishes no retention object at +0xfa0).
+    coredump_copy: Some(0xfa8),
+    retention: Retention::Runtime(0x2c8),
+    auxiliary_dvfs: true,
+    policy: POLICY_26B123,
 };
 
-/// 27.2 (candidate): the idle power-off delay in ms (region C 25G83 0x9bc = 40, 26B123 0x9c0).
-/// The firmware's idle path (fn 0x37f48) arms a delay * 1000 us timer (x10 while its state
-/// +0xeb8 is set) and powers the GPU off when it fires, or at once for 0. On 27.2 the wake from
-/// that power-off dies with an SError (J713, J773g), so keep the GPU powered: about 3.1 days,
-/// whose x10 still fits a u32.
-pub(crate) const IDLE_OFF_KEEP_POWERED_MS: u32 = 0x1000_0000;
+const G: usize = id::GLOBALS;
+const S: usize = id::POWER;
+const M: usize = id::MAIN;
+const P: usize = id::POWER_PERFORMANCE;
+const R: usize = id::RUNTIME;
+
+/// The words macOS 27.2 hands the J773g firmware in its InitData (hv25 capture) that the
+/// 25G83-derived encoding leaves zero or sets otherwise, at their 26B123 offsets. Pointers and
+/// firmware-written state are not listed. Among them: POWER_PERFORMANCE 0xa4, the power-up
+/// target state (0 leaves the GPU unpowered before the register restore, an SError), and
+/// 0xaa8, the limiter's divisor (fn 0x26c0c; 0 gives NaN and an out-of-bounds p-state load).
+#[rustfmt::skip]
+const POLICY_26B123: &[Fill] = &[
+    // GLOBALS (region C).
+    rep32(G, 0x30, 3, 0x1), w32(G, 0x40, 0x78), w32(G, 0x58, 0x28ffff), w32(G, 0x5c, 0xffff),
+    rep32(G, 0x60, 2, 0x10000), w32(G, 0x68, 0x30000), w32(G, 0x6c, 0x10000), w32(G, 0x84, 0x241d),
+    w32(G, 0x88, 0x91ad), w32(G, 0x7c8, 0x4e2), w32(G, 0x7cc, 0x3f800000),
+    w32(G, 0x7d0, 0x3f4ccccd), w32(G, 0x7d4, 0x3e4ccccd), w32(G, 0x7d8, 0x3f666666),
+    w32(G, 0x7dc, 0x3dcccccd), w32(G, 0x7e0, 0x3e800000), w32(G, 0x7e4, 0x3f333333),
+    w32(G, 0x7e8, 0x3f666666), w32(G, 0x7ec, 0x6), rep32(G, 0x7f0, 2, 0x1),
+    rep32(G, 0x7f8, 2, 0x64), w32(G, 0x9a8, 0x1), w32(G, 0x9d4, 0x1), w32(G, 0x9dc, 0x32),
+    w32(G, 0xe0c, 0xfa), w32(G, 0xe30, 0x1),
+    // POWER (power state).
+    w32(S, 0x10, 0x1f), w32(S, 0x14, 0x3e0a3d71), w32(S, 0x18, 0x401ae148), w32(S, 0x1c, 0x28),
+    w32(S, 0x20, 0x1), w32(S, 0xc8, 0x2af8), w32(S, 0xcc, 0x1f40), w32(S, 0xd8, 0x42f00000),
+    w32(S, 0xdc, 0x3fd55554), w32(S, 0xf0, 0x27a6), w32(S, 0xf4, 0xc8), w32(S, 0x108, 0x437a0000),
+    w32(S, 0x10c, 0x3f933333), w32(S, 0x110, 0x271), w32(S, 0x12c, 0x91ad),
+    w32(S, 0x130, 0x3e800000), w32(S, 0x134, 0x3f99999a), w32(S, 0x624, 0x41700000),
+    w32(S, 0x628, 0x40a00000), w32(S, 0x62c, 0x20), w32(S, 0x630, 0x3e8), w32(S, 0x640, 0x384),
+    // MAIN (HW data).
+    w32(M, 0xfb0, 0x8132), rep32(M, 0xfb4, 2, 0x1), w32(M, 0xfdc, 0x1), w32(M, 0xfe4, 0x1),
+    rep32(M, 0x1000, 2, 0x1), w32(M, 0x1020, 0x1f), w32(M, 0x1044, 0xc), rep32(M, 0x1050, 2, 0x1),
+    w32(M, 0x1068, 0x31), w32(M, 0x1088, 0x1), w32(M, 0x10a4, 0xa), w32(M, 0x10a8, 0x3),
+    w32(M, 0x10d4, 0x12), w32(M, 0x10d8, 0x4), w32(M, 0x10dc, 0xa),
+    rep32(M, 0x1964, 11, 0x3f828f5c), w32(M, 0x2684, 0xa), w32(M, 0x26a8, 0x160000),
+    rep32(M, 0x26b0, 2, 0x1), rep32(M, 0x26c0, 3, 0x1), rep32(M, 0x26d0, 12, 0xffffffff),
+    w32(M, 0x2724, 0x1), w32(M, 0x2754, 0x1),
+    w32(M, 0x277e, 1), w8(M, 0x2782, 1),
+    // POWER_PERFORMANCE (power config).
+    w32(P, 0x0, 0x1), w32(P, 0x4, 0x30d3f), rep32(P, 0x2c, 2, 0x3), w32(P, 0x40, 0x12c),
+    w32(P, 0x44, 0xc), w32(P, 0x48, 0x3e8), w32(P, 0x50, 0x12c), w32(P, 0x60, 0x4),
+    w32(P, 0x64, 0x3f800000), rep32(P, 0x6c, 2, 0x1), w32(P, 0x80, 0x12c), w32(P, 0x84, 0x1),
+    w32(P, 0x88, 0x3e8), w32(P, 0x90, 0x64), rep32(P, 0x9c, 4, 0x1), rep32(P, 0xd0, 11, 0x3f828f5c),
+    w32(P, 0x210, 0x1), w32(P, 0x9c8, 0x271), w32(P, 0x9d4, 0x3f7f2e9f), w32(P, 0x9dc, 0x3b516154),
+    w32(P, 0x9e4, 0x3ca59586), w32(P, 0x9f0, 0x4711ad00), w32(P, 0x9f4, 0x40a90fdb),
+    w32(P, 0x9fc, 0xbcdbaa78), w32(P, 0xa00, 0x28), w32(P, 0xa08, 0x3e8), w32(P, 0xa14, 0x91ad),
+    w32(P, 0xa80, 0x4), w32(P, 0xa94, 0x3f800000), w32(P, 0xa9c, 0x3f99999a),
+    w32(P, 0xaa8, 0x47800000), w32(P, 0xaac, 0x3e800000), w32(P, 0xab8, 0x28),
+    w32(P, 0xacc, 0x91ad), w32(P, 0xad8, 0x10), w32(P, 0xb0c, 0x3f800000),
+    w32(P, 0xb10, 0x3f99999a), w32(P, 0xb14, 0x3e800000), w32(P, 0xb38, 0x55), w32(P, 0xb3c, 0x2),
+    w32(P, 0xb40, 0x5f), w32(P, 0xb44, 0x32), w32(P, 0xb48, 0x6), w32(P, 0xb50, 0x6),
+    w32(P, 0xb54, 0x1), w32(P, 0xb5c, 0x3f4ccccd), w32(P, 0xb60, 0x3f7eb852),
+    w32(P, 0xb64, 0x3e4ccccd), w32(P, 0xb68, 0x3ba3d70a), rep32(P, 0xb6c, 2, 0x3f4c28f6),
+    w32(P, 0xb78, 0x42be0000), rep32(P, 0xb7c, 2, 0x40accccd), w32(P, 0xb84, 0x40ebca1b),
+    w32(P, 0xb88, 0x12c), w32(P, 0xb90, 0x12c), w32(P, 0xb98, 0x42aa0000), w32(P, 0xb9c, 0x55),
+    w32(P, 0xbd0, 0x12c), w32(P, 0xbd8, 0x3f4ccccd), w32(P, 0xbdc, 0x3e4ccccd),
+    w32(P, 0x1bfc, 0xff000000), rep32(P, 0x1c00, 255, 0xff7fff7f), w32(P, 0x1ffc, 0x7fff7f),
+    w32(P, 0x2200, 0x47800000), w32(P, 0x2204, 0x43960000), w32(P, 0x2208, 0x447a0000),
+    w32(P, 0x220c, 0x62a), w32(P, 0x2220, 0x12c), w32(P, 0x2228, 0x42c80000), w32(P, 0x222c, 0x3e8),
+    w32(P, 0x2234, 0x3f4ccccd), w32(P, 0x2238, 0x3e4ccccd), w32(P, 0x2274, 0x1092),
+    w32(P, 0x2278, 0x6958), w32(P, 0x2280, 0x1f40), w32(P, 0x2288, 0x4), w32(P, 0x229c, 0x3f800000),
+    w32(P, 0x22a4, 0x3fd55554), w32(P, 0x22b0, 0x47800000), w32(P, 0x22b4, 0x42f00000),
+    w32(P, 0x22c0, 0x28), w32(P, 0x22c8, 0x3e8), w32(P, 0x22d4, 0x2af8), w32(P, 0x22d8, 0x1092),
+    w32(P, 0x2528, 0x101), w32(P, 0x2728, 0xe030000), w32(P, 0x2744, 0x3f80),
+    w32(P, 0x2748, 0x33330000), w32(P, 0x274c, 0x3f93), w32(P, 0x2758, 0x4780),
+    w32(P, 0x275c, 0x437a), rep32(P, 0x2768, 2, 0x3e80000), w32(P, 0x277c, 0xe030000),
+    w32(P, 0x27bc, 0x33333f80), w32(P, 0x27c0, 0x3f93), w32(P, 0x27c4, 0x437a),
+    w32(P, 0x27c8, 0xc80000), w32(P, 0x27dc, 0x42d7), w32(P, 0x27e0, 0x2bc42d7),
+    w32(P, 0x27e8, 0x4280), w32(P, 0x27ec, 0x4780), w32(P, 0x2878, 0x428), w32(P, 0x2884, 0x31c),
+    w32(P, 0x2888, 0x26a), rep32(P, 0x28d8, 2, 0x42c80000), w32(P, 0x28e8, 0x1),
+    rep32(P, 0x28f0, 3, 0x91ad), w32(P, 0x2900, 0x4711ad00), w32(P, 0x2908, 0x3f800000),
+    w32(P, 0x290c, 0x4), w32(P, 0x2910, 0x8), w32(P, 0x2914, 0x2ee00), w32(P, 0x29e4, 0x74),
+    w32(P, 0x29f0, 0x3f772c23), w32(P, 0x29f8, 0x3d0d3dcb), w32(P, 0x2a00, 0x3e0a3d71),
+    w32(P, 0x2a0c, 0x47800000), w32(P, 0x2a10, 0x401ae148), w32(P, 0x2a1c, 0x28),
+    rep32(P, 0x2a20, 2, 0x3e8), w32(P, 0x2a2c, 0x40a11b75), w32(P, 0x2a30, 0x91ad),
+    w32(P, 0x2a3c, 0xf8), w32(P, 0x2a44, 0x5ad200), w32(P, 0x2a6c, 0x3f772c23),
+    w32(P, 0x2a70, 0x3d0d3dcb), w32(P, 0x2a74, 0x3e0a3d71), w32(P, 0x2a78, 0x401ae148),
+    w32(P, 0x2b48, 0x208d), w32(P, 0x2b68, 0x1), w32(P, 0x2b74, 0x32), w32(P, 0x2b78, 0x1),
+    w32(P, 0x2b80, 0x3f638e39), w32(P, 0x2b84, 0x3f2aaaab), w32(P, 0x2b88, 0x3de38e39),
+    w32(P, 0x2b8c, 0x3eaaaaab), w32(P, 0x2b90, 0xbecccccd), w32(P, 0x2b94, 0xbf4ccccd),
+    w32(P, 0x2b9c, 0x47800000), rep32(P, 0x2ba0, 2, 0xc0a00000), w32(P, 0x2bac, 0x64),
+    w32(P, 0x2bb4, 0x12c), w32(P, 0x2bbc, 0x46023400), w32(P, 0x2bc0, 0x578), w32(P, 0x2bcc, 0x48),
+    w32(P, 0x2bd0, 0x18), w32(P, 0x2bd4, 0x1a5e00), w32(P, 0x2bdc, 0x8ca00),
+    rep32(P, 0x2be8, 2, 0x47800000), w32(P, 0x2c10, 0x208d), w32(P, 0x2c14, 0x4),
+    w32(P, 0x2c18, 0x9c4), w32(P, 0x2c1c, 0x258), w32(P, 0x2c20, 0x2), w32(P, 0x2c24, 0x4),
+    w32(P, 0x2c28, 0x32), w32(P, 0x2c58, 0x47800000), w32(P, 0x2c68, 0x28),
+    rep32(P, 0x2d14, 2, 0x1), w32(P, 0x2d24, 0x6), w32(P, 0x2e4c, 0x4), w32(P, 0x2e58, 0x3f780000),
+    w32(P, 0x2e60, 0x3d000000), w32(P, 0x2e68, 0x40a00000), w32(P, 0x2e74, 0x47800000),
+    w32(P, 0x2e78, 0x41700000), w32(P, 0x2e84, 0x384), rep32(P, 0x2e88, 2, 0x3e8),
+    w32(P, 0x2e98, 0x3e8), w32(P, 0x2ecc, 0x3e8), w32(P, 0x2f0c, 0x42c80000),
+    w32(P, 0x2f28, 0x6958), w32(P, 0x2f30, 0x7d), w32(P, 0x2f34, 0x1), w32(P, 0x3ba0, 0x6b79),
+    w32(P, 0x3ba8, 0x1), w32(P, 0x5bac, 0x4159999a), w32(P, 0x5bb0, 0x41000000),
+    w32(P, 0x6348, 0x67305452), w32(P, 0x6388, 0x1), w32(P, 0x63f0, 0x1), w32(P, 0x6ac8, 0x1),
+    // RUNTIME (main config).
+    w8(R, 0x3d8, 0xff),
+];
 
 /// Runs are ordered, disjoint and land inside an object of `size` bytes.
 const fn runs_fit(runs: &[Run], size: usize) -> bool {
@@ -357,6 +433,31 @@ const fn runs_fit(runs: &[Run], size: usize) -> bool {
         i += 1;
     }
     true
+}
+
+/// Every fill lands inside its object, and the RUNTIME retention table pointer is clear of the
+/// power-config pointer.
+const fn fills_fit(layout: &Layout) -> bool {
+    let mut i = 0;
+    while i < layout.policy.len() {
+        let f = &layout.policy[i];
+        if f.object >= OBJECT_COUNT
+            || !matches!(f.width, 1 | 2 | 4 | 8)
+            || f.count == 0
+            || f.at + f.width * f.count > layout.object_size[f.object]
+        {
+            return false;
+        }
+        i += 1;
+    }
+    match layout.retention {
+        Retention::Main => true,
+        Retention::Runtime(at) => {
+            at % 8 == 0
+                && at + 8 <= layout.object_size[id::RUNTIME]
+                && (at + 8 <= layout.power_config || layout.power_config + 8 <= at)
+        }
+    }
 }
 
 /// A layout's words fit its objects and do not overlap each other.
@@ -375,6 +476,7 @@ const fn layout_fits(layout: &Layout) -> bool {
         && runs_fit(layout.main, size[id::MAIN])
         && runs_fit(layout.globals, size[id::GLOBALS])
         && runs_fit(layout.power_performance, size[id::POWER_PERFORMANCE])
+        && fills_fit(layout)
 }
 const _: () = assert!(layout_fits(&V25G83) && layout_fits(&V26B123));
 
@@ -822,6 +924,9 @@ pub(crate) fn encode_for(
     put64(runtime, 0x2e0, input.lower_uma)?;
     put32(runtime, 0x250, 1)?;
     put32(runtime, 0x2f8, 4)?;
+    if let Retention::Runtime(at) = layout.retention {
+        put64(runtime, at, input.va[id::RETENTION])?;
+    }
     for i in 0..12 {
         encode_channel(
             &mut runtime[0x20 + i * 0x20..],
@@ -863,13 +968,12 @@ pub(crate) fn encode_for(
     for at in layout.pstate_selectors {
         put32(g, at, 100 * ceiling)?;
     }
-    for &(at, value) in layout.globals_policy.iter().chain(layout.globals_override) {
-        put32(g, at, value)?;
-    }
     let runs = layout.main;
     let main = &mut objects[id::MAIN];
     put64(main, remap(runs, 0x28, 8)?, HOST_END)?;
-    put64(main, remap(runs, 0xe88, 8)?, input.va[id::RETENTION])?;
+    if layout.retention == Retention::Main {
+        put64(main, remap(runs, 0xe88, 8)?, input.va[id::RETENTION])?;
+    }
     if let Some(at) = layout.coredump_copy {
         put64(main, at, COREDUMP_COPY_SIZE)?;
     }
@@ -918,6 +1022,15 @@ pub(crate) fn encode_for(
                 input.performance.sram[i],
             )?;
         }
+        if layout.auxiliary_dvfs {
+            let p = &input.performance;
+            put32(main, remap(runs, 0x1cdc + i * 4, 4)?, p.auxiliary[i])?;
+            put32(main, remap(runs, 0x1d1c + i * 0x40, 4)?, p.voltage[i])?;
+            put32(main, remap(runs, 0x211c + i * 0x40, 4)?, p.sram[i])?;
+        }
+    }
+    if layout.auxiliary_dvfs {
+        put32(main, remap(runs, 0x1cd8, 4)?, ceiling)?;
     }
     for slot in 0..LOADER_COUNT {
         // This ABI has no slot for the record: the host must not have mapped it (`build`
@@ -959,8 +1072,20 @@ pub(crate) fn encode_for(
         put32(p, remap(runs, at, 4)?, 100 * ceiling)?;
     }
     // Last: the build's own words may replace a remapped 25G83 word.
-    for &(at, value) in layout.power_policy {
-        put32(p, at, value)?;
+    for f in layout.policy {
+        let size = *size.get(f.object).ok_or(())?;
+        let bytes = f.value.to_le_bytes();
+        let value = bytes.get(..f.width).ok_or(())?;
+        for n in 0..f.count {
+            let at = f.at + n * f.width;
+            if at + f.width > size {
+                return Err(());
+            }
+            objects[f.object]
+                .get_mut(at..at + f.width)
+                .ok_or(())?
+                .copy_from_slice(value);
+        }
     }
     Ok(())
 }

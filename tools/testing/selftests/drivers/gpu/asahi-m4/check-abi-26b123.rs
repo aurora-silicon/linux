@@ -293,9 +293,12 @@ fn main() {
     let data = object(&v26, l, id::FIRMWARE_DATA);
     assert_eq!((r64(data, 0x5168), r64(data, 0x5170), r32(data, 0x51b4)),
                (input().va[id::FWCTL], input().va[id::FWCTL] + 0x40, 1));
+    // macOS 27.2: no retention pointer, the crash copy buffer size, and the RETENTION object as
+    // the zeroed RUNTIME table at 0x2c8.
+    assert_eq!(r64(runtime, 0x2c8), input().va[id::RETENTION]);
     let main = object(&v26, l, id::MAIN);
-    assert_eq!(r64(main, 0xfa0), input().va[id::RETENTION]);
-    assert_eq!(r64(main, 0xfa8), 0);
+    assert_eq!(r64(main, 0xfa0), 0);
+    assert_eq!(r64(main, 0xfa8), wire::COREDUMP_COPY_SIZE);
     // CRE (25G83 slot 28) is register-map slot 33 in 26B123.
     assert_eq!(r64(main, 0x640 + 33 * 0x28), 0x300d58000);
     assert!(main[0x640 + 28 * 0x28..0x640 + 29 * 0x28].iter().all(|&b| b == 0));
