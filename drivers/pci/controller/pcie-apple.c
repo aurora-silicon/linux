@@ -471,6 +471,7 @@ static const struct hw_info t6050_pciec_hw = {
 	.no_port_reset		= true,
 	.msimap_by_vector	= true,
 	.mps_timers		= true,
+	.s2idle_hold_domain	= true,
 };
 
 static const struct of_device_id apple_pcie_of_match[];
@@ -6635,6 +6636,23 @@ err_release:
 }
 
 /*
+ * Pre-suspend policy shared with apple_pcie_prepare(): everything known before
+ * endpoints suspend, leaving only the domain hold and live link check to noirq.
+ */
+static bool apple_pcie_can_keep_link(const struct apple_pcie *pcie)
+{
+	if (!READ_ONCE(s2idle_keep_link) || !pm_suspend_no_platform())
+		return false;
+	if (!(pcie->kernel_init || pcie->tunnel_cold_init))
+		return false;
+	if (pcie->bus_stopped || pcie->resume_failed)
+		return false;
+	if (!pcie->power_retained && !pcie->hw->s2idle_hold_domain)
+		return false;
+	return true;
+}
+
+/*
  * In suspend-to-idle ACIO and the router links stay powered, so an up
  * tunnel can simply be left running. The functions below keep their state
  * and resume like any other PCIe device; nothing has to be re-trained.
@@ -6646,15 +6664,9 @@ static bool apple_pcie_keep_link(struct apple_pcie *pcie)
 {
 	int ret;
 
-	if (!READ_ONCE(s2idle_keep_link) || !pm_suspend_no_platform())
-		return false;
-	if (!(pcie->kernel_init || pcie->tunnel_cold_init))
-		return false;
-	if (pcie->bus_stopped || pcie->resume_failed)
+	if (!apple_pcie_can_keep_link(pcie))
 		return false;
 	if (!pcie->power_retained) {
-		if (!pcie->hw->s2idle_hold_domain)
-			return false;
 		ret = apple_pcie_hold_domains(pcie);
 		if (ret) {
 			dev_dbg(pcie->dev, "PCIe-C power domain not held (%d): link not kept\n",
@@ -6804,7 +6816,7 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	if (pcie->cio_prepared)
 		return apple_pcie_cio_suspend(pcie);
 	/* The reversed DART link is safe only with retained clocks or native PM. */
-	if (pcie->cio_dart && (!pm_suspend_no_platform() || !s2idle_keep_link))
+	if (pcie->cio_dart && !apple_pcie_can_keep_link(pcie))
 		return -EBUSY;
 	if (pcie->neo_sleep_armed) {
 		struct apple_pcie_port *port;
@@ -7467,7 +7479,7 @@ static int apple_pcie_prepare(struct device *dev)
 	 */
 	if (pcie && pcie->cio_dart && !pcie->cio_prepared &&
 	    pm_suspend_target_state != PM_SUSPEND_ON &&
-	    (!pm_suspend_no_platform() || !s2idle_keep_link)) {
+	    !apple_pcie_can_keep_link(pcie)) {
 		dev_warn(dev, "no CIO sleep transaction from the NHI; refusing sleep\n");
 		return -EBUSY;
 	}
