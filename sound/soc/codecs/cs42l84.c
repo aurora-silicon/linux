@@ -1182,6 +1182,23 @@ static void cs42l84_setup_plug_detect(struct cs42l84_private *cs42l84)
 }
 
 /*
+ * macOS's detect setup: plug state from ring sense, tip sense masked
+ * (TSRS_PLUG_INT_MASK = 0xfc). Probe and the resume after a deep sleep both
+ * end here, after cs42l84_setup_plug_detect().
+ */
+static void cs42l84_ring_detect_setup(struct cs42l84_private *cs42l84)
+{
+	unsigned int reg;
+
+	regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_STATUS, &reg);
+	cs42l84->ring_state = (((char)reg) &
+			      (CS42L84_RS_PLUG | CS42L84_RS_UNPLUG)) >>
+			      CS42L84_RS_PLUG_SHIFT;
+	cs42l84_set_interrupt_masks(cs42l84,
+				    CS42L84_TS_PLUG | CS42L84_TS_UNPLUG);
+}
+
+/*
  * Register writes the platform's own driver makes right after the device ID
  * check, from the device tree's apple,init-writes: 16-bit (register, value)
  * pairs, applied in order. Machines without the property are unchanged.
@@ -1329,12 +1346,7 @@ static int cs42l84_i2c_probe(struct i2c_client *i2c_client)
 	 * masked until tip sense reports a plug.
 	 */
 	if (cs42l84->ring_detect) {
-		regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_STATUS, &reg);
-		cs42l84->ring_state = (((char)reg) &
-		      (CS42L84_RS_PLUG | CS42L84_RS_UNPLUG)) >>
-		      CS42L84_RS_PLUG_SHIFT;
-		cs42l84_set_interrupt_masks(cs42l84,
-					    CS42L84_TS_PLUG | CS42L84_TS_UNPLUG);
+		cs42l84_ring_detect_setup(cs42l84);
 	} else {
 		cs42l84_set_interrupt_masks(cs42l84,
 					    CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
@@ -1411,6 +1423,7 @@ static int cs42l84_resume(struct device *dev)
 {
 	struct i2c_client *i2c_client = to_i2c_client(dev);
 	struct cs42l84_private *cs42l84 = i2c_get_clientdata(i2c_client);
+	unsigned int reg;
 	int ret, devid;
 
 	if (!cs42l84->sleep_reset)
@@ -1453,13 +1466,32 @@ static int cs42l84_resume(struct device *dev)
 	if (ret)
 		goto err;
 
+	/*
+	 * The sync wrote macOS's probe writes back, so the remote status
+	 * latch is set again: clear it as probe does.
+	 */
+	if (cs42l84->ring_detect)
+		regmap_read(cs42l84->regmap, CS42L84_REMOTE_BUTTON_STATUS1, &reg);
+
 	/* The plug may have changed while the codec was down: detect it again. */
 	cs42l84_setup_plug_detect(cs42l84);
-	cs42l84->ring_state = CS42L84_UNPLUG;
-	if (cs42l84->tip_state == CS42L84_PLUG) {
+	if (cs42l84->ring_detect) {
+		/* As in probe: ring sense reports the plug, tip sense stays masked. */
+		cs42l84_ring_detect_setup(cs42l84);
+		if (cs42l84->ring_state == CS42L84_PLUG) {
+			cs42l84->tip_state = CS42L84_PLUG;
+			cs42l84_detect_hs(cs42l84);
+		} else {
+			cs42l84->tip_state = CS42L84_UNPLUG;
+			cs42l84->hs_type = 0;
+			snd_soc_jack_report(cs42l84->jack, 0, SND_JACK_HEADSET);
+		}
+	} else if (cs42l84->tip_state == CS42L84_PLUG) {
+		cs42l84->ring_state = CS42L84_UNPLUG;
 		cs42l84_detect_hs(cs42l84);
 		cs42l84_set_interrupt_masks(cs42l84, 0);
 	} else {
+		cs42l84->ring_state = CS42L84_UNPLUG;
 		cs42l84->hs_type = 0;
 		snd_soc_jack_report(cs42l84->jack, 0, SND_JACK_HEADSET);
 		cs42l84_set_interrupt_masks(cs42l84,
