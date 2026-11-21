@@ -181,6 +181,8 @@ pub(crate) struct Regs {
     status: Mapping,
     /// Host-owned generation register page (SGX +0xd60000).
     generation: Mapping,
+    /// GFXCAXI2AF registers (SGX +0x1000000), written only by the 27.2 start.
+    axi2af: Mapping,
     /// Highest firmware performance state the board's table holds: S9 until the table is
     /// known (the ten-row J713/J604 tables), S10 on the eleven-row J773g table.
     top: AtomicU32,
@@ -203,6 +205,7 @@ impl Regs {
             asc: window(c_str!("asc"), 0)?,
             status: window(c_str!("sgx"), SGX_STATUS as u64)?,
             generation: window(c_str!("sgx"), 0xd60000)?,
+            axi2af: window(c_str!("sgx"), super::hw::start_27_2::AXI2AF as u64)?,
             top: AtomicU32::new(9),
             res,
         })
@@ -252,6 +255,33 @@ impl Regs {
             return Err(EIO);
         }
         Ok(())
+    }
+
+    /// macOS 27.2 before RUN: sets bit 0 of the two GFXCAXI2AF enables, each read first.
+    pub(crate) fn enable_axi2af(&self) -> Result {
+        let r = self.axi2af.io();
+        for offset in super::hw::start_27_2::AXI2AF_ENABLES {
+            let value = r.try_read32(offset)?;
+            r.try_write32(value | 1, offset)?;
+        }
+        mb();
+        Ok(())
+    }
+
+    /// macOS 27.2 after AP power-on and before the GPU endpoints start: zeroes the host block
+    /// in macOS's order, reads the scratch word, then reads and raises the ready word. Returns
+    /// the scratch word.
+    pub(crate) fn publish_host_block(&self) -> Result<u32> {
+        use super::hw::start_27_2 as s;
+        let g = self.generation.io();
+        for offset in s::HOST_BLOCK_ZERO_ORDER {
+            g.try_write32(0, offset)?;
+        }
+        let probe = self.res.sgx_read32_at(s::SCRATCH_PROBE)?;
+        let _ = g.try_read32(s::HOST_READY)?;
+        g.try_write32(1, s::HOST_READY)?;
+        mb();
+        Ok(probe)
     }
 
     /// ASC control word (`asc + 0x44`).

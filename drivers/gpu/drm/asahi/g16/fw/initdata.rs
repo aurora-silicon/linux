@@ -128,7 +128,13 @@ pub(crate) struct Layout {
     pub(crate) firmware_data: FirmwareData,
     /// GLOBALS p-state selectors the host publishes at runtime (hundredths of a state).
     pub(crate) pstate_selectors: [usize; 3],
+    /// MAIN offset of the u64 size of the host's crash copy buffer, where the build has one.
+    pub(crate) coredump_copy: Option<usize>,
 }
+
+/// Size of the host's crash copy buffer (`coredump-copy-buffer` in the 27.2 ADT); macOS 27.2
+/// hands the J773g firmware a buffer of this size on the crash-log endpoint.
+pub(crate) const COREDUMP_COPY_SIZE: u64 = 0x8000;
 
 impl Layout {
     /// The register-map slot of logical loader record `slot`.
@@ -196,6 +202,7 @@ pub(crate) const V25G83: Layout = Layout {
         snapshot_entries: 448,
     },
     pstate_selectors: [0x88, 0x8c, 0x98],
+    coredump_copy: None,
 };
 
 /// The 26B123 InitData ABI (macOS 27.2): the same 31 objects and pointers, with
@@ -247,6 +254,11 @@ pub(crate) const V26B123: Layout = Layout {
         snapshot_entries: 448,
     },
     pstate_selectors: [0x8c, 0x90, 0x9c],
+    // HW data +0xfa8 stays zero. With the crash copy buffer's size there, the J713's firmware
+    // faulted on its first resume from idle, at fw-text PA + 0x6f8, as soon as a doorbell woke
+    // it. The T6041 build pairs 0x8000 there with a dedicated 0x8000 window at +0xfa0, where
+    // G16 keeps its RAM retention object.
+    coredump_copy: None,
 };
 
 /// Runs are ordered, disjoint and land inside an object of `size` bytes.
@@ -772,6 +784,9 @@ pub(crate) fn encode_for(
     let main = &mut objects[id::MAIN];
     put64(main, remap(runs, 0x28, 8)?, HOST_END)?;
     put64(main, remap(runs, 0xe88, 8)?, input.va[id::RETENTION])?;
+    if let Some(at) = layout.coredump_copy {
+        put64(main, at, COREDUMP_COPY_SIZE)?;
+    }
     for (at, value) in [
         (0xea0, 1),
         (0xee0, 1),
