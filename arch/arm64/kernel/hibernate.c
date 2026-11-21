@@ -475,7 +475,7 @@ int swsusp_arch_suspend(void)
 	unsigned long flags;
 	struct sleep_stack_data state;
 
-	if (cpus_are_stuck_in_kernel() || spin_table_cpus_stuck()) {
+	if (cpus_are_stuck_in_kernel() || spin_table_hibernate_cpus_stuck()) {
 		pr_err("Can't hibernate: no mechanism to offline secondary CPUs.\n");
 		return -EBUSY;
 	}
@@ -523,6 +523,9 @@ int swsusp_arch_suspend(void)
 
 		sleep_cpu = -EINVAL;
 		__cpu_suspend_exit();
+
+		/* The boot kernel's secondaries are in its pen, not where the image parked them. */
+		spin_table_hibernate_restored();
 
 		/*
 		 * Just in case the boot kernel did turn the SSBD
@@ -627,10 +630,19 @@ int __nocfi swsusp_arch_resume(void)
 
 int hibernate_resume_nonboot_cpu_disable(void)
 {
+	int ret;
+
 	if (sleep_cpu < 0) {
 		pr_err("Failing to resume from hibernate on an unknown CPU.\n");
 		return -ENODEV;
 	}
 
-	return freeze_secondary_cpus(sleep_cpu);
+	/* Parking spin-table CPUs wait outside the image while it is restored. */
+	ret = spin_table_hibernate_pen_begin(resume_hdr.ttbr1_el1, sleep_cpu);
+	if (ret)
+		return ret;
+	ret = freeze_secondary_cpus(sleep_cpu);
+	spin_table_hibernate_pen_end(!ret);
+
+	return ret;
 }
