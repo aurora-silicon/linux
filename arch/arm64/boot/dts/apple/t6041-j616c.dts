@@ -12,6 +12,7 @@
 #include "t6041.dtsi"
 #include "t6041-j614-j616-j575-scaler.dtsi"
 #include "t6041-j614c-j616c.dtsi"
+#include "t6041-j616c-usb3.dtsi"
 
 / {
 	compatible = "apple,j616c", "apple,t6041", "apple,arm-platform";
