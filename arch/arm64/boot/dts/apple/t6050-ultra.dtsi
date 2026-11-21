@@ -27,36 +27,53 @@
 	 * order.
 	 */
 	cpus {
-		T6050_M_CPU(cpu0, 40000, cpufreq_mc0);
-		T6050_M_CPU(cpu1, 40001, cpufreq_mc0);
-		T6050_M_CPU(cpu2, 40002, cpufreq_mc0);
-		T6050_M_CPU(cpu3, 40003, cpufreq_mc0);
-		T6050_M_CPU(cpu4, 40004, cpufreq_mc0);
-		T6050_M_CPU(cpu6, 40100, cpufreq_mc1);
-		T6050_M_CPU(cpu7, 40101, cpufreq_mc1);
-		T6050_M_CPU(cpu8, 40102, cpufreq_mc1);
-		T6050_M_CPU(cpu9, 40103, cpufreq_mc1);
-		T6050_M_CPU(cpu10, 40104, cpufreq_mc1);
+		T6050_M_CPU(cpu0, 40000, cpufreq_mc0, l2_cache_m0);
+		T6050_M_CPU(cpu1, 40001, cpufreq_mc0, l2_cache_m0);
+		T6050_M_CPU(cpu2, 40002, cpufreq_mc0, l2_cache_m0);
+		T6050_M_CPU(cpu3, 40003, cpufreq_mc0, l2_cache_m0);
+		T6050_M_CPU(cpu4, 40004, cpufreq_mc0, l2_cache_m0);
+		T6050_M_CPU(cpu6, 40100, cpufreq_mc1, l2_cache_m1);
+		T6050_M_CPU(cpu7, 40101, cpufreq_mc1, l2_cache_m1);
+		T6050_M_CPU(cpu8, 40102, cpufreq_mc1, l2_cache_m1);
+		T6050_M_CPU(cpu9, 40103, cpufreq_mc1, l2_cache_m1);
+		T6050_M_CPU(cpu10, 40104, cpufreq_mc1, l2_cache_m1);
 		T6050_P_CPU(cpu12, 10200, cpufreq_pc);
 		T6050_P_CPU(cpu13, 10201, cpufreq_pc);
 		T6050_P_CPU(cpu14, 10202, cpufreq_pc);
 		T6050_P_CPU(cpu15, 10203, cpufreq_pc);
 		T6050_P_CPU(cpu16, 10204, cpufreq_pc);
-		T6050_M_CPU(cpu18, 41000, cpufreq_mc0_die1);
-		T6050_M_CPU(cpu19, 41001, cpufreq_mc0_die1);
-		T6050_M_CPU(cpu20, 41002, cpufreq_mc0_die1);
-		T6050_M_CPU(cpu21, 41003, cpufreq_mc0_die1);
-		T6050_M_CPU(cpu22, 41004, cpufreq_mc0_die1);
-		T6050_M_CPU(cpu24, 41100, cpufreq_mc1_die1);
-		T6050_M_CPU(cpu25, 41101, cpufreq_mc1_die1);
-		T6050_M_CPU(cpu26, 41102, cpufreq_mc1_die1);
-		T6050_M_CPU(cpu27, 41103, cpufreq_mc1_die1);
-		T6050_M_CPU(cpu28, 41104, cpufreq_mc1_die1);
+		T6050_M_CPU(cpu18, 41000, cpufreq_mc0_die1, l2_cache_m0_die1);
+		T6050_M_CPU(cpu19, 41001, cpufreq_mc0_die1, l2_cache_m0_die1);
+		T6050_M_CPU(cpu20, 41002, cpufreq_mc0_die1, l2_cache_m0_die1);
+		T6050_M_CPU(cpu21, 41003, cpufreq_mc0_die1, l2_cache_m0_die1);
+		T6050_M_CPU(cpu22, 41004, cpufreq_mc0_die1, l2_cache_m0_die1);
+		T6050_M_CPU(cpu24, 41100, cpufreq_mc1_die1, l2_cache_m1_die1);
+		T6050_M_CPU(cpu25, 41101, cpufreq_mc1_die1, l2_cache_m1_die1);
+		T6050_M_CPU(cpu26, 41102, cpufreq_mc1_die1, l2_cache_m1_die1);
+		T6050_M_CPU(cpu27, 41103, cpufreq_mc1_die1, l2_cache_m1_die1);
+		T6050_M_CPU(cpu28, 41104, cpufreq_mc1_die1, l2_cache_m1_die1);
 		T6050_P_CPU(cpu30, 11200, cpufreq_pc_die1);
 		T6050_P_CPU(cpu31, 11201, cpufreq_pc_die1);
 		T6050_P_CPU(cpu32, 11202, cpufreq_pc_die1);
 		T6050_P_CPU(cpu33, 11203, cpufreq_pc_die1);
 		T6050_P_CPU(cpu34, 11204, cpufreq_pc_die1);
+
+		T6050_M_L2(l2_cache_m0, l2-cache-m0);
+		T6050_M_L2(l2_cache_m1, l2-cache-m1);
+		T6050_P_L3(l3_cache_p, l3-cache-p);
+		T6050_P_L2(l2_cache_cpu12, l2-cache-cpu12, l3_cache_p);
+		T6050_P_L2(l2_cache_cpu13, l2-cache-cpu13, l3_cache_p);
+		T6050_P_L2(l2_cache_cpu14, l2-cache-cpu14, l3_cache_p);
+		T6050_P_L2(l2_cache_cpu15, l2-cache-cpu15, l3_cache_p);
+		T6050_P_L2(l2_cache_cpu16, l2-cache-cpu16, l3_cache_p);
+		T6050_P_L2(l2_cache_cpu30, l2-cache-cpu30, l3_cache_p_die1);
+		T6050_P_L2(l2_cache_cpu31, l2-cache-cpu31, l3_cache_p_die1);
+		T6050_P_L2(l2_cache_cpu32, l2-cache-cpu32, l3_cache_p_die1);
+		T6050_P_L2(l2_cache_cpu33, l2-cache-cpu33, l3_cache_p_die1);
+		T6050_P_L2(l2_cache_cpu34, l2-cache-cpu34, l3_cache_p_die1);
+		T6050_M_L2(l2_cache_m0_die1, l2-cache-m0-die1);
+		T6050_M_L2(l2_cache_m1_die1, l2-cache-m1-die1);
+		T6050_P_L3(l3_cache_p_die1, l3-cache-p-die1);
 	};
 
 	/* Die 1 MMIO. The boot loader needs each die's bus. */
