@@ -1619,11 +1619,18 @@ static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
 	.gpu_demand = false,
 	.gpu_input = true,
 	/*
-	 * ANE work gets the same M5/F3 floor while it is in flight. Without it
-	 * an idle J713 runs MobileNetV1 at about 0.9 ms an EXECUTE, against
-	 * 0.25 ms on T6040 with its ANE floor.
+	 * ANE work gets the same M5/F3 floor while it is in flight, and, as on
+	 * T6040, the engine runs at a speed set by the P cluster's frequency
+	 * (cpu-map cluster1), whatever runs on it. Measured on J713 with
+	 * MobileNetV1: no floor 0.92 ms an EXECUTE (firmware 0.70 ms), M5/F3
+	 * 0.68 ms (0.45 ms); then firmware time by P cluster frequency 0.44 ms
+	 * up to 1.512 GHz, 0.32 ms at 2.616 GHz and 0.29-0.31 ms from there to
+	 * 4.104 GHz. The cluster floor is the start of that plateau.
 	 */
 	.ane = { [APPLE_CLPC_DCS] = 5, [APPLE_CLPC_SOC] = 3 },
+	.ane_cluster = 1,
+	.ane_cluster_khz = 2616000,
+	.ane_cluster_machine = "apple,t8132",
 };
 
 /*
@@ -2005,6 +2012,8 @@ static void apple_clpc_ane_demand_hold_test(struct kunit *test)
 	/* T6040 holds its top qualified DCS and fabric states for the ANE. */
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane[APPLE_CLPC_DCS], 5);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane[APPLE_CLPC_SOC], 3);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane_cluster, 1u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane_cluster_khz, 2616000u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_DCS], 5);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_SOC], 2);
 }
