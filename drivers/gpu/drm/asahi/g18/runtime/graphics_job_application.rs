@@ -179,13 +179,18 @@ impl ApplicationJob {
             (va::GRAPHICS_SCHEDULER_START,0x8000),(va::PB_TABLE,0x4000),(va::UMA_TABLE,0x8000)] {
             pages+=uat.kernel_vm().translate_pages(address,bytes)?.len();
         }
-        let expected=self.job.encoded.as_ref().ok_or(EINVAL)?.digests;
-        self.job.graph.with_bytes_mut(|out| {
-            if crate::g18::fw::graphics_payload::fnv64_uncached(&out[..cmd::G18_TA_COMMAND_BYTES])!=expected[0]
-                || crate::g18::fw::graphics_payload::fnv64_uncached(&out[0x4000..0x4000+cmd::G18_3D_COMMAND_BYTES])!=expected[1] {return Err(EIO);}Ok(())
+        // Compared byte for byte with the encoder's cached copy, which reads
+        // the write-combined graph in wide loads; hashing both every frame
+        // cost about 100 us between two jobs.
+        let job=&mut *self.job;
+        let encoded=job.encoded.as_ref().ok_or(EINVAL)?;
+        let (ta,fragment)=encoded.commands();
+        job.graph.with_bytes_mut(|out| {
+            if out[..cmd::G18_TA_COMMAND_BYTES]!=*ta
+                || out[0x4000..0x4000+cmd::G18_3D_COMMAND_BYTES]!=*fragment {return Err(EIO);}Ok(())
         })?;
         if frame.generation<=3 {
-            for (name,digest) in assembly::DIGEST_NAMES.iter().zip(expected) {
+            for (name,digest) in assembly::DIGEST_NAMES.iter().zip(encoded.digests()) {
                 dev_info!(dev.as_ref(),"G18_APP_DIGEST frame={} name={} fnv={:#018x}\n",frame.generation,name,digest);
             }
             dev_info!(dev.as_ref(),"G18_APP_AUDIT frame={} pb=resident uma=match translations={} previous_stamp={:#x}\n",frame.generation,pages,frame.previous_stamp());
