@@ -15091,9 +15091,20 @@ static __latent_entropy void sched_balance_softirq(void)
  * the task on a busy bigger CPU. Bigger CPUs are taken round robin, so each
  * task on them takes its turn on a smaller CPU: the big CPUs are time
  * shared, as one runqueue would share them. It only applies when every
- * allowed bigger CPU runs exactly one fair task (an idle one pulls the
- * misfit task through load balancing instead), and it never moves down a
- * task with a higher weight or a higher uclamp_min than the misfit task.
+ * allowed bigger CPU runs exactly one fair task (with an idle one, the
+ * misfit task moves there instead, below), and it never moves down a task
+ * with a higher weight or a higher uclamp_min than the misfit task.
+ * Clearing MISFIT_ROTATE turns the swap off.
+ */
+/*
+ * A misfit task that finds an idle bigger CPU moves there at once, through
+ * the same work: the destination is chosen under the same mutex, from the
+ * same round-robin start, and the move completes before the mutex is
+ * released, so two smaller CPUs never aim at the same idle CPU. Waiting for
+ * the idle CPU to pull the task instead takes until its next newly-idle or
+ * nohz idle balance, which is skipped by chance (NI_RANDOM) or waits for the
+ * domain's balance interval. The move does not depend on MISFIT_ROTATE: a
+ * task that task_is_misfit() marks gets it either way.
  */
 /* Serialize destination selection through completion of the swap. */
 static DEFINE_MUTEX(misfit_rotate_mutex);
@@ -15106,13 +15117,137 @@ static bool misfit_rotate_candidate(struct task_struct *p)
 	       p->nr_cpus_allowed > 1;
 }
 
+/* Is a bigger CPU that p may use idle? A hint only: the work decides. */
+static bool misfit_idle_bigger(int src_cpu, struct task_struct *p)
+{
+	unsigned long cap = arch_scale_cpu_capacity(src_cpu);
+	int cpu;
+
+	for_each_cpu_and(cpu, p->cpus_ptr, cpu_active_mask) {
+		if (arch_scale_cpu_capacity(cpu) > cap && idle_cpu(cpu))
+			return true;
+	}
+	return false;
+}
+
+struct misfit_move_arg {
+	struct task_struct *task;
+	int src_cpu;
+	int dst_cpu;
+	bool moved;
+};
+
+/*
+ * Stopper half of misfit_move_idle(), on src_cpu: move p, and no other
+ * task, to dst_cpu, and only while dst_cpu is still idle. Since the work
+ * looked, p may have slept, moved or left the fair class, and another task
+ * may have woken on src_cpu; in all of those cases nothing moves.
+ */
+static int misfit_move_cpu_stop(void *data)
+{
+	struct misfit_move_arg *arg = data;
+	struct task_struct *p = arg->task;
+	struct rq *src_rq = cpu_rq(arg->src_cpu);
+	struct rq *dst_rq = cpu_rq(arg->dst_cpu);
+	struct sched_domain *sd;
+	struct rq_flags rf;
+
+	rq_lock_irq(src_rq, &rf);
+	if (!cpu_active(arg->src_cpu) || !cpu_active(arg->dst_cpu) ||
+	    !idle_cpu(arg->dst_cpu))
+		goto out_unlock;
+
+	if (task_rq(p) != src_rq || !task_on_rq_queued(p) ||
+	    p->sched_class != &fair_sched_class)
+		goto out_unlock;
+
+	rcu_read_lock();
+	for_each_domain(arg->dst_cpu, sd) {
+		if (cpumask_test_cpu(arg->src_cpu, sched_domain_span(sd)))
+			break;
+	}
+
+	if (likely(sd)) {
+		struct lb_env env = {
+			.sd		= sd,
+			.dst_cpu	= arg->dst_cpu,
+			.dst_rq		= dst_rq,
+			.src_cpu	= arg->src_cpu,
+			.src_rq		= src_rq,
+			.idle		= CPU_IDLE,
+			.flags		= LBF_ACTIVE_LB,
+			.migration_type	= migrate_misfit,
+		};
+
+		schedstat_inc(sd->alb_count);
+		update_rq_clock(src_rq);
+
+		if (can_migrate_task(p, &env)) {
+			detach_task(p, &env);
+			arg->moved = true;
+			schedstat_inc(sd->alb_pushed);
+		} else {
+			schedstat_inc(sd->alb_failed);
+		}
+	}
+	rcu_read_unlock();
+out_unlock:
+	src_rq->active_balance = 0;
+	rq_unlock(src_rq, &rf);
+
+	if (arg->moved)
+		attach_one_task(dst_rq, p);
+
+	local_irq_enable();
+
+	return 0;
+}
+
+/*
+ * Move p, preempted on src_rq by the rotation work, to the idle dst_cpu
+ * through the stopper, and wait for it. active_balance keeps load
+ * balancing from queueing its own stopper on src_rq meanwhile.
+ */
+static int misfit_move_idle(struct rq *src_rq, struct task_struct *p,
+			    int dst_cpu)
+{
+	struct misfit_move_arg arg = {
+		.task		= p,
+		.src_cpu	= cpu_of(src_rq),
+		.dst_cpu	= dst_cpu,
+	};
+	struct rq_flags rf;
+	bool queued = false;
+	int ret;
+
+	rq_lock_irq(src_rq, &rf);
+	if (!src_rq->active_balance) {
+		src_rq->active_balance = 1;
+		queued = true;
+	}
+	rq_unlock_irq(src_rq, &rf);
+	if (!queued)
+		return -EBUSY;
+
+	ret = stop_one_cpu(arg.src_cpu, misfit_move_cpu_stop, &arg);
+	if (ret) {
+		/* The stopper did not run, so it did not clear the flag. */
+		rq_lock_irq(src_rq, &rf);
+		src_rq->active_balance = 0;
+		rq_unlock_irq(src_rq, &rf);
+		return ret;
+	}
+
+	return arg.moved ? 0 : -EAGAIN;
+}
+
 static void misfit_rotate_work(struct work_struct *work)
 {
 	struct rq *src_rq = container_of(work, struct rq, misfit_rotate_work);
 	int src_cpu = cpu_of(src_rq), dst_cpu = -1, cpu, start;
 	unsigned long src_cap = arch_scale_cpu_capacity(src_cpu);
 	struct task_struct *p, *t = NULL;
-	bool idle = false;
+	bool idle = false, dwell;
 	int ret = -EINVAL;
 
 	p = xchg(&src_rq->misfit_rotate_p, NULL);
@@ -15120,11 +15255,6 @@ static void misfit_rotate_work(struct work_struct *work)
 		return;
 
 	mutex_lock(&misfit_rotate_mutex);
-
-	if (!sched_feat(MISFIT_ROTATE)) {
-		ret = -ECANCELED;
-		goto out;
-	}
 
 	/* The task may have moved, slept or shrunk since the tick. */
 	if (task_cpu(p) != src_cpu || !task_on_rq_queued(p) ||
@@ -15142,6 +15272,7 @@ static void misfit_rotate_work(struct work_struct *work)
 
 		if (!READ_ONCE(rq->nr_running)) {
 			idle = true;
+			dst_cpu = cpu;
 			break;
 		}
 
@@ -15171,12 +15302,20 @@ static void misfit_rotate_work(struct work_struct *work)
 		get_task_struct(t);
 	rcu_read_unlock();
 
-	ret = idle ? -EAGAIN : -EBUSY;
-	if (t) {
+	/* A swap takes one turn per MISFIT_SLICES of misfit execution. */
+	dwell = p->se.sum_exec_runtime - p->misfit_runtime >= misfit_slices_ns();
+	if (idle)
+		ret = misfit_move_idle(src_rq, p, dst_cpu);
+	else if (!sched_feat(MISFIT_ROTATE))
+		ret = -ECANCELED;
+	else if (t && dwell)
 		ret = migrate_swap(p, t, dst_cpu, src_cpu);
-		if (!ret)
-			misfit_rotate_last_cpu = dst_cpu;
-	}
+	else
+		ret = t ? -EAGAIN : -EBUSY;
+	if (dwell)
+		p->misfit_runtime = p->se.sum_exec_runtime;
+	if (!ret)
+		misfit_rotate_last_cpu = dst_cpu;
 out:
 	trace_sched_misfit_rotate(p, t, src_cpu, dst_cpu, ret);
 	if (t)
@@ -15190,18 +15329,24 @@ static void misfit_rotate_trigger(struct rq *rq)
 {
 	struct task_struct *p = current;
 
-	if (!sched_feat(MISFIT_ROTATE) || !sched_asym_cpucap_active())
+	if (!sched_asym_cpucap_active())
 		return;
 
 	if (!READ_ONCE(rq->misfit_task_load) ||
 	    READ_ONCE(rq->nr_running) != 1 || !misfit_rotate_candidate(p))
 		return;
 
-	/* Preemption must not restart a CPU-bound task's misfit interval. */
-	if (p->se.sum_exec_runtime - p->misfit_runtime < misfit_slices_ns())
+	if (READ_ONCE(rq->misfit_rotate_p))
 		return;
 
-	if (READ_ONCE(rq->misfit_rotate_p))
+	/*
+	 * An idle bigger CPU takes the task at once. A swap needs
+	 * MISFIT_ROTATE and waits until the task has executed as a misfit for
+	 * MISFIT_SLICES base slices; preemption must not restart that interval.
+	 */
+	if ((!sched_feat(MISFIT_ROTATE) ||
+	     p->se.sum_exec_runtime - p->misfit_runtime < misfit_slices_ns()) &&
+	    !misfit_idle_bigger(cpu_of(rq), p))
 		return;
 
 	get_task_struct(p);
@@ -15209,7 +15354,6 @@ static void misfit_rotate_trigger(struct rq *rq)
 		put_task_struct(p);
 		return;
 	}
-	p->misfit_runtime = p->se.sum_exec_runtime;
 	trace_sched_misfit_rotate(p, NULL, cpu_of(rq), -1, -EINPROGRESS);
 	queue_work_on(cpu_of(rq), system_highpri_wq, &rq->misfit_rotate_work);
 }
