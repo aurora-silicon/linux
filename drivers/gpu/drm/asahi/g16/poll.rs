@@ -332,6 +332,61 @@ impl Firmware {
 
     /// Exact M4 queue and submit-pipe proof for one serialized publication. Event
     /// notifications are wakeups; neither an event nor elapsed time releases an owner.
+    /// Stall diagnostics: every input of the oldest flight's compute receipt, so a stall names
+    /// the condition that keeps it pending.
+    pub(crate) fn log_retirement(&self, why: &str) {
+        let Some(f) = self.engine.oldest() else {
+            return;
+        };
+        let dev = self.dev();
+        let x32 = |r: Result<u32>| r.unwrap_or(u32::MAX);
+        let x64 = |r: Result<u64>| r.unwrap_or(u64::MAX);
+        let g = &self.graph.compute;
+        dev_err!(
+            dev,
+            "G16 {}: oldest flight target {} (engine {}) head {} rec {:?} computes {} renders {}; fw_stamp {}; qstate read {} write {}; qinfo {} {} {} busy {}; notifier stamp {} context {} (vm slot {}); compute pipe read {} completion {} write {}\n",
+            why,
+            f.target,
+            self.engine.target,
+            f.head,
+            f.rec,
+            f.computes,
+            f.renders,
+            x32(g.fw_stamp.r32(0)),
+            x32(g.qstate.r32(qstate::READ)),
+            x32(g.qstate.r32(qstate::WRITE)),
+            x32(g.qinfo.r32(0x20)),
+            x32(g.qinfo.r32(0x24)),
+            x32(g.qinfo.r32(0x28)),
+            x32(g.qinfo.r32(0x80)),
+            x32(g.notifier.r32(notifier_page::COMPUTE_STAMP)),
+            x32(g.notifier.r32(notifier_page::COMPUTE_CONTEXT)),
+            f.job.vm.slot,
+            x32(self.channels.channel(Channel::Compute).read()),
+            x32(self.channels.channel(Channel::Compute).completion()),
+            x32(self.channels.channel(Channel::Compute).write())
+        );
+        if f.computes == 0 {
+            return;
+        }
+        let k = f.claims.slot[0] as usize;
+        match f.job.resources.compute_unit(k) {
+            Ok(unit) => dev_err!(
+                dev,
+                "G16 {}: compute unit {}: submitted {:#x} completed {:#x} counter {:#x} (counter va {:#x}) its start {:#x} end {:#x}\n",
+                why,
+                k,
+                x64(unit.counter.r64(0)),
+                x64(unit.work.r64(compute::DESCRIPTOR_COMPLETED)),
+                x64(unit.work.r64(compute::DESCRIPTOR_COUNTER)),
+                unit.counter.va,
+                x64(unit.its.r64(0)),
+                x64(unit.its.r64(8))
+            ),
+            Err(e) => dev_err!(dev, "G16 {}: compute unit {}: {:?}\n", why, k, e),
+        }
+    }
+
     pub(crate) fn queue_receipt(
         &self,
         channel: Channel,

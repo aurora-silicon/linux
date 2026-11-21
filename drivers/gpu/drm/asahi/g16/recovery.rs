@@ -155,6 +155,7 @@ impl Firmware {
             self.engine.pending.len(),
             self.recovery.long_commands
         );
+        self.log_retirement(why);
         if let Some(flight) = self.engine.oldest() {
             let (comm, tgid) = flight.job.vm.status.client();
             dev_err!(
