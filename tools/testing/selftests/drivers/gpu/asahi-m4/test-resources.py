@@ -234,9 +234,10 @@ pub mod g16 {
         // Failure modes: SCS storage overlapping the base units, another VM-fixed range or the
         // Mesa hole's end; a pool larger than its freelist seeds or rows, or its window; a
         // freelist (+0x1c) that does not hold its pool; base pools changing.
-        // Seeds: Mesa's 0x0130000060010070 layout on a 10-core M4, one compute stage (18432)
-        // and both render stages (28672).
-        let (compute_seeds,render_seeds)=(18432usize,28672u32);
+        // Seeds: Mesa's 0x0130000060010070 layout on a 10-core M4, two compute dispatches and
+        // both render stages (28672 each).
+        let (compute_seeds,render_seeds)=(28672usize,28672u32);
+        let records=|seeds:usize|g16::rt::freelist_records(seeds as u32) as usize;
         let mut o=Objects::new();let arena=arenas(&mut o);let pools=PoolSet::new(&mut o).unwrap();
         let mut scs=Vec::new();
         for k in 0..2{scs.push(g16::slots::ComputeSlot::new_in(&mut o,k,g16::slots::Placement::Scs{seeds:compute_seeds as u32}).unwrap());}
@@ -251,7 +252,8 @@ pub mod g16 {
         let read64=|obj:&g16::object::FwObject,at:usize|->u64{obj.r32(at).unwrap()as u64|((obj.r32(at+4).unwrap()as u64)<<32)};
         for (unit,seeds) in arena.compute.compute.iter().map(|u|(u,8192usize)).chain(scs.iter().map(|u|(u,compute_seeds))) {
             assert_eq!(unit.seeds as usize,seeds);assert_eq!(unit.pool.size,seeds*0x1000);
-            assert_eq!(unit.pool_state.size,seeds.max(16384)*8);
+            assert_eq!(unit.pool_state.size,records(seeds)*8);
+            assert_eq!(records(seeds),if seeds==8192 {16384} else {0x80000});
             let pool=unit.pool.gva.unwrap();
             assert_eq!(read64(&unit.pool_state,0),pool);
             assert_eq!(read64(&unit.pool_state,(seeds-1)*8),pool+(seeds as u64-1)*0x1000);
@@ -271,10 +273,12 @@ pub mod g16 {
             for (set,seeds) in [(&pools,8192u32),(&render,render_seeds)] {
                 let refs=set.allocator_refs_for(k).unwrap();
                 let descriptor=o.objects.iter().find(|obj|obj.va==refs.uma_mgr[0]).unwrap();
-                assert_eq!((descriptor.r32(0x1c).unwrap(),descriptor.r32(0x24).unwrap(),descriptor.r32(0x2c).unwrap()),(seeds.max(16384),seeds,seeds));
+                assert_eq!((descriptor.r32(0x1c).unwrap(),descriptor.r32(0x24).unwrap(),descriptor.r32(0x2c).unwrap()),(records(seeds as usize) as u32,seeds,seeds));
+                // Eight row words per valid row: 128 for a base pool, as before.
+                assert_eq!(descriptor.r32(0x48).unwrap(),seeds/512*8);
                 assert_eq!(refs.parameter_id,k as u32);
                 let state=o.objects.iter().find(|obj|obj.gva==Some(read64(descriptor,0x14))).unwrap();
-                assert_eq!(state.size,seeds.max(16384) as usize*8);
+                assert_eq!(state.size,records(seeds as usize)*8);
                 let pool=o.objects.iter().find(|obj|obj.gva==Some(read64(state,0))).unwrap();
                 assert_eq!(pool.size,seeds as usize*0x1000);
                 assert_eq!(read64(state,(seeds as usize-1)*8),read64(state,0)+(seeds as u64-1)*0x1000);
@@ -283,7 +287,7 @@ pub mod g16 {
         }
         assert_eq!(render.allocator_refs_for(0).unwrap().scene_list,0x7012170000);
         // Pools are whole rows that, with their freelist, fit a window.
-        for seeds in [0u32,512*63+1,512*64] {
+        for seeds in [0u32,512*62+1,512*63] {
             assert_eq!(g16::slots::ComputeSlot::new_in(&mut o,0,g16::slots::Placement::Scs{seeds}).err(),Some(E2BIG),"{seeds}");
             assert_eq!(pools.scs(&mut o,seeds).err(),Some(E2BIG),"{seeds}");
         }

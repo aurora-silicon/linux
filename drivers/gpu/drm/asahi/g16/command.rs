@@ -137,8 +137,8 @@ pub(crate) struct RenderCommand {
     pub(crate) cmd: uapi::drm_asahi_cmd_render,
     /// The validated ray-query state of the vertex and fragment stages.
     pub(crate) ray_query: [super::rt::RayQueryStage; 2],
-    /// Freelist entries its UMA pool needs for both stages' scratch, zero without scratch.
-    pub(crate) scs_seeds: u32,
+    /// The SCS-capable UMA pool of both stages' scratch.
+    pub(crate) scs: super::rt::ScsSeeds,
     /// Retained timestamp destinations, published after full command retirement.
     pub(crate) timestamp_outputs: crate::timestamp::Destinations,
     /// Explicit hardware attachments in effect for each render engine.
@@ -151,8 +151,8 @@ pub(crate) struct ComputeCommand {
     pub(crate) cmd: uapi::drm_asahi_cmd_compute,
     /// The validated scratch layout and intersection tables.
     pub(crate) ray: super::rt::ComputeRay,
-    /// Freelist entries its UMA pool needs for the scratch, zero without scratch.
-    pub(crate) scs_seeds: u32,
+    /// The SCS-capable UMA pool of the scratch.
+    pub(crate) scs: super::rt::ScsSeeds,
     /// DRM_ASAHI_COMPUTE_AS_BUILD.
     pub(crate) as_build: bool,
     /// The compute attachments in effect (validated writable).
@@ -181,12 +181,12 @@ impl Command {
         }
     }
 
-    /// Freelist entries the command's SCS-capable UMA pool needs, zero without scratch: a
-    /// command with shader-context scratch runs on SCS-capable storage.
-    pub(crate) fn scs_seeds(&self) -> u32 {
+    /// The SCS-capable UMA pool the command runs on ([`super::rt::ScsSeeds::NONE`] without
+    /// shader-context scratch).
+    pub(crate) fn scs(&self) -> super::rt::ScsSeeds {
         match self {
-            Command::Render(r) => r.scs_seeds,
-            Command::Compute(c) => c.scs_seeds,
+            Command::Render(r) => r.scs,
+            Command::Compute(c) => c.scs,
         }
     }
 }
@@ -690,14 +690,17 @@ fn check_intersection(vm: &mmu::Vm, tables: &super::rt::IntersectionTables) -> R
 
 /// Per-command render ray-query admission. A render's scratch must fit what its queue
 /// reserved (`render_scs_layout`): the render's UMA pool was sized for that (EINVAL beyond it,
-/// as on the M4 Pro). Returns the freelist entries the render's UMA pool needs, zero without
-/// scratch.
-fn check_render_ray(context: &Context<'_>, stages: &[super::rt::RayQueryStage; 2]) -> Result<u32> {
+/// as on the M4 Pro). Returns the SCS-capable pool the render runs on, sized for the
+/// reservation ([`super::rt::pool_seeds`]).
+fn check_render_ray(
+    context: &Context<'_>,
+    stages: &[super::rt::RayQueryStage; 2],
+) -> Result<super::rt::ScsSeeds> {
     for stage in stages {
         check_intersection(context.vm, &stage.intersection)?;
     }
     if !stages.iter().any(|stage| stage.scratch.enabled()) {
-        return Ok(0);
+        return Ok(super::rt::ScsSeeds::NONE);
     }
     let pages = stages.map(|stage| stage.scratch.pages());
     let needed = super::rt::required_seeds(context.active_cores, &pages)?;
@@ -705,18 +708,25 @@ fn check_render_ray(context: &Context<'_>, stages: &[super::rt::RayQueryStage; 2
     if needed > reserved {
         return Err(EINVAL);
     }
-    Ok(needed)
+    let pool = super::rt::pool_seeds(context.active_cores, context.render_scs)?;
+    Ok(super::rt::ScsSeeds { needed, pool })
 }
 
 /// Per-command compute ray admission: the tables are mapped and the scratch fits an
-/// SCS-capable UMA pool (E2BIG). Returns the freelist entries the command's UMA pool needs,
-/// zero without scratch.
-fn check_compute_ray(context: &Context<'_>, ray: &super::rt::ComputeRay) -> Result<u32> {
+/// SCS-capable UMA pool (E2BIG). Returns the SCS-capable pool the command runs on.
+fn check_compute_ray(
+    context: &Context<'_>,
+    ray: &super::rt::ComputeRay,
+) -> Result<super::rt::ScsSeeds> {
     check_intersection(context.vm, &ray.intersection)?;
     if !ray.scratch.enabled() {
-        return Ok(0);
+        return Ok(super::rt::ScsSeeds::NONE);
     }
-    super::rt::required_seeds(context.active_cores, &[ray.scratch.pages()])
+    let pages = ray.scratch.pages();
+    Ok(super::rt::ScsSeeds {
+        needed: super::rt::required_seeds(context.active_cores, &[pages])?,
+        pool: super::rt::pool_seeds(context.active_cores, [pages, 0])?,
+    })
 }
 
 /// Per-command compute admission.
@@ -831,7 +841,7 @@ impl Prepared<'_> {
                     let outputs = resolved.next().ok_or(EINVAL)?;
                     let ray_query = render_ray_query(entry.payload)?;
                     check_render(context, cmd)?;
-                    let scs_seeds = check_render_ray(context, &ray_query)?;
+                    let scs = check_render_ray(context, &ray_query)?;
                     check_attachments(context.vm, &vertex, true)?;
                     check_attachments(context.vm, &fragment, true)?;
                     commands.push(
@@ -839,7 +849,7 @@ impl Prepared<'_> {
                             RenderCommand {
                                 cmd: *cmd,
                                 ray_query,
-                                scs_seeds,
+                                scs,
                                 timestamp_outputs: outputs,
                                 vertex_attachments: copy_list(&[&vertex])?,
                                 fragment_attachments: copy_list(&[&fragment])?,
@@ -854,7 +864,7 @@ impl Prepared<'_> {
                     let cmd = &packet;
                     check_compute(context, cmd, &compute)?;
                     let ray = compute_ray(cmd)?;
-                    let scs_seeds = check_compute_ray(context, &ray)?;
+                    let scs = check_compute_ray(context, &ray)?;
                     let as_build = super::rt::as_build(cmd.flags).ok_or(EINVAL)?;
                     let outputs = resolved.next().ok_or(EINVAL)?;
                     commands.push(
@@ -862,7 +872,7 @@ impl Prepared<'_> {
                             ComputeCommand {
                                 cmd: *cmd,
                                 ray,
-                                scs_seeds,
+                                scs,
                                 as_build,
                                 attachments: copy_list(&[&compute])?,
                                 timestamp_outputs: outputs,

@@ -9,7 +9,7 @@ mod fw {
     }
 }
 #[allow(unused_imports)]
-use fw::{graph::manager, work::compute};
+use fw::{graph::{manager, pools}, work::compute};
 mod uapi {
     #[derive(Default)]
     pub struct drm_asahi_cmd_compute {pub cdm_ctrl_stream_base:u64,pub cdm_ctrl_stream_end:u64}

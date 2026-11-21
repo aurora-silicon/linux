@@ -135,7 +135,11 @@ pub(crate) fn uma_manager_image(
     put32(&mut m, 0x2c, seeds);
     put64(&mut m, 0x30, list_gpu);
     put32(&mut m, 0x40, 4);
-    put32(&mut m, 0x48, 128);
+    put32(
+        &mut m,
+        super::graph::manager::ROW_WORDS,
+        super::graph::pools::row_words(seeds),
+    );
     put64(&mut m, 0x4c, submitted_fw);
     // +0x54 is the ASC completion count; +0x5c is the compute-exclusion flag.
     // Both start at zero for paired render engines and are never AP command serials.

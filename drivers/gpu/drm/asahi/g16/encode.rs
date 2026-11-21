@@ -8,7 +8,7 @@
 
 use kernel::{prelude::*, uapi};
 
-use super::fw::graph::manager;
+use super::fw::graph::{manager, pools};
 use super::fw::work::{self, barrier, compute, fs, initbm, scene, ta, REG_RECORD};
 use super::hw;
 

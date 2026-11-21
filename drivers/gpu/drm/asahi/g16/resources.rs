@@ -8,13 +8,13 @@
 //! Shader-context scratch (ray queries) takes its pages from the UMA pool of the unit that
 //! runs it, on top of the pool's base pages ([`super::rt::required_seeds`]). A job with
 //! scratch therefore runs on SCS-capable storage, created with its VM's first such job and
-//! sized for it: two compute units ([`Placement::Scs`]) for its compute commands, with pools
-//! for its largest compute scratch, and a second set of render allocators ([`PoolSet::scs`])
-//! for its renders, with pools for both stages of the queue's reservation
-//! ([`super::rt::render_pool_seeds`]). SCS storage cannot grow once the hardware may hold it:
-//! a later job that needs more is refused (E2BIG). Mesa's ray-query layout is fixed per
-//! device, so its jobs never do. Jobs without scratch keep the base storage, bytes and
-//! addresses unchanged.
+//! sized as its commands' admission says ([`super::rt::ScsSeeds`]): two compute units
+//! ([`Placement::Scs`]) for its compute commands, with pools for two dispatches of its largest
+//! compute scratch, and a second set of render allocators ([`PoolSet::scs`]) for its renders,
+//! with pools for both stages of the queue's reservation ([`super::rt::pool_seeds`]). SCS
+//! storage cannot grow once the hardware may hold it: a later job that needs more is refused
+//! (E2BIG). Mesa's ray-query layout is fixed per device, so its jobs never do. Jobs without
+//! scratch keep the base storage, bytes and addresses unchanged.
 
 use super::{
     command::Command,
@@ -150,19 +150,20 @@ impl RenderArena {
             GFP_KERNEL,
         )?)
     }
-    /// Creates the SCS-capable render allocators with pools of `seeds` entries unless they
-    /// exist. Existing ones must hold `needed`: once the hardware may hold them they cannot
-    /// grow (E2BIG). Called under the VM cache's construction mutex, before any job uses them.
-    fn ensure_scs(&self, factory: &Factory, vm: &mmu::Vm, seeds: u32, needed: u32) -> Result {
+    /// Creates the SCS-capable render allocators with pools of `seeds.pool` entries unless
+    /// they exist. Existing ones must hold `seeds.needed`: once the hardware may hold them they
+    /// cannot grow (E2BIG). Called under the VM cache's construction mutex, before any job uses
+    /// them.
+    fn ensure_scs(&self, factory: &Factory, vm: &mmu::Vm, seeds: super::rt::ScsSeeds) -> Result {
         if let Some(scs) = self.scs.as_ref() {
-            return if scs.pools.seeds() >= needed {
+            return if scs.pools.seeds() >= seeds.needed {
                 Ok(())
             } else {
                 Err(E2BIG)
             };
         }
         let mut objects = factory.objects(vm);
-        let pools = self.pools.scs(&mut objects, seeds.max(needed))?;
+        let pools = self.pools.scs(&mut objects, seeds.pool)?;
         objects.finish_private()?;
         // The construction mutex excludes a second populate.
         if !self.scs.populate(ScsPools {
@@ -258,14 +259,10 @@ impl Cache {
         drop(ready);
     }
 
-    /// The backing of a job of `commands`. `render_pool_seeds` sizes the VM's SCS-capable
-    /// render pools if this job creates them ([`super::rt::render_pool_seeds`] of the queue's
-    /// reservation); SCS-capable compute units are sized for the job's largest compute scratch.
     pub(crate) fn prepare(
         self: &Arc<Self>,
         vm: &Arc<VmState>,
         commands: &[Command],
-        render_pool_seeds: u32,
     ) -> Result<Prepared> {
         let computes = commands
             .iter()
@@ -279,20 +276,20 @@ impl Cache {
         let render = render_count != 0;
         // Scratch is sized on top of a pool's base pages: such a job runs on SCS-capable
         // storage, for all its commands of that engine, whose pools hold the largest of them.
-        let compute_seeds = commands
-            .iter()
-            .filter(|c| matches!(c, Command::Compute(_)))
-            .map(Command::scs_seeds)
-            .max()
-            .unwrap_or(0);
-        let render_seeds = commands
-            .iter()
-            .filter(|c| matches!(c, Command::Render(_)))
-            .map(Command::scs_seeds)
-            .max()
-            .unwrap_or(0);
-        let compute_scs = compute_seeds != 0;
-        let render_scs = render_seeds != 0;
+        let scs = |engine: fn(&Command) -> bool| {
+            commands
+                .iter()
+                .filter(|&c| engine(c))
+                .map(Command::scs)
+                .fold(super::rt::ScsSeeds::NONE, |a, b| super::rt::ScsSeeds {
+                    needed: a.needed.max(b.needed),
+                    pool: a.pool.max(b.pool).max(b.needed),
+                })
+        };
+        let compute_seeds = scs(|c| matches!(c, Command::Compute(_)));
+        let render_seeds = scs(|c| matches!(c, Command::Render(_)));
+        let compute_scs = compute_seeds.needed != 0;
+        let render_scs = render_seeds.needed != 0;
         let mut epochs = super::budget::Budget::reserve(&self.budget, render_count.try_into()?)?;
         let (compute, compute_ext, render) = {
             // Never held by publication, completion, recovery or fence signalling.
@@ -320,12 +317,12 @@ impl Cache {
                             &self.live,
                             0..super::hw::sizes::SCS_COMPUTE_UNITS,
                             Placement::Scs {
-                                seeds: compute_seeds,
+                                seeds: compute_seeds.pool,
                             },
                         )?);
                     }
                     // The units cannot grow once the hardware may hold them.
-                    Some(seeds) if seeds < compute_seeds => return Err(E2BIG),
+                    Some(seeds) if seeds < compute_seeds.needed => return Err(E2BIG),
                     Some(_) => {}
                 }
             }
@@ -367,7 +364,6 @@ impl Cache {
                 ready.render.as_ref().ok_or(EINVAL)?.ensure_scs(
                     &self.factory,
                     &vm.vm,
-                    render_pool_seeds,
                     render_seeds,
                 )?;
             }

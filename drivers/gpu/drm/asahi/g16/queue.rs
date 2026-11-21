@@ -9,8 +9,8 @@
 //! largest ray-query scratch layouts of the queue's render stages) is reserved at creation:
 //! EINVAL for a malformed layout, E2BIG beyond the largest SCS-capable UMA pool; a render
 //! whose scratch exceeds the reservation is refused (EINVAL), as on the M4 Pro. The
-//! reservation also sizes the VM's SCS-capable render pools if this queue creates them
-//! ([`super::rt::render_pool_seeds`]).
+//! reservation also sizes the SCS-capable render pools its VM creates for it
+//! ([`super::rt::pool_seeds`]).
 //!
 //! QUEUE_DESTROY (dropping the queue) drains: the scheduler entity is torn down first, which
 //! waits (killable) until every accepted job has been handed to the engine; the engine then runs
@@ -111,8 +111,6 @@ pub(crate) struct Queue {
     active_cores: u32,
     /// Reserved render scratch pages per stage (`render_scs_layout`).
     render_scs: [u16; 2],
-    /// Freelist entries of the SCS-capable render pools the reservation sizes.
-    render_pool_seeds: u32,
 }
 
 impl Queue {
@@ -169,7 +167,6 @@ impl Queue {
             timeline,
             active_cores: gpu.id.core_masks.iter().map(|mask| mask.count_ones()).sum(),
             render_scs: [0; 2],
-            render_pool_seeds: super::rt::BASE_SEEDS,
         })
     }
 
@@ -214,11 +211,12 @@ impl Queue {
         }
         // Allocate and map private backing before a fence or accepted ordinal exists.
         // No GPU completion lock is held; reclaim can wait for earlier hardware work.
-        let resources = self.vm.resources.as_ref().ok_or(EIO)?.prepare(
-            &self.vm,
-            &submission.commands,
-            self.render_pool_seeds,
-        )?;
+        let resources = self
+            .vm
+            .resources
+            .as_ref()
+            .ok_or(EIO)?
+            .prepare(&self.vm, &submission.commands)?;
         let fence = self.timeline.next()?;
         let job = Job::new(
             id,
@@ -243,8 +241,7 @@ impl Queue {
 impl crate::queue::Queue for Queue {
     /// RENDER_RAY_QUERY: the largest scratch layouts of the queue's vertex and fragment stages.
     /// A render's UMA pool serves both stages of one render at a time, so their extra pages add
-    /// up ([`super::rt::required_seeds`]); the VM's SCS-capable render pools are sized from
-    /// the reservation ([`super::rt::render_pool_seeds`]).
+    /// up ([`super::rt::required_seeds`]).
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
         if self.accepted != [0; 2] {
             return Err(EBUSY);
@@ -253,7 +250,7 @@ impl crate::queue::Queue for Queue {
             super::rt::ScratchRequest::new(layouts[0])?.pages(),
             super::rt::ScratchRequest::new(layouts[1])?.pages(),
         ];
-        self.render_pool_seeds = super::rt::render_pool_seeds(self.active_cores, pages)?;
+        super::rt::required_seeds(self.active_cores, &pages)?;
         self.render_scs = pages;
         Ok(())
     }

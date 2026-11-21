@@ -268,7 +268,7 @@ impl PoolSet {
     }
     /// The SCS-capable allocators of this set's VM (ray-query scratch): one per pass slot,
     /// sharing this set's PB heap, each with a pool of `seeds` entries
-    /// ([`super::rt::render_pool_seeds`]). A render uses either set's allocator `k` with pass
+    /// ([`super::rt::pool_seeds`]). A render uses either set's allocator `k` with pass
     /// slot `k`; both alternate the one hardware UMA slot 33.
     pub(crate) fn scs(&self, o: &mut Objects, seeds: u32) -> Result<Self> {
         let heap = &self.units.first().ok_or(EINVAL)?.heap;

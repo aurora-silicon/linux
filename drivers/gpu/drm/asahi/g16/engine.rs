@@ -1545,7 +1545,7 @@ fn compute_rt(ray: &super::rt::ComputeRay, seeds: u32) -> ComputeRt {
     ComputeRt {
         intersection: ray.intersection.words(),
         size: ray.scratch.size_word(),
-        tail: ray.scratch.tail_word(),
+        tail: ray.scratch.compute_tail_word(),
         stack: ray.scratch.stack_word(),
         window: ray.scratch.window_word(),
         driver: ray.scratch.driver_word(),

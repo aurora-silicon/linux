@@ -6,23 +6,25 @@
 //! scratch (SCS) layout and intersection tables, a render's per-stage ray-query state, and the
 //! compute AS-build flag. The validation, the register words they become and the SCS memory
 //! sizing are those of the M4 Pro (T6041, the same G16 GPU generation) on its 26B123 firmware
-//! (`g17::fw::variant::V26B123`): its compute program is 25F84's (`compute_registers_25f84`),
-//! which writes the intersection and scratch words but neither 0x017d9 nor 0x1a141, the shape
-//! of the G16G compute register list. This module is pure: no kernel objects, no allocation.
+//! (`g17::fw::variant::V26B123`), except where macOS 27.2 on the J773g (G16G, 26B123) has
+//! been traced: a ray-query compute item's 0x017e1/0x017d9 records and 0xd479 tail
+//! ([`super::encode`]), and the SCS pools' freelists (+0x1c, [`SCS_FREELIST_RECORDS`]) and
+//! row words (+0x48). This module is pure: no kernel objects, no allocation.
 //!
-//! What the M4 Pro's path does not settle for G16G stays off behind a named gate and is a
-//! trace question of mesa#577:
+//! What neither settles for G16G stays off behind a named gate or is open, as trace questions
+//! of mesa#577:
 //!
-//! - 0x017d9 (SCS enable), [`super::encode`]'s `COMPUTE_SCS_ENABLE` and `RENDER_SCS_ENABLE`
-//!   (T1, T5, T6). The M4 Pro's 25G83 render programs write it in a stage with SCS; its
-//!   compute program does not.
-//! - 0x1a141 (SCS driver word), `COMPUTE_SCS_DRIVER_WORD` (T1).
+//! - 0x017d9 (SCS enable) in a render stage, [`super::encode`]'s `RENDER_SCS_ENABLE` (T5,
+//!   T6): the M4 Pro's 25G83 render programs write it in a stage with SCS. No G16G render with
+//!   ray queries has been traced.
+//! - 0x1a141 (SCS driver word), `COMPUTE_SCS_DRIVER_WORD` (T1): macOS's ray-query compute
+//!   items on the J773g do not write it.
 //! - An SCS-enable bit in the work or microsequence, as g17's kick header has (T6): none is
 //!   known, so nothing is written.
 //! - A traversal exclusion between clients (T8): the A18 Pro needs one (`g17::traversal`), the
 //!   M4 Pro's variants do not set it; G16G adds none.
-//! - How macOS sizes the SCS pool and its freelist (T3). An SCS-capable pool here is sized from
-//!   the request and its freelist holds every seed ([`freelist_records`]).
+//! - How macOS sizes the SCS pool for a given request (T3): it grows its compute pool beyond
+//!   the M4 Pro's extras ([`pool_seeds`]); one request size does not give the rule.
 
 use kernel::prelude::*;
 
@@ -55,8 +57,12 @@ impl ScratchRequest {
     pub(crate) const WINDOW_DISABLED: u64 = 0xff_0000;
     /// Disabled stack word: the value G16G's work lists write today.
     pub(crate) const STACK_DISABLED: u64 = 8;
-    /// Tail reservation when enabled.
+    /// TA/FS tail reservation when enabled (0xd471, 0xd469), as the M4 Pro's 25G83 render
+    /// programs write it. No G16G render with ray queries has been traced.
     const TAIL_ENABLED: u64 = 8;
+    /// Compute tail reservation when enabled (0xd479), as macOS 27.2 on the J773g writes it in
+    /// its ray-query compute work.
+    const COMPUTE_TAIL_ENABLED: u64 = 0x2c;
 
     /// No scratch.
     pub(crate) const NONE: Self = Self {
@@ -135,9 +141,18 @@ impl ScratchRequest {
         self.driver
     }
 
-    /// 0xd479 (compute), 0xd471 (TA), 0xd469 (FS).
+    /// 0xd471 (TA), 0xd469 (FS).
     pub(crate) fn tail_word(self) -> u64 {
         self.tail
+    }
+
+    /// 0xd479 (compute).
+    pub(crate) fn compute_tail_word(self) -> u64 {
+        if self.enabled() {
+            Self::COMPUTE_TAIL_ENABLED
+        } else {
+            0
+        }
     }
 }
 
@@ -400,6 +415,9 @@ pub(crate) const BASE_SEEDS: u32 = 8192;
 /// Records of a base UMA freelist: the capacity G16G's managers report at +0x1c for their
 /// 0x20000-byte freelist (`UNK_1C_VALUE`).
 pub(crate) const FREELIST_RECORDS: u32 = 16384;
+/// Records of an SCS-capable pool's freelist: the +0x1c macOS 27.2 on the J773g writes on
+/// every pool, over a 4-MiB freelist, whatever the pool's rows (20 to 108 seen).
+pub(crate) const SCS_FREELIST_RECORDS: u32 = 0x80000;
 /// Bytes of one freelist record, the 64-bit address of one 4-KiB seed.
 pub(crate) const RECORD_BYTES: u64 = 8;
 /// Bytes of one seed.
@@ -407,19 +425,21 @@ pub(crate) const SEED_BYTES: u64 = 0x1000;
 /// Freelist entries of one 2-MiB pool-table row.
 pub(crate) const SEEDS_PER_ROW: u32 = 512;
 /// The most freelist entries of an SCS-capable UMA pool: the whole rows whose pool and
-/// freelist fit one SCS pool window (63 rows, 126 MiB). The 256-row pool table holds more.
+/// freelist fit one SCS pool window (62 rows, 124 MiB, and the 4-MiB freelist). The 256-row
+/// pool table holds more.
 pub(crate) const MAX_SCS_SEEDS: u32 = max_window_seeds(super::hw::client::SCS_POOL_WINDOW);
 const _: () = assert!(BASE_SEEDS % SEEDS_PER_ROW == 0 && MAX_SCS_SEEDS % SEEDS_PER_ROW == 0);
 const _: () = assert!(BASE_SEEDS < FREELIST_RECORDS && FREELIST_RECORDS < MAX_SCS_SEEDS);
+const _: () = assert!(MAX_SCS_SEEDS < SCS_FREELIST_RECORDS);
 const _: () = assert!(freelist_records(BASE_SEEDS) as u64 * RECORD_BYTES == 0x20000);
 
-/// The freelist records of a UMA pool with `seeds` entries: every seed, and never fewer than a
-/// base freelist. +0x1c is the record count of the freelist +0x14 points at, as M3's manager
-/// of the same format shows (g15 `UNK_1C_VALUE` 0x80000 for its 4-MiB freelist); a base pool
-/// keeps the 16384 G16G writes.
+/// The freelist records (+0x1c) of a UMA pool with `seeds` entries. +0x1c is the record count
+/// of the freelist +0x14 points at. A base pool keeps the 16384 G16G has always written; an
+/// SCS-capable pool (more than the base seeds) gets [`SCS_FREELIST_RECORDS`], as macOS 27.2 on
+/// the J773g gives every pool.
 pub(crate) const fn freelist_records(seeds: u32) -> u32 {
-    if seeds > FREELIST_RECORDS {
-        seeds
+    if seeds > BASE_SEEDS {
+        SCS_FREELIST_RECORDS
     } else {
         FREELIST_RECORDS
     }
@@ -481,12 +501,30 @@ pub(crate) fn required_seeds(active_cores: u32, pages: &[u16]) -> Result<u32> {
     u32::try_from(seeds).map_err(|_| E2BIG)
 }
 
-/// Freelist entries of the SCS-capable render pools a queue reserving `pages` per stage
-/// creates for its VM. The pools serve every queue of the VM and cannot grow once the hardware
-/// may hold them, while a later queue can reserve the other stage too (Mesa replaces its queue
-/// to add one): they are sized for both stages at the larger reserved one where a window holds
-/// that, otherwise for the reservation itself. E2BIG if neither fits.
-pub(crate) fn render_pool_seeds(active_cores: u32, pages: [u16; 2]) -> Result<u32> {
+/// The SCS-capable UMA pool a command runs on: one of at least `needed` freelist entries, or
+/// if its VM has none yet, a new one of `pool` ([`pool_seeds`]). Both zero without scratch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScsSeeds {
+    pub(crate) needed: u32,
+    pub(crate) pool: u32,
+}
+
+impl ScsSeeds {
+    /// No scratch.
+    pub(crate) const NONE: Self = Self { needed: 0, pool: 0 };
+}
+
+/// Freelist entries of the SCS-capable pools created for requests of `pages` per stage (a
+/// render's two stages, or a compute dispatch and zero). The pools serve every later job of the
+/// VM and cannot grow once the hardware may hold them, so they hold two stages at the larger
+/// one where a window holds that, otherwise the request itself; E2BIG if neither fits.
+///
+/// - A render pool then takes a later queue that reserves the other stage too (Mesa replaces
+///   its queue to add one).
+/// - A compute pool gets two dispatches' extras. One is less than macOS provisions: for its
+///   own ray-query kernel of 1703 pages per core, macOS 27.2 on the J773g grew the compute pool
+///   to 108 rows, about 2.6 times the extras of [`extra_pages`].
+pub(crate) fn pool_seeds(active_cores: u32, pages: [u16; 2]) -> Result<u32> {
     let largest = pages[0].max(pages[1]);
     required_seeds(active_cores, &[largest, largest])
         .or_else(|_| required_seeds(active_cores, &pages))

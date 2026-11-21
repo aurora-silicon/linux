@@ -3,7 +3,7 @@
 //! Pure G16G compute encoding (25G83 and 26B123 work layouts). Publication and lifetime proofs
 //! belong to the engine.
 
-use super::{compute, manager, put16, put32, put64, put8, uapi};
+use super::{compute, manager, pools, put16, put32, put64, put8, uapi};
 
 /// Stores the binding generation `v` as a little-endian integer of `bytes` (1 or 8) bytes.
 pub(super) fn put_generation(b: &mut [u8], off: usize, bytes: usize, v: u8) {
@@ -63,10 +63,12 @@ pub(crate) struct ComputeRefs {
     pub(crate) submitted: u64,
 }
 
-/// Write the SCS enable 0x017d9 = 1 first in the register list of a command with scratch, as
-/// g17's G17P compute program does. Off: the M4 Pro's 26B123 compute program (25F84's) runs
-/// ray traversal without it, the shape of this list. Trace question T1/T6.
-pub(crate) const COMPUTE_SCS_ENABLE: bool = false;
+/// The first and last register records of a ray-query compute work item, as macOS 27.2 on the
+/// J773g writes them: 0x017e1 = 1 first (only in ray-query items) and 0x017d9 = 1 last. macOS
+/// also writes the trailing 0x017d9 in some compute work without ray queries; G16G's
+/// non-ray-query work keeps the list it has always had.
+const RAY_QUERY_FIRST: (u32, u64) = (0x017e1, 1);
+const RAY_QUERY_LAST: (u32, u64) = (0x017d9, 1);
 /// Write the SCS driver word 0x1a141 after 0x1a0e9 for a command with scratch, as g17's G17P
 /// compute program does (zero on Gen1). Off: 25F84's program does not write it. Trace
 /// question T1.
@@ -110,9 +112,9 @@ impl ComputeRt {
     };
 }
 
-/// Register records of a compute work item at most: the 24 of [`compute::SEL`], 0x10071 and
-/// the two gated SCS registers.
-const MAX_REGS: usize = compute::SEL.len() + 3;
+/// Register records of a compute work item at most: the 24 of [`compute::SEL`], 0x10071, the
+/// ray-query first and last records and the gated SCS driver word.
+const MAX_REGS: usize = compute::SEL.len() + 4;
 
 const FW_START: u64 = 0xfffffc2000000000;
 const FW_END: u64 = 0xfffffc2ffc000000;
@@ -399,8 +401,8 @@ pub(crate) fn encode_compute_rt(
         records[count] = (sel, value);
         count += 1;
     };
-    if COMPUTE_SCS_ENABLE && rt.scs {
-        push(0x017d9, 1);
+    if rt.scs {
+        push(RAY_QUERY_FIRST.0, RAY_QUERY_FIRST.1);
     }
     for (&sel, &value) in compute::SEL.iter().zip(values.iter()) {
         push(sel, value);
@@ -410,6 +412,9 @@ pub(crate) fn encode_compute_rt(
     }
     if r.usc_base != 0 {
         push(0x10071, r.usc_base);
+    }
+    if rt.scs {
+        push(RAY_QUERY_LAST.0, RAY_QUERY_LAST.1);
     }
     for (i, &(sel, value)) in records[..count].iter().enumerate() {
         put32(w, compute::REGS + i * 12, sel);
@@ -524,7 +529,7 @@ pub(crate) fn encode_compute_rt(
     put32(w, d + manager::SEEDS_B, rt.seeds);
     put64(w, d + manager::POOL_TABLE, r.page_list_gva);
     put32(w, d + 0x40, 4);
-    put32(w, d + 0x48, 128);
+    put32(w, d + manager::ROW_WORDS, pools::row_words(rt.seeds));
     put64(w, compute::DESCRIPTOR_COUNTER, r.counter_fw);
     // Native M+0x5c distinguishes shared compute from per-workqueue-private pools.
     // Retain the existing value for these persistent units reused across queues;
