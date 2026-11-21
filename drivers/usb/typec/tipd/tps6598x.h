@@ -452,6 +452,7 @@ struct cd321x_status {
 struct cd321x {
 	struct notifier_block session_pm;
 	bool session_pm_registered;
+	bool session_pm_armed;
 	bool session_closed;
 	struct tps6598x tps;
 

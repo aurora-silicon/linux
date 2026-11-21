@@ -2825,12 +2825,20 @@ static int cd321x_session_pm(struct notifier_block *nb, unsigned long event, voi
 
 	switch (event) {
 	case PM_SUSPEND_PREPARE:
+		/* Only a switch that asked for it is stopped from here. */
+		scoped_guard(mutex, &cd->tps.lock)
+			cd->session_pm_armed =
+				typec_thunderbolt_switch_pd_ordered_stop(cd->tbt_switch);
+		if (!cd->session_pm_armed)
+			return NOTIFY_DONE;
 		ret = cd321x_session_stop(cd, true);
 		if (ret)
 			cd321x_session_restore(cd);
 		return notifier_from_errno(ret);
 	case PM_POST_SUSPEND:
-		cd321x_session_restore(cd);
+		if (cd->session_pm_armed)
+			cd321x_session_restore(cd);
+		cd->session_pm_armed = false;
 		break;
 	}
 	return NOTIFY_OK;
@@ -2840,12 +2848,11 @@ static void cd321x_ready(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
-	if (of_machine_is_compatible("apple,j613")) {
-		cd321x->session_pm.notifier_call = cd321x_session_pm;
-		cd321x->session_pm.priority = 100;
-		if (!register_pm_notifier(&cd321x->session_pm))
-			cd321x->session_pm_registered = true;
-	}
+	/* The switch may bind later; each suspend asks it again. */
+	cd321x->session_pm.notifier_call = cd321x_session_pm;
+	cd321x->session_pm.priority = 100;
+	if (!register_pm_notifier(&cd321x->session_pm))
+		cd321x->session_pm_registered = true;
 
 	guard(mutex)(&tps->lock);
 	/* Include failures reported while the port was still being initialized. */
@@ -4344,11 +4351,15 @@ EXPORT_SYMBOL_GPL(tipd_init);
 
 void tipd_shutdown(struct tps6598x *tps)
 {
+	struct cd321x *cd = container_of(tps, struct cd321x, tps);
+	bool ordered;
 	int ret;
 
-	if (!of_machine_is_compatible("apple,j613"))
+	scoped_guard(mutex, &tps->lock)
+		ordered = typec_thunderbolt_switch_pd_ordered_stop(cd->tbt_switch);
+	if (!ordered)
 		return;
-	ret = cd321x_session_stop(container_of(tps, struct cd321x, tps), false);
+	ret = cd321x_session_stop(cd, false);
 	if (ret)
 		dev_err(tps->dev, "USB4 shutdown incomplete: %d\n", ret);
 }
