@@ -2839,6 +2839,7 @@ F:	include/dt-bindings/pinctrl/apple.h
 F:	include/linux/irqchip/irq-apple-aic.h
 F:	include/linux/mfd/macsmc.h
 F:	include/linux/phy/apple-atc.h
+F:	include/linux/phy/apple-t6040-cio.h
 F:	include/linux/soc/apple/*
 F:	include/uapi/drm/asahi_drm.h
 F:	include/uapi/linux/apple-sep.h
