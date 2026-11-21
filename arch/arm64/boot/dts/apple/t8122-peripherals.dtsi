@@ -49,7 +49,7 @@
 		interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_venc_sys>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	dart_ave1: iommu@315040000 {
@@ -59,7 +59,7 @@
 		interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_venc_sys>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	dart_ave2: iommu@315020000 {
@@ -434,7 +434,7 @@
 				<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>;
 		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 		iommus = <&dart_ave0 0>, <&dart_ave1 0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	apr: video-codec@321000000 {
