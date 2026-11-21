@@ -596,14 +596,11 @@ impl Firmware {
         Ok(Retirement::Pending)
     }
 
-    /// Logs the non-zero fault banks of `state`.
+    /// Logs the fault bank of `state` when it holds a fault.
     #[allow(dead_code)]
     pub(crate) fn log_fault(&self, state: &EngineState) {
-        for bank in 0..2 {
-            let (f, va) = (state.status[bank], state.address[bank]);
-            if f == 0 {
-                continue;
-            }
+        let (bank, f, va) = (state.bank, state.status, state.address);
+        if f != 0 {
             let access = if (f >> 4) & 1 != 0 { "read" } else { "write" };
             let reason = if (f >> 1) & 7 != 0 {
                 "reason!=unmapped"
