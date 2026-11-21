@@ -697,12 +697,13 @@ static const struct sio_hw_data sio_hw_t6050 = {
 };
 
 /*
- * The T6050 description is in force on the board it has run on. On another T6050 board the
- * node is taken as before: by its generic compatible.
+ * The T6050 description has the SIO stopped by the sleep's commit (commit_stop), so it is in
+ * force where the device tree describes that sleep (apple,t6050-sleep). On a T6050 board
+ * without it the node is taken as before: by its generic compatible.
  */
 static bool sio_t6050_board(void)
 {
-	return of_machine_is_compatible("apple,j714s");
+	return apple_t6050_sleep_described();
 }
 
 static const struct of_device_id sio_of_match[] = {
