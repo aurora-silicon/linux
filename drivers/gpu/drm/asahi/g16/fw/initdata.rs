@@ -296,7 +296,25 @@ pub(crate) const V26B123: Layout = Layout {
     // hardware, linux#1954) and as macOS 27.2's InitData on the J773g holds them. 0xa4 is the
     // state the firmware powers the GPU up to; with 0 there (the state while off) the GPU stays
     // unpowered, and the J713 and the J773g took an SError on every 27.2 power-up.
-    power_policy: &[(0x9c, 1), (0xa0, 1), (0xa4, 1), (0xa8, 1)],
+    //
+    // The power limiter's tuning, which G16 left zero: with the clamp's top (+0xaa8) zero the
+    // limiter's estimate is NaN, and the J773g took a data abort right after its first 27.2
+    // power-up. These are the M4 Pro's macOS values on this firmware (linux#1954; its 25G83
+    // power-config words at +0x10, with its 26B123 values for 0xa80, 0xa8c, 0xa94 and 0xae0).
+    power_policy: &[
+        (0x9c, 1),
+        (0xa0, 1),
+        (0xa4, 1),
+        (0xa8, 1),
+        (0xa80, 8),
+        (0xa8c, 0x3f00_0000), // 0.5
+        (0xa94, 0x3f00_0000), // 0.5
+        (0xa9c, 0x3e3b_d7b3), // 0.18344
+        (0xaa8, 0x4780_0000), // 65536.0, the clamp's top
+        (0xaac, 0x3ecf_2e49), // 0.40465
+        (0xad8, 0x10),
+        (0xae0, 0x5_dc00),
+    ],
 };
 
 /// Runs are ordered, disjoint and land inside an object of `size` bytes.
