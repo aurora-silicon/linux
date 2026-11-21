@@ -175,6 +175,15 @@ impl Destinations {
         self.stamps.iter().any(Option::is_some)
     }
 
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn empty() -> Self {
+        Self {
+            stamps: core::array::from_fn(|_| None),
+            render: false,
+            handed: AtomicBool::new(false),
+        }
+    }
+
     fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
         self.stamps.iter()
     }
@@ -421,7 +430,7 @@ impl Completion {
         usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>,
     ) -> Result<Arc<Self>> {
         let fence = fence::independent(contexts)?;
-        let ordered = !compute && (host_predecessors || destinations.iter().any(Option::is_some));
+        let ordered = host_predecessors || destinations.has_outputs();
         let terminal = if host_predecessors {
             Some(fence::independent(contexts)?)
         } else {

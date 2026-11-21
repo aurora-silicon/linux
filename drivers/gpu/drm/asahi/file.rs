@@ -134,10 +134,11 @@ pub(crate) const DRM_ASAHI_RENDER_PROGRAM_TASK: u32 = uapi::DRM_ASAHI_RENDER_PRO
 #[allow(dead_code)]
 pub(crate) const DRM_ASAHI_COMPUTE_USES_MATRIX: u32 =
     uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_USES_MATRIX as u32;
-/// The compute command neither copies nor resets queries, so it cannot observe
-/// timestamps the host publishes after earlier commands complete
-/// (DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS). Accepted, and reported with
-/// DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS by the M5 command set.
+/// The compute command reads and writes no timestamp or availability word whose
+/// host publication is still pending for an earlier command, so it need not wait
+/// for that publication (DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS). It may copy or reset
+/// queries whose words are already published. Accepted, and reported with
+/// DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS, by the M5 command set.
 pub(crate) const DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: u32 =
     uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS as u32;
 

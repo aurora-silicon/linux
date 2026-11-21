@@ -473,8 +473,9 @@ pub(crate) enum Validated {
         long_job: bool,
         intersection: IntersectionTables,
         matrix_ops: bool,
-        /// The command may copy or reset queries, so it must follow the host's
-        /// timestamp publication for earlier commands.
+        /// The command may read or write a timestamp or availability word whose
+        /// host publication for an earlier command is still pending, so it must
+        /// follow that publication (no DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS).
         query_access: bool,
         /// The command's writes are visible when it completes (M5).
         visible_completion: bool,
