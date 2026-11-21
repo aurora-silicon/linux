@@ -2453,6 +2453,12 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	 * scan_profile27() drops them.
 	 */
 	wifi->wiphy->max_scan_ie_len = 512;
+	/*
+	 * The firmware lists the 6 GHz channels as passive, so each takes the
+	 * full listen time: cfg80211 scans 6 GHz after the other bands instead,
+	 * on the preferred scanning channels and those the 2.4/5 GHz APs report.
+	 */
+	wifi->wiphy->flags |= WIPHY_FLAG_SPLIT_SCAN_6GHZ;
 	wifi->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	wifi->wiphy->reg_notifier = wifi_regulatory;
 	wifi->wiphy->cipher_suites = cipher_suites;
