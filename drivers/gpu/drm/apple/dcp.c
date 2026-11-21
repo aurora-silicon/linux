@@ -7277,8 +7277,9 @@ static int dcp_s2r_pm_register(struct apple_dcp *dcp);
  *   over; Linux never starts its CPU.
  * - sink_metadata_edid: the display it finds at boot is its first sink,
  *   as on the T6041 dcpext.
- * No sleep support: neither a firmware-27 sleep nor a link release has run
- * on this processor.
+ * - s2r_ext: its deep-sleep stop and start (dcp_s2r_ext_suspend()), with the
+ *   power words from the device tree; without them it keeps running and its
+ *   deep sleep is refused.
  */
 /*
  * T8132 internal display processor on firmware 27.2, admitted by
@@ -8785,7 +8786,12 @@ static int dcp_s2r_stop_firmware(struct apple_dcp *dcp)
 static bool dcp_s2r_ext_capable(struct apple_dcp *dcp)
 {
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
-		return dcp->hw.s2r_ext && (s2r_untested || dcp->s2r_dt_layout_ok) &&
+		/*
+		 * Only with a power layout: the device tree's, or a static one under the lab
+		 * parameter. Without one the fixed DISPEXT0 sequence below is not this DCP's.
+		 */
+		return dcp->hw.s2r_ext &&
+		       (dcp->s2r_dt_layout_ok || (dcp->hw.s2r_layout && s2r_untested)) &&
 		       dcp->v27_methods &&
 		       dcp->v27_methods[dcpep_unnamed_500].tag[0];
 	return dcp->fw_compat == DCP_FIRMWARE_H17P && dcp->hw.s2r_ext;
@@ -9254,8 +9260,12 @@ static int dcp_s2r_ext_domains_off(struct apple_dcp *dcp)
 	int i, ret = -ENODEV;
 	u32 val;
 
-	if (dcp_s2r_ext_by_layout(dcp))
+	if (dcp_s2r_ext_by_layout(dcp)) {
+		/* Its display DART goes off with the domains too: dark until they are back. */
+		if (dcp->s2r_disp_dart)
+			apple_dart_power_dark(dcp->s2r_disp_dart, true);
 		return dcp_s2r_domains_off(dcp);
+	}
 
 	np = of_parse_phandle(dcp->dev->of_node, "apple,display-power", 0);
 	if (!np)
