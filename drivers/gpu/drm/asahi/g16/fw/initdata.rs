@@ -304,7 +304,8 @@ pub(crate) const V26B123: Layout = Layout {
     // The new u32 at 0x38 and two words in previously reserved fields, as the M4 Pro writes
     // them on this firmware (linux#1954, on hardware). The power-up path (0x3434) reads
     // 0x9dc; zero there is the candidate for the J713's SError on the first wake from idle.
-    globals_policy: &[(0x38, 1), (0x9dc, 50), (0xe0c, 250)],
+    // 27.2 (candidate): 0x7f0 = 1, a constant of the 27.2 AGXG16G kext's region C fill.
+    globals_policy: &[(0x38, 1), (0x9dc, 50), (0xe0c, 250), (0x7f0, 1)],
     // 27.2 (candidate): the GPU is never powered off when idle; see IDLE_OFF_KEEP_POWERED_MS.
     globals_override: &[(0x9c0, IDLE_OFF_KEEP_POWERED_MS)],
     // 27.2 (candidate): the four u32s inserted at 0x9c, as the M4 Pro writes them on this
@@ -351,6 +352,13 @@ pub(crate) const V26B123: Layout = Layout {
         (0x2c10, 8000),
         (0x2f34, 1),
         (0x6ac8, 1),
+        // The kext's other constants: 0x84 = 1 (the second {base, 1, top} p-state triple's
+        // middle word, as 0x44), 0x2b74 = 50 (the power-accounting history at 0x2b74, which
+        // 0x2bb38 passes to 0x2c124), and 0 at 0x2cb0, where the 25G83 run puts G16's
+        // 100 * top-state word 0x2c88 (the M4 Pro's 26B123 copy also ends before it).
+        (0x84, 1),
+        (0x2b74, 50),
+        (0x2cb0, 0),
     ],
 };
 
@@ -966,9 +974,6 @@ pub(crate) fn encode_for(
     let runs = layout.power_performance;
     let p = &mut objects[id::POWER_PERFORMANCE];
     put64(p, remap(runs, 0x3b50, 8)?, input.va[id::TEMPERATURE])?;
-    for &(at, value) in layout.power_policy {
-        put32(p, at, value)?;
-    }
     for (at, value) in [
         (4, 200000),
         (8, 200000),
@@ -985,6 +990,10 @@ pub(crate) fn encode_for(
         0x279e,
     ] {
         put32(p, remap(runs, at, 4)?, 100 * ceiling)?;
+    }
+    // Last: the build's own words may replace a remapped 25G83 word.
+    for &(at, value) in layout.power_policy {
+        put32(p, at, value)?;
     }
     Ok(())
 }
