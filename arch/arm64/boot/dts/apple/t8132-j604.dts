@@ -630,3 +630,15 @@
 	min-duty-cycle-bp = <542>;
 	max-duty-cycle-bp = <3500>;
 };
+
+/*
+ * ProRes: the engine and its DART. The driver binds the T8132 engine whenever
+ * apple/prores-t8132-init.bin is installed and leaves it off without it.
+ */
+&dart_apr0 {
+	status = "okay";
+};
+
+&apr {
+	status = "okay";
+};
