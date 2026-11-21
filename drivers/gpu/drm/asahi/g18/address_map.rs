@@ -62,7 +62,7 @@ pub(crate) const GRAPHICS_TARGET_BYTES: usize = 0x0100_0000;
 pub(crate) const GRAPHICS_PB_OFFSET: u64 = 0x0200_0000;
 // PB blocks grow to render_policy::PB_MAX_BLOCKS. The biased half stays
 // inside the COMPACT_BIAS + [32 MiB, 2 GiB) that Mesa leaves to the kernel.
-pub(crate) const GRAPHICS_PB_COMPACT_BYTES: usize = 0x0800_0000;
+pub(crate) const GRAPHICS_PB_COMPACT_BYTES: usize = 0x3400_0000;
 pub(crate) const PB_GRAPH: u64 = GRAPHICS_PB_HIGH + 0x4000;
 pub(crate) const PB_PAGE_LIST_HIGH: u64 = GRAPHICS_PB_HIGH + 0x10000;
 pub(crate) const PB_PAGE_LIST_LOW: u64 = GRAPHICS_PB_OFFSET;

@@ -105,7 +105,7 @@ impl G18GraphicsJob {
             metrics_high: va::PB_METRICS_HIGH, metrics_low: va::PB_METRICS_LOW,
             scene_scratch_low: va::PB_SCENE_SCRATCH, blocks_low: va::PB_BLOCKS,
             discard_low: va::PB_DISCARD, user_view_delta: 0,
-        }, G18PbPolicy { blocks: crate::g18::uapi::render_policy::PB_BLOCKS, capacity: 1650, pm_154: 550, pm_15c: 1650,
+        }, G18PbPolicy { blocks: crate::g18::uapi::render_policy::PB_BLOCKS, capacity: crate::g18::uapi::render_policy::PB_CAPACITY, pm_154: 550, pm_15c: 1650,
             pm_1d4: 0, scene_count: 80, scene: 1, slot: 0, generation: 1 })?;
         parameter_buffer.alias_low_window(program.vm(), program.vm(), va::COMPACT_BIAS)?;
         p.cycle = parameter_buffer.scene_cycle();

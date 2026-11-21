@@ -625,10 +625,17 @@ impl G18GraphicsQueues {
 use crate::g18::fw::parameter_buffer::*;
 
 const PM_GRAPH_BYTES: usize = 0x8000;
+// The block table holds an entry for each of the PB_CAPACITY ring slots the
+// firmware is given. It stays at the start of the graph (behind the scene
+// records, at +0x8000 of a larger graph, the first frame faulted); the shared
+// header, the counter and the scene records follow it.
 const BLOCK_TABLE: usize = 0;
-const SHARED: usize = 0x800;
-const COUNTER: usize = 0x900;
-const SCENES: usize = 0x1000;
+const SHARED: usize = 0x3400;
+const COUNTER: usize = 0x3500;
+const SCENES: usize = 0x4000;
+const _: () = assert!(
+    BLOCK_TABLE + crate::g18::uapi::render_policy::PB_CAPACITY as usize * 8 <= SHARED
+);
 const SCENE_BYTES: usize = 0x80;
 
 fn pb_put32(out: &mut [u8], offset: usize, value: u32) {
