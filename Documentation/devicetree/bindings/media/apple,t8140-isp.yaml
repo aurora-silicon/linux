@@ -109,6 +109,27 @@ properties:
     type: object
     description:
       Sensor firmware presets and the host output geometry associated with them.
+    properties:
+      apple,lens-circle:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        minimum: 1
+        maximum: 1000
+        description:
+          Radius of the image circle the lens draws on the sensor, in per mille
+          of each preset's input width, about the input's centre. Outside it
+          the picture is black, so each crop is scaled about its centre,
+          aspect kept, until its corners are inside.
+      apple,mlvnr-sensor-config:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        items:
+          - description: Sensor configuration index of the binned presets
+          - description:
+              Full-resolution configuration index, at twice the binned input
+              size, whose frames the ISP's ML noise reduction network takes
+        description:
+          With ML video noise reduction on, the presets of the first sensor
+          configuration stream the second one instead, input size and crop
+          doubled.
     patternProperties:
       "^preset[0-9]+$":
         type: object
