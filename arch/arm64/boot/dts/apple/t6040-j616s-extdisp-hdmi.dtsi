@@ -12,63 +12,7 @@
  * it is without the external displays.
  */
 
-/*
- * DISPEXT0 may only be powered once the PMP has acknowledged it in its
- * device-state table (SOC-DEV-PS-REQ/ACK, PTD entries 480/488 on T6041):
- * its ADT iop-pmp-nub soc-device ID is 18, so its request bit is 17.
- * Without it, enabling the DISPEXT0 PMGR chain hung the machine before
- * root. The T6030 PMP device-state provider works the same way.
- */
-&pmp_report {
-	pmp_dispext0: report@11 {
-		compatible = "apple,t6041-pmp-v2-report-entry",
-			     "apple,t6000-pmp-v2-report-entry";
-		reg = <0x11>;
-		label = "pmp-dispext0";
-		#power-domain-cells = <0>;
-		/* parent of the IRQ-safe PMGR chain */
-		apple,irq-safe;
-		status = "disabled";
-	};
-};
-
-/* ADT DISPEXT0_SYS parents: FAB2_SOC and the DISPEXT rail (PMP request). */
-&ps_dispext0_sys {
-	power-domains = <&ps_fab2_soc>, <&pmp_dispext0>;
-};
-
-&ps_dispext0_cpu {
-	/*
-	 * NEVER enable: the ADT marks DISPEXT0_CPU no_ps (no PMGR power-state
-	 * register, like the internal DISP_CPU). Its probe reads offset 0x350,
-	 * and that read resets the SoC. DCPEXT0's own power gate (ADT power-gates 431) is the
-	 * virtual DISPEXT0-CPU-V; the last real register of the chain is FE.
-	 */
-	/delete-property/ apple,always-on;
-};
-
-&dcpext0_dart {
-	/* in the DISPEXT0 block: powered (after the PMP request) before probing */
-	power-domains = <&ps_dispext0_fe>;
-};
-
-&dispext0_dart {
-	/* in the DISPEXT0 block: powered (after the PMP request) before probing */
-	power-domains = <&ps_dispext0_fe>;
-};
-
-&dcpext0_mbox {
-	power-domains = <&ps_dispext0_fe>;
-};
-
-&dcpext0 {
-	power-domains = <&ps_dispext0_fe>;
-	/*
-	 * The IOMFB surface layout of the internal DCP;
-	 * without apple,iomfb-surfaces apple-dcp's probe fails with -EINVAL.
-	 */
-	apple,iomfb-surfaces = <1 1 0 0>;
-};
+#include "t6040-dispext0.dtsi"
 
 /*
  * atcphy3 apply_tunables tables (aciophy_phy_init mode 3), from this machine's ADT /arm-io/atc-phy3

@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * dcpext1's firmware memory, for a boot loader that fills it from this
+ * boot's ADT /arm-io/dcpext1/iop-dcpext1-nub segment-ranges (__TEXT, __DATA
+ * and the heap), as t6040-j616s-extdisp-mem-loader.dtsi describes. A
+ * placeholder the loader does not fill stays disabled, and the enable gate
+ * then keeps dcpext1 off.
+ */
+
+/ {
+	reserved-memory {
+		dcpext1_text: dcpext1-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext1_data: dcpext1-data {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext1_heap: dcpext1-heap {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+&dcpext1 {
+	memory-region = <&dcpext1_text>, <&dcpext1_data>, <&dcpext1_heap>;
+	memory-region-names = "text", "data", "heap";
+};
