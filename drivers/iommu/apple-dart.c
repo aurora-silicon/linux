@@ -5507,7 +5507,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 			 of_node_name_prefix(dev->of_node->parent,
 					     "usb4-pcie-tunnel-");
 	bool j713_display, j713_dcpext, j713_dispext, j713_radio, j713_display_v27 = false;
-	bool t8132_dcpext_v27;
+	bool t8132_dcpext_v27, j713_dcpext_v27 = false;
 
 	/*
 	 * The M4 internal display DARTs are live: DCP firmware (SID23)
@@ -5539,8 +5539,19 @@ static int apple_dart_probe(struct platform_device *pdev)
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
 	/*
+	 * An Air's dcpext handed over with the 27.2 image runs the firmware-27
+	 * backend as the J773g's does, through ordinary domains: its firmware
+	 * and display DARTs are then not borrowed either, as the internal ones
+	 * are not (j713_display_v27). They must be locked.
+	 */
+	if ((j713_dcpext || j713_dispext) && apple_dart_serves_t8132_dcpext_v27(dev->of_node)) {
+		j713_dcpext = false;
+		j713_dispext = false;
+		j713_dcpext_v27 = true;
+	}
+	/*
 	 * A T8132 external display processor handed over with the 27.2 image
-	 * (the J773g's dcpext0) runs the same firmware-27 backend on its own
+	 * (the J773g's dcpext0, an Air's dcpext0 and dcpext1) runs the same firmware-27 backend on its own
 	 * firmware and display DARTs: when the boot loader left them locked,
 	 * they keep their firmware's roots the same way (fw_mirror below). Never
 	 * an Air's borrowed external DARTs.
@@ -6064,9 +6075,10 @@ params_done:
 			 dart->fw_mirror ? "mirror" : "NOT locked: refusing");
 	if (t8132_dcpext_v27)
 		dev_info(dev, "T8132 external display DART on the 27.2 image: %s\n",
-			 dart->fw_mirror ? "locked roots kept (mirror)" : "not locked");
+			 dart->fw_mirror ? "locked roots kept (mirror)" :
+			 j713_dcpext_v27 ? "NOT locked: refusing" : "not locked");
 	dart->fw_live_prot = j713_display_v27 || (t8132_dcpext_v27 && dart->fw_mirror);
-	if (j713_display_v27 && !dart->fw_mirror) {
+	if ((j713_display_v27 || j713_dcpext_v27) && !dart->fw_mirror) {
 		ret = -EINVAL;
 		goto err_clk_disable;
 	}
