@@ -4496,7 +4496,7 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j775c-macaudio", .data = &macaudio_j775_cfg },
 	/* j775d   -       sn012776    -       1x 1W    (AOP-fed, no sense: speaker off) */
 	{ .compatible = "apple,j775d-macaudio", .data = &macaudio_j775_cfg },
-	/* j704    -       sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
+	/* j704    -       sn012776    -       2x 2W+1T (AOP-fed; speakers off until bring-up) */
 	{ .compatible = "apple,j704-macaudio", .data = &macaudio_j704_cfg },
 	/* j813    AID?    sn012776    15      2x 1W+1T (AOP-fed, V/I sense) */
 	{ .compatible = "apple,j813-macaudio", .data = &macaudio_j813_cfg },
