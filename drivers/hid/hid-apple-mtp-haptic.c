@@ -5,6 +5,8 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/sysfs.h>
 #include <linux/soc/apple/actuator.h>
 
 #include "hid-ids.h"
@@ -100,17 +102,20 @@ EXPORT_SYMBOL_GPL(apple_taptic_switch_modes);
 #define APPLE_TAPTIC_WAVEFORM_STRENGTH	2
 #define APPLE_TAPTIC_WAVEFORM_MAX	64
 
-/*
- * click_strength=<press>,<release> overrides the device tree's values at
- * run time, so a strength can be tried on the live trackpad before it goes
- * into a device tree. 0,0 (the default) leaves the device tree's values, or
- * the firmware's own when there are none; a strength set earlier is then
- * taken back to the firmware's boot value.
+/**
+ * struct apple_taptic - state of one actuator
+ * @lock: serialises the strength writes of probe, resume and sysfs, and
+ *	guards the two arrays below
+ * @boot_strength: the firmware's own strength of the press and release
+ *	waveforms, read before the first write so that it can be put back
+ * @user_strength: press and release strength set through the click_strength
+ *	attribute, 0,0 when none is set
  */
-static DEFINE_MUTEX(apple_taptic_lock);
-static struct hid_device *apple_taptic_actuator;
-static u8 apple_taptic_boot_strength[2];
-static unsigned int click_strength[2];
+struct apple_taptic {
+	struct mutex lock; /* guards the strengths and their writes */
+	u8 boot_strength[2];
+	u8 user_strength[2];
+};
 
 static int apple_taptic_set_strength(struct hid_device *haptic_hdev, u8 report,
 				     u8 strength, u8 *boot)
@@ -144,7 +149,8 @@ static int apple_taptic_set_strength(struct hid_device *haptic_hdev, u8 report,
 	return len < 0 ? len : 0;
 }
 
-static void apple_taptic_set_click_strength(struct hid_device *haptic_hdev)
+static int apple_taptic_set_click_strength(struct hid_device *haptic_hdev,
+					   struct apple_taptic *taptic)
 {
 	static const u8 waveforms[] = {
 		APPLE_TAPTIC_PRESS_WAVEFORM,
@@ -154,8 +160,9 @@ static void apple_taptic_set_click_strength(struct hid_device *haptic_hdev)
 	u32 strength[ARRAY_SIZE(waveforms)] = { };
 	unsigned int i;
 	int ret = -EINVAL;
+	int err = 0;
 
-	lockdep_assert_held(&apple_taptic_lock);
+	lockdep_assert_held(&taptic->lock);
 
 	if (haptic_hdev->dev.parent)
 		np = of_get_child_by_name(haptic_hdev->dev.parent->of_node,
@@ -175,58 +182,100 @@ static void apple_taptic_set_click_strength(struct hid_device *haptic_hdev)
 		memset(strength, 0, sizeof(strength));
 
 	for (i = 0; i < ARRAY_SIZE(waveforms); i++)
-		if (click_strength[i])
-			strength[i] = click_strength[i];
+		if (taptic->user_strength[i])
+			strength[i] = taptic->user_strength[i];
 
 	/* Nothing asked for and nothing to take back: leave the firmware alone. */
-	if (!strength[0] && !strength[1] && !apple_taptic_boot_strength[0] &&
-	    !apple_taptic_boot_strength[1])
-		return;
+	if (!strength[0] && !strength[1] && !taptic->boot_strength[0] &&
+	    !taptic->boot_strength[1])
+		return 0;
 
 	for (i = 0; i < ARRAY_SIZE(waveforms); i++) {
 		ret = apple_taptic_set_strength(haptic_hdev, waveforms[i],
 						strength[i],
-						&apple_taptic_boot_strength[i]);
-		if (ret)
+						&taptic->boot_strength[i]);
+		if (ret) {
 			hid_warn(haptic_hdev,
 				 "cannot set the strength of click waveform 0x%02x (%d)\n",
 				 waveforms[i], ret);
+			err = err ?: ret;
+		}
 	}
+
+	return err;
 }
 
-static int click_strength_set(const char *val, const struct kernel_param *kp)
+/*
+ * click_strength is <press>,<release>, 1-255 each, used over the device
+ * tree's values, so that a user can move away from the default. 0,0 (the
+ * default) leaves the device tree's values, or the firmware's own when there
+ * are none; a strength set earlier is then taken back to the firmware's boot
+ * value.
+ */
+static ssize_t click_strength_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
 {
-	unsigned int press, release;
+	struct apple_taptic *taptic = hid_get_drvdata(to_hid_device(dev));
 
-	if (sscanf(val, "%i,%i", &press, &release) != 2 || press > U8_MAX ||
-	    release > U8_MAX || !press != !release)
+	guard(mutex)(&taptic->lock);
+	return sysfs_emit(buf, "%u,%u\n", taptic->user_strength[0],
+			  taptic->user_strength[1]);
+}
+
+static ssize_t click_strength_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	char *str __free(kfree) = kstrndup(buf, count, GFP_KERNEL);
+	struct hid_device *haptic_hdev = to_hid_device(dev);
+	struct apple_taptic *taptic = hid_get_drvdata(haptic_hdev);
+	u8 strength[2];
+	char *release;
+	int ret;
+
+	if (!str)
+		return -ENOMEM;
+	release = strchr(str, ',');
+	if (!release)
+		return -EINVAL;
+	*release++ = '\0';
+
+	ret = kstrtou8(str, 10, &strength[0]);
+	if (ret)
+		return ret;
+	ret = kstrtou8(release, 10, &strength[1]);
+	if (ret)
+		return ret;
+	/* Both waveforms or neither: one alone would keep the firmware's. */
+	if (!strength[0] != !strength[1])
 		return -EINVAL;
 
-	guard(mutex)(&apple_taptic_lock);
-	click_strength[0] = press;
-	click_strength[1] = release;
-	if (apple_taptic_actuator)
-		apple_taptic_set_click_strength(apple_taptic_actuator);
-	return 0;
-}
+	guard(mutex)(&taptic->lock);
+	memcpy(taptic->user_strength, strength, sizeof(strength));
+	ret = apple_taptic_set_click_strength(haptic_hdev, taptic);
 
-static int click_strength_get(char *buf, const struct kernel_param *kp)
-{
-	guard(mutex)(&apple_taptic_lock);
-	return sysfs_emit(buf, "%u,%u\n", click_strength[0], click_strength[1]);
+	return ret ?: count;
 }
+static DEVICE_ATTR_RW(click_strength);
 
-static const struct kernel_param_ops click_strength_ops = {
-	.set = click_strength_set,
-	.get = click_strength_get,
+static struct attribute *apple_taptic_attrs[] = {
+	&dev_attr_click_strength.attr,
+	NULL
 };
-module_param_cb(click_strength, &click_strength_ops, NULL, 0644);
-MODULE_PARM_DESC(click_strength,
-		 "Click strength on press and release, 1-255 each, over the device tree's (default 0,0: device tree, else firmware)");
+ATTRIBUTE_GROUPS(apple_taptic);
 
 static int apple_actuator_probe(struct hid_device *haptic_hdev, const struct hid_device_id *id)
 {
+	struct apple_taptic *taptic;
 	int ret;
+
+	taptic = devm_kzalloc(&haptic_hdev->dev, sizeof(*taptic), GFP_KERNEL);
+	if (!taptic)
+		return -ENOMEM;
+	ret = devm_mutex_init(&haptic_hdev->dev, &taptic->lock);
+	if (ret)
+		return ret;
+	hid_set_drvdata(haptic_hdev, taptic);
 
 	ret = hid_parse(haptic_hdev);
 	if (ret) {
@@ -259,18 +308,19 @@ static int apple_actuator_probe(struct hid_device *haptic_hdev, const struct hid
 			 "cannot return the actuator to device-controlled mode (%d)\n",
 			 ret);
 
-	guard(mutex)(&apple_taptic_lock);
-	if (!apple_taptic_actuator)
-		apple_taptic_actuator = haptic_hdev;
-	apple_taptic_set_click_strength(haptic_hdev);
+	/* A strength that cannot be set is warned about and is not fatal. */
+	guard(mutex)(&taptic->lock);
+	apple_taptic_set_click_strength(haptic_hdev, taptic);
 
 	return 0;
 }
 
 static int apple_actuator_resume(struct hid_device *haptic_hdev)
 {
-	guard(mutex)(&apple_taptic_lock);
-	apple_taptic_set_click_strength(haptic_hdev);
+	struct apple_taptic *taptic = hid_get_drvdata(haptic_hdev);
+
+	guard(mutex)(&taptic->lock);
+	apple_taptic_set_click_strength(haptic_hdev, taptic);
 	return 0;
 }
 
@@ -281,9 +331,6 @@ static bool actuator_match(struct hid_device *hdev, bool ignore_special_drivers)
 
 static void actuator_remove(struct hid_device *haptic_hdev)
 {
-	scoped_guard(mutex, &apple_taptic_lock)
-		if (apple_taptic_actuator == haptic_hdev)
-			apple_taptic_actuator = NULL;
 	apple_taptic_switch_modes(haptic_hdev, false);
 	hid_hw_stop(haptic_hdev);
 }
@@ -305,6 +352,7 @@ static struct hid_driver apple_actuator_driver = {
 	.remove = actuator_remove,
 	.resume = pm_ptr(apple_actuator_resume),
 	.reset_resume = pm_ptr(apple_actuator_resume),
+	.driver.dev_groups = apple_taptic_groups,
 };
 module_hid_driver(apple_actuator_driver);
 
