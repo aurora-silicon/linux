@@ -4,7 +4,8 @@
 //! known).
 //!
 //! The Rust owner validates firmware identity and all inherited regions before publication,
-//! holds the PMP AGX vote, prepares owned objects and publishes context0 while ASC RUN is clear.
+//! holds the PMP AGX vote (25G83; macOS 27.2 sends none), prepares owned objects and publishes
+//! context0 while ASC RUN is clear.
 //! It negotiates RTKit protocol12, accepts only the inherited EP1 crash buffer, then submits
 //! initdata plus the consume-only NOP and policy (re-import Globals, start; 0x1a, 0x34 and
 //! 0x0a on 25G83, 0x19, 0x35 and 0x0a on 26B123). Control+0x14 and exact retired indices
@@ -869,15 +870,20 @@ pub(crate) fn start(
     if regs.asc_control()? & regs::ASC_RUN != 0 {
         return Err(EBUSY);
     }
-    // SAFETY: `d` is the bound GPU device.
-    let ret = unsafe { bindings::apple_pmp_j713_gpu_get(d.as_raw()) };
-    if ret != 0 {
-        dev_err!(d, "PMP AGX vote failed: {}\n", ret);
-        return Err(Error::from_errno(ret));
-    }
     let kind = adt.layout.start;
     if kind == hw::Start::MacOs27_2 {
+        // macOS 27.2 sends no PMP AGX vote: it reads the identification words and starts the
+        // firmware without one, and the firmware acknowledges its own IOP power-on. A J713
+        // 27.2 boot without the vote reached the same point as one with it.
+        dev_info!(d, "G16: 27.2: no PMP AGX vote, as macOS\n");
         regs.enable_axi2af()?;
+    } else {
+        // SAFETY: `d` is the bound GPU device.
+        let ret = unsafe { bindings::apple_pmp_j713_gpu_get(d.as_raw()) };
+        if ret != 0 {
+            dev_err!(d, "PMP AGX vote failed: {}\n", ret);
+            return Err(Error::from_errno(ret));
+        }
     }
     let id = regs.identity()?;
     dev_info!(
