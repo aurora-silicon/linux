@@ -954,6 +954,7 @@ impl Firmware {
         self.primary.state.shared.note_gpu_activity();
         self.effort.submit();
         self.effort.note_waiters(now_ns(), fence::waiters());
+        self.effort.note_bound(self.primary.state.shared.feed.busy_run());
         self.apply_effort(power::FULL_EFFORT)
     }
 
@@ -1010,7 +1011,7 @@ impl Firmware {
     ) -> Result {
         // The performance-controller demand follows the requested effort; the firmware is
         // given, and the state records, the published value (InitData::submission_effort).
-        let published = init.submission_effort(effort, state.waited());
+        let published = init.submission_effort(effort, state.waited(), state.bound());
         port.set_effort_full(effort == power::FULL_EFFORT);
         if state.applied() == published {
             // M5 maps region C read-only to the firmware: once confirmed, the word holds
@@ -1051,9 +1052,14 @@ impl Firmware {
         if submitted {
             self.effort.submit();
         }
-        // A waiter that began or ended since the last note moves the effort while work streams.
-        if self.effort.streaming() && self.effort.note_waiters(now_ns, fence::waiters()) {
-            self.apply_effort(power::FULL_EFFORT)?;
+        // A waiter or a busy run that began or ended since the last note moves the effort while
+        // work streams.
+        if self.effort.streaming() {
+            let waiters = self.effort.note_waiters(now_ns, fence::waiters());
+            let bound = self.effort.note_bound(self.primary.state.shared.feed.busy_run());
+            if waiters || bound {
+                self.apply_effort(power::FULL_EFFORT)?;
+            }
         }
         let effort = match self.effort.idle(now_ns, in_flight || submitted) {
             power::IdleAction::None => None,
@@ -1064,6 +1070,7 @@ impl Firmware {
                     self.effort.submit();
                     return Ok(Some(power::IDLE_HOLD_NS));
                 }
+                self.primary.state.shared.feed.end_busy_run();
                 self.apply_effort(0)?;
                 None
             }

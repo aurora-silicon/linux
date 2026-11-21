@@ -3,7 +3,7 @@
 //! Work-based firmware performance effort. Idle power gating is managed separately by the
 //! device-control ring; this input never keeps an otherwise idle GPU powered.
 
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub(super) const FULL_EFFORT: u32 = 0x10000;
 pub(super) const IDLE_HOLD_NS: u64 = 16_000_000;
@@ -49,6 +49,8 @@ pub(super) struct Effort {
     seen_waits: u64,
     /// When a waiter was last seen.
     last_wait_ns: u64,
+    /// The GPU has run longer than [`IDLE_HOLD_NS`] without an idle gap ([`BusyRun`]).
+    bound: bool,
 }
 
 impl Effort {
@@ -62,6 +64,7 @@ impl Effort {
             waited: false,
             seen_waits: 0,
             last_wait_ns: 0,
+            bound: false,
         }
     }
 
@@ -86,6 +89,19 @@ impl Effort {
         let waited = self.last_wait_ns != 0 && now_ns.saturating_sub(self.last_wait_ns) < IDLE_HOLD_NS;
         let changed = waited != self.waited;
         self.waited = waited;
+        changed
+    }
+
+    /// Whether the GPU has run without an idle gap for longer than the effort is held after
+    /// work stops ([`BusyRun::bound`]).
+    pub(super) fn bound(&self) -> bool {
+        self.bound
+    }
+
+    /// Notes [`BusyRun::bound`]; returns whether that changed.
+    pub(super) fn note_bound(&mut self, bound: bool) -> bool {
+        let changed = bound != self.bound;
+        self.bound = bound;
         changed
     }
 
@@ -129,12 +145,69 @@ impl Effort {
         if idle >= IDLE_HOLD_NS {
             self.streaming = false;
             self.waited = false;
+            self.bound = false;
             self.last_wait_ns = 0;
             self.idle_since = None;
             IdleAction::Clear
         } else {
             IdleAction::Recheck(IDLE_HOLD_NS - idle)
         }
+    }
+}
+
+/// How long the GPU has been running without going idle, from the start and end timestamps the
+/// firmware writes for every command it executes.
+///
+/// The firmware raises its performance state for work that queues up behind the running command,
+/// not for how busy the GPU is: a client that submits one command and waits for it before the
+/// next keeps the GPU busy with nothing queued, and the state stays at the bottom. Such a loop is
+/// told apart from paced work (a frame, then idle until the next one) by its idle gaps. Its GPU
+/// only idles for the host's turnaround, shorter than the idle time after which the firmware
+/// powers the GPU off ([`FIRMWARE_IDLE_OFF_MS`]), and a gap at least that long ends a run. The
+/// host's own hold ([`IDLE_HOLD_MS`]) can be longer than a frame, so it doesn't mark idle. Once
+/// a run lasts longer than the effort is held after work stops ([`IDLE_HOLD_NS`]), the GPU is the
+/// bottleneck and gets the full effort ([`Effort::note_bound`]). A shorter run would not be worth
+/// a floor that outlasts it.
+///
+/// Completions note their intervals without the device lock, in any order; a late completion
+/// can only lengthen the run it belongs to.
+pub(super) struct BusyRun {
+    /// The latest end noted, in firmware timestamp ticks.
+    last_end: AtomicU64,
+    /// Start of the run that `last_end` belongs to.
+    start: AtomicU64,
+}
+
+impl BusyRun {
+    pub(super) const fn new() -> Self {
+        Self {
+            last_end: AtomicU64::new(0),
+            start: AtomicU64::new(0),
+        }
+    }
+
+    /// Notes a command that executed from `start` to `end`. A start at least `idle_ticks` after
+    /// every end noted so far (the firmware's idle power-off delay) begins a new run.
+    pub(super) fn note(&self, start: u64, end: u64, idle_ticks: u64) {
+        if start == 0 || end <= start {
+            return;
+        }
+        let previous = self.last_end.fetch_max(end, Ordering::AcqRel);
+        if previous == 0 || start >= previous.saturating_add(idle_ticks) {
+            self.start.store(start, Ordering::Release);
+        }
+    }
+
+    /// Whether the current run has lasted at least `hold_ticks`.
+    pub(super) fn bound(&self, hold_ticks: u64) -> bool {
+        let start = self.start.load(Ordering::Acquire);
+        start != 0 && self.last_end.load(Ordering::Acquire).saturating_sub(start) >= hold_ticks
+    }
+
+    /// The GPU went idle for longer than the effort hold: the next command begins a new run.
+    pub(super) fn end(&self) {
+        self.start.store(0, Ordering::Release);
+        self.last_end.store(0, Ordering::Release);
     }
 }
 
@@ -294,6 +367,65 @@ pub(super) fn release<C: Control>(control: &mut C) -> kernel::error::Result {
 #[cfg_attr(not(test), kernel::macros::kunit_tests(asahi_g17_idle_hold))]
 mod tests {
     use super::*;
+
+    /// `count` commands of `busy` ticks from `start`, each `gap` ticks after the previous one
+    /// ended. Returns where the next command would start.
+    fn commands(run: &BusyRun, mut start: u64, count: u64, busy: u64, gap: u64, idle: u64) -> u64 {
+        for _ in 0..count {
+            run.note(start, start + busy, idle);
+            start += busy + gap;
+        }
+        start
+    }
+
+    #[test]
+    fn a_submit_and_wait_loop_becomes_bound_once_it_outlasts_the_hold() {
+        // 24 MHz ticks: 1 ms commands, 100 us host turnarounds, 2 ms idle power-off delay.
+        let (ms, idle, hold) = (24_000, 48_000, 16 * 24_000);
+        let run = BusyRun::new();
+        let next = commands(&run, 1000, 10, ms, ms / 10, idle);
+        assert!(!run.bound(hold));
+        commands(&run, next, 20, ms, ms / 10, idle);
+        assert!(run.bound(hold));
+    }
+
+    #[test]
+    fn paced_work_never_becomes_bound() {
+        // 2 ms of work every 16.7 ms: each gap is longer than the idle power-off delay.
+        let (ms, idle, hold) = (24_000, 48_000, 16 * 24_000);
+        let run = BusyRun::new();
+        let next = commands(&run, 1000, 100, 2 * ms, 14 * ms, idle);
+        assert!(!run.bound(hold));
+        // A frame whose work leaves less idle than the power-off delay is bound: the GPU is.
+        commands(&run, next + 14 * ms, 20, 15 * ms, ms, idle);
+        assert!(run.bound(hold));
+    }
+
+    #[test]
+    fn overlapping_and_late_completions_extend_the_run_and_end_resets_it() {
+        let (idle, hold) = (48_000, 100);
+        let run = BusyRun::new();
+        run.note(1000, 1100, idle);
+        // Completes after a later command but started inside the run.
+        run.note(1050, 1060, idle);
+        assert!(run.bound(hold));
+        run.end();
+        assert!(!run.bound(hold));
+        run.note(0, 10, idle);
+        run.note(20, 20, idle);
+        assert!(!run.bound(0));
+    }
+
+    #[test]
+    fn effort_bound_is_cleared_with_the_effort() {
+        let mut effort = Effort::new();
+        effort.submit();
+        assert!(effort.note_bound(true));
+        assert!(!effort.note_bound(true));
+        assert_eq!(effort.idle(1, false), IdleAction::Recheck(IDLE_HOLD_NS));
+        assert_eq!(effort.idle(1 + IDLE_HOLD_NS, false), IdleAction::Clear);
+        assert!(!effort.bound());
+    }
 
     #[test]
     fn dt_idle_delay_is_bounded_and_absence_preserves_native_policy() {

@@ -858,9 +858,13 @@ impl Completion {
             if self.is_compute {
                 if let Some([start, end]) = compute {
                     feed.note_pass(start, end);
+                    feed.note_work(start, end);
                 }
             } else {
                 feed.note_pass(ticks[2], ticks[3]);
+                // The whole render, from the first of its two halves that ran to the last.
+                let start = [ticks[0], ticks[2]].into_iter().filter(|&tick| tick != 0).min();
+                feed.note_work(start.unwrap_or(0), ticks[1].max(ticks[3]));
             }
         }
         if let Err(error) = result {
