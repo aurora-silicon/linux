@@ -796,8 +796,13 @@ struct atcphy_cio_sleep {
  *           behind the T6030 HDMI port; it maps only its core window
  * @fixed_usb2: The USB2 pairs go to a fixed hub on the USB controller, which
  *              stays in host mode; the PHY provides USB2 from probe on
- * @typec_mode: Mode the Type-C mux last asked for; a fixed-hub port returns to
- *              it when the PHY is brought back up after a power-off
+ * @fixed_ss: The SuperSpeed lanes of a fixed-hub port go to that hub as well,
+ *            in the lane configuration and orientation of apple,lane-config
+ *            and apple,plug-orientation; the PHY runs them from probe on and
+ *            routes the PIPE to them before the controller leaves reset
+ * @typec_mode: Mode the Type-C mux last asked for, or the mode of fixed
+ *              SuperSpeed lanes; a fixed-hub port returns to it when the PHY is
+ *              brought back up after a power-off
  * @host_active: dwc3 has selected host mode on the USB3 PHY; a fixed-hub port
  *               then routes the PIPE itself on later Type-C mode changes
  * @usb3_port_off: The SuperSpeed root port of a fixed-hub controller was powered
@@ -910,6 +915,7 @@ struct apple_atcphy {
 	bool dp_presets_valid[5];
 	bool dp_only;
 	bool fixed_usb2;
+	bool fixed_ss;
 	enum atcphy_mode typec_mode;
 	bool host_active;
 	/*
@@ -2074,9 +2080,11 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 		 * is only acknowledged with the dummy PHY enabled. The boot
 		 * firmware leaves it set on the ports it brought up, but not
 		 * on every SuperSpeed port: on the J604, ATC3 comes up with it
-		 * clear and its first USB3 start times out.
+		 * clear and its first USB3 start times out. Fixed SuperSpeed
+		 * lanes take no PIPE lock and enable it once their host is set
+		 * up, see atcphy_usb3_set_mode().
 		 */
-		if (atcphy->t8132_ss)
+		if (atcphy->t8132_ss && !atcphy->fixed_ss)
 			atcphy_enable_dummy_phy(atcphy);
 		atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 		atcphy->pipe_pending = false;
@@ -2091,6 +2099,99 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 	atcphy->t8103_usb3_retry = false;
 	if (atcphy_needs_dummy_phy(atcphy))
 		atcphy_enable_dummy_phy(atcphy);
+}
+
+/*
+ * Fixed SuperSpeed lanes hand the PIPE to the USB3 PHY while their controller
+ * is still held in reset, as macOS 27.2 does on the J773g front ports (from an
+ * MMIO trace). Nothing drives the PIPE then: there is no PIPE lock, which only
+ * a running controller acknowledges, and only the receiver-valid override is
+ * set around the handover. The host BIST is the T8132 one, except that its
+ * second transition is complete once STATUS2 bit 7 has cleared next to bit 6,
+ * and that the native PHY leaves reset with its power-down state in one write.
+ * A failure leaves the native state unknown: the epoch is failed and the PIPE
+ * handover stays incomplete, so nothing retries it.
+ */
+static int atcphy_route_fixed_ss(struct apple_atcphy *atcphy)
+{
+	const u32 status2_done = BIT(6) | ACIOPHY_BIST_MAC_USBPHY_STATUS2_LN0_PHY_STATUS2;
+	void __iomem *pipe = atcphy->regs.pipehandler;
+	void __iomem *core = atcphy->regs.core;
+	u32 reg;
+	int ret;
+
+	lockdep_assert_held(&atcphy->lock);
+
+	ret = atcphy_pipehandler_check(atcphy);
+	if (ret)
+		return ret;
+	atcphy->pipe_pending = true;
+
+	clear32(pipe + PIPEHANDLER_OVERRIDE_VALUES,
+		PIPEHANDLER_OVERRIDE_VAL_RXDETECT0 | PIPEHANDLER_OVERRIDE_VAL_RXDETECT1);
+	set32(pipe + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
+
+	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
+	writel(ACIOPHY_BIST_MAC_USBPHY_CFG_OV1_LN0_PIPE_RESET_N_OV |
+	       FIELD_PREP(ACIOPHY_BIST_MAC_USBPHY_CFG_OV1_LN0_PWR_DOWN_OV, 2),
+	       core + ACIOPHY_BIST_MAC_USBPHY_CFG_OV1);
+	writel(ACIOPHY_BIST_MAC_USBPHY_CFG_OV2_LN0_RESET_N_OV |
+	       ACIOPHY_BIST_MAC_USBPHY_CFG_OV2_LN0_PWR_DOWN_OV,
+	       core + ACIOPHY_BIST_MAC_USBPHY_CFG_OV2);
+	ret = atcphy_t8132_bist_pulse(atcphy);
+	if (ret)
+		goto failed;
+	ret = readl_poll_timeout(core + ACIOPHY_BIST_MAC_USBPHY_STATUS2, reg,
+				 !(reg & ACIOPHY_BIST_MAC_USBPHY_STATUS2_LN0_PHY_STATUS2),
+				 10, 130000);
+	if (ret) {
+		dev_err(atcphy->dev, "USB3 BIST phase 1 timed out (%#x)\n", reg);
+		goto failed;
+	}
+	atcphy_t8132_bist_ack(atcphy);
+
+	core_mask32(atcphy, ACIOPHY_BIST_MAC_USBPHY_CFG_OV1,
+		    ACIOPHY_BIST_MAC_USBPHY_CFG_OV1_LN0_PWR_DOWN_OV,
+		    FIELD_PREP(ACIOPHY_BIST_MAC_USBPHY_CFG_OV1_LN0_PWR_DOWN_OV, 3));
+	writel(ACIOPHY_BIST_MAC_USBPHY_CFG_OV2_LN0_RESET_N_OV |
+	       ACIOPHY_BIST_MAC_USBPHY_CFG_OV2_LN0_PWR_DOWN_OV,
+	       core + ACIOPHY_BIST_MAC_USBPHY_CFG_OV2);
+	udelay(10);
+	ret = atcphy_t8132_bist_pulse(atcphy);
+	if (ret)
+		goto failed;
+	ret = readl_poll_timeout(core + ACIOPHY_BIST_MAC_USBPHY_STATUS2, reg,
+				 (reg & status2_done) == BIT(6), 10, 130000);
+	if (ret) {
+		dev_err(atcphy->dev, "USB3 BIST phase 2 timed out (%#x)\n", reg);
+		goto failed;
+	}
+	atcphy_t8132_bist_ack(atcphy);
+
+	mask32(pipe + PIPEHANDLER_NONSELECTED_OVERRIDE,
+	       PIPEHANDLER_NATIVE_RESET | PIPEHANDLER_NATIVE_POWER_DOWN,
+	       FIELD_PREP(PIPEHANDLER_NATIVE_POWER_DOWN, 3));
+	core_clear32(atcphy, ACIOPHY_BIST_MAC_USBPHY_CFG_OV2,
+		     ACIOPHY_BIST_MAC_USBPHY_CFG_OV2_LN0_RESET_N_OV |
+		     ACIOPHY_BIST_MAC_USBPHY_CFG_OV2_LN0_PWR_DOWN_OV);
+	ret = atcphy_t8132_bist_pulse(atcphy);
+	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
+	if (ret)
+		goto failed;
+
+	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_USB3,
+				   PIPEHANDLER_MUX_CTRL_CLK_USB3);
+	clear32(pipe + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
+	clear32(pipe + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_USB3;
+	atcphy->pipe_pending = false;
+	return 0;
+
+failed:
+	clear32(pipe + PIPEHANDLER_OVERRIDE,
+		PIPEHANDLER_OVERRIDE_RXVALID | PIPEHANDLER_OVERRIDE_RXDETECT);
+	atcphy->t8132_failed = true;
+	return ret;
 }
 
 #define J700_PMA_RECEIVER_CONTROL 0x000c
@@ -4753,6 +4854,14 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 			 readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
 			 readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE),
 			 readl(atcphy->regs.pipehandler + PIPEHANDLER_T8132_USB2_CONFIG));
+	/*
+	 * Fixed SuperSpeed lanes got their PIPE before the controller left
+	 * reset. macOS enables the dummy PHY beside it once the host is set
+	 * up, before xHCI runs, which is now.
+	 */
+	if (!ret && atcphy->fixed_ss && mode == PHY_MODE_USB_HOST &&
+	    atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3)
+		atcphy_enable_dummy_phy(atcphy);
 	if (!ret || !atcphy->fixed_usb2 || mode != PHY_MODE_USB_HOST)
 		return ret;
 
@@ -5275,6 +5384,31 @@ static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned
 	return 0;
 }
 
+/*
+ * Fixed SuperSpeed lanes before their controller leaves reset, in macOS 27.2's
+ * order on the J773g front ports: USB2 up, the lanes in their mode, the PIPE on
+ * the USB3 PHY, then the reset released. The lanes come back here after a
+ * power-off took them down. A handover that fails starts the host on USB2
+ * alone, as for any fixed-hub port (see atcphy_usb3_set_mode()).
+ */
+static void atcphy_fixed_ss_start(struct apple_atcphy *atcphy)
+{
+	int ret = 0;
+
+	lockdep_assert_held(&atcphy->lock);
+
+	/* A failed epoch or handover has no retry. */
+	if (atcphy->t8132_failed)
+		ret = -EIO;
+	else if (atcphy->mode != atcphy->typec_mode || atcphy->mode_dirty)
+		ret = atcphy_configure(atcphy, atcphy->typec_mode);
+	if (!ret && (atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3 || atcphy->pipe_pending))
+		ret = atcphy_route_fixed_ss(atcphy);
+	if (ret)
+		dev_warn(atcphy->dev, "Fixed SuperSpeed lanes not started, host starts without USB3: %d\n",
+			 ret);
+}
+
 static int atcphy_dwc3_reset_deassert(struct reset_controller_dev *rcdev, unsigned long id)
 {
 	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
@@ -5292,6 +5426,9 @@ static int atcphy_dwc3_reset_deassert(struct reset_controller_dev *rcdev, unsign
 	if (atcphy->hw->usb2_only && atcphy->mode != APPLE_ATCPHY_MODE_OFF &&
 	    !atcphy->mode_dirty)
 		atcphy_usb2_power_on(atcphy);
+
+	if (atcphy->fixed_ss)
+		atcphy_fixed_ss_start(atcphy);
 
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN,
 		PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
@@ -6632,6 +6769,52 @@ static bool atcphy_usb2_behind_fixed_hub(struct apple_atcphy *atcphy)
 	return hub;
 }
 
+/*
+ * apple,lane-config and apple,plug-orientation carry the ADT's atc-lane-config
+ * and atc-plug-orientation of a PHY whose SuperSpeed lanes go to a hub on the
+ * board, with no port controller to set a mode. The driver knows the values of
+ * the J773g front ports, as macOS 27.2 programs them there (from an MMIO
+ * trace): lane configuration <2 0> carries USB3 on one lane, set up as for USB3
+ * next to DisplayPort (lane 0 USB3, lane 1 DisplayPort with no AUX or link,
+ * the AUX calibration and the common block's start), and plug orientation 1
+ * leaves the lanes unswapped.
+ */
+static const u32 atcphy_lane_config_usb3[] = { 2, 0 };
+#define ATCPHY_PLUG_ORIENTATION_NORMAL 1
+
+/*
+ * Fixed SuperSpeed lanes run from probe on, in the mode their configuration
+ * gives, on a fixed-hub port only, whose controller stays a host. They need the
+ * SuperSpeed and AUX calibration. Anything else keeps the port on USB2, as it is
+ * without the properties.
+ */
+static void atcphy_probe_fixed_ss(struct apple_atcphy *atcphy)
+{
+	u32 config[ARRAY_SIZE(atcphy_lane_config_usb3)], orientation;
+
+	if (!of_property_present(atcphy->np, "apple,lane-config"))
+		return;
+
+	if (of_property_read_u32_array(atcphy->np, "apple,lane-config", config,
+				       ARRAY_SIZE(config)) ||
+	    of_property_read_u32(atcphy->np, "apple,plug-orientation", &orientation) ||
+	    memcmp(config, atcphy_lane_config_usb3, sizeof(config)) ||
+	    orientation != ATCPHY_PLUG_ORIENTATION_NORMAL) {
+		dev_warn(atcphy->dev, "Unknown fixed lane configuration, USB2 only\n");
+		return;
+	}
+	if (!atcphy->fixed_usb2 || !atcphy->t8132_ss || !atcphy->ss_tunables ||
+	    !atcphy->tunables.usb3_dp) {
+		dev_warn(atcphy->dev,
+			 "Fixed SuperSpeed lanes need a fixed hub and their calibration, USB2 only\n");
+		return;
+	}
+
+	atcphy->fixed_ss = true;
+	atcphy->swap_lanes = false;
+	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB3_DP;
+}
+
 static void atcphy_put_node(void *np)
 {
 	of_node_put(np);
@@ -6767,13 +6950,24 @@ static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
 	 * not enough for a port behind a fixed hub: the common block, its clamps
 	 * and the crossbar are set up by the mode change a cable event would
 	 * bring. Establish the complete USB2 state now, while dwc3 is still held
-	 * in reset.
+	 * in reset, and with fixed SuperSpeed lanes their mode as well. Lanes
+	 * that could not be started without touching them leave the port on USB2.
 	 */
 	if (atcphy->fixed_usb2) {
 		set32(atcphy->regs.usb2phy + USB2PHY_SIG, atcphy_usb2_sig_host(atcphy));
-		ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_USB2);
+		ret = atcphy_configure(atcphy, atcphy->typec_mode);
+		if (ret && atcphy->fixed_ss && !atcphy->t8132_failed) {
+			dev_warn(atcphy->dev, "Fixed SuperSpeed lanes not started (%d), USB2 only\n",
+				 ret);
+			atcphy->fixed_ss = false;
+			atcphy->typec_mode = APPLE_ATCPHY_MODE_USB2;
+			atcphy_enable_dummy_phy(atcphy);
+			ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_USB2);
+		}
 		if (ret)
-			return dev_err_probe(atcphy->dev, ret, "Failed to bring up USB2\n");
+			return dev_err_probe(atcphy->dev, ret, "Failed to bring up %s\n",
+					     atcphy->fixed_ss ? "the fixed SuperSpeed lanes" :
+								"USB2");
 	}
 
 	ret = atcphy_probe_rcdev(atcphy);
@@ -6933,6 +7127,7 @@ static int atcphy_probe(struct platform_device *pdev)
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 	atcphy->fixed_usb2 = atcphy_usb2_behind_fixed_hub(atcphy);
 	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB2;
+	atcphy_probe_fixed_ss(atcphy);
 	if (atcphy->fixed_usb2) {
 		ret = atcphy_probe_sleep_power(atcphy);
 		if (ret)
