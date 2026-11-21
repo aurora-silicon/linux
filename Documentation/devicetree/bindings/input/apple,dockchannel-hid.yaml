@@ -168,6 +168,25 @@ properties:
           power method 2 notifications without controlling an AFE GPIO.
           Mutually exclusive with apple,afe-reset-gpios on the parent.
 
+      apple,palm-classes:
+        type: boolean
+        description:
+          The trackpad controller classes every contact it reports (thumb,
+          finger or palm), and a contact it classes as a palm with a tool
+          area larger than any finger's is a palm.
+
+      apple,palm-tool-major:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        minimum: 1
+        maximum: 32767
+        description:
+          Tool area, in the units of the controller's reports, above which a
+          contact is a palm whatever its class. Only for trackpads on which
+          no finger reaches this area.
+
+    dependentRequired:
+      apple,palm-tool-major: [ "apple,palm-classes" ]
+
     allOf:
       - if:
           required:
