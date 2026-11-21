@@ -150,7 +150,9 @@ struct apple_dcp {
  bool external_native; int external_retries; struct delayed_work external_retry_wq;
  /* A display a J714s firmware 27 sleep released; never set here. */
  bool sleep_v27_torn;
+ int hdmi_disconnect_done;
 };
+static void __attribute__((unused)) complete_all(int *c) { *c = 1; }
 #define atomic_set(p, v) (*(p) = (v))
 struct platform_device { struct apple_dcp *data; };
 static struct apple_dcp *platform_get_drvdata(struct platform_device *p) { return p->data; }
@@ -2202,3 +2204,269 @@ int main(void)
     checker = block(desktop, 'static bool iomfb_check_callback_exact_v26_6_desktop(')
     alias = '\n#define iomfb_check_callback_v26_6_desktop iomfb_check_callback_exact_v26_6_desktop\n'
     return prefix + checker + alias + source[start:end] + suffix
+
+
+def inherited_hdmi(root):
+    """Actual inherited bootloader HDMI DPTX release and reconnect sequencing."""
+    source = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    production = '\n'.join((
+        block(source, 'static bool dcp_hdmi_has_inherited_link('),
+        '#define DCP_INHERITED_HDMI_UNPLUG_TIMEOUT_MS\t500',
+        block(source, 'static int dcp_release_inherited_hdmi_dptx('),
+        block(source, 'static int dcp_enable_dp2hdmi_hpd('),
+    ))
+    prefix = r"""
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef uint32_t u32;
+#define READ_ONCE(x) (x)
+#define dev_info(dev, ...) ((void)(dev))
+#define dev_warn(dev, ...) ((void)(dev))
+
+struct completion {
+	bool done;
+};
+
+struct dptx_port {
+	bool connected;
+	bool available;
+	void *service;
+};
+
+struct apple_connector {
+	bool connected;
+};
+
+struct apple_dcp {
+	void *dev;
+	int hpd_mutex;
+	void *hdmi_hpd;
+	int hdmi_hpd_irq;
+	bool typec_output;
+	bool typec_cable_connected;
+	bool hdmi_yielded;
+	unsigned int nr_modes;
+	struct apple_connector *connector;
+	struct completion hdmi_disconnect_done;
+	struct dptx_port dptxport[1];
+};
+
+struct dcp_fabric_resume_ops { int unused; };
+static const struct dcp_fabric_resume_ops dcp_resume_ops;
+
+static int hpd_mutex_depth;
+static int lock_enter(int *m) { (void)m; hpd_mutex_depth++; return 1; }
+static void lock_exit(int *m) { (void)m; assert(hpd_mutex_depth > 0); hpd_mutex_depth--; }
+#define scoped_guard(kind, lock) \
+	for (int _once = lock_enter(lock); _once; lock_exit(lock), _once = 0)
+
+static bool hpd_level;
+static int release_error;
+static unsigned int reinit_calls, release_calls, wait_calls, connect_calls, poweroff_calls, resume_calls;
+static unsigned int reinit_seq, release_seq, wait_seq, connect_seq, poweroff_seq, resume_seq, step;
+static unsigned long last_wait_ms;
+static bool deliver_disconnect, clear_conn_on_timeout;
+static struct apple_connector *active_connector;
+
+static bool dcp_is_typec_output(struct apple_dcp *dcp) { return dcp->typec_output; }
+static bool dptx_service_available(struct dptx_port *p) { return p->available && p->service; }
+static bool gpiod_get_value_cansleep(void *gpio) { assert(gpio); return hpd_level; }
+static unsigned long msecs_to_jiffies(unsigned int ms) { return ms; }
+
+static void reinit_completion(struct completion *c)
+{
+	assert(hpd_mutex_depth == 1);
+	c->done = false;
+	reinit_calls++;
+	reinit_seq = ++step;
+}
+
+static int dptxport_release_display(void *service)
+{
+	assert(service);
+	assert(hpd_mutex_depth == 1);
+	release_calls++;
+	release_seq = ++step;
+	return release_error;
+}
+
+static unsigned long wait_for_completion_timeout(struct completion *c, unsigned long timeout)
+{
+	assert(hpd_mutex_depth == 0);
+	wait_calls++;
+	wait_seq = ++step;
+	last_wait_ms = timeout;
+	if (deliver_disconnect) {
+		c->done = true;
+		if (active_connector)
+			active_connector->connected = false;
+		return timeout > 1 ? timeout - 1 : 1;
+	}
+	if (clear_conn_on_timeout && active_connector)
+		active_connector->connected = false;
+	return 0;
+}
+
+static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
+{
+	assert(hpd_mutex_depth == 0);
+	assert(port == 0);
+	connect_calls++;
+	connect_seq = ++step;
+	dcp->dptxport[0].connected = true;
+	return 0;
+}
+
+static void _dcp_poweroff(struct apple_dcp *dcp)
+{
+	(void)dcp;
+	assert(hpd_mutex_depth == 0);
+	poweroff_calls++;
+	poweroff_seq = ++step;
+}
+
+static void dcp_fabric_run_resume(const struct dcp_fabric_resume_ops *ops,
+				  struct apple_dcp *dcp)
+{
+	(void)ops;
+	(void)dcp;
+	assert(hpd_mutex_depth == 0);
+	resume_calls++;
+	resume_seq = ++step;
+}
+"""
+    suffix = r"""
+static int dummy_gpio, dummy_service;
+
+static void reset_case(struct apple_dcp *dcp, struct apple_connector *conn,
+		       bool hpd, bool conn_connected, unsigned int nr_modes)
+{
+	memset(dcp, 0, sizeof(*dcp));
+	memset(conn, 0, sizeof(*conn));
+	conn->connected = conn_connected;
+	dcp->hdmi_hpd = &dummy_gpio;
+	dcp->hdmi_hpd_irq = 42;
+	dcp->nr_modes = nr_modes;
+	dcp->connector = conn;
+	dcp->dptxport[0].available = true;
+	dcp->dptxport[0].service = &dummy_service;
+	hpd_level = hpd;
+	release_error = 0;
+	reinit_calls = release_calls = wait_calls = connect_calls = poweroff_calls = resume_calls = 0;
+	reinit_seq = release_seq = wait_seq = connect_seq = poweroff_seq = resume_seq = step = 0;
+	last_wait_ms = 0;
+	deliver_disconnect = false;
+	clear_conn_on_timeout = false;
+	active_connector = conn;
+	hpd_mutex_depth = 0;
+}
+
+int main(void)
+{
+	struct apple_dcp dcp;
+	struct apple_connector conn;
+
+	/* 1. Cold HDMI boot: no release, no wait, direct connect then IRQ resume. */
+	reset_case(&dcp, &conn, true, false, 0);
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(reinit_calls == 0 && release_calls == 0 && wait_calls == 0);
+	assert(connect_calls == 1 && poweroff_calls == 0 && resume_calls == 1);
+	assert(connect_seq < resume_seq && hpd_mutex_depth == 0);
+
+	/* 2. Warm inherited HDMI boot: reinit + release under mutex, wait outside, connect. */
+	reset_case(&dcp, &conn, true, true, 33);
+	deliver_disconnect = true;
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(reinit_calls == 1 && release_calls == 1 && wait_calls == 1 && connect_calls == 1);
+	assert(poweroff_calls == 0 && resume_calls == 1);
+	assert(reinit_seq < release_seq && release_seq < wait_seq &&
+	       wait_seq < connect_seq && connect_seq < resume_seq);
+	assert(!conn.connected && last_wait_ms == 500 && hpd_mutex_depth == 0);
+
+	/* 3. Warm inherited boot without connector yet (nr_modes > 0): waits on completion. */
+	reset_case(&dcp, &conn, true, false, 33);
+	dcp.connector = NULL;
+	active_connector = NULL;
+	deliver_disconnect = true;
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(reinit_calls == 1 && release_calls == 1 && wait_calls == 1 && connect_calls == 1);
+	assert(last_wait_ms == 500 && release_seq < wait_seq && wait_seq < connect_seq);
+
+	/* 4. Warm inherited boot where HDMI was unplugged before takeover. */
+	reset_case(&dcp, &conn, false, true, 33);
+	deliver_disconnect = true;
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(release_calls == 1 && wait_calls == 1 && connect_calls == 0 && poweroff_calls == 1);
+	assert(release_seq < wait_seq && wait_seq < poweroff_seq && poweroff_seq < resume_seq);
+
+	/* 5. Warm inherited boot when HDMI is yielded to Type-C: release, wait, skip connect. */
+	reset_case(&dcp, &conn, true, true, 33);
+	dcp.hdmi_yielded = true;
+	deliver_disconnect = true;
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(release_calls == 1 && wait_calls == 1 && connect_calls == 0 && poweroff_calls == 0);
+	assert(resume_calls == 1);
+
+	/* 6. Release error does not wait and skips connect, but still arms HPD IRQ. */
+	reset_case(&dcp, &conn, true, true, 33);
+	release_error = -EIO;
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(reinit_calls == 1 && release_calls == 1 && wait_calls == 0);
+	assert(connect_calls == 0 && poweroff_calls == 0 && resume_calls == 1);
+
+	/* 7. Disconnect wait timeout with display still connected skips connect, arms IRQ. */
+	reset_case(&dcp, &conn, true, true, 33);
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(release_calls == 1 && wait_calls == 1 && last_wait_ms == 500);
+	assert(connect_calls == 0 && poweroff_calls == 0 && resume_calls == 1);
+
+	/* 8. Disconnect wait timeout with NULL connector skips connect, arms IRQ. */
+	reset_case(&dcp, &conn, true, false, 33);
+	dcp.connector = NULL;
+	active_connector = NULL;
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(release_calls == 1 && wait_calls == 1 && connect_calls == 0 && resume_calls == 1);
+
+	/* 9. Timeout after connector already went false still proceeds to connect. */
+	reset_case(&dcp, &conn, true, true, 33);
+	clear_conn_on_timeout = true;
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(release_calls == 1 && wait_calls == 1 && connect_calls == 1 && resume_calls == 1);
+
+	/* 10. Unplugged cable still powers off even if disconnect wait timed out. */
+	reset_case(&dcp, &conn, false, true, 33);
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(release_calls == 1 && wait_calls == 1 && connect_calls == 0 && poweroff_calls == 1);
+
+	/* 11. Stale nr_modes after unplug with connector disconnected does not release. */
+	reset_case(&dcp, &conn, true, false, 33);
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(release_calls == 0 && wait_calls == 0 && connect_calls == 1);
+
+	/* 12. Already-connected port 0, Type-C output, or unavailable service: no release. */
+	reset_case(&dcp, &conn, true, true, 33);
+	dcp.dptxport[0].connected = true;
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(release_calls == 0 && connect_calls == 1);
+
+	reset_case(&dcp, &conn, true, true, 33);
+	dcp.typec_output = true;
+	dcp.typec_cable_connected = true;
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(release_calls == 0 && connect_calls == 1);
+
+	reset_case(&dcp, &conn, true, true, 33);
+	dcp.dptxport[0].available = false;
+	assert(dcp_enable_dp2hdmi_hpd(&dcp) == 0);
+	assert(release_calls == 0 && connect_calls == 1);
+
+	puts("PASS: inherited HDMI DPTX completion wait, timeout handling, lock discipline, and cold-boot no-op");
+	return 0;
+}
+"""
+    return prefix + production + suffix

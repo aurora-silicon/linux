@@ -1054,6 +1054,8 @@ struct apple_dcp {
 	bool typec_enable_pending;
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
+	/* IOMFB reports the inherited fixed-HDMI display disconnected after release. */
+	struct completion hdmi_disconnect_done;
 	struct delayed_work typec_reconnect_wq;
 	u32 typec_reconnect_tries;
 	struct dcp_fabric_session typec_reconnect_session; /* hpd_mutex */

@@ -2625,6 +2625,7 @@ static void dcp_external_report_disconnected(struct apple_dcp *dcp)
 	dcp->external_hotplug_pending = false;
 	action = dcp_mode_hotplug(&dcp->mode_state, false,
 				  dcp->connector ? &dcp->connector->connected : NULL);
+	complete_all(&dcp->hdmi_disconnect_done);
 	if (dcp->connector) {
 		WRITE_ONCE(dcp->connector->edid_invalidation_pending, true);
 		action |= DCP_HOTPLUG_NOTIFY;
@@ -4902,6 +4903,74 @@ static const struct dcp_fabric_resume_ops dcp_resume_ops = {
 	.sample = dcp_resume_sample,
 };
 
+static bool dcp_hdmi_has_inherited_link(struct apple_dcp *dcp)
+{
+	if (dcp_is_typec_output(dcp) || !dcp->hdmi_hpd)
+		return false;
+	if (!dptx_service_available(&dcp->dptxport[0]) ||
+	    READ_ONCE(dcp->dptxport[0].connected))
+		return false;
+	if (dcp->connector)
+		return READ_ONCE(dcp->connector->connected);
+	return READ_ONCE(dcp->nr_modes) > 0;
+}
+
+/*
+ * Measured J773g (26B123) release-to-unplug latency from
+ * dptxport_release_display() to the IOMFB disconnected hotplug callback is
+ * 58..99 ms; allow 500 ms (~5x headroom) before giving up.
+ */
+#define DCP_INHERITED_HDMI_UNPLUG_TIMEOUT_MS	500
+
+/*
+ * Early bootloader HDMI bring-up can leave DCP holding DPTX port 0 live across
+ * quiesce so simpledrm keeps scanning out through early boot. When apple-dcp
+ * starts up, firmware reports that display already connected while Linux's
+ * dptxport[0].connected is still false and lpdptx_phy is still unactivated.
+ * Calling dcp_dptx_connect() on top of that live session stalls waiting for
+ * link configuration that firmware never re-emits. Release the inherited port
+ * 0 session first and wait for the IOMFB disconnect callback so the normal
+ * connect path activates the PHY and trains the link cleanly.
+ */
+static int dcp_release_inherited_hdmi_dptx(struct apple_dcp *dcp)
+{
+	struct dptx_port *dptx = &dcp->dptxport[0];
+	struct apple_connector *connector;
+	int ret = 0;
+	bool released = false;
+
+	if (!dcp_hdmi_has_inherited_link(dcp))
+		return 0;
+
+	dev_info(dcp->dev, "releasing inherited bootloader HDMI DPTX session\n");
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (dptx_service_available(dptx) && !dptx->connected) {
+			reinit_completion(&dcp->hdmi_disconnect_done);
+			ret = dptxport_release_display(dptx->service);
+			released = !ret;
+		}
+	}
+	if (ret) {
+		dev_warn(dcp->dev,
+			 "failed to release inherited HDMI DPTX session: %d\n",
+			 ret);
+		return ret;
+	}
+	if (!released)
+		return 0;
+
+	if (!wait_for_completion_timeout(&dcp->hdmi_disconnect_done,
+					 msecs_to_jiffies(DCP_INHERITED_HDMI_UNPLUG_TIMEOUT_MS))) {
+		connector = READ_ONCE(dcp->connector);
+		if (!connector || READ_ONCE(connector->connected)) {
+			dev_warn(dcp->dev,
+				 "timed out waiting for inherited HDMI display disconnect\n");
+			return -ETIMEDOUT;
+		}
+	}
+	return 0;
+}
+
 static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 {
 	if (dcp_is_typec_output(dcp)) {
@@ -4910,12 +4979,18 @@ static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 	} else if (dcp->hdmi_hpd) {
 		/* Check HPD before enabling the edge-triggered IRQ. */
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+		int ret;
+
 		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
 
-		if (connected && !READ_ONCE(dcp->hdmi_yielded))
-			dcp_dptx_connect(dcp, 0);
-		else if (!connected)
+		ret = dcp_release_inherited_hdmi_dptx(dcp);
+
+		if (connected && !READ_ONCE(dcp->hdmi_yielded)) {
+			if (!ret)
+				dcp_dptx_connect(dcp, 0);
+		} else if (!connected) {
 			_dcp_poweroff(dcp);
+		}
 	}
 
 	if (dcp->hdmi_hpd_irq)
@@ -7300,6 +7375,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	of_property_read_u32(dev->of_node, "apple,dptx-die", &dcp->dptx_die);
 	dcp->fixed_dptx_phy = dcp->dptx_phy;
 	init_completion(&dcp->typec_iomfb_hpd_ready);
+	init_completion(&dcp->hdmi_disconnect_done);
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->link_recovery_wq, dcp_link_recovery_work);

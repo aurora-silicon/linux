@@ -3142,6 +3142,8 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	apple_connector_edid_set_live(connector, !!(*connected));
 	action = dcp_mode_hotplug(&dcp->mode_state, !!(*connected),
 				  connector ? &connector->connected : NULL);
+	if (!*connected)
+		complete_all(&dcp->hdmi_disconnect_done);
 	/*
 	 * A Type-C sink can assert HPD only after a modeset has already failed,
 	 * as a TV behind a DP-to-HDMI converter does when it wakes from standby.

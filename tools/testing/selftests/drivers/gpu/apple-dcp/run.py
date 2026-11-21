@@ -134,6 +134,7 @@ def main():
         ('lifecycle', 'vrr-rejection', lifecycle.vrr, ((),), ()),
         ('lifecycle', 'power-reply', lifecycle.power_reply, ((),), ()),
         ('lifecycle', 'dispatcher-scope', lifecycle.dispatcher, ((),), ()),
+        ('lifecycle', 'inherited-hdmi-handoff', lifecycle.inherited_hdmi, ((),), ()),
     ]
     transaction_tests = transaction.controls(root) + accounting.controls(root)
     tests.extend(('lifecycle', name, lambda r, u=unit: u, cases, flags)

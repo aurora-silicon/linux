@@ -770,10 +770,15 @@ void dcp_v14_external_hotplug(struct apple_dcp *dcp, bool connected)
 		complete_all(&dcp->typec_iomfb_hpd_ready);
 	if (!connected)
 		WRITE_ONCE(dcp->ext_backlight, false);
-	if (!connector)
+	if (!connector) {
+		if (!connected)
+			complete_all(&dcp->hdmi_disconnect_done);
 		return;
+	}
 	apple_connector_edid_set_live(connector, connected);
 	action = dcp_mode_hotplug(&dcp->mode_state, connected, &connector->connected);
+	if (!connected)
+		complete_all(&dcp->hdmi_disconnect_done);
 	if (connected && !READ_ONCE(dcp->mode_state.valid) &&
 	    !READ_ONCE(dcp->mode_state.changing))
 		action |= DCP_HOTPLUG_NOTIFY;
