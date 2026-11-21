@@ -3234,7 +3234,7 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 	}
 
 	/* Only a driver takes the display to where its domain can be lowered. */
-	if (!s->display[0].bound) {
+	if (s->soc->ndisp && !s->display[0].bound) {
 		dev_err(s->dev, "refused: no driver bound to the display coprocessor\n");
 		refused = true;
 	}
@@ -7685,7 +7685,7 @@ static int apple_sleep_profile_validate(const struct apple_sleep_soc *soc)
 	    !soc->ops->deep_wfi_arm || !soc->ops->aic_mask_all || !soc->ops->aic_ack ||
 	    !soc->ops->aic_restore ||
 	    (!soc->ops->commit_regs && (!soc->ops->lower_io || !soc->ops->last_mile)) ||
-	    !soc->ndisp || soc->ndisp > SLEEP_DISPLAYS_MAX || !soc->cpu_clusters)
+	    soc->ndisp > SLEEP_DISPLAYS_MAX || !soc->cpu_clusters)
 		return -EINVAL;
 	return 0;
 }
