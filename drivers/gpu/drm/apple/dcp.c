@@ -3054,6 +3054,7 @@ irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp)
 	msleep(500);
 	connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
 	dev_dbg(dcp->dev, "DP2HDMI HPD irq, connected:%d after 500 ms\n", connected);
+	WRITE_ONCE(dcp->hdmi_crtc_off, false);
 	if (!connected) {
 		/*
 		 * A yield outlasts HDMI blinks (a monitor reconfiguring its
@@ -5140,6 +5141,7 @@ void dcp_poweron(struct platform_device *pdev)
 		/* A yielded hybrid is about to take a Type-C display. */
 		if (connected && !READ_ONCE(dcp->hdmi_yielded))
 			dcp_dptx_connect(dcp, 0);
+		WRITE_ONCE(dcp->hdmi_crtc_off, false);
 	}
 
 	switch (dcp->fw_compat) {
@@ -5312,10 +5314,25 @@ void dcp_poweroff(struct platform_device *pdev)
 		}
 	} else if (dcp->hdmi_hpd) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+
 		if (!connected) {
 			disconnected_hpd_event(dcp->connector);
-			dcp_dptx_disconnect(dcp, 0);
 		}
+		/*
+		 * With the firmware-27 interface (DCP_FIRMWARE_V_27_0), DCP keeps
+		 * a fixed HDMI port's DPTX link trained after the pipe is
+		 * blanked, so the PHY stays powered while the display is off.
+		 * Release it; dcp_poweron() retrains the link before it enables
+		 * the pipe again. Earlier interfaces keep the old rule: release
+		 * the link only once the cable is gone.
+		 * The firmware then reports an unplug although the cable is still
+		 * attached; dcpep_cb_hotplug() ignores it while hdmi_crtc_off is
+		 * set. A real removal still arrives through the HPD GPIO.
+		 */
+		if (connected && dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			WRITE_ONCE(dcp->hdmi_crtc_off, true);
+		if (!connected || dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			dcp_dptx_disconnect(dcp, 0);
 	}
 }
 

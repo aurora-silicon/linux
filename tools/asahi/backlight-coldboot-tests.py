@@ -72,7 +72,7 @@ struct apple_dcp {
  struct { struct dcp_backlight_state state; int lock; } backlight;
  struct { bool update; u32 maximum; } brightness;
  bool panel,m4,v14,external,typec,pipe_enabled_h17p,crashed,quiescing;
- bool typec_crtc_off,typec_cable_connected,typec_follow_start,typec_poweron_hpd,hdmi_yielded;
+ bool typec_crtc_off,typec_cable_connected,typec_follow_start,typec_poweron_hpd,hdmi_yielded,hdmi_crtc_off;
  unsigned crtc_unplugs,typec_unplugs,typec_generation,typec_reconnect_tries,external_generation,external_crtc_generation;
  int external_lock,hpd_mutex,relink_lock,relink,typec_iomfb_hpd_ready;
  struct delayed_work typec_reconnect_wq,placeholder_edid_wq,external_stop_retry_wq,bl_fallback_wq;
