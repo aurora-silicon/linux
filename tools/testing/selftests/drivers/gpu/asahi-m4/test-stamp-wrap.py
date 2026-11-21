@@ -60,6 +60,8 @@ fn rmb(){}fn now_ns()->u64{100_000_000}
 impl Firmware{
     fn queue_receipt(&self,_ch:Channel,_state:&Object,_info:&Object,_head:u32,_rec:u32)->Result<bool>{Ok(self.queue_passed)}
     fn queue_passed(&self,_ch:Channel,_state:&Object,_info:&Object,_f:&Flight)->Result<bool>{Ok(self.queue_passed)}
+    // The ITS-pair ticks (25G83 and the 27.2 fallback's first choice): the receipt tests set its cells.
+    fn compute_ticks(&self,unit:&CUnit)->Result<(u64,u64)>{Ok((unit.its.r64(0)?,unit.its.r64(8)?))}
     __RETIRED__
     __RETIRED_SNAPSHOT__
 }
