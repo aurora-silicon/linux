@@ -1179,6 +1179,16 @@ static int apple_fast_die_init(struct cpufreq_policy *policy,
 
 	parsed = of_parse_phandle_with_fixed_args(cluster, "apple,fast-die-effort",
 						  1, 0, &args);
+	/*
+	 * A disabled report means the board does not run the PMP: there is no
+	 * effort to follow, as without the property.  The SoC's dtsi can then
+	 * describe the lanes once for every board.
+	 */
+	if (!parsed && !of_device_is_available(args.np) &&
+	    !priv->info->needs_thermal_policy) {
+		of_node_put(args.np);
+		return 0;
+	}
 	/* Required thermal admission must fail closed with an older DT. */
 	if (parsed == -ENOENT && !priv->info->needs_thermal_policy)
 		return 0;
