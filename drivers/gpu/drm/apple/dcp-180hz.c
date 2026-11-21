@@ -282,10 +282,22 @@ static void dcp_180hz_retry_work(struct work_struct *work)
 		schedule_work(&dcp->connector->hotplug_wq);
 }
 
+/*
+ * Probes again while an exception mode waits for the rest of its proof.
+ * Each input already has an event that probes again (the link facts and
+ * the announcement through dcp_180hz_notify(), the AV service through its
+ * publication, a new catalog through dcp_180hz_catalog_changed()); this
+ * bounded re-probe is kept until every one of them is shown to cover all
+ * orders of arrival, and says so when it runs out; see
+ * https://github.com/aurora-silicon/linux/issues/2346
+ */
+#define DCP_180HZ_PROBE_RETRIES		8
+#define DCP_180HZ_PROBE_DELAY_MS	300
+
 void dcp_180hz_retry(struct apple_dcp *dcp)
 {
+	bool retry = false, gave_up = false, rate = false, lanes = false;
 	unsigned long flags;
-	bool retry = false;
 
 	if (!dcp->rate_retry_initialized || READ_ONCE(dcp->quiescing))
 		return;
@@ -294,13 +306,22 @@ void dcp_180hz_retry(struct apple_dcp *dcp)
 		dcp->rate_proof.retry_generation = READ_ONCE(dcp->typec_generation);
 		dcp->rate_proof.retries = 0;
 	}
-	if (READ_ONCE(dcp->typec_cable_connected) && dcp->rate_proof.retries < 8) {
-		dcp->rate_proof.retries++;
-		retry = true;
+	if (READ_ONCE(dcp->typec_cable_connected) &&
+	    dcp->rate_proof.retries <= DCP_180HZ_PROBE_RETRIES) {
+		/* Past the last re-probe: said once, until the proof starts over. */
+		gave_up = dcp->rate_proof.retries++ == DCP_180HZ_PROBE_RETRIES;
+		retry = !gave_up;
+		rate = dcp_180hz_fact_current(dcp, &dcp->rate_proof.rate);
+		lanes = dcp_180hz_fact_current(dcp, &dcp->rate_proof.lanes);
 	}
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	if (retry)
-		mod_delayed_work(system_freezable_wq, &dcp->rate_retry_wq, msecs_to_jiffies(300));
+		mod_delayed_work(system_freezable_wq, &dcp->rate_retry_wq,
+				 msecs_to_jiffies(DCP_180HZ_PROBE_DELAY_MS));
+	else if (gave_up)
+		dev_warn(dcp->dev, "180 Hz exception mode still not offered after %u probes (link rate %s, lane count %s)\n",
+			 DCP_180HZ_PROBE_RETRIES, rate ? "proven" : "missing",
+			 lanes ? "proven" : "missing");
 }
 
 static void dcp_180hz_cancel(void *data)
