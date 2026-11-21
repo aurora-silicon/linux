@@ -800,6 +800,7 @@ struct atcphy_cio_sleep {
  *              it when the PHY is brought back up after a power-off
  * @host_active: dwc3 has selected host mode on the USB3 PHY; a fixed-hub port
  *               then routes the PIPE itself on later Type-C mode changes
+ * @dwc3_running: dwc3 is out of the reset this PHY provides, in either role
  * @usb3_port_off: The SuperSpeed root port of a fixed-hub controller was powered
  *                 off for a PIPE or lane change and is not powered on again yet
  * @usb3_port_work: Retries the power-on of @usb3_port_off after a USB failure
@@ -912,6 +913,7 @@ struct apple_atcphy {
 	bool fixed_usb2;
 	enum atcphy_mode typec_mode;
 	bool host_active;
+	bool dwc3_running;
 	/*
 	 * The controller sleeps in place for this system sleep, the SuperSpeed side is checked
 	 * against the mux after it, and the controller is in hibernation now.
@@ -5246,6 +5248,7 @@ static void _atcphy_dwc3_reset_assert(struct apple_atcphy *atcphy)
 {
 	lockdep_assert_held(&atcphy->lock);
 
+	atcphy->dwc3_running = false;
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN,
 	      PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
@@ -5296,6 +5299,7 @@ static int atcphy_dwc3_reset_deassert(struct reset_controller_dev *rcdev, unsign
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN,
 		PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+	atcphy->dwc3_running = true;
 
 	return 0;
 }
@@ -7848,15 +7852,16 @@ static int atcphy_suspend(struct device *dev)
 		return 0;
 	}
 	/*
-	 * An active one survives suspend-to-idle while a host runs on it: DWC3
-	 * then keeps the power domain on across system sleep, so the link stays
-	 * as it is. So does one in CIO mode, under its running USB4 router, whose
-	 * power states stay on across suspend-to-idle. Without either, or in a
-	 * deeper sleep state, it is lost.
+	 * An active one survives suspend-to-idle while DWC3 runs on it, as a
+	 * host or as a device: the glue then keeps the controller, and with it
+	 * the power domain this PHY shares, on across system sleep, so the link
+	 * stays as it is. So does one in CIO mode, under its running USB4
+	 * router, whose power states stay on across suspend-to-idle. Without
+	 * either, or in a deeper sleep state, it is lost.
 	 */
 	if (atcphy->t8132_common_owned &&
 	    (pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
-	     !(atcphy->host_active || atcphy_mode_is_cio(atcphy->mode))))
+	     !(atcphy->dwc3_running || atcphy_mode_is_cio(atcphy->mode))))
 		return -EBUSY;
 	/* Do not admit a new epoch after this check and before resume. */
 	atcphy->t8132_suspended = true;
