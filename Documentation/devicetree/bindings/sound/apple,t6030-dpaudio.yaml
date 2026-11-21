@@ -63,7 +63,18 @@ required:
   - compatible
   - dmas
   - dma-names
-  - power-domains
   - ports
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-dpaudio
+    then:
+      description: The DCP service owns the power lifecycle on T6050.
+    else:
+      required:
+        - power-domains
 
 additionalProperties: false
