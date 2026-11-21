@@ -36,8 +36,6 @@
 #![feature(sized_type_properties)]
 //
 #![feature(slice_range)]
-//
-#![cfg_attr(CONFIG_RUSTC_HAS_COERCE_POINTEE, feature(pin_coerce_unsized_trait))]
 // ============ end asahi dowanstream features ============
 //
 // To be determined.
