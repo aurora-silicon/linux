@@ -79,3 +79,17 @@ or sensitive, say so rather than substituting data from another Mac.
 
 For kernel patches, also follow the existing
 [kernel submission guidance](Documentation/process/submitting-patches.rst).
+
+## Pull requests made with an LLM
+
+Say in the pull request description how an LLM or other tool helped (see
+[generated-content.rst](Documentation/process/generated-content.rst)), and end
+the description with one line:
+
+```
+Assisted-by: LLM (<Vendor>:<Model>)
+```
+
+Commits carry only the human author's `Signed-off-by`, with no `Assisted-by`,
+`Co-developed-by` or `Co-Authored-By` for a tool: only a human can certify the
+DCO ([coding-assistants.rst](Documentation/process/coding-assistants.rst)).
