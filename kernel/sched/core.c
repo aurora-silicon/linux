@@ -1590,6 +1590,20 @@ static unsigned int __maybe_unused sysctl_sched_uclamp_util_max = SCHED_CAPACITY
  */
 unsigned int sysctl_sched_uclamp_util_min_rt_default = SCHED_CAPACITY_SCALE;
 
+/*
+ * Background work (nice >= sched_util_clamp_background_nice, or SCHED_IDLE; not
+ * RT) is capped, min and max, at this capacity: the smallest CPU's capacity
+ * puts it on the efficiency cores and keeps the big cores' clock down when it
+ * spills over, as macOS does for background QoS.  The cap wins over task and
+ * group requests (a focused app's uclamp.min boost included).
+ * SCHED_CAPACITY_SCALE, the default, turns it off; on the J616C (M4 Max) the
+ * E cores' capacity is 410.  The nice threshold is 15, above Android's
+ * THREAD_PRIORITY_BACKGROUND (10), which Android games running through a
+ * compatibility layer use for real work.
+ */
+unsigned int sysctl_sched_uclamp_util_background = SCHED_CAPACITY_SCALE;
+unsigned int sysctl_sched_uclamp_util_background_nice = 15;
+
 /* All clamps are required to be less or equal than these values */
 static struct uclamp_se uclamp_default[UCLAMP_CNT];
 
@@ -1741,10 +1755,16 @@ uclamp_eff_get(struct task_struct *p, enum uclamp_id clamp_id)
 {
 	struct uclamp_se uc_req = uclamp_tg_restrict(p, clamp_id);
 	struct uclamp_se uc_max = uclamp_default[clamp_id];
+	unsigned int bg = READ_ONCE(sysctl_sched_uclamp_util_background);
 
 	/* System default restrictions always apply */
 	if (unlikely(uc_req.value > uc_max.value))
-		return uc_max;
+		uc_req = uc_max;
+
+	if (bg < SCHED_CAPACITY_SCALE && uc_req.value > bg && !rt_or_dl_task(p) &&
+	    (task_nice(p) >= (int)READ_ONCE(sysctl_sched_uclamp_util_background_nice) ||
+	     p->policy == SCHED_IDLE))
+		uclamp_se_set(&uc_req, bg, false);
 
 	return uc_req;
 }
@@ -2146,7 +2166,29 @@ undo:
 	sysctl_sched_uclamp_util_min_rt_default = old_min_rt;
 	return result;
 }
+
+static const unsigned int sysctl_sched_uclamp_background_limit = SCHED_CAPACITY_SCALE;
+static const unsigned int sysctl_sched_uclamp_background_nice_limit = MAX_NICE;
+
+static int sysctl_sched_uclamp_background_handler(const struct ctl_table *table, int write,
+						  void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int result = proc_douintvec_minmax(table, write, buffer, lenp, ppos);
+
+	/* Tasks pick the new cap up at their next enqueue. */
+	if (!result && write && sysctl_sched_uclamp_util_background < SCHED_CAPACITY_SCALE)
+		sched_uclamp_enable();
+	return result;
+}
 #endif /* CONFIG_SYSCTL */
+
+static int __init sched_uclamp_background_init(void)
+{
+	if (sysctl_sched_uclamp_util_background < SCHED_CAPACITY_SCALE)
+		sched_uclamp_enable();
+	return 0;
+}
+late_initcall(sched_uclamp_background_init);
 
 static void uclamp_fork(struct task_struct *p)
 {
@@ -4873,6 +4915,24 @@ static const struct ctl_table sched_core_sysctls[] = {
 		.maxlen         = sizeof(unsigned int),
 		.mode           = 0644,
 		.proc_handler   = sysctl_sched_uclamp_handler,
+	},
+	{
+		.procname       = "sched_util_clamp_background",
+		.data           = &sysctl_sched_uclamp_util_background,
+		.maxlen         = sizeof(unsigned int),
+		.mode           = 0644,
+		.proc_handler   = sysctl_sched_uclamp_background_handler,
+		.extra1         = SYSCTL_ZERO,
+		.extra2         = (void *)&sysctl_sched_uclamp_background_limit,
+	},
+	{
+		.procname       = "sched_util_clamp_background_nice",
+		.data           = &sysctl_sched_uclamp_util_background_nice,
+		.maxlen         = sizeof(unsigned int),
+		.mode           = 0644,
+		.proc_handler   = sysctl_sched_uclamp_background_handler,
+		.extra1         = SYSCTL_ONE,
+		.extra2         = (void *)&sysctl_sched_uclamp_background_nice_limit,
 	},
 #endif /* CONFIG_UCLAMP_TASK */
 #ifdef CONFIG_NUMA_BALANCING
