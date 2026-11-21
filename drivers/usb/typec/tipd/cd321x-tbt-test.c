@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/property.h>
 #include <linux/reboot.h>
+#include <linux/suspend.h>
 #include <linux/usb/typec_mux.h>
 #include <linux/workqueue.h>
 
@@ -285,13 +286,15 @@ static struct cd321x *cd321x_tbt_test_late_port(struct kunit *test)
 	return cd;
 }
 
-static void cd321x_tbt_test_add_router(struct kunit *test,
-				       const struct software_node *node)
+static void cd321x_tbt_test_add_router_ordered(struct kunit *test,
+					       const struct software_node *node,
+					       bool pd_ordered_stop)
 {
 	struct typec_thunderbolt_switch_desc desc = {
 		.fwnode = software_node_fwnode(node),
 		.set = cd321x_tbt_test_set,
 		.name = node->name,
+		.pd_ordered_stop = pd_ordered_stop,
 	};
 	struct typec_thunderbolt_switch_dev *sw_dev;
 	struct device *router;
@@ -304,6 +307,12 @@ static void cd321x_tbt_test_add_router(struct kunit *test,
 	ret = kunit_add_action_or_reset(test, cd321x_tbt_test_unregister_switch,
 					sw_dev);
 	KUNIT_ASSERT_EQ(test, ret, 0);
+}
+
+static void cd321x_tbt_test_add_router(struct kunit *test,
+				       const struct software_node *node)
+{
+	cd321x_tbt_test_add_router_ordered(test, node, false);
 }
 
 /* A router that registers after the port gave up is taken; the cable is reread. */
@@ -414,7 +423,7 @@ static void cd321x_tbt_router_rebinds_test(struct kunit *test)
 }
 
 /* A port with a live router, as the cable events find it. */
-static struct cd321x *cd321x_tbt_test_live_port(struct kunit *test)
+static struct cd321x *cd321x_tbt_test_port(struct kunit *test, bool pd_ordered_stop)
 {
 	struct cd321x *cd = cd321x_tbt_test_late_port(test);
 	int ret;
@@ -422,12 +431,17 @@ static struct cd321x *cd321x_tbt_test_live_port(struct kunit *test)
 	ret = cd321x_tbt_watch_late(cd, software_node_fwnode(&cd321x_test_connector));
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	flush_work(&cd->tbt_attach_work);
-	cd321x_tbt_test_add_router(test, &cd321x_test_router);
+	cd321x_tbt_test_add_router_ordered(test, &cd321x_test_router, pd_ordered_stop);
 	flush_work(&cd->tbt_attach_work);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, cd->tbt_switch);
 	scoped_guard(mutex, &cd->tps.lock)
 		cd->pm.phase = CD321X_PM_RUNNING;
 	return cd;
+}
+
+static struct cd321x *cd321x_tbt_test_live_port(struct kunit *test)
+{
+	return cd321x_tbt_test_port(test, false);
 }
 
 /* A reboot closes the router's session at once and keeps cable events away. */
@@ -454,6 +468,41 @@ static void cd321x_tbt_reboot_other_action_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, cd321x_pm_can_update(&cd->pm));
 }
 
+/* A router that stops on its own is not stopped by the port before sleep. */
+static void cd321x_tbt_sleep_router_stops_itself_test(struct kunit *test)
+{
+	struct cd321x_tbt_test *ctx = test->priv;
+	struct cd321x *cd = cd321x_tbt_test_live_port(test);
+
+	KUNIT_EXPECT_EQ(test, cd321x_session_pm(&cd->session_pm, PM_SUSPEND_PREPARE, NULL),
+			NOTIFY_DONE);
+	KUNIT_EXPECT_EQ(test, ctx->set_calls, 0);
+	KUNIT_EXPECT_EQ(test, cd321x_session_pm(&cd->session_pm, PM_POST_SUSPEND, NULL),
+			NOTIFY_OK);
+	KUNIT_EXPECT_EQ(test, ctx->set_calls, 0);
+}
+
+/* A router that asks for it is put to sleep by the port and woken after. */
+static void cd321x_tbt_sleep_router_ordered_test(struct kunit *test)
+{
+	struct cd321x_tbt_test *ctx = test->priv;
+	struct cd321x *cd = cd321x_tbt_test_port(test, true);
+
+	KUNIT_EXPECT_EQ(test, cd321x_session_pm(&cd->session_pm, PM_SUSPEND_PREPARE, NULL),
+			NOTIFY_OK);
+	KUNIT_EXPECT_EQ(test, ctx->set_calls, 1);
+	KUNIT_EXPECT_EQ(test, ctx->last_state, TYPEC_THUNDERBOLT_SWITCH_SLEEP);
+	/* The port is gated for sleep; there is no controller to reread after it. */
+	scoped_guard(mutex, &cd->tps.lock) {
+		KUNIT_EXPECT_EQ(test, cd->pm.phase, CD321X_PM_PREPARED);
+		cd->pm.phase = CD321X_PM_INITIALIZING;
+	}
+	KUNIT_EXPECT_EQ(test, cd321x_session_pm(&cd->session_pm, PM_POST_SUSPEND, NULL),
+			NOTIFY_OK);
+	KUNIT_EXPECT_EQ(test, ctx->set_calls, 2);
+	KUNIT_EXPECT_EQ(test, ctx->last_state, TYPEC_THUNDERBOLT_SWITCH_WAKE);
+}
+
 static struct kunit_case cd321x_tbt_cases[] = {
 	KUNIT_CASE(cd321x_tbt_no_router_test),
 	KUNIT_CASE(cd321x_tbt_router_bound_test),
@@ -466,6 +515,8 @@ static struct kunit_case cd321x_tbt_cases[] = {
 	KUNIT_CASE(cd321x_tbt_router_rebinds_test),
 	KUNIT_CASE(cd321x_tbt_reboot_closes_session_test),
 	KUNIT_CASE(cd321x_tbt_reboot_other_action_test),
+	KUNIT_CASE(cd321x_tbt_sleep_router_stops_itself_test),
+	KUNIT_CASE(cd321x_tbt_sleep_router_ordered_test),
 	{}
 };
 
