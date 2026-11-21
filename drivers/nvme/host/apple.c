@@ -41,6 +41,7 @@
 #include <linux/pm_domain.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sart.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
 #include <linux/reset.h>
@@ -223,6 +224,8 @@ struct apple_nvme_hw {
 	bool sleep_traced;
 	/* ... or derived and never run: only with nvme_apple.sleep_untested */
 	bool sleep_untested;
+	/* A firmware sleep idles ANS (AP then IOP idle) instead of shutting it down. */
+	bool sleep_idle;
 	/* The last endpoint map reply from that trace */
 	u32 sleep_epmap_last_mask;
 	/* Higher namespaces are the firmware's, and a Flush to one faults the controller. */
@@ -260,6 +263,8 @@ struct apple_nvme {
 	bool sleep_stop;
 	bool sleep_idled;
 	u32 sleep_csts;
+	int legacy_shn_ret;	/* the last legacy disable's shutdown notification */
+	struct device_node *sleep_pmp_entry; /* T8122: ANS's PMP request, held to the last stop */
 	/* ANS came back across a sleep, or failed to. reset_work picks these up. */
 	bool sleep_restarted;
 	bool sleep_failed;
@@ -359,7 +364,8 @@ MODULE_PARM_DESC(flush_interval,
 		 "Grace period in msecs between flushes (ignored on post-M4 ANS)");
 
 /*
- * Stop ANS for a deep sleep on a controller whose sleep path was never run (T8142). Off by
+ * Stop ANS for a deep sleep on a controller whose sleep path was never run (T8142), or idle it
+ * as macOS does where that was never run through a resume (T8122). Off by
  * default: the root disk stays up through a sleep the SoC refuses.
  */
 static bool sleep_untested;
@@ -394,6 +400,8 @@ static void apple_nvme_put_resource_owner(void *data)
 {
 	struct apple_nvme *anv = data;
 
+	of_node_put(anv->sleep_pmp_entry);
+	anv->sleep_pmp_entry = NULL;
 	WRITE_ONCE(anv->detached, true);
 	if (!apple_nvme_m5_retained(anv))
 		kref_put(&anv->ref, apple_nvme_release);
@@ -1296,6 +1304,7 @@ static void apple_nvme_disable_legacy(struct apple_nvme *anv, bool shutdown)
 	bool dead = false, freeze = false;
 	unsigned long flags;
 
+	anv->legacy_shn_ret = -ENODATA;
 	if (apple_rtkit_is_crashed(anv->rtk))
 		dead = true;
 	if (!(csts & NVME_CSTS_RDY))
@@ -1338,8 +1347,8 @@ static void apple_nvme_disable_legacy(struct apple_nvme *anv, bool shutdown)
 		 * NVMe controller is handed off with firmware shut down, in an
 		 * NVMe disabled state, after a clean shutdown).
 		 */
-		if (shutdown)
-			nvme_disable_ctrl(&anv->ctrl, shutdown);
+		/* The notification's own result: CC.EN cleared below resets CSTS.SHST. */
+		anv->legacy_shn_ret = shutdown ? nvme_disable_ctrl(&anv->ctrl, shutdown) : -ENODATA;
 		nvme_disable_ctrl(&anv->ctrl, false);
 	}
 
@@ -2796,6 +2805,15 @@ static int apple_nvme_sleep_shutdown(void *data)
 	return -EIO;
 }
 
+/* T8122 trial: ANS's ASC state at each step from its idle to the commit. */
+static void apple_nvme_ans_trace(struct apple_nvme *anv, const char *step)
+{
+	if (anv->hw->sleep_idle && anv->sleep_stop)
+		dev_info(anv->dev, "ANS at %s: control %#x status %#x\n", step,
+			 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL),
+			 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS));
+}
+
 /*
  * The rest of a sleep's stop, last of all. From the first idle message only a real sleep
  * brings it back, so a failure goes on to the commit: what a flush acknowledged is on
@@ -2808,17 +2826,46 @@ static int apple_nvme_sleep_last_stop(void *data)
 	u32 cc, csts = anv->sleep_csts;
 	int ret;
 
-	cc = readl(anv->mmio_nvme + NVME_REG_CC);
+	/* T8122: the NVMe window is unreachable at the commit; ANS's own pages are not. */
+	cc = anv->hw->sleep_idle ? 0 : readl(anv->mmio_nvme + NVME_REG_CC);
 
+	/* T8122: already idled in the suspend; the sleep driver clears RUN after this. */
+	if (anv->hw->sleep_idle && anv->sleep_idled) {
+		int wret;
+
+		apple_nvme_ans_trace(anv, "the last stop");
+		apple_rtkit_mailbox_recv_off(anv->rtk);
+		apple_nvme_ans_trace(anv, "mailbox receive off");
+		wret = apple_pmp_report_entry_withdraw_polled(anv->sleep_pmp_entry);
+		apple_nvme_ans_trace(anv, "the PMP withdraw");
+		if (wret) {
+			dev_err(anv->dev, "ANS's PMP request not withdrawn at the last stop: %d\n", wret);
+			return 1;
+		}
+		return 0;
+	}
 	anv->sleep_idled = true;
 	ret = apple_rtkit_sleep_idle_polled(anv->rtk,
 					    anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL, &us);
 	if (ret)
 		dev_err(anv->dev, "ANS did not idle: %d\n", ret);
+	else if (anv->hw->sleep_idle)
+		dev_info(anv->dev, "ANS idle at the last stop, acknowledged in about %u us\n", us);
 	else
 		dev_dbg(anv->dev, "ANS idle, acknowledged in about %u us, CC %#x CSTS %#x\n",
 			us, cc, csts);
 	apple_rtkit_mailbox_recv_off(anv->rtk);
+	/*
+	 * T8122: ANS's PMP request was kept for this idle (macOS idles ANS well before its PMP
+	 * stops); with the CPU stopped, give it up, as the G17 GPU's last stop does.
+	 */
+	if (anv->hw->sleep_idle && anv->sleep_pmp_entry) {
+		writel(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
+		       ~APPLE_ANS_COPROC_CPU_CONTROL_RUN,
+		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
+		if (apple_pmp_report_entry_withdraw_polled(anv->sleep_pmp_entry))
+			dev_err(anv->dev, "ANS's PMP request not withdrawn at the last stop\n");
+	}
 
 	return ret ? 1 : 0;
 }
@@ -2868,6 +2915,42 @@ static int apple_nvme_probe(struct platform_device *pdev)
 			anv->sleep_registered = false;
 		}
 		apple_rtkit_set_warm_epmap_mask(anv->rtk, anv->hw->sleep_epmap_last_mask);
+	}
+
+	if (anv->hw->sleep_idle && (!anv->hw->sleep_untested || sleep_untested)) {
+		dev_warn(anv->dev, "idle for sleep enabled, untested through a resume\n");
+		anv->sleep_registered =
+			!apple_sleep_coproc_register(anv->dev, anv->mmio_coproc, false,
+						     apple_nvme_sleep_last_stop, anv);
+		/* The shutdown notification is checked in the suspend, not at the commit. */
+		if (anv->sleep_registered) {
+			int i = of_property_match_string(anv->dev->of_node, "power-domain-names", "ans");
+			struct device_node *e = i < 0 ? NULL :
+				of_parse_phandle(anv->dev->of_node, "power-domains", i);
+
+			/*
+			 * The "ans" domain is the PMP report entry itself (APPLE_USE_PMP), or the
+			 * power state the entry sits on: then the entry is the one on that state.
+			 */
+			if (e && !of_device_is_compatible(e, "apple,t6000-pmp-v2-report-entry")) {
+				struct device_node *r, *ps = e;
+
+				e = NULL;
+				for_each_compatible_node(r, NULL, "apple,t6000-pmp-v2-report-entry") {
+					struct device_node *d = of_parse_phandle(r, "power-domains", 0);
+
+					of_node_put(d);
+					if (d == ps && of_device_is_available(r)) {
+						e = of_node_get(r);
+						of_node_put(r);
+						break;
+					}
+				}
+				of_node_put(ps);
+			}
+			anv->sleep_pmp_entry = e;
+			dev_info(anv->dev, "ANS's PMP request for the sleep: %pOF\n", e);
+		}
 	}
 
 	apple_nvme_set_reset_ready(anv, true);
@@ -3078,6 +3161,23 @@ static int apple_nvme_resume(struct device *dev)
 		WRITE_ONCE(anv->suspended, false);
 		return nvme_try_sched_reset(&anv->ctrl);
 	}
+	if (anv->hw->sleep_idle && anv->sleep_stop) {
+		apple_sleep_coproc_set_ready(dev, false);
+		anv->sleep_stop = false;
+		anv->sleep_idled = false;
+		if (anv->sleep_pmp_entry) {
+			int ret;
+
+			apple_pmp_report_entry_commit_owned(anv->sleep_pmp_entry, false);
+			/* The last stop gave up ANS's request; nothing touches NVMe until it's back. */
+			ret = apple_pmp_report_entry_request(anv->sleep_pmp_entry, true);
+			if (ret) {
+				dev_crit(dev, "holding all I/O: ANS's PMP request not acknowledged after the sleep (%d), reboot to recover\n",
+					 ret);
+				return 0;
+			}
+		}
+	}
 	return nvme_reset_ctrl(&anv->ctrl);
 }
 
@@ -3238,6 +3338,34 @@ static int apple_nvme_suspend(struct device *dev)
 	}
 
 	if (apple_rtkit_is_running(anv->rtk)) {
+		/*
+		 * T8122: idle ANS here with interrupts on, then leave its RUN
+		 * bit for the last stop. The shutdown notification result must
+		 * be checked here too: clearing CC.EN resets CSTS.SHST, and
+		 * the NVMe window is unreachable at the commit on J613.
+		 * If either step fails, shut ANS down so resume can reset it.
+		 */
+		if (anv->sleep_registered && anv->hw->sleep_idle &&
+		    pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware() &&
+		    !anv->legacy_shn_ret && anv->sleep_pmp_entry &&
+		    !apple_pmp_report_entry_commit_owned(anv->sleep_pmp_entry, true)) {
+			ret = apple_rtkit_idle(anv->rtk);
+			if (!ret) {
+				anv->sleep_stop = true;
+				anv->sleep_idled = true;
+				apple_sleep_coproc_set_ready(dev, true);
+				dev_info(dev, "ANS idled for the sleep (status %#x), its run bit left to the commit\n",
+					 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS));
+				return 0;
+			}
+
+			apple_pmp_report_entry_commit_owned(anv->sleep_pmp_entry, false);
+			dev_warn(dev, "ANS could not idle for the sleep: %d\n", ret);
+		}
+		/* Registered but not idled at the commit: the sleep driver refuses the sleep. */
+		if (anv->sleep_registered && pm_suspend_via_firmware())
+			dev_warn(dev, "ANS shut down for the sleep instead (notification %d, PMP request %s): the sleep will be refused\n",
+				 anv->legacy_shn_ret, anv->sleep_pmp_entry ? "found" : "not found");
 		ret = apple_rtkit_shutdown(anv->rtk);
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
@@ -3246,9 +3374,22 @@ static int apple_nvme_suspend(struct device *dev)
 	return ret;
 }
 
+static int apple_nvme_suspend_late(struct device *dev)
+{
+	apple_nvme_ans_trace(dev_get_drvdata(dev), "suspend_late");
+	return 0;
+}
+
+static int apple_nvme_suspend_noirq(struct device *dev)
+{
+	apple_nvme_ans_trace(dev_get_drvdata(dev), "suspend_noirq");
+	return 0;
+}
+
 static const struct dev_pm_ops apple_nvme_pm_ops = {
 	SYSTEM_SLEEP_PM_OPS(apple_nvme_suspend, apple_nvme_resume)
-	LATE_SYSTEM_SLEEP_PM_OPS(NULL, apple_nvme_resume_early)
+	LATE_SYSTEM_SLEEP_PM_OPS(apple_nvme_suspend_late, apple_nvme_resume_early)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_nvme_suspend_noirq, NULL)
 };
 
 static const struct apple_nvme_hw apple_nvme_t8015_hw = {
@@ -3261,6 +3402,19 @@ static const struct apple_nvme_hw apple_nvme_t8103_hw = {
 	.has_lsq_nvmmu = true,
 	.has_queue_count = true,
 	.max_queue_depth = 64,
+};
+
+/*
+ * T8122 (M3) is laid out like T8103. macOS idles its ANS before a sleep (AP then IOP power
+ * state 0x201) and leaves the CPU stopped, where the T8103 path shuts it down. Untested through
+ * a resume: off unless sleep_untested is set.
+ */
+static const struct apple_nvme_hw apple_nvme_t8122_hw = {
+	.has_lsq_nvmmu = true,
+	.has_queue_count = true,
+	.max_queue_depth = 64,
+	.sleep_idle = true,
+	.sleep_untested = true,
 };
 
 /*
@@ -3354,6 +3508,7 @@ static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t6050-nvme-ans2", .data = &apple_nvme_t6050_hw },
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
+	{ .compatible = "apple,t8122-nvme-ans2", .data = &apple_nvme_t8122_hw },
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,t8140-nvme-ans2", .data = &apple_nvme_t8140_hw },
 	{ .compatible = "apple,t8142-nvme-ans2", .data = &apple_nvme_t8142_hw },
