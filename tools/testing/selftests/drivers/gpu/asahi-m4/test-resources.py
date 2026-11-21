@@ -126,7 +126,7 @@ pub mod g16 {
     }
     pub mod encode {
         pub struct Geometry{pub tpc_bytes:u64,pub tilemap_bytes:u64}
-        pub struct PassRefs{pub ta_work:u64,pub ta_work_gva:u64,pub fs_work:u64,pub fs_work_gva:u64,pub ta_seq:u64,pub fs_seq:u64,pub scene:u64,pub tpc_gva:u64,pub tilemap_gva:u64,pub heap_gva:u64,pub scene_user_gva:u64,pub pre_gva:[u64;3],pub fs_scratch_gva:u64,pub aux_gva:u64,pub its:u64,pub ta_scratch:u64,pub tpc_fw:u64,pub scratch_fw:u64}
+        pub struct PassRefs{pub ta_work:u64,pub ta_work_gva:u64,pub fs_work:u64,pub fs_work_gva:u64,pub ta_seq:u64,pub fs_seq:u64,pub scene:u64,pub tpc_gva:u64,pub tilemap_gva:u64,pub heap_gva:u64,pub scene_user_gva:u64,pub scene_list:u64,pub pre_gva:[u64;3],pub fs_scratch_gva:u64,pub aux_gva:u64,pub its:u64,pub ta_scratch:u64,pub tpc_fw:u64,pub scratch_fw:u64}
     }
     pub mod vm {
         use crate::{mmu,sync::Arc};use core::sync::atomic::Ordering;
@@ -149,13 +149,19 @@ pub mod g16 {
         pub struct ComputeArena{pub compute:KVec<super::slots::ComputeSlot>}
         // A job's compute units; here one arena.
         pub type Prepared=ComputeArena;
+        #[derive(Clone)]
+        pub enum PassOwnerArena{Base(crate::sync::Arc<RenderArena>)}
         impl ComputeArena{
             pub fn compute_units(&self)->Result<usize>{Ok(self.compute.len())}
             pub fn compute_unit(&self,k:usize)->Result<&super::slots::ComputeSlot>{self.compute.get(k).ok_or(EINVAL)}
             pub fn compute_arena(&self,_k:usize)->Option<crate::sync::Arc<ComputeArena>>{None}
             pub fn render_arena(&self)->Option<crate::sync::Arc<RenderArena>>{None}
+            pub fn render_passes(&self)->Result<usize>{Err(EINVAL)}
+            pub fn render_pass(&self,_k:usize)->Result<&super::slots::PassSlot>{Err(EINVAL)}
+            pub fn render_pass_dirty(&self,_k:usize)->Result<(&AtomicU64,&AtomicU64)>{Err(EINVAL)}
+            pub fn pass_owner_arena(&self,_k:usize)->Option<PassOwnerArena>{None}
         }
-        pub struct RenderArena{pub passes:KVec<super::slots::PassSlot>,pub tpc_dirty:[AtomicU64;2],pub tilemap_dirty:[AtomicU64;2]}
+        pub struct RenderArena{pub passes:KVec<super::slots::PassSlot>,pub tpc_dirty:[AtomicU64;8],pub tilemap_dirty:[AtomicU64;8]}
         impl RenderArena{ __SET_DIRTY__ }
     }
     pub mod boot {pub fn eproto()->crate::Error{crate::Error(71)}}
@@ -173,7 +179,7 @@ pub mod g16 {
     fn arenas(o:&mut Objects)->Arenas{
         let mut compute=KVec::new();let mut passes=KVec::new();
         for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
-        Arenas{compute:g16::resources::ComputeArena{compute},render:g16::resources::RenderArena{passes,tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};2],tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};2]}}
+        Arenas{compute:g16::resources::ComputeArena{compute},render:g16::resources::RenderArena{passes,tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};8],tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};8]}}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&c).unwrap();s.retire(&mut c).unwrap();}
     #[test]fn render_reuse_clears_only_previous_write_spans(){
@@ -255,13 +261,14 @@ pub mod g16 {
             }
         }
         for s in arena.render.passes.iter() {
-            for object in [&s.tpc,&s.tilemap,&s.heap,&s.scene_user,&s.fs_scratch,&s.aux] {
+            for object in [&s.tpc,&s.tilemap,&s.heap,&s.scene_user,&s.scene_list,&s.fs_scratch,&s.aux] {
                 assert_eq!(object.client_leaf,Some(0x00c0000000000c8b));
                 assert!(object.gva.is_some());
             }
             let refs=s.refs();
             assert_eq!(refs.ta_work_gva,s.ta_work.lower_gva.unwrap());
             assert_eq!(refs.fs_work_gva,s.fs_work.lower_gva.unwrap());
+            assert_eq!(refs.scene_list,s.scene_list.gva.unwrap());
         }
     }
     #[test]fn allocator_metadata_is_firmware_only_and_shared_state_keeps_real_backing(){
@@ -521,6 +528,7 @@ pub mod g16 {
         assert_eq!(p0.ta_scratch.fills.lock().unwrap().len(),1);
         assert_eq!(p0.fs_scratch.fills.lock().unwrap().len(),1);
         assert_eq!(p0.scene_user.fills.lock().unwrap().len(),1);
+        assert_eq!(p0.scene_list.fills.lock().unwrap().len(),1);
         assert_eq!(p0.tpc.fills.lock().unwrap().len(),1);
         assert_eq!(p0.tilemap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
         assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x1000)));
@@ -532,9 +540,155 @@ pub mod g16 {
         retire(&mut s,1,&a);
         s.claim_pass_for(&arena.render,0,Some(b.id)).unwrap();
         assert_eq!(p0.aux.fills.lock().unwrap().len(),2);
+        assert_eq!(p0.scene_list.fills.lock().unwrap().len(),2);
         assert_eq!(p0.tpc.fills.lock().unwrap().last(),Some(&(0,0x8000)));
         assert_eq!(p0.tilemap.fills.lock().unwrap().last(),Some(&(0,0x1000)));
         assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
+    }
+
+    #[test]fn eight_render_passes_and_sixteen_compute_units_are_disjoint_in_mesa_hole(){
+        let mut o=Objects::new();
+        let _pools=PoolSet::new(&mut o).unwrap();
+        for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
+            g16::slots::ComputeSlot::new(&mut o,k).unwrap();
+        }
+        let mut scene_lists=Vec::new();
+        for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
+            let pass=g16::slots::PassSlot::new(&mut o,k,1).unwrap();
+            let va=pass.refs().scene_list;
+            assert_ne!(va,0);
+            assert!(!scene_lists.contains(&va),"each pass slot must own a distinct scene_list");
+            scene_lists.push(va);
+        }
+        let mut aliases=Vec::new();
+        for a in &o.objects {
+            if let Some(g)=a.gva {
+                let base=g-a.offset as u64;
+                assert_eq!(base&0x3fff,0);
+                assert!(base>=0x7000000000 && base+a.mapped as u64<=0x7100000000);
+                // Must stay disjoint from the dynamic client range 0x7040000000..0x7080000000.
+                assert!(base+a.mapped as u64<=0x7040000000 || base>=0x7080000000,
+                    "overlap with dynamic client range: {:#x}..{:#x}", base, base+a.mapped as u64);
+                aliases.push((base,base+a.mapped as u64));
+            }
+        }
+        aliases.sort();
+        for w in aliases.windows(2) {
+            assert!(w[0].1<=w[1].0,"overlap {:x?} {:x?}",w[0],w[1]);
+        }
+    }
+
+    #[test]fn decoupled_pb_allocator_supports_same_vm_pipelining_cross_vm_displacement_and_abort(){
+        let mut o=Objects::new();let pools=PoolSet::new(&mut o).unwrap();
+        let vm1=vm(1);let vm2=vm(2);let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
+        let e1=g16::pools::PbEpoch::new(&factory,&vm1,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
+        e1.prepare(0,0x70c0000000,2048).unwrap();e1.check_assignment(0).unwrap();e1.expose();
+        let e2=g16::pools::PbEpoch::new(&factory,&vm2,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
+        e2.prepare(1,0x70c0000000,2048).unwrap();e2.check_assignment(1).unwrap();e2.expose();
+        let mut p=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        // Priming render on slot 0 (VM1).
+        assert_eq!(p.pick_slot(&vm1,false),Some(0));
+        let b1=p.bind(0,false);
+        let a1=pools.prepare_in_flight(0,1,false).unwrap();
+        assert_eq!(a1.uma_submitted,2);
+        pools.publish(0,2).unwrap();p.publish_flight(0);
+        let d0=o.objects.iter().find(|obj|obj.va==a1.uma_mgr[0]).unwrap();
+        d0.w64(0x54,2).unwrap();
+        p.retire_flight(0,&e1,b1,true).unwrap();
+        // Same-VM pipelining: 3 concurrent renders share slot 0 with cumulative uma_submitted (4, 6, 8).
+        assert!(p.can_pipeline(&vm1));
+        assert!(!p.can_pipeline(&vm2));
+        for draw in 2..=4u64 {
+            assert_eq!(p.pick_slot(&vm1,draw>2),Some(0));
+            let refs=pools.prepare_in_flight(0,draw,draw>2).unwrap();
+            assert_eq!(refs.uma_submitted,draw*2);
+            pools.publish(0,refs.uma_submitted).unwrap();
+            p.publish_flight(0);
+        }
+        assert!(!pools.retired_at(0,4).unwrap());
+        d0.w64(0x54,4).unwrap();
+        assert!(pools.retired_at(0,4).unwrap());
+        assert!(!pools.retired_at(0,6).unwrap());
+        p.retire_flight(0,&e1,b1,true).unwrap();
+        d0.w64(0x54,6).unwrap();
+        assert!(pools.retired_at(0,6).unwrap());
+        p.retire_flight(0,&e1,b1,true).unwrap();
+        d0.w64(0x54,8).unwrap();
+        assert!(pools.retired(0).unwrap());
+        p.retire_flight(0,&e1,b1,true).unwrap();
+        // Cross-VM switch drains and switches to slot 1 (displacing slot 0 upon clean retirement).
+        assert_eq!(p.pick_slot(&vm2,false),Some(1));
+        let b2=p.bind(1,false);
+        p.publish_flight(1);
+        p.retire_flight(1,&e2,b2,true).unwrap();
+        assert!(!p.exhausted());
+        // Aborted render on slot 0 after slot 1 was previously retired leaves slot 1 undisplaced
+        // and slot 0 quarantined -> global pool exhaustion.
+        assert_eq!(p.pick_slot(&vm1,false),Some(0));
+        p.publish_flight(0);
+        p.quarantine_flight(0);
+        assert!(p.reusable(0,&vm1).is_none());
+        assert_eq!(p.pick_slot(&vm1,false),None);
+        assert!(p.exhausted());
+        assert!(p.exhausted_for(&vm1));
+
+        // Quarantine slot 0 while slot 1 is still fresh: VM2 claims and reuses slot 1, while
+        // other VMs report per-VM exhaustion without tripping global exhaustion until recovery.
+        let vm3=vm(3);
+        let mut q=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        assert_eq!(q.pick_slot(&vm1,false),Some(0));
+        q.publish_flight(0);
+        q.quarantine_flight(0);
+        assert!(!q.exhausted());
+        assert_eq!(q.pick_slot(&vm2,false),Some(1));
+        let qb2=q.bind(1,false);
+        q.publish_flight(1);
+        assert!(!q.exhausted_for(&vm3)); // in-flight: waits for drain first
+        q.retire_flight(1,&e2,qb2,true).unwrap();
+        assert!(!q.exhausted());
+        assert!(!q.exhausted_for(&vm2));
+        assert_eq!(q.pick_slot(&vm2,false),Some(1));
+        assert!(q.exhausted_for(&vm1));
+        assert!(q.exhausted_for(&vm3));
+        // Recovery invalidates the surviving slot's epoch -> global pool exhaustion.
+        q.invalidate();
+        assert!(q.exhausted());
+        assert!(q.exhausted_for(&vm2));
+    }
+
+    #[test]fn pipelined_render_pass_slots_keep_seven_in_flight(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();
+        let mut passes=KVec::new();
+        for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
+            passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
+        }
+        let arena=g16::resources::RenderArena{
+            passes,
+            tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};8],
+            tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};8],
+        };
+        let a=vm(1);
+        let mut live:Vec<Claims>=Vec::new();
+        // Publish 7 concurrent passes in flight (slots 0..7).
+        for k in 0..7usize {
+            let mut c=Claims::new();
+            c.pass[0]=k as u32;c.pass_mask=1<<k;
+            s.claim_pass_for(&arena,k,Some(a.id)).unwrap();
+            s.hold_vm(&c,&a).unwrap();
+            s.publish(&c).unwrap();
+            live.push(c);
+        }
+        assert_eq!(s.render_published(),7);
+        assert!(s.pass_available(8)); // slot 7 is still fresh
+        // Retire 0 and 1 -> slot 0 is displaced and reusable while 5 others remain in flight.
+        s.retire(&mut live[0]).unwrap();
+        assert!(!s.pass_available(7)); // slot 0 not displaced yet
+        s.retire(&mut live[1]).unwrap();
+        assert!(s.pass_available(7)); // slot 0 displaced by slot 1!
+        for c in live.iter_mut().skip(2) {
+            s.retire(c).unwrap();
+        }
+        assert_eq!(s.render_published(),0);
     }
 
 }

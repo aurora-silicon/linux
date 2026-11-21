@@ -590,7 +590,8 @@ impl Firmware {
                 return Ok(Retirement::Pending);
             }
             let k = f.claims.pass[0] as usize;
-            let unit = f.job.resources.render()?.passes.get(k).ok_or(EINVAL)?;
+            let a = f.pb_slot as usize;
+            let unit = f.job.resources.render_pass(k)?;
             let ta_start = unit.scene.r64(0x600)?;
             let ta_end = unit.scene.r64(0x608)?;
             let fs_start = unit.scene.r64(0x620)?;
@@ -601,7 +602,7 @@ impl Firmware {
                 && g.notifier
                     .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
                     == f.job.vm.slot
-                && f.job.resources.render()?.pools.retired(k)?
+                && f.job.resources.render()?.pools.retired(a)?
                 && ta_start != 0
                 && ta_end > ta_start
                 && fs_start != 0
@@ -681,10 +682,12 @@ impl Firmware {
                 self.recovery.last_retired[1] = Some(f.ta_target);
                 self.recovery.last_retired[2] = Some(f.fs_target);
                 let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
-                    let k = timestamp_claims.pass[0] as usize;
-                    self.pools.retire_binding(k, epoch)?;
-                    self.pools.retire_epoch(k, f.pb_binding, result.is_ok());
-                    Ok(())
+                    self.pools.retire_flight(
+                        f.pb_slot as usize,
+                        epoch,
+                        f.pb_binding,
+                        result.is_ok(),
+                    )
                 });
                 if let Err(error) = committed {
                     self.retain(&f.job);
@@ -708,8 +711,8 @@ impl Firmware {
             // Only an actual passed abort lacks the full owner receipt. An affected job
             // with a full normal receipt fails its fence without poisoning healthy storage.
             if f.renders != 0 {
-                // The quarantined slot is not picked again, but keep no epoch of it for reuse.
-                self.pools.forget(timestamp_claims.pass[0] as usize);
+                // Quarantine the aborted allocator slot permanently and keep no epoch for reuse.
+                self.pools.quarantine_flight(f.pb_slot as usize);
             }
             self.slots.quarantine(&mut f.claims);
             self.retain(&f.job);
@@ -718,7 +721,7 @@ impl Firmware {
         if self.slots.compute_exhausted() {
             self.mark_class_unavailable(super::command::COMPUTE, EIO);
         }
-        if self.slots.render_exhausted() {
+        if self.slots.render_exhausted() || self.pools.exhausted() {
             self.mark_class_unavailable(super::command::RENDER, EIO);
         }
         if result.is_ok() {
@@ -865,13 +868,7 @@ impl Firmware {
                 }
                 super::command::Command::Render(command) => {
                     let index = *passes.get(render).ok_or(EINVAL)? as usize;
-                    let pass = flight
-                        .job
-                        .resources
-                        .render()?
-                        .passes
-                        .get(index)
-                        .ok_or(EINVAL)?;
+                    let pass = flight.job.resources.render_pass(index)?;
                     let ticks = [
                         pass.scene.r64(0x600)?,
                         pass.scene.r64(0x608)?,
@@ -928,10 +925,9 @@ impl Firmware {
             hi = hi.max(end);
         };
         for k in 0..f.renders as usize {
-            let Some(arena) = f.job.resources.render.as_ref() else {
+            let Ok(p) = f.job.resources.render_pass(f.claims.pass[k] as usize) else {
                 return;
             };
-            let p = &arena.passes[f.claims.pass[k] as usize];
             stage(
                 &p.scene,
                 0x600,

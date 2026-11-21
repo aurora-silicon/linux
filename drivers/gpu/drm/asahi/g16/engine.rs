@@ -187,10 +187,14 @@ pub(crate) struct Flight {
     pub(crate) published_ns: u64,
     /// Published behind another flight.
     pub(crate) behind: bool,
-    /// The PB epoch this render prefix uses (its own, or a reused pass-slot epoch).
+    /// The PB epoch this render prefix uses (its own, or a reused allocator-slot epoch).
     pub(crate) pb: Option<Arc<super::pools::PbEpoch>>,
-    /// Its pass slot binding (`Pools::bind`).
+    /// Its allocator slot (`0` or `1`, decoupled from `claims.pass[0]`).
+    pub(crate) pb_slot: u32,
+    /// Its allocator slot binding (`Pools::bind`).
     pub(crate) pb_binding: u64,
+    /// Whether this render carries InitBM (priming renders always drain before pipelining).
+    pub(crate) initbm: bool,
 }
 
 impl Flight {
@@ -222,7 +226,9 @@ impl Flight {
             published_ns: 0,
             behind: false,
             pb: None,
+            pb_slot: 0,
             pb_binding: 0,
+            initbm: false,
         }
     }
 }
@@ -668,7 +674,7 @@ impl Firmware {
             && !super::poll::stamp_reached(stage[0], f.ta_target, self.engine.ta_target)
         {
             let k = f.claims.pass[0] as usize;
-            let pass = f.job.resources.render()?.passes.get(k).ok_or(EINVAL)?;
+            let pass = f.job.resources.render_pass(k)?;
             let bytes = pass.ta_work.r64(work::ta::TPC_BYTES)?;
             if bytes == 0 || bytes > pass.tpc.size as u64 {
                 return Err(ERANGE);
@@ -817,7 +823,7 @@ impl Firmware {
                     }
                 }
                 Some(Command::Render(_)) => {
-                    if self.slots.render_exhausted() {
+                    if self.slots.render_exhausted() || self.pools.exhausted() {
                         Some((super::command::RENDER, EIO))
                     } else if super::recovery::logic::next_ordinal(self.engine.draw).is_none() {
                         Some((super::command::RENDER, EOVERFLOW))
@@ -835,6 +841,23 @@ impl Firmware {
                     .resources
                     .compute_units()
                     .is_ok_and(|n| self.slots.compute_exhausted_within(n))
+            {
+                self.engine.unpend(&job);
+                let _ = job.mark_terminal_retired();
+                complete(done, &job, Err(ECANCELED));
+                continue;
+            }
+            // A VM whose render pass slots were all quarantined, or that cannot acquire a
+            // physical PB allocator slot because the alternate slot is quarantined and the
+            // active slot belongs to another VM, cannot render again: cancel its queue
+            // immediately instead of spinning on EAGAIN and stalling unrelated compute.
+            if class_error.is_none()
+                && matches!(command(&job, job.progress.sent()), Some(Command::Render(_)))
+                && (self.pools.exhausted_for(&job.vm)
+                    || job
+                        .resources
+                        .render_passes()
+                        .is_ok_and(|n| self.slots.render_exhausted_within(n)))
             {
                 self.engine.unpend(&job);
                 let _ = job.mark_terminal_retired();
@@ -973,27 +996,34 @@ impl Firmware {
         job.progress.sent() != 0
     }
 
-    /// Addresses and cumulative allocator state of the selected retained render unit.
+    /// Addresses and cumulative allocator state of the selected retained render allocator slot.
     fn render_refs(
         &mut self,
-        k: usize,
+        alloc_slot: usize,
         job: &Job,
         draw: u64,
+        pipelined: bool,
     ) -> Result<(RenderRefs, bool, Arc<super::pools::PbEpoch>, u64)> {
         let generation = job.vm.generation;
         let arena = job.resources.render()?;
-        let mut a = arena.pools.prepare(k, draw)?;
-        // Reuse this VM's retired epoch of the slot when still bound: no reseed, no InitBM.
-        let (epoch, reused) = match self.pools.reusable(k, &job.vm) {
+        let mut a = arena.pools.prepare_in_flight(alloc_slot, draw, pipelined)?;
+        // Reuse this VM's retired epoch of the allocator slot when still bound (no reseed/InitBM).
+        let (epoch, reused) = match self.pools.reusable(alloc_slot, &job.vm) {
             Some(e) => {
                 self.pools.stats.reused += 1;
                 a.init_buffer = false;
                 (e, true)
             }
             None => {
+                if pipelined {
+                    return Err(EAGAIN);
+                }
                 let e = job.resources.take_pb()?;
-                if let Err(err) = e.prepare(k, arena.pools.heap_gva(k)?, arena.pools.heap_blocks())
-                {
+                if let Err(err) = e.prepare(
+                    alloc_slot,
+                    arena.pools.heap_gva(alloc_slot)?,
+                    arena.pools.heap_blocks(),
+                ) {
                     job.resources.return_pb(e);
                     return Err(err);
                 }
@@ -1001,7 +1031,7 @@ impl Firmware {
                 (e, false)
             }
         };
-        let binding = self.pools.bind(k, reused);
+        let binding = self.pools.bind(alloc_slot, reused);
         a.pb_mgr = epoch.manager.va;
         a.mgr_misc = epoch.misc.va;
         let r = &self.graph.render;
@@ -1020,7 +1050,7 @@ impl Firmware {
                 uma_aux: a.uma_aux,
                 uma_gpu: a.uma_gpu,
                 pb_mgr: a.pb_mgr,
-                scene_list: a.scene_list,
+                scene_list: 0,
                 mgr_misc: a.mgr_misc,
                 pb_init_blocks: a.init_blocks,
                 parameter_id: a.parameter_id,
@@ -1072,6 +1102,9 @@ impl Firmware {
     ) -> Result {
         let result = self.publish_prefix_body(job, f, visible);
         if result.is_err() && !*visible {
+            if f.pb.is_some() {
+                self.pools.cancel_alloc(f.pb_slot as usize);
+            }
             if let Some(epoch) = f.pb.take() {
                 if epoch.unexposed() {
                     job.resources.return_pb(epoch);
@@ -1098,7 +1131,7 @@ impl Firmware {
             return Err(EIO);
         }
         if if render {
-            self.slots.render_exhausted()
+            self.slots.render_exhausted() || self.pools.exhausted()
         } else {
             self.slots.compute_exhausted()
         } {
@@ -1113,7 +1146,7 @@ impl Firmware {
             let pipe = self.channels.channel(channel);
             let producer = self.channels.producer(channel);
             let busy = if behind {
-                // Behind in-flight compute: post after its unconsumed records, with room.
+                // Behind in-flight commands: post after their unconsumed records, with room.
                 pipe.write()? != producer
                     || producer.wrapping_sub(pipe.read()?) % RING_SLOTS >= sizes::AHEAD_RECORDS
             } else {
@@ -1142,12 +1175,26 @@ impl Firmware {
             return Err(super::boot::eproto());
         }
         if behind {
-            // Room for one more compute entry behind the unconsumed ones.
-            let read = self.graph.compute.qstate.r32(qstate::READ)?;
-            if read >= 256
-                || prefix.c_head.wrapping_sub(read) % sizes::QUEUE_CAP >= sizes::QUEUE_CAP - 2
-            {
-                return Err(EAGAIN);
+            if render {
+                let ta_read = self.graph.render.qstate[0].r32(qstate::READ)?;
+                let fs_read = self.graph.render.qstate[1].r32(qstate::READ)?;
+                if ta_read >= 256
+                    || fs_read >= 256
+                    || prefix.ta_head.wrapping_sub(ta_read) % sizes::QUEUE_CAP
+                        >= sizes::QUEUE_CAP - 4
+                    || prefix.fs_head.wrapping_sub(fs_read) % sizes::QUEUE_CAP
+                        >= sizes::QUEUE_CAP - 4
+                {
+                    return Err(EAGAIN);
+                }
+            } else {
+                // Room for one more compute entry behind the unconsumed ones.
+                let read = self.graph.compute.qstate.r32(qstate::READ)?;
+                if read >= 256
+                    || prefix.c_head.wrapping_sub(read) % sizes::QUEUE_CAP >= sizes::QUEUE_CAP - 2
+                {
+                    return Err(EAGAIN);
+                }
             }
         }
         f.c_start = prefix.c_head;
@@ -1157,21 +1204,25 @@ impl Firmware {
             Command::Compute(c) => self.prefix_compute(job, c, &mut prefix, f, false)?,
             Command::Render(r) => {
                 let geometry = Geometry::new(&r.cmd, 0);
-                if job.resources.render()?.passes.iter().all(|slot| {
-                    geometry
-                        .validate_capacity(slot.tpc.size as u64, slot.tilemap.size as u64)
-                        .is_err()
+                let n = job.resources.render_passes()?;
+                if (0..n).all(|k| {
+                    job.resources.render_pass(k).is_err_and(|_| true)
+                        || job.resources.render_pass(k).is_ok_and(|slot| {
+                            geometry
+                                .validate_capacity(slot.tpc.size as u64, slot.tilemap.size as u64)
+                                .is_err()
+                        })
                 }) {
                     return Err(E2BIG);
                 }
                 let k = self
                     .slots
-                    .pick_pass(job.resources.render()?, &geometry, 0)
+                    .pick_pass_in(&job.resources, &geometry, 0)
                     .ok_or(EAGAIN)?;
                 f.claims.pass[0] = k as u32;
                 f.claims.pass_mask = 1 << k;
                 self.slots.pass_busy |= 1 << k;
-                self.prefix_render(job, r, &mut prefix, f)?;
+                self.prefix_render(job, r, &mut prefix, f, behind)?;
             }
         }
         f.first = index as usize;
@@ -1194,7 +1245,12 @@ impl Firmware {
         if render {
             f.pb.as_ref()
                 .ok_or(EINVAL)?
-                .check_assignment(f.claims.pass[0] as usize)?;
+                .check_assignment(f.pb_slot as usize)?;
+            self.pools.hold_alloc(
+                f.pb_slot as usize,
+                &job.vm,
+                job.resources.render_arena(),
+            )?;
         }
         // Reserve lifetime ownership before any counter or producer becomes reachable.
         job.vm.vm.mark_binding_published()?;
@@ -1206,10 +1262,11 @@ impl Firmware {
         *visible = true;
         let publication = (|| -> Result {
             if render {
-                let k = f.claims.pass[0] as usize;
+                let a = f.pb_slot as usize;
                 f.pb.as_ref().ok_or(EINVAL)?.expose();
                 job.resources.commit_render();
-                job.resources.render()?.pools.publish(k, f.uma_submitted)?;
+                job.resources.render()?.pools.publish(a, f.uma_submitted)?;
+                self.pools.publish_flight(a);
                 // Notifier service dereferences u32 counters; the host ordering ledger
                 // remains u64. Eight-byte spacing is retained allocation padding.
                 self.graph.render.threshold.w32(0, prefix.draw as u32)?;
@@ -1428,32 +1485,35 @@ impl Firmware {
     }
 
     /// Encodes paired TA/FS work and the fragment's explicit TA dependency in one retained
-    /// pass unit. The preceding command already has a complete wire receipt.
+    /// pass unit.
     fn prefix_render(
         &mut self,
         job: &Arc<Job>,
         cmd: &RenderCommand,
         pf: &mut Prefix,
         f: &mut Flight,
+        behind: bool,
     ) -> Result {
         let k = f.claims.pass[0] as usize;
+        let alloc_slot = self.pools.pick_slot(&job.vm, behind).ok_or(EAGAIN)?;
         let draw = super::recovery::logic::next_ordinal(pf.draw).ok_or(EOVERFLOW)?;
         let target = encode::stamp(draw);
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
         self.slots
-            .claim_pass_for(job.resources.render()?, k, Some(job.vm.id))?;
+            .claim_pass_in(&job.resources, k, Some(job.vm.id))?;
         self.slots.hold_vm(&f.claims, &job.vm)?;
         self.slots.hold_arenas(&f.claims, &job.resources);
-        let (refs, init_buffer, epoch, binding) = self.render_refs(k, job, draw)?;
+        let (refs, init_buffer, epoch, binding) = self.render_refs(alloc_slot, job, draw, behind)?;
         f.pb = Some(epoch);
+        f.pb_slot = alloc_slot as u32;
         f.pb_binding = binding;
-        let p = &job.resources.render()?.passes[k];
+        f.initbm = init_buffer;
+        let p = job.resources.render_pass(k)?;
         let pass = p.refs();
         let geometry = Geometry::new(&cmd.cmd, pass.heap_gva);
         geometry.validate_capacity(p.tpc.size as u64, p.tilemap.size as u64)?;
         job.resources
-            .render()?
-            .set_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes)?;
+            .set_pass_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes)?;
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
         encode::encode_ta_for(
             self.init.abi.ta(),

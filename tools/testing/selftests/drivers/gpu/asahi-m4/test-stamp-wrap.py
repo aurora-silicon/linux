@@ -43,18 +43,18 @@ struct RGraph{fw_stamp:[Object;2],qstate:[Object;2],qinfo:[Object;2],notifier:Ob
 struct Graph{compute:CGraph,render:RGraph}
 struct Vm{slot:u32}struct Job{vm:Vm,resources:Resources}
 struct Resources{compute:Vec<CUnit>,passes:Vec<RUnit>,pools:Pools}
-impl Resources{fn compute(&self)->Result<&Self>{Ok(self)}fn render(&self)->Result<&Self>{Ok(self)}fn compute_unit(&self,k:usize)->Result<&CUnit>{self.compute.get(k).ok_or(EINVAL)}}
+impl Resources{fn compute(&self)->Result<&Self>{Ok(self)}fn render(&self)->Result<&Self>{Ok(self)}fn compute_unit(&self,k:usize)->Result<&CUnit>{self.compute.get(k).ok_or(EINVAL)}fn render_pass(&self,k:usize)->Result<&RUnit>{self.passes.get(k).ok_or(EINVAL)}}
 struct Claims{slot:[u32;1],pass:[u32;1]}
-struct Flight{computes:u32,renders:u32,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],recovery_suspect:bool,recovery_started_ns:u64,doomed:bool}
-struct Engine{flights:Vec<Flight>,target:u32}
+struct Flight{computes:u32,renders:u32,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],pb_slot:u32,uma_submitted:u64,recovery_suspect:bool,recovery_started_ns:u64,doomed:bool}
+struct Engine{flights:Vec<Flight>,target:u32,ta_target:u32,fs_target:u32}
 fn stamp_reached(observed:u32,own:u32,tail:u32)->bool{logic::stamp_reached(observed,own,tail)}
 impl Engine{fn oldest(&self)->Option<&Flight>{self.flights.first()}}
 struct CUnit{counter:Object,its:Object,work:Object}
 struct RUnit{scene:Object}
 struct Scrub{compute:Vec<CUnit>,passes:Vec<RUnit>}
 struct Slots{scrub:Scrub}
-struct Pools{full:bool}
-impl Pools{fn retired(&self,_k:usize)->Result<bool>{Ok(self.full)}}
+struct Pools{full:bool,completed:u64}
+impl Pools{fn retired(&self,_k:usize)->Result<bool>{Ok(self.full)}fn retired_at(&self,_k:usize,target:u64)->Result<bool>{Ok(self.full && target!=0 && self.completed>=target)}}
 struct Firmware{graph:Graph,engine:Engine,slots:Slots,pools:Pools,queue_passed:bool}
 fn rmb(){}fn now_ns()->u64{100_000_000}
 impl Firmware{
@@ -70,9 +70,9 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     let mut f=Firmware{
         graph:Graph{compute:CGraph{fw_stamp:Object::default(),qstate:Object::default(),qinfo:Object::default(),notifier:Object::default()},
             render:RGraph{fw_stamp:Default::default(),qstate:Default::default(),qinfo:Default::default(),notifier:Object::default()}},
-        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true}}},claims:Claims{slot:[0],pass:[0]},head:1,ta_head:1,fs_head:1,rec:[1;3],recovery_suspect:false,recovery_started_ns:0,doomed:false}],target},
+        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2}}},claims:Claims{slot:[0],pass:[0]},head:1,ta_head:1,fs_head:1,rec:[1;3],pb_slot:0,uma_submitted:2,recovery_suspect:false,recovery_started_ns:0,doomed:false}],target,ta_target:target,fs_target:target},
         slots:Slots{scrub:Scrub{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}]}},
-        pools:Pools{full:true},queue_passed:true,
+        pools:Pools{full:true,completed:2},queue_passed:true,
     };
     f.graph.compute.fw_stamp.set(0,u64::from(target));
     f.graph.compute.notifier.set(notifier_page::COMPUTE_STAMP,u64::from(target));

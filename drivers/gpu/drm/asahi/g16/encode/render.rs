@@ -21,7 +21,8 @@ pub(crate) struct RenderRefs {
     pub(crate) uma_aux: [u64; 2],
     pub(crate) uma_gpu: u64,
     pub(crate) pb_mgr: u64,
-    /// GPU VA of the scene list, not its firmware alias.
+    /// Fallback GPU VA of the scene list when `PassRefs::scene_list` is zero (ABI tests).
+    #[allow(dead_code)]
     pub(crate) scene_list: u64,
     #[allow(dead_code)]
     pub(crate) mgr_misc: u64,
@@ -55,6 +56,8 @@ pub(crate) struct PassRefs {
     pub(crate) heap_gva: u64,
     /// Scratch GPU VA; scratch_fw is a same-backing firmware alias.
     pub(crate) scene_user_gva: u64,
+    /// Per-pass scene list GPU VA, not its firmware alias.
+    pub(crate) scene_list: u64,
     pub(crate) scratch_fw: u64,
     pub(crate) pre_gva: [u64; 3],
     #[allow(dead_code)]
@@ -64,6 +67,14 @@ pub(crate) struct PassRefs {
     pub(crate) its: u64,
     #[allow(dead_code)]
     pub(crate) ta_scratch: u64,
+}
+
+fn scene_list_va(r: &RenderRefs, p: &PassRefs) -> u64 {
+    if p.scene_list != 0 {
+        p.scene_list
+    } else {
+        r.scene_list
+    }
 }
 
 fn metadata(w: &mut [u8], off: usize, r: &RenderRefs, engine: usize, target: u32) {
@@ -229,8 +240,8 @@ pub(crate) fn encode_ta_for(
         8,
         0xff0000,
         u64::from(r.parameter_id),
-        compact(r.scene_list),
-        compact(r.scene_list),
+        compact(scene_list_va(r, p)),
+        compact(scene_list_va(r, p)),
         scratch_word,
         0x6000400020,
         0x200000001,
@@ -427,7 +438,7 @@ pub(crate) fn encode_fs_for(
         u64::from(r.uuid),
         u64::from(r.uuid),
         u64::from(r.parameter_id),
-        compact(r.scene_list),
+        compact(scene_list_va(r, p)),
         usc,
     ];
     regs(&mut w[fs::REGS..], &fs::SEL, &val);
@@ -586,7 +597,7 @@ pub(crate) fn fill_scene(r: &RenderRefs, p: &PassRefs, out: &mut [u8]) {
     out.fill(0);
     put64(out, 0, p.scene_user_gva);
     put64(out, 8, p.scratch_fw);
-    put64(out, 0x28, compact(r.scene_list));
+    put64(out, 0x28, compact(scene_list_va(r, p)));
     put64(out, 0x40, p.scene + 0x200);
     put64(out, 0x500, r.uma_submitted);
 }
@@ -597,7 +608,7 @@ pub(crate) fn scene(r: &RenderRefs, p: &PassRefs, _n: u64) -> [u8; 0x80] {
     let mut out = [0u8; 0x80];
     put64(&mut out, 0, p.scene_user_gva);
     put64(&mut out, 8, p.scratch_fw);
-    put64(&mut out, 0x28, compact(r.scene_list));
+    put64(&mut out, 0x28, compact(scene_list_va(r, p)));
     put64(&mut out, 0x40, p.scene + 0x200);
     out
 }

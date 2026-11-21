@@ -79,6 +79,12 @@ impl ComputeArena {
     }
 }
 
+/// Render pass slots every VM gets with its first render command; extension slots
+/// (`BASE_RENDER_SLOTS..hw::sizes::RENDER_SLOTS`) are added lazily once it submits renders
+/// back to back.
+pub(crate) const BASE_RENDER_SLOTS: usize = 2;
+const EXT_RENDER_SLOTS: usize = super::hw::sizes::RENDER_SLOTS - BASE_RENDER_SLOTS;
+
 pub(crate) struct RenderArena(crate::cleanup::Deferred<RenderInner>);
 impl core::ops::Deref for RenderArena {
     type Target = RenderInner;
@@ -89,8 +95,8 @@ impl core::ops::Deref for RenderArena {
 pub(crate) struct RenderInner {
     pub(crate) passes: KVec<PassSlot>,
     pub(crate) pools: PoolSet,
-    pub(crate) tpc_dirty: [AtomicU64; 2],
-    pub(crate) tilemap_dirty: [AtomicU64; 2],
+    pub(crate) tpc_dirty: [AtomicU64; BASE_RENDER_SLOTS],
+    pub(crate) tilemap_dirty: [AtomicU64; BASE_RENDER_SLOTS],
     _objects: Objects,
     _bind: mmu::VmBind,
     _live: Arc<super::vm::LiveToken>,
@@ -103,9 +109,9 @@ impl RenderArena {
         live: &Arc<super::vm::LiveToken>,
     ) -> Result<Arc<Self>> {
         let mut objects = factory.objects(vm);
-        let mut passes = KVec::with_capacity(2, GFP_KERNEL)?;
-        for k in 0..2 {
-            passes.push(PassSlot::new(&mut objects, k, 1)?, GFP_KERNEL)?;
+        let mut passes = KVec::with_capacity(BASE_RENDER_SLOTS, GFP_KERNEL)?;
+        for k in 0..BASE_RENDER_SLOTS {
+            passes.push(PassSlot::new(&mut objects, k as u64, 1)?, GFP_KERNEL)?;
         }
         let pools = PoolSet::new(&mut objects)?;
         objects.finish_private()?;
@@ -113,8 +119,8 @@ impl RenderArena {
             Self(crate::cleanup::Deferred::new(RenderInner {
                 passes,
                 pools,
-                tpc_dirty: [const { AtomicU64::new(0) }; 2],
-                tilemap_dirty: [const { AtomicU64::new(0) }; 2],
+                tpc_dirty: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
+                tilemap_dirty: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
                 _objects: objects,
                 _bind: bind.clone(),
                 _live: live.clone(),
@@ -133,15 +139,72 @@ impl RenderArena {
     }
 }
 
+/// Extension render pass slots (`BASE_RENDER_SLOTS..hw::sizes::RENDER_SLOTS`), allocated lazily
+/// for VMs that submit renders back to back so idle or single-pass VMs keep only the two base
+/// pass slots.
+pub(crate) struct RenderExtArena(crate::cleanup::Deferred<RenderExtInner>);
+impl core::ops::Deref for RenderExtArena {
+    type Target = RenderExtInner;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+pub(crate) struct RenderExtInner {
+    pub(crate) passes: KVec<PassSlot>,
+    pub(crate) tpc_dirty: [AtomicU64; EXT_RENDER_SLOTS],
+    pub(crate) tilemap_dirty: [AtomicU64; EXT_RENDER_SLOTS],
+    _objects: Objects,
+    _bind: mmu::VmBind,
+    _live: Arc<super::vm::LiveToken>,
+}
+impl RenderExtArena {
+    fn new(
+        factory: &Factory,
+        bind: &mmu::VmBind,
+        vm: &mmu::Vm,
+        live: &Arc<super::vm::LiveToken>,
+    ) -> Result<Arc<Self>> {
+        let mut objects = factory.objects(vm);
+        let mut passes = KVec::with_capacity(EXT_RENDER_SLOTS, GFP_KERNEL)?;
+        for k in BASE_RENDER_SLOTS..super::hw::sizes::RENDER_SLOTS {
+            passes.push(PassSlot::new(&mut objects, k as u64, 1)?, GFP_KERNEL)?;
+        }
+        objects.finish_private()?;
+        Ok(Arc::new(
+            Self(crate::cleanup::Deferred::new(RenderExtInner {
+                passes,
+                tpc_dirty: [const { AtomicU64::new(0) }; EXT_RENDER_SLOTS],
+                tilemap_dirty: [const { AtomicU64::new(0) }; EXT_RENDER_SLOTS],
+                _objects: objects,
+                _bind: bind.clone(),
+                _live: live.clone(),
+            })?),
+            GFP_KERNEL,
+        )?)
+    }
+}
+
+/// Keeps the arena owning a retained pass slot alive through displacement.
+#[derive(Clone)]
+pub(crate) enum PassOwnerArena {
+    Base(Arc<RenderArena>),
+    Ext(Arc<RenderExtArena>),
+}
+
 #[derive(Default)]
 struct Ready {
     compute: Option<Arc<ComputeArena>>,
     /// Units from [`BASE_COMPUTE_UNITS`] on, for a VM that keeps compute queued.
     compute_ext: Option<Arc<ComputeArena>>,
     render: Option<Arc<RenderArena>>,
+    /// Pass slots from [`BASE_RENDER_SLOTS`] on, for a VM that keeps renders queued.
+    render_ext: Option<Arc<RenderExtArena>>,
     /// Last compute submission and the back-to-back run it continues.
     last_compute_ns: u64,
     burst: u32,
+    /// Last render submission and the back-to-back run it continues.
+    last_render_ns: u64,
+    render_burst: u32,
 }
 struct Standby {
     /// Never-exposed epochs kept on standby for this VM's queued renders.
@@ -297,6 +360,7 @@ impl Cache {
                 ready.compute.take(),
                 ready.compute_ext.take(),
                 ready.render.take(),
+                ready.render_ext.take(),
             )
         };
         drop(ready);
@@ -318,7 +382,7 @@ impl Cache {
             .count()
             .try_into()?;
         let render = render_count != 0;
-        let (compute, compute_ext, render) = {
+        let (compute, compute_ext, render, render_ext) = {
             // Never held by publication, completion, recovery or fence signalling.
             // Serializing standby top-up under `ready` prevents concurrent SUBMITs on the
             // same VM from over-allocating or racing each other's deficit calculation.
@@ -369,6 +433,23 @@ impl Cache {
                 )?);
             }
             if render {
+                // SAFETY: ktime_get has no preconditions.
+                let now = unsafe { kernel::bindings::ktime_get() } as u64;
+                ready.render_burst = if now.wrapping_sub(ready.last_render_ns) < BURST_GAP_NS {
+                    ready.render_burst.saturating_add(1)
+                } else {
+                    0
+                };
+                ready.last_render_ns = now;
+                if ready.render_ext.is_none()
+                    && EXT_RENDER_SLOTS != 0
+                    && (ready.render_burst >= BURST_SUBMITS
+                        || render_count as usize >= BURST_COMMANDS)
+                {
+                    // Best effort: without extension slots the VM keeps two base pass slots.
+                    ready.render_ext =
+                        RenderExtArena::new(&self.factory, &self.bind, &vm.vm, &self.live).ok();
+                }
                 if render_count > super::budget::LIMIT {
                     return Err(E2BIG);
                 }
@@ -454,14 +535,16 @@ impl Cache {
                 if compute { ready.compute.clone() } else { None },
                 if compute { ready.compute_ext.clone() } else { None },
                 if render { ready.render.clone() } else { None },
+                if render { ready.render_ext.clone() } else { None },
             )
         };
         Ok(Prepared {
             compute,
             compute_ext,
             render,
+            render_ext,
             unpublished_renders: AtomicU32::new(render_count),
-            cache: render.is_some().then(|| self.clone()),
+            cache: (render_count != 0).then(|| self.clone()),
         })
     }
 }
@@ -472,6 +555,8 @@ pub(crate) struct Prepared {
     /// The VM's extension compute units when the job was prepared.
     pub(crate) compute_ext: Option<Arc<ComputeArena>>,
     pub(crate) render: Option<Arc<RenderArena>>,
+    /// The VM's extension render pass slots when the job was prepared.
+    pub(crate) render_ext: Option<Arc<RenderExtArena>>,
     /// Render commands of this job whose standby reservation has not yet been committed.
     unpublished_renders: AtomicU32,
     /// The VM cache holding the standby PB epoch pool.
@@ -505,9 +590,60 @@ impl Prepared {
             self.compute_ext.clone()
         }
     }
-    /// The render arena.
+    /// The base render arena (owning the PB/UMA `PoolSet`).
     pub(crate) fn render_arena(&self) -> Option<Arc<RenderArena>> {
         self.render.clone()
+    }
+    /// Render pass slots this job can use.
+    pub(crate) fn render_passes(&self) -> Result<usize> {
+        Ok(self.render()?.passes.len()
+            + self.render_ext.as_deref().map_or(0, |e| e.passes.len()))
+    }
+    /// Render pass slot `k`: the VM's base slots, then its extension slots.
+    pub(crate) fn render_pass(&self, k: usize) -> Result<&PassSlot> {
+        let base = &self.render()?.passes;
+        match base.get(k) {
+            Some(pass) => Ok(pass),
+            None => self
+                .render_ext
+                .as_deref()
+                .and_then(|e| e.passes.get(k - base.len()))
+                .ok_or(EINVAL),
+        }
+    }
+    /// The dirty high-water marks (`tpc_dirty`, `tilemap_dirty`) for pass slot `k`.
+    pub(crate) fn render_pass_dirty(&self, k: usize) -> Result<(&AtomicU64, &AtomicU64)> {
+        let base = self.render()?;
+        if k < base.passes.len() {
+            Ok((&base.tpc_dirty[k], &base.tilemap_dirty[k]))
+        } else {
+            let ext = self.render_ext.as_deref().ok_or(EINVAL)?;
+            let idx = k - base.passes.len();
+            if idx >= ext.passes.len() {
+                return Err(EINVAL);
+            }
+            Ok((&ext.tpc_dirty[idx], &ext.tilemap_dirty[idx]))
+        }
+    }
+    /// Updates dirty high-water marks for pass slot `k` (base or extension).
+    pub(crate) fn set_pass_dirty(&self, k: usize, tpc: u64, tilemap: u64) -> Result {
+        let pass = self.render_pass(k)?;
+        if tpc > pass.tpc.size as u64 || tilemap > pass.tilemap.size as u64 {
+            return Err(E2BIG);
+        }
+        let (tpc_dirty, tilemap_dirty) = self.render_pass_dirty(k)?;
+        tpc_dirty.fetch_max(tpc, Ordering::Relaxed);
+        tilemap_dirty.fetch_max(tilemap, Ordering::Relaxed);
+        Ok(())
+    }
+    /// The arena owning render pass slot `k`.
+    pub(crate) fn pass_owner_arena(&self, k: usize) -> Option<PassOwnerArena> {
+        let base = self.render.as_ref()?;
+        if k < base.passes.len() {
+            Some(PassOwnerArena::Base(base.clone()))
+        } else {
+            self.render_ext.as_ref().map(|e| PassOwnerArena::Ext(e.clone()))
+        }
     }
     /// Compute unit `k`: the VM's base units, then its extension units.
     pub(crate) fn compute_unit(&self, k: usize) -> Result<&ComputeSlot> {
