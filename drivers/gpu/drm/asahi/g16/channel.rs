@@ -319,28 +319,46 @@ impl Channels {
 
     /// Drains every receive ring: events (decoded into `events`), the nine log sub-rings, trace
     /// and stats.
+    /// Drains every receive ring on every pass, whatever another ring reported: the 26B123
+    /// event writer (0x36330) spins with its lock held while the event ring is full, so one bad
+    /// record must never leave a ring undrained. The first error is returned once all are done.
     pub(crate) fn drain_rings(&self, dev: &kernel::device::Device, events: &mut Events) -> Result {
-        events.drain(dev, &self.event)?;
+        let mut result = events.drain(dev, &self.event);
+        let mut keep = |r: Result| {
+            if result.is_ok() {
+                result = r;
+            }
+        };
         for i in 0..rings::LOG_RINGS {
             self.print_log_records(dev, i);
-            Self::drain_one(&self.log, i * 0x30, 256)?;
+            keep(Self::drain_one(&self.log, i * 0x30, 256));
         }
-        // Ktrace has twice the capacity of the other receive rings.
+        keep(self.drain_trace(dev));
+        keep(events.drain_statistics(dev, &self.stats));
+        result
+    }
+
+    /// Ktrace has twice the capacity of the other receive rings. A record of another type than
+    /// the qualified one (5) is logged and consumed, then reported.
+    fn drain_trace(&self, dev: &kernel::device::Device) -> Result {
         let producer = self.trace.write()?;
         let mut consumer = self.trace.read()?;
         if producer >= 512 || consumer >= 512 {
             return Err(super::boot::eproto());
         }
         rmb();
+        let mut result = Ok(());
         while consumer != producer {
-            if self.trace.ring.r32(consumer as usize * 0x48)? != 5 {
-                return Err(super::boot::eproto());
+            let kind = self.trace.ring.r32(consumer as usize * 0x48)?;
+            if kind != 5 && result.is_ok() {
+                dev_err!(dev, "unexpected M4 firmware trace record type {} at {}\n", kind, consumer);
+                result = Err(super::boot::eproto());
             }
             consumer = (consumer + 1) % 512;
             self.trace.state.w32(STATE_READ, consumer)?;
             wmb();
         }
-        events.drain_statistics(dev, &self.stats)
+        result
     }
 }
 
