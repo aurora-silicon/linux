@@ -7383,6 +7383,7 @@ static void apple_sleep_put_node(void *np)
 }
 
 #include "sleep-t6050.h"
+#include "sleep-t6030.h"
 
 /* ANS's sleep owner on T6050: registered at its .suspend, its final stop in the last steps. */
 int apple_sleep_ans_m5_register(struct device *dev, void __iomem *asc,
@@ -9554,6 +9555,7 @@ static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8142-sleep", .data = &t8142_sleep_soc },
 	{ .compatible = "apple,t6050-sleep", .data = &t6050_sleep_soc },
 	{ .compatible = "apple,t6050-j716c-sleep", .data = &t6050_j716c_sleep_soc },
+	{ .compatible = "apple,t6030-sleep", .data = &t6030_sleep_soc },
 	{ }
 };
 
