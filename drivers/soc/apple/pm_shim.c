@@ -155,6 +155,39 @@ static struct device *sep_pm_dart(struct device *dev)
 	return pdev ? &pdev->dev : NULL;
 }
 
+/*
+ * Saves the enclave's DART while it can be read, before the enclave is told at suspend. Only
+ * a DART with apple,sleep-restore in its node is saved here and then left alone by its own
+ * callbacks. Without it, the DART's noirq suspend would read its registers after the enclave
+ * slept and its power domain went off, which hangs the suspend: refuse instead.
+ */
+int sep_pm_dart_prepare(void *ptr)
+{
+	struct device *dart = sep_pm_dart(ptr);
+	int ret;
+
+	if (!dart)
+		return -ENODEV;
+	if (!apple_dart_sleep_listed(dart)) {
+		dev_err(dart, "no apple,sleep-restore list: the enclave can't sleep at suspend\n");
+		put_device(dart);
+		return -EOPNOTSUPP;
+	}
+	ret = apple_dart_sleep_prepare(dart);
+	put_device(dart);
+
+	return ret;
+}
+
+/*
+ * Whether a sleep core commit sends the staged SLEEP (T8140). Without one, a firmware suspend
+ * (T6041's own sleep driver) tells the enclave at device suspend instead.
+ */
+bool sep_pm_platform_commit(void)
+{
+	return apple_sleep_commit_stops_coprocs();
+}
+
 void sep_pm_dart_restore(void *ptr)
 {
 	struct device *dart = sep_pm_dart(ptr);

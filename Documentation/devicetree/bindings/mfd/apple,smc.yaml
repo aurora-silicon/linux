@@ -51,6 +51,14 @@ properties:
   mboxes:
     maxItems: 1
 
+  apple,sleep-wake-type:
+    type: boolean
+    description:
+      The SMC firmware expects the wake type key (WKTP) set to its sleep value
+      and the CIO rail word (pmVC) written at the sleep commit, and WKTP cleared
+      after a full wake. Left at the sleep value, the SMC treats the time awake
+      as a power nap.
+
   gpio:
     oneOf:
       - $ref: /schemas/gpio/apple,smc-gpio.yaml

@@ -642,6 +642,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	smc->wake_reasons = of_device_is_compatible(dev->of_node, "apple,t8132-smc") ?
 			    apple_smc_t8132_wake_reasons : apple_smc_t8140_wake_reasons;
+	smc->sleep_wake_type = of_property_read_bool(dev->of_node, "apple,sleep-wake-type");
 
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
@@ -869,10 +870,48 @@ static int apple_smc_notice_idle(struct apple_smc *smc)
 	return ret;
 }
 
+/*
+ * WKTP, one byte: 2 at the sleep commit, 0 again once a wake is a full one. With the
+ * key left at 2 the SMC treats all the time awake as a power nap: it keeps its own fan
+ * policy against a fan request (the write times out and the fans stay at its idle
+ * speed), and under thermal load it requests a sleep once a second. #1910 does the same
+ * on the M4 Pro.
+ */
+#define SMC_WKTP_SLEEP		2
+#define SMC_WKTP_AWAKE		0
+
+/* WKTP back to 0 after a full wake, or after a sleep that ended in a refusal. */
+static void apple_smc_wake_full(struct apple_smc *smc)
+{
+	int ret;
+
+	if (!smc->wake_silent)
+		return;
+	smc->wake_silent = false;
+	ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_AWAKE);
+	if (ret)
+		dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_AWAKE, ret);
+}
+
 static int apple_smc_sleep_commit(struct apple_smc *smc)
 {
 	int ret;
 
+	/*
+	 * apple,sleep-wake-type (T6041): macOS's last SMC writes before MBSE (trace of its sleep
+	 * under aura's hypervisor): WKTP = 2, going to sleep, and pmVC, the CIO rail word. macOS
+	 * wrote 0x100 there, every port's rail off, but it slept with ATC0 held up by the
+	 * hypervisor; 0x101 is what the sleep that works here has written since 9 Nov.
+	 */
+	if (smc->sleep_wake_type) {
+		int r1 = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_SLEEP);
+		int r2 = apple_smc_write_u32(smc, SMC_KEY(pmVC), 0x101);
+
+		if (r1 || r2)
+			dev_err(smc->dev, "WKTP %d, pmVC %d\n", r1, r2);
+		/* Whatever was written, the SMC may run silent after this until it is told. */
+		smc->wake_silent = true;
+	}
 	apple_smc_write_mbse(smc, SMC_KEY(slpa));
 	/* Device interrupts are off here. */
 	mdelay(SMC_SLEEP_ARM_MS);
@@ -1125,6 +1164,9 @@ static void apple_smc_sleep_wake(struct apple_smc *smc, bool woken)
 	}
 	if (apple_smc_port_reasons_only(smc, smc->wake_record))
 		apple_sleep_debug_link_cut_wake();
+	/* A dark wake sleeps again, and its commit writes the key anyway. */
+	if (!pm_dark_wake())
+		apple_smc_wake_full(smc);
 	/* A dark wake isn't one: with wakeup_count in use, it would abort the sleep after it. */
 	if (smc->wake_record && !pm_dark_wake())
 		pm_wakeup_event(smc->dev, 0);
@@ -1717,6 +1759,8 @@ static void apple_smc_complete(struct device *dev)
 		smc->sleep_warned = false;
 	}
 	smc->sleep_policy = NULL;
+	/* A commit the SMC refused, or dark wakes that ended in a refusal. */
+	apple_smc_wake_full(smc);
 }
 
 /*

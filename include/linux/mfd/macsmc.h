@@ -144,6 +144,10 @@ struct apple_smc {
 	u8 wake_lid;
 	int wake_lid_ret;
 	u64 saved_unexpected;
+	/* WKTP left at its sleep value: written back once a wake is a full one. */
+	bool wake_silent;
+	/* apple,sleep-wake-type: WKTP and pmVC written at the sleep commit. */
+	bool sleep_wake_type;
 	/* To be told at the noirq suspend, after the debug link's cut. */
 	bool sleep_warn_late;
 	/* In a noirq phase: replies are polled for. */

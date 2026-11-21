@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t6041-sleep.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T6041 system sleep
+
+maintainers:
+  - AxxzyWasTaken <axxzytte@gmail.com>
+
+description: |
+  Suspend-to-RAM on the M4 Max (T6041) for a kernel running directly at EL2.
+  Unlike the sleep nodes of the other Apple SoCs, this one has no registers
+  and no properties. The blocks the driver writes to enter and leave the sleep
+  (the PMGR's power words, the CPU clusters, the memory controller's channels,
+  the PMU behind nub-spmi0, the storage link) are at the same addresses on
+  every T6041 and belong to several hardware blocks that other drivers also
+  use, so the driver maps them itself and claims none of them. The way back
+  from a sleep is the boot loader's S2R mailbox, which the boot loader names
+  in /chosen; without it the driver offers no deep sleep.
+
+properties:
+  compatible:
+    const: apple,t6041-sleep
+
+required:
+  - compatible
+
+additionalProperties: false
+
+examples:
+  - |
+    t6041-sleep {
+        compatible = "apple,t6041-sleep";
+    };
