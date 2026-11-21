@@ -1949,6 +1949,84 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 EXPORT_SYMBOL_GPL(ane_h16_session_close);
 
 /*
+ * One control command outside any program (the ISP link): prepared, sent and
+ * its reply checked (same command echoed, zero acknowledgment). The arena it
+ * used is given back once the firmware answered. Caller holds the session
+ * lock (ane_h16_session_enter()).
+ */
+int ane_h16_session_control(struct ane_h16_session *s, unsigned int ch, void *command,
+			    size_t length)
+{
+	struct ane_fw_transport *t;
+	const u8 *reply;
+	size_t mark;
+	u16 id;
+	int ret;
+
+	if (!s || !command || length < 8)
+		return -EINVAL;
+	h16_drain(s);
+	if (s->quarantined)
+		return -EIO;
+	if (s->asleep)
+		return -EAGAIN;
+	id = get_unaligned_le16((u8 *)command + 4);
+	ret = ane_h16_command_prepare(command, length, id, ch);
+	if (ret)
+		return ret;
+	t = s->transport;
+	mark = ane_fw_transport_mark(t);
+	ret = h16_send(s, ch, command, length, &reply);
+	if (ret == -EPERM)
+		return ret;
+	if (ret) {
+		/* No answer: the ring is stuck, as for a LOAD that got none. */
+		s->ops->log(s->ctx, "control unanswered", id, (u64)-ret);
+		h16_dump_rows("control", command, length);
+		return h16_fail(s, ret);
+	}
+	ret = h16_reply_header(reply, length, length, id);
+	if (ret)
+		h16_dump_rows("control reply", reply, length);
+	/* Answered: the arena goes back whatever the status said. */
+	ane_fw_transport_release(t, mark);
+	if (ret == -EREMOTEIO) {
+		s->ops->log(s->ctx, "control refused", id, get_unaligned_le16(reply + 6));
+		return ret;
+	}
+	if (ret)
+		return h16_fail(s, ret);
+	s->ops->log(s->ctx, "control", id, 0);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_control);
+
+/*
+ * Serve what the firmware posted while no host command waits (the ISP link
+ * drives the engine): the doorbell bits it rang, then SHAREDMALLOC and the
+ * terminal until quiet, for at most limit_ns. Returns the requests served.
+ * Caller holds the session lock.
+ */
+int ane_h16_session_serve(struct ane_h16_session *s, u32 *pending, u64 limit_ns)
+{
+	int ret;
+
+	if (!s || !pending)
+		return -EINVAL;
+	h16_drain(s);
+	if (s->quarantined)
+		return -EIO;
+	if (s->asleep)
+		return -EAGAIN;
+	ret = ane_fw_transport_irq(s->transport, pending);
+	if (ret)
+		return h16_fail(s, ret);
+	ret = ane_fw_transport_settle(s->transport, 0, limit_ns);
+	return ret < 0 ? h16_fail(s, ret) : ret;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_serve);
+
+/*
  * Requests (LOAD, EXECUTE) wait here while the engine is cycled across
  * system sleep, freezably so the freezer can stop their task, and enter with
  * the session's serializing lock held.

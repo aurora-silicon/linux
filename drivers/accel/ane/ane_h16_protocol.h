@@ -13,7 +13,20 @@ enum ane_h16_command {
 	ANE_H16_EXECUTE = 0x020c,
 	ANE_H16_POWER_GATE = 0x002d,
 	ANE_H16_EVENT_REPORT = 0x0300,
+	/*
+	 * The ISP link (MLVNR): CSNE_CMD_LOAD_AFPP / UNLOAD_AFPP and
+	 * CSNE_CMD_IPC_ENDPOINT_SET2 / UNSET2, from the macOS 27.2.1
+	 * AppleH16ANEInterface (ANEFirmwareManager::sendAFPPLoadCmd,
+	 * sendIPCEndpointSetCmd). Same channel as LOAD_PROGRAM.
+	 */
+	ANE_H16_IPC_ENDPOINT_SET2 = 0x002a,
+	ANE_H16_IPC_ENDPOINT_UNSET2 = 0x002b,
+	ANE_H16_LOAD_AFPP = 0x0205,
+	ANE_H16_UNLOAD_AFPP = 0x0206,
 };
+
+#define ANE_H16_AFPP_SIZE 0x38
+#define ANE_H16_ENDPOINT_SIZE 0x30
 
 struct ane_h16_command_info {
 	u16 id;
@@ -34,6 +47,10 @@ static inline const struct ane_h16_command_info *ane_h16_command_info(u16 id)
 		{ ANE_H16_EXECUTE, 0xca8, 0xcd8, 0x18, 7, false },
 		{ ANE_H16_POWER_GATE, 0xc, 0xc, 1, 7, false },
 		{ ANE_H16_EVENT_REPORT, 0x60, 0x60, 1, 6, true },
+		{ ANE_H16_IPC_ENDPOINT_SET2, 0x30, 0x30, 1, 1, false },
+		{ ANE_H16_IPC_ENDPOINT_UNSET2, 0x30, 0x30, 1, 1, false },
+		{ ANE_H16_LOAD_AFPP, 0x38, 0x38, 1, 1, false },
+		{ ANE_H16_UNLOAD_AFPP, 0x38, 0x38, 1, 1, false },
 	};
 	unsigned int i;
 

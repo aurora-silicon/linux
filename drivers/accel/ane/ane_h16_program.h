@@ -433,6 +433,9 @@ void ane_h16_export_get(struct ane_h16_export *e);
 void ane_h16_export_put(struct ane_h16_export *e);
 void ane_h16_session_flush_exports(struct ane_h16_session *s);
 int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock);
+int ane_h16_session_control(struct ane_h16_session *s, unsigned int ch, void *command,
+			    size_t length);
+int ane_h16_session_serve(struct ane_h16_session *s, u32 *pending, u64 limit_ns);
 unsigned int ane_h16_session_dump_fwlog(struct ane_h16_session *s);
 void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep);
 int ane_h16_session_gate_expire(struct ane_h16_session *s);

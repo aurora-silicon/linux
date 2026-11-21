@@ -5,6 +5,7 @@
 #include <linux/crash_dump.h>
 #include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
+#include <linux/firmware.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
@@ -18,15 +19,19 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/ane-isp.h>
 #include <linux/soc/apple/clpc.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
+#include <linux/vmalloc.h>
 
 #include "ane_fw_cold.h"
 #include "ane_fw_sleep.h"
 #include "ane_h16_accel.h"
+#include "ane_h16_protocol.h"
 
 #define ANE_FW_POOL_DVA 0x10000384000ULL
 #define ANE_FW_IPC_DVA 0x100003d0000ULL
@@ -133,6 +138,30 @@ struct ane_fw_backend {
 	struct work_struct start;
 	/* ANE_SYS and the child power states are on: the engine is readable. */
 	bool powered;
+	/* Completed firmware start-ups (ane_fw_startup()), for the ISP link. */
+	u64 fw_boots;
+	/*
+	 * The ISP link (MLVNR, ane_isp_endpoint_enable()): the held link, the
+	 * network package mapped once for the backend's lifetime, the ANE DVA
+	 * span reserved once for the ISP's rings, and the hold that marks the
+	 * engine as used by the ISP firmware (an idle park must honour it). Set under
+	 * the session lock; the link pointer under b->lock.
+	 */
+	struct ane_isp_link *isp_link;
+	u64 isp_afpp_dva, isp_afpp_len, isp_ring_dva, isp_ring_span;
+	/* Their ranges in dva_window, held for the backend's lifetime. */
+	struct drm_mm_node isp_afpp_node, isp_ring_node;
+	bool isp_hold;
+	/* The ring span is mapped (left so by a disable that found the engine off). */
+	bool isp_rings_mapped;
+	/*
+	 * While the ISP drives the engine no host command waits, and nothing
+	 * else serves the firmware's requests (this backend has no IRQ): poll
+	 * them (ane_fw_isp_service()). Counted, with the doorbell bits seen.
+	 */
+	struct delayed_work isp_service;
+	u64 isp_served;
+	u32 isp_bits;
 };
 
 /* One ANE per SoC. The observer exists before platform driver registration:
@@ -532,6 +561,7 @@ static int ane_fw_startup(struct ane_fw_backend *b);
 static int ane_fw_first_bringup(struct ane_fw_backend *b);
 static ssize_t ane_fw_stage_action(struct device *dev, const char *buf, size_t count);
 static int ane_fw_rvbar_ready(struct ane_fw_backend *b);
+static void ane_fw_isp_replay(struct ane_fw_backend *b);
 
 /* A power word goes off whole, and off means target, actual and BUSY clear. */
 #define ANE_FW_PS_OFF 0x300
@@ -816,8 +846,11 @@ static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
 		dev_err(dev, "H17 ANE: PROGRAM REPLAY FAILED %d after %u programs; session quarantined\n",
 			ret, b->resume_replayed);
 		WARN_ONCE(1, "H17 ANE: program replay failed after system sleep (%d)\n", ret);
+		return ret;
 	}
-	return ret;
+	/* A live ISP endpoint is lost with the old firmware: set it up again. */
+	ane_fw_isp_replay(b);
+	return 0;
 }
 
 /*
@@ -1941,6 +1974,7 @@ static int ane_fw_startup(struct ane_fw_backend *b)
 		ane_wr32(b, 1, b->engine + b->soc->scratch + 0x38);
 		ane_wr32(b, 0, b->engine + b->soc->scratch + 0x40);
 	}
+	b->fw_boots++;
 	return 0;
 }
 
@@ -2030,6 +2064,471 @@ static const struct ane_h16_session_ops ane_fw_session_ops = {
 	.busy = ane_fw_program_busy,
 	.wake = ane_fw_session_wake,
 };
+
+/*
+ * The ISP link (MLVNR). The ISP firmware runs Apple's ML video noise
+ * reduction network on this engine itself, over two rings and a doorbell
+ * each way; the host only sets it up. macOS 27.2.1 (AppleH16ANEInterface,
+ * ANEFirmwareManager) does it at every camera start, on the IO queue:
+ *
+ *   CSNE_CMD_LOAD_AFPP (0x205, 0x38 bytes): +0x08 1, +0x18 1, +0x20 the
+ *	network package's ANE address, +0x28 its size;
+ *   CSNE_CMD_IPC_ENDPOINT_SET2 (0x2a, 0x30 bytes): +0x08 the index (0),
+ *	+0x0c/+0x14 ring A = the ISP's write ring and its length, +0x18/+0x20
+ *	ring B = the ISP's read ring, +0x24 the ISP's doorbell (a PA: the ISP
+ *	CPU software interrupt register, 0x4a1668000 on T8142, admitted by
+ *	this engine's address filter) and +0x2c its bitmask (0x10);
+ *
+ * then the ISP gets this engine's doorbell (engine + 0x1660000, selector 1;
+ * 0x421660000 on T8142) with CISP_CMD_IPC_ENDPOINT_SET2. Stop is the
+ * reverse: UNSET2 (0x2b, same body), CSNE_CMD_UNLOAD_AFPP (0x206).
+ */
+#define ANE_FW_ISP_DOORBELL 0x1660000
+#define ANE_FW_ISP_DOORBELL_SEL 1
+#define ANE_FW_AFPP_MAX SZ_32M
+
+static bool isp_link = true;
+module_param(isp_link, bool, 0644);
+MODULE_PARM_DESC(isp_link, "Serve the ISP's MLVNR endpoint (Apple's ispane.afpp network) on the H17 ANE");
+
+static bool isp_fwlog;
+module_param(isp_fwlog, bool, 0644);
+MODULE_PARM_DESC(isp_fwlog, "Print the ANE firmware log when the ISP link goes down (MLVNR bring-up)");
+
+struct ane_isp_link {
+	struct ane_fw_backend *b;
+	struct device *isp;
+	struct ane_isp_endpoint ep;
+	/* The firmware boot (b->fw_boots) that has the endpoint. */
+	u64 boots;
+	bool live;
+};
+
+static void ane_fw_isp_afpp_encode(const struct ane_fw_backend *b, u8 *c, u16 id)
+{
+	memset(c, 0, ANE_H16_AFPP_SIZE);
+	put_unaligned_le16(id, c + 4);
+	put_unaligned_le32(1, c + 0x08);
+	put_unaligned_le32(1, c + 0x18);
+	put_unaligned_le64(b->isp_afpp_dva, c + 0x20);
+	put_unaligned_le64(b->isp_afpp_len, c + 0x28);
+}
+
+/* The ISP's read ring comes first in its pages, its write ring second. */
+static void ane_fw_isp_ep_encode(const struct ane_fw_backend *b, const struct ane_isp_link *l,
+				 u8 *c, u16 id)
+{
+	u32 len = l->ep.ring_len;
+
+	memset(c, 0, ANE_H16_ENDPOINT_SIZE);
+	put_unaligned_le16(id, c + 4);
+	put_unaligned_le32(0, c + 0x08);
+	put_unaligned_le64(b->isp_ring_dva + len, c + 0x0c);
+	put_unaligned_le32(len, c + 0x14);
+	put_unaligned_le64(b->isp_ring_dva, c + 0x18);
+	put_unaligned_le32(len, c + 0x20);
+	put_unaligned_le64(l->ep.isp_doorbell, c + 0x24);
+	put_unaligned_le32(l->ep.isp_doorbell_sel, c + 0x2c);
+}
+
+/*
+ * One command. Through the session (its lock held), or with @direct right
+ * after a firmware boot, while the session is still asleep (b->lock held).
+ * -EREMOTEIO: the firmware answered with a refusal.
+ */
+static int ane_fw_isp_send(struct ane_fw_backend *b, u8 *c, size_t len, bool direct)
+{
+	u16 id = get_unaligned_le16(c + 4);
+	size_t mark;
+	int ret;
+
+	if (!direct)
+		return ane_h16_session_control(&b->session, ANE_FW_IO, c, len);
+	ret = ane_h16_command_prepare(c, len, id, ANE_FW_IO);
+	if (ret)
+		return ret;
+	mark = ane_fw_transport_mark(&b->transport);
+	ret = ane_fw_command(b, ANE_FW_IO, c, len, ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	if (ret)
+		return ret;
+	ane_fw_transport_release(&b->transport, mark);
+	if (get_unaligned_le32(c) || get_unaligned_le16(c + 4) != id)
+		return -EPROTO;
+	return get_unaligned_le16(c + 6) ? -EREMOTEIO : 0;
+}
+
+static int ane_fw_isp_up(struct ane_fw_backend *b, struct ane_isp_link *l, bool direct)
+{
+	struct device *dev = &b->pdev->dev;
+	u8 c[ANE_H16_AFPP_SIZE];
+	int ret;
+
+	ane_fw_isp_afpp_encode(b, c, ANE_H16_LOAD_AFPP);
+	ret = ane_fw_isp_send(b, c, ANE_H16_AFPP_SIZE, direct);
+	if (ret) {
+		dev_warn(dev, "H17 ANE: ISP link: LOAD_AFPP failed (%d)\n", ret);
+		return ret;
+	}
+	ane_fw_isp_ep_encode(b, l, c, ANE_H16_IPC_ENDPOINT_SET2);
+	ret = ane_fw_isp_send(b, c, ANE_H16_ENDPOINT_SIZE, direct);
+	if (ret) {
+		dev_warn(dev, "H17 ANE: ISP link: IPC_ENDPOINT_SET2 failed (%d)\n", ret);
+		/* Only a firmware that answered can take the unload. */
+		if (ret == -EREMOTEIO) {
+			ane_fw_isp_afpp_encode(b, c, ANE_H16_UNLOAD_AFPP);
+			ane_fw_isp_send(b, c, ANE_H16_AFPP_SIZE, direct);
+		}
+		return ret;
+	}
+	l->boots = b->fw_boots;
+	return 0;
+}
+
+static void ane_fw_isp_down(struct ane_fw_backend *b, struct ane_isp_link *l)
+{
+	struct device *dev = &b->pdev->dev;
+	u8 c[ANE_H16_AFPP_SIZE];
+	int ret;
+
+	ane_fw_isp_ep_encode(b, l, c, ANE_H16_IPC_ENDPOINT_UNSET2);
+	ret = ane_fw_isp_send(b, c, ANE_H16_ENDPOINT_SIZE, false);
+	if (ret)
+		dev_warn(dev, "H17 ANE: ISP link: IPC_ENDPOINT_UNSET2 failed (%d)\n", ret);
+	if (ret && ret != -EREMOTEIO)
+		return;
+	ane_fw_isp_afpp_encode(b, c, ANE_H16_UNLOAD_AFPP);
+	ret = ane_fw_isp_send(b, c, ANE_H16_AFPP_SIZE, false);
+	if (ret)
+		dev_warn(dev, "H17 ANE: ISP link: UNLOAD_AFPP failed (%d)\n", ret);
+}
+
+/* One range of dva_window for the ISP link, never given back. */
+static int ane_fw_isp_reserve(struct ane_fw_backend *b, struct drm_mm_node *node, u64 size)
+{
+	int ret;
+
+	mutex_lock(&b->window_lock);
+	ret = drm_mm_insert_node_in_range(&b->dva_window, node, size, SZ_16K, 0,
+					  ANE_FW_ALLOC_DVA, ANE_FW_ALLOC_DVA + ANE_FW_WINDOW,
+					  DRM_MM_INSERT_LOW);
+	mutex_unlock(&b->window_lock);
+	return ret;
+}
+
+/*
+ * The network package, once for the backend's lifetime: read-only to the
+ * engine, at a fresh address, page by page (12.4 MiB on T8142, no large
+ * contiguous allocation). Session lock held: the engine is up.
+ */
+static int ane_fw_isp_afpp_map(struct ane_fw_backend *b, struct device *isp, const char *name)
+{
+	struct device *dev = &b->pdev->dev;
+	const struct firmware *fw;
+	size_t span, off = 0;
+	void *buf;
+	u64 dva;
+	int ret;
+
+	if (b->isp_afpp_len)
+		return 0;
+	ret = request_firmware(&fw, name, isp);
+	if (ret)
+		return ret;
+	ret = -EFBIG;
+	if (!fw->size || fw->size > ANE_FW_AFPP_MAX)
+		goto release;
+	span = ALIGN(fw->size, PAGE_SIZE);
+	if (!drm_mm_node_allocated(&b->isp_afpp_node)) {
+		ret = ane_fw_isp_reserve(b, &b->isp_afpp_node, span);
+		if (ret)
+			goto release;
+	}
+	ret = -ENOSPC;
+	if (b->isp_afpp_node.size < span)
+		goto release;
+	ret = -ENOMEM;
+	buf = vzalloc(span);
+	if (!buf)
+		goto release;
+	memcpy(buf, fw->data, fw->size);
+	dva = b->isp_afpp_node.start;
+	for (off = 0; off < span; off += PAGE_SIZE) {
+		struct page *page = vmalloc_to_page(buf + off);
+		dma_addr_t pa = dma_map_page(b->memory, page, 0, PAGE_SIZE, DMA_TO_DEVICE);
+
+		if (dma_mapping_error(b->memory, pa)) {
+			ret = -ENOMEM;
+			goto unwind;
+		}
+		/* Kept for good: a bounce buffer would not stay put. */
+		if (pa != page_to_phys(page)) {
+			dma_unmap_page(b->memory, pa, PAGE_SIZE, DMA_TO_DEVICE);
+			ret = -EIO;
+			goto unwind;
+		}
+		ret = ane_fw_map(b, dva + off, pa, PAGE_SIZE, IOMMU_READ);
+		if (ret) {
+			off += PAGE_SIZE;
+			goto unwind;
+		}
+	}
+	b->isp_afpp_dva = dva;
+	b->isp_afpp_len = fw->size;
+	dev_info(dev, "H17 ANE: ISP link: %s (%zu bytes) at %#llx\n", name, fw->size, dva);
+	release_firmware(fw);
+	return 0;
+unwind:
+	if (off)
+		iommu_unmap(b->domain, dva, off);
+	while (off) {
+		off -= PAGE_SIZE;
+		dma_unmap_page(b->memory, page_to_phys(vmalloc_to_page(buf + off)), PAGE_SIZE,
+			       DMA_TO_DEVICE);
+	}
+	vfree(buf);
+release:
+	release_firmware(fw);
+	dev_warn(dev, "H17 ANE: ISP link: %s not mapped (%d)\n", name, ret);
+	return ret;
+}
+
+
+/* The ISP's ring pages at one span of ANE addresses, reserved once. */
+static int ane_fw_isp_rings_map(struct ane_fw_backend *b, const struct ane_isp_endpoint *ep)
+{
+	struct scatterlist *sg;
+	size_t total = 0;
+	ssize_t mapped;
+	unsigned int i;
+
+	for_each_sgtable_sg(ep->rings, sg, i)
+		total += sg->length;
+	if (total < 2 * (size_t)ep->ring_len || !IS_ALIGNED(total, PAGE_SIZE))
+		return -EINVAL;
+	if (!b->isp_ring_span) {
+		int ret = ane_fw_isp_reserve(b, &b->isp_ring_node, total);
+
+		if (ret)
+			return ret;
+		b->isp_ring_dva = b->isp_ring_node.start;
+		b->isp_ring_span = total;
+	} else if (total > b->isp_ring_span) {
+		return -ENOSPC;
+	}
+	if (b->isp_rings_mapped) {
+		iommu_unmap(b->domain, b->isp_ring_dva, b->isp_ring_span);
+		b->isp_rings_mapped = false;
+	}
+	mapped = iommu_map_sgtable(b->domain, b->isp_ring_dva, ep->rings,
+				   IOMMU_READ | IOMMU_WRITE);
+	if (mapped < 0)
+		return mapped;
+	b->isp_rings_mapped = true;
+	if (mapped != total)
+		return -EIO;
+	for (i = 0; i < ANE_FW_DARTS; i++)
+		if (ane_rd32(b, b->dart[i] + 0x100))
+			return -EIO;
+	return 0;
+}
+
+/*
+ * After a firmware boot (recovery or a system sleep) with the endpoint
+ * still live: what the ISP set up went with the old firmware. It is not
+ * set up again behind the ISP's back (its firmware still owns the ring
+ * state): the link is stale until the ISP's next firmware start, and the
+ * engine may park again. b->lock held, the session still asleep.
+ */
+static void ane_fw_isp_replay(struct ane_fw_backend *b)
+{
+	struct ane_isp_link *l = b->isp_link;
+
+	if (!l || !l->live)
+		return;
+	l->live = false;
+	WRITE_ONCE(b->isp_hold, false);
+	dev_warn(&b->pdev->dev, "H17 ANE: firmware booted again under a live ISP link: MLVNR off until the camera restarts\n");
+}
+
+/*
+ * The firmware's requests (SHAREDMALLOC, the terminal) while the ISP uses
+ * the engine: every 2 ms, under the session lock, never blocking on it.
+ */
+static void ane_fw_isp_service(struct work_struct *work)
+{
+	struct ane_fw_backend *b = container_of(to_delayed_work(work), struct ane_fw_backend,
+						isp_service);
+	u32 pending = 0;
+	int ret;
+
+	/* Never the one to wake a parked engine. */
+	if (!READ_ONCE(b->isp_hold) || READ_ONCE(b->parked))
+		return;
+	if (ane_h16_session_enter(&b->session, true))
+		goto again;
+	if (!READ_ONCE(b->isp_hold)) {
+		mutex_unlock(b->session.lock);
+		return;
+	}
+	ret = ane_h16_session_serve(&b->session, &pending, NSEC_PER_MSEC);
+	if (pending & ~b->isp_bits) {
+		b->isp_bits |= pending;
+		dev_info(&b->pdev->dev, "H17 ANE: ISP link: firmware rang %#x (seen %#x)\n",
+			 pending, b->isp_bits);
+	}
+	if (ret > 0)
+		b->isp_served += ret;
+	mutex_unlock(b->session.lock);
+	if (ret == -EAGAIN)
+		goto again;
+	if (ret < 0) {
+		dev_err(&b->pdev->dev, "H17 ANE: ISP link: serving the firmware failed (%d)\n", ret);
+		return;
+	}
+again:
+	queue_delayed_work(system_dfl_wq, &b->isp_service, msecs_to_jiffies(2));
+}
+
+struct ane_isp_link *ane_isp_link_get(struct device *isp_dev, struct device_node *ane_np)
+{
+	struct ane_fw_backend *b = READ_ONCE(ane_backend);
+	struct ane_isp_link *l;
+
+	if (!isp_dev)
+		return ERR_PTR(-EINVAL);
+	if (!b || !b->pdev || !READ_ONCE(b->session.lock))
+		return ERR_PTR(-EPROBE_DEFER);
+	if (ane_np && ane_np != b->pdev->dev.of_node)
+		return ERR_PTR(-ENODEV);
+	l = kzalloc_obj(*l);
+	if (!l)
+		return ERR_PTR(-ENOMEM);
+	guard(mutex)(&b->lock);
+	if (b->isp_link) {
+		kfree(l);
+		return ERR_PTR(-EBUSY);
+	}
+	l->b = b;
+	l->isp = get_device(isp_dev);
+	b->isp_link = l;
+	return l;
+}
+EXPORT_SYMBOL_GPL(ane_isp_link_get);
+
+/*
+ * Never blocks on a system sleep (-EAGAIN: the ISP streams without MLVNR).
+ * A parked engine is booted. The engine stays up until the disable.
+ */
+int ane_isp_endpoint_enable(struct ane_isp_link *l, const char *afpp, struct ane_isp_endpoint *ep)
+{
+	struct ane_fw_backend *b;
+	struct device *dev;
+	int ret;
+
+	if (IS_ERR_OR_NULL(l) || !afpp || !ep || !ep->rings || !ep->ring_len ||
+	    !IS_ALIGNED(ep->ring_len, PAGE_SIZE) || !ep->isp_doorbell || !ep->isp_doorbell_sel)
+		return -EINVAL;
+	if (!READ_ONCE(isp_link))
+		return -EOPNOTSUPP;
+	b = l->b;
+	dev = &b->pdev->dev;
+	if (l->live)
+		ane_isp_endpoint_disable(l);
+	ret = ane_h16_session_enter(&b->session, true);
+	if (ret)
+		return ret;
+	/* The session lock is held from here. */
+	ret = ane_fw_isp_afpp_map(b, l->isp, afpp);
+	if (ret)
+		goto out;
+	ret = ane_fw_isp_rings_map(b, ep);
+	if (ret) {
+		dev_warn(dev, "H17 ANE: ISP link: rings not mapped (%d)\n", ret);
+		goto unmap;
+	}
+	l->ep = *ep;
+	WRITE_ONCE(b->isp_hold, true);
+	ret = ane_fw_isp_up(b, l, false);
+	if (ret) {
+		WRITE_ONCE(b->isp_hold, false);
+		goto unmap;
+	}
+	ep->ane_doorbell = b->window[0].pa + ANE_FW_ISP_DOORBELL;
+	ep->ane_doorbell_sel = ANE_FW_ISP_DOORBELL_SEL;
+	l->ep = *ep;
+	l->live = true;
+	dev_info(dev, "H17 ANE: ISP link up: network %#llx+%#llx; ring A (ISP write) %#llx, ring B (ISP read) %#llx, %#x each; ISP doorbell %#llx/%#x; ANE doorbell %#llx/%u\n",
+		 b->isp_afpp_dva, b->isp_afpp_len, b->isp_ring_dva + ep->ring_len,
+		 b->isp_ring_dva, ep->ring_len, ep->isp_doorbell, ep->isp_doorbell_sel,
+		 ep->ane_doorbell, ep->ane_doorbell_sel);
+	b->isp_served = 0;
+	queue_delayed_work(system_dfl_wq, &b->isp_service, msecs_to_jiffies(2));
+	goto out;
+unmap:
+	/* The ISP frees these pages next: not one more access through the DART. */
+	if (b->isp_rings_mapped) {
+		iommu_unmap(b->domain, b->isp_ring_dva, b->isp_ring_span);
+		b->isp_rings_mapped = false;
+	}
+out:
+	mutex_unlock(b->session.lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ane_isp_endpoint_enable);
+
+/*
+ * Before the ISP firmware stops and its rings go. Never boots or blocks on
+ * the engine: when it is parked or asleep, the firmware that had the
+ * endpoint is gone and only the bookkeeping is left.
+ */
+void ane_isp_endpoint_disable(struct ane_isp_link *l)
+{
+	struct ane_fw_backend *b;
+
+	if (IS_ERR_OR_NULL(l) || !l->live)
+		return;
+	b = l->b;
+	if (!READ_ONCE(b->parked) && !ane_h16_session_enter(&b->session, true)) {
+		if (READ_ONCE(isp_fwlog))
+			ane_h16_session_dump_fwlog(&b->session);
+		if (l->boots == b->fw_boots && !b->session.quarantined)
+			ane_fw_isp_down(b, l);
+		if (b->isp_rings_mapped) {
+			iommu_unmap(b->domain, b->isp_ring_dva, b->isp_ring_span);
+			b->isp_rings_mapped = false;
+		}
+		l->live = false;
+		WRITE_ONCE(b->isp_hold, false);
+		mutex_unlock(b->session.lock);
+		cancel_delayed_work_sync(&b->isp_service);
+		dev_info(&b->pdev->dev, "H17 ANE: ISP link down: %llu firmware requests served, doorbell bits seen %#x\n",
+			 b->isp_served, b->isp_bits);
+		return;
+	}
+	/* The DARTs may be off: the stale ring mapping goes at the next enable. */
+	scoped_guard(mutex, &b->lock) {
+		l->live = false;
+		WRITE_ONCE(b->isp_hold, false);
+	}
+	cancel_delayed_work_sync(&b->isp_service);
+	dev_info(&b->pdev->dev, "H17 ANE: ISP link down (engine off)\n");
+}
+EXPORT_SYMBOL_GPL(ane_isp_endpoint_disable);
+
+void ane_isp_link_put(struct ane_isp_link *l)
+{
+	struct ane_fw_backend *b;
+
+	if (IS_ERR_OR_NULL(l))
+		return;
+	b = l->b;
+	ane_isp_endpoint_disable(l);
+	scoped_guard(mutex, &b->lock)
+		b->isp_link = NULL;
+	put_device(l->isp);
+	kfree(l);
+}
+EXPORT_SYMBOL_GPL(ane_isp_link_put);
 
 /*
  * After startup: the shared program session and its ABI 3 node. From here on
@@ -2550,6 +3049,7 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 	}
 	dev_info(&pdev->dev, "H17 ANE: loader hand-off verified; starting the engine\n");
 	INIT_WORK(&b->start, ane_fw_start_work);
+	INIT_DELAYED_WORK(&b->isp_service, ane_fw_isp_service);
 	return 0;
 fail:
 	ane_fw_observer_free(b);
