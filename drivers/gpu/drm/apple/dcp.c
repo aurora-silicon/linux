@@ -2282,6 +2282,10 @@ static unsigned long dcp_dptx_wait_linkcfg(struct apple_dcp *dcp, u32 port,
 		return wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
 						   timeout);
 	for (;;) {
+		if (dcp_tb_tunnel_withdrawn(dcp, port)) {
+			*withdrawn = true;
+			return 0;
+		}
 		left = (long)(deadline - jiffies);
 		if (left <= 0)
 			return 0;
@@ -2289,10 +2293,6 @@ static unsigned long dcp_dptx_wait_linkcfg(struct apple_dcp *dcp, u32 port,
 						min_t(unsigned long, left,
 						      msecs_to_jiffies(DCP_LINKCFG_POLL_MS))))
 			return max_t(long, (long)(deadline - jiffies), 1);
-		if (dcp_tb_tunnel_withdrawn(dcp, port)) {
-			*withdrawn = true;
-			return 0;
-		}
 	}
 }
 
@@ -2304,6 +2304,8 @@ static unsigned long dcp_dptx_wait_linkcfg(struct apple_dcp *dcp, u32 port,
  * With a @session, every step checks that it is still the live one, and a
  * revoked session returns -ESTALE without touching the new one's state.
  */
+static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port);
+
 static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable,
 				const struct dcp_fabric_session *session, bool cable,
 				bool recovery)
@@ -2311,7 +2313,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	/* T8122 dcpext: HPD only after the link wait, see dcp_ext_dptx_607() */
 	bool late_hpd = dcp_ext_dptx_607(dcp);
 	bool t8132 = dcp_is_t8132_ext(dcp);
-	bool compact, withdrawn;
+	bool compact, withdrawn = false;
 	unsigned long timeout;
 	u64 generation;
 	u8 dfp_port;
@@ -2374,8 +2376,19 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_unlock;
 	}
 
-	if (dcp->dptxport[port].connected)
-		goto out_unlock;
+	if (dcp->dptxport[port].connected) {
+		if (!dcp_is_typec_output(dcp) ||
+		    generation <= dcp->dptxport[port].connected_generation) {
+			dev_dbg(dcp->dev, "DPTX port %u already connected for this attachment\n",
+				port);
+			goto out_unlock;
+		}
+		dev_info(dcp->dev,
+			 "connect while still connected, dropping stale display\n");
+		ret = dcp_dptx_release_locked(dcp, port);
+		if (ret)
+			goto out_unlock;
+	}
 	if (dcp->external)
 		smp_store_release(&dcp->external_link_ready, false);
 
@@ -2437,6 +2450,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_release;
 	}
 	dcp->dptxport[port].connected = true;
+	dcp->dptxport[port].connected_generation = generation;
 	if (dcp_is_typec_output(dcp) && !late_hpd) {
 		if (dcp_uses_t6020_tunnel_flow(dcp))
 			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
@@ -2547,6 +2561,20 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 
 out_withdraw:
 	mutex_lock(&dcp->hpd_mutex);
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery) ||
+	    dcp->typec_generation != generation) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
+	if (withdrawn && !dcp_is_external_h17p(dcp)) {
+		if (dptx_service_available(&dcp->dptxport[port]))
+			dptxport_set_hpd(dcp->dptxport[port].service, false);
+		err = dcp_dptx_release_locked(dcp, port);
+		if (err)
+			dev_warn(dcp->dev, "DPTX port %u tunnel withdrawal release failed: %d\n",
+				 port, err);
+		goto out_unlock;
+	}
 	/*
 	 * A T8132 dcpext's release lowers only the HPD of a connected port, so
 	 * a withdrawn one lowers its HPD here.
@@ -2755,8 +2783,6 @@ void dcp_external_ready(struct apple_dcp *dcp)
 }
 
 #define DCP_EXTERNAL_RETRIES	3
-
-static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port);
 
 /*
  * Bounded recovery for a native external pipe: re-apply the display mode,
@@ -3585,6 +3611,13 @@ static void dcp_typec_attach_locked(struct apple_dcp *dcp)
 		atomic_set(&dcp->external_retries, 0);
 		cancel_delayed_work(&dcp->external_retry_wq);
 	}
+}
+
+void dcp_typec_attach_reconnect(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp->hpd_mutex);
+	dcp_typec_attach_locked(dcp);
+	dcp_queue_typec_reconnect_locked(dcp, 0);
 }
 
 /* Connect the link of an attached display, retrying later if that fails. */
