@@ -437,6 +437,7 @@
 				<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>;
 		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 		iommus = <&dart_ave0 0>, <&dart_ave1 0>;
+		clocks = <&peripheral_clocks 430>;
 		status = "disabled";
 	};
 

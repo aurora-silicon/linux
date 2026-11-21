@@ -110,12 +110,41 @@ const struct ave_variant ave_t6041 = {
 };
 
 /*
- * The M4 (T8132) with the macOS 27.2 (26B123) stub, as on the MacBook Air
- * (J713): the bootloader preloads TEXT 0x154000 and DATA 0x12c000, TEXT CRC
- * 99fc929a, the same on every boot. The coprocessor and its start are the
- * M4 Pro's; this build boots as device 23 and takes handshake type 23.
+ * The M3 (T8122) with the macOS 27.2 (26B123) stub, as on the MacBook Air
+ * (J615): the bootloader preloads TEXT 0x134000 and DATA 0x128000, TEXT CRC
+ * 918d70d3, the same on every boot. The coprocessor registers and their start
+ * are the M2's; the firmware is the 27.2 build of the M4 generation, so it
+ * takes the boot configuration handshake, as device 17 with handshake type 17,
+ * and speaks the 26B123 command layout. Its codec clocks stay gated until the
+ * mailbox idle word is cleared, and the bootloader's code base (marked valid)
+ * is left as it is. DATA is restored from the boot snapshot before every start.
  */
-static const struct ave_variant ave_t8132 = {
+static const struct ave_variant ave_t8122 = {
+	.regs = &ave_coproc_6070,
+	.fw_text_size = 0x134000,
+	.fw_data_size = 0x128000,
+	.boot_device_id = 17,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1,
+	.vcbar_mask = GENMASK_ULL(41, 11),
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
+	.device_type = 17,
+	.lfs_ref_scale = 2,
+	.text_crc = AVE_FW_TEXT_CRC_T8122_26B123,
+	.mbox_idle = 0x38,
+	.restore_data_first = true,
+	.boot_qualified = true,
+};
+
+/*
+ * The M4 (T8132) with the macOS 27.2 (26B123) stub: the bootloader preloads
+ * TEXT 0x154000 and DATA 0x12c000, TEXT CRC 99fc929a with the per-boot word
+ * at 0x4224 zeroed. Some loaders leave that word zero (the MacBook Air, J713),
+ * others set it on every boot (the Mac mini, J773g, raw CRC f641c64b), so an
+ * unknown CRC is retried with it zeroed. The coprocessor and its start are
+ * the M4 Pro's; this build boots as device 23 and takes handshake type 23.
+ */
+const struct ave_variant ave_t8132 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x154000,
 	.fw_data_size = 0x12c000,
@@ -127,6 +156,7 @@ static const struct ave_variant ave_t8132 = {
 	.device_type = 23,
 	.lfs_ref_scale = 2,
 	.text_crc = AVE_FW_TEXT_CRC_T8132_26B123,
+	.text_boot_word = 0x4224,
 	.boot_qualified = true,
 };
 
@@ -181,10 +211,10 @@ static const struct ave_variant ave_t6050 = {
 
 /*
  * The M5 (T8142) with the macOS 27.0 stub runs the 26A428 build of the
- * firmware compiled for its chip (AppleAVE2FW_H17G, 9013.45.1, the version
+ * firmware compiled for its chip (9013.45.1, the version
  * T6050 runs): TEXT 0x154000 and DATA 0x12c000, TEXT CRC 8a3784bd.
  *
- * The chip identity comes from AppleAVE2's soc-id table (ADT ave soc-id
+ * The chip identity comes from the ADT (ave soc-id
  * "t8142"): device 27, generation 16. The 26A428 firmware carries the same
  * device table, and on T6050 (device 28 in both) the traced boot
  * configuration and handshake both name that number. Generation 16 shares
@@ -205,6 +235,21 @@ static const struct ave_variant ave_t8142 = {
 	.text_crc = AVE_FW_TEXT_CRC_T8142_26A428,
 	.mbox_idle = 0x118,
 	.boot_qualified = true,
+};
+
+/*
+ * The M3 generation (T8122, T6030, T6031, and both dies of T6032) has the
+ * T8112 encoder's register windows, interrupt order and power states, but
+ * iBoot preloads a firmware build of its own: on a J615 under macOS 27.2 the
+ * ADT segment-ranges give TEXT 0x134000 and DATA 0x128000, which is none of
+ * the builds above. Its boot sequence, device numbers and command layout are
+ * not known yet, so the encoder is probe-only: the driver checks the
+ * bootloader's firmware handoff and reports the build's CRCs, and refuses to
+ * start the coprocessor or encode. No segment sizes are pinned, as the M3
+ * Pro, Max and Ultra builds have not been seen.
+ */
+const struct ave_variant ave_m3 = {
+	.lfs_ref_scale = 1,
 };
 
 /*
@@ -638,9 +683,13 @@ static const struct dev_pm_ops ave_pm_ops = {
 
 static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6000-ave", .data = &ave_t6000 },
+	{ .compatible = "apple,t6030-ave", .data = &ave_m3 },
+	{ .compatible = "apple,t6031-ave", .data = &ave_m3 },
+	{ .compatible = "apple,t6032-ave", .data = &ave_m3 },
 	{ .compatible = "apple,t6041-ave", .data = &ave_t6041 },
 	{ .compatible = "apple,t6050-ave", .data = &ave_t6050 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
+	{ .compatible = "apple,t8122-ave", .data = &ave_t8122 },
 	{ .compatible = "apple,t8132-ave", .data = &ave_t8132 },
 	{ .compatible = "apple,t8140-ave", .data = &ave_t8140 },
 	{ .compatible = "apple,t8142-ave", .data = &ave_t8142 },

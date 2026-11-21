@@ -554,6 +554,7 @@ const struct ave_fw_layout ave_layout_26b123 = {
 	.name = "26B123",
 	.bytes = { { 0x3b40, 0x6e08 }, { 0x13ee0, 0x78c8 } },
 	AVE_LAYOUT_26A428_FIELDS
+	.any_gop = true,
 };
 
 /*
@@ -981,7 +982,7 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 		return &ave_layout_6070_11_1;
 	/*
 	 * The macOS 27.0 build for the M5 Pro and Max, and the M5's build of the
-	 * same firmware version (9013.45.1): one AppleAVE2 kext builds the
+	 * same firmware version (9013.45.1): one macOS driver builds the
 	 * commands for both.
 	 */
 	if (crc == AVE_FW_TEXT_CRC_T6050_26A428 ||
@@ -993,7 +994,8 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 	 */
 	if (crc == AVE_FW_TEXT_CRC_T6050_26C5035)
 		return &ave_layout_26a428;
-	if (crc == AVE_FW_TEXT_CRC_T8132_26B123)
+	if (crc == AVE_FW_TEXT_CRC_T8132_26B123 ||
+	    crc == AVE_FW_TEXT_CRC_T8122_26B123)
 		return &ave_layout_26b123;
 	return NULL;
 }
