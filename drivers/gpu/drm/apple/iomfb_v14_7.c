@@ -141,6 +141,31 @@ static const struct dcp_v14_board dcp_v14_board_j615 = {
 };
 
 /*
+ * J504 (MacBook Pro 14", M3): the J613 DCP image on the same T8122 DCP (the
+ * J504 ADT names it), driving the 14" mini-LED panel of the J514S: 3024x1964
+ * with 74 notch rows above the 3024x1890 boot framebuffer, at 60 or 120 Hz.
+ * The colour matrix methods are this image's, and so is the panel level
+ * block the J613 qualified (brightness in nits, 500 at most here). Its swaps
+ * keep zero timestamps as on the Airs. Every panel timing and the
+ * display clock are logged for the first boots.
+ */
+static const struct dcp_v14_board dcp_v14_board_j504 = {
+	.name = "J504",
+	.debugfs = "dcp-j504",
+	.dcp_compatible = "apple,t8122-dcp",
+	.machine = "apple,j504",
+	.firmware_uuid = DCP_V14_J613_FIRMWARE_UUID,
+	.handoff = "apple,t8122-handoff",
+	.panel_width = 3024,
+	.panel_height = 1964,
+	.promotion = true,
+	.log_bringup = true,
+	.panel_nits = true,
+	.ctm_set = A(421),
+	.ctm_get = A(420),
+};
+
+/*
  * J516C (MacBook Pro 16", M3 Max): the J516S panel, 3456x2234 with 74 notch
  * rows above the 3456x2160 boot framebuffer, at 60 or 120 Hz, on the T6031
  * DCP, running this Mac's own 14.7 DCP image (the J516C ADT names it). The
@@ -169,6 +194,27 @@ static const struct dcp_v14_board dcp_v14_board_j516c = {
 	 * at most), as the e272b67 path on this J516C presented it.
 	 */
 	.panel_nits = true,
+	.base_edid = true,
+};
+
+/* J516M uses the J516C image; its first boot offered only a 120 Hz panel timing. */
+static const struct dcp_v14_board dcp_v14_board_j516m = {
+	.name = "J516M",
+	.debugfs = "dcp-j516m",
+	.dcp_compatible = "apple,t6031-dcp",
+	.machine = "apple,j516m",
+	.soc = "apple,t6034",
+	.firmware_uuid = DCP_V14_J516C_FIRMWARE_UUID,
+	.handoff = "apple,t6031-handoff",
+	.panel_width = 3456,
+	.panel_height = 2234,
+	.promotion = true,
+	.log_bringup = true,
+	.base_edid = true,
+	/* Same pinned DCP image as J516C: zero stamps cap this panel at 60 fps. */
+	.swap_timestamps = true,
+	/* J516C's 14.7 image uses the bounded nits block for the J516 panel. */
+	.panel_nits = true,
 };
 
 /*
@@ -189,12 +235,28 @@ static const struct dcp_v14_board dcp_v14_board_j514c = {
 	.log_bringup = true,
 };
 
+/* J514M's 14.7 DCP image and panel geometry; the root SoC is required too. */
+static const struct dcp_v14_board dcp_v14_board_j514m = {
+	.name = "J514M",
+	.debugfs = "dcp-j514m",
+	.dcp_compatible = "apple,t6034-dcp",
+	.machine = "apple,j514m",
+	.soc = "apple,t6034",
+	.firmware_uuid = DCP_V14_J516C_FIRMWARE_UUID,
+	.handoff = "apple,t6034-handoff",
+	.promotion = true,
+	.log_bringup = true,
+};
+
 static const struct dcp_v14_board *const dcp_v14_boards[] = {
 	&dcp_v14_board_t6030,
 	&dcp_v14_board_j613,
 	&dcp_v14_board_j615,
+	&dcp_v14_board_j504,
 	&dcp_v14_board_j516c,
 	&dcp_v14_board_j514c,
+	&dcp_v14_board_j514m,
+	&dcp_v14_board_j516m,
 };
 
 struct dcp_v14_property {
@@ -324,7 +386,7 @@ static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_siz
 
 static void dcp_v14_backlight_work(struct work_struct *work);
 
-/* The internal panel of a board whose swap level block was validated (T6030). */
+/* The internal panel of a board admitted to the bounded swap level path. */
 static bool dcp_v14_board_nits(const struct apple_dcp_v14 *v14)
 {
 	return !v14->external && v14->panel_nits && v14->board && v14->board->panel_nits;
@@ -1651,7 +1713,8 @@ const struct dcp_v14_board *dcp_v14_board_select(dcp_v14_compat_fn dcp_is,
 		if (!dcp_is(ctx, board->dcp_compatible))
 			continue;
 		*dcp_known = true;
-		if (board->machine && !machine_is(ctx, board->machine))
+		if ((board->machine && !machine_is(ctx, board->machine)) ||
+		    (board->soc && !machine_is(ctx, board->soc)))
 			continue;
 		return board;
 	}
@@ -1694,7 +1757,8 @@ static bool dcp_v14_panel_nits_admit(const struct dcp_v14_board *board,
 {
 	return board && board->panel_nits &&
 		(machine_is(ctx, "apple,j514s") || machine_is(ctx, "apple,j516s") ||
-		 machine_is(ctx, "apple,j516c") || machine_is(ctx, "apple,j613"));
+		 machine_is(ctx, "apple,j516c") || machine_is(ctx, "apple,j613") ||
+		 machine_is(ctx, "apple,j504") || machine_is(ctx, "apple,j516m"));
 }
 
 const char *iomfb_v14_7_board_name(const struct dcp_v14_board *board)
@@ -1705,6 +1769,11 @@ const char *iomfb_v14_7_board_name(const struct dcp_v14_board *board)
 bool dcp_v14_board_stamps_swaps(const struct dcp_v14_board *board, bool external)
 {
 	return board && !external && board->swap_timestamps;
+}
+
+bool iomfb_v14_7_base_edid(const struct apple_dcp *dcp)
+{
+	return dcp->v14 && dcp->v14->board && dcp->v14->board->base_edid;
 }
 
 int iomfb_v14_7_probe(struct apple_dcp *dcp)

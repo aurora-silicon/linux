@@ -139,7 +139,7 @@ impl Config {
 }
 
 /// OF match table of the G15 platform driver.
-const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
+const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 3> =
     kernel::device_id::IdArray::new([
         (
             of::DeviceId::new(c_str!("apple,agx-t6030")),
@@ -148,6 +148,10 @@ const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
         (
             of::DeviceId::new(c_str!("apple,agx-t6031")),
             &&hw::t6031::CONFIG,
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6034")),
+            &&hw::t6034::CONFIG,
         ),
     ]);
 
@@ -159,6 +163,7 @@ kernel::of_device_table!(
     [
         of::DeviceId::new(c_str!("apple,agx-t6030")),
         of::DeviceId::new(c_str!("apple,agx-t6031")),
+        of::DeviceId::new(c_str!("apple,agx-t6034")),
     ]
 );
 
@@ -202,10 +207,18 @@ impl platform::Driver for Driver<'_> {
         // after probe_g15 started firmware would return an unbound device.
         try_pin_init!(Driver {
             _driver: {
+                // Not EPROBE_DEFER: a deferred device stays listed in devices_deferred until the
+                // deferred-probe work runs, even after activate()'s probe fails for good. Activation
+                // reprobes every unbound device; a device added later sees MODULE_READY set.
                 if !MODULE_READY.load(Ordering::Acquire) {
-                    return Err(EPROBE_DEFER);
+                    return Err(ENODEV);
                 }
                 let cfg = *info.ok_or(ENODEV)?;
+                let cfg = if cfg.chip_id == 0x6034 && boot::glue::machine(c_str!("apple,j516m")) {
+                    &hw::j516m::CONFIG
+                } else {
+                    cfg
+                };
                 dev_info!(pdev.as_ref(), "G15: probing ({})\n", cfg.name);
                 match crate::driver::AsahiPlatformDriver::probe_g15(pdev, cfg) {
                     Ok(driver) => Some(driver),
