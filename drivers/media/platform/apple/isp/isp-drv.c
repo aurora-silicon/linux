@@ -646,13 +646,14 @@ module_param(presets_full, bool, 0444);
 MODULE_PARM_DESC(presets_full, "TEST: same as sensor_config=7 (default: false)");
 
 /*
- * Default 9: on the J815 A/B of 2026-11-21 (1920x1080, frame-to-frame noise)
- * config 6 had 2.4x the centre luma noise of the binned modes without
- * Apple's ANE denoiser (MLVNR), and 9 + HR matched 8 with highlight recovery.
+ * Default 8 (the DT): on the J815 A/B of 2026-11-21 (1920x1080, frame-to-
+ * frame centre luma noise) config 8 had 1.29, 9 + HR 1.52 (brighter, with
+ * highlight recovery) and 6/7 about 3.0: full resolution needs Apple's ANE
+ * denoiser (MLVNR), which Linux does not run yet.
  */
-static int sensor_config = 9;
+static int sensor_config = 8;
 module_param(sensor_config, int, 0444);
-MODULE_PARM_DESC(sensor_config, "TEST: IMX958 sensor mode for the binned DT presets: 9 = binned + SIFR (default), 6 = full res + SIFR (macOS), 7 = full res, 8/0 = binned (DT)");
+MODULE_PARM_DESC(sensor_config, "TEST: IMX958 sensor mode for the binned DT presets: 8/0 = binned (DT, default), 9 = binned + SIFR, 6 = full res + SIFR (macOS), 7 = full res");
 
 /*
  * The IMX958's ultra-wide lens draws an image circle smaller than the
@@ -714,7 +715,7 @@ static void isp_preset_fit_lens(struct device *dev, struct isp_preset *p)
 	nh = round_down(h * lo / 1024, 2);
 	if (nw < 64 || nh < 64)
 		return;
-	dev_dbg(dev, "%ux%u preset: crop %ux%u+%u+%u -> %ux%u (lens circle)\n",
+	dev_info(dev, "%ux%u preset: crop %ux%u+%u+%u -> %ux%u (inside the lens circle)\n",
 		p->output_dim.x, p->output_dim.y, w, h, p->crop_offset.x,
 		p->crop_offset.y, nw, nh);
 	p->crop_offset.x = round_down(p->crop_offset.x + (w - nw) / 2, 2);
