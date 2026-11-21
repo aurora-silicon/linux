@@ -410,6 +410,58 @@ pub mod g16 {
         assert_eq!(sync::Arc::strong_count(&a),2);
     }
 
+    #[test]fn standby_pool_reuses_epochs_at_depth_16_and_drains_on_close(){
+        // Models Cache's Standby invariant: epochs.len() >= reserved while open or draining.
+        let one=vm(1);let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
+        let mut epochs:Vec<sync::Arc<g16::pools::PbEpoch>>=Vec::new();
+        let mut reserved:u32=0;
+        let mut allocs:u32=0;
+        let prepare=|n:u32,epochs:&mut Vec<sync::Arc<g16::pools::PbEpoch>>,reserved:&mut u32,allocs:&mut u32|{
+            let deficit=reserved.checked_add(n).unwrap().saturating_sub(epochs.len() as u32);
+            if deficit!=0 {
+                let mut res=g16::budget::Budget::reserve(&budget,deficit).unwrap();
+                for _ in 0..deficit {
+                    epochs.push(g16::pools::PbEpoch::new(&factory,&one,res.take().unwrap()).unwrap());
+                    *allocs+=1;
+                }
+            }
+            *reserved+=n;
+            assert!(epochs.len()>=*reserved as usize);
+        };
+        // Ramp to depth 16: allocates 16 standby epochs once.
+        for _ in 0..16 { prepare(1,&mut epochs,&mut reserved,&mut allocs); }
+        assert_eq!((allocs,epochs.len(),reserved),(16,16,16));
+        // Steady-state d=16 with PB reuse: 64 more submits allocate zero new epochs.
+        for _ in 0..64 {
+            reserved-=1; // previous render committed with reused PB
+            prepare(1,&mut epochs,&mut reserved,&mut allocs);
+        }
+        assert_eq!((allocs,epochs.len(),reserved),(16,16,16));
+        // One fresh InitBM consumes 1 standby epoch and commits 1 reservation; next submit refills 1.
+        let fresh=epochs.pop().unwrap();
+        assert!(fresh.unexposed());
+        fresh.prepare(0,0x70c0000000,2048).unwrap();
+        fresh.expose();
+        reserved-=1;
+        assert_eq!((epochs.len(),reserved),(15,15));
+        prepare(1,&mut epochs,&mut reserved,&mut allocs);
+        assert_eq!((allocs,epochs.len(),reserved),(17,16,16));
+        // Unpublished rollback returns the unexposed epoch without losing capacity.
+        let rolled=epochs.pop().unwrap();
+        assert!(rolled.unexposed());
+        epochs.push(rolled);
+        assert_eq!(epochs.len(),16);
+        // Closing trims surplus immediately while preserving reserved epochs until jobs finish.
+        reserved=2;
+        epochs.truncate(reserved as usize);
+        assert_eq!(epochs.len(),2);
+        reserved=0;
+        epochs.truncate(reserved as usize);
+        assert!(epochs.is_empty());
+        drop(fresh);
+        assert_eq!(sync::Arc::strong_count(&one),1);
+    }
+
 }
 '''
 budget=(production/'budget.rs').read_text()

@@ -13,17 +13,19 @@ use super::{
     vm::VmState,
 };
 use crate::mmu;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel::{
-    new_mutex, new_spinlock,
+    new_condvar, new_mutex, new_spinlock_irq,
     prelude::*,
-    sync::{Arc, Mutex, SpinLock},
+    sync::{Arc, CondVar, CondVarTimeoutResult, Mutex, SpinLockIrq},
 };
 
-/// Never-exposed PB epochs a VM keeps for its next renders. With PB epoch reuse most
-/// renders never expose the epoch prepared for them; allocating and mapping a fresh one per
-/// render submit costs far more than the render itself.
-const SPARE_EPOCHS: usize = 4;
+/// Never-exposed PB epochs an open VM keeps on standby after bursts drain.
+///
+/// With PB epoch reuse most renders never expose a fresh epoch; keeping a
+/// shared per-VM standby pool instead of attaching one epoch per queued job
+/// avoids allocating and mapping fresh epochs whenever submission depth rises.
+const SPARE_EPOCHS: usize = 32;
 
 pub(crate) struct ComputeArena(crate::cleanup::Deferred<ComputeInner>);
 impl core::ops::Deref for ComputeArena {
@@ -141,15 +143,27 @@ struct Ready {
     last_compute_ns: u64,
     burst: u32,
 }
+struct Standby {
+    /// Never-exposed epochs kept on standby for this VM's queued renders.
+    /// Invariant: while open or while `reserved > 0`, `epochs.len() >= reserved as usize`.
+    epochs: KVec<Arc<PbEpoch>>,
+    /// Accepted, not-yet-published render commands of this VM.
+    reserved: u32,
+}
+
 #[pin_data]
 pub(crate) struct Cache {
     #[pin]
     ready: Mutex<Ready>,
-    /// Never-exposed epochs returned by retired jobs (at most [`SPARE_EPOCHS`]). Each holds
-    /// the VM, which holds this cache: [`Self::close`] breaks that cycle.
+    /// Shared per-VM standby pool of never-exposed PB epochs. Each holds the VM, which
+    /// holds this cache: [`Self::close`] drains surplus epochs immediately and the remaining
+    /// reserved epochs as accepted renders finish.
     #[pin]
-    spares: SpinLock<KVec<Arc<PbEpoch>>>,
-    /// The VM's client closed: no arena or spare is kept here any more.
+    standby: SpinLockIrq<Standby>,
+    /// Wakes `SUBMIT` callers waiting for standby reservation headroom.
+    #[pin]
+    standby_available: CondVar,
+    /// The VM's client closed: no arena or surplus spare is kept here any more.
     closed: AtomicBool,
     pub(crate) factory: Factory,
     bind: mmu::VmBind,
@@ -163,34 +177,120 @@ impl Cache {
         live: Arc<super::vm::LiveToken>,
     ) -> Result<Arc<Self>> {
         let budget = super::budget::Budget::new()?;
-        let spares = KVec::with_capacity(SPARE_EPOCHS, GFP_KERNEL)?;
+        let epochs = KVec::with_capacity(super::budget::LIMIT as usize, GFP_KERNEL)?;
         Arc::pin_init(
             pin_init!(Self { ready <- new_mutex!(Ready::default(), "g16::resources"),
-            spares <- new_spinlock!(spares, "g16::spare_epochs"),
+            standby <- new_spinlock_irq!(Standby { epochs, reserved: 0 }, "g16::spare_epochs"),
+            standby_available <- new_condvar!(),
             closed: AtomicBool::new(false),
             factory, bind, live, budget }),
             GFP_KERNEL,
         )
     }
-    /// Returns a retired job's never-exposed epoch for the next renders. Any context.
-    fn give_back(&self, epoch: Arc<PbEpoch>) {
-        let mut spares = self.spares.lock();
-        // Without room, or once the client closed, the epoch drops: its deferred cleanup
-        // unmaps it as before.
-        if !self.closed.load(Ordering::Acquire) {
-            let _ = spares.push_within_capacity(epoch);
+
+    /// Pops one never-exposed standby epoch for a fresh InitBM publication.
+    fn take_standby(&self) -> Result<Arc<PbEpoch>> {
+        let mut standby = self.standby.lock();
+        while let Some(epoch) = standby.epochs.pop() {
+            if epoch.unexposed() {
+                return Ok(epoch);
+            }
         }
+        Err(EINVAL)
     }
 
-    /// The VM's client closed. Lets go of the arenas and spare epochs: what jobs and the
-    /// hardware slots' last-owner leases still need, they hold themselves.
-    pub(crate) fn close(&self) {
-        let spares = {
-            let mut spares = self.spares.lock();
-            self.closed.store(true, Ordering::Release);
-            core::mem::take(&mut *spares)
+    /// Returns a never-exposed epoch whose publication was deferred or failed before visibility.
+    fn return_standby(&self, epoch: Arc<PbEpoch>) {
+        if !epoch.unexposed() {
+            return;
+        }
+        let overflow = {
+            let mut standby = self.standby.lock();
+            let keep = if self.closed.load(Ordering::Acquire) {
+                standby.reserved as usize
+            } else {
+                super::budget::LIMIT as usize
+            };
+            if standby.epochs.len() < keep {
+                standby.epochs.push_within_capacity(epoch).err().map(|e| e.0)
+            } else {
+                Some(epoch)
+            }
         };
-        drop(spares);
+        drop(overflow);
+    }
+
+    /// Releases `count` reserved render credits and trims any surplus standby epochs outside
+    /// the spinlock (each `PbEpoch` defers its own unmap, so dropping here never sleeps).
+    fn release_reserved(&self, count: u32) {
+        if count == 0 {
+            return;
+        }
+        loop {
+            let excess = {
+                let mut standby = self.standby.lock();
+                standby.reserved = standby.reserved.saturating_sub(count);
+                let keep = if self.closed.load(Ordering::Acquire) {
+                    standby.reserved as usize
+                } else {
+                    (standby.reserved as usize).max(SPARE_EPOCHS)
+                };
+                if standby.epochs.len() > keep {
+                    standby.epochs.pop()
+                } else {
+                    None
+                }
+            };
+            if excess.is_none() {
+                break;
+            }
+            drop(excess);
+            // Subsequent iterations only trim remaining surplus; count was already subtracted.
+            loop {
+                let more = {
+                    let mut standby = self.standby.lock();
+                    let keep = if self.closed.load(Ordering::Acquire) {
+                        standby.reserved as usize
+                    } else {
+                        (standby.reserved as usize).max(SPARE_EPOCHS)
+                    };
+                    if standby.epochs.len() > keep {
+                        standby.epochs.pop()
+                    } else {
+                        None
+                    }
+                };
+                if more.is_none() {
+                    break;
+                }
+                drop(more);
+            }
+            break;
+        }
+        self.standby_available.notify_all();
+    }
+
+    /// The VM's client closed. Lets go of the arenas and surplus standby epochs: accepted
+    /// renders keep only the exact standby count they reserved until they finish, and hardware
+    /// slots hold their own last-owner leases.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        loop {
+            let excess = {
+                let mut standby = self.standby.lock();
+                let keep = standby.reserved as usize;
+                if standby.epochs.len() > keep {
+                    standby.epochs.pop()
+                } else {
+                    None
+                }
+            };
+            if excess.is_none() {
+                break;
+            }
+            drop(excess);
+        }
+        self.standby_available.notify_all();
         let ready = {
             let mut ready = self.ready.lock();
             (
@@ -212,14 +312,16 @@ impl Cache {
             .filter(|c| matches!(c, Command::Compute(_)))
             .count();
         let compute = computes != 0;
-        let render_count = commands
+        let render_count: u32 = commands
             .iter()
             .filter(|c| matches!(c, Command::Render(_)))
-            .count();
+            .count()
+            .try_into()?;
         let render = render_count != 0;
-        let mut epochs = super::budget::Budget::reserve(&self.budget, render_count.try_into()?)?;
         let (compute, compute_ext, render) = {
             // Never held by publication, completion, recovery or fence signalling.
+            // Serializing standby top-up under `ready` prevents concurrent SUBMITs on the
+            // same VM from over-allocating or racing each other's deficit calculation.
             let mut ready = self.ready.lock();
             if vm.status.get() != 0 || vm.vm.is_closed() || self.closed.load(Ordering::Acquire) {
                 return Err(EIO);
@@ -266,8 +368,86 @@ impl Cache {
                     &self.live,
                 )?);
             }
+            if render {
+                if render_count > super::budget::LIMIT {
+                    return Err(E2BIG);
+                }
+                let mut remaining = kernel::time::msecs_to_jiffies(10_000);
+                loop {
+                    let deficit = {
+                        let mut standby = self.standby.lock();
+                        if vm.status.get() != 0
+                            || vm.vm.is_closed()
+                            || self.closed.load(Ordering::Acquire)
+                        {
+                            return Err(EIO);
+                        }
+                        if let Some(needed) = standby
+                            .reserved
+                            .checked_add(render_count)
+                            .filter(|&n| n <= super::budget::LIMIT)
+                        {
+                            if standby.epochs.len() >= needed as usize {
+                                standby.reserved = needed;
+                                break;
+                            }
+                            needed - standby.epochs.len() as u32
+                        } else {
+                            match self
+                                .standby_available
+                                .wait_interruptible_timeout(&mut standby, remaining)
+                            {
+                                CondVarTimeoutResult::Woken { jiffies } => {
+                                    remaining = jiffies;
+                                    continue;
+                                }
+                                CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                                CondVarTimeoutResult::Timeout => {
+                                    if vm.status.get() != 0
+                                        || vm.vm.is_closed()
+                                        || self.closed.load(Ordering::Acquire)
+                                    {
+                                        return Err(EIO);
+                                    }
+                                    let needed = standby
+                                        .reserved
+                                        .checked_add(render_count)
+                                        .filter(|&n| n <= super::budget::LIMIT)
+                                        .ok_or(EBUSY)?;
+                                    if standby.epochs.len() >= needed as usize {
+                                        standby.reserved = needed;
+                                        break;
+                                    }
+                                    needed - standby.epochs.len() as u32
+                                }
+                            }
+                        }
+                    };
+                    let mut epochs = super::budget::Budget::reserve(&self.budget, deficit)?;
+                    let mut fresh = KVec::with_capacity(deficit as usize, GFP_KERNEL)?;
+                    for _ in 0..deficit {
+                        fresh.push(PbEpoch::new(&self.factory, vm, epochs.take()?)?, GFP_KERNEL)?;
+                    }
+                    let mut overflow = KVec::with_capacity(fresh.len(), GFP_KERNEL)?;
+                    {
+                        let mut standby = self.standby.lock();
+                        let closed = self.closed.load(Ordering::Acquire);
+                        for epoch in fresh {
+                            if closed {
+                                let _ = overflow.push_within_capacity(epoch);
+                            } else if let Err(err) = standby.epochs.push_within_capacity(epoch) {
+                                let _ = overflow.push_within_capacity(err.0);
+                            }
+                        }
+                    }
+                    drop(overflow);
+                }
+            }
             // A concurrent fault retains even newly constructed backing in this VM cache.
             if vm.status.get() != 0 || vm.vm.is_closed() {
+                if render {
+                    self.release_reserved(render_count);
+                }
                 return Err(EIO);
             }
             (
@@ -276,32 +456,12 @@ impl Cache {
                 if render { ready.render.clone() } else { None },
             )
         };
-        let mut pb = KVec::with_capacity(commands.len(), GFP_KERNEL)?;
-        for command in commands {
-            pb.push(
-                if matches!(command, Command::Render(_)) {
-                    // A spare keeps the budget permit it was created with; the reservation
-                    // returns the unused credit when it drops.
-                    let spare = self.spares.lock().pop();
-                    Some(match spare {
-                        Some(epoch) if epoch.unexposed() => epoch,
-                        _ => PbEpoch::new(&self.factory, vm, epochs.take()?)?,
-                    })
-                } else {
-                    None
-                },
-                GFP_KERNEL,
-            )?;
-        }
-        if vm.status.get() != 0 || vm.vm.is_closed() {
-            return Err(EIO);
-        }
         Ok(Prepared {
             compute,
             compute_ext,
             render,
-            pb,
-            cache: Some(self.clone()),
+            unpublished_renders: AtomicU32::new(render_count),
+            cache: render.is_some().then(|| self.clone()),
         })
     }
 }
@@ -312,8 +472,9 @@ pub(crate) struct Prepared {
     /// The VM's extension compute units when the job was prepared.
     pub(crate) compute_ext: Option<Arc<ComputeArena>>,
     pub(crate) render: Option<Arc<RenderArena>>,
-    pb: KVec<Option<Arc<PbEpoch>>>,
-    /// The VM cache that unused epochs return to.
+    /// Render commands of this job whose standby reservation has not yet been committed.
+    unpublished_renders: AtomicU32,
+    /// The VM cache holding the standby PB epoch pool.
     cache: Option<Arc<Cache>>,
 }
 
@@ -322,11 +483,8 @@ impl Drop for Prepared {
         let Some(cache) = self.cache.take() else {
             return;
         };
-        for epoch in self.pb.iter_mut().filter_map(Option::take) {
-            if epoch.unexposed() {
-                cache.give_back(epoch);
-            }
-        }
+        let remaining = self.unpublished_renders.swap(0, Ordering::AcqRel);
+        cache.release_reserved(remaining);
     }
 }
 impl Prepared {
@@ -366,7 +524,24 @@ impl Prepared {
     pub(crate) fn render(&self) -> Result<&RenderArena> {
         self.render.as_deref().ok_or(EINVAL)
     }
-    pub(crate) fn pb(&self, index: usize) -> Result<&Arc<PbEpoch>> {
-        self.pb.get(index).and_then(Option::as_ref).ok_or(EINVAL)
+    pub(crate) fn take_pb(&self) -> Result<Arc<PbEpoch>> {
+        self.cache.as_ref().ok_or(EINVAL)?.take_standby()
+    }
+    pub(crate) fn return_pb(&self, epoch: Arc<PbEpoch>) {
+        if let Some(cache) = &self.cache {
+            cache.return_standby(epoch);
+        }
+    }
+    /// Commits one render command's standby reservation once it reaches firmware visibility.
+    pub(crate) fn commit_render(&self) {
+        if let Some(cache) = &self.cache {
+            if self
+                .unpublished_renders
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                cache.release_reserved(1);
+            }
+        }
     }
 }

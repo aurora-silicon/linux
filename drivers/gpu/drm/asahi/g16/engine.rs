@@ -1000,8 +1000,12 @@ impl Firmware {
                 (e, true)
             }
             None => {
-                let e = job.resources.pb(job.progress.sent() as usize)?.clone();
-                e.prepare(k, arena.pools.heap_gva(k)?, arena.pools.heap_blocks())?;
+                let e = job.resources.take_pb()?;
+                if let Err(err) = e.prepare(k, arena.pools.heap_gva(k)?, arena.pools.heap_blocks())
+                {
+                    job.resources.return_pb(e);
+                    return Err(err);
+                }
                 self.pools.stats.fresh += 1;
                 (e, false)
             }
@@ -1070,6 +1074,23 @@ impl Firmware {
     }
 
     fn publish_prefix_into(
+        &mut self,
+        job: &Arc<Job>,
+        f: &mut Flight,
+        visible: &mut bool,
+    ) -> Result {
+        let result = self.publish_prefix_body(job, f, visible);
+        if result.is_err() && !*visible {
+            if let Some(epoch) = f.pb.take() {
+                if epoch.unexposed() {
+                    job.resources.return_pb(epoch);
+                }
+            }
+        }
+        result
+    }
+
+    fn publish_prefix_body(
         &mut self,
         job: &Arc<Job>,
         f: &mut Flight,
@@ -1196,6 +1217,7 @@ impl Firmware {
             if render {
                 let k = f.claims.pass[0] as usize;
                 f.pb.as_ref().ok_or(EINVAL)?.expose();
+                job.resources.commit_render();
                 job.resources.render()?.pools.publish(k, f.uma_submitted)?;
                 // Notifier service dereferences u32 counters; the host ordering ledger
                 // remains u64. Eight-byte spacing is retained allocation padding.
