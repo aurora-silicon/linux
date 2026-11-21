@@ -400,6 +400,8 @@ static void apple_nvme_put_resource_owner(void *data)
 {
 	struct apple_nvme *anv = data;
 
+	of_node_put(anv->sleep_pmp_entry);
+	anv->sleep_pmp_entry = NULL;
 	WRITE_ONCE(anv->detached, true);
 	if (!apple_nvme_m5_retained(anv))
 		kref_put(&anv->ref, apple_nvme_release);
@@ -2803,11 +2805,6 @@ static int apple_nvme_sleep_shutdown(void *data)
 	return -EIO;
 }
 
-/*
- * The rest of a sleep's stop, last of all. From the first idle message only a real sleep
- * brings it back, so a failure goes on to the commit: what a flush acknowledged is on
- * flash, and the watchdog is the net.
- */
 /* T8122 trial: ANS's ASC state at each step from its idle to the commit. */
 static void apple_nvme_ans_trace(struct apple_nvme *anv, const char *step)
 {
@@ -2817,6 +2814,11 @@ static void apple_nvme_ans_trace(struct apple_nvme *anv, const char *step)
 			 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS));
 }
 
+/*
+ * The rest of a sleep's stop, last of all. From the first idle message only a real sleep
+ * brings it back, so a failure goes on to the commit: what a flush acknowledged is on
+ * flash, and the watchdog is the net.
+ */
 static int apple_nvme_sleep_last_stop(void *data)
 {
 	struct apple_nvme *anv = data;
@@ -3337,27 +3339,28 @@ static int apple_nvme_suspend(struct device *dev)
 
 	if (apple_rtkit_is_running(anv->rtk)) {
 		/*
-		 * T8122: as macOS leaves ANS before its sleep, the sleep driver idles it last of
-		 * all (AP then IOP idle, polled, apple_nvme_sleep_last_stop()) and clears its RUN
-		 * bit; the shutdown notification above must have completed (its result is kept: the
-		 * NVMe window is unreachable at the commit on J613, and CC.EN cleared after it resets
-		 * CSTS.SHST). Otherwise it is shut down as before. Resume finds RUN
-		 * clear and resets and boots ANS, as after a shutdown.
+		 * T8122: idle ANS here with interrupts on, then leave its RUN
+		 * bit for the last stop. The shutdown notification result must
+		 * be checked here too: clearing CC.EN resets CSTS.SHST, and
+		 * the NVMe window is unreachable at the commit on J613.
+		 * If either step fails, shut ANS down so resume can reset it.
 		 */
 		if (anv->sleep_registered && anv->hw->sleep_idle &&
 		    pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware() &&
 		    !anv->legacy_shn_ret && anv->sleep_pmp_entry &&
 		    !apple_pmp_report_entry_commit_owned(anv->sleep_pmp_entry, true)) {
-			int idle = apple_rtkit_idle(anv->rtk);
+			ret = apple_rtkit_idle(anv->rtk);
+			if (!ret) {
+				anv->sleep_stop = true;
+				anv->sleep_idled = true;
+				apple_sleep_coproc_set_ready(dev, true);
+				dev_info(dev, "ANS idled for the sleep (status %#x), its run bit left to the commit\n",
+					 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS));
+				return 0;
+			}
 
-			anv->sleep_stop = true;
-			/* Idled here, with interrupts on: at the commit, polled, it does not answer. */
-			anv->sleep_idled = !idle;
-			apple_sleep_coproc_set_ready(dev, true);
-			dev_info(dev, "ANS idled for the sleep: %d (status %#x), its run bit left to the commit (notification %d)\n",
-				 idle, readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS),
-				 anv->legacy_shn_ret);
-			return 0;
+			apple_pmp_report_entry_commit_owned(anv->sleep_pmp_entry, false);
+			dev_warn(dev, "ANS could not idle for the sleep: %d\n", ret);
 		}
 		/* Registered but not idled at the commit: the sleep driver refuses the sleep. */
 		if (anv->sleep_registered && pm_suspend_via_firmware())
