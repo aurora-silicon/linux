@@ -4666,6 +4666,8 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->se.sum_exec_runtime		= 0;
 	p->misfit_runtime		= 0;
 	p->se.prev_sum_exec_runtime	= 0;
+	p->se.prev_sleep_sum_runtime	= 0;
+	p->se.burst_avg			= 0;
 	p->se.nr_migrations		= 0;
 	p->se.vruntime			= 0;
 	p->se.vlag			= 0;
