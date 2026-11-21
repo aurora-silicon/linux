@@ -135,6 +135,8 @@ struct t6050_dp {
 	enum combo_mode sleep_mode;	/* the mode the sleep's stop took down */
 	bool sleep_stopped;		/* stopped for a sleep that has not been accounted for yet */
 	bool aon_syscore;		/* the always-on domain is held out of this system transition */
+	u8 s2idle_domain_syscore;	/* active domains held out of s2idle genpd suspend */
+	u8 s2idle_gate_syscore;		/* active DP tunnel gates held out of s2idle genpd suspend */
 	bool aon_kept;			/* the stop left the always-on domain's reference in place */
 	/* A USB4 router's sleep in place: its host stops and restarts the port, see the end. */
 	bool cio_sleep;			/* asked for: the PHY's own stop for the sleep is skipped */

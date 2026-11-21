@@ -386,7 +386,35 @@ static int combo_pm_notify(struct notifier_block *nb, unsigned long action, void
 	guard(mutex)(&dp->lock);
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
-		if (pm_suspend_default_s2idle() || dp->faulted || dp->aon_syscore ||
+		if (pm_suspend_no_platform()) {
+			if (dp->faulted || dp->combo_mode == COMBO_SAFE)
+				break;
+			/*
+			 * Suspend-to-idle leaves an active combo PHY running:
+			 * t6050_dp_suspend_late() only quiesces for firmware
+			 * sleep. Hold the active virtual genpd devices out of
+			 * system suspend so genpd does not power off phymxwrap
+			 * (or common/usb) under the running PHY CPU.
+			 */
+			for (unsigned int i = 0; i < dp->ndomains; i++) {
+				if (dp->domain[i].active &&
+				    !(dp->s2idle_domain_syscore & BIT(i))) {
+					dev_pm_syscore_device(dp->domain[i].dev, true);
+					dp->s2idle_domain_syscore |= BIT(i);
+				}
+			}
+			if (dp->dp_gates) {
+				for (unsigned int i = 0; i < ATC_DP_TUNNELS; i++) {
+					if (dp->dp_gate[i].active &&
+					    !(dp->s2idle_gate_syscore & BIT(i))) {
+						dev_pm_syscore_device(dp->dp_gate[i].dev, true);
+						dp->s2idle_gate_syscore |= BIT(i);
+					}
+				}
+			}
+			break;
+		}
+		if (!combo_sleep_board() || dp->faulted || dp->aon_syscore ||
 		    dp->combo_mode == COMBO_SAFE || !dp->domain[0].active)
 			break;
 		if (!apple_sleep_usb_aon_keep(dp->port, true))
@@ -395,10 +423,26 @@ static int combo_pm_notify(struct notifier_block *nb, unsigned long action, void
 		dp->aon_syscore = true;
 		break;
 	case PM_POST_SUSPEND:
-		apple_sleep_usb_aon_keep(dp->port, false);
-		if (dp->aon_syscore) {
-			dev_pm_syscore_device(dp->domain[0].dev, false);
-			dp->aon_syscore = false;
+		if (dp->s2idle_domain_syscore) {
+			for (unsigned int i = 0; i < dp->ndomains; i++) {
+				if (dp->s2idle_domain_syscore & BIT(i))
+					dev_pm_syscore_device(dp->domain[i].dev, false);
+			}
+			dp->s2idle_domain_syscore = 0;
+		}
+		if (dp->s2idle_gate_syscore) {
+			for (unsigned int i = 0; i < ATC_DP_TUNNELS; i++) {
+				if (dp->s2idle_gate_syscore & BIT(i))
+					dev_pm_syscore_device(dp->dp_gate[i].dev, false);
+			}
+			dp->s2idle_gate_syscore = 0;
+		}
+		if (combo_sleep_board()) {
+			apple_sleep_usb_aon_keep(dp->port, false);
+			if (dp->aon_syscore) {
+				dev_pm_syscore_device(dp->domain[0].dev, false);
+				dp->aon_syscore = false;
+			}
 		}
 		break;
 	default:
@@ -712,9 +756,6 @@ static int combo_setup(struct platform_device *pdev, struct t6050_dp *dp)
 			return PTR_ERR(dp->combo_phy[i]);
 		phy_set_drvdata(dp->combo_phy[i], dp);
 	}
-	/* A deep sleep's hold of the always-on domain: see combo_sleep_board(). */
-	if (!combo_sleep_board())
-		return 0;
 	dp->pm_nb.notifier_call = combo_pm_notify;
 	ret = register_pm_notifier(&dp->pm_nb);
 	if (ret)
