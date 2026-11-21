@@ -111,6 +111,14 @@
 	};
 };
 
+/*
+ * The six amps' voltage and current sense words reach the speaker ports one
+ * bit clock later than the I2S format places them.
+ */
+&mca {
+	apple,rx-delay-bclks = <1 1 0 0 0 0>;
+};
+
 / {
 	sound {
 		compatible = "apple,j615-macaudio", "apple,j415-macaudio", "apple,macaudio";

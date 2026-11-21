@@ -43,6 +43,7 @@ static const u32 ave_known_text_crc[] = {
 	AVE_FW_TEXT_CRC_T6050_26A428, /* AppleAVE2FW, macOS 27.0 26A428 / T6050 */
 	AVE_FW_TEXT_CRC_T6050_26C5035, /* AppleAVE2FW, macOS 27.3 26C5035r / T6050 */
 	AVE_FW_TEXT_CRC_T8142_26A428, /* AppleAVE2FW 9013.45.1, macOS 27.0 26A428 / T8142 */
+	AVE_FW_TEXT_CRC_T8122_26B123, /* AppleAVE2FW, macOS 27.2 26B123 / T8122 */
 	0x460c7a7c, /* AppleAVE2FW 6070.11.1 / T6000 */
 	0x25bfd039, /* AppleAVE2FW 6070.11.1 / T8112 */
 };
@@ -257,6 +258,8 @@ int ave_fw_probe(struct ave_dev *ave)
 					     "unexpected firmware segment sizes (TEXT %#zx DATA %#zx)\n",
 					     ave->text.size, ave->data.size);
 		want_crc = build->text_crc;
+	} else if (!ave->variant->boot_qualified && !ave->variant->fw_text_size) {
+		/* A probe-only variant that pins no build takes any segment sizes. */
 	} else if (ave->text.size != ave->variant->fw_text_size ||
 		   (ave->data.size != ave->variant->fw_data_size &&
 		    (!ave->variant->fw_data_size_alt ||
@@ -334,8 +337,8 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (!ave->variant->boot_qualified || !ave->layout)
 		dev_info(
 			dev,
-			"probe only: firmware TEXT %08x DATA %08x needs qualification\n",
-			text_crc, data_crc);
+			"probe only: firmware TEXT %#zx CRC %08x, DATA %#zx CRC %08x needs qualification\n",
+			ave->text.size, text_crc, ave->data.size, data_crc);
 	else if (!ave->layout->encode_ready)
 		dev_info(
 			dev,

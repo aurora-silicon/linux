@@ -59,6 +59,7 @@
 
 #include "afk.h"
 #include "av.h"
+#include "cec.h"
 #include "dcp.h"
 #include "dcp-edr.h"
 #include "dcp-panel-adt.h"
@@ -4397,6 +4398,19 @@ static int dcp_start_desktop_external(struct apple_dcp *dcp, u32 map)
 			d->graph_started |= BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20);
 	}
 #endif
+#if IS_ENABLED(CONFIG_DRM_APPLE_CEC)
+	if (IS_ERR_OR_NULL(dcp->avep) &&
+	    dcp->fixed_connector_type == DRM_MODE_CONNECTOR_HDMIA &&
+	    (map & BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20))) {
+		ret = dcp_cec_init_avep(dcp);
+		if (ret)
+			dcp_desktop_graph_skip(dcp, AV_AUDIO_ENDPOINT_DESKTOP,
+					       "CEC", "CEC init failed", ret);
+		else if (dcp->avep)
+			d->graph_started |= BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20);
+	}
+	dcp_cec_register(dcp);
+#endif
 	ret = dcp_desktop_start_ext_ep(dcp, map, DPTX_HDCP_ENDPOINT,
 				       "DPTXHDCP");
 	if (ret)
@@ -4728,6 +4742,17 @@ int dcp_start(struct platform_device *pdev)
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start AV endpoint: %d", ret);
 		ret = 0;
+	}
+#endif
+#if IS_ENABLED(CONFIG_DRM_APPLE_CEC)
+	if (!dcp_is_ext26(dcp) && !dcp->external_native) {
+		if (IS_ERR_OR_NULL(dcp->avep)) {
+			ret = dcp_cec_init_avep(dcp);
+			if (ret)
+				dev_warn(dcp->dev, "Failed to start AV CEC endpoint: %d\n", ret);
+			ret = 0;
+		}
+		dcp_cec_register(dcp);
 	}
 #endif
 
@@ -6026,6 +6051,7 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	disable_delayed_work_sync(&dcp->announce_wq);
 	cancel_work_sync(&dcp->external_stop_work);
 	cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
+	dcp_hdmi_disable(dcp);
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
 	disable_delayed_work_sync(&dcp->link_recovery_wq);
@@ -6036,7 +6062,6 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 		dcp->tb_event_generation = 0;
 	}
 	disable_delayed_work_sync(&dcp->hybrid_wq);
-	dcp_hdmi_disable(dcp);
 }
 
 VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
@@ -6668,6 +6693,9 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 	 */
 	if (dcp->external_native)
 		disable_work_sync(&dcp->external_audio_work);
+#if IS_ENABLED(CONFIG_DRM_APPLE_CEC)
+	dcp_cec_unregister(dcp);
+#endif
 	av_audiosrv_quiesce(dcp);
 	if (READ_ONCE(dcp->ext_dead))
 		return;
@@ -9483,7 +9511,7 @@ static void dcp_dpms_power_off(struct apple_dcp *dcp)
  * Not in the sleep driver's dry run, which returns before its commit: there the coprocessor is
  * left running and takes the ordinary suspend below, and the sleep driver doesn't count it.
  */
-static bool dcp_j613_sleep_owned(struct apple_dcp *dcp)
+static bool dcp_sleep_owned(struct apple_dcp *dcp)
 {
 	return IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) && dcp->fw_compat == DCP_FIRMWARE_V_26_6 &&
 	       !dcp->external &&
@@ -9495,8 +9523,8 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	/* Whichever of this and the display subsystem suspends first: nothing commits to it. */
-	return READ_ONCE(dcp->s2r_fw_down) || READ_ONCE(dcp->j613_sleep_down) ||
-	       (pm_suspend_via_firmware() && dcp_j613_sleep_owned(dcp));
+	return READ_ONCE(dcp->s2r_fw_down) || READ_ONCE(dcp->sleep_cold_stopped) ||
+	       (pm_suspend_via_firmware() && dcp_sleep_owned(dcp));
 }
 
 #include "dcp-v27-sleep.inc"
@@ -9524,9 +9552,9 @@ static int dcp_platform_suspend(struct device *dev)
 	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp))
 		return dcp_v27_sleep_suspend(dcp);
 
-	if (READ_ONCE(dcp->j613_sleep_down))
+	if (READ_ONCE(dcp->sleep_cold_stopped))
 		return 0;
-	if (pm_suspend_via_firmware() && dcp_j613_sleep_owned(dcp)) {
+	if (pm_suspend_via_firmware() && dcp_sleep_owned(dcp)) {
 		u32 control = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 
 		dev_warn(dev, "J613: display coprocessor stopped cold for the sleep (control %#x); it stays dark until reboot\n",
@@ -9549,7 +9577,7 @@ static int dcp_platform_suspend(struct device *dev)
 				dev_warn(dev, "RTKit idle before the cold stop failed: %d\n", ret);
 		}
 		}
-		WRITE_ONCE(dcp->j613_sleep_down, true);
+		WRITE_ONCE(dcp->sleep_cold_stopped, true);
 		dcp_s2r_cpu_stop(dcp);
 		return 0;
 	}
@@ -9690,7 +9718,7 @@ static int dcp_platform_resume(struct device *dev)
 		return dcp_v27_sleep_resume(dcp);
 
 	/* Stopped cold, with nothing to restart it. */
-	if (READ_ONCE(dcp->j613_sleep_down))
+	if (READ_ONCE(dcp->sleep_cold_stopped))
 		return 0;
 
 	if (dcp->s2r_stopped)

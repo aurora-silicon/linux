@@ -170,6 +170,12 @@
 						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 						<&cpu_p15 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
+
+				map-dcs {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&pmc THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
 			};
 		};
 

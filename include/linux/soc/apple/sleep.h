@@ -32,6 +32,11 @@ struct apple_sleep_smc_saved_ops {
 	int (*commit_notice)(void *data, u64 *sent, u64 *ack);
 	int (*late_notice)(void *data, u64 *sent, u64 *ack);
 	int (*end)(void *data);
+	/*
+	 * Optional, right after a clean .end at the platform wake, before the SoC's PMU wake steps:
+	 * the SMC's first wake commands (its wake record, waka).
+	 */
+	void (*woken)(void *data);
 	/* Optional, after the irreversible stops: pmVC alone, before late_notice (which then skips it). */
 	int (*pmvc)(void *data);
 };
@@ -128,6 +133,15 @@ void apple_sleep_note_sub(u8 step);
  * and clears it at the wake.
  */
 void apple_sleep_usb_set_asleep(bool asleep);
+
+/*
+ * J714s: called at T6050's .prepare_late (no other SoC calls it), after every device's noirq suspend (the USB PHYs'
+ * stops) and before the SMC's scope, with whether a USB host sleeps in place: macOS arms a
+ * USB-C port controller's USB wake right after its PHY has stopped.
+ */
+struct notifier_block;
+int apple_sleep_usb_asleep_notifier_register(struct notifier_block *nb);
+void apple_sleep_usb_asleep_notifier_unregister(struct notifier_block *nb);
 
 /*
  * The USB host is up, as macOS's USB_SLP_DDR vote has it: from the host's start to its stop,
@@ -329,6 +343,16 @@ static inline bool apple_sleep_dry_run(void)
 }
 
 static inline void apple_sleep_usb_set_asleep(bool asleep)
+{
+}
+
+struct notifier_block;
+static inline int apple_sleep_usb_asleep_notifier_register(struct notifier_block *nb)
+{
+	return 0;
+}
+
+static inline void apple_sleep_usb_asleep_notifier_unregister(struct notifier_block *nb)
 {
 }
 

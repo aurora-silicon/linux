@@ -277,3 +277,20 @@
  * the camera).
  */
 #include "t6050-j714s-ane.dtsi"
+
+/* The port controllers follow the sleep's command rules (tipd: woken first, read at intervals) */
+&hpm0 {
+	apple,sleep-ssps-rules;
+};
+
+&hpm1 {
+	apple,sleep-ssps-rules;
+};
+
+&hpm2 {
+	apple,sleep-ssps-rules;
+};
+
+&hpm5 {
+	apple,sleep-ssps-rules;
+};

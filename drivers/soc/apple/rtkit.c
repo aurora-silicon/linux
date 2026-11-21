@@ -1879,14 +1879,25 @@ int apple_rtkit_m5_saved_poll(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_m5_saved_poll);
 
-static int apple_rtkit_m5_saved_tx(struct apple_rtkit *rtk, struct apple_mbox_msg msg,
-				 u64 *sent)
+/*
+ * The AP power state's post and its ack in the saved scope have the APPLE_RTKIT_M5_LOOPS bound of
+ * every other saved-scope message. Past it the call returns -ETIMEDOUT, which a committed SMC
+ * notice treats as fatal. A post or an ack that takes more than APPLE_RTKIT_M5_AP_SLOW_LOOPS steps
+ * (5 ms nominal) is logged with its count, so an SMC that answers late shows in the log well
+ * before the bound.
+ */
+#define APPLE_RTKIT_M5_AP_SLOW_LOOPS	500
+
+static int apple_rtkit_m5_saved_tx_tries(struct apple_rtkit *rtk, struct apple_mbox_msg msg,
+				       u64 *sent, unsigned int *tries)
 {
 	int i, ret;
 
+	*tries = 0;
 	if (!rtk->m5_saved.active)
 		return -EINVAL;
 	for (i = 0; i < APPLE_RTKIT_M5_LOOPS; i++) {
+		*tries = i;
 		if (rtk->m5_saved.error)
 			return rtk->m5_saved.error;
 		if (READ_ONCE(rtk->crashed) || READ_ONCE(rtk->shutting_down))
@@ -1905,7 +1916,16 @@ static int apple_rtkit_m5_saved_tx(struct apple_rtkit *rtk, struct apple_mbox_ms
 		 */
 		udelay(APPLE_RTKIT_M5_STEP_US);
 	}
+	*tries = APPLE_RTKIT_M5_LOOPS;
 	return -ETIMEDOUT;
+}
+
+static int apple_rtkit_m5_saved_tx(struct apple_rtkit *rtk, struct apple_mbox_msg msg,
+				 u64 *sent)
+{
+	unsigned int tries;
+
+	return apple_rtkit_m5_saved_tx_tries(rtk, msg, sent, &tries);
 }
 
 int apple_rtkit_m5_saved_send(struct apple_rtkit *rtk, u64 message)
@@ -1926,15 +1946,23 @@ static int apple_rtkit_m5_saved_wait_ap(struct apple_rtkit *rtk, u64 *ack)
 
 	for (i = 0; i < APPLE_RTKIT_M5_LOOPS; i++) {
 		ret = apple_rtkit_m5_saved_poll(rtk);
-		if (ret < 0)
+		if (ret < 0) {
+			dev_err(rtk->dev, "RTKit: AP power state %u: poll error %d after %d polls\n",
+				rtk->m5_saved.ap_target, ret, i);
 			return ret;
+		}
 		if (!rtk->m5_saved.ap_pending) {
 			if (ack)
 				*ack = rtk->m5_saved.stamp();
+			if (i >= APPLE_RTKIT_M5_AP_SLOW_LOOPS)
+				dev_warn(rtk->dev, "RTKit: AP power state %u: acked late, after %d polls\n",
+					 rtk->m5_saved.ap_target, i + 1);
 			return 0;
 		}
 		udelay(APPLE_RTKIT_M5_STEP_US);
 	}
+	dev_err(rtk->dev, "RTKit: AP power state %u: no ack after %d polls\n",
+		rtk->m5_saved.ap_target, i);
 	return -ETIMEDOUT;
 }
 
@@ -1947,6 +1975,7 @@ int apple_rtkit_m5_saved_ap_power(struct apple_rtkit *rtk, bool on,
 			FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, target),
 		.msg1 = APPLE_RTKIT_EP_MGMT,
 	};
+	unsigned int tries;
 	int ret;
 
 	if (!rtk->m5_saved.active)
@@ -1959,7 +1988,10 @@ int apple_rtkit_m5_saved_ap_power(struct apple_rtkit *rtk, bool on,
 	}
 	rtk->m5_saved.ap_target = target;
 	smp_store_release(&rtk->m5_saved.ap_pending, true);
-	ret = apple_rtkit_m5_saved_tx(rtk, msg, sent);
+	ret = apple_rtkit_m5_saved_tx_tries(rtk, msg, sent, &tries);
+	if (ret || tries >= APPLE_RTKIT_M5_AP_SLOW_LOOPS)
+		dev_warn(rtk->dev, "RTKit: AP power state %u: posted %d after %u tries\n", target, ret,
+			 tries);
 	if (ret) {
 		/* nowait TX guarantees a negative return means never posted. */
 		smp_store_release(&rtk->m5_saved.ap_pending, false);

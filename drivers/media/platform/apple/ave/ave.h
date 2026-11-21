@@ -178,6 +178,10 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_T6050_26C5035 0xc25b4ddb
 /* The M5 (T8142) build of the same 26A428 firmware (AppleAVE2FW 9013.45.1). */
 #define AVE_FW_TEXT_CRC_T8142_26A428 0x8a3784bd
+/* The M4 (T8132) build preloaded by the macOS 27.2 (26B123) stub. */
+#define AVE_FW_TEXT_CRC_T8132_26B123 0x99fc929a
+/* The M3 (T8122) build preloaded by the macOS 27.2 (26B123) stub. */
+#define AVE_FW_TEXT_CRC_T8122_26B123 0x918d70d3
 
 struct ave_ctx;
 
@@ -551,7 +555,7 @@ static inline struct ave_ctx *ave_file_to_ctx(struct file *file)
 	return container_of(file_to_v4l2_fh(file), struct ave_ctx, fh);
 }
 
-extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112;
+extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112, ave_m3;
 
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);

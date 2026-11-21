@@ -274,6 +274,10 @@ static void __attribute__((unused)) typec_unregister_altmode(void *a)
 #define typec_set_orientation(...) ((void)0)
 #define typec_set_data_role(...) ((void)0)
 #define power_supply_changed(...) ((void)0)
+/* J714s only (tipd_boot_power_on()): this fixture's machine never keeps the boot power state. */
+static void __attribute__((unused)) tipd_boot_host_started(struct tps6598x *t, enum usb_role r)
+{ (void)t; (void)r; }
+static void __attribute__((unused)) tipd_boot_order_done(struct tps6598x *t) { (void)t; }
 '''
     tests = r'''
 static int failures, checks;
@@ -520,6 +524,11 @@ static void __attribute__((unused)) dcp_relink_link_up(int *s, u64 generation, u
  CHECK(!roles && port.pm.phase == CD321X_PM_REVALIDATE);
  CHECK(sink.connected && !notices && !port.display_route_active);
 ''')
+    # The J714s's macOS USBw after an attach is a port controller command, not part of these
+    # display scenarios: the update calls it, and here it does nothing.
+    if 'cd321x_macos_usbw(cd321x);' in funcs:
+        shim += ('\nstruct cd321x;\n'
+                 'static void cd321x_macos_usbw(struct cd321x *cd321x) { (void)cd321x; }\n')
     # How long a held mux has been retried is measured on the driver's clock.
     if 'jiffies_to_msecs(jiffies)' in funcs:
         shim += ('\nstatic unsigned long jiffies;\n'
