@@ -3234,7 +3234,7 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 	}
 
 	/* Only a driver takes the display to where its domain can be lowered. */
-	if (!s->display[0].bound) {
+	if (s->soc->ndisp && !s->display[0].bound) {
 		dev_err(s->dev, "refused: no driver bound to the display coprocessor\n");
 		refused = true;
 	}
@@ -6860,9 +6860,12 @@ static const struct platform_suspend_ops apple_sleep_ops = {
 	.end = apple_sleep_end,
 };
 
-/* For a SoC with early_context: the same, with the scopes its entry needs held */
+/*
+ * For a SoC with early_context: the same, with the scopes its entry needs held. Deep sleep is
+ * offered as for the others: an untested profile only with apple_sleep.deep=1.
+ */
 static const struct platform_suspend_ops apple_sleep_early_ops = {
-	.valid = suspend_valid_only_mem,
+	.valid = apple_sleep_valid,
 	.begin = apple_sleep_begin,
 	.prepare = apple_sleep_prepare,
 	.prepare_late = apple_sleep_late_scope_begin,
@@ -7380,6 +7383,7 @@ static void apple_sleep_put_node(void *np)
 }
 
 #include "sleep-t6050.h"
+#include "sleep-t6030.h"
 
 /* ANS's sleep owner on T6050: registered at its .suspend, its final stop in the last steps. */
 int apple_sleep_ans_m5_register(struct device *dev, void __iomem *asc,
@@ -7685,7 +7689,7 @@ static int apple_sleep_profile_validate(const struct apple_sleep_soc *soc)
 	    !soc->ops->deep_wfi_arm || !soc->ops->aic_mask_all || !soc->ops->aic_ack ||
 	    !soc->ops->aic_restore ||
 	    (!soc->ops->commit_regs && (!soc->ops->lower_io || !soc->ops->last_mile)) ||
-	    !soc->ndisp || soc->ndisp > SLEEP_DISPLAYS_MAX || !soc->cpu_clusters)
+	    soc->ndisp > SLEEP_DISPLAYS_MAX || !soc->cpu_clusters)
 		return -EINVAL;
 	return 0;
 }
@@ -9551,6 +9555,7 @@ static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8142-sleep", .data = &t8142_sleep_soc },
 	{ .compatible = "apple,t6050-sleep", .data = &t6050_sleep_soc },
 	{ .compatible = "apple,t6050-j716c-sleep", .data = &t6050_j716c_sleep_soc },
+	{ .compatible = "apple,t6030-sleep", .data = &t6030_sleep_soc },
 	{ }
 };
 
