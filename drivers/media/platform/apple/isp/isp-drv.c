@@ -1670,6 +1670,17 @@ static const struct apple_isp_hw apple_isp_hw_t8142 = {
 	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
 	.fw_mmio = apple_isp_fw_mmio_t8142,
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8142),
+	/*
+	 * MLVNR (isp-ane.c, opt-in): the ANE firmware rings the ISP CPU
+	 * software interrupt register, ISP + 0x1668000, bit 0x10. macOS 27.2
+	 * logs it on the J815 (sendEPConfigToPeer); it is the first window of
+	 * the ANE's address filter (apple,dapf-ranges).
+	 */
+	.ane_doorbell_known = true,
+	.ane_isp_doorbell = 0x4a1668000,
+	.ane_isp_doorbell_sel = 0x10,
+	.ane_compatible = "apple,t8142-ane",
+	.mlvnr_mode_config = true,
 	.boot_mode = 1,
 	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
 	.resident_fw = true,
