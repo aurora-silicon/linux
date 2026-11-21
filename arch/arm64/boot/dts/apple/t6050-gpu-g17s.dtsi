@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T6050 GPU in the G17S layout, for the boot loader's GPU handoff.
+ *
+ * Shared by the boards that describe the GPU this way (K114c, K116s, J873s, K114s). It is the
+ * common part of t6050-k114c-gpu.dtsi and t6050-k116s-gpu.dtsi, which keep only their board
+ * notes, and the GPU half of t6050-j714s-gpu-panel.dtsi. Every value is the SoC's: the
+ * GPU aperture (ADT sgx), both GPU ASCs (gfx-asc, gfx1-asc) and the GPX/AFR power states,
+ * the same in every T6050 ADT read so far. What a part or a firmware build sets (the six
+ * memory reservations) is left zero for the loader to fill from the ADT the Mac boots with.
+ *
+ * Everything stays disabled: the loader checks the ADT and the live GPU firmware build, fills
+ * the reservations, then enables the GPU PMGR, GPX, AFR, GFX, both mailboxes and the GPU, the
+ * GPU last. A loader that refuses, or one without the handoff, leaves the GPU off.
+ */
+
+/ {
+	aliases {
+		/* The loader finds the GPU through this alias */
+		gpu = &sgx;
+	};
+
+	reserved-memory {
+		/* Filled and enabled by the loader from the ADT */
+		gpu_fw_text: gpu-fw-text {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_fw_data: gpu-fw-data {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_l2_pagetables: uat-l2-pagetables {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+/* The inventory ASC nodes; the mailboxes below describe the same windows. */
+/delete-node/ &gfx_asc;
+/delete-node/ &gfx1_asc;
+
+&{/soc} {
+	/*
+	 * ADT gfx-asc and gfx1-asc at their physical windows: the wrapper, the
+	 * 8-byte iop-vbar, and their second and third interrupts (send-empty,
+	 * recv-not-empty), as T8140/T8142.
+	 */
+	gfx_mbox: mailbox@2302600000 {
+		compatible = "apple,t6050-j775d-ascwrap-v6";
+		reg = <0x23 0x2600000 0x0 0x88000>,
+		      <0x23 0x2050000 0x0 0x8>;
+		reg-names = "wrapper", "iop-vbar";
+		interrupts = <AIC_IRQ 0 2797 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 2800 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	gfx1_mbox: mailbox@2302e00000 {
+		compatible = "apple,t6050-j775d-ascwrap-v6";
+		reg = <0x23 0x2e00000 0x0 0x88000>,
+		      <0x23 0x2850000 0x0 0x8>;
+		reg-names = "wrapper", "iop-vbar";
+		interrupts = <AIC_IRQ 0 2801 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 2804 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX1";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+};
+
+/* The ADT marks GPX and AFR, GFX's parents, critical. */
+&ps_gpx {
+	apple,always-on;
+};
+
+&ps_afr {
+	apple,always-on;
+};
+
+&sgx {
+	/*
+	 * "apple,agx-g17s" is what the loader checks and the driver binds
+	 * (drivers/gpu/drm/asahi/driver.rs); the driver then picks its configuration
+	 * from the GPU's ID registers.
+	 */
+	compatible = "apple,agx-g17s";
+	/* ADT sgx reg[0]; the driver maps the first 16 MiB as "sgx" */
+	reg = <0x23 0x0 0x0 0x3fdc000>;
+	reg-names = "sgx";
+	/delete-property/ interrupts;
+	mboxes = <&gfx_mbox>, <&gfx1_mbox>;
+	memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+			<&gpu_fw_data>, <&uat_l2_pagetables>, <&gpu_fw_text>;
+	memory-region-names = "ttbs", "pagetables", "handoff", "fw-data",
+			      "l2-pagetables", "fw-text";
+};
