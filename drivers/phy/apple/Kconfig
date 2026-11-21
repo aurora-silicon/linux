@@ -60,9 +60,10 @@ config PHY_APPLE_T6040_KUNIT_TEST
 	default KUNIT_ALL_TESTS
 	help
 	  Test the bounded hard-recovery state machine for a missed Power Down
-	  acknowledgment, a failed firmware tune and retry exhaustion. The tests
-	  access no hardware and run when the PHY driver is loaded. They are only
-	  useful for kernel developers.
+	  acknowledgment, a failed firmware tune and retry exhaustion, and which
+	  port states the PHY takes through a deep sleep with the USB host kept.
+	  The tests access no hardware and run when the PHY driver is loaded.
+	  They are only useful for kernel developers.
 
 config PHY_APPLE_DPTX
 	tristate "Apple DPTX PHY"
