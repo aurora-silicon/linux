@@ -939,10 +939,15 @@ pub(crate) fn start(
     }
     let kind = adt.layout.start;
     if kind == hw::Start::MacOs27_2 {
-        // macOS 27.2 sends no PMP AGX vote: it reads the identification words and starts the
-        // firmware without one, and the firmware acknowledges its own IOP power-on. A J713
-        // 27.2 boot without the vote reached the same point as one with it.
-        dev_info!(d, "G16: 27.2: no PMP AGX vote, as macOS\n");
+        // macOS 27.2 sends the PMP no mailbox vote for the GPU. Its GPU driver requests the
+        // GPU's power in the PMP report instead (the AGX soc-device record's PS-REQ bit) and
+        // holds it; without it the PMP treats the busy GPU as idle. The firmware acknowledges
+        // its own IOP power-on either way.
+        // SAFETY: `d` is the bound GPU device.
+        let ret = unsafe { bindings::apple_pmp_j713_gpu_request(d.as_raw()) };
+        if ret != 0 {
+            dev_warn!(d, "G16: 27.2: PMP AGX power request failed: {}\n", ret);
+        }
         regs.enable_axi2af()?;
     } else {
         // SAFETY: `d` is the bound GPU device.
