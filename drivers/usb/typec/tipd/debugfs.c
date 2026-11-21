@@ -15,8 +15,8 @@
  *	read-only register access: pread() with the register as offset
  *	(0x00..0x7f) and the length (1..64 bytes) as count.
  * /sys/kernel/debug/usb/tipd/<device>/replug
- *	Only on a port tipd can replug its partner on (the J714s's SN201202x
- *	with a USB role switch).
+ *	Only on a port tipd can replug its partner on (an SN201202x whose DT
+ *	gives apple,debug-lock-key, with a USB role switch).
  *	write: the seconds (1..10) the partner is disconnected for. One replug,
  *	       queued as the driver queues its own after a sleep (see
  *	       tipd_port_replug()); -EBUSY while one is queued and not yet
