@@ -37,6 +37,111 @@
 	status = "okay";
 };
 
+/*
+ * One L2 per CPU cluster, from the board's ADT: each CPU of cluster-id 0 and 1
+ * (cpu0-11, the M cores) has an l2-cache-size of 8 MiB, each CPU of cluster-id 2
+ * (cpu12-17, the P cores) 16 MiB. The ADT gives no L1 sizes and no L2 geometry,
+ * so the nodes carry the level and the size only. Without them every CPU's L2
+ * reads as shared by all eighteen, and the scheduler takes the whole package for
+ * one cache.
+ */
+/ {
+	cpus {
+		l2_cache_0: l2-cache-0 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x800000>;
+		};
+
+		l2_cache_1: l2-cache-1 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x800000>;
+		};
+
+		l2_cache_2: l2-cache-2 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x1000000>;
+		};
+	};
+};
+
+&cpu0 {
+	next-level-cache = <&l2_cache_0>;
+};
+
+&cpu1 {
+	next-level-cache = <&l2_cache_0>;
+};
+
+&cpu2 {
+	next-level-cache = <&l2_cache_0>;
+};
+
+&cpu3 {
+	next-level-cache = <&l2_cache_0>;
+};
+
+&cpu4 {
+	next-level-cache = <&l2_cache_0>;
+};
+
+&cpu5 {
+	next-level-cache = <&l2_cache_0>;
+};
+
+&cpu6 {
+	next-level-cache = <&l2_cache_1>;
+};
+
+&cpu7 {
+	next-level-cache = <&l2_cache_1>;
+};
+
+&cpu8 {
+	next-level-cache = <&l2_cache_1>;
+};
+
+&cpu9 {
+	next-level-cache = <&l2_cache_1>;
+};
+
+&cpu10 {
+	next-level-cache = <&l2_cache_1>;
+};
+
+&cpu11 {
+	next-level-cache = <&l2_cache_1>;
+};
+
+&cpu12 {
+	next-level-cache = <&l2_cache_2>;
+};
+
+&cpu13 {
+	next-level-cache = <&l2_cache_2>;
+};
+
+&cpu14 {
+	next-level-cache = <&l2_cache_2>;
+};
+
+&cpu15 {
+	next-level-cache = <&l2_cache_2>;
+};
+
+&cpu16 {
+	next-level-cache = <&l2_cache_2>;
+};
+
+&cpu17 {
+	next-level-cache = <&l2_cache_2>;
+};
+
 / {
 	compatible = "apple,j714s", "apple,t6050", "apple,arm-platform";
 	model = "Apple MacBook Pro (14-inch, M5 Pro, 2026)";
