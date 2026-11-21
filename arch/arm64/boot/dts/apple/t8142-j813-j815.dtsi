@@ -389,3 +389,23 @@
 &cpu7 { capacity-dmips-mhz = <1024>; };
 &cpu8 { capacity-dmips-mhz = <1024>; };
 &cpu9 { capacity-dmips-mhz = <1024>; };
+
+/*
+ * SIO AES engine, software keys only. It registers below the CPU's aes-ce, so
+ * it is used only when asked for by driver name.
+ */
+&ps_sio {
+	status = "okay";
+};
+
+&ps_aes {
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&aes {
+	status = "okay";
+};
