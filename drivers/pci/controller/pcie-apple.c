@@ -6880,6 +6880,9 @@ static int apple_pcie_adopted_links_ready(struct apple_pcie *pcie)
 		return -ENOLINK;
 
 	list_for_each_entry(port, &pcie->ports, entry) {
+		/* Parked for this sleep: held down on purpose, and may not answer */
+		if (pcie->t6050_parked & BIT(port->idx))
+			continue;
 		if (READ_ONCE(port->link_failed) ||
 		    !(apple_pcie_port_readl(port, PORT_STATUS) & PORT_STATUS_READY) ||
 		    (apple_pcie_port_readl(port, PORT_LINKSTS) &
@@ -6891,16 +6894,21 @@ static int apple_pcie_adopted_links_ready(struct apple_pcie *pcie)
 }
 
 /*
- * Whether apple_pcie_suspend_noirq() ends in apple_pcie_check_adopted_s2idle()
- * for this host, given that it passed the CIO-DART refusal: not in a CIO or
- * NEO sleep transaction, not a managed radio, an adopted host that is up, and
- * no firmware suspend. apple_pcie_prepare() refuses on the same terms.
+ * An adopted host that apple_pcie_suspend_noirq() puts to sleep itself, given
+ * that it passed the CIO-DART refusal: not in a CIO or NEO sleep transaction,
+ * not a managed radio, and up. For suspend-to-idle it ends in
+ * apple_pcie_check_adopted_s2idle(); for a firmware suspend in
+ * apple_pcie_t6050_sleep_down(). apple_pcie_prepare() refuses on the same terms.
  */
-static bool apple_pcie_adopted_s2idle_checked(struct apple_pcie *pcie)
+static bool apple_pcie_adopted_sleep_host(struct apple_pcie *pcie)
 {
 	return !pcie->cio_prepared && !pcie->neo_sleep_armed && !pcie->managed_sids &&
-	       pcie->hw->adopt_link && !READ_ONCE(pcie->t6050_down) &&
-	       !pm_suspend_via_firmware();
+	       pcie->hw->adopt_link && !READ_ONCE(pcie->t6050_down);
+}
+
+static bool apple_pcie_adopted_s2idle_checked(struct apple_pcie *pcie)
+{
+	return apple_pcie_adopted_sleep_host(pcie) && !pm_suspend_via_firmware();
 }
 
 /* ... and the devices below must still be in D0, before and after the sleep. */
@@ -7602,8 +7610,14 @@ static int apple_pcie_prepare(struct device *dev)
 	 * after this is still refused only there.
 	 */
 	if (pcie && pm_suspend_target_state != PM_SUSPEND_ON &&
-	    apple_pcie_adopted_s2idle_checked(pcie)) {
-		int ret = apple_pcie_adopted_links_ready(pcie);
+	    apple_pcie_adopted_sleep_host(pcie)) {
+		int ret;
+
+		/* A firmware suspend: the port and DART apple_pcie_t6050_sleep_down() takes down */
+		if (pm_suspend_via_firmware())
+			ret = pcie->t6050_port && pcie->t6050_dart ? 0 : -EBUSY;
+		else
+			ret = apple_pcie_adopted_links_ready(pcie);
 
 		if (ret) {
 			dev_warn(dev, "adopted link not kept for this sleep (%d); refusing\n",
