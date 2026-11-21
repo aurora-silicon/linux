@@ -1931,12 +1931,14 @@ void iomfb_v26_6_poweroff(struct apple_dcp *dcp)
 
 /*
  * Calls the 26.6 firmware receives from macOS before a system sleep, in the order and
- * with the inputs observed on its mailbox and RPC memory (capture run 68, n=1). Group 1, the
- * panel going off (6.9 s before the commit): A414 (8 zero bytes; reply 1), A478 (reply 1) twice,
- * A476(1), A478, A412 (reply 1), A473 (16 zero bytes; reply 8 zero bytes), A500 (0, 0). Group 2,
- * the sleep entry (49 ms before the commit): A478, A476(1), A473 (bytes 8, 11 and 12 set to 1),
- * A115 (reply 0), A500 (0, 1). What each call does is not known beyond that. @groups: 1 sends
- * group 2 only, 2 sends both. Every reply is compared with macOS's; a mismatch is -EPROTO.
+ * with the inputs observed on its mailbox and RPC memory (capture run 68, n=1).
+ * The panel-off group (6.9 s before the commit): A414 (8 zero bytes; reply 1), A478
+ * (reply 1) twice, A476(1), A478, A412 (reply 1), A473 (16 zero bytes; reply 8 zero
+ * bytes), A500 (0, 0). The sleep-entry group (49 ms before the commit): A478, A476(1),
+ * A473 (bytes 8, 11 and 12 set to 1), A115 (reply 0), A500 (0, 1). What each call does
+ * is not known beyond that. @groups: 1 sends the sleep-entry group only, 2 sends the
+ * panel-off group first, then the sleep-entry group. Every reply is compared with
+ * macOS's; a mismatch is -EPROTO.
  */
 static int dcp_v26_sleep_call(struct apple_dcp_v26 *v26, u32 tag, const void *in, u32 in_size,
 			     const void *want, u32 want_size, bool *same)

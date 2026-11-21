@@ -9475,15 +9475,6 @@ static void dcp_dpms_power_off(struct apple_dcp *dcp)
 }
 
 /*
- * J613 with the 26.6 firmware has no display sleep protocol in this driver and no restart. Under
- * the sleep driver, which refuses a sleep while a bound display coprocessor runs, its .suspend
- * stops the coprocessor cold, as macOS's last write to it does, and the sleep driver lowers
- * its domains. The display stays dark until a reboot: this is for qualifying the sleep's entry.
- *
- * Not in the sleep driver's dry run, which returns before its commit: there the coprocessor is
- * left running and takes the ordinary suspend below, and the sleep driver doesn't count it.
- */
-/*
  * J613 trial: the generic end of macOS's DCP shutdown before the cold stop. macOS ends it with AP
  * then IOP idle and the run bit off twice (capture run 51); Linux only clears the run bit. This
  * asks RTKit for idle first (the secure port's AP idle as in dcp_s2r_quiesce), logs the result,
@@ -9497,6 +9488,15 @@ module_param(v26_sleep_calls, int, 0444);
 MODULE_PARM_DESC(v26_sleep_calls, "The 26.6 firmware's calls observed before macOS's sleep, sent before the RTKit idle and cold stop (1: the sleep-entry group, 2: the panel-off group first)");
 MODULE_PARM_DESC(v26_sleep_rtkit_idle, "RTKit AP and IOP idle before the DCP's cold stop for a sleep, as macOS ends its shutdown");
 
+/*
+ * J613 with the 26.6 firmware has no display sleep protocol in this driver and no restart. Under
+ * the sleep driver, which refuses a sleep while a bound display coprocessor runs, its .suspend
+ * stops the coprocessor cold, as macOS's last write to it does, and the sleep driver lowers
+ * its domains. The display stays dark until a reboot: this is for qualifying the sleep's entry.
+ *
+ * Not in the sleep driver's dry run, which returns before its commit: there the coprocessor is
+ * left running and takes the ordinary suspend below, and the sleep driver doesn't count it.
+ */
 static bool dcp_j613_sleep_owned(struct apple_dcp *dcp)
 {
 	return IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) && dcp->fw_compat == DCP_FIRMWARE_V_26_6 &&
