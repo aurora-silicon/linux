@@ -779,12 +779,22 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 		BRCMF_PCIE_CFGREG_REG_BAR2_CONFIG,
 		BRCMF_PCIE_CFGREG_REG_BAR3_CONFIG
 	};
+	bool fn_reset = false;
 	u32 i;
 	u32 val;
 	u32 lsc;
 
 	if (!devinfo->ci)
 		return;
+
+	/*
+	 * On chipcommon rev >= 65 the watchdog below also resets PCIe function
+	 * 0 (CC_WD_SSRESET_PCIE_F0_EN), which puts its config space back to the
+	 * chip defaults: e.g. the resizable BAR 2 drops from the size the PCI
+	 * core assigned to 8 MiB. Save what the PCI core programmed, before
+	 * ASPM is turned off for the reset, so it can be put back afterwards.
+	 */
+	pci_save_state(devinfo->pdev);
 
 	/* Disable ASPM */
 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
@@ -800,6 +810,8 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 
 	if (core->rev >= 65) {
 		u32 mask = CC_WD_SSRESET_PCIE_F0_EN;
+
+		fn_reset = true;
 
 		core = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_PCIE2);
 		if (core->rev < 66)
@@ -825,6 +837,16 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
 	pci_write_config_dword(devinfo->pdev, BRCMF_PCIE_REG_LINK_STATUS_CTRL,
 			       lsc);
+
+	/*
+	 * Put the PCI core's configuration back. Otherwise the function runs
+	 * with the reset defaults while the core still holds the assigned
+	 * values, and the next pci_restore_state() (system resume) rewrites
+	 * them on a live, bus-mastering function: BAR 2 changes size under
+	 * running firmware.
+	 */
+	if (fn_reset)
+		pci_restore_state(devinfo->pdev);
 
 	core = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_PCIE2);
 	if (core->rev <= 13) {
