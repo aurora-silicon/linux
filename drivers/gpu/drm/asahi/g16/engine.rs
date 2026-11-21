@@ -760,6 +760,16 @@ impl Firmware {
         self.service_power()?;
         self.drain_rings()?;
         self.check_hangs(done)?;
+        self.publish_checked(done)
+    }
+
+    /// [`Self::publish`] for a poll pass, which has already checked the session and the
+    /// objects, drained the receive rings and checked for hangs under this device lock: they
+    /// are not repeated.
+    pub(crate) fn publish_checked(&mut self, done: &mut Completions) -> Result {
+        if self.session.shared.sleeping.load(core::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         // The initial G16 backend deliberately serializes hardware publication. Stronger
         // ordering satisfies Mesa's barriers while slot displacement and cache ownership
         // stay explicit. Never enable G15's submit-ahead policy on the M4 wire by accident.
