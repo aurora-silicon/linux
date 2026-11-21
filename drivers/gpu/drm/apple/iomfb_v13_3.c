@@ -38,7 +38,23 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 #define DCP_FW v13_3
 #define DCP_FW_VER DCP_FW_VERSION(13, 3, 0)
 
+#define DCP_HAS_T602X_PEER
 #include "iomfb_template.c"
+
+void iomfb_complete_pair_v13_3(struct apple_dcp *dcp, u32 id, ktime_t displayed)
+{
+	dcp_report_swap_complete(dcp, id, displayed);
+}
+
+static u32 t602x_set_tiling(struct apple_dcp *dcp, struct dcpep_get_tiling_state_req *req)
+{
+	u32 value = req->value;
+
+	return !req->value_null && dcp_t602x_tiling(dcp, true, req->event, req->param, &value);
+}
+
+TRAMPOLINE_INOUT(trampoline_t602x_set_tiling, t602x_set_tiling,
+		 struct dcpep_get_tiling_state_req, u32);
 
 static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[0] = trampoline_true, /* did_boot_signal */
@@ -59,7 +75,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[112] = trampoline_create_backlight_service,
 	[113] = trampoline_true, /* create_nvram_service? */
 	[114] = trampoline_get_tiling_state,
-	[115] = trampoline_false, /* set_tiling_state */
+	[115] = trampoline_t602x_set_tiling,
 	[120] = dcpep_cb_boot_1,
 	[121] = trampoline_false, /* is_dark_boot */
 	[122] = trampoline_false, /* is_dark_boot / is_waking_from_hibernate*/

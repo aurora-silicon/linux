@@ -302,6 +302,40 @@ static bool dcp_typec_safe_held(struct apple_dcp *dcp)
 	return false;
 }
 
+static int dcp_t602x_claim_port_locked(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+	if (dcp->fixed_phy || dcp->active_typec_route || dcp_typec_safe_held(dcp) ||
+	    dcp_t602x_port_reserved(dcp) ||
+	    READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->crashed))
+		return -EBUSY;
+	WRITE_ONCE(dcp->t602x_peer_reserved, true);
+	return 0;
+}
+
+/* Route activation and peer claims exclude each other under the fabric lock. */
+int dcp_t602x_claim_port(struct apple_dcp *dcp, bool fabric_held)
+{
+	int ret;
+
+	if (fabric_held)
+		return dcp_t602x_claim_port_locked(dcp);
+
+	/* Route teardown can hold the fabric lock while waiting for external_lock. */
+	if (!mutex_trylock(&dcp_typec_fabric_lock))
+		return -EAGAIN;
+	ret = dcp_t602x_claim_port_locked(dcp);
+	mutex_unlock(&dcp_typec_fabric_lock);
+	return ret;
+}
+
+/* The pair mutex serializes release against another claim. */
+void dcp_t602x_release_port(struct apple_dcp *dcp)
+{
+	/* Publish the stop and cleanup before the fabric can reuse the pipe. */
+	smp_store_release(&dcp->t602x_peer_reserved, false);
+}
+
 /*
  * A pipeline that can take no Type-C display: its fixed output is live, or
  * it is a T6030 external processor that failed (handoff check, start, or a
@@ -312,7 +346,8 @@ static bool dcp_typec_route_busy(struct apple_dcp_typec_route *route)
 {
 	struct apple_dcp *dcp = route->dcp;
 
-	return dcp_typec_route_fixed_output_busy(route) ||
+	return dcp_t602x_port_reserved(dcp) ||
+	       dcp_typec_route_fixed_output_busy(route) ||
 	       (dcp->external_native && iomfb_v14_7_external_failed(dcp));
 }
 
@@ -628,6 +663,8 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		dcp_typec_route_connector(route, xbar != route->xbar);
 	int ret;
 
+	if (dcp_t602x_port_reserved(dcp))
+		return -EBUSY;
 	dcp_tb_events_retire(dcp);
 
 	/* Never select a DP PHY output that has no DP PHY behind it. */
@@ -787,6 +824,12 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		dcp_peer_release_26_6(dcp);
 
 	guard(mutex)(&dcp->external_lock);
+	/* Both engines must stop before this route can release its crossbar. */
+	if (dcp->active_typec_route == route) {
+		ret = dcp_t602x_stop(dcp);
+		if (ret)
+			return ret;
+	}
 	if (dcp_is_retained_external(dcp) &&
 	    (dcp->external_error || (dcp->external_power_attempted && !dcp->external_stopped)))
 		return dcp->external_error ?: -EAGAIN;

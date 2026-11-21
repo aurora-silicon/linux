@@ -286,6 +286,7 @@ struct apple_dcp_hw_data {
 	u32 firmware_request;
 	/* M2 Pro/Max laptop T6020 Thunderbolt flow, from the match data */
 	bool t6020_tunnel_flow;
+	bool t602x_paired_dp;
 	/*
 	 * A processor Linux starts itself on 14.7 firmware through the IOMFB
 	 * template whose AFK, DPTX and DPAV endpoints speak the 14.7 protocol
@@ -497,6 +498,12 @@ struct apple_dcp {
 	struct delayed_work hybrid_wq;
 	struct dcp_peer_tiling peer_tiling;
 	bool peer_unbinding;
+	bool t602x_peer_reserved; /* Claimed under the fabric lock, released after stop. */
+	u32 t602x_pair_clock, t602x_frame_id;
+	bool t602x_frame_waiting;
+	atomic64_t t602x_frame_ns;
+	struct completion t602x_frame_done;
+	struct t602x_scanout *t602x_scanout;
 	/*
 	 * T6050: the platform limit left this display no pair when last
 	 * evaluated (dcp_peer_hints_v27(), dcp_peer_limit_update_v27()). Under
@@ -514,6 +521,7 @@ struct apple_dcp {
 	bool peer_complete_logged;
 	struct platform_device *piodma;
 	bool piodma_created;
+	bool piodma_domain_held;
 	struct iommu_domain *iommu_dom;
 	/* which of the nine cumulative A031 notify-client states to send next */
 	unsigned int a031_step;
@@ -1168,6 +1176,12 @@ struct apple_dcp {
 };
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
+static inline bool dcp_t602x_port_reserved(const struct apple_dcp *dcp)
+{
+	/* Observe pair cleanup after dcp_t602x_release_port() hands back the pipe. */
+	return smp_load_acquire(&dcp->t602x_peer_reserved);
+}
+
 static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
 {
 	return IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132) &&

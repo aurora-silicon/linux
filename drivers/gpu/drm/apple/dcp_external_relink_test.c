@@ -150,7 +150,7 @@ static void relink_test_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_com
 		wait_for_completion(&t->modeset_release);
 	}
 	if (t->real_modeset) {
-		t->modeset_ret = dcp_crtc_atomic_modeset(crtc, state);
+		t->modeset_ret = dcp_crtc_atomic_modeset(crtc, state, false);
 		return;
 	}
 	dcp_mode_begin(&t->dcp.mode_state);

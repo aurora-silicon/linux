@@ -24,6 +24,7 @@
 #include <kunit/visibility.h>
 
 #include "afk.h"
+#include "dcp.h"
 #include "afkv2-codec.h"
 #include "afk_reply.h"
 #include "trace.h"
@@ -97,7 +98,10 @@ static void afk_release_context(void *data)
 	if (afkep->dcp->v27_sleep_transport &&
 	    afkep->endpoint >= 0x20 && afkep->endpoint < 0x40)
 		cmpxchg(&afkep->dcp->sleep_v27_ep[afkep->endpoint - 0x20], afkep, NULL);
-	if (!afkep->dcp->retain_dma) {
+	if (!READ_ONCE(afkep->dcp->retain_dma)) {
+		if (afkep->owns_bfr)
+			dma_free_coherent(afkep->dcp->dev, afkep->bfr_size, afkep->bfr,
+					  afkep->bfr_dma);
 		kvfree(afkep->command_tags);
 		kfree(afkep);
 	}
@@ -287,8 +291,10 @@ static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
 		ep->bfr = ep->dcp->afk_alloc(ep->dcp, size, &ep->bfr_dma);
 		if (IS_ERR(ep->bfr))
 			ep->bfr = NULL;
-	} else if (READ_ONCE(ep->dcp->retain_dma)) {
+	} else if (READ_ONCE(ep->dcp->retain_dma) || dcp_t602x_ext13_5(ep->dcp)) {
+		/* A T602x pair can lose its stop acknowledgment after ring setup. */
 		ep->bfr = dma_alloc_coherent(ep->dcp->dev, size, &ep->bfr_dma, GFP_KERNEL);
+		ep->owns_bfr = !!ep->bfr;
 	} else {
 		ep->bfr = dmam_alloc_coherent(ep->dcp->dev, size, &ep->bfr_dma, GFP_KERNEL);
 	}

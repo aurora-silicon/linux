@@ -36,6 +36,8 @@ struct dcp_parse_ctx {
 	 * the H17P external color policy.
 	 */
 	bool metadata_timing;
+	/* T602x 13.5 uses the catalogue clock to verify paired readback. */
+	bool t602x_pair_timing;
 	/*
 	 * A firmware 27 external processor: for SDR, prefer the timing's
 	 * Default RGB element, as macOS does, over a higher-scored BT.2020 one.
@@ -144,6 +146,7 @@ struct dcp_display_mode {
 	struct drm_display_mode mode;
 	u32 color_mode_id;
 	u32 timing_mode_id;
+	u32 t602x_clock_hz;
 	u32 min_vrr;
 	u32 max_vrr;
 	struct dcp_color_mode sdr_rgb;

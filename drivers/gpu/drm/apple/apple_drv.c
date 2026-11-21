@@ -14,6 +14,7 @@
 #include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-mapping.h>
+#include <linux/iommu.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -22,6 +23,7 @@
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/ratelimit.h>
+#include <linux/sched.h>
 #include <linux/workqueue.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/display.h>
@@ -38,6 +40,8 @@
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_managed.h>
+#include <drm/drm_modeset_lock.h>
 #include <drm/drm_print.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_mode.h>
@@ -64,6 +68,10 @@
 
 struct apple_drm_private {
 	struct drm_device drm;
+	struct drm_modeset_lock t602x_topology_lock;
+	struct workqueue_struct *commit_wq;
+	struct task_struct *shutdown_task;
+	bool t602x_topology_pending;
 	/*
 	 * A T6041 panel refused the takeover trial: the boot framebuffer keeps
 	 * the screen, the DRM device stays unregistered and its DCPs running.
@@ -403,7 +411,7 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 		dcp_external_recover(to_apple_crtc(crtc)->dcp);
 	}
 	if (crtc_state->active) {
-		ret = dcp_crtc_atomic_modeset(crtc, commit);
+		ret = dcp_crtc_atomic_modeset(crtc, commit, locked);
 		if (ret) {
 			if (dcp_is_ext26(dcp))
 				goto failed;
@@ -573,8 +581,13 @@ static struct drm_atomic_commit *apple_atomic_state_alloc(struct drm_device *dev
 
 static void apple_atomic_state_clear(struct drm_atomic_commit *state)
 {
+	struct apple_atomic_state *apple = to_apple_atomic_state(state);
+
 	drm_atomic_commit_default_clear(state);
-	to_apple_atomic_state(state)->failed_routes = 0;
+	apple->failed_routes = 0;
+	apple->t602x_topology = false;
+	kfree(apple->t602x);
+	apple->t602x = NULL;
 }
 
 static void apple_atomic_state_free(struct drm_atomic_commit *state)
@@ -707,13 +720,24 @@ static void apple_fail_lost_flips(struct drm_atomic_commit *state)
 
 static void apple_atomic_commit_tail(struct drm_atomic_commit *state);
 
+static bool apple_t602x_topology_pending(const struct apple_drm_private *apple)
+{
+	/* Observe topology cleanup published by apple_commit_tail(). */
+	return smp_load_acquire(&apple->t602x_topology_pending);
+}
+
 /* The helper's commit_tail() with the bounded fence wait. */
 static void apple_commit_tail(struct drm_atomic_commit *state)
 {
+	struct apple_drm_private *apple = container_of(state->dev, struct apple_drm_private, drm);
+
 	apple_wait_for_fences(state->dev, state, false);
 	drm_atomic_helper_wait_for_dependencies(state);
 	apple_atomic_commit_tail(state);
 	drm_atomic_helper_commit_cleanup_done(state);
+	if (to_apple_atomic_state(state)->t602x_topology)
+		/* Publish route and pair changes after topology tail cleanup. */
+		smp_store_release(&apple->t602x_topology_pending, false);
 	drm_atomic_commit_put(state);
 }
 
@@ -728,9 +752,10 @@ static void apple_commit_work(struct work_struct *work)
  * helper's unbounded wait. The driver keeps no self-refresh state, so the
  * helper's self-refresh accounting is left out.
  */
-static int apple_atomic_commit(struct drm_device *dev,
-			       struct drm_atomic_commit *state, bool nonblock)
+static int apple_atomic_commit_live(struct drm_device *dev,
+				    struct drm_atomic_commit *state, bool nonblock)
 {
+	struct apple_drm_private *apple = container_of(dev, struct apple_drm_private, drm);
 	int ret;
 
 	if (state->async_update) {
@@ -764,9 +789,13 @@ static int apple_atomic_commit(struct drm_device *dev,
 	if (ret)
 		goto err;
 
+	if (to_apple_atomic_state(state)->t602x_topology) {
+		/* Publish the pending tail before the topology lock is dropped. */
+		smp_store_release(&apple->t602x_topology_pending, true);
+	}
 	drm_atomic_commit_get(state);
 	if (nonblock)
-		queue_work(system_dfl_wq, &state->commit_work);
+		queue_work(apple->commit_wq ?: system_dfl_wq, &state->commit_work);
 	else
 		apple_commit_tail(state);
 
@@ -777,11 +806,74 @@ err:
 	return ret;
 }
 
+static int apple_atomic_commit(struct drm_device *dev,
+			       struct drm_atomic_commit *state, bool nonblock)
+{
+	struct apple_drm_private *apple = container_of(dev, struct apple_drm_private, drm);
+	int idx, ret;
+
+	/* The synchronous disable of this unbound device runs on this task. */
+	if (!apple->commit_wq || READ_ONCE(apple->shutdown_task) == current)
+		return apple_atomic_commit_live(dev, state, nonblock);
+
+	if (!drm_dev_enter(dev, &idx))
+		return -ENODEV;
+	ret = apple_atomic_commit_live(dev, state, nonblock);
+	drm_dev_exit(idx);
+	return ret;
+}
+
+static int apple_atomic_check_live(struct drm_device *dev, struct drm_atomic_commit *state)
+{
+	struct apple_drm_private *apple = container_of(dev, struct apple_drm_private, drm);
+	int ret;
+
+	ret = drm_atomic_helper_check(dev, state);
+	if (ret || !dcp_t602x_topology_changed(state))
+		return ret;
+	if (state->async_update)
+		return -EINVAL;
+
+	ret = drm_modeset_lock(&apple->t602x_topology_lock, state->acquire_ctx);
+	if (ret)
+		return ret;
+	/* Reject topology changes while an earlier tail may still own its peer. */
+	if (apple_t602x_topology_pending(apple))
+		return -EBUSY;
+
+	ret = dcp_t602x_plan_commit(state);
+	if (!ret)
+		to_apple_atomic_state(state)->t602x_topology = true;
+	return ret;
+}
+
+static int apple_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state)
+{
+	struct apple_drm_private *apple = container_of(dev, struct apple_drm_private, drm);
+	int idx, ret;
+
+	if (!apple->commit_wq)
+		return drm_atomic_helper_check(dev, state);
+	if (READ_ONCE(apple->shutdown_task) == current)
+		return apple_atomic_check_live(dev, state);
+
+	if (!drm_dev_enter(dev, &idx))
+		return -ENODEV;
+	ret = apple_atomic_check_live(dev, state);
+	drm_dev_exit(idx);
+	return ret;
+}
+
+static void apple_t602x_topology_fini(struct drm_device *dev, void *data)
+{
+	drm_modeset_lock_fini(data);
+}
+
 static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.atomic_state_alloc	= apple_atomic_state_alloc,
 	.atomic_state_clear	= apple_atomic_state_clear,
 	.atomic_state_free	= apple_atomic_state_free,
-	.atomic_check		= drm_atomic_helper_check,
+	.atomic_check		= apple_atomic_check,
 	.atomic_commit		= apple_atomic_commit,
 	.fb_create		= drm_gem_fb_create,
 };
@@ -1686,6 +1778,43 @@ static int apple_drm_init_dcp(struct device *dev)
 	return 0;
 }
 
+static void apple_drm_destroy_commit_wq(struct drm_device *dev, void *data)
+{
+	destroy_workqueue(data);
+}
+
+static int apple_drm_init_paired_commits(struct apple_drm_private *apple)
+{
+	int ret;
+
+	if (!dcp_t602x_has_pair_engine(&apple->drm))
+		return 0;
+
+	drm_modeset_lock_init(&apple->t602x_topology_lock);
+	ret = drmm_add_action_or_reset(&apple->drm, apple_t602x_topology_fini,
+				       &apple->t602x_topology_lock);
+	if (ret)
+		return ret;
+
+	/* Match system_dfl_wq's concurrency and allow a per-device teardown flush. */
+	apple->commit_wq = alloc_workqueue("apple-drm-commit", WQ_UNBOUND, WQ_MAX_ACTIVE);
+	if (!apple->commit_wq)
+		return -ENOMEM;
+	return drmm_add_action_or_reset(&apple->drm, apple_drm_destroy_commit_wq,
+					apple->commit_wq);
+}
+
+static void apple_drm_unplug_atomic(struct apple_drm_private *apple)
+{
+	/*
+	 * Unplug drains guarded checks and the prepare/swap phase of commits.
+	 * Then wait for any asynchronous tails they queued before returning.
+	 */
+	drm_dev_unplug(&apple->drm);
+	if (apple->commit_wq)
+		flush_workqueue(apple->commit_wq);
+}
+
 static int apple_drm_init(struct device *dev)
 {
 	struct apple_drm_private *apple;
@@ -1744,6 +1873,10 @@ static int apple_drm_init(struct device *dev)
 		return ret;
 
 	ret = apple_drm_init_dcp(dev);
+	if (ret)
+		goto err_unbind;
+
+	ret = apple_drm_init_paired_commits(apple);
 	if (ret)
 		goto err_unbind;
 
@@ -1822,7 +1955,7 @@ static int apple_drm_init(struct device *dev)
 			if (ret) {
 				drm_modeset_unlock_all(&apple->drm);
 				t8132_ext_drm_fini(&apple->drm);
-				drm_dev_unregister(&apple->drm);
+				apple_drm_unplug_atomic(apple);
 				goto err_unbind;
 			}
 		}
@@ -1844,7 +1977,7 @@ static int apple_drm_init(struct device *dev)
 	ret = apple_g15_display_publish(dev);
 	if (ret) {
 		t8132_ext_drm_fini(&apple->drm);
-		drm_dev_unregister(&apple->drm);
+		apple_drm_unplug_atomic(apple);
 		goto err_unbind;
 	}
 
@@ -1879,8 +2012,10 @@ static void apple_drm_uninit(struct device *dev)
 	/* Before anything of the DRM device is torn down. */
 	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
-	drm_dev_unplug(&apple->drm);
+	apple_drm_unplug_atomic(apple);
+	WRITE_ONCE(apple->shutdown_task, current);
 	drm_atomic_helper_shutdown(&apple->drm);
+	WRITE_ONCE(apple->shutdown_task, NULL);
 
 	component_unbind_all(dev, NULL);
 
@@ -1903,14 +2038,25 @@ const struct component_master_ops apple_drm_ops = {
 	.unbind	= apple_drm_unbind,
 };
 
+static void apple_put_scanout_domain(void *data)
+{
+	struct device *dev = data;
+
+	device_lock_assert(dev);
+	if (!dcp_session_retained(dev))
+		iommu_device_unuse_default_domain(dev);
+}
+
 static int add_dcp_components(struct device *dev,
-			      struct component_match **matchptr)
+			      struct component_match **matchptr, bool *paired)
 {
 	struct device_node *np, *endpoint, *port;
 	int num = 0;
 
 	for_each_matching_node(np, apple_dcp_id_tbl) {
 		if (apple_dcp_usable(np)) {
+			if (of_device_is_compatible(np, "apple,t6020-dcpext"))
+				*paired = true;
 			drm_of_component_match_add(dev, matchptr,
 						   component_compare_of, np);
 			num++;
@@ -1953,12 +2099,26 @@ static int apple_platform_probe(struct platform_device *pdev)
 {
 	struct device *mdev = &pdev->dev;
 	struct component_match *match = NULL;
+	bool paired = false;
 	int num_dcp, ret;
 
+	if (dcp_session_retained(mdev))
+		return dev_err_probe(mdev, -EBUSY,
+				     "previous paired scanout still owns the DMA domain\n");
+
 	/* add DCP components, handle less than 1 as probe error */
-	num_dcp = add_dcp_components(mdev, &match);
+	num_dcp = add_dcp_components(mdev, &match, &paired);
 	if (num_dcp < 1)
 		return -ENODEV;
+	if (paired) {
+		/* Keep GEM mappings valid if a pair outlives platform unbind. */
+		ret = iommu_device_use_default_domain(mdev);
+		if (ret)
+			return ret;
+		ret = devm_add_action_or_reset(mdev, apple_put_scanout_domain, mdev);
+		if (ret)
+			return ret;
+	}
 
 	ret = component_master_add_with_match(mdev, &apple_drm_ops, match);
 	if (ret)

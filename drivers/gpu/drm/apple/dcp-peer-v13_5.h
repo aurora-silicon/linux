@@ -16,6 +16,9 @@
 #define T602X_TIMING_SIZE	0x50
 #define T602X_CLOCK_OFFSET	0x44
 
+/* Merge timing and color identifiers use a separate firmware namespace. */
+#define DCP_SPLIT_MODE_SUFFIX	800U
+
 static inline u32 dcp_t602x_wire_clock(const u8 *timing, size_t size)
 {
 	return size == T602X_TIMING_SIZE ? get_unaligned_le32(timing + T602X_CLOCK_OFFSET) : 0;

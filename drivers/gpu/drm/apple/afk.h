@@ -547,6 +547,7 @@ struct apple_dcp_afkep {
 	size_t ext26_command_bytes;
 	unsigned int ext26_command_count;
 	dma_addr_t bfr_dma;
+	bool owns_bfr;
 
 	struct afk_ringbuffer txbfr;
 	struct afk_ringbuffer rxbfr;

@@ -1022,9 +1022,11 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		    of_device_is_compatible(dcp->dev->of_node, "apple,t6020-dcpext") &&
 		    data_size == sizeof(struct dcp_display_hints_v13_5)) {
 			ret = dcp_no_peer_hints_v13_5(data, reply, reply_size);
-			if (!ret)
-				dptxport_note_tile_hint(service, data, data_size);
-			return ret;
+			if (ret)
+				return ret;
+			dptxport_note_tile_hint(service, data, data_size);
+			dcp_t602x_display_hints(dcp, reply);
+			return 0;
 		}
 
 		/*
@@ -1608,7 +1610,9 @@ int dptx_controller_init(struct apple_dcp *dcp)
 
 	init_completion(&dcp->dptx_controller_ready);
 	ep = afk_init(dcp, DPTX_CONTROLLER_ENDPOINT,
-		      dcp_is_ext26(dcp) ? dptx_native_controller_ops : dptx_controller_ops);
+		      (dcp_is_ext26(dcp) || (dcp->fw_compat == DCP_FIRMWARE_V_13_5 &&
+			    of_device_is_compatible(dcp->dev->of_node, "apple,t6020-dcpext"))) ?
+		      dptx_native_controller_ops : dptx_controller_ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	/* Controller interfaces require the same OPEN handshake as the port. */
