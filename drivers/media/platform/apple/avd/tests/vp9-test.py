@@ -208,6 +208,42 @@ int main(int argc,char **argv) {
   assert(p->bank[0].busy&&p->bank[1].busy);
   avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
  }
+ /* After a frame size change the temporal-MV input is not the prior bank. */
+ params=(struct v4l2_ctrl_vp9_frame){.flags=V4L2_VP9_FRAME_FLAG_SHOW_FRAME,
+  .frame_width_minus_1=1919,.frame_height_minus_1=1087,.bit_depth=8};
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ struct avd_vp9_bank *shown=p->b;
+ params.frame_width_minus_1=1899;params.frame_height_minus_1=1079;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(!avd_vp9_run(&ctx));
+ assert(p->b!=shown&&p->last.width==1900&&p->last.height==1080);
+ {bool prior_color=false;u32 *words=program.cpu;
+  for(size_t j=0;j<frame.prog_words;j++)if(words[j]==(shown->bufs.color.addr>>8))prior_color=true;
+  assert(!prior_color);}
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
+ /* A 1440x1088 reference of a 1920x1088 frame: vertical scale high, horizontal low. */
+ params.frame_width_minus_1=1919;params.frame_height_minus_1=1087;reference.vp9.width=1440;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ {bool scale=false;u32 *words=program.cpu;
+  for(size_t j=0;j<frame.prog_words;j++){assert(words[j]!=0x30004000);if(words[j]==0x40003000)scale=true;}
+  assert(scale);}
+ reference.vp9.width=1920;avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ /* Only a frame size change clears the segmentation state in the seg buffer. */
+ for(unsigned int i=0;i<p->nbanks;i++)memset(p->bank[i].bufs.seg.cpu,0xa5,p->bank[i].bufs.seg.size);
+ params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ assert(((u8 *)p->b->bufs.seg.cpu)[0]==0xa5);
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ params.frame_width_minus_1=1899;params.frame_height_minus_1=1079;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(!avd_vp9_run(&ctx));
+ {u8 *seg=p->b->bufs.seg.cpu;for(size_t j=0;j<p->b->bufs.seg.size;j++)assert(!seg[j]);}
+ avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);params.seg.flags=0;
+ /* A frame smaller than the capture format runs in it, a larger one is refused. */
+ params.frame_width_minus_1=959;params.frame_height_minus_1=539;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ assert(dst[0].vp9.width==960&&dst[0].vp9.height==540);
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ params.frame_width_minus_1=1983;params.frame_height_minus_1=1087;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(avd_vp9_run(&ctx)==-EINVAL);
  avd_vp9_stop(&ctx);assert(!avd_vp9_ready(&ctx));
  /* Old firmware and the legacy transport allocate only one bank. */
  for(unsigned int mode=0;mode<2;mode++) {
