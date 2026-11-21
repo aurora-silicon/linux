@@ -53,6 +53,7 @@
 #include <linux/ktime.h>
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
@@ -596,6 +597,8 @@ struct apple_sleep_ops {
 	/* After final peer stops: errors are fatal, never a veto. */
 	int (*commit_notice)(struct apple_sleep *s);
 	void (*finish)(struct apple_sleep *s);
+	/* Optional: the PMU's wake steps, after the SMC's first wake commands */
+	void (*pmu_wake)(struct apple_sleep *s);
 	int (*cpu_prepare)(u64 mpidr);
 	void (*cpu_restore)(u64 mpidr);
 	/* Optional: a stopped core's own last steps and WFI at the commit (never returns) */
@@ -1198,6 +1201,21 @@ void apple_sleep_usb_set_asleep(bool asleep)
 	WRITE_ONCE(sleep_usb_asleep, asleep);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_usb_set_asleep);
+
+/* J714s: see apple_sleep_late_scope_begin() */
+static BLOCKING_NOTIFIER_HEAD(sleep_usb_asleep_chain);
+
+int apple_sleep_usb_asleep_notifier_register(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&sleep_usb_asleep_chain, nb);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_usb_asleep_notifier_register);
+
+void apple_sleep_usb_asleep_notifier_unregister(struct notifier_block *nb)
+{
+	blocking_notifier_chain_unregister(&sleep_usb_asleep_chain, nb);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_usb_asleep_notifier_unregister);
 
 static unsigned long sleep_usb_wake_ports;
 
@@ -2504,16 +2522,14 @@ static void sleep_cpu_down_off(u64 mpidr)
 }
 
 /*
- * apple_sleep.cpu_on_trace: after a sleep, one line per core start. aura's spin-table slot is
+ * After a sleep, one line per core start, when its dynamic debug site is on (no runtime switch;
+ * without CONFIG_DYNAMIC_DEBUG it is compiled out, and so is its wait). aura's spin-table slot is
  * { mpidr, flag, target, ... } with cpu-release-addr = &target, and aura bumps flag as the core
  * enters its reset path: "flag a -> b" tells a core that never left reset from one that ran
  * and stopped later (in the kernel's pen or its bring-up). Also the cpu-start words before and
- * after, the core's power and power-gate words and its EDPRSR (bit 0 PU).
+ * after, the core's power and power-gate words and its EDPRSR (bit 0 PU). On with
+ * dyndbg="func sleep_cpu_on +p" (only +p matters: the line is a pr_info).
  */
-static bool sleep_cpu_on_trace = true;
-module_param_named(cpu_on_trace, sleep_cpu_on_trace, bool, 0644);
-MODULE_PARM_DESC(cpu_on_trace, "Report each core start after a sleep (aura slot flag, cpu-start words, EDPRSR)");
-
 static void __iomem *sleep_cpu_slot[NR_CPUS];
 
 static void __iomem *sleep_cpu_slot_map(int cpu)
@@ -2552,14 +2568,17 @@ static int sleep_cpu_on(u64 mpidr)
 {
 	struct apple_sleep *s = apple_sleep;
 	unsigned int cluster = sleep_cpu_cluster(s, mpidr), core = sleep_cpu_core(mpidr);
-	bool trace = READ_ONCE(sleep_cpu_on_trace) && s->soc->cpu_clusters >= 2;
 	int cpu = get_logical_index(mpidr & MPIDR_HWID_BITMASK);
-	void __iomem *slot = trace ? sleep_cpu_slot_map(cpu) : NULL;
+	void __iomem *slot = NULL;
 	u32 before[4], after[4], ps = 0, gate = 0, edprsr = ~0U;
 	u64 flag0 = 0, flag1 = 0;
 	unsigned int us = 0;
+	bool trace;
+	DEFINE_DYNAMIC_DEBUG_METADATA(cpu_on_trace, "apple-sleep: cpu start after a sleep\n");
 
+	trace = DYNAMIC_DEBUG_BRANCH(cpu_on_trace) && s->soc->cpu_clusters >= 2;
 	if (trace) {
+		slot = sleep_cpu_slot_map(cpu);
 		sleep_cpu_start_words(s, before);
 		if (slot)
 			flag0 = sleep_cpu_slot_read(slot, 8);
@@ -6530,6 +6549,9 @@ static void apple_sleep_end(void)
 	sleep_v27_scope_end();
 	if (pm_suspend_via_firmware() && apple_sleep->soc->ops->finish)
 		apple_sleep->soc->ops->finish(apple_sleep);
+	/* Nothing left by now after a wake; the platform wake takes it */
+	if (pm_suspend_via_firmware() && apple_sleep->soc->ops->pmu_wake)
+		apple_sleep->soc->ops->pmu_wake(apple_sleep);
 	if (pm_suspend_via_firmware() && !apple_sleep->soc->no_wd2)
 		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
 }
@@ -6776,6 +6798,8 @@ static void apple_sleep_smc_scope_end(void)
 	ret = s->smc.saved_ops->end(s->smc.data);
 	if (ret)
 		dev_err(s->smc.dev, "SMC state not restored after the sleep: %d\n", ret);
+	else if (s->smc.saved_ops->woken)
+		s->smc.saved_ops->woken(s->smc.data);
 	s->smc.held = false;
 	device_unlock(s->smc.dev);
 }
@@ -6783,7 +6807,15 @@ static void apple_sleep_smc_scope_end(void)
 static int apple_sleep_late_scope_begin(void)
 {
 	const char *step = "V27 display scope";
-	int ret = sleep_v27_scope_begin();
+	int ret;
+
+	/*
+	 * J714s: every device's noirq suspend is done, the USB PHYs' stops with them. macOS opens
+	 * its USB-C port controllers' USBw 0x09 window 0.5 ms after the port's ATC PHY CPU stops,
+	 * before the SMC's slpa (traced on the J714s).
+	 */
+	blocking_notifier_call_chain(&sleep_usb_asleep_chain, READ_ONCE(sleep_usb_asleep), NULL);
+	ret = sleep_v27_scope_begin();
 
 	if (!ret) {
 		step = "SMC scope";
@@ -6886,7 +6918,10 @@ static void apple_sleep_report(void)
 	sleep_note(s, 0x7e);
 	if (s->soc->ops->finish)
 		s->soc->ops->finish(s);
+	/* AP ON, then the SMC's wake record and waka, then the PMU's wake steps: macOS's order */
 	apple_sleep_smc_scope_end();
+	if (s->soc->ops->pmu_wake)
+		s->soc->ops->pmu_wake(s);
 	sleep_v27_scope_end();
 	s->smc_woke_alone = false;
 	if (!s->returned)
@@ -7631,11 +7666,8 @@ EXPORT_SYMBOL_GPL(apple_sleep_display_v27_power_ready);
  * the display coprocessor after a wake, outside a system sleep, in this order and with these
  * values. No PMC word is written here: the display driver does the PMC requests around this. The
  * display pipe DART's Linux-owned streams are remembered before the power-off and written back
- * after the power-on (m5_disp_dart_rewrite). The sleep's own entry and exit don't call this.
+ * after the power-on. The sleep's own entry and exit don't call this.
  */
-static bool t6050_disp_dart_rewrite = true;
-module_param_named(m5_disp_dart_rewrite, t6050_disp_dart_rewrite, bool, 0644);
-
 static void __iomem *t6050_disp_dcp_gate;
 
 static int t6050_disp_ps_settle(void __iomem *word, u32 mask, u32 want)
@@ -7671,15 +7703,13 @@ int apple_sleep_m5_display_power(bool on)
 		writel(0, t6050_disp_dcp_gate + 0x1c);
 		writel(1, t6050_disp_dcp_gate + 0x40);
 		writel(0x1f00000f, cpu);
-		if (t6050_disp_dart_rewrite)
-			apple_dart_m5_display_rewrite(NULL);
+		apple_dart_m5_display_rewrite(NULL);
 		dev_dbg(s->dev, "display power on: %d, CPU %#x FE %#x SYS %#x gate %#x %#x\n", ret,
 			readl(cpu), readl(fe), readl(sys), readl(t6050_disp_dcp_gate + 0x1c),
 			readl(t6050_disp_dcp_gate + 0x40));
 		return ret;
 	}
-	if (t6050_disp_dart_rewrite)
-		apple_dart_m5_display_snapshot(NULL);
+	apple_dart_m5_display_snapshot(NULL);
 	writel(0x0f0000ff, cpu);
 	ret |= t6050_disp_ps_settle(cpu, 0xf0, 0xf0);
 	writel(3, t6050_disp_dcp_gate + 0x1c);

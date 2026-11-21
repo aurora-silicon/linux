@@ -43,7 +43,7 @@ pub(super) const BASE: Config = Config {
         handoff_slot: 0xffff_ffff,
         handoff_unk2: 0,
         native_gpu_permissions: true,
-        narrow_pool_window: true,
+        narrow_pool_window: false,
     },
     region_c: Some(&REGION_C),
     chip: Some(&CHIP),

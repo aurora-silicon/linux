@@ -519,3 +519,12 @@
 &jpeg1 {
 	status = "okay";
 };
+
+/* The port controllers follow the sleep's command rules (tipd: woken first, read at intervals) */
+&hpm0 {
+	apple,sleep-ssps-rules;
+};
+
+&hpm1 {
+	apple,sleep-ssps-rules;
+};
