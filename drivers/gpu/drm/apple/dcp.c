@@ -7318,7 +7318,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 				       (get_random_u64() & GENMASK_ULL(47, 4));
 	}
 	dcp->ext_failsafe = dcp_ext_is_failsafe(dev->of_node);
-	dcp->dcpext = of_device_is_compatible(dev->of_node, "apple,dcpext");
+	/*
+	 * The T8132 dcpext nodes carry no apple,dcpext fallback: the M4 26.6.2
+	 * backend matches them alone. One admitted on the 27.2 image runs the
+	 * firmware-27 external processor path, so it is a dcpext here too.
+	 */
+	dcp->dcpext = of_device_is_compatible(dev->of_node, "apple,dcpext") ||
+		      apple_t8132_dcpext_v27_2(dev->of_node);
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
 	dcp->desktop_external = dcp_desktop_external_node(dev->of_node);
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
