@@ -36,7 +36,7 @@ use core::ops::Range;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel::bindings;
-use kernel::dma_fence::RawDmaFence;
+use kernel::dma_fence::{Fence, RawDmaFence};
 use kernel::drm::gem::BaseObject;
 use kernel::drm::Registered;
 use kernel::error::code::*;
@@ -346,11 +346,36 @@ pub(crate) enum Object {
     TimestampBuffer(Arc<crate::timestamp::Buffer>),
 }
 
+/// Most submissions a queue may have in flight, the one just made included, for its submitter's
+/// syncobj waits to take the wait hint. Up to this depth the client waits for (one of) its newest
+/// jobs, so each wait is on the critical path of the next submission. Deeper, the GPU has queued
+/// work and the waiter only paces the client.
+const WAIT_HINT_MAX_IN_FLIGHT: usize = 2;
+
 /// A queue in a file's table. Its count in the creating process's share of the device's
 /// queues is given back once the queue itself is gone.
 pub(crate) struct TableQueue {
     queue: KBox<dyn queue::Queue>,
     _share: Option<queue_share::Share>,
+    /// Completion fences of the queue's most recent submissions, oldest first
+    /// ([`TableQueue::note_submission`]).
+    recent: [Option<Fence>; WAIT_HINT_MAX_IN_FLIGHT],
+}
+
+impl TableQueue {
+    /// Records a successful submission. Returns whether the queue now has at most
+    /// [`WAIT_HINT_MAX_IN_FLIGHT`] submissions in flight: whether the submission made
+    /// that many submissions ago has finished. Queues that track no completion fence
+    /// ([`queue::Queue::last_submission`]) always count as shallow.
+    fn note_submission(&mut self) -> bool {
+        let oldest = self.recent[0].take();
+        self.recent.rotate_left(1);
+        self.recent[WAIT_HINT_MAX_IN_FLIGHT - 1] = self.queue.last_submission();
+        oldest.is_none_or(|fence| {
+            // SAFETY: `fence` owns a reference to a live dma_fence for this status query.
+            unsafe { bindings::dma_fence_get_status(fence.raw()) != 0 }
+        })
+    }
 }
 
 impl Deref for TableQueue {
@@ -1745,6 +1770,7 @@ impl File {
             new_mutex!(TableQueue {
                 queue,
                 _share: share,
+                recent: Default::default(),
             }),
             GFP_KERNEL,
         )?)?;
@@ -1854,18 +1880,31 @@ impl File {
         }
 
         let objects = file.inner().objects();
-        let ret = queue.lock().submit(
-            reg_data,
-            id,
-            syncs,
-            data.in_sync_count as usize,
-            &vec,
-            objects,
-        );
+        let (ret, shallow) = {
+            let mut queue = queue.lock();
+            let ret = queue.submit(
+                reg_data,
+                id,
+                syncs,
+                data.in_sync_count as usize,
+                &vec,
+                objects,
+            );
+            let shallow = ret.is_ok() && queue.note_submission();
+            (ret, shallow)
+        };
 
+        // The capacity hint goes only to waits that follow a submission to a shallow queue,
+        // where the waiter is on the critical path of the next submission. A deeper submission
+        // withdraws it: the GPU then has queued work and the waiter only paces the client. (On
+        // an M1 Pro a hint after every submission cost 2% at depth 16 for its depth-1 gains.)
         if ret.is_ok() {
             if let Some((util_min, duration_ms)) = gpu.syncobj_wait_hint() {
-                file.set_syncobj_wait_hint(util_min, duration_ms);
+                if shallow {
+                    file.set_syncobj_wait_hint(gpu::fit_wait_util_min(util_min), duration_ms);
+                } else {
+                    file.set_syncobj_wait_hint(0, 0);
+                }
             }
         }
 

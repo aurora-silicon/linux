@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //
-// CPU capacity lookup for the syncobj wait hint (gpu.rs).
+// CPU capacity lookup for the syncobj wait hint (gpu.rs, fit_wait_util_min).
 
 #include <linux/arch_topology.h>
 #include <linux/cpumask.h>

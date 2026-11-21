@@ -105,6 +105,8 @@ pub(crate) struct Queue<B: Backend> {
     /// can tear a whole completion down; that waits until the ioctl has published.
     finished: KVec<Fences>,
     failures: [FailureRecord<Fences>; 2],
+    /// Output fence of the most recent successful submission.
+    last_out: Option<Fence>,
     // Closing the userspace queue releases admission even if firmware still
     // retains one of its execution contexts or installed physical graphs.
     _slot: admission::QueueSlot,
@@ -155,6 +157,7 @@ impl<B: Backend> Queue<B> {
             frontiers: core::array::from_fn(|_| KVec::new()),
             finished: KVec::new(),
             failures: [FailureRecord::new(), FailureRecord::new()],
+            last_out: None,
             _slot: slot,
         })
     }
@@ -647,7 +650,14 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             result.as_ref().err().map_or(0, |error| error.to_errno()),
             output_fence.as_ref(),
         );
+        if result.is_ok() {
+            self.last_out = output_fence;
+        }
         outputs.finish(result)
+    }
+
+    fn last_submission(&self) -> Option<Fence> {
+        self.last_out.clone()
     }
 }
 
