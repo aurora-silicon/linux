@@ -54,14 +54,20 @@ static void fixture_section(u8 *s, const char *segment, const char *name,
 	put_unaligned_le32(flags, s + 64);
 }
 
-static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool kernel)
+/*
+ * @names: the two surfaces' names, as buffer references and tensor short
+ * names give them. Short names (up to 7 characters) give the 32-byte
+ * reference of the MobileNet-era HWX; longer ones the variable reference
+ * zin_ane_compiler 10.205 writes for Apple's camera networks.
+ */
+static struct hwx_fixture *fixture_create_names(struct kunit *test, bool mixed, bool kernel,
+						 const char * const names[2])
 {
 	struct hwx_fixture *f;
 	u64 surface = 0x30000000 + (mixed ? SZ_16K : 0);
 	u64 text = surface + 2 * SZ_16K, kern = text + SZ_32K;
 	u32 i, strings_length = 1;
 	u8 *c, *s, *text_section;
-	static const char * const names[] = { "in", "out" };
 	static const char * const symbols[] = { "input", "output" };
 
 	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
@@ -98,10 +104,12 @@ static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool k
 				SZ_32K + SZ_16K, 6, 0x26);
 	}
 	for (i = 0; i < 2; i++) {
-		c = fixture_command(f, 0x40, 32);
+		size_t length = strlen(names[i]);
+
+		c = fixture_command(f, 0x40, ALIGN(0x18 + length + 1, 8));
 		put_unaligned_le64(0x18, c + 8);
 		put_unaligned_le64(surface + i * SZ_16K, c + 0x10);
-		strscpy(c + 0x18, names[i], 8);
+		memcpy(c + 0x18, names[i], length + 1);
 	}
 	f->program = f->cursor;
 	c = fixture_command(f, 4, mixed ? 0x8c0 : 0x8a0);
@@ -146,7 +154,8 @@ static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool k
 		u32 shortoff = 0xd3d + strlen(symbols[i]) + 1;
 
 		f->tensor[i] = f->cursor;
-		c = fixture_command(f, 4, 0xd48);
+		c = fixture_command(f, 4, max_t(u32, 0xd48,
+						ALIGN(shortoff + strlen(names[i]) + 1, 8)));
 		put_unaligned_le32(3, c + 8);
 		put_unaligned_le32(0x34a, c + 0xc);
 		put_unaligned_le32(3, c + 0x10);
@@ -209,6 +218,13 @@ static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool k
 	put_unaligned_le32(f->cursor - 32, f->bytes + 20);
 	put_unaligned_le32(0x200000, f->bytes + 24);
 	return f;
+}
+
+static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool kernel)
+{
+	static const char * const names[] = { "in", "out" };
+
+	return fixture_create_names(test, mixed, kernel, names);
 }
 
 #endif /* __ANE_H16_HWX_TEST_FIXTURE_H__ */

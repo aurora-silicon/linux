@@ -8,28 +8,37 @@
 
 #include "ane_h16_hwx_test_fixture.h"
 
+/* The parsed program is too large for a test's stack (16 surfaces). */
+static struct ane_h16_hwx *hwx_info_alloc(struct kunit *test)
+{
+	struct ane_h16_hwx *h = kunit_kzalloc(test, sizeof(*h), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, h);
+	return h;
+}
+
 static void hwx_forms_test(struct kunit *test)
 {
 	unsigned int variant;
 
 	for (variant = 0; variant < 4; variant++) {
 		struct hwx_fixture *f = fixture_create(test, variant & 1, variant & 2);
-		struct ane_h16_hwx info = {};
+		struct ane_h16_hwx *info = hwx_info_alloc(test);
 
 		KUNIT_ASSERT_NOT_NULL(test, f);
-		KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
-		KUNIT_EXPECT_EQ(test, info.surface_count, 2U);
-		KUNIT_EXPECT_EQ(test, info.surfaces[0].span, 256ULL);
-		KUNIT_EXPECT_EQ(test, info.tasks, 1U);
-		KUNIT_EXPECT_EQ(test, info.text.ordinal, (variant & 1) ? 4U : 3U);
-		KUNIT_EXPECT_EQ(test, info.text.nreloc, (variant & 2) ? 1U : 0U);
+		KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
+		KUNIT_EXPECT_EQ(test, info->surface_count, 2U);
+		KUNIT_EXPECT_EQ(test, info->surfaces[0].span, 256ULL);
+		KUNIT_EXPECT_EQ(test, info->tasks, 1U);
+		KUNIT_EXPECT_EQ(test, info->text.ordinal, (variant & 1) ? 4U : 3U);
+		KUNIT_EXPECT_EQ(test, info->text.nreloc, (variant & 2) ? 1U : 0U);
 	}
 }
 
 static void hwx_header_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, false, false);
-	struct ane_h16_hwx info;
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
 	u32 offset;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
@@ -37,22 +46,22 @@ static void hwx_header_test(struct kunit *test)
 		u32 saved = get_unaligned_le32(f->bytes + offset);
 
 		put_unaligned_le32(U32_MAX, f->bytes + offset);
-		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 		put_unaligned_le32(saved, f->bytes + offset);
 	}
 	for (offset = 0; offset < 32; offset++)
-		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, offset, &info), -ENOEXEC);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size - 1, &info), -ENOEXEC);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, ANE_H16_HWX_MAX + 1, &info), -ENOEXEC);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, offset, info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size - 1, info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, ANE_H16_HWX_MAX + 1, info), -ENOEXEC);
 	/* A truncated command must not inherit a previous command's success. */
 	put_unaligned_le32(f->cursor - 33, f->bytes + 20);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 }
 
 static void hwx_command_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, false, false);
-	struct ane_h16_hwx info;
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
 	u32 pos;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
@@ -61,10 +70,10 @@ static void hwx_command_test(struct kunit *test)
 		u32 length = get_unaligned_le32(f->bytes + pos + 4);
 
 		put_unaligned_le32(0xffffffff, f->bytes + pos);
-		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 		put_unaligned_le32(command, f->bytes + pos);
 		put_unaligned_le32(0, f->bytes + pos + 4);
-		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 		put_unaligned_le32(length, f->bytes + pos + 4);
 		pos += length;
 	}
@@ -78,7 +87,7 @@ static void hwx_tensor_test(struct kunit *test)
 		0x78, 0x7c, 0x80, 0x88, 0xd38, 0xd44,
 	};
 	struct hwx_fixture *f = fixture_create(test, false, false);
-	struct ane_h16_hwx info;
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
 	u8 *tensor;
 	unsigned int i;
 
@@ -88,18 +97,18 @@ static void hwx_tensor_test(struct kunit *test)
 		u32 saved = get_unaligned_le32(tensor + fields[i]);
 
 		put_unaligned_le32(U32_MAX, tensor + fields[i]);
-		KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+		KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, info),
 				    -ENOEXEC, "tensor field %#x", fields[i]);
 		put_unaligned_le32(saved, tensor + fields[i]);
 	}
 	/* Four batches fit in the allocation; span is not just one batch. */
 	put_unaligned_le32(4, tensor + 0x28);
-	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
-	KUNIT_EXPECT_EQ(test, info.surfaces[0].span, 1024ULL);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
+	KUNIT_EXPECT_EQ(test, info->surfaces[0].span, 1024ULL);
 	put_unaligned_le64(U64_MAX, tensor + 0x50);
 	put_unaligned_le64(U64_MAX, tensor + 0x70);
 	put_unaligned_le64(U64_MAX, tensor + 0x80);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 }
 
 /*
@@ -123,7 +132,7 @@ static void hwx_element_format_test(struct kunit *test)
 		{ 2, 1ULL << 32 | 1, -ENOEXEC }, { 5, 1ULL << 32 | 2, -ENOEXEC },
 	};
 	struct hwx_fixture *f = fixture_create(test, false, false);
-	struct ane_h16_hwx info;
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
 	unsigned int i, t;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
@@ -136,29 +145,29 @@ static void hwx_element_format_test(struct kunit *test)
 			put_unaligned_le32(pairs[i].format, tensor + 0x24);
 			put_unaligned_le64(pairs[i].element, tensor + 0x68);
 			KUNIT_EXPECT_EQ_MSG(test,
-					    ane_h16_hwx_validate(f->bytes, f->size, &info),
+					    ane_h16_hwx_validate(f->bytes, f->size, info),
 					    pairs[i].ret, "tensor %u format %u element %#llx",
 					    t, pairs[i].format, pairs[i].element);
 			if (!pairs[i].ret)
-				KUNIT_EXPECT_EQ(test, info.surfaces[t].span, 256ULL);
+				KUNIT_EXPECT_EQ(test, info->surfaces[t].span, 256ULL);
 		}
 		/* Leave this surface 8-bit: int8 in with uint8 out loads too. */
 		put_unaligned_le32(t ? 3 : 2, tensor + 0x24);
 		put_unaligned_le64(1, tensor + 0x68);
 	}
-	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
 
 	/* A 256-byte row holds 256 int8 elements but only 128 fp16 ones. */
 	put_unaligned_le32(256, f->bytes + f->tensor[0] + 0x34);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
 	put_unaligned_le32(257, f->bytes + f->tensor[0] + 0x34);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 	put_unaligned_le32(256, f->bytes + f->tensor[0] + 0x34);
 	put_unaligned_le32(5, f->bytes + f->tensor[0] + 0x24);
 	put_unaligned_le64(2, f->bytes + f->tensor[0] + 0x68);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 	put_unaligned_le32(128, f->bytes + f->tensor[0] + 0x34);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
 }
 
 static u8 *fixture_ref(struct hwx_fixture *f, unsigned int index)
@@ -194,7 +203,7 @@ static void fixture_surface_kind(struct hwx_fixture *f, unsigned int index, u32 
 static void hwx_surface_order_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, false, false);
-	struct ane_h16_hwx info;
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
 	u8 *tensor = kunit_kzalloc(test, 0xd48, GFP_KERNEL), *ref[2], *symbol[2];
 	u64 value;
 	u8 ordinal;
@@ -205,11 +214,11 @@ static void hwx_surface_order_test(struct kunit *test)
 	memcpy(tensor, f->bytes + f->tensor[0], 0xd48);
 	memmove(f->bytes + f->tensor[0], f->bytes + f->tensor[1], 0xd48);
 	memcpy(f->bytes + f->tensor[1], tensor, 0xd48);
-	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
-	KUNIT_EXPECT_STREQ(test, info.surfaces[0].name, "in");
-	KUNIT_EXPECT_EQ(test, info.surfaces[0].direction, 1U);
-	KUNIT_EXPECT_STREQ(test, info.surfaces[1].name, "out");
-	KUNIT_EXPECT_EQ(test, info.surfaces[1].direction, 2U);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info->surfaces[0].name_offset, "in");
+	KUNIT_EXPECT_EQ(test, info->surfaces[0].direction, 1U);
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info->surfaces[1].name_offset, "out");
+	KUNIT_EXPECT_EQ(test, info->surfaces[1].direction, 2U);
 
 	/* The output need not be the last segment. */
 	f = fixture_create(test, false, false);
@@ -232,22 +241,89 @@ static void hwx_surface_order_test(struct kunit *test)
 	ordinal = symbol[0][5];
 	symbol[0][5] = symbol[1][5];
 	symbol[1][5] = ordinal;
-	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
-	KUNIT_EXPECT_STREQ(test, info.surfaces[0].name, "out");
-	KUNIT_EXPECT_EQ(test, info.surfaces[0].direction, 2U);
-	KUNIT_EXPECT_STREQ(test, info.surfaces[1].name, "in");
-	KUNIT_EXPECT_EQ(test, info.surfaces[1].direction, 1U);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info->surfaces[0].name_offset, "out");
+	KUNIT_EXPECT_EQ(test, info->surfaces[0].direction, 2U);
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info->surfaces[1].name_offset, "in");
+	KUNIT_EXPECT_EQ(test, info->surfaces[1].direction, 1U);
 
 	/* A reference naming no tensor refuses. */
 	strscpy(ref[1] + 0x18, "zz", 8);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 
-	/* Exactly one output: two inputs and no output refuse. */
+	/* At least one output: two inputs and no output refuse. */
 	f = fixture_create(test, false, false);
 	KUNIT_ASSERT_NOT_NULL(test, f);
 	fixture_surface_kind(f, 1, 1);
 	put_unaligned_le32(1, f->bytes + f->tensor[1] + 0x14);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
+
+	/*
+	 * Several outputs validate (Apple's person segmentation has two, the
+	 * ANOD v5 detector eleven): the input turned into a second output.
+	 * Whether a program without an input runs is the process bindings'
+	 * call, not the container's.
+	 */
+	f = fixture_create(test, false, false);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	fixture_surface_kind(f, 0, 2);
+	put_unaligned_le32(2, f->bytes + f->tensor[0] + 0x14);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
+	KUNIT_EXPECT_EQ(test, info->surfaces[0].direction, 2U);
+	KUNIT_EXPECT_EQ(test, info->surfaces[1].direction, 2U);
+}
+
+/*
+ * zin_ane_compiler 10.205 writes a buffer reference with the whole name:
+ * person segmentation's outputs are 32-character hashes, and the ANOD v5
+ * detector has outputs whose names share their first 8 characters
+ * (fcos/association_preds and fcos/association_preds_export). Pairing is
+ * by the whole name.
+ */
+static void hwx_long_names_test(struct kunit *test)
+{
+	static const char * const hashed[] = { "in", "293bdc1f04ed53222ad81ce2f31e4b37" };
+	static const char * const shared[] = { "fcos/association_preds",
+					      "fcos/association_preds_export" };
+	static const char * const too_long[] = {
+		"in", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" };
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
+	struct hwx_fixture *f;
+	u8 *ref;
+
+	f = fixture_create_names(test, false, false, hashed);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info->surfaces[1].name_offset, hashed[1]);
+	KUNIT_EXPECT_EQ(test, info->surfaces[1].direction, 2U);
+
+	f = fixture_create_names(test, false, false, shared);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info->surfaces[0].name_offset, shared[0]);
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info->surfaces[1].name_offset, shared[1]);
+
+	/* A name that does not fit ANE_H16_NAME_MAX refuses. */
+	f = fixture_create_names(test, false, false, too_long);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
+
+	/* A reference whose name runs into its padding without a NUL refuses. */
+	f = fixture_create_names(test, false, false, hashed);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ref = fixture_ref(f, 1);
+	KUNIT_ASSERT_NOT_NULL(test, ref);
+	memset(ref + 0x18 + strlen(hashed[1]), 'x', get_unaligned_le32(ref + 4) -
+	       0x18 - strlen(hashed[1]));
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
+
+	/* Nonzero padding after the name refuses. */
+	f = fixture_create_names(test, false, false, hashed);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ref = fixture_ref(f, 1);
+	KUNIT_ASSERT_NOT_NULL(test, ref);
+	ref[get_unaligned_le32(ref + 4) - 1] = 1;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 }
 
 static void hwx_program_test(struct kunit *test)
@@ -259,7 +335,7 @@ static void hwx_program_test(struct kunit *test)
 		0x858, 0x85c, 0x860, 0x864, 0x868, 0x870, 0x878, 0x880, 0x890, 0x89c,
 	};
 	struct hwx_fixture *f = fixture_create(test, false, false);
-	struct ane_h16_hwx info;
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
 	u8 *program;
 	unsigned int i;
 
@@ -269,7 +345,7 @@ static void hwx_program_test(struct kunit *test)
 		u32 saved = get_unaligned_le32(program + fields[i]);
 
 		put_unaligned_le32(saved ^ U32_MAX, program + fields[i]);
-		KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+		KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, info),
 				    -ENOEXEC, "program field %#x", fields[i]);
 		put_unaligned_le32(saved, program + fields[i]);
 	}
@@ -320,7 +396,7 @@ static void hwx_staged_counts_test(struct kunit *test)
 		{ 1, 0x10, 61 }, { 1, 0x10, 92 }, /* LUT/ALU 1024. */
 		{ 1, 0x10, 245 }, { 1, 0x10, 368 }, /* LUT/ALU 2048. */
 	};
-	struct ane_h16_hwx info;
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
 	unsigned int form, i;
 
 	for (form = 0; form < 2; form++) {
@@ -333,28 +409,28 @@ static void hwx_staged_counts_test(struct kunit *test)
 			fixture_tasks(f, shapes[i].tasks, shapes[i].records);
 			program = f->bytes + f->program;
 			put_unaligned_le32(shapes[i].work, program + work_offset);
-			KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
-			KUNIT_EXPECT_EQ(test, info.tasks, shapes[i].tasks);
+			KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
+			KUNIT_EXPECT_EQ(test, info->tasks, shapes[i].tasks);
 			/* Neither count nor work may exceed its program-derived bound. */
 			put_unaligned_le32(shapes[i].records + 1, program + 0x860);
-			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info),
 					-ENOEXEC);
 			put_unaligned_le32(0, program + 0x860);
-			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info),
 					-ENOEXEC);
 			put_unaligned_le32(shapes[i].records, program + 0x860);
 			put_unaligned_le32(SZ_32K, program + work_offset);
-			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
 			put_unaligned_le32(SZ_32K + 1, program + work_offset);
-			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info),
 					-ENOEXEC);
 			put_unaligned_le32(U32_MAX, program + work_offset);
-			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info),
 					-ENOEXEC);
 			put_unaligned_le32(shapes[i].work, program + work_offset);
 			/* A plausible hint never overrides a corrupt task stream. */
 			put_unaligned_le32(0x6000 / 4, f->bytes + SZ_16K + 52);
-			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info),
 					-ENOEXEC);
 		}
 	}
@@ -367,7 +443,7 @@ static void hwx_staged_counts_test(struct kunit *test)
 static void hwx_final_task_end_test(struct kunit *test)
 {
 	static const u32 tails[] = { 4, 8, 12, 12 + 16 };
-	struct ane_h16_hwx info;
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
 	unsigned int form, i;
 
 	for (form = 0; form < 2; form++) {
@@ -382,23 +458,23 @@ static void hwx_final_task_end_test(struct kunit *test)
 		program = f->bytes + f->program;
 		end = get_unaligned_le64(section + 40);
 		KUNIT_ASSERT_EQ(test, end, 68ULL);
-		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
 		for (i = 0; i < ARRAY_SIZE(tails); i++) {
 			put_unaligned_le64(end + tails[i], section + 40);
 			put_unaligned_le32((end + tails[i]) / 4, program + 0x824);
-			KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+			KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, info),
 					    -ENOEXEC, "form %u tail %u", form, tails[i]);
 		}
 		put_unaligned_le64(end, section + 40);
 		put_unaligned_le32(end / 4, program + 0x824);
-		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0);
 	}
 }
 
 static void hwx_geometry_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, false, false);
-	struct ane_h16_hwx info;
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
 	u8 *segment;
 	unsigned int variant;
 
@@ -409,17 +485,17 @@ static void hwx_geometry_test(struct kunit *test)
 		u32 saved = get_unaligned_le32(segment + fields[variant]);
 
 		put_unaligned_le32(U32_MAX, segment + fields[variant]);
-		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 		put_unaligned_le32(saved, segment + fields[variant]);
 	}
 	put_unaligned_le64(U64_MAX - SZ_16K + 1, segment + 24);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 }
 
 static void hwx_symbols_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, false, false);
-	struct ane_h16_hwx info;
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
 	u32 field;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
@@ -427,52 +503,53 @@ static void hwx_symbols_test(struct kunit *test)
 		u32 saved = get_unaligned_le32(f->bytes + f->symtab + field);
 
 		put_unaligned_le32(U32_MAX, f->bytes + f->symtab + field);
-		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 		put_unaligned_le32(saved, f->bytes + f->symtab + field);
 	}
 	f->bytes[f->symbols + 5] = 0;
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 	f->bytes[f->symbols + 5] = 1;
 	f->bytes[f->strings + 1] = 'X';
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 }
 
 static void hwx_relocations_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, true, true);
-	struct ane_h16_hwx info;
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
 	/* Scratch changes the section ordinal; a fixed ordinal is invalid. */
 	put_unaligned_le32(0x07000005, f->bytes + f->reloc + 4);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 	put_unaligned_le32(0x07000006, f->bytes + f->reloc + 4);
 	put_unaligned_le32(64, f->bytes + SZ_16K + 56);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 	put_unaligned_le32(32, f->bytes + SZ_16K + 56);
 	put_unaligned_le32(57, f->bytes + f->reloc);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 	/* A small addend in a header or the prefix must not be patched. */
 	put_unaligned_le32(20, f->bytes + f->reloc);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 	put_unaligned_le32(4, f->bytes + f->reloc);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC);
 }
 
 static void hwx_snapshot_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, false, false);
-	struct ane_h16_hwx_snapshot snapshot = {};
+	struct ane_h16_hwx_snapshot *snapshot = kunit_kzalloc(test, sizeof(*snapshot), GFP_KERNEL);
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
-	KUNIT_ASSERT_EQ(test, ane_h16_hwx_snapshot_create(f->bytes, f->size, &snapshot), 0);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_snapshot_create(f->bytes, f->size, snapshot), 0);
 	f->bytes[f->tensor[0] + 0x24] = 0;
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_check(&snapshot), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_check(snapshot), 0);
 	/* Even padding and original command bytes are covered by the digest. */
-	((u8 *)snapshot.bytes)[f->program + 0x100] = 1;
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_check(&snapshot), -ENOEXEC);
-	ane_h16_hwx_snapshot_destroy(&snapshot);
-	KUNIT_EXPECT_PTR_EQ(test, snapshot.bytes, NULL);
+	((u8 *)snapshot->bytes)[f->program + 0x100] = 1;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_check(snapshot), -ENOEXEC);
+	ane_h16_hwx_snapshot_destroy(snapshot);
+	KUNIT_EXPECT_PTR_EQ(test, snapshot->bytes, NULL);
 }
 
 static void hwx_snapshot_free(void *snapshot)
@@ -638,21 +715,22 @@ static void hwx_load_resources_test(struct kunit *test)
 static void hwx_import_bounds_test(struct kunit *test)
 {
 	const void __user *invalid = (const void __user *)1UL;
-	struct ane_h16_hwx_snapshot snapshot = {};
+	struct ane_h16_hwx_snapshot *snapshot = kunit_kzalloc(test, sizeof(*snapshot), GFP_KERNEL);
 	struct hwx_fixture *f = fixture_create(test, false, false);
 	int ret;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
-	ret = ane_h16_hwx_snapshot_from_user(invalid, U64_MAX, &snapshot);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	ret = ane_h16_hwx_snapshot_from_user(invalid, U64_MAX, snapshot);
 	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_from_user(invalid, 31, &snapshot), -EINVAL);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_from_user(invalid, 32, &snapshot), -EFAULT);
-	KUNIT_EXPECT_PTR_EQ(test, snapshot.bytes, NULL);
-	KUNIT_ASSERT_EQ(test, ane_h16_hwx_snapshot_create(f->bytes, f->size, &snapshot), 0);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_create(f->bytes, f->size, &snapshot), -EBUSY);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_from_user(invalid, 32, &snapshot), -EBUSY);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_check(&snapshot), 0);
-	ane_h16_hwx_snapshot_destroy(&snapshot);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_from_user(invalid, 31, snapshot), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_from_user(invalid, 32, snapshot), -EFAULT);
+	KUNIT_EXPECT_PTR_EQ(test, snapshot->bytes, NULL);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_snapshot_create(f->bytes, f->size, snapshot), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_create(f->bytes, f->size, snapshot), -EBUSY);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_from_user(invalid, 32, snapshot), -EBUSY);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_check(snapshot), 0);
+	ane_h16_hwx_snapshot_destroy(snapshot);
 }
 
 /*
@@ -689,13 +767,13 @@ static void fixture_gap(struct hwx_fixture *f, u32 at, u32 len)
 static void hwx_h17_zin_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, true, true);
-	struct ane_h16_hwx info;
+	struct ane_h16_hwx *info = hwx_info_alloc(test);
 	u8 *c, *sym, *note;
 	u32 i, strsize;
 	u64 cell[3];
 
-#define H17_OK() KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0)
-#define REFUSED() KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC)
+#define H17_OK() KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0)
+#define REFUSED() KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), -ENOEXEC)
 #define AS_H16(check)							\
 	do {								\
 		put_unaligned_le32(ANE_HWX_SUBTYPE_H16, f->bytes + 8);	\
@@ -704,7 +782,7 @@ static void hwx_h17_zin_test(struct kunit *test)
 	} while (0)
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
-	AS_H16(KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0));
+	AS_H16(KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0));
 	H17_OK();
 
 	/* __TEXT carries relocations: flags 0 beside a scratch segment; nothing else. */
@@ -733,7 +811,7 @@ static void hwx_h17_zin_test(struct kunit *test)
 	put_unaligned_le64(0, c + 0x60);	/* back to the slot 6 form */
 	for (i = 0; i < 3; i++)
 		put_unaligned_le64(cell[i], c + 0x70 + i * 16);
-	AS_H16(KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0));
+	AS_H16(KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0));
 
 	/* A stabs N_LSYM record: no section, value 0, a type number in n_desc. */
 	strsize = get_unaligned_le32(f->bytes + f->symtab + 20);
@@ -764,7 +842,7 @@ static void hwx_h17_zin_test(struct kunit *test)
 	put_unaligned_le64(cell[2] + 65, sym + 8);
 	REFUSED();
 	put_unaligned_le64(cell[2], sym + 8);	/* inside: every form takes it */
-	AS_H16(KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0));
+	AS_H16(KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, info), 0));
 
 	/* LC_NOTE "rt.version", its 4 bytes inline at +40, zero padding. */
 	fixture_gap(f, f->cursor, 48);
@@ -797,8 +875,8 @@ static void hwx_h17_zin_test(struct kunit *test)
 		put_unaligned_le64(cell[i], c + 0x60 + i * 16);
 	put_unaligned_le64(cell[2] + 64, sym + 8);
 	H17_OK();
-	KUNIT_EXPECT_EQ(test, info.surface_count, 2U);
-	KUNIT_EXPECT_EQ(test, info.subtype, ANE_HWX_SUBTYPE_H17);
+	KUNIT_EXPECT_EQ(test, info->surface_count, 2U);
+	KUNIT_EXPECT_EQ(test, info->subtype, ANE_HWX_SUBTYPE_H17);
 #undef H17_OK
 #undef REFUSED
 #undef AS_H16
@@ -811,6 +889,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_tensor_test),
 	KUNIT_CASE(hwx_element_format_test),
 	KUNIT_CASE(hwx_surface_order_test),
+	KUNIT_CASE(hwx_long_names_test),
 	KUNIT_CASE(hwx_program_test),
 	KUNIT_CASE(hwx_staged_counts_test),
 	KUNIT_CASE(hwx_final_task_end_test),

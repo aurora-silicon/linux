@@ -6,9 +6,17 @@
 #include <linux/types.h>
 #include <crypto/sha2.h>
 
-#define ANE_H16_SURFACES 4
-#define ANE_H16_SECTIONS 8
-#define ANE_H16_REGIONS 7
+/*
+ * Surfaces of one program: its inputs and outputs. Apple's camera networks
+ * have several outputs (person segmentation: 3 surfaces; the ANOD v5
+ * face/body detector: 12), so a program is not limited to one output.
+ * Every surface is a segment, a section and a mapped region of its own.
+ */
+#define ANE_H16_SURFACES 16
+#define ANE_H16_SECTIONS (ANE_H16_SURFACES + 4)
+#define ANE_H16_REGIONS (ANE_H16_SURFACES + 3)
+/* A surface's name as its buffer reference gives it, NUL included. */
+#define ANE_H16_NAME_MAX 64
 #define ANE_H16_HWX_MAX (SZ_256M + SZ_1M)
 /* Mach-O CPU subtypes of the two targets that share this container form. */
 #define ANE_HWX_SUBTYPE_H16 7
@@ -29,7 +37,12 @@ struct ane_h16_hwx_surface {
 	u64 span;
 	u32 direction;
 	u32 symbol_offset;
-	char name[8];
+	/*
+	 * Offset of the surface's NUL-terminated name in the HWX (the tensor's
+	 * short name, which the buffer reference repeats): names run up to
+	 * ANE_H16_NAME_MAX bytes, so they stay in the snapshot, not here.
+	 */
+	u32 name_offset;
 };
 
 enum ane_h16_region_kind {

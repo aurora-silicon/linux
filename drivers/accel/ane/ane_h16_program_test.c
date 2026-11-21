@@ -5,6 +5,7 @@
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/mutex.h>
+#include <linux/slab.h>
 
 #include "ane_h16_boot.h"
 #include "ane_h16_program.h"
@@ -592,15 +593,19 @@ static size_t test_aux_size[ANE_H16_AUX_COUNT] = { 0x298, 0x410, 0x38, 0x28 };
 static int fw_load_snapshot(struct prog_fw *f, struct ane_h16_hwx_snapshot *snapshot,
 			    struct ane_h16_program **p)
 {
-	struct ane_h16_hwx hwx;
+	/* too large for the stack with 16 surfaces */
+	struct ane_h16_hwx *hwx = kzalloc(sizeof(*hwx), GFP_KERNEL);
 
-	if (!snapshot || ane_h16_hwx_validate(snapshot->bytes, snapshot->size, &hwx))
+	if (!hwx || !snapshot || ane_h16_hwx_validate(snapshot->bytes, snapshot->size, hwx)) {
+		kfree(hwx);
 		return -ENOMEM;
+	}
 	test_aux_size[ANE_H16_AUX_GENERIC] =
-		generic_fill(test_aux[ANE_H16_AUX_GENERIC], &hwx, TEST_GENERIC_BASE);
+		generic_fill(test_aux[ANE_H16_AUX_GENERIC], hwx, TEST_GENERIC_BASE);
 	test_aux_size[ANE_H16_AUX_OPERATION] =
-		operation_fill(test_aux[ANE_H16_AUX_OPERATION], snapshot, &hwx,
+		operation_fill(test_aux[ANE_H16_AUX_OPERATION], snapshot, hwx,
 			       TEST_GENERIC_BASE);
+	kfree(hwx);
 	return ane_h16_session_load(&f->s, snapshot, test_aux_ptr, test_aux_size, p);
 }
 
@@ -761,8 +766,18 @@ static void program_add128_slots_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_load_slots(hwx, plan, &layout, slots), -EINVAL);
 	KUNIT_EXPECT_EQ(test, ane_h16_load_encode(load, sizeof(load) - 8, slots), -EINVAL);
 
-	/* A program needs an input and exactly one output. */
+	/*
+	 * A program needs an input and an output; it may have several outputs
+	 * (add128 is in, out, in: two outputs and an input bind).
+	 */
+	KUNIT_ASSERT_EQ(test, hwx->surface_count, 3U);
 	hwx->surfaces[0].direction = 2;
+	generic_size = generic_fill(generic, hwx, 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count, NULL), 0);
+	KUNIT_EXPECT_EQ(test, count, 3U);
+	/* Outputs only: no input refuses. */
+	hwx->surfaces[2].direction = 2;
 	generic_size = generic_fill(generic, hwx, 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
 						       &count, NULL), -ENOEXEC);
@@ -1314,16 +1329,17 @@ static void program_bad_operation_test(struct kunit *test)
 	struct prog_fw *f = fw_create(test);
 	struct ane_h16_hwx_snapshot *snapshot;
 	struct ane_h16_program *p = NULL;
-	struct ane_h16_hwx hwx;
+	struct ane_h16_hwx *hwx = kunit_kzalloc(test, sizeof(*hwx), GFP_KERNEL);
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, hwx);
 	snapshot = fw_snapshot(test, false, false);
 	KUNIT_ASSERT_NOT_NULL(test, snapshot);
-	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(snapshot->bytes, snapshot->size, &hwx), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(snapshot->bytes, snapshot->size, hwx), 0);
 	test_aux_size[ANE_H16_AUX_GENERIC] =
-		generic_fill(test_aux[ANE_H16_AUX_GENERIC], &hwx, TEST_GENERIC_BASE);
+		generic_fill(test_aux[ANE_H16_AUX_GENERIC], hwx, TEST_GENERIC_BASE);
 	test_aux_size[ANE_H16_AUX_OPERATION] =
-		operation_fill(test_aux[ANE_H16_AUX_OPERATION], snapshot, &hwx,
+		operation_fill(test_aux[ANE_H16_AUX_OPERATION], snapshot, hwx,
 			       TEST_GENERIC_BASE);
 	/* One record more than the section carries. */
 	put_unaligned_le32(get_unaligned_le32(test_aux[ANE_H16_AUX_OPERATION]) + 1,

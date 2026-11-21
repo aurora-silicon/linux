@@ -10,7 +10,7 @@
 
 #define HWX_COMMANDS_MAX 64
 #define HWX_SYMBOLS_MAX 4096
-#define HWX_SEGMENTS_MAX 8
+#define HWX_SEGMENTS_MAX (ANE_H16_SURFACES + 8)
 
 struct hwx_range {
 	u64 start, size;
@@ -26,7 +26,10 @@ struct hwx_parser {
 	u32 tensor_count, ref_count, segment_count, file_count, section_count;
 	u32 symoff, nsyms, stroff, strsize;
 	bool guard, symtab, metadata, note;
+	/* The one procedure's name, as the tensors and the descriptor give it. */
+	char procedure[8];
 };
+
 
 static bool hwx_fits(u64 start, u64 length, u64 size)
 {
@@ -44,6 +47,21 @@ static bool hwx_name(const u8 *p, const char *name)
 static bool hwx_zero(const u8 *p, size_t start, size_t end)
 {
 	return !memchr_inv(p + start, 0, end - start);
+}
+
+/*
+ * The procedure name: "main" in the MobileNet-era HWX and our compiler's,
+ * "net" in Apple's camera networks (zin_ane_compiler 10.205).
+ * Returns its length, or 0 if @name is neither or not NUL-terminated within 8.
+ */
+static size_t hwx_procedure_name(const u8 *name)
+{
+	size_t n = strnlen(name, 8);
+
+	/* In a tensor the symbol follows; the descriptor's padding is checked whole. */
+	if (n == 8)
+		return 0;
+	return (n == 4 && !memcmp(name, "main", 4)) || (n == 3 && !memcmp(name, "net", 3)) ? n : 0;
 }
 
 static int hwx_range_add(struct hwx_range *ranges, u32 *count, u32 max,
@@ -218,7 +236,7 @@ static int hwx_program(struct hwx_parser *p)
 {
 	const u8 *c = p->bytes + p->info.program_offset;
 	struct ane_h16_hwx *info = &p->info;
-	u32 length = get_unaligned_le32(c + 4), records, record_limit, table, i;
+	u32 length = get_unaligned_le32(c + 4), records, record_limit, table, slots, i;
 	u32 prologue = 1;
 	size_t final_end = 0;
 	u64 work_limit = 0;
@@ -269,7 +287,14 @@ static int hwx_program(struct hwx_parser *p)
 	 * starts the same run at slot 5 (+0x60) on H17, the task stream naming slots 5, 6, 7.
 	 */
 	table = info->subtype == ANE_HWX_SUBTYPE_H17 && get_unaligned_le64(c + 0x60) ? 0x60 : 0x70;
-	for (i = 0; i < 5; i++) {
+	/*
+	 * Every surface, then the kernel, then at least one empty slot: the
+	 * ANOD v5 detector's 12 surfaces fill +0x60..+0x110 and its kernel +0x120.
+	 */
+	slots = max_t(u32, 5, info->surface_count + 2);
+	if (table + slots * 16 > 0x810)
+		return -ENOEXEC;
+	for (i = 0; i < slots; i++) {
 		u64 base = i < info->surface_count ? info->surfaces[i].section.vm :
 			   i == info->surface_count ? info->kernel.vm : 0;
 
@@ -293,7 +318,7 @@ static int hwx_program(struct hwx_parser *p)
 		return -ENOMEM;
 	for (i = 0; i < ARRAY_SIZE(common); i++)
 		memcpy(expected + common[i], c + common[i], 4);
-	for (i = 0; i < 5; i++)
+	for (i = 0; i < slots; i++)
 		memcpy(expected + table + i * 16, c + table + i * 16, 8);
 	put_unaligned_le32(4, expected + 0x868);
 	put_unaligned_le32(mixed ? 4 : 2, expected + 0x870);
@@ -313,7 +338,12 @@ static int hwx_program(struct hwx_parser *p)
 		put_unaligned_le32(8, expected + 0x8ac);
 	}
 	memcpy(expected + (mixed ? 0x8b0 : 0x890), c + (mixed ? 0x8b0 : 0x890), 4);
-	memcpy(expected + (mixed ? 0x8b8 : 0x898), "main", 5);
+	/* The tensors' procedure name (main or net); hwx_tensor checked it. */
+	if (!p->procedure[0]) {
+		kfree(expected);
+		return -ENOEXEC;
+	}
+	memcpy(expected + (mixed ? 0x8b8 : 0x898), p->procedure, strlen(p->procedure) + 1);
 	if (!memcmp(c, expected, length)) {
 		ret = ane_hx_task_stream_validate_limit(p->bytes + info->text.offset,
 							info->text.size, info->tasks, prologue,
@@ -340,11 +370,26 @@ static int hwx_program(struct hwx_parser *p)
  * with tensors x, z, y. Pair each surface with the one tensor whose short name
  * is the name its buffer reference gives.
  */
-static int hwx_tensor_for(struct hwx_parser *p, u32 index, u32 *used)
+/* The name a buffer reference gives, or NULL if it is malformed. */
+static const char *hwx_ref_name(const struct hwx_parser *p, u32 index)
 {
 	const u8 *ref = p->bytes + p->refs[index];
+	u32 length = get_unaligned_le32(ref + 4);
+	size_t n = strnlen(ref + 0x18, length - 0x18);
+
+	if (!n || n == length - 0x18 || n >= ANE_H16_NAME_MAX ||
+	    !hwx_zero(ref, 0x18 + n + 1, length))
+		return NULL;
+	return (const char *)ref + 0x18;
+}
+
+static int hwx_tensor_for(struct hwx_parser *p, u32 index, u32 *used)
+{
+	const char *want = hwx_ref_name(p, index);
 	u32 i, match = ANE_H16_SURFACES;
 
+	if (!want)
+		return -ENOEXEC;
 	for (i = 0; i < p->tensor_count; i++) {
 		const u8 *c = p->bytes + p->tensors[i];
 		u32 length = get_unaligned_le32(c + 4), shortoff = get_unaligned_le32(c + 0x7c);
@@ -352,9 +397,8 @@ static int hwx_tensor_for(struct hwx_parser *p, u32 index, u32 *used)
 
 		if (shortoff >= length)
 			return -ENOEXEC;
-		room = min_t(size_t, length - shortoff, 8);
-		if (strnlen(c + shortoff, room) == room ||
-		    strncmp(c + shortoff, ref + 0x18, 8))
+		room = length - shortoff;
+		if (strnlen(c + shortoff, room) == room || strcmp(c + shortoff, want))
 			continue;
 		if (match != ANE_H16_SURFACES || (*used & BIT(i)))
 			return -ENOEXEC;
@@ -401,20 +445,28 @@ static int hwx_tensor(struct hwx_parser *p, u32 index, u32 tensor)
 	struct ane_h16_hwx_surface *b = &p->info.surfaces[index];
 	const u8 *c = p->bytes + p->tensors[tensor];
 	const u8 *ref = p->bytes + p->refs[index];
-	u32 length = get_unaligned_le32(c + 4), shortoff;
+	u32 length = get_unaligned_le32(c + 4), shortoff, symbol;
 	u64 n, channels, height, width, row, plane, batch, minimum;
-	size_t symbol_length, short_length;
+	size_t symbol_length, short_length, procedure;
 	unsigned int i;
 	u32 element;
 
-	if (length < 0xd48 || length > SZ_16K || get_unaligned_le32(c + 0xc) != 0x34a ||
+	if (length < 0xd48 || length > SZ_16K)
+		return -ENOEXEC;
+	/* The procedure name at +0xd38, then the tensor's symbol right after it. */
+	procedure = hwx_procedure_name(c + 0xd38);
+	symbol = 0xd38 + procedure + 1;
+	if (!procedure || (p->procedure[0] && strcmp(p->procedure, c + 0xd38)))
+		return -ENOEXEC;
+	if (!p->procedure[0])
+		memcpy(p->procedure, c + 0xd38, procedure + 1);
+	if (get_unaligned_le32(c + 0xc) != 0x34a ||
 	    get_unaligned_le32(c + 0x10) != 3 ||
 	    get_unaligned_le32(c + 0x14) != b->direction ||
 	    get_unaligned_le32(c + 0x18) != 0xd38 || !hwx_zero(c, 0x1c, 0x20) ||
-	    get_unaligned_le32(c + 0x20) != 0xd3d ||
+	    get_unaligned_le32(c + 0x20) != symbol ||
 	    get_unaligned_le32(c + 0x38) != 1 || !hwx_zero(c, 0x3c, 0x50) ||
-	    get_unaligned_le32(c + 0x78) != 1 || !hwx_zero(c, 0x88, 0xd38) ||
-	    memcmp(c + 0xd38, "main", 5))
+	    get_unaligned_le32(c + 0x78) != 1 || !hwx_zero(c, 0x88, 0xd38))
 		return -ENOEXEC;
 	element = hwx_element_size(c);
 	if (!element)
@@ -434,25 +486,27 @@ static int hwx_tensor(struct hwx_parser *p, u32 index, u32 tensor)
 	    get_unaligned_le64(c + 0x80) != batch ||
 	    check_mul_overflow(n, batch, &b->span) || b->span > b->section.size)
 		return -ENOEXEC;
-	symbol_length = strnlen(c + 0xd3d, min_t(u32, 256, length - 0xd3d));
-	if (!symbol_length || symbol_length == min_t(u32, 256, length - 0xd3d))
+	symbol_length = strnlen(c + symbol, min_t(u32, 256, length - symbol));
+	if (!symbol_length || symbol_length == min_t(u32, 256, length - symbol))
 		return -ENOEXEC;
 	shortoff = get_unaligned_le32(c + 0x7c);
-	if (shortoff != 0xd3d + symbol_length + 1 || shortoff >= length)
+	if (shortoff != symbol + symbol_length + 1 || shortoff >= length)
 		return -ENOEXEC;
 	short_length = strnlen(c + shortoff, length - shortoff);
 	if (!short_length || short_length == length - shortoff ||
-	    short_length >= sizeof(b->name) ||
+	    short_length >= ANE_H16_NAME_MAX ||
 	    !hwx_zero(c, shortoff + short_length + 1, length))
 		return -ENOEXEC;
-	memcpy(b->name, c + shortoff, short_length);
-	b->symbol_offset = p->tensors[tensor] + 0xd3d;
+	b->name_offset = p->tensors[tensor] + shortoff;
+	b->symbol_offset = p->tensors[tensor] + symbol;
 	if (get_unaligned_le64(ref + 8) != 0x18 ||
 	    get_unaligned_le64(ref + 0x10) != b->section.vm ||
-	    memcmp(ref + 0x18, b->name, sizeof(b->name)))
+	    !hwx_ref_name(p, index) ||
+	    strcmp(hwx_ref_name(p, index), (const char *)p->bytes + b->name_offset))
 		return -ENOEXEC;
 	for (i = 0; i < index; i++)
-		if (!strcmp(b->name, p->info.surfaces[i].name) ||
+		if (!strcmp((const char *)p->bytes + b->name_offset,
+			    (const char *)p->bytes + p->info.surfaces[i].name_offset) ||
 		    !strcmp(p->bytes + b->symbol_offset,
 			    p->bytes + p->info.surfaces[i].symbol_offset))
 			return -ENOEXEC;
@@ -507,7 +561,7 @@ static int hwx_symbols(struct hwx_parser *p)
 		for (j = 0; j < p->info.surface_count; j++) {
 			const struct ane_h16_hwx_surface *b = &p->info.surfaces[j];
 
-			if (strcmp(name, b->name))
+			if (strcmp(name, (const char *)p->bytes + b->name_offset))
 				continue;
 			if ((found & BIT(j)) || s[5] != b->section.ordinal ||
 			    value != b->section.vm)
@@ -623,7 +677,14 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 			}
 			break;
 		case 0x40:
-			if (len != 32 || p->ref_count == ANE_H16_SURFACES)
+			/*
+			 * Buffer reference: +0x10 the surface's address, +0x18 its
+			 * NUL-terminated name, padded with zeros to 8 bytes. Short
+			 * names give 32 bytes; zin_ane_compiler 10.205 writes long
+			 * ones (Apple's camera nets) whole, up to 0x58 here.
+			 */
+			if (len < 32 || len > 0x18 + ANE_H16_NAME_MAX ||
+			    p->ref_count == ANE_H16_SURFACES)
 				goto invalid;
 			p->refs[p->ref_count++] = pos;
 			break;
@@ -661,7 +722,7 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 	    p->tensor_count != p->info.surface_count)
 		goto invalid;
 	for (i = 0, outputs = 0, used = 0; i < p->info.surface_count; i++) {
-		/* Surfaces stay in segment order: inputs and exactly one output. */
+		/* Surfaces stay in segment order: inputs and one or more outputs. */
 		outputs += p->info.surfaces[i].direction == 2;
 		ret = hwx_tensor_for(p, i, &used);
 		if (ret < 0)
@@ -670,7 +731,7 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 		if (ret)
 			goto out;
 	}
-	if (outputs != 1)
+	if (!outputs)
 		goto invalid;
 	ret = hwx_program(p);
 	if (ret)
@@ -705,36 +766,46 @@ out:
 }
 EXPORT_SYMBOL_GPL(ane_h16_hwx_validate);
 
-static int hwx_snapshot_finish(struct ane_h16_hwx_snapshot *copy,
+/* Takes ownership of bytes. The parsed HWX (16 surfaces) is too big for the stack. */
+static int hwx_snapshot_finish(void *bytes, size_t size,
 			       struct ane_h16_hwx_snapshot *snapshot)
 {
+	struct ane_h16_hwx_snapshot *copy;
 	int ret;
 
+	copy = kzalloc(sizeof(*copy), GFP_KERNEL);
+	if (!copy) {
+		kvfree(bytes);
+		return -ENOMEM;
+	}
+	copy->bytes = bytes;
+	copy->size = size;
 	ret = ane_h16_hwx_validate(copy->bytes, copy->size, &copy->info);
 	if (ret) {
 		kvfree(copy->bytes);
+		kfree(copy);
 		return ret;
 	}
 	sha256(copy->bytes, copy->size, copy->digest);
 	*snapshot = *copy;
+	kfree(copy);
 	return 0;
 }
 
 int ane_h16_hwx_snapshot_create(const void *bytes, size_t size,
 				struct ane_h16_hwx_snapshot *snapshot)
 {
-	struct ane_h16_hwx_snapshot copy = {};
+	void *copy;
 
 	if (!bytes || !snapshot || size < 32 || size > ANE_H16_HWX_MAX)
 		return -EINVAL;
 	if (snapshot->bytes)
 		return -EBUSY;
-	copy.bytes = kvmalloc(size, GFP_KERNEL);
-	if (!copy.bytes)
+	copy = kvmalloc(size, GFP_KERNEL);
+	if (!copy)
 		return -ENOMEM;
-	memcpy(copy.bytes, bytes, size);
-	copy.size = size;
-	return hwx_snapshot_finish(&copy, snapshot);
+	memcpy(copy, bytes, size);
+	return hwx_snapshot_finish(copy, size, snapshot);
 }
 EXPORT_SYMBOL_GPL(ane_h16_hwx_snapshot_create);
 
@@ -746,17 +817,16 @@ EXPORT_SYMBOL_GPL(ane_h16_hwx_snapshot_create);
 int ane_h16_hwx_snapshot_from_user(const void __user *bytes, u64 size,
 				   struct ane_h16_hwx_snapshot *snapshot)
 {
-	struct ane_h16_hwx_snapshot copy = {};
+	void *copy;
 
 	if (!bytes || !snapshot || size < 32 || size > ANE_H16_HWX_MAX)
 		return -EINVAL;
 	if (snapshot->bytes)
 		return -EBUSY;
-	copy.bytes = vmemdup_user(bytes, size);
-	if (IS_ERR(copy.bytes))
-		return PTR_ERR(copy.bytes);
-	copy.size = size;
-	return hwx_snapshot_finish(&copy, snapshot);
+	copy = vmemdup_user(bytes, size);
+	if (IS_ERR(copy))
+		return PTR_ERR(copy);
+	return hwx_snapshot_finish(copy, size, snapshot);
 }
 EXPORT_SYMBOL_GPL(ane_h16_hwx_snapshot_from_user);
 

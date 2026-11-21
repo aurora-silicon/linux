@@ -250,17 +250,21 @@ static void resources_test(struct kunit *test)
 {
 	/* add-128 shape: input, output, input with class-local indices 0, 0, 1. */
 	static const u32 direction[3] = { 1, 2, 1 }, index[3] = { 0, 0, 1 };
-	struct ane_h16_hwx hwx = { .surface_count = 3 };
+	/* too large for the stack with 16 surfaces */
+	struct ane_h16_hwx *hwx = kunit_kzalloc(test, sizeof(*hwx), GFP_KERNEL);
 	struct ane_h16_resource resources[3] = {};
 	unsigned int i, variant;
 
+	KUNIT_ASSERT_NOT_NULL(test, hwx);
+	hwx->surface_count = 3;
+
 	for (i = 0; i < 3; i++) {
-		hwx.surfaces[i].section.vm = 0x30000000 + i * SZ_16K;
-		hwx.surfaces[i].section.size = SZ_16K;
-		hwx.surfaces[i].allocation = SZ_16K;
-		hwx.surfaces[i].span = 256;
-		hwx.surfaces[i].direction = direction[i];
-		resources[i].hwx_vm = hwx.surfaces[i].section.vm;
+		hwx->surfaces[i].section.vm = 0x30000000 + i * SZ_16K;
+		hwx->surfaces[i].section.size = SZ_16K;
+		hwx->surfaces[i].allocation = SZ_16K;
+		hwx->surfaces[i].span = 256;
+		hwx->surfaces[i].direction = direction[i];
+		resources[i].hwx_vm = hwx->surfaces[i].section.vm;
 		resources[i].permissions = direction[i];
 		resources[i].buffer = (struct ane_h16_execute_buffer) {
 			.index = index[i], .class = direction[i] - 1,
@@ -268,8 +272,8 @@ static void resources_test(struct kunit *test)
 			.mapping_size = SZ_16K, .size = 256,
 		};
 	}
-	KUNIT_EXPECT_EQ(test, ane_h16_resources_validate(&hwx, resources, 3), 0);
-	KUNIT_EXPECT_EQ(test, ane_h16_resources_validate(&hwx, resources, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ane_h16_resources_validate(hwx, resources, 3), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_resources_validate(hwx, resources, 1), -EINVAL);
 	for (variant = 0; variant < 9; variant++) {
 		struct ane_h16_resource bad[3];
 
@@ -304,7 +308,7 @@ static void resources_test(struct kunit *test)
 			bad[0].buffer.mapping_size--;
 			break;
 		}
-		KUNIT_EXPECT_EQ(test, ane_h16_resources_validate(&hwx, bad, 3), -EINVAL);
+		KUNIT_EXPECT_EQ(test, ane_h16_resources_validate(hwx, bad, 3), -EINVAL);
 	}
 }
 
