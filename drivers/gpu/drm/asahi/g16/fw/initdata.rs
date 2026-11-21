@@ -290,8 +290,9 @@ pub(crate) const V26B123: Layout = Layout {
     retention: Retention::Runtime(0x2c8),
     // The new u32 at 0x38 and two words in previously reserved fields, as the M4 Pro writes
     // them on this firmware (linux#1954, on hardware) and as macOS 27.2's InitData on the J773g
-    // holds them. The firmware takes region C into its state when it powers the GPU up.
-    globals_policy: &[(0x38, 1), (0x9dc, 50), (0xe0c, 250)],
+    // holds them. The firmware takes region C into its state when it powers the GPU up. 0x7f0
+    // is 1 in macOS 27.2's InitData on the J773g.
+    globals_policy: &[(0x38, 1), (0x9dc, 50), (0xe0c, 250), (0x7f0, 1)],
     // The four u32s inserted at 0x9c, as the M4 Pro writes them on this firmware (1 each, on
     // hardware, linux#1954) and as macOS 27.2's InitData on the J773g holds them. 0xa4 is the
     // state the firmware powers the GPU up to; with 0 there (the state while off) the GPU stays
@@ -314,6 +315,13 @@ pub(crate) const V26B123: Layout = Layout {
         (0xaac, 0x3ecf_2e49), // 0.40465
         (0xad8, 0x10),
         (0xae0, 0x5_dc00),
+        // Words G16 left zero, as macOS 27.2 has them in the J773g's InitData (our hypervisor
+        // capture of it).
+        (0x44, 12),
+        (0x84, 1),
+        (0x2b74, 50),
+        (0x2f34, 1),
+        (0x6ac8, 1),
     ],
 };
 
@@ -933,9 +941,6 @@ pub(crate) fn encode_for(
     let runs = layout.power_performance;
     let p = &mut objects[id::POWER_PERFORMANCE];
     put64(p, remap(runs, 0x3b50, 8)?, input.va[id::TEMPERATURE])?;
-    for &(at, value) in layout.power_policy {
-        put32(p, at, value)?;
-    }
     for (at, value) in [
         (4, 200000),
         (8, 200000),
@@ -952,6 +957,10 @@ pub(crate) fn encode_for(
         0x279e,
     ] {
         put32(p, remap(runs, at, 4)?, 100 * ceiling)?;
+    }
+    // Last, so that no remapped 25G83 word lands on a word of the build's own.
+    for &(at, value) in layout.power_policy {
+        put32(p, at, value)?;
     }
     Ok(())
 }
