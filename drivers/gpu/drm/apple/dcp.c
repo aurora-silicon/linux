@@ -9649,8 +9649,10 @@ MODULE_PARM_DESC(j613_rtkit_idle, "J613 trial: RTKit AP and IOP idle before the 
 
 static bool dcp_j613_sleep_owned(struct apple_dcp *dcp)
 {
-	return IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) && dcp->fw_compat == DCP_FIRMWARE_V_26_6 &&
-	       !dcp->external && of_machine_is_compatible("apple,j613") &&
+	return IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) && !dcp->external &&
+	       of_device_is_compatible(dcp->dev->of_node, "apple,t8122-dcp") &&
+	       (dcp->fw_compat == DCP_FIRMWARE_V_26_6 ||
+		apple_t8122_dcp_v27_2(dcp->dev->of_node)) &&
 	       apple_sleep_commit_stops_coprocs() && !apple_sleep_dry_run();
 }
 
