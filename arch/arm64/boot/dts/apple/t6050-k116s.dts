@@ -269,9 +269,9 @@
 };
 
 /*
- * Right port (ATC2): hpm2 on nub-spmi-a1, USB only (dcpext0's DisplayPort route
- * through ATC2 stays off). The driver polls the generation 4 bus and refuses an
- * interrupt, so it takes the first register window only, as on J714s.
+ * Right port (ATC2): hpm2 on nub-spmi-a1. The driver polls the generation 4 bus
+ * and refuses an interrupt, so it takes the first register window only, as on
+ * J714s.
  */
 &nub_spmi_a1 {
 	reg = <0x2 0x8a1a8000 0x0 0x4000>;
@@ -359,6 +359,52 @@
 };
 
 /*
+ * External displays: DisplayPort alt mode on the left-front (ATC1) and right
+ * (ATC2) ports, through dcpext0 and dcpext2 (t6050-display.dtsi).
+ */
+#include "t6050-display.dtsi"
+
+&typec1 {
+	ports {
+		port@2 {
+			reg = <2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			atc1_dp_dcpext0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext0_atc1>;
+			};
+
+			atc1_dp_dcpext2: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext2_atc1>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@2 {
+			reg = <2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			atc2_dp_dcpext0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext0_atc2>;
+			};
+
+			atc2_dp_dcpext2: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext2_atc2>;
+			};
+		};
+	};
+};
+
+/*
  * SMC sensors, as on J714s: every readable float T* key is discovered through
  * apple,discover-temperatures in t6050-die0.dtsi, so the shared temperature
  * nodes and apple,soc-die-keys go. The T6050 SMC spells the fan mode keys
@@ -432,44 +478,6 @@
 		width-mm = <345>;
 		height-mm = <223>;
 	};
-};
-
-/* The ADT lists no clocks for the external engines (clock-ids = []) */
-&dcpext1 {
-	apple,clock-ids;
-};
-
-&dcpext2 {
-	apple,clock-ids;
-};
-
-&dcpext3 {
-	apple,clock-ids;
-};
-
-/* ADT dart-dcpextN and dart-dispextN: vm-base 1 TiB, vm-size 3 TiB */
-&dcpext1_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dispext1_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dcpext2_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dispext2_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dcpext3_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dispext3_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
 };
 
 /*
