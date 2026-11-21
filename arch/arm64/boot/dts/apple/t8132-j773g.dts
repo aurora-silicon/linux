@@ -262,6 +262,7 @@
 
 #include "hwmon-common.dtsi"
 #include "hwmon-mini.dtsi"
+#include "t8132-j773g-dpaudio.dtsi"
 
 /*
  * The PMGR domains of the USB-C ports this board wires beyond ATC0/ATC1, as
