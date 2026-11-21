@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t6040-sleep.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T6040 system sleep controls
+
+maintainers:
+  - Diljit Singh <hey@djdev.me>
+  - František Balázsy <frantisekbalazsy@gmail.com>
+
+description: |
+  The registers a kernel running directly at EL2 on an Apple SoC writes to enter
+  and return from suspend-to-RAM and to power its secondary CPUs off. They belong
+  to several hardware blocks, some of which other drivers also use, so this node
+  overlaps those drivers' register ranges and the driver does not claim them.
+
+  On the T6040 the sleep engine waits for the display pipes, so the node lists
+  the power states that have to be off before a sleep, as the ADT's
+  device-check-ps-b4-sleep table does. Each entry names a PMGR register block,
+  the offset of a display pipe's CPU power state and the offset of its last
+  sub-block; the states in between are 8 bytes apart. All of the T6040's
+  register blocks are needed to enter a suspend and to undo it.
+
+properties:
+  compatible:
+    const: apple,t6040-sleep
+
+  reg:
+    items:
+      - description: CPU start/stop block (pmgr + 0x88000)
+      - description: AON watchdog
+      - description: control words of the three CPU complexes
+      - description: SoC power gate, wake and retention voters
+      - description: SPMI controller of the PMU (boot stage, notify, hibernate)
+      - description: second SPMI controller's notify word
+      - description: MasterMini block with the S2R timer
+      - description: SOC-East page with retention, fabric, DCS, SIO and other power words
+      - description: SOC page with the west axi2af, ATC, fabric and DCS power words
+      - description: AOP global block, S2R control and wake masks
+      - description: MiniPMGR power states of the AOP and its audio island
+      - description: internal display's DART, for its transaction idle wait
+      - description: internal display's power gate controls
+      - description: PMC voters of the display coprocessors
+      - description: PMC bandwidth request and boost enables of the display pipes
+      - description: keep-alive enables in the SOC PMGR
+      - description: keep-alive enables in the SOC-East PMGR
+      - description: SMC's AP watchdog deadline
+      - description: MiniPMGR GPU residency gate
+      - description: MiniPMGR S2R entry counter
+      - description: GPU AFR power state
+      - description: external debug windows of the CPU cores
+
+  reg-names:
+    items:
+      - const: cpu-start
+      - const: wdt
+      - const: cluster
+      - const: pwrgate
+      - const: spmi
+      - const: spmi-a0
+      - const: mastermini
+      - const: soc-east
+      - const: soc-ps
+      - const: wake
+      - const: aop-ps
+      - const: disp-dart
+      - const: disp-pwrgate
+      - const: pmc-dcp
+      - const: pmc-bwr
+      - const: keep-alive-soc
+      - const: keep-alive-east
+      - const: smc-wdt
+      - const: agx-gate
+      - const: s2r-count
+      - const: gfx-ps
+      - const: cpu-debug
+
+  apple,apcie:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PCIe host whose shared registers and tunables the storage controller's
+      link depends on. They are needed even with that host disabled. The boot
+      loader adds it, with those registers and tunables on the host's node;
+      without it the storage controller can't be stopped for a sleep.
+
+  apple,check-ps-b4-sleep:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description:
+      The display pipes whose power states have to be off before a sleep, one
+      entry per pipe.
+    items:
+      items:
+        - description: PMGR syscon
+        - description: offset of the pipe's CPU power state
+        - description: offset of its last sub-block's power state
+
+  apple,check-ps-b4-sleep-names:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    description: One name per apple,check-ps-b4-sleep entry.
+
+  apple,pinctrl:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The AP pin controller, whose pins a deep sleep resets.
+
+  apple,pinctrl-skip-pins:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Pins neither saved nor restored.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - apple,check-ps-b4-sleep
+  - apple,check-ps-b4-sleep-names
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        sleep-controller@502888000 {
+            compatible = "apple,t6040-sleep";
+            reg = <0x5 0x02888000 0x0 0x20>,
+                  <0x5 0x0836c000 0x0 0x4000>,
+                  <0x5 0x02820000 0x0 0x20>,
+                  <0x5 0x0282c000 0x0 0x1000>,
+                  <0x5 0x09014000 0x0 0x1000>,
+                  <0x5 0x09188000 0x0 0x1000>,
+                  <0x5 0x08900000 0x0 0x8000>,
+                  <0x5 0x02280000 0x0 0xd000>,
+                  <0x5 0x02800000 0x0 0x9000>,
+                  <0x5 0x08004000 0x0 0x1000>,
+                  <0x5 0x08304000 0x0 0x160>,
+                  <0x4 0x02340000 0x0 0x1000>,
+                  <0x5 0x022a1000 0x0 0x100>,
+                  <0x5 0x048a9c14 0x0 0xc>,
+                  <0x5 0x048ac020 0x0 0x10>,
+                  <0x5 0x029dc000 0x0 0x880>,
+                  <0x5 0x022d0000 0x0 0x880>,
+                  <0x5 0x08330008 0x0 0x4>,
+                  <0x5 0x08375010 0x0 0x4>,
+                  <0x5 0x08370970 0x0 0x4>,
+                  <0x2 0x88e80100 0x0 0x4>,
+                  <0x2 0x10010000 0x0 0x3000000>;
+            reg-names = "cpu-start", "wdt", "cluster", "pwrgate",
+                        "spmi", "spmi-a0", "mastermini", "soc-east",
+                        "soc-ps", "wake", "aop-ps", "disp-dart",
+                        "disp-pwrgate", "pmc-dcp", "pmc-bwr",
+                        "keep-alive-soc", "keep-alive-east", "smc-wdt",
+                        "agx-gate", "s2r-count", "gfx-ps", "cpu-debug";
+            apple,check-ps-b4-sleep = <&pmgr_disp 0x0 0x58>;
+            apple,check-ps-b4-sleep-names = "disp";
+        };
+    };
