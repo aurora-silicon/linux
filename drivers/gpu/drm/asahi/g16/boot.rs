@@ -22,7 +22,10 @@ use kernel::{
     platform,
     prelude::*,
     sync::{aref::ARef, Arc, ArcBorrow},
-    time::{delay::fsleep, Delta, Instant, Monotonic},
+    time::{
+        delay::{fsleep, udelay},
+        Delta, Instant, Monotonic,
+    },
 };
 
 use super::adt::{self, GpuAdt};
@@ -640,6 +643,40 @@ fn devctl_op(
     channel::devctl_submit(session, channels, events, init, &DevCtl::op(opcode), true)
 }
 
+/// The 26B123 start: waits for one posted boot control to retire, polling the indices every
+/// 5 us without draining or printing the rings, and returns how long it took. The firmware
+/// powers down about 0.5 ms after its last work (J713), so a boot control posted later wakes it
+/// from idle first.
+fn await_boot_control_prompt(
+    session: &Session,
+    channels: &Channels,
+    init: &InitData,
+    target: u32,
+) -> Result<Delta> {
+    let start = Instant::<Monotonic>::now();
+    loop {
+        session.check()?;
+        let read = channels.devctl.read()?;
+        let done = channels.devctl.completion()?;
+        if read == target && done == target && init.readiness()? == 1 {
+            return Ok(start.elapsed());
+        }
+        if read > target || done > target || channels.devctl.write()? != target {
+            channels.log_stop(session, init, "unexpected boot-control indices");
+            return Err(eproto());
+        }
+        if init.halted()? {
+            channels.log_stop(session, init, "firmware halted awaiting a boot control");
+            return Err(EBUSY);
+        }
+        if start.elapsed() > Delta::from_millis(20) {
+            channels.log_stop(session, init, "boot control not retired in 20 ms");
+            return Err(ETIMEDOUT);
+        }
+        udelay(Delta::from_micros(5));
+    }
+}
+
 /// Wait for one boot control to retire, requiring stable consumer+completion indices.
 fn wait_boot_control(
     session: &Session,
@@ -807,34 +844,60 @@ fn run(
         );
         0
     };
-    devctl_op(session, channels, events, init, devctl.import_globals)?;
-    wait_boot_control(session, channels, events, init, base + 1, 5000)?;
     let scheduler = init.control.as_ref().ok_or(EINVAL)?;
     let scheduler_word = init.firmware_data().scheduler;
-    let pending = scheduler.r32(scheduler_word)?;
     if kind == hw::Start::MacOs27_2 {
-        // 26B123: the InitData request (1) can still be pending here (seen on the J713): the
-        // firmware consumes it when it powers the GPU up or recovers, and the boot records
-        // need not power it up. Post START with it pending; never stack a second request.
+        // 26B123: IMPORT_GLOBALS and START go out behind one doorbell, so the firmware does not
+        // idle between them. On the J773g the doorbell after a lone IMPORT_GLOBALS crashed the
+        // firmware in its wake, whether 29 us or 52 ms later; on the J713 the pair behind one
+        // doorbell retired both.
+        //
+        // The InitData request (1) can still be pending here (seen on the J713): the firmware
+        // consumes it when it powers the GPU up or recovers, and the boot records need not
+        // power it up. Post START with it pending; never stack a second request.
+        let pending = scheduler.r32(scheduler_word)?;
         if pending > 1 {
-            channels.log_stop(session, init, "scheduler word unexpected after IMPORT_GLOBALS");
+            channels.log_stop(
+                session,
+                init,
+                "scheduler word unexpected before the boot pair",
+            );
             return Err(EBUSY);
         }
-        dev_info!(dev, "G16: 27.2 scheduler request {} pending at START\n", pending);
         if pending == 0 {
             scheduler.w32(scheduler_word, 1)?;
         }
+        regs::wmb();
+        channel::devctl_submit_batch(
+            session,
+            channels,
+            events,
+            init,
+            &[DevCtl::op(devctl.import_globals), DevCtl::op(devctl.start)],
+        )?;
+        let retired = await_boot_control_prompt(session, channels, init, base + 2)?;
+        session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
+        dev_info!(
+            dev,
+            "G16: 27.2 boot pair: IMPORT_GLOBALS and START behind one doorbell with scheduler request {} pending, both retired in {} us\n",
+            pending,
+            retired.as_micros_ceil()
+        );
+        // Settled: the same stable-index check as 25G83, with no boot doorbell left to send.
+        wait_boot_control(session, channels, events, init, base + 2, 2000)?;
     } else {
-        if pending != 0 {
+        devctl_op(session, channels, events, init, devctl.import_globals)?;
+        wait_boot_control(session, channels, events, init, base + 1, 5000)?;
+        if scheduler.r32(scheduler_word)? != 0 {
             channels.log_stop(session, init, "scheduler word set after IMPORT_GLOBALS");
             return Err(EBUSY);
         }
         scheduler.w32(scheduler_word, 1)?;
+        regs::wmb();
+        devctl_op(session, channels, events, init, devctl.start)?;
+        wait_boot_control(session, channels, events, init, base + 2, 2000)?;
+        session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
     }
-    regs::wmb();
-    devctl_op(session, channels, events, init, devctl.start)?;
-    wait_boot_control(session, channels, events, init, base + 2, 2000)?;
-    session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
     for _ in 0..10 {
         fsleep(Delta::from_millis(10));
         channels.drain_rings(&dev, events)?;
