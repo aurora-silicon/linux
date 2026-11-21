@@ -181,6 +181,8 @@ static void qspi_policy_gd_status(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, apple_qspi_gd_status_allows_write(0x00, 0x02, 0x1c));
 	KUNIT_EXPECT_TRUE(test, apple_qspi_gd_status_allows_write(0x04, 0x02, 0x1c));
 	KUNIT_EXPECT_FALSE(test, apple_qspi_gd_status_allows_write(0x04, 0x02, 0));
+	/* The J773g GD25UF64E part: QE only, no block protection. */
+	KUNIT_EXPECT_TRUE(test, apple_qspi_gd_status_allows_write(0x00, 0x02, 0));
 	/* SRP0, SRP1 and LB1 to LB3 stay as found and do not block a write. */
 	KUNIT_EXPECT_TRUE(test, apple_qspi_gd_status_allows_write(0x80, 0x3b, 0x1c));
 	/* WIP and WEL are never admitted. */
