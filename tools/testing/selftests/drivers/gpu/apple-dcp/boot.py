@@ -201,6 +201,7 @@ def t6041_v27_admission(root):
                        if line.startswith('#define APPLE_T6041_DCP_26B123_UUID '))
     helper = '\n'.join((uuid_define, *(
         block(display_h, 'static inline bool ' + name + '(') for name in (
+            'apple_dcp_image_v27_2',
             'apple_t6041_dcp_any_v27_2', 'apple_t6041_dcp_v27_2',
             'apple_t6041_dcpext_v27_2'))))
     iomfb_h = (root / 'drivers/gpu/drm/apple/iomfb.h').read_text()
