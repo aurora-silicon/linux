@@ -1008,6 +1008,25 @@ static void isp_test_failed_fw_stop_lights_off(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, trace.set_off_at, 1);
 }
 
+/*
+ * The MLVNR network's inputs (ISP firmware NetInputCheck): the J815's binned
+ * mode (config 8, 1520x1440, rows of 3072 bytes) asserted the firmware on
+ * hardware (2026-11-21); the full-resolution mode macOS streams (config 6,
+ * 3040x2880 = rows of 0x17c0) is taken.
+ */
+static void isp_test_mlvnr_inputs(struct kunit *test)
+{
+	KUNIT_EXPECT_FALSE(test, isp_mlvnr_input_ok(1520, 1440));
+	KUNIT_EXPECT_FALSE(test, isp_mlvnr_input_ok(1520, 2880));
+	KUNIT_EXPECT_TRUE(test, isp_mlvnr_input_ok(3040, 2880));
+	KUNIT_EXPECT_TRUE(test, isp_mlvnr_input_ok(3040, 2872));
+	KUNIT_EXPECT_FALSE(test, isp_mlvnr_input_ok(3040, 2871));
+	KUNIT_EXPECT_TRUE(test, isp_mlvnr_input_ok(1920, 1080));
+	KUNIT_EXPECT_TRUE(test, isp_mlvnr_input_ok(3072, 3024));
+	KUNIT_EXPECT_FALSE(test, isp_mlvnr_input_ok(3072, 3023));
+	KUNIT_EXPECT_FALSE(test, isp_mlvnr_input_ok(0, 0));
+}
+
 static struct kunit_case isp_cam_test_cases[] = {
 	KUNIT_CASE(isp_test_call_crop),
 	KUNIT_CASE(isp_test_call_crop_bounds),
@@ -1020,6 +1039,7 @@ static struct kunit_case isp_cam_test_cases[] = {
 	KUNIT_CASE(isp_test_sensor_geometry),
 	KUNIT_CASE(isp_test_sensor_names),
 	KUNIT_CASE(isp_test_sensor_config_list),
+	KUNIT_CASE(isp_test_mlvnr_inputs),
 	KUNIT_CASE(isp_test_sensor_config_failure),
 	KUNIT_CASE(isp_test_preview_stream),
 	KUNIT_CASE(isp_test_preview_command_failures),

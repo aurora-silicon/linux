@@ -14,6 +14,7 @@ struct isp_surf *isp_alloc_surface_at(struct apple_isp *isp, dma_addr_t iova,
 				      u64 size);
 int isp_surf_vmap(struct apple_isp *isp, struct isp_surf *surf);
 void isp_free_surface(struct apple_isp *isp, struct isp_surf *surf);
+void isp_put_surface(struct apple_isp *isp, struct isp_surf *surf);
 void isp_free_released_surfaces(struct apple_isp *isp);
 
 int apple_isp_iommu_map_sgt(struct apple_isp *isp, struct isp_surf *surf,

@@ -97,6 +97,8 @@ struct isp_surf {
 	bool gc;
 	bool submitted;
 	bool iova_reserved; /* @iova comes from &apple_isp.iovas */
+	/* SHAREDMALLOC: the ID given to the firmware (macOS: the IOSurface ID), or 0 */
+	u32 id;
 };
 
 struct isp_message {
@@ -397,6 +399,10 @@ struct apple_isp {
 	struct ane_isp_link *ane;
 	struct isp_surf *ane_rings;
 	u64 ane_doorbell;
+	u64 ane_ring_fw; /* the rings' address as handed to the firmware */
+	/* SHAREDMALLOC surfaces get IDs the ANE can map them by (isp-ane.c) */
+	bool ane_ids;
+	u32 ane_next_id, ane_ids_given;
 	u32 ane_doorbell_sel;
 	char ane_afpp[64];
 	u32 cam_connections_scheme;
