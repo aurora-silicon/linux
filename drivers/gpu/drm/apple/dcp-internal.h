@@ -308,12 +308,14 @@ struct apple_dcp_hw_data {
 	/*
 	 * The endpoint the DPTX port services are announced on, where it is not
 	 * the firmware's default (DPTX_ENDPOINT_V2 on firmware 27): the T8142
-	 * dcpext announces them on DPTX_ENDPOINT. 0: the default.
+	 * dcpext announces them on DPTX_ENDPOINT. 0: the default, or on a
+	 * firmware-27 dcpext what its firmware advertises (dcp_v27_dptx_layout()).
 	 */
 	u8 dptx_endpoint;
 	/*
 	 * Open the DPTX controller endpoint before the ports, as for H17P
 	 * externals: the T8142 dcpext announces AppleDCPDPTXController there.
+	 * Also set by dcp_v27_dptx_layout().
 	 */
 	bool dptx_controller;
 	/*
@@ -557,7 +559,13 @@ struct apple_dcp {
 	/* Firmware 27.x: the method IDs of this build (iomfb_v27_methods()). */
 	const struct dcp_method_entry *v27_methods;
 	bool external;
-	/* A desktop 26.x external processor (apple,t6041-dcpext) */
+	/* Any external processor (apple,dcpext), whatever its SoC; set at probe. */
+	bool dcpext;
+	/*
+	 * A desktop external processor: apple,t6041-dcpext (26.x or 27.2), or
+	 * the J773g's apple,t8132-dcpext on 27.2 (apple_t8132_dcpext_v27_2()),
+	 * which drives the HDMI port the same way.
+	 */
 	bool desktop_external;
 	/*
 	 * A failsafe dcpext (dcp_ext_is_failsafe(): T8122's, T6041's, T6050's):
