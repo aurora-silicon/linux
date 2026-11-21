@@ -189,6 +189,9 @@ static void drop(int **l)
 #define guard(type) \
 	int *CAT(g_, __COUNTER__) __maybe_unused __cleanup(drop) = take
 #define lockdep_assert_held(l) assert(*(l))
+#define scoped_guard(type, l) \
+	for (int *CAT(sg_, __LINE__) __cleanup(drop) = take(l), CAT(sgo_, __LINE__) = 1; \
+	     CAT(sgo_, __LINE__); CAT(sgo_, __LINE__) = 0)
 static void panic(const char *s, ...)
 {
 	assert(false);
@@ -538,7 +541,7 @@ static void add_xdomain(int i)
 {
 	struct tb_switch *sw = i ? &child : &root;
 
-	xports[i] = (struct tb_port){ .sw = sw, .port = 5 + i };
+	xports[i] = (struct tb_port){ .sw = sw, .port = 5 + i, .null = true };
 	xds[i] = (struct tb_xdomain){ .present = true, .port = &xports[i],
 				      .route = tb_downstream_route(&xports[i]) };
 	xports[i].xdomain = &xds[i];
@@ -548,6 +551,24 @@ static void add_xdomain(int i)
 	} else {
 		link[0].next = &xports[0];
 	}
+}
+/* The refused path's rescan: a released peer whose link is still up is found again. */
+static int rescans, cleanups;
+static void tb_resume_cleanup(struct tb *t)
+{
+	assert(tb.lock);
+	cleanups++;
+}
+static void tb_scan_switch(struct tb_switch *sw)
+{
+	assert(tb.lock && sw == &root);
+	rescans++;
+	for (int i = 0; i < 2; i++)
+		if (xds[i].present && xds[i].unregistered && !xports[i].xdomain) {
+			xds[i] = (struct tb_xdomain){ .present = true, .port = &xports[i],
+						      .route = xds[i].route };
+			xports[i].xdomain = &xds[i];
+		}
 }
 static void check_released(int i)
 {
@@ -585,6 +606,8 @@ static void setup(void)
 	child = (struct tb_switch){ .usb4 = true, .uid = 2 };
 	link[0].remote = &link[1];
 	link[0].next = link[1].next = NULL;
+	link[0].null = link[1].null = true;
+	rescans = cleanups = 0;
 	link[1].sw = &child;
 	memset(xds, 0, sizeof(xds));
 	memset(xports, 0, sizeof(xports));
@@ -953,6 +976,52 @@ int main(void)
 	assert(tb_cio_sleep_prepare(&tb) == -EBUSY);
 	check_untouched(1);
 	assert(!xd_unconfigured);
+	cases++;
+	/*
+	 * A prepare refused later, on the NHI side (PHY, DART, rings): the CM's refused path
+	 * completes, unregisters and rescans, which finds the still-linked peers again.
+	 */
+	setup();
+	add_xdomain(0);
+	add_xdomain(1);
+	assert(!tb_cio_sleep_prepare(&tb));
+	check_released(0);
+	check_released(1);
+	clients_awake = true;
+	tb_cio_sleep_refused(&tb);
+	assert(!cm.cio_prepared && cm.hotplug_active && !cm.resume_cleanup_pending);
+	assert(rescans == 1 && cleanups == 1);
+	check_untouched(0);
+	check_untouched(1);
+	cases++;
+	/* The CM's own refusal after the release (a tunnel's prepare): the same. */
+	setup();
+	add_xdomain(0);
+	inject(1, 1);
+	assert(tb_cio_sleep_prepare(&tb) == -ENOMEM);
+	check_released(0);
+	tb_cio_sleep_refused(&tb);
+	assert(rescans == 1 && !cm.resume_cleanup_pending);
+	check_untouched(0);
+	cases++;
+	/* Refused before anything was released: an ordinary rescan, the peer stays as it is. */
+	setup();
+	add_xdomain(0);
+	cm.stopping = true;
+	assert(tb_cio_sleep_prepare(&tb) == -EBUSY);
+	cm.stopping = false;
+	tb_cio_sleep_refused(&tb);
+	assert(rescans == 1 && !cleanups);
+	check_untouched(0);
+	cases++;
+	/* A connection manager that is stopping is not rescanned. */
+	setup();
+	add_xdomain(0);
+	cm.stopping = true;
+	assert(tb_cio_sleep_prepare(&tb) == -EBUSY);
+	tb_cio_sleep_refused(&tb);
+	assert(!rescans);
+	check_untouched(0);
 	cases++;
 	printf("PASS %u native tunnel replay cases\n", cases);
 }

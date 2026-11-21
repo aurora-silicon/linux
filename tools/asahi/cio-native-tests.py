@@ -64,6 +64,9 @@ def main():
                                   'ret = 0;'),
         't6050-port-refuses-late': ('ret = apple_dart_cio_check(pcie->cio_dart, true);',
                                     'ret = 0;'),
+        't6050-refuses-after-release': ('if (!pcie && anhi->cio_t6050) {\n\t\tret = -ENODEV;\n\t\tgoto release_cable;',
+                                        'if (false) {\n\t\tret = -ENODEV;\n\t\tgoto release_cable;'),
+        'refused-without-rescan': ('\ttb_cio_sleep_refused(anhi->tb);\n', '\ttb_cio_sleep_complete(anhi->tb);\n'),
     }
     variants = {'real': fixture}
     for name, (old, new) in mutations.items():

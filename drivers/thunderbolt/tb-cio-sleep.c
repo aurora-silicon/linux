@@ -40,13 +40,17 @@ static void tb_cio_release_xdomains(struct tb *tb, struct tb_switch *sw)
 	tb_switch_for_each_port(sw, port) {
 		struct tb_xdomain *xd;
 
-		if (tb_is_upstream_port(port))
+		if (!tb_port_is_null(port) || tb_is_upstream_port(port))
 			continue;
 		if (tb_port_has_remote(port)) {
 			tb_cio_release_xdomains(tb, port->remote->sw);
 			continue;
 		}
-		/* By its route, as it was found: the bus holds it wherever the port keeps it. */
+		/*
+		 * By its route, through the router tree: on the J713 the adapter iterated here
+		 * did not hold the peer itself when the release first ran (0:1's xdomain was
+		 * unset), while the route lookup finds it.
+		 */
 		xd = tb_xdomain_find_by_route(tb, tb_downstream_route(port));
 		tb_port_dbg(port, "sleep: xdomain %s, port's %s\n", xd ? "found" : "none",
 			    port->xdomain ? "set" : "unset");
@@ -519,3 +523,28 @@ void tb_cio_sleep_complete(struct tb *tb)
 	tcm->resume_cleanup_pending = true;
 }
 EXPORT_SYMBOL_FOR_MODULES(tb_cio_sleep_complete, "thunderbolt_apple");
+
+/*
+ * A prepare refused at or after tb_cio_sleep_prepare(): nothing slept, but the PM core
+ * calls no complete for the refusing device, so do here what tb_complete() would. Peers
+ * released for the sleep still have their links up: unregister them and rescan, which
+ * finds them again. Without a transaction open it is an ordinary rescan.
+ */
+void tb_cio_sleep_refused(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	tb_cio_sleep_complete(tb);
+	scoped_guard(mutex, &tb->lock) {
+		if (tcm->resume_cleanup_pending) {
+			tb_resume_cleanup(tb);
+			tcm->resume_cleanup_pending = false;
+		}
+	}
+	tb_domain_unregister_unplugged_xdomains(tb);
+	guard(mutex)(&tb->lock);
+	/* Not while the connection manager stops, or before it scans at all. */
+	if (tcm->hotplug_active && !tcm->stopping)
+		tb_scan_switch(tb->root_switch);
+}
+EXPORT_SYMBOL_FOR_MODULES(tb_cio_sleep_refused, "thunderbolt_apple");
