@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * Long-term pins of user memory as whole native pages, for GEM_USERPTR.
+ * Long-term pins of user memory as whole native pages, for GEM_USERPTR, and
+ * their charge to the user against RLIMIT_MEMLOCK.
  *
  * The GPU maps memory in native pages. A process whose user page size is
  * smaller (CONFIG_MM_SUBPAGE) maps each of its pages to a fragment of a
@@ -10,12 +11,92 @@
  * memory the process does not map.
  */
 
+#include <linux/capability.h>
+#include <linux/cred.h>
 #include <linux/mm.h>
 #include <linux/mm_subpage.h>
+#include <linux/overflow.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/user.h>
 #include <linux/slab.h>
+#include <linux/user_namespace.h>
 
 #include "user_pages.h"
+
+/*
+ * Charges @nr_pages to the current user's locked_vm, the count RLIMIT_MEMLOCK
+ * bounds for io_uring's registered buffers and iommufd's pinned pages as well
+ * (__io_account_mem(), incr_user_locked_vm()). The count belongs to the user,
+ * not to an mm: every process of the user shares it, and pages a process pinned
+ * stay counted after it exits, until they are released. As both of those, a
+ * CAP_IPC_LOCK caller is not charged at all.
+ *
+ * On success *@out is the charged user, with a reference, for
+ * asahi_user_unaccount(), or NULL when nothing was charged. -ENOMEM when the
+ * pages would take the user past RLIMIT_MEMLOCK.
+ */
+int asahi_user_account(unsigned long nr_pages, struct user_struct **out)
+{
+	struct user_struct *user = current_user();
+	unsigned long limit, cur, new;
+
+	*out = NULL;
+	if (ns_capable_noaudit(&init_user_ns, CAP_IPC_LOCK))
+		return 0;
+
+	limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+	cur = atomic_long_read(&user->locked_vm);
+	do {
+		if (check_add_overflow(cur, nr_pages, &new) || new > limit)
+			return -ENOMEM;
+	} while (!atomic_long_try_cmpxchg(&user->locked_vm, &cur, new));
+	*out = get_uid(user);
+	return 0;
+}
+
+void asahi_user_unaccount(struct user_struct *user, unsigned long nr_pages)
+{
+	if (!user)
+		return;
+	if (!WARN_ON(atomic_long_read(&user->locked_vm) < nr_pages))
+		atomic_long_sub(nr_pages, &user->locked_vm);
+	free_uid(user);
+}
+
+#if IS_BUILTIN(CONFIG_KUNIT) && !defined(MODULE)
+/* For gem.rs's KUnit tests: adds @delta to the current user's charged pages. */
+long asahi_test_user_locked_vm_add(long delta)
+{
+	return atomic_long_add_return(delta, &current_user()->locked_vm);
+}
+
+/* For gem.rs's KUnit tests: the thread's credentials without CAP_IPC_LOCK. */
+const struct cred *asahi_test_drop_ipc_lock(void)
+{
+	struct cred *new = prepare_creds();
+
+	if (!new)
+		return NULL;
+	cap_lower(new->cap_effective, CAP_IPC_LOCK);
+	return override_creds(new);
+}
+
+void asahi_test_restore_creds(const struct cred *old)
+{
+	put_cred(revert_creds(old));
+}
+
+/* For gem.rs's KUnit tests: sets the thread's RLIMIT_MEMLOCK, returns the old one. */
+unsigned long asahi_test_set_memlock(unsigned long bytes)
+{
+	struct rlimit *rlim = &current->signal->rlim[RLIMIT_MEMLOCK];
+	unsigned long old = rlim->rlim_cur;
+
+	WRITE_ONCE(rlim->rlim_cur, bytes);
+	return old;
+}
+#endif
 
 #ifdef CONFIG_MM_SUBPAGE
 /* Pinned fragments of a range; released only through asahi_unpin_user_fragments(). */

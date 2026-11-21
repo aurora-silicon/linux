@@ -450,22 +450,27 @@ pub(crate) fn new_user_memory_object(
     Ok(gem)
 }
 
-/// Pages of the calling process pinned as the backing of a user-memory object, and counted in its
-/// mm's `pinned_vm` against RLIMIT_MEMLOCK.
+/// Pages of the calling process pinned as the backing of a user-memory object, charged to its
+/// user against RLIMIT_MEMLOCK and counted in its mm's `pinned_vm`.
 pub(crate) struct UserPages {
     pages: KVVec<*mut kernel::bindings::page>,
     writable: bool,
     /// The mm whose `pinned_vm` counts the pages; it may outlive the address space.
     mm: ARef<Mm>,
-    /// Pages counted in `pinned_vm`: all of the range, including any not pinned yet.
+    /// Pages counted in `pinned_vm`, and charged to `user` if that is set: all of the range,
+    /// including any not pinned yet.
     counted: i64,
+    /// The user whose `locked_vm` the pages are charged to, with a reference (null when nothing
+    /// was charged: see `asahi_user_account()`).
+    user: *mut kernel::bindings::user_struct,
     /// The fragment pins of a process with a smaller page size, which hold `pages` (null when
     /// `pages` are ordinary pins).
     fragments: *mut core::ffi::c_void,
 }
 
 // SAFETY: The pinned pages and fragment records may be released from any thread; the mm
-// reference is thread-safe.
+// reference is thread-safe, and so is the user reference (`asahi_user_unaccount()` takes the
+// count atomically and `free_uid()` may run on any thread).
 unsafe impl Send for UserPages {}
 // SAFETY: Shared access only reads the array.
 unsafe impl Sync for UserPages {}
@@ -482,8 +487,10 @@ impl UserPages {
     /// writable or whose filesystem tracks writes (`FOLL_LONGTERM` refuses those). In a process
     /// whose page size is smaller than the native one, a native page is accepted only where the
     /// process maps all of it, in order at consecutive addresses (`EFAULT` otherwise). Fails with
-    /// `ENOMEM` when the pages would take the process past RLIMIT_MEMLOCK without CAP_IPC_LOCK,
-    /// counting every page pinned this way or by other long-term pinners.
+    /// `ENOMEM` when the pages would take the calling user past RLIMIT_MEMLOCK. The limit counts
+    /// the user's pages, not the process's: the pins of every process of the user, children that
+    /// have exited included, and the user's io_uring and iommufd pins. A CAP_IPC_LOCK caller's
+    /// pins are not charged, as theirs are not.
     ///
     /// Anonymous pages pinned here stay with this process across fork(): the child gets copies.
     /// Pages unmapped by the process stay pinned, and backing the object, until it is freed.
@@ -498,24 +505,21 @@ impl UserPages {
             .mm()
             .map(|mm| ARef::from(&**mm))
             .ok_or(EFAULT)?;
-        let pinned_vm = Self::pinned_vm(&mm);
         let added = i64::try_from(count).map_err(|_| ENOMEM)?;
-        let total = pinned_vm
-            .fetch_add(added, Ordering::AcqRel)
-            .saturating_add(added);
-        if !memlock_allows(total, memlock_limit_pages()) {
-            // SAFETY: `capable()` has no preconditions.
-            if !unsafe { kernel::bindings::capable(kernel::bindings::CAP_IPC_LOCK as i32) } {
-                pinned_vm.fetch_sub(added, Ordering::AcqRel);
-                return Err(ENOMEM);
-            }
+        let mut user = core::ptr::null_mut();
+        // SAFETY: `user` is a valid place for the charged user; nothing else is required.
+        let ret = unsafe { asahi_user_account(count as _, &mut user) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
         }
-        // From here on, dropping `this` unpins what it holds and uncounts all `count` pages.
+        Self::pinned_vm(&mm).fetch_add(added, Ordering::AcqRel);
+        // From here on, dropping `this` unpins what it holds and uncharges all `count` pages.
         let mut this = Self {
             pages: KVVec::new(),
             writable,
             mm,
             counted: added,
+            user,
             fragments: core::ptr::null_mut(),
         };
         this.pages.reserve(count, GFP_KERNEL)?;
@@ -599,25 +603,10 @@ impl Drop for UserPages {
             };
         }
         Self::pinned_vm(&self.mm).fetch_sub(self.counted, Ordering::AcqRel);
+        // SAFETY: `user` is null or the user `pin()` charged `counted` pages to, with the reference
+        // it took; both are given back once, here.
+        unsafe { asahi_user_unaccount(self.user, self.counted as _) };
     }
-}
-
-/// RLIMIT_MEMLOCK of the calling process, in pages.
-fn memlock_limit_pages() -> u64 {
-    let task = kernel::current!().as_ptr();
-    // SAFETY: The current task and its signal structure are live; the limit is read once, as
-    // `rlimit()` does.
-    let bytes = unsafe {
-        core::ptr::read_volatile(core::ptr::addr_of!(
-            (*(*task).signal).rlim[kernel::bindings::RLIMIT_MEMLOCK as usize].rlim_cur
-        ))
-    };
-    (bytes >> kernel::page::PAGE_SHIFT) as u64
-}
-
-/// Whether `pinned` pages stay within a memlock limit of `limit` pages.
-fn memlock_allows(pinned: i64, limit: u64) -> bool {
-    u64::try_from(pinned).is_ok_and(|pinned| pinned <= limit)
 }
 
 #[vtable]
@@ -871,13 +860,72 @@ mod user_memory_tests {
         })
     }
 
+    /// Pins charge the current user's `locked_vm`, and RLIMIT_MEMLOCK bounds that count, not the
+    /// calling mm's: pages another process of the same user holds (`held`, standing in for a
+    /// forked child's pins that outlive it) count against this process's next pin. A caller with
+    /// CAP_IPC_LOCK is not charged. The counts are exact because nothing else charges the test's
+    /// user (the root user of the KUnit thread) while the suite runs, which holds only when the
+    /// driver is built in and the suite runs before userspace; otherwise the case is skipped.
+    ///
+    /// A failed assertion ends the test thread without running anything after it, so every
+    /// check made while the test has changed the user's count, credentials or limit is an error
+    /// return instead, and the changes are undone before the final assertion.
+    #[cfg(CONFIG_DRM_ASAHI = "y")]
     #[test]
-    fn memlock_limit_policy() {
-        assert!(memlock_allows(0, 0));
-        assert!(memlock_allows(512, 512));
-        assert!(!memlock_allows(513, 512));
-        assert!(!memlock_allows(-1, 512));
-        assert!(memlock_allows(i64::MAX, u64::MAX));
+    fn pins_count_against_the_user() -> Result {
+        fn check(ok: bool) -> Result {
+            if ok {
+                Ok(())
+            } else {
+                Err(EINVAL)
+            }
+        }
+        // SAFETY: Test-only helper on the test's own thread; it only reads the count with 0.
+        let count = || unsafe { asahi_test_user_locked_vm_add(0) };
+        let addr = map(4 * PAGE_SIZE, PROT_READ | PROT_WRITE)?;
+        let held: i64 = 1024;
+        let before = count();
+        // The KUnit thread has CAP_IPC_LOCK: nothing is charged, though the mm counts the pages.
+        // A failed check drops `pages`, which unpins them.
+        let mm_before = pinned_vm()?;
+        let pages = UserPages::pin(addr, 2 * PAGE_SIZE, true)?;
+        check(count() == before)?;
+        check(pinned_vm()? == mm_before + 2)?;
+        drop(pages);
+        // SAFETY: Test-only helpers on the test's own thread; every change is undone below.
+        let old_creds = unsafe { asahi_test_drop_ipc_lock() };
+        if old_creds.is_null() {
+            return Err(ENOMEM);
+        }
+        let limit = (before + held + 2) as usize * PAGE_SIZE;
+        // SAFETY: As above.
+        let old_limit = unsafe { asahi_test_set_memlock(limit as _) };
+        // What the test adds to the user's count, so the cleanup takes back only that.
+        let mut added: i64 = 0;
+        let result = (|| -> Result {
+            // Within the limit: charged to the user while the pages are pinned.
+            let pages = UserPages::pin(addr, 2 * PAGE_SIZE, true)?;
+            check(count() == before + 2)?;
+            drop(pages);
+            check(count() == before)?;
+            // The user's other pins count, though this mm has none.
+            // SAFETY: As above.
+            unsafe { asahi_test_user_locked_vm_add(held) };
+            added = held;
+            let mm_before = pinned_vm()?;
+            check(UserPages::pin(addr, 4 * PAGE_SIZE, true).err() == Some(ENOMEM))?;
+            check(pinned_vm()? == mm_before)?;
+            drop(UserPages::pin(addr, 2 * PAGE_SIZE, true)?);
+            check(count() == before + held)
+        })();
+        // SAFETY: Restores what the test changed, in reverse.
+        unsafe {
+            asahi_test_user_locked_vm_add(-added);
+            asahi_test_set_memlock(old_limit);
+            asahi_test_restore_creds(old_creds);
+        }
+        assert_eq!(count(), before);
+        result
     }
 
     #[test]
@@ -1027,6 +1075,21 @@ extern "C" {
         out: *mut *mut core::ffi::c_void,
     ) -> core::ffi::c_long;
     fn asahi_unpin_user_fragments(frags: *mut core::ffi::c_void, dirty: bool);
+    fn asahi_user_account(
+        nr_pages: core::ffi::c_ulong,
+        out: *mut *mut kernel::bindings::user_struct,
+    ) -> core::ffi::c_int;
+    fn asahi_user_unaccount(user: *mut kernel::bindings::user_struct, nr_pages: core::ffi::c_ulong);
+}
+
+// user_pages.c: helpers for the KUnit case that needs them, built only with it (built-in KUnit
+// and a built-in driver).
+#[cfg(all(CONFIG_KUNIT = "y", CONFIG_DRM_ASAHI = "y"))]
+extern "C" {
+    fn asahi_test_user_locked_vm_add(delta: core::ffi::c_long) -> core::ffi::c_long;
+    fn asahi_test_drop_ipc_lock() -> *const core::ffi::c_void;
+    fn asahi_test_restore_creds(old: *const core::ffi::c_void);
+    fn asahi_test_set_memlock(bytes: core::ffi::c_ulong) -> core::ffi::c_ulong;
 }
 
 #[cfg(CONFIG_DRM_ASAHI_G15)]

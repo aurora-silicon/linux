@@ -25,7 +25,7 @@ struct user_struct {
 
 #if defined(CONFIG_NET) || defined(CONFIG_IO_URING) || \
 	defined(CONFIG_VFIO_PCI_ZDEV_KVM) || IS_ENABLED(CONFIG_IOMMUFD) || \
-	defined(CONFIG_SECRETMEM)
+	defined(CONFIG_SECRETMEM) || IS_ENABLED(CONFIG_DRM_ASAHI)
 	atomic_long_t locked_vm;	/* pinned pages charged to RLIMIT_MEMLOCK */
 #endif
 #ifdef CONFIG_PERF_EVENTS

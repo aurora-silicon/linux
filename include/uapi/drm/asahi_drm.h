@@ -762,9 +762,13 @@ struct drm_asahi_gem_create {
  * object stays the parent's memory. The CPU and GPU views are coherent
  * without cache maintenance.
  *
- * The pinned pages count against the caller's RLIMIT_MEMLOCK, together with
- * its other long-term pins, unless it has CAP_IPC_LOCK (ENOMEM otherwise),
- * and their size against the client and device limits of
+ * The pinned pages are charged to the caller's user against its
+ * RLIMIT_MEMLOCK, together with the user's other objects of this kind and its
+ * io_uring and iommufd pins, until the object is freed: the pins of all of the
+ * user's processes count, also after the process that made them has exited.
+ * Pages past the limit are refused (ENOMEM). A caller with CAP_IPC_LOCK is not
+ * charged. Their size
+ * counts against the client and device limits of
  * drm_asahi_params_global::client_memory_limit and
  * drm_asahi_params_global::memory_limit (ENOMEM). They are never released by
  * memory-pressure reclaim.
