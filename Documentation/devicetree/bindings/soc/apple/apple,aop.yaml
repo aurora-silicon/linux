@@ -54,7 +54,7 @@ properties:
     description:
       The firmware's external code, data and log segments in DRAM, reserved
       by the bootloader with their IOVAs in iommu-addresses (T6040, T8122 and
-      T8132). Without it, a T8122 AOP starts as its apple,t6020-aop fallback.
+      T8132). Absent when the bootloader did not reserve them.
 
   audio:
     $ref: /schemas/sound/apple,aop-audio.yaml#

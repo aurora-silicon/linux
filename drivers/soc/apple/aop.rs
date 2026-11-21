@@ -2090,6 +2090,14 @@ impl AopData {
         Ok((phys, iova, size))
     }
 
+    /// Whether the bootloader reserved any firmware `memory-region` for `dev`.
+    fn has_fw_regions(dev: &device::Device) -> bool {
+        // SAFETY: `dev` is a live device being probed.
+        let np = unsafe { (*dev.as_raw()).of_node };
+        // SAFETY: `np` is the device's node, valid while it is bound.
+        !np.is_null() && unsafe { bindings::of_reserved_mem_region_count(np) } > 0
+    }
+
     /// Checks the firmware segments the AOP runs from DRAM (T6040). The
     /// bootloader reserves them and lists them in `memory-region`, and each
     /// one's `iommu-addresses` gives the IOVA the firmware uses for it. The
@@ -2100,14 +2108,6 @@ impl AopData {
     /// When the firmware bootargs declare `ED0p` (`allow_ed0p`), macOS 27
     /// firmware may also supply one translated `__EDATA` segment after
     /// `__ETEXT`, while `__OS_LOG` remains identity-mapped.
-    /// Whether the bootloader reserved any firmware `memory-region` for `dev`.
-    fn has_fw_regions(dev: &device::Device) -> bool {
-        // SAFETY: `dev` is a live device being probed.
-        let np = unsafe { (*dev.as_raw()).of_node };
-        // SAFETY: `np` is the device's node, valid while it is bound.
-        !np.is_null() && unsafe { bindings::of_reserved_mem_region_count(np) } > 0
-    }
-
     fn check_fw_regions(
         dev: &device::Device,
         ec0p: u64,
@@ -3012,10 +3012,21 @@ struct AopHwConfig {
     /// Halt the co-processor again when its start fails (T6040).
     halt_on_failed_start: bool,
     /// The configuration to start with when the bootloader reserved no
-    /// firmware `memory-region` for a `fw_regions` block: the segments are
-    /// then not in DRAM where this one expects them, so it runs as its
+    /// firmware `memory-region` for a `fw_regions` block: the segments iBoot
+    /// left in DRAM are then neither reserved nor mapped, so it runs as its
     /// fallback compatible's block did (T8122: `apple,t6020-aop`).
     without_fw_regions: Option<&'static AopHwConfig>,
+}
+
+impl AopHwConfig {
+    /// The configuration to start the block with, given whether the
+    /// bootloader reserved its firmware regions.
+    fn for_regions(&'static self, has_fw_regions: bool) -> &'static AopHwConfig {
+        match self.without_fw_regions {
+            Some(alt) if self.fw_regions && !has_fw_regions => alt,
+            _ => self,
+        }
+    }
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
@@ -3287,15 +3298,13 @@ impl platform::Driver for AopDriver {
         pdev: &'bound platform::Device<Core<'_>>,
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
-        let mut cfg: &AopHwConfig = info.ok_or(ENODEV)?;
-        if let Some(alt) = cfg.without_fw_regions {
-            if cfg.fw_regions && !AopData::has_fw_regions(pdev.as_ref()) {
-                dev_info!(
-                    pdev.as_ref(),
-                    "No firmware memory-region from the bootloader: starting as the fallback block"
-                );
-                cfg = alt;
-            }
+        let matched: &'static AopHwConfig = info.ok_or(ENODEV)?;
+        let cfg = matched.for_regions(AopData::has_fw_regions(pdev.as_ref()));
+        if !core::ptr::eq(cfg, matched) {
+            dev_info!(
+                pdev.as_ref(),
+                "No firmware memory-region from the bootloader: starting with the fallback compatible's configuration"
+            );
         }
         if RETIRED.load(Acquire) {
             dev_err!(
