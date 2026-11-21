@@ -51,8 +51,8 @@ pub(crate) const CONFIG: Config = Config {
     firmware: crate::g17::fw::variant::Firmware::Identified(&[
         // The 27.2 build of the Mac17,10 to Mac17,13 restore image (K114, K116), which iBoot
         // loads on the K116s: the a010 images whose Mach-O UUIDs are the ADT's iop-gfx-nub and
-        // iop-gfx1-nub uuid. Its records and sections sit where 26B123's do; its kext builds the
-        // 26B123 version word and allocation sizes.
+        // iop-gfx1-nub uuid. Its records and sections sit where 26B123's do, and on the K116s
+        // both firmware roles accepted the 26B123 InitData (V26B123_M5) and ran it.
         crate::g17::fw::variant::Build {
             os_version: [27, 2, 0],
             name: "27.2 (26B8125), G17S",
