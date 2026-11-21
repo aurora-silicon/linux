@@ -74,6 +74,10 @@ const BOOTARGS_SIZE: usize = 0x230;
 const ASC_CPU_CONTROL_OFFSET: usize = 0x44;
 /// The RTKit header word holding the SRAM offset of the firmware's data segment.
 const SRAM_DATA_START: usize = 0x234;
+/// How long the PMP's start waits for the firmware to acknowledge IOP power on by itself before
+/// asking for it. On the M4 Mac mini (J773g) the 27.2 image's whole RTKit start, from its CPU
+/// starting to its acknowledgment and the AP going on, takes 1.3 ms; this is 15 times that.
+const PMP_SELF_ACK_MS: u32 = 20;
 const PMP_ENDPOINT: u8 = 0x20;
 const PM_COMMAND_MARKER: u64 = pmp_power::MARKER;
 const PM_COMMAND_SHIFT: u32 = pmp_power::SHIFT;
@@ -185,6 +189,8 @@ struct PmpData {
     sram_backup: Option<(usize, usize)>,
     /// See [`PmpHwConfig::sram_backup_data`].
     sram_backup_data: bool,
+    /// See [`PmpHwConfig::self_ack_start`].
+    self_ack_start: bool,
 }
 
 impl PmpData {
@@ -220,6 +226,7 @@ impl PmpData {
                     display_error: AtomicI32::new(0),
                     sram_backup,
                     sram_backup_data,
+                    self_ack_start: cfg.self_ack_start,
                 }
             ),
             GFP_KERNEL,
@@ -228,7 +235,14 @@ impl PmpData {
     fn start(&self) -> Result<()> {
         let mut guard = self.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().unwrap();
-        rtk.as_mut().wake()?;
+        // Some T8132 PMP images acknowledge IOP power on by themselves once they have reported in,
+        // and answer no request for it after that (macOS 27.2; macOS sends it none). Others wait
+        // to be asked. Only SoCs with `self_ack_start` wait for a self-acknowledgment first.
+        if self.self_ack_start {
+            rtk.as_mut().boot_or_wake(PMP_SELF_ACK_MS)?;
+        } else {
+            rtk.as_mut().wake()?;
+        }
         rtk.start_endpoint(PMP_ENDPOINT)
     }
     fn patch_bootargs(
@@ -863,6 +877,9 @@ struct PmpHwConfig {
     /// The range kept is the firmware's data segment: its offset comes from the firmware's
     /// header ([`SRAM_DATA_START`]), and `sram_backup` gives its size.
     sram_backup_data: bool,
+    /// Wait briefly for the firmware to acknowledge IOP power on by itself before sending
+    /// SET_IOP_PWR_STATE.
+    self_ack_start: bool,
 }
 
 /// Whether a PMP firmware needs endpoint 7 to finish its RTKit boot.
@@ -882,6 +899,7 @@ const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     coreanalytics: Ep7::No,
     sram_backup: None,
     sram_backup_data: false,
+    self_ack_start: false,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
@@ -891,6 +909,7 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     coreanalytics: Ep7::No,
     sram_backup: Some((0x3c000, 0x5c000)),
     sram_backup_data: false,
+    self_ack_start: false,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
@@ -902,6 +921,7 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     coreanalytics: Ep7::Always,
     sram_backup: None,
     sram_backup_data: false,
+    self_ack_start: false,
 };
 
 /// T8142: the DART window starts at 1 TiB as on T8140. Its registry-v2
@@ -913,6 +933,7 @@ const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
     coreanalytics: Ep7::Always,
     sram_backup: None,
     sram_backup_data: false,
+    self_ack_start: false,
 };
 
 /// T6050: the DART window starts at 1 TiB (ADT dart-pmp0 vm-base) and spans
@@ -924,6 +945,7 @@ const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
     coreanalytics: Ep7::No,
     sram_backup: None,
     sram_backup_data: false,
+    self_ack_start: false,
 };
 
 /// T8132: over a sleep only the ADT's second segment (0x68000 bytes, starting at 0x3c000 on
@@ -936,6 +958,7 @@ const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     coreanalytics: Ep7::RetainedBoard,
     sram_backup: Some((0x3c000, 0x68000)),
     sram_backup_data: true,
+    self_ack_start: true,
 };
 
 impl Drop for PmpDriver {
