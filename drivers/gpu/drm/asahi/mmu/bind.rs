@@ -81,9 +81,9 @@ impl Vm {
         let context = self.prepare_context_binding(addr, size, offset)?;
         let resources = VmOpResources {
             preallocated_gpuvas: [
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
             ],
         };
         // SAFETY: As in `Vm::bind_object()`, the device is bound while its file can issue binds.

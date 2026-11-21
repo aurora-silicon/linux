@@ -559,7 +559,9 @@ impl SgSegments {
 ///
 /// VM operations may require allocating new GPUVA objects to track mappings.
 /// To avoid allocation failures during the operation, preallocate the
-/// maximum number of GPUVAs that might be needed.
+/// maximum number of GPUVAs that might be needed. They are charged to the
+/// memory cgroup of the task that asks for the operation: a GPUVA lasts as
+/// long as the mapping it records.
 struct VmOpResources {
     /// Preallocated GPUVA objects for remap operations.
     ///
@@ -579,9 +581,9 @@ impl VmOpResources {
     fn for_unmap() -> Result<Self> {
         Ok(Self {
             preallocated_gpuvas: [
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
             ],
         })
     }
@@ -2668,8 +2670,13 @@ impl Vm {
     }
 
     /// Status shared by every queue using this VM, if enabled by its GPU.
-    /// Charges kernel memory sized by this VM's client to `client` ([`Self::memory_client`]).
+    /// Charges kernel memory sized by this VM's client to `client` ([`Self::memory_client`]),
+    /// starting with the VM's page tables.
     pub(crate) fn with_memory_client(mut self, client: Arc<crate::memacct::Client>) -> Self {
+        self.gpuvm.lock_inner().page_table.charge_to(crate::memacct::Usage::new(
+            &crate::memacct::LEDGER,
+            client.clone(),
+        ));
         self.memory = Some(client);
         self
     }
@@ -3066,9 +3073,9 @@ impl Vm {
 
         let mut resources = VmOpResources {
             preallocated_gpuvas: [
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
             ],
         };
 
