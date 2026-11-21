@@ -120,7 +120,7 @@ static int tas2764_do_quirky_pwr_ctrl_change(struct tas2764_priv *tas2764,
 					     unsigned int target)
 {
 	unsigned int curr;
-	int ret;
+	int ret, err;
 
 	curr = snd_soc_component_read_field(tas2764->component,
 					       TAS2764_PWR_CTRL,
@@ -129,26 +129,37 @@ static int tas2764_do_quirky_pwr_ctrl_change(struct tas2764_priv *tas2764,
 	if (target == curr)
 		return 0;
 
-	/* Handle power state transition to shutdown */
+	/*
+	 * Handle power state transition to shutdown. update_bits() returns 1
+	 * when it changed the register, so only a negative value is an error.
+	 * Keep the first error, and always run the post sequence so that
+	 * 0xfd:0x64 is put back and the hidden page deselected, even when a
+	 * step before it failed.
+	 */
 	if (target == TAS2764_PWR_CTRL_SHUTDOWN &&
 	   (curr == TAS2764_PWR_CTRL_MUTE || curr == TAS2764_PWR_CTRL_ACTIVE)) {
 		ret = regmap_multi_reg_write(tas2764->regmap, tas2764_pre_shutdown_seq,
 					ARRAY_SIZE(tas2764_pre_shutdown_seq));
+		if (!ret) {
+			err = snd_soc_component_update_bits(tas2764->component,
+							    TAS2764_PWR_CTRL,
+							    TAS2764_PWR_CTRL_MASK,
+							    TAS2764_PWR_CTRL_SHUTDOWN);
+			if (err < 0)
+				ret = err;
+		}
+		err = regmap_multi_reg_write(tas2764->regmap,
+					     tas2764_post_shutdown_seq,
+					     ARRAY_SIZE(tas2764_post_shutdown_seq));
 		if (!ret)
-			ret = snd_soc_component_update_bits(tas2764->component,
-							TAS2764_PWR_CTRL,
-							TAS2764_PWR_CTRL_MASK,
-							TAS2764_PWR_CTRL_SHUTDOWN);
-		if (!ret)
-			ret = regmap_multi_reg_write(tas2764->regmap,
-						tas2764_post_shutdown_seq,
-						ARRAY_SIZE(tas2764_post_shutdown_seq));
+			ret = err;
+		return ret;
 	}
 
 	ret = snd_soc_component_update_bits(tas2764->component, TAS2764_PWR_CTRL,
-						    TAS2764_PWR_CTRL_MASK, target);
+					    TAS2764_PWR_CTRL_MASK, target);
 
-	return ret;
+	return ret < 0 ? ret : 0;
 }
 
 /*
