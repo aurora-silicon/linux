@@ -98,10 +98,38 @@ properties:
       camera streams whether or not the indicator is shown. The indicator is
       software, not a privacy guarantee.
 
+  apple,module-tuning:
+    $ref: /schemas/types.yaml#/definitions/string
+    pattern: "^[0-9]{4}_[0-9]{2}$"
+    description:
+      Name of the camera module's own tuning (setfile), loaded in place of
+      the sensor's default one, e.g. "2226_02" for apple/isp_2226_02XX.dat.
+
   sensor-presets:
     type: object
     description:
       Sensor firmware presets and the host output geometry associated with them.
+    properties:
+      apple,lens-circle:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        minimum: 1
+        maximum: 1000
+        description:
+          Radius of the image circle the lens draws on the sensor, in per mille
+          of each preset's input width, about the input's centre. Outside it
+          the picture is black, so each crop is scaled about its centre,
+          aspect kept, until its corners are inside.
+      apple,mlvnr-sensor-config:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        items:
+          - description: Sensor configuration index of the binned presets
+          - description:
+              Full-resolution configuration index, at twice the binned input
+              size, whose frames the ISP's ML noise reduction network takes
+        description:
+          With ML video noise reduction on, the presets of the first sensor
+          configuration stream the second one instead, input size and crop
+          doubled.
     patternProperties:
       "^preset[0-9]+$":
         type: object

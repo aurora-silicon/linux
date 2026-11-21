@@ -154,6 +154,11 @@
 &isp {
 	/* J815 ADT /arm-io/isp sensor-type */
 	apple,platform-id = <0x72>;
+	/*
+	 * The J815's IMX958 module tuning: with the sensor's default 2224_01 the
+	 * corners read half the centre's brightness, with 2226_02 0.85.
+	 */
+	apple,module-tuning = "2226_02";
 };
 
 &aop_audio {

@@ -491,6 +491,65 @@ int isp_cmd_ch_als_disable(struct apple_isp *isp, u32 chan)
 	return CISP_SEND_IN(isp, args);
 }
 
+int isp_cmd_ipc_endpoint_set2(struct apple_isp *isp, u64 rd, u32 rd_len, u64 wr,
+			      u32 wr_len, u64 doorbell, u32 doorbell_sel)
+{
+	struct cmd_ipc_endpoint_set2 args = {
+		.opcode = CISP_OPCODE(CISP_CMD_IPC_ENDPOINT_SET2),
+		.addr1 = rd,
+		.size1 = rd_len,
+		.addr2 = wr,
+		.size2 = wr_len,
+		.regs = doorbell,
+		.unk2 = doorbell_sel,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+/* macOS 27.2 sends UNSET2 with the whole SET2 body again (0x30 bytes). */
+int isp_cmd_ipc_endpoint_unset2(struct apple_isp *isp, u64 rd, u32 rd_len, u64 wr,
+				u32 wr_len, u64 doorbell, u32 doorbell_sel)
+{
+	struct cmd_ipc_endpoint_set2 args = {
+		.opcode = CISP_OPCODE(CISP_CMD_IPC_ENDPOINT_UNSET2),
+		.addr1 = rd,
+		.size1 = rd_len,
+		.addr2 = wr,
+		.size2 = wr_len,
+		.regs = doorbell,
+		.unk2 = doorbell_sel,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_apple_ch_mlvnr_mode_config_set(struct apple_isp *isp, u32 chan, u32 ctrl_mode,
+					   u32 gain_enter, u32 gain_exit, u32 fps_enter,
+					   u32 fps_exit, u32 ramp_frames)
+{
+	struct cmd_apple_ch_mlvnr_mode_config args = {
+		.opcode = CISP_OPCODE(CISP_CMD_APPLE_CH_MLVNR_MODE_CONFIG_SET),
+		.chan = chan,
+		.ctrl_mode = ctrl_mode,
+		.gain_enter = gain_enter,
+		.gain_exit = gain_exit,
+		.fps_enter = fps_enter,
+		.fps_exit = fps_exit,
+		.ramp_frames = ramp_frames,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_ch_algorithm_enable(struct apple_isp *isp, u32 chan, u32 alg, u32 enable)
+{
+	struct cmd_ch_algorithm_enable args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_PROPERTY_WRITE),
+		.chan = chan,
+		.alg = alg,
+		.enable = enable,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
 int isp_cmd_ch_cnr_start(struct apple_isp *isp, u32 chan)
 {
 	struct cmd_ch_cnr_start args = {
@@ -655,12 +714,13 @@ int isp_cmd_apple_ch_temporal_filter_disable(struct apple_isp *isp, u32 chan)
 	return CISP_SEND_IN(isp, args);
 }
 
-int isp_cmd_apple_ch_tnr_start_h17(struct apple_isp *isp, u32 chan)
+int isp_cmd_apple_ch_tnr_start_h17(struct apple_isp *isp, u32 chan, u32 unk_10)
 {
 	struct cmd_apple_ch_temporal_filter_start_h17 args = {
 		.opcode = CISP_OPCODE(CISP_CMD_APPLE_CH_TEMPORAL_FILTER_START),
 		.chan = chan,
 		.unk_c = 1,
+		.unk_10 = unk_10, /* macOS 27.2 on the J815: 1 */
 	};
 	return CISP_SEND_IN(isp, args);
 }
@@ -846,3 +906,62 @@ int isp_cmd_ch_property_read(struct apple_isp *isp, u32 chan, u32 prop, u32 *val
 
 	return ret;
 }
+
+int isp_cmd_ch_ae_gain_cap_set(struct apple_isp *isp, u32 chan, u32 gain)
+{
+	struct cmd_ch_ae_gain_cap_set args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_AE_GAIN_CAP_SET),
+		.chan = chan,
+		.gain = gain,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_ch_status_led_mbrightness_set(struct apple_isp *isp, u32 chan,
+					  u16 brightness)
+{
+	struct cmd_ch_status_led_mbrightness_set args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_STATUS_LED_MBRIGHTNESS_SET),
+		.chan = chan,
+		.brightness = brightness,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_ch_status_led_thr_get(struct apple_isp *isp, u32 chan, u16 *low,
+				  u16 *high)
+{
+	struct cmd_ch_status_led_thr_get args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_STATUS_LED_THR_GET),
+		.chan = chan,
+	};
+	int err = CISP_SEND_OUT(isp, &args);
+
+	if (err)
+		return err;
+	*low = args.low;
+	*high = args.high;
+	return 0;
+}
+
+int isp_cmd_ch_hr_enable(struct apple_isp *isp, u32 chan, u32 enable)
+{
+	struct cmd_ch_hr_enable args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_HR_ENABLE),
+		.chan = chan,
+		.enable = enable,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_ch_sifr_skip_interval_set(struct apple_isp *isp, u32 chan,
+				      u32 interval)
+{
+	struct cmd_ch_sifr_skip_interval_set args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_SIFR_SKIP_INTERVAL_SET),
+		.chan = chan,
+		.interval = interval,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+

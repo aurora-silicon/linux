@@ -21,6 +21,7 @@
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
 
+#include "isp-ane.h"
 #include "isp-cam.h"
 #include "isp-fw.h"
 #include "isp-iommu.h"
@@ -627,10 +628,78 @@ static int isp_of_read_coord(struct device *dev, struct device_node *np,
 	return 0;
 }
 
+/*
+ * Two camera properties of the sensor-presets node (DT), both optional:
+ *
+ * apple,mlvnr-sensor-config = <binned full>: with MLVNR (apple_isp.mlvnr),
+ * the presets of the binned sensor mode move to the full-resolution one,
+ * input and crops doubled. Apple's MLVNR network takes only certain frame
+ * shapes: on the J813/J815 IMX958 the binned config 8 (1520x1440) is not
+ * one, and config 6 (3040x2880 with SIFR, what macOS 27.2 streams) is. The
+ * firmware reports a SIFR mode at twice its frame height (a short exposure
+ * rides along with each frame); highlight recovery uses it (isp-cam.c).
+ * Without MLVNR the presets keep the DT's binned mode: on the J815 its noise
+ * was 1.29 against about 3.0 for full resolution (2026-11-21).
+ *
+ * apple,lens-circle = <radius>: the lens draws an image circle smaller than
+ * the sensor, black outside. macOS never shows that part (it frames a 1.5x
+ * zoom and dewarps); crops that take the full sensor width show black
+ * corners. On a J815 (config 8 frames, 2026-11-21) the 1520x856 16:9 crop
+ * went dark at 0.855 and 0.895 of its half-diagonal at the bottom corners and
+ * 0.96 at the top: the circle's centre sits about 5 % of the height above
+ * the sensor's, radius ~0.53 of the width. The radius is per mille of the
+ * input width, about the input's centre. A crop whose corners leave the
+ * circle is scaled about its centre, aspect kept, until they fit.
+ */
+static bool isp_crop_in_circle(s64 ox, s64 oy, u32 w, u32 h, s64 r)
+{
+	s64 dx = abs(ox) + w / 2, dy = abs(oy) + h / 2;
+
+	return dx * dx + dy * dy <= r * r;
+}
+
+static void isp_preset_fit_lens(struct device *dev, struct isp_preset *p, u32 lens_circle)
+{
+	u32 in_w = p->input_dim.x, in_h = p->input_dim.y;
+	u32 w = p->crop_size.x, h = p->crop_size.y, lo = 0, hi = 1024, s, nw, nh;
+	s64 r, ccx, ccy, ox, oy;
+
+	if (!lens_circle)
+		return;
+	r = (s64)lens_circle * in_w / 1000;
+	ccx = in_w / 2;
+	ccy = in_h / 2;
+	/* crop centre relative to the circle's, doubled to stay integer */
+	ox = 2 * (s64)p->crop_offset.x + w - 2 * ccx;
+	oy = 2 * (s64)p->crop_offset.y + h - 2 * ccy;
+	if (isp_crop_in_circle(ox, oy, 2 * w, 2 * h, 2 * r))
+		return;
+	/* largest scale s/1024 of the crop whose corners are inside */
+	while (hi - lo > 1) {
+		s = (lo + hi) / 2;
+		if (isp_crop_in_circle(ox, oy, 2 * w * s / 1024, 2 * h * s / 1024, 2 * r))
+			lo = s;
+		else
+			hi = s;
+	}
+	nw = round_down(w * lo / 1024, 2);
+	nh = round_down(h * lo / 1024, 2);
+	if (nw < 64 || nh < 64)
+		return;
+	dev_info(dev, "%ux%u preset: crop %ux%u+%u+%u -> %ux%u (inside the lens circle)\n",
+		p->output_dim.x, p->output_dim.y, w, h, p->crop_offset.x,
+		p->crop_offset.y, nw, nh);
+	p->crop_offset.x = round_down(p->crop_offset.x + (w - nw) / 2, 2);
+	p->crop_offset.y = round_down(p->crop_offset.y + (h - nh) / 2, 2);
+	p->crop_size.x = nw;
+	p->crop_size.y = nh;
+}
+
 static int apple_isp_init_presets(struct apple_isp *isp)
 {
 	struct device *dev = isp->dev;
 	struct isp_preset *preset;
+	u32 lens_circle, mlvnr_config[2] = { U32_MAX, U32_MAX };
 	int err = 0;
 
 	struct device_node *np __free(device_node) =
@@ -650,6 +719,14 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 		dev, sizeof(*isp->presets) * isp->num_presets, GFP_KERNEL);
 	if (!isp->presets)
 		return -ENOMEM;
+
+	if (of_property_read_u32(np, "apple,lens-circle", &lens_circle))
+		lens_circle = 0;
+	if (apple_isp_ane_wanted() &&
+	    of_property_read_u32_array(np, "apple,mlvnr-sensor-config", mlvnr_config, 2)) {
+		dev_info(dev, "MLVNR: no apple,mlvnr-sensor-config: the presets keep their sensor modes\n");
+		mlvnr_config[0] = U32_MAX;
+	}
 
 	preset = isp->presets;
 	for_each_child_of_node_scoped(np, child) {
@@ -680,6 +757,18 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 		preset->crop_offset.y = xywh[1];
 		preset->crop_size.x = xywh[2];
 		preset->crop_size.y = xywh[3];
+
+		if (preset->index == mlvnr_config[0]) {
+			preset->index = mlvnr_config[1];
+			preset->remapped = true;
+			preset->input_dim.x *= 2;
+			preset->input_dim.y *= 2;
+			preset->crop_offset.x *= 2;
+			preset->crop_offset.y *= 2;
+			preset->crop_size.x *= 2;
+			preset->crop_size.y *= 2;
+		}
+		isp_preset_fit_lens(dev, preset, lens_circle);
 
 		preset++;
 	}
@@ -891,6 +980,10 @@ static int apple_isp_probe(struct platform_device *pdev)
 	if (err)
 		isp->temporal_filter = 0;
 
+	/* the camera module's own tuning, where the board names one */
+	of_property_read_string(dev->of_node, "apple,module-tuning",
+				&isp->module_tuning);
+
 	/* the sensor connection layout, for firmware that takes it at boot */
 	of_property_read_u32(dev->of_node, "apple,cam-connections-scheme",
 			     &isp->cam_connections_scheme);
@@ -994,6 +1087,10 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto detach_genpd;
 	}
 
+	err = apple_isp_ane_init(isp);
+	if (err)
+		goto destroy_wq;
+
 	err = apple_isp_init_iommu(isp);
 	if (err) {
 		dev_err(dev, "failed to init iommu: %d\n", err);
@@ -1046,6 +1143,7 @@ free_surface:
 free_iommu:
 	apple_isp_free_iommu(isp);
 destroy_wq:
+	apple_isp_ane_exit(isp);
 	destroy_workqueue(isp->wq);
 detach_genpd:
 	apple_isp_detach_genpd(isp);
@@ -1069,6 +1167,7 @@ static void apple_isp_remove(struct platform_device *pdev)
 	/* Stop resident firmware before freeing what it may still use. */
 	apple_isp_firmware_flush(isp);
 	apple_isp_firmware_halt(isp);
+	apple_isp_ane_exit(isp);
 	apple_isp_free_video(isp);
 	pm_runtime_disable(isp->dev);
 	apple_isp_free_firmware_surface(isp);
@@ -1543,6 +1642,18 @@ static const struct apple_isp_hw apple_isp_hw_t8142 = {
 	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
 	.fw_mmio = apple_isp_fw_mmio_t8142,
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8142),
+	/*
+	 * MLVNR (isp-ane.c, opt-in): the ANE firmware rings the ISP CPU
+	 * software interrupt register, ISP + 0x1668000, bit 0x10. macOS 27.2
+	 * logs it on the J815 (sendEPConfigToPeer); it is the first window of
+	 * the ANE's address filter (apple,dapf-ranges).
+	 */
+	.ane_doorbell_known = true,
+	.ane_isp_doorbell = 0x4a1668000,
+	.ane_isp_doorbell_sel = 0x10,
+	.ane_compatible = "apple,t8142-ane",
+	.mlvnr_mode_config = true,
+	.led_brightness = 529,
 	.boot_mode = 1,
 	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
 	.resident_fw = true,

@@ -69,6 +69,9 @@ struct apple_isp {
 	bool ipc_quiescing;
 	bool fw_idle;
 	struct delayed_work fw_idle_work;
+	/* Restart after a firmware crash (only with fw_restart; never here). */
+	struct delayed_work fw_recover_work;
+	bool fw_recovering;
 	struct isp_channel *chan_io, *chan_sm, *chan_tm, *chan_bt;
 	struct isp_channel *ipc_stale;
 	bool ipc_failed;
@@ -317,6 +320,7 @@ static unsigned int idle_schedules;
 static unsigned int msecs_to_jiffies(unsigned int ms) { return ms; }
 static bool mod_delayed_work(void *wq, struct delayed_work *work, unsigned int delay)
 {
+	/* The crash recovery is scheduled only for fw_restart firmware. */
 	CHECK(wq == system_dfl_wq && delay == 1000);
 	CHECK(!irq_disabled && !synchronizing->ipc_quiescing);
 	work->scheduled++;
@@ -335,6 +339,9 @@ static u64 get_unaligned_le64(const void *p) { u64 v; memcpy(&v, p, sizeof(v)); 
 #define IS_ENABLED(x) 0
 #define jiffies 0
 static bool isp_is_p010(struct apple_isp *isp) { return false; }
+/* The neural engine (MLVNR) link: no engine in these fixtures. */
+static int apple_isp_ane_start(struct apple_isp *isp) { return 0; }
+static void apple_isp_ane_stop(struct apple_isp *isp) { }
 static int isp_ipc_resync(struct apple_isp *isp) { return 0; }
 static void isp_restore_fw_memory(struct apple_isp *isp) { }
 /* #1445's post-restart query; these fixtures never restart (fw.started is clear). */

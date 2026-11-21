@@ -241,20 +241,44 @@ free_surf:
 	return NULL;
 }
 
+static void isp_surf_destroy(struct apple_isp *isp, struct isp_surf *surf)
+{
+	isp_surf_vunmap(isp, surf);
+	isp_surf_iommu_unmap(isp, surf);
+	isp_surf_unreserve_iova(isp, surf);
+	isp_surf_free_pages(surf);
+	if (surf->gc) {
+		mutex_lock(&isp->gc_lock);
+		list_del(&surf->head);
+		mutex_unlock(&isp->gc_lock);
+	}
+	kfree(surf);
+}
+
+/* This driver's own reference. */
 void isp_free_surface(struct apple_isp *isp, struct isp_surf *surf)
 {
 	if (refcount_dec_and_test(&surf->refcount)) {
-		isp_surf_vunmap(isp, surf);
-		isp_surf_iommu_unmap(isp, surf);
-		isp_surf_unreserve_iova(isp, surf);
-		isp_surf_free_pages(surf);
-		if (surf->gc) {
-			mutex_lock(&isp->gc_lock);
-			list_del(&surf->head);
-			mutex_unlock(&isp->gc_lock);
-		}
-		kfree(surf);
+		isp_surf_destroy(isp, surf);
+		return;
 	}
+	/*
+	 * Still mapped by the ANE (isp-ane.c), the only other holder: off this
+	 * driver's lists now, freed at isp_put_surface().
+	 */
+	if (surf->gc) {
+		mutex_lock(&isp->gc_lock);
+		list_del_init(&surf->head);
+		surf->gc = false;
+		mutex_unlock(&isp->gc_lock);
+	}
+}
+
+/* A reference taken with refcount_inc_not_zero() (the ANE's mapping). */
+void isp_put_surface(struct apple_isp *isp, struct isp_surf *surf)
+{
+	if (refcount_dec_and_test(&surf->refcount))
+		isp_surf_destroy(isp, surf);
 }
 
 /*

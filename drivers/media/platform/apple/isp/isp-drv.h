@@ -97,6 +97,8 @@ struct isp_surf {
 	bool gc;
 	bool submitted;
 	bool iova_reserved; /* @iova comes from &apple_isp.iovas */
+	/* SHAREDMALLOC: the ID given to the firmware (macOS: the IOSurface ID), or 0 */
+	u32 id;
 };
 
 struct isp_message {
@@ -157,10 +159,30 @@ struct isp_preset {
 	struct coord crop_size;
 	/* Processed P010 geometry established by preview or a config reply. */
 	bool p010;
+	/* moved off its DT sensor config to the MLVNR one (apple,mlvnr-sensor-config) */
+	bool remapped;
 };
+
+struct ane_isp_link;
 
 struct apple_isp_hw {
 	enum isp_generation gen;
+	/*
+	 * How the ANE firmware signals this ISP over the ML noise reduction
+	 * endpoint; the endpoint stays off where it is not known.
+	 */
+	bool ane_doorbell_known;
+	u64 ane_isp_doorbell;
+	u32 ane_isp_doorbell_sel;
+	/* The ANE node when the ISP node has no apple,ane phandle. */
+	const char *ane_compatible;
+	/*
+	 * H17: MLVNR runs in the auto mode macOS sets
+	 * (CISP_CMD_APPLE_CH_MLVNR_MODE_CONFIG_SET), not algorithm 0x143d.
+	 */
+	bool mlvnr_mode_config;
+	/* camera LED brightness at each start (macOS's value), 0 = firmware default */
+	u16 led_brightness;
 	enum isp_fw_abi fw_abi;
 	u64 pmu_base;
 
@@ -334,6 +356,8 @@ enum isp_sensor_id {
 	ISP_IMX853_7622_01,
 	ISP_IMX913_7523_01,
 	ISP_IMX958_2224_01,
+	ISP_IMX958_2226_01,	/* J815 module tunings (macOS appleh16camerad) */
+	ISP_IMX958_2226_02,
 	ISP_VD56G0_6221_01,
 	ISP_VD56G0_6222_01,
 };
@@ -357,6 +381,8 @@ struct isp_format {
 	size_t total_size;
 };
 
+struct dentry;
+
 struct apple_isp {
 	struct device *dev;
 	const struct apple_isp_hw *hw;
@@ -370,6 +396,20 @@ struct apple_isp {
 	bool preview_26;
 	u32 platform_id;
 	u32 temporal_filter;
+	/* setfile name of the board's camera module (DT apple,module-tuning), or NULL */
+	const char *module_tuning;
+
+	/* ML noise reduction on the neural engine (isp-ane.c) */
+	struct ane_isp_link *ane;
+	struct isp_surf *ane_rings;
+	u64 ane_doorbell;
+	u64 ane_ring_fw; /* the rings' address as handed to the firmware */
+	/* SHAREDMALLOC surfaces get IDs the ANE can map them by (isp-ane.c) */
+	bool ane_ids;
+	u32 ane_next_id, ane_ids_given;
+	u32 ane_doorbell_sel;
+	char ane_afpp[64];
+	struct dentry *ane_debugfs;
 	u32 cam_connections_scheme;
 	struct isp_preset *presets;
 	int num_presets;
@@ -440,6 +480,12 @@ struct apple_isp {
 	/* firmware that starts again, idling until fw_idle_work stops it */
 	bool fw_idle;
 	struct delayed_work fw_idle_work;
+	/*
+	 * Firmware that crashed cannot power the camera module down (its
+	 * status light stays on): it is started once more and stopped cleanly.
+	 */
+	struct delayed_work fw_recover_work;
+	bool fw_recovering;
 	/* the camera was detected; until then a deferred start is pending */
 	bool camera_detected;
 	/* configurations the firmware has, once a deferred start detected them */

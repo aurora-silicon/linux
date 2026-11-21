@@ -8,6 +8,7 @@
 #include <linux/soc/apple/display.h>
 #include <kunit/static_stub.h>
 
+#include "isp-ane.h"
 #include "isp-cam.h"
 #include "isp-cmd.h"
 #include "isp-fw.h"
@@ -41,6 +42,8 @@ struct isp_setfile {
 	 * noise filter gains. The setfile does not carry it.
 	 */
 	int snf_centre_dy;
+	/* used instead when this file is not installed (module tunings missing from vendorfw) */
+	const struct isp_setfile *fallback;
 };
 
 // clang-format off
@@ -96,10 +99,106 @@ static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX913_7523_01] = {0x913, "imx913", 0x75230107, "apple/isp_7523_01XX.dat", 0x247f8},
 	[ISP_IMX958_2224_01] = {0x958, "imx958-uw", 0x22240106, "apple/isp_2224_01XX.dat", 0x6ff4,
 				0, ISP_TEMPORAL_FILTER_BAND0, -156},
+	/* J815's own module tunings, H17-native (lens-shading records without the xx24 stride). */
+	[ISP_IMX958_2226_01] = {0x958, "imx958-uw", 0x22260101, "apple/isp_2226_01XX.dat", 0x7040,
+				0, ISP_TEMPORAL_FILTER_BAND0, -156,
+				&isp_setfiles[ISP_IMX958_2224_01]},
+	[ISP_IMX958_2226_02] = {0x958, "imx958-uw", 0x22260201, "apple/isp_2226_02XX.dat", 0x7000,
+				0, ISP_TEMPORAL_FILTER_BAND0, -156,
+				&isp_setfiles[ISP_IMX958_2224_01]},
 	[ISP_VD56G0_6221_01] = {0xd56, "vd56g0", 0x62210102, "apple/isp_6221_01XX.dat", 0x1b80},
 	[ISP_VD56G0_6222_01] = {0xd56, "vd56g0", 0x62220102, "apple/isp_6222_01XX.dat", 0x1b80},
 };
 // clang-format on
+
+/*
+ * What macOS 27.2 sends the same H17 firmware on the J815, from a hypervisor
+ * IPC trace (2026-11-20):
+ * - in a SIFR sensor config (one that reports twice its frame height: the
+ *   sensor sends a short exposure with every frame), SIFR skip interval 1 and
+ *   highlight recovery on. The firmware refuses HR in other configs, so
+ *   nothing is sent there;
+ * - the green camera LED's brightness, 529 at each start in a lit room (only
+ *   on T8142, where it was traced: hw->led_brightness). It is clamped to the
+ *   range the firmware reports (CH_STATUS_LED_THR_GET, 204..1023 on the
+ *   J815), so the privacy LED can never be set dark;
+ * - AE stability 16 / to-stable 8 (other firmware: 32 / 20) and an AE gain
+ *   cap of 96.0;
+ * - on band-0 setfiles, TNR started with (1, 1, 0) and high strength on.
+ * macOS ramps the LED with ambient light; the driver keeps the start value.
+ */
+/*
+ * A SIFR config carries a second, short exposure in its frame: the IMX958
+ * reports twice the frame height. Full resolution (config 6): input
+ * 3040x5760 for a 3040x2880 second size pair. Binned (config 9): input
+ * 1520x2880, half the width and the full height of the 3040x2880 pair.
+ */
+static bool isp_ch_config_is_sifr(struct apple_isp *isp, u32 ch, u32 index)
+{
+	struct cmd_ch_camera_config_h17 args;
+	struct cmd_ch_camera_config *config = &args.config;
+
+	if (isp_cmd_ch_camera_config_get(isp, ch, index, &args))
+		return false;
+	if (config->preset != index || !config->in_width2 || !config->in_height2)
+		return false;
+	return (config->in_width == config->in_width2 &&
+		config->in_height == 2 * config->in_height2) ||
+	       (2 * config->in_width == config->in_width2 &&
+		config->in_height == config->in_height2);
+}
+
+static void isp_ch_configure_led(struct apple_isp *isp, u32 ch)
+{
+	u16 low, high, value;
+	int err;
+
+	if (!isp->hw->led_brightness)
+		return;
+	err = isp_cmd_ch_status_led_thr_get(isp, ch, &low, &high);
+	if (err || !low || high < low) {
+		dev_warn(isp->dev, "camera LED: no brightness range (%d, %u..%u): left as is\n",
+			 err, low, high);
+		return;
+	}
+	value = clamp_t(unsigned int, isp->hw->led_brightness, low, high);
+	err = isp_cmd_ch_status_led_mbrightness_set(isp, ch, value);
+	dev_info(isp->dev, "camera LED brightness %u (range %u..%u)%s\n", value,
+		 low, high, err ? ": firmware refused" : "");
+}
+
+/* Best effort: without these the SIFR config still streams from its long exposure. */
+static void isp_ch_configure_sifr(struct apple_isp *isp, u32 ch, u32 index)
+{
+	int err, err_hr;
+
+	err = isp_cmd_ch_sifr_skip_interval_set(isp, ch, 1);
+	err_hr = isp_cmd_ch_hr_enable(isp, ch, true);
+	dev_info(isp->dev, "sensor config %u is SIFR: skip interval 1%s, highlight recovery on%s\n",
+		 index, err ? " (refused)" : "", err_hr ? " (refused)" : "");
+}
+
+/*
+ * The board's camera module tuning, named in the DT (apple,module-tuning,
+ * e.g. "2226_02"), in place of the sensor's default setfile. Unknown names
+ * and other sensors' setfiles keep the default.
+ */
+static enum isp_sensor_id isp_module_tuning(struct apple_isp *isp, enum isp_sensor_id def)
+{
+	char path[48];
+	unsigned int i;
+
+	if (!isp->module_tuning)
+		return def;
+	snprintf(path, sizeof(path), "apple/isp_%sXX.dat", isp->module_tuning);
+	for (i = 0; i < ARRAY_SIZE(isp_setfiles); i++)
+		if (isp_setfiles[i].path && isp_setfiles[i].version == isp_setfiles[def].version &&
+		    !strcmp(isp_setfiles[i].path, path))
+			return i;
+	dev_warn(isp->dev, "module tuning %s: no such setfile for sensor 0x%x, using %s\n",
+		 isp->module_tuning, isp_setfiles[def].version, isp_setfiles[def].path);
+	return def;
+}
 
 static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 {
@@ -186,7 +285,7 @@ static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 		break;
 	case 0x958:
 		/* Section 0x50f of 2224 names sensor 0x958; 2924's names 0x614. */
-		id = ISP_IMX958_2224_01;
+		id = isp_module_tuning(isp, ISP_IMX958_2224_01);
 		break;
 	case 0xd56:
 		id = ISP_VD56G0_6221_01;
@@ -494,7 +593,8 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 	if (err ||
 	    (fmt->id != ISP_IMX248_1820_01 && fmt->id != ISP_IMX558_1921_01 &&
 	     fmt->id != ISP_IMX558_1925_03 && fmt->id != ISP_IMX364_8720_01 &&
-	     fmt->id != ISP_IMX958_2224_01)) {
+	     fmt->id != ISP_IMX958_2224_01 && fmt->id != ISP_IMX958_2226_01 &&
+	     fmt->id != ISP_IMX958_2226_02)) {
 		dev_err(isp->dev,
 			"ch %d: unsupported sensor. Please file a bug report with hardware info & dmesg trace.\n",
 			ch);
@@ -820,6 +920,13 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 		return -ENOSPC;
 
 	err = firmware_request_nowarn(&fw, setfile->path, isp->dev);
+	if (err == -ENOENT && setfile->fallback) {
+		dev_info_once(isp->dev, "setfile '%s' not installed, using '%s'\n",
+			      setfile->path, setfile->fallback->path);
+		setfile = setfile->fallback;
+		len = setfile->file_size ?: setfile->size;
+		err = firmware_request_nowarn(&fw, setfile->path, isp->dev);
+	}
 	if (err) {
 		if (err == -ENOENT)
 			dev_warn_once(isp->dev,
@@ -928,11 +1035,12 @@ static int isp_ch_configure_temporal_filter(struct apple_isp *isp, u32 ch)
 		return isp_cmd_apple_ch_temporal_filter_stop(isp, ch);
 
 	case ISP_TEMPORAL_FILTER_BAND0:
-		err = isp_cmd_apple_ch_tnr_start_h17(isp, ch);
+		/* (1, 1, 0) and high strength, as macOS 27.2 */
+		err = isp_cmd_apple_ch_tnr_start_h17(isp, ch, true);
 		if (err)
 			return err;
 
-		err = isp_cmd_apple_ch_tnr_high_strength_set(isp, ch, 0);
+		err = isp_cmd_apple_ch_tnr_high_strength_set(isp, ch, true);
 		if (err)
 			return err;
 
@@ -995,6 +1103,7 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
 	bool h17 = isp->hw->fw_abi == ISP_FW_ABI_H17;
+	bool sifr;
 	int err;
 
 	err = isp_cmd_flicker_sensor_set(isp, 0);
@@ -1029,9 +1138,21 @@ select_config:
 	if (err)
 		return err;
 
+	/*
+	 * Only presets moved to the MLVNR sensor mode are queried, before the
+	 * select (as macOS queries), so the DT presets send what they always did.
+	 */
+	sifr = fmt->preset->remapped && !isp_is_p010(isp) &&
+	       isp_ch_config_is_sifr(isp, ch, fmt->preset->index);
+
 	err = isp_cmd_ch_camera_config_select(isp, ch, fmt->preset->index);
 	if (err)
 		return err;
+
+	if (!isp_is_p010(isp))
+		isp_ch_configure_led(isp, ch);
+	if (sifr)
+		isp_ch_configure_sifr(isp, ch, fmt->preset->index);
 
 	err = isp_cmd_ch_buffer_recycle_mode_set(
 		isp, ch, CISP_BUFFER_RECYCLE_MODE_EMPTY_ONLY);
@@ -1094,6 +1215,11 @@ select_config:
 	if (err)
 		return err;
 
+	/* ML noise reduction, only with a live neural engine endpoint */
+	err = apple_isp_ane_stream_start(isp, ch);
+	if (err)
+		dev_warn(isp->dev, "ML noise reduction not enabled: %d\n", err);
+
 	/* The H17 firmware faults on this face-detection metering setup. */
 	if (!h17) {
 		err = isp_cmd_apple_ch_ae_fd_scene_metering_config_set(isp,
@@ -1106,13 +1232,21 @@ select_config:
 	if (err)
 		return err;
 
-	err = isp_cmd_ch_ae_stability_set(isp, ch, 32);
+	err = isp_cmd_ch_ae_stability_set(isp, ch, h17 ? 16 : 32);
 	if (err)
 		return err;
 
-	err = isp_cmd_ch_ae_stability_to_stable_set(isp, ch, 20);
+	err = isp_cmd_ch_ae_stability_to_stable_set(isp, ch,
+						    h17 ? 8 : 20);
 	if (err)
 		return err;
+
+	/* 96.0 in 8.8 fixed point, as macOS (its AEMaxGain) */
+	if (h17) {
+		err = isp_cmd_ch_ae_gain_cap_set(isp, ch, 96 << 8);
+		if (err)
+			return err;
+	}
 
 	err = isp_cmd_ch_sif_pixel_format_set(isp, ch);
 	if (err)
