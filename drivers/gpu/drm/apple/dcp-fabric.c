@@ -2632,7 +2632,16 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 	struct mux_control *xbar = NULL;
 	int ret;
 
-	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_t6041_ext_v27(dcp))
+	/*
+	 * A T8132 dcpext on the 27.2 image (the J713's, on its Type-C routes)
+	 * has the T8132 crossbar whatever its backend: like the M4 one, its
+	 * output only routes on select and needs the link-up for its clocks.
+	 * The T6050 path below would return early for it (no fixed DP PHY).
+	 */
+	bool t8132_v27 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+			 of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext");
+
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_t6041_ext_v27(dcp) && !t8132_v27)
 		return dcp_direct_crossbar_link_t6050(dcp, up);
 	/*
 	 * On T6030, a T6041 firmware-27 dcpext, a T8132 dcpext and the selected
@@ -2640,7 +2649,7 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 	 * link-up enables clocks.
 	 */
 	if (!of_machine_is_compatible("apple,t6030") &&
-	    !dcp_t6041_ext_v27(dcp) &&
+	    !dcp_t6041_ext_v27(dcp) && !t8132_v27 &&
 	    !dcp_is_t8132_ext(dcp) && !dcp_is_ext26(dcp))
 		return 0;
 	guard(mutex)(&dcp->tb_lock);
