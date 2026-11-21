@@ -293,8 +293,9 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
  * display domains through apple,display-power, and the internal DCP only takes IOP idle
  * once its secure port has gone idle. A device tree without those keeps the firmware
  * running: DPMS is the backlight alone and the display stays up across a sleep. A SoC
- * without a secure mailbox says so (hw.s2r_no_secure_port), and one behind
- * appledrm.s2r_untested stops its firmware for DPMS off and J813 system sleep.
+ * without a secure mailbox says so (hw.s2r_no_secure_port). Power words from the device
+ * tree stop the firmware by default; a SoC whose static words are only derived (T8142) does
+ * so only with appledrm.s2r_untested.
  */
 /*
  * hw.s2r without a layout in its hw data takes its words from the device tree, the ones its
@@ -382,6 +383,38 @@ out:
 	return err;
 }
 
+static struct device *dcp_s2r_find_dart(struct device_node *np);
+
+/*
+ * A device-tree layout's DART streams: the ones its DARTs have enabled at probe, with the
+ * firmware running. A DCP DART that reads none leaves nothing for the stop to restore.
+ */
+static int dcp_s2r_layout_streams(struct apple_dcp *dcp)
+{
+	struct device_node *piodma;
+	struct device *dart;
+
+	dart = dcp_s2r_find_dart(dcp->dev->of_node);
+	if (!dart)
+		return -ENODEV;
+	dcp->s2r_dt_layout.dcp_streams = apple_dart_enabled_streams(dart);
+	put_device(dart);
+	if (!dcp->s2r_dt_layout.dcp_streams)
+		return -ENODATA;
+	piodma = of_get_child_by_name(dcp->dev->of_node, "piodma");
+	if (piodma) {
+		dart = dcp_s2r_find_dart(piodma);
+		of_node_put(piodma);
+		if (dart) {
+			dcp->s2r_dt_layout.disp_streams = apple_dart_enabled_streams(dart);
+			put_device(dart);
+		}
+	}
+	dev_dbg(dcp->dev, "DART streams for the stop: DCP %#x, display %#x\n",
+		dcp->s2r_dt_layout.dcp_streams, dcp->s2r_dt_layout.disp_streams);
+	return 0;
+}
+
 static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 {
 	struct device_node *np = dcp->dev->of_node;
@@ -395,11 +428,12 @@ static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 		dcp->hw.s2r = false;
 	}
 	if (dcp->hw.s2r && !dcp->hw.s2r_layout) {
-		int ret = dcp_s2r_layout_from_dt(dcp);
+		int ret = dcp_s2r_layout_from_dt(dcp) ?: dcp_s2r_layout_streams(dcp);
 
 		if (ret) {
-			dev_info(dcp->dev, "display power words not in the device tree (%d), the firmware keeps running\n",
+			dev_info(dcp->dev, "no display power layout (%d), the firmware keeps running\n",
 				 ret);
+			dcp->s2r_dt_layout_ok = false;
 			dcp->hw.s2r = false;
 		}
 	}
@@ -579,7 +613,7 @@ static bool dcp_j714s_ext(struct device *dev)
 static bool s2r_untested;
 module_param(s2r_untested, bool, 0444);
 MODULE_PARM_DESC(s2r_untested,
-		 "Stop the DCP firmware on DPMS off and J813 system sleep using derived T8142 power words (default 0)");
+		 "Stop the DCP firmware on DPMS off and system sleep using derived T8142 power words (default 0)");
 
 bool dcp_t6041_ext_enabled(void)
 {
@@ -7409,7 +7443,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	    of_device_is_compatible(dev->of_node, "apple,t8132-dcp"))
 		dcp->hw = apple_dcp_hw_t8132_v27;
 	/*
-	 * A SoC with derived power words is offered the stop only when asked for, and only on
+	 * A stop needs power words: a static layout, or the device tree's (see
+	 * dcp_s2r_layout_from_dt(), offered by default). A SoC whose static words are only
+	 * derived (hw.s2r_untested, T8142) is offered it only when asked for, and only on
 	 * firmware 27.0, whose calls are the ones that ran with them.
 	 */
 	if (dcp->hw.s2r && ((!dcp->hw.s2r_layout &&
@@ -8423,15 +8459,6 @@ static void dcp_s2r_find_darts(struct apple_dcp *dcp)
 	if (piodma) {
 		dcp->s2r_disp_dart = dcp_s2r_find_dart(piodma);
 		of_node_put(piodma);
-	}
-	/* A device-tree layout's streams: what its DARTs have on before the first stop. */
-	if (dcp->s2r_dt_layout_ok && !dcp->s2r_dt_layout.dcp_streams && dcp->s2r_dcp_dart) {
-		dcp->s2r_dt_layout.dcp_streams = apple_dart_enabled_streams(dcp->s2r_dcp_dart);
-		if (dcp->s2r_disp_dart)
-			dcp->s2r_dt_layout.disp_streams =
-				apple_dart_enabled_streams(dcp->s2r_disp_dart);
-		dev_dbg(dcp->dev, "DART streams for the stop: DCP %#x, display %#x\n",
-			dcp->s2r_dt_layout.dcp_streams, dcp->s2r_dt_layout.disp_streams);
 	}
 }
 

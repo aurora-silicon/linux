@@ -7762,15 +7762,24 @@ int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool fl
 EXPORT_SYMBOL_GPL(apple_dart_display_streams);
 
 /*
- * The streams 0 to 31 a T8110 display DART has enabled, read while its domain is up: what
- * a DCP whose device tree names no streams stops and enables again around its power cycle.
+ * The streams a T8110 display DART has enabled, read while its domain is up: what a DCP
+ * whose device tree names no streams stops and enables again around its power cycle. The
+ * mask holds streams 0 to 31; a DART with any stream above them enabled can't be described
+ * by it and reads 0, which its caller takes as no streams to stop.
  */
 u32 apple_dart_enabled_streams(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
+	unsigned int i;
 
 	if (!dart || dart->hw->type != DART_T8110)
 		return 0;
+	for (i = 1; i < DIV_ROUND_UP(dart->num_streams, 32); i++) {
+		if (readl(dart->regs + DART_T8110_ENABLE_STREAMS + 4 * i)) {
+			dev_warn_once(dart->dev, "streams above 31 enabled: not reported\n");
+			return 0;
+		}
+	}
 	return readl(dart->regs + DART_T8110_ENABLE_STREAMS);
 }
 EXPORT_SYMBOL_GPL(apple_dart_enabled_streams);
