@@ -1412,14 +1412,19 @@ static void dcp_panel_read_adt(struct apple_dcp *dcp)
 	if (dcp->panel_identity)
 		dcp->panel_identity->adt = panel.identity;
 	dcp->panel.color_target = ret ? NULL : dcp_panel_gamut_color_space(panel.gamut);
-	if (desktop || dcp->fw_compat == DCP_FIRMWARE_V_27_0)
-		dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
+	/*
+	 * Whether the panel has EDR headroom at all is the machine's to say: an
+	 * XDR panel's backlight node carries EDRPotentialHeadroom above 1.0, an
+	 * SDR panel none.  Without it the panel gets no peak, so it shows no PQ
+	 * content as EDR and offers userspace no HDR (dcp_panel_edr()).
+	 */
+	dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
 	/*
 	 * Firmware 27 reports no peak (desktop 26.x: res_max_panel_brightness()).
 	 * The ADT's LmaxProduct gives it (1600 nits on the M5 Pro).  Only a peak
 	 * above the SDR range gives headroom.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+	if (dcp->panel.edr_ceiling && dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 		u32 peak = panel.lmax_product >> 16;
 
 		if (peak > dcp->brightness.maximum && peak <= 10000) {
@@ -4226,13 +4231,18 @@ bool dcp_fw_compat_is_desktop(struct platform_device *pdev)
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 }
 
-/* Firmware whose panel shows PQ content as EDR (dcp_panel_edr_supported()). */
-bool dcp_fw_compat_panel_edr(struct platform_device *pdev)
+/*
+ * Whether @pdev's internal panel can show PQ content as EDR: the panel has
+ * EDR headroom (the ADT's EDRPotentialHeadroom, see dcp_panel_read_adt()),
+ * and the firmware interface is one whose swaps carry EDR, which the driver
+ * implements for desktop 26.x and firmware 27 (dcp_panel_edr_supported()).
+ */
+bool dcp_panel_edr(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+	return dcp_fw_swap_has_edr(dcp) && dcp_has_panel(dcp) &&
+	       dcp->panel.edr_ceiling;
 }
 
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
