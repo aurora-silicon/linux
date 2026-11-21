@@ -1032,6 +1032,15 @@ static int radio_start(struct centauri_t6050_wifi *wifi)
 }
 
 #define CEN_SCAN_CHANNELS_MAX 59
+/*
+ * The scan header's dwell fields, in ms: the least and the most time on an
+ * active channel, then the time on a passive one. An AP that answers no probe
+ * request is heard only by its beacon, one every 102.4 ms on most networks,
+ * so an active channel may take as long as a passive one.
+ */
+#define SCAN_ACTIVE_MIN_MS 40
+#define SCAN_LISTEN_MS 110
+
 static int scan_profile27(struct centauri_t6050_wifi *wifi)
 {
 	struct cfg80211_scan_request *request = wifi->scan_request;
@@ -1058,9 +1067,9 @@ static int scan_profile27(struct centauri_t6050_wifi *wifi)
 		scan[5] = 2;
 		scan[7] = 0x10;
 
-		put_unaligned_le16(40, scan + 8);
-		put_unaligned_le16(40, scan + 10);
-		put_unaligned_le16(110, scan + 12);
+		put_unaligned_le16(SCAN_ACTIVE_MIN_MS, scan + 8);
+		put_unaligned_le16(SCAN_LISTEN_MS, scan + 10);
+		put_unaligned_le16(SCAN_LISTEN_MS, scan + 12);
 		while (next < request->n_channels &&
 		       count < CEN_SCAN_CHANNELS_MAX) {
 			struct ieee80211_channel *channel =
