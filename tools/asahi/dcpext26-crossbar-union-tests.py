@@ -14,6 +14,7 @@ header = (ROOT / 'drivers/gpu/drm/apple/dcp-internal.h').read_text()
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--drop-native26', action='store_true')
 parser.add_argument('--drop-t8132', action='store_true')
+parser.add_argument('--drop-on-link', action='store_true')
 args = parser.parse_args()
 
 def function(text, name):
@@ -28,12 +29,17 @@ def function(text, name):
     return text[match.start():end]
 
 link = function(source, 'dcp_direct_crossbar_link')
+clocks_on_link = function(source, 'dcp_typec_xbar_clocks_on_link')
 if args.drop_native26:
     old = ' && !dcp_is_ext26(dcp)'
     assert link.count(old) == 1
     link = link.replace(old, '', 1)
 if args.drop_t8132:
     old = '!dcp_is_t8132_ext(dcp) && '
+    assert link.count(old) == 1
+    link = link.replace(old, '', 1)
+if args.drop_on_link:
+    old = '!on_link && '
     assert link.count(old) == 1
     link = link.replace(old, '', 1)
 
@@ -73,6 +79,15 @@ static bool apple_t8132_dcpext_v27_2(const struct device_node *n) {
     return of_device_is_compatible(n, "apple,t8132-dcpext") && n->v27_2;
 }
 static void mock_guard(int *lock) { (void)lock; locks++; }
+/* The crossbar's export, include/linux/soc/apple/dp-tunnel.h, behind symbol_get(). */
+static bool xbar_clocks_on_link, xbar_module = true;
+static unsigned queries, symbol_puts;
+static struct mux_control *queried;
+static bool apple_dpxbar_clocks_on_link(struct mux_control *mux) {
+    queries++; queried = mux; return xbar_clocks_on_link;
+}
+#define symbol_get(sym) (xbar_module ? &(sym) : NULL)
+#define symbol_put(sym) do { symbol_puts++; } while (0)
 #define guard(kind) mock_guard
 #define dev_warn(...) ((void)0)
 static int dcp_dpxbar_link(struct mux_control *xbar, bool up) {
@@ -83,7 +98,9 @@ static int dcp_direct_crossbar_link_t6050(struct apple_dcp *dcp, bool up) {
 }
 '''
 cases = r'''
-static void reset(void) { links = v27 = locks = 0; last = NULL; last_up = false; fault = 0; }
+static void reset(void) {
+    links = v27 = locks = queries = symbol_puts = 0; last = queried = NULL; last_up = false; fault = 0;
+}
 int main(void) {
     struct device_node node = { .compatible = "apple,other-dcp" };
     struct device dev = { &node };
@@ -124,10 +141,14 @@ int main(void) {
         d.fixed_route_selected = false; d.direct_xbar_up = NULL;
         reset(); assert(dcp_direct_crossbar_link(&d, true) == 0 && links == 0);
 
-        /* The V27 PHY helper precedes every family admission/lock except T6041 dcpext. */
+        /*
+         * The V27 PHY helper precedes every family admission except T6041
+         * dcpext: without a Type-C route the crossbar is not asked (the
+         * route probe takes the lock once and finds none).
+         */
         d.fw_compat = DCP_FIRMWARE_V_27_0;
         reset(); assert(dcp_direct_crossbar_link(&d, true) == 37);
-        assert(v27 == 1 && links == 0 && locks == 0);
+        assert(v27 == 1 && links == 0 && locks == 1 && queries == 0);
         d.desktop_external = true; d.active_typec_route = &route;
         reset(); assert(dcp_direct_crossbar_link(&d, true) == 0);
         assert(v27 == 0 && links == 1 && locks == 1);
@@ -140,18 +161,55 @@ int main(void) {
     reset(); assert(dcp_direct_crossbar_link(&j773g, true) == 0);
     assert(v27 == 0 && links == 1 && locks == 1 && j773g.direct_xbar_up == &a);
     node.v27_2 = false;
+
+    /*
+     * Firmware 27 on a Type-C route: the crossbar decides. An output whose
+     * clocks follow the link (the M4 Air's 27.2 dcpexts) is linked here on
+     * any machine and processor; any other keeps the T6050 PHY path.
+     */
+    machine = "apple,other"; node.compatible = "apple,other-dcp";
+    route.tunnel = false; route.selected = true; route.active_xbar = NULL;
+    struct apple_dcp air = { .dev = &dev, .active_typec_route = &route,
+                             .fw_compat = DCP_FIRMWARE_V_27_0 };
+    xbar_clocks_on_link = true;
+    reset(); assert(dcp_direct_crossbar_link(&air, true) == 0);
+    assert(queries == 1 && queried == &a && symbol_puts == 1);
+    assert(v27 == 0 && links == 1 && last == &a && last_up && air.direct_xbar_up == &a);
+    /* Brought up that way, it is taken down that way without asking again. */
+    reset(); assert(dcp_direct_crossbar_link(&air, false) == 0);
+    assert(queries == 0 && v27 == 0 && links == 1 && !last_up && !air.direct_xbar_up);
+    /* The selected output is the one asked about. */
+    route.active_xbar = &b;
+    reset(); assert(dcp_direct_crossbar_link(&air, true) == 0);
+    assert(queried == &b && links == 1 && last == &b && air.direct_xbar_up == &b);
+    reset(); assert(dcp_direct_crossbar_link(&air, false) == 0 && !air.direct_xbar_up);
+    route.active_xbar = NULL;
+
+    xbar_clocks_on_link = false;
+    reset(); assert(dcp_direct_crossbar_link(&air, true) == 37);
+    assert(queries == 1 && symbol_puts == 1 && v27 == 1 && links == 0 && !air.direct_xbar_up);
+    /* No crossbar module, or a tunnel: not asked, the T6050 path. */
+    xbar_clocks_on_link = true; xbar_module = false;
+    reset(); assert(dcp_direct_crossbar_link(&air, true) == 37);
+    assert(queries == 0 && symbol_puts == 0 && v27 == 1 && links == 0);
+    xbar_module = true; route.tunnel = true;
+    reset(); assert(dcp_direct_crossbar_link(&air, true) == 37);
+    assert(queries == 0 && v27 == 1 && links == 0);
+    route.tunnel = false; xbar_clocks_on_link = false;
+
     machine = "apple,other"; node.compatible = "apple,other-dcp";
     struct apple_dcp unrelated = { .dev = &dev, .active_typec_route = &route };
     reset(); assert(dcp_direct_crossbar_link(&unrelated, true) == 0);
     assert(links == 0 && locks == 0);
-    puts("PASS production crossbar union, route/cache/error behavior, V27 precedence, J773g 27.2 and unrelated exclusion");
+    puts("PASS production crossbar union, route/cache/error behavior, V27 precedence, "
+         "firmware-27 clocks-on-link crossbar (true/false/no module/tunnel), J773g 27.2 and unrelated exclusion");
     return 0;
 }
 '''
 unit = pre + function(header, 'dcp_is_ext26') + '\n'
 unit += function(source, 'dcp_t6041_ext_v27') + '\n'
 unit += function(source, 'dcp_t8132_ext_m4_node') + '\n'
-unit += function(source, 'dcp_is_t8132_ext') + '\n' + link + '\n' + cases
+unit += function(source, 'dcp_is_t8132_ext') + '\n' + clocks_on_link + '\n' + link + '\n' + cases
 with tempfile.TemporaryDirectory() as tmp:
     c = Path(tmp) / 'crossbar.c'
     binary = Path(tmp) / 'crossbar'
