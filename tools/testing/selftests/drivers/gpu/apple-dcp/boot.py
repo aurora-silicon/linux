@@ -214,13 +214,16 @@ def t6041_v27_admission(root):
     cutoff = '\n\tret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);\n\tif (ret < 0)'
     selector = selector_full[:selector_full.index(cutoff)] + '\n\t(void)v14_board;\n\treturn DCP_FIRMWARE_UNKNOWN;\n}\n'
     method_table = block(dcp_c, 'static enum dcp_firmware_version dcp_v27_method_table(')
-    # The J773g's admission, with its machine check as a flag: no of_machine_is_compatible()
-    # exists in this translation unit, so the T6041 helpers cannot depend on the machine.
+    # The J773g's and J713's admission, with its machine checks as flags: no
+    # of_machine_is_compatible() exists in this translation unit, so the T6041 helpers
+    # cannot depend on the machine.
     t8132_h = (root / 'include/linux/soc/apple/t8132.h').read_text()
     t8132_admission = block(t8132_h, 'static inline bool apple_t8132_dcpext_v27_2(')
     assert t8132_admission.count('of_machine_is_compatible("apple,j773g")') == 1
-    t8132_admission = ('static bool machine_j773g;\n' +
-                       t8132_admission.replace('of_machine_is_compatible("apple,j773g")', 'machine_j773g'))
+    assert t8132_admission.count('of_machine_is_compatible("apple,j713")') == 1
+    t8132_admission = ('static bool machine_j773g, machine_j713;\n' +
+                       t8132_admission.replace('of_machine_is_compatible("apple,j773g")', 'machine_j773g')
+                                      .replace('of_machine_is_compatible("apple,j713")', 'machine_j713'))
     return r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -423,8 +426,9 @@ int main(void)
     }
 
     /*
-     * The Mac mini's (J773g) dcpext handed over with the T8132 27.2 image runs
-     * the 27.2 table; nothing else of T8132 does, whatever the firmware path.
+     * The Mac mini's (J773g) and 13-inch Air's (J713) dcpexts handed over with
+     * the T8132 27.2 image run the 27.2 table; nothing else of T8132 does,
+     * whatever the firmware path.
      */
     reset_t6041_26b123(true);
     node.compatible = "apple,t8132-dcpext";
@@ -435,8 +439,13 @@ int main(void)
         machine_j773g = true;
         assert(apple_t8132_dcpext_v27_2(&node));
         assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
-        /* Another M4 Mac (J713, J604): the M4 backend's, as before. */
+        /* The 13-inch Air's (J713) dcpexts run the same image on 27.2. */
         machine_j773g = false;
+        machine_j713 = true;
+        assert(apple_t8132_dcpext_v27_2(&node));
+        assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
+        /* Another M4 Mac (J604): the M4 backend's, as before. */
+        machine_j713 = false;
         assert(!apple_t8132_dcpext_v27_2(&node));
         assert(dcp_check_firmware_version(&dev) == (path ? DCP_FIRMWARE_M4 : DCP_FIRMWARE_UNKNOWN));
     }
