@@ -3772,7 +3772,7 @@ static int t6040_phy_count(struct phy *phy)
 }
 
 /*
- * Resume from disk is a cold boot: the PHY, its coprocessor and the
+ * Resume from disk through a boot: the PHY, its coprocessor and the
  * pipehandler come back reset, while this driver's state comes from the
  * image.  Before the image its consumers gave it back: the sleep hook
  * unbinds dwc3 (USB2/USB3 phys powered off, controller reset asserted),
@@ -3798,6 +3798,15 @@ static int t6040_usb2_restore_early(struct device *dev)
 	if (!tphy)
 		return 0;
 	guard(mutex)(&tphy->lock);
+	/*
+	 * The kernel that wrote the image loaded it again (test_resume): the PHY
+	 * kept its power and its state, and the hardware matches this driver's,
+	 * as after a sleep that the firmware did not take the SoC through.
+	 */
+	if (!pm_hibernate_restored_cold()) {
+		WRITE_ONCE(tphy->sleep_back, tphy->sleep_down);
+		return 0;
+	}
 	if (tphy->powered || tphy->usb3_on || tphy->dwc3_running ||
 	    t6040_phy_count(tphy->dp))
 		dev_warn(dev,
@@ -3844,7 +3853,8 @@ static int t6040_usb2_restore(struct device *dev)
 	if (!tphy || IS_ERR_OR_NULL(tphy->rtk))
 		return 0;
 	guard(mutex)(&tphy->lock);
-	if (!apple_rtkit_is_running(tphy->rtk))
+	/* Without a boot behind the restore the session is still the one this kernel runs. */
+	if (!pm_hibernate_restored_cold() || !apple_rtkit_is_running(tphy->rtk))
 		return 0;
 	ret = apple_rtkit_reinit(tphy->rtk);
 	dev_info(dev, "restore: USB3 coprocessor RTKit reset: %d\n", ret);
