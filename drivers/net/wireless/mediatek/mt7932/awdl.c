@@ -927,6 +927,8 @@ int mt_awdl_register(struct mt7932 *m)
 	eth_hw_addr_set(netdev, mac);
 	ether_addr_copy(netdev->perm_addr, mac);
 	strscpy(netdev->name, "awdl0", IFNAMSIZ);
+	/* A fixed name: udev must not give awdl0 the station's onboard name. */
+	netdev->name_assign_type = NET_NAME_PREDICTABLE;
 	netif_carrier_off(netdev);
 	m->awdl.netdev = netdev;
 	ret = register_netdev(netdev);
