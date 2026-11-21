@@ -1050,19 +1050,25 @@ static int apple_nhi_cio_suspend(struct apple_nhi *anhi)
 
 	if (anhi->cio_t6050)
 		return apple_nhi_cio_suspend_t6050(anhi);
+	apple_sleep_note_sub(0xa1);	/* LAB row H */
 	if (anhi->cio_pcie && !apple_pcie_tunnel_cio_stopped(anhi->cio_pcie))
 		return -EBUSY;
 	dev_info(anhi->dev, "CIO save paths and routers\n");
+	apple_sleep_note_sub(0xa2);
 	ret = tb_cio_sleep(anhi->tb);
+	apple_sleep_note_sub(ret ? 0xe2 : 0xa3);
 	if (ret)
 		return ret;
 	dev_info(anhi->dev, "CIO stop NHI DART\n");
 	ret = apple_nhi_cio_dart_off(anhi);
+	apple_sleep_note_sub(ret ? 0xe3 : 0xa4);
 	/* Asleep, the controller wakes only through a restart, which loses this DART. */
 	if (ret)
 		panic("Apple CIO: NHI DART not saved (%d) with the router asleep", ret);
 	dev_info(anhi->dev, "CIO stop controller\n");
+	apple_sleep_note_sub(0xa5);
 	ret = apple_rtkit_poweroff(acio->rtk);
+	apple_sleep_note_sub(ret ? 0xe5 : 0xa6);
 	if (ret)
 		panic("Apple CIO: CPU shutdown failed %d; DMA stays closed", ret);
 	anhi->cio_rtk_off = true;
@@ -1071,14 +1077,18 @@ static int apple_nhi_cio_suspend(struct apple_nhi *anhi)
 						 APPLE_CIO_LSTX_CTRL_LEVEL));
 	if (ret)
 		goto unwind;
+	apple_sleep_note_sub(0xa7);
 	ret = apple_nhi_cio_domains_off(anhi);
 	if (ret)
 		goto unwind;
 	dev_info(anhi->dev, "CIO stop PHY\n");
+	apple_sleep_note_sub(0xa8);
 	ret = apple_nhi_cio_phy(anhi, CIO_PHY_OFF);
+	apple_sleep_note_sub(ret ? 0xe8 : 0xa9);
 	if (!ret)
 		return 0;
 unwind:
+	apple_sleep_note_sub(0xee);
 	dev_warn(anhi->dev, "CIO suspend failed %d; restarting the controller\n", ret);
 	/*
 	 * The host router took the vendor sleep: only a controller restart wakes

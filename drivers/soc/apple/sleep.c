@@ -4780,7 +4780,8 @@ static void sleep_spmi_sources_report(struct apple_sleep *s)
 
 static bool sleep_notes_on(struct apple_sleep *s)
 {
-	return s && s->spmi && s->soc->untested && READ_ONCE(sleep_pmu_notes);
+	/* LAB (J713-S2R row H): notes on the tested T8132 profile too. */
+	return s && s->spmi && READ_ONCE(sleep_pmu_notes);
 }
 
 /*
