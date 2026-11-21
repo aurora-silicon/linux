@@ -812,6 +812,7 @@ struct Firmware {
     rings: channel::Rings,
     recovery: recovery::State,
     effort: power::Effort,
+    ceiling: Option<power::Ceiling>,
     hold: power::Hold,
     /// M5: host GPU power budget governor (Region C's budget word).
     governor: thermal::Governor,
@@ -1055,7 +1056,7 @@ impl Firmware {
         if self.effort.streaming() && self.effort.note_waiters(now_ns, fence::waiters()) {
             self.apply_effort(power::FULL_EFFORT)?;
         }
-        let effort = match self.effort.idle(now_ns, in_flight || submitted) {
+        let mut effort = match self.effort.idle(now_ns, in_flight || submitted) {
             power::IdleAction::None => None,
             power::IdleAction::Clear => {
                 self.port.set_effort_full(false);
@@ -1069,6 +1070,16 @@ impl Firmware {
             }
             power::IdleAction::Recheck(delay) => Some(delay),
         };
+        // A stopped firmware polls nothing; the next pass after the wake samples again.
+        let sleeping = self.primary.state.shared.sleeping();
+        if let Some(ceiling) = self.ceiling.as_mut().filter(|_| !sleeping) {
+            ceiling.update(&self.init)?;
+            if in_flight || submitted {
+                effort = Some(effort.map_or(power::PMP_REPORT_PERIOD_NS, |delay| {
+                    delay.min(power::PMP_REPORT_PERIOD_NS)
+                }));
+            }
+        }
         Ok(
             match (effort, self.idle_hold(now_ns, in_flight || submitted)) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -1201,6 +1212,8 @@ struct Shared {
     deflake: fw::render::Deflake,
     compute_blocks: usize,
     descriptor_flags: [u32; 2],
+    /// Whether the GPU is linked to a PMP runtime-policy provider.
+    pmp: bool,
     /// Firmware events and work run: off for an M5 profile without the bare-metal boot.
     submission_enabled: bool,
     /// Such an M5 profile admits no render command.
@@ -1701,6 +1714,17 @@ impl Gpu {
         let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
         let idle_delay =
             power::idle_delay(node.get_opt_property(c_str!("apple,idle-off-delay-ms"))?)?;
+        let pmp = node
+            .get_opt_property::<u32>(c_str!("apple,pmp"))?
+            .is_some();
+        if pmp {
+            // SAFETY: `dev` remains live for the device link. The helper
+            // resolves the phandle and defers probe until the PMP is bound.
+            let ret = unsafe { kernel::bindings::apple_pmp_link_device(pdev.as_ref().as_raw()) };
+            if ret != 0 {
+                return Err(Error::from_errno(ret));
+            }
+        }
         power::IDLE_HOLD_MS.store(idle_delay, Ordering::Relaxed);
         dev_info!(
             dev.as_ref(),
@@ -1767,6 +1791,7 @@ impl Gpu {
                 deflake: cfg.core_layout.deflake,
                 compute_blocks: cfg.core_layout.compute_blocks,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
+                pmp,
                 submission_enabled: submits,
                 firmware_test: !submits,
                 render_policy,
@@ -2084,6 +2109,7 @@ impl Gpu {
                 rings: channel::Rings::new(shared.variant.graph, shared.variant.m5_commands)?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
+                ceiling: None,
                 hold: power::Hold::new(),
                 governor: thermal::Governor::new(),
                 registration_power_release_pending: false,
@@ -2288,6 +2314,7 @@ impl Gpu {
                 rings: channel::Rings::new(shared.variant.graph, shared.variant.m5_commands)?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
+                ceiling: None,
                 hold: power::Hold::new(),
                 governor: thermal::Governor::new(),
                 registration_power_release_pending: false,
@@ -2331,6 +2358,9 @@ impl Gpu {
             shared.active_cores,
             shared.variant,
         )?;
+        if shared.pmp {
+            session.ceiling = Some(power::Ceiling::new(session.init.ppm_target()?));
+        }
         if let Some(root_entries) = root_entries {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }

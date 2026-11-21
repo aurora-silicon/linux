@@ -14,7 +14,9 @@ description: |
   The PMP running bit qualifies the per-cluster fast-die effort. Lane 1
   tracks P-cluster load in Linux measurements. Lane 0 is assigned to the
   E cluster from the Apple device tree order and has not been observed
-  changing. The T6041 report has three lanes: E, P0 and P1. Only
+  changing. The T6041 report has three lanes: E, P0 and P1. On T8140 the
+  running bit also qualifies the GPU lifetime-control effort, one entry
+  holding an integer percent from 0 (no limit) to 100. Only
   documented report entries may be read; the aperture is not a
   contiguous readable array of registers.
 
