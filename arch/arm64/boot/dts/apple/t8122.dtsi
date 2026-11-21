@@ -552,6 +552,40 @@
 			status = "disabled";
 		};
 
+		/*
+		 * Entry qualification of the system sleep, for a trial's device tree only:
+		 * that tree enables this, names the display coprocessor and gives the SEP
+		 * its power domain. The blocks are the ones measured from a macOS sleep on
+		 * J613; "dockchannel" is the debug cable's console, for the late witness.
+		 * "ps-aon" is the mini PMGR, for the debug switch word: a trial tree that
+		 * also names the port carrying the debug link (apple,debug-port) has that
+		 * link cut for the sleep, as on the working SoCs.
+		 */
+		sleep: sleep-controller@2d0700000 {
+			compatible = "apple,t8122-sleep";
+			reg = <0x2 0xd0700000 0x0 0x14000>,
+			      <0x2 0xd0724000 0x0 0x4000>,
+			      <0x2 0xd0734000 0x0 0x10>,
+			      <0x2 0xd0768000 0x0 0x40>,
+			      <0x2 0xd0780000 0x0 0x8>,
+			      <0x2 0xe42d4000 0x0 0x4>,
+			      <0x2 0xe42b0000 0x0 0x30>,
+			      <0x2 0xe4714000 0x0 0x100>,
+			      <0x2 0xe4908000 0x0 0x100>,
+			      <0x2 0xe413c000 0x0 0x4000>,
+			      <0x2 0xe4280000 0x0 0x4000>,
+			      <0x2 0xe4004000 0x0 0x48>;
+			reg-names = "ps", "pwrgate", "cpu-start", "cllt", "cluster",
+				    "commit", "wdt", "spmi", "spmi-hpm", "dockchannel",
+				    "ps-aon", "wake";
+			/*
+			 * NUB.SPMI0.SW3: the PMU, and so its RTC alarm. Required: without it
+			 * the driver refuses every sleep.
+			 */
+			apple,wake-enable = <155>;
+			status = "disabled";
+		};
+
 		sep: sep@29e400000 {
 			compatible = "apple,sep";
 			reg = <0x2 0x9e400000 0x0 0x6c000>;

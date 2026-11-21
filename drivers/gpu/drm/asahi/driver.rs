@@ -275,15 +275,28 @@ unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_i
     let data = unsafe { sleep_data(dev) };
     match data.g17.as_ref() {
         Some(gpu) => kernel::error::from_result(|| gpu.sleep_prepare().map(|_| 0)),
+        // The M3 has no firmware restart: its C side admits an idle GPU with its domain off
+        // and leaves the rest to the sleep driver's commit, or refuses.
+        // SAFETY: `dev` is the bound GPU device, for the duration of this PM callback.
+        None if data.m3.is_some() => unsafe { asahi_m3_sleep_prepare(dev) },
         None => EBUSY.to_errno(),
     }
+}
+
+extern "C" {
+    fn asahi_m3_sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_int;
+    fn asahi_m3_sleep_complete(dev: *mut bindings::device);
 }
 
 /// Runs after every device resumed. Does nothing unless [`sleep_prepare`] stopped the firmware.
 unsafe extern "C" fn sleep_complete(dev: *mut bindings::device) {
     // SAFETY: Called by the PM core.
-    if let Some(gpu) = unsafe { sleep_data(dev) }.g17.as_ref() {
+    let data = unsafe { sleep_data(dev) };
+    if let Some(gpu) = data.g17.as_ref() {
         gpu.sleep_complete();
+    } else if data.m3.is_some() {
+        // SAFETY: `dev` is the bound GPU device, for the duration of this PM callback.
+        unsafe { asahi_m3_sleep_complete(dev) };
     }
 }
 
