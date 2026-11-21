@@ -56,8 +56,9 @@ const _: () = {
     assert!(queue_limit(0) == crate::mmu::MAX_EXECUTION_CONTEXTS);
     // Compute keeps this many channels even with every execution context open.
     assert!(QID_COUNT - FULL_RENDER_RESERVE >= 4);
-    // The reserve counts one pair per owner. A second pair of an owner comes
-    // only from surplus (g17::pairs), never from this reserve.
+    // Future queue headroom caps at one pair per execution context; compute
+    // reservation still protects current pair demand (including live siblings
+    // and teardown-held released pairs) above that cap.
     assert!(FULL_RENDER_RESERVE == 2 * crate::mmu::MAX_EXECUTION_CONTEXTS as usize + 2);
 };
 
@@ -130,7 +131,7 @@ impl QueueIds {
         engine: DataMaster,
         preferred: Option<u8>,
     ) -> Result<Id> {
-        self.reserve_for(owner, engine, preferred, crate::mmu::MAX_EXECUTION_CONTEXTS as usize)
+        self.reserve_for(owner, engine, preferred, queue_limit(self.floor) as usize)
     }
 
     fn render_ids(&self) -> usize {
@@ -141,10 +142,18 @@ impl QueueIds {
             .count()
     }
 
+    /// Total dedicated render pairs the QID table can hold beside the
+    /// bootstrap reservations and installed compute channels.
+    pub(crate) fn render_pair_capacity(&self) -> usize {
+        (self.render_ids() + (QID_COUNT - self.floor - self.leased))
+            .saturating_sub(2)
+            / 2
+    }
+
     /// Whether `queues` open logical queues can each still install a dedicated
     /// render pair, beside the bootstrap reservations and installed compute.
     pub(crate) fn render_fits(&self, queues: usize) -> bool {
-        self.render_ids() + (QID_COUNT - self.floor - self.leased) >= 2 * queues + 2
+        self.render_pair_capacity() >= queues
     }
 
     /// Whether a render pair not yet built can still reserve both of its identities.
@@ -160,17 +169,23 @@ impl QueueIds {
         self.compute_room(queues, usize::from(initial))
     }
 
-    fn compute_room(&self, queues: usize, replacement: usize) -> bool {
+    fn compute_room(&self, pairs: usize, replacement: usize) -> bool {
         // Existing render identities already satisfy this reservation. Counting
         // them twice can refuse compute even while physical QIDs remain free.
         // Replacing an initial reservation consumes one render identity.
         // Include that transition when protecting render's minimum, and
         // count the replacement as available compute capacity.
+        //
+        // Cap future queue headroom at `FULL_RENDER_RESERVE - self.floor`, but
+        // always protect every pair in current demand (`2 * pairs + 2`) so
+        // compute cannot strand an open queue when live siblings or
+        // teardown-held pairs push demand above `queue_limit(self.floor)`.
         let render = self.render_ids();
+        let current = 2 * pairs + 2;
+        let with_headroom = render_reserve(pairs).min(FULL_RENDER_RESERVE - self.floor);
+        let reserve = current.max(with_headroom);
         QID_COUNT - self.floor - self.leased + replacement
-            > render_reserve(queues)
-                .min(FULL_RENDER_RESERVE - self.floor)
-                .saturating_sub(render - replacement)
+            > reserve.saturating_sub(render - replacement)
     }
 
     /// As [`Self::reserve`], with the compute reserve sized for `queues` open
@@ -387,6 +402,46 @@ mod accounting_tests {
         assert_eq!(ids.reserve(1002, DataMaster::Compute, None), Ok(replacement));
         assert_eq!(ids.leased, QID_COUNT);
         assert_eq!(ids.reserve(1002, DataMaster::Fragment, None), Err(EINVAL));
+    }
+
+    #[test]
+    fn compute_reserve_protects_sibling_demand_above_context_limit() {
+        let mut ids = table();
+        ids.reserve_initial_render().unwrap();
+        let max = crate::mmu::MAX_EXECUTION_CONTEXTS as usize;
+        // 58 open queues + 1 live sibling = 59 pairs demand (above MAX_EXECUTION_CONTEXTS).
+        let demand = max + 1;
+        // Install 57 first pairs + 1 sibling = 58 pairs (116 render IDs) plus 2 bootstrap IDs.
+        let mut owner = 100u64;
+        for _ in 0..max {
+            let t = ids.reserve_for(owner, DataMaster::Tiling, None, demand).unwrap();
+            ids.publish(t).unwrap();
+            owner += 1;
+            let f = ids.reserve_for(owner, DataMaster::Fragment, None, demand).unwrap();
+            ids.publish(f).unwrap();
+            owner += 1;
+        }
+        // Compute takes all remaining QIDs except the 2 needed for the 58th queue's first pair.
+        let compute_budget = QID_COUNT - (2 * demand + 2);
+        for _ in 0..compute_budget {
+            let c = ids.reserve_for(owner, DataMaster::Compute, None, demand).unwrap();
+            ids.publish(c).unwrap();
+            owner += 1;
+        }
+        assert_eq!(ids.render_pair_capacity(), demand);
+        assert!(!ids.compute_fits(demand));
+        assert_eq!(
+            ids.reserve_for(owner, DataMaster::Compute, None, demand),
+            Err(ENOSPC)
+        );
+        // The last open queue can still install its first pair.
+        assert!(ids.render_pair_fits());
+        let t = ids.reserve_for(owner, DataMaster::Tiling, None, demand).unwrap();
+        let f = ids
+            .reserve_for(owner + 1, DataMaster::Fragment, None, demand)
+            .unwrap();
+        ids.publish(t).unwrap();
+        ids.publish(f).unwrap();
     }
 }
 

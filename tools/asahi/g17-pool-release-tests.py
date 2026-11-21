@@ -74,7 +74,10 @@ struct Id { qid: u8 }
 struct ComputeReservation { slot: usize, id: Id, owner: u64 }
 type ComputeSlot = Option<Box<compute::Queue>>;
 struct ComputeEntry { reservation: ComputeReservation, queue: ComputeSlot }
-struct Admission; impl Admission {fn queues(&self)->u32{4}}
+struct Admission; impl Admission {fn queues(&self)->u32{4}
+    fn reserve_compute_with_budget<T>(&self, reserve: impl FnOnce(usize) -> Result<(T, bool, usize)>) -> Result<T> {
+        reserve(self.queues() as usize).map(|(value, _, _)| value)
+    }}
 struct QueueIds { free: bool, fail: Option<Error> }
 impl QueueIds {
     fn reserve_for(&mut self, _: u64, _: DataMaster, preferred: Option<u8>, _: usize) -> Result<Id> {
@@ -83,6 +86,8 @@ impl QueueIds {
         self.free = false;
         Ok(Id { qid: preferred.unwrap() })
     }
+    fn render_pair_fits(&self) -> bool { true }
+    fn render_pair_capacity(&self) -> usize { 0 }
 }
 struct Identities { next: u64 }
 impl Identities {

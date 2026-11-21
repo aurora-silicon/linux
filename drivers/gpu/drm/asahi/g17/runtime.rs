@@ -288,7 +288,7 @@ impl Registry {
         if let Some(rebind) = self.bind_reusable(owner, context, required, admission)? {
             return Ok(rebind);
         }
-        if self.qids.compute_fits(self.admission.queues() as usize) {
+        if self.qids.compute_fits(self.admission.render_demand(0)) {
             return Ok(Rebind::Fresh);
         }
         if self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
@@ -378,7 +378,7 @@ impl Registry {
                 (queue.reusable() || queue.shareable() || queue.can_rearm())
                     && !queue.context().is_some_and(|bound| teardown.releasing(bound))
             });
-        if available || self.qids.compute_fits(self.admission.queues() as usize) {
+        if available || self.qids.compute_fits(self.admission.render_demand(0)) {
             Readiness::Ready
         } else {
             Readiness::Channel
@@ -600,12 +600,19 @@ impl Registry {
             .ok_or_else(|| self.compute_admission_error(
                 crate::g17::capacity::refused(crate::g17::capacity::Site::ComputeSlots)))?;
         let identity = self.identities.reserve(1)?.start;
-        let queues = self.admission.queues() as usize;
+        let qids = &mut self.qids;
         let id = self
-            .qids
-            .reserve_for(identity, DataMaster::Compute, Some(FIRST_COMPUTE_QID), queues)
+            .admission
+            .reserve_compute_with_budget(|demand| {
+                let id = qids.reserve_for(
+                    identity,
+                    DataMaster::Compute,
+                    Some(FIRST_COMPUTE_QID),
+                    demand,
+                )?;
+                Ok((id, qids.render_pair_fits(), qids.render_pair_capacity()))
+            })
             .map_err(|error| self.compute_admission_error(error))?;
-        self.note_build_room();
         let reservation = ComputeReservation { slot, id, owner };
         self.compute[slot] = Some(ComputeEntry {
             reservation,
@@ -787,10 +794,11 @@ impl Backend {
             // wait would end at once and admission would spin on the device
             // mutex for the whole wait, starving the queues it waits for.
             let admission = &firmware.queues.admission;
-            // Installed compute channels narrow render's QIDs: every open
-            // logical queue keeps a dedicated render pair within reach.
+            // Installed compute channels and live sibling render pairs narrow
+            // render's QIDs: every open logical queue keeps a dedicated first
+            // render pair within reach.
             if !admission.has_room()
-                || !firmware.queues.qids.render_fits(admission.queues() as usize + 1)
+                || !firmware.queues.qids.render_fits(admission.render_demand(1))
             {
                 return Err(super::capacity::refused(super::capacity::Site::LogicalQueues));
             }
@@ -805,12 +813,13 @@ impl Backend {
             firmware.queues.qos_ids.forget_released(|ids| firmware.port.qos_forget(ids));
             // G17P queues of one VM join its live execution context (super::exec_share).
             let joined = if firmware.uat.is_m5() { None } else { super::exec_share::join(vm) };
+            let render_capacity = firmware.queues.qids.render_pair_capacity();
             let attempt = if let Some((execution, share)) = joined {
-                Ok((execution, admission.reserve_queue()?, Some(share)))
+                Ok((execution, admission.try_reserve_queue(render_capacity)?, Some(share)))
             } else if firmware.uat.execution_contexts_used() < crate::mmu::MAX_EXECUTION_CONTEXTS {
-                // Creators hold the device mutex, so neither check above can
-                // have changed; the slot only fails on a broken invariant.
-                let slot = admission.reserve_queue()?;
+                // Creators hold the device mutex, and try_reserve_queue re-checks
+                // live siblings atomically against render_capacity before taking a slot.
+                let slot = admission.try_reserve_queue(render_capacity)?;
                 firmware.uat.new_execution_context(vm, super::channel::control_witnessed()).map(|execution| (execution, slot, None))
             } else {
                 Err(ENOSPC)
@@ -2825,7 +2834,7 @@ impl Registry {
                  self.compute.iter().flatten().filter(|entry| entry.queue.is_none()).count())?;
         writeln!(f, "compute_channels used={} fresh_fits={}",
                  self.compute.iter().flatten().count(),
-                 u8::from(self.qids.compute_fits(self.admission.queues() as usize)))?;
+                 u8::from(self.qids.compute_fits(self.admission.render_demand(0))))?;
         writeln!(f, "scheduler_teardown pending={}", self.teardown.len())?;
         for queue in self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()) {
             queue.write_capacity(f)?;

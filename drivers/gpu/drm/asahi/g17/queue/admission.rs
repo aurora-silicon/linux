@@ -90,6 +90,9 @@ struct State {
     /// The physical queue table still has room for a pair built in an unowned slot. The
     /// runtime updates this whenever the table changes.
     build_room: bool,
+    /// Total dedicated render pairs the QID table can hold (installed plus buildable).
+    /// Updated alongside `build_room` so sibling admission preserves first-pair capacity.
+    render_capacity: usize,
     released: u64,
     epoch: u64,
     footprints: KVec<InFlight>,
@@ -112,11 +115,42 @@ impl State {
             killed_at: [0; cfg::RENDER_SLOTS],
             held: 0,
             build_room: true,
+            render_capacity: cfg::RENDER_SLOTS - 1,
             released: 0,
             epoch: 0,
             footprints: KVec::new(),
             next_ticket: 1,
         }
+    }
+    fn live_owners(&self) -> usize {
+        let mut count = 0usize;
+        for slot in 1..cfg::RENDER_SLOTS {
+            let owner = self.owners[slot];
+            if owner == 0 || self.released & (1u64 << slot) != 0 {
+                continue;
+            }
+            if !(1..slot).any(|prev| {
+                self.owners[prev] == owner && self.released & (1u64 << prev) == 0
+            }) {
+                count += 1;
+            }
+        }
+        count
+    }
+    fn live_siblings(&self) -> usize {
+        let mut siblings = 0usize;
+        for slot in 1..cfg::RENDER_SLOTS {
+            let owner = self.owners[slot];
+            if owner == 0 || self.released & (1u64 << slot) != 0 {
+                continue;
+            }
+            if (1..slot).any(|prev| {
+                self.owners[prev] == owner && self.released & (1u64 << prev) == 0
+            }) {
+                siblings += 1;
+            }
+        }
+        siblings
     }
     fn exhausted(&self) -> bool {
         self.quarantined & Self::MASK == Self::MASK
@@ -175,7 +209,11 @@ impl State {
         self.advance(slot);
         slot as u8
     }
+    #[cfg(CONFIG_KUNIT = "y")]
     fn acquire(&mut self, owner: u64, pairs: usize) -> Option<u8> {
+        self.acquire_for(owner, pairs, 0)
+    }
+    fn acquire_for(&mut self, owner: u64, pairs: usize, open_queues: usize) -> Option<u8> {
         if owner == 0 {
             return None;
         }
@@ -210,7 +248,7 @@ impl State {
             if !(0..cfg::RENDER_SLOTS)
                 .any(|other| self.owners[other] == owner && self.refs[other] != 0)
             {
-                self.claim_sibling(owner, pairs);
+                self.claim_sibling(owner, pairs, open_queues);
             }
             return Some(self.take_idle(slot, owner));
         }
@@ -249,12 +287,31 @@ impl State {
             })
             .or_else(unowned)?;
         let first = self.take_idle(slot, owner);
-        self.claim_sibling(owner, pairs);
+        self.claim_sibling(owner, pairs, open_queues);
         Some(first)
     }
-    /// Claims another pair for an owner that may hold `pairs`.
-    fn claim_sibling(&mut self, owner: u64, pairs: usize) {
+    fn unavailable_released(&self) -> usize {
+        (self.released
+            & (self.active | self.quarantined | self.kill_hold | self.held)
+            & Self::MASK)
+            .count_ones() as usize
+    }
+
+    fn pair_demand(&self, open_queues: usize) -> usize {
+        open_queues
+            .max(self.live_owners())
+            .saturating_add(self.live_siblings())
+            .saturating_add(self.unavailable_released())
+    }
+
+    /// Claims another pair for an owner that may hold `pairs`, while keeping
+    /// first-pair capacity for every open logical queue.
+    fn claim_sibling(&mut self, owner: u64, pairs: usize, open_queues: usize) {
         if self.owners.iter().filter(|id| **id == owner).count() >= pairs {
+            return;
+        }
+        let needed = self.pair_demand(open_queues).saturating_add(1);
+        if needed > self.render_capacity.min(cfg::RENDER_SLOTS - 1) {
             return;
         }
         // A speculative sibling never takes a killed context's pair.
@@ -402,9 +459,20 @@ impl State {
         }
     }
 
+    #[cfg(CONFIG_KUNIT = "y")]
     fn pick(&mut self, owner: u64, pairs: usize, plan: Plan) -> Option<u8> {
+        self.pick_for(owner, pairs, 0, plan)
+    }
+
+    fn pick_for(
+        &mut self,
+        owner: u64,
+        pairs: usize,
+        open_queues: usize,
+        plan: Plan,
+    ) -> Option<u8> {
         match plan {
-            Plan::Any => self.acquire(owner, pairs),
+            Plan::Any => self.acquire_for(owner, pairs, open_queues),
             Plan::Wait => None,
             Plan::Pair(slot) => self.join(owner, usize::from(slot)),
             // The preferred pair, else the owner's least-loaded other pair:
@@ -608,11 +676,34 @@ impl Pool {
     pub(crate) fn has_room(&self) -> bool {
         self.queues() < self.max_queues
     }
+    /// Render pairs needed so every open logical queue (plus `extra_queues`)
+    /// keeps a first pair alongside live sibling and teardown-held pairs.
+    pub(crate) fn render_demand(&self, extra_queues: usize) -> usize {
+        let state = self.state.lock();
+        let open = self.queues.load(Ordering::Acquire) as usize;
+        state.pair_demand(open).saturating_add(extra_queues)
+    }
+    #[cfg(CONFIG_KUNIT = "y")]
     pub(crate) fn reserve_queue(self: &Arc<Self>) -> Result<QueueSlot> {
+        self.try_reserve_queue(cfg::RENDER_SLOTS - 1)
+    }
+    /// Reserves a logical queue slot only if every open queue (including this
+    /// one), every live sibling, and every teardown-held released pair still
+    /// fits within `render_capacity`.
+    pub(crate) fn try_reserve_queue(
+        self: &Arc<Self>,
+        render_capacity: usize,
+    ) -> Result<QueueSlot> {
+        let mut state = self.state.lock();
+        state.render_capacity = render_capacity;
+        let cap = render_capacity.min(cfg::RENDER_SLOTS - 1);
         let mut count = self.queues.load(Ordering::Acquire);
         loop {
-            if count >= self.max_queues {
-                return Err(crate::g17::capacity::refused(crate::g17::capacity::Site::LogicalQueues));
+            let needed = state.pair_demand(count as usize).saturating_add(1);
+            if count >= self.max_queues || needed > cap {
+                return Err(crate::g17::capacity::refused(
+                    crate::g17::capacity::Site::LogicalQueues,
+                ));
             }
             match self.queues.compare_exchange(
                 count,
@@ -624,6 +715,25 @@ impl Pool {
                 Err(current) => count = current,
             }
         }
+    }
+    /// Reserves a compute QID while holding admission's state lock so sibling
+    /// admission cannot race ahead of the updated render-pair capacity.
+    pub(crate) fn reserve_compute_with_budget<T>(
+        &self,
+        reserve: impl FnOnce(usize) -> Result<(T, bool, usize)>,
+    ) -> Result<T> {
+        let mut state = self.state.lock();
+        let open = self.queues.load(Ordering::Acquire) as usize;
+        let demand = state.pair_demand(open);
+        let (value, room, capacity) = reserve(demand)?;
+        let grew = (room && !state.build_room) || capacity > state.render_capacity;
+        state.build_room = room;
+        state.render_capacity = capacity;
+        drop(state);
+        if grew {
+            self.returned();
+        }
+        Ok(value)
     }
     /// The owner's pair is quarantined behind another VM's recovery (spared) and drains.
     pub(crate) fn spared_quarantined(&self, owner: u64) -> bool {
@@ -683,7 +793,8 @@ impl Pool {
             } else {
                 state.plan(owner, request, ticket)
             };
-            if let Some(slot) = state.pick(owner, pairs, plan) {
+            let open_queues = self.queues.load(Ordering::Acquire) as usize;
+            if let Some(slot) = state.pick_for(owner, pairs, open_queues, plan) {
                 state.forget_waiter(ticket.take());
                 let record =
                     request.and_then(|request| state.record(owner, Some(slot), 0, request));
@@ -737,7 +848,8 @@ impl Pool {
             return Ok(None);
         }
         let plan = state.plan(owner, request, None);
-        let Some(slot) = state.pick(owner, pairs, plan) else {
+        let open_queues = self.queues.load(Ordering::Acquire) as usize;
+        let Some(slot) = state.pick_for(owner, pairs, open_queues, plan) else {
             return Ok(None);
         };
         let record = request.and_then(|request| state.record(owner, Some(slot), 0, request));
@@ -862,11 +974,14 @@ impl Pool {
         }
     }
 
-    /// Whether the physical queue table can hold another pair (see `State::build_room`).
-    pub(crate) fn note_build_room(&self, room: bool) {
+    /// Whether the physical queue table can hold another pair and how many
+    /// dedicated render pairs fit in total (see `State::build_room` and
+    /// `State::render_capacity`).
+    pub(crate) fn note_build_room(&self, room: bool, capacity: usize) {
         let mut state = self.state.lock();
-        if state.build_room != room {
+        if state.build_room != room || state.render_capacity != capacity {
             state.build_room = room;
+            state.render_capacity = capacity;
             drop(state);
             self.returned();
         }
@@ -1398,7 +1513,7 @@ mod fault_capacity_tests {
         let built = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
         assert!(usize::from(built.slot()) >= 8);
         // Without room it takes the killed pair released longest ago.
-        pool.note_build_room(false);
+        pool.note_build_room(false, cfg::RENDER_SLOTS - 1);
         let reused = pool.acquire_render(2, 1, None, u64::MAX, || Ok(())).unwrap();
         assert_eq!(reused.slot(), 7);
         assert_eq!(pool.state.lock().killed & (1u64 << 7), 0);
@@ -1582,6 +1697,110 @@ mod two_pair_tests {
         let first = state.acquire(1, 1).unwrap();
         assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 1);
         assert_eq!(state.acquire(1, 1), Some(first));
+    }
+
+    #[test]
+    fn sibling_claim_preserves_first_pair_capacity_for_open_queues() {
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        pool.note_build_room(true, 2);
+        let _q1 = pool.try_reserve_queue(2).unwrap();
+        let _q2 = pool.try_reserve_queue(2).unwrap();
+        // Two open queues and capacity for two pairs: neither an unowned slot
+        // nor a released pair may be claimed as a sibling.
+        {
+            let mut state = pool.state.lock();
+            state.owners[5] = 99;
+            state.released |= 1u64 << 5;
+        }
+        let l1 = pool.acquire_render(1, 2, None, u64::MAX, || Ok(())).unwrap();
+        assert_eq!(
+            pool.state.lock().owners.iter().filter(|id| **id == 1).count(),
+            1
+        );
+        // The second open queue still gets its guaranteed first pair.
+        let l2 = pool.acquire_render(2, 2, None, u64::MAX, || Ok(())).unwrap();
+        assert_ne!(l1.slot(), l2.slot());
+        assert_eq!(
+            pool.state.lock().owners.iter().filter(|id| **id == 2).count(),
+            1
+        );
+        drop(l1);
+        drop(l2);
+        // Once capacity exceeds open queues, a sibling is claimed from surplus.
+        pool.note_build_room(true, 3);
+        let l1_again = pool.acquire_render(1, 2, None, u64::MAX, || Ok(())).unwrap();
+        assert_eq!(
+            pool.state.lock().owners.iter().filter(|id| **id == 1).count(),
+            2
+        );
+        assert_eq!(pool.render_demand(0), 3);
+        drop(l1_again);
+    }
+
+    #[test]
+    fn queue_and_compute_admission_account_for_live_siblings() {
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        pool.note_build_room(true, 2);
+        let q1 = pool.try_reserve_queue(2).unwrap();
+        let l1 = pool.acquire_render(1, 2, None, u64::MAX, || Ok(())).unwrap();
+        assert_eq!(
+            pool.state.lock().owners.iter().filter(|id| **id == 1).count(),
+            2
+        );
+        assert_eq!(pool.render_demand(0), 2);
+        assert_eq!(pool.render_demand(1), 3);
+        // Live sibling occupies the second pair: a second queue is refused.
+        assert!(matches!(pool.try_reserve_queue(2), Err(ENOSPC)));
+        // Compute reservation observes demand including the live sibling.
+        let observed = pool
+            .reserve_compute_with_budget(|demand| Ok((demand, false, 2)))
+            .unwrap();
+        assert_eq!(observed, 2);
+        assert!(!pool.state.lock().build_room);
+        // Closing the sibling owner releases both pairs so a new queue fits.
+        drop(l1);
+        pool.release_owner(1);
+        drop(q1);
+        assert_eq!(pool.render_demand(0), 0);
+        let _q2 = pool.try_reserve_queue(2).unwrap();
+    }
+
+    #[test]
+    fn queue_admission_accounts_for_teardown_held_released_pairs() {
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        pool.note_build_room(true, 3);
+        let q1 = pool.try_reserve_queue(3).unwrap();
+        let l1 = pool.acquire_render(1, 2, None, u64::MAX, || Ok(())).unwrap();
+        // Owner 1 now holds a primary pair and a sibling (2 pairs).
+        assert_eq!(
+            pool.state.lock().owners.iter().filter(|id| **id == 1).count(),
+            2
+        );
+        // Simulate a third pair that was released but is still held for teardown.
+        let held_slot = (1..cfg::RENDER_SLOTS)
+            .find(|slot| pool.state.lock().owners[*slot] == 0)
+            .unwrap();
+        {
+            let mut state = pool.state.lock();
+            state.owners[held_slot] = 99;
+            state.released |= 1u64 << held_slot;
+            state.held |= 1u64 << held_slot;
+        }
+        assert_eq!(pool.render_demand(0), 3);
+        assert_eq!(pool.render_demand(1), 4);
+        // All 3 pairs are occupied (2 by owner 1 + 1 teardown-held): a second queue is refused.
+        assert!(matches!(pool.try_reserve_queue(3), Err(ENOSPC)));
+        // Compute reservation observes demand including the teardown-held pair.
+        let observed = pool
+            .reserve_compute_with_budget(|demand| Ok((demand, false, 3)))
+            .unwrap();
+        assert_eq!(observed, 3);
+        // Once teardown finishes and clears `held`, the released pair becomes reusable.
+        pool.state.lock().held &= !(1u64 << held_slot);
+        assert_eq!(pool.render_demand(0), 2);
+        let _q2 = pool.try_reserve_queue(3).unwrap();
+        drop(l1);
+        drop(q1);
     }
 }
 
