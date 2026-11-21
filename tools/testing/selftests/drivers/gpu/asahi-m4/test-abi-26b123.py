@@ -120,6 +120,9 @@ def expect_initdata(old_image):
             for at, value in ((0x38, 1), (0x9dc, 50), (0xe0c, 250)):
                 assert not any(after[at:at + 4]), f'GLOBALS +{at:#x}'
                 struct.pack_into('<I', after, at, value)
+            # The 26B123 idle power-off delay (25G83 0x9bc = 40), kept effectively off.
+            assert struct.unpack_from('<I', after, 0x9c0)[0] == 40, 'GLOBALS +0x9c0'
+            struct.pack_into('<I', after, 0x9c0, 0x1000_0000)
         for at, value in NEW_26B123.get(index, []):
             assert not any(after[at:at + 8]), f'object {index} +{at:#x}'
             struct.pack_into('<Q', after, at, value)
