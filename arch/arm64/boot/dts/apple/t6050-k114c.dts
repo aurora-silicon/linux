@@ -27,6 +27,30 @@
 /* The Neural Engine, started only after the boot loader's preload hand-off */
 #include "t6050-j714s-ane.dtsi"
 
+/*
+ * ANE_SYS's declared suppliers are the fabric domains: enabled here the way
+ * the J714s enables them (t6050-j714s.dts for fab8/fab0,
+ * t6050-j716c-isp.dtsi for fab9). Left disabled they never register a
+ * provider and the enabled ps_ane_sys defers forever, taking ane0 and its
+ * three DARTs with it.
+ */
+&ps_fab0_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab8_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab9_soc {
+	/delete-property/ power-domains;
+	apple,no-auto-pm;
+	apple,firmware-owned;
+	status = "okay";
+};
+
 / {
 	aliases {
 		/* kboot fills the N1's factory addresses from /chosen through these */
