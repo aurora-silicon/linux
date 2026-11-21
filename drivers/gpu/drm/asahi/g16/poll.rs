@@ -39,6 +39,12 @@ use super::regs::EngineState;
 use super::{params, Firmware, Shared, POLL_WORK};
 use crate::module_parameters;
 
+/// 26B123: where the firmware leaves a compute work's GPU start and end ticks, as macOS 27.2's
+/// compute work on the J773g shows (its timestamp records' +0x34 names work +0x7dc; the ticks
+/// land at +0x10 and +0x18 from there).
+const WORK_TICK_START: usize = 0x7ec;
+const WORK_TICK_END: usize = 0x7f4;
+
 impl_has_hr_timer! {
     impl HasHrTimer<Self> for Shared {
         mode: RelativeMode<Monotonic>, field: self.resnap
@@ -329,6 +335,21 @@ impl Firmware {
         o.r32(offset)
     }
 
+    /// A compute unit's GPU start and end ticks. 25G83 writes them into the unit's ITS pair.
+    /// The 26B123 firmware leaves that pair 0/0 and writes them into the work at
+    /// [`WORK_TICK_START`]/[`WORK_TICK_END`]. The ITS pair is used whenever it holds an interval.
+    fn compute_ticks(&self, unit: &super::slots::ComputeSlot) -> Result<(u64, u64)> {
+        let (start, end) = (unit.its.r64(0)?, unit.its.r64(8)?);
+        if (start != 0 && end > start)
+            || self.session.adt.layout.start != super::hw::Start::MacOs27_2
+        {
+            return Ok((start, end));
+        }
+        let w = &unit.work;
+        let at = |o: usize| -> Result<u64> { Ok(w.r32(o)? as u64 | (w.r32(o + 4)? as u64) << 32) };
+        Ok((at(WORK_TICK_START)?, at(WORK_TICK_END)?))
+    }
+
     /// Exact M4 queue and submit-pipe proof for one serialized publication. Event
     /// notifications are wakeups; neither an event nor elapsed time releases an owner.
     pub(crate) fn queue_receipt(
@@ -435,8 +456,7 @@ impl Firmware {
             let k = f.claims.slot[0] as usize;
             let unit = f.job.resources.compute_unit(k)?;
             let submitted = unit.counter.r64(0)?;
-            let start = unit.its.r64(0)?;
-            let end = unit.its.r64(8)?;
+            let (start, end) = self.compute_ticks(unit)?;
             let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
             full &= stamp_reached(stamp, f.target, e.target)
                 && (stamp != f.target
@@ -456,8 +476,7 @@ impl Firmware {
             let k = f.claims.slot[0] as usize;
             let unit = f.job.resources.compute_unit(k)?;
             let submitted = unit.counter.r64(0)?;
-            let start = unit.its.r64(0)?;
-            let end = unit.its.r64(8)?;
+            let (start, end) = self.compute_ticks(unit)?;
             full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
                 && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot
                 && submitted != 0
