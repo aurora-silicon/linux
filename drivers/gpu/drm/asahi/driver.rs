@@ -627,15 +627,8 @@ impl AsahiPlatformDriver {
                 Ok(Some(_))
             )
         });
-        // Identification only: always the G17 path's PROBE, whatever profile the loader
-        // published, so the 25G76 path below (which starts its firmware) is never reached.
-        let probe_only = module_parameters::m5_probe_only.value() != 0;
-        if probe_only {
-            dev_info!(pdev.as_ref(), "M5: m5_probe_only set, identifying the GPU only\n");
-        }
-        if !has_25g76 || probe_only {
-            let cfg = hw::t8142::select();
-            return Self::probe_g17(pdev, regs::G17Resources::new(pdev)?, cfg);
+        if !has_25g76 {
+            return Self::probe_g17(pdev, regs::G17Resources::new(pdev)?, &hw::t8142::CONFIG);
         }
         // SAFETY: The M5 UAT has 42 output bits.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)? };
