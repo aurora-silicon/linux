@@ -34,6 +34,8 @@ struct apple_radio_sleep {
 	struct apple_pcie_port *port;
 	struct apple_dart_sleep dart;
 	struct apple_radio_function fn[2];
+	/* Each function's SID, in RID order, from the host's apple,managed-sids */
+	unsigned int sid[2];
 	struct task_struct *owner;
 	u64 generation;
 	enum apple_radio_phase phase;
@@ -255,10 +257,10 @@ static int apple_radio_snapshot(struct apple_radio_sleep *s, bool verify)
 	}
 	for (i = 0; i < ARRAY_SIZE(s->fn); i++) {
 		expected = 0;
-		if (apple_pcie_managed_word(pcie->managed_sids, 0x100 + i, 1 + i, &expected) ||
-		    s->rid[1 + i] != expected)
-			return apple_radio_snapshot_error(s, "rid-admission", 1 + i, s->rid[1 + i],
-							  expected);
+		if (apple_pcie_managed_word(pcie->managed_sids, 0x100 + i, s->sid[i], &expected) ||
+		    s->rid[s->sid[i]] != expected)
+			return apple_radio_snapshot_error(s, "rid-admission", s->sid[i],
+							  s->rid[s->sid[i]], expected);
 	}
 	for (i = 0; i < pcie->nvecs; i++) {
 		value = apple_pcie_port_readl(port, pcie->hw->port_msimap + 4 * i);
@@ -689,7 +691,7 @@ static int apple_radio_bind(struct platform_device *pdev, struct apple_radio_sle
 		if (ret)
 			break;
 		if (map[i].np != s->dart.provider->of_node || map[i].args_count != 1 ||
-		    map[i].args[0] != 1 + i) {
+		    map[i].args[0] != s->sid[i]) {
 			ret = -EINVAL;
 			break;
 		}
@@ -709,9 +711,17 @@ static void apple_radio_register(struct platform_device *pdev, struct apple_pcie
 
 	if (!pcie->managed_sids)
 		return;
+	/*
+	 * A T8132 host whose apple,managed-sids names the radio's two functions,
+	 * with port 0 and its PHY glue as its one port, and the MSI routing the
+	 * transaction restores. The bind checks the endpoints and the host's
+	 * iommu-map against the same SIDs. The firmware suspend itself has run
+	 * only on the J713, so it stays there until another T8132 host has a
+	 * deep-sleep row.
+	 */
 	if (!of_machine_is_compatible("apple,j713") ||
 	    !of_device_is_compatible(pcie->dev->of_node, "apple,t8132-pcie") ||
-	    pcie->managed_sids != (BIT(1) | BIT(2)) || pcie->piodma_supplier ||
+	    hweight16(pcie->managed_sids) != ARRAY_SIZE(s->sid) || pcie->piodma_supplier ||
 	    !list_is_singular(&pcie->ports) || pcie->nvecs != 32 || !pcie->hw->port_msiaddr_hi ||
 	    !pcie->hw->port_msimap)
 		return;
@@ -719,6 +729,8 @@ static void apple_radio_register(struct platform_device *pdev, struct apple_pcie
 	if (!s)
 		return;
 	s->pcie = pcie;
+	s->sid[0] = __ffs(pcie->managed_sids);
+	s->sid[1] = __fls(pcie->managed_sids);
 	s->port = list_first_entry(&pcie->ports, struct apple_pcie_port, entry);
 	if (s->port->idx || !s->port->phy || s->port->sid_map_sz != 16)
 		return;

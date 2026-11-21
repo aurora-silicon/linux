@@ -5748,12 +5748,14 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		u32 ids[15];
 		int count = of_property_count_u32_elems(dev->of_node, "apple,managed-sids");
 
+		/*
+		 * The node names the managed SIDs. The radio's bind checks
+		 * them against each function's iommu-map entry and IDs.
+		 */
 		if (!of_device_is_compatible(dev->of_node, "apple,t8132-pcie") ||
-		    !apple_t8132_managed_radio() || count <= 0 || count > 15)
+		    count <= 0 || count > 15)
 			return -EINVAL;
 		ret = of_property_read_u32_array(dev->of_node, "apple,managed-sids", ids, count);
-		if (!ret && (count != 2 || ids[0] != 1 || ids[1] != 2))
-			ret = -EINVAL;
 		if (!ret)
 			ret = apple_pcie_managed_sid_mask(ids, count, &pcie->managed_sids);
 		if (ret)
