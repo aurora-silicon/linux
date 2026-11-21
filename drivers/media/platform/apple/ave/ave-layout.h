@@ -381,6 +381,12 @@ struct ave_fw_layout {
 	u8 max_sessions;
 	u32 codec_state_bytes[2];
 	bool counted;
+	/*
+	 * A counted layout normally runs only 30 fps sessions with B-frames
+	 * (H.264 Baseline and intra-only aside). Set where the firmware build
+	 * has been shown to encode without B-frames and at other rates too.
+	 */
+	bool any_gop;
 };
 
 extern const struct ave_fw_abi ave_abi_9003, ave_abi_6070;

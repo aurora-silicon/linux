@@ -554,6 +554,7 @@ const struct ave_fw_layout ave_layout_26b123 = {
 	.name = "26B123",
 	.bytes = { { 0x3b40, 0x6e08 }, { 0x13ee0, 0x78c8 } },
 	AVE_LAYOUT_26A428_FIELDS
+	.any_gop = true,
 };
 
 /*
