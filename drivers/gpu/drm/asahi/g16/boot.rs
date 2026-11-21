@@ -75,7 +75,7 @@ pub(crate) mod glue {
         kernel::error::to_result(unsafe { asahi_g16_display_prepare(dev.as_raw().cast()) })
     }
 
-    /// The firmware DVFS row count qualified for this board, or zero.
+    /// The firmware DVFS row count qualified for this board.
     pub(crate) fn perf_rows() -> usize {
         // SAFETY: Reads the machine compatible strings only.
         unsafe { asahi_g16_perf_rows() as usize }
@@ -553,7 +553,11 @@ pub(crate) fn admit(
     res: shared_regs::G16Resources,
 ) -> Result<Admitted> {
     let dev = pdev.as_ref();
-    if !glue::board() {
+    // The board check guards the PMP AGX vote, which only the 25G83 start sends. A firmware
+    // whose handoff names the start without the vote (26B123) rests on the firmware identity
+    // checks below instead.
+    let votes = !matches!(adt::layout(dev), Some(layout) if layout.start == hw::Start::MacOs27_2);
+    if votes && !glue::board() {
         return Err(ENODEV);
     }
     // Retain the PMP supplier (and its AGX bridge) before any vote.
