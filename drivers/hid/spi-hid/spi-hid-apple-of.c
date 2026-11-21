@@ -138,6 +138,7 @@ static struct spi_driver spihid_apple_of_driver = {
 		.name	= "spi-hid-apple-of",
 		.pm	= &spihid_apple_core_pm,
 		.of_match_table = of_match_ptr(spihid_apple_of_match),
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 
 	.id_table	= spihid_apple_of_id,
