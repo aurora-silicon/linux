@@ -1,28 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Module 1134 diagnostic controls kept for its module-parameter interface.
+//! Module 1134 items still read by the G18 backend: the `g17p_host_path`
+//! WORD_STORES bit (`fw::store`), the `g17p_diag_knobs` FRG +0x222d bit
+//! (`fw::render_params`) and the G17P SKSM scratch geometry
+//! (`fw::submission`).
 
-#[allow(dead_code)]
-pub(crate) mod dep_stats;
-#[allow(dead_code)]
-pub(crate) mod dvfs_parity;
-#[allow(dead_code)]
-pub(crate) mod e2e;
-#[allow(dead_code)]
-pub(crate) mod gem_stats;
-#[allow(dead_code)]
 pub(crate) mod host_path;
-#[allow(dead_code)]
-pub(crate) mod mem_path;
-#[allow(dead_code)]
-pub(crate) mod queue_slots;
-#[allow(dead_code)]
-pub(crate) mod recovery_isolation;
-#[allow(dead_code)]
-pub(crate) mod recovery_path;
-#[allow(dead_code)]
-pub(crate) mod stackwatch;
-#[allow(dead_code)]
 pub(crate) mod timing_buffer;
 #[allow(dead_code)]
 pub(crate) mod g17p;
