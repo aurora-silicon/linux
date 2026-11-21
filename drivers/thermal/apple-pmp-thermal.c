@@ -43,6 +43,16 @@
 /* Inside the cooling slope window (50-250 ms); used while cool and idle. */
 #define APPLE_PMP_SLOW_POLL_MS		100
 #define APPLE_PMP_GOVERNOR_NS	100000000ULL
+/*
+ * On the 27.2 firmware a cool, idle J713 keeps every sensor dark much longer than
+ * APPLE_PMP_GATED_HOLD_NS (13.3 s the longest of 53 spans in 120 s sampled at
+ * 100 ms, 86% of samples dark). Dark clusters are powered down, so ride a span out
+ * this long as well, but only while the SMC's measured CPU and GPU rails, read no
+ * longer ago than the stale limit, add up to less than an idle SoC draws.
+ */
+#define APPLE_PMP_GATED_IDLE_HOLD_NS	30000000000ULL
+#define APPLE_PMP_IDLE_RAILS_MW		500
+#define APPLE_PMP_IDLE_RAILS_STALE_NS	1500000000ULL
 
 struct apple_pmp_cluster {
 	struct cpufreq_policy *policy;
@@ -61,6 +71,9 @@ static struct {
 	struct delayed_work power_work;
 	struct device *power_hwmon;
 	unsigned int rail_mw[3];
+	/* The last successful SMC rail read, whatever the sensors said, and when. */
+	unsigned int idle_rail_mw;
+	u64 idle_rail_ns;
 	int power_error;
 	u64 gpu_epoch;
 	bool power_polling;
@@ -226,6 +239,10 @@ static void apple_pmp_power_work(struct work_struct *work)
 	 */
 	mutex_lock(&pmp_thermal.lock);
 	now = ktime_get_ns();
+	if (!ret) {
+		pmp_thermal.idle_rail_mw = mw[0] + mw[1] + mw[2];
+		pmp_thermal.idle_rail_ns = now;
+	}
 	if (!ret && (!pmp_thermal.enabled || pmp_thermal.cached_error ||
 		     now - pmp_thermal.cooling.last_ns > 500000000ULL))
 		ret = -EAGAIN;
@@ -397,6 +414,14 @@ static int apple_pmp_guard(unsigned int level)
 	return err;
 }
 
+/* Called with the lock held: did the SMC just see an idle SoC? */
+static bool apple_pmp_rails_idle(u64 now)
+{
+	return pmp_thermal.idle_rail_ns && now >= pmp_thermal.idle_rail_ns &&
+	       now - pmp_thermal.idle_rail_ns < APPLE_PMP_IDLE_RAILS_STALE_NS &&
+	       pmp_thermal.idle_rail_mw < APPLE_PMP_IDLE_RAILS_MW;
+}
+
 static int apple_pmp_sample(void)
 {
 	struct apple_pmp_snapshot snapshot;
@@ -415,8 +440,10 @@ static int apple_pmp_sample(void)
 		pmp_thermal.valid_ns = snapshot.finished_ns;
 		pmp_thermal.valid_mc = value;
 	} else if (ret == -ENODATA && pmp_thermal.valid_ns &&
-		   snapshot.finished_ns - pmp_thermal.valid_ns < APPLE_PMP_GATED_HOLD_NS &&
-		   pmp_thermal.valid_mc < APPLE_PMP_GATED_HOLD_MC) {
+		   pmp_thermal.valid_mc < APPLE_PMP_GATED_HOLD_MC &&
+		   (snapshot.finished_ns - pmp_thermal.valid_ns < APPLE_PMP_GATED_HOLD_NS ||
+		    (snapshot.finished_ns - pmp_thermal.valid_ns < APPLE_PMP_GATED_IDLE_HOLD_NS &&
+		     apple_pmp_rails_idle(snapshot.finished_ns)))) {
 		value = pmp_thermal.valid_mc;
 		ret = 0;
 	}
