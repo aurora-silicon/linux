@@ -563,6 +563,8 @@ static int dcp_v26_callback(void *cookie, u32 tag,
 	if ((tag == D(2) && SHAPE(0, 0)) || (tag == D(592) && SHAPE(20, 0)))
 		return 0;
 	if (tag == D(572) && SHAPE(4, 4)) {
+		if (v26->dcp)
+			dcp_s2r_dart_power(v26->dcp, get_unaligned_le32(in));
 		memset(out, 0, 4);
 		return 0;
 	}
