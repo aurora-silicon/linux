@@ -4,14 +4,16 @@
 //!
 //! Order of one pass, under the device lock: drain the receive rings; authenticate recovery;
 //! retire flights using stage stamps, NC queue READ/WRITE and submit-pipe frontiers, normal
-//! notifier/UMA receipts and internal timestamps; renew the progress deadline. Up to four
-//! trailing 5 us polls follow an EP 0x20 event. Then answer PB
-//! growth ([`Firmware::answer_growth`]); check hangs and recover ([`Firmware::check_hangs`],
-//! which calls [`Firmware::progress`]); publish ([`Firmware::publish`]). Then drop the lock
-//! and complete the retired jobs ([`super::job::complete_all`]). Wakeups: the EP 0x20 event
-//! kick, then an hrtimer re-poll every `g16_resnap_us` (100) while anything is published, or
-//! `g16_repoll_us` (15) while a ready prefix waits for record consumption, with a 1-jiffy
-//! delayed-work backup.
+//! notifier/UMA receipts and internal timestamps; renew the progress deadline; answer PB
+//! growth ([`Firmware::answer_growth`]); publish ([`Firmware::publish_checked`]). Then drop
+//! the lock and complete retired jobs ([`super::job::complete_all`]) before periodic 1 ms
+//! housekeeping (`session.check`, `objects.health`, `service_power`, administrative hang
+//! checks). If an EP 0x20 event arrived with flights outstanding and nothing retired yet, up
+//! to [`EVENT_RETIRE_POLLS`] trailing 5 us waits run with `Shared::state` dropped so concurrent
+//! submissions are not blocked, stopping as soon as any flight retires. Wakeups: the EP 0x20
+//! event kick, then an hrtimer re-poll every `g16_resnap_us` (100) while anything is
+//! published, or `g16_repoll_us` (15) while a ready prefix waits for record consumption or a
+//! post-event receipt tail did not settle, with a 1-jiffy delayed-work backup.
 
 use core::sync::atomic::Ordering;
 
@@ -81,18 +83,36 @@ impl Shared {
             return;
         }
         let signalling = kernel::dma_fence::SignallingGuard::new();
-        let mut done = Completions::new();
-        {
-            let mut state = self.state.lock();
+        let mut evented = false;
+        let mut tail = 0u32;
+        let mut housekeeping_deferred = false;
+        let mut step = 0u32;
+
+        loop {
             if self.sleeping.load(Ordering::Acquire) {
-                return;
+                break;
             }
-            if let Some(firmware) = state.as_deref_mut() {
+            let mut done = Completions::new();
+            let mut retry_tail = false;
+            if let Some(firmware) = self.state.lock().as_deref_mut() {
+                if self.sleeping.load(Ordering::Acquire) {
+                    return;
+                }
                 if firmware.engine.shared.is_none() {
                     firmware.engine.shared = Some(self.clone());
                 }
-                let evented = self.evented.swap(false, Ordering::AcqRel);
-                match firmware.poll(evented, &mut done) {
+                if step == 0 {
+                    evented = self.evented.swap(false, Ordering::AcqRel);
+                    tail = if evented { EVENT_RETIRE_POLLS } else { 0 };
+                }
+                match firmware.poll_step(
+                    evented,
+                    tail,
+                    &mut retry_tail,
+                    &mut housekeeping_deferred,
+                    &mut done,
+                ) {
+                    Ok(true) if retry_tail => {}
                     Ok(true) => {
                         self.rearm(firmware.engine.chan_wait || firmware.engine.short_repoll)
                     }
@@ -115,8 +135,30 @@ impl Shared {
                     }
                 }
             }
+            job::complete_all(done);
+            if !retry_tail {
+                break;
+            }
+            tail -= 1;
+            step += 1;
+            delay::udelay(Delta::from_micros(5));
         }
-        job::complete_all(done);
+
+        if housekeeping_deferred && !self.sleeping.load(Ordering::Acquire) {
+            let mut done = Completions::new();
+            if let Some(firmware) = self.state.lock().as_deref_mut() {
+                if !self.sleeping.load(Ordering::Acquire) {
+                    if let Err(error) = firmware.run_housekeeping(&mut done) {
+                        self.cancel_resnap();
+                        firmware.fail_stop(error, &mut done);
+                        self.fail_stop(error);
+                    } else if firmware.recovery.needs_repoll() || firmware.engine.frozen {
+                        self.rearm(false);
+                    }
+                }
+            }
+            job::complete_all(done);
+        }
         drop(signalling);
         self.notify_wedged();
     }
@@ -300,29 +342,41 @@ pub(crate) fn ring_passed(c: u32, b: u32, h: u32, t: u32, m: u32) -> bool {
 }
 
 impl Firmware {
-    /// One poll pass under the device lock. Returns whether to re-arm the poll timers.
-    pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<bool> {
+    /// One non-sleeping poll step under the device lock.
+    ///
+    /// Retires finished flights and publishes ready work before periodic 1 ms housekeeping so
+    /// completion fences wake userspace promptly. When an EP 0x20 event arrived with flights
+    /// outstanding and nothing retired yet, sets `*retry_tail` so [`Shared::run_poll`] drops
+    /// `Shared::state` across the 5 us receipt-tail delay instead of holding the device lock.
+    pub(crate) fn poll_step(
+        &mut self,
+        evented: bool,
+        tail: u32,
+        retry_tail: &mut bool,
+        housekeeping_deferred: &mut bool,
+        done: &mut Completions,
+    ) -> Result<bool> {
         if self.recovery.failed().is_some() {
             return Ok(false);
         }
         self.engine.short_repoll = false;
         self.session.transport()?;
         let now = now_ns();
-        let housekeeping = self.engine.flights.is_empty()
-            || now.wrapping_sub(self.last_housekeeping_ns) >= HOUSEKEEPING_NS;
-        if housekeeping {
-            self.session.check()?;
-            self.objects.health()?;
-            self.service_power()?;
-            self.last_housekeeping_ns = now;
-        }
+        let housekeeping_due = now.wrapping_sub(self.last_housekeeping_ns) >= HOUSEKEEPING_NS;
+        let had_flights = !self.engine.flights.is_empty();
+        let mut ran_housekeeping = false;
         // With nothing published only a pending firmware recovery notification needs this
         // pass: one that arrived after its prefix's receipts is answered
         // here (the firmware halted and waits for the resume) instead of being taken for a
         // failure of the next prefix. Drain the receive rings before deciding, published or
         // not, so the error count is current and idle log/trace/stats traffic is consumed. With
         // prefixes published the retirement loop below drains first.
-        if self.engine.flights.is_empty() {
+        if !had_flights {
+            self.session.check()?;
+            self.objects.health()?;
+            self.service_power()?;
+            self.last_housekeeping_ns = now;
+            ran_housekeeping = true;
             self.drain_rings()?;
             if self.recovery_idle()? && self.engine.pending.is_empty() {
                 return Ok(false);
@@ -330,10 +384,10 @@ impl Firmware {
         }
         let mut lap = Lap::start();
         let start = lap.on().then(now_ns);
-        self.retire(evented, done)?;
+        let retired_any = self.retire_once(done)?;
         lap.lap(&mut self.engine.prof.retire_ns);
         self.answer_growth()?;
-        if housekeeping || self.recovery.receipt_fault || self.recovery_pending()? {
+        if self.recovery.receipt_fault || self.recovery_pending()? {
             self.check_hangs(done)?;
         }
         let published = if self.engine.pending.is_empty() {
@@ -352,49 +406,82 @@ impl Firmware {
             self.engine.prof.poll_ns += now_ns().wrapping_sub(start);
         }
         published?;
-        // If an EP 0x20 event arrived and a flight still did not finish its final receipt
-        // within the trailing spin, repoll at `repoll_us` instead of sleeping `resnap_us`.
-        self.engine.short_repoll = evented && !self.engine.flights.is_empty();
+        // After an EP 0x20 event, retry up to `EVENT_RETIRE_POLLS` times (outside the device
+        // lock) only while no flight has retired yet and flights remain in flight. Once any
+        // flight retires, stop spinning so deeper queues do not burn 50 us per interrupt.
+        if evented
+            && had_flights
+            && !retired_any
+            && tail != 0
+            && !self.engine.flights.is_empty()
+            && !self.recovery.receipt_fault
+            && !self.engine.frozen
+            && self.recovery.failed().is_none()
+        {
+            *retry_tail = true;
+            return Ok(true);
+        }
+        if !ran_housekeeping && housekeeping_due {
+            if !done.is_empty() {
+                *housekeeping_deferred = true;
+            } else {
+                self.run_housekeeping(done)?;
+            }
+        }
+        // If an EP 0x20 event arrived with flights outstanding and nothing retired within the
+        // trailing polls, repoll at `repoll_us` instead of sleeping `resnap_us`.
+        self.engine.short_repoll =
+            evented && had_flights && !retired_any && !self.engine.flights.is_empty();
         Ok(!self.engine.flights.is_empty()
             || self.engine.chan_wait
             || self.recovery.needs_repoll()
             || self.engine.frozen)
     }
 
-    /// Drains the rings and retires finished flights, with up to [`EVENT_RETIRE_POLLS`]
-    /// trailing 5 us polls after an event. A receipt fault is left in
-    /// `Recovery::receipt_fault` for the hang checks.
-    pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result {
-        // After an event, short trailing polls catch firmware's final WC receipt writes
-        // before falling back to a timer repoll.
-        let mut tail = if evented { EVENT_RETIRE_POLLS } else { 0 };
-        let mut ret;
+    /// Periodic 1 ms housekeeping (session/object health, power governor, administrative hang
+    /// checks), run after retired completion fences have been signalled when work retired.
+    pub(crate) fn run_housekeeping(&mut self, done: &mut Completions) -> Result {
+        if self.recovery.failed().is_some() {
+            return Ok(());
+        }
+        self.session.transport()?;
+        self.session.check()?;
+        self.objects.health()?;
+        self.service_power()?;
+        self.last_housekeeping_ns = now_ns();
+        if !self.engine.flights.is_empty()
+            || self.recovery.receipt_fault
+            || self.recovery_pending()?
+        {
+            self.check_hangs(done)?;
+        }
+        Ok(())
+    }
 
-        loop {
-            let mut lap = Lap::start();
-            self.drain_rings()?;
-            lap.lap(&mut self.engine.prof.drain_ns);
-            // Recovery may force stage progress: authenticate it before any receipt.
-            if self.recovery.receipt_fault || self.recovery_pending()? {
-                self.check_hangs(done)?;
-            }
-            ret = self.retired();
-            while let Ok(receipt) = ret {
-                if !receipt.complete() {
-                    break;
-                }
-                let outcome = self.retire_outcome(receipt);
-                self.retire_oldest(receipt, outcome, done);
-                ret = self.retired();
-            }
-            if ret.is_err() || tail == 0 || self.engine.flights.is_empty() {
+    /// Drains the rings and retires all currently complete flights without sleeping. Returns
+    /// whether at least one flight retired. A receipt fault is left in
+    /// `Recovery::receipt_fault` for the hang checks.
+    pub(crate) fn retire_once(&mut self, done: &mut Completions) -> Result<bool> {
+        let mut lap = Lap::start();
+        self.drain_rings()?;
+        lap.lap(&mut self.engine.prof.drain_ns);
+        // Recovery may force stage progress: authenticate it before any receipt.
+        if self.recovery.receipt_fault || self.recovery_pending()? {
+            self.check_hangs(done)?;
+        }
+        let mut retired_any = false;
+        let mut ret = self.retired();
+        while let Ok(receipt) = ret {
+            if !receipt.complete() {
                 break;
             }
-            tail -= 1;
-            delay::udelay(Delta::from_micros(5));
+            let outcome = self.retire_outcome(receipt);
+            self.retire_oldest(receipt, outcome, done);
+            retired_any = true;
+            ret = self.retired();
         }
         self.recovery.receipt_fault = ret.is_err();
-        Ok(())
+        Ok(retired_any)
     }
 
     #[allow(dead_code)]

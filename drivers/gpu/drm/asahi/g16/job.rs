@@ -433,6 +433,10 @@ impl Completions {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
     /// Queues the first completion of `job`; subsequent attempts have no effect.
     pub(crate) fn push(&mut self, job: &Arc<Job>, result: Result) {
         {
