@@ -101,6 +101,15 @@
 };
 
 
+/*
+ * The ADT's pmgr ap-wake-sources. Disabled with the T6030 sleep profile, which is untested;
+ * a test boot sets status = "okay" here.
+ */
+&t6030_sleep {
+	apple,wake-enable = <3 51 74 83 87 88 89 90 91 92 93 94 104 111 113 132 133 147 159
+			     169 185 190 214>;
+};
+
 &i2c4 {
 	sd_card_control: card-control@20 {
 		compatible = "apple,t6030-sd-card-control", "apple,sd-card-control";
