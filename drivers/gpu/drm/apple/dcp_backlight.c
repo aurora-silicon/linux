@@ -269,7 +269,24 @@ static int dcp_get_brightness(struct backlight_device *bd)
 		return actual;
 	}
 
-	return dcp->brightness.nits;
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	actual = dcp_bl_presented_actual(&dcp->brightness.presented,
+					 READ_ONCE(dcp->brightness.nits));
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return actual;
+}
+
+/*
+ * A present set the panel to @nits, outside the policy: every one that
+ * carries a level, and the power-off present, which carries 0.
+ */
+void dcp_backlight_presented(struct apple_dcp *dcp, u32 nits)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	dcp_bl_presented_set(&dcp->brightness.presented, nits);
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 }
 
 int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,

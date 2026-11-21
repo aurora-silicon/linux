@@ -198,6 +198,25 @@ int main(void)
     assert(!dcp_bl_dpms(&s,false) && dcp_bl_effective(&s)==0);
     assert(!dcp_bl_dpms(&s,true) && dcp_bl_effective(&s)==450);
     assert(!dcp_bl_resend(&s));
+    /*
+     * DAC firmware: the report stays 0 after a display power cycle while the
+     * panel is lit again (J414s, 13.5). Boot and resume end at the same level.
+     */
+    {
+        struct dcp_bl_presented boot={0}, resume={0};
+        assert(dcp_bl_presented_actual(&boot,140)==140);
+        dcp_bl_presented_set(&boot,500);
+        dcp_bl_presented_set(&boot,0);
+        assert(dcp_bl_presented_actual(&boot,0)==0);
+        dcp_bl_presented_set(&boot,500);
+        assert(dcp_bl_presented_actual(&boot,0)==500);
+        dcp_bl_presented_set(&resume,500);
+        dcp_bl_presented_set(&resume,0);
+        dcp_bl_presented_set(&resume,0);
+        assert(dcp_bl_presented_actual(&resume,0)==0);
+        dcp_bl_presented_set(&resume,500);
+        assert(dcp_bl_presented_actual(&resume,500)==dcp_bl_presented_actual(&boot,0));
+    }
     return 0;
 }
 '''
