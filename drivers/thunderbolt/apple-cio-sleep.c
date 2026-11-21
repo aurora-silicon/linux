@@ -522,16 +522,25 @@ static int apple_nhi_cio_prepare(struct apple_nhi *anhi)
 		goto release_phy;
 	scoped_guard(mutex, &acio->pcie_tunnel_lock)
 		pcie = apple_cio_find_pcie_tunnel(acio);
-	if (!pcie) {
+	/*
+	 * A partner with no PCIe tunnel (a host-to-host cable, a USB4 device that tunnels
+	 * only USB or DisplayPort) leaves the router nothing to stop behind it. T6050's
+	 * sleep has only run with a dock's tunnel: it still refuses without one.
+	 */
+	if (!pcie && anhi->cio_t6050) {
 		ret = -ENODEV;
 		goto release_dart;
 	}
-	ret = apple_pcie_tunnel_cio_prepare(&pcie->dev);
-	if (ret) {
-		put_device(&pcie->dev);
-		goto release_dart;
+	if (pcie) {
+		ret = apple_pcie_tunnel_cio_prepare(&pcie->dev);
+		if (ret) {
+			put_device(&pcie->dev);
+			goto release_dart;
+		}
+	} else {
+		dev_info(anhi->dev, "CIO sleep with no PCIe tunnel behind the router\n");
 	}
-	anhi->cio_pcie = &pcie->dev;
+	anhi->cio_pcie = pcie ? &pcie->dev : NULL;
 	anhi->cio_prepared = true;
 	anhi->cio_pd_suspended = 0;
 	anhi->cio_rtk_off = false;
@@ -662,14 +671,16 @@ static int apple_nhi_cio_wake(struct apple_nhi *anhi)
 	ret = tb_cio_wake(anhi->tb, &pci_lost);
 	if (!ret && pci_lost) {
 		dev_warn(anhi->dev, "CIO dock lost during sleep; retiring its tunnels\n");
-		apple_pcie_tunnel_cio_lost(anhi->cio_pcie);
+		if (anhi->cio_pcie)
+			apple_pcie_tunnel_cio_lost(anhi->cio_pcie);
 	}
 	if (ret || !anhi->cio_t6050)
 		return ret;
 	peer = apple_nhi_cio_peer(anhi);
 	if (!peer) {
 		/* Also with no PCIe tunnel among the lost ones: the port waits for no link. */
-		apple_pcie_tunnel_cio_lost(anhi->cio_pcie);
+		if (anhi->cio_pcie)
+			apple_pcie_tunnel_cio_lost(anhi->cio_pcie);
 		phy = apple_nhi_cio_phy(anhi, CIO_PHY_LOST);
 	}
 	dev_info(anhi->dev, "T6050 sleep: router woken in %lld ms: firmware lane init action %d (5 = its wake from the sleep, 0 = a cold start), \"Waking up from sleep\" %s, retimer register 12 answered %d, timed out %d; dock %s\n",
@@ -1039,7 +1050,7 @@ static int apple_nhi_cio_suspend(struct apple_nhi *anhi)
 
 	if (anhi->cio_t6050)
 		return apple_nhi_cio_suspend_t6050(anhi);
-	if (!apple_pcie_tunnel_cio_stopped(anhi->cio_pcie))
+	if (anhi->cio_pcie && !apple_pcie_tunnel_cio_stopped(anhi->cio_pcie))
 		return -EBUSY;
 	dev_info(anhi->dev, "CIO save paths and routers\n");
 	ret = tb_cio_sleep(anhi->tb);
@@ -1112,7 +1123,7 @@ static void apple_nhi_cio_complete(struct apple_nhi *anhi)
 	if (!anhi->cio_prepared)
 		return;
 	if (anhi->cio_t6050) {
-		int pcie = apple_pcie_tunnel_cio_finish(anhi->cio_pcie);
+		int pcie = anhi->cio_pcie ? apple_pcie_tunnel_cio_finish(anhi->cio_pcie) : 0;
 		int dart = apple_dart_cio_finish(anhi->cio_dart);
 		int phy = apple_nhi_cio_phy(anhi, CIO_PHY_FINISH);
 
@@ -1122,7 +1133,7 @@ static void apple_nhi_cio_complete(struct apple_nhi *anhi)
 				pcie, dart, phy);
 		ret = 0;
 	} else {
-		ret = apple_pcie_tunnel_cio_finish(anhi->cio_pcie) ?:
+		ret = (anhi->cio_pcie ? apple_pcie_tunnel_cio_finish(anhi->cio_pcie) : 0) ?:
 		      apple_dart_cio_finish(anhi->cio_dart) ?:
 		      apple_nhi_cio_phy(anhi, CIO_PHY_FINISH);
 	}
