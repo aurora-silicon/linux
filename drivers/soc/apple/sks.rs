@@ -407,10 +407,7 @@ impl SepData {
     /// designate uses struct version 0; the other profile uses its own
     /// variant.
     fn sks_designate_variant(&self) -> u32 {
-        match self.profile.key_store {
-            profile::KeyStore::Sepos13 { .. } => crate::sks::SKS_DESIGNATE_VERSION_13,
-            profile::KeyStore::Variant5 => crate::sks::SKS_DESIGNATE_VARIANT,
-        }
+        designate_variant(self.profile.key_store)
     }
 
     /// `0x0d` designate, which makes the system key bag. On 13.5 the body is:
@@ -1467,6 +1464,16 @@ const OP_SKS_DESIGNATE_KEYBAG: u8 = 0x0d;
 pub(crate) const SKS_DESIGNATE_VARIANT: u32 = 1;
 static_assert!(SKS_DESIGNATE_VARIANT == 1);
 pub(crate) const SKS_DESIGNATE_VERSION_13: u32 = 0;
+
+/// The designate request's leading variant on `key_store`: `0` on the 13.5
+/// key store, which ends the body after the empty blob, and `1` on variant 5,
+/// which adds the flags word.
+pub(crate) fn designate_variant(key_store: profile::KeyStore) -> u32 {
+    match key_store {
+        profile::KeyStore::Sepos13 { .. } => SKS_DESIGNATE_VERSION_13,
+        profile::KeyStore::Variant5 => SKS_DESIGNATE_VARIANT,
+    }
+}
 
 pub(crate) const SKS_DESIGNATE_USER_MIN: i32 = 10;
 static_assert!(SKS_DESIGNATE_USER_MIN > 0);
