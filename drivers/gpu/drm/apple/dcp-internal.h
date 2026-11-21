@@ -332,6 +332,8 @@ struct apple_dcp_hw_data {
 	 */
 	bool s2r;
 	bool s2r_ext;
+	/* An external display processor (a dcpext block), not the internal display's */
+	bool external_processor;
 	/* The firmware crashes on any mode but the 120 Hz boot timing, see dcp_mode_settable(). */
 	bool only_120hz_modes;
 	/* A firmware 27 sleep in progress, and how it ended */
