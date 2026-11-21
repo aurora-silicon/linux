@@ -1607,6 +1607,8 @@
 
 	multi-touch {
 		apple,power-method = <2>;
+		apple,palm-classes;
+		apple,palm-tool-major = <2200>;
 	};
 
 	keyboard: keyboard {

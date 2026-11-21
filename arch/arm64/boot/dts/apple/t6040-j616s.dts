@@ -87,6 +87,8 @@
 
 &mtp_mt {
 	firmware-name = "apple/tpmtfw-j616s.bin";
+	/* Fingers reach a tool area of 2475 here: palms by class only. */
+	apple,palm-classes;
 };
 
 /*
