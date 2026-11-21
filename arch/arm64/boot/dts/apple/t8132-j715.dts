@@ -21,6 +21,15 @@
 	model = "Apple MacBook Air (15-inch, M4, 2025)";
 
 	/*
+	 * Without U-Boot (stage 1 -> aura -> Linux), iBoot leaves the
+	 * J715's MTP stopped, as on the J604, so the loader programs its DART
+	 * filter as for a halted consumer and Linux cold-starts it.
+	 */
+	chosen {
+		linux-enablement-mac,dapf-halted-handoff = "/arm-io/mtp";
+	};
+
+	/*
 	 * The AOP firmware runs the stream (MCA cluster 0, one serializer for
 	 * the six amps); macaudio's J715 variant links the AOP audio
 	 * component's speaker back-end (DAI 3) to them. The codecs are listed in
@@ -72,7 +81,21 @@
 	model = "MacBook Air J715 Jack";
 };
 
+/*
+ * The cold-started MTP runs on DART stream 0, as on the J604, instead of
+ * the stream 1 the J713's running MTP is handed over on.
+ */
+&mtp_dart {
+	apple,remap-streams = <1 0>, <2 0>, <3 0>;
+};
+
+&mtp {
+	iommus = <&mtp_dart 0>;
+};
+
 &mtp_hid {
+	iommus = <&mtp_dart 0>;
+
 	multi-touch {
 		firmware-name = "apple/tpmtfw-j715.bin";
 	};
