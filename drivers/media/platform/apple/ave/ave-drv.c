@@ -136,6 +136,30 @@ static const struct ave_variant ave_t8122 = {
 	.boot_qualified = true,
 };
 
+/*
+ * The M4 (T8132) with the macOS 27.2 (26B123) stub: the bootloader preloads
+ * TEXT 0x154000 and DATA 0x12c000, TEXT CRC 99fc929a with the per-boot word
+ * at 0x4224 zeroed. Some loaders leave that word zero (the MacBook Air, J713),
+ * others set it on every boot (the Mac mini, J773g, raw CRC f641c64b), so an
+ * unknown CRC is retried with it zeroed. The coprocessor and its start are
+ * the M4 Pro's; this build boots as device 23 and takes handshake type 23.
+ */
+const struct ave_variant ave_t8132 = {
+	.regs = &ave_coproc_v40,
+	.fw_text_size = 0x154000,
+	.fw_data_size = 0x12c000,
+	.boot_device_id = 23,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1,
+	.vcbar_mask = U64_MAX,
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
+	.device_type = 23,
+	.lfs_ref_scale = 2,
+	.text_crc = AVE_FW_TEXT_CRC_T8132_26B123,
+	.text_boot_word = 0x4224,
+	.boot_qualified = true,
+};
+
 static const struct ave_variant ave_t8140 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x14c000,
@@ -187,10 +211,10 @@ static const struct ave_variant ave_t6050 = {
 
 /*
  * The M5 (T8142) with the macOS 27.0 stub runs the 26A428 build of the
- * firmware compiled for its chip (AppleAVE2FW_H17G, 9013.45.1, the version
+ * firmware compiled for its chip (9013.45.1, the version
  * T6050 runs): TEXT 0x154000 and DATA 0x12c000, TEXT CRC 8a3784bd.
  *
- * The chip identity comes from AppleAVE2's soc-id table (ADT ave soc-id
+ * The chip identity comes from the ADT (ave soc-id
  * "t8142"): device 27, generation 16. The 26A428 firmware carries the same
  * device table, and on T6050 (device 28 in both) the traced boot
  * configuration and handshake both name that number. Generation 16 shares
@@ -666,6 +690,7 @@ static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6050-ave", .data = &ave_t6050 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
 	{ .compatible = "apple,t8122-ave", .data = &ave_t8122 },
+	{ .compatible = "apple,t8132-ave", .data = &ave_t8132 },
 	{ .compatible = "apple,t8140-ave", .data = &ave_t8140 },
 	{ .compatible = "apple,t8142-ave", .data = &ave_t8142 },
 	{}

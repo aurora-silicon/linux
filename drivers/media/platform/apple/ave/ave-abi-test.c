@@ -1509,6 +1509,10 @@ static void ave_t6041_text_boot_word(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, off, 0x4224U);
 	KUNIT_EXPECT_EQ(test, ave_t6041.fw_data_size_alt, 0x130000U);
 	KUNIT_EXPECT_EQ(test, ave_t6041.text_link_cell, 0U);
+	/* The M4 27.2 build: the same word, set per boot by some loaders. */
+	KUNIT_EXPECT_EQ(test, ave_t8132.text_boot_word, off);
+	KUNIT_EXPECT_EQ(test, ave_t8132.text_crc, AVE_FW_TEXT_CRC_T8132_26B123);
+	KUNIT_EXPECT_EQ(test, ave_t8132.text_link_cell, 0U);
 	for (u32 i = 0; i < size; i++)
 		text[i] = i * 7 + 3;
 	memset(text + off, 0, 4);
