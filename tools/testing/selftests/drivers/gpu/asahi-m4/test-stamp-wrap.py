@@ -136,6 +136,37 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
         assert_eq!(f.retired(),Ok(Retirement::Pending));
     }
 }
+#[test]fn queued_render_flight_retires_on_passed_receipts_in_order(){
+    for n in [0x7fffff,0x800000,0xffffff,0x1000000,0x1000001]{
+        let mut f=firmware(true,n);
+        let mut later=firmware(true,n+1).engine.flights.remove(0);
+        later.uma_submitted=4;
+        f.engine.flights.push(later);
+        f.engine.ta_target=encode::stamp(n+1);
+        f.engine.fs_target=encode::stamp(n+1);
+        // The render behind it finished too: shared TA/FS stamps and notifier moved on.
+        for stage in 0..2 { f.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(n+1))); }
+        f.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(n+1)));
+        f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(n+1)));
+        f.graph.render.notifier.set(notifier::CONTEXT,9);
+        f.graph.render.notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,9);
+        f.engine.flights[0].job.resources.pools.completed=4;
+        assert_eq!(f.retired(),Ok(Retirement::Full));
+        // Unreached FS stamp keeps it pending.
+        f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(n-1)));
+        assert_eq!(f.retired(),Ok(Retirement::Pending));
+        f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(n)));
+        assert_eq!(f.retired(),Ok(Retirement::Full));
+        // Unreached UMA completion keeps it pending.
+        f.engine.flights[0].job.resources.pools.completed=1;
+        assert_eq!(f.retired(),Ok(Retirement::Pending));
+        f.engine.flights[0].job.resources.pools.completed=2;
+        assert_eq!(f.retired(),Ok(Retirement::Full));
+        // Unpassed TA/FS queue keeps it pending.
+        f.queue_passed=false;
+        assert_eq!(f.retired(),Ok(Retirement::Pending));
+    }
+}
 #[test]fn changing_packed_receipt_remains_pending_and_stable_retry_can_retire(){
     let mut f=firmware(false,1);f.engine.flights[0].job.resources.compute[0].its.unstable=true;
     assert_eq!(f.retired(),Ok(Retirement::Pending));

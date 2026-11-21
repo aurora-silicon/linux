@@ -113,13 +113,12 @@ impl Order {
     /// Cross-engine historical dependencies end at the named prefix, even while later
     /// commands in that older submission remain pending.
     pub(crate) fn ready(&self, completed: [u64; 2], published: [u64; 2]) -> bool {
-        // Same-engine compute order and barriers are kept by the firmware compute queue,
-        // which finishes each command before it starts the next: its published frontier
-        // suffices. Renders, and every cross-engine dependency, need the completed one.
+        // Same-engine order and barriers are kept by the firmware engine rings (in-order
+        // CDM execution for compute, explicit TA/FS barriers for pipelined renders): the
+        // same-engine published frontier suffices. Every cross-engine dependency still waits
+        // for the other engine's completed frontier.
         let mut frontier = completed;
-        if self.engine == COMPUTE {
-            frontier[COMPUTE] = published[COMPUTE].max(completed[COMPUTE]);
-        }
+        frontier[self.engine] = published[self.engine].max(completed[self.engine]);
         frontier[self.engine].checked_add(1) == Some(self.sequence)
             && self
                 .wait_through

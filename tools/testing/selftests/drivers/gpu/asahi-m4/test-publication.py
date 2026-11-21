@@ -39,7 +39,7 @@ impl Progress {
     fn count(&self)->u32{self.count}
     fn set_pending(&self,v:bool){self.pending.store(v,Ordering::Relaxed)}
 }
-struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}}
+struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}fn render_passes(&self)->Result<usize>{Ok(8)}}
 struct Job { id:u32,vm:Vm,queue:Queue,progress:Progress,commands:Vec<Command>,dependency:Result,terminal_marked:AtomicBool,resources:Resources }
 impl Job {
     fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}
@@ -66,8 +66,14 @@ impl Slots{
     fn compute_exhausted(&self)->bool{self.compute_exhausted}
     fn render_exhausted(&self)->bool{self.render_exhausted}
     fn compute_exhausted_within(&self,_units:usize)->bool{self.compute_exhausted}
+    fn render_exhausted_within(&self,_passes:usize)->bool{self.render_exhausted}
     fn release(&mut self,_claims:&mut Claims){self.releases+=1;}
     fn quarantine(&mut self,_claims:&mut Claims){self.quarantines+=1;}
+}
+struct Pools{exhausted:bool,exhausted_vm:Option<u32>}
+impl Pools{
+    fn exhausted(&self)->bool{self.exhausted}
+    fn exhausted_for(&self,vm:&Vm)->bool{self.exhausted_vm==Some(vm.slot)}
 }
 mod encode {
     pub struct ComputeRefs{pub invalid:bool}
@@ -111,7 +117,7 @@ struct Stage{result:Result,visible:bool}
 #[derive(Default)]struct Power{work:Vec<bool>}
 impl Power{fn report_work(&mut self,in_flight:bool){self.work.push(in_flight);}}
 struct Firmware{
-    session:Session,objects:Checks,recovery:Recovery,engine:Engine,slots:Slots,power:Power,
+    session:Session,objects:Checks,recovery:Recovery,engine:Engine,slots:Slots,pools:Pools,power:Power,
     unavailable:Vec<(usize,Error)>,stages:VecDeque<Stage>,retained:Vec<u32>,attempted:Vec<u32>,fail_stops:u32,
 }
 impl Firmware {
@@ -155,7 +161,7 @@ fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
 fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     Firmware{session:Session{shared:Shared{sleeping:AtomicBool::new(false)}},objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
         engine:Engine{ordinal:0,draw:0,pending:jobs,flights:vec![],frozen:false,turn:0,stats:Stats::default(),chan_wait:false},
-        slots:Slots{compute_exhausted:false,render_exhausted:false,releases:0,quarantines:0},power:Power::default(),
+        slots:Slots{compute_exhausted:false,render_exhausted:false,releases:0,quarantines:0},pools:Pools{exhausted:false,exhausted_vm:None},power:Power::default(),
         unavailable:vec![],stages:stages.into_iter().map(|(result,visible)|Stage{result,visible}).collect(),
         retained:vec![],attempted:vec![],fail_stops:0}
 }
@@ -185,6 +191,21 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     #[test]fn exhausted_render_class_still_allows_compute(){
         let mut f=firmware(vec![job(1,true,0,Ok(())),job(2,false,0,Ok(()))],vec![(Ok(()),true)]);f.slots.render_exhausted=true;
         let mut done=vec![];assert_eq!(f.publish(&mut done),Ok(()));assert_eq!(done,[(1,Err(ECANCELED))]);assert_eq!(f.attempted,[2]);assert_eq!(f.fail_stops,0);
+    }
+    #[test]fn exhausted_render_pools_cancels_render_and_allows_compute(){
+        let mut f=firmware(vec![job(1,true,0,Ok(())),job(2,false,0,Ok(()))],vec![(Ok(()),true)]);f.pools.exhausted=true;
+        let mut done=vec![];assert_eq!(f.publish(&mut done),Ok(()));assert_eq!(done,[(1,Err(ECANCELED))]);
+        assert_eq!(f.unavailable,[(command::RENDER,EIO)]);assert_eq!(f.attempted,[2]);assert_eq!(f.fail_stops,0);
+    }
+    #[test]fn per_vm_exhausted_render_pools_cancels_only_blocked_vm_without_stalling_compute(){
+        let mut f=firmware(vec![job(1,true,0,Ok(())),job(2,false,0,Ok(()))],vec![(Ok(()),true)]);
+        f.pools.exhausted_vm=Some(1);
+        let mut done=vec![];assert_eq!(f.publish(&mut done),Ok(()));
+        assert_eq!(done,[(1,Err(ECANCELED))]);
+        assert!(f.unavailable.is_empty());
+        assert!(!f.engine.chan_wait);
+        assert_eq!(f.recovery.publication_wait_deadline,None);
+        assert_eq!(f.attempted,[2]);assert_eq!(f.fail_stops,0);
     }
     #[test]fn logical_u64_overflow_is_explicit_and_class_local(){
         let mut f=firmware(vec![job(1,false,0,Ok(())),job(2,true,0,Ok(()))],vec![(Ok(()),true)]);
@@ -239,16 +260,26 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
 }
 struct QueueBehindJob{id:u32,vm:Arc<Vm>,progress:Progress,commands:Vec<Command>,dependency:Result,resources:Resources}
 impl QueueBehindJob{fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}}
-struct QueueBehindFlight{job:Arc<QueueBehindJob>,renders:u32,doomed:bool,recovery_suspect:bool}
-struct QueueBehindEngine{ordinal:u64,flights:Vec<QueueBehindFlight>}
-struct QueueBehindSlots{exhausted:bool,available:bool}
-impl QueueBehindSlots{fn compute_exhausted(&self)->bool{self.exhausted}fn compute_available(&self,_n:usize)->bool{self.available}}
-struct QueueBehindHost{engine:QueueBehindEngine,slots:QueueBehindSlots}
+struct QueueBehindFlight{job:Arc<QueueBehindJob>,computes:u32,renders:u32,initbm:bool,doomed:bool,recovery_suspect:bool}
+struct QueueBehindEngine{ordinal:u64,draw:u64,flights:Vec<QueueBehindFlight>}
+struct QueueBehindSlots{compute_exhausted:bool,render_exhausted:bool,compute_available:bool,pass_available:bool}
+impl QueueBehindSlots{
+    fn compute_exhausted(&self)->bool{self.compute_exhausted}
+    fn render_exhausted(&self)->bool{self.render_exhausted}
+    fn compute_available(&self,_n:usize)->bool{self.compute_available}
+    fn pass_available(&self,_n:usize)->bool{self.pass_available}
+}
+struct QueueBehindPools{exhausted:bool,can_pipeline:bool}
+impl QueueBehindPools{
+    fn exhausted(&self)->bool{self.exhausted}
+    fn can_pipeline(&self,_vm:&Arc<Vm>)->bool{self.can_pipeline}
+}
+struct QueueBehindHost{engine:QueueBehindEngine,slots:QueueBehindSlots,pools:QueueBehindPools}
 mod queue_behind_scope {
     use super::*;
     type Job = QueueBehindJob;
     fn command(job:&Job,k:u32)->Option<&Command>{job.commands.get(k as usize)}
-    mod params { pub fn compute_flights()->usize{16} }
+    mod params { pub fn compute_flights()->usize{16} pub fn render_flights()->usize{7} }
     impl QueueBehindHost {
         __CAN_QUEUE_BEHIND__
     }
@@ -265,8 +296,9 @@ mod queue_behind_scope {
         let j_other_vm=mk(3,vm2.clone(),false);
         let j_render=mk(4,vm1.clone(),true);
         let mut p=QueueBehindHost{
-            engine:QueueBehindEngine{ordinal:1,flights:vec![QueueBehindFlight{job:j1,renders:0,doomed:false,recovery_suspect:false}]},
-            slots:QueueBehindSlots{exhausted:false,available:true},
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:j1,computes:1,renders:0,initbm:false,doomed:false,recovery_suspect:false}]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
         assert!(p.can_queue_behind(&j2));
         assert!(!p.can_queue_behind(&j_other_vm));
@@ -277,8 +309,40 @@ mod queue_behind_scope {
         p.engine.flights[0].renders=1;
         assert!(!p.can_queue_behind(&j2));
         p.engine.flights[0].renders=0;
-        p.slots.available=false;
+        p.slots.compute_available=false;
         assert!(!p.can_queue_behind(&j2));
+    }
+    #[test]fn render_queues_behind_same_vm_and_blocks_initbm_cross_vm_or_compute(){
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let vm2=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:2});
+        let mk=|id:u32,vm:Arc<Vm>,render:bool|Arc::new(QueueBehindJob{
+            id,vm,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![if render{Command::Render(())}else{Command::Compute(())}],
+            dependency:Ok(()),resources:Resources,
+        });
+        let r1=mk(1,vm1.clone(),true);
+        let r2=mk(2,vm1.clone(),true);
+        let r_other_vm=mk(3,vm2.clone(),true);
+        let c1=mk(4,vm1.clone(),false);
+        let mut p=QueueBehindHost{
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:r1,computes:0,renders:1,initbm:false,doomed:false,recovery_suspect:false}]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+        };
+        assert!(p.can_queue_behind(&r2));
+        assert!(!p.can_queue_behind(&r_other_vm));
+        assert!(!p.can_queue_behind(&c1));
+        p.engine.flights[0].initbm=true;
+        assert!(!p.can_queue_behind(&r2));
+        p.engine.flights[0].initbm=false;
+        p.pools.can_pipeline=false;
+        assert!(!p.can_queue_behind(&r2));
+        p.pools.can_pipeline=true;
+        p.slots.pass_available=false;
+        assert!(!p.can_queue_behind(&r2));
+        p.slots.pass_available=true;
+        p.engine.flights[0].recovery_suspect=true;
+        assert!(!p.can_queue_behind(&r2));
     }
 }
 '''
@@ -307,7 +371,7 @@ for command in [rustc() + ['--edition=2021', '--test', str(unit), '-o', str(outp
     if result.returncode:
         raise SystemExit(result.returncode)
 (output/'publication.json').write_text(json.dumps({
-    'passed': True, 'tests': 21, 'cpu_only': True, 'hardware_execution': False,
+    'passed': True, 'tests': 23, 'cpu_only': True, 'hardware_execution': False,
     'scope': 'Verbatim production publication wrapper, selection, error isolation and descriptor-error containment branch; wire encoder, descriptor failure injection and transport replaced by CPU recorders.',
     'source_sha256': sha(production),
 }, indent=2)+'\n')

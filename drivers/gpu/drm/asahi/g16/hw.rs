@@ -690,10 +690,9 @@ pub(crate) mod sizes {
     pub(crate) const PB_BLOCKS: u32 = 2048;
     pub(crate) const PB_LIST_RECORDS: u32 = 4096;
     pub(crate) const PB_GROW_STEP: u32 = 10;
-    /// Published prefixes at most. A render is published only with nothing else in flight;
-    /// compute commands may queue behind each other on the one firmware compute queue, each
-    /// in its own retained unit ([`COMPUTE_UNITS`]).
-    pub(crate) const FLIGHTS: usize = 16;
+    /// Published prefixes at most. Same-VM compute or render commands may pipeline behind
+    /// each other on their engine rings while cross-VM and cross-engine transitions drain.
+    pub(crate) const FLIGHTS: usize = 32;
     /// Retained compute units per VM at most; each unit owns its own hardware UMA slot
     /// (`COMPUTE_UMA_SLOT + index`). A unit is reused only after a later publication retired
     /// (it displaced the unit), so `n` units keep up to `n - 1` compute commands in flight.
@@ -701,11 +700,12 @@ pub(crate) mod sizes {
     const _: () = assert!(super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP);
     /// Inherited diagnostic histogram width; M4 does not fold jobs into a compute horizon.
     pub(crate) const HORIZON_JOBS: u32 = 1;
-    /// Jobs admitted to the engine per logical queue: enough to keep a queue's compute
-    /// commands in flight back to back; exact prior-command dependencies still gate each one.
-    pub(crate) const SCHEDULER_CREDITS: u32 = 16;
+    /// Jobs admitted to the engine per logical queue: enough to keep a queue's commands
+    /// in flight back to back without scheduler backpressure stalls; exact prior-command
+    /// dependencies still gate each one.
+    pub(crate) const SCHEDULER_CREDITS: u32 = 32;
     /// Unconsumed records per 256-entry channel ring a prefix may be posted behind.
-    pub(crate) const AHEAD_RECORDS: u32 = 64;
+    pub(crate) const AHEAD_RECORDS: u32 = 128;
     /// Policy bound on logical queues reported in QUEUE_LIMITS (not a firmware limit).
     pub(crate) const MAX_QUEUES: u32 = 58;
     /// TTBAT user slots: user VMs hold one each for their lifetime (ASIDs 1..63).

@@ -704,6 +704,7 @@ impl Slots {
         resources: &super::resources::Prepared,
         k: usize,
         vm_id: Option<u64>,
+        tilemap_bytes: u64,
     ) -> Result {
         let n = resources.render_passes()?.min(sizes::RENDER_SLOTS);
         if k >= n || !self.render.lifetime.claim(k) {
@@ -717,10 +718,19 @@ impl Slots {
             });
         let p = resources.render_pass(k)?;
         let (tpc_dirty, tilemap_dirty) = resources.render_pass_dirty(k)?;
+        // On clean same-VM reuse, zero only the overlap with the current pass's tilemap so a
+        // small render never scrubs leftover bytes from an earlier large render; preserve the
+        // high-water mark in `tilemap_dirty` for cross-VM or recovery full scrubs.
+        let prev_tilemap = tilemap_dirty.load(Ordering::Relaxed);
+        let clear_tilemap = if full {
+            prev_tilemap
+        } else {
+            prev_tilemap.min(tilemap_bytes)
+        };
         if let Err(e) = p.scrub(
             1,
             tpc_dirty.load(Ordering::Relaxed),
-            tilemap_dirty.load(Ordering::Relaxed),
+            clear_tilemap,
             full,
             &mut self.stats,
         ) {
@@ -729,8 +739,8 @@ impl Slots {
         }
         if full {
             tpc_dirty.store(0, Ordering::Relaxed);
+            tilemap_dirty.store(0, Ordering::Relaxed);
         }
-        tilemap_dirty.store(0, Ordering::Relaxed);
         self.pass_cursor = ((k + 1) % n) as u32;
         Ok(())
     }

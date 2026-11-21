@@ -131,11 +131,7 @@ impl Shared {
             firmware.engine.shared = Some(self.clone());
         }
         let accepted = firmware.enqueue(job);
-        // Nothing is published while a render is in flight: the poll pass after its
-        // retirement publishes this job. Skipping the pass here keeps queued submissions
-        // from holding the device lock (ring drains, health checks) on that path.
-        let render_busy = firmware.engine.flights.iter().any(|f| f.renders != 0);
-        if accepted.is_ok() && !render_busy && !self.sleeping.load(Ordering::Acquire) {
+        if accepted.is_ok() && !self.sleeping.load(Ordering::Acquire) {
             let now = now_ns();
             let full = now.wrapping_sub(firmware.last_housekeeping_ns) >= HOUSEKEEPING_NS
                 || self.evented.load(Ordering::Acquire)
@@ -472,9 +468,9 @@ impl Firmware {
         Ok(true)
     }
 
-    /// In-order receipt of compute flight `f` with later flights queued behind it: the NC
-    /// READ cursor (and with uncached queue info its consumers) passed its ring entries,
-    /// and the submit pipe's read and completion cursors passed its record.
+    /// In-order receipt of flight `f` with later flights queued behind it: the NC READ cursor
+    /// (and with uncached queue info its consumers) passed its ring entries, and the submit
+    /// pipe's read and completion cursors passed its record.
     fn queue_passed(
         &self,
         channel: Channel,
@@ -483,22 +479,25 @@ impl Firmware {
         f: &Flight,
     ) -> Result<bool> {
         let cap = super::hw::sizes::QUEUE_CAP;
-        let tail = self.engine.head;
-        if f.head >= cap || f.c_start >= cap || tail >= cap {
+        let (start, head, tail, record) = match channel {
+            Channel::Compute => (f.c_start, f.head, self.engine.head, f.rec[2]),
+            Channel::Ta => (f.ta_start, f.ta_head, self.engine.ta_head, f.rec[0]),
+            Channel::Fs => (f.fs_start, f.fs_head, self.engine.fs_head, f.rec[1]),
+        };
+        if head >= cap || start >= cap || tail >= cap {
             return Err(EINVAL);
         }
-        if !ring_passed(state.r32(qstate::READ)?, f.c_start, f.head, tail, cap) {
+        if !ring_passed(state.r32(qstate::READ)?, start, head, tail, cap) {
             return Ok(false);
         }
         if !super::hw::tuning::FW_CACHED {
             for offset in [0x20, 0x24, 0x28] {
-                if !ring_passed(info.r32(offset)?, f.c_start, f.head, tail, cap) {
+                if !ring_passed(info.r32(offset)?, start, head, tail, cap) {
                     return Ok(false);
                 }
             }
         }
         let slots = super::fw::channels::RING_SLOTS;
-        let record = f.rec[2];
         let first = (record + slots - 1) % slots;
         let producer = self.channels.producer(channel);
         let pipe = self.channels.channel(channel);
@@ -568,7 +567,43 @@ impl Firmware {
                 && start != 0
                 && end > start;
         }
-        if f.renders != 0 {
+        if f.renders != 0 && behind {
+            let g = &self.graph.render;
+            let e = &self.engine;
+            if !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target)
+                || !stamp_reached(g.fw_stamp[1].r32(0)?, f.fs_target, e.fs_target)
+                || !self.queue_passed(Channel::Ta, &g.qstate[0], &g.qinfo[0], f)?
+                || !self.queue_passed(Channel::Fs, &g.qstate[1], &g.qinfo[1], f)?
+            {
+                return Ok(Retirement::Pending);
+            }
+            let k = f.claims.pass[0] as usize;
+            let a = f.pb_slot as usize;
+            let unit = f.job.resources.render_pass(k)?;
+            let ta_start = unit.scene.r64(0x600)?;
+            let ta_end = unit.scene.r64(0x608)?;
+            let fs_start = unit.scene.r64(0x620)?;
+            let fs_end = unit.scene.r64(0x628)?;
+            let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
+            let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
+            full &= stamp_reached(ta_stamp, f.ta_target, e.ta_target)
+                && (ta_stamp != f.ta_target
+                    || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot)
+                && stamp_reached(fs_stamp, f.fs_target, e.fs_target)
+                && (fs_stamp != f.fs_target
+                    || g.notifier
+                        .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
+                        == f.job.vm.slot)
+                && f.job
+                    .resources
+                    .render()?
+                    .pools
+                    .retired_at(a, f.uma_submitted)?
+                && ta_start != 0
+                && ta_end > ta_start
+                && fs_start != 0
+                && fs_end > fs_start;
+        } else if f.renders != 0 {
             let g = &self.graph.render;
             if g.fw_stamp[0].r32(0)? != f.ta_target
                 || g.fw_stamp[1].r32(0)? != f.fs_target

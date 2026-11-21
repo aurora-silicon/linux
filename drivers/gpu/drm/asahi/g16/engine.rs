@@ -956,38 +956,55 @@ impl Firmware {
         result
     }
 
-    /// Whether `job`'s next command may be published behind the flights in flight: it is a
-    /// healthy compute command whose dependencies are met, every flight is a healthy
-    /// compute-only prefix of the same VM, and the compute depth is below
-    /// [`params::compute_flights`]. Renders, another VM's commands and every failure path
-    /// need an empty engine: under several clients, compute queued behind another VM's
-    /// lost its writes and stalled the firmware compute queue.
+    /// Whether `job`'s next command may be published behind the flights in flight:
     ///
-    /// Timed compute commands pipeline freely: each flight owns a private `ComputeSlot`
-    /// (`its`/`work`) and `retire_oldest` publishes timestamps in FIFO publication order
-    /// before signalling the flight's fence.
+    /// - Compute queues behind healthy same-VM compute flights (up to
+    ///   [`params::compute_flights`]), each in its own `ComputeSlot` (`its`/`work`).
+    /// - Render queues behind healthy same-VM non-InitBM render flights (up to
+    ///   [`params::render_flights`]), rotating `PassSlot` (`0..RENDER_SLOTS`) while sharing the
+    ///   active exposed PB/UMA allocator slot (`Pools::can_pipeline`). Hardware barriers on the
+    ///   TA/FS rings preserve exact prior-render ordering (or TA/FS overlap for fragment-only
+    ///   barriers).
+    /// - Cross-VM switches, cross-engine transitions, InitBM priming renders, and every failure
+    ///   or recovery path still drain the engine first.
     fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
         let e = &self.engine;
-        if e.flights.len() >= params::compute_flights()
+        if job.vm.status.get() != 0
             || e.flights.iter().any(|f| {
-                f.renders != 0
-                    || f.doomed
-                    || f.recovery_suspect
-                    || !Arc::ptr_eq(&f.job.vm, &job.vm)
+                f.doomed || f.recovery_suspect || !Arc::ptr_eq(&f.job.vm, &job.vm)
             })
-            || job.vm.status.get() != 0
-            || self.slots.compute_exhausted()
-            || super::recovery::logic::next_ordinal(e.ordinal).is_none()
-            || !job
-                .resources
-                .compute_units()
-                .is_ok_and(|units| self.slots.compute_available(units))
         {
             return false;
         }
         let sent = job.progress.sent();
-        matches!(command(job, sent), Some(Command::Compute(_)))
-            && job.check_command_dependencies(sent).is_ok()
+        if job.check_command_dependencies(sent).is_err() {
+            return false;
+        }
+        match command(job, sent) {
+            Some(Command::Compute(_)) => {
+                e.flights.len() < params::compute_flights()
+                    && e.flights.iter().all(|f| f.renders == 0)
+                    && !self.slots.compute_exhausted()
+                    && super::recovery::logic::next_ordinal(e.ordinal).is_some()
+                    && job
+                        .resources
+                        .compute_units()
+                        .is_ok_and(|units| self.slots.compute_available(units))
+            }
+            Some(Command::Render(_)) => {
+                e.flights.len() < params::render_flights()
+                    && e.flights.iter().all(|f| f.computes == 0 && !f.initbm)
+                    && !self.slots.render_exhausted()
+                    && !self.pools.exhausted()
+                    && super::recovery::logic::next_ordinal(e.draw).is_some()
+                    && self.pools.can_pipeline(&job.vm)
+                    && job
+                        .resources
+                        .render_passes()
+                        .is_ok_and(|passes| self.slots.pass_available(passes))
+            }
+            None => false,
+        }
     }
 
     /// Whether some of `job`'s commands were published: such a job is retained after a
@@ -1498,9 +1515,10 @@ impl Firmware {
         let alloc_slot = self.pools.pick_slot(&job.vm, behind).ok_or(EAGAIN)?;
         let draw = super::recovery::logic::next_ordinal(pf.draw).ok_or(EOVERFLOW)?;
         let target = encode::stamp(draw);
+        let tilemap_bytes = Geometry::new(&cmd.cmd, 0).tilemap_bytes;
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
         self.slots
-            .claim_pass_in(&job.resources, k, Some(job.vm.id))?;
+            .claim_pass_in(&job.resources, k, Some(job.vm.id), tilemap_bytes)?;
         self.slots.hold_vm(&f.claims, &job.vm)?;
         self.slots.hold_arenas(&f.claims, &job.resources);
         let (refs, init_buffer, epoch, binding) = self.render_refs(alloc_slot, job, draw, behind)?;
@@ -1572,8 +1590,50 @@ impl Firmware {
             r.ring[0].w64(8 * pf.ta_head as usize, epoch.initbm.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
         }
-        // Every previous command has its complete receipt before this publication.
-        // The paired fragment still requires the native explicit TA dependency.
+        // When pipelining behind an in-flight same-VM render, insert explicit hardware ordering
+        // barriers on the TA/FS rings. Fragment-only or barrier-free renders overlap TA(N) with
+        // FS(N-1) (TA waits on prior TA; FS waits on prior FS then own TA); otherwise TA(N)
+        // waits on prior FS to preserve full vertex-stage visibility.
+        let frag_only = cmd.cmd.flags
+            & kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS
+            != 0;
+        let no_render_barrier = job
+            .command_order(job.progress.sent())
+            .is_some_and(|o| o.wait_through[super::command::RENDER].is_none());
+        let early = behind && params::early_tiling() && (frag_only || no_render_barrier);
+        if behind {
+            let (wait_va, wait_stamp, wait_event) = if early {
+                (r.fw_stamp[0].va, self.engine.ta_target, 0x70)
+            } else {
+                (r.fw_stamp[1].va, self.engine.fs_target, 0x71)
+            };
+            let prev = encode::barrier(
+                wait_va,
+                wait_stamp,
+                wait_event,
+                target,
+                work::barrier::RENDER_WAIT_UUID,
+                BarrierType::Hold,
+            );
+            p.prev_barrier.write(0, &prev)?;
+            r.ring[0].w64(8 * pf.ta_head as usize, p.prev_barrier.va)?;
+            pf.ta_head = (pf.ta_head + 1) % cap;
+            if early {
+                let dep = encode::barrier(
+                    r.fw_stamp[1].va,
+                    self.engine.fs_target,
+                    0x71,
+                    target,
+                    work::barrier::RENDER_WAIT_UUID,
+                    BarrierType::Hold,
+                );
+                p.fs_dep.write(0, &dep)?;
+                r.ring[1].w64(8 * pf.fs_head as usize, p.fs_dep.va)?;
+                pf.fs_head = (pf.fs_head + 1) % cap;
+                self.engine.stats.early += 1;
+            }
+        }
+        // The paired fragment always requires the native explicit TA dependency.
         let own = encode::barrier(
             r.fw_stamp[0].va,
             target,

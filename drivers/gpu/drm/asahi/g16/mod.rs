@@ -191,6 +191,10 @@ impl platform::Driver for Driver {
 const POLL_WORK: u64 = 0;
 /// Work item ID of the submitter-pinned fast event poll work.
 const FAST_POLL_WORK: u64 = 1;
+/// Capacity hint for `drm_syncobj_wait` during active submit bursts (mirroring G17's wait hint).
+const WAIT_UTIL_MIN: u32 = 512;
+const WAIT_HINT_MS: u32 = 8;
+const WAIT_HINT_ACTIVE_NS: u64 = 50_000_000;
 
 /// Device state shared with the RTKit callbacks and the poll work.
 #[pin_data]
@@ -208,6 +212,10 @@ pub(crate) struct Shared {
     pub(crate) evented: AtomicBool,
     /// CPU that last submitted work, for placing the per-CPU completion worker.
     pub(crate) submitter: AtomicU32,
+    /// Monotonic timestamp (ns) of the previous submit, for active-burst wait hints.
+    pub(crate) last_submit_ns: AtomicU64,
+    /// Whether the most recent submit continued an active burst within [`WAIT_HINT_ACTIVE_NS`].
+    pub(crate) wait_hint_active: AtomicBool,
     /// Next armed hrtimer expiry (monotonic ns, 0 when disarmed).
     pub(crate) resnap_deadline_ns: AtomicU64,
     /// Next 1-jiffy backup delayed-work schedule bound (monotonic ns).
@@ -280,10 +288,25 @@ impl WorkItem<FAST_POLL_WORK> for Shared {
 }
 
 impl Shared {
-    /// Records the submitting CPU so completion work runs on the same core.
+    /// Records the submitting CPU and burst cadence for completion placement and wait hints.
     pub(crate) fn note_submitter(&self) {
         self.submitter
             .store(kernel::cpu::CpuId::current().as_u32(), Ordering::Relaxed);
+        let now = engine::now_ns();
+        let prev = self.last_submit_ns.swap(now, Ordering::Relaxed);
+        self.wait_hint_active.store(
+            prev != 0 && now.wrapping_sub(prev) <= WAIT_HINT_ACTIVE_NS,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Temporary `drm_syncobj_wait` capacity hint while a client is submitting back to back.
+    pub(crate) fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
+        if cfg!(CONFIG_UCLAMP_TASK) && self.wait_hint_active.load(Ordering::Relaxed) {
+            Some((WAIT_UTIL_MIN, WAIT_HINT_MS))
+        } else {
+            None
+        }
     }
 
     /// Last recorded submitting CPU, if valid.
@@ -438,6 +461,8 @@ impl Gpu {
                 crashed: AtomicBool::new(false),
                 evented: AtomicBool::new(false),
                 submitter: AtomicU32::new(u32::MAX),
+                last_submit_ns: AtomicU64::new(0),
+                wait_hint_active: AtomicBool::new(false),
                 resnap_deadline_ns: AtomicU64::new(0),
                 backup_deadline_ns: AtomicU64::new(0),
                 error: AtomicI32::new(0),
@@ -590,6 +615,10 @@ impl Firmware {
 }
 
 impl gpu::Gpu for Gpu {
+    fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
+        self.shared.syncobj_wait_hint()
+    }
+
     fn max_cmdbuf_size(&self) -> usize {
         command::MAX_CMDBUF
     }

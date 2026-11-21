@@ -31,12 +31,16 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel::{
-    c_str, device,
+    c_str,
+    cpu::CpuId,
+    cpumask::Cpumask,
+    device,
     dma_fence::Fence,
     drm::sched,
     new_mutex,
     prelude::*,
     sync::{Arc, Mutex},
+    workqueue,
 };
 
 use super::{
@@ -303,6 +307,11 @@ impl Job {
         }
     }
 
+    /// Returns the immutable dependency order for command `index`.
+    pub(crate) fn command_order(&self, index: u32) -> Option<Order> {
+        self.orders.get(index as usize).copied()
+    }
+
     /// Checks the retained dependency set for each command immediately before publication.
     /// Never waits or signals fences under the device lock. The scheduler and start() have
     /// already waited; a pending fence asks the engine to defer rather than publish early.
@@ -516,13 +525,21 @@ pub(crate) struct Scheduler {
 
 impl Scheduler {
     pub(crate) fn new(dev: &device::Device) -> Result<Self> {
-        let scheduler = sched::Scheduler::new(
+        // Keep drm_sched run/free work in the creating CPU's cluster (matching g17/job.rs).
+        // Completion work still follows the per-submit submitter_cpu, not queue creation, and
+        // an unbound workqueue restricted via apply_workqueue_attrs() falls back to
+        // wq_unbound_cpumask if the cluster goes offline (failing soft if restrict() errors).
+        let submit = workqueue::OwnedQueue::new_ordered_reclaim(c_str!("aurora_g16"))?;
+        let _ = submit.restrict(Cpumask::cluster_of(CpuId::current()));
+        let scheduler = sched::Scheduler::new_with_queues(
             dev,
             1,
             hw::sizes::SCHEDULER_CREDITS,
             0,
             hw::tuning::SCHED_TIMEOUT_MS,
             c_str!("aurora_g16"),
+            Some(submit),
+            None,
         )?;
         // With one run queue, only the kernel priority is valid.
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;

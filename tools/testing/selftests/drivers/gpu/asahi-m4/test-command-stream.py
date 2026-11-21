@@ -358,14 +358,17 @@ fn historical_priors_enforce_entry_bounds() {
     assert_eq!(order.wait_through,[Some(5),Some(7)]);
     assert!(!order.ready([6,6],[6,6]));
     assert!(order.ready([6,7],[6,7]));
-    // A compute command may follow published compute predecessors (the firmware compute
-    // queue runs them in order); every cross-engine dependency still needs completion.
+    // Same-engine commands may follow published predecessors (ordered on the hardware
+    // engine rings); every cross-engine dependency still needs completion.
     let compute=Order::new([0,2],[0,0],[NONE,NONE],[0,2],COMPUTE).unwrap();
     assert!(!compute.ready([0,1],[0,1]));
     assert!(compute.ready([0,1],[0,2]));
     let render=Order::new([0,2],[0,0],[NONE,NONE],[0,2],RENDER).unwrap();
     assert!(!render.ready([0,1],[0,2]));
     assert!(render.ready([0,2],[0,2]));
+    let render_next=Order::new([2,0],[0,0],[NONE,NONE],[2,0],RENDER).unwrap();
+    assert!(!render_next.ready([1,0],[1,0]));
+    assert!(render_next.ready([1,0],[2,0]));
 }
 #[test]
 fn geometry_capacity_boundary_uses_the_real_encoder() {

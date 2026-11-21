@@ -45,7 +45,14 @@ pub(crate) fn compute_units() -> usize {
 
 /// Compute commands in flight at most.
 pub(crate) fn compute_flights() -> usize {
-    16usize.clamp(1, hw::sizes::FLIGHTS)
+    32usize.clamp(1, hw::sizes::FLIGHTS)
+}
+
+/// Render commands in flight at most (`RENDER_SLOTS - 1` so one slot holds displacement).
+pub(crate) fn render_flights() -> usize {
+    hw::sizes::RENDER_SLOTS
+        .saturating_sub(1)
+        .clamp(1, hw::sizes::FLIGHTS)
 }
 
 /// Repoll while a ready prefix waits for record consumption, us.
@@ -68,9 +75,9 @@ pub(crate) fn stream_gate() -> bool {
     module_parameters::g16_stream_gate.value() != 0
 }
 
-/// Fragment-only dependency publication has not been qualified on this backend.
+/// Fragment-only render barriers overlap a pipelined render's TA with the prior render's FS.
 pub(crate) fn early_tiling() -> bool {
-    false
+    true
 }
 
 /// Fills the generation part of GET_PARAMS group 0.
@@ -81,7 +88,8 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
         return Err(ENODEV);
     }
     params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
-        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS);
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS);
     params.gpu_generation = GPU_GENERATION;
     params.gpu_variant = gpu.cfg.gpu_variant as u32;
     params.gpu_revision = gpu.cfg.gpu_revision;
