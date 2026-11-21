@@ -52,6 +52,12 @@
 #define APPLE_PMP_GATED_IDLE_HOLD_NS	30000000000ULL
 #define APPLE_PMP_IDLE_RAILS_MW		500
 #define APPLE_PMP_IDLE_RAILS_STALE_NS	1500000000ULL
+/*
+ * The long hold only starts from a cool reading: well below the 106 C cooling
+ * start, so a die that kept drawing under 500 mW for the whole 30 s still ends
+ * far from any trip. Hotter readings keep the 2 s hold only.
+ */
+#define APPLE_PMP_GATED_IDLE_HOLD_MC	70000
 
 struct apple_pmp_cluster {
 	struct cpufreq_policy *policy;
@@ -410,10 +416,15 @@ static int apple_pmp_guard(unsigned int level)
 	return err;
 }
 
-/* Called with the lock held: did the SMC just see an idle SoC? */
+/*
+ * Called with the lock held: did the SMC just see an idle SoC? Only on the
+ * fanless machines this rail budget was measured on; a Mac with a fan keeps
+ * the 2 s hold alone.
+ */
 static bool apple_pmp_rails_idle(u64 now)
 {
-	return pmp_thermal.idle_rail_ns && now >= pmp_thermal.idle_rail_ns &&
+	return pmp_thermal.power_budget &&
+	       pmp_thermal.idle_rail_ns && now >= pmp_thermal.idle_rail_ns &&
 	       now - pmp_thermal.idle_rail_ns < APPLE_PMP_IDLE_RAILS_STALE_NS &&
 	       pmp_thermal.idle_rail_mw < APPLE_PMP_IDLE_RAILS_MW;
 }
@@ -439,6 +450,7 @@ static int apple_pmp_sample(void)
 		   pmp_thermal.valid_mc < APPLE_PMP_GATED_HOLD_MC &&
 		   (snapshot.finished_ns - pmp_thermal.valid_ns < APPLE_PMP_GATED_HOLD_NS ||
 		    (snapshot.finished_ns - pmp_thermal.valid_ns < APPLE_PMP_GATED_IDLE_HOLD_NS &&
+		     pmp_thermal.valid_mc < APPLE_PMP_GATED_IDLE_HOLD_MC &&
 		     apple_pmp_rails_idle(snapshot.finished_ns)))) {
 		value = pmp_thermal.valid_mc;
 		ret = 0;
