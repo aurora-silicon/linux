@@ -536,6 +536,7 @@ struct bcm4377_hw {
 	unsigned long broken_mws_transport_config : 1;
 	unsigned long broken_le_coded : 1;
 	unsigned long broken_le_ext_adv_report_phy : 1;
+	unsigned long recover_resume_timeout : 1;
 
 	int (*send_calibration)(struct bcm4377_data *bcm4377);
 	int (*send_ptb)(struct bcm4377_data *bcm4377,
@@ -1592,10 +1593,16 @@ static void bcm4377_setup_retry_work(struct work_struct *work)
 	queue_work(hdev->req_workqueue, &hdev->power_on);
 }
 
+/*
+ * The in-place recovery after a resume is selected by the controller, not by
+ * the board: the stall is a behaviour of the chip and its firmware. Chips
+ * without the flag keep the rebind recovery of bcm4377_hci_reset(). BCM4387
+ * (M1 Pro/Max, M2) has shown no command timeout after s2idle (J316s, J413:
+ * over 1700 cycles), so it is not flagged.
+ */
 static bool bcm4377_resume_recovery_supported(struct bcm4377_data *bcm4377)
 {
-	return bcm4377->hw->id == 0x4378 &&
-	       of_machine_is_compatible("apple,j493");
+	return bcm4377->hw->recover_resume_timeout;
 }
 
 static bool bcm4377_resume_recovery_allowed(struct hci_dev *hdev)
@@ -3301,6 +3308,12 @@ static const struct bcm4377_hw bcm4377_hw_variants[] = {
 		.broken_mws_transport_config = true,
 		.broken_le_coded = true,
 		.broken_le_ext_adv_report_phy = true,
+		/*
+		 * After a powered resume the first command can time out; one
+		 * in-place transport reset brings it back (seen on J493). The
+		 * M1 MacBook Air/Pro, Mac mini and iMac use the same chip.
+		 */
+		.recover_resume_timeout = true,
 		.send_calibration = bcm4378_send_calibration,
 		.send_ptb = bcm4378_send_ptb,
 	},

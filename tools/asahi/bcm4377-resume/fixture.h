@@ -99,7 +99,7 @@ static int queue_work(void *wq,struct work_struct *w) { w->queued=1;queued_count
 typedef uint64_t u64;
 #define spin_lock_irqsave(l,f) do { (f)=0;pthread_mutex_lock(l); } while(0)
 #define spin_unlock_irqrestore(l,f) do { (void)(f);pthread_mutex_unlock(l); } while(0)
-static bool req_locked,board_j493=true,allocation_error;
+static bool req_locked, allocation_error;
 static int submit_error,suspend_error,resume_error,recovery_error,quiesces,unregistered,timer_fences;
 static bool old_timeout_at_fence,producer_pause;
 static pthread_barrier_t producer_captured,producer_release;
@@ -107,7 +107,6 @@ static pthread_t producer_thread;
 static void hci_cmd_timeout(struct work_struct *work);
 static struct bcm4377_data *active;
 static bool hdev_is_powered(struct hci_dev *h) {return (h->flags&HCI_UP) && !(h->flags&HCI_AUTO_OFF);}
-static bool of_machine_is_compatible(const char *s) {assert(!strcmp(s,"apple,j493"));return board_j493;}
 static void *kmalloc(size_t n,int flags) {return allocation_error?NULL:malloc(n);}
 static void kfree(void *p) {free(p);}
 #define bt_dev_warn(...) ((void)0)
