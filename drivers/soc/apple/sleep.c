@@ -700,6 +700,8 @@ struct apple_sleep_soc {
 	unsigned int cpu_cores_per_cluster;
 	bool (*cpu_valid)(u64 mpidr);
 	const char *machine;
+	/* With no machine: check the boot core and CPU count on whatever board has the node. */
+	bool check_inventory;
 	u64 boot_mpidr;
 	unsigned int cpu_count;
 	struct apple_sleep_domains ps;
@@ -1884,6 +1886,12 @@ MODULE_PARM_DESC(j813_smc_late,
  * as a cable pulled after AP IDLE), take the SMC's messages off its mailbox before the commit.
  * The keep-link watch run (n=1) read no wake source 208 (SMC.OutboxNotEmpty) after the commit.
  */
+/* T8122 trial switches follow the device tree's T8122 sleep-controller node, not a board name. */
+static bool sleep_t8122_node(void)
+{
+	return apple_sleep && of_device_is_compatible(apple_sleep->dev->of_node, "apple,t8122-sleep");
+}
+
 static bool sleep_j613_smc_drain_after_cut;
 module_param_named(j613_smc_drain_after_cut, sleep_j613_smc_drain_after_cut, bool, 0444);
 MODULE_PARM_DESC(j613_smc_drain_after_cut, "J613 trial: empty the SMC's mailbox to the AP after the debug link's cut");
@@ -1902,14 +1910,14 @@ bool apple_sleep_smc_defer_notice(void)
 {
 	return apple_sleep && pm_suspend_via_firmware() &&
 		((READ_ONCE(sleep_j813_smc_late) && of_machine_is_compatible("apple,j813")) ||
-		 (READ_ONCE(sleep_j613_smc_late) && of_machine_is_compatible("apple,j613")));
+		 (READ_ONCE(sleep_j613_smc_late) && sleep_t8122_node()));
 }
 EXPORT_SYMBOL_GPL(apple_sleep_smc_defer_notice);
 
 /* J613 trial: slpa and AP idle after the final coprocessor stops, through .commit_notice. */
 static bool apple_sleep_j613_notice_after_stops(void)
 {
-	return READ_ONCE(sleep_j613_smc_late) && of_machine_is_compatible("apple,j613") &&
+	return READ_ONCE(sleep_j613_smc_late) && sleep_t8122_node() &&
 	       apple_sleep_smc_defer_notice();
 }
 
@@ -2022,9 +2030,10 @@ static int apple_sleep_validate_cpu_topology(struct apple_sleep *s)
 		    soc->cpu_cores_per_cluster > 32)
 		return dev_err_probe(s->dev, -EINVAL, "invalid CPU-start geometry\n");
 
-	if (soc->machine && (!of_machine_is_compatible(soc->machine) ||
-	    cpu_logical_map(0) != soc->boot_mpidr ||
-	    num_possible_cpus() != soc->cpu_count))
+	if ((soc->machine || soc->check_inventory) &&
+	    ((soc->machine && !of_machine_is_compatible(soc->machine)) ||
+	     cpu_logical_map(0) != soc->boot_mpidr ||
+	     num_possible_cpus() != soc->cpu_count))
 		return dev_err_probe(s->dev, -EINVAL, "unsupported board/CPU inventory\n");
 
 	index = of_property_match_string(np, "reg-names", "cpu-start");
@@ -6165,7 +6174,7 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 	if (!s->soc->regions) {
 		bool cut = apple_sleep_usb_down(s);
 
-		if (READ_ONCE(sleep_j613_smc_drain_after_cut) && of_machine_is_compatible("apple,j613") &&
+		if (READ_ONCE(sleep_j613_smc_drain_after_cut) && sleep_t8122_node() &&
 		    s->smc.held && s->smc.saved_ops && s->smc.saved_ops->drain)
 			s->smc_drained = s->smc.saved_ops->drain(s->smc.data) + (cut ? 1000 : 0);
 	}
@@ -8035,7 +8044,7 @@ static int apple_sleep_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "cannot control CPU power\n");
 	if (s->soc->pen_deep ||
-	    (READ_ONCE(sleep_j613_pen_deep) && of_machine_is_compatible("apple,j613"))) {
+	    (READ_ONCE(sleep_j613_pen_deep) && sleep_t8122_node())) {
 		spin_table_pen_deep_arm(true);
 		if (!s->soc->pen_deep)
 			dev_info(dev, "J613 trial: holding pen's deep-sleep WFI armed\n");

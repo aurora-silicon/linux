@@ -372,7 +372,8 @@ static void apple_sleep_test_t8122_unqualified(struct kunit *test)
 {
 	const struct apple_sleep_soc *soc = &t8122_sleep_soc;
 
-	KUNIT_EXPECT_STREQ(test, soc->machine, "apple,j613");
+	KUNIT_EXPECT_NULL(test, soc->machine);
+	KUNIT_EXPECT_TRUE(test, soc->check_inventory);
 	KUNIT_EXPECT_TRUE(test, soc->untested);
 	/* No bespoke stage, no notes in unmeasured PMU scratch, no cold display stop in a dry run. */
 	KUNIT_EXPECT_NULL(test, soc->ops->commit_begin);

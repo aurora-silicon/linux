@@ -2109,8 +2109,11 @@ static const struct apple_sleep_soc t8122_sleep_soc = {
 	.no_wd2 = true,
 	/* The SEP misses its SLEEP when the cut's seconds come first (candidates 19 to 21). */
 	.debug_cut_after_stops = true,
-	/* J613 alone: its boot core is the first P core, as under macOS, and it has eight. */
-	.machine = "apple,j613",
+	/*
+	 * Any board whose DT has this node (J613, J615): the boot core is the first P core, as
+	 * under macOS, and there are eight, checked at probe.
+	 */
+	.check_inventory = true,
 	.boot_mpidr = 0x10100,
 	.cpu_count = 8,
 	/* NUB.SPMI0.SW3: the PMU, and so its RTC alarm, as on T8140 and T8132. */

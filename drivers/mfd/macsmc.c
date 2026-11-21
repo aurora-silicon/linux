@@ -63,6 +63,16 @@
  * so it stays off unless asked for. Here it follows slpw at once, which keeps it between the
  * two; its distance from the commit is not macOS's.
  */
+/* The T8122 trial switches follow the DT's T8122 sleep-controller node, not a board name. */
+static bool apple_smc_t8122_sleep_node(void)
+{
+	struct device_node *np = of_find_compatible_node(NULL, NULL, "apple,t8122-sleep");
+	bool ok = np && of_device_is_available(np);
+
+	of_node_put(np);
+	return ok;
+}
+
 static bool j613_wktp2;
 module_param(j613_wktp2, bool, 0600);
 MODULE_PARM_DESC(j613_wktp2,
@@ -684,7 +694,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (of_machine_is_compatible("apple,j813"))
 		smc->saved_enabled = true;
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
-	if (j613_saved && of_machine_is_compatible("apple,j613"))
+	if (j613_saved && apple_smc_t8122_sleep_node())
 		smc->saved_enabled = true;
 #endif
 	smc->sram_base = devm_platform_get_and_ioremap_resource(pdev, 1, &smc->sram);
@@ -876,7 +886,7 @@ static void apple_smc_sleep_warn(struct apple_smc *smc)
 	apple_smc_write_mbse(smc, SMC_KEY(slpw));
 	smc->sleep_warned = true;
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
-	if (j613_pmvc && of_machine_is_compatible("apple,j613")) {
+	if (j613_pmvc && apple_smc_t8122_sleep_node()) {
 		struct apple_smc_key_info info;
 		int ret = apple_smc_get_key_info(smc, SMC_KEY(pmVC), &info);
 
@@ -889,7 +899,7 @@ static void apple_smc_sleep_warn(struct apple_smc *smc)
 		else
 			dev_info(smc->dev, "J613 sleep: pmVC=0x%x accepted\n", J613_PMVC);
 	}
-	if (j613_wktp2 && of_machine_is_compatible("apple,j613")) {
+	if (j613_wktp2 && apple_smc_t8122_sleep_node()) {
 		int ret;
 
 		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), 2);
@@ -1132,7 +1142,7 @@ static void apple_smc_sleep_wake(struct apple_smc *smc)
 		apple_smc_write_mbse(smc, SMC_KEY(waka));
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
 		/* macOS: pmVC=0x100 again 9 ms after waka (capture run 51). */
-		if (j613_pmvc && of_machine_is_compatible("apple,j613")) {
+		if (j613_pmvc && apple_smc_t8122_sleep_node()) {
 			ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), J613_PMVC);
 			if (ret)
 				dev_err(smc->dev, "J613 wake: pmVC=0x%x failed: %d\n", J613_PMVC, ret);
