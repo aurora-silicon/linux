@@ -601,6 +601,7 @@ impl Firmware {
                 return;
             }
             if result.is_err() {
+                self.slots.mark_dirty(&timestamp_claims);
                 self.recovery.affected_full_receipts =
                     self.recovery.affected_full_receipts.saturating_add(1);
             }

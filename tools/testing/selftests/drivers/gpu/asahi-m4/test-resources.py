@@ -462,6 +462,81 @@ pub mod g16 {
         assert_eq!(sync::Arc::strong_count(&one),1);
     }
 
+    #[test]fn compute_same_vm_reuse_skips_bulk_scrub_and_cross_vm_or_recovery_full_scrubs(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
+        let a=vm(1);let b=vm(2);let mut c=Claims::new();
+        // First use of units 0 and 1 runs full scrub (context_store + aux + preempt + seq + its).
+        for _ in 0..2 {
+            let k=s.claim_compute_for(&arena.compute,&mut c,Some(a.id)).unwrap().unwrap();
+            assert_eq!(arena.compute.compute[k].context_store.fills.lock().unwrap().len(),1);
+            assert_eq!(arena.compute.compute[k].its.fills.lock().unwrap().len(),1);
+            s.hold_vm(&c,&a).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        }
+        // Same-VM clean reuse of unit 0 clears ONLY its (16 B), skipping context_store/aux/preempt/seq.
+        let k=s.claim_compute_for(&arena.compute,&mut c,Some(a.id)).unwrap().unwrap();
+        assert_eq!(k,0);
+        assert_eq!(arena.compute.compute[0].its.fills.lock().unwrap().len(),2);
+        assert_eq!(arena.compute.compute[0].context_store.fills.lock().unwrap().len(),1);
+        assert_eq!(arena.compute.compute[0].preempt.fills.lock().unwrap().len(),1);
+        assert_eq!(arena.compute.compute[0].aux.fills.lock().unwrap().len(),1);
+        s.hold_vm(&c,&a).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        // Cross-VM switch on unit 1 runs full scrub.
+        let k=s.claim_compute_for(&arena.compute,&mut c,Some(b.id)).unwrap().unwrap();
+        assert_eq!(k,1);
+        assert_eq!(arena.compute.compute[1].context_store.fills.lock().unwrap().len(),2);
+        assert_eq!(arena.compute.compute[1].preempt.fills.lock().unwrap().len(),2);
+        s.hold_vm(&c,&b).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        // Firmware recovery forces full scrub even for same VM.
+        s.invalidate_scrub();
+        let k=s.claim_compute_for(&arena.compute,&mut c,Some(a.id)).unwrap().unwrap();
+        assert_eq!(k,0);
+        assert_eq!(arena.compute.compute[0].context_store.fills.lock().unwrap().len(),2);
+        // Cancelled preparation forces full scrub on next claim.
+        s.release(&mut c);
+        let k=s.claim_compute_for(&arena.compute,&mut c,Some(a.id)).unwrap().unwrap();
+        assert_eq!(k,0);
+        assert_eq!(arena.compute.compute[0].context_store.fills.lock().unwrap().len(),3);
+        s.hold_vm(&c,&a).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+    }
+
+    #[test]fn pass_same_vm_reuse_skips_bulk_scrub_and_preserves_tpc_dirty_for_full_scrub(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
+        let a=vm(1);let b=vm(2);
+        let retire=|s:&mut Slots,k:usize,owner:&sync::Arc<g16::vm::VmState>|{
+            let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;
+            s.hold_vm(&c,owner).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        };
+        // First use of slots 0 and 1 runs full scrub.
+        s.claim_pass_for(&arena.render,0,Some(a.id)).unwrap();
+        arena.render.set_dirty(0,0x8000,0x4000).unwrap();
+        retire(&mut s,0,&a);
+        s.claim_pass_for(&arena.render,1,Some(a.id)).unwrap();
+        retire(&mut s,1,&a);
+        let p0=&arena.render.passes[0];
+        assert_eq!(p0.aux.fills.lock().unwrap().len(),1);
+        assert_eq!(p0.tpc.fills.lock().unwrap().len(),1);
+        // Same-VM clean reuse of slot 0: clears tilemap/its/heap(0x1000)/pre headers only; skips aux/tpc/scratch.
+        s.claim_pass_for(&arena.render,0,Some(a.id)).unwrap();
+        assert_eq!(p0.aux.fills.lock().unwrap().len(),1);
+        assert_eq!(p0.ta_scratch.fills.lock().unwrap().len(),1);
+        assert_eq!(p0.fs_scratch.fills.lock().unwrap().len(),1);
+        assert_eq!(p0.scene_user.fills.lock().unwrap().len(),1);
+        assert_eq!(p0.tpc.fills.lock().unwrap().len(),1);
+        assert_eq!(p0.tilemap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
+        assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x1000)));
+        assert_eq!(p0.pre[0].fills.lock().unwrap().last(),Some(&(0,0x540)));
+        // Preserved tpc_dirty high-water mark is still cleared on cross-VM switch.
+        arena.render.set_dirty(0,0x2000,0x1000).unwrap();
+        retire(&mut s,0,&a);
+        s.claim_pass_for(&arena.render,1,Some(a.id)).unwrap();
+        retire(&mut s,1,&a);
+        s.claim_pass_for(&arena.render,0,Some(b.id)).unwrap();
+        assert_eq!(p0.aux.fills.lock().unwrap().len(),2);
+        assert_eq!(p0.tpc.fills.lock().unwrap().last(),Some(&(0,0x8000)));
+        assert_eq!(p0.tilemap.fills.lock().unwrap().last(),Some(&(0,0x1000)));
+        assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
+    }
+
 }
 '''
 budget=(production/'budget.rs').read_text()

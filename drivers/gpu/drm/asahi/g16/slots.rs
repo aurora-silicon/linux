@@ -105,9 +105,17 @@ impl ComputeSlot {
         )?;
         Ok(unit)
     }
-    /// Only command-local scratch is reset. Pool/list/counter/descriptor state is preserved.
-    fn scrub(&self) -> Result {
+    /// Resets command-local state before reuse. Pool/list/counter/descriptor state is preserved.
+    ///
+    /// Clean same-VM reuse only zeroes the 16-byte internal timestamp pair so retirement
+    /// checks cannot observe stale ticks; `work` (including its embedded sequence) is
+    /// overwritten completely by `prefix_compute`. First use, cross-VM retarget, cancelled
+    /// preparation, or post-recovery/error reuse runs the full scrub of all scratch areas.
+    fn scrub(&self, full: bool) -> Result {
         self.its.fill(0, 0, 16)?;
+        if !full {
+            return Ok(());
+        }
         self.seq.fill(0, 0, 0x300)?;
         self.aux.fill(0, 0, 0x4000)?;
         self.context_store.fill(0, 0, 0x40000)?;
@@ -253,18 +261,36 @@ impl PassSlot {
         })
     }
 
-    /// Per-use reset of a pass slot's storage: work images, microsequences, scratch, stage
-    /// stamps, the TPC/tilemap spans its last use wrote, auxiliary, heap metadata and
-    /// scene-user and the preemption save areas. The slot is neither
-    /// published nor claimed; the dirty spans are passed in.
+    /// Per-use reset of a pass slot's storage. The slot is neither published nor claimed; the
+    /// dirty spans are passed in.
+    ///
+    /// Clean same-VM reuse skips the work/sequence images (immediately overwritten by
+    /// `prefix_render`), unused scratch objects (`ta_scratch`, `fs_scratch`), bulk scratch
+    /// (`aux`, `scene_user`), and `tpc` (overwritten by TA hardware), zeroing only the stage
+    /// timestamp cells, active `heap` header (`0x1000`), `tilemap_dirty`, and active
+    /// preemption record headers. First use, cross-VM switch, cancelled preparation, or
+    /// post-recovery/error reuse runs the full scrub including `tpc_dirty`.
     fn scrub(
         &self,
         pre_records: u32,
         tpc_dirty: u64,
         tilemap_dirty: u64,
+        full: bool,
         stats: &mut SlotStats,
     ) -> Result {
-        let _ = pre_records;
+        let r = pre_records as usize;
+
+        if !full {
+            self.its.fill(0, 0, 32)?;
+            self.tilemap.fill(0, 0, tilemap_dirty as usize)?;
+            stats.tilemap_clear_bytes = stats.tilemap_clear_bytes.saturating_add(tilemap_dirty);
+            self.heap.fill(0, 0, 0x1000)?;
+            self.pre[0].fill(0, 0, r * 0x540)?;
+            self.pre[1].fill(0, 0, r * 0x280)?;
+            self.pre[2].fill(0, 0, r * 0x40)?;
+            stats.pass_scrubs = stats.pass_scrubs.saturating_add(1);
+            return Ok(());
+        }
 
         self.ta_work.fill(0, 0, ta::WORK_SIZE)?;
         self.fs_work.fill(0, 0, fs::WORK_SIZE)?;
@@ -280,7 +306,7 @@ impl PassSlot {
         self.aux.fill(0, 0, 0x20000)?;
         self.heap.fill(0, 0, 0x4000)?;
         self.scene_user.fill(0, 0, 0x10000)?;
-        // Preemption save areas start zeroed on every use.
+        // Preemption save areas start zeroed on every full reset.
         self.pre[0].fill(0, 0, 0x4000)?;
         self.pre[1].fill(0, 0, 0x4000)?;
         self.pre[2].fill(0, 0, 0x4000)?;
@@ -381,6 +407,8 @@ pub(crate) struct ComputeOwners {
     /// descriptor when a later owner displaces it, after its VM's client closed.
     arena: [Option<Arc<super::resources::ComputeArena>>; sizes::COMPUTE_UNITS],
     pending_arena: [Option<Arc<super::resources::ComputeArena>>; sizes::COMPUTE_UNITS],
+    /// Force a full scrub on next claim (first use, cancel, error, or firmware recovery).
+    scrub_full: [bool; sizes::COMPUTE_UNITS],
 }
 
 pub(crate) struct Slots {
@@ -400,6 +428,8 @@ pub(crate) struct Slots {
     /// The render arena of each pass slot's owner (see [`ComputeOwners::arena`]).
     pass_arena: [Option<Arc<super::resources::RenderArena>>; 2],
     pending_pass_arena: [Option<Arc<super::resources::RenderArena>>; 2],
+    /// Force a full scrub on next pass claim (first use, cancel, error, or firmware recovery).
+    pass_scrub_full: [bool; 2],
 }
 impl Slots {
     pub(crate) fn new() -> Result<Self> {
@@ -416,6 +446,7 @@ impl Slots {
                     pending_owner: [const { None }; sizes::COMPUTE_UNITS],
                     arena: [const { None }; sizes::COMPUTE_UNITS],
                     pending_arena: [const { None }; sizes::COMPUTE_UNITS],
+                    scrub_full: [true; sizes::COMPUTE_UNITS],
                 },
                 GFP_KERNEL,
             )?,
@@ -425,6 +456,7 @@ impl Slots {
             pending_pass_owner: [None, None],
             pass_arena: [None, None],
             pending_pass_arena: [None, None],
+            pass_scrub_full: [true; 2],
         })
     }
     pub(crate) fn init(&self) -> Result {
@@ -474,11 +506,43 @@ impl Slots {
             .filter(|&k| self.compute.lifetime.available(k))
             .count() as u32
     }
+    /// Forces a full scrub on the next claim of every slot (after firmware recovery).
+    #[allow(dead_code)]
+    pub(crate) fn invalidate_scrub(&mut self) {
+        self.compute.scrub_full = [true; sizes::COMPUTE_UNITS];
+        self.pass_scrub_full = [true; 2];
+    }
+
+    /// Forces a full scrub on the next claim of the units in `f` (after an affected error).
+    #[allow(dead_code)]
+    pub(crate) fn mark_dirty(&mut self, f: &Claims) {
+        for &k in &f.slot[..(f.slot_count as usize).min(f.slot.len())] {
+            if let Some(dirty) = self.compute.scrub_full.get_mut(k as usize) {
+                *dirty = true;
+            }
+        }
+        for k in 0..2 {
+            if f.pass_mask & (1 << k) != 0 {
+                self.pass_scrub_full[k] = true;
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn claim_compute(
         &mut self,
         units: &super::resources::Prepared,
         f: &mut Claims,
         _j: u32,
+    ) -> Result<Option<usize>> {
+        self.claim_compute_for(units, f, None)
+    }
+
+    pub(crate) fn claim_compute_for(
+        &mut self,
+        units: &super::resources::Prepared,
+        f: &mut Claims,
+        vm_id: Option<u64>,
     ) -> Result<Option<usize>> {
         if f.slot_count != 0 {
             return Ok(None);
@@ -489,7 +553,13 @@ impl Slots {
         for i in 0..n {
             let k = (self.cursor as usize + i) % n;
             if self.compute.lifetime.claim(k) {
-                if let Err(e) = units.compute_unit(k).and_then(|unit| unit.scrub()) {
+                let full = self.compute.scrub_full[k]
+                    || vm_id.is_none_or(|id| {
+                        self.compute.owner[k]
+                            .as_ref()
+                            .is_none_or(|prev| prev.id != id)
+                    });
+                if let Err(e) = units.compute_unit(k).and_then(|unit| unit.scrub(full)) {
                     self.compute.lifetime.cancel(k);
                     return Err(e);
                 }
@@ -520,22 +590,37 @@ impl Slots {
         }
         None
     }
+    #[allow(dead_code)]
     pub(crate) fn claim_pass(&mut self, arena: &super::resources::RenderArena, k: usize) -> Result {
+        self.claim_pass_for(arena, k, None)
+    }
+
+    pub(crate) fn claim_pass_for(
+        &mut self,
+        arena: &super::resources::RenderArena,
+        k: usize,
+        vm_id: Option<u64>,
+    ) -> Result {
         if k >= 2 || !self.pass_lifetime.claim(k) {
             return Err(EBUSY);
         }
         // Only a retired displaced owner may reach here; no in-flight storage is reset.
+        let full = self.pass_scrub_full[k]
+            || vm_id.is_none_or(|id| self.pass_owner[k].as_ref().is_none_or(|prev| prev.id != id));
         let p = &arena.passes[k];
         if let Err(e) = p.scrub(
             1,
             arena.tpc_dirty[k].load(Ordering::Relaxed),
             arena.tilemap_dirty[k].load(Ordering::Relaxed),
+            full,
             &mut self.stats,
         ) {
             self.pass_lifetime.cancel(k);
             return Err(e);
         }
-        arena.tpc_dirty[k].store(0, Ordering::Relaxed);
+        if full {
+            arena.tpc_dirty[k].store(0, Ordering::Relaxed);
+        }
         arena.tilemap_dirty[k].store(0, Ordering::Relaxed);
         self.pass_cursor = (1 - k) as u32;
         Ok(())
@@ -663,11 +748,13 @@ impl Slots {
         for &k in &f.slot[..f.slot_count as usize] {
             self.compute.owner[k as usize] = self.compute.pending_owner[k as usize].take();
             self.compute.arena[k as usize] = self.compute.pending_arena[k as usize].take();
+            self.compute.scrub_full[k as usize] = false;
         }
         for k in 0..2 {
             if f.pass_mask & (1 << k) != 0 {
                 self.pass_owner[k] = self.pending_pass_owner[k].take();
                 self.pass_arena[k] = self.pending_pass_arena[k].take();
+                self.pass_scrub_full[k] = false;
             }
         }
         self.pass_busy &= !f.pass_mask;
@@ -680,11 +767,13 @@ impl Slots {
         for &k in &f.slot[..f.slot_count as usize] {
             self.compute.lifetime.quarantine(k as usize);
             self.compute.pending_retarget[k as usize] = None;
+            self.compute.scrub_full[k as usize] = true;
         }
         for k in 0..2 {
             if f.pass_mask & (1 << k) != 0 {
                 self.pass_lifetime.quarantine(k);
                 self.pending_pass_retarget[k] = None;
+                self.pass_scrub_full[k] = true;
             }
         }
         self.pass_busy &= !f.pass_mask;
@@ -699,6 +788,7 @@ impl Slots {
             self.compute.pending_retarget[k as usize] = None;
             self.compute.pending_owner[k as usize] = None;
             self.compute.pending_arena[k as usize] = None;
+            self.compute.scrub_full[k as usize] = true;
         }
         for k in 0..2 {
             if f.pass_mask & (1 << k) != 0 {
@@ -706,6 +796,7 @@ impl Slots {
                 self.pending_pass_retarget[k] = None;
                 self.pending_pass_owner[k] = None;
                 self.pending_pass_arena[k] = None;
+                self.pass_scrub_full[k] = true;
             }
         }
         self.pass_busy &= !f.pass_mask;

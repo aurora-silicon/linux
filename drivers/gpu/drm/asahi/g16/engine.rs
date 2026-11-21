@@ -1350,7 +1350,7 @@ impl Firmware {
         let target = encode::stamp(n);
         let index = self
             .slots
-            .claim_compute(&job.resources, &mut f.claims, 0)?
+            .claim_compute_for(&job.resources, &mut f.claims, Some(job.vm.id))?
             .ok_or(EAGAIN)?;
         let generation = job.vm.generation;
         self.slots.hold_vm(&f.claims, &job.vm)?;
@@ -1449,7 +1449,8 @@ impl Firmware {
         let draw = super::recovery::logic::next_ordinal(pf.draw).ok_or(EOVERFLOW)?;
         let target = encode::stamp(draw);
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
-        self.slots.claim_pass(job.resources.render()?, k)?;
+        self.slots
+            .claim_pass_for(job.resources.render()?, k, Some(job.vm.id))?;
         self.slots.hold_vm(&f.claims, &job.vm)?;
         self.slots.hold_arenas(&f.claims, &job.resources);
         let (refs, init_buffer, epoch, binding) = self.render_refs(k, job, draw)?;

@@ -424,10 +424,12 @@ impl Firmware {
                         u32::MAX
                     };
                     // Firmware is now halted in phase 1: invalidate bound PB state and
-                    // capture stage frontiers and fault-bank state before answering 2
+                    // force a full scrub on the next claim of every compute and render slot,
+                    // then capture stage frontiers and fault-bank state before answering 2
                     // (firmware may force stage targets while aborting work, and fault_scan
                     // writes the fault-bank selector so it must not run against active FW).
                     self.pools.invalidate();
+                    self.slots.invalidate_scrub();
                     self.events.grow.clear();
                     let stage = self.recovery_snapshot()?;
                     // Powered down, the GPU holds no fault to read.
