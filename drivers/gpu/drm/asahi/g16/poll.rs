@@ -279,7 +279,9 @@ impl Firmware {
         lap.lap(&mut self.engine.prof.retire_ns);
         self.answer_growth()?;
         self.check_hangs(done)?;
-        let published = self.publish(done);
+        let published = self
+            .service_power()
+            .and_then(|()| self.publish_checked(done));
         let s = &mut self.engine.stats;
         if self.engine.flights.is_empty() && s.idle_from_ns != 0 {
             // Idle with nothing ready is not a gap: the clients are late.

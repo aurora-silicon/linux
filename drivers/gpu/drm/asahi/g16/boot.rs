@@ -504,17 +504,24 @@ impl Session {
 
     /// Live transport and powered-firmware health, plus any previously latched failure.
     pub(crate) fn check(&self) -> Result {
-        self.shared.check()?;
+        self.transport()?;
         // The performance state is in the power controller, which the firmware itself reads
         // with the GPU powered down and admission reads before the firmware runs: it needs no
         // powered GPU.
-        if !self.rtkit.running()
-            || self.regs.asc_control()? & regs::ASC_RUN == 0
-            || self.regs.pstate()? > self.regs.top()
-        {
+        if self.regs.asc_control()? & regs::ASC_RUN == 0 || self.regs.pstate()? > self.regs.top() {
             return Err(EIO);
         }
         self.uat.check_adopted_bindings()
+    }
+
+    /// The transport alone: a latched failure, or RTKit stopped or crashed. No register or
+    /// UAT read, so the retirement loop can ask between its receipts.
+    pub(crate) fn transport(&self) -> Result {
+        self.shared.check()?;
+        if !self.rtkit.running() {
+            return Err(EIO);
+        }
+        Ok(())
     }
 
     /// Runs `read` with the GPU held powered, or returns `None` while it is powered down. A

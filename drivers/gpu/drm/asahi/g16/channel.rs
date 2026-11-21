@@ -421,9 +421,10 @@ impl Firmware {
         )
     }
 
-    /// The latched transport error: an RTKit crash or a refused RTKit buffer.
+    /// The latched transport error: an RTKit crash or a refused RTKit buffer. The register
+    /// and UAT checks of [`Session::check`] run once per pass, in its callers.
     pub(crate) fn transport_error(&self) -> Option<Error> {
-        self.session.check().err()
+        self.session.transport().err()
     }
 
     /// Drains the receive rings and decodes events. Called first in every poll pass.

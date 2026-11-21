@@ -144,6 +144,7 @@ impl Firmware {
     }
     __PUBLISH_PREFIX__
     __PUBLISH__
+    __PUBLISH_CHECKED__
 }
 fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
     Arc::new(Job{id,vm:Vm{status:Status(AtomicU32::new(0)),slot:id},
@@ -244,6 +245,7 @@ for token, declaration in {
     '__UNPEND__': 'fn unpend(&mut self',
     '__PUBLISH_PREFIX__': 'fn publish_prefix(',
     '__PUBLISH__': 'pub(crate) fn publish(&mut self',
+    '__PUBLISH_CHECKED__': 'pub(crate) fn publish_checked(&mut self',
     '__DESCRIPTOR_CONTAINMENT__': 'if encode::preserve_compute_descriptor(',
     '__PUBLISH_PRODUCER__': 'fn publish_producer(',
 }.items():
