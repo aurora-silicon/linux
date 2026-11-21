@@ -295,6 +295,8 @@ unsafe impl Sync for PolicyNotifier {}
 #[pin_data(PinnedDrop)]
 pub(crate) struct Feed {
     detector: Detector,
+    /// Every command's execution, for the performance effort ([`super::power::BusyRun`]).
+    run: super::power::BusyRun,
     #[cfg(CONFIG_CPU_FREQ)]
     #[pin]
     requests: Mutex<Requests>,
@@ -313,6 +315,7 @@ impl Feed {
         let feed = Arc::pin_init(
             pin_init!(Self {
                 detector: Detector::new(),
+                run: super::power::BusyRun::new(),
                 #[cfg(CONFIG_CPU_FREQ)]
                 requests <- new_mutex!(Requests::new(m5), "G17 CPU feed"),
                 #[cfg(CONFIG_CPU_FREQ)]
@@ -441,6 +444,25 @@ impl Feed {
         if cfg!(CONFIG_CPU_FREQ) {
             self.detector.note(start, end, Self::now());
         }
+    }
+
+    /// A command's execution interval in the firmware timestamp domain, for the performance
+    /// effort's busy run. A gap of the firmware's idle power-off delay ends a run.
+    pub(crate) fn note_work(&self, start: u64, end: u64) {
+        let idle_ticks = u64::from(super::power::FIRMWARE_IDLE_OFF_MS) * (CLOCK_HZ / 1000);
+        self.run.note(start, end, idle_ticks);
+    }
+
+    /// Whether the GPU has run without going idle for longer than the effort is held after work
+    /// stops ([`super::power::BusyRun`]).
+    pub(crate) fn busy_run(&self) -> bool {
+        let hold_ticks = super::power::IDLE_HOLD_NS * CLOCK_HZ / 1_000_000_000;
+        self.run.bound(hold_ticks)
+    }
+
+    /// The effort was taken down after the hold: the next command begins a new run.
+    pub(crate) fn end_busy_run(&self) {
+        self.run.end();
     }
 
     /// Whether the GPU itself is the bottleneck: passes follow each other with refill gaps
