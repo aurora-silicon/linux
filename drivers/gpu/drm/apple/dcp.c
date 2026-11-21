@@ -6027,22 +6027,22 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	 * 27.2 driving the mini's dcpext0 has to confirm the A4xx/A5xx IDs
 	 * before this is relied on.
 	 */
+	if (apple_t8132_dcpext_v27_2(dev->of_node)) {
+		/* Checked by apple_t8132_dcpext_v27_2(). */
+		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		return dcp_v27_method_table(dev, compat_str);
+	}
+
 	/*
 	 * The T8132 internal panel's processor on the macOS 27.2 stub, handed
 	 * over by the boot loader with the 26B123 image (see
 	 * apple_t8132_dcp_v27_2()): the firmware-27 backend with the 27.2
 	 * method table. That this image numbers its IOMFB methods as the
 	 * T6041 and T8142 26B123 images do is the same assumption the J773g
-	 * dcpext case below makes.
+	 * dcpext case above makes.
 	 */
 	if (apple_t8132_dcp_v27_2(dev->of_node)) {
 		/* Checked by apple_t8132_dcp_v27_2(). */
-		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		return dcp_v27_method_table(dev, compat_str);
-	}
-
-	if (apple_t8132_dcpext_v27_2(dev->of_node)) {
-		/* Checked by apple_t8132_dcpext_v27_2(). */
 		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
 		return dcp_v27_method_table(dev, compat_str);
 	}
