@@ -47,6 +47,7 @@ typedef uint64_t u64;
 typedef u64 phys_addr_t;
 typedef unsigned int gfp_t;
 #define BIT(n) (1UL << (n))
+#define BIT_ULL(n) (1ULL << (n))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define READ_ONCE(x) (x)
@@ -213,7 +214,8 @@ def main():
     code = PRELUDE
     code += macro(dcp, 'apple_dart_dcp_fail') + '\n'
     code += macro(dcp, 'apple_dart_fail_borrowed') + '\n'
-    for name in ('static bool apple_dart_state_retained(',
+    for name in ('static bool apple_dart_state_retained_except(',
+                 'static bool apple_dart_state_retained(',
                  'static void apple_dart_managed_quarantine_locked(',
                  'static void apple_dart_managed_quarantine(',
                  'static void apple_dart_quarantine_borrowed(',
