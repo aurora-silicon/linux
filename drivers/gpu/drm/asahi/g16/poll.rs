@@ -519,14 +519,11 @@ impl Firmware {
         Ok(Retirement::Pending)
     }
 
-    /// Logs the non-zero fault banks of `state`.
+    /// Logs the fault bank of `state` when it holds a fault.
     #[allow(dead_code)]
     pub(crate) fn log_fault(&self, state: &EngineState) {
-        for bank in 0..2 {
-            let (f, va) = (state.status[bank], state.address[bank]);
-            if f == 0 {
-                continue;
-            }
+        let (bank, f, va) = (state.bank, state.status, state.address);
+        if f != 0 {
             let access = if (f >> 4) & 1 != 0 { "read" } else { "write" };
             let reason = if (f >> 1) & 7 != 0 {
                 "reason!=unmapped"
@@ -890,7 +887,12 @@ impl Firmware {
         let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
         let ch = &self.channels;
         let rd = |o: &super::object::FwObject, off| o.r32(off).unwrap_or(0xdeadbeef);
-        let state = self.session.regs.engine_state().unwrap_or_default();
+        let state = self
+            .session
+            .engine_state()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let f = e.oldest();
         let ms = f.map_or(0, |f| now_ns().wrapping_sub(f.published_ns) / 1_000_000);
 

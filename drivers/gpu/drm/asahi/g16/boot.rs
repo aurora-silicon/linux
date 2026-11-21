@@ -484,6 +484,9 @@ pub(crate) struct Session {
     pub(crate) regs: regs::Regs,
     pub(crate) adt: GpuAdt,
     uat: Arc<mmu::Uat>,
+    /// The PPL handoff page, mapped here only to read the firmware's powered flag
+    /// ([`hw::FwLayout::powered`]); `None` when the firmware keeps the GPU powered.
+    handoff: Option<regs::Mapping>,
 }
 
 impl Session {
@@ -495,6 +498,9 @@ impl Session {
     /// Live transport and powered-firmware health, plus any previously latched failure.
     pub(crate) fn check(&self) -> Result {
         self.shared.check()?;
+        // The performance state is in the power controller, which the firmware itself reads
+        // with the GPU powered down and admission reads before the firmware runs: it needs no
+        // powered GPU.
         if !self.rtkit.running()
             || self.regs.asc_control()? & regs::ASC_RUN == 0
             || self.regs.pstate()? > self.regs.top()
@@ -502,6 +508,33 @@ impl Session {
             return Err(EIO);
         }
         self.uat.check_adopted_bindings()
+    }
+
+    /// Runs `read` with the GPU held powered, or returns `None` while it is powered down. A
+    /// firmware that powers the GPU down while idle changes GPU power only while it holds the
+    /// PPL handoff lock, and records the result on the handoff page before releasing it. The
+    /// AP side of the lock is held here across that record and `read`, so the GPU cannot go
+    /// down between them. Reading a GPU register while it is down takes an SError.
+    fn while_powered<T>(&self, read: impl FnOnce(&regs::Regs) -> Result<T>) -> Result<Option<T>> {
+        let (Some(page), Some(offset)) = (&self.handoff, self.adt.layout.powered) else {
+            return read(&self.regs).map(Some);
+        };
+        let _held = self.uat.lock_m4_handoff()?;
+        if page.io().try_read8(offset)? == 0 {
+            return Ok(None);
+        }
+        read(&self.regs).map(Some)
+    }
+
+    /// The engine receipts of a running firmware, or `None` while the GPU is powered down.
+    pub(crate) fn engine_state(&self) -> Result<Option<regs::EngineState>> {
+        self.while_powered(regs::Regs::engine_state)
+    }
+
+    /// The first engine fault bank holding a fault, for a firmware halted for recovery, or
+    /// `None` while the GPU is powered down.
+    pub(crate) fn fault_scan(&self) -> Result<Option<regs::EngineState>> {
+        self.while_powered(regs::Regs::fault_scan)
     }
 
     /// Sends a mailbox message.
@@ -995,6 +1028,13 @@ pub(crate) fn start(
     if !window.ttbat_is_clear()? {
         return Err(EBUSY);
     }
+    let handoff = match adt.layout.powered {
+        Some(_) => Some(regs::Mapping::write_combined(
+            adt.handoff.start,
+            hw::HANDOFF_SIZE as usize,
+        )?),
+        None => None,
+    };
     // Adopt the UAT and prove the leaf words before anything firmware-visible is written: no
     // context names the shadow window or the lower root yet.
     let uat = uat::adopt(dev, cfg, &adt)?;
@@ -1029,6 +1069,7 @@ pub(crate) fn start(
         regs,
         adt,
         uat,
+        handoff,
     };
     let mut events = Events::new();
     let mut built = None;

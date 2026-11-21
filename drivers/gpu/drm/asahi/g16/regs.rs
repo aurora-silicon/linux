@@ -152,23 +152,28 @@ pub(crate) struct Identity {
     pub(crate) core_masks: [u32; 2],
 }
 
-/// Engine receipts: busy bit and the two fault banks.
+/// Fault-bank selector values (`+0xd800`) that name a fault bank.
+const FAULT_BANKS: u64 = 8;
+
+/// Engine receipts: busy bit and one fault bank.
 #[derive(Copy, Clone, Default)]
 pub(crate) struct EngineState {
     /// Bit 0 of `+0xc020 | +0xc120`.
     #[allow(dead_code)]
     pub(crate) busy: u64,
-    /// `+0xd8c0` under fault-bank selectors 0 and 1.
-    pub(crate) status: [u64; 2],
-    /// `+0xd8c8 << 6` under fault-bank selectors 0 and 1.
-    pub(crate) address: [u64; 2],
+    /// The fault-bank selector (`+0xd800`) the status and address were read under.
+    pub(crate) bank: u64,
+    /// `+0xd8c0`: bit 0 set when the bank holds a fault.
+    pub(crate) status: u64,
+    /// `+0xd8c8 << 6`.
+    pub(crate) address: u64,
 }
 
 impl EngineState {
-    /// Fault status of both banks, OR-ed together.
+    /// Fault status of the bank read.
     #[allow(dead_code)]
     pub(crate) fn fault(&self) -> u64 {
-        self.status[0] | self.status[1]
+        self.status
     }
 }
 
@@ -295,22 +300,42 @@ impl Regs {
         self.asc.io().try_write32(value, ASC_CONTROL)
     }
 
-    /// Engine receipts, under the device lock: busy is bit 0 of `C020 | C120`; the fault status
-    /// is `D8C0` under fault-bank selectors 0 and 1 (`D800`), with the saved selector restored.
-    /// 64-bit accesses.
+    /// Engine receipts for a running firmware, read only: busy is bit 0 of `C020 | C120`; the
+    /// fault status and address are `D8C0`/`D8C8` under the selector `D800` already holds. A
+    /// firmware that powers the GPU down while idle writes `D800` itself on the way down, so the
+    /// selector is not written here. 64-bit accesses.
     pub(crate) fn engine_state(&self) -> Result<EngineState> {
         let r = self.status.io();
+        Ok(EngineState {
+            busy: (r.try_read64(0x20)? | r.try_read64(0x120)?) & 1,
+            bank: r.try_read64(0x1800)?,
+            status: r.try_read64(0x18c0)?,
+            address: r.try_read64(0x18c8)? << 6,
+        })
+    }
+
+    /// Engine receipts for a firmware halted for recovery and waiting on the host: the first
+    /// fault bank, selectors 0 to 7 in order, whose status has bit 0 set, with the saved
+    /// selector restored. Without a fault, the status is zero and the bank the saved selector.
+    pub(crate) fn fault_scan(&self) -> Result<EngineState> {
+        let r = self.status.io();
+        let saved = r.try_read64(0x1800)?;
         let mut state = EngineState {
             busy: (r.try_read64(0x20)? | r.try_read64(0x120)?) & 1,
+            bank: saved,
             ..Default::default()
         };
-        let sel = r.try_read64(0x1800)?;
-        for bank in 0..2 {
-            r.try_write64(bank as u64, 0x1800)?;
-            state.status[bank] = r.try_read64(0x18c0)?;
-            state.address[bank] = r.try_read64(0x18c8)? << 6;
+        for bank in 0..FAULT_BANKS {
+            r.try_write64(bank, 0x1800)?;
+            let status = r.try_read64(0x18c0)?;
+            if status & 1 != 0 {
+                state.bank = bank;
+                state.status = status;
+                state.address = r.try_read64(0x18c8)? << 6;
+                break;
+            }
         }
-        r.try_write64(sel, 0x1800)?;
+        r.try_write64(saved, 0x1800)?;
         Ok(state)
     }
 }

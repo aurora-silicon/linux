@@ -331,12 +331,11 @@ impl Firmware {
         // These frontiers must be captured before the host answers 2: the
         // firmware can force the stage target while aborting a work item.
         let stage = self.recovery_snapshot()?;
-        let fault = self.session.regs.engine_state()?;
-        let asid = fault
-            .status
-            .iter()
-            .find(|status| **status & 1 != 0)
-            .map(|status| ((*status >> 17) & 0x3f) as u32)
+        // Powered down, the GPU holds no fault to read.
+        let fault = self.session.fault_scan()?.unwrap_or_default();
+        let asid = Some(fault.status)
+            .filter(|status| status & 1 != 0)
+            .map(|status| ((status >> 17) & 0x3f) as u32)
             .filter(|asid| *asid >= 1);
         let deadline = start.saturating_add(logic::RECOVERY_BUDGET_NS);
         let mut answered = false;
