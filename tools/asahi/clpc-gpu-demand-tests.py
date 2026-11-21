@@ -111,6 +111,7 @@ struct apple_clpc {
  unsigned int ane_qos_khz;
  unsigned long ane_until;
  bool low_power;
+ unsigned int low_power_khz;
 };
 static unsigned long jiffies;
 static u64 ktime_get_mono_fast_ns(void) { return jiffies * 1000000ull; }
@@ -245,6 +246,19 @@ static void check_t8140_dense(void) {
  assert(c.last_reason==16);
 }
 
+// Low power samples on time only where it has a CPU ceiling to keep
+// (low_power_khz); a High Power-only profile stays deferrable when idle.
+static void check_low_power(void) {
+ struct apple_clpc_gpu gpu={0};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t6040,.agent=1,.mask=3,.gpu=&gpu,.low_power=true};
+ read_error=vote_error=0; pmgr_status=0xf0; published=~0u;
+ jiffies=3000; apple_clpc_sample(&c); assert(published==0 && queued_idle);
+ c.low_power_khz=2808000;
+ jiffies=3004; apple_clpc_sample(&c); assert(published==0 && !queued_idle);
+ c.low_power=false;
+ jiffies=3008; apple_clpc_sample(&c); assert(published==0 && queued_idle);
+}
+
 int main(void) {
  // T6040's supplier is always powered: it must NEVER substitute for work.
  struct apple_clpc_gpu gpu={0};
@@ -273,6 +287,7 @@ int main(void) {
  check_t8140();
  check_t8140_dense();
  check_t8140_ane();
+ check_low_power();
  check_t6040_ane();
  puts("PASS: T6040 and T8132 host demand; T8140 ANE, streaming, dense work, read errors and PMP backoff; idle release");
 }
