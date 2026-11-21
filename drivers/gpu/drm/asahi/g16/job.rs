@@ -94,6 +94,9 @@ pub(crate) struct Job {
     pub(crate) vm: Arc<VmState>,
     /// Validated commands, in submission order (at most 64).
     pub(crate) commands: KVec<Command>,
+    /// Some command traces rays: every command of the job gets the long execution allowance,
+    /// so an ordered helper cannot time out waiting for it.
+    long: bool,
     pub(crate) resources: super::resources::Prepared,
     /// Immutable dependency/order ledger, one entry for every accepted command.
     orders: KVec<Order>,
@@ -140,6 +143,7 @@ impl Job {
             return Err(EINVAL);
         }
         let progress = super::engine::Progress::new(commands.len());
+        let long = commands.iter().any(Command::long);
         let guard = MappingGuard {
             guard,
             _vm: vm.clone(),
@@ -150,6 +154,7 @@ impl Job {
                 queue,
                 vm,
                 commands,
+                long,
                 orders,
                 resources,
                 fence,
@@ -167,6 +172,11 @@ impl Job {
             }),
             GFP_KERNEL,
         )
+    }
+
+    /// Whether the job's flights get the long execution allowance ([`Command::long`]).
+    pub(crate) fn long(&self) -> bool {
+        self.long
     }
 
     /// Latches a hardware/publication failure before any later work can be published.

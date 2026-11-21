@@ -34,76 +34,146 @@ pub(crate) struct ComputeSlot {
     pub(crate) counter: Arc<FwObject>,
     pub(crate) context_store: Arc<FwObject>,
     pub(crate) aux: Arc<FwObject>,
+    /// Freelist entries of the unit's UMA pool, seeded once ([`init_uma_pool`]).
+    pub(crate) seeds: u32,
 }
 
+/// Where a compute unit lives and how large its UMA pool is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// The VM's base units: a 32 MiB pool at the unit's original client addresses.
+    Base,
+    /// SCS-capable units (ray-query scratch): a 64 MiB pool ([`super::rt::SCS_SEEDS`]) at
+    /// their own client addresses, sharing ledger index and UMA slot `1 + k` with base unit k.
+    Scs,
+}
+
+impl Placement {
+    fn pool(self, k: u64) -> u64 {
+        match self {
+            Placement::Base => client::compute_pool(k),
+            Placement::Scs => client::scs_compute_pool(k),
+        }
+    }
+    fn state(self, k: u64) -> u64 {
+        match self {
+            Placement::Base => client::compute_state(k),
+            Placement::Scs => client::scs_compute_state(k),
+        }
+    }
+    fn work(self, k: u64) -> u64 {
+        let index = match self {
+            Placement::Base => k,
+            Placement::Scs => sizes::COMPUTE_UNITS as u64 + k,
+        };
+        client::WORK_PAGE + index * client::CWORK_STRIDE
+    }
+    /// Freelist entries of the unit's pool.
+    pub(crate) fn seeds(self) -> u32 {
+        match self {
+            Placement::Base => super::rt::BASE_SEEDS,
+            Placement::Scs => super::rt::SCS_SEEDS,
+        }
+    }
+    /// Bytes of the unit's pool: its seeds of 4 KiB.
+    pub(crate) fn pool_bytes(self) -> usize {
+        match self {
+            Placement::Base => sizes::POOL_BYTES as usize,
+            Placement::Scs => sizes::SCS_POOL_SIZE as usize,
+        }
+    }
+}
+const _: () = assert!(
+    sizes::POOL_BYTES == super::rt::BASE_SEEDS as u64 * 0x1000
+        && sizes::SCS_POOL_SIZE == super::rt::SCS_SEEDS as u64 * 0x1000
+);
+
 /// Initializes the private pool exactly once, before it is exposed. Never called on reuse.
-pub(crate) fn init_uma_pool(state: &FwObject, list: &FwObject, pool: u64) -> Result {
-    if pool & 0x3fff != 0 {
+/// `seeds` 4-KiB freelist entries and their 2-MiB pool-table rows; 8192 is the 32 MiB pool
+/// every unit had before SCS.
+pub(crate) fn init_uma_pool(state: &FwObject, list: &FwObject, pool: u64, seeds: u32) -> Result {
+    let seeds = seeds as usize;
+    if pool & 0x3fff != 0
+        || seeds == 0
+        || seeds % super::rt::SEEDS_PER_ROW as usize != 0
+        || seeds > super::rt::FREELIST_RECORDS as usize
+    {
         return Err(EINVAL);
     }
     let mut chunk = [0u8; 512];
-    for first in (0..8192).step_by(64) {
+    for first in (0..seeds).step_by(64) {
         for j in 0..64 {
             chunk[j * 8..j * 8 + 8]
                 .copy_from_slice(&(pool + ((first + j) as u64) * 0x1000).to_le_bytes());
         }
         state.write(first * 8, &chunk)?;
     }
-    for i in 0..16 {
+    for i in 0..seeds / super::rt::SEEDS_PER_ROW as usize {
         list.w64(i * 64, (1u64 << 61) | (pool + i as u64 * 0x200000))?;
     }
     Ok(())
 }
 
 impl ComputeSlot {
-    pub(crate) fn new(o: &mut Objects, k: u64) -> Result<Self> {
+    /// Unit `k` at `placement`.
+    pub(crate) fn new_in(o: &mut Objects, k: u64, placement: Placement) -> Result<Self> {
         let sh = Class::Shared;
+        let state = placement.state(k);
         let unit = Self {
             its: alloc(o, 16, sh, None, 0, false)?,
             preempt: alloc(
                 o,
                 0x4000,
                 sh,
-                Client::nc(client::compute_preempt(k)),
+                Client::nc(state + client::COMPUTE_PREEMPT_OFF),
                 0,
                 false,
             )?,
-            work: alloc_work(o, 0x2000, client::WORK_PAGE + k * client::CWORK_STRIDE, 0)?,
+            work: alloc_work(o, 0x2000, placement.work(k), 0)?,
             seq: alloc(o, 0x300, cmd_fw(), None, 0, false)?,
             barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
             pool: o.alloc(super::object::Request {
-                size: 0x2000000,
+                size: placement.pool_bytes(),
                 class: sh,
                 placement: super::object::Placement::Anywhere,
                 offset: 0,
-                client: Some((client::compute_pool(k), super::hw::pte::LEAF_NC)),
+                client: Some((placement.pool(k), super::hw::pte::LEAF_NC)),
                 lower: None,
                 cpu: false,
             })?,
-            pool_state: alloc(
+            pool_state: alloc(o, 0x20000, sh, Client::nc(state), 0, false)?,
+            page_list: alloc(
                 o,
-                0x20000,
+                0x4000,
                 sh,
-                Client::nc(client::compute_state(k)),
+                Client::nc(state + client::COMPUTE_LIST_OFF),
                 0,
                 false,
             )?,
-            page_list: alloc(o, 0x4000, sh, Client::nc(client::compute_list(k)), 0, false)?,
             counter: alloc(o, 0x80, sh, None, 0, false)?,
             context_store: alloc(
                 o,
                 0x40000,
                 sh,
-                Client::nc(client::compute_context(k)),
+                Client::nc(state + client::COMPUTE_CONTEXT_OFF),
                 0,
                 false,
             )?,
-            aux: alloc(o, 0x4000, sh, Client::nc(client::compute_aux(k)), 0, false)?,
+            aux: alloc(
+                o,
+                0x4000,
+                sh,
+                Client::nc(state + client::COMPUTE_AUX_OFF),
+                0,
+                false,
+            )?,
+            seeds: placement.seeds(),
         };
         init_uma_pool(
             &unit.pool_state,
             &unit.page_list,
             unit.pool.gva.ok_or(EINVAL)?,
+            unit.seeds,
         )?;
         Ok(unit)
     }

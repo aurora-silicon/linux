@@ -133,8 +133,22 @@ fn write_records<const N: usize>(
     Ok(())
 }
 impl Allocator {
-    fn new(o: &mut Objects, k: u64, heap: &Arc<FwObject>) -> Result<Self> {
-        let base = client::render_base(k);
+    /// Render allocator `k`: the base one (32 MiB pool) or, with `scs`, the SCS-capable one
+    /// (64 MiB, [`super::rt::SCS_SEEDS`]) at its own client addresses.
+    fn new(o: &mut Objects, k: u64, heap: &Arc<FwObject>, scs: bool) -> Result<Self> {
+        let (pool_va, state_va, placement) = if scs {
+            (
+                client::scs_render_pool(k),
+                client::scs_render_state(k),
+                super::slots::Placement::Scs,
+            )
+        } else {
+            (
+                client::render_pool(k),
+                client::render_state(k),
+                super::slots::Placement::Base,
+            )
+        };
         let nc = |va| Some((va, pte::LEAF_NC));
         // Native UMA software metadata is ASC-owned and never needs a client GPU alias.
         // In particular its firmware pointers, +0x54 completion and +0x5c exclusion flag
@@ -144,28 +158,28 @@ impl Allocator {
             o,
             0x4000,
             Class::Shared,
-            nc(client::render_descriptor(k)),
+            nc(state_va + client::RENDER_DESCRIPTOR_OFF),
             false,
         )?;
-        let pool = alloc(
+        let pool = alloc(o, placement.pool_bytes(), Class::Shared, nc(pool_va), false)?;
+        let state = alloc(o, 0x20000, Class::Shared, nc(state_va), true)?;
+        let list = alloc(
             o,
-            0x2000000,
+            0x4000,
             Class::Shared,
-            nc(client::render_pool(k)),
-            false,
+            nc(state_va + client::RENDER_LIST_OFF),
+            true,
         )?;
-        let state = alloc(o, 0x20000, Class::Shared, nc(client::render_state(k)), true)?;
-        let list = alloc(o, 0x4000, Class::Shared, nc(client::render_list(k)), true)?;
         let submitted = alloc(o, 0x40, Class::Fw, None, true)?;
         let heap = heap.clone();
         let scene_list = alloc(
             o,
             buffer::SCENE_LIST_SIZE,
             Class::Shared,
-            nc(base + 0x2070000),
+            nc(state_va + client::RENDER_SCENE_LIST_OFF),
             true,
         )?;
-        super::slots::init_uma_pool(&state, &list, gva(&pool)?)?;
+        super::slots::init_uma_pool(&state, &list, gva(&pool)?, placement.seeds())?;
         descriptor.write(
             0,
             &buffer::uma_manager_image(
@@ -174,6 +188,7 @@ impl Allocator {
                 gva(&state)?,
                 gva(&list)?,
                 submitted.va,
+                placement.seeds(),
             ),
         )?;
         Ok(Self {
@@ -230,9 +245,23 @@ impl PoolSet {
         )?;
         let mut units = KVec::with_capacity(2, GFP_KERNEL)?;
         for k in 0..2 {
-            units.push(Allocator::new(o, k, &heap)?, GFP_KERNEL)?;
+            units.push(Allocator::new(o, k, &heap, false)?, GFP_KERNEL)?;
         }
         Ok(Self { units, heap_blocks })
+    }
+    /// The SCS-capable allocators of this set's VM (ray-query scratch): one per pass slot,
+    /// sharing this set's PB heap, each with a 64 MiB pool. A render uses either set's
+    /// allocator `k` with pass slot `k`; both alternate the one hardware UMA slot 33.
+    pub(crate) fn scs(&self, o: &mut Objects) -> Result<Self> {
+        let heap = &self.units.first().ok_or(EINVAL)?.heap;
+        let mut units = KVec::with_capacity(2, GFP_KERNEL)?;
+        for k in 0..2 {
+            units.push(Allocator::new(o, k, heap, true)?, GFP_KERNEL)?;
+        }
+        Ok(Self {
+            units,
+            heap_blocks: self.heap_blocks,
+        })
     }
     #[allow(dead_code)]
     pub(crate) fn allocator_refs_for(&self, k: usize) -> Result<AllocatorRefs> {
