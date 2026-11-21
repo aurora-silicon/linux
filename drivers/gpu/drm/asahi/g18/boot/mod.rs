@@ -37,9 +37,8 @@
 //! The GFX/GFX1 mailbox providers exist only when the loader enabled their
 //! nodes, which it does together with the firmware receipt. A missing
 //! provider is reported and turned into ENODEV, never EPROBE_DEFER, so the
-//! driver core cannot re-run a stage in a deferral loop. The providers
-//! receive by polling unless `apple_mailbox.ascwrap_v8_rx_irq=1` (REQUIRES
-//! USER APPROVAL), so no GPU mailbox interrupt is enabled by default.
+//! driver core cannot re-run a stage in a deferral loop. Like the other
+//! ASC mailboxes, a provider receives by interrupt while it is started.
 //!
 //! Safety rules this module follows:
 //! - Every SGX or ASC wrapper MMIO read follows a PSD read of that block that

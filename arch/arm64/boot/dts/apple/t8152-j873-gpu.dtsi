@@ -24,9 +24,7 @@
  *    both together with the /chosen aurora,g18g-gpu-firmware-profile
  *    property, and only after it has checked the loaded firmware images.
  *    Even then the provider only maps its windows: ASC CPU control is
- *    refused unless apple_mailbox.ascwrap_v8_cpu_control=1 is given, and the
- *    receive side is polled, with no interrupt enabled, unless
- *    apple_mailbox.ascwrap_v8_rx_irq=1 is given.
+ *    refused unless apple_mailbox.ascwrap_v8_cpu_control=1 is given.
  *
  * No power-domain is attached. The GPU is powered by PMGR2 PSD services 3
  * (sgx), 81 (gfx-asc) and 82 (gfx1-asc). Their 0x100-byte service blocks
@@ -120,7 +118,7 @@
 	 * (0x316020000 + (2 * 1 + 0) * 0x80) is claimed; the rest of the
 	 * 0x316020000 bank belongs to PMP, DCP, DCPEXT and SCALER0.
 	 * Interrupt index 0 is send-empty and index 1 recv-not-empty, as in
-	 * the macOS ASCWrap v8 driver. The provider polls by default.
+	 * the macOS ASCWrap v8 driver.
 	 */
 	gfx_asc: mailbox@582600000 {
 		compatible = "apple,t8152-gfx-ascwrap-v8";
