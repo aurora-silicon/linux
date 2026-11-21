@@ -632,6 +632,7 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 	struct drm_crtc *crtc;
 	struct drm_encoder *encoder;
 	struct drm_connector *connector;
+	int connector_type = DRM_MODE_CONNECTOR_Unknown;
 	unsigned long max_width, max_height;
 	size_t nformats;
 	int ret;
@@ -688,6 +689,7 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 			return ERR_CAST(mem);
 		panel_node = of_parse_phandle(of_node, "panel", 0);
 		if (panel_node) {
+			connector_type = DRM_MODE_CONNECTOR_eDP;
 			/*
 			 * Ignore errors from parsing the physical panel
 			 * size. Using the pre-initialized sizes of 0 will
@@ -865,7 +867,7 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 
 	connector = &sdev->connector;
 	ret = drm_connector_init(dev, connector, &simpledrm_connector_funcs,
-				 DRM_MODE_CONNECTOR_Unknown);
+				 connector_type);
 	if (ret)
 		return ERR_PTR(ret);
 	drm_connector_helper_add(connector, &simpledrm_connector_helper_funcs);
