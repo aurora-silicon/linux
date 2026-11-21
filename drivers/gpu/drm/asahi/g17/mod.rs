@@ -1921,8 +1921,12 @@ impl Gpu {
             "unsupported GPU firmware build: {}\n",
             measured.identity(builds.iter().flat_map(|build| build.images))
         );
-        for image in builds.iter().flat_map(|build| build.images) {
-            dev_err!(dev.as_ref(), "supported: {}\n", image.name);
+        // Builds that differ only in their core layout share an image: list each image once.
+        let images = || builds.iter().flat_map(|build| build.images);
+        for (i, image) in images().enumerate() {
+            if !images().take(i).any(|seen| core::ptr::eq(seen, image)) {
+                dev_err!(dev.as_ref(), "supported: {}\n", image.name);
+            }
         }
         dev_err!(
             dev.as_ref(),
@@ -1936,16 +1940,26 @@ impl Gpu {
     /// region, for [`Self::firmware_variant`] to identify among the builds. The version
     /// property is only a selection hint.
     fn measure_text(dev: &AsahiDrmDevice) -> Result<crate::fwid::Measured> {
-        let node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
-        let text = node.reserved_mem_region_to_resource_byname(c_str!("fw-text"))?;
-        let data = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
-        let start = text.start();
-        let end = start.checked_add(text.size()).ok_or(EINVAL)?;
-        crate::fwid::measure(start..end, data.size()).inspect_err(|e| {
+        let measure = || {
+            let node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
+            let text = node.reserved_mem_region_to_resource_byname(c_str!("fw-text"))?;
+            let data = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
+            let start = text.start();
+            let end = start.checked_add(text.size()).ok_or(EINVAL)?;
+            crate::fwid::measure(start..end, data.size())
+        };
+        measure().inspect_err(|e| {
             if *e == EAGAIN {
                 dev_err!(
                     dev.as_ref(),
                     "GPU firmware TEXT changed while it was measured\n"
+                );
+            } else {
+                // A missing or bad fw-text/fw-data region: a DT or boot loader mismatch.
+                dev_err!(
+                    dev.as_ref(),
+                    "GPU firmware image not measured (fw-text/fw-data): {:?}\n",
+                    e
                 );
             }
         })
