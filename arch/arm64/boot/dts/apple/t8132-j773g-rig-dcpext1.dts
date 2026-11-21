@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * TEST (lab mini only, not for merging): the rig tree with dcpext1's chain
+ * enabled statically, for a boot whose Image predates the display gate's
+ * dcpext1 stage. On macOS 27.2 aura hands dcpext1 over (firmware memory,
+ * 27.2 identity); the old gate then enables only the HDMI chain and points
+ * the display subsystem at dispext0's DART, which is enough to see dcpext1
+ * boot and open its DPTX services. The merged form is the gate stage.
+ */
+
+#include "t8132-j773g-rig.dts"
+
+&dcpext1_dart {
+	status = "okay";
+};
+
+&dispext1_dart {
+	status = "okay";
+};
+
+&dcpext1_mbox {
+	status = "okay";
+};
+
+&dcpext1_piodma {
+	status = "okay";
+};
+
+&dcpext1 {
+	status = "okay";
+};
