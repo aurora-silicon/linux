@@ -38,6 +38,8 @@ pub(crate) struct InitData {
     #[allow(dead_code)]
     pub(crate) parameter: Arc<FwObject>,
     root: Arc<FwObject>,
+    /// Rows of the board's firmware performance table, including off.
+    pub(crate) rows: u32,
     loader: [u8; wire::LOADER_BYTES],
     /// The complete inventory, including firmware-only log and retention data.
     _graph: KVec<Arc<FwObject>>,
@@ -83,7 +85,10 @@ pub(crate) fn build(
     objects: &mut Objects,
 ) -> Result<(InitData, Channels, u32)> {
     let performance = board::qualify(dev, adt)?;
-    let max_khz = performance.frequency[wire::PERF_STATES - 1] * 1000;
+    // The top row: S9 on J713, S10 on J773g.
+    let ceiling = performance.count as u32 - 1;
+    let rows = performance.count as u32;
+    let max_khz = performance.frequency[ceiling as usize] * 1000;
     let mut graph = KVec::with_capacity(wire::OBJECT_COUNT, GFP_KERNEL)?;
     for (i, size) in wire::OBJECT_SIZE.iter().copied().enumerate() {
         let lower = match i {
@@ -184,11 +189,11 @@ pub(crate) fn build(
         }
         let array: &mut [&mut [u8]; wire::OBJECT_COUNT] =
             (&mut slices[..]).try_into().map_err(|_| EINVAL)?;
-        wire::encode(array, &input, 9).map_err(|()| EINVAL)?;
+        wire::encode(array, &input, ceiling).map_err(|()| EINVAL)?;
     }
     let mut loader = [0u8; wire::LOADER_BYTES];
     loader.copy_from_slice(&images[id::MAIN][0x640..0x640 + wire::LOADER_BYTES]);
-    // Host startup policy: Main and PowerPerformance contain S9, but the
+    // Host startup policy: Main and PowerPerformance contain the top row, but the
     // published selectors remain S1 until the thermal owner admits a raise.
     for at in globals::PSTATE_SELECTORS {
         images[id::GLOBALS][at..at + 4].copy_from_slice(&100u32.to_le_bytes());
@@ -197,7 +202,11 @@ pub(crate) fn build(
         graph[i].write(0, &images[i])?;
     }
 
-    dev_info!(dev, "M4 initdata: 31 objects, 12 submit channel pairs, 42 loader records, S1 startup (S9 tables)\n");
+    dev_info!(
+        dev,
+        "M4 initdata: 31 objects, 12 submit channel pairs, 42 loader records, S1 startup (S{} tables)\n",
+        ceiling
+    );
     Ok((
         InitData {
             globals: Some(graph[id::GLOBALS].clone()),
@@ -213,6 +222,7 @@ pub(crate) fn build(
             uma: graph[id::UMA].clone(),
             parameter: graph[id::PARAMETER].clone(),
             root: graph[id::ROOT].clone(),
+            rows,
             loader,
             _graph: graph,
         },
