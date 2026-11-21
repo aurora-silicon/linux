@@ -208,10 +208,10 @@ static const struct ave_variant ave_t6050 = {
 
 /*
  * The M5 (T8142) with the macOS 27.0 stub runs the 26A428 build of the
- * firmware compiled for its chip (AppleAVE2FW_H17G, 9013.45.1, the version
+ * firmware compiled for its chip (9013.45.1, the version
  * T6050 runs): TEXT 0x154000 and DATA 0x12c000, TEXT CRC 8a3784bd.
  *
- * The chip identity comes from AppleAVE2's soc-id table (ADT ave soc-id
+ * The chip identity comes from the ADT (ave soc-id
  * "t8142"): device 27, generation 16. The 26A428 firmware carries the same
  * device table, and on T6050 (device 28 in both) the traced boot
  * configuration and handshake both name that number. Generation 16 shares
