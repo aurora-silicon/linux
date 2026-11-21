@@ -44,6 +44,7 @@ struct typec_thunderbolt_switch_dev {
 	struct module *owner;
 	typec_thunderbolt_switch_set_fn_t set;
 	struct atomic_notifier_head notifiers;
+	bool pd_ordered_stop;
 };
 
 #define to_typec_thunderbolt_switch_dev(_dev_) \

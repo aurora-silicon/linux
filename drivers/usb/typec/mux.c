@@ -921,6 +921,24 @@ bool typec_thunderbolt_switch_is_live(struct typec_thunderbolt_switch *sw)
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_is_live);
 
 /**
+ * typec_thunderbolt_switch_pd_ordered_stop - Whether the port driver stops the switch
+ * @sw: USB4/Thunderbolt switch
+ *
+ * Returns true if the bound provider asked the Type-C port driver to stop
+ * it before tasks freeze and at shutdown (see struct
+ * typec_thunderbolt_switch_desc), false for any other or no provider.
+ */
+bool typec_thunderbolt_switch_pd_ordered_stop(struct typec_thunderbolt_switch *sw)
+{
+	if (IS_ERR_OR_NULL(sw))
+		return false;
+
+	guard(rwsem_read)(&sw->sw_dev->set_lock);
+	return sw->sw_dev->set && sw->sw_dev->pd_ordered_stop;
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_pd_ordered_stop);
+
+/**
  * typec_thunderbolt_switch_set - Forward cable details to USB4/Thunderbolt switch
  * @sw: USB4/Thunderbolt switch
  * @data: Cable state and details
@@ -1086,6 +1104,7 @@ typec_thunderbolt_switch_register(struct device *parent,
 	init_rwsem(&sw_dev->set_lock);
 	sw_dev->owner = parent->driver ? parent->driver->owner : NULL;
 	sw_dev->set = desc->set;
+	sw_dev->pd_ordered_stop = desc->pd_ordered_stop;
 
 	device_initialize(&sw_dev->dev);
 	sw_dev->dev.parent = parent;

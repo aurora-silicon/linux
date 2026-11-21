@@ -257,12 +257,16 @@ typedef int (*typec_thunderbolt_switch_set_fn_t)(struct typec_thunderbolt_switch
  * @set: Callback invoked with the cable details on connection changes
  * @name: Optional switch name, the parent device name is used if not set
  * @drvdata: Private data
+ * @pd_ordered_stop: The switch must be stopped by the Type-C port driver,
+ *	before tasks freeze and at shutdown, ahead of the USB role and PHY
+ *	(TYPEC_THUNDERBOLT_SWITCH_SLEEP / _OFF), instead of on its own
  */
 struct typec_thunderbolt_switch_desc {
 	struct fwnode_handle *fwnode;
 	typec_thunderbolt_switch_set_fn_t set;
 	const char *name;
 	void *drvdata;
+	bool pd_ordered_stop;
 };
 
 #if IS_ENABLED(CONFIG_TYPEC)
@@ -271,6 +275,7 @@ struct typec_thunderbolt_switch *
 fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *fwnode);
 void typec_thunderbolt_switch_put(struct typec_thunderbolt_switch *sw);
 bool typec_thunderbolt_switch_is_live(struct typec_thunderbolt_switch *sw);
+bool typec_thunderbolt_switch_pd_ordered_stop(struct typec_thunderbolt_switch *sw);
 int typec_thunderbolt_switch_set(struct typec_thunderbolt_switch *sw,
 				 const struct typec_thunderbolt_switch_data *data);
 int typec_thunderbolt_switch_register_notifier(struct typec_thunderbolt_switch *sw,
@@ -322,6 +327,12 @@ typec_thunderbolt_switch_register(struct device *parent,
 
 static inline bool
 typec_thunderbolt_switch_is_live(struct typec_thunderbolt_switch *sw)
+{
+	return false;
+}
+
+static inline bool
+typec_thunderbolt_switch_pd_ordered_stop(struct typec_thunderbolt_switch *sw)
 {
 	return false;
 }
