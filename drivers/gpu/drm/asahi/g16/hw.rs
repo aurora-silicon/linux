@@ -79,6 +79,21 @@ pub(crate) mod t8132 {
                     0xc8, 0x29, 0x86, 0x8b, 0xc9, 0xcf,
                 ],
             },
+            FirmwareBuild {
+                // The same 25G83 image as loaded by iBoot on a J715 (Mac16,13, 15-inch M4
+                // Air, OS firmware 26.6.2): the J713 entries' sizes and entropy records,
+                // a different iBoot-filled block.
+                name: "Apple GFX 25G83 (normalized loaded image, J715)",
+                text_size: 0x60000,
+                data_size: 0x13c000,
+                entropy: &[[0x5c8df, 0x5c9c2]],
+                boot_filled: &[],
+                text_sha256: [
+                    0xcc, 0xeb, 0x3f, 0x98, 0x01, 0xc3, 0x0a, 0x6c, 0x25, 0x7d, 0x61, 0x92, 0x5f,
+                    0x84, 0x95, 0x57, 0x44, 0x5f, 0x4c, 0xa0, 0x54, 0xd6, 0x52, 0xee, 0x07, 0xe7,
+                    0x06, 0x51, 0x50, 0x4d, 0x53, 0x13,
+                ],
+            },
         ],
     };
 }
