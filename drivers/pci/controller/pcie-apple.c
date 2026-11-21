@@ -6863,19 +6863,15 @@ static int apple_pcie_check_d0(struct pci_dev *pdev, void *data)
 	return *error;
 }
 
-static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
+/*
+ * Every host whose links the boot loader trained (hw->adopt_link) keeps them
+ * across suspend-to-idle: the root complex and every port's link must still
+ * be up, read from the hardware. Deeper sleep remains unqualified.
+ */
+static int apple_pcie_adopted_links_ready(struct apple_pcie *pcie)
 {
-	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
 	struct apple_pcie_port *port;
-	int error = 0;
 
-	/*
-	 * Every host whose links the boot loader trained (hw->adopt_link) keeps
-	 * them across suspend-to-idle: the root complex, every port's link and
-	 * the devices below must still be up and in D0, which the checks below
-	 * read from the hardware, before and after the sleep. Deeper sleep
-	 * remains unqualified.
-	 */
 	if (!pm_suspend_no_platform())
 		return -EBUSY;
 
@@ -6891,6 +6887,17 @@ static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
 		    (apple_pcie_port_readl(port, PORT_INTSTAT) & BIT(PORT_INT_LINK_DOWN)))
 			return -ENOLINK;
 	}
+	return 0;
+}
+
+/* ... and the devices below must still be in D0, before and after the sleep. */
+static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	int error = apple_pcie_adopted_links_ready(pcie);
+
+	if (error)
+		return error;
 	pci_walk_bus(bridge->bus, apple_pcie_check_d0, &error);
 	return error;
 }
@@ -7571,6 +7578,24 @@ static int apple_pcie_prepare(struct device *dev)
 	    !apple_pcie_can_keep_link(pcie)) {
 		dev_warn(dev, "no CIO sleep transaction from the NHI; refusing sleep\n");
 		return -EBUSY;
+	}
+	/*
+	 * An adopted link that apple_pcie_suspend_noirq() would refuse to keep:
+	 * refuse now. Refused there, the root ports and endpoints below have
+	 * already suspended to D3hot, this host gets no noirq resume, and nothing
+	 * retrains their links before their drivers resume.
+	 */
+	if (pcie && !pcie->cio_prepared && !pcie->neo_sleep_armed &&
+	    !pcie->managed_sids && pcie->hw->adopt_link &&
+	    !READ_ONCE(pcie->t6050_down) &&
+	    pm_suspend_target_state != PM_SUSPEND_ON && !pm_suspend_via_firmware()) {
+		int ret = apple_pcie_adopted_links_ready(pcie);
+
+		if (ret) {
+			dev_warn(dev, "adopted link not kept for this sleep (%d); refusing\n",
+				 ret);
+			return ret;
+		}
 	}
 	return apple_radio_prepare(dev);
 }
