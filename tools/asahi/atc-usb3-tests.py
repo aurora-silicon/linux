@@ -99,6 +99,8 @@ struct apple_atcphy {
     enum atcphy_mode typec_mode;
     bool pipe_pending, t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround, mode_dirty, usb_off_pending;
     bool host_active, usb3_port_off, dp_only, ss_tunables, fixed_usb2, t8140_dp_tunables, dp_tunables;
+    /* Fixed SuperSpeed lanes: their start before the reset release is modeled. */
+    bool fixed_ss;
     /* T8132 ownership is tested without entering its lane-setup backend. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     struct { void *usb3_dp; } tunables;
@@ -117,6 +119,7 @@ static unsigned polls, sleeps, sets, clears, muxes, bist_old, bist_new;
 static unsigned configure_calls, restore_calls, unlocks, warnings;
 static unsigned dummy_muxes, pending_seen_at_unlock;
 static unsigned usb2_power_off_calls;
+static unsigned fixed_ss_starts;
 static unsigned ack_on;
 static int check_ret, bist_ret, unlock_ret, configure_ret;
 static bool concurrent_override_change;
@@ -188,6 +191,14 @@ static int atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *a) 
 static void atcphy_usb2_power_on(struct apple_atcphy *a) {
     (void)a; assert(!"USB2-only power restore reached");
 }
+/* The lanes and the PIPE come up before the controller leaves reset. */
+static void atcphy_fixed_ss_start(struct apple_atcphy *a) {
+    assert(a->fixed_ss);
+    assert(readl(a->regs.pipehandler + PIPEHANDLER_AON_GEN) & PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+    assert(!(readl(a->regs.pipehandler + PIPEHANDLER_AON_GEN) & PIPEHANDLER_AON_GEN_DWC3_RESET_N));
+    fixed_ss_starts++;
+    a->pipe_state = ATCPHY_PIPEHANDLER_STATE_USB3;
+}
 static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode) {
     /* ACTUAL_CONFIGURE_ENTRY */
     struct apple_atcphy *a = atcphy;
@@ -211,6 +222,7 @@ static void reset(enum atcphy_generation generation, bool t8140) {
     configure_calls = restore_calls = unlocks = warnings = reports = 0;
     dummy_muxes = pending_seen_at_unlock = 0;
     usb2_power_off_calls = 0;
+    fixed_ss_starts = 0;
     ack_on = 1;
     check_ret = bist_ret = unlock_ret = configure_ret = 0;
     concurrent_override_change = false;
@@ -436,6 +448,37 @@ static void target_mode_table_and_dirty(void) {
  p.mode=APPLE_ATCPHY_MODE_USB3;p.mode_dirty=true;assert(atcphy_usb3_route(&p,true)==-EBUSY);assert(!muxes&&!configure_calls);
  p.mode_dirty=false;p.usb_off_pending=true;assert(atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0)==-EBUSY);
 }
+static void fixed_ss_handover_before_reset_release(void) {
+ /* No PIPE lock: the dummy PHY stays off until the host is set up. */
+ for (unsigned fixed=0;fixed<2;fixed++) {
+  reset(ATCPHY_GENERATION_T8132,false);hw.usb2_only=true;p.t8132_ss=true;p.fixed_usb2=true;p.fixed_ss=fixed;
+  atcphy_setup_pipehandler(&p);
+  assert(p.pipe_state==ATCPHY_PIPEHANDLER_STATE_DUMMY&&dummy_muxes==1);
+  assert(!!(readl(memory+PIPEHANDLER_NONSELECTED_OVERRIDE)&PIPEHANDLER_DUMMY_PHY_EN)==!fixed);
+ }
+ /* The reset is released only after the lanes and the PIPE came up, which a power-off took down. */
+ reset(ATCPHY_GENERATION_T8132,false);hw.usb2_only=true;p.t8132_ss=true;p.fixed_usb2=p.fixed_ss=true;
+ p.typec_mode=APPLE_ATCPHY_MODE_USB3_DP;
+ set32(memory+PIPEHANDLER_AON_GEN,PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+ assert(!atcphy_dwc3_reset_deassert(&p.rcdev,0));
+ assert(fixed_ss_starts==1&&readl(memory+PIPEHANDLER_AON_GEN)==PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+ /* Without the lanes the release is as before. */
+ reset(ATCPHY_GENERATION_T8132,false);hw.usb2_only=true;p.t8132_ss=true;p.fixed_usb2=true;
+ assert(!atcphy_dwc3_reset_deassert(&p.rcdev,0));assert(!fixed_ss_starts);
+ /* The host then finds its PIPE routed and only enables the dummy PHY beside it. */
+ for (unsigned fixed=0;fixed<2;fixed++) {
+  reset(ATCPHY_GENERATION_T8132,false);hw.usb2_only=true;p.t8132_ss=true;p.fixed_usb2=true;p.fixed_ss=fixed;
+  p.mode=p.typec_mode=APPLE_ATCPHY_MODE_USB3_DP;p.pipe_state=ATCPHY_PIPEHANDLER_STATE_USB3;
+  assert(!atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0));
+  assert(p.host_active&&!configure_calls&&!muxes&&!polls&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
+  assert(!!(readl(memory+PIPEHANDLER_NONSELECTED_OVERRIDE)&PIPEHANDLER_DUMMY_PHY_EN)==fixed);
+ }
+ /* Nor on a PIPE that did not come over. */
+ reset(ATCPHY_GENERATION_T8132,false);hw.usb2_only=true;p.t8132_ss=true;p.fixed_usb2=p.fixed_ss=true;
+ p.mode=p.typec_mode=APPLE_ATCPHY_MODE_USB3_DP;p.t8132_failed=true;p.pipe_pending=true;
+ assert(!atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0));
+ assert(!(readl(memory+PIPEHANDLER_NONSELECTED_OVERRIDE)&PIPEHANDLER_DUMMY_PHY_EN));
+}
 static void live_park_finishes_generic_pending(void) {
  setup_legacy_usb3(); p.pipe_pending=true;
  assert(!atcphy_park_pipehandler(&p,false));
@@ -615,7 +658,7 @@ int main(void) {
  TEST(live_lock_failure_restores_masks);TEST(live_park_then_pending_completion);TEST(legacy_live_dispatch_and_generation);TEST(pending_blocks_lane_and_backend);
  TEST(canceled_lane_change_reconnects);TEST(role_finishes_pending);TEST(target_failure_preserves_reconnect);TEST(nonusb_commit_clears_retry);TEST(dp_assignment_d_retains_usb3);TEST(modern_safe_refusal_retained);
  TEST(fixed_hub_host_dispatch);TEST(reset_release_retries_before_writes);TEST(reset_assert_failure_and_stop);TEST(power_off_preserves_dp_and_finishes_pending);TEST(t8132_usb_stop_keeps_cio_until_mux_disconnect);TEST(setup_known_reset_clears_obligations);TEST(target_mode_table_and_dirty);
- TEST(lock_timeout_left_to_caller);
+ TEST(lock_timeout_left_to_caller);TEST(fixed_ss_handover_before_reset_release);
  printf("%u ATCPHY USB3 host cases passed\n",tests);
 }
 '''
@@ -866,6 +909,15 @@ MUTATIONS = {'t8132-usb-stop-keeps-dirty-cio': ('atcphy_usb3_power_off',
                                 'clear32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN, '
                                 'PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);\n'
                                 '\tif (atcphy->t8103_dummy_pending) {'),
+ 'fixed-ss-dummy-phy-at-probe': ('void atcphy_setup_pipehandler',
+                                 'atcphy->t8132_ss && !atcphy->fixed_ss', 'atcphy->t8132_ss'),
+ 'fixed-ss-start-after-release': ('atcphy_dwc3_reset_deassert',
+                                  '\tif (atcphy->fixed_ss)\n\t\tatcphy_fixed_ss_start(atcphy);\n',
+                                  '\tset32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN, '
+                                  'PIPEHANDLER_AON_GEN_DWC3_RESET_N);\n'
+                                  '\tif (atcphy->fixed_ss)\n\t\tatcphy_fixed_ss_start(atcphy);\n'),
+ 'fixed-ss-no-dummy-phy-for-host': ('atcphy_usb3_set_mode',
+                                    'atcphy->fixed_ss && mode == PHY_MODE_USB_HOST', 'false'),
  'reset-no-retry-clear': ('atcphy_dwc3_reset_assert',
                           'atcphy->t8103_usb3_retry = false;',
                           '(void)0;'),
