@@ -161,7 +161,7 @@
 		reg-names = "core", "lpdptx", "axi2af", "lioa";
 		#phy-cells = <1>;
 		#reset-cells = <0>;
-		orientation-switch;
+		/* dcpext1 finds this PHY's mux over the graph to select DisplayPort. */
 		mode-switch;
 		power-domains = <&pmp_report_atc2>;
 
