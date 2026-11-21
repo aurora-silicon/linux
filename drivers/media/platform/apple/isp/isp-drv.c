@@ -1464,6 +1464,7 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
 	.scl1 = true,
 	.lpdp = false,
 	.meta_size = ISP_META_SIZE_T8140,
+	.meta_exposure = true,
 	.dapf_from_dt = true,
 
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
