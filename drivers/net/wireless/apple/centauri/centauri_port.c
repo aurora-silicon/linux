@@ -11,7 +11,10 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/of.h>
+#include <linux/mfd/macsmc.h>
+#include <linux/of_platform.h>
 #include <linux/pci.h>
+#include <linux/platform_device.h>
 #include "centauri.h"
 
 static void update(void __iomem *base, u32 offset, u32 clear, u32 set)
@@ -26,7 +29,100 @@ static bool wait_bits(void __iomem *address, u32 mask, u32 wanted, u32 us)
 	return !readl_poll_timeout(address, value, (value & mask) == wanted, 100, us);
 }
 
-int centauri_port_cycle(struct pci_dev *pdev)
+#define CEN_WARM_WRITES_MAX 4
+
+/*
+ * The N1's warm reset, as the root port describes it (bindings/pci/apple,pcie.yaml, as on the
+ * T6050 boards): "apple,function-warm-reset" names the SMC and the key (the ADT's pci-bridge0
+ * function-warm_reset), "apple,warm-reset-writes" the writes: the key's value, its bytes from
+ * the cell's most significant down, and the wait after it in microseconds. Reads them into
+ * @writes and returns how many, with the SMC's device (a reference) in *smc_pdev, or an error.
+ */
+static int warm_reset_parse(struct pci_dev *pdev, struct platform_device **smc_pdev, u32 *key,
+			    u32 writes[2 * CEN_WARM_WRITES_MAX])
+{
+	struct pci_dev *bridge = pdev->bus->self;
+	struct device_node *np = bridge ? pci_device_to_OF_node(bridge) : NULL;
+	struct of_phandle_args fn;
+	int count, i;
+
+	*smc_pdev = NULL;
+	if (!IS_REACHABLE(CONFIG_MFD_MACSMC) || !np ||
+	    of_parse_phandle_with_fixed_args(np, "apple,function-warm-reset", 2, 0, &fn))
+		return -ENODEV;
+	*smc_pdev = of_find_device_by_node(fn.np);
+	of_node_put(fn.np);
+	if (!*smc_pdev)
+		return -ENODEV;
+	*key = fn.args[0];
+	count = of_property_count_u32_elems(np, "apple,warm-reset-writes");
+	if (count < 2 || count % 2 || count > 2 * CEN_WARM_WRITES_MAX ||
+	    of_property_read_u32_array(np, "apple,warm-reset-writes", writes, count))
+		goto bad;
+	for (i = 1; i < count; i += 2)
+		if (writes[i] > 100 * USEC_PER_MSEC)
+			goto bad;
+	return count / 2;
+bad:
+	put_device(&(*smc_pdev)->dev);
+	*smc_pdev = NULL;
+	return -EINVAL;
+}
+
+/*
+ * The root port describes a warm reset, and centauri_port_cycle() can cycle this port: only
+ * then does the driver restart a stopped N1, so a restart never tears the functions down on a
+ * board whose port cycle would refuse.
+ */
+bool centauri_warm_reset_described(struct pci_dev *pdev)
+{
+	const struct centauri_board *board = centauri_board();
+	struct pci_dev *bridge = pdev->bus->self;
+	u32 key, writes[2 * CEN_WARM_WRITES_MAX];
+	struct platform_device *smc_pdev;
+
+	if (!board || !board->port || !bridge || bridge->vendor != PCI_VENDOR_ID_APPLE ||
+	    (board->bridge_id && bridge->device != board->bridge_id))
+		return false;
+	if (warm_reset_parse(pdev, &smc_pdev, &key, writes) <= 0)
+		return false;
+	put_device(&smc_pdev->dev);
+	return true;
+}
+
+/*
+ * Given while the port is down and not set up: the link then trains a chip that was just
+ * reset. PERST# alone leaves the firmware running.
+ */
+static int warm_reset(struct pci_dev *pdev)
+{
+	u32 key, writes[2 * CEN_WARM_WRITES_MAX];
+	struct platform_device *smc_pdev;
+	struct apple_smc *smc;
+	int count, i, ret = 0;
+
+	count = warm_reset_parse(pdev, &smc_pdev, &key, writes);
+	if (count <= 0) {
+		ret = count ?: -ENODEV;
+		goto out;
+	}
+	smc = platform_get_drvdata(smc_pdev);
+	if (!smc)
+		ret = -ENODEV;
+	for (i = 0; i < count && !ret; i++) {
+		__be32 value = cpu_to_be32(writes[2 * i]);
+
+		ret = apple_smc_write(smc, key, &value, sizeof(value));
+		if (!ret)
+			fsleep(writes[2 * i + 1]);
+	}
+	put_device(&smc_pdev->dev);
+out:
+	dev_info(&pdev->dev, "warm reset through the SMC: %d\n", ret);
+	return ret;
+}
+
+int centauri_port_cycle(struct pci_dev *pdev, bool reset_chip)
 {
 	static const u32 reset[][2] = {
 		{0x88, 0x110}, {0x100, ~0U}, {0x148, ~0U}, {0x210, ~0U},
@@ -141,6 +237,8 @@ int centauri_port_cycle(struct pci_dev *pdev)
 		writel(0, port + 0x3800 + 4 * i);
 	for (i = 0; i < ARRAY_SIZE(tune); i++)
 		writel(tune[i][1], port + tune[i][0]);
+	if (reset_chip)
+		warm_reset(pdev);
 	update(port, 0x800, 0, 1);
 	udelay(10);
 	update(phy, 0, 0, 1);
