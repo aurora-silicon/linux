@@ -41,6 +41,7 @@ pub const drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES: drm_asahi_cmd_type 
 pub const drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_RESOURCES: drm_asahi_cmd_type = 6;
 pub const drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES_V2: drm_asahi_cmd_type = 7;
 pub const drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES: drm_asahi_render_flags = 8388608;
+pub const drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: drm_asahi_compute_flags = 131072;
 '''
 BINDINGS = OUT / 'm5-uapi.rs'
 BINDINGS.write_text('include!(' + json.dumps(str(FLAT)) + ');\n' + M5_UAPI)
@@ -309,6 +310,13 @@ fn unsupported_flags_and_compute_fields() {
     for flag in [1u32,4,1<<19,FRAGMENT_BARRIERS] {
         let mut r=render(); r.flags=flag;
         assert!(check_stream(&entry(CMD_RENDER,&data(&r)[..256],[NONE;2]),false).is_err());
+    }
+    let mut c=compute();
+    c.flags=COMPUTE_NO_QUERY_ACCESS;
+    assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_ok());
+    for bad in [1u32, 1<<16, 1<<18, COMPUTE_NO_QUERY_ACCESS | 1] {
+        c.flags=bad;
+        assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());
     }
     let mut c=compute();
     c.scs_layout=1;

@@ -195,6 +195,8 @@ pub(crate) struct Flight {
     pub(crate) pb_binding: u64,
     /// Whether this render carries InitBM (priming renders always drain before pipelining).
     pub(crate) initbm: bool,
+    /// Whether this flight publishes CPU-written command timestamps on retirement.
+    pub(crate) has_timestamps: bool,
 }
 
 impl Flight {
@@ -229,6 +231,7 @@ impl Flight {
             pb_slot: 0,
             pb_binding: 0,
             initbm: false,
+            has_timestamps: false,
         }
     }
 }
@@ -959,7 +962,10 @@ impl Firmware {
     /// Whether `job`'s next command may be published behind the flights in flight:
     ///
     /// - Compute queues behind healthy same-VM compute flights (up to
-    ///   [`params::compute_flights`]), each in its own `ComputeSlot` (`its`/`work`).
+    ///   [`params::compute_flights`]), each in its own `ComputeSlot` (`its`/`work`), unless
+    ///   `query_access` is set and a same-queue predecessor in its compute barrier prefix has
+    ///   CPU-published timestamp outputs that have not retired yet
+    ///   (`DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS` clears `query_access`).
     /// - Render queues behind healthy same-VM non-InitBM render flights (up to
     ///   [`params::render_flights`]), rotating `PassSlot` (`0..RENDER_SLOTS`) while sharing the
     ///   active exposed PB/UMA allocator slot (`Pools::can_pipeline`). Hardware barriers on the
@@ -981,8 +987,22 @@ impl Firmware {
             return false;
         }
         match command(job, sent) {
-            Some(Command::Compute(_)) => {
-                e.flights.len() < params::compute_flights()
+            Some(Command::Compute(c)) => {
+                let waits_for_timestamps = c.query_access
+                    && job
+                        .command_order(sent)
+                        .and_then(|o| o.wait_through[super::command::COMPUTE])
+                        .is_some_and(|last| {
+                            e.flights.iter().any(|f| {
+                                f.has_timestamps
+                                    && Arc::ptr_eq(&f.job.queue, &job.queue)
+                                    && f.job
+                                        .command_order(f.first as u32)
+                                        .is_none_or(|fo| fo.sequence <= last)
+                            })
+                        });
+                !waits_for_timestamps
+                    && e.flights.len() < params::compute_flights()
                     && e.flights.iter().all(|f| f.renders == 0)
                     && !self.slots.compute_exhausted()
                     && super::recovery::logic::next_ordinal(e.ordinal).is_some()
@@ -1489,6 +1509,7 @@ impl Firmware {
         }
         s.work.write(0, w)?;
         f.uma_submitted = submitted;
+        f.has_timestamps = !cmd.timestamp_outputs.is_empty();
         wmb();
         g.ring.w64(8 * pf.c_head as usize, s.work.va)?;
         pf.c_head = (pf.c_head + 1) % sizes::QUEUE_CAP;

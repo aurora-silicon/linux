@@ -29,7 +29,8 @@ const ETIMEDOUT:Error=Error(110);const ECANCELED:Error=Error(125);const EOVERFLO
 type Result<T=()> = std::result::Result<T,Error>;
 macro_rules! dev_err {($($argument:tt)*)=>{()};}
 __PUBLICATION_ERROR__
-#[derive(Copy,Clone)]enum Command { Compute(()), Render(()) }
+#[derive(Copy,Clone)]struct ComputeCommand { query_access: bool }
+#[derive(Copy,Clone)]enum Command { Compute(ComputeCommand), Render(()) }
 struct Status(AtomicU32);impl Status{fn get(&self)->u32{self.0.load(Ordering::Relaxed)}}
 struct Vm { status:Status, slot:u32 }
 struct Queue { turn:AtomicU64, priority:u32 }
@@ -156,7 +157,7 @@ fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
     Arc::new(Job{id,vm:Vm{status:Status(AtomicU32::new(0)),slot:id},
         queue:Queue{turn:AtomicU64::new(0),priority:0},
         progress:Progress{sent:AtomicU32::new(sent),count:sent+1,pending:AtomicBool::new(true)},
-        commands:vec![if render{Command::Render(())}else{Command::Compute(())};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false),resources:Resources})
+        commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false),resources:Resources})
 }
 fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     Firmware{session:Session{shared:Shared{sleeping:AtomicBool::new(false)}},objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
@@ -258,9 +259,13 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     }
 
 }
-struct QueueBehindJob{id:u32,vm:Arc<Vm>,progress:Progress,commands:Vec<Command>,dependency:Result,resources:Resources}
-impl QueueBehindJob{fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}}
-struct QueueBehindFlight{job:Arc<QueueBehindJob>,computes:u32,renders:u32,initbm:bool,doomed:bool,recovery_suspect:bool}
+#[derive(Copy,Clone)]struct Order{sequence:u64,wait_through:[Option<u64>;2]}
+struct QueueBehindJob{id:u32,vm:Arc<Vm>,queue:Arc<Queue>,progress:Progress,commands:Vec<Command>,order:Order,dependency:Result,resources:Resources}
+impl QueueBehindJob{
+    fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}
+    fn command_order(&self,_index:u32)->Option<Order>{Some(self.order)}
+}
+struct QueueBehindFlight{job:Arc<QueueBehindJob>,first:usize,computes:u32,renders:u32,initbm:bool,has_timestamps:bool,doomed:bool,recovery_suspect:bool}
 struct QueueBehindEngine{ordinal:u64,draw:u64,flights:Vec<QueueBehindFlight>}
 struct QueueBehindSlots{compute_exhausted:bool,render_exhausted:bool,compute_available:bool,pass_available:bool}
 impl QueueBehindSlots{
@@ -286,17 +291,19 @@ mod queue_behind_scope {
     #[test]fn timed_compute_queues_behind_same_vm_and_blocks_cross_vm_or_render(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
         let vm2=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:2});
-        let mk=|id:u32,vm:Arc<Vm>,render:bool|Arc::new(QueueBehindJob{
-            id,vm,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![if render{Command::Render(())}else{Command::Compute(())}],
+        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0});
+        let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,render:bool|Arc::new(QueueBehindJob{
+            id,vm,queue,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})}],
+            order:Order{sequence:u64::from(id),wait_through:[None,None]},
             dependency:Ok(()),resources:Resources,
         });
-        let j1=mk(1,vm1.clone(),false);
-        let j2=mk(2,vm1.clone(),false);
-        let j_other_vm=mk(3,vm2.clone(),false);
-        let j_render=mk(4,vm1.clone(),true);
+        let j1=mk(1,vm1.clone(),q1.clone(),false);
+        let j2=mk(2,vm1.clone(),q1.clone(),false);
+        let j_other_vm=mk(3,vm2.clone(),q1.clone(),false);
+        let j_render=mk(4,vm1.clone(),q1.clone(),true);
         let mut p=QueueBehindHost{
-            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:j1,computes:1,renders:0,initbm:false,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:j1,first:0,computes:1,renders:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
@@ -312,12 +319,40 @@ mod queue_behind_scope {
         p.slots.compute_available=false;
         assert!(!p.can_queue_behind(&j2));
     }
+    #[test]fn compute_query_access_waits_for_timed_predecessor_unless_no_query_access(){
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0});
+        let q2=Arc::new(Queue{turn:AtomicU64::new(0),priority:0});
+        let mk=|id:u32,queue:Arc<Queue>,query_access:bool,wait_cdm:Option<u64>|Arc::new(QueueBehindJob{
+            id,vm:vm1.clone(),queue,
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Compute(ComputeCommand{query_access})],
+            order:Order{sequence:u64::from(id),wait_through:[None,wait_cdm]},
+            dependency:Ok(()),resources:Resources,
+        });
+        let timed=mk(1,q1.clone(),true,None);
+        let query_copy=mk(2,q1.clone(),true,Some(1));
+        let no_query=mk(2,q1.clone(),false,Some(1));
+        let no_barrier=mk(2,q1.clone(),true,None);
+        let other_queue=mk(2,q2.clone(),true,Some(1));
+        let p=QueueBehindHost{
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:timed,first:0,computes:1,renders:0,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+        };
+        assert!(!p.can_queue_behind(&query_copy));
+        assert!(p.can_queue_behind(&no_query));
+        assert!(p.can_queue_behind(&no_barrier));
+        assert!(p.can_queue_behind(&other_queue));
+    }
     #[test]fn render_queues_behind_same_vm_and_blocks_initbm_cross_vm_or_compute(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
         let vm2=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:2});
+        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0});
         let mk=|id:u32,vm:Arc<Vm>,render:bool|Arc::new(QueueBehindJob{
-            id,vm,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![if render{Command::Render(())}else{Command::Compute(())}],
+            id,vm,queue:q1.clone(),progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})}],
+            order:Order{sequence:u64::from(id),wait_through:[None,None]},
             dependency:Ok(()),resources:Resources,
         });
         let r1=mk(1,vm1.clone(),true);
@@ -325,7 +360,7 @@ mod queue_behind_scope {
         let r_other_vm=mk(3,vm2.clone(),true);
         let c1=mk(4,vm1.clone(),false);
         let mut p=QueueBehindHost{
-            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:r1,computes:0,renders:1,initbm:false,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:r1,first:0,computes:0,renders:1,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };

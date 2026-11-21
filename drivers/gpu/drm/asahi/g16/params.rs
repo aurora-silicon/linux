@@ -3,10 +3,10 @@
 //! Module parameters and the GET_PARAMS identity.
 //!
 //! With the shared `file.rs` additions (VM_STATUS and VM_STATUS_MIRROR from `supports_vm_status`,
-//! SOFT_FAULTS suppressed by `soft_faults`), the feature word is 0x1c02: per-command input
-//! readiness/errors and exact queue-local historical prefixes use explicit retained inputs
-//! and successful command receipt frontiers. No independent hardware queue reservation,
-//! fragment barriers or ray queries are advertised.
+//! SOFT_FAULTS suppressed by `soft_faults`), G16 advertises per-command input readiness/errors,
+//! exact queue-local historical prefixes, fragment-only render barriers, and
+//! `COMPUTE_NO_QUERY_ACCESS`. No independent hardware queue reservation or ray queries are
+//! advertised.
 
 use kernel::{prelude::*, uapi};
 
@@ -89,7 +89,8 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
     }
     params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
-        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS);
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS);
     params.gpu_generation = GPU_GENERATION;
     params.gpu_variant = gpu.cfg.gpu_variant as u32;
     params.gpu_revision = gpu.cfg.gpu_revision;
