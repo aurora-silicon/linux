@@ -99,6 +99,12 @@ impl VmStatus {
         );
     }
 
+    /// The client's name and thread-group id, as the failure warning names them.
+    pub(crate) fn client(&self) -> (&[u8], Pid) {
+        let len = self.comm.iter().position(|&b| b == 0).unwrap_or(self.comm.len());
+        (&self.comm[..len], self.tgid)
+    }
+
     pub(crate) fn reported_error(&self) -> i32 {
         self.reported_error.load(Ordering::Acquire)
     }
