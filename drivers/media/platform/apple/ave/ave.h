@@ -180,6 +180,8 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_T8142_26A428 0x8a3784bd
 /* The M4 Air (T8132) build of AppleAVE2FW 9003.78.0. */
 #define AVE_FW_TEXT_CRC_T8132_25G83 0x9308d2ab
+/* The M4 (T8132) build of AppleAVE2FW 9013.55.1, macOS 27.2 (26B123). */
+#define AVE_FW_TEXT_CRC_T8132_26B123 0x99fc929a
 
 struct ave_ctx;
 
@@ -200,6 +202,11 @@ struct ave_fw_build {
 	u32 text_size;
 	u32 data_size;
 	u32 text_crc;
+	/*
+	 * The variant the build starts with, when its release numbers the chip
+	 * differently from the variant the device matched, or NULL.
+	 */
+	const struct ave_variant *variant;
 };
 
 struct ave_variant {

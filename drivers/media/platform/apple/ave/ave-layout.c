@@ -976,5 +976,11 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 	 */
 	if (crc == AVE_FW_TEXT_CRC_T6050_26C5035)
 		return &ave_layout_26a428;
+	/*
+	 * macOS 27.2 gives the M4 the 9013.55.1 release, a later build of the
+	 * 26A428 firmware; it takes the same command layout.
+	 */
+	if (crc == AVE_FW_TEXT_CRC_T8132_26B123)
+		return &ave_layout_26a428;
 	return NULL;
 }

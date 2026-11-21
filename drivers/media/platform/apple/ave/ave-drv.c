@@ -110,6 +110,44 @@ const struct ave_variant ave_t6041 = {
 };
 
 /*
+ * macOS 27.2 (26B123) preloads the M4's build of AppleAVE2FW 9013.55.1 (the
+ * release the M5 runs on 27.2): TEXT 0x154000 and DATA 0x12c000 (J773g ADT
+ * ave segment-ranges), TEXT CRC 99fc929a, the zlib CRC32 of the image's
+ * __TEXT. The per-boot word at TEXT 0x4224 is zero in the image, as in the
+ * 26.6.2 one.
+ *
+ * AppleAVE2 27.2 numbers the chips anew. Its soc-id table (ADT ave soc-id
+ * "t8132") gives device 23, and its device table device type 23 and chip
+ * type 13; the 26.6.2 tables give device 26, type 24, the values the 25G83
+ * build starts with, and "t8142" and "t6050" are 27 and 28 in both, as
+ * their variants start. AVE_SVECtrl gives chip types 12 to 23 one SVE
+ * register block, so the idle word at mailbox +0x118 is cleared before the
+ * start, as on T8142 and T6050.
+ */
+static const struct ave_variant ave_t8132_26b123 = {
+	.regs = &ave_coproc_v40,
+	.fw_text_size = 0x154000,
+	.fw_data_size = 0x12c000,
+	.text_boot_word = 0x4224,
+	.boot_device_id = 23,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1,
+	.vcbar_mask = U64_MAX,
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
+	.device_type = 23,
+	.lfs_ref_scale = 2,
+	.text_crc = AVE_FW_TEXT_CRC_T8132_26B123,
+	.mbox_idle = 0x118,
+	.boot_qualified = true,
+};
+
+static const struct ave_fw_build ave_t8132_builds[] = {
+	{ "25G83", 0x148000, 0x12c000, AVE_FW_TEXT_CRC_T8132_25G83 },
+	{ "26B123", 0x154000, 0x12c000, AVE_FW_TEXT_CRC_T8132_26B123,
+	  &ave_t8132_26b123 },
+};
+
+/*
  * The M4 (T8132), as seen on the MacBook Air (J713): iBoot preloads TEXT
  * 0x148000 and DATA 0x12c000 (ADT ave segment-ranges), TEXT CRC 9308d2ab.
  * The capability table in that TEXT has device 26, type 24 as its default
@@ -132,6 +170,8 @@ static const struct ave_variant ave_t8132 = {
 	.device_type = 24,
 	.lfs_ref_scale = 2,
 	.text_crc = AVE_FW_TEXT_CRC_T8132_25G83,
+	.builds = ave_t8132_builds,
+	.build_count = ARRAY_SIZE(ave_t8132_builds),
 	.boot_qualified = true,
 };
 

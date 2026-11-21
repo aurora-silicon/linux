@@ -9,6 +9,7 @@
 #include <linux/unaligned.h>
 
 #include "ave.h"
+#include "ave-mctf.h"
 #include "ave-regs.h"
 #include "tests/ave-9003-reference.h"
 
@@ -1496,8 +1497,22 @@ static void ave_t6041_text_boot_word(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, size - 2, &a), -EINVAL);
 }
 
+/*
+ * The M4's 26.6.2 and 27.2 builds speak different command layouts: 27.2
+ * (9013.55.1) takes 26A428's, 26.6.2 keeps 9003.78.0's.
+ */
+static void ave_t8132_build_layouts(struct kunit *test)
+{
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T8132_25G83),
+			    &ave_layout_9003_78_0);
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T8132_26B123),
+			    &ave_layout_26a428);
+	KUNIT_EXPECT_NULL(test, ave_mctf_layout_for_crc(AVE_FW_TEXT_CRC_T8132_26B123));
+}
+
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_t6041_text_boot_word),
+	KUNIT_CASE(ave_t8132_build_layouts),
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
 	KUNIT_CASE(ave_9003_speed),	    KUNIT_CASE(ave_cq_table),
 	KUNIT_CASE(ave_6070_images),
