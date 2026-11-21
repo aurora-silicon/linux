@@ -120,10 +120,16 @@
  * Force the bus number assignments so that we can declare some of the
  * on-board devices and properties that are populated by the bootloader
  * (such as MAC addresses).
+ *
+ * The pwren numbers are the SMC gPxx keys (xx read as hex) of the ADT
+ * function-reg_on (port00), function-sd_pwr_en (port01) and
+ * function-power_enable (port03) properties; the ADT has no power
+ * function for port02.
  */
 &port00 {
 	/* WLAN */
 	bus-range = <1 1>;
+	pwren-gpios = <&smc_gpio 19 GPIO_ACTIVE_HIGH>;
 
 	wifi0: wifi@0,0 {
 		compatible = "pci14e4,4434";
@@ -147,8 +153,10 @@
 &port01 {
 	/* SD card reader */
 	bus-range = <2 2>;
+	pwren-gpios = <&smc_gpio 25 GPIO_ACTIVE_HIGH>;
+	status = "okay";
 
-	mmc@0,0 {
+	sdhci0: mmc@0,0 {
 		compatible = "pci17a0,9755";
 		reg = <0x20000 0x0 0x0 0x0 0x0>;
 		cd-inverted;
@@ -172,6 +180,11 @@
 &port03 {
 	/* USB xHCI */
 	bus-range = <4 4>;
+	pwren-gpios = <&smc_gpio 22 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};
+
+&pcie0_dart_1 {
 	status = "okay";
 };
 
