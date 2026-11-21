@@ -1055,13 +1055,24 @@ static int tas2764_apply_init_quirks(struct tas2764_priv *tas2764)
 		if (!init_seq->seq)
 			continue;
 
-		if (!(BIT(i) & ENABLED_APPLE_QUIRKS) &&
-		    !(BIT(i) == TAS2764_SHUTDOWN_DANCE && tas2764_shutdown_dance(tas2764)))
+		if (!(BIT(i) & ENABLED_APPLE_QUIRKS))
 			continue;
 
 		ret = regmap_multi_reg_write(tas2764->regmap, init_seq->seq,
 					     init_seq->len);
 
+		if (ret < 0)
+			return ret;
+	}
+
+	/*
+	 * The shutdown dance needs an immediate SDZ. Set that field alone, so
+	 * the rest of MISC_CFG2 keeps what reset and the other writes left.
+	 */
+	if (tas2764_shutdown_dance(tas2764)) {
+		ret = regmap_update_bits(tas2764->regmap, TAS2764_MISC_CFG2,
+					 TAS2764_MISC_CFG2_SDZ_MODE,
+					 TAS2764_MISC_CFG2_SDZ_MODE_IMMEDIATE);
 		if (ret < 0)
 			return ret;
 	}

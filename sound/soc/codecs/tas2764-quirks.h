@@ -92,17 +92,15 @@ static const struct reg_sequence tas2764_thermal_th1_dis_seq[] = {
  */
 #define TAS2764_SHUTDOWN_DANCE		BIT(7)
 
-static const struct reg_sequence tas2764_shutdown_dance_init_seq[] = {
-	/*
-	 * SDZ_MODE=01 (immediate)
-	 *
-	 * We want the shutdown to happen under the influence of
-	 * the magic writes in the 0xfdXX region, so make sure
-	 * the shutdown is immediate and there's no grace period
-	 * followed by the codec part.
-	 */
-	REG_SEQ0(TAS2764_REG(0x0, 0x7), 0x60),
-};
+/*
+ * The dance's init step, SDZ_MODE=01 (immediate), is made in
+ * tas2764_apply_init_quirks() as an update of that field alone.
+ *
+ * We want the shutdown to happen under the influence of
+ * the magic writes in the 0xfdXX region, so make sure
+ * the shutdown is immediate and there's no grace period
+ * followed by the codec part.
+ */
 
 static const struct reg_sequence tas2764_pre_shutdown_seq[] = {
 	REG_SEQ0(TAS2764_REG(0xfd, 0x0d), 0xd), /* switch hidden page */
@@ -185,7 +183,7 @@ static const struct tas2764_quirk_init_sequence {
 	{ tas2764_unk_seq1, ARRAY_SIZE(tas2764_unk_seq1) },
 	{ tas2764_unk_seq2, ARRAY_SIZE(tas2764_unk_seq2) },
 	{ tas2764_thermal_th1_dis_seq, ARRAY_SIZE(tas2764_thermal_th1_dis_seq) },
-	{ tas2764_shutdown_dance_init_seq, ARRAY_SIZE(tas2764_shutdown_dance_init_seq) },
+	{ NULL, 0 },	/* TAS2764_SHUTDOWN_DANCE: see tas2764_apply_init_quirks() */
 };
 
 #endif /* __TAS2764_QUIRKS__ */
