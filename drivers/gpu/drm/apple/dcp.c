@@ -9629,12 +9629,11 @@ static int dcp_platform_suspend(struct device *dev)
 		return dcp_v27_sleep_suspend(dcp);
 
 	/*
-	 * J813 uses the same qualified stop as DPMS off. Probe already gates
-	 * its derived power layout on appledrm.s2r_untested; without this
-	 * system-suspend path an active panel leaves the DCP running.
+	 * The same stop as DPMS off; without this system-suspend path an active
+	 * panel leaves the DCP running. Probe already gates a derived power
+	 * layout (T8142) on appledrm.s2r_untested.
 	 */
-	if (pm_suspend_via_firmware() && dcp_s2r_capable(dcp) &&
-	    (!dcp->hw.s2r_untested || of_machine_is_compatible("apple,j813"))) {
+	if (pm_suspend_via_firmware() && dcp_s2r_capable(dcp)) {
 		int ret = dcp_s2r_suspend(dcp);
 
 		/* Lit by the last resume with its CRTC off: the next resume finds it off by DPMS. */
