@@ -8,11 +8,6 @@
 //! policy words, idle standby timer) is its GPU node's, which [`board`] reads at probe. A node
 //! without it is refused, so no board runs with another's power values.
 //!
-//! [`PROBE`] stops at the identity check, after `get_g17_id` has logged the ID registers and
-//! core masks, before the UAT or the firmware are touched. [`select`] picks it when the
-//! `m5_probe_only` module parameter is set (`aurora.m5_probe_only=1` with the driver built in),
-//! otherwise [`CONFIG`].
-//!
 //! J813 (2026-11-07): ID registers 0xb022000 0xb0800 0x11010a 0x40404 0x1320311 0x10030302,
 //! family 0xb, variant 2, one die, one cluster of ten core slots; core mask 0x3bd (eight
 //! enabled, slots 1 and 6 fused off).
@@ -24,13 +19,21 @@ use crate::g17::fw::m5::initdata::{Board, BoardPower, BoardPowerCells};
 use crate::g17::{Config, CoreLayout, CrashBuffers, FirmwareProfile, Identity};
 use crate::hw::{GpuGen, GpuVariant};
 
+/// The T8142 on the M5 graph: the GPU's identity and the T8142 board template,
+/// which the probe completes with the board's GPU node ([`board`]). It runs either firmware
+/// build of [`BUILDS`]; 26B123 runs [`CONFIG_26B123`].
+pub(crate) const CONFIG: Config = Config {
+    firmware: crate::g17::fw::variant::Firmware::Identified(&BUILDS),
+    ..BASE
+};
 
-/// Refuses the GPU after logging its identity: no variant byte is 0xff.
-pub(crate) const PROBE: Config = Config {
+/// The T8142 board template and identity. [`CONFIG`] and [`CONFIG_26B123`] choose the
+/// firmware build.
+const BASE: Config = Config {
     chip_id: 0x8142,
     identity: Identity {
         family: 0xb,
-        variant: 0xff,
+        variant: 2,
         num_dies: 1,
         gpu_variant: GpuVariant::G,
         usc_generation: 3,
@@ -53,42 +56,16 @@ pub(crate) const PROBE: Config = Config {
     uat_quirks: crate::mmu::UatQuirks::DEFAULT,
     region_c: None,
     chip: None,
-    // Never reached: the identity check refuses first.
-    m5: Some(&crate::g17::fw::m5::initdata::J714),
+    m5: Some(&crate::g17::fw::m5::initdata::T8142),
     adopt_root_entries: true,
     fabric_bridge: false,
-    sleep_restart: false,
+    // TEST: the sleep's commit stops the firmware and a real wake restarts it warm, as on
+    // T8140. Not yet run through a real sleep on the J813.
+    sleep_restart: true,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
-    firmware: crate::g17::fw::variant::Firmware::Fixed(&crate::g17::fw::variant::V26A428_M5),
-    core_layout: CoreLayout {
-        cores: None,
-        alternate_core_masks: None,
-        operand_state: crate::g17::fw::compute::OperandState::TWO_BY_TEN,
-        deflake: crate::g17::fw::render::Deflake::TWO_CLUSTERS,
-        compute_blocks: crate::g17::fw::freelist::COMPUTE_BLOCKS,
-    },
-};
-
-/// The T8142 on the M5 graph: [`PROBE`] with the GPU's identity and the T8142 board template,
-/// which the probe completes with the board's GPU node ([`board`]). It runs either firmware
-/// build of [`BUILDS`]; 26B123 runs [`CONFIG_26B123`].
-pub(crate) const CONFIG: Config = Config {
-    firmware: crate::g17::fw::variant::Firmware::Identified(&BUILDS),
-    ..BASE
-};
-
-/// The T8142 board template and identity, before a firmware build is chosen.
-const BASE: Config = Config {
-    identity: Identity {
-        family: 0xb,
-        variant: 2,
-        num_dies: 1,
-        gpu_variant: GpuVariant::G,
-        usc_generation: 3,
-        hal_generation: 300,
-    },
-    m5: Some(&crate::g17::fw::m5::initdata::T8142),
+    // No build: each CONFIG names its own (BUILDS refers back to CONFIG_26B123).
+    firmware: crate::g17::fw::variant::Firmware::Identified(&[]),
     // One cluster of ten core slots; the buffers are sized for all ten.
     core_layout: CoreLayout {
         cores: None,
@@ -97,10 +74,6 @@ const BASE: Config = Config {
         deflake: crate::g17::fw::render::Deflake::ONE_CLUSTER,
         compute_blocks: crate::g17::fw::freelist::COMPUTE_BLOCKS,
     },
-    // TEST: the sleep's commit stops the firmware and a real wake restarts it warm, as on
-    // T8140. Not yet run through a real sleep on the J813.
-    sleep_restart: true,
-    ..PROBE
 };
 
 /// The T8142 on the 27.2 firmware: the board template on the common 26B123 graph.
@@ -174,17 +147,6 @@ const _: () = assert!(
     CONFIG.core_layout.operand_state.bank_bytes()
         == crate::g17::fw::m5::initdata::T8142.gpu_cores * 0x1800
 );
-
-/// The configuration the 26A428 (G17) path of a T8142 starts with: [`PROBE`] when the
-/// `m5_probe_only` module parameter is set, else [`CONFIG`], whose board the probe reads from
-/// the GPU node.
-pub(crate) fn select() -> &'static Config {
-    if crate::module_parameters::m5_probe_only.value() != 0 {
-        &PROBE
-    } else {
-        &CONFIG
-    }
-}
 
 /// The board's power data, read from its GPU node by the first probe.
 static POWER: SetOnce<BoardPower> = SetOnce::new();
