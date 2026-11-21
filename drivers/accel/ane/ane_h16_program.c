@@ -346,7 +346,7 @@ int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 		};
 		seen[direction - 1]++;
 	}
-	if (!seen[0] || seen[1] != 1)
+	if (!seen[0] || !seen[1])
 		return -ENOEXEC;
 	if (scratch && !hwx->scratch.size)
 		*scratch = (struct ane_h16_process_binding) {};

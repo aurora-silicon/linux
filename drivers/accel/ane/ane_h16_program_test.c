@@ -760,8 +760,18 @@ static void program_add128_slots_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_load_slots(hwx, plan, &layout, slots), -EINVAL);
 	KUNIT_EXPECT_EQ(test, ane_h16_load_encode(load, sizeof(load) - 8, slots), -EINVAL);
 
-	/* A program needs an input and exactly one output. */
+	/*
+	 * A program needs an input and an output; it may have several outputs
+	 * (add128 is in, out, in: two outputs and an input bind).
+	 */
+	KUNIT_ASSERT_EQ(test, hwx->surface_count, 3U);
 	hwx->surfaces[0].direction = 2;
+	generic_size = generic_fill(generic, hwx, 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count, NULL), 0);
+	KUNIT_EXPECT_EQ(test, count, 3U);
+	/* Outputs only: no input refuses. */
+	hwx->surfaces[2].direction = 2;
 	generic_size = generic_fill(generic, hwx, 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
 						       &count, NULL), -ENOEXEC);

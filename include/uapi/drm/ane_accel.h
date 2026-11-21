@@ -25,7 +25,10 @@ extern "C" {
  *   %DRM_ANE_ABI_V3: GET_CAPS, H16_LOAD and H16_EXEC. The node exists only
  *   after the staged opt-in reached its program stage. DRM_IOCTL_VERSION
  *   minor 1 adds surface mappings (%DRM_ANE_H16_MMAP_OFFSET) and
- *   %DRM_ANE_H16_EXEC_IN_PLACE.
+ *   %DRM_ANE_H16_EXEC_IN_PLACE. Minor 2 adds H16_LOAD_WIDE for programs
+ *   with more than %DRM_ANE_H16_SURFACES surfaces (several outputs), up to
+ *   %DRM_ANE_H16_SURFACES_WIDE; H16_EXEC and the surface mappings take
+ *   that many surfaces too.
  *
  * The DRM_IOCTL_VERSION major and &drm_ane_get_caps.abi_version both give
  * the ABI version. The two versions share the ioctl numbers and the
@@ -66,6 +69,7 @@ extern "C" {
 #define DRM_ANE_EXEC		0x06
 #define DRM_ANE_H16_LOAD	0x07
 #define DRM_ANE_H16_EXEC	0x08
+#define DRM_ANE_H16_LOAD_WIDE	0x09
 
 /* ABI version 3: host-built program sections that H16_LOAD places */
 #define DRM_ANE_H16_SECTION_GENERIC		1
@@ -89,8 +93,10 @@ extern "C" {
 #define DRM_ANE_H16_RESOURCE_TEXT_PROPERTIES	1005
 #define DRM_ANE_H16_RESOURCE_TEXT		1006
 #define DRM_ANE_H16_RESOURCE_KERNEL		1007
-/* ABI version 3: most surfaces of one program */
+/* ABI version 3: most surfaces of one program that H16_LOAD reports */
 #define DRM_ANE_H16_SURFACES			4
+/* ABI version 3, DRM_IOCTL_VERSION minor 2: most surfaces of one program */
+#define DRM_ANE_H16_SURFACES_WIDE		16
 
 /**
  * struct drm_ane_get_caps - DRM_IOCTL_ANE_GET_CAPS argument
@@ -298,12 +304,12 @@ struct drm_ane_h16_section {
  * @sections_ptr: In. Pointer to struct drm_ane_h16_section[@section_count].
  * @section_count: In. Exactly %DRM_ANE_H16_SECTIONS.
  * @flags: In. No flags are defined: must be zero.
- * @surface_count: Out. Surfaces of the program, inputs and the one output in
+ * @surface_count: Out. Surfaces of the program, its inputs and outputs in
  *	the HWX segment order that H16_EXEC uses. A program's __DATA scratch
  *	is kernel-owned and not a surface.
  * @pad: Must be zero.
  * @surface_size: Out. Bytes of each surface, for @surface_count entries.
- * @surface_direction: Out. 1 for an input, 2 for the output.
+ * @surface_direction: Out. 1 for an input, 2 for an output.
  *
  * The kernel validates the HWX, places every section in its own private
  * mapping, then loads the program and creates its process. The program
@@ -323,6 +329,27 @@ struct drm_ane_h16_load {
 	__u32 pad;
 	__u64 surface_size[DRM_ANE_H16_SURFACES];
 	__u32 surface_direction[DRM_ANE_H16_SURFACES];
+};
+
+/**
+ * struct drm_ane_h16_load_wide - DRM_IOCTL_ANE_H16_LOAD_WIDE argument
+ *	(ABI version 3, DRM_IOCTL_VERSION minor 2)
+ *
+ * H16_LOAD for a program of up to %DRM_ANE_H16_SURFACES_WIDE surfaces, the
+ * fields as in &struct drm_ane_h16_load. H16_LOAD refuses a program with
+ * more than %DRM_ANE_H16_SURFACES surfaces with -E2BIG, since its arrays
+ * cannot report them; this one loads it.
+ */
+struct drm_ane_h16_load_wide {
+	__u64 hwx_ptr;
+	__u64 hwx_size;
+	__u64 sections_ptr;
+	__u32 section_count;
+	__u32 flags;
+	__u32 surface_count;
+	__u32 pad;
+	__u64 surface_size[DRM_ANE_H16_SURFACES_WIDE];
+	__u32 surface_direction[DRM_ANE_H16_SURFACES_WIDE];
 };
 
 /**
@@ -390,6 +417,8 @@ struct drm_ane_h16_exec {
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_ANE_H16_LOAD, struct drm_ane_h16_load)
 #define DRM_IOCTL_ANE_H16_EXEC \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_ANE_H16_EXEC, struct drm_ane_h16_exec)
+#define DRM_IOCTL_ANE_H16_LOAD_WIDE \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_ANE_H16_LOAD_WIDE, struct drm_ane_h16_load_wide)
 
 #if defined(__cplusplus)
 }

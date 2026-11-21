@@ -147,9 +147,9 @@ static void hwx_surface_order_test(struct kunit *test)
 	memmove(f->bytes + f->tensor[0], f->bytes + f->tensor[1], 0xd48);
 	memcpy(f->bytes + f->tensor[1], tensor, 0xd48);
 	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
-	KUNIT_EXPECT_STREQ(test, info.surfaces[0].name, "in");
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info.surfaces[0].name_offset, "in");
 	KUNIT_EXPECT_EQ(test, info.surfaces[0].direction, 1U);
-	KUNIT_EXPECT_STREQ(test, info.surfaces[1].name, "out");
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info.surfaces[1].name_offset, "out");
 	KUNIT_EXPECT_EQ(test, info.surfaces[1].direction, 2U);
 
 	/* The output need not be the last segment. */
@@ -174,20 +174,87 @@ static void hwx_surface_order_test(struct kunit *test)
 	symbol[0][5] = symbol[1][5];
 	symbol[1][5] = ordinal;
 	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
-	KUNIT_EXPECT_STREQ(test, info.surfaces[0].name, "out");
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info.surfaces[0].name_offset, "out");
 	KUNIT_EXPECT_EQ(test, info.surfaces[0].direction, 2U);
-	KUNIT_EXPECT_STREQ(test, info.surfaces[1].name, "in");
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info.surfaces[1].name_offset, "in");
 	KUNIT_EXPECT_EQ(test, info.surfaces[1].direction, 1U);
 
 	/* A reference naming no tensor refuses. */
 	strscpy(ref[1] + 0x18, "zz", 8);
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 
-	/* Exactly one output: two inputs and no output refuse. */
+	/* At least one output: two inputs and no output refuse. */
 	f = fixture_create(test, false, false);
 	KUNIT_ASSERT_NOT_NULL(test, f);
 	fixture_surface_kind(f, 1, 1);
 	put_unaligned_le32(1, f->bytes + f->tensor[1] + 0x14);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+
+	/*
+	 * Several outputs validate (Apple's person segmentation has two, the
+	 * ANOD v5 detector eleven): the input turned into a second output.
+	 * Whether a program without an input runs is the process bindings'
+	 * call, not the container's.
+	 */
+	f = fixture_create(test, false, false);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	fixture_surface_kind(f, 0, 2);
+	put_unaligned_le32(2, f->bytes + f->tensor[0] + 0x14);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.surfaces[0].direction, 2U);
+	KUNIT_EXPECT_EQ(test, info.surfaces[1].direction, 2U);
+}
+
+/*
+ * zin_ane_compiler 10.205 writes a buffer reference with the whole name:
+ * person segmentation's outputs are 32-character hashes, and the ANOD v5
+ * detector has outputs whose names share their first 8 characters
+ * (fcos/association_preds and fcos/association_preds_export). Pairing is
+ * by the whole name.
+ */
+static void hwx_long_names_test(struct kunit *test)
+{
+	static const char * const hashed[] = { "in", "293bdc1f04ed53222ad81ce2f31e4b37" };
+	static const char * const shared[] = { "fcos/association_preds",
+					      "fcos/association_preds_export" };
+	static const char * const too_long[] = {
+		"in", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" };
+	struct ane_h16_hwx info;
+	struct hwx_fixture *f;
+	u8 *ref;
+
+	f = fixture_create_names(test, false, false, hashed);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info.surfaces[1].name_offset, hashed[1]);
+	KUNIT_EXPECT_EQ(test, info.surfaces[1].direction, 2U);
+
+	f = fixture_create_names(test, false, false, shared);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info.surfaces[0].name_offset, shared[0]);
+	KUNIT_EXPECT_STREQ(test, (char *)f->bytes + info.surfaces[1].name_offset, shared[1]);
+
+	/* A name that does not fit ANE_H16_NAME_MAX refuses. */
+	f = fixture_create_names(test, false, false, too_long);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+
+	/* A reference whose name runs into its padding without a NUL refuses. */
+	f = fixture_create_names(test, false, false, hashed);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ref = fixture_ref(f, 1);
+	KUNIT_ASSERT_NOT_NULL(test, ref);
+	memset(ref + 0x18 + strlen(hashed[1]), 'x', get_unaligned_le32(ref + 4) -
+	       0x18 - strlen(hashed[1]));
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+
+	/* Nonzero padding after the name refuses. */
+	f = fixture_create_names(test, false, false, hashed);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ref = fixture_ref(f, 1);
+	KUNIT_ASSERT_NOT_NULL(test, ref);
+	ref[get_unaligned_le32(ref + 4) - 1] = 1;
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 }
 
@@ -751,6 +818,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_command_test),
 	KUNIT_CASE(hwx_tensor_test),
 	KUNIT_CASE(hwx_surface_order_test),
+	KUNIT_CASE(hwx_long_names_test),
 	KUNIT_CASE(hwx_program_test),
 	KUNIT_CASE(hwx_staged_counts_test),
 	KUNIT_CASE(hwx_final_task_end_test),
