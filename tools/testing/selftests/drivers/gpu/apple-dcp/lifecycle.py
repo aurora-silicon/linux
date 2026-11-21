@@ -598,7 +598,8 @@ def bounce(root):
          ' bool external, external_link_ready, crashed;\n'
          ' bool typec_work_enabled;' + ('' if '\n int fw_compat;' in unit else ' int fw_compat;') +
          ' struct { bool fw_14_7_endpoints; } hw;\n'
-         ' struct { bool active; } split;')
+         ' struct { bool active; } split;\n'
+         ' bool hdmi_hpd;')
     old_raw = unit[unit.index('static int dcp_dptx_connect_raw('):]
     old_raw = old_raw[:old_raw.index('return raw_error; }') + len('return raw_error; }')]
     sessions = bool(SESSION_RAW.search(dcp))
@@ -625,6 +626,7 @@ typedef uint8_t u8;
 #define dev_info(...) ((void)0)
 #define DRM_MODE_CONNECTOR_DisplayPort 10
 #define DCP_FIRMWARE_H17P 17
+#define DCP_FIRMWARE_V_13_5 2
 #define DPTX_CONNECT_TIMEOUT 2000
 #define DPTX_TUNNEL_CONNECT_TIMEOUT 8000
 static void mutex_lock(int *m) { (void)m; }

@@ -2311,6 +2311,17 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	/* T8122 dcpext: HPD only after the link wait, see dcp_ext_dptx_607() */
 	bool late_hpd = dcp_ext_dptx_607(dcp);
 	bool t8132 = dcp_is_t8132_ext(dcp);
+	/*
+	 * A DP2HDMI output on the 13.5 firmware line asserts its own HPD, in
+	 * dcp_enable_dp2hdmi_hpd(), and the connect asks the firmware for HPD
+	 * only on a DisplayPort connector or a late-HPD path, so this firmware
+	 * is never asked to detect the sink and never sends the link
+	 * configuration the wait below looks for. Treat the timeout as
+	 * non-fatal, as the compact and late-HPD cases do, instead of
+	 * withdrawing the display.
+	 */
+	bool dp2hdmi = dcp->hdmi_hpd && !dcp_is_typec_output(dcp) &&
+		       dcp->fw_compat == DCP_FIRMWARE_V_13_5;
 	bool compact, withdrawn;
 	unsigned long timeout;
 	u64 generation;
@@ -2482,6 +2493,14 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		dev_dbg(dcp->dev,
 			"dcp_dptx_connect: no link configuration on port %u yet\n", port);
 		ret = 0;
+	} else if (!ret && dp2hdmi) {
+		/*
+		 * The converter holds HPD itself, and dptxport_set_hpd() below runs
+		 * only for a DisplayPort connector, so nothing is asserted here.
+		 */
+		dev_dbg(dcp->dev,
+			"dcp_dptx_connect: no link configuration on port %u, HPD is the converter's\n",
+			port);
 	} else if (!ret && late_hpd) {
 		/* Without HPD this firmware does not train: assert it now. */
 		dev_dbg(dcp->dev,
