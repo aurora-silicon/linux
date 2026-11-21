@@ -48,6 +48,15 @@
 #define DCP_MAX_PLANES 4
 /* Bounds the CRTC power cycles a rebuilt T6020 tunnel may trigger. */
 #define DCP_TUNNEL_POWER_CYCLES 2
+/*
+ * A Type-C sink's IRQ_HPD that comes again within this long of a replay of
+ * the same mode, which left its link as it was, has the hotplug worker
+ * power cycle the CRTC (dcp_sink_irq_power_cycle()), at most
+ * DCP_SINK_IRQ_POWER_CYCLES times per display connection. A sink whose link
+ * trained blank repeats IRQ_HPD about every 19 s.
+ */
+#define DCP_SINK_IRQ_WINDOW_MS 30000
+#define DCP_SINK_IRQ_POWER_CYCLES 2
 
 struct apple_dcp;
 struct iomfb_m4;
@@ -760,6 +769,16 @@ struct apple_dcp {
 	struct dcp_mode_state mode_state;
 	/* hotplug worker: power cycles since the mode was last valid */
 	unsigned int tunnel_power_cycles;
+	/*
+	 * hotplug worker: a Type-C sink's IRQ_HPD on the display connection
+	 * that sink_irq_unplugs names (typec_unplugs then): when
+	 * the same mode was last applied again for one, and the CRTC power
+	 * cycles since. See dcp_sink_irq_power_cycle().
+	 */
+	u64 sink_irq_unplugs;
+	unsigned long sink_irq_replayed;
+	bool sink_irq_replay_pending;
+	unsigned int sink_irq_power_cycles;
 	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
 	bool placeholder_retried;
 	u64 typec_generation;	/* hpd_mutex: identifies the current connection */

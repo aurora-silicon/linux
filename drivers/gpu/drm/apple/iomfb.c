@@ -1558,7 +1558,15 @@ void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action)
 		dcp_queue_hotplug(dcp->connector);
 }
 
-void dcp_retrain_oob(struct apple_connector *connector)
+enum dcp_hotplug_reason {
+	DCP_HOTPLUG_READY = BIT(0),
+	DCP_HOTPLUG_ROUTE_FAILURE = BIT(1),
+	/* with READY: a Type-C sink raised IRQ_HPD, see dcp_retrain_sink_irq() */
+	DCP_HOTPLUG_SINK_IRQ = BIT(2),
+};
+
+static void dcp_retrain_reasons(struct apple_connector *connector,
+				unsigned int reasons)
 {
 	struct platform_device *pdev = READ_ONCE(connector->dcp);
 	struct apple_dcp *dcp;
@@ -1575,7 +1583,64 @@ void dcp_retrain_oob(struct apple_connector *connector)
 	 * context; sending a synthetic disconnect would tear down the connector.
 	 */
 	dcp_mode_invalidate(&dcp->mode_state);
-	dcp_queue_hotplug(connector);
+	/* The worker takes every reason queued so far with one atomic_xchg(). */
+	atomic_or(reasons, &connector->hotplug_reasons);
+	schedule_work(&connector->hotplug_wq);
+}
+
+void dcp_retrain_oob(struct apple_connector *connector)
+{
+	dcp_retrain_reasons(connector, DCP_HOTPLUG_READY);
+}
+
+/*
+ * A connected Type-C sink raised IRQ_HPD. The reason is queued with READY in
+ * one atomic_or(), after the mode was invalidated, so the run of the worker
+ * that takes it also sees the invalid mode.
+ */
+void dcp_retrain_sink_irq(struct apple_connector *connector)
+{
+	dcp_retrain_reasons(connector, DCP_HOTPLUG_READY | DCP_HOTPLUG_SINK_IRQ);
+}
+
+/*
+ * The hotplug worker, about to retrain the active CRTC for a Type-C sink's
+ * IRQ_HPD: whether to power cycle it. The first IRQ_HPD gets the plain replay
+ * of the same mode; it is enough when the sink raised IRQ_HPD for something
+ * other than its link (HDCP, MCCS, a test request, a dock's state), but a
+ * firmware that answers a mode set of an unchanged timing without training
+ * the link again, as firmware 27 does, leaves a blank link as it was. When
+ * the sink asks again within DCP_SINK_IRQ_WINDOW_MS of the replay, the replay
+ * did not help: turning the CRTC off and on takes the link down and connects
+ * it again before the mode set, which trains it anew. At most
+ * DCP_SINK_IRQ_POWER_CYCLES of those per display connection: an unplug
+ * (typec_unplugs) starts the count again, and each power cycle needs a replay
+ * that did not help before it.
+ */
+static bool dcp_sink_irq_power_cycle(struct apple_dcp *dcp)
+{
+	u64 unplugs;
+
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		unplugs = dcp->typec_unplugs;
+	if (unplugs != dcp->sink_irq_unplugs) {
+		dcp->sink_irq_unplugs = unplugs;
+		dcp->sink_irq_power_cycles = 0;
+		dcp->sink_irq_replay_pending = false;
+	}
+
+	if (dcp->sink_irq_replay_pending &&
+	    time_before(jiffies, dcp->sink_irq_replayed +
+			msecs_to_jiffies(DCP_SINK_IRQ_WINDOW_MS)) &&
+	    dcp->sink_irq_power_cycles < DCP_SINK_IRQ_POWER_CYCLES) {
+		dcp->sink_irq_replay_pending = false;
+		dcp->sink_irq_power_cycles++;
+		return true;
+	}
+
+	dcp->sink_irq_replay_pending = true;
+	dcp->sink_irq_replayed = jiffies;
+	return false;
 }
 
 static void dcp_clear_connector_edid(struct apple_connector *connector)
@@ -1899,11 +1964,6 @@ static void dcp_notify_hotplug(struct apple_connector *connector)
 		drm_kms_helper_connector_hotplug_event(&connector->base);
 }
 
-enum dcp_hotplug_reason {
-	DCP_HOTPLUG_READY = BIT(0),
-	DCP_HOTPLUG_ROUTE_FAILURE = BIT(1),
-};
-
 void dcp_queue_hotplug(struct apple_connector *connector)
 {
 	atomic_or(DCP_HOTPLUG_READY, &connector->hotplug_reasons);
@@ -1923,7 +1983,7 @@ void dcp_hotplug(struct work_struct *work)
 	struct platform_device *pdev;
 	struct apple_dcp *dcp;
 	bool connected, gated;
-	bool notify_only;
+	bool notify_only, sink_irq;
 	unsigned int reasons;
 	int ret;
 
@@ -1949,6 +2009,7 @@ void dcp_hotplug(struct work_struct *work)
 		return;
 	}
 	dcp = platform_get_drvdata(pdev);
+	sink_irq = reasons & DCP_HOTPLUG_SINK_IRQ;
 	dev_info(dcp->dev, "%s() connected:%d valid_mode:%d nr_modes:%u\n", __func__,
 		 connector->connected, READ_ONCE(dcp->mode_state.valid), dcp->nr_modes);
 	if (READ_ONCE(dcp->mode_state.valid))
@@ -2013,12 +2074,20 @@ void dcp_hotplug(struct work_struct *work)
 		/*
 		 * A rebuilt T6020 tunnel is power cycled here; a link reported
 		 * bad would only have userspace retry the modeset that fails.
+		 * So is a Type-C sink's IRQ_HPD that a replay of the same mode
+		 * did not answer; see dcp_sink_irq_power_cycle().
 		 */
-		if (power_cycle)
+		if (power_cycle) {
 			dcp->tunnel_power_cycles++;
-		else
+		} else if (sink_irq && dcp_sink_irq_power_cycle(dcp)) {
+			power_cycle = true;
+			dev_info(dcp->dev,
+				 "sink IRQ_HPD again: power cycling to train the link (%u of %u)\n",
+				 dcp->sink_irq_power_cycles, DCP_SINK_IRQ_POWER_CYCLES);
+		} else {
 			drm_connector_set_link_status_property(&connector->base,
 							       DRM_MODE_LINK_STATUS_BAD);
+		}
 
 		/*
 		 * A short Type-C route interruption can leave the DRM CRTC active
