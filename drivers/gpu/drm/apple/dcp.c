@@ -297,6 +297,92 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
  * without a secure mailbox says so (hw.s2r_no_secure_port), and one behind
  * appledrm.s2r_untested stops its firmware for DPMS off and J813 system sleep.
  */
+/*
+ * hw.s2r without a layout in its hw data takes its words from the device tree, the ones its
+ * deep sleep lowers: DISP_CPU is the first state of the DCP's power-domains, DISP_FE that
+ * state's parent and DISP_SYS theirs, each at its reg in the power manager whose block the
+ * display-power node's "ps" starts. The retention words are DISP_CPU's two
+ * apple,retention-workaround entries (power manager offset, mask, value while off), in the
+ * node's "pwrgate" block, and the value each reads now, with the DCP running, is the one it
+ * gets back at power-on. It counts in pmc-dcp where the node has that word. The DART streams
+ * are the ones its DARTs have enabled at the first stop, see dcp_s2r_find_darts().
+ */
+static int dcp_s2r_layout_from_dt(struct apple_dcp *dcp)
+{
+	struct dcp_s2r_layout *l = &dcp->s2r_dt_layout;
+	struct device_node *power, *pmgr = NULL, *ps[3] = {};
+	struct resource ps_res, gate_res, pmgr_res;
+	u32 off[3], ret[6];
+	void __iomem *gate;
+	int i, err = -EINVAL;
+
+	power = of_parse_phandle(dcp->dev->of_node, "apple,display-power", 0);
+	if (!power)
+		return -ENODEV;
+	if (of_address_to_resource(power, of_property_match_string(power, "reg-names", "ps"),
+				   &ps_res) ||
+	    of_address_to_resource(power, of_property_match_string(power, "reg-names", "pwrgate"),
+				   &gate_res))
+		goto out;
+	ps[0] = of_parse_phandle(dcp->dev->of_node, "power-domains", 0);
+	for (i = 1; i < 3 && ps[i - 1]; i++)
+		ps[i] = of_parse_phandle(ps[i - 1], "power-domains", 0);
+	if (!ps[2])
+		goto out;
+	pmgr = of_get_parent(ps[0]);
+	if (!pmgr || of_address_to_resource(pmgr, 0, &pmgr_res) || pmgr_res.start != ps_res.start)
+		goto out;
+	for (i = 0; i < 3; i++) {
+		struct device_node *parent = of_get_parent(ps[i]);
+
+		of_node_put(parent);
+		if (parent != pmgr || of_property_read_u32(ps[i], "reg", &off[i]) ||
+		    off[i] > resource_size(&ps_res) - 4)
+			goto out;
+	}
+	if (of_property_read_u32_array(ps[0], "apple,retention-workaround", ret, 6) ||
+	    of_property_count_u32_elems(ps[0], "apple,retention-workaround") != 6)
+		goto out;
+	for (i = 0; i < 6; i += 3) {
+		u64 at = pmgr_res.start + ret[i];
+
+		if (at <= gate_res.start || at + 4 > gate_res.end + 1 || at % 4 || !ret[i + 1] ||
+		    ret[i + 2] & ~ret[i + 1])
+			goto out;
+	}
+	gate = ioremap(gate_res.start, resource_size(&gate_res));
+	if (!gate) {
+		err = -ENOMEM;
+		goto out;
+	}
+	*l = (struct dcp_s2r_layout){
+		.disp_cpu = off[0],
+		.disp_fe = off[1],
+		.disp_sys = off[2],
+		.ret_ff = pmgr_res.start + ret[0] - gate_res.start,
+		.ret_ff_mask = ret[1],
+		.ret_ff_off = ret[2],
+		.ret_mem = pmgr_res.start + ret[3] - gate_res.start,
+		.ret_mem_mask = ret[4],
+		.ret_mem_off = ret[5],
+		.pmc_dcp = of_property_match_string(power, "reg-names", "pmc-dcp") >= 0,
+	};
+	l->ret_ff_on = readl(gate + l->ret_ff);
+	l->ret_mem_on = readl(gate + l->ret_mem);
+	iounmap(gate);
+	dcp->s2r_dt_layout_ok = true;
+	dev_dbg(dcp->dev, "display power from the device tree: CPU %#x FE %#x SYS %#x, retention %#x/%#x on %#x/%#x\n",
+		l->disp_cpu, l->disp_fe, l->disp_sys, l->ret_ff, l->ret_mem, l->ret_ff_on,
+		l->ret_mem_on);
+	err = 0;
+out:
+	for (i = 0; i < 3; i++)
+		of_node_put(ps[i]);
+	of_node_put(pmgr);
+	of_node_put(power);
+	return err;
+}
+
 static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 {
 	struct device_node *np = dcp->dev->of_node;
@@ -308,6 +394,15 @@ static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 		dev_info(dcp->dev, "no %s in the device tree, the firmware keeps running\n",
 			 !power ? "apple,display-power" : "secure mailbox");
 		dcp->hw.s2r = false;
+	}
+	if (dcp->hw.s2r && !dcp->hw.s2r_layout) {
+		int ret = dcp_s2r_layout_from_dt(dcp);
+
+		if (ret) {
+			dev_info(dcp->dev, "display power words not in the device tree (%d), the firmware keeps running\n",
+				 ret);
+			dcp->hw.s2r = false;
+		}
 	}
 	if (dcp->hw.s2r_ext && !power) {
 		dev_info(dcp->dev, "no apple,display-power in the device tree, the firmware keeps running\n");
@@ -7182,13 +7277,17 @@ static int dcp_s2r_pm_register(struct apple_dcp *dcp);
  * - num_dptx_ports 0: it drives the panel only.
  * - adopt_live_session: iBoot leaves it running with the 27.2 image and the
  *   panel lit; Linux never starts its CPU.
- * No sleep support: no firmware-27 sleep has run on this processor.
+ * - s2r: the firmware-27 stop (iomfb_v27.c) for DPMS off and deep sleep,
+ *   with the 27.2 table's calls and the power words its device tree names
+ *   (dcp_s2r_layout_from_dt()). It has no secure mailbox.
  */
 static const struct apple_dcp_hw_data apple_dcp_hw_t8132_v27 = {
 	.firmware_dma_bits = 41,
 	.num_dptx_ports = 0,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
+	.s2r = true,
+	.s2r_no_secure_port = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext_v27 = {
@@ -7404,7 +7503,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	 * A SoC with derived power words is offered the stop only when asked for, and only on
 	 * firmware 27.0, whose calls are the ones that ran with them.
 	 */
-	if (dcp->hw.s2r && (!dcp->hw.s2r_layout ||
+	if (dcp->hw.s2r && ((!dcp->hw.s2r_layout &&
+			     !of_property_present(dev->of_node, "apple,display-power")) ||
 			    (dcp->hw.s2r_untested &&
 			     (!s2r_untested || fw_compat != DCP_FIRMWARE_V_27_0))))
 		dcp->hw.s2r = false;
@@ -8381,7 +8481,9 @@ static const struct dcp_s2r_layout *dcp_s2r_layout(struct apple_dcp *dcp)
 {
 	if (dcp_s2r_is_t8142_ext(dcp))
 		return &dcp_s2r_t8142_ext[dcp->index - 1];
-	return dcp->hw.s2r_layout ?: &dcp_s2r_t8140;
+	if (dcp->hw.s2r_layout)
+		return dcp->hw.s2r_layout;
+	return dcp->s2r_dt_layout_ok ? &dcp->s2r_dt_layout : &dcp_s2r_t8140;
 }
 #define DCP_PS_MIN		GENMASK(19, 16)
 
@@ -8420,6 +8522,15 @@ static void dcp_s2r_find_darts(struct apple_dcp *dcp)
 	if (piodma) {
 		dcp->s2r_disp_dart = dcp_s2r_find_dart(piodma);
 		of_node_put(piodma);
+	}
+	/* A device-tree layout's streams: what its DARTs have on before the first stop. */
+	if (dcp->s2r_dt_layout_ok && !dcp->s2r_dt_layout.dcp_streams && dcp->s2r_dcp_dart) {
+		dcp->s2r_dt_layout.dcp_streams = apple_dart_enabled_streams(dcp->s2r_dcp_dart);
+		if (dcp->s2r_disp_dart)
+			dcp->s2r_dt_layout.disp_streams =
+				apple_dart_enabled_streams(dcp->s2r_disp_dart);
+		dev_dbg(dcp->dev, "DART streams for the stop: DCP %#x, display %#x\n",
+			dcp->s2r_dt_layout.dcp_streams, dcp->s2r_dt_layout.disp_streams);
 	}
 }
 
@@ -8890,6 +9001,12 @@ static void dcp_s2r_ps_lower(void __iomem *reg)
 	writel((val & ~GENMASK(3, 0)) | GENMASK(9, 8), reg);
 }
 
+/* A retention word: the whole of it from a hw-data layout, only its masked bits from the DT's. */
+static void dcp_s2r_ret_write(void __iomem *reg, u32 mask, u32 val, u32 word)
+{
+	writel(mask ? (readl(reg) & ~mask) | (val & mask) : word, reg);
+}
+
 /* Its display-power words, pmc-dcp only where the layout has one. */
 static int dcp_s2r_map_power(struct apple_dcp *dcp, void __iomem **ps, void __iomem **pwrgate,
 			     void __iomem **pmc)
@@ -8928,8 +9045,8 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 	if (val & BIT(28))
 		writel(val & ~(BIT(28) | GENMASK(9, 8)), ps + l->disp_cpu);
 	if (l->ret_ff) {
-		writel(3, pwrgate + l->ret_ff);
-		writel(0, pwrgate + l->ret_mem);
+		dcp_s2r_ret_write(pwrgate + l->ret_ff, l->ret_ff_mask, l->ret_ff_off, 3);
+		dcp_s2r_ret_write(pwrgate + l->ret_mem, l->ret_mem_mask, l->ret_mem_off, 0);
 	}
 	dcp_s2r_ps_lower(ps + l->disp_cpu);
 	dcp_s2r_ps_lower(ps + l->disp_fe);
@@ -8980,8 +9097,8 @@ static int dcp_s2r_domains_on(struct apple_dcp *dcp)
 	}
 	writel(val | 0xf, ps + l->disp_cpu);
 	if (l->ret_ff) {
-		writel(0, pwrgate + l->ret_ff);
-		writel(1, pwrgate + l->ret_mem);
+		dcp_s2r_ret_write(pwrgate + l->ret_ff, l->ret_ff_mask, l->ret_ff_on, 0);
+		dcp_s2r_ret_write(pwrgate + l->ret_mem, l->ret_mem_mask, l->ret_mem_on, 1);
 	}
 	writel(val | 0xf | BIT(28), ps + l->disp_cpu);
 	if (pmc)
@@ -9730,12 +9847,11 @@ static int dcp_platform_suspend(struct device *dev)
 		return dcp_v27_sleep_suspend(dcp);
 
 	/*
-	 * J813 uses the same qualified stop as DPMS off. Probe already gates
-	 * its derived power layout on appledrm.s2r_untested; without this
-	 * system-suspend path an active panel leaves the DCP running.
+	 * The same stop as DPMS off; without this system-suspend path an active
+	 * panel leaves the DCP running. Probe already gates a derived power
+	 * layout (T8142) on appledrm.s2r_untested.
 	 */
-	if (pm_suspend_via_firmware() && dcp_s2r_capable(dcp) &&
-	    (!dcp->hw.s2r_untested || of_machine_is_compatible("apple,j813"))) {
+	if (pm_suspend_via_firmware() && dcp_s2r_capable(dcp)) {
 		int ret = dcp_s2r_suspend(dcp);
 
 		/* Lit by the last resume with its CRTC off: the next resume finds it off by DPMS. */
