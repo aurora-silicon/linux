@@ -103,6 +103,16 @@ struct ane_fw_transport_ops {
 	/* Optional: a shared allocation was freed ("FREE") or served again ("reuse"). */
 	void (*shared_note)(void *ctx, const char *event, u64 dva, u64 size, u32 tag);
 	/*
+	 * Optional (H17 with an ISP link): another firmware's memory by request.
+	 * map: a SHAREDMALLOC (0, 0, id) asks for the ISP surface @id (macOS:
+	 * ANE_processISPSurfaceMapRequest); 0 with its DVA and size, or an
+	 * error, which is answered as macOS does (1, 0, id) instead of failing
+	 * the transport. unmap: a FREE of a DVA that map gave out; 0 when it was
+	 * one (then answered like any FREE), -ENOENT otherwise.
+	 */
+	int (*map)(void *ctx, u32 id, u64 *dva, u64 *size);
+	int (*unmap)(void *ctx, u64 dva);
+	/*
 	 * Optional: true once the firmware's CPU no longer runs, so no reply can
 	 * come. A wait then ends at once with -ESHUTDOWN instead of at its
 	 * deadline.
@@ -682,6 +692,17 @@ static inline void ane_fw_shared_note(struct ane_fw_transport *t, const char *ev
 				    t->shared_tags[i]);
 }
 
+/* The FREE answer: 1 (H16 26A428) or DVA|1 (H17 25G83), then the doorbell. */
+static inline void ane_fw_transport_free_reply(struct ane_fw_transport *t, void *slot, u64 dva)
+{
+	t->ops->store64(t->ctx, (u8 *)slot + 8, 0);
+	t->ops->store64(t->ctx, (u8 *)slot + 16, 0);
+	t->ops->write_barrier(t->ctx);
+	t->ops->store64(t->ctx, slot, t->native_free ? 1 : dva | 1);
+	t->ops->write_barrier(t->ctx);
+	ane_fw_transport_doorbell(t, ANE_FW_SHAREDMALLOC);
+}
+
 /*
  * SHAREDMALLOC FREE of a live allocation. Backing storage, its mapping and
  * its quota stay until reset; FREE retires the surface, so no later report
@@ -704,16 +725,35 @@ ane_fw_transport_free(struct ane_fw_transport *t, void *slot, u64 dva, u64 bytes
 			break;
 	if (i == t->shared_count)
 		return -ENOENT;
-	t->ops->store64(t->ctx, (u8 *)slot + 8, 0);
-	t->ops->store64(t->ctx, (u8 *)slot + 16, 0);
-	t->ops->write_barrier(t->ctx);
-	t->ops->store64(t->ctx, slot, t->native_free ? 1 : dva | 1);
-	t->ops->write_barrier(t->ctx);
-	ane_fw_transport_doorbell(t, ANE_FW_SHAREDMALLOC);
+	ane_fw_transport_free_reply(t, slot, dva);
 	t->shared_retired[i] = true;
 	t->free_count++;
 	ane_fw_transport_advance(t, ANE_FW_SHAREDMALLOC);
 	ane_fw_shared_note(t, "FREE", i);
+	return 0;
+}
+
+/*
+ * SHAREDMALLOC (0, 0, id): map another firmware's surface by ID. Always
+ * answered: (DVA|1, size, id), or (1, 0, id) when it cannot be mapped
+ * (macOS ANE_sendISPSurfaceRemapAck, 27.2.1).
+ */
+static inline int ane_fw_transport_map(struct ane_fw_transport *t, void *slot, u64 id)
+{
+	u64 dva = 0, size = 0;
+	int ret = id > U32_MAX ? -EINVAL : t->ops->map(t->ctx, id, &dva, &size);
+
+	if (!ret && (!dva || !size || !IS_ALIGNED(dva, SZ_16K)))
+		ret = -EPROTO;
+	if (ret)
+		dva = size = 0;
+	t->ops->store64(t->ctx, (u8 *)slot + 8, size);
+	t->ops->store64(t->ctx, (u8 *)slot + 16, id);
+	t->ops->write_barrier(t->ctx);
+	t->ops->store64(t->ctx, slot, dva | 1);
+	t->ops->write_barrier(t->ctx);
+	ane_fw_transport_doorbell(t, ANE_FW_SHAREDMALLOC);
+	ane_fw_transport_advance(t, ANE_FW_SHAREDMALLOC);
 	return 0;
 }
 
@@ -777,8 +817,18 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 	word2 = t->ops->load64(t->ctx, p + 16);
 	if (!word0 && !word1 && !word2)
 		return -EAGAIN;
+	if (!word0 && !word1 && t->ops->map)
+		return ane_fw_transport_map(t, p, word2);
 	if (word0) {
 		ret = ane_fw_transport_free(t, p, word0, word1, word2);
+		/* Not one of ours: one this transport mapped for another firmware? */
+		if (ret == -ENOENT && t->ops->unmap && !word1 && !word2 &&
+		    !t->ops->unmap(t->ctx, word0)) {
+			ane_fw_transport_free_reply(t, p, word0);
+			t->free_count++;
+			ane_fw_transport_advance(t, ANE_FW_SHAREDMALLOC);
+			return 0;
+		}
 		if (ret)
 			goto refused;
 		return 0;

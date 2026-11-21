@@ -395,6 +395,8 @@ struct ane_h16_session {
 	 */
 	u64 gate_hold_ns;
 	bool gate_held;
+	/* Gating held off by ane_h16_session_gate_pin() (the ISP link), not by a request. */
+	bool gate_pinned;
 	u64 gate_last_ns;
 	struct delayed_work gate_work;
 	/* Firmware phases of the last successful EXECUTE. */
@@ -433,6 +435,7 @@ void ane_h16_export_get(struct ane_h16_export *e);
 void ane_h16_export_put(struct ane_h16_export *e);
 void ane_h16_session_flush_exports(struct ane_h16_session *s);
 int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock);
+int ane_h16_session_gate_pin(struct ane_h16_session *s, bool pin);
 int ane_h16_session_control(struct ane_h16_session *s, unsigned int ch, void *command,
 			    size_t length);
 int ane_h16_session_serve(struct ane_h16_session *s, u32 *pending, u64 limit_ns);

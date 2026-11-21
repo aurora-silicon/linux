@@ -41,6 +41,15 @@
 #define ANE_FW_WINDOW SZ_512M
 /* ane_fw_alloc_mem(): a DVA range from the window. */
 #define ANE_FW_WINDOW_ANY U64_MAX
+/*
+ * The ISP surfaces the ANE firmware asks for by ID (MLVNR), in a window of
+ * their own above the allocation window, reused at every ISP link up. macOS
+ * 27.2 mapped 30 of 0x14000 bytes at link up and a few hundred MiB in all
+ * while streaming (v26b: 16542 pages shared by the two DARTs).
+ */
+#define ANE_FW_ISP_MAP_DVA (ANE_FW_ALLOC_DVA + ANE_FW_WINDOW)
+#define ANE_FW_ISP_MAP_SPAN SZ_512M
+#define ANE_FW_ISP_MAPS 256
 #define ANE_FW_TIMEOUT_NS (3ULL * NSEC_PER_SEC)
 
 enum ane_fw_stage {
@@ -160,8 +169,17 @@ struct ane_fw_backend {
 	 * them (ane_fw_isp_service()). Counted, with the doorbell bits seen.
 	 */
 	struct delayed_work isp_service;
-	u64 isp_served;
+	u64 isp_served, isp_up_ns;
 	u32 isp_bits;
+	/*
+	 * The ISP surfaces mapped for the ANE firmware (ane_fw_isp_map()), each
+	 * holding a reference on its pages until the firmware frees it or the
+	 * link goes down. Under the session lock, like the transport.
+	 */
+	struct ane_fw_isp_map *isp_maps;
+	u32 isp_map_count;
+	u64 isp_map_next, isp_map_bytes;
+	u32 isp_maps_done, isp_maps_failed, isp_maps_freed;
 };
 
 /* One ANE per SoC. The observer exists before platform driver registration:
@@ -1491,6 +1509,18 @@ static void ane_fw_cold_shared_note(void *ctx, const char *event, u64 dva, u64 s
 		event, tag, size, dva);
 }
 
+/* One ISP surface the ANE firmware asked for (macOS: its ISP mapped surface list). */
+struct ane_fw_isp_map {
+	u64 dva, size, isp_iova;
+	void (*put)(void *ctx, void *cookie);
+	void *ctx, *cookie;
+	u32 id, tag;
+	bool live;
+};
+
+static int ane_fw_isp_map(void *ctx, u32 id, u64 *dva, u64 *size);
+static int ane_fw_isp_unmap(void *ctx, u64 dva);
+
 static const struct ane_fw_transport_ops ane_fw_ops = {
 	.load64 = ane_fw_load64, .store64 = ane_fw_store64,
 	.read_barrier = ane_fw_rmb, .write_barrier = ane_fw_wmb,
@@ -1498,6 +1528,7 @@ static const struct ane_fw_transport_ops ane_fw_ops = {
 	.now_ns = ane_fw_now, .relax = ane_fw_relax,
 	.alloc = ane_fw_alloc, .refused = ane_fw_refused,
 	.shared_note = ane_fw_cold_shared_note,
+	.map = ane_fw_isp_map, .unmap = ane_fw_isp_unmap,
 };
 
 /*
@@ -2095,6 +2126,45 @@ static bool isp_fwlog;
 module_param(isp_fwlog, bool, 0644);
 MODULE_PARM_DESC(isp_fwlog, "Print the ANE firmware log when the ISP link goes down (MLVNR bring-up)");
 
+/*
+ * Bring-up switch: hold the firmware's dynamic power gating off while the
+ * ISP link is live. The host submits nothing then, so nothing else keeps it
+ * off (macOS powers the engine for the ISP on request, ANE_IPC_PowerOnByPeer).
+ */
+static bool isp_gate_off;
+module_param(isp_gate_off, bool, 0644);
+MODULE_PARM_DESC(isp_gate_off, "Hold ANE power gating off while the ISP link is live (MLVNR bring-up; read at link up)");
+
+/*
+ * Bring-up switch: the ISP client's system-cache set-up macOS does at every
+ * firmware start (ANEHWDevice::handleISPClientMCacheRequest, 27.2 log on the
+ * J815): CSNE_CMD_MCACHE_SIZE_GET (victims 0x300000, intermediate 0x300000,
+ * prefetch 0), then CSNE_CMD_ANE_DEFAULT_SETTING_SET with the intermediate spill DSID
+ * (0xc there). The ANE firmware asserts on an AFPP request without an mcache
+ * DSID ("pSwitchedOutReq->request.mcacheDsid != (0xFF)"). Nothing on Linux
+ * partitions the system cache, so the DSID is only the tag macOS uses.
+ */
+static bool isp_mcache_query;
+module_param(isp_mcache_query, bool, 0644);
+MODULE_PARM_DESC(isp_mcache_query, "At ISP link up, ask the ANE firmware its system-cache sizes and give it the ISP client's spill DSID, as macOS does (MLVNR bring-up)");
+
+/*
+ * The ISP firmware hands the ANE firmware its shared surfaces by ID (macOS:
+ * the IOSurface ID the ISP driver returns with each SHAREDMALLOC), and the
+ * ANE firmware asks the host to map each one: SHAREDMALLOC (0, 0, id),
+ * ANEHWDevice::ANE_processISPSurfaceMapRequest. macOS 27.2 on the J815
+ * mapped 30 at link up and freed them at UNSET2. Without IDs the request is
+ * (0, 0, 0), which looks like an empty slot: the J815 runs saw the
+ * SHAREDMALLOC doorbell, an empty slot, and a hung ANE.
+ */
+static bool isp_surface_map = true;
+module_param(isp_surface_map, bool, 0644);
+MODULE_PARM_DESC(isp_surface_map, "Map the ISP surfaces the ANE firmware asks for by ID, as macOS does (MLVNR; read at link up)");
+
+static uint isp_mcache_dsid = 0xc;
+module_param(isp_mcache_dsid, uint, 0644);
+MODULE_PARM_DESC(isp_mcache_dsid, "Intermediate spill DSID for the ISP client (isp_mcache_query; macOS 27.2: 0xc)");
+
 struct ane_isp_link {
 	struct ane_fw_backend *b;
 	struct device *isp;
@@ -2103,6 +2173,131 @@ struct ane_isp_link {
 	u64 boots;
 	bool live;
 };
+
+/* macOS DecodeFirmwareAllocationUsageField: bit 31 with bits 22-23 = "remap allowed". */
+static bool ane_fw_isp_tag_remap(u32 tag)
+{
+	return (tag & BIT(31)) && (tag >> 22 & 3);
+}
+
+/* SHAREDMALLOC (0, 0, id): the ISP surface @id into the ANE DART. Session lock held. */
+static int ane_fw_isp_map(void *ctx, u32 id, u64 *dva, u64 *size)
+{
+	struct ane_fw_backend *b = ctx;
+	struct ane_isp_link *l = READ_ONCE(b->isp_link);
+	struct device *dev = &b->pdev->dev;
+	struct ane_isp_surface sf = {};
+	struct ane_fw_isp_map *m = NULL;
+	ssize_t mapped;
+	unsigned int i;
+	int ret;
+
+	if (!l || !l->ep.surface_map || !b->isp_maps) {
+		ret = -ENODEV;
+		goto out;
+	}
+	ret = -EINVAL;
+	if (!id)
+		goto out;
+	for (i = 0; i < ANE_FW_ISP_MAPS; i++) {
+		if (b->isp_maps[i].live && b->isp_maps[i].id == id) {
+			/* macOS: an ID already in its list is refused. */
+			ret = -EEXIST;
+			goto out;
+		}
+		if (!m && !b->isp_maps[i].live)
+			m = &b->isp_maps[i];
+	}
+	ret = -ENOSPC;
+	if (!m)
+		goto out;
+	ret = l->ep.surface_get(l->ep.surface_ctx, id, &sf);
+	if (ret)
+		goto out;
+	ret = -EINVAL;
+	if (!sf.sgt || !sf.size || !IS_ALIGNED(sf.size, SZ_16K))
+		goto put;
+	ret = -ENOSPC;
+	if (sf.size > ANE_FW_ISP_MAP_SPAN ||
+	    b->isp_map_next > ANE_FW_ISP_MAP_DVA + ANE_FW_ISP_MAP_SPAN - sf.size ||
+	    b->domain->geometry.aperture_end < ANE_FW_ISP_MAP_DVA + ANE_FW_ISP_MAP_SPAN - 1)
+		goto put;
+	mapped = iommu_map_sgtable(b->domain, b->isp_map_next, sf.sgt, IOMMU_READ | IOMMU_WRITE);
+	if (mapped != sf.size) {
+		if (mapped > 0)
+			iommu_unmap(b->domain, b->isp_map_next, mapped);
+		ret = mapped < 0 ? mapped : -EIO;
+		goto put;
+	}
+	*m = (struct ane_fw_isp_map){
+		.dva = b->isp_map_next, .size = sf.size, .isp_iova = sf.iova,
+		.put = l->ep.surface_put, .ctx = l->ep.surface_ctx, .cookie = sf.cookie,
+		.id = id, .tag = sf.tag, .live = true,
+	};
+	b->isp_map_next += sf.size;
+	b->isp_map_bytes += sf.size;
+	b->isp_map_count++;
+	b->isp_maps_done++;
+	*dva = m->dva;
+	*size = m->size;
+	dev_info(dev, "H17 ANE: ISP link: +%llu us surface %#x mapped: %#llx bytes at %#llx (ISP %#llx, tag %#x%s)\n",
+		 div_u64(ktime_get_ns() - b->isp_up_ns, NSEC_PER_USEC), id, m->size, m->dva,
+		 m->isp_iova, m->tag, ane_fw_isp_tag_remap(m->tag) ? "" : ", not marked remap");
+	return 0;
+put:
+	l->ep.surface_put(l->ep.surface_ctx, sf.cookie);
+out:
+	b->isp_maps_failed++;
+	dev_info(dev, "H17 ANE: ISP link: +%llu us surface %#x not mapped (%d)\n",
+		 div_u64(ktime_get_ns() - b->isp_up_ns, NSEC_PER_USEC), id, ret);
+	return ret;
+}
+
+/* Out of the ANE DART first, then the reference on the pages. Session lock held. */
+static void ane_fw_isp_map_drop(struct ane_fw_backend *b, struct ane_fw_isp_map *m)
+{
+	iommu_unmap(b->domain, m->dva, m->size);
+	if (m->put)
+		m->put(m->ctx, m->cookie);
+	m->live = false;
+	b->isp_map_bytes -= m->size;
+	if (!--b->isp_map_count)
+		b->isp_map_next = ANE_FW_ISP_MAP_DVA;
+}
+
+/* A FREE of a DVA ane_fw_isp_map() gave out (macOS: ANE_processISPSurfaceUnMapRequest). */
+static int ane_fw_isp_unmap(void *ctx, u64 dva)
+{
+	struct ane_fw_backend *b = ctx;
+	unsigned int i;
+
+	for (i = 0; b->isp_maps && i < ANE_FW_ISP_MAPS; i++) {
+		struct ane_fw_isp_map *m = &b->isp_maps[i];
+
+		if (m->live && m->dva == dva) {
+			dev_dbg(&b->pdev->dev, "H17 ANE: ISP link: surface %#x freed by the firmware\n", m->id);
+			ane_fw_isp_map_drop(b, m);
+			b->isp_maps_freed++;
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
+/* Every surface still mapped: at link down, or at the next link up after a disable with the engine off. */
+static void ane_fw_isp_maps_release(struct ane_fw_backend *b)
+{
+	unsigned int i, n = 0;
+
+	for (i = 0; b->isp_maps && i < ANE_FW_ISP_MAPS; i++) {
+		if (b->isp_maps[i].live) {
+			ane_fw_isp_map_drop(b, &b->isp_maps[i]);
+			n++;
+		}
+	}
+	if (n)
+		dev_info(&b->pdev->dev, "H17 ANE: ISP link: %u surfaces the firmware still had unmapped\n", n);
+}
 
 static void ane_fw_isp_afpp_encode(const struct ane_fw_backend *b, u8 *c, u16 id)
 {
@@ -2371,10 +2566,11 @@ static void ane_fw_isp_service(struct work_struct *work)
 		return;
 	}
 	ret = ane_h16_session_serve(&b->session, &pending, NSEC_PER_MSEC);
-	if (pending & ~b->isp_bits) {
+	if (pending) {
 		b->isp_bits |= pending;
-		dev_info(&b->pdev->dev, "H17 ANE: ISP link: firmware rang %#x (seen %#x)\n",
-			 pending, b->isp_bits);
+		dev_info_ratelimited(&b->pdev->dev, "H17 ANE: ISP link: +%llu us firmware rang %#x (seen %#x), served %d\n",
+				     div_u64(ktime_get_ns() - b->isp_up_ns, NSEC_PER_USEC), pending,
+				     b->isp_bits, ret);
 	}
 	if (ret > 0)
 		b->isp_served += ret;
@@ -2438,6 +2634,16 @@ int ane_isp_endpoint_enable(struct ane_isp_link *l, const char *afpp, struct ane
 	if (ret)
 		return ret;
 	/* The session lock is held from here. */
+	/* Left by a disable that found the engine off: the DARTs are up now. */
+	ane_fw_isp_maps_release(b);
+	if (!b->isp_maps)
+		b->isp_maps = kcalloc(ANE_FW_ISP_MAPS, sizeof(*b->isp_maps), GFP_KERNEL);
+	b->isp_map_next = ANE_FW_ISP_MAP_DVA;
+	b->isp_maps_done = 0;
+	b->isp_maps_failed = 0;
+	b->isp_maps_freed = 0;
+	ep->surface_map = b->isp_maps && ep->surface_get && ep->surface_put &&
+			  READ_ONCE(isp_surface_map);
 	ret = ane_fw_isp_afpp_map(b, l->isp, afpp);
 	if (ret)
 		goto out;
@@ -2448,8 +2654,36 @@ int ane_isp_endpoint_enable(struct ane_isp_link *l, const char *afpp, struct ane
 	}
 	l->ep = *ep;
 	WRITE_ONCE(b->isp_hold, true);
+	if (READ_ONCE(isp_mcache_query)) {
+		/* What the firmware wants from the system cache, as macOS asks at start-up. */
+		u8 q[0xc] = {};
+
+		u8 d[0x20] = {};
+		int r;
+
+		put_unaligned_le16(ANE_H16_MCACHE_SIZE_GET, q + 4);
+		r = ane_fw_isp_send(b, q, sizeof(q), false);
+		dev_info(dev, "H17 ANE: ISP link: MCACHE_SIZE_GET %d: %#x\n", r, get_unaligned_le32(q + 8));
+		put_unaligned_le16(ANE_H16_DEFAULT_SETTING_SET, d + 4);
+		put_unaligned_le32(2, d + 8);
+		put_unaligned_le32(3, d + 0x10);
+		put_unaligned_le32(0, d + 0x14);
+		put_unaligned_le32(4, d + 0x18);
+		put_unaligned_le32(READ_ONCE(isp_mcache_dsid), d + 0x1c);
+		if (!r) {
+			r = ane_fw_isp_send(b, d, sizeof(d), false);
+			dev_info(dev, "H17 ANE: ISP link: DEFAULT_SETTING_SET intermediate spill DSID %#x: %d\n",
+				 READ_ONCE(isp_mcache_dsid), r);
+		}
+	}
+	if (READ_ONCE(isp_gate_off)) {
+		int gate = ane_h16_session_gate_pin(&b->session, true);
+
+		dev_info(dev, "H17 ANE: ISP link: power gating held off (%d)\n", gate);
+	}
 	ret = ane_fw_isp_up(b, l, false);
 	if (ret) {
+		ane_h16_session_gate_pin(&b->session, false);
 		WRITE_ONCE(b->isp_hold, false);
 		goto unmap;
 	}
@@ -2462,6 +2696,11 @@ int ane_isp_endpoint_enable(struct ane_isp_link *l, const char *afpp, struct ane
 		 b->isp_ring_dva, ep->ring_len, ep->isp_doorbell, ep->isp_doorbell_sel,
 		 ep->ane_doorbell, ep->ane_doorbell_sel);
 	b->isp_served = 0;
+	b->isp_bits = 0;
+	b->isp_up_ns = ktime_get_ns();
+	dev_info(dev, "H17 ANE: ISP link: surface maps %s (window %#llx+%#x, aperture end %#llx)\n",
+		 ep->surface_map ? "on" : "off", (u64)ANE_FW_ISP_MAP_DVA, ANE_FW_ISP_MAP_SPAN,
+		 (u64)b->domain->geometry.aperture_end);
 	queue_delayed_work(system_dfl_wq, &b->isp_service, msecs_to_jiffies(2));
 	goto out;
 unmap:
@@ -2481,6 +2720,20 @@ EXPORT_SYMBOL_GPL(ane_isp_endpoint_enable);
  * the engine: when it is parked or asleep, the firmware that had the
  * endpoint is gone and only the bookkeeping is left.
  */
+/* For a stalled link: a DART fault is silent here (no IRQ is taken). */
+static void ane_fw_isp_dart_report(struct ane_fw_backend *b)
+{
+	for (unsigned int i = 0; i < ANE_FW_DARTS; i++) {
+		u32 err;
+
+		if (!b->dart[i])
+			continue;
+		err = ane_rd32(b, b->dart[i] + 0x100);
+		dev_info(&b->pdev->dev, "H17 ANE: ISP link: DART%u error %#x (addr %#x:%08x)\n", i, err,
+			 ane_rd32(b, b->dart[i] + 0x174), ane_rd32(b, b->dart[i] + 0x170));
+	}
+}
+
 void ane_isp_endpoint_disable(struct ane_isp_link *l)
 {
 	struct ane_fw_backend *b;
@@ -2489,6 +2742,29 @@ void ane_isp_endpoint_disable(struct ane_isp_link *l)
 		return;
 	b = l->b;
 	if (!READ_ONCE(b->parked) && !ane_h16_session_enter(&b->session, true)) {
+		ane_fw_isp_dart_report(b);
+		{
+			const struct ane_fw_channel *c = &b->transport.channels[ANE_FW_SHAREDMALLOC];
+			const u8 *t2h = ane_fw_transport_slot(&b->transport, ANE_FW_IO_T2H);
+
+			dev_info(&b->pdev->dev, "H17 ANE: ISP link: SHAREDMALLOC head %u, ready %u, early %u, served %u; IO_T2H head %u: %#llx %#llx\n",
+				 b->transport.head[ANE_FW_SHAREDMALLOC], b->transport.shared_ready,
+				 b->transport.shared_early, b->transport.shared_count,
+				 b->transport.head[ANE_FW_IO_T2H], get_unaligned_le64(t2h),
+				 get_unaligned_le64(t2h + 8));
+			/* Every slot with anything in it, all eight words. */
+			for (unsigned int i = 0; i < c->slots; i++) {
+				const u8 *sm = (const u8 *)b->transport.ipc.cpu + c->offset + i * ANE_FW_SLOT_SIZE;
+
+				if (!memchr_inv(sm, 0, 64))
+					continue;
+				dev_info(&b->pdev->dev, "H17 ANE: ISP link: SHAREDMALLOC[%u] %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+					 i, get_unaligned_le64(sm), get_unaligned_le64(sm + 8),
+					 get_unaligned_le64(sm + 16), get_unaligned_le64(sm + 24),
+					 get_unaligned_le64(sm + 32), get_unaligned_le64(sm + 40),
+					 get_unaligned_le64(sm + 48), get_unaligned_le64(sm + 56));
+			}
+		}
 		if (READ_ONCE(isp_fwlog))
 			ane_h16_session_dump_fwlog(&b->session);
 		if (l->boots == b->fw_boots && !b->session.quarantined)
@@ -2497,17 +2773,21 @@ void ane_isp_endpoint_disable(struct ane_isp_link *l)
 			iommu_unmap(b->domain, b->isp_ring_dva, b->isp_ring_span);
 			b->isp_rings_mapped = false;
 		}
+		ane_fw_isp_maps_release(b);
+		ane_h16_session_gate_pin(&b->session, false);
 		l->live = false;
 		WRITE_ONCE(b->isp_hold, false);
 		mutex_unlock(b->session.lock);
 		cancel_delayed_work_sync(&b->isp_service);
-		dev_info(&b->pdev->dev, "H17 ANE: ISP link down: %llu firmware requests served, doorbell bits seen %#x\n",
-			 b->isp_served, b->isp_bits);
+		dev_info(&b->pdev->dev, "H17 ANE: ISP link down: %llu firmware requests served, doorbell bits seen %#x; ISP surfaces: %u mapped, %u refused, %u freed by the firmware\n",
+			 b->isp_served, b->isp_bits, b->isp_maps_done, b->isp_maps_failed,
+			 b->isp_maps_freed);
 		return;
 	}
 	/* The DARTs may be off: the stale ring mapping goes at the next enable. */
 	scoped_guard(mutex, &b->lock) {
 		l->live = false;
+		WRITE_ONCE(b->session.gate_pinned, false);
 		WRITE_ONCE(b->isp_hold, false);
 	}
 	cancel_delayed_work_sync(&b->isp_service);
@@ -2525,6 +2805,17 @@ void ane_isp_link_put(struct ane_isp_link *l)
 	ane_isp_endpoint_disable(l);
 	scoped_guard(mutex, &b->lock)
 		b->isp_link = NULL;
+	/*
+	 * Surfaces left by a disable with the engine off stay mapped until the
+	 * next link up and their pages are never freed: the ISP driver that
+	 * holds them may be gone by then, so its reference is not dropped.
+	 */
+	if (b->isp_map_count) {
+		dev_warn(&b->pdev->dev, "H17 ANE: ISP link put with %u surfaces still mapped: their pages are kept\n",
+			 b->isp_map_count);
+		for (unsigned int i = 0; i < ANE_FW_ISP_MAPS; i++)
+			b->isp_maps[i].put = NULL;
+	}
 	put_device(l->isp);
 	kfree(l);
 }

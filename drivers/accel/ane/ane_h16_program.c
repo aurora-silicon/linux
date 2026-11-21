@@ -1229,7 +1229,7 @@ static int h16_gate_release(struct ane_h16_session *s)
  */
 int ane_h16_session_gate_expire(struct ane_h16_session *s)
 {
-	if (!s->gate_held)
+	if (!s->gate_held || s->gate_pinned)
 		return 0;
 	if (s->running || h16_now(s) - s->gate_last_ns < s->gate_hold_ns)
 		return -EAGAIN;
@@ -1952,7 +1952,8 @@ EXPORT_SYMBOL_GPL(ane_h16_session_close);
  * One control command outside any program (the ISP link): prepared, sent and
  * its reply checked (same command echoed, zero acknowledgment). The arena it
  * used is given back once the firmware answered. Caller holds the session
- * lock (ane_h16_session_enter()).
+ * lock (ane_h16_session_enter()). On success the reply is copied back into
+ * @command, for the commands that answer in their body.
  */
 int ane_h16_session_control(struct ane_h16_session *s, unsigned int ch, void *command,
 			    size_t length)
@@ -1996,20 +1997,58 @@ int ane_h16_session_control(struct ane_h16_session *s, unsigned int ch, void *co
 	}
 	if (ret)
 		return h16_fail(s, ret);
+	memcpy(command, reply, length);
 	s->ops->log(s->ctx, "control", id, 0);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_control);
 
 /*
+ * Hold the firmware's dynamic power gating off without a request (or let it
+ * go back on): for work the host does not submit, the ISP's MLVNR on its own
+ * rings. Caller holds the session lock.
+ */
+int ane_h16_session_gate_pin(struct ane_h16_session *s, bool pin)
+{
+	int ret;
+
+	if (!s)
+		return -EINVAL;
+	if (!pin) {
+		if (!s->gate_pinned)
+			return 0;
+		s->gate_pinned = false;
+		return s->running ? 0 : h16_gate_release(s);
+	}
+	h16_drain(s);
+	if (s->quarantined)
+		return -EIO;
+	if (s->asleep)
+		return -EAGAIN;
+	if (!s->gate_held) {
+		ret = h16_gate(s, 0);
+		if (ret)
+			return h16_fail(s, ret);
+		s->gate_held = true;
+	}
+	s->gate_pinned = true;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_gate_pin);
+
+/*
  * Serve what the firmware posted while no host command waits (the ISP link
  * drives the engine): the doorbell bits it rang, then SHAREDMALLOC and the
- * terminal until quiet, for at most limit_ns. Returns the requests served.
- * Caller holds the session lock.
+ * terminal until quiet, for at most limit_ns per round. After a request is
+ * served the next is waited for up to 100 us, so a burst is served in one
+ * call: the firmware posts its next request only after the answer, and macOS
+ * serves the 30 ISP surface maps of an MLVNR start within about 1 ms (the
+ * ISP firmware gives an ANE command 200 ms). Nothing posted: one pass, no
+ * wait. Returns the requests served. Caller holds the session lock.
  */
 int ane_h16_session_serve(struct ane_h16_session *s, u32 *pending, u64 limit_ns)
 {
-	int ret;
+	int ret, total;
 
 	if (!s || !pending)
 		return -EINVAL;
@@ -2022,7 +2061,9 @@ int ane_h16_session_serve(struct ane_h16_session *s, u32 *pending, u64 limit_ns)
 	if (ret)
 		return h16_fail(s, ret);
 	ret = ane_fw_transport_settle(s->transport, 0, limit_ns);
-	return ret < 0 ? h16_fail(s, ret) : ret;
+	for (total = ret; ret > 0 && total < 64; total += ret)
+		ret = ane_fw_transport_settle(s->transport, 100 * NSEC_PER_USEC, limit_ns);
+	return ret < 0 ? h16_fail(s, ret) : total;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_serve);
 
