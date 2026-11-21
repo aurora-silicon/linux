@@ -536,12 +536,6 @@ int apple_pmp_j713_display_check_release(struct device *consumer)
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_display_check_release);
 
-int apple_pmp_j713_gpu_check(struct device *consumer)
-{
-	return apple_pmp_j713_board() ? pmp_power_check(consumer, PMP_POWER_AGX, false) : -ENODEV;
-}
-EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_check);
-
 int apple_pmp_j713_display_get(struct device *consumer)
 {
 	return apple_pmp_j713_board() ? pmp_power_get(consumer, PMP_POWER_DISP) : -ENODEV;

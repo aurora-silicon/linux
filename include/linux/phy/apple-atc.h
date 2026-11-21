@@ -40,15 +40,11 @@ int apple_atcphy_sleep_recover(struct phy *usb2_phy);
 /*
  * Ends a sleep that prepare took on, with the SuperSpeed side back as the mux wants it.
  * Without @kept the host was restarted; only a failure of the PHY's own then makes the
- * controller stop for later sleeps.
+ * controller stop for later sleeps. It runs from the PHY's work, after a wake.
  */
-void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept);
-
-/* The same from the PHY's work, for after a wake; the flush waits for it. */
 void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept);
 /* Nonblocking admission query; the caller serializes finish requests into epochs. */
 bool apple_atcphy_sleep_finish_done(struct phy *usb2_phy);
-void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy);
 
 /* ACIO owns this transaction; @phy is its shared USB3 lane PHY handle. */
 int apple_atcphy_cio_prepare(struct phy *phy);
@@ -71,10 +67,6 @@ static inline int apple_atcphy_sleep_recover(struct phy *usb2_phy)
 	return -EOPNOTSUPP;
 }
 
-static inline void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
-{
-}
-
 static inline void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept)
 {
 }
@@ -82,10 +74,6 @@ static inline void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool ke
 static inline bool apple_atcphy_sleep_finish_done(struct phy *usb2_phy)
 {
 	return true;
-}
-
-static inline void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy)
-{
 }
 
 static inline int apple_atcphy_cio_prepare(struct phy *phy)
