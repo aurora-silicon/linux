@@ -135,6 +135,9 @@ pub(crate) struct Layout {
     pub(crate) globals_policy: &'static [(usize, u32)],
     /// GLOBALS (region C) words this build writes in place of the 25G83 value at that position.
     pub(crate) globals_override: &'static [(usize, u32)],
+    /// POWER_PERFORMANCE (power config) words of this build that have no 25G83 position, at
+    /// their own offsets.
+    pub(crate) power_policy: &'static [(usize, u32)],
 }
 
 /// Size of the host's crash copy buffer (`coredump-copy-buffer` in the 27.2 nub); macOS 27.2
@@ -214,6 +217,7 @@ pub(crate) const V25G83: Layout = Layout {
     coredump_copy: None,
     globals_policy: &[],
     globals_override: &[],
+    power_policy: &[],
 };
 
 /// The 26B123 InitData ABI (macOS 27.2): the same 31 objects and pointers, with
@@ -278,6 +282,14 @@ pub(crate) const V26B123: Layout = Layout {
     globals_policy: &[(0x38, 1), (0x9dc, 50), (0xe0c, 250)],
     // 27.2 (candidate): the GPU is never powered off when idle; see IDLE_OFF_KEEP_POWERED_MS.
     globals_override: &[(0x9c0, IDLE_OFF_KEEP_POWERED_MS)],
+    // 27.2 (candidate): the four u32s inserted at 0x9c, as the M4 Pro writes them on this
+    // firmware (1 each). 0xa4 is the power-up target state: both 26B123 power-up sites load it
+    // (0x3ea60, 0x136f0; 25G83 passes 1) into AGFAPowerHandlePowerUp (0x123d0), whose power
+    // kick (0x305fc) returns at once when the target equals the current state, 0 while off. With
+    // 0 the GPU stays unpowered, and the register restore that follows (0xb7d4, first write
+    // SGX+0xd800) takes the SError seen on the J713 and the J773g. 0x9c is what 0x13e88 copies
+    // into 0xa4 while the GPU is on.
+    power_policy: &[(0x9c, 1), (0xa0, 1), (0xa4, 1), (0xa8, 1)],
 };
 
 /// 27.2 (candidate): the idle power-off delay in ms (region C 25G83 0x9bc = 40, 26B123 0x9c0).
@@ -884,6 +896,9 @@ pub(crate) fn encode_for(
     let runs = layout.power_performance;
     let p = &mut objects[id::POWER_PERFORMANCE];
     put64(p, remap(runs, 0x3b50, 8)?, input.va[id::TEMPERATURE])?;
+    for &(at, value) in layout.power_policy {
+        put32(p, at, value)?;
+    }
     for (at, value) in [
         (4, 200000),
         (8, 200000),
