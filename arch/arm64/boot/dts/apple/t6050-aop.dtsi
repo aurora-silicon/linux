@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The AOP of the T6050 MacBook Pros (J714c, J714s, J716c, J716s, K114c, K114s, K116c, K116s),
+ * with its sensor services (ambient light, lid angle) and its audio service, and the
+ * microphone array that service captures.
+ *
+ * Each of these boards' ADTs has the same nodes here: the AOP (ASC 0x290600000, interrupts
+ * 578-581), its setup port (aop-exclave-mailbox at 0x2d067c000, dart-aop stream 1), dart-aop
+ * (0x290fc0000, IRQ 616), admac-base-ns (0x293800000, IRQ 637, dart-aop stream 8), the
+ * ambient light sensor and the audio service under the AOP, and the same microphone array:
+ * audio-hp-mic, three microphones on leap-s ADMAC RX0, which the AP reaches through the proxy
+ * aperture admac-hp-mic-ec-proxy (0x2d3200000, dma-channel 0, admac-leap-s interrupt 638,
+ * dart-aop stream 11). The nodes themselves are in t6050-die0.dtsi and t6050-peripherals.dtsi,
+ * disabled. The lid angle is a service the AOP firmware announces; it has no node of its own.
+ *
+ * The LEAP leaves have no AP power state: the firmware raises them with the hpai service's
+ * "pw0 " when the capture opens, and the proxy ADMAC's registers are first touched after
+ * that, when the capture requests its channel.
+ *
+ * Only the chassis name, the microphone card's identity (Apple<chassis>HPAI), differs: each
+ * board sets &aop_audio's apple,chassis-name before it includes this file, after
+ * t6050-peripherals.dtsi.
+ */
+
+/* The AOP, booted through its setup port, with its sensor and audio services. */
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_setup_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+&admac_base_ns {
+	status = "okay";
+};
+
+&admac_ec_proxy {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,machine-kind = "MacBook Pro";
+	/* hpai: leap-s RX0 is Linux channel 1 of the proxy ADMAC (2N for TX N, 2N+1 for RX N) */
+	dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
+	       <&admac_base_ns 0>, <&admac_base_ns 1>,
+	       <&admac_ec_proxy 1>;
+	dma-names = "cout", "cin", "spkr", "sense", "hpai";
+};
