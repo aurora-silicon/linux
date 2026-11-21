@@ -111,6 +111,11 @@ int tb_cio_sleep_prepare(struct tb *tb)
 	mutex_unlock(&tb->lock);
 	/* A DPRX callback already outside the lock must finish before device PM. */
 	flush_workqueue(tb->wq);
+	/*
+	 * Outside the lock, as after an unplug: the released peers' services unbind now and
+	 * give back their rings, which the host must not hold across its power cycle.
+	 */
+	tb_domain_unregister_unplugged_xdomains(tb);
 	/* Bandwidth release runs on a system queue, outside the CM workqueue. */
 	for (unsigned int i = 0; i < ARRAY_SIZE(tcm->groups); i++) {
 		if (cancel_delayed_work_sync(&tcm->groups[i].release_work)) {
