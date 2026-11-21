@@ -23,8 +23,8 @@
  * after the last refusal, after the SEP and GPU stops, after the remaining stops (set against
  * macOS's commit, while the debug link still carries it), and after the link's cut.
  *
- * No wake is qualified. The wake sources are armed only with t8122_wake_mask=1, at mask
- * offsets taken from T8140's layout and unmeasured here; the display and the GPU have no
+ * No wake is qualified. The wake sources are not armed (their mask offsets would come from
+ * T8140's layout and are unmeasured here); the display and the GPU have no
  * restart; and a real commit is recovered by reset.
  *
  * The SMC's order is not macOS's. Measured before its commit: MBSE=slpw 240 ms, pmVC 147 ms,
@@ -439,19 +439,19 @@ static void t8122_witness_show(struct apple_sleep *s)
 		if (!w->taken)
 			continue;
 		for (i = 0; i < T8122_W_COPROCS; i++)
-			dev_info(s->dev, "J613 witness %u: %s ASC control %08x status %08x\n", n,
+			dev_info(s->dev, "T8122 witness %u: %s ASC control %08x status %08x\n", n,
 				 t8122_witness_coprocs[i].name, w->control[i], w->status[i]);
-		dev_info(s->dev, "J613 witness %u: gates %08x %08x clusters %08x %08x CLLT %08x notify PMU %08x HPM %08x\n",
+		dev_info(s->dev, "T8122 witness %u: gates %08x %08x clusters %08x %08x CLLT %08x notify PMU %08x HPM %08x\n",
 			 n, w->extra[0], w->extra[1], w->extra[2], w->extra[3], w->extra[4],
 			 w->extra[5], w->extra[6]);
 		for (i = 0; i < ARRAY_SIZE(t8122_ps_all); i++)
-			dev_info(s->dev, "J613 witness %u: ps %05x %08x\n", n, t8122_ps_all[i],
+			dev_info(s->dev, "T8122 witness %u: ps %05x %08x\n", n, t8122_ps_all[i],
 				 w->ps[i]);
 		for (i = 0; i < T8122_W_WAKE; i++)
-			dev_info(s->dev, "J613 witness %u: wake %02x %08x\n", n, i * 4, w->wake[i]);
+			dev_info(s->dev, "T8122 witness %u: wake %02x %08x\n", n, i * 4, w->wake[i]);
 	}
 	if (t8122.disp_poll_us != -1)
-		dev_info(s->dev, "J613: DISP_CPU read off %d us after its lower\n",
+		dev_info(s->dev, "T8122: DISP_CPU read off %d us after its lower\n",
 			 t8122.disp_poll_us);
 }
 
@@ -525,7 +525,7 @@ static int t8122_sleep_map_regs(struct apple_sleep *s)
 	 * Without "ps-aon" the gate stays shut and the link is left alone.
 	 */
 	if (t8122_keep_debug_link) {
-		dev_info(s->dev, "J613 trial: a live debug link is kept across the commit\n");
+		dev_info(s->dev, "T8122: a live debug link is kept across the commit\n");
 	} else {
 		s->ps_aon = t8122_map(s, "ps-aon", NULL);
 		if (IS_ERR(s->ps_aon)) {
@@ -604,15 +604,15 @@ static int t8122_sleep_begin(struct apple_sleep *s)
 	t8122.dc_dropped = 0;
 	/* What the cut's gate will find: the late witness goes dark with the link. */
 	if (s->ps_aon)
-		dev_info(s->dev, "J613: debug switch %#x, port controller %s: %s\n",
+		dev_info(s->dev, "T8122: debug switch %#x, port controller %s: %s\n",
 			 readl(s->ps_aon + s->soc->ps_aon_debug_switch),
 			 s->hpm_spmi ? "named" : "not named",
 			 sleep_debug_link_up(s) ? "live debug link, cut after the coprocessor stops" :
 						  "no cut");
 	if (apple_sleep_dry(s))
-		dev_info(s->dev, "J613: dry run: the refusals and the first witness, then a return before any stop\n");
+		dev_info(s->dev, "T8122: dry run: the refusals and the first witness, then a return before any stop\n");
 	else
-		dev_warn(s->dev, "J613: this sleep commits: wake sources %s; no wake is qualified, the display and the GPU don't restart\n",
+		dev_warn(s->dev, "T8122: this sleep commits: wake sources %s; no wake is qualified, the display and the GPU don't restart\n",
 			 t8122_wake_mask && s->wake && s->wake_enable_count ?
 			 "armed from the tree's apple,wake-enable" : "not armed, left as they are");
 
@@ -689,7 +689,7 @@ static int t8122_sleep_display_off(struct apple_sleep *s)
 	return 0;
 }
 
-/* Final J613-specific witness; the shared untested gate controls commitment. */
+/* Final T8122 witness; the shared untested setting keeps the commit off. */
 static int t8122_sleep_final_check(struct apple_sleep *s)
 {
 	t8122_witness_take(s, 0);
@@ -701,7 +701,7 @@ static int t8122_sleep_final_check(struct apple_sleep *s)
 	 * hypervisor reads at macOS's last WFI. Reads only, of registers this kernel already uses.
 	 */
 	if (t8122_dry_regs && apple_sleep_dry(s))
-		dev_info(s->dev, "J613 dry run: boot cpu deep-sleep %#llx cntp/cntv_el0 %#llx/%#llx cntp/cntv_el02 %#llx/%#llx VM_TMR_FIQ_ENA %#llx PMCR0 %#llx IPI_SR %#llx ISR %#llx\n",
+		dev_info(s->dev, "T8122 dry run: boot cpu deep-sleep %#llx cntp/cntv_el0 %#llx/%#llx cntp/cntv_el02 %#llx/%#llx VM_TMR_FIQ_ENA %#llx PMCR0 %#llx IPI_SR %#llx ISR %#llx\n",
 			 read_sysreg_s(SYS_APL_DEEP_SLEEP), read_sysreg(cntp_ctl_el0),
 			 read_sysreg(cntv_ctl_el0),
 			 is_kernel_in_hyp_mode() ? read_sysreg_s(SYS_CNTP_CTL_EL02) : 0,
