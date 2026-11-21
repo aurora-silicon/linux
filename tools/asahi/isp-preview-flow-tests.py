@@ -15,10 +15,10 @@ code='''
 #include <errno.h>
 typedef unsigned int u32;
 struct coord {int x,y;};
-struct preset {int index;struct coord crop_offset,crop_size,output_dim;};
+struct preset {int index;bool remapped;struct coord crop_offset,crop_size,output_dim;};
 struct isp_format {struct preset *preset;int strides[2];};
 struct hw {int fw_abi;bool lpdp;};
-struct apple_isp {struct hw *hw;bool preview_26;int temporal_filter;};
+struct apple_isp {void *dev;struct hw *hw;bool preview_26;int temporal_filter;};
 static struct preset preset;
 static struct isp_format fmt={.preset=&preset};
 static struct isp_format *isp_get_format(struct apple_isp *i,u32 ch){return &fmt;}
@@ -35,6 +35,13 @@ for name in names:
  effect={'isp_cmd_apple_ch_temporal_filter_start':'temporal_start++;','isp_cmd_apple_ch_motion_history_start':'history++;','isp_cmd_apple_ch_temporal_filter_enable':'enable++;','isp_cmd_apple_ch_temporal_filter_disable':'disable++;if(fail_disable)return -EIO;','isp_ch_configure_pools':'pools++;'}.get(name,'')
  code+='static int '+name+'(struct apple_isp *i,...){'+effect+'return 0;}\n'
 code += 'static bool isp_is_p010(struct apple_isp *i){return false;}\n'
+# Knobs and helpers outside the order checked here (macOS-parity tuning, SIFR, camera LED, MLVNR).
+code += 'static bool isp_lpdp_macos, isp_macos_tune;\n'
+code += 'static bool isp_ch_config_is_sifr(struct apple_isp *i,u32 ch,int index){return false;}\n'
+code += 'static void isp_ch_configure_led(struct apple_isp *i,u32 ch){}\n'
+code += 'static void isp_ch_configure_sifr(struct apple_isp *i,u32 ch,int index){}\n'
+code += 'static int apple_isp_ane_stream_start(struct apple_isp *i,u32 ch){return -ENODEV;}\n'
+code += '#define dev_warn(dev, ...) ((void)(dev))\n'
 code += 'static int isp_ch_configure_temporal_filter(struct apple_isp *i,u32 ch){temporal_start++;history++;enable++;return 0;}\n'
 code+=body+r'''
 int main(void){
