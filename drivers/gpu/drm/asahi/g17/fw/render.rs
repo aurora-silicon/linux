@@ -398,6 +398,9 @@ pub(crate) struct RenderArgs<'a> {
     pub(crate) programs: RegisterPrograms,
     /// Device/build policy for registers 0x1c890 and 0x1c918 in V25G83-format arrays.
     pub(crate) ta_mode_1: bool,
+    /// Clusters of the GPU: above two, clustered tiling takes the segment words of
+    /// `fw::m5::target::cluster_control` instead of the two-cluster capture.
+    pub(crate) clusters: u32,
     /// Deflake-buffer layout of the GPU.
     pub(crate) deflake: Deflake,
 }
@@ -697,6 +700,8 @@ const T6041_TA_MODE_1: u64 = 1;
 /// Pages the tiler keeps out of a partial render's segments: without them the pages a pass
 /// returns shrink to none and the tiler can't advance. Fifteen blocks, macOS's minimum heap.
 const MIN_FREE_TVB_PAGES: u64 = 0x3c;
+/// 0x1c9a8 of a clustered four-cluster T6041 25G83 pass, as macOS 26.6.2 writes it.
+const T6041_CLUSTERED_FREE_PAGES: u64 = 0x5c;
 
 /// The 25G83 tiling array: the A18 Pro's without 0x1748 and 0x1740 (and 0x17d9 unless the stage
 /// has SCS), with the tiler parameter sub-buffer registers and 0x10131 = 0x88, in the order the
@@ -748,10 +753,20 @@ fn ta_registers_25g83(
     push(find(0x1c880, 0)?);
     push(RegisterWrite::new(0x1c948, gtp(4)?));
     push(RegisterWrite::new(0x1c888, gtp(5)?));
-    let (segment_control, segment_index) = if args.ta_mode_1 {
-        (T6041_TA_MODE_1, 0)
-    } else {
-        (VDM_SEGMENT_CONTROL, VDM_SEGMENT_INDEX)
+    let multi = (!args.ta_mode_1 && args.clusters > 2)
+        .then(|| {
+            super::m5::target::cluster_control(
+                args.clusters,
+                super::m5::target::min_parameter_buffer_pages(args.clusters),
+            )
+        })
+        .flatten();
+    let (segment_control, segment_index, free_pages) = match (args.ta_mode_1, multi) {
+        (true, _) => (T6041_TA_MODE_1, 0, MIN_FREE_TVB_PAGES),
+        // Four clusters (M4 Max): 0x280540 / 4, and 32 + 16 x clusters free pages.
+        // macOS writes 0x5c free pages on the four-cluster 25G83 build, not the M5's 0x60.
+        (false, Some([control, index, _])) => (control, index, T6041_CLUSTERED_FREE_PAGES),
+        (false, None) => (VDM_SEGMENT_CONTROL, VDM_SEGMENT_INDEX, MIN_FREE_TVB_PAGES),
     };
     push(RegisterWrite::new(0x1c890, segment_control));
     push(RegisterWrite::new(0x1c918, segment_index));
@@ -761,7 +776,7 @@ fn ta_registers_25g83(
     push(RegisterWrite::new(0x1c9e0, gtp2));
     push(RegisterWrite::new(0x16c41, gtp6));
     push(RegisterWrite::new(0x1ca40, gtp6));
-    push(RegisterWrite::new(0x1c9a8, MIN_FREE_TVB_PAGES));
+    push(RegisterWrite::new(0x1c9a8, free_pages));
     push(RegisterWrite::new(0x1c920, gtp(7)?));
     for reg in [0x10151, 0x1c199, 0x1c1a1, 0x1c1a9, 0x1c1b1, 0x1c1b9, 0x1c8f8, 0x1c0b1, 0x1c850] {
         push(find(reg, 0)?);
@@ -1771,8 +1786,7 @@ mod ta_mode_tests {
 
     /// The TA mode of every admitted T6041 build.
     fn t6041_ta_mode_1() -> bool {
-        let [f84, g83, b123] = t6041_variants();
-        assert_eq!(f84.ta_mode_1, g83.ta_mode_1);
+        let [f84, _, b123] = t6041_variants();
         assert_eq!(f84.ta_mode_1, b123.ta_mode_1);
         f84.ta_mode_1
     }
@@ -1794,8 +1808,16 @@ mod ta_mode_tests {
         assert!(!b123.split_firmware_area);
         for max in [f84, g83, b123] {
             assert_eq!(max.programs, RegisterPrograms::V25G83);
-            assert!(max.ta_mode_1);
         }
+        // 25F84 keeps TA mode 1; 25G83 tiles clustered with a heap that may fill the block table.
+        assert!(f84.ta_mode_1);
+        assert!(!g83.ta_mode_1);
+        assert_eq!(g83.tvb_normal_blocks, crate::g17::fw::buffer::NORMAL_MAX_BLOCKS_FOUR_CLUSTERS);
+        assert_eq!(f84.tvb_normal_blocks, crate::g17::fw::buffer::NORMAL_MAX_BLOCKS);
+        assert_eq!(pro.tvb_normal_blocks, crate::g17::fw::buffer::NORMAL_MAX_BLOCKS);
+        // 26B123 keeps 25F84's TA mode 1 and heap maximum.
+        assert!(b123.ta_mode_1);
+        assert_eq!(b123.tvb_normal_blocks, crate::g17::fw::buffer::NORMAL_MAX_BLOCKS);
         assert!(!pro.ta_mode_1);
         assert!(!V25F84.ta_mode_1);
         assert!(!V25G83.ta_mode_1);
@@ -1848,6 +1870,7 @@ mod ta_mode_tests {
             fragment: stage,
             programs: RegisterPrograms::V25G83,
             ta_mode_1: false,
+            clusters: 2,
             deflake: Deflake::FOUR_CLUSTERS,
         }
     }
@@ -1890,6 +1913,30 @@ mod ta_mode_tests {
                 assert_eq!(changed, 2);
             }
         }
+    }
+
+    #[test]
+    fn four_clusters_take_the_four_cluster_segment_words() {
+        let (pass, resources) = fixture();
+        let geometry = Geometry::new(&pass).unwrap();
+        let words = PassWords::new(&pass).unwrap();
+        let find = |a: &[RegisterWrite], reg: u32| a.iter().find(|w| w.reg == reg).map(|w| w.value);
+        let mut args = args(&pass, &resources, false);
+        let (two, count) = ta_registers_25g83(&args, &geometry, &words).unwrap();
+        assert_eq!(find(&two[..count], 0x1c890), Some(VDM_SEGMENT_CONTROL));
+        assert_eq!(find(&two[..count], 0x1c918), Some(VDM_SEGMENT_INDEX));
+        assert_eq!(find(&two[..count], 0x1c9a8), Some(MIN_FREE_TVB_PAGES));
+        args.clusters = 4;
+        let (four, count4) = ta_registers_25g83(&args, &geometry, &words).unwrap();
+        assert_eq!(count4, count);
+        assert_eq!(find(&four[..count4], 0x1c890), Some(0x28_0540));
+        assert_eq!(find(&four[..count4], 0x1c918), Some(4));
+        assert_eq!(find(&four[..count4], 0x1c9a8), Some(T6041_CLUSTERED_FREE_PAGES));
+        // TA mode 1 is unaffected by the cluster count.
+        args.ta_mode_1 = true;
+        let (mode1, _) = ta_registers_25g83(&args, &geometry, &words).unwrap();
+        assert_eq!(find(&mode1[..count4], 0x1c890), Some(T6041_TA_MODE_1));
+        assert_eq!(find(&mode1[..count4], 0x1c9a8), Some(MIN_FREE_TVB_PAGES));
     }
 
     #[test]
