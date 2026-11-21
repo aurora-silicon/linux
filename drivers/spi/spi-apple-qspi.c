@@ -94,7 +94,6 @@
 struct apple_qspi_soc {
 	/* T8140: data reads of any shape pass straight to the controller. */
 	bool multi_io_reads;
-	bool runtime_pm;
 };
 
 /*
@@ -1077,8 +1076,12 @@ static int apple_qspi_probe(struct platform_device *pdev)
 	ctlr->mem_ops = &apple_qspi_mem_ops;
 
 	platform_set_drvdata(pdev, ctlr);
-	/* Keep probe and SPI NOR discovery powered until registration finishes. */
-	if (soc->runtime_pm && IS_ENABLED(CONFIG_PM)) {
+	/*
+	 * A controller in a power domain lets it gate between accesses, which
+	 * it otherwise holds on for as long as the driver is bound. Keep probe
+	 * and SPI NOR discovery powered until registration finishes.
+	 */
+	if (dev->pm_domain && IS_ENABLED(CONFIG_PM)) {
 		pm_runtime_get_noresume(dev);
 		ret = devm_pm_runtime_set_active_enabled(dev);
 		if (ret) {
@@ -1263,7 +1266,6 @@ static const struct apple_qspi_soc apple_qspi_single_io = { };
 
 static const struct apple_qspi_soc apple_qspi_t8140 = {
 	.multi_io_reads = true,
-	.runtime_pm = true,
 };
 
 static const struct of_device_id apple_qspi_of_match[] = {
