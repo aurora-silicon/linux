@@ -122,13 +122,13 @@ static void combo_pipe_fault(struct t6050_dp *dp, const char *what, int ret)
 /*
  * What the combo PHY gained for a deep sleep outside its sleep callbacks (a wrapper domain
  * still held at a stop is released, a safe state with a domain still held is stopped again,
- * the always-on domain's hold over the sleep) is in force on the boards with a T6050 sleep,
- * the J714s and the J716c. On another T6050 board the stop, the safe state and the probe are
- * as before.
+ * the always-on domain's hold over the sleep) is in force where the device tree describes
+ * the T6050 sleep (apple,t6050-sleep). On a T6050 board without it the stop, the safe state
+ * and the probe are as before.
  */
 static bool combo_sleep_board(void)
 {
-	return of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c");
+	return apple_t6050_sleep_described();
 }
 
 static bool combo_domains_held(struct t6050_dp *dp)

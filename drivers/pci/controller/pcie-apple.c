@@ -4312,8 +4312,7 @@ static int apple_pcie_tunnel_add_links(struct apple_pcie *pcie)
 		if (ret == -EOPNOTSUPP)
 			dev_warn(pcie->dev, "DART has no CIO sleep path; a docked deep sleep is refused\n");
 	} else if (cio_s2r && pcie->hw == &t6050_pciec_hw &&
-		   (of_machine_is_compatible("apple,j714s") ||
-		    of_machine_is_compatible("apple,j716c")) &&
+		   apple_t6050_sleep_described() &&
 		   of_property_present(dart_pdev->dev.of_node, "apple,clock-protection")) {
 		/*
 		 * TEST: T6050, a router that sleeps in place. Only with the DART's clock
@@ -5419,16 +5418,15 @@ static int apple_pcie_t6050_warm_reset(struct apple_pcie *pcie, bool noirq)
 }
 
 /*
- * The adopted host's firmware sleep is set up on the boards with a T6050 sleep, the J714s and
- * the J716c. On another T6050 board nothing is registered and no port is taken for it: the
- * host is as before.
+ * The adopted host's firmware sleep is set up where the device tree describes the T6050 sleep
+ * (apple,t6050-sleep). On a T6050 board without it nothing is registered and no port is taken
+ * for it: the host is as before.
  */
 static void apple_pcie_t6050_sleep_probe(struct platform_device *pdev, struct apple_pcie *pcie)
 {
 	struct apple_pcie_port *port;
 
-	if (pcie->managed_sids || !(of_machine_is_compatible("apple,j714s") ||
-				    of_machine_is_compatible("apple,j716c")))
+	if (pcie->managed_sids || !apple_t6050_sleep_described())
 		return;
 	/* The one port a boot loader trained; an endpoint Linux powers is parked instead. */
 	list_for_each_entry(port, &pcie->ports, entry)
@@ -6770,15 +6768,14 @@ static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
 	int error = 0;
 
 	/*
-	 * Qualified on the J716c, the K114c, the K116s and the J714s: the same
-	 * T6050 host with the N1 adopted on port 0. The K116s and the J714s
-	 * (16- and 14-inch M5 Pro) also have a kernel-trained SD reader port.
-	 * Other adopted platforms and deeper sleep remain unqualified.
+	 * A host that adopts the boot loader's link (hw->adopt_link, the caller's
+	 * condition): the link and every device below it are checked here before
+	 * and after suspend-to-idle, so the retained hierarchy is taken only where
+	 * it is healthy and in D0, whatever the board. Run on the J716c, the K114c,
+	 * the K116s and the J714s (the K116s and the J714s with a kernel-trained SD
+	 * reader port too). Deeper sleep is not this path.
 	 */
-	if (!(of_machine_is_compatible("apple,j716c") ||
-	      of_machine_is_compatible("apple,k114c") ||
-	      of_machine_is_compatible("apple,k116s") ||
-	      of_machine_is_compatible("apple,j714s")) || !pm_suspend_no_platform())
+	if (!pm_suspend_no_platform())
 		return -EBUSY;
 
 	if (!(readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN) ||
@@ -7342,8 +7339,7 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		 * failed for it (run sv6t4: "PM: failed to resume noirq: error -107").
 		 */
 		if (ret == -ENOTCONN && pcie->cio_lost && pcie->hw == &t6050_pciec_hw &&
-		    (of_machine_is_compatible("apple,j714s") ||
-		     of_machine_is_compatible("apple,j716c"))) {
+		    apple_t6050_sleep_described()) {
 			dev_warn(dev, "T6050 sleep: PCIe-C tunnel gone with its dock during the sleep: the port is closed as after an unplug, its functions return when the dock is plugged in again\n");
 			return 0;
 		}

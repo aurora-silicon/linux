@@ -1331,8 +1331,7 @@ int apple_t6050_phy_cio_usb(struct device *dev, enum apple_t6050_cio_usb step)
 		return 0;
 	case APPLE_T6050_CIO_USB_KEEP:
 		dp->cio_usb_kept = dp->cio_usb_parked = false;
-		if (!(of_machine_is_compatible("apple,j714s") ||
-		      of_machine_is_compatible("apple,j716c")) ||
+		if (!apple_t6050_sleep_described() ||
 		    !dp->cio_usb_host || dp->faulted ||
 		    dp->combo_mode != COMBO_CIO || !dp->cio_prepared || !dp->controller_active ||
 		    !dp->pipe_active || !dp->pipe_tunnel)
