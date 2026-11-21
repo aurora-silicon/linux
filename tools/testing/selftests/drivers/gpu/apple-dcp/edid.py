@@ -105,6 +105,8 @@ struct apple_dcp {
              u64 opened_epoch,close_gen,terminated_epoch,close_epoch;bool opening;struct work_struct close_wq; } dcpavserv;
     /* A J714s firmware 27 processor's: this one is not. */
     bool v27_j714s, v27_sleep_transport; struct apple_dcp_afkep *sleep_v27_ep[0x20], *panelav[0x20];
+    /* Not a dcpext: none of these scenarios is an external processor. */
+    bool dcpext;
 };
 '''+internal_inline(root,'dcp_fw_is_14_7')+internal_inline(root,'dcp_is_v14_7_external')+internal_inline(root,'dcp_is_v27_external')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
 static unsigned int dma_frees,opens;

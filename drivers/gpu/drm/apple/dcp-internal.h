@@ -308,12 +308,14 @@ struct apple_dcp_hw_data {
 	/*
 	 * The endpoint the DPTX port services are announced on, where it is not
 	 * the firmware's default (DPTX_ENDPOINT_V2 on firmware 27): the T8142
-	 * dcpext announces them on DPTX_ENDPOINT. 0: the default.
+	 * dcpext announces them on DPTX_ENDPOINT. 0: the default, or on a
+	 * firmware-27 dcpext what its firmware advertises (dcp_v27_dptx_layout()).
 	 */
 	u8 dptx_endpoint;
 	/*
 	 * Open the DPTX controller endpoint before the ports, as for H17P
 	 * externals: the T8142 dcpext announces AppleDCPDPTXController there.
+	 * Also set by dcp_v27_dptx_layout().
 	 */
 	bool dptx_controller;
 	/*
@@ -558,6 +560,8 @@ struct apple_dcp {
 	/* Firmware 27.x: the method IDs of this build (iomfb_v27_methods()). */
 	const struct dcp_method_entry *v27_methods;
 	bool external;
+	/* Any external processor (apple,dcpext), whatever its SoC; set at probe. */
+	bool dcpext;
 	/* A desktop 26.x external processor (apple,t6041-dcpext) */
 	bool desktop_external;
 	/*
