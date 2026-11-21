@@ -186,6 +186,16 @@ pub(crate) enum Registration {
     M5(crate::g17::fw::m5::queue::HardwareSubmission),
 }
 
+/// A tiler heap growth the host makes before publishing a render, to this many blocks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HostGrowth {
+    /// The pair is idle: the page list and the PB descriptor are rebuilt.
+    Idle(usize),
+    /// The pair has work in flight: blocks are only appended to the inventory,
+    /// as for a firmware grow request.
+    Busy(usize),
+}
+
 /// Installed kick backing remains owned even when this pair has no logical
 /// owner. Commands retain their exact descriptor and allocation generations.
 pub(crate) struct Pair {
@@ -1793,9 +1803,11 @@ impl Pair {
     pub(crate) fn oldest_packet(&self) -> Option<Arc<Packet>> {
         self.active.front().map(|active| active.packet.clone())
     }
-    /// Sample PM feedback only after this pair's exact retirement. Busy pairs
-    /// keep their current capacity and let firmware request growth as needed.
-    pub(crate) fn host_growth_target(&mut self, packet: &Packet) -> Result<Option<usize>> {
+    /// Sample PM feedback only after this pair's exact retirement. A busy pair
+    /// grows ahead of the render only by appending blocks to its inventory, as a
+    /// firmware grow request does (`buffer::Manager::busy_target`), and otherwise
+    /// keeps its current capacity and lets firmware request growth as needed.
+    pub(crate) fn host_growth_target(&mut self, packet: &Packet) -> Result<Option<HostGrowth>> {
         let mut required =
             m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs)?
                 .tvb_blocks;
@@ -1810,11 +1822,18 @@ impl Pair {
                 required = required.max(floor);
             }
         }
-        self.memory
-            .manager
-            .note_required(required, crate::g17::now_ns());
+        let now = crate::g17::now_ns();
+        self.memory.manager.note_required(required, now);
         if self.in_flight() {
-            return Ok(None);
+            if self.quarantined {
+                return Ok(None);
+            }
+            let client = self.memory.context.vm().memory_client().cloned();
+            return Ok(self
+                .memory
+                .manager
+                .busy_target(required, now, client.as_ref())?
+                .map(HostGrowth::Busy));
         }
         if !self.idle_for_context(self.context())? {
             return Err(EBUSY);
@@ -1830,7 +1849,7 @@ impl Pair {
         // ERANGE: a 16384x16384 no-attachment render after smaller ones lost the device
         // (dEQP-GLES31.functional.fbo.no_attachments.maximums.*).
         let required = required.max(feedback).min(self.memory.manager.max_blocks());
-        Ok((required > self.memory.manager.blocks()).then_some(required))
+        Ok((required > self.memory.manager.blocks()).then_some(HostGrowth::Idle(required)))
     }
 
     /// A quarantined pair, or a closed owner's pair that holds only groups whose stamps are
