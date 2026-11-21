@@ -174,6 +174,15 @@ const fn rep32(object: usize, at: usize, count: usize, value: u32) -> Fill {
 const fn w32(object: usize, at: usize, value: u32) -> Fill {
     rep32(object, at, 1, value)
 }
+const fn w64(object: usize, at: usize, value: u64) -> Fill {
+    Fill {
+        object,
+        at,
+        width: 8,
+        count: 1,
+        value,
+    }
+}
 const fn w8(object: usize, at: usize, value: u8) -> Fill {
     Fill {
         object,
@@ -361,6 +370,43 @@ const POLICY_26B123: &[Fill] = &[
     rep32(M, 0x26b0, 2, 0x1), rep32(M, 0x26c0, 3, 0x1), rep32(M, 0x26d0, 12, 0xffffffff),
     w32(M, 0x2724, 0x1), w32(M, 0x2754, 0x1),
     w32(M, 0x277e, 1), w8(M, 0x2782, 1),
+    // MAIN header and the four packed u16 blocks (meaning unknown): the constants g17's
+    // `HwData` writes (`unk_0`..`unk_20`, `UNK_E0`, `UNK_2D8`, `UNK_3E0`, `UNK_5D8`), which
+    // macOS 27.2 also writes on J773g.
+    w32(M, 0x4, 0x6f), w32(M, 0x8, 0xffc00000), w32(M, 0x14, 0x10), w32(M, 0x1c, 0x10),
+    w64(M, 0x20, 0x2ff_ffff_8000),
+    w32(M, 0xe0, 0x2008), w32(M, 0xe8, 0x20080000), w32(M, 0xf4, 0x2008), w32(M, 0xf8, 0x24cb),
+    w32(M, 0xfc, 0xc98a2cfa), w32(M, 0x100, 0xf4f624cb), w32(M, 0x104, 0x1877e917),
+    w32(M, 0x108, 0x38d924cb), w32(M, 0x10c, 0xbdab0000),
+    w32(M, 0x2d8, 0xfff82000), w32(M, 0x2dc, 0xd32d2cdb), w32(M, 0x2e0, 0xf5002000),
+    w32(M, 0x2e4, 0x21dae926), w32(M, 0x2e8, 0x38b62000), w32(M, 0x2ec, 0xc7420008),
+    w32(M, 0x3e0, 0x7fe0), w32(M, 0x3e8, 0x7fe00000), w32(M, 0x3f4, 0x7fe0), w32(M, 0x3f8, 0x8000),
+    w32(M, 0x400, 0x80000000), w32(M, 0x40c, 0x8000),
+    w32(M, 0x5d8, 0x4b232645), w32(M, 0x5dc, 0xe98), w32(M, 0x5e0, 0xd5a2ea5f),
+    w32(M, 0x5e4, 0x40003fff), w32(M, 0x5e8, 0xca5e4000), w32(M, 0x5ec, 0x4000f5a2),
+    // J773g's performance-state tables. Test kit: these are this board's values, from our
+    // macOS 27.2 capture (hv25), unchanged in every later hv29 snapshot, two of them under
+    // GPU load. They are the fields g17's `HwData25G83` calls `perf_a_relative` (25G83 0x18c8,
+    // here 0x19e4), `perf_b_relative` (0x1908, here 0x1a24), `perf_a_states` (0x19c8, here
+    // 0x1ae4) and `perf_b_states` (0x1a08, here 0x1b24), 11 rows each. macOS leaves row 0 of
+    // each zero, and rows 1-3 of the relative table B.
+    // Relative performance of rows 1..10 of table A and rows 4..10 of table B, in percent
+    // (f32): 9.28 14.91 20.47 26.81 35.26 43.71 53.95 60.65 79.13 100, and
+    // 16.88 33.25 47.83 61.64 69.31 86.19 100.
+    w32(M, 0x19e8, 0x41147d2f), w32(M, 0x19ec, 0x416e8b1e), w32(M, 0x19f0, 0x41a3bdbe),
+    w32(M, 0x19f4, 0x41d673ff), w32(M, 0x19f8, 0x420d0617), w32(M, 0x19fc, 0x422ed22e),
+    w32(M, 0x1a00, 0x4257cb3a), w32(M, 0x1a04, 0x42729e88), w32(M, 0x1a08, 0x429e42a1),
+    w32(M, 0x1a0c, 0x42c80000),
+    w32(M, 0x1a34, 0x418709d2), w32(M, 0x1a38, 0x4204fe09), w32(M, 0x1a3c, 0x423f4de9),
+    w32(M, 0x1a40, 0x42768c1d), w32(M, 0x1a44, 0x428a9e72), w32(M, 0x1a48, 0x42ac60e6),
+    w32(M, 0x1a4c, 0x42c80000),
+    // The performance state of rows 1..10 of table A, then of table B.
+    w32(M, 0x1ae8, 1), w32(M, 0x1aec, 2), w32(M, 0x1af0, 3), w32(M, 0x1af4, 4), w32(M, 0x1af8, 6),
+    w32(M, 0x1afc, 8), w32(M, 0x1b00, 10), w32(M, 0x1b04, 12), w32(M, 0x1b08, 14),
+    w32(M, 0x1b0c, 15),
+    w32(M, 0x1b28, 1), w32(M, 0x1b2c, 2), w32(M, 0x1b30, 3), w32(M, 0x1b34, 4), w32(M, 0x1b38, 5),
+    w32(M, 0x1b3c, 7), w32(M, 0x1b40, 9), w32(M, 0x1b44, 11), w32(M, 0x1b48, 13),
+    w32(M, 0x1b4c, 15),
     // POWER_PERFORMANCE (power config).
     w32(P, 0x0, 0x1), w32(P, 0x4, 0x30d3f), rep32(P, 0x2c, 2, 0x3), w32(P, 0x40, 0x12c),
     w32(P, 0x44, 0xc), w32(P, 0x48, 0x3e8), w32(P, 0x50, 0x12c), w32(P, 0x60, 0x4),
