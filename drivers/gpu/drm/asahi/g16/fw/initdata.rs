@@ -364,10 +364,13 @@ pub(crate) const V26B123: Layout = Layout {
     coredump_copy: Some(0xfa8),
     retention: Retention::Runtime(0x2c8),
     globals_policy: &[],
-    // 0xa4 selects the powered-up state; leaving 0 there keeps the GPU unpowered and triggers an
-    // SError on power-up. The low-peak (PPM) limiter words at +0xa80..+0xae0 are computed from
-    // the machine's ADT in `power_limiter`.
-    power_policy: &[(0xa4, 1)],
+    // The four u32s this build inserts at +0x9c, 1 each as macOS 27.2 writes them. 0xa4 selects
+    // the powered-up state; leaving 0 there keeps the GPU unpowered and triggers an SError on
+    // power-up. The firmware's warm restart after a deep sleep needs the other three as well: with
+    // only 0xa4 set it crashed in its power-up right after the RTKit handshake on the first wake.
+    // The low-peak (PPM) limiter words at +0xa80..+0xae0 are computed from the machine's ADT in
+    // `power_limiter`.
+    power_policy: &[(0x9c, 1), (0xa0, 1), (0xa4, 1), (0xa8, 1)],
     // Exact power sample period (from `gpu-pwr-sample-period-aic-clks`, in us) and the
     // average-power IIR filter over the ADT's `cpu-avg-limiter-input-tc`.
     power_sampling: Some(PowerSampling {
