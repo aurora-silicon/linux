@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * TEST ONLY: the Mac mini (M4, 2024) of the Aurora Silicon lab, whose host
+ * holds its control cable on Back Left (ATC1, hpm1). That port's PHY, port
+ * controller and roles must stay as they are without USB4 support, so
+ * everything USB4 on ATC1 is left out here: the router, its NHI, PCIe
+ * tunnel and mailbox are disabled, its PHY has no CIO calibration, its
+ * connector has no link to a router and the boot loader finds no alias for
+ * it. Back Middle (ACIO0) and Back Right (ACIO3) are as t8132-j773g.dts
+ * has them.
+ */
+
+#include "t8132-j773g.dts"
+
+/ {
+	aliases {
+		/delete-property/ usb4-1-acio;
+		/delete-property/ usb4-1-nhi;
+		/delete-property/ usb4-1-pcie-adapter;
+	};
+};
+
+&typec1 {
+	ports {
+		/delete-node/ port@2;
+	};
+};
+
+&usb4_1_acio {
+	status = "disabled";
+	/delete-property/ apple,tunable-pcie-adapter;
+	/delete-property/ apple,tunable-rc;
+	/delete-node/ ports;
+};
+
+&usb4_1_nhi {
+	/delete-property/ status;
+	/delete-property/ apple,tunable-nhi;
+	apple,thunderbolt-drom = [00];
+};
+
+&usb4_1_mbox {
+	status = "disabled";
+};
+
+&usb4_1_pcie_tunnel {
+	/delete-property/ status;
+};
+
+&usb4_1_pcie_dart {
+	/delete-property/ status;
+};
+
+&usb4_1_pcie {
+	/delete-property/ status;
+};
+
+&ps_atc1_pcie {
+	/delete-property/ status;
+};
+
+&ps_atc1_cio {
+	/delete-property/ status;
+};
+
+&ps_atc1_cio_pcie {
+	/delete-property/ status;
+};
+
+&ps_atc1_cio_usb {
+	/delete-property/ status;
+};
+
+&atcphy1 {
+	/delete-property/ apple,tunable-cio-axi2af;
+	/delete-property/ apple,tunable-cio-lioa;
+	/delete-property/ apple,tunable-cio-fabric;
+	/delete-property/ apple,tunable-cio-config;
+	/delete-property/ apple,tunable-cio-common;
+	/delete-property/ apple,tunable-cio-lane0;
+	/delete-property/ apple,tunable-cio-lane0-eq;
+	/delete-property/ apple,tunable-cio-lane1;
+	/delete-property/ apple,tunable-cio-lane1-eq;
+	/delete-property/ apple,tunable-cio-post;
+};
