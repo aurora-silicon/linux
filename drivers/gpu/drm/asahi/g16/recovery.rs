@@ -21,7 +21,12 @@ use kernel::{
 use logic::{RecoveryAction, Retirement, SnapshotEntry};
 
 use super::job::{Completions, Job};
+use super::regs::wmb;
 use super::{params, Firmware};
+
+/// S1, the lowest powered row of the firmware DVFS table, as the Globals p-state selectors
+/// express it (hundredths of a state). The host starts the firmware there too.
+const FLOOR_SELECTOR: u32 = 100;
 
 /// Monotonic time, ns.
 pub(crate) fn now_ns() -> u64 {
@@ -126,7 +131,9 @@ impl Firmware {
     }
 
     pub(crate) fn recovery_pending(&self) -> Result<bool> {
-        Ok(self.recovery.running || self.new_recovery() || self.firmware_r32(logic::PHASE)? != 0)
+        Ok(self.recovery.running
+            || self.new_recovery()
+            || self.firmware_r32(self.init.firmware_data().phase)? != 0)
     }
 
     pub(crate) fn recovery_idle(&self) -> Result<bool> {
@@ -235,6 +242,7 @@ impl Firmware {
     pub(crate) fn fail_stop(&mut self, error: Error, done: &mut Completions) {
         if self.recovery.failed.is_none() {
             self.recovery.failed = Some(error);
+            self.floor_power(error);
         }
         self.engine.frozen = true;
         self.events.grow.clear();
@@ -247,6 +255,60 @@ impl Firmware {
                 self.retain(job);
             }
         }
+    }
+
+    /// A failed device must not stay at its last performance request: the J773g idled at 98 C
+    /// after a fail-stop, against 83 C with the GPU idle. The Globals ceiling selectors are
+    /// host-owned (`service_power` writes them at runtime and stops after a failure): drop them
+    /// to S1 and log the one fail-stop summary. Nothing firmware-owned is touched, and no GPU
+    /// register is read.
+    fn floor_power(&mut self, error: Error) {
+        let before = self.power.effective;
+        let selectors = self.init.abi.initdata().pstate_selectors;
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        if let Some(globals) = self.init.globals.as_ref() {
+            // Write every selector without short-circuiting so a single write error cannot
+            // leave the remaining selectors unfloored.
+            for offset in selectors {
+                match globals.w32(offset, FLOOR_SELECTOR) {
+                    Ok(()) => ok += 1,
+                    Err(write_err) => {
+                        failed += 1;
+                        dev_err!(
+                            self.dev(),
+                            "G16: fail-stop: failed to floor Globals +{:#x}: {:?}\n",
+                            offset,
+                            write_err
+                        );
+                    }
+                }
+            }
+        }
+        if ok != 0 {
+            wmb();
+        }
+        let all_floored = ok == selectors.len() && failed == 0;
+        if all_floored {
+            self.power.effective = 1;
+        }
+        let outcome = if all_floored {
+            "S1"
+        } else if ok != 0 {
+            "partial S1"
+        } else {
+            "unchanged (Globals unwritable)"
+        };
+        dev_err!(
+            self.dev(),
+            "G16: fail-stop ({:?}): host ceiling S{} -> {} ({}/{} selectors written), temperature {} mC\n",
+            error,
+            before,
+            outcome,
+            ok,
+            selectors.len(),
+            self.power.temperature_mc
+        );
     }
 
     /// Flights own firmware-visible resources and slot claims. Failed-stop
@@ -288,16 +350,18 @@ impl Firmware {
 
     fn firmware_generation(&self) -> Result<u64> {
         // The firmware is stopped while its published generation is consumed.
-        let lo = self.firmware_r32(logic::GENERATION)?;
-        let hi = self.firmware_r32(logic::GENERATION + 4)?;
+        let generation = self.init.firmware_data().generation;
+        let lo = self.firmware_r32(generation)?;
+        let hi = self.firmware_r32(generation + 4)?;
         Ok(u64::from(lo) | (u64::from(hi) << 32))
     }
 
     /// Resolve the snapshot while the firmware is stopped. A missing retained
     /// owner prevents acknowledgement: its failure cannot safely be attributed.
     fn mark_recovery(&mut self, stage: [u32; 3], event: u32, asid: Option<u32>) -> Result {
-        for i in 0..logic::SNAPSHOT_ENTRIES {
-            let offset = logic::SNAPSHOT + i * 8;
+        let data = self.init.firmware_data();
+        for i in 0..data.snapshot_entries {
+            let offset = data.snapshot + i * 8;
             let flags = self.firmware_r32(offset)?;
             let target = self.firmware_r32(offset + 4)?;
             let Some(entry) = SnapshotEntry::decode(flags, target) else {
@@ -327,12 +391,11 @@ impl Firmware {
         // These frontiers must be captured before the host answers 2: the
         // firmware can force the stage target while aborting a work item.
         let stage = self.recovery_snapshot()?;
-        let fault = self.session.regs.engine_state()?;
-        let asid = fault
-            .status
-            .iter()
-            .find(|status| **status & 1 != 0)
-            .map(|status| ((*status >> 17) & 0x3f) as u32)
+        // Powered down, the GPU holds no fault to read.
+        let fault = self.session.fault_scan()?.unwrap_or_default();
+        let asid = Some(fault.status)
+            .filter(|status| status & 1 != 0)
+            .map(|status| ((status >> 17) & 0x3f) as u32)
             .filter(|asid| *asid >= 1);
         let deadline = start.saturating_add(logic::RECOVERY_BUDGET_NS);
         let mut answered = false;
@@ -346,7 +409,7 @@ impl Firmware {
                 dev_err!(self.dev(), "M4 GPU recovery exceeded 1000 ms\n");
                 return Err(ETIMEDOUT);
             }
-            let phase = self.firmware_r32(logic::PHASE)?;
+            let phase = self.firmware_r32(self.init.firmware_data().phase)?;
             let current_generation = if phase == 1 || phase == 3 {
                 self.firmware_generation()?
             } else {
@@ -376,13 +439,13 @@ impl Firmware {
                     self.mark_recovery(stage, event, asid)?;
                     // Snapshot reads and all TPC repairs precede acknowledgement.
                     barrier();
-                    self.firmware_w32(logic::PHASE, 2)?;
+                    self.firmware_w32(self.init.firmware_data().phase, 2)?;
                     barrier();
                     answered = true;
                 }
                 RecoveryAction::Resume => {
                     barrier();
-                    self.firmware_w32(logic::PHASE, 0)?;
+                    self.firmware_w32(self.init.firmware_data().phase, 0)?;
                     barrier();
                     self.recovery.recoveries += 1;
                     self.recovery.errors_seen = self.events.errors;

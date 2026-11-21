@@ -187,7 +187,7 @@ pub(crate) struct Flight {
     pub(crate) published_ns: u64,
     /// Published behind another flight.
     pub(crate) behind: bool,
-    /// The PB epoch this render prefix uses (its own, or a reused one with `g16_pb_reuse`).
+    /// The PB epoch this render prefix uses (its own, or a reused pass-slot epoch).
     pub(crate) pb: Option<Arc<super::pools::PbEpoch>>,
     /// Its pass slot binding (`Pools::bind`).
     pub(crate) pb_binding: u64,
@@ -432,8 +432,6 @@ pub(crate) struct Engine {
     pub(crate) prof: KBox<Prof>,
     /// The `aurora-g16/stats` file.
     pub(crate) debugfs: Option<Pin<KBox<kernel::debugfs::File<Arc<Shared>>>>>,
-    /// The `aurora-g16/tune` file.
-    pub(crate) tune_file: Option<Pin<KBox<kernel::debugfs::File<Arc<Shared>>>>>,
     scratch: Option<KBox<Scratch>>,
 }
 
@@ -467,7 +465,6 @@ impl Engine {
             stats: KBox::new(Stats::default(), GFP_KERNEL)?,
             prof: KBox::new(Prof::default(), GFP_KERNEL)?,
             debugfs: None,
-            tune_file: None,
             // Allocate host encoder buffers before any submitted fence can depend on
             // the device mutex. Publication must never enter direct reclaim here.
             scratch: Some(KBox::new(Scratch::new()?, GFP_KERNEL)?),
@@ -760,6 +757,22 @@ impl Firmware {
         self.service_power()?;
         self.drain_rings()?;
         self.check_hangs(done)?;
+        self.publish_checked(done)
+    }
+
+    /// [`Self::publish`] for a poll pass, which has already drained the receive rings and
+    /// checked for hangs under this device lock; still rechecks the session (including ASC RUN)
+    /// after retirement before publishing new work.
+    pub(crate) fn publish_checked(&mut self, done: &mut Completions) -> Result {
+        if self
+            .session
+            .shared
+            .sleeping
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        self.session.check()?;
         // The initial G16 backend deliberately serializes hardware publication. Stronger
         // ordering satisfies Mesa's barriers while slot displacement and cache ownership
         // stay explicit. Never enable G15's submit-ahead policy on the M4 wire by accident.
@@ -979,8 +992,8 @@ impl Firmware {
         let generation = job.vm.generation;
         let arena = job.resources.render()?;
         let mut a = arena.pools.prepare(k, draw)?;
-        // g16_pb_reuse: reuse this VM's retired epoch of the slot: no reseed, no InitBM.
-        let (epoch, reused) = match self.pools.reusable(params::pb_reuse(), k, &job.vm) {
+        // Reuse this VM's retired epoch of the slot when still bound: no reseed, no InitBM.
+        let (epoch, reused) = match self.pools.reusable(k, &job.vm) {
             Some(e) => {
                 self.pools.stats.reused += 1;
                 a.init_buffer = false;
@@ -1331,7 +1344,7 @@ impl Firmware {
             fw_stamp: g.fw_stamp.va,
             work: s.work.va,
             work_gva: s.work.lower_gva.ok_or(EINVAL)?,
-            // Exact embedded sequence: every self-reference then matches the 25G83 layout.
+            // Exact embedded sequence: every self-reference then matches the qualified layout.
             seq: s.work.va + 0x900,
             preempt_gva: s.preempt.gva.ok_or(EINVAL)?,
             its: s.its.va,
@@ -1361,7 +1374,8 @@ impl Firmware {
         let w = image(&mut scratch.cw)?;
         // User results are published coherently after the complete retirement receipt.
         // The firmware's internal timestamp pair remains enabled.
-        encode::encode_compute(
+        encode::encode_compute_for(
+            self.init.abi.compute(),
             &refs,
             &cmd.cmd,
             &cmd.attachments,
@@ -1427,7 +1441,8 @@ impl Firmware {
             .render()?
             .set_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes)?;
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
-        encode::encode_ta(
+        encode::encode_ta_for(
+            self.init.abi.ta(),
             &refs,
             &pass,
             &cmd.cmd,
@@ -1439,7 +1454,8 @@ impl Firmware {
             image(&mut scratch.ta)?,
             image(&mut scratch.tas)?,
         );
-        encode::encode_fs(
+        encode::encode_fs_for(
+            self.init.abi.fs(),
             &refs,
             &pass,
             &cmd.cmd,

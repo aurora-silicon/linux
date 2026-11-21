@@ -4,6 +4,7 @@
  * and macros. The module pin is retain.c's. Built only with CONFIG_DRM_ASAHI_G16.
  */
 #include <linux/device.h>
+#include <asm/arch_timer.h>
 #include <linux/atomic.h>
 #include <linux/dma-map-ops.h>
 #include <linux/io.h>
@@ -24,6 +25,8 @@
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/thermal.h>
+
+#include "glue.h"
 
 bool asahi_g16_board(void);
 int asahi_g16_display_prepare(struct device *dev);
@@ -204,6 +207,15 @@ int asahi_g16_tvm_enable(struct device *dev)
 bool asahi_g16_board(void)
 {
 	return apple_pmp_t8132_retained_board();
+}
+
+/*
+ * The system counter frequency the boot loader programmed, in Hz: the clock the
+ * ADT counts GPU power sample periods in.
+ */
+u32 asahi_g16_timebase_hz(void)
+{
+	return arch_timer_get_cntfrq();
 }
 
 /*

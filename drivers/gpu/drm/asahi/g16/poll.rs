@@ -56,25 +56,6 @@ impl HrTimerCallback for Shared {
     }
 }
 
-/// The `aurora-g16/tune` debugfs file: current tunables.
-fn tune_show(_shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    super::params::tune::show(f)
-}
-
-/// The `aurora-g16/tune` debugfs file: `name=value` lines.
-fn tune_write(_shared: &Arc<Shared>, reader: &mut kernel::uaccess::UserSliceReader) -> Result {
-    let mut buf = [0u8; 128];
-    let len = reader.len().min(buf.len());
-    reader.read_slice(&mut buf[..len])?;
-    let text = core::str::from_utf8(&buf[..len]).map_err(|_| EINVAL)?;
-    for line in text.split(|c| c == '\n' || c == ' ' || c == ',') {
-        if !line.trim().is_empty() {
-            super::params::tune::set(line)?;
-        }
-    }
-    Ok(())
-}
-
 /// The `aurora-g16/stats` debugfs file contents.
 fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let state = shared.state.lock();
@@ -221,15 +202,10 @@ impl Shared {
             dir.read_callback_file(c_str!("stats"), self.clone(), &stats_show),
             GFP_KERNEL,
         )?;
-        let tune = KBox::pin_init(
-            dir.read_write_callback_file(c_str!("tune"), self.clone(), &tune_show, &tune_write),
-            GFP_KERNEL,
-        )?;
         let mut state = self.state.lock();
         let firmware = state.as_deref_mut().ok_or(ENODEV)?;
         firmware.engine.shared = Some(self.clone());
         firmware.engine.debugfs = Some(file);
-        firmware.engine.tune_file = Some(tune);
         Ok(())
     }
 }
@@ -273,7 +249,9 @@ impl Firmware {
         lap.lap(&mut self.engine.prof.retire_ns);
         self.answer_growth()?;
         self.check_hangs(done)?;
-        let published = self.publish(done);
+        let published = self
+            .service_power()
+            .and_then(|()| self.publish_checked(done));
         let s = &mut self.engine.stats;
         if self.engine.flights.is_empty() && s.idle_from_ns != 0 {
             // Idle with nothing ready is not a gap: the clients are late.
@@ -329,6 +307,33 @@ impl Firmware {
         o.r32(offset)
     }
 
+    /// A compute unit's GPU start and end ticks. 25G83 writes them into the unit's ITS pair;
+    /// ABIs with `work_ticks` leave ITS 0/0 and write them into the work object. The ITS pair
+    /// is used whenever it holds an interval.
+    fn compute_ticks(&self, unit: &super::slots::ComputeSlot) -> Result<(u64, u64)> {
+        let (start, end) = (unit.its.r64(0)?, unit.its.r64(8)?);
+        if start != 0 && end > start {
+            return Ok((start, end));
+        }
+        let Some((start_off, end_off)) = self.init.abi.compute().work_ticks else {
+            return Ok((start, end));
+        };
+        let w = &unit.work;
+        // Work tick offsets are 4-byte aligned (not 8-byte), so read hi/lo/hi to avoid tearing.
+        let at = |o: usize| -> Result<u64> {
+            for _ in 0..4 {
+                let hi1 = w.r32(o + 4)?;
+                let lo = w.r32(o)?;
+                let hi2 = w.r32(o + 4)?;
+                if hi1 == hi2 {
+                    return Ok(u64::from(lo) | (u64::from(hi1) << 32));
+                }
+            }
+            Err(EIO)
+        };
+        Ok((at(start_off)?, at(end_off)?))
+    }
+
     /// Exact M4 queue and submit-pipe proof for one serialized publication. Event
     /// notifications are wakeups; neither an event nor elapsed time releases an owner.
     pub(crate) fn queue_receipt(
@@ -355,7 +360,7 @@ impl Firmware {
                     return Ok(false);
                 }
             }
-            if info.r32(0x80)? != 0 {
+            if info.r32(self.init.abi.qinfo().busy)? != 0 {
                 return Ok(false);
             }
         }
@@ -435,8 +440,7 @@ impl Firmware {
             let k = f.claims.slot[0] as usize;
             let unit = f.job.resources.compute_unit(k)?;
             let submitted = unit.counter.r64(0)?;
-            let start = unit.its.r64(0)?;
-            let end = unit.its.r64(8)?;
+            let (start, end) = self.compute_ticks(unit)?;
             let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
             full &= stamp_reached(stamp, f.target, e.target)
                 && (stamp != f.target
@@ -456,8 +460,7 @@ impl Firmware {
             let k = f.claims.slot[0] as usize;
             let unit = f.job.resources.compute_unit(k)?;
             let submitted = unit.counter.r64(0)?;
-            let start = unit.its.r64(0)?;
-            let end = unit.its.r64(8)?;
+            let (start, end) = self.compute_ticks(unit)?;
             full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
                 && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot
                 && submitted != 0
@@ -519,14 +522,11 @@ impl Firmware {
         Ok(Retirement::Pending)
     }
 
-    /// Logs the non-zero fault banks of `state`.
+    /// Logs the fault bank of `state` when it holds a fault.
     #[allow(dead_code)]
     pub(crate) fn log_fault(&self, state: &EngineState) {
-        for bank in 0..2 {
-            let (f, va) = (state.status[bank], state.address[bank]);
-            if f == 0 {
-                continue;
-            }
+        let (bank, f, va) = (state.bank, state.status, state.address);
+        if f != 0 {
             let access = if (f >> 4) & 1 != 0 { "read" } else { "write" };
             let reason = if (f >> 1) & 7 != 0 {
                 "reason!=unmapped"
@@ -584,9 +584,7 @@ impl Firmware {
                 let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
                     let k = timestamp_claims.pass[0] as usize;
                     self.pools.retire_binding(k, epoch)?;
-                    let enabled = params::pb_reuse();
-                    self.pools
-                        .retire_epoch(enabled, k, f.pb_binding, result.is_ok());
+                    self.pools.retire_epoch(k, f.pb_binding, result.is_ok());
                     Ok(())
                 });
                 if let Err(error) = committed {
@@ -890,7 +888,12 @@ impl Firmware {
         let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
         let ch = &self.channels;
         let rd = |o: &super::object::FwObject, off| o.r32(off).unwrap_or(0xdeadbeef);
-        let state = self.session.regs.engine_state().unwrap_or_default();
+        let state = self
+            .session
+            .engine_state()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let f = e.oldest();
         let ms = f.map_or(0, |f| now_ns().wrapping_sub(f.published_ns) / 1_000_000);
 
@@ -1099,7 +1102,6 @@ impl Firmware {
                 s.hold[1],
                 s.hold[2]
             )?;
-            super::params::tune::show(f)?;
         }
         let p = &self.engine.prof;
         writeln!(
