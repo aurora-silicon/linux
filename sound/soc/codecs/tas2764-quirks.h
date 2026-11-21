@@ -7,7 +7,7 @@
 #include "tas2764.h"
 
 /* Bitmask of enabled Apple quirks */
-#define ENABLED_APPLE_QUIRKS	0x17f
+#define ENABLED_APPLE_QUIRKS	0x13f
 
 /*
  * Disable noise gate and flip down reserved bit in NS_CFG0
@@ -79,12 +79,14 @@ static const struct reg_sequence tas2764_unk_seq2[] = {
 };
 
 /*
- * Disable 'Thermal Threshold 1'
+ * Disable 'Thermal Threshold 1': TG_EN keeps threshold 2 only. The TAS2764
+ * data sheet names the two enables but not the thresholds or what crossing
+ * them does, so this stays out of the defaults.
  */
 #define TAS2764_THERMAL_TH1_DISABLE	BIT(6)
 
 static const struct reg_sequence tas2764_thermal_th1_dis_seq[] = {
-	REG_SEQ0(TAS2764_REG(0x1, 0x47), 0x2),
+	REG_SEQ0(TAS2764_TG_EN, TAS2764_TG_EN_TH2),
 };
 
 /*

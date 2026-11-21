@@ -49,6 +49,11 @@
 #define TAS2764_MISC_CFG1		TAS2764_REG(0x0, 0x06)
 #define TAS2764_MISC_CFG1_OCE_RETRY_SHIFT  5
 
+/* Thermal detection enable (TAS2764 data sheet: TG_EN, reset 0xab) */
+#define TAS2764_TG_EN			TAS2764_REG(0x1, 0x47)
+#define TAS2764_TG_EN_TH2		BIT(1)
+#define TAS2764_TG_EN_TH1		BIT(0)
+
 /* TDM Configuration Reg0 */
 #define TAS2764_TDM_CFG0		TAS2764_REG(0X0, 0x08)
 #define TAS2764_TDM_CFG0_SMP_MASK	BIT(5)
