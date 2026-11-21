@@ -3487,13 +3487,16 @@ static int __init gate_t8132_v27_display_iommus(struct of_changeset *cs,
 	bool present[2] = {};
 	struct of_phandle_args args;
 	unsigned int add = 0, i, k, nr = 0;
-	struct property *prop;
+	struct property *old, *prop;
 	__be32 *value;
 	u32 sid = 0;
 	int ret;
 
 	if (n > ARRAY_SIZE(present))
 		return -E2BIG;
+	old = of_find_property(display, "iommus", NULL);
+	if (!old)
+		return -EINVAL;
 	for (i = 0; !of_parse_phandle_with_args(display, "iommus", "#iommu-cells", i, &args); i++) {
 		bool one_cell = args.args_count == 1;
 
@@ -3507,7 +3510,12 @@ static int __init gate_t8132_v27_display_iommus(struct of_changeset *cs,
 			return -EINVAL;
 		nr++;
 	}
-	if (!nr)
+	/*
+	 * Every entry parsed, one-cell each, and nothing after them: a
+	 * malformed entry is refused, not dropped from the copy below.
+	 */
+	if (!nr || of_count_phandle_with_args(display, "iommus", "#iommu-cells") != (int)nr ||
+	    old->length != 2 * nr * sizeof(*value))
 		return -EINVAL;
 	for (k = 0; k < n; k++) {
 		if (!darts[k]->phandle)
@@ -3529,7 +3537,7 @@ static int __init gate_t8132_v27_display_iommus(struct of_changeset *cs,
 		kfree(value);
 		return -ENOMEM;
 	}
-	memcpy(value, of_get_property(display, "iommus", NULL), 2 * nr * sizeof(*value));
+	memcpy(value, old->value, old->length);
 	for (i = 2 * nr, k = 0; k < n; k++) {
 		if (present[k])
 			continue;
