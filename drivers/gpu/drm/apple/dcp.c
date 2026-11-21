@@ -6991,6 +6991,9 @@ static void dcp_t8132_ext_routes(struct apple_dcp *dcp)
 
 static int dcp_s2r_pm_register(struct apple_dcp *dcp);
 
+/* A DCP node with apple,sleep-host-stop: the SoC's sleep needs the display stopped from here. */
+static bool dcp_sleep_host_stop;
+
 static int dcp_platform_probe_pipe(struct platform_device *pdev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
@@ -7222,6 +7225,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	of_property_read_u32(dev->of_node, "apple,dcp-endpoint", &dcp->peer_endpoint);
 	if (of_property_read_bool(dev->of_node, "apple,typec-hybrid-first"))
 		dcp_typec_hybrid_first_dt();
+	if (of_property_read_bool(dev->of_node, "apple,sleep-host-stop"))
+		WRITE_ONCE(dcp_sleep_host_stop, true);
 	of_property_read_u32(dev->of_node, "apple,dptx-phy", &dcp->dptx_phy);
 	of_property_read_u32(dev->of_node, "apple,dptx-die", &dcp->dptx_die);
 	dcp->fixed_dptx_phy = dcp->dptx_phy;
@@ -10425,7 +10430,7 @@ static int dcp_t6041_s2r_step(enum dcp_t6041_step step)
 /* T6041: the display down for a real sleep and back after it. */
 void dcp_t6041_s2r_all(bool start)
 {
-	if (!of_machine_is_compatible("apple,t6041"))
+	if (!READ_ONCE(dcp_sleep_host_stop))
 		return;
 	if (start) {
 		dcp_t6041_s2r_step(DCP_S2R_START);
