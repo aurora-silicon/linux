@@ -393,7 +393,8 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 		apple_crtc->fabric_held = true;
 	}
 	if (crtc_state->active &&
-	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
+	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp) ||
+	     dcp_external_pipe_off(apple_crtc->dcp))) {
 		/* The HPD of the link dcp_poweron() reconnects precedes our mode set. */
 		WRITE_ONCE(dcp->typec_enable_pending, true);
 		dcp_poweron(apple_crtc->dcp);
@@ -2028,6 +2029,13 @@ static int apple_platform_suspend(struct device *dev)
 	if (apple && apple->dark_held)
 		return 0;
 
+	if (pm_suspend_via_firmware()) {
+		int ret = dcp_t6041_s2r_all(false);
+
+		if (ret)
+			return ret;
+	}
+
 	if (apple && !apple->aborted) {
 		apple->s2r_skipped = apple_drm_firmware_stopped(apple);
 		if (!apple->s2r_skipped)
@@ -2078,6 +2086,9 @@ static void apple_drm_resume_outputs(struct apple_drm_private *apple)
 static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
+
+	/* Nothing if this suspend never took the display down. */
+	dcp_t6041_s2r_all(true);
 
 	if (!apple || apple->aborted || apple->s2r_skipped)
 		return 0;
