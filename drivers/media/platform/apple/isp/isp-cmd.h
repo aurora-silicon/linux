@@ -104,6 +104,7 @@
 #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_DISABLE	     0xc114
 #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_BAND0_MODULATION   0xc11c
 #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_BAND0_THRESHOLD    0xc11d
+#define CISP_CMD_APPLE_CH_MLVNR_MODE_CONFIG_SET		     0xc11f
 #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_HIGH_STRENGTH	     0xc120
 
 /* Opcodes of the DEBUG channel, which has its own numbering */
@@ -274,12 +275,6 @@ struct cmd_ipc_endpoint_set2 {
 } __packed;
 static_assert(sizeof(struct cmd_ipc_endpoint_set2) == 0x30);
 
-struct cmd_ipc_endpoint_unset2 {
-	u64 opcode;
-	u32 unk;
-} __packed;
-static_assert(sizeof(struct cmd_ipc_endpoint_unset2) == 0xc);
-
 /* Channel algorithm enable: CISP_CMD_CH_PROPERTY_WRITE with a 0x14-byte body */
 struct cmd_ch_algorithm_enable {
 	u64 opcode;
@@ -288,6 +283,23 @@ struct cmd_ch_algorithm_enable {
 	u32 enable;
 } __packed;
 static_assert(sizeof(struct cmd_ch_algorithm_enable) == 0x14);
+
+/*
+ * H17 MLVNR mode (CISP_CMD_APPLE_CH_MLVNR_MODE_CONFIG_SET, 0xc11f), as macOS
+ * 27.2 sends it: auto mode (2), on above gain 14x and off below 11x (8.8
+ * fixed point), at up to 30 fps either way, ramped over 30 frames.
+ */
+struct cmd_apple_ch_mlvnr_mode_config {
+	u64 opcode;
+	u32 chan;
+	u32 ctrl_mode;
+	u32 gain_enter;
+	u32 gain_exit;
+	u32 fps_enter;
+	u32 fps_exit;
+	u32 ramp_frames;
+} __packed;
+static_assert(sizeof(struct cmd_apple_ch_mlvnr_mode_config) == 0x24);
 
 struct cmd_flicker_sensor_set {
 	u64 opcode;
@@ -591,7 +603,11 @@ int isp_cmd_ch_preview_stream_set(struct apple_isp *isp, u32 chan, u32 stream);
 int isp_cmd_ch_als_disable(struct apple_isp *isp, u32 chan);
 int isp_cmd_ipc_endpoint_set2(struct apple_isp *isp, u64 rd, u32 rd_len, u64 wr,
 			      u32 wr_len, u64 doorbell, u32 doorbell_sel);
-int isp_cmd_ipc_endpoint_unset2(struct apple_isp *isp);
+int isp_cmd_ipc_endpoint_unset2(struct apple_isp *isp, u64 rd, u32 rd_len, u64 wr,
+				u32 wr_len, u64 doorbell, u32 doorbell_sel);
+int isp_cmd_apple_ch_mlvnr_mode_config_set(struct apple_isp *isp, u32 chan, u32 ctrl_mode,
+					   u32 gain_enter, u32 gain_exit, u32 fps_enter,
+					   u32 fps_exit, u32 ramp_frames);
 int isp_cmd_ch_algorithm_enable(struct apple_isp *isp, u32 chan, u32 alg, u32 enable);
 int isp_cmd_ch_cnr_start(struct apple_isp *isp, u32 chan);
 int isp_cmd_ch_mbnr_enable(struct apple_isp *isp, u32 chan, u32 use_case,

@@ -172,6 +172,13 @@ struct apple_isp_hw {
 	bool ane_doorbell_known;
 	u64 ane_isp_doorbell;
 	u32 ane_isp_doorbell_sel;
+	/* The ANE node when the ISP node has no apple,ane phandle. */
+	const char *ane_compatible;
+	/*
+	 * H17: MLVNR runs in the auto mode macOS sets
+	 * (CISP_CMD_APPLE_CH_MLVNR_MODE_CONFIG_SET), not algorithm 0x143d.
+	 */
+	bool mlvnr_mode_config;
 	enum isp_fw_abi fw_abi;
 	u64 pmu_base;
 
@@ -388,6 +395,8 @@ struct apple_isp {
 	/* ML noise reduction on the neural engine (isp-ane.c) */
 	struct ane_isp_link *ane;
 	struct isp_surf *ane_rings;
+	u64 ane_doorbell;
+	u32 ane_doorbell_sel;
 	char ane_afpp[64];
 	u32 cam_connections_scheme;
 	struct isp_preset *presets;

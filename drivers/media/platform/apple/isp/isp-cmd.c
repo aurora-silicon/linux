@@ -506,10 +506,35 @@ int isp_cmd_ipc_endpoint_set2(struct apple_isp *isp, u64 rd, u32 rd_len, u64 wr,
 	return CISP_SEND_IN(isp, args);
 }
 
-int isp_cmd_ipc_endpoint_unset2(struct apple_isp *isp)
+/* macOS 27.2 sends UNSET2 with the whole SET2 body again (0x30 bytes). */
+int isp_cmd_ipc_endpoint_unset2(struct apple_isp *isp, u64 rd, u32 rd_len, u64 wr,
+				u32 wr_len, u64 doorbell, u32 doorbell_sel)
 {
-	struct cmd_ipc_endpoint_unset2 args = {
+	struct cmd_ipc_endpoint_set2 args = {
 		.opcode = CISP_OPCODE(CISP_CMD_IPC_ENDPOINT_UNSET2),
+		.addr1 = rd,
+		.size1 = rd_len,
+		.addr2 = wr,
+		.size2 = wr_len,
+		.regs = doorbell,
+		.unk2 = doorbell_sel,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_apple_ch_mlvnr_mode_config_set(struct apple_isp *isp, u32 chan, u32 ctrl_mode,
+					   u32 gain_enter, u32 gain_exit, u32 fps_enter,
+					   u32 fps_exit, u32 ramp_frames)
+{
+	struct cmd_apple_ch_mlvnr_mode_config args = {
+		.opcode = CISP_OPCODE(CISP_CMD_APPLE_CH_MLVNR_MODE_CONFIG_SET),
+		.chan = chan,
+		.ctrl_mode = ctrl_mode,
+		.gain_enter = gain_enter,
+		.gain_exit = gain_exit,
+		.fps_enter = fps_enter,
+		.fps_exit = fps_exit,
+		.ramp_frames = ramp_frames,
 	};
 	return CISP_SEND_IN(isp, args);
 }
