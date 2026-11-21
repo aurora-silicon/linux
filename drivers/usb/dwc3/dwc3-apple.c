@@ -199,6 +199,12 @@ struct dwc3_apple {
 	u32 sleep_guid;
 	/* The core lost its registers in that sleep and was set up again in place. */
 	bool sleep_reinit;
+	/*
+	 * T6040 Type-C port: kept by its PHY, which holds the core in reset through the sleep
+	 * (see dwc3_apple_restart_resume()), and whether xHCI's wakeup was on before it.
+	 */
+	bool sleep_restart;
+	bool sleep_xhci_wakeup;
 	/* Looks for the fixed hub once a host restarted after a sleep has had time to find it. */
 	struct delayed_work hub_check;
 	/* The core didn't come back from a sleep or a power cycle: nothing may touch it. */
@@ -495,7 +501,9 @@ static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
  * device stay, so xHCI can restore its saved state, or start over. Runs in the resume,
  * while nothing else touches the core.
  */
-static int dwc3_apple_core_reinit(struct dwc3_apple *appledwc)
+static void dwc3_apple_usb3_pipe_reset(struct dwc3_apple *appledwc);
+
+static int dwc3_apple_core_reinit(struct dwc3_apple *appledwc, bool phy_down)
 {
 	struct dwc3 *dwc = &appledwc->dwc;
 	int i, ret;
@@ -512,6 +520,12 @@ static int dwc3_apple_core_reinit(struct dwc3_apple *appledwc)
 		phy_power_off(dwc->usb2_generic_phy[i]);
 		phy_exit(dwc->usb2_generic_phy[i]);
 	}
+	/* A PHY that took the core through its reset brings its sides back once it is set up. */
+	if (phy_down) {
+		ret = apple_t6040_atcphy_sleep_power_up(appledwc->usb2_phy);
+		if (ret)
+			return ret;
+	}
 
 	dwc3_apple_setup_cio(appledwc);
 	dwc3_apple_apply_tunables(appledwc);
@@ -524,6 +538,8 @@ static int dwc3_apple_core_reinit(struct dwc3_apple *appledwc)
 	if (ret)
 		dev_warn(appledwc->dev, "USB3 PHY setup failed after the sleep, USB2 only, err=%d\n",
 			 ret);
+	else if (phy_down && appledwc->usb3_phy)
+		dwc3_apple_usb3_pipe_reset(appledwc);
 
 	return 0;
 }
@@ -577,7 +593,7 @@ static int dwc3_apple_tunnel_resume(struct dwc3_apple *appledwc)
 	appledwc->sleep_tunnel_result = APPLE_T6050_CIO_USB_LOST;
 	ret = reset_control_deassert(appledwc->reset);
 	if (!ret)
-		ret = dwc3_apple_core_reinit(appledwc);
+		ret = dwc3_apple_core_reinit(appledwc, false);
 	if (ret) {
 		dev_err(appledwc->dev, "not resuming xHCI after the router's sleep, the core is not set up: %d\n",
 			ret);
@@ -595,6 +611,37 @@ static int dwc3_apple_tunnel_resume(struct dwc3_apple *appledwc)
 		dev_info(appledwc->dev, "dark wake: USB host kept again for the router's next sleep: %s\n",
 			 dwc3_apple_tunnel_keep(appledwc) ? "yes" : "no");
 	return 1;
+}
+
+/*
+ * T6040 Type-C port kept through a deep sleep: its PHY held the core in reset with its own
+ * sides down (dwc3_apple_suspend()), and the power domain may have gone off in between. Out of
+ * reset, the core is set up again as at a start, the PHY brings USB2 and USB3 back, and xHCI
+ * starts over: the USB core then reset-resumes the devices, which keep their device numbers.
+ * A sleep given up before the PHY went down leaves everything as it was.
+ */
+static int dwc3_apple_restart_resume(struct dwc3_apple *appledwc)
+{
+	struct dwc3 *dwc = &appledwc->dwc;
+	int ret;
+
+	ret = apple_t6040_atcphy_sleep_result(appledwc->usb2_phy);
+	if (!ret && dwc3_readl(dwc, DWC3_GUID) == DWC3_APPLE_SLEEP_GUID)
+		return 0;
+	if (ret == APPLE_ATCPHY_SLEEP_RESET) {
+		ret = dwc3_apple_core_reinit(appledwc, true);
+		if (!ret) {
+			appledwc->sleep_reinit = true;
+			dev_dbg(appledwc->dev,
+				"host kept through the sleep: core and PHY set up again, xHCI starts over\n");
+			return 1;
+		}
+	} else if (!ret) {
+		ret = -EIO;
+	}
+	dev_err(appledwc->dev, "not resuming xHCI, the core didn't come back: %d\n", ret);
+
+	return ret;
 }
 
 /*
@@ -616,6 +663,8 @@ static int dwc3_apple_pre_host_resume(struct dwc3 *dwc)
 		return dwc3_apple_tunnel_resume(appledwc);
 	if (!READ_ONCE(appledwc->sleep_in_place))
 		return 0;
+	if (READ_ONCE(appledwc->sleep_restart))
+		return dwc3_apple_restart_resume(appledwc);
 
 	ret = apple_atcphy_sleep_result(appledwc->usb2_phy);
 	lost = ret == APPLE_ATCPHY_SLEEP_POWER_LOST;
@@ -627,7 +676,7 @@ static int dwc3_apple_pre_host_resume(struct dwc3 *dwc)
 			       DWC3_APPLE_PIPE_PHY_READY_US))
 		dev_warn(appledwc->dev, "PIPE PHY not ready after the sleep: %#x\n", val);
 	if (!ret && dwc3_readl(dwc, DWC3_GUID) != DWC3_APPLE_SLEEP_GUID) {
-		ret = dwc3_apple_core_reinit(appledwc);
+		ret = dwc3_apple_core_reinit(appledwc, false);
 		if (!ret && !lost) {
 			appledwc->sleep_reinit = true;
 			dev_dbg(appledwc->dev,
@@ -1627,7 +1676,10 @@ static int dwc3_apple_recover(struct dwc3_apple *appledwc)
 	int ret;
 
 	lockdep_assert_held(&appledwc->lock);
-	ret = apple_atcphy_sleep_recover(appledwc->usb2_phy);
+	if (appledwc->sleep_restart)
+		ret = apple_t6040_atcphy_sleep_recover(appledwc->usb2_phy);
+	else
+		ret = apple_atcphy_sleep_recover(appledwc->usb2_phy);
 	if (ret < 0) {
 		appledwc->sleep_dead = true;
 		dev_err(appledwc->dev, "USB host still unpowered: sleep refused (%d)\n", ret);
@@ -1709,7 +1761,7 @@ static void dwc3_apple_tunnel_work(struct work_struct *work)
 	if (appledwc->sleep_tunnel_result == APPLE_T6050_CIO_USB_LOST) {
 		ret = reset_control_deassert(appledwc->reset);
 		if (!ret)
-			ret = dwc3_apple_core_reinit(appledwc);
+			ret = dwc3_apple_core_reinit(appledwc, false);
 		if (ret) {
 			dev_err(appledwc->dev, "USB host's core not back after the router's sleep (%d): left as it is, sleeps refused\n",
 				ret);
@@ -1737,7 +1789,10 @@ static int dwc3_apple_sleep_kept(struct dwc3_apple *appledwc, bool *kept)
 
 	lockdep_assert_held(&appledwc->lock);
 	appledwc->sleep_in_place = false;
-	ret = apple_atcphy_sleep_result(appledwc->usb2_phy);
+	if (appledwc->sleep_restart)
+		ret = apple_t6040_atcphy_sleep_result(appledwc->usb2_phy);
+	else
+		ret = apple_atcphy_sleep_result(appledwc->usb2_phy);
 	if (ret == -ENODEV)
 		return dwc3_apple_recover(appledwc);
 	if (appledwc->sleep_reinit) {
@@ -1765,9 +1820,42 @@ static int dwc3_apple_sleep_kept(struct dwc3_apple *appledwc, bool *kept)
 /* The notifier never waits. This existing bound belongs after the chain and freezer. */
 #define DWC3_APPLE_SLEEP_STOP_PREPARE_MS	5000
 
+/*
+ * T6040 Type-C port kept through a deep sleep: xHCI's wakeup is off for it, so that xHCI
+ * halts whatever the sleep comes to, and the glue is no syscore device for this sleep, so that
+ * dwc3_apple_suspend() runs after xHCI's suspend and the power domain goes off as a stopped
+ * controller's does.
+ */
+static void dwc3_apple_restart_begin(struct dwc3_apple *appledwc)
+{
+	struct platform_device *xhci = appledwc->dwc.xhci;
+
+	lockdep_assert_held(&appledwc->lock);
+	appledwc->sleep_xhci_wakeup = xhci && device_may_wakeup(&xhci->dev);
+	if (appledwc->sleep_xhci_wakeup)
+		device_set_wakeup_enable(&xhci->dev, false);
+	dwc3_apple_syscore(appledwc, false);
+}
+
+/* Ends what the PHY's sleep prepare took on, after the sleep or when the glue goes away. */
+static void dwc3_apple_sleep_finish(struct dwc3_apple *appledwc, bool kept)
+{
+	struct platform_device *xhci = appledwc->dwc.xhci;
+
+	lockdep_assert_held(&appledwc->lock);
+	if (!appledwc->sleep_restart) {
+		apple_atcphy_sleep_finish_async(appledwc->usb2_phy, kept);
+		return;
+	}
+	appledwc->sleep_restart = false;
+	if (xhci && appledwc->sleep_xhci_wakeup)
+		device_set_wakeup_enable(&xhci->dev, true);
+	apple_t6040_atcphy_sleep_finish(appledwc->usb2_phy, kept);
+}
+
 static int dwc3_apple_sleep_prepare_work(struct dwc3_apple *appledwc)
 {
-	bool in_place;
+	bool in_place, restart;
 	int ret;
 
 	/* A restart left to the work after the last router sleep ends first. */
@@ -1790,18 +1878,25 @@ static int dwc3_apple_sleep_prepare_work(struct dwc3_apple *appledwc)
 		/* A J714s host on a USB4 router's USB3 tunnel stays up for its router's sleep. */
 		if (!in_place && appledwc->state == DWC3_APPLE_HOST && dwc3_apple_tunnel_keep(appledwc))
 			return 0;
+		restart = !in_place && appledwc->state == DWC3_APPLE_HOST;
 	}
 	/* This only records a PHY sleep token; its hardware work runs at noirq. */
 	in_place = in_place && !apple_atcphy_sleep_prepare(appledwc->usb2_phy);
+	/* A T6040 Type-C PHY keeps the host if nothing but USB runs on its lanes. */
+	restart = restart && !apple_t6040_atcphy_sleep_prepare(appledwc->usb2_phy);
 	guard(mutex)(&appledwc->lock);
-	if (in_place) {
+	if (in_place || restart) {
 		/* Own finish even if a role change made retention impossible meanwhile. */
 		appledwc->sleep_in_place = true;
+		appledwc->sleep_restart = restart;
 		if (appledwc->shutting_down || appledwc->state != DWC3_APPLE_HOST)
 			return -EBUSY;
 		appledwc->sleep_guid = dwc3_readl(&appledwc->dwc, DWC3_GUID);
 		dwc3_writel(&appledwc->dwc, DWC3_GUID, DWC3_APPLE_SLEEP_GUID);
-		apple_sleep_usb_set_wake_ports(dwc3_apple_hub_wake_ports(appledwc));
+		if (restart)
+			dwc3_apple_restart_begin(appledwc);
+		else
+			apple_sleep_usb_set_wake_ports(dwc3_apple_hub_wake_ports(appledwc));
 		return 0;
 	}
 	ret = dwc3_apple_sleep_stop(appledwc);
@@ -1863,7 +1958,7 @@ static void dwc3_apple_sleep_start_work(struct work_struct *work)
 		dwc3_apple_syscore(appledwc, appledwc->core_active || appledwc->reset_pending);
 		/* Publish IDLE with the role lock held, after queuing the PHY's finish. */
 		if (finish)
-			apple_atcphy_sleep_finish_async(appledwc->usb2_phy, kept);
+			dwc3_apple_sleep_finish(appledwc, kept);
 		spin_lock_irqsave(&appledwc->sleep_pm_lock, flags);
 		if (appledwc->sleep_phase != DWC3_APPLE_SLEEP_REMOVING)
 			appledwc->sleep_phase = DWC3_APPLE_SLEEP_IDLE;
@@ -1979,8 +2074,62 @@ static int dwc3_apple_pm_prepare(struct device *dev)
 	return ret;
 }
 
+/* Whether xHCI, the child, has suspended: its controller halted, its state saved. */
+static bool dwc3_apple_xhci_suspended(struct dwc3_apple *appledwc)
+{
+	struct platform_device *xhci = appledwc->dwc.xhci;
+	struct usb_hcd *hcd;
+	bool suspended;
+
+	lockdep_assert_held(&appledwc->lock);
+	if (!xhci)
+		return true;
+
+	device_lock(&xhci->dev);
+	hcd = xhci->dev.driver ? platform_get_drvdata(xhci) : NULL;
+	suspended = !hcd || !HCD_HW_ACCESSIBLE(hcd);
+	device_unlock(&xhci->dev);
+
+	return suspended;
+}
+
+/*
+ * T6040 Type-C port kept through a deep sleep, once xHCI has suspended: the PHY takes USB3
+ * and USB2 down and the core into reset, and nothing touches the core until
+ * dwc3_apple_restart_resume(). This may sleep for the PHY's coprocessor, which is why it is
+ * no noirq callback. An error refuses the sleep, with the PHY and the core as they were.
+ */
+static int dwc3_apple_suspend(struct device *dev)
+{
+	struct dwc3_apple *appledwc = to_dwc3_apple(dev_get_drvdata(dev));
+	struct dwc3 *dwc = &appledwc->dwc;
+	int ret;
+
+	guard(mutex)(&appledwc->lock);
+	if (!appledwc->sleep_in_place || !appledwc->sleep_restart)
+		return 0;
+
+	if (!dwc3_apple_xhci_suspended(appledwc)) {
+		dev_err(dev, "xHCI still runs: refusing the sleep\n");
+		return -EBUSY;
+	}
+	/* The PHY hands the PIPE back in P3, as it took it over. */
+	dwc->dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
+	dwc3_enable_susphy(dwc, true);
+	ret = apple_t6040_atcphy_sleep_enter(appledwc->usb2_phy);
+	if (ret) {
+		dev_err(dev, "PHY did not take the host through the sleep: %d, refusing it\n", ret);
+		return ret;
+	}
+	/* No wakeup of a powered-down SoC comes through the controller. */
+	device_set_out_band_wakeup(dev);
+
+	return 0;
+}
+
 static const struct dev_pm_ops dwc3_apple_pm_ops = {
 	.prepare = pm_sleep_ptr(dwc3_apple_pm_prepare),
+	.suspend = pm_sleep_ptr(dwc3_apple_suspend),
 };
 
 /* Called under the device lock, but never with the glue lock held across a work drain. */
@@ -1997,7 +2146,7 @@ static void dwc3_apple_pm_quiesce(struct dwc3_apple *appledwc)
 	if (appledwc->sleep_in_place) {
 		appledwc->sleep_in_place = false;
 		apple_sleep_usb_set_wake_ports(0);
-		apple_atcphy_sleep_finish_async(appledwc->usb2_phy, false);
+		dwc3_apple_sleep_finish(appledwc, false);
 	}
 }
 
