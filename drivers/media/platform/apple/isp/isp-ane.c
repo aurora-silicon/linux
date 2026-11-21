@@ -17,6 +17,7 @@
  *
  * Based on Ryan Murray's H16 draft (camera/isp-ane-mlvnr).
  */
+#include <linux/debugfs.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/string.h>
@@ -47,21 +48,28 @@
 #define ISP_MLVNR_FPS 30
 #define ISP_MLVNR_RAMP 30
 
+/*
+ * Read at probe: with MLVNR, the presets move to the full-resolution sensor
+ * mode the DT names for it (apple,mlvnr-sensor-config), the only frames the
+ * network takes.
+ */
 static bool mlvnr;
-module_param(mlvnr, bool, 0644);
-MODULE_PARM_DESC(mlvnr, "ML noise reduction on the neural engine (needs the ANE driver and apple/ispane-<board>.afpp; read at each firmware start)");
+module_param(mlvnr, bool, 0444);
+MODULE_PARM_DESC(mlvnr, "ML noise reduction on the neural engine (needs the ANE driver and apple/ispane-<board>.afpp)");
+
+bool apple_isp_ane_wanted(void)
+{
+	return mlvnr;
+}
 
 /*
- * TEST: the auto mode's gain thresholds (1/256 steps; enter >= exit, the
- * firmware asserts otherwise). macOS: 14x / 11x, so MLVNR runs only in dim
- * light. 256:256 makes it run in any light, to see it work. Read per stream.
+ * The auto mode's total-gain thresholds, 1/256 steps: macOS's 14x / 11x. For
+ * a test, debugfs apple-isp/mlvnr_gain_{enter,exit} move them (256:256 runs
+ * MLVNR in any light); read per stream, and the firmware asserts unless
+ * enter >= exit, so other pairs fall back to macOS's.
  */
-static unsigned int mlvnr_gain_enter = ISP_MLVNR_GAIN_ENTER;
-module_param(mlvnr_gain_enter, uint, 0644);
-MODULE_PARM_DESC(mlvnr_gain_enter, "TEST: MLVNR auto mode: switch on at this sensor gain, 1/256 steps (default 3584 = 14x, macOS)");
-static unsigned int mlvnr_gain_exit = ISP_MLVNR_GAIN_EXIT;
-module_param(mlvnr_gain_exit, uint, 0644);
-MODULE_PARM_DESC(mlvnr_gain_exit, "TEST: MLVNR auto mode: switch off below this sensor gain, 1/256 steps, <= enter (default 2816 = 11x, macOS)");
+static u32 mlvnr_gain_enter = ISP_MLVNR_GAIN_ENTER;
+static u32 mlvnr_gain_exit = ISP_MLVNR_GAIN_EXIT;
 
 /*
  * The frames the ISP firmware's MLVNR network takes (CMLVNRProcImp::
@@ -71,7 +79,7 @@ MODULE_PARM_DESC(mlvnr_gain_exit, "TEST: MLVNR auto mode: switch off below this 
  * ("wrong input buffer size", CMLVNRProcImp.cpp:1046) and the stream stops.
  * The binned IMX958 mode (config 8, 1520 wide = 3072 bytes) is not among
  * them: MLVNR needs the full-resolution mode macOS streams (config 6,
- * 3040x2880 = 0x17c0 x 0xb40), sensor_config=6.
+ * 3040x2880 = 0x17c0 x 0xb40), which the DT names in apple,mlvnr-sensor-config.
  */
 static const struct {
 	u16 stride, rows;
@@ -102,7 +110,7 @@ static bool isp_mlvnr_presets_ok(struct apple_isp *isp)
 		const struct isp_preset *p = &isp->presets[i];
 
 		if (!isp_mlvnr_input_ok(p->input_dim.x, p->input_dim.y)) {
-			dev_info(isp->dev, "MLVNR: off: sensor mode %u (%ux%u, rows of %u bytes) is not a frame the network takes; it needs the full-resolution mode macOS uses (apple_isp.sensor_config=6)\n",
+			dev_info(isp->dev, "MLVNR: off: sensor mode %u (%ux%u, rows of %u bytes) is not a frame the network takes; it needs the full-resolution mode macOS uses (DT apple,mlvnr-sensor-config)\n",
 				 p->index, p->input_dim.x, p->input_dim.y,
 				 ALIGN(p->input_dim.x * 2, 64));
 			return false;
@@ -110,10 +118,6 @@ static bool isp_mlvnr_presets_ok(struct apple_isp *isp)
 	}
 	return true;
 }
-
-static bool mlvnr_ring_tag = true;
-module_param(mlvnr_ring_tag, bool, 0644);
-MODULE_PARM_DESC(mlvnr_ring_tag, "Hand the MLVNR rings to the ISP firmware as shared memory (IOVA | bit 40), as macOS does (default on; read at each firmware start)");
 
 /* One ISP per SoC: the ANE driver's functions, while this driver holds them. */
 static struct {
@@ -155,6 +159,12 @@ int apple_isp_ane_init(struct apple_isp *isp)
 {
 	const char *board, *model;
 
+	if (mlvnr) {
+		isp->ane_debugfs = debugfs_create_dir("apple-isp", NULL);
+		debugfs_create_u32("mlvnr_gain_enter", 0600, isp->ane_debugfs, &mlvnr_gain_enter);
+		debugfs_create_u32("mlvnr_gain_exit", 0600, isp->ane_debugfs, &mlvnr_gain_exit);
+	}
+
 	if (!of_property_read_string_index(of_root, "compatible", 0, &model)) {
 		board = strchr(model, ',');
 		snprintf(isp->ane_afpp, sizeof(isp->ane_afpp), "apple/ispane-%s.afpp",
@@ -165,6 +175,8 @@ int apple_isp_ane_init(struct apple_isp *isp)
 
 void apple_isp_ane_exit(struct apple_isp *isp)
 {
+	debugfs_remove_recursive(isp->ane_debugfs);
+	isp->ane_debugfs = NULL;
 	apple_isp_ane_stop(isp);
 	if (isp->ane)
 		isp_ane.put(isp->ane);
@@ -313,7 +325,8 @@ int apple_isp_ane_start(struct apple_isp *isp)
 	WRITE_ONCE(isp->ane_ids, ep.surface_map);
 
 	/* The read ring is the first half, the write ring the second. */
-	isp->ane_ring_fw = rings->iova | (READ_ONCE(mlvnr_ring_tag) ? ISP_ANE_SHARED_TAG : 0);
+	/* as shared memory (IOVA | bit 40), the form macOS hands over */
+	isp->ane_ring_fw = rings->iova | ISP_ANE_SHARED_TAG;
 	err = isp_cmd_ipc_endpoint_set2(isp, isp->ane_ring_fw, ISP_ANE_RING_LEN,
 					isp->ane_ring_fw + ISP_ANE_RING_LEN, ISP_ANE_RING_LEN,
 					ep.ane_doorbell, ep.ane_doorbell_sel);

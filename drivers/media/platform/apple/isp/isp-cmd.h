@@ -911,16 +911,6 @@ struct cmd_ch_hr_enable {
 } __packed;
 static_assert(sizeof(struct cmd_ch_hr_enable) == 0x14);
 
-/* The 0x18-byte form macOS 27.2 sends on the J815: (2, 0x17, 0x10). */
-struct cmd_ch_lpdp_hs_receiver_tuning_set3 {
-	u64 opcode;
-	u32 chan;
-	u32 unk1;
-	u32 unk2;
-	u32 unk3;
-} __packed;
-static_assert(sizeof(struct cmd_ch_lpdp_hs_receiver_tuning_set3) == 0x18);
-
 struct cmd_ch_sifr_skip_interval_set {
 	u64 opcode;
 	u32 chan;
@@ -934,8 +924,6 @@ int isp_cmd_ch_status_led_mbrightness_set(struct apple_isp *isp, u32 chan,
 int isp_cmd_ch_status_led_thr_get(struct apple_isp *isp, u32 chan, u16 *low,
 				  u16 *high);
 int isp_cmd_ch_hr_enable(struct apple_isp *isp, u32 chan, u32 enable);
-int isp_cmd_ch_lpdp_hs_receiver_tuning_set3(struct apple_isp *isp, u32 chan,
-					    u32 unk1, u32 unk2, u32 unk3);
 int isp_cmd_ch_sifr_skip_interval_set(struct apple_isp *isp, u32 chan,
 				      u32 interval);
 
