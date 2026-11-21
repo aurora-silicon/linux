@@ -798,41 +798,43 @@ impl Session {
     /// Live transport and powered-firmware health, plus any previously latched failure.
     pub(crate) fn check(&self) -> Result {
         self.shared.check()?;
+        // The performance state is in the power controller, which the firmware itself reads
+        // with the GPU powered down and admission reads before the firmware runs: it needs no
+        // powered GPU.
         if !self.rtkit.running()
             || self.regs.asc_control()? & regs::ASC_RUN == 0
-            || self.pstate()?.is_some_and(|state| state > self.regs.top())
+            || self.regs.pstate()? > self.regs.top()
         {
             return Err(EIO);
         }
         self.uat.check_adopted_bindings()
     }
 
-    /// Whether the firmware has the GPU powered. A firmware that powers it down while idle
-    /// says so on the PPL handoff page; reading a GPU register while it is off takes an
-    /// SError, so every runtime GPU register read goes through this.
-    pub(crate) fn gpu_powered(&self) -> Result<bool> {
-        match (&self.handoff, self.adt.layout.powered) {
-            (Some(page), Some(offset)) => Ok(page.io().try_read8(offset)? != 0),
-            _ => Ok(true),
+    /// Runs `read` with the GPU held powered, or returns `None` while it is powered down. A
+    /// firmware that powers the GPU down while idle changes GPU power only while it holds the
+    /// PPL handoff lock, and records the result on the handoff page before releasing it; the
+    /// AP side of the lock is held here across that record and `read`, so the GPU cannot go
+    /// down between them. Reading a GPU register while it is down takes an SError.
+    fn while_powered<T>(&self, read: impl FnOnce(&regs::Regs) -> Result<T>) -> Result<Option<T>> {
+        let (Some(page), Some(offset)) = (&self.handoff, self.adt.layout.powered) else {
+            return read(&self.regs).map(Some);
+        };
+        let _held = self.uat.lock_m4_handoff()?;
+        if page.io().try_read8(offset)? == 0 {
+            return Ok(None);
         }
+        read(&self.regs).map(Some)
     }
 
-    /// The firmware's current performance state, or `None` while the GPU is powered down.
-    pub(crate) fn pstate(&self) -> Result<Option<u32>> {
-        if self.gpu_powered()? {
-            self.regs.pstate().map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// The engine receipts, or `None` while the GPU is powered down.
+    /// The engine receipts of a running firmware, or `None` while the GPU is powered down.
     pub(crate) fn engine_state(&self) -> Result<Option<regs::EngineState>> {
-        if self.gpu_powered()? {
-            self.regs.engine_state().map(Some)
-        } else {
-            Ok(None)
-        }
+        self.while_powered(regs::Regs::engine_state)
+    }
+
+    /// The first engine fault bank holding a fault, for a firmware halted for recovery, or
+    /// `None` while the GPU is powered down.
+    pub(crate) fn fault_scan(&self) -> Result<Option<regs::EngineState>> {
+        self.while_powered(regs::Regs::fault_scan)
     }
 
     /// Sends a mailbox message.

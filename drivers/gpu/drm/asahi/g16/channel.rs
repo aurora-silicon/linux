@@ -253,13 +253,12 @@ impl Channels {
             Ok(None) => dev_err!(d, "G16 {}: engine state not read: GPU powered down\n", why),
             Ok(Some(e)) => dev_err!(
                 d,
-                "G16 {}: engine busy {} fault {:#x}/{:#x} address {:#x}/{:#x}\n",
+                "G16 {}: engine busy {} fault bank {:#x} status {:#x} address {:#x}\n",
                 why,
                 e.busy,
-                e.status[0],
-                e.status[1],
-                e.address[0],
-                e.address[1]
+                e.bank,
+                e.status,
+                e.address
             ),
             Err(err) => dev_err!(d, "G16 {}: engine state unreadable: {:?}\n", why, err),
         }
