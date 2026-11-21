@@ -185,6 +185,14 @@ static void dcp_connector_set_dict(struct apple_connector *connector,
 void dcp_connector_update_dict(struct apple_connector *connector, const char *key,
 			       struct dcp_chunks *chunks)
 {
+	/* An unconnected peer can still publish display properties. */
+	if (!connector) {
+		kvfree(chunks->data);
+		chunks->data = NULL;
+		chunks->length = 0;
+		return;
+	}
+
 	mutex_lock(&connector->chunk_lock);
 	if (!strcmp(key, "ColorElements"))
 		dcp_connector_set_dict(connector, &connector->color_elements, chunks);
