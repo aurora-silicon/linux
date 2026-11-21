@@ -385,6 +385,17 @@ struct ane_h16_session {
 	DECLARE_BITMAP(records, ANE_H16_RECORDS);
 	/* Firmware log lines printed after the last failed EXECUTE. */
 	unsigned int fwlog_lines;
+	/*
+	 * IO_T2H reports taken by ane_h16_session_serve() (the ISP link drives
+	 * the engine and no host command waits): every report, those of no
+	 * host request (the ISP's own programs, destination 1, or a UUID no
+	 * caller waits for), and the first of those as posted, for the log.
+	 */
+	u8 serve_report[ANE_H16_REPORT_MAX];
+	u64 serve_reports;
+	u64 serve_foreign;
+	u8 serve_first[ANE_H16_REPORT_MAX];
+	size_t serve_first_size;
 	bool quarantined;
 	/*
 	 * Dynamic power gating (0x002d) held off across back-to-back requests.
@@ -395,6 +406,8 @@ struct ane_h16_session {
 	 */
 	u64 gate_hold_ns;
 	bool gate_held;
+	/* Gating held off by ane_h16_session_gate_pin() (the ISP link), not by a request. */
+	bool gate_pinned;
 	u64 gate_last_ns;
 	struct delayed_work gate_work;
 	/* Firmware phases of the last successful EXECUTE. */
@@ -433,6 +446,10 @@ void ane_h16_export_get(struct ane_h16_export *e);
 void ane_h16_export_put(struct ane_h16_export *e);
 void ane_h16_session_flush_exports(struct ane_h16_session *s);
 int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock);
+int ane_h16_session_gate_pin(struct ane_h16_session *s, bool pin);
+int ane_h16_session_control(struct ane_h16_session *s, unsigned int ch, void *command,
+			    size_t length);
+int ane_h16_session_serve(struct ane_h16_session *s, u32 *pending, u64 limit_ns);
 unsigned int ane_h16_session_dump_fwlog(struct ane_h16_session *s);
 void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep);
 int ane_h16_session_gate_expire(struct ane_h16_session *s);

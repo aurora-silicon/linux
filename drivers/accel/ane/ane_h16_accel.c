@@ -62,7 +62,7 @@ static int ane_h16_get_caps_ioctl(struct drm_device *drm, void *data,
 	return 0;
 }
 
-static int ane_h16_sections_copy(const struct drm_ane_h16_load *args,
+static int ane_h16_sections_copy(u64 sections_ptr, u32 section_count,
 				 void *aux[ANE_H16_AUX_COUNT],
 				 size_t aux_size[ANE_H16_AUX_COUNT])
 {
@@ -72,9 +72,9 @@ static int ane_h16_sections_copy(const struct drm_ane_h16_load *args,
 	BUILD_BUG_ON(DRM_ANE_H16_SECTIONS != ANE_H16_AUX_COUNT);
 	BUILD_BUG_ON(DRM_ANE_H16_SECTION_MIN != ANE_H16_AUX_MIN);
 	BUILD_BUG_ON(DRM_ANE_H16_SECTION_MAX != ANE_H16_AUX_MAX);
-	if (args->section_count != DRM_ANE_H16_SECTIONS)
+	if (section_count != DRM_ANE_H16_SECTIONS)
 		return -EINVAL;
-	if (copy_from_user(sections, u64_to_user_ptr(args->sections_ptr), sizeof(sections)))
+	if (copy_from_user(sections, u64_to_user_ptr(sections_ptr), sizeof(sections)))
 		return -EFAULT;
 	for (i = 0; i < DRM_ANE_H16_SECTIONS; i++) {
 		const struct drm_ane_h16_section *s = &sections[i];
@@ -95,24 +95,37 @@ static int ane_h16_sections_copy(const struct drm_ane_h16_load *args,
 	return 0;
 }
 
-static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_file *file)
+/*
+ * The body of H16_LOAD and H16_LOAD_WIDE: they differ only in how many
+ * surfaces their arrays report (@max). A program with more surfaces than
+ * that is refused with -E2BIG before anything is loaded.
+ */
+static int ane_h16_load_common(struct drm_device *drm, struct drm_file *file,
+			       u64 hwx_ptr, u64 hwx_size, u64 sections_ptr,
+			       u32 section_count, u32 flags, u32 pad, unsigned int max,
+			       u32 *surface_count, u64 *surface_size, u32 *surface_direction)
 {
 	struct ane_h16_accel *a = to_h16_accel(drm);
 	struct ane_h16_accel_file *f = file->driver_priv;
-	struct drm_ane_h16_load *args = data;
-	struct ane_h16_hwx_snapshot snapshot = {};
+	struct ane_h16_hwx_snapshot *snapshot;
 	void *aux[ANE_H16_AUX_COUNT] = {};
 	size_t aux_size[ANE_H16_AUX_COUNT] = {};
 	struct ane_h16_program *program = NULL;
 	unsigned int i;
 	int ret;
 
-	if (args->flags || args->pad)
+	if (flags || pad)
 		return -EINVAL;
-	ret = ane_h16_sections_copy(args, aux, aux_size);
+	/* It holds the parsed HWX, too big for the stack with 16 surfaces. */
+	snapshot = kzalloc(sizeof(*snapshot), GFP_KERNEL);
+	if (!snapshot)
+		return -ENOMEM;
+	ret = ane_h16_sections_copy(sections_ptr, section_count, aux, aux_size);
 	if (!ret)
-		ret = ane_h16_hwx_snapshot_from_user(u64_to_user_ptr(args->hwx_ptr),
-						     args->hwx_size, &snapshot);
+		ret = ane_h16_hwx_snapshot_from_user(u64_to_user_ptr(hwx_ptr),
+						     hwx_size, snapshot);
+	if (!ret && snapshot->info.surface_count > max)
+		ret = -E2BIG;
 	if (ret)
 		goto out;
 	mutex_lock(&f->lock);
@@ -130,7 +143,7 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	if (f->program) {
 		ret = -EBUSY;
 	} else {
-		ret = ane_h16_session_load(a->session, &snapshot,
+		ret = ane_h16_session_load(a->session, snapshot,
 					   (const void *const *)aux, aux_size, &program);
 		if (!ret)
 			f->program = program;
@@ -138,11 +151,11 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	if (!ret) {
 		const struct ane_h16_hwx *hwx = &program->hwx;
 
-		args->surface_count = program->resource_count;
-		for (i = 0; i < DRM_ANE_H16_SURFACES; i++) {
-			args->surface_size[i] = i < program->resource_count ?
+		*surface_count = program->resource_count;
+		for (i = 0; i < max; i++) {
+			surface_size[i] = i < program->resource_count ?
 				program->resources[i].buffer.size : 0;
-			args->surface_direction[i] = i < program->resource_count ?
+			surface_direction[i] = i < program->resource_count ?
 				hwx->surfaces[i].direction : 0;
 		}
 	}
@@ -150,11 +163,33 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	mutex_unlock(&f->lock);
 out:
 	/* A consumed snapshot was moved into the program and reads as empty. */
-	if (snapshot.bytes)
-		ane_h16_hwx_snapshot_destroy(&snapshot);
+	if (snapshot->bytes)
+		ane_h16_hwx_snapshot_destroy(snapshot);
+	kfree(snapshot);
 	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
 		kfree(aux[i]);
 	return ret;
+}
+
+static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_file *file)
+{
+	struct drm_ane_h16_load *args = data;
+
+	return ane_h16_load_common(drm, file, args->hwx_ptr, args->hwx_size,
+				   args->sections_ptr, args->section_count, args->flags,
+				   args->pad, DRM_ANE_H16_SURFACES, &args->surface_count,
+				   args->surface_size, args->surface_direction);
+}
+
+static int ane_h16_load_wide_ioctl(struct drm_device *drm, void *data, struct drm_file *file)
+{
+	struct drm_ane_h16_load_wide *args = data;
+
+	BUILD_BUG_ON(DRM_ANE_H16_SURFACES_WIDE != ANE_H16_SURFACES);
+	return ane_h16_load_common(drm, file, args->hwx_ptr, args->hwx_size,
+				   args->sections_ptr, args->section_count, args->flags,
+				   args->pad, DRM_ANE_H16_SURFACES_WIDE, &args->surface_count,
+				   args->surface_size, args->surface_direction);
 }
 
 static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_file *file)
@@ -388,6 +423,7 @@ static const struct drm_ioctl_desc ane_h16_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(ANE_GET_CAPS, ane_h16_get_caps_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(ANE_H16_LOAD, ane_h16_load_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(ANE_H16_EXEC, ane_h16_exec_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(ANE_H16_LOAD_WIDE, ane_h16_load_wide_ioctl, DRM_RENDER_ALLOW),
 };
 
 /*
@@ -416,7 +452,7 @@ static const struct drm_driver ane_h16_drm_driver = {
 	.num_ioctls = ARRAY_SIZE(ane_h16_ioctls),
 	.fops = &ane_h16_fops,
 	.major = DRM_ANE_ABI_V3,
-	.minor = 1,
+	.minor = 2,
 	.name = "ane",
 	.desc = "Apple Neural Engine (H16 and later)",
 };

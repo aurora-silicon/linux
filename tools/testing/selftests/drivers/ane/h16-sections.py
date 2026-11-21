@@ -9,8 +9,10 @@ derives them from the HWX alone:
 - generic: a 0x208-byte header (magic 1, version 0x10, buffer count at
   0x204) and one 0x30-byte entry per surface in HWX segment order. Each
   entry names its buffer ID, its type (0 input, 1 output), its direction
-  (1 input, 2 output) and its size. The output gets ID 4 and the inputs
-  5, 6, ... in segment order. A program with a __DATA scratch (a linked
+  (1 input, 2 output) and its size. The first output gets ID 4 and the
+  inputs 5, 6, ... in segment order; further outputs (Apple's camera
+  networks have several) take the IDs after the inputs. A one-output
+  program's sections are the same as before. A program with a __DATA scratch (a linked
   program's DRAM edges) gets one more entry, last, typed as an input of
   the __bss size with the next input ID; the kernel binds it to private
   memory. EXECUTE names buffers by these IDs.
@@ -118,8 +120,9 @@ def parse(hwx):
         if direction != s["direction"] or not span or span > s["allocation"]:
             raise HwxError("surface %s has no matching tensor" % s.get("name"))
         s["span"] = span
-    if sum(s["direction"] == 2 for s in surfaces) != 1:
-        raise HwxError("an H16 program has exactly one output")
+    if not any(s["direction"] == 1 for s in surfaces) or \
+            not any(s["direction"] == 2 for s in surfaces):
+        raise HwxError("a program needs an input and an output")
     return surfaces, text, kernel, scratch, descriptor
 
 
@@ -169,9 +172,15 @@ def build(hwx):
     stream = hwx[text_off:text_off + text_size]
     tasks, slots = walk(stream, PROLOGUE[u32(hwx, 8)])
 
-    inputs = iter(range(FIRST_OUTPUT_ID + 1, 0x3d))
+    ids = iter(range(FIRST_OUTPUT_ID + 1, 0x3d))
+    outputs = [s for s in surfaces if s["direction"] == 2]
+    outputs[0]["id"] = FIRST_OUTPUT_ID
     for s in surfaces:
-        s["id"] = FIRST_OUTPUT_ID if s["direction"] == 2 else next(inputs)
+        if s["direction"] == 1:
+            s["id"] = next(ids)
+    for s in outputs[1:]:
+        s["id"] = next(ids)
+    inputs = ids
     entries = [(s["id"], s["direction"], s["allocation"]) for s in surfaces]
     scratch_id = None
     if scratch:

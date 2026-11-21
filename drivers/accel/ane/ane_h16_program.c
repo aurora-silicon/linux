@@ -346,7 +346,7 @@ int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 		};
 		seen[direction - 1]++;
 	}
-	if (!seen[0] || seen[1] != 1)
+	if (!seen[0] || !seen[1])
 		return -ENOEXEC;
 	if (scratch && !hwx->scratch.size)
 		*scratch = (struct ane_h16_process_binding) {};
@@ -1229,7 +1229,7 @@ static int h16_gate_release(struct ane_h16_session *s)
  */
 int ane_h16_session_gate_expire(struct ane_h16_session *s)
 {
-	if (!s->gate_held)
+	if (!s->gate_held || s->gate_pinned)
 		return 0;
 	if (s->running || h16_now(s) - s->gate_last_ns < s->gate_hold_ns)
 		return -EAGAIN;
@@ -1947,6 +1947,185 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_close);
+
+/*
+ * One control command outside any program (the ISP link): prepared, sent and
+ * its reply checked (same command echoed, zero acknowledgment).
+ *
+ * Kernel-only: no ioctl reaches it. Its one caller is the ISP link in
+ * ane_fw_cold.c (ane_isp_endpoint_enable() and _disable()), which builds the
+ * whole command itself: LOAD_AFPP and UNLOAD_AFPP, IPC_ENDPOINT_SET2 and
+ * UNSET2, MCACHE_SIZE_GET and DEFAULT_SETTING_SET. A client cannot choose
+ * the opcode or the body. It is exported only because that caller is in
+ * the ane_t6021 module. The arena it
+ * used is given back once the firmware answered. Caller holds the session
+ * lock (ane_h16_session_enter()). On success the reply is copied back into
+ * @command, for the commands that answer in their body.
+ */
+int ane_h16_session_control(struct ane_h16_session *s, unsigned int ch, void *command,
+			    size_t length)
+{
+	struct ane_fw_transport *t;
+	const u8 *reply;
+	size_t mark;
+	u16 id;
+	int ret;
+
+	if (!s || !command || length < 8)
+		return -EINVAL;
+	h16_drain(s);
+	if (s->quarantined)
+		return -EIO;
+	if (s->asleep)
+		return -EAGAIN;
+	id = get_unaligned_le16((u8 *)command + 4);
+	ret = ane_h16_command_prepare(command, length, id, ch);
+	if (ret)
+		return ret;
+	t = s->transport;
+	mark = ane_fw_transport_mark(t);
+	ret = h16_send(s, ch, command, length, &reply);
+	if (ret == -EPERM)
+		return ret;
+	if (ret) {
+		/* No answer: the ring is stuck, as for a LOAD that got none. */
+		s->ops->log(s->ctx, "control unanswered", id, (u64)-ret);
+		h16_dump_rows("control", command, length);
+		return h16_fail(s, ret);
+	}
+	ret = h16_reply_header(reply, length, length, id);
+	if (ret)
+		h16_dump_rows("control reply", reply, length);
+	/* Answered: the arena goes back whatever the status said. */
+	ane_fw_transport_release(t, mark);
+	if (ret == -EREMOTEIO) {
+		s->ops->log(s->ctx, "control refused", id, get_unaligned_le16(reply + 6));
+		return ret;
+	}
+	if (ret)
+		return h16_fail(s, ret);
+	memcpy(command, reply, length);
+	s->ops->log(s->ctx, "control", id, 0);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_control);
+
+/*
+ * Hold the firmware's dynamic power gating off without a request (or let it
+ * go back on): for work the host does not submit, the ISP's MLVNR on its own
+ * rings. Caller holds the session lock.
+ */
+int ane_h16_session_gate_pin(struct ane_h16_session *s, bool pin)
+{
+	int ret;
+
+	if (!s)
+		return -EINVAL;
+	if (!pin) {
+		if (!s->gate_pinned)
+			return 0;
+		s->gate_pinned = false;
+		return s->running ? 0 : h16_gate_release(s);
+	}
+	h16_drain(s);
+	if (s->quarantined)
+		return -EIO;
+	if (s->asleep)
+		return -EAGAIN;
+	if (!s->gate_held) {
+		ret = h16_gate(s, 0);
+		if (ret)
+			return h16_fail(s, ret);
+		s->gate_held = true;
+	}
+	s->gate_pinned = true;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_gate_pin);
+
+/*
+ * Take every IO_T2H report posted so far. The ISP's programs (MLVNR) run on
+ * the engine like a host EXECUTE and the firmware reports each of them here,
+ * one per camera frame, on the ring of the host's own reports; it waits for
+ * a free slot before it reports the next, and the ISP's next ANE command
+ * waits behind it (boot 1a050318: the ring filled 6 s into an MLVNR stream
+ * and the ISP firmware asserted on its 200 ms command timeout). A report a
+ * host request waits for goes to it, as in h16_wait_report(), which drops
+ * the lock while it pauses; the others are acknowledged and counted. A
+ * report too large for any message of this firmware stops the transport:
+ * it cannot be acknowledged unread. Returns the reports taken.
+ */
+static int h16_serve_reports(struct ane_h16_session *s)
+{
+	struct ane_fw_transport *t = s->transport;
+	int ret, n;
+
+	for (n = 0; n < 64; n++) {
+		size_t size;
+
+		ret = ane_fw_transport_consume(t, s->serve_report, sizeof(s->serve_report),
+					       &size);
+		if (ret == -EAGAIN)
+			break;
+		if (ret == -ENOSPC)
+			return ane_fw_transport_fail(t, -EPROTO);
+		if (ret)
+			return ret;
+		s->serve_reports++;
+		ret = h16_report(s, s->serve_report, size);
+		if (ret >= 0)
+			continue;
+		/* Kept for the log, also when it is what stopped the session. */
+		if (!s->serve_foreign++) {
+			memcpy(s->serve_first, s->serve_report, size);
+			s->serve_first_size = size;
+		}
+		if (ret != -ENOENT && ret != -ENOMSG)
+			return ret;
+	}
+	return n;
+}
+
+/*
+ * Serve what the firmware posted while no host command waits (the ISP link
+ * drives the engine): the doorbell bits it rang, the IO_T2H reports, then
+ * SHAREDMALLOC and the terminal until quiet, for at most limit_ns per round.
+ * After a request is served the next is waited for up to 100 us, so a burst
+ * is served in one call: the firmware posts its next request only after the
+ * answer, and macOS serves the 30 ISP surface maps of an MLVNR start within
+ * about 1 ms (the ISP firmware gives an ANE command 200 ms). Nothing posted:
+ * one pass, no wait. Returns the requests and reports served. Caller holds
+ * the session lock.
+ */
+int ane_h16_session_serve(struct ane_h16_session *s, u32 *pending, u64 limit_ns)
+{
+	int ret, total = 0, round;
+
+	if (!s || !pending)
+		return -EINVAL;
+	h16_drain(s);
+	if (s->quarantined)
+		return -EIO;
+	if (s->asleep)
+		return -EAGAIN;
+	ret = ane_fw_transport_irq(s->transport, pending);
+	if (ret)
+		return h16_fail(s, ret);
+	do {
+		ret = h16_serve_reports(s);
+		if (ret < 0)
+			break;
+		round = ret;
+		ret = ane_fw_transport_settle(s->transport, total ? 100 * NSEC_PER_USEC : 0,
+					      limit_ns);
+		if (ret < 0)
+			break;
+		round += ret;
+		total += round;
+	} while (round > 0 && total < 64);
+	return ret < 0 ? h16_fail(s, ret) : total;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_serve);
 
 /*
  * Requests (LOAD, EXECUTE) wait here while the engine is cycled across

@@ -760,8 +760,18 @@ static void program_add128_slots_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_load_slots(hwx, plan, &layout, slots), -EINVAL);
 	KUNIT_EXPECT_EQ(test, ane_h16_load_encode(load, sizeof(load) - 8, slots), -EINVAL);
 
-	/* A program needs an input and exactly one output. */
+	/*
+	 * A program needs an input and an output; it may have several outputs
+	 * (add128 is in, out, in: two outputs and an input bind).
+	 */
+	KUNIT_ASSERT_EQ(test, hwx->surface_count, 3U);
 	hwx->surfaces[0].direction = 2;
+	generic_size = generic_fill(generic, hwx, 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count, NULL), 0);
+	KUNIT_EXPECT_EQ(test, count, 3U);
+	/* Outputs only: no input refuses. */
+	hwx->surfaces[2].direction = 2;
 	generic_size = generic_fill(generic, hwx, 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
 						       &count, NULL), -ENOEXEC);
@@ -1366,6 +1376,63 @@ static void program_bad_report_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), -EIO);
 		KUNIT_EXPECT_EQ(test, f->count, sent);
 	}
+}
+
+/*
+ * The ISP link drives the engine (MLVNR): the firmware reports the ISP's own
+ * programs on IO_T2H, one per frame, with no host request waiting, and posts
+ * the next only into a free slot. ane_h16_session_serve() takes and
+ * acknowledges each, keeps the first, and a host request afterwards still
+ * completes. A report larger than any message stops the session.
+ */
+static void program_serve_reports_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	struct ane_h16_event e;
+	unsigned int i, head;
+	u32 pending = 0;
+	u8 *slot;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	head = f->t.head[ANE_FW_IO_T2H];
+	KUNIT_ASSERT_EQ(test, head, f->head[ANE_FW_IO_T2H]);
+	for (i = 0; i < 3; i++)
+		fw_report(f, 0x5000 + i, 2, 2, i == 2 ? 1 : 3);
+	/* The second goes to the ISP (destination 1). */
+	((u8 *)f->ipc.cpu)[FW_REPORTS + ((f->reports - 2) % 16) * 0x60 + 0x30] = 1;
+
+	KUNIT_EXPECT_EQ(test, ane_h16_session_serve(&f->s, &pending, NSEC_PER_MSEC), 3);
+	for (i = 0; i < 3; i++) {
+		slot = (u8 *)f->ipc.cpu + f->t.channels[ANE_FW_IO_T2H].offset +
+		       ((head + i) % FW_RING_SLOTS) * ANE_FW_SLOT_SIZE;
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot) & 1, 1);
+	}
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_IO_T2H], (head + 3) % FW_RING_SLOTS);
+	KUNIT_EXPECT_EQ(test, f->s.serve_reports, 3);
+	KUNIT_EXPECT_EQ(test, f->s.serve_foreign, 3);
+	KUNIT_ASSERT_EQ(test, f->s.serve_first_size, 0x60);
+	KUNIT_ASSERT_EQ(test, ane_h16_event_decode(f->s.serve_first, 0x60, ANE_FW_IO_T2H, &e), 0);
+	KUNIT_EXPECT_EQ(test, e.key.uuid, 0x5000);
+	KUNIT_EXPECT_EQ(test, e.state, 3);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_FALSE(test, f->s.pending.quarantined);
+	/* Nothing posted: one quiet pass. */
+	KUNIT_EXPECT_EQ(test, ane_h16_session_serve(&f->s, &pending, NSEC_PER_MSEC), 0);
+	/* The host's own request still gets its reports. */
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->s.serve_reports, 3);
+
+	/* Too large to read: never acknowledged unread, the session stops. */
+	fw_report(f, 0x6000, 2, 2, 3);
+	slot = (u8 *)f->ipc.cpu + f->t.channels[ANE_FW_IO_T2H].offset +
+	       f->t.head[ANE_FW_IO_T2H] * ANE_FW_SLOT_SIZE;
+	put_unaligned_le64(ANE_H16_REPORT_MAX + 8, slot + 8);
+	KUNIT_EXPECT_LT(test, ane_h16_session_serve(&f->s, &pending, NSEC_PER_MSEC), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot) & 1, 0);
+	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
 }
 
 /* A request that starts and never ends names the wait step and the last state. */
@@ -3403,6 +3470,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_bad_load_test),
 	KUNIT_CASE(program_bad_operation_test),
 	KUNIT_CASE(program_bad_report_test),
+	KUNIT_CASE(program_serve_reports_test),
 	KUNIT_CASE(program_stall_trace_test),
 	KUNIT_CASE(program_timing_test),
 	KUNIT_CASE(program_fwlog_line_test),

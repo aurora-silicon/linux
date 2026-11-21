@@ -20,7 +20,7 @@ static void ane_h16_accel_fops_test(struct kunit *test)
 	/* No GEM offset manager: surfaces map through the driver's own mmap. */
 	KUNIT_EXPECT_TRUE(test, ane_h16_fops.mmap == ane_h16_mmap);
 	KUNIT_EXPECT_FALSE(test, ane_h16_drm_driver.driver_features & DRIVER_GEM);
-	KUNIT_EXPECT_EQ(test, ane_h16_drm_driver.minor, 1);
+	KUNIT_EXPECT_EQ(test, ane_h16_drm_driver.minor, 2);
 }
 
 static void ane_h16_accel_open_test(struct kunit *test)

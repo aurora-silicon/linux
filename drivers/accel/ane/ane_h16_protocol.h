@@ -13,7 +13,35 @@ enum ane_h16_command {
 	ANE_H16_EXECUTE = 0x020c,
 	ANE_H16_POWER_GATE = 0x002d,
 	ANE_H16_EVENT_REPORT = 0x0300,
+	/*
+	 * The ISP link (MLVNR): CSNE_CMD_LOAD_AFPP / UNLOAD_AFPP and
+	 * CSNE_CMD_IPC_ENDPOINT_SET2 / UNSET2, from the macOS 27.2.1
+	 * AppleH16ANEInterface (ANEFirmwareManager::sendAFPPLoadCmd,
+	 * sendIPCEndpointSetCmd). Same channel as LOAD_PROGRAM.
+	 */
+	ANE_H16_IPC_ENDPOINT_SET2 = 0x002a,
+	ANE_H16_IPC_ENDPOINT_UNSET2 = 0x002b,
+	ANE_H16_LOAD_AFPP = 0x0205,
+	ANE_H16_UNLOAD_AFPP = 0x0206,
+	/*
+	 * CSNE_CMD_MCACHE_SIZE_GET (ANEFirmwareManager::getMCacheSize): 0xc
+	 * bytes, the firmware answers its system-cache need at +8. macOS asks it
+	 * at every firmware start before it hands out cache partitions
+	 * (handleISPClientMCacheRequest). Read-only.
+	 */
+	ANE_H16_MCACHE_SIZE_GET = 0x0026,
+	/*
+	 * CSNE_CMD_ANE_DEFAULT_SETTING_SET (ANEFirmwareManager::setMCacheDSIDs,
+	 * H17): a count at +8, then (type, value) pairs from +0x10. macOS gives
+	 * the ISP client its spill caches with it at every firmware start: type 3
+	 * = prefetch DSID, type 4 = intermediate spill DSID (27.2 on the J815:
+	 * 0xc, 0x300000 bytes). (The older CSNE_CMD_DSID_SET is 0x25.)
+	 */
+	ANE_H16_DEFAULT_SETTING_SET = 0x002e,
 };
+
+#define ANE_H16_AFPP_SIZE 0x38
+#define ANE_H16_ENDPOINT_SIZE 0x30
 
 struct ane_h16_command_info {
 	u16 id;
@@ -34,6 +62,12 @@ static inline const struct ane_h16_command_info *ane_h16_command_info(u16 id)
 		{ ANE_H16_EXECUTE, 0xca8, 0xcd8, 0x18, 7, false },
 		{ ANE_H16_POWER_GATE, 0xc, 0xc, 1, 7, false },
 		{ ANE_H16_EVENT_REPORT, 0x60, 0x60, 1, 6, true },
+		{ ANE_H16_IPC_ENDPOINT_SET2, 0x30, 0x30, 1, 1, false },
+		{ ANE_H16_IPC_ENDPOINT_UNSET2, 0x30, 0x30, 1, 1, false },
+		{ ANE_H16_LOAD_AFPP, 0x38, 0x38, 1, 1, false },
+		{ ANE_H16_UNLOAD_AFPP, 0x38, 0x38, 1, 1, false },
+		{ ANE_H16_MCACHE_SIZE_GET, 0xc, 0xc, 1, 1, false },
+		{ ANE_H16_DEFAULT_SETTING_SET, 0x18, 0x20, 8, 1, false },
 	};
 	unsigned int i;
 

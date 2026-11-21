@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <linux/module.h>
+#include <linux/slab.h>
 
 #include "ane_h16_load.h"
 
@@ -30,7 +31,7 @@ static int h16_load_plan(const struct ane_h16_hwx *hwx, struct ane_h16_load_plan
 int ane_h16_load_plan_create(const struct ane_h16_hwx_snapshot *snapshot,
 			     struct ane_h16_load_plan *plan)
 {
-	struct ane_h16_hwx hwx;
+	struct ane_h16_hwx *hwx;
 	int ret;
 
 	if (!plan)
@@ -38,11 +39,16 @@ int ane_h16_load_plan_create(const struct ane_h16_hwx_snapshot *snapshot,
 	ret = ane_h16_hwx_snapshot_check(snapshot);
 	if (ret)
 		return ret;
+	/* 16 surfaces make the parsed HWX too big for the stack. */
+	hwx = kzalloc(sizeof(*hwx), GFP_KERNEL);
+	if (!hwx)
+		return -ENOMEM;
 	/* Reparse the authenticated original, not caller-supplied cached metadata. */
-	ret = ane_h16_hwx_validate(snapshot->bytes, snapshot->size, &hwx);
-	if (ret)
-		return ret;
-	return h16_load_plan(&hwx, plan);
+	ret = ane_h16_hwx_validate(snapshot->bytes, snapshot->size, hwx);
+	if (!ret)
+		ret = h16_load_plan(hwx, plan);
+	kfree(hwx);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(ane_h16_load_plan_create);
 
@@ -53,9 +59,12 @@ int ane_h16_load_resources_create(const struct ane_h16_hwx_snapshot *snapshot,
 				  unsigned int binding_count,
 				  struct ane_h16_resource *resources)
 {
-	struct ane_h16_resource next[ANE_H16_SURFACES] = {};
-	struct ane_h16_load_plan plan;
-	struct ane_h16_hwx hwx;
+	/* 16 surfaces make these too big for the stack. */
+	struct {
+		struct ane_h16_resource next[ANE_H16_SURFACES];
+		struct ane_h16_load_plan plan;
+		struct ane_h16_hwx hwx;
+	} *w;
 	unsigned int i, j;
 	int ret;
 
@@ -64,44 +73,48 @@ int ane_h16_load_resources_create(const struct ane_h16_hwx_snapshot *snapshot,
 	ret = ane_h16_hwx_snapshot_check(snapshot);
 	if (ret)
 		return ret;
-	ret = ane_h16_hwx_validate(snapshot->bytes, snapshot->size, &hwx);
+	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!w)
+		return -ENOMEM;
+	ret = ane_h16_hwx_validate(snapshot->bytes, snapshot->size, &w->hwx);
 	if (ret)
-		return ret;
-	ret = h16_load_plan(&hwx, &plan);
+		goto out;
+	ret = h16_load_plan(&w->hwx, &w->plan);
 	if (ret)
-		return ret;
-	if (mapping_count != plan.count || binding_count != hwx.surface_count)
-		return -EINVAL;
+		goto out;
+	ret = -EINVAL;
+	if (mapping_count != w->plan.count || binding_count != w->hwx.surface_count)
+		goto out;
 	for (i = 0; i < mapping_count; i++) {
 		const struct ane_h16_load_mapping *m = &mappings[i];
 		u64 end;
 
 		if (!m->dva || !IS_ALIGNED(m->dva, SZ_16K) ||
-		    m->size != plan.allocation[i] ||
-		    m->permissions != plan.regions[i].permissions ||
+		    m->size != w->plan.allocation[i] ||
+		    m->permissions != w->plan.regions[i].permissions ||
 		    check_add_overflow(m->dva, m->size, &end) ||
 		    (m->dva < 0x1000036c000ULL && end > 0x10000000000ULL))
-			return -EINVAL;
+			goto out;
 		for (j = 0; j < i; j++)
 			if (m->dva < mappings[j].dva + mappings[j].size &&
 			    mappings[j].dva < end)
-				return -EINVAL;
+				goto out;
 	}
 	for (i = 0; i < binding_count; i++) {
-		const struct ane_h16_hwx_surface *s = &hwx.surfaces[i];
+		const struct ane_h16_hwx_surface *s = &w->hwx.surfaces[i];
 		const struct ane_h16_process_binding *b = &bindings[i];
 
 		if (b->hwx_vm != s->section.vm || b->class != s->direction - 1)
-			return -EINVAL;
-		for (j = 0; j < plan.count; j++)
-			if (plan.regions[j].kind == ANE_H16_REGION_SURFACE &&
-			    plan.regions[j].vm == b->hwx_vm)
+			goto out;
+		for (j = 0; j < w->plan.count; j++)
+			if (w->plan.regions[j].kind == ANE_H16_REGION_SURFACE &&
+			    w->plan.regions[j].vm == b->hwx_vm)
 				break;
-		if (j == plan.count)
-			return -EINVAL;
-		next[i].hwx_vm = b->hwx_vm;
-		next[i].permissions = s->direction;
-		next[i].buffer = (struct ane_h16_execute_buffer) {
+		if (j == w->plan.count)
+			goto out;
+		w->next[i].hwx_vm = b->hwx_vm;
+		w->next[i].permissions = s->direction;
+		w->next[i].buffer = (struct ane_h16_execute_buffer) {
 			.index = b->index,
 			.class = b->class,
 			.mapping_dva = mappings[j].dva,
@@ -109,9 +122,11 @@ int ane_h16_load_resources_create(const struct ane_h16_hwx_snapshot *snapshot,
 			.size = s->span,
 		};
 	}
-	ret = ane_h16_resources_validate(&hwx, next, binding_count);
+	ret = ane_h16_resources_validate(&w->hwx, w->next, binding_count);
 	if (!ret)
-		memcpy(resources, next, binding_count * sizeof(*resources));
+		memcpy(resources, w->next, binding_count * sizeof(*resources));
+out:
+	kfree(w);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(ane_h16_load_resources_create);

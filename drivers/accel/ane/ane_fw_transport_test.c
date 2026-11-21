@@ -42,6 +42,11 @@ struct ane_transport_test {
 	int alloc_error;
 	int alloc_bad;
 	bool post_next_unnotified;
+	/* map/unmap (ISP surfaces by ID) */
+	int map_error;
+	unsigned int maps, unmaps;
+	u32 map_id;
+	u64 mapped_dva;
 };
 
 static void ane_test_access(struct ane_transport_test *f, char kind, const void *p, u64 value)
@@ -171,6 +176,32 @@ static void ane_test_refused(void *ctx, u64 word0, u64 word1, u64 word2, int err
 	f->refused_error = error;
 }
 
+#define TEST_MAP_DVA 0x10021300000ULL
+
+static int ane_test_map(void *ctx, u32 id, u64 *dva, u64 *size)
+{
+	struct ane_transport_test *f = ctx;
+
+	f->maps++;
+	f->map_id = id;
+	if (f->map_error)
+		return f->map_error;
+	*dva = f->mapped_dva = TEST_MAP_DVA;
+	*size = 0x14000;
+	return 0;
+}
+
+static int ane_test_unmap(void *ctx, u64 dva)
+{
+	struct ane_transport_test *f = ctx;
+
+	if (!f->mapped_dva || dva != f->mapped_dva)
+		return -ENOENT;
+	f->unmaps++;
+	f->mapped_dva = 0;
+	return 0;
+}
+
 static const struct ane_fw_transport_ops ane_test_ops = {
 	.load64 = ane_test_load,
 	.store64 = ane_test_store,
@@ -182,6 +213,21 @@ static const struct ane_fw_transport_ops ane_test_ops = {
 	.relax = ane_test_relax,
 	.alloc = ane_test_alloc,
 	.refused = ane_test_refused,
+};
+
+static const struct ane_fw_transport_ops ane_test_map_ops = {
+	.load64 = ane_test_load,
+	.store64 = ane_test_store,
+	.read_barrier = ane_test_rmb,
+	.write_barrier = ane_test_wmb,
+	.read32 = ane_test_read32,
+	.write32 = ane_test_write32,
+	.now_ns = ane_test_now,
+	.relax = ane_test_relax,
+	.alloc = ane_test_alloc,
+	.refused = ane_test_refused,
+	.map = ane_test_map,
+	.unmap = ane_test_unmap,
 };
 
 static void ane_test_table(struct ane_transport_test *f)
@@ -735,6 +781,87 @@ static void ane_transport_shared_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
 	KUNIT_EXPECT_EQ(test, f->t.shared_bytes, (size_t)(SZ_2M + SZ_16K));
 	KUNIT_EXPECT_EQ(test, f->t.shared_count, 2U);
+}
+
+/*
+ * (0, 0, id): another firmware's surface by ID (macOS
+ * ANE_processISPSurfaceMapRequest), answered (DVA|1, size, id); its FREE
+ * goes back through unmap and is answered like any H17 FREE.
+ */
+static void ane_transport_shared_map_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 *p;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_init(&f->t, &f->soc, &ane_test_map_ops, f,
+						    f->ipc, f->pool, TEST_RESERVED,
+						    f->ipc.dva, ANE_FW_TABLE_SIZE), 0);
+	f->t.allow_free = true;
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_test_shared_request(f, 0, 0, 0x101);
+	p = ane_test_slot(f, ANE_FW_SHAREDMALLOC);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->maps, 1U);
+	KUNIT_EXPECT_EQ(test, f->map_id, 0x101U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p), TEST_MAP_DVA | 1);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p + 8), 0x14000ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p + 16), 0x101ULL);
+	KUNIT_EXPECT_EQ(test, f->last_value, (u32)BIT(5));
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_SHAREDMALLOC], 1U);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 0U);
+	KUNIT_EXPECT_EQ(test, f->refusals, 0U);
+	/* The firmware frees it: unmapped, answered DVA|1. */
+	ane_test_shared_request(f, TEST_MAP_DVA, 0, 0);
+	p = ane_test_slot(f, ANE_FW_SHAREDMALLOC);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->unmaps, 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p), TEST_MAP_DVA | 1);
+	KUNIT_EXPECT_EQ(test, f->t.free_count, 1U);
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_SHAREDMALLOC], 0U);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+}
+
+/* A surface that cannot be mapped is answered (1, 0, id); the transport goes on. */
+static void ane_transport_shared_map_refused_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 *p;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_init(&f->t, &f->soc, &ane_test_map_ops, f,
+						    f->ipc, f->pool, TEST_RESERVED,
+						    f->ipc.dva, ANE_FW_TABLE_SIZE), 0);
+	f->t.allow_free = true;
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->map_error = -EEXIST;
+	ane_test_shared_request(f, 0, 0, 0x102);
+	p = ane_test_slot(f, ANE_FW_SHAREDMALLOC);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p), 1ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p + 8), 0ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p + 16), 0x102ULL);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+	KUNIT_EXPECT_EQ(test, f->refusals, 0U);
+	/* An ordinary allocation after it is still served. */
+	ane_test_shared_request(f, 0, SZ_16K, 0x1234);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 1U);
+	/* A FREE of a DVA nobody gave out is still refused. */
+	ane_test_shared_request(f, TEST_MAP_DVA + SZ_1M, 0, 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -ENOENT);
+	KUNIT_EXPECT_EQ(test, f->refusals, 1U);
+	KUNIT_EXPECT_EQ(test, f->refused_error, -ENOENT);
+}
+
+/* Without a map op (H16, no ISP link) (0, 0, id) stays refused. */
+static void ane_transport_shared_map_absent_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_test_shared_request(f, 0, 0, 0x103);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, f->refusals, 1U);
+	KUNIT_EXPECT_EQ(test, f->maps, 0U);
 }
 
 /* The body of a fresh zero-header request is not its publication boundary. */
@@ -1539,6 +1666,9 @@ static void ane_transport_terminal_wrap_test(struct kunit *test)
 }
 
 static struct kunit_case ane_transport_cases[] = {
+	KUNIT_CASE(ane_transport_shared_map_test),
+	KUNIT_CASE(ane_transport_shared_map_refused_test),
+	KUNIT_CASE(ane_transport_shared_map_absent_test),
 	KUNIT_CASE(ane_transport_terminal_ack_test),
 	KUNIT_CASE(ane_transport_terminal_bounds_test),
 	KUNIT_CASE(ane_transport_terminal_wrap_test),
