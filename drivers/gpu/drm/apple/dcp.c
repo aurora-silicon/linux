@@ -9879,7 +9879,8 @@ static int dcp_platform_suspend(struct device *dev)
 	 * stops its firmware cold and nothing starts it again, so its resume would wait on a
 	 * dead firmware. Refuse the deep sleep instead; suspend-to-idle keeps it running.
 	 */
-	if (pm_suspend_via_firmware() && dcp->external && !dcp->hw.s2r_ext &&
+	if (pm_suspend_via_firmware() && !dcp->hw.s2r_ext &&
+	    (dcp->external || apple_t8132_dcpext_v27_2(dev->of_node)) &&
 	    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 		dev_warn(dev, "no firmware stop for a deep sleep: refusing it\n");
 		return -EBUSY;
