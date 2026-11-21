@@ -10,6 +10,7 @@
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
+#include <linux/syscore_ops.h>
 #include <linux/uaccess.h>
 
 #include <clocksource/arm_arch_timer.h>
@@ -1436,6 +1437,58 @@ static void kvm_timer_handle_errata(void)
 	}
 }
 
+/*
+ * A guest's counters are the physical counter minus an offset that is fixed
+ * when the VM is made.  The physical counter can start again in a sleep: it
+ * always does across a resume from disk, which is a cold boot.  The guest's
+ * counters then fall back by what the counter lost, and the guest's clock
+ * stands still until the counter has caught up, which takes as long as the
+ * host had been up.  Move the offsets by the same amount instead: the
+ * guest's counters go on from the value they had when the system went down,
+ * as for a VM that was stopped that long.  A counter that keeps running
+ * through the sleep is left alone, and the guest sees the sleep as time that
+ * passed.
+ *
+ * Syscore: one CPU, interrupts off, every task frozen, so no vCPU is loaded
+ * and nothing changes vm_list.
+ */
+static u64 kvm_timer_sleep_cnt;
+
+static int kvm_timer_syscore_suspend(void *data)
+{
+	kvm_timer_sleep_cnt = kvm_phys_timer_read();
+	return 0;
+}
+
+static void kvm_timer_syscore_resume(void *data)
+{
+	u64 now = kvm_phys_timer_read();
+	unsigned int vms = 0;
+	struct kvm *kvm;
+	u64 lost;
+
+	if (now >= kvm_timer_sleep_cnt)
+		return;
+	lost = kvm_timer_sleep_cnt - now;
+	list_for_each_entry(kvm, &vm_list, vm_list) {
+		kvm->arch.timer_data.voffset -= lost;
+		kvm->arch.timer_data.poffset -= lost;
+		vms++;
+	}
+	if (vms)
+		kvm_info("the counter started again in the sleep (%llu -> %llu): the counters of %u VM(s) kept\n",
+			 kvm_timer_sleep_cnt, now, vms);
+}
+
+static const struct syscore_ops kvm_timer_syscore_ops = {
+	.suspend = kvm_timer_syscore_suspend,
+	.resume = kvm_timer_syscore_resume,
+};
+
+static struct syscore kvm_timer_syscore = {
+	.ops = &kvm_timer_syscore_ops,
+};
+
 int __init kvm_timer_hyp_init(bool has_gic)
 {
 	struct arch_timer_kvm_info *info;
@@ -1505,6 +1558,7 @@ int __init kvm_timer_hyp_init(bool has_gic)
 	}
 
 	kvm_timer_handle_errata();
+	register_syscore(&kvm_timer_syscore);
 	return 0;
 
 out_free_ptimer_irq:
