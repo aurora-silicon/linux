@@ -273,8 +273,10 @@ struct effect_job {
  * @tp26_button: Button state of the last Trackpad26 frame.
  * @mtp_c1fe: Whether the MTP trackpad sends the J700 C1FE report layout.
  * @mtp_palms: Whether the controller's contact classes are trusted for palms
- *             on the standard MTP report (T6041, J616s).
- * @mtp_palm_size: Whether a tool area alone marks an MTP contact as a palm.
+ *             on the standard MTP report (DT apple,palm-classes).
+ * @mtp_palm_tool_major: Tool area above which an MTP contact is a palm
+ *                       whatever its class, 0 for none (DT
+ *                       apple,palm-tool-major).
  * @mtp_palm_ids: MTP contact IDs reported as palms until they lift.
  * @ntouches: Number of touches in most recent touch report.
  * @scroll_accel: Number of consecutive scroll motions.
@@ -308,7 +310,7 @@ struct magicmouse_sc {
 	bool tp26_button;
 	bool mtp_c1fe;
 	bool mtp_palms;
-	bool mtp_palm_size;
+	u32 mtp_palm_tool_major;
 	DECLARE_BITMAP(mtp_palm_ids, U8_MAX + 1);
 
 	int ntouches;
@@ -989,19 +991,21 @@ static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 				    bool firmware_button);
 
 /*
- * The T6041 (M4 Max) MTP trackpad's records carry the contact ID and state in
- * the first word and the controller's class in the low byte of the second: 1
- * for a thumb, 2 and 3 for fingers, 6 and above for palms. Recorded on a J616C:
+ * On trackpads whose node has apple,palm-classes, the MTP records carry the
+ * contact ID and state in the first word and the controller's class in the low
+ * byte of the second: 1 for a thumb, 2 and 3 for fingers, 6 and above for
+ * palms. Recorded on a J616C:
  * moving fingers had a tool area of 830-1010 and class 2 or 3, a resting thumb
  * ~1750 and class 1, a resting palm ~2040 and class 7; palms dragged across the
  * pad reached 5100. The class flickers while a hand lands, so a contact counts
  * as a palm once the controller classes it as one with a tool area no finger
- * reaches, or once its tool area passes palm size, and stays a palm until it
- * lifts. Thumbs stay touches.
+ * reaches, or once its tool area passes the palm size the node gives in
+ * apple,palm-tool-major (2200 on the J616C), and stays a palm until it lifts.
+ * Trackpads whose fingers reach palm sizes (the J616S: 2475) give no palm
+ * size, so only the class marks their palms. Thumbs stay touches.
  */
 #define MAGICMOUSE_MTP_PALM_CLASS_MIN		6
 #define MAGICMOUSE_MTP_CLASSED_PALM_TOOL_MAJOR	1400
-#define MAGICMOUSE_MTP_PALM_TOOL_MAJOR		2200
 
 static u8 magicmouse_mtp_contact_id(const struct tp_finger *f)
 {
@@ -1022,7 +1026,8 @@ static void magicmouse_mtp_update_palms(struct magicmouse_sc *msc,
 		id = magicmouse_mtp_contact_id(f);
 		class = le16_to_cpu(f->unknown2) & 0xff;
 		tool = le16_to_int(f->tool_major);
-		if ((msc->mtp_palm_size && tool > MAGICMOUSE_MTP_PALM_TOOL_MAJOR) ||
+		if ((msc->mtp_palm_tool_major &&
+		     tool > msc->mtp_palm_tool_major) ||
 		    (class >= MAGICMOUSE_MTP_PALM_CLASS_MIN &&
 		     tool > MAGICMOUSE_MTP_CLASSED_PALM_TOOL_MAJOR) ||
 		    test_bit(id, msc->mtp_palm_ids))
@@ -1733,7 +1738,7 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	 */
 	if (!msc->mtp_c1fe) {
 		/*
-		 * A palm's tool area on the T6041 and J616s trackpads exceeds
+		 * A palm's tool area on the trackpads that class palms exceeds
 		 * 5000 once scaled, so allow the full range of the record's
 		 * 16-bit fields there.
 		 */
@@ -1762,7 +1767,7 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 				     J314_TP_MAX_FINGER_ORIENTATION, 0, 0);
 	}
 
-	/* The T6041, J616s and Trackpad26 controllers classify palms. */
+	/* The palm-classing and Trackpad26 controllers classify palms. */
 	if (msc->mtp_palms || msc->mtp_tp26)
 		input_set_abs_params(input, ABS_MT_TOOL_TYPE, 0, MT_TOOL_MAX,
 				     0, 0);
@@ -2875,16 +2880,15 @@ static int magicmouse_probe(struct hid_device *hdev,
 		/* The J700 trackpad sends a different report layout. */
 		np = of_get_child_by_name(dev_of_node(hdev->dev.parent), "multi-touch");
 		msc->mtp_c1fe = of_device_is_compatible(np, "apple,j700-multitouch");
-		msc->mtp_palm_size = !msc->mtp_c1fe &&
-				     of_machine_is_compatible("apple,t6041");
 		/*
-		 * The J616s controller classes contacts the same way, but its
-		 * fingers reach a tool area of 2475, so only the class marks its
-		 * palms there.
+		 * The node tells whether the controller's contact classes mark
+		 * palms, and from which tool area a contact is a palm anyway.
 		 */
-		msc->mtp_palms = msc->mtp_palm_size ||
-				 (!msc->mtp_c1fe &&
-				  of_machine_is_compatible("apple,j616s"));
+		msc->mtp_palms = !msc->mtp_c1fe &&
+				 of_property_read_bool(np, "apple,palm-classes");
+		if (msc->mtp_palms)
+			of_property_read_u32(np, "apple,palm-tool-major",
+					     &msc->mtp_palm_tool_major);
 		of_node_put(np);
 
 		/*
