@@ -61,6 +61,10 @@ def main():
         'drain-macos-paths': ('if (path->tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES)\n\t\treturn 0;',
                               'if (false)\n\t\treturn 0;'),
         'rewrite-unslept-hops': ('!path->sleep_lost && observed.enable', 'false && observed.enable'),
+        'keep-xdomain-plugged': ('\t\txd->is_unplugged = true;\n', ''),
+        'skip-xdomain-unregister': ('\ttb_domain_unregister_unplugged_xdomains(tb);\n', ''),
+        'skip-device-router-xdomains': ('\t\t\ttb_cio_release_xdomains(tb, port->remote->sw);\n', ''),
+        'keep-xdomain-port': ('\t\tif (port->xdomain == xd)\n\t\t\tport->xdomain = NULL;\n', ''),
     }
     variants = {'real': unit}
     for name, (old, new) in mutations.items():
