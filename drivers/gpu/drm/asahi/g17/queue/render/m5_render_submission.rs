@@ -114,12 +114,7 @@ fn single_layer_compressed_depth_zls(pass: &RenderPass) -> bool {
 }
 
 pub(crate) fn parameter_geometry(blocks: usize) -> Result<crate::g17::buffer::BlockGeometry> {
-    let mut info = core::mem::MaybeUninit::<kernel::bindings::sysinfo>::zeroed();
-    // SAFETY: The complete sysinfo is initialized and writable.
-    unsafe { kernel::bindings::si_meminfo(info.as_mut_ptr()); }
-    // SAFETY: The object was initialized before si_meminfo filled it.
-    let info = unsafe { info.assume_init() };
-    let ram = (info.totalram as u64).checked_mul(u64::from(info.mem_unit)).ok_or(EOVERFLOW)?;
+    let ram = crate::g17::buffer::memory_bytes()?;
     let initial = blocks.checked_mul(0x80000).ok_or(EOVERFLOW)?;
     crate::g17::buffer::BlockGeometry::m5(ram, initial as u64)
 }

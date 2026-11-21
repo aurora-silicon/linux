@@ -315,6 +315,16 @@ impl Growth {
     }
 }
 
+/// Usable memory, the input of the RAM-scaled tiler-heap limits.
+pub(crate) fn memory_bytes() -> Result<u64> {
+    let mut info = core::mem::MaybeUninit::<kernel::bindings::sysinfo>::zeroed();
+    // SAFETY: The complete sysinfo is initialized and writable.
+    unsafe { kernel::bindings::si_meminfo(info.as_mut_ptr()); }
+    // SAFETY: The object was initialized before si_meminfo filled it.
+    let info = unsafe { info.assume_init() };
+    (info.totalram as u64).checked_mul(u64::from(info.mem_unit)).ok_or(EOVERFLOW)
+}
+
 /// The high-water sample estimates capacity, not current occupancy. A growth
 /// reserves three times the demand only once twice that demand no longer fits.
 fn automatic_target_for(used_pages: usize, current: usize, pages: usize, maximum: usize) -> Option<usize> {
@@ -768,7 +778,11 @@ impl Manager {
     ) -> Result<Self> {
         let geometry = tvb.geometry;
         let neo = geometry == BlockGeometry::NEO;
-        let layout = if neo { layout::Layout::NEO } else { layout::Layout::m5(geometry)? };
+        let layout = if neo {
+            layout::Layout::neo(memory_bytes()?)
+        } else {
+            layout::Layout::m5(geometry)?
+        };
         if metrics.scene_stride != layout.metric_stride {
             return Err(EINVAL);
         }
@@ -802,6 +816,7 @@ impl Manager {
             discard: args.discard,
             buffer_id: args.buffer_id.into(),
             generation: args.generation,
+            normal_blocks: layout.normal_blocks,
         };
         if neo {
             graph.initialize::<fw::Graph>(0, |view| view.init(&graph_args))?;
@@ -854,12 +869,12 @@ impl Manager {
         self.tvb.geometry.max_blocks()
     }
     /// The blocks an A18 Pro heap holds ahead of a render with mesh shading
-    /// (`aurora.g17_mesh_tvb_floor`): the size its automatic growth reaches.
-    /// None on other heaps, or with the switch off.
+    /// (`aurora.g17_mesh_tvb_floor`): 1,118 blocks, the normal maximum of the 8 GiB A18 Pro
+    /// (the size its automatic growth reaches). None on other heaps, or with the switch off.
     pub(crate) fn mesh_floor(&self) -> Option<usize> {
         // SAFETY: Reads a module parameter; no other effect.
         let enabled = unsafe { asahi_g17_mesh_tvb_floor() } != 0;
-        (enabled && self.tvb.geometry == BlockGeometry::NEO).then_some(self.layout.normal_blocks)
+        (enabled && self.tvb.geometry == BlockGeometry::NEO).then_some(fw::NORMAL_MAX_BLOCKS)
     }
     /// Read-only diagnostic while firmware is halted. In particular this
     /// does not reset the high-water counter as automatic_target() does.
