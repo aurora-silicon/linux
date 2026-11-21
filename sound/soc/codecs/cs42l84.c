@@ -40,6 +40,8 @@
 #include "cs42l84.h"
 #include "cirrus_legacy.h"
 
+#define CS42L84_INIT_WRITES_MAX 32
+
 struct cs42l84_private {
 	struct regmap *regmap;
 	struct device *dev;
@@ -58,6 +60,9 @@ struct cs42l84_private {
 	bool remote_active;
 	/* macOS's detect scheme: plug state from ring sense, tip sense masked */
 	bool ring_detect;
+	/* apple,init-writes as probe applied them, for the resume after a reset */
+	u16 init_writes[CS42L84_INIT_WRITES_MAX * 2];
+	int n_init_writes;
 	unsigned int remote_btn1_prev;
 	unsigned int remote_short_prev;
 	struct delayed_work remote_poll_work;
@@ -1203,8 +1208,6 @@ static void cs42l84_ring_detect_setup(struct cs42l84_private *cs42l84)
  * check, from the device tree's apple,init-writes: 16-bit (register, value)
  * pairs, applied in order. Machines without the property are unchanged.
  */
-#define CS42L84_INIT_WRITES_MAX 32
-
 static int cs42l84_apply_init_writes(struct cs42l84_private *cs42l84)
 {
 	struct device *dev = cs42l84->dev;
@@ -1236,6 +1239,8 @@ static int cs42l84_apply_init_writes(struct cs42l84_private *cs42l84)
 			return ret;
 	}
 
+	memcpy(cs42l84->init_writes, seq, n * sizeof(seq[0]));
+	cs42l84->n_init_writes = n;
 	dev_dbg(dev, "%d init writes\n", n / 2);
 	/*
 	 * macOS's probe sequence leaves the codec in macOS's detect setup,
@@ -1244,6 +1249,23 @@ static int cs42l84_apply_init_writes(struct cs42l84_private *cs42l84)
 	 */
 	cs42l84->ring_detect = true;
 	return 0;
+}
+
+/*
+ * The chip is out of reset again: give it the pairs first and in list order,
+ * as probe did. They go past the cache, which still holds them and whatever
+ * the driver has written since, for the sync that follows.
+ */
+static int cs42l84_replay_init_writes(struct cs42l84_private *cs42l84)
+{
+	int i, ret = 0;
+
+	regcache_cache_bypass(cs42l84->regmap, true);
+	for (i = 0; i < cs42l84->n_init_writes && !ret; i += 2)
+		ret = regmap_write(cs42l84->regmap, cs42l84->init_writes[i],
+				   cs42l84->init_writes[i + 1]);
+	regcache_cache_bypass(cs42l84->regmap, false);
+	return ret;
 }
 
 static int cs42l84_i2c_probe(struct i2c_client *i2c_client)
@@ -1466,6 +1488,10 @@ static int cs42l84_resume(struct device *dev)
 
 	/* The revision was read into the cache at probe; it isn't ours to write. */
 	regcache_drop_region(cs42l84->regmap, CS42L84_REVID, CS42L84_REVID);
+
+	ret = cs42l84_replay_init_writes(cs42l84);
+	if (ret)
+		goto err;
 
 	ret = regcache_sync(cs42l84->regmap);
 	if (ret)
