@@ -5632,6 +5632,19 @@ static int atcphy_usb3_port_on(struct apple_atcphy *atcphy, struct atcphy_usb3_p
  * root hub, and only while the PIPE is on the USB3 backend of a running host.
  * The work is freezable, so it waits across system sleep, and is cancelled on
  * removal.
+ *
+ * What is retried is a failed request to a running root hub: out of memory
+ * for the control request, a runtime resume of the hub or its port that
+ * failed, or a controller or hub driver not bound yet (-EAGAIN). Nothing
+ * signals that such a request would now succeed, hence the backoff: 100, 200,
+ * 400, 800 and 1600 ms, about 3 s in all, then a warning. Each failed
+ * power-on is logged by atcphy_usb3_port_on() as it happens.
+ *
+ * Nothing is retried for a port that is not held off: there is no power-on
+ * to owe. Nor once the host or its root hub is gone or is not this PHY's
+ * (-ENODEV, -ESHUTDOWN): a new host powers the ports of its root hubs itself
+ * as it starts, and atcphy_usb3_set_mode() then drops the debt, so a retry
+ * could only end in the warning.
  */
 #define ATCPHY_USB3_PORT_RETRIES	5
 #define ATCPHY_USB3_PORT_RETRY_MS	100
@@ -5648,6 +5661,13 @@ static void atcphy_usb3_port_retry(struct apple_atcphy *atcphy, bool restart, in
 	unsigned int retry = 0;
 
 	scoped_guard(mutex, &atcphy->lock) {
+		if (!atcphy->usb3_port_off)
+			return;
+		if (err == -ENODEV || err == -ESHUTDOWN) {
+			dev_dbg(atcphy->dev,
+				"SuperSpeed port left to the next host: %d\n", err);
+			return;
+		}
 		if (restart)
 			atcphy->usb3_port_retries = ATCPHY_USB3_PORT_RETRIES;
 		if (!atcphy->usb3_port_retries) {
@@ -7259,8 +7279,15 @@ static int atcphy_common_restore(struct apple_atcphy *atcphy)
 	ret = atcphy_configure(atcphy, mode);
 	if (!ret || mode == APPLE_ATCPHY_MODE_USB2)
 		return ret;
-	/* USB2 keeps the hub; the mux update after the wake then tries the mode again. */
-	dev_warn(atcphy->dev, "mode %d not set up again after the sleep (%d): USB2 for now\n",
+	/*
+	 * USB2 keeps the hub. After a sleep in place, atcphy_sleep_ss_up()
+	 * applies the mode the mux last asked for again once the controller is
+	 * back, and warns if that fails too; after a power cycle outside one,
+	 * only the next Type-C event does. Why the set-up can fail here is not
+	 * known yet, see https://github.com/aurora-silicon/linux/issues/2314.
+	 */
+	dev_warn(atcphy->dev,
+		 "mode %d not set up again after the sleep (%d): USB2 until the mode is applied again\n",
 		 mode, ret);
 	return atcphy_configure(atcphy, APPLE_ATCPHY_MODE_USB2);
 }
@@ -7474,7 +7501,11 @@ static void atcphy_sleep_ss_up(struct apple_atcphy *atcphy)
 		}
 	}
 	ret = atcphy_mux_update_to(atcphy, mode);
-	dev_dbg(atcphy->dev, "SuperSpeed side back after the sleep, mode %d: %d\n", mode, ret);
+	/* Nothing else applies the mode again before the next Type-C event. */
+	if (ret)
+		dev_warn(atcphy->dev, "mode %d not applied again after the sleep: %d\n", mode, ret);
+	else
+		dev_dbg(atcphy->dev, "SuperSpeed side back after the sleep, mode %d\n", mode);
 }
 
 /* No lane or port change here: anything the sleep needs is done at noirq, in a few ms. */
