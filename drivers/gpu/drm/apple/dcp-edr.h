@@ -44,6 +44,24 @@ static inline u32 dcp_edr_ceiling(u32 fixed)
 	return hm > DCP_EDR_UNITY && hm <= U32_MAX ? hm : 0;
 }
 
+/*
+ * The peak a firmware 27 panel's EDR may use: the ADT's @peak nits, limited
+ * to @max_nits when that is set.  Only a peak above the SDR maximum
+ * @sdr_max leaves headroom; otherwise 0, and the panel offers no EDR.  A
+ * cap with an unknown SDR maximum (0: no apple,max-brightness) cannot be
+ * compared with it, so it gives no EDR either.  With the peak at most P, a
+ * swap never asks for more than SDR white or P, whichever is higher
+ * (dcp_edr_target()).
+ */
+static inline u32 dcp_edr_peak(u32 peak, u32 sdr_max, u32 max_nits)
+{
+	if (peak > 10000 || (max_nits && !sdr_max))
+		return 0;
+	if (max_nits)
+		peak = min(peak, max_nits);
+	return peak > sdr_max ? peak : 0;
+}
+
 /* The headroom the panel has above @sdr nits: peak / sdr, up to @ceiling. */
 static inline u32 dcp_edr_target(u32 peak, u32 sdr, u32 ceiling)
 {
