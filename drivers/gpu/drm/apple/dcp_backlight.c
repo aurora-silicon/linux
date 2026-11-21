@@ -540,13 +540,27 @@ int dcp_backlight_wake_lit(struct apple_dcp *dcp)
 	return ret;
 }
 
+/* Called with the lock held; warns if a refused level gets no more presents. */
+static unsigned int dcp_backlight_retry_delay_locked(struct apple_dcp *dcp)
+{
+	struct dcp_backlight_state *state = &dcp->backlight.state;
+
+	lockdep_assert_held(&dcp->backlight.lock);
+	if (dcp_bl_retry_exhausted(state))
+		dev_warn_ratelimited(dcp->dev,
+				     "backlight: %u nits refused %u times, %u presents refused in total; waiting for the next present\n",
+				     dcp_bl_effective(state), DCP_BL_RETRY_MAX + 1,
+				     state->refused);
+	return dcp_bl_retry_delay(state);
+}
+
 unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp)
 {
 	unsigned long flags;
 	unsigned int delay;
 
 	spin_lock_irqsave(&dcp->backlight.lock, flags);
-	delay = dcp_bl_retry_delay(&dcp->backlight.state);
+	delay = dcp_backlight_retry_delay_locked(dcp);
 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	return delay;
 }
@@ -614,7 +628,7 @@ void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,
 	finished = dcp_bl_swap_finish(&dcp->backlight.state,
 				      &dcp->desktop->backlight, id, reply, accepted);
 	changed = previous != dcp_bl_actual(&dcp->backlight.state);
-	delay = dcp_bl_retry_delay(&dcp->backlight.state);
+	delay = finished ? dcp_backlight_retry_delay_locked(dcp) : 0;
 	pending = dcp->backlight.state.dirty;
 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	if (changed)

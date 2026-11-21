@@ -25,7 +25,10 @@ struct dcp_backlight_state {
 	/* Firmware observations confirm output; they never become user requests. */
 	u32 reported;
 	u64 sequence;
+	/* Deferred presents of the current request after a refusal. */
 	u8 retries;
+	/* Presents carrying a level that the firmware refused, in total. */
+	u32 refused;
 	bool ready;
 	bool controlled;
 	/* An unchanged registration default cannot take over an unknown level. */
@@ -52,6 +55,23 @@ struct dcp_backlight_present {
 	u64 sequence;
 	u32 nits;
 };
+
+/*
+ * The level rides on a present; there is no separate brightness write.  It
+ * is taken once the firmware has accepted the swap and completed it, and
+ * dcp_bl_complete() is called on exactly those events.  A present can still
+ * be refused: swap_submit answers a non-zero status, or the swap watchdog
+ * retires a present the firmware never completed.  Both are logged where
+ * they happen.  The firmware gives no reason for a refusal and sends nothing
+ * that says when a present would be taken, so on a static display (no other
+ * present coming) the refused level is presented again after
+ * DCP_BL_RETRY_BASE_MS ms, doubling each time, at most DCP_BL_RETRY_MAX
+ * times per request.  After that it stays pending for the next present or
+ * request, and dcp_backlight_retry_delay() warns.  The cause of refusals is
+ * not known yet: https://github.com/aurora-silicon/linux/issues/2332
+ */
+#define DCP_BL_RETRY_MAX	3U
+#define DCP_BL_RETRY_BASE_MS	100U
 
 /*
  * Public powerlog reports use millinits.  A report slightly above the panel
@@ -303,7 +323,8 @@ static inline bool dcp_bl_complete(struct dcp_backlight_state *state,
 		state->level_known = true;
 	} else {
 		state->dirty = true;
-		if (state->retries < 4)
+		state->refused++;
+		if (state->retries <= DCP_BL_RETRY_MAX)
 			state->retries++;
 	}
 	return true;
@@ -316,13 +337,20 @@ static inline int dcp_bl_reported_actual(const struct dcp_backlight_state *state
 	return state->actual;
 }
 
-/* Three deferred retries per user request; a permanent rejection stays dirty. */
+/* A refused level that has used up its deferred presents. */
+static inline bool dcp_bl_retry_exhausted(const struct dcp_backlight_state *state)
+{
+	return state->ready && state->dirty && !state->in_flight &&
+	       state->retries > DCP_BL_RETRY_MAX;
+}
+
+/* Delay before the next deferred present of a refused level, 0 for none. */
 static inline unsigned int dcp_bl_retry_delay(const struct dcp_backlight_state *state)
 {
 	if (!state->ready || !state->dirty || state->in_flight ||
-	    !state->retries || state->retries > 3)
+	    !state->retries || state->retries > DCP_BL_RETRY_MAX)
 		return 0;
-	return 100U << (state->retries - 1);
+	return DCP_BL_RETRY_BASE_MS << (state->retries - 1);
 }
 
 /* A desktop present can complete before its submit reply arrives. */
