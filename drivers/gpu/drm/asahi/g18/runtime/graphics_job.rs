@@ -8,9 +8,27 @@ use crate::{g18::buffer::object::MappedObject, g18::runtime::graphics_memory::G1
         G18ParameterBuffer, G18PbAddresses, G18PbPolicy, G18QueuedPass, G18PbReadback}};
 use crate::{driver::AsahiDrmDevice, g18::fw::render_params::G17pRenderParameters,
     g18::address_map as va, g18::fw::render as regs, g18::fw::render_command as cmd,
-    g18::fw::render_assembly::{self as assembly, EncodedJob, RenderVariant}, mmu};
+    g18::fw::render_assembly::{self as assembly, RenderVariant}, g18::fw::sksm::M5SksmRce, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
+
+/// An encoded render: its RCE records and the cached copy of its TA and 3D
+/// commands, as copied to the graph. The copy (`G18_TA_COMMAND_BYTES` +
+/// `G18_3D_COMMAND_BYTES`, about 11 KiB) lives as long as the job, so the
+/// audits can compare the graph's read-back with it.
+pub(crate) struct EncodedJob { pub rce: [[M5SksmRce; 4]; 2], commands: KVec<u8> }
+
+impl EncodedJob {
+    /// The TA and the 3D command.
+    pub(crate) fn commands(&self) -> (&[u8], &[u8]) {
+        self.commands.split_at(cmd::G18_TA_COMMAND_BYTES)
+    }
+    /// The [`assembly::digests`] of the commands, for the logs.
+    pub(crate) fn digests(&self) -> [u64; 7] {
+        let (ta, fragment) = self.commands();
+        assembly::digests(ta, fragment)
+    }
+}
 
 pub(crate) struct G18GraphicsJob {
     // Payload's context lease retracts before the additional job mappings drop.
@@ -225,15 +243,13 @@ impl G18GraphicsJob {
             let digest=self.program.terminated_digest(self.parameters.encoder)?;
             dev_info!(dev.as_ref(), "G18_RENDER_DIGEST name=terminated-vdm-page fnv={:#018x}\n",digest);
         }
-        let expected=self.encoded.as_ref().ok_or(EINVAL)?.digests;
+        let (ta_expected,fr_expected)=self.encoded.as_ref().ok_or(EINVAL)?.commands();
         self.graph.with_bytes_mut(|bytes| {
             let ta=&bytes[..cmd::G18_TA_COMMAND_BYTES];
             let fr=&bytes[assembly::FRAGMENT_OFFSET..assembly::FRAGMENT_OFFSET+cmd::G18_3D_COMMAND_BYTES];
-            let f=crate::g18::fw::graphics_payload::fnv64;
-            let actual=[f(ta),f(fr),f(&ta[0x60..0x60+91*12]),f(&fr[0xa0..0xa0+92*12]),
-                f(&fr[0x7c0..0x7c0+17*12]),f(&fr[0xee0..0xee0+24*12]),f(&fr[0x1600..0x1600+12*12])];
-            if actual!=expected {return Err(EIO);}
-            for (name,digest) in assembly::DIGEST_NAMES.iter().zip(actual) {
+            if ta!=ta_expected || fr!=fr_expected {return Err(EIO);}
+            // Equal to the read-back: hash the cached copy, not the write-combined graph.
+            for (name,digest) in assembly::DIGEST_NAMES.iter().zip(assembly::digests(ta_expected,fr_expected)) {
                 dev_info!(dev.as_ref(), "G18_RENDER_DIGEST name={} fnv={:#018x}\n",name,digest);
             }
             Ok(())
@@ -304,11 +320,12 @@ impl G18GraphicsJob {
         unsafe { core::ptr::write_bytes(workspace.as_mut_ptr(), 0, 1); }
         let mut workspace = unsafe { workspace.assume_init() };
         // Encode in cached memory and copy the commands to the write-combined
-        // graph at once: the encoder and its digests read what they write.
+        // graph at once: the encoder reads what it writes. The cached copy is
+        // kept for the audit's comparison.
         let mut commands = KVec::from_elem(0u8, cmd::G18_TA_COMMAND_BYTES + cmd::G18_3D_COMMAND_BYTES,
             GFP_KERNEL)?;
         let (ta, fragment) = commands.split_at_mut(cmd::G18_TA_COMMAND_BYTES);
-        let encoded = assembly::encode_into(ta.try_into().map_err(|_| EINVAL)?,
+        let rce = assembly::encode_into(ta.try_into().map_err(|_| EINVAL)?,
             fragment.try_into().map_err(|_| EINVAL)?,
             &self.parameters, &self.controls, inputs, &mut workspace).map_err(|_| EINVAL)?;
         self.graph.with_bytes_mut(|bytes| {
@@ -317,7 +334,7 @@ impl G18GraphicsJob {
             rest[..cmd::G18_3D_COMMAND_BYTES].copy_from_slice(fragment);
             Ok(())
         })?;
-        self.encoded = Some(encoded);
+        self.encoded = Some(EncodedJob { rce, commands });
         fence(Ordering::SeqCst);
         Ok(())
     }
