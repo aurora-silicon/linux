@@ -620,3 +620,13 @@
 		};
 	};
 };
+
+/*
+ * Keyboard backlight on macOS's scale: its levels 0.0625..1.0 drive
+ * 69..336 of 960 PWM cycles, on = 52 + 284 * level, so the top level is
+ * 35 % duty and the line starts at 5.42 %.
+ */
+&kbd_led {
+	min-duty-cycle-bp = <542>;
+	max-duty-cycle-bp = <3500>;
+};
