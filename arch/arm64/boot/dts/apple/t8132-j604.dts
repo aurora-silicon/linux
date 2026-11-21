@@ -199,7 +199,7 @@
 	label = "USB-C Left Rear";
 };
 
-/* hpm3 is ATC3's port controller; hpm5, the MagSafe port's, is not wired. */
+/* hpm3 is ATC3's port controller. The MagSafe port's, hpm5, is in t8132-laptop.dtsi. */
 &nub_spmi_a1 {
 	status = "okay";
 
