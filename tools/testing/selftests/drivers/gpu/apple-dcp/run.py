@@ -64,6 +64,7 @@ def main():
         ('lifecycle', 'desktop-modeset-unmap', desktop.modeset_unmap, ((),), ()),
         ('lifecycle', 'desktop-unknown-modeset-recovery', desktop.modeset_unknown, ((),), ()),
         ('display', 'panel-backlight-ramp', display.backlight, ((),), ()),
+        ('display', 'panel-dac-words', display.dac_words, ((),), ()),
         ('display', 'panel-takeover-registration', desktop.brightness_takeover, ((),), ()),
         ('display', 'panel-brightness-commit', display.brightness_commit, ((),), ()),
         ('display', 'camera-indicator-dpms', display.indicator_dpms, ((),), ()),

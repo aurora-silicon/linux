@@ -222,6 +222,71 @@ int main(void)
 '''
 
 
+
+def dac_words(root):
+    """The production DAC tables, interpolate() and calculate_dac() at every level."""
+    import re
+    source = (root / 'drivers/gpu/drm/apple/dcp_backlight.c').read_text()
+    defines = '\n'.join(re.findall(r'^#define (?:MIN|MAX)_BRIGHTNESS_PART[12]\s.*$', source, re.M))
+    tables = '\n'.join(re.findall(r'^static u32 brightness_part[0-9]+\[\] = \{.*?\};', source, re.M | re.S))
+    functions = '\n'.join(block(source, marker) for marker in (
+        'static u32 interpolate(', 'static u32 calculate_dac('))
+    return r"""
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+typedef uint32_t u32;
+typedef uint64_t u64;
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define WARN(c, ...) (c)
+#define SCALE_FACTOR (1 << 10)
+struct apple_dcp;
+""" + defines + '\n' + tables + '\n' + functions + r"""
+/* Every word is two 16-bit DAC halves, each a table value times 16. */
+static void check_word(u32 word, u32 *hi, u32 *lo)
+{
+    *hi = word >> 16;
+    *lo = word & 0xffff;
+    assert(!(*hi & 0xf) && !(*lo & 0xf));
+    assert(*hi <= 0x7ff0 && *lo <= *hi);
+}
+/* The widest gap between a table word's two halves, times 16. */
+static u32 widest(const u32 *tbl, size_t n, u32 gap)
+{
+    for (size_t i = 0; i < n; i++)
+        if (16 * ((tbl[i] >> 16) - (tbl[i] & 0xffff)) > gap)
+            gap = 16 * ((tbl[i] >> 16) - (tbl[i] & 0xffff));
+    return gap;
+}
+int main(void)
+{
+    u32 prev_hi = 0, prev_lo = 0, hi, lo, gap;
+    gap = widest(brightness_part1, ARRAY_SIZE(brightness_part1), 0);
+    gap = widest(brightness_part12, ARRAY_SIZE(brightness_part12), gap);
+    gap = widest(brightness_part2, ARRAY_SIZE(brightness_part2), gap);
+    /* The table points themselves, as before. */
+    assert(calculate_dac(NULL, 2) == 0);
+    assert(calculate_dac(NULL, MAX_BRIGHTNESS_PART1) == 16 * brightness_part1[ARRAY_SIZE(brightness_part1) - 1]);
+    assert(calculate_dac(NULL, MIN_BRIGHTNESS_PART2) == 16 * brightness_part2[0]);
+    assert(calculate_dac(NULL, MAX_BRIGHTNESS_PART2) == 16 * brightness_part2[ARRAY_SIZE(brightness_part2) - 1]);
+    for (int nits = 0; nits <= (int)MAX_BRIGHTNESS_PART2; nits++) {
+        check_word(calculate_dac(NULL, nits), &hi, &lo);
+        /* Both halves rise with the level; neither picks up the other's fraction. */
+        assert(hi >= prev_hi && lo >= prev_lo);
+        /* The lower half stays the half step below, as in the table. */
+        assert(hi - lo <= gap);
+        prev_hi = hi;
+        prev_lo = lo;
+    }
+    /* 370 nits (J313): the lower half was 0x10a0, a 4 to 5 nit value. */
+    check_word(calculate_dac(NULL, 370), &hi, &lo);
+    assert(hi > 0x7800 && lo > 0x7800);
+    return 0;
+}
+"""
+
+
 def modes(root):
     f = rate.parser_fixture(root)
     # Use the exact production parser and public serializer already used by rate.
