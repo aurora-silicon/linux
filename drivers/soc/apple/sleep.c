@@ -597,6 +597,8 @@ struct apple_sleep_ops {
 	/* After final peer stops: errors are fatal, never a veto. */
 	int (*commit_notice)(struct apple_sleep *s);
 	void (*finish)(struct apple_sleep *s);
+	/* Optional: the PMU's wake steps, after the SMC's first wake commands */
+	void (*pmu_wake)(struct apple_sleep *s);
 	int (*cpu_prepare)(u64 mpidr);
 	void (*cpu_restore)(u64 mpidr);
 	/* Optional: a stopped core's own last steps and WFI at the commit (never returns) */
@@ -6400,6 +6402,9 @@ static void apple_sleep_end(void)
 	sleep_v27_scope_end();
 	if (pm_suspend_via_firmware() && apple_sleep->soc->ops->finish)
 		apple_sleep->soc->ops->finish(apple_sleep);
+	/* Nothing left by now after a wake; the platform wake takes it */
+	if (pm_suspend_via_firmware() && apple_sleep->soc->ops->pmu_wake)
+		apple_sleep->soc->ops->pmu_wake(apple_sleep);
 	if (pm_suspend_via_firmware())
 		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
 }
@@ -6646,6 +6651,8 @@ static void apple_sleep_smc_scope_end(void)
 	ret = s->smc.saved_ops->end(s->smc.data);
 	if (ret)
 		dev_err(s->smc.dev, "SMC state not restored after the sleep: %d\n", ret);
+	else if (s->smc.saved_ops->woken)
+		s->smc.saved_ops->woken(s->smc.data);
 	s->smc.held = false;
 	device_unlock(s->smc.dev);
 }
@@ -6764,7 +6771,10 @@ static void apple_sleep_report(void)
 	sleep_note(s, 0x7e);
 	if (s->soc->ops->finish)
 		s->soc->ops->finish(s);
+	/* AP ON, then the SMC's wake record and waka, then the PMU's wake steps: macOS's order */
 	apple_sleep_smc_scope_end();
+	if (s->soc->ops->pmu_wake)
+		s->soc->ops->pmu_wake(s);
 	sleep_v27_scope_end();
 	s->smc_woke_alone = false;
 	if (!s->returned)
