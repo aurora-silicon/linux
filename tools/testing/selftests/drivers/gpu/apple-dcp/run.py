@@ -119,6 +119,7 @@ def main():
         ('phy', 'pipe', phy.pipe, tuple((c,) for c in ('backend', 'host', 'mux', 'same', 'park', 'requested', 'scope')), ()),
         ('phy', 'unwind', phy.unwind, ((),), ()),
         ('phy', 'aux', phy.aux, ((),), ()),
+        ('phy', 't6050-warm-activate', phy.t6050_warm_activate, ((),), ()),
         ('lifecycle', 'physical-disconnect', lifecycle.disconnect, ((),),
          ('-Wno-unused-variable', '-Wno-unused-function', '-Wno-unused-but-set-variable')),
         ('lifecycle', 'fast-replug-bounce', lifecycle.bounce, ((),),
