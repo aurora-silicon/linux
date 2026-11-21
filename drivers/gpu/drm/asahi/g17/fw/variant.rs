@@ -27,6 +27,17 @@ pub(crate) enum InitAck {
     Status,
 }
 
+/// The InitData layouts of an M5 firmware build ([`super::m5::initdata`]). The 27.2 and later
+/// layouts are not yet confirmed from captured InitData.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum M5Layouts {
+    /// The 26A428 graph: version word 0x0c8e_0339_8728_04c0 and its allocation sizes.
+    V26A428,
+    /// The 27.2 (26B123) graph: version word 0x0c8e_4339_8728_04c0, a larger power policy
+    /// (0x12728) and status config (0x790), the 26A428 HW data.
+    V26B123,
+}
+
 /// The initialization graph of a firmware build.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InitGraph {

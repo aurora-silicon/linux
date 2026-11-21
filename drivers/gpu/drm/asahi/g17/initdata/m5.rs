@@ -70,16 +70,19 @@ impl InitData {
         // 26A428 one (0x6d0 bytes) has no such table.
         if self.graph.is_common26() { return Ok(()); }
         let private = self.object(self.cluster)?;
-        let base = m::M5_PRIVATE_LAYOUT.status_config;
+        let status_config = self.graph.profile.m5_status_config();
+        let base = self.graph.private.status_config;
+        let history_at = status_config.relocate(m::M5_STATUS_CONFIG_HISTORY).ok_or(EINVAL)?;
+        let generation_at = status_config.relocate(m::M5_STATUS_CONFIG_HISTORY_GENERATION).ok_or(EINVAL)?;
         for _ in 0..64 {
-            let generation = private.word(base + 0x74c)?.load(Ordering::Acquire);
+            let generation = private.word(base + generation_at)?.load(Ordering::Acquire);
             if generation & 1 != 0 { core::hint::spin_loop(); continue; }
             // The firmware moves the generation around every change of the geometry: while it
             // reads as it did, the geometry read under it stands, without four more loads.
             let (period, count) = match self.history_geometry.get() {
                 Some((seen, period, count)) if seen == generation => (period, count),
                 _ => {
-                    let config = private.read_words::<4>(base + 0x73c)?;
+                    let config = private.read_words::<4>(base + history_at)?;
                     fence(Ordering::Acquire);
                     if generation != private.word(base + 0x74c)?.load(Ordering::Acquire) {
                         core::hint::spin_loop(); continue;
@@ -210,9 +213,11 @@ impl InitData {
                 .map_err(|_| EINVAL)?;
         } else {
             m::encode_m5_region_c(self.object_mut(self.region_c)?.bytes_mut()).map_err(|_| EINVAL)?;
-            m::encode_m5_private_cluster(PRIVATE, FWCTL,
+            m::encode_m5_private_cluster(self.graph.profile, PRIVATE, FWCTL,
                 &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total]).map_err(|_| EINVAL)?;
         }
+        let layout = self.graph.profile.m5_layout().ok_or(EINVAL)?;
+        let hw_data_size = layout.hw_data_size();
         let windows = board.register_windows();
         let windows = &windows[..board.register_window_count()];
         for (index, window) in windows.iter().enumerate() {
@@ -236,16 +241,17 @@ impl InitData {
         let views = m::PrimaryRegionViews {
             sentinel_high: BASE + 0xc07e_0000, alias_high: [PB, UMA],
         };
-        m::encode_m5_hw_data(board, completions, QOS, windows,
-            &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE]).map_err(|_| EINVAL)?;
+        m::encode_m5_hw_data(layout, board, completions, QOS, windows,
+            &mut self.object_mut(self.bundle)?.bytes_mut()[..hw_data_size])
+            .map_err(|_| EINVAL)?;
         m::set_m5_kick_shared(board,
-            &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], KICK_SHARED)
+            &mut self.object_mut(self.bundle)?.bytes_mut()[..hw_data_size], KICK_SHARED)
             .map_err(|_| EINVAL)?;
         let masked_cores: u32 = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
         let enabled_cores = if masked_cores != 0 { masked_cores }
             else { id.num_clusters.checked_mul(id.num_cores).ok_or(EOVERFLOW)? };
-        m::set_m5_enabled_cores(board,
-            &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], enabled_cores)
+        m::set_m5_enabled_cores(layout,
+            &mut self.object_mut(self.bundle)?.bytes_mut()[..hw_data_size], enabled_cores)
             .map_err(|_| EINVAL)?;
         let bindings = m::M5PolicyBindings {
             state: PRIVATE + private.policy_state as u64, aon_ptd: aon_va, boot_timestamp: 0,
@@ -253,8 +259,19 @@ impl InitData {
         if common26 {
             m::encode_common26_bundle_policy(board, bindings, self.object_mut(self.bundle)?.bytes_mut())
         } else {
-            m::encode_m5_bundle_policy(bindings, self.object_mut(self.bundle)?.bytes_mut())
+            m::encode_m5_bundle_policy(layout, bindings, self.object_mut(self.bundle)?.bytes_mut())
         }.map_err(|_| EINVAL)?;
+        if !common26 {
+            // The M5 encoders write the 26A428 form; a later build's policy map lays it out
+            // in place. For 26A428 the map has no bands and this changes nothing.
+            let policy_map = m::m5_policy(self.graph.profile.m5_layouts().ok_or(EINVAL)?);
+            let policy_start = self.graph.shared.policy;
+            let policy_size = self.graph.policy_size;
+            m::relayout_m5_policy(policy_map, board, board.controller_defaults.is_some(),
+                &mut self.object_mut(self.bundle)?.bytes_mut()
+                    [policy_start..policy_start + policy_size])
+                .map_err(|_| EINVAL)?;
+        }
         if let Some(defaults) = board.controller_defaults {
             defaults(self.object_mut(self.bundle)?.bytes_mut()).map_err(|_| EINVAL)?;
             let maximum = self.object(self.bundle)?.word(shared.policy + m::M5_POLICY_MAXIMUM_POWER)?
