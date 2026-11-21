@@ -177,20 +177,30 @@ ATC_RPM = ('atcphy_rpm_get', 'atcphy_rpm_busy', 'atcphy_rpm_sync', 'atcphy_rpm_p
 
 def atc_cio_helpers(source):
     """The PIPE backend of a mode, which T8132 CIO keeps on the dummy one, and
-    whether a T8132 port is wired for DP alt mode.
+    whether a T8132 port is wired for DP alt mode, and the USB2 mode of a device
+    role without SuperSpeed device mode.
 
     The mux and PIPE functions call these; older sources have none: ''.
     """
     result = ''
     for name in ('atcphy_mode_is_cio', 'atcphy_pipe_state_for',
-                 'atcphy_usb2_sig_host', 'atcphy_t8132_dp_on'):
+                 'atcphy_usb2_sig_host', 'atcphy_t8132_dp_on', 'atcphy_usb2_device_mode'):
         marker = re.search(r'^static [^;{}()]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M)
         if marker:
             helper = block(source, marker.start())
             if name == 'atcphy_usb2_sig_host':
                 helper = helper.replace('static u32',
                                         'static __attribute__((unused)) u32', 1)
+            if name == 'atcphy_usb2_device_mode':
+                # Only units with the mux mapping or the USB3 set_mode call it.
+                helper = helper.replace('static enum',
+                                        'static __attribute__((unused)) enum', 1)
             result += helper + '\n'
+    # atcphy_usb3_set_mode() serves a no-SuperSpeed-device role on USB2 through
+    # atcphy_mux_switch(), which the source defines further down.
+    prototype = re.search(r'^static int atcphy_mux_switch\([^;{}]*\);', source, re.M)
+    if prototype:
+        result += prototype.group() + '\n'
     return result
 
 
