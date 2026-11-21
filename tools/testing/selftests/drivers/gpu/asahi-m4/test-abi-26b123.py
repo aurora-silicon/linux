@@ -121,9 +121,9 @@ def expect_initdata(old_image):
             assert not any(after[0x2c8:0x2d0])
             after[0x2c8:0x2d0] = old[MAIN][0xe88:0xe90]
         if index == POWER_PERFORMANCE:
-            # 26B123 power-up state selector (+0xa4) plus ADT-derived low-peak (PPM) limiter
-            # and average-power sampling filter words.
-            for at, value in ((0xa4, 1), (0xa80, 8), (0xa8c, 0x3f000000), (0xa94, 0x3f000000),
+            # 26B123 power-up words (+0x9c..+0xa8, +0xa4 selects the powered-up state) plus
+            # ADT-derived low-peak (PPM) limiter and average-power sampling filter words.
+            for at, value in ((0x9c, 1), (0xa0, 1), (0xa4, 1), (0xa8, 1), (0xa80, 8), (0xa8c, 0x3f000000), (0xa94, 0x3f000000),
                               (0xa9c, 0x3c86378d), (0xaa8, 0x47800000), (0xaac, 0x3f031200),
                               (0xad8, 0x10), (0xae0, 0x5dc00), (0x29e4, 116), (0x29f0, 0x3f772c23),
                               (0x29f8, 0x3d0d3dcb), (0x2b48, 8333), (0x2bbc, 0x46023400),
