@@ -32,12 +32,18 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
     #define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
     #define dev_err(...) ((void)0)
     #define MAX_NOTCH_HEIGHT 100
-    struct device_node {const char *compatible;};
+    struct device_node {const char *compatible;struct device_node *panel;};
+    #define __free(x)
     struct device {struct device_node *of_node;};
     static const char *machine;
     static bool of_device_is_compatible(const struct device_node *n,const char *c){return !strcmp(n->compatible,c);}
-    static bool of_machine_is_compatible(const char*c){return !strcmp(machine,c);}
-    static struct device_node fb={"simple-framebuffer"},dcp={"apple,t8122-dcp"};
+    static bool __attribute__((unused)) of_machine_is_compatible(const char*c){return !strcmp(machine,c);}
+    /* The board DT's panel node under the DCP: its compatible names the panel. */
+    static struct device_node panel={"apple,panel-j615"};
+    static struct device_node fb={"simple-framebuffer"},dcp={"apple,t8122-dcp",&panel};
+    static struct device_node *of_get_child_by_name(const struct device_node*n,const char*name){return strcmp(name,"panel")?NULL:n->panel;}
+    /* A machine and the panel compatible its device tree gives. */
+    static void board(const char*m,const char*p){machine=m;panel.compatible=p;}
     static u32 width,height,stride,notch,marker_value=1;
     static const char *image_uuid;
     static int of_property_read_string(struct device_node*n,const char*k,const char**v){*v=image_uuid;return 0;}
@@ -71,7 +77,7 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
      uuid_gate=probe[probe.index('\tif (of_property_read_string(np, "apple,firmware-uuid"'):probe.index('\tif (!iommu_get_domain_for_dev(dev))')]
      gate='static int probe_gate(struct device *dev,const struct dcp_v14_board *board){struct device_node *np=dev->of_node;const char *uuid=NULL;u32 marker=0;'+uuid_gate+'return 0;}\n'
      tests=r'''int main(void){
-     struct device dev={&dcp};machine="apple,j615";
+     struct device dev={&dcp};board("apple,j615","apple,panel-j615");
      const struct dcp_v14_board *b=iomfb_v14_7_board(&dev);
     #ifdef OLD
      assert(IS_ERR(b));puts("old J615 board selection rejects: PASS");return 0;
@@ -84,11 +90,11 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
      image_uuid="unknown";assert(probe_gate(&dev,b)==-ENODEV);
      image_uuid=b->firmware_uuid;marker_value=0;assert(probe_gate(&dev,b)==-ENODEV);marker_value=2;assert(probe_gate(&dev,b)==-ENODEV);marker_value=1;
      assert(b->ctm_set==A(421) && b->ctm_get==A(420));
-     machine="apple,j613";const struct dcp_v14_board*j=iomfb_v14_7_board(&dev);
+     board("apple,j613","apple,panel-j613");const struct dcp_v14_board*j=iomfb_v14_7_board(&dev);
      assert(!IS_ERR(j)&&j->panel_width==2560 && j->panel_height==1664);
-     machine="apple,j700";assert(IS_ERR(iomfb_v14_7_board(&dev)));
-     machine="apple,j504";assert(IS_ERR(iomfb_v14_7_board(&dev)));
-     dcp.compatible="apple,t6030-dcp";machine="apple,j516s";assert(iomfb_v14_7_board(&dev)==&dcp_v14_board_t6030);
+     board("apple,j700","apple,panel-j700");assert(IS_ERR(iomfb_v14_7_board(&dev)));
+     board("apple,j504","apple,panel-j504");assert(IS_ERR(iomfb_v14_7_board(&dev)));
+     dcp.compatible="apple,t6030-dcp";board("apple,j516s","apple,panel-j516");assert(iomfb_v14_7_board(&dev)==&dcp_v14_board_t6030);
      dcp.compatible="apple,t8122-dcp";
      struct apple_dcp_v14 v={.dev=&dev,.board=b};width=2880;height=1800;stride=width*4;notch=64;
      assert(dcp_v14_geometry(&v)==0 && v.panel_height==1864);
@@ -99,7 +105,7 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
      width=2560;stride=width*4;assert(dcp_v14_geometry(&v)==-EINVAL);
      width=2880;stride=width*4;notch=101;assert(dcp_v14_geometry(&v)==-EINVAL);
      /* J516C (T6031): its own DCP image, the J516S panel. */
-     dcp.compatible="apple,t6031-dcp";machine="apple,j516c";
+     dcp.compatible="apple,t6031-dcp";board("apple,j516c","apple,panel-j516");
      const struct dcp_v14_board*c=iomfb_v14_7_board(&dev);
      assert(!IS_ERR(c)&&c&&!strcmp(c->name,"J516C")&&c->panel_width==3456&&c->panel_height==2234&&c->promotion);
      assert(!strcmp(c->handoff,"apple,t6031-handoff")&&!c->ctm_set&&!c->ctm_get);
@@ -115,7 +121,7 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
      height=2160;notch=0;assert(dcp_v14_geometry(&m)==-EINVAL);
      notch=74;width=3024;stride=width*4;height=1890;assert(dcp_v14_geometry(&m)==-EINVAL);
      /* J514C is now admitted explicitly; its dimensions come from simplefb. */
-     machine="apple,j514c";
+     board("apple,j514c","apple,panel-j514");
      const struct dcp_v14_board *c14=iomfb_v14_7_board(&dev);
      assert(!IS_ERR(c14)&&c14==&dcp_v14_board_j514c&&c14!=c);
      assert(!strcmp(c14->name,"J514C")&&!strcmp(c14->debugfs,"dcp-j514c"));
@@ -135,10 +141,13 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
      notch=MAX_NOTCH_HEIGHT+1;assert(dcp_v14_geometry(&m14)==-EINVAL);notch=74;
      width=0;stride=0;assert(dcp_v14_geometry(&m14)==-EINVAL);
      dcp.compatible="apple,t8122-dcp";assert(IS_ERR(iomfb_v14_7_board(&dev)));
-     dcp.compatible="apple,t6031-dcp";machine="apple,j514s";assert(IS_ERR(iomfb_v14_7_board(&dev)));
-     machine="apple,j613";assert(IS_ERR(iomfb_v14_7_board(&dev)));
-     machine="apple,j516m";assert(IS_ERR(iomfb_v14_7_board(&dev)));
-     dcp.compatible="apple,t6030-dcp";machine="apple,j516s";assert(iomfb_v14_7_board(&dev)==&dcp_v14_board_t6030);
+     /* T6031 records follow the panel node, not the machine. */
+     dcp.compatible="apple,t6031-dcp";board("apple,j514m","apple,panel-j514");assert(iomfb_v14_7_board(&dev)==c14);
+     board("apple,j516m","apple,panel-j516");assert(iomfb_v14_7_board(&dev)==c);
+     board("apple,j516c","apple,panel-other");assert(IS_ERR(iomfb_v14_7_board(&dev)));
+     dcp.panel=NULL;assert(IS_ERR(iomfb_v14_7_board(&dev)));dcp.panel=&panel;
+     board("apple,j613","apple,panel-j613");assert(IS_ERR(iomfb_v14_7_board(&dev)));
+     dcp.compatible="apple,t6030-dcp";board("apple,j516s","apple,panel-j516");assert(iomfb_v14_7_board(&dev)==&dcp_v14_board_t6030);
      puts("current J615/J613/T6030/J516C/J514C admission + hidden/full notch, wrong geometry controls: PASS");
     #endif
     }
