@@ -54,6 +54,12 @@ impl Layout {
         Self::m5_for(ContextStore::selected(board), !board.g17d_forms())
     }
 
+    /// Bytes of an M5 context state on a part of `clusters` physical clusters: at least those of
+    /// its board's layout, whose store has that many clusters or fewer.
+    pub(in crate::g17) const fn m5_bytes(clusters: usize) -> usize {
+        Self::m5_for(ContextStore::of(clusters), false).bytes
+    }
+
     pub(in crate::g17) fn prepare(self, state: &mut [u8], pass: &RenderPass) -> Result {
         if state.len() < self.bytes { return Err(EINVAL); }
         if let Some(viewport_offset) = self.viewport {

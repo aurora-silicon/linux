@@ -37,6 +37,22 @@ impl Backend {
         })
     }
 
+    /// The render pairs this queue uses for `packet`: its own count, or one for an M5 layout
+    /// whose pairs the client's compact window cannot hold side by side
+    /// ([`crate::g17::pairs::for_window`]).
+    pub(in crate::g17::runtime) fn render_pairs(&self, packet: &Packet) -> u8 {
+        if self.pairs == 1 {
+            return 1;
+        }
+        let window = crate::g17::buffer::BlockGeometry::M5_COMPACT;
+        // SUBMIT derived the same layout without error.
+        let reserved = crate::g17::queue::render::m5_render_submission::layout_and_window(
+            &packet.command, self.shared.clusters, self.shared.variant.programs)
+            .ok().and_then(|(_, reserved)| reserved);
+        crate::g17::pairs::for_window(self.pairs, reserved.map(|bytes| bytes as u64),
+            window.end - window.start)
+    }
+
     pub(in crate::g17) fn render_packet(
         &self,
         packet: &Arc<Packet>,
@@ -87,7 +103,7 @@ impl Backend {
                 if !sleep {
                     return Err(FALLBACK);
                 }
-                match pool.acquire_render(self.owner, self.pairs.into(), Request::of(packet), deadline_ns, || {
+                match pool.acquire_render(self.owner, self.render_pairs(packet).into(), Request::of(packet), deadline_ns, || {
                     // Atomics only: the callback runs under the pool mutex.
                     if packet.cancel_requested() || self.closed.load(Ordering::Acquire) {
                         return Err(ECANCELED);
@@ -190,11 +206,12 @@ impl Backend {
                 Ok(_) => {}
             }
             let request = Request::of(packet);
-            if self.admission.admits_render(self.owner, request) {
+            let pairs = self.render_pairs(packet).into();
+            if self.admission.admits_render(self.owner, pairs, request) {
                 return None;
             }
             let observed = self.shared.renders.observe();
-            if self.admission.admits_render(self.owner, request) {
+            if self.admission.admits_render(self.owner, pairs, request) {
                 return None;
             }
             self.shared.queue_events();
@@ -411,7 +428,7 @@ impl Backend {
             Some(lease) => Some(lease),
             None if known != 0 => self
                 .admission
-                .try_acquire_render(self.owner, self.pairs.into(), Request::of(packet))
+                .try_acquire_render(self.owner, self.render_pairs(packet).into(), Request::of(packet))
                 .ok()
                 .flatten(),
             None => None,
@@ -574,7 +591,7 @@ impl Backend {
         if !self.traversal_inline(packet) {
             return false;
         }
-        let admission = match self.admission.try_acquire_render(self.owner, self.pairs.into(), Request::of(packet)) {
+        let admission = match self.admission.try_acquire_render(self.owner, self.render_pairs(packet).into(), Request::of(packet)) {
             Ok(Some(lease)) => lease,
             _ => return false,
         };
