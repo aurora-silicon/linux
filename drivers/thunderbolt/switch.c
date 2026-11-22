@@ -2640,7 +2640,7 @@ int tb_switch_configure(struct tb_switch *sw)
 
 	/* Set Notification Timeout to 255 ms for all routers */
 	sw->config.plug_events_delay = 0xff;
-	/* TEST: placeholder from run mxt6: macOS enumerates the host and the dock with 10 ms. */
+	/* macOS enumerates the host and the dock with a 10 ms timeout (traced in run mxt6). */
 	if (tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES)
 		sw->config.plug_events_delay = 0x0a;
 	if (tb_switch_is_usb4(sw)) {

@@ -282,7 +282,7 @@ EXPORT_SYMBOL_GPL(apple_dart_cio_off);
 
 int apple_dart_cio_on(struct apple_dart_cio *s)
 {
-	u32 test_word = 0;
+	u32 prot_word = 0;
 	int ret;
 
 	if (!s || !READ_ONCE(s->dart->cio_active))
@@ -342,10 +342,10 @@ int apple_dart_cio_on(struct apple_dart_cio *s)
 		return ret;
 	}
 	s->restored = true;
-	/* TEST (sv6t7): the guard the wake leaves on, until the DART is removed. */
-	regmap_read(s->gapf, APPLE_PS_PROT_SLICE(s->slice), &test_word);
-	dev_info(s->dart->dev, "TEST sv6t7: CIO DART start: PS_PROT slice %u now %#x\n",
-		 s->slice, test_word);
+	/* Diagnostic (sv6t7): the guard the wake leaves on, until the DART is removed. */
+	regmap_read(s->gapf, APPLE_PS_PROT_SLICE(s->slice), &prot_word);
+	dev_dbg(s->dart->dev, "CIO DART start: PS_PROT slice %u now %#x\n",
+		s->slice, prot_word);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dart_cio_on);

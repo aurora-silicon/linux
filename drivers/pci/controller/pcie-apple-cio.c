@@ -144,7 +144,7 @@ static int apple_pcie_cio_resume(struct apple_pcie *pcie)
 }
 
 /*
- * TEST: T6050 PCIe-C, from a macOS sleep and wake with a dock on this port (run mxt4, the
+ * T6050 PCIe-C, as traced from a macOS sleep and wake with a dock on this port (run mxt4, the
  * values as traced). The root port's express capability is at 0x70; the two fabric words and
  * the Intr2AXI word are written by the sleep with no name known for them.
  */
@@ -206,52 +206,7 @@ static u32 apple_pcie_cio_t6050_pme_reg(void)
 }
 
 /*
- * TEST (sv6t9, J714s): what decides L2 on the tunnel's link. The power state of each
- * function below the root port as the port goes down (PME_Turn_Off takes a link to L2 from
- * functions in D3hot), and the PME register and link status as macOS reads them: the
- * register once at once, then until its send bit clears, then the link once.
- */
-struct apple_pcie_cio_test_buf {
-	char *buf;
-	size_t size, len;
-};
-
-static int apple_pcie_cio_test_dstate(struct pci_dev *pdev, void *data)
-{
-	struct apple_pcie_cio_test_buf *b = data;
-
-	b->len += scnprintf(b->buf + b->len, b->size - b->len, " %s %s", pci_name(pdev),
-			    pci_power_name(pdev->current_state));
-	return 0;
-}
-
-static void apple_pcie_cio_test_dstates(struct apple_pcie *pcie)
-{
-	struct pci_host_bridge *bridge = dev_get_drvdata(pcie->dev);
-	char text[384];
-	struct apple_pcie_cio_test_buf b = { .buf = text, .size = sizeof(text) };
-
-	if (!of_machine_is_compatible("apple,j714s"))
-		return;
-	text[0] = '\0';
-	if (bridge && bridge->bus)
-		pci_walk_bus(bridge->bus, apple_pcie_cio_test_dstate, &b);
-	dev_info(pcie->dev, "TEST sv6t9: PCIe-C functions below the tunnel as it goes down:%s\n",
-		 b.len ? text : " none");
-}
-
-static void apple_pcie_cio_test_pme(struct apple_pcie *pcie, u32 reg, u32 first, u32 last,
-				    s64 us, u32 link, int l2)
-{
-	if (!of_machine_is_compatible("apple,j714s"))
-		return;
-	dev_info(pcie->dev, "TEST sv6t9: PCIe-C PME_Turn_Off through +%#x: %#x read at once, %#x after %lld us (send bit %s); LINKSTS %#x, L2 %s (macOS mxt4, mxt5, mxt6b, five sleeps: +0x8c, 0x1 at once, 0x10 after 1.26 ms, LINKSTS 0x99000241 with L2; sv6t5, sv6t7, sv6t8: +0x88, clear in 2 to 4 us, LINKSTS 0x99000001, no L2)\n",
-		 reg, first, last, us, last & PORT_PME_TURN_OFF_SEND ? "still set" : "clear", link,
-		 !l2 ? "reported" : l2 == -ENODATA ? "not looked for" : "not reported");
-}
-
-/*
- * TEST: T6050. macOS takes this port DOWN for a sleep and waits for no link (run mxt4, 6.6 ms
+ * T6050: macOS takes this port DOWN for a sleep and waits for no link (run mxt4, 6.6 ms
  * before the ATC2_PCIE power word goes off, the router still awake): the slot's events off;
  * the port's error interrupts masked and acknowledged; the root port's command and bus
  * numbers 0; the clock gate off and PME_Turn_Off sent (the send bit clears, the link reads
@@ -273,7 +228,6 @@ static int apple_pcie_cio_suspend_t6050(struct apple_pcie *pcie)
 	const char *step;
 	bool idle;
 	u32 stat, link, fabric[2] = {}, i2a = 0, pme_reg = apple_pcie_cio_t6050_pme_reg();
-	u32 pme_first = 0, pme_last = 0;	/* TEST */
 	int i, ret, recover, perst, ready, l2 = -ENODATA;
 	s64 pme_us = 0;
 
@@ -286,7 +240,6 @@ static int apple_pcie_cio_suspend_t6050(struct apple_pcie *pcie)
 		return ret;
 	}
 	dev_info(pcie->dev, "CIO PCIe-C stop (T6050 order)\n");
-	apple_pcie_cio_test_dstates(pcie);
 	apple_pcie_port_disable_irq(port);
 	port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
 	for_each_set_bit(i, port->sid_map, port->sid_map_sz)
@@ -302,13 +255,12 @@ static int apple_pcie_cio_suspend_t6050(struct apple_pcie *pcie)
 	apple_pcie_port_rmw_set(port, PORT_APPCLK_CGDIS, PORT_APPCLK);
 	sent = ktime_get();
 	apple_pcie_port_writel(port, PORT_PME_TURN_OFF_SEND | PORT_PME_TURN_OFF_BIT4, pme_reg);
-	/* TEST: macOS reads the register once at once; printed when the port is down. */
-	pme_first = apple_pcie_port_readl(port, pme_reg);
+	/* macOS reads the register once at once: keep its access order. */
+	apple_pcie_port_readl(port, pme_reg);
 	ret = read_poll_timeout(apple_pcie_port_readl, stat,
 				!(stat & PORT_PME_TURN_OFF_SEND),
 				50, PCIEC_T6050_PME_US, false, port, pme_reg);
 	pme_us = ktime_us_delta(ktime_get(), sent);
-	pme_last = stat;
 	if (ret)
 		goto unwind;
 	/* macOS reads the link once here and goes on: L2 is reported, not required. */
@@ -348,7 +300,6 @@ static int apple_pcie_cio_suspend_t6050(struct apple_pcie *pcie)
 		 ktime_us_delta(ktime_get(), start), pme_us, link,
 		 l2 ? "not reported" : "reported", fabric[0], fabric[1], i2a,
 		 perst ? "not read back" : "read back", ready ? "still ready" : "not ready");
-	apple_pcie_cio_test_pme(pcie, pme_reg, pme_first, pme_last, pme_us, link, l2);
 	return 0;
 unwind:
 	/*
@@ -356,8 +307,6 @@ unwind:
 	 * PME_Turn_Off, or whose state machine was stopped, trains again only behind a
 	 * reset: the port goes down the rest of the way and comes back as after a sleep.
 	 */
-	apple_pcie_cio_test_pme(pcie, pme_reg, pme_first, pme_last, pme_us,
-				apple_pcie_port_readl(port, PORT_LINKSTS), l2);
 	dev_err(pcie->dev,"T6050 sleep: PCIe-C step \"%s\" failed (%d) after %lld us, status %#x, link %#x, events %#x: the port is reset and started again from cold, sleep refused\n",
 		step, ret, ktime_us_delta(ktime_get(), start),
 		apple_pcie_port_readl(port, PORT_STATUS),
