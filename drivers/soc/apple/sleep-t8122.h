@@ -1169,6 +1169,17 @@ static const struct apple_sleep_ops t8122_sleep_ops = {
 	.cpu_restore = t8122_sleep_cpu_restore,
 };
 
+
+/*
+ * TRIAL ONLY (not for #2572): the named domains macOS has off at its commit (run 77) that
+ * Linux leaves on (n103), lowered by the framework's own stray step. The ATC commons, SEP,
+ * the partial ones (SIO_CPU, APCIE_PHY_SW) and the unnamed words are left out.
+ */
+static const struct apple_sleep_word t8122_trial_stray[] = {
+	{ "isp_sys", 0x1e8 }, { "i2c1", 0x238 }, { "i2c2", 0x240 }, { "i2c3", 0x248 },
+	{ "spi2", 0x2a8 }, { "qspi", 0x2c8 },
+};
+
 static const struct apple_sleep_soc t8122_sleep_soc = {
 	.ops = &t8122_sleep_ops,
 	.untested = true,
@@ -1179,6 +1190,8 @@ static const struct apple_sleep_soc t8122_sleep_soc = {
 	.early_context = true,
 	/* The common arm stays off: the trial's switch runs it (t8122_wake_mask). */
 	.own_wake = true,
+	.stray = t8122_trial_stray,
+	.nstray = ARRAY_SIZE(t8122_trial_stray),
 	.wake_optional = true,
 	/* T8140's layout at this base; ids to 208, so seven words. The status offset is unmeasured. */
 	.wake_mask = 0x08,
