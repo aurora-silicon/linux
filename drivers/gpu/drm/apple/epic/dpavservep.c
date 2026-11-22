@@ -44,8 +44,15 @@ static bool dcpavserv_identity(struct apple_epic_service *service, const char *n
 			class && !strcmp(class, "DCPDPService") && service->channel;
 	if (!service->ep->wire_v2)
 		return unit == 0;
+	/*
+	 * A DP-to-HDMI converter's AV service: the generic ones, and the
+	 * MCDP29xx converters that firmware 27 names after their part (the
+	 * M2 Mac mini's HDMI port, and USB-C to HDMI adapters).
+	 */
 	if (!class || (strcmp(class, "AppleDCPDP2HDMI") &&
-		       strcmp(class, "DCPDP13Service")) ||
+		       strcmp(class, "DCPDP13Service") &&
+		       strcmp(class, "AppleDCPMCDP29XX") &&
+		       strcmp(class, "AppleDCPMCDP2900")) ||
 	    !service->channel || service->channel > U16_MAX)
 		return false;
 	/* H17P's lower-case interface-id is dynamic, not a physical-port unit. */
