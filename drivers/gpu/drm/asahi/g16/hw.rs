@@ -741,12 +741,14 @@ pub(crate) mod sizes {
     ///
     /// Sized inside both the host client-VA window (`0x7020000000..0x7040000000`) and firmware
     /// queue/recovery capacities: `47` in-flight passes consume at most `47 * 4 = 188` entries of
-    /// each 256-entry TA/FS work ring (`QUEUE_CAP = 256`, 255 usable, ring cap `63`), share
-    /// hardware UMA slot `RENDER_UMA_SLOT` (33) via the active PB/UMA descriptor, post at most
-    /// `FLIGHTS = 32` `SubmitRecord`s (vs `AHEAD_RECORDS = 128` / `RING_SLOTS = 256`), and stay
-    /// far below the firmware recovery `snapshot_entries = 448` limit.
+    /// each 256-entry TA/FS work ring (`QUEUE_CAP = 256`, 255 usable, ring cap `63`), use
+    /// per-allocator hardware UMA slots `RENDER_UMA_SLOT + slot` (`33..38`, strictly inside the
+    /// firmware render slot range `33..64`), post at most `FLIGHTS = 32` `SubmitRecord`s (vs
+    /// `AHEAD_RECORDS = 128` / `RING_SLOTS = 256`), and stay far below the firmware recovery
+    /// `snapshot_entries = 448` limit.
     pub(crate) const RENDER_SLOTS: usize = 48;
     const _: () = assert!(RENDER_SLOTS >= BASE_RENDER_SLOTS && RENDER_SLOTS <= 64);
+    const _: () = assert!(super::engine::RENDER_UMA_SLOT + (PB_SLOTS as u32) <= 65);
     const _: () = assert!((RENDER_SLOTS - 1) * MAX_RENDER_RING_ENTRIES < QUEUE_CAP as usize);
     const _: () = assert!(super::client::AUX + 0x20000 <= super::client::SCENE_LIST);
     const _: () = assert!(super::client::SCENE_LIST + 0x4000 <= super::client::TPC);

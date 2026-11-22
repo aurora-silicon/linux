@@ -699,6 +699,74 @@ pub mod g16 {
         assert_eq!(p.pick_slot(&vm1,false),Some(0));
     }
 
+    #[test]fn render_allocators_use_distinct_uma_slots_within_firmware_window(){
+        let mut o=Objects::new();
+        let pools=PoolSet::new(&mut o).unwrap();
+        let mut uma_slots=Vec::new();
+        for k in 0..g16::hw::sizes::PB_SLOTS {
+            let alloc=g16::pools::Allocator::new(&mut o,k as u64,pools.heap()).unwrap();
+            let refs=alloc.prepare_in_flight(1,false).unwrap();
+            assert_eq!(refs.parameter_id,k as u32);
+            let desc=o.objects.iter().find(|obj|obj.va==refs.uma_mgr[0]).unwrap();
+            let slot_id=desc.r32(8).unwrap();
+            let expected=g16::hw::engine::RENDER_UMA_SLOT+k as u32;
+            assert_eq!(slot_id,expected);
+            assert!(slot_id>=33 && slot_id<=64);
+            assert!(!uma_slots.contains(&slot_id));
+            uma_slots.push(slot_id);
+            // Tampering with the descriptor UMA slot ID is rejected before publication.
+            desc.write(8,&(expected+1).to_le_bytes()).unwrap();
+            assert_eq!(alloc.prepare_in_flight(1,false).err(),Some(EINVAL));
+        }
+    }
+
+    #[test]fn multi_active_pools_allow_warm_cross_vm_reuse_and_gate_cold_initbm(){
+        let vm1=vm(1);let vm2=vm(2);let vm3=vm(3);
+        let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
+        let mk_epoch=|owner:&sync::Arc<g16::vm::VmState>,slot:usize|{
+            let e=g16::pools::PbEpoch::new(&factory,owner,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
+            e.prepare(slot,0x70c0000000,2048).unwrap();e.check_assignment(slot).unwrap();e.expose();
+            e
+        };
+        let mut p=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        // Prime VM1 on slot 0 and VM2 on slot 1 (drained InitBM).
+        let e1=mk_epoch(&vm1,0);
+        assert_eq!(p.pick_slot_within(&vm1,false,2),Some(0));
+        let b1=p.bind(0,false);p.publish_flight(0);p.retire_flight(0,&e1,b1,true).unwrap();
+        let e2=mk_epoch(&vm2,1);
+        assert_eq!(p.pick_slot_within(&vm2,false,2),Some(1));
+        let b2=p.bind(1,false);p.publish_flight(1);p.retire_flight(1,&e2,b2,true).unwrap();
+        // VM1 starts a render on warm slot 0 (no InitBM).
+        assert_eq!(p.pick_slot_within(&vm1,false,2),Some(0));
+        assert!(p.reusable(0,&vm1).is_some());
+        let b1=p.bind(0,true);p.publish_flight(0);
+        assert_eq!(p.slot_inflight(0),1);
+        assert_eq!(p.slot_inflight(1),0);
+        // While VM1 is live on slot 0 (behind=true):
+        // - Warm VM2 pipelines onto its own slot 1 without InitBM or drain.
+        // - Cold VM3 has no warm slot and returns None so the engine drains before InitBM.
+        assert!(p.can_pipeline_within(&vm2,2));
+        assert_eq!(p.pick_slot_within(&vm2,true,2),Some(1));
+        assert!(!p.can_pipeline_within(&vm3,2));
+        assert_eq!(p.pick_slot_within(&vm3,true,2),None);
+        // VM2 publishes on slot 1 concurrently with VM1 on slot 0.
+        let b2=p.bind(1,true);p.publish_flight(1);
+        assert_eq!(p.slot_inflight(0),1);
+        assert_eq!(p.slot_inflight(1),1);
+        // Neither in-flight slot is displaced while live.
+        assert!(!p.exhausted());
+        // Both retire cleanly in order.
+        p.retire_flight(0,&e1,b1,true).unwrap();
+        assert_eq!(p.slot_inflight(0),0);
+        assert_eq!(p.slot_inflight(1),1);
+        p.retire_flight(1,&e2,b2,true).unwrap();
+        assert_eq!(p.slot_inflight(1),0);
+        // Recovery invalidation clears warm reuse for BOTH slots so both VMs drain for InitBM.
+        p.invalidate();
+        assert!(!p.can_pipeline_within(&vm1,2));
+        assert!(!p.can_pipeline_within(&vm2,2));
+    }
+
     #[test]fn render_hang_after_cross_vm_use_recovers_via_lazy_pb_slot_and_displaces_survivor(){
         let vm1=vm(1);let vm2=vm(2);let vm3=vm(3);let vm4=vm(4);
         let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
@@ -782,7 +850,13 @@ pub mod g16 {
         // 5th hang quarantines slot 4: only slot 5 survives (reuse-only for VM2; other VMs exhausted).
         p.publish_flight(4);
         p.quarantine_flight(4,None);
-        // Slot 5 was the last_clean_retired slot (undisplaced) and slot 4 is quarantined -> exhausted.
+        assert!(!p.exhausted());
+        assert!(!p.exhausted_for(&vm2));
+        assert_eq!(p.pick_slot(&vm2,false),Some(5));
+        assert!(p.exhausted_for(&vm1));
+        assert!(p.exhausted_for(&vm3));
+        // Recovery invalidation clears slot 5's warm epoch -> global pool exhaustion.
+        p.invalidate();
         assert!(p.exhausted());
 
         // Quarantine 5 fresh slots leaving slot 5 fresh: VM2 claims and reuses slot 5 while
