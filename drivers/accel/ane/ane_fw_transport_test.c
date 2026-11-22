@@ -924,6 +924,51 @@ static void ane_transport_shared_total_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->allocs, 12U);
 }
 
+/*
+ * The allocator saying "no room" is a refusal, not a failure: the transport
+ * stays up, the request stays the firmware's to retry, and a command whose
+ * wait died with it frees the channel for the next one.
+ */
+static void ane_transport_shared_refused_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->alloc_error = -ENOSPC;
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+	KUNIT_EXPECT_EQ(test, f->refused_error, -ENOSPC);
+
+	/* The refused entry is consumed; the retry lands behind it and is served. */
+	f->alloc_error = 0;
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 1U);
+
+	/* A wait that died on a refusal leaves the channel free. */
+	f->alloc_error = -ENOMEM;
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_IO), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO), -ENOMEM);
+	KUNIT_EXPECT_FALSE(test, f->t.pending[ANE_FW_IO].active);
+	f->alloc_error = 0;
+	KUNIT_EXPECT_EQ(test, ane_test_publish(f, ANE_FW_IO), 0);
+}
+
+/* An alloc refused while settling does not fail the settle. */
+static void ane_transport_settle_refused_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->t.allow_free = true;
+	f->alloc_error = -ENOSPC;
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_settle(&f->t, 5, 100), 0);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+}
+
 static void ane_transport_shared_report_test(struct kunit *test)
 {
 	struct ane_transport_test *f = test->priv;
@@ -1580,6 +1625,8 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_shared_overlap_test),
 	KUNIT_CASE(ane_transport_shared_count_test),
 	KUNIT_CASE(ane_transport_shared_total_test),
+	KUNIT_CASE(ane_transport_shared_refused_test),
+	KUNIT_CASE(ane_transport_settle_refused_test),
 	KUNIT_CASE(ane_transport_shared_report_test),
 	KUNIT_CASE(ane_transport_irq_test),
 	KUNIT_CASE(ane_transport_match_data_test),
