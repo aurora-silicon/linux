@@ -2771,14 +2771,17 @@ static void bcm4377_reset_work(struct work_struct *work)
 {
 	struct bcm4377_reset_work *rw =
 		container_of(work, struct bcm4377_reset_work, work);
+	int ret;
 
 	/*
 	 * Remove and probe again: probe resets the function and boots the
 	 * firmware from scratch. device_reprobe() frees the old bcm4377_data,
 	 * which is why this work and its device reference live outside it.
 	 */
-	if (device_reprobe(&rw->pdev->dev))
-		dev_err(&rw->pdev->dev, "reprobe after command timeout failed\n");
+	ret = device_reprobe(&rw->pdev->dev);
+	/* A BCM4388 defers until its Wi-Fi function is bound again: the retry binds it. */
+	if (ret && ret != -EPROBE_DEFER)
+		dev_err(&rw->pdev->dev, "reprobe after command timeout failed: %d\n", ret);
 
 	pci_dev_put(rw->pdev);
 	kfree(rw);
@@ -2790,8 +2793,8 @@ static void bcm4377_reset_work(struct work_struct *work)
  * every later command times out until the module is reloaded. Recover the
  * same way, by rebinding the driver.
  */
-static void bcm4377_queue_rebind(struct bcm4377_data *bcm4377,
-				 const char *why)
+static void __bcm4377_queue_rebind(struct bcm4377_data *bcm4377,
+				   const char *why, bool expected)
 {
 	struct hci_dev *hdev = bcm4377->hdev;
 	struct bcm4377_reset_work *rw;
@@ -2813,10 +2816,19 @@ static void bcm4377_queue_rebind(struct bcm4377_data *bcm4377,
 		return;
 	}
 
-	bt_dev_err(hdev, "%s, rebinding the driver", why);
+	if (expected)
+		bt_dev_info(hdev, "%s, rebinding the driver", why);
+	else
+		bt_dev_err(hdev, "%s, rebinding the driver", why);
 	rw->pdev = pci_dev_get(bcm4377->pdev);
 	INIT_WORK(&rw->work, bcm4377_reset_work);
 	queue_work(bcm4377_reset_wq, &rw->work);
+}
+
+static void bcm4377_queue_rebind(struct bcm4377_data *bcm4377,
+				 const char *why)
+{
+	__bcm4377_queue_rebind(bcm4377, why, false);
 }
 
 static void bcm4377_hci_reset(struct hci_dev *hdev)
@@ -3203,8 +3215,10 @@ static int bcm4377_resume(struct device *dev)
 	if (pm_resume_via_firmware() && !bcm4377->dma_window_base) {
 		bcm4377->quiesced = false;
 		bcm4377->resume_powered = false;
+		/* No firmware to take the rings down at the close before the rebind. */
+		bcm4377->needs_reset = true;
 		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
-		bcm4377_queue_rebind(bcm4377, "power lost in the sleep");
+		__bcm4377_queue_rebind(bcm4377, "power lost in the sleep", true);
 		return 0;
 	}
 
