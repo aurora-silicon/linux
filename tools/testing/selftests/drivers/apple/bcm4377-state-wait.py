@@ -43,6 +43,8 @@ static struct bcm4377_data *resetting;
 #define test_and_set_bit(bit,p) ({ unsigned long mask=1UL<<(bit); bool old=*(p)&mask; *(p)|=mask; old; })
 #define clear_bit(bit,p) ((void)(bit),(*(p))=0)
 static void bt_dev_err(struct hci_dev *h,const char *fmt,...) { assert(h && h->data->hdev==h && fmt);errors++; }
+static unsigned infos;
+static void bt_dev_info(struct hci_dev *h,const char *fmt,...) { assert(h && h->data->hdev==h && fmt);infos++; }
 static void *allocate(unsigned size) { allocations++;return allocated=fail_alloc?NULL:calloc(1,size); }
 #define kzalloc_obj(value) allocate(sizeof(value))
 static struct pci_dev *pci_dev_get(struct pci_dev *p) { p->refs++;return p; }
@@ -66,7 +68,8 @@ static int bcm4377_init_cfg(struct bcm4377_data *b) { (void)b;return 0; }
 static int bcm4377_boot(struct bcm4377_data *b) { (void)b;boots++;return 0; }
 static int bcm4377_setup_rti(struct bcm4377_data *b) { (void)b;return 0; }
 '''
-    body = definition(source, 'static void bcm4377_queue_rebind(')
+    body = definition(source, 'static void __bcm4377_queue_rebind(')
+    body += definition(source, 'static void bcm4377_queue_rebind(')
     body += definition(source, 'static void bcm4377_hci_reset(struct hci_dev *hdev)\n{')
     body += definition(source, 'static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)\n{')
     tests = r'''
@@ -87,6 +90,11 @@ int main(void)
     bcm4377_hci_reset(&h);assert(allocations==1 && queued==1);
     h.setup=false;fail_alloc=true;
     bcm4377_hci_reset(&h);assert(!b.reset_pending && allocations==2 && queued==1);
+    /* A rebind the driver expects (power lost in a sleep) is logged as information. */
+    fail_alloc=false;errors=0;
+    __bcm4377_queue_rebind(&b,"power lost",true);
+    assert(allocations==3 && queued==2 && pci.refs==2 && !errors && infos==1 && b.reset_pending);
+    free(allocated);allocated=NULL;b.reset_pending=0;
     struct bcm4377_hw hw={0};struct ring_state ring={.value=99};
     b.hw=&hw;b.ring_state=&ring;b.needs_reset=true;b.dma_window_base=0x10000100000UL;
     errors=0;
@@ -236,7 +244,7 @@ int main(void)
         for control in ["production", "timeout-reprobe", "pci-function-reset"]:
             tested = source
             if control != "production":
-                name = ('static void bcm4377_queue_rebind(' if control == "timeout-reprobe" else
+                name = ('static void __bcm4377_queue_rebind(' if control == "timeout-reprobe" else
                         'static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)\n{')
                 body = definition(source, name)
                 assert body.count('if (bcm4377->dma_window_base) {') == 1
