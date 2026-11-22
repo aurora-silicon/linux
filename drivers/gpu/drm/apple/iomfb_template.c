@@ -2881,6 +2881,9 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 #endif
 	dcp_prepare_clear_swap(dcp, swap);
 #endif
+	/* The clear swap takes the panel to 0 (dcp_prepare_clear_swap()). */
+	if (dcp_has_panel(dcp))
+		dcp_backlight_presented(dcp, 0);
 
 	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
 
@@ -2985,9 +2988,11 @@ void DCP_FW_NAME(iomfb_blank)(struct apple_dcp *dcp)
 	kref_get(&cookie->refcount);
 
 	dcp_prepare_clear_swap(dcp, swap);
-	if (dcp_has_panel(dcp))
+	if (dcp_has_panel(dcp)) {
 		iomfb_encode_backlight_swap_h17p((u8 *)&swap->swap, 0,
 						 dcp->brightness.maximum, true);
+		dcp_backlight_presented(dcp, 0);
+	}
 
 	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
 	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(500));
@@ -4618,10 +4623,12 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			   dcp->brightness.bl_dev->props.brightness :
 			   dcp->brightness.nits;
 
-		if (nits > 0)
+		if (nits > 0) {
 			iomfb_encode_backlight_swap_h17p((u8 *)&req->swap, nits,
 							 dcp->brightness.maximum,
 							 true);
+			dcp_backlight_presented(dcp, nits);
+		}
 #else
 #if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 		req->swap.bl_update = 1;
@@ -4630,6 +4637,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
+		dcp_backlight_presented(dcp, dcp->brightness.level);
 #endif
 		dcp->brightness.update = false;
 	}

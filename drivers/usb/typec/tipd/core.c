@@ -1146,6 +1146,27 @@ static bool cd321x_identity_known(const struct usb_pd_identity *id)
 static void cd321x_macos_usbw(struct cd321x *cd321x);
 static void tipd_boot_host_started(struct tps6598x *tps, enum usb_role role);
 
+/*
+ * DisplayPort pin D comes to a connection whose USB 3 already runs: the partner entered the
+ * mode after the port's first update had set it up for USB. A lane provider that adds pin D
+ * beside a running USB 3 link (typec_mux_dp_joins_usb()) gets the change with the USB role
+ * kept, as macOS keeps the port's host running there and only adds the display. Every other
+ * mode change stops the role first.
+ */
+static bool cd321x_dp_joins_usb(struct cd321x *cd321x, const struct cd321x_status *st)
+{
+	u32 ds = st->data_status;
+
+	return cd321x->state_valid && !cd321x->state.alt &&
+	       cd321x->state.mode == TYPEC_STATE_USB &&
+	       (ds & TPS_DATA_STATUS_DATA_CONNECTION) &&
+	       (ds & TPS_DATA_STATUS_DP_CONNECTION) &&
+	       TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT(ds) ==
+		       TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT_D &&
+	       !(st->data_status_changed & TPS_DATA_STATUS_USB3_CONNECTION) &&
+	       typec_mux_dp_joins_usb(cd321x->mux);
+}
+
 static void cd321x_update_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
@@ -1248,6 +1269,10 @@ static void cd321x_update_work(struct work_struct *work)
 	if (!new_connected)
 		reset |= CD321X_DP_RESET_UNPLUG;
 
+	/* DisplayPort pin D joining the running USB 3 link keeps the role. */
+	bool dp_joins = dp_mode_changed && !was_disconnected && new_role == old_role &&
+			cd321x_dp_joins_usb(cd321x, &st);
+
 	/* A new DP connection: its DP status counts once one is signalled. */
 	if (!new_connected || was_disconnected || !dp_connected || dp_mode_changed)
 		cd321x->dp_sid_valid = false;
@@ -1298,7 +1323,7 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* If we are switching from an active role, transition to USB_ROLE_NONE. */
 	if (old_role != USB_ROLE_NONE &&
-	    (new_role != old_role || was_disconnected || dp_mode_changed)) {
+	    (new_role != old_role || was_disconnected || (dp_mode_changed && !dp_joins))) {
 		ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 		if (ret)
 			goto retry;
@@ -1415,6 +1440,16 @@ static void cd321x_update_work(struct work_struct *work)
 			goto retry;
 	}
 	ret = cd321x_typec_update_mode(tps, &st, &display_busy, &held);
+	/*
+	 * A provider failed the change with the role kept: stop the role and set the mode
+	 * again, as for any other mode change.
+	 */
+	if (ret && dp_joins && !display_busy && !held) {
+		ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+		if (ret)
+			goto retry;
+		ret = cd321x_typec_update_mode(tps, &st, &display_busy, &held);
+	}
 	if (ret && !display_busy)
 		goto retry;
 	/* A shared display route can be busy while the dock's USB path is usable. */

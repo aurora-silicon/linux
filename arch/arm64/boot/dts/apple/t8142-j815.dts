@@ -438,88 +438,6 @@
 	status = "okay";
 };
 
-/*
- * Video encoder: ADT ave behind dart-ave (DART + CPUDART). aura hands over the
- * preloaded 26A428 firmware (memory regions, CRCs in /chosen) or disables the
- * node when the ADT has no preload.
- */
-&ps_venc_sys {
-	status = "okay";
-};
-
-&ps_venc_dma {
-	status = "okay";
-};
-
-&ps_venc_pipe4 {
-	status = "okay";
-};
-
-&ps_venc_pipe5 {
-	status = "okay";
-};
-
-&ps_venc_me0 {
-	status = "okay";
-};
-
-&ps_venc_me1 {
-	status = "okay";
-};
-
-&ave_dart0 {
-	status = "okay";
-};
-
-&ave_dart1 {
-	status = "okay";
-};
-
-&ave {
-	status = "okay";
-};
-
-/*
- * The Neural Engine. It stays off until the first request: the firmware is
- * started then, from the preload, and system sleep cycles it cold.
- */
-&ps_ane_sys {
-	status = "okay";
-};
-
-&ane_dart0 {
-	status = "okay";
-};
-
-&ane_dart1 {
-	status = "okay";
-};
-
-&ane_dart2 {
-	status = "okay";
-};
-
-&ane {
-	status = "okay";
-};
-
-/* Both JPEG engines and their DART. */
-&ps_jpg {
-	status = "okay";
-};
-
-&jpeg_dart {
-	status = "okay";
-};
-
-&jpeg0 {
-	status = "okay";
-};
-
-&jpeg1 {
-	status = "okay";
-};
-
 /* The port controllers follow the sleep's command rules (tipd: woken first, read at intervals) */
 &hpm0 {
 	apple,sleep-ssps-rules;
@@ -545,3 +463,13 @@
 		apple,sleep-ssps-rules;
 	};
 };
+
+#include "t8142-j813-j815-sleep.dtsi"
+
+/*
+ * The external display processors (dispext0/1), their DARTs, the display
+ * crossbars and the USB-C ports' DisplayPort routes: the same two ports and
+ * blocks as the J813. The loader hands both processors over and enables
+ * them; without its hand-off they stay disabled.
+ */
+#include "t8142-j813-dcpext.dtsi"
