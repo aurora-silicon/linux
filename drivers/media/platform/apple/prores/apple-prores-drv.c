@@ -36,6 +36,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
+#include <linux/scatterlist.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -1126,9 +1127,9 @@ struct apr_ctx;
 
 /*
  * A source buffer of the decoder. The frame is parsed once, when it is
- * queued; job_ready, the source-change check and device_run then use the
- * cached result instead of walking the slice table of the (uncached) buffer
- * again each time.
+ * queued, for the source-change check and to fail a malformed frame early.
+ * The engine never reads this buffer: userspace may still write it, so
+ * device_run copies the frame and parses and programs the copy.
  */
 struct apr_buf {
 	struct v4l2_m2m_buffer m2m;	/* first: vb2 and m2m embed this */
@@ -1140,6 +1141,18 @@ static struct apr_buf *to_apr_buf(struct vb2_v4l2_buffer *vbuf)
 {
 	return container_of(vbuf, struct apr_buf, m2m.vb);
 }
+
+/*
+ * A driver-owned copy of one decoder source frame, the only input the engine
+ * reads. The decode descriptor has no input length: the engine follows the
+ * frame's in-band sizes, which are checked on this copy, out of userspace's
+ * reach, before the descriptor points at it.
+ */
+struct apr_bounce {
+	struct sg_table *sgt;
+	void *vaddr;
+	size_t size;
+};
 
 /* A job in the ring; its buffers left the m2m queues when it was published. */
 struct apr_job {
@@ -1184,6 +1197,13 @@ struct apr_dev {
 
 	spinlock_t hw_lock;	/* protects the fields below */
 	struct apr_job jobs[APR_MAX_INFLIGHT];	/* in ring order */
+	/*
+	 * Source copy of the decode job in the jobs[] slot of the same index.
+	 * Not under hw_lock: only device_run, which m2m runs one at a time,
+	 * fills the next free slot's copy, and completions free slots in order
+	 * without changing which slot is next.
+	 */
+	struct apr_bounce bounce[APR_MAX_INFLIGHT];
 	unsigned int job_first;	/* oldest job in jobs[] */
 	unsigned int njobs;	/* jobs the engine owns */
 	unsigned int nencodes;	/* encode jobs among them */
@@ -1387,18 +1407,89 @@ static int apr_parse_src(struct vb2_v4l2_buffer *src,
 	return 0;
 }
 
+static void apr_bounce_free(struct apr_dev *apr, struct apr_bounce *b)
+{
+	if (!b->sgt)
+		return;
+	dma_vunmap_noncontiguous(apr->dev, b->vaddr);
+	dma_free_noncontiguous(apr->dev, b->size, b->sgt, DMA_TO_DEVICE);
+	*b = (struct apr_bounce){};
+}
+
+/* Called once no job is in the ring, from runtime suspend and removal. */
+static void apr_bounce_free_all(struct apr_dev *apr)
+{
+	unsigned int i;
+
+	for (i = 0; i < APR_MAX_INFLIGHT; i++)
+		apr_bounce_free(apr, &apr->bounce[i]);
+}
+
+/*
+ * Make @b hold at least @bytes. Frame sizes vary within a stream, so a copy
+ * that grows keeps a quarter in hand and is rarely reallocated. CPU access
+ * is cached; the engine sees one IOVA range through its DART.
+ */
+static int apr_bounce_reserve(struct apr_dev *apr, struct apr_bounce *b,
+			      size_t bytes)
+{
+	size_t size;
+
+	if (b->size >= bytes)
+		return 0;
+	apr_bounce_free(apr, b);
+	size = PAGE_ALIGN(max_t(size_t, SZ_1M, bytes + bytes / 4));
+	b->sgt = dma_alloc_noncontiguous(apr->dev, size, DMA_TO_DEVICE,
+					 GFP_KERNEL, 0);
+	if (!b->sgt)
+		return -ENOMEM;
+	b->size = size;
+	b->vaddr = dma_vmap_noncontiguous(apr->dev, size, b->sgt);
+	if (!b->vaddr || b->sgt->nents != 1) {
+		if (b->vaddr)
+			dma_vunmap_noncontiguous(apr->dev, b->vaddr);
+		dma_free_noncontiguous(apr->dev, size, b->sgt, DMA_TO_DEVICE);
+		*b = (struct apr_bounce){};
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+/*
+ * Copy @src's frame into @b, parse the copy and describe a decode of it.
+ * Userspace keeps write access to @src while it is queued, so the sizes
+ * checked when it was queued are only a hint: everything the engine follows
+ * comes from the copy, which nothing but the engine reads from now on.
+ */
 static int apr_fill_decode_frame(struct apr_ctx *ctx,
 				 struct vb2_v4l2_buffer *src,
 				 struct vb2_v4l2_buffer *dst,
+				 struct apr_bounce *b,
 				 struct apr_decode_frame *f)
 {
 	const struct v4l2_pix_format_mplane *d = &ctx->dst_fmt;
+	struct apr_dev *apr = ctx->apr;
 	struct apr_prores_info info;
+	u32 offset = src->vb2_buf.planes[0].data_offset;
+	u32 payload = vb2_get_plane_payload(&src->vb2_buf, 0);
 	dma_addr_t output;
 	u32 luma_stride;
+	u8 *data;
 	int ret;
 
-	ret = apr_parse_src(src, &info);
+	ret = to_apr_buf(src)->parse_err;
+	if (ret)
+		return ret;
+	if (vb2_plane_size(&dst->vb2_buf, 0) < d->plane_fmt[0].sizeimage)
+		return -EINVAL;
+	data = vb2_plane_vaddr(&src->vb2_buf, 0);
+	if (!data || offset > payload)
+		return -EINVAL;
+	ret = apr_bounce_reserve(apr, b, payload - offset);
+	if (ret)
+		return ret;
+	memcpy(b->vaddr, data + offset, payload - offset);
+	ret = apr_parse_frame(b->vaddr, payload - offset, &info);
 	if (ret)
 		return ret;
 	/* The non-RAW descriptor accepts one picture; field repacking is later. */
@@ -1407,6 +1498,7 @@ static int apr_fill_decode_frame(struct apr_ctx *ctx,
 	if (info.width != d->width || info.height != d->height ||
 	    info.chroma == 3 != ctx->raw->is444)
 		return -EINVAL;
+	dma_sync_sgtable_for_device(apr->dev, b->sgt, DMA_TO_DEVICE);
 
 	luma_stride = d->plane_fmt[0].bytesperline;
 	output = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
@@ -1416,8 +1508,7 @@ static int apr_fill_decode_frame(struct apr_ctx *ctx,
 		.output = ctx->raw->input,
 		.luma_stride = luma_stride,
 		.chroma_stride = luma_stride * (ctx->raw->is444 ? 2 : 1),
-		.input = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0) +
-			 src->vb2_buf.planes[0].data_offset,
+		.input = sg_dma_address(b->sgt->sgl),
 		.luma = output,
 		.chroma = output + (u64)luma_stride * d->height,
 	};
@@ -1763,6 +1854,7 @@ static void apr_device_run(void *priv)
 	u8 desc[APR_ENCODE_DESC_BYTES];
 	u32 desc_bytes;
 	unsigned long flags;
+	unsigned int slot;
 	bool hold;
 	void *out;
 	int ret;
@@ -1776,8 +1868,13 @@ static void apr_device_run(void *priv)
 		apr_finish_job(apr, ctx, ret);
 		return;
 	}
+	/* device_run is entered with room in jobs[]; see apr_dev.bounce. */
+	spin_lock_irqsave(&apr->hw_lock, flags);
+	slot = (apr->job_first + apr->njobs) % APR_MAX_INFLIGHT;
+	spin_unlock_irqrestore(&apr->hw_lock, flags);
 	if (ctx->decode) {
-		ret = apr_fill_decode_frame(ctx, src, dst, &decode);
+		ret = apr_fill_decode_frame(ctx, src, dst, &apr->bounce[slot],
+					    &decode);
 		desc_bytes = APR_DECODE_DESC_BYTES;
 	} else {
 		apr_fill_frame(ctx, src, dst, &f);
@@ -1841,6 +1938,7 @@ static void apr_device_run(void *priv)
 	apr_ring_write(apr->ring, ring_bytes, apr->head, desc, desc_bytes);
 	apr->head = apr_ring_advance(apr->head, desc_bytes, ring_bytes);
 	job = &apr->jobs[(apr->job_first + apr->njobs) % APR_MAX_INFLIGHT];
+	WARN_ON(job != &apr->jobs[slot]);
 	*job = (struct apr_job){
 		.ctx = ctx,
 		.src = v4l2_m2m_src_buf_remove(m2m),
@@ -2589,6 +2687,8 @@ static int apr_runtime_suspend(struct device *dev)
 	apr->ring_ready = false;
 	apr->hung = false;
 	spin_unlock_irqrestore(&apr->hw_lock, flags);
+	/* Every job holds a runtime PM reference, so no copy is in use. */
+	apr_bounce_free_all(apr);
 	return 0;
 }
 
@@ -2632,6 +2732,7 @@ static void apr_cleanup(void *data)
 	if (apr->m2m_dev)
 		v4l2_m2m_release(apr->m2m_dev);
 	v4l2_device_unregister(&apr->v4l2_dev);
+	apr_bounce_free_all(apr);
 }
 
 /*
