@@ -97,6 +97,8 @@
 			msi-controller;
 			msi-parent = <&usb4_0_pcie>;
 			msi-ranges = <&aic AIC_IRQ 1342 IRQ_TYPE_EDGE_RISING 0x200>;
+			/* The driver's T6030 slice for this ECAM aperture (0x730000000). */
+			apple,msi-vector-base = <32>;
 			iommu-map = <0x0 &usb4_0_pcie_dart 0x0 0x40>;
 			iommu-map-mask = <0x3f>;
 			bus-range = <0x0 0x7f>;
