@@ -43,11 +43,14 @@ this source does not keep all key use inside the SEP. There is no current
 userspace plaintext-unseal or login-keyring unlock API. Adding one requires an
 explicit authorization and userspace integration policy.
 
-The SEP source ignores trailing trusted-key policy options: they do not add PCR
-binding, a password requirement, or user-presence enforcement. Unsealing uses the
-persisted identity-bag secret, without requiring a fingerprint or fresh login
-authentication. Normal Linux key permissions still apply. The source marks keys
-non-migratable, so ``keyctl update`` is refused with ``EPERM``.
+The SEP source refuses trailing trusted-key policy options (``keyhandle=``,
+``keyauth=``, ``blobauth=``, ``pcrinfo=`` and the rest) with ``EINVAL``: it has
+no PCR binding, password requirement, or user-presence enforcement to apply
+them to, so a key is never made without a protection its caller asked for.
+Unsealing uses the persisted identity-bag secret, without requiring a
+fingerprint or fresh login authentication. Normal Linux key permissions still
+apply. The source marks keys non-migratable, so ``keyctl update`` is refused
+with ``EPERM``.
 
 Persistent identity and reference key
 =====================================
