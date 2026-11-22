@@ -286,7 +286,7 @@ impl FenceOps for G18SubmissionFence {
 /// Dropped unaccepted, it signals the fence with `result` and installs it.
 struct OutputPublication {
     fence: Option<UserFence<G18SubmissionFence>>,
-    syncs: KVec<file::SyncItem>,
+    syncs: KVVec<file::SyncItem>,
     input_count: usize,
     result: Result,
 }
@@ -707,7 +707,7 @@ impl queue::Queue for G18Queue {
     /// userspace nothing to wait on (Mesa's G18G split compute prepass reads
     /// GPU results after such submissions).
     fn submit(&mut self, _reg_data: &AsahiRegData<'_>, submission_id: u64,
-        syncs: KVec<file::SyncItem>,
+        syncs: KVVec<file::SyncItem>,
         in_sync_count: usize, cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>) -> Result {
         if in_sync_count > syncs.len() { return Err(EINVAL); }

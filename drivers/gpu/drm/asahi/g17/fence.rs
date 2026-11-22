@@ -526,7 +526,7 @@ fn install(outputs: impl Iterator<Item = SyncItem>, fence: &Fence) {
 
 pub(crate) struct Outputs {
     fallback: Option<UniqueFence<ExportFence>>,
-    syncs: KVec<SyncItem>,
+    syncs: KVVec<SyncItem>,
     input_count: usize,
     submission: Option<Aggregate>,
     result: Result,
@@ -535,7 +535,7 @@ pub(crate) struct Outputs {
 impl Outputs {
     pub(crate) fn new(
         contexts: &FenceContexts,
-        mut syncs: KVec<SyncItem>,
+        mut syncs: KVVec<SyncItem>,
         input_count: usize,
         allocation_failure: &Fence,
     ) -> Result<Self> {
