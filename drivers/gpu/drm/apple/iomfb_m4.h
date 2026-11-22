@@ -70,6 +70,14 @@ void iomfb_m4_ext_sleep_wake(struct apple_dcp *dcp);
 bool iomfb_m4_ext_stale(struct apple_dcp *dcp);
 int iomfb_m4_ext_restore_result(struct apple_dcp *dcp, unsigned int timeout_ms);
 void iomfb_m4_ext_restore_end(struct apple_dcp *dcp);
+void iomfb_m4_ext_relink_own(struct apple_dcp *dcp);
+void iomfb_m4_ext_relink_expect(struct apple_dcp *dcp);
+bool iomfb_m4_ext_relinking(struct apple_dcp *dcp);
+void iomfb_m4_ext_relink_arm(struct apple_dcp *dcp, bool cable);
+void iomfb_m4_ext_relink_lost(struct apple_dcp *dcp);
+void iomfb_m4_ext_relink_wait(struct apple_dcp *dcp, unsigned long deadline);
+int iomfb_m4_ext_relink_end(struct apple_dcp *dcp);
+bool iomfb_m4_ext_stopped(struct apple_dcp *dcp);
 
 /* The caller has waited for the producer fence before publishing the DMA GEM. */
 int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
@@ -140,6 +148,14 @@ static inline int iomfb_m4_ext_restore_result(struct apple_dcp *dcp, unsigned in
 }
 
 static inline void iomfb_m4_ext_restore_end(struct apple_dcp *dcp) { }
+static inline void iomfb_m4_ext_relink_own(struct apple_dcp *dcp) { }
+static inline void iomfb_m4_ext_relink_expect(struct apple_dcp *dcp) { }
+static inline bool iomfb_m4_ext_relinking(struct apple_dcp *dcp) { return false; }
+static inline void iomfb_m4_ext_relink_arm(struct apple_dcp *dcp, bool cable) { }
+static inline void iomfb_m4_ext_relink_lost(struct apple_dcp *dcp) { }
+static inline void iomfb_m4_ext_relink_wait(struct apple_dcp *dcp, unsigned long deadline) { }
+static inline int iomfb_m4_ext_relink_end(struct apple_dcp *dcp) { return 0; }
+static inline bool iomfb_m4_ext_stopped(struct apple_dcp *dcp) { return false; }
 
 static inline int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
 				  dma_addr_t dva, size_t mapped)

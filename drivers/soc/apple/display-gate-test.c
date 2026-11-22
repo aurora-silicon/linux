@@ -830,6 +830,15 @@ static void __init gate_t8122_t6031_pmp_image(struct kunit *test)
 	gt_expect_untouched(test);
 }
 
+/* The 27.2 (26B123) T8122 PMP image is taken as well. */
+static void __init gate_t8122_pmp_image_27_2(struct kunit *test)
+{
+	gt_set_string(test, gt_t8122.values, "apple,tunable-uuid",
+		      "C6CCB960-AC83-34A2-9493-C3131BD5AE4B");
+	gt_run(test);
+	gt_expect_enabled(test);
+}
+
 static void __init gate_t8122_no_report_pmp_link(struct kunit *test)
 {
 	gt_remove(test, gt_t8122.report, "apple,pmp");
@@ -962,6 +971,7 @@ static struct kunit_case gate_t8122_cases[] __refdata = {
 	KUNIT_CASE(gate_t8122_no_pmp_values),
 	KUNIT_CASE(gate_t8122_t6031_pmp_image),
 	KUNIT_CASE(gate_t8122_no_report_pmp_link),
+	KUNIT_CASE(gate_t8122_pmp_image_27_2),
 	KUNIT_CASE(gate_t8122_pmp_enabled),
 	KUNIT_CASE(gate_t8122_pmp_has_values),
 	KUNIT_CASE(gate_t8122_no_pmp_dart),
@@ -1233,6 +1243,59 @@ static void __init gate_t6041_max_no_display(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, of_count_phandle_with_args(display, "iommus", "#iommu-cells"), 1);
 }
 
+static void __init gt_max_set_dcp_fw(struct kunit *test, const char *path,
+				     const char *uuid, const u32 compat[3])
+{
+	struct device_node *np = gt_node(test, path);
+	struct gate_test *t = test->priv;
+
+	KUNIT_ASSERT_EQ(test,
+			of_changeset_add_prop_string(&t->cs, np, "apple,firmware-uuid", uuid),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			of_changeset_add_prop_u32_array(&t->cs, np, "apple,firmware-version",
+							compat, 3),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			of_changeset_add_prop_u32_array(&t->cs, np, "apple,firmware-compat",
+							compat, 3),
+			0);
+}
+
+/* Unapproved firmware 27 on the internal DCP leaves external chains off. */
+static void __init gate_t6041_max_unapproved_firmware27(struct kunit *test)
+{
+	static const u32 compat[3] = { 27, 2, 0 };
+
+	gt_max_fill(test, 0);
+	gt_max_fill(test, 1);
+	gt_max_set_dcp_fw(test, "/dcp@402e00000",
+			  "71F140DC-F18D-31B3-9772-537A5CC8400D", compat);
+	gt_max_run(test);
+	gt_max_expect_chain(test, 0, false);
+	gt_max_expect_chain(test, 1, false);
+	gt_max_expect_display(test, 0);
+}
+
+/* Headless T6041 (e.g. J575c) also checks each external DCP's firmware-27 UUID. */
+static void __init gate_t6041_max_v27_2(struct kunit *test)
+{
+	static const u32 compat[3] = { 27, 2, 0 };
+
+	gt_max_fill(test, 0);
+	gt_max_fill(test, 1);
+	gt_max_fill(test, 2);
+	gt_max_set_dcp_fw(test, "/dcp@402e00000", APPLE_T6041_DCP_26B123_UUID, compat);
+	gt_max_set_dcp_fw(test, "/dcp@602e00000", APPLE_T6041_DCP_26B123_UUID, compat);
+	gt_max_set_dcp_fw(test, "/dcp@606e00000",
+			  "71F140DC-F18D-31B3-9772-537A5CC8400D", compat);
+	gt_max_run(test);
+	gt_max_expect_chain(test, 0, true);
+	gt_max_expect_chain(test, 1, true);
+	gt_max_expect_chain(test, 2, false);
+	gt_max_expect_display(test, BIT(0) | BIT(1));
+}
+
 static struct kunit_case gate_t6041_max_cases[] __refdata = {
 	KUNIT_CASE(gate_t6041_max_enabled),
 	KUNIT_CASE(gate_t6041_max_no_memory),
@@ -1242,6 +1305,8 @@ static struct kunit_case gate_t6041_max_cases[] __refdata = {
 	KUNIT_CASE(gate_t6041_max_enabled_by_loader),
 	KUNIT_CASE(gate_t6041_max_missing_node),
 	KUNIT_CASE(gate_t6041_max_no_display),
+	KUNIT_CASE(gate_t6041_max_unapproved_firmware27),
+	KUNIT_CASE(gate_t6041_max_v27_2),
 	{}
 };
 
