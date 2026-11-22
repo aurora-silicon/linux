@@ -953,6 +953,30 @@ mod queue_behind_scope {
             initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
         };
         assert_eq!(p.wait_stamp_for_with(&next_r,command::RENDER,Some(4),Some(&cur)),Ok(Some(WaitTarget{stamp:0x400,initbm:false})));
+        // Cross-job render horizon flight resolves folded flight.group member stamps too.
+        let r_fold_a=Arc::new(QueueBehindJob{
+            id:10,vm:vm1.clone(),queue:q1.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Render(())],
+            order:Order{engine:command::RENDER,sequence:5,wait_through:[Some(4),None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+        });
+        let r_fold_b=Arc::new(QueueBehindJob{
+            id:11,vm:vm1.clone(),queue:q1.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Render(())],
+            order:Order{engine:command::RENDER,sequence:6,wait_through:[Some(5),None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+        });
+        let mut grp_fs=[0u32;16];
+        grp_fs[0]=0x400;grp_fs[1]=0x500;grp_fs[2]=0x600;
+        let cur_grp=QueueBehindFlight{
+            job:next_r.clone(),group:vec![r_fold_a.clone(),r_fold_b.clone()],first:0,count:1,computes:0,renders:3,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:grp_fs,fs_target:0x600,
+            initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
+        };
+        assert_eq!(p.wait_stamp_for_with(&r_fold_b,command::RENDER,Some(4),Some(&cur_grp)),Ok(Some(WaitTarget{stamp:0x400,initbm:false})));
+        assert_eq!(p.wait_stamp_for_with(&r_fold_b,command::RENDER,Some(5),Some(&cur_grp)),Ok(Some(WaitTarget{stamp:0x500,initbm:false})));
+        assert_eq!(p.wait_stamp_for_with(&r_fold_b,command::RENDER,Some(6),Some(&cur_grp)),Ok(Some(WaitTarget{stamp:0x600,initbm:false})));
         // Active renders sum flight.renders: 44 passes (4x11-pass postfx) still pipelines
         // behind once TA has finished, while 47 batched renders saturates render_flights().
         assert!(p.can_queue_behind(&next_r));
@@ -1408,6 +1432,7 @@ mod compute_horizon_scope {
         __CAN_FOLD_CMD__
         __CAN_FOLD_JOB__
         __CAN_FOLD_RENDER_CMD__
+        __CAN_FOLD_RENDER_JOB__
     }
     #[test]
     fn compute_horizon_eligibility_rejects_barriers_renders_unready_fences_and_gaps() {
@@ -1528,6 +1553,58 @@ mod compute_horizon_scope {
             0,
         );
         assert!(!unready.can_fold_render_cmd(1, 2));
+    }
+
+    #[test]
+    fn can_fold_render_horizon_job_accepts_render_only_jobs_and_rejects_mixed_or_unready() {
+        let mk = |cmds: Vec<Command>, orders: Vec<Order>, inputs: Vec<bool>, pub_c: u64| Job {
+            vm: Vm { status: Status(AtomicU32::new(0)) },
+            queue: Queue {
+                cancelled_compute: 0,
+                completed: [AtomicU64::new(0), AtomicU64::new(0)],
+                published: [AtomicU64::new(0), AtomicU64::new(pub_c)],
+            },
+            progress: Progress { sent: 0, count: cmds.len() as u32 },
+            commands: cmds,
+            orders,
+            inputs,
+            terminal_retired: AtomicBool::new(false),
+        };
+        // Two-pass render job waiting on primary flight pass 1 and its own pass 2.
+        let r_job = mk(
+            vec![Command::Render(()), Command::Render(())],
+            vec![
+                Order { engine: command::RENDER, sequence: 2, wait_through: [Some(1), None] },
+                Order { engine: command::RENDER, sequence: 3, wait_through: [Some(2), Some(5)] },
+            ],
+            vec![true],
+            4,
+        );
+        // Compute dep 5 not yet published (published=4) -> rejected.
+        assert!(!r_job.can_fold_render_horizon_job(2));
+        r_job.queue.published[command::COMPUTE].store(5, Ordering::Release);
+        assert!(r_job.can_fold_render_horizon_job(2));
+        // Wrong sequence is rejected.
+        assert!(!r_job.can_fold_render_horizon_job(3));
+        // Mixed compute+render job is rejected.
+        let mixed = mk(
+            vec![Command::Render(()), Command::Compute(())],
+            vec![
+                Order { engine: command::RENDER, sequence: 2, wait_through: [None, None] },
+                Order { engine: command::COMPUTE, sequence: 1, wait_through: [None, None] },
+            ],
+            vec![true],
+            5,
+        );
+        assert!(!mixed.can_fold_render_horizon_job(2));
+        // Pending input fence is rejected.
+        let unready = mk(
+            vec![Command::Render(())],
+            vec![Order { engine: command::RENDER, sequence: 2, wait_through: [Some(1), None] }],
+            vec![false],
+            5,
+        );
+        assert!(!unready.can_fold_render_horizon_job(2));
     }
 
     mod recovery {
@@ -1694,6 +1771,12 @@ harness = harness.replace(
 harness = harness.replace(
     '__CAN_FOLD_RENDER_CMD__',
     item_in(job_src, 'pub(crate) fn can_fold_render_cmd(')
+    .replace('super::command::', 'command::')
+    .replace('super::fence::', 'fence::'),
+)
+harness = harness.replace(
+    '__CAN_FOLD_RENDER_JOB__',
+    item_in(job_src, 'pub(crate) fn can_fold_render_horizon_job(')
     .replace('super::command::', 'command::')
     .replace('super::fence::', 'fence::'),
 )

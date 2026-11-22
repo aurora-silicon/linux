@@ -405,6 +405,55 @@ impl Job {
         order.ready(completed, published)
     }
 
+    /// Whether every command of this job is a ready render command continuing a render
+    /// horizon sequentially from `first_expected` (treating earlier passes in the in-progress
+    /// render flight as already published).
+    pub(crate) fn can_fold_render_horizon_job(&self, first_expected: u64) -> bool {
+        let count = self.progress.count();
+        if count == 0
+            || self.progress.sent() != 0
+            || self.terminal_retired.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+            || super::fence::check_dependencies(&self.inputs).is_err()
+        {
+            return false;
+        }
+        let completed = self
+            .queue
+            .completed
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        let base_published = self
+            .queue
+            .published
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        for k in 0..count {
+            let Some(expected) = first_expected.checked_add(u64::from(k)) else {
+                return false;
+            };
+            let Some(Command::Render(_)) = self.commands.get(k as usize) else {
+                return false;
+            };
+            let Some(order) = self.orders.get(k as usize) else {
+                return false;
+            };
+            if order.engine != super::command::RENDER
+                || order.sequence != expected
+                || self.queue.check(order).is_err()
+            {
+                return false;
+            }
+            let mut published = base_published;
+            published[super::command::RENDER] =
+                published[super::command::RENDER].max(expected.saturating_sub(1));
+            if !order.ready(completed, published) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Checks the retained dependency set for each command immediately before publication.
     /// Never waits or signals fences under the device lock. The scheduler and start() have
     /// already waited; a pending fence asks the engine to defer rather than publish early.

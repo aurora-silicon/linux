@@ -1437,18 +1437,38 @@ impl Firmware {
             if flight.renders == 0 || !Arc::ptr_eq(&flight.job.queue, &job.queue) {
                 return None;
             }
-            let count = (flight.renders as usize).min(flight.r_fs_stamp.len());
-            for member in 0..count {
-                let k = (flight.first + member) as u32;
+            let max_members = (flight.renders as usize).min(flight.r_fs_stamp.len());
+            let mut member = 0usize;
+            for k in flight.first..flight.first + flight.count {
+                if member >= max_members {
+                    return None;
+                }
                 if flight
                     .job
-                    .command_order(k)
+                    .command_order(k as u32)
                     .is_some_and(|fo| fo.engine == super::command::RENDER && fo.sequence == last)
                 {
                     return Some(WaitTarget {
                         stamp: flight.r_fs_stamp[member],
                         initbm: flight.initbm,
                     });
+                }
+                member += 1;
+            }
+            for j2 in flight.group.iter() {
+                for k in 0..j2.progress.count() {
+                    if member >= max_members {
+                        return None;
+                    }
+                    if j2.command_order(k).is_some_and(|fo| {
+                        fo.engine == super::command::RENDER && fo.sequence == last
+                    }) {
+                        return Some(WaitTarget {
+                            stamp: flight.r_fs_stamp[member],
+                            initbm: flight.initbm,
+                        });
+                    }
+                    member += 1;
                 }
             }
             None
@@ -1895,10 +1915,23 @@ impl Firmware {
                 f.claims.pass_count = 1;
                 f.claims.pass_mask = 1u64 << k;
                 self.slots.pass_busy |= 1u64 << k;
-                self.prefix_render(job, r, geometry, &mut prefix, f, behind, class_behind)?;
+                self.prefix_render(
+                    job,
+                    &job.resources,
+                    index,
+                    r,
+                    geometry,
+                    &mut prefix,
+                    f,
+                    behind,
+                    class_behind,
+                )?;
+                f.count = 1;
                 // Batch consecutive ready non-InitBM render passes of the same SUBMIT into
                 // one TA/FS producer advance, one UMA submitted update, and one SubmitRecord.
                 if !f.initbm {
+                    let stage_prefix =
+                        kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
                     let mut last_seq = job.command_order(index).map(|o| o.sequence);
                     let active_renders: usize = self
                         .engine
@@ -1985,6 +2018,8 @@ impl Firmware {
                         self.slots.pass_busy |= 1u64 << k2;
                         self.prefix_render(
                             job,
+                            &job.resources,
+                            end,
                             r2,
                             geo2,
                             &mut prefix,
@@ -1994,7 +2029,158 @@ impl Firmware {
                         )?;
                         last_seq = Some(next_seq);
                         end += 1;
+                        f.count = (end - index) as usize;
                         more_renders -= 1;
+                    }
+                    // Cross-job render horizon: fold subsequent ready render-only jobs of
+                    // the same queue and VM into the same <= TA_WAVE_PASSES flight, sharing
+                    // one TA/FS producer advance, one UMA submitted update, and one doorbell.
+                    // Any non-qualifying job of this queue ends the scan so no later job
+                    // overtakes it.
+                    if end == job.progress.count() && more_renders > 0 {
+                        let mut idx = 0;
+                        while more_renders > 0 && idx < self.engine.pending.len() {
+                            let j2 = self.engine.pending[idx].clone();
+                            idx += 1;
+                            if Arc::ptr_eq(&j2, job) || !Arc::ptr_eq(&j2.queue, &job.queue) {
+                                continue;
+                            }
+                            if 1 + f.group.len() >= sizes::HORIZON_JOBS as usize {
+                                break;
+                            }
+                            let n2 = j2.progress.count();
+                            let n2_usize = n2 as usize;
+                            let Some(first_seq) = last_seq.and_then(|s| s.checked_add(1)) else {
+                                break;
+                            };
+                            if !Arc::ptr_eq(&j2.vm, &job.vm)
+                                || n2 == 0
+                                || n2_usize > more_renders
+                                || !j2.can_fold_render_horizon_job(first_seq)
+                            {
+                                break;
+                            }
+                            let mut test_draw = prefix.draw;
+                            let mut ord_ok = true;
+                            for _ in 0..n2 {
+                                match super::recovery::logic::next_ordinal(test_draw) {
+                                    Some(next) => test_draw = next,
+                                    None => {
+                                        ord_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !ord_ok {
+                                break;
+                            }
+                            let ta_used =
+                                (prefix.ta_head.wrapping_sub(ta_read) % sizes::QUEUE_CAP) as usize;
+                            let fs_used =
+                                (prefix.fs_head.wrapping_sub(fs_read) % sizes::QUEUE_CAP) as usize;
+                            let need_ring = n2_usize * 5;
+                            if ta_used + need_ring >= sizes::QUEUE_CAP as usize
+                                || fs_used + need_ring >= sizes::QUEUE_CAP as usize
+                            {
+                                break;
+                            }
+                            let mut picked = [0usize; sizes::TA_WAVE_PASSES];
+                            let mut picked_mask = f.claims.pass_mask;
+                            let mut precheck_ok = true;
+                            for k in 0..n2 {
+                                let Some(Command::Render(r2)) = command(&j2, k) else {
+                                    precheck_ok = false;
+                                    break;
+                                };
+                                let Some(o2) = j2.command_order(k) else {
+                                    precheck_ok = false;
+                                    break;
+                                };
+                                let geo2 = Geometry::new(&r2.cmd, 0);
+                                let Some(slot) = self.slots.pick_pass_in(
+                                    &job.resources,
+                                    &geo2,
+                                    picked_mask,
+                                ) else {
+                                    precheck_ok = false;
+                                    break;
+                                };
+                                let staged2 = r2.cmd.flags & stage_prefix != 0;
+                                let render_wait_ok = |target: Option<u64>| -> bool {
+                                    match target {
+                                        None => true,
+                                        Some(seq) if seq >= first_seq => {
+                                            seq < first_seq + u64::from(k)
+                                        }
+                                        Some(seq) => self
+                                            .wait_stamp_for_with(
+                                                &j2,
+                                                super::command::RENDER,
+                                                Some(seq),
+                                                Some(f),
+                                            )
+                                            .is_ok(),
+                                    }
+                                };
+                                if self
+                                    .wait_stamp_for_with(
+                                        &j2,
+                                        super::command::COMPUTE,
+                                        o2.ta_wait_through[super::command::COMPUTE],
+                                        None,
+                                    )
+                                    .is_err()
+                                    || self
+                                        .wait_stamp_for_with(
+                                            &j2,
+                                            super::command::COMPUTE,
+                                            o2.wait_through[super::command::COMPUTE],
+                                            None,
+                                        )
+                                        .is_err()
+                                    || !render_wait_ok(o2.wait_through[super::command::RENDER])
+                                    || (staged2
+                                        && params::early_tiling()
+                                        && !render_wait_ok(
+                                            o2.ta_wait_through[super::command::RENDER],
+                                        ))
+                                {
+                                    precheck_ok = false;
+                                    break;
+                                }
+                                picked[k as usize] = slot;
+                                picked_mask |= 1u64 << slot;
+                            }
+                            if !precheck_ok || f.group.reserve(1, GFP_NOWAIT).is_err() {
+                                break;
+                            }
+                            let _ = f.group.push_within_capacity(j2.clone());
+                            for k in 0..n2 {
+                                let Some(Command::Render(r2)) = command(&j2, k) else {
+                                    return Err(EINVAL);
+                                };
+                                let geo2 = Geometry::new(&r2.cmd, 0);
+                                let slot = picked[k as usize];
+                                let member = prefix.renders as usize;
+                                f.claims.pass[member] = slot as u32;
+                                f.claims.pass_count += 1;
+                                f.claims.pass_mask |= 1u64 << slot;
+                                self.slots.pass_busy |= 1u64 << slot;
+                                self.prefix_render(
+                                    &j2,
+                                    &job.resources,
+                                    k,
+                                    r2,
+                                    geo2,
+                                    &mut prefix,
+                                    f,
+                                    behind,
+                                    class_behind,
+                                )?;
+                            }
+                            last_seq = Some(first_seq + u64::from(n2 - 1));
+                            more_renders -= n2_usize;
+                        }
                     }
                 }
             }
@@ -2033,7 +2219,10 @@ impl Firmware {
             if render {
                 let a = f.pb_slot as usize;
                 f.pb.as_ref().ok_or(EINVAL)?.expose();
-                job.resources.commit_render(f.renders);
+                job.resources.commit_render(f.count as u32);
+                for j2 in f.group.iter() {
+                    j2.resources.commit_render(j2.progress.count());
+                }
                 job.resources
                     .publish_pb_batch(a, f.uma_submitted, f.renders)?;
                 self.pools.publish_flight(a);
@@ -2170,6 +2359,9 @@ impl Firmware {
             if class_behind {
                 s.hz_behind += 1;
             }
+            s.grouped = s.grouped.saturating_add(f.group.len() as u64);
+        } else if !f.group.is_empty() {
+            let s = &mut self.engine.stats;
             s.grouped = s.grouped.saturating_add(f.group.len() as u64);
         }
         let mut flight = Flight::new(job.clone());
@@ -2345,9 +2537,15 @@ impl Firmware {
 
     /// Encodes paired TA/FS work and the fragment's explicit TA dependency in one retained
     /// pass unit.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Encodes one render member into a shared flight and prefix state."
+    )]
     fn prefix_render(
         &mut self,
         job: &Arc<Job>,
+        resources: &super::resources::Prepared,
+        cmd_index: u32,
         cmd: &RenderCommand,
         mut geometry: Geometry,
         pf: &mut Prefix,
@@ -2359,7 +2557,6 @@ impl Firmware {
         if member >= sizes::RENDER_SLOTS {
             return Err(EAGAIN);
         }
-        let cmd_index = (f.first + member) as u32;
         let k = f.claims.pass[member] as usize;
         let draw = super::recovery::logic::next_ordinal(pf.draw).ok_or(EOVERFLOW)?;
         let target = encode::stamp(draw);
@@ -2430,10 +2627,10 @@ impl Firmware {
         );
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
         self.slots
-            .claim_pass_in(&job.resources, k, Some(job.vm.id), geometry.tilemap_bytes)?;
-        self.slots.hold_render_pass(k, &job.vm, &job.resources)?;
+            .claim_pass_in(resources, k, Some(job.vm.id), geometry.tilemap_bytes)?;
+        self.slots.hold_render_pass(k, &job.vm, resources)?;
         let (refs, init_buffer) = if member == 0 {
-            let pb_slots = job.resources.pb_slots()?;
+            let pb_slots = resources.pb_slots()?;
             let alloc_slot = self
                 .pools
                 .pick_slot_within(&job.vm, behind, pb_slots)
@@ -2452,7 +2649,7 @@ impl Firmware {
             let epoch = f.pb.as_ref().ok_or(EINVAL)?;
             let refs = self.render_refs_batched(
                 f.pb_slot as usize,
-                job,
+                &f.job,
                 draw,
                 epoch,
                 f.uma_submitted,
@@ -2460,13 +2657,12 @@ impl Firmware {
             (refs, false)
         };
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
-        let p = job.resources.render_pass(k)?;
+        let p = resources.render_pass(k)?;
         let pass = p.refs();
         let heap_bytes = if cmd.cmd.layers > 1 { 0x1000 } else { 0x200 };
         geometry.layer_metadata = pass.heap_gva + if cmd.cmd.layers > 1 { 0x200 } else { 0 };
         geometry.validate_capacity(p.tpc.size as u64, p.tilemap.size as u64)?;
-        job.resources
-            .set_pass_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes, heap_bytes)?;
+        resources.set_pass_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes, heap_bytes)?;
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
         encode::encode_ta_for(
             self.init.abi.ta(),

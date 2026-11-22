@@ -1288,6 +1288,10 @@ impl Firmware {
                 if let Err(error) = committed {
                     self.retain(&f.job);
                     complete(done, &f.job, Err(error));
+                    for j2 in f.group.iter() {
+                        self.retain(j2);
+                        complete(done, j2, Err(error));
+                    }
                     self.fail_stop(error, done);
                     core::mem::forget(f);
                     return;
@@ -1449,8 +1453,8 @@ impl Firmware {
             }
             complete(done, &job, Ok(()));
         }
-        // Complete folded compute-horizon jobs unconditionally (even if an earlier render
-        // command of `job` is still in flight; `Timeline` preserves queue fence order).
+        // Complete folded horizon jobs unconditionally (even if an earlier command of `job`
+        // is still in flight; `Timeline` preserves queue fence order).
         for j2 in f.group.iter() {
             let p2 = &j2.progress;
             p2.next.store(p2.count(), Ordering::Relaxed);
@@ -1594,7 +1598,22 @@ impl Firmware {
                         }
                         compute += 1;
                     }
-                    super::command::Command::Render(_) => return Err(EINVAL),
+                    super::command::Command::Render(command) => {
+                        let index = *passes.get(render).ok_or(EINVAL)? as usize;
+                        if !command.timestamp_outputs.is_empty() {
+                            let pass = flight.job.resources.render_pass(index)?;
+                            let ticks = [
+                                pass.scene.r64(0x600)?,
+                                pass.scene.r64(0x608)?,
+                                pass.scene.r64(0x620)?,
+                                pass.scene.r64(0x628)?,
+                            ];
+                            command
+                                .timestamp_outputs
+                                .publish(ticks, super::hw::COMMAND_TIMESTAMP_HZ);
+                        }
+                        render += 1;
+                    }
                 }
             }
         }

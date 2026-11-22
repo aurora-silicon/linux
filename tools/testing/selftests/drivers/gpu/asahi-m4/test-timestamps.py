@@ -152,7 +152,7 @@ mod backend {
     pub mod hw{pub const COMMAND_TIMESTAMP_HZ:u64=24_000_000;}
     pub mod slots{
         use super::*;
-        pub struct Claims{pub slot:[u8;16],pub slot_count:u32,pub pass:[u8;2]}
+        pub struct Claims{pub slot:[u8;16],pub slot_count:u32,pub pass:[u8;4]}
         pub type ComputeSlot = Compute;
     }
     pub mod command{
@@ -199,7 +199,7 @@ fn resources()->Resources{Resources{
         Compute{its:Cells([30,40,0,0]),work:Cells([0,0,0,0])},
         Compute{its:Cells([50,60,0,0]),work:Cells([0,0,0,0])},
     ],
-    passes:vec![Pass{scene:Cells([100,200,300,400])},Pass{scene:Cells([500,600,700,800])}]
+    passes:vec![Pass{scene:Cells([100,200,300,400])},Pass{scene:Cells([500,600,700,800])},Pass{scene:Cells([900,1000,1100,1200])}]
 }}
 #[test]fn retirement_uses_claimed_hardware_cells_and_endpoint_order(){
     let compute=backing();let render=backing();
@@ -208,7 +208,7 @@ fn resources()->Resources{Resources{
         command::Command::Render(command::Render{timestamp_outputs:outputs(&render)})
     ],resources:resources()},group:vec![],first:0,count:2,renders:1};
     let mut slot=[0u8;16];slot[0]=1;
-    let claims=slots::Claims{slot,slot_count:1,pass:[1,0]};
+    let claims=slots::Claims{slot,slot_count:1,pass:[1,0,0,0]};
     firmware().publish_timestamps(&flight,&claims).unwrap();
     assert_eq!(compute.words[0].load(Ordering::Relaxed),expected(30));
     assert_eq!(compute.words[1].load(Ordering::Relaxed),expected(40));
@@ -227,17 +227,35 @@ fn resources()->Resources{Resources{
         first:0,count:1,renders:0,
     };
     let mut slot=[0u8;16];slot[0]=0;slot[1]=1;slot[2]=2;
-    let claims=slots::Claims{slot,slot_count:3,pass:[0,0]};
+    let claims=slots::Claims{slot,slot_count:3,pass:[0,0,0,0]};
     firmware().publish_timestamps(&flight,&claims).unwrap();
     assert_eq!((c0.words[0].load(Ordering::Relaxed),c0.words[1].load(Ordering::Relaxed)),(expected(10),expected(20)));
     assert_eq!((c1.words[0].load(Ordering::Relaxed),c1.words[1].load(Ordering::Relaxed)),(expected(30),expected(40)));
     assert_eq!((c2.words[0].load(Ordering::Relaxed),c2.words[1].load(Ordering::Relaxed)),(expected(50),expected(60)));
 }
+#[test]fn batched_render_horizon_group_timestamps_publish_for_all_members(){
+    let r0=backing();let r1=backing();let r2=backing();
+    let flight=Flight{
+        job:Job{commands:vec![command::Command::Render(command::Render{timestamp_outputs:outputs(&r0)})],resources:resources()},
+        group:vec![
+            Job{commands:vec![command::Command::Render(command::Render{timestamp_outputs:outputs(&r1)})],resources:Resources{compute:vec![],passes:vec![]}},
+            Job{commands:vec![command::Command::Render(command::Render{timestamp_outputs:outputs(&r2)})],resources:Resources{compute:vec![],passes:vec![]}},
+        ],
+        first:0,count:1,renders:3,
+    };
+    let claims=slots::Claims{slot:[0;16],slot_count:0,pass:[0,1,2,0]};
+    firmware().publish_timestamps(&flight,&claims).unwrap();
+    for (buf, ticks) in [(&r0,[100,200,300,400]),(&r1,[500,600,700,800]),(&r2,[900,1000,1100,1200])] {
+        for (index, tick) in ticks.into_iter().enumerate() {
+            assert_eq!(buf.words[index].load(Ordering::Relaxed), expected(tick));
+        }
+    }
+}
 #[test]fn invalid_command_span_and_missing_claim_are_rejected(){
     let memory=backing();let mut flight=Flight{job:Job{commands:vec![
         command::Command::Compute(command::Compute{timestamp_outputs:outputs(&memory)})
     ],resources:resources()},group:vec![],first:usize::MAX,count:2,renders:0};
-    let mut claims=slots::Claims{slot:[0;16],slot_count:1,pass:[0,0]};
+    let mut claims=slots::Claims{slot:[0;16],slot_count:1,pass:[0,0,0,0]};
     assert_eq!(firmware().publish_timestamps(&flight,&claims),Err(EOVERFLOW));
     flight.first=1;assert_eq!(firmware().publish_timestamps(&flight,&claims),Err(EINVAL));
     flight.first=0;flight.count=1;claims.slot_count=0;
@@ -249,7 +267,7 @@ fn resources()->Resources{Resources{
         command::Command::Compute(command::Compute{timestamp_outputs:Destinations(core::array::from_fn(|_|None))}),
         command::Command::Render(command::Render{timestamp_outputs:Destinations(core::array::from_fn(|_|None))}),
     ],resources:Resources{compute:vec![],passes:vec![]}},group:vec![],first:0,count:2,renders:1};
-    let claims=slots::Claims{slot:[0;16],slot_count:1,pass:[0,0]};
+    let claims=slots::Claims{slot:[0;16],slot_count:1,pass:[0,0,0,0]};
     firmware().publish_timestamps(&flight,&claims).unwrap();
 }
 #[test]fn work_ticks_fallback_publishes_compute_timestamps_for_26b123(){
@@ -269,7 +287,7 @@ fn resources()->Resources{Resources{
         first:0,count:1,renders:0,
     };
     let mut slot=[0u8;16];slot[0]=0;slot[1]=1;
-    let claims=slots::Claims{slot,slot_count:2,pass:[0,0]};
+    let claims=slots::Claims{slot,slot_count:2,pass:[0,0,0,0]};
     fw.publish_timestamps(&flight,&claims).unwrap();
     assert_eq!((c0.words[0].load(Ordering::Relaxed),c0.words[1].load(Ordering::Relaxed)),(expected(0x1_0000_0070),expected(0x1_0000_0090)));
     assert_eq!((c1.words[0].load(Ordering::Relaxed),c1.words[1].load(Ordering::Relaxed)),(expected(0x2_0000_0010),expected(0x2_0000_0040)));
