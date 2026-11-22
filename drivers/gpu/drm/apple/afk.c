@@ -768,11 +768,11 @@ int afk_start_service(struct apple_epic_service *service)
 	return ret;
 }
 
-/* "prefix:name[:suffix]": match on name; "*" takes every service. */
+/* "prefix:name[:suffix]": match on name, cut or not; "*" takes every other service. */
 static const struct apple_epic_service_ops *
 afk_compact_match_service(struct apple_dcp_afkep *ep, const char *name)
 {
-	const struct apple_epic_service_ops *ops;
+	const struct apple_epic_service_ops *ops, *any = NULL;
 	const char *service_name;
 	size_t len;
 
@@ -786,8 +786,10 @@ afk_compact_match_service(struct apple_dcp_afkep *ep, const char *name)
 		service_name = name;
 
 	for (ops = ep->ops; ops->name[0]; ops++) {
-		if (!strcmp(ops->name, "*"))
-			return ops;
+		if (!strcmp(ops->name, "*")) {
+			any = any ?: ops;
+			continue;
+		}
 
 		len = strlen(ops->name);
 		if (strncmp(ops->name, service_name, len))
@@ -800,12 +802,12 @@ afk_compact_match_service(struct apple_dcp_afkep *ep, const char *name)
 
 	/* An announcement that filled its field may have lost its end. */
 	if (strlen(name) < AFK_COMPACT_NAME_LEN - 1)
-		return NULL;
+		return any;
 	for (ops = ep->ops; ops->name[0]; ops++)
 		if (afk_compact_cut_of(ops, service_name))
 			return ops;
 
-	return NULL;
+	return any;
 }
 
 /*
