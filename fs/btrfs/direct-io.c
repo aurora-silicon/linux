@@ -388,15 +388,15 @@ static bool btrfs_dio_write_is_cow(const struct btrfs_inode *inode,
  * A COW write replaces everything mapped in its range with one newly allocated
  * extent, so the boundaries of the extents it overwrites do not matter. Extend
  * the mapping [@start, @start + @len) over the following extent maps that a
- * direct write would COW as well, up to @length. Without this, a sequential
- * rewrite of a fragmented range allocates one new extent (and ordered extent,
- * file extent item and bio) per old extent, so the file stays as fragmented as
- * it was and the rewrite runs at small-write speed.
+ * direct write would COW as well, within @length and the maximum extent size.
+ * Without this, a sequential rewrite of a fragmented range allocates one new
+ * extent (and ordered extent, file extent item and bio) per old extent. The
+ * file stays fragmented and the rewrite runs at small-write speed.
  */
 static u64 btrfs_dio_cow_write_len(struct btrfs_inode *inode, u64 start,
 				   u64 len, u64 length)
 {
-	const u64 limit = start + length;
+	const u64 limit = start + min(length, inode->root->fs_info->max_extent_size);
 	u64 end = start + len;
 
 	while (end < limit) {
@@ -413,6 +413,7 @@ static u64 btrfs_dio_cow_write_len(struct btrfs_inode *inode, u64 start,
 		if (!cow)
 			break;
 		end = min(em_end, limit);
+		cond_resched();
 	}
 
 	return end - start;
@@ -560,7 +561,8 @@ static int btrfs_dio_iomap_begin(struct inode *inode, loff_t start,
 	}
 
 	len = min(len, em->len - (start - em->start));
-	if (write && btrfs_dio_write_is_cow(BTRFS_I(inode), em))
+	if (write && !(flags & IOMAP_NOWAIT) &&
+	    btrfs_dio_write_is_cow(BTRFS_I(inode), em))
 		len = btrfs_dio_cow_write_len(BTRFS_I(inode), start, len, length);
 
 	/*
