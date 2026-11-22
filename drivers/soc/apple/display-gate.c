@@ -1903,7 +1903,8 @@ static int __init gate_t8122_dcpext_alias(struct of_changeset *cs,
 	panel_dart = dcp ? of_parse_phandle(dcp, "iommus", 0) : NULL;
 	of_node_put(dcp);
 	window = panel_dart ? of_find_property(panel_dart, "apple,dma-range", NULL) : NULL;
-	if (!window || !window->length) {
+	/* One window: its start and its size, as the DART driver reads it. */
+	if (!window || window->length != 2 * sizeof(u64)) {
 		of_node_put(panel_dart);
 		return -ENODEV;
 	}
@@ -1923,6 +1924,10 @@ static int __init gate_t8122_dcpext_alias(struct of_changeset *cs,
 		prop->length = window->length;
 		prop->value = value;
 		ret = of_changeset_update_property(cs, targets[i], prop);
+		if (ret) {
+			kfree(prop);
+			kfree(value);
+		}
 	}
 	of_node_put(panel_dart);
 	return ret;

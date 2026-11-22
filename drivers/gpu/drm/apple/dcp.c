@@ -6018,7 +6018,7 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 			return dcp_v27_method_table(dev, compat_str);
 		if (!strcmp(compat_str, "14.7.0"))
 			return DCP_FIRMWARE_V_14_7_TEMPLATE;
-		dev_err(dev, "T8122 external display not started: DCP firmware-compat %s is not 14.7.0\n",
+		dev_err(dev, "T8122 external display not started: DCP firmware-compat %s is neither 14.7.0 nor the 27.2 image\n",
 			compat_str);
 		return DCP_FIRMWARE_UNKNOWN;
 	}
@@ -7279,10 +7279,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	 * The T8122 external processor on firmware 27: the boot loader leaves
 	 * it unpowered (its DISPEXT domains are off at handoff), so Linux
 	 * starts it as on 14.7, with the firmware-27 endpoints and both DPTX
-	 * port services. Its DART window is the one the device tree describes.
+	 * port services. Its DART window is the internal panel's, which the
+	 * display gate copied onto its DARTs (gate_t8122_dcpext_alias()):
+	 * 0x100_0000_0000 + 64 GiB, so 41-bit firmware DMA addressing as there.
 	 */
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")) {
+		dcp->hw.firmware_dma_bits = 41;
 		dcp->hw.num_dptx_ports = 2;
 		dcp->hw.fw_14_7_endpoints = false;
 		dcp->hw.adopt_live_session = false;
