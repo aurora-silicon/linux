@@ -1869,7 +1869,7 @@ impl Firmware {
             if render {
                 let a = f.pb_slot as usize;
                 f.pb.as_ref().ok_or(EINVAL)?.expose();
-                job.resources.commit_render();
+                job.resources.commit_render(f.renders);
                 job.resources
                     .publish_pb_batch(a, f.uma_submitted, f.renders)?;
                 self.pools.publish_flight(a);

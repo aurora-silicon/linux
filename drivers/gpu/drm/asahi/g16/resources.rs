@@ -1005,15 +1005,21 @@ impl Prepared {
             cache.return_standby(epoch);
         }
     }
-    /// Commits one render command's standby reservation once it reaches firmware visibility.
-    pub(crate) fn commit_render(&self) {
+    /// Commits `count` render commands' standby reservations once they reach firmware visibility.
+    pub(crate) fn commit_render(&self, count: u32) {
+        if count == 0 {
+            return;
+        }
         if let Some(cache) = &self.cache {
-            if self
-                .unpublished_renders
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-                .is_ok()
-            {
-                cache.release_reserved(1);
+            if let Ok(prev) = self.unpublished_renders.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |n| Some(n.saturating_sub(count)),
+            ) {
+                let released = prev.min(count);
+                if released != 0 {
+                    cache.release_reserved(released);
+                }
             }
         }
     }
