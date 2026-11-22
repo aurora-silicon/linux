@@ -5500,6 +5500,42 @@ static bool apple_dart_serves_t8132_dcp_v27(const struct device_node *dart_np)
 	return serves;
 }
 
+/*
+ * Whether a DART the boot loader left locked keeps its firmware's roots
+ * (fw_mirror): Linux tables go only into root slots the firmware left
+ * empty or must mirror its leaves exactly, so the firmware's own
+ * translations stay live. Every locked DART of these SoCs does unless the
+ * boot loader handed its reserved tables over (fw_handoff) or it is one of
+ * the T8132 display DARTs borrowed on the 26.6.2 path (preserve_display).
+ * T6050's boot loader leaves every display DART locked on four-level roots
+ * of its own (dart-dcpextN SID 23, dart-dispextN SIDs 0 and 16); a T8132
+ * one locks the DARTs of the display processors it hands over on 27.2 (the
+ * J713's internal ones, the J773g's dcpext0). The DART's own state decides,
+ * not the board or the firmware build.
+ */
+static bool apple_dart_keeps_fw_roots(const struct apple_dart *dart,
+				      const struct device_node *np)
+{
+	static const char *const compatible[] = {
+		"apple,t6041-dart", "apple,t6050-dart", "apple,t8132-dart",
+		"apple,t8140-dart", "apple,t8142-dart", NULL
+	};
+
+	return dart->locked && !dart->fw_handoff && !dart->preserve_display &&
+	       of_device_compatible_match(np, compatible);
+}
+
+/*
+ * A T8132 fw_mirror DART's re-exported firmware segments take the protection
+ * of their live leaves (__apple_dart_fw_live_prot()). The other SoCs' locked
+ * DARTs keep what the core asks for: no row has checked the change there.
+ */
+static bool apple_dart_wants_fw_live_prot(const struct apple_dart *dart,
+					  const struct device_node *np)
+{
+	return dart->fw_mirror && of_device_is_compatible(np, "apple,t8132-dart");
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret, sid;
@@ -6045,17 +6081,9 @@ params_done:
 	/* Reserved table-page lifetime requires the matched three-level loader. */
 	dart->fw_handoff = apple_dart_fw_handoff_enabled(dart);
 	dart->display_scanout = dart->fw_handoff && apple_dart_display_scanout(dev->of_node);
-	/*
-	 * Preserve our retained-root path when no reserved-table handoff exists.
-	 * T6050's boot loader leaves every display DART locked on four-level
-	 * roots of its own (dart-dcpextN SID 23, dart-dispextN SIDs 0 and 16).
-	 */
-	dart->fw_mirror = dart->locked && !dart->fw_handoff &&
-		(of_device_is_compatible(dev->of_node, "apple,t6041-dart") ||
-		 of_device_is_compatible(dev->of_node, "apple,t6050-dart") ||
-		 of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
-		 of_device_is_compatible(dev->of_node, "apple,t8142-dart") ||
-		 t8132_display_v27);
+	/* Preserve our retained-root path when no reserved-table handoff exists. */
+	dart->fw_mirror = apple_dart_keeps_fw_roots(dart, dev->of_node);
+	dart->fw_live_prot = apple_dart_wants_fw_live_prot(dart, dev->of_node);
 	/*
 	 * The firmware-27 backend runs on the locked roots alone: a DART that
 	 * is not locked, or whose boot loader also handed over reserved tables,
@@ -6067,7 +6095,8 @@ params_done:
 		dev_err(dev, "T8132 internal display DART on the 27.2 image: NOT locked: refusing\n");
 	else if (t8132_display_v27)
 		dev_err(dev, "T8132 internal display DART on the 27.2 image: locked with a reserved-table handoff: refusing\n");
-	dart->fw_live_prot = t8132_display_v27;
+	else if (dart->fw_live_prot)
+		dev_info(dev, "T8132 DART locked by the boot loader: locked roots kept (mirror)\n");
 	if (t8132_display_v27 && !dart->fw_mirror) {
 		ret = -EINVAL;
 		goto err_clk_disable;
