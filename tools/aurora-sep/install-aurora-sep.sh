@@ -686,7 +686,7 @@ M3_PERSISTENT_MAIN_ARMED=0
 M3_GPU_BIN=/usr/local/bin
 M3_GPU_SCRIPTS=(
   "air-gpu-oneshot.sh 0cb379e91c4cdccbfa8591dfea362413bb420953918b4f6d29f0f610c9cd7923"
-  "air-gpu-collect.sh face8fac811b59c31a8e98e6ca704a2cb33eceada8bc37986397cb393b050b30"
+  "air-gpu-collect.sh 6a457261dc9773401f2ec7e436839a5f0d3b2bccdd9a90f013f8e72878189879"
   "air-gpu-job.sh 9a0eb9aab52fd099488054e4ed4846c579b19fc9f78144245242b6975a40da1d"
 )
 # The Mesa prefix air-gpu-job.sh runs with: mesa-m3's (12.4 on; it replaces the separate
