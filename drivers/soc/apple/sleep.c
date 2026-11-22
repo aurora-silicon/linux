@@ -3156,16 +3156,6 @@ static bool apple_sleep_gate_failed(struct apple_sleep *s)
 		struct apple_sleep_gate *g = &s->gate[i];
 
 		/* Even an always-on domain may read actual0: require a prepared protocol. */
-		/*
-		 * TRIAL ONLY (not for #2572): a RAM trial keeps the SEP driver off
-		 * (initcall_blacklist), so no sleep request can be prepared. Skip
-		 * the gate when no driver is bound at all; a bound SEP without a
-		 * stop handler still refuses. The SEP firmware keeps running.
-		 */
-		if (g->sep && !g->bound) {
-			dev_warn(s->dev, "TRIAL: SEP not bound (disabled for the trial): its gate skipped, the SEP is left running\n");
-			continue;
-		}
 		if (g->sep && (!g->bound || !apple_sleep_enclave.stop)) {
 			dev_err(s->dev, "refused: SEP has no prepared irreversible sleep request\n");
 			bad++;
