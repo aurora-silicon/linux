@@ -561,9 +561,10 @@ EXPORT_SYMBOL_IF_KUNIT(apr_build_decode_desc);
 /*
  * The decode descriptor carries no input length: the engine follows the
  * frame's own sizes. Every size it consumes must therefore be checked against
- * the payload here, before the engine is programmed. Each field is read once
- * into a local so that the parse itself stays in bounds even if the buffer
- * changes under it.
+ * the payload here, before the engine is programmed, and on a copy userspace
+ * cannot write (see apr_fill_decode_frame()). Each field is read once into a
+ * local, so that a parse of a buffer that changes under it, as at QBUF, still
+ * stays in bounds.
  */
 static int apr_parse_picture(const u8 *data, u32 bytes, u32 width,
 			     u32 height, bool interlaced, bool alpha,
