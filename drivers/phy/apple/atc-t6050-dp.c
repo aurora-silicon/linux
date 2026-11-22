@@ -624,6 +624,8 @@ static void atc_dp_tunnels_stop(struct t6050_dp *dp)
 	bool running = memchr_inv(dp->tunnel_rate, 0, sizeof(dp->tunnel_rate));
 
 	memset(dp->tunnel_rate, 0, sizeof(dp->tunnel_rate));
+	/* Every clock is stopped here: no stop deferred across s2idle is left. */
+	dp->s2idle_clock_stops = 0;
 	if (running) {
 		atc_dp_tunnels_apply(dp, 0, NULL);
 		return;
@@ -809,7 +811,16 @@ static int atc_s2idle_clock_stop(struct t6050_dp *dp, unsigned int i)
 
 	lockdep_assert_held(&dp->lock);
 	dp->tunnel_rate[i] = 0;
-	ret = atc_dp_tunnel_apply(dp, i + 1, NULL);
+	/*
+	 * The switches are written only in USB4 mode. If the PHY left it (or
+	 * faulted) since the stop was deferred, the clock no longer runs: only
+	 * its gate can still be held.
+	 */
+	if (dp->faulted || dp->combo_mode != COMBO_CIO) {
+		ret = dp->dp_gates ? atc_domain_set(&dp->dp_gate[i], false) : 0;
+	} else {
+		ret = atc_dp_tunnels_apply(dp, i + 1, NULL);
+	}
 	if (!ret)
 		dp->s2idle_clock_stops &= ~BIT(i);
 	return ret;
@@ -863,8 +874,10 @@ int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate)
 
 	stop = BIT(clock - 1);
 	if (dp->s2idle_frozen) {
-		if (rate)
+		if (rate) {
+			dev_dbg(dp->dev, "DP tunnel clock %u start refused across s2idle\n", clock);
 			return -EBUSY;
+		}
 		/* DCP may discard the route once it asks us to stop this clock. */
 		dp->s2idle_clock_stops |= stop;
 		return 0;
