@@ -198,6 +198,7 @@ impl Shared {
                     .and_then(|quiet| if quiet { Ok(()) } else { Err(EBUSY) })
                     .and_then(|_| {
                         if self.leave_for_commit(firmware) {
+                            firmware.power.release_clpc_now();
                             Ok(())
                         } else {
                             Err(EBUSY)

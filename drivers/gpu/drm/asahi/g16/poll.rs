@@ -123,7 +123,20 @@ impl Shared {
                             && firmware.power.utilization.decaying() =>
                     {
                         self.mod_poll(kernel::time::msecs_to_jiffies(
-                            (super::power::policy::WINDOW_NS / 1_000_000) as u32,
+                            (if firmware.power.clpc_holding() {
+                                super::power::policy::CLPC_IDLE_HOLD_NS
+                            } else {
+                                super::power::policy::WINDOW_NS
+                            } / 1_000_000) as u32,
+                        ));
+                        self.cancel_resnap();
+                    }
+                    Ok(false)
+                        if firmware.recovery.failed().is_none()
+                            && firmware.power.clpc_holding() =>
+                    {
+                        self.mod_poll(kernel::time::msecs_to_jiffies(
+                            (super::power::policy::CLPC_IDLE_HOLD_NS / 1_000_000) as u32,
                         ));
                         self.cancel_resnap();
                     }
@@ -224,6 +237,12 @@ impl Shared {
                 } else {
                     firmware.publish_checked(done)
                 };
+            }
+            if pub_res.is_ok()
+                && !firmware.engine.flights.is_empty()
+                && firmware.power.needs_ramp(now)
+            {
+                pub_res = firmware.service_power();
             }
             if let Err(error) = pub_res {
                 firmware.fail_stop(error, done);

@@ -202,6 +202,10 @@ for path, call in [
         ('poll.rs', 'Ok(false)\n                        if firmware.recovery.failed().is_none()\n'
                     '                            && firmware.power.utilization.decaying() =>\n'
                     '                    {\n                        self.mod_poll('),
+        ('poll.rs', '&& firmware.power.clpc_holding() =>'),
+        ('power.rs', 'if idle && self.power.clpc_hold.expire(now) {'),
+        ('recovery.rs', 'self.power.release_clpc_now();'),
+        ('sleep.rs', 'firmware.power.release_clpc_now();'),
 ]:
     assert (G16/path).read_text().count(call) == 1, (path, call)
 print('Governor connected at publication, drain, power service and idle re-arm')

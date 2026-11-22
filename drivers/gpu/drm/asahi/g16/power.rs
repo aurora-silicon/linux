@@ -155,8 +155,8 @@ impl Drop for Demand {
 /// provider sample the shared cooling policy keeps the ceiling at S1.
 pub(crate) struct Power {
     clpc: Demand,
-    /// The work-in-flight state last reported to `clpc`.
-    reported: Option<bool>,
+    /// Work-in-flight state and 2 ms idle-hold hysteresis reported to `clpc`.
+    clpc_hold: policy::ClpcHold,
     cooling: Cooling,
     sample: Sample,
     last_sample_ns: Option<u64>,
@@ -183,7 +183,7 @@ impl Power {
         Ok(Self {
             // First: a CLPC that has not probed yet defers before the PMP vote.
             clpc: Demand::new(dev)?,
-            reported: None,
+            clpc_hold: policy::ClpcHold::new(),
             cooling: Cooling::new(dev)?,
             sample: Sample {
                 temperature_mc: 0,
@@ -220,12 +220,31 @@ impl Power {
     }
 
     /// Reports a change of work in flight to the CLPC: the memory and fabric
-    /// floor follows it, not the GFX power state.
+    /// floor follows it, held for [`policy::CLPC_IDLE_HOLD_NS`] after drain.
     pub(crate) fn report_work(&mut self, in_flight: bool) {
-        if self.reported != Some(in_flight) {
-            self.clpc.set_active(in_flight);
-            self.reported = Some(in_flight);
+        if let Some(active) = self.clpc_hold.report(in_flight, now_ns()) {
+            self.clpc.set_active(active);
         }
+    }
+
+    /// Immediately drops the CLPC memory and fabric floor (fail-stop or sleep).
+    pub(crate) fn release_clpc_now(&mut self) {
+        if self.clpc_hold.release_now() {
+            self.clpc.set_active(false);
+        }
+    }
+
+    /// Whether the CLPC floor is held across an idle gap awaiting expiry.
+    pub(crate) fn clpc_holding(&self) -> bool {
+        self.clpc_hold.holding()
+    }
+
+    /// Whether an active burst below the current ceiling can ramp early.
+    pub(crate) fn needs_ramp(&self, now: u64) -> bool {
+        let level = self.governor.max(self.budget).max(self.sample.backstop);
+        let ceiling = policy::cooling_ceiling(self.top, level);
+        let limit = policy::limit(self.configured, ceiling, self.user);
+        self.utilization.ramp_due(now, limit)
     }
 
     fn ceiling(&mut self, now: u64, idle: bool) -> (u32, bool) {
@@ -270,6 +289,9 @@ impl Firmware {
         }
         let now = now_ns();
         let idle = self.engine.flights.is_empty();
+        if idle && self.power.clpc_hold.expire(now) {
+            self.power.clpc.set_active(false);
+        }
         let (limit, decision) = self.power.ceiling(now, idle);
         let target = self
             .power

@@ -177,6 +177,16 @@ impl Shared {
     __SUBMIT_LOCKED__
 }
 
+#[derive(Default)]
+struct Power {
+    ramp: bool,
+}
+impl Power {
+    fn needs_ramp(&self, _now: u64) -> bool {
+        self.ramp
+    }
+}
+
 struct Firmware {
     session: Session,
     objects: Objects,
@@ -184,6 +194,7 @@ struct Firmware {
     engine: Engine,
     events: Events,
     recovery: Recovery,
+    power: Power,
     last_housekeeping_ns: u64,
     // Test script knobs for retire_once / publish / housekeeping observation.
     retire_on_call: bool,
@@ -194,6 +205,7 @@ struct Firmware {
     publish_full_calls: u32,
     publish_checked_calls: u32,
     housekeeping_calls: u32,
+    power_calls: u32,
 }
 
 impl Firmware {
@@ -223,6 +235,7 @@ impl Firmware {
             },
             events: Events::default(),
             recovery: Recovery::default(),
+            power: Power::default(),
             last_housekeeping_ns: 0,
             retire_on_call: false,
             drain_stage_delta: 0,
@@ -232,6 +245,7 @@ impl Firmware {
             publish_full_calls: 0,
             publish_checked_calls: 0,
             housekeeping_calls: 0,
+            power_calls: 0,
         }
     }
 
@@ -246,6 +260,7 @@ impl Firmware {
         Ok(!self.recovery.pending)
     }
     fn service_power(&mut self) -> Result {
+        self.power_calls += 1;
         Ok(())
     }
     fn drain_rings(&mut self) -> Result {
