@@ -90,6 +90,7 @@ enum apple_clpc_rail {
  *	counts as streaming, see apple_clpc_gpu_streaming(); 0 counts it at once
  * @pmp_backoff: release that GPU floor while the PMP, voter agent
  *	@pmp_agent, limits the DCS, see apple_clpc_gpu_limited()
+ * @pmp_agent: PMC floor voter agent of the PMP, read for @pmp_backoff
  * @gpu_dense: submissions per sampling period that make light GPU work
  *	dense, see apple_clpc_gpu_dense(); 0 for none
  * @ane: state of each rail while ANE work is in flight; all zero disables input
