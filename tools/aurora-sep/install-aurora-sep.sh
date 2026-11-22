@@ -759,7 +759,7 @@ m3_pro_perf_activate() {
      $(cat /opt/mesa-m3/pro-vulkan/share/mesa-m3/profile) == t6030-pro-vulkan-legacy-hal ]] || die "paired Pro Mesa installation is incomplete"
   user=$(m3_pro_mesa_user)
   if [[ $user != root ]]; then
-    printf '%s' "$M3_PRO_PERF_MIGRATOR" | base64 -d > "$work/migrate-pro-session.py"
+    printf '%s' "$M3_PRO_PERF_MIGRATOR" | base64 -d | $sudo tee "$work/migrate-pro-session.py" >/dev/null
     $sudo runuser -u "$user" -- python3 - "$user" < "$work/migrate-pro-session.py" || die "could not update the managed native Pro session"
   fi
   $sudo systemctl enable mesa-m3-pro-performance.service
@@ -2694,8 +2694,8 @@ m3_pro_mesa_set_aside() {
   local file
   file=$(m3_pro_mesa_file)
   [[ -n $M3_PRO_MESA_PACKAGE && -f $work/$file ]] || return 0
-  mkdir -p "$work/m3-pro"
-  mv "$work/$file" "$work/m3-pro/"
+  $sudo mkdir -p "$work/m3-pro"
+  $sudo mv -- "$work/$file" "$work/m3-pro/"
 }
 
 # The M3_PRO_MESA_NEEDS entries this Mac does not satisfy, one "name version (needs min or
@@ -3875,7 +3875,7 @@ frozen_dependency_prepare() {
   for archive in "$@"; do args+=(--candidate "$archive"); done
   args+=(--allow-remove linux-asahi --allow-remove linux-asahi-headers
          --allow-remove m1n1 --allow-remove mesa-m3-g15g)
-  cat >"$work/frozen-dependencies.py" <<'FROZEN_DEPENDENCIES_PY'
+  $sudo tee "$work/frozen-dependencies.py" >/dev/null <<'FROZEN_DEPENDENCIES_PY'
 #!/usr/bin/env python3
 """Admit missing repository dependencies without changing installed packages."""
 import argparse
@@ -4222,7 +4222,7 @@ if __name__ == "__main__":
         sys.exit(1)
 FROZEN_DEPENDENCIES_PY
   say "Resolving only missing dependencies while preserving this image's package holds"
-  $sudo python3 "$work/frozen-dependencies.py" "${args[@]}" >"$work/dependency-result.json" ||
+  $sudo python3 "$work/frozen-dependencies.py" "${args[@]}" | $sudo tee "$work/dependency-result.json" >/dev/null ||
     die "could not admit a missing-only dependency transaction. Nothing was installed. The package holds were preserved."
   FROZEN_TRANSACTION_CONFIG=$(python3 - "$work/dependency-result.json" <<'FROZEN_CONFIG_PY'
 import json, sys
@@ -4230,7 +4230,7 @@ print(json.load(open(sys.argv[1]))['transaction_config'])
 FROZEN_CONFIG_PY
   )
   $sudo test -f "$FROZEN_TRANSACTION_CONFIG" || die "missing admitted package transaction configuration"
-  python3 - "$work/dependency-result.json" >"$work/dependency-files" <<'FROZEN_FILES_PY'
+  python3 - "$work/dependency-result.json" <<'FROZEN_FILES_PY' | $sudo tee "$work/dependency-files" >/dev/null
 import json, sys
 plan = json.load(open(sys.argv[1]))
 for filename in list(plan['candidate_sha256']) + [p['file'] for p in plan['dependencies']]:
@@ -4268,6 +4268,35 @@ package_database_check() {
   done <<<"$pending"
   ((${#unheld[@]} == 0)) || die "this Mac has ${#unheld[@]} package upgrade(s) pending (pacman -Qu; first: ${unheld[*]:0:8}).
     Run 'omarchy update', reboot, then retry. Installing repository dependencies before a full update would be a partial upgrade. Nothing was installed."
+}
+
+# The downloads were fetched and checked as the invoking user, in that user's own temporary
+# directory, so another process of that user could still change them before root uses them.
+# Under sudo, copy each listed file ("file sha256" lines on stdin) into a directory root owns
+# (the user's shell opens the source, so root itself opens nothing the user named), check its
+# sha256 again as root there, and use only that copy from then on: $work names it, and
+# candidate_archives is rewritten to it. The directory is 0700 while files arrive and 0755 after
+# (the user may read the packages, not change them).
+WORK_ROOT_OWNED=0
+INSTALL_ARCHIVES=()
+work_to_root() {
+  local old=$work new file sha
+  [[ -n $sudo ]] || return 0
+  new=$($sudo mktemp -d) || die "could not make a work directory for root. Nothing was installed."
+  work=$new
+  WORK_ROOT_OWNED=1
+  while read -r file sha; do
+    [[ -n $file ]] || continue
+    [[ $file != */* && $file != .* && $sha =~ ^[0-9a-f]{64}$ ]] ||
+      die "unexpected release file entry '$file'. Nothing was installed."
+    $sudo sh -c 'umask 022 && cat >"$1"' _ "$new/$file" <"$old/$file" ||
+      die "could not copy $file for root. Nothing was installed."
+    [[ $($sudo sha256sum -- "$new/$file" | cut -d' ' -f1) == "$sha" ]] ||
+      die "$file changed after its checksum was checked. Nothing was installed."
+  done
+  $sudo chmod 0755 "$new"
+  candidate_archives=("${candidate_archives[@]/#"$old/"/"$new/"}")
+  rm -rf -- "$old"
 }
 
 install_all() {
@@ -4343,6 +4372,9 @@ install_all() {
     [[ -n $file ]] || continue
     candidate_archives+=("$work/$file")
   done < <(desktop_fixes_files)
+  # Root installs and runs only its own checked copy of what was downloaded (work_to_root).
+  work_to_root < <(printf '%s\n' "${entries[@]}"; desktop_fixes_files)
+  INSTALL_ARCHIVES=("${candidate_archives[@]}")
   if ((M3_GPU_PERSISTENT)); then m3_persistent_package_check "$work/${M3_PRO_MESA_PACKAGE%% *}"; fi
   m3_pro_perf_verify
   m3_pro_mesa_set_aside
@@ -7349,7 +7381,7 @@ m3_install_cleanup() {
       fi
     fi
   fi
-  if ((FROZEN_PACKAGES)); then $sudo rm -rf "${work:-}"
+  if ((FROZEN_PACKAGES || WORK_ROOT_OWNED)); then $sudo rm -rf "${work:-}"
   else rm -rf "${work:-}"; fi
   return "$status"
 }
@@ -7421,7 +7453,16 @@ m3_install_packages() {
       M3_PRO_MESA_RESULT=installed
     fi
   else
-    $sudo pacman -U --noconfirm --ask 4 "$work"/*.pkg.tar.zst
+    # The checked archives (no glob over the directory), less a package set aside below it.
+    local archive
+    local -a archives=()
+    for archive in "${INSTALL_ARCHIVES[@]}"; do
+      [[ $archive == "$work"/*.pkg.tar.zst && -f $archive ]] && archives+=("$archive")
+    done
+    ((${#archives[@]})) || die "no checked package archives to install. Nothing was installed."
+    # In the order the directory listing gave them before.
+    mapfile -t archives < <(printf '%s\n' "${archives[@]}" | sort)
+    $sudo pacman -U --noconfirm --ask 4 "${archives[@]}"
   fi
   if ((M3_PRO_PERF_SELECTED)) && [[ -f $work/$(m3_pro_mesa_file) ]]; then M3_PRO_MESA_RESULT=installed; fi
   if ((M3_GPU_PERSISTENT)); then
@@ -8000,7 +8041,7 @@ m3_gpu_check_plan() {
 m3_gpu_check_install() {
   local sha
   m3_gpu_check_plan
-  m3_gpu_check_builtin >"$work/aurora-m3-gpu-check"
+  m3_gpu_check_builtin | $sudo tee "$work/aurora-m3-gpu-check" >/dev/null
   sha=$(sha256sum "$work/aurora-m3-gpu-check" | cut -d' ' -f1)
   $sudo python3 - "$work/aurora-m3-gpu-check" "$M3_GPU_CHECK" "$STATE/m3-gpu-check" "$sha" <<'M3_CHECK_INSTALL_PY'
 import hashlib, os, stat, sys, tempfile
@@ -10638,22 +10679,35 @@ m3max_kit_identity() {
 # This script, on disk, into the work directory: the runner the kit installs. From a pipe
 # (curl ... | bash) it can't be read again, so this release's copy is downloaded, and it must
 # install exactly what this one does (m3max_kit_identity).
+M3MAX_KIT_SELF_SHA=""
 m3max_kit_self() {
   local out=$M3MAX_KIT_WORK/install-aurora-sep.sh theirs rc=0
   if [[ $SELF_SOURCE == file && -f $SELF_PATH ]]; then
     cp "$SELF_PATH" "$out"
     [[ $(sha256sum "$out" | cut -d' ' -f1) == "$SELF_SHA256" ]] || die "this script changed while it ran. Nothing was changed."
+    M3MAX_KIT_SELF_SHA=$SELF_SHA256
     return 0
   fi
   say "Downloading this release's install-aurora-sep.sh, for the kit's runner"
   fetch_release_file "$RELEASE_URL/install-aurora-sep.sh" "$out" || rc=$?
   ((rc == 0)) || die "could not download install-aurora-sep.sh from $TAG (curl exit $rc). Nothing was changed."
+  # The hash root's copy must have, taken before the identity check reads the file.
+  M3MAX_KIT_SELF_SHA=$(sha256sum "$out" | cut -d' ' -f1)
   # shellcheck disable=SC2016 # expanded by that bash
   theirs=$(bash -c 'AURORA_SEP_SOURCE_ONLY=1 source "$1" >/dev/null 2>&1 && m3max_kit_identity' _ "$out" 2>/dev/null) || theirs=""
   [[ -n $theirs && $theirs == "$(m3max_kit_identity)" ]] ||
     die "the install-aurora-sep.sh of $TAG is not the script that runs now (another release?). Run the
     kit's command again. Nothing was changed."
   chmod 0755 "$out"
+}
+
+# As root, the kit's work directory must be root's own: its files are run and installed as root.
+m3max_kit_work_is_root() {
+  local owner mode
+  [[ -d $M3MAX_KIT_WORK && ! -L $M3MAX_KIT_WORK ]] || die "the kit's work directory $M3MAX_KIT_WORK is missing. Nothing was changed."
+  read -r owner mode < <(stat -c '%u %a' "$M3MAX_KIT_WORK")
+  [[ $owner == "$EUID" ]] && (((8#$mode & 8#022) == 0)) ||
+    die "the kit's work directory $M3MAX_KIT_WORK is not root's own (owner $owner, mode $mode). Nothing was changed."
 }
 
 # How many restarts the plan takes at most, and roughly how long, for the consent screen.
@@ -10784,15 +10838,49 @@ m3max_kit_setup() { # [--yes] [--kit-work DIR]
   if [[ -z $M3MAX_KIT_WORK ]]; then M3MAX_KIT_WORK=$(mktemp -d); fi
   M3MAX_KIT_USER_NAME=${SUDO_USER:-$(id -un)}
   # The kit runs as root from here (its state, its checks of the EFI variables, its runner), from
-  # this script's copy on disk.
+  # this script's copy on disk. Root does not run or install files from the invoking user's
+  # directory: it copies this
+  # script's checked copy into a directory of its own, opening it without following a link and
+  # only as a regular file of the invoking user's, checks the sha256 of its copy, and runs that
+  # copy with its own directory as the kit's work directory, where it downloads and checks the
+  # kit's other files itself.
   if [[ -n $sudo ]]; then
     m3max_kit_self
     say "The kit runs as root from here on (sudo may ask for your password)."
     a=()
     ((M3MAX_KIT_YES == 0)) || a=(--yes)
-    exec $sudo --preserve-env=AURORA_RELEASE_URL,AURORA_RELEASES_API bash "$M3MAX_KIT_WORK/install-aurora-sep.sh" \
-      --m3max-kit --kit-work "$M3MAX_KIT_WORK" "${a[@]}"
+    local rc=0
+    # shellcheck disable=SC2016 # expanded by that bash
+    $sudo --preserve-env=AURORA_RELEASE_URL,AURORA_RELEASES_API bash -c '
+      set -eu
+      d=$(mktemp -d)
+      if ! python3 -I - "$1" "$d/install-aurora-sep.sh" "$2" "$(id -u "$3")" <<"KIT_SELF_COPY_PY"
+import hashlib, os, stat, sys
+src, dst, want, uid = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+st = os.fstat(fd)
+if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_size > 64 << 20:
+    sys.exit("not a regular file of the invoking user")
+with os.fdopen(fd, "rb") as f:
+    data = f.read(64 << 20)
+if hashlib.sha256(data).hexdigest() != want:
+    sys.exit("its sha256 differs from the checked one")
+out = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o755)
+with os.fdopen(out, "wb") as f:
+    f.write(data)
+KIT_SELF_COPY_PY
+      then
+        rm -rf "$d"
+        echo "install-aurora-sep: error: root could not take the kit script ($1) as checked. Nothing was changed." >&2
+        exit 1
+      fi
+      shift 3
+      exec bash "$d/install-aurora-sep.sh" --m3max-kit --kit-work "$d" "$@"' \
+      _ "$M3MAX_KIT_WORK/install-aurora-sep.sh" "$M3MAX_KIT_SELF_SHA" "$(id -un)" "${a[@]}" || rc=$?
+    rm -rf -- "$M3MAX_KIT_WORK"
+    exit "$rc"
   fi
+  m3max_kit_work_is_root
   [[ -f $M3MAX_KIT_WORK/install-aurora-sep.sh ]] || m3max_kit_self
   m3max_kit_preflight
   m3max_kit_consent

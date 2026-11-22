@@ -78,6 +78,7 @@ jobs:
           python3 -m unittest discover -s tools/aurora-sep/tests -p test_kernel_log_anchor.py -v
           python3 -m unittest discover -s tools/aurora-sep/tests -p test_collect_handover.py -v
           python3 -m unittest discover -s tools/aurora-sep/tests -p test_touchid_package.py -v
+          python3 -m unittest discover -s tools/aurora-sep/tests -p test_root_staging.py -v
 
   rust-build:
     runs-on: ubuntu-24.04
