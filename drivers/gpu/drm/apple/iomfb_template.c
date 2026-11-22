@@ -21,6 +21,8 @@
 #include <linux/slab.h>
 #include <linux/unaligned.h>
 
+#include <kunit/static_stub.h>
+
 #include <drm/drm_color_mgmt.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
@@ -1257,6 +1259,28 @@ static void dcpep_cb_unmap_piodma(struct apple_dcp *dcp,
 }
 
 /*
+ * Whether one more buffer of @size bytes keeps the live allocate_buffer
+ * buffers within the budget the link backends use as well.
+ */
+static bool dcp_fw_buffer_fits(struct apple_dcp *dcp, size_t size)
+{
+	unsigned int count = 0;
+	size_t bytes = 0;
+	u32 id;
+
+	for_each_set_bit(id, dcp->memdesc_map, DCP_MAX_MAPPINGS) {
+		/* map_physical descriptors have no buffer */
+		if (!dcp->memdesc[id].buf)
+			continue;
+		count++;
+		bytes += ALIGN(dcp->memdesc[id].size, SZ_16K);
+	}
+
+	return count < DCP_FW_MAX_BUFFERS && bytes <= DCP_FW_MAX_BUFFER_BYTES &&
+	       size <= DCP_FW_MAX_BUFFER_BYTES - bytes;
+}
+
+/*
  * Allocate an IOVA contiguous buffer mapped to the DCP. The buffer need not be
  * physically contiguous, however we should save the sgtable in case the
  * buffer needs to be later mapped for PIODMA.
@@ -1272,7 +1296,13 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 	int ret;
 
 	/* Validate both wire-size and IOMMU-page rounding before allocating. */
+	/*
+	 * Native26 is bounded by ext26_allocate()'s own session budget: its
+	 * release callback keeps every buffer until rebind, so the live-buffer
+	 * budget below would count the whole session.
+	 */
 	if (!req->size || req->size > SIZE_MAX ||
+	    (!dcp_is_ext26(dcp) && req->size > DCP_FW_MAX_BUFFER) ||
 	    check_add_overflow((size_t)req->size, (size_t)4095, &rounded))
 		return resp;
 	allocated.size = round_down(rounded, 4096);
@@ -1284,6 +1314,13 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 
 	if (id >= DCP_MAX_MAPPINGS) {
 		dev_warn(dcp->dev, "DCP overflowed mapping table, ignoring\n");
+		return resp;
+	}
+
+	if (!dcp_is_ext26(dcp) && !dcp_fw_buffer_fits(dcp, size)) {
+		dev_warn_ratelimited(dcp->dev,
+				     "refusing a %zu byte buffer over the DCP buffer budget\n",
+				     size);
 		return resp;
 	}
 
@@ -1469,6 +1506,8 @@ static u64 dcpep_cb_get_frequency(struct apple_dcp *dcp)
 static dma_addr_t dcpep_map_reg_dva(struct apple_dcp *dcp, u32 index,
 				    struct resource *rsrc)
 {
+	KUNIT_STATIC_STUB_REDIRECT(dcpep_map_reg_dva, dcp, index, rsrc);
+
 #if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 	/*
 	 * T8122 dcpext: with the PMGR bandwidth page mapped, the DART faults
@@ -1489,6 +1528,26 @@ static dma_addr_t dcpep_map_reg_dva(struct apple_dcp *dcp, u32 index,
 #endif
 	return dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
 				DMA_BIDIRECTIONAL, 0);
+}
+
+/*
+ * map_reg may come again for a window: hand out the first mapping rather
+ * than map the window (or allocate its scratch page) once more.
+ */
+static dma_addr_t dcpep_map_reg_once(struct apple_dcp *dcp, u32 index,
+				     struct resource *rsrc)
+{
+	dma_addr_t dva;
+
+	if (test_bit(index, dcp->disp_reg_mapped))
+		return dcp->disp_reg_dva[index];
+
+	dva = dcpep_map_reg_dva(dcp, index, rsrc);
+	if (dva == DMA_MAPPING_ERROR)
+		return dva;
+	dcp->disp_reg_dva[index] = dva;
+	set_bit(index, dcp->disp_reg_mapped);
+	return dva;
 }
 #endif
 
@@ -1520,7 +1579,7 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 		 */
 		dma_addr_t dva = rsrc->start;
 #elif DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		dma_addr_t dva = dcpep_map_reg_dva(dcp, req->index, rsrc);
+		dma_addr_t dva = dcpep_map_reg_once(dcp, req->index, rsrc);
 		WARN_ON(dva == DMA_MAPPING_ERROR);
 #endif
 
