@@ -79,7 +79,8 @@ typedef uint32_t u32;
 #define FIELD_PREP(m,v) (((v) << __builtin_ctz(m)) & (m))
 #define __iomem
 #define guard(x) fake_guard
-#define dev_warn(...) ((void)0)
+static unsigned warns __attribute__((unused));
+#define dev_warn(...) ((void)warns++)
 #define dev_err(...) ((void)0)
 #define dev_dbg(...) ((void)0)
 #define READ_ONCE(x) (x)
@@ -340,6 +341,12 @@ int main(void)
     pm_suspend_target_state=PM_SUSPEND_TO_IDLE; kept=writes;
     assert(!atcphy_suspend(&dev) && a.t8132_suspended && a.t8132_common_owned && writes==kept);
     assert(!atcphy_resume(&dev) && !a.t8132_suspended && a.t8132_common_owned);
+    /* Losing the domain under it is reported for a device as for a host. */
+    warns=0;
+    assert(!atcphy_suspend(&dev) && a.t8132_suspended);
+    a.pd_was_off=true;
+    assert(!atcphy_resume(&dev) && !a.t8132_suspended && warns==1);
+    a.pd_was_off=false;
     /* A controller held in reset has nothing keeping the domain on. */
     a.dwc3_running=false;
     assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
@@ -440,6 +447,11 @@ int main(void)
             "(!atcphy->dwc3_running || pm_suspend_target_state", "(!atcphy->t8132_ss || pm_suspend_target_state", 1)
         assert no_reset != program
         run(Path(directory), "suspend-reset-negative-control", no_reset, expect_failure=True)
+        host_warn = program.replace(
+            "atcphy->t8132_common_owned && atcphy->dwc3_running &&\n\t    READ_ONCE(atcphy->pd_was_off)",
+            "atcphy->t8132_common_owned && atcphy->host_active &&\n\t    READ_ONCE(atcphy->pd_was_off)", 1)
+        assert host_warn != program
+        run(Path(directory), "resume-warn-host-only-negative-control", host_warn, expect_failure=True)
         permissive = program.replace(
             "if (atcphy->mode_dirty)\n\t\treturn -EBUSY;", "if (false)\n\t\treturn -EBUSY;", 1)
         assert permissive != program
@@ -714,7 +726,7 @@ static void usb_phy_set_suspend(void *p,int v) { (void)p;assert(v==1); }
 static void dwc3_core_exit_after_phy_power_off(struct dwc3 *d) {
     (void)d;assert(!atc.t8132_common_owned);event(6);
 }
-static int reset_control_assert(void *p) { (void)p;reset_calls++;event(7);return 0; }
+static int reset_control_assert(void *p) { (void)p;reset_calls++;atc.dwc3_running=false;event(7);return 0; }
 static unsigned rpm_puts,cancels;
 static const int dwc3_apple_glue_ops;
 static void pm_runtime_get_noresume(struct device *d) { (void)d;assert(0); }
@@ -782,7 +794,7 @@ int main(void)
     }
     init(&p,&a);a.state=DWC3_APPLE_HOST;a.core_active=a.reset_pending=true;
     a.usb3_power_off_pending=a.usb2_power_off_pending=1;
-    atc.t8132_common_owned=atc.host_active=true;a.rpm_held=true;
+    atc.t8132_common_owned=atc.host_active=atc.dwc3_running=true;a.rpm_held=true;
     dwc3_apple_shutdown(&p);
     unsigned expected[]={1,2,3,4,5,6,7};
     assert(count==7 && !memcmp(stage,expected,sizeof(expected)));
@@ -793,10 +805,11 @@ int main(void)
     /* A failed PHY release never reaches core exit or controller reset. */
     init(&p,&a);a.state=DWC3_APPLE_HOST;a.core_active=a.reset_pending=true;
     a.usb3_power_off_pending=a.usb2_power_off_pending=1;
-    atc.t8132_common_owned=atc.host_active=true;fail_phy=1;
+    atc.t8132_common_owned=atc.host_active=atc.dwc3_running=true;fail_phy=1;
     dwc3_apple_shutdown(&p);
     assert(count==4 && stage[0]==1 && stage[3]==4 && !reset_calls);
     assert(atc.t8132_common_owned && atc.t8132_failed && a.core_active && a.reset_pending);
+    assert(atc.dwc3_running);
     supplier.dev.data=&atc;atcphy_shutdown(&supplier);assert(!provider_stops);
     /* Provider may finish a successful configured epoch with no consumer. */
     init(&p,&a);atc.t8132_common_owned=true;supplier.dev.data=&atc;
@@ -804,7 +817,8 @@ int main(void)
     for(unsigned blocked=0;blocked<4;blocked++) {
         init(&p,&a);atc.t8132_common_owned=true;supplier.dev.data=&atc;
         if(blocked==0) atc.t8132_failed=true;
-        if(blocked==1) atc.host_active=true;
+        /* DWC3 left out of reset, as a device: its reset assert failed. */
+        if(blocked==1) atc.dwc3_running=true;
         if(blocked==2) atc.pipe_pending=true;
         if(blocked==3) atc.pipe_state=ATCPHY_PIPEHANDLER_STATE_USB3;
         atcphy_shutdown(&supplier);assert(!provider_stops && atc.t8132_common_owned);
@@ -827,6 +841,10 @@ int main(void)
             broken=broken.replace("static void platform_set_drvdata", "static inline void platform_set_drvdata")
             broken=broken.replace("static void dev_set_drvdata", "static inline void dev_set_drvdata")
             run(Path(directory),"shutdown-negative-"+name,broken,expect_failure=True)
+        host_guard=shutdown.replace("atcphy->t8132_failed || atcphy->dwc3_running ||",
+                                    "atcphy->t8132_failed || atcphy->host_active ||",1)
+        assert host_guard!=shutdown
+        run(Path(directory),"shutdown-negative-host-only-guard",host_guard,expect_failure=True)
         framework = (root / "drivers/phy/phy-core.c").read_text()
         for name in ["phy_init", "phy_exit", "phy_power_off"]:
             framework = framework.replace("\nint "+name+"(", "\nstatic int "+name+"(")

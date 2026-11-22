@@ -7882,7 +7882,8 @@ static int atcphy_resume(struct device *dev)
 	if (atcphy->cio_sleep.prepared)
 		return atcphy->cio_sleep.changed && !atcphy->cio_sleep.restored ? -EIO : 0;
 	atcphy->t8132_suspended = false;
-	if (atcphy->t8132_common_owned && atcphy->host_active &&
+	/* Suspend admitted a common epoch only with DWC3 running, in either role. */
+	if (atcphy->t8132_common_owned && atcphy->dwc3_running &&
 	    READ_ONCE(atcphy->pd_was_off))
 		dev_warn(dev, "power domain went off under an active USB3 link\n");
 	/* DP tunnel pixel clocks are then set up again at their next rate change. */
@@ -7912,7 +7913,8 @@ static void atcphy_shutdown(struct platform_device *pdev)
 	atcphy->t8132_suspended = true;
 	if (!atcphy->t8132_common_owned)
 		return;
-	if (atcphy->t8132_failed || atcphy->host_active || atcphy->pipe_pending ||
+	/* DWC3 still out of reset, in either role, means its shutdown did not finish. */
+	if (atcphy->t8132_failed || atcphy->dwc3_running || atcphy->pipe_pending ||
 	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY) {
 		dev_err(atcphy->dev, "Shutdown retains incomplete USB3 common ownership\n");
 		return;
