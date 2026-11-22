@@ -795,6 +795,13 @@ static inline int ane_fw_transport_shared_reserve(struct ane_fw_transport *t, si
 	if (ane_fw_shared_reusable(t, size, tag) < t->shared_count)
 		return 0;
 	ret = ane_fw_shared_add(t, size, tag, &i);
+	/*
+	 * An invalid surface from the backend is a host error, as it is for a
+	 * request (ane_fw_transport_shared()): its mapping is not recorded, so
+	 * retrying would map another one at every LOAD.
+	 */
+	if (ret == -EPROTO)
+		return ane_fw_transport_fail(t, ret);
 	if (ret)
 		return ret;
 	t->shared_retired[i] = true;

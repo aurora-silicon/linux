@@ -676,6 +676,8 @@ static int h16_process_pool(struct ane_h16_session *s)
 		ret = ane_fw_transport_shared_reserve(s->transport, SZ_2M,
 						      ANE_FW_SHARED_EXPP);
 	}
+	if (ret && s->transport->error)
+		return h16_fail(s, ret);
 	if (ret)
 		s->ops->log(s->ctx, "LOAD: no process pool", (u64)-ret,
 			    s->transport->shared_bytes);
