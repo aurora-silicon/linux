@@ -65,7 +65,7 @@ const AUX_DRAIN_NS: u64 = 10_000_000;
 const EVENT_RETIRE_POLLS: u32 = 11;
 mod hw {
     pub mod sizes {
-        pub const TA_WAVE_PASSES: usize = 3;
+        pub const TA_WAVE_PASSES: usize = 8;
     }
 }
 
@@ -848,21 +848,21 @@ fn ta_only_irq_wakes_ta_wave_wait_without_spinning_retry_tail() {
     let mut fw = Firmware::new();
     fw.engine.flights.push(Flight {
         computes: 0,
-        renders: 3,
+        renders: 8,
         target: 0,
-        fs_target: 0x300,
+        fs_target: 0x800,
     });
-    fw.engine.fs_target = 0x300;
+    fw.engine.fs_target = 0x800;
     fw.engine.pending.push(Arc::new(Job { id: 2 }));
     fw.engine.ta_wave_wait = true;
-    fw.ta_pending = 3;
+    fw.ta_pending = 8;
     fw.drain_stage_delta = 1;
     fw.drain_fs_delta = 0;
 
     let mut retry_tail = false;
     let mut deferred = false;
     let mut done = vec![];
-    // TA still full (3 >= 3): no publish_checked wakeup and no retry_tail spin.
+    // TA still full (8 >= 8): no publish_checked wakeup and no retry_tail spin.
     assert!(fw
         .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
         .unwrap());
@@ -870,9 +870,9 @@ fn ta_only_irq_wakes_ta_wave_wait_without_spinning_retry_tail() {
     assert!(!retry_tail);
     assert!(!fw.engine.short_repoll);
 
-    // TA finishes one pass (ta_pending drops to 2 < 3) on a TA-only 0x70 IRQ while FS is still
+    // TA finishes one pass (ta_pending drops to 7 < 8) on a TA-only 0x70 IRQ while FS is still
     // running: immediately wakes publish_checked() without spinning retry_tail or short_repoll.
-    fw.ta_pending = 2;
+    fw.ta_pending = 7;
     assert!(fw
         .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
         .unwrap());

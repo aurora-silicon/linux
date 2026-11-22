@@ -981,17 +981,37 @@ impl Firmware {
                     self.engine.stats.hold[0] += 1;
                     break;
                 }
+                let ta_wave_paused = self.ta_pending_passes() >= super::hw::sizes::TA_WAVE_PASSES;
                 let mut alt: Option<usize> = None;
                 for (i, cand) in self.engine.pending.iter().enumerate() {
                     if i == index || !self.can_queue_behind(cand) {
                         continue;
                     }
                     // Preserve per-queue FIFO: never jump a later job of a queue ahead
-                    // of an earlier pending job of the same queue.
-                    if self.engine.pending[..i]
-                        .iter()
-                        .any(|earlier| Arc::ptr_eq(&earlier.queue, &cand.queue))
-                    {
+                    // of an earlier pending job of the same queue, except when TA wave
+                    // pacing pauses earlier ready renders and an independent non-query
+                    // compute (such as pre-gfx culling) has all dependencies published
+                    // (`can_queue_behind` already checked `check_command_dependencies`).
+                    let same_queue_blocked = self.engine.pending[..i].iter().any(|earlier| {
+                        if !Arc::ptr_eq(&earlier.queue, &cand.queue) {
+                            return false;
+                        }
+                        let allow_pre_gfx = ta_wave_paused
+                            && matches!(
+                                command(cand, cand.progress.sent()),
+                                Some(Command::Compute(c)) if !c.query_access
+                            )
+                            && matches!(
+                                command(earlier, earlier.progress.sent()),
+                                Some(Command::Render(_))
+                            )
+                            && !self.needs_engine_drain(earlier)
+                            && earlier
+                                .check_command_dependencies(earlier.progress.sent())
+                                .is_ok();
+                        !allow_pre_gfx
+                    });
+                    if same_queue_blocked {
                         continue;
                     }
                     let better = match alt {
@@ -1231,11 +1251,12 @@ impl Firmware {
         result
     }
 
-    /// Rings each submit channel touched during a publication batch once, preserving
+    /// Rings each submit channel touched during a publication batch once, waking Compute
+    /// first so pre-gfx compute starts immediately ahead of TA barriers while preserving
     /// FS-before-TA doorbell order for render batches.
     fn flush_doorbells(&mut self, pending_rings: &mut u8) -> Result {
         let mask = core::mem::take(pending_rings);
-        for channel in [Channel::Fs, Channel::Ta, Channel::Compute] {
+        for channel in [Channel::Compute, Channel::Fs, Channel::Ta] {
             if mask & (1u8 << (channel as u8)) != 0 {
                 self.session.ring(channel)?;
             }

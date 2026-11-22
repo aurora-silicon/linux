@@ -731,9 +731,9 @@ pub(crate) mod sizes {
     /// Worst-case firmware work-ring entries per compute command (`fs2c` barrier + `work`).
     pub(crate) const MAX_COMPUTE_RING_ENTRIES: usize = 2;
     /// Maximum unfinished TA passes kept in flight at once so multi-pass render bursts pace
-    /// TA in `<= 3`-pass waves without throttling single-pass pipelining (where TA finishes
+    /// TA in `<= 8`-pass waves without throttling single-pass pipelining (where TA finishes
     /// well ahead of FS).
-    pub(crate) const TA_WAVE_PASSES: usize = 3;
+    pub(crate) const TA_WAVE_PASSES: usize = 8;
     /// Base render pass slots allocated on first render (full TPC/tilemap capacity).
     pub(crate) const BASE_RENDER_SLOTS: usize = 2;
     /// Retained render pass slots per VM at most. A slot is reused only after a later render

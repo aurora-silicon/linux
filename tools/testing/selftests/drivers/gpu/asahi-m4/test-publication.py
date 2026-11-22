@@ -152,7 +152,7 @@ mod encode {
     // containment branch below decides whether the unit becomes claimable again.
     pub fn preserve_compute_descriptor(refs:&ComputeRefs,_old:&[u8;160],_before:u64,_work:&mut[u8;8192])->Result<(),()>{if refs.invalid{Err(())}else{Ok(())}}
 }
-mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=3; } }
+mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=8; } }
 mod command {pub const RENDER:usize=0;pub const COMPUTE:usize=1;}
 thread_local!{static CLOCK:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};}
 fn now_ns()->u64{CLOCK.with(|clock|clock.get())}
@@ -581,27 +581,100 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         assert_eq!(j1.queue.turn.load(Ordering::Relaxed),11);
         assert_eq!(f.engine.turn,11);
     }
-    #[test]fn ta_wave_pacing_flushes_doorbell_at_three_passes_and_arms_ta_wave_wait(){
+    #[test]fn mixed_compute_and_render_batch_rings_compute_before_fs_and_ta(){
         let vm1=mk_vm(1);
-        let r1=job_on_vm(1,vm1.clone(),true,0,Ok(()));
-        let r2=job_on_vm(2,vm1.clone(),true,0,Ok(()));
-        let r3=job_on_vm(3,vm1.clone(),true,0,Ok(()));
-        let r4=job_on_vm(4,vm1.clone(),true,0,Ok(()));
-        let c5=job_on_vm(5,vm1,false,0,Ok(()));
         let mut f=firmware(
-            vec![r1,r2,r3,r4,c5],
-            vec![(Ok(()),true),(Ok(()),true),(Ok(()),true),(Ok(()),true)],
+            vec![job_on_vm(1,vm1.clone(),true,0,Ok(())),job_on_vm(2,vm1,false,0,Ok(()))],
+            vec![(Ok(()),true),(Ok(()),true)],
         );
         f.allow_behind=true;
         let mut done=vec![];
+        assert_eq!(f.publish(&mut done),Ok(()));
+        assert_eq!(f.attempted,[1,2]);
+        assert_eq!(f.session.rings,[Channel::Compute,Channel::Fs,Channel::Ta]);
+    }
+    #[test]fn ta_wave_pacing_flushes_doorbell_at_eight_passes_and_arms_ta_wave_wait(){
+        let vm1=mk_vm(1);
+        let mut jobs:Vec<Arc<Job>>=(1..=9).map(|id|job_on_vm(id,vm1.clone(),true,0,Ok(()))).collect();
+        jobs.push(job_on_vm(10,vm1,false,0,Ok(())));
+        let stages=vec![(Ok(()),true);9];
+        let mut f=firmware(jobs,stages);
+        f.allow_behind=true;
+        let mut done=vec![];
         assert_eq!(f.publish_checked(&mut done),Ok(()));
-        // Passes 1..3 fill TA_WAVE_PASSES (3) and ring FS+TA immediately; pass 4 pauses with
-        // ta_wave_wait=true while alt compute job 5 still publishes on Compute.
-        assert_eq!(f.attempted,[1,2,3,5]);
+        // Passes 1..8 fill TA_WAVE_PASSES (8) and ring FS+TA immediately; pass 9 pauses with
+        // ta_wave_wait=true while alt compute job 10 still publishes on Compute.
+        assert_eq!(f.attempted,[1,2,3,4,5,6,7,8,10]);
         assert_eq!(f.session.rings,[Channel::Fs,Channel::Ta,Channel::Compute]);
         assert!(f.engine.ta_wave_wait);
         assert!(!f.engine.slot_wait);
         assert_eq!(f.engine.pending.len(),1);
+    }
+    #[test]fn same_queue_independent_compute_bypasses_ta_wave_paused_render_only(){
+        let vm1=mk_vm(1);
+        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let mk=|id:u32,render:bool,query_access:bool,dep:Result|Arc::new(Job{
+            id,vm:vm1.clone(),queue:q1.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access})}],
+            dependency:dep,terminal_marked:AtomicBool::new(false),resources:Resources,
+        });
+        // Seed 8 active TA passes so TA wave pacing is active.
+        let mut active_flights=Vec::new();
+        for id in 1..=8 {
+            let mut fl=Flight::new(mk(id,true,false,Ok(())));
+            fl.renders=1;
+            active_flights.push(fl);
+        }
+        // On q1: render 9 is TA-wave paused; independent !query_access compute 10 bypasses it.
+        let r9=mk(9,true,false,Ok(()));
+        let c10=mk(10,false,false,Ok(()));
+        let mut f=firmware(vec![r9,c10],vec![(Ok(()),true)]);
+        f.engine.flights=active_flights;
+        f.allow_behind=true;
+        let mut done=vec![];
+        assert_eq!(f.publish_checked(&mut done),Ok(()));
+        assert_eq!(f.attempted,[10]);
+        assert_eq!(f.engine.pending.len(),1);
+        assert!(f.engine.ta_wave_wait);
+
+        // query_access compute on the same queue must NOT bypass TA-wave-paused render.
+        let mut f_q=firmware(vec![mk(11,true,false,Ok(())),mk(12,false,true,Ok(()))],vec![]);
+        for id in 1..=8 {
+            let mut fl=Flight::new(mk(id,true,false,Ok(())));
+            fl.renders=1;
+            f_q.engine.flights.push(fl);
+        }
+        f_q.allow_behind=true;
+        assert_eq!(f_q.publish_checked(&mut done),Ok(()));
+        assert!(f_q.attempted.is_empty());
+
+        // Dependent compute (dependency Err(EAGAIN)) must NOT bypass TA-wave-paused render.
+        let mut f_dep=firmware(vec![mk(13,true,false,Ok(())),mk(14,false,false,Err(EAGAIN))],vec![]);
+        for id in 1..=8 {
+            let mut fl=Flight::new(mk(id,true,false,Ok(())));
+            fl.renders=1;
+            f_dep.engine.flights.push(fl);
+        }
+        f_dep.allow_behind=true;
+        assert_eq!(f_dep.publish_checked(&mut done),Ok(()));
+        assert!(f_dep.attempted.is_empty());
+
+        // Later compute must NEVER jump an earlier pending compute on the same queue.
+        let mut f_cc=firmware(
+            vec![mk(15,true,false,Ok(())),mk(16,false,true,Ok(())),mk(17,false,false,Ok(()))],
+            vec![],
+        );
+        for id in 1..=8 {
+            let mut fl=Flight::new(mk(id,true,false,Ok(())));
+            fl.renders=1;
+            f_cc.engine.flights.push(fl);
+        }
+        f_cc.allow_behind=true;
+        f_cc.block_compute_behind=false;
+        // Job 16 is query_access (cannot bypass render 15); job 17 sits behind compute 16 so it must also wait.
+        assert_eq!(f_cc.publish_checked(&mut done),Ok(()));
+        assert!(f_cc.attempted.is_empty());
     }
 
 }
@@ -1130,32 +1203,34 @@ mod queue_behind_scope {
         let r_live=mk(1);
         let next_r=mk(2);
         let mut r_ta=[0u32;16];
-        r_ta[0]=0x100;r_ta[1]=0x200;r_ta[2]=0x300;
+        for i in 0..8 {
+            r_ta[i]=(i as u32 + 1)*0x100;
+        }
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:0,draw:3,ta_target:0x300,flights:vec![QueueBehindFlight{
-                job:r_live,group:vec![],first:0,count:3,computes:0,renders:2,target:0,cstamp:[0;16],
-                r_ta_stamp:r_ta,r_fs_stamp:r_ta,fs_target:0x300,
+            engine:QueueBehindEngine{ordinal:0,draw:8,ta_target:0x800,flights:vec![QueueBehindFlight{
+                job:r_live,group:vec![],first:0,count:8,computes:0,renders:7,target:0,cstamp:[0;16],
+                r_ta_stamp:r_ta,r_fs_stamp:r_ta,fs_target:0x800,
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
-        // Below TA_WAVE_PASSES (2 < 3): zero WC fw_stamp reads.
-        assert_eq!(p.ta_pending_passes(),2);
+        // Below TA_WAVE_PASSES (7 < 8): zero WC fw_stamp reads.
+        assert_eq!(p.ta_pending_passes(),7);
         assert_eq!(p.graph.render.fw_stamp[0].reads.get(),0);
         assert!(p.can_queue_behind(&next_r));
-        // 3 unfinished TA passes: paces render queue_behind until TA advances.
-        p.engine.flights[0].renders=3;
-        assert_eq!(p.ta_pending_passes(),3);
+        // 8 unfinished TA passes: paces render queue_behind until TA advances.
+        p.engine.flights[0].renders=8;
+        assert_eq!(p.ta_pending_passes(),8);
         assert!(p.graph.render.fw_stamp[0].reads.get()>0);
         assert!(!p.can_queue_behind(&next_r));
-        // Once pass 0 finishes TA (obs=0x100) while FS is still running, ta_pending drops to 2.
+        // Once pass 0 finishes TA (obs=0x100) while FS is still running, ta_pending drops to 7.
         p.graph.render.fw_stamp[0].val.set(0x100);
-        assert_eq!(p.ta_pending_passes(),2);
+        assert_eq!(p.ta_pending_passes(),7);
         assert!(p.can_queue_behind(&next_r));
-        // Even with 16 active FS passes, finished TA (obs=0x300) leaves single-pass pipelining unthrottled.
-        p.graph.render.fw_stamp[0].val.set(0x300);
+        // Even with 16 active FS passes, finished TA (obs=0x800) leaves single-pass pipelining unthrottled.
+        p.graph.render.fw_stamp[0].val.set(0x800);
         p.engine.flights[0].renders=16;
         assert_eq!(p.ta_pending_passes(),0);
         assert!(p.can_queue_behind(&next_r));
@@ -2110,7 +2185,7 @@ for command in [rustc() + ['--edition=2021', '--test', str(unit), '-o', str(outp
     if result.returncode:
         raise SystemExit(result.returncode)
 (output/'publication.json').write_text(json.dumps({
-    'passed': True, 'tests': 68, 'cpu_only': True, 'hardware_execution': False,
+    'passed': True, 'tests': 70, 'cpu_only': True, 'hardware_execution': False,
     'scope': 'Verbatim production publication wrapper, selection, error isolation and descriptor-error containment branch; wire encoder, descriptor failure injection and transport replaced by CPU recorders.',
     'source_sha256': sha(production),
 }, indent=2)+'\n')
