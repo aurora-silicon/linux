@@ -92,6 +92,9 @@ input_fences_src = fence_source[
     fence_source.index('/// Inline storage for the common 0-2 input fences'):
     fence_source.index('/// Reads a retained dependency')
 ]
+syncs_src = fence_source[
+    fence_source.index('/// The syncs of one SUBMIT.'):
+]
 
 timeline_harness = r'''
 #![allow(dead_code)]
@@ -214,6 +217,10 @@ impl UserFence<JobFenceOps> {
     }
 }
 
+fn signal_fence(fence: &UserFence<JobFenceOps>) {
+    fence.signal();
+}
+
 SIGNAL_BATCH_LINE
 
 struct Pending {
@@ -312,9 +319,109 @@ fn concurrent_completers_preserve_strict_fifo_signal_order() {
         assert!(tl.pending.lock().is_empty());
     }
 }
+
+mod cumulative_syncs_test {
+    use super::{Error, Result, EIO, ENOMEM};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Fence(pub(crate) i32);
+
+    pub(crate) struct Timeline;
+    impl Timeline {
+        pub(crate) fn refused(&self, error: Error) -> Fence {
+            Fence(error.0)
+        }
+    }
+
+    pub(crate) mod g17 {
+        pub(crate) mod sync_output {
+            use super::super::{Fence, Result, ENOMEM};
+            use std::cell::RefCell;
+            use std::rc::Rc;
+
+            #[derive(Default)]
+            pub(crate) struct BundleLog {
+                pub(crate) published: Vec<Fence>,
+                pub(crate) failed: Vec<Fence>,
+                pub(crate) fail_publish: bool,
+            }
+
+            pub(crate) struct SignalBundle(pub(crate) Rc<RefCell<BundleLog>>);
+            impl SignalBundle {
+                pub(crate) fn publish(&mut self, fence: &Fence) -> Result {
+                    let mut log = self.0.borrow_mut();
+                    if log.fail_publish {
+                        return Err(ENOMEM);
+                    }
+                    log.published.push(*fence);
+                    Ok(())
+                }
+                pub(crate) fn fail(&mut self, fence: &Fence) {
+                    self.0.borrow_mut().failed.push(*fence);
+                }
+            }
+        }
+    }
+
+    pub(crate) struct SyncItem {
+        pub(crate) installed: Rc<RefCell<Vec<Fence>>>,
+        pub(crate) cumulative: Option<g17::sync_output::SignalBundle>,
+    }
+
+    pub(crate) type KVec<T> = Vec<T>;
+
+    fn install(outputs: impl Iterator<Item = SyncItem>, fence: &Fence) {
+        for sync in outputs {
+            sync.installed.borrow_mut().push(*fence);
+        }
+    }
+
+    SYNCS_SRC
+
+    #[test]
+    fn cumulative_bundle_publishes_and_handles_oom_refusal_cleanly() {
+        let log = Rc::new(RefCell::new(g17::sync_output::BundleLog::default()));
+        let out_log = Rc::new(RefCell::new(Vec::new()));
+        let items = vec![
+            SyncItem { installed: out_log.clone(), cumulative: None },
+            SyncItem {
+                installed: out_log.clone(),
+                cumulative: Some(g17::sync_output::SignalBundle(log.clone())),
+            },
+        ];
+        let mut syncs = Syncs::new(items, 1);
+        assert_eq!(syncs.inputs().len(), 1);
+        syncs.publish(&Fence(42)).unwrap();
+        assert_eq!(log.borrow().published, vec![Fence(42)]);
+        assert!(log.borrow().failed.is_empty());
+        assert!(out_log.borrow().is_empty());
+        // Calling refuse() after successful publish() is a no-op.
+        syncs.refuse(&Timeline, EIO);
+        assert!(log.borrow().failed.is_empty());
+
+        // ENOMEM during publish() leaves bundle armed so refuse() installs error fence.
+        let log2 = Rc::new(RefCell::new(g17::sync_output::BundleLog {
+            fail_publish: true,
+            ..Default::default()
+        }));
+        let items2 = vec![SyncItem {
+            installed: out_log.clone(),
+            cumulative: Some(g17::sync_output::SignalBundle(log2.clone())),
+        }];
+        let mut syncs2 = Syncs::new(items2, 0);
+        assert_eq!(syncs2.publish(&Fence(99)), Err(ENOMEM));
+        assert!(log2.borrow().published.is_empty());
+        syncs2.refuse(&Timeline, ENOMEM);
+        assert_eq!(log2.borrow().failed, vec![Fence(ENOMEM.0)]);
+    }
+}
 '''.replace('SIGNAL_BATCH_LINE', signal_batch_line).replace(
     'TIMELINE_COMPLETE_FN', timeline_complete_fn
-).replace('INPUT_FENCES_SRC', input_fences_src)
+).replace('INPUT_FENCES_SRC', input_fences_src).replace(
+    'SYNCS_SRC', syncs_src.replace('crate::g17::', 'g17::')
+)
 
 with tempfile.TemporaryDirectory(prefix='m4-rust-timeline-') as directory:
     directory = pathlib.Path(directory)
@@ -333,7 +440,7 @@ with tempfile.TemporaryDirectory(prefix='m4-rust-timeline-') as directory:
             raise SystemExit(result.returncode)
 
 (out / 'fence-signalling.json').write_text(json.dumps({
-    'passed': True, 'tests': 7, 'negative_compile_checks': 1, 'cpu_only': True,
+    'passed': True, 'tests': 8, 'negative_compile_checks': 1, 'cpu_only': True,
     'scope': 'Production RAII annotation compiled in both CONFIG_LOCKDEP variants and g16 Timeline::complete() off-pending FIFO batch signalling.',
     'source_sha256': sha(production),
     'timeline_source_sha256': sha(fence_source_path),

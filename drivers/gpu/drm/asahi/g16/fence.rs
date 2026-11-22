@@ -137,6 +137,17 @@ impl FenceOps for JobFenceOps {
 /// Stack batch size for signalling completed fences outside `Timeline::pending`.
 const SIGNAL_BATCH: usize = 8;
 
+unsafe extern "C" {
+    fn asahi_g17_signal_fence(fence: *mut kernel::bindings::dma_fence);
+}
+
+/// Signals a completed job fence, draining any attached cumulative output scopes on the
+/// current CPU instead of bouncing each scope through `irq_work`.
+fn signal_fence(fence: &UserFence<JobFenceOps>) {
+    // SAFETY: `fence` is a live `dma_fence` reference kept alive for the call.
+    unsafe { asahi_g17_signal_fence(fence.raw()) };
+}
+
 /// An accepted fence of a timeline that has not signalled yet.
 struct Pending {
     fence: UserFence<JobFenceOps>,
@@ -247,7 +258,7 @@ impl Timeline {
                     if let Err(error) = res {
                         fence.set_error(error);
                     }
-                    fence.signal();
+                    signal_fence(&fence);
                 }
             }
             if !more {
@@ -311,15 +322,22 @@ fn install(outputs: impl Iterator<Item = SyncItem>, fence: &Fence) {
 
 /// The syncs of one SUBMIT. Every output sync gets a fence: the job's fence once the job is
 /// accepted, a signalled error fence when the submission is refused (the shared `file.rs`
-/// contract of `tracked_submission`).
+/// contract of `tracked_submission`). Cumulative output bundles reuse the shared
+/// `g17::sync_output::SignalBundle` scope chain.
 pub(crate) struct Syncs {
     syncs: KVec<SyncItem>,
     input_count: usize,
+    cumulative: Option<crate::g17::sync_output::SignalBundle>,
 }
 
 impl Syncs {
-    pub(crate) fn new(syncs: KVec<SyncItem>, input_count: usize) -> Self {
-        Self { syncs, input_count }
+    pub(crate) fn new(mut syncs: KVec<SyncItem>, input_count: usize) -> Self {
+        let cumulative = syncs.iter_mut().find_map(|sync| sync.cumulative.take());
+        Self {
+            syncs,
+            input_count,
+            cumulative,
+        }
     }
 
     /// The input syncs (all resolved to fences or already signalled).
@@ -327,14 +345,27 @@ impl Syncs {
         &self.syncs[..self.input_count.min(self.syncs.len())]
     }
 
-    /// Publishes the accepted job's fence in every output sync.
-    pub(crate) fn accept(mut self, fence: &Fence) {
+    /// Publishes the job's fence in every output sync before enqueuing the job. If publishing a
+    /// cumulative bundle fails (`ENOMEM`), the bundle remains unpublished so [`Self::refuse`]
+    /// installs a signalled error fence in every target.
+    pub(crate) fn publish(&mut self, fence: &Fence) -> Result {
         let first = self.input_count.min(self.syncs.len());
+        if let Some(bundle) = &mut self.cumulative {
+            bundle.publish(fence)?;
+            self.cumulative = None;
+            self.syncs.truncate(first);
+            return Ok(());
+        }
         install(self.syncs.drain(first..), fence);
+        Ok(())
     }
 
     /// Publishes a signalled error fence in every output sync of a refused submission.
     pub(crate) fn refuse(mut self, timeline: &Timeline, error: Error) {
+        if let Some(mut bundle) = self.cumulative.take() {
+            bundle.fail(&timeline.refused(error));
+            return;
+        }
         let first = self.input_count.min(self.syncs.len());
         if first < self.syncs.len() {
             install(self.syncs.drain(first..), &timeline.refused(error));

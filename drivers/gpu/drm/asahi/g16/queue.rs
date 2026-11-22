@@ -30,7 +30,7 @@
 //! ordinal, or depending on its failed prefix, cannot execute. The VM remains usable.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use kernel::{dma_fence::Fence, prelude::*, sync::Arc, uapi, xarray};
+use kernel::{prelude::*, sync::Arc, uapi, xarray};
 
 use super::{
     command::{self, USC_WINDOW},
@@ -191,15 +191,15 @@ impl Queue {
         })
     }
 
-    /// Validates a SUBMIT and pushes its job; returns the job's fence.
+    /// Validates a SUBMIT, publishes its output syncs, and pushes its job.
     fn submit_job(
         &mut self,
         id: u64,
-        syncs: &Syncs,
+        syncs: &mut Syncs,
         sync_count: usize,
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
-    ) -> Result<Fence> {
+    ) -> Result {
         if sync_count > command::MAX_SYNCS {
             return Err(EINVAL);
         }
@@ -254,11 +254,15 @@ impl Queue {
             inputs,
         )?;
         let published = job.fence.fence();
+        // Publish output syncs (including fallible cumulative scope allocation) before pushing
+        // to the scheduler so ENOMEM refuses cleanly without leaving an accepted job behind.
+        // If `scheduler.push` later fails, dropping `job` signals `published` with ECANCELED.
+        syncs.publish(&published)?;
         self.scheduler.push(job, self.shared.clone())?;
         // Accepted: retain bounded per-engine accounting for later submissions.
         self.accepted[command::RENDER] += submission.counts[command::RENDER];
         self.accepted[command::COMPUTE] += submission.counts[command::COMPUTE];
-        Ok(published)
+        Ok(())
     }
 }
 
@@ -273,12 +277,9 @@ impl crate::queue::Queue for Queue {
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
         let sync_count = syncs.len();
-        let syncs = Syncs::new(syncs, in_sync_count);
-        match self.submit_job(id, &syncs, sync_count, cmdbuf_raw, objects) {
-            Ok(fence) => {
-                syncs.accept(&fence);
-                Ok(())
-            }
+        let mut syncs = Syncs::new(syncs, in_sync_count);
+        match self.submit_job(id, &mut syncs, sync_count, cmdbuf_raw, objects) {
+            Ok(()) => Ok(()),
             Err(error) => {
                 // A refused submission leaves the VM usable unless the device is lost.
                 self.vm.status.record_if_device_loss(error);
