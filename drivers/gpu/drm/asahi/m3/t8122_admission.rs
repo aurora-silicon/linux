@@ -64,6 +64,7 @@ pub(crate) fn profile_for(compat:&[u32],j613:bool)->Option<Profile> {
     match compat {
         [14,8,3]=>Some(Profile::Legacy),
         [26,6,2] if j613=>Some(Profile::Extended),
+        [27,2,0]=>Some(Profile::Extended27),
         _=>None,
     }
 }

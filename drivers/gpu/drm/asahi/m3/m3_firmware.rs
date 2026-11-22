@@ -75,6 +75,25 @@ pub(crate) static T8122_IMAGES_26: [KnownImage; 1] = [KnownImage {
     initdata_magic: Some(0x0c89_c357_8392_04b8),
 }];
 
+/// The T8122 C0 image the macOS 27.2 boot chain loads (ABI 26B123), identified by its
+/// GKTS/ECAP-normalized TEXT hash (measured on the J615, stable over three boots), with the
+/// InitData version this image accepts.
+pub(crate) static T8122_IMAGES_27: [KnownImage; 1] = [KnownImage {
+    name: "T8122 C0 firmware-compat 27.2",
+    uuid: None,
+    stkg_sha256: Some([
+        0x74, 0x06, 0xa5, 0x68, 0x34, 0x28, 0x37, 0xa7,
+        0x9f, 0x22, 0xc0, 0x3f, 0x7d, 0x45, 0x7f, 0x9f,
+        0x9d, 0x3e, 0x08, 0x8c, 0x4b, 0x78, 0xd7, 0x83,
+        0xe2, 0xdc, 0xad, 0x76, 0x71, 0x6f, 0x16, 0xf5,
+    ]),
+    // Measured on the J615: with this InitData version the image comes up; with the G16
+    // 26B123 version (0x0c8a_836f_0392_04b8), with 0x0391/0x0393/0x0395 in that field, or with
+    // the 26.6.2 version, the firmware faults right after the root is sent and never reports
+    // ready.
+    initdata_magic: Some(0x0c8a_836f_0394_04b8),
+}];
+
 /// The same T8122 image for the start experiment (`t8122_start`, only with
 /// `asahi.t8122_start=1`), where `asahi.t8122_initdata_version` may replace the version.
 pub(crate) static KNOWN_IMAGES_T8122_EXPERIMENT: [KnownImage; 1] = [KnownImage {
@@ -176,6 +195,19 @@ pub(crate) static T8122_LAYOUT_26: Layout = Layout {
     version: "RTKit-3255.160.4.release",
 };
 
+/// T8122 C0 firmware-compat 27.2 as the boot chain loads it (three segments; fw-data = DATA
+/// 0xb4000 + DATA_SHARED_RO 0x8000, from the version-2 handoff).
+pub(crate) static T8122_LAYOUT_27: Layout = Layout {
+    text_size: 0x64000,
+    data_size: 0xbc000,
+    vas: [0xffff_fc00_0000_0000, 0xffff_fc00_0006_4000],
+    entropy_tag_offset: 397152,
+    entropy_tag: *b"GKTS\x08\x00\x00\x00",
+    extra_boot_value: Some((397379, *b"ECAP\x08\x00\x00\x00")),
+    boot_table: Some((397152, 561)),
+    version: "RTKit-3514.41.1.release",
+};
+
 fn normalize_boot_entropy(layout: &Layout, text: &mut [u8]) -> bool {
     if text.len() != layout.text_size as usize {
         return false;
@@ -237,7 +269,9 @@ pub(crate) struct Firmware {
 
 impl Firmware {
     pub(crate) fn profile(&self) -> super::m3_profile::Profile {
-        if core::ptr::eq(self.layout, &T8122_LAYOUT_26) {
+        if core::ptr::eq(self.layout, &T8122_LAYOUT_27) {
+            super::m3_profile::Profile::Extended27
+        } else if core::ptr::eq(self.layout, &T8122_LAYOUT_26) {
             super::m3_profile::Profile::Extended
         } else {
             super::m3_profile::Profile::Legacy
@@ -258,7 +292,7 @@ impl Firmware {
 /// Only the admitted extended image has this host-owned boot descriptor slot.
 fn loader_span(profile: super::m3_profile::Profile, data_bytes: u64, input_bytes: usize)
     -> Option<core::ops::Range<usize>> {
-    if !profile.extended() || input_bytes != 53 * 40
+    if profile != super::m3_profile::Profile::Extended || input_bytes != 53 * 40
         || data_bytes != T8122_LAYOUT_26.data_size { return None; }
     let start: usize = 0x12_28e0;
     let end = start.checked_add(input_bytes)?;
@@ -313,10 +347,15 @@ pub(crate) fn identify_loaded(
         prelude::*,
     };
 
-    let extended=crate::m3::t8122_start::is_t8122(soc)
-        && crate::m3::t8122_admission::loaded_profile(pdev)?.extended();
+    let loaded = if crate::m3::t8122_start::is_t8122(soc) {
+        Some(crate::m3::t8122_admission::loaded_profile(pdev)?)
+    } else {
+        None
+    };
+    let extended = loaded.is_some_and(|p| p.extended());
     if extended && experiment.is_some() {return Err(EINVAL);}
-    let layout = if extended {&T8122_LAYOUT_26} else {soc.firmware.ok_or(ENODEV)?};
+    let v26b123 = loaded.is_some_and(|p| p.v26b123());
+    let layout = if v26b123 {&T8122_LAYOUT_27} else if extended {&T8122_LAYOUT_26} else {soc.firmware.ok_or(ENODEV)?};
     if !Firmware::matching_layout(layout, &resources) {
         dev_err!(pdev.as_ref(), "M3 {}: unsupported firmware segment layout\n", soc.gpu_name);
         return Err(ENODEV);
@@ -340,6 +379,7 @@ pub(crate) fn identify_loaded(
     // The T8122 start experiment identifies the same image, with its own InitData version.
     let images = match experiment {
         Some(_) => &KNOWN_IMAGES_T8122_EXPERIMENT[..],
+        None if v26b123 => &T8122_IMAGES_27[..],
         None if extended => &T8122_IMAGES_26[..],
         None => soc.images,
     };
