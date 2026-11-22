@@ -380,8 +380,12 @@ pub(crate) fn compact_alias(
 pub(crate) struct TvbGrowth {
     mappings: KVec<mmu::KernelMapping>,
     addresses: KVec<u64>,
-    extension: KernelObject,
+    extensions: KVec<KernelObject>,
 }
+
+/// Blocks of one growth extension at most. A shrink gives back whole trailing extensions, so
+/// this is its step: 8 MiB, 16 periods of shrink credit, and 53 extensions in a full block table.
+const EXTENSION_BLOCKS: usize = 64;
 
 /// Aliases and backing of growth extensions a shrink removed from an idle
 /// heap. Field order unmaps the aliases before freeing their backing.
@@ -509,21 +513,28 @@ impl Tvb {
             return Err(ERANGE);
         }
         let added = target - self.blocks();
-        self.extensions.reserve(1, GFP_KERNEL)?;
+        let count = added.div_ceil(EXTENSION_BLOCKS);
+        self.extensions.reserve(count, GFP_KERNEL)?;
         self.addresses.reserve(added, GFP_KERNEL)?;
-        let backing = KernelObject::backing(dev, Self::backing_bytes(self.geometry, added)?,
-            CpuMap::WriteCombined)?;
+        // Declared first, so an error drops the mappings before their backing.
+        let mut extensions = KVec::with_capacity(count, GFP_KERNEL)?;
         let mut mappings = KVec::with_capacity(added, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(added, GFP_KERNEL)?;
-        for relative in 0..added {
-            let mapping = Self::map_block(&backing, vm, relative, self.geometry)?;
-            addresses.push(mapping.iova(), GFP_KERNEL)?;
-            mappings.push(mapping, GFP_KERNEL)?;
+        while addresses.len() < added {
+            let blocks = (added - addresses.len()).min(EXTENSION_BLOCKS);
+            extensions.push(KernelObject::backing(dev, Self::backing_bytes(self.geometry, blocks)?,
+                CpuMap::WriteCombined)?, GFP_KERNEL)?;
+            let backing = extensions.last().ok_or(EIO)?;
+            for relative in 0..blocks {
+                let mapping = Self::map_block(backing, vm, relative, self.geometry)?;
+                addresses.push(mapping.iova(), GFP_KERNEL)?;
+                mappings.push(mapping, GFP_KERNEL)?;
+            }
         }
         Ok(Some(TvbGrowth {
             mappings,
             addresses,
-            extension: backing,
+            extensions,
         }))
     }
 }
@@ -1252,7 +1263,8 @@ impl Manager {
         // Bounds, actual alignment and every reserved host entry are checked
         // before transferring aliases or consuming the caller-owned plan.
         self.graph.word(0)?;
-        if self.tvb.extensions.len() == self.tvb.extensions.capacity()
+        if candidate.growth.extensions.len()
+                > self.tvb.extensions.capacity() - self.tvb.extensions.len()
             || candidate.growth.addresses.len()
                 > self.tvb.addresses.capacity() - self.tvb.addresses.len()
         {
@@ -1284,7 +1296,7 @@ impl Manager {
         } = prepared.take().ok_or(EIO)?;
         let TvbGrowth {
             addresses,
-            extension,
+            extensions,
             ..
         } = growth;
 
@@ -1315,7 +1327,9 @@ impl Manager {
             write(core::mem::offset_of!(fw::State, consumer), before.read);
             write(core::mem::offset_of!(fw::State, last_page), pages - 1);
         }
-        append_reserved(&mut self.tvb.extensions, extension);
+        for extension in extensions.into_iter() {
+            append_reserved(&mut self.tvb.extensions, extension);
+        }
         write(self.layout.control, plan.target());
         fence(Ordering::SeqCst);
         write(self.layout.control + 4, plan.target());
