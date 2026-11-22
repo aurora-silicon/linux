@@ -216,10 +216,12 @@ def _v27_prelude(root, helpers):
     method_table = block(dcp_c, 'static enum dcp_firmware_version dcp_v27_method_table(')
     return r'''
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 typedef uint32_t u32;
 enum dcp_firmware_version {
     DCP_FIRMWARE_UNKNOWN,
