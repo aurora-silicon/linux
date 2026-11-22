@@ -152,6 +152,7 @@ impl Shared {
             }
             job::complete_all(done);
             self.enqueue_scrubs(scrubs);
+            self.queue_feed();
             if !retry_tail {
                 break;
             }
@@ -282,6 +283,7 @@ impl Shared {
         };
         job::complete_all(done);
         self.enqueue_scrubs(scrubs);
+        self.queue_feed();
         drop(signalling);
         self.notify_wedged();
         accepted
@@ -317,6 +319,7 @@ impl Shared {
         };
         job::complete_all(done);
         self.enqueue_scrubs(scrubs);
+        self.queue_feed();
         drop(signalling);
         self.notify_wedged();
         Some(accepted)
@@ -1186,6 +1189,9 @@ impl Firmware {
         self.engine.retired_ticks = [0; 4];
         if result.is_ok() {
             self.stat_retire(&f, retired_ticks);
+            if let Some(shared) = &self.engine.shared {
+                shared.feed.note_flight(f.published_ns, now_ns());
+            }
         }
         if receipt.owner_retired() {
             if let Err(error) = self.slots.retire(&mut f.claims) {

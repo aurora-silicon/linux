@@ -52,6 +52,7 @@ mod command;
 mod encode;
 mod engine;
 mod event;
+mod feed;
 mod fence;
 pub(crate) mod fw;
 mod gate;
@@ -194,6 +195,8 @@ const POLL_WORK: u64 = 0;
 const FAST_POLL_WORK: u64 = 1;
 /// Work item ID of the asynchronous displaced pass-slot scrub work.
 const SCRUB_WORK: u64 = 2;
+/// Work item ID of the asynchronous CPU feed-boost work.
+const FEED_WORK: u64 = 3;
 /// Capacity hint for `drm_syncobj_wait` during active submit bursts (mirroring G17's wait hint).
 const WAIT_UTIL_MIN: u32 = 512;
 const WAIT_HINT_MS: u32 = 8;
@@ -260,6 +263,10 @@ pub(crate) struct Shared {
     pub(crate) events: OwnedQueue,
     /// Dedicated unbound workqueue for asynchronous off-lock pass-slot WC scrubbing.
     pub(crate) scrub_wq: OwnedQueue,
+    /// Host-refill CPU frequency floor actuator (mirroring G17's feed worker).
+    pub(crate) feed: Arc<feed::Feed>,
+    /// Dedicated unbound workqueue for cpufreq `FREQ_QOS_MIN` updates outside `Shared::state`.
+    pub(crate) feed_wq: OwnedQueue,
     #[pin]
     pub(crate) orphan: Mutex<Option<KBox<boot::Orphan>>>,
     #[pin]
@@ -270,6 +277,8 @@ pub(crate) struct Shared {
     pub(crate) scrub_queue: SpinLock<slots::ScrubQueue>,
     #[pin]
     pub(crate) scrub_work: Work<Shared, SCRUB_WORK>,
+    #[pin]
+    pub(crate) feed_work: Work<Shared, FEED_WORK>,
     // --- The completion/repoll hrtimer and the handle of its current expiry (dropping it
     // cancels the expiry; see `Shared::rearm`). ---
     #[pin]
@@ -291,6 +300,10 @@ impl_has_work! {
 
 impl_has_work! {
     impl HasWork<Shared, SCRUB_WORK> for Shared { self.scrub_work }
+}
+
+impl_has_work! {
+    impl HasWork<Shared, FEED_WORK> for Shared { self.feed_work }
 }
 
 impl WorkItem<POLL_WORK> for Shared {
@@ -322,6 +335,13 @@ impl WorkItem<SCRUB_WORK> for Shared {
     }
 }
 
+impl WorkItem<FEED_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        this.feed.run();
+    }
+}
+
 impl Shared {
     /// Records the submitting CPU and burst cadence for completion placement and wait hints.
     pub(crate) fn note_submitter(&self) {
@@ -345,11 +365,20 @@ impl Shared {
 
     /// Temporary `drm_syncobj_wait` capacity hint while a client is submitting back to back.
     pub(crate) fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
-        let until = self.wait_hint_until_ns.load(Ordering::Relaxed);
-        if cfg!(CONFIG_UCLAMP_TASK) && until != 0 && engine::now_ns() <= until {
-            Some((WAIT_UTIL_MIN, WAIT_HINT_MS))
-        } else {
-            None
+        self.feed.wait_hint().or_else(|| {
+            let until = self.wait_hint_until_ns.load(Ordering::Relaxed);
+            if cfg!(CONFIG_UCLAMP_TASK) && until != 0 && engine::now_ns() <= until {
+                Some((WAIT_UTIL_MIN, WAIT_HINT_MS))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Wakes the CPU feed-boost worker outside `Shared::state` when refill gaps cross threshold.
+    pub(crate) fn queue_feed(self: &Arc<Self>) {
+        if !self.sleeping.load(Ordering::Acquire) && self.feed.take_pending() {
+            let _ = self.feed_wq.enqueue::<Arc<Shared>, FEED_WORK>(self.clone());
         }
     }
 
@@ -375,6 +404,7 @@ impl Shared {
 
     /// Latches the fail-stop state.
     pub(crate) fn fail_stop(&self, error: Error) {
+        self.feed.begin_shutdown();
         let _ =
             self.error
                 .compare_exchange(0, error.to_errno(), Ordering::AcqRel, Ordering::Acquire);
@@ -506,6 +536,8 @@ impl Gpu {
         let drm_device: ARef<AsahiDrmDevice> = dev.into();
         let events = OwnedQueue::new_percpu_reclaim(c_str!("aurora_g16_events"), true)?;
         let scrub_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_scrub"), false)?;
+        let feed = feed::Feed::new()?;
+        let feed_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_feed"), false)?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 dev: dev.as_ref().as_ref().into(),
@@ -535,11 +567,14 @@ impl Gpu {
                 sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
                 events,
                 scrub_wq,
+                feed,
+                feed_wq,
                 orphan <- new_mutex!(None, "g16::Shared::orphan"),
                 poll <- new_delayed_work!("g16::Shared::poll"),
                 fast_poll <- new_work!("g16::Shared::fast_poll"),
                 scrub_queue <- new_spinlock!(slots::ScrubQueue::new(), "g16::Shared::scrub_queue"),
                 scrub_work <- new_work!("g16::Shared::scrub_work"),
+                feed_work <- new_work!("g16::Shared::feed_work"),
                 resnap <- HrTimer::new(),
                 resnap_handle <- new_mutex!(None, "g16::Shared::resnap_handle"),
                 state <- new_mutex!(None, "g16::Shared::state"),

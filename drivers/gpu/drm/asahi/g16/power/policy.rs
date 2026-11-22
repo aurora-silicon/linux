@@ -183,6 +183,14 @@ impl ClpcHold {
     }
 }
 
+/// Maximum inter-flight idle gap bridged for active-burst GPU demand.
+/// Matches [`CLPC_IDLE_HOLD_NS`] (2 ms): back-to-back `d=1` CPU-recording bursts
+/// sit well below 2 ms while 60 Hz (16.67 ms) and 120 Hz (8.33 ms) desktop frames
+/// exceed it cleanly and stay at [`FLOOR`].
+const BURST_GAP_NS: u64 = CLPC_IDLE_HOLD_NS;
+/// Consecutive sub-`BURST_GAP_NS` turnarounds required before bridging short gaps.
+const BURST_STREAK_ON: u32 = 4;
+
 /// Busy-time accounting over the governor's windows. The engine reports each
 /// publication and drain; each power service closes the window once it is due.
 pub(crate) struct Governor {
@@ -193,6 +201,8 @@ pub(crate) struct Governor {
     pub(crate) top: u32,
     window_ns: u64,
     busy_since: Option<u64>,
+    idle_since: Option<u64>,
+    burst_streak: u32,
     busy_ns: u64,
 }
 
@@ -204,19 +214,35 @@ impl Governor {
             top: TOP_DEFAULT,
             window_ns: 0,
             busy_since: None,
+            idle_since: None,
+            burst_streak: 0,
             busy_ns: 0,
         }
     }
 
     /// The engine published work; it stays busy until [`Governor::idle`].
     pub(crate) fn busy(&mut self, now: u64) {
-        self.busy_since.get_or_insert(now);
+        if self.busy_since.is_none() {
+            if let Some(idle_at) = self.idle_since.take() {
+                let gap = now.saturating_sub(idle_at);
+                if gap < BURST_GAP_NS {
+                    self.burst_streak = self.burst_streak.saturating_add(1);
+                    if self.burst_streak >= BURST_STREAK_ON {
+                        self.busy_ns = self.busy_ns.saturating_add(gap);
+                    }
+                } else {
+                    self.burst_streak = 0;
+                }
+            }
+            self.busy_since = Some(now);
+        }
     }
 
     /// The engine drained.
     pub(crate) fn idle(&mut self, now: u64) {
         if let Some(since) = self.busy_since.take() {
             self.busy_ns += now.saturating_sub(since);
+            self.idle_since = Some(now);
         }
     }
 
@@ -248,6 +274,12 @@ impl Governor {
         // Recovery can drop flights without a drain.
         if !busy {
             self.idle(now);
+            if self
+                .idle_since
+                .is_some_and(|at| now.saturating_sub(at) >= BURST_GAP_NS)
+            {
+                self.burst_streak = 0;
+            }
         }
         let window = now.wrapping_sub(self.window_ns);
         if window >= WINDOW_NS {
@@ -591,5 +623,47 @@ mod tests {
         assert!(hold.release_now());
         assert!(!hold.holding());
         assert!(!hold.release_now());
+    }
+
+    #[test]
+    fn active_burst_demand_ramps_low_duty_d1_while_preserving_120hz_and_idle_decay() {
+        // Low-duty d=1 CPU-recording-bound burst: 170 us GPU + 600 us host gap (22% raw duty,
+        // < 2 ms turnaround). Bridges short refill gaps after BURST_STREAK_ON and ramps to top.
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        let mut t = T;
+        for _ in 0..8 {
+            g.busy(t);
+            g.idle(t + 170_000);
+            t += 770_000;
+        }
+        assert!(t - T >= RAMP_WINDOW_NS);
+        g.busy(t);
+        assert!(g.ramp_due(t, PSTATE_MAX));
+        assert_eq!(g.govern(t, PSTATE_MAX, true), PSTATE_MAX);
+
+        // Once idle, burst streak resets after 2 ms and demand decays cleanly back to FLOOR.
+        g.idle(t + 170_000);
+        let mut now = t + 170_000;
+        for _ in 0..20 {
+            now += WINDOW_NS;
+            let _ = g.govern(now, PSTATE_MAX, false);
+        }
+        assert_eq!(g.demand, FLOOR);
+        assert!(!g.decaying());
+
+        // 120 Hz desktop pacing (2 ms busy every 8.33 ms -> 6.33 ms gap >= 2 ms) never bridges
+        // gaps and stays bounded at FLOOR.
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        let mut now = T;
+        for _ in 0..16 {
+            g.busy(now);
+            assert!(g.govern(now + 2_000_000, PSTATE_MAX, true) <= FLOOR + 1);
+            g.idle(now + 2_000_000);
+            now += 8_333_333;
+            assert!(g.govern(now, PSTATE_MAX, false) <= FLOOR + 1);
+        }
+        assert_eq!(g.demand, FLOOR);
     }
 }

@@ -205,10 +205,17 @@ for path, call in [
         ('power.rs', 'if idle && self.power.clpc_hold.expire(now) {'),
         ('recovery.rs', 'self.power.release_clpc_now();'),
         ('sleep.rs', 'firmware.power.release_clpc_now();'),
+        ('poll.rs', 'shared.feed.note_flight(f.published_ns, now_ns());'),
+        ('mod.rs', 'self.feed.begin_shutdown();'),
+        ('sleep.rs', 'self.feed.pause();'),
+        ('sleep.rs', 'self.feed_wq.drain();'),
+        ('sleep.rs', 'self.feed.release_floor();'),
 ]:
     assert (G16/path).read_text().count(call) == 1, (path, call)
 assert (G16/'poll.rs').read_text().count('self.arm_idle_power_poll(firmware);') == 3
-print('Governor connected at publication, drain, power service and idle re-arm')
+assert (G16/'poll.rs').read_text().count('self.queue_feed();') == 3
+assert (G16/'sleep.rs').read_text().count('feed.resume();') == 3
+print('Governor and CPU feed actuator connected at publication, drain, power service, sleep and idle re-arm')
 print(json.dumps(report,indent=2))
 
 # Read/reattach interleavings exercise the provider's actual epoch state helpers.

@@ -123,6 +123,9 @@ impl Shared {
         };
         drop(pending_scrubs);
         self.scrub_wq.drain();
+        self.feed.pause();
+        self.feed_wq.drain();
+        self.feed.release_floor();
     }
 
     /// Waits for what's been published to retire. The poll work keeps running meanwhile.
@@ -220,6 +223,7 @@ impl Shared {
         match left {
             Ok(()) => Ok(()),
             Err(error) => {
+                self.feed.resume();
                 self.sleeping.store(false, Ordering::Release);
                 self.poll_now();
                 Err(error)
@@ -260,6 +264,7 @@ impl Shared {
                     "GPU firmware back in {} us\n",
                     now_ns().saturating_sub(started) / 1000
                 );
+                self.feed.resume();
                 self.poll_now();
                 Ok(())
             }
@@ -294,6 +299,7 @@ impl Gpu {
                 self.shared.dev.as_ref(),
                 "sleep refused before the commit: GPU firmware never stopped\n"
             );
+            self.shared.feed.resume();
             self.shared.sleeping.store(false, Ordering::Release);
             self.shared.poll_now();
             return;
