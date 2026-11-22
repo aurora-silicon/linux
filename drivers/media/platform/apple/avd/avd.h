@@ -376,8 +376,10 @@ void avd_job_finish(struct avd_ctx *ctx, enum vb2_buffer_state result);
 void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run);
 int avd_check_run_image_fmt(struct avd_ctx *ctx, enum avd_image_fmt image_fmt);
 void avd_run_postamble(struct avd_ctx *ctx, struct avd_run *run);
+int avd_ctrl_copy(struct avd_ctx *ctx, u32 id, void *dst, size_t size);
 
 #if IS_ENABLED(CONFIG_KUNIT)
+int avd_ctrl_copy_value(struct v4l2_ctrl *ctrl, void *dst, size_t size);
 bool avd_h264_find_slice_data(const u8 *data, u32 len, u32 header_len,
 			      u32 *off);
 bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps, size_t held,

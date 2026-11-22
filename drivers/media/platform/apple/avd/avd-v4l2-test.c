@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * KUnit tests for the format ioctls of the Apple video decoder.
+ * KUnit tests for the format ioctls and the control helpers of the Apple
+ * video decoder.
  */
 
 #include <kunit/test.h>
+#include <linux/completion.h>
 #include <linux/fs.h>
+#include <linux/workqueue.h>
 #include <media/v4l2-mem2mem.h>
 
 #include "avd.h"
@@ -136,9 +139,133 @@ static void avd_s_capture_fmt_test(struct kunit *test)
 	avd_test_expect_comp(test, &t.ctx->comp, &want);
 }
 
+/* A context whose control handler holds the VP9 frame control. */
+static struct v4l2_ctrl *avd_test_ctrl_init(struct kunit *test,
+					    struct avd_ctx **ctxp)
+{
+	static const struct v4l2_ctrl_config cfg = {
+		.id = V4L2_CID_STATELESS_VP9_FRAME,
+	};
+	struct avd_ctx *ctx;
+	struct v4l2_ctrl *ctrl;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	v4l2_ctrl_handler_init(&ctx->ctrl_hdl, 1);
+	ctrl = v4l2_ctrl_new_custom(&ctx->ctrl_hdl, &cfg, NULL);
+	KUNIT_ASSERT_EQ(test, ctx->ctrl_hdl.error, 0);
+	KUNIT_ASSERT_NOT_NULL(test, ctrl);
+
+	*ctxp = ctx;
+	return ctrl;
+}
+
+static int avd_test_set_vp9_width(struct v4l2_ctrl *ctrl, u16 width)
+{
+	struct v4l2_ctrl_vp9_frame frame = *ctrl->p_cur.p_vp9_frame;
+
+	frame.frame_width_minus_1 = width - 1;
+	frame.frame_height_minus_1 = width - 1;
+	return v4l2_ctrl_s_ctrl_compound(ctrl, V4L2_CTRL_TYPE_VP9_FRAME,
+					 &frame);
+}
+
+/* A copy keeps the value it was taken from when the control is set again. */
+static void avd_ctrl_copy_test(struct kunit *test)
+{
+	struct v4l2_ctrl_vp9_frame *copy;
+	struct v4l2_ctrl *ctrl;
+	struct avd_ctx *ctx;
+
+	ctrl = avd_test_ctrl_init(test, &ctx);
+	copy = kunit_kzalloc(test, sizeof(*copy) + 1, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+
+	KUNIT_ASSERT_EQ(test, avd_test_set_vp9_width(ctrl, 64), 0);
+	KUNIT_ASSERT_EQ(test, avd_ctrl_copy(ctx, V4L2_CID_STATELESS_VP9_FRAME,
+					    copy, sizeof(*copy)), 0);
+	KUNIT_EXPECT_MEMEQ(test, copy, ctrl->p_cur.p, sizeof(*copy));
+	KUNIT_EXPECT_TRUE(test, avd_vp9_frame_fits(copy, 64, 64));
+
+	KUNIT_ASSERT_EQ(test, avd_test_set_vp9_width(ctrl, 4096), 0);
+	KUNIT_EXPECT_FALSE(test, avd_vp9_frame_fits(ctrl->p_cur.p_vp9_frame,
+						    64, 64));
+	KUNIT_EXPECT_EQ(test, copy->frame_width_minus_1, 63);
+	KUNIT_EXPECT_EQ(test, copy->frame_height_minus_1, 63);
+	KUNIT_EXPECT_TRUE(test, avd_vp9_frame_fits(copy, 64, 64));
+
+	/* Only a destination of the control's own size is filled. */
+	memset(copy, 0, sizeof(*copy));
+	KUNIT_EXPECT_EQ(test, avd_ctrl_copy(ctx, V4L2_CID_STATELESS_VP9_FRAME,
+					    copy, sizeof(*copy) - 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, avd_ctrl_copy(ctx, V4L2_CID_STATELESS_VP9_FRAME,
+					    copy, sizeof(*copy) + 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, copy->frame_width_minus_1, 0);
+	/* So is a control that the handler does not have. */
+	KUNIT_EXPECT_EQ(test,
+			avd_ctrl_copy(ctx, V4L2_CID_STATELESS_VP9_COMPRESSED_HDR,
+				      copy, sizeof(*copy)), -EINVAL);
+
+	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
+}
+
+struct avd_test_copy_work {
+	struct work_struct work;
+	struct completion done;
+	struct v4l2_ctrl *ctrl;
+	struct v4l2_ctrl_vp9_frame copy;
+	int ret;
+};
+
+static void avd_test_copy_work_fn(struct work_struct *work)
+{
+	struct avd_test_copy_work *w =
+		container_of(work, struct avd_test_copy_work, work);
+
+	w->ret = avd_ctrl_copy_value(w->ctrl, &w->copy, sizeof(w->copy));
+	complete(&w->done);
+}
+
+/* The copy waits for whoever holds the control lock and sees its whole update. */
+static void avd_ctrl_copy_locked_test(struct kunit *test)
+{
+	struct avd_test_copy_work *w;
+	struct v4l2_ctrl *ctrl;
+	struct avd_ctx *ctx;
+
+	ctrl = avd_test_ctrl_init(test, &ctx);
+	w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	w->ctrl = ctrl;
+	w->ret = -EINPROGRESS;
+	init_completion(&w->done);
+	INIT_WORK(&w->work, avd_test_copy_work_fn);
+
+	KUNIT_ASSERT_EQ(test, avd_test_set_vp9_width(ctrl, 64), 0);
+
+	v4l2_ctrl_lock(ctrl);
+	ctrl->p_cur.p_vp9_frame->frame_width_minus_1 = 4095;
+	schedule_work(&w->work);
+	KUNIT_EXPECT_EQ(test,
+			wait_for_completion_timeout(&w->done,
+						    msecs_to_jiffies(200)), 0);
+	KUNIT_EXPECT_EQ(test, w->ret, -EINPROGRESS);
+	ctrl->p_cur.p_vp9_frame->frame_height_minus_1 = 4095;
+	v4l2_ctrl_unlock(ctrl);
+
+	flush_work(&w->work);
+	KUNIT_EXPECT_EQ(test, w->ret, 0);
+	KUNIT_EXPECT_EQ(test, w->copy.frame_width_minus_1, 4095);
+	KUNIT_EXPECT_EQ(test, w->copy.frame_height_minus_1, 4095);
+
+	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
+}
+
 static struct kunit_case avd_v4l2_test_cases[] = {
 	KUNIT_CASE(avd_try_capture_fmt_test),
 	KUNIT_CASE(avd_s_capture_fmt_test),
+	KUNIT_CASE(avd_ctrl_copy_test),
+	KUNIT_CASE(avd_ctrl_copy_locked_test),
 	{}
 };
 

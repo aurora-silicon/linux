@@ -1116,6 +1116,40 @@ void avd_run_postamble(struct avd_ctx *ctx, struct avd_run *run)
 		v4l2_ctrl_request_complete(src_req, &ctx->ctrl_hdl);
 }
 
+/*
+ * Copy the current value of a fixed-size control for a run. Requests are
+ * applied to the controls before a run reads them, but a control can also be
+ * set directly at any time, which rewrites its value under the control lock
+ * only. A run that checks a value and then reads it again from the control
+ * may see two different values. Take one copy under the lock; the run checks
+ * and uses that copy. @size must be the size of the control's value.
+ */
+VISIBLE_IF_KUNIT int avd_ctrl_copy_value(struct v4l2_ctrl *ctrl, void *dst,
+					 size_t size)
+{
+	int ret = -EINVAL;
+
+	v4l2_ctrl_lock(ctrl);
+	if ((size_t)ctrl->elems * ctrl->elem_size == size) {
+		memcpy(dst, ctrl->p_cur.p, size);
+		ret = 0;
+	}
+	v4l2_ctrl_unlock(ctrl);
+
+	return ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_ctrl_copy_value);
+
+/* v4l2_ctrl_find() takes the control lock itself, so look up before copying. */
+int avd_ctrl_copy(struct avd_ctx *ctx, u32 id, void *dst, size_t size)
+{
+	struct v4l2_ctrl *ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, id);
+
+	if (!ctrl)
+		return -EINVAL;
+	return avd_ctrl_copy_value(ctrl, dst, size);
+}
+
 static int avd_add_ctrls(struct avd_ctx *ctx, const struct avd_ctrls *ctrls)
 {
 	unsigned int i;
