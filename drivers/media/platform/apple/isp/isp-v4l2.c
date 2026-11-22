@@ -74,7 +74,8 @@ static bool isp_p010_buffer_matches(const struct isp_format *fmt,
  * the fourth section opens with the frame's exposure: the integration time in
  * microseconds (le32 at 0) and the total sensor gain in 1/256 steps, 256 for
  * unity (le16 at 6). Observed on T6040 and T8140 with AE converging under a
- * fixed scene and with the frame rate capping the integration time.
+ * fixed scene and with the frame rate capping the integration time, and the
+ * same on the T8122 running 27.2 firmware.
  */
 #define ISP_META_SECTIONS		0x10
 #define ISP_META_SECTION_EXPOSURE	3
@@ -1256,13 +1257,16 @@ int apple_isp_setup_video(struct apple_isp *isp)
 	}
 
 	/*
-	 * Auto exposure is always on. By default it holds the frame rate, as
-	 * V4L2 specifies; with exposure priority it may slow down in low light.
+	 * Auto exposure is always on. V4L2 has it hold the frame rate by
+	 * default. On H17 firmware it may by default slow the frame rate down
+	 * to 15 fps in low light rather than raise the gain, which lowers
+	 * the noise; clearing exposure priority holds the frame rate.
 	 */
 	v4l2_ctrl_handler_init(&isp->ctrl_handler, 4);
 	isp->exposure_priority =
 		v4l2_ctrl_new_std(&isp->ctrl_handler, NULL,
-				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
+				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1,
+				  isp->hw->fw_abi == ISP_FW_ABI_H17);
 	/*
 	 * The H17 firmware's auto exposure avoids mains flicker at the given
 	 * frequency. 50 Hz is the default, as on macOS when it does not know
