@@ -776,7 +776,12 @@ static bool spihid_process_iface_hid_report_desc(struct spihid_apple *spihid,
 {
 	struct spihid_interface *iface = spihid_get_iface(spihid, num);
 
-	if (!iface)
+	/*
+	 * Only the HID interfaces have a descriptor buffer; probe asks for
+	 * theirs alone. An unasked descriptor for the management interface
+	 * would otherwise be copied through its NULL hid_desc.
+	 */
+	if (!iface || !iface->hid_desc)
 		return false;
 
 	if (iface->hid_desc_len == 0) {
