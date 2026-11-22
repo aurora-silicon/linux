@@ -2119,13 +2119,21 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 	return 0;
 }
 
-/* The VDD_CIO rail request (SMC key pmVC), written in each .begin. */
+/*
+ * The VDD_CIO rail request (SMC key pmVC), written in each .begin. A kernel
+ * whose SMC driver this built-in code cannot call (not built, or a module)
+ * links without the call and says so.
+ */
 static void t6040_sleep_pmvc(struct t6040_sleep *s)
 {
 	struct platform_device *pdev;
 	struct device_node *np;
 	struct apple_smc *smc;
 
+	if (!IS_REACHABLE(CONFIG_MFD_MACSMC)) {
+		dev_warn_once(s->dev, "pmVC: the SMC driver is not built in\n");
+		return;
+	}
 	np = of_find_matching_node(NULL, t6040_smc_match);
 	pdev = np ? of_find_device_by_node(np) : NULL;
 	of_node_put(np);
