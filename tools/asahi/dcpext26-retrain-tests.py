@@ -20,6 +20,7 @@ pre = r'''
 #include <assert.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <errno.h>
 #define READ_ONCE(x) (x)
 struct mode { int id; };
 struct drm_device { int unused; };
@@ -30,7 +31,7 @@ struct apple_connector { struct { struct drm_device *dev; struct { struct drm_cr
 struct apple_dcp { bool native, admitted, external_stopped; struct { bool valid; } mode_state; };
 struct drm_mode_set { struct drm_crtc *crtc; };
 static int resets, toggles, releases, transition;
-static bool lost;
+static bool lost, unlisted, follows;
 static struct apple_dcp *current;
 static void acquire(void) {
  /* Model the commit that held the modeset locks before the queued worker. */
@@ -45,6 +46,8 @@ static void acquire(void) {
 #define DRM_MODESET_LOCK_ALL_END(dev, ctx, ret) } while (0)
 static bool dcp_is_ext26(struct apple_dcp *d) { return d->native; }
 static bool dcp_has_mode(struct apple_dcp *d, const struct mode *m) { return d->admitted && m->id == 1; }
+static bool dcp_mode_settable(struct apple_dcp *d, const struct mode *m) { return !unlisted; }
+static bool dcp_typec_follows_crtc(struct apple_dcp *d) { return follows; }
 static bool dcp_crtc_lost_route(struct drm_crtc *c, struct apple_connector *p) { return lost; }
 static bool dcp_crtc_can_retrain(struct drm_crtc *c, struct apple_connector *p) { return true; }
 static int drm_atomic_helper_set_config(struct drm_mode_set *s, void *ctx) { releases++; return 0; }
@@ -69,6 +72,13 @@ int main(void) {
  d.native=false; d.mode_state.valid=false;
  assert(!dcp_retrain_active_crtc(&c,&d,false) && resets==2);
  assert(!dcp_retrain_active_crtc(&c,&d,true) && toggles==2);
+ /* A sink just woken that lists only its base modes: no reset until the full list. */
+ unlisted=true;
+ assert(dcp_retrain_active_crtc(&c,&d,false)==-ENOENT && resets==2 && toggles==2);
+ /* unless the Type-C route follows this CRTC, whose own mode set reads the list */
+ follows=true;
+ assert(!dcp_retrain_active_crtc(&c,&d,false) && resets==3);
+ unlisted=follows=false;
  d.native=true; d.admitted=false; lost=true;
  assert(!dcp_retrain_active_crtc(&c,&d,false) && releases==1);
 }
@@ -82,4 +92,4 @@ with tempfile.TemporaryDirectory() as t:
     result = subprocess.run([str(p.with_suffix(''))])
     if result.returncode:
         sys.exit(1)
-print('PASS native26 retrain: lock-wait layout restart, fresh READY, completed commit, classic reset/power cycle')
+print('PASS native26 retrain: lock-wait layout restart, fresh READY, completed commit, classic reset/power cycle, unlisted mode')
