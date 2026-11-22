@@ -417,14 +417,28 @@ const PERIOD_CLOCKS: u32 = 200_000;
 const TEMP_SENSOR_MASK: u32 = 0x2a22_2aa2;
 
 pub(crate) struct Chip {
-    pub(crate) max_power_mw: u32,
-    pub(crate) leakage: [u32; 56],
-    pub(crate) aon_table: &'static [u32],
+    /// Static power limit for measured captures; `None` requires loader calibration from DT.
+    pub(crate) max_power_mw: Option<u32>,
+    /// Static leakage coefficients for measured captures; `None` requires loader calibration.
+    pub(crate) leakage: Option<[u32; 56]>,
+    /// Whether this 25G83 profile populates the AON table from calibration; `false` leaves
+    /// `aon_va = 0` (as on the 40-core J614C 25G83 capture).
+    pub(crate) aon_table: bool,
     pub(crate) hw_data_words: Words,
     pub(crate) power_config_words: Words,
     pub(crate) perf_a_replicate_lanes: bool,
     pub(crate) cs_perf_table: bool,
 }
+
+impl Chip {
+    /// Whether this static profile supplies its own measured power ceiling and leakage model.
+    pub(crate) const fn has_static_power(&self) -> bool {
+        self.max_power_mw.is_some() && self.leakage.is_some()
+    }
+}
+
+/// Offset of the power-limit scaling slope (`-1000.0 / max_power_mw`, IEEE-754 binary32).
+const POWER_SCALE_OFFSET: usize = 0x9ec;
 
 /// Offset of the per-chip leakage coefficients in the power configuration.
 const LEAKAGE_OFFSET: usize = 0x642c;
@@ -460,7 +474,6 @@ const POWER_CONFIG_WORDS: Words = &[
     (0x9cc, 0x3b516154, 1),
     (0x9d4, 0x3ca59586, 1),
     (0x9e4, 0x40a90fdb, 1),
-    (0x9ec, 0xbc6d0cfe, 1),
     (0x9f0, 0x64, 1),
     (0x9f4, 0x3e8, 2),
     (0xa38, 0x3e8, 1),
@@ -630,10 +643,14 @@ impl PowerConfig25G83 {
         for offset in [0xa04, 0xabc, 0x28c8, 0x28cc, 0x28d0, 0x2a08] {
             self.0[offset..offset + 4].copy_from_slice(&max_power_mw.to_le_bytes());
         }
-        let power = crate::float::F32::from(max_power_mw).to_bits();
+        let power = crate::float::F32::from(max_power_mw);
+        let power_bits = power.to_bits();
         for offset in [0x9e0, 0x2a04] {
-            self.0[offset..offset + 4].copy_from_slice(&power.to_le_bytes());
+            self.0[offset..offset + 4].copy_from_slice(&power_bits.to_le_bytes());
         }
+        let neg_inv_kw = (-crate::f32!(1000.0) / power).to_bits();
+        self.0[POWER_SCALE_OFFSET..POWER_SCALE_OFFSET + 4]
+            .copy_from_slice(&neg_inv_kw.to_le_bytes());
         self.0[CONFIG_STATUS_POINTER..CONFIG_STATUS_POINTER + 8]
             .copy_from_slice(&(config_va + 0x80).to_le_bytes());
         self.0[AON_POINTER..AON_POINTER + 8].copy_from_slice(&aon_va.to_le_bytes());
@@ -641,6 +658,12 @@ impl PowerConfig25G83 {
     }
 
     pub(crate) fn apply_chip(&mut self, chip: &Chip) -> Result {
+        for &(offset, _, repeat) in chip.power_config_words {
+            let end = offset.checked_add(4 * repeat).ok_or(EINVAL)?;
+            if offset <= POWER_SCALE_OFFSET && POWER_SCALE_OFFSET < end {
+                return Err(EINVAL);
+            }
+        }
         overlay_words(&mut self.0, chip.power_config_words)
     }
 }

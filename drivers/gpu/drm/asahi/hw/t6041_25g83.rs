@@ -1,50 +1,39 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright The Gravity Linux Contributors
 //
-// The power configuration words, leakage coefficients, power limit and AON rows of this
-// profile are what the M4 GPU encoders of Gravity Linux (g16_fw.rs, g16_platform.rs and
-// g16_power.rs, written by Cody Ho, with the bootloader power limit added by Niklas Sheth)
-// built on a 32-core J616C:
+// The four-cluster 25G83 register layout and power configuration words of this profile derive
+// from the M4 GPU encoders of Gravity Linux (g16_fw.rs, g16_platform.rs and g16_power.rs,
+// written by Cody Ho):
 // https://github.com/GravityLinux/linux/commit/bd25d194b0a295a75692a0e6caed3793603b9e65
 // https://github.com/GravityLinux/linux/commit/3a2ad760d7316813f37c0ddc653ef783827f855b
 
-//! T6041 (M4 Max) with 32 cores on the 25G83 firmware build, as the J616C runs it.
+//! T6041 (M4 Max) with 32 cores on the 25G83 and 26B123 firmware builds, as the J616C runs it.
 //!
-//! The J616C boots through a macOS 26.6.2 stub (iBoot mBoot-18000.161.10), which loads the
-//! 25G83 image [`t6041::BUILD_25G83`] admits. Its GPU has 32 of 40 cores in four clusters, so
-//! the 40-core configuration of that build refuses it; this one is selected instead.
+//! The J616C boots through a macOS 26.6.2 stub (iBoot mBoot-18000.161.10) or macOS 27.2 stub
+//! (iBoot mBoot-20457.41.3). Its GPU has 32 of 40 cores in four clusters, so the 40-core
+//! configuration refuses it; this one is selected instead.
 //!
-//! What differs between units comes from the device tree, which the boot loader fills from the
-//! ADT: the operating points with one voltage per cluster (`operating-points-v2`, from the
-//! ADT `perf-states` tables) and the CS and AFR tables (`apple,cs-opp`, `apple,afr-opp`, from
-//! `cs-perf-states` and `afr-perf-states`). The builders turn them into the performance, CS and
-//! AFR tables of the hardware data. The enabled cores are probed from the GPU.
-//!
-//! Everything else is static, because the driver has no source for it on T6041:
-//! - [`PERF`]: the selector ladders, see there.
-//! - [`MAX_POWER_MW`] and the leakage coefficients of [`CHIP`]: not in the ADT. They are the
-//!   M4 Pro's values (its per-core power budget for 32 cores, its per-cluster coefficients for
-//!   four clusters), not values of this unit.
-//! - [`AON_TABLE`]: the GPU cluster and SoC rows of the ADT's `/arm-io/aon-ptd`
-//!   `ptd_data_table`, which the loader does not publish.
-//! - [`REGISTER_WINDOWS`]: slot 3 holds this part's six memory controllers (ADT
-//!   `/arm-io/sgx` `active-mcc-bit-vector` 0x3f).
-//!
-//! Built from the device tree of the J616C, the hardware data and region C equal what this
-//! unit ran with since October 2026, and the power configuration does with [`CHIP`]'s words.
+//! All per-unit calibration values come from the device tree, published by the boot loader under
+//! `apple,t6041-handoff-version = 2`: operating points (`operating-points-v2`), CS and AFR tables
+//! (`apple,cs-opp`, `apple,afr-opp`), performance selector and relative ladders
+//! (`apple,perf-map-a/b`, `apple,perf-relative-a/b`, `apple,perf-base-pstate`), power ceiling
+//! (`apple,max-power-mw`), four-cluster leakage coefficients (`apple,core-leak-coef`,
+//! `apple,sram-leak-coef`, `apple,cs-leak-coef`, `apple,afr-leak-coef`), AON temperature-source
+//! rows (`apple,aon-table`), core mask (`apple,core-mask`), and active MCC bit vector
+//! (`apple,active-mcc-bit-vector`). There is no static power or leakage fallback.
 
 use super::t6041;
 use super::t604x::{instances, window};
 use crate::g17::fw::{
     self,
-    initdata::{v25g83, PerfConfig, RegionCConfig, RegisterWindow, PERF_STATES},
+    initdata::{v25g83, RegionCConfig, RegisterWindow},
 };
 use crate::g17::{Config, CoreLayout};
 
 pub(super) const CONFIG: Config = Config {
     windows: &REGISTER_WINDOWS,
     reserved_slots: &[],
-    perf: Some(&PERF),
+    perf: None,
     region_c: Some(&REGION_C),
     chip: Some(&CHIP),
     firmware: fw::variant::Firmware::Identified(&[t6041::BUILD_25G83_32CORE, t6041::BUILD_26B123]),
@@ -67,7 +56,8 @@ pub(super) const CONFIG: Config = Config {
 
 /// The register map of [`t6041::REGISTER_WINDOWS_25G83`] with six memory controller
 /// instances in slot 3 instead of eight, laid out by the same rule, so every window after it
-/// lies 0x30000 lower.
+/// lies 0x30000 lower. At boot, slot 3's instance count (and subsequent window addresses) are
+/// resolved from the loader's `apple,active-mcc-bit-vector`.
 const REGISTER_WINDOWS: [RegisterWindow; 25] = [
     window(0, 0x5_0241_4000, 0x20_0000, 0x4000, 0, 2),
     instances(
@@ -126,83 +116,23 @@ const _: () = {
     }
 };
 
-/// The selector ladders. `states_a` and `states_b` are the highest and lowest of the J616C's
-/// operating points at each of its 11 core voltages, in ADT order; the 40-core 25F84 profile
-/// selects OPP 6 for state 5 of `states_b`, this one OPP 5. The relative ladders are the M4
-/// Pro's. The driver has no source for them on T6041.
-const PERF: PerfConfig = PerfConfig {
-    states_a: [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 15],
-    states_b: [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 15],
-    relative_a: [0, 9, 16, 23, 29, 38, 49, 60, 69, 79, 100],
-    relative_b: [0, 0, 22, 36, 47, 57, 68, 78, 84, 91, 100],
-    sram_min_mv: 810,
-};
-
-const _: () = {
-    let mut index = 0;
-    while index < PERF_STATES {
-        assert!((PERF.states_a[index] as usize) < t6041::OPPS);
-        assert!((PERF.states_b[index] as usize) < t6041::OPPS);
-        index += 1;
-    }
-};
-
-/// The M4 Pro's power budget per core (69116 mW for 20) for 32 cores.
-const MAX_POWER_MW: u32 = 110_586;
-
 const REGION_C: RegionCConfig = RegionCConfig {
-    max_power_mw: MAX_POWER_MW,
+    max_power_mw: 0,
     ..t6041::REGION_C
 };
 
-/// The AON temperature-source rows (12 bytes each) the power configuration names: GPU clusters
-/// 0 to 3 and the SoC, as in the ADT's `ptd_data_table`.
-const AON_TABLE: [u32; 15] = [
-    u32::from_be_bytes(*b"g0TR"),
-    0x00c2_0001,
-    0x0000_1401,
-    u32::from_be_bytes(*b"g1TR"),
-    0x0097_0001,
-    0x0000_1401,
-    u32::from_be_bytes(*b"g2TR"),
-    0x0092_0001,
-    0x0000_1401,
-    u32::from_be_bytes(*b"g3TR"),
-    0x00c7_0001,
-    0x0000_1401,
-    u32::from_be_bytes(*b"r0TR"),
-    0x012c_0001,
-    0x0000_1401,
-];
-
 const CHIP: v25g83::Chip = v25g83::Chip {
-    max_power_mw: MAX_POWER_MW,
-    // The M4 Pro's per-cluster core coefficients for four clusters, its SRAM, CS and AFR ones.
-    leakage: {
-        let mut words = [0; 56];
-        words[0] = 0x44f0_3000;
-        words[1] = 0x44f3_0000;
-        words[2] = 0x44f0_3000;
-        words[3] = 0x44f3_0000;
-        words[32] = 0x4373_0000;
-        words[33] = 0x4373_0000;
-        words[34] = 0x4373_0000;
-        words[35] = 0x4373_0000;
-        words[52] = 0x437b_0000;
-        words[54] = 0x43bd_c000;
-        words
-    },
-    aon_table: &AON_TABLE,
+    max_power_mw: None,
+    leakage: None,
+    aon_table: true,
     hw_data_words: &[],
     power_config_words: POWER_CONFIG_WORDS,
     perf_a_replicate_lanes: false,
     cs_perf_table: true,
 };
 
-/// What differs from the M4 Pro's power configuration besides the power limit and leakage.
+/// Four-cluster T6041 power configuration words that differ from the two-cluster 25G83 base.
 const POWER_CONFIG_WORDS: &[(usize, u32, usize)] = &[
-    // -1000 / MAX_POWER_MW, as the M4 Pro's word is for its 69116 mW.
-    (0x9ec, 0xbc14_27fc, 1),
     // The second temperature-sensor mask word.
     (0x3b5c, 0x2a22_2aa2, 1),
     // The temperature sources of GPU clusters 2 and 3.

@@ -7,7 +7,7 @@
 
 use super::{abi, low, BuildEnv, BundleObjects, CpuMap, InitData};
 use crate::{
-    g17::{Config, Role},
+    g17::{calibration::Calibration, Config, Role},
     mmu,
 };
 use abi::{v25g83 as old, v26b123 as v};
@@ -30,32 +30,33 @@ impl InitData {
         &mut self,
         env: &BuildEnv<'_>,
         cfg: &Config,
+        windows: &[abi::RegisterWindow],
         active_cores: u32,
+        max_power_mw: u32,
         bundle: &BundleObjects,
         aon: usize,
         power_state: usize,
         firmware_area: usize,
         views: [usize; 5],
+        calibration: Option<&Calibration>,
     ) -> Result {
         use mmu::PROT_FW_PRIV_RW as FP;
         use mmu::PROT_FW_SHARED_RW as FS;
         use CpuMap::WriteCombined as WC;
 
         // Both 32-core and 40-core T6041 parts have four GPU clusters (g0TR..g3TR);
-        // core counts, AMCC windows, OPPs, and power limits come from `cfg` via
-        // `initialize_25g83()` and `Gpu::new()`'s core-layout check.
+        // core counts, AMCC windows, OPPs, and power limits come from `calibration`
+        // (or the measured 40-core static profile when no handoff is present).
         if cfg.chip_id != crate::hw::t6041::CHIP_ID || env.clusters != 4 {
             return Err(EINVAL);
         }
-        let chip = cfg.chip.ok_or(EINVAL)?;
         let bundle_va = self.object(self.bundle)?.gpu_va();
         let cluster_va = self.object(self.cluster)?.gpu_va();
         let config_va = cluster_va + old::private::CONFIG as u64;
         let aon_va = self.object(aon)?.gpu_va();
         // The existing register window already maps the complete GPTBAT span
         // with firmware MMIO permissions; reuse its first 0x8000 bytes.
-        let gptbat = cfg
-            .windows
+        let gptbat = windows
             .iter()
             .find(|window| window.phys == v::GPTBAT_PHYS && window.size >= v::GPTBAT_SIZE)
             .ok_or(EINVAL)?;
@@ -66,7 +67,7 @@ impl InitData {
 
         // SAFETY: RegisterTable consists of initialized integer descriptors only.
         let mut registers: v::RegisterTable = unsafe { core::mem::zeroed() };
-        registers.init(cfg.windows)?;
+        registers.init(windows)?;
         let args = v::HardwareArgs {
             gptbat_va: gptbat.va,
             gptbat_size: v::GPTBAT_SIZE,
@@ -74,7 +75,8 @@ impl InitData {
             completion_high: bundle.completion_rings.map(|ring| ring.high_va),
             qos_va: self.object(bundle.qos)?.gpu_va(),
             auxiliary_va: self.object(auxiliary)?.gpu_va(),
-            relative_words: (active_cores == 40).then_some((RELATIVE_A, RELATIVE_B)),
+            relative_words: (active_cores == 40 && calibration.is_none())
+                .then_some((RELATIVE_A, RELATIVE_B)),
         };
         let legacy_hw = self
             .object(self.bundle)?
@@ -120,39 +122,45 @@ impl InitData {
         self.region_c_shift = 4;
         self.object_mut(power_state)?
             .initialize::<v::PowerState>(0, |state| {
-                state.init(chip.max_power_mw);
+                state.init(max_power_mw);
                 Ok(())
             })?;
+        let aon_sensors = match calibration.and_then(|cal| cal.aon_table.as_ref()) {
+            Some(aon_table) => core::array::from_fn(|i| v::AonSensor {
+                key: aon_table[i * 3].to_be_bytes(),
+                selector: aon_table[i * 3 + 1],
+                config: aon_table[i * 3 + 2],
+            }),
+            None => [
+                v::AonSensor {
+                    key: *b"g0TR",
+                    selector: 0x00c20001,
+                    config: 0x1401,
+                },
+                v::AonSensor {
+                    key: *b"g1TR",
+                    selector: 0x00970001,
+                    config: 0x1401,
+                },
+                v::AonSensor {
+                    key: *b"g2TR",
+                    selector: 0x00920001,
+                    config: 0x1401,
+                },
+                v::AonSensor {
+                    key: *b"g3TR",
+                    selector: 0x00c70001,
+                    config: 0x1401,
+                },
+                v::AonSensor {
+                    key: *b"r0TR",
+                    selector: 0x012c0001,
+                    config: 0x1401,
+                },
+            ],
+        };
         self.object_mut(aon)?
-            .initialize::<v::AonTable>(0, |table| {
-                table.init(&[
-                    v::AonSensor {
-                        key: *b"g0TR",
-                        selector: 0x00c20001,
-                        config: 0x1401,
-                    },
-                    v::AonSensor {
-                        key: *b"g1TR",
-                        selector: 0x00970001,
-                        config: 0x1401,
-                    },
-                    v::AonSensor {
-                        key: *b"g2TR",
-                        selector: 0x00920001,
-                        config: 0x1401,
-                    },
-                    v::AonSensor {
-                        key: *b"g3TR",
-                        selector: 0x00c70001,
-                        config: 0x1401,
-                    },
-                    v::AonSensor {
-                        key: *b"r0TR",
-                        selector: 0x012c0001,
-                        config: 0x1401,
-                    },
-                ])
-            })?;
+            .initialize::<v::AonTable>(0, |table| table.init(&aon_sensors))?;
 
         let main_offset = abi::bundle::MAIN_CONFIG[Role::Primary as usize];
         let main_va = bundle_va + main_offset as u64;

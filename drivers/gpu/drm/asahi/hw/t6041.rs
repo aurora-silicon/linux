@@ -390,8 +390,8 @@ pub(super) const REGION_C: RegionCConfig = RegionCConfig {
 };
 
 const CHIP: v25g83::Chip = v25g83::Chip {
-    max_power_mw: MAX_POWER_MW,
-    leakage: {
+    max_power_mw: Some(MAX_POWER_MW),
+    leakage: Some({
         let mut words = [0; 56];
         words[0] = 0x44f9_c000;
         words[1] = 0x44f7_2000;
@@ -404,8 +404,8 @@ const CHIP: v25g83::Chip = v25g83::Chip {
         words[52] = 0x4404_0000;
         words[54] = 0x43df_8000;
         words
-    },
-    aon_table: &[],
+    }),
+    aon_table: false,
     hw_data_words: HW_DATA_WORDS,
     power_config_words: POWER_CONFIG_WORDS,
     perf_a_replicate_lanes: true,
@@ -495,7 +495,6 @@ const POWER_CONFIG_WORDS: &[(usize, u32, usize)] = &[
     (0x728, 0x4a714, 1),
     (0x7a8, 0x4a714, 1),
     (0x920, 0x3dd00000, 1),
-    (0x9ec, 0xbbfca403, 1),
     (0x9f0, 0x28, 1),
     (0xa70, 0x4, 1),
     (0xa7c, 0x0, 1),
