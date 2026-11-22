@@ -202,8 +202,9 @@ EXPORT_SYMBOL_IF_KUNIT(ane_dart_alloc_scratch_page);
  * later BO_INIT, and a scratch whose release is skipped degrades into
  * a bounded, benign leak instead of a poisoned address space. Reserve
  * failure means a live BO node already owns the faulting page (a wild
- * descriptor, not a hole): refuse and let the caller wedge, fail
- * closed.
+ * descriptor, not a hole): a BO of another job, which ane_submit() took
+ * out of the DART for this one. Refuse and let the caller wedge and
+ * recover, fail closed.
  */
 int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova,
 			 struct ane_dart_scratch *scratch, int *pages)

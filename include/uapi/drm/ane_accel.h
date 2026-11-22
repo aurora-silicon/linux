@@ -157,7 +157,9 @@ struct drm_ane_bo_free {
  * @pad: Must be zero.
  *
  * A successful SUBMIT returns after the engine completed the work, with the
- * output buffers visible to the CPU.
+ * output buffers visible to the CPU. While it runs, the engine reaches only
+ * the buffers in @handles and @btsp_handle: an access outside them faults
+ * and fails the SUBMIT.
  */
 struct drm_ane_submit {
 	__u64 tsk_size;

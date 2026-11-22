@@ -71,6 +71,15 @@ struct ane_device {
 	struct list_head bo_list;
 
 	/*
+	 * BOs whose pages are in the DART now. Between jobs this is the last
+	 * job's set; ane_submit() unmaps every other BO before the engine
+	 * starts, so a job reaches only the buffers it names. job_seq tags
+	 * the BOs of the job being set up. Both under engine_lock.
+	 */
+	struct list_head mapped_list;
+	u64 job_seq;
+
+	/*
 	 * Wedge-preserved BO ranges, tied to their still-inserted drm_mm
 	 * nodes (see ane_reclaim_preserved). Registered under engine_lock.
 	 */
