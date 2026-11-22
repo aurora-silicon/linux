@@ -787,6 +787,157 @@ mod event_drain_test {
         assert_eq!(ring.ring.reads.get(), 21);
     }
 }
+
+mod resnap_sync_test {
+    use std::sync::{
+        Arc, Barrier, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    };
+
+    const BACKUP_REARM_NS: u64 = 1_000_000;
+    static CLOCK: AtomicU64 = AtomicU64::new(0);
+    fn now_ns() -> u64 {
+        CLOCK.load(Ordering::Acquire)
+    }
+
+    mod params {
+        pub fn resnap_us() -> u32 {
+            100
+        }
+        pub fn repoll_us() -> u32 {
+            25
+        }
+    }
+    #[allow(non_upper_case_globals)]
+    mod module_parameters {
+        pub struct Param(u32);
+        impl Param {
+            pub fn value(&self) -> u32 {
+                self.0
+            }
+        }
+        pub static g16_repoll_us: Param = Param(25);
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Delta(i64);
+    impl Delta {
+        fn from_micros(us: i64) -> Self {
+            Self(us)
+        }
+    }
+
+    struct Handle {
+        drops: Arc<AtomicU32>,
+    }
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct Lock<T>(Mutex<T>);
+    impl<T> Lock<T> {
+        fn new(v: T) -> Self {
+            Self(Mutex::new(v))
+        }
+        fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+            self.0.lock().unwrap()
+        }
+    }
+
+    struct Shared {
+        sleeping: AtomicBool,
+        resnap_deadline_ns: AtomicU64,
+        backup_deadline_ns: AtomicU64,
+        resnap_handle: Lock<Option<Handle>>,
+        starts: AtomicU32,
+        drops: Arc<AtomicU32>,
+        mod_polls: AtomicU32,
+    }
+
+    impl Shared {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                sleeping: AtomicBool::new(false),
+                resnap_deadline_ns: AtomicU64::new(0),
+                backup_deadline_ns: AtomicU64::new(0),
+                resnap_handle: Lock::new(None),
+                starts: AtomicU32::new(0),
+                drops: Arc::new(AtomicU32::new(0)),
+                mod_polls: AtomicU32::new(0),
+            })
+        }
+        fn start(self: Arc<Self>, _delta: Delta) -> Handle {
+            self.starts.fetch_add(1, Ordering::AcqRel);
+            Handle {
+                drops: self.drops.clone(),
+            }
+        }
+        fn mod_poll(self: &Arc<Self>, _delay: u64) {
+            self.mod_polls.fetch_add(1, Ordering::AcqRel);
+        }
+
+        __CANCEL_RESNAP__
+        __REARM__
+    }
+
+    #[test]
+    fn resnap_rearm_coalesces_and_cancel_disarms_unconditionally() {
+        CLOCK.store(100_000, Ordering::Release);
+        let shared = Shared::new();
+        shared.rearm(false);
+        assert_eq!(shared.starts.load(Ordering::Acquire), 1);
+        assert_eq!(shared.resnap_deadline_ns.load(Ordering::Acquire), 200_000);
+        assert!(shared.resnap_handle.lock().is_some());
+
+        // Same-window rearm coalesces without cancelling/restarting the handle.
+        CLOCK.store(102_000, Ordering::Release);
+        shared.rearm(false);
+        assert_eq!(shared.starts.load(Ordering::Acquire), 1);
+        assert_eq!(shared.drops.load(Ordering::Acquire), 0);
+
+        // Sooner repoll (>5 us earlier) replaces the handle cleanly.
+        shared.rearm(true);
+        assert_eq!(shared.starts.load(Ordering::Acquire), 2);
+        assert_eq!(shared.drops.load(Ordering::Acquire), 1);
+        assert_eq!(shared.resnap_deadline_ns.load(Ordering::Acquire), 127_000);
+
+        // cancel_resnap unconditionally clears deadline and drops handle.
+        shared.cancel_resnap();
+        assert_eq!(shared.resnap_deadline_ns.load(Ordering::Acquire), 0);
+        assert!(shared.resnap_handle.lock().is_none());
+        assert_eq!(shared.drops.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn sleep_cancel_resnap_never_leaves_handle_armed_under_concurrent_rearm() {
+        CLOCK.store(1_000_000, Ordering::Release);
+        for _ in 0..200 {
+            let shared = Shared::new();
+            shared.rearm(false);
+            let start = Arc::new(Barrier::new(2));
+            let s1 = shared.clone();
+            let b1 = start.clone();
+            let t = std::thread::spawn(move || {
+                b1.wait();
+                for _ in 0..32 {
+                    s1.rearm(true);
+                }
+            });
+            start.wait();
+            // Exact sleep_down() + join_workers() sequence: sleeping = true, then cancel_resnap().
+            shared.sleeping.store(true, Ordering::Release);
+            shared.cancel_resnap();
+            t.join().unwrap();
+            assert!(
+                shared.resnap_handle.lock().is_none(),
+                "rearm leaked an hrtimer handle past sleep_down() + cancel_resnap()"
+            );
+            assert_eq!(shared.resnap_deadline_ns.load(Ordering::Acquire), 0);
+        }
+    }
+}
 '''
 
 for token, decl in {
@@ -794,6 +945,8 @@ for token, decl in {
     '__POLL_STEP__': 'pub(crate) fn poll_step(',
     '__OLDEST_TERMINAL_EVENTS__': 'fn oldest_terminal_events(',
     '__OLDEST_STAMP_REACHED__': 'fn oldest_stamp_reached(',
+    '__CANCEL_RESNAP__': 'pub(crate) fn cancel_resnap(',
+    '__REARM__': 'pub(crate) fn rearm(',
 }.items():
     harness = harness.replace(token, item(decl))
 for token, decl in {
@@ -819,7 +972,7 @@ for command in [
     json.dumps(
         {
             'passed': True,
-            'tests': 10,
+            'tests': 12,
             'cpu_only': True,
             'hardware_execution': False,
             'scope': 'Verbatim production submit_locked inline retirement and poll_step TA-only non-spin logic.',

@@ -51,6 +51,21 @@ with tempfile.TemporaryDirectory(prefix='m4-m5-uapi-') as name:
 if errors:
     raise RuntimeError('Kernel UAPI ABI differs from the M5 bindings: ' + json.dumps(errors))
 command = SOURCE.read_text()
+queue_src = (SOURCE.parent / 'queue.rs').read_text()
+poll_src = (SOURCE.parent / 'poll.rs').read_text()
+assert 'command::parse_stream(bytes, params::early_tiling())?' in queue_src
+assert 'parsed.prepare(self.accepted, objects)?' in queue_src
+assert 'command::check_stream(' not in queue_src
+parse_idx = command.index('pub(crate) fn parse_stream(')
+prep_idx = command.index('impl ParsedStream {')
+assert 'stream(bytes)' in command[parse_idx:prep_idx]
+assert 'stream(bytes)' not in command[prep_idx:]
+assert 'resnap_has_handle' not in poll_src
+assert 'let mut handle = self.resnap_handle.lock();' in poll_src
+assert 'if self.sleeping.load(Ordering::Acquire)' in poll_src
+assert 'fn check_stream(' not in command
+assert 'fn cover(' not in command
+assert 'enum Resolved' not in command
 hardware = (SOURCE.parent / 'hw.rs').read_text()
 capacities = '\n'.join(re.findall(r'pub\(crate\) const (?:TPC_SIZE|TILEMAP_SIZE): u64 = .*?;', hardware))
 names = ['drm_asahi_cmd_header', 'drm_asahi_attachment', 'drm_asahi_cmd_render',
@@ -58,8 +73,13 @@ names = ['drm_asahi_cmd_header', 'drm_asahi_attachment', 'drm_asahi_cmd_render',
          'drm_asahi_timestamp', 'drm_asahi_timestamps', 'drm_asahi_helper_program',
          'drm_asahi_render_ray_query_stage']
 constants = command[command.index('/// Largest command buffer.'):command.index('/// A validated render command.')]
+parse_types = command[command.index('/// A validated render command.'):command.index('/// Inline storage for the common 1-2 command ordinals')]
 inline_containers = command[command.index('/// Inline storage for the common 1-2 command submission'):command.index('/// A validated SUBMIT.')]
-parser = command[command.index('/// One command of the stream.'):command.index('/// Checks that `[start, end)`')]
+parser = (
+    command[command.index('/// One command of the stream.'):command.index('/// Checks that `[start, end)`')]
+    + command[command.index('/// Parses the attachment list'):command.index('/// Checks that `[start, end)` (rounded out to pages) is user memory mapped')]
+    + command[command.index('/// Per-command barrier and stage-prefix metadata'):command.index('impl ParsedStream {')]
+)
 render_admission = (
     command[command.index('/// Checks that `[start, end)`'):command.index('/// Parses the attachment list')]
     + command[command.index('/// Whether a GVA can be named by a 32-bit compact pointer.'):command.index('/// Per-command compute admission.')]
@@ -77,12 +97,29 @@ type Result<T = ()> = core::result::Result<T, i32>;
 const EINVAL: i32 = -22;
 const EOVERFLOW: i32 = -75;
 const E2BIG: i32 = -7;
+const GFP_KERNEL: u32 = 0;
 struct Error; impl Error { fn from_errno(error:i32)->i32 { error } }
 extern crate self as kernel;
 // The parser logs why it refuses a command; check the format arguments, print nothing.
 macro_rules! pr_warn { ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }}; }
 pub mod bindings { pub const EOPNOTSUPP:i32=95; }
 pub mod prelude { pub type Result<T=()> = core::result::Result<T,i32>; pub const E2BIG:i32=-7; }
+pub(crate) mod timestamp {
+    pub(crate) struct Destinations;
+    impl Destinations { pub(crate) const fn empty() -> Self { Self } }
+}
+pub(crate) struct KBox<T>(Box<T>);
+impl<T> KBox<T> { fn new(v: T, _: u32) -> Result<Self> { Ok(Self(Box::new(v))) } }
+impl<T> core::ops::Deref for KBox<T> { type Target = T; fn deref(&self) -> &T { &self.0 } }
+pub(crate) struct KVec<T>(Vec<T>);
+impl<T> KVec<T> {
+    fn new() -> Self { Self(Vec::new()) }
+    fn with_capacity(cap: usize, _: u32) -> Result<Self> { Ok(Self(Vec::with_capacity(cap))) }
+    fn push(&mut self, v: T, _: u32) -> Result { self.0.push(v); Ok(()) }
+    fn push_within_capacity(&mut self, v: T) -> std::result::Result<(), T> { self.0.push(v); Ok(()) }
+}
+impl<T> core::ops::Deref for KVec<T> { type Target = [T]; fn deref(&self) -> &[T] { &self.0 } }
+impl<T> core::ops::DerefMut for KVec<T> { fn deref_mut(&mut self) -> &mut [T] { &mut self.0 } }
 mod uapi { include!("FULL_UAPI"); }
 mod file { pub const MAX_COMMANDS_PER_SUBMISSION: u32 = 64; }
 mod hw {
@@ -98,9 +135,13 @@ mod fw {
 READER
 IMPLS
 PRODUCTION_CONSTANTS
+PARSE_TYPES
 PRODUCTION_PARSER
+fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
+    parse_stream(bytes, early_tiling).map(|_| ())
+}
 mod g17 {
-    use super::{uapi, AnyBitPattern, Reader, Result, EINVAL, size_of, offset_of, Range};
+    use super::{uapi, AnyBitPattern, Reader, Result, EINVAL, size_of, Range};
     G17_CONSTANTS
     const STAGE_PREFIXES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
     const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
@@ -548,15 +589,17 @@ mod inline_submit_containers {
         type Target = [T];
         fn deref(&self) -> &[T] { &self.0 }
     }
+    impl<T> core::ops::DerefMut for KVec<T> {
+        fn deref_mut(&mut self) -> &mut [T] { &mut self.0 }
+    }
 
     INLINE_CONTAINERS
 
     #[test]
-    fn inline_commands_orders_and_resolved_skip_heap_up_to_two_and_spill_safely() {
+    fn inline_commands_and_orders_skip_heap_up_to_two_and_spill_safely() {
         ALLOCS.with(|a| a.set(0));
         let mut cmds = Commands::new();
         let mut orders = Orders::new();
-        let mut resolved = Resolved::new();
         let o0 = Order::new([0, 0], [0, 0], [NONE; 2], [0; 2], COMPUTE).unwrap();
         let o1 = Order::new([0, 0], [0, 1], [NONE; 2], [0; 2], RENDER).unwrap();
         let o2 = Order::new([0, 0], [1, 1], [NONE; 2], [0; 2], COMPUTE).unwrap();
@@ -564,8 +607,6 @@ mod inline_submit_containers {
         cmds.push(Command(2)).unwrap();
         orders.push(o0).unwrap();
         orders.push(o1).unwrap();
-        resolved.push(timestamp::Destinations(11)).unwrap();
-        resolved.push(timestamp::Destinations(22)).unwrap();
         assert_eq!(ALLOCS.with(|a| a.get()), 0);
         assert_eq!(&*cmds, &[Command(1), Command(2)]);
         assert_eq!(&*orders, &[o0, o1]);
@@ -577,21 +618,14 @@ mod inline_submit_containers {
         FAIL_NEXT.with(|f| f.set(true));
         assert_eq!(orders.push(o2), Err(ENOMEM));
         assert_eq!(&*orders, &[o0, o1]);
-        FAIL_NEXT.with(|f| f.set(true));
-        assert_eq!(resolved.push(timestamp::Destinations(33)), Err(ENOMEM));
         assert_eq!(ALLOCS.with(|a| a.get()), 0);
 
-        // Spill to heap preserves exact FIFO order across all 3 containers.
+        // Spill to heap preserves exact FIFO order across both containers.
         cmds.push(Command(3)).unwrap();
         orders.push(o2).unwrap();
-        resolved.push(timestamp::Destinations(33)).unwrap();
-        assert_eq!(ALLOCS.with(|a| a.get()), 3);
+        assert_eq!(ALLOCS.with(|a| a.get()), 2);
         assert_eq!(&*cmds, &[Command(1), Command(2), Command(3)]);
         assert_eq!(&*orders, &[o0, o1, o2]);
-        assert_eq!(resolved.next(), Some(timestamp::Destinations(11)));
-        assert_eq!(resolved.next(), Some(timestamp::Destinations(22)));
-        assert_eq!(resolved.next(), Some(timestamp::Destinations(33)));
-        assert_eq!(resolved.next(), None);
     }
 }
 mod render_admission_tests {
@@ -812,7 +846,8 @@ replacements = {'FULL_UAPI': str(BINDINGS), 'READER': reader,
                 'CAPACITIES': capacities, 'FW_GRAPH': str(SOURCE.parent/'fw/graph.rs'),
                 'FW_WORK': str(SOURCE.parent/'fw/work.rs'), 'FULL_ENCODER': str(SOURCE.parent/'encode.rs'),
                 'IMPLS': '\n'.join('unsafe impl AnyBitPattern for uapi::' + name + ' {}' for name in names),
-                'PRODUCTION_CONSTANTS': constants, 'PRODUCTION_PARSER': parser.replace('super::encode::', 'encode::'),
+                'PRODUCTION_CONSTANTS': constants, 'PARSE_TYPES': parse_types,
+                'PRODUCTION_PARSER': parser.replace('super::encode::', 'encode::'),
                 'INLINE_CONTAINERS': inline_containers.replace('crate::timestamp::', 'timestamp::'),
                 'RENDER_ADMISSION': render_admission.replace('super::vm::', 'vm::').replace('super::params::', 'params::'),
                 'G17_CONSTANTS': g17_constants, 'G17_PARSER': g17_parser}

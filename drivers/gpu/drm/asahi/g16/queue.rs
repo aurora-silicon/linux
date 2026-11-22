@@ -203,14 +203,14 @@ impl Queue {
         if sync_count > command::MAX_SYNCS {
             return Err(EINVAL);
         }
-        command::check_stream(bytes, params::early_tiling())?;
+        let parsed = command::parse_stream(bytes, params::early_tiling())?;
         if self.shared.crashed.load(Ordering::Acquire) {
             return Err(EIO);
         }
         if self.vm.status.get() != 0 {
             return Err(EIO);
         }
-        let prepared = command::prepare(bytes, self.accepted, objects)?;
+        let prepared = parsed.prepare(self.accepted, objects)?;
         // The job reference first, so that the mappings checked below stay retained.
         let guard = self.vm.vm.retain_first_job()?;
         let submission = prepared.validate(&command::Context {

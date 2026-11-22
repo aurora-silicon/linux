@@ -17,7 +17,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 use kernel::prelude::*;
 
-use super::{command::cover, command::USC_WINDOW, params};
+use super::{command::cover_locked, command::USC_WINDOW, params};
 use crate::mmu;
 
 const VDM_ROOT: u32 = 0x21000960;
@@ -57,8 +57,8 @@ struct Window {
 
 impl Window {
     /// The `count` words at `va`, reading whole spans of up to 256 bytes (not past the page
-    /// unless the record crosses it). Unreadable memory: EFAULT.
-    fn words(&mut self, vm: &mmu::Vm, va: u64, count: usize) -> Result<[u32; 10]> {
+    /// unless the record crosses it) under an already-held VM read lock. Unreadable memory: EFAULT.
+    fn words(&mut self, guard: &mut mmu::VmReadGuard, va: u64, count: usize) -> Result<[u32; 10]> {
         let n = count.checked_mul(4).filter(|&n| n <= 40).ok_or(EINVAL)?;
         let end = va.checked_add(n as u64).ok_or(EINVAL)?;
         let cached = self.len != 0 && va >= self.va && end <= self.va + self.len as u64;
@@ -66,9 +66,10 @@ impl Window {
             let in_page = mmu::UAT_PGSZ - (va as usize & mmu::UAT_PGMSK);
             let len = n.max(self.bytes.len().min(in_page));
             let cover_end = va.checked_add(len as u64).ok_or(EINVAL)?;
-            cover(vm, va, cover_end, true, false)?;
+            cover_locked(guard, va, cover_end, true, false)?;
             self.len = 0;
-            vm.read_user(va, &mut self.bytes[..len])
+            guard
+                .read_user(va, &mut self.bytes[..len])
                 .map_err(|_| EFAULT)?;
             self.va = va;
             self.len = len;
@@ -87,7 +88,12 @@ impl Window {
 
 /// A launch's program: inside the queue's 4 GiB USC window, 64-aligned, first block readable.
 /// `checked` caches the last proven program page.
-fn program(vm: &mmu::Vm, usc: u64, address: u64, checked: &mut Option<u64>) -> Result {
+fn program(
+    guard: &mut mmu::VmReadGuard,
+    usc: u64,
+    address: u64,
+    checked: &mut Option<u64>,
+) -> Result {
     if address < usc || address - usc >= USC_WINDOW || address & 63 != 0 {
         return Err(EINVAL);
     }
@@ -96,7 +102,7 @@ fn program(vm: &mmu::Vm, usc: u64, address: u64, checked: &mut Option<u64>) -> R
     if *checked == Some(page) {
         return Ok(());
     }
-    cover(vm, address, address + 64, true, false)?;
+    cover_locked(guard, address, address + 64, true, false)?;
     *checked = Some(page);
     Ok(())
 }
@@ -161,6 +167,7 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
     let mut power = 1u64;
     let mut first = true;
     let mut resched = 0;
+    let mut guard: Option<mmu::VmReadGuard> = None;
     loop {
         if first {
             first = false;
@@ -176,10 +183,13 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
             }
         }
         if resched == 0 {
-            // No VM lock is held between reads. Keep a long userspace stream
-            // preemptible and allow its submitting task to be interrupted.
+            // Release the VM lock and clear cached window/program proofs before
+            // rescheduling so any mapping change while unlocked is re-verified.
             // might_sleep() includes might_resched() (cond_resched on voluntary kernels).
             // It is a real scheduling point, not only a debug assertion.
+            guard = None;
+            window.len = 0;
+            checked = None;
             kernel::task::might_sleep();
             if kernel::current!().signal_pending() {
                 return Err(ERESTARTSYS);
@@ -187,6 +197,10 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
             resched = CDM_RESCHED_RECORDS;
         }
         resched -= 1;
+        let guard = match guard.as_mut() {
+            Some(guard) => guard,
+            None => guard.insert(vm.read_lock().map_err(|_| EFAULT)?),
+        };
         let root_bytes = |va: u64, bytes: u64| -> Result {
             if !linked && (va < base || va.checked_add(bytes).is_none_or(|at| at > end)) {
                 return Err(EINVAL);
@@ -194,7 +208,7 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
             Ok(())
         };
         root_bytes(va, 4)?;
-        let w = window.words(vm, va, 1)?;
+        let w = window.words(guard, va, 1)?;
         if w[0] == CDM_TERMINATE {
             return Ok(());
         }
@@ -214,7 +228,7 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
         }
         if w[0] & 0xffff0000 == CDM_LINK {
             root_bytes(va, 8)?;
-            let w = window.words(vm, va, 2)?;
+            let w = window.words(guard, va, 2)?;
             let target = (u64::from(w[0] & 0xffff) << 32) | u64::from(w[1]);
             if target & 3 != 0 || target == va {
                 return Err(reject("CDM link", va, &w));
@@ -234,9 +248,9 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
             _ => return Err(reject("CDM launch mode", va, &w)),
         };
         root_bytes(va, (words * 4) as u64)?;
-        let w = window.words(vm, va, words)?;
+        let w = window.words(guard, va, words)?;
         let address = (u64::from(w[1] >> 22) << 38) | (u64::from(w[2]) << 6);
-        match program(vm, usc, address, &mut checked) {
+        match program(guard, usc, address, &mut checked) {
             Err(error) if error == EINVAL => return Err(reject("CDM program", va, &w)),
             result => result?,
         }
@@ -256,8 +270,8 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
             if indirect & 3 != 0 {
                 return Err(reject("CDM indirect parameters", va, &w));
             }
-            cover(
-                vm,
+            cover_locked(
+                guard,
                 indirect,
                 indirect.checked_add(bytes).ok_or(EINVAL)?,
                 true,

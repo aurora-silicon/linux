@@ -386,9 +386,15 @@ impl Shared {
     }
 
     /// Disarms the completion hrtimer when idle or entering system sleep.
+    ///
+    /// Always takes `resnap_handle` rather than checking a lock-free shadow flag so
+    /// `sleep::join_workers()` strictly orders with any concurrent `rearm()`: `sleep_down()`
+    /// stores `sleeping = true` before calling `cancel_resnap()`, and `rearm()` re-checks
+    /// `sleeping` under `resnap_handle.lock()` before installing a new handle.
     pub(crate) fn cancel_resnap(&self) {
+        let mut handle = self.resnap_handle.lock();
         self.resnap_deadline_ns.store(0, Ordering::Release);
-        drop(self.resnap_handle.lock().take());
+        drop(handle.take());
     }
 
     /// Queues the backup poll on `system_highpri_wq` after `delay` jiffies, or moves an already
@@ -413,6 +419,9 @@ impl Shared {
     /// Re-checks a published command soon: hrtimer, with a throttled 1-jiffy backup; sooner while
     /// a ready prefix waits for record consumption or a post-event receipt tail is settling.
     pub(crate) fn rearm(self: &Arc<Self>, soon: bool) {
+        if self.sleeping.load(Ordering::Acquire) {
+            return;
+        }
         let mut us = params::resnap_us();
         if soon && module_parameters::g16_repoll_us.value() != 0 {
             us = params::repoll_us();
@@ -422,9 +431,15 @@ impl Shared {
         let armed_ns = self.resnap_deadline_ns.load(Ordering::Acquire);
         if armed_ns == 0 || armed_ns <= now || target_ns.saturating_add(5_000) < armed_ns {
             let mut handle = self.resnap_handle.lock();
-            drop(handle.take());
-            self.resnap_deadline_ns.store(target_ns, Ordering::Release);
-            *handle = Some(self.clone().start(Delta::from_micros(i64::from(us))));
+            if self.sleeping.load(Ordering::Acquire) {
+                return;
+            }
+            let armed_ns = self.resnap_deadline_ns.load(Ordering::Acquire);
+            if armed_ns == 0 || armed_ns <= now || target_ns.saturating_add(5_000) < armed_ns {
+                drop(handle.take());
+                self.resnap_deadline_ns.store(target_ns, Ordering::Release);
+                *handle = Some(self.clone().start(Delta::from_micros(i64::from(us))));
+            }
         }
         let backup_ns = self.backup_deadline_ns.load(Ordering::Acquire);
         if now >= backup_ns {

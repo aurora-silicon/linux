@@ -203,6 +203,12 @@ pub(crate) struct Destinations(Option<crate::cleanup::Deferred<[Option<Destinati
 
 #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 impl Destinations {
+    /// Empty placeholder before timestamp destinations are resolved.
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    pub(crate) const fn empty() -> Self {
+        Self(None)
+    }
+
     /// No timestamp is written for this command.
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {

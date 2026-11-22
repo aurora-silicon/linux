@@ -51,10 +51,17 @@ mod mmu {
         pub lock_calls: std::cell::Cell<usize>,
         pub read_calls: std::cell::Cell<usize>,
     }
-    pub struct VmReadGuard<'a>(&'a Vm);
-    impl VmReadGuard<'_> {
+    pub struct VmReadGuard(*const Vm);
+    impl VmReadGuard {
+        pub fn covers_range(&mut self, address: u64, size: u64, _read: bool, _write: bool) -> bool {
+            let vm = unsafe { &*self.0 };
+            address
+                .checked_add(size)
+                .is_some_and(|end| vm.contains(address, end))
+        }
         pub fn read_user(&mut self, va: u64, out: &mut [u8]) -> Result {
-            self.0.read_user(va, out)
+            let vm = unsafe { &*self.0 };
+            vm.read_user(va, out)
         }
     }
     impl Vm {
@@ -65,9 +72,9 @@ mod mmu {
             self.regions.iter().any(|r| r.readable && va >= r.base
                 && end >= va && end <= r.base + r.bytes.len() as u64)
         }
-        pub fn read_lock(&self) -> Result<VmReadGuard<'_>> {
+        pub fn read_lock(&self) -> Result<VmReadGuard> {
             self.lock_calls.set(self.lock_calls.get() + 1);
-            Ok(VmReadGuard(self))
+            Ok(VmReadGuard(self as *const Vm))
         }
         pub fn read_user(&self, va: u64, out: &mut [u8]) -> Result {
             self.read_calls.set(self.read_calls.get() + 1);
@@ -94,7 +101,13 @@ mod g16 {
         }
         pub fn reset_cover_calls() { COVER_CALLS.with(|c| c.set(0)); }
         pub fn cover_calls() -> usize { COVER_CALLS.with(Cell::get) }
-        pub fn cover(vm: &mmu::Vm, start: u64, end: u64, _read: bool, _write: bool) -> Result {
+        pub fn cover_locked(
+            guard: &mut mmu::VmReadGuard,
+            start: u64,
+            end: u64,
+            read: bool,
+            write: bool,
+        ) -> Result {
             COVER_CALLS.with(|c| c.set(c.get() + 1));
             if end <= start || start < 0x4000 || end > (1u64 << 42) - 0x8000 {
                 return Err(EINVAL);
@@ -103,7 +116,7 @@ mod g16 {
                 || start < 0x1000010000 && end > 0x1000000000 {
                 return Err(EACCES);
             }
-            if vm.contains(start, end) { Ok(()) } else { Err(EFAULT) }
+            if guard.covers_range(start, end - start, read, write) { Ok(()) } else { Err(EFAULT) }
         }
     }
     #[path = "PRODUCTION_SOURCE"] pub mod gate;
@@ -318,6 +331,36 @@ fn vdm_batch_shares_lock_caches_window_and_rejects_bad_root() {
     assert_eq!(vm.lock_calls.get(), 1);
     assert_eq!(vm.read_calls.get(), 3);
 }
+#[test]
+fn cdm_batches_vm_read_lock_and_releases_on_resched() {
+    let target = 0x600000000u64;
+    let mut root = Vec::new();
+    root.extend(launch(0, USC, 0));
+    root.extend(launch(1, USC + 0x80, 0x400000000));
+    root.extend(launch(2, USC + 0x100, 0x400000040));
+    root.extend([0x20000000 | (target >> 32) as u32, target as u32]);
+    let mut vm = vm_for(&root);
+    let mut linked_words = launch(0, USC + 0x4000, 0);
+    linked_words.push(0x40000000);
+    let mut linked = bytes(&linked_words);
+    linked.resize(0x4000, 0);
+    vm.region(target, linked);
+    vm.region(USC + 0x4000, vec![0; 0x4000]);
+
+    // Multi-launch mode 0/1/2 + linked segment acquires the VM read lock only once.
+    assert!(g16::gate::cdm(&vm, USC, BASE, BASE + root.len() as u64 * 4).is_ok());
+    assert_eq!(vm.lock_calls.get(), 1);
+
+    // Streams longer than CDM_RESCHED_RECORDS (1024) drop and re-acquire the lock on each resched.
+    let mut long = vec![0x60000160; 2500];
+    long.push(0x40000000);
+    let long_vm = vm_for(&long);
+    let sched_before = kernel::task::scheduled();
+    assert!(g16::gate::cdm(&long_vm, USC, BASE, BASE + long.len() as u64 * 4).is_ok());
+    let sched_delta = kernel::task::scheduled() - sched_before;
+    assert_eq!(sched_delta, 3);
+    assert_eq!(long_vm.lock_calls.get(), sched_delta);
+}
 '''
 
 with tempfile.TemporaryDirectory(prefix='m4-rust-gate-') as directory:
@@ -331,7 +374,7 @@ with tempfile.TemporaryDirectory(prefix='m4-rust-gate-') as directory:
     (OUT / 'stream-gate-host.log').write_text(result.stdout + result.stderr)
     (OUT / 'stream-gate-host.json').write_text(json.dumps({
         'source': str(SOURCE), 'sha256': hashlib.sha256(SOURCE.read_bytes()).hexdigest(),
-        'result': 'pass', 'test_groups': 10,
+        'result': 'pass', 'test_groups': 11,
         'mesa_sources': ['src/asahi/genxml/agx3_cmdstream.h', 'src/asahi/lib/agx3_cdm_decode_core.c',
                          'src/asahi/lib/agx_vdm_barrier_core.c'],
         'limitations': 'Host VM model validates parser, addresses, cycles and interruption; hardware and kernel cache behavior require target tests.'
