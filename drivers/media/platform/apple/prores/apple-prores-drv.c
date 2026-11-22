@@ -1516,6 +1516,16 @@ static void apr_finish_job(struct apr_dev *apr, struct apr_ctx *ctx, int err)
 }
 
 /*
+ * The ring state is inconsistent: no completion may be trusted until the
+ * watchdog has reset the engine. Called with hw_lock held.
+ */
+static void apr_set_hung(struct apr_dev *apr)
+{
+	apr->hung = true;
+	apr_write(apr, APR_REG_IRQ_ENABLE, 0);
+}
+
+/*
  * Move the jobs the engine has finished, oldest first, to @out (room for
  * APR_MAX_INFLIGHT). Returns false if the engine raised nothing. Called with
  * hw_lock held and the engine powered.
@@ -1530,7 +1540,9 @@ static void apr_finish_job(struct apr_dev *apr, struct apr_ctx *ctx, int err)
  * job finished since the reset, which is no progress; an id the driver has
  * not issued yet means the engine and the ring disagree, so the ring is
  * declared hung and the watchdog resets the engine before any buffer goes
- * back. An encode has no id and retires on DONE once the tail passed it.
+ * back. From then on nothing is taken off the ring here: the engine's
+ * interrupt is masked, and the watchdog fails every job after the reset.
+ * An encode has no id and retires on DONE once the tail passed it.
  * A DONE still latched after the last job was taken here would make a new
  * encode look finished as soon as it is fetched, so device_run clears the
  * status before it publishes into an empty ring.
@@ -1546,6 +1558,8 @@ static bool apr_take_done(struct apr_dev *apr, struct apr_job *out,
 	u16 done_id;
 
 	*n = 0;
+	if (apr->hung)
+		return false;
 	status = apr_read(apr, APR_REG_IRQ_STATUS);
 	if (!(status & (APR_IRQ_DONE | APR_IRQ_ERROR)))
 		return false;
@@ -1579,7 +1593,7 @@ static bool apr_take_done(struct apr_dev *apr, struct apr_job *out,
 	if (!apr_ring_tail_valid(apr->done, tail, apr->head, ring_bytes)) {
 		dev_err_ratelimited(apr->dev, "tail %#x outside %#x..%#x\n",
 				    tail, apr->done, apr->head);
-		apr->hung = true;
+		apr_set_hung(apr);
 		return true;
 	}
 	/* Read after the W1C: a job finishing later raises DONE again. */
@@ -1588,7 +1602,7 @@ static bool apr_take_done(struct apr_dev *apr, struct apr_job *out,
 	if (state == APR_DONE_ID_FUTURE && apr->njobs > apr->nencodes) {
 		dev_err_ratelimited(apr->dev, "finished id %#x not issued yet, next %#x\n",
 				    done_id, apr->next_id);
-		apr->hung = true;
+		apr_set_hung(apr);
 		return true;
 	}
 	while (apr->njobs) {
@@ -1635,12 +1649,15 @@ static irqreturn_t apr_irq(int irq, void *data)
 	bool handled = false, hung;
 
 	spin_lock(&apr->hw_lock);
-	/* Registers are only reachable while the engine is powered. */
+	/*
+	 * Registers are only reachable while the engine is powered. A hung
+	 * ring masked the interrupt; one already in flight is ours.
+	 */
 	if (apr->ring_ready)
-		handled = apr_take_done(apr, done, &n);
+		handled = apr_take_done(apr, done, &n) || apr->hung;
 	held = apr_take_held(apr);
 	hung = apr->hung;
-	if (!apr->njobs)
+	if (!apr->njobs && !hung)
 		cancel_delayed_work(&apr->watchdog);
 	spin_unlock(&apr->hw_lock);
 	if (hung)
@@ -1666,11 +1683,12 @@ static void apr_watchdog(struct work_struct *work)
 	unsigned int n = 0;
 
 	spin_lock_irqsave(&apr->hw_lock, flags);
-	if (!apr->njobs) {
+	/* A hung ring is reset even when no job is left in it. */
+	if (!apr->njobs && !apr->hung) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		return;
 	}
-	if (apr->ring_ready && apr_take_done(apr, done, &n) && n)
+	if (!apr->hung && apr->ring_ready && apr_take_done(apr, done, &n) && n)
 		dev_warn_once(apr->dev, "completion found without an interrupt\n");
 	if (!apr->hung && (!apr->njobs ||
 			   time_before(jiffies, apr->progress +
@@ -1778,10 +1796,15 @@ static void apr_device_run(void *priv)
 	}
 
 	spin_lock_irqsave(&apr->hw_lock, flags);
-	/* An encode has no job id, so it only runs alone in the ring. */
-	while (apr->resetting || (!ctx->decode && apr->njobs)) {
+	/*
+	 * Nothing enters a hung ring or one being reset; the watchdog clears
+	 * both and wakes idle_wq. An encode has no job id, so it only runs
+	 * alone in the ring.
+	 */
+	while (apr->hung || apr->resetting || (!ctx->decode && apr->njobs)) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
-		wait_event(apr->idle_wq, !READ_ONCE(apr->resetting) &&
+		wait_event(apr->idle_wq, !READ_ONCE(apr->hung) &&
+			   !READ_ONCE(apr->resetting) &&
 			   (ctx->decode || !READ_ONCE(apr->njobs)));
 		spin_lock_irqsave(&apr->hw_lock, flags);
 	}
@@ -2558,9 +2581,13 @@ static int apr_runtime_suspend(struct device *dev)
 	struct apr_dev *apr = dev_get_drvdata(dev);
 	unsigned long flags;
 
-	/* Registers do not survive the power domain going off. */
+	/*
+	 * Registers do not survive the power domain going off, which resets
+	 * the engine: a ring found hung with no job left needs nothing more.
+	 */
 	spin_lock_irqsave(&apr->hw_lock, flags);
 	apr->ring_ready = false;
+	apr->hung = false;
 	spin_unlock_irqrestore(&apr->hw_lock, flags);
 	return 0;
 }
