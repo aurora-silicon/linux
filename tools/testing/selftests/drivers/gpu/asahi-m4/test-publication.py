@@ -175,6 +175,7 @@ struct Firmware{
 }
 impl Firmware {
     fn mark_class_unavailable(&mut self,class:usize,error:Error){self.unavailable.push((class,error));}
+    fn sync_quarantine_hints(&self){}
     __NEEDS_ENGINE_DRAIN__
     fn can_queue_behind(&self,job:&Arc<Job>)->bool{
         if !self.allow_behind{return false;}

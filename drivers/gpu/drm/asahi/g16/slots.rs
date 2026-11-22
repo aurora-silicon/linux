@@ -683,6 +683,18 @@ impl Slots {
     pub(crate) fn render_exhausted_within(&self, n: usize) -> bool {
         self.render.lifetime.exhausted_within(n)
     }
+    /// Whether any base compute unit (`0..BASE_COMPUTE_UNITS`) is permanently quarantined.
+    pub(crate) fn base_compute_quarantined(&self) -> bool {
+        self.compute
+            .lifetime
+            .any_quarantined_within(super::resources::BASE_COMPUTE_UNITS)
+    }
+    /// Whether any base render pass slot (`0..BASE_RENDER_SLOTS`) is permanently quarantined.
+    pub(crate) fn base_render_quarantined(&self) -> bool {
+        self.render
+            .lifetime
+            .any_quarantined_within(super::resources::BASE_RENDER_SLOTS)
+    }
     pub(crate) fn lifetime_counts(&self) -> [super::pools::lifetime::Counts; 2] {
         [self.compute.lifetime.counts(), self.render.lifetime.counts()]
     }

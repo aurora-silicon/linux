@@ -88,21 +88,53 @@ const EXT_RENDER_SLOTS: usize = super::hw::sizes::RENDER_SLOTS - BASE_RENDER_SLO
 /// `BASE_RENDER_SLOTS` holds only one active render once displacement occupies a slot.
 const RENDER_BURST_COMMANDS: usize = BASE_RENDER_SLOTS;
 
+/// Device-wide hints read locklessly in `SUBMIT` to size per-VM extension backing.
+#[derive(Copy, Clone, Default)]
+pub(crate) struct PrepareHints {
+    /// A base compute unit (`0..BASE_COMPUTE_UNITS`) is quarantined: allocate extension units.
+    pub(crate) expand_compute_ext: bool,
+    /// A base render pass slot (`0..BASE_RENDER_SLOTS`) is quarantined: allocate extension slots.
+    pub(crate) expand_render_ext: bool,
+}
+
+/// Updates the consecutive-compute burst counter and reports whether this submission
+/// qualifies to allocate extension compute units (`compute_ext`).
+///
+/// If a base compute unit (`0..BASE_COMPUTE_UNITS`) has been permanently quarantined, fresh
+/// single-command VMs must expand immediately so they can claim a healthy extension unit and
+/// displace the remaining retired base unit rather than hitting `compute_exhausted_within(2)`.
+fn should_expand_compute_ext(
+    last_compute_ns: &mut u64,
+    burst: &mut u32,
+    now: u64,
+    computes: usize,
+    base_quarantined: bool,
+) -> bool {
+    *burst = if *last_compute_ns != 0 && now.wrapping_sub(*last_compute_ns) < BURST_GAP_NS {
+        burst.saturating_add(1)
+    } else {
+        0
+    };
+    *last_compute_ns = now;
+    base_quarantined || *burst >= BURST_SUBMITS || computes >= BURST_COMMANDS
+}
+
 /// Updates the consecutive-render burst counter and reports whether this submission
 /// qualifies to allocate extension pass slots (`RenderExtArena`).
 ///
 /// Steady 60/120 Hz single-pass depth-1 clients finish each frame before the next arrives
 /// (`active_renders == 0`, `render_count == 1`, inter-frame gap >= `BURST_GAP_NS`) and stay
-/// on the two base pass slots. Extension slots allocate when a VM actually overlaps an
-/// in-flight render (`active_renders != 0`, including multi-ms 1080p/4K pipelined frames),
-/// submits a multi-pass command stream (`render_count >= BASE_RENDER_SLOTS`), or sustains a
-/// sub-2 ms back-to-back burst.
+/// on the two base pass slots. Extension slots allocate when a base pass slot is quarantined,
+/// a VM actually overlaps an in-flight render (`active_renders != 0`, including multi-ms
+/// 1080p/4K pipelined frames), submits a multi-pass command stream
+/// (`render_count >= BASE_RENDER_SLOTS`), or sustains a sub-2 ms back-to-back burst.
 fn should_expand_render_ext(
     last_render_ns: &mut u64,
     render_burst: &mut u32,
     now: u64,
     render_count: usize,
     active_renders: u32,
+    base_quarantined: bool,
 ) -> bool {
     *render_burst = if *last_render_ns != 0 && now.wrapping_sub(*last_render_ns) < BURST_GAP_NS {
         render_burst.saturating_add(1)
@@ -110,7 +142,10 @@ fn should_expand_render_ext(
         0
     };
     *last_render_ns = now;
-    active_renders != 0 || *render_burst >= BURST_SUBMITS || render_count >= RENDER_BURST_COMMANDS
+    base_quarantined
+        || active_renders != 0
+        || *render_burst >= BURST_SUBMITS
+        || render_count >= RENDER_BURST_COMMANDS
 }
 
 pub(crate) struct RenderArena(crate::cleanup::Deferred<RenderInner>);
@@ -424,6 +459,7 @@ impl Cache {
         self: &Arc<Self>,
         vm: &Arc<VmState>,
         commands: &[Command],
+        hints: PrepareHints,
     ) -> Result<Prepared> {
         let computes = commands
             .iter()
@@ -457,15 +493,16 @@ impl Cache {
                 if units > BASE_COMPUTE_UNITS {
                     // SAFETY: ktime_get has no preconditions.
                     let now = unsafe { kernel::bindings::ktime_get() } as u64;
-                    ready.burst = if now.wrapping_sub(ready.last_compute_ns) < BURST_GAP_NS {
-                        ready.burst.saturating_add(1)
-                    } else {
-                        0
-                    };
-                    ready.last_compute_ns = now;
-                    if ready.burst >= BURST_SUBMITS || computes >= BURST_COMMANDS {
-                        // Best effort: without them the VM keeps one command in flight.
-                        ready.compute_ext = ComputeArena::new(
+                    let state = &mut *ready;
+                    if should_expand_compute_ext(
+                        &mut state.last_compute_ns,
+                        &mut state.burst,
+                        now,
+                        computes,
+                        hints.expand_compute_ext,
+                    ) {
+                        // Best effort: without them the VM keeps the base compute units.
+                        state.compute_ext = ComputeArena::new(
                             &self.factory,
                             &self.bind,
                             &vm.vm,
@@ -496,6 +533,7 @@ impl Cache {
                         now,
                         render_count as usize,
                         active,
+                        hints.expand_render_ext,
                     ) {
                         // Best effort: without extension slots the VM keeps two base pass slots.
                         state.render_ext =

@@ -1051,6 +1051,19 @@ impl Firmware {
         }
     }
 
+    /// Publishes lockless quarantine hints so `SUBMIT` expands extension slots immediately
+    /// when a base slot has been permanently quarantined.
+    pub(crate) fn sync_quarantine_hints(&self) {
+        if let Some(shared) = &self.engine.shared {
+            shared
+                .base_compute_quarantined
+                .store(self.slots.base_compute_quarantined(), Ordering::Release);
+            shared
+                .base_render_quarantined
+                .store(self.slots.base_render_quarantined(), Ordering::Release);
+        }
+    }
+
     /// Retire the flight at `index` (the oldest of its engine class). Only a full normal receipt
     /// retires its storage; a passed abort quarantines it. Job failure independently drops
     /// remaining unpublished commands even when the storage fully retired.
@@ -1076,6 +1089,7 @@ impl Firmware {
         if receipt.owner_retired() {
             if let Err(error) = self.slots.retire(&mut f.claims) {
                 self.slots.quarantine(&mut f.claims);
+                self.sync_quarantine_hints();
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
                 for j2 in f.group.iter() {
@@ -1140,6 +1154,7 @@ impl Firmware {
                 self.pools.quarantine_flight(f.pb_slot as usize, f.pb.take());
             }
             self.slots.quarantine(&mut f.claims);
+            self.sync_quarantine_hints();
             self.retain(&f.job);
             for j2 in f.group.iter() {
                 self.retain(j2);

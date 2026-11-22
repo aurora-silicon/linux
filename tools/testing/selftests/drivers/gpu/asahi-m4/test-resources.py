@@ -168,6 +168,7 @@ pub mod g16 {
         }
         pub struct RenderArena{pub passes:KVec<super::slots::PassSlot>,pub tpc_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS],pub tilemap_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS]}
         impl RenderArena{ __SET_DIRTY__ }
+        pub(crate) const BASE_COMPUTE_UNITS: usize = 2;
         pub(crate) const BASE_RENDER_SLOTS: usize = super::hw::sizes::BASE_RENDER_SLOTS;
         __RENDER_BURST__
     }
@@ -1008,7 +1009,7 @@ pub mod g16 {
             let mut last = 0u64;
             let mut burst = 0u32;
             for step in 1u64..=10 {
-                assert!(!should_expand_render_ext(&mut last, &mut burst, step * period_ns, 1, 0));
+                assert!(!should_expand_render_ext(&mut last, &mut burst, step * period_ns, 1, 0, false));
                 assert_eq!(burst, 0);
             }
         }
@@ -1017,23 +1018,99 @@ pub mod g16 {
         // already-active render (active_renders >= 1) and expand immediately.
         let mut last = 0u64;
         let mut burst = 0u32;
-        assert!(!should_expand_render_ext(&mut last, &mut burst, 1_000_000, 1, 0));
-        assert!(should_expand_render_ext(&mut last, &mut burst, 6_000_000, 1, 1));
-        assert!(should_expand_render_ext(&mut last, &mut burst, 22_600_000, 1, 1));
+        assert!(!should_expand_render_ext(&mut last, &mut burst, 1_000_000, 1, 0, false));
+        assert!(should_expand_render_ext(&mut last, &mut burst, 6_000_000, 1, 1, false));
+        assert!(should_expand_render_ext(&mut last, &mut burst, 22_600_000, 1, 1, false));
 
         // Sub-2 ms back-to-back single-pass bursts still expand after 3 consecutive gaps.
         let mut last = 0u64;
         let mut burst = 0u32;
-        assert!(!should_expand_render_ext(&mut last, &mut burst, 1_000_000, 1, 0));
-        assert!(!should_expand_render_ext(&mut last, &mut burst, 2_000_000, 1, 0));
-        assert!(!should_expand_render_ext(&mut last, &mut burst, 3_000_000, 1, 0));
-        assert!(should_expand_render_ext(&mut last, &mut burst, 4_000_000, 1, 0));
+        assert!(!should_expand_render_ext(&mut last, &mut burst, 1_000_000, 1, 0, false));
+        assert!(!should_expand_render_ext(&mut last, &mut burst, 2_000_000, 1, 0, false));
+        assert!(!should_expand_render_ext(&mut last, &mut burst, 3_000_000, 1, 0, false));
+        assert!(should_expand_render_ext(&mut last, &mut burst, 4_000_000, 1, 0, false));
         assert_eq!(burst, 3);
 
         // A single multi-pass SUBMIT with >= BASE_RENDER_SLOTS (2) renders expands immediately.
         let mut last = 0u64;
         let mut burst = 0u32;
-        assert!(should_expand_render_ext(&mut last, &mut burst, 100_000_000, 2, 0));
+        assert!(should_expand_render_ext(&mut last, &mut burst, 100_000_000, 2, 0, false));
+    }
+
+    #[test]fn base_compute_quarantine_expands_fresh_vm_and_recovers_displacement(){
+        use crate::g16::resources::should_expand_compute_ext;
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();
+        let mut units=KVec::new();
+        for k in 0..4u64 {
+            units.push(g16::slots::ComputeSlot::new(&mut o,k).unwrap(),0).unwrap();
+        }
+        let prep_full=g16::resources::ComputeArena{compute:units,render:None};
+        let a=vm(1);let b=vm(2);
+        // Retire base unit 0, then hang and quarantine base unit 1 (or vice versa):
+        // unit 0 is now retired-undisplaced and unit 1 is quarantined -> base [0..2] exhausted.
+        let mut c=Claims::new();
+        assert_eq!(s.claim_compute_for(&prep_full,&mut c,Some(a.id)).unwrap(),Some(0));
+        s.hold_vm(&c,&a).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        assert_eq!(s.claim_compute_for(&prep_full,&mut c,Some(a.id)).unwrap(),Some(1));
+        s.hold_vm(&c,&a).unwrap();s.publish(&c).unwrap();s.quarantine(&mut c);
+        assert!(s.base_compute_quarantined());
+        assert!(s.compute_exhausted_within(2));
+        assert!(!s.compute_exhausted_within(4));
+        // Fresh single-command VM expands extension units immediately because a base unit is quarantined.
+        let mut last=0u64;let mut burst=0u32;
+        assert!(!should_expand_compute_ext(&mut last,&mut burst,10_000_000,1,false));
+        let mut last=0u64;let mut burst=0u32;
+        assert!(should_expand_compute_ext(&mut last,&mut burst,10_000_000,1,s.base_compute_quarantined()));
+        // Expanded fresh VM claims unit 2, retires cleanly, and displaces base unit 0 back to reusable.
+        assert_eq!(s.claim_compute_for(&prep_full,&mut c,Some(b.id)).unwrap(),Some(2));
+        s.hold_vm(&c,&b).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        assert!(!s.compute_exhausted_within(2));
+        assert!(s.compute_available(2));
+        // A base-only (2-unit) VM can now claim displaced base unit 0 again.
+        let mut base_units=KVec::new();
+        for k in 0..2u64 {
+            base_units.push(g16::slots::ComputeSlot::new(&mut o,k).unwrap(),0).unwrap();
+        }
+        let prep_base=g16::resources::ComputeArena{compute:base_units,render:None};
+        assert_eq!(s.claim_compute_for(&prep_base,&mut c,Some(b.id)).unwrap(),Some(0));
+        s.release(&mut c);
+    }
+
+    #[test]fn base_render_quarantine_expands_fresh_vm_and_recovers_displacement(){
+        use crate::g16::resources::should_expand_render_ext;
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();
+        let mut passes=KVec::new();
+        for k in 0..4u64 {
+            passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
+        }
+        let render=sync::Arc::new(g16::resources::RenderArena{
+            passes,
+            tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
+            tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
+        },0).unwrap();
+        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render)};
+        let a=vm(1);let b=vm(2);
+        let geo=g16::encode::Geometry{tpc_bytes:0x1000,tilemap_bytes:0x1000};
+        // Retire base pass slot 0, then hang and quarantine base pass slot 1 -> base [0..2] exhausted.
+        let mut c0=Claims::new();c0.pass[0]=0;c0.pass_count=1;c0.pass_mask=1<<0;
+        s.claim_pass_in(&prep,0,Some(a.id),0x1000).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.publish(&c0).unwrap();s.retire(&mut c0).unwrap();
+        let mut c1=Claims::new();c1.pass[0]=1;c1.pass_count=1;c1.pass_mask=1<<1;
+        s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.publish(&c1).unwrap();s.quarantine(&mut c1);
+        assert!(s.base_render_quarantined());
+        assert!(s.render_exhausted_within(2));
+        assert!(!s.render_exhausted_within(4));
+        // Fresh single-pass VM expands RenderExtArena immediately because a base pass slot is quarantined.
+        let mut last=0u64;let mut burst=0u32;
+        assert!(should_expand_render_ext(&mut last,&mut burst,10_000_000,1,0,s.base_render_quarantined()));
+        // Expanded VM picks and retires pass slot 2, displacing base pass slot 0 back to reusable.
+        let k=s.pick_pass_in(&prep,&geo,0).unwrap();
+        assert_eq!(k,2);
+        let mut c2=Claims::new();c2.pass[0]=k as u32;c2.pass_count=1;c2.pass_mask=1<<k;
+        s.claim_pass_in(&prep,k,Some(b.id),0x1000).unwrap();
+        s.hold_vm(&c2,&b).unwrap();s.publish(&c2).unwrap();s.retire(&mut c2).unwrap();
+        assert!(!s.render_exhausted_within(2));
     }
 
 }
@@ -1066,8 +1143,8 @@ source = source.replace('__LIVE_TOKEN__' ,item((production/'vm.rs').read_text(),
 resources_source = (production/'resources.rs').read_text()
 render_burst_lines = '\n'.join(
     line for line in resources_source.splitlines()
-    if line.startswith(('const BURST_SUBMITS:', 'const BURST_GAP_NS:', 'const RENDER_BURST_COMMANDS:'))
-) + '\npub(crate) ' + item(resources_source, 'fn should_expand_render_ext(')
+    if line.startswith(('const BURST_SUBMITS:', 'const BURST_GAP_NS:', 'const BURST_COMMANDS:', 'const RENDER_BURST_COMMANDS:'))
+) + '\npub(crate) ' + item(resources_source, 'fn should_expand_compute_ext(') + '\npub(crate) ' + item(resources_source, 'fn should_expand_render_ext(')
 source = source.replace('__CMD_CLASSES__',item(graph_source,'pub(crate) const fn cmd_fw(')+'\n'+item(graph_source,'pub(crate) const fn cmd_shared(')).replace('__SET_DIRTY__',item(resources_source,'pub(crate) fn set_dirty(')).replace('__RENDER_BURST__', render_burst_lines)
 source = source.replace('__ALLOC__',item(graph_source,'pub(crate) fn alloc(')).replace('__ALLOC_WORK__',item(graph_source,'pub(crate) fn alloc_work('))
 source = source.replace('__HW__','\n'.join(module(hw,n) for n in ('client','sizes','engine','tuning','pte'))).replace('__ROOT__',str(production)).replace('__PRIVATE_RW__',hex(private_rw)+'u64').replace('__CLIENT__', '#[derive(Copy,Clone)]\n'+item(graph_source, 'pub(crate) struct Client {')+'\n'+item(graph_source, 'impl Client {'))
@@ -1085,7 +1162,7 @@ for command in [
         raise SystemExit(result.returncode)
 files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs']
 (out/'resource-host.json').write_text(json.dumps({
-    'result': 'pass', 'tests': 28,
+    'result': 'pass', 'tests': 30,
     'scope': 'Actual production allocation, initialization and lifetime code against a CPU-only backing recorder; no hardware qualification.',
     'private_rw_pte': hex(private_rw),
     'private_rw_reference': 'Qualified J713 NC read/write leaf attributes',

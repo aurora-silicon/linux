@@ -230,12 +230,16 @@ impl Queue {
         }
         // Allocate and map private backing before a fence or accepted ordinal exists.
         // No GPU completion lock is held; reclaim can wait for earlier hardware work.
+        let hints = super::resources::PrepareHints {
+            expand_compute_ext: self.shared.base_compute_quarantined.load(Ordering::Acquire),
+            expand_render_ext: self.shared.base_render_quarantined.load(Ordering::Acquire),
+        };
         let resources = self
             .vm
             .resources
             .as_ref()
             .ok_or(EIO)?
-            .prepare(&self.vm, &submission.commands)?;
+            .prepare(&self.vm, &submission.commands, hints)?;
         let fence = self.timeline.next()?;
         let job = Job::new(
             id,

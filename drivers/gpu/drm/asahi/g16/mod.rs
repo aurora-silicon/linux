@@ -236,6 +236,10 @@ pub(crate) struct Shared {
     pub(crate) sleeping: AtomicBool,
     /// Firmware recovery is active under `Shared::state` (may sleep up to 1000 ms).
     pub(crate) recovering: AtomicBool,
+    /// Whether any base compute unit (`0..BASE_COMPUTE_UNITS`) has been quarantined.
+    pub(crate) base_compute_quarantined: AtomicBool,
+    /// Whether any base render pass slot (`0..BASE_RENDER_SLOTS`) has been quarantined.
+    pub(crate) base_render_quarantined: AtomicBool,
     /// The GFX power state word from before a system sleep.
     sleep_ps: AtomicU32,
     /// The stop left to a system sleep's commit, until `.complete` finishes it.
@@ -474,6 +478,8 @@ impl Gpu {
                 orphaned: AtomicBool::new(false),
                 sleeping: AtomicBool::new(false),
                 recovering: AtomicBool::new(false),
+                base_compute_quarantined: AtomicBool::new(false),
+                base_render_quarantined: AtomicBool::new(false),
                 sleep_ps: AtomicU32::new(0),
                 sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
                 events,

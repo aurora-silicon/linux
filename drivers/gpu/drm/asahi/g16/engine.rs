@@ -2073,6 +2073,7 @@ impl Firmware {
                 // refusal. Keep the unit and its previous VM lease mapped forever; cancelling
                 // preparation would make the corrupt descriptor available to another job.
                 self.slots.quarantine(&mut f.claims);
+                self.sync_quarantine_hints();
                 return Err(EIO);
             }
         }
