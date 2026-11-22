@@ -72,6 +72,7 @@
 			compatible = "apple,t6041-dart", "apple,t8110-dart";
 			reg = <0x1a80000 0xc000>;
 			#iommu-cells = <1>;
+			power-domains = <&ps_atc3_cio>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1933 IRQ_TYPE_LEVEL_HIGH>;
 			/* ADT dart-acio3 vm-base: NHI rings below 1 TiB + 4 GiB. */
