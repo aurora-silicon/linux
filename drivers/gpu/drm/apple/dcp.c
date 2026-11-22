@@ -1506,10 +1506,9 @@ void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation)
 		width_mm = dcp->panel.width_mm;
 		height_mm = dcp->panel.height_mm;
 	}
-	if (connector) {
-		connector->display_info.width_mm = width_mm;
-		connector->display_info.height_mm = height_mm;
-	}
+	/* As get_modes() would: the notch-free geometry is shorter. */
+	if (connector)
+		dcp_update_connector_dimensions(dcp, connector);
 	for (i = 0; i < dcp->nr_modes; ++i) {
 		dcp->modes[i].mode.width_mm = width_mm;
 		dcp->modes[i].mode.height_mm = height_mm;
@@ -1532,10 +1531,12 @@ void dcp_update_connector_dimensions(struct apple_dcp *dcp,
 		height_mm = dcp->panel.height_mm;
 	}
 	/* The notch-free geometry is physically shorter (dcp-notch.h). */
-	if (READ_ONCE(dcp->notch_free_offered))
+	if (READ_ONCE(dcp->notch_free_offered)) {
+		u32 rows = READ_ONCE(dcp->notch_panel_rows);
+
 		height_mm = dcp_notch_free_mm(height_mm, dcp->panel.adj_height_mm,
-					      READ_ONCE(dcp->notch_panel_rows),
-					      READ_ONCE(dcp->notch_panel_rows) - dcp->notch_rows);
+					      rows, rows - dcp->notch_rows);
+	}
 	connector->display_info.width_mm = width_mm;
 	connector->display_info.height_mm = height_mm;
 }

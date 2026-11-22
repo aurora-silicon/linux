@@ -2273,8 +2273,8 @@ err_unlock:
 	if (retained_modeset)
 		drm_modeset_unlock_all(&apple->drm);
 err_unbind:
-	cancel_work_sync(&apple->notch_hotplug);
-	cancel_work_sync(&apple->notch_console);
+	disable_work_sync(&apple->notch_hotplug);
+	disable_work_sync(&apple->notch_console);
 	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
 	component_unbind_all(dev, NULL);
@@ -2300,8 +2300,8 @@ static void apple_drm_uninit(struct device *dev)
 	drm_dev_unplug(&apple->drm);
 	drm_atomic_helper_shutdown(&apple->drm);
 	/* No sysfs write, commit or master change queues them now. */
-	cancel_work_sync(&apple->notch_hotplug);
-	cancel_work_sync(&apple->notch_console);
+	disable_work_sync(&apple->notch_hotplug);
+	disable_work_sync(&apple->notch_console);
 
 	component_unbind_all(dev, NULL);
 

@@ -954,7 +954,7 @@ rx_unused(apple_rtkit_kdebug_rx)
 rx_unused(apple_rtkit_ioreport_rx)
 rx_unused(apple_rtkit_oslog_rx)
 '''
-    parts=[function(dcp,'void dcp_set_dimensions('), function(template,'static u8 dcpep_cb_prop_start(')]
+    parts=[]
     if 'void dcp_update_connector_dimensions(' in dcp:
         notch = (root / 'drivers/gpu/drm/apple/dcp-notch.h').read_text()
         if 'dcp_notch_free_mm(' in notch:
@@ -962,6 +962,7 @@ rx_unused(apple_rtkit_oslog_rx)
         parts.append(function(dcp,'void dcp_update_connector_dimensions('))
     else:
         parts.append('static void dcp_update_connector_dimensions(struct apple_dcp *d, struct drm_connector *c) { (void)d; (void)c; }')
+    parts += [function(dcp,'void dcp_set_dimensions('), function(template,'static u8 dcpep_cb_prop_start(')]
     parts += [function(iomfb,'void iomfb_recv_msg('),function(af,'int afk_receive_message('),
               function(dcp,'static struct apple_dcp_afkep *dcp_afkep('),
               function(dcp,'static void dcp_recv_msg(')]
