@@ -318,16 +318,16 @@ static int dcpaud_select_cookie(struct dcp_audio *dcpaud,
 }
 
 static int dcpaud_rule_channels(struct snd_pcm_hw_params *params,
-                                struct snd_pcm_hw_rule *rule)
+				struct snd_pcm_hw_rule *rule)
 {
 	struct dcp_audio *dcpaud = rule->private;
 	struct snd_interval *c = hw_param_interval(params,
 				SNDRV_PCM_HW_PARAM_CHANNELS);
 	struct dcp_sound_format_mask hits = {0, 0, 0};
 
-        dcpaud_consult_elements(dcpaud, params, &hits);
+	dcpaud_consult_elements(dcpaud, params, &hits);
 
-        return dcpaud_interval_bitmask(c, hits.nchans);
+	return dcpaud_interval_bitmask(c, hits.nchans);
 }
 
 static int dcpaud_refine_fmt_mask(struct snd_mask *m, u64 mask)
@@ -343,29 +343,29 @@ static int dcpaud_refine_fmt_mask(struct snd_mask *m, u64 mask)
 }
 
 static int dcpaud_rule_format(struct snd_pcm_hw_params *params,
-                               struct snd_pcm_hw_rule *rule)
+			       struct snd_pcm_hw_rule *rule)
 {
 	struct dcp_audio *dcpaud = rule->private;
 	struct snd_mask *f = hw_param_mask(params,
 				SNDRV_PCM_HW_PARAM_FORMAT);
 	struct dcp_sound_format_mask hits;
 
-        dcpaud_consult_elements(dcpaud, params, &hits);
+	dcpaud_consult_elements(dcpaud, params, &hits);
 
-        return dcpaud_refine_fmt_mask(f, hits.formats);
+	return dcpaud_refine_fmt_mask(f, hits.formats);
 }
 
 static int dcpaud_rule_rate(struct snd_pcm_hw_params *params,
-                             struct snd_pcm_hw_rule *rule)
+			     struct snd_pcm_hw_rule *rule)
 {
 	struct dcp_audio *dcpaud = rule->private;
 	struct snd_interval *r = hw_param_interval(params,
 				SNDRV_PCM_HW_PARAM_RATE);
 	struct dcp_sound_format_mask hits;
 
-        dcpaud_consult_elements(dcpaud, params, &hits);
+	dcpaud_consult_elements(dcpaud, params, &hits);
 
-        return snd_interval_rate_bits(r, hits.rates);
+	return snd_interval_rate_bits(r, hits.rates);
 }
 
 static int dcpaud_init_dma(struct dcp_audio *dcpaud)
@@ -1543,7 +1543,7 @@ static const struct snd_pcm_ops dcp_native_playback_ops = {
 #include "hdmi-codec-chmap.h"
 
 static int dcpaud_chmap_ctl_get(struct snd_kcontrol *kcontrol,
-			        struct snd_ctl_elem_value *ucontrol)
+				struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_pcm_chmap *info = snd_kcontrol_chip(kcontrol);
 	struct dcp_audio *dcpaud = info->private_data;
@@ -2110,7 +2110,7 @@ int __init dcp_audio_register(void)
 
 void dcp_audio_unregister(void)
 {
-        platform_driver_unregister(&dcpaud_driver);
+	platform_driver_unregister(&dcpaud_driver);
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)

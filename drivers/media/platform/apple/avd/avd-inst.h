@@ -176,7 +176,7 @@ static inline void push(struct avd_ctx *ctx, u32 inst)
 static inline void push_address(struct avd_ctx *ctx, dma_addr_t addr)
 {
 	if (ctx->dev->variant->quirks & AVD_QUIRK_LSR) {
-		push(ctx, (addr >> 8));
+		push(ctx, (u32)((addr >> 8) & 0xffffffff));
 	} else {
 		push(ctx, (u32)(addr & 0xffffffff));
 		push(ctx, (u32)(addr >> 32));

@@ -191,7 +191,7 @@ static int message(struct cen_context *ctx, void __iomem *doorbell,
 {
 	u16 head = ctx->message_head;
 	u8 *descriptor;
-	u16 tail;
+	__le16 tail;
 	int ret;
 
 	if (head >= 15 || !length || length > 512)
@@ -232,7 +232,7 @@ static int cchi_init(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_ipc *ipc = c->ipc;
 	u8 config[4] = {9, 0, 0xff, 0xff}, *entry;
-	u16 tail;
+	__le16 tail;
 	int i, ret;
 
 	ipc->cchi_rx = buffer_alloc(c, 0, SZ_32K);
