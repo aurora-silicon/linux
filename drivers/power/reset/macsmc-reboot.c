@@ -119,21 +119,28 @@ static int nvmem_cell_set_u8(struct nvmem_cell *cell, u8 val)
 static int macsmc_prepare_atomic(struct sys_off_data *data)
 {
 	struct macsmc_reboot *reboot = data->cb_data;
+	int ret;
 
 	dev_info(reboot->dev, "Preparing SMC for atomic mode\n");
 
-	apple_smc_enter_atomic(reboot->smc);
+	ret = apple_smc_enter_atomic(reboot->smc);
+	if (ret)
+		dev_err(reboot->dev, "Failed to enter atomic mode: %d\n", ret);
 	return NOTIFY_OK;
 }
 
 static int macsmc_power_off(struct sys_off_data *data)
 {
 	struct macsmc_reboot *reboot = data->cb_data;
+	int ret;
 
 	dev_info(reboot->dev, "Issuing power off (off1)\n");
 
-	if (apple_smc_write_u32_atomic(reboot->smc, SMC_KEY(MBSE), SMC_KEY(off1)) < 0) {
-		dev_err(reboot->dev, "Failed to issue MBSE = off1 (power_off)\n");
+	ret = apple_smc_write_u32_atomic(reboot->smc, SMC_KEY(MBSE), SMC_KEY(off1));
+	if (ret < 0) {
+		dev_err(reboot->dev,
+			"Failed to issue MBSE = off1 (power_off): %d; trying the next power-off handler\n",
+			ret);
 	} else {
 		mdelay(100);
 		WARN_ONCE(1, "Unable to power off system\n");
@@ -145,11 +152,15 @@ static int macsmc_power_off(struct sys_off_data *data)
 static int macsmc_restart(struct sys_off_data *data)
 {
 	struct macsmc_reboot *reboot = data->cb_data;
+	int ret;
 
 	dev_info(reboot->dev, "Issuing restart (phra)\n");
 
-	if (apple_smc_write_u32_atomic(reboot->smc, SMC_KEY(MBSE), SMC_KEY(phra)) < 0) {
-		dev_err(reboot->dev, "Failed to issue MBSE = phra (restart)\n");
+	ret = apple_smc_write_u32_atomic(reboot->smc, SMC_KEY(MBSE), SMC_KEY(phra));
+	if (ret < 0) {
+		dev_err(reboot->dev,
+			"Failed to issue MBSE = phra (restart): %d; trying the next restart handler\n",
+			ret);
 	} else {
 		mdelay(100);
 		WARN_ONCE(1, "Unable to restart system\n");
@@ -163,6 +174,7 @@ static int macsmc_reboot_notify(struct notifier_block *this, unsigned long actio
 	struct macsmc_reboot *reboot = container_of(this, struct macsmc_reboot, reboot_notify);
 	u8 shutdown_flag;
 	u32 val;
+	int ret;
 
 	switch (action) {
 	case SYS_RESTART:
@@ -180,8 +192,10 @@ static int macsmc_reboot_notify(struct notifier_block *this, unsigned long actio
 	dev_info(reboot->dev, "Preparing for reboot (%p4ch)\n", &val);
 
 	/* On the Mac Mini, this will turn off the LED for power off */
-	if (apple_smc_write_u32(reboot->smc, SMC_KEY(MBSE), val) < 0)
-		dev_err(reboot->dev, "Failed to issue MBSE = %p4ch (reboot_prepare)\n", &val);
+	ret = apple_smc_write_u32(reboot->smc, SMC_KEY(MBSE), val);
+	if (ret < 0)
+		dev_err(reboot->dev, "Failed to issue MBSE = %p4ch (reboot_prepare): %d\n",
+			&val, ret);
 
 	/* Set the boot_stage to 0, which means we're doing a clean shutdown/reboot. */
 	if (reboot->nvm.boot_stage &&
