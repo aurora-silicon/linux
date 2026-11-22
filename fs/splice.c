@@ -219,22 +219,35 @@ static const struct pipe_buf_operations subpage_pipe_buf_ops = {
 static int subpage_pipe_buf_retain(struct pipe_buffer *buf)
 {
 	struct subpage_pipe_refs *refs;
+	struct mm_subpage *first;
 	unsigned int pos, count = 0;
 
 	if (!buf->len || buf->ops != &nosteal_pipe_buf_ops ||
 	    !folio_test_anon(page_folio(buf->page)))
 		return 0;
+	/*
+	 * Look up the first quarter before allocating. It has no owner on a
+	 * native anonymous page, and none at all while user4k is off, so the
+	 * common splice keeps its native reference without an allocation.
+	 */
+	pos = round_down(buf->offset, MM_SUBPAGE_SIZE);
+	first = mm_subpage_get_from_phys(page_to_phys(buf->page) + pos);
+	if (!first)
+		return 0;
 	refs = kmalloc(struct_size(refs, fragments, PAGE_SIZE / MM_SUBPAGE_SIZE), GFP_KERNEL);
-	if (!refs)
+	if (!refs) {
+		mm_subpage_put(first);
 		return -ENOMEM;
-	for (pos = round_down(buf->offset, MM_SUBPAGE_SIZE);
-	     pos < buf->offset + buf->len; pos += MM_SUBPAGE_SIZE) {
-		struct mm_subpage *slot = mm_subpage_get_from_phys(page_to_phys(buf->page) + pos);
+	}
+	for (; pos < buf->offset + buf->len; pos += MM_SUBPAGE_SIZE) {
+		struct mm_subpage *slot = first;
 
+		if (count)
+			slot = mm_subpage_get_from_phys(page_to_phys(buf->page) + pos);
 		if (!slot) {
 			release_user_fragments(refs->fragments, count, false);
 			kfree(refs);
-			return count ? -EFAULT : 0;
+			return -EFAULT;
 		}
 		refs->fragments[count++] = (struct user_page_fragment) {
 			.folio = page_folio(buf->page),
