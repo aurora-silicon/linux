@@ -59,18 +59,25 @@ int main(void) {
  typeof(((struct apple_connector *)0)->base.state[0]) state = {.crtc=&crtc};
  struct apple_connector c = {.base.state=&state};
  struct apple_dcp d = {.native=true,.admitted=true}; current=&d;
+ bool cy;
  transition=1;
- assert(dcp_retrain_active_crtc(&c,&d,false)==0);
+ assert(dcp_retrain_active_crtc(&c,&d,false,&cy)==0 && !cy);
  assert(!resets && !toggles && !releases);
  transition=0; d.admitted=true; /* fresh catalogue READY must still retrain */
- assert(!dcp_retrain_active_crtc(&c,&d,false) && resets==1);
+ assert(!dcp_retrain_active_crtc(&c,&d,false,&cy) && resets==1 && !cy);
  d.mode_state.valid=true; /* prior commit already completed the work */
- assert(!dcp_retrain_active_crtc(&c,&d,false) && resets==1);
+ assert(!dcp_retrain_active_crtc(&c,&d,false,&cy) && resets==1 && !cy);
  d.native=false; d.mode_state.valid=false;
- assert(!dcp_retrain_active_crtc(&c,&d,false) && resets==2);
- assert(!dcp_retrain_active_crtc(&c,&d,true) && toggles==2);
+ assert(!dcp_retrain_active_crtc(&c,&d,false,&cy) && resets==2 && !cy);
+ /* a power cycle that is done is reported, so the caller counts it */
+ assert(!dcp_retrain_active_crtc(&c,&d,true,&cy) && toggles==2 && cy);
  d.native=true; d.admitted=false; lost=true;
- assert(!dcp_retrain_active_crtc(&c,&d,false) && releases==1);
+ assert(!dcp_retrain_active_crtc(&c,&d,false,&cy) && releases==1 && !cy);
+ /* asked for but not done: a commit set the mode, or no active CRTC */
+ d.native=false; d.admitted=true; lost=false; d.mode_state.valid=true;
+ assert(!dcp_retrain_active_crtc(&c,&d,true,&cy) && toggles==2 && !cy);
+ d.mode_state.valid=false; cs.active=false;
+ assert(!dcp_retrain_active_crtc(&c,&d,true,&cy) && toggles==2 && !cy);
 }
 '''
 with tempfile.TemporaryDirectory() as t:
@@ -82,4 +89,4 @@ with tempfile.TemporaryDirectory() as t:
     result = subprocess.run([str(p.with_suffix(''))])
     if result.returncode:
         sys.exit(1)
-print('PASS native26 retrain: lock-wait layout restart, fresh READY, completed commit, classic reset/power cycle')
+print('PASS native26 retrain: lock-wait layout restart, fresh READY, completed commit, classic reset/power cycle, power cycle reported only when done')

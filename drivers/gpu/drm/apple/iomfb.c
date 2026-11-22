@@ -1493,15 +1493,22 @@ static int dcp_set_crtc_active(struct drm_crtc *crtc,
  * @power_cycle: the firmware powered the pipe down with the lost link, so a
  * modeset alone cannot bring it back. Turn the CRTC off and on instead, which
  * reconnects the DPTX and powers the pipe on before the mode is set.
+ * @cycled: set once the CRTC is asked to turn off for that, whether or not that
+ * succeeds, so a power cycle that fails still spends its budget. It is not set
+ * when, under the modeset locks, there is no active CRTC this connector can
+ * retrain, or a commit already set the mode: the caller spends a power cycle
+ * of its budget only for one that was started.
  */
 static int dcp_retrain_active_crtc(struct apple_connector *connector,
-				   struct apple_dcp *dcp, bool power_cycle)
+				   struct apple_dcp *dcp, bool power_cycle,
+				   bool *cycled)
 {
 	struct drm_device *dev = connector->base.dev;
 	struct drm_modeset_acquire_ctx ctx;
 	struct drm_crtc *crtc;
 	int ret;
 
+	*cycled = false;
 	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
 
 	/*
@@ -1533,8 +1540,12 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector,
 	} else if (crtc && crtc->state && crtc->state->active &&
 		   dcp_crtc_can_retrain(crtc, connector) && power_cycle) {
 		/* A commit that held the locks first may have set the mode. */
-		ret = READ_ONCE(dcp->mode_state.valid) ? 0 :
-		      dcp_set_crtc_active(crtc, &ctx, false);
+		if (READ_ONCE(dcp->mode_state.valid)) {
+			ret = 0;
+		} else {
+			*cycled = true;
+			ret = dcp_set_crtc_active(crtc, &ctx, false);
+		}
 		if (!ret && !crtc->state->active)
 			ret = dcp_set_crtc_active(crtc, &ctx, true);
 	} else if (crtc && crtc->state && crtc->state->active &&
@@ -2008,14 +2019,13 @@ void dcp_hotplug(struct work_struct *work)
 		   (!dcp_uses_t6020_tunnel_flow(dcp) ||
 		    dcp->tunnel_power_cycles < DCP_TUNNEL_POWER_CYCLES)) {
 		bool power_cycle = dcp_uses_t6020_tunnel_flow(dcp);
+		bool cycled;
 
 		/*
 		 * A rebuilt T6020 tunnel is power cycled here; a link reported
 		 * bad would only have userspace retry the modeset that fails.
 		 */
-		if (power_cycle)
-			dcp->tunnel_power_cycles++;
-		else
+		if (!power_cycle)
 			drm_connector_set_link_status_property(&connector->base,
 							       DRM_MODE_LINK_STATUS_BAD);
 
@@ -2026,7 +2036,10 @@ void dcp_hotplug(struct work_struct *work)
 		 * link.  Re-apply the active CRTC state once the DPTX link-config
 		 * callback has completed.
 		 */
-		ret = dcp_retrain_active_crtc(connector, dcp, power_cycle);
+		ret = dcp_retrain_active_crtc(connector, dcp, power_cycle,
+					      &cycled);
+		if (cycled)
+			dcp->tunnel_power_cycles++;
 		if (ret) {
 			dev_warn(dcp->dev,
 				 "failed to retrain active CRTC after hotplug: %d\n",
