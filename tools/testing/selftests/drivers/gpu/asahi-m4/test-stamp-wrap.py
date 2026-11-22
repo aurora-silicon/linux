@@ -21,18 +21,20 @@ def function(text, name):
 
 harness = r'''
 #![allow(dead_code)]
+use std::cell::Cell;
 use std::collections::BTreeMap;
 #[derive(Copy,Clone,Debug,PartialEq,Eq)]struct Error(i32);
 const EINVAL:Error=Error(-22);const EAGAIN:Error=Error(-11);type Result<T=()> = std::result::Result<T,Error>;
 #[path="__LOGIC__"]mod logic;
 use logic::Retirement;
 mod encode { __STAMP_SEED__ __STAMP__ }
-struct Object{cells:BTreeMap<usize,u64>,va:u64,unstable:bool}
-impl Default for Object{fn default()->Self{Self{cells:BTreeMap::new(),va:0x1234,unstable:false}}}
+struct Object{cells:BTreeMap<usize,u64>,va:u64,unstable:bool,reads:Cell<u32>}
+impl Default for Object{fn default()->Self{Self{cells:BTreeMap::new(),va:0x1234,unstable:false,reads:Cell::new(0)}}}
 impl Object {
-    fn r32(&self,off:usize)->Result<u32>{Ok(*self.cells.get(&off).unwrap_or(&0) as u32)}
-    fn r64(&self,off:usize)->Result<u64>{if self.unstable{return Err(EAGAIN)}Ok(*self.cells.get(&off).unwrap_or(&0))}
+    fn r32(&self,off:usize)->Result<u32>{self.reads.set(self.reads.get()+1);Ok(*self.cells.get(&off).unwrap_or(&0) as u32)}
+    fn r64(&self,off:usize)->Result<u64>{self.reads.set(self.reads.get()+1);if self.unstable{return Err(EAGAIN)}Ok(*self.cells.get(&off).unwrap_or(&0))}
     fn set(&mut self,off:usize,v:u64){self.cells.insert(off,v);}
+    fn reset_reads(&self){self.reads.set(0);}
 }
 #[derive(Clone,Copy)]enum Channel{Compute,Ta,Fs}
 mod notifier_page {pub const COMPUTE_STAMP:usize=0;pub const COMPUTE_CONTEXT:usize=4;pub const TA_STAMP:usize=8;pub const FS_STAMP:usize=12;pub const FS_RECORD:usize=32;}
@@ -65,6 +67,7 @@ impl Firmware{
     __RETIRED__
     __RETIRED_AT__
     __RETIRED_FLIGHT__
+    __RETIRED_FLIGHT_CLASSES__
     __RETIRED_SNAPSHOT__
     __RETIRED_SNAPSHOT_AT__
 }
@@ -237,9 +240,61 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.engine.flights[0].job.resources.compute[2].its.set(8,130);
     assert_eq!(f.retired(),Ok(Retirement::Full));
 }
+#[test]fn inactive_class_and_unreached_stage_skip_wc_reads(){
+    // Compute-only retirement performs zero render WC reads.
+    let mut fc=firmware(false,5);
+    assert_eq!(fc.retired_flight(),Ok(Some((0,Retirement::Full))));
+    assert_eq!(fc.graph.render.fw_stamp[0].reads.get(),0);
+    assert_eq!(fc.graph.render.fw_stamp[1].reads.get(),0);
+    assert_eq!(fc.graph.render.notifier.reads.get(),0);
+    // Render-only retirement performs zero compute WC reads.
+    let mut fr=firmware(true,5);
+    assert_eq!(fr.retired_flight(),Ok(Some((0,Retirement::Full))));
+    assert_eq!(fr.graph.compute.fw_stamp.reads.get(),0);
+    assert_eq!(fr.graph.compute.notifier.reads.get(),0);
+    // In-progress render (TA done, FS still running) fails fast on FS stamp without reading TA or scene.
+    let mut fp=firmware(true,7);
+    fp.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(6)));
+    assert_eq!(fp.retired_flight(),Ok(None));
+    assert_eq!(fp.graph.render.fw_stamp[1].reads.get(),1);
+    assert_eq!(fp.graph.render.fw_stamp[0].reads.get(),0);
+    assert_eq!(fp.engine.flights[0].job.resources.passes[0].scene.reads.get(),0);
+    // Unsettled notifier skips scene WC timestamp reads.
+    fp.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(7)));
+    fp.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(6)));
+    assert_eq!(fp.retired_flight(),Ok(None));
+    assert_eq!(fp.engine.flights[0].job.resources.passes[0].scene.reads.get(),0);
+    // Mixed flight pending is polled once, not twice.
+    let mut fm=firmware(false,9);
+    fm.engine.flights[0].renders=1;
+    fm.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(8)));
+    assert_eq!(fm.retired_flight(),Ok(None));
+    assert_eq!(fm.graph.compute.fw_stamp.reads.get(),1);
+    assert_eq!(fm.graph.render.fw_stamp[1].reads.get(),0);
+    // Pending compute class is not re-polled while retiring a burst of render flights.
+    let mut fmix=firmware(false,30);
+    let r1=firmware(true,40).engine.flights.remove(0);
+    let r2=firmware(true,41).engine.flights.remove(0);
+    fmix.engine.flights.push(r1);
+    fmix.engine.flights.push(r2);
+    fmix.engine.ta_target=encode::stamp(41);
+    fmix.engine.fs_target=encode::stamp(41);
+    for stage in 0..2 { fmix.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(41))); }
+    fmix.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(41)));
+    fmix.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(41)));
+    fmix.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(29)));
+    let (mut check_c,mut check_r)=(true,true);
+    assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(Some((1,Retirement::Full))));
+    assert!(!check_c && check_r);
+    fmix.engine.flights.remove(1);
+    assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(Some((1,Retirement::Full))));
+    fmix.engine.flights.remove(1);
+    assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(None));
+    assert_eq!(fmix.graph.compute.fw_stamp.reads.get(),1);
+}
 
 '''.replace('__LOGIC__', str(backend/'recovery/logic.rs'))
-for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at')]:
+for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_FLIGHT_CLASSES__','poll.rs','retired_flight_classes'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at')]:
     harness=harness.replace(token,function((backend/path).read_text(),name))
 unit=out/'stamp-wrap.rs';unit.write_text(harness)
 log=''

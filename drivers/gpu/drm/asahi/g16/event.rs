@@ -89,7 +89,9 @@ impl Events {
         if producer >= RING_SLOTS || consumer >= RING_SLOTS {
             return Err(super::boot::eproto());
         }
-        rmb();
+        if consumer != producer {
+            rmb();
+        }
         Ok((consumer, producer))
     }
 

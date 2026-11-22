@@ -58,6 +58,7 @@ names = ['drm_asahi_cmd_header', 'drm_asahi_attachment', 'drm_asahi_cmd_render',
          'drm_asahi_timestamp', 'drm_asahi_timestamps', 'drm_asahi_helper_program',
          'drm_asahi_render_ray_query_stage']
 constants = command[command.index('/// Largest command buffer.'):command.index('/// A validated render command.')]
+inline_containers = command[command.index('/// Inline storage for the common 1-2 command submission'):command.index('/// A validated SUBMIT.')]
 parser = command[command.index('/// One command of the stream.'):command.index('/// Checks that `[start, end)`')]
 g17 = (ROOT / 'drivers/gpu/drm/asahi/g17/command.rs').read_text()
 # The stage-prefix offset and the render payload reader precede the parser.
@@ -416,12 +417,107 @@ fn mixed_batch_rejects_before_any_command_can_publish() {
     assert_eq!(result,Err(E2BIG));
     assert_eq!(publications,0,"a rejected render must prevent the earlier compute publishing");
 }
+mod inline_submit_containers {
+    use super::{Order, Result, COMPUTE, NONE, RENDER};
+    use std::cell::Cell;
+
+    const ENOMEM: i32 = -12;
+    const GFP_KERNEL: u32 = 0;
+
+    std::thread_local! {
+        static ALLOCS: Cell<u32> = const { Cell::new(0) };
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) mod timestamp {
+        #[derive(Debug, PartialEq, Eq)]
+        pub(crate) struct Destinations(pub(crate) u32);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) struct Command(pub(crate) u32);
+
+    pub(crate) struct KVec<T>(Vec<T>);
+    impl<T> KVec<T> {
+        fn with_capacity(cap: usize, _flags: u32) -> Result<Self> {
+            if FAIL_NEXT.with(|f| f.replace(false)) {
+                return Err(ENOMEM);
+            }
+            ALLOCS.with(|a| a.set(a.get() + 1));
+            Ok(Self(Vec::with_capacity(cap)))
+        }
+        fn push(&mut self, v: T, _flags: u32) -> Result {
+            if FAIL_NEXT.with(|f| f.replace(false)) {
+                return Err(ENOMEM);
+            }
+            self.0.push(v);
+            Ok(())
+        }
+        fn push_within_capacity(&mut self, v: T) -> std::result::Result<(), T> {
+            self.0.push(v);
+            Ok(())
+        }
+        fn get_mut(&mut self, idx: usize) -> Option<&mut T> {
+            self.0.get_mut(idx)
+        }
+    }
+    impl<T> core::ops::Deref for KVec<T> {
+        type Target = [T];
+        fn deref(&self) -> &[T] { &self.0 }
+    }
+
+    INLINE_CONTAINERS
+
+    #[test]
+    fn inline_commands_orders_and_resolved_skip_heap_up_to_two_and_spill_safely() {
+        ALLOCS.with(|a| a.set(0));
+        let mut cmds = Commands::new();
+        let mut orders = Orders::new();
+        let mut resolved = Resolved::new();
+        let o0 = Order::new([0, 0], [0, 0], [NONE; 2], [0; 2], COMPUTE).unwrap();
+        let o1 = Order::new([0, 0], [0, 1], [NONE; 2], [0; 2], RENDER).unwrap();
+        let o2 = Order::new([0, 0], [1, 1], [NONE; 2], [0; 2], COMPUTE).unwrap();
+        cmds.push(Command(1)).unwrap();
+        cmds.push(Command(2)).unwrap();
+        orders.push(o0).unwrap();
+        orders.push(o1).unwrap();
+        resolved.push(timestamp::Destinations(11)).unwrap();
+        resolved.push(timestamp::Destinations(22)).unwrap();
+        assert_eq!(ALLOCS.with(|a| a.get()), 0);
+        assert_eq!(&*cmds, &[Command(1), Command(2)]);
+        assert_eq!(&*orders, &[o0, o1]);
+
+        // OOM on 2 -> 3 spill preserves inline entries.
+        FAIL_NEXT.with(|f| f.set(true));
+        assert_eq!(cmds.push(Command(3)), Err(ENOMEM));
+        assert_eq!(&*cmds, &[Command(1), Command(2)]);
+        FAIL_NEXT.with(|f| f.set(true));
+        assert_eq!(orders.push(o2), Err(ENOMEM));
+        assert_eq!(&*orders, &[o0, o1]);
+        FAIL_NEXT.with(|f| f.set(true));
+        assert_eq!(resolved.push(timestamp::Destinations(33)), Err(ENOMEM));
+        assert_eq!(ALLOCS.with(|a| a.get()), 0);
+
+        // Spill to heap preserves exact FIFO order across all 3 containers.
+        cmds.push(Command(3)).unwrap();
+        orders.push(o2).unwrap();
+        resolved.push(timestamp::Destinations(33)).unwrap();
+        assert_eq!(ALLOCS.with(|a| a.get()), 3);
+        assert_eq!(&*cmds, &[Command(1), Command(2), Command(3)]);
+        assert_eq!(&*orders, &[o0, o1, o2]);
+        assert_eq!(resolved.next(), Some(timestamp::Destinations(11)));
+        assert_eq!(resolved.next(), Some(timestamp::Destinations(22)));
+        assert_eq!(resolved.next(), Some(timestamp::Destinations(33)));
+        assert_eq!(resolved.next(), None);
+    }
+}
 '''
 replacements = {'FULL_UAPI': str(BINDINGS), 'READER': reader,
                 'CAPACITIES': capacities, 'FW_GRAPH': str(SOURCE.parent/'fw/graph.rs'),
                 'FW_WORK': str(SOURCE.parent/'fw/work.rs'), 'FULL_ENCODER': str(SOURCE.parent/'encode.rs'),
                 'IMPLS': '\n'.join('unsafe impl AnyBitPattern for uapi::' + name + ' {}' for name in names),
                 'PRODUCTION_CONSTANTS': constants, 'PRODUCTION_PARSER': parser.replace('super::encode::', 'encode::'),
+                'INLINE_CONTAINERS': inline_containers.replace('crate::timestamp::', 'timestamp::'),
                 'G17_CONSTANTS': g17_constants, 'G17_PARSER': g17_parser}
 for key in sorted(replacements,key=len,reverse=True):
     harness = harness.replace(key,replacements[key])

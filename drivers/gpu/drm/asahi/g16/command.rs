@@ -157,12 +157,158 @@ pub(crate) enum Command {
     Compute(KBox<ComputeCommand>),
 }
 
+/// Inline storage for the common 1-2 command submission, spilling to a heap `KVec` above 2.
+pub(crate) enum Commands {
+    Empty,
+    One([Command; 1]),
+    Two([Command; 2]),
+    Heap(KVec<Command>),
+}
+
+impl Commands {
+    fn new() -> Self {
+        Self::Empty
+    }
+
+    fn push(&mut self, command: Command) -> Result {
+        match self {
+            Self::Heap(vec) => vec.push(command, GFP_KERNEL)?,
+            Self::Two(_) => {
+                // Allocate before moving inline entries so OOM leaves `self` intact.
+                let mut vec = KVec::with_capacity(4, GFP_KERNEL)?;
+                if let Self::Two([a, b]) = core::mem::replace(self, Self::Empty) {
+                    let _ = vec.push_within_capacity(a);
+                    let _ = vec.push_within_capacity(b);
+                    let _ = vec.push_within_capacity(command);
+                }
+                *self = Self::Heap(vec);
+            }
+            Self::One(_) => {
+                if let Self::One([a]) = core::mem::replace(self, Self::Empty) {
+                    *self = Self::Two([a, command]);
+                }
+            }
+            Self::Empty => *self = Self::One([command]),
+        }
+        Ok(())
+    }
+}
+
+impl core::ops::Deref for Commands {
+    type Target = [Command];
+
+    fn deref(&self) -> &[Command] {
+        match self {
+            Self::Empty => &[],
+            Self::One(items) => items,
+            Self::Two(items) => items,
+            Self::Heap(vec) => vec,
+        }
+    }
+}
+
+/// Inline storage for the common 1-2 command ordinals, spilling to a heap `KVec` above 2.
+pub(crate) enum Orders {
+    Empty,
+    One([Order; 1]),
+    Two([Order; 2]),
+    Heap(KVec<Order>),
+}
+
+impl Orders {
+    fn new() -> Self {
+        Self::Empty
+    }
+
+    fn push(&mut self, order: Order) -> Result {
+        match self {
+            Self::Heap(vec) => vec.push(order, GFP_KERNEL)?,
+            Self::Two([a, b]) => {
+                let (a, b) = (*a, *b);
+                let mut vec = KVec::with_capacity(4, GFP_KERNEL)?;
+                let _ = vec.push_within_capacity(a);
+                let _ = vec.push_within_capacity(b);
+                let _ = vec.push_within_capacity(order);
+                *self = Self::Heap(vec);
+            }
+            Self::One([a]) => *self = Self::Two([*a, order]),
+            Self::Empty => *self = Self::One([order]),
+        }
+        Ok(())
+    }
+}
+
+impl core::ops::Deref for Orders {
+    type Target = [Order];
+
+    fn deref(&self) -> &[Order] {
+        match self {
+            Self::Empty => &[],
+            Self::One(items) => items,
+            Self::Two(items) => items,
+            Self::Heap(vec) => vec,
+        }
+    }
+}
+
+/// Inline storage for transient resolved timestamp destinations during SUBMIT validation.
+enum Resolved {
+    Empty,
+    One(Option<crate::timestamp::Destinations>),
+    Two([Option<crate::timestamp::Destinations>; 2]),
+    Heap {
+        items: KVec<Option<crate::timestamp::Destinations>>,
+        index: usize,
+    },
+}
+
+impl Resolved {
+    fn new() -> Self {
+        Self::Empty
+    }
+
+    fn push(&mut self, dest: crate::timestamp::Destinations) -> Result {
+        match self {
+            Self::Heap { items, .. } => items.push(Some(dest), GFP_KERNEL)?,
+            Self::Two(_) => {
+                let mut items = KVec::with_capacity(4, GFP_KERNEL)?;
+                if let Self::Two([a, b]) = core::mem::replace(self, Self::Empty) {
+                    let _ = items.push_within_capacity(a);
+                    let _ = items.push_within_capacity(b);
+                    let _ = items.push_within_capacity(Some(dest));
+                }
+                *self = Self::Heap { items, index: 0 };
+            }
+            Self::One(_) => {
+                if let Self::One(a) = core::mem::replace(self, Self::Empty) {
+                    *self = Self::Two([a, Some(dest)]);
+                }
+            }
+            Self::Empty => *self = Self::One(Some(dest)),
+        }
+        Ok(())
+    }
+
+    fn next(&mut self) -> Option<crate::timestamp::Destinations> {
+        match self {
+            Self::Empty => None,
+            Self::One(slot) => slot.take(),
+            Self::Two(slots) => slots[0].take().or_else(|| slots[1].take()),
+            Self::Heap { items, index } => {
+                let item = items.get_mut(*index)?.take();
+                *index += 1;
+                item
+            }
+        }
+    }
+}
+
 /// A validated SUBMIT.
 pub(crate) struct Submission {
     /// The commands, in submission order.
-    pub(crate) commands: KVec<Command>,
+    pub(crate) commands: Commands,
     /// Exact per-command queue-local ordinals, allocated before scheduler acceptance.
-    pub(crate) orders: KVec<Order>,
+    pub(crate) orders: Orders,
     /// Render and compute commands, for the queue's accepted-command accounting.
     pub(crate) counts: [u64; 2],
 }
@@ -180,8 +326,8 @@ pub(crate) struct Context<'a> {
 pub(crate) struct Prepared<'a> {
     bytes: &'a [u8],
     /// CPU views and their backing resolved before scheduler acceptance.
-    resolved: KVec<crate::timestamp::Destinations>,
-    orders: KVec<Order>,
+    resolved: Resolved,
+    orders: Orders,
     counts: [u64; 2],
 }
 
@@ -733,8 +879,8 @@ pub(crate) fn prepare<'a>(
     accepted: [u64; 2],
     objects: Pin<&xarray::XArray<KBox<file::Object>>>,
 ) -> Result<Prepared<'a>> {
-    let mut resolved = KVec::new();
-    let mut orders = KVec::new();
+    let mut resolved = Resolved::new();
+    let mut orders = Orders::new();
     let mut preceding = [0u16; 2];
     for entry in stream(bytes) {
         let entry = entry?;
@@ -755,11 +901,14 @@ pub(crate) fn prepare<'a>(
             }
             _ => continue,
         };
-        resolved.push(outputs, GFP_KERNEL)?;
-        orders.push(
-            Order::new(accepted, preceding, entry.barriers, prior, engine)?,
-            GFP_KERNEL,
-        )?;
+        resolved.push(outputs)?;
+        orders.push(Order::new(
+            accepted,
+            preceding,
+            entry.barriers,
+            prior,
+            engine,
+        )?)?;
         preceding[engine] += 1;
     }
 
@@ -777,15 +926,16 @@ impl Prepared<'_> {
     pub(crate) fn validate(self, context: &Context<'_>) -> Result<Submission> {
         let Prepared {
             bytes,
-            resolved,
+            mut resolved,
             orders,
             counts,
         } = self;
-        let mut commands = KVec::with_capacity(resolved.len(), GFP_KERNEL)?;
+        let mut commands = Commands::new();
         let mut vertex = KVec::new();
         let mut fragment = KVec::new();
         let mut compute = KVec::new();
-        let mut resolved = resolved.into_iter();
+        let mut rem_renders = counts[RENDER];
+        let mut rem_computes = counts[COMPUTE];
         for entry in stream(bytes) {
             let entry = entry?;
             match entry.kind {
@@ -797,36 +947,42 @@ impl Prepared<'_> {
                     let cmd = &packet;
                     let outputs = resolved.next().ok_or(EINVAL)?;
                     check_render(context, cmd, &vertex, &fragment)?;
-                    commands.push(
-                        Command::Render(KBox::new(
-                            RenderCommand {
-                                cmd: *cmd,
-                                timestamp_outputs: outputs,
-                                vertex_attachments: copy_list(&[&vertex])?,
-                                fragment_attachments: copy_list(&[&fragment])?,
-                            },
-                            GFP_KERNEL,
-                        )?),
+                    rem_renders = rem_renders.checked_sub(1).ok_or(EINVAL)?;
+                    let (vertex_attachments, fragment_attachments) = if rem_renders == 0 {
+                        (core::mem::take(&mut vertex), core::mem::take(&mut fragment))
+                    } else {
+                        (copy_list(&[&vertex])?, copy_list(&[&fragment])?)
+                    };
+                    commands.push(Command::Render(KBox::new(
+                        RenderCommand {
+                            cmd: *cmd,
+                            timestamp_outputs: outputs,
+                            vertex_attachments,
+                            fragment_attachments,
+                        },
                         GFP_KERNEL,
-                    )?;
+                    )?))?;
                 }
                 CMD_COMPUTE => {
                     let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
                     let cmd = &packet;
                     check_compute(context, cmd, &compute)?;
                     let outputs = resolved.next().ok_or(EINVAL)?;
-                    commands.push(
-                        Command::Compute(KBox::new(
-                            ComputeCommand {
-                                cmd: *cmd,
-                                attachments: copy_list(&[&compute])?,
-                                timestamp_outputs: outputs,
-                                query_access: cmd.flags & COMPUTE_NO_QUERY_ACCESS == 0,
-                            },
-                            GFP_KERNEL,
-                        )?),
+                    rem_computes = rem_computes.checked_sub(1).ok_or(EINVAL)?;
+                    let attachments = if rem_computes == 0 {
+                        core::mem::take(&mut compute)
+                    } else {
+                        copy_list(&[&compute])?
+                    };
+                    commands.push(Command::Compute(KBox::new(
+                        ComputeCommand {
+                            cmd: *cmd,
+                            attachments,
+                            timestamp_outputs: outputs,
+                            query_access: cmd.flags & COMPUTE_NO_QUERY_ACCESS == 0,
+                        },
                         GFP_KERNEL,
-                    )?;
+                    )?))?;
                 }
                 _ => return Err(EINVAL),
             }

@@ -61,13 +61,23 @@ impl Lap {
     fn lap(&mut self, _acc: &mut u64) {}
 }
 
-struct Cell32(Cell<u32>);
+struct Cell32 {
+    val: Cell<u32>,
+    reads: Cell<u32>,
+}
 impl Cell32 {
     fn new(v: u32) -> Self {
-        Self(Cell::new(v))
+        Self {
+            val: Cell::new(v),
+            reads: Cell::new(0),
+        }
+    }
+    fn set(&self, v: u32) {
+        self.val.set(v);
     }
     fn r32(&self, _off: usize) -> Result<u32> {
-        Ok(self.0.get())
+        self.reads.set(self.reads.get() + 1);
+        Ok(self.val.get())
     }
 }
 
@@ -319,7 +329,7 @@ fn submit_locked_retires_inline_on_reached_stamp_without_full_housekeeping() {
         fs_target: 0,
     });
     fw.engine.target = 0x100;
-    fw.graph.compute.fw_stamp.0.set(0x100);
+    fw.graph.compute.fw_stamp.set(0x100);
     fw.retire_on_call = true;
 
     let mut done = vec![];
@@ -432,10 +442,45 @@ fn concurrent_compute_completion_behind_pending_render_wakes_submit_retire() {
     fw.engine.fs_target = 0x200;
     fw.engine.target = 0x100;
     // Render still running, compute reached its stamp.
-    fw.graph.render.fw_stamp[1].0.set(0x100);
-    fw.graph.compute.fw_stamp.0.set(0x100);
+    fw.graph.render.fw_stamp[1].set(0x100);
+    fw.graph.compute.fw_stamp.set(0x100);
     assert!(fw.oldest_stamp_reached());
+    assert_eq!(fw.graph.compute.fw_stamp.reads.get(), 1);
+    assert_eq!(fw.graph.render.fw_stamp[1].reads.get(), 0);
     assert_eq!(fw.oldest_terminal_events(), Some((Some(0), Some(0))));
+}
+
+#[test]
+fn oldest_stamp_reached_skips_inactive_class_wc_reads() {
+    // Compute-only workload never reads render fw_stamp.
+    let mut fc = Firmware::new();
+    fc.engine.flights.push(Flight {
+        computes: 1,
+        renders: 0,
+        target: 0x200,
+        fs_target: 0,
+    });
+    fc.engine.target = 0x200;
+    fc.graph.compute.fw_stamp.set(0x100);
+    assert!(!fc.oldest_stamp_reached());
+    assert_eq!(fc.graph.compute.fw_stamp.reads.get(), 1);
+    assert_eq!(fc.graph.render.fw_stamp[0].reads.get(), 0);
+    assert_eq!(fc.graph.render.fw_stamp[1].reads.get(), 0);
+
+    // Render-only workload never reads compute fw_stamp.
+    let mut fr = Firmware::new();
+    fr.engine.flights.push(Flight {
+        computes: 0,
+        renders: 1,
+        target: 0,
+        fs_target: 0x200,
+    });
+    fr.engine.fs_target = 0x200;
+    fr.graph.render.fw_stamp[1].set(0x100);
+    assert!(!fr.oldest_stamp_reached());
+    assert_eq!(fr.graph.compute.fw_stamp.reads.get(), 0);
+    assert_eq!(fr.graph.render.fw_stamp[0].reads.get(), 0);
+    assert_eq!(fr.graph.render.fw_stamp[1].reads.get(), 1);
 }
 '''
 

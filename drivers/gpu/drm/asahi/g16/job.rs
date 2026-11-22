@@ -44,8 +44,8 @@ use kernel::{
 };
 
 use super::{
-    command::{Command, Order},
-    fence::JobFence,
+    command::{Command, Commands, Order, Orders},
+    fence::{InputFences, JobFence},
     hw,
     queue::QueueState,
     vm::VmState,
@@ -97,16 +97,16 @@ pub(crate) struct Job {
     /// The job's VM (TTBAT slot, status).
     pub(crate) vm: Arc<VmState>,
     /// Validated commands, in submission order (at most 64).
-    pub(crate) commands: KVec<Command>,
+    pub(crate) commands: Commands,
     pub(crate) resources: super::resources::Prepared,
     /// Immutable dependency/order ledger, one entry for every accepted command.
-    orders: KVec<Order>,
+    orders: Orders,
     /// The job's hardware fence.
     pub(crate) fence: JobFence,
     /// The engine's bookkeeping; `progress.signaled` makes [`Job::complete`] act once.
     pub(crate) progress: super::engine::Progress,
     /// Inputs and resolved historical-prefix dependencies, held through every command.
-    inputs: KVec<Fence>,
+    inputs: InputFences,
     /// Bitmask of commands (`0..MAX_COMMANDS`) with full owner-retirement proof; an aborted
     /// receipt never sets its bit. Tracks per-command bits so concurrent compute/render
     /// commands within one job may retire in either hardware completion order.
@@ -135,12 +135,12 @@ impl Job {
         id: u64,
         queue: Arc<QueueState>,
         vm: Arc<VmState>,
-        commands: KVec<Command>,
-        orders: KVec<Order>,
+        commands: Commands,
+        orders: Orders,
         resources: super::resources::Prepared,
         fence: JobFence,
         guard: mmu::VmJobGuard,
-        inputs: KVec<Fence>,
+        inputs: InputFences,
     ) -> Result<Arc<Self>> {
         if commands.len() != orders.len() {
             return Err(EINVAL);

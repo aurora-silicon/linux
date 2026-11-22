@@ -34,7 +34,7 @@ use kernel::{dma_fence::Fence, prelude::*, sync::Arc, uapi, xarray};
 
 use super::{
     command::{self, USC_WINDOW},
-    fence::{Syncs, Timeline},
+    fence::{InputFences, Syncs, Timeline},
     hw,
     job::{Job, Scheduler},
     params,
@@ -219,13 +219,13 @@ impl Queue {
         })?;
         // Refused jobs add no accepted ordinals; check every prepared dependency before
         // publishing a fence or extending the queue's accepted frontier.
-        for order in &submission.orders {
+        for order in submission.orders.iter() {
             self.state.check(order)?;
         }
-        let mut inputs = KVec::with_capacity(syncs.inputs().len(), GFP_KERNEL)?;
+        let mut inputs = InputFences::new();
         for sync in syncs.inputs() {
             if let Some(fence) = &sync.fence {
-                inputs.push(fence.clone(), GFP_KERNEL)?;
+                inputs.push(fence.clone())?;
             }
         }
         // Allocate and map private backing before a fence or accepted ordinal exists.

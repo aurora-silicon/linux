@@ -592,15 +592,31 @@ impl Firmware {
         if self.engine.flights.is_empty() {
             return false;
         }
+        let mut oldest_compute: Option<&Flight> = None;
+        let mut compute_behind = false;
+        let mut oldest_render: Option<&Flight> = None;
+        let mut render_behind = false;
+        for f in self.engine.flights.iter() {
+            if f.computes != 0 {
+                if oldest_compute.is_none() {
+                    oldest_compute = Some(f);
+                } else {
+                    compute_behind = true;
+                }
+            }
+            if f.renders != 0 {
+                if oldest_render.is_none() {
+                    oldest_render = Some(f);
+                } else {
+                    render_behind = true;
+                }
+            }
+            if compute_behind && render_behind {
+                break;
+            }
+        }
         rmb();
-        let compute_behind = self
-            .engine
-            .flights
-            .iter()
-            .filter(|f| f.computes != 0)
-            .count()
-            > 1;
-        if let Some(f) = self.engine.flights.iter().find(|f| f.computes != 0) {
+        if let Some(f) = oldest_compute {
             if let Ok(obs) = self.graph.compute.fw_stamp.r32(0) {
                 let reached = if compute_behind {
                     stamp_reached(obs, f.target, self.engine.target)
@@ -612,14 +628,7 @@ impl Firmware {
                 }
             }
         }
-        let render_behind = self
-            .engine
-            .flights
-            .iter()
-            .filter(|f| f.renders != 0)
-            .count()
-            > 1;
-        if let Some(f) = self.engine.flights.iter().find(|f| f.renders != 0) {
+        if let Some(f) = oldest_render {
             if let Ok(obs) = self.graph.render.fw_stamp[1].r32(0) {
                 let reached = if render_behind {
                     stamp_reached(obs, f.fs_target, self.engine.fs_target)
@@ -646,12 +655,13 @@ impl Firmware {
             self.check_hangs(done)?;
         }
         let mut retired_any = false;
-        let mut ret = self.retired_flight();
+        let (mut check_compute, mut check_render) = (true, true);
+        let mut ret = self.retired_flight_classes(&mut check_compute, &mut check_render);
         while let Ok(Some((index, receipt))) = ret {
             let outcome = self.retire_outcome_at(index, receipt);
             self.retire_oldest(index, receipt, outcome, done);
             retired_any = true;
-            ret = self.retired_flight();
+            ret = self.retired_flight_classes(&mut check_compute, &mut check_render);
         }
         self.recovery.receipt_fault = ret.is_err();
         Ok(retired_any)
@@ -791,13 +801,56 @@ impl Firmware {
     /// Inspects the oldest compute flight and oldest render flight independently so either
     /// class can retire as soon as its hardware receipt settles without waiting on the other.
     pub(crate) fn retired_flight(&mut self) -> Result<Option<(usize, Retirement)>> {
-        let compute_idx = self.engine.flights.iter().position(|f| f.computes != 0);
-        let render_idx = self.engine.flights.iter().position(|f| f.renders != 0);
-        for index in [compute_idx, render_idx].into_iter().flatten() {
+        let (mut check_compute, mut check_render) = (true, true);
+        self.retired_flight_classes(&mut check_compute, &mut check_render)
+    }
+
+    /// Like [`Self::retired_flight`], skipping classes that are inactive or already known
+    /// pending in the current [`Self::retire_once`] pass and never polling a mixed flight twice.
+    fn retired_flight_classes(
+        &mut self,
+        check_compute: &mut bool,
+        check_render: &mut bool,
+    ) -> Result<Option<(usize, Retirement)>> {
+        let (mut compute_idx, mut render_idx) = (None, None);
+        if *check_compute || *check_render {
+            for (i, f) in self.engine.flights.iter().enumerate() {
+                if *check_compute && compute_idx.is_none() && f.computes != 0 {
+                    compute_idx = Some(i);
+                }
+                if *check_render && render_idx.is_none() && f.renders != 0 {
+                    render_idx = Some(i);
+                }
+                if (!*check_compute || compute_idx.is_some())
+                    && (!*check_render || render_idx.is_some())
+                {
+                    break;
+                }
+            }
+        }
+        if compute_idx.is_none() {
+            *check_compute = false;
+        }
+        if render_idx.is_none() {
+            *check_render = false;
+        }
+        if let Some(index) = compute_idx {
             let receipt = self.retired_at(index)?;
             if receipt.complete() {
                 return Ok(Some((index, receipt)));
             }
+            *check_compute = false;
+            if render_idx == Some(index) {
+                *check_render = false;
+                render_idx = None;
+            }
+        }
+        if let Some(index) = render_idx {
+            let receipt = self.retired_at(index)?;
+            if receipt.complete() {
+                return Ok(Some((index, receipt)));
+            }
+            *check_render = false;
         }
         Ok(None)
     }
@@ -816,63 +869,35 @@ impl Firmware {
         // Later flights of the same engine class queued behind this one: that class's queue,
         // pipe and stamp cells already moved on, so its receipt is "passed", in order; the
         // newest flight of a class keeps the exact receipt.
-        let compute_behind = self
-            .engine
-            .flights
-            .iter()
-            .filter(|f| f.computes != 0)
-            .count()
-            > 1;
-        let render_behind = self
-            .engine
-            .flights
-            .iter()
-            .filter(|f| f.renders != 0)
-            .count()
-            > 1;
-        if f.computes != 0 && compute_behind {
+        if f.computes != 0 {
+            let compute_behind = self
+                .engine
+                .flights
+                .iter()
+                .filter(|o| o.computes != 0)
+                .nth(1)
+                .is_some();
             let g = &self.graph.compute;
-            let e = &self.engine;
-            if !stamp_reached(g.fw_stamp.r32(0)?, f.target, e.target)
-                || !self.queue_passed(Channel::Compute, &g.qstate, &g.qinfo, f)?
-            {
-                return Ok(Retirement::Pending);
-            }
-            let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
-            full &= stamp_reached(stamp, f.target, e.target)
-                && (stamp != f.target
-                    || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot);
-            let count = f.claims.slot_count as usize;
-            full &= count != 0 && count == f.computes as usize;
-            if full {
-                for m in 0..count {
-                    let k = f.claims.slot[m] as usize;
-                    let unit = f.job.resources.compute_unit(k)?;
-                    let submitted = f.csubmitted[m];
-                    let (start, end) = self.compute_ticks(unit)?;
-                    if m == 0 && count == 1 {
-                        ticks = [start, end, 0, 0];
-                    }
-                    full &= submitted != 0
-                        && unit.counter.r64(0)? == submitted
-                        && unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted
-                        && unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va
-                        && start != 0
-                        && end > start;
-                    if !full {
-                        break;
-                    }
+            if compute_behind {
+                let e = &self.engine;
+                if !stamp_reached(g.fw_stamp.r32(0)?, f.target, e.target)
+                    || !self.queue_passed(Channel::Compute, &g.qstate, &g.qinfo, f)?
+                {
+                    return Ok(Retirement::Pending);
                 }
+                let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
+                full &= stamp_reached(stamp, f.target, e.target)
+                    && (stamp != f.target
+                        || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot);
+            } else {
+                if g.fw_stamp.r32(0)? != f.target
+                    || !self.queue_receipt(Channel::Compute, &g.qstate, &g.qinfo, f.head, f.rec[2])?
+                {
+                    return Ok(Retirement::Pending);
+                }
+                full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
+                    && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot;
             }
-        } else if f.computes != 0 {
-            let g = &self.graph.compute;
-            if g.fw_stamp.r32(0)? != f.target
-                || !self.queue_receipt(Channel::Compute, &g.qstate, &g.qinfo, f.head, f.rec[2])?
-            {
-                return Ok(Retirement::Pending);
-            }
-            full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
-                && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot;
             let count = f.claims.slot_count as usize;
             full &= count != 0 && count == f.computes as usize;
             if full {
@@ -880,103 +905,101 @@ impl Firmware {
                     let k = f.claims.slot[m] as usize;
                     let unit = f.job.resources.compute_unit(k)?;
                     let submitted = f.csubmitted[m];
+                    if submitted == 0
+                        || unit.counter.r64(0)? != submitted
+                        || unit.work.r64(compute::DESCRIPTOR_COMPLETED)? != submitted
+                        || unit.work.r64(compute::DESCRIPTOR_COUNTER)? != unit.counter.va
+                    {
+                        full = false;
+                        break;
+                    }
                     let (start, end) = self.compute_ticks(unit)?;
+                    if start == 0 || end <= start {
+                        full = false;
+                        break;
+                    }
                     if m == 0 && count == 1 {
                         ticks = [start, end, 0, 0];
-                    }
-                    full &= submitted != 0
-                        && unit.counter.r64(0)? == submitted
-                        && unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted
-                        && unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va
-                        && start != 0
-                        && end > start;
-                    if !full {
-                        break;
                     }
                 }
             }
         }
-        if f.renders != 0 && render_behind {
+        if f.renders != 0 {
+            let render_behind = self
+                .engine
+                .flights
+                .iter()
+                .filter(|o| o.renders != 0)
+                .nth(1)
+                .is_some();
             let g = &self.graph.render;
-            let e = &self.engine;
-            if !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target)
-                || !stamp_reached(g.fw_stamp[1].r32(0)?, f.fs_target, e.fs_target)
-                || !self.queue_passed(Channel::Ta, &g.qstate[0], &g.qinfo[0], f)?
-                || !self.queue_passed(Channel::Fs, &g.qstate[1], &g.qinfo[1], f)?
-            {
-                return Ok(Retirement::Pending);
-            }
             let k = f.claims.pass[0] as usize;
             let a = f.pb_slot as usize;
-            let unit = f.job.resources.render_pass(k)?;
-            let ta_start = unit.scene.r64(0x600)?;
-            let ta_end = unit.scene.r64(0x608)?;
-            let fs_start = unit.scene.r64(0x620)?;
-            let fs_end = unit.scene.r64(0x628)?;
-            if f.computes == 0 {
-                ticks = [ta_start, ta_end, fs_start, fs_end];
-            }
-            let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
-            let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
-            full &= stamp_reached(ta_stamp, f.ta_target, e.ta_target)
-                && (ta_stamp != f.ta_target
-                    || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot)
-                && stamp_reached(fs_stamp, f.fs_target, e.fs_target)
-                && (fs_stamp != f.fs_target
-                    || g.notifier
+            if render_behind {
+                let e = &self.engine;
+                // Check FS (terminal stage) before TA so running renders fail fast on 1 WC read.
+                if !stamp_reached(g.fw_stamp[1].r32(0)?, f.fs_target, e.fs_target)
+                    || !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target)
+                    || !self.queue_passed(Channel::Ta, &g.qstate[0], &g.qinfo[0], f)?
+                    || !self.queue_passed(Channel::Fs, &g.qstate[1], &g.qinfo[1], f)?
+                {
+                    return Ok(Retirement::Pending);
+                }
+                let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
+                let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
+                full &= stamp_reached(fs_stamp, f.fs_target, e.fs_target)
+                    && (fs_stamp != f.fs_target
+                        || g.notifier
+                            .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
+                            == f.job.vm.slot)
+                    && stamp_reached(ta_stamp, f.ta_target, e.ta_target)
+                    && (ta_stamp != f.ta_target
+                        || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot)
+                    && f.job
+                        .resources
+                        .render()?
+                        .pools
+                        .retired_at(a, f.uma_submitted)?;
+            } else {
+                // Check FS (terminal stage) before TA so running renders fail fast on 1 WC read.
+                if g.fw_stamp[1].r32(0)? != f.fs_target
+                    || g.fw_stamp[0].r32(0)? != f.ta_target
+                    || !self.queue_receipt(
+                        Channel::Ta,
+                        &g.qstate[0],
+                        &g.qinfo[0],
+                        f.ta_head,
+                        f.rec[0],
+                    )?
+                    || !self.queue_receipt(
+                        Channel::Fs,
+                        &g.qstate[1],
+                        &g.qinfo[1],
+                        f.fs_head,
+                        f.rec[1],
+                    )?
+                {
+                    return Ok(Retirement::Pending);
+                }
+                full &= g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
+                    && g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
+                    && g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot
+                    && g.notifier
                         .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
-                        == f.job.vm.slot)
-                && f.job
-                    .resources
-                    .render()?
-                    .pools
-                    .retired_at(a, f.uma_submitted)?
-                && ta_start != 0
-                && ta_end > ta_start
-                && fs_start != 0
-                && fs_end > fs_start;
-        } else if f.renders != 0 {
-            let g = &self.graph.render;
-            if g.fw_stamp[0].r32(0)? != f.ta_target
-                || g.fw_stamp[1].r32(0)? != f.fs_target
-                || !self.queue_receipt(
-                    Channel::Ta,
-                    &g.qstate[0],
-                    &g.qinfo[0],
-                    f.ta_head,
-                    f.rec[0],
-                )?
-                || !self.queue_receipt(
-                    Channel::Fs,
-                    &g.qstate[1],
-                    &g.qinfo[1],
-                    f.fs_head,
-                    f.rec[1],
-                )?
-            {
-                return Ok(Retirement::Pending);
+                        == f.job.vm.slot
+                    && f.job.resources.render()?.pools.retired(a)?;
             }
-            let k = f.claims.pass[0] as usize;
-            let a = f.pb_slot as usize;
-            let unit = f.job.resources.render_pass(k)?;
-            let ta_start = unit.scene.r64(0x600)?;
-            let ta_end = unit.scene.r64(0x608)?;
-            let fs_start = unit.scene.r64(0x620)?;
-            let fs_end = unit.scene.r64(0x628)?;
-            if f.computes == 0 {
-                ticks = [ta_start, ta_end, fs_start, fs_end];
+            if full {
+                let unit = f.job.resources.render_pass(k)?;
+                let ta_start = unit.scene.r64(0x600)?;
+                let ta_end = unit.scene.r64(0x608)?;
+                let fs_start = unit.scene.r64(0x620)?;
+                let fs_end = unit.scene.r64(0x628)?;
+                if f.computes == 0 {
+                    ticks = [ta_start, ta_end, fs_start, fs_end];
+                }
+                full &= ta_start != 0 && ta_end > ta_start && fs_start != 0 && fs_end > fs_start;
             }
-            full &= g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
-                && g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
-                && g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot
-                && g.notifier
-                    .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
-                    == f.job.vm.slot
-                && f.job.resources.render()?.pools.retired(a)?
-                && ta_start != 0
-                && ta_end > ta_start
-                && fs_start != 0
-                && fs_end > fs_start;
         }
         if full {
             self.engine.retired_ticks = ticks;
@@ -1271,18 +1294,28 @@ impl Firmware {
             return;
         }
         let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
+        let (mut fc, mut fr) = (None, None);
+        for f in e.flights.iter() {
+            if fc.is_none() && f.computes != 0 {
+                fc = Some(f);
+            }
+            if fr.is_none() && f.renders != 0 {
+                fr = Some(f);
+            }
+            if fc.is_some() && fr.is_some() {
+                break;
+            }
+        }
         // None denotes an inactive/reached stage. A real unreached stamp may be zero
         // immediately after native wrap and must remain distinguishable from completion.
         let pending =
             |observed, own, tail| (!stamp_reached(observed, own, tail)).then_some(observed);
         let (mut c, mut ta, mut fs) = (None, None, None);
         let mut published = [0u64; 2];
-        let fc = e.flights.iter().find(|f| f.computes != 0);
         if let Some(fc) = fc {
             c = pending(g.fw_stamp.r32(0).unwrap_or(0), fc.target, e.target);
             published[0] = fc.published_ns;
         }
-        let fr = e.flights.iter().find(|f| f.renders != 0);
         if let Some(fr) = fr {
             ta = pending(r.fw_stamp[0].r32(0).unwrap_or(0), fr.ta_target, e.ta_target);
             fs = pending(r.fw_stamp[1].r32(0).unwrap_or(0), fr.fs_target, e.fs_target);

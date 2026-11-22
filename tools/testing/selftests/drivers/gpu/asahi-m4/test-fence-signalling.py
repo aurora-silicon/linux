@@ -88,6 +88,10 @@ signal_batch_line = [
     line for line in fence_source.splitlines() if line.startswith('const SIGNAL_BATCH:')
 ][0]
 timeline_complete_fn = extract_function(fence_source, 'complete')
+input_fences_src = fence_source[
+    fence_source.index('/// Inline storage for the common 0-2 input fences'):
+    fence_source.index('/// Reads a retained dependency')
+]
 
 timeline_harness = r'''
 #![allow(dead_code)]
@@ -97,8 +101,73 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Error(i32);
 const EIO: Error = Error(-5);
+const ENOMEM: Error = Error(-12);
 const ECANCELED: Error = Error(-125);
+const GFP_KERNEL: u32 = 0;
 type Result<T = ()> = std::result::Result<T, Error>;
+
+mod input_fences_test {
+    use super::{Result, ENOMEM, GFP_KERNEL};
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static ALLOCS: Cell<u32> = const { Cell::new(0) };
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct Fence(pub(crate) u32);
+
+    pub(crate) struct KVec<T>(Vec<T>);
+    impl<T> KVec<T> {
+        fn with_capacity(cap: usize, _flags: u32) -> Result<Self> {
+            if FAIL_NEXT.with(|f| f.replace(false)) {
+                return Err(ENOMEM);
+            }
+            ALLOCS.with(|a| a.set(a.get() + 1));
+            Ok(Self(Vec::with_capacity(cap)))
+        }
+        fn push(&mut self, v: T, _flags: u32) -> Result {
+            if FAIL_NEXT.with(|f| f.replace(false)) {
+                return Err(ENOMEM);
+            }
+            self.0.push(v);
+            Ok(())
+        }
+        fn push_within_capacity(&mut self, v: T) -> std::result::Result<(), T> {
+            self.0.push(v);
+            Ok(())
+        }
+    }
+    impl<T> core::ops::Deref for KVec<T> {
+        type Target = [T];
+        fn deref(&self) -> &[T] { &self.0 }
+    }
+
+    INPUT_FENCES_SRC
+
+    #[test]
+    fn input_fences_inline_zero_to_two_and_spill_safely() {
+        ALLOCS.with(|a| a.set(0));
+        let mut inputs = InputFences::new();
+        assert_eq!(&*inputs, &[]);
+        inputs.push(Fence(10)).unwrap();
+        assert_eq!(&*inputs, &[Fence(10)]);
+        inputs.push(Fence(20)).unwrap();
+        assert_eq!(&*inputs, &[Fence(10), Fence(20)]);
+        assert_eq!(ALLOCS.with(|a| a.get()), 0);
+        // OOM during 2 -> 3 spill preserves the 2 inline fences intact.
+        FAIL_NEXT.with(|f| f.set(true));
+        assert_eq!(inputs.push(Fence(30)), Err(ENOMEM));
+        assert_eq!(&*inputs, &[Fence(10), Fence(20)]);
+        assert_eq!(ALLOCS.with(|a| a.get()), 0);
+        // Spill succeeds with one allocation and keeps exact order.
+        inputs.push(Fence(30)).unwrap();
+        inputs.push(Fence(40)).unwrap();
+        assert_eq!(ALLOCS.with(|a| a.get()), 1);
+        assert_eq!(&*inputs, &[Fence(10), Fence(20), Fence(30), Fence(40)]);
+    }
+}
 
 struct Mutex<T>(StdMutex<T>);
 impl<T> Mutex<T> {
@@ -245,7 +314,7 @@ fn concurrent_completers_preserve_strict_fifo_signal_order() {
 }
 '''.replace('SIGNAL_BATCH_LINE', signal_batch_line).replace(
     'TIMELINE_COMPLETE_FN', timeline_complete_fn
-)
+).replace('INPUT_FENCES_SRC', input_fences_src)
 
 with tempfile.TemporaryDirectory(prefix='m4-rust-timeline-') as directory:
     directory = pathlib.Path(directory)
