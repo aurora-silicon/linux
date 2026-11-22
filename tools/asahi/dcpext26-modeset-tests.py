@@ -91,6 +91,8 @@ static int dcp_typec_prepare_route(struct apple_dcp *d){return 0;}
 static int apple_drm_fabric_hold(void){return 0;}
 static void dcp_poweron(struct apple_dcp *d){assert(d->typec_enable_pending);powered++;}
 static void dcp_external_recover(struct apple_dcp *d){}
+static bool pipe_off;
+static bool dcp_external_pipe_off(struct apple_dcp *d){return pipe_off;}
 static bool drm_atomic_crtc_needs_modeset(struct drm_crtc_state *s){return true;}
 static int dcp_crtc_atomic_modeset(struct drm_crtc *c,struct drm_atomic_commit *a){programmed++;return mode_error;}
 static void dcp_mode_invalidate(int *m){invalidated++;*m=0;}
@@ -109,6 +111,12 @@ int main(void){
  }
  done=woken=notified=invalidated=0;mode_error=0;
  apple_crtc_atomic_enable(&crtc,&commit);assert(done==1&&!woken&&!notified&&!invalidated&&!d.typec_enable_pending);
+ // A CRTC that stayed active on a pipe the firmware turned off is powered on first.
+ state.active_changed=false;pipe_off=true;done=powered=programmed=0;
+ apple_crtc_atomic_enable(&crtc,&commit);assert(done==1&&powered==1&&programmed==1&&!d.typec_enable_pending);
+ pipe_off=false;powered=programmed=0;
+ apple_crtc_atomic_enable(&crtc,&commit);assert(!powered&&programmed==1);
+ state.active_changed=true;
  // Existing non-native error policy is preserved.
  d.native=false;done=woken=notified=invalidated=0;mode_error=-EIO;
  apple_crtc_atomic_enable(&crtc,&commit);assert(done==1&&!woken&&!notified&&!invalidated&&classic_errors==1&&!d.typec_enable_pending);
@@ -118,4 +126,4 @@ with tempfile.TemporaryDirectory() as t:
  p=Path(t)/'enable.c';p.write_text(preamble+actual+checks)
  subprocess.run(['clang','-std=gnu11','-Wall','-Werror','-fsanitize=address,undefined',str(p),'-o',str(p.with_suffix(''))],check=True)
  subprocess.run([str(p.with_suffix(''))],check=True)
-print('PASS actual enable callback: native mode errors invalidate/wake flips/finish route once; success and classic policy preserved')
+print('PASS actual enable callback: native mode errors invalidate/wake flips/finish route once; success and classic policy preserved; an active CRTC on a pipe turned off is powered first')
