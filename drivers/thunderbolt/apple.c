@@ -1311,6 +1311,40 @@ static bool apple_cio_pciec_eligible(const struct device_node *np)
 	       of_device_is_compatible(np, "apple,t6050-pciec");
 }
 
+/*
+ * Whether an IOMMU isolates what this router tunnels over PCIe. Each PCIe host
+ * of the tunnel must translate through a DART (an iommu-map) and have only
+ * root ports marked "external-facing": the PCI core then marks every function
+ * below them untrusted, and the IOMMU core keeps those in strict DMA domains.
+ * A router with no PCIe host to tunnel to gives devices no way to reach
+ * memory, so there is nothing to isolate.
+ */
+static bool apple_cio_pcie_tunnel_isolated(struct apple_cio *acio)
+{
+	if (!acio->pcie_tunnel_np)
+		return true;
+
+	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, host) {
+		bool external = false;
+
+		if (!of_node_is_type(host, "pci"))
+			continue;
+		if (!of_property_present(host, "iommu-map"))
+			return false;
+		for_each_available_child_of_node_scoped(host, port) {
+			if (!of_node_is_type(port, "pci"))
+				continue;
+			if (!of_property_read_bool(port, "external-facing"))
+				return false;
+			external = true;
+		}
+		if (!external)
+			return false;
+	}
+
+	return true;
+}
+
 static bool
 apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 {
@@ -2668,7 +2702,10 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		goto err;
 
 	spin_lock_init(&anhi->nhi.lock);
-	anhi->nhi.iommu_dma_protection = true;
+	anhi->nhi.iommu_dma_protection = apple_cio_pcie_tunnel_isolated(acio);
+	if (!anhi->nhi.iommu_dma_protection)
+		dev_warn(&pdev->dev,
+			 "PCIe tunnel root port is not external-facing or not translated: no IOMMU DMA protection reported\n");
 	/*
 	 * DP tunnel display support (and with it the host DP IN handling in
 	 * the connection manager) only where it is enabled and known to work.
