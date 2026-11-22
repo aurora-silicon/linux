@@ -819,6 +819,7 @@ static int dwc3_apple_core_stop(struct dwc3_apple *appledwc)
 static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
 {
 	enum phy_mode mode;
+	bool usb2_device_selected = false;
 	int ret, ret_reset;
 
 	lockdep_assert_held(&appledwc->lock);
@@ -858,6 +859,8 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 			if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
 				return ret;
 			dev_warn(appledwc->dev, "Failed to set the USB2 PHY mode, err=%d\n", ret);
+		} else {
+			usb2_device_selected = mode == PHY_MODE_USB_DEVICE;
 		}
 	}
 
@@ -868,7 +871,7 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	if (appledwc->pre_core_rpm) {
 		ret = pm_runtime_resume_and_get(appledwc->dev);
 		if (ret)
-			return ret;
+			goto restore_usb2_mode;
 		pm_runtime_disable(appledwc->dev);
 		pm_runtime_put_noidle(appledwc->dev);
 		appledwc->pre_core_rpm = false;
@@ -881,7 +884,7 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	if (appledwc->state != DWC3_APPLE_PROBE_PENDING && !appledwc->rpm_held) {
 		ret = pm_runtime_resume_and_get(appledwc->dev);
 		if (ret)
-			return ret;
+			goto restore_usb2_mode;
 		appledwc->rpm_held = true;
 	}
 
@@ -895,7 +898,7 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 		ret_reset = dwc3_apple_core_stop(appledwc);
 		if (ret_reset)
 			dev_warn(appledwc->dev, "Failed to finish core shutdown, err=%d\n", ret_reset);
-		return ret;
+		goto restore_usb2_mode;
 	}
 
 	appledwc->reset_pending = true;
@@ -924,6 +927,16 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	appledwc->usb3_power_off_pending = BIT(appledwc->dwc.num_usb3_ports) - 1;
 
 	return 0;
+
+restore_usb2_mode:
+	/* These exits never asserted reset to undo the device-role selection. */
+	if (usb2_device_selected) {
+		ret_reset = phy_set_mode(appledwc->usb2_phy, PHY_MODE_USB_HOST);
+		if (ret_reset)
+			dev_warn(appledwc->dev, "Failed to restore USB2 PHY host mode, err=%d\n",
+				 ret_reset);
+	}
+	return ret;
 }
 
 /*

@@ -380,7 +380,7 @@ static int t6040_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 				 T6040_USB2_SIG_HOST_2)
 #define T6040_USB2_SIG_VBUSVLDEXT (T6040_USB2_SIG_VBUSVLDEXT_FORCE_VAL | \
 				   T6040_USB2_SIG_VBUSVLDEXT_FORCE_EN)
-/* The signal bits power_on programs and checks: the init ones, plus VBUS valid in device mode. */
+/* The signal bits power_on programs and checks in both roles. */
 #define T6040_USB2_SIG_CHECKED	(T6040_USB2_SIG_INIT | T6040_USB2_SIG_VBUSVLDEXT)
 
 static u32 t6040_usb2_sig_tunable(u32 sig, const struct apple_tunable *t)
@@ -464,6 +464,8 @@ static int t6040_usb2_power_on(struct phy *phy)
 		 */
 		apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_default);
 		apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_host);
+		/* Forced VBUS valid belongs only to the device role. */
+		t6040_usb2_clear32(tphy->usb2 + T6040_USB2_SIG, T6040_USB2_SIG_VBUSVLDEXT);
 	}
 
 	msleep(10);
@@ -510,8 +512,7 @@ static int t6040_usb2_power_on(struct phy *phy)
 	    (ctl & (T6040_USB2_CTL_RESET | T6040_USB2_CTL_PORT_RESET |
 		    T6040_USB2_CTL_SIDDQ | T6040_USB2_CTL_APB_RESET_N)) !=
 		   T6040_USB2_CTL_APB_RESET_N ||
-	    (sig & (tphy->mode == PHY_MODE_USB_DEVICE ? T6040_USB2_SIG_CHECKED :
-						      T6040_USB2_SIG_INIT)) != sig_want ||
+	    (sig & T6040_USB2_SIG_CHECKED) != sig_want ||
 	    (tune & (T6040_USB2_MISCTUNE_APBCLK_GATE_OFF |
 		     T6040_USB2_MISCTUNE_REFCLK_GATE_OFF)) ||
 	    (mode & T6040_USB2_USBCTL_MODE) != T6040_USB2_USBCTL_MODE_HOST ||

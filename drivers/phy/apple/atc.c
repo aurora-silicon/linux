@@ -4670,6 +4670,8 @@ static int atcphy_usb3_power_off(struct phy *phy)
 	ret = atcphy_park_pipehandler(atcphy, true);
 	if (ret)
 		return ret;
+	/* A same-plug role swap updates the mux before selecting USB host. */
+	atcphy->usb2_device = false;
 	atcphy->t8103_usb3_retry = false;
 	/*
 	 * T8132 keeps DWC3 on the dummy PIPE while USB4/Thunderbolt owns the
@@ -4753,6 +4755,7 @@ static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode targe
 static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+	const bool usb2_device = atcphy->hw->no_ss_device && mode == PHY_MODE_USB_DEVICE;
 	int ret;
 
 	guard(mutex)(&atcphy->lock);
@@ -4761,7 +4764,7 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	if (atcphy->usb_off_pending)
 		return -EBUSY;
 
-	if (atcphy->hw->no_ss_device && mode == PHY_MODE_USB_DEVICE) {
+	if (usb2_device) {
 		enum atcphy_mode usb2 = atcphy_usb2_device_mode(atcphy, atcphy->mode);
 
 		/*
@@ -4770,7 +4773,6 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 		 * the role. Later mux updates keep USB2 (usb2_device). Without
 		 * the T8132 SuperSpeed banks the lanes never leave USB2.
 		 */
-		atcphy->usb2_device = true;
 		if (usb2 != atcphy->mode) {
 			dev_info(atcphy->dev, "USB device role: no SuperSpeed device mode, using USB2\n");
 			ret = atcphy_mux_switch(atcphy, usb2);
@@ -4778,7 +4780,7 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 				return ret;
 		}
 	} else if (mode == PHY_MODE_USB_HOST) {
-		/* The lanes regain USB3 with the next mux update (a data role swap). */
+		/* Also clear the device-role limit on a direct host selection. */
 		atcphy->usb2_device = false;
 	}
 
@@ -4796,6 +4798,8 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	}
 
 	ret = atcphy_usb3_route(atcphy, mode == PHY_MODE_USB_HOST);
+	if (!ret && usb2_device)
+		atcphy->usb2_device = true;
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
 		dev_dbg(atcphy->dev,
 			 "USB %s route: mode=%u ss=%u calibration=%u common=%u dirty=%u pipe=%u pending=%u ret=%d mux=%#x override=%#x config=%#x\n",
