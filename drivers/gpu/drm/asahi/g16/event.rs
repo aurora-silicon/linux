@@ -36,6 +36,7 @@ impl ErrorEvent {
 
 pub(crate) struct Events {
     pub(crate) compute_events: u32,
+    pub(crate) fs_events: u32,
     pub(crate) stage_events: u32,
     pub(crate) errors: u32,
     pub(crate) last_error: Option<ErrorEvent>,
@@ -54,6 +55,7 @@ impl Events {
     pub(crate) fn new() -> Self {
         Self {
             compute_events: 0,
+            fs_events: 0,
             stage_events: 0,
             errors: 0,
             last_error: None,
@@ -94,6 +96,9 @@ impl Events {
     /// Decode notifications, copying every record before returning its slot.
     pub(crate) fn drain(&mut self, dev: &device::Device, ring: &Ring) -> Result {
         let (mut read, producer) = Self::indices(ring)?;
+        if read == producer {
+            return Ok(());
+        }
         // SAFETY: ktime_get has no preconditions.
         let now = unsafe { bindings::ktime_get() } as u64;
         let mut error = None;
@@ -108,7 +113,9 @@ impl Events {
                         }
                         self.event_ns[stage] = now;
                         self.stage_events = self.stage_events.wrapping_add(1);
-                        if stage == 2 {
+                        if stage == 1 {
+                            self.fs_events = self.fs_events.wrapping_add(1);
+                        } else if stage == 2 {
                             self.compute_events = self.compute_events.wrapping_add(1);
                         }
                     }

@@ -236,12 +236,25 @@ impl Channels {
         Ok(())
     }
 
-    /// Drains every receive ring: events (decoded into `events`), the nine log sub-rings, trace
-    /// and stats, on every pass, whatever another ring reported. The firmware waits while its
-    /// event ring is full, so one bad record must never leave a ring undrained. The first error
-    /// is returned once all are done.
-    pub(crate) fn drain_rings(&self, dev: &kernel::device::Device, events: &mut Events) -> Result {
+    /// Drains the event and statistics receive rings, which carry completion notifications and
+    /// firmware recovery announcements. Hot retirement passes use this to avoid polling the
+    /// auxiliary log and trace rings on every flight; periodic housekeeping drains the rest.
+    pub(crate) fn drain_events_and_stats(
+        &self,
+        dev: &kernel::device::Device,
+        events: &mut Events,
+    ) -> Result {
         let mut result = events.drain(dev, &self.event);
+        let stats = events.drain_statistics(dev, &self.stats);
+        if result.is_ok() {
+            result = stats;
+        }
+        result
+    }
+
+    /// Drains the nine log sub-rings and the ktrace receive ring.
+    pub(crate) fn drain_auxiliary_rings(&self, dev: &kernel::device::Device) -> Result {
+        let mut result = Ok(());
         let mut keep = |r: Result| {
             if result.is_ok() {
                 result = r;
@@ -251,7 +264,19 @@ impl Channels {
             keep(Self::drain_one(&self.log, i * 0x30, 256));
         }
         keep(self.drain_trace(dev));
-        keep(events.drain_statistics(dev, &self.stats));
+        result
+    }
+
+    /// Drains every receive ring: events (decoded into `events`), the nine log sub-rings, trace
+    /// and stats, whatever another ring reported. The firmware waits while its event ring is
+    /// full, so one bad record must never leave a ring undrained. The first error is returned
+    /// once all are done.
+    pub(crate) fn drain_rings(&self, dev: &kernel::device::Device, events: &mut Events) -> Result {
+        let mut result = self.drain_events_and_stats(dev, events);
+        let aux = self.drain_auxiliary_rings(dev);
+        if result.is_ok() {
+            result = aux;
+        }
         result
     }
 
@@ -382,9 +407,21 @@ impl Firmware {
         self.session.transport().err()
     }
 
-    /// Drains the receive rings and decodes events. Called first in every poll pass.
+    /// Drains the receive rings and decodes events. Called on full housekeeping and idle passes.
     pub(crate) fn drain_rings(&mut self) -> Result {
         let dev = self.session.dev.clone();
         self.channels.drain_rings(&dev, &mut self.events)
+    }
+
+    /// Drains only the event and statistics rings on the hot retirement path.
+    pub(crate) fn drain_events_and_stats(&mut self) -> Result {
+        let dev = self.session.dev.clone();
+        self.channels.drain_events_and_stats(&dev, &mut self.events)
+    }
+
+    /// Drains the auxiliary log and trace rings on periodic housekeeping passes.
+    pub(crate) fn drain_auxiliary_rings(&mut self) -> Result {
+        let dev = self.session.dev.clone();
+        self.channels.drain_auxiliary_rings(&dev)
     }
 }

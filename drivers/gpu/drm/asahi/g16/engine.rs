@@ -413,6 +413,10 @@ pub(crate) struct Engine {
     /// The device's shared state, for the transport-error latch; set by the first poll or
     /// submission.
     pub(crate) shared: Option<Arc<Shared>>,
+    /// Authenticated GPU tick tuple captured by [`Firmware::retired_snapshot`] for the oldest
+    /// flight (`[start, end, 0, 0]` for compute; `[ta_start, ta_end, fs_start, fs_end]` for
+    /// render), reused by accounting without re-reading WC cells.
+    pub(crate) retired_ticks: [u64; 4],
     /// Host compute ordinal and draw ordinal of the last publication.
     pub(crate) ordinal: u64,
     pub(crate) draw: u64,
@@ -457,6 +461,7 @@ impl Engine {
             frozen: false,
             turn: 0,
             shared: None,
+            retired_ticks: [0; 4],
             ordinal: 0,
             draw: 0,
             target: 0,
@@ -772,9 +777,9 @@ impl Firmware {
         self.publish_checked(done)
     }
 
-    /// [`Self::publish`] for a poll pass, which has already drained the receive rings and
-    /// checked for hangs under this device lock; still rechecks the session (including ASC RUN)
-    /// after retirement before publishing new work.
+    /// [`Self::publish`] for a fast submit or poll pass that already drained/retired under this
+    /// device lock; verifies RTKit/transport liveness without repeating the 1 ms `Session::check`
+    /// register and UAT table walk on every command.
     pub(crate) fn publish_checked(&mut self, done: &mut Completions) -> Result {
         if self
             .session
@@ -784,7 +789,7 @@ impl Firmware {
         {
             return Ok(());
         }
-        self.session.check()?;
+        self.session.transport()?;
         // The initial G16 backend deliberately serializes hardware publication. Stronger
         // ordering satisfies Mesa's barriers while slot displacement and cache ownership
         // stay explicit. Never enable G15's submit-ahead policy on the M4 wire by accident.

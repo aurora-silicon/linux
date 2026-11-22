@@ -63,6 +63,7 @@ struct Destination{cpu:TimestampMapping}
 impl Destination { __WRITE__ }
 struct Destinations([Option<Destination>;4]);
 impl Destinations {
+    fn is_empty(&self)->bool{self.0.iter().all(Option::is_none)}
     fn iter(&self)->core::slice::Iter<'_,Option<Destination>>{self.0.iter()}
     __PUBLISH__
 }
@@ -196,6 +197,14 @@ fn resources()->Resources{Resources{
     flight.first=0;flight.count=1;claims.slot_count=0;
     assert_eq!(firmware().publish_timestamps(&flight,&claims),Err(EINVAL));
     assert_eq!(memory.words[0].load(Ordering::Relaxed),u64::MAX);
+}
+#[test]fn empty_timestamp_outputs_skip_hardware_cell_reads(){
+    let flight=Flight{job:Job{commands:vec![
+        command::Command::Compute(command::Compute{timestamp_outputs:Destinations(core::array::from_fn(|_|None))}),
+        command::Command::Render(command::Render{timestamp_outputs:Destinations(core::array::from_fn(|_|None))}),
+    ],resources:Resources{compute:vec![],passes:vec![]}},first:0,count:2,renders:1};
+    let claims=slots::Claims{slot:[0,0],slot_count:1,pass:[0,0]};
+    firmware().publish_timestamps(&flight,&claims).unwrap();
 }
 '''.replace('__CHECKED_OFFSET__', checked_offset).replace('__STORE__', store).replace('__VMAP_STORE__', vmap_store.replace('.timestamp_lock.lock()', '.timestamp_lock.lock().unwrap()')).replace('__CACHE_POLICY__', cache_policy).replace('__WRITE__', write).replace('__PUBLISH__', publish).replace('__RETIRE__', retire.replace('fn publish_timestamps', 'pub(crate) fn publish_timestamps'))
 path = out / 'timestamps-host.rs'

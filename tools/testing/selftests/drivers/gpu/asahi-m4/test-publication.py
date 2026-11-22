@@ -61,9 +61,10 @@ impl Engine {
 }
 struct Checks;impl Checks{fn check(&self)->Result{Ok(())}fn health(&self)->Result{Ok(())}}
 struct Shared{sleeping:AtomicBool}
-struct Session{shared:Shared,rings:Vec<Channel>,ring_fail:bool}
+struct Session{shared:Shared,rings:Vec<Channel>,ring_fail:bool,checks:AtomicU32,transports:AtomicU32}
 impl Session{
-    fn check(&self)->Result{Ok(())}
+    fn check(&self)->Result{self.checks.fetch_add(1,Ordering::Relaxed);Ok(())}
+    fn transport(&self)->Result{self.transports.fetch_add(1,Ordering::Relaxed);Ok(())}
     fn ring(&mut self,channel:Channel)->Result{
         if self.ring_fail{return Err(EIO);}
         self.rings.push(channel);
@@ -174,7 +175,7 @@ fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
         commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false),resources:Resources})
 }
 fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
-    Firmware{session:Session{shared:Shared{sleeping:AtomicBool::new(false)},rings:vec![],ring_fail:false},objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
+    Firmware{session:Session{shared:Shared{sleeping:AtomicBool::new(false)},rings:vec![],ring_fail:false,checks:AtomicU32::new(0),transports:AtomicU32::new(0)},objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
         engine:Engine{ordinal:0,draw:0,pending:jobs,flights:vec![],frozen:false,turn:0,stats:Stats::default(),chan_wait:false},
         slots:Slots{compute_exhausted:false,render_exhausted:false,releases:0,quarantines:0},pools:Pools{exhausted:false,exhausted_vm:None},power:Power::default(),
         unavailable:vec![],stages:stages.into_iter().map(|(result,visible)|Stage{result,visible}).collect(),
@@ -434,6 +435,17 @@ mod queue_behind_scope {
         p.slots.pass_available=true;
         p.engine.flights[0].recovery_suspect=true;
         assert!(!p.can_queue_behind(&r2));
+    }
+    #[test]fn publish_checked_uses_transport_without_repeating_session_check(){
+        let mut fw=firmware(vec![job(1,false,0,Ok(()))],vec![(Ok(()),true)]);
+        let mut done=vec![];
+        fw.publish_checked(&mut done).unwrap();
+        assert_eq!(fw.session.checks.load(Ordering::Relaxed),0);
+        assert_eq!(fw.session.transports.load(Ordering::Relaxed),1);
+        let mut fw2=firmware(vec![job(2,false,0,Ok(()))],vec![(Ok(()),true)]);
+        fw2.publish(&mut done).unwrap();
+        assert_eq!(fw2.session.checks.load(Ordering::Relaxed),1);
+        assert_eq!(fw2.session.transports.load(Ordering::Relaxed),1);
     }
 }
 '''
