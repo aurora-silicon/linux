@@ -19,6 +19,7 @@
 #include <media/videobuf2-dma-contig.h>
 
 #include "avd.h"
+#include "avd-inst.h"
 
 static bool avd_image_fmt_match(enum avd_image_fmt fmt1,
 				enum avd_image_fmt fmt2)
@@ -972,14 +973,21 @@ static int avd_start_streaming(struct vb2_queue *q, unsigned int count)
 		goto err_return_buffers;
 	}
 
+	/* The context's instruction FIFO is only used while OUTPUT streams. */
+	ret = avd_buf_alloc(ctx->dev, &ctx->inst, fifo_size());
+	if (ret)
+		goto err_return_buffers;
+
 	if (desc->ops->start) {
 		ret = desc->ops->start(ctx);
 		if (ret)
-			goto err_return_buffers;
+			goto err_free_inst;
 	}
 
 	return 0;
 
+err_free_inst:
+	avd_buf_free(ctx->dev, &ctx->inst);
 err_return_buffers:
 	/* Keep requests queued for a later STREAMON retry. */
 	while ((vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx)))
@@ -1021,6 +1029,7 @@ static void avd_stop_streaming(struct vb2_queue *q)
 
 		if (desc->ops->stop)
 			desc->ops->stop(ctx);
+		avd_buf_free(ctx->dev, &ctx->inst);
 
 		/* Drop a job table left over from a frame that never finished. */
 		kvfree(ctx->job.segments);
