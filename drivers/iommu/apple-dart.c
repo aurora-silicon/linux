@@ -7266,8 +7266,9 @@ MODULE_DEVICE_TABLE(of, apple_dart_of_match);
 static int apple_dart_drained(struct apple_dart *dart)
 {
 	u32 params = readl(dart->regs + DART_PARAMS2);
-	unsigned int ports = max(FIELD_GET(DART_T8110_PARAMS2_READ_PORTS, params),
-				 FIELD_GET(DART_T8110_PARAMS2_WRITE_PORTS, params));
+	unsigned int rports = FIELD_GET(DART_T8110_PARAMS2_READ_PORTS, params);
+	unsigned int wports = FIELD_GET(DART_T8110_PARAMS2_WRITE_PORTS, params);
+	unsigned int ports = max(rports, wports);
 
 	if (!ports || ports > 4)
 		return -EIO;
