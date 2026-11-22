@@ -30,7 +30,8 @@ mod bindings { pub const CAP_SYS_NICE:u32=23;
 }
 mod g17 {pub struct Gpu;}
 mod m3 {pub mod m3_drm {
- #[derive(PartialEq)] pub enum Profile {Legacy, Extended}
+ #[derive(PartialEq, Clone, Copy)] pub enum Profile {Legacy, Extended, Extended27}
+ impl Profile {pub const fn extended(self)->bool {matches!(self, Self::Extended | Self::Extended27)}}
  pub struct Soc {pub chip_id:u32}
  pub struct Backend {pub soc:Soc,pub profile:Profile}
  impl Backend {pub fn supports_high_priority(&self)->bool { PREDICATE }}
@@ -50,19 +51,20 @@ fn ordering(priority:u32)->Result<(u8,sched::Priority),i32> {
 fn main() {
  use m3::m3_drm::*;
  let mut n=0;
- for backend in 0..5 { for cap in [false,true] { for master in [false,true] {
+ for backend in 0..6 { for cap in [false,true] { for master in [false,true] {
   let gpu:Box<dyn Any>=match backend {
    0=>Box::new(g17::Gpu),
    1=>Box::new(Backend{soc:Soc{chip_id:0x8122},profile:Profile::Extended}),
    2=>Box::new(Backend{soc:Soc{chip_id:0x8122},profile:Profile::Legacy}),
    3=>Box::new(Backend{soc:Soc{chip_id:0x6030},profile:Profile::Extended}),
+   5=>Box::new(Backend{soc:Soc{chip_id:0x8122},profile:Profile::Extended27}),
    _=>Box::new(())};
   let reg=Reg{gpu:Gpu(gpu)};
   bindings::CAP.with(|c|c.set(cap));
   for flags in [0,1,u32::MAX] { for priority in [0,1,2,3,4,u32::MAX] {
    let expected=if flags!=0 || priority>=3 {Err(EINVAL)}
     else if priority!=2 {Ok(())}
-    else if backend!=0 && !(backend==1 && cfg!(CONFIG_DRM_ASAHI_M3_T8122)) {Err(EINVAL)}
+    else if backend!=0 && !((backend==1 || backend==5) && cfg!(CONFIG_DRM_ASAHI_M3_T8122)) {Err(EINVAL)}
     else if cap||master {Ok(())} else {Err(EACCES)};
    assert_eq!(admit(&reg,&Data{flags,priority},&File(master)),expected,
     "backend={backend} cap={cap} master={master} flags={flags} priority={priority}"); n+=1;

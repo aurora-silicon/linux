@@ -17,7 +17,9 @@ and the idle reclaim became fixed tuning constants instead of module
 parameters (four constants; the tables are unchanged), and when the two stamp
 renumbering margins became tuning constants (the tables are unchanged), and when
 the T6030/T6031 tables were gated on CONFIG_DRM_ASAHI_G15 for the T8122 runtime's
-UAT adoption (two #[cfg] lines; the tables are unchanged). Its T6030
+UAT adoption (two #[cfg] lines; the tables are unchanged), and when the PPL
+magic version 3 constant was added for the T8122 27.2 runtime (two lines; the
+tables are unchanged). Its T6030
 configuration module is
 independently pinned to the original bytes,
 except for the J514S B0 FirmwareBuild row, the J514S cd05 and J516S cd05
@@ -42,7 +44,7 @@ G15 = "drivers/gpu/drm/asahi/g15"
 GOLDEN_FILES = {
     "board/data.rs": "7c5ff1077ca3296cbfc9e7144294162b6dea78a3774c38eeed4b0f59a14d7a5c",
     "board/template.rs": "286872f5474a67534f214e83e659253299f85143f3dc59035fa80894022e2549",
-    "hw.rs": "9fa2d6e5f5d14127574448cafd6523d2151dab77c66d16e74500fafde21e8d92",
+    "hw.rs": "ebd354e9ca97061c3ea64f51803c5fcd45137b2609fdc9d48c6739d2206ca1e5",
     "power/idle.rs": "4928ecf7699b3ca85ff5143eb6e996efd40d47321e29a238a02c8873bc9f102c",
 }
 GOLDEN_FUNCTIONS = {
