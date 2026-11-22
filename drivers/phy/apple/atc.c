@@ -4949,8 +4949,13 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
 	if (atcphy->hw->dp_t8122)
 		return atcphy_dpphy_configure_t8122(atcphy, opts);
 
+	/*
+	 * These PHYs have no drive level control: the lanes keep the levels
+	 * their tunables set up. Tell a drive level request apart from a bad
+	 * one, so the caller can keep the levels it asked for.
+	 */
 	if (opts->set_voltages)
-		return -EINVAL;
+		return -EOPNOTSUPP;
 	if (opts->set_lanes)
 		return -EINVAL;
 
