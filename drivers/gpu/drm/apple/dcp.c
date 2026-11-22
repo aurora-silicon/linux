@@ -6100,31 +6100,25 @@ static bool dcp_ext26_admitted(struct device_node *np)
 }
 
 /*
- * J716c shares the 27.0 endpoint-control wire format, not the J714s normal
- * IOMFB method or panel profile. Establish this before RTKit can receive any
- * application traffic, including traffic that invalidates a later inventory.
+ * Firmware 27 (T6050) sleep endpoint-control transport. Establish this before
+ * RTKit can receive any application traffic, including traffic that invalidates
+ * a later inventory. Admitted for a T6050 DCP/DCPEXT whose firmware 27 method
+ * table has an ID for every call the sleep sends.
  */
 static bool dcp_v27_sleep_transport_supported(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
-	char compat[DCP_FW_VERSION_STR_LEN];
 
 	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
 		return false;
-	if (dcp->v27_j714s)
-		return true;
-	if (!of_machine_is_compatible("apple,j716c") ||
-	    !of_machine_is_compatible("apple,t6050") ||
-	    !(of_device_is_compatible(dev->of_node, "apple,t6050-dcp") ||
+	if (!(of_device_is_compatible(dev->of_node, "apple,t6050-dcp") ||
 	      of_device_is_compatible(dev->of_node, "apple,t6050-dcpext")) ||
 	    !dcp->hw.adopt_live_session ||
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_DEFAULT ||
 	    dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		return false;
 
-	/* The enum also covers later 27.x method tables. */
-	return dcp_read_fw_version(dev, "apple,firmware-compat", compat) >= 0 &&
-	       !strcmp(compat, "27.0.0");
+	return iomfb_v27_sleep_methods_complete(dcp->v27_methods);
 }
 
 /*
