@@ -6055,10 +6055,17 @@ params_done:
 		 of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8142-dart") ||
 		 t8132_display_v27);
+	/*
+	 * The firmware-27 backend runs on the locked roots alone: a DART that
+	 * is not locked, or whose boot loader also handed over reserved tables,
+	 * is not the handoff it was written for. Refuse either, saying which.
+	 */
 	if (t8132_display_v27 && dart->fw_mirror)
 		dev_info(dev, "T8132 internal display DART on the 27.2 image: locked roots kept (mirror)\n");
-	else if (t8132_display_v27)
+	else if (t8132_display_v27 && !dart->locked)
 		dev_err(dev, "T8132 internal display DART on the 27.2 image: NOT locked: refusing\n");
+	else if (t8132_display_v27)
+		dev_err(dev, "T8132 internal display DART on the 27.2 image: locked with a reserved-table handoff: refusing\n");
 	dart->t8132_dcp_v27 = t8132_display_v27;
 	if (t8132_display_v27 && !dart->fw_mirror) {
 		ret = -EINVAL;
