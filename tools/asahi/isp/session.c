@@ -69,6 +69,9 @@ struct apple_isp {
 	bool ipc_quiescing;
 	bool fw_idle;
 	struct delayed_work fw_idle_work;
+	/* Restart after a firmware crash (only with fw_restart; never here). */
+	struct delayed_work fw_recover_work;
+	bool fw_recovering;
 	struct isp_channel *chan_io, *chan_sm, *chan_tm, *chan_bt;
 	struct isp_channel *ipc_stale;
 	bool ipc_failed;
@@ -317,6 +320,7 @@ static unsigned int idle_schedules;
 static unsigned int msecs_to_jiffies(unsigned int ms) { return ms; }
 static bool mod_delayed_work(void *wq, struct delayed_work *work, unsigned int delay)
 {
+	/* The crash recovery is scheduled only for fw_restart firmware. */
 	CHECK(wq == system_dfl_wq && delay == 1000);
 	CHECK(!irq_disabled && !synchronizing->ipc_quiescing);
 	work->scheduled++;
