@@ -3587,6 +3587,16 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		return ret ? ret : drm_mode_equal(&crtc_state->mode, &fixed) ? 0 : -EINVAL;
 	}
 
+	/*
+	 * T6040 S2R: the external link is not back yet, and a mode set now
+	 * leaves the pipe off ("Modeset done, but pipe not enabled") and
+	 * fails.  dcp_poweron() and the flips leave the firmware alone until
+	 * then too; the hotplug worker sets the mode of the CRTC that is
+	 * still active once the link work is through (dcp_t6040_plug_done()).
+	 */
+	if (READ_ONCE(dcp->t6040_relinking))
+		return 0;
+
 	/* Disconnect cannot pass the admission check before these RPCs finish. */
 	guard(mutex)(&dcp->external_lock);
 	if (dcp_is_retained_external(dcp) &&
