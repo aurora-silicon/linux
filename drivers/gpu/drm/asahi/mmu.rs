@@ -506,10 +506,10 @@ fn lock_vm(
 }
 
 #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
-pub(crate) struct VmReadGuard(VmExecGuard);
+pub(crate) struct VmReadGuard<'a>(gpuvm::GpuVmInnerGuard<'a, VmInner>);
 
 #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
-impl VmReadGuard {
+impl VmReadGuard<'_> {
     pub(crate) fn covers_range(&mut self, address: u64, size: u64, read: bool, write: bool) -> bool {
         Vm::covers_range_locked(&mut self.0, address, size, read, write)
     }
@@ -2622,15 +2622,18 @@ impl Vm {
     /// Every page must be mapped GPU-readable and be RAM; otherwise EFAULT. The lines are cleaned
     /// and invalidated to the point of coherency first (never only invalidated: CPU-written lines
     /// may be dirty), so the copy sees what the GPU or a write-combined CPU view stored. The
-    /// mappings cannot change during the copy (GPUVM exec lock).
+    /// mappings cannot change during the copy (VM reservation lock).
     #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
     pub(crate) fn read_user(&self, va: u64, buf: &mut [u8]) -> Result {
         self.read_lock()?.read_user(va, buf)
     }
 
     #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
-    pub(crate) fn read_lock(&self) -> Result<VmReadGuard> {
-        Ok(VmReadGuard(lock_vm(&self.gpuvm, None, false)?))
+    pub(crate) fn read_lock(&self) -> Result<VmReadGuard<'_>> {
+        // Every mapping change holds the VM reservation, so read-only page-table walks and
+        // user-memory copies need only that reservation. The full exec lock would allocate a
+        // `drm_gpuvm_exec` context and lock every external BO, making each submit O(external BOs).
+        Ok(VmReadGuard(self.gpuvm.lock_inner()))
     }
 
     #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
@@ -2650,7 +2653,7 @@ impl Vm {
             }
             let phys = inner.page_table.translate_iova(page).map_err(|_| EFAULT)?;
             // SAFETY: `phys` is checked to be a RAM page; it stays mapped (and its backing pinned)
-            // while the exec lock is held, and is only read here.
+            // while the VM reservation lock is held, and is only read here.
             let ram = unsafe { kernel::page::Page::borrow_phys(&phys) }.ok_or(EFAULT)?;
             let target = &mut buf[done..done + count];
             ram.with_pointer_into_page(within, count, |p| {

@@ -686,6 +686,26 @@ impl SpanBatch {
         }
         Ok(())
     }
+
+    fn flush_locked(&mut self, guard: &mut mmu::VmReadGuard<'_>) -> Result {
+        let n = self.len;
+        if n == 0 {
+            return Ok(());
+        }
+        self.len = 0;
+        for &(first, size, access) in &self.ranges[..n] {
+            let read = access & 1 != 0;
+            let write = access & 2 != 0;
+            if !guard.covers_range(first, size, read, write) {
+                return if guard.covers_range(first, size, false, false) {
+                    Err(EACCES)
+                } else {
+                    Err(ENOENT)
+                };
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Attachment spans, 128-byte granular, actually mapped with `write` or read access.
@@ -740,7 +760,7 @@ fn copy_list(lists: &[&[uapi::drm_asahi_attachment]]) -> Result<KVec<uapi::drm_a
 /// Checks that `[start, end)` (rounded out to pages) is user memory mapped with the requested
 /// GPU access under an already-held [`mmu::VmReadGuard`].
 pub(crate) fn cover_locked(
-    guard: &mut mmu::VmReadGuard,
+    guard: &mut mmu::VmReadGuard<'_>,
     start: u64,
     end: u64,
     read: bool,
@@ -1246,8 +1266,13 @@ impl Prepared {
                 }
             }
         }
-        batch.flush(context.vm)?;
-        gate::vdm_batch(context.vm, &vdm_vas[..vdm_count])?;
+        if vdm_count != 0 {
+            let mut guard = context.vm.read_lock().map_err(|_| EFAULT)?;
+            batch.flush_locked(&mut guard)?;
+            gate::vdm_batch_locked(&mut guard, &vdm_vas[..vdm_count])?;
+        } else {
+            batch.flush(context.vm)?;
+        }
         Ok(Submission {
             counts,
             commands,

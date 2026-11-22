@@ -50,18 +50,17 @@ mod mmu {
         pub regions: Vec<Region>,
         pub lock_calls: std::cell::Cell<usize>,
         pub read_calls: std::cell::Cell<usize>,
+        pub last_read_len: std::cell::Cell<usize>,
     }
-    pub struct VmReadGuard(*const Vm);
-    impl VmReadGuard {
+    pub struct VmReadGuard<'a>(&'a Vm);
+    impl VmReadGuard<'_> {
         pub fn covers_range(&mut self, address: u64, size: u64, _read: bool, _write: bool) -> bool {
-            let vm = unsafe { &*self.0 };
             address
                 .checked_add(size)
-                .is_some_and(|end| vm.contains(address, end))
+                .is_some_and(|end| self.0.contains(address, end))
         }
         pub fn read_user(&mut self, va: u64, out: &mut [u8]) -> Result {
-            let vm = unsafe { &*self.0 };
-            vm.read_user(va, out)
+            self.0.read_user(va, out)
         }
     }
     impl Vm {
@@ -72,12 +71,13 @@ mod mmu {
             self.regions.iter().any(|r| r.readable && va >= r.base
                 && end >= va && end <= r.base + r.bytes.len() as u64)
         }
-        pub fn read_lock(&self) -> Result<VmReadGuard> {
+        pub fn read_lock(&self) -> Result<VmReadGuard<'_>> {
             self.lock_calls.set(self.lock_calls.get() + 1);
-            Ok(VmReadGuard(self as *const Vm))
+            Ok(VmReadGuard(self))
         }
         pub fn read_user(&self, va: u64, out: &mut [u8]) -> Result {
             self.read_calls.set(self.read_calls.get() + 1);
+            self.last_read_len.set(out.len());
             let end = va.checked_add(out.len() as u64).ok_or(EFAULT)?;
             for r in &self.regions {
                 if r.readable && va >= r.base && end <= r.base + r.bytes.len() as u64 {
@@ -102,7 +102,7 @@ mod g16 {
         pub fn reset_cover_calls() { COVER_CALLS.with(|c| c.set(0)); }
         pub fn cover_calls() -> usize { COVER_CALLS.with(Cell::get) }
         pub fn cover_locked(
-            guard: &mut mmu::VmReadGuard,
+            guard: &mut mmu::VmReadGuard<'_>,
             start: u64,
             end: u64,
             read: bool,
@@ -286,11 +286,15 @@ fn pending_signal_interrupts_walk() {
     assert_eq!(result, Err(kernel::prelude::ERESTARTSYS));
     assert!(g16::gate::cdm(&vm, USC, BASE, BASE + 8).is_ok());
 }
+fn vdm_check(vm: &mmu::Vm, vas: &[u64]) -> kernel::prelude::Result {
+    let mut guard = vm.read_lock()?;
+    g16::gate::vdm_batch_locked(&mut guard, vas)
+}
 #[test]
 fn vdm_m4_root_barrier() {
-    assert!(g16::gate::vdm_batch(&vm_for(&[0x21000960]), &[BASE]).is_ok());
+    assert!(vdm_check(&vm_for(&[0x21000960]), &[BASE]).is_ok());
     for word in [0, 0x21000964, 0x40000000] {
-        assert!(g16::gate::vdm_batch(&vm_for(&[word]), &[BASE]).is_err());
+        assert!(vdm_check(&vm_for(&[word]), &[BASE]).is_err());
     }
 }
 #[test]
@@ -306,20 +310,20 @@ fn vdm_batch_shares_lock_caches_window_and_rejects_bad_root() {
     vm.region(BASE, page0);
     vm.region(BASE + 0x4000, page1);
 
-    // Empty batch acquires no VM lock.
-    assert!(g16::gate::vdm_batch(&vm, &[]).is_ok());
-    assert_eq!(vm.lock_calls.get(), 0);
+    // Empty batch performs no reads.
+    assert!(vdm_check(&vm, &[]).is_ok());
     assert_eq!(vm.read_calls.get(), 0);
 
     // Four adjacent VDM roots within 256 bytes share one lock and one read_user.
-    assert!(g16::gate::vdm_batch(&vm, &[BASE, BASE + 0x20, BASE + 0x40, BASE + 0x80]).is_ok());
+    vm.lock_calls.set(0);
+    assert!(vdm_check(&vm, &[BASE, BASE + 0x20, BASE + 0x40, BASE + 0x80]).is_ok());
     assert_eq!(vm.lock_calls.get(), 1);
     assert_eq!(vm.read_calls.get(), 1);
 
     // A bad root inside the same cached 256-byte window is still rejected.
     vm.regions[0].bytes[0x80..0x84].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
     assert_eq!(
-        g16::gate::vdm_batch(&vm, &[BASE, BASE + 0x20, BASE + 0x80]),
+        vdm_check(&vm, &[BASE, BASE + 0x20, BASE + 0x80]),
         Err(kernel::prelude::EINVAL)
     );
     vm.regions[0].bytes[0x80..0x84].copy_from_slice(&root);
@@ -327,7 +331,7 @@ fn vdm_batch_shares_lock_caches_window_and_rejects_bad_root() {
     // Cross-page and end-of-page roots share one lock and never over-read past UAT_PGSZ.
     vm.lock_calls.set(0);
     vm.read_calls.set(0);
-    assert!(g16::gate::vdm_batch(&vm, &[BASE, BASE + 0x3ffc, BASE + 0x4010]).is_ok());
+    assert!(vdm_check(&vm, &[BASE, BASE + 0x3ffc, BASE + 0x4010]).is_ok());
     assert_eq!(vm.lock_calls.get(), 1);
     assert_eq!(vm.read_calls.get(), 3);
 }
@@ -361,6 +365,22 @@ fn cdm_batches_vm_read_lock_and_releases_on_resched() {
     assert_eq!(sched_delta, 3);
     assert_eq!(long_vm.lock_calls.get(), sched_delta);
 }
+#[test]
+fn single_vdm_and_short_cdm_root_minimize_poc_read_len() {
+    let vm = vm_for(&[0x21000960]);
+    assert!(vdm_check(&vm, &[BASE]).is_ok());
+    assert_eq!(vm.lock_calls.get(), 1);
+    assert_eq!(vm.read_calls.get(), 1);
+    assert_eq!(vm.last_read_len.get(), 4);
+
+    let mut words = launch(0, USC, 0);
+    words.push(0x40000000);
+    let cdm_vm = vm_for(&words);
+    assert!(g16::gate::cdm(&cdm_vm, USC, BASE, BASE + words.len() as u64 * 4).is_ok());
+    assert_eq!(cdm_vm.lock_calls.get(), 1);
+    assert_eq!(cdm_vm.read_calls.get(), 1);
+    assert_eq!(cdm_vm.last_read_len.get(), words.len() * 4);
+}
 '''
 
 with tempfile.TemporaryDirectory(prefix='m4-rust-gate-') as directory:
@@ -374,7 +394,7 @@ with tempfile.TemporaryDirectory(prefix='m4-rust-gate-') as directory:
     (OUT / 'stream-gate-host.log').write_text(result.stdout + result.stderr)
     (OUT / 'stream-gate-host.json').write_text(json.dumps({
         'source': str(SOURCE), 'sha256': hashlib.sha256(SOURCE.read_bytes()).hexdigest(),
-        'result': 'pass', 'test_groups': 11,
+        'result': 'pass', 'test_groups': 12,
         'mesa_sources': ['src/asahi/genxml/agx3_cmdstream.h', 'src/asahi/lib/agx3_cdm_decode_core.c',
                          'src/asahi/lib/agx_vdm_barrier_core.c'],
         'limitations': 'Host VM model validates parser, addresses, cycles and interruption; hardware and kernel cache behavior require target tests.'

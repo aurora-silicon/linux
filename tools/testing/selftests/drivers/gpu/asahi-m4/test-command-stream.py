@@ -651,11 +651,20 @@ mod render_admission_tests {
     }
     pub(crate) mod mmu {
         pub(crate) const UAT_PGMSK: usize = 0x3fff;
+        pub(crate) struct VmReadGuard<'a>(&'a Vm);
+        impl VmReadGuard<'_> {
+            pub(crate) fn covers_range(&mut self, start: u64, size: u64, read: bool, write: bool) -> bool {
+                self.0.covers_range(start, size, read, write)
+            }
+        }
         pub(crate) struct Vm {
             pub(crate) maps: Vec<(u64, u64, bool, bool)>,
             pub(crate) batch_calls: std::cell::Cell<usize>,
         }
         impl Vm {
+            pub(crate) fn read_lock(&self) -> super::Result<VmReadGuard<'_>> {
+                Ok(VmReadGuard(self))
+            }
             pub(crate) fn covers_range(&self, start: u64, size: u64, read: bool, write: bool) -> bool {
                 let Some(end) = start.checked_add(size) else { return false };
                 self.maps.iter().any(|&(s, e, r, w)| {
@@ -824,6 +833,11 @@ mod render_admission_tests {
         assert_eq!(vm.batch_calls.get(), 0);
         assert_eq!(batch.flush(&vm), Ok(()));
         assert_eq!(vm.batch_calls.get(), 1);
+        let mut guard = vm.read_lock().unwrap();
+        assert_eq!(check_render(&mut batch, &ctx, &base_cmd(), &[], &[]), Ok(()));
+        assert_eq!(batch.flush_locked(&mut guard), Ok(()));
+        assert_eq!(vm.batch_calls.get(), 1);
+        drop(guard);
 
         // Unmapped or read-only span on a later pass still reports exact ENOENT / EACCES.
         let mut bad_unmapped = base_cmd();

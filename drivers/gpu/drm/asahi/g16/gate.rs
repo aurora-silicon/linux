@@ -57,14 +57,26 @@ struct Window {
 
 impl Window {
     /// The `count` words at `va`, reading whole spans of up to 256 bytes (not past the page
-    /// unless the record crosses it) under an already-held VM read lock. Unreadable memory: EFAULT.
-    fn words(&mut self, guard: &mut mmu::VmReadGuard, va: u64, count: usize) -> Result<[u32; 10]> {
+    /// or an optional root-stream `limit` unless the record crosses it) under an already-held
+    /// VM read lock. Unreadable memory: EFAULT.
+    fn words(
+        &mut self,
+        guard: &mut mmu::VmReadGuard<'_>,
+        va: u64,
+        count: usize,
+        limit: Option<u64>,
+    ) -> Result<[u32; 10]> {
         let n = count.checked_mul(4).filter(|&n| n <= 40).ok_or(EINVAL)?;
         let end = va.checked_add(n as u64).ok_or(EINVAL)?;
         let cached = self.len != 0 && va >= self.va && end <= self.va + self.len as u64;
         if !cached {
             let in_page = mmu::UAT_PGSZ - (va as usize & mmu::UAT_PGMSK);
-            let len = n.max(self.bytes.len().min(in_page));
+            let mut max_len = self.bytes.len().min(in_page);
+            if let Some(limit_va) = limit {
+                let rem = usize::try_from(limit_va.saturating_sub(va)).unwrap_or(usize::MAX);
+                max_len = max_len.min(rem);
+            }
+            let len = n.max(max_len);
             let cover_end = va.checked_add(len as u64).ok_or(EINVAL)?;
             cover_locked(guard, va, cover_end, true, false)?;
             self.len = 0;
@@ -89,7 +101,7 @@ impl Window {
 /// A launch's program: inside the queue's 4 GiB USC window, 64-aligned, first block readable.
 /// `checked` caches the last proven program page.
 fn program(
-    guard: &mut mmu::VmReadGuard,
+    guard: &mut mmu::VmReadGuard<'_>,
     usc: u64,
     address: u64,
     checked: &mut Option<u64>,
@@ -107,22 +119,23 @@ fn program(
     Ok(())
 }
 
-/// VDM admission for a batch of root streams under a single VM read lock, caching up to
-/// 256 intra-page bytes across adjacent VDM roots (for example in a multi-pass render SUBMIT).
-pub(crate) fn vdm_batch(vm: &mmu::Vm, vas: &[u64]) -> Result {
+/// VDM admission for a batch of root streams under an already-held VM read lock.
+/// Reads only the 4-byte root word for a single pass to minimize PoC cache maintenance,
+/// and caches up to 256 intra-page bytes across multi-pass batches.
+pub(crate) fn vdm_batch_locked(guard: &mut mmu::VmReadGuard<'_>, vas: &[u64]) -> Result {
     if vas.is_empty() || !params::stream_gate() {
         return Ok(());
     }
-    let mut guard = vm.read_lock().map_err(|_| EFAULT)?;
     let mut win_va = 0u64;
     let mut win_len = 0usize;
     let mut buf = [0u8; 256];
+    let max_read = if vas.len() == 1 { 4 } else { buf.len() };
     for &va in vas {
         let end = va.checked_add(4).ok_or(EINVAL)?;
         let cached = win_len != 0 && va >= win_va && end <= win_va + win_len as u64;
         if !cached {
             let in_page = mmu::UAT_PGSZ - (va as usize & mmu::UAT_PGMSK);
-            let len = buf.len().min(in_page);
+            let len = max_read.min(in_page);
             if len < 4 {
                 return Err(EINVAL);
             }
@@ -167,7 +180,7 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
     let mut power = 1u64;
     let mut first = true;
     let mut resched = 0;
-    let mut guard: Option<mmu::VmReadGuard> = None;
+    let mut guard: Option<mmu::VmReadGuard<'_>> = None;
     loop {
         if first {
             first = false;
@@ -207,8 +220,9 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
             }
             Ok(())
         };
+        let limit = (!linked).then_some(end);
         root_bytes(va, 4)?;
-        let w = window.words(guard, va, 1)?;
+        let w = window.words(guard, va, 1, limit)?;
         if w[0] == CDM_TERMINATE {
             return Ok(());
         }
@@ -228,7 +242,7 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
         }
         if w[0] & 0xffff0000 == CDM_LINK {
             root_bytes(va, 8)?;
-            let w = window.words(guard, va, 2)?;
+            let w = window.words(guard, va, 2, limit)?;
             let target = (u64::from(w[0] & 0xffff) << 32) | u64::from(w[1]);
             if target & 3 != 0 || target == va {
                 return Err(reject("CDM link", va, &w));
@@ -248,7 +262,7 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
             _ => return Err(reject("CDM launch mode", va, &w)),
         };
         root_bytes(va, (words * 4) as u64)?;
-        let w = window.words(guard, va, words)?;
+        let w = window.words(guard, va, words, limit)?;
         let address = (u64::from(w[1] >> 22) << 38) | (u64::from(w[2]) << 6);
         match program(guard, usc, address, &mut checked) {
             Err(error) if error == EINVAL => return Err(reject("CDM program", va, &w)),
