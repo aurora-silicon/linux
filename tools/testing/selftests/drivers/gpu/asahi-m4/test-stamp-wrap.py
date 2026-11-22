@@ -374,6 +374,56 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     assert_eq!(f.engine.flights[0].job.resources.compute[0].its.reads.get(),2);
     assert_eq!(f.engine.retired_ticks,[0;4]);
 }
+#[test]fn cross_vm_render_hang_recovery_isolates_innocent_client_flight(){
+    // VM A (slot 0, ASID 1) hangs/aborts on render n=30 while innocent VM B (slot 1, ASID 2,
+    // compact stage_ts_mask=0) has a co-resident render n=31 with real FS ticks and independent
+    // allocator slot completion. VM A aborts; VM B retires Full without blame or error.
+    CLOCK.with(|c|c.set(100_000_000));
+    let mut f=firmware(true,30);
+    f.engine.flights[0].job.vm.slot=1;
+    f.engine.flights[0].pb_slot=0;
+    f.engine.flights[0].stage_ts_mask=0;
+    f.engine.flights[0].doomed=true;
+    f.engine.flights[0].recovery_suspect=true;
+    f.engine.flights[0].recovery_started_ns=90_000_000;
+    f.engine.flights[0].job.resources.passes[0].scene=Object::default();
+
+    let mut innocent=firmware(true,31).engine.flights.remove(0);
+    innocent.job.vm.slot=2;
+    innocent.pb_slot=1;
+    innocent.uma_submitted=2;
+    innocent.stage_ts_mask=0;
+    innocent.doomed=false;
+    innocent.recovery_suspect=true;
+    innocent.recovery_started_ns=90_000_000;
+    innocent.job.resources.pools=Pools{full:true,completed:2};
+    innocent.job.resources.passes[0].scene=Object::default();
+    innocent.job.resources.passes[0].scene.set(0x620,400);
+    innocent.job.resources.passes[0].scene.set(0x628,430);
+    f.engine.flights.push(innocent);
+
+    let t31=encode::stamp(31);
+    f.engine.ta_target=t31;
+    f.engine.fs_target=t31;
+    for stage in 0..2 { f.graph.render.fw_stamp[stage].set(0,u64::from(t31)); }
+    f.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(t31));
+    f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(t31));
+    f.graph.render.notifier.set(notifier::CONTEXT,2);
+    f.graph.render.notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,2);
+
+    // After 20 ms recovery grace, hanging VM A aborts on slot 0.
+    CLOCK.with(|c|c.set(110_000_000));
+    let (idx_a,ret_a)=f.retired_flight().unwrap().unwrap();
+    assert_eq!((idx_a,ret_a),(0,Retirement::Aborted));
+    assert!(ret_a.job_failed(f.engine.flights[0].doomed));
+    f.engine.flights.remove(0);
+
+    // Innocent VM B on slot 1 proves FS execution via cold-path FS ticks and retires Full.
+    let (idx_b,ret_b)=f.retired_flight().unwrap().unwrap();
+    assert_eq!((idx_b,ret_b),(0,Retirement::Full));
+    assert!(!f.engine.flights[0].doomed);
+    assert!(!ret_b.job_failed(f.engine.flights[0].doomed));
+}
 
 mod queue_proof {
     use super::{Channel, Object, Result, EINVAL};

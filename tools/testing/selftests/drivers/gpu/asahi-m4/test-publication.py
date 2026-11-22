@@ -453,16 +453,18 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         assert_eq!(f.publish_checked(&mut done),Ok(()));
         assert_eq!(f.attempted,[2,3]);
     }
-    #[test]fn alt_bypass_does_not_starve_cross_vm_render_while_compute_overlaps(){
+    #[test]fn alt_bypass_does_not_starve_cold_cross_vm_initbm_while_warm_overlaps(){
         let vm1=mk_vm(1);
         let vm2=mk_vm(2);
         let vm1_active=job_on_vm(1,vm1.clone(),false,0,Ok(()));
-        let vm2_render=job_on_vm(2,vm2.clone(),true,0,Ok(()));
+        let vm2_cold_render=job_on_vm(2,vm2.clone(),true,0,Ok(()));
         let vm1_pending=job_on_vm(3,vm1.clone(),false,0,Ok(()));
         vm1_pending.queue.turn.store(5,Ordering::Relaxed);
-        let mut f=firmware(vec![vm2_render,vm1_pending],vec![(Ok(()),true),(Ok(()),true)]);
+        let mut f=firmware(vec![vm2_cold_render,vm1_pending],vec![(Ok(()),true),(Ok(()),true)]);
         f.engine.flights.push(Flight::new(vm1_active));
         f.allow_behind=true;
+        // Cold cross-VM render (requires InitBM) must drain without starvation.
+        f.pools.block_pipeline_vm=Some(vm2.slot);
         let mut done=vec![];
         assert_eq!(f.publish_checked(&mut done),Ok(()));
         assert!(f.attempted.is_empty());
@@ -470,36 +472,57 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         assert_eq!(f.engine.pending.len(),2);
         f.engine.flights.clear();
         assert_eq!(f.publish_checked(&mut done),Ok(()));
-        // VM2 render publishes first; VM1 compute waits for VM2 render to drain (no cross-VM R<->C overlap).
+        // Once drained, VM2's InitBM render publishes (fl.initbm=true blocks vm1_pending behind it).
         assert_eq!(f.attempted,[2]);
         assert_eq!(f.engine.pending.len(),1);
-        f.engine.flights.clear();
-        assert_eq!(f.publish_checked(&mut done),Ok(()));
-        assert_eq!(f.attempted,[2,3]);
 
-        // Cross-VM compute queues immediately behind another VM's active compute without drain,
-        // but drains behind another VM's active render so compute cannot starve cross-VM FS.
-        let vm1_c=job_on_vm(10,vm1.clone(),false,0,Ok(()));
-        let vm2_c=job_on_vm(11,vm2.clone(),false,0,Ok(()));
+        // Warm cross-VM render queues directly behind another VM's active render with zero hold[0].
+        let vm1_r=job_on_vm(10,vm1.clone(),true,0,Ok(()));
+        let vm2_warm_r=job_on_vm(11,vm2.clone(),true,0,Ok(()));
+        let mut fw=firmware(vec![vm2_warm_r],vec![(Ok(()),true)]);
+        let mut fl=Flight::new(vm1_r);
+        fl.renders=1;
+        fw.engine.flights.push(fl);
+        fw.allow_behind=true;
+        assert_eq!(fw.publish_checked(&mut done),Ok(()));
+        assert_eq!(fw.attempted,[11]);
+        assert_eq!(fw.engine.stats.hold[0],0);
+
+        // Cross-VM compute queues immediately behind another VM's active compute without drain.
+        let vm1_c=job_on_vm(12,vm1.clone(),false,0,Ok(()));
+        let vm2_c=job_on_vm(13,vm2.clone(),false,0,Ok(()));
         let mut fc=firmware(vec![vm2_c],vec![(Ok(()),true)]);
-        let mut fl=Flight::new(vm1_c);
-        fl.computes=1;
-        fc.engine.flights.push(fl);
+        let mut flc=Flight::new(vm1_c);
+        flc.computes=1;
+        fc.engine.flights.push(flc);
         fc.allow_behind=true;
         assert_eq!(fc.publish_checked(&mut done),Ok(()));
-        assert_eq!(fc.attempted,[11]);
+        assert_eq!(fc.attempted,[13]);
         assert_eq!(fc.engine.stats.hold[0],0);
 
-        let vm1_r=job_on_vm(12,vm1,true,0,Ok(()));
-        let vm2_c2=job_on_vm(13,vm2,false,0,Ok(()));
+        // Cross-VM compute drains behind another VM's active render (no cross-VM R<->C overlap).
+        let vm1_r2=job_on_vm(14,vm1.clone(),true,0,Ok(()));
+        let vm2_c2=job_on_vm(15,vm2.clone(),false,0,Ok(()));
         let mut fcr=firmware(vec![vm2_c2],vec![(Ok(()),true)]);
-        let mut flr=Flight::new(vm1_r);
+        let mut flr=Flight::new(vm1_r2);
         flr.renders=1;
         fcr.engine.flights.push(flr);
         fcr.allow_behind=true;
         assert_eq!(fcr.publish_checked(&mut done),Ok(()));
         assert!(fcr.attempted.is_empty());
         assert_eq!(fcr.engine.stats.hold[0],1);
+
+        // Symmetrically, warm cross-VM render drains behind another VM's active compute.
+        let vm1_c2=job_on_vm(16,vm1,false,0,Ok(()));
+        let vm2_r2=job_on_vm(17,vm2,true,0,Ok(()));
+        let mut frc=firmware(vec![vm2_r2],vec![(Ok(()),true)]);
+        let mut flc2=Flight::new(vm1_c2);
+        flc2.computes=1;
+        frc.engine.flights.push(flc2);
+        frc.allow_behind=true;
+        assert_eq!(frc.publish_checked(&mut done),Ok(()));
+        assert!(frc.attempted.is_empty());
+        assert_eq!(frc.engine.stats.hold[0],1);
     }
     #[test]fn alt_bypass_preserves_per_queue_fifo_order(){
         let vm1=mk_vm(1);
@@ -611,10 +634,10 @@ impl QueueBehindSlots{
     fn compute_available(&self,_n:usize)->bool{self.compute_available}
     fn pass_available(&self,_n:usize)->bool{self.pass_available}
 }
-struct QueueBehindPools{exhausted:bool,can_pipeline:bool}
+struct QueueBehindPools{exhausted:bool,can_pipeline:bool,block_pipeline_vm:Option<u32>}
 impl QueueBehindPools{
     fn exhausted(&self)->bool{self.exhausted}
-    fn can_pipeline(&self,_vm:&Arc<Vm>)->bool{self.can_pipeline}
+    fn can_pipeline(&self,vm:&Arc<Vm>)->bool{self.can_pipeline&&self.block_pipeline_vm!=Some(vm.slot)}
     fn can_pipeline_within(&self,vm:&Arc<Vm>,_limit:usize)->bool{self.can_pipeline(vm)}
 }
 struct QueueBehindHost{graph:QueueBehindGraph,engine:QueueBehindEngine,slots:QueueBehindSlots,pools:QueueBehindPools}
@@ -674,7 +697,7 @@ mod queue_behind_scope {
             graph:QueueBehindGraph::new(),
             engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![QueueBehindFlight{job:j1,group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
-            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert!(p.can_queue_behind(&j2));
         // Cross-VM compute queues behind another VM's healthy compute, but drains behind
@@ -720,7 +743,7 @@ mod queue_behind_scope {
             graph:QueueBehindGraph::new(),
             engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![QueueBehindFlight{job:timed,group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
-            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert!(!p.can_queue_behind(&query_copy));
         assert!(p.can_queue_behind(&no_query));
@@ -738,7 +761,7 @@ mod queue_behind_scope {
             graph:QueueBehindGraph::new(),
             engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![QueueBehindFlight{job:timed_render,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
-            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert!(!pr.can_queue_behind(&mk(2,q1.clone(),true,Some(1),None)));
         assert!(pr.can_queue_behind(&mk(2,q1.clone(),false,Some(1),None)));
@@ -762,13 +785,19 @@ mod queue_behind_scope {
             graph:QueueBehindGraph::new(),
             engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
-            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert!(p.can_queue_behind(&r2));
+        // Warm cross-VM render queues behind healthy non-InitBM render; cold InitBM VM drains.
+        assert!(p.can_queue_behind(&r_other_vm));
+        p.pools.block_pipeline_vm=Some(vm2.slot);
         assert!(!p.can_queue_behind(&r_other_vm));
+        assert!(p.needs_engine_drain(&r_other_vm));
+        p.pools.block_pipeline_vm=None;
         assert!(p.can_queue_behind(&c1));
         p.engine.flights[0].initbm=true;
         assert!(!p.can_queue_behind(&r2));
+        assert!(!p.can_queue_behind(&r_other_vm));
         assert!(!p.can_queue_behind(&c1));
         p.engine.flights[0].initbm=false;
         p.pools.can_pipeline=false;
@@ -781,6 +810,48 @@ mod queue_behind_scope {
         p.engine.flights[0].recovery_suspect=true;
         assert!(!p.can_queue_behind(&r2));
         assert!(!p.can_queue_behind(&c1));
+    }
+    #[test]fn cross_vm_render_compute_overlap_matrix(){
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let vm2=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:2});
+        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q2=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,render:bool|Arc::new(QueueBehindJob{
+            id,vm,queue,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
+            order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:u64::from(id),wait_through:[None,None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+        });
+        let vm1_r=mk(1,vm1.clone(),q1.clone(),true);
+        let vm1_c=mk(2,vm1.clone(),q1.clone(),false);
+        let vm2_r=mk(3,vm2.clone(),q2.clone(),true);
+        let vm2_c=mk(4,vm2.clone(),q2.clone(),false);
+        let mk_flight=|job:Arc<QueueBehindJob>,c:u32,r:u32|QueueBehindFlight{
+            job,group:vec![],first:0,count:1,computes:c,renders:r,
+            target:if c!=0{0x100}else{0},cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},
+            fs_target:if r!=0{0x200}else{0},initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
+        };
+        let mut p=QueueBehindHost{
+            graph:QueueBehindGraph::new(),
+            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![mk_flight(vm1_r.clone(),0,1)]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
+        };
+        // Active VM1 Render: same-VM R & C allowed; cross-VM R allowed; cross-VM C blocked + drains.
+        assert!(p.can_queue_behind(&vm1_r) && !p.needs_engine_drain(&vm1_r));
+        assert!(p.can_queue_behind(&vm1_c) && !p.needs_engine_drain(&vm1_c));
+        assert!(p.can_queue_behind(&vm2_r) && !p.needs_engine_drain(&vm2_r));
+        assert!(!p.can_queue_behind(&vm2_c) && p.needs_engine_drain(&vm2_c));
+        // Active VM1 Compute: same-VM R & C allowed; cross-VM C allowed; cross-VM R blocked + drains.
+        p.engine.flights=vec![mk_flight(vm1_c.clone(),1,0)];
+        assert!(p.can_queue_behind(&vm1_r) && !p.needs_engine_drain(&vm1_r));
+        assert!(p.can_queue_behind(&vm1_c) && !p.needs_engine_drain(&vm1_c));
+        assert!(p.can_queue_behind(&vm2_c) && !p.needs_engine_drain(&vm2_c));
+        assert!(!p.can_queue_behind(&vm2_r) && p.needs_engine_drain(&vm2_r));
+        // Mixed active VM1 Render + VM1 Compute: both cross-VM R and cross-VM C blocked + drain.
+        p.engine.flights=vec![mk_flight(vm1_r.clone(),0,1),mk_flight(vm1_c.clone(),1,0)];
+        assert!(!p.can_queue_behind(&vm2_r) && p.needs_engine_drain(&vm2_r));
+        assert!(!p.can_queue_behind(&vm2_c) && p.needs_engine_drain(&vm2_c));
     }
     #[test]fn cross_engine_wait_resolves_barriers_and_skips_no_barrier_or_retired(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
@@ -805,7 +876,7 @@ mod queue_behind_scope {
                 QueueBehindFlight{job:c1.clone(),group:vec![],first:0,count:1,computes:1,renders:0,target:0x700,cstamp:{let mut a=[0;16];a[0]=0x700;a},r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
             ]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
-            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Same-queue FS -> CDM barrier resolves render's fs_target; CDM -> TA resolves compute's target.
         assert_eq!(p.cross_engine_wait(&c1,0,command::RENDER),Ok(Some(WaitTarget{stamp:0x500,initbm:false})));
@@ -841,7 +912,7 @@ mod queue_behind_scope {
                 QueueBehindFlight{job:multi_c,group:vec![],first:0,count:3,computes:3,renders:0,target:0x300,cstamp,r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
             ]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
-            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert_eq!(pm.cross_engine_wait(&r_wait_c2,0,command::COMPUTE),Ok(Some(WaitTarget{stamp:0x200,initbm:false})));
         assert_eq!(pm.cross_engine_wait(&r_wait_c3,0,command::COMPUTE),Ok(Some(WaitTarget{stamp:0x300,initbm:false})));
@@ -876,7 +947,7 @@ mod queue_behind_scope {
                 initbm:true,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
-            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         let fs2c = host.cross_engine_wait(&c_after_r, 0, command::RENDER).unwrap().unwrap();
         assert_eq!(fs2c, WaitTarget { stamp: 0x900, initbm: true });
@@ -921,7 +992,7 @@ mod queue_behind_scope {
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
-            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Queue 1 render queues directly behind Queue 0 compute on the same VM with no cross-engine barrier.
         assert!(p.can_queue_behind(&r_job));
@@ -959,7 +1030,7 @@ mod queue_behind_scope {
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
-            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert_eq!(p.cross_engine_wait(&r_wait_c2,0,command::COMPUTE),Ok(Some(WaitTarget{stamp:0x200,initbm:false})));
         assert_eq!(p.cross_engine_wait(&r_wait_c3,0,command::COMPUTE),Ok(Some(WaitTarget{stamp:0x300,initbm:false})));
@@ -999,7 +1070,7 @@ mod queue_behind_scope {
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
-            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Lookup into published multi-pass render flight resolves interior and tail passes.
         assert_eq!(p.wait_stamp_for(&next_r,command::RENDER,Some(1)),Ok(Some(WaitTarget{stamp:0x100,initbm:false})));
@@ -1068,7 +1139,7 @@ mod queue_behind_scope {
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
-            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Below TA_WAVE_PASSES (2 < 3): zero WC fw_stamp reads.
         assert_eq!(p.ta_pending_passes(),2);
@@ -1113,18 +1184,21 @@ mod queue_behind_scope {
                 initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
-            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Not blocked on slots when pass_available is true and render_flights has headroom.
         assert!(!p.blocked_on_slot_headroom(&r_same));
         // Waiting on CPU timestamp publish (query_access) is NOT a slot-headroom block.
         assert!(!p.can_queue_behind(&c_ts_wait));
         assert!(!p.blocked_on_slot_headroom(&c_ts_wait));
-        // Render pass slot exhaustion IS a slot-headroom block for a ready same-VM render...
+        // Render pass slot exhaustion IS a slot-headroom block for ready same-VM and warm cross-VM renders...
         p.slots.pass_available=false;
         assert!(p.blocked_on_slot_headroom(&r_same));
-        // ...but NOT for cross-VM, external-fence, or InitBM/PB-unprimed jobs.
+        assert!(p.blocked_on_slot_headroom(&r_cross_vm));
+        // ...but NOT for cold InitBM cross-VM, external-fence, or live-InitBM jobs.
+        p.pools.block_pipeline_vm=Some(vm2.slot);
         assert!(!p.blocked_on_slot_headroom(&r_cross_vm));
+        p.pools.block_pipeline_vm=None;
         assert!(!p.blocked_on_slot_headroom(&r_ext_fence));
         p.pools.can_pipeline=false;
         assert!(!p.blocked_on_slot_headroom(&r_same));
@@ -1137,12 +1211,14 @@ mod queue_behind_scope {
         p.engine.flights[0].renders=47;
         assert!(p.blocked_on_slot_headroom(&r_same));
 
-        // End-to-end publish_checked: cross-VM drain leaves slot_wait=false; same-VM slot block sets slot_wait=true.
+        // End-to-end publish_checked: cold InitBM cross-VM drain leaves slot_wait=false;
+        // warm render slot block sets slot_wait=true.
         let v1=mk_vm(1);
         let v2=mk_vm(2);
-        let mut fc=firmware(vec![job_on_vm(2,v2,true,0,Ok(()))],vec![]);
+        let mut fc=firmware(vec![job_on_vm(2,v2.clone(),true,0,Ok(()))],vec![]);
         fc.engine.flights.push(super::Flight::new(job_on_vm(1,v1.clone(),true,0,Ok(()))));
         fc.allow_behind=true;
+        fc.pools.block_pipeline_vm=Some(v2.slot);
         let mut done=vec![];
         assert_eq!(fc.publish_checked(&mut done),Ok(()));
         assert!(!fc.engine.slot_wait);
@@ -1157,10 +1233,10 @@ mod queue_behind_scope {
     #[test]fn staged_render_barriers_split_ta_and_fs_compute_and_render_waits(){
         const FRAG: u32 = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
         const STAGED: u32 = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
-        // 1. Cross-VM / InitBM / empty render pipe (`class_behind = false`): zero render barriers,
+        // 1. Cold InitBM / empty render pipe (`class_behind = false`): zero render barriers,
         //    compute->FS-only wait routes directly to fs_compute_barrier.
         assert_eq!(
-            plan_render_barriers(STAGED, false, true, 0, None, None, [None, Some(0x700)]),
+            plan_render_barriers(STAGED, false, true, 0, None, None, [None, Some(0x700)], false),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: false,
@@ -1176,7 +1252,7 @@ mod queue_behind_scope {
         //    ZERO FS->FS barriers (only own_barrier on FS).
         for flags in [0u32, FRAG, STAGED] {
             assert_eq!(
-                plan_render_barriers(flags, true, true, 0x200, None, None, [None, None]),
+                plan_render_barriers(flags, true, true, 0x200, None, None, [None, None], false),
                 RenderBarrierPlan {
                     early: true,
                     ta_prev_wait: true,
@@ -1198,6 +1274,7 @@ mod queue_behind_scope {
                 Some(0x200),
                 None,
                 [Some(0x700), Some(0x700)],
+                false,
             ),
             RenderBarrierPlan {
                 early: true,
@@ -1219,6 +1296,7 @@ mod queue_behind_scope {
                 None,
                 None,
                 [Some(0x600), Some(0x700)],
+                false,
             ),
             RenderBarrierPlan {
                 early: true,
@@ -1240,6 +1318,7 @@ mod queue_behind_scope {
                 Some(0x200),
                 Some(0x100),
                 [None, None],
+                false,
             ),
             RenderBarrierPlan {
                 early: true,
@@ -1262,6 +1341,7 @@ mod queue_behind_scope {
                 Some(0x100),
                 Some(0x100),
                 [None, None],
+                false,
             ),
             RenderBarrierPlan {
                 early: true,
@@ -1284,6 +1364,7 @@ mod queue_behind_scope {
                 Some(0x200),
                 Some(0x200),
                 [None, None],
+                false,
             ),
             RenderBarrierPlan {
                 early: false,
@@ -1305,6 +1386,7 @@ mod queue_behind_scope {
                 Some(0x200),
                 None,
                 [Some(0x700), Some(0x700)],
+                false,
             ),
             RenderBarrierPlan {
                 early: true,
@@ -1318,7 +1400,7 @@ mod queue_behind_scope {
         // 9. Legacy dependent render (flags = 0, fs_wait_render = Some(0x200)):
         //    TA waits on 0x200 (FS->TA, dominating prev_ta); prev_barrier and fs_dep omitted.
         assert_eq!(
-            plan_render_barriers(0, true, true, 0x200, Some(0x200), None, [None, None]),
+            plan_render_barriers(0, true, true, 0x200, Some(0x200), None, [None, None], false),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: false,
@@ -1331,7 +1413,7 @@ mod queue_behind_scope {
         // 10. Legacy dependent render waiting on an older FS (0x100 != prev_fs 0x200):
         //     TA still needs prev_barrier on the shared PB in addition to ta_fs_wait(0x100).
         assert_eq!(
-            plan_render_barriers(0, true, true, 0x200, Some(0x100), None, [None, None]),
+            plan_render_barriers(0, true, true, 0x200, Some(0x100), None, [None, None], false),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: true,
@@ -1344,7 +1426,50 @@ mod queue_behind_scope {
         // 11. Conservative `early_tiling = false` serializes TA behind prev_fs even when
         //     fs_wait_render is None, dominating prev_ta and omitting fs_dep.
         assert_eq!(
-            plan_render_barriers(FRAG, true, false, 0x200, None, None, [None, None]),
+            plan_render_barriers(FRAG, true, false, 0x200, None, None, [None, None], false),
+            RenderBarrierPlan {
+                early: false,
+                ta_prev_wait: false,
+                ta_fs_wait: Some(0x200),
+                fs_render_wait: None,
+                ta_compute_wait: None,
+                fs_compute_wait: None,
+            }
+        );
+        // 12. Cross-VM warm render behind another VM's render (`cross_vm_prev = true`, no
+        //     own-queue render barrier): TA runs early behind prev_ta (overlapping VM A's FS)
+        //     for all flag styles (legacy/FRAG/STAGED) while FS ALWAYS waits on prev_fs (0x200).
+        for flags in [0u32, FRAG, STAGED] {
+            assert_eq!(
+                plan_render_barriers(flags, true, true, 0x200, None, None, [None, None], true),
+                RenderBarrierPlan {
+                    early: true,
+                    ta_prev_wait: true,
+                    ta_fs_wait: None,
+                    fs_render_wait: Some(0x200),
+                    ta_compute_wait: None,
+                    fs_compute_wait: None,
+                }
+            );
+        }
+        // 13. Cross-VM legacy render that also has an own-queue barrier on an older FS (0x100):
+        //     TA waits on own older FS (0x100) and prev_ta, while FS still waits on cross-VM
+        //     prev_fs (0x200) so two VMs' FS/PB teardowns never overlap.
+        assert_eq!(
+            plan_render_barriers(0, true, true, 0x200, Some(0x100), None, [None, None], true),
+            RenderBarrierPlan {
+                early: false,
+                ta_prev_wait: true,
+                ta_fs_wait: Some(0x100),
+                fs_render_wait: Some(0x200),
+                ta_compute_wait: None,
+                fs_compute_wait: None,
+            }
+        );
+        // 14. Cross-VM with `early_tiling = false`: TA already waits on prev_fs, so fs_dep
+        //     is dominated and omitted.
+        assert_eq!(
+            plan_render_barriers(STAGED, true, false, 0x200, None, None, [None, None], true),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: false,
@@ -1870,6 +1995,37 @@ mod compute_horizon_scope {
         assert!(fw.engine.flights[0].doomed);
         assert!(fw.engine.flights[0].recovery_suspect);
         // VM 2's co-resident compute is suspect-only (checked via hardware ITS ticks), NEVER doomed!
+        assert!(!fw.engine.flights[1].doomed);
+        assert!(fw.engine.flights[1].recovery_suspect);
+
+        // Two co-resident cross-VM renders: VM 1 faults on FS 0x100 while VM 2 has live render 0x200.
+        let mut r2_ta = [0u32; 16];
+        let mut r2_fs = [0u32; 16];
+        r2_ta[0] = 0x200; r2_fs[0] = 0x200;
+        fw.engine.flights[0].doomed = false;
+        fw.engine.flights[0].recovery_suspect = false;
+        fw.engine.flights[1] = RecFlight {
+            job: RecJob { vm: RecVm { slot: 2 }, resources: Resources { passes: vec![] } },
+            claims: RecClaims { pass: [0; 16] },
+            computes: 0,
+            renders: 1,
+            target: 0,
+            ta_target: 0x200,
+            fs_target: 0x200,
+            cstamp: [0; 16],
+            r_ta_stamp: r2_ta,
+            r_fs_stamp: r2_fs,
+            doomed: false,
+            recovery_suspect: false,
+            recovery_started_ns: 0,
+            gate_passed_ns: None,
+            unsettled_polls: 0,
+        };
+        fw.engine.ta_target = 0x200;
+        fw.engine.fs_target = 0x200;
+        assert_eq!(fw.recovery_prepare(1, 0x71, 0x100, [0x200, 0, 0]), Ok(()));
+        assert_eq!(fw.recovery_prepare_suspects([0x200, 0, 0], 0x71, Some(1)), Ok(()));
+        assert!(fw.engine.flights[0].doomed);
         assert!(!fw.engine.flights[1].doomed);
         assert!(fw.engine.flights[1].recovery_suspect);
     }

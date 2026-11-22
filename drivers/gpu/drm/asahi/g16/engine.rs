@@ -176,13 +176,21 @@ struct RenderBarrierPlan {
 }
 
 /// Computes TA/FS hardware ring barriers for a render command from its flags, prior render
-/// FS stamp, resolved render waits (`fs_wait_render`, `ta_wait_fs`), and resolved `[ta, fs]`
-/// compute wait stamps.
+/// FS stamp, resolved render waits (`fs_wait_render`, `ta_wait_fs`), resolved `[ta, fs]`
+/// compute wait stamps, and whether the immediately preceding in-flight render belongs to a
+/// different VM (`cross_vm_prev`).
 ///
-/// Pipelined renders share one parameter-buffer / UMA epoch (`RENDER_UMA_SLOT`), so TA(N)
-/// must still wait on TA(N-1) (`ta_prev_wait`, matching G15's `prev_barrier`) whenever
+/// Same-VM pipelined renders share one parameter-buffer / UMA slot, and cross-VM pipelined
+/// renders use distinct UMA slots (`RENDER_UMA_SLOT + slot`) on the shared TA/FS pipes: TA(N)
+/// always waits on TA(N-1) (`ta_prev_wait`, matching G15's `prev_barrier`) whenever
 /// `ta_fs_wait` does not already wait on `prev_fs` (which dominates `prev_ta` via
-/// `own_barrier`). Independent FS passes still omit `fs_dep`.
+/// `own_barrier`). Same-VM independent FS passes omit `fs_dep`, while `cross_vm_prev` forces
+/// `fs_render_wait = Some(prev_fs)` (whenever `ta_fs_wait != Some(prev_fs)`) so cross-VM TA
+/// overlaps the previous VM's FS without ever overlapping two VMs' FS/PB teardowns.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Pure barrier-plan helper mirrors the exact render barrier inputs."
+)]
 fn plan_render_barriers(
     flags: u32,
     class_behind: bool,
@@ -191,6 +199,7 @@ fn plan_render_barriers(
     fs_wait_render: Option<u32>,
     ta_wait_fs: Option<u32>,
     compute_waits: [Option<u32>; 2],
+    cross_vm_prev: bool,
 ) -> RenderBarrierPlan {
     let staged =
         flags & kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES != 0;
@@ -220,8 +229,16 @@ fn plan_render_barriers(
         None
     };
     let ta_prev_wait = class_behind && ta_fs_wait != Some(prev_fs);
-    let fs_render_wait = if class_behind && early && fs_wait_render != ta_fs_wait {
+    let effective_fs_wait = if cross_vm_prev && class_behind {
+        Some(prev_fs)
+    } else {
         fs_wait_render
+    };
+    let fs_render_wait = if class_behind
+        && (early || (cross_vm_prev && ta_fs_wait != Some(prev_fs)))
+        && effective_fs_wait != ta_fs_wait
+    {
+        effective_fs_wait
     } else {
         None
     };
@@ -952,13 +969,13 @@ impl Firmware {
             };
             let mut job = self.engine.pending[index].clone();
             // Even a failed job may have an earlier command in flight. An aggregate
-            // error fence must not race that command's access to user buffers: only
-            // healthy non-InitBM commands (cross-VM compute or same-VM render) queue
-            // behind active flights; when the head queue cannot queue behind (e.g. its
-            // class hit its flight cap), still allow another ready queue to run
-            // concurrently while preserving per-queue FIFO, unless the head job itself
-            // requires `flights` to drain to empty first (cross-VM render switch,
-            // unprimed InitBM render, failed VM, or recovery/InitBM in flight).
+            // error fence must not race that command's access to user buffers: healthy
+            // non-InitBM commands (compute or warm-PB render of any VM) queue behind
+            // active flights; when the head queue cannot queue behind (e.g. its class
+            // hit its flight cap), still allow another ready queue to run concurrently
+            // while preserving per-queue FIFO, unless the head job itself requires
+            // `flights` to drain to empty first (unprimed cold InitBM render, failed
+            // VM, or recovery/InitBM in flight).
             if !self.engine.flights.is_empty() && !self.can_queue_behind(&job) {
                 if self.needs_engine_drain(&job) {
                     self.engine.stats.hold[0] += 1;
@@ -1237,7 +1254,7 @@ impl Firmware {
                 f.doomed
                     || f.recovery_suspect
                     || f.initbm
-                    || ((is_render || (is_compute && f.renders != 0))
+                    || (((is_compute && f.renders != 0) || (is_render && f.computes != 0))
                         && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
             || (is_render
@@ -1247,9 +1264,9 @@ impl Firmware {
                     .is_ok_and(|n| self.pools.can_pipeline_within(&job.vm, n)))
     }
 
-    /// Whether `job` is ready to run on the same VM but currently blocked solely on
-    /// flight-depth or pass/compute-slot headroom (not on cross-VM/InitBM/recovery drain,
-    /// external sync dependencies, or CPU timestamp-publish waits).
+    /// Whether `job` is ready to run without an engine drain but currently blocked solely on
+    /// flight-depth or pass/compute-slot headroom (not on InitBM/recovery drain, external sync
+    /// dependencies, or CPU timestamp-publish waits).
     fn blocked_on_slot_headroom(&self, job: &Arc<Job>) -> bool {
         let e = &self.engine;
         if e.flights.is_empty() || self.needs_engine_drain(job) {
@@ -1322,28 +1339,26 @@ impl Firmware {
     ///   `ComputeSlot` and hardware UMA slot (`COMPUTE_UMA_SLOT + index`), unless `query_access`
     ///   is set and a same-queue predecessor in its compute or render barrier prefix has
     ///   CPU-published timestamp outputs that have not retired yet
-    ///   (`DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS` clears `query_access`). Cross-VM compute never
-    ///   overlaps an active render of another VM so long compute dispatches cannot starve
-    ///   another client's fragment shading into a firmware DM1 timeout.
-    /// - Render queues behind healthy same-VM non-InitBM render and/or compute flights (up to
-    ///   [`params::render_flights`] active renders), rotating `PassSlot` (`0..RENDER_SLOTS`)
-    ///   while sharing the active exposed PB/UMA allocator slot (`Pools::can_pipeline`).
-    ///   Hardware barriers on the CDM/TA/FS rings preserve exact same-engine and cross-engine
-    ///   ordering while barrier-free or independent-queue compute and render run concurrently.
-    /// - Cross-VM render switches, InitBM priming renders, and every failure or recovery path
+    ///   (`DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS` clears `query_access`).
+    /// - Render queues behind healthy non-InitBM render flights of any VM or same-VM compute
+    ///   flights (up to [`params::render_flights`] active renders), rotating `PassSlot`
+    ///   (`0..RENDER_SLOTS`) while reusing that VM's warm PB/UMA allocator slot
+    ///   (`Pools::can_pipeline_within`, each owning its own hardware UMA slot
+    ///   `RENDER_UMA_SLOT + slot`). Hardware barriers on the CDM/TA/FS rings preserve exact
+    ///   same-engine, cross-engine, and cross-VM FS ordering while allowing cross-VM TA to
+    ///   overlap the preceding VM's FS.
+    /// - Cross-VM compute/render overlap is disallowed in both directions so a long compute
+    ///   dispatch from one client cannot starve another client's fragment shading into a
+    ///   firmware DM1 timeout. Cold InitBM priming renders and every failure or recovery path
     ///   still drain the engine first.
     fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
         let e = &self.engine;
         let sent = job.progress.sent();
-        let is_render = matches!(command(job, sent), Some(Command::Render(_)));
         if job.vm.status.get() != 0
             || e.flights.len() >= super::hw::sizes::FLIGHTS
-            || e.flights.iter().any(|f| {
-                f.doomed
-                    || f.recovery_suspect
-                    || f.initbm
-                    || (is_render && !Arc::ptr_eq(&f.job.vm, &job.vm))
-            })
+            || e.flights
+                .iter()
+                .any(|f| f.doomed || f.recovery_suspect || f.initbm)
         {
             return false;
         }
@@ -1392,8 +1407,13 @@ impl Firmware {
                         .is_ok_and(|units| self.slots.compute_available(units))
             }
             Some(Command::Render(_)) => {
+                let cross_vm_compute = e
+                    .flights
+                    .iter()
+                    .any(|f| f.computes != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
                 let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
-                render_count < params::render_flights()
+                !cross_vm_compute
+                    && render_count < params::render_flights()
                     && self.ta_pending_passes() < super::hw::sizes::TA_WAVE_PASSES
                     && !self.slots.render_exhausted()
                     && !self.pools.exhausted()
@@ -2641,6 +2661,15 @@ impl Firmware {
         } else {
             None
         };
+        let cross_vm_prev = member == 0
+            && class_behind
+            && self
+                .engine
+                .flights
+                .iter()
+                .rev()
+                .find(|fl| fl.renders != 0)
+                .is_some_and(|fl| !Arc::ptr_eq(&fl.job.vm, &job.vm));
         let plan = plan_render_barriers(
             cmd.cmd.flags,
             has_prior_render,
@@ -2652,6 +2681,7 @@ impl Firmware {
                 ta_wait_compute.map(|w| w.stamp),
                 fs_wait_compute.map(|w| w.stamp),
             ],
+            cross_vm_prev,
         );
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
         self.slots
@@ -2663,8 +2693,9 @@ impl Firmware {
                 .pools
                 .pick_slot_within(&job.vm, behind, pb_slots)
                 .ok_or(EAGAIN)?;
+            let slot_pipelined = self.pools.slot_inflight(alloc_slot) > 0;
             let (refs, init_buffer, epoch, binding) =
-                self.render_refs(alloc_slot, job, draw, class_behind, behind)?;
+                self.render_refs(alloc_slot, job, draw, slot_pipelined, behind)?;
             f.pb = Some(epoch);
             f.pb_slot = alloc_slot as u32;
             f.pb_binding = binding;
@@ -2777,11 +2808,11 @@ impl Firmware {
             r.ring[0].w64(8 * pf.ta_head as usize, epoch.initbm.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
         }
-        // Pipelined same-VM render->render and cross-engine (CDM->TA, CDM->FS) barriers use
+        // Pipelined render->render and cross-engine (CDM->TA, CDM->FS) barriers use
         // `BarrierType::Stamp` (type 0) only when neither producer, any live flight, nor this
         // consumer carries `InitBM`: G16 `FINALIZE` flushes producer caches before advancing
         // `fw_stamp` (unlike G15's `CROSS_ENGINE_HOLD`; see `cross_engine_barrier_type`).
-        // Cross-VM transitions and recovery paths drain completely before publishing.
+        // Cold `InitBM` transitions and recovery paths drain completely before publishing.
         let producer_initbm = pf.initbm
             || self.engine.flights.iter().any(|fl| fl.initbm)
             || ta_wait_compute.is_some_and(|w| w.initbm)
@@ -2789,11 +2820,11 @@ impl Firmware {
             || fs_wait_render.is_some_and(|w| w.initbm)
             || ta_wait_fs.is_some_and(|w| w.initbm);
         let render_bar = cross_engine_barrier_type(producer_initbm, init_buffer);
-        // Pipelined renders share one parameter-buffer / UMA epoch (`RENDER_UMA_SLOT`), so keep
+        // Pipelined renders share TA/FS pipes across same-VM and cross-VM flights, so keep
         // the TA(N-1)->TA(N) `prev_barrier` (matching G15) whenever `plan.ta_fs_wait` does not
         // already serialize behind `prev_fs`. Emit `ta_fs_barrier` only when `plan.ta_fs_wait`
-        // names an in-flight FS stamp, and `fs_dep` only when `plan.fs_render_wait` names an
-        // in-flight FS dependency not already dominated by TA.
+        // names an in-flight FS stamp, and `fs_dep` when `plan.fs_render_wait` names an
+        // in-flight FS dependency (or cross-VM `prev_fs`) not already dominated by TA.
         if plan.ta_prev_wait {
             let prev = encode::barrier(
                 r.fw_stamp[0].va,
