@@ -73,10 +73,26 @@ struct apple_drm_private {
 	bool s2r_skipped;
 	/* A dark wake left the outputs as the suspend did, for the next resume. */
 	bool dark_held;
-	struct notifier_block pm_nb;
+	/* On apple_drm_pm_list while bound, for the system-sleep notifier. */
+	struct list_head pm_node;
 };
 
 static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data);
+
+/*
+ * One system-sleep notifier for every bound display subsystem, registered at
+ * module init. Registering it from the component bind would take the PM
+ * notifier chain's rwsem under component_mutex, while a PM notifier that
+ * takes a lock held around a component_add() (as the Apple CIO driver's does
+ * with its device lock, which it holds while populating the NHI) closes a
+ * cycle: component_mutex -> pm_chain_head.rwsem -> acio->lock ->
+ * component_mutex. apple_drm_pm_lock is a leaf below both.
+ */
+static DEFINE_MUTEX(apple_drm_pm_lock);
+static LIST_HEAD(apple_drm_pm_list);
+static struct notifier_block apple_drm_pm_nb = {
+	.notifier_call = apple_drm_pm_notify,
+};
 
 /* Component readiness is later than platform probe/bind. */
 static DEFINE_MUTEX(apple_g15_display_lock);
@@ -1713,6 +1729,7 @@ static int apple_drm_init(struct device *dev)
 	if (IS_ERR(apple))
 		return PTR_ERR(apple);
 
+	INIT_LIST_HEAD(&apple->pm_node);
 	dev_set_drvdata(dev, apple);
 
 	ret = drmm_mode_config_init(&apple->drm);
@@ -1855,8 +1872,9 @@ static int apple_drm_init(struct device *dev)
 		goto err_unbind;
 	}
 
-	apple->pm_nb.notifier_call = apple_drm_pm_notify;
-	register_pm_notifier(&apple->pm_nb);
+	mutex_lock(&apple_drm_pm_lock);
+	list_add_tail(&apple->pm_node, &apple_drm_pm_list);
+	mutex_unlock(&apple_drm_pm_lock);
 
 	return 0;
 
@@ -1881,7 +1899,9 @@ static void apple_drm_uninit(struct device *dev)
 	if (apple->aborted)
 		return;
 
-	unregister_pm_notifier(&apple->pm_nb);
+	mutex_lock(&apple_drm_pm_lock);
+	list_del_init(&apple->pm_node);
+	mutex_unlock(&apple_drm_pm_lock);
 
 	/* Before anything of the DRM device is torn down. */
 	t8132_ext_drm_fini(&apple->drm);
@@ -2105,12 +2125,19 @@ static void apple_platform_complete(struct device *dev)
 /* It failed before ->prepare() reached this device, so ->complete() didn't run either. */
 static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
 {
-	struct apple_drm_private *apple = container_of(nb, struct apple_drm_private, pm_nb);
+	struct apple_drm_private *apple;
 
-	if (action == PM_POST_SUSPEND && apple->dark_held) {
-		dev_warn(apple->drm.dev, "dark wake over without a resume: outputs back now\n");
-		apple_drm_resume_outputs(apple);
+	if (action != PM_POST_SUSPEND)
+		return NOTIFY_DONE;
+
+	mutex_lock(&apple_drm_pm_lock);
+	list_for_each_entry(apple, &apple_drm_pm_list, pm_node) {
+		if (apple->dark_held) {
+			dev_warn(apple->drm.dev, "dark wake over without a resume: outputs back now\n");
+			apple_drm_resume_outputs(apple);
+		}
 	}
+	mutex_unlock(&apple_drm_pm_lock);
 
 	return NOTIFY_DONE;
 }
@@ -2163,9 +2190,11 @@ static int __init appledrm_register(void)
 	ret = dcp_register();
 	if (ret)
 		goto unregister_audio;
+	register_pm_notifier(&apple_drm_pm_nb);
 	ret = platform_driver_register(&apple_platform_driver);
 	if (!ret)
 		return 0;
+	unregister_pm_notifier(&apple_drm_pm_nb);
 	dcp_unregister();
 unregister_audio:
 	apple_j613_display_fail();
@@ -2183,6 +2212,7 @@ static void __exit appledrm_unregister(void)
 #endif
 	dcp_unregister();
 	platform_driver_unregister(&apple_platform_driver);
+	unregister_pm_notifier(&apple_drm_pm_nb);
 }
 
 module_init(appledrm_register);
