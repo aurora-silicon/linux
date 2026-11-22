@@ -1600,7 +1600,8 @@ impl SepData {
             None => Err(ENODEV),
         }?;
         self.sleep_hold_rx();
-        dev_dbg!(self.dev, "SEP SLEEP staged for the irreversible commit\n");
+        // TRIAL ONLY (not for #2572): visible on the trial console, before the link's cut.
+        dev_info!(self.dev, "SEP SLEEP staged for the irreversible commit\n");
         Ok(())
     }
 
