@@ -20,6 +20,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
+#include <linux/percpu.h>
 #include <linux/platform_device.h>
 #include <linux/pm_qos.h>
 #include <linux/soc/apple/cpufreq-thermal.h>
@@ -28,11 +29,11 @@
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-power-policy.h>
 #include <linux/soc/apple/t8132.h>
-#include <linux/suspend.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
 #include "apple-pmp-confirm.h"
+#include "apple-pmp-hold.h"
 
 /* Fast raw protection and ordinary governor regulation have separate clocks.
  * No sysfs read advances either controller. Thresholds remain a development
@@ -68,10 +69,11 @@ static struct {
 	bool enabled;
 	long cached_mc;
 	int cached_error;
-	/* The last reading from a sensor that was valid, and when. */
-	u64 valid_ns;
-	long valid_mc;
-	u64 governor_ns;
+	/* Gated-sensor hold state, CPU idle tracker, and zone-notify state. */
+	struct apple_pmp_gated_hold hold;
+	struct apple_pmp_idle_tracker idle;
+	struct apple_pmp_zone_notify zone_notify;
+	bool fault_disabled;
 	unsigned long long sample_count, governor_count;
 	struct apple_pmp_confirmation critical;
 	bool shutdown_requested;
@@ -381,7 +383,39 @@ static int apple_pmp_guard(unsigned int level)
 	return err;
 }
 
-static int apple_pmp_sample(void)
+static DEFINE_PER_CPU(struct apple_pmp_cpu_sample, apple_pmp_cpu_samples);
+
+/*
+ * Integrate per-CPU idle accounting over at least APPLE_PMP_IDLE_WINDOW_NS so
+ * brief wakeups do not look like sustained load. Runs outside pmp_thermal.lock
+ * on the serialized poll_work thread so cpus_read_lock() never nests with it.
+ */
+static bool apple_pmp_cpus_idle(u64 now)
+{
+	struct apple_pmp_idle_acc acc;
+	unsigned int cpu;
+
+	if (!apple_pmp_idle_window_due(&pmp_thermal.idle, now))
+		return pmp_thermal.idle.cpus_idle;
+
+	apple_pmp_idle_begin(&acc, pmp_thermal.idle.window_ns != 0);
+	cpus_read_lock();
+	for_each_possible_cpu(cpu) {
+		u64 wall = 0, idle = 0;
+		bool online = cpu_online(cpu);
+
+		if (online)
+			idle = get_cpu_idle_time(cpu, &wall, 0);
+		apple_pmp_idle_add_cpu(&acc,
+				       per_cpu_ptr(&apple_pmp_cpu_samples, cpu),
+				       online, idle, wall);
+	}
+	cpus_read_unlock();
+
+	return apple_pmp_idle_finish(&pmp_thermal.idle, &acc, now);
+}
+
+static int apple_pmp_sample(bool cpus_idle)
 {
 	struct apple_pmp_snapshot snapshot;
 	struct apple_pmp_cooling *cooling = &pmp_thermal.cooling;
@@ -395,15 +429,9 @@ static int apple_pmp_sample(void)
 	old_level = pmp_thermal.guard_level;
 	old_reason = cooling->reason;
 	ret = apple_pmp_sample_all(&snapshot, &value);
-	if (!ret) {
-		pmp_thermal.valid_ns = snapshot.finished_ns;
-		pmp_thermal.valid_mc = value;
-	} else if (ret == -ENODATA && pmp_thermal.valid_ns &&
-		   snapshot.finished_ns - pmp_thermal.valid_ns < APPLE_PMP_GATED_HOLD_NS &&
-		   pmp_thermal.valid_mc < APPLE_PMP_GATED_HOLD_MC) {
-		value = pmp_thermal.valid_mc;
-		ret = 0;
-	}
+	ret = apple_pmp_gated_hold_sample(&pmp_thermal.hold,
+					  snapshot.finished_ns, &value, ret,
+					  cpus_idle);
 	was_confirmed = pmp_thermal.critical.confirmed;
 	apple_pmp_confirmation_sample(&pmp_thermal.critical, value, ret,
 				      snapshot.finished_ns);
@@ -513,16 +541,29 @@ static void apple_pmp_critical(struct thermal_zone_device *zone)
 
 static void apple_pmp_poll_work(struct work_struct *work)
 {
-	u64 now;
+	bool cpus_idle = apple_pmp_cpus_idle(ktime_get_ns());
+	enum apple_pmp_zone_action action;
+	bool fault_disabled;
+	int ret;
 
-	apple_pmp_sample();
+	ret = apple_pmp_sample(cpus_idle);
 	pmp_thermal.sample_count++;
 	apple_pmp_critical(pmp_thermal.zone);
-	now = ktime_get_ns();
-	if (now - pmp_thermal.governor_ns >= APPLE_PMP_GOVERNOR_NS) {
-		pmp_thermal.governor_ns = now;
+	fault_disabled = READ_ONCE(pmp_thermal.fault_disabled);
+	action = apple_pmp_zone_notify_step(&pmp_thermal.zone_notify,
+					    ktime_get_ns(), ret,
+					    fault_disabled,
+					    APPLE_PMP_GOVERNOR_NS);
+	if (action == APPLE_PMP_ZONE_REENABLE) {
+		ret = thermal_zone_device_enable(pmp_thermal.zone);
+		if (!ret)
+			pr_info_ratelimited("apple-pmp-thermal: sensor sampling recovered; thermal zone re-enabled\n");
+		return;
+	}
+	if (action == APPLE_PMP_ZONE_UPDATE) {
 		pmp_thermal.governor_count++;
-		thermal_zone_device_update(pmp_thermal.zone, THERMAL_EVENT_UNSPECIFIED);
+		thermal_zone_device_update(pmp_thermal.zone,
+					   THERMAL_EVENT_UNSPECIFIED);
 	}
 }
 
@@ -543,7 +584,14 @@ static int apple_pmp_change_mode(struct thermal_zone_device *zone,
 {
 	guard(mutex)(&pmp_thermal.lock);
 	pmp_thermal.enabled = mode == THERMAL_DEVICE_ENABLED;
+	if (mode == THERMAL_DEVICE_DISABLED)
+		WRITE_ONCE(pmp_thermal.fault_disabled,
+			   pmp_thermal.cached_error &&
+			   pmp_thermal.cached_error != -EAGAIN);
+	else
+		WRITE_ONCE(pmp_thermal.fault_disabled, false);
 	apple_pmp_gpu_publish(pmp_thermal.sensors, 0, 8, 0);
+	apple_pmp_gated_hold_reset(&pmp_thermal.hold);
 	apple_pmp_cooling_init(&pmp_thermal.cooling);
 	WRITE_ONCE(pmp_thermal.fast_poll, true);
 	return apple_pmp_guard(8);
@@ -670,6 +718,10 @@ static void apple_pmp_thermal_cleanup(void)
 		c->policy = NULL;
 	}
 
+	apple_pmp_gated_hold_reset(&pmp_thermal.hold);
+	apple_pmp_idle_tracker_reset(&pmp_thermal.idle);
+	apple_pmp_zone_notify_reset(&pmp_thermal.zone_notify);
+	WRITE_ONCE(pmp_thermal.fault_disabled, false);
 	pmp_thermal.enabled = false;
 	pmp_thermal.ready = false;
 }
@@ -801,11 +853,13 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 	pmp_thermal.sensors = sensors;
 	pmp_thermal.cached_error = -EAGAIN;
 	pmp_thermal.power_error = -EAGAIN;
-	pmp_thermal.valid_ns = 0;
+	apple_pmp_gated_hold_reset(&pmp_thermal.hold);
+	apple_pmp_idle_tracker_reset(&pmp_thermal.idle);
+	apple_pmp_zone_notify_reset(&pmp_thermal.zone_notify);
+	WRITE_ONCE(pmp_thermal.fault_disabled, false);
 	pmp_thermal.critical = (struct apple_pmp_confirmation) {};
 	pmp_thermal.shutdown_requested = false;
 	pmp_thermal.critical_dumped = false;
-	pmp_thermal.governor_ns = 0;
 	INIT_DELAYED_WORK(&pmp_thermal.setup_work, apple_pmp_thermal_setup_work);
 	INIT_DELAYED_WORK(&pmp_thermal.power_work, apple_pmp_power_work);
 	INIT_WORK(&pmp_thermal.poll_work, apple_pmp_poll_work);
@@ -816,14 +870,15 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 }
 
 /*
- * A deep sleep stops the PMP: sampling on through it would read its sensors stopped and
- * restrict the CPUs and the GPU for seconds after the wake. Nothing runs to heat the die
- * from the first device callback to the last, so neither sampler runs in between.
+ * Deep sleep stops the PMP and s2idle parks all clusters in WFI, so sampling
+ * through either sleep would read dark/stopped sensors and restrict the CPUs
+ * and GPU after wake. Userspace is frozen and nothing runs to heat the die
+ * between prepare and complete, so pause both samplers across system sleep and
+ * refresh a cool valid hold on resume (with cpus_idle cleared to bound post-
+ * wake dark reads to APPLE_PMP_GATED_HOLD_NS).
  */
 static int apple_pmp_thermal_prepare(struct device *dev)
 {
-	if (!pm_suspend_via_firmware())
-		return 0;
 	if (pmp_thermal.polling) {
 		hrtimer_cancel(&pmp_thermal.poll_timer);
 		cancel_work_sync(&pmp_thermal.poll_work);
@@ -842,9 +897,13 @@ static void apple_pmp_thermal_complete(struct device *dev)
 		return;
 	pmp_thermal.sleep_paused = false;
 	scoped_guard(mutex, &pmp_thermal.lock) {
+		u64 now = ktime_get_ns();
+
 		/* The sleep is no telemetry gap, nor cool time to refill the bucket. */
 		if (p->last_ns)
-			p->last_ns = ktime_get_ns();
+			p->last_ns = now;
+		apple_pmp_gated_hold_resume(&pmp_thermal.hold, now);
+		apple_pmp_idle_tracker_reset(&pmp_thermal.idle);
 		if (p->active & BIT(2))
 			apple_pmp_gpu_publish(pmp_thermal.sensors, pmp_thermal.gpu_epoch,
 					      p->level[2], p->last_ns);

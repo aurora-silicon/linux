@@ -22,8 +22,11 @@
 #define APPLE_PMP_RELEASE_MC 106000
 /*
  * The firmware publishes a die sensor only while its cluster has power, so an idle
- * machine can have none valid for a moment (0.46 s the longest measured). Go on from the
- * last reading for this long, if it was this cool. Longer or hotter is a failed sensor.
+ * machine can have none valid for a moment (0.46 s at the old 5 ms poll cadence;
+ * 2.1-3.8 s measured at the 100 ms slow cadence on T8132). Under load, go on from
+ * the last reading for up to APPLE_PMP_GATED_HOLD_NS if it was below
+ * APPLE_PMP_GATED_HOLD_MC; longer or hotter fails closed. Idle CPU/GPU consumers
+ * may extend a cool hold under their own idle criteria and cap.
  */
 #define APPLE_PMP_GATED_HOLD_NS 2000000000ULL
 #define APPLE_PMP_GATED_HOLD_MC 90000
