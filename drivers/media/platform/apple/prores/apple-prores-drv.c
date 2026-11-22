@@ -1233,6 +1233,8 @@ struct apr_ctx {
 	bool decode;
 	bool source_valid;
 	bool decode_444;
+	/* LAST went out for a resolution change: wait for CAPTURE to restart. */
+	bool drc_pending;
 	atomic_t inflight;	/* jobs in the ring not yet given back to vb2 */
 	enum apr_profile stream_profile;	/* fixed while OUTPUT streams */
 	u32 sequence;
@@ -1394,17 +1396,6 @@ static void apr_fill_frame(struct apr_ctx *ctx, struct vb2_v4l2_buffer *src,
 		.transfer = apr_color_transfer(s),
 		.matrix = apr_color_matrix(s),
 	};
-}
-
-static int apr_parse_src(struct vb2_v4l2_buffer *src,
-			 struct apr_prores_info *info)
-{
-	struct apr_buf *buf = to_apr_buf(src);
-
-	if (buf->parse_err)
-		return buf->parse_err;
-	*info = buf->info;
-	return 0;
 }
 
 static void apr_bounce_free(struct apr_dev *apr, struct apr_bounce *b)
@@ -1835,6 +1826,58 @@ static void apr_watchdog(struct work_struct *work)
 		v4l2_m2m_job_finish(apr->m2m_dev, held->fh.m2m_ctx);
 }
 
+static const struct v4l2_event apr_source_change = {
+	.type = V4L2_EVENT_SOURCE_CHANGE,
+	.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
+};
+
+static void apr_decode_set_source(struct apr_ctx *ctx,
+				  const struct apr_prores_info *info);
+
+/* Does a parsed source frame need other CAPTURE buffers than the format's? */
+static bool apr_decode_differs(const struct apr_ctx *ctx,
+			       const struct apr_prores_info *info)
+{
+	return info->width != ctx->dst_fmt.width ||
+	       info->height != ctx->dst_fmt.height ||
+	       (info->chroma == 3) != ctx->raw->is444;
+}
+
+/*
+ * Decode reached a frame whose geometry differs from the CAPTURE format:
+ * the stateful decoder's dynamic resolution change. Every frame from before
+ * it is given back first; the next CAPTURE buffer then goes back empty with
+ * LAST, the formats switch to the new geometry and SOURCE_CHANGE is queued.
+ * The frame stays first on OUTPUT, and no job runs until CAPTURE is
+ * restarted (STREAMOFF and STREAMON) or a START command resumes decoding.
+ * Called from device_run; sleeps.
+ */
+static void apr_decode_resolution_change(struct apr_ctx *ctx,
+					 struct vb2_v4l2_buffer *src)
+{
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+	struct apr_dev *apr = ctx->apr;
+	struct vb2_v4l2_buffer *dst;
+	unsigned long flags;
+
+	wait_event(apr->idle_wq, !atomic_read(&ctx->inflight));
+	/* Formats change under hw_lock for the G_FMT and TRY_FMT readers. */
+	spin_lock_irqsave(&apr->hw_lock, flags);
+	apr_decode_set_source(ctx, &to_apr_buf(src)->info);
+	WRITE_ONCE(ctx->drc_pending, true);
+	dst = v4l2_m2m_dst_buf_remove(m2m);
+	spin_unlock_irqrestore(&apr->hw_lock, flags);
+	/* A query after the event sees the new format. */
+	v4l2_event_queue_fh(&ctx->fh, &apr_source_change);
+	if (!WARN_ON(!dst)) {
+		vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
+		dst->field = V4L2_FIELD_NONE;
+		dst->flags |= V4L2_BUF_FLAG_LAST;
+		v4l2_m2m_buf_done(dst, VB2_BUF_STATE_DONE);
+	}
+	v4l2_m2m_job_finish(apr->m2m_dev, m2m);
+}
+
 /*
  * Publish one job and, while the ring has room for another, finish the m2m
  * job at once so the next one is prepared while the engine works. When the
@@ -1861,6 +1904,11 @@ static void apr_device_run(void *priv)
 
 	src = v4l2_m2m_next_src_buf(m2m);
 	dst = v4l2_m2m_next_dst_buf(m2m);
+	if (ctx->decode && !to_apr_buf(src)->parse_err &&
+	    apr_decode_differs(ctx, &to_apr_buf(src)->info)) {
+		apr_decode_resolution_change(ctx, src);
+		return;
+	}
 
 	ret = pm_runtime_resume_and_get(apr->dev);
 	if (ret < 0) {
@@ -1970,20 +2018,12 @@ static void apr_device_run(void *priv)
 		v4l2_m2m_job_finish(apr->m2m_dev, m2m);
 }
 
+/* A frame of another geometry is device_run's resolution change. */
 static int apr_job_ready(void *priv)
 {
 	struct apr_ctx *ctx = priv;
-	struct vb2_v4l2_buffer *src;
-	struct apr_prores_info info;
 
-	if (!ctx->decode)
-		return 1;
-	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
-	if (!src || apr_parse_src(src, &info))
-		return 1;
-	return info.width == ctx->dst_fmt.width &&
-	       info.height == ctx->dst_fmt.height &&
-	       (info.chroma == 3) == ctx->raw->is444;
+	return !READ_ONCE(ctx->drc_pending);
 }
 
 static void apr_job_abort(void *priv)
@@ -2180,15 +2220,29 @@ static int apr_enum_framesizes(struct file *file, void *priv,
 	return 0;
 }
 
+/*
+ * A decoder's resolution change rewrites the formats from device_run, which
+ * does not hold vdev_lock; it holds hw_lock.
+ */
 static int apr_g_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 {
-	f->fmt.pix_mp = apr_file_to_ctx(file)->src_fmt;
+	struct apr_ctx *ctx = apr_file_to_ctx(file);
+	unsigned long flags;
+
+	spin_lock_irqsave(&ctx->apr->hw_lock, flags);
+	f->fmt.pix_mp = ctx->src_fmt;
+	spin_unlock_irqrestore(&ctx->apr->hw_lock, flags);
 	return 0;
 }
 
 static int apr_g_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
-	f->fmt.pix_mp = apr_file_to_ctx(file)->dst_fmt;
+	struct apr_ctx *ctx = apr_file_to_ctx(file);
+	unsigned long flags;
+
+	spin_lock_irqsave(&ctx->apr->hw_lock, flags);
+	f->fmt.pix_mp = ctx->dst_fmt;
+	spin_unlock_irqrestore(&ctx->apr->hw_lock, flags);
 	return 0;
 }
 
@@ -2212,11 +2266,18 @@ static int apr_try_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
 	const struct apr_fmt *fmt;
 
 	if (ctx->decode) {
-		fmt = apr_find_raw(f->fmt.pix_mp.pixelformat);
-		if (!fmt || (ctx->source_valid && fmt->is444 != ctx->decode_444))
-			fmt = &apr_raw_fmts[ctx->decode_444 ? 3 : 1];
+		unsigned long flags;
+		bool valid, is444;
+
+		spin_lock_irqsave(&ctx->apr->hw_lock, flags);
+		valid = ctx->source_valid;
+		is444 = ctx->decode_444;
 		f->fmt.pix_mp.width = ctx->src_fmt.width;
 		f->fmt.pix_mp.height = ctx->src_fmt.height;
+		spin_unlock_irqrestore(&ctx->apr->hw_lock, flags);
+		fmt = apr_find_raw(f->fmt.pix_mp.pixelformat);
+		if (!fmt || (valid && fmt->is444 != is444))
+			fmt = &apr_raw_fmts[is444 ? 3 : 1];
 		apr_fill_raw(&f->fmt.pix_mp, fmt);
 		return 0;
 	}
@@ -2322,7 +2383,14 @@ static int apr_decoder_cmd(struct file *file, void *priv,
 		return ret;
 	if (dc->cmd == V4L2_DEC_CMD_STOP)
 		return apr_stop_cmd(file, ctx, dc);
-	return v4l2_m2m_ioctl_decoder_cmd(file, priv, dc);
+	ret = v4l2_m2m_ioctl_decoder_cmd(file, priv, dc);
+	if (ret)
+		return ret;
+	/* START resumes after a drain or a resolution change. */
+	WRITE_ONCE(ctx->drc_pending, false);
+	vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
+	v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
+	return 0;
 }
 
 static const struct v4l2_ioctl_ops apr_ioctl_ops = {
@@ -2434,45 +2502,54 @@ static int apr_buf_prepare(struct vb2_buffer *vb)
 	return 0;
 }
 
+/* Make a parsed frame's geometry the stream's. Called with hw_lock held. */
+static void apr_decode_set_source(struct apr_ctx *ctx,
+				  const struct apr_prores_info *info)
+{
+	unsigned int i;
+
+	ctx->source_valid = true;
+	ctx->decode_444 = info->chroma == 3;
+	ctx->src_fmt.width = info->width;
+	ctx->src_fmt.height = info->height;
+	for (i = 0; i < ARRAY_SIZE(apr_raw_fmts); i++) {
+		if (apr_raw_fmts[i].is444 == ctx->decode_444 &&
+		    apr_raw_fmts[i].bytes == ctx->raw->bytes) {
+			ctx->raw = &apr_raw_fmts[i];
+			break;
+		}
+	}
+	/* A new geometry starts from the minimum stride. */
+	if (ctx->dst_fmt.width != info->width ||
+	    ctx->dst_fmt.height != info->height)
+		ctx->dst_fmt.plane_fmt[0].bytesperline = 0;
+	ctx->dst_fmt.width = info->width;
+	ctx->dst_fmt.height = info->height;
+	apr_fill_raw(&ctx->dst_fmt, ctx->raw);
+}
+
+/*
+ * Before CAPTURE streams, the next frame to decode sets the formats, and a
+ * new geometry is reported at once (initial setup, or a change while CAPTURE
+ * is stopped). While CAPTURE streams, device_run handles a change when
+ * decode reaches the frame, after the frames queued before it.
+ */
 static void apr_decode_source_change(struct apr_ctx *ctx,
 				     struct vb2_v4l2_buffer *vbuf)
 {
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
-	struct apr_prores_info info;
-	bool changed;
-	unsigned int i;
+	struct apr_buf *buf = to_apr_buf(vbuf);
+	unsigned long flags;
 
-	if (apr_parse_src(vbuf, &info))
+	if (buf->parse_err || vb2_is_streaming(v4l2_m2m_get_dst_vq(m2m)))
 		return;
-	changed = !ctx->source_valid || ctx->src_fmt.width != info.width ||
-		  ctx->src_fmt.height != info.height ||
-		  ctx->decode_444 != (info.chroma == 3);
-	if (!changed)
+	if (ctx->source_valid && (v4l2_m2m_num_src_bufs_ready(m2m) ||
+				  !apr_decode_differs(ctx, &buf->info)))
 		return;
-	ctx->source_valid = true;
-	ctx->decode_444 = info.chroma == 3;
-	ctx->src_fmt.width = info.width;
-	ctx->src_fmt.height = info.height;
-	if (!vb2_is_busy(v4l2_m2m_get_dst_vq(m2m))) {
-		for (i = 0; i < ARRAY_SIZE(apr_raw_fmts); i++) {
-			if (apr_raw_fmts[i].is444 == ctx->decode_444 &&
-			    apr_raw_fmts[i].bytes == ctx->raw->bytes) {
-				ctx->raw = &apr_raw_fmts[i];
-				break;
-			}
-		}
-		ctx->dst_fmt.width = info.width;
-		ctx->dst_fmt.height = info.height;
-		apr_fill_raw(&ctx->dst_fmt, ctx->raw);
-	}
-	{
-		const struct v4l2_event event = {
-			.type = V4L2_EVENT_SOURCE_CHANGE,
-			.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
-		};
-
-		v4l2_event_queue_fh(&ctx->fh, &event);
-	}
+	spin_lock_irqsave(&ctx->apr->hw_lock, flags);
+	apr_decode_set_source(ctx, &buf->info);
+	spin_unlock_irqrestore(&ctx->apr->hw_lock, flags);
+	v4l2_event_queue_fh(&ctx->fh, &apr_source_change);
 }
 
 static void apr_buf_queue(struct vb2_buffer *vb)
@@ -2532,6 +2609,9 @@ static void apr_stop_streaming(struct vb2_queue *q)
 			break;
 		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
 	}
+	/* Restarting CAPTURE ends a resolution change. */
+	if (!V4L2_TYPE_IS_OUTPUT(q->type))
+		WRITE_ONCE(ctx->drc_pending, false);
 	v4l2_m2m_update_stop_streaming_state(ctx->fh.m2m_ctx, q);
 	if (V4L2_TYPE_IS_OUTPUT(q->type) && !ctx->decode)
 		v4l2_ctrl_grab(ctx->profile, false);
