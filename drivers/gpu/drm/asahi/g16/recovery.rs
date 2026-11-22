@@ -402,6 +402,22 @@ impl Firmware {
     }
 
     fn recover(&mut self) -> Result {
+        struct RecoveringGuard(Option<Arc<super::Shared>>);
+        impl Drop for RecoveringGuard {
+            fn drop(&mut self) {
+                if let Some(shared) = &self.0 {
+                    shared
+                        .recovering
+                        .store(false, core::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+        if let Some(shared) = &self.engine.shared {
+            shared
+                .recovering
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+        let _recovering = RecoveringGuard(self.engine.shared.clone());
         let start = self.events.recovery_started_ns.unwrap_or_else(now_ns);
         self.recovery.running = true;
         self.engine.frozen = true;

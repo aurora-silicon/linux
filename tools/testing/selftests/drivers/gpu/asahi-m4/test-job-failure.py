@@ -18,8 +18,8 @@ command_source = (SOURCE.parent / 'command.rs').read_text()
 queue_source = (SOURCE.parent / 'queue.rs').read_text()
 order_source = command_source[command_source.index('/// Exact queue-local command ordinal'):command_source.index('/// A validated render command.')]
 
-def function(text, name):
-    marker = text.index('fn ' + name + '(')
+def function_from(text, marker_text):
+    marker = text.index(marker_text)
     start = text.rfind('\n', 0, marker) + 1
     first = text.index('{', marker)
     depth = 1
@@ -29,8 +29,12 @@ def function(text, name):
         at += 1
     return text[start:at]
 
+def function(text, name):
+    return function_from(text, 'fn ' + name + '(')
+
 queue_methods = '\n'.join(function(queue_source, name) for name in ['cancel', 'check'])
 methods = '\n'.join(function(source, name) for name in ['latch_failure', 'complete', 'finish', 'is_started', 'try_start_inline', 'start', 'check_command_dependencies', 'command_retired', 'note_full_retirement', 'mark_terminal_retired'])
+push_method = function_from(source, 'pub(crate) fn push(&mut self, job: Arc<Job>')
 fence_methods = '\n'.join(function(fence_source, name) for name in ['dependency_status', 'check_dependencies', 'wait_dependencies'])
 harness = r'''
 #![allow(dead_code)]
@@ -99,21 +103,50 @@ mod command { pub(crate) use super::Order; }
 struct QueueState { completed:[AtomicU64;2],published:[AtomicU64;2],cancelled_at:[AtomicU64;2] }
 impl QueueState { QUEUE_METHODS }
 struct Job { id:u64,vm:Vm,_guard:Guard,progress:Progress,started:AtomicBool,accepted:AtomicBool,fence:Fence,commands:Vec<()>,inputs:Vec<InputFence>,orders:Vec<Order>,queue:Arc<QueueState>,full_retired:AtomicU64,terminal_retired:AtomicBool }
-struct Shared { crashed:AtomicBool,sleeping:AtomicBool,contended:AtomicBool,submitted:Mutex<Vec<u64>>,submit_result:Result }
+struct Shared { crashed:AtomicBool,sleeping:AtomicBool,recovering:AtomicBool,contended:AtomicBool,submitted:Mutex<Vec<u64>>,submit_result:Result }
 impl Shared {
     fn new()->Arc<Self> {
-        Arc::new(Self{crashed:AtomicBool::new(false),sleeping:AtomicBool::new(false),contended:AtomicBool::new(false),submitted:Mutex::new(vec![]),submit_result:Ok(())})
+        Arc::new(Self{crashed:AtomicBool::new(false),sleeping:AtomicBool::new(false),recovering:AtomicBool::new(false),contended:AtomicBool::new(false),submitted:Mutex::new(vec![]),submit_result:Ok(())})
     }
+    fn note_submitter(&self) {}
     fn submit(&self,job:Arc<Job>)->Result {
         self.submitted.lock().unwrap().push(job.id); self.submit_result
     }
     fn try_submit_inline(&self,job:Arc<Job>)->Option<Result> {
-        if self.contended.load(Ordering::Acquire) { return None; }
+        if self.contended.load(Ordering::Acquire) || self.sleeping.load(Ordering::Acquire) || self.recovering.load(Ordering::Acquire) { return None; }
         Some(self.submit(job))
     }
 }
 impl Job {
     METHODS
+}
+struct SchedJob { job:Arc<Job>, shared:Arc<Shared> }
+struct ArmedJob { job:SchedJob, pushed:Arc<Mutex<Vec<u64>>> }
+impl ArmedJob {
+    fn push(self) { self.pushed.lock().unwrap().push(self.job.job.id); }
+}
+struct PendingJob { job:SchedJob, deps:Vec<InputFence>, pushed:Arc<Mutex<Vec<u64>>>, fail_dep:bool }
+impl PendingJob {
+    fn add_dependency(&mut self, fence:InputFence)->Result {
+        if self.fail_dep { return Err(ENOMEM); }
+        self.deps.push(fence);
+        Ok(())
+    }
+    fn arm(self)->ArmedJob { ArmedJob { job:self.job, pushed:self.pushed } }
+}
+struct Entity { new_jobs:AtomicUsize, pushed:Arc<Mutex<Vec<u64>>>, fail_new:bool, fail_dep:bool }
+impl Entity {
+    fn new()->Self { Self { new_jobs:AtomicUsize::new(0), pushed:Arc::new(Mutex::new(vec![])), fail_new:false, fail_dep:false } }
+    fn new_job(&mut self, _credits:u32, job:SchedJob)->Result<PendingJob> {
+        self.new_jobs.fetch_add(1, Ordering::AcqRel);
+        if self.fail_new { return Err(ENOMEM); }
+        Ok(PendingJob { job, deps:vec![], pushed:self.pushed.clone(), fail_dep:self.fail_dep })
+    }
+}
+struct Scheduler { entity:Entity, last_job:Option<Arc<Job>> }
+impl Scheduler {
+    fn new()->Self { Self { entity:Entity::new(), last_job:None } }
+    PUSH_METHOD
 }
 fn job(id:u64,status:Arc<Status>)->Arc<Job> {
     job_with_inputs(id,status,vec![])
@@ -374,7 +407,7 @@ fn never_published_refusal_needs_no_mapping_quarantine() {
 #[test]
 fn never_published_capacity_failure_closes_only_its_queue() {
     let status=Arc::new(Status::new());let failed=job(1,status.clone());
-    let shared=Arc::new(Shared{crashed:AtomicBool::new(false),sleeping:AtomicBool::new(false),contended:AtomicBool::new(false),submitted:Mutex::new(vec![]),submit_result:Err(ENOMEM)});
+    let shared=Arc::new(Shared{crashed:AtomicBool::new(false),sleeping:AtomicBool::new(false),recovering:AtomicBool::new(false),contended:AtomicBool::new(false),submitted:Mutex::new(vec![]),submit_result:Err(ENOMEM)});
     failed.start(&shared);
     assert_eq!(failed.fence.signals.lock().unwrap()[0],(Err(ENOMEM),-12));
     assert_eq!(failed.queue.check(&failed.orders[0]),Err(ECANCELED));assert_eq!(status.get(),0);
@@ -405,20 +438,26 @@ fn inline_start_submits_once_and_falls_back_on_pending_input_or_contention() {
     let shared=Shared::new();
     // Ready job with signalled input submits inline; subsequent drm_sched start() is a no-op.
     let ready=job_with_inputs(10,status.clone(),vec![InputFence::new(1)]);
-    ready.try_start_inline(&shared);
+    assert!(ready.try_start_inline(&shared));
     assert!(ready.is_started());
     assert_eq!(*shared.submitted.lock().unwrap(),vec![10]);
     ready.start(&shared);
     assert_eq!(*shared.submitted.lock().unwrap(),vec![10]);
     // Unsignalled input defers to drm_sched without marking started.
     let pending=job_with_inputs(11,status.clone(),vec![InputFence::new(0)]);
-    pending.try_start_inline(&shared);
+    assert!(!pending.try_start_inline(&shared));
     assert!(!pending.is_started());
     assert_eq!(*shared.submitted.lock().unwrap(),vec![10]);
+    // Recovering device defers to drm_sched without blocking or marking started.
+    shared.recovering.store(true,Ordering::Release);
+    let rec=job(13,status.clone());
+    assert!(!rec.try_start_inline(&shared));
+    assert!(!rec.is_started());
+    shared.recovering.store(false,Ordering::Release);
     // Contended device mutex defers to drm_sched without blocking or marking started.
     shared.contended.store(true,Ordering::Release);
     let contended=job(12,status.clone());
-    contended.try_start_inline(&shared);
+    assert!(!contended.try_start_inline(&shared));
     assert!(!contended.is_started());
     assert_eq!(*shared.submitted.lock().unwrap(),vec![10]);
     shared.contended.store(false,Ordering::Release);
@@ -426,7 +465,48 @@ fn inline_start_submits_once_and_falls_back_on_pending_input_or_contention() {
     assert!(contended.is_started());
     assert_eq!(*shared.submitted.lock().unwrap(),vec![10,12]);
 }
-'''.replace('QUEUE_METHODS', queue_methods).replace('ORDER_SOURCE', order_source).replace('FENCE_METHODS', fence_methods).replace('METHODS', methods.replace('super::fence::','fence::'))
+#[test]
+fn scheduler_push_bypasses_drm_sched_on_inline_start_and_rolls_back_on_fallback_enomem() {
+    let status=Arc::new(Status::new());
+    let shared=Shared::new();
+    let mut sched=Scheduler::new();
+    // Ready jobs bypass entity.new_job() and armed.push() completely.
+    let j1=job_with_inputs(1,status.clone(),vec![InputFence::new(1)]);
+    j1.accepted.store(false,Ordering::Release);
+    sched.push(j1.clone(),shared.clone()).unwrap();
+    assert!(j1.is_started());
+    assert!(j1.accepted.load(Ordering::Acquire));
+    assert_eq!(sched.entity.new_jobs.load(Ordering::Acquire),0);
+    assert!(sched.entity.pushed.lock().unwrap().is_empty());
+    assert_eq!(*shared.submitted.lock().unwrap(),vec![1]);
+    // Second ready job also bypasses drm_sched because j1 is already started.
+    let j2=job(2,status.clone());
+    sched.push(j2.clone(),shared.clone()).unwrap();
+    assert!(j2.is_started());
+    assert_eq!(sched.entity.new_jobs.load(Ordering::Acquire),0);
+    assert_eq!(*shared.submitted.lock().unwrap(),vec![1,2]);
+    // Unsignalled input falls back to drm_sched; subsequent job waits for predecessor start.
+    let j3=job_with_inputs(3,status.clone(),vec![InputFence::new(0)]);
+    sched.push(j3.clone(),shared.clone()).unwrap();
+    assert!(!j3.is_started());
+    assert_eq!(sched.entity.new_jobs.load(Ordering::Acquire),1);
+    assert_eq!(*sched.entity.pushed.lock().unwrap(),vec![3]);
+    let j4=job(4,status.clone());
+    sched.push(j4.clone(),shared.clone()).unwrap();
+    assert!(!j4.is_started());
+    assert_eq!(sched.entity.new_jobs.load(Ordering::Acquire),2);
+    assert_eq!(*sched.entity.pushed.lock().unwrap(),vec![3,4]);
+    // Fallback ENOMEM rolls back accepted so the failed push never poisons queue ordinals.
+    j3.started.store(true,Ordering::Release);
+    j4.started.store(true,Ordering::Release);
+    sched.entity.fail_new=true;
+    let j5=job_with_inputs(5,status.clone(),vec![InputFence::new(0)]);
+    j5.accepted.store(false,Ordering::Release);
+    assert_eq!(sched.push(j5.clone(),shared.clone()),Err(ENOMEM));
+    assert!(!j5.accepted.load(Ordering::Acquire));
+    assert!(!j5.is_started());
+}
+'''.replace('QUEUE_METHODS', queue_methods).replace('ORDER_SOURCE', order_source).replace('FENCE_METHODS', fence_methods).replace('METHODS', methods.replace('super::fence::','fence::')).replace('PUSH_METHOD', push_method)
 
 with tempfile.TemporaryDirectory(prefix='m4-rust-job-') as directory:
     directory=pathlib.Path(directory); test=directory/'test.rs'; test.write_text(harness)

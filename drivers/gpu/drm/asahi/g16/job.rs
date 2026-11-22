@@ -243,31 +243,34 @@ impl Job {
         self.started.load(Ordering::Acquire)
     }
 
-    /// Attempts to submit a ready job directly from SUBMIT ioctl context without waiting for
-    /// the drm_sched worker wakeup. Only runs when all input fences are already signalled,
-    /// the device and VM are healthy, and `Shared::state` is uncontended (`try_lock`); on
-    /// contention or pending dependencies it returns without setting `started` so drm_sched
-    /// runs the job in queue order.
-    pub(crate) fn try_start_inline(self: &Arc<Self>, shared: &Arc<Shared>) {
+    /// Attempts to submit a ready job directly from SUBMIT ioctl context, bypassing `drm_sched`.
+    /// Only runs when all input fences are already signalled, the device and VM are healthy,
+    /// and the GPU is neither sleeping nor recovering; returns `true` when the job was started
+    /// inline (accepted or already finished with error), or `false` to fall back to `drm_sched`.
+    pub(crate) fn try_start_inline(self: &Arc<Self>, shared: &Arc<Shared>) -> bool {
         if shared.crashed.load(Ordering::Acquire)
             || shared.sleeping.load(Ordering::Acquire)
+            || shared.recovering.load(Ordering::Acquire)
             || self.vm.status.get() != 0
         {
-            return;
+            return false;
         }
         if let Some(order) = self.orders.first() {
             if self.queue.check(order).is_err() {
-                return;
+                return false;
             }
         }
         if super::fence::check_dependencies(&self.inputs).is_err() {
-            return;
+            return false;
         }
         if let Some(result) = shared.try_submit_inline(self.clone()) {
             self.started.store(true, Ordering::Release);
             if let Err(error) = result {
                 self.finish(Err(if error == ENODEV { EIO } else { error }), false);
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -584,8 +587,10 @@ impl Scheduler {
         })
     }
 
-    /// Pushes a job that waits for its retained inputs. On failure the job is cancelled (not counted as
-    /// submitted work of its VM) and the error is returned.
+    /// Pushes a job that waits for its retained inputs. When the predecessor has already
+    /// started and all inputs are signalled, submits directly inline and bypasses `drm_sched`
+    /// allocation and kworker wakeup. On failure the job is cancelled (not counted as submitted
+    /// work of its VM) and the error is returned.
     pub(crate) fn push(&mut self, job: Arc<Job>, shared: Arc<Shared>) -> Result {
         shared.note_submitter();
         let prev_started = match &self.last_scheduled {
@@ -597,12 +602,19 @@ impl Scheduler {
             None => true,
         };
         let handle = job.clone();
+        if prev_started {
+            handle.accepted.store(true, Ordering::Release);
+            if handle.try_start_inline(&shared) {
+                return Ok(());
+            }
+            handle.accepted.store(false, Ordering::Release);
+        }
         let scheduled = Arc::new(AtomicBool::new(false), GFP_KERNEL)?;
         let mut pending = self.entity.new_job(
             1,
             SchedJob {
                 job,
-                shared: shared.clone(),
+                shared,
                 scheduled: scheduled.clone(),
             },
         )?;
@@ -611,14 +623,7 @@ impl Scheduler {
         }
         let armed = pending.arm();
         handle.accepted.store(true, Ordering::Release);
-        if prev_started {
-            handle.try_start_inline(&shared);
-        }
-        if handle.is_started() {
-            scheduled.store(true, Ordering::Release);
-        } else {
-            self.last_scheduled = Some(scheduled);
-        }
+        self.last_scheduled = Some(scheduled);
         armed.push();
         Ok(())
     }

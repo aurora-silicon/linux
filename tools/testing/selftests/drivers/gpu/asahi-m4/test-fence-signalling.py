@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""Exercise the production task-local DMA-fence lockdep guard with and without LOCKDEP."""
+"""Exercise production DMA-fence lockdep guard and Timeline off-pending signalling."""
 from common import kernel_root, output_dir, rustc, sha
 import json
+import pathlib
 import subprocess
+import tempfile
 
 root = kernel_root()
 out = output_dir()
@@ -65,8 +67,205 @@ result = subprocess.run(rustc() + ['--edition=2021', str(not_send), '-o', str(ou
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 (out / 'fence-signalling-not-send.log').write_text(result.stdout)
 assert result.returncode and 'E0277' in result.stdout and 'cannot be sent between threads safely' in result.stdout, result.stdout
+
+fence_source_path = root / 'drivers/gpu/drm/asahi/g16/fence.rs'
+fence_source = fence_source_path.read_text()
+
+
+def extract_function(text, name):
+    marker = text.index('fn ' + name + '(')
+    start = text.rfind('\n', 0, marker) + 1
+    first = text.index('{', marker)
+    depth = 1
+    at = first + 1
+    while depth:
+        depth += (text[at] == '{') - (text[at] == '}')
+        at += 1
+    return text[start:at]
+
+
+signal_batch_line = [
+    line for line in fence_source.splitlines() if line.startswith('const SIGNAL_BATCH:')
+][0]
+timeline_complete_fn = extract_function(fence_source, 'complete')
+
+timeline_harness = r'''
+#![allow(dead_code)]
+use std::sync::{Arc, Barrier, Mutex as StdMutex};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Error(i32);
+const EIO: Error = Error(-5);
+const ECANCELED: Error = Error(-125);
+type Result<T = ()> = std::result::Result<T, Error>;
+
+struct Mutex<T>(StdMutex<T>);
+impl<T> Mutex<T> {
+    fn new(v: T) -> Self { Self(StdMutex::new(v)) }
+    fn lock(&self) -> std::sync::MutexGuard<'_, T> { self.0.lock().unwrap() }
+    fn try_lock(&self) -> std::sync::TryLockResult<std::sync::MutexGuard<'_, T>> {
+        self.0.try_lock()
+    }
+}
+
+#[derive(Clone)]
+struct JobFenceOps;
+struct FenceInner {
+    seqno: u64,
+    error: AtomicI32,
+    log: Arc<StdMutex<Vec<(u64, i32)>>>,
+    on_signal: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+}
+#[derive(Clone)]
+struct UserFence<T>(Arc<FenceInner>, core::marker::PhantomData<T>);
+impl UserFence<JobFenceOps> {
+    fn new(
+        seqno: u64,
+        log: Arc<StdMutex<Vec<(u64, i32)>>>,
+        on_signal: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    ) -> Self {
+        Self(
+            Arc::new(FenceInner {
+                seqno,
+                error: AtomicI32::new(0),
+                log,
+                on_signal,
+            }),
+            core::marker::PhantomData,
+        )
+    }
+    fn raw(&self) -> *const FenceInner { Arc::as_ptr(&self.0) }
+    fn set_error(&self, error: Error) { self.0.error.store(error.0, Ordering::Release); }
+    fn signal(&self) {
+        if let Some(cb) = &self.0.on_signal {
+            cb(self.0.seqno);
+        }
+        self.0.log.lock().unwrap().push((self.0.seqno, self.0.error.load(Ordering::Acquire)));
+    }
+}
+
+SIGNAL_BATCH_LINE
+
+struct Pending {
+    fence: UserFence<JobFenceOps>,
+    result: Option<Result>,
+}
+
+struct Timeline {
+    next_seq: AtomicU64,
+    signaller: Mutex<()>,
+    pending: Mutex<Vec<Pending>>,
+    log: Arc<StdMutex<Vec<(u64, i32)>>>,
+}
+
+impl Timeline {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            next_seq: AtomicU64::new(1),
+            signaller: Mutex::new(()),
+            pending: Mutex::new(Vec::new()),
+            log: Arc::new(StdMutex::new(Vec::new())),
+        })
+    }
+
+    fn next(&self, on_signal: Option<Arc<dyn Fn(u64) + Send + Sync>>) -> UserFence<JobFenceOps> {
+        let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
+        let fence = UserFence::new(seq, self.log.clone(), on_signal);
+        self.pending.lock().push(Pending { fence: fence.clone(), result: None });
+        fence
+    }
+
+    TIMELINE_COMPLETE_FN
+}
+
+#[test]
+fn out_of_order_and_large_batches_signal_strictly_in_order() {
+    let tl = Timeline::new();
+    let count = SIGNAL_BATCH * 3 + 2;
+    let fences: Vec<_> = (0..count).map(|_| tl.next(None)).collect();
+    for i in (1..count).rev() {
+        let res = if i % 7 == 0 { Err(EIO) } else { Ok(()) };
+        tl.complete(&fences[i], res);
+    }
+    assert!(tl.log.lock().unwrap().is_empty());
+    tl.complete(&fences[1], Err(ECANCELED));
+    tl.complete(&fences[0], Ok(()));
+    let log = tl.log.lock().unwrap().clone();
+    assert_eq!(log.len(), count);
+    for (idx, (seq, err)) in log.iter().enumerate() {
+        assert_eq!(*seq, (idx + 1) as u64);
+        assert_eq!(*err, if idx != 0 && idx % 7 == 0 { EIO.0 } else { 0 });
+    }
+    assert!(tl.pending.lock().is_empty());
+    tl.complete(&fences[0], Err(EIO));
+    assert_eq!(tl.log.lock().unwrap().len(), count);
+}
+
+#[test]
+fn signal_callbacks_do_not_hold_pending_lock_and_allow_next() {
+    let tl = Timeline::new();
+    let tl_cb = tl.clone();
+    let f1 = tl.next(Some(Arc::new(move |_| {
+        assert!(tl_cb.pending.try_lock().is_ok());
+        let _f_nested = tl_cb.next(None);
+    })));
+    tl.complete(&f1, Ok(()));
+    assert_eq!(tl.log.lock().unwrap().len(), 1);
+    assert_eq!(tl.pending.lock().len(), 1);
+}
+
+#[test]
+fn concurrent_completers_preserve_strict_fifo_signal_order() {
+    for _ in 0..64 {
+        let tl = Timeline::new();
+        let n = 16usize;
+        let fences: Vec<_> = (0..n).map(|_| tl.next(None)).collect();
+        let barrier = Arc::new(Barrier::new(n));
+        let mut threads = Vec::with_capacity(n);
+        for (i, fence) in fences.into_iter().enumerate() {
+            let tl = tl.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                tl.complete(&fence, if i == 5 { Err(ECANCELED) } else { Ok(()) });
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        let log = tl.log.lock().unwrap().clone();
+        assert_eq!(log.len(), n);
+        for (idx, (seq, err)) in log.iter().enumerate() {
+            assert_eq!(*seq, (idx + 1) as u64);
+            assert_eq!(*err, if idx == 5 { ECANCELED.0 } else { 0 });
+        }
+        assert!(tl.pending.lock().is_empty());
+    }
+}
+'''.replace('SIGNAL_BATCH_LINE', signal_batch_line).replace(
+    'TIMELINE_COMPLETE_FN', timeline_complete_fn
+)
+
+with tempfile.TemporaryDirectory(prefix='m4-rust-timeline-') as directory:
+    directory = pathlib.Path(directory)
+    tl_unit = directory / 'timeline.rs'
+    tl_unit.write_text(timeline_harness)
+    tl_bin = directory / 'timeline'
+    for command in [
+        rustc() + ['--edition=2021', '--test', '-Dwarnings', str(tl_unit), '-o', str(tl_bin)],
+        [str(tl_bin), '--nocapture'],
+    ]:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        logs += result.stdout
+        print(result.stdout, end='')
+        (out / 'fence-signalling.log').write_text(logs)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+
 (out / 'fence-signalling.json').write_text(json.dumps({
-    'passed': True, 'tests': 4, 'negative_compile_checks': 1, 'cpu_only': True,
-    'scope': 'Production RAII annotation compiled in both CONFIG_LOCKDEP variants with task-cookie mock; does not exercise kernel lockdep or GPU lock ordering.',
+    'passed': True, 'tests': 7, 'negative_compile_checks': 1, 'cpu_only': True,
+    'scope': 'Production RAII annotation compiled in both CONFIG_LOCKDEP variants and g16 Timeline::complete() off-pending FIFO batch signalling.',
     'source_sha256': sha(production),
+    'timeline_source_sha256': sha(fence_source_path),
 }, indent=2) + '\n')

@@ -234,6 +234,8 @@ pub(crate) struct Shared {
     /// From a system sleep's `.prepare` until the firmware restarted: nothing reads its
     /// registers and nothing is published.
     pub(crate) sleeping: AtomicBool,
+    /// Firmware recovery is active under `Shared::state` (may sleep up to 1000 ms).
+    pub(crate) recovering: AtomicBool,
     /// The GFX power state word from before a system sleep.
     sleep_ps: AtomicU32,
     /// The stop left to a system sleep's commit, until `.complete` finishes it.
@@ -471,6 +473,7 @@ impl Gpu {
                 rtkit_buffer: AtomicU64::new(0),
                 orphaned: AtomicBool::new(false),
                 sleeping: AtomicBool::new(false),
+                recovering: AtomicBool::new(false),
                 sleep_ps: AtomicU32::new(0),
                 sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
                 events,

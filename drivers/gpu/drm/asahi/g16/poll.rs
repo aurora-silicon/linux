@@ -283,15 +283,20 @@ impl Shared {
         accepted
     }
 
-    /// Non-blocking variant of [`Self::submit`] for inline SUBMIT ioctl publication: returns
-    /// `None` without sleeping when `Shared::state` is contended so `drm_sched` publishes instead.
+    /// Inline SUBMIT ioctl publication: acquires `Shared::state` directly when the GPU is
+    /// neither sleeping nor recovering so brief poll-lock overlap does not bounce ready
+    /// submissions onto `drm_sched` kworker wakeups. Returns `None` during sleep or recovery
+    /// so `drm_sched` handles those paths without stalling SUBMIT.
     pub(crate) fn try_submit_inline(self: &Arc<Self>, job: Arc<Job>) -> Option<Result> {
+        if self.sleeping.load(Ordering::Acquire) || self.recovering.load(Ordering::Acquire) {
+            return None;
+        }
         let signalling = kernel::dma_fence::SignallingGuard::new();
         let mut done = Completions::new();
         let mut scrubs = super::slots::ScrubBatch::new();
         let accepted = {
-            let mut state = self.state.try_lock()?;
-            if self.sleeping.load(Ordering::Acquire) {
+            let mut state = self.state.lock();
+            if self.sleeping.load(Ordering::Acquire) || self.recovering.load(Ordering::Acquire) {
                 return None;
             }
             match state.as_deref_mut() {
