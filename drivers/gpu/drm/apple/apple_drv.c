@@ -8,6 +8,7 @@
  */
 
 #include <linux/soc/apple/j613-display.h>
+#include <kunit/visibility.h>
 #include <linux/aperture.h>
 #include <linux/component.h>
 #include <linux/completion.h>
@@ -1268,9 +1269,10 @@ static int apple_probe_per_dcp(struct device *dev,
  * Type-C connector any of whose pipelines is native26 offers no BT.2020/PQ
  * output contract. Every other pipeline has a 10-bit primary.
  */
-static bool apple_typec_port_rgb8_only(struct platform_device **dcp, int num_dcp,
-				       struct platform_device *pipeline,
-				       unsigned int port_idx)
+VISIBLE_IF_KUNIT bool apple_typec_port_rgb8_only(struct platform_device **dcp,
+						 int num_dcp,
+						 struct platform_device *pipeline,
+						 unsigned int port_idx)
 {
 	int i;
 
