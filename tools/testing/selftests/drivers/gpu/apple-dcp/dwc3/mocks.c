@@ -111,6 +111,8 @@ struct dwc3_apple {
 	enum dwc3_apple_sleep_phase sleep_phase;
 	bool sleep_syscore, sleep_role_pending;
 	enum dwc3_apple_state sleep_role;
+	/* A device role taken off its host for suspend-to-idle; never set here. */
+	bool sleep_gadget_off;
 	/*
 	 * J714s only: a host kept suspended on its USB4 router's USB3 tunnel through the
 	 * router's sleep, and the role its port controller asked for meanwhile.
