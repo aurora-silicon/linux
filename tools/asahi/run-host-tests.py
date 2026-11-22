@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ASAHI = ROOT / 'tools/asahi'
 GPU = ROOT / 'tools/testing/selftests/drivers/gpu'
 APPLE = ROOT / 'tools/testing/selftests/drivers/apple'
+AVE_TESTS = ROOT / 'drivers/media/platform/apple/ave/tests'
 
 PASS = 'pass'
 KILL = 'kill'
@@ -331,6 +332,10 @@ SUITES = [
     ('apple-afkv2-gcc', GPU / 'apple-afkv2', ['sh', 'run-afkv2-tests.sh']),
     ('apple-afkv2-clang', GPU / 'apple-afkv2', ['sh', 'run-afkv2-tests.sh']),
     ('t8140-external-bw', GPU, ['python3', '-I', '-B', 'test_t8140_external_bw.py']),
+    # The AVE encoder's own harnesses: the production command, session and
+    # recovery code built against host boundaries.
+    ('ave-host', AVE_TESTS, ['python3', '-I', '-B', 'run.py', '--build', '{out}']),
+    ('ave-recovery', AVE_TESTS, ['python3', '-I', '-B', 'run-recovery.py']),
 ]
 
 # tools/testing/selftests/drivers/apple: the host-runnable harnesses build the
