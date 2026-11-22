@@ -70,6 +70,23 @@ pub(crate) fn pipeline_room(depth: usize, batches: usize, passes: usize,
     Some(((last_base + last_count) % SLOTS, SLOTS - passes))
 }
 
+/// Whether the next command may extend the batch. Render passes always need the budget. A compute
+/// batch always takes one command; further commands need a budget and the VM's measured compute
+/// cost, so that without a budget every compute batch is one command, as before. Only an
+/// explicit `m3_compute_batch_override` lets the front packet's own commands go unbudgeted.
+pub(crate) fn admits(render:bool, joined:bool, explicit:bool, cost:Option<u64>, budget:Option<u64>,
+    passes:usize) -> bool {
+    if render || passes == 0 { return within_budget(cost, budget, passes); }
+    if explicit && !joined { return true; }
+    budget.is_some() && within_budget(cost, budget, passes)
+}
+
+/// Seconds a published batch may run before it is failed: each command keeps the two seconds it
+/// had when it was published alone, so batching never shortens a command's deadline.
+pub(crate) const fn batch_deadline_secs(commands:usize) -> i64 {
+    2 * (if commands == 0 { 1 } else { commands }) as i64
+}
+
 /// Always admit one pass; subsequent passes must fit the measured budget.
 /// Unknown cost permits one pass until a measurement is available.
 pub(crate) fn within_budget(cost: Option<u64>, budget: Option<u64>, passes: usize) -> bool {

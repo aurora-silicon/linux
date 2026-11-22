@@ -33,6 +33,43 @@ fn priority_fifo_and_partial_packet_yields() {
 }
 
 #[test]
+fn compute_batches_grow_only_under_a_budget() {
+    let budget=Some(4_000_000);
+    for joined in [false,true] { for explicit in [false,true] {
+        // One command always goes.
+        assert!(admits(false,joined,explicit,None,None,0));
+        // A measured cost that fits the budget lets the batch grow.
+        assert!(admits(false,joined,explicit,Some(1_000_000),budget,3));
+        assert!(admits(false,joined,explicit,Some(10_000),budget,1));
+    }}
+    // Without an override: no budget or no measurement keeps one command per batch.
+    for joined in [false,true] {
+        assert!(!admits(false,joined,false,Some(10_000),None,1));
+        assert!(!admits(false,joined,false,None,budget,1));
+        assert!(!admits(false,joined,false,Some(1_000_000),budget,4));
+    }
+    // An explicit override bounds the front packet's own commands alone, never joined ones.
+    assert!(admits(false,false,true,None,None,15));
+    assert!(admits(false,false,true,Some(10_000_000),budget,15));
+    assert!(!admits(false,true,true,None,None,1));
+    assert!(!admits(false,true,true,Some(1_000_000),budget,4));
+    // Render keeps its budget rule.
+    for joined in [false,true] {
+        assert!(admits(true,joined,false,None,budget,0));
+        assert!(!admits(true,joined,false,None,budget,1));
+        assert!(admits(true,joined,false,None,None,7));
+    }
+}
+
+#[test]
+fn batched_commands_keep_their_deadline() {
+    assert_eq!(batch_deadline_secs(0),2);
+    assert_eq!(batch_deadline_secs(1),2);
+    assert_eq!(batch_deadline_secs(8),16);
+    assert_eq!(batch_deadline_secs(16),32);
+}
+
+#[test]
 fn initbm_vm_engine_and_notification_gates() {
     for bits in 0..32 {
         let yes=|i|bits&(1<<i)!=0;

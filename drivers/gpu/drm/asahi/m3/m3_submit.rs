@@ -85,6 +85,9 @@ impl Packet {
     pub(crate) fn release_guard(&self) {drop(self.vm_job.lock().take());}
     /// Called before the first firmware-visible change of a batch that includes this packet.
     pub(crate) fn mark_published(&self) {self.published.store(true,Ordering::Relaxed);}
+    /// Undo `mark_published` for a packet that joined a batch from its first command when that
+    /// batch failed before any firmware-visible change.
+    pub(crate) fn clear_published(&self) {self.published.store(false,Ordering::Relaxed);}
     /// Whether the firmware may have seen any of this packet's commands.
     pub(crate) fn may_be_published(&self)->bool {self.published.load(Ordering::Relaxed)}
     pub(crate) fn retired(&self) {self.release_guard();self.finish(Ok(()));}

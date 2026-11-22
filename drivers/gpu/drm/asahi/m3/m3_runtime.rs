@@ -63,6 +63,9 @@ struct Inner {
     /// Whether a T8122 job verdict line was already emitted for the current job, so the
     /// execute-path fallback does not add a second one. T8122 only.
     t8122_verdict: bool,
+    /// Publish the front packet alone once: a batch that joined later packets failed before
+    /// anything reached the firmware, and the front packet must not take the blame for them.
+    solo_next: bool,
     /// The step the firmware boot sequence has reached, for the T8122 boot verdict. T8122 only.
     boot_step: crate::m3::t8122_start::BootStep,
     /// Packets that joined a batch started by an earlier packet (debug summary).
@@ -223,6 +226,7 @@ impl Inner {
         self.packets.retain(|p| self.active.iter().any(|b|b.entries.iter().any(|(q,_)|Arc::ptr_eq(p,q))));
     }
     fn fail_front(&mut self,error:Error) {
+        self.solo_next=false;
         if let Ok((packet,_))=self.pending.remove(0) {
             if !self.packet_active(&packet) && !self.fault_captured {packet.release_guard();}
             packet.finish(Err(error));
@@ -260,15 +264,16 @@ impl Inner {
         let same_engine=|c:&crate::m3::m3_submit::Command| render==matches!(c,crate::m3::m3_submit::Command::Render{..});
         let per_pass=if render {self.pass_cost.get(packet.vm.id())} else {self.compute_cost.get(packet.vm.id())};
         let budget=crate::m3::m3_params::render_batch_budget_ns(self.device.soc());
+        let explicit=crate::m3::m3_params::compute_batch_overridden();
         let in_flight:usize=self.active.iter().map(|b|b.entries.len()).sum();
         for (position,(candidate,start)) in self.pending.iter().enumerate() {
             // Later packets join only from their first command, only for the VM the batch is
             // bound to and at its urgency, while the batch's expected GPU time is within the
             // budget. Each queued submission otherwise pays a full firmware round trip.
-            if position>0 && !policy::may_join(*start,candidate.vm.same(&packet.vm),candidate.urgency==packet.urgency) {break;}
+            if position>0 && (self.solo_next || !policy::may_join(*start,candidate.vm.same(&packet.vm),candidate.urgency==packet.urgency)) {break;}
             let mut index=*start;
             while index<candidate.commands.len() && entries.len()<limit && same_engine(&candidate.commands[index]) {
-                if !policy::within_budget(per_pass,budget,in_flight+entries.len()) {return Ok(entries);}
+                if !policy::admits(render,position>0,explicit,per_pass,budget,in_flight+entries.len()) {return Ok(entries);}
                 entries.push((candidate.clone(),index),GFP_KERNEL)?;
                 index+=1;
             }
@@ -340,6 +345,7 @@ impl Inner {
             };
             match self.publish(&entries,base,overlap) {
                 Ok(batch)=>{
+                    self.solo_next=false;
                     // Consume the published commands from `pending`.
                     let Some((last,last_index))=entries.last().map(|(p,i)|(p.clone(),*i)) else {break;};
                     while let Some((packet,_))=self.pending.first() {
@@ -374,6 +380,13 @@ impl Inner {
                         // Not publishable behind the running batch (new VM binding or storage
                         // growth): wait for it to retire.
                         break;
+                    } else if !self.solo_next && entries.iter().any(|(p,_)|!Arc::ptr_eq(p,&entries[0].0)) {
+                        // Nothing reached the firmware, but later packets joined: they joined from
+                        // their first command and were never published before, so they are
+                        // unpublished again. Retry the front packet alone before failing it.
+                        for (p,_) in entries.iter().filter(|(p,_)|!Arc::ptr_eq(p,&entries[0].0)) {p.clear_published();}
+                        self.solo_next=true;
+                        progress=true;
                     } else {
                         // Nothing reached the firmware: fail only the front packet, as a failed
                         // execute() did before publication.
@@ -734,7 +747,7 @@ impl Inner {
                     return Ok(true);
                 }
                 Ok(false)=>{
-                    let (expired,previous)=self.active.first().map(|b|(b.start.elapsed()>=Delta::from_secs(2),b.previous_events)).ok_or(EIO)?;
+                    let (expired,previous)=self.active.first().map(|b|(b.start.elapsed()>=Delta::from_secs(policy::batch_deadline_secs(b.entries.len())),b.previous_events)).ok_or(EIO)?;
                     if expired {
                         dev_err!(self.drm.as_ref(),"M3 pipelined completion events={} previous={}\n",self.config.completed_events,previous);
                         self.fail_active(ETIMEDOUT);return Err(ETIMEDOUT);
@@ -810,7 +823,7 @@ impl Inner {
                 if evented && batch.events_ns<0 {batch.events_ns=at;}
             }
             if let Some(t)=poll_start {batch.polling_ns+=t.elapsed().as_nanos();batch.polls+=1;}
-            (evented,batch.start.elapsed()>=Delta::from_secs(2),batch.previous_events)
+            (evented,batch.start.elapsed()>=Delta::from_secs(policy::batch_deadline_secs(batch.entries.len())),batch.previous_events)
         };
         if stamped && evented {
             let retire_mmio=crate::m3::m3_params::retire_mmio(self.device.soc());
@@ -1124,7 +1137,7 @@ impl Runtime {
         };
         Ok(Self { inner: ManuallyDrop::new(owner.write(Inner { transport, state, config, uat, window, drm, device,
             jobs:KVec::new(),packets:KVec::new(),pending:KVec::new(),active:KVec::new(),gpu_pending:false,active_power_last:None,active_power_samples:0,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3::m3_pass_layout::SLOTS],
-            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,mixed_batches:0,pass_cost:policy::PassCosts::default(),compute_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,
+            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,mixed_batches:0,pass_cost:policy::PassCosts::default(),compute_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,solo_next:false,
             boot_step:crate::m3::t8122_start::BootStep::Publish })) })
     }
     pub(crate) fn drm(&self) -> driver::AsahiDevRef { self.inner.drm.clone() }
