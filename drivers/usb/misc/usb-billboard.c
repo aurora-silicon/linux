@@ -218,6 +218,12 @@ static const char * const bb_mode_attr_names[BB_NR_MODE_ATTRS] = {
 /*
  * Sysfs groups cannot nest, so everything lives in one "billboard" group:
  * the device-wide attributes plus altmode<N>_<field> for each mode.
+ *
+ * The group is not device-managed: devres would remove it only after
+ * usb_unbind_interface() has cleared the interface data that the
+ * device-wide attributes read. billboard_disconnect() removes it instead,
+ * while the data is still set; sysfs removal waits for running show()
+ * calls, so none can see the cleared pointer or the freed state.
  */
 static int bb_add_group(struct usb_billboard *bb)
 {
@@ -259,7 +265,7 @@ static int bb_add_group(struct usb_billboard *bb)
 	bb->group.name = "billboard";
 	bb->group.attrs = attrs;
 
-	return devm_device_add_group(dev, &bb->group);
+	return device_add_group(dev, &bb->group);
 }
 
 /* Descriptor parsing */
@@ -305,8 +311,8 @@ static void bb_kfree(void *p)
 }
 
 /*
- * Strings are released by devres after the sysfs groups that print them,
- * because devres runs in reverse order and the strings are registered first.
+ * Strings are released by devres, after billboard_disconnect() has removed
+ * the sysfs group that prints them.
  */
 static char *bb_string(struct usb_interface *intf, u8 index)
 {
@@ -404,7 +410,10 @@ static int billboard_probe(struct usb_interface *intf,
 
 static void billboard_disconnect(struct usb_interface *intf)
 {
-	/* Everything is device-managed. */
+	struct usb_billboard *bb = usb_get_intfdata(intf);
+
+	/* Before the core clears intfdata; the rest is device-managed. */
+	device_remove_group(&intf->dev, &bb->group);
 }
 
 static const struct usb_device_id billboard_ids[] = {
