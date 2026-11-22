@@ -672,6 +672,24 @@ static int avd_h264_validate_slice(struct avd_ctx *ctx,
 	return 0;
 }
 
+static enum avd_image_fmt
+avd_h264_sps_image_fmt(const struct v4l2_ctrl_h264_sps *sps)
+{
+	if (sps->bit_depth_luma_minus8 == 0) {
+		if (sps->chroma_format_idc == 2)
+			return AVD_IMG_FMT_422_8BIT;
+		else
+			return AVD_IMG_FMT_420_8BIT;
+	} else if (sps->bit_depth_luma_minus8 == 2) {
+		if (sps->chroma_format_idc == 2)
+			return AVD_IMG_FMT_422_10BIT;
+		else
+			return AVD_IMG_FMT_420_10BIT;
+	}
+
+	return AVD_IMG_FMT_ANY;
+}
+
 /*
  * H.264 7.4.2.1.1: the picture is PicWidthInMbs macroblocks wide and
  * FrameHeightInMbs = (2 - frame_mbs_only_flag) * PicHeightInMapUnits high.
@@ -1025,6 +1043,9 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	/* Recheck controls applied from this request before building instructions. */
 	ret = avd_h264_validate_sps(ctx, run.sps);
 	if (!ret)
+		ret = avd_check_run_image_fmt(ctx,
+					      avd_h264_sps_image_fmt(run.sps));
+	if (!ret)
 		ret = avd_h264_validate_pps(ctx, run.pps);
 	if (!ret)
 		ret = avd_h264_validate_slice(ctx, run.slice_params);
@@ -1182,24 +1203,10 @@ static void avd_h264_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
 static enum avd_image_fmt avd_h264_get_image_fmt(struct avd_ctx *ctx,
 						 struct v4l2_ctrl *ctrl)
 {
-	const struct v4l2_ctrl_h264_sps *sps = ctrl->p_new.p_h264_sps;
-
 	if (ctrl->id != V4L2_CID_STATELESS_H264_SPS)
 		return AVD_IMG_FMT_ANY;
 
-	if (sps->bit_depth_luma_minus8 == 0) {
-		if (sps->chroma_format_idc == 2)
-			return AVD_IMG_FMT_422_8BIT;
-		else
-			return AVD_IMG_FMT_420_8BIT;
-	} else if (sps->bit_depth_luma_minus8 == 2) {
-		if (sps->chroma_format_idc == 2)
-			return AVD_IMG_FMT_422_10BIT;
-		else
-			return AVD_IMG_FMT_420_10BIT;
-	}
-
-	return AVD_IMG_FMT_ANY;
+	return avd_h264_sps_image_fmt(ctrl->p_new.p_h264_sps);
 }
 
 static void avd_h264_adjust_decoded_fmt(struct avd_ctx *ctx,

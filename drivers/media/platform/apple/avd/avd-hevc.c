@@ -1038,14 +1038,9 @@ static void avd_hevc_adjust_decoded_fmt(struct avd_ctx *ctx,
 		mv_color_size(pix_mp->width, pix_mp->height);
 }
 
-static enum avd_image_fmt avd_hevc_get_image_fmt(struct avd_ctx *ctx,
-						 struct v4l2_ctrl *ctrl)
+static enum avd_image_fmt
+avd_hevc_sps_image_fmt(const struct v4l2_ctrl_hevc_sps *sps)
 {
-	const struct v4l2_ctrl_hevc_sps *sps = ctrl->p_new.p_hevc_sps;
-
-	if (ctrl->id != V4L2_CID_STATELESS_HEVC_SPS)
-		return AVD_IMG_FMT_ANY;
-
 	/* avd_hevc_validate_sps() refuses 4:4:4 and depths other than 8/10. */
 	if (sps->bit_depth_luma_minus8 == 0) {
 		if (sps->chroma_format_idc == 2)
@@ -1060,6 +1055,15 @@ static enum avd_image_fmt avd_hevc_get_image_fmt(struct avd_ctx *ctx,
 	}
 
 	return AVD_IMG_FMT_ANY;
+}
+
+static enum avd_image_fmt avd_hevc_get_image_fmt(struct avd_ctx *ctx,
+						 struct v4l2_ctrl *ctrl)
+{
+	if (ctrl->id != V4L2_CID_STATELESS_HEVC_SPS)
+		return AVD_IMG_FMT_ANY;
+
+	return avd_hevc_sps_image_fmt(ctrl->p_new.p_hevc_sps);
 }
 
 /*
@@ -1690,6 +1694,9 @@ static int avd_hevc_run(struct avd_ctx *ctx)
 
 	/* Also validate controls applied from a queued request before submission. */
 	ret = avd_hevc_validate_sps(ctx, run.sps);
+	if (!ret)
+		ret = avd_check_run_image_fmt(ctx,
+					      avd_hevc_sps_image_fmt(run.sps));
 	if (ret)
 		goto complete;
 

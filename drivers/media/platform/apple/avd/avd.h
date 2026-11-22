@@ -368,6 +368,7 @@ void avd_job_finish_no_pm(struct avd_ctx *ctx, enum vb2_buffer_state result);
 void avd_job_finish(struct avd_ctx *ctx, enum vb2_buffer_state result);
 
 void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run);
+int avd_check_run_image_fmt(struct avd_ctx *ctx, enum avd_image_fmt image_fmt);
 void avd_run_postamble(struct avd_ctx *ctx, struct avd_run *run);
 
 #if IS_ENABLED(CONFIG_KUNIT)

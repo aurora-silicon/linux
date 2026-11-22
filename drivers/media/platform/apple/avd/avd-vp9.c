@@ -698,6 +698,14 @@ static void init_probs(struct avd_ctx *ctx, const struct avd_vp9_run *run)
 	       sizeof(avd_probs->seg.tree_probs));
 }
 
+static enum avd_image_fmt
+avd_vp9_frame_image_fmt(const struct v4l2_ctrl_vp9_frame *frame)
+{
+	/* avd_vp9_try_ctrl() admits only 4:2:0 (profiles 0 and 2). */
+	return frame->bit_depth == 8 ? AVD_IMG_FMT_420_8BIT :
+				       AVD_IMG_FMT_420_10BIT;
+}
+
 /*
  * The row and column scratch is sized at STREAMON from the OUTPUT (coded)
  * format, which cannot change while it streams. The CAPTURE format can be
@@ -921,6 +929,9 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 
 	/* The frame may have been set, unchecked, while another codec was selected. */
 	ret = avd_vp9_validate_frame(ctx, dec_params);
+	if (!ret)
+		ret = avd_check_run_image_fmt(ctx,
+					      avd_vp9_frame_image_fmt(dec_params));
 	if (ret)
 		return ret;
 
@@ -1286,17 +1297,10 @@ err_free_ctx:
 static enum avd_image_fmt avd_vp9_get_image_fmt(struct avd_ctx *ctx,
 						struct v4l2_ctrl *ctrl)
 {
-#define BIT_DEPTH(chroma)                                      \
-	(frame->bit_depth == 8 ? AVD_IMG_FMT_##chroma##_8BIT : \
-				 AVD_IMG_FMT_##chroma##_10BIT)
-	const struct v4l2_ctrl_vp9_frame *frame = ctrl->p_new.p_vp9_frame;
-
 	if (ctrl->id != V4L2_CID_STATELESS_VP9_FRAME)
 		return AVD_IMG_FMT_ANY;
 
-	/* avd_vp9_try_ctrl() admits only 4:2:0 (profiles 0 and 2). */
-	return BIT_DEPTH(420);
-#undef BIT_DEPTH
+	return avd_vp9_frame_image_fmt(ctrl->p_new.p_vp9_frame);
 }
 
 static int avd_vp9_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)

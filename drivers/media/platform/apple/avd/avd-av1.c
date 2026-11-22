@@ -1448,6 +1448,14 @@ EXPORT_SYMBOL_IF_KUNIT(avd_av1_check_tiles);
  * when the sequence is set and again when a frame runs, so it never
  * reaches the decoder.
  */
+static enum avd_image_fmt
+avd_av1_seq_image_fmt(const struct v4l2_ctrl_av1_sequence *seq)
+{
+	/* avd_av1_validate_sequence() admits only Main profile 4:2:0. */
+	return seq->bit_depth == 8 ? AVD_IMG_FMT_420_8BIT :
+				     AVD_IMG_FMT_420_10BIT;
+}
+
 static int avd_av1_validate_sequence(struct avd_ctx *ctx,
 				     const struct v4l2_ctrl_av1_sequence *seq)
 {
@@ -1482,6 +1490,9 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 
 	/* The sequence may have been set, unchecked, while another codec was selected. */
 	ret = avd_av1_validate_sequence(ctx, run->seq);
+	if (!ret)
+		ret = avd_check_run_image_fmt(ctx,
+					      avd_av1_seq_image_fmt(run->seq));
 	if (ret)
 		return ret;
 
@@ -1899,18 +1910,10 @@ err_free_ctx:
 static enum avd_image_fmt avd_av1_get_image_fmt(struct avd_ctx *ctx,
 						struct v4l2_ctrl *ctrl)
 {
-#define BIT_DEPTH(chroma)                                    \
-	(seq->bit_depth == 8 ? AVD_IMG_FMT_##chroma##_8BIT : \
-			       AVD_IMG_FMT_##chroma##_10BIT)
-
-	const struct v4l2_ctrl_av1_sequence *seq = ctrl->p_new.p_av1_sequence;
-
 	if (ctrl->id != V4L2_CID_STATELESS_AV1_SEQUENCE)
 		return AVD_IMG_FMT_ANY;
 
-	/* avd_av1_validate_sequence() admits only Main profile 4:2:0. */
-	return BIT_DEPTH(420);
-#undef BIT_DEPTH
+	return avd_av1_seq_image_fmt(ctrl->p_new.p_av1_sequence);
 }
 
 static unsigned int avd_av1_pp_kicks(struct avd_ctx *ctx)

@@ -66,6 +66,32 @@ static bool avd_image_fmt_fits_capture(struct avd_ctx *ctx,
 	       !memcmp(comp.offsets, ctx->comp.offsets, sizeof(comp.offsets));
 }
 
+/*
+ * Whether a job may program @image_fmt, the picture format that the current
+ * value of the codec's format control describes. The CAPTURE buffers and the
+ * per-context scratch were sized for ctx->image_fmt (ANY sizes them as 8-bit
+ * 4:2:0), and the control's value can differ from it: it may have been set
+ * while another codec was selected, or kept over an OUTPUT format change, and
+ * an unchanged value never reaches s_ctrl. Refuse the job unless both are the
+ * same and the CAPTURE buffers fit it.
+ */
+int avd_check_run_image_fmt(struct avd_ctx *ctx, enum avd_image_fmt image_fmt)
+{
+	enum avd_image_fmt sized = ctx->image_fmt;
+
+	if (sized == AVD_IMG_FMT_ANY)
+		sized = AVD_IMG_FMT_420_8BIT;
+	if (image_fmt == AVD_IMG_FMT_ANY)
+		image_fmt = AVD_IMG_FMT_420_8BIT;
+	if (image_fmt != sized || !avd_image_fmt_fits_capture(ctx, image_fmt)) {
+		dev_dbg_ratelimited(ctx->dev->dev,
+				    "picture format %d does not fit the buffers (%d)\n",
+				    image_fmt, ctx->image_fmt);
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static u32 avd_enum_decoded_fmt(struct avd_ctx *ctx, int index,
 				enum avd_image_fmt image_fmt)
 {
