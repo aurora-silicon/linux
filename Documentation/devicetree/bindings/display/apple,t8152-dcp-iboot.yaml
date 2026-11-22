@@ -188,6 +188,12 @@ properties:
     maxItems: 1
     description: DCP DART stream
 
+  power-domains:
+    maxItems: 1
+    description:
+      The coprocessor's power state, which its firmware runs; the DARTs
+      follow it.
+
   scanout:
     type: object
     additionalProperties: false
