@@ -61,10 +61,7 @@ static void dcp_peer_wait_done(struct apple_dcp *dcp, void *out, void *cookie)
 	kref_put(&wait->refs, dcp_peer_wait_free);
 }
 
-static struct dcp_peer_wait *dcp_peer_begin(struct apple_dcp *dcp, bool oob,
-					    const struct dcp_method_entry *method,
-					    void *in, size_t in_size, size_t out_size,
-					    u8 reply_fill)
+static struct dcp_peer_wait *dcp_peer_wait_alloc(size_t out_size, u8 reply_fill)
 {
 	struct dcp_peer_wait *wait;
 
@@ -79,6 +76,18 @@ static struct dcp_peer_wait *dcp_peer_begin(struct apple_dcp *dcp, bool oob,
 	init_completion(&wait->done);
 	kref_init(&wait->refs);
 	kref_get(&wait->refs);
+	return wait;
+}
+
+static struct dcp_peer_wait *dcp_peer_begin(struct apple_dcp *dcp, bool oob,
+					    const struct dcp_method_entry *method,
+					    void *in, size_t in_size, size_t out_size,
+					    u8 reply_fill)
+{
+	struct dcp_peer_wait *wait = dcp_peer_wait_alloc(out_size, reply_fill);
+
+	if (IS_ERR(wait))
+		return wait;
 	dcp_push(dcp, oob, method, in_size, out_size, in, dcp_peer_wait_done, wait);
 	return wait;
 }
@@ -168,7 +177,9 @@ void dcp_peer_bound_26_6(struct apple_dcp *dcp)
 static void dcp_peer_forget(struct apple_dcp *dcp)
 {
 	guard(mutex)(&dcp_peer_lock);
-	dcp->peer_unbinding = true;
+	WRITE_ONCE(dcp->peer_unbinding, true);
+	if (dcp->hw.t602x_paired_dp && (dcp->peer_owner || dcp->peer_reserved))
+		wake_up_all(&(dcp->peer_owner ?: dcp)->t602x_pair_wait);
 	if (dcp->peer_reserved) {
 		dcp->peer_reserved->peer_owner = NULL;
 		memset(&dcp->peer_reserved->peer_tiling, 0,

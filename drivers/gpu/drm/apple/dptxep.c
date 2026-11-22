@@ -1018,8 +1018,8 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		struct apple_dcp *dcp = service->ep->dcp;
 		int ret;
 
-		if (dcp->fw_compat == DCP_FIRMWARE_V_13_5 && !dptx->unit &&
-		    of_device_is_compatible(dcp->dev->of_node, "apple,t6020-dcpext") &&
+		if (dcp->fw_compat == DCP_FIRMWARE_V_13_5 && dcp->hw.t602x_paired_dp &&
+		    !dptx->unit &&
 		    data_size == sizeof(struct dcp_display_hints_v13_5)) {
 			struct dcp_display_hints_v13_5 *hints = reply;
 
@@ -1590,6 +1590,25 @@ static int dptx_native_controller_prepare(struct apple_epic_service *service,
 	return 0;
 }
 
+static void dptx_t602x_controller_init(struct apple_epic_service *service, const char *name,
+				       const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+
+	complete(&dcp->dptx_controller_ready);
+	if ((unsigned long)service->cookie == BIT(0))
+		wake_up_all(&dcp->t602x_pair_wait);
+}
+
+static const struct apple_epic_service_ops dptx_t602x_controller_ops[] = {
+	{
+		.name = "AppleDCPDPTXController",
+		.prepare = dptx_native_controller_prepare,
+		.init = dptx_t602x_controller_init,
+	},
+	{}
+};
+
 static const struct apple_epic_service_ops dptx_native_controller_ops[] = {
 	{
 		.name = "AppleDCPDPTXController",
@@ -1609,14 +1628,16 @@ static const struct apple_epic_service_ops dptx_controller_ops[] = {
 
 int dptx_controller_init(struct apple_dcp *dcp)
 {
+	const struct apple_epic_service_ops *ops = dptx_controller_ops;
 	struct apple_dcp_afkep *ep;
 	int ret;
 
 	init_completion(&dcp->dptx_controller_ready);
-	ep = afk_init(dcp, DPTX_CONTROLLER_ENDPOINT,
-		      (dcp_is_ext26(dcp) || (dcp->fw_compat == DCP_FIRMWARE_V_13_5 &&
-			    of_device_is_compatible(dcp->dev->of_node, "apple,t6020-dcpext"))) ?
-		      dptx_native_controller_ops : dptx_controller_ops);
+	if (dcp_is_ext26(dcp))
+		ops = dptx_native_controller_ops;
+	else if (dcp->fw_compat == DCP_FIRMWARE_V_13_5 && dcp->hw.t602x_paired_dp)
+		ops = dptx_t602x_controller_ops;
+	ep = afk_init(dcp, DPTX_CONTROLLER_ENDPOINT, ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	/* Controller interfaces require the same OPEN handshake as the port. */

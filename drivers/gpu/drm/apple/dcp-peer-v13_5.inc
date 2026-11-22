@@ -331,8 +331,25 @@ static int t602x_read_counter(struct apple_dcp *pipe, u32 *value)
 	return ret;
 }
 
+static struct apple_epic_service *t602x_get_av_controller(struct apple_dcp_afkep *ep)
+{
+	u32 count = min_t(u32, READ_ONCE(ep->num_channels), AFK_MAX_CHANNEL);
+
+	for (u32 i = 0; i < count; i++) {
+		struct apple_epic_service *s = afk_service_get(&ep->services[i]);
+
+		if (!s)
+			continue;
+		if ((unsigned long)s->cookie == BIT(0))
+			return s;
+		afk_service_put(s);
+	}
+	return NULL;
+}
+
 static struct apple_epic_service *t602x_peer_controller(struct apple_dcp *peer)
 {
+	struct apple_epic_service *service;
 	struct apple_dcp_afkep *ep;
 	int ret;
 
@@ -344,22 +361,10 @@ static struct apple_epic_service *t602x_peer_controller(struct apple_dcp *peer)
 	ep = peer->dptx_controller_ep;
 	if (IS_ERR_OR_NULL(ep) || ep->wire_v2)
 		return ERR_PTR(-ENODEV);
-	for (int attempt = 0; attempt < 20; attempt++) {
-		u32 count = min_t(u32, READ_ONCE(ep->num_channels), AFK_MAX_CHANNEL);
-
-		for (u32 i = 0; i < count; i++) {
-			struct apple_epic_service *s = afk_service_get(&ep->services[i]);
-
-			if (!s)
-				continue;
-			/* The controller's prepare callback identifies unit 0, AV. */
-			if ((unsigned long)s->cookie == BIT(0))
-				return s;
-			afk_service_put(s);
-		}
-		msleep(15);
-	}
-	return ERR_PTR(-ENODEV);
+	if (!wait_event_timeout(peer->t602x_pair_wait,
+				(service = t602x_get_av_controller(ep)), msecs_to_jiffies(300)))
+		return ERR_PTR(-ENODEV);
+	return service;
 }
 
 struct t602x_ctrl_value {
@@ -427,6 +432,11 @@ static int t602x_pair_power(struct apple_dcp *owner, struct apple_dcp *peer, boo
 	r = t602x_end(w, 4, 2500, NULL);
 	s = IS_ERR(p) ? PTR_ERR(p) : t602x_end(p, 4, 2500, NULL);
 	dev_dbg(owner->dev, "13.5 pair power %u: primary %d peer %d\n", on, r, s);
+	/*
+	 * A472 acknowledges the request. Firmware 13.5 supplies no known
+	 * power-ready event here. Keep the same settle time as the 26.6 pair
+	 * before changing the link or selecting a mode.
+	 */
 	if (!r && !s)
 		msleep(100);
 	return r ?: s;
@@ -453,7 +463,11 @@ bool dcp_t602x_tiling(struct apple_dcp *pipe, bool write, u32 event, u32 param,
 		switch (param) {
 		case 2: t->phase = *value; return true;
 		case 5: t->ready = !!*value; return true;
-		case 9: t->modeset_state = *value; return true;
+		case 9:
+			WRITE_ONCE(t->modeset_state, *value);
+			if (*value >= 2)
+				wake_up_all(&target->t602x_pair_wait);
+			return true;
 		default: return false;
 		}
 	}
@@ -540,6 +554,12 @@ static int t602x_dsc(struct apple_dcp *owner, struct apple_dcp *peer)
 	return ret;
 }
 
+static void t602x_modeset_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	dcp_peer_wait_done(dcp, out, cookie);
+	wake_up_all(&dcp->t602x_pair_wait);
+}
+
 static int t602x_set_mode(struct apple_dcp *owner, struct apple_dcp *peer,
 				   struct dcp_peer_insert_video_req *video)
 {
@@ -548,7 +568,6 @@ static int t602x_set_mode(struct apple_dcp *owner, struct apple_dcp *peer,
 	};
 	__le32 mode[] = { video->color_id, video->timing_id };
 	struct dcp_peer_wait *w, *p;
-	unsigned long until;
 	u32 phase = 1;
 	int ret, owner_ret;
 
@@ -561,17 +580,16 @@ static int t602x_set_mode(struct apple_dcp *owner, struct apple_dcp *peer,
 		ret = t602x_sync_video_ids(owner, peer);
 	if (ret)
 		return ret;
-	w = dcp_peer_begin(owner, false, &select, mode, sizeof(mode), 4, 0xff);
+	w = dcp_peer_wait_alloc(4, 0xff);
 	if (IS_ERR(w))
 		return PTR_ERR(w);
-	until = jiffies + msecs_to_jiffies(7500);
-	do {
-		if (!dcp_t602x_tiling(owner, false, 1, 9, &phase) || phase >= 2 ||
-		    completion_done(&w->done) || READ_ONCE(owner->crashed))
-			break;
-		usleep_range(1000, 2000);
-	} while (time_before(jiffies, until));
-	if (phase < 2) {
+	dcp_push(owner, false, &select, sizeof(mode), 4, mode, t602x_modeset_done, w);
+	wait_event_timeout(owner->t602x_pair_wait,
+			   READ_ONCE(owner->peer_tiling.modeset_state) >= 2 ||
+			   READ_ONCE(owner->peer_unbinding) || READ_ONCE(peer->peer_unbinding) ||
+			   completion_done(&w->done) || READ_ONCE(owner->crashed),
+			   msecs_to_jiffies(7500));
+	if (!dcp_t602x_tiling(owner, false, 1, 9, &phase) || phase < 2) {
 		ret = -EPROTO;
 	} else {
 		ret = t602x_dsc(owner, peer);

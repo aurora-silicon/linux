@@ -7203,6 +7203,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		return ret;
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->external_lock);
+	init_waitqueue_head(&dcp->t602x_pair_wait);
 	INIT_WORK(&dcp->external_stop_work, dcp_external_stop_work);
 	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, dcp_external_stop_retry);
 	mutex_init(&dcp->tb_lock);
