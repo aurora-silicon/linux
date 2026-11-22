@@ -63,22 +63,29 @@ with tempfile.TemporaryDirectory(prefix='j613-usb4-') as tmp:
     subprocess.run([str(t / 'test')], check=True)
 print('PASS: production PMGR witness rejects missing/foreign domains, read faults, all live state bits')
 
-# Use the same aperture selector and constants as PCIe-C admission.
+# The PCIe-C slices as the J613 DT gives them, checked by the same helper PCIe-C admission uses.
+dts = (root / 'arch/arm64/boot/dts/apple/t8122-usb4.dtsi').read_text()
+internal = (root / 'arch/arm64/boot/dts/apple/t8122.dtsi').read_text()
+bases = [int(x) for x in re.findall(r'apple,msi-vector-base = <(\d+)>', dts)]
+irqs = [int(x) for x in re.findall(r'msi-ranges = <&aic AIC_IRQ (\d+) IRQ_TYPE_EDGE_RISING 32>', dts)]
+window = int(re.search(r'msi-ranges = <&aic AIC_IRQ (\d+) IRQ_TYPE_EDGE_RISING 32>', internal).group(1))
+assert len(bases) == len(irqs) == 2, (bases, irqs)
+pairs = ', '.join(f'{{{b}, {i}}}' for b, i in zip(bases, irqs))
 msi = r'''
 #include <assert.h>
 #include "pcie-apple-t8122.h"
+static const unsigned int slices[][2] = { PAIRS };
 int main(void)
 {
-    assert(apple_t8122_msi_vector_base(APPLE_T8122_PCIEC0_ECAM) == 32);
-    assert(apple_t8122_msi_vector_base(APPLE_T8122_PCIEC1_ECAM) == 64);
-    assert(APPLE_T8122_PCIEC_AIC_BASE + APPLE_T8122_PCIEC0_MSI_BASE == 1107);
-    assert(APPLE_T8122_PCIEC_AIC_BASE + APPLE_T8122_PCIEC1_MSI_BASE == 1139);
-    assert(apple_t8122_msi_vector_base(0) < 0);
-    assert(apple_t8122_msi_vector_base(APPLE_T8122_PCIEC0_ECAM + 1) < 0);
-    assert(apple_t8122_msi_vector_base(APPLE_T8122_PCIEC1_ECAM - 1) < 0);
+    for (unsigned int i = 0; i < sizeof(slices) / sizeof(slices[0]); i++)
+        assert(apple_t8122_msi_window(slices[i][0], slices[i][1], 32) == WINDOW);
+    assert(apple_t8122_msi_window(0, WINDOW, 32) < 0);   /* the internal host's vectors */
+    assert(apple_t8122_msi_window(48, WINDOW + 48, 32) < 0);
+    assert(apple_t8122_msi_window(32, WINDOW + 32, 64) < 0);
+    assert(apple_t8122_msi_window(64, 10, 32) < 0);
     return 0;
 }
-'''
+'''.replace('PAIRS', pairs).replace('WINDOW', str(window))
 with tempfile.TemporaryDirectory(prefix='j613-msi-') as tmp:
     t = Path(tmp)
     (t / 'test.c').write_text(msi)
@@ -86,4 +93,4 @@ with tempfile.TemporaryDirectory(prefix='j613-msi-') as tmp:
                     '-I', str(root / 'drivers/pci/controller'),
                     str(t / 'test.c'), '-o', str(t / 'test')], check=True)
     subprocess.run([str(t / 'test')], check=True)
-print('PASS: shared T8122 PCIe-C aperture/MSI selector and unknown apertures')
+print('PASS: T8122 PCIe-C MSI slices from the DT, and invalid slices refused')

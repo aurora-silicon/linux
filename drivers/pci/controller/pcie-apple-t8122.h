@@ -2,23 +2,19 @@
 #ifndef PCIE_APPLE_T8122_H
 #define PCIE_APPLE_T8122_H
 
-#define APPLE_T8122_PCIEC0_ECAM 0x730000000ULL
-#define APPLE_T8122_PCIEC1_ECAM 0xb30000000ULL
-#define APPLE_T8122_PCIEC_AIC_BASE 1075
-#define APPLE_T8122_PCIEC0_MSI_BASE 32
-#define APPLE_T8122_PCIEC1_MSI_BASE 64
-
-/* Reject unknown apertures instead of assigning another bridge's slice. */
-static inline int apple_t8122_msi_vector_base(unsigned long long ecam)
+/*
+ * A T8122 PCIe-C bridge's MSI slice, as its node describes it: the first
+ * vector of the shared window it owns (apple,msi-vector-base) and that
+ * vector's AIC line (msi-ranges). The internal host owns vectors 0..31 and
+ * each PCIe-C bridge a 32-vector slice after them. Returns the window's AIC
+ * base, or -1 for a slice that is not one of those.
+ */
+static inline int apple_t8122_msi_window(unsigned int base, unsigned int irq,
+					 unsigned int nvecs)
 {
-	switch (ecam) {
-	case APPLE_T8122_PCIEC0_ECAM:
-		return APPLE_T8122_PCIEC0_MSI_BASE;
-	case APPLE_T8122_PCIEC1_ECAM:
-		return APPLE_T8122_PCIEC1_MSI_BASE;
-	default:
+	if (base < 32 || base % 32 || nvecs != 32 || irq < base)
 		return -1;
-	}
+	return irq - base;
 }
 
 #endif

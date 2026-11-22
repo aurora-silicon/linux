@@ -3425,12 +3425,17 @@ static int apple_msi_init(struct apple_pcie *pcie)
 			default:
 				goto invalid_slice;
 			}
-		} else if (of_machine_is_compatible("apple,t8122")) {
-			aic_base = APPLE_T8122_PCIEC_AIC_BASE;
-			ret = apple_t8122_msi_vector_base(ecam.start);
+		} else if (pcie->hw == &t8122_pciec_hw) {
+			/* The node names its slice; check its shape, not the board. */
+			if (args.args_count != 3 ||
+			    of_property_read_u32(to_of_node(fwnode),
+						 "apple,msi-vector-base", &expected_base))
+				goto invalid_slice;
+			ret = apple_t8122_msi_window(expected_base, args.args[1],
+						     pcie->nvecs);
 			if (ret < 0)
 				goto invalid_slice;
-			expected_base = ret;
+			aic_base = ret;
 		} else if (of_machine_is_compatible("apple,t8132")) {
 			aic_base = 1506;
 			switch (ecam.start) {
