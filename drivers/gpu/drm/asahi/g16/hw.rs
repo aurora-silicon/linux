@@ -633,12 +633,16 @@ pub(crate) mod client {
     pub(crate) const PB_PAGE_LIST: u64 = 0x7012040000;
     pub(crate) const PB_PAGE_LIST_SIZE: u64 = 0x8000;
 
-    // Render pass resources, each in a distinct 64 MiB interval within 0x7020000000..0x7040000000.
+    // Host-chosen client VA layout for render pass slots within 0x7020000000..0x7040000000
+    // (512 MiB). Firmware takes explicit 64-bit VAs for each pass object rather than
+    // indexing by stride. One pass slot spans +0x0..+0x1c00000 (28 MiB: TILEMAP at +0x1400000
+    // plus TILEMAP_SIZE = 0x800000), rounded up to a 32 MiB power-of-two stride (4 MiB guard)
+    // so 16 slots fill the 512 MiB window (matching COMPUTE_UNITS = 16).
     pub(crate) const FS_WORK_PAGE: u64 = 0x7020000000;
     pub(crate) const FS_WORK_OFF: u64 = 0;
     pub(crate) const TA_WORK_PAGE: u64 = 0x7020004000;
     pub(crate) const TA_WORK_OFF: u64 = 0;
-    pub(crate) const WORK_STRIDE: u64 = 0x04000000;
+    pub(crate) const WORK_STRIDE: u64 = 0x02000000;
     pub(crate) const PASS_STRIDE: u64 = WORK_STRIDE;
     pub(crate) const PRE0_PAGE: u64 = 0x7020080000;
     pub(crate) const PRE1_PAGE: u64 = 0x70200a0000;
@@ -653,8 +657,10 @@ pub(crate) mod client {
     pub(crate) const TPC_SIZE: u64 = 0x1000000;
     pub(crate) const TILEMAP: u64 = 0x7021400000;
     pub(crate) const TILEMAP_SIZE: u64 = 0x800000;
-    pub(crate) const TPC_SLOT_SIZE: u64 = TPC_SIZE;
-    pub(crate) const TILEMAP_SLOT_SIZE: u64 = TILEMAP_SIZE;
+    /// Extension pass slot TPC/tilemap sizes (2 MiB / 1 MiB, covering 4K multi-layer and 8K
+    /// passes); base slots keep full `TPC_SIZE` / `TILEMAP_SIZE` for worst-case geometries.
+    pub(crate) const TPC_SLOT_SIZE: u64 = 0x200000;
+    pub(crate) const TILEMAP_SLOT_SIZE: u64 = 0x100000;
     pub(crate) const TPC_SLOT_STRIDE: u64 = WORK_STRIDE;
     pub(crate) const CT: u64 = 0x7080000000;
     pub(crate) const CT_STRIDE: u64 = 0x1000000;
@@ -668,9 +674,12 @@ pub(crate) mod sizes {
     pub(crate) const FREELIST_SEED: u32 = 8192;
     pub(crate) const QUEUE_CAP: u32 = 256;
     pub(crate) const COMPUTE_SLOTS: usize = 2;
-    /// Retained render pass slots per VM at most. A slot is reused only after a later render
-    /// retired (displacing it), so `n` slots keep up to `n - 1` renders in flight.
-    pub(crate) const RENDER_SLOTS: usize = 8;
+    /// Base render pass slots allocated on first render (full TPC/tilemap capacity).
+    pub(crate) const BASE_RENDER_SLOTS: usize = 2;
+    /// Retained render pass slots per VM at most (host client-VA budget: 512 MiB / 32 MiB
+    /// stride = 16, not a firmware limit). A slot is reused only after a later render retired
+    /// (displacing it), so `n` slots keep up to `n - 1` renders in flight.
+    pub(crate) const RENDER_SLOTS: usize = 16;
     const _: () = assert!(super::client::AUX + 0x20000 <= super::client::SCENE_LIST);
     const _: () = assert!(super::client::SCENE_LIST + 0x4000 <= super::client::TPC);
     const _: () = assert!(super::client::TPC + super::client::TPC_SIZE <= super::client::TILEMAP);

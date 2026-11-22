@@ -82,7 +82,7 @@ impl ComputeArena {
 /// Render pass slots every VM gets with its first render command; extension slots
 /// (`BASE_RENDER_SLOTS..hw::sizes::RENDER_SLOTS`) are added lazily once it submits renders
 /// back to back.
-pub(crate) const BASE_RENDER_SLOTS: usize = 2;
+pub(crate) const BASE_RENDER_SLOTS: usize = super::hw::sizes::BASE_RENDER_SLOTS;
 const EXT_RENDER_SLOTS: usize = super::hw::sizes::RENDER_SLOTS - BASE_RENDER_SLOTS;
 
 pub(crate) struct RenderArena(crate::cleanup::Deferred<RenderInner>);

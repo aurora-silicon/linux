@@ -1307,7 +1307,7 @@ impl Firmware {
                 f.claims.pass[0] = k as u32;
                 f.claims.pass_mask = 1 << k;
                 self.slots.pass_busy |= 1 << k;
-                self.prefix_render(job, r, &mut prefix, f, behind)?;
+                self.prefix_render(job, r, geometry, &mut prefix, f, behind)?;
             }
         }
         f.first = index as usize;
@@ -1584,6 +1584,7 @@ impl Firmware {
         &mut self,
         job: &Arc<Job>,
         cmd: &RenderCommand,
+        mut geometry: Geometry,
         pf: &mut Prefix,
         f: &mut Flight,
         behind: bool,
@@ -1592,10 +1593,9 @@ impl Firmware {
         let alloc_slot = self.pools.pick_slot(&job.vm, behind).ok_or(EAGAIN)?;
         let draw = super::recovery::logic::next_ordinal(pf.draw).ok_or(EOVERFLOW)?;
         let target = encode::stamp(draw);
-        let tilemap_bytes = Geometry::new(&cmd.cmd, 0).tilemap_bytes;
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
         self.slots
-            .claim_pass_in(&job.resources, k, Some(job.vm.id), tilemap_bytes)?;
+            .claim_pass_in(&job.resources, k, Some(job.vm.id), geometry.tilemap_bytes)?;
         self.slots.hold_vm(&f.claims, &job.vm)?;
         self.slots.hold_arenas(&f.claims, &job.resources);
         let (refs, init_buffer, epoch, binding) = self.render_refs(alloc_slot, job, draw, behind)?;
@@ -1605,7 +1605,7 @@ impl Firmware {
         f.initbm = init_buffer;
         let p = job.resources.render_pass(k)?;
         let pass = p.refs();
-        let geometry = Geometry::new(&cmd.cmd, pass.heap_gva);
+        geometry.layer_metadata = pass.heap_gva + if cmd.cmd.layers > 1 { 0x200 } else { 0 };
         geometry.validate_capacity(p.tpc.size as u64, p.tilemap.size as u64)?;
         job.resources
             .set_pass_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes)?;
@@ -1649,8 +1649,23 @@ impl Firmware {
             init_buffer,
             &mut scratch.scene[..],
         );
-        p.ta_work.write(0, &scratch.ta[..])?;
-        p.fs_work.write(0, &scratch.fs[..])?;
+        if self.slots.render_needs_full_work(k) {
+            p.ta_work.write(0, &scratch.ta[..])?;
+            p.fs_work.write(0, &scratch.fs[..])?;
+        } else {
+            p.ta_work
+                .write(0, &scratch.ta[..work::ta::HEAD_ACTIVE_SIZE])?;
+            p.ta_work.write(
+                work::ta::TAIL_ACTIVE_START,
+                &scratch.ta[work::ta::TAIL_ACTIVE_START..],
+            )?;
+            p.fs_work
+                .write(0, &scratch.fs[..work::fs::HEAD_ACTIVE_SIZE])?;
+            p.fs_work.write(
+                work::fs::TAIL_ACTIVE_START,
+                &scratch.fs[work::fs::TAIL_ACTIVE_START..],
+            )?;
+        }
         p.ta_seq.write(0, &scratch.tas[..])?;
         p.fs_seq.write(0, &scratch.fss[..])?;
         p.scene.write(0, &scratch.scene[..])?;

@@ -161,7 +161,7 @@ pub mod g16 {
             pub fn render_pass_dirty(&self,_k:usize)->Result<(&AtomicU64,&AtomicU64)>{Err(EINVAL)}
             pub fn pass_owner_arena(&self,_k:usize)->Option<PassOwnerArena>{None}
         }
-        pub struct RenderArena{pub passes:KVec<super::slots::PassSlot>,pub tpc_dirty:[AtomicU64;8],pub tilemap_dirty:[AtomicU64;8]}
+        pub struct RenderArena{pub passes:KVec<super::slots::PassSlot>,pub tpc_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS],pub tilemap_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS]}
         impl RenderArena{ __SET_DIRTY__ }
     }
     pub mod boot {pub fn eproto()->crate::Error{crate::Error(71)}}
@@ -179,7 +179,7 @@ pub mod g16 {
     fn arenas(o:&mut Objects)->Arenas{
         let mut compute=KVec::new();let mut passes=KVec::new();
         for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
-        Arenas{compute:g16::resources::ComputeArena{compute},render:g16::resources::RenderArena{passes,tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};8],tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};8]}}
+        Arenas{compute:g16::resources::ComputeArena{compute},render:g16::resources::RenderArena{passes,tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS]}}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();}
     #[test]fn render_reuse_clears_only_previous_write_spans(){
@@ -701,35 +701,54 @@ pub mod g16 {
         assert_eq!(arena.render.passes[0].scene.fills.lock().unwrap().len(),2);
     }
 
-    #[test]fn pipelined_render_pass_slots_keep_seven_in_flight(){
+    #[test]fn pipelined_render_pass_slots_keep_fifteen_in_flight(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
         let mut passes=KVec::new();
         for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
-            passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
+            let pass=g16::slots::PassSlot::new(&mut o,k,1).unwrap();
+            if k < g16::hw::sizes::BASE_RENDER_SLOTS as u64 {
+                assert_eq!(pass.tpc.size as u64, g16::hw::client::TPC_SIZE);
+                assert_eq!(pass.tilemap.size as u64, g16::hw::client::TILEMAP_SIZE);
+            } else {
+                assert_eq!(pass.tpc.size as u64, g16::hw::client::TPC_SLOT_SIZE);
+                assert_eq!(pass.tilemap.size as u64, g16::hw::client::TILEMAP_SLOT_SIZE);
+            }
+            passes.push(pass,0).unwrap();
         }
         let arena=g16::resources::RenderArena{
             passes,
-            tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};8],
-            tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};8],
+            tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
+            tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
         };
         let a=vm(1);
+        let b=vm(2);
         let mut live:Vec<Claims>=Vec::new();
-        // Publish 7 concurrent passes in flight (slots 0..7).
-        for k in 0..7usize {
+        // Publish 15 concurrent passes in flight (slots 0..15).
+        for k in 0..15usize {
             let mut c=Claims::new();
             c.pass[0]=k as u32;c.pass_mask=1<<k;
             s.claim_pass_for(&arena,k,Some(a.id)).unwrap();
+            assert!(s.render_needs_full_work(k));
             s.hold_vm(&c,&a).unwrap();
             s.publish(&mut c).unwrap();
             live.push(c);
         }
-        assert_eq!(s.render_published(),7);
-        assert!(s.pass_available(8)); // slot 7 is still fresh
-        // Retire 0 and 1 -> slot 0 is displaced and reusable while 5 others remain in flight.
+        assert_eq!(s.render_published(),15);
+        assert!(s.pass_available(16)); // slot 15 is still fresh
+        // Retire 0 and 1 -> slot 0 is displaced and reusable while 13 others remain in flight.
         s.retire(&mut live[0]).unwrap();
-        assert!(!s.pass_available(7)); // slot 0 not displaced yet
+        assert!(!s.pass_available(15)); // slot 0 not displaced yet
         s.retire(&mut live[1]).unwrap();
-        assert!(s.pass_available(7)); // slot 0 displaced by slot 1!
+        assert!(s.pass_available(15)); // slot 0 displaced by slot 1!
+        // Clean same-VM reuse of displaced slot 0 does not need full work write.
+        s.claim_pass_for(&arena,0,Some(a.id)).unwrap();
+        assert!(!s.render_needs_full_work(0));
+        let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
+        s.release(&mut c0);
+        // Cancelled preparation or cross-VM switch forces full work write again.
+        s.claim_pass_for(&arena,0,Some(b.id)).unwrap();
+        assert!(s.render_needs_full_work(0));
+        s.release(&mut c0);
         for c in live.iter_mut().skip(2) {
             s.retire(c).unwrap();
         }

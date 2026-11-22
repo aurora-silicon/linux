@@ -154,12 +154,12 @@ impl PassSlot {
     pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32) -> Result<Self> {
         let sh = Class::Shared;
         let (ps, ws) = (i * client::PASS_STRIDE, i * client::WORK_STRIDE);
-        let tpc = if i != 0 {
+        let tpc = if i >= sizes::BASE_RENDER_SLOTS as u64 {
             client::TPC_SLOT_SIZE
         } else {
             client::TPC_SIZE
         };
-        let tilemap = if i != 0 {
+        let tilemap = if i >= sizes::BASE_RENDER_SLOTS as u64 {
             client::TILEMAP_SLOT_SIZE
         } else {
             client::TILEMAP_SIZE
@@ -447,6 +447,8 @@ pub(crate) struct RenderOwners {
     pending_arena: [Option<super::resources::PassOwnerArena>; sizes::RENDER_SLOTS],
     /// Force a full scrub on next pass claim (first use, cancel, error, or firmware recovery).
     scrub_full: [bool; sizes::RENDER_SLOTS],
+    /// Whether the most recent claim of each render pass slot required a full scrub/work write.
+    last_full: [bool; sizes::RENDER_SLOTS],
 }
 
 pub(crate) struct Slots {
@@ -490,6 +492,7 @@ impl Slots {
                     arena: [const { None }; sizes::RENDER_SLOTS],
                     pending_arena: [const { None }; sizes::RENDER_SLOTS],
                     scrub_full: [true; sizes::RENDER_SLOTS],
+                    last_full: [true; sizes::RENDER_SLOTS],
                 },
                 GFP_KERNEL,
             )?,
@@ -675,6 +678,13 @@ impl Slots {
         }
         None
     }
+    /// Whether the most recent claim of render pass slot `k` requires writing the entire
+    /// TA/FS work images (first use, cross-VM switch, cancelled preparation, error, or
+    /// firmware recovery) rather than only the active non-zero spans.
+    pub(crate) fn render_needs_full_work(&self, k: usize) -> bool {
+        self.render.last_full.get(k).copied().unwrap_or(true)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn claim_pass(&mut self, arena: &super::resources::RenderArena, k: usize) -> Result {
         self.claim_pass_for(arena, k, None)
@@ -709,6 +719,7 @@ impl Slots {
             self.render.lifetime.cancel(k);
             return Err(e);
         }
+        self.render.last_full[k] = full;
         if full {
             arena.tpc_dirty[k].store(0, Ordering::Relaxed);
         }
@@ -756,6 +767,7 @@ impl Slots {
             self.render.lifetime.cancel(k);
             return Err(e);
         }
+        self.render.last_full[k] = full;
         if full {
             tpc_dirty.store(0, Ordering::Relaxed);
             tilemap_dirty.store(0, Ordering::Relaxed);
