@@ -64,11 +64,23 @@ struct bcm4377_data {
 	uint64_t resume_epoch, resume_pending;
 	bool resume_armed, resume_blocked, resume_powered;
 	bool resume_guarded, resume_recovering;
+	unsigned long dma_window_base;
 	struct work_struct resume_work;
  struct ring acl_d2h_ring,acl_h2d_ring,sco_d2h_ring,sco_h2d_ring,hci_d2h_ring,hci_h2d_ring,sco_event_ring,sco_ack_ring,hci_acl_event_ring,hci_acl_ack_ring;
 };
 static int cal_count,ptb_count,reset_count,open_count,queued_count,addr_count,cal_failures,ptb_error,addr_error,reset_error,rings_error,close_error;
 static int rebind_count;
+/* A real sleep that took the function's power, and the rebind it queues. */
+static bool resume_via_firmware;
+static int power_rebinds;
+static bool pm_resume_via_firmware(void) { return resume_via_firmware; }
+static void __bcm4377_queue_rebind(struct bcm4377_data *b, const char *why, bool expected)
+{
+	(void)b;
+	(void)why;
+	assert(expected);
+	power_rebinds++;
+}
 
 /* Controlled boundary for the existing driver's asynchronous rebind work. */
 static void bcm4377_hci_reset(struct hci_dev *hdev)
