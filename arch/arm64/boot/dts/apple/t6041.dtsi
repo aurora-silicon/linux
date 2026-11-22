@@ -495,3 +495,113 @@
 				     0x22c004000 0x22c1d62fc
 				     0x22e004000 0x22e1d62fc>;
 };
+
+/*
+ * The second video encoder (ADT ave1, soc-id t6041), unique to the M4 Max.
+ * Its six PMGR power states (VENC1_SYS through VENC1_ME1) live in pmgr_aux
+ * (0x5028002a0..0x5028002c8). All nodes stay disabled until a bootloader
+ * handoff preloads and qualifies ave1's firmware.
+ */
+&pmgr_aux {
+	ps_venc1_sys: power-controller@2a0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_sys";
+		status = "disabled";
+	};
+
+	ps_venc1_dma: power-controller@2a8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_dma";
+		power-domains = <&ps_venc1_sys>;
+		status = "disabled";
+	};
+
+	ps_venc1_pipe4: power-controller@2b0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2b0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_pipe4";
+		power-domains = <&ps_venc1_dma>;
+		status = "disabled";
+	};
+
+	ps_venc1_pipe5: power-controller@2b8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2b8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_pipe5";
+		power-domains = <&ps_venc1_dma>;
+		status = "disabled";
+	};
+
+	ps_venc1_me0: power-controller@2c0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_me0";
+		power-domains = <&ps_venc1_dma>;
+		status = "disabled";
+	};
+
+	ps_venc1_me1: power-controller@2c8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2c8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_me1";
+		power-domains = <&ps_venc1_me0>;
+		status = "disabled";
+	};
+};
+
+/ {
+	ave1_dart1: iommu@285080000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x2 0x85080000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1473 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc1_sys>;
+		status = "disabled";
+	};
+
+	ave1_dart0: iommu@2850a0000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x2 0x850a0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1473 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc1_sys>;
+		status = "disabled";
+	};
+
+	ave1: video-codec@285100000 {
+		compatible = "apple,t6041-ave";
+		reg = <0x2 0x85100000 0x0 0x45c000>,
+		      <0x2 0x85050000 0x0 0x4000>,
+		      <0x2 0x85800000 0x0 0x800000>;
+		reg-names = "codec", "mailbox", "coproc";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1476 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1470 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1469 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1472 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1471 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc1_dma>, <&ps_venc1_pipe4>,
+				<&ps_venc1_pipe5>, <&ps_venc1_me0>, <&ps_venc1_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+		iommus = <&ave1_dart0 0>, <&ave1_dart1 0>;
+		status = "disabled";
+	};
+};
