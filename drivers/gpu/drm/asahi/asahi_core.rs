@@ -188,6 +188,10 @@ module! {
             default: 30000,
             description: "G17: longest compute watchdog allowance a queue may set, ms (floor 2000)",
         },
+        legacy_perf_base_pstate: u32 {
+            default: 0,
+            description: "G13/G14: base performance state of a working GPU (0: the device tree's)",
+        },
         g15_deadline_ms: u32 {
             default: 5000,
             description: "G15: host deadline of a published prefix without progress, ms (min 100)",

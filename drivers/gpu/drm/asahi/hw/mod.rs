@@ -602,7 +602,30 @@ impl PwrConfig {
             max_power_mw: perf_states.iter().map(|a| a.pwr_mw).max().unwrap(),
             max_freq_mhz: perf_states.iter().map(|a| a.freq_hz).max().unwrap() / 1_000_000,
 
-            perf_base_pstate: prop!("apple,perf-base-pstate", 1),
+            perf_base_pstate: {
+                let dt: u32 = prop!("apple,perf-base-pstate", 1);
+                let want = crate::module_parameters::legacy_perf_base_pstate.value();
+                // The firmware boosts from the base state, so one state has to stay above it.
+                if want != 0 && (want as usize) + 1 < perf_states.len() {
+                    dev_info!(
+                        dev,
+                        "performance base state {} (device tree: {})\n",
+                        want,
+                        dt
+                    );
+                    want
+                } else {
+                    if want != 0 {
+                        dev_warn!(
+                            dev,
+                            "legacy_perf_base_pstate {} is out of range, keeping {}\n",
+                            want,
+                            dt
+                        );
+                    }
+                    dt
+                }
+            },
             perf_max_pstate: perf_states.len() as u32 - 1,
             min_sram_microvolt: prop!("apple,min-sram-microvolt"),
 
