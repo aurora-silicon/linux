@@ -61,6 +61,59 @@
 		#address-cells = <2>;
 		#size-cells = <0>;
 
+		/*
+		 * Three clusters: E (6 cores), P (2) and M (4); P and M share a
+		 * performance domain. capacity-dmips-mhz is single-thread work per
+		 * MHz relative to a P core, from integer, compression and sort
+		 * loops at each cluster's top P-state.
+		 */
+		cpu-map {
+			cluster0 {
+				core0 {
+					cpu = <&cpu0>;
+				};
+				core1 {
+					cpu = <&cpu1>;
+				};
+				core2 {
+					cpu = <&cpu2>;
+				};
+				core3 {
+					cpu = <&cpu3>;
+				};
+				core4 {
+					cpu = <&cpu4>;
+				};
+				core5 {
+					cpu = <&cpu5>;
+				};
+			};
+
+			cluster1 {
+				core0 {
+					cpu = <&cpu6>;
+				};
+				core1 {
+					cpu = <&cpu7>;
+				};
+			};
+
+			cluster2 {
+				core0 {
+					cpu = <&cpu8>;
+				};
+				core1 {
+					cpu = <&cpu9>;
+				};
+				core2 {
+					cpu = <&cpu10>;
+				};
+				core3 {
+					cpu = <&cpu11>;
+				};
+			};
+		};
+
 		cpu0: cpu@0 {
 			compatible = "apple,t8152-e";
 			device_type = "cpu";
@@ -68,6 +121,7 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
+			capacity-dmips-mhz = <800>;
 			performance-domains = <&m6_e_cpufreq>;
 			#cooling-cells = <2>;
 		};
@@ -79,6 +133,7 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
+			capacity-dmips-mhz = <800>;
 			performance-domains = <&m6_e_cpufreq>;
 			#cooling-cells = <2>;
 		};
@@ -90,6 +145,7 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
+			capacity-dmips-mhz = <800>;
 			performance-domains = <&m6_e_cpufreq>;
 			#cooling-cells = <2>;
 		};
@@ -101,6 +157,7 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
+			capacity-dmips-mhz = <800>;
 			performance-domains = <&m6_e_cpufreq>;
 			#cooling-cells = <2>;
 		};
@@ -112,6 +169,7 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
+			capacity-dmips-mhz = <800>;
 			performance-domains = <&m6_e_cpufreq>;
 			#cooling-cells = <2>;
 		};
@@ -123,6 +181,7 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
+			capacity-dmips-mhz = <800>;
 			performance-domains = <&m6_e_cpufreq>;
 			#cooling-cells = <2>;
 		};
@@ -134,6 +193,7 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
+			capacity-dmips-mhz = <1024>;
 			performance-domains = <&m6_pm_cpufreq>;
 			#cooling-cells = <2>;
 		};
@@ -145,6 +205,7 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
+			capacity-dmips-mhz = <1024>;
 			performance-domains = <&m6_pm_cpufreq>;
 			#cooling-cells = <2>;
 		};
@@ -156,6 +217,7 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
+			capacity-dmips-mhz = <819>;
 			performance-domains = <&m6_pm_cpufreq>;
 			#cooling-cells = <2>;
 		};
@@ -167,6 +229,7 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
+			capacity-dmips-mhz = <819>;
 			performance-domains = <&m6_pm_cpufreq>;
 			#cooling-cells = <2>;
 		};
@@ -178,6 +241,7 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
+			capacity-dmips-mhz = <819>;
 			performance-domains = <&m6_pm_cpufreq>;
 			#cooling-cells = <2>;
 		};
@@ -189,6 +253,7 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
+			capacity-dmips-mhz = <819>;
 			performance-domains = <&m6_pm_cpufreq>;
 			#cooling-cells = <2>;
 		};
