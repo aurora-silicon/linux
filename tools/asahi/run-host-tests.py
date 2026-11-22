@@ -337,6 +337,7 @@ SUITES = [
     ('ave-host', AVE_TESTS, ['python3', '-I', '-B', 'run.py', '--build', '{out}']),
     ('ave-recovery', AVE_TESTS, ['python3', '-I', '-B', 'run-recovery.py']),
     ('ave-input', AVE_TESTS, ['python3', '-I', '-B', 'run-input.py']),
+    ('ave-ipc', AVE_TESTS, ['python3', '-I', '-B', 'run-ipc.py']),
 ]
 
 # tools/testing/selftests/drivers/apple: the host-runnable harnesses build the
