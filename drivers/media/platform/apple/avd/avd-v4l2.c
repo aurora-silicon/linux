@@ -11,6 +11,7 @@
  * Copyright (C) 2011 Samsung Electronics Co., Ltd.
  */
 
+#include <kunit/visibility.h>
 #include <linux/pm_runtime.h>
 
 #include <media/v4l2-event.h>
@@ -103,15 +104,21 @@ static bool avd_is_valid_fmt(struct avd_ctx *ctx, u32 fourcc,
 	return false;
 }
 
+/*
+ * Lay out a decoded buffer: the picture, then the compressed reference area
+ * described by @comp, then any codec specific tail. Only @pix_mp and @comp
+ * are written, so TRY_FMT can use it on a context that is streaming.
+ */
 static void avd_fill_decoded_pixfmt(struct avd_ctx *ctx,
-				    struct v4l2_pix_format_mplane *pix_mp)
+				    struct v4l2_pix_format_mplane *pix_mp,
+				    struct avd_comp *comp)
 {
 	v4l2_fill_pixfmt_mp(pix_mp, pix_mp->pixelformat, pix_mp->width,
 			    pix_mp->height);
 
-	ctx->comp.start_offset = pix_mp->plane_fmt[0].sizeimage;
-	fill_comp(&ctx->comp, ctx->image_fmt, pix_mp->width, pix_mp->height);
-	pix_mp->plane_fmt[0].sizeimage += ctx->comp.size;
+	comp->start_offset = pix_mp->plane_fmt[0].sizeimage;
+	fill_comp(comp, ctx->image_fmt, pix_mp->width, pix_mp->height);
+	pix_mp->plane_fmt[0].sizeimage += comp->size;
 	if (ctx->coded_fmt_desc->ops->adjust_decoded_fmt)
 		ctx->coded_fmt_desc->ops->adjust_decoded_fmt(ctx, pix_mp);
 }
@@ -138,7 +145,7 @@ void avd_reset_decoded_fmt(struct avd_ctx *ctx)
 	f->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	f->fmt.pix_mp.width = ctx->coded_fmt.fmt.pix_mp.width;
 	f->fmt.pix_mp.height = ctx->coded_fmt.fmt.pix_mp.height;
-	avd_fill_decoded_pixfmt(ctx, &f->fmt.pix_mp);
+	avd_fill_decoded_pixfmt(ctx, &f->fmt.pix_mp, &ctx->comp);
 }
 
 static int avd_try_ctrl(struct v4l2_ctrl *ctrl)
@@ -566,11 +573,10 @@ static int avd_querycap(struct file *file, void *priv,
 	return 0;
 }
 
-static int avd_try_capture_fmt(struct file *file, void *priv,
-			       struct v4l2_format *f)
+static int avd_try_decoded_fmt(struct avd_ctx *ctx, struct v4l2_format *f,
+			       struct avd_comp *comp)
 {
 	struct v4l2_pix_format_mplane *pix_mp = &f->fmt.pix_mp;
-	struct avd_ctx *ctx = file_to_ctx(file);
 	const struct avd_coded_fmt_desc *coded_desc;
 
 	/*
@@ -594,11 +600,20 @@ static int avd_try_capture_fmt(struct file *file, void *priv,
 	v4l2_apply_frmsize_constraints(&pix_mp->width, &pix_mp->height,
 				       &coded_desc->frmsize);
 
-	avd_fill_decoded_pixfmt(ctx, pix_mp);
+	avd_fill_decoded_pixfmt(ctx, pix_mp, comp);
 	pix_mp->field = V4L2_FIELD_NONE;
 
 	return 0;
 }
+
+VISIBLE_IF_KUNIT int avd_try_capture_fmt(struct file *file, void *priv,
+					 struct v4l2_format *f)
+{
+	struct avd_comp comp;
+
+	return avd_try_decoded_fmt(file_to_ctx(file), f, &comp);
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_try_capture_fmt);
 
 static int avd_try_output_fmt(struct file *file, void *priv,
 			      struct v4l2_format *f)
@@ -627,10 +642,11 @@ static int avd_try_output_fmt(struct file *file, void *priv,
 	return 0;
 }
 
-static int avd_s_capture_fmt(struct file *file, void *priv,
-			     struct v4l2_format *f)
+VISIBLE_IF_KUNIT int avd_s_capture_fmt(struct file *file, void *priv,
+				       struct v4l2_format *f)
 {
 	struct avd_ctx *ctx = file_to_ctx(file);
+	struct avd_comp comp;
 	struct vb2_queue *vq;
 	int ret;
 
@@ -640,13 +656,15 @@ static int avd_s_capture_fmt(struct file *file, void *priv,
 	if (vb2_is_busy(vq))
 		return -EBUSY;
 
-	ret = avd_try_capture_fmt(file, priv, f);
+	ret = avd_try_decoded_fmt(ctx, f, &comp);
 	if (ret)
 		return ret;
 
 	ctx->decoded_fmt = *f;
+	ctx->comp = comp;
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(avd_s_capture_fmt);
 
 static int avd_s_output_fmt(struct file *file, void *priv,
 			    struct v4l2_format *f)

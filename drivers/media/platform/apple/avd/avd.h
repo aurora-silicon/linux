@@ -393,6 +393,8 @@ int avd_av1_check_tiles(struct device *dev, unsigned int tile_rows,
 			unsigned int tile_cols,
 			const struct v4l2_ctrl_av1_tile_group_entry *tile_group,
 			unsigned int entries, size_t payload);
+int avd_try_capture_fmt(struct file *file, void *priv, struct v4l2_format *f);
+int avd_s_capture_fmt(struct file *file, void *priv, struct v4l2_format *f);
 int avd_vp9_check_tiling(const struct v4l2_ctrl_vp9_frame *frame);
 int avd_vp9_next_tile(const u8 *data, u32 payload, bool last, u32 *offset,
 		      u32 *size);
