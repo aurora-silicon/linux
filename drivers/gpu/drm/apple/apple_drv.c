@@ -106,8 +106,17 @@ static DEFINE_MUTEX(apple_drm_pm_lock);
 static LIST_HEAD(apple_drm_pm_list);
 /* Ordered, so the next suspend's PM_SUSPEND_PREPARE can wait for every restore. */
 static struct workqueue_struct *apple_drm_pm_wq;
+/*
+ * Below the DCPs' own notifiers (dcp_s2r_pm_register(), priority 0), whatever
+ * the probe order: the chain runs higher priorities first and appends equal
+ * ones, and a DCP that defers past module init would otherwise come after
+ * this one. At PM_POST_SUSPEND a DCPEXT's dark-wake firmware restart then
+ * still finishes before the restore here is queued, and a DCP that refuses
+ * PM_SUSPEND_PREPARE rolls back only the notifiers before it, as at bind.
+ */
 static struct notifier_block apple_drm_pm_nb = {
 	.notifier_call = apple_drm_pm_notify,
+	.priority = -1,
 };
 
 /* Component readiness is later than platform probe/bind. */
@@ -2144,7 +2153,10 @@ static void apple_platform_complete(struct device *dev)
 		apple_drm_resume_outputs(apple);
 }
 
-/* It failed before ->prepare() reached this device, so ->complete() didn't run either. */
+/*
+ * Queued at PM_POST_SUSPEND: the sleep failed before ->prepare() reached this
+ * device, so ->complete() didn't run either.
+ */
 static void apple_drm_pm_resume_work(struct work_struct *work)
 {
 	struct apple_drm_private *apple =
@@ -2161,7 +2173,9 @@ static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, 
 	struct apple_drm_private *apple;
 	int ret;
 
-	if (action == PM_SUSPEND_PREPARE)
+	/* No restore queued by the last PM_POST_SUSPEND overlaps the next transition. */
+	if (action == PM_SUSPEND_PREPARE || action == PM_HIBERNATION_PREPARE ||
+	    action == PM_RESTORE_PREPARE)
 		flush_workqueue(apple_drm_pm_wq);
 
 	/* The T8132 external outputs' sleep handling (a no-op without them). */
@@ -2231,11 +2245,14 @@ static int __init appledrm_register(void)
 		ret = -ENOMEM;
 		goto unregister_dcp;
 	}
-	register_pm_notifier(&apple_drm_pm_nb);
+	ret = register_pm_notifier(&apple_drm_pm_nb);
+	if (ret)
+		goto destroy_wq;
 	ret = platform_driver_register(&apple_platform_driver);
 	if (!ret)
 		return 0;
 	unregister_pm_notifier(&apple_drm_pm_nb);
+destroy_wq:
 	destroy_workqueue(apple_drm_pm_wq);
 unregister_dcp:
 	dcp_unregister();

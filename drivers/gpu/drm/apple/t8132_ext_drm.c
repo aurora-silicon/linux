@@ -900,7 +900,7 @@ static void t8132_ext_relink_end(struct t8132_ext_out *out)
  * display DART and a frame shown, iomfb_m4_ext_restore_result()) sets the
  * connector's link status BAD and sends a hotplug event: the compositor has
  * to set the mode again. A display released for the sleep was waited for
- * before (t8132_ext_pm_notify()); its connector's hold ends here, and the
+ * before (t8132_ext_drm_pm_event()); its connector's hold ends here, and the
  * hotplug held meanwhile goes out at the end.
  */
 static void t8132_ext_sleep_restore(struct t8132_ext_out *out)
@@ -993,9 +993,10 @@ static void t8132_ext_sleep_end(struct t8132_ext_out *out)
 }
 
 /*
- * The layer's one PM notifier, for every output. A refused sleep gets
- * no PM_POST_SUSPEND here (the chain rolls back only the notifiers before
- * this one): the outputs already prepared come back at once.
+ * The layer's sleep handling, for every output, called from appledrm's PM
+ * notifier (apple_drm_pm_notify()). A sleep this refuses gets no
+ * PM_POST_SUSPEND here, since the chain rolls back only the notifiers before
+ * appledrm's: the outputs already prepared come back at once.
  */
 int t8132_ext_drm_pm_event(unsigned long event)
 {
