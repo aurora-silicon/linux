@@ -712,7 +712,8 @@ static void dwc3_apple_pm_notifier_remove(void *data) { (void)data; }
 static void cancel_work_sync(int *w) { (void)w;cancels++; }
 static void cancel_delayed_work_sync(int *w) { (void)w;cancels++; }
 static void apple_sleep_usb_set_wake_ports(unsigned m) { (void)m;assert(0); }
-static void apple_atcphy_sleep_finish_async(void *p,bool ok) { (void)p;(void)ok;assert(0); }
+/* No sleep was prepared in these shutdown scenarios. */
+static void dwc3_apple_sleep_finish(struct dwc3_apple *a,bool kept) { (void)a;(void)kept;assert(0); }
 static void dwc3_host_exit(struct dwc3 *d) { (void)d;atc.host_active=false;event(1); }
 static void dwc3_gadget_exit(struct dwc3 *d) { (void)d;assert(0); }
 static int atcphy_configure_t8132(struct apple_atcphy *a,int mode) {
@@ -736,6 +737,7 @@ static bool dwc3_apple_has_fixed_hub(struct device *d,unsigned *port) { (void)d;
 static bool dwc3_apple_host_only(struct device *d) { (void)d;return false; }
 static bool device_property_read_bool(struct device *d,const char *name) { (void)d;(void)name;return false; }
 static void spin_lock_init(int *p) { *p=0; }
+static void device_enable_async_suspend(struct device *d) { (void)d; }
 static void publish_owner(struct platform_device *pdev,struct dwc3_apple *appledwc)
 {
     struct device *dev=&pdev->dev;
