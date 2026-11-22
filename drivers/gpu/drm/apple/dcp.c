@@ -749,25 +749,6 @@ static void send_vblank_event(struct drm_device *dev,
 	drm_send_event_timestamp_locked(dev, &e->base, now);
 }
 
-/**
- * dcp_crtc_send_page_flip_event - helper to send vblank event after pageflip
- * @crtc: CRTC whose flip completed
- * @e: pending vblank event
- * @now: swap completion timestamp
- * @start: swap submission timestamp
- *
- * Compensate for unknown slack between page flip and arrival of the
- * swap_complete callback. Minimal observed duration on DCP with HDMI output
- * was around 2.3 ms. If the fb swap was submitted closer to the expected
- * swap_complete it gets a penalty of one frame duration. This is on the border
- * of unreasonable considering that Apple advertises support for 240 Hz (frame
- * duration of 4.167 ms).
- * It is unreasonable considering kwin's kms commit scheduling. Kwin commits
- * 1.5 ms + the mode's vblank time before the expected next page flip
- * completion. This results in presenting at half the display's rate for HDMI
- * outputs.
- * This might be a difference between dcp and dcpext.
- */
 /*
  * Advance the CRTC's flip sequence by the number of refresh periods since the
  * previous flip (at least one), so that userspace sees a non-zero, increasing
@@ -792,6 +773,25 @@ static u64 dcp_crtc_next_flip_seq(struct apple_crtc *crtc, ktime_t flip)
 	return crtc->flip_seq;
 }
 
+/**
+ * dcp_crtc_send_page_flip_event - helper to send vblank event after pageflip
+ * @crtc: CRTC whose flip completed
+ * @e: pending vblank event
+ * @now: swap completion timestamp
+ * @start: swap submission timestamp
+ *
+ * Compensate for unknown slack between page flip and arrival of the
+ * swap_complete callback. Minimal observed duration on DCP with HDMI output
+ * was around 2.3 ms. If the fb swap was submitted closer to the expected
+ * swap_complete it gets a penalty of one frame duration. This is on the border
+ * of unreasonable considering that Apple advertises support for 240 Hz (frame
+ * duration of 4.167 ms).
+ * It is unreasonable considering kwin's kms commit scheduling. Kwin commits
+ * 1.5 ms + the mode's vblank time before the expected next page flip
+ * completion. This results in presenting at half the display's rate for HDMI
+ * outputs.
+ * This might be a difference between dcp and dcpext.
+ */
 static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
 					  struct drm_pending_vblank_event *e,
 					  ktime_t now, ktime_t start)
@@ -7027,10 +7027,12 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
 	}
-	if (dcp->clk)
-		devm_clk_put(dev, dcp->clk);
+	/*
+	 * Both clocks are released with the bind's devres group. An explicit
+	 * devm_clk_put() would also match the NULL devres entry of an absent
+	 * optional clock and warn.
+	 */
 	dcp->clk = NULL;
-	/* optional and possibly NULL, released with the bind's devres group */
 	dcp->clk_194 = NULL;
 	dcp->firmware_clocks = NULL;
 	dcp->num_firmware_clocks = 0;

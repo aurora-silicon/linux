@@ -670,12 +670,25 @@ static int validate_dec_params(struct avd_ctx *ctx,
 {
 	unsigned int aligned_width, aligned_height;
 
-	if (dec_params->frame_height_minus_1 + 1 < 64 ||
-	    dec_params->frame_width_minus_1 + 1 < 64)
+	/*
+	 * The CAPTURE format is at least 64x64, the minimum of the VP9 frame
+	 * size range, so a smaller frame is decoded into a 64x64 buffer, as
+	 * H.264, HEVC and AV1 frames are. That is measured on the legacy
+	 * transport only. The firmware transports keep the 64-pixel floor
+	 * until it is measured there: an input their firmware does not
+	 * expect can reset the engine instead of failing the frame.
+	 */
+	if (!avd_backend_is_open(ctx->dev) &&
+	    (dec_params->frame_width_minus_1 + 1 < 64 ||
+	     dec_params->frame_height_minus_1 + 1 < 64))
 		return -EINVAL;
 
-	aligned_width = round_up(dec_params->frame_width_minus_1 + 1, 64);
-	aligned_height = round_up(dec_params->frame_height_minus_1 + 1, 16);
+	aligned_width = max_t(unsigned int,
+			      round_up(dec_params->frame_width_minus_1 + 1, 64),
+			      64);
+	aligned_height = max_t(unsigned int,
+			       round_up(dec_params->frame_height_minus_1 + 1, 16),
+			       64);
 
 	/*
 	 * Userspace should update the capture/decoded format when the

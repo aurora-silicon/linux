@@ -7959,8 +7959,9 @@ static bool apple_dart_m5_streams_unowned(struct apple_dart *dart, u32 allowed)
 static int apple_dart_m5_idle(struct apple_dart *dart)
 {
 	u32 params = readl(dart->regs + DART_PARAMS2);
-	unsigned int port, ports = max(FIELD_GET(DART_T8110_PARAMS2_READ_PORTS, params),
-					FIELD_GET(DART_T8110_PARAMS2_WRITE_PORTS, params));
+	unsigned int rports = FIELD_GET(DART_T8110_PARAMS2_READ_PORTS, params);
+	unsigned int wports = FIELD_GET(DART_T8110_PARAMS2_WRITE_PORTS, params);
+	unsigned int port, ports = max(rports, wports);
 
 	if (!ports || ports > 4 || apple_dart_fault_pending(dart))
 		return -EIO;

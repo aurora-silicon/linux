@@ -122,7 +122,7 @@ int dockchannel_send(struct dockchannel *dockchannel, const void *buf, size_t co
 			enable_irq(dockchannel->tx_irq);
 
 			if (!wait_for_completion_timeout(&dockchannel->tx_comp,
-                                                 msecs_to_jiffies(DOCKCHANNEL_TX_TIMEOUT_MS))) {
+						 msecs_to_jiffies(DOCKCHANNEL_TX_TIMEOUT_MS))) {
 				disable_irq(dockchannel->tx_irq);
 				return -ETIMEDOUT;
 			}
@@ -164,7 +164,7 @@ int dockchannel_recv(struct dockchannel *dockchannel, void *buf, size_t count)
 			enable_irq(dockchannel->rx_irq);
 
 			if (!wait_for_completion_timeout(&dockchannel->rx_comp,
-                                                 msecs_to_jiffies(DOCKCHANNEL_RX_TIMEOUT_MS))) {
+						 msecs_to_jiffies(DOCKCHANNEL_RX_TIMEOUT_MS))) {
 				disable_irq(dockchannel->rx_irq);
 				return -ETIMEDOUT;
 			}

@@ -390,9 +390,9 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim, 
 			else
 				ret = parse_int_bound(it.handle, &dim->pixel_repetition,
 						      0, U32_MAX);
-		}
-		else
+		} else {
 			ret = skip(it.handle);
+		}
 
 		if (!IS_ERR_OR_NULL(key))
 			kfree(key);
