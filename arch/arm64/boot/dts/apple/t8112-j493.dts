@@ -316,6 +316,7 @@
 
 #include "hwmon-laptop.dtsi"
 #include "hwmon-fan.dtsi"
+#include "t8112-hwmon.dtsi"
 /*
  * SPI2 uses native chip select. The sensor power line is AP GPIO 178,
  * active high; the data-ready line is omitted so captures use polling.
