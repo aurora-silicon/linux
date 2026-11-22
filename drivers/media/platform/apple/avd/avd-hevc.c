@@ -952,6 +952,12 @@ static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 			row = pos / num_cols;
 			col = pos % num_cols;
+			/* A malformed stream must not walk past the boundary tables */
+			if (row + 1 >= ARRAY_SIZE(tile_info->row_bd)) {
+				dev_err_ratelimited(ctx->dev->dev,
+						    "HEVC: more tile segments than tiles\n");
+				return -EINVAL;
+			}
 
 			/*
 			 * not a fan of this, in JCT-VC-HEVC_V1 only TILES_B_Cisco_1
@@ -1074,6 +1080,60 @@ static int avd_hevc_validate_sps(struct avd_ctx *ctx,
 		return -EINVAL;
 
 	return 0;
+}
+
+/*
+ * The V4L2 core bounds the tile counts by the uAPI arrays, but not the
+ * picture geometry, the tile sizes or the slice addresses against each
+ * other. Explicit tile sizes larger than the picture wrap the last tile's
+ * u16 size, and the per-CTB tables are sized from the picture, so such a
+ * layout would write past them. Refuse it before anything is computed.
+ */
+static int avd_hevc_validate_layout(struct avd_ctx *ctx,
+				    const struct avd_hevc_run *run)
+{
+	const struct v4l2_ctrl_hevc_sps *sps = run->sps;
+	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
+	u32 ctb_log2, ctbs_w, ctbs_h, cols, rows, sum, i;
+
+	/* CtbLog2SizeY is 4 to 6 (H.265 7.4.3.2.1) */
+	ctb_log2 = sps->log2_min_luma_coding_block_size_minus3 + 3 +
+		   sps->log2_diff_max_min_luma_coding_block_size;
+	if (ctb_log2 < 4 || ctb_log2 > 6 || !sps->pic_width_in_luma_samples ||
+	    !sps->pic_height_in_luma_samples)
+		goto invalid;
+	ctbs_w = DIV_ROUND_UP(sps->pic_width_in_luma_samples, 1U << ctb_log2);
+	ctbs_h = DIV_ROUND_UP(sps->pic_height_in_luma_samples, 1U << ctb_log2);
+
+	if (pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED) {
+		cols = pps->num_tile_columns_minus1 + 1;
+		rows = pps->num_tile_rows_minus1 + 1;
+		/* The core bounds the counts by the arrays, not by the picture */
+		if (cols > ctbs_w || rows > ctbs_h)
+			goto invalid;
+		/* The explicit sizes must leave at least one CTB to the last tile */
+		if (!(pps->flags & V4L2_HEVC_PPS_FLAG_UNIFORM_SPACING)) {
+			for (sum = 0, i = 0; i < cols - 1; i++)
+				sum += pps->column_width_minus1[i] + 1;
+			if (sum >= ctbs_w)
+				goto invalid;
+			for (sum = 0, i = 0; i < rows - 1; i++)
+				sum += pps->row_height_minus1[i] + 1;
+			if (sum >= ctbs_h)
+				goto invalid;
+		}
+	}
+
+	for (i = 0; i < run->num_slices; i++)
+		if (run->sl[i].slice_segment_addr >= ctbs_w * ctbs_h)
+			goto invalid;
+
+	return 0;
+
+invalid:
+	dev_err_ratelimited(ctx->dev->dev,
+			    "HEVC picture, tile or slice layout out of range\n");
+	return -EINVAL;
 }
 
 static int avd_hevc_alloc_bufs(struct avd_ctx *ctx, struct avd_hevc_bank *bank)
@@ -1292,14 +1352,15 @@ static int avd_hevc_compute_tiles(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	tiles_enabled = !!(pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED);
 
-	tile_info->ctb_addr_rs_to_ts = kzalloc(
-		sizeof(*tile_info->ctb_addr_rs_to_ts) * pic_in_ctbs_size,
-		GFP_KERNEL);
+	/* avd_hevc_validate_layout() has checked the sizes; avd_hevc_run frees */
+	tile_info->ctb_addr_rs_to_ts = kcalloc(pic_in_ctbs_size,
+					       sizeof(*tile_info->ctb_addr_rs_to_ts),
+					       GFP_KERNEL);
 	if (!tile_info->ctb_addr_rs_to_ts)
 		return -ENOMEM;
 
-	tile_info->tile_ids = kzalloc(
-		sizeof(*tile_info->tile_ids) * pic_in_ctbs_size, GFP_KERNEL);
+	tile_info->tile_ids = kcalloc(pic_in_ctbs_size,
+				      sizeof(*tile_info->tile_ids), GFP_KERNEL);
 	if (!tile_info->tile_ids)
 		return -ENOMEM;
 
@@ -1467,6 +1528,10 @@ static int avd_hevc_run(struct avd_ctx *ctx)
 
 	/* Also validate controls applied from a queued request before submission. */
 	ret = avd_hevc_validate_sps(ctx, run.sps);
+	if (ret)
+		goto complete;
+
+	ret = avd_hevc_validate_layout(ctx, &run);
 	if (ret)
 		goto complete;
 
