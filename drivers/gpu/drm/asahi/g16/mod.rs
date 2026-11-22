@@ -240,6 +240,8 @@ pub(crate) struct Shared {
     pub(crate) base_compute_quarantined: AtomicBool,
     /// Whether any base render pass slot (`0..BASE_RENDER_SLOTS`) has been quarantined.
     pub(crate) base_render_quarantined: AtomicBool,
+    /// Contiguous PB/UMA allocator slots (`BASE_PB_SLOTS..=PB_SLOTS`) needed across quarantines.
+    pub(crate) needed_pb_slots: AtomicU32,
     /// The GFX power state word from before a system sleep.
     sleep_ps: AtomicU32,
     /// The stop left to a system sleep's commit, until `.complete` finishes it.
@@ -480,6 +482,7 @@ impl Gpu {
                 recovering: AtomicBool::new(false),
                 base_compute_quarantined: AtomicBool::new(false),
                 base_render_quarantined: AtomicBool::new(false),
+                needed_pb_slots: AtomicU32::new(hw::sizes::BASE_PB_SLOTS as u32),
                 sleep_ps: AtomicU32::new(0),
                 sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
                 events,

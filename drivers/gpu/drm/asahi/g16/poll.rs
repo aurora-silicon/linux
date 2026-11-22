@@ -956,9 +956,7 @@ impl Firmware {
                         || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot)
                     && f.job
                         .resources
-                        .render()?
-                        .pools
-                        .retired_at(a, f.uma_submitted)?;
+                        .pb_retired_at(a, f.uma_submitted)?;
             } else {
                 // Check FS (terminal stage) before TA so running renders fail fast on 1 WC read.
                 if g.fw_stamp[1].r32(0)? != f.fs_target
@@ -986,7 +984,7 @@ impl Firmware {
                     && g.notifier
                         .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
                         == f.job.vm.slot
-                    && f.job.resources.render()?.pools.retired(a)?;
+                    && f.job.resources.pb_retired(a)?;
             }
             if full {
                 let count = (f.renders as usize).min(f.claims.pass.len());
@@ -1051,8 +1049,8 @@ impl Firmware {
         }
     }
 
-    /// Publishes lockless quarantine hints so `SUBMIT` expands extension slots immediately
-    /// when a base slot has been permanently quarantined.
+    /// Publishes lockless quarantine hints so `SUBMIT` expands extension and recovery slots
+    /// immediately when a base or PB allocator slot has been permanently quarantined.
     pub(crate) fn sync_quarantine_hints(&self) {
         if let Some(shared) = &self.engine.shared {
             shared
@@ -1061,6 +1059,9 @@ impl Firmware {
             shared
                 .base_render_quarantined
                 .store(self.slots.base_render_quarantined(), Ordering::Release);
+            shared
+                .needed_pb_slots
+                .store(self.pools.needed_slots() as u32, Ordering::Release);
         }
     }
 

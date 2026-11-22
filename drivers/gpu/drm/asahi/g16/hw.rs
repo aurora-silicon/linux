@@ -605,9 +605,16 @@ pub(crate) mod client {
     pub(crate) const WORK_OFF: u64 = 0;
     pub(crate) const CWORK_STRIDE: u64 = 0x4000;
 
-    // Render allocator units contain one 32 MiB UMA pool and its persistent lists.
+    // Render allocator units contain one 32 MiB UMA pool and its persistent lists in a
+    // 64 MiB stride. Slots 0..4 live in 0x7010000000..0x7020000000; slots 4..PB_SLOTS
+    // live in 0x7008000000..0x7010000000, above base compute units 0..2 (ending at
+    // 0x70070c0000) and below the render pass slot window (0x7020000000..0x7040000000).
     pub(crate) const fn render_base(k: u64) -> u64 {
-        0x7010000000 + k * 0x08000000
+        if k < 4 {
+            0x7010000000 + k * 0x04000000
+        } else {
+            0x7008000000 + (k - 4) * 0x04000000
+        }
     }
     pub(crate) const fn render_pool(k: u64) -> u64 {
         render_base(k)
@@ -675,6 +682,19 @@ pub(crate) mod sizes {
     pub(crate) const QUEUE_CAP: u32 = 256;
     /// Compute units claimable in one batched compute prefix (matches `COMPUTE_UNITS`).
     pub(crate) const COMPUTE_SLOTS: usize = COMPUTE_UNITS;
+    /// Base physical PB/UMA allocator slots allocated per VM on first render.
+    pub(crate) const BASE_PB_SLOTS: usize = 2;
+    /// Physical PB/UMA allocator slots (`parameter_id` `0..PB_SLOTS`, hardware UMA slot 33).
+    /// Base slots `0..BASE_PB_SLOTS` serve normal cross-VM switching; extra slots are allocated
+    /// lazily per VM only after a render hang permanently quarantines an allocator slot.
+    pub(crate) const PB_SLOTS: usize = 6;
+    const _: () = assert!(PB_SLOTS >= BASE_PB_SLOTS && PB_SLOTS <= 6);
+    const _: () =
+        assert!(super::client::compute_context(1) + 0x40000 <= super::client::render_base(4));
+    const _: () =
+        assert!(super::client::render_descriptor(3) + 0x4000 <= super::client::FS_WORK_PAGE);
+    const _: () =
+        assert!(super::client::render_descriptor(5) + 0x4000 <= super::client::render_base(0));
     /// Base render pass slots allocated on first render (full TPC/tilemap capacity).
     pub(crate) const BASE_RENDER_SLOTS: usize = 2;
     /// Retained render pass slots per VM at most (host client-VA budget: 512 MiB / 32 MiB

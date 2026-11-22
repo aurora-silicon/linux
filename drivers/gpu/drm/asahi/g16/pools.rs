@@ -14,7 +14,7 @@
 pub(crate) mod lifetime;
 
 use super::fw::buffer::{self, uma_manager};
-use super::hw::{client, engine, pte};
+use super::hw::{client, engine, pte, sizes};
 use super::object::{Class, FwObject, Objects, Placement, Request};
 use super::Firmware;
 use crate::driver::AsahiDrmDevice;
@@ -46,7 +46,7 @@ pub(crate) struct AllocatorRefs {
     pub(crate) init_buffer: bool,
 }
 
-struct Allocator {
+pub(crate) struct Allocator {
     descriptor: Arc<FwObject>,
     auxiliary: Arc<FwObject>,
     #[allow(dead_code)]
@@ -77,6 +77,7 @@ pub(crate) struct PbStats {
 
 pub(crate) struct PoolSet {
     units: KVec<Allocator>,
+    heap: Arc<FwObject>,
     /// Blocks of the shared heap (the PB managers' lists cover the whole 256 MiB window).
     heap_blocks: u32,
 }
@@ -130,7 +131,7 @@ fn write_records<const N: usize>(
     Ok(())
 }
 impl Allocator {
-    fn new(o: &mut Objects, k: u64, heap: &Arc<FwObject>) -> Result<Self> {
+    pub(crate) fn new(o: &mut Objects, k: u64, heap: &Arc<FwObject>) -> Result<Self> {
         let nc = |va| Some((va, pte::LEAF_NC));
         // Native UMA software metadata is ASC-owned and never needs a client GPU alias.
         // In particular its firmware pointers, +0x54 completion and +0x5c exclusion flag
@@ -177,7 +178,7 @@ impl Allocator {
             id: k as u32,
         })
     }
-    fn refs(&self) -> Result<AllocatorRefs> {
+    pub(crate) fn refs(&self) -> Result<AllocatorRefs> {
         let prior = read64(&self.submitted, 0)?;
         if prior & 1 != 0 {
             return Err(EINVAL);
@@ -197,14 +198,49 @@ impl Allocator {
             init_buffer: true,
         })
     }
-    fn retired(&self) -> Result<bool> {
+    /// Prepares this UMA/PB allocator slot. When `pipelined` is true, earlier same-VM renders
+    /// are still in flight on the same active descriptor and PB manager, so the submitted
+    /// counter advances cumulatively while descriptor identity is still verified.
+    pub(crate) fn prepare_in_flight(&self, _draw: u64, pipelined: bool) -> Result<AllocatorRefs> {
+        if !pipelined && self.published.load(Ordering::Acquire) && !self.retired()? {
+            return Err(EBUSY);
+        }
+        // Descriptor pointer/counter and slot must still identify this exact retained unit.
+        if read64(&self.descriptor, 0)? != self.descriptor.va
+            || self.descriptor.r32(8)? != engine::RENDER_UMA_SLOT
+            || read64(&self.descriptor, 0x4c)? != self.submitted.va
+        {
+            return Err(EINVAL);
+        }
+        self.refs()
+    }
+    pub(crate) fn publish_batch(&self, submitted: u64, renders: u32) -> Result {
+        if renders == 0 {
+            return Err(EINVAL);
+        }
+        let delta = u64::from(renders).checked_mul(2).ok_or(EOVERFLOW)?;
+        if submitted
+            != read64(&self.submitted, 0)?
+                .checked_add(delta)
+                .ok_or(EOVERFLOW)?
+        {
+            return Err(EINVAL);
+        }
+        self.submitted.w64(0, submitted)?;
+        self.published.store(true, Ordering::Release);
+        Ok(())
+    }
+    pub(crate) fn retired(&self) -> Result<bool> {
         let submitted = read64(&self.submitted, 0)?;
         let completed = read64(&self.descriptor, uma_manager::COMPLETED)?;
         Ok(submitted != 0 && submitted == completed)
     }
-    fn retired_at(&self, target: u64) -> Result<bool> {
+    pub(crate) fn retired_at(&self, target: u64) -> Result<bool> {
         let completed = read64(&self.descriptor, uma_manager::COMPLETED)?;
         Ok(target != 0 && completed >= target)
+    }
+    pub(crate) fn heap_gva(&self) -> Result<u64> {
+        gva(&self.heap)
     }
 }
 impl PoolSet {
@@ -219,11 +255,23 @@ impl PoolSet {
             Some((client::pb_heap(0), pte::LEAF_NC)),
             false,
         )?;
-        let mut units = KVec::with_capacity(2, GFP_KERNEL)?;
-        for k in 0..2 {
+        let mut units = KVec::with_capacity(sizes::BASE_PB_SLOTS, GFP_KERNEL)?;
+        for k in 0..sizes::BASE_PB_SLOTS as u64 {
             units.push(Allocator::new(o, k, &heap)?, GFP_KERNEL)?;
         }
-        Ok(Self { units, heap_blocks })
+        Ok(Self {
+            units,
+            heap,
+            heap_blocks,
+        })
+    }
+    #[allow(dead_code)]
+    pub(crate) fn unit(&self, k: usize) -> Option<&Allocator> {
+        self.units.get(k)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn heap(&self) -> &Arc<FwObject> {
+        &self.heap
     }
     #[allow(dead_code)]
     pub(crate) fn allocator_refs_for(&self, k: usize) -> Result<AllocatorRefs> {
@@ -233,45 +281,27 @@ impl PoolSet {
     pub(crate) fn prepare(&self, k: usize, draw: u64) -> Result<AllocatorRefs> {
         self.prepare_in_flight(k, draw, false)
     }
-    /// Prepares UMA/PB allocator slot `k` (`0` or `1`). When `pipelined` is true, earlier
-    /// same-VM renders are still in flight on the same active descriptor and PB manager, so
-    /// the submitted counter advances cumulatively while descriptor identity is still verified.
+    /// Prepares base UMA/PB allocator slot `k` (`0..BASE_PB_SLOTS`).
+    #[allow(dead_code)]
     pub(crate) fn prepare_in_flight(
         &self,
         k: usize,
-        _draw: u64,
+        draw: u64,
         pipelined: bool,
     ) -> Result<AllocatorRefs> {
-        let u = self.units.get(k).ok_or(EINVAL)?;
-        if !pipelined && u.published.load(Ordering::Acquire) && !u.retired()? {
-            return Err(EBUSY);
-        }
-        // Descriptor pointer/counter and slot must still identify this exact retained unit.
-        if read64(&u.descriptor, 0)? != u.descriptor.va
-            || u.descriptor.r32(8)? != engine::RENDER_UMA_SLOT
-            || read64(&u.descriptor, 0x4c)? != u.submitted.va
-        {
-            return Err(EINVAL);
-        }
-        u.refs()
+        self.units
+            .get(k)
+            .ok_or(EINVAL)?
+            .prepare_in_flight(draw, pipelined)
     }
+    #[allow(dead_code)]
     pub(crate) fn publish_batch(&self, k: usize, submitted: u64, renders: u32) -> Result {
-        if renders == 0 {
-            return Err(EINVAL);
-        }
-        let u = self.units.get(k).ok_or(EINVAL)?;
-        let delta = u64::from(renders).checked_mul(2).ok_or(EOVERFLOW)?;
-        if submitted
-            != read64(&u.submitted, 0)?
-                .checked_add(delta)
-                .ok_or(EOVERFLOW)?
-        {
-            return Err(EINVAL);
-        }
-        u.submitted.w64(0, submitted)?;
-        u.published.store(true, Ordering::Release);
-        Ok(())
+        self.units
+            .get(k)
+            .ok_or(EINVAL)?
+            .publish_batch(submitted, renders)
     }
+    #[allow(dead_code)]
     pub(crate) fn retired(&self, k: usize) -> Result<bool> {
         self.units.get(k).ok_or(EINVAL)?.retired()
     }
@@ -279,64 +309,84 @@ impl PoolSet {
     pub(crate) fn retired_at(&self, k: usize, target: u64) -> Result<bool> {
         self.units.get(k).ok_or(EINVAL)?.retired_at(target)
     }
+    #[allow(dead_code)]
     pub(crate) fn heap_gva(&self, k: usize) -> Result<u64> {
-        gva(&self.units.get(k).ok_or(EINVAL)?.heap)
+        self.units.get(k).ok_or(EINVAL)?.heap_gva()
     }
     pub(crate) fn heap_blocks(&self) -> u32 {
         self.heap_blocks
     }
 }
 
-/// Device-wide physical PB-slot leases (`parameter_id` 0 and 1, hardware UMA slot 33).
+/// Device-wide physical PB-slot leases (`parameter_id` `0..PB_SLOTS`, hardware UMA slot 33).
 ///
 /// Decoupled from per-pass storage (`PassSlot 0..RENDER_SLOTS`): same-VM renders stay on one
 /// active `pb_slot` and reuse its exposed `PbEpoch` (including pipelined renders in flight),
-/// while cross-VM switches or post-recovery/error renders drain and switch to the displaced
-/// alternate `pb_slot` so the previous VM's UMA/PB storage remains mapped through displacement.
+/// while cross-VM switches or post-recovery/error renders drain and switch to a displaced or
+/// fresh alternate `pb_slot` so the previous VM's UMA/PB storage remains mapped through
+/// displacement. Under normal non-fault operation the working set stays on the two base slots;
+/// recovery slots `BASE_PB_SLOTS..PB_SLOTS` are claimed only after a render hang permanently
+/// quarantines a slot.
 pub(crate) struct Pools {
     pub(crate) dev: ARef<device::Device>,
     pub(crate) stats: PbStats,
-    owners: [Option<Arc<PbEpoch>>; 2],
+    owners: [Option<Arc<PbEpoch>>; sizes::PB_SLOTS],
     #[allow(dead_code)]
-    owner_vms: [Option<Arc<super::vm::VmState>>; 2],
+    owner_vms: [Option<Arc<super::vm::VmState>>; sizes::PB_SLOTS],
     #[allow(dead_code)]
-    owner_arenas: [Option<Arc<super::resources::RenderArena>>; 2],
-    pending_vms: [Option<Arc<super::vm::VmState>>; 2],
-    pending_arenas: [Option<Arc<super::resources::RenderArena>>; 2],
+    owner_arenas: [Option<super::resources::PbOwnerArena>; sizes::PB_SLOTS],
+    pending_vms: [Option<Arc<super::vm::VmState>>; sizes::PB_SLOTS],
+    pending_arenas: [Option<super::resources::PbOwnerArena>; sizes::PB_SLOTS],
     /// Per allocator slot, a binding count, bumped by each fresh epoch (its InitBM rebinds the
     /// slot) and by a firmware recovery. It identifies a binding without holding the epoch.
-    binds: [u64; 2],
+    binds: [u64; sizes::PB_SLOTS],
     /// Per allocator slot: `owners[k]` may serve the next render of its VM without InitBM.
-    keep: [bool; 2],
-    /// Most recently published allocator slot (`0` or `1`).
+    keep: [bool; sizes::PB_SLOTS],
+    /// Most recently published allocator slot (`0..PB_SLOTS`).
     active: Option<usize>,
-    /// Most recently cleanly retired allocator slot (proves the alternate slot is displaced).
+    /// Most recently cleanly retired allocator slot (proves every other slot is displaced).
     last_clean_retired: Option<usize>,
     /// Live in-flight render count per allocator slot.
-    inflight: [u32; 2],
+    inflight: [u32; sizes::PB_SLOTS],
     /// Permanently quarantined allocator slots after an aborted receipt.
-    quarantined: [bool; 2],
+    quarantined: [bool; sizes::PB_SLOTS],
     /// Fresh PB epoch retained when an aborted render had not yet replaced `owners[k]`.
-    quarantined_epochs: [Option<Arc<PbEpoch>>; 2],
+    quarantined_epochs: [Option<Arc<PbEpoch>>; sizes::PB_SLOTS],
 }
 impl Pools {
     pub(crate) fn new(dev: &AsahiDrmDevice) -> Self {
         Self {
             dev: dev.as_ref().as_ref().into(),
             stats: PbStats::default(),
-            owners: [None, None],
-            owner_vms: [None, None],
-            owner_arenas: [None, None],
-            pending_vms: [None, None],
-            pending_arenas: [None, None],
-            binds: [0, 0],
-            keep: [false, false],
+            owners: [const { None }; sizes::PB_SLOTS],
+            owner_vms: [const { None }; sizes::PB_SLOTS],
+            owner_arenas: [const { None }; sizes::PB_SLOTS],
+            pending_vms: [const { None }; sizes::PB_SLOTS],
+            pending_arenas: [const { None }; sizes::PB_SLOTS],
+            binds: [0; sizes::PB_SLOTS],
+            keep: [false; sizes::PB_SLOTS],
             active: None,
             last_clean_retired: None,
-            inflight: [0, 0],
-            quarantined: [false, false],
-            quarantined_epochs: [None, None],
+            inflight: [0; sizes::PB_SLOTS],
+            quarantined: [false; sizes::PB_SLOTS],
+            quarantined_epochs: [const { None }; sizes::PB_SLOTS],
         }
+    }
+    /// Number of contiguous PB/UMA allocator slots (`0..n`) each rendering VM should prepare
+    /// so at least [`sizes::BASE_PB_SLOTS`] healthy slots remain available across quarantines.
+    #[allow(dead_code)]
+    pub(crate) fn needed_slots(&self) -> usize {
+        let quarantined = self.quarantined.iter().filter(|&&q| q).count();
+        sizes::BASE_PB_SLOTS
+            .saturating_add(quarantined)
+            .min(sizes::PB_SLOTS)
+    }
+    /// Whether slot `k` is healthy, not active, and either fresh or displaced by a clean
+    /// retirement of some other slot.
+    fn slot_displaced(&self, k: usize) -> bool {
+        !self.quarantined[k]
+            && self.active != Some(k)
+            && (self.owners[k].is_none() || self.last_clean_retired.is_some_and(|r| r != k))
     }
     /// Allocator slot `k`'s owner epoch, if its render retired normally while the slot was still
     /// bound to it, it belongs to `vm` and was exposed (its InitBM ran). InitBM binds the
@@ -351,81 +401,91 @@ impl Pools {
         (Arc::ptr_eq(&owner._vm, vm) && owner.exposed.load(Ordering::Acquire))
             .then(|| owner.clone())
     }
-    /// Selects the physical PB/UMA allocator slot (`0` or `1`) for `vm`.
+    /// Selects a physical PB/UMA allocator slot within `0..limit` for `vm`.
     ///
     /// When `behind` is true (pipelining behind in-flight same-VM renders), the active slot must
-    /// be healthy and reusable for `vm`. When `behind` is false (engine drained), a same-VM
-    /// render stays on its reusable active slot; otherwise it switches to the alternate slot
-    /// only once that alternate is fresh or displaced by a clean retirement of the active slot.
-    #[allow(dead_code)]
-    pub(crate) fn pick_slot(&self, vm: &Arc<super::vm::VmState>, behind: bool) -> Option<usize> {
+    /// be within `0..limit`, healthy, and reusable for `vm`. When `behind` is false (engine
+    /// drained), a same-VM render stays on its reusable active slot if within `0..limit`;
+    /// otherwise it switches to an already-used displaced slot first (preserving the 2-slot
+    /// working set) or claims the lowest fresh slot.
+    pub(crate) fn pick_slot_within(
+        &self,
+        vm: &Arc<super::vm::VmState>,
+        behind: bool,
+        limit: usize,
+    ) -> Option<usize> {
+        let n = limit.min(sizes::PB_SLOTS);
         if behind {
             let a = self.active?;
-            return (!self.quarantined[a] && self.reusable(a, vm).is_some()).then_some(a);
+            return (a < n && !self.quarantined[a] && self.reusable(a, vm).is_some()).then_some(a);
         }
-        match self.active {
-            None => (!self.quarantined[0])
-                .then_some(0)
-                .or_else(|| (!self.quarantined[1]).then_some(1)),
-            Some(a) => {
-                if !self.quarantined[a] && self.reusable(a, vm).is_some() {
-                    return Some(a);
-                }
-                let other = 1 - a;
-                let displaced =
-                    self.owners[other].is_none() || self.last_clean_retired == Some(a);
-                (!self.quarantined[other] && displaced).then_some(other)
+        if let Some(a) = self.active {
+            if a < n && !self.quarantined[a] && self.reusable(a, vm).is_some() {
+                return Some(a);
             }
         }
+        // Prefer reusing a displaced slot over claiming a fresh recovery slot.
+        (0..n)
+            .find(|&k| self.slot_displaced(k) && self.owners[k].is_some())
+            .or_else(|| (0..n).find(|&k| self.slot_displaced(k)))
+    }
+    /// Selects a physical PB/UMA allocator slot across all `0..PB_SLOTS` for `vm`.
+    #[allow(dead_code)]
+    pub(crate) fn pick_slot(&self, vm: &Arc<super::vm::VmState>, behind: bool) -> Option<usize> {
+        self.pick_slot_within(vm, behind, sizes::PB_SLOTS)
+    }
+    /// Whether `vm` can pipeline another render behind active same-VM renders within `0..limit`.
+    #[allow(dead_code)]
+    pub(crate) fn can_pipeline_within(&self, vm: &Arc<super::vm::VmState>, limit: usize) -> bool {
+        self.pick_slot_within(vm, true, limit).is_some()
     }
     /// Whether `vm` can pipeline another render behind the currently active same-VM renders.
     #[allow(dead_code)]
     pub(crate) fn can_pipeline(&self, vm: &Arc<super::vm::VmState>) -> bool {
-        self.pick_slot(vm, true).is_some()
+        self.can_pipeline_within(vm, sizes::PB_SLOTS)
     }
     /// Whether no allocator slot can ever accept another render (even after draining).
     #[allow(dead_code)]
     pub(crate) fn exhausted(&self) -> bool {
-        if self.inflight != [0, 0] {
+        if self.inflight.iter().any(|&c| c != 0) {
             return false;
         }
-        if self.quarantined[0] && self.quarantined[1] {
-            return true;
-        }
-        match self.active {
-            None => false,
-            Some(a) => {
-                let other = 1 - a;
-                let can_reuse_active = !self.quarantined[a]
-                    && self.keep[a]
-                    && self.owners[a]
-                        .as_ref()
-                        .is_some_and(|o| o.exposed.load(Ordering::Acquire));
-                let can_switch_other = !self.quarantined[other]
-                    && (self.owners[other].is_none() || self.last_clean_retired == Some(a));
-                !can_reuse_active && !can_switch_other
+        if let Some(a) = self.active {
+            let can_reuse_active = !self.quarantined[a]
+                && self.keep[a]
+                && self.owners[a]
+                    .as_ref()
+                    .is_some_and(|o| o.exposed.load(Ordering::Acquire));
+            if can_reuse_active {
+                return false;
             }
         }
+        !(0..sizes::PB_SLOTS).any(|k| self.slot_displaced(k))
     }
-    /// Whether no allocator slot can accept a render for `vm` once the engine is drained.
+    /// Whether no allocator slot within `0..limit` can accept a render for `vm` once drained.
     ///
-    /// When one slot is quarantined and the surviving slot is owned by another VM, the global
-    /// render class stays alive for that owner while other VMs must be cancelled immediately
+    /// When a VM prepared fewer PB slots than needed after a render hang (or when only one
+    /// surviving slot remains and belongs to another VM), that job must cancel immediately
     /// instead of spinning on `EAGAIN` until the administrative publication deadline fails the GPU.
     #[allow(dead_code)]
-    pub(crate) fn exhausted_for(&self, vm: &Arc<super::vm::VmState>) -> bool {
-        self.inflight == [0, 0] && self.pick_slot(vm, false).is_none()
+    pub(crate) fn exhausted_for_within(&self, vm: &Arc<super::vm::VmState>, limit: usize) -> bool {
+        self.inflight.iter().all(|&c| c == 0) && self.pick_slot_within(vm, false, limit).is_none()
     }
-    /// Retains the candidate VM and render arena (holding the `PoolSet` UMA descriptors) before
-    /// publication visibility.
+    /// Whether no allocator slot can accept a render for `vm` once the engine is drained.
+    #[allow(dead_code)]
+    pub(crate) fn exhausted_for(&self, vm: &Arc<super::vm::VmState>) -> bool {
+        self.exhausted_for_within(vm, sizes::PB_SLOTS)
+    }
+    /// Retains the candidate VM and owning render/recovery arena (holding the UMA descriptors)
+    /// before publication visibility.
     #[allow(dead_code)]
     pub(crate) fn hold_alloc(
         &mut self,
         k: usize,
         vm: &Arc<super::vm::VmState>,
-        arena: Option<Arc<super::resources::RenderArena>>,
+        arena: Option<super::resources::PbOwnerArena>,
     ) -> Result {
-        if k >= 2 || self.quarantined[k] {
+        if k >= sizes::PB_SLOTS || self.quarantined[k] {
             return Err(EINVAL);
         }
         self.pending_vms[k] = Some(vm.clone());
@@ -435,7 +495,7 @@ impl Pools {
     /// Cancels unpublished candidate retention for allocator slot `k`.
     #[allow(dead_code)]
     pub(crate) fn cancel_alloc(&mut self, k: usize) {
-        if k < 2 {
+        if k < sizes::PB_SLOTS {
             self.pending_vms[k] = None;
             self.pending_arenas[k] = None;
         }
@@ -443,7 +503,7 @@ impl Pools {
     /// Records a render reaching firmware visibility on allocator slot `k`.
     #[allow(dead_code)]
     pub(crate) fn publish_flight(&mut self, k: usize) {
-        if k < 2 {
+        if k < sizes::PB_SLOTS {
             self.active = Some(k);
             self.inflight[k] = self.inflight[k].saturating_add(1);
         }
@@ -457,7 +517,7 @@ impl Pools {
         binding: u64,
         completed: bool,
     ) -> Result {
-        if k >= 2 {
+        if k >= sizes::PB_SLOTS {
             return Err(EINVAL);
         }
         self.inflight[k] = self.inflight[k].saturating_sub(1);
@@ -479,7 +539,7 @@ impl Pools {
     /// including any fresh epoch published on the aborted flight alongside `owners[k]`.
     #[allow(dead_code)]
     pub(crate) fn quarantine_flight(&mut self, k: usize, pb: Option<Arc<PbEpoch>>) {
-        if k < 2 {
+        if k < sizes::PB_SLOTS {
             self.inflight[k] = self.inflight[k].saturating_sub(1);
             self.quarantined[k] = true;
             self.keep[k] = false;
@@ -609,7 +669,7 @@ impl PbEpoch {
     /// Seed only unpublished storage. A retry may choose another physical slot; after
     /// exposure neither the manager nor any of its firmware-mutated lists is reset.
     pub(crate) fn prepare(&self, k: usize, heap: u64, heap_blocks: u32) -> Result {
-        if k >= 2
+        if k >= sizes::PB_SLOTS
             || self.exposed.load(Ordering::Acquire)
             || heap_blocks == 0
             || heap_blocks > buffer::MAX_BLOCKS

@@ -80,7 +80,7 @@ impl Progress {
     fn count(&self)->u32{self.count}
     fn set_pending(&self,v:bool){self.pending.store(v,Ordering::Relaxed)}
 }
-struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}fn render_passes(&self)->Result<usize>{Ok(8)}}
+struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}fn render_passes(&self)->Result<usize>{Ok(8)}fn pb_slots(&self)->Result<usize>{Ok(2)}}
 struct Job { id:u32,vm:Arc<Vm>,queue:Queue,progress:Progress,commands:Vec<Command>,dependency:Result,terminal_marked:AtomicBool,resources:Resources }
 impl Job {
     fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}
@@ -124,7 +124,9 @@ struct Pools{exhausted:bool,exhausted_vm:Option<u32>,block_pipeline_vm:Option<u3
 impl Pools{
     fn exhausted(&self)->bool{self.exhausted}
     fn exhausted_for(&self,vm:&Vm)->bool{self.exhausted_vm==Some(vm.slot)}
+    fn exhausted_for_within(&self,vm:&Vm,_limit:usize)->bool{self.exhausted_for(vm)}
     fn can_pipeline(&self,vm:&Arc<Vm>)->bool{self.block_pipeline_vm!=Some(vm.slot)}
+    fn can_pipeline_within(&self,vm:&Arc<Vm>,_limit:usize)->bool{self.can_pipeline(vm)}
 }
 mod encode {
     pub struct ComputeRefs{pub invalid:bool}
@@ -499,6 +501,7 @@ struct QueueBehindPools{exhausted:bool,can_pipeline:bool}
 impl QueueBehindPools{
     fn exhausted(&self)->bool{self.exhausted}
     fn can_pipeline(&self,_vm:&Arc<Vm>)->bool{self.can_pipeline}
+    fn can_pipeline_within(&self,vm:&Arc<Vm>,_limit:usize)->bool{self.can_pipeline(vm)}
 }
 struct QueueBehindHost{engine:QueueBehindEngine,slots:QueueBehindSlots,pools:QueueBehindPools}
 mod queue_behind_scope {

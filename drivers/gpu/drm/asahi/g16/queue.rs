@@ -233,6 +233,7 @@ impl Queue {
         let hints = super::resources::PrepareHints {
             expand_compute_ext: self.shared.base_compute_quarantined.load(Ordering::Acquire),
             expand_render_ext: self.shared.base_render_quarantined.load(Ordering::Acquire),
+            pb_slots: self.shared.needed_pb_slots.load(Ordering::Acquire) as usize,
         };
         let resources = self
             .vm

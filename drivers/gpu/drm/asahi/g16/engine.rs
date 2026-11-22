@@ -967,7 +967,10 @@ impl Firmware {
             // immediately instead of spinning on EAGAIN and stalling unrelated compute.
             if class_error.is_none()
                 && matches!(command(&job, job.progress.sent()), Some(Command::Render(_)))
-                && (self.pools.exhausted_for(&job.vm)
+                && (job
+                    .resources
+                    .pb_slots()
+                    .is_ok_and(|n| self.pools.exhausted_for_within(&job.vm, n))
                     || job
                         .resources
                         .render_passes()
@@ -1116,7 +1119,10 @@ impl Firmware {
                 f.doomed || f.recovery_suspect || f.initbm || !Arc::ptr_eq(&f.job.vm, &job.vm)
             })
             || (matches!(command(job, job.progress.sent()), Some(Command::Render(_)))
-                && !self.pools.can_pipeline(&job.vm))
+                && !job
+                    .resources
+                    .pb_slots()
+                    .is_ok_and(|n| self.pools.can_pipeline_within(&job.vm, n)))
     }
 
     /// Whether `job`'s next command may be published behind the flights in flight:
@@ -1186,7 +1192,10 @@ impl Firmware {
                     && !self.slots.render_exhausted()
                     && !self.pools.exhausted()
                     && super::recovery::logic::next_ordinal(e.draw).is_some()
-                    && self.pools.can_pipeline(&job.vm)
+                    && job
+                        .resources
+                        .pb_slots()
+                        .is_ok_and(|n| self.pools.can_pipeline_within(&job.vm, n))
                     && job
                         .resources
                         .render_passes()
@@ -1305,10 +1314,9 @@ impl Firmware {
         engine_behind: bool,
     ) -> Result<(RenderRefs, bool, Arc<super::pools::PbEpoch>, u64)> {
         let generation = job.vm.generation;
-        let arena = job.resources.render()?;
-        let mut a = arena
-            .pools
-            .prepare_in_flight(alloc_slot, draw, render_pipelined)?;
+        let mut a = job
+            .resources
+            .prepare_pb_in_flight(alloc_slot, draw, render_pipelined)?;
         // Reuse this VM's retired epoch of the allocator slot when still bound (no reseed/InitBM).
         let (epoch, reused) = match self.pools.reusable(alloc_slot, &job.vm) {
             Some(e) => {
@@ -1323,8 +1331,8 @@ impl Firmware {
                 let e = job.resources.take_pb()?;
                 if let Err(err) = e.prepare(
                     alloc_slot,
-                    arena.pools.heap_gva(alloc_slot)?,
-                    arena.pools.heap_blocks(),
+                    job.resources.pb_heap_gva(alloc_slot)?,
+                    job.resources.pb_heap_blocks()?,
                 ) {
                     job.resources.return_pb(e);
                     return Err(err);
@@ -1379,8 +1387,7 @@ impl Firmware {
         epoch: &super::pools::PbEpoch,
         prev_uma_submitted: u64,
     ) -> Result<RenderRefs> {
-        let arena = job.resources.render()?;
-        let a = arena.pools.allocator_refs_for(alloc_slot)?;
+        let a = job.resources.pb_allocator_refs(alloc_slot)?;
         let r = &self.graph.render;
         let stage = draw.checked_mul(2).ok_or(EOVERFLOW)?;
         let uma_submitted = prev_uma_submitted.checked_add(2).ok_or(EOVERFLOW)?;
@@ -1809,7 +1816,7 @@ impl Firmware {
             self.pools.hold_alloc(
                 f.pb_slot as usize,
                 &job.vm,
-                job.resources.render_arena(),
+                job.resources.pb_owner_arena(f.pb_slot as usize),
             )?;
         }
         // Reserve lifetime ownership before any counter or producer becomes reachable.
@@ -1826,9 +1833,7 @@ impl Firmware {
                 f.pb.as_ref().ok_or(EINVAL)?.expose();
                 job.resources.commit_render();
                 job.resources
-                    .render()?
-                    .pools
-                    .publish_batch(a, f.uma_submitted, f.renders)?;
+                    .publish_pb_batch(a, f.uma_submitted, f.renders)?;
                 self.pools.publish_flight(a);
                 // Notifier service dereferences u32 counters; the host ordering ledger
                 // remains u64. Eight-byte spacing is retained allocation padding.
@@ -2187,7 +2192,11 @@ impl Firmware {
         self.slots.hold_vm(&f.claims, &job.vm)?;
         self.slots.hold_arenas(&f.claims, &job.resources);
         let (refs, init_buffer) = if member == 0 {
-            let alloc_slot = self.pools.pick_slot(&job.vm, behind).ok_or(EAGAIN)?;
+            let pb_slots = job.resources.pb_slots()?;
+            let alloc_slot = self
+                .pools
+                .pick_slot_within(&job.vm, behind, pb_slots)
+                .ok_or(EAGAIN)?;
             let (refs, init_buffer, epoch, binding) =
                 self.render_refs(alloc_slot, job, draw, class_behind, behind)?;
             f.pb = Some(epoch);

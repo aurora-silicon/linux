@@ -151,6 +151,9 @@ pub mod g16 {
         pub type Prepared=ComputeArena;
         #[derive(Clone)]
         pub enum PassOwnerArena{Base(crate::sync::Arc<RenderArena>)}
+        pub struct PoolExtArena;
+        #[derive(Clone)]
+        pub enum PbOwnerArena{Base(crate::sync::Arc<RenderArena>),Ext(crate::sync::Arc<PoolExtArena>)}
         impl PassOwnerArena{
             pub fn pass_and_tilemap_dirty(&self,k:usize)->Option<(&super::slots::PassSlot,&AtomicU64)>{
                 match self{Self::Base(a)=>Some((a.passes.get(k)?,a.tilemap_dirty.get(k)?))}
@@ -563,7 +566,11 @@ pub mod g16 {
 
     #[test]fn eight_render_passes_and_sixteen_compute_units_are_disjoint_in_mesa_hole(){
         let mut o=Objects::new();
-        let _pools=PoolSet::new(&mut o).unwrap();
+        let pools=PoolSet::new(&mut o).unwrap();
+        for k in g16::hw::sizes::BASE_PB_SLOTS as u64..g16::hw::sizes::PB_SLOTS as u64 {
+            let ext=g16::pools::Allocator::new(&mut o,k,pools.heap()).unwrap();
+            assert_eq!(ext.refs().unwrap().parameter_id,k as u32);
+        }
         for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
             g16::slots::ComputeSlot::new(&mut o,k).unwrap();
         }
@@ -637,40 +644,118 @@ pub mod g16 {
         p.publish_flight(1);
         p.retire_flight(1,&e2,b2,true).unwrap();
         assert!(!p.exhausted());
-        // Aborted render on slot 0 with a fresh epoch after slot 1 was previously retired
-        // retains BOTH the prior owner epoch (e1) and the fresh aborted epoch (e1_fresh),
-        // leaving slot 1 undisplaced and slot 0 quarantined -> global pool exhaustion.
-        let e1_fresh=g16::pools::PbEpoch::new(&factory,&vm1,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
-        e1_fresh.prepare(0,0x70c0000000,2048).unwrap();e1_fresh.expose();
+        assert_eq!(p.needed_slots(),g16::hw::sizes::BASE_PB_SLOTS);
+        // Normal cross-VM switch back to VM1 reuses displaced slot 0 rather than claiming slot 2.
         assert_eq!(p.pick_slot(&vm1,false),Some(0));
-        p.publish_flight(0);
-        p.quarantine_flight(0,Some(e1_fresh.clone()));
-        assert_eq!(sync::Arc::strong_count(&e1),2,"prior slot owner epoch must stay mapped");
-        assert_eq!(sync::Arc::strong_count(&e1_fresh),2,"aborted fresh epoch must stay mapped");
-        assert!(p.reusable(0,&vm1).is_none());
-        assert_eq!(p.pick_slot(&vm1,false),None);
-        assert!(p.exhausted());
-        assert!(p.exhausted_for(&vm1));
+    }
 
-        // Quarantine slot 0 while slot 1 is still fresh: VM2 claims and reuses slot 1, while
+    #[test]fn render_hang_after_cross_vm_use_recovers_via_lazy_pb_slot_and_displaces_survivor(){
+        let vm1=vm(1);let vm2=vm(2);let vm3=vm(3);let vm4=vm(4);
+        let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
+        let mk_epoch=|owner:&sync::Arc<g16::vm::VmState>,slot:usize|{
+            let e=g16::pools::PbEpoch::new(&factory,owner,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
+            e.prepare(slot,0x70c0000000,2048).unwrap();e.check_assignment(slot).unwrap();e.expose();
+            e
+        };
+        let mut p=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        // Exact live cross-VM sequence: VM1 on slot 0 -> VM2 on slot 1 -> VM1 on slot 0.
+        let e1=mk_epoch(&vm1,0);
+        assert_eq!(p.pick_slot_within(&vm1,false,2),Some(0));
+        let b=p.bind(0,false);p.publish_flight(0);p.retire_flight(0,&e1,b,true).unwrap();
+        let e2=mk_epoch(&vm2,1);
+        assert_eq!(p.pick_slot_within(&vm2,false,2),Some(1));
+        let b=p.bind(1,false);p.publish_flight(1);p.retire_flight(1,&e2,b,true).unwrap();
+        let e1b=mk_epoch(&vm1,0);
+        assert_eq!(p.pick_slot_within(&vm1,false,2),Some(0));
+        let b=p.bind(0,false);p.publish_flight(0);p.retire_flight(0,&e1b,b,true).unwrap();
+        // VM3 switches to slot 1 with a fresh epoch and hangs: recovery invalidates epochs
+        // and quarantines slot 1 while retaining BOTH the prior owner (e2) and fresh epoch (e3).
+        let e3=mk_epoch(&vm3,1);
+        assert_eq!(p.pick_slot_within(&vm3,false,2),Some(1));
+        let _=p.bind(1,false);p.publish_flight(1);
+        p.invalidate();
+        p.quarantine_flight(1,Some(e3.clone()));
+        assert_eq!(sync::Arc::strong_count(&e2),2,"prior slot owner epoch must stay mapped");
+        assert_eq!(sync::Arc::strong_count(&e3),2,"aborted fresh epoch must stay mapped");
+        // Render class must NOT wedge: slot 2 is fresh and needed_slots advances to 3.
+        assert!(!p.exhausted());
+        assert_eq!(p.needed_slots(),3);
+        // Pre-hang job with only 2 prepared PB slots sees per-job exhaustion (no EAGAIN spin),
+        // while a post-hang job with 3 prepared PB slots claims recovery slot 2.
+        assert!(p.exhausted_for_within(&vm4,2));
+        assert!(!p.exhausted_for_within(&vm4,3));
+        assert_eq!(p.pick_slot_within(&vm4,false,3),Some(2));
+        let e4=mk_epoch(&vm4,2);
+        let b=p.bind(2,false);p.publish_flight(2);p.retire_flight(2,&e4,b,true).unwrap();
+        // Clean retirement on slot 2 displaces surviving slot 0 back to reusable!
+        assert!(!p.exhausted_for_within(&vm1,3));
+        assert_eq!(p.pick_slot_within(&vm1,false,3),Some(0));
+        let e1c=mk_epoch(&vm1,0);
+        let b=p.bind(0,false);p.publish_flight(0);p.retire_flight(0,&e1c,b,true).unwrap();
+        // Subsequent cross-VM render reuses displaced slot 2 (does not consume slot 3).
+        assert_eq!(p.pick_slot_within(&vm2,false,3),Some(2));
+        // An unrelated compute hang calling invalidate() does not wedge render either.
+        p.invalidate();
+        assert!(!p.exhausted());
+        assert_eq!(p.pick_slot_within(&vm2,false,3),Some(2));
+    }
+
+    #[test]fn pb_recovery_slots_survive_four_render_hangs_and_exhaust_cleanly_at_limit(){
+        let vm1=vm(1);let vm2=vm(2);let vm3=vm(3);
+        let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
+        let mk_epoch=|owner:&sync::Arc<g16::vm::VmState>,slot:usize|{
+            let e=g16::pools::PbEpoch::new(&factory,owner,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
+            e.prepare(slot,0x70c0000000,2048).unwrap();e.check_assignment(slot).unwrap();e.expose();
+            e
+        };
+        let mut p=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        // Quarantine 4 slots (0..4): 2 healthy slots (4 and 5) remain for cross-VM switching.
+        for hang in 0..4usize {
+            let n=p.needed_slots();
+            let slot=p.pick_slot_within(&vm1,false,n).unwrap();
+            assert_eq!(slot,hang);
+            p.publish_flight(slot);
+            p.invalidate();
+            p.quarantine_flight(slot,None);
+            assert!(!p.exhausted());
+            assert_eq!(p.needed_slots(),(2+hang+1).min(g16::hw::sizes::PB_SLOTS));
+        }
+        assert_eq!(p.needed_slots(),g16::hw::sizes::PB_SLOTS);
+        // Cross-VM switching still works cleanly across slots 4 and 5.
+        assert_eq!(p.pick_slot(&vm1,false),Some(4));
+        let e4=mk_epoch(&vm1,4);
+        let b=p.bind(4,false);p.publish_flight(4);p.retire_flight(4,&e4,b,true).unwrap();
+        assert_eq!(p.pick_slot(&vm2,false),Some(5));
+        let e5=mk_epoch(&vm2,5);
+        let b=p.bind(5,false);p.publish_flight(5);p.retire_flight(5,&e5,b,true).unwrap();
+        assert_eq!(p.pick_slot(&vm1,false),Some(4));
+        // 5th hang quarantines slot 4: only slot 5 survives (reuse-only for VM2; other VMs exhausted).
+        p.publish_flight(4);
+        p.quarantine_flight(4,None);
+        // Slot 5 was the last_clean_retired slot (undisplaced) and slot 4 is quarantined -> exhausted.
+        assert!(p.exhausted());
+
+        // Quarantine 5 fresh slots leaving slot 5 fresh: VM2 claims and reuses slot 5 while
         // other VMs report per-VM exhaustion without tripping global exhaustion until recovery.
-        let vm3=vm(3);
         let mut q=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
-        assert_eq!(q.pick_slot(&vm1,false),Some(0));
-        q.publish_flight(0);
-        q.quarantine_flight(0,None);
-        assert!(!q.exhausted());
-        assert_eq!(q.pick_slot(&vm2,false),Some(1));
-        let qb2=q.bind(1,false);
-        q.publish_flight(1);
+        for _ in 0..5 {
+            let slot=q.pick_slot(&vm1,false).unwrap();
+            q.publish_flight(slot);
+            q.quarantine_flight(slot,None);
+            assert!(!q.exhausted());
+        }
+        assert_eq!(q.pick_slot(&vm2,false),Some(5));
+        let qe5=mk_epoch(&vm2,5);
+        let qb=q.bind(5,false);
+        q.publish_flight(5);
         assert!(!q.exhausted_for(&vm3)); // in-flight: waits for drain first
-        q.retire_flight(1,&e2,qb2,true).unwrap();
+        q.retire_flight(5,&qe5,qb,true).unwrap();
         assert!(!q.exhausted());
         assert!(!q.exhausted_for(&vm2));
-        assert_eq!(q.pick_slot(&vm2,false),Some(1));
+        assert_eq!(q.pick_slot(&vm2,false),Some(5));
         assert!(q.exhausted_for(&vm1));
         assert!(q.exhausted_for(&vm3));
-        // Recovery invalidates the surviving slot's epoch -> global pool exhaustion.
+        // Recovery invalidates the last surviving slot's epoch -> global pool exhaustion.
         q.invalidate();
         assert!(q.exhausted());
         assert!(q.exhausted_for(&vm2));
@@ -1162,7 +1247,7 @@ for command in [
         raise SystemExit(result.returncode)
 files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs']
 (out/'resource-host.json').write_text(json.dumps({
-    'result': 'pass', 'tests': 30,
+    'result': 'pass', 'tests': 32,
     'scope': 'Actual production allocation, initialization and lifetime code against a CPU-only backing recorder; no hardware qualification.',
     'private_rw_pte': hex(private_rw),
     'private_rw_reference': 'Qualified J713 NC read/write leaf attributes',
