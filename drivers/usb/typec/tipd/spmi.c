@@ -824,9 +824,14 @@ static int sn201202x_cold_reset(struct sn201202x *sn)
 	char mode[4];
 	int ms, ret;
 
+	/*
+	 * The boot loader's debug link runs in mode DBMa: it is never reset from here, nor is a
+	 * controller whose mode cannot be read, which could be in it.
+	 */
 	ret = sn201202x_mode(tps, mode);
-	/* The boot loader's debug link runs in this mode: it is never reset from here */
-	if (!ret && !memcmp(mode, "DBMa", 4))
+	if (ret)
+		return ret;
+	if (!memcmp(mode, "DBMa", 4))
 		return -EBUSY;
 	ret = tipd_cmd_write_busy(tps, "Gaid");
 	if (ret)
