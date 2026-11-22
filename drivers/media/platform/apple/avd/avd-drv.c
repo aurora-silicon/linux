@@ -280,7 +280,6 @@ static int avd_v4l2_init(struct avd_dev *avd)
 
 	avd->mdev.dev = avd->dev;
 	strscpy(avd->mdev.model, "avd", sizeof(avd->mdev.model));
-	strscpy(avd->mdev.bus_info, "platform:avd", sizeof(avd->mdev.bus_info));
 	media_device_init(&avd->mdev);
 	avd->mdev.ops = &avd_media_ops;
 	avd->v4l2_dev.mdev = &avd->mdev;
