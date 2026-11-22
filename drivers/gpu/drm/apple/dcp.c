@@ -10166,4 +10166,5 @@ void dcp_unregister(void)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "dcp_external_audio_test.c"
+#include "dcp_handoff_test.c"
 #endif
