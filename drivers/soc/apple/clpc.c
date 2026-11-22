@@ -108,9 +108,9 @@ enum apple_clpc_rail {
  *	taken up to the next table frequency; 0 for no platform profile
  * @low_power_mw: package power (the SMC's PHPC key) the low-power profile
  *	holds the CPU clusters to; 0 for none
- * @high_power_machine: the machine compatible on which the performance
- *	profile tells the SMC that macOS's High Power mode is on (the zETM
- *	record below); NULL for none
+ * @high_power_machine: the machine compatible that had High Power mode from
+ *	this table before the board DT carried "apple,high-power-mode"; kept so
+ *	that a DTB without the property keeps High Power mode. NULL for none
  */
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
@@ -1064,10 +1064,10 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 			seq_printf(s, " cpu%u %u", clpc->clusters[i].policy_cpu,
 				   clpc->clusters[i].max_khz);
 		seq_puts(s, "\n");
-		if (clpc->high_power)
-			seq_printf(s, "smc high power: %s (%u records sent)\n",
-				   clpc->high_power_sent ? "on" : "off", clpc->high_power_seq);
 	}
+	if (clpc->high_power)
+		seq_printf(s, "smc high power: %s (%u records sent)\n",
+			   clpc->high_power_sent ? "on" : "off", clpc->high_power_seq);
 	if (clpc->gpu_pmgr) {
 		seq_printf(s, "gpu: powered %u for %u ms, pmp limited ", clpc->gpu_on,
 			   clpc->gpu_on ? jiffies_to_msecs(jiffies - clpc->gpu_on_since) : 0);
@@ -1360,6 +1360,7 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	struct device_node *gpu = NULL;
 	struct apple_clpc *clpc;
 	unsigned int rail, i;
+	bool high_power;
 	int ret;
 
 	clpc = devm_kzalloc(dev, sizeof(*clpc), GFP_KERNEL);
@@ -1497,20 +1498,40 @@ static int apple_clpc_probe(struct platform_device *pdev)
 
 	clpc->profile = PLATFORM_PROFILE_BALANCED;
 	clpc->power_next = jiffies;
-	if (clpc->hw->low_power_khz && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
-		struct device *ppdev;
-
+	/*
+	 * The board DT says whether the machine has High Power mode: then the
+	 * performance profile tells the SMC that it is on (the zETM record).
+	 * A machine with High Power mode and no low-power ceiling still gets
+	 * the platform profile, named "apple-smc" so that userspace keeps its
+	 * own low-power CPU budget.
+	 */
+	high_power = of_property_read_bool(dev->of_node, "apple,high-power-mode");
+	/*
+	 * A DTB from before the property (the ESP copy can lag the kernel)
+	 * keeps High Power mode where this table already gave it.
+	 */
+	if (!high_power && clpc->hw->high_power_machine)
+		high_power = of_machine_is_compatible(clpc->hw->high_power_machine);
+	if ((clpc->hw->low_power_khz || high_power) && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
 		/* The SMC is optional: without it the low-power profile has only its ceiling. */
 		clpc->smc_np = of_parse_phandle(dev->of_node, "apple,smc", 0);
-		clpc->high_power = clpc->smc_np && clpc->hw->high_power_machine &&
-				   of_machine_is_compatible(clpc->hw->high_power_machine);
-		if (!clpc->policy_nb_added) {
+		clpc->high_power = clpc->smc_np && high_power;
+	}
+	/* High Power mode alone needs the SMC; without it there is no profile. */
+	if ((clpc->hw->low_power_khz || clpc->high_power) && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
+		struct device *ppdev;
+
+		if (clpc->hw->low_power_khz && !clpc->policy_nb_added) {
 			clpc->policy_nb.notifier_call = apple_clpc_policy_notify;
 			clpc->policy_nb_added = !cpufreq_register_notifier(&clpc->policy_nb,
 									   CPUFREQ_POLICY_NOTIFIER);
 		}
-		ppdev = devm_platform_profile_register(dev, "apple-clpc", clpc,
-						       &apple_clpc_profile_ops);
+		/*
+		 * "apple-clpc" budgets the low-power profile itself; "apple-smc"
+		 * only carries High Power mode, and userspace keeps the CPU budget.
+		 */
+		ppdev = devm_platform_profile_register(dev, clpc->hw->low_power_khz ? "apple-clpc" :
+						       "apple-smc", clpc, &apple_clpc_profile_ops);
 		if (IS_ERR(ppdev))
 			dev_warn(dev, "no platform profile: %pe\n", ppdev);
 	}
@@ -2108,7 +2129,10 @@ static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
 	.idle_on_time = true,
 	.low_power_khz = 2808000,
 	.low_power_mw = 15000,
-	/* High Power mode's record, as macOS 27.0 writes it on the 14-inch M5 Pro */
+	/*
+	 * Only for DTBs without apple,high-power-mode: the 14-inch M5 Pro had
+	 * High Power mode here first. The record is as macOS 27.0 writes it there.
+	 */
 	.high_power_machine = "apple,j714s",
 };
 
