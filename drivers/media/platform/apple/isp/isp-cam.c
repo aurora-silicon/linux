@@ -116,77 +116,24 @@ static const struct isp_setfile isp_setfiles[] = {
 // clang-format on
 
 /*
- * TEST knobs (J815, WIP): what macOS 27.2 sends the same firmware,
- * from the hypervisor IPC trace of 2026-11-20 (notes/camera-isp-run-2026-11-20.md
- * in the J815 workspace). One knob per behaviour, read at each stream start.
- *
- * hr: in a SIFR sensor config (one that reports twice its frame height: the
- * sensor sends a short exposure with every frame, sensor_config=6), macOS
- * sets the SIFR skip interval to 1 and turns highlight recovery on. The
- * firmware refuses HR in other configs, so nothing is sent there.
+ * What macOS 27.2 sends the same H17 firmware on the J815, from a hypervisor
+ * IPC trace (2026-11-20):
+ * - the green camera LED's brightness, 529 at each start in a lit room. It is
+ *   clamped to the range the firmware reports (CH_STATUS_LED_THR_GET,
+ *   204..1023 on the J815), so the privacy LED can never be set dark;
+ * - AE stability 16 / to-stable 8 (other firmware: 32 / 20) and an AE gain
+ *   cap of 96.0;
+ * - on band-0 setfiles, TNR started with (1, 1, 0) and high strength on.
+ * macOS ramps the LED with ambient light; the driver keeps the start value.
  */
-static bool isp_hr = true;
-module_param_named(hr, isp_hr, bool, 0644);
-MODULE_PARM_DESC(hr, "TEST: highlight recovery in SIFR sensor configs, as macOS (default: true)");
-
-/*
- * led_brightness: the green camera LED's brightness. The firmware lights it
- * whenever the sensor runs; macOS sets the brightness at each start (529 in a
- * lit room, 204 with the lens covered) and ramps it with ambient light. 0
- * leaves the firmware's own level. Any other value is clamped to the range
- * the firmware reports (CH_STATUS_LED_THR_GET, 204..1023 on the J815), so the
- * privacy LED can never be set dark from here.
- */
-static unsigned int isp_led_brightness;
-module_param_named(led_brightness, isp_led_brightness, uint, 0644);
-MODULE_PARM_DESC(led_brightness, "TEST: camera LED brightness, clamped to the firmware's range; 0 = firmware default");
-
-/*
- * macos_tune: auto-exposure and temporal-filter arguments as macOS sends
- * them: AE stability 16 / to-stable 8 (the driver's own: 32 / 20), an AE
- * gain cap of 96.0, and on band-0 setfiles TNR started with (1, 1, 0) and
- * high strength on (the driver's own: (1, 0, 0), off).
- */
-static bool isp_macos_tune = true;
-module_param_named(macos_tune, isp_macos_tune, bool, 0644);
-MODULE_PARM_DESC(macos_tune, "TEST: AE stability, AE gain cap and TNR strength as macOS (default: true)");
-
-/*
- * lpdp_macos: the sensor link receiver tuning as macOS sends it on the J815,
- * a 0x18-byte command (2, 0x17, 0x10), instead of the driver's 0x14-byte
- * (1, 15). Off by default: the link works as it is; this is for the A/B.
- */
-static bool isp_lpdp_macos;
-module_param_named(lpdp_macos, isp_lpdp_macos, bool, 0644);
-MODULE_PARM_DESC(lpdp_macos, "TEST: LPDP receiver tuning as macOS, (2, 0x17, 0x10) (default: false)");
-
-/*
- * A SIFR config carries a second, short exposure in its frame: the IMX958
- * reports twice the frame height. Full resolution (config 6): input
- * 3040x5760 for a 3040x2880 second size pair. Binned (config 9): input
- * 1520x2880, half the width and the full height of the 3040x2880 pair.
- */
-static bool isp_ch_config_is_sifr(struct apple_isp *isp, u32 ch, u32 index)
-{
-	struct cmd_ch_camera_config_h17 args;
-	struct cmd_ch_camera_config *config = &args.config;
-
-	if (isp_cmd_ch_camera_config_get(isp, ch, index, &args))
-		return false;
-	if (config->preset != index || !config->in_width2 || !config->in_height2)
-		return false;
-	return (config->in_width == config->in_width2 &&
-		config->in_height == 2 * config->in_height2) ||
-	       (2 * config->in_width == config->in_width2 &&
-		config->in_height == config->in_height2);
-}
+#define ISP_H17_LED_BRIGHTNESS 529
 
 static void isp_ch_configure_led(struct apple_isp *isp, u32 ch)
 {
 	u16 low, high, value;
 	int err;
 
-	if (!isp_led_brightness)
+	if (isp->hw->fw_abi != ISP_FW_ABI_H17)
 		return;
 	err = isp_cmd_ch_status_led_thr_get(isp, ch, &low, &high);
 	if (err || !low || high < low) {
@@ -194,22 +141,10 @@ static void isp_ch_configure_led(struct apple_isp *isp, u32 ch)
 			 err, low, high);
 		return;
 	}
-	value = clamp_t(unsigned int, isp_led_brightness, low, high);
+	value = clamp_t(unsigned int, ISP_H17_LED_BRIGHTNESS, low, high);
 	err = isp_cmd_ch_status_led_mbrightness_set(isp, ch, value);
 	dev_info(isp->dev, "camera LED brightness %u (range %u..%u)%s\n", value,
 		 low, high, err ? ": firmware refused" : "");
-}
-
-/* Best effort: without these the SIFR config still streams from its long exposure. */
-static void isp_ch_configure_sifr(struct apple_isp *isp, u32 ch, u32 index)
-{
-	int err, err_hr;
-
-	err = isp_cmd_ch_sifr_skip_interval_set(isp, ch, 1);
-	err_hr = isp_cmd_ch_hr_enable(isp, ch, isp_hr);
-	dev_info(isp->dev, "sensor config %u is SIFR: skip interval 1%s, highlight recovery %s%s\n",
-		 index, err ? " (refused)" : "", isp_hr ? "on" : "off",
-		 err_hr ? " (refused)" : "");
 }
 
 /*
@@ -1069,13 +1004,12 @@ static int isp_ch_configure_temporal_filter(struct apple_isp *isp, u32 ch)
 		return isp_cmd_apple_ch_temporal_filter_stop(isp, ch);
 
 	case ISP_TEMPORAL_FILTER_BAND0:
-		err = isp_cmd_apple_ch_tnr_start_h17(isp, ch, isp_macos_tune);
+		/* (1, 1, 0) and high strength, as macOS 27.2 */
+		err = isp_cmd_apple_ch_tnr_start_h17(isp, ch, true);
 		if (err)
 			return err;
 
-		/* macOS 27.2 sends 1 (macos_tune) */
-		err = isp_cmd_apple_ch_tnr_high_strength_set(isp, ch,
-							     isp_macos_tune);
+		err = isp_cmd_apple_ch_tnr_high_strength_set(isp, ch, true);
 		if (err)
 			return err;
 
@@ -1138,7 +1072,6 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
 	bool h17 = isp->hw->fw_abi == ISP_FW_ABI_H17;
-	bool sifr;
 	int err;
 
 	err = isp_cmd_flicker_sensor_set(isp, 0);
@@ -1159,11 +1092,7 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 		return err;
 
 	if (isp->hw->lpdp) {
-		if (isp_lpdp_macos)
-			err = isp_cmd_ch_lpdp_hs_receiver_tuning_set3(isp, ch, 2,
-								      0x17, 0x10);
-		else
-			err = isp_cmd_ch_lpdp_hs_receiver_tuning_set(isp, ch, 1, 15);
+		err = isp_cmd_ch_lpdp_hs_receiver_tuning_set(isp, ch, 1, 15);
 		if (err)
 			return err;
 	}
@@ -1177,21 +1106,12 @@ select_config:
 	if (err)
 		return err;
 
-	/*
-	 * Only presets the sensor_config knob moved are queried, before the
-	 * select (as macOS queries), so the DT presets send what they always did.
-	 */
-	sifr = fmt->preset->remapped && !isp_is_p010(isp) &&
-	       isp_ch_config_is_sifr(isp, ch, fmt->preset->index);
-
 	err = isp_cmd_ch_camera_config_select(isp, ch, fmt->preset->index);
 	if (err)
 		return err;
 
 	if (!isp_is_p010(isp))
 		isp_ch_configure_led(isp, ch);
-	if (sifr)
-		isp_ch_configure_sifr(isp, ch, fmt->preset->index);
 
 	err = isp_cmd_ch_buffer_recycle_mode_set(
 		isp, ch, CISP_BUFFER_RECYCLE_MODE_EMPTY_ONLY);
@@ -1264,17 +1184,17 @@ select_config:
 	if (err)
 		return err;
 
-	err = isp_cmd_ch_ae_stability_set(isp, ch, isp_macos_tune ? 16 : 32);
+	err = isp_cmd_ch_ae_stability_set(isp, ch, h17 ? 16 : 32);
 	if (err)
 		return err;
 
 	err = isp_cmd_ch_ae_stability_to_stable_set(isp, ch,
-						    isp_macos_tune ? 8 : 20);
+						    h17 ? 8 : 20);
 	if (err)
 		return err;
 
 	/* 96.0 in 8.8 fixed point, the gain cap macOS sets */
-	if (isp_macos_tune && h17) {
+	if (h17) {
 		err = isp_cmd_ch_ae_gain_cap_set(isp, ch, 96 << 8);
 		if (err)
 			return err;

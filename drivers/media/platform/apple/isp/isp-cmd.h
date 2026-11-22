@@ -84,8 +84,6 @@
 #define CISP_CMD_CH_FACE_DETECTION_CONFIG_SET		     0x0d03
 #define CISP_CMD_CH_FACE_DETECTION_DISABLE		     0x0d04
 #define CISP_CMD_CH_FACE_DETECTION_ENABLE		     0x0d05
-#define CISP_CMD_CH_HR_ENABLE				     0x1005
-#define CISP_CMD_CH_SIFR_SKIP_INTERVAL_SET		     0x1008
 #define CISP_CMD_CH_FID_START				     0x3000
 #define CISP_CMD_CH_FID_STOP				     0x3001
 #define CISP_CMD_IPC_ENDPOINT_SET2			     0x300c
@@ -866,41 +864,10 @@ struct cmd_ch_status_led_thr_get {
 } __packed;
 static_assert(sizeof(struct cmd_ch_status_led_thr_get) == 0x10);
 
-/* Highlight recovery from the short exposure of a SIFR sensor config. */
-struct cmd_ch_hr_enable {
-	u64 opcode;
-	u32 chan;
-	u32 unk_c; /* 0 in every macOS call */
-	u32 enable;
-} __packed;
-static_assert(sizeof(struct cmd_ch_hr_enable) == 0x14);
-
-/* The 0x18-byte form macOS 27.2 sends on the J815: (2, 0x17, 0x10). */
-struct cmd_ch_lpdp_hs_receiver_tuning_set3 {
-	u64 opcode;
-	u32 chan;
-	u32 unk1;
-	u32 unk2;
-	u32 unk3;
-} __packed;
-static_assert(sizeof(struct cmd_ch_lpdp_hs_receiver_tuning_set3) == 0x18);
-
-struct cmd_ch_sifr_skip_interval_set {
-	u64 opcode;
-	u32 chan;
-	u32 interval; /* macOS: 1 */
-} __packed;
-static_assert(sizeof(struct cmd_ch_sifr_skip_interval_set) == 0x10);
-
 int isp_cmd_ch_ae_gain_cap_set(struct apple_isp *isp, u32 chan, u32 gain);
 int isp_cmd_ch_status_led_mbrightness_set(struct apple_isp *isp, u32 chan,
 					  u16 brightness);
 int isp_cmd_ch_status_led_thr_get(struct apple_isp *isp, u32 chan, u16 *low,
 				  u16 *high);
-int isp_cmd_ch_hr_enable(struct apple_isp *isp, u32 chan, u32 enable);
-int isp_cmd_ch_lpdp_hs_receiver_tuning_set3(struct apple_isp *isp, u32 chan,
-					    u32 unk1, u32 unk2, u32 unk3);
-int isp_cmd_ch_sifr_skip_interval_set(struct apple_isp *isp, u32 chan,
-				      u32 interval);
 
 #endif /* __ISP_CMD_H__ */

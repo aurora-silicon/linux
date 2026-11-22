@@ -885,36 +885,3 @@ int isp_cmd_ch_status_led_thr_get(struct apple_isp *isp, u32 chan, u16 *low,
 	return 0;
 }
 
-int isp_cmd_ch_hr_enable(struct apple_isp *isp, u32 chan, u32 enable)
-{
-	struct cmd_ch_hr_enable args = {
-		.opcode = CISP_OPCODE(CISP_CMD_CH_HR_ENABLE),
-		.chan = chan,
-		.enable = enable,
-	};
-	return CISP_SEND_IN(isp, args);
-}
-
-int isp_cmd_ch_sifr_skip_interval_set(struct apple_isp *isp, u32 chan,
-				      u32 interval)
-{
-	struct cmd_ch_sifr_skip_interval_set args = {
-		.opcode = CISP_OPCODE(CISP_CMD_CH_SIFR_SKIP_INTERVAL_SET),
-		.chan = chan,
-		.interval = interval,
-	};
-	return CISP_SEND_IN(isp, args);
-}
-
-int isp_cmd_ch_lpdp_hs_receiver_tuning_set3(struct apple_isp *isp, u32 chan,
-					    u32 unk1, u32 unk2, u32 unk3)
-{
-	struct cmd_ch_lpdp_hs_receiver_tuning_set3 args = {
-		.opcode = CISP_OPCODE(CISP_CMD_CH_LPDP_HS_RECEIVER_TUNING_SET),
-		.chan = chan,
-		.unk1 = unk1,
-		.unk2 = unk2,
-		.unk3 = unk3,
-	};
-	return CISP_SEND_IN(isp, args);
-}

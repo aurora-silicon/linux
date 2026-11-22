@@ -157,8 +157,6 @@ struct isp_preset {
 	struct coord crop_size;
 	/* Processed P010 geometry established by preview or a config reply. */
 	bool p010;
-	/* TEST: moved off its DT sensor config by the sensor_config knob */
-	bool remapped;
 };
 
 struct apple_isp_hw {
@@ -360,6 +358,8 @@ struct isp_format {
 	size_t plane_size[VB2_MAX_PLANES];
 	size_t total_size;
 };
+
+struct dentry;
 
 struct apple_isp {
 	struct device *dev;
