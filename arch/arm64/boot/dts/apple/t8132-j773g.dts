@@ -298,3 +298,29 @@
 &avd {
 	status = "okay";
 };
+
+/*
+ * Enable the Broadcom Gigabit Ethernet port (port02 / dart_apcie2) alongside
+ * the port00 radio. Drop the port-0-only managed-SID clamp on pcie0/dart_apcie0
+ * and drop dart_apcie2's power-domains reference (ps_apcie_sys_gp stays off
+ * under the T8132 PMGR policy, matching dart_apcie0).
+ */
+&dart_apcie0 {
+	/delete-property/ apple,managed-sids;
+	/delete-property/ apple,dma-range;
+};
+
+&dart_apcie2 {
+	/delete-property/ power-domains;
+	status = "okay";
+};
+
+&pcie0 {
+	/delete-property/ apple,managed-sids;
+	iommu-map = <0x100 &dart_apcie0 1 2>,
+		    <0x200 &dart_apcie2 1 1>;
+};
+
+&port02 {
+	status = "okay";
+};
