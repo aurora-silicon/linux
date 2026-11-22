@@ -333,8 +333,8 @@ pub mod g16 {
     #[test]fn production_render_descriptors_preserve_firmware_bytes_and_exact_counter(){
         let mut o=Objects::new();let mut pools=PoolSet::new(&mut o).unwrap();
         let a=pools.prepare(0,1).unwrap();assert!(a.init_buffer);assert_eq!(a.uma_submitted,2);
-        assert!(!pools.retired(0).unwrap());pools.publish(0,2).unwrap();
-        assert!(pools.publish(0,2).is_err());assert!(pools.prepare(0,2).is_err());
+        assert!(!pools.retired(0).unwrap());pools.publish_batch(0,2,1).unwrap();
+        assert!(pools.publish_batch(0,2,1).is_err());assert!(pools.prepare(0,2).is_err());
         let d=o.objects.iter().find(|o|o.va==a.uma_mgr[0]).unwrap();
         d.w64(0x54,2).unwrap();d.w64(0x60,0x5a5aa5a5).unwrap();
         let original=d.snapshot();assert!(pools.retired(0).unwrap());
@@ -603,7 +603,7 @@ pub mod g16 {
         let b1=p.bind(0,false);
         let a1=pools.prepare_in_flight(0,1,false).unwrap();
         assert_eq!(a1.uma_submitted,2);
-        pools.publish(0,2).unwrap();p.publish_flight(0);
+        pools.publish_batch(0,2,1).unwrap();p.publish_flight(0);
         let d0=o.objects.iter().find(|obj|obj.va==a1.uma_mgr[0]).unwrap();
         d0.w64(0x54,2).unwrap();
         p.retire_flight(0,&e1,b1,true).unwrap();
@@ -614,7 +614,7 @@ pub mod g16 {
             assert_eq!(p.pick_slot(&vm1,draw>2),Some(0));
             let refs=pools.prepare_in_flight(0,draw,draw>2).unwrap();
             assert_eq!(refs.uma_submitted,draw*2);
-            pools.publish(0,refs.uma_submitted).unwrap();
+            pools.publish_batch(0,refs.uma_submitted,1).unwrap();
             p.publish_flight(0);
         }
         assert!(!pools.retired_at(0,4).unwrap());
@@ -928,6 +928,73 @@ pub mod g16 {
         assert_eq!(s.free_compute_in(hw::sizes::COMPUTE_UNITS),0);
         s.release(&mut batch);
         assert_eq!(s.free_compute_in(hw::sizes::COMPUTE_UNITS),(hw::sizes::COMPUTE_UNITS-1) as u32);
+    }
+
+    #[test]fn multi_pass_render_batch_claims_ordered_retirement_and_publish_batch(){
+        use crate::g16::pools::PoolSet;
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
+        let mut passes=KVec::new();
+        for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
+            passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
+        }
+        let render=sync::Arc::new(g16::resources::RenderArena{
+            passes,
+            tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
+            tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
+        },0).unwrap();
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render)};
+        let a=vm(1);
+        // Wrapped submission order [14, 15, 0]: retiring in order leaves slot 0 as last_retired
+        // while slots 14 and 15 are displaced and reusable immediately.
+        let order=[14usize,15,0];
+        let mut c=Claims::new();
+        for (i,&k) in order.iter().enumerate() {
+            s.claim_pass_in(&prep,k,Some(a.id),0x1000).unwrap();
+            c.pass[i]=k as u32;
+            c.pass_count+=1;
+            c.pass_mask|=1<<k;
+            s.pass_busy|=1<<k;
+        }
+        // Mismatched pass_mask or duplicate slot is rejected by hold_vm.
+        let mut bad=c;
+        bad.pass_mask^=1<<1;
+        assert_eq!(s.hold_vm(&bad,&a),Err(EINVAL));
+        let mut dup=c;
+        dup.pass[2]=14;
+        assert_eq!(s.hold_vm(&dup,&a),Err(EINVAL));
+
+        s.hold_vm(&c,&a).unwrap();
+        s.hold_arenas(&c,&prep);
+        s.publish(&c).unwrap();
+        assert_eq!(s.render_published(),3);
+        s.retire(&mut c).unwrap();
+        assert_eq!(s.render_published(),0);
+        assert_eq!(c.pass_count,0);
+        assert_eq!(c.pass_mask,0);
+        assert_eq!(s.pass_busy,0);
+        // Slots 14 and 15 were displaced by slot 0 (newest), so 14 & 15 are claimable while 0 is held.
+        assert_eq!(s.claim_pass_in(&prep,0,Some(a.id),0x1000),Err(EBUSY));
+        s.claim_pass_in(&prep,14,Some(a.id),0x1000).unwrap();
+        s.claim_pass_in(&prep,15,Some(a.id),0x1000).unwrap();
+        let mut cancel=Claims::new();
+        cancel.pass[0]=14;cancel.pass[1]=15;cancel.pass_count=2;cancel.pass_mask=(1<<14)|(1<<15);
+        s.pass_busy|=cancel.pass_mask;
+        s.release(&mut cancel);
+        assert_eq!(cancel.pass_count,0);
+        assert_eq!(s.pass_busy,0);
+        s.claim_pass_in(&prep,14,Some(a.id),0x1000).unwrap();
+        let mut cancel2=Claims::new();
+        cancel2.pass[0]=14;cancel2.pass_count=1;cancel2.pass_mask=1<<14;
+        s.release(&mut cancel2);
+
+        // PoolSet::publish_batch advances submitted by 2 * renders and rejects invalid deltas.
+        let pools=PoolSet::new(&mut o).unwrap();
+        assert_eq!(pools.publish_batch(0,0,0),Err(EINVAL));
+        assert_eq!(pools.publish_batch(0,4,3),Err(EINVAL));
+        assert_eq!(pools.publish_batch(0,6,3),Ok(()));
+        assert_eq!(pools.publish_batch(0,10,3),Err(EINVAL));
+        assert_eq!(pools.publish_batch(0,12,3),Ok(()));
+        assert!(!pools.retired_at(0,6).unwrap());
     }
 
 }

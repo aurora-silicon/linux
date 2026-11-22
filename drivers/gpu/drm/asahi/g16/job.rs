@@ -369,6 +369,41 @@ impl Job {
         true
     }
 
+    /// Whether command `index` is a ready render command continuing a same-SUBMIT render batch
+    /// at queue-local render ordinal `expected` (treating `expected - 1` as already published
+    /// within the in-progress render flight).
+    pub(crate) fn can_fold_render_cmd(&self, index: u32, expected: u64) -> bool {
+        if self.terminal_retired.load(Ordering::Acquire) || self.vm.status.get() != 0 {
+            return false;
+        }
+        let Some(Command::Render(_)) = self.commands.get(index as usize) else {
+            return false;
+        };
+        let Some(order) = self.orders.get(index as usize) else {
+            return false;
+        };
+        if order.engine != super::command::RENDER
+            || order.sequence != expected
+            || self.queue.check(order).is_err()
+            || super::fence::check_dependencies(&self.inputs).is_err()
+        {
+            return false;
+        }
+        let completed = self
+            .queue
+            .completed
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        let mut published = self
+            .queue
+            .published
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        published[super::command::RENDER] =
+            published[super::command::RENDER].max(expected.saturating_sub(1));
+        order.ready(completed, published)
+    }
+
     /// Checks the retained dependency set for each command immediately before publication.
     /// Never waits or signals fences under the device lock. The scheduler and start() have
     /// already waited; a pending fence asks the engine to defer rather than publish early.

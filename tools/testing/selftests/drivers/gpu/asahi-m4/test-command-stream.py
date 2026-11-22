@@ -619,6 +619,7 @@ mod render_admission_tests {
         pub(crate) const UAT_PGMSK: usize = 0x3fff;
         pub(crate) struct Vm {
             pub(crate) maps: Vec<(u64, u64, bool, bool)>,
+            pub(crate) batch_calls: std::cell::Cell<usize>,
         }
         impl Vm {
             pub(crate) fn covers_range(&self, start: u64, size: u64, read: bool, write: bool) -> bool {
@@ -628,6 +629,7 @@ mod render_admission_tests {
                 })
             }
             pub(crate) fn covers_ranges_batch(&self, ranges: &[(u64, u64, u8)]) -> (bool, usize) {
+                self.batch_calls.set(self.batch_calls.get() + 1);
                 for (i, &(start, size, acc)) in ranges.iter().enumerate() {
                     if !self.covers_range(start, size, acc & 1 != 0, acc & 2 != 0) {
                         return (false, i);
@@ -643,6 +645,17 @@ mod render_admission_tests {
     }
     RENDER_ADMISSION
 
+    fn check_render_one(
+        ctx: &Context<'_>,
+        cmd: &uapi::drm_asahi_cmd_render,
+        vertex: &[uapi::drm_asahi_attachment],
+        fragment: &[uapi::drm_asahi_attachment],
+    ) -> Result {
+        let mut batch = SpanBatch::new();
+        check_render(&mut batch, ctx, cmd, vertex, fragment)?;
+        batch.flush(ctx.vm)
+    }
+
     const BASE_GVA: u64 = 0x10_0000_0000;
     fn base_vm() -> mmu::Vm {
         mmu::Vm {
@@ -651,6 +664,7 @@ mod render_admission_tests {
                 (BASE_GVA + 0x20_0000, BASE_GVA + 0x40_0000, true, true),
                 (BASE_GVA + 0x50_0000, BASE_GVA + 0x51_0000, true, false),
             ],
+            batch_calls: std::cell::Cell::new(0),
         }
     }
     fn base_cmd() -> uapi::drm_asahi_cmd_render {
@@ -681,26 +695,26 @@ mod render_admission_tests {
         cmd.depth.comp_base = BASE_GVA + 0x24_0000;
         cmd.stencil.base = BASE_GVA + 0x28_0000;
         cmd.stencil.comp_base = BASE_GVA + 0x2c_0000;
-        assert_eq!(check_render(&ctx, &cmd, &[], &[]), Ok(()));
+        assert_eq!(check_render_one(&ctx, &cmd, &[], &[]), Ok(()));
         // 1x compressed D16 depth (Z Format = 2 at bits 25..26).
         let mut d16 = base_cmd();
         d16.zls_ctrl = Z_COMP | (2 << 25);
         d16.depth.base = BASE_GVA + 0x20_0000;
         d16.depth.comp_base = BASE_GVA + 0x24_0000;
-        assert_eq!(check_render(&ctx, &d16, &[], &[]), Ok(()));
+        assert_eq!(check_render_one(&ctx, &d16, &[], &[]), Ok(()));
         // 2x MSAA compressed depth.
         let mut msaa2 = d16;
         msaa2.samples = 2;
-        assert_eq!(check_render(&ctx, &msaa2, &[], &[]), Ok(()));
+        assert_eq!(check_render_one(&ctx, &msaa2, &[], &[]), Ok(()));
         // Layered compressed depth/stencil with comp_stride == 0 (1 line = 0x80) and nonzero stride.
         let mut layered = cmd;
         layered.layers = 4;
         layered.depth.stride = (1 << 14) | 1;
         layered.stencil.stride = (1 << 14) | 1;
-        assert_eq!(check_render(&ctx, &layered, &[], &[]), Ok(()));
+        assert_eq!(check_render_one(&ctx, &layered, &[], &[]), Ok(()));
         layered.depth.comp_stride = 3 << 14;
         layered.stencil.comp_stride = 2 << 14;
-        assert_eq!(check_render(&ctx, &layered, &[], &[]), Ok(()));
+        assert_eq!(check_render_one(&ctx, &layered, &[], &[]), Ok(()));
     }
 
     #[test]
@@ -720,36 +734,36 @@ mod render_admission_tests {
         for bit in [1u64 << 2, 1 << 6, 1 << 4, 1 << 8] {
             let mut bad = valid();
             bad.zls_ctrl ^= bit;
-            assert_eq!(check_render(&ctx, &bad, &[], &[]), Err(EINVAL));
+            assert_eq!(check_render_one(&ctx, &bad, &[], &[]), Err(EINVAL));
         }
         // Unaligned comp_stride or comp_base.
         for bad_stride in [1u32, 0x4001, 0x3fff] {
             let mut bad = valid();
             bad.depth.comp_stride = bad_stride;
-            assert_eq!(check_render(&ctx, &bad, &[], &[]), Err(EINVAL));
+            assert_eq!(check_render_one(&ctx, &bad, &[], &[]), Err(EINVAL));
         }
         let mut bad = valid();
         bad.depth.comp_base += 2;
-        assert_eq!(check_render(&ctx, &bad, &[], &[]), Err(EINVAL));
+        assert_eq!(check_render_one(&ctx, &bad, &[], &[]), Err(EINVAL));
         // comp_base without compress bits, compress bits without comp_base, stride without base.
         let mut bad = valid();
         bad.zls_ctrl &= !((1 << 2) | (1 << 6));
-        assert_eq!(check_render(&ctx, &bad, &[], &[]), Err(EINVAL));
+        assert_eq!(check_render_one(&ctx, &bad, &[], &[]), Err(EINVAL));
         let mut bad = valid();
         bad.depth.comp_base = 0;
-        assert_eq!(check_render(&ctx, &bad, &[], &[]), Err(EINVAL));
+        assert_eq!(check_render_one(&ctx, &bad, &[], &[]), Err(EINVAL));
         let mut bad = valid();
         bad.zls_ctrl = Z_COMP;
         bad.stencil = Default::default();
         bad.stencil.comp_stride = 1 << 14;
-        assert_eq!(check_render(&ctx, &bad, &[], &[]), Err(EINVAL));
+        assert_eq!(check_render_one(&ctx, &bad, &[], &[]), Err(EINVAL));
         // Unmapped comp_base -> ENOENT; read-only comp_base -> EACCES.
         let mut unmapped = valid();
         unmapped.depth.comp_base = BASE_GVA + 0x60_0000;
-        assert_eq!(check_render(&ctx, &unmapped, &[], &[]), Err(ENOENT));
+        assert_eq!(check_render_one(&ctx, &unmapped, &[], &[]), Err(ENOENT));
         let mut ro = valid();
         ro.depth.comp_base = BASE_GVA + 0x50_0000;
-        assert_eq!(check_render(&ctx, &ro, &[], &[]), Err(EACCES));
+        assert_eq!(check_render_one(&ctx, &ro, &[], &[]), Err(EACCES));
         // Layered metadata span extending past mapped range -> ENOENT.
         let mut past_end = valid();
         past_end.layers = 4;
@@ -757,7 +771,40 @@ mod render_admission_tests {
         past_end.stencil.stride = 1;
         past_end.depth.comp_base = BASE_GVA + 0x3f_c000;
         past_end.depth.comp_stride = 0x100 << 14;
-        assert_eq!(check_render(&ctx, &past_end, &[], &[]), Err(ENOENT));
+        assert_eq!(check_render_one(&ctx, &past_end, &[], &[]), Err(ENOENT));
+    }
+
+    #[test]
+    fn submit_wide_span_batch_dedups_and_flushes_once_across_passes() {
+        let vm = base_vm();
+        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        let mut batch = SpanBatch::new();
+        for pass in 0..4u64 {
+            let mut cmd = base_cmd();
+            cmd.vdm_ctrl_stream_base = BASE_GVA + pass * 0x20;
+            cmd.zls_ctrl = Z_COMP;
+            cmd.depth.base = BASE_GVA + 0x20_0000 + pass * 0x4000;
+            cmd.depth.comp_base = BASE_GVA + 0x24_0000 + pass * 0x4000;
+            assert_eq!(check_render(&mut batch, &ctx, &cmd, &[], &[]), Ok(()));
+        }
+        assert_eq!(vm.batch_calls.get(), 0);
+        assert_eq!(batch.flush(&vm), Ok(()));
+        assert_eq!(vm.batch_calls.get(), 1);
+
+        // Unmapped or read-only span on a later pass still reports exact ENOENT / EACCES.
+        let mut bad_unmapped = base_cmd();
+        bad_unmapped.zls_ctrl = Z_COMP;
+        bad_unmapped.depth.base = BASE_GVA + 0x20_0000;
+        bad_unmapped.depth.comp_base = BASE_GVA + 0x60_0000;
+        assert_eq!(check_render(&mut batch, &ctx, &base_cmd(), &[], &[]), Ok(()));
+        assert_eq!(check_render(&mut batch, &ctx, &bad_unmapped, &[], &[]), Ok(()));
+        assert_eq!(batch.flush(&vm), Err(ENOENT));
+
+        let mut bad_ro = bad_unmapped;
+        bad_ro.depth.comp_base = BASE_GVA + 0x50_0000;
+        assert_eq!(check_render(&mut batch, &ctx, &base_cmd(), &[], &[]), Ok(()));
+        assert_eq!(check_render(&mut batch, &ctx, &bad_ro, &[], &[]), Ok(()));
+        assert_eq!(batch.flush(&vm), Err(EACCES));
     }
 }
 '''

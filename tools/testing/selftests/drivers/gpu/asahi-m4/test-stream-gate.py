@@ -46,7 +46,17 @@ mod mmu {
     pub const UAT_PGMSK: usize = UAT_PGSZ - 1;
     pub struct Region { pub base: u64, pub bytes: Vec<u8>, pub readable: bool }
     #[derive(Default)]
-    pub struct Vm { pub regions: Vec<Region> }
+    pub struct Vm {
+        pub regions: Vec<Region>,
+        pub lock_calls: std::cell::Cell<usize>,
+        pub read_calls: std::cell::Cell<usize>,
+    }
+    pub struct VmReadGuard<'a>(&'a Vm);
+    impl VmReadGuard<'_> {
+        pub fn read_user(&mut self, va: u64, out: &mut [u8]) -> Result {
+            self.0.read_user(va, out)
+        }
+    }
     impl Vm {
         pub fn region(&mut self, base: u64, bytes: Vec<u8>) {
             self.regions.push(Region { base, bytes, readable: true });
@@ -55,7 +65,12 @@ mod mmu {
             self.regions.iter().any(|r| r.readable && va >= r.base
                 && end >= va && end <= r.base + r.bytes.len() as u64)
         }
+        pub fn read_lock(&self) -> Result<VmReadGuard<'_>> {
+            self.lock_calls.set(self.lock_calls.get() + 1);
+            Ok(VmReadGuard(self))
+        }
         pub fn read_user(&self, va: u64, out: &mut [u8]) -> Result {
+            self.read_calls.set(self.read_calls.get() + 1);
             let end = va.checked_add(out.len() as u64).ok_or(EFAULT)?;
             for r in &self.regions {
                 if r.readable && va >= r.base && end <= r.base + r.bytes.len() as u64 {
@@ -260,10 +275,48 @@ fn pending_signal_interrupts_walk() {
 }
 #[test]
 fn vdm_m4_root_barrier() {
-    assert!(g16::gate::vdm(&vm_for(&[0x21000960]), BASE).is_ok());
+    assert!(g16::gate::vdm_batch(&vm_for(&[0x21000960]), &[BASE]).is_ok());
     for word in [0, 0x21000964, 0x40000000] {
-        assert!(g16::gate::vdm(&vm_for(&[word]), BASE).is_err());
+        assert!(g16::gate::vdm_batch(&vm_for(&[word]), &[BASE]).is_err());
     }
+}
+#[test]
+fn vdm_batch_shares_lock_caches_window_and_rejects_bad_root() {
+    let mut vm = mmu::Vm::default();
+    let mut page0 = vec![0u8; 0x4000];
+    let mut page1 = vec![0u8; 0x4000];
+    let root = 0x21000960u32.to_le_bytes();
+    for off in [0usize, 0x20, 0x40, 0x80, 0x3ffc] {
+        page0[off..off + 4].copy_from_slice(&root);
+    }
+    page1[0x10..0x14].copy_from_slice(&root);
+    vm.region(BASE, page0);
+    vm.region(BASE + 0x4000, page1);
+
+    // Empty batch acquires no VM lock.
+    assert!(g16::gate::vdm_batch(&vm, &[]).is_ok());
+    assert_eq!(vm.lock_calls.get(), 0);
+    assert_eq!(vm.read_calls.get(), 0);
+
+    // Four adjacent VDM roots within 256 bytes share one lock and one read_user.
+    assert!(g16::gate::vdm_batch(&vm, &[BASE, BASE + 0x20, BASE + 0x40, BASE + 0x80]).is_ok());
+    assert_eq!(vm.lock_calls.get(), 1);
+    assert_eq!(vm.read_calls.get(), 1);
+
+    // A bad root inside the same cached 256-byte window is still rejected.
+    vm.regions[0].bytes[0x80..0x84].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
+    assert_eq!(
+        g16::gate::vdm_batch(&vm, &[BASE, BASE + 0x20, BASE + 0x80]),
+        Err(kernel::prelude::EINVAL)
+    );
+    vm.regions[0].bytes[0x80..0x84].copy_from_slice(&root);
+
+    // Cross-page and end-of-page roots share one lock and never over-read past UAT_PGSZ.
+    vm.lock_calls.set(0);
+    vm.read_calls.set(0);
+    assert!(g16::gate::vdm_batch(&vm, &[BASE, BASE + 0x3ffc, BASE + 0x4010]).is_ok());
+    assert_eq!(vm.lock_calls.get(), 1);
+    assert_eq!(vm.read_calls.get(), 3);
 }
 '''
 

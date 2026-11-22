@@ -933,7 +933,6 @@ impl Firmware {
                 .nth(1)
                 .is_some();
             let g = &self.graph.render;
-            let k = f.claims.pass[0] as usize;
             let a = f.pb_slot as usize;
             if render_behind {
                 let e = &self.engine;
@@ -990,15 +989,25 @@ impl Firmware {
                     && f.job.resources.render()?.pools.retired(a)?;
             }
             if full {
-                let unit = f.job.resources.render_pass(k)?;
-                let ta_start = unit.scene.r64(0x600)?;
-                let ta_end = unit.scene.r64(0x608)?;
-                let fs_start = unit.scene.r64(0x620)?;
-                let fs_end = unit.scene.r64(0x628)?;
-                if f.computes == 0 {
-                    ticks = [ta_start, ta_end, fs_start, fs_end];
+                let count = (f.renders as usize).min(f.claims.pass.len());
+                for m in 0..count {
+                    let k = f.claims.pass[m] as usize;
+                    let unit = f.job.resources.render_pass(k)?;
+                    let ta_start = unit.scene.r64(0x600)?;
+                    let ta_end = unit.scene.r64(0x608)?;
+                    let fs_start = unit.scene.r64(0x620)?;
+                    let fs_end = unit.scene.r64(0x628)?;
+                    if count == 1 && f.computes == 0 {
+                        ticks = [ta_start, ta_end, fs_start, fs_end];
+                    }
+                    full &= ta_start != 0
+                        && ta_end > ta_start
+                        && fs_start != 0
+                        && fs_end > fs_start;
+                    if !full {
+                        break;
+                    }
                 }
-                full &= ta_start != 0 && ta_end > ta_start && fs_start != 0 && fs_end > fs_start;
             }
         }
         if full {

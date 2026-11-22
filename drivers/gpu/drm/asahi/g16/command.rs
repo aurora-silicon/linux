@@ -888,8 +888,10 @@ fn check_zls_plane(
     Ok(())
 }
 
-/// Per-command render admission.
+/// Per-command render admission. Pushes VM spans into `batch` so a multi-pass SUBMIT flushes
+/// coverage once across all passes.
 fn check_render(
+    batch: &mut SpanBatch,
     context: &Context<'_>,
     cmd: &uapi::drm_asahi_cmd_render,
     vertex: &[uapi::drm_asahi_attachment],
@@ -936,7 +938,6 @@ fn check_render(
     if vdm & 3 != 0 || !compact(vdm) || scissor == 0 || scissor & 3 != 0 {
         return Err(EINVAL);
     }
-    let mut batch = SpanBatch::new();
     batch.push(vm, vdm, vdm + 4, true, false)?;
     batch.push(
         vm,
@@ -977,17 +978,16 @@ fn check_render(
             false,
         )?;
     }
-    check_zls_plane(&mut batch, context, cmd, false)?;
-    check_zls_plane(&mut batch, context, cmd, true)?;
-    check_attachments(&mut batch, vm, vertex, true)?;
-    check_attachments(&mut batch, vm, fragment, true)?;
-    batch.flush(vm)?;
-    gate::vdm(vm, vdm)?;
+    check_zls_plane(batch, context, cmd, false)?;
+    check_zls_plane(batch, context, cmd, true)?;
+    check_attachments(batch, vm, vertex, true)?;
+    check_attachments(batch, vm, fragment, true)?;
     Ok(())
 }
 
 /// Per-command compute admission.
 fn check_compute(
+    batch: &mut SpanBatch,
     context: &Context<'_>,
     cmd: &uapi::drm_asahi_cmd_compute,
     attachments: &[uapi::drm_asahi_attachment],
@@ -1005,9 +1005,8 @@ fn check_compute(
     {
         return Err(EINVAL);
     }
-    let mut batch = SpanBatch::new();
     batch.push(vm, base, end, true, false)?;
-    check_attachments(&mut batch, vm, attachments, true)?;
+    check_attachments(batch, vm, attachments, true)?;
     batch.flush(vm)?;
     gate::cdm(vm, context.usc_base, base, end)
 }
@@ -1080,6 +1079,9 @@ impl Prepared<'_> {
         let mut vertex = KVec::new();
         let mut fragment = KVec::new();
         let mut compute = KVec::new();
+        let mut batch = SpanBatch::new();
+        let mut vdm_vas = [0u64; MAX_COMMANDS as usize];
+        let mut vdm_count = 0usize;
         let mut rem_renders = counts[RENDER];
         let mut rem_computes = counts[COMPUTE];
         for entry in stream(bytes) {
@@ -1092,7 +1094,12 @@ impl Prepared<'_> {
                     let (packet, _) = render_payload(entry.payload)?;
                     let cmd = &packet;
                     let outputs = resolved.next().ok_or(EINVAL)?;
-                    check_render(context, cmd, &vertex, &fragment)?;
+                    check_render(&mut batch, context, cmd, &vertex, &fragment)?;
+                    if vdm_count >= vdm_vas.len() {
+                        return Err(EINVAL);
+                    }
+                    vdm_vas[vdm_count] = cmd.vdm_ctrl_stream_base;
+                    vdm_count += 1;
                     rem_renders = rem_renders.checked_sub(1).ok_or(EINVAL)?;
                     let (vertex_attachments, fragment_attachments) = if rem_renders == 0 {
                         (core::mem::take(&mut vertex), core::mem::take(&mut fragment))
@@ -1112,7 +1119,7 @@ impl Prepared<'_> {
                 CMD_COMPUTE => {
                     let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
                     let cmd = &packet;
-                    check_compute(context, cmd, &compute)?;
+                    check_compute(&mut batch, context, cmd, &compute)?;
                     let outputs = resolved.next().ok_or(EINVAL)?;
                     rem_computes = rem_computes.checked_sub(1).ok_or(EINVAL)?;
                     let attachments = if rem_computes == 0 {
@@ -1136,6 +1143,8 @@ impl Prepared<'_> {
         if commands.is_empty() {
             return Err(EINVAL);
         }
+        batch.flush(context.vm)?;
+        gate::vdm_batch(context.vm, &vdm_vas[..vdm_count])?;
         Ok(Submission {
             counts,
             commands,

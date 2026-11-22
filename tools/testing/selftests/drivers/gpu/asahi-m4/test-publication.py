@@ -478,10 +478,14 @@ struct QueueBehindJob{id:u32,vm:Arc<Vm>,queue:Arc<Queue>,progress:Progress,comma
 impl QueueBehindJob{
     fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}
     fn command_order(&self,index:u32)->Option<Order>{
-        if self.extra_orders.is_empty(){Some(self.order)}else{self.extra_orders.get(index as usize).copied()}
+        if !self.extra_orders.is_empty() {
+            self.extra_orders.get(index as usize).copied()
+        } else {
+            Some(self.order)
+        }
     }
 }
-struct QueueBehindFlight{job:Arc<QueueBehindJob>,group:Vec<Arc<QueueBehindJob>>,first:usize,count:usize,computes:u32,renders:u32,target:u32,cstamp:[u32;16],fs_target:u32,initbm:bool,has_timestamps:bool,doomed:bool,recovery_suspect:bool}
+struct QueueBehindFlight{job:Arc<QueueBehindJob>,group:Vec<Arc<QueueBehindJob>>,first:usize,count:usize,computes:u32,renders:u32,target:u32,cstamp:[u32;16],r_fs_stamp:[u32;16],fs_target:u32,initbm:bool,has_timestamps:bool,doomed:bool,recovery_suspect:bool}
 struct QueueBehindEngine{ordinal:u64,draw:u64,flights:Vec<QueueBehindFlight>}
 struct QueueBehindSlots{compute_exhausted:bool,render_exhausted:bool,compute_available:bool,pass_available:bool}
 impl QueueBehindSlots{
@@ -499,8 +503,10 @@ struct QueueBehindHost{engine:QueueBehindEngine,slots:QueueBehindSlots,pools:Que
 mod queue_behind_scope {
     use super::*;
     type Job = QueueBehindJob;
+    type Flight = QueueBehindFlight;
     fn command(job:&Job,k:u32)->Option<&Command>{job.commands.get(k as usize)}
     mod params { pub fn compute_flights()->usize{16} pub fn render_flights()->usize{15} }
+    #[allow(non_upper_case_globals)]
     mod kernel {
         pub mod uapi {
             pub const drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS: u32 = 1 << 20;
@@ -512,6 +518,7 @@ mod queue_behind_scope {
     __PLAN_RENDER_BARRIERS__
     impl QueueBehindHost {
         __CAN_QUEUE_BEHIND__
+        __WAIT_STAMP_FOR_WITH__
         __WAIT_STAMP_FOR__
         __CROSS_ENGINE_WAIT__
     }
@@ -530,7 +537,7 @@ mod queue_behind_scope {
         let j_other_vm=mk(3,vm2.clone(),q1.clone(),false);
         let j_render=mk(4,vm1.clone(),q1.clone(),true);
         let mut p=QueueBehindHost{
-            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:j1,group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:j1,group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
@@ -568,7 +575,7 @@ mod queue_behind_scope {
         let no_barrier=mk(2,q1.clone(),true,None,None);
         let other_queue=mk(2,q2.clone(),true,None,Some(1));
         let p=QueueBehindHost{
-            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:timed,group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],fs_target:0,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:timed,group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
@@ -585,7 +592,7 @@ mod queue_behind_scope {
             extra_orders:vec![],dependency:Ok(()),resources:Resources,
         });
         let pr=QueueBehindHost{
-            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:timed_render,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x200,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:timed_render,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
@@ -608,7 +615,7 @@ mod queue_behind_scope {
         let r_other_vm=mk(3,vm2.clone(),true);
         let c1=mk(4,vm1.clone(),false);
         let mut p=QueueBehindHost{
-            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x200,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
@@ -648,8 +655,8 @@ mod queue_behind_scope {
         let c_other_q=mk(5,q2.clone(),false,1,[None,None]);
         let p=QueueBehindHost{
             engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![
-                QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x500,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
-                QueueBehindFlight{job:c1.clone(),group:vec![],first:0,count:1,computes:1,renders:0,target:0x700,cstamp:{let mut a=[0;16];a[0]=0x700;a},fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
+                QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x500;a},fs_target:0x500,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
+                QueueBehindFlight{job:c1.clone(),group:vec![],first:0,count:1,computes:1,renders:0,target:0x700,cstamp:{let mut a=[0;16];a[0]=0x700;a},r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
             ]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
@@ -684,7 +691,7 @@ mod queue_behind_scope {
         cstamp[0]=0x100;cstamp[1]=0x200;cstamp[2]=0x300;
         let pm=QueueBehindHost{
             engine:QueueBehindEngine{ordinal:3,draw:1,flights:vec![
-                QueueBehindFlight{job:multi_c,group:vec![],first:0,count:3,computes:3,renders:0,target:0x300,cstamp,fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
+                QueueBehindFlight{job:multi_c,group:vec![],first:0,count:3,computes:3,renders:0,target:0x300,cstamp,r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
             ]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
@@ -713,20 +720,18 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Compute(ComputeCommand{query_access:false})],
             order:Order{engine:command::COMPUTE,sequence:1,wait_through:[None,None]},
-            extra_orders:vec![],
-            dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,
         });
         let r_job=Arc::new(QueueBehindJob{
             id:2,vm:vm1.clone(),queue:q_rend.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Render(())],
             order:Order{engine:command::RENDER,sequence:1,wait_through:[None,None]},
-            extra_orders:vec![],
-            dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,
         });
         let mut p=QueueBehindHost{
             engine:QueueBehindEngine{ordinal:1,draw:0,flights:vec![QueueBehindFlight{
-                job:c_job.clone(),group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],fs_target:0,
+                job:c_job.clone(),group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],r_fs_stamp:[0;16],fs_target:0,
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
@@ -737,7 +742,7 @@ mod queue_behind_scope {
         assert_eq!(p.cross_engine_wait(&r_job,0,command::COMPUTE),Ok(None));
         // Symmetrically, Queue 0 compute queues directly behind Queue 1 render on the same VM.
         p.engine.flights[0]=QueueBehindFlight{
-            job:r_job,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x200,
+            job:r_job,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,
             initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
         };
         assert!(p.can_queue_behind(&c_job));
@@ -751,8 +756,7 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:seq,wait_through:wait},
-            extra_orders:vec![],
-            dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,
         });
         let c1=mk(1,false,1,[None,None]);
         let c2=mk(2,false,2,[None,None]);
@@ -764,7 +768,7 @@ mod queue_behind_scope {
         cstamp[0]=0x100;cstamp[1]=0x200;cstamp[2]=0x300;
         let mut p=QueueBehindHost{
             engine:QueueBehindEngine{ordinal:3,draw:0,flights:vec![QueueBehindFlight{
-                job:c1,group:vec![c2,c3],first:0,count:1,computes:3,renders:0,target:0x300,cstamp,fs_target:0,
+                job:c1,group:vec![c2,c3],first:0,count:1,computes:3,renders:0,target:0x300,cstamp,r_fs_stamp:[0;16],fs_target:0,
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
@@ -776,6 +780,56 @@ mod queue_behind_scope {
         assert!(p.can_queue_behind(&c4));
         p.engine.flights[0].computes=16;
         assert!(!p.can_queue_behind(&c4));
+    }
+    #[test]fn multi_pass_render_flight_wait_stamp_and_render_cap(){
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:2,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let multi=Arc::new(QueueBehindJob{
+            id:1,vm:vm1.clone(),queue:q1.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:3,pending:AtomicBool::new(true)},
+            commands:vec![Command::Render(()),Command::Render(()),Command::Render(())],
+            order:Order{engine:command::RENDER,sequence:1,wait_through:[None,None]},
+            extra_orders:vec![
+                Order{engine:command::RENDER,sequence:1,wait_through:[None,None]},
+                Order{engine:command::RENDER,sequence:2,wait_through:[Some(1),None]},
+                Order{engine:command::RENDER,sequence:3,wait_through:[Some(2),None]},
+            ],
+            dependency:Ok(()),resources:Resources,
+        });
+        let next_r=Arc::new(QueueBehindJob{
+            id:2,vm:vm1.clone(),queue:q1.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Render(())],
+            order:Order{engine:command::RENDER,sequence:4,wait_through:[Some(3),None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+        });
+        let mut r_fs=[0u32;16];
+        r_fs[0]=0x100;r_fs[1]=0x200;r_fs[2]=0x300;
+        let mut p=QueueBehindHost{
+            engine:QueueBehindEngine{ordinal:0,draw:3,flights:vec![QueueBehindFlight{
+                job:multi.clone(),group:vec![],first:0,count:3,computes:0,renders:3,target:0,cstamp:[0;16],r_fs_stamp:r_fs,fs_target:0x300,
+                initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
+            }]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+        };
+        // Lookup into published multi-pass render flight resolves interior and tail passes.
+        assert_eq!(p.wait_stamp_for(&next_r,command::RENDER,Some(1)),Ok(Some(0x100)));
+        assert_eq!(p.wait_stamp_for(&next_r,command::RENDER,Some(2)),Ok(Some(0x200)));
+        assert_eq!(p.wait_stamp_for(&next_r,command::RENDER,Some(3)),Ok(Some(0x300)));
+        assert_eq!(p.wait_stamp_for(&next_r,command::RENDER,Some(4)),Err(EAGAIN));
+        // Lookup against an in-progress same-batch flight resolves earlier pass before publish.
+        let mut cur_fs=[0u32;16];
+        cur_fs[0]=0x400;
+        let cur=QueueBehindFlight{
+            job:next_r.clone(),group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_fs_stamp:cur_fs,fs_target:0x400,
+            initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
+        };
+        assert_eq!(p.wait_stamp_for_with(&next_r,command::RENDER,Some(4),Some(&cur)),Ok(Some(0x400)));
+        // Active renders sum flight.renders: 15 batched renders saturates render_flights().
+        assert!(p.can_queue_behind(&next_r));
+        p.engine.flights[0].renders=15;
+        assert!(!p.can_queue_behind(&next_r));
     }
     #[test]fn staged_render_barriers_split_ta_and_fs_compute_and_render_waits(){
         const FRAG: u32 = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
@@ -939,10 +993,24 @@ mod compute_horizon_scope {
     use super::{Error, Result, EAGAIN, now_ns};
     const ENOENT: Error = Error(2);
     const ERANGE: Error = Error(34);
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     mod command { pub const RENDER: usize = 0; pub const COMPUTE: usize = 1; }
     #[derive(Copy, Clone)]
     struct Order { engine: usize, sequence: u64, wait_through: [Option<u64>; 2] }
+    impl Order {
+        fn ready(&self, completed: [u64; 2], published: [u64; 2]) -> bool {
+            let mut i = 0;
+            while i < 2 {
+                if let Some(last) = self.wait_through[i] {
+                    if completed[i].max(published[i]) < last {
+                        return false;
+                    }
+                }
+                i += 1;
+            }
+            true
+        }
+    }
     #[derive(Copy, Clone)]
     enum Command { Compute(()), Render(()) }
     mod fence {
@@ -954,7 +1022,11 @@ mod compute_horizon_scope {
     struct Status(AtomicU32);
     impl Status { fn get(&self) -> u32 { self.0.load(Ordering::Relaxed) } }
     struct Vm { status: Status }
-    struct Queue { cancelled_compute: u64 }
+    struct Queue {
+        cancelled_compute: u64,
+        completed: [AtomicU64; 2],
+        published: [AtomicU64; 2],
+    }
     impl Queue {
         fn check(&self, order: &Order) -> Result {
             if self.cancelled_compute != 0 && order.sequence >= self.cancelled_compute {
@@ -981,12 +1053,17 @@ mod compute_horizon_scope {
     impl Job {
         __CAN_FOLD_CMD__
         __CAN_FOLD_JOB__
+        __CAN_FOLD_RENDER_CMD__
     }
     #[test]
     fn compute_horizon_eligibility_rejects_barriers_renders_unready_fences_and_gaps() {
         let mk = |cmds: Vec<Command>, orders: Vec<Order>, inputs: Vec<bool>, cancelled: u64| Job {
             vm: Vm { status: Status(AtomicU32::new(0)) },
-            queue: Queue { cancelled_compute: cancelled },
+            queue: Queue {
+                cancelled_compute: cancelled,
+                completed: [AtomicU64::new(0), AtomicU64::new(0)],
+                published: [AtomicU64::new(0), AtomicU64::new(0)],
+            },
             progress: Progress { sent: 0, count: cmds.len() as u32 },
             commands: cmds,
             orders,
@@ -1053,6 +1130,52 @@ mod compute_horizon_scope {
         assert!(!cancelled.can_fold_horizon_job(2));
     }
 
+    #[test]
+    fn can_fold_render_cmd_accepts_same_batch_render_dep_and_rejects_unready_compute() {
+        let mk = |cmds: Vec<Command>, orders: Vec<Order>, inputs: Vec<bool>, pub_c: u64| Job {
+            vm: Vm { status: Status(AtomicU32::new(0)) },
+            queue: Queue {
+                cancelled_compute: 0,
+                completed: [AtomicU64::new(0), AtomicU64::new(0)],
+                published: [AtomicU64::new(0), AtomicU64::new(pub_c)],
+            },
+            progress: Progress { sent: 0, count: cmds.len() as u32 },
+            commands: cmds,
+            orders,
+            inputs,
+            terminal_retired: AtomicBool::new(false),
+        };
+        let multi = mk(
+            vec![Command::Render(()), Command::Render(()), Command::Render(())],
+            vec![
+                Order { engine: command::RENDER, sequence: 1, wait_through: [None, None] },
+                Order { engine: command::RENDER, sequence: 2, wait_through: [Some(1), None] },
+                Order { engine: command::RENDER, sequence: 3, wait_through: [Some(2), Some(5)] },
+            ],
+            vec![true],
+            4,
+        );
+        // Pass 1 waits on pass 0 (not yet globally published): foldable at expected=2.
+        assert!(multi.can_fold_render_cmd(1, 2));
+        // Wrong sequence is rejected.
+        assert!(!multi.can_fold_render_cmd(1, 3));
+        // Pass 2 waits on unpublished compute 5 (published=4): rejected until compute 5 publishes.
+        assert!(!multi.can_fold_render_cmd(2, 3));
+        multi.queue.published[command::COMPUTE].store(5, Ordering::Release);
+        assert!(multi.can_fold_render_cmd(2, 3));
+        // Unready input fence blocks folding.
+        let unready = mk(
+            vec![Command::Render(()), Command::Render(())],
+            vec![
+                Order { engine: command::RENDER, sequence: 1, wait_through: [None, None] },
+                Order { engine: command::RENDER, sequence: 2, wait_through: [Some(1), None] },
+            ],
+            vec![false],
+            0,
+        );
+        assert!(!unready.can_fold_render_cmd(1, 2));
+    }
+
     mod recovery {
         pub mod logic {
             pub fn last_retired_target(last: &[Option<u32>; 3], event: u32, target: u32) -> bool {
@@ -1062,20 +1185,31 @@ mod compute_horizon_scope {
         }
     }
     mod poll {
-        pub fn stamp_reached(_obs: u32, _own: u32, _tail: u32) -> bool { true }
+        pub fn stamp_reached(obs: u32, own: u32, _tail: u32) -> bool { obs >= own }
     }
     mod work { pub mod ta { pub const TPC_BYTES: usize = 0; } }
     fn wmb() {}
-    struct PassBuf { size: usize }
+    struct PassBuf {
+        size: usize,
+        tpc_bytes: u64,
+        cleared: std::cell::Cell<usize>,
+    }
     impl PassBuf {
-        fn r64(&self, _o: usize) -> Result<u64> { Ok(0) }
-        fn fill(&self, _o: usize, _v: u8, _n: usize) -> Result { Ok(()) }
+        fn r64(&self, _o: usize) -> Result<u64> { Ok(self.tpc_bytes) }
+        fn fill(&self, _o: usize, _v: u8, n: usize) -> Result {
+            self.cleared.set(self.cleared.get() + n);
+            Ok(())
+        }
     }
     struct Pass { ta_work: PassBuf, tpc: PassBuf }
-    struct Resources;
-    impl Resources { fn render_pass(&self, _k: usize) -> Result<&Pass> { Err(ENOENT) } }
+    struct Resources { passes: Vec<Pass> }
+    impl Resources {
+        fn render_pass(&self, k: usize) -> Result<&Pass> {
+            self.passes.get(k).ok_or(ENOENT)
+        }
+    }
     struct RecJob { resources: Resources }
-    struct RecClaims { pass: [u32; 2] }
+    struct RecClaims { pass: [u32; 16] }
     struct RecFlight {
         job: RecJob,
         claims: RecClaims,
@@ -1085,6 +1219,8 @@ mod compute_horizon_scope {
         ta_target: u32,
         fs_target: u32,
         cstamp: [u32; 16],
+        r_ta_stamp: [u32; 16],
+        r_fs_stamp: [u32; 16],
         doomed: bool,
         recovery_suspect: bool,
         recovery_started_ns: u64,
@@ -1104,14 +1240,16 @@ mod compute_horizon_scope {
         let mut fw = RecFirmware {
             engine: RecEngine {
                 flights: vec![RecFlight {
-                    job: RecJob { resources: Resources },
-                    claims: RecClaims { pass: [0; 2] },
+                    job: RecJob { resources: Resources { passes: vec![] } },
+                    claims: RecClaims { pass: [0; 16] },
                     computes: 3,
                     renders: 0,
                     target: 0x300,
                     ta_target: 0,
                     fs_target: 0,
                     cstamp,
+                    r_ta_stamp: [0; 16],
+                    r_fs_stamp: [0; 16],
                     doomed: false,
                     recovery_suspect: false,
                     recovery_started_ns: 0,
@@ -1124,6 +1262,54 @@ mod compute_horizon_scope {
         assert!(fw.engine.flights[0].doomed);
         assert!(fw.engine.flights[0].recovery_suspect);
         assert_eq!(fw.recovery_prepare(1, 15, 0x400, [0, 0, 0x100]), Err(ENOENT));
+    }
+    #[test]
+    fn recovery_prepare_matches_interior_render_stamps_and_cleans_only_unfinished_tpc() {
+        let mk_pass = |bytes: u64| Pass {
+            ta_work: PassBuf { size: 0x1000, tpc_bytes: bytes, cleared: std::cell::Cell::new(0) },
+            tpc: PassBuf { size: 0x10000, tpc_bytes: 0, cleared: std::cell::Cell::new(0) },
+        };
+        let mut r_ta = [0u32; 16];
+        let mut r_fs = [0u32; 16];
+        r_ta[0] = 0x100; r_ta[1] = 0x200; r_ta[2] = 0x300;
+        r_fs[0] = 0x100; r_fs[1] = 0x200; r_fs[2] = 0x300;
+        let mut pass = [0u32; 16];
+        pass[0] = 0; pass[1] = 1; pass[2] = 2;
+        let mut fw = RecFirmware {
+            engine: RecEngine {
+                flights: vec![RecFlight {
+                    job: RecJob {
+                        resources: Resources {
+                            passes: vec![mk_pass(0x1000), mk_pass(0x2000), mk_pass(0x3000)],
+                        },
+                    },
+                    claims: RecClaims { pass },
+                    computes: 0,
+                    renders: 3,
+                    target: 0,
+                    ta_target: 0x300,
+                    fs_target: 0x300,
+                    cstamp: [0; 16],
+                    r_ta_stamp: r_ta,
+                    r_fs_stamp: r_fs,
+                    doomed: false,
+                    recovery_suspect: false,
+                    recovery_started_ns: 0,
+                }],
+                ta_target: 0x300,
+            },
+            recovery: RecState { last_retired: [None; 3] },
+        };
+        // Pass 0 TA finished (stage[0] == 0x100); interior TA target 0x200 matches and cleans
+        // TPC only for unfinished passes 1 and 2.
+        assert_eq!(fw.recovery_prepare(9, 0x70, 0x200, [0x100, 0, 0]), Ok(()));
+        assert!(fw.engine.flights[0].doomed);
+        assert_eq!(fw.engine.flights[0].job.resources.passes[0].tpc.cleared.get(), 0);
+        assert_eq!(fw.engine.flights[0].job.resources.passes[1].tpc.cleared.get(), 0x2000);
+        assert_eq!(fw.engine.flights[0].job.resources.passes[2].tpc.cleared.get(), 0x3000);
+        // Interior FS target 0x200 also matches; unrelated target 0x400 returns ENOENT.
+        assert_eq!(fw.recovery_prepare(1, 0x71, 0x200, [0x300, 0x100, 0]), Ok(()));
+        assert_eq!(fw.recovery_prepare(1, 0x71, 0x400, [0x300, 0x100, 0]), Err(ENOENT));
     }
 }
 '''
@@ -1149,6 +1335,12 @@ harness = harness.replace(
     .replace('super::fence::', 'fence::'),
 )
 harness = harness.replace(
+    '__CAN_FOLD_RENDER_CMD__',
+    item_in(job_src, 'pub(crate) fn can_fold_render_cmd(')
+    .replace('super::command::', 'command::')
+    .replace('super::fence::', 'fence::'),
+)
+harness = harness.replace(
     '__RECOVERY_PREPARE__',
     item('pub(crate) fn recovery_prepare(')
     .replace('super::recovery::', 'recovery::')
@@ -1166,6 +1358,7 @@ for token, declaration in {
     '__DESCRIPTOR_CONTAINMENT__': 'if encode::preserve_compute_descriptor(',
     '__PUBLISH_PRODUCER__': 'fn publish_producer(',
     '__CAN_QUEUE_BEHIND__': 'fn can_queue_behind(',
+    '__WAIT_STAMP_FOR_WITH__': 'fn wait_stamp_for_with(',
     '__WAIT_STAMP_FOR__': 'fn wait_stamp_for(',
     '__CROSS_ENGINE_WAIT__': 'fn cross_engine_wait(',
     '__RENDER_BARRIER_PLAN__': 'struct RenderBarrierPlan {',

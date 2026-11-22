@@ -255,9 +255,17 @@ impl PoolSet {
         }
         u.refs()
     }
-    pub(crate) fn publish(&self, k: usize, submitted: u64) -> Result {
+    pub(crate) fn publish_batch(&self, k: usize, submitted: u64, renders: u32) -> Result {
+        if renders == 0 {
+            return Err(EINVAL);
+        }
         let u = self.units.get(k).ok_or(EINVAL)?;
-        if submitted != read64(&u.submitted, 0)?.checked_add(2).ok_or(EOVERFLOW)? {
+        let delta = u64::from(renders).checked_mul(2).ok_or(EOVERFLOW)?;
+        if submitted
+            != read64(&u.submitted, 0)?
+                .checked_add(delta)
+                .ok_or(EOVERFLOW)?
+        {
             return Err(EINVAL);
         }
         u.submitted.w64(0, submitted)?;

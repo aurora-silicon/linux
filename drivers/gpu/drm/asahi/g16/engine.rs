@@ -222,6 +222,9 @@ pub(crate) struct Flight {
     pub(crate) cstamp: [u32; sizes::COMPUTE_SLOTS],
     pub(crate) cwait: [u32; sizes::COMPUTE_SLOTS],
     pub(crate) csubmitted: [u64; sizes::COMPUTE_SLOTS],
+    /// Render member j's TA and FS FW stamp targets.
+    pub(crate) r_ta_stamp: [u32; sizes::RENDER_SLOTS],
+    pub(crate) r_fs_stamp: [u32; sizes::RENDER_SLOTS],
     /// Compute slots, pass slots and clustering buffers it holds.
     pub(crate) claims: Claims,
     /// A kill or recovery ended this prefix's VM: later prefixes of it fail with EIO.
@@ -269,6 +272,8 @@ impl Flight {
             cstamp: [0; sizes::COMPUTE_SLOTS],
             cwait: [0; sizes::COMPUTE_SLOTS],
             csubmitted: [0; sizes::COMPUTE_SLOTS],
+            r_ta_stamp: [0; sizes::RENDER_SLOTS],
+            r_fs_stamp: [0; sizes::RENDER_SLOTS],
             claims: Claims::new(),
             doomed: false,
             uma_submitted: 0,
@@ -302,6 +307,7 @@ struct Prefix {
     n: u64,
     draw: u64,
     last_ct: u32,
+    last_ta: u32,
     last_fs: u32,
 }
 
@@ -711,7 +717,7 @@ impl Firmware {
             // owner, not the next command that happens to occupy the flight list.
             return Ok(());
         }
-        // The named owner: the oldest flight, or with compute queued behind it a later one.
+        // The named owner: the oldest flight, or with compute/render queued behind it a later one.
         let f = self
             .engine
             .flights
@@ -721,26 +727,41 @@ impl Firmware {
                     f.computes != 0
                         && f.cstamp[..(f.computes as usize).min(f.cstamp.len())].contains(&target)
                 }
-                0x70 => f.renders != 0 && f.ta_target == target,
-                0x71 => f.renders != 0 && f.fs_target == target,
+                0x70 => {
+                    f.renders != 0
+                        && f.r_ta_stamp[..(f.renders as usize).min(f.r_ta_stamp.len())]
+                            .contains(&target)
+                }
+                0x71 => {
+                    f.renders != 0
+                        && f.r_fs_stamp[..(f.renders as usize).min(f.r_fs_stamp.len())]
+                            .contains(&target)
+                }
                 _ => false,
             })
             .ok_or(ENOENT)?;
         if flags & 1 == 0 {
             return Err(ENOENT);
         }
-        if flags & 9 == 9
-            && f.renders != 0
-            && !super::poll::stamp_reached(stage[0], f.ta_target, self.engine.ta_target)
-        {
-            let k = f.claims.pass[0] as usize;
-            let pass = f.job.resources.render_pass(k)?;
-            let bytes = pass.ta_work.r64(work::ta::TPC_BYTES)?;
-            if bytes == 0 || bytes > pass.tpc.size as u64 {
-                return Err(ERANGE);
+        if flags & 9 == 9 && f.renders != 0 {
+            let mut cleaned = false;
+            let count = (f.renders as usize).min(f.r_ta_stamp.len());
+            for m in 0..count {
+                if super::poll::stamp_reached(stage[0], f.r_ta_stamp[m], self.engine.ta_target) {
+                    continue;
+                }
+                let k = f.claims.pass[m] as usize;
+                let pass = f.job.resources.render_pass(k)?;
+                let bytes = pass.ta_work.r64(work::ta::TPC_BYTES)?;
+                if bytes == 0 || bytes > pass.tpc.size as u64 {
+                    return Err(ERANGE);
+                }
+                pass.tpc.fill(0, 0, bytes as usize)?;
+                cleaned = true;
             }
-            pass.tpc.fill(0, 0, bytes as usize)?;
-            wmb();
+            if cleaned {
+                wmb();
+            }
         }
         f.doomed = true;
         f.recovery_suspect = true;
@@ -1160,7 +1181,7 @@ impl Firmware {
                         .is_ok_and(|units| self.slots.compute_available(units))
             }
             Some(Command::Render(_)) => {
-                let render_count = e.flights.iter().filter(|f| f.renders != 0).count();
+                let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
                 render_count < params::render_flights()
                     && !self.slots.render_exhausted()
                     && !self.pools.exhausted()
@@ -1175,14 +1196,16 @@ impl Firmware {
         }
     }
 
-    /// Resolves a same-queue target stamp for `class` (`RENDER` -> `fs_target`, `COMPUTE` ->
-    /// `target`) when `target_seq` names an in-flight command of `job.queue`. Returns `Ok(None)`
-    /// when no barrier was requested or the waited prefix has already retired.
-    fn wait_stamp_for(
+    /// Resolves a same-queue target stamp for `class` (`RENDER` -> `r_fs_stamp`, `COMPUTE` ->
+    /// `cstamp`) when `target_seq` names an in-flight command of `job.queue` or an earlier member
+    /// of an in-progress render batch `current`. Returns `Ok(None)` when no barrier was requested
+    /// or the waited prefix has already retired.
+    fn wait_stamp_for_with(
         &self,
         job: &Arc<Job>,
         class: usize,
         target_seq: Option<u64>,
+        current: Option<&Flight>,
     ) -> Result<Option<u32>> {
         let Some(last) = target_seq else {
             return Ok(None);
@@ -1217,19 +1240,42 @@ impl Firmware {
             }
             return Err(EAGAIN);
         }
-        for flight in &self.engine.flights {
+        let find_render = |flight: &Flight| -> Option<u32> {
             if flight.renders == 0 || !Arc::ptr_eq(&flight.job.queue, &job.queue) {
-                continue;
+                return None;
             }
-            for k in flight.first..flight.first + flight.count {
-                if flight.job.command_order(k as u32).is_some_and(|fo| {
-                    fo.engine == super::command::RENDER && fo.sequence == last
-                }) {
-                    return Ok(Some(flight.fs_target));
+            let count = (flight.renders as usize).min(flight.r_fs_stamp.len());
+            for member in 0..count {
+                let k = (flight.first + member) as u32;
+                if flight
+                    .job
+                    .command_order(k)
+                    .is_some_and(|fo| fo.engine == super::command::RENDER && fo.sequence == last)
+                {
+                    return Some(flight.r_fs_stamp[member]);
                 }
+            }
+            None
+        };
+        if let Some(stamp) = current.and_then(find_render) {
+            return Ok(Some(stamp));
+        }
+        for flight in &self.engine.flights {
+            if let Some(stamp) = find_render(flight) {
+                return Ok(Some(stamp));
             }
         }
         Err(EAGAIN)
+    }
+
+    /// Resolves a same-queue target stamp for `class` across published in-flight flights.
+    fn wait_stamp_for(
+        &self,
+        job: &Arc<Job>,
+        class: usize,
+        target_seq: Option<u64>,
+    ) -> Result<Option<u32>> {
+        self.wait_stamp_for_with(job, class, target_seq, None)
     }
 
     /// Resolves a same-queue cross-engine barrier target stamp when `job`'s command `index`
@@ -1321,6 +1367,47 @@ impl Firmware {
             epoch,
             binding,
         ))
+    }
+
+    /// Allocator references for subsequent passes (`member > 0`) in a non-InitBM multi-pass
+    /// render flight, reusing the active slot and PB epoch while advancing `uma_submitted` by 2.
+    fn render_refs_batched(
+        &self,
+        alloc_slot: usize,
+        job: &Job,
+        draw: u64,
+        epoch: &super::pools::PbEpoch,
+        prev_uma_submitted: u64,
+    ) -> Result<RenderRefs> {
+        let arena = job.resources.render()?;
+        let a = arena.pools.allocator_refs_for(alloc_slot)?;
+        let r = &self.graph.render;
+        let stage = draw.checked_mul(2).ok_or(EOVERFLOW)?;
+        let uma_submitted = prev_uma_submitted.checked_add(2).ok_or(EOVERFLOW)?;
+        Ok(RenderRefs {
+            notifier: r.notifier.va,
+            legacy_empty: r.legacy_empty.va,
+            qinfo: [r.qinfo[0].va, r.qinfo[1].va],
+            user_stamp: [
+                r.notifier.va + notifier_page::TA_STAMP as u64,
+                r.notifier.va + notifier_page::FS_STAMP as u64,
+            ],
+            fw_stamp: [r.fw_stamp[0].va, r.fw_stamp[1].va],
+            uma_mgr: a.uma_mgr,
+            uma_aux: a.uma_aux,
+            uma_gpu: a.uma_gpu,
+            pb_mgr: epoch.manager.va,
+            scene_list: 0,
+            mgr_misc: epoch.misc.va,
+            pb_init_blocks: a.init_blocks,
+            parameter_id: a.parameter_id,
+            generation: job.vm.generation,
+            activity: [self.init.ta_activity.va + 4, self.init.fs_activity.va + 8],
+            counter: [stage, stage - 1],
+            uma_submitted,
+            uuid: (draw as u32).wrapping_add(1),
+            usc_base: job.queue.usc_base,
+        })
     }
 
     /// Publishes the next command of `job`. All images and ring entries precede the host
@@ -1446,12 +1533,14 @@ impl Firmware {
             return Err(super::boot::eproto());
         }
         let mut c_read = prefix.c_head;
+        let mut ta_read = prefix.ta_head;
+        let mut fs_read = prefix.fs_head;
         if class_behind {
             if render {
                 // Room for up to 4 TA entries (prev_barrier, ta_fs_barrier, compute_barrier,
                 // ta_work) and 4 FS entries (fs_dep, fs_compute_barrier, own_barrier, fs_work).
-                let ta_read = self.graph.render.qstate[0].r32(qstate::READ)?;
-                let fs_read = self.graph.render.qstate[1].r32(qstate::READ)?;
+                ta_read = self.graph.render.qstate[0].r32(qstate::READ)?;
+                fs_read = self.graph.render.qstate[1].r32(qstate::READ)?;
                 if ta_read >= 256
                     || fs_read >= 256
                     || prefix.ta_head.wrapping_sub(ta_read) % sizes::QUEUE_CAP
@@ -1471,6 +1560,7 @@ impl Firmware {
                 }
             }
         }
+        f.first = index as usize;
         f.c_start = prefix.c_head;
         f.ta_start = prefix.ta_head;
         f.fs_start = prefix.fs_head;
@@ -1601,9 +1691,102 @@ impl Firmware {
                     .pick_pass_in(&job.resources, &geometry, 0)
                     .ok_or(EAGAIN)?;
                 f.claims.pass[0] = k as u32;
+                f.claims.pass_count = 1;
                 f.claims.pass_mask = 1 << k;
                 self.slots.pass_busy |= 1 << k;
                 self.prefix_render(job, r, geometry, &mut prefix, f, behind, class_behind)?;
+                // Batch consecutive ready non-InitBM render passes of the same SUBMIT into
+                // one TA/FS producer advance, one UMA submitted update, and one SubmitRecord.
+                if !f.initbm {
+                    let mut last_seq = job.command_order(index).map(|o| o.sequence);
+                    let active_renders: usize = self
+                        .engine
+                        .flights
+                        .iter()
+                        .map(|fl| fl.renders as usize)
+                        .sum();
+                    let mut more_renders = params::render_flights()
+                        .saturating_sub(active_renders + 1)
+                        .min(sizes::RENDER_SLOTS.saturating_sub(1));
+                    while more_renders > 0 && end < job.progress.count() {
+                        let Some(next_seq) = last_seq.and_then(|s| s.checked_add(1)) else {
+                            break;
+                        };
+                        if !job.can_fold_render_cmd(end, next_seq)
+                            || super::recovery::logic::next_ordinal(prefix.draw).is_none()
+                        {
+                            break;
+                        }
+                        let Some(Command::Render(r2)) = command(job, end) else {
+                            break;
+                        };
+                        let Some(o2) = job.command_order(end) else {
+                            break;
+                        };
+                        let ta_used = prefix.ta_head.wrapping_sub(ta_read) % sizes::QUEUE_CAP;
+                        let fs_used = prefix.fs_head.wrapping_sub(fs_read) % sizes::QUEUE_CAP;
+                        if ta_used >= sizes::QUEUE_CAP - 5 || fs_used >= sizes::QUEUE_CAP - 5 {
+                            break;
+                        }
+                        let geo2 = Geometry::new(&r2.cmd, 0);
+                        let Some(k2) = self.slots.pick_pass_in(
+                            &job.resources,
+                            &geo2,
+                            f.claims.pass_mask,
+                        ) else {
+                            break;
+                        };
+                        let staged2 = r2.cmd.flags
+                            & kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES
+                            != 0;
+                        if self
+                            .wait_stamp_for_with(
+                                job,
+                                super::command::COMPUTE,
+                                o2.ta_wait_through[super::command::COMPUTE],
+                                None,
+                            )
+                            .is_err()
+                            || self
+                                .wait_stamp_for_with(
+                                    job,
+                                    super::command::COMPUTE,
+                                    o2.wait_through[super::command::COMPUTE],
+                                    None,
+                                )
+                                .is_err()
+                            || (staged2
+                                && params::early_tiling()
+                                && self
+                                    .wait_stamp_for_with(
+                                        job,
+                                        super::command::RENDER,
+                                        o2.ta_wait_through[super::command::RENDER],
+                                        Some(f),
+                                    )
+                                    .is_err())
+                        {
+                            break;
+                        }
+                        let member = prefix.renders as usize;
+                        f.claims.pass[member] = k2 as u32;
+                        f.claims.pass_count += 1;
+                        f.claims.pass_mask |= 1 << k2;
+                        self.slots.pass_busy |= 1 << k2;
+                        self.prefix_render(
+                            job,
+                            r2,
+                            geo2,
+                            &mut prefix,
+                            f,
+                            behind,
+                            class_behind,
+                        )?;
+                        last_seq = Some(next_seq);
+                        end += 1;
+                        more_renders -= 1;
+                    }
+                }
             }
         }
         f.first = index as usize;
@@ -1611,11 +1794,7 @@ impl Firmware {
         f.computes = prefix.computes;
         f.renders = prefix.renders;
         f.target = prefix.last_ct;
-        f.ta_target = if render {
-            encode::stamp(prefix.draw)
-        } else {
-            0
-        };
+        f.ta_target = if render { prefix.last_ta } else { 0 };
         f.fs_target = prefix.last_fs;
         f.head = prefix.c_head;
         f.ta_head = prefix.ta_head;
@@ -1646,7 +1825,10 @@ impl Firmware {
                 let a = f.pb_slot as usize;
                 f.pb.as_ref().ok_or(EINVAL)?.expose();
                 job.resources.commit_render();
-                job.resources.render()?.pools.publish(a, f.uma_submitted)?;
+                job.resources
+                    .render()?
+                    .pools
+                    .publish_batch(a, f.uma_submitted, f.renders)?;
                 self.pools.publish_flight(a);
                 // Notifier service dereferences u32 counters; the host ordering ledger
                 // remains u64. Eight-byte spacing is retained allocation padding.
@@ -1949,38 +2131,51 @@ impl Firmware {
         behind: bool,
         class_behind: bool,
     ) -> Result {
-        let k = f.claims.pass[0] as usize;
-        let alloc_slot = self.pools.pick_slot(&job.vm, behind).ok_or(EAGAIN)?;
+        let member = pf.renders as usize;
+        if member >= sizes::RENDER_SLOTS {
+            return Err(EAGAIN);
+        }
+        let cmd_index = (f.first + member) as u32;
+        let k = f.claims.pass[member] as usize;
         let draw = super::recovery::logic::next_ordinal(pf.draw).ok_or(EOVERFLOW)?;
         let target = encode::stamp(draw);
-        let order = job.command_order(job.progress.sent());
+        let has_prior_render = class_behind || member > 0;
+        let (prev_ta, prev_fs) = if member > 0 {
+            (pf.last_ta, pf.last_fs)
+        } else {
+            (self.engine.ta_target, self.engine.fs_target)
+        };
+        let order = job.command_order(cmd_index);
         let staged = cmd.cmd.flags
             & kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES
             != 0;
-        let ta_wait_compute = self.wait_stamp_for(
+        let ta_wait_compute = self.wait_stamp_for_with(
             job,
             super::command::COMPUTE,
             order.and_then(|o| o.ta_wait_through[super::command::COMPUTE]),
+            None,
         )?;
-        let fs_wait_compute = self.wait_stamp_for(
+        let fs_wait_compute = self.wait_stamp_for_with(
             job,
             super::command::COMPUTE,
             order.and_then(|o| o.wait_through[super::command::COMPUTE]),
+            None,
         )?;
-        let ta_wait_fs = if class_behind && staged && params::early_tiling() {
-            self.wait_stamp_for(
+        let ta_wait_fs = if has_prior_render && staged && params::early_tiling() {
+            self.wait_stamp_for_with(
                 job,
                 super::command::RENDER,
                 order.and_then(|o| o.ta_wait_through[super::command::RENDER]),
+                Some(f),
             )?
         } else {
             None
         };
         let plan = plan_render_barriers(
             cmd.cmd.flags,
-            class_behind,
+            has_prior_render,
             params::early_tiling(),
-            self.engine.fs_target,
+            prev_fs,
             order.is_some_and(|o| o.wait_through[super::command::RENDER].is_none()),
             ta_wait_fs,
             [ta_wait_compute, fs_wait_compute],
@@ -1990,13 +2185,30 @@ impl Firmware {
             .claim_pass_in(&job.resources, k, Some(job.vm.id), geometry.tilemap_bytes)?;
         self.slots.hold_vm(&f.claims, &job.vm)?;
         self.slots.hold_arenas(&f.claims, &job.resources);
-        let (refs, init_buffer, epoch, binding) =
-            self.render_refs(alloc_slot, job, draw, class_behind, behind)?;
-        f.pb = Some(epoch);
-        f.pb_slot = alloc_slot as u32;
-        f.pb_binding = binding;
-        f.initbm = init_buffer;
-        f.has_timestamps = !cmd.timestamp_outputs.is_empty();
+        let (refs, init_buffer) = if member == 0 {
+            let alloc_slot = self.pools.pick_slot(&job.vm, behind).ok_or(EAGAIN)?;
+            let (refs, init_buffer, epoch, binding) =
+                self.render_refs(alloc_slot, job, draw, class_behind, behind)?;
+            f.pb = Some(epoch);
+            f.pb_slot = alloc_slot as u32;
+            f.pb_binding = binding;
+            f.initbm = init_buffer;
+            (refs, init_buffer)
+        } else {
+            if f.initbm {
+                return Err(EAGAIN);
+            }
+            let epoch = f.pb.as_ref().ok_or(EINVAL)?;
+            let refs = self.render_refs_batched(
+                f.pb_slot as usize,
+                job,
+                draw,
+                epoch,
+                f.uma_submitted,
+            )?;
+            (refs, false)
+        };
+        f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
         let p = job.resources.render_pass(k)?;
         let pass = p.refs();
         geometry.layer_metadata = pass.heap_gva + if cmd.cmd.layers > 1 { 0x200 } else { 0 };
@@ -2064,7 +2276,7 @@ impl Firmware {
         p.fs_seq.write(0, &scratch.fss[..])?;
         p.scene.write(0, &scratch.scene[..])?;
         // One retained descriptor is shared by TA and FS; its private submitted counter
-        // advances by two. Reused descriptors and their pool/list bytes remain intact.
+        // advances by two per pass. Reused descriptors and their pool/list bytes remain intact.
         f.uma_submitted = refs.uma_submitted;
         let r = &self.graph.render;
         let cap = sizes::QUEUE_CAP;
@@ -2076,21 +2288,21 @@ impl Firmware {
             r.ring[0].w64(8 * pf.ta_head as usize, epoch.initbm.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
         }
-        // When pipelining behind an in-flight same-VM render, insert explicit hardware ordering
-        // barriers on the TA/FS rings. Fragment-only, barrier-free, or staged renders whose TA
-        // prefix stops before the newest in-flight FS overlap TA(N) with FS(N-1) (TA waits on
-        // prior TA plus any older in-flight FS named by `ta_wait_through`; FS waits on prior FS
-        // then own TA); otherwise TA(N) waits on prior FS to preserve full vertex-stage visibility.
-        if class_behind {
+        // When pipelining behind an in-flight or same-batch same-VM render, insert explicit
+        // hardware ordering barriers on the TA/FS rings. Fragment-only, barrier-free, or staged
+        // renders whose TA prefix stops before the prior FS overlap TA(N) with FS(N-1) (TA waits
+        // on prior TA plus any older in-flight FS named by `ta_wait_through`; FS waits on prior
+        // FS then own TA); otherwise TA(N) waits on prior FS to preserve full vertex visibility.
+        if has_prior_render {
             // Pipelined same-VM non-InitBM render->render barriers wait on the producer's
             // firmware stamp only (type 0), matching `own_barrier` and G15's
             // `RENDER_INTERNAL_HOLD = 0`, so consecutive TA/FS stages hand off without a
             // software-job hold bubble. Cross-engine barriers (`fs2c`/`c2ta`) stay `Hold`.
             let render_bar = BarrierType::from_stamp_only(!init_buffer);
             let (wait_va, wait_stamp, wait_event) = if plan.early {
-                (r.fw_stamp[0].va, self.engine.ta_target, 0x70)
+                (r.fw_stamp[0].va, prev_ta, 0x70)
             } else {
-                (r.fw_stamp[1].va, self.engine.fs_target, 0x71)
+                (r.fw_stamp[1].va, prev_fs, 0x71)
             };
             let prev = encode::barrier(
                 wait_va,
@@ -2119,7 +2331,7 @@ impl Firmware {
                 }
                 let dep = encode::barrier(
                     r.fw_stamp[1].va,
-                    self.engine.fs_target,
+                    prev_fs,
                     0x71,
                     target,
                     work::barrier::RENDER_WAIT_UUID,
@@ -2175,8 +2387,12 @@ impl Firmware {
         pf.fs_head = (pf.fs_head + 1) % cap;
         r.ring[1].w64(8 * pf.fs_head as usize, p.fs_work.va)?;
         pf.fs_head = (pf.fs_head + 1) % cap;
-        pf.renders = 1;
+        f.r_ta_stamp[member] = target;
+        f.r_fs_stamp[member] = target;
+        pf.renders += 1;
+        f.renders = pf.renders;
         pf.draw = draw;
+        pf.last_ta = target;
         pf.last_fs = target;
         pf.prev = Prev::Render;
         Ok(())
