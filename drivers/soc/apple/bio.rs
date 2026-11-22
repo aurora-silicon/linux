@@ -252,6 +252,7 @@ impl Lockout {
 pub(crate) const REARM_SECRET_MAX: usize = 1024;
 
 /// A password which userspace has already verified for the requesting user.
+/// The kernel does not check or use it (see `rearm_after_password`).
 #[repr(C)]
 pub(crate) struct Rearm {
     pub(crate) secret_len: u32,

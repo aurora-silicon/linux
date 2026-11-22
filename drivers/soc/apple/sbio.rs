@@ -5417,9 +5417,10 @@ impl SepData {
 
     /// Userspace calls this only after the user's password was verified. The
     /// node is root's alone and its SELinux label confines it to the re-arm
-    /// helper. The verified password authorizes a password-mode verification
-    /// of the designated user's key bag with its stored secret, which is what
-    /// ends the enclave's lockout. A new SCRD match context is then set up and
+    /// helper. The kernel neither checks nor uses `_password` (it is wiped on
+    /// drop): it trusts the caller's check. What ends the enclave's lockout is
+    /// a password-mode verification of the Linux identity key bag with the bag
+    /// secret the kernel stores. A new SCRD match context is then set up and
     /// the enclave's lockout record is saved.
     fn rearm_after_password(&self, _password: crate::Secret) -> Result<()> {
         // The first password since boot is all the after-boot wait needs;
