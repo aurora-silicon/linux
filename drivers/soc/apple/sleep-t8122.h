@@ -24,7 +24,7 @@
  * macOS's commit, while the debug link still carries it), and after the link's cut.
  *
  * No wake is qualified. The wake sources are armed only with t8122_wake_mask=1, at mask
- * offsets taken from T8140's layout and unmeasured here; the display and the GPU have no
+ * offsets measured from macOS's commit; the display and the GPU have no
  * restart; and a real commit is recovered by reset.
  *
  * The SMC's order is not macOS's. Measured before its commit: MBSE=slpw 240 ms, pmVC 147 ms,
@@ -1121,9 +1121,12 @@ static const struct apple_sleep_soc t8122_sleep_soc = {
 	/* The common arm stays off: the trial's switch runs it (t8122_wake_mask). */
 	.own_wake = true,
 	.wake_optional = true,
-	/* T8140's layout at this base; ids to 208, so seven words. The status offset is unmeasured. */
+	/*
+	 * Measured from macOS's commit: seven mask words at +0x08 (ids to 223), and the
+	 * status words from +0x24 (every wake latches source 155 at +0x34, bit 27).
+	 */
 	.wake_mask = 0x08,
-	.wake_status = 0x28,
+	.wake_status = 0x24,
 	.wake_words = 7,
 	.wake_last_word = GENMASK(16, 0),
 	.wake_names = t8122_wake_names,
