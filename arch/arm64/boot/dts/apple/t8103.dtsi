@@ -1243,8 +1243,8 @@
 						bits = <3 1>;
 					};
 
-					fault_shadow: fault-shadow@a67b {
-						reg = <0xa67b 0x10>;
+					fault_shadow: fault-shadow@a47b {
+						reg = <0xa47b 0x10>;
 					};
 
 					socd: socd@ab00 {
