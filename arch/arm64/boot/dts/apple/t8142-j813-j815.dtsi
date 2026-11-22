@@ -259,9 +259,8 @@
 		reg-names = "smc", "sram";
 		mboxes = <&smc_mbox>;
 
-		hwmon {
+		smc_hwmon: hwmon {
 			compatible = "apple,smc-hwmon";
-			apple,discover-temperatures;
 		};
 
 		smc_gpio: gpio {
