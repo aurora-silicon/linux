@@ -49,10 +49,12 @@ can_queue_behind_fn = item('fn can_queue_behind(')
 assert 'let render_bar = cross_engine_barrier_type(producer_initbm, init_buffer);' in prefix_render_fn
 assert (
     prefix_render_fn.index('let render_bar = cross_engine_barrier_type(producer_initbm, init_buffer);')
-    < prefix_render_fn.rindex('if has_prior_render')
-), 'render_bar must be hoisted ahead of has_prior_render for c2ta/c2fs barriers'
+    < prefix_render_fn.index('if plan.ta_prev_wait')
+), 'render_bar must be hoisted ahead of barrier emission'
 assert prefix_render_fn.count('render_bar,') == 5, prefix_render_fn
+assert 'p.prev_barrier.write(0, &prev)?;' in prefix_render_fn
 assert 'p.ta_fs_barrier.write(0, &ta_fs)?;' in prefix_render_fn
+assert 'p.fs_dep.write(0, &dep)?;' in prefix_render_fn
 assert 'p.compute_barrier.write(0, &cbar)?;' in prefix_render_fn
 assert 'p.fs_compute_barrier.write(0, &fcbar)?;' in prefix_render_fn
 c2ta_slice = prefix_render_fn[
@@ -904,83 +906,199 @@ mod queue_behind_scope {
     #[test]fn staged_render_barriers_split_ta_and_fs_compute_and_render_waits(){
         const FRAG: u32 = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
         const STAGED: u32 = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
-        // 1. Compute->FS-only wait (common texture-write-by-compute -> fragment-read):
-        //    TA runs immediately (no TA compute barrier); FS gets fs_compute_barrier.
+        // 1. Cross-VM / InitBM / empty render pipe (`class_behind = false`): zero render barriers,
+        //    compute->FS-only wait routes directly to fs_compute_barrier.
         assert_eq!(
-            plan_render_barriers(STAGED, false, true, 0, false, None, [None, Some(0x700)]),
+            plan_render_barriers(STAGED, false, true, 0, None, None, [None, Some(0x700)]),
             RenderBarrierPlan {
                 early: false,
+                ta_prev_wait: false,
                 ta_fs_wait: None,
+                fs_render_wait: None,
                 ta_compute_wait: None,
                 fs_compute_wait: Some(0x700),
             }
         );
-        // 2. Same compute target on TA and FS: only TA waits (FS is ordered via own_barrier).
+        // 2. Independent multi-pass render (`fs_wait_render = None`, e.g. compress.bw array /
+        //    render.shadow or already-retired predecessor): overlaps early while keeping
+        //    TA(N-1)->TA(N) `prev_barrier` on the shared PB/UMA epoch, with ZERO FS->TA and
+        //    ZERO FS->FS barriers (only own_barrier on FS).
+        for flags in [0u32, FRAG, STAGED] {
+            assert_eq!(
+                plan_render_barriers(flags, true, true, 0x200, None, None, [None, None]),
+                RenderBarrierPlan {
+                    early: true,
+                    ta_prev_wait: true,
+                    ta_fs_wait: None,
+                    fs_render_wait: None,
+                    ta_compute_wait: None,
+                    fs_compute_wait: None,
+                }
+            );
+        }
+        // 3. Same compute target on TA and FS: only TA waits (FS is ordered via own_barrier);
+        //    shared-PB TA->TA `prev_barrier` is kept and dependent FS wait on 0x200 emits fs_dep.
         assert_eq!(
-            plan_render_barriers(STAGED, true, true, 0x200, false, None, [Some(0x700), Some(0x700)]),
+            plan_render_barriers(
+                STAGED,
+                true,
+                true,
+                0x200,
+                Some(0x200),
+                None,
+                [Some(0x700), Some(0x700)],
+            ),
             RenderBarrierPlan {
                 early: true,
+                ta_prev_wait: true,
                 ta_fs_wait: None,
+                fs_render_wait: Some(0x200),
                 ta_compute_wait: Some(0x700),
                 fs_compute_wait: None,
             }
         );
-        // 3. Different compute targets on TA (0x600) vs FS (0x700): TA waits on 0x600, FS waits on 0x700.
+        // 4. Different compute targets on TA (0x600) vs FS (0x700) with no FS render dep:
+        //    TA waits on prev_ta and 0x600, FS waits on 0x700, zero FS->FS render barriers.
         assert_eq!(
-            plan_render_barriers(STAGED, true, true, 0x200, false, None, [Some(0x600), Some(0x700)]),
+            plan_render_barriers(
+                STAGED,
+                true,
+                true,
+                0x200,
+                None,
+                None,
+                [Some(0x600), Some(0x700)],
+            ),
             RenderBarrierPlan {
                 early: true,
+                ta_prev_wait: true,
                 ta_fs_wait: None,
+                fs_render_wait: None,
                 ta_compute_wait: Some(0x600),
                 fs_compute_wait: Some(0x700),
             }
         );
-        // 4. Staged render whose TA waits on an older in-flight FS (0x100 != prev_fs 0x200):
-        //    overlaps TA with 0x200's FS while waiting on 0x100's FS via ta_fs_barrier.
+        // 5. Staged render whose TA waits on an older in-flight FS (0x100 != prev_fs 0x200)
+        //    while FS depends on 0x200: TA waits on prev_ta and 0x100, FS waits on 0x200.
         assert_eq!(
-            plan_render_barriers(STAGED, true, true, 0x200, false, Some(0x100), [None, None]),
+            plan_render_barriers(
+                STAGED,
+                true,
+                true,
+                0x200,
+                Some(0x200),
+                Some(0x100),
+                [None, None],
+            ),
             RenderBarrierPlan {
                 early: true,
+                ta_prev_wait: true,
                 ta_fs_wait: Some(0x100),
+                fs_render_wait: Some(0x200),
                 ta_compute_wait: None,
                 fs_compute_wait: None,
             }
         );
-        // 5. Staged render whose TA explicitly waits on the newest in-flight FS (0x200 == prev_fs):
-        //    no early overlap; prev_barrier waits on 0x200 directly.
+        // 6. Staged render where TA and FS wait on the same older in-flight FS (0x100):
+        //    TA still waits on prev_ta for the shared PB, and TA wait dominates FS wait via
+        //    own_barrier so fs_render_wait is omitted.
         assert_eq!(
-            plan_render_barriers(STAGED, true, true, 0x200, false, Some(0x200), [None, None]),
+            plan_render_barriers(
+                STAGED,
+                true,
+                true,
+                0x200,
+                Some(0x100),
+                Some(0x100),
+                [None, None],
+            ),
+            RenderBarrierPlan {
+                early: true,
+                ta_prev_wait: true,
+                ta_fs_wait: Some(0x100),
+                fs_render_wait: None,
+                ta_compute_wait: None,
+                fs_compute_wait: None,
+            }
+        );
+        // 7. Staged render whose TA explicitly waits on the newest in-flight FS (0x200 == prev_fs):
+        //    no early overlap; TA waits on 0x200 directly (which dominates prev_ta) and omits both
+        //    prev_barrier and fs_dep.
+        assert_eq!(
+            plan_render_barriers(
+                STAGED,
+                true,
+                true,
+                0x200,
+                Some(0x200),
+                Some(0x200),
+                [None, None],
+            ),
             RenderBarrierPlan {
                 early: false,
-                ta_fs_wait: None,
+                ta_prev_wait: false,
+                ta_fs_wait: Some(0x200),
+                fs_render_wait: None,
                 ta_compute_wait: None,
                 fs_compute_wait: None,
             }
         );
-        // 6. Legacy FRAGMENT_BARRIERS and plain render remain unchanged.
+        // 8. Dependent FRAGMENT_BARRIERS render (e.g. render.postfx): TA runs early with
+        //    shared-PB prev_barrier; FS waits on exact fs_wait_render (0x200).
         assert_eq!(
-            plan_render_barriers(FRAG, true, true, 0x200, false, None, [Some(0x700), Some(0x700)]),
+            plan_render_barriers(
+                FRAG,
+                true,
+                true,
+                0x200,
+                Some(0x200),
+                None,
+                [Some(0x700), Some(0x700)],
+            ),
             RenderBarrierPlan {
                 early: true,
+                ta_prev_wait: true,
                 ta_fs_wait: None,
+                fs_render_wait: Some(0x200),
                 ta_compute_wait: Some(0x700),
                 fs_compute_wait: None,
             }
         );
+        // 9. Legacy dependent render (flags = 0, fs_wait_render = Some(0x200)):
+        //    TA waits on 0x200 (FS->TA, dominating prev_ta); prev_barrier and fs_dep omitted.
         assert_eq!(
-            plan_render_barriers(0, true, true, 0x200, false, None, [None, None]),
+            plan_render_barriers(0, true, true, 0x200, Some(0x200), None, [None, None]),
             RenderBarrierPlan {
                 early: false,
-                ta_fs_wait: None,
+                ta_prev_wait: false,
+                ta_fs_wait: Some(0x200),
+                fs_render_wait: None,
                 ta_compute_wait: None,
                 fs_compute_wait: None,
             }
         );
+        // 10. Legacy dependent render waiting on an older FS (0x100 != prev_fs 0x200):
+        //     TA still needs prev_barrier on the shared PB in addition to ta_fs_wait(0x100).
         assert_eq!(
-            plan_render_barriers(0, true, true, 0x200, true, None, [None, None]),
+            plan_render_barriers(0, true, true, 0x200, Some(0x100), None, [None, None]),
             RenderBarrierPlan {
-                early: true,
-                ta_fs_wait: None,
+                early: false,
+                ta_prev_wait: true,
+                ta_fs_wait: Some(0x100),
+                fs_render_wait: None,
+                ta_compute_wait: None,
+                fs_compute_wait: None,
+            }
+        );
+        // 11. Conservative `early_tiling = false` serializes TA behind prev_fs even when
+        //     fs_wait_render is None, dominating prev_ta and omitting fs_dep.
+        assert_eq!(
+            plan_render_barriers(FRAG, true, false, 0x200, None, None, [None, None]),
+            RenderBarrierPlan {
+                early: false,
+                ta_prev_wait: false,
+                ta_fs_wait: Some(0x200),
+                fs_render_wait: None,
                 ta_compute_wait: None,
                 fs_compute_wait: None,
             }

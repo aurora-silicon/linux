@@ -143,10 +143,8 @@ pub(crate) struct PassSlot {
     /// Part of the slot's firmware layout; the host does not use it.
     _uts: Arc<FwObject>,
     pub(crate) own_barrier: Arc<FwObject>,
-    #[allow(dead_code)]
     pub(crate) prev_barrier: Arc<FwObject>,
     pub(crate) ta_fs_barrier: Arc<FwObject>,
-    #[allow(dead_code)]
     pub(crate) fs_dep: Arc<FwObject>,
     pub(crate) compute_barrier: Arc<FwObject>,
     pub(crate) fs_compute_barrier: Arc<FwObject>,
