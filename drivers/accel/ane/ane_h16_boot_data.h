@@ -503,6 +503,44 @@ static const struct ane_h16_profile ane_t8132_profiles[] __maybe_unused = {
 	},
 };
 
+/*
+ * The M4 (J713) 27.2 (26B123) preload: iBoot hands over TEXT 0xbc000 and
+ * DATA 0x2b0000. DATA carries the 26A428 patchbay records and rewritten
+ * range 0x10 bytes earlier, and the same records as on 25G83 change on
+ * every boot (GKTS and ECAP).
+ */
+static const struct ane_h16_preload_cell ane_h16_patchbay_26b123_t8132[] = {
+	{ "GKTS", 0x5a30, 8, true },
+	{ "ECAP", 0x5b23, 8, true },
+	{ "ABOI", 0x5c49, 8, false },
+	{ "ZSOI", 0x5c59, 4, false },
+	{ "ARcM", 0x5c65, 4, true },
+};
+
+static const struct ane_h16_preload_rule ane_h16_preload_26b123_j713 = {
+	.cells = ane_h16_patchbay_26b123_t8132,
+	.cell_count = ARRAY_SIZE(ane_h16_patchbay_26b123_t8132),
+	.zero_start = 0x17c70,
+	.zero_end = 0x18310,
+	.text_size = 0xbc000,
+	.data_size = 0x2b0000,
+	.digest = {
+		0xb6, 0x88, 0x93, 0xc9, 0x55, 0x8a, 0xa0, 0xd3,
+		0xbc, 0x15, 0xe5, 0x9a, 0x69, 0xa1, 0x7a, 0x34,
+		0xf1, 0x5b, 0x6e, 0x38, 0x7d, 0xb0, 0x92, 0xca,
+		0x8c, 0xc4, 0x19, 0x5a, 0xf7, 0x0a, 0x87, 0x21,
+	},
+};
+
+/* The 27.2 builds; their preload is not the size of the 25G83 one. */
+static const struct ane_h16_profile ane_t8132_profiles_26b123[] __maybe_unused = {
+	{
+		.identity = "H16 T8132 27.2 26B123 J713",
+		.preload = &ane_h16_preload_26b123_j713,
+		.build = &ane_h16_build_t8132_25g83,
+	},
+};
+
 /* 27.2 (26B123) preload on T6041 (J616c): 26A428 DATA layout and zeroed range. */
 static const struct ane_h16_preload_rule ane_h16_preload_26b123 = {
 	.cells = ane_h16_patchbay_26a428,
