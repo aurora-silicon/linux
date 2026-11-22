@@ -212,7 +212,7 @@ struct avd_variant {
 	unsigned int fw_caps_required;
 	void (*configure_stream)(struct avd_dev *avd, dma_addr_t addr,
 			u8 fifo_idx, u32 vp_slot);
-	const char* fw_name;
+	const char *fw_name;
 	/* Older image tried when fw_name is not installed (legacy transport). */
 	const char *fw_name_fallback;
 	unsigned char revision; /* the same as the device tree */
