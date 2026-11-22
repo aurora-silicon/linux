@@ -189,8 +189,9 @@ pub(crate) enum Registration {
 /// A tiler heap growth the host makes before publishing a render, to this many blocks.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HostGrowth {
-    /// The pair is idle: the page list and the PB descriptor are rebuilt.
-    Idle(usize),
+    /// The pair is idle: the page list and the PB descriptor are rebuilt. The heap grows
+    /// towards `target`, and the render fails if it stays below `required`.
+    Idle { required: usize, target: usize },
     /// The pair has work in flight: blocks are only appended to the inventory,
     /// as for a firmware grow request.
     Busy(usize),
@@ -1839,7 +1840,7 @@ impl Pair {
             return Err(EBUSY);
         }
         let feedback = if self.ordinal != 0 {
-            self.memory.manager.automatic_target()?.unwrap_or(0)
+            self.memory.manager.automatic_target(now)?.unwrap_or(0)
         } else {
             0
         };
@@ -1848,8 +1849,10 @@ impl Pair {
         // firmware's own requests do (firmware_target), instead of failing the render with
         // ERANGE: a 16384x16384 no-attachment render after smaller ones lost the device
         // (dEQP-GLES31.functional.fbo.no_attachments.maximums.*).
-        let required = required.max(feedback).min(self.memory.manager.max_blocks());
-        Ok((required > self.memory.manager.blocks()).then_some(HostGrowth::Idle(required)))
+        let required = required.min(self.memory.manager.max_blocks());
+        let target = required.max(feedback).min(self.memory.manager.max_blocks());
+        Ok((target > self.memory.manager.blocks())
+            .then_some(HostGrowth::Idle { required, target }))
     }
 
     /// A quarantined pair, or a closed owner's pair that holds only groups whose stamps are

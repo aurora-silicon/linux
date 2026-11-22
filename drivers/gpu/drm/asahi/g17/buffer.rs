@@ -365,7 +365,20 @@ pub(crate) fn compact_alias(
     prot: mmu::Prot,
     guard: usize,
 ) -> Result<mmu::KernelMapping> {
-    for range in cfg::compact_ranges() {
+    alias_in(&cfg::compact_ranges(), object, vm, source, align, prot, guard)
+}
+
+/// [`compact_alias`] in the first of `ranges` with room.
+fn alias_in(
+    ranges: &[Range<u64>],
+    object: &KernelObject,
+    vm: &mmu::Vm,
+    source: Range<usize>,
+    align: u64,
+    prot: mmu::Prot,
+    guard: usize,
+) -> Result<mmu::KernelMapping> {
+    for range in ranges.iter().cloned() {
         match object.map_range(vm, source.clone(), range, align, prot, guard) {
             Ok(mapping) => return Ok(mapping),
             Err(error) if error == ENOSPC => {}
@@ -381,6 +394,8 @@ pub(crate) struct TvbGrowth {
     mappings: KVec<mmu::KernelMapping>,
     addresses: KVec<u64>,
     extensions: KVec<KernelObject>,
+    /// Why the growth stopped short of its target: ENOMEM or ENOSPC.
+    stopped: Option<Error>,
 }
 
 /// Blocks of one growth extension at most. A shrink gives back whole trailing extensions, so
@@ -418,11 +433,13 @@ impl Tvb {
         }
         geometry.backing_bytes(blocks)
     }
+    /// Maps a NEO block in the first of `ranges` with room; other geometries have their own.
     fn map_block(
         object: &KernelObject,
         vm: &mmu::Vm,
         relative: usize,
         geometry: BlockGeometry,
+        ranges: &[Range<u64>],
     ) -> Result<mmu::KernelMapping> {
         if geometry != BlockGeometry::NEO {
             let start = relative.checked_mul(geometry.backing_stride).ok_or(EOVERFLOW)?;
@@ -435,7 +452,8 @@ impl Tvb {
         }
         let start = relative.checked_mul(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
         let source = start..start.checked_add(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
-        let mapping = compact_alias(
+        let mapping = alias_in(
+            ranges,
             object,
             vm,
             source,
@@ -467,7 +485,7 @@ impl Tvb {
         let mut mappings = KVec::with_capacity(blocks, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(blocks, GFP_KERNEL)?;
         for index in 0..blocks {
-            let mapping = Self::map_block(&backing, vm, index, geometry)?;
+            let mapping = Self::map_block(&backing, vm, index, geometry, &cfg::compact_ranges())?;
             addresses.push(mapping.iova(), GFP_KERNEL)?;
             mappings.push(mapping, GFP_KERNEL)?;
         }
@@ -520,21 +538,40 @@ impl Tvb {
         let mut extensions = KVec::with_capacity(count, GFP_KERNEL)?;
         let mut mappings = KVec::with_capacity(added, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(added, GFP_KERNEL)?;
+        let mut stopped = None;
+        let ranges = cfg::tvb_growth_ranges();
         while addresses.len() < added {
-            let blocks = (added - addresses.len()).min(EXTENSION_BLOCKS);
-            extensions.push(KernelObject::backing(dev, Self::backing_bytes(self.geometry, blocks)?,
-                CpuMap::WriteCombined)?, GFP_KERNEL)?;
-            let backing = extensions.last().ok_or(EIO)?;
-            for relative in 0..blocks {
-                let mapping = Self::map_block(backing, vm, relative, self.geometry)?;
-                addresses.push(mapping.iova(), GFP_KERNEL)?;
-                mappings.push(mapping, GFP_KERNEL)?;
+            let (start, made) = (addresses.len(), extensions.len());
+            let blocks = (added - start).min(EXTENSION_BLOCKS);
+            let result = (|| {
+                extensions.push(KernelObject::backing(dev,
+                    Self::backing_bytes(self.geometry, blocks)?, CpuMap::WriteCombined)?, GFP_KERNEL)?;
+                let backing = extensions.last().ok_or(EIO)?;
+                for relative in 0..blocks {
+                    let mapping = Self::map_block(backing, vm, relative, self.geometry, &ranges)?;
+                    addresses.push(mapping.iova(), GFP_KERNEL)?;
+                    mappings.push(mapping, GFP_KERNEL)?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {}
+                // Out of memory or of growth arenas: keep the whole extensions made so far.
+                Err(error) if error == ENOMEM || error == ENOSPC => {
+                    mappings.truncate(start);
+                    addresses.truncate(start);
+                    extensions.truncate(made);
+                    stopped = Some(error);
+                    break;
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(Some(TvbGrowth {
             mappings,
             addresses,
             extensions,
+            stopped,
         }))
     }
 }
@@ -778,9 +815,9 @@ struct Shrink {
     /// An idle shrink may return to this size: that growth only serves
     /// renders overlapping in flight.
     busy_base: usize,
-    /// Host ns before which a busy pair is not grown again after a growth
-    /// was refused or failed.
-    busy_retry: u64,
+    /// Host ns before which the host does not grow the heap beyond the blocks a render
+    /// requires, after a growth was refused, failed or stopped short.
+    retry: u64,
 }
 
 pub(crate) struct Submitted<'a> {
@@ -994,7 +1031,10 @@ impl Manager {
         self.shrink.growth_max = self.shrink.growth_max.max(pages);
         Ok(pages)
     }
-    pub(crate) fn automatic_target(&mut self) -> Result<Option<usize>> {
+    pub(crate) fn automatic_target(&mut self, now: u64) -> Result<Option<usize>> {
+        if now < self.shrink.retry {
+            return Ok(None);
+        }
         self.sample_max_pages()?;
         let pages = core::mem::take(&mut self.shrink.growth_max);
         Ok(automatic_target_for(pages as usize, self.blocks(), self.tvb.geometry.pages(),
@@ -1017,7 +1057,7 @@ impl Manager {
         // appended blocks while the firmware uses it, the path its grow requests take. M5
         // heaps have their own geometry and are never shrunk (`shrinkable`), so growth made
         // for renders in flight together would never be given back.
-        if self.tvb.geometry != BlockGeometry::NEO || now < self.shrink.busy_retry {
+        if self.tvb.geometry != BlockGeometry::NEO || now < self.shrink.retry {
             return Ok(None);
         }
         let max_pages = self
@@ -1034,16 +1074,16 @@ impl Manager {
         }
         let bytes = Tvb::backing_bytes(self.tvb.geometry, target - current)? as u64;
         if !busy_growth_admitted(bytes, client) {
-            self.defer_busy_growth(now);
+            self.defer_growth(now);
             super::trace::heap(super::trace::HEAP_HOST_BUSY, false, current, current);
             return Ok(None);
         }
         Ok(Some(target))
     }
-    /// A busy pair's growth was refused or failed at `now`: retry a shrink
-    /// period later.
-    pub(crate) fn defer_busy_growth(&mut self, now: u64) {
-        self.shrink.busy_retry = now.saturating_add(SHRINK_PERIOD_NS);
+    /// A growth was refused, failed or stopped short at `now`: grow beyond what a render
+    /// requires only a shrink period later, as every attempt allocates and maps afresh.
+    pub(crate) fn defer_growth(&mut self, now: u64) {
+        self.shrink.retry = now.saturating_add(SHRINK_PERIOD_NS);
     }
     /// Records the blocks a pass layout requires, the floor of any shrink.
     /// A pass is being prepared at `now`; the heap counts as busy.
@@ -1174,11 +1214,16 @@ impl Manager {
     /// Allocate growth and precompute its words while the pair is exclusively
     /// borrowed. A descriptor snapshot requests idle-host growth; None leaves
     /// the firmware-owned page list and PB state untouched.
+    ///
+    /// The heap grows towards `target` as far as memory and the growth arenas allow, and fails
+    /// only if it would stay below `required`; a tiling pass partial-renders within the heap
+    /// it has.
     pub(crate) fn prepare_growth(
         &mut self,
         dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         target: usize,
+        required: usize,
         descriptor: Option<[u32; 4]>,
     ) -> Result<Option<PreparedGrowth>> {
         let previous = self.blocks();
@@ -1189,6 +1234,16 @@ impl Manager {
         let Some(growth) = self.tvb.prepare_growth(dev, vm, target)? else {
             return Ok(None);
         };
+        let target = previous + growth.addresses.len();
+        if let Some(error) = growth.stopped {
+            self.defer_growth(super::now_ns());
+            if target < required {
+                return Err(error);
+            }
+        }
+        if target == previous {
+            return Ok(None);
+        }
         let before = self.cursors()?;
         let plan = Growth::with_capacity(before, target - previous, self.tvb.geometry.capacity)?;
         let firmware_request = descriptor.is_none();
