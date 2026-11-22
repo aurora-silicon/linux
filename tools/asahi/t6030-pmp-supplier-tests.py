@@ -166,14 +166,13 @@ def main():
     variants = [(name, with_t8122(source)) for name, source in variants]
     if args.mutations:
         t8122_mutations = [
-            ("t8122-config-scope", "if (!IS_ENABLED(CONFIG_APPLE_T8122_GPU_PMP_LINK) ||", "if (false ||"),
-            ("t8122-supplier-compat", '!of_device_is_compatible(supplier->of_node, "apple,t8122-pmp-v2"))', "false)"),
+            ("t8122-config-scope", "if (!IS_ENABLED(CONFIG_APPLE_T8122_GPU_PMP_LINK))", "if (false)"),
             ("t8122-report-compat", 'for_each_compatible_node(np, NULL, "apple,t8122-pmp-v2-report")',
              'for_each_compatible_node(np, NULL, "apple,t6030-pmp-v2-report")'),
             ("t8122-duplicate-report", "\t\tif (report) {", "\t\tif (false) {"),
             ("t8122-disabled-report", "!of_device_is_available(report) ||", "false ||"),
             ("t8122-report-phandle-shape", 'of_property_count_u32_elems(report, "apple,pmp") != 1', "false"),
-            ("t8122-supplier-identity", "pmp == supplier->of_node && entry ?", "entry ?"),
+            ("t8122-supplier-identity", "pmp == supplier->of_node && entry ?", "supplier && entry ?"),
             ("t8122-readiness-error", "apple_pmp_report_wait_ready(entry, msecs_to_jiffies(timeout_ms)) : -ENODEV;",
              "(apple_pmp_report_wait_ready(entry, msecs_to_jiffies(timeout_ms)), 0) : -ENODEV;"),
             ("t8122-entry-reference", "\tof_node_put(entry);\n\tof_node_put(pmp);", "\tof_node_put(pmp);"),
@@ -181,9 +180,9 @@ def main():
         for name, old, new in t8122_mutations:
             assert t8122.count(old) == 1, (name, t8122.count(old))
             variants.insert(-1, (name, with_t8122(code, t8122.replace(old, new))))
-        # The dispatch owns the machine scope: T8122 takes the T8122 wait, every other SoC the
-        # T6030 one. (The wait's own machine check repeats it and cannot be reached otherwise.)
-        machine = 'if (of_machine_is_compatible("apple,t8122"))'
+        # The dispatch picks the wait by the supplier's compatible: a T8122 PMP takes the T8122
+        # wait, every other supplier the T6030 one (which checks its own compatible).
+        machine = 'if (of_device_is_compatible(supplier->of_node, "apple,t8122-pmp-v2"))'
         assert code.count(machine) == 1
         for name, new in (("t8122-dispatch-never", "if (false)"), ("t8122-dispatch-always", "if (true)")):
             variants.insert(-1, (name, with_t8122(code.replace(machine, new))))

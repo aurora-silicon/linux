@@ -694,8 +694,9 @@ static int apple_pmp_report_wait_t6030_14(struct device *supplier, unsigned int 
 }
 
 /*
- * The T8122 (M3 MacBook Air) GPU on its 14.8.3 firmware, for the M3 runtime
- * (APPLE_T8122_GPU_PMP_LINK): the unique T8122 report linked to this PMP, and
+ * A T8122 PMP (apple,t8122-pmp-v2, chosen by the dispatch below) behind the GPU
+ * on its 14.8.3 firmware, for the M3 runtime (APPLE_T8122_GPU_PMP_LINK): the
+ * unique T8122 report linked to this PMP, and
  * its display request (DISP, reg 7) READY and acknowledged before AGX, as on
  * the 7.1.12 kernel that runtime was qualified with.
  */
@@ -704,9 +705,7 @@ static int apple_pmp_report_wait_t8122_14(struct device *supplier, unsigned int 
 	struct device_node *np, *report = NULL, *pmp, *entry;
 	int ret;
 
-	if (!IS_ENABLED(CONFIG_APPLE_T8122_GPU_PMP_LINK) ||
-	    !of_machine_is_compatible("apple,t8122") ||
-	    !of_device_is_compatible(supplier->of_node, "apple,t8122-pmp-v2"))
+	if (!IS_ENABLED(CONFIG_APPLE_T8122_GPU_PMP_LINK))
 		return -ENODEV;
 	for_each_compatible_node(np, NULL, "apple,t8122-pmp-v2-report") {
 		if (report) {
@@ -746,7 +745,7 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 
 	/* A declared report always takes the existing native25 path below. */
 	if (!np && !of_property_present(supplier->of_node, "apple,pmp-report")) {
-		if (of_machine_is_compatible("apple,t8122"))
+		if (of_device_is_compatible(supplier->of_node, "apple,t8122-pmp-v2"))
 			return apple_pmp_report_wait_t8122_14(supplier, timeout_ms);
 		return apple_pmp_report_wait_t6030_14(supplier, timeout_ms);
 	}
