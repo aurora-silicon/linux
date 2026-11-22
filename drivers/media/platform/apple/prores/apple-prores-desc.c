@@ -474,7 +474,7 @@ int apr_build_desc_v0(const struct apr_frame *f, u8 *desc)
 }
 EXPORT_SYMBOL_IF_KUNIT(apr_build_desc_v0);
 
-/* Non-RAW decode descriptor version 0 (T6000 and T8140). */
+/* Non-RAW decode descriptor version 0, used on every APR variant. */
 #define DD_COMMAND		0x000
 #define  DD_COMMAND_BFF		BIT(14)
 #define  DD_COMMAND_IRQ		BIT(12)
@@ -557,6 +557,11 @@ EXPORT_SYMBOL_IF_KUNIT(apr_build_decode_desc);
 
 /* Slice-size entries copied per block; 256 bytes of stack. */
 #define APR_SLICE_CHUNK		128
+/*
+ * Slices per picture, which bounds the CPU walk of the slice table. Both
+ * fields of an interlaced frame have the same geometry and the same bound.
+ */
+#define APR_MAX_SLICES		262144
 
 /*
  * The decode descriptor carries no input length: the engine follows the
@@ -674,8 +679,8 @@ int apr_parse_frame(const u8 *data, size_t bytes, struct apr_prores_info *info)
 		ret = apr_parse_picture(data + offset, frame_size - offset,
 					info->width, info->height,
 					info->pictures == 2, info->alpha,
-					i ? 16384 : 262144,
-					&info->picture_size[i], &info->slices[i]);
+					APR_MAX_SLICES, &info->picture_size[i],
+					&info->slices[i]);
 		if (ret)
 			return ret;
 		if (check_add_overflow(offset, info->picture_size[i], &offset))

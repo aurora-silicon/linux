@@ -15,8 +15,7 @@ config VIDEO_APPLE_PRORES
 	  the built-in initialization rows; T8132 has no built-in rows and
 	  binds only with apple/prores-t8132-init.bin. It encodes 8
 	  and 16 bit 4:2:2 and 4:4:4 frames to ProRes 422 Proxy, LT, 422, HQ,
-	  4444 and 4444 XQ, and on engines with the decode descriptor
-	  (T6000, T8140) also decodes those profiles.
+	  4444 and 4444 XQ, and decodes those profiles, on every engine.
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called apple-prores.
