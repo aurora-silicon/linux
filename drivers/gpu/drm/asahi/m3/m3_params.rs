@@ -492,11 +492,11 @@ pub(crate) fn pipeline_depth(soc: &crate::m3::m3_soc::Soc) -> usize {
 
 /// `asahi.m3_render_batch_budget_us`: writable at runtime. A render or compute batch takes in
 /// later packets of its VM only while the VM's measured GPU time per pass (or per compute
-/// command), times the passes already in the batch, stays below this budget (4000 µs on
-/// experimental T8122, disabled on Pro, where compute packets then never join). Each batched
-/// command keeps its own completion deadline. Coalescing a client's heavy frames or dispatches
-/// otherwise makes every other client's work, the compositor's included, wait for all of them.
-/// 0 disables the budget; u64::MAX restores the SoC default.
+/// command), times the passes already in the batch, stays below this budget (4000 µs by
+/// default). Each batched command keeps its own completion deadline. Coalescing a client's heavy
+/// frames or dispatches otherwise makes every other client's work, the compositor's included,
+/// wait for all of them. 0 disables the budget, and every compute batch is then one command;
+/// u64::MAX restores the default.
 static M3_RENDER_BATCH_BUDGET_US: AtomicU64 = AtomicU64::new(u64::MAX);
 m3_param!("m3_render_batch_budget_us", M3_RENDER_BATCH_BUDGET_US, parse_u64, 0o644, Some(get_atomic_param));
 

@@ -370,28 +370,35 @@ impl Inner {
                             self.t8122_verdict=true;
                         }
                         // A live ring WRITE or doorbell may have been published: keep packets
-                        // retained (self.packets) and fail them and everything in flight.
+                        // retained (self.packets) and fail them and everything in flight. The
+                        // error may come from before the batch's packets were marked.
+                        for (p,_) in entries.iter() {p.mark_published();}
                         self.capture_fault(error);
                         Self::finish_all(&entries,Err(error));
                         self.fail_active(error);
                         self.fail_pending(error);
                         return true;
-                    } else if overlap && error==EBUSY {
-                        // Not publishable behind the running batch (new VM binding or storage
-                        // growth): wait for it to retire.
-                        break;
-                    } else if !self.solo_next && entries.iter().any(|(p,_)|!Arc::ptr_eq(p,&entries[0].0)) {
-                        // Nothing reached the firmware, but later packets joined: they joined from
-                        // their first command and were never published before, so they are
-                        // unpublished again. Retry the front packet alone before failing it.
-                        for (p,_) in entries.iter().filter(|(p,_)|!Arc::ptr_eq(p,&entries[0].0)) {p.clear_published();}
-                        self.solo_next=true;
-                        progress=true;
                     } else {
-                        // Nothing reached the firmware: fail only the front packet, as a failed
-                        // execute() did before publication.
-                        self.fail_front(error);
-                        progress=true;
+                        // Nothing reached the firmware. A packet whose first command is in this
+                        // batch was never published before, so it is unpublished again if the
+                        // batch marked it: a later failure then releases its VM job guard.
+                        for (p,i) in entries.iter() {if policy::first_publication(*i) {p.clear_published();}}
+                        if overlap && error==EBUSY {
+                            // Not publishable behind the running batch (new VM binding or
+                            // storage growth): wait for it to retire.
+                            break;
+                        } else if !self.solo_next && entries.iter().any(|(p,_)|!Arc::ptr_eq(p,&entries[0].0)) {
+                            // Later packets joined, and the error may be theirs: retry the front
+                            // packet alone. If it publishes, the next packet is tried as the
+                            // front in turn, so only a packet that fails alone is failed.
+                            self.solo_next=true;
+                            progress=true;
+                        } else {
+                            // Fail only the front packet, as a failed execute() did before
+                            // publication.
+                            self.fail_front(error);
+                            progress=true;
+                        }
                     }
                 }
             }
@@ -421,9 +428,11 @@ impl Inner {
         for (p,_) in entries {
             if !self.packets.iter().any(|q| Arc::ptr_eq(q,p)) {self.packets.push(p.clone(),GFP_KERNEL).map_err(|_|early(ENOMEM))?;}
         }
-        // Before any producer state changes: an append the overlapping firmware consumes, or a
-        // partial publication, makes these packets visible to it.
-        for (p,_) in entries {p.mark_published();}
+        // Behind a running batch the firmware can consume an append without a new doorbell, so
+        // the packets count as published before any producer state changes. With nothing in
+        // flight they are marked only once every command is encoded (below): an encoding
+        // failure then leaves them unpublished.
+        if overlap {for (p,_) in entries {p.mark_published();}}
         let found=self.jobs.iter().position(|job| matches!((job,control),
             (NativeJob::Compute(_),crate::m3::m3_submit::Command::Compute(_)) |
             (NativeJob::Render(_),crate::m3::m3_submit::Command::Render{..})));
@@ -515,6 +524,8 @@ impl Inner {
             packet.vm.mark_binding_published().map_err(early)?;
         }
         let publication_tick=if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {physical_counter()} else {0};
+        // Every command is encoded and the next step tells the firmware about the batch.
+        for (p,_) in entries {p.mark_published();}
         self.state.health.set_gpu_pending(true);
         self.gpu_pending = true;
         let late=|e:Error|(e,true);

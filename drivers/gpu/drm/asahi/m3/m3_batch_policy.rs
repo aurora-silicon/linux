@@ -108,6 +108,12 @@ pub(crate) const fn release_unpublished(may_be_published: bool) -> bool {
     !may_be_published
 }
 
+/// A batch entry that is its packet's first command: no earlier batch included the packet, so if
+/// this batch fails before anything reached the firmware, the packet is unpublished again.
+pub(crate) const fn first_publication(command: usize) -> bool {
+    command == 0
+}
+
 pub(crate) const fn retain_runtime(stop_failed: bool, gpu_pending: bool) -> bool {
     stop_failed || gpu_pending
 }
