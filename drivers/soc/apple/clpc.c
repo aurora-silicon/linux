@@ -1262,12 +1262,22 @@ static int apple_clpc_policy_notify(struct notifier_block *nb, unsigned long eve
 	return NOTIFY_OK;
 }
 
+/* Called once apple_clpc_stop() is set to undo it. */
+static void apple_clpc_policy_nb_register(struct apple_clpc *clpc)
+{
+	if (clpc->policy_nb_added)
+		return;
+	clpc->policy_nb.notifier_call = apple_clpc_policy_notify;
+	clpc->policy_nb_added = !cpufreq_register_notifier(&clpc->policy_nb,
+							   CPUFREQ_POLICY_NOTIFIER);
+}
+
 /*
  * The CPU whose frequency the ANE engine speed follows and the floor to hold
  * it at while ANE work is in flight, from the CLPC node's apple,ane-cpu-opp:
  * an OPP of that CPU cluster's table. A CPU that uses the OPP's table, or
  * -ENOENT without the property, -ENODEV when no CPU uses it or it gives no
- * frequency.
+ * frequency a frequency QoS request can hold (1 kHz to S32_MAX kHz).
  */
 static int apple_clpc_ane_cpu_opp(const struct device_node *np, unsigned int *khz)
 {
@@ -1280,18 +1290,20 @@ static int apple_clpc_ane_cpu_opp(const struct device_node *np, unsigned int *kh
 		return -ENOENT;
 	table = of_get_parent(opp);
 	if (!table || of_property_read_u64(opp, "opp-hz", &hz) || hz < 1000 ||
-	    div_u64(hz, 1000) > UINT_MAX)
+	    div_u64(hz, 1000) > S32_MAX)
 		goto out;
 	for_each_possible_cpu(cpu) {
 		struct device_node *cpu_np = of_cpu_device_node_get(cpu);
 		struct device_node *cpu_table;
+		bool match;
 
 		if (!cpu_np)
 			continue;
 		cpu_table = of_parse_phandle(cpu_np, "operating-points-v2", 0);
 		of_node_put(cpu_np);
+		match = cpu_table == table;
 		of_node_put(cpu_table);
-		if (cpu_table == table) {
+		if (match) {
 			found = cpu;
 			*khz = div_u64(hz, 1000);
 			break;
@@ -1415,7 +1427,7 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct device_node *gpu = NULL;
 	struct apple_clpc *clpc;
-	unsigned int rail, i;
+	unsigned int rail, i, ane_khz = 0;
 	bool high_power;
 	u32 mhz;
 	int ret;
@@ -1457,25 +1469,13 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->ane_cpu = -ENODEV;
 	clpc->ane_until = jiffies;
 	if (clpc->ane) {
-		unsigned int khz = 0;
-
 		/* The node names the cluster and its floor; else the table's. */
-		clpc->ane_cpu = apple_clpc_ane_cpu_opp(dev->of_node, &khz);
+		clpc->ane_cpu = apple_clpc_ane_cpu_opp(dev->of_node, &ane_khz);
 		if (clpc->ane_cpu == -ENOENT && clpc->hw->ane_cluster_khz &&
 		    of_machine_is_compatible(clpc->hw->ane_cluster_machine)) {
 			clpc->ane_cpu = apple_clpc_cluster_cpu(clpc->hw->ane_cluster);
-			khz = clpc->hw->ane_cluster_khz;
+			ane_khz = clpc->hw->ane_cluster_khz;
 		}
-		if (clpc->ane_cpu >= 0) {
-			clpc->policy_nb.notifier_call = apple_clpc_policy_notify;
-			if (!cpufreq_register_notifier(&clpc->policy_nb,
-						       CPUFREQ_POLICY_NOTIFIER)) {
-				clpc->policy_nb_added = true;
-				clpc->ane_cluster_khz = khz;
-			}
-		}
-		if (!clpc->ane_cluster_khz)
-			dev_dbg(dev, "no ANE cluster floor (%d)\n", clpc->ane_cpu);
 	}
 	/* The property is optional: without it, CPU demand alone sets the floors. */
 	if (clpc->hw->gpu_demand)
@@ -1551,13 +1551,26 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	if (clpc->ane)
 		debugfs_create_file("ane_states", 0600, clpc->debugfs, clpc,
 				    &apple_clpc_ane_states_fops);
-	if (clpc->ane && clpc->ane_cpu >= 0)
-		debugfs_create_u32("ane_cluster_khz", 0600, clpc->debugfs,
-				   &clpc->ane_cluster_khz);
 
+	/*
+	 * apple_clpc_stop() unregisters the policy notifier, so register it
+	 * only once that action is in place: a probe error before then frees
+	 * clpc, which must not be left on the notifier chain.
+	 */
 	ret = devm_add_action_or_reset(dev, apple_clpc_stop, clpc);
 	if (ret)
 		return ret;
+
+	if (clpc->ane_cpu >= 0) {
+		apple_clpc_policy_nb_register(clpc);
+		if (clpc->policy_nb_added) {
+			clpc->ane_cluster_khz = ane_khz;
+			debugfs_create_u32("ane_cluster_khz", 0600, clpc->debugfs,
+					   &clpc->ane_cluster_khz);
+		}
+	}
+	if (clpc->ane && !clpc->ane_cluster_khz)
+		dev_dbg(dev, "no ANE cluster floor (%d)\n", clpc->ane_cpu);
 
 	clpc->profile = PLATFORM_PROFILE_BALANCED;
 	clpc->power_next = jiffies;
@@ -1599,11 +1612,8 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	    IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
 		struct device *ppdev;
 
-		if (clpc->low_power_khz && !clpc->policy_nb_added) {
-			clpc->policy_nb.notifier_call = apple_clpc_policy_notify;
-			clpc->policy_nb_added = !cpufreq_register_notifier(&clpc->policy_nb,
-									   CPUFREQ_POLICY_NOTIFIER);
-		}
+		if (clpc->low_power_khz)
+			apple_clpc_policy_nb_register(clpc);
 		/*
 		 * "apple-clpc" budgets the low-power profile itself; "apple-smc"
 		 * only carries High Power mode, and userspace keeps the CPU budget.
@@ -2054,12 +2064,15 @@ static void apple_clpc_ane_demand_hold_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_clpc_ane_input_demand(clpc, demand));
 	KUNIT_EXPECT_GT(test, ane.updated_ns, 0ull);
 	KUNIT_EXPECT_EQ(test, ane.sequence, 4ull);
-	/* T6040 holds its top qualified DCS and fabric states for the ANE. */
+	/*
+	 * T8132 holds its top qualified DCS and fabric states for the ANE; its
+	 * cluster floor comes from the device tree only.
+	 */
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane[APPLE_CLPC_DCS], 5);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane[APPLE_CLPC_SOC], 3);
-	/* T8132's cluster floor comes from the device tree only. */
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane_cluster_khz, 0u);
 	KUNIT_EXPECT_NULL(test, apple_clpc_hw_t8132.ane_cluster_machine);
+	/* T6040 holds its top qualified DCS and fabric states for the ANE. */
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_DCS], 5);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_SOC], 2);
 }

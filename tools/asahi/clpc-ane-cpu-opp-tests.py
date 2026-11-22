@@ -5,8 +5,9 @@
 The CLPC node's apple,ane-cpu-opp names an OPP of the CPU cluster whose
 frequency sets the Neural Engine's speed. The parser must return a CPU that
 uses the OPP's table and the OPP's frequency in kHz, -ENOENT without the
-property, -ENODEV for an OPP no CPU uses or one without a usable opp-hz, and
-put every node it got.
+property, -ENODEV for an OPP no CPU uses, one outside a table or one without
+an opp-hz a frequency QoS request can hold (1 kHz to S32_MAX kHz), and put
+every node it got.
 
 --mutation names a change to the production source that the matrix must kill.
 """
@@ -21,11 +22,15 @@ ROOT = Path(os.environ.get('CLPC_ROOT', Path(__file__).resolve().parents[2]))
 
 MUTATIONS = {
     # Take any CPU, not one that uses the OPP's table.
-    'any-cpu': ('if (cpu_table == table) {', 'if (cpu_table || 1) {'),
+    'any-cpu': ('match = cpu_table == table;', 'match = true;'),
     # Report hertz, not kilohertz.
     'hz': ('*khz = div_u64(hz, 1000);', '*khz = hz;'),
     # Leak the OPP node.
     'leak': ('\tof_node_put(opp);\n\treturn found;', '\treturn found;'),
+    # Bound the floor by the u32 range, which a negative s32 request passes.
+    'u32': ('div_u64(hz, 1000) > S32_MAX', 'div_u64(hz, 1000) > UINT_MAX'),
+    # Accept an OPP outside any table.
+    'no-parent': ('if (!table || of_property_read_u64', 'if (of_property_read_u64'),
 }
 
 
@@ -41,6 +46,7 @@ def item(text, signature):
 
 HARNESS = r'''
 #include <assert.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -48,7 +54,8 @@ typedef uint64_t u64;
 #define ENOENT 2
 #define ENODEV 19
 #define UINT_MAX 0xffffffffu
-#define NR_CPUS 10
+#define S32_MAX 0x7fffffff
+#define NR_CPUS 11
 static u64 div_u64(u64 a, unsigned int b) { return a / b; }
 struct device_node { const char *name; struct device_node *parent, *opp_ref, *table_ref;
 	int has_hz; u64 hz; int refs; };
@@ -84,19 +91,23 @@ int main(void)
 	struct device_node nohz = { "opp-nohz", &ptab, 0, 0, 0, 0 };
 	struct device_node tiny = { "opp-tiny", &ptab, 0, 0, 1, 999 };
 	struct device_node huge = { "opp-huge", &ptab, 0, 0, 1, 5000000000000ull };
+	/* Above S32_MAX kHz but within u32 kHz: a negative s32 request. */
+	struct device_node s32 = { "opp-s32", &ptab, 0, 0, 1, (S32_MAX + 1ull) * 1000 };
+	struct device_node top = { "opp-top", &ptab, 0, 0, 1, S32_MAX * 1000ull + 999 };
+	struct device_node low = { "opp-low", &ptab, 0, 0, 1, 1000 };
+	struct device_node orphan = { "opp-orphan", 0, 0, 0, 1, 2616000000ull };
 	struct device_node cpu[NR_CPUS];
 	struct device_node clpc = { "clpc" };
 	unsigned int khz;
 	int i, r;
 
 	memset(cpu, 0, sizeof(cpu));
-	/* T8132: CPUs 0-5 E, 6-9 P; CPU 7 has no node. */
+	/* T8132: CPUs 0-5 E, 6-9 P; CPU 7 has no node, CPU 10 no OPP table. */
 	for (i = 0; i < NR_CPUS; i++) {
 		cpu[i].name = "cpu";
-		cpu[i].table_ref = i < 6 ? &etab : &ptab;
+		cpu[i].table_ref = i < 6 ? &etab : i < 10 ? &ptab : 0;
 		cpus[i] = i == 7 ? 0 : &cpu[i];
 	}
-	cpus[7] = 0;
 
 	khz = 7; r = apple_clpc_ane_cpu_opp(&clpc, &khz);
 	assert(r == -ENOENT && khz == 7);
@@ -108,8 +119,14 @@ int main(void)
 	clpc.opp_ref = &eopp; khz = 0; r = apple_clpc_ane_cpu_opp(&clpc, &khz);
 	assert(r >= 0 && r < 6 && khz == 912000);
 
-	for (i = 0; i < 4; i++) {
-		struct device_node *bad[] = { &gopp, &nohz, &tiny, &huge };
+	/* The bounds: 1 kHz and S32_MAX kHz are both held. */
+	clpc.opp_ref = &low; khz = 0; r = apple_clpc_ane_cpu_opp(&clpc, &khz);
+	assert(r >= 6 && r < 10 && khz == 1);
+	clpc.opp_ref = &top; khz = 0; r = apple_clpc_ane_cpu_opp(&clpc, &khz);
+	assert(r >= 6 && r < 10 && khz == S32_MAX);
+
+	for (i = 0; i < 6; i++) {
+		struct device_node *bad[] = { &gopp, &nohz, &tiny, &huge, &s32, &orphan };
 		clpc.opp_ref = bad[i]; khz = 7; r = apple_clpc_ane_cpu_opp(&clpc, &khz);
 		assert(r == -ENODEV && khz == 7);
 	}
