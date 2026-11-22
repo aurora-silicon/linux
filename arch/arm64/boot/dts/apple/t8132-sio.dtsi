@@ -32,6 +32,7 @@
 		compatible = "apple,t8132-sio", "apple,sio";
 		reg = <0x3 0xade00000 0x0 0x8000>,
 		      <0x3 0xad850000 0x0 0x4000>;
+		reg-names = "asc", "auxiliary";
 		#dma-cells = <1>;
 		/* Channel numbers run up to dp-audio2's 0x68, as on T8140. */
 		dma-channels = <128>;
