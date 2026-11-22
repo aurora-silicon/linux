@@ -959,7 +959,7 @@ impl G18FirmwareMemory {
         if next == consumer {
             return Err(EBUSY);
         }
-        let record = init::G18G_26A428_CONTROL_RING_BUNDLE_OFFSETS[0] + producer as usize * init::CONTROL_RECORD_SIZE;
+        let record = self.layouts.shared.control_ring[0] + producer as usize * init::CONTROL_RECORD_SIZE;
         self.shared.with_bytes_mut(|out| {
             let record = out.get_mut(record..record + init::CONTROL_RECORD_SIZE).ok_or(EINVAL)?;
             init::encode_device_control_record(DEVICE_CONTROL_OPCODE_TVB_GROW_REPLY, u32::from(grew), record)
