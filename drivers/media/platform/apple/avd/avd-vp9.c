@@ -14,6 +14,7 @@
  *	Alpha Lin <Alpha.Lin@rock-chips.com>
  */
 
+#include <kunit/visibility.h>
 #include <linux/unaligned.h>
 
 #include <media/v4l2-vp9.h>
@@ -781,6 +782,40 @@ static int avd_vp9_alloc_bufs(struct avd_ctx *ctx, struct avd_vp9_bank *bank)
 }
 
 /*
+ * VP9 6.2.13 tile_info(): tile_rows_log2 is 0, 1 or 2, and tile_cols_log2
+ * lies between calc_min_log2_tile_cols() and calc_max_log2_tile_cols() of
+ * 6.2.14, which follow from the frame width. The job has one segment per
+ * tile and the per-column scratch is sized for the column count this allows.
+ */
+#define VP9_MIN_TILE_WIDTH_B64	4
+#define VP9_MAX_TILE_WIDTH_B64	64
+#define VP9_MAX_TILE_ROWS_LOG2	2
+
+VISIBLE_IF_KUNIT int
+avd_vp9_check_tiling(const struct v4l2_ctrl_vp9_frame *frame)
+{
+	/* 6.2.6 Compute image size syntax */
+	u32 sb_64_cols = (((frame->frame_width_minus_1 + 8) >> 3) + 7) >> 3;
+	u32 min_log2 = 0, max_log2 = 1;
+
+	if (frame->tile_rows_log2 > VP9_MAX_TILE_ROWS_LOG2)
+		return -EINVAL;
+
+	while ((VP9_MAX_TILE_WIDTH_B64 << min_log2) < sb_64_cols)
+		min_log2++;
+	while ((sb_64_cols >> max_log2) >= VP9_MIN_TILE_WIDTH_B64)
+		max_log2++;
+	max_log2--;
+
+	if (frame->tile_cols_log2 < min_log2 ||
+	    frame->tile_cols_log2 > max_log2)
+		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_vp9_check_tiling);
+
+/*
  * Only VP9 profiles 0 and 2 (4:2:0, 8 and 10 bits) decode. A profile 1
  * frame (4:2:2 or 4:4:4) is never completed: it times out and the whole
  * decoder is reset, failing every other stream's frames too. Refuse
@@ -796,7 +831,7 @@ static int avd_vp9_validate_frame(struct avd_ctx *ctx,
 	if (frame->bit_depth != (frame->profile == 2 ? 10 : 8))
 		return -EINVAL;
 
-	return 0;
+	return avd_vp9_check_tiling(frame);
 }
 
 static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
@@ -880,11 +915,10 @@ static int avd_vp9_run(struct avd_ctx *ctx)
 		return ret;
 	}
 
-	ret = avd_init_job(
-		ctx, AVD_CODEC_VP9,
-		(1 << run.decode_params->tile_rows_log2) *
-				(1 << run.decode_params->tile_cols_log2) +
-			1);
+	/* One segment per tile, bounded by avd_vp9_check_tiling(), and the header. */
+	ret = avd_init_job(ctx, AVD_CODEC_VP9,
+			   ((size_t)1 << (run.decode_params->tile_rows_log2 +
+					  run.decode_params->tile_cols_log2)) + 1);
 	if (ret) {
 		avd_run_postamble(ctx, &run.base);
 		return ret;

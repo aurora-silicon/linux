@@ -383,6 +383,7 @@ int avd_hevc_check_tiles(const struct v4l2_ctrl_hevc_sps *sps,
 int avd_hevc_kunit_compute_tiles(const struct v4l2_ctrl_hevc_sps *sps,
 				 const struct v4l2_ctrl_hevc_pps *pps,
 				 u32 *tile_ids, size_t n);
+int avd_vp9_check_tiling(const struct v4l2_ctrl_vp9_frame *frame);
 #endif
 
 extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;
