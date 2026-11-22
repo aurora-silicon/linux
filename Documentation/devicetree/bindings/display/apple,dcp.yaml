@@ -34,6 +34,8 @@ properties:
               - apple,t8112-dcpext
               - apple,t6000-dcpext
               - apple,t6020-dcpext
+              - apple,t6030-dcpext
+              - apple,t6031-dcpext
               - apple,t6041-dcpext
               - apple,t8122-dcpext
               - apple,t6050-dcpext
@@ -593,23 +595,6 @@ allOf:
           maxItems: 10
           items:
             pattern: '^(dp-xbar|typec[0-9]+(-dpin[01])?)$'
-  - if:
-      not:
-        properties:
-          compatible:
-            contains:
-              enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext',
-                     'apple,t6050-dcp', 'apple,t6050-dcpext']
-        required:
-          - compatible
-    then:
-      properties:
-        mux-controls:
-          maxItems: 8
-        mux-control-names:
-          maxItems: 8
-          items:
-            pattern: '^(dp-xbar|typec[0-9]+)$'
   - if:
       allOf:
         - not:
