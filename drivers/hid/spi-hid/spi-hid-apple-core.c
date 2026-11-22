@@ -929,6 +929,24 @@ static void spihid_assemble_message(struct spihid_apple *spihid,
 		rep->length = 0;
 	}
 
+	/*
+	 * The packet header sets the report size, up to 64 KiB, but rep->buf
+	 * holds SPIHID_MAX_INPUT_REPORT_SIZE bytes. Drop a report that does
+	 * not fit, and any packet that would write past the buffer, so a bad
+	 * header cannot overrun the heap. A later packet must also end where
+	 * the first one said the report ends; that is checked below.
+	 */
+	if ((offset == 0 && length + remain > SPIHID_MAX_INPUT_REPORT_SIZE) ||
+	    offset + length > SPIHID_MAX_INPUT_REPORT_SIZE) {
+		dev_warn_ratelimited(dev, "oversized report off:%zu len:%zu remain:%zu\n",
+				     offset, length, remain);
+		rep->device = 0;
+		rep->flags = 0;
+		rep->offset = 0;
+		rep->length = 0;
+		return;
+	}
+
 	if (offset == 0) {
 		if (rep->offset != 0) {
 			dev_warn(dev, "incomplete report off:%u len:%u",
@@ -943,6 +961,11 @@ static void spihid_assemble_message(struct spihid_apple *spihid,
 		if (offset + length + remain != rep->length) {
 			dev_warn(dev, "incomplete report off:%u len:%u",
 				 rep->offset, rep->length);
+			/* Do not join this packet's report to the earlier one. */
+			rep->device = 0;
+			rep->flags = 0;
+			rep->offset = 0;
+			rep->length = 0;
 			return;
 		}
 		memcpy(rep->buf + offset, pkt->data, length);
