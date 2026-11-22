@@ -7,7 +7,8 @@ drivers/soc/apple/rtkit.c unchanged and built with ASan and UBSan. The
 endpoint map starts endpoint 7 only for a client that asks for CoreAnalytics
 (APPLE_RTKIT_NEEDS_COREANALYTICS) and for registry-v2 PMP firmware, so only
 those get a buffer or an acknowledgment there: a buffer request from any
-other co-processor, of any size, allocates nothing and is not answered.
+other co-processor, of any size, allocates nothing and is not answered, and
+is reported through the rate-limited unknown-endpoint warning.
 
 --old-ref REV runs the same checks on the driver at REV and requires them to
 fail there.
@@ -69,6 +70,7 @@ typedef uint64_t dma_addr_t;
 #define FIELD_FIT(m,v) (!((((u64)(v)) << __builtin_ctzll(m)) & ~(m)))
 #define READ_ONCE(x) (x)
 #define dev_warn(...) ((void)0)
+#define dev_warn_ratelimited(...) ((void)warned++)
 #define dev_err(...) ((void)0)
 #define dev_dbg(...) ((void)0)
 
@@ -92,7 +94,7 @@ struct apple_rtkit {
 	int coreanalytics_completion;
 };
 
-static unsigned allocations, frees, sent, aux;
+static unsigned allocations, frees, sent, aux, warned;
 static size_t allocated;
 static char memory[64];
 static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep, struct apple_rtkit_shmem *b)
@@ -127,13 +129,18 @@ static u64 buffer_request(unsigned count, u64 unit)
 	       FIELD_PREP(APPLE_RTKIT_CA_COUNT, count) | unit;
 }
 
-static void deliver(const struct apple_rtkit_ops *ops, bool registry_v2, u64 msg)
+static void deliver_ep(const struct apple_rtkit_ops *ops, bool registry_v2, u8 ep, u64 msg)
 {
 	struct apple_rtkit rtk = { .ops = ops, .pmp_registry_v2 = registry_v2 };
 
-	allocations = frees = sent = aux = 0;
+	allocations = frees = sent = aux = warned = 0;
 	allocated = 0;
-	apple_rtkit_rx_dispatch(&rtk, APPLE_RTKIT_EP_COREANALYTICS, msg, false, 0);
+	apple_rtkit_rx_dispatch(&rtk, ep, msg, false, 0);
+}
+
+static void deliver(const struct apple_rtkit_ops *ops, bool registry_v2, u64 msg)
+{
+	deliver_ep(ops, registry_v2, APPLE_RTKIT_EP_COREANALYTICS, msg);
 }
 
 int main(void)
@@ -147,21 +154,29 @@ int main(void)
 
 	/* A client that asked for CoreAnalytics gets its buffer and its acks. */
 	deliver(&asks, false, small);
-	assert(allocations == 1 && allocated == 0x4000 && sent == 1 && frees == 0);
+	assert(allocations == 1 && allocated == 0x4000 && sent == 1 && frees == 0 && !warned);
 	deliver(&asks, false, event);
-	assert(allocations == 0 && sent == 1);
+	assert(allocations == 0 && sent == 1 && !warned);
 
 	/* Registry-v2 PMP firmware's endpoint 7 is its auxiliary buffer. */
 	deliver(&plain, true, small);
-	assert(aux == 1 && allocations == 0 && sent == 0);
+	assert(aux == 1 && allocations == 0 && sent == 0 && !warned);
 
-	/* Any other co-processor: nothing allocated, nothing answered. */
+	/*
+	 * Any other co-processor: nothing allocated, nothing answered, and the
+	 * message reported through the rate-limited unknown-endpoint warning,
+	 * since the firmware decides how often it arrives.
+	 */
 	deliver(&plain, false, small);
-	assert(allocations == 0 && sent == 0 && aux == 0);
+	assert(allocations == 0 && sent == 0 && aux == 0 && warned == 1);
 	deliver(&plain, false, largest);
-	assert(allocations == 0 && sent == 0 && aux == 0);
+	assert(allocations == 0 && sent == 0 && aux == 0 && warned == 1);
 	deliver(&plain, false, event);
-	assert(allocations == 0 && sent == 0 && aux == 0);
+	assert(allocations == 0 && sent == 0 && aux == 0 && warned == 1);
+
+	/* A system endpoint nobody serves takes the same warning. */
+	deliver_ep(&asks, false, 0x10, small);
+	assert(allocations == 0 && sent == 0 && aux == 0 && warned == 1);
 
 	puts("PASS endpoint 7 is served only for the clients the endpoint map starts it for");
 	return 0;
@@ -191,6 +206,8 @@ def main():
         if name == 'apple_rtkit_needs_coreanalytics':
             # The one predicate the endpoint map and the dispatcher share; absent before it.
             code += function(source, 'apple_rtkit_ep7_served', optional=True)
+            # The one rate-limited warning for unserved endpoints; absent before it.
+            code += function(source, 'apple_rtkit_unserved_ep_msg', optional=True)
     code += MAIN
 
     def run(out):

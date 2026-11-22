@@ -177,6 +177,9 @@ def main():
                                'assert(!"The PMP auxiliary buffer is outside this ordered-display fixture")\n')
                     # A display co-processor doesn't take CoreAnalytics buffers.
                     prefix += '#define apple_rtkit_ep7_served(...) false\n'
+                    # Nor does it receive messages for endpoints it doesn't serve.
+                    prefix += ('#define apple_rtkit_unserved_ep_msg(...) '
+                               'assert(!"No unserved endpoint is in this ordered-display fixture")\n')
                 unit = prefix + unit
             if unit is not None:
                 result['translation_unit_sha256'] = run_unit(name, unit, output, cases, includes if name == 'service-rebind' else (), flags)
