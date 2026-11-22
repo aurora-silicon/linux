@@ -320,8 +320,8 @@ properties:
       buffer lies inside one of the reserved-memory regions referenced by
       memory-region, and that region maps it at the same address through
       iommu-addresses, so the mapping survives the IOMMU taking over the
-      processor's page tables. An empty property records that the session
-      has no shared buffers.
+      processor's page tables. Those regions are no-map. An empty property
+      records that the session has no shared buffers.
 
   apple,j613-25g83-dcpext-handoff:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -621,6 +621,9 @@ required:
   - reg-names
   - mboxes
   - iommus
+
+dependentRequired:
+  apple,rtkit-handoff: [ 'apple,rtkit-version', 'apple,rtkit-epmap', 'apple,rtkit-buffers' ]
 
 allOf:
   - if:
