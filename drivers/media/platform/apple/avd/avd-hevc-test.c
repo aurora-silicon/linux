@@ -279,12 +279,71 @@ static void avd_hevc_two_slices_test(struct kunit *test)
 						    &ep, 1, 119), -EINVAL);
 }
 
+/*
+ * The entry point offsets split a slice's data into its tiles; the last tile
+ * takes what the others leave. Offsets that add up to more than the slice
+ * holds leave it less than nothing, even when each one fits the payload.
+ */
+static void avd_hevc_entry_points_sum_test(struct kunit *test)
+{
+	struct v4l2_ctrl_hevc_decode_params *decode;
+	struct v4l2_ctrl_hevc_slice_params *sl;
+	struct v4l2_ctrl_hevc_sps sps;
+	struct v4l2_ctrl_hevc_pps pps = {
+		.flags = V4L2_HEVC_PPS_FLAG_TILES_ENABLED |
+			 V4L2_HEVC_PPS_FLAG_UNIFORM_SPACING,
+		.num_tile_columns_minus1 = 3,
+	};
+	u32 ep[6] = { 20, 20, 20, 20, 20, 20 };
+
+	decode = kunit_kzalloc(test, sizeof(*decode), GFP_KERNEL);
+	sl = kunit_kcalloc(test, 2, sizeof(*sl), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, decode);
+	KUNIT_ASSERT_NOT_NULL(test, sl);
+
+	avd_hevc_test_sps(&sps);
+	sl[0].slice_type = V4L2_HEVC_SLICE_TYPE_I;
+	sl[0].bit_size = 100 * 8;
+	sl[0].data_byte_offset = 10;
+	sl[0].num_entry_point_offsets = 3;
+	sl[1] = sl[0];
+	sl[1].slice_segment_addr = 8;
+
+	/* 10 header bytes, three tiles of 20 bytes and a last one of 30. */
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_slices(&sps, &pps, decode, sl, 1,
+						    ep, 3, 100), 0);
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_slices(&sps, &pps, decode, sl, 2,
+						    ep, 6, 200), 0);
+
+	/* One byte more than the 90 data bytes of the slice. */
+	ep[0] = 30;
+	ep[1] = 30;
+	ep[2] = 31;
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_slices(&sps, &pps, decode, sl, 1,
+						    ep, 3, 100), -EINVAL);
+	/*
+	 * The same in the first of two slices: every offset and their sum
+	 * stay inside the payload, but not inside the slice.
+	 */
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_slices(&sps, &pps, decode, sl, 2,
+						    ep, 6, 200), -EINVAL);
+
+	/* And in the second slice. */
+	ep[0] = 20;
+	ep[1] = 20;
+	ep[2] = 20;
+	ep[5] = 51;
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_slices(&sps, &pps, decode, sl, 2,
+						    ep, 6, 200), -EINVAL);
+}
+
 static struct kunit_case avd_hevc_test_cases[] = {
 	KUNIT_CASE_PARAM(avd_hevc_geometry_test, avd_hevc_geometry_gen_params),
 	KUNIT_CASE_PARAM(avd_hevc_tiles_test, avd_hevc_tiles_gen_params),
 	KUNIT_CASE(avd_hevc_no_tiles_test),
 	KUNIT_CASE_PARAM(avd_hevc_slices_test, avd_hevc_slices_gen_params),
 	KUNIT_CASE(avd_hevc_two_slices_test),
+	KUNIT_CASE(avd_hevc_entry_points_sum_test),
 	{}
 };
 
