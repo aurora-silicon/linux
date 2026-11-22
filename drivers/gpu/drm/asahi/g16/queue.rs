@@ -127,6 +127,8 @@ pub(crate) struct Queue {
     pub(crate) state: Arc<QueueState>,
     /// Commands accepted per engine (render, compute) since creation (checked for accounting overflow).
     pub(crate) accepted: [u64; 2],
+    /// Epoch-validated GPUVM span cache reused across submits on this logical queue.
+    proof: KBox<command::SpanProof>,
     vm: Arc<VmState>,
     shared: Arc<Shared>,
     timeline: Arc<Timeline>,
@@ -180,10 +182,12 @@ impl Queue {
             },
             GFP_KERNEL,
         )?;
+        let proof = KBox::new(command::SpanProof::new(), GFP_KERNEL)?;
         Ok(Self {
             scheduler,
             state,
             accepted: [0; 2],
+            proof,
             vm: vm_state,
             shared: gpu.shared.clone(),
             timeline,
@@ -213,10 +217,13 @@ impl Queue {
         let prepared = parsed.prepare(self.accepted, objects)?;
         // The job reference first, so that the mappings checked below stay retained.
         let guard = self.vm.vm.retain_first_job()?;
-        let submission = prepared.validate(&command::Context {
-            vm: &self.vm.vm,
-            usc_base: self.state.usc_base,
-        })?;
+        let submission = prepared.validate(
+            &command::Context {
+                vm: &self.vm.vm,
+                usc_base: self.state.usc_base,
+            },
+            &mut self.proof,
+        )?;
         // Refused jobs add no accepted ordinals; check every prepared dependency before
         // publishing a fence or extending the queue's accepted frontier.
         for order in submission.orders.iter() {

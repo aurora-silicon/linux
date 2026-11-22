@@ -634,6 +634,133 @@ fn align_span(start: u64, end: u64) -> Result<(u64, u64)> {
     Ok((first, last - first))
 }
 
+/// Maximum page-aligned GPUVM spans retained in one logical queue's validation cache.
+const MAX_PROOF_RANGES: usize = 128;
+
+/// One logical queue's bounded cache of validated page-aligned GPUVM spans and permissions.
+/// Mapping mutations invalidate or hide the VM's validation epoch so stale proofs are never
+/// reused across unmaps or remaps.
+pub(crate) struct SpanProof {
+    epoch: Option<u64>,
+    ranges: [(u64, u64, u8); MAX_PROOF_RANGES],
+    count: usize,
+    overflow: bool,
+}
+
+impl SpanProof {
+    pub(crate) const fn new() -> Self {
+        Self {
+            epoch: None,
+            ranges: [(0, 0, 0); MAX_PROOF_RANGES],
+            count: 0,
+            overflow: false,
+        }
+    }
+
+    fn contains(outer: (u64, u64, u8), inner: (u64, u64, u8)) -> bool {
+        outer.2 & inner.2 == inner.2
+            && inner.0 >= outer.0
+            && inner.0.checked_add(inner.1).is_some_and(|end| {
+                outer
+                    .0
+                    .checked_add(outer.1)
+                    .is_some_and(|limit| end <= limit)
+            })
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.epoch = None;
+        self.count = 0;
+        self.overflow = false;
+    }
+
+    fn covers_entry(&self, req: (u64, u64, u8)) -> bool {
+        self.ranges[..self.count]
+            .iter()
+            .any(|&range| Self::contains(range, req))
+    }
+
+    pub(crate) fn covers_aligned(
+        &self,
+        epoch: Option<u64>,
+        first: u64,
+        size: u64,
+        access: u8,
+    ) -> bool {
+        self.epoch.is_some() && self.epoch == epoch && self.covers_entry((first, size, access))
+    }
+
+    fn insert_entry(&mut self, mut req: (u64, u64, u8)) {
+        if req.1 == 0 || req.2 == 0 || req.2 & !3 != 0 {
+            return;
+        }
+        if self.covers_entry(req) {
+            return;
+        }
+        // Merge only equal permissions so an adjacent writable span never widens a read-only
+        // span. Restart after each merge because the widened range may join an earlier entry.
+        let mut index = 0;
+        while index < self.count {
+            let range = self.ranges[index];
+            let end = req.0.saturating_add(req.1);
+            let other_end = range.0.saturating_add(range.1);
+            if Self::contains(req, range)
+                || (req.2 == range.2 && req.0 <= other_end && range.0 <= end)
+            {
+                if req.2 == range.2 {
+                    let start = req.0.min(range.0);
+                    req = (start, end.max(other_end) - start, req.2);
+                }
+                self.count -= 1;
+                self.ranges[index] = self.ranges[self.count];
+                index = 0;
+            } else {
+                index += 1;
+            }
+        }
+        if self.count == self.ranges.len() {
+            self.overflow = true;
+            return;
+        }
+        self.ranges[self.count] = req;
+        self.count += 1;
+    }
+
+    pub(crate) fn record_one(&mut self, epoch: Option<u64>, first: u64, size: u64, access: u8) {
+        if epoch.is_none() {
+            self.invalidate();
+            return;
+        }
+        if self.epoch != epoch || self.overflow {
+            self.epoch = epoch;
+            self.count = 0;
+            self.overflow = false;
+        }
+        self.insert_entry((first, size, access));
+    }
+
+    fn record_slice(&mut self, epoch: Option<u64>, ranges: &[(u64, u64, u8)]) {
+        if epoch.is_none() {
+            self.invalidate();
+            return;
+        }
+        if self.epoch == epoch && !self.overflow {
+            for &req in ranges {
+                self.insert_entry(req);
+            }
+            if !self.overflow {
+                return;
+            }
+        }
+        self.epoch = epoch;
+        self.count = 0;
+        self.overflow = false;
+        for &req in ranges {
+            self.insert_entry(req);
+        }
+    }
+}
+
 /// Batches page-aligned GPUVM coverage checks under one `gpuvm.lock_inner()` hold while
 /// preserving exact per-span `ENOENT` / `EACCES` / `EINVAL` error reporting on failure.
 struct SpanBatch {
@@ -666,16 +793,8 @@ impl SpanBatch {
         Ok(())
     }
 
-    fn flush(&mut self, vm: &mmu::Vm) -> Result {
-        let n = self.len;
-        if n == 0 {
-            return Ok(());
-        }
-        self.len = 0;
-        if vm.covers_ranges_batch(&self.ranges[..n]).0 {
-            return Ok(());
-        }
-        for &(first, size, access) in &self.ranges[..n] {
+    fn report_failure(vm: &mmu::Vm, ranges: &[(u64, u64, u8)]) -> Result {
+        for &(first, size, access) in ranges {
             let read = access & 1 != 0;
             let write = access & 2 != 0;
             if !vm.covers_range(first, size, read, write) {
@@ -689,22 +808,87 @@ impl SpanBatch {
         Ok(())
     }
 
-    fn flush_locked(&mut self, guard: &mut mmu::VmReadGuard<'_>) -> Result {
+    fn flush(&mut self, vm: &mmu::Vm) -> Result {
         let n = self.len;
         if n == 0 {
             return Ok(());
         }
         self.len = 0;
+        if vm.covers_ranges_batch(&self.ranges[..n]).0 {
+            return Ok(());
+        }
+        Self::report_failure(vm, &self.ranges[..n])
+    }
+
+    fn flush_with_proof(&mut self, vm: &mmu::Vm, proof: &mut SpanProof) -> Result {
+        let n = self.len;
+        if n == 0 {
+            return Ok(());
+        }
+        self.len = 0;
+        let epoch = vm.mapping_validation_epoch();
+        if proof.epoch.is_some() && proof.epoch == epoch {
+            let mut missing = [(0u64, 0u64, 0u8); 48];
+            let mut missing_len = 0usize;
+            for &req in &self.ranges[..n] {
+                if !proof.covers_entry(req) {
+                    missing[missing_len] = req;
+                    missing_len += 1;
+                }
+            }
+            if missing_len == 0 {
+                return Ok(());
+            }
+            let (mut covered, mut walked) = vm.covers_ranges_batch(&missing[..missing_len]);
+            if covered && walked != proof.epoch {
+                (covered, walked) = vm.covers_ranges_batch(&self.ranges[..n]);
+            }
+            if covered {
+                proof.record_slice(walked, &self.ranges[..n]);
+                return Ok(());
+            }
+            proof.invalidate();
+            return Self::report_failure(vm, &self.ranges[..n]);
+        }
+        let (covered, walked) = vm.covers_ranges_batch(&self.ranges[..n]);
+        if covered {
+            proof.record_slice(walked, &self.ranges[..n]);
+            return Ok(());
+        }
+        proof.invalidate();
+        Self::report_failure(vm, &self.ranges[..n])
+    }
+
+    fn flush_locked_with_proof(
+        &mut self,
+        guard: &mut mmu::VmReadGuard<'_>,
+        epoch: Option<u64>,
+        proof: &mut SpanProof,
+    ) -> Result {
+        let n = self.len;
+        if n == 0 {
+            return Ok(());
+        }
+        self.len = 0;
+        let mut had_miss = false;
         for &(first, size, access) in &self.ranges[..n] {
+            if proof.covers_aligned(epoch, first, size, access) {
+                continue;
+            }
+            had_miss = true;
             let read = access & 1 != 0;
             let write = access & 2 != 0;
             if !guard.covers_range(first, size, read, write) {
+                proof.invalidate();
                 return if guard.covers_range(first, size, false, false) {
                     Err(EACCES)
                 } else {
                     Err(ENOENT)
                 };
             }
+        }
+        if had_miss {
+            proof.record_slice(epoch, &self.ranges[..n]);
         }
         Ok(())
     }
@@ -760,21 +944,39 @@ fn copy_list(lists: &[&[uapi::drm_asahi_attachment]]) -> Result<KVec<uapi::drm_a
 }
 
 /// Checks that `[start, end)` (rounded out to pages) is user memory mapped with the requested
-/// GPU access under an already-held [`mmu::VmReadGuard`].
+/// GPU access under an already-held [`mmu::VmReadGuard`], reusing and populating `proof` for
+/// the matching VM validation `epoch`.
 pub(crate) fn cover_locked(
     guard: &mut mmu::VmReadGuard<'_>,
+    epoch: Option<u64>,
+    mut proof: Option<&mut SpanProof>,
     start: u64,
     end: u64,
     read: bool,
     write: bool,
 ) -> Result {
     let (first, size) = align_span(start, end)?;
+    let access = u8::from(read) | (u8::from(write) << 1);
+    if proof
+        .as_deref()
+        .is_some_and(|cache| cache.covers_aligned(epoch, first, size, access))
+    {
+        return Ok(());
+    }
     if guard.covers_range(first, size, read, write) {
+        if let Some(cache) = proof.as_deref_mut() {
+            cache.record_one(epoch, first, size, access);
+        }
         Ok(())
-    } else if guard.covers_range(first, size, false, false) {
-        Err(EACCES)
     } else {
-        Err(ENOENT)
+        if let Some(cache) = proof.as_deref_mut() {
+            cache.invalidate();
+        }
+        if guard.covers_range(first, size, false, false) {
+            Err(EACCES)
+        } else {
+            Err(ENOENT)
+        }
     }
 }
 
@@ -963,7 +1165,7 @@ fn check_compute(
     context: &Context<'_>,
     cmd: &uapi::drm_asahi_cmd_compute,
     attachments: &[uapi::drm_asahi_attachment],
-) -> Result {
+) -> Result<(u64, u64)> {
     let vm = context.vm;
     let (base, end) = (cmd.cdm_ctrl_stream_base, cmd.cdm_ctrl_stream_end);
     if cmd.flags & !COMPUTE_NO_QUERY_ACCESS != 0
@@ -979,8 +1181,7 @@ fn check_compute(
     }
     batch.push(vm, base, end, true, false)?;
     check_attachments(batch, vm, attachments, true)?;
-    batch.flush(vm)?;
-    gate::cdm(vm, context.usc_base, base, end)
+    Ok((base, end))
 }
 
 /// Per-command barrier and stage-prefix metadata captured during single-pass parsing.
@@ -1236,7 +1437,11 @@ impl ParsedStream {
 impl Prepared {
     /// Checks each command's spans, programs and stream gates, with a job reference on the VM
     /// already held so that the checked mappings are retained until the job retires.
-    pub(crate) fn validate(self, context: &Context<'_>) -> Result<Submission> {
+    pub(crate) fn validate(
+        self,
+        context: &Context<'_>,
+        proof: &mut SpanProof,
+    ) -> Result<Submission> {
         let Prepared {
             commands,
             orders,
@@ -1248,6 +1453,8 @@ impl Prepared {
         let mut batch = SpanBatch::new();
         let mut vdm_vas = [0u64; MAX_COMMANDS as usize];
         let mut vdm_count = 0usize;
+        let mut cdm_ranges = [(0u64, 0u64); MAX_COMMANDS as usize];
+        let mut cdm_count = 0usize;
         for command in commands.iter() {
             match command {
                 Command::Render(render) => {
@@ -1265,16 +1472,47 @@ impl Prepared {
                     vdm_count += 1;
                 }
                 Command::Compute(compute) => {
-                    check_compute(&mut batch, context, &compute.cmd, &compute.attachments)?;
+                    let range =
+                        check_compute(&mut batch, context, &compute.cmd, &compute.attachments)?;
+                    if cdm_count >= cdm_ranges.len() {
+                        return Err(EINVAL);
+                    }
+                    cdm_ranges[cdm_count] = range;
+                    cdm_count += 1;
                 }
             }
         }
-        if vdm_count != 0 {
-            let mut guard = context.vm.read_lock().map_err(|_| EFAULT)?;
-            batch.flush_locked(&mut guard)?;
-            gate::vdm_batch_locked(&mut guard, &vdm_vas[..vdm_count])?;
+        let stream_gate = super::params::stream_gate();
+        let need_vdm = vdm_count != 0 && stream_gate;
+        let need_cdm = cdm_count != 0 && stream_gate;
+        if need_vdm || need_cdm {
+            if need_cdm {
+                kernel::task::might_sleep();
+                if kernel::current!().signal_pending() {
+                    return Err(ERESTARTSYS);
+                }
+            }
+            let mut guard = Some(context.vm.read_lock().map_err(|_| EFAULT)?);
+            let mut epoch = guard.as_ref().and_then(|g| g.epoch());
+            if let Some(g) = guard.as_mut() {
+                batch.flush_locked_with_proof(g, epoch, proof)?;
+                if need_vdm {
+                    gate::vdm_batch_locked(g, &vdm_vas[..vdm_count])?;
+                }
+            }
+            for &(base, end) in &cdm_ranges[..cdm_count] {
+                gate::cdm_locked(
+                    context.vm,
+                    &mut guard,
+                    &mut epoch,
+                    context.usc_base,
+                    base,
+                    end,
+                    Some(&mut *proof),
+                )?;
+            }
         } else {
-            batch.flush(context.vm)?;
+            batch.flush_with_proof(context.vm, proof)?;
         }
         Ok(Submission {
             counts,

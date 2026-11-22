@@ -653,32 +653,43 @@ mod render_admission_tests {
         pub(crate) const UAT_PGMSK: usize = 0x3fff;
         pub(crate) struct VmReadGuard<'a>(&'a Vm);
         impl VmReadGuard<'_> {
+            pub(crate) fn epoch(&self) -> Option<u64> {
+                self.0.epoch.get()
+            }
             pub(crate) fn covers_range(&mut self, start: u64, size: u64, read: bool, write: bool) -> bool {
                 self.0.covers_range(start, size, read, write)
             }
         }
         pub(crate) struct Vm {
             pub(crate) maps: Vec<(u64, u64, bool, bool)>,
+            pub(crate) epoch: std::cell::Cell<Option<u64>>,
             pub(crate) batch_calls: std::cell::Cell<usize>,
+            pub(crate) cover_calls: std::cell::Cell<usize>,
+            pub(crate) batch_ranges: std::cell::Cell<usize>,
         }
         impl Vm {
             pub(crate) fn read_lock(&self) -> super::Result<VmReadGuard<'_>> {
                 Ok(VmReadGuard(self))
             }
+            pub(crate) fn mapping_validation_epoch(&self) -> Option<u64> {
+                self.epoch.get()
+            }
             pub(crate) fn covers_range(&self, start: u64, size: u64, read: bool, write: bool) -> bool {
+                self.cover_calls.set(self.cover_calls.get() + 1);
                 let Some(end) = start.checked_add(size) else { return false };
                 self.maps.iter().any(|&(s, e, r, w)| {
                     start >= s && end <= e && (!read || r) && (!write || w)
                 })
             }
-            pub(crate) fn covers_ranges_batch(&self, ranges: &[(u64, u64, u8)]) -> (bool, usize) {
+            pub(crate) fn covers_ranges_batch(&self, ranges: &[(u64, u64, u8)]) -> (bool, Option<u64>) {
                 self.batch_calls.set(self.batch_calls.get() + 1);
-                for (i, &(start, size, acc)) in ranges.iter().enumerate() {
+                self.batch_ranges.set(self.batch_ranges.get() + ranges.len());
+                for &(start, size, acc) in ranges {
                     if !self.covers_range(start, size, acc & 1 != 0, acc & 2 != 0) {
-                        return (false, i);
+                        return (false, self.epoch.get());
                     }
                 }
-                (true, ranges.len())
+                (true, self.epoch.get())
             }
         }
     }
@@ -707,7 +718,10 @@ mod render_admission_tests {
                 (BASE_GVA + 0x20_0000, BASE_GVA + 0x40_0000, true, true),
                 (BASE_GVA + 0x50_0000, BASE_GVA + 0x51_0000, true, false),
             ],
+            epoch: std::cell::Cell::new(Some(1)),
             batch_calls: std::cell::Cell::new(0),
+            cover_calls: std::cell::Cell::new(0),
+            batch_ranges: std::cell::Cell::new(0),
         }
     }
     fn base_cmd() -> uapi::drm_asahi_cmd_render {
@@ -834,8 +848,10 @@ mod render_admission_tests {
         assert_eq!(batch.flush(&vm), Ok(()));
         assert_eq!(vm.batch_calls.get(), 1);
         let mut guard = vm.read_lock().unwrap();
+        let mut proof = SpanProof::new();
+        let epoch = guard.epoch();
         assert_eq!(check_render(&mut batch, &ctx, &base_cmd(), &[], &[]), Ok(()));
-        assert_eq!(batch.flush_locked(&mut guard), Ok(()));
+        assert_eq!(batch.flush_locked_with_proof(&mut guard, epoch, &mut proof), Ok(()));
         assert_eq!(vm.batch_calls.get(), 1);
         drop(guard);
 
@@ -885,6 +901,73 @@ mod render_admission_tests {
         assert_eq!(check_render_one(&ctx, &cmd, &[], &[]), Ok(()));
         cmd.flags |= 1 << 21;
         assert_eq!(check_render_one(&ctx, &cmd, &[], &[]), Err(EINVAL));
+    }
+
+    #[test]
+    fn span_proof_reuses_epoch_partial_walks_and_invalidates_on_unmap() {
+        let mut vm = base_vm();
+        let mut proof = SpanProof::new();
+        let cmd = base_cmd();
+
+        // First flush populates the proof for epoch 1.
+        let mut batch = SpanBatch::new();
+        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        check_render(&mut batch, &ctx, &cmd, &[], &[]).unwrap();
+        assert_eq!(batch.flush_with_proof(&vm, &mut proof), Ok(()));
+        assert_eq!(vm.batch_calls.get(), 1);
+
+        // Second flush at unchanged epoch hits the proof with zero VM walks.
+        let mut batch = SpanBatch::new();
+        check_render(&mut batch, &ctx, &cmd, &[], &[]).unwrap();
+        assert_eq!(batch.flush_with_proof(&vm, &mut proof), Ok(()));
+        assert_eq!(vm.batch_calls.get(), 1);
+
+        // A new attachment triggers a partial walk of only the uncovered span.
+        let att = uapi::drm_asahi_attachment {
+            pointer: BASE_GVA + 0x20_0000,
+            size: 0x4000,
+            ..Default::default()
+        };
+        let ranges_before = vm.batch_ranges.get();
+        let mut batch = SpanBatch::new();
+        check_render(&mut batch, &ctx, &cmd, &[att], &[]).unwrap();
+        assert_eq!(batch.flush_with_proof(&vm, &mut proof), Ok(()));
+        assert_eq!(vm.batch_calls.get(), 2);
+        assert_eq!(vm.batch_ranges.get() - ranges_before, 1);
+
+        // Locked flush under a held VmReadGuard also skips already-proven spans.
+        let covers_before = vm.cover_calls.get();
+        let mut batch = SpanBatch::new();
+        check_render(&mut batch, &ctx, &cmd, &[att], &[]).unwrap();
+        let mut guard = vm.read_lock().unwrap();
+        let epoch = guard.epoch();
+        assert_eq!(batch.flush_locked_with_proof(&mut guard, epoch, &mut proof), Ok(()));
+        drop(guard);
+        assert_eq!(vm.cover_calls.get(), covers_before);
+
+        // Adjacent read-only and read-write ranges never merge to grant write on RO memory.
+        let mut rw_batch = SpanBatch::new();
+        rw_batch.push(&vm, BASE_GVA, BASE_GVA + 0x4000, true, true).unwrap();
+        assert_eq!(rw_batch.flush_with_proof(&vm, &mut proof), Err(EACCES));
+
+        // Repopulate, then simulate an unmap that bumps the epoch: cached proof is invalidated.
+        let mut batch = SpanBatch::new();
+        check_render(&mut batch, &ctx, &cmd, &[att], &[]).unwrap();
+        assert_eq!(batch.flush_with_proof(&vm, &mut proof), Ok(()));
+        vm.maps.remove(1);
+        vm.epoch.set(Some(2));
+        let mut batch = SpanBatch::new();
+        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        check_render(&mut batch, &ctx, &cmd, &[att], &[]).unwrap();
+        assert_eq!(batch.flush_with_proof(&vm, &mut proof), Err(ENOENT));
+
+        // Epoch None (concurrent mutation) never serves a stale cached proof.
+        vm.epoch.set(None);
+        let mut batch = SpanBatch::new();
+        check_render(&mut batch, &ctx, &cmd, &[], &[]).unwrap();
+        let calls_before = vm.batch_calls.get();
+        assert_eq!(batch.flush_with_proof(&vm, &mut proof), Ok(()));
+        assert_eq!(vm.batch_calls.get(), calls_before + 1);
     }
 }
 '''
