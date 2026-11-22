@@ -372,6 +372,25 @@ bool dcp_h17p_external_ready(struct device_node *np)
 	return ready;
 }
 
+bool dcp_pace_enable = true;
+module_param_named(frame_pacing, dcp_pace_enable, bool, 0644);
+MODULE_PARM_DESC(frame_pacing, "Keep steady-rate content (60 Hz and slower) on an exact frame cadence on the built-in 120 Hz panel (default: on)");
+unsigned int dcp_pace_hold_us = 12500;
+module_param_named(frame_pacing_hold_us, dcp_pace_hold_us, uint, 0644);
+MODULE_PARM_DESC(frame_pacing_hold_us, "Longest time in microseconds a frame is held back for its place in the cadence (default and most: 12500)");
+/* paced, late, shifted, extra, unlocks */
+atomic_t dcp_pace_stat[5];
+static int dcp_pace_stat_get(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "paced %d late %d shift %d extra %d unlocks %d\n",
+			  atomic_read(&dcp_pace_stat[0]), atomic_read(&dcp_pace_stat[1]),
+			  atomic_read(&dcp_pace_stat[2]), atomic_read(&dcp_pace_stat[3]),
+			  atomic_read(&dcp_pace_stat[4]));
+}
+
+static const struct kernel_param_ops dcp_pace_stat_ops = { .get = dcp_pace_stat_get };
+module_param_cb(frame_pacing_stats, &dcp_pace_stat_ops, NULL, 0444);
+
 static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and show the notch (also when /chosen/asahi,show-notch is \"1\")");

@@ -737,6 +737,176 @@ static u32 dcpep_cb_zero(struct apple_dcp *dcp)
 	return 0;
 }
 
+#ifdef DCP_PACE
+/*
+ * Frame pacing for the built-in 120 Hz panel.
+ *
+ * The panel shows a frame for 2 to 10 subframes of 1/240 s and starts the next
+ * one on the first subframe after the swap's requested presentation time. A
+ * swap that asks for "now" lands on whichever subframe comes next, so content
+ * with a steady rate (video) jitters by a subframe whenever its submission
+ * does. macOS gives every swap the time it is meant for. The driver gets no
+ * such time from user space, so it derives one: once the last frames came at
+ * a steady interval of n subframes, a swap that arrives ahead of the next slot
+ * of that cadence is asked for that slot. A late swap is shown as soon as
+ * possible, as without pacing, and the cadence continues from it. A swap far
+ * too early for the slot is not part of the cadence (a pointer or a clock
+ * drawn over a video): it is shown at once and leaves the cadence alone, and
+ * a run of them ends it.
+ */
+#define DCP_PACE_WIN		16
+#define DCP_PACE_MIN		4	/* shortest paced interval: 60 Hz */
+#define DCP_PACE_SHIFT		2	/* subframes a slot may be brought forward */
+#define DCP_PACE_EXTRA		4	/* weight of a swap outside the cadence */
+#define DCP_PACE_EXTRA_MAX	12
+#define DCP_PACE_SHIFTED	8	/* weight of a run of slots brought forward */
+#define DCP_PACE_SHIFTED_MAX	20
+
+static void dcp_pace_reset(struct apple_dcp *dcp, u64 sf)
+{
+	memset(&dcp->pace, 0, sizeof(dcp->pace));
+	dcp->pace.sf = sf;
+}
+
+static void dcp_pace_unlock(struct apple_dcp *dcp)
+{
+	if (dcp->pace.lock)
+		atomic_inc(&dcp_pace_stat[4]);
+	WRITE_ONCE(dcp->pace.lock, 0);
+	dcp->pace.fill = 0;
+	dcp->pace.extras = 0;
+	dcp->pace.shifts = 0;
+	dcp->pace.shifting = false;
+}
+
+static void dcp_pace_complete(struct apple_dcp *dcp)
+{
+	u64 t = arch_timer_read_counter(), sf = dcp->pace.sf, d;
+	unsigned int k, i, n, sum = 0, lock = dcp->pace.lock;
+	bool extra, shifted, ok = true;
+
+	if (!sf)
+		return;
+	extra = READ_ONCE(dcp->pace.extra);
+	WRITE_ONCE(dcp->pace.extra, false);
+	shifted = READ_ONCE(dcp->pace.shifted);
+	WRITE_ONCE(dcp->pace.shifted, false);
+	if (lock && extra) {
+		dcp->pace.extras += DCP_PACE_EXTRA;
+		if (dcp->pace.extras >= DCP_PACE_EXTRA_MAX) {
+			dcp_pace_unlock(dcp);
+			WRITE_ONCE(dcp->pace.anchor, t);
+		}
+		return;
+	}
+	d = t - dcp->pace.anchor;
+	WRITE_ONCE(dcp->pace.anchor, t);
+	k = d > 20 * sf ? 0 : (unsigned int)div64_u64(d + sf / 2, sf);
+	if (k < 2 || k > 13) {
+		/* a pause: start over */
+		dcp_pace_unlock(dcp);
+		dcp->pace.backoff = 0;
+		dcp->pace.penalty = 0;
+		return;
+	}
+	if (dcp->pace.backoff)
+		dcp->pace.backoff--;
+	if (dcp->pace.extras)
+		dcp->pace.extras--;
+	/*
+	 * A true cadence is brought forward now and then, a few frames in a
+	 * row, to realign. Content that needs it again and again has another
+	 * rate (50 Hz content looks like 48 Hz for a moment when it drops a
+	 * frame): let it go and wait before trying again, longer every time.
+	 */
+	if (lock && shifted) {
+		if (!dcp->pace.shifting)
+			dcp->pace.shifts += DCP_PACE_SHIFTED;
+		dcp->pace.shifting = true;
+		if (dcp->pace.shifts >= DCP_PACE_SHIFTED_MAX) {
+			dcp->pace.penalty = clamp_t(unsigned int, dcp->pace.penalty * 2, 256, 4096);
+			dcp->pace.backoff = dcp->pace.penalty;
+			dcp_pace_unlock(dcp);
+			return;
+		}
+	} else {
+		dcp->pace.shifting = false;
+		if (dcp->pace.shifts)
+			dcp->pace.shifts--;
+		if (lock && dcp->pace.penalty)
+			dcp->pace.penalty--;
+	}
+	dcp->pace.iv[dcp->pace.pos] = k;
+	dcp->pace.pos = (dcp->pace.pos + 1) % DCP_PACE_WIN;
+	if (dcp->pace.fill < DCP_PACE_WIN) {
+		dcp->pace.fill++;
+		return;
+	}
+	for (i = 0; i < DCP_PACE_WIN; i++)
+		sum += dcp->pace.iv[i];
+	n = lock ? lock : (sum + DCP_PACE_WIN / 2) / DCP_PACE_WIN;
+	/*
+	 * The fastest rates need no help and a rate between two counts gets
+	 * none. A held cadence tolerates the odd late or early frame.
+	 */
+	if (n < DCP_PACE_MIN || n > 10 ||
+	    abs((int)sum - (int)(n * DCP_PACE_WIN)) > (lock ? 3 : 1))
+		ok = false;
+	for (i = 0; ok && i < DCP_PACE_WIN; i++)
+		if (abs((int)dcp->pace.iv[i] - (int)n) > 2)
+			ok = false;
+	if (!ok) {
+		if (lock)
+			dcp_pace_unlock(dcp);
+	} else if (lock || !dcp->pace.backoff) {
+		WRITE_ONCE(dcp->pace.lock, n);
+	}
+}
+
+/* The presentation time to request for a swap submitted at @now. */
+static u64 dcp_pace_target(struct apple_dcp *dcp, u64 now)
+{
+	u64 sf = dcp->pace.sf, next, k;
+	unsigned int n = READ_ONCE(dcp->pace.lock);
+	s64 early, hold;
+	/*
+	 * Measured on a J314s: a swap submitted less than 2.5 ms before a
+	 * subframe misses it, and a frame is shown on the first subframe that
+	 * completes 0.4 ms or more after its requested time. Half a subframe
+	 * ahead of the wanted completion is the middle of that window.
+	 */
+	const s64 lead = sf * 3 / 5, bias = sf / 2;
+
+	if (!sf || !n || !READ_ONCE(dcp_pace_enable))
+		return now;
+	/* when the frame in the next slot of the cadence would complete */
+	next = READ_ONCE(dcp->pace.anchor) + n * sf;
+	early = (s64)(next - now) - lead;
+	if (early <= 0) {
+		/* too late for the slot: as soon as possible */
+		atomic_inc(&dcp_pace_stat[1]);
+		return now;
+	}
+	/* Requested times further ahead than three subframes were honoured less well. */
+	hold = min3((s64)mul_u64_u32_div(sf * 240, READ_ONCE(dcp_pace_hold_us), USEC_PER_SEC),
+		    (s64)(3 * sf), (s64)((n - 1) * sf));
+	if (early <= hold) {
+		atomic_inc(&dcp_pace_stat[0]);
+		return next - bias;
+	}
+	/* The content runs ahead of the cadence: bring the slot forward. */
+	k = div64_u64(early - hold + sf - 1, sf);
+	if (k <= DCP_PACE_SHIFT) {
+		WRITE_ONCE(dcp->pace.shifted, true);
+		atomic_inc(&dcp_pace_stat[2]);
+		return next - k * sf - bias;
+	}
+	WRITE_ONCE(dcp->pace.extra, true);
+	atomic_inc(&dcp_pace_stat[3]);
+	return now;
+}
+#endif
+
 static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now)
 {
 	bool retire = true;
@@ -847,6 +1017,9 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 {
 	ktime_t now = dcp_is_ext26(dcp) ? ns_to_ktime(dcp->ext26_rx_ns) : ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
+#ifdef DCP_PACE
+	dcp_pace_complete(dcp);
+#endif
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	if (dcp_peer_swap_complete_v27(dcp, resp->swap_id, now, dcp_peer_queue_completion))
 		return;
@@ -4273,6 +4446,13 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
 	dcp->use_timestamps = mode->needs_timestamps && dcp->main_display;
+#ifdef DCP_PACE
+	/* The adaptive 120 Hz timing of the built-in panel runs on 1/240 s subframes. */
+	dcp_pace_reset(dcp, dcp_has_panel(dcp) && mode->vrr &&
+		       drm_mode_vrefresh(&mode->mode) == 120 ?
+		       arch_timer_get_cntfrq() / 240 : 0);
+	dev_info(dcp->dev, "frame pacing: subframe %llu ticks\n", dcp->pace.sf);
+#endif
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie) {
@@ -4590,7 +4770,11 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		 * with the previous accepted swap makes DCP follow swap pacing.
 		 */
 		/* Firmware 12.x/13.x requires timestamp types 1, 2, and 7. */
+#ifdef DCP_PACE
+		req->swap.timestamp[0] = dcp_pace_target(dcp, timestamp);
+#else
 		req->swap.timestamp[0] = timestamp;
+#endif
 		req->swap.timestamp[1] = submit_timestamp;
 		req->swap.timestamp[6] = timestamp;
 

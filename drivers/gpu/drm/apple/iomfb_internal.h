@@ -32,6 +32,11 @@ typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 		dcp_push(dcp, oob, &dcp_methods[handle], sizeof(T), 0, data, cb, cookie); \
 	}
 
+/* frame pacing (dcp.c) */
+extern bool dcp_pace_enable;
+extern unsigned int dcp_pace_hold_us;
+extern atomic_t dcp_pace_stat[5];
+
 #define DCP_THUNK_INOUT(func, handle, T_in, T_out)                            \
 	static void func(struct apple_dcp *dcp, bool oob, T_in *data,         \
 			 dcp_callback_t cb, void *cookie)                     \

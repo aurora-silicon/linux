@@ -765,6 +765,21 @@ struct apple_dcp {
 	bool swap_lost;
 	ktime_t swap_start;
 	u64 swap_submit_timestamp;
+	/* Frame pacing on the built-in 120 Hz panel, see dcp_pace_target(). */
+	struct {
+		u64 sf;		/* subframe period in timer ticks, 0 = off */
+		u64 anchor;	/* timer count when the last frame of the cadence completed */
+		u8 iv[16];	/* the last frame intervals, in subframes */
+		u8 pos, fill;
+		u8 lock;	/* frame interval in subframes while the cadence is steady */
+		u8 extras;	/* leaky count of swaps outside the cadence */
+		bool extra;	/* the swap in flight is outside the cadence */
+		u8 shifts;	/* leaky count of the times the cadence was brought forward */
+		bool shifted;	/* the slot of the swap in flight was brought forward */
+		bool shifting;	/* so was the one before it */
+		u16 backoff;	/* frames until a cadence may be locked again */
+		u16 penalty;	/* the last such wait */
+	} pace;
 
 	/* Current display mode */
 	struct dcp_mode_state mode_state;
