@@ -99,7 +99,7 @@ impl Progress {
     fn set_pending(&self,v:bool){self.pending.store(v,Ordering::Relaxed)}
 }
 struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}fn render_passes(&self)->Result<usize>{Ok(8)}fn pb_slots(&self)->Result<usize>{Ok(2)}}
-struct Job { id:u32,vm:Arc<Vm>,queue:Queue,progress:Progress,commands:Vec<Command>,dependency:Result,terminal_marked:AtomicBool,resources:Resources }
+struct Job { id:u32,vm:Arc<Vm>,queue:Arc<Queue>,progress:Progress,commands:Vec<Command>,dependency:Result,terminal_marked:AtomicBool,resources:Resources }
 impl Job {
     fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}
     fn mark_terminal_retired(&self)->Result{assert!(!self.progress.pending.load(Ordering::Relaxed));self.terminal_marked.store(true,Ordering::Relaxed);Ok(())}
@@ -109,8 +109,8 @@ type Completions=Vec<(u32,Result)>;
 fn complete(done:&mut Completions,job:&Arc<Job>,result:Result){done.push((job.id,result));}
 #[derive(Default)]struct Stats{hold:[u64;3],grouped:u64}
 struct Claims;
-struct Flight{job:Arc<Job>,claims:Claims,group:Vec<Arc<Job>>,renders:u32,doomed:bool,recovery_suspect:bool,initbm:bool}
-impl Flight{fn new(job:Arc<Job>)->Self{Self{job,claims:Claims,group:vec![],renders:0,doomed:false,recovery_suspect:false,initbm:false}}}
+struct Flight{job:Arc<Job>,claims:Claims,group:Vec<Arc<Job>>,computes:u32,renders:u32,doomed:bool,recovery_suspect:bool,initbm:bool}
+impl Flight{fn new(job:Arc<Job>)->Self{Self{job,claims:Claims,group:vec![],computes:0,renders:0,doomed:false,recovery_suspect:false,initbm:false}}}
 struct Engine{ordinal:u64,draw:u64,pending:Vec<Arc<Job>>,flights:Vec<Flight>,frozen:bool,turn:u64,stats:Stats,chan_wait:bool,slot_wait:bool,ta_wave_wait:bool}
 impl Engine {
     __PICK__
@@ -242,7 +242,7 @@ impl Firmware {
                     fl.renders=1;
                     fl.initbm=!self.pools.can_pipeline(&job.vm);
                 }
-                _=>{*pending_rings|=1<<(Channel::Compute as u8);}
+                _=>{*pending_rings|=1<<(Channel::Compute as u8);fl.computes=1;}
             }
             self.engine.flights.push(fl);
         }
@@ -256,7 +256,7 @@ impl Firmware {
 fn mk_vm(slot:u32)->Arc<Vm>{Arc::new(Vm{status:Status(AtomicU32::new(0)),slot})}
 fn job_on_vm(id:u32,vm:Arc<Vm>,render:bool,sent:u32,dependency:Result)->Arc<Job>{
     Arc::new(Job{id,vm,
-        queue:Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]},
+        queue:Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]}),
         progress:Progress{sent:AtomicU32::new(sent),count:sent+1,pending:AtomicBool::new(true)},
         commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false),resources:Resources})
 }
@@ -410,7 +410,7 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         let vm1=mk_vm(1);
         let mk_prio=|id:u32,render:bool,priority:u32|Arc::new(Job{
             id,vm:vm1.clone(),
-            queue:Queue{turn:AtomicU64::new(0),priority,completed:[AtomicU64::new(0),AtomicU64::new(0)]},
+            queue:Arc::new(Queue{turn:AtomicU64::new(0),priority,completed:[AtomicU64::new(0),AtomicU64::new(0)]}),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
             dependency:Ok(()),terminal_marked:AtomicBool::new(false),resources:Resources,
@@ -453,14 +453,14 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         assert_eq!(f.publish_checked(&mut done),Ok(()));
         assert_eq!(f.attempted,[2,3]);
     }
-    #[test]fn alt_bypass_does_not_starve_cross_vm(){
+    #[test]fn alt_bypass_does_not_starve_cross_vm_render_while_compute_overlaps(){
         let vm1=mk_vm(1);
         let vm2=mk_vm(2);
         let vm1_active=job_on_vm(1,vm1.clone(),false,0,Ok(()));
-        let vm2_head=job_on_vm(2,vm2,false,0,Ok(()));
-        let vm1_pending=job_on_vm(3,vm1,false,0,Ok(()));
+        let vm2_render=job_on_vm(2,vm2.clone(),true,0,Ok(()));
+        let vm1_pending=job_on_vm(3,vm1.clone(),false,0,Ok(()));
         vm1_pending.queue.turn.store(5,Ordering::Relaxed);
-        let mut f=firmware(vec![vm2_head,vm1_pending],vec![(Ok(()),true)]);
+        let mut f=firmware(vec![vm2_render,vm1_pending],vec![(Ok(()),true),(Ok(()),true)]);
         f.engine.flights.push(Flight::new(vm1_active));
         f.allow_behind=true;
         let mut done=vec![];
@@ -470,7 +470,61 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         assert_eq!(f.engine.pending.len(),2);
         f.engine.flights.clear();
         assert_eq!(f.publish_checked(&mut done),Ok(()));
+        // VM2 render publishes first; VM1 compute waits for VM2 render to drain (no cross-VM R<->C overlap).
         assert_eq!(f.attempted,[2]);
+        assert_eq!(f.engine.pending.len(),1);
+        f.engine.flights.clear();
+        assert_eq!(f.publish_checked(&mut done),Ok(()));
+        assert_eq!(f.attempted,[2,3]);
+
+        // Cross-VM compute queues immediately behind another VM's active compute without drain,
+        // but drains behind another VM's active render so compute cannot starve cross-VM FS.
+        let vm1_c=job_on_vm(10,vm1.clone(),false,0,Ok(()));
+        let vm2_c=job_on_vm(11,vm2.clone(),false,0,Ok(()));
+        let mut fc=firmware(vec![vm2_c],vec![(Ok(()),true)]);
+        let mut fl=Flight::new(vm1_c);
+        fl.computes=1;
+        fc.engine.flights.push(fl);
+        fc.allow_behind=true;
+        assert_eq!(fc.publish_checked(&mut done),Ok(()));
+        assert_eq!(fc.attempted,[11]);
+        assert_eq!(fc.engine.stats.hold[0],0);
+
+        let vm1_r=job_on_vm(12,vm1,true,0,Ok(()));
+        let vm2_c2=job_on_vm(13,vm2,false,0,Ok(()));
+        let mut fcr=firmware(vec![vm2_c2],vec![(Ok(()),true)]);
+        let mut flr=Flight::new(vm1_r);
+        flr.renders=1;
+        fcr.engine.flights.push(flr);
+        fcr.allow_behind=true;
+        assert_eq!(fcr.publish_checked(&mut done),Ok(()));
+        assert!(fcr.attempted.is_empty());
+        assert_eq!(fcr.engine.stats.hold[0],1);
+    }
+    #[test]fn alt_bypass_preserves_per_queue_fifo_order(){
+        let vm1=mk_vm(1);
+        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q2=Arc::new(Queue{turn:AtomicU64::new(1),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let mk_q=|id:u32,q:Arc<Queue>,render:bool|Arc::new(Job{
+            id,vm:vm1.clone(),queue:q,
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
+            dependency:Ok(()),terminal_marked:AtomicBool::new(false),resources:Resources,
+        });
+        // q1 has blocked render job 1 followed by compute job 2 on the SAME queue q1;
+        // q2 has ready compute job 3. alt-bypass must NOT jump q1's job 2 ahead of job 1,
+        // and must select q2's job 3 instead.
+        let q1_r1=mk_q(1,q1.clone(),true);
+        let q1_c2=mk_q(2,q1,false);
+        let q2_c3=mk_q(3,q2,false);
+        let mut f=firmware(vec![q1_r1.clone(),q1_c2,q2_c3],vec![(Ok(()),true)]);
+        f.engine.flights.push(Flight::new(q1_r1));
+        f.allow_behind=true;
+        f.block_render_behind=true;
+        let mut done=vec![];
+        assert_eq!(f.publish_checked(&mut done),Ok(()));
+        assert_eq!(f.attempted,[3]);
+        assert_eq!(f.engine.pending.len(),2);
     }
     #[test]fn alt_bypass_still_allows_same_vm_class_cap_overlap(){
         let vm1=mk_vm(1);
@@ -623,16 +677,23 @@ mod queue_behind_scope {
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
         assert!(p.can_queue_behind(&j2));
-        assert!(!p.can_queue_behind(&j_other_vm));
+        // Cross-VM compute queues behind another VM's healthy compute, but drains behind
+        // another VM's render.
+        assert!(p.can_queue_behind(&j_other_vm));
+        assert!(!p.needs_engine_drain(&j_other_vm));
         assert!(p.can_queue_behind(&j_render));
         p.engine.flights[0].doomed=true;
         assert!(!p.can_queue_behind(&j2));
+        assert!(!p.can_queue_behind(&j_other_vm));
         p.engine.flights[0].doomed=false;
         p.engine.flights[0].renders=1;
         p.engine.flights[0].computes=0;
         assert!(p.can_queue_behind(&j2));
+        assert!(!p.can_queue_behind(&j_other_vm));
+        assert!(p.needs_engine_drain(&j_other_vm));
         p.engine.flights[0].initbm=true;
         assert!(!p.can_queue_behind(&j2));
+        assert!(!p.can_queue_behind(&j_other_vm));
         p.engine.flights[0].initbm=false;
         p.engine.flights[0].renders=0;
         p.engine.flights[0].computes=1;
@@ -1609,7 +1670,7 @@ mod compute_horizon_scope {
 
     mod recovery {
         pub(crate) mod logic {
-            pub(crate) use crate::recovery::logic::RetiredStamps;
+            pub(crate) use crate::recovery::logic::{stamp_reached, RetiredStamps};
         }
     }
     mod poll {
@@ -1636,7 +1697,8 @@ mod compute_horizon_scope {
             self.passes.get(k).ok_or(ENOENT)
         }
     }
-    struct RecJob { resources: Resources }
+    struct RecVm { slot: u32 }
+    struct RecJob { vm: RecVm, resources: Resources }
     struct RecClaims { pass: [u32; 16] }
     struct RecFlight {
         job: RecJob,
@@ -1655,11 +1717,12 @@ mod compute_horizon_scope {
         gate_passed_ns: Option<u64>,
         unsettled_polls: u32,
     }
-    struct RecEngine { flights: Vec<RecFlight>, ta_target: u32 }
+    struct RecEngine { flights: Vec<RecFlight>, target: u32, ta_target: u32, fs_target: u32 }
     struct RecState { last_retired: recovery::logic::RetiredStamps }
     struct RecFirmware { engine: RecEngine, recovery: RecState }
     impl RecFirmware {
         __RECOVERY_PREPARE__
+        __RECOVERY_PREPARE_SUSPECTS__
     }
     #[test]
     fn recovery_prepare_matches_interior_cstamp_in_batched_compute_horizon() {
@@ -1670,7 +1733,7 @@ mod compute_horizon_scope {
         let mut fw = RecFirmware {
             engine: RecEngine {
                 flights: vec![RecFlight {
-                    job: RecJob { resources: Resources { passes: vec![] } },
+                    job: RecJob { vm: RecVm { slot: 1 }, resources: Resources { passes: vec![] } },
                     claims: RecClaims { pass: [0; 16] },
                     computes: 3,
                     renders: 0,
@@ -1686,7 +1749,9 @@ mod compute_horizon_scope {
                     gate_passed_ns: None,
                     unsettled_polls: 0,
                 }],
+                target: 0x300,
                 ta_target: 0,
+                fs_target: 0,
             },
             recovery: RecState { last_retired: recovery::logic::RetiredStamps::new() },
         };
@@ -1711,6 +1776,7 @@ mod compute_horizon_scope {
             engine: RecEngine {
                 flights: vec![RecFlight {
                     job: RecJob {
+                        vm: RecVm { slot: 1 },
                         resources: Resources {
                             passes: vec![mk_pass(0x1000), mk_pass(0x2000), mk_pass(0x3000)],
                         },
@@ -1730,7 +1796,9 @@ mod compute_horizon_scope {
                     gate_passed_ns: None,
                     unsettled_polls: 0,
                 }],
+                target: 0,
                 ta_target: 0x300,
+                fs_target: 0x300,
             },
             recovery: RecState { last_retired: recovery::logic::RetiredStamps::new() },
         };
@@ -1744,6 +1812,66 @@ mod compute_horizon_scope {
         // Interior FS target 0x200 also matches; unrelated target 0x400 returns ENOENT.
         assert_eq!(fw.recovery_prepare(1, 0x71, 0x200, [0x300, 0x100, 0]), Ok(()));
         assert_eq!(fw.recovery_prepare(1, 0x71, 0x400, [0x300, 0x100, 0]), Err(ENOENT));
+    }
+    #[test]
+    fn cross_vm_recovery_prepare_isolates_blame_to_faulting_vm() {
+        let mut r_ta = [0u32; 16];
+        let mut r_fs = [0u32; 16];
+        r_ta[0] = 0x100; r_fs[0] = 0x100;
+        let mut cstamp = [0u32; 16];
+        cstamp[0] = 0x500;
+        let mut fw = RecFirmware {
+            engine: RecEngine {
+                flights: vec![
+                    RecFlight {
+                        job: RecJob { vm: RecVm { slot: 1 }, resources: Resources { passes: vec![] } },
+                        claims: RecClaims { pass: [0; 16] },
+                        computes: 0,
+                        renders: 1,
+                        target: 0,
+                        ta_target: 0x100,
+                        fs_target: 0x100,
+                        cstamp: [0; 16],
+                        r_ta_stamp: r_ta,
+                        r_fs_stamp: r_fs,
+                        doomed: false,
+                        recovery_suspect: false,
+                        recovery_started_ns: 0,
+                        gate_passed_ns: None,
+                        unsettled_polls: 0,
+                    },
+                    RecFlight {
+                        job: RecJob { vm: RecVm { slot: 2 }, resources: Resources { passes: vec![] } },
+                        claims: RecClaims { pass: [0; 16] },
+                        computes: 1,
+                        renders: 0,
+                        target: 0x500,
+                        ta_target: 0,
+                        fs_target: 0,
+                        cstamp,
+                        r_ta_stamp: [0; 16],
+                        r_fs_stamp: [0; 16],
+                        doomed: false,
+                        recovery_suspect: false,
+                        recovery_started_ns: 0,
+                        gate_passed_ns: None,
+                        unsettled_polls: 0,
+                    },
+                ],
+                target: 0x500,
+                ta_target: 0x100,
+                fs_target: 0x100,
+            },
+            recovery: RecState { last_retired: recovery::logic::RetiredStamps::new() },
+        };
+        // VM 1 (ASID 1) faults on FS 0x100 while VM 2 (ASID 2) has co-resident compute 0x500.
+        assert_eq!(fw.recovery_prepare(1, 0x71, 0x100, [0x100, 0, 0]), Ok(()));
+        assert_eq!(fw.recovery_prepare_suspects([0x100, 0, 0], 0x71, Some(1)), Ok(()));
+        assert!(fw.engine.flights[0].doomed);
+        assert!(fw.engine.flights[0].recovery_suspect);
+        // VM 2's co-resident compute is suspect-only (checked via hardware ITS ticks), NEVER doomed!
+        assert!(!fw.engine.flights[1].doomed);
+        assert!(fw.engine.flights[1].recovery_suspect);
     }
 }
 '''
@@ -1785,6 +1913,11 @@ harness = harness.replace(
     item('pub(crate) fn recovery_prepare(')
     .replace('super::recovery::', 'recovery::')
     .replace('super::poll::', 'poll::'),
+)
+harness = harness.replace(
+    '__RECOVERY_PREPARE_SUSPECTS__',
+    item('pub(crate) fn recovery_prepare_suspects(')
+    .replace('super::recovery::', 'recovery::'),
 )
 for token, declaration in {
     '__PUBLICATION_ERROR__': 'enum PublicationError {',

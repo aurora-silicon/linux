@@ -358,6 +358,22 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     c.engine.flights[0].job.resources.compute[0].its.set(8,299);
     assert_eq!(c.retired(),Ok(Retirement::Pending));
 }
+#[test]fn recovery_suspect_compact_compute_retires_full_with_hw_ticks(){
+    // An innocent cross-VM compact compute (compute_ts_mask == 0) marked recovery_suspect
+    // during another VM's hang still proves stage execution via cold-path ITS ticks and
+    // retires Full without false Aborted or VM blame.
+    CLOCK.with(|c|c.set(100_000_000));
+    let mut f=firmware(false,29);
+    f.engine.flights[0].compute_ts_mask=0;
+    f.engine.flights[0].recovery_suspect=true;
+    f.engine.flights[0].recovery_started_ns=90_000_000;
+    f.engine.flights[0].job.resources.compute[0].its.set(0,500);
+    f.engine.flights[0].job.resources.compute[0].its.set(8,525);
+    assert_eq!(f.retired_flight(),Ok(Some((0,Retirement::Full))));
+    assert!(!f.engine.flights[0].doomed);
+    assert_eq!(f.engine.flights[0].job.resources.compute[0].its.reads.get(),2);
+    assert_eq!(f.engine.retired_ticks,[0;4]);
+}
 
 mod queue_proof {
     use super::{Channel, Object, Result, EINVAL};

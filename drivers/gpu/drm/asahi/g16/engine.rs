@@ -953,11 +953,12 @@ impl Firmware {
             let mut job = self.engine.pending[index].clone();
             // Even a failed job may have an earlier command in flight. An aggregate
             // error fence must not race that command's access to user buffers: only
-            // healthy same-VM non-InitBM commands queue behind active flights; when the
-            // head queue cannot queue behind (e.g. its class hit its flight cap), still
-            // allow another ready queue of the other class to run concurrently, unless
-            // the head job itself requires `flights` to drain to empty first (cross-VM
-            // switch, unprimed InitBM render, failed VM, or recovery/InitBM in flight).
+            // healthy non-InitBM commands (cross-VM compute or same-VM render) queue
+            // behind active flights; when the head queue cannot queue behind (e.g. its
+            // class hit its flight cap), still allow another ready queue to run
+            // concurrently while preserving per-queue FIFO, unless the head job itself
+            // requires `flights` to drain to empty first (cross-VM render switch,
+            // unprimed InitBM render, failed VM, or recovery/InitBM in flight).
             if !self.engine.flights.is_empty() && !self.can_queue_behind(&job) {
                 if self.needs_engine_drain(&job) {
                     self.engine.stats.hold[0] += 1;
@@ -966,6 +967,14 @@ impl Firmware {
                 let mut alt: Option<usize> = None;
                 for (i, cand) in self.engine.pending.iter().enumerate() {
                     if i == index || !self.can_queue_behind(cand) {
+                        continue;
+                    }
+                    // Preserve per-queue FIFO: never jump a later job of a queue ahead
+                    // of an earlier pending job of the same queue.
+                    if self.engine.pending[..i]
+                        .iter()
+                        .any(|earlier| Arc::ptr_eq(&earlier.queue, &cand.queue))
+                    {
                         continue;
                     }
                     let better = match alt {
@@ -1220,11 +1229,18 @@ impl Firmware {
     /// Whether `job` requires `self.engine.flights` to drain to empty before it can
     /// publish (so `alt`-class bypass must not keep refilling the engine ahead of it).
     fn needs_engine_drain(&self, job: &Arc<Job>) -> bool {
+        let cmd = command(job, job.progress.sent());
+        let is_render = matches!(cmd, Some(Command::Render(_)));
+        let is_compute = matches!(cmd, Some(Command::Compute(_)));
         job.vm.status.get() != 0
             || self.engine.flights.iter().any(|f| {
-                f.doomed || f.recovery_suspect || f.initbm || !Arc::ptr_eq(&f.job.vm, &job.vm)
+                f.doomed
+                    || f.recovery_suspect
+                    || f.initbm
+                    || ((is_render || (is_compute && f.renders != 0))
+                        && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
-            || (matches!(command(job, job.progress.sent()), Some(Command::Render(_)))
+            || (is_render
                 && !job
                     .resources
                     .pb_slots()
@@ -1301,29 +1317,36 @@ impl Firmware {
 
     /// Whether `job`'s next command may be published behind the flights in flight:
     ///
-    /// - Compute queues behind healthy same-VM non-InitBM compute and/or render flights (up to
-    ///   [`params::compute_flights`] active computes), each in its own `ComputeSlot`
-    ///   (`its`/`work`), unless `query_access` is set and a same-queue predecessor in its
-    ///   compute or render barrier prefix has CPU-published timestamp outputs that have not
-    ///   retired yet (`DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS` clears `query_access`).
+    /// - Compute queues behind healthy non-InitBM compute flights of any VM or same-VM
+    ///   render flights (up to [`params::compute_flights`] active computes), each in its own
+    ///   `ComputeSlot` and hardware UMA slot (`COMPUTE_UMA_SLOT + index`), unless `query_access`
+    ///   is set and a same-queue predecessor in its compute or render barrier prefix has
+    ///   CPU-published timestamp outputs that have not retired yet
+    ///   (`DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS` clears `query_access`). Cross-VM compute never
+    ///   overlaps an active render of another VM so long compute dispatches cannot starve
+    ///   another client's fragment shading into a firmware DM1 timeout.
     /// - Render queues behind healthy same-VM non-InitBM render and/or compute flights (up to
     ///   [`params::render_flights`] active renders), rotating `PassSlot` (`0..RENDER_SLOTS`)
     ///   while sharing the active exposed PB/UMA allocator slot (`Pools::can_pipeline`).
     ///   Hardware barriers on the CDM/TA/FS rings preserve exact same-engine and cross-engine
     ///   ordering while barrier-free or independent-queue compute and render run concurrently.
-    /// - Cross-VM switches, InitBM priming renders, and every failure or recovery path still
-    ///   drain the engine first.
+    /// - Cross-VM render switches, InitBM priming renders, and every failure or recovery path
+    ///   still drain the engine first.
     fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
         let e = &self.engine;
+        let sent = job.progress.sent();
+        let is_render = matches!(command(job, sent), Some(Command::Render(_)));
         if job.vm.status.get() != 0
             || e.flights.len() >= super::hw::sizes::FLIGHTS
             || e.flights.iter().any(|f| {
-                f.doomed || f.recovery_suspect || f.initbm || !Arc::ptr_eq(&f.job.vm, &job.vm)
+                f.doomed
+                    || f.recovery_suspect
+                    || f.initbm
+                    || (is_render && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
         {
             return false;
         }
-        let sent = job.progress.sent();
         if job.check_command_dependencies(sent).is_err() {
             return false;
         }
@@ -1353,8 +1376,13 @@ impl Firmware {
                         };
                         waits_class(super::command::COMPUTE) || waits_class(super::command::RENDER)
                     });
+                let cross_vm_render = e
+                    .flights
+                    .iter()
+                    .any(|f| f.renders != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
                 let compute_count: usize = e.flights.iter().map(|f| f.computes as usize).sum();
-                !waits_for_timestamps
+                !cross_vm_render
+                    && !waits_for_timestamps
                     && compute_count < params::compute_flights()
                     && !self.slots.compute_exhausted()
                     && super::recovery::logic::next_ordinal(e.ordinal).is_some()
