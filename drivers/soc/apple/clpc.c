@@ -403,6 +403,7 @@ static const struct of_device_id apple_clpc_ane_providers[] = {
 	{ .compatible = "apple,t6041-max-clpc" },
 	{ .compatible = "apple,t6041-clpc" },
 	{ .compatible = "apple,t8140-clpc" },
+	{ .compatible = "apple,t8142-clpc" },
 	{}
 };
 
@@ -1758,6 +1759,20 @@ static const struct apple_clpc_hw apple_clpc_hw_t8142 = {
 		[APPLE_CLPC_SOC] = { 1, 2, 3, 4 },
 	},
 	.gpu_input = true,
+	/*
+	 * Measured ANE demand (J813, H17; J815/J704 share the compatible and
+	 * are untested): DCS 7 is the top DCS state; fabric 3 is a measured
+	 * policy choice below the top fabric state (4). With the CPU pinned at
+	 * minimum frequency so ANE owns the floor, firmware time drops from
+	 * (0, 0) -> (7, 2) -> (7, 3) across denoise-640 (16.5 -> 11.7 -> 10.3
+	 * ms; cold SLC 20.0 -> 11.7 -> 10.4 ms), unet-320 conv (3.94 -> 2.79
+	 * -> 2.46 ms), and mm-512x2048 GEMM (627 -> 493 -> 420 us; cold SLC
+	 * 782 -> 560 -> 526 us). Fabric 4 gives no further speedup on any of
+	 * them and adds 71-121 mW of system power (4.28 -> 4.41 W on
+	 * denoise-640, 3.94 -> 4.04 W on unet-320, 3.95 -> 4.02 W on
+	 * mm-512x2048).
+	 */
+	.ane = { [APPLE_CLPC_DCS] = 7, [APPLE_CLPC_SOC] = 3 },
 };
 
 #if IS_BUILTIN(CONFIG_KUNIT) && !defined(MODULE)
@@ -1998,6 +2013,18 @@ static void apple_clpc_ane_demand_hold_test(struct kunit *test)
 	/* T6040 holds its top qualified DCS and fabric states for the ANE. */
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_DCS], 5);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_SOC], 2);
+	/* T8142 holds DCS 7 and fabric 3 while ANE work is in flight. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8142.ane[APPLE_CLPC_DCS], 7);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8142.ane[APPLE_CLPC_SOC], 3);
+	clpc->hw = &apple_clpc_hw_t8142;
+	clpc->ane_states[APPLE_CLPC_DCS] = clpc->hw->ane[APPLE_CLPC_DCS];
+	clpc->ane_states[APPLE_CLPC_SOC] = clpc->hw->ane[APPLE_CLPC_SOC];
+	memset(demand, 0, sizeof(demand));
+	apple_clpc_ane_set_active(&ane, true);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_ane_input_demand(clpc, demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 7u);
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 3u);
+	apple_clpc_ane_set_active(&ane, false);
 }
 
 static void apple_clpc_ane_cluster_test(struct kunit *test)
@@ -2061,7 +2088,6 @@ static void apple_clpc_ane_no_provider_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 0u);
 	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 0u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane[APPLE_CLPC_DCS], 0);
-	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8142.ane[APPLE_CLPC_DCS], 0);
 }
 
 static void apple_clpc_ane_wake_removal_test(struct kunit *test)
