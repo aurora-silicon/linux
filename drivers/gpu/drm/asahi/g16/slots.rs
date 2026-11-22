@@ -455,6 +455,9 @@ struct ScrubState {
     scrubbing: AtomicU32,
     /// Displaced pass slots whose clean same-VM spans were zeroed off-lock.
     clean_mask: AtomicU32,
+    /// Incremented by [`Self::clear_all_clean`] on recovery so an in-flight async scrub that
+    /// started before recovery can never publish a stale `clean_mask` bit afterwards.
+    generation: AtomicU64,
     /// Set if slot selection found eligible slots blocked only by an in-flight off-lock scrub.
     waiter: AtomicBool,
     /// Set when an off-lock scrub finished while `waiter` was pending so the next `poll_step()`
@@ -470,6 +473,7 @@ impl ScrubState {
         Self {
             scrubbing: AtomicU32::new(0),
             clean_mask: AtomicU32::new(0),
+            generation: AtomicU64::new(0),
             waiter: AtomicBool::new(false),
             woke: AtomicBool::new(false),
             pass_scrubs: AtomicU64::new(0),
@@ -495,7 +499,8 @@ impl ScrubState {
     }
 
     fn clear_all_clean(&self) {
-        self.clean_mask.store(0, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.clean_mask.store(0, Ordering::SeqCst);
     }
 }
 
@@ -504,16 +509,21 @@ pub(crate) struct PendingScrub {
     slot: usize,
     arena: super::resources::PassOwnerArena,
     state: Arc<ScrubState>,
+    generation: u64,
     done: bool,
 }
 
 impl PendingScrub {
-    fn run_one(&mut self) -> bool {
+    pub(crate) fn run_one(&mut self) -> bool {
         let bit = 1u32 << self.slot;
-        let ok = if let Some((pass, tilemap_dirty)) = self.arena.pass_and_tilemap_dirty(self.slot) {
+        let ok = if self.state.generation.load(Ordering::Acquire) != self.generation {
+            false
+        } else if let Some((pass, tilemap_dirty)) = self.arena.pass_and_tilemap_dirty(self.slot) {
             let dirty = tilemap_dirty.load(Ordering::Acquire);
             match pass.scrub_clean(1, dirty) {
                 Ok(()) => {
+                    // Order scrubbed WC bytes before clearing dirty / publishing clean_mask.
+                    super::engine::wmb();
                     tilemap_dirty.store(0, Ordering::Release);
                     self.state.pass_scrubs.fetch_add(1, Ordering::Relaxed);
                     self.state
@@ -526,8 +536,11 @@ impl PendingScrub {
         } else {
             false
         };
-        if ok {
-            self.state.clean_mask.fetch_or(bit, Ordering::Release);
+        if ok && self.state.generation.load(Ordering::SeqCst) == self.generation {
+            self.state.clean_mask.fetch_or(bit, Ordering::SeqCst);
+            if self.state.generation.load(Ordering::SeqCst) != self.generation {
+                self.state.clean_mask.fetch_and(!bit, Ordering::SeqCst);
+            }
         }
         self.state.scrubbing.fetch_and(!bit, Ordering::SeqCst);
         self.done = true;
@@ -562,6 +575,10 @@ impl ScrubBatch {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     fn push(&mut self, item: PendingScrub) -> bool {
         if self.len >= sizes::RENDER_SLOTS {
             return false;
@@ -570,16 +587,45 @@ impl ScrubBatch {
         self.len += 1;
         true
     }
+}
 
-    /// Runs every staged off-lock pass scrub. Returns `true` if a waiting submitter needs wakeup.
-    pub(crate) fn run(mut self) -> bool {
-        let mut wake = false;
-        for slot in &mut self.items[..self.len] {
-            if let Some(mut item) = slot.take() {
-                wake |= item.run_one();
+/// Zero-allocation slot-indexed queue handed to the async pass-scrub workqueue.
+///
+/// Each pass slot `0..sizes::RENDER_SLOTS` keeps its `scrubbing` bit set while a
+/// [`PendingScrub`] is queued or running, so at most one entry per slot exists at once.
+pub(crate) struct ScrubQueue {
+    slots: [Option<PendingScrub>; sizes::RENDER_SLOTS],
+}
+
+impl ScrubQueue {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slots: [const { None }; sizes::RENDER_SLOTS],
+        }
+    }
+
+    /// Moves every staged scrub from `batch` into the queue. Returns `true` if any was queued.
+    pub(crate) fn push_batch(&mut self, mut batch: ScrubBatch) -> bool {
+        let mut pushed = false;
+        for slot in &mut batch.items[..batch.len] {
+            if let Some(item) = slot.take() {
+                let idx = item.slot;
+                self.slots[idx] = Some(item);
+                pushed = true;
             }
         }
-        wake
+        batch.len = 0;
+        pushed
+    }
+
+    /// Pops the next queued pass scrub, if any.
+    pub(crate) fn pop(&mut self) -> Option<PendingScrub> {
+        for slot in &mut self.slots {
+            if slot.is_some() {
+                return slot.take();
+            }
+        }
+        None
     }
 }
 
@@ -786,10 +832,12 @@ impl Slots {
                 continue;
             };
             self.scrub.scrubbing.fetch_or(bit, Ordering::SeqCst);
+            let generation = self.scrub.generation.load(Ordering::Acquire);
             let item = PendingScrub {
                 slot: k,
                 arena,
                 state: self.scrub.clone(),
+                generation,
                 done: false,
             };
             if !self.render.staged.push(item) {

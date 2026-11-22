@@ -176,6 +176,14 @@ pub mod g16 {
         __RENDER_BURST__
     }
     pub mod boot {pub fn eproto()->crate::Error{crate::Error(71)}}
+    pub mod engine {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        pub static WMB_CALLS: AtomicU32 = AtomicU32::new(0);
+        pub fn wmb() {
+            WMB_CALLS.fetch_add(1, Ordering::SeqCst);
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
+    }
     // Arenas here have the two base units.
     pub mod params {pub fn compute_units()->usize{2}pub fn pb_heap_blocks()->u32{2048}pub fn pb_posted_blocks(heap:u32)->u32{heap}}
     pub struct Events{pub grow:crate::KVec<[u32;18]>}
@@ -193,6 +201,7 @@ pub mod g16 {
         Arenas{compute:g16::resources::ComputeArena{compute,render:None},render:g16::resources::RenderArena{passes,tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS]}}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();}
+    fn drain_scrubs(batch:g16::slots::ScrubBatch)->bool{let mut q=g16::slots::ScrubQueue::new();q.push_batch(batch);let mut wake=false;while let Some(mut item)=q.pop(){wake|=item.run_one();}wake}
     #[test]fn render_reuse_clears_only_previous_write_spans(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
         s.claim_pass(&arena.render,0).unwrap();
@@ -864,7 +873,7 @@ pub mod g16 {
         s.retire(&mut c0).unwrap();
         s.stage_displaced_pass_scrubs();
         assert!(!s.scrubbing_active());
-        assert!(!s.take_staged_scrubs().run());
+        assert!(!drain_scrubs(s.take_staged_scrubs()));
         // Publish and retire slot 1: displaces slot 0, staging slot 0 for off-lock scrub.
         let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
         s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
@@ -877,7 +886,7 @@ pub mod g16 {
         assert_eq!(s.pick_pass_in(&prep,&geo,0),None);
         assert_eq!(s.claim_pass_in(&prep,0,Some(a.id),0x4000),Err(EBUSY));
         let batch=s.take_staged_scrubs();
-        assert!(batch.run());
+        assert!(drain_scrubs(batch));
         assert!(!s.scrubbing_active());
         assert!(render.passes[0].tilemap.snapshot()[..0x4000].iter().all(|&b|b==0));
         assert!(render.passes[0].its.snapshot()[..32].iter().all(|&b|b==0));
@@ -916,7 +925,7 @@ pub mod g16 {
         // Failed off-lock scrub preserves tilemap_dirty and falls back synchronously.
         s.stage_displaced_pass_scrubs();
         render.passes[0].tilemap.fail_fill.store(true,std::sync::atomic::Ordering::Relaxed);
-        assert!(!s.take_staged_scrubs().run());
+        assert!(!drain_scrubs(s.take_staged_scrubs()));
         assert_eq!(render.tilemap_dirty[0].load(std::sync::atomic::Ordering::Acquire),0x2000);
         let fills_before=render.passes[0].tilemap.fills.lock().unwrap().len();
         s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
@@ -929,7 +938,7 @@ pub mod g16 {
         s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
         s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&mut c1).unwrap();s.retire(&mut c1).unwrap();
         s.stage_displaced_pass_scrubs();
-        let _=s.take_staged_scrubs().run();
+        let _=drain_scrubs(s.take_staged_scrubs());
         s.invalidate_scrub();
         s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
         assert!(s.render_needs_full_work(0));
@@ -939,7 +948,7 @@ pub mod g16 {
         s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
         s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&mut c1).unwrap();s.retire(&mut c1).unwrap();
         s.stage_displaced_pass_scrubs();
-        let _=s.take_staged_scrubs().run();
+        let _=drain_scrubs(s.take_staged_scrubs());
         s.claim_pass_in(&prep,0,Some(b.id),0x2000).unwrap();
         assert!(s.render_needs_full_work(0));
     }
@@ -967,17 +976,17 @@ pub mod g16 {
         assert!(s.pass_available(2));
         assert_eq!(s.pick_pass_in(&prep,&geo,0),Some(0));
         // Disallowed staging (fail-stop / frozen) stages nothing and clears pending flag.
-        assert!(!s.stage_and_take_scrubs(false).run());
+        assert!(!drain_scrubs(s.stage_and_take_scrubs(false)));
         assert!(!s.scrubbing_active());
         // Allowed staging after publication stages idle displaced slot 0 and scrubs it off-lock.
         s.note_render_retired();
         let batch=s.stage_and_take_scrubs(true);
         assert!(s.scrubbing_active());
-        assert!(!batch.run());
+        assert!(!drain_scrubs(batch));
         assert!(!s.scrubbing_active());
         assert!(render.passes[0].tilemap.snapshot()[..0x2000].iter().all(|&b|b==0));
         // Calling stage_and_take_scrubs again without a new render retirement is a no-op.
-        assert!(!s.stage_and_take_scrubs(true).run());
+        assert!(!drain_scrubs(s.stage_and_take_scrubs(true)));
         assert!(!s.scrubbing_active());
     }
     #[test]fn multi_unit_compute_horizon_claims_publish_retire_and_release(){
@@ -1198,8 +1207,74 @@ pub mod g16 {
         assert!(!s.render_exhausted_within(2));
     }
 
+    #[test]fn async_scrub_queue_and_recovery_generation_guard(){
+        use crate::g16::slots::ScrubQueue;
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
+        let render=sync::Arc::new(arena.render,0).unwrap();
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone())};
+        let a=vm(1);
+        let geo=g16::encode::Geometry{tpc_bytes:0x1000,tilemap_bytes:0x2000};
+        // Prime and displace slot 0.
+        let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
+        s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();
+        render.set_dirty(0,0x1000,0x2000).unwrap();
+        render.passes[0].tilemap.fill(0,0x66,0x2000).unwrap();
+        s.retire(&mut c0).unwrap();
+        let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
+        s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();
+        s.retire(&mut c1).unwrap();
+
+        // Hand staged scrub off via ScrubQueue; waiter is woken on completion and woke flag is set.
+        s.stage_displaced_pass_scrubs();
+        let batch=s.take_staged_scrubs();
+        assert!(!batch.is_empty());
+        let mut q=ScrubQueue::new();
+        assert!(q.push_batch(batch));
+        assert!(s.scrubbing_active());
+        assert_eq!(s.pick_pass_in(&prep,&geo,0),None);
+        let mut item=q.pop().expect("queued scrub");
+        assert!(q.pop().is_none());
+        let wmb_before=g16::engine::WMB_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(item.run_one());
+        assert!(g16::engine::WMB_CALLS.load(std::sync::atomic::Ordering::SeqCst)>wmb_before);
+        assert!(!s.scrubbing_active());
+        assert!(s.take_scrub_woke());
+        assert!(!s.take_scrub_woke());
+        assert_eq!(s.pick_pass_in(&prep,&geo,0),Some(0));
+        s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
+        assert!(!s.render_needs_full_work(0));
+
+        // Re-displace slot 0, stage scrub, then simulate recovery invalidate_scrub() BEFORE
+        // the async scrub runs: it must clear scrubbing without marking clean, so next claim
+        // performs a full scrub.
+        let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();s.retire(&mut c0).unwrap();
+        let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
+        s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();s.retire(&mut c1).unwrap();
+        s.stage_displaced_pass_scrubs();
+        assert!(q.push_batch(s.take_staged_scrubs()));
+        assert!(s.scrubbing_active());
+        s.invalidate_scrub();
+        let mut stale=q.pop().expect("stale scrub");
+        assert!(!stale.run_one());
+        assert!(!s.scrubbing_active());
+        s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
+        assert!(s.render_needs_full_work(0));
+    }
+
 }
 '''
+poll_source = (production/'poll.rs').read_text()
+mod_source = (production/'mod.rs').read_text()
+sleep_source = (production/'sleep.rs').read_text()
+assert 'scrubs.run()' not in poll_source, 'poll.rs must hand scrubs off asynchronously via enqueue_scrubs'
+assert 'while let Some(mut item) = self.scrub_queue.lock().pop()' not in poll_source, 'run_scrubs must drop scrub_queue spinlock before run_one()'
+assert 'self.enqueue_scrubs(scrubs)' in poll_source, 'poll.rs must enqueue scrubs asynchronously'
+assert 'OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_scrub"), false)' in mod_source
+assert 'self.scrub_wq.drain();' in sleep_source, 'sleep.rs::join_workers must drain scrub_wq'
 budget=(production/'budget.rs').read_text()
 budget=budget.replace('new_condvar, new_mutex,','').replace('#[pin_data]','').replace('    #[pin]\n','')
 constructor=item(budget,'pub(crate) fn new()')
@@ -1247,7 +1322,7 @@ for command in [
         raise SystemExit(result.returncode)
 files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs']
 (out/'resource-host.json').write_text(json.dumps({
-    'result': 'pass', 'tests': 32,
+    'result': 'pass', 'tests': 33,
     'scope': 'Actual production allocation, initialization and lifetime code against a CPU-only backing recorder; no hardware qualification.',
     'private_rw_pte': hex(private_rw),
     'private_rw_reference': 'Qualified J713 NC read/write leaf attributes',

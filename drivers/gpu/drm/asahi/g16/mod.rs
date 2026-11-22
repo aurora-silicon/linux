@@ -81,9 +81,10 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64,
 use kernel::{
     c_str,
     device::{self, Core},
-    impl_has_delayed_work, impl_has_work, new_delayed_work, new_mutex, new_work, of, platform,
+    impl_has_delayed_work, impl_has_work, new_delayed_work, new_mutex, new_spinlock, new_work, of,
+    platform,
     prelude::*,
-    sync::{aref::ARef, Arc, Mutex},
+    sync::{aref::ARef, Arc, Mutex, SpinLock},
     time::hrtimer::{ArcHrTimerHandle, HrTimer},
     uapi,
     workqueue::{DelayedWork, OwnedQueue, Work, WorkItem},
@@ -191,6 +192,8 @@ impl platform::Driver for Driver {
 const POLL_WORK: u64 = 0;
 /// Work item ID of the submitter-pinned fast event poll work.
 const FAST_POLL_WORK: u64 = 1;
+/// Work item ID of the asynchronous displaced pass-slot scrub work.
+const SCRUB_WORK: u64 = 2;
 /// Capacity hint for `drm_syncobj_wait` during active submit bursts (mirroring G17's wait hint).
 const WAIT_UTIL_MIN: u32 = 512;
 const WAIT_HINT_MS: u32 = 8;
@@ -255,12 +258,18 @@ pub(crate) struct Shared {
     sleep_commit: AtomicPtr<core::ffi::c_void>,
     /// Dedicated high-priority per-CPU workqueue for immediate completion polling.
     pub(crate) events: OwnedQueue,
+    /// Dedicated unbound workqueue for asynchronous off-lock pass-slot WC scrubbing.
+    pub(crate) scrub_wq: OwnedQueue,
     #[pin]
     pub(crate) orphan: Mutex<Option<KBox<boot::Orphan>>>,
     #[pin]
     pub(crate) poll: DelayedWork<Shared, POLL_WORK>,
     #[pin]
     pub(crate) fast_poll: Work<Shared, FAST_POLL_WORK>,
+    #[pin]
+    pub(crate) scrub_queue: SpinLock<slots::ScrubQueue>,
+    #[pin]
+    pub(crate) scrub_work: Work<Shared, SCRUB_WORK>,
     // --- The completion/repoll hrtimer and the handle of its current expiry (dropping it
     // cancels the expiry; see `Shared::rearm`). ---
     #[pin]
@@ -278,6 +287,10 @@ impl_has_delayed_work! {
 
 impl_has_work! {
     impl HasWork<Shared, FAST_POLL_WORK> for Shared { self.fast_poll }
+}
+
+impl_has_work! {
+    impl HasWork<Shared, SCRUB_WORK> for Shared { self.scrub_work }
 }
 
 impl WorkItem<POLL_WORK> for Shared {
@@ -299,6 +312,13 @@ impl WorkItem<FAST_POLL_WORK> for Shared {
             return;
         }
         this.run_poll();
+    }
+}
+
+impl WorkItem<SCRUB_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        this.run_scrubs();
     }
 }
 
@@ -485,6 +505,7 @@ impl Gpu {
         // the platform-device field. Retain the typed DRM device before that point.
         let drm_device: ARef<AsahiDrmDevice> = dev.into();
         let events = OwnedQueue::new_percpu_reclaim(c_str!("aurora_g16_events"), true)?;
+        let scrub_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_scrub"), false)?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 dev: dev.as_ref().as_ref().into(),
@@ -513,9 +534,12 @@ impl Gpu {
                 sleep_ps: AtomicU32::new(0),
                 sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
                 events,
+                scrub_wq,
                 orphan <- new_mutex!(None, "g16::Shared::orphan"),
                 poll <- new_delayed_work!("g16::Shared::poll"),
                 fast_poll <- new_work!("g16::Shared::fast_poll"),
+                scrub_queue <- new_spinlock!(slots::ScrubQueue::new(), "g16::Shared::scrub_queue"),
+                scrub_work <- new_work!("g16::Shared::scrub_work"),
                 resnap <- HrTimer::new(),
                 resnap_handle <- new_mutex!(None, "g16::Shared::resnap_handle"),
                 state <- new_mutex!(None, "g16::Shared::state"),

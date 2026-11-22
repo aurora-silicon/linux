@@ -38,7 +38,7 @@ use super::fw::work::compute;
 use super::job::{self, Completions, Job};
 use super::recovery::logic::Retirement;
 use super::regs::EngineState;
-use super::{params, Firmware, Shared, FAST_POLL_WORK, POLL_WORK};
+use super::{params, Firmware, Shared, FAST_POLL_WORK, POLL_WORK, SCRUB_WORK};
 use crate::module_parameters;
 
 /// Cadence of periodic housekeeping (power governor, window health, administrative hang check).
@@ -145,13 +145,13 @@ impl Shared {
                         self.fail_stop(error);
                     }
                 }
-                let allow_stage = firmware.recovery.failed().is_none() && !firmware.engine.frozen;
+                let allow_stage = firmware.recovery.failed().is_none()
+                    && !firmware.engine.frozen
+                    && !self.sleeping.load(Ordering::Acquire);
                 scrubs = firmware.slots.stage_and_take_scrubs(allow_stage);
             }
             job::complete_all(done);
-            if scrubs.run() {
-                self.poll_now();
-            }
+            self.enqueue_scrubs(scrubs);
             if !retry_tail {
                 break;
             }
@@ -275,13 +275,13 @@ impl Shared {
             let mut state = self.state.lock();
             let firmware = state.as_deref_mut().ok_or(ENODEV)?;
             let res = self.submit_locked(firmware, job, &mut done);
-            let allow_stage = firmware.recovery.failed().is_none() && !firmware.engine.frozen;
+            let allow_stage = firmware.recovery.failed().is_none()
+                && !firmware.engine.frozen
+                && !self.sleeping.load(Ordering::Acquire);
             (res, firmware.slots.stage_and_take_scrubs(allow_stage))
         };
         job::complete_all(done);
-        if scrubs.run() {
-            self.poll_now();
-        }
+        self.enqueue_scrubs(scrubs);
         drop(signalling);
         self.notify_wedged();
         accepted
@@ -306,8 +306,9 @@ impl Shared {
             match state.as_deref_mut() {
                 Some(firmware) => {
                     let res = self.submit_locked(firmware, job, &mut done);
-                    let allow_stage =
-                        firmware.recovery.failed().is_none() && !firmware.engine.frozen;
+                    let allow_stage = firmware.recovery.failed().is_none()
+                        && !firmware.engine.frozen
+                        && !self.sleeping.load(Ordering::Acquire);
                     scrubs = firmware.slots.stage_and_take_scrubs(allow_stage);
                     res
                 }
@@ -315,12 +316,47 @@ impl Shared {
             }
         };
         job::complete_all(done);
-        if scrubs.run() {
-            self.poll_now();
-        }
+        self.enqueue_scrubs(scrubs);
         drop(signalling);
         self.notify_wedged();
         Some(accepted)
+    }
+
+    /// Hands staged displaced pass scrubs to the dedicated unbound scrub workqueue so SUBMIT
+    /// and completion polling never stall on write-combining zeroing.
+    pub(crate) fn enqueue_scrubs(self: &Arc<Self>, batch: super::slots::ScrubBatch) {
+        if batch.is_empty() {
+            return;
+        }
+        let mut queue = self.scrub_queue.lock();
+        if self.sleeping.load(Ordering::Acquire) {
+            drop(queue);
+            drop(batch);
+            return;
+        }
+        if queue.push_batch(batch) {
+            // Queue under `scrub_queue` so `sleep.rs::join_workers()` cannot overlap
+            // `scrub_wq.drain()` with a concurrent enqueue once `sleeping` is set.
+            let _ = self
+                .scrub_wq
+                .enqueue::<Arc<Shared>, SCRUB_WORK>(self.clone());
+        }
+    }
+
+    /// Drains queued displaced pass scrubs on the dedicated unbound scrub workqueue.
+    pub(crate) fn run_scrubs(self: &Arc<Self>) {
+        loop {
+            let Some(mut item) = self.scrub_queue.lock().pop() else {
+                break;
+            };
+            if self.sleeping.load(Ordering::Acquire) {
+                drop(item);
+                break;
+            }
+            if item.run_one() && !self.sleeping.load(Ordering::Acquire) {
+                self.poll_now();
+            }
+        }
     }
 
     /// Deliver userspace notification outside the device mutex and fence completion path.
