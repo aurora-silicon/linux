@@ -36,6 +36,7 @@ const VERTEX_SCRATCH: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_VERTEX
 const PROCESS_EMPTY_TILES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
 const RSRC_SPEC_HI: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_RSRC_SPEC_HI;
 const DBIAS_IS_INT: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT;
+const FEW_PRIMITIVES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES;
 const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
 const STAGE_PREFIXES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
 const COMPUTE_NO_QUERY_ACCESS: u32 =
@@ -530,6 +531,7 @@ fn validate_render_entry(
     // M4 HAL200 resource words carry all four high halves.
     let allowed = PROCESS_EMPTY_TILES
         | DBIAS_IS_INT
+        | FEW_PRIMITIVES
         | RSRC_SPEC_HI
         | if early_tiling {
             FRAGMENT_BARRIERS | STAGE_PREFIXES
@@ -871,6 +873,7 @@ fn check_render(
     let allowed = PROCESS_EMPTY_TILES
         | RSRC_SPEC_HI
         | DBIAS_IS_INT
+        | FEW_PRIMITIVES
         | if super::params::early_tiling() {
             FRAGMENT_BARRIERS | STAGE_PREFIXES
         } else {

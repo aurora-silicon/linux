@@ -432,7 +432,7 @@ fn g16_stage_prefixes_v2_framing_and_tiling_narrowing() {
 }
 #[test]
 fn unsupported_flags_and_compute_fields() {
-    for flag in [1u32,4,1<<19,FRAGMENT_BARRIERS] {
+    for flag in [1u32,4,1<<21,FRAGMENT_BARRIERS] {
         let mut r=render(); r.flags=flag;
         assert!(check_stream(&entry(CMD_RENDER,&data(&r)[..256],[NONE;2]),false).is_err());
     }
@@ -630,9 +630,9 @@ mod inline_submit_containers {
 }
 mod render_admission_tests {
     use super::{
-        check_render_helpers, hw, uapi, Result, DBIAS_IS_INT, EINVAL, FRAGMENT_BARRIERS,
-        MAX_DIMENSION, MAX_LAYERS, MAX_TILE_BUFFER, PROCESS_EMPTY_TILES, RSRC_SPEC_HI,
-        STAGE_PREFIXES, ZLS_METADATA_STRIDE,
+        check_render_helpers, hw, uapi, Result, DBIAS_IS_INT, EINVAL, FEW_PRIMITIVES,
+        FRAGMENT_BARRIERS, MAX_DIMENSION, MAX_LAYERS, MAX_TILE_BUFFER, PROCESS_EMPTY_TILES,
+        RSRC_SPEC_HI, STAGE_PREFIXES, ZLS_METADATA_STRIDE,
     };
     const ENOENT: i32 = -2;
     const EACCES: i32 = -13;
@@ -853,6 +853,38 @@ mod render_admission_tests {
         assert_eq!(check_render(&mut batch, &ctx, &base_cmd(), &[], &[]), Ok(()));
         assert_eq!(check_render(&mut batch, &ctx, &bad_ro, &[], &[]), Ok(()));
         assert_eq!(batch.flush(&vm), Err(EACCES));
+    }
+
+    #[test]
+    fn few_primitives_flag_admitted_in_parse_and_render_check() {
+        let vm = base_vm();
+        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        let mut r = super::render();
+        r.flags = FEW_PRIMITIVES;
+        assert!(super::check_stream(
+            &super::entry(super::CMD_RENDER, &super::data(&r)[..256], [super::NONE; 2]),
+            false,
+        )
+        .is_ok());
+        assert!(super::check_stream(
+            &super::entry(super::CMD_RENDER, &super::data(&r)[..256], [super::NONE; 2]),
+            true,
+        )
+        .is_ok());
+        r.flags = FEW_PRIMITIVES | DBIAS_IS_INT;
+        assert!(super::check_stream(
+            &super::entry(super::CMD_RENDER, &super::data(&r)[..256], [super::NONE; 2]),
+            false,
+        )
+        .is_ok());
+        let mut cmd = base_cmd();
+        cmd.flags |= FEW_PRIMITIVES;
+        assert_eq!(check_render_one(&ctx, &cmd, &[], &[]), Ok(()));
+        cmd.isp_dbias_base = BASE_GVA + 0x200;
+        cmd.flags |= DBIAS_IS_INT;
+        assert_eq!(check_render_one(&ctx, &cmd, &[], &[]), Ok(()));
+        cmd.flags |= 1 << 21;
+        assert_eq!(check_render_one(&ctx, &cmd, &[], &[]), Err(EINVAL));
     }
 }
 '''
