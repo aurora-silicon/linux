@@ -168,6 +168,8 @@ pub mod g16 {
         }
         pub struct RenderArena{pub passes:KVec<super::slots::PassSlot>,pub tpc_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS],pub tilemap_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS]}
         impl RenderArena{ __SET_DIRTY__ }
+        pub(crate) const BASE_RENDER_SLOTS: usize = super::hw::sizes::BASE_RENDER_SLOTS;
+        __RENDER_BURST__
     }
     pub mod boot {pub fn eproto()->crate::Error{crate::Error(71)}}
     // Arenas here have the two base units.
@@ -997,6 +999,43 @@ pub mod g16 {
         assert!(!pools.retired_at(0,6).unwrap());
     }
 
+    #[test]fn render_burst_expands_on_overlap_multipass_or_sub2ms_burst_not_steady_60_120fps(){
+        use crate::g16::resources::should_expand_render_ext;
+        // Steady 60 fps (16.67 ms) and 120 fps (8.33 ms) single-pass depth-1 clients
+        // finish each frame before the next arrives (active_renders == 0) and stay on
+        // the two base pass slots without allocating RenderExtArena.
+        for period_ns in [16_666_667u64, 8_333_333u64] {
+            let mut last = 0u64;
+            let mut burst = 0u32;
+            for step in 1u64..=10 {
+                assert!(!should_expand_render_ext(&mut last, &mut burst, step * period_ns, 1, 0));
+                assert_eq!(burst, 0);
+            }
+        }
+
+        // Heavy multi-ms pipelined renders (e.g. 5 ms and 16.6 ms apart) overlap an
+        // already-active render (active_renders >= 1) and expand immediately.
+        let mut last = 0u64;
+        let mut burst = 0u32;
+        assert!(!should_expand_render_ext(&mut last, &mut burst, 1_000_000, 1, 0));
+        assert!(should_expand_render_ext(&mut last, &mut burst, 6_000_000, 1, 1));
+        assert!(should_expand_render_ext(&mut last, &mut burst, 22_600_000, 1, 1));
+
+        // Sub-2 ms back-to-back single-pass bursts still expand after 3 consecutive gaps.
+        let mut last = 0u64;
+        let mut burst = 0u32;
+        assert!(!should_expand_render_ext(&mut last, &mut burst, 1_000_000, 1, 0));
+        assert!(!should_expand_render_ext(&mut last, &mut burst, 2_000_000, 1, 0));
+        assert!(!should_expand_render_ext(&mut last, &mut burst, 3_000_000, 1, 0));
+        assert!(should_expand_render_ext(&mut last, &mut burst, 4_000_000, 1, 0));
+        assert_eq!(burst, 3);
+
+        // A single multi-pass SUBMIT with >= BASE_RENDER_SLOTS (2) renders expands immediately.
+        let mut last = 0u64;
+        let mut burst = 0u32;
+        assert!(should_expand_render_ext(&mut last, &mut burst, 100_000_000, 2, 0));
+    }
+
 }
 '''
 budget=(production/'budget.rs').read_text()
@@ -1024,7 +1063,12 @@ budget += r'''
 '''
 source=source.replace('__BUDGET__',budget.replace('//!','//'))
 source = source.replace('__LIVE_TOKEN__' ,item((production/'vm.rs').read_text(),'pub(crate) struct LiveToken')).replace('__LIVE_DROP__',item((production/'vm.rs').read_text(),'impl Drop for LiveToken'))
-source = source.replace('__CMD_CLASSES__',item(graph_source,'pub(crate) const fn cmd_fw(')+'\n'+item(graph_source,'pub(crate) const fn cmd_shared(')).replace('__SET_DIRTY__',item((production/'resources.rs').read_text(),'pub(crate) fn set_dirty('))
+resources_source = (production/'resources.rs').read_text()
+render_burst_lines = '\n'.join(
+    line for line in resources_source.splitlines()
+    if line.startswith(('const BURST_SUBMITS:', 'const BURST_GAP_NS:', 'const RENDER_BURST_COMMANDS:'))
+) + '\npub(crate) ' + item(resources_source, 'fn should_expand_render_ext(')
+source = source.replace('__CMD_CLASSES__',item(graph_source,'pub(crate) const fn cmd_fw(')+'\n'+item(graph_source,'pub(crate) const fn cmd_shared(')).replace('__SET_DIRTY__',item(resources_source,'pub(crate) fn set_dirty(')).replace('__RENDER_BURST__', render_burst_lines)
 source = source.replace('__ALLOC__',item(graph_source,'pub(crate) fn alloc(')).replace('__ALLOC_WORK__',item(graph_source,'pub(crate) fn alloc_work('))
 source = source.replace('__HW__','\n'.join(module(hw,n) for n in ('client','sizes','engine','tuning','pte'))).replace('__ROOT__',str(production)).replace('__PRIVATE_RW__',hex(private_rw)+'u64').replace('__CLIENT__', '#[derive(Copy,Clone)]\n'+item(graph_source, 'pub(crate) struct Client {')+'\n'+item(graph_source, 'impl Client {'))
 (out/'check-resources.rs').write_text(source)
@@ -1041,7 +1085,7 @@ for command in [
         raise SystemExit(result.returncode)
 files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs']
 (out/'resource-host.json').write_text(json.dumps({
-    'result': 'pass', 'tests': 27,
+    'result': 'pass', 'tests': 28,
     'scope': 'Actual production allocation, initialization and lifetime code against a CPU-only backing recorder; no hardware qualification.',
     'private_rw_pte': hex(private_rw),
     'private_rw_reference': 'Qualified J713 NC read/write leaf attributes',

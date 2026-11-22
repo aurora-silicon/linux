@@ -80,10 +80,38 @@ impl ComputeArena {
 }
 
 /// Render pass slots every VM gets with its first render command; extension slots
-/// (`BASE_RENDER_SLOTS..hw::sizes::RENDER_SLOTS`) are added lazily once it submits renders
-/// back to back.
+/// (`BASE_RENDER_SLOTS..hw::sizes::RENDER_SLOTS`) are added lazily once the VM actually
+/// pipelines renders or submits a multi-pass/burst frame.
 pub(crate) const BASE_RENDER_SLOTS: usize = super::hw::sizes::BASE_RENDER_SLOTS;
 const EXT_RENDER_SLOTS: usize = super::hw::sizes::RENDER_SLOTS - BASE_RENDER_SLOTS;
+/// Single-submission render command count that expands extension slots immediately:
+/// `BASE_RENDER_SLOTS` holds only one active render once displacement occupies a slot.
+const RENDER_BURST_COMMANDS: usize = BASE_RENDER_SLOTS;
+
+/// Updates the consecutive-render burst counter and reports whether this submission
+/// qualifies to allocate extension pass slots (`RenderExtArena`).
+///
+/// Steady 60/120 Hz single-pass depth-1 clients finish each frame before the next arrives
+/// (`active_renders == 0`, `render_count == 1`, inter-frame gap >= `BURST_GAP_NS`) and stay
+/// on the two base pass slots. Extension slots allocate when a VM actually overlaps an
+/// in-flight render (`active_renders != 0`, including multi-ms 1080p/4K pipelined frames),
+/// submits a multi-pass command stream (`render_count >= BASE_RENDER_SLOTS`), or sustains a
+/// sub-2 ms back-to-back burst.
+fn should_expand_render_ext(
+    last_render_ns: &mut u64,
+    render_burst: &mut u32,
+    now: u64,
+    render_count: usize,
+    active_renders: u32,
+) -> bool {
+    *render_burst = if *last_render_ns != 0 && now.wrapping_sub(*last_render_ns) < BURST_GAP_NS {
+        render_burst.saturating_add(1)
+    } else {
+        0
+    };
+    *last_render_ns = now;
+    active_renders != 0 || *render_burst >= BURST_SUBMITS || render_count >= RENDER_BURST_COMMANDS
+}
 
 pub(crate) struct RenderArena(crate::cleanup::Deferred<RenderInner>);
 impl core::ops::Deref for RenderArena {
@@ -243,6 +271,8 @@ pub(crate) struct Cache {
     standby_available: CondVar,
     /// The VM's client closed: no arena or surplus spare is kept here any more.
     closed: AtomicBool,
+    /// Prepared render jobs on this VM that have not yet retired and dropped.
+    active_renders: AtomicU32,
     pub(crate) factory: Factory,
     bind: mmu::VmBind,
     live: Arc<super::vm::LiveToken>,
@@ -268,6 +298,7 @@ impl Cache {
             ),
             standby_available <- new_condvar!(),
             closed: AtomicBool::new(false),
+            active_renders: AtomicU32::new(0),
             factory, bind, live, budget }),
             GFP_KERNEL,
         )
@@ -457,17 +488,17 @@ impl Cache {
                 if ready.render_ext.is_none() && EXT_RENDER_SLOTS != 0 {
                     // SAFETY: ktime_get has no preconditions.
                     let now = unsafe { kernel::bindings::ktime_get() } as u64;
-                    ready.render_burst = if now.wrapping_sub(ready.last_render_ns) < BURST_GAP_NS {
-                        ready.render_burst.saturating_add(1)
-                    } else {
-                        0
-                    };
-                    ready.last_render_ns = now;
-                    if ready.render_burst >= BURST_SUBMITS
-                        || render_count as usize >= BURST_COMMANDS
-                    {
+                    let state = &mut *ready;
+                    let active = self.active_renders.load(Ordering::Acquire);
+                    if should_expand_render_ext(
+                        &mut state.last_render_ns,
+                        &mut state.render_burst,
+                        now,
+                        render_count as usize,
+                        active,
+                    ) {
                         // Best effort: without extension slots the VM keeps two base pass slots.
-                        ready.render_ext =
+                        state.render_ext =
                             RenderExtArena::new(&self.factory, &self.bind, &vm.vm, &self.live).ok();
                     }
                 }
@@ -563,13 +594,19 @@ impl Cache {
             }
             return Err(EIO);
         }
+        let cache = if render_count != 0 {
+            self.active_renders.fetch_add(1, Ordering::AcqRel);
+            Some(self.clone())
+        } else {
+            None
+        };
         Ok(Prepared {
             compute,
             compute_ext,
             render: render_arena,
             render_ext,
             unpublished_renders: AtomicU32::new(render_count),
-            cache: (render_count != 0).then(|| self.clone()),
+            cache,
         })
     }
 }
@@ -593,6 +630,8 @@ impl Drop for Prepared {
         let Some(cache) = self.cache.take() else {
             return;
         };
+        let previous = cache.active_renders.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0);
         let remaining = self.unpublished_renders.swap(0, Ordering::AcqRel);
         cache.release_reserved(remaining);
     }
