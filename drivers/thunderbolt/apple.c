@@ -4650,13 +4650,17 @@ static int apple_cio_probe(struct platform_device *pdev)
 			acio->router_ap_fw_tunable =
 				devm_apple_tunable_parse(dev, acio->np,
 							 "apple,tunable-router-ap-fw", ap_fw);
-			if (IS_ERR(acio->router_ap_fw_tunable)) {
-				if (PTR_ERR(acio->router_ap_fw_tunable) != -ENOENT)
-					return dev_err_probe(dev,
-							PTR_ERR(acio->router_ap_fw_tunable),
-							"Unable to load router AP firmware tunable\n");
-				acio->router_ap_fw_tunable = NULL;
-			}
+			/*
+			 * The bootloader copies this tuning from the machine. Without it
+			 * the router would run untuned, so a loader that left it out fails
+			 * the probe, like a missing RC tuning.
+			 */
+			if (PTR_ERR_OR_ZERO(acio->router_ap_fw_tunable) == -ENOENT)
+				return dev_err_probe(dev, -EINVAL,
+						     "Missing bootloader router AP firmware tuning\n");
+			if (IS_ERR(acio->router_ap_fw_tunable))
+				return dev_err_probe(dev, PTR_ERR(acio->router_ap_fw_tunable),
+						     "Unable to load router AP firmware tunable\n");
 		}
 	}
 
