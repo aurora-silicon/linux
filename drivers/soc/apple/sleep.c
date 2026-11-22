@@ -3427,7 +3427,16 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 
 	sleep_note(s, 0x28);
 	/* A dry run, which stops right after this, writes no power word (as in b27). */
-	return apple_sleep_lower_stray(s, apple_sleep_dry(s));
+	{
+		int ret = apple_sleep_lower_stray(s, apple_sleep_dry(s));
+		unsigned int i;
+
+		/* TRIAL ONLY (not for #2572): the stray words as they read after the step. */
+		for (i = 0; i < s->soc->nstray; i++)
+			dev_info(s->dev, "TRIAL stray after the step: %s %#x\n", s->soc->stray[i].name,
+				 readl(sleep_power_reg(s, s->soc->stray[i].offset)));
+		return ret;
+	}
 }
 
 static void sleep_wake_arm(struct apple_sleep *s)
