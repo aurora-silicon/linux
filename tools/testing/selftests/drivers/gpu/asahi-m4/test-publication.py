@@ -43,6 +43,14 @@ max_queues_line = next(line for line in hw_src.splitlines() if 'const MAX_QUEUES
 flights_line = next(line for line in hw_src.splitlines() if 'const FLIGHTS:' in line)
 assert 'const COMPUTE_SLOTS: usize = COMPUTE_UNITS;' in hw_src
 assert 'const HORIZON_JOBS: u32 = COMPUTE_UNITS as u32;' in hw_src
+prefix_render_fn = item('fn prefix_render(')
+prefix_compute_fn = item('fn prefix_compute(')
+assert 'let render_bar = BarrierType::from_stamp_only(!init_buffer);' in prefix_render_fn
+assert prefix_render_fn.count('render_bar,') == 2, prefix_render_fn
+assert 'p.compute_barrier.write(0, &cbar)?;' in prefix_render_fn
+assert 'BarrierType::Hold,' in prefix_render_fn[prefix_render_fn.index('wait_compute'):prefix_render_fn.index('p.compute_barrier.write')]
+assert 'BarrierType::Stamp,' in prefix_render_fn[prefix_render_fn.index('let own = encode::barrier'):prefix_render_fn.index('p.own_barrier.write')]
+assert 'BarrierType::Hold,' in prefix_compute_fn[prefix_compute_fn.index('wait_render'):prefix_compute_fn.index('s.barrier.write')]
 
 
 harness = r'''

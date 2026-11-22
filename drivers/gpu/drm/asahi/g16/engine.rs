@@ -1997,6 +1997,11 @@ impl Firmware {
             .is_some_and(|o| o.wait_through[super::command::RENDER].is_none());
         let early = class_behind && params::early_tiling() && (frag_only || no_render_barrier);
         if class_behind {
+            // Pipelined same-VM non-InitBM render->render barriers wait on the producer's
+            // firmware stamp only (type 0), matching `own_barrier` and G15's
+            // `RENDER_INTERNAL_HOLD = 0`, so consecutive TA/FS stages hand off without a
+            // software-job hold bubble. Cross-engine barriers (`fs2c`/`c2ta`) stay `Hold`.
+            let render_bar = BarrierType::from_stamp_only(!init_buffer);
             let (wait_va, wait_stamp, wait_event) = if early {
                 (r.fw_stamp[0].va, self.engine.ta_target, 0x70)
             } else {
@@ -2008,7 +2013,7 @@ impl Firmware {
                 wait_event,
                 target,
                 work::barrier::RENDER_WAIT_UUID,
-                BarrierType::Hold,
+                render_bar,
             );
             p.prev_barrier.write(0, &prev)?;
             r.ring[0].w64(8 * pf.ta_head as usize, p.prev_barrier.va)?;
@@ -2020,7 +2025,7 @@ impl Firmware {
                     0x71,
                     target,
                     work::barrier::RENDER_WAIT_UUID,
-                    BarrierType::Hold,
+                    render_bar,
                 );
                 p.fs_dep.write(0, &dep)?;
                 r.ring[1].w64(8 * pf.fs_head as usize, p.fs_dep.va)?;
