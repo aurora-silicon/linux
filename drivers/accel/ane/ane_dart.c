@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2026 Joshua Warren */
 
+#include <kunit/visibility.h>
 #include <linux/interrupt.h>
 #include <linux/gfp.h>
 #include <linux/io.h>
@@ -171,6 +172,17 @@ bool ane_dart_faulted(struct ane_device *ane, u64 *iova, u32 *status)
 }
 
 /*
+ * The scratch page is mapped read-write for the job that faulted, and
+ * the job's output can carry what it reads from there: hand it out
+ * zeroed.
+ */
+VISIBLE_IF_KUNIT struct page *ane_dart_alloc_scratch_page(void)
+{
+	return alloc_page(GFP_KERNEL | __GFP_ZERO);
+}
+EXPORT_SYMBOL_IF_KUNIT(ane_dart_alloc_scratch_page);
+
+/*
  * A fault is a missing PTE, nothing more: the page tables are provider
  * owned and unchanged, so the stream-restore apple-dart uses at reset
  * time is the wrong tool mid-job (register surgery while the faulting
@@ -201,7 +213,7 @@ int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova,
 	u64 iova;
 	int ret, i;
 
-	page = alloc_page(GFP_KERNEL);
+	page = ane_dart_alloc_scratch_page();
 	if (!page)
 		return -ENOMEM;
 	iova = fault_iova & ~((1ULL << ane->shift) - 1);

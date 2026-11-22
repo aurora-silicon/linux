@@ -227,6 +227,7 @@ static inline bool ane_tm_failure_recoverable(bool tm_retention,
 #if IS_ENABLED(CONFIG_KUNIT)
 u64 ane_bo_iova_size(u32 npages, unsigned int shift);
 int ane_bo_check_size(u64 size, u64 iova_span);
+struct page *ane_dart_alloc_scratch_page(void);
 int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
 			   size_t btsp_size);
 #endif

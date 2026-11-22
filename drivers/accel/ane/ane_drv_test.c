@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * KUnit tests for the buffer size checks of DRM_IOCTL_ANE_SUBMIT and
- * DRM_IOCTL_ANE_BO_INIT.
+ * DRM_IOCTL_ANE_BO_INIT, and the fault-drain scratch page.
  */
 
 #include <kunit/test.h>
+#include <linux/gfp.h>
+#include <linux/highmem.h>
+#include <linux/mm.h>
 #include <linux/sizes.h>
 
 #include "ane.h"
@@ -190,9 +193,48 @@ static void ane_bo_check_size_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_bo_check_size(c->size, c->span), c->ret);
 }
 
+/*
+ * The fault-drain scratch page is readable by the job that faulted.
+ * Dirty some pages and give them back to the allocator first, so an
+ * unzeroed allocation would very likely hand one of them out again
+ * (likely, not certain: the allocator may pick other pages).
+ */
+#define ANE_TEST_SCRATCH_PAGES 16
+
+static void ane_dart_scratch_page_zeroed_test(struct kunit *test)
+{
+	struct page *pages[ANE_TEST_SCRATCH_PAGES];
+	int i;
+
+	/* The allocator zeroes every page itself: nothing to tell apart. */
+	if (want_init_on_alloc(GFP_KERNEL))
+		kunit_skip(test, "init_on_alloc zeroes every page");
+
+	for (i = 0; i < ARRAY_SIZE(pages); i++) {
+		pages[i] = alloc_page(GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, pages[i]);
+		memset(page_address(pages[i]), 0xa5, PAGE_SIZE);
+	}
+	for (i = 0; i < ARRAY_SIZE(pages); i++)
+		__free_page(pages[i]);
+
+	for (i = 0; i < ARRAY_SIZE(pages); i++) {
+		pages[i] = ane_dart_alloc_scratch_page();
+		KUNIT_ASSERT_NOT_NULL(test, pages[i]);
+	}
+	for (i = 0; i < ARRAY_SIZE(pages); i++) {
+		KUNIT_EXPECT_TRUE_MSG(test,
+				      !memchr_inv(page_address(pages[i]), 0,
+						  PAGE_SIZE),
+				      "scratch page %d is not zeroed", i);
+		__free_page(pages[i]);
+	}
+}
+
 static struct kunit_case ane_bo_test_cases[] = {
 	KUNIT_CASE(ane_bo_iova_size_test),
 	KUNIT_CASE_PARAM(ane_bo_check_size_test, ane_bo_size_gen_params),
+	KUNIT_CASE(ane_dart_scratch_page_zeroed_test),
 	{}
 };
 
