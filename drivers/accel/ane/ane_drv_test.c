@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * KUnit tests for the buffer size checks of DRM_IOCTL_ANE_SUBMIT.
+ * KUnit tests for the buffer size checks of DRM_IOCTL_ANE_SUBMIT and
+ * DRM_IOCTL_ANE_BO_INIT.
  */
 
 #include <kunit/test.h>
@@ -145,7 +146,63 @@ static struct kunit_suite ane_recovery_test_suite = {
 	.test_cases = ane_recovery_test_cases,
 };
 
-kunit_test_suites(&ane_submit_test_suite, &ane_recovery_test_suite);
+/* BO_INIT: the reservation and the map must agree for any page count. */
+static void ane_bo_iova_size_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, ane_bo_iova_size(1, 14), (u64)SZ_16K);
+	KUNIT_EXPECT_EQ(test, ane_bo_iova_size(0x3ffff, 14),
+			(u64)SZ_4G - SZ_16K);
+	KUNIT_EXPECT_EQ(test, ane_bo_iova_size(0x40000, 14), (u64)SZ_4G);
+	KUNIT_EXPECT_EQ(test, ane_bo_iova_size(0x40001, 14),
+			(u64)SZ_4G + SZ_16K);
+	KUNIT_EXPECT_EQ(test, ane_bo_iova_size(U32_MAX, 12),
+			(u64)U32_MAX << 12);
+}
+
+struct ane_bo_size_case {
+	const char *desc;
+	u64 size;
+	u64 span;
+	int ret;
+};
+
+/* The H13 allocator range: one page above zero up to 4 GiB. */
+#define ANE_TEST_SPAN ((u64)SZ_4G - PAGE_SIZE)
+
+static const struct ane_bo_size_case ane_bo_size_cases[] = {
+	{ "zero bytes", 0, ANE_TEST_SPAN, -EINVAL },
+	{ "one byte", 1, ANE_TEST_SPAN, 0 },
+	{ "the whole range", ANE_TEST_SPAN, ANE_TEST_SPAN, 0 },
+	{ "one byte past the range", ANE_TEST_SPAN + 1, ANE_TEST_SPAN, -E2BIG },
+	{ "4 GiB", SZ_4G, ANE_TEST_SPAN, -E2BIG },
+	{ "4 GiB and one page", (u64)SZ_4G + PAGE_SIZE, ANE_TEST_SPAN, -E2BIG },
+	{ "page count past u32", (u64)PAGE_SIZE << 32, ANE_TEST_SPAN, -E2BIG },
+	{ "largest u64", U64_MAX, ANE_TEST_SPAN, -E2BIG },
+	{ "rounds up past a smaller range", SZ_16K + 1, SZ_16K + 1, -E2BIG },
+};
+
+KUNIT_ARRAY_PARAM_DESC(ane_bo_size, ane_bo_size_cases, desc);
+
+static void ane_bo_check_size_test(struct kunit *test)
+{
+	const struct ane_bo_size_case *c = test->param_value;
+
+	KUNIT_EXPECT_EQ(test, ane_bo_check_size(c->size, c->span), c->ret);
+}
+
+static struct kunit_case ane_bo_test_cases[] = {
+	KUNIT_CASE(ane_bo_iova_size_test),
+	KUNIT_CASE_PARAM(ane_bo_check_size_test, ane_bo_size_gen_params),
+	{}
+};
+
+static struct kunit_suite ane_bo_test_suite = {
+	.name = "ane-bo",
+	.test_cases = ane_bo_test_cases,
+};
+
+kunit_test_suites(&ane_submit_test_suite, &ane_recovery_test_suite,
+		  &ane_bo_test_suite);
 
 MODULE_DESCRIPTION("KUnit tests for the Apple Neural Engine SUBMIT checks");
 MODULE_LICENSE("Dual MIT/GPL");

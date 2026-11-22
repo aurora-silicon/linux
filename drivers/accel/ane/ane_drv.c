@@ -115,6 +115,32 @@ static struct ane_bo *bo_lookup(struct drm_file *file, u32 handle)
 	return to_bo(gem);
 }
 
+/*
+ * The IOVA span of a buffer object. Computed in 64 bits: the reservation
+ * and the map must cover the same range for any page count.
+ */
+VISIBLE_IF_KUNIT u64 ane_bo_iova_size(u32 npages, unsigned int shift)
+{
+	return (u64)npages << shift;
+}
+EXPORT_SYMBOL_IF_KUNIT(ane_bo_iova_size);
+
+/*
+ * A buffer object must fit the device address range the allocator
+ * manages, or it can never be mapped. Refusing it before any page is
+ * allocated also keeps the page count within the u32 that the map
+ * paths use.
+ */
+VISIBLE_IF_KUNIT int ane_bo_check_size(u64 size, u64 iova_span)
+{
+	if (!size)
+		return -EINVAL;
+	if (size > iova_span || round_up(size, PAGE_SIZE) > iova_span)
+		return -E2BIG;
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(ane_bo_check_size);
+
 /* Unmap every valid PTE in [start, end) and return how many there were. */
 static unsigned long ane_iommu_clear_range(struct ane_device *ane, u64 start,
 					   u64 end)
@@ -145,7 +171,7 @@ static int ane_iommu_map_each(struct ane_device *ane, struct ane_bo *bo,
 	int err = 0;
 
 	for (u32 i = 0; i < bo->npages; i++) {
-		dma_addr_t iova = bo->iova + (i << ane->shift);
+		dma_addr_t iova = bo->iova + ((u64)i << ane->shift);
 		bool healed = false;
 
 retry:
@@ -168,12 +194,12 @@ retry:
 
 				unmapped = iommu_unmap(ane->domain,
 						       bo->iova +
-						       (i << ane->shift),
+						       ((u64)i << ane->shift),
 						       1UL << ane->shift);
 				if (unmapped != 1UL << ane->shift)
 					dev_err(ane->dev,
 						"rollback unmap short at %#llx: %zu\n",
-						bo->iova + (i << ane->shift),
+						bo->iova + ((u64)i << ane->shift),
 						unmapped);
 			}
 			break;
@@ -191,7 +217,7 @@ retry:
 static int ane_iommu_map_batch(struct ane_device *ane, struct ane_bo *bo,
 			       int prot)
 {
-	size_t size = (size_t)bo->npages << ane->shift;
+	size_t size = ane_bo_iova_size(bo->npages, ane->shift);
 	struct sg_table sgt;
 	unsigned long strays;
 	ssize_t mapped;
@@ -261,7 +287,7 @@ static int ane_iommu_map_pages(struct ane_device *ane, struct ane_bo *bo)
 
 	/* reserve area from ANE address space */
 	err = drm_mm_insert_node_generic(&ane->mm, bo->mm,
-					 bo->npages << ane->shift,
+					 ane_bo_iova_size(bo->npages, ane->shift),
 					 1UL << ane->shift, 0, 0);
 	if (err < 0) {
 		dev_err(ane->dev, "out of ANE space: %d\n", err);
@@ -300,7 +326,7 @@ static void ane_iommu_unmap_pages(struct ane_device *ane, struct ane_bo *bo)
 	list_del_init(&bo->node);
 	mutex_lock(&ane->iommu_lock);
 	for (u32 i = 0; i < bo->npages; i++) {
-		dma_addr_t iova = bo->iova + (i << ane->shift);
+		dma_addr_t iova = bo->iova + ((u64)i << ane->shift);
 		size_t unmapped = iommu_unmap(ane->domain, iova,
 					      1UL << ane->shift);
 
@@ -371,12 +397,12 @@ void ane_reclaim_preserved(struct ane_device *ane)
 			size_t unmapped;
 
 			unmapped = iommu_unmap(ane->domain,
-					       iova + (i << ane->shift),
+					       iova + ((u64)i << ane->shift),
 					       1UL << ane->shift);
 			if (unmapped != 1UL << ane->shift)
 				dev_err(ane->dev,
 					"preserved unmap short at %#llx: %zu\n",
-					iova + (i << ane->shift), unmapped);
+					iova + ((u64)i << ane->shift), unmapped);
 		}
 		drm_mm_remove_node(p->mm);
 		mutex_unlock(&ane->iommu_lock);
@@ -488,8 +514,11 @@ static int ane_bo_init(struct drm_device *drm, void *data,
 	struct ane_bo *bo;
 	int err;
 
-	if (args->pad || !args->size)
+	if (args->pad)
 		return -EINVAL;
+	err = ane_bo_check_size(args->size, ane->iova_span);
+	if (err)
+		return err;
 
 	bo = kzalloc_obj(*bo);
 	if (!bo)
@@ -1044,7 +1073,8 @@ static int ane_iommu_domain_init(struct ane_device *ane)
 		return -EINVAL;
 	ane->domain = domain;
 	ane->shift = PAGE_SHIFT;
-	drm_mm_init(&ane->mm, min_iova, limit - min_iova);
+	ane->iova_span = limit - min_iova;
+	drm_mm_init(&ane->mm, min_iova, ane->iova_span);
 
 	return 0;
 }

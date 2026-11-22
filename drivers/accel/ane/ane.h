@@ -46,6 +46,8 @@ struct ane_device {
 	void __iomem *ps;
 
 	struct drm_mm mm;
+	/* Size of the device address range that mm manages. */
+	u64 iova_span;
 	struct iommu_domain *domain;
 	unsigned long shift;
 	struct ane_dart {
@@ -223,6 +225,8 @@ static inline bool ane_tm_failure_recoverable(bool tm_retention,
 }
 
 #if IS_ENABLED(CONFIG_KUNIT)
+u64 ane_bo_iova_size(u32 npages, unsigned int shift);
+int ane_bo_check_size(u64 size, u64 iova_span);
 int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
 			   size_t btsp_size);
 #endif
