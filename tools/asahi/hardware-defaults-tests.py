@@ -17,7 +17,7 @@ NATIVE_DIRECTORIES = (
 )
 # Native options that stay off until their stated prerequisites ship; the fragment must say
 # so with "# CONFIG_<name> is not set".
-DELIBERATELY_OFF = {'MT7932_AWDL'}
+DELIBERATELY_OFF = {'MT7932_AWDL', 'APPLE_SOC_SLEEP_T8122'}
 BLOCK = re.compile(r'^(?:menuconfig|config) ([A-Z0-9_]+)\n(.*?)(?=^(?:menuconfig|config) |\Z)',
                    re.M | re.S)
 
