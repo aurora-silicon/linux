@@ -8,9 +8,10 @@
  * Linux demand:
  *
  *  - every sampling period, each cpufreq policy reports how busy its
- *    busiest CPU was and how fast the policy runs relative to its maximum;
- *    a busy policy requests a DCS and fabric state from a table indexed by
- *    that frequency quartile;
+ *    busiest CPU was, with time spent waiting for I/O counted as busy, and
+ *    how fast the policy runs relative to its maximum; a busy policy
+ *    requests a DCS and fabric state from a table indexed by that frequency
+ *    quartile;
  *  - each rail keeps its last request for a hold time after demand stops,
  *    then drops back to 0, so idle releases the floor.
  *
@@ -531,7 +532,13 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
 			continue;
 		}
 
-		idle = get_cpu_idle_time(cpu, &wall, 0);
+		/*
+		 * Time waiting for I/O counts as busy, as ondemand's io_is_busy
+		 * counts it: a CPU that drives I/O and waits for each completion
+		 * is mostly idle otherwise, and its transfers then run at the
+		 * lowest DRAM and fabric states.
+		 */
+		idle = get_cpu_idle_time(cpu, &wall, 1);
 		dw = wall - clpc->wall[cpu];
 		di = idle - clpc->idle[cpu];
 		valid = clpc->wall[cpu];
