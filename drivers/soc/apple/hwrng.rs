@@ -21,7 +21,12 @@ extern "C" {
     fn sep_hwrng_unregister(mem: *mut c_void);
 }
 
-pub(crate) const QUALITY: c_ushort = 1024;
+/// Bits of entropy credited per 1024 bits read. 1024 would claim that every
+/// bit is fully random, but there is no public analysis of the enclave's
+/// source or of how its firmware conditions it. 900 is the figure most SoC
+/// TRNG drivers declare without their own measurement (omap, stm32, mtk).
+/// An administrator can change it through hw_random's rng_quality.
+pub(crate) const QUALITY: c_ushort = 900;
 
 pub(crate) const NAME: &CStr = c"apple-sep";
 
