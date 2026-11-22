@@ -950,6 +950,29 @@ static void t8122_sleep_stopped(struct apple_sleep *s)
  * Past the last refusal, with the SEP and the GPU stopped: the count clears, the PMU's sleep
  * byte and both notify words, in the measured order. The PMP's stop follows, as measured.
  */
+/* TRIAL ONLY (not for #2572): an SPMI extended read of n (1..4) bytes (the diagnostic tree's). */
+static u32 t8122_trial_pmu_read(struct apple_sleep *s, u16 reg, unsigned int n)
+{
+	unsigned int tries, k;
+	u32 enable, w = 0;
+
+	enable = readl(s->spmi + SPMI_NOTIFY_ENABLE);
+	writel(enable & ~SPMI_NOTIFY_REPLY, s->spmi + SPMI_NOTIFY_ENABLE);
+	writel(((u32)reg << 16) | SPMI_CMD_ACTIVE | (0x38 | ((n) - 1)) |
+	       FIELD_PREP(SPMI_CMD_USID, s->soc->pmu_usid), s->spmi + SPMI_CMD);
+	for (k = 0; k < 2; k++) {
+		tries = 100000;
+		while ((readl(s->spmi + SPMI_STATUS) & SPMI_STATUS_RX_EMPTY) && --tries)
+			cpu_relax();
+		if (!tries)
+			break;
+		w = readl(s->spmi + SPMI_REPLY);
+	}
+	writel(1, s->spmi + SPMI_NOTIFY_ACK);
+	writel(enable, s->spmi + SPMI_NOTIFY_ENABLE);
+	return k == 2 ? w : 0xdead0000;
+}
+
 static void t8122_sleep_prepare_regs(struct apple_sleep *s)
 {
 	/* The driver's own arm, where the working SoCs run it: after the first stops. */
@@ -967,7 +990,11 @@ static void t8122_sleep_prepare_regs(struct apple_sleep *s)
 		writel(0, s->wdt + WDT_WD0_COUNT);
 		writel(0, s->wdt + WDT_WD1_COUNT);
 	}
+	dev_info(s->dev, "J613 TRIAL PMU %#x before the sleep byte: %#x\n", s->soc->pmu_sleep_reg,
+		 t8122_trial_pmu_read(s, s->soc->pmu_sleep_reg, 1));
 	t8122_pmu_write(s, s->soc->pmu_sleep_reg, s->soc->pmu_sleep_val);
+	dev_info(s->dev, "J613 TRIAL PMU %#x after writing %#x: %#x\n", s->soc->pmu_sleep_reg,
+		 s->soc->pmu_sleep_val, t8122_trial_pmu_read(s, s->soc->pmu_sleep_reg, 1));
 	t8122.notify_saved[0] = readl(s->spmi + SPMI_NOTIFY_ENABLE);
 	t8122.notify_saved[1] = readl(t8122.hpm_notify + SPMI_NOTIFY_ENABLE);
 	t8122.notify_staged = true;
@@ -1180,6 +1207,8 @@ static const struct apple_sleep_word t8122_trial_stray[] = {
 	{ "spi2", 0x2a8 }, { "qspi", 0x2c8 },
 	/* n105: the two macOS has at 4 (t8122_match's AUTO_IDLE write does not take), fully off */
 	{ "sio_cpu", 0x210 }, { "apcie_phy_sw", 0x4a0 },
+	/* n111: the two words macOS has off or at 4 that J613's ADT does not name */
+	{ "ps_0x1c8", 0x1c8 }, { "ps_0x1f8", 0x1f8 },
 };
 
 static const struct apple_sleep_soc t8122_sleep_soc = {
