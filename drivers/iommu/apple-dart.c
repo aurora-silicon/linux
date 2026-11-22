@@ -4588,6 +4588,7 @@ static void __apple_dart_fw_live_prot(struct apple_dart_master_cfg *cfg, struct 
 	phys_addr_t table;
 	u64 *root, span, base;
 	size_t entries;
+	bool four_level;
 	u32 ttbr;
 	int sid;
 
@@ -4604,10 +4605,10 @@ static void __apple_dart_fw_live_prot(struct apple_dart_master_cfg *cfg, struct 
 	if (pm_runtime_resume_and_get(dart->dev) < 0)
 		return;
 	ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, 0));
+	four_level = dart->hw->tcr_4level &&
+		     (apple_dart_readl(dart, DART_TCR(dart, sid)) & dart->hw->tcr_4level);
 	pm_runtime_put(dart->dev);
-	if (!(ttbr & dart->hw->ttbr_valid) ||
-	    (dart->hw->tcr_4level &&
-	     (apple_dart_readl(dart, DART_TCR(dart, sid)) & dart->hw->tcr_4level)))
+	if (!(ttbr & dart->hw->ttbr_valid) || four_level)
 		return;
 	ttbr &= ~dart->hw->ttbr_valid;
 	if (dart->hw->ttbr_addr_field_shift)
