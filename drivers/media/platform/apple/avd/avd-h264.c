@@ -854,6 +854,7 @@ static int avd_h264_realloc_slices(struct avd_ctx *ctx, size_t max_slices)
 
 	memcpy(ctx->job.segments, tmp,
 	       sizeof(*ctx->job.segments) * (ctx->job.num + 1));
+	ctx->job.max = alloc_slice_num + 1;
 	kvfree(tmp);
 
 	return 0;

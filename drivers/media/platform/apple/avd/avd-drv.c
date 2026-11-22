@@ -100,9 +100,11 @@ int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments)
 
 	job->codec = codec;
 	job->num = 0;
+	job->overflow = false;
 	/* A table that was built but never submitted still belongs to us. */
 	kvfree(job->segments);
 	job->segments = kvcalloc(segments, sizeof(*job->segments), GFP_KERNEL);
+	job->max = job->segments ? segments : 0;
 	if (!job->segments)
 		ret = -ENOMEM;
 	return ret;

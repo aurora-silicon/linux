@@ -302,7 +302,12 @@ struct avd_segment {
 
 struct avd_job {
 	enum avd_codec codec;
+	/* index of the segment being written */
 	size_t num;
+	/* segments allocated */
+	size_t max;
+	/* an instruction did not fit; the job must not be submitted */
+	bool overflow;
 	struct avd_segment *segments;
 };
 
