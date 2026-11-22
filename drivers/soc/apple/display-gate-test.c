@@ -158,6 +158,7 @@ struct gate_test {
 	bool requested, t6031_requested;
 	int t6031_switch;
 	const char *t6031_board;
+	const char *pmp_uuid;	/* the PMP image the values name: the fixture's unless set */
 };
 
 static struct device_node *__init gt_node(struct kunit *test, const char *path)
@@ -333,7 +334,7 @@ static void __init gt_expect_enabled(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, of_device_is_compatible(pmp, s->pmp_compat));
 	KUNIT_EXPECT_FALSE(test, of_device_is_available(pmp));
 	KUNIT_ASSERT_EQ(test, of_property_read_string(pmp, "apple,tunable-uuid", &uuid), 0);
-	KUNIT_EXPECT_STREQ(test, uuid, s->pmp_uuid);
+	KUNIT_EXPECT_STREQ(test, uuid, t->pmp_uuid);
 	KUNIT_EXPECT_TRUE(test, of_property_present(pmp, "apple,tunable-test"));
 	KUNIT_EXPECT_TRUE(test, of_property_present(pmp, "apple,board-id"));
 	KUNIT_EXPECT_TRUE(test, of_property_present(pmp, "apple,dram-vendor-id"));
@@ -404,6 +405,7 @@ static int __init gt_init(struct kunit *test, const struct gt_soc *s)
 		return -ENOMEM;
 	test->priv = t;
 	t->s = s;
+	t->pmp_uuid = s->pmp_uuid;
 	/* As the boot left them: the test kernel's command line sets neither. */
 	t->requested = gate_requested;
 	t->t6031_requested = gate_t6031_requested;
@@ -833,8 +835,10 @@ static void __init gate_t8122_t6031_pmp_image(struct kunit *test)
 /* The 27.2 (26B123) T8122 PMP image is taken as well. */
 static void __init gate_t8122_pmp_image_27_2(struct kunit *test)
 {
-	gt_set_string(test, gt_t8122.values, "apple,tunable-uuid",
-		      "C6CCB960-AC83-34A2-9493-C3131BD5AE4B");
+	struct gate_test *t = test->priv;
+
+	t->pmp_uuid = "C6CCB960-AC83-34A2-9493-C3131BD5AE4B";
+	gt_set_string(test, gt_t8122.values, "apple,tunable-uuid", t->pmp_uuid);
 	gt_run(test);
 	gt_expect_enabled(test);
 }
