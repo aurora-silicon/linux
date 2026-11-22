@@ -72,6 +72,8 @@ struct Inner {
     /// Recent measured render GPU time per pass by VM. Smoothed over batches;
     /// replacing the least recently measured VM does not retain its mappings.
     pass_cost: policy::PassCosts,
+    /// Measured GPU time per compute command, per VM (the compute twin of `pass_cost`).
+    compute_cost: policy::PassCosts,
     /// Latched only after the isolated InitBM draw fully retired.
     render_initialized: bool,
     config: Config,
@@ -231,8 +233,8 @@ impl Inner {
         for (packet,_) in entries {packet.finish(result);}
     }
     /// Choose the next batch from the front of `pending`: the front packet's next commands of
-    /// one engine, and for render also the leading render commands of following packets of the
-    /// same VM, up to the ordered-batch limit.
+    /// one engine, and the leading commands of that engine of following packets of the same VM,
+    /// up to the ordered-batch limit and the batch's GPU-time budget.
     fn next_batch(&self,max:usize)->Result<KVec<(Arc<crate::m3::m3_submit::Packet>,usize)>> {
         let mut entries=KVec::new();
         let Some((packet,next))=self.pending.first() else {return Ok(entries);};
@@ -256,17 +258,17 @@ impl Inner {
                 .clamp(1,crate::m3::m3_compute_storage::SLOTS)
         };
         let same_engine=|c:&crate::m3::m3_submit::Command| render==matches!(c,crate::m3::m3_submit::Command::Render{..});
-        let per_pass=self.pass_cost.get(packet.vm.id());
+        let per_pass=if render {self.pass_cost.get(packet.vm.id())} else {self.compute_cost.get(packet.vm.id())};
         let budget=crate::m3::m3_params::render_batch_budget_ns(self.device.soc());
         let in_flight:usize=self.active.iter().map(|b|b.entries.len()).sum();
         for (position,(candidate,start)) in self.pending.iter().enumerate() {
-            // Later packets join only render batches, only from their first command, and only
-            // for the VM the batch is bound to, while the batch's expected GPU time is within
-            // the budget.
-            if position>0 && !policy::may_join(render,*start,candidate.vm.same(&packet.vm),candidate.urgency==packet.urgency) {break;}
+            // Later packets join only from their first command, only for the VM the batch is
+            // bound to and at its urgency, while the batch's expected GPU time is within the
+            // budget. Each queued submission otherwise pays a full firmware round trip.
+            if position>0 && !policy::may_join(*start,candidate.vm.same(&packet.vm),candidate.urgency==packet.urgency) {break;}
             let mut index=*start;
             while index<candidate.commands.len() && entries.len()<limit && same_engine(&candidate.commands[index]) {
-                if render && !policy::within_budget(per_pass,budget,in_flight+entries.len()) {return Ok(entries);}
+                if !policy::within_budget(per_pass,budget,in_flight+entries.len()) {return Ok(entries);}
                 entries.push((candidate.clone(),index),GFP_KERNEL)?;
                 index+=1;
             }
@@ -906,6 +908,8 @@ impl Inner {
             let vm=batch.entries[0].0.vm.id();
             self.pass_cost.record(vm,gpu_ns/batch_count as u64);
             self.render_initialized=true;
+        } else {
+            self.compute_cost.record(batch.entries[0].0.vm.id(),gpu_ns/batch_count as u64);
         }
         if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
             let observed_tick=physical_counter();
@@ -1120,7 +1124,7 @@ impl Runtime {
         };
         Ok(Self { inner: ManuallyDrop::new(owner.write(Inner { transport, state, config, uat, window, drm, device,
             jobs:KVec::new(),packets:KVec::new(),pending:KVec::new(),active:KVec::new(),gpu_pending:false,active_power_last:None,active_power_samples:0,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3::m3_pass_layout::SLOTS],
-            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,mixed_batches:0,pass_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,
+            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,mixed_batches:0,pass_cost:policy::PassCosts::default(),compute_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,
             boot_step:crate::m3::t8122_start::BootStep::Publish })) })
     }
     pub(crate) fn drm(&self) -> driver::AsahiDevRef { self.inner.drm.clone() }

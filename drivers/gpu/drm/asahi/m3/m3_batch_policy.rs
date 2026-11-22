@@ -48,8 +48,10 @@ pub(crate) fn urgent_waiting(urgencies: impl Iterator<Item=u8>, active:u8) -> bo
     urgencies.into_iter().any(|p|p>active)
 }
 
-pub(crate) const fn may_join(render:bool, next:usize, same_vm:bool, same_urgency:bool) -> bool {
-    render && next==0 && same_vm && same_urgency
+/// A later pending packet may extend a batch of either engine from its first command, for the
+/// batch's VM and at its urgency. The batch limit and GPU-time budget still bound the batch.
+pub(crate) const fn may_join(next:usize, same_vm:bool, same_urgency:bool) -> bool {
+    next==0 && same_vm && same_urgency
 }
 
 pub(crate) const fn default_depth(t8122:bool) -> usize {if t8122 {2} else {1}}

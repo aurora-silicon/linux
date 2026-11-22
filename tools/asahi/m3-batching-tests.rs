@@ -21,11 +21,10 @@ fn priority_fifo_and_partial_packet_yields() {
     // An unfinished low-priority packet gets a high-priority predecessor next batch.
     let low_continuation=vec![0,0];
     assert_eq!(pending_position(low_continuation.into_iter(),3),0);
-    assert!(!may_join(true,0,true,false));
-    assert!(!may_join(true,1,true,true));
-    assert!(!may_join(true,0,false,true));
-    assert!(!may_join(false,0,true,true));
-    assert!(may_join(true,0,true,true));
+    assert!(!may_join(0,true,false));
+    assert!(!may_join(1,true,true));
+    assert!(!may_join(0,false,true));
+    assert!(may_join(0,true,true));
     // A sorted pending head cannot detect its own urgency advantage. Compare
     // with the active batch so same-VM urgent work also stops extending it.
     assert!(urgent_waiting([3,0].into_iter(),0));

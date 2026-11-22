@@ -208,8 +208,9 @@ pub(crate) fn render_internal_timestamps()->bool {
 /// `asahi.m3_render_batch_size`: bounded ordered render batch size (1..16).
 static M3_RENDER_BATCH_SIZE: AtomicU64 = AtomicU64::new(1);
 m3_param!("m3_render_batch_size", M3_RENDER_BATCH_SIZE, parse_u64);
-/// `asahi.m3_compute_batch_size`: bounded ordered compute batch size (1..16).
-static M3_COMPUTE_BATCH_SIZE: AtomicU64 = AtomicU64::new(1);
+/// `asahi.m3_compute_batch_size`: bounded ordered compute batch size (1..16). The default is the
+/// compute storage's slot count; the batch's GPU-time budget and the pending queue bound it.
+static M3_COMPUTE_BATCH_SIZE: AtomicU64 = AtomicU64::new(crate::m3::m3_compute_storage::SLOTS as u64);
 m3_param!("m3_compute_batch_size", M3_COMPUTE_BATCH_SIZE, parse_u64);
 /// `asahi.m3_early_tiling`: opt-in fragment-only stage dependencies.
 static M3_EARLY_TILING: AtomicU64 = AtomicU64::new(0);
@@ -483,10 +484,10 @@ pub(crate) fn pipeline_depth(soc: &crate::m3::m3_soc::Soc) -> usize {
     }
 }
 
-/// `asahi.m3_render_batch_budget_us`: writable at runtime. A render batch takes in later packets
-/// of its VM only while the VM's measured GPU time per pass, times the passes already in the
-/// batch, stays below this budget (4000 µs on experimental T8122, disabled on Pro).
-/// Coalescing a client's heavy frames
+/// `asahi.m3_render_batch_budget_us`: writable at runtime. A render or compute batch takes in
+/// later packets of its VM only while the VM's measured GPU time per pass (or per compute
+/// command), times the passes already in the batch, stays below this budget (4000 µs on
+/// experimental T8122, disabled on Pro). Coalescing a client's heavy frames or dispatches
 /// otherwise makes every other client's work, the compositor's included, wait for all of them.
 /// 0 disables the budget; u64::MAX restores the SoC default.
 static M3_RENDER_BATCH_BUDGET_US: AtomicU64 = AtomicU64::new(u64::MAX);
