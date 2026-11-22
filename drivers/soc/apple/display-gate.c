@@ -1828,6 +1828,8 @@ static void __init gate_describe(void)
  * alone. apple_t8122_display.dcpext=0 keeps them disabled too.
  */
 static bool gate_t8122_dcpext_requested __initdata = true;
+/* The changeset that enabled the dcpext; only the KUnit test reverts it. */
+static struct of_changeset *gate_t8122_dcpext_cs __initdata;
 
 static int __init gate_t8122_dcpext_setup(char *arg)
 {
@@ -2067,6 +2069,7 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		gate_ext_refuse(np, "the gate could not enable it");
 		goto put;
 	}
+	gate_t8122_dcpext_cs = cs;
 	gate_info("enabled %pOF with its Type-C routes, DARTs, mailbox, %d display crossbar(s) with ATC common power kept on, display DART %pOF in the display subsystem, CPU power floor and PMP DISPEXT request; started by the display driver\n",
 		  np, nxbar, disp_dart);
 put:
