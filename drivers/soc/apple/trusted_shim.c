@@ -78,6 +78,8 @@ static char sep_tk_name[] = "applesep";
 
 static struct trusted_key_ops sep_tk_ops = {
 	.migratable	= 0,
+	/* "import": see Documentation/security/keys/apple-sep.rst */
+	.importable	= 1,
 	.init		= tk_init,
 	.seal		= tk_seal,
 	.unseal		= tk_unseal,
