@@ -19,12 +19,45 @@
 };
 
 /*
+ * The internal PCIe power states (ADT pmgr devices APCIE_GP and APCIE_SYS_GP,
+ * the latter's parent the former). iBoot leaves both on, and Linux cannot redo
+ * the PHY and lane setup the loader does on them, so they stay on, without
+ * automatic power management: APCIE_GP has no automatic state set and would
+ * be power gated by it. dart-apcie2 takes APCIE_SYS_GP, as on T8142.
+ */
+&pmgr {
+	ps_apcie_gp: power-controller@8c0 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x8c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_gp";
+		apple,no-auto-pm;
+		apple,always-on;
+	};
+
+	ps_apcie_sys_gp: power-controller@ec0 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xec0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_sys_gp";
+		power-domains = <&ps_apcie_gp>;
+		apple,no-auto-pm;
+		apple,always-on;
+	};
+};
+
+/*
  * dart-apcie2, described in t8152-peripherals.dtsi. The ADT window is
  * 0x20000; keep the 0xc000 this port was brought up with, the size that
  * pcie0_dart has in t8152-j873-n1.dtsi.
  */
 &pcie2_dart {
 	reg = <0x3 0x8a000000 0x0 0xc000>;
+	power-domains = <&ps_apcie_sys_gp>;
 	status = "okay";
 };
 
