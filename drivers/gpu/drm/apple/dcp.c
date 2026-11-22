@@ -6999,10 +6999,12 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
 	}
-	if (dcp->clk)
-		devm_clk_put(dev, dcp->clk);
+	/*
+	 * Both clocks are released with the bind's devres group. An explicit
+	 * devm_clk_put() would also match the NULL devres entry of an absent
+	 * optional clock and warn.
+	 */
 	dcp->clk = NULL;
-	/* optional and possibly NULL, released with the bind's devres group */
 	dcp->clk_194 = NULL;
 	dcp->firmware_clocks = NULL;
 	dcp->num_firmware_clocks = 0;
