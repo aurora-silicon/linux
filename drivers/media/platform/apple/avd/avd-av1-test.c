@@ -4,6 +4,7 @@
  */
 
 #include <kunit/test.h>
+#include <linux/slab.h>
 
 #include "avd.h"
 
@@ -110,11 +111,72 @@ static void avd_av1_tiles_rowcol_test(struct kunit *test)
 						  AVD_TEST_PAYLOAD), c->ret);
 }
 
+/*
+ * The run takes its own copy of the tile-group entries: replacing and freeing
+ * the control's storage afterwards, as setting a larger array does, leaves
+ * the copy and its count intact.
+ */
+static void avd_av1_copy_tile_group_test(struct kunit *test)
+{
+	struct v4l2_ctrl_av1_tile_group_entry expect[6] = {};
+	struct v4l2_ctrl_av1_tile_group_entry *src, *bigger, *copy;
+	struct v4l2_ctrl_handler *hdl;
+	struct v4l2_ctrl *ctrl;
+	unsigned int entries = 0;
+
+	hdl = kunit_kzalloc(test, sizeof(*hdl), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hdl);
+	ctrl = kunit_kzalloc(test, sizeof(*ctrl), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctrl);
+	KUNIT_ASSERT_EQ(test, v4l2_ctrl_handler_init(hdl, 0), 0);
+
+	src = kcalloc(ARRAY_SIZE(expect), sizeof(*src), GFP_KERNEL);
+	bigger = kcalloc(V4L2_AV1_MAX_TILE_COUNT, sizeof(*bigger), GFP_KERNEL);
+	if (!src || !bigger) {
+		kfree(src);
+		kfree(bigger);
+		v4l2_ctrl_handler_free(hdl);
+		KUNIT_FAIL(test, "out of memory");
+		return;
+	}
+	avd_av1_test_layout(expect, 2, 3);
+	memcpy(src, expect, sizeof(expect));
+	ctrl->handler = hdl;
+	ctrl->elems = ARRAY_SIZE(expect);
+	ctrl->elem_size = sizeof(*src);
+	ctrl->p_cur.p = src;
+
+	copy = avd_av1_copy_tile_group(ctrl, &entries);
+	KUNIT_EXPECT_EQ(test, entries, ARRAY_SIZE(expect));
+
+	/* A larger array replaces and frees the old storage. */
+	memset(bigger, 0xff, V4L2_AV1_MAX_TILE_COUNT * sizeof(*bigger));
+	ctrl->p_cur.p = bigger;
+	ctrl->elems = V4L2_AV1_MAX_TILE_COUNT;
+	memset(src, 0xff, sizeof(expect));
+	kfree(src);
+
+	if (copy) {
+		KUNIT_EXPECT_MEMEQ(test, copy, expect, sizeof(expect));
+		KUNIT_EXPECT_EQ(test, avd_av1_check_tiles(NULL, 2, 3, copy,
+							  entries,
+							  AVD_TEST_PAYLOAD), 0);
+	} else {
+		KUNIT_FAIL(test, "no copy");
+	}
+	KUNIT_EXPECT_EQ(test, entries, ARRAY_SIZE(expect));
+
+	kfree(copy);
+	kfree(bigger);
+	v4l2_ctrl_handler_free(hdl);
+}
+
 static struct kunit_case avd_av1_test_cases[] = {
 	KUNIT_CASE(avd_av1_tiles_valid_test),
 	KUNIT_CASE(avd_av1_tiles_count_test),
 	KUNIT_CASE(avd_av1_tiles_extent_test),
 	KUNIT_CASE_PARAM(avd_av1_tiles_rowcol_test, avd_av1_rowcol_gen_params),
+	KUNIT_CASE(avd_av1_copy_tile_group_test),
 	{}
 };
 

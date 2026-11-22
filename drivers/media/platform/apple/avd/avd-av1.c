@@ -221,7 +221,12 @@ struct avd_av1_run {
 
 	const struct v4l2_ctrl_av1_sequence *seq;
 	const struct v4l2_ctrl_av1_frame *frame;
-	const struct v4l2_ctrl_av1_tile_group_entry *tile_group;
+	/* Private copy of the tile-group control, freed by avd_av1_run(). */
+	struct v4l2_ctrl_av1_tile_group_entry *tile_group;
+	unsigned int tile_group_entries;
+	/* The tile grid tile_group was checked against */
+	unsigned int tile_rows;
+	unsigned int tile_cols;
 	const struct v4l2_ctrl_av1_film_grain *grain;
 };
 
@@ -1139,12 +1144,12 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_av1_run *run)
 		seq->flags & V4L2_AV1_SEQUENCE_FLAG_USE_128X128_SUPERBLOCK ? 5 :
 									     4;
 
-	av1_ctx->submit_num = tile_info->tile_cols * tile_info->tile_rows;
+	av1_ctx->submit_num = run->tile_cols * run->tile_rows;
 
-	for (row = 0; row < tile_info->tile_rows; row++) {
-		for (col = 0; col < tile_info->tile_cols; col++) {
+	for (row = 0; row < run->tile_rows; row++) {
+		for (col = 0; col < run->tile_cols; col++) {
 			ctx->job.num++;
-			tile_id = row * tile_info->tile_cols + col;
+			tile_id = row * run->tile_cols + col;
 			tile_group = &run->tile_group[tile_id];
 
 			push(AVD_OP_CODED_DATA |
@@ -1441,6 +1446,25 @@ avd_av1_check_tiles(struct device *dev, unsigned int tile_rows,
 EXPORT_SYMBOL_IF_KUNIT(avd_av1_check_tiles);
 
 /*
+ * Setting a larger tile-group array reallocates the control's storage and
+ * frees the old one under the control lock, which the run does not otherwise
+ * hold. Copy the entries under that lock; the run checks and uses the copy.
+ */
+VISIBLE_IF_KUNIT struct v4l2_ctrl_av1_tile_group_entry *
+avd_av1_copy_tile_group(struct v4l2_ctrl *ctrl, unsigned int *entries)
+{
+	struct v4l2_ctrl_av1_tile_group_entry *copy;
+
+	v4l2_ctrl_lock(ctrl);
+	*entries = ctrl->elems;
+	copy = kmemdup_array(ctrl->p_cur.p, ctrl->elems, ctrl->elem_size,
+			     GFP_KERNEL);
+	v4l2_ctrl_unlock(ctrl);
+	return copy;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_av1_copy_tile_group);
+
+/*
  * Only the AV1 Main profile at 4:2:0 (8 and 10 bits) decodes. A High
  * profile (4:4:4) frame is never completed: it times out and the whole
  * decoder is reset, failing every other stream's frames too. Professional
@@ -1523,10 +1547,14 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 			      V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY);
 	if (WARN_ON(!ctrl))
 		return -EINVAL;
-	run->tile_group = ctrl->p_cur.p;
-	ret = avd_av1_check_tiles(ctx->dev->dev, run->frame->tile_info.tile_rows,
-				  run->frame->tile_info.tile_cols,
-				  run->tile_group, ctrl->elems,
+	run->tile_group = avd_av1_copy_tile_group(ctrl, &run->tile_group_entries);
+	if (!run->tile_group)
+		return -ENOMEM;
+	/* The frame control can be set meanwhile too: use one tile grid throughout. */
+	run->tile_rows = run->frame->tile_info.tile_rows;
+	run->tile_cols = run->frame->tile_info.tile_cols;
+	ret = avd_av1_check_tiles(ctx->dev->dev, run->tile_rows, run->tile_cols,
+				  run->tile_group, run->tile_group_entries,
 				  vb2_get_plane_payload(&run->base.bufs.src->vb2_buf, 0));
 	if (ret)
 		return ret;
@@ -1694,7 +1722,7 @@ static int avd_av1_alloc_work_bufs(struct avd_ctx *ctx, struct avd_av1_run *run)
 
 static int avd_av1_run(struct avd_ctx *ctx)
 {
-	struct avd_av1_run run;
+	struct avd_av1_run run = {};
 	struct avd_av1_stream *av1_ctx = ((struct avd_av1_ctx *)ctx->priv)->stream;
 	struct avd_decoded_buffer *dst, *ref;
 	int ret;
@@ -1702,7 +1730,7 @@ static int avd_av1_run(struct avd_ctx *ctx)
 	ret = avd_av1_run_preamble(ctx, &run);
 	if (ret) {
 		avd_run_postamble(ctx, &run.base);
-		return ret;
+		goto out;
 	}
 
 	/* The CDF and segmentation map copies need the CPU mappings. */
@@ -1716,7 +1744,8 @@ static int avd_av1_run(struct avd_ctx *ctx)
 	if (!vb2_plane_vaddr(&dst->base.vb.vb2_buf, 0) ||
 	    !vb2_plane_vaddr(&ref->base.vb.vb2_buf, 0)) {
 		avd_run_postamble(ctx, &run.base);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out;
 	}
 	if (av1_ctx->nbanks > 1) {
 		struct avd_av1_bank *bank = NULL;
@@ -1728,7 +1757,8 @@ static int avd_av1_run(struct avd_ctx *ctx)
 			}
 		if (!bank) {
 			avd_run_postamble(ctx, &run.base);
-			return -EBUSY;
+			ret = -EBUSY;
+			goto out;
 		}
 		av1_ctx->b = bank;
 		smp_store_release(&ctx->priv, &bank->codec);
@@ -1743,18 +1773,16 @@ static int avd_av1_run(struct avd_ctx *ctx)
 	}
 
 	ret = avd_init_job(ctx, AVD_CODEC_AV1,
-			   run.frame->tile_info.tile_cols *
-					   run.frame->tile_info.tile_rows +
-				   1);
+			   run.tile_cols * run.tile_rows + 1);
 	if (ret) {
 		avd_run_postamble(ctx, &run.base);
-		return ret;
+		goto out;
 	}
 
 	ret = avd_av1_alloc_work_bufs(ctx, &run);
 	if (ret) {
 		avd_run_postamble(ctx, &run.base);
-		return ret;
+		goto out;
 	}
 
 	update_dec_buf_info(dst, run.seq, run.frame);
@@ -1771,7 +1799,10 @@ static int avd_av1_run(struct avd_ctx *ctx)
 
 	avd_run_postamble(ctx, &run.base);
 
-	return avd_submit_job(ctx);
+	ret = avd_submit_job(ctx);
+out:
+	kfree(run.tile_group);
+	return ret;
 }
 
 
