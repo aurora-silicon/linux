@@ -7232,6 +7232,14 @@ static int dcp_s2r_pm_register(struct apple_dcp *dcp);
  * No sleep support: neither a firmware-27 sleep nor a link release has run
  * on this processor.
  */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext_v27 = {
+	.firmware_dma_bits = 41,
+	.num_dptx_ports = 2,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_V_27_0,
+	.sink_metadata_edid = true,
+};
+
 /*
  * T8132 internal display processor on firmware 27.2, admitted by
  * dcp_check_firmware_version(), whatever hw data its compatible matched:
@@ -7247,14 +7255,6 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8132_v27 = {
 	.num_dptx_ports = 0,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
-};
-
-static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext_v27 = {
-	.firmware_dma_bits = 41,
-	.num_dptx_ports = 2,
-	.adopt_live_session = true,
-	.firmware_compat = DCP_FIRMWARE_V_27_0,
-	.sink_metadata_edid = true,
 };
 
 static int dcp_platform_probe_pipe(struct platform_device *pdev)
