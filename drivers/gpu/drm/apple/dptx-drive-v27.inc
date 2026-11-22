@@ -103,7 +103,12 @@ static int dptxport_call_drive_v27(struct apple_epic_service *service, bool set,
 			if (!dptx->atcphy)
 				return -ENODEV;
 			ret = phy_configure(dptx->atcphy, &opts);
-			if (ret)
+			/*
+			 * A PHY without drive level control keeps the levels
+			 * its tunables set; DCP's link training goes on with
+			 * them, as with the firmware before 27.
+			 */
+			if (ret && ret != -EOPNOTSUPP)
 				return ret;
 		}
 		for (u32 i = 0; i < count; i++) {
