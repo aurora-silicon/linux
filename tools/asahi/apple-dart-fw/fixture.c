@@ -203,11 +203,15 @@ int main(int argc,char**argv){
   }else abort();
  }
  else if(!strncmp(c,"handoff-",8)){
+  d.version=0x0202;
   if(!strcmp(c,"handoff-missing"))node.count=-EINVAL;
   if(!strcmp(c,"handoff-duplicate"))node.count=2;
   if(!strcmp(c,"handoff-zero"))node.value=0;
   if(!strcmp(c,"handoff-unlocked"))d.locked=0;
   if(!strcmp(c,"handoff-dart1-format"))hw.fmt=APPLE_DART;
+  /* A T6000 DART has the APPLE_DART2 layout but reports no version. */
+  if(!strcmp(c,"handoff-unversioned"))d.version=0;
+  if(!strcmp(c,"handoff-version-0201"))d.version=0x0201;
   assert(apple_dart_fw_handoff_enabled(&d)==!strcmp(c,"handoff-matched"));
  }
  else if(!strncmp(c,"core-",5)){

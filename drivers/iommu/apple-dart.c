@@ -1037,8 +1037,10 @@ static phys_addr_t apple_dart_pte_to_paddr(const struct apple_dart *dart,
 /*
  * Firmware table pages must remain outside Linux's page allocator. The boot
  * loader says it reserved them with apple,firmware-root-handoff; the walker
- * decodes them in the APPLE_DART2 PTE layout, so that is the only other
- * condition.
+ * decodes them in the APPLE_DART2 PTE layout, and the handoff paths (retire,
+ * per-slot invalidate, locked map/unmap) need a DART whose probed version is
+ * at least 2.2. Only the T8110 family reports a version, so a T6000 DART,
+ * which shares the APPLE_DART2 layout, never takes the handoff.
  */
 static bool apple_dart_fw_handoff_enabled(const struct apple_dart *dart)
 {
@@ -1046,6 +1048,7 @@ static bool apple_dart_fw_handoff_enabled(const struct apple_dart *dart)
 	u32 handoff;
 
 	return dart->locked && dart->hw->fmt == APPLE_DART2 &&
+		dart->version >= 0x0202 &&
 		of_property_count_u32_elems(np, "apple,firmware-root-handoff") == 1 &&
 		!of_property_read_u32(np, "apple,firmware-root-handoff", &handoff) &&
 		handoff == 1;
