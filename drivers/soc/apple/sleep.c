@@ -6062,6 +6062,10 @@ static void apple_sleep_display_then_gpu(struct apple_sleep *s)
  * changing anything runs too, so the dry run reports it: each coprocessor's own last check and
  * the SoC's final check.
  */
+static bool sleep_trial_dry_sep_stop;
+module_param_named(trial_dry_sep_stop, sleep_trial_dry_sep_stop, bool, 0444);
+MODULE_PARM_DESC(trial_dry_sep_stop, "TRIAL ONLY: a dry run also sends the SEP its SLEEP and reports its power word");
+
 static int apple_sleep_enter_dry(struct apple_sleep *s)
 {
 	int ret = apple_sleep_coprocs_check(s);
@@ -6077,6 +6081,23 @@ static int apple_sleep_enter_dry(struct apple_sleep *s)
 	}
 	dev_info(s->dev,
 		 "dry run: every check passed; refusing before the first stop and the commit (untested SoC, apple_sleep.untested_commit=1 lets it through)\n");
+	/*
+	 * TRIAL ONLY (not for #2572): with the debug link still up, send the SEP its SLEEP as the
+	 * commit would and watch its power word, then refuse as a dry run does. The SEP stays
+	 * asleep for the rest of this boot.
+	 */
+	if (READ_ONCE(sleep_trial_dry_sep_stop)) {
+		u32 before = readl(s->ps + 0xc00);
+		int r, i;
+
+		r = apple_sleep_enclave_stop(s);
+		dev_info(s->dev, "TRIAL dry SEP stop: %d, SEP power word %#x before\n", r, before);
+		for (i = 1; i <= 4; i++) {
+			mdelay(50);
+			dev_info(s->dev, "TRIAL dry SEP stop: +%d ms SEP power word %#x\n", 50 * i,
+				 readl(s->ps + 0xc00));
+		}
+	}
 	return -EAGAIN;
 }
 
