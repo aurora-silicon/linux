@@ -37,9 +37,6 @@ const TRACE_RECORDS: u32 = 512;
 const RING_RECORDS: u32 = 256;
 /// Queue capacity at position block +0x50 (16 x the 0x50 channels).
 const QUEUE_CAPACITY: u32 = 0x500;
-/// Upper performance-state cap, in hundredths, at globals +0x98: the first state above idle.
-/// Only this cap has run on hardware.
-const STATE_CAP: u32 = 100;
 
 /// Board facts the root needs, read from the device tree at probe.
 pub(crate) struct BoardV27_2 {
@@ -119,6 +116,8 @@ fn encode_compute(
     put64(cmd, 0x334, timestamps + 0x20);
 
     put32(stream, 0, 11);
+    // 13.5 StartCompute.unk_28, at the same place in this layout (the 13.5 G14 path writes 1).
+    put32(stream, 0x28, 1);
     put64(stream, 0x160, job.sequence);
     put64(stream, 0x04, cmd_va + 0x18);
     put64(stream, 0x0c, cmd_va + 0x68);
@@ -810,7 +809,7 @@ impl RootV27_2 {
                 data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
             }
             let ceiling = pwr.perf_max_pstate * 100;
-            for (at, value) in [(0x84, pwr.max_power_mw), (0x88, ceiling), (0x8c, ceiling), (0x98, STATE_CAP)] {
+            for (at, value) in [(0x84, pwr.max_power_mw), (0x88, ceiling), (0x8c, ceiling), (0x98, ceiling)] {
                 put32(data, at, value);
             }
             put32(data, 0x6e, 1);
@@ -942,6 +941,11 @@ impl RootV27_2 {
         for (word, value) in policy[0x62b8..0x62f8].chunks_exact_mut(4).zip(cfg.shared3_tab) {
             word.copy_from_slice(&value.to_le_bytes());
         }
+        // The temperature alarm's service floor, the word before its per-state thresholds (13.5
+        // HwDataShared3 places it there too). The alarm runs only in states at or above the
+        // floor. Nothing on the machine describes the alarm's hysteresis or retry interval, so
+        // keep it off: a floor of the DT state count lies above every state.
+        put32(policy, 0x62b4, pwr.perf_states.len() as u32);
         // Cold-wake operand: the board's base operating point.
         put32(policy, 0xa4, pwr.perf_base_pstate);
         for (source, bits) in [
