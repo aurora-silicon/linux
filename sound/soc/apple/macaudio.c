@@ -517,6 +517,7 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 	const char *name = volume_control_names[ma->cfg->amp];
 	struct snd_kcontrol *kctl;
 	bool failed = false;
+	unsigned int i;
 
 	if (!name) {
 		WARN_ON_ONCE(1);
@@ -558,12 +559,11 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 	/*
 	 * One control at a time: snd_soc_limit_volume() stops at the first
 	 * control it cannot clip, which would leave the rest at their old
-	 * limit and value.
+	 * limit and value. Only the driver's own volume controls, taken before
+	 * the card registered (macaudio_spk_take_volumes()).
 	 */
-	list_for_each_entry(kctl, &ma->card.snd_card->controls, list) {
-		if (!snd_soc_control_matches(kctl, name))
-			continue;
-
+	for (i = 0; i < ma->spk_nr_vols; i++) {
+		kctl = ma->spk_vols[i];
 		hits++;
 		ret = snd_soc_limit_volume(&ma->card, kctl->id.name, max);
 		if (ret < 0) {
@@ -680,9 +680,8 @@ static void macaudio_pm_volumes_save(struct macaudio_snd_data *ma)
 		return;
 	macaudio_pm_volumes_drop(ma);
 
-	list_for_each_entry(kctl, &ma->card.snd_card->controls, list)
-		if (snd_soc_control_matches(kctl, name))
-			nr++;
+	/* The driver's own volume controls, which live as long as the card */
+	nr = ma->spk_nr_vols;
 	if (!nr)
 		return;
 
@@ -691,9 +690,8 @@ static void macaudio_pm_volumes_save(struct macaudio_snd_data *ma)
 	if (!vols || !uval)
 		goto out;
 
-	list_for_each_entry(kctl, &ma->card.snd_card->controls, list) {
-		if (!snd_soc_control_matches(kctl, name))
-			continue;
+	for (i = 0; i < nr; i++) {
+		kctl = ma->spk_vols[i];
 		memset(uval, 0, sizeof(*uval));
 		uval->id = kctl->id;
 		ret = kctl->get(kctl, uval);
@@ -705,7 +703,6 @@ static void macaudio_pm_volumes_save(struct macaudio_snd_data *ma)
 		vols[i].kctl = kctl;
 		vols[i].value[0] = uval->value.integer.value[0];
 		vols[i].value[1] = uval->value.integer.value[1];
-		i++;
 	}
 
 	ma->pm_volumes = vols;
@@ -752,7 +749,7 @@ static void macaudio_pm_volumes_restore(struct macaudio_snd_data *ma)
 
 static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 {
-	int i;
+	unsigned int i, j;
 	bool unlock = true;
 	struct snd_kcontrol *kctl;
 	const char *reason;
@@ -793,10 +790,8 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 	}
 
 	/* Check that *every* limited control is locked by the same owner */
-	list_for_each_entry(kctl, &ma->card.snd_card->controls, list) {
-		if(!snd_soc_control_matches(kctl, volume_control_names[ma->cfg->amp]))
-			continue;
-
+	for (j = 0; j < ma->spk_nr_vols; j++) {
+		kctl = ma->spk_vols[j];
 		for (i = 0; i < kctl->count; i++) {
 			if (kctl->vd[i].owner != ma->speaker_lock_owner) {
 				reason = "Not all child controls locked by the same process";
