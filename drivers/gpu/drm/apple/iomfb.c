@@ -421,6 +421,28 @@ static bool dcp_cb_pending(const struct dcp_channel *ch)
 	       !ch->command[ch->depth - 1];
 }
 
+/*
+ * Answer the innermost pending callback on @context with a one-byte status,
+ * for handlers that deferred their ack until a nested command completed.
+ * If that frame is not a callback (the firmware acked out of order, or sent
+ * the callback on another context), refuse instead of writing through a
+ * stale or missing output pointer.
+ */
+void dcp_ack_status(struct apple_dcp *dcp, enum dcp_context_id context,
+		    bool status)
+{
+	struct dcp_channel *ch = dcp_get_channel(dcp, context);
+
+	if (!dcp_cb_pending(ch) || !ch->output[ch->depth - 1]) {
+		dev_err(dcp->dev, "no pending callback to answer on context %X\n",
+			context);
+		WRITE_ONCE(dcp->crashed, true);
+		return;
+	}
+	*(u8 *)ch->output[ch->depth - 1] = status;
+	dcp_ack(dcp, context);
+}
+
 /* Write the reply of the callback at @depth back to its shared record, once. */
 static void dcp_cb_reply_commit(struct dcp_channel *ch, u8 depth)
 {

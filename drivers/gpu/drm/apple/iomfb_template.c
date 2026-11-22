@@ -896,11 +896,7 @@ DCP_THUNK_INOUT(dcp_register_dfb_surface, dcpep_register_dfb_surface,
 
 static void __maybe_unused dcp_ack_dfb_surface(struct apple_dcp *dcp)
 {
-	struct dcp_channel *ch = &dcp->ch_cb;
-	u8 *succ = ch->output[ch->depth - 1];
-
-	*succ = true;
-	dcp_ack(dcp, DCP_CONTEXT_CB);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
 }
 
 /*
@@ -938,10 +934,7 @@ static void __maybe_unused dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
 static void complete_dfb_surface(struct apple_dcp *dcp, void *out, void *cookie)
 {
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	struct dcp_channel *ch = &dcp->ch_cb;
-
-	*(u8 *)ch->output[ch->depth - 1] = out && !get_unaligned_le32(out);
-	dcp_ack(dcp, DCP_CONTEXT_CB);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, out && !get_unaligned_le32(out));
 #else
 	dcp_ack_dfb_surface(dcp);
 #endif
@@ -1012,13 +1005,8 @@ static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
 
 static void complete_pmu_service_matched(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_channel *ch = &dcp->ch_cb;
-	u8 *succ = ch->output[ch->depth - 1];
-
-	*succ = true;
-
 	// ack D206 cb_match_pmu_service_2
-	dcp_ack(dcp, DCP_CONTEXT_CB);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
 }
 
 static bool iomfbep_cb_match_pmu_service_2(struct apple_dcp *dcp, int tag, void *out, void *in)
@@ -1034,13 +1022,8 @@ static bool iomfbep_cb_match_pmu_service_2(struct apple_dcp *dcp, int tag, void 
 
 static void complete_backlight_service_matched(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_channel *ch = &dcp->ch_cb;
-	u8 *succ = ch->output[ch->depth - 1];
-
-	*succ = true;
-
 	// ack D206 cb_match_backlight_service
-	dcp_ack(dcp, DCP_CONTEXT_CB);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
 }
 
 static bool iomfbep_cb_match_backlight_service(struct apple_dcp *dcp, int tag, void *out, void *in)
@@ -1833,12 +1816,9 @@ static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 /* Boot sequence */
 static void boot_done(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_channel *ch = &dcp->ch_cb;
-	u8 *succ = ch->output[ch->depth - 1];
 	dev_dbg(dcp->dev, "boot done\n");
 
-	*succ = true;
-	dcp_ack(dcp, DCP_CONTEXT_CB);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
 }
 
 static void boot_5b(struct apple_dcp *dcp, void *out, void *cookie)
@@ -1927,12 +1907,9 @@ static void boot_1_10(struct apple_dcp *dcp, void *out, void *cookie)
 
 	if (dim.width > 16384 || dim.height > 16384
 	   ) {
-		struct dcp_channel *ch = &dcp->ch_cb;
-
 		dev_err(dcp->dev, "invalid default framebuffer dimensions %ux%u\n",
 			dim.width, dim.height);
-		*(u8 *)ch->output[ch->depth - 1] = false;
-		dcp_ack(dcp, DCP_CONTEXT_CB);
+		dcp_ack_status(dcp, DCP_CONTEXT_CB, false);
 		return;
 	}
 
@@ -1947,12 +1924,9 @@ static void boot_1_10(struct apple_dcp *dcp, void *out, void *cookie)
 	 */
 	memcpy(&dim, out, sizeof(dim));
 	if (!dim.width || !dim.height || dim.width > 16384 || dim.height > 16384) {
-		struct dcp_channel *ch = &dcp->ch_cb;
-
 		dev_err(dcp->dev, "invalid default framebuffer dimensions %ux%u\n",
 			dim.width, dim.height);
-		*(u8 *)ch->output[ch->depth - 1] = false;
-		dcp_ack(dcp, DCP_CONTEXT_CB);
+		dcp_ack_status(dcp, DCP_CONTEXT_CB, false);
 		return;
 	}
 	dev_dbg(dcp->dev, "default framebuffer dimensions %ux%u\n",
@@ -2037,11 +2011,7 @@ static void boot_1_5(struct apple_dcp *dcp, void *out, void *cookie)
 #if DCP_FW_H17(DCP_FW_VER)
 static void d000_done(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_channel *ch = &dcp->ch_cb;
-	u8 *succ = ch->output[ch->depth - 1];
-
-	*succ = true;
-	dcp_ack(dcp, DCP_CONTEXT_CB);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
 }
 
 /*

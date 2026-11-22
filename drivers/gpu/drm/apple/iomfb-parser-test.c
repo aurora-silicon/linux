@@ -284,6 +284,34 @@ static void iomfb_ack_without_callback_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 1);
 }
 
+/*
+ * A deferred handler answers its callback with dcp_ack_status() once its
+ * nested command completes; only a pending callback can be answered.
+ */
+static void iomfb_ack_status_test(struct kunit *test)
+{
+	struct apple_dcp *dcp = test->priv;
+	struct dcp_packet_header *record;
+
+	record = kunit_kzalloc(test, sizeof(*record) + 4, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, record);
+	dcp->quiescing = true;
+	dcp->fw_compat = DCP_FIRMWARE_V_12_3;
+
+	/* The firmware already took the callback off the stack. */
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
+	KUNIT_EXPECT_TRUE(test, dcp->crashed);
+	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 0);
+
+	/* The status reaches the pending callback's reply, then the shared record. */
+	dcp->crashed = false;
+	iomfb_push_deferred_callback(test, dcp, record);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
+	KUNIT_EXPECT_FALSE(test, dcp->crashed);
+	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 0);
+	KUNIT_EXPECT_EQ(test, *((u8 *)(record + 1)), 1);
+}
+
 /* Every firmware bounds the command stack before it writes a frame. */
 static void iomfb_command_depth_test(struct kunit *test)
 {
@@ -347,6 +375,7 @@ static struct kunit_case iomfb_parser_cases[] = {
 	KUNIT_CASE(iomfb_legacy_callback_lengths_test),
 	KUNIT_CASE(iomfb_ack_pending_callback_test),
 	KUNIT_CASE(iomfb_ack_without_callback_test),
+	KUNIT_CASE(iomfb_ack_status_test),
 	KUNIT_CASE(iomfb_command_depth_test),
 	KUNIT_CASE(iomfb_callback_tail_test),
 	{}
