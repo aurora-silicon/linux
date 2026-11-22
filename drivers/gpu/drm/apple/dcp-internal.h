@@ -225,6 +225,8 @@ struct dcp_panel {
 	int width_mm;
 	/// panel height in millimeter
 	int height_mm;
+	/// height below the notch rows (adj-height-mm), 0 if not given
+	u32 adj_height_mm;
 	/// panel has a mini-LED backlight
 	bool has_mini_led;
 	/// peak panel luminance in nits, for EDR (desktop 26.x; 0 if unknown)
@@ -933,6 +935,8 @@ struct apple_dcp {
 	bool notch_owned;
 	/* Panel rows above the last frame swapped in: the notch rows, or 0. */
 	u32 notch_scanout_y;
+	/* The notch-free geometry is what a compositor is offered now. */
+	bool notch_free_offered;
 
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct work_struct vblank_wq;

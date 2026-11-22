@@ -404,7 +404,11 @@ int main(void)
     assert(m[0].mode.vsync_start == 1911 && m[0].mode.vsync_end == 1919 && m[0].mode.vtotal == 1961);
     assert(!dcp_notch_add_twins(&m, &n, 64, &panel));
     assert(n == 2 && panel == 1864 && dcp_notch_twin_count(m, n) == 1);
-    assert(!m[0].notch_free && m[1].notch_free);
+    assert(!m[0].notch_free && m[1].notch_free && m[0].notch_twin && !m[1].notch_twin);
+    /* get_modes() gives the twin its physical height: adj-height-mm, else scaled by rows. */
+    assert(m[0].mode.height_mm == 212 && m[1].mode.height_mm == 212);
+    assert(dcp_notch_free_mm(m[1].mode.height_mm, 0, 1864, m[1].mode.vdisplay) == 205);
+    assert(dcp_notch_free_mm(212, 199, 1864, 1800) == 199 && dcp_notch_free_mm(212, 0, 0, 1800) == 212);
     /* The twin is that same mode: one timing, the notch rows folded into the sync. */
     assert(m[1].mode.vdisplay == hidden[0].mode.vdisplay &&
            m[1].mode.vsync_start == hidden[0].mode.vsync_start &&
@@ -435,6 +439,15 @@ int main(void)
     /* A twin gets no twin of its own. */
     assert(!dcp_notch_add_twins(&m, &n, 64, &panel) && n == 3 && dcp_notch_twin_count(m, n) == 2);
     assert(m[2].notch_free && m[2].mode.vdisplay == 1800);
+    /* A timing too short for the rows gets no twin and stays unmarked (offered as is). */
+    {
+        unsigned k = 1;
+        struct dcp_display_mode *one = calloc(1, sizeof(*one));
+
+        one[0] = hidden[0];
+        assert(!dcp_notch_add_twins(&one, &k, 1800, &panel) && k == 1 && !one[0].notch_twin);
+        free(one);
+    }
     /* Nobody owns the display: the console gets the notch-free geometry. */
     assert(dcp_notch_effective(DCP_NOTCH_SHOWN, false) == DCP_NOTCH_HIDDEN);
     assert(dcp_notch_effective(DCP_NOTCH_HIDDEN, false) == DCP_NOTCH_HIDDEN);

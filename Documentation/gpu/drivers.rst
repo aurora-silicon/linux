@@ -13,6 +13,7 @@ GPU Driver Documentation
    asahi-usage-stats
    asahi-m4-bringup
    apple-dcp-m4
+   apple-dcp-notch
    i915
    imagination/index
    intel-display/index

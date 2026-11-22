@@ -604,7 +604,7 @@ struct apple_dcp {
     bool dptx_tunnel, usb4, typec_cable_connected, quiescing, hpd_mutex;
     u64 typec_generation; unsigned int nr_modes;
     /* No notched panel here: the notch-free twins are the panel tests'. */
-    unsigned int nr_notch_twins; u32 notch_rows, notch_panel_rows; u8 notch_policy; bool notch_owned;
+    unsigned int nr_notch_twins; u32 notch_rows, notch_panel_rows; u8 notch_policy; bool notch_owned, notch_free_offered;
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
     bool ext_backlight, has_panel;
@@ -763,7 +763,7 @@ def publication(root):
     state = n['state']
     state = state.replace('struct apple_connector {', '''struct drm_device { void *dev; struct { bool mutex; } mode_config; };
 struct drm_connector { struct drm_device *dev; int registration_state; void *state;
-    struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; } display_info;
+    struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; int width_mm,height_mm; } display_info;
 };
 struct apple_connector {''')
     state = state.replace('    struct { int registration_state; } base;', '    struct drm_connector base;')
@@ -778,7 +778,7 @@ struct apple_connector {''')
     int fw_compat,width_mm,height_mm,fixed_connector_type; unsigned notch_height;
     bool modes_lock,modes_admitted,modes_provisional,placeholder_retried,external_native; int external_held;
     u64 modes_generation,dimensions_generation; struct work_struct dimensions_wq;
-    struct { int width_mm,height_mm; } panel;
+    struct { int width_mm,height_mm; unsigned adj_height_mm; } panel;
     struct { size_t length,received; void *data; bool contiguous,payload_complete; u64 modes_generation;
         u64 av_service_epoch,automatic_connection_sequence; bool automatic_service_pending;
         struct dcp_metadata_ticket metadata_ticket,mode_ticket;
@@ -1211,10 +1211,8 @@ def panel_dimensions(root):
     unit = unit.replace('bool modes_lock,modes_admitted,',
                         'bool external_physically_absent,modes_lock,modes_admitted,', 1)
     # The connector's physical size, which DRM keeps in display_info.
-    old = 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; } display_info;'
+    old = 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; int width_mm,height_mm; } display_info;'
     assert unit.count(old) == 1
-    unit = unit.replace(old, 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; '
-                        'int width_mm,height_mm; } display_info;')
     dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
     unit = unit.replace(block(unit, 'static bool __attribute__((unused)) dcp_has_panel('),
                         block(dcp, 'bool dcp_has_panel('))

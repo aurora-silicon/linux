@@ -113,6 +113,19 @@ static inline bool dcp_notch_offer(bool notch_free, enum dcp_notch_policy effect
 	return offered;
 }
 
+/*
+ * The physical height of the notch-free geometry: the panel's adj-height-mm
+ * if it gives one, else the full height scaled by the rows.
+ */
+static inline int dcp_notch_free_mm(int height_mm, u32 adj_mm, u32 full_rows, u32 free_rows)
+{
+	if (adj_mm)
+		return adj_mm;
+	if (!full_rows)
+		return height_mm;
+	return (int)(((u64)height_mm * free_rows + full_rows / 2) / full_rows);
+}
+
 /* A probe limited to @max_y rows (0: none) can take the @panel_rows panel. */
 static inline bool dcp_notch_full_fits(u32 max_y, u32 panel_rows)
 {

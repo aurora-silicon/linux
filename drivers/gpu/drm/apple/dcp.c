@@ -372,9 +372,6 @@ bool dcp_h17p_external_ready(struct device_node *np)
 	return ready;
 }
 
-static bool show_notch;
-module_param(show_notch, bool, 0644);
-MODULE_PARM_DESC(show_notch, "Start with the notch shown (default: the boot loader's choice, /chosen/asahi,show-notch; it can be changed at run time)");
 
 /*
  * DP/HDMI audio of external displays, on by default as on macOS: a display
@@ -1243,8 +1240,11 @@ void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_
 	of_property_read_u32(panel_np, "width-mm", &dcp->panel.width_mm);
 	/* Read the full height first: adj-height-mm is optional. */
 	of_property_read_u32(panel_np, "height-mm", &dcp->panel.height_mm);
-	if (dcp->notch_height)
-		of_property_read_u32(panel_np, "adj-height-mm", &dcp->panel.height_mm);
+	/* The notch-free geometry's height (dcp-notch.h); optional. */
+	dcp->panel.adj_height_mm = 0;
+	of_property_read_u32(panel_np, "adj-height-mm", &dcp->panel.adj_height_mm);
+	if (dcp->notch_height && dcp->panel.adj_height_mm)
+		dcp->panel.height_mm = dcp->panel.adj_height_mm;
 }
 
 /*
@@ -1531,6 +1531,11 @@ void dcp_update_connector_dimensions(struct apple_dcp *dcp,
 		width_mm = dcp->panel.width_mm;
 		height_mm = dcp->panel.height_mm;
 	}
+	/* The notch-free geometry is physically shorter (dcp-notch.h). */
+	if (READ_ONCE(dcp->notch_free_offered))
+		height_mm = dcp_notch_free_mm(height_mm, dcp->panel.adj_height_mm,
+					      READ_ONCE(dcp->notch_panel_rows),
+					      READ_ONCE(dcp->notch_panel_rows) - dcp->notch_rows);
 	connector->display_info.width_mm = width_mm;
 	connector->display_info.height_mm = height_mm;
 }
@@ -6551,8 +6556,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	 */
 	of_property_read_u32(dev->of_node, "apple,notch-height", &dcp->notch_rows);
 	dcp->notch_rows = min_t(u32, dcp->notch_rows, MAX_NOTCH_HEIGHT);
-	dcp->notch_policy = show_notch || boot_show_notch() ? DCP_NOTCH_SHOWN :
-							      DCP_NOTCH_HIDDEN;
+	dcp->notch_policy = boot_show_notch() ? DCP_NOTCH_SHOWN : DCP_NOTCH_HIDDEN;
 	if (!dcp_notch_dynamic(dcp) && dcp->notch_policy == DCP_NOTCH_HIDDEN)
 		dcp->notch_height = dcp->notch_rows;
 	if (dcp->notch_rows)

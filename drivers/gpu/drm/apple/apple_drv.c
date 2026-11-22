@@ -298,7 +298,7 @@ static void apple_drm_notch_owner(struct drm_device *drm, bool owned)
 		notch = true;
 	}
 	/* master_drop() runs under master_mutex, which the console's restore takes. */
-	if (notch && !owned)
+	if (notch && !owned && !drm_dev_is_unplugged(drm))
 		schedule_work(&to_apple_drm(drm)->notch_console);
 }
 
@@ -315,14 +315,26 @@ static void apple_drm_master_drop(struct drm_device *drm, struct drm_file *file)
 
 static void apple_drm_notch_console(struct work_struct *work)
 {
-	drm_client_dev_hotplug(&container_of(work, struct apple_drm_private,
-					     notch_console)->drm);
+	struct drm_device *drm = &container_of(work, struct apple_drm_private,
+					       notch_console)->drm;
+	int idx;
+
+	if (!drm_dev_enter(drm, &idx))
+		return;
+	drm_client_dev_hotplug(drm);
+	drm_dev_exit(idx);
 }
 
 static void apple_drm_notch_hotplug(struct work_struct *work)
 {
-	drm_kms_helper_hotplug_event(&container_of(work, struct apple_drm_private,
-						   notch_hotplug)->drm);
+	struct drm_device *drm = &container_of(work, struct apple_drm_private,
+					       notch_hotplug)->drm;
+	int idx;
+
+	if (!drm_dev_enter(drm, &idx))
+		return;
+	drm_kms_helper_hotplug_event(drm);
+	drm_dev_exit(idx);
 }
 
 /*
@@ -1117,6 +1129,7 @@ static ssize_t notch_store(struct device *kdev, struct device_attribute *attr,
 {
 	struct drm_connector *connector = dev_get_drvdata(kdev);
 	int ret = sysfs_match_string(apple_notch_words, buf);
+	int idx;
 
 	if (ret < 0) {
 		bool on;
@@ -1127,7 +1140,10 @@ static ssize_t notch_store(struct device *kdev, struct device_attribute *attr,
 	}
 	if (!apple_connector_notch_dcp(connector))
 		return -ENODEV;
+	if (!drm_dev_enter(connector->dev, &idx))
+		return -ENODEV;
 	ret = apple_connector_commit_notch(connector, ret);
+	drm_dev_exit(idx);
 	return ret ? ret : len;
 }
 static DEVICE_ATTR_RW(notch);
@@ -1242,6 +1258,8 @@ static void apple_connector_notch_fastset(struct drm_connector *conn,
 	    !dcp_notch_mode_known(dcp, &new_cs->mode))
 		return;
 	new_cs->mode_changed = false;
+	/* No mode_fixup() runs now: the adjusted mode is the mode, as it would be. */
+	drm_mode_copy(&new_cs->adjusted_mode, &new_cs->mode);
 }
 
 static int apple_connector_atomic_check(struct drm_connector *conn,
@@ -2275,14 +2293,15 @@ static void apple_drm_uninit(struct device *dev)
 		return;
 
 	unregister_pm_notifier(&apple->pm_nb);
-	cancel_work_sync(&apple->notch_hotplug);
-	cancel_work_sync(&apple->notch_console);
 
 	/* Before anything of the DRM device is torn down. */
 	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
 	drm_dev_unplug(&apple->drm);
 	drm_atomic_helper_shutdown(&apple->drm);
+	/* No sysfs write, commit or master change queues them now. */
+	cancel_work_sync(&apple->notch_hotplug);
+	cancel_work_sync(&apple->notch_console);
 
 	component_unbind_all(dev, NULL);
 

@@ -1,0 +1,16 @@
+What:		/sys/class/drm/card<N>-eDP-<M>/notch
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	dri-devel@lists.freedesktop.org
+Description:
+		(RW) Present on the built-in panel connector of an Apple
+		display controller (appledrm) when the panel has notch rows
+		(apple,notch-height). Reads "shown" or "hidden": whether
+		compositors are offered the full panel, notch rows included,
+		or the notch-free geometry. It is the connector's "notch"
+		property. Writing "shown", "hidden" or a boolean (1/0, on/off,
+		y/n) commits that property and makes compositors and the
+		console probe the connector again. The text console always
+		uses the notch-free geometry. The value starts as the boot
+		loader's choice (chosen/asahi,show-notch). See
+		Documentation/gpu/apple-dcp-notch.rst.

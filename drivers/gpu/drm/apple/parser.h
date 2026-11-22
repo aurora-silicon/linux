@@ -179,6 +179,8 @@ struct dcp_display_mode {
 	bool has_bootstrap;
 	/* The notch-free twin of a full-panel timing (dcp-notch.h). */
 	bool notch_free;
+	/* A full-panel timing that has one. */
+	bool notch_twin;
 	/* Immutable receipt provenance; never retag a cached exception. */
 	struct dcp_metadata_ticket unsafe_rgb8_ticket;
 	u64 unsafe_rgb8_service_epoch;
@@ -234,7 +236,8 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 
 int parse_array_count(const struct dcp_parse_ctx *handle, u32 *count);
 
-/* Caller serializes readers against replacement. */int replace_modes(struct dcp_parse_ctx *handle,
+/* Caller serializes readers against replacement. */
+int replace_modes(struct dcp_parse_ctx *handle,
 		  struct dcp_display_mode **modes, unsigned int *count,
 		  int width_mm, int height_mm, unsigned int notch_height,
 		  bool internal);
