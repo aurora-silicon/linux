@@ -462,6 +462,8 @@ static void dcp_cb_reply_commit(struct dcp_channel *ch, u8 depth)
 
 /* Older firmware and the H17G method profile retain their existing transport. */
 static u64 ext26_scanout_bytes(struct iomfb_scanout_h17p *scanout);
+static void iomfb_ext26_release_retained(struct apple_dcp *dcp,
+					 struct iomfb_scanout_h17p *completed);
 
 static bool iomfb_uses_queue(struct apple_dcp *dcp)
 {
@@ -3912,6 +3914,7 @@ iomfb_scanout_prepare_h17p(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	if (!scanout)
 		return NULL;
 	INIT_LIST_HEAD(&scanout->link);
+	scanout->ext26_epoch = dcp->ext26_stops;
 	if (dcp->iomfb.scanout) {
 		scanout->request = dcp->iomfb.scanout->request;
 		for (i = 0; i < SWAP_SURFACES; i++) {
@@ -4143,6 +4146,7 @@ void iomfb_present_failed_h17p(struct apple_dcp *dcp)
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 {
 	struct iomfb_transaction *transaction = dcp->iomfb.active;
+	struct iomfb_scanout_h17p *completed = dcp->iomfb.next_scanout;
 	struct iomfb_scanout_h17p *dropped, *next;
 
 	lockdep_assert_held(&dcp->iomfb.lock);
@@ -4166,6 +4170,8 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 		atomic_cmpxchg(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING,
 			       IOMFB_OPAQUE_X_NEEDED);
 	iomfb_scanout_complete_h17p(dcp);
+	if (completed && dcp_is_ext26(dcp))
+		iomfb_ext26_release_retained(dcp, completed);
 	return true;
 }
 
@@ -4812,12 +4818,63 @@ int iomfb_ext26_retain_epoch(struct apple_dcp *dcp)
 	dcp->ext26_retained_bytes = dcpext26_backing_add(dcp->ext26_retained_bytes, bytes);
 	if (bytes)
 		dcp->ext26_epochs++;
+	/* Scanouts prepared from here on belong to the next epoch. */
+	dcp->ext26_stops++;
 	dcp->ext26_blanked = false;
 	dcp->ext26_normal = false;
 	dcp->ext26_early_complete = false;
 	dev_dbg(dcp->dev, "native26 retained epoch %u: %llu backing bytes; remote/DMA fence unproved\n",
 		 dcp->ext26_epochs, dcp->ext26_retained_bytes);
 	return 0;
+}
+
+/*
+ * Release the backing retained from earlier epochs once a present of a later
+ * epoch has completed with a surface of its own.  That completion is the
+ * witness iomfb_present_complete_h17p() already relies on within an epoch:
+ * the firmware has latched the new surface and is past every earlier
+ * present.  Every scanout of an earlier epoch was exposed before the stop that
+ * ended it, and that stop found no present pending or prepared, so the
+ * completed present was submitted after all of them.  The new surface cannot
+ * share a GEM object with them (iomfb_ext26_backing_fresh()).  A retained
+ * scanout is released only if the completed present wrote every layer it
+ * used.  Scanouts retained in the completed present's own epoch (an exposed
+ * present that failed) stay until a present of a later epoch completes.
+ */
+static void iomfb_ext26_release_retained(struct apple_dcp *dcp,
+					 struct iomfb_scanout_h17p *completed)
+{
+	struct iomfb_scanout_h17p *scanout, *next;
+	u64 bytes = 0;
+	unsigned int i;
+	bool surface = false;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	for (i = 0; i < SWAP_SURFACES; i++)
+		surface |= !!completed->fb[i];
+	if (!surface)
+		return;
+	list_for_each_entry_safe(scanout, next, &dcp->ext26_retained, link) {
+		bool replaced = scanout->ext26_epoch != completed->ext26_epoch;
+
+		/*
+		 * Only a layer the completed present wrote is known to have
+		 * moved on: a layer it left out may still hold the old surface.
+		 */
+		for (i = 0; replaced && i < SWAP_SURFACES; i++)
+			if (scanout->fb[i] && !completed->fb[i])
+				replaced = false;
+		if (!replaced) {
+			bytes = dcpext26_backing_add(bytes, ext26_scanout_bytes(scanout));
+			continue;
+		}
+		list_del(&scanout->link);
+		iomfb_scanout_release_h17p(scanout);
+	}
+	if (bytes != dcp->ext26_retained_bytes)
+		dev_dbg(dcp->dev, "native26 epoch %u present completed; %llu retained backing bytes left\n",
+			completed->ext26_epoch, bytes);
+	dcp->ext26_retained_bytes = bytes;
 }
 
 /* A retained old attachment may still address this GEM object. */

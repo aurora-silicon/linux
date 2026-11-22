@@ -62,6 +62,8 @@ struct iomfb_scanout_h17p {
 	struct drm_framebuffer *fb[SWAP_SURFACES];
 	/* On iomfb.dropped while the firmware may still read a dropped present. */
 	struct list_head link;
+	/* Native26: the value of ext26_stops when this snapshot was prepared. */
+	unsigned int ext26_epoch;
 };
 
 /* One operation, including all of its nested replies and present completion. */
@@ -679,6 +681,8 @@ struct apple_dcp {
 	struct list_head ext26_retained;
 	u64 ext26_retained_bytes;
 	unsigned int ext26_epochs;
+	/* Successful retaining stops; tags the epoch of each prepared scanout. */
+	unsigned int ext26_stops;
 	struct drm_display_mode ext26_mode;
 	DECLARE_BITMAP(ext26_released, DCP_MAX_MAPPINGS);
 	bool ext26_power_sent;
