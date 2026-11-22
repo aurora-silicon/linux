@@ -1435,6 +1435,12 @@ assert 'while let Some(mut item) = self.scrub_queue.lock().pop()' not in poll_so
 assert 'self.enqueue_scrubs(scrubs)' in poll_source, 'poll.rs must enqueue scrubs asynchronously'
 assert 'OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_scrub"), false)' in mod_source
 assert 'self.scrub_wq.drain();' in sleep_source, 'sleep.rs::join_workers must drain scrub_wq'
+lifetime_source = (production.parent / 'mmu' / 'lifetime.rs').read_text()
+is_closed_fn = item(lifetime_source, 'pub(crate) fn is_closed(')
+assert '.lock()' not in is_closed_fn, 'Vm::is_closed() must be lock-free'
+assert 'lifetime.closed.load(Ordering::Acquire)' in is_closed_fn
+unmap_fn = item(lifetime_source, 'pub(crate) fn unmap_user_ranges(')
+assert 'lifetime.closed.store(true, Ordering::Release)' in unmap_fn
 budget=(production/'budget.rs').read_text()
 budget=budget.replace('new_condvar, new_mutex,','').replace('#[pin_data]','').replace('    #[pin]\n','')
 constructor=item(budget,'pub(crate) fn new()')
