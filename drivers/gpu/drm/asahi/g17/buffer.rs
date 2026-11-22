@@ -393,7 +393,7 @@ fn alias_in(
 pub(crate) struct TvbGrowth {
     mappings: KVec<mmu::KernelMapping>,
     addresses: KVec<u64>,
-    extensions: KVec<KernelObject>,
+    extensions: KVec<Extension>,
     /// Why the growth stopped short of its target: ENOMEM or ENOSPC.
     stopped: Option<Error>,
 }
@@ -406,7 +406,13 @@ const EXTENSION_BLOCKS: usize = 64;
 /// heap. Field order unmaps the aliases before freeing their backing.
 pub(crate) struct TvbRelease {
     _mappings: KVec<mmu::KernelMapping>,
-    _extensions: KVec<KernelObject>,
+    _extensions: KVec<Extension>,
+}
+
+/// One growth extension's packed blocks, and their charge to the pair's client if it has one.
+struct Extension {
+    backing: KernelObject,
+    _charge: Option<crate::memacct::Charge>,
 }
 
 /// Packed 128-KiB data blocks mapped at guarded 160-KiB virtual strides.
@@ -419,7 +425,7 @@ pub(crate) struct Tvb {
     addresses: KVec<u64>,
     // Retain sparse-block backing until the pool and its aliases retire.
     _primary: KernelObject,
-    extensions: KVec<KernelObject>,
+    extensions: KVec<Extension>,
 }
 impl Tvb {
     /// Blocks are packed in the backing; only their VA placement keeps the
@@ -506,8 +512,23 @@ impl Tvb {
         &self.addresses
     }
     /// Blocks of each growth extension; extensions are packed like the primary.
-    fn extension_blocks(extension: &KernelObject) -> usize {
-        extension.size() / cfg::TVB_BLOCK_SIZE
+    fn extension_blocks(extension: &Extension) -> usize {
+        extension.backing.size() / cfg::TVB_BLOCK_SIZE
+    }
+    /// Backing for `bytes` of growth. A client's growth is admitted against its own and the
+    /// device's memory limits (ENOMEM over one) and counted as its held memory, as its buffers
+    /// are: the client sizes it through its renders.
+    fn extension(dev: &AsahiDrmDevice, client: Option<&Arc<crate::memacct::Client>>,
+        bytes: usize) -> Result<Extension> {
+        let Some(client) = client else {
+            let backing = KernelObject::backing(dev, bytes, CpuMap::WriteCombined)?;
+            return Ok(Extension { backing, _charge: None });
+        };
+        let commit = crate::memacct::LEDGER.admit(client, bytes as u64)?;
+        let backing = KernelObject::backing_user_charged(dev, bytes)?;
+        let charge = crate::memacct::Charge::user(commit, None);
+        charge.set_held(true);
+        Ok(Extension { backing, _charge: Some(charge) })
     }
     /// Blocks of the primary backing, which a heap never gives back.
     fn primary_blocks(&self) -> usize {
@@ -544,9 +565,9 @@ impl Tvb {
             let (start, made) = (addresses.len(), extensions.len());
             let blocks = (added - start).min(EXTENSION_BLOCKS);
             let result = (|| {
-                extensions.push(KernelObject::backing(dev,
-                    Self::backing_bytes(self.geometry, blocks)?, CpuMap::WriteCombined)?, GFP_KERNEL)?;
-                let backing = extensions.last().ok_or(EIO)?;
+                extensions.push(Self::extension(dev, vm.memory_client(),
+                    Self::backing_bytes(self.geometry, blocks)?)?, GFP_KERNEL)?;
+                let backing = &extensions.last().ok_or(EIO)?.backing;
                 for relative in 0..blocks {
                     let mapping = Self::map_block(backing, vm, relative, self.geometry, &ranges)?;
                     addresses.push(mapping.iova(), GFP_KERNEL)?;
@@ -556,7 +577,8 @@ impl Tvb {
             })();
             match result {
                 Ok(()) => {}
-                // Out of memory or of growth arenas: keep the whole extensions made so far.
+                // Over a memory limit, or out of memory or of growth arenas: keep the whole
+                // extensions made so far.
                 Err(error) if error == ENOMEM || error == ENOSPC => {
                     mappings.truncate(start);
                     addresses.truncate(start);

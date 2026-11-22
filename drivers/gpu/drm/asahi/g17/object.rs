@@ -108,6 +108,12 @@ impl KernelObject {
         }, size)
     }
 
+    /// [`Self::backing`] write-combined that is not counted as kernel memory: the caller
+    /// charges it to a client ([`crate::memacct::Charge::user`]).
+    pub(crate) fn backing_user_charged(dev: &AsahiDrmDevice, size: usize) -> Result<Self> {
+        Self::with_object(gem::new_kernel_object_wc_user_charged(dev, size)?, size)
+    }
+
     fn with_object(mut obj: gem::ObjectRef, size: usize) -> Result<Self> {
         let vmap = obj.vmap()?;
         let ptr = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
