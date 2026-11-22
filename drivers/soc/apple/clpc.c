@@ -2116,27 +2116,30 @@ static void apple_clpc_step_khz_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1200000, true), 1500000u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1500000, true), 2000000u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1500000, false), 1200000u);
-	/* The invalid entry is not a step. */
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1200000, false), 600000u);
 	/* Off the table: the nearest entry in that direction. */
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1300000, true), 1500000u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1300000, false), 1200000u);
-	/* No step past either end: @khz back. */
+	/*
+	 * No step past either end: @khz back. The invalid entry sits above
+	 * every real one, so these up steps are the ones that would pick it.
+	 */
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 2000000, true), 2000000u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 600000, false), 600000u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 2100000, true), 2100000u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 0, false), 0u);
 
 	/*
-	 * The low-power top, as apple_clpc_profile_limit() takes it: the first
-	 * entry at or above low_power_khz, so a value between two entries
-	 * rounds up and an exact entry is kept.
+	 * The lookup apple_clpc_profile_limit() makes for the low-power top: the
+	 * first entry at or above low_power_khz, so a value between two entries
+	 * rounds up and an exact entry is kept. Its max_freq fallback is not
+	 * covered here.
 	 */
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1400000 - 1, true), 1500000u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1500000 - 1, true), 1500000u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 600000 - 1, true), 600000u);
-	/* Above the table nothing is found; the caller falls back to max_freq. */
-	KUNIT_EXPECT_LT(test, apple_clpc_step_khz(policy, 2100000 - 1, true), 2100000u);
+	/* Above the table nothing is found and @khz comes back. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 2100000 - 1, true), 2100000u - 1);
 }
 
 static void apple_clpc_steps_first_test(struct kunit *test)
@@ -2161,11 +2164,16 @@ static void apple_clpc_steps_first_test(struct kunit *test)
 static void apple_clpc_vote_test(struct kunit *test)
 {
 	unsigned long hold = msecs_to_jiffies(APPLE_CLPC_HOLD_MS);
-	/* Start close to the jiffies wrap, so the hold spans it. */
-	unsigned long t0 = ULONG_MAX - hold / 2;
+	/*
+	 * Start so that the hold deadline wraps to 0 while its last held
+	 * sample is still ULONG_MAX: a compare that is not wrap-safe drops
+	 * the vote early there.
+	 */
+	unsigned long t0 = ULONG_MAX - (hold - 1);
 	struct apple_clpc_vote vote = {};
 
 	KUNIT_ASSERT_GT(test, hold, 1ul);
+	KUNIT_ASSERT_EQ(test, t0 + hold - 1, ULONG_MAX);
 	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, 0, t0), 0u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, 5, t0), 5u);
 	/* No demand: the state holds for APPLE_CLPC_HOLD_MS, then drops. */
