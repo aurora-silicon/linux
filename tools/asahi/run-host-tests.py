@@ -103,6 +103,9 @@ ASAHI_TESTS = {
     'aop-als-channel-tests.py': [([], PASS)],
     'aop-als-calibration-tests.py': [([], PASS)],
     'aop-bootargs-tests.py': [([], PASS)],
+    # 24dc422773c9 registers another child device for each repeated service announcement.
+    'aop-service-tests.py': [([], PASS),
+                             (['--old-ref', '24dc422773c9beb9e99ee9e1ab713e9d6abb1e7b'], PASS)],
     'mtp-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-transport', '4db3a5a22c43'], PASS),
                          (out() + ['--old-mouse', '62d2045d8928'], PASS)],

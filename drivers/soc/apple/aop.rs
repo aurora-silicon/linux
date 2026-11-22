@@ -57,7 +57,10 @@ use kernel::{
         self,
         ASC_CPU_CONTROL, //
     },
-    str::CString,
+    str::{
+        BStr,
+        CString, //
+    },
     sync::{
         aref::ARef,
         atomic::{
@@ -216,6 +219,7 @@ const ALS_SENSOR_BLOB_LEN: usize = 193;
 const ALS_SENSOR_MESSAGE_LEN: usize = 216;
 
 mod aop_ring;
+mod aop_services;
 
 /// Index into the AFK endpoint tables for RTKit endpoint `ep`, if it is one
 /// of the endpoints this driver drives.
@@ -1307,10 +1311,11 @@ struct AopData {
     epic_v4: bool,
     /// Runs the service registrations one at a time; drained on removal.
     registration_queue: OwnedQueue,
-    /// Serializes queueing a registration with the start of removal, so that
-    /// nothing is queued once the queue drains. Never held across a drain.
+    /// The services that have a device, registered or queued. Taken to queue
+    /// a registration and by the start of removal, so that nothing is queued
+    /// once the queue drains. Never held across a drain.
     #[pin]
-    registration_gate: Mutex<()>,
+    registration_gate: Mutex<aop_services::Claims>,
     /// Set once by the first teardown; later teardowns return at once.
     removing: Atomic<bool>,
     /// Set when the transport starts closing; no call is started after it.
@@ -1432,11 +1437,13 @@ impl WorkItem for AopServiceRegisterWork {
         // transport, but nothing on that path takes this lock.
         let mut subdevices = this.data.subdevices.lock();
         if subdevices.reserve(1, GFP_KERNEL).is_err() {
+            drop(subdevices);
             dev_err!(
                 this.data.dev,
                 "Failed to allocate the device slot for service {:?}",
                 this.name
             );
+            this.data.registration_gate.lock().release(this.service);
             return;
         }
         // SAFETY: `info` is a valid, fully initialized `platform_device_info`
@@ -1445,12 +1452,14 @@ impl WorkItem for AopServiceRegisterWork {
         drop(fwnode);
         match pdev.and_then(|pdev| NonNull::new(pdev).ok_or(EINVAL)) {
             Err(e) => {
+                drop(subdevices);
                 dev_err!(
                     this.data.dev,
                     "Failed to create device for service {:?}: {:?}",
                     this.name,
                     e
                 );
+                this.data.registration_gate.lock().release(this.service);
             }
             Ok(pdev) => {
                 if let Err(child) = subdevices.push_within_capacity(ChildDevice(pdev)) {
@@ -1517,13 +1526,14 @@ impl AopData {
         } else {
             None
         };
+        let claims = aop_services::Claims::new()?;
         Arc::pin_init(
             pin_init!(
                 AopData {
                     dev: dev.as_ref().into(),
                     epic_v4: cfg.epic_v4,
                     registration_queue,
-                    registration_gate <- new_mutex!(()),
+                    registration_gate <- new_mutex!(claims),
                     removing: Atomic::new(false),
                     transport_closing: Atomic::new(false),
                     cpu_started: Atomic::new(false),
@@ -1640,29 +1650,41 @@ impl AopData {
             channel,
             endpoint: ep.index,
         };
-        let dev_name = match name {
-            b"aop-audio" => c_str!("audio"),
-            b"las" => c_str!("las"),
-            b"als" => c_str!("als"),
-            b"accel" => c_str!("accel"),
-            b"gyro" => c_str!("gyro"),
-            b"devmotion6" => c_str!("devmotion6"),
-            b"als-temp" => c_str!("als-temp"),
-            _ => {
-                return Ok(());
-            }
-        };
         // The child's probe calls back into the transport, so it runs from a
         // work item with the endpoint lock dropped. The gate orders queueing
         // it against removal, which drains the queue after setting the flag.
-        let gate = self.registration_gate.lock();
+        let mut claims = self.registration_gate.lock();
         if self.removing.load(Acquire) {
             return Ok(());
         }
-        let work = AopServiceRegisterWork::new(dev_name, self.clone(), svc)?;
-        self.registration_queue.enqueue(work);
-        drop(gate);
-        Ok(())
+        let dev_name = match claims.claim(svc, name) {
+            Ok(Some(dev_name)) => dev_name,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                // Counted and logged as the endpoint's other dropped
+                // messages are, with what the firmware announced.
+                ep.drop_message(
+                    &self.dev,
+                    fmt!(
+                        "service \"{}\" on channel {}: {:?} (its name or channel has a device)",
+                        BStr::from_bytes(name),
+                        channel,
+                        e
+                    ),
+                );
+                return Ok(());
+            }
+        };
+        match AopServiceRegisterWork::new(dev_name, self.clone(), svc) {
+            Ok(work) => {
+                self.registration_queue.enqueue(work);
+                Ok(())
+            }
+            Err(e) => {
+                claims.release(svc);
+                Err(e)
+            }
+        }
     }
 
     /// Hands a report to its listener; `Ok(false)` when there is none.
