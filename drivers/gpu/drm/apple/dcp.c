@@ -7096,6 +7096,9 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 			drm_dev_get(dcp->crtc->base.dev);
 			dcp->drm_retained = true;
 		}
+		/* Its handler talks to the session this unbind leaves behind. */
+		if (dcp->hdmi_hpd_irq)
+			disable_irq(dcp->hdmi_hpd_irq);
 		iomfb_queue_stop(dcp);
 		afk_quiesce(dcp->avep);
 		afk_quiesce(dcp->dptxep);
@@ -7122,6 +7125,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 			dcp->announce.stopped = true;
 		disable_delayed_work_sync(&dcp->announce_wq);
 		dcp_test_point(dcp, DCP_TEST_UNBIND_ANNOUNCE_STOPPED);
+		disable_delayed_work_sync(&dcp->swap_watchdog_wq);
 		cancel_work_sync(&dcp->vblank_wq);
 		if (dcp->connector)
 			cancel_work_sync(&dcp->connector->hotplug_wq);
