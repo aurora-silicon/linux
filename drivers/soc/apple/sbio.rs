@@ -3164,7 +3164,7 @@ impl SepData {
         // unrequested MATCH_RETRY_FINALIZE counting as one more failure.
         match crate::sbio::MatchResult::parse(&result) {
             Some(p) if p.retry_requested() => self.no_match_tail(),
-            Some(p) if !p.matches(user) => dev_info!(
+            Some(p) if !p.matches(user) => dev_info_ratelimited!(
                 self.dev,
                 "verify: the no-match result asks for no retry pass; going straight to MATCH_POLICY\n"
             ),
