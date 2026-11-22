@@ -125,7 +125,37 @@ static void avd_vp9_tiles_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ret, c->ret);
 }
 
+/* The frame size against a 1920x1088 coded format. */
+static void avd_vp9_frame_fits_test(struct kunit *test)
+{
+	struct v4l2_ctrl_vp9_frame frame = {
+		.frame_width_minus_1 = 1919,
+		.frame_height_minus_1 = 1079,
+	};
+
+	KUNIT_EXPECT_TRUE(test, avd_vp9_frame_fits(&frame, 1920, 1088));
+	frame.frame_height_minus_1 = 1087;
+	KUNIT_EXPECT_TRUE(test, avd_vp9_frame_fits(&frame, 1920, 1088));
+	frame.frame_width_minus_1 = 959;
+	frame.frame_height_minus_1 = 539;
+	KUNIT_EXPECT_TRUE(test, avd_vp9_frame_fits(&frame, 1920, 1088));
+
+	frame.frame_width_minus_1 = 1920;
+	frame.frame_height_minus_1 = 1079;
+	KUNIT_EXPECT_FALSE(test, avd_vp9_frame_fits(&frame, 1920, 1088));
+	frame.frame_width_minus_1 = 1919;
+	frame.frame_height_minus_1 = 1088;
+	KUNIT_EXPECT_FALSE(test, avd_vp9_frame_fits(&frame, 1920, 1088));
+	frame.frame_width_minus_1 = 4095;
+	frame.frame_height_minus_1 = 2175;
+	KUNIT_EXPECT_FALSE(test, avd_vp9_frame_fits(&frame, 64, 64));
+	frame.frame_width_minus_1 = 0xffff;
+	frame.frame_height_minus_1 = 0xffff;
+	KUNIT_EXPECT_FALSE(test, avd_vp9_frame_fits(&frame, 4096, 4096));
+}
+
 static struct kunit_case avd_vp9_test_cases[] = {
+	KUNIT_CASE(avd_vp9_frame_fits_test),
 	KUNIT_CASE_PARAM(avd_vp9_tiling_test, avd_vp9_tiling_gen_params),
 	KUNIT_CASE_PARAM(avd_vp9_tiles_test, avd_vp9_tiles_gen_params),
 	{}

@@ -698,6 +698,20 @@ static void init_probs(struct avd_ctx *ctx, const struct avd_vp9_run *run)
 	       sizeof(avd_probs->seg.tree_probs));
 }
 
+/*
+ * The row and column scratch is sized at STREAMON from the OUTPUT (coded)
+ * format, which cannot change while it streams. The CAPTURE format can be
+ * larger and can change meanwhile, so the frame must fit the coded size.
+ */
+VISIBLE_IF_KUNIT bool
+avd_vp9_frame_fits(const struct v4l2_ctrl_vp9_frame *frame, u32 width,
+		   u32 height)
+{
+	return frame->frame_width_minus_1 + 1 <= width &&
+	       frame->frame_height_minus_1 + 1 <= height;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_vp9_frame_fits);
+
 static int validate_dec_params(struct avd_ctx *ctx,
 			       const struct v4l2_ctrl_vp9_frame *dec_params)
 {
@@ -714,6 +728,9 @@ static int validate_dec_params(struct avd_ctx *ctx,
 	if (!avd_backend_is_open(ctx->dev) &&
 	    (dec_params->frame_width_minus_1 + 1 < 64 ||
 	     dec_params->frame_height_minus_1 + 1 < 64))
+		return -EINVAL;
+
+	if (!avd_vp9_frame_fits(dec_params, fmt_width(ctx), fmt_height(ctx)))
 		return -EINVAL;
 
 	aligned_width = max_t(unsigned int,

@@ -400,6 +400,8 @@ int avd_s_capture_fmt(struct file *file, void *priv, struct v4l2_format *f);
 int avd_vp9_check_tiling(const struct v4l2_ctrl_vp9_frame *frame);
 int avd_vp9_next_tile(const u8 *data, u32 payload, bool last, u32 *offset,
 		      u32 *size);
+bool avd_vp9_frame_fits(const struct v4l2_ctrl_vp9_frame *frame, u32 width,
+			u32 height);
 #endif
 
 extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;
