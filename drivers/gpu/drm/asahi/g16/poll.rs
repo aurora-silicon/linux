@@ -588,7 +588,8 @@ impl Firmware {
         // unblocked `engine.pending`. `Prepared::drop` releases standby PB epochs only for
         // `Cache::prepare` waiters (`standby_available`, which enter `submit_locked()` directly),
         // while `publish_woke` covers external state changes (VM close, unstarted queue
-        // cancellation) so pending jobs never wait on the 1 ms housekeeping tick.
+        // cancellation) and `ta_wave_ready()` wakes TA-wave-paced renders when a `0x70` TA
+        // pass finishes while FS is still running.
         let should_publish = !self.engine.pending.is_empty()
             && (retired_any
                 || !had_flights
@@ -597,6 +598,7 @@ impl Firmware {
                 || unfrozen
                 || scrub_woke
                 || publish_woke
+                || self.ta_wave_ready()
                 || housekeeping_due);
         let published = if should_publish {
             self.publish_checked(done)
@@ -715,6 +717,11 @@ impl Firmware {
             .any(|f| f.renders != 0)
             .then_some(self.events.fs_events);
         Some((compute, render))
+    }
+
+    /// Whether a render job paused by `TA_WAVE_PASSES` pacing can publish its next wave now.
+    fn ta_wave_ready(&self) -> bool {
+        self.engine.ta_wave_wait && self.ta_pending_passes() < super::hw::sizes::TA_WAVE_PASSES
     }
 
     /// Cheap single-stage stamp check for the oldest compute and oldest render flights' terminal

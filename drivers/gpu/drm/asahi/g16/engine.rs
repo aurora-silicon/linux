@@ -559,6 +559,8 @@ pub(crate) struct Engine {
     /// headroom (not cross-VM/InitBM drain, external fences, or CPU timestamp waits): repoll
     /// sooner to refill freed slots promptly.
     pub(crate) slot_wait: bool,
+    /// A ready same-VM render job is paused by `TA_WAVE_PASSES` pacing until TA advances.
+    pub(crate) ta_wave_wait: bool,
     /// An EP 0x20 event arrived with a flight still settling its final receipt: repoll sooner.
     pub(crate) short_repoll: bool,
     /// Progress tracking of the oldest compute and render flights.
@@ -600,6 +602,7 @@ impl Engine {
             ta_registered: false,
             chan_wait: false,
             slot_wait: false,
+            ta_wave_wait: false,
             short_repoll: false,
             progress_flight: [0; 2],
             progress: [None; 3],
@@ -939,6 +942,7 @@ impl Firmware {
 
         self.engine.chan_wait = false;
         self.engine.slot_wait = false;
+        self.engine.ta_wave_wait = false;
         while self.recovery.failed().is_none()
             && !self.engine.frozen
             && !self.engine.pending.is_empty()
@@ -986,6 +990,17 @@ impl Firmware {
                             .pending
                             .iter()
                             .any(|cand| self.blocked_on_slot_headroom(cand));
+                        self.engine.ta_wave_wait = self.ta_pending_passes()
+                            >= super::hw::sizes::TA_WAVE_PASSES
+                            && self.engine.pending.iter().any(|cand| {
+                                matches!(
+                                    command(cand, cand.progress.sent()),
+                                    Some(Command::Render(_))
+                                ) && !self.needs_engine_drain(cand)
+                                    && cand
+                                        .check_command_dependencies(cand.progress.sent())
+                                        .is_ok()
+                            });
                         self.engine.stats.hold[0] += 1;
                         break;
                     }
@@ -1081,6 +1096,24 @@ impl Firmware {
                     self.recovery.publication_wait_deadline = None;
                     if job.progress.sent() == job.progress.count() {
                         self.engine.unpend(&job); // fully published
+                    }
+                    // Ring TA/FS immediately once a render wave fills TA_WAVE_PASSES so the GPU
+                    // starts tiling right away instead of waiting behind another loop iteration
+                    // or an alt-class compute publication.
+                    if pending_rings & ((1u8 << (Channel::Fs as u8)) | (1u8 << (Channel::Ta as u8)))
+                        != 0
+                        && self.ta_pending_passes() >= super::hw::sizes::TA_WAVE_PASSES
+                    {
+                        if let Err(e) = self.flush_doorbells(&mut pending_rings) {
+                            dev_err!(
+                                self.graph.dev.as_ref(),
+                                "G16: render wave doorbell ring failed after visibility began ({:?})\n",
+                                e
+                            );
+                            self.fail_stop(EIO, done);
+                            result = Err(EIO);
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -1239,6 +1272,33 @@ impl Firmware {
         }
     }
 
+    /// Unfinished TA passes across active render flights. Returns immediately without reading
+    /// WC memory when total active render passes are already below `TA_WAVE_PASSES`.
+    pub(crate) fn ta_pending_passes(&self) -> usize {
+        let active_renders: usize = self
+            .engine
+            .flights
+            .iter()
+            .map(|f| f.renders as usize)
+            .sum();
+        if active_renders < super::hw::sizes::TA_WAVE_PASSES {
+            return active_renders;
+        }
+        let Ok(obs) = self.graph.render.fw_stamp[0].r32(0) else {
+            return active_renders;
+        };
+        let tail = self.engine.ta_target;
+        let mut pending = 0usize;
+        for f in &self.engine.flights {
+            for &stamp in &f.r_ta_stamp[..(f.renders as usize).min(f.r_ta_stamp.len())] {
+                if !super::recovery::logic::stamp_reached(obs, stamp, tail) {
+                    pending += 1;
+                }
+            }
+        }
+        pending
+    }
+
     /// Whether `job`'s next command may be published behind the flights in flight:
     ///
     /// - Compute queues behind healthy same-VM non-InitBM compute and/or render flights (up to
@@ -1306,6 +1366,7 @@ impl Firmware {
             Some(Command::Render(_)) => {
                 let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
                 render_count < params::render_flights()
+                    && self.ta_pending_passes() < super::hw::sizes::TA_WAVE_PASSES
                     && !self.slots.render_exhausted()
                     && !self.pools.exhausted()
                     && super::recovery::logic::next_ordinal(e.draw).is_some()
@@ -1847,7 +1908,8 @@ impl Firmware {
                         .sum();
                     let mut more_renders = params::render_flights()
                         .saturating_sub(active_renders + 1)
-                        .min(sizes::RENDER_SLOTS.saturating_sub(1));
+                        .min(sizes::RENDER_SLOTS.saturating_sub(1))
+                        .min(sizes::TA_WAVE_PASSES.saturating_sub(self.ta_pending_passes() + 1));
                     while more_renders > 0 && end < job.progress.count() {
                         let Some(next_seq) = last_seq.and_then(|s| s.checked_add(1)) else {
                             break;

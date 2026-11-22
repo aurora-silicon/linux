@@ -53,6 +53,11 @@ type Result<T = ()> = std::result::Result<T, Error>;
 const HOUSEKEEPING_NS: u64 = 1_000_000;
 const AUX_DRAIN_NS: u64 = 10_000_000;
 const EVENT_RETIRE_POLLS: u32 = 11;
+mod hw {
+    pub mod sizes {
+        pub const TA_WAVE_PASSES: usize = 3;
+    }
+}
 
 thread_local! {
     static CLOCK: Cell<u64> = const { Cell::new(0) };
@@ -141,6 +146,7 @@ struct Engine {
     fs_target: u32,
     chan_wait: bool,
     slot_wait: bool,
+    ta_wave_wait: bool,
     short_repoll: bool,
     frozen: bool,
     stats: Stats,
@@ -270,6 +276,7 @@ struct Firmware {
     drain_stage_delta: u32,
     drain_fs_delta: u32,
     drain_compute_delta: u32,
+    ta_pending: usize,
     retire_calls: u32,
     publish_full_calls: u32,
     publish_checked_calls: u32,
@@ -299,6 +306,7 @@ impl Firmware {
                 fs_target: 0,
                 chan_wait: false,
                 slot_wait: false,
+                ta_wave_wait: false,
                 short_repoll: false,
                 frozen: false,
                 stats: Stats::default(),
@@ -315,6 +323,7 @@ impl Firmware {
             drain_stage_delta: 0,
             drain_fs_delta: 0,
             drain_compute_delta: 0,
+            ta_pending: 0,
             retire_calls: 0,
             publish_full_calls: 0,
             publish_checked_calls: 0,
@@ -379,9 +388,13 @@ impl Firmware {
         self.publish_checked_calls += 1;
         Ok(())
     }
+    fn ta_pending_passes(&self) -> usize {
+        self.ta_pending
+    }
 
     __POLL_STEP__
     __OLDEST_TERMINAL_EVENTS__
+    __TA_WAVE_READY__
     __OLDEST_STAMP_REACHED__
 }
 
@@ -751,6 +764,45 @@ fn pending_slot_wait_arms_short_repoll_without_breaking_ta_only_or_frozen() {
     assert!(fw
         .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
         .unwrap());
+    assert!(!fw.engine.short_repoll);
+}
+
+#[test]
+fn ta_only_irq_wakes_ta_wave_wait_without_spinning_retry_tail() {
+    CLOCK.with(|c| c.set(100_000));
+    let mut fw = Firmware::new();
+    fw.engine.flights.push(Flight {
+        computes: 0,
+        renders: 3,
+        target: 0,
+        fs_target: 0x300,
+    });
+    fw.engine.fs_target = 0x300;
+    fw.engine.pending.push(Arc::new(Job { id: 2 }));
+    fw.engine.ta_wave_wait = true;
+    fw.ta_pending = 3;
+    fw.drain_stage_delta = 1;
+    fw.drain_fs_delta = 0;
+
+    let mut retry_tail = false;
+    let mut deferred = false;
+    let mut done = vec![];
+    // TA still full (3 >= 3): no publish_checked wakeup and no retry_tail spin.
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 0);
+    assert!(!retry_tail);
+    assert!(!fw.engine.short_repoll);
+
+    // TA finishes one pass (ta_pending drops to 2 < 3) on a TA-only 0x70 IRQ while FS is still
+    // running: immediately wakes publish_checked() without spinning retry_tail or short_repoll.
+    fw.ta_pending = 2;
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 1);
+    assert!(!retry_tail);
     assert!(!fw.engine.short_repoll);
 }
 
@@ -1255,13 +1307,14 @@ for token, decl in {
     '__POLL_STEP__': 'pub(crate) fn poll_step(',
     '__RUN_HOUSEKEEPING__': 'pub(crate) fn run_housekeeping(',
     '__OLDEST_TERMINAL_EVENTS__': 'fn oldest_terminal_events(',
+    '__TA_WAVE_READY__': 'fn ta_wave_ready(',
     '__OLDEST_STAMP_REACHED__': 'fn oldest_stamp_reached(',
     '__CANCEL_RESNAP__': 'pub(crate) fn cancel_resnap(',
     '__REARM_US__': 'pub(crate) fn rearm_us(',
     '__REARM__': 'pub(crate) fn rearm(',
     '__POLL_NOW__': 'pub(crate) fn poll_now(',
 }.items():
-    harness = harness.replace(token, item(decl))
+    harness = harness.replace(token, item(decl).replace('super::hw::', 'hw::'))
 for token, decl in {
     '__EVENT_DRAIN__': 'pub(crate) fn drain(',
     '__EVENT_DRAIN_STATS__': 'pub(crate) fn drain_statistics(',
@@ -1285,7 +1338,7 @@ for command in [
     json.dumps(
         {
             'passed': True,
-            'tests': 17,
+            'tests': 18,
             'cpu_only': True,
             'hardware_execution': False,
             'scope': 'Verbatim production submit_locked inline retirement and poll_step TA-only non-spin logic.',
