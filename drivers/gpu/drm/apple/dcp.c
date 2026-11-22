@@ -5593,6 +5593,48 @@ err_destroy_pdev:
 	return ret;
 }
 
+/*
+ * The realtime bandwidth slot: usually a window of its own, at index
+ * @expected right after the "disp-N" ones (returns 1). A T8132 DCP describes
+ * the PMC window that holds its slot as its last display window instead
+ * (disp-4, the ADT's dispN reg[4]), and apple,bw-scratch names that index:
+ * the slot is then an offset into that window, which the firmware already
+ * maps, and no window is added (returns 0).
+ */
+static int dcp_get_bw_scratch_in_window(struct apple_dcp *dcp,
+					struct of_phandle_args *ph_args,
+					u32 addr_idx, u32 disp_idx, u32 offset)
+{
+	struct resource *win = dcp->disp_registers[disp_idx];
+	struct resource slot;
+	u64 addr;
+	int ret;
+
+	ret = of_address_to_resource(ph_args->np, addr_idx, &slot);
+	if (ret < 0) {
+		dev_err(dcp->dev, "Failed to get 'apple,bw-scratch' resource %d from %pOF\n",
+			addr_idx, ph_args->np);
+		return ret;
+	}
+	/* The slot's 4 bytes, inside both the PMGR range and the window. */
+	if (resource_size(&slot) < 4 || offset > resource_size(&slot) - 4 ||
+	    resource_size(win) < 4) {
+		dev_err(dcp->dev, "'apple,bw-scratch' offset %#x is outside %pR\n",
+			offset, &slot);
+		return -EINVAL;
+	}
+	addr = slot.start + offset;
+	if (addr < win->start || addr - win->start > resource_size(win) - 4) {
+		dev_err(dcp->dev, "'apple,bw-scratch' %#llx is outside display window %u %pR\n",
+			addr, disp_idx, win);
+		return -EINVAL;
+	}
+	dcp->disp_bw_scratch_res = *win;
+	dcp->disp_bw_scratch_index = disp_idx;
+	dcp->disp_bw_scratch_offset = addr - win->start;
+	return 0;
+}
+
 static int dcp_get_bw_scratch_reg(struct apple_dcp *dcp, u32 expected)
 {
 	struct of_phandle_args ph_args;
@@ -5617,6 +5659,11 @@ static int dcp_get_bw_scratch_reg(struct apple_dcp *dcp, u32 expected)
 	disp_idx = ph_args.args[1];
 	offset = ph_args.args[2];
 
+	if (disp_idx && disp_idx < expected) {
+		ret = dcp_get_bw_scratch_in_window(dcp, &ph_args, addr_idx,
+						   disp_idx, offset);
+		goto err_of_node_put;
+	}
 	if (disp_idx != expected || disp_idx >= MAX_DISP_REGISTERS) {
 		dev_err(dcp->dev, "Unexpected disp_reg value in 'apple,bw-scratch': %d\n",
 			disp_idx);
@@ -5638,7 +5685,7 @@ static int dcp_get_bw_scratch_reg(struct apple_dcp *dcp, u32 expected)
 	dcp->disp_registers[disp_idx] = &dcp->disp_bw_scratch_res;
 	dcp->disp_bw_scratch_index = disp_idx;
 	dcp->disp_bw_scratch_offset = offset;
-	ret = 0;
+	ret = 1;
 
 err_of_node_put:
 	of_node_put(ph_args.np);
@@ -5770,7 +5817,7 @@ static int dcp_get_disp_regs(struct apple_dcp *dcp)
 	ret = dcp_get_bw_scratch_reg(dcp, count);
 	if (ret < 0)
 		return ret;
-	count += 1;
+	count += ret;
 
 	/* load pmgr bandwidth doorbell resource if present (only on t8103) */
 	if (of_property_present(dcp->dev->of_node, "apple,bw-doorbell")) {
@@ -5894,14 +5941,37 @@ static bool dcp_v27_sleep_transport_supported(struct apple_dcp *dcp)
 	       !strcmp(compat, "27.0.0");
 }
 
+/*
+ * Firmware 27, if firmware-compat @compat_str has a 27.x method table with an
+ * ID for every method the driver calls: the firmware panics on an unknown tag.
+ */
+static enum dcp_firmware_version dcp_v27_method_table(struct device *dev,
+							const char *compat_str)
+{
+	const struct dcp_method_entry *methods = iomfb_v27_methods(compat_str);
+	unsigned int num_missing;
+	const char *missing;
+
+	if (!methods) {
+		dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
+			compat_str);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+	missing = iomfb_v27_missing_method(methods, &num_missing);
+	if (missing) {
+		dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
+			compat_str, num_missing, missing);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+	return DCP_FIRMWARE_V_27_0;
+}
+
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(dev);
 	const struct dcp_v14_board *v14_board;
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
-	unsigned int num_missing;
-	const char *missing;
 	int ret;
 
 	/*
@@ -5917,21 +5987,25 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 			return DCP_FIRMWARE_V_27_0;
 	}
 
+	/*
+	 * The T8122 (M3 MacBook Air) internal DCP on the 27.2 (26B123) image
+	 * runs the firmware-27 backend with the 27.2 table, as the T6041's
+	 * 27.2 internal DCP does. Its 14.x image keeps the native 14.7 path
+	 * and the 25G83 profile its own, below.
+	 */
+	if (apple_t8122_dcp_v27_2(dev->of_node)) {
+		/* Checked by apple_t8122_dcp_v27_2(). */
+		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		return dcp_v27_method_table(dev, compat_str);
+	}
+
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret < 0 || !iomfb_v27_methods(compat_str)) {
-			dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
-				ret < 0 ? "missing" : compat_str);
+		if (ret < 0) {
+			dev_err(dev, "DCP firmware-compat missing has no 27.x method table\n");
 			return DCP_FIRMWARE_UNKNOWN;
 		}
-		missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
-						   &num_missing);
-		if (missing) {
-			dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
-				compat_str, num_missing, missing);
-			return DCP_FIRMWARE_UNKNOWN;
-		}
-		return DCP_FIRMWARE_V_27_0;
+		return dcp_v27_method_table(dev, compat_str);
 	}
 
 	/*
@@ -5959,21 +6033,8 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		    (!strcmp(fw_str, "26.5.2") || !strcmp(fw_str, "26.6.2")))
 			return DCP_FIRMWARE_V_26_6_DESKTOP;
 		if (apple_t6041_dcp_v27_2(dev->of_node) ||
-		    apple_t6041_dcpext_v27_2(dev->of_node)) {
-			if (!iomfb_v27_methods(compat_str)) {
-				dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
-					compat_str);
-				return DCP_FIRMWARE_UNKNOWN;
-			}
-			missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
-							   &num_missing);
-			if (missing) {
-				dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
-					compat_str, num_missing, missing);
-				return DCP_FIRMWARE_UNKNOWN;
-			}
-			return DCP_FIRMWARE_V_27_0;
-		}
+		    apple_t6041_dcpext_v27_2(dev->of_node))
+			return dcp_v27_method_table(dev, compat_str);
 		dev_err(dev, "T6041 display not started: unsupported DCP firmware %s (compat %s)\n",
 			ret >= 0 ? fw_str : "missing",
 			compat_ret >= 0 ? compat_str : "missing");
@@ -6203,8 +6264,13 @@ clocks:
 	 * (376 at 712 MHz and 460 at 0 Hz). Expose the same two-entry table
 	 * when apple,clock-ids is absent so getClockFrequency(0/1) matches.
 	 */
+	/*
+	 * The T8122 /arm-io/disp0 names the same pair (345 at 712 MHz, the
+	 * device tree's disp0 clock, and 416 at 0 Hz).
+	 */
 	if (!of_property_present(dev->of_node, "apple,clock-ids") &&
-	    of_device_is_compatible(dev->of_node, "apple,t6041-dcp")) {
+	    (of_device_is_compatible(dev->of_node, "apple,t6041-dcp") ||
+	     of_device_is_compatible(dev->of_node, "apple,t8122-dcp"))) {
 		struct clk *clk = devm_clk_get_optional(dev, NULL);
 
 		if (IS_ERR(clk))
@@ -7260,6 +7326,17 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	 */
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t6041-dcp")) {
+		dcp->hw.firmware_dma_bits = 41;
+		dcp->hw.num_dptx_ports = 0;
+		dcp->hw.adopt_live_session = true;
+	}
+	/*
+	 * The same for the T8122 internal panel on firmware 27: its DART
+	 * window is 0x100_0000_0000 + 64 GiB, and dcpext drives the external
+	 * ports.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t8122-dcp")) {
 		dcp->hw.firmware_dma_bits = 41;
 		dcp->hw.num_dptx_ports = 0;
 		dcp->hw.adopt_live_session = true;
