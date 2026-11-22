@@ -827,4 +827,5 @@ int dpavservep_init(struct apple_dcp *dcp)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "dpavservep-v14-test.c"
+#include "dpavservep-identity-test.c"
 #endif
