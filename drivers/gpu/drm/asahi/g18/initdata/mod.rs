@@ -107,7 +107,8 @@ const EVENT_TYPE_RECOVERY: u32 = 4;
 const EVENT_TYPE_TVB_GROW: u32 = 6;
 /// Device-control TvbGrowReply (g17 DeviceControlOp::TvbGrowReply).
 const DEVICE_CONTROL_OPCODE_TVB_GROW_REPLY: u32 = 0x08;
-/// Grow requests held between a drain and the session answering them.
+/// Grow requests held between a drain and the session answering them. More
+/// stay in the event ring until a later drain.
 const TVB_GROW_QUEUE: usize = 4;
 
 /// `halLoadUMADesc` device words (accelerator+0x11af8..0x11b10) as native
@@ -912,10 +913,23 @@ impl G18FirmwareMemory {
                         recovery |= word(0) == EVENT_TYPE_RECOVERY;
                         if word(0) == EVENT_TYPE_TVB_GROW {
                             // The session grows the PB and replies after the drain.
-                            self.tvb_grow.push_within_capacity(G18TvbGrowRequest {
+                            let request = G18TvbGrowRequest {
                                 vm_slot: word(4), buffer_slot: word(8), counter: word(0xc),
                                 subpipe: word(0x10), halt_count: qword(0x14),
-                            }).map_err(|_| EBUSY)?;
+                            };
+                            // A repeated request gets one reply, as on G17.
+                            if !self.tvb_grow.contains(&request) {
+                                if self.tvb_grow.len() >= TVB_GROW_QUEUE {
+                                    // Leave it in the ring: the session answers
+                                    // the queued ones first, the next drain
+                                    // takes this one. The session drains on
+                                    // every poll of its waits (poll_faults(),
+                                    // check_faults()), not on an interrupt, so
+                                    // the next drain is one poll away.
+                                    break;
+                                }
+                                self.tvb_grow.push_within_capacity(request).map_err(|_| EBUSY)?;
+                            }
                         }
                         if role == 0 && word(0) == 1 {
                             // Original G18 b000 233a8..233d4 uses this exact
