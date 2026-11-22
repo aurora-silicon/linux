@@ -3349,7 +3349,11 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.needs_ioq_registers = true,
 	.lsq_in_nvmmu = true,
 	.max_queue_depth = 64,
-	.quirks = NVME_QUIRK_NO_APST,
+	/*
+	 * FUA has not been shown durable on any post-M4 ANS (T8132, T8140,
+	 * T8142 and T6050 all flush instead), and this is the T8132 controller.
+	 */
+	.quirks = NVME_QUIRK_NO_APST | NVME_QUIRK_BROKEN_FUA,
 };
 
 /*
