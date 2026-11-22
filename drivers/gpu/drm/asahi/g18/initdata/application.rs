@@ -59,7 +59,7 @@ impl G18FirmwareMemory {
         let after=(before+records.len() as u32)%256;
         self.shared.with_bytes_mut(|out| {
             for (index,record) in records.iter().enumerate() {
-                let start=init::G18G_26A428_WORK_RING_BUNDLE_OFFSETS[8]+((before as usize+index)%256)*24;
+                let start=self.layouts.work_rings[8]+((before as usize+index)%256)*24;
                 out.get_mut(start..start+24).ok_or(EINVAL)?.copy_from_slice(record);
             } Ok(())
         })?;

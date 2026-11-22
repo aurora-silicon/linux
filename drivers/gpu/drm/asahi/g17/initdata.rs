@@ -17,6 +17,7 @@ use kernel::{c_str, prelude::*, sync::Arc};
 use t8140::{kernel_window as high, low};
 
 mod v25g83;
+mod v26b123;
 mod m5;
 mod work_pair;
 pub(crate) mod outer_credit;
@@ -172,6 +173,10 @@ impl WorkPublication<'_> {
 /// Session-long storage and mappings. Aliases are released before their backing objects.
 pub(super) struct InitData {
     m5: bool,
+    v26b123: bool,
+    /// The lowest effort that keeps work above the base performance state
+    /// ([`active_effort`]); zero on M5, which has no such table.
+    active_effort: u32,
     /// The M5 firmware build's layout, where [`Self::m5`].
     graph: &'static super::fw::m5::initdata::Graph,
     outer_credits: Option<Arc<outer_credit::Credits>>,
@@ -186,6 +191,7 @@ pub(super) struct InitData {
     cluster: usize,
     bundle: usize,
     region_c: usize,
+    region_c_shift: usize,
     qos: usize,
     pb: usize,
     page_pool: usize,
@@ -291,6 +297,8 @@ impl InitData {
     pub(super) fn new() -> Self {
         Self {
             m5: false,
+            v26b123: false,
+            active_effort: 0,
             graph: &super::fw::m5::initdata::M5_GRAPH,
             outer_credits: None,
             _single_publisher: core::marker::PhantomData,
@@ -301,6 +309,7 @@ impl InitData {
             cluster: 0,
             bundle: 0,
             region_c: 0,
+            region_c_shift: 0,
             qos: 0,
             pb: 0,
             page_pool: 0,
@@ -477,7 +486,7 @@ impl InitData {
     /// A scheduler-state release record in the family's opcode.
     pub(super) fn scheduler_release(&self, page_va: u64, id: [u8; 4]) -> super::fw::channels::SchedulerStateRelease {
         let mut record = super::fw::channels::SchedulerStateRelease::new(page_va, id);
-        if self.m5 {
+        if self.m5 || self.v26b123 {
             record.opcode = super::fw::m5::queue::SCHEDULER_RELEASE_OPCODE;
         }
         record
@@ -1171,6 +1180,7 @@ impl InitData {
         variant: &super::fw::Variant,
     ) -> Result {
         self.pm_metrics_va = cfg.pm_metrics()?.va;
+        self.v26b123 = variant.v26b123;
         self.recovery_slot_keys = cfg.recovery_slot_keys;
         let range = uat.geometry().kernel_range();
         let env = BuildEnv {
@@ -1185,6 +1195,7 @@ impl InitData {
         if variant.graph == super::fw::variant::InitGraph::V25G83 {
             return self.build_25g83(&env, cfg, metrics, active_cores, variant);
         }
+        self.active_effort = active_effort(&Self::opps(dev, cfg.opps, clusters)?, cfg.perf()?)?;
         self.map_register_windows(&env, cfg.windows)?;
         let tables = self.build_descriptor_tables(&env, abi::private::SIZE)?;
         self.build_render_free_lists(&env)?;
@@ -1665,13 +1676,29 @@ impl InitData {
         self.m5
     }
 
-    /// The effort value the firmware is given for a requested `effort`. M5 publishes none while
-    /// work streams, except while a host thread waits for it (`waited`): then the full effort,
-    /// which the firmware takes as a floor for its performance state, so a submit-and-wait loop
-    /// runs at the top state.
-    pub(super) fn submission_effort(&self, effort: u32, waited: bool) -> u32 {
-        if self.m5 && !waited { 0 }
-        else { effort }
+    /// The effort value the firmware is given for a requested `effort`. The firmware takes the
+    /// effort as a floor for its performance state, as a fraction of the top state's frequency
+    /// (16.16); without one, its own controller raises the state for work that queues up behind
+    /// the running command and otherwise lets it fall to the base state.
+    ///
+    /// M5 publishes none while work streams, except while a host thread waits for it (`waited`):
+    /// then the full effort, so a submit-and-wait loop runs at the top state.
+    ///
+    /// The other G17 SoCs publish the full effort while a client has kept the GPU running
+    /// without going idle for longer than the effort hold (`bound`, [`super::power::BusyRuns`]):
+    /// a submit-and-wait loop queues nothing behind its command, so the firmware alone keeps it
+    /// at the bottom state however busy the GPU is. Other work streams with the lowest effort
+    /// that keeps it above the base performance state ([`active_effort`]), and leaves the rest
+    /// to the firmware: work that the firmware let fall to the base state stalled the GPU under
+    /// concurrent load (a firmware recovery with no fault), and a full effort on every
+    /// submission held the top state whatever the load. A waiter doesn't tell paced work from a
+    /// submit-and-wait loop, because paced work has one too (the compositor, or the next frame's
+    /// fence).
+    pub(super) fn submission_effort(&self, effort: u32, waited: bool, bound: bool) -> u32 {
+        if self.m5 {
+            return if waited { effort } else { 0 };
+        }
+        if bound { effort } else { effort.min(self.active_effort) }
     }
 
     /// Writes the effort input in firmware order, then cleans its cache line to coherency.
@@ -1679,7 +1706,12 @@ impl InitData {
         let region = self.object(self.region_c)?;
         let (effort_offset, override_offset) = if self.m5 {
             (super::fw::m5::power::EFFORT, super::fw::m5::power::EFFORT_OVERRIDE)
-        } else { (abi::RegionC::EFFORT, abi::RegionC::UNK_E8) };
+        } else {
+            (
+                abi::RegionC::EFFORT + self.region_c_shift,
+                abi::RegionC::UNK_E8 + self.region_c_shift,
+            )
+        };
         let override_word = region.word(override_offset)?;
         let effort_word = region.word(effort_offset)?;
         let line = region.pointer(effort_offset, 4)?;
@@ -1697,7 +1729,11 @@ impl InitData {
     pub(super) fn effort(&self) -> Result<u32> {
         Ok(self
             .object(self.region_c)?
-            .word(if self.m5 { super::fw::m5::power::EFFORT } else { abi::RegionC::EFFORT })?
+            .word(if self.m5 {
+                super::fw::m5::power::EFFORT
+            } else {
+                abi::RegionC::EFFORT + self.region_c_shift
+            })?
             .load(Ordering::Relaxed))
     }
 
@@ -1876,8 +1912,11 @@ impl InitData {
         let ring = self.object(self.bundle)?.pointer(offset, record.len())?;
         let power = self
             .object(self.region_c)?
-            .pointer(if self.m5 { self.graph.power_assert_tally }
-                else { abi::RegionC::POWER_ASSERT_TALLY }, 4)?;
+            .pointer(if self.m5 {
+                self.graph.power_assert_tally
+            } else {
+                abi::RegionC::POWER_ASSERT_TALLY + self.region_c_shift
+            }, 4)?;
         let producer = self.control_producer()?;
         // SAFETY: The checked pointers remain valid for the lifetime of this non-Sync owner.
         // Firmware only reads records after the producer store and the device mutex serializes
@@ -1973,6 +2012,25 @@ impl InitData {
     }
 }
 
+impl InitData {
+    /// The M5 firmware's recovery record, read in recovery state 1 like the slot mask.
+    fn m5_recovery_record(&self) -> Result<super::recovery::Record> {
+        use super::fw::m5::initdata as m5;
+        let base = self.graph.private.status_b;
+        let object = self.object(self.cluster)?;
+        let word = |offset: usize| -> Result<u32> {
+            Ok(object.word(base + offset)?.load(Ordering::Relaxed))
+        };
+        fence(Ordering::Acquire);
+        Ok(super::recovery::Record {
+            reason: word(m5::M5_RECOVERY_REASON)?,
+            slots_walked: word(m5::M5_RECOVERY_SLOTS_WALKED)?,
+            slot_word: word(m5::M5_RECOVERY_SLOT_WORD)?,
+            detail: object.dword(base + m5::M5_RECOVERY_DETAIL)?.load(Ordering::Relaxed),
+        })
+    }
+}
+
 impl super::recovery::Memory for InitData {
     fn is_m5(&self) -> bool {
         self.m5
@@ -1990,9 +2048,13 @@ impl super::recovery::Memory for InitData {
             .load(Ordering::Relaxed);
         // M5's slot-identity storage is not available through this mapping.
         // Keep firmware's explicit blame when attribution evidence is missing,
-        // while still allowing the recovery handshake to complete.
+        // while still allowing the recovery handshake to complete. Its firmware's
+        // recovery record names the cause in the log only: it does not steer
+        // blame, since the M5 reasons are not yet proven to mean what G17P's do.
         if self.m5 {
-            return Ok(super::recovery::Sources::sample(mask as u32, |_| None));
+            let mut sources = super::recovery::Sources::sample(mask as u32, |_| None);
+            sources.record = self.m5_recovery_record().ok();
+            return Ok(sources);
         }
         let mut sources = super::recovery::Sources::sample(mask as u32, |slot| {
             // Progress is independently available even when this firmware's key
@@ -2149,5 +2211,48 @@ impl InitData {
             options(nostack, preserves_flags))
         };
         Ok(())
+    }
+}
+
+/// The lowest effort that keeps work above the base performance state, from the performance
+/// table the firmware is given: the frequency of the first state above the base as a fraction
+/// of the top state's (16.16, rounded up). The base state is the one the table's B curve gives
+/// no relative performance (on T6040 the boot loader's `apple,perf-base-pstate`); the firmware
+/// powers the GPU up in it.
+pub(super) fn active_effort(opps: &[abi::Opp], perf: &abi::PerfConfig) -> Result<u32> {
+    let base = perf.relative_b.iter().skip(1).take_while(|&&value| value == 0).count();
+    let frequency = |state: usize| -> Result<u64> {
+        let index = usize::from(*perf.states_a.get(state).ok_or(EINVAL)?);
+        Ok(opps.get(index).ok_or(EINVAL)?.freq_hz)
+    };
+    let (active, top) = (frequency(base + 1)?, frequency(perf.states_a.len() - 1)?);
+    if active == 0 || active > top {
+        return Err(EINVAL);
+    }
+    let effort = (active * u64::from(super::power::FULL_EFFORT)).div_ceil(top);
+    u32::try_from(effort).map_err(|_| EINVAL)
+}
+
+#[kernel::macros::kunit_tests(asahi_g17_active_effort)]
+mod active_effort_tests {
+    use super::*;
+
+    fn opp(mhz: u64) -> abi::Opp {
+        abi::Opp { freq_hz: mhz * 1_000_000, volt_uv: [0; abi::OPP_CELLS], cells: 1 }
+    }
+
+    #[test]
+    fn floor_is_the_first_state_above_the_base_as_a_fraction_of_the_top() {
+        // A T8140's operating points in performance-state order.
+        let opps = [0, 338, 492, 618, 796, 928, 952, 1056, 1053, 1170, 1152, 1278, 1204, 1338,
+            1326, 1470].map(opp);
+        // State 2 (492 MHz) of 1470 MHz, rounded up: the firmware never picks state 1 for it.
+        assert_eq!(active_effort(&opps, &t8140::PERF), Ok(0x55af));
+    }
+
+    #[test]
+    fn a_table_without_a_frequency_above_the_base_is_refused() {
+        let opps = [0u64; 16].map(opp);
+        assert_eq!(active_effort(&opps, &t8140::PERF), Err(EINVAL));
     }
 }
