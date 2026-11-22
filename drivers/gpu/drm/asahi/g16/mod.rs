@@ -212,6 +212,9 @@ pub(crate) struct Shared {
     pub(crate) crashed: AtomicBool,
     /// Set by the firmware's EP 0x20 event message; consumed by the poll work.
     pub(crate) evented: AtomicBool,
+    /// Set by external state changes (VM teardown, unstarted queue cancellation) so the next
+    /// `poll_step()` re-evaluates `publish_checked()` even while unrelated flights are active.
+    pub(crate) publish_wake: AtomicBool,
     /// CPU that last submitted work, for placing the per-CPU completion worker.
     pub(crate) submitter: AtomicU32,
     /// Monotonic timestamp (ns) of the previous submit, for active-burst wait hints.
@@ -339,6 +342,15 @@ impl Shared {
     pub(crate) fn kick(self: &Arc<Self>) {
         self.evented.store(true, Ordering::Release);
         self.poll_now();
+    }
+
+    /// Marks external publish-relevant state dirty and queues a poll so pending jobs re-evaluate
+    /// without waiting for the 1 ms housekeeping tick.
+    pub(crate) fn wake_publish(self: &Arc<Self>) {
+        self.publish_wake.store(true, Ordering::Release);
+        if self.started.load(Ordering::Acquire) && !self.sleeping.load(Ordering::Acquire) {
+            self.poll_now();
+        }
     }
 
     /// Latches the fail-stop state.
@@ -481,6 +493,7 @@ impl Gpu {
                 wedged_notified: AtomicBool::new(false),
                 crashed: AtomicBool::new(false),
                 evented: AtomicBool::new(false),
+                publish_wake: AtomicBool::new(false),
                 submitter: AtomicU32::new(u32::MAX),
                 last_submit_ns: AtomicU64::new(0),
                 wait_hint_streak: AtomicU32::new(0),
@@ -731,6 +744,7 @@ impl gpu::Gpu for Gpu {
     }
     fn vm_closed(&self, vm: &mmu::Vm) {
         self.vms.close(vm.id());
+        self.shared.wake_publish();
     }
 
     fn new_queue(

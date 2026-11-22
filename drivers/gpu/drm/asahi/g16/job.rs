@@ -302,6 +302,7 @@ impl Job {
             // before signalling; later accepted ordinals must not jump this hole.
             self.queue.cancel(&self.orders, self.progress.sent());
             self.finish(Err(ECANCELED), false);
+            shared.wake_publish();
             return;
         }
         // `Shared::submit`: enqueue, publish and rearm under the device lock,

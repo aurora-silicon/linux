@@ -43,7 +43,7 @@ use crate::module_parameters;
 
 /// Cadence of periodic housekeeping (power governor, window health, administrative hang check).
 const HOUSEKEEPING_NS: u64 = 1_000_000;
-/// Maximum trailing receipt polls after an EP 0x20 event (stepped 1/2/5 us, ~48 us total).
+/// Maximum trailing receipt polls after an EP 0x20 event (stepped 1/2/3/4/5 us, 45 us total).
 const EVENT_RETIRE_POLLS: u32 = 11;
 /// Minimum interval between 1-jiffy delayed-work safety backup rearms (2 ms).
 const BACKUP_REARM_NS: u64 = 2_000_000;
@@ -158,6 +158,8 @@ impl Shared {
             let delay_us = match step {
                 0 => 1,
                 1 => 2,
+                2 => 3,
+                3 => 4,
                 _ => 5,
             };
             tail -= 1;
@@ -215,7 +217,7 @@ impl Shared {
                 pub_res = firmware.session.transport().and_then(|()| {
                     let retired_any = firmware.retire_once(done)?;
                     firmware.answer_growth()?;
-                    if firmware.recovery.receipt_fault || firmware.recovery_pending()? {
+                    if firmware.recovery.receipt_fault || recovery_pending {
                         firmware.check_hangs(done)?;
                     }
                     if was_evented && !retired_any && !firmware.engine.flights.is_empty() {
@@ -224,7 +226,7 @@ impl Shared {
                             && firmware.oldest_terminal_events() == term_before
                             && !firmware.oldest_stamp_reached()
                             && !firmware.recovery.receipt_fault
-                            && !firmware.recovery_pending().unwrap_or(true);
+                            && !recovery_pending;
                         if !non_terminal_only {
                             self.evented.store(true, Ordering::Release);
                         }
@@ -464,6 +466,7 @@ impl Firmware {
                 return Ok(false);
             }
         }
+        let was_frozen = self.engine.frozen;
         let stage_before = self.events.stage_events;
         let term_before = self.oldest_terminal_events();
         let mut lap = Lap::start();
@@ -471,13 +474,35 @@ impl Firmware {
         let retired_any = self.retire_once(done)?;
         lap.lap(&mut self.engine.prof.retire_ns);
         self.answer_growth()?;
-        if self.recovery.receipt_fault || self.recovery_pending()? {
+        let recovery_pending = self.recovery.receipt_fault || self.recovery_pending()?;
+        if recovery_pending {
             self.check_hangs(done)?;
         }
-        let published = if self.engine.pending.is_empty() {
-            Ok(())
-        } else {
+        let unfrozen = was_frozen && !self.engine.frozen;
+        let scrub_woke = self.slots.take_scrub_woke();
+        let publish_woke = self
+            .engine
+            .shared
+            .as_ref()
+            .is_some_and(|shared| shared.publish_wake.swap(false, Ordering::AcqRel));
+        // Skip redundant `publish_checked()` walks on busy polls where nothing could have
+        // unblocked `engine.pending`. `Prepared::drop` releases standby PB epochs only for
+        // `Cache::prepare` waiters (`standby_available`, which enter `submit_locked()` directly),
+        // while `publish_woke` covers external state changes (VM close, unstarted queue
+        // cancellation) so pending jobs never wait on the 1 ms housekeeping tick.
+        let should_publish = !self.engine.pending.is_empty()
+            && (retired_any
+                || !had_flights
+                || self.engine.flights.is_empty()
+                || self.engine.chan_wait
+                || unfrozen
+                || scrub_woke
+                || publish_woke
+                || housekeeping_due);
+        let published = if should_publish {
             self.publish_checked(done)
+        } else {
+            Ok(())
         };
         if self.engine.flights.is_empty() {
             self.power.report_work(false);
@@ -501,7 +526,7 @@ impl Firmware {
             && self.oldest_terminal_events() == term_before
             && !self.oldest_stamp_reached()
             && !self.recovery.receipt_fault
-            && !self.recovery_pending().unwrap_or(true);
+            && !recovery_pending;
         // After an EP 0x20 event, retry up to `EVENT_RETIRE_POLLS` times (outside the device
         // lock) only while no flight has retired yet and flights remain in flight. Once any
         // flight retires, stop spinning so deeper queues do not burn tail waits per interrupt.
@@ -655,6 +680,9 @@ impl Firmware {
         // Recovery may force stage progress: authenticate it before any receipt.
         if self.recovery.receipt_fault || self.recovery_pending()? {
             self.check_hangs(done)?;
+        }
+        if self.engine.flights.is_empty() {
+            return Ok(false);
         }
         let mut retired_any = false;
         let (mut check_compute, mut check_render) = (true, true);

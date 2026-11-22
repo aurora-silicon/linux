@@ -6,18 +6,25 @@ import json
 import subprocess
 
 production = kernel_root() / 'drivers/gpu/drm/asahi/g16/poll.rs'
+event_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/event.rs').read_text()
+mod_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/mod.rs').read_text()
 source = production.read_text()
 output = output_dir()
 
+assert 'const EVENT_RETIRE_POLLS: u32 = 11;' in source, 'EVENT_RETIRE_POLLS expected to be 11'
+assert (
+    'OwnedQueue::new_percpu_reclaim(c_str!("aurora_g16_events"), true)' in mod_source
+), 'aurora_g16_events must use new_percpu_reclaim(..., true)'
 
-def item(declaration):
-    start = source.index(declaration)
-    at = source.index('{', start)
+
+def item(declaration, text=source):
+    start = text.index(declaration)
+    at = text.index('{', start)
     depth, end = 1, at + 1
     while depth:
-        depth += (source[end] == '{') - (source[end] == '}')
+        depth += (text[end] == '{') - (text[end] == '}')
         end += 1
-    return source[start:end]
+    return text[start:end]
 
 
 harness = r'''
@@ -170,6 +177,7 @@ impl Objects {
 struct Shared {
     sleeping: AtomicBool,
     evented: AtomicBool,
+    publish_wake: AtomicBool,
     rearmed: Cell<u32>,
 }
 impl Shared {
@@ -177,6 +185,7 @@ impl Shared {
         Arc::new(Self {
             sleeping: AtomicBool::new(false),
             evented: AtomicBool::new(false),
+            publish_wake: AtomicBool::new(false),
             rearmed: Cell::new(0),
         })
     }
@@ -199,6 +208,16 @@ impl Power {
     fn report_work(&mut self, _in_flight: bool) {}
 }
 
+#[derive(Default)]
+struct Slots {
+    scrub_woke: AtomicBool,
+}
+impl Slots {
+    fn take_scrub_woke(&self) -> bool {
+        self.scrub_woke.swap(false, Ordering::AcqRel)
+    }
+}
+
 struct Firmware {
     session: Session,
     objects: Objects,
@@ -207,9 +226,11 @@ struct Firmware {
     events: Events,
     recovery: Recovery,
     power: Power,
+    slots: Slots,
     last_housekeeping_ns: u64,
     // Test script knobs for retire_once / publish / housekeeping observation.
     retire_on_call: bool,
+    unfreeze_on_hang_check: bool,
     drain_stage_delta: u32,
     drain_fs_delta: u32,
     drain_compute_delta: u32,
@@ -248,8 +269,10 @@ impl Firmware {
             events: Events::default(),
             recovery: Recovery::default(),
             power: Power::default(),
+            slots: Slots::default(),
             last_housekeeping_ns: 0,
             retire_on_call: false,
+            unfreeze_on_hang_check: false,
             drain_stage_delta: 0,
             drain_fs_delta: 0,
             drain_compute_delta: 0,
@@ -282,6 +305,10 @@ impl Firmware {
         Ok(())
     }
     fn check_hangs(&mut self, _done: &mut Completions) -> Result {
+        if self.unfreeze_on_hang_check {
+            self.engine.frozen = false;
+            self.recovery.pending = false;
+        }
         Ok(())
     }
     fn fail_stop(&mut self, error: Error, _done: &mut Completions) {
@@ -484,6 +511,282 @@ fn oldest_stamp_reached_skips_inactive_class_wc_reads() {
     assert_eq!(fr.graph.render.fw_stamp[0].reads.get(), 0);
     assert_eq!(fr.graph.render.fw_stamp[1].reads.get(), 1);
 }
+
+#[test]
+fn poll_step_skips_publish_when_pending_blocked_and_nothing_retired() {
+    CLOCK.with(|c| c.set(100_000));
+    let mut fw = Firmware::new();
+    fw.engine.flights.push(Flight {
+        computes: 0,
+        renders: 1,
+        target: 0,
+        fs_target: 0x100,
+    });
+    fw.engine.pending.push(Arc::new(Job { id: 2 }));
+    fw.engine.fs_target = 0x100;
+    fw.drain_stage_delta = 1;
+    let mut retry_tail = false;
+    let mut deferred = false;
+    let mut done = vec![];
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 0);
+
+    // Waking via scrub_woke triggers publish_checked once.
+    fw.slots.scrub_woke.store(true, Ordering::Release);
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 1);
+
+    // Waking via chan_wait triggers publish_checked.
+    fw.engine.chan_wait = true;
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 2);
+    fw.engine.chan_wait = false;
+
+    // Waking via unfreeze triggers publish_checked.
+    fw.engine.frozen = true;
+    fw.recovery.pending = true;
+    fw.unfreeze_on_hang_check = true;
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 3);
+
+    // Waking via external publish_wake (e.g. VM close or unstarted queue cancel) triggers
+    // publish_checked once while flights remain active, then skips again on the next busy poll.
+    let shared = Shared::new();
+    fw.engine.shared = Some(shared.clone());
+    shared.publish_wake.store(true, Ordering::Release);
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 4);
+    assert!(!shared.publish_wake.load(Ordering::Acquire));
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 4);
+
+    // Waking via retirement triggers publish_checked (and returns false since flights drained).
+    fw.retire_on_call = true;
+    assert!(!fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 5);
+}
+
+mod boot {
+    pub fn eproto() -> super::Error {
+        super::Error(-71)
+    }
+}
+
+mod event_drain_test {
+    use super::{Error, Result};
+    use std::cell::{Cell, RefCell};
+
+    const EIO: Error = Error(-5);
+    const STATE_READ: usize = 0;
+    const STATE_WRITE: usize = 0x40;
+    const RING_SLOTS: u32 = 128;
+    const RECORD_WORDS: usize = 18;
+    const STAGE_EVENTS: [u32; 3] = [0x70, 0x71, 15];
+    mod rings {
+        pub const EVENT_RECORD: usize = 0x48;
+    }
+    mod bindings {
+        pub unsafe fn ktime_get() -> i64 {
+            12345
+        }
+    }
+    mod device {
+        pub struct Device;
+    }
+    macro_rules! dev_warn { ($dev:expr, $($arg:tt)*) => {{ let _ = ($dev, format_args!($($arg)*)); }}; }
+    macro_rules! dev_err { ($dev:expr, $($arg:tt)*) => {{ let _ = ($dev, format_args!($($arg)*)); }}; }
+    fn rmb() {}
+    fn wmb() {}
+    fn mb() {}
+
+    struct Mem {
+        words: RefCell<Vec<u32>>,
+        reads: Cell<u32>,
+        writes: Cell<u32>,
+        fail_at_offset: Cell<Option<usize>>,
+    }
+    impl Mem {
+        fn new(n_words: usize) -> Self {
+            Self {
+                words: RefCell::new(vec![0u32; n_words]),
+                reads: Cell::new(0),
+                writes: Cell::new(0),
+                fail_at_offset: Cell::new(None),
+            }
+        }
+        fn r32(&self, off: usize) -> Result<u32> {
+            self.reads.set(self.reads.get() + 1);
+            if self.fail_at_offset.get() == Some(off) {
+                return Err(EIO);
+            }
+            Ok(self.words.borrow()[off / 4])
+        }
+        fn w32(&self, off: usize, val: u32) -> Result {
+            self.writes.set(self.writes.get() + 1);
+            self.words.borrow_mut()[off / 4] = val;
+            Ok(())
+        }
+    }
+
+    struct Ring {
+        state: Mem,
+        ring: Mem,
+    }
+    impl Ring {
+        fn new() -> Self {
+            Self {
+                state: Mem::new(0x40),
+                ring: Mem::new(RING_SLOTS as usize * RECORD_WORDS),
+            }
+        }
+        fn put_record(&self, slot: u32, words: &[u32]) {
+            let mut buf = self.ring.words.borrow_mut();
+            let base = slot as usize * RECORD_WORDS;
+            for (i, &w) in words.iter().enumerate() {
+                buf[base + i] = w;
+            }
+        }
+        fn set_indices(&self, read: u32, write: u32) {
+            let mut st = self.state.words.borrow_mut();
+            st[STATE_READ / 4] = read;
+            st[STATE_WRITE / 4] = write;
+        }
+        fn read_idx(&self) -> u32 {
+            self.state.words.borrow()[STATE_READ / 4]
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ErrorEvent {
+        kind: u32,
+        slot: i32,
+        raw: [u32; RECORD_WORDS],
+    }
+
+    #[derive(Default)]
+    struct Events {
+        stage_events: u32,
+        ta_events: u32,
+        fs_events: u32,
+        compute_events: u32,
+        event_ns: [u64; 3],
+        errors: u32,
+        channel_errors: u32,
+        recovery_started_ns: Option<u64>,
+        last_error: Option<ErrorEvent>,
+        last_statistics: Option<[u32; RECORD_WORDS]>,
+        recovery_statistics: u32,
+    }
+
+    impl Events {
+        fn indices(ring: &Ring) -> Result<(u32, u32)> {
+            let read = ring.state.r32(STATE_READ)?;
+            let producer = ring.state.r32(STATE_WRITE)?;
+            if read >= RING_SLOTS || producer >= RING_SLOTS {
+                return Err(EIO);
+            }
+            rmb();
+            Ok((read, producer))
+        }
+        fn words(ring: &Ring, slot: u32) -> Result<[u32; RECORD_WORDS]> {
+            let base = slot as usize * rings::EVENT_RECORD;
+            let mut out = [0u32; RECORD_WORDS];
+            for (i, word) in out.iter_mut().enumerate() {
+                *word = ring.ring.r32(base + i * 4)?;
+            }
+            Ok(out)
+        }
+        __EVENT_DRAIN__
+        __EVENT_DRAIN_STATS__
+    }
+
+    #[test]
+    fn event_drain_batches_state_read_and_minimizes_wc_reads() {
+        let ring = Ring::new();
+        // 3 consecutive type-1 stage events: TA (0x70 -> word 4 bit 16), FS (0x71 -> word 4 bit 17), Compute (15 -> word 1 bit 15).
+        let mut r0 = [0u32; RECORD_WORDS];
+        r0[0] = 1;
+        r0[4] = 1 << 16;
+        let mut r1 = [0u32; RECORD_WORDS];
+        r1[0] = 1;
+        r1[4] = 1 << 17;
+        let mut r2 = [0u32; RECORD_WORDS];
+        r2[0] = 1;
+        r2[1] = 1 << 15;
+        ring.put_record(0, &r0);
+        ring.put_record(1, &r1);
+        ring.put_record(2, &r2);
+        ring.set_indices(0, 3);
+
+        let mut ev = Events::default();
+        ev.drain(&device::Device, &ring).unwrap();
+        assert_eq!(ev.event_ns[0], 12345);
+        assert_eq!(ev.fs_events, 1);
+        assert_eq!(ev.compute_events, 1);
+        assert_eq!(ev.stage_events, 3);
+        assert_eq!(ring.read_idx(), 3);
+        // Exactly ONE STATE_READ write for all 3 records!
+        assert_eq!(ring.state.writes.get(), 1);
+        // Exactly 3 WC reads per type-1 record (kind, word 1, word 4) = 9 reads (not 54)!
+        assert_eq!(ring.ring.reads.get(), 9);
+    }
+
+    #[test]
+    fn event_drain_flushes_progress_on_mid_burst_error() {
+        let ring = Ring::new();
+        let mut r0 = [0u32; RECORD_WORDS];
+        r0[0] = 1;
+        r0[4] = 1 << 17;
+        ring.put_record(0, &r0);
+        ring.set_indices(0, 2);
+        // Fail reading record 1's kind word.
+        ring.ring.fail_at_offset.set(Some(rings::EVENT_RECORD));
+        let mut ev = Events::default();
+        assert_eq!(ev.drain(&device::Device, &ring), Err(EIO));
+        // Record 0 progress must still have been flushed to STATE_READ = 1.
+        assert_eq!(ring.read_idx(), 1);
+        assert_eq!(ring.state.writes.get(), 1);
+        assert_eq!(ev.fs_events, 1);
+    }
+
+    #[test]
+    fn stats_drain_batches_state_read_and_reads_single_word_for_non_recovery() {
+        let ring = Ring::new();
+        let mut r0 = [0u32; RECORD_WORDS];
+        r0[0] = 0x10;
+        let mut r1 = [0u32; RECORD_WORDS];
+        r1[0] = 0x11;
+        let mut r2 = [0u32; RECORD_WORDS];
+        r2[0] = 0x16;
+        ring.put_record(0, &r0);
+        ring.put_record(1, &r1);
+        ring.put_record(2, &r2);
+        ring.set_indices(0, 3);
+
+        let mut ev = Events::default();
+        ev.drain_statistics(&device::Device, &ring).unwrap();
+        assert_eq!(ev.recovery_statistics, 1);
+        assert!(ev.last_statistics.is_some());
+        assert_eq!(ring.read_idx(), 3);
+        assert_eq!(ring.state.writes.get(), 1);
+        // 1 read each for r0, r1 + 1 (kind) + 18 (full words) for r2 = 21 reads (vs 54).
+        assert_eq!(ring.ring.reads.get(), 21);
+    }
+}
 '''
 
 for token, decl in {
@@ -493,6 +796,11 @@ for token, decl in {
     '__OLDEST_STAMP_REACHED__': 'fn oldest_stamp_reached(',
 }.items():
     harness = harness.replace(token, item(decl))
+for token, decl in {
+    '__EVENT_DRAIN__': 'pub(crate) fn drain(',
+    '__EVENT_DRAIN_STATS__': 'pub(crate) fn drain_statistics(',
+}.items():
+    harness = harness.replace(token, item(decl, event_source))
 
 unit = output / 'poll-retire.rs'
 unit.write_text(harness)
@@ -511,7 +819,7 @@ for command in [
     json.dumps(
         {
             'passed': True,
-            'tests': 4,
+            'tests': 10,
             'cpu_only': True,
             'hardware_execution': False,
             'scope': 'Verbatim production submit_locked inline retirement and poll_step TA-only non-spin logic.',

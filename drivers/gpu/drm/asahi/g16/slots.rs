@@ -457,6 +457,9 @@ struct ScrubState {
     clean_mask: AtomicU32,
     /// Set if slot selection found eligible slots blocked only by an in-flight off-lock scrub.
     waiter: AtomicBool,
+    /// Set when an off-lock scrub finished while `waiter` was pending so the next `poll_step()`
+    /// retries `publish_checked()` even if no flight retired.
+    woke: AtomicBool,
     /// Off-lock scrub counters folded into [`SlotStats`] on subsequent locked access.
     pass_scrubs: AtomicU64,
     tilemap_clear_bytes: AtomicU64,
@@ -468,6 +471,7 @@ impl ScrubState {
             scrubbing: AtomicU32::new(0),
             clean_mask: AtomicU32::new(0),
             waiter: AtomicBool::new(false),
+            woke: AtomicBool::new(false),
             pass_scrubs: AtomicU64::new(0),
             tilemap_clear_bytes: AtomicU64::new(0),
         }
@@ -527,7 +531,11 @@ impl PendingScrub {
         }
         self.state.scrubbing.fetch_and(!bit, Ordering::SeqCst);
         self.done = true;
-        self.state.waiter.swap(false, Ordering::SeqCst)
+        let woke = self.state.waiter.swap(false, Ordering::SeqCst);
+        if woke {
+            self.state.woke.store(true, Ordering::Release);
+        }
+        woke
     }
 }
 
@@ -731,6 +739,10 @@ impl Slots {
     /// Whether any render pass slot is currently being scrubbed off-lock.
     pub(crate) fn scrubbing_active(&self) -> bool {
         self.scrub.scrubbing.load(Ordering::Acquire) != 0
+    }
+    /// Consumes the wakeup flag set when an off-lock scrub unblocks a waiting render submitter.
+    pub(crate) fn take_scrub_woke(&self) -> bool {
+        self.scrub.woke.swap(false, Ordering::AcqRel)
     }
     /// Total pass scrubs including completed off-lock pre-scrubs.
     pub(crate) fn pass_scrubs_total(&self) -> u64 {
