@@ -366,6 +366,7 @@ struct t6040_usb2_phy {
 	struct apple_tunable *cio_tunables[5];
 	bool cio_ok;
 	bool cio_up;		/* PHY in mode 2, holds a runtime PM reference */
+	bool cio_elsewhere;	/* USB4/TBT on the port without CIO here: lanes left alone */
 	bool pipe_tunneled;	/* the controller's PIPE runs on the USB4 router */
 	u8 tun_rate[2];		/* DP tunnel link rate per DP IN adapter, 0 = off */
 	bool tun_pre;		/* switch 1 is held for DP IN 1 alone */
@@ -1290,9 +1291,12 @@ static void t6040_usb3_up_locked(struct t6040_usb2_phy *tphy)
 		dev_dbg(tphy->dev, "USB3: lanes held by DP, USB2 only for now\n");
 		return;
 	}
-	/* CIO owns both lanes; USB3 comes back in t6040_usb3_reclaim_locked() after it. */
-	if (tphy->cio_up) {
-		dev_dbg(tphy->dev, "USB3: lanes held by CIO, USB2 only for now\n");
+	/*
+	 * CIO owns both lanes, or the port runs USB4/Thunderbolt that this PHY doesn't
+	 * drive; USB3 comes back in t6040_usb3_reclaim_locked() once the port leaves it.
+	 */
+	if (tphy->cio_up || tphy->cio_elsewhere) {
+		dev_dbg(tphy->dev, "USB3: lanes held by USB4/Thunderbolt, USB2 only for now\n");
 		tphy->usb3_lent = true;
 		return;
 	}
@@ -1841,7 +1845,7 @@ static void t6040_dp_drive(struct t6040_usb2_phy *tphy, unsigned int lane, u32 p
 static void t6040_usb3_reclaim_locked(struct t6040_usb2_phy *tphy)
 {
 	lockdep_assert_held(&tphy->lock);
-	if (!tphy->usb3_lent || tphy->dp_up || tphy->dp_alt || tphy->cio_up)
+	if (!tphy->usb3_lent || tphy->dp_up || tphy->dp_alt || tphy->cio_up || tphy->cio_elsewhere)
 		return;
 	tphy->usb3_lent = false;
 	if (!tphy->usb3_on || tphy->usb3_up)
@@ -1891,7 +1895,7 @@ static int t6040_dp_power_on(struct phy *phy)
 	if (!tphy->dp_ok || tphy->dp_up)
 		return 0;
 	/* The port carries USB4/Thunderbolt: DP reaches it only as a tunnel. */
-	if (tphy->cio_up)
+	if (tphy->cio_up || tphy->cio_elsewhere)
 		return -EBUSY;
 	/* Pin D shares the running PHY with USB3. Keep its PIPE and firmware. */
 	if (tphy->dp_two_lanes) {
@@ -2773,11 +2777,11 @@ static int t6040_dp_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *s
 	bool dp = state->alt && state->alt->svid == USB_TYPEC_DP_SID;
 	bool alt = false;
 
+	bool cio = t6040_cio_requested(state);
+
 	guard(mutex)(&tphy->lock);
 	/* USB4/TBT, only with the CIO tables; leaving it first takes the PHY out of CIO. */
 	if (tphy->cio_ok && (tphy->cio_up || t6040_cio_router_enabled(tphy))) {
-		bool cio = t6040_cio_requested(state);
-
 		if (tphy->cio_up && !cio) {
 			/* The router stops before the mux leaves USB4/TBT (apple.c). */
 			if (tphy->router_running) {
@@ -2794,6 +2798,26 @@ static int t6040_dp_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *s
 			return t6040_cio_up_locked(tphy);
 		}
 	}
+	/*
+	 * USB4/TBT that this PHY doesn't drive (no CIO tables, or no router of its own
+	 * enabled): the link belongs to the partner and the router's firmware, and the USB3
+	 * firmware start or a DP crossbar write would take it down. Leave the lanes alone
+	 * and keep USB3 off until the port leaves USB4/TBT.
+	 */
+	if (cio) {
+		if (!tphy->cio_elsewhere)
+			dev_info(tphy->dev, "Type-C mux: %s without CIO here, lanes left as they are\n",
+				 state->alt ? "Thunderbolt" : "USB4");
+		tphy->cio_elsewhere = true;
+		tphy->dp_alt = false;
+		tphy->dp_two_lanes = false;
+		if (tphy->usb3_up || tphy->pipe_switched) {
+			t6040_usb3_down_locked(tphy);
+			tphy->usb3_lent = true;
+		}
+		return 0;
+	}
+	tphy->cio_elsewhere = false;
 	tphy->dp_flip = (tphy->orientation == TYPEC_ORIENTATION_REVERSE);
 	/*
 	 * Latch the DP alt mode state for the DCP's Type-C route. Pin
@@ -3760,12 +3784,12 @@ static int t6040_phy_count(struct phy *phy)
  * core counts, with their runtime PM reference) is theirs to release and
  * is kept, so that every count stays balanced; a phy still held is only
  * reported.  The port's Type-C state (orientation, DP alt mode, pin
- * assignment) describes the partner, not the PHY, and stays for the next
- * power-on.  A power cycle that the coprocessor was waiting for when the
- * image was made has happened by now.  Early, before any .restore: the
- * Type-C controller's may set the mux again.  Nothing touches the hardware
- * here.  CIO is torn down before the image (.freeze), so the image never
- * holds a CIO session.
+ * assignment, USB4/Thunderbolt without CIO here) describes the partner,
+ * not the PHY, and stays for the next power-on.  A power cycle that the
+ * coprocessor was waiting for when the image was made has happened by
+ * now.  Early, before any .restore: the Type-C controller's may set the mux
+ * again.  Nothing touches the hardware here.  CIO is torn down before the
+ * image (.freeze), so the image never holds a CIO session.
  */
 static int t6040_usb2_restore_early(struct device *dev)
 {
