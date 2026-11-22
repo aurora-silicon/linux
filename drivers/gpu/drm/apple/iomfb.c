@@ -414,6 +414,13 @@ static int dcp_cb_shadow_alloc(struct apple_dcp *dcp)
 	return 0;
 }
 
+/* Whether the innermost frame of @ch is a firmware callback awaiting our ack. */
+static bool dcp_cb_pending(const struct dcp_channel *ch)
+{
+	return ch && ch->depth && ch->depth <= DCP_MAX_CALL_DEPTH &&
+	       !ch->command[ch->depth - 1];
+}
+
 /* Write the reply of the callback at @depth back to its shared record, once. */
 static void dcp_cb_reply_commit(struct dcp_channel *ch, u8 depth)
 {
@@ -1347,12 +1354,16 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 	u8 depth;
 	u16 offset;
 
-	if (iomfb_uses_queue(dcp) &&
-	    (!ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
-	     (u64)sizeof(header) + in_len + out_len > 0x8000 ||
-	     dcp_packet_start(ch, ch->depth) >
+	/*
+	 * Every firmware: the frame must fit the channel's call stack and its
+	 * 0x8000-byte transmit window. A firmware that stops acking (or that
+	 * nests too deeply) must not grow the stack past its arrays.
+	 */
+	if (!ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
+	    (u64)sizeof(header) + in_len + out_len > 0x8000 ||
+	    dcp_packet_start(ch, ch->depth) >
 		0x8000 - ALIGN(sizeof(header) + in_len + out_len,
-			       DCP_PACKET_ALIGNMENT))) {
+			       DCP_PACKET_ALIGNMENT)) {
 		dev_err(dcp->dev, "invalid IOMFB command envelope\n");
 		WRITE_ONCE(dcp->crashed, true);
 		return;
@@ -1500,6 +1511,13 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 {
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 
+	/* Only a pending firmware callback can be answered. */
+	if (!dcp_cb_pending(ch)) {
+		dev_err(dcp->dev, "no pending callback to ack on context %X\n",
+			context);
+		WRITE_ONCE(dcp->crashed, true);
+		return;
+	}
 	dcp_cb_reply_commit(ch, dcp_pop_depth(&ch->depth));
 	if (dcp_is_ext26(dcp))
 		dma_wmb();

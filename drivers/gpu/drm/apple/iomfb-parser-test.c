@@ -257,6 +257,71 @@ static void iomfb_ack_pending_callback_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 1);
 }
 
+/* dcp_ack() answers only a pending firmware callback. */
+static void iomfb_ack_without_callback_test(struct kunit *test)
+{
+	struct apple_dcp *dcp = test->priv;
+	static const struct dcp_method_entry call = {
+		.name = "test", .tag = { 'A', '0', '0', '0' },
+	};
+
+	dcp->quiescing = true;	/* nothing is sent to a mailbox */
+	dcp->fw_compat = DCP_FIRMWARE_V_12_3;
+	dcp->shmem = kunit_kzalloc(test, 0x10000, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->shmem);
+
+	/* An empty stack must not wrap. */
+	dcp_ack(dcp, DCP_CONTEXT_CB);
+	KUNIT_EXPECT_TRUE(test, dcp->crashed);
+	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 0);
+
+	/* Nor may our own command be popped as if it were a callback. */
+	dcp->crashed = false;
+	dcp_push_context(dcp, DCP_CONTEXT_CB, &call, 4, 4, dcp->shmem, NULL, NULL);
+	KUNIT_ASSERT_FALSE(test, dcp->crashed);
+	dcp_ack(dcp, DCP_CONTEXT_CB);
+	KUNIT_EXPECT_TRUE(test, dcp->crashed);
+	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 1);
+}
+
+/* Every firmware bounds the command stack before it writes a frame. */
+static void iomfb_command_depth_test(struct kunit *test)
+{
+	static const struct dcp_method_entry call = {
+		.name = "test", .tag = { 'A', '0', '0', '0' },
+	};
+	static const enum dcp_firmware_version fws[] = {
+		DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5, DCP_FIRMWARE_V_26_6_DESKTOP,
+	};
+	struct apple_dcp *dcp = test->priv;
+	unsigned int i;
+
+	dcp->shmem = kunit_kzalloc(test, 0x10000, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->shmem);
+	dcp->quiescing = true;
+	for (i = 0; i < ARRAY_SIZE(fws); i++) {
+		dcp->fw_compat = fws[i];
+		dcp->crashed = false;
+		memset(&dcp->ch_cmd, 0, sizeof(dcp->ch_cmd));
+		dcp->ch_cmd.depth = DCP_MAX_CALL_DEPTH;
+		dcp_push_context(dcp, DCP_CONTEXT_CMD, &call, 4, 4, &i, NULL, NULL);
+		KUNIT_EXPECT_TRUE(test, dcp->crashed);
+		KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, DCP_MAX_CALL_DEPTH);
+		/* A frame that does not fit the transmit window is refused too. */
+		dcp->crashed = false;
+		dcp->ch_cmd.depth = 0;
+		dcp_push_context(dcp, DCP_CONTEXT_CMD, &call, 0x8000, 0, dcp->shmem, NULL, NULL);
+		KUNIT_EXPECT_TRUE(test, dcp->crashed);
+		KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, 0);
+		/* A command that fits is pushed and marked as a command frame. */
+		dcp->crashed = false;
+		dcp_push_context(dcp, DCP_CONTEXT_CMD, &call, 4, 4, &i, NULL, NULL);
+		KUNIT_EXPECT_FALSE(test, dcp->crashed);
+		KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, 1);
+		KUNIT_EXPECT_TRUE(test, dcp->ch_cmd.command[0]);
+	}
+}
+
 /* Bytes past a record read as zero, not as what an earlier record left there. */
 static void iomfb_callback_tail_test(struct kunit *test)
 {
@@ -281,6 +346,8 @@ static struct kunit_case iomfb_parser_cases[] = {
 	KUNIT_CASE(iomfb_callback_copy_once_test),
 	KUNIT_CASE(iomfb_legacy_callback_lengths_test),
 	KUNIT_CASE(iomfb_ack_pending_callback_test),
+	KUNIT_CASE(iomfb_ack_without_callback_test),
+	KUNIT_CASE(iomfb_command_depth_test),
 	KUNIT_CASE(iomfb_callback_tail_test),
 	{}
 };
