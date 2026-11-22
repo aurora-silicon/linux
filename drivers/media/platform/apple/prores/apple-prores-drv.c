@@ -1863,6 +1863,31 @@ static void apr_decode_resolution_change(struct apr_ctx *ctx,
 }
 
 /*
+ * The next CAPTURE buffer predates a resolution change and cannot hold a
+ * frame of the current format: give it back with ERROR and no payload,
+ * after the context's frames in the ring, and leave the source frame queued
+ * for a buffer that fits. Called from device_run; sleeps.
+ */
+static void apr_decode_small_dst(struct apr_ctx *ctx)
+{
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+	struct apr_dev *apr = ctx->apr;
+	struct vb2_v4l2_buffer *dst;
+	unsigned long flags;
+
+	wait_event(apr->idle_wq, !atomic_read(&ctx->inflight));
+	spin_lock_irqsave(&apr->hw_lock, flags);
+	dst = v4l2_m2m_dst_buf_remove(m2m);
+	spin_unlock_irqrestore(&apr->hw_lock, flags);
+	if (!WARN_ON(!dst)) {
+		vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
+		dst->field = V4L2_FIELD_NONE;
+		v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
+	}
+	v4l2_m2m_job_finish(apr->m2m_dev, m2m);
+}
+
+/*
  * Publish one job and, while the ring has room for another, finish the m2m
  * job at once so the next one is prepared while the engine works. When the
  * ring is full the m2m job stays running until a completion makes room, so
@@ -1891,6 +1916,11 @@ static void apr_device_run(void *priv)
 	if (ctx->decode && !to_apr_buf(src)->parse_err &&
 	    apr_decode_differs(ctx, &to_apr_buf(src)->info)) {
 		apr_decode_resolution_change(ctx, src);
+		return;
+	}
+	if (ctx->decode && vb2_plane_size(&dst->vb2_buf, 0) <
+			   ctx->dst_fmt.plane_fmt[0].sizeimage) {
+		apr_decode_small_dst(ctx);
 		return;
 	}
 
@@ -2461,7 +2491,15 @@ static int apr_buf_prepare(struct vb2_buffer *vb)
 	struct apr_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
 	u32 size = apr_q_fmt(ctx, vb->type)->plane_fmt[0].sizeimage;
 
-	if (vb2_plane_size(vb, 0) < size)
+	/*
+	 * A decoder's CAPTURE format may grow at a resolution change before
+	 * the client has seen SOURCE_CHANGE, and the old buffers must still
+	 * queue: the LAST buffer of the change is one of them. queue_setup
+	 * sized them for the format of their time; device_run gives back one
+	 * too small for the current format instead of decoding into it.
+	 */
+	if (vb2_plane_size(vb, 0) < size &&
+	    !(ctx->decode && !V4L2_TYPE_IS_OUTPUT(vb->type)))
 		return -EINVAL;
 	if (V4L2_TYPE_IS_OUTPUT(vb->type)) {
 		if (ctx->decode) {
