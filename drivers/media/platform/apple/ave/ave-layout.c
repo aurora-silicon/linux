@@ -997,5 +997,13 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 	if (crc == AVE_FW_TEXT_CRC_T8132_26B123 ||
 	    crc == AVE_FW_TEXT_CRC_T8122_26B123)
 		return &ave_layout_26b123;
+	/*
+	 * The M5's macOS 27.2 build (9013.55.1), between 26A428 and the 27.3
+	 * beta, speaks 26A428's layout: on the J815's 27.2 stub, H.264
+	 * Baseline (ffmpeg), H.264 and HEVC with B-frames (v4l2-ctl) encode
+	 * with it.
+	 */
+	if (crc == AVE_FW_TEXT_CRC_T8142_26B123)
+		return &ave_layout_26a428;
 	return NULL;
 }
