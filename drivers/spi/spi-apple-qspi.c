@@ -19,6 +19,7 @@
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/io.h>
+#include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -156,6 +157,10 @@ static DEFINE_MUTEX(apple_qspi_policy_lock);
 static bool read_only = true;
 static bool runtime_ready;
 static bool write_fault_latched;
+/* Write-candidate controllers, kept powered while writes are armed. */
+static LIST_HEAD(apple_qspi_writers);
+
+static int apple_qspi_hold_writers(bool hold);
 
 static int apple_qspi_set_read_only(const char *val, const struct kernel_param *kp)
 {
@@ -169,6 +174,8 @@ static int apple_qspi_set_read_only(const char *val, const struct kernel_param *
 	if (!value && (!runtime_ready || write_fault_latched))
 		ret = -EPERM;
 	else
+		ret = apple_qspi_hold_writers(!value);
+	if (!ret)
 		*(bool *)kp->arg = value;
 	mutex_unlock(&apple_qspi_policy_lock);
 	return ret;
@@ -226,6 +233,11 @@ struct apple_qspi {
 	u8 bp_ok;
 	bool nvram_write_candidate;
 	bool write_fault;
+	/* On apple_qspi_writers; holds a runtime-PM reference while armed. */
+	struct list_head writer;
+	struct device *dev;
+	bool runtime_pm;
+	bool power_held;
 	void __iomem *base;
 	void __iomem *p;
 	void __iomem *c;
@@ -718,6 +730,63 @@ static int apple_qspi_status(struct spi_mem *mem, u8 mfr, u8 sr[3])
 	return 0;
 }
 
+/*
+ * spi-nor erases a sector and programs it back as separate spi-mem
+ * operations, each of which drops its runtime-PM reference, and userspace
+ * may pause between them for longer than the autosuspend delay. If the
+ * block gated in that gap, the programs would run on a controller rebuilt
+ * from its reset state rather than the one the erase ran on, and a verify
+ * failure there would leave the sector erased. So while writes are armed,
+ * every write-candidate controller holds a runtime-PM reference: a whole
+ * erase/program/verify sequence runs in one power session, and the block
+ * gates again once writes are disarmed or a fault latches.
+ *
+ * Called with apple_qspi_policy_lock held.
+ */
+static int apple_qspi_hold_power(struct apple_qspi *qspi, bool hold)
+{
+	int ret;
+
+	if (!qspi->runtime_pm || qspi->power_held == hold)
+		return 0;
+	if (hold) {
+		ret = pm_runtime_resume_and_get(qspi->dev);
+		if (ret)
+			return ret;
+	} else {
+		pm_runtime_put_autosuspend(qspi->dev);
+	}
+	qspi->power_held = hold;
+	return 0;
+}
+
+static int apple_qspi_hold_writers(bool hold)
+{
+	struct apple_qspi *qspi;
+	int ret = 0;
+
+	list_for_each_entry(qspi, &apple_qspi_writers, writer) {
+		ret = apple_qspi_hold_power(qspi, hold && !qspi->write_fault);
+		if (ret)
+			break;
+	}
+	/* Arm all or none: a controller that cannot resume stays read-only. */
+	if (ret)
+		list_for_each_entry(qspi, &apple_qspi_writers, writer)
+			apple_qspi_hold_power(qspi, false);
+	return ret;
+}
+
+static void apple_qspi_remove_writer(void *data)
+{
+	struct apple_qspi *qspi = data;
+
+	mutex_lock(&apple_qspi_policy_lock);
+	apple_qspi_hold_power(qspi, false);
+	list_del(&qspi->writer);
+	mutex_unlock(&apple_qspi_policy_lock);
+}
+
 static int apple_qspi_nvram_modify(struct spi_mem *mem, const struct spi_mem_op *op)
 {
 	struct apple_qspi *qspi = spi_controller_get_devdata(mem->spi->controller);
@@ -828,6 +897,7 @@ fault:
 	qspi->write_fault = true;
 	write_fault_latched = true;
 	read_only = true;
+	apple_qspi_hold_writers(false);
 	dev_err(&mem->spi->dev,
 		"NVRAM write fault %d (WRDI %d); read-only latched, do not retry\n",
 		ret, disable_ret);
@@ -1014,6 +1084,7 @@ static int apple_qspi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	qspi = spi_controller_get_devdata(ctlr);
+	qspi->dev = dev;
 	qspi->nvram_policy = true;
 	qspi->nvram_window = soc->multi_io_reads;
 	apple_qspi_nvram_window(dev, qspi);
@@ -1092,6 +1163,7 @@ static int apple_qspi_probe(struct platform_device *pdev)
 		pm_runtime_set_autosuspend_delay(dev, APPLE_QSPI_AUTOSUSPEND_MS);
 		pm_runtime_use_autosuspend(dev);
 		ctlr->auto_runtime_pm = true;
+		qspi->runtime_pm = true;
 	}
 	ret = devm_spi_register_controller(dev, ctlr);
 	if (ret) {
@@ -1103,7 +1175,26 @@ static int apple_qspi_probe(struct platform_device *pdev)
 
 	mutex_lock(&apple_qspi_policy_lock);
 	runtime_ready = true;
+	if (qspi->nvram_write_candidate) {
+		/* A controller bound while writes are armed is held too. */
+		ret = read_only ? 0 : apple_qspi_hold_power(qspi, true);
+		if (!ret)
+			list_add(&qspi->writer, &apple_qspi_writers);
+	}
 	mutex_unlock(&apple_qspi_policy_lock);
+	if (ret) {
+		if (ctlr->auto_runtime_pm)
+			pm_runtime_put_noidle(dev);
+		return dev_err_probe(dev, ret, "failed to hold controller power\n");
+	}
+	if (qspi->nvram_write_candidate) {
+		ret = devm_add_action_or_reset(dev, apple_qspi_remove_writer, qspi);
+		if (ret) {
+			if (ctlr->auto_runtime_pm)
+				pm_runtime_put_noidle(dev);
+			return ret;
+		}
+	}
 	version = apple_qspi_p_read(qspi, APPLE_QSPI_P_VERSION);
 	dev_dbg(dev, "QSPIMC version %#x, %lu Hz clock, txq=%u rxq=%u\n",
 		version, clk_get_rate(qspi->clk), qspi->tx_depth,
