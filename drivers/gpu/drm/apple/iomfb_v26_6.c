@@ -764,6 +764,11 @@ static int dcp_v26_callback(void *cookie, u32 tag,
 			out[0] = 1;
 		return ret;
 	}
+	/* get_calendar_time_ms, as the M4 and H17P ABIs answer it */
+	if (tag == D(209) && SHAPE(0, 8)) {
+		put_unaligned_le64(ktime_get_real_ns() / NSEC_PER_MSEC, out);
+		return 0;
+	}
 	if (tag == D(100) && SHAPE(0, 0))
 		return dcp_v26_simple_call(v26, A(390), false, true, false);
 	dev_err(v26->dev, "J613 unhandled kernel callback %#x %u/%u\n", tag, in_size, out_size);
