@@ -44,18 +44,11 @@ static bool dcpavserv_identity(struct apple_epic_service *service, const char *n
 			class && !strcmp(class, "DCPDPService") && service->channel;
 	if (!service->ep->wire_v2)
 		return unit == 0;
-	if (!class || (strcmp(class, "AppleDCPDP2HDMI") &&
-		       strcmp(class, "DCPDP13Service")) ||
-	    !service->channel || service->channel > U16_MAX)
-		return false;
 	/* H17P's lower-case interface-id is dynamic, not a physical-port unit. */
-	if (service->ep->endpoint == DPAVSERV_ENDPOINT_V2)
-		return unit == service->channel;
-	/*
-	 * An AFKV2 AV service on the classic DPAV endpoint carries EPICUnit 0;
-	 * its interface-id (the channel) is dynamic across reconnects.
-	 */
-	return service->ep->endpoint == DPAVSERV_ENDPOINT && unit == 0;
+	return service->ep->endpoint == DPAVSERV_ENDPOINT_V2 && class &&
+		(!strcmp(class, "AppleDCPDP2HDMI") ||
+		 !strcmp(class, "DCPDP13Service")) && service->channel &&
+		service->channel <= U16_MAX && unit == service->channel;
 }
 
 static bool dcpavserv_admission_current(struct apple_dcp *dcp, u64 generation)
