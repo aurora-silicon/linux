@@ -1929,7 +1929,7 @@ static void apple_drm_unbind(struct device *dev)
 	apple_drm_uninit(dev);
 }
 
-const struct component_master_ops apple_drm_ops = {
+static const struct component_master_ops apple_drm_ops = {
 	.bind	= apple_drm_bind,
 	.unbind	= apple_drm_unbind,
 };
