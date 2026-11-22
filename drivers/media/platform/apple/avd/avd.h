@@ -418,6 +418,7 @@ void avd_qfw_select(struct avd_dev *avd);
 void avd_qfw_prepare_boot(struct avd_dev *avd);
 void avd_qfw_debug(struct avd_dev *avd, struct avd_frame *f, const char *where);
 bool avd_backend_is_qfw(const struct avd_dev *avd);
+bool avd_backend_is_open(const struct avd_dev *avd);
 bool avd_qfw_has_vp_done(const struct avd_dev *avd);
 unsigned int avd_qfw_picture_banks(const struct avd_dev *avd, unsigned int codec);
 int avd_backend_select(struct avd_dev *avd);

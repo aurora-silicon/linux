@@ -177,6 +177,11 @@ static irqreturn_t avd_open_irq(struct avd_dev *avd)
 	return IRQ_HANDLED;
 }
 
+bool avd_backend_is_open(const struct avd_dev *avd)
+{
+	return avd->backend == &avd_open_backend;
+}
+
 const struct avd_backend_ops avd_open_backend = {
 	.name = "open-compat",
 	.boot = avd_boot,
