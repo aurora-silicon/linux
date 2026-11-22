@@ -315,7 +315,8 @@ struct apple_dcp_hw_data {
 	 * The endpoint the DPTX port services are announced on, where it is not
 	 * the firmware's default (DPTX_ENDPOINT_V2 on firmware 27): the T8142
 	 * dcpext announces them on DPTX_ENDPOINT. 0: the default, or on a
-	 * firmware-27 dcpext what its firmware advertises (dcp_v27_dptx_layout()).
+	 * firmware-27 dcpext or DCP with Type-C routes what its firmware
+	 * advertises (dcp_v27_dptx_layout()).
 	 */
 	u8 dptx_endpoint;
 	/*
