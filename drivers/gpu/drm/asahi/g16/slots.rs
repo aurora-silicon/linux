@@ -8,7 +8,7 @@
 //! Private backing and old VM leases survive until a distinct replacement fully retires.
 //! Aborted storage remains mapped and quarantined. Pool cursors are never scrubbed.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
 use super::encode::{Geometry, PassRefs};
@@ -366,7 +366,7 @@ pub(crate) struct Claims {
     pub(crate) slot_count: u32,
     pub(crate) pass: [u32; sizes::RENDER_SLOTS],
     pub(crate) pass_count: u32,
-    pub(crate) pass_mask: u32,
+    pub(crate) pass_mask: u64,
     #[allow(dead_code)]
     pub(crate) ct: [u32; sizes::RENDER_SLOTS],
     pub(crate) ct_count: u32,
@@ -437,15 +437,15 @@ pub(crate) struct ComputeOwners {
 }
 
 /// Bitmask of valid render pass slot indices (`0..sizes::RENDER_SLOTS`).
-const PASS_MASK: u32 = u32::MAX >> (32 - sizes::RENDER_SLOTS);
+const PASS_MASK: u64 = u64::MAX >> (64 - sizes::RENDER_SLOTS);
 
 /// Shared atomic coordination between `Shared::state` slot selection/claims and off-lock
 /// pre-scrubbing of displaced render pass slots.
 struct ScrubState {
     /// Pass slots currently being scrubbed outside `Shared::state`; never picked or claimed.
-    scrubbing: AtomicU32,
+    scrubbing: AtomicU64,
     /// Displaced pass slots whose clean same-VM spans were zeroed off-lock.
-    clean_mask: AtomicU32,
+    clean_mask: AtomicU64,
     /// Incremented by [`Self::clear_all_clean`] on recovery so an in-flight async scrub that
     /// started before recovery can never publish a stale `clean_mask` bit afterwards.
     generation: AtomicU64,
@@ -462,8 +462,8 @@ struct ScrubState {
 impl ScrubState {
     const fn new() -> Self {
         Self {
-            scrubbing: AtomicU32::new(0),
-            clean_mask: AtomicU32::new(0),
+            scrubbing: AtomicU64::new(0),
+            clean_mask: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             waiter: AtomicBool::new(false),
             woke: AtomicBool::new(false),
@@ -473,20 +473,20 @@ impl ScrubState {
     }
 
     fn is_scrubbing(&self, k: usize) -> bool {
-        self.scrubbing.load(Ordering::Acquire) & (1u32 << k) != 0
+        self.scrubbing.load(Ordering::Acquire) & (1u64 << k) != 0
     }
 
     fn is_clean(&self, k: usize) -> bool {
-        self.clean_mask.load(Ordering::Acquire) & (1u32 << k) != 0
+        self.clean_mask.load(Ordering::Acquire) & (1u64 << k) != 0
     }
 
     fn take_clean(&self, k: usize) -> bool {
-        let bit = 1u32 << k;
+        let bit = 1u64 << k;
         self.clean_mask.fetch_and(!bit, Ordering::AcqRel) & bit != 0
     }
 
     fn clear_clean(&self, k: usize) {
-        self.clean_mask.fetch_and(!(1u32 << k), Ordering::Release);
+        self.clean_mask.fetch_and(!(1u64 << k), Ordering::Release);
     }
 
     fn clear_all_clean(&self) {
@@ -506,7 +506,7 @@ pub(crate) struct PendingScrub {
 
 impl PendingScrub {
     pub(crate) fn run_one(&mut self) -> bool {
-        let bit = 1u32 << self.slot;
+        let bit = 1u64 << self.slot;
         let ok = if self.state.generation.load(Ordering::Acquire) != self.generation {
             false
         } else if let Some((pass, tilemap_dirty)) = self.arena.pass_and_tilemap_dirty(self.slot) {
@@ -546,7 +546,7 @@ impl PendingScrub {
 impl Drop for PendingScrub {
     fn drop(&mut self) {
         if !self.done {
-            let bit = 1u32 << self.slot;
+            let bit = 1u64 << self.slot;
             self.state.scrubbing.fetch_and(!bit, Ordering::SeqCst);
         }
     }
@@ -644,7 +644,7 @@ pub(crate) struct RenderOwners {
 
 pub(crate) struct Slots {
     pub(crate) cursor: u32,
-    pub(crate) pass_busy: u32,
+    pub(crate) pass_busy: u64,
     pub(crate) pass_cursor: u32,
     scrub_gen: u64,
     pub(crate) stats: SlotStats,
@@ -810,7 +810,7 @@ impl Slots {
         self.render.scrub_pending = false;
         self.fold_scrub_stats();
         for k in 0..sizes::RENDER_SLOTS {
-            let bit = 1u32 << k;
+            let bit = 1u64 << k;
             if self.pass_busy & bit != 0
                 || !self.render.lifetime.available(k)
                 || self.render.scrub_full[k]
@@ -951,7 +951,7 @@ impl Slots {
         &self,
         arena: &super::resources::RenderArena,
         geo: &Geometry,
-        picked: u32,
+        picked: u64,
     ) -> Option<usize> {
         let n = arena.passes.len().min(sizes::RENDER_SLOTS);
         let mut fallback = None;
@@ -959,7 +959,7 @@ impl Slots {
         for i in 0..n {
             let k = (self.pass_cursor as usize + i) % n;
             let p = &arena.passes[k];
-            if (self.pass_busy | picked) & (1 << k) == 0
+            if (self.pass_busy | picked) & (1u64 << k) == 0
                 && self.render.lifetime.available(k)
                 && geo.tpc_bytes <= p.tpc.size as u64
                 && geo.tilemap_bytes <= p.tilemap.size as u64
@@ -982,7 +982,7 @@ impl Slots {
             for i in 0..n {
                 let k = (self.pass_cursor as usize + i) % n;
                 let p = &arena.passes[k];
-                if (self.pass_busy | picked) & (1 << k) == 0
+                if (self.pass_busy | picked) & (1u64 << k) == 0
                     && self.render.lifetime.available(k)
                     && !self.scrub.is_scrubbing(k)
                     && geo.tpc_bytes <= p.tpc.size as u64
@@ -999,7 +999,7 @@ impl Slots {
         &self,
         resources: &super::resources::Prepared,
         geo: &Geometry,
-        picked: u32,
+        picked: u64,
     ) -> Option<usize> {
         let n = resources.render_passes().ok()?.min(sizes::RENDER_SLOTS);
         let mut fallback = None;
@@ -1009,7 +1009,7 @@ impl Slots {
             let Ok(p) = resources.render_pass(k) else {
                 continue;
             };
-            if (self.pass_busy | picked) & (1 << k) == 0
+            if (self.pass_busy | picked) & (1u64 << k) == 0
                 && self.render.lifetime.available(k)
                 && geo.tpc_bytes <= p.tpc.size as u64
                 && geo.tilemap_bytes <= p.tilemap.size as u64
@@ -1034,7 +1034,7 @@ impl Slots {
                 let Ok(p) = resources.render_pass(k) else {
                     continue;
                 };
-                if (self.pass_busy | picked) & (1 << k) == 0
+                if (self.pass_busy | picked) & (1u64 << k) == 0
                     && self.render.lifetime.available(k)
                     && !self.scrub.is_scrubbing(k)
                     && geo.tpc_bytes <= p.tpc.size as u64
@@ -1205,12 +1205,12 @@ impl Slots {
             return Err(EINVAL);
         }
         if f.pass_count != 0 {
-            let mut mask = 0u32;
+            let mut mask = 0u64;
             for &k in &f.pass[..f.pass_count as usize] {
                 if k as usize >= sizes::RENDER_SLOTS {
                     return Err(EINVAL);
                 }
-                let bit = 1u32 << k;
+                let bit = 1u64 << k;
                 if mask & bit != 0 {
                     return Err(EINVAL);
                 }

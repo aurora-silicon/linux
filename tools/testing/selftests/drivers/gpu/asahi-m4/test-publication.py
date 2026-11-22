@@ -111,7 +111,7 @@ fn complete(done:&mut Completions,job:&Arc<Job>,result:Result){done.push((job.id
 struct Claims;
 struct Flight{job:Arc<Job>,claims:Claims,group:Vec<Arc<Job>>,doomed:bool,recovery_suspect:bool,initbm:bool}
 impl Flight{fn new(job:Arc<Job>)->Self{Self{job,claims:Claims,group:vec![],doomed:false,recovery_suspect:false,initbm:false}}}
-struct Engine{ordinal:u64,draw:u64,pending:Vec<Arc<Job>>,flights:Vec<Flight>,frozen:bool,turn:u64,stats:Stats,chan_wait:bool}
+struct Engine{ordinal:u64,draw:u64,pending:Vec<Arc<Job>>,flights:Vec<Flight>,frozen:bool,turn:u64,stats:Stats,chan_wait:bool,slot_wait:bool}
 impl Engine {
     __PICK__
     __UNPEND__
@@ -197,6 +197,12 @@ impl Firmware {
     fn mark_class_unavailable(&mut self,class:usize,error:Error){self.unavailable.push((class,error));}
     fn sync_quarantine_hints(&self){}
     __NEEDS_ENGINE_DRAIN__
+    fn blocked_on_slot_headroom(&self,job:&Arc<Job>)->bool{
+        if self.engine.flights.is_empty()||self.needs_engine_drain(job){return false;}
+        if job.check_command_dependencies(job.progress.sent()).is_err(){return false;}
+        (self.block_render_behind&&matches!(command(job,job.progress.sent()),Some(Command::Render(()))))
+            ||(self.block_compute_behind&&matches!(command(job,job.progress.sent()),Some(Command::Compute(_))))
+    }
     fn can_queue_behind(&self,job:&Arc<Job>)->bool{
         if !self.allow_behind{return false;}
         if self.needs_engine_drain(job){return false;}
@@ -253,7 +259,7 @@ fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
 }
 fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     Firmware{session:Session{shared:Shared{sleeping:AtomicBool::new(false)},rings:vec![],ring_fail:false,checks:AtomicU32::new(0),transports:AtomicU32::new(0)},objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
-        engine:Engine{ordinal:0,draw:0,pending:jobs,flights:vec![],frozen:false,turn:0,stats:Stats::default(),chan_wait:false},
+        engine:Engine{ordinal:0,draw:0,pending:jobs,flights:vec![],frozen:false,turn:0,stats:Stats::default(),chan_wait:false,slot_wait:false},
         slots:Slots{compute_exhausted:false,render_exhausted:false,releases:0,quarantines:0},pools:Pools{exhausted:false,exhausted_vm:None,block_pipeline_vm:None},power:Power::default(),
         unavailable:vec![],stages:stages.into_iter().map(|(result,visible)|Stage{result,visible}).collect(),
         retained:vec![],attempted:vec![],fail_stops:0,allow_behind:false,block_render_behind:false,block_compute_behind:false}
@@ -527,7 +533,7 @@ mod queue_behind_scope {
     type Job = QueueBehindJob;
     type Flight = QueueBehindFlight;
     fn command(job:&Job,k:u32)->Option<&Command>{job.commands.get(k as usize)}
-    mod params { pub fn compute_flights()->usize{16} pub fn render_flights()->usize{15} }
+    mod params { pub fn compute_flights()->usize{16} pub fn render_flights()->usize{47} }
     #[allow(non_upper_case_globals)]
     mod kernel {
         pub mod uapi {
@@ -552,6 +558,8 @@ mod queue_behind_scope {
     __RENDER_BARRIER_PLAN__
     __PLAN_RENDER_BARRIERS__
     impl QueueBehindHost {
+        __NEEDS_ENGINE_DRAIN__
+        __BLOCKED_ON_SLOT_HEADROOM__
         __CAN_QUEUE_BEHIND__
         __WAIT_STAMP_FOR_WITH__
         __WAIT_STAMP_FOR__
@@ -898,10 +906,77 @@ mod queue_behind_scope {
             initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
         };
         assert_eq!(p.wait_stamp_for_with(&next_r,command::RENDER,Some(4),Some(&cur)),Ok(Some(WaitTarget{stamp:0x400,initbm:false})));
-        // Active renders sum flight.renders: 15 batched renders saturates render_flights().
+        // Active renders sum flight.renders: 44 passes (4x11-pass postfx) still pipelines
+        // behind, while 47 batched renders saturates render_flights().
         assert!(p.can_queue_behind(&next_r));
-        p.engine.flights[0].renders=15;
+        p.engine.flights[0].renders=44;
+        assert!(p.can_queue_behind(&next_r));
+        p.engine.flights[0].renders=47;
         assert!(!p.can_queue_behind(&next_r));
+    }
+    #[test]fn slot_wait_arms_only_for_same_vm_slot_or_flight_headroom_blocks(){
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let vm2=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:2});
+        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let mk=|id:u32,vm:Arc<Vm>,render:bool,dep:Result,query_access:bool,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
+            id,vm,queue:q1.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access})}],
+            order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:u64::from(id),wait_through:wait},
+            extra_orders:vec![],dependency:dep,resources:Resources,
+        });
+        let r_live=mk(1,vm1.clone(),true,Ok(()),false,[None,None]);
+        let r_same=mk(2,vm1.clone(),true,Ok(()),false,[None,None]);
+        let r_cross_vm=mk(3,vm2.clone(),true,Ok(()),false,[None,None]);
+        let r_ext_fence=mk(4,vm1.clone(),true,Err(EAGAIN),false,[None,None]);
+        let c_ts_wait=mk(5,vm1.clone(),false,Ok(()),true,[Some(1),None]);
+        let mut p=QueueBehindHost{
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{
+                job:r_live,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],
+                r_fs_stamp:{let mut a=[0;16];a[0]=0x100;a},fs_target:0x100,
+                initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false,
+            }]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+        };
+        // Not blocked on slots when pass_available is true and render_flights has headroom.
+        assert!(!p.blocked_on_slot_headroom(&r_same));
+        // Waiting on CPU timestamp publish (query_access) is NOT a slot-headroom block.
+        assert!(!p.can_queue_behind(&c_ts_wait));
+        assert!(!p.blocked_on_slot_headroom(&c_ts_wait));
+        // Render pass slot exhaustion IS a slot-headroom block for a ready same-VM render...
+        p.slots.pass_available=false;
+        assert!(p.blocked_on_slot_headroom(&r_same));
+        // ...but NOT for cross-VM, external-fence, or InitBM/PB-unprimed jobs.
+        assert!(!p.blocked_on_slot_headroom(&r_cross_vm));
+        assert!(!p.blocked_on_slot_headroom(&r_ext_fence));
+        p.pools.can_pipeline=false;
+        assert!(!p.blocked_on_slot_headroom(&r_same));
+        p.pools.can_pipeline=true;
+        p.engine.flights[0].initbm=true;
+        assert!(!p.blocked_on_slot_headroom(&r_same));
+        p.engine.flights[0].initbm=false;
+        // Render flight cap (47) also counts as a slot-headroom block.
+        p.slots.pass_available=true;
+        p.engine.flights[0].renders=47;
+        assert!(p.blocked_on_slot_headroom(&r_same));
+
+        // End-to-end publish_checked: cross-VM drain leaves slot_wait=false; same-VM slot block sets slot_wait=true.
+        let v1=mk_vm(1);
+        let v2=mk_vm(2);
+        let mut fc=firmware(vec![job_on_vm(2,v2,true,0,Ok(()))],vec![]);
+        fc.engine.flights.push(super::Flight::new(job_on_vm(1,v1.clone(),true,0,Ok(()))));
+        fc.allow_behind=true;
+        let mut done=vec![];
+        assert_eq!(fc.publish_checked(&mut done),Ok(()));
+        assert!(!fc.engine.slot_wait);
+
+        let mut fs=firmware(vec![job_on_vm(2,v1.clone(),true,0,Ok(()))],vec![]);
+        fs.engine.flights.push(super::Flight::new(job_on_vm(1,v1,true,0,Ok(()))));
+        fs.allow_behind=true;
+        fs.block_render_behind=true;
+        assert_eq!(fs.publish_checked(&mut done),Ok(()));
+        assert!(fs.engine.slot_wait);
     }
     #[test]fn staged_render_barriers_split_ta_and_fs_compute_and_render_waits(){
         const FRAG: u32 = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
@@ -1540,6 +1615,7 @@ for token, declaration in {
     '__PUBLISH__': 'pub(crate) fn publish(&mut self',
     '__PUBLISH_CHECKED__': 'pub(crate) fn publish_checked(&mut self',
     '__NEEDS_ENGINE_DRAIN__': 'fn needs_engine_drain(',
+    '__BLOCKED_ON_SLOT_HEADROOM__': 'fn blocked_on_slot_headroom(',
     '__DESCRIPTOR_CONTAINMENT__': 'if encode::preserve_compute_descriptor(',
     '__PUBLISH_PRODUCER__': 'fn publish_producer(',
     '__CAN_QUEUE_BEHIND__': 'fn can_queue_behind(',

@@ -86,21 +86,25 @@ pub(crate) const BASE_RENDER_SLOTS: usize = super::hw::sizes::BASE_RENDER_SLOTS;
 /// Demand-grown extension render pass slot tiers (`BASE_RENDER_SLOTS..hw::sizes::RENDER_SLOTS`).
 ///
 /// Each extension `PassSlot` backs 3.59 MiB (2 MiB TPC + 1 MiB tilemap + 608 KiB metadata,
-/// scratch, and barriers). Growing in bounded chunks keeps compositor and shallow desktop VMs
-/// on Tier 0 (~21.6 MiB) instead of allocating all 30 extension slots (~107.8 MiB) on a 2-pass
-/// submission:
-/// - Tier 0 (`2..8`, 6 slots, 21.56 MiB): compositors, 2-6 pass frames, depth 1-2.
+/// scratch, and barriers). Growing in four bounded chunks keeps compositor and shallow desktop
+/// VMs on Tier 0 (~21.6 MiB), keeps 20-31 pass workloads on Tier 2 without paying for 48 slots,
+/// and keeps every tier's client-object batch well below `MAX_CLIENT` (512):
+/// - Tier 0 (`2..8`, 6 slots, +21.56 MiB / 21.56 MiB cum): compositors, 2-6 pass frames.
 /// - Tier 1 (`8..18`, 10 slots, +35.94 MiB / 57.50 MiB cum): moderate multi-pass bursts.
-/// - Tier 2 (`18..RENDER_SLOTS`, 14 slots / +50.31 MiB at 32 slots): deep multi-pass bursts.
-pub(crate) const EXT_RENDER_TIERS: [(usize, usize); 3] = [
+/// - Tier 2 (`18..32`, 14 slots, +50.31 MiB / 107.81 MiB cum): 20-31 pass pipelined frames.
+/// - Tier 3 (`32..RENDER_SLOTS`, 16 slots, +57.50 MiB / 165.31 MiB cum at 48 slots): deep
+///   multi-pass bursts (160 client mappings <= `MAX_CLIENT`).
+pub(crate) const EXT_RENDER_TIERS: [(usize, usize); 4] = [
     (BASE_RENDER_SLOTS, 8),
     (8, 18),
-    (18, super::hw::sizes::RENDER_SLOTS),
+    (18, 32),
+    (32, super::hw::sizes::RENDER_SLOTS),
 ];
 const _: () = assert!(EXT_RENDER_TIERS[0].0 == BASE_RENDER_SLOTS);
 const _: () = assert!(EXT_RENDER_TIERS[0].1 == EXT_RENDER_TIERS[1].0);
 const _: () = assert!(EXT_RENDER_TIERS[1].1 == EXT_RENDER_TIERS[2].0);
-const _: () = assert!(EXT_RENDER_TIERS[2].1 == super::hw::sizes::RENDER_SLOTS);
+const _: () = assert!(EXT_RENDER_TIERS[2].1 == EXT_RENDER_TIERS[3].0);
+const _: () = assert!(EXT_RENDER_TIERS[3].1 == super::hw::sizes::RENDER_SLOTS);
 const BASE_PB_SLOTS: usize = super::hw::sizes::BASE_PB_SLOTS;
 const EXT_PB_SLOTS: usize = super::hw::sizes::PB_SLOTS - BASE_PB_SLOTS;
 /// Single-submission render command count that expands Tier 0 extension slots immediately:

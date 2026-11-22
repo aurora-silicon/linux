@@ -602,12 +602,13 @@ impl Firmware {
             }
         }
         // If a terminal EP 0x20 event arrived with flights outstanding and nothing retired within
-        // the trailing polls, repoll at `repoll_us` instead of sleeping `resnap_us`.
-        self.engine.short_repoll = evented
-            && had_flights
-            && !retired_any
+        // the trailing polls, or a ready same-VM pending job is blocked on slot/flight/work-ring
+        // headroom, repoll at `repoll_us` instead of sleeping `resnap_us`.
+        self.engine.short_repoll = !self.engine.flights.is_empty()
+            && !self.engine.frozen
             && !non_terminal_only
-            && !self.engine.flights.is_empty();
+            && ((evented && had_flights && !retired_any)
+                || (!self.engine.pending.is_empty() && self.engine.slot_wait));
         Ok(!self.engine.flights.is_empty()
             || self.engine.chan_wait
             || self.recovery.needs_repoll()

@@ -125,6 +125,7 @@ struct Engine {
     target: u32,
     fs_target: u32,
     chan_wait: bool,
+    slot_wait: bool,
     short_repoll: bool,
     frozen: bool,
     stats: Stats,
@@ -261,6 +262,7 @@ impl Firmware {
                 target: 0,
                 fs_target: 0,
                 chan_wait: false,
+                slot_wait: false,
                 short_repoll: false,
                 frozen: false,
                 stats: Stats::default(),
@@ -578,6 +580,60 @@ fn poll_step_skips_publish_when_pending_blocked_and_nothing_retired() {
         .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
         .unwrap());
     assert_eq!(fw.publish_checked_calls, 5);
+}
+
+#[test]
+fn pending_slot_wait_arms_short_repoll_without_breaking_ta_only_or_frozen() {
+    CLOCK.with(|c| c.set(100_000));
+    let mut fw = Firmware::new();
+    fw.engine.flights.push(Flight {
+        computes: 0,
+        renders: 11,
+        target: 0,
+        fs_target: 0x100,
+    });
+    fw.engine.fs_target = 0x100;
+    let mut retry_tail = false;
+    let mut deferred = false;
+    let mut done = vec![];
+
+    // No pending work on a timer poll -> keep normal resnap_us interval.
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(!fw.engine.short_repoll);
+
+    // Pending job NOT blocked on slot headroom (e.g. external fence / cross-VM / InitBM) ->
+    // keep normal resnap_us interval without arming short_repoll.
+    fw.engine.pending.push(Arc::new(Job { id: 2 }));
+    fw.engine.slot_wait = false;
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(!fw.engine.short_repoll);
+
+    // Pending job waiting on slot headroom on a non-event poll -> arm short_repoll.
+    fw.engine.slot_wait = true;
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(fw.engine.short_repoll);
+
+    // TA-only EP 0x20 event still suppresses short_repoll.
+    fw.drain_stage_delta = 1;
+    fw.drain_fs_delta = 0;
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(!fw.engine.short_repoll);
+    fw.drain_stage_delta = 0;
+
+    // Frozen engine suppresses short_repoll even with pending work.
+    fw.engine.frozen = true;
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(!fw.engine.short_repoll);
 }
 
 mod boot {
