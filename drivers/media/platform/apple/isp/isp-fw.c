@@ -374,9 +374,12 @@ static int isp_check_coproc_t6040(struct apple_isp *isp)
 /*
  * The reset of the ISPs before T8140 and T6040 reads two words until they are
  * 0, at most this many times each with no wait between reads, and goes on
- * whatever they read: the WFI poll that follows is the check that fails the
- * boot. The reads, their offsets and this bound come from the original driver
- * and have no known source (aurora-silicon/linux#2318).
+ * whatever they read. A word that is still set after the last read is not a
+ * fault: on M1 Pro the first word and on M2 the second one stays set on every
+ * boot and the camera works. The WFI poll that follows is the check that
+ * fails the reset. The reads, their offsets and this bound come from the
+ * original driver and have no known source (aurora-silicon/linux#2318), so
+ * each word's last value and number of reads are reported at debug level.
  */
 #define ISP_COPROC_DRAIN_READS 128
 
@@ -390,13 +393,8 @@ static void isp_drain_coproc_word(struct apple_isp *isp, u32 reg)
 		reads++;
 	} while (val && reads < ISP_COPROC_DRAIN_READS);
 
-	if (val)
-		dev_warn_once(isp->dev,
-			      "coprocessor word %#x still %#x after %u reads\n",
-			      reg, val, reads);
-	else
-		isp_dbg(isp, "coprocessor word %#x read 0 after %u reads\n",
-			reg, reads);
+	isp_dbg(isp, "coprocessor word %#x read %#x after %u reads\n", reg, val,
+		reads);
 }
 
 static int isp_reset_coproc(struct apple_isp *isp)
