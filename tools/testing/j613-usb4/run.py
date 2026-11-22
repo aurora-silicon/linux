@@ -70,6 +70,7 @@ bases = [int(x) for x in re.findall(r'apple,msi-vector-base = <(\d+)>', dts)]
 irqs = [int(x) for x in re.findall(r'msi-ranges = <&aic AIC_IRQ (\d+) IRQ_TYPE_EDGE_RISING 32>', dts)]
 window = int(re.search(r'msi-ranges = <&aic AIC_IRQ (\d+) IRQ_TYPE_EDGE_RISING 32>', internal).group(1))
 assert len(bases) == len(irqs) == 2, (bases, irqs)
+assert len(set(bases)) == len(bases), f'two PCIe-C bridges claim the same MSI slice: {bases}'
 pairs = ', '.join(f'{{{b}, {i}}}' for b, i in zip(bases, irqs))
 msi = r'''
 #include <assert.h>
@@ -83,6 +84,7 @@ int main(void)
     assert(apple_t8122_msi_window(48, WINDOW + 48, 32) < 0);
     assert(apple_t8122_msi_window(32, WINDOW + 32, 64) < 0);
     assert(apple_t8122_msi_window(64, 10, 32) < 0);
+    assert(apple_t8122_msi_window(256, WINDOW + 256, 32) < 0);  /* past vector 255 */
     return 0;
 }
 '''.replace('PAIRS', pairs).replace('WINDOW', str(window))

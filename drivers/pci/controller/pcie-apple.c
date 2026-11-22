@@ -3329,6 +3329,32 @@ static bool apple_t6030_msi_slice_valid(u32 base, u32 count, u32 aic_irq,
 	       count == 32 && aic_irq == aic_base + base;
 }
 
+/* One bit per 32-vector slice of T8122's shared MSI window: no two bridges share one. */
+static DEFINE_MUTEX(apple_t8122_msi_lock);
+static unsigned long apple_t8122_msi_claimed;
+
+static void apple_t8122_msi_release(void *data)
+{
+	mutex_lock(&apple_t8122_msi_lock);
+	clear_bit((unsigned long)data, &apple_t8122_msi_claimed);
+	mutex_unlock(&apple_t8122_msi_lock);
+}
+
+static int apple_t8122_msi_claim(struct apple_pcie *pcie, u32 base)
+{
+	unsigned long slice = base / 32;
+	bool taken;
+
+	mutex_lock(&apple_t8122_msi_lock);
+	taken = test_and_set_bit(slice, &apple_t8122_msi_claimed);
+	mutex_unlock(&apple_t8122_msi_lock);
+	if (taken) {
+		dev_err(pcie->dev, "MSI vectors %u..%u are another bridge's\n", base, base + 31);
+		return -EBUSY;
+	}
+	return devm_add_action_or_reset(pcie->dev, apple_t8122_msi_release, (void *)slice);
+}
+
 static int apple_msi_init(struct apple_pcie *pcie)
 {
 	struct fwnode_handle *fwnode = dev_fwnode(pcie->dev);
@@ -3436,6 +3462,8 @@ static int apple_msi_init(struct apple_pcie *pcie)
 			if (ret < 0)
 				goto invalid_slice;
 			aic_base = ret;
+			if (apple_t8122_msi_claim(pcie, expected_base))
+				goto invalid_slice;
 		} else if (of_machine_is_compatible("apple,t8132")) {
 			aic_base = 1506;
 			switch (ecam.start) {
