@@ -429,6 +429,7 @@ struct brcmf_pciedev_info {
 	const struct brcmf_pcie_reginfo *reginfo;
 	void __iomem *regs;
 	void __iomem *tcm;
+	size_t tcm_size;
 	u32 fw_size;
 	bool skip_reset_vector;
 	struct brcmf_chip *ci;
@@ -1009,6 +1010,11 @@ static bool brcmf_pcie_console_trapped(struct brcmf_pciedev_info *devinfo)
 
 	if (!console->base_addr || !console->bufsize)
 		return false;
+	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr +
+					BRCMF_CONSOLE_WRITEIDX_OFFSET, 4) ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->buf_addr,
+					console->bufsize))
+		return false;
 	widx = brcmf_pcie_read_tcm32(devinfo, console->base_addr +
 				     BRCMF_CONSOLE_WRITEIDX_OFFSET);
 	if (widx >= console->bufsize || console->scan_idx >= console->bufsize)
@@ -1056,9 +1062,13 @@ static void brcmf_pcie_ctl_stall(struct device *dev, u32 stalls)
 		addr = brcmf_pcie_read_tcm32(devinfo, shared->tcm_base_address +
 					     BRCMF_SHARED_TRAP_ADDR_OFFSET);
 		/* trap type, then the exception pc */
-		brcmf_err(bus, "firmware trap 0x%x at 0x%08x\n",
-			  brcmf_pcie_read_tcm32(devinfo, addr),
-			  brcmf_pcie_read_tcm32(devinfo, addr + 4));
+		if (brcmf_pcie_tcm_range_valid(devinfo->tcm_size, addr, 8))
+			brcmf_err(bus, "firmware trap 0x%x at 0x%08x\n",
+				  brcmf_pcie_read_tcm32(devinfo, addr),
+				  brcmf_pcie_read_tcm32(devinfo, addr + 4));
+		else
+			brcmf_err(bus, "firmware trap record at 0x%08x is outside the TCM\n",
+				  addr);
 		reason = "trap in shared RAM";
 	} else if ((flags & BRCMF_PCIE_SHARED_ASSERT_BUILT) &&
 		   (flags & BRCMF_PCIE_SHARED_ASSERT)) {
@@ -1133,14 +1143,31 @@ static void brcmf_pcie_bus_console_init(struct brcmf_pciedev_info *devinfo)
 	console = &shared->console;
 	addr = shared->tcm_base_address + BRCMF_SHARED_CONSOLE_ADDR_OFFSET;
 	console->base_addr = brcmf_pcie_read_tcm32(devinfo, addr);
+	console->bufsize = 0;
+	console->read_idx = 0;
+	console->scan_idx = 0;
+	console->scan_len = 0;
+	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr,
+					BRCMF_CONSOLE_WRITEIDX_OFFSET + 4)) {
+		console->base_addr = 0;
+		return;
+	}
 
 	addr = console->base_addr + BRCMF_CONSOLE_BUFADDR_OFFSET;
 	console->buf_addr = brcmf_pcie_read_tcm32(devinfo, addr);
 	addr = console->base_addr + BRCMF_CONSOLE_BUFSIZE_OFFSET;
 	console->bufsize = brcmf_pcie_read_tcm32(devinfo, addr);
+	if (!console->bufsize ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->buf_addr,
+					console->bufsize)) {
+		console->base_addr = 0;
+		console->bufsize = 0;
+		return;
+	}
 	addr = console->base_addr + BRCMF_CONSOLE_WRITEIDX_OFFSET;
 	console->scan_idx = brcmf_pcie_read_tcm32(devinfo, addr);
-	console->scan_len = 0;
+	if (console->scan_idx >= console->bufsize)
+		console->scan_idx = 0;
 
 	brcmf_dbg(FWCON, "Console: base %x, buf %x, size %d\n",
 		  console->base_addr, console->buf_addr, console->bufsize);
@@ -1170,6 +1197,8 @@ static void brcmf_pcie_bus_console_read(struct brcmf_pciedev_info *devinfo,
 		return;
 	addr = console->base_addr + BRCMF_CONSOLE_WRITEIDX_OFFSET;
 	newidx = brcmf_pcie_read_tcm32(devinfo, addr);
+	if (newidx >= console->bufsize || console->read_idx >= console->bufsize)
+		return;
 	while (newidx != console->read_idx) {
 		addr = console->buf_addr + console->read_idx;
 		ch = brcmf_pcie_read_tcm8(devinfo, addr);
@@ -2392,6 +2421,7 @@ static int brcmf_pcie_get_resource(struct brcmf_pciedev_info *devinfo)
 
 	devinfo->regs = ioremap(bar0_addr, BRCMF_PCIE_REG_MAP_SIZE);
 	devinfo->tcm = ioremap(bar1_addr, bar1_size);
+	devinfo->tcm_size = bar1_size;
 
 	if (!devinfo->regs || !devinfo->tcm) {
 		brcmf_err(bus, "ioremap() failed (%p,%p)\n", devinfo->regs,
