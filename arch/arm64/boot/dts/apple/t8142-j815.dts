@@ -299,6 +299,7 @@
  */
 &smc {
 	hwmon {
+		apple,discover-temperatures;
 		apple,soc-die-keys = "Te04", "Te08", "Te0C", "Te0R",
 				     "Tp00", "Tp04", "Tp0C", "Tp0G", "Tp0O",
 				     "Tp0R", "Tp0X", "Tp0a", "Tp0p", "Tp0u",

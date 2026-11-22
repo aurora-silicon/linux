@@ -126,6 +126,7 @@
 #include "t8142-j813-isp.dtsi"
 #include "t8142-j813-n1.dtsi"
 #include "t8142-j813-audio.dtsi"
+#include "t8142-hwmon.dtsi"
 
 /*
  * Ambient light sensor, the AOP's "als" service: an ST VD6286, as on J815
