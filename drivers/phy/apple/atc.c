@@ -839,6 +839,13 @@ struct atcphy_cio_sleep {
  * @idle_rpm: An idle PHY runtime-suspends, see atcphy_rpm_get()
  * @rpm_held: A runtime PM reference is held while busy, see atcphy_rpm_busy();
  *            under @lock
+ * @pd_hold: Second, syscore, consumer of the PHY's own power domain (T8132), so
+ *           that a CIO-mode port can keep the domain on across suspend-to-idle,
+ *           see atcphy_cio_can_hold()
+ * @pd_hold_sleep: This suspend-to-idle keeps the domain on through @pd_hold;
+ *                 under @lock
+ * @pd_hold_released: @pd_hold is counted as suspended for this system sleep;
+ *                    under @lock
  * @regs: Memory-mapped registers
  * @regs.core: Core registers
  * @regs.axi2af: AXI to Apple Fabric interface registers
@@ -961,6 +968,9 @@ struct apple_atcphy {
 	bool pd_was_off;
 	bool idle_rpm;
 	bool rpm_held;
+	struct device *pd_hold;
+	bool pd_hold_sleep;
+	bool pd_hold_released;
 
 	bool tunnel_dual_stream;
 	bool tunnel_routes_present;
@@ -1462,6 +1472,18 @@ static void atcphy_clear_nonselected_phy_reset(struct apple_atcphy *atcphy)
 static bool atcphy_mode_is_cio(enum atcphy_mode mode)
 {
 	return mode == APPLE_ATCPHY_MODE_TBT || mode == APPLE_ATCPHY_MODE_USB4;
+}
+
+/*
+ * Whether a port in CIO mode can keep its domain, and with it the PHY state the
+ * USB4 router runs on, across suspend-to-idle: only by holding it itself, see
+ * atcphy_probe_pd_hold(). Not through a router: a board need not have one (the
+ * J604 has CIO tunables and no ACIO), and one does not hold this domain. The
+ * hold keeps the parent, ATCn_COMMON, on as well.
+ */
+static bool atcphy_cio_can_hold(const struct apple_atcphy *atcphy)
+{
+	return atcphy_mode_is_cio(atcphy->mode) && atcphy->pd_hold;
 }
 
 /*
@@ -6852,6 +6874,40 @@ static void atcphy_pd_notifier_remove(void *data)
 	dev_pm_genpd_remove_notifier(data);
 }
 
+static void atcphy_pd_hold_remove(void *data)
+{
+	dev_pm_domain_detach(data, false);
+}
+
+/*
+ * The PHY's own domain, ATCn_USB, is held by nothing else across system sleep
+ * while it runs a USB4 link: the ACIO holds the CIO and PCIe states and, through
+ * them, ATCn_COMMON, and DWC3, held in reset, lets its domain go. So attach a
+ * second consumer to it, as the ACIO does for its own states: a syscore device
+ * the system sleep leaves alone, whose share of the domain the PHY gives up in
+ * its noirq suspend unless it keeps the domain on, see atcphy_sleep_suspend_noirq().
+ * Runtime suspended, it leaves runtime PM of the domain to the PHY.
+ */
+static int atcphy_probe_pd_hold(struct apple_atcphy *atcphy)
+{
+	struct device *hold;
+
+	if (!atcphy->t8132_ss || !atcphy->cio_tunables)
+		return 0;
+	hold = genpd_dev_pm_attach_by_id(atcphy->dev, 0);
+	if (IS_ERR(hold) && PTR_ERR(hold) == -EPROBE_DEFER)
+		return -EPROBE_DEFER;
+	if (IS_ERR_OR_NULL(hold)) {
+		dev_info(atcphy->dev,
+			 "no power domain to hold (%d): USB4 is not kept across suspend-to-idle\n",
+			 PTR_ERR_OR_ZERO(hold));
+		return 0;
+	}
+	dev_pm_syscore_device(hold, true);
+	atcphy->pd_hold = hold;
+	return devm_add_action_or_reset(atcphy->dev, atcphy_pd_hold_remove, hold);
+}
+
 static void atcphy_usb2_repeater_exit(void *data)
 {
 	phy_exit(data);
@@ -6945,6 +7001,9 @@ static int atcphy_probe(struct platform_device *pdev)
 			return ret;
 	}
 	followed = atcphy_probe_pd_notifier(atcphy);
+	ret = atcphy_probe_pd_hold(atcphy);
+	if (ret)
+		return ret;
 
 	/*
 	 * Only a PHY that follows its domain may let it drop. Before the PHYs are
@@ -7846,6 +7905,7 @@ static int atcphy_suspend(struct device *dev)
 		return 0;
 
 	guard(mutex)(&atcphy->lock);
+	atcphy->pd_hold_sleep = false;
 	/* An incomplete common epoch has no qualified sleep handoff. */
 	if (atcphy->mode_dirty)
 		return -EBUSY;
@@ -7857,14 +7917,16 @@ static int atcphy_suspend(struct device *dev)
 	 * An active one survives suspend-to-idle while DWC3 runs on it, as a
 	 * host or as a device: the glue then keeps the controller, and with it
 	 * the power domain this PHY shares, on across system sleep, so the link
-	 * stays as it is. So does one in CIO mode, under its running USB4
-	 * router, whose power states stay on across suspend-to-idle. Without
-	 * either, or in a deeper sleep state, it is lost.
+	 * stays as it is. So does one in CIO mode, whose domain the PHY holds
+	 * itself until the resume: the router's power states do not keep it.
+	 * Without either, or in a deeper sleep state, it is lost.
 	 */
 	if (atcphy->t8132_common_owned &&
 	    (pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
-	     !(atcphy->dwc3_running || atcphy_mode_is_cio(atcphy->mode))))
+	     !(atcphy->dwc3_running || atcphy_cio_can_hold(atcphy))))
 		return -EBUSY;
+	atcphy->pd_hold_sleep = pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
+				atcphy_cio_can_hold(atcphy);
 	/* Do not admit a new epoch after this check and before resume. */
 	atcphy->t8132_suspended = true;
 
@@ -7884,10 +7946,16 @@ static int atcphy_resume(struct device *dev)
 	if (atcphy->cio_sleep.prepared)
 		return atcphy->cio_sleep.changed && !atcphy->cio_sleep.restored ? -EIO : 0;
 	atcphy->t8132_suspended = false;
-	/* Suspend admitted a common epoch only with DWC3 running, in either role. */
-	if (atcphy->t8132_common_owned && atcphy->dwc3_running &&
+	atcphy->pd_hold_sleep = false;
+	/*
+	 * Suspend admitted a common epoch only with DWC3 running, in either role,
+	 * or in CIO mode with the domain held: neither should have lost it.
+	 */
+	if (((atcphy->t8132_common_owned && atcphy->dwc3_running) ||
+	     atcphy_mode_is_cio(atcphy->mode)) &&
 	    READ_ONCE(atcphy->pd_was_off))
-		dev_warn(dev, "power domain went off under an active USB3 link\n");
+		dev_warn(dev, "power domain went off under an active %s link\n",
+			 atcphy_mode_is_cio(atcphy->mode) ? "USB4" : "USB3");
 	/* DP tunnel pixel clocks are then set up again at their next rate change. */
 	if (atcphy->tunnel_users && READ_ONCE(atcphy->pd_was_off))
 		dev_dbg(dev, "power domain went off across sleep under DP tunnel clocks (users %#x)\n",
@@ -7926,9 +7994,60 @@ static void atcphy_shutdown(struct platform_device *pdev)
 		dev_err(atcphy->dev, "USB3 common shutdown failed: %d\n", ret);
 }
 
+/*
+ * Give up the hold's share of the domain for this sleep, unless the PHY keeps
+ * the domain on: genpd then powers it off once its other devices suspend, as
+ * before. Not for hibernation, whose noirq phases genpd counts differently.
+ */
+static void atcphy_pd_hold_release(struct apple_atcphy *atcphy)
+{
+	lockdep_assert_held(&atcphy->lock);
+	if (!atcphy->pd_hold || atcphy->pd_hold_sleep)
+		return;
+	dev_pm_genpd_suspend(atcphy->pd_hold);
+	atcphy->pd_hold_released = true;
+}
+
+static void atcphy_pd_hold_reclaim(struct apple_atcphy *atcphy)
+{
+	lockdep_assert_held(&atcphy->lock);
+	if (!atcphy->pd_hold_released)
+		return;
+	dev_pm_genpd_resume(atcphy->pd_hold);
+	atcphy->pd_hold_released = false;
+}
+
+/* No resume_noirq follows a failed suspend_noirq: release only on success. */
+static int atcphy_sleep_suspend_noirq(struct device *dev)
+{
+	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+	int ret;
+
+	ret = atcphy_suspend_noirq(dev);
+	if (ret)
+		return ret;
+	guard(mutex)(&atcphy->lock);
+	atcphy_pd_hold_release(atcphy);
+	return 0;
+}
+
+static int atcphy_sleep_resume_noirq(struct device *dev)
+{
+	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+
+	scoped_guard(mutex, &atcphy->lock)
+		atcphy_pd_hold_reclaim(atcphy);
+	return atcphy_resume_noirq(dev);
+}
+
 static const struct dev_pm_ops atcphy_pm_ops = {
 	SYSTEM_SLEEP_PM_OPS(atcphy_suspend, atcphy_resume)
-	NOIRQ_SYSTEM_SLEEP_PM_OPS(atcphy_suspend_noirq, atcphy_resume_noirq)
+	.suspend_noirq = pm_sleep_ptr(atcphy_sleep_suspend_noirq),
+	.resume_noirq = pm_sleep_ptr(atcphy_sleep_resume_noirq),
+	.freeze_noirq = pm_sleep_ptr(atcphy_suspend_noirq),
+	.thaw_noirq = pm_sleep_ptr(atcphy_resume_noirq),
+	.poweroff_noirq = pm_sleep_ptr(atcphy_suspend_noirq),
+	.restore_noirq = pm_sleep_ptr(atcphy_resume_noirq),
 };
 
 static const struct atcphy_hw atcphy_hw_t8103 = {
