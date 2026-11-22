@@ -62,6 +62,7 @@ enum vb2_buffer_state { STATE_DUMMY };
 #define kfree free
 static bool vp_feature = true;
 static bool avd_qfw_has_vp_done(const struct avd_dev *d) { return d->queued && vp_feature; }
+static bool avd_backend_is_open(const struct avd_dev *d) { return !d->queued; }
 static void *vb2_plane_vaddr(struct vb2_buffer *b,int p) { (void)p;return b->cpu; }
 static size_t vb2_get_plane_payload(struct vb2_buffer *b,int p) { (void)p;return b->payload; }
 static struct vb2_v4l2_buffer *current_src,*current_dst;
@@ -208,12 +209,26 @@ int main(int argc,char **argv) {
   assert(p->bank[0].busy&&p->bank[1].busy);
   avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
  }
+ /* The firmware transport keeps the 64-pixel floor. */
+ ctx.decoded_fmt.fmt.pix_mp.width=64;ctx.decoded_fmt.fmt.pix_mp.height=64;
+ ctx.decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline=64;
+ params=(struct v4l2_ctrl_vp9_frame){.flags=V4L2_VP9_FRAME_FLAG_KEY_FRAME|V4L2_VP9_FRAME_FLAG_SHOW_FRAME,
+  .frame_width_minus_1=31,.frame_height_minus_1=15,.bit_depth=8};
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(avd_vp9_run(&ctx)==-EINVAL);
  avd_vp9_stop(&ctx);assert(!avd_vp9_ready(&ctx));
  /* Old firmware and the legacy transport allocate only one bank. */
  for(unsigned int mode=0;mode<2;mode++) {
   dev.queued=mode;vp_feature=false;assert(!avd_vp9_start(&ctx));p=ctx.priv;
   assert(p->nbanks==1&&ctx.max_frames==1);avd_vp9_stop(&ctx);
  }
+ /* On the legacy transport a frame below 64x64 decodes into a 64x64 CAPTURE buffer. */
+ dev.queued=false;vp_feature=false;assert(!avd_vp9_start(&ctx));p=ctx.priv;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ /* A frame larger than the CAPTURE format is still refused. */
+ params.frame_width_minus_1=1919;params.frame_height_minus_1=1087;
+ assert(avd_vp9_run(&ctx)==-EINVAL);
+ avd_vp9_stop(&ctx);
  dev.queued=true;vp_feature=true;fail_alloc_after=13;allocating_ctx=&ctx;
  assert(avd_vp9_start(&ctx)==-ENOMEM);allocating_ctx=NULL;
  assert(!ctx.priv&&!avd_vp9_ready(&ctx)&&ctx.max_frames==1);

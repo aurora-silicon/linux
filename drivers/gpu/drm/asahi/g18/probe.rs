@@ -64,6 +64,9 @@ impl platform::Driver for Driver {
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let soc = *info.ok_or(ENODEV)?;
+        // The memory limits the parameter buffer's growth is admitted
+        // against (memacct), as the other generations' probe sets them.
+        crate::memacct::LEDGER.configure();
         AsahiPlatformDriver::probe_g18(pdev, soc)
     }
 

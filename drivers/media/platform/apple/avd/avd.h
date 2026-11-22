@@ -212,7 +212,7 @@ struct avd_variant {
 	unsigned int fw_caps_required;
 	void (*configure_stream)(struct avd_dev *avd, dma_addr_t addr,
 			u8 fifo_idx, u32 vp_slot);
-	const char* fw_name;
+	const char *fw_name;
 	/* Older image tried when fw_name is not installed (legacy transport). */
 	const char *fw_name_fallback;
 	unsigned char revision; /* the same as the device tree */
@@ -418,6 +418,7 @@ void avd_qfw_select(struct avd_dev *avd);
 void avd_qfw_prepare_boot(struct avd_dev *avd);
 void avd_qfw_debug(struct avd_dev *avd, struct avd_frame *f, const char *where);
 bool avd_backend_is_qfw(const struct avd_dev *avd);
+bool avd_backend_is_open(const struct avd_dev *avd);
 bool avd_qfw_has_vp_done(const struct avd_dev *avd);
 unsigned int avd_qfw_picture_banks(const struct avd_dev *avd, unsigned int codec);
 int avd_backend_select(struct avd_dev *avd);
