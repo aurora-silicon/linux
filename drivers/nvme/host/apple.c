@@ -353,10 +353,16 @@ static inline void apple_nvme_writeq(struct apple_nvme *anv, u64 value,
 		writeq(value, addr);
 }
 
-unsigned int flush_interval = 1000;
+/*
+ * A non-zero grace period completes a flush that arrives within it at once,
+ * before the data reaches the drive, and sends one flush when the period
+ * ends. A power loss in between loses data the filesystem was told is safe,
+ * so every flush goes to the drive unless the user opts in.
+ */
+static unsigned int flush_interval;
 module_param(flush_interval, uint, 0644);
 MODULE_PARM_DESC(flush_interval,
-		 "Grace period in msecs between flushes (ignored on post-M4 ANS)");
+		 "Grace period in msecs between flushes; a non-zero value acknowledges flushes before they reach the drive (default 0, ignored on post-M4 ANS)");
 
 /*
  * Stop ANS for a deep sleep on a controller whose sleep path was never run (T8142). Off by
@@ -1166,19 +1172,22 @@ static int apple_nvme_remove_sq(struct apple_nvme *anv)
 static bool apple_nvme_delayed_flush(struct apple_nvme *anv, struct nvme_ns *ns,
 				     struct request *req)
 {
+	/* remove() clears this to send the remaining flushes to the drive. */
+	unsigned long interval = READ_ONCE(anv->flush_interval);
+
 	/*
 	 * A flush completion is a persistence boundary for the filesystem.
 	 * Post-M4 internal-root storage must submit it to the controller and
 	 * wait for its completion, even when the legacy grace period is set.
 	 */
 	if (anv->hw->needs_ioq_registers ||
-	    !anv->flush_interval || req_op(req) != REQ_OP_FLUSH)
+	    !interval || req_op(req) != REQ_OP_FLUSH)
 		return false;
 	if (delayed_work_pending(&anv->flush_dwork))
 		return true;
-	if (time_before(jiffies, anv->last_flush + anv->flush_interval)) {
+	if (time_before(jiffies, anv->last_flush + interval)) {
 		kblockd_mod_delayed_work_on(WORK_CPU_UNBOUND, &anv->flush_dwork,
-						anv->flush_interval);
+					    interval);
 		if (WARN_ON_ONCE(anv->flush_ns && anv->flush_ns != ns))
 			goto out;
 		anv->flush_ns = ns;
@@ -2909,8 +2918,15 @@ static void apple_nvme_remove(struct platform_device *pdev)
 	cancel_work_sync(&anv->recovery_work);
 	cancel_work_sync(&anv->ctrl.reset_work);
 	nvme_stop_ctrl(&anv->ctrl);
-	cancel_delayed_work_sync(&anv->flush_dwork);
+	/*
+	 * Removing a namespace flushes its disk. Send those flushes to the
+	 * drive, and run a flush that is still deferred while its namespace
+	 * exists: the work uses flush_ns, which namespace removal frees.
+	 */
+	WRITE_ONCE(anv->flush_interval, 0);
+	flush_delayed_work(&anv->flush_dwork);
 	nvme_remove_namespaces(&anv->ctrl);
+	disable_delayed_work_sync(&anv->flush_dwork);
 	/* A quarantined controller keeps everything it may still DMA into. */
 	if (apple_nvme_disable(anv, true))
 		return;
