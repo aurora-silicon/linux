@@ -4443,9 +4443,14 @@ static int apple_dart_def_domain_type(struct device *dev)
 		return IOMMU_DOMAIN_IDENTITY;
 	/*
 	 * Tunneled PCIe is untrusted, and the PCIe-C DART bypasses only its
-	 * reserved streams: translate everything behind a USB4 port.
+	 * reserved streams: translate everything behind a USB4 port. The
+	 * T6050 PCIe-C DART is not read as a tunnel DART (its container is
+	 * not a usb4-pcie-tunnel-N node), so also go by the PCI core, which
+	 * marks each function below an external-facing root port untrusted.
+	 * The IOMMU core refuses an untrusted device any other domain.
 	 */
-	if (cfg->stream_maps[0].dart->tunneled)
+	if (cfg->stream_maps[0].dart->tunneled ||
+	    (dev_is_pci(dev) && to_pci_dev(dev)->untrusted))
 		return IOMMU_DOMAIN_DMA;
 	if (dev_is_pci(dev) && apple_t8132_air() &&
 	    cfg->supports_bypass && !cfg->locked)
