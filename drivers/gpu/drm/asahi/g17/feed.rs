@@ -17,13 +17,15 @@
 //! architected system counter (CNTFRQ_EL0); the detector takes that rate at
 //! creation and keeps its thresholds in time.
 
+use crate::hw::t8140::qos::CLOCK_HZ;
 use core::{
     pin::Pin,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use kernel::{
+    new_spinlock,
     prelude::*,
-    sync::Arc,
+    sync::{Arc, SpinLock},
     time::{delay::fsleep, ClockSource, Delta, Monotonic},
 };
 
@@ -32,9 +34,16 @@ use core::ptr;
 #[cfg(CONFIG_CPU_FREQ)]
 use kernel::{bindings, new_mutex, sync::Mutex, types::Opaque};
 
+unsafe extern "C" {
+    /// The system time base in ticks of `hz`, the clock the firmware stamps command execution
+    /// with.
+    fn asahi_g17_firmware_clock(hz: u64) -> u64;
+}
+
 /// The longest gap between one pass's end and the next one's start that still counts as a
 /// refill is 1/500 s (2 ms).
 const MAX_REFILL_PER_SEC: u64 = 500;
+const _: () = assert!(CLOCK_HZ == crate::hw::t8140::resources::COMMAND_TIMESTAMP_HZ);
 const STREAK_ON: u32 = 8;
 const STREAK_MAX: u32 = 64;
 const LINGER_NS: u64 = 8_000_000;
@@ -346,6 +355,10 @@ unsafe impl Sync for PolicyNotifier {}
 pub(crate) struct Feed {
     policy: &'static Policy,
     detector: Detector,
+    /// Every command's execution per client, for the performance effort
+    /// ([`super::power::BusyRuns`]).
+    #[pin]
+    runs: SpinLock<super::power::BusyRuns>,
     #[cfg(CONFIG_CPU_FREQ)]
     #[pin]
     requests: Mutex<Requests>,
@@ -364,6 +377,7 @@ impl Feed {
             pin_init!(Self {
                 policy,
                 detector: Detector::new(counter_hz),
+                runs <- new_spinlock!(super::power::BusyRuns::new(), "G17 busy runs"),
                 #[cfg(CONFIG_CPU_FREQ)]
                 requests <- new_mutex!(Requests::new(policy.floor_percent), "G17 CPU feed"),
                 #[cfg(CONFIG_CPU_FREQ)]
@@ -492,6 +506,29 @@ impl Feed {
         if cfg!(CONFIG_CPU_FREQ) {
             self.detector.note(start, end, Self::now());
         }
+    }
+
+    /// A command of `client` (its context id) executed from `start` to `end`, in the firmware
+    /// timestamp domain, for the performance effort's busy runs. A gap of the firmware's idle
+    /// power-off delay between the client's commands ends its run.
+    pub(crate) fn note_work(&self, client: u32, start: u64, end: u64) {
+        let idle_ticks = u64::from(super::power::FIRMWARE_IDLE_OFF_MS) * (CLOCK_HZ / 1000);
+        self.runs.lock().note(client, start, end, idle_ticks);
+    }
+
+    /// Whether a client that is still running has kept the GPU running without going idle for
+    /// longer than the effort is held after work stops ([`super::power::BusyRuns`]).
+    pub(crate) fn busy_run(&self) -> bool {
+        let hold_ticks = super::power::IDLE_HOLD_NS * CLOCK_HZ / 1_000_000_000;
+        let idle_ticks = u64::from(super::power::FIRMWARE_IDLE_OFF_MS) * (CLOCK_HZ / 1000);
+        // SAFETY: Reads the system counter; plain value in and out.
+        let now = unsafe { asahi_g17_firmware_clock(CLOCK_HZ) };
+        self.runs.lock().bound(now, hold_ticks, idle_ticks)
+    }
+
+    /// The effort was taken down after the hold: every client's next command begins a new run.
+    pub(crate) fn end_busy_run(&self) {
+        self.runs.lock().end();
     }
 
     /// Whether the GPU itself is the bottleneck: passes follow each other with refill gaps
