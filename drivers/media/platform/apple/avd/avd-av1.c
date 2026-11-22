@@ -2036,10 +2036,25 @@ static void avd_av1_adjust_decoded_fmt(struct avd_ctx *ctx,
 
 static int avd_av1_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 {
+	struct vb2_queue *vq;
+
 	if (ctrl->id == V4L2_CID_STATELESS_AV1_SEQUENCE)
 		return avd_av1_validate_sequence(ctx,
 						 ctrl->p_new.p_av1_sequence);
 	/* width should also be > 8 */
+	if (ctrl->id != V4L2_CID_STATELESS_AV1_FRAME)
+		return 0;
+
+	/*
+	 * The CAPTURE format is fixed while its buffers are allocated: a frame
+	 * that does not fit them cannot be decoded, as the run finds too.
+	 * Before that the format may still be set to the stream's.
+	 */
+	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+	if (vb2_is_busy(vq))
+		return avd_av1_check_frame_size(ctrl->p_new.p_av1_frame,
+						ctx->decoded_fmt.fmt.pix_mp.width,
+						ctx->decoded_fmt.fmt.pix_mp.height);
 	return 0;
 }
 

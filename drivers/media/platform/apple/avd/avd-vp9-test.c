@@ -4,6 +4,7 @@
  */
 
 #include <kunit/test.h>
+#include <media/v4l2-mem2mem.h>
 
 #include "avd.h"
 
@@ -154,8 +155,56 @@ static void avd_vp9_frame_fits_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, avd_vp9_frame_fits(&frame, 4096, 4096));
 }
 
+/*
+ * A frame larger than the OUTPUT format is refused when the control is set,
+ * once the OUTPUT queue streams and the format can no longer follow it.
+ */
+static void avd_vp9_try_frame_size_test(struct kunit *test)
+{
+	static const struct v4l2_ctrl_config cfg = {
+		.id = V4L2_CID_STATELESS_VP9_FRAME,
+	};
+	struct v4l2_m2m_ctx *m2m_ctx;
+	struct v4l2_ctrl_vp9_frame *frame;
+	struct v4l2_ctrl *ctrl;
+	struct avd_ctx *ctx;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	m2m_ctx = kunit_kzalloc(test, sizeof(*m2m_ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, m2m_ctx);
+	ctx->fh.m2m_ctx = m2m_ctx;
+	ctx->coded_fmt.fmt.pix_mp.width = 1920;
+	ctx->coded_fmt.fmt.pix_mp.height = 1088;
+
+	v4l2_ctrl_handler_init(&ctx->ctrl_hdl, 1);
+	ctrl = v4l2_ctrl_new_custom(&ctx->ctrl_hdl, &cfg, NULL);
+	KUNIT_ASSERT_EQ(test, ctx->ctrl_hdl.error, 0);
+	KUNIT_ASSERT_NOT_NULL(test, ctrl);
+	frame = ctrl->p_new.p_vp9_frame;
+
+	/* Not streaming: the format may still be set to the stream's size. */
+	frame->frame_width_minus_1 = 4095;
+	frame->frame_height_minus_1 = 2159;
+	KUNIT_EXPECT_EQ(test, avd_vp9_fmt_ops.try_ctrl(ctx, ctrl), 0);
+
+	m2m_ctx->out_q_ctx.q.streaming = 1;
+	KUNIT_EXPECT_EQ(test, avd_vp9_fmt_ops.try_ctrl(ctx, ctrl), -EINVAL);
+	frame->frame_width_minus_1 = 1919;
+	frame->frame_height_minus_1 = 1088;
+	KUNIT_EXPECT_EQ(test, avd_vp9_fmt_ops.try_ctrl(ctx, ctrl), -EINVAL);
+	frame->frame_height_minus_1 = 1087;
+	KUNIT_EXPECT_EQ(test, avd_vp9_fmt_ops.try_ctrl(ctx, ctrl), 0);
+	frame->frame_width_minus_1 = 1279;
+	frame->frame_height_minus_1 = 719;
+	KUNIT_EXPECT_EQ(test, avd_vp9_fmt_ops.try_ctrl(ctx, ctrl), 0);
+
+	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
+}
+
 static struct kunit_case avd_vp9_test_cases[] = {
 	KUNIT_CASE(avd_vp9_frame_fits_test),
+	KUNIT_CASE(avd_vp9_try_frame_size_test),
 	KUNIT_CASE_PARAM(avd_vp9_tiling_test, avd_vp9_tiling_gen_params),
 	KUNIT_CASE_PARAM(avd_vp9_tiles_test, avd_vp9_tiles_gen_params),
 	{}

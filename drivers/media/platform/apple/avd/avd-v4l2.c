@@ -439,6 +439,7 @@ static const struct avd_ctrl_desc avd_av1_ctrl_descs[] = {
 	},
 	{
 		.cfg.id = V4L2_CID_STATELESS_AV1_FRAME,
+		.cfg.ops = &avd_ctrl_ops,
 	},
 	{
 		.cfg.id = V4L2_CID_STATELESS_AV1_FILM_GRAIN,

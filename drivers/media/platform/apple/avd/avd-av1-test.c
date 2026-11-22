@@ -6,6 +6,7 @@
 
 #include <kunit/test.h>
 #include <linux/slab.h>
+#include <media/v4l2-mem2mem.h>
 
 #include "avd.h"
 
@@ -225,6 +226,54 @@ static void avd_av1_frame_size_test(struct kunit *test)
 			c->ret);
 }
 
+/*
+ * A frame that does not fit the CAPTURE format is refused when the control
+ * is set, once CAPTURE buffers are allocated and the format can no longer
+ * follow it.
+ */
+static void avd_av1_try_frame_size_test(struct kunit *test)
+{
+	static const struct v4l2_ctrl_config cfg = {
+		.id = V4L2_CID_STATELESS_AV1_FRAME,
+	};
+	struct v4l2_m2m_ctx *m2m_ctx;
+	struct v4l2_ctrl_av1_frame *frame;
+	struct v4l2_ctrl *ctrl;
+	struct avd_ctx *ctx;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	m2m_ctx = kunit_kzalloc(test, sizeof(*m2m_ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, m2m_ctx);
+	ctx->fh.m2m_ctx = m2m_ctx;
+	ctx->decoded_fmt.fmt.pix_mp.width = 1920;
+	ctx->decoded_fmt.fmt.pix_mp.height = 1088;
+
+	v4l2_ctrl_handler_init(&ctx->ctrl_hdl, 1);
+	ctrl = v4l2_ctrl_new_custom(&ctx->ctrl_hdl, &cfg, NULL);
+	KUNIT_ASSERT_EQ(test, ctx->ctrl_hdl.error, 0);
+	KUNIT_ASSERT_NOT_NULL(test, ctrl);
+	frame = ctrl->p_new.p_av1_frame;
+
+	/* No buffers: the format may still be set to the stream's size. */
+	frame->frame_width_minus_1 = 3839;
+	frame->frame_height_minus_1 = 2159;
+	frame->upscaled_width = 3840;
+	KUNIT_EXPECT_EQ(test, avd_av1_fmt_ops.try_ctrl(ctx, ctrl), 0);
+
+	m2m_ctx->cap_q_ctx.q.is_busy = 1;
+	KUNIT_EXPECT_EQ(test, avd_av1_fmt_ops.try_ctrl(ctx, ctrl), -EINVAL);
+	frame->frame_width_minus_1 = 1919;
+	frame->frame_height_minus_1 = 1079;
+	KUNIT_EXPECT_EQ(test, avd_av1_fmt_ops.try_ctrl(ctx, ctrl), -EINVAL);
+	frame->upscaled_width = 1920;
+	KUNIT_EXPECT_EQ(test, avd_av1_fmt_ops.try_ctrl(ctx, ctrl), 0);
+	frame->upscaled_width = 0;
+	KUNIT_EXPECT_EQ(test, avd_av1_fmt_ops.try_ctrl(ctx, ctrl), -EINVAL);
+
+	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
+}
+
 static struct kunit_case avd_av1_test_cases[] = {
 	KUNIT_CASE(avd_av1_tiles_valid_test),
 	KUNIT_CASE(avd_av1_tiles_count_test),
@@ -232,6 +281,7 @@ static struct kunit_case avd_av1_test_cases[] = {
 	KUNIT_CASE_PARAM(avd_av1_tiles_rowcol_test, avd_av1_rowcol_gen_params),
 	KUNIT_CASE(avd_av1_copy_tile_group_test),
 	KUNIT_CASE_PARAM(avd_av1_frame_size_test, avd_av1_size_gen_params),
+	KUNIT_CASE(avd_av1_try_frame_size_test),
 	{}
 };
 

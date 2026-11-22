@@ -1309,10 +1309,23 @@ static enum avd_image_fmt avd_vp9_get_image_fmt(struct avd_ctx *ctx,
 
 static int avd_vp9_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 {
-	if (ctrl->id == V4L2_CID_STATELESS_VP9_FRAME)
-		return avd_vp9_validate_frame(ctx, ctrl->p_new.p_vp9_frame);
+	const struct v4l2_ctrl_vp9_frame *frame = ctrl->p_new.p_vp9_frame;
+	struct vb2_queue *vq;
 
-	return 0;
+	if (ctrl->id != V4L2_CID_STATELESS_VP9_FRAME)
+		return 0;
+
+	/*
+	 * The OUTPUT format is fixed while its queue streams and the scratch
+	 * is sized from it: a larger frame cannot be decoded, as the run
+	 * finds too. Before that the format may still be set to the stream's.
+	 */
+	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+	if (vb2_is_streaming(vq) &&
+	    !avd_vp9_frame_fits(frame, fmt_width(ctx), fmt_height(ctx)))
+		return -EINVAL;
+
+	return avd_vp9_validate_frame(ctx, frame);
 }
 
 static unsigned int avd_vp9_pp_kicks(struct avd_ctx *ctx)
