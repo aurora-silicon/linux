@@ -881,6 +881,13 @@ struct apple_atcphy {
 	const struct atcphy_hw *hw;
 	/* T8132 keeps USB2 support when its optional SuperSpeed banks are absent. */
 	bool t8132_ss;
+	/*
+	 * SuperSpeed device mode is not supported by this driver on T8132:
+	 * while the controller holds the device role, the lanes run USB2
+	 * instead of a partner's SuperSpeed mode. Cleared when the USB3 PHY
+	 * powers off or the controller switches to host mode.
+	 */
+	bool t8132_device;
 	/* Only this driver's admitted common-power epoch may be stopped. */
 	bool t8132_common_owned;
 	/* A touched failure has no qualified partial rollback or retry. */
@@ -3621,6 +3628,19 @@ static bool atcphy_t8132_dp_on(const struct apple_atcphy *atcphy)
 }
 
 /*
+ * The mode a T8132 port runs in while its controller is a USB device:
+ * SuperSpeed device mode is not supported by this driver, so USB3 and pin-D
+ * USB3+DP fall back to USB2. Four-lane DisplayPort (pin C/E) keeps USB2 on its
+ * own wires and is unchanged.
+ */
+static enum atcphy_mode atcphy_t8132_device_mode(enum atcphy_mode mode)
+{
+	if (mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP)
+		return APPLE_ATCPHY_MODE_USB2;
+	return mode;
+}
+
+/*
  * The T8132 lane start differs from the T8122 one: both blocks start at swing
  * 0 / pre-emphasis 0, the RX block's VREF filter is held until both DTVREG
  * stages are on, and HBR3 keeps the LDOCLK1 regulator in circuit.
@@ -4552,8 +4572,13 @@ static int atcphy_usb2_init(struct phy *phy)
 
 	/* A delayed shutdown may have completed after the last Type-C event. */
 	if (!atcphy->fixed_usb2) {
-		if (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)
-			return atcphy_configure(atcphy, atcphy->typec_mode);
+		if (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty) {
+			enum atcphy_mode mode = atcphy->t8132_device ?
+				atcphy_t8132_device_mode(atcphy->typec_mode) :
+				atcphy->typec_mode;
+
+			return atcphy_configure(atcphy, mode);
+		}
 		/*
 		 * Reset assertion stops USB2 even when a DisplayPort mode keeps
 		 * the common block running. An aborted suspend need not produce
@@ -4627,10 +4652,11 @@ static int atcphy_usb3_power_off(struct phy *phy)
 	atcphy_restore_after_pd_off(atcphy);
 
 	/*
-	 * dwc3 has left host mode: nothing drives the PIPE any more, and the
+	 * dwc3 has left its role: nothing drives the PIPE any more, and the
 	 * next host powers its SuperSpeed port on as it starts.
 	 */
 	atcphy->host_active = false;
+	atcphy->t8132_device = false;
 	atcphy->usb3_port_off = false;
 
 	ret = atcphy_park_pipehandler(atcphy, true);
@@ -4714,6 +4740,8 @@ static int atcphy_usb3_route(struct apple_atcphy *atcphy, bool host)
 	return atcphy_configure_pipehandler(atcphy, host);
 }
 
+static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode target_mode);
+
 static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
@@ -4725,18 +4753,51 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	if (atcphy->usb_off_pending)
 		return -EBUSY;
 
-	if (atcphy->t8132_ss &&
-	    (atcphy->mode == APPLE_ATCPHY_MODE_USB3 || atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP) &&
-	    mode == PHY_MODE_USB_DEVICE)
-		return -EOPNOTSUPP;
-
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
+		if (atcphy->t8132_device) {
+			enum atcphy_mode target = atcphy->typec_mode;
+
+			/*
+			 * Leaving the device role lifts the USB2 fallback:
+			 * restore the partner's SuperSpeed mode before
+			 * host_active blocks T8132 lane reconfiguration.
+			 */
+			atcphy->t8132_device = false;
+			if (atcphy->mode == APPLE_ATCPHY_MODE_USB2 &&
+			    atcphy_t8132_device_mode(target) != target) {
+				ret = atcphy_mux_switch(atcphy, target);
+				if (ret) {
+					atcphy->t8132_device = true;
+					return ret;
+				}
+			}
+		}
 		atcphy->host_active = true;
 		/* A host that starts up powers the ports of its root hubs itself. */
 		atcphy->usb3_port_off = false;
 		break;
 	case PHY_MODE_USB_DEVICE:
+		if (atcphy->t8132_ss) {
+			enum atcphy_mode usb2 = atcphy_t8132_device_mode(atcphy->mode);
+
+			/*
+			 * SuperSpeed device mode is not supported by this
+			 * driver on T8132: serve the device role on USB2
+			 * instead of failing it. Keep typec_mode intact so a
+			 * later host role can restore SuperSpeed.
+			 */
+			if (usb2 != atcphy->mode) {
+				enum atcphy_mode saved_typec_mode = atcphy->typec_mode;
+
+				dev_info(atcphy->dev,
+					 "USB device role: SuperSpeed device mode not supported by driver, using USB2\n");
+				ret = atcphy_mux_switch(atcphy, usb2);
+				atcphy->typec_mode = saved_typec_mode;
+				if (ret)
+					return ret;
+			}
+		}
 		atcphy->host_active = false;
 		break;
 	default:
@@ -4744,6 +4805,8 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	}
 
 	ret = atcphy_usb3_route(atcphy, mode == PHY_MODE_USB_HOST);
+	if (!ret && atcphy->t8132_ss && mode == PHY_MODE_USB_DEVICE)
+		atcphy->t8132_device = true;
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
 		dev_dbg(atcphy->dev,
 			 "USB %s route: mode=%u ss=%u calibration=%u common=%u dirty=%u pipe=%u pending=%u ret=%d mux=%#x override=%#x config=%#x\n",
@@ -5823,6 +5886,8 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
  */
 static bool atcphy_mux_in_mode(const struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
 {
+	if (atcphy->t8132_device)
+		target_mode = atcphy_t8132_device_mode(target_mode);
 	if (atcphy->mode != target_mode || atcphy->mode_dirty ||
 	    atcphy->t8103_dummy_pending || atcphy->t8103_usb3_retry)
 		return false;
@@ -5907,9 +5972,12 @@ static int atcphy_mux_check(const struct apple_atcphy *atcphy, enum atcphy_mode 
 
 static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
 {
+	enum atcphy_mode requested_mode = target_mode;
 	int ret;
 
 	lockdep_assert_held(&atcphy->lock);
+	if (atcphy->t8132_device)
+		target_mode = atcphy_t8132_device_mode(target_mode);
 	if (atcphy->t8103_dummy_pending) {
 		ret = atcphy_park_live_t8103_pipehandler(atcphy);
 		if (ret)
@@ -5917,7 +5985,7 @@ static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode targe
 	}
 
 	if (atcphy->mode == target_mode && !atcphy->mode_dirty) {
-		atcphy->typec_mode = target_mode;
+		atcphy->typec_mode = requested_mode;
 		/* A canceled lane change owes the old USB3 backend its reconnect. */
 		if (atcphy->t8103_usb3_retry) {
 			if (atcphy_pipe_state_for(atcphy, target_mode) ==
@@ -5947,7 +6015,7 @@ static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode targe
 	ret = atcphy_mux_check(atcphy, target_mode);
 	if (ret)
 		return ret;
-	atcphy->typec_mode = target_mode;
+	atcphy->typec_mode = requested_mode;
 
 	if (atcphy->fixed_usb2) {
 		enum atcphy_pipehandler_state pipe_state;
@@ -6069,7 +6137,8 @@ static int atcphy_mux_update_to(struct apple_atcphy *atcphy, enum atcphy_mode ta
 			return 0;
 		}
 		/* Turn down a mode the PHY cannot run before USB3 goes down for it. */
-		ret = atcphy_mux_check(atcphy, target_mode);
+		ret = atcphy_mux_check(atcphy, atcphy->t8132_device ?
+				       atcphy_t8132_device_mode(target_mode) : target_mode);
 		if (ret)
 			return ret;
 		in_mode = atcphy_mux_in_mode(atcphy, target_mode);
