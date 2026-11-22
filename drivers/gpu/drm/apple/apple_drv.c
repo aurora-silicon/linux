@@ -81,6 +81,12 @@ struct apple_drm_private {
 	struct work_struct notch_hotplug;
 	/* The console took the display back: it re-probes its notch-free modes. */
 	struct work_struct notch_console;
+	/*
+	 * The console's first probe ran while a DRM master was offered the
+	 * full panel: its modes are not its notch-free surface's until it
+	 * re-probes, which the next master drop asks for, once.
+	 */
+	bool notch_console_stale;
 };
 
 static struct apple_drm_private *to_apple_drm(struct drm_device *drm)
@@ -266,6 +272,7 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 			continue;
 		sizes->surface_height -= dcp->notch_rows;
 		sizes->fb_height = min(sizes->fb_height, sizes->surface_height);
+		WRITE_ONCE(to_apple_drm(helper->dev)->notch_console_stale, true);
 		break;
 	}
 
@@ -275,11 +282,14 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 
 /*
  * Who owns the display decides the notch geometry offered (dcp-notch.h): a
- * DRM master gets the policy, the console gets notch-free modes.  When the
- * master goes (a VT switch, a compositor that exits or drops master), the
- * console client re-probes and so takes them; when one comes back, it is
- * offered the policy's geometry at its next probe, and its own mode, full or
- * notch-free, is a fast switch either way.
+ * DRM master gets the policy, the console gets notch-free modes.  Every
+ * probe of the console after its first is bounded by its notch-free surface
+ * and so picks notch-free modes whoever owns the device; only a first probe
+ * under a master offered the full panel (a boot splash) leaves it with full
+ * modes, and the first master drop after that has it re-probe.  Other drops
+ * (greeter to session, user switch) leave the console alone.  When a master
+ * comes back, it is offered the policy's geometry at its next probe, and its
+ * own mode, full or notch-free, is a fast switch either way.
  */
 static void apple_drm_notch_owner(struct drm_device *drm, bool owned)
 {
@@ -298,7 +308,8 @@ static void apple_drm_notch_owner(struct drm_device *drm, bool owned)
 		notch = true;
 	}
 	/* master_drop() runs under master_mutex, which the console's restore takes. */
-	if (notch && !owned && !drm_dev_is_unplugged(drm))
+	if (notch && !owned && !drm_dev_is_unplugged(drm) &&
+	    xchg(&to_apple_drm(drm)->notch_console_stale, false))
 		schedule_work(&to_apple_drm(drm)->notch_console);
 }
 
@@ -1239,15 +1250,15 @@ static u8 apple_connector_eotf(const struct drm_connector_state *state)
  * the display back or a compositor taking it, keeps the panel's mode, so it
  * is no mode set (no CRTC off and on, no firmware mode set).
  */
-static void apple_connector_notch_fastset(struct drm_connector *conn,
-					  struct drm_atomic_commit *state,
-					  struct drm_connector_state *new)
+static int apple_connector_notch_fastset(struct drm_connector *conn,
+					 struct drm_atomic_commit *state,
+					 struct drm_connector_state *new)
 {
 	struct apple_dcp *dcp = apple_connector_notch_dcp(conn);
 	struct drm_crtc_state *old_cs, *new_cs;
 
 	if (!dcp || !new->crtc)
-		return;
+		return 0;
 	old_cs = drm_atomic_get_old_crtc_state(state, new->crtc);
 	new_cs = drm_atomic_get_new_crtc_state(state, new->crtc);
 	if (!old_cs || !new_cs || !new_cs->mode_changed || new_cs->active_changed ||
@@ -1256,10 +1267,15 @@ static void apple_connector_notch_fastset(struct drm_connector *conn,
 	    old_cs->vrr_enabled != new_cs->vrr_enabled ||
 	    !dcp_notch_twins(&old_cs->mode, &new_cs->mode, dcp->notch_rows) ||
 	    !dcp_notch_mode_known(dcp, &new_cs->mode))
-		return;
+		return 0;
 	new_cs->mode_changed = false;
 	/* No mode_fixup() runs now: the adjusted mode is the mode, as it would be. */
 	drm_mode_copy(&new_cs->adjusted_mode, &new_cs->mode);
+	/*
+	 * The frame moves by the notch rows: the swap that does it needs the
+	 * CRTC's planes, which the core adds only to a mode set.
+	 */
+	return drm_atomic_add_affected_planes(state, new->crtc);
 }
 
 static int apple_connector_atomic_check(struct drm_connector *conn,
@@ -1268,9 +1284,12 @@ static int apple_connector_atomic_check(struct drm_connector *conn,
 	struct drm_connector_state *old = drm_atomic_get_old_connector_state(state, conn);
 	struct drm_connector_state *new = drm_atomic_get_new_connector_state(state, conn);
 	struct drm_crtc_state *crtc_state;
+	int ret;
 
 	/* Before anything below asks for a real mode set again. */
-	apple_connector_notch_fastset(conn, state, new);
+	ret = apple_connector_notch_fastset(conn, state, new);
+	if (ret)
+		return ret;
 
 	if (!new->crtc || (old->colorspace == new->colorspace &&
 			   drm_connector_atomic_hdr_metadata_equal(old, new)))

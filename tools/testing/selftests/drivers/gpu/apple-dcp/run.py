@@ -72,6 +72,7 @@ def main():
         ('display', 'panel-brightness-takeover', display.takeover, ((),), ()),
         ('display', 'panel-mode-catalog', display.modes, ((),), ()),
         ('display', 'panel-notch-geometry', display.notch, ((),), ()),
+        ('display', 'panel-notch-console', display.notch_console, ((),), ()),
         ('display', 'desktop-brightness-notifications', desktop.brightness_notifications, ((),), ()),
         ('display', 'j616s-panel-identity', lambda r: j616s.identity(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('display', 'desktop-adt-identity', desktop.adt_identity, ((),), ()),

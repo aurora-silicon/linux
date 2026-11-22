@@ -384,6 +384,136 @@ def notch(root):
     return prefix + f['parser'] + twins + '\n' + blob + NOTCH_MAIN
 
 
+
+def notch_console(root):
+    """Who re-probes the console when a DRM master drops (apple_drv.c): only
+    the first drop after a console probe that a master's full-panel offer
+    left with full modes (a boot splash with the notch shown).  Other
+    handoffs (greeter to session, user switch) must not make the fbdev
+    client re-probe and commit in the gap."""
+    drv = (root / 'drivers/gpu/drm/apple/apple_drv.c').read_text()
+    return (NOTCH_CONSOLE_PREFIX +
+            block(drv, 'static int apple_drm_fbdev_probe(') + '\n' +
+            block(drv, 'static void apple_drm_notch_owner(') + '\n' +
+            block(drv, 'static void apple_drm_master_set(') + '\n' +
+            block(drv, 'static void apple_drm_master_drop(') + '\n' +
+            NOTCH_CONSOLE_MAIN)
+
+
+NOTCH_CONSOLE_PREFIX = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+typedef uint32_t u32;
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+#define xchg(p, v) __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
+#define min(a, b) ((a) < (b) ? (a) : (b))
+enum { DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_26_6, DCP_FIRMWARE_V_27_0,
+       DCP_FIRMWARE_H17P, DCP_FIRMWARE_V_13_5 };
+struct apple_dcp { int fw_compat; u32 notch_rows, notch_panel_rows; bool notch_owned; };
+struct drm_crtc { struct apple_dcp *dcp; bool ext; };
+struct drm_file { int unused; };
+struct work_struct { int scheduled; };
+struct drm_device { struct drm_crtc *crtcs; int n; bool unplugged; };
+struct apple_drm_private {
+    struct drm_device drm;
+    struct work_struct notch_console;
+    bool notch_console_stale;
+};
+struct drm_fb_helper { struct drm_device *dev; };
+struct drm_fb_helper_surface_size { u32 surface_width, surface_height, fb_width, fb_height,
+                                    surface_bpp, surface_depth; };
+static struct apple_drm_private apple;
+#define container_of(p, t, m) ((t *)((char *)(p) - __builtin_offsetof(t, m)))
+static struct apple_drm_private *to_apple_drm(struct drm_device *drm)
+{ return container_of(drm, struct apple_drm_private, drm); }
+#define drm_for_each_crtc(c, dev) \
+    for (int _i = 0; _i < (dev)->n && ((c) = &(dev)->crtcs[_i]); _i++)
+static bool t8132_ext_crtc(struct drm_crtc *c) { return c->ext; }
+static struct drm_crtc *to_apple_crtc(struct drm_crtc *c) { return c; }
+static struct apple_dcp *platform_get_drvdata(struct apple_dcp *d) { return d; }
+static bool dcp_notch_dynamic(const struct apple_dcp *dcp)
+{ return dcp->fw_compat != DCP_FIRMWARE_V_14_7 && dcp->fw_compat != DCP_FIRMWARE_V_26_6; }
+static bool drm_dev_is_unplugged(struct drm_device *d) { return d->unplugged; }
+static int kicks;
+static void schedule_work(struct work_struct *w) { w->scheduled++; kicks++; }
+static int probes;
+static int drm_fbdev_dma_driver_fbdev_probe(struct drm_fb_helper *h,
+                                            struct drm_fb_helper_surface_size *s)
+{ (void)h; (void)s; probes++; return 0; }
+'''
+
+NOTCH_CONSOLE_MAIN = r'''
+static struct apple_dcp panel = { DCP_FIRMWARE_V_13_5, 64, 1864, false };
+static struct drm_crtc crtcs[2];
+static struct drm_file file;
+
+/* The console's first probe, at the height of the mode it picked. */
+static u32 first_probe(u32 rows)
+{
+    struct drm_fb_helper h = { &apple.drm };
+    struct drm_fb_helper_surface_size s = { 2880, rows, 2880, rows, 32, 24 };
+
+    assert(!apple_drm_fbdev_probe(&h, &s));
+    assert(s.fb_height <= s.surface_height);
+    return s.surface_height;
+}
+
+int main(void)
+{
+    crtcs[0].dcp = &panel;
+    crtcs[1].dcp = &panel; crtcs[1].ext = true;
+    apple.drm.crtcs = crtcs; apple.drm.n = 2;
+
+    /* A normal boot: the console probed with no master, notch-free already. */
+    assert(first_probe(1800) == 1800 && !apple.notch_console_stale);
+    /* Every handoff afterwards leaves the console alone. */
+    for (int i = 0; i < 4; i++) {
+        apple_drm_master_set(&apple.drm, &file, true);
+        assert(panel.notch_owned);
+        apple_drm_master_drop(&apple.drm, &file);
+        assert(!panel.notch_owned);
+    }
+    assert(kicks == 0);
+
+    /* A splash held master with the notch shown: the clamp fires... */
+    apple_drm_master_set(&apple.drm, &file, true);
+    assert(first_probe(1864) == 1800 && apple.notch_console_stale);
+    /* ...and only the first drop after it asks the console to re-probe. */
+    apple_drm_master_drop(&apple.drm, &file);
+    assert(kicks == 1 && apple.notch_console.scheduled == 1 && !apple.notch_console_stale);
+    apple_drm_master_set(&apple.drm, &file, false);
+    apple_drm_master_drop(&apple.drm, &file);
+    assert(kicks == 1);
+
+    /* An unplugged device schedules nothing. */
+    apple_drm_master_set(&apple.drm, &file, true);
+    assert(first_probe(1864) == 1800 && apple.notch_console_stale);
+    apple.drm.unplugged = true;
+    apple_drm_master_drop(&apple.drm, &file);
+    assert(kicks == 1);
+    apple.drm.unplugged = false;
+    apple.notch_console_stale = false;
+
+    /* Pipes that keep one geometry for the boot (14.7, 26.6): no clamp, no kick. */
+    panel.fw_compat = DCP_FIRMWARE_V_26_6;
+    apple_drm_master_set(&apple.drm, &file, true);
+    assert(first_probe(1864) == 1864 && !apple.notch_console_stale);
+    apple_drm_master_drop(&apple.drm, &file);
+    assert(kicks == 1);
+
+    /* No notch rows: nothing. */
+    panel.fw_compat = DCP_FIRMWARE_V_13_5; panel.notch_rows = 0;
+    assert(first_probe(1864) == 1864 && !apple.notch_console_stale);
+    apple_drm_master_drop(&apple.drm, &file);
+    assert(kicks == 1 && probes == 5);
+    puts("PASS: notch console re-probe only after a stale first probe");
+    return 0;
+}
+'''
+
 NOTCH_MAIN = r'''
 int main(void)
 {
