@@ -278,6 +278,13 @@ patternProperties:
           offers on some MacBook Pros. The performance platform profile then
           tells the SMC (apple,smc) that it is on.
 
+      apple,low-power-frequency-max-mhz:
+        description:
+          The machine's CPU frequency ceiling in macOS's Low Power mode, in
+          MHz, as the ADT's cpu-low-power-frequency-max has it. The low-power
+          platform profile holds the CPU clusters to it, up to the next
+          frequency of their tables.
+
     required:
       - compatible
       - reg
