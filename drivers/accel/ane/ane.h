@@ -46,6 +46,8 @@ struct ane_device {
 	void __iomem *ps;
 
 	struct drm_mm mm;
+	/* Size of the range mm hands out, page aligned and below 4 GiB. */
+	u64 iova_size;
 	struct iommu_domain *domain;
 	unsigned long shift;
 	struct ane_dart {

@@ -145,7 +145,7 @@ static int ane_iommu_map_each(struct ane_device *ane, struct ane_bo *bo,
 	int err = 0;
 
 	for (u32 i = 0; i < bo->npages; i++) {
-		dma_addr_t iova = bo->iova + (i << ane->shift);
+		dma_addr_t iova = bo->iova + ((u64)i << ane->shift);
 		bool healed = false;
 
 retry:
@@ -168,12 +168,12 @@ retry:
 
 				unmapped = iommu_unmap(ane->domain,
 						       bo->iova +
-						       (i << ane->shift),
+						       ((u64)i << ane->shift),
 						       1UL << ane->shift);
 				if (unmapped != 1UL << ane->shift)
 					dev_err(ane->dev,
 						"rollback unmap short at %#llx: %zu\n",
-						bo->iova + (i << ane->shift),
+						bo->iova + ((u64)i << ane->shift),
 						unmapped);
 			}
 			break;
@@ -261,7 +261,7 @@ static int ane_iommu_map_pages(struct ane_device *ane, struct ane_bo *bo)
 
 	/* reserve area from ANE address space */
 	err = drm_mm_insert_node_generic(&ane->mm, bo->mm,
-					 bo->npages << ane->shift,
+					 (u64)bo->npages << ane->shift,
 					 1UL << ane->shift, 0, 0);
 	if (err < 0) {
 		dev_err(ane->dev, "out of ANE space: %d\n", err);
@@ -300,7 +300,7 @@ static void ane_iommu_unmap_pages(struct ane_device *ane, struct ane_bo *bo)
 	list_del_init(&bo->node);
 	mutex_lock(&ane->iommu_lock);
 	for (u32 i = 0; i < bo->npages; i++) {
-		dma_addr_t iova = bo->iova + (i << ane->shift);
+		dma_addr_t iova = bo->iova + ((u64)i << ane->shift);
 		size_t unmapped = iommu_unmap(ane->domain, iova,
 					      1UL << ane->shift);
 
@@ -371,12 +371,12 @@ void ane_reclaim_preserved(struct ane_device *ane)
 			size_t unmapped;
 
 			unmapped = iommu_unmap(ane->domain,
-					       iova + (i << ane->shift),
+					       iova + ((u64)i << ane->shift),
 					       1UL << ane->shift);
 			if (unmapped != 1UL << ane->shift)
 				dev_err(ane->dev,
 					"preserved unmap short at %#llx: %zu\n",
-					iova + (i << ane->shift), unmapped);
+					iova + ((u64)i << ane->shift), unmapped);
 		}
 		drm_mm_remove_node(p->mm);
 		mutex_unlock(&ane->iommu_lock);
@@ -490,6 +490,13 @@ static int ane_bo_init(struct drm_device *drm, void *data,
 
 	if (args->pad || !args->size)
 		return -EINVAL;
+	/*
+	 * A buffer is mapped whole into the engine's address space, which
+	 * ends below 4 GiB. A larger one could never be mapped, and its page
+	 * count would overflow the u32 in struct ane_bo.
+	 */
+	if (args->size > ane->iova_size)
+		return -E2BIG;
 
 	bo = kzalloc_obj(*bo);
 	if (!bo)
@@ -1044,7 +1051,8 @@ static int ane_iommu_domain_init(struct ane_device *ane)
 		return -EINVAL;
 	ane->domain = domain;
 	ane->shift = PAGE_SHIFT;
-	drm_mm_init(&ane->mm, min_iova, limit - min_iova);
+	ane->iova_size = limit - min_iova;
+	drm_mm_init(&ane->mm, min_iova, ane->iova_size);
 
 	return 0;
 }
