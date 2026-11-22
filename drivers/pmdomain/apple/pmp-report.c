@@ -2647,6 +2647,27 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132 = {
 	/* No qualified fast-die effort on this generation. */
 };
 
+/*
+ * T8142 (M5): PTD entries 1 (PMP-STATUS), 15 (FAST-DIE-CE: E, P),
+ * 39 (SOC-DEV-PS-REQ), 47 (SOC-DEV-PS-ACK) and 55..70 (SOC-DEV-DVFS).
+ * Reads are 16 bytes per entry from the base, writes 8 bytes per entry
+ * from base + 0x10000.
+ */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t8142 = {
+	.tgt_read = 0x270,
+	.tgt_write = 0x10138,
+	.update = 0x10000,
+	.dvfs_first = 0x37,
+	.dvfs_count = 16,
+	.actual = 0x2f0,
+	.status = 0x10,
+	.fast_die = 0xf0,
+	.fast_die_lanes = 2,
+	.fast_die_wide = true,
+	.running_any = true,
+	.defer_requests = true,
+};
+
 static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,j613-25g83-pmp-report", .data = &apple_pmp_offsets_j613_25g83 },
 	{ .compatible = "apple,t6000-pmp-v2-report", .data = &apple_pmp_offsets_t600x },
@@ -2660,6 +2681,7 @@ static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,t8122-pmp-v2-report", .data = &apple_pmp_offsets_t8122 },
 	{ .compatible = "apple,t8132-pmp-v2-report", .data = &apple_pmp_offsets_t8132 },
 	{ .compatible = "apple,t8140-pmp-v2-report", .data = &apple_pmp_offsets_t8140 },
+	{ .compatible = "apple,t8142-pmp-v2-report", .data = &apple_pmp_offsets_t8142 },
 	{}
 };
 
