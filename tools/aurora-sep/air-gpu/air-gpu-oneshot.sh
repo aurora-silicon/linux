@@ -91,8 +91,11 @@ BLI_GUID=4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
 UBOOT_GUID=b2ac5fc9-92b7-4acd-aeac-11e818c3130c
 GLOBAL_GUID=8be4df61-93ca-11d2-aa0d-00e098032b8c
 # Omarchy's Limine tools take one of these before they touch the EFI partition (newer ones the
-# first, older ones the second); maclab takes both in this order, and so does this script.
-LOCKS="/run/lock/boot-partition.lock /tmp/limine-global.lock"
+# first, older ones the second); maclab takes both in this order, and so does this script. The
+# second is in world-writable /tmp, where any user could make or hold it first: it is taken only
+# when it is already there as a regular file of root's (COMPAT_LOCKS, never created).
+LOCKS="/run/lock/boot-partition.lock"
+COMPAT_LOCKS="/tmp/limine-global.lock"
 STATE_DIR=/var/lib/air-gpu
 # limine-entry-tool's settings; ENABLE_ENROLL_LIMINE_CONFIG=yes there makes Limine check a hash
 # of limine.conf enrolled into its EFI binary, so an edited limine.conf would not boot.
@@ -303,6 +306,35 @@ take_locks() {
     fi
     LOCK_FDS+=("$fd")
   done
+  for l in $COMPAT_LOCKS; do
+    open_compat_lock "$l" || continue
+    fd=$COMPAT_FD
+    if ! flock -w 5 "$fd"; then
+      release_locks
+      refuse "$l is held by another tool (limine-snapper-sync?); try again in a moment."
+    fi
+    LOCK_FDS+=("$fd")
+  done
+}
+# Open a compatibility lock read-only (never created) into COMPAT_FD, and keep it only when the
+# opened file is a regular file owned by this user (root) and is the path itself, not something
+# a symbolic link points to; that is checked on the open descriptor. The test before the open only
+# avoids opening a FIFO (which would block): in sticky /tmp nobody else can replace root's file.
+COMPAT_FD=
+open_compat_lock() {
+  local l=$1 fd owner inode type
+  COMPAT_FD=
+  [[ -f $l && ! -L $l && -O $l ]] || return 1
+  exec {fd}<"$l" 2>/dev/null || return 1
+  # stat inherits the descriptor: /proc/self/fd/N is the file that was opened.
+  read -r owner inode type < <(stat -L -c '%u %d:%i %F' "/proc/self/fd/$fd" 2>/dev/null) || true
+  if [[ $owner == "$EUID" && $type == regular* &&
+        $inode == "$(stat -c '%d:%i' "$l" 2>/dev/null)" ]]; then
+    COMPAT_FD=$fd
+    return 0
+  fi
+  exec {fd}<&-
+  return 1
 }
 LOCK_FDS=()
 release_locks() {

@@ -685,7 +685,7 @@ M3_PERSISTENT_TRANSACTION_ACTIVE=0
 M3_PERSISTENT_MAIN_ARMED=0
 M3_GPU_BIN=/usr/local/bin
 M3_GPU_SCRIPTS=(
-  "air-gpu-oneshot.sh d0259869b8519439a4dbcdae08ef1b0e17fdcaf84ac746fca61febf6a325f8aa"
+  "air-gpu-oneshot.sh 0cb379e91c4cdccbfa8591dfea362413bb420953918b4f6d29f0f610c9cd7923"
   "air-gpu-collect.sh face8fac811b59c31a8e98e6ca704a2cb33eceada8bc37986397cb393b050b30"
   "air-gpu-job.sh 9a0eb9aab52fd099488054e4ed4846c579b19fc9f78144245242b6975a40da1d"
 )
@@ -7178,8 +7178,25 @@ def inventory(esp, state):
     return records
 
 
+def compat_lock(path):
+    """fd of the compatibility lock older Omarchy Limine tools take, or None.
+
+    It sits in world-writable /tmp, where any user could create it first or
+    hold it. So it is never created or followed: it is used only when it is
+    already there as a regular file owned by this (root) user; otherwise the
+    /run/lock lock alone serializes the boot partition."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+        os.close(fd)
+        return None
+    return fd
+
 @contextlib.contextmanager
-def lock(paths):
+def lock(paths, compat=()):
     fds = []
     try:
         for path in paths:
@@ -7189,19 +7206,31 @@ def lock(paths):
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise ValueError('nonregular boot lock')
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for path in compat:
+            fd = compat_lock(path)
+            if fd is None:
+                continue
+            fds.append(fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield
     finally:
         for fd in reversed(fds):
             os.close(fd)
 
 
-def archive(esp, state, destination, lock_paths=None):
+BOOT_LOCK = Path('/run/lock/boot-partition.lock')
+COMPAT_LOCK = Path('/tmp/limine-global.lock')
+
+
+def archive(esp, state, destination, lock_paths=None, compat_locks=None):
     esp, state, destination = esp.absolute(), state.absolute(), destination.absolute()
     destination.mkdir(parents=True, exist_ok=True)
     checked_tree(destination)
     if destination.resolve().is_relative_to(esp.resolve()) or os.stat(destination).st_dev == os.stat(esp).st_dev:
         raise ValueError('archive must be on a different filesystem from the EFI partition')
-    with lock(lock_paths or [Path('/run/lock/boot-partition.lock'), Path('/tmp/limine-global.lock')]):
+    if lock_paths is None:
+        lock_paths, compat_locks = [BOOT_LOCK], [COMPAT_LOCK] if compat_locks is None else compat_locks
+    with lock(lock_paths, compat_locks or ()):
         planned = inventory(esp, state)
         moved = []
         for item in planned:
@@ -7539,16 +7568,38 @@ def atomic(path, data):
     finally:
         if os.path.exists(name): os.unlink(name)
 
+def compat_lock(path):
+    """fd of the compatibility lock older Omarchy Limine tools take, or None.
+
+    It sits in world-writable /tmp, where any user could create it first or
+    hold it. So it is never created or followed: it is used only when it is
+    already there as a regular file owned by this (root) user; otherwise the
+    /run/lock lock alone serializes the boot partition."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+        os.close(fd)
+        return None
+    return fd
+
 @contextlib.contextmanager
-def locks(paths, timeout=30.0):
+def locks(paths, timeout=30.0, compat=()):
     deadline = time.monotonic() + timeout
     fds = []
     try:
-        for path in paths:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-            fds.append(fd)
-            if not stat.S_ISREG(os.fstat(fd).st_mode): raise ValueError('nonregular boot lock')
+        for path, required in [(p, True) for p in paths] + [(p, False) for p in compat]:
+            if required:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+                fds.append(fd)
+                if not stat.S_ISREG(os.fstat(fd).st_mode): raise ValueError('nonregular boot lock')
+            else:
+                fd = compat_lock(path)
+                if fd is None: continue
+                fds.append(fd)
             while True:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -7616,7 +7667,7 @@ def same_esp_path(left, right):
         return False
 
 def limine(args):
-    with locks(args.lock, args.lock_timeout):
+    with locks(args.lock, args.lock_timeout, args.compat_lock):
         loader = regular(args.esp / 'EFI/BOOT/BOOTAA64.EFI').read_bytes()
         if b'limine.conf' not in loader: raise ValueError('EFI loader is not Limine')
         sig = b'++CONFIG_B2SUM_SIGNATURE++'
@@ -7739,11 +7790,16 @@ def main():
     p.add_argument('--release', default=os.uname().release)
     p.add_argument('--modules', type=Path, default=Path('/usr/lib/modules'))
     p.add_argument('--lock', type=Path, action='append')
+    p.add_argument('--compat-lock', type=Path, action='append',
+                   help='a lock taken only if it already exists as a regular file of this user')
     p.add_argument('--lock-timeout', type=float, default=30.0, help='total boot-lock wait, in seconds (0..30)')
     args = p.parse_args()
     if not 0 <= args.lock_timeout <= 30:
         p.error('lock timeout must be between 0 and 30 seconds')
-    args.lock = args.lock or [Path('/run/lock/boot-partition.lock'), Path('/tmp/limine-global.lock')]
+    if not args.lock:
+        args.lock = [Path('/run/lock/boot-partition.lock')]
+        args.compat_lock = args.compat_lock or [Path('/tmp/limine-global.lock')]
+    args.compat_lock = args.compat_lock or []
     try: limine(args)
     except (OSError, ValueError, KeyError) as e: p.exit(1, f'M3 boot profile refused: {e}\n')
 
@@ -8867,7 +8923,8 @@ M3MAX_KIT_DEBUGFS=/sys/kernel/debug
 # arming script itself (the runner's copy; the setup's download before that).
 M3MAX_KIT_EFIVARS=/sys/firmware/efi/efivars
 M3MAX_KIT_CMDLINE=/proc/cmdline
-M3MAX_KIT_LOCKS="/run/lock/boot-partition.lock /tmp/limine-global.lock"
+M3MAX_KIT_LOCKS="/run/lock/boot-partition.lock"
+M3MAX_KIT_COMPAT_LOCKS="/tmp/limine-global.lock"
 M3MAX_KIT_LIMINE_DEFAULTS=/etc/default/limine
 M3MAX_KIT_ONESHOT=$M3MAX_KIT_LIBEXEC/air-gpu-oneshot.sh
 M3MAX_KIT_JOB=$M3MAX_KIT_LIBEXEC/air-gpu-job.sh
@@ -9181,6 +9238,7 @@ m3max_kit_oneshot_setup() {
   EFIVARS=$M3MAX_KIT_EFIVARS
   CMDLINE=$M3MAX_KIT_CMDLINE
   LOCKS=$M3MAX_KIT_LOCKS
+  COMPAT_LOCKS=$M3MAX_KIT_COMPAT_LOCKS
   LIMINE_DEFAULTS=$M3MAX_KIT_LIMINE_DEFAULTS
   check_board() {
     is_m3_max || refuse "this Mac ($(this_board), $(this_soc)) is not a 16-core M3 Max (t6031: $M3_MAX_BOARDS)."

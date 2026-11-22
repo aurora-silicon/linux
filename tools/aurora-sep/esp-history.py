@@ -87,8 +87,25 @@ def inventory(esp, state):
     return records
 
 
+def compat_lock(path):
+    """fd of the compatibility lock older Omarchy Limine tools take, or None.
+
+    It sits in world-writable /tmp, where any user could create it first or
+    hold it. So it is never created or followed: it is used only when it is
+    already there as a regular file owned by this (root) user; otherwise the
+    /run/lock lock alone serializes the boot partition."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+        os.close(fd)
+        return None
+    return fd
+
 @contextlib.contextmanager
-def lock(paths):
+def lock(paths, compat=()):
     fds = []
     try:
         for path in paths:
@@ -98,19 +115,31 @@ def lock(paths):
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise ValueError('nonregular boot lock')
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for path in compat:
+            fd = compat_lock(path)
+            if fd is None:
+                continue
+            fds.append(fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield
     finally:
         for fd in reversed(fds):
             os.close(fd)
 
 
-def archive(esp, state, destination, lock_paths=None):
+BOOT_LOCK = Path('/run/lock/boot-partition.lock')
+COMPAT_LOCK = Path('/tmp/limine-global.lock')
+
+
+def archive(esp, state, destination, lock_paths=None, compat_locks=None):
     esp, state, destination = esp.absolute(), state.absolute(), destination.absolute()
     destination.mkdir(parents=True, exist_ok=True)
     checked_tree(destination)
     if destination.resolve().is_relative_to(esp.resolve()) or os.stat(destination).st_dev == os.stat(esp).st_dev:
         raise ValueError('archive must be on a different filesystem from the EFI partition')
-    with lock(lock_paths or [Path('/run/lock/boot-partition.lock'), Path('/tmp/limine-global.lock')]):
+    if lock_paths is None:
+        lock_paths, compat_locks = [BOOT_LOCK], [COMPAT_LOCK] if compat_locks is None else compat_locks
+    with lock(lock_paths, compat_locks or ()):
         planned = inventory(esp, state)
         moved = []
         for item in planned:

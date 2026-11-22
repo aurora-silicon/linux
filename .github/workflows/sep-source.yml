@@ -74,6 +74,7 @@ jobs:
           python3 -m unittest tools/aurora-sep/tests/test_key_context_cleanup.py -v
           python3 -m unittest discover -s tools/aurora-sep/tests -p test_packaging.py -v
           python3 -m unittest discover -s tools/aurora-sep/tests -p test_sep_writes_always_on.py -v
+          python3 -m unittest discover -s tools/aurora-sep/tests -p test_boot_locks.py -v
 
   rust-build:
     runs-on: ubuntu-24.04
