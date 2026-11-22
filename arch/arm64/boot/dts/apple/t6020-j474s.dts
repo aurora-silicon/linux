@@ -21,10 +21,6 @@
 / {
 	compatible = "apple,j474s", "apple,t6020", "apple,arm-platform";
 	model = "Apple Mac mini (M2 Pro, 2023)";
-
-	aliases {
-		sep = &sep;
-	};
 };
 
 /* PCIe devices */
