@@ -31,6 +31,29 @@ fn host_offset(start: usize, size: usize, offset: usize) -> Result<usize> {
     start.checked_add(offset).ok_or(EOVERFLOW)
 }
 
+/// Permission for a timestamp bind to alias in the backend's firmware timestamp window.
+pub(crate) enum WindowPermit {
+    /// No per-file window share applies (the backend has no fixed window limit).
+    Unrestricted,
+    /// The file's reserved share of the firmware timestamp window, held until unmap.
+    Share(crate::memacct::WindowShare),
+    /// The file's window share is exhausted; fall back to host or refuse with ENOSPC.
+    Denied,
+}
+
+impl WindowPermit {
+    pub(crate) fn is_allowed(&self) -> bool {
+        !matches!(self, Self::Denied)
+    }
+
+    pub(crate) fn into_share(self) -> Option<crate::memacct::WindowShare> {
+        match self {
+            Self::Share(share) => Some(share),
+            Self::Unrestricted | Self::Denied => None,
+        }
+    }
+}
+
 /// A firmware-mapped timestamp buffer with a kernel CPU mapping of its backing, kept for the
 /// buffer's lifetime so that commands need no mapping of their own.
 pub(crate) struct FirmwareBuffer {
@@ -38,6 +61,9 @@ pub(crate) struct FirmwareBuffer {
     cpu: mmu::TimestampVmap,
     /// Mapped in the firmware's timestamp window: the firmware may write stamps itself.
     window: bool,
+    /// The file's share of the firmware timestamp window, held as the last field so `mapping`
+    /// is unmapped on the cleanup queue before the quota is credited back.
+    _window_share: Option<crate::memacct::WindowShare>,
 }
 
 /// A timestamp buffer only the host writes, through a kernel CPU mapping of its backing. It has
@@ -75,7 +101,10 @@ pub(crate) struct Bound {
 
 impl Bound {
     pub(crate) fn new(buffer: Buffer, charge: crate::memacct::Commit) -> Self {
-        Self { buffer, _charge: charge }
+        Self {
+            buffer,
+            _charge: charge,
+        }
     }
 }
 
@@ -102,13 +131,19 @@ impl Buffer {
         crate::cleanup::Deferred::<HostBuffer>::HEAP_BYTES,
     );
 
-    pub(crate) fn firmware(mapping: mmu::KernelMapping) -> Result<Self> {
-        Self::new_firmware(mapping, false)
+    pub(crate) fn firmware(
+        mapping: mmu::KernelMapping,
+        window_share: Option<crate::memacct::WindowShare>,
+    ) -> Result<Self> {
+        Self::new_firmware(mapping, false, window_share)
     }
 
     /// A buffer aliased in the firmware's timestamp window.
-    pub(crate) fn firmware_window(mapping: mmu::KernelMapping) -> Result<Self> {
-        Self::new_firmware(mapping, true)
+    pub(crate) fn firmware_window(
+        mapping: mmu::KernelMapping,
+        window_share: Option<crate::memacct::WindowShare>,
+    ) -> Result<Self> {
+        Self::new_firmware(mapping, true, window_share)
     }
 
     /// A buffer whose stamps the host writes: the bound range of a firmware-shareable object,
@@ -127,13 +162,28 @@ impl Buffer {
         })?))
     }
 
-    fn new_firmware(mapping: mmu::KernelMapping, window: bool) -> Result<Self> {
-        let cpu = mapping.timestamp_vmap()?;
-        Ok(Self::Firmware(crate::cleanup::Deferred::new(FirmwareBuffer {
-            mapping,
-            cpu,
-            window,
-        })?))
+    fn new_firmware(
+        mapping: mmu::KernelMapping,
+        window: bool,
+        window_share: Option<crate::memacct::WindowShare>,
+    ) -> Result<Self> {
+        // Keep `window_share` behind `mapping` on error paths too: `mapping` must unmap
+        // before the window share is credited back.
+        let cpu = match mapping.timestamp_vmap() {
+            Ok(cpu) => cpu,
+            Err(err) => {
+                drop(mapping);
+                return Err(err);
+            }
+        };
+        Ok(Self::Firmware(crate::cleanup::Deferred::new(
+            FirmwareBuffer {
+                mapping,
+                cpu,
+                window,
+                _window_share: window_share,
+            },
+        )?))
     }
 
     /// The window address of the timestamp at `offset`, for a window buffer and an aligned
@@ -217,7 +267,7 @@ impl Buffer {
 
     /// Firmware-aliased command encoders publish firmware pointers and must never accept a
     /// host- or CPU-only buffer. Returning a borrow keeps the mapping tied to [`Bound`] so no
-    /// command can retain the mapping without also keeping its bind charge alive.
+    /// command can retain the mapping without also keeping its bind charge and window share alive.
     pub(crate) fn firmware_mapping(&self) -> Result<&mmu::KernelMapping> {
         match self {
             Self::Firmware(buffer) => Ok(&buffer.mapping),

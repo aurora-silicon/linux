@@ -1210,7 +1210,7 @@ impl gpu::Gpu for Backend {
         Ok(KBox::new(crate::m3::m3_submit::Queue::new_g14_v27_2(self.runtime.clone(), self.scheduler.clone(),
             vm, priority, usc_exec_base, ualloc_priv, self.preempt_bytes, render)?, GFP_KERNEL)?)
     }
-    fn map_timestamp_buffer(&self, _bo: gem::ObjectRef, _range: Range<usize>) -> Result<crate::timestamp::Buffer> {
+    fn map_timestamp_buffer(&self, _bo: gem::ObjectRef, _range: Range<usize>, _window: crate::timestamp::WindowPermit) -> Result<crate::timestamp::Buffer> {
         // Timestamp buffers would need new tables in the firmware window after boot.
         Err(ENOTSUPP)
     }

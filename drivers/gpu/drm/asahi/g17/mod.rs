@@ -854,6 +854,11 @@ impl Drop for Firmware {
 }
 
 impl Firmware {
+    /// The firmware's fixed timestamp window, on the older firmware graph; `None` on M5's graph.
+    fn timestamp_window(&self) -> Option<Range<u64>> {
+        (!self.uat.is_m5()).then_some(hw::t8140::dynamic::TIMESTAMP_WINDOW)
+    }
+
     /// The firmware instances this GPU runs.
     fn roles(&self) -> &'static [Role] {
         if self.secondary.is_some() {
@@ -2718,32 +2723,46 @@ impl gpu::Gpu for Gpu {
         Ok(KBox::new(frontend, GFP_KERNEL)?)
     }
 
+    fn timestamp_window_size(&self) -> u64 {
+        let state = self.shared.state.lock();
+        (*state)
+            .as_ref()
+            .and_then(|firmware| firmware.timestamp_window())
+            .map_or(0, |window| window.end - window.start)
+    }
+
     fn map_timestamp_buffer(
         &self,
         mut bo: gem::ObjectRef,
         range: Range<usize>,
+        window: crate::timestamp::WindowPermit,
     ) -> Result<crate::timestamp::Buffer> {
         let windowed = {
             let state = self.shared.state.lock();
             let firmware = (*state).as_ref().ok_or(ENODEV)?;
-            // The timestamp window is part of the older firmware graph, not M5's graph.
-            if firmware.uat.is_m5() {
-                None
+            // A file whose share of the window is used up gets a host-written buffer, as when
+            // the window is full.
+            if window.is_allowed() {
+                firmware.timestamp_window().and_then(|window| {
+                    bo.map_range_into_range(
+                        firmware.uat.kernel_vm(),
+                        range.clone(),
+                        window,
+                        mmu::UAT_PGSZ as u64,
+                        mmu::PROT_FW_SHARED_RW,
+                        false,
+                    )
+                    .ok()
+                })
             } else {
-                bo.map_range_into_range(
-                    firmware.uat.kernel_vm(),
-                    range.clone(),
-                    hw::t8140::dynamic::TIMESTAMP_WINDOW,
-                    mmu::UAT_PGSZ as u64,
-                    mmu::PROT_FW_SHARED_RW,
-                    false,
-                )
-                .ok()
+                None
             }
         };
         // The buffer's CPU mapping takes the reservation lock: not under the device mutex.
         match windowed {
-            Some(mapping) => crate::timestamp::Buffer::firmware_window(mapping),
+            Some(mapping) => {
+                crate::timestamp::Buffer::firmware_window(mapping, window.into_share())
+            }
             // Outside the window the host writes every stamp, and the firmware never sees the
             // buffer: give it no firmware alias, which would take kernel address space shared
             // with every firmware object (queues, rings, pools) for as long as it is bound.
