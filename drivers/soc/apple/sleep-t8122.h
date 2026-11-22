@@ -5,7 +5,7 @@
  *
  * Those gates are the only ones: deep sleep is offered only with apple_sleep.deep=1, and a
  * sleep is a dry run unless apple_sleep.untested_commit=1. The dry run runs every refusal and
- * the first witness and returns: no core held, no power word written, no SMC notice beyond
+ * returns: no core held, no power word written, no SMC notice beyond
  * the ones its driver's own suspend sends and takes back, nothing stopped. The display
  * coprocessor is left running by it (display_no_restart). No PMU scratch is written for
  * step notes (no_pmu_notes): the scratch's place is unmeasured on this PMU.
@@ -18,10 +18,7 @@
  *
  * Here the same sequence runs as this driver's SoC operations, so the refusals are real and
  * the coprocessors stop where the working SoCs stop theirs: SEP, then the GPU, then the PMP
- * and the rest. Whether that is what J613's sleep engine waits for is the hypothesis, so a
- * witness reads every named power word and each coprocessor's run control at four points:
- * after the last refusal, after the SEP and GPU stops, after the remaining stops (set against
- * macOS's commit, while the debug link still carries it), and after the link's cut.
+ * and the rest. Whether that is what J613's sleep engine waits for is not yet shown.
  *
  * No wake is qualified. The wake sources are not armed (their mask offsets would come from
  * T8140's layout and are unmeasured here); the display and the GPU have no
@@ -67,23 +64,16 @@
 #define T8122_WDT_WD1_CTL	0x1c
 #define T8122_WDT_RESET_EN	BIT(2)
 
-/* The debug cable's DockChannel UART, channel 1 data page */
-#define T8122_DC_TX8		0x04
-#define T8122_DC_TX_FREE	0x14
-
 static const unsigned int t8122_wdt_secs = 0;
 
 static const unsigned int t8122_wdt_clear = 0;
 
 static const unsigned int t8122_disp_off = 1;
 
-static const bool t8122_console = false;
 
 static const bool t8122_keep_debug_link = false;
 
-static const bool t8122_witness_full = false;
 
-static const bool t8122_witness_sep_asc = false;
 
 static const unsigned int t8122_match = 1;
 
@@ -94,53 +84,6 @@ static const unsigned int t8122_wake_mask = 0;
 static const bool t8122_quiet = false;
 
 static const bool t8122_dry_regs = false;
-
-/* Every power word J613's device tree names, as the trial's entry dump has them. */
-static const u32 t8122_ps_all[] = {
-	0x100, 0x108, 0x110, 0x118, 0x120, 0x128, 0x130, 0x138, 0x140, 0x148,
-	0x150, 0x158, 0x160, 0x168, 0x170, 0x178, 0x180, 0x188, 0x190, 0x198,
-	0x1a8, 0x1b0, 0x1b8, 0x1d8, 0x1e0, 0x1e8, 0x1f0, 0x200, 0x208, 0x210,
-	0x218, 0x220, 0x228, 0x230, 0x238, 0x240, 0x248, 0x250, 0x258, 0x260,
-	0x268, 0x270, 0x278, 0x280, 0x288, 0x290, 0x298, 0x2a0, 0x2a8, 0x2b0,
-	0x2b8, 0x2c0, 0x2c8, 0x2d0, 0x2d8, 0x2e0, 0x2e8, 0x2f0, 0x2f8, 0x300,
-	0x308, 0x310, 0x318, 0x330, 0x338, 0x340, 0x348, 0x358, 0x360, 0x368,
-	0x370, 0x378, 0x380, 0x388, 0x390, 0x398, 0x3a0, 0x3a8, 0x3b0, 0x3b8,
-	0x3c0, 0x3f0, 0x3f8, 0x400, 0x408, 0x410, 0x418, 0x420, 0x428, 0x430,
-	0x438, 0x440, 0x448, 0x450, 0x458, 0x460, 0x468, 0x470, 0x478, 0x480,
-	0x488, 0x490, 0x498, 0x4a0, 0x4a8, 0x4b0, 0x4b8, 0x4c0, 0xc00, 0x4000,
-	0x4008, 0x4010, 0x4018, 0x4020, 0x4028, 0x4030, 0x4038, 0x4040, 0x4048, 0x4050,
-	0x4058, 0x4060, 0x8000, 0x8008, 0x8010, 0x8018, 0x8020, 0x10000,
-};
-
-/*
- * The same words at macOS 25G83's commit on J613, as its hypervisor read them. Its console
- * was UART0, so UART_P, UART_N and UART0 stand on for that alone.
- */
-#define T8122_M_NONE		0xffffffff
-static const u32 t8122_ps_macos[ARRAY_SIZE(t8122_ps_all)] = {
-	0x1f0002ff, 0x00000200, 0x000000ff, 0x000000ff, 0x000000ff, 0x1f0002ff,
-	0x1f0002ff, 0x00000200, 0x00000200, 0x00000200, 0x00000200, 0x00000200,
-	0x000000ff, 0x000000ff, 0x000000ff, 0x00000200, 0x04000200, 0x04000200,
-	0x04000200, 0x04000200, 0x00000200, 0x1f0003ff, 0x00000300, 0x00002300,
-	0x0f002300, 0x00002300, 0x0f002300, 0x0f000300, 0x00002300, 0x1400024f,
-	0x00000200, 0x00000200, 0x00000200, 0x00000200, 0x00000200, 0x00000200,
-	0x00000200, 0x00000200, 0x00000200, 0x00000200, 0x00000200, 0x00000200,
-	0x000002ff, 0x000002ff, 0x000002ff, 0x00000300, 0x00000200, 0x00000200,
-	0x00000200, 0x00000200, 0x00000200, 0x00000200, 0x00000200, 0x000002ff,
-	0x000000ff, 0x00000200, 0x00000200, 0x00000200, 0x00000200, 0x00000200,
-	0x00000200, 0x00000200, 0x00000200, 0x1f0000ff, 0x1f0000ff, 0x1f0000ff,
-	0x1f0000ff, 0x1f0003ff, 0x1f0003ff, 0x1f0003ff, 0x1f0003ff, 0x00000200,
-	0x00000200, 0x00000200, 0x00000200, 0x00000200, 0x00000200, 0x00000200,
-	0x00000300, 0x00000200, 0x1f0000ff, 0x000000ff, 0x1f0023ff, 0x000023ff,
-	0x000023ff, 0x00002300, 0x0f002300, 0x00002300, 0x0f002300, T8122_M_NONE,
-	0x0f002300, 0x1f0023ff, 0x1f0003ff, 0x1f0f03ff, 0x1f0003ff, 0x00000300,
-	0x00000300, 0x00000300, 0x00000300, 0x00002300, 0x0f040300, 0x00000300,
-	0x00000300, 0x1400024f, 0x00000300, 0x00000300, 0x00000300, 0x00000300,
-	0x1000270f, T8122_M_NONE, T8122_M_NONE, T8122_M_NONE, T8122_M_NONE, T8122_M_NONE,
-	T8122_M_NONE, T8122_M_NONE, T8122_M_NONE, T8122_M_NONE, T8122_M_NONE, T8122_M_NONE,
-	T8122_M_NONE, T8122_M_NONE, 0x00000300, 0x00000300, 0x00000300, 0x00000300,
-	0x00000300, 0x0f000300,
-};
 
 /*
  * On at macOS's commit and off once Linux's drivers have suspended: DWI, GPIO, SOC_RC, SPI_P,
@@ -177,292 +120,17 @@ static const u32 t8122_ps_macos_off[] = {
 /* Both as macOS has them at its commit: on, and idled to 4 by the hardware. */
 #define T8122_PS_AUTO_IDLE	0x1400000f
 
-/*
- * The coprocessors the witness reads: run control and status, only with the CPU's domain up,
- * since their registers don't answer without it.
- */
-enum { T8122_W_GPU, T8122_W_PMP, T8122_W_ANS, T8122_W_DCP, T8122_W_SEP, T8122_W_COPROCS };
-
-static const struct {
-	const char *name;
-	const char *path;
-	const char *reg;
-	u32 ps;
-} t8122_witness_coprocs[T8122_W_COPROCS] = {
-	[T8122_W_GPU] = { "gpu", "/soc/gpu@292400000", "asc", T8122_PS_GFX },
-	[T8122_W_PMP] = { "pmp", "/soc/pmp@2d0500000", "asc", T8122_PS_PMP },
-	[T8122_W_ANS] = { "ans", "/soc/nvme@30dcc0000", "ans", T8122_PS_ANS },
-	[T8122_W_DCP] = { "dcp", "/soc/dcp@28ec00000", "coproc", T8122_PS_DISP_CPU },
-	[T8122_W_SEP] = { "sep", "/soc/sep@29e400000", NULL, T8122_PS_SEP },
-};
-
-/* Not read: its domain was off, or (the SEP's) reading it wasn't asked for. */
-#define T8122_W_UNREAD		0xdead0ff0
-
-#define T8122_W_SNAPS		4
-#define T8122_W_EXTRA		7
-#define T8122_W_AON		5
-/* The wake block whole, 0x00 to 0x44: SLP_DDR, the masks, and wherever the status sits. */
-#define T8122_W_WAKE		18
-
-struct t8122_witness {
-	bool taken;
-	u32 ps[ARRAY_SIZE(t8122_ps_all)];
-	u32 control[T8122_W_COPROCS];
-	u32 status[T8122_W_COPROCS];
-	/* Power gates E and P, cluster controls E and P, CLLT's last word, both notify words */
-	u32 extra[T8122_W_EXTRA];
-	/* The mini PMGR's debug switch and the two ports' words, 0xa8 to 0xc8 */
-	u32 aon[T8122_W_AON];
-	u32 wake[T8122_W_WAKE];
-};
 
 static struct {
-	void __iomem *asc[T8122_W_COPROCS];
 	void __iomem *hpm_notify;
-	void __iomem *dc_uart;
-	struct t8122_witness snap[T8122_W_SNAPS];
 	u32 notify_saved[2];
 	bool notify_staged;
 	bool matched;
 	unsigned int match_done;
 	u32 match_saved[4];
 	bool wdt_armed;
-	/* Nobody drained the DockChannel: no more is sent this sleep. */
-	bool dc_stalled;
-	/* The link is gone (it goes with the SEP's stop): what doesn't fit the FIFO is dropped. */
-	bool dc_nowait;
-	u32 dc_dropped;
 	int disp_poll_us;
-	unsigned int wfi_returns;
 } t8122;
-
-static void t8122_dc_putc(unsigned char c)
-{
-	/* The witness is long and the cable slow: a second for room. One timeout ends all output. */
-	u64 start = read_sysreg(cntvct_el0), hz = arch_timer_get_cntfrq();
-	bool room;
-
-	if (!t8122.dc_uart || t8122.dc_stalled)
-		return;
-	if (t8122.dc_nowait) {
-		if (readl(t8122.dc_uart + T8122_DC_TX_FREE))
-			writel(c, t8122.dc_uart + T8122_DC_TX8);
-		else
-			t8122.dc_dropped++;
-		return;
-	}
-	while (!(room = readl(t8122.dc_uart + T8122_DC_TX_FREE)) &&
-	       read_sysreg(cntvct_el0) - start < hz)
-		cpu_relax();
-	if (room)
-		writel(c, t8122.dc_uart + T8122_DC_TX8);
-	else
-		t8122.dc_stalled = true;
-}
-
-static void t8122_dc_puts(const char *str)
-{
-	while (*str) {
-		if (*str == '\n')
-			t8122_dc_putc('\r');
-		t8122_dc_putc(*str++);
-	}
-}
-
-static void t8122_dc_hex(u32 v)
-{
-	int i;
-
-	for (i = 28; i >= 0; i -= 4)
-		t8122_dc_putc("0123456789abcdef"[(v >> i) & 0xf]);
-}
-
-static void t8122_dc_pair(const char *name, u32 a, u32 b)
-{
-	t8122_dc_putc(' ');
-	t8122_dc_puts(name);
-	t8122_dc_putc('=');
-	t8122_dc_hex(a);
-	t8122_dc_putc('/');
-	t8122_dc_hex(b);
-}
-
-static void t8122_witness_take(struct apple_sleep *s, unsigned int n)
-{
-	struct t8122_witness *w = &t8122.snap[n];
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(t8122_ps_all); i++)
-		w->ps[i] = readl(s->ps + t8122_ps_all[i]);
-	for (i = 0; i < T8122_W_COPROCS; i++) {
-		bool up = FIELD_GET(PS_ACTUAL, readl(s->ps + t8122_witness_coprocs[i].ps));
-
-		w->control[i] = w->status[i] = T8122_W_UNREAD;
-		/*
-		 * With IOA1 lowered a coprocessor's registers abort (attempt N died here, in
-		 * the snapshot after the lower): the last snapshot reads none.
-		 */
-		if (!t8122.asc[i] || !up || (i == T8122_W_SEP && !t8122_witness_sep_asc) ||
-		    (n == T8122_W_SNAPS - 1 && (t8122_atc_off & 4)))
-			continue;
-		w->control[i] = readl(t8122.asc[i] + ASC_CPU_CONTROL);
-		w->status[i] = readl(t8122.asc[i] + ASC_CPU_STATUS);
-	}
-	w->extra[0] = readl(s->pwrgate + T8122_PWRGATE_E);
-	w->extra[1] = readl(s->pwrgate + T8122_PWRGATE_P);
-	w->extra[2] = readl(s->cluster + T8122_CLUSTER_E);
-	w->extra[3] = readl(s->cluster + T8122_CLUSTER_P);
-	w->extra[4] = readl(s->cllt + T8122_CLLT_LAST);
-	w->extra[5] = readl(s->spmi + SPMI_NOTIFY_ENABLE);
-	w->extra[6] = readl(t8122.hpm_notify + SPMI_NOTIFY_ENABLE);
-	for (i = 0; i < T8122_W_AON; i++)
-		w->aon[i] = s->ps_aon ? readl(s->ps_aon + 0xa8 + i * 8) : T8122_W_UNREAD;
-	for (i = 0; i < T8122_W_WAKE; i++)
-		w->wake[i] = s->wake ? readl(s->wake + i * 4) : T8122_W_UNREAD;
-	w->taken = true;
-}
-
-/*
- * Straight to the DockChannel, with no printk this late. Snapshot 0 whole; a later one only
- * the power words that differ from the one before, and every coprocessor again.
- */
-static void t8122_witness_dc(unsigned int n)
-{
-	const struct t8122_witness *w = &t8122.snap[n], *prev = n ? &t8122.snap[n - 1] : NULL;
-	unsigned int i;
-
-	if (!t8122.dc_uart || !w->taken)
-		return;
-	if (!t8122_witness_full) {
-		/*
-		 * Nothing may wait here: a second spent before the SEP's SLEEP and it never
-		 * answers, and the link goes with its stop. So short lines that fit the FIFO
-		 * (2047 bytes) for the next reader: PMP control and status, both notify words,
-		 * the mini PMGR's five; after the last one, every word that differs from
-		 * macOS's commit.
-		 */
-		t8122_dc_puts("\nW");
-		t8122_dc_putc('0' + n);
-		t8122_dc_pair("p", w->control[T8122_W_PMP], w->status[T8122_W_PMP]);
-		t8122_dc_pair("n", w->extra[5], w->extra[6]);
-		t8122_dc_puts(" a");
-		for (i = 0; i < T8122_W_AON; i++) {
-			t8122_dc_putc(i ? '/' : '=');
-			t8122_dc_hex(w->aon[i]);
-		}
-		if (n != T8122_W_SNAPS - 1)
-			return;
-		for (i = 0; i < ARRAY_SIZE(t8122_ps_all); i++) {
-			if (t8122_ps_macos[i] == T8122_M_NONE || t8122_ps_macos[i] == w->ps[i])
-				continue;
-			t8122_dc_putc(' ');
-			t8122_dc_hex(t8122_ps_all[i]);
-			t8122_dc_putc(':');
-			t8122_dc_hex(w->ps[i]);
-		}
-		t8122_dc_puts(" k");
-		for (i = 0; i < T8122_W_WAKE; i++) {
-			t8122_dc_putc(i ? '/' : '=');
-			t8122_dc_hex(w->wake[i]);
-		}
-		t8122_dc_puts(" d=");
-		t8122_dc_hex(t8122.dc_dropped);
-		t8122_dc_putc('\n');
-		return;
-	}
-	t8122_dc_puts("\nW");
-	t8122_dc_putc('0' + n);
-	for (i = 0; i < T8122_W_COPROCS; i++)
-		t8122_dc_pair(t8122_witness_coprocs[i].name, w->control[i], w->status[i]);
-	t8122_dc_pair("gate", w->extra[0], w->extra[1]);
-	t8122_dc_pair("clus", w->extra[2], w->extra[3]);
-	t8122_dc_pair("cllt-notify", w->extra[4], w->extra[5]);
-	t8122_dc_pair("hpm", w->extra[6], 0);
-	t8122_dc_pair("aon-a8-b0", w->aon[0], w->aon[1]);
-	t8122_dc_pair("aon-b8-c0", w->aon[2], w->aon[3]);
-	t8122_dc_pair("aon-c8", w->aon[4], 0);
-	for (i = 0; i < ARRAY_SIZE(t8122_ps_all); i++) {
-		if (prev && prev->taken && prev->ps[i] == w->ps[i])
-			continue;
-		t8122_dc_puts("\nw");
-		t8122_dc_putc('0' + n);
-		t8122_dc_putc(' ');
-		t8122_dc_hex(t8122_ps_all[i]);
-		t8122_dc_putc(' ');
-		t8122_dc_hex(w->ps[i]);
-	}
-	t8122_dc_puts("\nW");
-	t8122_dc_putc('0' + n);
-	t8122_dc_puts(" end\n");
-}
-
-/* Snapshot @n against macOS's commit: every word that differs, with both values. */
-static void t8122_witness_macos_dc(unsigned int n)
-{
-	const struct t8122_witness *w = &t8122.snap[n];
-	unsigned int i, differ = 0;
-
-	if (!t8122.dc_uart || !w->taken)
-		return;
-	t8122_dc_puts("\nM");
-	t8122_dc_putc('0' + n);
-	t8122_dc_puts(" linux/macOS");
-	for (i = 0; i < ARRAY_SIZE(t8122_ps_all); i++) {
-		if (t8122_ps_macos[i] == T8122_M_NONE || t8122_ps_macos[i] == w->ps[i])
-			continue;
-		differ++;
-		t8122_dc_puts("\nm");
-		t8122_dc_putc('0' + n);
-		t8122_dc_putc(' ');
-		t8122_dc_hex(t8122_ps_all[i]);
-		t8122_dc_putc(' ');
-		t8122_dc_hex(w->ps[i]);
-		t8122_dc_putc(' ');
-		t8122_dc_hex(t8122_ps_macos[i]);
-	}
-	t8122_dc_puts("\nM");
-	t8122_dc_putc('0' + n);
-	t8122_dc_puts(" end differ=");
-	t8122_dc_hex(differ);
-	t8122_dc_putc('\n');
-}
-
-/* After a return, through printk: whatever was taken. */
-static void t8122_witness_show(struct apple_sleep *s)
-{
-	unsigned int n, i;
-
-	for (n = 0; n < T8122_W_SNAPS; n++) {
-		const struct t8122_witness *w = &t8122.snap[n];
-
-		if (!w->taken)
-			continue;
-		for (i = 0; i < T8122_W_COPROCS; i++)
-			dev_info(s->dev, "T8122 witness %u: %s ASC control %08x status %08x\n", n,
-				 t8122_witness_coprocs[i].name, w->control[i], w->status[i]);
-		dev_info(s->dev, "T8122 witness %u: gates %08x %08x clusters %08x %08x CLLT %08x notify PMU %08x HPM %08x\n",
-			 n, w->extra[0], w->extra[1], w->extra[2], w->extra[3], w->extra[4],
-			 w->extra[5], w->extra[6]);
-		for (i = 0; i < ARRAY_SIZE(t8122_ps_all); i++)
-			dev_info(s->dev, "T8122 witness %u: ps %05x %08x\n", n, t8122_ps_all[i],
-				 w->ps[i]);
-		for (i = 0; i < T8122_W_WAKE; i++)
-			dev_info(s->dev, "T8122 witness %u: wake %02x %08x\n", n, i * 4, w->wake[i]);
-	}
-	if (t8122.disp_poll_us != -1)
-		dev_info(s->dev, "T8122: DISP_CPU read off %d us after its lower\n",
-			 t8122.disp_poll_us);
-}
-
-static void t8122_witness_reset(void)
-{
-	unsigned int n;
-
-	for (n = 0; n < T8122_W_SNAPS; n++)
-		t8122.snap[n].taken = false;
-	t8122.disp_poll_us = -1;
-}
 
 /* This SoC's on-chip MMIO takes non-posted writes only: a posted one loses the machine. */
 static void __iomem *t8122_map(struct apple_sleep *s, const char *name, struct resource *out)
@@ -535,7 +203,7 @@ static int t8122_sleep_map_regs(struct apple_sleep *s)
 	}
 	/*
 	 * The wake block: pmgr reg[4] in the ADT, T8140's at this SoC's base. Its status offset
-	 * is unmeasured here, so the witness reads the block whole.
+	 * is unmeasured here.
 	 */
 	s->wake = t8122_map(s, "wake", NULL);
 	if (IS_ERR(s->wake)) {
@@ -547,34 +215,11 @@ static int t8122_sleep_map_regs(struct apple_sleep *s)
 		if (ret)
 			return ret;
 	}
-	if (t8122_console) {
-		t8122.dc_uart = t8122_map(s, "dockchannel", NULL);
-		if (IS_ERR(t8122.dc_uart)) {
-			dev_warn(s->dev, "no dockchannel registers: no late witness\n");
-			t8122.dc_uart = NULL;
-		}
-	}
 	s->driver_down = devm_bitmap_zalloc(s->dev, resource_size(&s->ps_res) / 4, GFP_KERNEL);
 	if (!s->driver_down)
 		return -ENOMEM;
 	if (apple_sleep_alloc_books(s))
 		return -ENOMEM;
-
-	for (i = 0; i < T8122_W_COPROCS; i++) {
-		struct device_node *np = of_find_node_by_path(t8122_witness_coprocs[i].path);
-		int index = 0;
-
-		if (!np)
-			continue;
-		if (t8122_witness_coprocs[i].reg)
-			index = of_property_match_string(np, "reg-names",
-							 t8122_witness_coprocs[i].reg);
-		/* of_iomap() maps non-posted under this bus. */
-		if (index >= 0)
-			t8122.asc[i] = of_iomap(np, index);
-		of_node_put(np);
-	}
-	t8122_witness_reset();
 
 	return 0;
 }
@@ -597,12 +242,7 @@ static void t8122_trial_wdt(struct apple_sleep *s, bool on)
 
 static int t8122_sleep_begin(struct apple_sleep *s)
 {
-	t8122_witness_reset();
-	t8122.wfi_returns = 0;
-	t8122.dc_stalled = false;
-	t8122.dc_nowait = !t8122_witness_full;
-	t8122.dc_dropped = 0;
-	/* What the cut's gate will find: the late witness goes dark with the link. */
+	/* What the debug link's cut will find. */
 	if (s->ps_aon)
 		dev_info(s->dev, "T8122: debug switch %#x, port controller %s: %s\n",
 			 readl(s->ps_aon + s->soc->ps_aon_debug_switch),
@@ -610,7 +250,7 @@ static int t8122_sleep_begin(struct apple_sleep *s)
 			 sleep_debug_link_up(s) ? "live debug link, cut after the coprocessor stops" :
 						  "no cut");
 	if (apple_sleep_dry(s))
-		dev_info(s->dev, "T8122: dry run: the refusals and the first witness, then a return before any stop\n");
+		dev_info(s->dev, "T8122: dry run: the refusals, then a return before any stop\n");
 	else
 		dev_warn(s->dev, "T8122: this sleep commits: wake sources %s; no wake is qualified, the display and the GPU don't restart\n",
 			 t8122_wake_mask && s->wake && s->wake_enable_count ?
@@ -679,7 +319,6 @@ static int t8122_sleep_display_off(struct apple_sleep *s)
 		}
 		cpu_relax();
 	}
-	t8122_dc_putc(t8122.disp_poll_us >= 0 ? 'D' : 'd');
 	if (t8122.disp_poll_us < 0) {
 		dev_err(s->dev, "refused: DISP_CPU stayed on: %#x\n",
 			readl(s->ps + T8122_PS_DISP_CPU));
@@ -689,13 +328,9 @@ static int t8122_sleep_display_off(struct apple_sleep *s)
 	return 0;
 }
 
-/* Final T8122 witness; the shared untested setting keeps the commit off. */
+/* The last check before the stops; the shared untested setting keeps the commit off. */
 static int t8122_sleep_final_check(struct apple_sleep *s)
 {
-	t8122_witness_take(s, 0);
-	t8122_witness_dc(0);
-	if (t8122_witness_full)
-		t8122_witness_macos_dc(0);
 	/*
 	 * The boot core's own state where a sleep would find it, to set against what the
 	 * hypervisor reads at macOS's last WFI. Reads only, of registers this kernel already uses.
@@ -730,7 +365,6 @@ static void t8122_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
 		readl(s->spmi + SPMI_REPLY);
 	writel(1, s->spmi + SPMI_NOTIFY_ACK);
 	writel(enable, s->spmi + SPMI_NOTIFY_ENABLE);
-	t8122_dc_putc(tries ? 'P' : 'p');
 }
 
 /*
@@ -822,7 +456,6 @@ static void t8122_sleep_match(struct apple_sleep *s)
 		writel(T8122_PS_AUTO_IDLE, s->ps + T8122_PS_SIO_CPU);
 		writel(T8122_PS_AUTO_IDLE, s->ps + T8122_PS_APCIE_PHY_SW);
 	}
-	t8122_dc_putc(failed ? 'x' : 'X');
 }
 
 static void t8122_sleep_match_undo(struct apple_sleep *s)
@@ -850,8 +483,6 @@ static void t8122_sleep_match_undo(struct apple_sleep *s)
  */
 static void t8122_sleep_stopped(struct apple_sleep *s)
 {
-	t8122_witness_take(s, 2);
-	t8122_witness_dc(2);
 }
 
 /*
@@ -864,11 +495,8 @@ static void t8122_sleep_prepare_regs(struct apple_sleep *s)
 	if (t8122_wake_mask && s->wake && s->wake_enable_count) {
 		sleep_wake_arm(s);
 		s->wake_masks_saved = true;
-		t8122_dc_putc('K');
 	}
 	t8122_sleep_match(s);
-	t8122_witness_take(s, 1);
-	t8122_witness_dc(1);
 	if (t8122_wdt_clear == 2) {
 		writel(0, s->wdt + WDT_WD0_COUNT);
 		writel(0, s->wdt + WDT_WD1_COUNT);
@@ -896,9 +524,6 @@ static void t8122_deep_wfi_arm(void)
 	if (t8122_quiet)
 		sleep_core_fiq_quiet();
 	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
-	/* The boot core's, last: 'Z' going in. */
-	if (apple_sleep && (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) == apple_sleep->mbox->boot_mpidr)
-		t8122_dc_putc('Z');
 }
 
 static void t8122_aon_lower(struct apple_sleep *s, u32 off)
@@ -947,9 +572,6 @@ static void t8122_sleep_atc_off(struct apple_sleep *s)
 static void t8122_sleep_commit_regs(struct apple_sleep *s)
 {
 	t8122_sleep_atc_off(s);
-	/* After the cut: what it changed, left in the DockChannel for whoever asks next. */
-	t8122_witness_take(s, 3);
-	t8122_witness_dc(3);
 	if (t8122_wdt_clear)
 		writel(0, s->wdt + WDT_WD0_CTL);
 	/* The discriminator: a SoC that stays powered resets itself; one that slept may not. */
@@ -968,26 +590,8 @@ static void t8122_sleep_commit_regs(struct apple_sleep *s)
 	writel(0x1c17, s->cllt + T8122_CLLT_LAST);
 }
 
-/* The mailbox is armed: 'c' before the commit word, 'C' once every line is masked after it. */
-static void t8122_sleep_pre_commit(struct apple_sleep *s)
-{
-	t8122_dc_putc('c');
-	/* The hold: the commit word is not written, and the next thing is a reset from outside. */
-	if (READ_ONCE(sleep_untested_hold))
-		t8122_dc_puts(" HOLD before commit\n");
-}
-
-static void t8122_sleep_post_timer(struct apple_sleep *s)
-{
-	t8122_dc_putc('C');
-}
-
-/* 'w' each time the boot core's WFI returns: a core still awake, not a SoC that slept. */
 static u32 t8122_aic_ack(void)
 {
-	if (t8122.wfi_returns++ < 32)
-		t8122_dc_putc('w');
-
 	return aic_sleep_ack();
 }
 
@@ -1007,13 +611,7 @@ static void t8122_sleep_wake(struct apple_sleep *s)
 /* .wake and .end, after a refusal or a return. */
 static void t8122_sleep_finish(struct apple_sleep *s)
 {
-	bool taken = t8122.snap[0].taken || t8122.snap[1].taken || t8122.snap[2].taken ||
-		     t8122.snap[3].taken;
-
 	t8122_trial_wdt(s, false);
-	if (taken)
-		t8122_witness_show(s);
-	t8122_witness_reset();
 }
 
 static int t8122_sleep_cpu_prepare(u64 mpidr)
@@ -1067,8 +665,6 @@ static const struct apple_sleep_ops t8122_sleep_ops = {
 	.stopped = t8122_sleep_stopped,
 	.undo_regs = t8122_sleep_undo_regs,
 	.commit_regs = t8122_sleep_commit_regs,
-	.pre_commit = t8122_sleep_pre_commit,
-	.post_timer = t8122_sleep_post_timer,
 	.wake = t8122_sleep_wake,
 	.finish = t8122_sleep_finish,
 	.cpu_prepare = t8122_sleep_cpu_prepare,
