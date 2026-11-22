@@ -11,6 +11,9 @@
 set -euo pipefail
 
 gate="auth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed"
+# Marks a /etc/pam.d/polkit-1 that this script wrote; --remove deletes only a
+# file that carries it.
+created="# Created by aurora-touchid-setup; aurora-touchid-setup --remove deletes it."
 sudo=""
 (( EUID == 0 )) || sudo=sudo
 
@@ -21,14 +24,23 @@ configure_pam() {
   local file
   for file in /etc/pam.d/sudo /etc/pam.d/polkit-1; do
     if [[ ! -f $file && $file == */polkit-1 ]]; then
-      $sudo tee "$file" >/dev/null <<EOF
-auth      sufficient pam_fprintd.so
-auth      required pam_unix.so
-
-account   required pam_unix.so
-password  required pam_unix.so
-session   required pam_unix.so
+      # Without an /etc copy, polkit uses the packaged stack in /usr/lib/pam.d.
+      # Keep it (faillock, the account checks), so that only the fingerprint
+      # line below is added; Arch's own polkit-1 stack is the fallback.
+      {
+        printf '%s\n' "$created"
+        if [[ -f /usr/lib/pam.d/polkit-1 ]]; then
+          cat /usr/lib/pam.d/polkit-1
+        else
+          cat <<'EOF'
+#%PAM-1.0
+auth       include      system-auth
+account    include      system-auth
+password   include      system-auth
+session    include      system-auth
 EOF
+        fi
+      } | $sudo tee "$file" >/dev/null
     fi
     grep -q pam_fprintd.so "$file" || $sudo sed -i '1i auth      sufficient pam_fprintd.so' "$file"
     # The gate needs omarchy-hw-laptop-closed; without Omarchy's helper, skip it.
@@ -48,6 +60,11 @@ remove_pam() {
   local file
   for file in /etc/pam.d/sudo /etc/pam.d/polkit-1; do
     [[ -f $file ]] || continue
+    # A polkit-1 this script wrote goes, so the packaged stack applies again.
+    if [[ $file == */polkit-1 ]] && grep -qxF "$created" "$file"; then
+      $sudo rm -f "$file"
+      continue
+    fi
     $sudo sed -i -e '/pam_fprintd\.so/d' -e '/omarchy-hw-laptop-closed/d' "$file"
   done
   $sudo rm -f /etc/pam.d/omarchy-lock-fingerprint
