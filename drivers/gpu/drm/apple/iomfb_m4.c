@@ -222,6 +222,28 @@ struct iomfb_m4 {
 	bool ext_dart_down;
 	/* ... since a system sleep (no D572(1) since) */
 	bool ext_dart_since_sleep;
+	/*
+	 * Its display was released for a deep sleep with the cable left in
+	 * (dcp.c), and is connected again after the wake in the background:
+	 * the DRM replay waits for that (iomfb_m4_ext_relink_wait()).
+	 * Meanwhile, until iomfb_m4_ext_relink_end(), its connector stays as
+	 * it was: connected, its hotplugs held, its modes those of the link it
+	 * had (ext_hold_capacity).
+	 */
+	bool ext_relink;
+	u64 ext_hold_capacity;
+	/*
+	 * Its reconnect under way after the wake (armed), and the display
+	 * found gone meanwhile (lost): the replay stops waiting for it. Both
+	 * set under the owner's hpd_mutex, as its cable state is.
+	 */
+	bool ext_relink_armed, ext_relink_lost;
+	/*
+	 * From PM_SUSPEND_PREPARE, the DRM layer ends a hold for this sleep
+	 * at PM_POST_SUSPEND (iomfb_m4_ext_relink_own()); without that, no
+	 * hold starts.
+	 */
+	bool ext_relink_owned;
 	/* The external PIODMA child, kept once created; ->piodma once usable */
 	struct platform_device *ext_piodma;
 	/* The display DART's state was found lost after a D572(1) */
@@ -1814,6 +1836,9 @@ static int dcp_m4_external_callback(struct dcp_m4_runtime *r, u32 tag, bool remo
 			WRITE_ONCE(r->dcp->ext_sink, !!connected);
 			t8132_ext_drm_hotplug(r->dcp->dev);
 		}
+		/* A replay waiting for the link (iomfb_m4_ext_relink_wait()). */
+		if (connected)
+			wake_up_all(&r->dcp->ext_settle_wq);
 		return 0;
 	}
 
@@ -2999,6 +3024,9 @@ int iomfb_m4_ext_detect(struct apple_dcp *owner)
 
 	if (!dcp || !dcp->external)
 		return -ENODEV;
+	/* Released for a deep sleep: connected as it was until it is back. */
+	if (READ_ONCE(dcp->ext_relink))
+		return 1;
 	/* A tunnel whose pixel clock was refused cannot show. */
 	return iomfb_m4_external_ready(owner) && READ_ONCE(dcp->ext_sink) &&
 	       !READ_ONCE(owner->tb_clock_refused);
@@ -3017,9 +3045,13 @@ int iomfb_m4_ext_detect(struct apple_dcp *owner)
 /* The DPTX link's capacity in kbit/s at 8b/10b, 0 while not known. */
 static u64 dcp_m4_ext_capacity(struct apple_dcp *owner)
 {
+	struct iomfb_m4 *dcp = owner->v26_6;
 	u32 lanes = READ_ONCE(owner->dptxport[0].lane_count);
 	u32 rate = READ_ONCE(owner->dptxport[0].link_rate);
 
+	/* Released for a deep sleep: the link it had until it is back. */
+	if (dcp && READ_ONCE(dcp->ext_relink))
+		return READ_ONCE(dcp->ext_hold_capacity);
 	return (u64)lanes * rate * 270 * 1000 * 8 / 10;
 }
 
@@ -3861,6 +3893,8 @@ static bool dcp_m4_ext_cache_modes(struct iomfb_m4 *dcp, const void *blob, u32 s
 	dcp->ext_pref_count = 0;
 	mutex_unlock(&dcp->ext_modes_lock);
 	kfree(old);
+	/* A replay waiting for the sink's modes (iomfb_m4_ext_relink_wait()). */
+	wake_up_all(&dcp->ext_settle_wq);
 	dev_dbg(dcp->dev, "%u of %u timing(s) with an 8-bpc RGB SDR colour: %d\n",
 		kept, count, ret);
 	return true;
@@ -5149,6 +5183,141 @@ void iomfb_m4_ext_sleep_wake(struct apple_dcp *owner)
 	mutex_unlock(&dcp->lock);
 }
 
+/*
+ * PM_SUSPEND_PREPARE: the DRM layer ends a hold of this output's connector at
+ * PM_POST_SUSPEND (iomfb_m4_ext_relink_end()), if this sleep starts one.
+ */
+void iomfb_m4_ext_relink_own(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+
+	if (dcp && dcp->external)
+		WRITE_ONCE(dcp->ext_relink_owned, true);
+}
+
+/*
+ * A dcpext's display released for a deep sleep with the cable left in: it is
+ * connected again after the wake, by the type-C work, in the background. Its
+ * connector is held meanwhile only for a DRM layer that ends the hold
+ * (iomfb_m4_ext_relink_own()).
+ */
+void iomfb_m4_ext_relink_expect(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+
+	if (!dcp || !dcp->external || !READ_ONCE(dcp->ext_relink_owned))
+		return;
+	/* The link's capacity before it goes down: its modes meanwhile. */
+	WRITE_ONCE(dcp->ext_hold_capacity, dcp_m4_ext_capacity(owner));
+	WRITE_ONCE(dcp->ext_relink_armed, false);
+	WRITE_ONCE(dcp->ext_relink_lost, false);
+	WRITE_ONCE(dcp->ext_relink, true);
+}
+
+/*
+ * After the wake, its reconnect queued, under the owner's hpd_mutex with
+ * @cable read under it: from now on, the display found gone (the cable
+ * already gone, or iomfb_m4_ext_relink_lost()) ends the replay's wait for it.
+ */
+void iomfb_m4_ext_relink_arm(struct apple_dcp *owner, bool cable)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+
+	lockdep_assert_held(&owner->hpd_mutex);
+	if (!dcp || !dcp->external || !READ_ONCE(dcp->ext_relink))
+		return;
+	WRITE_ONCE(dcp->ext_relink_armed, true);
+	if (!cable) {
+		WRITE_ONCE(dcp->ext_relink_lost, true);
+		wake_up_all(&dcp->ext_settle_wq);
+	}
+}
+
+/*
+ * Its display unplugged after the wake, under the owner's hpd_mutex as its
+ * cable goes: nothing comes back to wait for.
+ */
+void iomfb_m4_ext_relink_lost(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+
+	lockdep_assert_held(&owner->hpd_mutex);
+	if (!dcp || !dcp->external || !READ_ONCE(dcp->ext_relink) ||
+	    !READ_ONCE(dcp->ext_relink_armed))
+		return;
+	WRITE_ONCE(dcp->ext_relink_lost, true);
+	wake_up_all(&dcp->ext_settle_wq);
+}
+
+/* Whether its connector is held for a reconnect after a deep sleep. */
+bool iomfb_m4_ext_relinking(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+
+	return dcp && dcp->external && READ_ONCE(dcp->ext_relink);
+}
+
+/*
+ * Its display connected again, the sink's modes in; or found gone; or the
+ * session failed.
+ */
+static bool dcp_m4_ext_relinked(struct iomfb_m4 *dcp)
+{
+	/* Pairs with the release store of dcp->runtime in startup. */
+	struct dcp_m4_runtime *r = smp_load_acquire(&dcp->runtime);
+
+	if (READ_ONCE(dcp->error) || READ_ONCE(dcp->ext_relink_lost))
+		return true;
+	/* Pairs with the release store of r->done in startup. */
+	return r && smp_load_acquire(&r->done) && READ_ONCE(r->ext_connected) &&
+	       READ_ONCE(dcp->ext_sink) && READ_ONCE(dcp->ext_catalog_open);
+}
+
+/*
+ * PM_POST_SUSPEND, before the DRM replay: after iomfb_m4_ext_relink_expect(),
+ * the display connected again (until @deadline at most, in jiffies), so that
+ * the replay's enable finds a link instead of failing on one not up yet (and
+ * leaving the compositor a hotplug to set the mode again); or found gone
+ * (unplugged during the sleep), at once; or the session failed. Its
+ * connector stays held: iomfb_m4_ext_relink_end() ends that.
+ */
+void iomfb_m4_ext_relink_wait(struct apple_dcp *owner, unsigned long deadline)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	long left = (long)(deadline - jiffies);
+
+	if (!dcp || !dcp->external || !READ_ONCE(dcp->ext_relink) || left <= 0)
+		return;
+	wait_event_timeout(dcp->ext_settle_wq, dcp_m4_ext_relinked(dcp), left);
+}
+
+/*
+ * PM_POST_SUSPEND after iomfb_m4_ext_relink_wait(), or a sleep refused at
+ * PM_SUSPEND_PREPARE, or the DRM device going: the hold of its connector ends,
+ * and the DRM layer's part in one with it. 0 if none was kept or the display
+ * is back; -ENOLINK if it was found gone; the session's error if it failed;
+ * -ETIMEDOUT if it is not back otherwise. The DRM layer sends the hotplug
+ * held meanwhile once its replay is done (t8132_ext_drm.c).
+ */
+int iomfb_m4_ext_relink_end(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	int ret;
+
+	if (!dcp || !dcp->external)
+		return 0;
+	WRITE_ONCE(dcp->ext_relink_owned, false);
+	if (!READ_ONCE(dcp->ext_relink))
+		return 0;
+	WRITE_ONCE(dcp->ext_relink, false);
+	if (READ_ONCE(dcp->ext_relink_lost))
+		return -ENOLINK;
+	ret = READ_ONCE(dcp->error);
+	if (ret)
+		return ret;
+	return dcp_m4_ext_relinked(dcp) ? 0 : -ETIMEDOUT;
+}
+
 /* A replay ends unchecked (it failed, or nothing to replay). */
 void iomfb_m4_ext_restore_end(struct apple_dcp *owner)
 {
@@ -5461,6 +5630,20 @@ static int iomfb_m4_ext_start(struct iomfb_m4 *dcp)
 	WRITE_ONCE(dcp->gated, false);
 	dev_info(dcp->dev, "external DCP restarted after sleep\n");
 	return 0;
+}
+
+/* An external DCP stopped for a deep sleep, its CPU to start from reset after it. */
+bool iomfb_m4_ext_stopped(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	bool stopped;
+
+	if (!dcp || !dcp->external)
+		return false;
+	mutex_lock(&dcp->lock);
+	stopped = dcp->ext_stopped;
+	mutex_unlock(&dcp->lock);
+	return stopped;
 }
 
 /* apple-drm, a consumer of this device, has blanked the panel before this. */
