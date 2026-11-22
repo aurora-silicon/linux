@@ -207,7 +207,7 @@ struct cd321x_status { u32 status, data_status, status_changed, data_status_chan
  bool dp_sid_event,dp_sid_hpd_low,dp_sid_irq;
  struct { u32 status_rx,configure,mode_data; } dp_sid_status; };
 struct tps6598x { void *partner, *dev, *port, *psy; int lock; u32 data_status; enum usb_role *role_sw;
- void *partner_altmode_dp; };
+ void *partner_altmode_dp; bool display_native_hpd; };
 struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
  struct cd321x_pm_state pm; struct delayed_work update_work, resume_work;
  struct typec_mux_state state; bool state_valid, display_route_active, cur_partner_is_pd;
@@ -288,6 +288,8 @@ static struct cd321x port;
 static void init(void)
 {
  memset(&display,0,sizeof(display)); memset(&sink,0,sizeof(sink)); memset(&port,0,sizeof(port));
+ /* The native H17 fixture's DT carries apple,display-native-hpd. */
+ port.tps.display_native_hpd = true;
  sink.connected = true; display.connector = &sink; display.external_prepared = true;
  raw_error = raw_links = 0;
  display.external_running = display.external_power_attempted = true;
