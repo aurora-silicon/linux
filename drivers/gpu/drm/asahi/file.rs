@@ -294,34 +294,45 @@ impl SyncItem {
         let count = in_count.checked_add(out_count).ok_or(EOVERFLOW)?;
 
         const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_sync>();
+        const CHUNK: usize = 8;
         let size = STRIDE.checked_mul(count as usize).ok_or(EOVERFLOW)?;
         let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL)?;
         let mut anchor = None;
 
-        // Read each record once so validation and use see the same retained bytes.
+        // Read each record once in small stack chunks so validation and use see the
+        // same retained bytes without a per-entry copy_from_user.
         let mut reader = UserSlice::new(UserPtr::from_addr(ptr as usize), size).reader();
+        let mut buf = MaybeUninit::<[uapi::drm_asahi_sync; CHUNK]>::uninit();
 
-        for i in 0..count {
-            let mut sync: MaybeUninit<uapi::drm_asahi_sync> = MaybeUninit::uninit();
+        let mut base = 0u32;
+        while base < count {
+            let chunk = ((count - base) as usize).min(CHUNK);
+            let raw = buf.as_mut_ptr().cast::<uapi::drm_asahi_sync>();
 
-            // SAFETY: The size of `sync` is STRIDE
+            // SAFETY: `buf` holds `CHUNK` contiguous `drm_asahi_sync` entries and
+            // `chunk <= CHUNK`, so `chunk * STRIDE` bytes are writable.
             reader.read_raw(unsafe {
-                core::slice::from_raw_parts_mut(sync.as_mut_ptr().cast::<MaybeUninit<u8>>(), STRIDE)
+                core::slice::from_raw_parts_mut(raw.cast::<MaybeUninit<u8>>(), chunk * STRIDE)
             })?;
 
-            // SAFETY: All bit patterns in the struct are valid
-            let sync = unsafe { sync.assume_init() };
+            for offset in 0..chunk {
+                let i = base + offset as u32;
+                // SAFETY: `read_raw` initialized `chunk` contiguous entries starting at `raw`,
+                // `offset < chunk`, and all bit patterns in the struct are valid.
+                let sync = unsafe { raw.add(offset).read() };
 
-            if sync.sync_type == crate::g17::sync_output::SYNC_CUMULATIVE {
-                if !allow_cumulative || i < in_count || anchor.is_some() {
-                    return Err(EINVAL);
+                if sync.sync_type == crate::g17::sync_output::SYNC_CUMULATIVE {
+                    if !allow_cumulative || i < in_count || anchor.is_some() {
+                        return Err(EINVAL);
+                    }
+                    anchor = Some(i as usize);
                 }
-                anchor = Some(i as usize);
+                vec.push(
+                    Self::parse_one(file, sync, i >= in_count, allow_cumulative)?,
+                    GFP_KERNEL,
+                )?;
             }
-            vec.push(
-                Self::parse_one(file, sync, i >= in_count, allow_cumulative)?,
-                GFP_KERNEL,
-            )?;
+            base += chunk as u32;
         }
         if let Some(anchor) = anchor {
             let bundle = crate::g17::sync_output::SignalBundle::new(
@@ -350,7 +361,40 @@ pub(crate) enum Object {
 /// queues is given back once the queue itself is gone.
 pub(crate) struct TableQueue {
     queue: KBox<dyn queue::Queue>,
+    /// Reusable staging buffer for `SUBMIT` command buffers, avoiding per-submit heap
+    /// allocations and keeping large command buffers off the kernel stack.
+    cmdbuf: KVec<u8>,
     _share: Option<queue_share::Share>,
+}
+
+impl TableQueue {
+    /// Maximum command-buffer capacity retained on a queue between submissions.
+    const REUSE_CMDBUF_CAP: usize = 4096;
+
+    /// Takes the cached command-buffer staging allocation so userspace copies run outside the
+    /// queue mutex (preventing `queue.lock()` -> `mmap_lock` lock-order inversion).
+    fn take_cmdbuf(&mut self) -> KVec<u8> {
+        core::mem::take(&mut self.cmdbuf)
+    }
+
+    /// Returns a cleared command-buffer allocation to the per-queue cache when within the
+    /// reuse capacity cap; oversized buffers are dropped.
+    fn return_cmdbuf(&mut self, mut buf: KVec<u8>) {
+        buf.clear();
+        if buf.capacity() > 0
+            && buf.capacity() <= Self::REUSE_CMDBUF_CAP
+            && buf.capacity() >= self.cmdbuf.capacity()
+        {
+            self.cmdbuf = buf;
+        }
+    }
+}
+
+fn copy_cmdbuf_from_user(buf: &mut KVec<u8>, addr: u64, size: usize) -> Result {
+    buf.clear();
+    UserSlice::new(UserPtr::from_addr(addr as usize), size)
+        .reader()
+        .read_all(buf, GFP_KERNEL)
 }
 
 impl Deref for TableQueue {
@@ -1744,6 +1788,7 @@ impl File {
         resv.fill(Arc::pin_init(
             new_mutex!(TableQueue {
                 queue,
+                cmdbuf: KVec::new(),
                 _share: share,
             }),
             GFP_KERNEL,
@@ -1815,28 +1860,37 @@ impl File {
             data.queue_id,
             id
         );
-        let mut vec = KVec::new();
-        let copy_commands = |bytes: &mut KVec<u8>| {
-            UserSlice::new(
-                UserPtr::from_addr(data.cmdbuf as usize),
-                data.cmdbuf_size as usize,
-            )
-            .reader()
-            .read_all(bytes, GFP_KERNEL)
-        };
+        let cmdbuf_size = data.cmdbuf_size as usize;
         let guarded = gpu.as_any().is::<crate::g17::Gpu>() || gpu.tracked_submission();
         // Once G17 output syncobjs are resolved, its queue must install a fence
-        // on every failure. Take the fallible userspace snapshot before that point.
-        if guarded {
-            copy_commands(&mut vec)?;
-        }
-        let syncs = SyncItem::parse_array(
+        // on every failure. Take the fallible userspace snapshot before that point,
+        // staging into a buffer taken from the queue's reusable cache so user
+        // copies never execute under `queue.lock()`.
+        let mut cmdbuf = if guarded {
+            let mut buf = queue.lock().take_cmdbuf();
+            if let Err(e) = copy_cmdbuf_from_user(&mut buf, data.cmdbuf, cmdbuf_size) {
+                queue.lock().return_cmdbuf(buf);
+                return Err(e);
+            }
+            Some(buf)
+        } else {
+            None
+        };
+        let syncs = match SyncItem::parse_array(
             file,
             data.syncs,
             data.in_sync_count,
             data.out_sync_count,
             gpu.as_any().is::<crate::g17::Gpu>(),
-        )?;
+        ) {
+            Ok(syncs) => syncs,
+            Err(e) => {
+                if let Some(buf) = cmdbuf {
+                    queue.lock().return_cmdbuf(buf);
+                }
+                return Err(e);
+            }
+        };
 
         mod_dev_dbg!(
             device,
@@ -1846,22 +1900,33 @@ impl File {
             id
         );
 
-        // Copy the command buffer into the kernel. Because we need to iterate
-        // the command buffer twice, we do this in one big copy_from_user to
-        // avoid TOCTOU issues.
-        if !guarded {
-            copy_commands(&mut vec)?;
-        }
+        // Copy the command buffer into the kernel outside `queue.lock()`. Because we
+        // need to iterate the command buffer twice, we do this in one big copy_from_user
+        // to avoid TOCTOU issues.
+        let cmdbuf = match cmdbuf.take() {
+            Some(buf) => buf,
+            None => {
+                let mut buf = queue.lock().take_cmdbuf();
+                if let Err(e) = copy_cmdbuf_from_user(&mut buf, data.cmdbuf, cmdbuf_size) {
+                    queue.lock().return_cmdbuf(buf);
+                    return Err(e);
+                }
+                buf
+            }
+        };
 
         let objects = file.inner().objects();
-        let ret = queue.lock().submit(
+        let mut guard = queue.lock();
+        let ret = guard.queue.submit(
             reg_data,
             id,
             syncs,
             data.in_sync_count as usize,
-            &vec,
+            cmdbuf.as_slice(),
             objects,
         );
+        guard.return_cmdbuf(cmdbuf);
+        drop(guard);
 
         if ret.is_ok() {
             if let Some((util_min, duration_ms)) = gpu.syncobj_wait_hint() {
