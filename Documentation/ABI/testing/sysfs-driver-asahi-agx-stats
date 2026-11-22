@@ -42,10 +42,10 @@ Description:
 		           fence signals), not from a firmware counter.
 
 		pstate     u32; current performance state index (PowerState.pstate).
-		           A logical index, not a load or power reading: on the
-		           T6020 above it took 6 values between 1 and 8 and did
-		           not follow power_mw (2156 mW at pstate 2, 889 mW at
-		           pstate 1).
+		           On the measured T6020 (M2 Pro, firmware 13.5), the
+		           index took six values between 1 and 8. At index 1,
+		           power_mw ranged from 1 to 6 mW at idle to 889 mW under
+		           load. Read power_mw for the latest power measurement.
 
 		requested_frequency_hz
 		           G13/G14: nominal OPP frequency in Hz for the pstate
