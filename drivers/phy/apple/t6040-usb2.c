@@ -44,6 +44,7 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <linux/reset-controller.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/rtkit.h>
@@ -285,6 +286,8 @@ struct t6040_usb2_phy {
 	struct completion app_reply;
 	struct t6040_recovery_state recovery;
 	atomic_t drop_next_power_down_ack;
+	struct notifier_block pm_nb;
+	bool s2idle_held;	/* held out of this suspend-to-idle, see t6040_pm_notify() */
 	struct dentry *debugfs;
 	enum typec_orientation orientation;
 	bool usb3_up;		/* tuned by the coprocessor this power cycle */
@@ -2128,6 +2131,52 @@ static void t6040_rtkit_cleanup(void *data)
 	t6040_rtkit_stop_transport(data);
 }
 
+/*
+ * Suspend-to-idle leaves the Type-C link up: the USB4/Thunderbolt router keeps
+ * its own domains out of the system transition while a cable is set up, and a
+ * running PHY coprocessor is not stopped either. genpd would still power off
+ * common_dp (and with it phymxwrap) in its noirq phase once this device has
+ * suspended, under the running coprocessor: the link then dies after resume and
+ * the next detach finds a coprocessor that no longer answers (AP idle -62).
+ * Hold this device out of the whole transition, from before its prepare to
+ * after its complete, while its coprocessor runs, so its domains stay on. A
+ * sleep the platform takes part in (firmware suspend) is left as it was.
+ */
+static int t6040_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct t6040_usb2_phy *tphy = container_of(nb, struct t6040_usb2_phy, pm_nb);
+
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+		if (!pm_suspend_no_platform())
+			break;
+		scoped_guard(mutex, &tphy->lock) {
+			if (tphy->rtk && apple_rtkit_is_running(tphy->rtk)) {
+				dev_pm_syscore_device(tphy->dev, true);
+				tphy->s2idle_held = true;
+				dev_dbg(tphy->dev, "PHY coprocessor running: domains kept on for s2idle\n");
+			}
+		}
+		break;
+	case PM_POST_SUSPEND:
+		scoped_guard(mutex, &tphy->lock) {
+			if (tphy->s2idle_held) {
+				dev_pm_syscore_device(tphy->dev, false);
+				tphy->s2idle_held = false;
+			}
+		}
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+static void t6040_pm_notifier_unregister(void *data)
+{
+	struct t6040_usb2_phy *tphy = data;
+
+	unregister_pm_notifier(&tphy->pm_nb);
+}
+
 static void t6040_mbox_dev_put(void *data)
 {
 	put_device(data);
@@ -2293,6 +2342,14 @@ static int t6040_usb3_probe(struct t6040_usb2_phy *tphy, struct platform_device 
 		return 0;
 	}
 	ret = devm_add_action_or_reset(dev, t6040_rtkit_cleanup, tphy);
+	if (ret)
+		return ret;
+
+	tphy->pm_nb.notifier_call = t6040_pm_notify;
+	ret = register_pm_notifier(&tphy->pm_nb);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, t6040_pm_notifier_unregister, tphy);
 	if (ret)
 		return ret;
 
