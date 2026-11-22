@@ -1600,11 +1600,23 @@ static void dptx_t602x_controller_init(struct apple_epic_service *service, const
 		wake_up_all(&dcp->t602x_pair_wait);
 }
 
+/* Firmware 13.5 also advertises this service on the controller endpoint. */
+static int dptx_t602x_expert_prepare(struct apple_epic_service *service,
+				     const char *name, const char *class, s64 unit)
+{
+	/* Scanout uses the DPTX controller interfaces only. */
+	return -EOPNOTSUPP;
+}
+
 static const struct apple_epic_service_ops dptx_t602x_controller_ops[] = {
 	{
 		.name = "AppleDCPDPTXController",
 		.prepare = dptx_native_controller_prepare,
 		.init = dptx_t602x_controller_init,
+	}, {
+		.name = "dcpexpert-service",
+		.optional = true,
+		.prepare = dptx_t602x_expert_prepare,
 	},
 	{}
 };
