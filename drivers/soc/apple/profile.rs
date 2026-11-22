@@ -709,8 +709,9 @@ fn select(
     {
         return Ok(&T6050);
     }
-    // Only the M4 MacBook Airs: the other T8132 Macs are unread.
-    if has(b"apple,t8132") && (has(b"apple,j713") || has(b"apple,j715")) {
+    // Every T8132 Mac shares the same SEP block and firmware; boards without a
+    // Touch ID sensor (such as J773g) omit the sensor node in DT.
+    if has(b"apple,t8132") {
         return Ok(&T8132);
     }
     // The J815 and the J813, whose ADTs were read: both have the sensor (mesa) on spi2
@@ -745,7 +746,7 @@ mod tests {
             if admitted {
                 assert!(matches!(selected, Ok(profile) if profile.name == T8142.name));
             } else {
-                assert!(selected.is_err());
+                assert!(!matches!(selected, Ok(profile) if profile.name == T8142.name));
             }
         }
     }
@@ -806,12 +807,12 @@ mod tests {
     }
 
     #[test]
-    fn t8132_selection_is_limited_to_the_m4_airs() {
+    fn t8132_selection_matches_the_soc() {
         assert_eq!(picked(&[b"apple,j713", b"apple,t8132"]), Some(T8132.name));
         assert_eq!(picked(&[b"apple,j715", b"apple,t8132"]), Some(T8132.name));
-        assert_eq!(picked(&[b"apple,j604", b"apple,t8132"]), None);
-        assert_eq!(picked(&[b"apple,t8132"]), None);
-        assert_eq!(picked(&[b"apple,j613", b"apple,t8132"]), None);
+        assert_eq!(picked(&[b"apple,j773g", b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,j604", b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,t8132"]), Some(T8132.name));
         assert_eq!(picked(&[b"apple,j713", b"apple,t8122"]), None);
         assert_eq!(picked(&[b"apple,j613", b"apple,t8122"]), Some(T8122.name));
         assert_eq!(picked(&[b"apple,j700", b"apple,t8140"]), Some(T8140.name));
