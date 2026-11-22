@@ -18,6 +18,7 @@ MUTATIONS = {
     'any-system': ('if (test_bit(i, map) && !test_bit(i, known))', 'if (0)'),
     'any-version': ('session->protocol_version < APPLE_RTKIT_MIN_SUPPORTED_VERSION ||', '0 ||'),
     'ignore-ops-version': ('session->protocol_version != rtk->ops->protocol_version', '0'),
+    'any-buffer-endpoint': ('rtk->ioreport_buffer.size && !test_bit(APPLE_RTKIT_EP_IOREPORT, map)', '0'),
 }
 
 
@@ -53,20 +54,29 @@ struct apple_rtkit_ops { u16 protocol_version; };
 '''
 
 TESTS = r'''
+struct apple_rtkit_shmem { unsigned long size; };
 struct apple_rtkit {
 	const struct apple_rtkit_ops *ops;
 	bool endpoints[APPLE_RTKIT_MAX_ENDPOINTS];
 	u16 version;
+	struct apple_rtkit_shmem crashlog_buffer, syslog_buffer, ioreport_buffer, oslog_buffer;
 };
 ''' + '%s' + r'''
 static int run(u16 required, u16 version, const u32 *map, struct apple_rtkit *rtk)
 {
 	static struct apple_rtkit_ops ops;
 	struct apple_rtkit_adopted_session s = { .protocol_version = version };
+	struct apple_rtkit_shmem crashlog = rtk->crashlog_buffer, syslog = rtk->syslog_buffer;
+	struct apple_rtkit_shmem ioreport = rtk->ioreport_buffer, oslog = rtk->oslog_buffer;
 
 	ops.protocol_version = required;
 	memset(rtk, 0, sizeof(*rtk));
 	rtk->ops = &ops;
+	/* The buffers the session retained, set by the caller. */
+	rtk->crashlog_buffer = crashlog;
+	rtk->syslog_buffer = syslog;
+	rtk->ioreport_buffer = ioreport;
+	rtk->oslog_buffer = oslog;
 	memcpy(s.epmap, map, sizeof(s.epmap));
 	return apple_rtkit_inherit_endpoints(rtk, &s);
 }
@@ -79,7 +89,7 @@ int main(void)
 	 * 0x20-0x2c, 0x31 and 0x37.
 	 */
 	const u32 dcpext[8] = { 0x0000011f, 0x00821fff };
-	struct apple_rtkit r;
+	struct apple_rtkit r = {};
 	u32 m[8];
 	int i;
 
@@ -118,6 +128,26 @@ int main(void)
 	memset(m, 0, sizeof(m));
 	m[0] = 1;
 	assert(run(0, 12, m, &r) == 0 && r.endpoints[0] && !r.endpoints[0x37]);
+
+	/*
+	 * The J473 retains crashlog, syslog and ioreport buffers: all three
+	 * endpoints are in its map. A buffer for an endpoint the map lacks
+	 * is refused.
+	 */
+	memset(&r, 0, sizeof(r));
+	r.crashlog_buffer.size = 0x10000;
+	r.syslog_buffer.size = 0x4000;
+	r.ioreport_buffer.size = 0x4000;
+	assert(run(0, 12, dcpext, &r) == 0);
+	memcpy(m, dcpext, sizeof(m));
+	m[0] &= ~(1u << 4);
+	assert(run(0, 12, m, &r) == -EINVAL);
+	memset(&r, 0, sizeof(r));
+	r.oslog_buffer.size = 0x4000;
+	assert(run(0, 12, dcpext, &r) == 0);
+	memcpy(m, dcpext, sizeof(m));
+	m[0] &= ~(1u << 8);
+	assert(run(0, 12, m, &r) == -EINVAL);
 
 	puts("PASS adopted session endpoint map, protocol version and system endpoints");
 	return 0;

@@ -294,7 +294,7 @@ ASAHI_TESTS = {
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
     'rtkit-adopted-session-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('no-management', 'any-system', 'any-version',
-                                   'ignore-ops-version'), out()),
+                                   'ignore-ops-version', 'any-buffer-endpoint'), out()),
     'rtkit-retained-tests.py': [(out(), PASS)],
     't6030-clock-tests.py': [(out(), PASS)],
     't6030-display-admission-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],

@@ -2324,6 +2324,12 @@ static int apple_rtkit_inherit_endpoints(
 	for (i = 0; i < APPLE_RTKIT_APP_ENDPOINT_START; i++)
 		if (test_bit(i, map) && !test_bit(i, known))
 			return -EINVAL;
+	/* A retained buffer belongs to an endpoint the session has. */
+	if ((rtk->crashlog_buffer.size && !test_bit(APPLE_RTKIT_EP_CRASHLOG, map)) ||
+	    (rtk->syslog_buffer.size && !test_bit(APPLE_RTKIT_EP_SYSLOG, map)) ||
+	    (rtk->ioreport_buffer.size && !test_bit(APPLE_RTKIT_EP_IOREPORT, map)) ||
+	    (rtk->oslog_buffer.size && !test_bit(APPLE_RTKIT_EP_OSLOG, map)))
+		return -EINVAL;
 
 	bitmap_copy(rtk->endpoints, map, APPLE_RTKIT_MAX_ENDPOINTS);
 	rtk->version = session->protocol_version;
