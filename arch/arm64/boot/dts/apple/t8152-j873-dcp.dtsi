@@ -18,34 +18,80 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/spmi/spmi.h>
 
+/*
+ * The display coprocessors' PMGR power states (ADT pmgr devices DISP_CPU,
+ * DISPEXT0_CPU and DISPEXT1_CPU), which their DARTs follow. The PMGR does not
+ * switch them for the AP: the coprocessor is started through its PSD service
+ * (coproc-psd below) and its firmware runs the state, so Linux only reads
+ * DISPEXT0_CPU (coproc-ps). They are the firmware's: the OS keeps them on and
+ * never accesses them.
+ */
+&pmgr {
+	ps_dispext1_cpu: power-controller@aa0 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xaa0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext1_cpu";
+		apple,firmware-owned;
+	};
+
+	ps_dispext0_cpu: power-controller@e00 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xe00 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext0_cpu";
+		apple,firmware-owned;
+	};
+
+	ps_disp_cpu: power-controller@14000 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x14000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "disp_cpu";
+		apple,firmware-owned;
+	};
+};
+
 &dcp_dart {
 	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	power-domains = <&ps_disp_cpu>;
 	status = "okay";
 };
 
 &disp0_dart {
 	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	power-domains = <&ps_disp_cpu>;
 	status = "okay";
 };
 
 &dcpext0_dart {
 	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	power-domains = <&ps_dispext0_cpu>;
 	status = "okay";
 };
 
 &dispext0_dart {
 	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	power-domains = <&ps_dispext0_cpu>;
 	status = "okay";
 };
 
 &dcpext1_dart {
 	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	power-domains = <&ps_dispext1_cpu>;
 	status = "okay";
 };
 
 &dispext1_dart {
 	reg-names = "dart", "dapf";
 	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	power-domains = <&ps_dispext1_cpu>;
 	status = "okay";
 };
 
@@ -115,6 +161,7 @@
 			ranges;
 			mboxes = <&dcp_mbox>;
 			iommus = <&dcp_dart 23>;
+			power-domains = <&ps_disp_cpu>;
 			/*
 			 * Cacheable DMA, as iBoot maps DCP buffers: the firmware
 			 * faults on entries with the DART's no-cache bit.
@@ -472,6 +519,7 @@
 				    "phy-ps", "coproc-ps", "coproc-psd", "phy-psd";
 			mboxes = <&dcpext_mbox>;
 			iommus = <&dcpext0_dart 23>;
+			power-domains = <&ps_dispext0_cpu>;
 			dma-coherent;
 			apple,dp-source = <1>;
 			apple,usb-c-ports = <&dcp_iboot>;
@@ -534,6 +582,7 @@
 			reg-names = "coproc", "coproc-psd";
 			mboxes = <&dcpext1_mbox>;
 			iommus = <&dcpext1_dart 23>;
+			power-domains = <&ps_dispext1_cpu>;
 			dma-coherent;
 			apple,dp-source = <2>;
 			apple,usb-c-ports = <&dcp_iboot>;
