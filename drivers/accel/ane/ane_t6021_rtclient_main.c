@@ -9,8 +9,9 @@
  *     CREATE_PROCESS 0x202, PROCEDURE_CALL 0x204) driven through the
  *     ioctls in this file;
  *   - DRM accel: BO_INIT/BO_FREE plus PROG_LOAD/PROC_CREATE/EXEC per
- *     include/uapi/drm/ane_accel.h (ABI 2). Sections ride BOs the
- *     user supplies; one global mutex serializes every firmware
+ *     include/uapi/drm/ane_accel.h (ABI 2). Sections arrive in BOs
+ *     the user supplies and PROG_LOAD copies them into kernel memory;
+ *     one global mutex serializes every firmware
  *     command; completion = the legacy exchange's reply PLUS the
  *     firmware's finish event on the IO_T2H ring. EXEC also returns the
  *     fw's target-to-host slots (drained after every exchange).
@@ -347,9 +348,9 @@ struct ane_t6021_fd {
 
 /* Per-file handle counter and every per-fd list against same-fd concurrent
  * ioctls. A BO whose IOVA reached the firmware (fw_ref) never goes back to
- * the kernel: a program section is held until a verified reset, an io BO is parked
- * for reuse (see ane_t6021_bo_release). Every other BO frees at its last
- * reference.
+ * the kernel: an io BO is parked for reuse (see ane_t6021_bo_release). Every
+ * other BO frees at its last reference. Program sections are not BOs: a
+ * program owns a kernel copy of them (struct ane_t6021_sec_copy).
  *
  * Per-BO cap: matvec weights emitted by the H14 compiler are bounded by
  * `reduction * columns * 2`, which reaches 20 MiB at (K,N)=(2048,5120).
@@ -357,7 +358,8 @@ struct ane_t6021_fd {
  * and any H14 softmax/reduction with an 8 MiB table. Total BO bytes
  * across all fds are capped separately (bo_total_max_mb) by an atomic
  * counter, enforced at alloc and released when the memory is really
- * freed. Program sections stay held until a verified reset, and one large model's
+ * freed. The section copies of the programs count against the same cap:
+ * they stay until the firmware dropped the program, and one large model's
  * programs alone can hold gigabytes.
  * A cap of 0 refuses every BO_INIT with -ENOSPC; there is no unlimited
  * value. Every BO also needs IOVA below 4 GiB (32-bit DMA mask), so
@@ -365,7 +367,6 @@ struct ane_t6021_fd {
  * The 16 KiB alignment check is unchanged: every DMA site assumes it.
  */
 #define ANE_T6021_BO_MAX		SZ_1G
-#define ANE_T6021_BO_HASH_CHUNK		SZ_1M
 
 struct ane_t6021_bo {
 	struct list_head node;
@@ -376,10 +377,7 @@ struct ane_t6021_bo {
 	dma_addr_t dma;
 	size_t size;
 	u64 fw_epoch;
-	u32 prog_refs;			/* program sections using this BO */
 	bool fw_ref;			/* the firmware received this IOVA */
-	bool fw_program;		/* a loaded program keeps this IOVA */
-	bool fw_io;			/* published as a CALL buffer */
 	struct device *dev;
 };
 
@@ -429,11 +427,10 @@ static u64 ane_t6021_bo_epoch = 1;
 static DEFINE_SPINLOCK(ane_t6021_bo_pool_lock);
 
 /* Final put: the last handle or mapping is gone. The firmware must never
- * see a freed IOVA, so a current-generation fw_ref BO is retained: a program
- * section stays held, because a cached firmware program keeps reading
- * it; an io BO goes to the pool, unless a quarantined firmware may still
- * write it. Every other BO frees here, so the BO cap bounds only the
- * memory the firmware may touch.
+ * see a freed IOVA, so a current-generation fw_ref BO is retained: an io BO
+ * goes to the pool, unless a quarantined firmware may still write it. Every
+ * other BO frees here, so the BO cap bounds only the memory the firmware
+ * may touch.
  */
 static void ane_t6021_bo_destroy(struct ane_t6021_bo *bo)
 {
@@ -451,7 +448,7 @@ static void ane_t6021_bo_release(struct kref *ref)
 	spin_lock(&ane_t6021_bo_pool_lock);
 	release = !bo->fw_ref || bo->fw_epoch != ane_t6021_bo_epoch;
 	if (!release) {
-		if (bo->fw_program || atomic_read(&ane_t6021_quarantined))
+		if (atomic_read(&ane_t6021_quarantined))
 			list_add_tail(&bo->node, &ane_t6021_bo_held);
 		else
 			list_add_tail(&bo->node, &ane_t6021_bo_pool);
@@ -481,18 +478,10 @@ static void ane_t6021_bo_new_epoch(void)
 }
 
 /* bo_lock and a live handle protect the BO while its IOVA is published. */
-static void ane_t6021_bo_publish(struct ane_t6021_bo *bo, bool program)
+static void ane_t6021_bo_publish(struct ane_t6021_bo *bo)
 {
-	if (bo->fw_epoch != ane_t6021_bo_epoch) {
-		bo->fw_program = false;
-		bo->fw_io = false;
-	}
 	bo->fw_epoch = ane_t6021_bo_epoch;
 	bo->fw_ref = true;
-	if (program)
-		bo->fw_program = true;
-	else
-		bo->fw_io = true;
 }
 
 /* A parked io BO of SIZE's page-aligned size, or NULL. */
@@ -1471,13 +1460,14 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 /* ---- LOAD / CREATE / CALL wrappers ---- */
 
 /* Two loads of byte-identical sections share one program and one process.
- * The key is SHA-256 over every section's id, size and bytes, so a client
- * can only reach a program whose bytes it also supplied, and every file
- * holds a reference on each program it loaded. The last close unloads a
- * program, at most ANE_T6021_FW_RESIDENT_MAX programs are resident, and a
- * program a file still holds loads again on its next use after it was
- * unloaded for room or a restart (ane_t6021_lifetime.h). Protected by
- * ane_t6021_fw_lock.
+ * The key is SHA-256 over every section's id, size and bytes, taken over the
+ * program's own kernel copy of the sections that the firmware reads and no
+ * client can map or change, so a client can only reach a program whose bytes
+ * it also supplied. Every file holds a reference on each program it loaded.
+ * The last close unloads a program, at most ANE_T6021_FW_RESIDENT_MAX
+ * programs are resident, and a program a file still holds loads again on
+ * its next use after it was unloaded for room or a restart
+ * (ane_t6021_lifetime.h). Protected by ane_t6021_fw_lock.
  */
 static struct ane_t6021_progtab ane_t6021_progtab;
 static struct ane_fw_ids ane_t6021_ids;
@@ -1560,28 +1550,75 @@ static int ane_t6021_prog_unload_op(void *ctx, struct ane_t6021_prog *p)
 	return ret;
 }
 
-/* The firmware no longer reads the sections: drop the program's references.
- * A BO no other program uses stops being a program BO, and is freed or
- * pooled by the usual rule at its last put.
+/* A program's kernel copy of one section: allocated for the same device as
+ * the BOs, so the firmware reaches it the same way, never mapped to
+ * userspace and not written after PROG_LOAD filled it. Counted against
+ * bo_total_max_mb like a BO.
  */
+struct ane_t6021_sec_copy {
+	struct device *dev;
+	void *cpu;
+	dma_addr_t dma;
+	size_t size;			/* allocated bytes, page aligned */
+};
+
+static struct ane_t6021_sec_copy *
+ane_t6021_sec_copy_alloc(struct ane_rtclient *ane, u64 size)
+{
+	struct ane_t6021_sec_copy *c;
+	size_t alloc;
+
+	/* No BO holds more, so a larger section is refused anyway. */
+	if (size > ANE_T6021_BO_MAX)
+		return ERR_PTR(-EINVAL);
+	alloc = PAGE_ALIGN(max_t(size_t, size, 1));
+	if (atomic64_add_return(alloc, &ane_t6021_bo_total_bytes) >
+	    (s64)bo_total_max_mb << 20) {
+		atomic64_sub(alloc, &ane_t6021_bo_total_bytes);
+		return ERR_PTR(-ENOSPC);
+	}
+	c = kzalloc_obj(*c);
+	if (!c) {
+		atomic64_sub(alloc, &ane_t6021_bo_total_bytes);
+		return ERR_PTR(-ENOMEM);
+	}
+	c->cpu = dma_alloc_coherent(ane->dev, alloc, &c->dma, GFP_KERNEL);
+	if (!c->cpu) {
+		atomic64_sub(alloc, &ane_t6021_bo_total_bytes);
+		kfree(c);
+		return ERR_PTR(-ENOMEM);
+	}
+	/* The same IOVA rules as a BO (see ane_t6021_bo_init_locked()). */
+	if (!IS_ALIGNED(c->dma, SZ_16K) ||
+	    (ane->fw && !ane_t6021_fw_alias_iova_ok(ane->fw, c->dma, alloc))) {
+		dma_free_coherent(ane->dev, alloc, c->cpu, c->dma);
+		atomic64_sub(alloc, &ane_t6021_bo_total_bytes);
+		kfree(c);
+		return ERR_PTR(-ERANGE);
+	}
+	c->dev = ane->dev;
+	c->size = alloc;
+	return c;
+}
+
+static void ane_t6021_sec_copy_free(struct ane_t6021_sec_copy *c)
+{
+	dma_free_coherent(c->dev, c->size, c->cpu, c->dma);
+	atomic64_sub(c->size, &ane_t6021_bo_total_bytes);
+	kfree(c);
+}
+
+/* The firmware no longer reads the sections: free the program's copies. */
 static void ane_t6021_prog_release_op(void *ctx, struct ane_t6021_prog *p)
 {
 	unsigned int i;
 
-	mutex_lock(&ane_t6021_bo_lock);
 	for (i = 0; i < ANE_T6021_PROG_SECS; i++) {
-		struct ane_t6021_bo *bo = p->sec[i];
-
-		if (!bo)
+		if (!p->sec[i])
 			continue;
+		ane_t6021_sec_copy_free(p->sec[i]);
 		p->sec[i] = NULL;
-		if (!WARN_ON(!bo->prog_refs) && !--bo->prog_refs) {
-			bo->fw_program = false;
-			bo->fw_ref = bo->fw_io;
-		}
-		kref_put(&bo->refcount, ane_t6021_bo_release);
 	}
-	mutex_unlock(&ane_t6021_bo_lock);
 }
 
 /*
@@ -1590,8 +1627,8 @@ static void ane_t6021_prog_release_op(void *ctx, struct ane_t6021_prog *p)
  * at slot 6 and slot 5 stays empty when id 6 is absent). flags bit0 = 1, id
  * at +0x04, iova at +0x18, size at +0x20. The firmware writes the program ID
  * back at +0x1b8. Used for the first load and for every reload after an
- * eviction or a restart; the section IOVAs are republished to the current
- * firmware generation before the doorbell.
+ * eviction or a restart; every record names the program's kernel copy of
+ * the section, which lives until the firmware dropped the program for good.
  */
 static int ane_rtclient_send_load(struct ane_rtclient *ane,
 				  struct ane_t6021_prog *p)
@@ -1599,29 +1636,13 @@ static int ane_rtclient_send_load(struct ane_rtclient *ane,
 	struct ane_legacy_buffer *command = ane->cmd_buf;
 	u8 *cmd;
 	u32 fw_prog;
-	unsigned int i;
 	int ret;
 
 	if (!command || atomic_read(&ane_t6021_quarantined))
 		return -ENODEV;
 	cmd = command->cpu;
 	memset(cmd, 0, SZ_16K);
-	mutex_lock(&ane_t6021_bo_lock);
-	for (i = 0; i < ANE_T6021_PROG_SECS; i++) {
-		u64 slot_base = 0x8 + (u64)i * 0x30;
-
-		if (!p->sec[i])
-			continue;
-		/* The firmware may read the section any time after the
-		 * doorbell, including during a timeout.
-		 */
-		ane_t6021_bo_publish(p->sec[i], true);
-		*(u32 *)(cmd + slot_base + 0x00) = cpu_to_le32(1);
-		*(u32 *)(cmd + slot_base + 0x04) = cpu_to_le32(i + 1);
-		*(u64 *)(cmd + slot_base + 0x18) = cpu_to_le64(p->sec_iova[i]);
-		*(u64 *)(cmd + slot_base + 0x20) = cpu_to_le64(p->sec_size[i]);
-	}
-	mutex_unlock(&ane_t6021_bo_lock);
+	ane_t6021_load_records(cmd, p);
 	*(u32 *)(cmd + 0x1b8) = cpu_to_le32(U32_MAX);
 	/* The LOAD command is 0x1C0 bytes: the nine 0x30 records end at
 	 * 0x1b8, ProgramId at +0x1b8, 8 bytes of zero tail.
@@ -1692,11 +1713,28 @@ static const struct ane_t6021_progtab_ops ane_t6021_progtab_ops = {
 	.restart = ane_t6021_prog_restart_op,
 };
 
+/* The BO of this file that holds section @sec, or NULL. Under bo_lock. */
+static struct ane_t6021_bo *
+ane_t6021_sec_bo_locked(struct ane_t6021_fd *fd,
+			const struct drm_ane_section *sec)
+{
+	struct ane_t6021_bo *b;
+
+	lockdep_assert_held(&ane_t6021_bo_lock);
+	list_for_each_entry(b, &fd->bos, node) {
+		if (b->handle != sec->bo_handle)
+			continue;
+		if (sec->size > b->size || sec->offset > b->size - sec->size)
+			return NULL;
+		return b;
+	}
+	return NULL;
+}
+
 /* Build a LOAD_PROGRAM (0x200) message in a kernel-owned buffer. The
- * section bytes live in the BOs the user supplied (section_ptr), the
- * generic binds (bufferId, bo_handle, size) patch the generic section
- * at iova +0x20 / +0x28 once the BO is copied. Returns 0 with
- * *prog_id set on success.
+ * section bytes are copied out of the BOs the user supplied (section_ptr)
+ * into kernel memory the program owns; the generic binds are accepted
+ * and unused (see below). Returns 0 with *prog_id set on success.
  */
 static int ane_rtclient_load_program(struct ane_rtclient *ane,
 				     struct drm_file *file,
@@ -1707,6 +1745,7 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	struct drm_ane_generic_bind *binds;
 	struct ane_t6021_fd *fd = file->driver_priv;
 	struct ane_t6021_prog *cached, *prog = NULL;
+	struct ane_t6021_secs secs = {};
 	bool sent = false;
 	int td_flags = 0;
 	u32 key, gen;
@@ -1770,64 +1809,50 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 		}
 	}
 
-	/* Identical sections share one firmware program (see the table).
-	 * A constant section can reach 20 MiB (the H14 (K,N)=(2048,5120)
-	 * matvec), so feed the hash in ANE_T6021_BO_HASH_CHUNK-sized slices
-	 * under bo_lock: a single sha256_update of a 20 MiB buffer would
-	 * rely on a 20 MiB stack argument list and has no upper bound on
-	 * the chunk that the BO could supply.
+	/* Copy every section out of the caller's buffer into kernel memory no
+	 * client can map, then key and check the copies: identical sections
+	 * share one firmware program (see the table), and the bytes keyed and
+	 * checked here are the bytes every LOAD of the program names. The
+	 * buffer is read once, under bo_lock.
 	 */
-	{
-		struct sha256_ctx sha;
-		void *scratch;
+	/* Every section must name a BO of this file that holds it. */
+	for (i = 0; i < user->section_count; i++) {
+		bool ok;
 
-		sha256_init(&sha);
-		scratch = kvmalloc(ANE_T6021_BO_HASH_CHUNK, GFP_KERNEL);
-		if (!scratch) {
-			ret = -ENOMEM;
+		mutex_lock(&ane_t6021_bo_lock);
+		ok = ane_t6021_sec_bo_locked(fd, &sections[i]);
+		mutex_unlock(&ane_t6021_bo_lock);
+		if (!ok) {
+			ret = -EINVAL;
 			goto out;
 		}
-		for (i = 0; i < user->section_count; i++) {
-			struct ane_t6021_bo *bo = NULL, *b;
-			u64 hdr[2] = { sections[i].id, sections[i].size };
-			size_t left;
-
-			mutex_lock(&ane_t6021_bo_lock);
-			list_for_each_entry(b, &fd->bos, node) {
-				if (b->handle == sections[i].bo_handle) {
-					bo = b;
-					break;
-				}
-			}
-			if (!bo || sections[i].size > bo->size ||
-			    sections[i].offset > bo->size - sections[i].size) {
-				mutex_unlock(&ane_t6021_bo_lock);
-				kvfree(scratch);
-				ret = -EINVAL;
-				goto out;
-			}
-			sha256_update(&sha, (const u8 *)hdr, sizeof(hdr));
-			/* Checked in the same snapshot as the key. */
-			if (sections[i].id == ANE_T6021_SEC_TEXT)
-				td_flags = ane_t6021_td_flags_check((const u8 *)bo->cpu +
-								    sections[i].offset,
-								    sections[i].size);
-			left = sections[i].size;
-			while (left) {
-				size_t n = min_t(size_t, left,
-						 ANE_T6021_BO_HASH_CHUNK);
-
-				memcpy(scratch, (const u8 *)bo->cpu +
-				       sections[i].offset +
-				       (sections[i].size - left), n);
-				sha256_update(&sha, scratch, n);
-				left -= n;
-			}
-			mutex_unlock(&ane_t6021_bo_lock);
-		}
-		kvfree(scratch);
-		sha256_final(&sha, digest);
 	}
+	for (i = 0; i < user->section_count; i++) {
+		struct ane_t6021_sec_copy *c;
+		struct ane_t6021_bo *bo;
+		unsigned int slot = sections[i].id - 1;
+
+		c = ane_t6021_sec_copy_alloc(ane, sections[i].size);
+		if (IS_ERR(c)) {
+			ret = PTR_ERR(c);
+			goto out;
+		}
+		/* Looked up again: the BO may have been freed meanwhile. */
+		mutex_lock(&ane_t6021_bo_lock);
+		bo = ane_t6021_sec_bo_locked(fd, &sections[i]);
+		if (bo)
+			ane_t6021_secs_fill(&secs, slot, c, c->cpu, c->dma,
+					    (const u8 *)bo->cpu +
+					    sections[i].offset,
+					    sections[i].size);
+		mutex_unlock(&ane_t6021_bo_lock);
+		if (!bo) {
+			ane_t6021_sec_copy_free(c);
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+	td_flags = ane_t6021_secs_key(&secs, digest);
 	/* A program that opens or closes on the wrong task wedges the firmware
 	 * for every client; refuse it before the firmware sees it.
 	 */
@@ -1873,37 +1898,10 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 		goto out;
 	}
 	gen = ane_t6021_progtab.gen;
-	/* The record slot IS the section identity (slot = id - 1). The program
-	 * takes its own reference on each section buffer, kept until the
-	 * firmware dropped the program for good (or forever if uncertain).
+	/* The program owns the copies from here, until the firmware dropped it
+	 * for good (or forever if uncertain).
 	 */
-	for (i = 0; i < user->section_count; i++) {
-		struct ane_t6021_bo *bo = NULL, *b;
-		unsigned int slot = sections[i].id - 1;
-
-		mutex_lock(&ane_t6021_bo_lock);
-		list_for_each_entry(b, &fd->bos, node) {
-			if (b->handle == sections[i].bo_handle) {
-				bo = b;
-				break;
-			}
-		}
-		if (bo && sections[i].size <= bo->size &&
-		    sections[i].offset <= bo->size - sections[i].size) {
-			kref_get(&bo->refcount);
-			bo->prog_refs++;
-			prog->sec[slot] = bo;
-			prog->sec_iova[slot] = bo->dma + sections[i].offset;
-			prog->sec_size[slot] = sections[i].size;
-		} else {
-			bo = NULL;
-		}
-		mutex_unlock(&ane_t6021_bo_lock);
-		if (!bo) {
-			ret = -EINVAL;
-			goto out;
-		}
-	}
+	ane_t6021_secs_give(&secs, prog);
 	/* Generic binds are accepted for ABI compatibility and unused: the
 	 * LOAD record already carries iova + size, and the generic section
 	 * image is prepared by userspace (generic.bin).
@@ -1929,6 +1927,10 @@ out:
 	/* The firmware never saw these IOVAs: give the reservation back. */
 	if (prog && !sent)
 		ane_t6021_progtab_cancel(prog, &ane_t6021_progtab_ops, ane);
+	/* Copies no program took (a cached program, or a failed load). */
+	for (i = 0; i < ANE_T6021_PROG_SECS; i++)
+		if (secs.mem[i])
+			ane_t6021_sec_copy_free(secs.mem[i]);
 	kfree(sections);
 	kfree(binds);
 	return ret;
@@ -2203,7 +2205,7 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 			/* Keep this IO element out of the reuse pool until completion. */
 			kref_get(&bo->refcount);
 			exec_bos[pinned++] = bo;
-			ane_t6021_bo_publish(bo, false);
+			ane_t6021_bo_publish(bo);
 			iova = bo->dma;
 			mutex_unlock(&ane_t6021_bo_lock);
 			*(u32 *)(cmd + slot_base + 0x00) = cpu_to_le32(1);
