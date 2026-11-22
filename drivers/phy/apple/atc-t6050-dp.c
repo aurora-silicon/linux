@@ -1372,6 +1372,14 @@ int apple_t6050_phy_cio_on(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_on);
 
+/*
+ * Not fenced by s2idle_frozen, unlike the CIO calls above: this and
+ * apple_t6050_phy_cio_lost() write no PHY register and change no mode,
+ * clock or domain. They only update the sleep-in-place bookkeeping, under
+ * dp->lock. Their only caller, the Thunderbolt host's CIO sleep in
+ * drivers/thunderbolt/apple-cio-sleep.c, runs them only for a
+ * suspend-to-RAM it prepared (PM_SUSPEND_MEM), never across s2idle.
+ */
 int apple_t6050_phy_cio_finish(struct device *dev)
 {
 	struct t6050_dp *dp = t6050_dp_from_dev(dev);
