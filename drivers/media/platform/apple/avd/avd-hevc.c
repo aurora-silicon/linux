@@ -13,6 +13,7 @@
  *	Tomasz Figa <tfiga@chromium.org>
  */
 
+#include <kunit/visibility.h>
 #include <media/videobuf2-dma-contig.h>
 
 #include "avd.h"
@@ -832,20 +833,25 @@ static void compute_rs_to_ts(struct avd_hevc_run *run, u32 pic_in_ctbs_size,
 	}
 }
 
-static void compute_tile_ids(struct avd_hevc_run *run, u32 pic_in_ctbs_width,
-			     u32 *col_bd, u32 *row_bd, u32 *ctb_addr_rs_to_ts,
-			     u32 *tile_ids)
+static void compute_tile_ids(struct avd_hevc_run *run, u32 pic_in_ctbs_size,
+			     u32 pic_in_ctbs_width, u32 *col_bd, u32 *row_bd,
+			     u32 *ctb_addr_rs_to_ts, u32 *tile_ids)
 {
 	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
 	int j, i, y, x;
-	u32 tile_idx;
+	u32 tile_idx, rs, ts;
+
 	for (j = 0, tile_idx = 0; j <= pps->num_tile_rows_minus1; j++)
 		for (i = 0; i <= pps->num_tile_columns_minus1; i++, tile_idx++)
 			for (y = row_bd[j]; y < row_bd[j + 1]; y++)
-				for (x = col_bd[i]; x < col_bd[i + 1]; x++)
-					tile_ids[ctb_addr_rs_to_ts
-							 [y * pic_in_ctbs_width +
-							  x]] = tile_idx;
+				for (x = col_bd[i]; x < col_bd[i + 1]; x++) {
+					rs = y * pic_in_ctbs_width + x;
+					if (rs >= pic_in_ctbs_size)
+						continue;
+					ts = ctb_addr_rs_to_ts[rs];
+					if (ts < pic_in_ctbs_size)
+						tile_ids[ts] = tile_idx;
+				}
 }
 
 struct sl_ctx {
@@ -1046,9 +1052,76 @@ static enum avd_image_fmt avd_hevc_get_image_fmt(struct avd_ctx *ctx,
 	return AVD_IMG_FMT_ANY;
 }
 
+/*
+ * The picture must have at least one sample in each direction and the CTB
+ * size must be one of those H.265 allows (CtbLog2SizeY 4 to 6, 7.4.3.2.1):
+ * the picture size in CTBs sizes the tile tables and divides slice addresses.
+ */
+VISIBLE_IF_KUNIT int
+avd_hevc_check_sps_geometry(const struct v4l2_ctrl_hevc_sps *sps)
+{
+	unsigned int ctb_log2 = sps->log2_min_luma_coding_block_size_minus3 + 3 +
+				sps->log2_diff_max_min_luma_coding_block_size;
+
+	if (!sps->pic_width_in_luma_samples || !sps->pic_height_in_luma_samples)
+		return -EINVAL;
+	if (ctb_log2 < 4 || ctb_log2 > 6)
+		return -EINVAL;
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_hevc_check_sps_geometry);
+
+static void avd_hevc_pic_in_ctbs(const struct v4l2_ctrl_hevc_sps *sps,
+				 u32 *width, u32 *height)
+{
+	u32 ctb = 1 << (sps->log2_min_luma_coding_block_size_minus3 + 3 +
+			sps->log2_diff_max_min_luma_coding_block_size);
+
+	*width = DIV_ROUND_UP(sps->pic_width_in_luma_samples, ctb);
+	*height = DIV_ROUND_UP(sps->pic_height_in_luma_samples, ctb);
+}
+
+/*
+ * The tile columns and rows must cover the picture, each at least one CTB
+ * wide or high (H.265 7.4.3.3.1). Explicitly sized tiles give all but the
+ * last width and height; the last one takes the rest and must not be empty.
+ * avd_hevc_check_sps_geometry() must have accepted the SPS.
+ */
+VISIBLE_IF_KUNIT int avd_hevc_check_tiles(const struct v4l2_ctrl_hevc_sps *sps,
+					  const struct v4l2_ctrl_hevc_pps *pps)
+{
+	u32 width, height, sum;
+	int i;
+
+	if (!(pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED))
+		return 0;
+
+	avd_hevc_pic_in_ctbs(sps, &width, &height);
+	if (pps->num_tile_columns_minus1 >= width ||
+	    pps->num_tile_rows_minus1 >= height)
+		return -EINVAL;
+	if (pps->flags & V4L2_HEVC_PPS_FLAG_UNIFORM_SPACING)
+		return 0;
+
+	for (i = 0, sum = 0; i < pps->num_tile_columns_minus1; i++)
+		sum += pps->column_width_minus1[i] + 1;
+	if (sum >= width)
+		return -EINVAL;
+
+	for (i = 0, sum = 0; i < pps->num_tile_rows_minus1; i++)
+		sum += pps->row_height_minus1[i] + 1;
+	if (sum >= height)
+		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_hevc_check_tiles);
+
 static int avd_hevc_validate_sps(struct avd_ctx *ctx,
 				 const struct v4l2_ctrl_hevc_sps *sps)
 {
+	if (avd_hevc_check_sps_geometry(sps))
+		return -EINVAL;
 	if (sps->pic_width_in_luma_samples > ctx->coded_fmt.fmt.pix_mp.width ||
 	    sps->pic_height_in_luma_samples > ctx->coded_fmt.fmt.pix_mp.height)
 		return -EINVAL;
@@ -1292,6 +1365,9 @@ static int avd_hevc_compute_tiles(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	tiles_enabled = !!(pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED);
 
+	if (avd_hevc_check_tiles(sps, pps))
+		return -EINVAL;
+
 	tile_info->ctb_addr_rs_to_ts = kzalloc(
 		sizeof(*tile_info->ctb_addr_rs_to_ts) * pic_in_ctbs_size,
 		GFP_KERNEL);
@@ -1332,7 +1408,8 @@ static int avd_hevc_compute_tiles(struct avd_ctx *ctx, struct avd_hevc_run *run)
 				 tile_info->col_bd, tile_info->row_bd,
 				 tile_info->col_width, tile_info->row_height,
 				 tile_info->ctb_addr_rs_to_ts);
-		compute_tile_ids(run, pic_in_ctbs_width, tile_info->col_bd,
+		compute_tile_ids(run, pic_in_ctbs_size, pic_in_ctbs_width,
+				 tile_info->col_bd,
 				 tile_info->row_bd,
 				 tile_info->ctb_addr_rs_to_ts,
 				 tile_info->tile_ids);
@@ -1345,6 +1422,36 @@ static int avd_hevc_compute_tiles(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	return 0;
 }
+
+#if IS_ENABLED(CONFIG_KUNIT)
+/* Build the tile tables of a picture and copy out tile_ids in tile scan order. */
+int avd_hevc_kunit_compute_tiles(const struct v4l2_ctrl_hevc_sps *sps,
+				 const struct v4l2_ctrl_hevc_pps *pps,
+				 u32 *tile_ids, size_t n)
+{
+	struct avd_hevc_run *run;
+	u32 width, height;
+	int ret;
+
+	run = kzalloc(sizeof(*run), GFP_KERNEL);
+	if (!run)
+		return -ENOMEM;
+	run->sps = sps;
+	run->pps = pps;
+	ret = avd_hevc_compute_tiles(NULL, run);
+	if (!ret) {
+		avd_hevc_pic_in_ctbs(sps, &width, &height);
+		memcpy(tile_ids, run->tile_info.tile_ids,
+		       min_t(size_t, n, (size_t)width * height) *
+			       sizeof(*tile_ids));
+	}
+	kfree(run->tile_info.ctb_addr_rs_to_ts);
+	kfree(run->tile_info.tile_ids);
+	kfree(run);
+	return ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_hevc_kunit_compute_tiles);
+#endif
 
 /*
  * The slice builder below expects the GStreamer layout: the slices tile the

@@ -377,6 +377,12 @@ bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps, size_t held,
 			 size_t held_bytes, u32 len, size_t decoded_size);
 bool avd_h264_scaling_is_flat(const struct v4l2_ctrl_h264_pps *pps,
 			      const struct v4l2_ctrl_h264_scaling_matrix *scaling);
+int avd_hevc_check_sps_geometry(const struct v4l2_ctrl_hevc_sps *sps);
+int avd_hevc_check_tiles(const struct v4l2_ctrl_hevc_sps *sps,
+			 const struct v4l2_ctrl_hevc_pps *pps);
+int avd_hevc_kunit_compute_tiles(const struct v4l2_ctrl_hevc_sps *sps,
+				 const struct v4l2_ctrl_hevc_pps *pps,
+				 u32 *tile_ids, size_t n);
 #endif
 
 extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;
