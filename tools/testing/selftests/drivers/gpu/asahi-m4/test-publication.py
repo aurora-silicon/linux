@@ -7,21 +7,45 @@ import subprocess
 
 production = kernel_root() / 'drivers/gpu/drm/asahi/g16/engine.rs'
 source = production.read_text()
+params_src = (production.parent / 'params.rs').read_text()
+queue_src = (production.parent / 'queue.rs').read_text()
+mod_src = (production.parent / 'mod.rs').read_text()
+hw_src = (production.parent / 'hw.rs').read_text()
+gpu_src = (production.parent.parent / 'gpu.rs').read_text()
 output = output_dir()
 
 
-def item(declaration):
-    start = source.index(declaration)
-    at = source.index('{', start)
+def item_in(src, declaration):
+    start = src.index(declaration)
+    at = src.index('{', start)
     depth, end = 1, at + 1
     while depth:
-        depth += (source[end] == '{') - (source[end] == '}')
+        depth += (src[end] == '{') - (src[end] == '}')
         end += 1
-    return source[start:end]
+    return src[start:end]
+
+
+def item(declaration):
+    return item_in(source, declaration)
+
+
+# Verify Queue struct declares `_credit: QueueCredit` after `scheduler: Scheduler`.
+queue_struct = item_in(queue_src, 'pub(crate) struct Queue {')
+sched_pos = queue_struct.index('scheduler: Scheduler')
+credit_pos = queue_struct.index('_credit: QueueCredit')
+assert sched_pos < credit_pos, 'QueueCredit must drop after Scheduler'
+assert queue_struct[credit_pos:].strip().endswith('}'), '_credit must be last Queue field'
+gpu_limits_fn = item_in(mod_src, 'fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits>')
+assert 'Some(params::queue_limits())' in gpu_limits_fn, gpu_limits_fn
+assert 'DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES' in gpu_src
+max_queues_line = next(line for line in hw_src.splitlines() if 'const MAX_QUEUES:' in line)
+flights_line = next(line for line in hw_src.splitlines() if 'const FLIGHTS:' in line)
 
 
 harness = r'''
 #![allow(dead_code, unused_variables)]
+#[path = "__USAGE__"]
+mod usage;
 use std::sync::{Arc, atomic::{AtomicU32,AtomicU64,AtomicBool,Ordering}};
 use std::collections::VecDeque;
 #[derive(Copy,Clone,Debug,PartialEq,Eq)] struct Error(i32);
@@ -655,9 +679,128 @@ mod queue_behind_scope {
         assert_eq!(fw2.session.checks.load(Ordering::Relaxed),1);
         assert_eq!(fw2.session.transports.load(Ordering::Relaxed),1);
     }
+    #[test]fn multi_queue_concurrent_compute_and_render_on_same_vm(){
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let q_comp=Arc::new(Queue{turn:AtomicU64::new(0),priority:2,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q_rend=Arc::new(Queue{turn:AtomicU64::new(0),priority:2,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let c_job=Arc::new(QueueBehindJob{
+            id:1,vm:vm1.clone(),queue:q_comp.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Compute(ComputeCommand{query_access:false})],
+            order:Order{sequence:1,wait_through:[None,None]},
+            extra_orders:vec![],
+            dependency:Ok(()),resources:Resources,
+        });
+        let r_job=Arc::new(QueueBehindJob{
+            id:2,vm:vm1.clone(),queue:q_rend.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Render(())],
+            order:Order{sequence:1,wait_through:[None,None]},
+            extra_orders:vec![],
+            dependency:Ok(()),resources:Resources,
+        });
+        let mut p=QueueBehindHost{
+            engine:QueueBehindEngine{ordinal:1,draw:0,flights:vec![QueueBehindFlight{
+                job:c_job.clone(),first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],fs_target:0,
+                initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
+            }]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+        };
+        // Queue 1 render queues directly behind Queue 0 compute on the same VM with no cross-engine barrier.
+        assert!(p.can_queue_behind(&r_job));
+        assert_eq!(p.cross_engine_wait(&r_job,0,command::COMPUTE),Ok(None));
+        // Symmetrically, Queue 0 compute queues directly behind Queue 1 render on the same VM.
+        p.engine.flights[0]=QueueBehindFlight{
+            job:r_job,first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x200,
+            initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
+        };
+        assert!(p.can_queue_behind(&c_job));
+        assert_eq!(p.cross_engine_wait(&c_job,0,command::RENDER),Ok(None));
+    }
+}
+#[allow(non_camel_case_types, deprecated)]
+mod queue_limits_scope {
+    use std::sync::Arc;
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    struct Error(i32);
+    const ENOSPC: Error = Error(28);
+    type Result<T = ()> = std::result::Result<T, Error>;
+    mod uapi {
+        pub const DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES: u64 = 1 << 2;
+        #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+        pub struct drm_asahi_queue_limits {
+            pub max_queues: u32,
+            pub max_in_flight_per_queue: u32,
+            pub flags: u32,
+            pub pad: u32,
+        }
+    }
+    mod hw {
+        pub mod sizes {
+            __FLIGHTS_LINE__
+            __MAX_QUEUES_LINE__
+        }
+    }
+    mod params {
+        use super::{hw, uapi};
+        __QUEUE_LIMITS_FN__
+    }
+    struct Gpu;
+    impl Gpu { __GPU_QUEUE_LIMITS_FN__ }
+    __QUEUE_CREDIT_STRUCT__
+    __QUEUE_CREDIT_IMPL__
+    __QUEUE_CREDIT_DROP__
+    #[test]
+    fn queue_limits_and_independent_queues_feature_match_g16_bounds() {
+        let gpu = Gpu;
+        let limits = gpu.queue_limits().expect("G16 must expose queue_limits");
+        assert_eq!(limits.max_queues, 58);
+        assert_eq!(limits.max_in_flight_per_queue, 32);
+        assert_eq!(limits.flags, 0);
+        assert_eq!(limits.pad, 0);
+        let mut features = 0u64;
+        if gpu.queue_limits().is_some() {
+            features |= uapi::DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES;
+        }
+        assert_ne!(features & uapi::DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES, 0);
+    }
+    #[test]
+    fn queue_credit_enforces_per_file_max_queues_without_starving_other_clients() {
+        let client_a = Arc::new(crate::usage::Client::new());
+        let client_b = Arc::new(crate::usage::Client::new());
+        let mut held_a = Vec::new();
+        for i in 0..hw::sizes::MAX_QUEUES {
+            held_a.push(QueueCredit::acquire(&client_a).expect("credit within MAX_QUEUES"));
+            assert_eq!(client_a.queues(), i + 1);
+        }
+        assert_eq!(QueueCredit::acquire(&client_a).err(), Some(ENOSPC));
+        assert_eq!(client_a.queues(), hw::sizes::MAX_QUEUES);
+        // A second DRM file (e.g. a compositor) keeps its own queue budget.
+        let compositor = QueueCredit::acquire(&client_b)
+            .expect("client A hitting MAX_QUEUES must not starve client B");
+        assert_eq!(client_b.queues(), 1);
+        drop(held_a.pop());
+        assert_eq!(client_a.queues(), hw::sizes::MAX_QUEUES - 1);
+        let reused = QueueCredit::acquire(&client_a).expect("dropped credit reusable");
+        assert_eq!(QueueCredit::acquire(&client_a).err(), Some(ENOSPC));
+        drop(compositor);
+        assert_eq!(client_b.queues(), 0);
+        drop(reused);
+        drop(held_a);
+        assert_eq!(client_a.queues(), 0);
+    }
 }
 '''
 harness = harness.replace('__LOGIC__', str(production.parent / 'recovery/logic.rs'))
+harness = harness.replace('__USAGE__', str(production.parent.parent / 'usage.rs'))
+harness = harness.replace('__FLIGHTS_LINE__', flights_line.strip())
+harness = harness.replace('__MAX_QUEUES_LINE__', max_queues_line.strip())
+harness = harness.replace('__QUEUE_LIMITS_FN__', item_in(params_src, 'pub(crate) fn queue_limits()'))
+harness = harness.replace('__GPU_QUEUE_LIMITS_FN__', gpu_limits_fn)
+harness = harness.replace('__QUEUE_CREDIT_STRUCT__', item_in(queue_src, 'struct QueueCredit {'))
+harness = harness.replace('__QUEUE_CREDIT_IMPL__', item_in(queue_src, 'impl QueueCredit {'))
+harness = harness.replace('__QUEUE_CREDIT_DROP__', item_in(queue_src, 'impl Drop for QueueCredit {'))
 for token, declaration in {
     '__PUBLICATION_ERROR__': 'enum PublicationError {',
     '__PICK__': 'fn pick(&self)',
@@ -685,7 +828,7 @@ for command in [rustc() + ['--edition=2021', '--test', str(unit), '-o', str(outp
     if result.returncode:
         raise SystemExit(result.returncode)
 (output/'publication.json').write_text(json.dumps({
-    'passed': True, 'tests': 24, 'cpu_only': True, 'hardware_execution': False,
+    'passed': True, 'tests': 57, 'cpu_only': True, 'hardware_execution': False,
     'scope': 'Verbatim production publication wrapper, selection, error isolation and descriptor-error containment branch; wire encoder, descriptor failure injection and transport replaced by CPU recorders.',
     'source_sha256': sha(production),
 }, indent=2)+'\n')

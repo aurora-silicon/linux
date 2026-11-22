@@ -9,7 +9,7 @@
 //! A backend whose firmware overlaps the commands of one queue charges through a [`Lane`]
 //! per queue, so each engine of a queue counts the union of its stage intervals.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[derive(Clone, Copy)]
 pub(crate) enum Engine {
@@ -21,13 +21,45 @@ pub(crate) enum Engine {
 /// One ledger per DRM file, shared by all of its queues and VMs.
 pub(crate) struct Client {
     ns: [AtomicU64; 3],
+    queues: AtomicU32,
 }
 
 impl Client {
     pub(crate) const fn new() -> Self {
         Self {
             ns: [const { AtomicU64::new(0) }; 3],
+            queues: AtomicU32::new(0),
         }
+    }
+
+    /// Reserves one logical queue credit against this DRM file up to `limit`.
+    pub(crate) fn try_acquire_queue(&self, limit: u32) -> bool {
+        let mut count = self.queues.load(Ordering::Acquire);
+        loop {
+            if count >= limit {
+                return false;
+            }
+            match self.queues.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(value) => count = value,
+            }
+        }
+    }
+
+    /// Releases one logical queue credit previously acquired from this DRM file.
+    pub(crate) fn release_queue(&self) {
+        let previous = self.queues.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queues(&self) -> u32 {
+        self.queues.load(Ordering::Acquire)
     }
 
     /// Called exactly once per retired stage, while its internal timestamps are retained.
@@ -317,5 +349,24 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(client.snapshot(), [0, 0, 80_000_000]);
+    }
+
+    #[test]
+    fn per_file_queue_credits_are_bounded_and_isolated() {
+        let a = Client::new();
+        let b = Client::new();
+        for i in 0..4u32 {
+            assert!(a.try_acquire_queue(4));
+            assert_eq!(a.queues(), i + 1);
+        }
+        assert!(!a.try_acquire_queue(4));
+        assert_eq!(a.queues(), 4);
+        assert!(b.try_acquire_queue(4));
+        assert_eq!(b.queues(), 1);
+        a.release_queue();
+        assert_eq!(a.queues(), 3);
+        assert!(a.try_acquire_queue(4));
+        b.release_queue();
+        assert_eq!(b.queues(), 0);
     }
 }

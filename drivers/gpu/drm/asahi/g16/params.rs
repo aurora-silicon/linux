@@ -3,10 +3,10 @@
 //! Module parameters and the GET_PARAMS identity.
 //!
 //! With the shared `file.rs` additions (VM_STATUS and VM_STATUS_MIRROR from `supports_vm_status`,
-//! SOFT_FAULTS suppressed by `soft_faults`), G16 advertises per-command input readiness/errors,
-//! exact queue-local historical prefixes, fragment-only render barriers, and
-//! `COMPUTE_NO_QUERY_ACCESS`. No independent hardware queue reservation or ray queries are
-//! advertised.
+//! SOFT_FAULTS suppressed by `soft_faults`, and `INDEPENDENT_QUEUES` from `queue_limits`), G16
+//! advertises per-command input readiness/errors, exact queue-local historical prefixes,
+//! fragment-only render barriers, independent logical queues, and `COMPUTE_NO_QUERY_ACCESS`.
+//! Ray queries are not advertised.
 
 use kernel::{prelude::*, uapi};
 
@@ -107,4 +107,14 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
         *(params.core_masks.get_mut(i).ok_or(EIO)?) = (*mask).into();
     }
     Ok(())
+}
+
+/// QUEUE_LIMITS: a policy bound on logical queues (they own no firmware state) and the
+/// number of prefixes in flight.
+pub(crate) fn queue_limits() -> uapi::drm_asahi_queue_limits {
+    uapi::drm_asahi_queue_limits {
+        max_queues: hw::sizes::MAX_QUEUES,
+        max_in_flight_per_queue: hw::sizes::FLIGHTS as u32,
+        ..Default::default()
+    }
 }

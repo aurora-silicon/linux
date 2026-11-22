@@ -662,7 +662,7 @@ impl gpu::Gpu for Gpu {
     }
 
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
-        None
+        Some(params::queue_limits())
     }
 
     fn base_clock_hz(&self) -> u32 {
