@@ -631,7 +631,7 @@ static int isp_of_read_coord(struct device *dev, struct device_node *np,
 /*
  * Two camera properties of the sensor-presets node (DT), both optional:
  *
- * apple,mlvnr-sensor-config = <binned full>: with MLVNR (apple_isp.mlvnr),
+ * apple,mlvnr-sensor-config = <binned full>: with MLVNR (apple_isp_ane_probe()),
  * the presets of the binned sensor mode move to the full-resolution one,
  * input and crops doubled. Apple's MLVNR network takes only certain frame
  * shapes: on the J813/J815 IMX958 the binned config 8 (1520x1440) is not
@@ -700,6 +700,7 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 	struct device *dev = isp->dev;
 	struct isp_preset *preset;
 	u32 lens_circle, mlvnr_config[2] = { U32_MAX, U32_MAX };
+	bool mlvnr;
 	int err = 0;
 
 	struct device_node *np __free(device_node) =
@@ -722,11 +723,9 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 
 	if (of_property_read_u32(np, "apple,lens-circle", &lens_circle))
 		lens_circle = 0;
-	if (apple_isp_ane_wanted() &&
-	    of_property_read_u32_array(np, "apple,mlvnr-sensor-config", mlvnr_config, 2)) {
-		dev_info(dev, "MLVNR: no apple,mlvnr-sensor-config: the presets keep their sensor modes\n");
+	mlvnr = !of_property_read_u32_array(np, "apple,mlvnr-sensor-config", mlvnr_config, 2);
+	if (!apple_isp_ane_probe(isp, mlvnr))
 		mlvnr_config[0] = U32_MAX;
-	}
 
 	preset = isp->presets;
 	for_each_child_of_node_scoped(np, child) {

@@ -408,6 +408,7 @@ struct apple_isp {
 	u32 ane_next_id, ane_ids_given;
 	u32 ane_doorbell_sel;
 	char ane_afpp[64];
+	bool mlvnr; /* on: decided at probe (apple_isp_ane_probe()) */
 	struct dentry *ane_debugfs;
 	u32 cam_connections_scheme;
 	struct isp_preset *presets;

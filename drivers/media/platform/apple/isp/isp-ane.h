@@ -4,8 +4,8 @@
 
 #include "isp-drv.h"
 
-/* MLVNR asked for (apple_isp.mlvnr, read at probe). */
-bool apple_isp_ane_wanted(void);
+/* At probe, before the presets: whether MLVNR is on (sets isp->mlvnr). */
+bool apple_isp_ane_probe(struct apple_isp *isp, bool has_config);
 int apple_isp_ane_init(struct apple_isp *isp);
 void apple_isp_ane_exit(struct apple_isp *isp);
 int apple_isp_ane_start(struct apple_isp *isp);

@@ -10,14 +10,15 @@
  * uses (CISP_CMD_APPLE_CH_MLVNR_MODE_CONFIG_SET).
  *
  * Enabling MLVNR without a live endpoint stalls the stream, so it is only
- * enabled once every step here has succeeded. It is opt-in (mlvnr=1), the
- * ANE functions are taken with symbol_get() so this driver loads without
- * the ANE driver, and without the network, the ANE or its driver the camera
- * works as before.
+ * enabled once every step here has succeeded. It is on where the system has
+ * what it needs (apple_isp_ane_probe()); the ANE functions are taken with
+ * symbol_get() so this driver loads without the ANE driver, and without the
+ * network, the ANE or its driver the camera works as before.
  *
  * Based on Ryan Murray's H16 draft (camera/isp-ane-mlvnr).
  */
 #include <linux/debugfs.h>
+#include <linux/firmware.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/string.h>
@@ -48,19 +49,6 @@
 #define ISP_MLVNR_FPS 30
 #define ISP_MLVNR_RAMP 30
 
-/*
- * Read at probe: with MLVNR, the presets move to the full-resolution sensor
- * mode the DT names for it (apple,mlvnr-sensor-config), the only frames the
- * network takes.
- */
-static bool mlvnr;
-module_param(mlvnr, bool, 0444);
-MODULE_PARM_DESC(mlvnr, "ML noise reduction on the neural engine (needs the ANE driver and apple/ispane-<board>.afpp)");
-
-bool apple_isp_ane_wanted(void)
-{
-	return mlvnr;
-}
 
 /*
  * The auto mode's total-gain thresholds, 1/256 steps: macOS's 14x / 11x. For
@@ -154,21 +142,69 @@ static bool isp_ane_syms_get(void)
 	return false;
 }
 
-/* The network is per board: apple,j815 -> apple/ispane-j815.afpp. */
+static struct device_node *isp_ane_node(struct apple_isp *isp)
+{
+	struct device_node *np = of_parse_phandle(isp->dev->of_node, "apple,ane", 0);
+
+	if (!np && isp->hw->ane_compatible)
+		np = of_find_compatible_node(NULL, NULL, isp->hw->ane_compatible);
+	return np;
+}
+
+/*
+ * At probe, before the presets: MLVNR is on when the system has what it
+ * needs. The ISP must know the ANE's doorbell, the DT must name the sensor
+ * mode the network takes (@has_config, apple,mlvnr-sensor-config), the ANE
+ * must be enabled in the DT, and the board's network must be installed
+ * (per board: apple,j815 -> apple/ispane-j815.afpp; the ANE driver loads
+ * it). One line says why it is off where the platform could run it. The
+ * presets then move to the network's sensor mode, so this is decided once;
+ * if the link fails later, that mode streams without MLVNR.
+ */
+bool apple_isp_ane_probe(struct apple_isp *isp, bool has_config)
+{
+	struct device_node *np;
+	const struct firmware *fw;
+	const char *board, *model;
+	u8 head[16];
+	bool ane;
+	int err;
+
+	isp->mlvnr = false;
+	if (!isp->hw->ane_doorbell_known)
+		return false;
+	if (of_property_read_string_index(of_root, "compatible", 0, &model))
+		return false;
+	board = strchr(model, ',');
+	snprintf(isp->ane_afpp, sizeof(isp->ane_afpp), "apple/ispane-%s.afpp",
+		 board ? board + 1 : model);
+
+	np = isp_ane_node(isp);
+	ane = np && of_device_is_available(np);
+	of_node_put(np);
+	if (!has_config || !ane) {
+		dev_info(isp->dev, "MLVNR: off: %s\n", !has_config ?
+			 "no apple,mlvnr-sensor-config" : "no neural engine in the DT");
+		return false;
+	}
+	/* Only whether it is there: the ANE driver reads it whole. */
+	err = request_partial_firmware_into_buf(&fw, isp->ane_afpp, isp->dev, head,
+						sizeof(head), 0);
+	if (err) {
+		dev_info(isp->dev, "MLVNR: off: %s not installed (%d)\n", isp->ane_afpp, err);
+		return false;
+	}
+	release_firmware(fw);
+	isp->mlvnr = true;
+	return true;
+}
+
 int apple_isp_ane_init(struct apple_isp *isp)
 {
-	const char *board, *model;
-
-	if (mlvnr) {
+	if (isp->mlvnr) {
 		isp->ane_debugfs = debugfs_create_dir("apple-isp", NULL);
 		debugfs_create_u32("mlvnr_gain_enter", 0600, isp->ane_debugfs, &mlvnr_gain_enter);
 		debugfs_create_u32("mlvnr_gain_exit", 0600, isp->ane_debugfs, &mlvnr_gain_exit);
-	}
-
-	if (!of_property_read_string_index(of_root, "compatible", 0, &model)) {
-		board = strchr(model, ',');
-		snprintf(isp->ane_afpp, sizeof(isp->ane_afpp), "apple/ispane-%s.afpp",
-			 board ? board + 1 : model);
 	}
 	return 0;
 }
@@ -185,7 +221,7 @@ void apple_isp_ane_exit(struct apple_isp *isp)
 }
 
 /*
- * The link, at the first firmware start with mlvnr=1 rather than at probe:
+ * The link, at the first firmware start with MLVNR rather than at probe:
  * the ANE comes up on its own schedule and the camera must not wait for it.
  */
 static int isp_ane_link(struct apple_isp *isp)
@@ -196,12 +232,10 @@ static int isp_ane_link(struct apple_isp *isp)
 	if (isp->ane)
 		return 0;
 	if (!isp_ane_syms_get()) {
-		dev_info(isp->dev, "MLVNR: the neural engine driver is not loaded\n");
+		dev_info_once(isp->dev, "MLVNR: off: the neural engine driver is not loaded\n");
 		return -ENODEV;
 	}
-	np = of_parse_phandle(isp->dev->of_node, "apple,ane", 0);
-	if (!np && isp->hw->ane_compatible)
-		np = of_find_compatible_node(NULL, NULL, isp->hw->ane_compatible);
+	np = isp_ane_node(isp);
 	if (!np)
 		return -ENODEV;
 	link = isp_ane.get(isp->dev, np);
@@ -287,9 +321,7 @@ int apple_isp_ane_start(struct apple_isp *isp)
 	struct isp_surf *rings;
 	int err;
 
-	if (!READ_ONCE(mlvnr) || isp->ane_rings || isp->fw_recovering)
-		return 0;
-	if (!isp->ane_afpp[0] || !isp->hw->ane_doorbell_known)
+	if (!isp->mlvnr || isp->ane_rings || isp->fw_recovering)
 		return 0;
 	if (!isp_mlvnr_presets_ok(isp))
 		return 0;
