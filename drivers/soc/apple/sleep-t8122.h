@@ -660,6 +660,32 @@ static void t8122_trial_asc_census(struct apple_sleep *s, const char *when)
 	}
 }
 
+/*
+ * TRIAL ONLY (not for #2572): read-only dump of every non-zero PMGR power-state word in the
+ * sleep node's "ps" window, eight per line, to diff against macOS's wide capture at its commit.
+ */
+static void t8122_trial_ps_dump(struct apple_sleep *s, const char *when)
+{
+	unsigned int n = resource_size(&s->ps_res) / 4, i, k = 0;
+	char line[8 * 20 + 1];
+	int len = 0;
+
+	for (i = 0; i < n; i++) {
+		u32 v = readl(s->ps + 4 * i);
+
+		if (!v)
+			continue;
+		len += scnprintf(line + len, sizeof(line) - len, " %x=%x", 4 * i, v);
+		if (++k % 8 == 0) {
+			dev_info(s->dev, "J613 TRIAL PS %s:%s\n", when, line);
+			len = 0;
+		}
+	}
+	if (len)
+		dev_info(s->dev, "J613 TRIAL PS %s:%s\n", when, line);
+	dev_info(s->dev, "J613 TRIAL PS %s: %u non-zero of %u words at %pa\n", when, k, n, &s->ps_res.start);
+}
+
 static int t8122_sleep_begin(struct apple_sleep *s)
 {
 	t8122_trial_asc_census(s, "entry");
@@ -934,6 +960,7 @@ static void t8122_sleep_prepare_regs(struct apple_sleep *s)
 	}
 	t8122_sleep_match(s);
 	t8122_trial_asc_census(s, "after the first stops");
+	t8122_trial_ps_dump(s, "after the first stops");
 	t8122_witness_take(s, 1);
 	t8122_witness_dc(1);
 	if (t8122_wdt_clear == 2) {
