@@ -225,8 +225,16 @@ pub(crate) struct Shared {
     pub(crate) publish_wake: AtomicBool,
     /// CPU that last submitted work, for placing the per-CPU completion worker.
     pub(crate) submitter: AtomicU32,
+    /// CPU whose cluster currently restricts `events_unbound` (`u32::MAX` before first pin).
+    unbound_cluster_cpu: AtomicU32,
+    /// Serializes best-effort `events_unbound.restrict()` updates without blocking concurrent
+    /// submitters on `wq_pool_mutex`.
+    unbound_pinning: AtomicBool,
     /// Number of flights currently active under `Shared::state`, for poll worker placement.
     pub(crate) active_flights: AtomicU32,
+    /// Smoothed recent flight duration in microseconds (0 before first retirement), used to
+    /// shorten the fallback hrtimer interval on sub-100 us workloads.
+    pub(crate) ewma_flight_us: AtomicU32,
     /// Monotonic timestamp (ns) of the previous submit, for active-burst wait hints.
     pub(crate) last_submit_ns: AtomicU64,
     /// Consecutive back-to-back submits within [`WAIT_HINT_GAP_NS`].
@@ -367,9 +375,31 @@ impl WorkItem<UNBOUND_POLL_WORK> for Shared {
 
 impl Shared {
     /// Records the submitting CPU and burst cadence for completion placement and wait hints.
+    /// Runs in process context during SUBMIT; keeps `events_unbound` pinned to the submitter's
+    /// CPU cluster so pipelined completion polls stay on the same cluster (avoiding E-core
+    /// wake bounces while still sparing the submitter CPU itself).
     pub(crate) fn note_submitter(&self) {
-        self.submitter
-            .store(kernel::cpu::CpuId::current().as_u32(), Ordering::Relaxed);
+        let cpu = kernel::cpu::CpuId::current();
+        self.submitter.store(cpu.as_u32(), Ordering::Relaxed);
+        let pinned = self.unbound_cluster_cpu.load(Ordering::Acquire);
+        if pinned != cpu.as_u32()
+            && !kernel::cpu::CpuId::from_u32(pinned)
+                .is_some_and(|p| kernel::cpumask::Cpumask::cluster_of(p).test(cpu))
+            && self
+                .unbound_pinning
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            if self
+                .events_unbound
+                .restrict(kernel::cpumask::Cpumask::cluster_of(cpu))
+                .is_ok()
+            {
+                self.unbound_cluster_cpu
+                    .store(cpu.as_u32(), Ordering::Release);
+            }
+            self.unbound_pinning.store(false, Ordering::Release);
+        }
         let now = engine::now_ns();
         let prev = self.last_submit_ns.swap(now, Ordering::Relaxed);
         if prev != 0 && now.wrapping_sub(prev) <= WAIT_HINT_GAP_NS {
@@ -384,6 +414,17 @@ impl Shared {
         } else {
             self.wait_hint_streak.store(1, Ordering::Relaxed);
         }
+    }
+
+    /// Updates the lock-free EWMA of recent retired flight durations (microseconds).
+    pub(crate) fn note_flight_us(&self, us: u32) {
+        let prev = self.ewma_flight_us.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            us
+        } else {
+            (prev.saturating_mul(3).saturating_add(us)) / 4
+        };
+        self.ewma_flight_us.store(next, Ordering::Relaxed);
     }
 
     /// Temporary `drm_syncobj_wait` capacity hint while a client is submitting back to back.
@@ -522,6 +563,8 @@ pub(crate) struct Firmware {
     pub(crate) vms: Arc<vm::Registry>,
     /// Monotonic timestamp (ns) of the last full housekeeping pass (power, health, hang poll).
     pub(crate) last_housekeeping_ns: u64,
+    /// Monotonic timestamp (ns) of the last auxiliary (log/ktrace/stats) ring drain.
+    pub(crate) last_aux_drain_ns: u64,
 }
 
 /// A G16 GPU.
@@ -573,7 +616,10 @@ impl Gpu {
                 evented: AtomicBool::new(false),
                 publish_wake: AtomicBool::new(false),
                 submitter: AtomicU32::new(u32::MAX),
+                unbound_cluster_cpu: AtomicU32::new(u32::MAX),
+                unbound_pinning: AtomicBool::new(false),
                 active_flights: AtomicU32::new(0),
+                ewma_flight_us: AtomicU32::new(0),
                 last_submit_ns: AtomicU64::new(0),
                 wait_hint_streak: AtomicU32::new(0),
                 wait_hint_until_ns: AtomicU64::new(0),
@@ -723,6 +769,7 @@ impl Firmware {
                 pools,
                 vms,
                 last_housekeeping_ns: 0,
+                last_aux_drain_ns: 0,
             },
         );
         if let Err(e) = firmware.init_graphs() {

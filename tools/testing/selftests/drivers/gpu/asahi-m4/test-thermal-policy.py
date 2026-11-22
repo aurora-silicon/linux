@@ -205,7 +205,7 @@ for path, call in [
         ('power.rs', 'if idle && self.power.clpc_hold.expire(now) {'),
         ('recovery.rs', 'self.power.release_clpc_now();'),
         ('sleep.rs', 'firmware.power.release_clpc_now();'),
-        ('poll.rs', 'shared.feed.note_flight(f.published_ns, now_ns());'),
+        ('poll.rs', 'shared.feed.note_flight(f.published_ns, now);'),
         ('mod.rs', 'self.feed.begin_shutdown();'),
         ('sleep.rs', 'self.feed.pause();'),
         ('sleep.rs', 'self.feed_wq.drain();'),

@@ -51,6 +51,7 @@ struct Error(i32);
 type Result<T = ()> = std::result::Result<T, Error>;
 
 const HOUSEKEEPING_NS: u64 = 1_000_000;
+const AUX_DRAIN_NS: u64 = 10_000_000;
 const EVENT_RETIRE_POLLS: u32 = 11;
 
 thread_local! {
@@ -195,6 +196,8 @@ struct Shared {
     publish_wake: AtomicBool,
     rearmed: Cell<u32>,
     idle_power_polls: Cell<u32>,
+    rearm_soon: Cell<u32>,
+    poll_now_calls: Cell<u32>,
 }
 impl Shared {
     fn new() -> Arc<Self> {
@@ -204,10 +207,18 @@ impl Shared {
             publish_wake: AtomicBool::new(false),
             rearmed: Cell::new(0),
             idle_power_polls: Cell::new(0),
+            rearm_soon: Cell::new(0),
+            poll_now_calls: Cell::new(0),
         })
     }
-    fn rearm(&self, _soon: bool) {
+    fn rearm(&self, soon: bool) {
         self.rearmed.set(self.rearmed.get() + 1);
+        if soon {
+            self.rearm_soon.set(self.rearm_soon.get() + 1);
+        }
+    }
+    fn poll_now(&self) {
+        self.poll_now_calls.set(self.poll_now_calls.get() + 1);
     }
     fn arm_idle_power_poll(&self, _firmware: &Firmware) {
         self.idle_power_polls.set(self.idle_power_polls.get() + 1);
@@ -252,6 +263,7 @@ struct Firmware {
     power: Power,
     slots: Slots,
     last_housekeeping_ns: u64,
+    last_aux_drain_ns: u64,
     // Test script knobs for retire_once / publish / housekeeping observation.
     retire_on_call: bool,
     unfreeze_on_hang_check: bool,
@@ -262,6 +274,7 @@ struct Firmware {
     publish_full_calls: u32,
     publish_checked_calls: u32,
     housekeeping_calls: u32,
+    aux_drain_calls: u32,
     power_calls: u32,
 }
 
@@ -296,6 +309,7 @@ impl Firmware {
             power: Power::default(),
             slots: Slots::default(),
             last_housekeeping_ns: 0,
+            last_aux_drain_ns: 0,
             retire_on_call: false,
             unfreeze_on_hang_check: false,
             drain_stage_delta: 0,
@@ -305,6 +319,7 @@ impl Firmware {
             publish_full_calls: 0,
             publish_checked_calls: 0,
             housekeeping_calls: 0,
+            aux_drain_calls: 0,
             power_calls: 0,
         }
     }
@@ -326,6 +341,10 @@ impl Firmware {
     fn drain_rings(&mut self) -> Result {
         Ok(())
     }
+    fn drain_auxiliary_rings(&mut self) -> Result {
+        self.aux_drain_calls += 1;
+        Ok(())
+    }
     fn answer_growth(&mut self) -> Result {
         Ok(())
     }
@@ -339,11 +358,7 @@ impl Firmware {
     fn fail_stop(&mut self, error: Error, _done: &mut Completions) {
         self.recovery.failed = Some(error);
     }
-    fn run_housekeeping(&mut self, _done: &mut Completions) -> Result {
-        self.housekeeping_calls += 1;
-        self.last_housekeeping_ns = now_ns();
-        Ok(())
-    }
+    __RUN_HOUSEKEEPING__
     fn retire_once(&mut self, done: &mut Completions) -> Result<bool> {
         self.retire_calls += 1;
         self.events.stage_events += self.drain_stage_delta;
@@ -417,6 +432,86 @@ fn submit_locked_preserves_evented_when_irq_precedes_receipt() {
         .unwrap();
     assert_eq!(fw.retire_calls, 1);
     assert!(shared.evented.load(Ordering::Acquire));
+}
+
+#[test]
+fn submit_locked_defers_housekeeping_and_arms_short_repoll_on_coalesced_event() {
+    // Housekeeping due (> 1 ms): submit_locked must NOT run synchronous publish(); it
+    // calls publish_checked() and kicks poll_now() so housekeeping runs off SUBMIT.
+    CLOCK.with(|c| c.set(5_000_000));
+    let shared = Shared::new();
+    let mut fw = Firmware::new();
+    fw.last_housekeeping_ns = 1_000_000;
+    fw.engine.flights.push(Flight {
+        computes: 1,
+        renders: 0,
+        target: 0x100,
+        fs_target: 0,
+    });
+    fw.engine.flights.push(Flight {
+        computes: 1,
+        renders: 0,
+        target: 0x200,
+        fs_target: 0,
+    });
+    fw.engine.target = 0x200;
+
+    let mut done = vec![];
+    shared
+        .submit_locked(&mut fw, Arc::new(Job { id: 3 }), &mut done)
+        .unwrap();
+    assert_eq!(fw.publish_full_calls, 0);
+    assert_eq!(fw.publish_checked_calls, 1);
+    assert_eq!(fw.retire_calls, 0);
+    assert_eq!(shared.poll_now_calls.get(), 1);
+    assert_eq!(shared.rearm_soon.get(), 0);
+
+    // Coalesced EP 0x20 event retires flight 0 while flight 1 stays active -> short repoll.
+    shared.evented.store(true, Ordering::Release);
+    fw.retire_on_call = true;
+    shared
+        .submit_locked(&mut fw, Arc::new(Job { id: 4 }), &mut done)
+        .unwrap();
+    assert_eq!(fw.retire_calls, 1);
+    assert_eq!(fw.engine.flights.len(), 1);
+    assert_eq!(shared.rearm_soon.get(), 1);
+}
+
+#[test]
+fn run_housekeeping_throttles_auxiliary_ring_drain_while_flights_active() {
+    CLOCK.with(|c| c.set(1_000_000));
+    let mut fw = Firmware::new();
+    fw.last_aux_drain_ns = 1_000_000;
+    fw.engine.flights.push(Flight {
+        computes: 1,
+        renders: 0,
+        target: 0x100,
+        fs_target: 0,
+    });
+    let mut done = vec![];
+
+    // Within AUX_DRAIN_NS (10 ms) while busy: skip auxiliary ring drain.
+    CLOCK.with(|c| c.set(5_000_000));
+    fw.run_housekeeping(&mut done).unwrap();
+    assert_eq!(fw.aux_drain_calls, 0);
+
+    // Past AUX_DRAIN_NS while busy: drain once and advance timestamp.
+    CLOCK.with(|c| c.set(11_000_000));
+    fw.run_housekeeping(&mut done).unwrap();
+    assert_eq!(fw.aux_drain_calls, 1);
+
+    // Recovery pending bypasses throttle immediately.
+    CLOCK.with(|c| c.set(12_000_000));
+    fw.recovery.pending = true;
+    fw.run_housekeeping(&mut done).unwrap();
+    assert_eq!(fw.aux_drain_calls, 2);
+
+    // Idle bypasses throttle immediately.
+    CLOCK.with(|c| c.set(13_000_000));
+    fw.recovery.pending = false;
+    fw.engine.flights.clear();
+    fw.run_housekeeping(&mut done).unwrap();
+    assert_eq!(fw.aux_drain_calls, 3);
 }
 
 #[test]
@@ -927,6 +1022,7 @@ mod resnap_sync_test {
 
     struct Shared {
         sleeping: AtomicBool,
+        ewma_flight_us: AtomicU32,
         resnap_deadline_ns: AtomicU64,
         backup_deadline_ns: AtomicU64,
         resnap_handle: Lock<Option<Handle>>,
@@ -939,6 +1035,7 @@ mod resnap_sync_test {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 sleeping: AtomicBool::new(false),
+                ewma_flight_us: AtomicU32::new(0),
                 resnap_deadline_ns: AtomicU64::new(0),
                 backup_deadline_ns: AtomicU64::new(0),
                 resnap_handle: Lock::new(None),
@@ -958,7 +1055,27 @@ mod resnap_sync_test {
         }
 
         __CANCEL_RESNAP__
+        __REARM_US__
         __REARM__
+    }
+
+    #[test]
+    fn adaptive_rearm_us_scales_with_short_flight_ewma() {
+        let shared = Shared::new();
+        assert_eq!(shared.rearm_us(false), 100);
+        assert_eq!(shared.rearm_us(true), 25);
+
+        // Very short 30 us flights clamp to repoll_us (25 us).
+        shared.ewma_flight_us.store(30, Ordering::Relaxed);
+        assert_eq!(shared.rearm_us(false), 25);
+
+        // 100 us flights halve to 50 us.
+        shared.ewma_flight_us.store(100, Ordering::Relaxed);
+        assert_eq!(shared.rearm_us(false), 50);
+
+        // Heavy 250+ us flights stay at full resnap_us (100 us).
+        shared.ewma_flight_us.store(250, Ordering::Relaxed);
+        assert_eq!(shared.rearm_us(false), 100);
     }
 
     #[test]
@@ -1136,9 +1253,11 @@ harness = harness.replace(
 for token, decl in {
     '__SUBMIT_LOCKED__': 'fn submit_locked(',
     '__POLL_STEP__': 'pub(crate) fn poll_step(',
+    '__RUN_HOUSEKEEPING__': 'pub(crate) fn run_housekeeping(',
     '__OLDEST_TERMINAL_EVENTS__': 'fn oldest_terminal_events(',
     '__OLDEST_STAMP_REACHED__': 'fn oldest_stamp_reached(',
     '__CANCEL_RESNAP__': 'pub(crate) fn cancel_resnap(',
+    '__REARM_US__': 'pub(crate) fn rearm_us(',
     '__REARM__': 'pub(crate) fn rearm(',
     '__POLL_NOW__': 'pub(crate) fn poll_now(',
 }.items():
@@ -1166,7 +1285,7 @@ for command in [
     json.dumps(
         {
             'passed': True,
-            'tests': 14,
+            'tests': 17,
             'cpu_only': True,
             'hardware_execution': False,
             'scope': 'Verbatim production submit_locked inline retirement and poll_step TA-only non-spin logic.',

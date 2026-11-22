@@ -43,6 +43,8 @@ use crate::module_parameters;
 
 /// Cadence of periodic housekeeping (power governor, window health, administrative hang check).
 const HOUSEKEEPING_NS: u64 = 1_000_000;
+/// Minimum interval between auxiliary log/ktrace/stats ring drains while flights are active.
+const AUX_DRAIN_NS: u64 = 10_000_000;
 /// Maximum trailing receipt polls after an EP 0x20 event (stepped 1/2/3/4/5 us, 45 us total).
 const EVENT_RETIRE_POLLS: u32 = 11;
 /// Minimum interval between 1-jiffy delayed-work safety backup rearms (2 ms).
@@ -208,17 +210,15 @@ impl Shared {
             let had_flights = !firmware.engine.flights.is_empty();
             let was_evented = had_flights && self.evented.swap(false, Ordering::AcqRel);
             let recovery_pending = firmware.recovery_pending().unwrap_or(true);
+            let mut retired_any = false;
             let mut pub_res = Ok(());
             if had_flights
-                && (was_evented
-                    || housekeeping_due
-                    || recovery_pending
-                    || firmware.oldest_stamp_reached())
+                && (was_evented || recovery_pending || firmware.oldest_stamp_reached())
             {
                 let stage_before = firmware.events.stage_events;
                 let term_before = firmware.oldest_terminal_events();
                 pub_res = firmware.session.transport().and_then(|()| {
-                    let retired_any = firmware.retire_once(done)?;
+                    retired_any = firmware.retire_once(done)?;
                     firmware.answer_growth()?;
                     if firmware.recovery.receipt_fault || recovery_pending {
                         firmware.check_hangs(done)?;
@@ -238,10 +238,11 @@ impl Shared {
                 });
             }
             if pub_res.is_ok() {
-                pub_res = if housekeeping_due || recovery_pending {
+                pub_res = if recovery_pending {
                     let r = firmware.publish(done);
                     if r.is_ok() {
                         firmware.last_housekeeping_ns = now;
+                        firmware.last_aux_drain_ns = now;
                     }
                     r
                 } else {
@@ -259,10 +260,18 @@ impl Shared {
                 self.fail_stop(error);
             }
             if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
-                self.rearm(firmware.engine.chan_wait);
+                // If an EP 0x20 event retired an older flight while later flights remain active,
+                // arm a short repoll in case another completion coalesced into that interrupt.
+                self.rearm(
+                    firmware.engine.chan_wait
+                        || (was_evented && retired_any && !firmware.engine.flights.is_empty()),
+                );
             } else {
                 firmware.power.report_work(false);
                 self.arm_idle_power_poll(firmware);
+            }
+            if housekeeping_due && !recovery_pending && pub_res.is_ok() {
+                self.poll_now();
             }
         }
         accepted
@@ -437,16 +446,33 @@ impl Shared {
         };
     }
 
+    /// Computes the hrtimer repoll delay in microseconds: `repoll_us` when `soon`, otherwise
+    /// adapts down to `clamp(ewma_flight_us / 2, repoll_us, resnap_us)` on sub-`2 * resnap_us`
+    /// bursts while respecting `g16_repoll_us == 0` as a full disable of shortened repolls.
+    pub(crate) fn rearm_us(&self, soon: bool) -> u32 {
+        let resnap = params::resnap_us();
+        if module_parameters::g16_repoll_us.value() == 0 {
+            return resnap;
+        }
+        let repoll = params::repoll_us();
+        if soon {
+            return repoll;
+        }
+        let ewma = self.ewma_flight_us.load(Ordering::Relaxed);
+        if ewma != 0 && ewma < resnap.saturating_mul(2) {
+            (ewma / 2).clamp(repoll, resnap)
+        } else {
+            resnap
+        }
+    }
+
     /// Re-checks a published command soon: hrtimer, with a throttled 1-jiffy backup; sooner while
     /// a ready prefix waits for record consumption or a post-event receipt tail is settling.
     pub(crate) fn rearm(self: &Arc<Self>, soon: bool) {
         if self.sleeping.load(Ordering::Acquire) {
             return;
         }
-        let mut us = params::resnap_us();
-        if soon && module_parameters::g16_repoll_us.value() != 0 {
-            us = params::repoll_us();
-        }
+        let us = self.rearm_us(soon);
         let now = now_ns();
         let target_ns = now.saturating_add(u64::from(us) * 1000);
         let armed_ns = self.resnap_deadline_ns.load(Ordering::Acquire);
@@ -532,6 +558,7 @@ impl Firmware {
             self.objects.health()?;
             self.service_power()?;
             self.last_housekeeping_ns = now;
+            self.last_aux_drain_ns = now;
             ran_housekeeping = true;
             self.drain_rings()?;
             if self.recovery_idle()? && self.engine.pending.is_empty() {
@@ -647,12 +674,17 @@ impl Firmware {
         self.session.check()?;
         self.objects.health()?;
         self.service_power()?;
-        self.drain_auxiliary_rings()?;
-        self.last_housekeeping_ns = now_ns();
-        if !self.engine.flights.is_empty()
-            || self.recovery.receipt_fault
-            || self.recovery_pending()?
+        let now = now_ns();
+        let recovery_pending = self.recovery.receipt_fault || self.recovery_pending()?;
+        if self.engine.flights.is_empty()
+            || recovery_pending
+            || now.wrapping_sub(self.last_aux_drain_ns) >= AUX_DRAIN_NS
         {
+            self.drain_auxiliary_rings()?;
+            self.last_aux_drain_ns = now;
+        }
+        self.last_housekeeping_ns = now;
+        if !self.engine.flights.is_empty() || recovery_pending {
             self.check_hangs(done)?;
         }
         Ok(())
@@ -1208,7 +1240,12 @@ impl Firmware {
         if result.is_ok() {
             self.stat_retire(&f, retired_ticks);
             if let Some(shared) = &self.engine.shared {
-                shared.feed.note_flight(f.published_ns, now_ns());
+                let now = now_ns();
+                shared.feed.note_flight(f.published_ns, now);
+                if f.published_ns != 0 && now > f.published_ns {
+                    let dur_us = ((now - f.published_ns) / 1000).clamp(1, 10_000) as u32;
+                    shared.note_flight_us(dur_us);
+                }
             }
         }
         if receipt.owner_retired() {
