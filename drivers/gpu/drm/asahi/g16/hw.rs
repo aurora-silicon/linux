@@ -571,16 +571,17 @@ pub(crate) mod client {
     pub(crate) const CLIENT_APERTURE: Range<u64> = 0x7000000000..0x7100000000;
     pub(crate) const COMPACT_WINDOW: Range<u64> = 0x1000000000..0x9000000000;
 
-    // Persistent compute units, each in its own 64 MiB interval and reused across
-    // application queues. Units 0 and 1 keep their original placement below the render
-    // allocators; further units (up to [`super::sizes::COMPUTE_UNITS`]) live from
-    // 0x7080000000 up to the PB heap (0x70c0000000), clear of the dynamic PB page-list
-    // range 0x7040000000..0x7080000000. Every alias is inside Mesa's reserved driver hole.
+    // Persistent compute units reused across application queues. Units 0 and 1 keep their
+    // original 64 MiB placement below the render allocators; extension units (2..COMPUTE_UNITS)
+    // pack at a 40 MiB stride from 0x7080000000 up to the PB heap (0x70c0000000), clear of the
+    // dynamic PB page-list range 0x7040000000..0x7080000000 and leaving 7.25 MiB guard above
+    // each unit's 32.75 MiB footprint (`0x20c0000`). Every alias is inside Mesa's reserved hole.
+    pub(crate) const EXT_COMPUTE_STRIDE: u64 = 0x02800000;
     pub(crate) const fn compute_base(k: u64) -> u64 {
         if k < 2 {
             0x7001000000 + k * 0x04000000
         } else {
-            0x7080000000 + (k - 2) * 0x04000000
+            0x7080000000 + (k - 2) * EXT_COMPUTE_STRIDE
         }
     }
     pub(crate) const fn compute_pool(k: u64) -> u64 {
@@ -769,13 +770,18 @@ pub(crate) mod sizes {
     /// Retained compute units per VM at most; each unit owns its own hardware UMA slot
     /// (`COMPUTE_UMA_SLOT + index`, fitting in `1..RENDER_UMA_SLOT = 33`). A unit is reused
     /// only after a later publication retired (it displaced the unit), so `n` units keep up to
-    /// `n - 1` compute commands in flight (`17 * 2 = 34` entries of the 256-entry compute work
+    /// `n - 1` compute commands in flight (`23 * 2 = 46` entries of the 256-entry compute work
     /// ring `QUEUE_CAP`, well inside `AHEAD_RECORDS = 128`, `RING_SLOTS = 256`, and recovery
     /// `snapshot_entries = 448`).
-    pub(crate) const COMPUTE_UNITS: usize = 18;
+    pub(crate) const COMPUTE_UNITS: usize = 24;
     const _: () = assert!(COMPUTE_UNITS >= 2);
     const _: () = assert!((COMPUTE_UNITS - 1) * MAX_COMPUTE_RING_ENTRIES < QUEUE_CAP as usize);
-    const _: () = assert!(super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP);
+    const _: () = assert!(
+        super::client::compute_context(2) + 0x40000 <= super::client::compute_base(3)
+    );
+    const _: () = assert!(
+        super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP
+    );
     const _: () = assert!(
         super::engine::COMPUTE_UMA_SLOT + (COMPUTE_UNITS as u32)
             <= super::engine::RENDER_UMA_SLOT

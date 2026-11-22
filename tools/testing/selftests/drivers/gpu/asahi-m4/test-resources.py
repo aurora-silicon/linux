@@ -573,9 +573,9 @@ pub mod g16 {
         assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
     }
 
-    #[test]fn forty_eight_render_passes_and_eighteen_compute_units_are_disjoint_in_mesa_hole(){
+    #[test]fn forty_eight_render_passes_and_twenty_four_compute_units_are_disjoint_in_mesa_hole(){
         assert_eq!(g16::hw::sizes::RENDER_SLOTS, 48);
-        assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 18);
+        assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 24);
         let mut o=Objects::new();
         let pools=PoolSet::new(&mut o).unwrap();
         for k in g16::hw::sizes::BASE_PB_SLOTS as u64..g16::hw::sizes::PB_SLOTS as u64 {

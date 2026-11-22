@@ -16,6 +16,9 @@ pub(crate) const STREAK_ON: u32 = 8;
 pub(crate) const STREAK_MAX: u32 = 64;
 /// How long CPU capacity boost lingers after the most recent refill-pressure sample.
 pub(crate) const LINGER_NS: u64 = 8_000_000;
+/// EWMA busy-sum ceiling (~8x 600 us incremental flight time) below which overlapping
+/// pipelined (`d >= 2`) flights are still host-recording-bound rather than GPU-bound.
+pub(crate) const SHORT_PIPELINE_BUSY_SUM_NS: u64 = 4_800_000;
 
 /// Lock-free refill-gap detector shared between completion retirement and the feed worker.
 pub(crate) struct Detector {
@@ -68,6 +71,7 @@ impl Detector {
             return;
         }
         let previous = self.last_end.fetch_max(end_ns, Ordering::AcqRel);
+        let overlapped = previous != 0 && start_ns < previous;
         let (idle, busy, paced) = if previous == 0 {
             (0, end_ns - start_ns, true)
         } else if start_ns >= previous {
@@ -105,7 +109,9 @@ impl Detector {
         if streak < STREAK_ON {
             return;
         }
-        if idle_sum.saturating_mul(4) >= busy_sum {
+        if idle_sum.saturating_mul(4) >= busy_sum
+            || (overlapped && busy_sum <= SHORT_PIPELINE_BUSY_SUM_NS)
+        {
             self.until
                 .store(now_ns.saturating_add(LINGER_NS), Ordering::Release);
             if !self.active.swap(true, Ordering::AcqRel) {
@@ -254,6 +260,43 @@ mod tests {
         d.begin_shutdown();
         assert!(d.is_stopped_or_paused());
         assert!(!d.wanted(resumed_now));
+        assert!(!d.take_pending());
+    }
+
+    #[test]
+    fn pipelined_d2_cpu_recording_burst_sustains_boost_and_expires_after_linger() {
+        let d = Detector::new();
+        // Overlapping d=2 short flights (~300 us GPU duration, 200 us host submit cadence):
+        // idle gap is 0 while overlapping, so EWMA busy_sum (~1.6 ms) sustains CPU boost.
+        let mut start = 10_000_000u64;
+        let mut last_end = 0u64;
+        for _ in 0..20 {
+            let end = start + 300_000;
+            d.note(start, end, end);
+            last_end = end;
+            start += 200_000;
+        }
+        assert!(d.wanted(last_end));
+        assert!(d.take_pending());
+        assert!(!d.bound(last_end));
+        assert!(!d.wanted(last_end + LINGER_NS));
+    }
+
+    #[test]
+    fn pipelined_d2_gpu_bound_flights_do_not_boost_cpu() {
+        let d = Detector::new();
+        // Overlapping d=2 long GPU-bound flights (2 ms GPU duration, 1.8 ms cadence):
+        // EWMA busy_sum (~14.4 ms >> SHORT_PIPELINE_BUSY_SUM_NS) stays GPU-bound without boost.
+        let mut start = 10_000_000u64;
+        let mut last_end = 0u64;
+        for _ in 0..20 {
+            let end = start + 2_000_000;
+            d.note(start, end, end);
+            last_end = end;
+            start += 1_800_000;
+        }
+        assert!(d.bound(last_end));
+        assert!(!d.wanted(last_end));
         assert!(!d.take_pending());
     }
 }
