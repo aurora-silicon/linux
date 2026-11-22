@@ -630,8 +630,39 @@ static void t8122_trial_wdt(struct apple_sleep *s, bool on)
 	t8122.wdt_armed = true;
 }
 
+/*
+ * TRIAL ONLY (not for #2572): read-only census of the ASCs no Linux driver stops (AOP, MTP,
+ * SIO, dcpext): CPU_CONTROL (+0x44) and CPU_STATUS (+0x48), read only where the domain is up.
+ * macOS at its commit: SIO 0/0x2e, AOP and MTP running 0x2c, dcpext off.
+ */
+static void t8122_trial_asc_census(struct apple_sleep *s, const char *when)
+{
+	static const struct { const char *name; phys_addr_t asc; u32 ps; } c[] = {
+		{ "aop", 0x2f4400000, 0 }, { "mtp", 0x2fa400000, 0 },
+		{ "sio", 0x2a1c00000, T8122_PS_SIO_CPU }, { "dcpext", 0x31ac00000, T8122_PS_DISPEXT_CPU },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(c); i++) {
+		u32 ps = c[i].ps ? readl(s->ps + c[i].ps) : 0;
+		void __iomem *r;
+
+		if (c[i].ps && !FIELD_GET(PS_ACTUAL, ps)) {
+			dev_info(s->dev, "J613 TRIAL ASC census %s: %s domain off (ps %#x)\n", when, c[i].name, ps);
+			continue;
+		}
+		r = ioremap_np(c[i].asc, 0x4000);
+		if (!r)
+			continue;
+		dev_info(s->dev, "J613 TRIAL ASC census %s: %s control %#x status %#x (ps %#x)\n", when,
+			 c[i].name, readl(r + 0x44), readl(r + 0x48), ps);
+		iounmap(r);
+	}
+}
+
 static int t8122_sleep_begin(struct apple_sleep *s)
 {
+	t8122_trial_asc_census(s, "entry");
 	t8122_witness_reset();
 	t8122.wfi_returns = 0;
 	t8122.dc_stalled = false;
@@ -902,6 +933,7 @@ static void t8122_sleep_prepare_regs(struct apple_sleep *s)
 		t8122_dc_putc('K');
 	}
 	t8122_sleep_match(s);
+	t8122_trial_asc_census(s, "after the first stops");
 	t8122_witness_take(s, 1);
 	t8122_witness_dc(1);
 	if (t8122_wdt_clear == 2) {
