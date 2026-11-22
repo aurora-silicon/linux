@@ -133,6 +133,16 @@ struct apple_smc {
 	bool saved_enabled, saved_blocked, saved_scope, saved_committed;
 	bool saved_pending, saved_recovery, saved_wake;
 	int saved_fault, saved_notice_error, saved_restore_error;
+	/*
+	 * T6050: the wake record and waka, taken cleanly right after AP ON at the platform
+	 * wake (the sleep driver's .woken), for the noirq resume; when waka was answered.
+	 */
+	bool woken_done, woken_mbsw;
+	u64 waka_at;
+	/* T6050: MSLD as read right after waka, for the noirq resume's lid handling */
+	bool wake_lid_read;
+	u8 wake_lid;
+	int wake_lid_ret;
 	u64 saved_unexpected;
 	/* To be told at the noirq suspend, after the debug link's cut. */
 	bool sleep_warn_late;

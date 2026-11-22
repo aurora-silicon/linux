@@ -632,6 +632,14 @@
 };
 
 /*
+ * The headset jack reports the plug on ring sense; tip sense keeps
+ * re-asserting with nothing plugged in.
+ */
+&jack_codec {
+	cirrus,ring-sense-detect;
+};
+
+/*
  * ProRes: the engine and its DART. The driver binds the T8132 engine whenever
  * apple/prores-t8132-init.bin is installed and leaves it off without it.
  */
