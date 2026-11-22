@@ -1012,6 +1012,19 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		ret = avd_h264_validate_pps(ctx, run.pps);
 	if (!ret)
 		ret = avd_h264_validate_slice(ctx, run.slice_params);
+	/*
+	 * The scratch and capture buffers are sized from the OUTPUT format,
+	 * which the core rounds up to whole macroblocks. Refuse a picture
+	 * larger than that, as HEVC does, so the engine stays inside them.
+	 */
+	if (!ret &&
+	    ((run.sps->pic_width_in_mbs_minus1 + 1) * 16 > fmt_width(ctx) ||
+	     (run.sps->pic_height_in_map_units_minus1 + 1) * 16 > fmt_height(ctx))) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "H.264 picture larger than the %ux%u format\n",
+				    fmt_width(ctx), fmt_height(ctx));
+		ret = -EINVAL;
+	}
 	if (ret)
 		goto err_free_jobs;
 
