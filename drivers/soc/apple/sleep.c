@@ -59,6 +59,7 @@
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
+#include <linux/nvmem-consumer.h>
 #include <linux/percpu.h>
 #include <linux/sched/task_stack.h>
 #include <asm/sections.h>
@@ -830,6 +831,14 @@ struct apple_sleep_soc {
 
 struct apple_sleep {
 	struct device *dev;
+	/*
+	 * The step notes' place in PMU scratch, from the sleep node's "sleep-notes" nvmem cell,
+	 * and the work that reads and clears the last sleep's notes once the cell's provider is up.
+	 */
+	u16 note_base;
+	u8 note_len;
+	struct delayed_work notes_work;
+	unsigned int notes_tries;
 	const struct apple_sleep_soc *soc;
 	struct apple_sleep_region_state *region;
 	void __iomem *ps;
@@ -4885,7 +4894,7 @@ static void sleep_spmi_sources_report(struct apple_sleep *s)
 
 static bool sleep_notes_on(struct apple_sleep *s)
 {
-	return s && s->spmi && s->soc->untested && !s->soc->no_pmu_notes &&
+	return s && s->spmi && s->soc->untested && (s->note_len || !s->soc->no_pmu_notes) &&
 	       READ_ONCE(sleep_pmu_notes);
 }
 
@@ -4895,8 +4904,12 @@ static bool sleep_notes_on(struct apple_sleep *s)
  */
 static void sleep_note_at(struct apple_sleep *s, u8 off, u8 val)
 {
-	if (sleep_notes_on(s))
+	if (!sleep_notes_on(s))
+		return;
+	if (!s->note_len)
 		sleep_pmu_write(s, PMU_NOTE_BASE + off, val);
+	else if (off < s->note_len)
+		sleep_pmu_write(s, s->note_base + off, val);
 }
 
 static void sleep_note(struct apple_sleep *s, u8 step)
@@ -4909,6 +4922,75 @@ void apple_sleep_note_sub(u8 step)
 	sleep_note_at(apple_sleep, 4, step);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_note_sub);
+
+/*
+ * The step notes' place, where the device tree describes it: a "sleep-notes" nvmem cell of the
+ * PMU's scratch on the sleep node. With it the notes are on for an untested SoC whatever its
+ * profile says. Only the cell's offset and length are taken here; the late writes go straight
+ * to the sleep's SPMI block, as the other PMU writes do.
+ */
+static void sleep_notes_parse(struct apple_sleep *s)
+{
+	struct device_node *np = s->dev->of_node, *cell;
+	u32 reg[2];
+	int idx;
+
+	idx = of_property_match_string(np, "nvmem-cell-names", "sleep-notes");
+	if (idx < 0)
+		return;
+	cell = of_parse_phandle(np, "nvmem-cells", idx);
+	if (!cell)
+		return;
+	if (!of_property_read_u32_array(cell, "reg", reg, 2) && reg[0] <= U16_MAX - 32 &&
+	    reg[1] >= 5 && reg[1] <= 32) {
+		s->note_base = reg[0];
+		s->note_len = reg[1];
+	}
+	of_node_put(cell);
+}
+
+/*
+ * The last sleep's notes, read through the PMU's nvmem provider once it is up, then cleared
+ * so the next attempt starts from zero: a reset in the sleep leaves them for this boot.
+ */
+static void sleep_notes_work(struct work_struct *work)
+{
+	struct apple_sleep *s = container_of(to_delayed_work(work), struct apple_sleep,
+					     notes_work);
+	struct nvmem_cell *cell;
+	char line[3 * 32 + 1];
+	size_t len, i, n = 0;
+	u8 *buf;
+
+	cell = of_nvmem_cell_get(s->dev->of_node, "sleep-notes");
+	if (IS_ERR(cell)) {
+		if (PTR_ERR(cell) == -EPROBE_DEFER && ++s->notes_tries < 30)
+			schedule_delayed_work(&s->notes_work, 2 * HZ);
+		else
+			dev_warn(s->dev, "sleep notes: no cell: %pe\n", cell);
+		return;
+	}
+	buf = nvmem_cell_read(cell, &len);
+	if (IS_ERR(buf)) {
+		dev_warn(s->dev, "sleep notes: read failed: %pe\n", buf);
+		goto out;
+	}
+	for (i = 0; i < len && i < 32; i++)
+		n += scnprintf(line + n, sizeof(line) - n, " %02x", buf[i]);
+	if (len && buf[0] == PMU_NOTE_MAGIC) {
+		dev_info(s->dev, "last sleep's notes at PMU %#x: step %#x, attempt %u:%s\n",
+			 s->note_base, len > 1 ? buf[1] : 0, len > 3 ? buf[3] : 0, line);
+		memset(buf, 0, len);
+		if (nvmem_cell_write(cell, buf, len) < 0)
+			dev_warn(s->dev, "sleep notes: clear failed\n");
+	} else {
+		dev_info(s->dev, "no sleep notes at PMU %#x (+0 %#x)\n", s->note_base,
+			 len ? buf[0] : 0);
+	}
+	kfree(buf);
+out:
+	nvmem_cell_put(cell);
+}
 
 /*
  * The DRAM-kept wake writes each of these words and gives its switch 171 us to report closed.
@@ -7870,6 +7952,8 @@ static int apple_sleep_probe(struct platform_device *pdev)
 	s->soc = of_device_get_match_data(dev);
 	if (!s->soc)
 		return -ENODEV;
+	sleep_notes_parse(s);
+	INIT_DELAYED_WORK(&s->notes_work, sleep_notes_work);
 	if (s->soc->spmi_gen4) {
 		s->spmi_status = SPMI4_STATUS;
 		s->spmi_rx_empty = SPMI4_STATUS_RX_EMPTY;
@@ -7960,6 +8044,8 @@ static int apple_sleep_probe(struct platform_device *pdev)
 
 	/* Last: the exported helpers take it as a probed driver, and a failure frees s. */
 	apple_sleep = s;
+	if (s->note_len)
+		schedule_delayed_work(&s->notes_work, 0);
 	/* Deep becomes the default sleep state, unless mem_sleep_default= chose another. */
 	suspend_set_ops(s->soc->early_context ? &apple_sleep_early_ops : &apple_sleep_ops);
 	/* Not on a SoC whose data is derived: there it is asked for by name. */

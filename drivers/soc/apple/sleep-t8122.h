@@ -879,6 +879,8 @@ static void t8122_sleep_match_undo(struct apple_sleep *s)
 		t8122_match_ps_undo(s);
 }
 
+static void t8122_note_digest(struct apple_sleep *s, unsigned int n);
+
 /*
  * Every coprocessor has stopped and the link is still up: the state the commit starts from,
  * against macOS's, with time for the cable to carry it before the cut.
@@ -887,6 +889,8 @@ static void t8122_sleep_stopped(struct apple_sleep *s)
 {
 	t8122_witness_take(s, 2);
 	t8122_witness_dc(2);
+	t8122_note_digest(s, 2);
+	sleep_note(s, 0x72);
 }
 
 /*
@@ -895,6 +899,7 @@ static void t8122_sleep_stopped(struct apple_sleep *s)
  */
 static void t8122_sleep_prepare_regs(struct apple_sleep *s)
 {
+	sleep_note(s, 0x70);
 	/* The driver's own arm, where the working SoCs run it: after the first stops. */
 	if (t8122_wake_mask && s->wake && s->wake_enable_count) {
 		sleep_wake_arm(s);
@@ -908,6 +913,8 @@ static void t8122_sleep_prepare_regs(struct apple_sleep *s)
 		writel(0, s->wdt + WDT_WD0_COUNT);
 		writel(0, s->wdt + WDT_WD1_COUNT);
 	}
+	t8122_note_digest(s, 1);
+	sleep_note(s, 0x71);
 	t8122_pmu_write(s, s->soc->pmu_sleep_reg, s->soc->pmu_sleep_val);
 	t8122.notify_saved[0] = readl(s->spmi + SPMI_NOTIFY_ENABLE);
 	t8122.notify_saved[1] = readl(t8122.hpm_notify + SPMI_NOTIFY_ENABLE);
@@ -978,13 +985,59 @@ static void t8122_sleep_atc_off(struct apple_sleep *s)
 	}
 }
 
+/*
+ * The step notes after a reset: what snapshot @n left, in PMU scratch (+5 on). Indices are
+ * into t8122_ps_all, 0xff for none. +5/+6 words with BUSY/PARENT_MISSING (bit 11) latched,
+ * +7/+8 words asked off but still on, +9 words on where macOS has them off at its commit and
+ * +10..+12 the first three, +13/+14 the SEP's and DISP_CPU's low bytes.
+ */
+static void t8122_note_digest(struct apple_sleep *s, unsigned int n)
+{
+	const struct t8122_witness *w = &t8122.snap[n];
+	unsigned int i, nbusy = 0, nstuck = 0, non = 0;
+	u8 fbusy = 0xff, fstuck = 0xff, fon[3] = { 0xff, 0xff, 0xff };
+	u8 sep = 0xff, disp = 0xff;
+
+	if (!w->taken)
+		return;
+	for (i = 0; i < ARRAY_SIZE(t8122_ps_all); i++) {
+		u32 v = w->ps[i], m = t8122_ps_macos[i];
+
+		if (t8122_ps_all[i] == T8122_PS_SEP)
+			sep = v;
+		if (t8122_ps_all[i] == T8122_PS_DISP_CPU)
+			disp = v;
+		if (v & BIT(11) && nbusy++ == 0)
+			fbusy = i;
+		if (!FIELD_GET(PS_TARGET, v) && FIELD_GET(PS_ACTUAL, v) && nstuck++ == 0)
+			fstuck = i;
+		if (m != T8122_M_NONE && !FIELD_GET(PS_ACTUAL, m) && FIELD_GET(PS_ACTUAL, v)) {
+			if (non < ARRAY_SIZE(fon))
+				fon[non] = i;
+			non++;
+		}
+	}
+	sleep_note_at(s, 5, min(nbusy, 255U));
+	sleep_note_at(s, 6, fbusy);
+	sleep_note_at(s, 7, min(nstuck, 255U));
+	sleep_note_at(s, 8, fstuck);
+	sleep_note_at(s, 9, min(non, 255U));
+	for (i = 0; i < ARRAY_SIZE(fon); i++)
+		sleep_note_at(s, 10 + i, fon[i]);
+	sleep_note_at(s, 13, sep);
+	sleep_note_at(s, 14, disp);
+}
+
 /* The other cores are stopped. The measured final 165 us, in its order. */
 static void t8122_sleep_commit_regs(struct apple_sleep *s)
 {
+	sleep_note(s, 0x73);
 	t8122_sleep_atc_off(s);
 	/* After the cut: what it changed, left in the DockChannel for whoever asks next. */
 	t8122_witness_take(s, 3);
 	t8122_witness_dc(3);
+	t8122_note_digest(s, 3);
+	sleep_note(s, 0x74);
 	if (t8122_wdt_clear)
 		writel(0, s->wdt + WDT_WD0_CTL);
 	/* The discriminator: a SoC that stays powered resets itself; one that slept may not. */
@@ -1001,11 +1054,15 @@ static void t8122_sleep_commit_regs(struct apple_sleep *s)
 	writel(0x2500, s->cllt + T8122_CLLT_CTL);
 	writel(0, s->cllt + T8122_CLLT_CTL);
 	writel(0x1c17, s->cllt + T8122_CLLT_LAST);
+	sleep_note(s, 0x75);
 }
 
 /* The mailbox is armed: 'c' before the commit word, 'C' once every line is masked after it. */
 static void t8122_sleep_pre_commit(struct apple_sleep *s)
 {
+	/* The last SPMI before the commit word: a reset that leaves this came after it. */
+	sleep_note_at(s, 15, 0x5a);
+	sleep_note(s, 0x77);
 	t8122_dc_putc('c');
 	/* The hold: the commit word is not written, and the next thing is a reset from outside. */
 	if (READ_ONCE(sleep_untested_hold))

@@ -582,6 +582,9 @@
 			 * the driver refuses every sleep.
 			 */
 			apple,wake-enable = <155>;
+			/* The sleep's step notes, for the boot after a reset in it. */
+			nvmem-cells = <&sleep_notes>;
+			nvmem-cell-names = "sleep-notes";
 			status = "disabled";
 		};
 
@@ -1088,6 +1091,11 @@
 
 					socd: socd@8b00 {
 						reg = <0x8b00 0x400>;
+					};
+
+					/* In the ADT's info-scrpad (0x8000 + 0x2800); kept across a reset. */
+					sleep_notes: sleep-notes@8308 {
+						reg = <0x8308 0x10>;
 					};
 
 					boot_stage: boot-stage@f701 {
