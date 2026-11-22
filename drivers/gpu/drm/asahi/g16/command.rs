@@ -37,8 +37,28 @@ const PROCESS_EMPTY_TILES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_P
 const RSRC_SPEC_HI: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_RSRC_SPEC_HI;
 const DBIAS_IS_INT: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT;
 const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+const STAGE_PREFIXES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
 const COMPUTE_NO_QUERY_ACCESS: u32 =
     uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS as u32;
+
+const RENDER_STAGE_PREFIXES_OFF: usize =
+    offset_of!(uapi::drm_asahi_cmd_render_m5, stage_prefixes);
+const RENDER_M5_SIZE: usize = size_of::<uapi::drm_asahi_cmd_render_m5>();
+
+const _: () = {
+    assert!(RENDER_STAGE_PREFIXES_OFF == size_of::<uapi::drm_asahi_cmd_render>());
+    assert!(size_of::<uapi::drm_asahi_cmd_render>() == 448);
+    assert!(RENDER_M5_SIZE == 480);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, ta_cdm_barrier) == 0);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, reserved0) == 2);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, reserved1) == 4);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, ta_prior_cdm) == 8);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, ta_vdm_barrier) == 16);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, reserved2) == 18);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, reserved3) == 20);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, ta_prior_vdm) == 24);
+    assert!(size_of::<uapi::drm_asahi_render_stage_prefixes>() == 32);
+};
 
 const CMD_RENDER: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER;
 const CMD_COMPUTE: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE;
@@ -66,6 +86,7 @@ pub(crate) struct Order {
     pub(crate) engine: usize,
     pub(crate) sequence: u64,
     pub(crate) wait_through: [Option<u64>; 2],
+    pub(crate) ta_wait_through: [Option<u64>; 2],
 }
 
 impl Order {
@@ -109,7 +130,20 @@ impl Order {
             engine,
             sequence: sequences[engine],
             wait_through,
+            ta_wait_through: wait_through,
         })
+    }
+
+    /// Narrows the tiling half's prefixes to `tiling` (`DRM_ASAHI_RENDER_STAGE_PREFIXES`),
+    /// requiring each stage prefix to stay within the command's full fragment prefix.
+    pub(crate) fn narrow_tiling(&mut self, tiling: &Self) -> Result {
+        for index in 0..2 {
+            if tiling.wait_through[index].unwrap_or(0) > self.wait_through[index].unwrap_or(0) {
+                return Err(EINVAL);
+            }
+        }
+        self.ta_wait_through = tiling.wait_through;
+        Ok(())
     }
 
     /// A same-engine command cannot jump a hole in its queue's published frontier.
@@ -393,6 +427,71 @@ fn payload<T: AnyBitPattern>(bytes: &[u8]) -> Result<T> {
     Reader::new(bytes).read_up_to(bytes.len())
 }
 
+/// Decodes the 32-byte `drm_asahi_render_stage_prefixes` tail from a 480-byte
+/// `drm_asahi_cmd_render_m5` payload without adding a duplicate `AnyBitPattern` impl.
+fn decode_stage_prefixes(tail: &[u8]) -> Result<uapi::drm_asahi_render_stage_prefixes> {
+    let bytes: &[u8; 32] = tail.try_into().map_err(|_| EINVAL)?;
+    let u16_at = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+    let u32_at = |o: usize| {
+        u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
+    };
+    let u64_at = |o: usize| {
+        u64::from_le_bytes([
+            bytes[o],
+            bytes[o + 1],
+            bytes[o + 2],
+            bytes[o + 3],
+            bytes[o + 4],
+            bytes[o + 5],
+            bytes[o + 6],
+            bytes[o + 7],
+        ])
+    };
+    Ok(uapi::drm_asahi_render_stage_prefixes {
+        ta_cdm_barrier: u16_at(0),
+        reserved0: u16_at(2),
+        reserved1: u32_at(4),
+        ta_prior_cdm: u64_at(8),
+        ta_vdm_barrier: u16_at(16),
+        reserved2: u16_at(18),
+        reserved3: u32_at(20),
+        ta_prior_vdm: u64_at(24),
+    })
+}
+
+/// Decodes a render command. With `DRM_ASAHI_RENDER_STAGE_PREFIXES`, the payload must be
+/// the exact 480-byte `drm_asahi_cmd_render_m5` with zero reserved fields and without
+/// `DRM_ASAHI_RENDER_FRAGMENT_BARRIERS`. Without the flag, any trailing bytes must be zero.
+fn render_payload(
+    bytes: &[u8],
+) -> Result<(
+    uapi::drm_asahi_cmd_render,
+    Option<uapi::drm_asahi_render_stage_prefixes>,
+)> {
+    let head_len = bytes.len().min(RENDER_STAGE_PREFIXES_OFF);
+    let cmd: uapi::drm_asahi_cmd_render = Reader::new(&bytes[..head_len]).read_up_to(head_len)?;
+    let tail = bytes.get(RENDER_STAGE_PREFIXES_OFF..).unwrap_or(&[]);
+    if cmd.flags & STAGE_PREFIXES != 0 {
+        if bytes.len() != RENDER_M5_SIZE || cmd.flags & FRAGMENT_BARRIERS != 0 {
+            return Err(EINVAL);
+        }
+        let prefixes = decode_stage_prefixes(tail)?;
+        if prefixes.reserved0 != 0
+            || prefixes.reserved1 != 0
+            || prefixes.reserved2 != 0
+            || prefixes.reserved3 != 0
+        {
+            return Err(EINVAL);
+        }
+        Ok((cmd, Some(prefixes)))
+    } else {
+        if tail.iter().any(|&byte| byte != 0) {
+            return Err(EINVAL);
+        }
+        Ok((cmd, None))
+    }
+}
+
 /// Whether `[start, start + size)` is a nonempty range inside `range`.
 fn inside(start: u64, size: u64, range: &Range<u64>) -> bool {
     size != 0 && start >= range.start && start < range.end && size <= range.end - start
@@ -459,20 +558,38 @@ pub(crate) fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
         }
         match entry.kind {
             CMD_RENDER => {
-                let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
+                let (packet, prefixes) = render_payload(entry.payload)?;
                 let cmd = &packet;
                 // Ray-query extensions belong to G17; reject every nonzero byte
-                // beyond the common historical-prefix fields on G16.
+                // between the common historical-prefix fields and the stage-prefix tail.
                 let end = offset_of!(uapi::drm_asahi_cmd_render, prior_cdm) + size_of::<u64>();
-                if entry.payload.get(end..).is_some_and(|tail| tail.iter().any(|&b| b != 0)) {
+                let rq_end = entry.payload.len().min(RENDER_STAGE_PREFIXES_OFF);
+                if entry
+                    .payload
+                    .get(end..rq_end)
+                    .is_some_and(|tail| tail.iter().any(|&b| b != 0))
+                {
                     return Err(EINVAL);
+                }
+                if let Some(prefixes) = prefixes {
+                    if (prefixes.ta_vdm_barrier != NONE
+                        && u32::from(prefixes.ta_vdm_barrier) > counts[RENDER])
+                        || (prefixes.ta_cdm_barrier != NONE
+                            && u32::from(prefixes.ta_cdm_barrier) > counts[COMPUTE])
+                    {
+                        return Err(EINVAL);
+                    }
                 }
                 check_render_helpers(cmd)?;
                 // M4 HAL200 resource words carry all four high halves.
                 let allowed = PROCESS_EMPTY_TILES
                     | DBIAS_IS_INT
                     | RSRC_SPEC_HI
-                    | if early_tiling { FRAGMENT_BARRIERS } else { 0 };
+                    | if early_tiling {
+                        FRAGMENT_BARRIERS | STAGE_PREFIXES
+                    } else {
+                        0
+                    };
                 if cmd.flags & !allowed != 0
                     || !(1..=MAX_DIMENSION).contains(&cmd.width_px)
                     || !(1..=MAX_DIMENSION).contains(&cmd.height_px)
@@ -784,7 +901,7 @@ fn check_render(
         | RSRC_SPEC_HI
         | DBIAS_IS_INT
         | if super::params::early_tiling() {
-            FRAGMENT_BARRIERS
+            FRAGMENT_BARRIERS | STAGE_PREFIXES
         } else {
             0
         };
@@ -908,31 +1025,36 @@ pub(crate) fn prepare<'a>(
     let mut preceding = [0u16; 2];
     for entry in stream(bytes) {
         let entry = entry?;
-        let (outputs, engine, prior) = match entry.kind {
+        let (outputs, engine, prior, prefixes) = match entry.kind {
             CMD_RENDER => {
-                let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
+                let (packet, prefixes) = render_payload(entry.payload)?;
                 let outputs = crate::timestamp::Destinations::resolve_aligned(
                     objects,
                     &[packet.ts_vtx, packet.ts_frag],
                 )?;
-                (outputs, RENDER, [packet.prior_vdm, packet.prior_cdm])
+                (outputs, RENDER, [packet.prior_vdm, packet.prior_cdm], prefixes)
             }
             CMD_COMPUTE => {
                 let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
                 let outputs =
                     crate::timestamp::Destinations::resolve_aligned(objects, &[packet.ts])?;
-                (outputs, COMPUTE, [packet.prior_vdm, packet.prior_cdm])
+                (outputs, COMPUTE, [packet.prior_vdm, packet.prior_cdm], None)
             }
             _ => continue,
         };
         resolved.push(outputs)?;
-        orders.push(Order::new(
-            accepted,
-            preceding,
-            entry.barriers,
-            prior,
-            engine,
-        )?)?;
+        let mut order = Order::new(accepted, preceding, entry.barriers, prior, engine)?;
+        if let Some(prefixes) = prefixes {
+            let tiling = Order::new(
+                accepted,
+                preceding,
+                [prefixes.ta_vdm_barrier, prefixes.ta_cdm_barrier],
+                [prefixes.ta_prior_vdm, prefixes.ta_prior_cdm],
+                RENDER,
+            )?;
+            order.narrow_tiling(&tiling)?;
+        }
+        orders.push(order)?;
         preceding[engine] += 1;
     }
 
@@ -967,7 +1089,7 @@ impl Prepared<'_> {
                 SET_FRAGMENT_ATTACHMENTS => fragment = attachment_list(entry.payload)?,
                 SET_COMPUTE_ATTACHMENTS => compute = attachment_list(entry.payload)?,
                 CMD_RENDER => {
-                    let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
+                    let (packet, _) = render_payload(entry.payload)?;
                     let cmd = &packet;
                     let outputs = resolved.next().ok_or(EINVAL)?;
                     check_render(context, cmd, &vertex, &fragment)?;

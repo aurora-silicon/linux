@@ -145,9 +145,11 @@ pub(crate) struct PassSlot {
     pub(crate) own_barrier: Arc<FwObject>,
     #[allow(dead_code)]
     pub(crate) prev_barrier: Arc<FwObject>,
+    pub(crate) ta_fs_barrier: Arc<FwObject>,
     #[allow(dead_code)]
     pub(crate) fs_dep: Arc<FwObject>,
     pub(crate) compute_barrier: Arc<FwObject>,
+    pub(crate) fs_compute_barrier: Arc<FwObject>,
 }
 
 impl PassSlot {
@@ -268,8 +270,10 @@ impl PassSlot {
             _uts: alloc(o, 32, Class::Fw, None, 0, false)?,
             own_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
             prev_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
+            ta_fs_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
             fs_dep: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
             compute_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
+            fs_compute_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
         })
     }
 

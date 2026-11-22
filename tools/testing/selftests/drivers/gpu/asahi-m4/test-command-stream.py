@@ -311,6 +311,85 @@ fn g17_resource_lists_apply_to_later_commands_until_cleared() {
     }
 }
 #[test]
+fn g16_stage_prefixes_v2_framing_and_tiling_narrowing() {
+    let mut m5 = uapi::drm_asahi_cmd_render_m5 { legacy: render(), ..Default::default() };
+    m5.legacy.flags = STAGE_PREFIXES;
+    m5.legacy.prior_vdm = 5;
+    m5.legacy.prior_cdm = 9;
+    m5.stage_prefixes.ta_vdm_barrier = NONE;
+    m5.stage_prefixes.ta_cdm_barrier = NONE;
+    m5.stage_prefixes.ta_prior_vdm = 3;
+    m5.stage_prefixes.ta_prior_cdm = 0;
+
+    // Rejected when early_tiling is disabled; accepted when enabled.
+    let wire = entry(CMD_RENDER, &data(&m5), [NONE; 2]);
+    assert!(check_stream(&wire, false).is_err());
+    assert!(check_stream(&wire, true).is_ok());
+
+    // Exact 480-byte payload, zero reserved fields, zero ray-query bytes, mutually exclusive with FRAGMENT_BARRIERS.
+    assert!(check_stream(&entry(CMD_RENDER, &data(&m5)[..448], [NONE; 2]), true).is_err());
+    let mut over = data(&m5);
+    over.extend([0u8; 8]);
+    assert!(check_stream(&entry(CMD_RENDER, &over, [NONE; 2]), true).is_err());
+    for field in 0..4 {
+        let mut bad = m5;
+        match field {
+            0 => bad.stage_prefixes.reserved0 = 1,
+            1 => bad.stage_prefixes.reserved1 = 1,
+            2 => bad.stage_prefixes.reserved2 = 1,
+            _ => bad.stage_prefixes.reserved3 = 1,
+        }
+        assert!(check_stream(&entry(CMD_RENDER, &data(&bad), [NONE; 2]), true).is_err());
+    }
+    let mut both = m5;
+    both.legacy.flags |= FRAGMENT_BARRIERS;
+    assert!(check_stream(&entry(CMD_RENDER, &data(&both), [NONE; 2]), true).is_err());
+    let mut rq = m5;
+    rq.legacy.ray_query[0].scs_layout = 1;
+    assert!(check_stream(&entry(CMD_RENDER, &data(&rq), [NONE; 2]), true).is_err());
+
+    // Without STAGE_PREFIXES, nonzero trailing bytes past 448 are rejected; zero tail is accepted.
+    let mut plain = m5;
+    plain.legacy.flags = 0;
+    assert!(check_stream(&entry(CMD_RENDER, &data(&plain), [NONE; 2]), true).is_err());
+    plain.stage_prefixes = Default::default();
+    assert!(check_stream(&entry(CMD_RENDER, &data(&plain), [NONE; 2]), true).is_ok());
+
+    // Out-of-bounds in-stream ta_vdm_barrier / ta_cdm_barrier are rejected by check_stream.
+    let mut bad_bar = m5;
+    bad_bar.stage_prefixes.ta_vdm_barrier = 1;
+    assert!(check_stream(&entry(CMD_RENDER, &data(&bad_bar), [NONE; 2]), true).is_err());
+    let mut bad_cdm = m5;
+    bad_cdm.stage_prefixes.ta_cdm_barrier = 1;
+    assert!(check_stream(&entry(CMD_RENDER, &data(&bad_cdm), [NONE; 2]), true).is_err());
+
+    // In-stream barriers following prior compute + render succeed in check_stream.
+    let mut seq = entry(CMD_COMPUTE, &data(&compute())[..64], [NONE; 2]);
+    seq.extend(entry(CMD_RENDER, &data(&render())[..256], [NONE; 2]));
+    let mut staged = m5;
+    staged.stage_prefixes.ta_vdm_barrier = 1;
+    staged.stage_prefixes.ta_cdm_barrier = 1;
+    seq.extend(entry(CMD_RENDER, &data(&staged), [1, 1]));
+    assert!(check_stream(&seq, true).is_ok());
+
+    // Order::narrow_tiling allows narrower TA prefixes (including TA-no-compute while FS waits)
+    // and rejects any TA prefix wider than the fragment prefix.
+    let mut full = Order::new([10, 20], [2, 1], [2, 1], [10, 20], RENDER).unwrap();
+    assert_eq!(full.wait_through, [Some(12), Some(21)]);
+    assert_eq!(full.ta_wait_through, [Some(12), Some(21)]);
+    let ta_narrow = Order::new([10, 20], [2, 1], [1, NONE], [0, 0], RENDER).unwrap();
+    assert_eq!(full.narrow_tiling(&ta_narrow), Ok(()));
+    assert_eq!(full.wait_through, [Some(12), Some(21)]);
+    assert_eq!(full.ta_wait_through, [Some(11), None]);
+
+    let ta_too_wide_vdm = Order::new([10, 20], [2, 1], [2, NONE], [0, 0], RENDER).unwrap();
+    let mut full_vdm1 = Order::new([10, 20], [2, 1], [1, 1], [0, 0], RENDER).unwrap();
+    assert_eq!(full_vdm1.narrow_tiling(&ta_too_wide_vdm), Err(EINVAL));
+    let ta_too_wide_cdm = Order::new([10, 20], [2, 1], [NONE, 1], [0, 0], RENDER).unwrap();
+    let mut full_nocdm = Order::new([10, 20], [2, 1], [2, NONE], [0, 0], RENDER).unwrap();
+    assert_eq!(full_nocdm.narrow_tiling(&ta_too_wide_cdm), Err(EINVAL));
+}
+#[test]
 fn unsupported_flags_and_compute_fields() {
     for flag in [1u32,4,1<<19,FRAGMENT_BARRIERS] {
         let mut r=render(); r.flags=flag;
@@ -519,7 +598,7 @@ mod render_admission_tests {
     use super::{
         check_render_helpers, hw, uapi, Result, DBIAS_IS_INT, EINVAL, FRAGMENT_BARRIERS,
         MAX_DIMENSION, MAX_LAYERS, MAX_TILE_BUFFER, PROCESS_EMPTY_TILES, RSRC_SPEC_HI,
-        ZLS_METADATA_STRIDE,
+        STAGE_PREFIXES, ZLS_METADATA_STRIDE,
     };
     const ENOENT: i32 = -2;
     const EACCES: i32 = -13;

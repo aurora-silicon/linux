@@ -46,11 +46,15 @@ assert 'const HORIZON_JOBS: u32 = COMPUTE_UNITS as u32;' in hw_src
 prefix_render_fn = item('fn prefix_render(')
 prefix_compute_fn = item('fn prefix_compute(')
 assert 'let render_bar = BarrierType::from_stamp_only(!init_buffer);' in prefix_render_fn
-assert prefix_render_fn.count('render_bar,') == 2, prefix_render_fn
+assert prefix_render_fn.count('render_bar,') == 3, prefix_render_fn
+assert 'p.ta_fs_barrier.write(0, &ta_fs)?;' in prefix_render_fn
 assert 'p.compute_barrier.write(0, &cbar)?;' in prefix_render_fn
-assert 'BarrierType::Hold,' in prefix_render_fn[prefix_render_fn.index('wait_compute'):prefix_render_fn.index('p.compute_barrier.write')]
+assert 'p.fs_compute_barrier.write(0, &fcbar)?;' in prefix_render_fn
+assert 'BarrierType::Hold,' in prefix_render_fn[prefix_render_fn.index('plan.ta_compute_wait'):prefix_render_fn.index('p.compute_barrier.write')]
+assert 'BarrierType::Hold,' in prefix_render_fn[prefix_render_fn.index('plan.fs_compute_wait'):prefix_render_fn.index('p.fs_compute_barrier.write')]
 assert 'BarrierType::Stamp,' in prefix_render_fn[prefix_render_fn.index('let own = encode::barrier'):prefix_render_fn.index('p.own_barrier.write')]
 assert 'BarrierType::Hold,' in prefix_compute_fn[prefix_compute_fn.index('wait_render'):prefix_compute_fn.index('s.barrier.write')]
+assert 'DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2' in params_src
 
 
 harness = r'''
@@ -497,8 +501,18 @@ mod queue_behind_scope {
     type Job = QueueBehindJob;
     fn command(job:&Job,k:u32)->Option<&Command>{job.commands.get(k as usize)}
     mod params { pub fn compute_flights()->usize{16} pub fn render_flights()->usize{15} }
+    mod kernel {
+        pub mod uapi {
+            pub const drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS: u32 = 1 << 20;
+            pub const drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES: u32 = 1 << 23;
+        }
+    }
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    __RENDER_BARRIER_PLAN__
+    __PLAN_RENDER_BARRIERS__
     impl QueueBehindHost {
         __CAN_QUEUE_BEHIND__
+        __WAIT_STAMP_FOR__
         __CROSS_ENGINE_WAIT__
     }
     #[test]fn timed_compute_queues_behind_same_vm_and_coexists_with_render(){
@@ -762,6 +776,91 @@ mod queue_behind_scope {
         assert!(p.can_queue_behind(&c4));
         p.engine.flights[0].computes=16;
         assert!(!p.can_queue_behind(&c4));
+    }
+    #[test]fn staged_render_barriers_split_ta_and_fs_compute_and_render_waits(){
+        const FRAG: u32 = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+        const STAGED: u32 = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
+        // 1. Compute->FS-only wait (common texture-write-by-compute -> fragment-read):
+        //    TA runs immediately (no TA compute barrier); FS gets fs_compute_barrier.
+        assert_eq!(
+            plan_render_barriers(STAGED, false, true, 0, false, None, [None, Some(0x700)]),
+            RenderBarrierPlan {
+                early: false,
+                ta_fs_wait: None,
+                ta_compute_wait: None,
+                fs_compute_wait: Some(0x700),
+            }
+        );
+        // 2. Same compute target on TA and FS: only TA waits (FS is ordered via own_barrier).
+        assert_eq!(
+            plan_render_barriers(STAGED, true, true, 0x200, false, None, [Some(0x700), Some(0x700)]),
+            RenderBarrierPlan {
+                early: true,
+                ta_fs_wait: None,
+                ta_compute_wait: Some(0x700),
+                fs_compute_wait: None,
+            }
+        );
+        // 3. Different compute targets on TA (0x600) vs FS (0x700): TA waits on 0x600, FS waits on 0x700.
+        assert_eq!(
+            plan_render_barriers(STAGED, true, true, 0x200, false, None, [Some(0x600), Some(0x700)]),
+            RenderBarrierPlan {
+                early: true,
+                ta_fs_wait: None,
+                ta_compute_wait: Some(0x600),
+                fs_compute_wait: Some(0x700),
+            }
+        );
+        // 4. Staged render whose TA waits on an older in-flight FS (0x100 != prev_fs 0x200):
+        //    overlaps TA with 0x200's FS while waiting on 0x100's FS via ta_fs_barrier.
+        assert_eq!(
+            plan_render_barriers(STAGED, true, true, 0x200, false, Some(0x100), [None, None]),
+            RenderBarrierPlan {
+                early: true,
+                ta_fs_wait: Some(0x100),
+                ta_compute_wait: None,
+                fs_compute_wait: None,
+            }
+        );
+        // 5. Staged render whose TA explicitly waits on the newest in-flight FS (0x200 == prev_fs):
+        //    no early overlap; prev_barrier waits on 0x200 directly.
+        assert_eq!(
+            plan_render_barriers(STAGED, true, true, 0x200, false, Some(0x200), [None, None]),
+            RenderBarrierPlan {
+                early: false,
+                ta_fs_wait: None,
+                ta_compute_wait: None,
+                fs_compute_wait: None,
+            }
+        );
+        // 6. Legacy FRAGMENT_BARRIERS and plain render remain unchanged.
+        assert_eq!(
+            plan_render_barriers(FRAG, true, true, 0x200, false, None, [Some(0x700), Some(0x700)]),
+            RenderBarrierPlan {
+                early: true,
+                ta_fs_wait: None,
+                ta_compute_wait: Some(0x700),
+                fs_compute_wait: None,
+            }
+        );
+        assert_eq!(
+            plan_render_barriers(0, true, true, 0x200, false, None, [None, None]),
+            RenderBarrierPlan {
+                early: false,
+                ta_fs_wait: None,
+                ta_compute_wait: None,
+                fs_compute_wait: None,
+            }
+        );
+        assert_eq!(
+            plan_render_barriers(0, true, true, 0x200, true, None, [None, None]),
+            RenderBarrierPlan {
+                early: true,
+                ta_fs_wait: None,
+                ta_compute_wait: None,
+                fs_compute_wait: None,
+            }
+        );
     }
 }
 #[allow(non_camel_case_types, deprecated)]
@@ -1067,7 +1166,10 @@ for token, declaration in {
     '__DESCRIPTOR_CONTAINMENT__': 'if encode::preserve_compute_descriptor(',
     '__PUBLISH_PRODUCER__': 'fn publish_producer(',
     '__CAN_QUEUE_BEHIND__': 'fn can_queue_behind(',
+    '__WAIT_STAMP_FOR__': 'fn wait_stamp_for(',
     '__CROSS_ENGINE_WAIT__': 'fn cross_engine_wait(',
+    '__RENDER_BARRIER_PLAN__': 'struct RenderBarrierPlan {',
+    '__PLAN_RENDER_BARRIERS__': 'fn plan_render_barriers(',
 }.items():
     harness = harness.replace(token, item(declaration).replace("super::command::", "crate::command::").replace("super::recovery::", "crate::recovery::").replace("super::hw::", "crate::hw::"))
 unit = output / 'publication.rs'

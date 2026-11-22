@@ -136,6 +136,53 @@ impl Progress {
     }
 }
 
+/// Resolved ring-barrier placement for one render pass (legacy, `FRAGMENT_BARRIERS`, or
+/// `DRM_ASAHI_RENDER_STAGE_PREFIXES`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct RenderBarrierPlan {
+    early: bool,
+    ta_fs_wait: Option<u32>,
+    ta_compute_wait: Option<u32>,
+    fs_compute_wait: Option<u32>,
+}
+
+/// Computes TA/FS hardware ring barriers for a render command from its flags, prior render
+/// FS stamp, and resolved `[ta, fs]` compute wait stamps.
+fn plan_render_barriers(
+    flags: u32,
+    class_behind: bool,
+    early_tiling: bool,
+    prev_fs: u32,
+    no_render_barrier: bool,
+    ta_wait_fs: Option<u32>,
+    compute_waits: [Option<u32>; 2],
+) -> RenderBarrierPlan {
+    let staged =
+        flags & kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES != 0;
+    let frag_only =
+        flags & kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS != 0;
+    let early = class_behind
+        && early_tiling
+        && if staged {
+            ta_wait_fs != Some(prev_fs)
+        } else {
+            frag_only || no_render_barrier
+        };
+    let ta_fs_wait = if early && staged { ta_wait_fs } else { None };
+    let [ta_compute_wait, fs_wait] = compute_waits;
+    let fs_compute_wait = if fs_wait != ta_compute_wait {
+        fs_wait
+    } else {
+        None
+    };
+    RenderBarrierPlan {
+        early,
+        ta_fs_wait,
+        ta_compute_wait,
+        fs_compute_wait,
+    }
+}
+
 /// Engine of the previous member.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Prev {
@@ -1128,21 +1175,22 @@ impl Firmware {
         }
     }
 
-    /// Resolves a same-queue cross-engine barrier target stamp when `job`'s command `index`
-    /// waits on an in-flight command of `other` engine (`RENDER` -> `fs_target`, `COMPUTE` ->
-    /// `target`). Returns `Ok(None)` when no cross-engine barrier was requested or the waited
-    /// prefix has already retired.
-    fn cross_engine_wait(&self, job: &Arc<Job>, index: u32, other: usize) -> Result<Option<u32>> {
-        let Some(last) = job
-            .command_order(index)
-            .and_then(|o| o.wait_through[other])
-        else {
+    /// Resolves a same-queue target stamp for `class` (`RENDER` -> `fs_target`, `COMPUTE` ->
+    /// `target`) when `target_seq` names an in-flight command of `job.queue`. Returns `Ok(None)`
+    /// when no barrier was requested or the waited prefix has already retired.
+    fn wait_stamp_for(
+        &self,
+        job: &Arc<Job>,
+        class: usize,
+        target_seq: Option<u64>,
+    ) -> Result<Option<u32>> {
+        let Some(last) = target_seq else {
             return Ok(None);
         };
-        if job.queue.completed[other].load(Ordering::Acquire) >= last {
+        if job.queue.completed[class].load(Ordering::Acquire) >= last {
             return Ok(None);
         }
-        if other == super::command::COMPUTE {
+        if class == super::command::COMPUTE {
             for flight in &self.engine.flights {
                 if flight.computes == 0 || !Arc::ptr_eq(&flight.job.queue, &job.queue) {
                     continue;
@@ -1182,6 +1230,17 @@ impl Firmware {
             }
         }
         Err(EAGAIN)
+    }
+
+    /// Resolves a same-queue cross-engine barrier target stamp when `job`'s command `index`
+    /// waits on an in-flight command of `other` engine (`RENDER` -> `fs_target`, `COMPUTE` ->
+    /// `target`). Returns `Ok(None)` when no cross-engine barrier was requested or the waited
+    /// prefix has already retired.
+    fn cross_engine_wait(&self, job: &Arc<Job>, index: u32, other: usize) -> Result<Option<u32>> {
+        let target_seq = job
+            .command_order(index)
+            .and_then(|o| o.wait_through[other]);
+        self.wait_stamp_for(job, other, target_seq)
     }
 
     /// Whether some of `job`'s commands were published: such a job is retained after a
@@ -1389,14 +1448,16 @@ impl Firmware {
         let mut c_read = prefix.c_head;
         if class_behind {
             if render {
+                // Room for up to 4 TA entries (prev_barrier, ta_fs_barrier, compute_barrier,
+                // ta_work) and 4 FS entries (fs_dep, fs_compute_barrier, own_barrier, fs_work).
                 let ta_read = self.graph.render.qstate[0].r32(qstate::READ)?;
                 let fs_read = self.graph.render.qstate[1].r32(qstate::READ)?;
                 if ta_read >= 256
                     || fs_read >= 256
                     || prefix.ta_head.wrapping_sub(ta_read) % sizes::QUEUE_CAP
-                        >= sizes::QUEUE_CAP - 4
+                        >= sizes::QUEUE_CAP - 5
                     || prefix.fs_head.wrapping_sub(fs_read) % sizes::QUEUE_CAP
-                        >= sizes::QUEUE_CAP - 4
+                        >= sizes::QUEUE_CAP - 5
                 {
                     return Err(EAGAIN);
                 }
@@ -1892,8 +1953,38 @@ impl Firmware {
         let alloc_slot = self.pools.pick_slot(&job.vm, behind).ok_or(EAGAIN)?;
         let draw = super::recovery::logic::next_ordinal(pf.draw).ok_or(EOVERFLOW)?;
         let target = encode::stamp(draw);
-        let wait_compute =
-            self.cross_engine_wait(job, job.progress.sent(), super::command::COMPUTE)?;
+        let order = job.command_order(job.progress.sent());
+        let staged = cmd.cmd.flags
+            & kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES
+            != 0;
+        let ta_wait_compute = self.wait_stamp_for(
+            job,
+            super::command::COMPUTE,
+            order.and_then(|o| o.ta_wait_through[super::command::COMPUTE]),
+        )?;
+        let fs_wait_compute = self.wait_stamp_for(
+            job,
+            super::command::COMPUTE,
+            order.and_then(|o| o.wait_through[super::command::COMPUTE]),
+        )?;
+        let ta_wait_fs = if class_behind && staged && params::early_tiling() {
+            self.wait_stamp_for(
+                job,
+                super::command::RENDER,
+                order.and_then(|o| o.ta_wait_through[super::command::RENDER]),
+            )?
+        } else {
+            None
+        };
+        let plan = plan_render_barriers(
+            cmd.cmd.flags,
+            class_behind,
+            params::early_tiling(),
+            self.engine.fs_target,
+            order.is_some_and(|o| o.wait_through[super::command::RENDER].is_none()),
+            ta_wait_fs,
+            [ta_wait_compute, fs_wait_compute],
+        );
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
         self.slots
             .claim_pass_in(&job.resources, k, Some(job.vm.id), geometry.tilemap_bytes)?;
@@ -1986,23 +2077,17 @@ impl Firmware {
             pf.ta_head = (pf.ta_head + 1) % cap;
         }
         // When pipelining behind an in-flight same-VM render, insert explicit hardware ordering
-        // barriers on the TA/FS rings. Fragment-only or barrier-free renders overlap TA(N) with
-        // FS(N-1) (TA waits on prior TA; FS waits on prior FS then own TA); otherwise TA(N)
-        // waits on prior FS to preserve full vertex-stage visibility.
-        let frag_only = cmd.cmd.flags
-            & kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS
-            != 0;
-        let no_render_barrier = job
-            .command_order(job.progress.sent())
-            .is_some_and(|o| o.wait_through[super::command::RENDER].is_none());
-        let early = class_behind && params::early_tiling() && (frag_only || no_render_barrier);
+        // barriers on the TA/FS rings. Fragment-only, barrier-free, or staged renders whose TA
+        // prefix stops before the newest in-flight FS overlap TA(N) with FS(N-1) (TA waits on
+        // prior TA plus any older in-flight FS named by `ta_wait_through`; FS waits on prior FS
+        // then own TA); otherwise TA(N) waits on prior FS to preserve full vertex-stage visibility.
         if class_behind {
             // Pipelined same-VM non-InitBM render->render barriers wait on the producer's
             // firmware stamp only (type 0), matching `own_barrier` and G15's
             // `RENDER_INTERNAL_HOLD = 0`, so consecutive TA/FS stages hand off without a
             // software-job hold bubble. Cross-engine barriers (`fs2c`/`c2ta`) stay `Hold`.
             let render_bar = BarrierType::from_stamp_only(!init_buffer);
-            let (wait_va, wait_stamp, wait_event) = if early {
+            let (wait_va, wait_stamp, wait_event) = if plan.early {
                 (r.fw_stamp[0].va, self.engine.ta_target, 0x70)
             } else {
                 (r.fw_stamp[1].va, self.engine.fs_target, 0x71)
@@ -2018,7 +2103,20 @@ impl Firmware {
             p.prev_barrier.write(0, &prev)?;
             r.ring[0].w64(8 * pf.ta_head as usize, p.prev_barrier.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
-            if early {
+            if plan.early {
+                if let Some(older_fs) = plan.ta_fs_wait {
+                    let ta_fs = encode::barrier(
+                        r.fw_stamp[1].va,
+                        older_fs,
+                        0x71,
+                        target,
+                        work::barrier::RENDER_WAIT_UUID,
+                        render_bar,
+                    );
+                    p.ta_fs_barrier.write(0, &ta_fs)?;
+                    r.ring[0].w64(8 * pf.ta_head as usize, p.ta_fs_barrier.va)?;
+                    pf.ta_head = (pf.ta_head + 1) % cap;
+                }
                 let dep = encode::barrier(
                     r.fw_stamp[1].va,
                     self.engine.fs_target,
@@ -2033,7 +2131,7 @@ impl Firmware {
                 self.engine.stats.early += 1;
             }
         }
-        if let Some(wait_c) = wait_compute {
+        if let Some(wait_c) = plan.ta_compute_wait {
             let cbar = encode::barrier(
                 self.graph.compute.fw_stamp.va,
                 wait_c,
@@ -2045,6 +2143,20 @@ impl Firmware {
             p.compute_barrier.write(0, &cbar)?;
             r.ring[0].w64(8 * pf.ta_head as usize, p.compute_barrier.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
+            self.engine.stats.c2ta0 += 1;
+        }
+        if let Some(wait_c) = plan.fs_compute_wait {
+            let fcbar = encode::barrier(
+                self.graph.compute.fw_stamp.va,
+                wait_c,
+                15,
+                target,
+                work::barrier::RENDER_WAIT_UUID,
+                BarrierType::Hold,
+            );
+            p.fs_compute_barrier.write(0, &fcbar)?;
+            r.ring[1].w64(8 * pf.fs_head as usize, p.fs_compute_barrier.va)?;
+            pf.fs_head = (pf.fs_head + 1) % cap;
             self.engine.stats.c2ta0 += 1;
         }
         // The paired fragment always requires the native explicit TA dependency.
