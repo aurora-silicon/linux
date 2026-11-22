@@ -130,16 +130,16 @@ config APPLE_SOC_SLEEP_KUNIT_TEST
 	  If unsure, say N.
 
 config APPLE_SOC_SLEEP_T8122
-	bool "Apple SoC system sleep: J613 (T8122) match data, in qualification"
+	bool "Apple SoC system sleep: T8122 match data, in qualification"
 	depends on APPLE_SOC_SLEEP
 	help
-	  Adds the MacBook Air (13-inch, M3) to the SoCs the Apple SoC sleep
-	  driver matches. Its entry sequence was measured from a macOS sleep on
-	  that machine; no sleep entered by Linux has yet powered the SoC down
+	  Adds T8122 (M3) to the SoCs the Apple SoC sleep driver matches. Its
+	  entry sequence was measured from a macOS sleep on a MacBook Air
+	  (13-inch, M3); no sleep entered by Linux has yet powered the SoC down
 	  or come back, so the match is left out of a kernel built without this.
 
-	  The driver binds only on J613, only with the sleep node enabled in
-	  the device tree, and only when the boot object published
+	  The driver binds on any T8122 board whose device tree has the
+	  apple,t8122-sleep node enabled, and only when the boot object published
 	  /chosen/aurora,s2r-mailbox. Deep sleep is offered only with
 	  apple_sleep.deep=1, and a sleep is then a dry run that refuses before
 	  it stops anything unless apple_sleep.untested_commit=1. A sleep is
