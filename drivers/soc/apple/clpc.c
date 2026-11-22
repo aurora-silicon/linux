@@ -482,6 +482,20 @@ static bool apple_clpc_ane_input_demand(struct apple_clpc *clpc, unsigned int *d
 }
 
 /* cpufreq policies can appear after probe; pick up new ones as they do. */
+/*
+ * A CPU's idle time and its wall clock, for the busy estimate. Time waiting
+ * for I/O counts as busy, as ondemand's io_is_busy counts it: a CPU that drives
+ * I/O and waits for each completion is mostly idle otherwise, and its transfers
+ * then run at the lowest DRAM and fabric states. The baseline and every sample
+ * must read the same counters: with io_busy 0, get_cpu_idle_time() returns
+ * idle plus iowait, so a baseline read that way and a sample read with
+ * io_busy 1 would differ by all the I/O wait since boot.
+ */
+static u64 apple_clpc_idle_time(unsigned int cpu, u64 *wall)
+{
+	return get_cpu_idle_time(cpu, wall, 1);
+}
+
 static void apple_clpc_find_clusters(struct apple_clpc *clpc)
 {
 	unsigned int cpu, i;
@@ -506,7 +520,7 @@ static void apple_clpc_find_clusters(struct apple_clpc *clpc)
 			cl = &clpc->clusters[i];
 			cpumask_set_cpu(cpu, cl->cpus);
 			cpumask_set_cpu(cpu, clpc->covered);
-			clpc->idle[cpu] = get_cpu_idle_time(cpu, &clpc->wall[cpu], 0);
+			clpc->idle[cpu] = apple_clpc_idle_time(cpu, &clpc->wall[cpu]);
 		}
 		cpufreq_cpu_put(policy);
 	}
@@ -532,13 +546,7 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
 			continue;
 		}
 
-		/*
-		 * Time waiting for I/O counts as busy, as ondemand's io_is_busy
-		 * counts it: a CPU that drives I/O and waits for each completion
-		 * is mostly idle otherwise, and its transfers then run at the
-		 * lowest DRAM and fabric states.
-		 */
-		idle = get_cpu_idle_time(cpu, &wall, 1);
+		idle = apple_clpc_idle_time(cpu, &wall);
 		dw = wall - clpc->wall[cpu];
 		di = idle - clpc->idle[cpu];
 		valid = clpc->wall[cpu];
