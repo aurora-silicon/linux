@@ -220,7 +220,9 @@ int apple_smc_write_noirq(struct apple_smc *smc, smc_key key, const void *buf, s
  * This function switches the SMC backend to atomic mode which allows the
  * use of apple_smc_write_atomic while disabling *all* other functions.
  * This is only used for shutdown/reboot which requires writing to a SMC
- * key from atomic context.
+ * key from atomic context. Atomic mode is entered even when ordinary commands
+ * are refused after a protocol fault, so that the final power command can
+ * still be sent.
  *
  * Return: Zero on success, negative errno on error
  */

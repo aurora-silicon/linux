@@ -395,6 +395,32 @@ static void macsmc_port_reasons_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(&ctx->smc, BIT_ULL(43)));
 }
 
+static void macsmc_atomic_after_fault_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+
+	ctx->result = 1;
+
+	/* Without a fault: notifications are turned off, then atomic mode. */
+	KUNIT_EXPECT_EQ(test, apple_smc_enter_atomic(&ctx->smc), 0);
+	KUNIT_EXPECT_TRUE(test, ctx->smc.atomic_mode);
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[0], (u32)0);
+
+	/* A protocol fault refuses commands, but power-off still gets atomic mode. */
+	ctx->smc.atomic_mode = false;
+	ctx->seen_count = 0;
+	ctx->smc.saved_enabled = true;
+	ctx->smc.saved_fault = -EPROTO;
+	KUNIT_EXPECT_EQ(test, apple_smc_enter_atomic(&ctx->smc), 0);
+	KUNIT_EXPECT_TRUE(test, ctx->smc.atomic_mode);
+	KUNIT_EXPECT_EQ(test, ctx->seen_count, 0U);
+	/* Ordinary commands stay refused. */
+	KUNIT_EXPECT_EQ(test, apple_smc_write_u32(&ctx->smc, SMC_KEY(MBSE), SMC_KEY(offw)),
+			-EPROTO);
+	KUNIT_EXPECT_EQ(test, ctx->seen_count, 0U);
+}
+
 static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_key_info_lock_test),
 	KUNIT_CASE(macsmc_key_index_test),
@@ -412,6 +438,7 @@ static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_lid_wake_test),
 	KUNIT_CASE(macsmc_wake_reason_test),
 	KUNIT_CASE(macsmc_port_reasons_test),
+	KUNIT_CASE(macsmc_atomic_after_fault_test),
 	{}
 };
 
