@@ -160,6 +160,27 @@ static void avd_sps_size_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps(ctx, &sps), c->ret);
 }
 
+static void avd_start_slices_test(struct kunit *test)
+{
+	struct v4l2_ctrl_h264_sps sps = {
+		.flags = V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY,
+	};
+
+	/* One slice per row */
+	sps.pic_width_in_mbs_minus1 = 119;
+	sps.pic_height_in_map_units_minus1 = 67;
+	KUNIT_EXPECT_EQ(test, avd_h264_start_slices(&sps), 68);
+
+	/* No more rows than macroblocks, and never more than the table */
+	sps.pic_width_in_mbs_minus1 = 0;
+	sps.pic_height_in_map_units_minus1 = U16_MAX;
+	KUNIT_EXPECT_LE(test, avd_h264_start_slices(&sps), AVD_TEST_MAX_SLICES);
+	sps.pic_width_in_mbs_minus1 = U16_MAX;
+	KUNIT_EXPECT_LE(test, avd_h264_start_slices(&sps), AVD_TEST_MAX_SLICES);
+	sps.flags = 0;
+	KUNIT_EXPECT_LE(test, avd_h264_start_slices(&sps), AVD_TEST_MAX_SLICES);
+}
+
 static void avd_scaling_flat_test(struct kunit *test)
 {
 	struct v4l2_ctrl_h264_pps pps = {};
@@ -188,6 +209,7 @@ static struct kunit_case avd_h264_test_cases[] = {
 	KUNIT_CASE_PARAM(avd_slice_data_test, avd_slice_data_gen_params),
 	KUNIT_CASE_PARAM(avd_slice_fits_test, avd_slice_fits_gen_params),
 	KUNIT_CASE_PARAM(avd_sps_size_test, avd_sps_size_gen_params),
+	KUNIT_CASE(avd_start_slices_test),
 	{}
 };
 

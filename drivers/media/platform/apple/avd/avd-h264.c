@@ -769,6 +769,9 @@ static void avd_h264_stop(struct avd_ctx *ctx)
 	ctx->priv = NULL;
 }
 
+VISIBLE_IF_KUNIT size_t
+avd_h264_start_slices(const struct v4l2_ctrl_h264_sps *sps);
+
 static int avd_h264_start(struct avd_ctx *ctx)
 {
 	struct avd_h264_ctx *h264_ctx;
@@ -783,7 +786,7 @@ static int avd_h264_start(struct avd_ctx *ctx)
 	if (ret)
 		return ret;
 
-	h264_ctx = kzalloc(sizeof(*h264_ctx), GFP_KERNEL);
+	h264_ctx = kzalloc(sizeof(*h264_ctx), GFP_KERNEL_ACCOUNT);
 	if (!h264_ctx)
 		return -ENOMEM;
 
@@ -795,11 +798,10 @@ static int avd_h264_start(struct avd_ctx *ctx)
 	for (unsigned int i = 0; i < h264_ctx->nbanks; i++) {
 		struct avd_bank *bank = &h264_ctx->bank[i];
 
-		/* assume one slice per row */
 		bank->alloc_slice_num =
-			ctrl->p_new.p_h264_sps->pic_height_in_map_units_minus1 + 1;
+			avd_h264_start_slices(ctrl->p_new.p_h264_sps);
 		bank->slices = kcalloc(bank->alloc_slice_num,
-				       sizeof(*bank->slices), GFP_KERNEL);
+				       sizeof(*bank->slices), GFP_KERNEL_ACCOUNT);
 		if (!bank->slices) {
 			ret = -ENOMEM;
 			goto err_free_ctx;
@@ -955,6 +957,15 @@ static size_t avd_h264_max_slices(const struct v4l2_ctrl_h264_sps *sps)
 
 	return min_t(size_t, mbs, MAX_SLICES);
 }
+
+/* Slice table entries made at STREAMON: one slice per row to begin with. */
+VISIBLE_IF_KUNIT size_t
+avd_h264_start_slices(const struct v4l2_ctrl_h264_sps *sps)
+{
+	return min_t(size_t, sps->pic_height_in_map_units_minus1 + 1,
+		     avd_h264_max_slices(sps));
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_h264_start_slices);
 
 /*
  * Coded data held for one picture. A picture of PCM macroblocks is about the
