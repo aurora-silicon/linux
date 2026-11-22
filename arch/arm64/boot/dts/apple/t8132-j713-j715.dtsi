@@ -59,15 +59,6 @@
 	brcm,board-type = "apple,garden";
 };
 
-/* An external pipe's PMC enables follow its SYS state, before its FE. */
-&ps_dispext0_fe {
-	power-domains = <&ps_dispext0_sys>, <&pmc_dispext0>;
-};
-
-&ps_dispext1_fe {
-	power-domains = <&ps_dispext1_sys>, <&pmc_dispext1>;
-};
-
 &smc_hwmon {
 	current-ID0R {
 		apple,key-id = "ID0R";

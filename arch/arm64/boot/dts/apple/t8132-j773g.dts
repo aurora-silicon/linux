@@ -38,10 +38,13 @@
 /*
  * iBoot scans out through dispext0 to the HDMI port (dptx-phy and a
  * DP-to-HDMI converter at i2c0 0x08, hot-plug on AOP GPIO 41): keep the
- * power domains used for it on.
+ * power domains used for it on. Hold ps_dispext0_sys (rather than
+ * ps_dispext0_fe, which depends on pmc_dispext0 and thus on apple-pmp) so
+ * simpledrm still binds early when apple-pmp is a module; ps_dispext0_fe
+ * is held always-on and never powered off by genpd.
  */
 &framebuffer0 {
-	power-domains = <&ps_dispext0_fe>, <&ps_dptx_phy>;
+	power-domains = <&ps_dispext0_sys>, <&ps_dptx_phy>;
 };
 
 /*

@@ -1437,6 +1437,15 @@
 
 #include "t8132-memory.dtsi"
 
+/* An external pipe's PMC BWR/boost enables follow its SYS state, before its FE. */
+&ps_dispext0_fe {
+	power-domains = <&ps_dispext0_sys>, <&pmc_dispext0>;
+};
+
+&ps_dispext1_fe {
+	power-domains = <&ps_dispext1_sys>, <&pmc_dispext1>;
+};
+
 #include "t8132-peripherals.dtsi"
 
 #include "t8132-peripheral-buses.dtsi"
