@@ -43,21 +43,38 @@
 #define APPLE_PMP_SLOW_POLL_MS		100
 #define APPLE_PMP_GOVERNOR_NS	100000000ULL
 /*
- * On the 27.2 firmware a cool, idle J713 keeps every sensor dark much longer than
- * APPLE_PMP_GATED_HOLD_NS (13.3 s the longest of 53 spans in 120 s sampled at
- * 100 ms, 86% of samples dark). Dark clusters are powered down, so ride a span out
- * this long as well, but only while the SMC's measured CPU and GPU rails, read no
- * longer ago than the stale limit, add up to less than an idle SoC draws.
+ * On the 27.2 firmware a cool, idle SoC can keep every sensor dark much longer
+ * than APPLE_PMP_GATED_HOLD_NS (measured on a fanless M4: 13.3 s the longest of
+ * 53 spans in 120 s sampled at 100 ms, 86% of samples dark). Dark clusters are
+ * powered down, so ride a span out this long as well, but only while the SMC's
+ * measured CPU and GPU rails, read no longer ago than the stale limit, add up to
+ * less than APPLE_PMP_IDLE_RAILS_MW.
+ *
+ * APPLE_PMP_IDLE_RAILS_MW is a cap, not a tuning value: after an all-core soak
+ * the measured sum of the three rails had a median of 28 mW and stayed under
+ * 70 mW in 99% of 466 1 Hz samples (308 mW at most), while a busy cluster
+ * draws 6-8 W.
  */
 #define APPLE_PMP_GATED_IDLE_HOLD_NS	30000000000ULL
 #define APPLE_PMP_IDLE_RAILS_MW		500
 #define APPLE_PMP_IDLE_RAILS_STALE_NS	1500000000ULL
 /*
- * The long hold only starts from a cool reading: well below the 106 C cooling
- * start, so a die that kept drawing under 500 mW for the whole 30 s still ends
- * far from any trip. Hotter readings keep the 2 s hold only.
+ * The long hold only starts from a reading low enough that the worst measured
+ * rise during the hold still ends below the first cooling trip:
+ *  - rails under APPLE_PMP_IDLE_RAILS_MW for the whole 30 s: at most 3.25 C
+ *    (largest 30 s rise over every such window of two 1 Hz soaks, 1-2 C of it
+ *    sensor quantization);
+ *  - a load step: the rails are re-read every 500 ms and go stale after 1.5 s,
+ *    so a busy SoC rides the hold for at most 2 s; the largest 2 s rise under
+ *    all-core load was 18.75 C.
+ * Hotter readings keep the 2 s hold only.
  */
-#define APPLE_PMP_GATED_IDLE_HOLD_MC	70000
+#define APPLE_PMP_IDLE_HOLD_RISE_MC	3250
+#define APPLE_PMP_LOAD_EDGE_RISE_MC	18750
+#define APPLE_PMP_GATED_IDLE_HOLD_MC	(APPLE_PMP_PASSIVE_MC - \
+					 APPLE_PMP_IDLE_HOLD_RISE_MC - \
+					 APPLE_PMP_LOAD_EDGE_RISE_MC)
+static_assert(APPLE_PMP_GATED_IDLE_HOLD_MC <= APPLE_PMP_GATED_HOLD_MC);
 
 struct apple_pmp_cluster {
 	struct cpufreq_policy *policy;
@@ -417,9 +434,8 @@ static int apple_pmp_guard(unsigned int level)
 }
 
 /*
- * Called with the lock held: did the SMC just see an idle SoC? Only on the
- * fanless machines this rail budget was measured on; a Mac with a fan keeps
- * the 2 s hold alone.
+ * Called with the lock held: did the SMC just see an idle SoC? Only where the
+ * SMC describes no fan (power_budget); a Mac with a fan keeps the 2 s hold alone.
  */
 static bool apple_pmp_rails_idle(u64 now)
 {
