@@ -1247,6 +1247,26 @@ static void ane_transport_shared_reserve_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->t.error, 0);
 }
 
+/*
+ * A backend surface that fails validation fails the transport, as it does for
+ * a request, so a later LOAD does not map another one.
+ */
+static void ane_transport_shared_reserve_invalid_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->alloc_bad = 1;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared_reserve(&f->t, SZ_2M, ANE_FW_SHARED_EXPP),
+			-EPROTO);
+	KUNIT_EXPECT_EQ(test, f->t.error, -EPROTO);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 0U);
+	KUNIT_EXPECT_EQ(test, f->t.shared_bytes, 0UL);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared_reserve(&f->t, SZ_2M, ANE_FW_SHARED_EXPP),
+			-EPROTO);
+	KUNIT_EXPECT_EQ(test, f->allocs, 1U);
+}
+
 /* A FREE posted after UNLOAD is answered by the settle loop. */
 static void ane_transport_settle_test(struct kunit *test)
 {
@@ -1612,6 +1632,7 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_pool_reuse_native_test),
 	KUNIT_CASE(ane_transport_pool_no_free_test),
 	KUNIT_CASE(ane_transport_shared_reserve_test),
+	KUNIT_CASE(ane_transport_shared_reserve_invalid_test),
 	KUNIT_CASE(ane_transport_settle_test),
 	KUNIT_CASE(ane_transport_carry_shared_test),
 	KUNIT_CASE(ane_transport_mode_stop_test),
