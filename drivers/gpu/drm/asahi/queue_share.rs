@@ -57,6 +57,11 @@ fn may_take(held: u32, total: u32, max: u32) -> bool {
 
 /// Counts a new queue against the process `key`; EBUSY when [`may_take`] refuses it.
 fn take(processes: &mut KVec<Process>, key: usize, mm: Option<ARef<Mm>>, max: u32) -> Result {
+    take_with(processes, key, mm, max, GFP_KERNEL)
+}
+
+fn take_with(processes: &mut KVec<Process>, key: usize, mm: Option<ARef<Mm>>, max: u32,
+             flags: kernel::alloc::Flags) -> Result {
     let total = processes.iter().map(|process| process.held).sum::<u32>();
     let index = processes.iter().position(|process| process.key == key);
     let held = index.map_or(0, |index| processes[index].held);
@@ -67,7 +72,7 @@ fn take(processes: &mut KVec<Process>, key: usize, mm: Option<ARef<Mm>>, max: u3
         Some(index) => processes[index].held += 1,
         None => {
             let (tgid, comm) = current_name();
-            processes.push(Process { key, _mm: mm, held: 1, tgid, comm }, GFP_KERNEL)?
+            processes.push(Process { key, _mm: mm, held: 1, tgid, comm }, flags)?
         }
     }
     Ok(())
@@ -114,6 +119,36 @@ fn give_back(processes: &mut KVec<Process>, key: usize) -> Option<Process> {
     (processes[index].held == 0).then(|| processes.swap_remove(index))
 }
 
+/// The current process's key and an `mm` reference that keeps it from being reused.
+fn current_key() -> (usize, Option<ARef<Mm>>) {
+    let mm = kernel::current!().mm().map(|mm| ARef::from(&**mm));
+    (mm.as_ref().map_or(0, |mm| mm.as_raw() as usize), mm)
+}
+
+/// Another device-wide resource shared between processes by the same rule as the queues,
+/// under its owner's lock.
+pub(crate) struct Shares(KVec<Process>);
+
+impl Shares {
+    pub(crate) const fn new() -> Self {
+        Self(KVec::new())
+    }
+
+    /// Counts one more of the `max` against the current process and returns its key; EBUSY
+    /// when [`may_take`] refuses it.
+    pub(crate) fn take_current(&mut self, max: u32, flags: kernel::alloc::Flags) -> Result<usize> {
+        let (key, mm) = current_key();
+        take_with(&mut self.0, key, mm, max, flags)?;
+        Ok(key)
+    }
+
+    /// Gives one back of the process `key`; returns the process once it holds none, to drop
+    /// outside the owner's lock.
+    pub(crate) fn give_back(&mut self, key: usize) -> Option<Process> {
+        give_back(&mut self.0, key)
+    }
+}
+
 /// One queue counted against the process that created it; dropping it gives the queue back.
 pub(crate) struct Share {
     key: usize,
@@ -122,8 +157,7 @@ pub(crate) struct Share {
 impl Share {
     /// Counts a new queue against the current process, of the device's `max` queues.
     pub(crate) fn take_current(max: u32) -> Result<Self> {
-        let mm = kernel::current!().mm().map(|mm| ARef::from(&**mm));
-        let key = mm.as_ref().map_or(0, |mm| mm.as_raw() as usize);
+        let (key, mm) = current_key();
         take(&mut PROCESSES.lock(), key, mm, max)?;
         Ok(Self { key })
     }
