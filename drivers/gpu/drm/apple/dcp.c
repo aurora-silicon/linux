@@ -1844,10 +1844,9 @@ static int dcp_check_iova_contiguous(struct iommu_domain *domain,
 	return 0;
 }
 
-#define DCP_RTKIT_LIVE_V1		1
-#define DCP_RTKIT_LIVE_BUFFER_CELLS	8
+#define DCP_RTKIT_HANDOFF		"dcp-live-v1"
+#define DCP_RTKIT_LIVE_BUFFER_CELLS	5
 #define DCP_RTKIT_LIVE_MAX_BUFFERS	4
-#define DCP_RTKIT_LIVE_LOADER_OWNED	BIT(0)
 
 struct dcp_rtkit_live {
 	struct apple_rtkit_adopted_session session;
@@ -1892,29 +1891,32 @@ static void dcp_rtkit_live_unmap(struct dcp_rtkit_live *live)
 
 /*
  * A boot stage that negotiated RTKit with this DCP and handed it over running
- * describes the session on the node: apple,rtkit-live (layout version),
- * apple,rtkit-version, apple,rtkit-epmap (word i = endpoints 32i..32i+31) and
- * apple,rtkit-live-buffers (<ep flags iova_hi iova_lo phys_hi phys_lo size_hi
- * size_lo> per system buffer, each inside one of the node's memory-region
- * carveouts and mapped there through its iommu-addresses). Such a firmware
- * does not repeat HELLO or EPMAP. Returns 1 with the session filled in, 0 without a description, or an
- * error for one that cannot be adopted safely.
+ * describes the session on the node, with the RTKit handoff properties of other
+ * co-processors handed over running: apple,rtkit-handoff ("dcp-live-v1") and
+ * apple,rtkit-buffers (<ep dva_hi dva_lo size is_mapped> per system buffer, the
+ * device address being the DART input address), plus apple,rtkit-version and
+ * apple,rtkit-epmap (word i = endpoints 32i..32i+31). Each buffer lies in one of
+ * the node's memory-region carveouts, mapped there through its iommu-addresses.
+ * Such a firmware does not repeat HELLO or EPMAP. Returns 1 with the session
+ * filled in, 0 without a description, or an error for one that cannot be adopted
+ * safely.
  */
 static int dcp_rtkit_live_parse(struct apple_dcp *dcp, struct dcp_rtkit_live *live)
 {
 	u32 cells[DCP_RTKIT_LIVE_MAX_BUFFERS * DCP_RTKIT_LIVE_BUFFER_CELLS];
 	struct device_node *np = dcp->dev->of_node;
 	struct iommu_domain *domain;
-	u32 layout, version;
+	const char *handoff;
 	int count, i, ret;
+	u32 version;
 
-	if (!of_property_present(np, "apple,rtkit-live"))
+	if (!of_property_present(np, "apple,rtkit-handoff"))
 		return 0;
-	ret = of_property_read_u32(np, "apple,rtkit-live", &layout);
+	ret = of_property_read_string(np, "apple,rtkit-handoff", &handoff);
 	if (ret)
 		return ret;
-	if (layout != DCP_RTKIT_LIVE_V1) {
-		dev_err(dcp->dev, "unknown live RTKit layout %u\n", layout);
+	if (strcmp(handoff, DCP_RTKIT_HANDOFF)) {
+		dev_err(dcp->dev, "unknown RTKit handoff \"%s\"\n", handoff);
 		return -EINVAL;
 	}
 	if (!(readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL) &
@@ -1932,14 +1934,14 @@ static int dcp_rtkit_live_parse(struct apple_dcp *dcp, struct dcp_rtkit_live *li
 	if (ret)
 		return ret;
 
-	count = of_property_count_u32_elems(np, "apple,rtkit-live-buffers");
-	if (count == -EINVAL)
+	count = of_property_count_u32_elems(np, "apple,rtkit-buffers");
+	if (count == -EINVAL || count == -ENODATA)
 		count = 0;
 	if (count < 0 || count > ARRAY_SIZE(cells) ||
 	    count % DCP_RTKIT_LIVE_BUFFER_CELLS)
 		return -EINVAL;
 	if (count) {
-		ret = of_property_read_u32_array(np, "apple,rtkit-live-buffers",
+		ret = of_property_read_u32_array(np, "apple,rtkit-buffers",
 						 cells, count);
 		if (ret)
 			return ret;
@@ -1954,30 +1956,29 @@ static int dcp_rtkit_live_parse(struct apple_dcp *dcp, struct dcp_rtkit_live *li
 	for (i = 0; i < count; i++) {
 		const u32 *t = &cells[i * DCP_RTKIT_LIVE_BUFFER_CELLS];
 		struct apple_rtkit_inherited_buffer *b = &live->buffers[i];
-		u64 iova = (u64)t[2] << 32 | t[3];
-		u64 phys = (u64)t[4] << 32 | t[5];
-		u64 size = (u64)t[6] << 32 | t[7];
+		u64 iova = (u64)t[1] << 32 | t[2];
+		u64 size = t[3];
+		phys_addr_t phys;
 
-		if (t[0] > U8_MAX || (t[1] & ~DCP_RTKIT_LIVE_LOADER_OWNED) ||
-		    !size || size > SZ_16M || !PAGE_ALIGNED(phys) ||
-		    !PAGE_ALIGNED(size) || iova + size < iova ||
-		    phys + size < phys) {
+		/* The system endpoints with shared buffers, as for other handoffs. */
+		if ((t[0] != 1 && t[0] != 2 && t[0] != 4 && t[0] != 8) ||
+		    t[4] > 1 || !size || size > SZ_16M || !PAGE_ALIGNED(iova) ||
+		    !PAGE_ALIGNED(size) || iova + size < iova) {
 			ret = -EINVAL;
 			goto fail;
 		}
-		if (!dcp_rtkit_live_carveout(np, phys, size)) {
-			dev_err(dcp->dev, "live RTKit buffer %#llx+%#llx is not in a DCP carveout\n",
-				phys, size);
-			ret = -EACCES;
+		/* The DCP's own DART says where the buffer is; it must be contiguous. */
+		phys = iommu_iova_to_phys(domain, iova);
+		ret = phys ? dcp_check_iova_contiguous(domain, iova, size, phys) : -ENXIO;
+		if (ret) {
+			dev_err(dcp->dev, "live RTKit buffer ep%u iova %#llx+%#llx is not mapped\n",
+				t[0], iova, size);
 			goto fail;
 		}
-		/* The DCP's own DART must already translate it to that memory. */
-		ret = dcp_check_iova_contiguous(domain, iova, size, phys);
-		if (ret) {
-			dev_err(dcp->dev,
-				"live RTKit buffer ep%u iova %#llx is not mapped to %#llx (DART: %pa)\n",
-				t[0], iova, phys,
-				&(phys_addr_t){ iommu_iova_to_phys(domain, iova) });
+		if (!dcp_rtkit_live_carveout(np, phys, size)) {
+			dev_err(dcp->dev, "live RTKit buffer %pa+%#llx is not in a DCP carveout\n",
+				&phys, size);
+			ret = -EACCES;
 			goto fail;
 		}
 
@@ -7510,7 +7511,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	/* A boot stage handed this DCP over running: keep its session. */
-	if (of_property_present(dev->of_node, "apple,rtkit-live"))
+	if (of_property_present(dev->of_node, "apple,rtkit-handoff"))
 		dcp->hw.adopt_live_session = true;
 	/* The link report: on the board it has run on (dcp_j714s_ext()). */
 	if (!dcp_j714s_ext(dev))

@@ -473,7 +473,7 @@ struct apple_dcp {
 	struct iomfb_m4 *v26_6;
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
 	bool retain_dma;
-	/* RTKit session handed over running by a boot stage (apple,rtkit-live) */
+	/* RTKit session handed over running by a boot stage (apple,rtkit-handoff) */
 	bool rtkit_adopted;
 	/*
 	 * Allocates AFK rings where the DMA API cannot, on an adopted
