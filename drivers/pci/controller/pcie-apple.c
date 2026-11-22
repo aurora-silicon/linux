@@ -3846,6 +3846,26 @@ static bool apple_pcie_adopted_link_trained_by(struct apple_pcie *pcie,
 	return false;
 }
 
+/*
+ * The slot of @port's RID-to-SID table that already maps @rid, or -ENOENT.
+ * pci_reenable_device() (at a resume, after a bridge's resources are resized)
+ * enables a function again without disabling it first. Its entry must be
+ * found, not added again: the disable hook takes back one entry only, and a
+ * table indexed by SID would refuse the second one with -EBUSY.
+ */
+static int apple_pcie_rid2sid_find(struct apple_pcie_port *port, u32 rid)
+{
+	int idx;
+
+	for_each_set_bit(idx, port->sid_map, port->sid_map_sz) {
+		u32 entry = apple_pcie_port_readl(port, port_rid2sid_offset(port, idx));
+
+		if ((entry & PORT_RID2SID_VALID) && (entry & 0xffff) == rid)
+			return idx;
+	}
+	return -ENOENT;
+}
+
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
@@ -3916,7 +3936,11 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 		return -EBUSY;
 	}
 
-	if (port->pcie->managed_sids || port->pcie->hw->sid_indexed_rid2sid) {
+	/* A function enabled again keeps its slot. Managed admission still refuses it. */
+	idx = pcie->managed_sids ? -ENOENT : apple_pcie_rid2sid_find(port, rid);
+	if (idx >= 0) {
+		dev_dbg(&pdev->dev, "RID%x keeps RID-to-SID slot %d\n", rid, idx);
+	} else if (port->pcie->managed_sids || port->pcie->hw->sid_indexed_rid2sid) {
 		if (sid >= port->sid_map_sz ||
 		    (pcie->managed_sids && (!rid || !sid || sid >= 16 ||
 					  !(pcie->managed_sids & BIT(sid)))))
