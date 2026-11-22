@@ -8,6 +8,7 @@
 #include <linux/ktime.h>
 #include <linux/miscdevice.h>
 #include <linux/poll.h>
+#include <linux/refcount.h>
 #include <linux/rwsem.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
@@ -26,7 +27,13 @@ struct sep_bio_chardev {
 	long (*f_ioctl)(void *ctx, unsigned int cmd, unsigned long arg);
 	int (*f_ready)(void *ctx);
 	bool registered;
-	int open_count;
+	/*
+	 * One reference for the registration and one per open file. The holder
+	 * that drops the last one frees @d, after its own unlock of @lock has
+	 * returned: mutex_unlock() can still touch the mutex after a waiter has
+	 * taken it, so @d must not be freed by whoever takes @lock next.
+	 */
+	refcount_t refs;
 	/*
 	 * Concurrent devices run ioctls without @lock, so an ioctl that sleeps
 	 * (a touch-gated signature waits up to a minute for a finger) does not
@@ -55,29 +62,31 @@ static int sep_bio_fop_open(struct inode *inode, struct file *file)
 	}
 	ret = d->f_open(d->ctx);
 	if (!ret)
-		d->open_count++;
+		refcount_inc(&d->refs);
 	mutex_unlock(&d->lock);
 
 	return ret;
 }
 
+static void sep_bio_put(struct sep_bio_chardev *d)
+{
+	if (refcount_dec_and_test(&d->refs)) {
+		mutex_destroy(&d->lock);
+		kfree(d);
+	}
+}
+
 static int sep_bio_fop_release(struct inode *inode, struct file *file)
 {
 	struct sep_bio_chardev *d = from_file(file);
-	bool last;
 
 	mutex_lock(&d->lock);
 	if (d->ctx)
 		d->f_release(d->ctx);
-	d->open_count--;
-	last = (d->open_count == 0) && !d->ctx;
 	mutex_unlock(&d->lock);
 
-	/* Detached while this file was open: nobody else can reach it now. */
-	if (last) {
-		mutex_destroy(&d->lock);
-		kfree(d);
-	}
+	/* Frees d if it was detached while this file was open. */
+	sep_bio_put(d);
 
 	return 0;
 }
@@ -152,6 +161,7 @@ static void *__sep_bio_register(const char *name, unsigned short mode, void *ctx
 	init_waitqueue_head(&d->wq);
 	mutex_init(&d->lock);
 	init_rwsem(&d->life);
+	refcount_set(&d->refs, 1);
 	d->concurrent = concurrent;
 	d->ctx = ctx;
 	d->f_open = f_open;
@@ -204,7 +214,6 @@ void *sep_bio_register_concurrent(const char *name, unsigned short mode,
 void sep_bio_unregister(void *dev)
 {
 	struct sep_bio_chardev *d = dev;
-	bool free_now;
 
 	if (!d)
 		return;
@@ -216,16 +225,12 @@ void sep_bio_unregister(void *dev)
 	down_write(&d->life);
 	mutex_lock(&d->lock);
 	WRITE_ONCE(d->ctx, NULL);
-	free_now = (d->open_count == 0);
 	wake_up_interruptible(&d->wq);
-	/* Before the mutex: the last close may free d once it is dropped. */
 	up_write(&d->life);
 	mutex_unlock(&d->lock);
 
-	if (free_now) {
-		mutex_destroy(&d->lock);
-		kfree(d);
-	}
+	/* Files still open keep d until their release. */
+	sep_bio_put(d);
 }
 
 void sep_bio_wake(void *dev)
