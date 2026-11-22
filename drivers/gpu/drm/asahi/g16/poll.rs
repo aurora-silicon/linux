@@ -93,6 +93,7 @@ impl Shared {
                 break;
             }
             let mut done = Completions::new();
+            let mut scrubs = super::slots::ScrubBatch::new();
             let mut retry_tail = false;
             if let Some(firmware) = self.state.lock().as_deref_mut() {
                 if self.sleeping.load(Ordering::Acquire) {
@@ -147,8 +148,13 @@ impl Shared {
                         self.fail_stop(error);
                     }
                 }
+                let allow_stage = firmware.recovery.failed().is_none() && !firmware.engine.frozen;
+                scrubs = firmware.slots.stage_and_take_scrubs(allow_stage);
             }
             job::complete_all(done);
+            if scrubs.run() {
+                self.poll_now();
+            }
             if !retry_tail {
                 break;
             }
@@ -261,12 +267,17 @@ impl Shared {
     pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
         let signalling = kernel::dma_fence::SignallingGuard::new();
         let mut done = Completions::new();
-        let accepted = {
+        let (accepted, scrubs) = {
             let mut state = self.state.lock();
             let firmware = state.as_deref_mut().ok_or(ENODEV)?;
-            self.submit_locked(firmware, job, &mut done)
+            let res = self.submit_locked(firmware, job, &mut done);
+            let allow_stage = firmware.recovery.failed().is_none() && !firmware.engine.frozen;
+            (res, firmware.slots.stage_and_take_scrubs(allow_stage))
         };
         job::complete_all(done);
+        if scrubs.run() {
+            self.poll_now();
+        }
         drop(signalling);
         self.notify_wedged();
         accepted
@@ -277,17 +288,27 @@ impl Shared {
     pub(crate) fn try_submit_inline(self: &Arc<Self>, job: Arc<Job>) -> Option<Result> {
         let signalling = kernel::dma_fence::SignallingGuard::new();
         let mut done = Completions::new();
+        let mut scrubs = super::slots::ScrubBatch::new();
         let accepted = {
             let mut state = self.state.try_lock()?;
             if self.sleeping.load(Ordering::Acquire) {
                 return None;
             }
             match state.as_deref_mut() {
-                Some(firmware) => self.submit_locked(firmware, job, &mut done),
+                Some(firmware) => {
+                    let res = self.submit_locked(firmware, job, &mut done);
+                    let allow_stage =
+                        firmware.recovery.failed().is_none() && !firmware.engine.frozen;
+                    scrubs = firmware.slots.stage_and_take_scrubs(allow_stage);
+                    res
+                }
                 None => Err(ENODEV),
             }
         };
         job::complete_all(done);
+        if scrubs.run() {
+            self.poll_now();
+        }
         drop(signalling);
         self.notify_wedged();
         Some(accepted)
@@ -1064,6 +1085,9 @@ impl Firmware {
                     return;
                 }
             }
+            if receipt.owner_retired() && f.renders != 0 {
+                self.slots.note_render_retired();
+            }
         }
         if self.engine.flights.is_empty() {
             // Drained: a gap until the next publication.
@@ -1526,7 +1550,9 @@ impl Firmware {
         writeln!(
             f,
             "pass_scrub: passes {} tpc_clear_bytes {} tilemap_clear_bytes {}",
-            slots.pass_scrubs, slots.tpc_clear_bytes, slots.tilemap_clear_bytes
+            self.slots.pass_scrubs_total(),
+            slots.tpc_clear_bytes,
+            self.slots.tilemap_clear_bytes_total()
         )?;
         writeln!(f, "type0: fs2c {} c2ta {}", s.fs2c0, s.c2ta0)?;
         write!(f, "horizon:")?;

@@ -54,6 +54,7 @@ impl Firmware {
         Ok(self.engine.flights.is_empty()
             && self.engine.pending.is_empty()
             && !self.engine.frozen
+            && !self.slots.scrubbing_active()
             && self.recovery_idle()?)
     }
 

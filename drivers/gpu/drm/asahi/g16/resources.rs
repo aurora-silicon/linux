@@ -191,6 +191,19 @@ pub(crate) enum PassOwnerArena {
     Ext(Arc<RenderExtArena>),
 }
 
+impl PassOwnerArena {
+    /// Returns the pass slot and its tilemap dirty high-water mark for global slot `k`.
+    pub(crate) fn pass_and_tilemap_dirty(&self, k: usize) -> Option<(&PassSlot, &AtomicU64)> {
+        match self {
+            Self::Base(arena) => Some((arena.passes.get(k)?, arena.tilemap_dirty.get(k)?)),
+            Self::Ext(arena) => {
+                let idx = k.checked_sub(BASE_RENDER_SLOTS)?;
+                Some((arena.passes.get(idx)?, arena.tilemap_dirty.get(idx)?))
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Ready {
     compute: Option<Arc<ComputeArena>>,

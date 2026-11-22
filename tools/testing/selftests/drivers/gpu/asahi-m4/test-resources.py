@@ -146,20 +146,25 @@ pub mod g16 {
     }
     pub mod resources {
         use core::sync::atomic::{AtomicU64,Ordering};use crate::*;
-        pub struct ComputeArena{pub compute:KVec<super::slots::ComputeSlot>}
+        pub struct ComputeArena{pub compute:KVec<super::slots::ComputeSlot>,pub render:Option<crate::sync::Arc<RenderArena>>}
         // A job's compute units; here one arena.
         pub type Prepared=ComputeArena;
         #[derive(Clone)]
         pub enum PassOwnerArena{Base(crate::sync::Arc<RenderArena>)}
+        impl PassOwnerArena{
+            pub fn pass_and_tilemap_dirty(&self,k:usize)->Option<(&super::slots::PassSlot,&AtomicU64)>{
+                match self{Self::Base(a)=>Some((a.passes.get(k)?,a.tilemap_dirty.get(k)?))}
+            }
+        }
         impl ComputeArena{
             pub fn compute_units(&self)->Result<usize>{Ok(self.compute.len())}
             pub fn compute_unit(&self,k:usize)->Result<&super::slots::ComputeSlot>{self.compute.get(k).ok_or(EINVAL)}
             pub fn compute_arena(&self,_k:usize)->Option<crate::sync::Arc<ComputeArena>>{None}
-            pub fn render_arena(&self)->Option<crate::sync::Arc<RenderArena>>{None}
-            pub fn render_passes(&self)->Result<usize>{Err(EINVAL)}
-            pub fn render_pass(&self,_k:usize)->Result<&super::slots::PassSlot>{Err(EINVAL)}
-            pub fn render_pass_dirty(&self,_k:usize)->Result<(&AtomicU64,&AtomicU64)>{Err(EINVAL)}
-            pub fn pass_owner_arena(&self,_k:usize)->Option<PassOwnerArena>{None}
+            pub fn render_arena(&self)->Option<crate::sync::Arc<RenderArena>>{self.render.clone()}
+            pub fn render_passes(&self)->Result<usize>{self.render.as_deref().map(|r|r.passes.len()).ok_or(EINVAL)}
+            pub fn render_pass(&self,k:usize)->Result<&super::slots::PassSlot>{self.render.as_deref().and_then(|r|r.passes.get(k)).ok_or(EINVAL)}
+            pub fn render_pass_dirty(&self,k:usize)->Result<(&AtomicU64,&AtomicU64)>{let r=self.render.as_deref().ok_or(EINVAL)?;if k>=r.passes.len(){return Err(EINVAL);}Ok((&r.tpc_dirty[k],&r.tilemap_dirty[k]))}
+            pub fn pass_owner_arena(&self,_k:usize)->Option<PassOwnerArena>{self.render.as_ref().map(|r|PassOwnerArena::Base(r.clone()))}
         }
         pub struct RenderArena{pub passes:KVec<super::slots::PassSlot>,pub tpc_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS],pub tilemap_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS]}
         impl RenderArena{ __SET_DIRTY__ }
@@ -179,7 +184,7 @@ pub mod g16 {
     fn arenas(o:&mut Objects)->Arenas{
         let mut compute=KVec::new();let mut passes=KVec::new();
         for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
-        Arenas{compute:g16::resources::ComputeArena{compute},render:g16::resources::RenderArena{passes,tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS]}}
+        Arenas{compute:g16::resources::ComputeArena{compute,render:None},render:g16::resources::RenderArena{passes,tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS]}}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();}
     #[test]fn render_reuse_clears_only_previous_write_spans(){
@@ -755,6 +760,139 @@ pub mod g16 {
         assert_eq!(s.render_published(),0);
     }
 
+    #[test]fn offlock_scrub_cleans_displaced_slot_and_skips_sync_scrub_on_same_vm_claim(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
+        let render=sync::Arc::new(arena.render,0).unwrap();
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone())};
+        let a=vm(1);
+        let geo=g16::encode::Geometry{tpc_bytes:0x2000,tilemap_bytes:0x4000};
+        // Publish and retire slot 0: not displaced yet, so nothing is staged.
+        let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
+        s.claim_pass_in(&prep,0,Some(a.id),0x4000).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();
+        render.set_dirty(0,0x2000,0x4000).unwrap();
+        render.passes[0].tilemap.fill(0,0xab,0x4000).unwrap();
+        render.passes[0].its.fill(0,0xcd,32).unwrap();
+        s.retire(&mut c0).unwrap();
+        s.stage_displaced_pass_scrubs();
+        assert!(!s.scrubbing_active());
+        assert!(!s.take_staged_scrubs().run());
+        // Publish and retire slot 1: displaces slot 0, staging slot 0 for off-lock scrub.
+        let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
+        s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();
+        s.retire(&mut c1).unwrap();
+        s.stage_displaced_pass_scrubs();
+        assert!(s.scrubbing_active());
+        // While slot 0 scrubs off-lock it cannot be picked or claimed, and waiter is recorded.
+        assert!(!s.pass_available(2));
+        assert_eq!(s.pick_pass_in(&prep,&geo,0),None);
+        assert_eq!(s.claim_pass_in(&prep,0,Some(a.id),0x4000),Err(EBUSY));
+        let batch=s.take_staged_scrubs();
+        assert!(batch.run());
+        assert!(!s.scrubbing_active());
+        assert!(render.passes[0].tilemap.snapshot()[..0x4000].iter().all(|&b|b==0));
+        assert!(render.passes[0].its.snapshot()[..32].iter().all(|&b|b==0));
+        assert_eq!(render.tilemap_dirty[0].load(std::sync::atomic::Ordering::Acquire),0);
+        // Next same-VM claim picks pre-cleaned slot 0 and performs zero WC fills under lock.
+        let fills_before=render.passes[0].tilemap.fills.lock().unwrap().len();
+        let its_before=render.passes[0].its.fills.lock().unwrap().len();
+        assert_eq!(s.pick_pass_in(&prep,&geo,0),Some(0));
+        s.claim_pass_in(&prep,0,Some(a.id),0x4000).unwrap();
+        assert!(!s.render_needs_full_work(0));
+        assert_eq!(render.passes[0].tilemap.fills.lock().unwrap().len(),fills_before);
+        assert_eq!(render.passes[0].its.fills.lock().unwrap().len(),its_before);
+    }
+
+    #[test]fn offlock_scrub_falls_back_on_error_drop_recovery_and_cross_vm(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
+        let render=sync::Arc::new(arena.render,0).unwrap();
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone())};
+        let a=vm(1);let b=vm(2);
+        // Prime and displace slot 0.
+        let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
+        s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();
+        render.set_dirty(0,0x1000,0x2000).unwrap();
+        render.passes[0].tilemap.fill(0,0x55,0x2000).unwrap();
+        s.retire(&mut c0).unwrap();
+        let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
+        s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();
+        s.retire(&mut c1).unwrap();
+        // Dropped batch clears scrubbing bit without marking clean.
+        s.stage_displaced_pass_scrubs();
+        assert!(s.scrubbing_active());
+        drop(s.take_staged_scrubs());
+        assert!(!s.scrubbing_active());
+        // Failed off-lock scrub preserves tilemap_dirty and falls back synchronously.
+        s.stage_displaced_pass_scrubs();
+        render.passes[0].tilemap.fail_fill.store(true,std::sync::atomic::Ordering::Relaxed);
+        assert!(!s.take_staged_scrubs().run());
+        assert_eq!(render.tilemap_dirty[0].load(std::sync::atomic::Ordering::Acquire),0x2000);
+        let fills_before=render.passes[0].tilemap.fills.lock().unwrap().len();
+        s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
+        assert!(render.passes[0].tilemap.fills.lock().unwrap().len()>fills_before);
+        assert!(render.passes[0].tilemap.snapshot()[..0x2000].iter().all(|&b|b==0));
+        // Cancel, re-displace, pre-scrub clean, then invalidate_scrub() or cross-VM forces full scrub.
+        let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();s.retire(&mut c0).unwrap();
+        let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
+        s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();s.retire(&mut c1).unwrap();
+        s.stage_displaced_pass_scrubs();
+        let _=s.take_staged_scrubs().run();
+        s.invalidate_scrub();
+        s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
+        assert!(s.render_needs_full_work(0));
+        let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();s.retire(&mut c0).unwrap();
+        let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
+        s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();s.retire(&mut c1).unwrap();
+        s.stage_displaced_pass_scrubs();
+        let _=s.take_staged_scrubs().run();
+        s.claim_pass_in(&prep,0,Some(b.id),0x2000).unwrap();
+        assert!(s.render_needs_full_work(0));
+    }
+    #[test]fn post_publish_scrub_staging_does_not_block_immediate_slot_reuse(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
+        let render=sync::Arc::new(arena.render,0).unwrap();
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone())};
+        let a=vm(1);
+        let geo=g16::encode::Geometry{tpc_bytes:0x1000,tilemap_bytes:0x2000};
+        // Prime slot 0, then displace it by retiring slot 1; record retirement without staging yet.
+        let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
+        s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();
+        render.set_dirty(0,0x1000,0x2000).unwrap();
+        render.passes[0].tilemap.fill(0,0x77,0x2000).unwrap();
+        s.retire(&mut c0).unwrap();
+        s.note_render_retired();
+        let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
+        s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();
+        s.retire(&mut c1).unwrap();
+        s.note_render_retired();
+        // Immediate publication in the same lock hold sees slot 0 available and NOT scrubbing.
+        assert!(!s.scrubbing_active());
+        assert!(s.pass_available(2));
+        assert_eq!(s.pick_pass_in(&prep,&geo,0),Some(0));
+        // Disallowed staging (fail-stop / frozen) stages nothing and clears pending flag.
+        assert!(!s.stage_and_take_scrubs(false).run());
+        assert!(!s.scrubbing_active());
+        // Allowed staging after publication stages idle displaced slot 0 and scrubs it off-lock.
+        s.note_render_retired();
+        let batch=s.stage_and_take_scrubs(true);
+        assert!(s.scrubbing_active());
+        assert!(!batch.run());
+        assert!(!s.scrubbing_active());
+        assert!(render.passes[0].tilemap.snapshot()[..0x2000].iter().all(|&b|b==0));
+        // Calling stage_and_take_scrubs again without a new render retirement is a no-op.
+        assert!(!s.stage_and_take_scrubs(true).run());
+        assert!(!s.scrubbing_active());
+    }
+
 }
 '''
 budget=(production/'budget.rs').read_text()
@@ -799,7 +937,7 @@ for command in [
         raise SystemExit(result.returncode)
 files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs']
 (out/'resource-host.json').write_text(json.dumps({
-    'result': 'pass', 'tests': 26,
+    'result': 'pass', 'tests': 27,
     'scope': 'Actual production allocation, initialization and lifetime code against a CPU-only backing recorder; no hardware qualification.',
     'private_rw_pte': hex(private_rw),
     'private_rw_reference': 'Qualified J713 NC read/write leaf attributes',
