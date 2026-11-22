@@ -10,10 +10,16 @@ queue_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/queue.rs').read_text(
 event_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/event.rs').read_text()
 mod_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/mod.rs').read_text()
 sleep_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/sleep.rs').read_text()
+core_source = (kernel_root() / 'drivers/gpu/drm/asahi/asahi_core.rs').read_text()
 source = production.read_text()
 output = output_dir()
 
 assert 'const EVENT_RETIRE_POLLS: u32 = 11;' in source, 'EVENT_RETIRE_POLLS expected to be 11'
+assert 'const ACTIVE_HOUSEKEEPING_NS: u64 = 5_000_000;' in source, 'ACTIVE_HOUSEKEEPING_NS expected to be 5 ms'
+assert 'const MAX_EVENT_RECHECKS: u32 = 8;' in source, 'MAX_EVENT_RECHECKS expected to be 8'
+assert 'rechecks < MAX_EVENT_RECHECKS' in source, 'run_poll must loop-recheck evented completions'
+assert 'self.idle_resnap();' in source, 'run_poll idle paths must use idle_resnap()'
+assert 'g16_repoll_us: u32 {\n            default: 8,' in core_source, 'g16_repoll_us default expected to be 8'
 assert (
     'OwnedQueue::new_percpu_reclaim(c_str!("aurora_g16_events"), true)' in mod_source
 ), 'aurora_g16_events must use new_percpu_reclaim(..., true)'
@@ -29,6 +35,9 @@ assert (
 assert (
     'self.events_unbound.drain();' in sleep_source
 ), 'sleep.rs must drain events_unbound on suspend'
+assert (
+    'self.cancel_resnap();' in sleep_source
+), 'sleep.rs must still call unconditional cancel_resnap()'
 
 
 def item(declaration, text=source):
@@ -51,6 +60,7 @@ struct Error(i32);
 type Result<T = ()> = std::result::Result<T, Error>;
 
 const HOUSEKEEPING_NS: u64 = 1_000_000;
+const ACTIVE_HOUSEKEEPING_NS: u64 = 5_000_000;
 const AUX_DRAIN_NS: u64 = 10_000_000;
 const EVENT_RETIRE_POLLS: u32 = 11;
 mod hw {
@@ -445,12 +455,35 @@ fn submit_locked_preserves_evented_when_irq_precedes_receipt() {
         .unwrap();
     assert_eq!(fw.retire_calls, 1);
     assert!(shared.evented.load(Ordering::Acquire));
+    assert_eq!(shared.rearm_soon.get(), 1);
+    assert_eq!(shared.poll_now_calls.get(), 1);
+
+    // TA-only non-terminal event must NOT restore evented, arm short repoll, or kick poll_now.
+    let shared_ta = Shared::new();
+    shared_ta.evented.store(true, Ordering::Release);
+    let mut fw_ta = Firmware::new();
+    fw_ta.engine.flights.push(Flight {
+        computes: 0,
+        renders: 1,
+        target: 0,
+        fs_target: 0x100,
+    });
+    fw_ta.engine.fs_target = 0x100;
+    fw_ta.drain_stage_delta = 1;
+    fw_ta.drain_fs_delta = 0;
+    shared_ta
+        .submit_locked(&mut fw_ta, Arc::new(Job { id: 3 }), &mut done)
+        .unwrap();
+    assert!(!shared_ta.evented.load(Ordering::Acquire));
+    assert_eq!(shared_ta.rearm_soon.get(), 0);
+    assert_eq!(shared_ta.poll_now_calls.get(), 0);
 }
 
 #[test]
 fn submit_locked_defers_housekeeping_and_arms_short_repoll_on_coalesced_event() {
-    // Housekeeping due (> 1 ms): submit_locked must NOT run synchronous publish(); it
-    // calls publish_checked() and kicks poll_now() so housekeeping runs off SUBMIT.
+    // Active bursts hold housekeeping at ACTIVE_HOUSEKEEPING_NS (5 ms): at 4 ms (< 5 ms),
+    // submit_locked skips poll_now(); at 5 ms, it calls publish_checked() and kicks poll_now()
+    // so housekeeping runs off SUBMIT.
     CLOCK.with(|c| c.set(5_000_000));
     let shared = Shared::new();
     let mut fw = Firmware::new();
@@ -476,6 +509,16 @@ fn submit_locked_defers_housekeeping_and_arms_short_repoll_on_coalesced_event() 
     assert_eq!(fw.publish_full_calls, 0);
     assert_eq!(fw.publish_checked_calls, 1);
     assert_eq!(fw.retire_calls, 0);
+    assert_eq!(shared.poll_now_calls.get(), 0);
+    assert_eq!(shared.rearm_soon.get(), 0);
+
+    // At 5 ms (>= ACTIVE_HOUSEKEEPING_NS), submit_locked defers housekeeping via poll_now().
+    CLOCK.with(|c| c.set(6_000_000));
+    shared
+        .submit_locked(&mut fw, Arc::new(Job { id: 4 }), &mut done)
+        .unwrap();
+    assert_eq!(fw.publish_full_calls, 0);
+    assert_eq!(fw.publish_checked_calls, 2);
     assert_eq!(shared.poll_now_calls.get(), 1);
     assert_eq!(shared.rearm_soon.get(), 0);
 
@@ -483,11 +526,43 @@ fn submit_locked_defers_housekeeping_and_arms_short_repoll_on_coalesced_event() 
     shared.evented.store(true, Ordering::Release);
     fw.retire_on_call = true;
     shared
-        .submit_locked(&mut fw, Arc::new(Job { id: 4 }), &mut done)
+        .submit_locked(&mut fw, Arc::new(Job { id: 5 }), &mut done)
         .unwrap();
     assert_eq!(fw.retire_calls, 1);
     assert_eq!(fw.engine.flights.len(), 1);
     assert_eq!(shared.rearm_soon.get(), 1);
+}
+
+#[test]
+fn poll_step_defers_active_housekeeping_until_five_ms_and_off_hot_lock() {
+    let mut fw = Firmware::new();
+    fw.last_housekeeping_ns = 1_000_000;
+    fw.engine.flights.push(Flight {
+        computes: 1,
+        renders: 0,
+        target: 0x100,
+        fs_target: 0,
+    });
+    fw.engine.target = 0x100;
+    let mut retry_tail = false;
+    let mut deferred = false;
+    let mut done = vec![];
+
+    // At 4 ms (< 5 ms) while busy: housekeeping neither runs inline nor defers.
+    CLOCK.with(|c| c.set(5_000_000));
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(!deferred);
+    assert_eq!(fw.last_housekeeping_ns, 1_000_000);
+
+    // At 5 ms (>= 5 ms) while busy: defers off the hot poll_step lock instead of running inline.
+    CLOCK.with(|c| c.set(6_000_000));
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(deferred);
+    assert_eq!(fw.last_housekeeping_ns, 1_000_000);
 }
 
 #[test]
@@ -1107,8 +1182,54 @@ mod resnap_sync_test {
         }
 
         __CANCEL_RESNAP__
+        __IDLE_RESNAP__
         __REARM_US__
         __REARM__
+        __NOTE_FLIGHT_US__
+    }
+
+    #[test]
+    fn idle_resnap_avoids_churn_for_short_armed_timer_while_cancelling_long_or_stale() {
+        CLOCK.store(100_000, Ordering::Release);
+        let shared = Shared::new();
+        // Unarmed idle: no-op without dropping anything.
+        shared.idle_resnap();
+        assert_eq!(shared.drops.load(Ordering::Acquire), 0);
+
+        // Short armed timer (<= resnap_us = 100 us): preserved across brief d=1 idle gap.
+        shared.rearm(false);
+        assert_eq!(shared.starts.load(Ordering::Acquire), 1);
+        CLOCK.store(120_000, Ordering::Release);
+        shared.idle_resnap();
+        assert_eq!(shared.drops.load(Ordering::Acquire), 0);
+        assert!(shared.resnap_handle.lock().is_some());
+
+        // Next submission arriving within window reuses the armed timer without restart.
+        shared.rearm(false);
+        assert_eq!(shared.starts.load(Ordering::Acquire), 1);
+        assert_eq!(shared.drops.load(Ordering::Acquire), 0);
+
+        // Overdue or > resnap_us timer falls back to unconditional cancel_resnap().
+        CLOCK.store(200_000, Ordering::Release);
+        shared.idle_resnap();
+        assert_eq!(shared.drops.load(Ordering::Acquire), 1);
+        assert!(shared.resnap_handle.lock().is_none());
+        assert_eq!(shared.resnap_deadline_ns.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn note_flight_us_decays_rapidly_downward_for_burst_transitions() {
+        let shared = Shared::new();
+        shared.note_flight_us(260);
+        assert_eq!(shared.ewma_flight_us.load(Ordering::Relaxed), 260);
+        // Three 20 us flights decay rapidly below 2 * resnap_us (200 -> 140 -> 80 -> 50).
+        shared.note_flight_us(20);
+        assert_eq!(shared.ewma_flight_us.load(Ordering::Relaxed), 140);
+        shared.note_flight_us(20);
+        assert_eq!(shared.ewma_flight_us.load(Ordering::Relaxed), 80);
+        shared.note_flight_us(20);
+        assert_eq!(shared.ewma_flight_us.load(Ordering::Relaxed), 50);
+        assert_eq!(shared.rearm_us(false), 25);
     }
 
     #[test]
@@ -1310,11 +1431,13 @@ for token, decl in {
     '__TA_WAVE_READY__': 'fn ta_wave_ready(',
     '__OLDEST_STAMP_REACHED__': 'fn oldest_stamp_reached(',
     '__CANCEL_RESNAP__': 'pub(crate) fn cancel_resnap(',
+    '__IDLE_RESNAP__': 'pub(crate) fn idle_resnap(',
     '__REARM_US__': 'pub(crate) fn rearm_us(',
     '__REARM__': 'pub(crate) fn rearm(',
     '__POLL_NOW__': 'pub(crate) fn poll_now(',
 }.items():
     harness = harness.replace(token, item(decl).replace('super::hw::', 'hw::'))
+harness = harness.replace('__NOTE_FLIGHT_US__', item('pub(crate) fn note_flight_us(', mod_source))
 for token, decl in {
     '__EVENT_DRAIN__': 'pub(crate) fn drain(',
     '__EVENT_DRAIN_STATS__': 'pub(crate) fn drain_statistics(',
@@ -1338,7 +1461,7 @@ for command in [
     json.dumps(
         {
             'passed': True,
-            'tests': 18,
+            'tests': 21,
             'cpu_only': True,
             'hardware_execution': False,
             'scope': 'Verbatim production submit_locked inline retirement and poll_step TA-only non-spin logic.',

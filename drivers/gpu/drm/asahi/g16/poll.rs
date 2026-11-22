@@ -12,7 +12,7 @@
 //! to [`EVENT_RETIRE_POLLS`] trailing 5 us waits run with `Shared::state` dropped so concurrent
 //! submissions are not blocked, stopping as soon as any flight retires. Wakeups: the EP 0x20
 //! event kick, then an hrtimer re-poll every `g16_resnap_us` (100) while anything is
-//! published, or `g16_repoll_us` (15) while a ready prefix waits for record consumption or a
+//! published, or `g16_repoll_us` (8) while a ready prefix waits for record consumption or a
 //! post-event receipt tail did not settle, with a 1-jiffy delayed-work backup.
 
 use core::sync::atomic::Ordering;
@@ -41,12 +41,18 @@ use super::regs::EngineState;
 use super::{params, Firmware, Shared, FAST_POLL_WORK, POLL_WORK, SCRUB_WORK, UNBOUND_POLL_WORK};
 use crate::module_parameters;
 
-/// Cadence of periodic housekeeping (power governor, window health, administrative hang check).
+/// Cadence of periodic housekeeping when idle or entering recovery (1 ms).
 const HOUSEKEEPING_NS: u64 = 1_000_000;
+/// Cadence of periodic housekeeping while flights are active (5 ms, aligned with
+/// `power::policy::SAMPLE_NS` and far below the 100 ms minimum hang deadline).
+const ACTIVE_HOUSEKEEPING_NS: u64 = 5_000_000;
 /// Minimum interval between auxiliary log/ktrace/stats ring drains while flights are active.
 const AUX_DRAIN_NS: u64 = 10_000_000;
 /// Maximum trailing receipt polls after an EP 0x20 event (stepped 1/2/3/4/5 us, 45 us total).
 const EVENT_RETIRE_POLLS: u32 = 11;
+/// Maximum consecutive in-place EP 0x20 rechecks in `run_poll()` before yielding back to
+/// the workqueue so short bursts avoid extra worker round-trips without starving housekeeping.
+const MAX_EVENT_RECHECKS: u32 = 8;
 /// Minimum interval between 1-jiffy delayed-work safety backup rearms (2 ms).
 const BACKUP_REARM_NS: u64 = 2_000_000;
 
@@ -105,6 +111,7 @@ impl Shared {
         let mut tail = 0u32;
         let mut housekeeping_deferred = false;
         let mut step = 0u32;
+        let mut rechecks = 0u32;
 
         loop {
             if self.sleeping.load(Ordering::Acquire) {
@@ -113,6 +120,7 @@ impl Shared {
             let mut done = Completions::new();
             let mut scrubs = super::slots::ScrubBatch::new();
             let mut retry_tail = false;
+            let mut poll_ok = true;
             if let Some(firmware) = self.state.lock().as_deref_mut() {
                 if self.sleeping.load(Ordering::Acquire) {
                     return;
@@ -139,9 +147,14 @@ impl Shared {
                     // floor hold is still pending so both expire cleanly to idle power.
                     Ok(false) => {
                         self.arm_idle_power_poll(firmware);
-                        self.cancel_resnap();
+                        if firmware.recovery.failed().is_some() {
+                            self.cancel_resnap();
+                        } else {
+                            self.idle_resnap();
+                        }
                     }
                     Err(error) => {
+                        poll_ok = false;
                         self.cancel_resnap();
                         firmware.fail_stop(error, &mut done);
                         self.fail_stop(error);
@@ -157,6 +170,20 @@ impl Shared {
             self.enqueue_scrubs(scrubs);
             self.queue_feed();
             if !retry_tail {
+                if poll_ok
+                    && !self.sleeping.load(Ordering::Acquire)
+                    && !self.crashed.load(Ordering::Acquire)
+                    && self.evented.load(Ordering::Acquire)
+                {
+                    if rechecks < MAX_EVENT_RECHECKS {
+                        rechecks += 1;
+                        step = 0;
+                        evented = false;
+                        tail = 0;
+                        continue;
+                    }
+                    self.poll_now();
+                }
                 break;
             }
             let delay_us = match step {
@@ -205,12 +232,18 @@ impl Shared {
         let accepted = firmware.enqueue(job);
         if accepted.is_ok() && !self.sleeping.load(Ordering::Acquire) {
             let now = now_ns();
-            let housekeeping_due =
-                now.wrapping_sub(firmware.last_housekeeping_ns) >= HOUSEKEEPING_NS;
             let had_flights = !firmware.engine.flights.is_empty();
+            let housekeeping_interval = if had_flights {
+                ACTIVE_HOUSEKEEPING_NS
+            } else {
+                HOUSEKEEPING_NS
+            };
+            let housekeeping_due =
+                now.wrapping_sub(firmware.last_housekeeping_ns) >= housekeeping_interval;
             let was_evented = had_flights && self.evented.swap(false, Ordering::AcqRel);
             let recovery_pending = firmware.recovery_pending().unwrap_or(true);
             let mut retired_any = false;
+            let mut restored_event = false;
             let mut pub_res = Ok(());
             if had_flights
                 && (was_evented || recovery_pending || firmware.oldest_stamp_reached())
@@ -232,6 +265,7 @@ impl Shared {
                             && !recovery_pending;
                         if !non_terminal_only {
                             self.evented.store(true, Ordering::Release);
+                            restored_event = true;
                         }
                     }
                     Ok(())
@@ -261,16 +295,20 @@ impl Shared {
             }
             if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
                 // If an EP 0x20 event retired an older flight while later flights remain active,
-                // arm a short repoll in case another completion coalesced into that interrupt.
+                // or arrived before the oldest receipt became visible, arm a short repoll so
+                // trailing completions never fall back to `resnap_us`.
                 self.rearm(
                     firmware.engine.chan_wait
+                        || restored_event
                         || (was_evented && retired_any && !firmware.engine.flights.is_empty()),
                 );
             } else {
                 firmware.power.report_work(false);
                 self.arm_idle_power_poll(firmware);
             }
-            if housekeeping_due && !recovery_pending && pub_res.is_ok() {
+            if pub_res.is_ok()
+                && (restored_event || (housekeeping_due && !recovery_pending))
+            {
                 self.poll_now();
             }
         }
@@ -427,6 +465,23 @@ impl Shared {
         drop(handle.take());
     }
 
+    /// Relaxes the completion hrtimer on healthy idle transitions without cancelling a
+    /// short (`<= resnap_us`) already-armed timer so back-to-back `d=1` bursts avoid
+    /// per-job cancel/restart mutex and hrtimer-rbtree churn. System sleep and fail-stop
+    /// paths still call [`Self::cancel_resnap`] unconditionally.
+    pub(crate) fn idle_resnap(&self) {
+        let armed_ns = self.resnap_deadline_ns.load(Ordering::Acquire);
+        if armed_ns == 0 {
+            return;
+        }
+        let now = now_ns();
+        let keep_ns = u64::from(params::resnap_us()).saturating_mul(1000);
+        if armed_ns > now && armed_ns.saturating_sub(now) <= keep_ns {
+            return;
+        }
+        self.cancel_resnap();
+    }
+
     /// Queues the backup poll on `system_highpri_wq` after `delay` jiffies, or moves an already
     /// pending one to that expiry.
     fn mod_poll(self: &Arc<Self>, delay: Jiffies) {
@@ -544,8 +599,14 @@ impl Firmware {
         self.engine.short_repoll = false;
         self.session.transport()?;
         let now = now_ns();
-        let housekeeping_due = now.wrapping_sub(self.last_housekeeping_ns) >= HOUSEKEEPING_NS;
         let had_flights = !self.engine.flights.is_empty();
+        let housekeeping_interval = if had_flights {
+            ACTIVE_HOUSEKEEPING_NS
+        } else {
+            HOUSEKEEPING_NS
+        };
+        let housekeeping_due =
+            now.wrapping_sub(self.last_housekeeping_ns) >= housekeeping_interval;
         let mut ran_housekeeping = false;
         // With nothing published only a pending firmware recovery notification needs this
         // pass: one that arrived after its prefix's receipts is answered
@@ -645,7 +706,7 @@ impl Firmware {
             return Ok(true);
         }
         if !ran_housekeeping && housekeeping_due {
-            if !done.is_empty() {
+            if !done.is_empty() || !self.engine.flights.is_empty() {
                 *housekeeping_deferred = true;
             } else {
                 self.run_housekeeping(done)?;

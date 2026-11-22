@@ -417,10 +417,14 @@ impl Shared {
     }
 
     /// Updates the lock-free EWMA of recent retired flight durations (microseconds).
+    /// Decays faster downward than upward so transitions from heavy flights into short
+    /// bursts tighten the adaptive repoll window within a few completions.
     pub(crate) fn note_flight_us(&self, us: u32) {
         let prev = self.ewma_flight_us.load(Ordering::Relaxed);
         let next = if prev == 0 {
             us
+        } else if us < prev {
+            prev.saturating_add(us) / 2
         } else {
             (prev.saturating_mul(3).saturating_add(us)) / 4
         };
