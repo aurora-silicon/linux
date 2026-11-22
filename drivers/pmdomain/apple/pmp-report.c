@@ -61,9 +61,10 @@
  * @tgt_write: power state request, write side
  * @actual: power state acknowledgment
  * @status: PMP status; bit 0 is set while the PMP is running
- * @fast_die: 32-bit word holding the fast die-temperature effort of each
+ * @fast_die: word holding the fast die-temperature effort of each
  *	CPU cluster, one byte per lane; 0 if the SoC has none
  * @fast_die_lanes: number of lanes at @fast_die, at most 4
+ * @fast_die_wide: read @fast_die with a 64-bit access instead of 32-bit
  * @running_any: the PMP runs while any bit of the 64-bit status word is set,
  *	not only bit 0
  * @defer_requests: keep power state requests in memory until the PMP runs,
@@ -89,6 +90,7 @@ struct apple_pmp_report_offsets {
 	/* Update aperture of every entry (8 bytes each) and SOC-DEV-DVFS range. */
 	u32 update;
 	u32 dvfs_first, dvfs_count;
+	bool fast_die_wide;
 	bool running_any;
 	bool defer_requests;
 	bool starts_pmp;
@@ -339,6 +341,13 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_ane_perf);
 
 static struct dentry *apple_pmp_report_debugfs;
 
+static u32 apple_pmp_report_fast_die_word(const struct apple_pmp_report *rep)
+{
+	void __iomem *reg = rep->base + rep->offsets->fast_die;
+
+	return rep->offsets->fast_die_wide ? lower_32_bits(readq(reg)) : readl(reg);
+}
+
 /**
  * apple_pmp_report_fast_die_effort() - read the fast die-temperature effort
  *	of a CPU cluster
@@ -377,7 +386,7 @@ int apple_pmp_report_fast_die_effort(const struct device_node *np,
 		} else if (!apple_pmp_report_running(rep)) {
 			ret = -EAGAIN;
 		} else {
-			*effort = readl(rep->base + offs->fast_die) >>
+			*effort = apple_pmp_report_fast_die_word(rep) >>
 				  (lane * BITS_PER_BYTE);
 			ret = 0;
 		}
@@ -406,7 +415,7 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	if (!running || !offs->fast_die)
 		return 0;
 
-	effort = readl(rep->base + offs->fast_die);
+	effort = apple_pmp_report_fast_die_word(rep);
 	for (lane = 0; lane < offs->fast_die_lanes; lane++)
 		seq_printf(s, "lane%u: %u\n", lane,
 			   (effort >> (lane * BITS_PER_BYTE)) & 0xff);
