@@ -273,6 +273,13 @@ struct avd_av1_stream {
 	unsigned int nbanks;
 	struct avd_av1_bank bank[AVD_AV1_BANKS];
 	struct avd_av1_bank *b;
+
+	/* What the run being built took from the controls, see avd_ctrl_copy(). */
+	struct {
+		struct v4l2_ctrl_av1_sequence seq;
+		struct v4l2_ctrl_av1_frame frame;
+		struct v4l2_ctrl_av1_film_grain grain;
+	} params;
 };
 
 /*
@@ -1500,6 +1507,7 @@ static int avd_av1_validate_sequence(struct avd_ctx *ctx,
 
 static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 {
+	struct avd_av1_stream *av1_ctx = ((struct avd_av1_ctx *)ctx->priv)->stream;
 	struct v4l2_ctrl *ctrl;
 	int dst_len, ret, tlb_len;
 
@@ -1507,10 +1515,25 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	if (run->base.setup_err)
 		return run->base.setup_err;
 
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_AV1_SEQUENCE);
-	if (WARN_ON(!ctrl))
-		return -EINVAL;
-	run->seq = ctrl->p_cur.p;
+	/*
+	 * The checks below and the builders must see the same parameters, and
+	 * the controls can be set again at any time: use copies.
+	 */
+	ret = avd_ctrl_copy(ctx, V4L2_CID_STATELESS_AV1_SEQUENCE,
+			    &av1_ctx->params.seq, sizeof(av1_ctx->params.seq));
+	if (!ret)
+		ret = avd_ctrl_copy(ctx, V4L2_CID_STATELESS_AV1_FRAME,
+				    &av1_ctx->params.frame,
+				    sizeof(av1_ctx->params.frame));
+	if (!ret)
+		ret = avd_ctrl_copy(ctx, V4L2_CID_STATELESS_AV1_FILM_GRAIN,
+				    &av1_ctx->params.grain,
+				    sizeof(av1_ctx->params.grain));
+	if (WARN_ON(ret))
+		return ret;
+	run->seq = &av1_ctx->params.seq;
+	run->frame = &av1_ctx->params.frame;
+	run->grain = &av1_ctx->params.grain;
 
 	/* The sequence may have been set, unchecked, while another codec was selected. */
 	ret = avd_av1_validate_sequence(ctx, run->seq);
@@ -1519,11 +1542,6 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 					      avd_av1_seq_image_fmt(run->seq));
 	if (ret)
 		return ret;
-
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_AV1_FRAME);
-	if (WARN_ON(!ctrl))
-		return -EINVAL;
-	run->frame = ctrl->p_cur.p;
 
 	/* The map, CDFs and color data sit at the buffer's end, sized by the frame. */
 	if (run->frame->frame_width_minus_1 + 1 > ctx->decoded_fmt.fmt.pix_mp.width ||
@@ -1550,7 +1568,6 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	run->tile_group = avd_av1_copy_tile_group(ctrl, &run->tile_group_entries);
 	if (!run->tile_group)
 		return -ENOMEM;
-	/* The frame control can be set meanwhile too: use one tile grid throughout. */
 	run->tile_rows = run->frame->tile_info.tile_rows;
 	run->tile_cols = run->frame->tile_info.tile_cols;
 	ret = avd_av1_check_tiles(ctx->dev->dev, run->tile_rows, run->tile_cols,
@@ -1558,12 +1575,6 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 				  vb2_get_plane_payload(&run->base.bufs.src->vb2_buf, 0));
 	if (ret)
 		return ret;
-
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_AV1_FILM_GRAIN);
-	if (WARN_ON(!ctrl))
-		return -EINVAL;
-	run->grain = ctrl->p_cur.p;
 
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
 	tlb_len = avd_color_size(run->frame->frame_width_minus_1 + 1,
