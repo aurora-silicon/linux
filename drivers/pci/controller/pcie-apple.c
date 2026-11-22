@@ -3454,8 +3454,11 @@ static int apple_msi_init(struct apple_pcie *pcie)
 			if (ret < 0)
 				goto invalid_slice;
 			aic_base = ret;
-			if (apple_t8122_msi_claim(pcie, expected_base))
-				goto invalid_slice;
+			ret = apple_t8122_msi_claim(pcie, expected_base);
+			if (ret) {
+				of_node_put(args.np);
+				return ret;	/* -EBUSY, logged by the claim */
+			}
 		} else if (of_machine_is_compatible("apple,t8132")) {
 			aic_base = 1506;
 			switch (ecam.start) {
