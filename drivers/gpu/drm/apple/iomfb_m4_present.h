@@ -11,6 +11,11 @@
 
 #include "dcp-m4-frame.h"
 
+/*
+ * A frame of the @width x @height mode: the panel's, or its notch-free twin
+ * (dcp-notch.h), which dcp_crtc_atomic_check() admits and which starts its
+ * notch rows down the panel.
+ */
 static inline int iomfb_m4_plane_frame(const struct drm_plane_state *state,
 				       u32 width, u32 height,
 				       struct dcp_m4_frame *frame)
@@ -29,9 +34,11 @@ static inline int iomfb_m4_plane_frame(const struct drm_plane_state *state,
 	obj = drm_fb_dma_get_gem_obj(fb, 0);
 	if (!obj)
 		return -EINVAL;
-	return dcp_m4_direct_frame(frame, obj->dma_addr, obj->base.size,
-				   fb->width, fb->height, fb->pitches[0],
-				   fb->format->format == DRM_FORMAT_ARGB8888);
+	return dcp_m4_direct_frame_at(frame, obj->dma_addr, obj->base.size,
+				      fb->width, fb->height, fb->pitches[0],
+				      fb->format->format == DRM_FORMAT_ARGB8888,
+				      height < DCP_M4_PANEL_HEIGHT ?
+				      DCP_M4_PANEL_HEIGHT - height : 0);
 }
 
 #endif

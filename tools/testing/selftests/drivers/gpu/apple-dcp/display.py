@@ -362,6 +362,110 @@ def modes(root):
     return prefix + parser + '\n'.join(blobs) + '\nint main(void){' + '\n'.join(checks) + 'return 0;}'
 
 
+def notch(root):
+    """Both notch geometries of a panel timing (dcp-notch.h), through the
+    production parser and catalogue code: the notch-free twin is exactly the
+    mode the boot-time hidden notch gave, and offer, offset and ownership
+    follow the policy."""
+    f = rate.parser_fixture(root)
+    iomfb = (root / 'drivers/gpu/drm/apple/iomfb.c').read_text()
+    twins = (block(iomfb, 'static unsigned int dcp_notch_twin_count(') + '\n' +
+             block(iomfb, 'static int dcp_notch_add_twins('))
+    prefix = (f['prefix'] + f['epoch'] + f['metadata'] + f['header']).replace(
+        'static inline ', 'static inline __attribute__((unused)) ')
+    # The J615 panel timing as its DCP reports it (2880x1864 at 60 Hz, from our
+    # own boot log), with the 64 rows of its apple,notch-height.
+    m = copy.deepcopy(f['timing_fixture'][0])
+    m['HorizontalAttributes'].update(Active=2880, FrontPorch=8, SyncWidth=32, Total=2960)
+    m['VerticalAttributes'].update(Active=1864, FrontPorch=47, SyncWidth=8, Total=1961)
+    raw = bytearray(struct.pack('<I', 0xd3))
+    f['wire']([m], raw)
+    blob = 'static const unsigned char j615[]={%s};' % ','.join(map(str, raw))
+    return prefix + f['parser'] + twins + '\n' + blob + NOTCH_MAIN
+
+
+NOTCH_MAIN = r'''
+int main(void)
+{
+    struct dcp_parse_ctx c;
+    struct dcp_display_mode *m, *hidden;
+    unsigned n = 0, nh = 0;
+    u32 panel = 0;
+    bool pref;
+
+    /* What the boot-time hidden notch produced. */
+    assert(!parse(j615, sizeof(j615), &c));
+    hidden = enumerate_modes(&c, &nh, 327, 212, 64, true, false);
+    assert(!IS_ERR(hidden) && nh == 1 && hidden[0].mode.vdisplay == 1800);
+
+    assert(!parse(j615, sizeof(j615), &c));
+    m = enumerate_modes(&c, &n, 327, 212, 0, true, false);
+    assert(!IS_ERR(m) && n == 1 && m[0].mode.vdisplay == 1864);
+    assert(m[0].mode.vsync_start == 1911 && m[0].mode.vsync_end == 1919 && m[0].mode.vtotal == 1961);
+    assert(!dcp_notch_add_twins(&m, &n, 64, &panel));
+    assert(n == 2 && panel == 1864 && dcp_notch_twin_count(m, n) == 1);
+    assert(!m[0].notch_free && m[1].notch_free);
+    /* The twin is that same mode: one timing, the notch rows folded into the sync. */
+    assert(m[1].mode.vdisplay == hidden[0].mode.vdisplay &&
+           m[1].mode.vsync_start == hidden[0].mode.vsync_start &&
+           m[1].mode.vsync_end == hidden[0].mode.vsync_end &&
+           m[1].mode.vtotal == hidden[0].mode.vtotal &&
+           m[1].mode.clock == hidden[0].mode.clock &&
+           m[1].mode.hdisplay == hidden[0].mode.hdisplay &&
+           m[1].mode.hsync_start == hidden[0].mode.hsync_start &&
+           m[1].mode.htotal == hidden[0].mode.htotal &&
+           m[1].mode.flags == hidden[0].mode.flags);
+    assert(m[1].mode.vdisplay == 1800 && m[1].mode.vsync_start == 1847);
+    assert(m[1].timing_mode_id == m[0].timing_mode_id && m[1].color_mode_id == m[0].color_mode_id);
+    assert((m[1].mode.type & DRM_MODE_TYPE_PREFERRED) == (m[0].mode.type & DRM_MODE_TYPE_PREFERRED));
+    assert(dcp_notch_twin_of(&m[0].mode, &m[1].mode, 64));
+    assert(!dcp_notch_twin_of(&m[1].mode, &m[0].mode, 64));
+    assert(dcp_notch_twins(&m[0].mode, &m[1].mode, 64) && dcp_notch_twins(&m[1].mode, &m[0].mode, 64));
+    assert(!dcp_notch_twins(&m[0].mode, &m[1].mode, 63) && !dcp_notch_twins(&m[0].mode, &m[0].mode, 64));
+    {
+        struct drm_display_mode other = m[1].mode;
+
+        other.clock++;
+        assert(!dcp_notch_twins(&m[0].mode, &other, 64));
+    }
+    /* Scan-out offset: below the notch for the twin only. */
+    assert(dcp_notch_offset(&m[1].mode, panel, 64) == 64);
+    assert(dcp_notch_offset(&m[0].mode, panel, 64) == 0);
+    assert(dcp_notch_offset(&m[1].mode, panel, 0) == 0 && dcp_notch_offset(&m[1].mode, 0, 64) == 0);
+    /* A twin gets no twin of its own. */
+    assert(!dcp_notch_add_twins(&m, &n, 64, &panel) && n == 3 && dcp_notch_twin_count(m, n) == 2);
+    assert(m[2].notch_free && m[2].mode.vdisplay == 1800);
+    /* Nobody owns the display: the console gets the notch-free geometry. */
+    assert(dcp_notch_effective(DCP_NOTCH_SHOWN, false) == DCP_NOTCH_HIDDEN);
+    assert(dcp_notch_effective(DCP_NOTCH_HIDDEN, false) == DCP_NOTCH_HIDDEN);
+    assert(dcp_notch_effective(DCP_NOTCH_SHOWN, true) == DCP_NOTCH_SHOWN);
+    assert(dcp_notch_effective(DCP_NOTCH_HIDDEN, true) == DCP_NOTCH_HIDDEN);
+    /* Offered: the effective geometry only, so a compositor follows the policy... */
+    pref = true; assert(dcp_notch_offer(false, DCP_NOTCH_SHOWN, true, &pref) && pref);
+    pref = true; assert(!dcp_notch_offer(true, DCP_NOTCH_SHOWN, true, &pref) && !pref);
+    pref = true; assert(!dcp_notch_offer(false, DCP_NOTCH_HIDDEN, true, &pref) && !pref);
+    pref = true; assert(dcp_notch_offer(true, DCP_NOTCH_HIDDEN, true, &pref) && pref);
+    pref = false; assert(dcp_notch_offer(true, DCP_NOTCH_HIDDEN, true, &pref) && !pref);
+    /* ...and the notch-free one to the console re-probing within its surface. */
+    pref = true; assert(dcp_notch_offer(true, DCP_NOTCH_SHOWN, false, &pref) && pref);
+    pref = true; assert(!dcp_notch_offer(false, DCP_NOTCH_SHOWN, false, &pref));
+    pref = true; assert(dcp_notch_offer(true, DCP_NOTCH_HIDDEN, false, &pref) && pref);
+    assert(dcp_notch_full_fits(0, 1864) && dcp_notch_full_fits(1864, 1864));
+    assert(!dcp_notch_full_fits(1800, 1864) && dcp_notch_full_fits(1800, 0));
+    /* No notch rows: no twins. */
+    {
+        unsigned k = 1;
+        u32 rows = 7;
+
+        assert(!dcp_notch_add_twins(&hidden, &k, 0, &rows) && k == 1 && rows == 0);
+    }
+    free(hidden);
+    free(m);
+    return 0;
+}
+'''
+
+
 def refresh(root):
     h=(root/'drivers/gpu/drm/apple/dcp-refresh.h').read_text().replace('#include <linux/types.h>','')
     return r'''

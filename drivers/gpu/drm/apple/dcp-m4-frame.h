@@ -29,13 +29,19 @@ struct dcp_m4_frame {
 	u32 height;
 	u32 stride;
 	enum dcp_m4_frame_format format;
+	/* Panel rows above the frame: a notch-free frame starts below the notch. */
+	u32 dst_y;
 };
+
+/* Most notch rows a panel frame may start below (as MAX_NOTCH_HEIGHT). */
+#define DCP_M4_MAX_DST_Y	160U
 
 static inline int dcp_m4_frame_check(const struct dcp_m4_frame *frame)
 {
 	u64 size = (u64)frame->stride * frame->height;
 
-	if (frame->width != DCP_M4_PANEL_WIDTH || frame->height != DCP_M4_PANEL_HEIGHT ||
+	if (frame->width != DCP_M4_PANEL_WIDTH || frame->dst_y > DCP_M4_MAX_DST_Y ||
+	    frame->height + frame->dst_y != DCP_M4_PANEL_HEIGHT ||
 	    frame->stride < DCP_M4_PANEL_WIDTH * 4 || frame->stride % 64 ||
 	    !size || size > 0xffffffffULL || frame->backing_size < size ||
 	    !frame->dva || frame->dva % 0x4000 || frame->dva >= (1ULL << 42) ||
@@ -78,17 +84,29 @@ static inline int dcp_m4_direct_extent(u64 dva, u64 mapped, u64 needed)
 	return 0;
 }
 
-/* Describe a qualified client framebuffer at its SID0 DVA; no CPU access. */
-static inline int dcp_m4_direct_frame(struct dcp_m4_frame *frame, u64 dva, u64 mapped,
-				      u32 width, u32 height, u32 pitch, bool alpha)
+/*
+ * Describe a qualified client framebuffer at its SID0 DVA, @dst_y rows down
+ * the panel; no CPU access.
+ */
+static inline int dcp_m4_direct_frame_at(struct dcp_m4_frame *frame, u64 dva, u64 mapped,
+					 u32 width, u32 height, u32 pitch, bool alpha,
+					 u32 dst_y)
 {
 	*frame = (struct dcp_m4_frame) {
 		.dva = dva, .backing_size = mapped, .width = width, .height = height,
 		.stride = pitch, .format = alpha ? DCP_M4_ARGB8888 : DCP_M4_XRGB8888,
+		.dst_y = dst_y,
 	};
 	if (dcp_m4_direct_extent(dva, mapped, (u64)pitch * height))
 		return -ERANGE;
 	return dcp_m4_frame_check(frame);
+}
+
+/* A full-panel client framebuffer. */
+static inline int dcp_m4_direct_frame(struct dcp_m4_frame *frame, u64 dva, u64 mapped,
+				      u32 width, u32 height, u32 pitch, bool alpha)
+{
+	return dcp_m4_direct_frame_at(frame, dva, mapped, width, height, pitch, alpha, 0);
 }
 
 /* Exact single-layer fixture, not an ABI for tiled or compressed surfaces. */
@@ -143,6 +161,7 @@ static inline int dcp_m4_frame_check_ext(const struct dcp_m4_frame *frame)
 	u64 size = (u64)frame->stride * frame->height;
 
 	if (!frame->width || !frame->height || frame->width > 3840 || frame->height > 2160 ||
+	    frame->dst_y ||
 	    frame->stride < frame->width * 4 || frame->stride % 64 ||
 	    !size || size > 0xffffffffULL || frame->backing_size < size ||
 	    !frame->dva || frame->dva % 0x4000 || frame->dva >= (1ULL << 42) ||
@@ -235,6 +254,8 @@ static inline int dcp_m4_swap_encode_on(void *output, size_t length, u32 swap_id
 		put_unaligned_le32(1, data + 0x9c);
 		put_unaligned_le32(frame->width, data + 0xb4);
 		put_unaligned_le32(frame->height, data + 0xb8);
+		/* Destination x, y, w, h: below the notch for a notch-free frame. */
+		put_unaligned_le32(frame->dst_y, data + 0x110);
 		put_unaligned_le32(frame->width, data + 0x114);
 		put_unaligned_le32(frame->height, data + 0x118);
 		dcp_m4_surface_encode(data + dcp_m4_pf->swap_surface, frame);

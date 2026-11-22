@@ -374,7 +374,7 @@ bool dcp_h17p_external_ready(struct device_node *np)
 
 static bool show_notch;
 module_param(show_notch, bool, 0644);
-MODULE_PARM_DESC(show_notch, "Use the full display height and show the notch (also when /chosen/asahi,show-notch is \"1\")");
+MODULE_PARM_DESC(show_notch, "Start with the notch shown (default: the boot loader's choice, /chosen/asahi,show-notch; it can be changed at run time)");
 
 /*
  * DP/HDMI audio of external displays, on by default as on macOS: a display
@@ -2020,7 +2020,10 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 		if (!(crtc_state->plane_mask & drm_plane_mask(crtc->primary)))
 			return -EINVAL;
 		ret = iomfb_m4_get_mode(dcp, &mode);
-		return ret ? ret : drm_mode_equal(&crtc_state->mode, &mode) ? 0 : -EINVAL;
+		if (ret)
+			return ret;
+		/* The panel's timing, full or notch-free (dcp-notch.h). */
+		return dcp_notch_mode_known(dcp, &crtc_state->mode) ? 0 : -EINVAL;
 	}
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		return iomfb_v26_6_atomic_check(dcp, crtc, commit);
@@ -6541,14 +6544,22 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
 
-	if (!show_notch && !boot_show_notch())
-		ret = of_property_read_u32(dev->of_node, "apple,notch-height",
-					   &dcp->notch_height);
-
-	if (dcp->notch_height > MAX_NOTCH_HEIGHT)
-		dcp->notch_height = MAX_NOTCH_HEIGHT;
-	if (dcp->notch_height > 0)
-		dev_info(dev, "Detected display with notch of %u pixel\n", dcp->notch_height);
+	/*
+	 * The notch rows are a fact of the panel; whether they are drawn on is
+	 * the boot loader's choice first, then the user's, at run time (see
+	 * dcp-notch.h).
+	 */
+	of_property_read_u32(dev->of_node, "apple,notch-height", &dcp->notch_rows);
+	dcp->notch_rows = min_t(u32, dcp->notch_rows, MAX_NOTCH_HEIGHT);
+	dcp->notch_policy = show_notch || boot_show_notch() ? DCP_NOTCH_SHOWN :
+							      DCP_NOTCH_HIDDEN;
+	if (!dcp_notch_dynamic(dcp) && dcp->notch_policy == DCP_NOTCH_HIDDEN)
+		dcp->notch_height = dcp->notch_rows;
+	if (dcp->notch_rows)
+		dev_info(dev, "Detected display with notch of %u pixel (%s%s)\n",
+			 dcp->notch_rows,
+			 dcp->notch_policy == DCP_NOTCH_SHOWN ? "shown" : "hidden",
+			 dcp_notch_dynamic(dcp) ? "" : " for this boot");
 
 	/* initialize brightness scale to a sensible default to avoid divide by 0*/
 	dcp->brightness.scale = 65536;
