@@ -6120,6 +6120,14 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		(strncmp(fw_str, "14.7.0", sizeof(compat_str)) == 0))
 		return DCP_FIRMWARE_V_14_7_TEMPLATE;
 
+	/*
+	 * The loader reports the method ABI for each DCP. Legacy match data
+	 * leaves the ABI to this property, so accept a complete table here
+	 * when the reported ABI has no legacy implementation.
+	 */
+	if (iomfb_v27_methods(compat_str))
+		return dcp_v27_method_table(dev, compat_str);
+
 	dev_err(dev, "DCP firmware-compat %s (FW: %s) is not supported\n",
 		compat_str, fw_str);
 
