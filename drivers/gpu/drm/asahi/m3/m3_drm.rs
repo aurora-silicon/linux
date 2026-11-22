@@ -98,7 +98,7 @@ pub(crate) struct Backend {
 impl Backend {
     /// HIGH promises host publication ordering, not firmware preemption.
     pub(crate) fn supports_high_priority(&self) -> bool {
-        self.soc.chip_id == 0x8122 && self.profile == super::m3_profile::Profile::Extended
+        self.soc.chip_id == 0x8122 && self.profile.extended()
     }
 
     /// Admits and starts the M3 runtime on `soc` (the T8122), with the DRM device `drm` that the
@@ -121,7 +121,7 @@ impl Backend {
         // Extended T8122 uses its dedicated initialization graph. Keep the
         // legacy guarded-start and completeness checks for older interfaces.
         let extended=crate::m3::t8122_start::is_t8122(soc)
-            && crate::m3::t8122_admission::loaded_profile(pdev)?==super::m3_profile::Profile::Extended;
+            && crate::m3::t8122_admission::loaded_profile(pdev)?.extended();
         let experiment = if extended {None} else {crate::m3::t8122_start::arm(pdev.as_ref(), soc)?};
         if experiment.is_none() && !extended {
             soc.require_complete(pdev.as_ref())?;

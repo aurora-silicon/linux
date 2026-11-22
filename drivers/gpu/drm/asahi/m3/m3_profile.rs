@@ -11,6 +11,11 @@ pub(crate) enum Profile {
 pub(crate) const PARAMS_REQUIRED: u64 = 600;
 
 impl Profile {
+    /// Whether the firmware speaks the Extended interface.
+    pub(crate) const fn extended(self) -> bool {
+        matches!(self, Self::Extended)
+    }
+
     pub(crate) const fn firmware_compat(self) -> [u32; 3] {
         match self {
             Self::Legacy => [14, 8, 3],

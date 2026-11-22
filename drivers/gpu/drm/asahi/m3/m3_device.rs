@@ -128,7 +128,7 @@ impl Device {
                 }
                 e.sgx_setup()
             }
-            None if device.firmware.profile() == super::m3_profile::Profile::Extended => None,
+            None if device.firmware.profile().extended() => None,
             None => Some(soc.sgx_setup.ok_or(ENODEV)?),
         };
         if let Some((setup_offset, setup_value)) = setup {
@@ -176,7 +176,7 @@ impl Device {
     /// Read-only snapshot. Do not select or acknowledge fault banks here;
     /// the firmware owns those registers until recovery is ported.
     pub(crate) fn log_engine_state(&self, vm: &crate::mmu::Vm) -> Result {
-        if self.firmware.profile() == super::m3_profile::Profile::Extended {
+        if self.firmware.profile().extended() {
             // Adaptive clock gating can leave individual engine banks inaccessible
             // even while the GPU performance-state register says powered up.
             return Ok(());

@@ -54,7 +54,7 @@ impl Compute {
         let mut objects=KVec::new();
         let mut client_command=None;
         let mut command_bytes = KVec::new();
-        command_bytes.resize(if profile == super::m3_profile::Profile::Extended {
+        command_bytes.resize(if profile.extended() {
             command::EXTENDED_SIZE
         } else { command::SIZE }, 0u8, GFP_KERNEL)?;
         let mut sequence_bytes = KVec::new();
@@ -75,7 +75,7 @@ impl Compute {
         Self::encode_command(&mut objects, &mut command_bytes, binding.slot(), control, 1, timeline::stamp(0xc1000000,1), 0,
             registers, profile, binding.generation())?;
         Self::encode_sequence(&mut objects, &mut sequence_bytes, stats, binding.slot(), timeline::stamp(0xc1000000,1), 0, profile, 0)?;
-        if profile == super::m3_profile::Profile::Extended {
+        if profile.extended() {
             UMA_POOL.initialize_extended(&mut objects, 1, true)?;
         } else { UMA_POOL.initialize(&mut objects)?; }
         Self::initialize_state(&mut objects, binding.slot(), profile)?;
@@ -88,10 +88,10 @@ impl Compute {
             context: address(GPU_CONTEXT)?, uuid: 0xc10000 };
         let command = address(storage::COMMAND)?;
         let mut bytes = KVec::new();
-        bytes.resize(if profile == super::m3_profile::Profile::Extended {
+        bytes.resize(if profile.extended() {
             queue::QueueInfo::EXTENDED_SIZE
         } else { queue::INFO_SIZE }, 0u8, GFP_KERNEL)?;
-        if profile == super::m3_profile::Profile::Extended {
+        if profile.extended() {
             info.encode_extended(address(storage::QUEUE)?, &mut bytes).map_err(|_| EINVAL)?;
         } else { info.encode(&mut bytes).map_err(|_| EINVAL)?; }
         objects[storage::QUEUE].write(0, &bytes)?;
@@ -134,7 +134,7 @@ impl Compute {
             cdm_last: command::GpuVa::new(control.end.checked_sub(4).ok_or(EINVAL)?).map_err(|_| EINVAL)?,
             gpu_alias: command::GpuVa::new(objects[storage::COMMAND].gpu_va()?+offset(storage::COMMAND)? as u64).map_err(|_| EINVAL)?,
             microsequence: fw(storage::MICROSEQUENCE)?, microsequence_size:
-                if profile == super::m3_profile::Profile::Extended { microsequence::Sequence::EXTENDED_LENGTH as u32 }
+                if profile.extended() { microsequence::Sequence::EXTENDED_LENGTH as u32 }
                 else { microsequence::LENGTH as u32 },
             stamp: fw(storage::STAMP)?, fw_stamp: fw(storage::FW_STAMP)?,
             stamp_value,
@@ -143,7 +143,7 @@ impl Compute {
             register_set,
         };
         value.encode_with_usc(profile, generation, 0,
-            if profile == super::m3_profile::Profile::Extended { control.usc_base } else { 0 }, bytes).map_err(|_| EINVAL)?;
+            if profile.extended() { control.usc_base } else { 0 }, bytes).map_err(|_| EINVAL)?;
         objects[storage::COMMAND].write(offset(storage::COMMAND)?, bytes)
     }
     fn encode_sequence(objects: &mut [Buffer], bytes: &mut [u8], stats: Region,
@@ -155,12 +155,12 @@ impl Compute {
         let value = microsequence::Sequence {
             command: region(storage::COMMAND)?, stats, notifier: region(NOTIFIER)?,
             queue: fw(storage::QUEUE)?, context,
-            generation: if profile == super::m3_profile::Profile::Extended { 0 } else { 1 }, pool: fw(storage::POOL)?,
+            generation: if profile.extended() { 0 } else { 1 }, pool: fw(storage::POOL)?,
             scratch: [fw(MICROSEQUENCE_SCRATCH[0])?, fw(MICROSEQUENCE_SCRATCH[1])?,
                 fw(MICROSEQUENCE_SCRATCH[2])?, fw(MICROSEQUENCE_SCRATCH[3])?, fw(MICROSEQUENCE_SCRATCH[4])?],
             fw_stamp: fw(storage::FW_STAMP)?, stamp_value,
         };
-        if profile == super::m3_profile::Profile::Extended {
+        if profile.extended() {
             let auxiliary = command::GpuVa::new(objects[TAIL_SCRATCH].gpu_va()? + offset(TAIL_SCRATCH)? as u64).map_err(|_| EINVAL)?;
             let context_store = GpuRegion::new(objects[MICROSEQUENCE_SCRATCH[1]].gpu_va()?
                 + offset(MICROSEQUENCE_SCRATCH[1])? as u64, 0x40000).map_err(|_| EINVAL)?;
@@ -173,18 +173,18 @@ impl Compute {
         let notification = state::Notifier { threshold: address(storage::EVENT)?, context: context_slot };
         let list_owner = address(JOB_LIST)?;
         let mut context = [0; state::CONTEXT_SIZE];
-        if profile == super::m3_profile::Profile::Extended {
+        if profile.extended() {
             state::context_extended(&mut context).map_err(|_| EINVAL)?;
         } else { state::context(&mut context).map_err(|_| EINVAL)?; }
-        let context_size = if profile == super::m3_profile::Profile::Extended {
+        let context_size = if profile.extended() {
             state::EXTENDED_CONTEXT_SIZE
         } else { state::CONTEXT_SIZE };
         objects[GPU_CONTEXT].write(0, &context[..context_size])?;
         let mut notifier = KVec::new();
-        notifier.resize(if profile == super::m3_profile::Profile::Extended {
+        notifier.resize(if profile.extended() {
             state::EXTENDED_NOTIFIER_SIZE
         } else { state::NOTIFIER_SIZE }, 0u8, GFP_KERNEL)?;
-        if profile == super::m3_profile::Profile::Extended {
+        if profile.extended() {
             notification.encode_extended(&mut notifier).map_err(|_| EINVAL)?;
         } else { notification.encode(&mut notifier).map_err(|_| EINVAL)?; }
         objects[NOTIFIER].write(0, &notifier)?;
@@ -282,7 +282,7 @@ impl Compute {
     }
     fn write_counters(&mut self) -> Result {
         for index in [storage::EVENT, storage::COUNTER] {
-            if self.profile == super::m3_profile::Profile::Extended {
+            if self.profile.extended() {
                 self.objects[index].u64(0, self.sequence)?;
             } else { self.objects[index].u32(0, self.sequence as u32)?; }
         }
@@ -296,22 +296,22 @@ impl Compute {
     /// notifier must use the same tag before the firmware flushes user stamps.
     /// RTKit 2419: StartCompute.counter1 +0x34; JobMeta.flush_stamps +0x804.
     pub(crate) fn prepare_completion(&mut self,coalesce:bool)->Result {
-        if coalesce && self.profile == super::m3_profile::Profile::Extended { return Err(EINVAL); }
+        if coalesce && self.profile.extended() { return Err(EINVAL); }
         let sequence=self.offset(storage::MICROSEQUENCE)?;
         let command=self.offset(storage::COMMAND)?;
         self.objects[storage::MICROSEQUENCE].u32(sequence+microsequence::GENERATION,0)?;
-        self.objects[storage::COMMAND].u32(command+if self.profile == super::m3_profile::Profile::Extended { 0x81c } else { command::FLUSH_STAMPS },u32::from(!coalesce))?;
+        self.objects[storage::COMMAND].u32(command+if self.profile.extended() { 0x81c } else { command::FLUSH_STAMPS },u32::from(!coalesce))?;
         agx_memory::publish();Ok(())
     }
     pub(crate) fn set_user_timestamps(&mut self,addresses:[u64;2])->Result {
-        let offset=self.offset(storage::COMMAND)?+if self.profile == super::m3_profile::Profile::Extended {
+        let offset=self.offset(storage::COMMAND)?+if self.profile.extended() {
             0x844
         } else { command::USER_TIMESTAMPS };
         self.objects[storage::COMMAND].u64(offset,addresses[0])?;
         self.objects[storage::COMMAND].u64(offset+8,addresses[1])?;
         let pointer=if addresses==[0,0] {0} else {self.objects[storage::COMMAND].va()+offset as u64};
         let sequence=self.offset(storage::MICROSEQUENCE)?;
-        for start in if self.profile == super::m3_profile::Profile::Extended { [0x1bc, 0x20c] }
+        for start in if self.profile.extended() { [0x1bc, 0x20c] }
             else { [microsequence::TIMESTAMP_START,microsequence::TIMESTAMP_END] } {
             self.objects[storage::MICROSEQUENCE].u64(sequence+start+microsequence::USER_TIMESTAMP_POINTER,pointer)?;
         }
@@ -319,10 +319,10 @@ impl Compute {
     }
     pub(crate) fn set_attachments(&mut self,attachments:&crate::m3::agx_attachments::Attachments)->Result {
         let sequence=self.offset(storage::MICROSEQUENCE)?;
-        self.objects[storage::MICROSEQUENCE].write(sequence+if self.profile == super::m3_profile::Profile::Extended {
+        self.objects[storage::MICROSEQUENCE].write(sequence+if self.profile.extended() {
             microsequence::Sequence::EXTENDED_ATTACHMENTS
         } else { microsequence::ATTACHMENTS },&attachments.0)?;
-        self.objects[storage::MICROSEQUENCE].write(sequence+if self.profile == super::m3_profile::Profile::Extended {
+        self.objects[storage::MICROSEQUENCE].write(sequence+if self.profile.extended() {
             microsequence::Sequence::EXTENDED_HAS_ATTACHMENTS
         } else { microsequence::HAS_ATTACHMENTS },&[u8::from(attachments.count()!=0)])?;
         agx_memory::publish();Ok(())
@@ -368,7 +368,7 @@ impl Compute {
             stamp:dependency.stamp,wait_value:dependency.value,event:dependency.event,
             self_value:value,uuid:0xc10000,dependency:crate::m3::m3_sync_layout::Dependency::PreviousPass,
         };
-        if self.profile==super::m3_profile::Profile::Extended {barrier.encode_extended(&mut bytes)}
+        if self.profile.extended() {barrier.encode_extended(&mut bytes)}
         else {barrier.encode(&mut bytes)}.map_err(|_|EINVAL)?;
         barriers.write(offset,&bytes)?;
         let address=barriers.va()+offset as u64;
@@ -433,7 +433,7 @@ impl Compute {
             && self.objects[storage::QUEUE_STATE].read_u32(queue::DONE)? == u32::from(self.head)
             && self.objects[storage::QUEUE_STATE].read_u32(queue::READ)? == u32::from(self.head);
         if !stamped { return Ok(false); }
-        if self.profile == super::m3_profile::Profile::Extended {
+        if self.profile.extended() {
             return Ok(self.objects[storage::POOL].read_u64(0x54)? == self.sequence);
         }
         Ok(true)

@@ -258,7 +258,7 @@ impl Firmware {
 /// Only the admitted extended image has this host-owned boot descriptor slot.
 fn loader_span(profile: super::m3_profile::Profile, data_bytes: u64, input_bytes: usize)
     -> Option<core::ops::Range<usize>> {
-    if profile != super::m3_profile::Profile::Extended || input_bytes != 53 * 40
+    if !profile.extended() || input_bytes != 53 * 40
         || data_bytes != T8122_LAYOUT_26.data_size { return None; }
     let start: usize = 0x12_28e0;
     let end = start.checked_add(input_bytes)?;
@@ -314,7 +314,7 @@ pub(crate) fn identify_loaded(
     };
 
     let extended=crate::m3::t8122_start::is_t8122(soc)
-        && crate::m3::t8122_admission::loaded_profile(pdev)?==super::m3_profile::Profile::Extended;
+        && crate::m3::t8122_admission::loaded_profile(pdev)?.extended();
     if extended && experiment.is_some() {return Err(EINVAL);}
     let layout = if extended {&T8122_LAYOUT_26} else {soc.firmware.ok_or(ENODEV)?};
     if !Firmware::matching_layout(layout, &resources) {

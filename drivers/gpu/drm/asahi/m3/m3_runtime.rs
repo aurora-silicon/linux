@@ -496,7 +496,7 @@ impl Inner {
         crate::mem::sync();
         self.t8122_verdict=false;
         let previous_events=self.config.completed_events;
-        if self.device.firmware().profile() == super::m3_profile::Profile::Extended {
+        if self.device.firmware().profile().extended() {
             packet.vm.mark_binding_published().map_err(early)?;
         }
         let publication_tick=if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {physical_counter()} else {0};
@@ -1248,7 +1248,7 @@ impl Runtime {
     }
     fn boot_inner(&mut self, pdev: &platform::Device<Core<'_>>) -> Result {
         use crate::m3::t8122_start::BootStep;
-        if self.inner.device.firmware().profile() == super::m3_profile::Profile::Extended {
+        if self.inner.device.firmware().profile().extended() {
             return self.boot_extended(pdev);
         }
         let root = self.inner.config.root();

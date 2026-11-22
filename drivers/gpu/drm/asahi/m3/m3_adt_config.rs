@@ -311,7 +311,7 @@ impl Contents {
         experiment: Option<&Experiment>,
     ) -> Result<Self> {
         let dev = pdev.as_ref();
-        if firmware.profile() == super::m3_profile::Profile::Extended {
+        if firmware.profile().extended() {
             if experiment.is_some() { return Err(EINVAL); }
             return Self::extended(dev, soc);
         }

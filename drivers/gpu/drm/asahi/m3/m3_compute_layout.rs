@@ -76,7 +76,7 @@ impl Command {
 
     pub(crate) fn encode_with_usc(&self, profile: super::m3_profile::Profile,
         asid_generation: u8, event_slot: u8, usc_base: u64, out: &mut [u8]) -> Result<(), Error> {
-        let extended = profile == super::m3_profile::Profile::Extended;
+        let extended = profile.extended();
         if usc_base & 0xffff_ffff != 0 || usc_base >= 1 << 42
             || (!extended && usc_base != 0) { return Err(Error::Address); }
         let size = if extended { EXTENDED_SIZE } else { SIZE };

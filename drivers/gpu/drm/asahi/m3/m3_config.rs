@@ -69,7 +69,7 @@ impl Config {
         contents: &crate::m3::m3_adt_config::Contents) -> Result<Self> {
         contents.check_for_upload()?;
         if let Some(inputs) = &contents.extended {
-            if firmware.profile() != super::m3_profile::Profile::Extended { return Err(EINVAL); }
+            if !firmware.profile().extended() { return Err(EINVAL); }
             let owners = ExtendedStorage::new(dev, uat, &inputs.power, &inputs.sram_uv, inputs.bases)?;
             let thermal = crate::m3::m3_thermal::Governor::new(dev.as_ref().as_ref(), &contents.pstates)?;
             return Ok(Self { objects: owners.objects, _iomaps: owners.iomaps,
@@ -179,7 +179,7 @@ impl Config {
 
     pub(crate) fn global_table_views(&mut self, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
         let mut mappings = KVec::new();
-        if self.profile == super::m3_profile::Profile::Extended {
+        if self.profile.extended() {
             for index in [super::m3_init_26::GLOBAL_POOL, super::m3_init_26::GLOBAL_PARAMETERS] {
                 mappings.push(self.objects[index].map_gpu_view(vm)?, GFP_KERNEL)?;
             }
@@ -190,7 +190,7 @@ impl Config {
     pub(crate) fn root(&self) -> u64 { self.objects[storage::ROOT].va() }
     pub(crate) fn performance_request(&mut self,chip:u32,busy:bool)->Result {
         // Native controller inputs supersede the legacy fixed-request interface.
-        if self.profile == super::m3_profile::Profile::Extended { return Ok(()); }
+        if self.profile.extended() { return Ok(()); }
         let Some(value)=crate::m3::m3_consistent_perf::request(chip,
             crate::m3::m3_params::consistent_perf(),busy,self.request_top) else {return Ok(());};
         if value==0 && self.request_value==0 {return Ok(());}
@@ -222,7 +222,7 @@ impl Config {
     /// state the firmware reports against the ceiling and the runtime cap. Called after boot and
     /// after every job, by the job thread.
     pub(crate) fn check_pstate(&mut self, dev: &driver::AsahiDrmDevice, device: &crate::m3::m3_device::Device, what: &str) -> Result {
-        if self.profile == super::m3_profile::Profile::Extended {
+        if self.profile.extended() {
             let state = device.pstate_register()? & 15;
             if state > self.request_top {
                 dev_err!(dev.as_ref(), "M3: native performance state {} exceeds {} ({})\n", state, self.request_top, what);
@@ -253,7 +253,7 @@ impl Config {
     }
 
     pub(crate) fn stats_region(&self) -> Result<init::Region> {
-        let owner = &self.objects[if self.profile == super::m3_profile::Profile::Extended {
+        let owner = &self.objects[if self.profile.extended() {
             UNKNOWN_C3
         } else { HARDWARE_DATA }];
         init::Region::new(owner.va(), owner.size()).map_err(|_| EINVAL)
@@ -262,7 +262,7 @@ impl Config {
     pub(crate) fn log_active_power(&mut self, dev: &driver::AsahiDrmDevice,
                                   device: &crate::m3::m3_device::Device,
                                   sequence: u32) -> Result {
-        if self.profile == super::m3_profile::Profile::Extended {
+        if self.profile.extended() {
             let state = device.pstate_register()? & 15;
             let performance = &mut self.objects[super::m3_init_26::PERFORMANCE_CONTROL];
             let actual = performance.read_u32(0x2c)?;
@@ -291,7 +291,7 @@ impl Config {
     }
 
     pub(crate) fn render_pb(&mut self) -> Result {
-        if self.profile == super::m3_profile::Profile::Extended { return Err(EOPNOTSUPP); }
+        if self.profile.extended() { return Err(EOPNOTSUPP); }
         self.objects[UNKNOWN_C1].write(0,&storage::parameter_buffer(crate::m3::m3_render::PB_PAGES).map_err(|_|EINVAL)?)
     }
     pub(crate) fn submit_queue(&mut self, kind:usize, queue:u64, head:u16,event:u8,new:bool)->Result {
@@ -324,7 +324,7 @@ impl Config {
         Ok(true)
     }
     pub(crate) fn ready(&mut self) -> Result<bool> {
-        if self.profile == super::m3_profile::Profile::Extended {
+        if self.profile.extended() {
             return Ok(self.objects[RUNTIME_FLAGS].read_u32(0x14)? == 1);
         }
         // NewRegionB+4 is an input initialized to 1, not an acknowledgement.
@@ -334,7 +334,7 @@ impl Config {
             && self.objects[RUNTIME_FLAGS].read_u32(4)? == 1)
     }
     pub(crate) fn log_ready(&mut self, dev: &driver::AsahiDrmDevice) -> Result {
-        if self.profile == super::m3_profile::Profile::Extended {
+        if self.profile.extended() {
             let ready = self.objects[RUNTIME_FLAGS].read_u32(0x14)?;
             let consumed = self.objects[CONTROL_REGION].read_u32(0xeae8)?;
             dev_info!(dev.as_ref(), "M3: extended firmware ready={} control-generation={}/{}\n",
@@ -351,14 +351,14 @@ impl Config {
     }
     /// The firmware's halt counter and its halted and resume flags.
     pub(crate) fn halt_state(&mut self) -> Result<(u64,u32,u32)> {
-        if self.profile == super::m3_profile::Profile::Extended { return Err(EOPNOTSUPP); }
+        if self.profile.extended() { return Err(EOPNOTSUPP); }
         let control=&mut self.objects[CONTROL_REGION];
         Ok((control.read_u64(0x4580)?,control.read_u32(0x4590)?,control.read_u32(0x45a0)?))
     }
     /// Let a halted firmware continue: clear halted, then set resume. These
     /// words keep the halt/resume layout of earlier Apple GPU firmware.
     pub(crate) fn resume_halted(&mut self) -> Result {
-        if self.profile == super::m3_profile::Profile::Extended { return Err(EOPNOTSUPP); }
+        if self.profile.extended() { return Err(EOPNOTSUPP); }
         let control=&mut self.objects[CONTROL_REGION];
         control.u32(0x4590,0)?;
         agx_memory::publish();
@@ -372,7 +372,7 @@ impl Config {
     /// at +0x40a0, and the details it leaves for a recovery event at +0x44a0.
     /// Nothing is acknowledged, cleared or resumed here.
     pub(crate) fn log_recovery_state(&mut self, dev: &driver::AsahiDrmDevice, events: u64) -> Result {
-        if self.profile == super::m3_profile::Profile::Extended {
+        if self.profile.extended() {
             for (owner, start, length) in [(super::m3_init_26::RECOVERY_ACTIVITY, 0, 0x60),
                 (CONTROL_REGION, 0x4ebc, 0x100)] {
                 for offset in (start..start + length).step_by(32) {
@@ -399,7 +399,7 @@ impl Config {
     /// index (at most 16), as `drain` reads them. Nothing is consumed or acknowledged, and the
     /// completion count is not changed.
     pub(crate) fn log_event_ring(&mut self, dev: &driver::AsahiDrmDevice) -> Result {
-        let size = if self.profile == super::m3_profile::Profile::Extended { 0x48 } else { 0x38 };
+        let size = if self.profile.extended() { 0x48 } else { 0x38 };
         const COUNT: usize = 256;
         let r = self.objects[storage::EVENT*2].read_u32(0)? as usize;
         let w = self.objects[storage::EVENT*2].read_u32(0x20)? as usize;
@@ -434,7 +434,7 @@ impl Config {
     /// doorbell after this method and waits for both retirement cursors.
     pub(crate) fn control_extended(&mut self, action: super::m3_channel_format::Action) -> Result<u32> {
         use super::m3_channel_format as format;
-        if self.profile != super::m3_profile::Profile::Extended { return Err(EINVAL); }
+        if !self.profile.extended() { return Err(EINVAL); }
         let state = storage::DEVICE_CONTROL * 2;
         let cursors = [self.objects[state].read_u32(0)?,
             self.objects[state].read_u32(0x10)?, self.objects[state].read_u32(0x20)?];
@@ -461,7 +461,7 @@ impl Config {
         Ok(self.objects[storage::DEVICE_CONTROL*2].read_u32(0)? == next && self.objects[storage::DEVICE_CONTROL*2].read_u32(0x10)? == next)
     }
     pub(crate) fn drain(&mut self, dev: &driver::AsahiDrmDevice) -> Result {
-        if self.profile == super::m3_profile::Profile::Extended {
+        if self.profile.extended() {
             return self.drain_extended(dev);
         }
         // Event, trace, stats and six independent firmware log rings.
