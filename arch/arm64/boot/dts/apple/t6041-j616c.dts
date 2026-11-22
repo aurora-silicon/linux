@@ -41,6 +41,11 @@
 	apple,output-templates = <0xe 0x00800000>;
 };
 
+/* The 16-inch M4 Max chassis has High Power mode, as on the J616s */
+&clpc {
+	apple,high-power-mode;
+};
+
 /*
  * ADT aop-spmi0/stockholm-spmi: the Stockholm NFC controller at SPMI 9, its
  * interrupts in 224-230 and its enable on SMC gp0e, as on the J616s.
