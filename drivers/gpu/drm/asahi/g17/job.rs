@@ -122,8 +122,8 @@ pub(crate) struct Packet {
     pub(crate) order: Order,
     pub(crate) completion: Arc<Completion>,
     pub(crate) footprint: Option<Arc<super::hazard::Footprint>>,
-    inputs: KVec<Fence>,
-    firmware: KVec<Fence>,
+    inputs: KVVec<Fence>,
+    firmware: KVVec<Fence>,
     publication: AtomicU8,
     cancelled: AtomicBool,
     early: AtomicI32,
@@ -140,8 +140,8 @@ impl Packet {
         command: Validated,
         order: Order,
         completion: Arc<Completion>,
-        inputs: KVec<Fence>,
-        firmware: KVec<Fence>,
+        inputs: KVVec<Fence>,
+        firmware: KVVec<Fence>,
     ) -> Result<Arc<Self>> {
         let footprint = match &command {
             Validated::Render { attachments, pass, .. } => {
@@ -603,7 +603,7 @@ impl<B: Backend> Scheduler<B> {
     pub(crate) fn enqueue(
         &mut self,
         packet: Arc<Packet>,
-        dependencies: KVec<Fence>,
+        dependencies: KVVec<Fence>,
         early: bool,
         publication: Option<super::completion::PreparedPublication>,
     ) -> Result<Fences> {

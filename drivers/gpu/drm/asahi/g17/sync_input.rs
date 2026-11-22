@@ -21,9 +21,10 @@ unsafe extern "C" {
 
 /// One fence that signals once all of `fences` have (see `job::MERGED_DEPENDENCIES`).
 pub(super) fn merge(fences: &[Fence]) -> Result<Fence> {
-    let mut raw = KVec::with_capacity(fences.len(), GFP_KERNEL)?;
+    // As many as the command waits for: no contiguous pages, charged to the caller.
+    let mut raw = KVVec::with_capacity(fences.len(), GFP_KERNEL_ACCOUNT)?;
     for fence in fences {
-        raw.push(fence.raw(), GFP_KERNEL)?;
+        raw.push(fence.raw(), GFP_KERNEL_ACCOUNT)?;
     }
     // SAFETY: Every pointer is a live fence borrowed from `fences` for this call;
     // the helper only reads them and returns a new reference of its own.
