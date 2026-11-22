@@ -5265,15 +5265,17 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 	if (test_bit(BRCMF_SCAN_STATUS_BUSY, &cfg->scan_status))
 		brcmf_abort_scanning(cfg);
 
-	/* An in-band MSI cannot wake the host once the link goes down, so a
-	 * deeper sleep than suspend-to-idle leaves the network, as without
-	 * WoWLAN, instead of failing the whole system suspend.
+	/* An in-band MSI cannot wake the host once the link goes down, so
+	 * refuse WoWLAN for a deeper sleep than suspend-to-idle instead of
+	 * failing the whole system suspend. cfg80211 then leaves every
+	 * interface (AP and P2P-GO included) and suspends again without it.
 	 */
 	if (wowl && cfg->pub->bus_if->wowl_s2idle_only &&
 	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE) {
 		bphy_info_once(cfg->pub,
 			       "WoWLAN wakes only from suspend-to-idle here, sleeping without it\n");
-		wowl = NULL;
+		cfg->scan_status = 0;
+		return 1;
 	}
 
 	if (wowl == NULL) {

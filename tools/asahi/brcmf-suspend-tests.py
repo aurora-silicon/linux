@@ -210,7 +210,8 @@ static bool vif_up;
 static struct net_device *cfg_to_ndev(struct brcmf_cfg80211_info *c) {return c->pub->iflist[0]->ndev;}
 static struct brcmf_if *netdev_priv(struct net_device *n) {return &ifp[n-ndev];}
 static bool check_vif_up(struct brcmf_cfg80211_vif *v) {(void)v;return vif_up;}
-static bool brcmf_feat_is_enabled(struct brcmf_if *i,int f) {(void)i;(void)f;return false;}
+static unsigned feats;
+static bool brcmf_feat_is_enabled(struct brcmf_if *i,int f) {(void)i;return feats&BIT(f);}
 static void brcmf_report_wowl_wakeind(struct wiphy *w,struct brcmf_if *i) {(void)w;(void)i;can_command();}
 static void brcmf_fil_iovar_int_set(struct brcmf_if *i,const char *s,int n) {(void)i;(void)s;(void)n;can_command();}
 static void brcmf_config_wowl_pattern(struct brcmf_if *i,const char *s,void *p,int n,void *q,int t) {(void)i;(void)s;(void)p;(void)n;(void)q;(void)t;can_command();}
@@ -225,7 +226,8 @@ static void brcmf_bus_wowl_config(struct brcmf_bus *b,bool e) {(void)b;if(!e)wow
 static void brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {(void)v;(void)r;(void)b;can_command();}
 static void brcmf_delay(int t) {(void)t;}
 static void brcmf_set_mpc(struct brcmf_if *i,int v) {(void)i;(void)v;can_command();}
-static int brcmf_configure_wowl(struct brcmf_cfg80211_info *c,struct brcmf_if *i,struct cfg80211_wowlan *w) {(void)c;(void)i;(void)w;can_command();return 0;}
+static unsigned wowl_configs;
+static int brcmf_configure_wowl(struct brcmf_cfg80211_info *c,struct brcmf_if *i,struct cfg80211_wowlan *w) {(void)c;(void)i;(void)w;can_command();wowl_configs++;return 0;}
 static void brcmf_keepalive_start(struct brcmf_if *i,int n) {(void)i;(void)n;can_command();}
 '''
 
@@ -242,7 +244,7 @@ static void reset(void) {
  devinfo.state=BRCMFMAC_PCIE_STATE_UP;devinfo.intr=devinfo.ready=devinfo.timer=true;
  country_gets=sets=bands=txflows=creates=cancels=removes=probes=0;
  failure=translation=d0_error=probe_error=wake_error=save_error=0;ack=true;retain=1;d3_informs=d0_informs=0;
- pm_suspend_target_state=PM_SUSPEND_TO_IDLE;
+ pm_suspend_target_state=PM_SUSPEND_TO_IDLE;feats=0;
 }
 static void hint(const char *a) {
  struct regulatory_request r={.alpha2={a[0],a[1]}};brcmf_cfg80211_reg_notifier(&wiphy,&r);
@@ -353,16 +355,21 @@ for(int up=0;up<2;up++)for(int fail=0;fail<2;fail++) {
   assert(msgbuf.flowring_work.queued && msgbuf.txflow_work.queued);
   assert(!d0_informs && !removes && !probes);cases++;
  }
- /* WoWLAN over an in-band MSI only wakes from s2idle: a deeper target sleeps
-  * as without WoWLAN (network left, WoWLAN off on the bus) instead of
-  * failing the suspend; s2idle, and a bus with a real wake line, keep it. */
+ /* WoWLAN over an in-band MSI only wakes from s2idle: a deeper target
+  * refuses WoWLAN like the other refusals (scan state cleared, return 1,
+  * nothing configured) so cfg80211 leaves every interface and suspends
+  * again without it; s2idle, and a bus with a real wake line, keep it. */
  for(int only=0;only<2;only++)for(int deep=0;deep<2;deep++) {
   static struct cfg80211_wowlan magic={.magic_pkt=true};
-  reset();vif_up=true;wowl_offs=0;bus.wowl_s2idle_only=only;
+  reset();vif_up=true;wowl_offs=wowl_configs=0;bus.wowl_s2idle_only=only;feats=BIT(BRCMF_FEAT_WOWL);
+  cfg.scan_status=BIT(BRCMF_SCAN_STATUS_BUSY);
   pm_suspend_target_state=deep?PM_SUSPEND_ON:PM_SUSPEND_TO_IDLE;
   int ret=brcmf_cfg80211_suspend(&wiphy,&magic);
-  if(only&&deep)assert(!ret && cfg.suspended && wowl_offs==1);
-  else assert(ret==1 && !cfg.suspended && !wowl_offs);
+  assert(!cfg.scan_status);
+  if(only&&deep) {
+   assert(ret==1 && !cfg.suspended && !wowl_offs && !wowl_configs);
+   assert(!brcmf_cfg80211_suspend(&wiphy,NULL) && cfg.suspended && wowl_offs==1 && !wowl_configs);
+  } else assert(!ret && cfg.suspended && !wowl_offs && wowl_configs==1);
   cases++;
  }
  /* Outside s2idle (hibernation) Apple firmware still gets the D3 handshake. */
