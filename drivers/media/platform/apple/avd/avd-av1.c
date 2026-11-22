@@ -16,6 +16,7 @@
  *	Tomasz Figa <tfiga@chromium.org>
  */
 
+#include <kunit/visibility.h>
 #include <media/videobuf2-dma-contig.h>
 
 #include "avd.h"
@@ -1396,34 +1397,48 @@ static void update_dec_buf_info(struct avd_decoded_buffer *buf,
 		buf->av1.ref_frame_idx[i] = frame->ref_frame_idx[i];
 }
 
-/* The engine fetches each tile from these: bad values make it read wild addresses. */
-static int avd_av1_check_tiles(struct avd_ctx *ctx, struct avd_av1_run *run,
-			       unsigned int entries)
+/*
+ * The engine fetches each tile from these: bad values make it read wild
+ * addresses. set_tiles() also looks each entry's tile_row and tile_col up in
+ * the frame's tile_info arrays; in a conformant stream they are below
+ * TileRows and TileCols (AV1 5.11.1, tile_group_obu()), and TileRows and
+ * TileCols are at most MAX_TILE_ROWS and MAX_TILE_COLS (AV1 section 3).
+ */
+VISIBLE_IF_KUNIT int
+avd_av1_check_tiles(struct device *dev, unsigned int tile_rows,
+		    unsigned int tile_cols,
+		    const struct v4l2_ctrl_av1_tile_group_entry *tile_group,
+		    unsigned int entries, size_t payload)
 {
-	unsigned int tiles = run->frame->tile_info.tile_cols *
-			     run->frame->tile_info.tile_rows;
+	unsigned int tiles = tile_cols * tile_rows;
 	unsigned int t;
-	size_t payload;
 
+	if (tile_rows > V4L2_AV1_MAX_TILE_ROWS ||
+	    tile_cols > V4L2_AV1_MAX_TILE_COLS)
+		return -EINVAL;
 	if (entries < tiles) {
-		dev_err_ratelimited(ctx->dev->dev, "AV1: %u tiles but %u tile entries\n",
+		dev_err_ratelimited(dev, "AV1: %u tiles but %u tile entries\n",
 				    tiles, entries);
 		return -EINVAL;
 	}
-	if (!tiles)
-		return 0;
-	payload = vb2_get_plane_payload(&run->base.bufs.src->vb2_buf, 0);
 	for (t = 0; t < tiles; t++) {
-		const struct v4l2_ctrl_av1_tile_group_entry *e = &run->tile_group[t];
+		const struct v4l2_ctrl_av1_tile_group_entry *e = &tile_group[t];
 
 		if ((u64)e->tile_offset + e->tile_size > payload) {
-			dev_err_ratelimited(ctx->dev->dev, "AV1: tile %u at %u+%u past %zu bytes\n",
+			dev_err_ratelimited(dev, "AV1: tile %u at %u+%u past %zu bytes\n",
 					    t, e->tile_offset, e->tile_size, payload);
+			return -EINVAL;
+		}
+		if (e->tile_row >= tile_rows || e->tile_col >= tile_cols) {
+			dev_err_ratelimited(dev, "AV1: tile %u at row %u col %u of %ux%u\n",
+					    t, e->tile_row, e->tile_col,
+					    tile_rows, tile_cols);
 			return -EINVAL;
 		}
 	}
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(avd_av1_check_tiles);
 
 /*
  * Only the AV1 Main profile at 4:2:0 (8 and 10 bits) decodes. A High
@@ -1498,7 +1513,10 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	if (WARN_ON(!ctrl))
 		return -EINVAL;
 	run->tile_group = ctrl->p_cur.p;
-	ret = avd_av1_check_tiles(ctx, run, ctrl->elems);
+	ret = avd_av1_check_tiles(ctx->dev->dev, run->frame->tile_info.tile_rows,
+				  run->frame->tile_info.tile_cols,
+				  run->tile_group, ctrl->elems,
+				  vb2_get_plane_payload(&run->base.bufs.src->vb2_buf, 0));
 	if (ret)
 		return ret;
 
