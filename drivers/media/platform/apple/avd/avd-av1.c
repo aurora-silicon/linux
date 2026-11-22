@@ -1421,6 +1421,15 @@ static int avd_av1_check_tiles(struct avd_ctx *ctx, struct avd_av1_run *run,
 					    t, e->tile_offset, e->tile_size, payload);
 			return -EINVAL;
 		}
+		/* set_tiles() indexes the frame's tile start and size arrays with these */
+		if (e->tile_row >= run->frame->tile_info.tile_rows ||
+		    e->tile_col >= run->frame->tile_info.tile_cols) {
+			dev_err_ratelimited(ctx->dev->dev, "AV1: tile %u at row %u col %u of %ux%u\n",
+					    t, e->tile_row, e->tile_col,
+					    run->frame->tile_info.tile_cols,
+					    run->frame->tile_info.tile_rows);
+			return -EINVAL;
+		}
 	}
 	return 0;
 }
