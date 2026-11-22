@@ -767,6 +767,13 @@ static int dcp_v26_callback(void *cookie, u32 tag,
 	/* will_power_off_signal: a notification, as every other ABI takes it */
 	if (tag == D(2) && SHAPE(0, 0))
 		return 0;
+	/*
+	 * set_power_trace_enable, swap_complete_intent and
+	 * enable_backlight_message_ap_gated: notifications with no reply, as the
+	 * M4 ABI takes them.
+	 */
+	if ((tag == D(8) || tag == D(592) || tag == D(594)) && out_size == 0)
+		return 0;
 	/* get_calendar_time_ms, as the M4 and H17P ABIs answer it */
 	if (tag == D(209) && SHAPE(0, 8)) {
 		put_unaligned_le64(ktime_get_real_ns() / NSEC_PER_MSEC, out);
