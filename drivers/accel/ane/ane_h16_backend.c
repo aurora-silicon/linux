@@ -282,7 +282,7 @@ static int ane_h16_suspend_firmware(struct ane_h16_device *h)
 	if (h->boot.soc->exclave_mode_stop && !h->mode_stopped) {
 		ret = ane_fw_transport_publish_mode_stop(t, ktime_get_ns() + 3 * NSEC_PER_SEC);
 		if (!ret)
-			ret = ane_fw_transport_wait(t, t->control_ch);
+			ret = ane_fw_transport_wait(t, t->control_ch, false);
 		dev_info(h->dev, "H16 ANE: EXCLAVE_MODE_STOP (0x31) on ring %s: %d\n",
 			 ane_fw_channel_name(t->control_ch), ret);
 		if (ret) {
@@ -299,7 +299,7 @@ static int ane_h16_suspend_firmware(struct ane_h16_device *h)
 	if (!ret) {
 		u8 *slot = ane_fw_transport_slot(t, ANE_FW_IO);
 
-		ret = ane_fw_transport_wait(t, ANE_FW_IO);
+		ret = ane_fw_transport_wait(t, ANE_FW_IO, false);
 		/*
 		 * The H16 firmware is not expected to run in Exclave mode (the
 		 * J616s macOS power-off finds no Exclave clients), but an H17

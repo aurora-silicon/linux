@@ -834,6 +834,17 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 	return 0;
 refused:
 	t->ops->refused(t->ctx, word0, word1, word2, ret);
+	/*
+	 * "No room" is the firmware's problem, not the transport's: the
+	 * request is consumed un-answered — the firmware waiter parked on
+	 * it never completes — but it must not block the ring behind it
+	 * either, so the service moves on. A malformed or impossible
+	 * request stays fatal.
+	 */
+	if (ret == -ENOSPC || ret == -ENOMEM) {
+		ane_fw_transport_advance(t, ANE_FW_SHAREDMALLOC);
+		return ret;
+	}
 	return ane_fw_transport_fail(t, ret);
 }
 
@@ -940,7 +951,7 @@ static inline int ane_fw_transport_settle(struct ane_fw_transport *t, u64 quiet_
 		if (!ret) {
 			served++;
 			last = now;
-		} else if (ret != -EAGAIN) {
+		} else if (ret != -EAGAIN && ret != -ENOSPC && ret != -ENOMEM) {
 			return ret;
 		}
 		ret = ane_fw_transport_terminal(t);
@@ -953,7 +964,14 @@ static inline int ane_fw_transport_settle(struct ane_fw_transport *t, u64 quiet_
 	}
 }
 
-static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int ch)
+/*
+ * @refusal_dies: a caller that knows its command can be parked behind a
+ * SHAREDMALLOC request (program LOAD/CREATE wait on their EXPP pool) lets a
+ * refusal end this wait. Every other caller's command cannot be blocked by
+ * an alloc it never asked for, so a refusal is served and the wait goes on.
+ */
+static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int ch,
+					bool refusal_dies)
 {
 	u64 start = t->ops->now_ns(t->ctx), now;
 	u32 pending;
@@ -962,25 +980,53 @@ static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int
 	for (;;) {
 		ret = ane_fw_transport_poll(t, ch);
 		if (ret != -EAGAIN)
-			return ret;
+			break;
 		ret = ane_fw_transport_irq(t, &pending);
 		if (ret)
-			return ret;
+			break;
 		ret = ane_fw_transport_shared(t);
-		if (ret && ret != -EAGAIN)
-			return ret;
+		if (ret == -ENOSPC || ret == -ENOMEM) {
+			if (refusal_dies)
+				break;
+		} else if (ret && ret != -EAGAIN) {
+			break;
+		}
 		ret = ane_fw_transport_terminal(t);
 		if (ret)
-			return ret;
+			break;
 		/* Recheck before sleeping, including time spent in alloc(). */
 		now = t->ops->now_ns(t->ctx);
-		if (now >= t->pending[ch].deadline_ns)
-			return ane_fw_transport_fail(t, -ETIMEDOUT);
-		if (t->ops->stopped && t->ops->stopped(t->ctx))
-			return ane_fw_transport_fail(t, -ESHUTDOWN);
+		if (now >= t->pending[ch].deadline_ns) {
+			ret = ane_fw_transport_fail(t, -ETIMEDOUT);
+			break;
+		}
+		if (t->ops->stopped && t->ops->stopped(t->ctx)) {
+			ret = ane_fw_transport_fail(t, -ESHUTDOWN);
+			break;
+		}
 		t->polls++;
 		t->ops->relax(t->ctx, now - start);
 	}
+	if (ret && !t->error && ch < ANE_FW_CHANNELS && t->pending[ch].active) {
+		/*
+		 * The wait died on something transient (a SHAREDMALLOC
+		 * refusal) with the firmware never answering the command.
+		 * Retire the transaction and reclaim the slot, or the
+		 * channel stays busy forever. A command parked behind a
+		 * refused request never completes, so no late reply lands
+		 * here; a header that is not the published command is a
+		 * protocol violation instead.
+		 */
+		t->pending[ch].active = false;
+		if (t->ops->load64(t->ctx, ane_fw_transport_slot(t, ch)) ==
+		    t->pending[ch].dva) {
+			t->ops->store64(t->ctx, ane_fw_transport_slot(t, ch), 1);
+			t->ops->write_barrier(t->ctx);
+		} else {
+			ret = ane_fw_transport_fail(t, -EPROTO);
+		}
+	}
+	return ret;
 }
 
 #endif /* __ANE_FW_TRANSPORT_H__ */

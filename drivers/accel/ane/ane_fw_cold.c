@@ -401,7 +401,7 @@ static int ane_fw_suspend_wait(struct ane_fw_backend *b)
 		ret = ane_fw_transport_shared(t);
 		if (!ret)
 			shared++;
-		else if (ret != -EAGAIN)
+		else if (ret != -EAGAIN && ret != -ENOSPC && ret != -ENOMEM)
 			break;
 		now = ktime_get_ns();
 		if (now >= t->pending[ANE_FW_IO].deadline_ns) {
@@ -441,7 +441,7 @@ static int ane_fw_exclave_mode_stop(struct ane_fw_backend *b)
 			before[i] = ane_fw_load64(b, slot + 8 * i);
 	}
 	published = ane_fw_transport_publish_mode_stop(t, ktime_get_ns() + ANE_FW_TIMEOUT_NS);
-	ret = published ?: ane_fw_transport_wait(t, ch);
+	ret = published ?: ane_fw_transport_wait(t, ch, false);
 	if (ret) {
 		const struct ane_fw_transaction *tx = &t->pending[ch < ANE_FW_CHANNELS ? ch : 0];
 
@@ -1873,7 +1873,7 @@ static int ane_fw_command(struct ane_fw_backend *b, unsigned int channel,
 	ret = ane_fw_transport_publish(&b->transport, channel, command, size, deadline);
 	if (ret)
 		return ret;
-	ret = ane_fw_transport_wait(&b->transport, channel);
+	ret = ane_fw_transport_wait(&b->transport, channel, false);
 	if (!ret)
 		memcpy(command, b->pool.cpu + tx->dva - b->pool.dva, size);
 	return ret;

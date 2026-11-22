@@ -3191,7 +3191,7 @@ static void program_pool_placed_bounds_test(struct kunit *test)
 							  sizeof(command), U64_MAX,
 							  end - ANE_FW_SLOT_SIZE),
 			0);
-	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO, false), 0);
 	KUNIT_EXPECT_EQ(test, f->count, 1U);
 	KUNIT_EXPECT_EQ(test, ane_fw_transport_mark(&f->t), end);
 	KUNIT_EXPECT_EQ(test, ane_fw_transport_release(&f->t, end - 1), -EINVAL);

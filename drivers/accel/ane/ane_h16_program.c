@@ -498,6 +498,7 @@ MODULE_PARM_DESC(execute_depth, "Maximum concurrent EXECUTEs (1-4, default 2)");
 
 static void h16_gate_work(struct work_struct *work);
 static void h16_export_work(struct work_struct *work);
+static int h16_gate_release(struct ane_h16_session *s);
 
 /* Lifecycle traffic must not interleave with a batch's command arena. */
 static void h16_drain(struct ane_h16_session *s)
@@ -580,21 +581,25 @@ static u64 h16_now(struct ane_h16_session *s)
 
 /*
  * Publish one command at arena offset at (ANE_FW_ARENA: the arena's end) and
- * wait for its transport reply, kept in the pool.
+ * wait for its transport reply, kept in the pool. @refusal_dies is for the
+ * LOAD and CREATE that can be parked behind their own SHAREDMALLOC.
  */
 static int h16_send_at(struct ane_h16_session *s, unsigned int ch, const void *command,
-		       size_t length, size_t at, const u8 **reply)
+		       size_t length, size_t at, bool refusal_dies, bool *sent,
+		       const u8 **reply)
 {
 	struct ane_fw_transport *t = s->transport;
 	int ret;
 
+	*sent = false;
 	if (ane_fw_command_denied(get_unaligned_le16((const u8 *)command + 4)))
 		return -EPERM;
 	ret = ane_fw_transport_publish_at(t, ch, command, length,
 					  h16_now(s) + s->timeout_ns, at);
 	if (ret)
 		return ret;
-	ret = ane_fw_transport_wait(t, ch);
+	*sent = true;
+	ret = ane_fw_transport_wait(t, ch, refusal_dies);
 	*reply = (const u8 *)t->pool.cpu + (t->pending[ch].dva - t->pool.dva);
 	return ret;
 }
@@ -602,7 +607,10 @@ static int h16_send_at(struct ane_h16_session *s, unsigned int ch, const void *c
 static int h16_send(struct ane_h16_session *s, unsigned int ch, const void *command,
 		    size_t length, const u8 **reply)
 {
-	return h16_send_at(s, ch, command, length, ANE_FW_ARENA, reply);
+	bool sent;
+
+	return h16_send_at(s, ch, command, length, ANE_FW_ARENA, false, &sent,
+			   reply);
 }
 
 /*
@@ -1049,16 +1057,66 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 }
 
 /*
- * LOAD or CREATE failed with the firmware holding the program, maybe: the
- * session is quarantined and the program is kept, memory and all, with
- * those closed while quarantined, until a verified power cycle gives them
- * back (ane_h16_session_recovered()).
+ * A LOAD or CREATE refused on "no room" (-ENOSPC, -ENOMEM) is a refusal,
+ * not a failure, and the session is not quarantined for it. A command
+ * that never left the host freed nothing on the firmware side, so the
+ * program is released outright. A LOAD that went out but was never
+ * answered leaves both ownership and the program ID unknown - nothing
+ * can be probed, so the session is quarantined and the program kept,
+ * memory and all, until reset (ane_h16_session_recovered()).
+ * With LOAD acknowledged the firmware may hold the program and its ID is
+ * known, so an UNLOAD asks for it back the way session_close does; an
+ * UNLOAD refused on the host side keeps the program held until close,
+ * while a NAK, a dead transport, or any other error is fatal - the
+ * session is quarantined with the program kept until reset.
  */
-static int h16_failed_load(struct ane_h16_session *s, struct ane_h16_program *p, int error)
+static int h16_failed_load(struct ane_h16_session *s, struct ane_h16_program *p,
+			   u8 *command, bool loaded, bool sent, int error)
 {
+	const u8 *reply;
+	size_t mark;
+	int ret;
+
 	p->closed = true;
-	list_add_tail(&p->node, &s->held);
-	return h16_fail(s, error);
+	if (error != -ENOSPC && error != -ENOMEM) {
+		list_add_tail(&p->node, &s->held);
+		return h16_fail(s, error);
+	}
+	if (!loaded) {
+		if (!sent) {
+			h16_give_back(s, p);
+			h16_record_put(s, p);
+			ane_h16_session_put(s, p);
+			return error;
+		}
+		list_add_tail(&p->node, &s->held);
+		return h16_fail(s, error);
+	}
+	mark = ane_fw_transport_mark(s->transport);
+	ret = h16_gate_release(s);
+	if (!ret)
+		ret = ane_h16_unload_encode(command, ANE_H16_UNLOAD_SIZE, p->key.program);
+	if (!ret)
+		ret = h16_send(s, ANE_FW_IO, command, ANE_H16_UNLOAD_SIZE, &reply);
+	if (!ret)
+		ret = ane_h16_id_reply(reply, ANE_H16_UNLOAD_SIZE, command);
+	if (ret) {
+		/*
+		 * Ownership is unknown: a NAK or a sticky-failed transport
+		 * (including -ENOSPC from command-arena exhaustion, not a
+		 * SHAREDMALLOC refusal) means the program may still be
+		 * loaded firmware-side. Hold it for recovery teardown and
+		 * quarantine.
+		 */
+		list_add_tail(&p->node, &s->held);
+		return h16_fail(s, ret);
+	}
+	s->ops->log(s->ctx, "UNLOAD program after refusal", p->key.program, 0);
+	h16_give_back(s, p);
+	h16_record_put(s, p);
+	h16_pool_release(s, mark);
+	ane_h16_session_put(s, p);
+	return error;
 }
 
 /*
@@ -1081,6 +1139,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	struct ane_h16_load_layout layout = {};
 	struct h16_program_binds binds = {};
 	struct ane_h16_program *p;
+	bool sent = false;
 	u8 *command;
 	const u8 *reply;
 	unsigned int i;
@@ -1151,27 +1210,27 @@ int ane_h16_session_load(struct ane_h16_session *s,
 		ane_h16_session_put(s, p);
 		goto out;
 	}
-	/* A refused LOAD or CREATE keeps the record, like the rest, until reset. */
-	ret = h16_send_at(s, ANE_FW_IO, command, ANE_H16_LOAD_SIZE, h16_record_at(s, p, false),
-			  &reply);
+	/* A refused LOAD is transient; what survives is decided in h16_failed_load(). */
+	ret = h16_send_at(s, ANE_FW_IO, command, ANE_H16_LOAD_SIZE,
+			  h16_record_at(s, p, false), true, &sent, &reply);
 	if (!ret)
 		ret = ane_h16_load_reply(reply, ANE_H16_LOAD_SIZE, command, &p->key.program);
 	if (ret) {
 		s->ops->log(s->ctx, "LOAD refused", (u64)-ret, 0);
-		ret = h16_failed_load(s, p, ret);
+		ret = h16_failed_load(s, p, command, false, sent, ret);
 		goto out;
 	}
 	s->ops->log(s->ctx, "LOAD program", p->key.program, p->bar_count);
 	ret = ane_h16_create_encode(command, ANE_H16_CREATE_SIZE, p->key.program);
 	if (!ret)
 		ret = h16_send_at(s, ANE_FW_IO, command, ANE_H16_CREATE_SIZE,
-				  h16_record_at(s, p, true), &reply);
+				  h16_record_at(s, p, true), true, &sent, &reply);
 	if (!ret)
 		ret = ane_h16_create_reply(reply, ANE_H16_CREATE_SIZE, p->key.program,
 					   &p->key.process);
 	if (ret) {
 		s->ops->log(s->ctx, "CREATE refused", (u64)-ret, 0);
-		ret = h16_failed_load(s, p, ret);
+		ret = h16_failed_load(s, p, command, true, sent, ret);
 		goto out;
 	}
 	/* Each validated program has exactly one procedure. */
@@ -2069,6 +2128,7 @@ EXPORT_SYMBOL_GPL(ane_h16_session_recovered);
  */
 static int h16_replay(struct ane_h16_session *s, struct ane_h16_program *p)
 {
+	bool sent;
 	u8 *command;
 	const u8 *reply;
 	unsigned int i;
@@ -2095,7 +2155,7 @@ static int h16_replay(struct ane_h16_session *s, struct ane_h16_program *p)
 	ret = ane_h16_load_encode(command, ANE_H16_LOAD_SIZE, p->slots);
 	if (!ret)
 		ret = h16_send_at(s, ANE_FW_IO, command, ANE_H16_LOAD_SIZE,
-				  h16_record_at(s, p, false), &reply);
+				  h16_record_at(s, p, false), true, &sent, &reply);
 	if (!ret)
 		ret = ane_h16_load_reply(reply, ANE_H16_LOAD_SIZE, command, &p->key.program);
 	if (!ret) {
@@ -2104,7 +2164,7 @@ static int h16_replay(struct ane_h16_session *s, struct ane_h16_program *p)
 	}
 	if (!ret)
 		ret = h16_send_at(s, ANE_FW_IO, command, ANE_H16_CREATE_SIZE,
-				  h16_record_at(s, p, true), &reply);
+				  h16_record_at(s, p, true), true, &sent, &reply);
 	if (!ret)
 		ret = ane_h16_create_reply(reply, ANE_H16_CREATE_SIZE, p->key.program,
 					   &p->key.process);
