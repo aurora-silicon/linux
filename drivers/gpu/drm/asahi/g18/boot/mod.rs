@@ -1063,6 +1063,10 @@ struct G18Session {
     stage: u32,
     /// InitData profile of the firmware build the loader admitted.
     profile: crate::g18::fw::initdata::RootProfile,
+    /// A TVB grow request of the running job was answered "not grown".
+    /// The tiler then stays stalled, so wait_job() ends the render with a
+    /// recovery at once instead of waiting for its watchdog.
+    growth_refused: bool,
 }
 
 fn cntvct() -> u64 {
@@ -1120,6 +1124,7 @@ impl G18Session {
                 false
             }
         };
+        self.growth_refused |= !grew;
         self.memory.as_mut().ok_or(EIO)?.reply_tvb_grow(request, grew)?;
         Pin::new(&mut self.roles[G18Role::Gfx.index()].rtkit)
             .send_message(EP_GFX_INTERRUPTS, CONTROL_NOTIFY)?;
@@ -2062,6 +2067,7 @@ fn prepare_firmware_session(pdev: &platform::Device<Core<'_>>, probe: T8152Probe
         dev: drm,
         stage,
         profile,
+        growth_refused: false,
     }, GFP_KERNEL)?;
 
     // Point of no return: from here every path retains the session, and the
