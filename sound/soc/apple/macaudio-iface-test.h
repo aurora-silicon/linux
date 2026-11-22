@@ -299,10 +299,42 @@ static void macaudio_iface_control_is_inactive(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, iface.access & SNDRV_CTL_ELEM_ACCESS_VOLATILE);
 }
 
+/*
+ * A sleep on the volume lock, then the lease and back before the daemon's
+ * first ping: both switches drop the kept volumes, the way back reports the
+ * lost lock once, and the unlock after it reports nothing more.
+ */
+static void macaudio_iface_lease_after_sleep(struct kunit *test)
+{
+	struct macaudio_test_iface f;
+	struct macaudio_snd_data *ma;
+
+	macaudio_test_iface_card(test, &f);
+	ma = f.t.ma;
+	macaudio_test_daemon_take(test, &f);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), 0);
+	macaudio_pm_notify(&ma->pm_nb, PM_SUSPEND_PREPARE, NULL);
+	macaudio_pm_notify(&ma->pm_nb, PM_POST_SUSPEND, NULL);
+	KUNIT_EXPECT_NOT_NULL(test, ma->pm_volumes);
+	KUNIT_EXPECT_TRUE(test, ma->pm_lock_taken);
+
+	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_LEASE), 1);
+	KUNIT_EXPECT_NULL(test, ma->pm_volumes);
+	KUNIT_EXPECT_FALSE(test, ma->pm_lock_taken);
+	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_UNLOCK), 1);
+	macaudio_test_settle(ma);
+
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), 0);
+	KUNIT_EXPECT_TRUE(test, ma->speaker_volume_unlocked);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), 0);
+}
+
 static struct kunit_case macaudio_iface_cases[] = {
 	KUNIT_CASE(macaudio_iface_volume_lock_from_binding),
 	KUNIT_CASE(macaudio_iface_switch_goes_through_the_floor),
 	KUNIT_CASE(macaudio_iface_revert_starts_at_the_floor),
+	KUNIT_CASE(macaudio_iface_lease_after_sleep),
 	KUNIT_CASE(macaudio_iface_unowned_lease_reverts),
 	KUNIT_CASE(macaudio_iface_needs_cap_sys_admin),
 	KUNIT_CASE(macaudio_iface_control_is_inactive),
