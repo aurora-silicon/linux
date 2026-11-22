@@ -159,6 +159,7 @@
 				#iommu-cells = <1>;
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1656 IRQ_TYPE_LEVEL_HIGH>;
+				power-domains = <&cio_psd59>;
 				apple,dma-range = <0x100 0x0 0x10 0x0>;
 			};
 
@@ -265,6 +266,7 @@
 				#iommu-cells = <1>;
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1727 IRQ_TYPE_LEVEL_HIGH>;
+				power-domains = <&cio_psd60>;
 				apple,dma-range = <0x100 0x0 0x10 0x0>;
 			};
 
@@ -371,6 +373,7 @@
 				#iommu-cells = <1>;
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1869 IRQ_TYPE_LEVEL_HIGH>;
+				power-domains = <&cio_psd62>;
 				apple,dma-range = <0x100 0x0 0x10 0x0>;
 			};
 
