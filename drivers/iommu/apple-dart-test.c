@@ -1439,6 +1439,77 @@ static void apple_dart_test_fw_live_prot(struct kunit *test)
 	pm_runtime_disable(dart->dev);
 }
 
+/* A device node with only a compatible list, as of_device_is_compatible() reads it. */
+struct apple_dart_test_node {
+	struct property compatible;
+	struct device_node np;
+};
+
+static void apple_dart_test_node(struct apple_dart_test_node *node, const char *compat,
+				 size_t len)
+{
+	*node = (struct apple_dart_test_node){
+		.compatible = { .name = "compatible", .length = len, .value = (void *)compat },
+	};
+	node->np.properties = &node->compatible;
+}
+
+#define APPLE_DART_TEST_NODE(node, compat) \
+	apple_dart_test_node(node, compat, sizeof(compat))
+
+/*
+ * fw_mirror follows the DART's own state: any locked T8132 DART without a
+ * reserved-table handoff that is not borrowed keeps its firmware's roots, as
+ * T6041/T6050/T8140/T8142 ones do, whatever the board or firmware build.
+ * fw_live_prot comes with it on T8132 only.
+ */
+static void apple_dart_test_keeps_fw_roots(struct kunit *test)
+{
+	static const char *const mirrored[] = {
+		"apple,t6041-dart", "apple,t6050-dart", "apple,t8132-dart",
+		"apple,t8140-dart", "apple,t8142-dart",
+	};
+	struct apple_dart_test_node t8132, other;
+	struct apple_dart dart = {};
+
+	/* The J773g dcpext0 and dispext0 DARTs' compatible list. */
+	APPLE_DART_TEST_NODE(&t8132, "apple,t8132-dart\0apple,t8110-dart");
+	dart.locked = true;
+	KUNIT_EXPECT_TRUE(test, apple_dart_keeps_fw_roots(&dart, &t8132.np));
+	dart.fw_mirror = true;
+	KUNIT_EXPECT_TRUE(test, apple_dart_wants_fw_live_prot(&dart, &t8132.np));
+
+	/* Unlocked: the plain path, as on every other SoC. */
+	dart.locked = false;
+	KUNIT_EXPECT_FALSE(test, apple_dart_keeps_fw_roots(&dart, &t8132.np));
+	dart.fw_mirror = false;
+	KUNIT_EXPECT_FALSE(test, apple_dart_wants_fw_live_prot(&dart, &t8132.np));
+
+	/* A reserved-table handoff, or a DART borrowed on the 26.6.2 path. */
+	dart.locked = true;
+	dart.fw_handoff = true;
+	KUNIT_EXPECT_FALSE(test, apple_dart_keeps_fw_roots(&dart, &t8132.np));
+	dart.fw_handoff = false;
+	dart.preserve_display = true;
+	KUNIT_EXPECT_FALSE(test, apple_dart_keeps_fw_roots(&dart, &t8132.np));
+	dart.preserve_display = false;
+
+	/* The other SoCs: mirrored as before, without the protection change. */
+	for (int i = 0; i < ARRAY_SIZE(mirrored); i++) {
+		apple_dart_test_node(&other, mirrored[i], strlen(mirrored[i]) + 1);
+		KUNIT_EXPECT_TRUE(test, apple_dart_keeps_fw_roots(&dart, &other.np));
+		dart.fw_mirror = true;
+		KUNIT_EXPECT_EQ(test, apple_dart_wants_fw_live_prot(&dart, &other.np),
+				!strcmp(mirrored[i], "apple,t8132-dart"));
+		dart.fw_mirror = false;
+	}
+	/* SoCs without the retained-root path stay off it. */
+	APPLE_DART_TEST_NODE(&other, "apple,t8122-dart\0apple,t8110-dart");
+	KUNIT_EXPECT_FALSE(test, apple_dart_keeps_fw_roots(&dart, &other.np));
+	APPLE_DART_TEST_NODE(&other, "apple,t8103-dart");
+	KUNIT_EXPECT_FALSE(test, apple_dart_keeps_fw_roots(&dart, &other.np));
+}
+
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_strict_engines),
 	KUNIT_CASE(apple_dart_test_topology),
@@ -1449,6 +1520,7 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_sync_unknown_roots),
 	KUNIT_CASE(apple_dart_test_firmware_roots),
 	KUNIT_CASE(apple_dart_test_fw_live_prot),
+	KUNIT_CASE(apple_dart_test_keeps_fw_roots),
 	KUNIT_CASE(apple_dart_test_unmap_flush_after_publish_failure),
 	KUNIT_CASE(apple_dart_test_gated_commands),
 	KUNIT_CASE(apple_dart_test_resume_commands_failure),
