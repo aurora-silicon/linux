@@ -75,21 +75,37 @@ struct apple_drm_private {
 	bool dark_held;
 	/* On apple_drm_pm_list while bound, for the system-sleep notifier. */
 	struct list_head pm_node;
+	/* The notifier's output restore, run outside apple_drm_pm_lock. */
+	struct work_struct pm_resume_work;
 };
 
 static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data);
+#ifdef CONFIG_PM_SLEEP
+static void apple_drm_pm_resume_work(struct work_struct *work);
+#endif
 
 /*
- * One system-sleep notifier for every bound display subsystem, registered at
- * module init. Registering it from the component bind would take the PM
- * notifier chain's rwsem under component_mutex, while a PM notifier that
- * takes a lock held around a component_add() (as the Apple CIO driver's does
- * with its device lock, which it holds while populating the NHI) closes a
- * cycle: component_mutex -> pm_chain_head.rwsem -> acio->lock ->
- * component_mutex. apple_drm_pm_lock is a leaf below both.
+ * One system-sleep notifier for every bound display subsystem (and for the
+ * T8132 external outputs), registered at module init. Registering it from the
+ * component bind would take the PM notifier chain's rwsem under
+ * component_mutex, while a PM notifier that takes a lock held around a
+ * component_add() (as the Apple CIO driver's does with its device lock, which
+ * it holds while populating the NHI) closes a cycle: component_mutex ->
+ * pm_chain_head.rwsem -> acio->lock -> component_mutex.
+ *
+ * apple_drm_pm_lock is a leaf: it guards apple_drm_pm_list only, and nothing
+ * else is taken under it. At PM_POST_SUSPEND the notifier queues each
+ * device's restore (pm_resume_work) on apple_drm_pm_wq under it; the restore
+ * itself, which takes the hotplug, modeset and DCP locks, runs from the work.
+ * PM_POST_SUSPEND comes after user space is thawed, as before. The next
+ * PM_SUSPEND_PREPARE flushes the queue, outside the lock, so a restore never
+ * overlaps the next suspend, and apple_drm_uninit() cancels its device's
+ * after taking it off the list.
  */
 static DEFINE_MUTEX(apple_drm_pm_lock);
 static LIST_HEAD(apple_drm_pm_list);
+/* Ordered, so the next suspend's PM_SUSPEND_PREPARE can wait for every restore. */
+static struct workqueue_struct *apple_drm_pm_wq;
 static struct notifier_block apple_drm_pm_nb = {
 	.notifier_call = apple_drm_pm_notify,
 };
@@ -1730,6 +1746,9 @@ static int apple_drm_init(struct device *dev)
 		return PTR_ERR(apple);
 
 	INIT_LIST_HEAD(&apple->pm_node);
+#ifdef CONFIG_PM_SLEEP
+	INIT_WORK(&apple->pm_resume_work, apple_drm_pm_resume_work);
+#endif
 	dev_set_drvdata(dev, apple);
 
 	ret = drmm_mode_config_init(&apple->drm);
@@ -1902,6 +1921,9 @@ static void apple_drm_uninit(struct device *dev)
 	mutex_lock(&apple_drm_pm_lock);
 	list_del_init(&apple->pm_node);
 	mutex_unlock(&apple_drm_pm_lock);
+#ifdef CONFIG_PM_SLEEP
+	cancel_work_sync(&apple->pm_resume_work);
+#endif
 
 	/* Before anything of the DRM device is torn down. */
 	t8132_ext_drm_fini(&apple->drm);
@@ -2123,23 +2145,37 @@ static void apple_platform_complete(struct device *dev)
 }
 
 /* It failed before ->prepare() reached this device, so ->complete() didn't run either. */
+static void apple_drm_pm_resume_work(struct work_struct *work)
+{
+	struct apple_drm_private *apple =
+		container_of(work, struct apple_drm_private, pm_resume_work);
+
+	if (apple->dark_held) {
+		dev_warn(apple->drm.dev, "dark wake over without a resume: outputs back now\n");
+		apple_drm_resume_outputs(apple);
+	}
+}
+
 static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
 {
 	struct apple_drm_private *apple;
+	int ret;
 
+	if (action == PM_SUSPEND_PREPARE)
+		flush_workqueue(apple_drm_pm_wq);
+
+	/* The T8132 external outputs' sleep handling (a no-op without them). */
+	ret = t8132_ext_drm_pm_event(action);
 	if (action != PM_POST_SUSPEND)
-		return NOTIFY_DONE;
+		return ret;
 
 	mutex_lock(&apple_drm_pm_lock);
-	list_for_each_entry(apple, &apple_drm_pm_list, pm_node) {
-		if (apple->dark_held) {
-			dev_warn(apple->drm.dev, "dark wake over without a resume: outputs back now\n");
-			apple_drm_resume_outputs(apple);
-		}
-	}
+	list_for_each_entry(apple, &apple_drm_pm_list, pm_node)
+		if (apple->dark_held)
+			queue_work(apple_drm_pm_wq, &apple->pm_resume_work);
 	mutex_unlock(&apple_drm_pm_lock);
 
-	return NOTIFY_DONE;
+	return ret;
 }
 
 static const struct dev_pm_ops apple_platform_pm_ops = {
@@ -2190,11 +2226,18 @@ static int __init appledrm_register(void)
 	ret = dcp_register();
 	if (ret)
 		goto unregister_audio;
+	apple_drm_pm_wq = alloc_ordered_workqueue("appledrm-pm", 0);
+	if (!apple_drm_pm_wq) {
+		ret = -ENOMEM;
+		goto unregister_dcp;
+	}
 	register_pm_notifier(&apple_drm_pm_nb);
 	ret = platform_driver_register(&apple_platform_driver);
 	if (!ret)
 		return 0;
 	unregister_pm_notifier(&apple_drm_pm_nb);
+	destroy_workqueue(apple_drm_pm_wq);
+unregister_dcp:
 	dcp_unregister();
 unregister_audio:
 	apple_j613_display_fail();
@@ -2213,6 +2256,7 @@ static void __exit appledrm_unregister(void)
 	dcp_unregister();
 	platform_driver_unregister(&apple_platform_driver);
 	unregister_pm_notifier(&apple_drm_pm_nb);
+	destroy_workqueue(apple_drm_pm_wq);
 }
 
 module_init(appledrm_register);
