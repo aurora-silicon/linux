@@ -7262,6 +7262,23 @@ static const struct of_device_id apple_dart_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_dart_of_match);
 
+/* No TLB command and no transaction outstanding on any port: -EBUSY until then. */
+static int apple_dart_drained(struct apple_dart *dart)
+{
+	u32 params = readl(dart->regs + DART_PARAMS2);
+	unsigned int ports = max(FIELD_GET(DART_T8110_PARAMS2_READ_PORTS, params),
+				 FIELD_GET(DART_T8110_PARAMS2_WRITE_PORTS, params));
+
+	if (!ports || ports > 4)
+		return -EIO;
+	if (readl(dart->regs + DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY)
+		return -EBUSY;
+	for (unsigned int port = 0; port < ports; port++)
+		if (readl(dart->regs + DART_T8110_OUTSTANDING(port)))
+			return -EBUSY;
+	return 0;
+}
+
 #if IS_ENABLED(CONFIG_APPLE_DART_J713_DCP)
 /* The internal display DART of a DCP consumer (its firmware or display stream). */
 static struct apple_dart *apple_dart_dcp_consumer(struct device *dev)
@@ -7286,23 +7303,6 @@ static int apple_dart_tlb_command(struct apple_dart *dart, u32 command)
 	return readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_CMD, status,
 					 !(status & DART_T8110_TLB_CMD_BUSY), 1,
 					 DART_STREAM_COMMAND_BUSY_TIMEOUT);
-}
-
-/* No TLB command and no transaction outstanding on any port: -EBUSY until then. */
-static int apple_dart_drained(struct apple_dart *dart)
-{
-	u32 params = readl(dart->regs + DART_PARAMS2);
-	unsigned int ports = max(FIELD_GET(DART_T8110_PARAMS2_READ_PORTS, params),
-				 FIELD_GET(DART_T8110_PARAMS2_WRITE_PORTS, params));
-
-	if (!ports || ports > 4)
-		return -EIO;
-	if (readl(dart->regs + DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY)
-		return -EBUSY;
-	for (unsigned int port = 0; port < ports; port++)
-		if (readl(dart->regs + DART_T8110_OUTSTANDING(port)))
-			return -EBUSY;
-	return 0;
 }
 
 /*
