@@ -228,6 +228,12 @@
 	 * crops the driver derived in config 7, halved.
 	 */
 	sensor-presets {
+		/*
+		 * Measured on a J815 (2026-11-21); the J813 is assumed to have the
+		 * same ultra-wide lens.
+		 */
+		apple,lens-circle = <470>;
+
 		/* 1280x720 */
 		preset0 {
 			apple,config-index = <8>;
