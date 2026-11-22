@@ -405,10 +405,9 @@ pub(crate) fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
     Ok(())
 }
 
-/// Checks that `[start, end)` (rounded out to pages) is user memory mapped with the requested
-/// GPU access: a driver range ENOENT, outside the user range EINVAL, an unmapped page ENOENT, a
-/// page without the access EACCES.
-pub(crate) fn cover(vm: &mmu::Vm, start: u64, end: u64, read: bool, write: bool) -> Result {
+/// Checks that `[start, end)` (rounded out to pages) lies inside the user address range and
+/// outside every driver-reserved range, returning `(first_page, byte_size)`.
+fn align_span(start: u64, end: u64) -> Result<(u64, u64)> {
     let mask = mmu::UAT_PGMSK as u64;
     if end <= start {
         return Err(EINVAL);
@@ -428,17 +427,86 @@ pub(crate) fn cover(vm: &mmu::Vm, start: u64, end: u64, read: bool, write: bool)
     if first < range.start || last > range.end {
         return Err(EINVAL);
     }
-    if vm.covers_range(first, last - first, read, write) {
+    Ok((first, last - first))
+}
+
+/// Checks that `[start, end)` (rounded out to pages) is user memory mapped with the requested
+/// GPU access: a driver range ENOENT, outside the user range EINVAL, an unmapped page ENOENT, a
+/// page without the access EACCES.
+pub(crate) fn cover(vm: &mmu::Vm, start: u64, end: u64, read: bool, write: bool) -> Result {
+    let (first, size) = align_span(start, end)?;
+    if vm.covers_range(first, size, read, write) {
         Ok(())
-    } else if vm.covers_range(first, last - first, false, false) {
+    } else if vm.covers_range(first, size, false, false) {
         Err(EACCES)
     } else {
         Err(ENOENT)
     }
 }
 
+/// Batches page-aligned GPUVM coverage checks under one `gpuvm.lock_inner()` hold while
+/// preserving exact per-span `ENOENT` / `EACCES` / `EINVAL` error reporting on failure.
+struct SpanBatch {
+    ranges: [(u64, u64, u8); 48],
+    len: usize,
+}
+
+impl SpanBatch {
+    const fn new() -> Self {
+        Self {
+            ranges: [(0, 0, 0); 48],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, vm: &mmu::Vm, start: u64, end: u64, read: bool, write: bool) -> Result {
+        let (first, size) = align_span(start, end)?;
+        let access = u8::from(read) | (u8::from(write) << 1);
+        if self.ranges[..self.len]
+            .iter()
+            .any(|&(a, s, acc)| a == first && s == size && (acc & access) == access)
+        {
+            return Ok(());
+        }
+        if self.len == self.ranges.len() {
+            self.flush(vm)?;
+        }
+        self.ranges[self.len] = (first, size, access);
+        self.len += 1;
+        Ok(())
+    }
+
+    fn flush(&mut self, vm: &mmu::Vm) -> Result {
+        let n = self.len;
+        if n == 0 {
+            return Ok(());
+        }
+        self.len = 0;
+        if vm.covers_ranges_batch(&self.ranges[..n]).0 {
+            return Ok(());
+        }
+        for &(first, size, access) in &self.ranges[..n] {
+            let read = access & 1 != 0;
+            let write = access & 2 != 0;
+            if !vm.covers_range(first, size, read, write) {
+                return if vm.covers_range(first, size, false, false) {
+                    Err(EACCES)
+                } else {
+                    Err(ENOENT)
+                };
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Attachment spans, 128-byte granular, actually mapped with `write` or read access.
-fn check_attachments(vm: &mmu::Vm, list: &[uapi::drm_asahi_attachment], write: bool) -> Result {
+fn check_attachments(
+    batch: &mut SpanBatch,
+    vm: &mmu::Vm,
+    list: &[uapi::drm_asahi_attachment],
+    write: bool,
+) -> Result {
     for attachment in list {
         let end = attachment
             .pointer
@@ -452,7 +520,7 @@ fn check_attachments(vm: &mmu::Vm, list: &[uapi::drm_asahi_attachment], write: b
         if (last - first) / 128 > u64::from(u32::MAX) {
             return Err(EINVAL);
         }
-        cover(vm, first, last, true, write)?;
+        batch.push(vm, first, last, true, write)?;
     }
     Ok(())
 }
@@ -486,6 +554,7 @@ fn compact(gva: u64) -> bool {
 /// does not describe the complete ZLS surface layout. The encoded stride is a
 /// register word, not a byte distance (the C HAL200 contract).
 fn check_zls_plane(
+    batch: &mut SpanBatch,
     context: &Context<'_>,
     cmd: &uapi::drm_asahi_cmd_render,
     stencil: bool,
@@ -511,7 +580,7 @@ fn check_zls_plane(
             .checked_mul(u64::from(cmd.layers - 1))
             .and_then(|bytes| bytes.checked_add(1))
             .ok_or(EINVAL)?;
-        cover(
+        batch.push(
             context.vm,
             z.base,
             z.base.checked_add(minimum).ok_or(EINVAL)?,
@@ -529,7 +598,12 @@ fn check_zls_plane(
 }
 
 /// Per-command render admission.
-fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Result {
+fn check_render(
+    context: &Context<'_>,
+    cmd: &uapi::drm_asahi_cmd_render,
+    vertex: &[uapi::drm_asahi_attachment],
+    fragment: &[uapi::drm_asahi_attachment],
+) -> Result {
     check_render_helpers(cmd)?;
     let vm = context.vm;
     let allowed = PROCESS_EMPTY_TILES
@@ -576,9 +650,9 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
     if vdm & 3 != 0 || !compact(vdm) || scissor == 0 || scissor & 3 != 0 {
         return Err(EINVAL);
     }
-    cover(vm, vdm, vdm + 4, true, false)?;
-    gate::vdm(vm, vdm)?;
-    cover(
+    let mut batch = SpanBatch::new();
+    batch.push(vm, vdm, vdm + 4, true, false)?;
+    batch.push(
         vm,
         scissor,
         scissor.checked_add(4).ok_or(EINVAL)?,
@@ -590,7 +664,7 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
         if base & 3 != 0 {
             return Err(EINVAL);
         }
-        cover(vm, base, base.checked_add(4).ok_or(EINVAL)?, true, false)?;
+        batch.push(vm, base, base.checked_add(4).ok_or(EINVAL)?, true, false)?;
     } else if cmd.flags & DBIAS_IS_INT != 0 {
         return Err(EINVAL);
     }
@@ -599,7 +673,7 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
             return Err(EINVAL);
         }
         let base = cmd.isp_oclqry_base;
-        cover(vm, base, base.checked_add(8).ok_or(EINVAL)?, true, true)?;
+        batch.push(vm, base, base.checked_add(8).ok_or(EINVAL)?, true, true)?;
     }
     for program in [&cmd.bg, &cmd.eot, &cmd.partial_bg, &cmd.partial_eot] {
         if program.usc == 0 {
@@ -609,7 +683,7 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
             .usc_base
             .checked_add(u64::from(program.usc & !63))
             .ok_or(EINVAL)?;
-        cover(
+        batch.push(
             vm,
             address,
             address.checked_add(64).ok_or(EINVAL)?,
@@ -617,8 +691,12 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
             false,
         )?;
     }
-    check_zls_plane(context, cmd, false)?;
-    check_zls_plane(context, cmd, true)?;
+    check_zls_plane(&mut batch, context, cmd, false)?;
+    check_zls_plane(&mut batch, context, cmd, true)?;
+    check_attachments(&mut batch, vm, vertex, true)?;
+    check_attachments(&mut batch, vm, fragment, true)?;
+    batch.flush(vm)?;
+    gate::vdm(vm, vdm)?;
     Ok(())
 }
 
@@ -641,9 +719,11 @@ fn check_compute(
     {
         return Err(EINVAL);
     }
-    cover(vm, base, end, true, false)?;
-    gate::cdm(vm, context.usc_base, base, end)?;
-    check_attachments(vm, attachments, true)
+    let mut batch = SpanBatch::new();
+    batch.push(vm, base, end, true, false)?;
+    check_attachments(&mut batch, vm, attachments, true)?;
+    batch.flush(vm)?;
+    gate::cdm(vm, context.usc_base, base, end)
 }
 
 /// Resolves timestamps and exact historical-prefix dependencies of a valid stream
@@ -655,43 +735,28 @@ pub(crate) fn prepare<'a>(
     objects: Pin<&xarray::XArray<KBox<file::Object>>>,
 ) -> Result<Prepared<'a>> {
     let mut resolved = KVec::new();
+    let mut orders = KVec::new();
+    let mut preceding = [0u16; 2];
     for entry in stream(bytes) {
         let entry = entry?;
-        let outputs = match entry.kind {
+        let (outputs, engine, prior) = match entry.kind {
             CMD_RENDER => {
                 let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
-                let cmd = &packet;
-                crate::timestamp::Destinations::resolve_aligned(
+                let outputs = crate::timestamp::Destinations::resolve_aligned(
                     objects,
-                    &[cmd.ts_vtx, cmd.ts_frag],
-                )?
+                    &[packet.ts_vtx, packet.ts_frag],
+                )?;
+                (outputs, RENDER, [packet.prior_vdm, packet.prior_cdm])
             }
             CMD_COMPUTE => {
                 let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
-                let cmd = &packet;
-                crate::timestamp::Destinations::resolve_aligned(objects, &[cmd.ts])?
+                let outputs =
+                    crate::timestamp::Destinations::resolve_aligned(objects, &[packet.ts])?;
+                (outputs, COMPUTE, [packet.prior_vdm, packet.prior_cdm])
             }
             _ => continue,
         };
         resolved.push(outputs, GFP_KERNEL)?;
-    }
-
-    // Historical priors and header barriers.
-    let mut preceding = [0u16; 2];
-    let mut orders = KVec::with_capacity(resolved.len(), GFP_KERNEL)?;
-    for entry in stream(bytes) {
-        let entry = entry?;
-        let (engine, prior) = match entry.kind {
-            CMD_RENDER => {
-                let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
-                (RENDER, [packet.prior_vdm, packet.prior_cdm])
-            }
-            CMD_COMPUTE => {
-                let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
-                (COMPUTE, [packet.prior_vdm, packet.prior_cdm])
-            }
-            _ => continue,
-        };
         orders.push(
             Order::new(accepted, preceding, entry.barriers, prior, engine)?,
             GFP_KERNEL,
@@ -732,9 +797,7 @@ impl Prepared<'_> {
                     let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
                     let cmd = &packet;
                     let outputs = resolved.next().ok_or(EINVAL)?;
-                    check_render(context, cmd)?;
-                    check_attachments(context.vm, &vertex, true)?;
-                    check_attachments(context.vm, &fragment, true)?;
+                    check_render(context, cmd, &vertex, &fragment)?;
                     commands.push(
                         Command::Render(KBox::new(
                             RenderCommand {

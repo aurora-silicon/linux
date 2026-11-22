@@ -72,8 +72,15 @@ mod g16 {
     pub mod params { pub fn stream_gate() -> bool { true } }
     pub mod command {
         use crate::{mmu, kernel::prelude::*};
+        use std::cell::Cell;
         pub const USC_WINDOW: u64 = 1 << 32;
+        std::thread_local! {
+            static COVER_CALLS: Cell<usize> = const { Cell::new(0) };
+        }
+        pub fn reset_cover_calls() { COVER_CALLS.with(|c| c.set(0)); }
+        pub fn cover_calls() -> usize { COVER_CALLS.with(Cell::get) }
         pub fn cover(vm: &mmu::Vm, start: u64, end: u64, _read: bool, _write: bool) -> Result {
+            COVER_CALLS.with(|c| c.set(c.get() + 1));
             if end <= start || start < 0x4000 || end > (1u64 << 42) - 0x8000 {
                 return Err(EINVAL);
             }
@@ -227,6 +234,19 @@ fn long_link_chains_and_cycles() {
     let tail = vm.regions.last_mut().unwrap();
     tail.bytes[..8].copy_from_slice(&bytes(&root));
     assert!(g16::gate::cdm(&vm, USC, BASE, BASE + 8).is_err());
+}
+#[test]
+fn cached_window_reuses_page_coverage_without_rechecking_every_record() {
+    let mut words = Vec::new();
+    for _ in 0..5 {
+        words.extend(launch(0, USC, 0));
+    }
+    words.push(0x40000000);
+    // 5 launches * 40B + 4B terminate = 204 bytes, all within one 256-byte window.
+    g16::command::reset_cover_calls();
+    assert!(run(&words));
+    // Expect 1 cover() call for the 256B stream window + 1 for the cached USC program page.
+    assert_eq!(g16::command::cover_calls(), 2);
 }
 #[test]
 fn pending_signal_interrupts_walk() {

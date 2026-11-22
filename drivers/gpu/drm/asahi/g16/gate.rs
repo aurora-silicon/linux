@@ -60,15 +60,13 @@ impl Window {
     /// unless the record crosses it). Unreadable memory: EFAULT.
     fn words(&mut self, vm: &mmu::Vm, va: u64, count: usize) -> Result<[u32; 10]> {
         let n = count.checked_mul(4).filter(|&n| n <= 40).ok_or(EINVAL)?;
-        cover(vm, va, va.checked_add(n as u64).ok_or(EINVAL)?, true, false)?;
-        let cached = self.len != 0
-            && va >= self.va
-            && va
-                .checked_add(n as u64)
-                .is_some_and(|end| end <= self.va + self.len as u64);
+        let end = va.checked_add(n as u64).ok_or(EINVAL)?;
+        let cached = self.len != 0 && va >= self.va && end <= self.va + self.len as u64;
         if !cached {
             let in_page = mmu::UAT_PGSZ - (va as usize & mmu::UAT_PGMSK);
             let len = n.max(self.bytes.len().min(in_page));
+            let cover_end = va.checked_add(len as u64).ok_or(EINVAL)?;
+            cover(vm, va, cover_end, true, false)?;
             self.len = 0;
             vm.read_user(va, &mut self.bytes[..len])
                 .map_err(|_| EFAULT)?;

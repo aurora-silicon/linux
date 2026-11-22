@@ -212,6 +212,8 @@ struct Standby {
     epochs: KVec<Arc<PbEpoch>>,
     /// Accepted, not-yet-published render commands of this VM.
     reserved: u32,
+    /// `SUBMIT` callers currently sleeping on `standby_available`.
+    waiters: u32,
 }
 
 #[pin_data]
@@ -243,7 +245,14 @@ impl Cache {
         let epochs = KVec::with_capacity(super::budget::LIMIT as usize, GFP_KERNEL)?;
         Arc::pin_init(
             pin_init!(Self { ready <- new_mutex!(Ready::default(), "g16::resources"),
-            standby <- new_spinlock_irq!(Standby { epochs, reserved: 0 }, "g16::spare_epochs"),
+            standby <- new_spinlock_irq!(
+                Standby {
+                    epochs,
+                    reserved: 0,
+                    waiters: 0,
+                },
+                "g16::spare_epochs"
+            ),
             standby_available <- new_condvar!(),
             closed: AtomicBool::new(false),
             factory, bind, live, budget }),
@@ -289,29 +298,29 @@ impl Cache {
         if count == 0 {
             return;
         }
-        loop {
-            let excess = {
-                let mut standby = self.standby.lock();
-                standby.reserved = standby.reserved.saturating_sub(count);
-                let keep = if self.closed.load(Ordering::Acquire) {
-                    standby.reserved as usize
-                } else {
-                    (standby.reserved as usize).max(SPARE_EPOCHS)
-                };
-                if standby.epochs.len() > keep {
-                    standby.epochs.pop()
-                } else {
-                    None
-                }
+        let (mut wake, excess) = {
+            let mut standby = self.standby.lock();
+            standby.reserved = standby.reserved.saturating_sub(count);
+            let wake = standby.waiters != 0;
+            let keep = if self.closed.load(Ordering::Acquire) {
+                standby.reserved as usize
+            } else {
+                (standby.reserved as usize).max(SPARE_EPOCHS)
             };
-            if excess.is_none() {
-                break;
-            }
+            let excess = if standby.epochs.len() > keep {
+                standby.epochs.pop()
+            } else {
+                None
+            };
+            (wake, excess)
+        };
+        if let Some(excess) = excess {
             drop(excess);
             // Subsequent iterations only trim remaining surplus; count was already subtracted.
             loop {
                 let more = {
                     let mut standby = self.standby.lock();
+                    wake |= standby.waiters != 0;
                     let keep = if self.closed.load(Ordering::Acquire) {
                         standby.reserved as usize
                     } else {
@@ -328,9 +337,10 @@ impl Cache {
                 }
                 drop(more);
             }
-            break;
         }
-        self.standby_available.notify_all();
+        if wake {
+            self.standby_available.notify_all();
+        }
     }
 
     /// The VM's client closed. Lets go of the arenas and surplus standby epochs: accepted
@@ -398,29 +408,28 @@ impl Cache {
                     0..BASE_COMPUTE_UNITS,
                 )?);
             }
-            if compute {
-                // SAFETY: ktime_get has no preconditions.
-                let now = unsafe { kernel::bindings::ktime_get() } as u64;
-                ready.burst = if now.wrapping_sub(ready.last_compute_ns) < BURST_GAP_NS {
-                    ready.burst.saturating_add(1)
-                } else {
-                    0
-                };
-                ready.last_compute_ns = now;
+            if compute && ready.compute_ext.is_none() {
                 let units = super::params::compute_units();
-                if ready.compute_ext.is_none()
-                    && units > BASE_COMPUTE_UNITS
-                    && (ready.burst >= BURST_SUBMITS || computes >= BURST_COMMANDS)
-                {
-                    // Best effort: without them the VM keeps one command in flight.
-                    ready.compute_ext = ComputeArena::new(
-                        &self.factory,
-                        &self.bind,
-                        &vm.vm,
-                        &self.live,
-                        BASE_COMPUTE_UNITS..units,
-                    )
-                    .ok();
+                if units > BASE_COMPUTE_UNITS {
+                    // SAFETY: ktime_get has no preconditions.
+                    let now = unsafe { kernel::bindings::ktime_get() } as u64;
+                    ready.burst = if now.wrapping_sub(ready.last_compute_ns) < BURST_GAP_NS {
+                        ready.burst.saturating_add(1)
+                    } else {
+                        0
+                    };
+                    ready.last_compute_ns = now;
+                    if ready.burst >= BURST_SUBMITS || computes >= BURST_COMMANDS {
+                        // Best effort: without them the VM keeps one command in flight.
+                        ready.compute_ext = ComputeArena::new(
+                            &self.factory,
+                            &self.bind,
+                            &vm.vm,
+                            &self.live,
+                            BASE_COMPUTE_UNITS..units,
+                        )
+                        .ok();
+                    }
                 }
             }
             if render && ready.render.is_none() {
@@ -432,22 +441,22 @@ impl Cache {
                 )?);
             }
             if render {
-                // SAFETY: ktime_get has no preconditions.
-                let now = unsafe { kernel::bindings::ktime_get() } as u64;
-                ready.render_burst = if now.wrapping_sub(ready.last_render_ns) < BURST_GAP_NS {
-                    ready.render_burst.saturating_add(1)
-                } else {
-                    0
-                };
-                ready.last_render_ns = now;
-                if ready.render_ext.is_none()
-                    && EXT_RENDER_SLOTS != 0
-                    && (ready.render_burst >= BURST_SUBMITS
-                        || render_count as usize >= BURST_COMMANDS)
-                {
-                    // Best effort: without extension slots the VM keeps two base pass slots.
-                    ready.render_ext =
-                        RenderExtArena::new(&self.factory, &self.bind, &vm.vm, &self.live).ok();
+                if ready.render_ext.is_none() && EXT_RENDER_SLOTS != 0 {
+                    // SAFETY: ktime_get has no preconditions.
+                    let now = unsafe { kernel::bindings::ktime_get() } as u64;
+                    ready.render_burst = if now.wrapping_sub(ready.last_render_ns) < BURST_GAP_NS {
+                        ready.render_burst.saturating_add(1)
+                    } else {
+                        0
+                    };
+                    ready.last_render_ns = now;
+                    if ready.render_burst >= BURST_SUBMITS
+                        || render_count as usize >= BURST_COMMANDS
+                    {
+                        // Best effort: without extension slots the VM keeps two base pass slots.
+                        ready.render_ext =
+                            RenderExtArena::new(&self.factory, &self.bind, &vm.vm, &self.live).ok();
+                    }
                 }
             }
             (
@@ -482,10 +491,12 @@ impl Cache {
                         }
                         needed - standby.epochs.len() as u32
                     } else {
-                        match self
+                        standby.waiters += 1;
+                        let waited = self
                             .standby_available
-                            .wait_interruptible_timeout(&mut standby, remaining)
-                        {
+                            .wait_interruptible_timeout(&mut standby, remaining);
+                        standby.waiters -= 1;
+                        match waited {
                             CondVarTimeoutResult::Woken { jiffies } => {
                                 remaining = jiffies;
                                 continue;
