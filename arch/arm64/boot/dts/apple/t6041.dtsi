@@ -9,7 +9,15 @@
 
 &avd {
 	compatible = "apple,t6041-max-avd", "apple,t6041-avd", "apple,t8132-avd";
-	power-domains = <&ps_avd_sys>;
+	power-domains = <&ps_avd_sys>, <&pmc_soc_max>;
+	power-domain-names = "core", "perf";
+};
+
+&ave {
+	power-domains = <&ps_venc0_dma>, <&ps_venc0_pipe4>,
+			<&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>,
+			<&pmc_soc_max>;
+	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
 };
 
 /*
