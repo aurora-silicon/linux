@@ -694,6 +694,19 @@ static int avd_h264_validate_sps(struct avd_ctx *ctx,
 	if (!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY))
 		/* no interlaced support */
 		return -EINVAL;
+	/*
+	 * The scratch and capture buffers, and the slice table start() sizes,
+	 * follow the OUTPUT format, which the core rounds up to whole
+	 * macroblocks. Refuse a larger picture, as HEVC does, so the engine
+	 * stays inside them. Frame MBs only: map units are macroblock rows.
+	 */
+	if ((sps->pic_width_in_mbs_minus1 + 1) * 16 > fmt_width(ctx) ||
+	    (sps->pic_height_in_map_units_minus1 + 1) * 16 > fmt_height(ctx)) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "H.264 picture larger than the %ux%u format\n",
+				    fmt_width(ctx), fmt_height(ctx));
+		return -EINVAL;
+	}
 
 	return 0;
 }
