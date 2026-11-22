@@ -59,8 +59,9 @@
 		device_type = "pci";
 		reg = <0x1000 0x0 0x0 0x0 0x0>;
 		bus-range = <2 2>;
-		/* ADT pci-bridge2 function-perst */
+		/* ADT pci-bridge2 function-perst and function-clkreq */
 		reset-gpios = <&pinctrl_ap 165 GPIO_ACTIVE_LOW>;
+		clkreq-gpios = <&pinctrl_ap 162 GPIO_ACTIVE_LOW>;
 
 		#address-cells = <3>;
 		#size-cells = <2>;
