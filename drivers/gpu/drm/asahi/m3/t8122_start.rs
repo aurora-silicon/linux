@@ -16,7 +16,11 @@
 //! | `asahi.t8122_sgx_setup` | `t6030`: SGX+0xd14000 = 0x70001 | `none` |
 //! | `asahi.t8122_unit_mask_a` | `0x700000003` | nonzero, within `0x700000003` |
 //! | `asahi.t8122_unit_mask_b` | `0x7` | nonzero, within `0x7` |
-//! | `asahi.t8122_pstate_cap` | `2` | 1 to 5; 6 to 8 with `asahi.m3_thermal=on` |
+//! | `asahi.t8122_pstate_cap` | `8` with `apple,soc-die-keys-complete` and `asahi.m3_thermal=on`, else `2` | 1 to 5; 6 to 8 with `asahi.m3_thermal=on` |
+//!
+//! Where the device tree marks its SoC die key list complete (`apple,soc-die-keys-complete`, as
+//! the J615 tree does) states 6 to 8 are the default ceiling and need no parameter; the
+//! parameters only override. A T8122 without the property keeps the ceiling of 2.
 //!
 //! A cap above 2 is the thermal limit's ceiling (`m3_thermal`), not a fixed cap: the runtime
 //! cap starts at 2 and rises above it only while `asahi.m3_thermal` is on (the default) and the
@@ -163,7 +167,7 @@ const _: () = {
 
 /// The values of one armed boot.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct Experiment(Values);
+pub(crate) struct Experiment(Values, bool);
 
 /// Whether `soc` is the T8122 table.
 pub(crate) fn is_t8122(soc: &Soc) -> bool {
@@ -236,6 +240,12 @@ impl Experiment {
     /// The SGX write (offset, value) made before the firmware starts, if any.
     pub(crate) fn sgx_setup(&self) -> Option<(usize, u32)> {
         self.0.sgx_setup
+    }
+
+    /// Whether the device tree marks its SoC die key list complete
+    /// (`apple,soc-die-keys-complete`).
+    pub(crate) fn die_keys_complete(&self) -> bool {
+        self.1
     }
 
     /// The highest performance state the firmware may use (`asahi.t8122_pstate_cap`).
@@ -315,7 +325,15 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
         dev_err!(dev, "M3 G15G start: refused: the T8122 table is not the one this experiment expects\n");
         return Err(ENODEV);
     }
-    let v = knobs::resolve(&raw).map_err(|refusal| {
+    // Where the device tree marks its SoC die key list complete the ceiling defaults to all
+    // eight states. The hwmon driver then registers the SoC die zone only with every listed key
+    // present, and the runtime cap still starts at and falls back to 2 and rises only while the
+    // thermal limit reads a usable temperature from that zone. Elsewhere, or with the limit not
+    // on, the default is the old 2. `asahi.t8122_pstate_cap` overrides either.
+    let mode = thermal_mode();
+    let die_keys_complete = crate::m3::m3_board::soc_die_keys_complete();
+    let default_cap = knobs::default_pstate_cap(die_keys_complete, feedback(mode));
+    let v = knobs::resolve_with(&raw, default_cap).map_err(|refusal| {
         dev_err!(
             dev,
             "M3 G15G start: refused: asahi.{} has a value it does not accept ({}); GPU startup disabled\n",
@@ -326,9 +344,8 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
     })?;
     // A cap above the no-feedback limit is the thermal limit's ceiling. Without the limit on it
     // is lowered to the no-feedback limit (below), so the GPU still starts.
-    let mode = thermal_mode();
     let u = knobs::pstate_cap_use(v.pstate_cap, feedback(mode));
-    let e = Experiment(v);
+    let e = Experiment(v, die_keys_complete);
     dev_warn!(
         dev,
         "M3 G15G start: armed (board default or asahi.t8122_start=1, boot loader handoff admitted): initdata_version={:#018x} fender={:#x} clkgen={} sgx_setup={} unit_mask_a={:#x} unit_mask_b={:#x} pstate_cap={}\n",

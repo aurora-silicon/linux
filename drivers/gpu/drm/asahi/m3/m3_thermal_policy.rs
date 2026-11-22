@@ -98,6 +98,41 @@ pub(crate) const COOL_GAP_DEFAULT: u64 = 10;
 pub(crate) const COOL_GAP_MIN: u64 = 3;
 pub(crate) const COOL_GAP_MAX: u64 = 10;
 
+/// Default `hot` and cool gap where the device tree marks the SoC die key list of a T8122
+/// complete (`apple,soc-die-keys-complete`): 90 C with a gap of 3 C. On a J615 this held a 600 s
+/// GPU load with the hottest GPU key at 93.8 C and no missed frames, at 289 fps against 218 fps
+/// for 80 C with a gap of 10 C (85 C with a gap of 10 C, which never left state 2 under a
+/// sustained load, gave 272 fps). 92 C lets the GPU keys pass the 94 C die target of the boot
+/// firmware's tree. `critical` is then 98 C, below the 110 C critical trip of the CPU thermal
+/// zones.
+pub(crate) const DIE_KEYS_HOT_DEFAULT: u64 = 90;
+pub(crate) const DIE_KEYS_COOL_GAP_DEFAULT: u64 = 3;
+const _: () = {
+    assert!(DIE_KEYS_HOT_DEFAULT >= THERMAL_HOT_MIN && DIE_KEYS_HOT_DEFAULT <= THERMAL_HOT_MAX);
+    assert!(DIE_KEYS_COOL_GAP_DEFAULT >= COOL_GAP_MIN && DIE_KEYS_COOL_GAP_DEFAULT <= COOL_GAP_MAX);
+};
+/// Value of `asahi.m3_thermal_hot` and `asahi.m3_thermal_cool_gap` while they are not given.
+pub(crate) const THRESHOLD_UNSET: u64 = u64::MAX;
+
+/// The `hot` and cool gap in degrees Celsius that a boot uses before clamping: each given
+/// parameter as it is, else the default of a T8122 whose device tree marks its SoC die key list
+/// complete (`die_keys_complete`) or the general default.
+pub(crate) fn resolve_thresholds(
+    hot_param: u64,
+    gap_param: u64,
+    die_keys_complete: bool,
+) -> (u64, u64) {
+    let (hot, gap) = if die_keys_complete {
+        (DIE_KEYS_HOT_DEFAULT, DIE_KEYS_COOL_GAP_DEFAULT)
+    } else {
+        (THERMAL_HOT_DEFAULT, COOL_GAP_DEFAULT)
+    };
+    (
+        if hot_param == THRESHOLD_UNSET { hot } else { hot_param },
+        if gap_param == THRESHOLD_UNSET { gap } else { gap_param },
+    )
+}
+
 /// `hot` and the cool gap in millidegrees Celsius for the requested values in degrees Celsius,
 /// each clamped to its bounds, and whether either was clamped.
 pub(crate) fn clamp_thresholds(hot_c: u64, gap_c: u64) -> (i32, i32, bool) {
@@ -957,6 +992,27 @@ mod tuning_tests {
         assert_eq!(clamp_thresholds(150, 0), (92_000, 3_000, true));
         assert_eq!(clamp_thresholds(39, 11), (40_000, 10_000, true));
         assert_eq!(clamp_thresholds(40, 10), (40_000, 10_000, false));
+    }
+
+    #[test]
+    fn the_defaults_follow_the_device_tree_and_the_parameters_override_them() {
+        let unset = THRESHOLD_UNSET;
+        assert_eq!(resolve_thresholds(unset, unset, false), (80, 10));
+        assert_eq!(resolve_thresholds(unset, unset, true), (90, 3));
+        // A parameter replaces only its own default.
+        assert_eq!(resolve_thresholds(85, unset, true), (85, 3));
+        assert_eq!(resolve_thresholds(unset, 10, true), (90, 10));
+        assert_eq!(resolve_thresholds(85, 10, false), (85, 10));
+        assert_eq!(resolve_thresholds(0, 0, true), (0, 0));
+        // Both defaults are inside their bounds, so nothing is clamped or logged.
+        let (hot, gap) = resolve_thresholds(unset, unset, true);
+        assert_eq!(clamp_thresholds(hot, gap), (90_000, 3_000, false));
+        let (hot, gap) = resolve_thresholds(unset, unset, false);
+        assert_eq!(clamp_thresholds(hot, gap), (80_000, 10_000, false));
+        // At 90 C with a gap of 3 C the cap is raised at or below 87 C and critical is 98 C.
+        let mut p = Policy::new(true, 2, 8, 90_000);
+        p.set_thresholds(90_000, 3_000);
+        assert_eq!(p.thresholds(), (87_000, 90_000, 98_000));
     }
 
     #[test]

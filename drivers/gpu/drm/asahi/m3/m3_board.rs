@@ -23,6 +23,28 @@ pub(crate) fn board_is(compatible: &[u8]) -> bool {
     board.split(|b| *b == 0).any(|s| s == compatible)
 }
 
+/// Whether the device tree marks its SoC die key list complete: a node that has the
+/// `apple,soc-die-keys-complete` property (the SMC hwmon node of a board whose firmware provides
+/// every key in `apple,soc-die-keys`). The hwmon driver then registers the `macsmc_soc_die`
+/// thermal zone only when every listed key is present. The thermal limit keeps the runtime cap
+/// at its fallback without a usable reading of that zone, so this being true raises nothing by
+/// itself.
+pub(crate) fn soc_die_keys_complete() -> bool {
+    // SAFETY: the property name is NUL-terminated; the lookup takes a node reference or returns
+    // NULL. `NodeRef` releases it.
+    let np = unsafe {
+        bindings::of_find_node_with_property(
+            core::ptr::null_mut(),
+            c_str!("apple,soc-die-keys-complete").as_char_ptr(),
+        )
+    };
+    if np.is_null() {
+        return false;
+    }
+    drop(NodeRef(np));
+    true
+}
+
 /// Whether this is a board the M3 runtime is validated on (`soc.validated_boards`).
 /// `asahi.m3_expose=auto` registers the render node and `asahi.m3_backend=auto` starts the
 /// runtime only on these.

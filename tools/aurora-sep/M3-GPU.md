@@ -112,11 +112,15 @@ entry remains available. After reboot and desktop login, run
 
 ## J613/J615 temperature-guarded performance ceiling
 
-The T8122 default ceiling remains state 2. With the state-2 fallback repair in
-this driver, an explicit `asahi.t8122_pstate_cap=5 asahi.m3_thermal=on` permits
-states up to 5 only while the governor has usable die-temperature readings.
-Do not apply this higher ceiling to an older kernel: its implementation can
-also raise the boot and sensor-failure cap.
+Where the device tree marks its die key list complete with
+`apple,soc-die-keys-complete` (so far the J615) and `asahi.m3_thermal` is on,
+which is the default, the ceiling is state 8 without any boot option. A T8122
+whose device tree does not have the property, such as J613 and J504, keeps the
+old ceiling of state 2. With the state-2 fallback repair in this driver the ceiling
+is reached only while the governor has usable die-temperature readings. Do not
+apply a higher ceiling to an older kernel: its implementation can also raise the
+boot and sensor-failure cap. `asahi.t8122_pstate_cap` is an override that
+lowers or sets the ceiling.
 
 The repaired driver starts at state 2 and immediately returns there for missing,
 failed, stale, stuck or implausible temperature readings, or at the critical
@@ -124,20 +128,30 @@ temperature. A lower requested ceiling still wins. `m3_thermal=off` and `hold`
 do not permit states above 2. Non-T8122 cap selection is unchanged.
 
 J615 now supplies `macsmc_soc_die` from the six Tg GPU-family keys and the six
-CPU die keys also used on J613. All twelve must be discovered before the J615
-zone is registered; a later read failure in any sensor fails the whole reading.
+CPU die keys also used on J613. With `apple,soc-die-keys-complete` in the J615
+tree all twelve must be discovered before the zone is registered; a later read
+failure in any sensor fails the whole reading.
 Do not shorten the `apple,soc-die-keys` list in `t8122.dtsi`. These are raw sensor
 readings, not a calibration or a hardware safety certification.
 
-Caps 6 to 8 (up to 1338 MHz, the top of the T8122 table) are an experiment on top
-of this. They are admitted only with `asahi.m3_thermal=on`, which is also the
-default. With `off` or `hold` the driver lowers them to 5 with one boot line and
-the GPU still starts. Boot, missing readings and the critical temperature stay at
-state 2. The runtime range is 2 to the cap, and the firmware's highest state is
-the cap. Values of 9 or more are refused. While the firmware's highest state is
-above 2 the driver checks the reported state at every retirement with no later
-batch in flight, whatever `asahi.m3_retire_mmio` says, and lets the pipeline
-drain once the last check is 500 ms old. `air-gpu-oneshot.sh` still offers 1 to 5.
+States 6 to 8 (up to 1338 MHz, the top of the T8122 table) are the default
+ceiling with the die key list marked complete. They are admitted only with
+`asahi.m3_thermal=on`, which is also the default. With `off` or `hold` the
+driver lowers them to 5 with one boot line and the GPU still starts (an unset
+cap with `off` or `hold` stays at 2). Boot, missing readings and the critical
+temperature stay at state 2. The runtime range is 2 to the cap, and the
+firmware's highest state is the cap. Values of 9 or more are refused. While the
+firmware's highest state is above 2 the driver checks the reported state at
+every retirement with no later batch in flight, whatever `asahi.m3_retire_mmio`
+says, and lets the pipeline drain once the last check is 500 ms old.
+`air-gpu-oneshot.sh` still offers 1 to 5.
+
+The thermal limit's thresholds follow the same rule. With the property the
+runtime cap steps down at 90 C and up again at 87 C (`asahi.m3_thermal_hot` 90,
+`asahi.m3_thermal_cool_gap` 3) and returns to state 2 at 98 C. Without it the
+old 80 C and 10 C apply. Both parameters only override these defaults and can
+be written at runtime. On a J615 the 90 C and 3 C pair held a 600 s GPU load with
+the hottest GPU key at 93.8 C and no missed frames.
 
 First boot with `asahi.t8122_pstate_cap=5 asahi.m3_thermal=hold` and confirm that
 the firmware respects the runtime cap of 2 under GPU load. Before relying on

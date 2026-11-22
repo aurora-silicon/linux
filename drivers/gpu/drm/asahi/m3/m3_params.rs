@@ -561,24 +561,53 @@ pub(crate) fn thermal_param() -> Option<ThermalMode> {
 }
 
 pub(crate) use crate::m3::m3_thermal_policy::{
-    COOL_GAP_DEFAULT, COOL_GAP_MAX, COOL_GAP_MIN, THERMAL_HOT_DEFAULT, THERMAL_HOT_MAX,
-    THERMAL_HOT_MIN,
+    COOL_GAP_MAX, COOL_GAP_MIN, THERMAL_HOT_MAX, THERMAL_HOT_MIN, THRESHOLD_UNSET,
 };
 
+/// Print a threshold parameter: its value, or `default` while it is not given (the default
+/// depends on the device tree, see `m3_thermal_policy::resolve_thresholds`).
+unsafe extern "C" fn get_threshold_param(
+    buffer: *mut c_char,
+    kp: *const kernel::bindings::kernel_param,
+) -> c_int {
+    use core::fmt::Write;
+
+    // SAFETY: The entry points to static AtomicU64 storage by contract.
+    let value = unsafe { &*((*kp).__bindgen_anon_1.arg.cast::<AtomicU64>()) }
+        .load(Ordering::Relaxed);
+    // SAFETY: 32 bytes fit in the core's PAGE_SIZE output buffer and hold any decimal u64 or
+    // "default" plus a NUL.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), 32) };
+    let mut output = kernel::str::Formatter::new(bytes);
+    let written = if value == THRESHOLD_UNSET {
+        write!(output, "default\0")
+    } else {
+        write!(output, "{}\0", value)
+    };
+    if written.is_err() {
+        return EINVAL.to_errno();
+    }
+    (output.bytes_written() - 1) as c_int
+}
+
 /// `asahi.m3_thermal_hot`: the SoC die temperature (degrees Celsius) at or above which the thermal
-/// limit lowers the runtime cap, clamped to [`THERMAL_HOT_MIN`]..=[`THERMAL_HOT_MAX`]. Writable
-/// at runtime through sysfs. The thermal limit picks a new value up at its next update.
-static M3_THERMAL_HOT: AtomicU64 = AtomicU64::new(THERMAL_HOT_DEFAULT);
-m3_param!("m3_thermal_hot", M3_THERMAL_HOT, parse_u64, 0o644, Some(get_atomic_param));
+/// limit lowers the runtime cap, clamped to [`THERMAL_HOT_MIN`]..=[`THERMAL_HOT_MAX`]. Only an
+/// override: unset it is 90 on a T8122 whose device tree marks its SoC die key list complete
+/// (`apple,soc-die-keys-complete`) and 80 otherwise (`m3_thermal_policy::resolve_thresholds`).
+/// Writable at runtime through sysfs. The thermal limit picks a new value up at its next update.
+static M3_THERMAL_HOT: AtomicU64 = AtomicU64::new(THRESHOLD_UNSET);
+m3_param!("m3_thermal_hot", M3_THERMAL_HOT, parse_u64, 0o644, Some(get_threshold_param));
 
 /// `asahi.m3_thermal_cool_gap`: how far below `hot` (degrees Celsius) the die must be before the
 /// thermal limit raises the runtime cap again, clamped to [`COOL_GAP_MIN`]..=[`COOL_GAP_MAX`].
-/// Writable at runtime through sysfs, like `asahi.m3_thermal_hot`.
-static M3_THERMAL_COOL_GAP: AtomicU64 = AtomicU64::new(COOL_GAP_DEFAULT);
-m3_param!("m3_thermal_cool_gap", M3_THERMAL_COOL_GAP, parse_u64, 0o644, Some(get_atomic_param));
+/// Only an override: unset it is 3 on a T8122 whose device tree marks its SoC die key list
+/// complete and 10 otherwise. Writable at runtime through sysfs, like `asahi.m3_thermal_hot`.
+static M3_THERMAL_COOL_GAP: AtomicU64 = AtomicU64::new(THRESHOLD_UNSET);
+m3_param!("m3_thermal_cool_gap", M3_THERMAL_COOL_GAP, parse_u64, 0o644, Some(get_threshold_param));
 
-/// The requested `asahi.m3_thermal_hot` and `asahi.m3_thermal_cool_gap`, in degrees Celsius
-/// and not yet clamped (`m3_thermal_policy::clamp_thresholds` does that).
+/// The `asahi.m3_thermal_hot` and `asahi.m3_thermal_cool_gap` as given, in degrees Celsius, or
+/// [`THRESHOLD_UNSET`] (`m3_thermal_policy::resolve_thresholds` gives the defaults and
+/// `clamp_thresholds` the bounds).
 pub(crate) fn thermal_threshold_params() -> (u64, u64) {
     (
         M3_THERMAL_HOT.load(Ordering::Relaxed),
@@ -661,9 +690,11 @@ m3_param!("t8122_unit_mask_a", T8122_UNIT_MASK_A, parse_t8122_number);
 static T8122_UNIT_MASK_B: AtomicU64 = AtomicU64::new(T8122_UNSET);
 m3_param!("t8122_unit_mask_b", T8122_UNIT_MASK_B, parse_t8122_number);
 /// `asahi.t8122_pstate_cap=N`: the highest performance state the T8122 firmware may use, 1 to 8.
-/// The runtime cap starts at and falls back to 2; with `asahi.m3_thermal=on` it may rise to the
-/// cap on usable die temperatures. 6 to 8 need `on`: with `hold` or `off` they are lowered to 5
-/// (`t8122_knobs::pstate_cap_use`).
+/// Only an override: unset it is 8 where the device tree marks its SoC die key list complete
+/// (`apple,soc-die-keys-complete`) and the thermal limit is on, else 2
+/// (`t8122_knobs::default_pstate_cap`). The runtime cap starts at and falls back to 2; with
+/// `asahi.m3_thermal=on` it may rise to the cap on usable die temperatures. 6 to 8 need `on`:
+/// with `hold` or `off` they are lowered to 5 (`t8122_knobs::pstate_cap_use`).
 static T8122_PSTATE_CAP: AtomicU64 = AtomicU64::new(T8122_UNSET);
 m3_param!("t8122_pstate_cap", T8122_PSTATE_CAP, parse_t8122_number);
 

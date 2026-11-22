@@ -164,6 +164,9 @@ pub(crate) struct PstatePolicy {
     pub(crate) freqs: [u32; 16],
     /// `asahi.m3_thermal`.
     pub(crate) thermal: ThermalMode,
+    /// Whether the device tree marks this T8122's SoC die key list complete
+    /// (`apple,soc-die-keys-complete`): it selects the default thresholds of the thermal limit.
+    pub(crate) die_keys_complete: bool,
 }
 
 impl PstatePolicy {
@@ -243,6 +246,7 @@ impl PstatePolicy {
             boot_mhz: freqs[boot as usize],
             freqs,
             thermal,
+            die_keys_complete: experiment.is_some_and(|e| e.die_keys_complete()),
         })
     }
 }
@@ -427,7 +431,7 @@ impl Contents {
         // The legacy host-only thermal governor must not replace those inputs.
         let pstates = PstatePolicy { table_max: 8, table_max_mhz: 1338,
             max: 8, safe: 8, boot: 1, max_mhz: 1338, safe_mhz: 1338,
-            boot_mhz: freqs[1], freqs, thermal: ThermalMode::Off };
+            boot_mhz: freqs[1], freqs, thermal: ThermalMode::Off, die_keys_complete: false };
         let mut images = KVec::new();
         for _ in 0..super::m3_init_26::COUNT { images.push(None, GFP_KERNEL)?; }
         Ok(Self { extended: Some(ExtendedInputs { power, sram_uv, bases }),

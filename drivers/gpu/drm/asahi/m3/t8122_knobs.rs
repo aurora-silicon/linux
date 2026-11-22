@@ -37,6 +37,19 @@ pub(crate) const PSTATE_FALLBACK: u32 = 2;
 /// `t8122_start` asserts is the same number). A higher cap with `asahi.m3_thermal=off` or `hold`
 /// is lowered to it, so the GPU still starts.
 pub(crate) const PSTATE_CAP_NO_FEEDBACK_MAX: u32 = 5;
+/// The ceiling when `asahi.t8122_pstate_cap` is not given: all eight states where the device
+/// tree marks its SoC die key list complete (`apple,soc-die-keys-complete`) and the thermal limit
+/// is on, so the ceiling is only reached while the limit reads a usable temperature and the
+/// runtime cap otherwise stays at [`PSTATE_FALLBACK`]; [`PSTATE_CAP`] everywhere else, which
+/// needs no feedback.
+pub(crate) fn default_pstate_cap(die_keys_complete: bool, feedback: Feedback) -> u32 {
+    if die_keys_complete && feedback == Feedback::On {
+        PSTATE_CAP_MAX
+    } else {
+        PSTATE_CAP
+    }
+}
+
 /// The highest performance-state ceiling the experiment accepts: the eight states of the M3
 /// Airs' table. A ceiling above [`PSTATE_CAP_NO_FEEDBACK_MAX`] needs the thermal limit on
 /// (`m3_thermal`) and is only how far it may raise the runtime cap while it reads a usable SoC
@@ -250,8 +263,15 @@ fn given(param: u64, default: u64) -> Option<u64> {
     }
 }
 
-/// Resolve the parameters. The first parameter with a value it does not accept is the refusal.
+/// Resolve the parameters with the default ceiling [`PSTATE_CAP`].
 pub(crate) fn resolve(raw: &Raw) -> Result<Values, Refusal> {
+    resolve_with(raw, PSTATE_CAP)
+}
+
+/// Resolve the parameters. `default_cap` is the ceiling when `asahi.t8122_pstate_cap` is not
+/// given ([`default_pstate_cap`]). The first parameter with a value it does not accept is the
+/// refusal.
+pub(crate) fn resolve_with(raw: &Raw, default_cap: u32) -> Result<Values, Refusal> {
     let refuse = |name, accepts| Refusal { name, accepts };
     let initdata_version = given(raw.initdata_version, crate::m3::m3_firmware::G15_V14_8_3_INITDATA)
         .filter(|v| *v != 0)
@@ -276,7 +296,7 @@ pub(crate) fn resolve(raw: &Raw) -> Result<Values, Refusal> {
     let unit_mask_b = given(raw.unit_mask_b, UNIT_MASK_B as u64)
         .filter(|v| *v != 0 && *v & !UNIT_MASK_B_LIMIT == 0)
         .ok_or(refuse("t8122_unit_mask_b", "nonzero, no bits outside 0x7"))? as u32;
-    let pstate_cap = given(raw.pstate_cap, PSTATE_CAP as u64)
+    let pstate_cap = given(raw.pstate_cap, u64::from(default_cap))
         .filter(|v| (1..=u64::from(PSTATE_CAP_MAX)).contains(v))
         .ok_or(refuse("t8122_pstate_cap", "1 to 8"))? as u32;
     Ok(Values {
@@ -390,6 +410,30 @@ mod tests {
     }
 
     const FEEDBACK: [Feedback; 3] = [Feedback::Off, Feedback::Hold, Feedback::On];
+
+    #[test]
+    fn the_default_ceiling_follows_the_complete_die_keys_and_the_given_cap_overrides_it() {
+        for feedback in FEEDBACK {
+            // Without a complete die key list the old default stays whatever the thermal limit
+            // is.
+            assert_eq!(default_pstate_cap(false, feedback), 2);
+        }
+        assert_eq!(default_pstate_cap(true, Feedback::Off), 2);
+        assert_eq!(default_pstate_cap(true, Feedback::Hold), 2);
+        assert_eq!(default_pstate_cap(true, Feedback::On), 8);
+        let given_none = with(|_| {});
+        assert_eq!(resolve_with(&given_none, 8).unwrap().pstate_cap, 8);
+        assert_eq!(resolve(&given_none).unwrap().pstate_cap, 2);
+        // A given cap wins over the default, including a lower one.
+        for cap in 1..=PSTATE_CAP_MAX {
+            let raw = with(|r| r.pstate_cap = u64::from(cap));
+            assert_eq!(resolve_with(&raw, 8).unwrap().pstate_cap, cap);
+        }
+        // The default ceiling is a ceiling only: the runtime cap stays at the fallback without
+        // a usable reading, so the complete-keys default raises nothing by itself.
+        let u = pstate_cap_use(default_pstate_cap(true, Feedback::On), Feedback::On);
+        assert_eq!(u, CapUse { ceiling: 8, fallback: 2, ranges: true });
+    }
 
     #[test]
     fn pstate_cap_accepts_one_to_eight_only() {
