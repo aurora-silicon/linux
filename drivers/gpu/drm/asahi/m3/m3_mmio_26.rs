@@ -56,6 +56,20 @@ pub(crate) struct RegisterBases {
     pub(crate) metrology: u64,
 }
 
+/// Register-map positions of the 26B123 (27.2) firmware.
+pub(crate) const SLOTS_26B123: usize = 60;
+
+/// The 26B123 register-map position of 26.6.2 logical slot `slot`: 26B123 renumbers the map
+/// (53 -> 60 positions; the same renumbering as the G16 26B123 map): slots 0-7, 9-20 and 22-24
+/// keep their numbers and 26-43 move up by five. Slots 8, 21, 25 and 44-52 have no position.
+pub(crate) const fn position_26b123(slot: usize) -> Option<usize> {
+    match slot {
+        0..=7 | 9..=20 | 22..=24 => Some(slot),
+        26..=43 => Some(slot + 5),
+        _ => None,
+    }
+}
+
 /// Select the wire slot and map its logical hardware block independently of its VA.
 pub(crate) fn area(slot: usize, bases: RegisterBases) -> Result<Option<Area>, Error> {
     let (base, offset, bytes, tagged, writable, split) = match slot {

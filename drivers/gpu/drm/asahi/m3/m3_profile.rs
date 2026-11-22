@@ -4,36 +4,48 @@
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Profile {
+    /// Firmware 14.8.3 (the Legacy G15 interface).
     Legacy,
+    /// Firmware 26.6.2 (ABI 25G83): the Extended G15 interface.
     Extended,
+    /// Firmware 27.2 (ABI 26B123): the Extended interface with the 26B123 object sizes,
+    /// InitData positions, start sequence and work records. Chosen by the admitted image
+    /// (`Firmware::profile`), never by a board or a parameter.
+    Extended27,
 }
 
 pub(crate) const PARAMS_REQUIRED: u64 = 600;
 
 impl Profile {
-    /// Whether the firmware speaks the Extended interface.
+    /// Whether the firmware speaks the Extended interface (26.6.2 or 27.2).
     pub(crate) const fn extended(self) -> bool {
-        matches!(self, Self::Extended)
+        matches!(self, Self::Extended | Self::Extended27)
+    }
+
+    /// Whether the firmware uses the 26B123 (27.2) layouts on top of the Extended interface.
+    pub(crate) const fn v26b123(self) -> bool {
+        matches!(self, Self::Extended27)
     }
 
     pub(crate) const fn firmware_compat(self) -> [u32; 3] {
         match self {
             Self::Legacy => [14, 8, 3],
             Self::Extended => [26, 6, 2],
+            Self::Extended27 => [27, 2, 0],
         }
     }
 
     pub(crate) const fn hal(self) -> u32 {
         match self {
             Self::Legacy => 0,
-            Self::Extended => 200,
+            Self::Extended | Self::Extended27 => 200,
         }
     }
 
     pub(crate) const fn user_end(self) -> u64 {
         match self {
             Self::Legacy => 0x2ff_ffff_8000,
-            Self::Extended => (1 << 42) - 2 * 0x4000,
+            Self::Extended | Self::Extended27 => (1 << 42) - 2 * 0x4000,
         }
     }
 
@@ -42,14 +54,14 @@ impl Profile {
     pub(crate) const fn profiler_ticks(self, timestamp: u64) -> u64 {
         match self {
             Self::Legacy => timestamp,
-            Self::Extended => (timestamp / 1000) * 24 + (timestamp % 1000) * 24 / 1000,
+            Self::Extended | Self::Extended27 => (timestamp / 1000) * 24 + (timestamp % 1000) * 24 / 1000,
         }
     }
 
     pub(crate) fn gpu_duration_ns(self, elapsed: u64) -> Option<u64> {
         match self {
             Self::Legacy => elapsed.checked_mul(1000).map(|value| value / 24),
-            Self::Extended => Some(elapsed),
+            Self::Extended | Self::Extended27 => Some(elapsed),
         }
     }
 

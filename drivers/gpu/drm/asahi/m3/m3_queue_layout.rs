@@ -59,6 +59,8 @@ pub(crate) struct QueueInfo {
     pub(crate) gpu_scratch: FirmwareVa,
     pub(crate) context: FirmwareVa,
     pub(crate) uuid: u32,
+    /// 26B123 (27.2) records: the binding generation is a u64, so the fields after it move +7.
+    pub(crate) v26b123: bool,
 }
 
 impl QueueInfo {
@@ -124,12 +126,15 @@ impl QueueInfo {
         if end > 0xffff_fc30_0000_0000 { return Err(Error::Address); }
         let bytes = output.get_mut(..Self::EXTENDED_SIZE).ok_or(Error::Size)?;
         bytes.fill(0);
+        // 26B123: header 0x80 (class word 0x44, u32::MAX 0x48, scheduling context 0x78).
+        let v26 = self.v26b123;
+        let (header, context, class_c, unk_4c) = if v26 { (0x80, 0x78, 0x44, 0x48) } else { (0xb0, 0xa4, 0x48, 0x4c) };
         for (offset, value) in [(0, self.state.get()), (8, self.ring.get()),
-            (16, self.job_list.get()), (24, owner.get() + 0xb0), (0xa4, self.context.get())] {
+            (16, self.job_list.get()), (24, owner.get() + header), (context, self.context.get())] {
             bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         }
-        for offset in [0x2c, 0x4c] { bytes[offset..offset + 4].fill(0xff); }
-        for offset in [0x30, 0x34, 0x48] {
+        for offset in [0x2c, unk_4c] { bytes[offset..offset + 4].fill(0xff); }
+        for offset in [0x30, 0x34, class_c] {
             bytes[offset..offset + 4].copy_from_slice(&2u32.to_le_bytes());
         }
         bytes[0x38..0x40].copy_from_slice(&0xffff_0000_0000_0000u64.to_le_bytes());
@@ -143,7 +148,7 @@ mod extended_tests {
     #[test] fn scheduler_pointer_relocates_with_its_retained_queue_owner() {
         let fw = |i: u64| FirmwareVa::new(0xffff_fc21_4000_0000 + i * 0x4000).unwrap();
         let info = QueueInfo { state: fw(1), ring: fw(2), job_list: fw(3),
-            gpu_scratch: fw(4), context: fw(5), uuid: 9 };
+            gpu_scratch: fw(4), context: fw(5), uuid: 9, v26b123: false };
         let mut output = vec![0xa5; QueueInfo::EXTENDED_SIZE + 8];
         info.encode_extended(fw(0), &mut output).unwrap();
         assert_eq!(u64::from_le_bytes(output[24..32].try_into().unwrap()), fw(0).get() + 0xb0);
@@ -152,5 +157,30 @@ mod extended_tests {
         let mut short = [0xa5; INFO_SIZE];
         assert!(info.encode_extended(fw(0), &mut short).is_err());
         assert_eq!(short, [0xa5; INFO_SIZE]);
+    }
+}
+
+#[cfg(test)]
+mod u1_tests {
+    use super::*;
+    /// Oracle: djdev/g16-272 fw/graph.rs queue_image_for(&qinfo::V26B123, ...), re-typed.
+    fn v26b123_image(state: u64, ring: u64, list: u64, queue: u64, context: u64) -> [u8; 0xb4] {
+        let mut q = [0u8; 0xb4];
+        for (at, v) in [(0usize, state), (8, ring), (0x10, list), (0x18, queue + 0x80), (0x38, 0xffff_0000_0000_0000u64), (0x78, context)] {
+            q[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        for (at, v) in [(0x2cusize, u32::MAX), (0x30, 2), (0x34, 2), (0x44, 2), (0x48, u32::MAX)] {
+            q[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        q
+    }
+    #[test] fn u1_qinfo_matches_v26b123_image_image() {
+        let fw = |i: u64| FirmwareVa::new(0xffff_fc21_4000_0000 + i * 0x4000).unwrap();
+        let info = QueueInfo { state: fw(1), ring: fw(2), job_list: fw(3), gpu_scratch: fw(4), context: fw(5), uuid: 9, v26b123: true };
+        let mut out = vec![0xa5; QueueInfo::EXTENDED_SIZE + 8];
+        info.encode_extended(fw(0), &mut out).unwrap();
+        assert_eq!(&out[..0xb4], &v26b123_image(fw(1).get(), fw(2).get(), fw(3).get(), fw(0).get(), fw(5).get())[..]);
+        assert!(out[0xb4..QueueInfo::EXTENDED_SIZE].iter().all(|&b| b == 0));
+        assert_eq!(&out[QueueInfo::EXTENDED_SIZE..], &[0xa5; 8]);
     }
 }

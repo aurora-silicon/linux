@@ -92,7 +92,80 @@ fixture = r'''
     }
     fn build(p: &hw::PwrConfig, sram: &[u32]) -> Result<m3_power_26::PowerImages> {
         m3_power_26::PowerImages::new(p, sram, 0xffff_fc21_0340_0000,
-            0xffff_fc21_0350_0000, 0xffff_fc2f_fc00_0000, &[0; 53 * 40])
+            0xffff_fc21_0350_0000, 0xffff_fc2f_fc00_0000, &[0; 53 * 40], None)
+    }
+    fn build_26b123(p: &hw::PwrConfig, sram: &[u32], records: &[u8])
+        -> Result<m3_power_26::PowerImages> {
+        m3_power_26::PowerImages::new(p, sram, 0xffff_fc21_0340_0000,
+            0xffff_fc21_0350_0000, 0xffff_fc2f_fc00_0000, records,
+            Some(m3_power_26::Abi26B123 { crash_copy_bytes: 0x8000, fast_die_target_c: 88 }))
+    }
+    #[test] fn the_26b123_images_move_the_26_6_2_words_and_take_the_machine_values() {
+        let mut records = [0u8; 53 * 40];
+        for (slot, record) in records.chunks_exact_mut(40).enumerate() {
+            record[..8].copy_from_slice(&(0x1000 + slot as u64).to_le_bytes());
+        }
+        let p = input();
+        let old = build(&p, &[950_001; 9]).unwrap();
+        let new = build_26b123(&p, &[950_001; 9], &records).unwrap();
+        assert_eq!((new.hardware.len(), new.performance.len(), new.power.len(), new.globals.len()),
+            (0x2788, 0x6c48, 0x698, 0xe4c));
+        // Register map: 0-7, 9-20, 22-24 keep their slots, 26-43 move up five, the rest stay empty.
+        let at = |position: usize| 0x640 + position * 40;
+        for (slot, position) in [(0, 0), (7, 7), (9, 9), (24, 24), (26, 31), (43, 48)] {
+            assert_eq!(u64::from_le_bytes(new.hardware[at(position)..at(position) + 8].try_into().unwrap()),
+                0x1000 + slot as u64, "slot {}", slot);
+        }
+        for position in [8, 21, 25, 26, 30, 49, 59] {
+            assert!(new.hardware[at(position)..at(position) + 40].iter().all(|&b| b == 0), "position {}", position);
+        }
+        // Main: retention moves to the runtime pointers (+0xfa0 empty), +0xfa8 is the crash copy size.
+        assert!(new.hardware[0xfa0..0xfa8] == [0; 8]);
+        assert_eq!(u64::from_le_bytes(new.hardware[0xfa8..0xfb0].try_into().unwrap()), 0x8000);
+        assert!(new.hardware[0xfb0..0xfdc] == old.hardware[0xe90..0xebc]);
+        assert!(new.hardware[0xfdc..0x26d0] == old.hardware[0xec0..0x25b4]);
+        // Words 26B123 adds or sets on top of the moved 26.6.2 ones (checked below).
+        let masked = |b: &[u8], words: &[usize]| {
+            let mut b = b.to_vec();
+            for &at in words { b[at..at + 4].fill(0); }
+            b
+        };
+        let perf = masked(&new.performance, &[0x2f34, 0x6ac8]);
+        // Performance: the runs, the power-up words, the two added words and the shared3 state
+        // word above every state.
+        assert!(perf[..0x9c] == old.performance[..0x9c]);
+        assert!(perf[0xac..0x28c0] == old.performance[0x9c..0x28b0]);
+        // (26.6.2 source of each: +0x2f14 by the 0x2f08.. run, +0x6420 by the 0x63cc.. run)
+        for (at, from) in [(0x2f34, 0x2f14), (0x6ac8, 0x6420)] {
+            let was = word(&old.performance, from);
+            assert_eq!(word(&new.performance, at), if was == 0 { 1 } else { was }, "perf +{:#x}", at);
+        }
+        for at in [0x9c, 0xa0, 0xa4, 0xa8] { assert_eq!(word(&new.performance, at), 1); }
+        assert_eq!(word(&new.performance, 0x62b4), p.perf_states.len() as u32);
+        // The rest of the block is only what the 26.6.2 build wrote there, moved by the run.
+        assert!(new.performance[0x62ac..0x62b4] == old.performance[0x6264..0x626c]);
+        assert!(new.performance[0x62b8..0x62fc] == old.performance[0x6270..0x62b4]);
+        // Globals: one u32 inserted at 0x38, nothing else added.
+        assert!(new.globals[..0x38] == old.globals[..0x38]);
+        assert_eq!(word(&new.globals, 0x38), 0);
+        assert!(new.globals[0x3c..0xe4c] == old.globals[0x38..0xe48]);
+        // Power: the 26.6.2 words keep their positions, FastDie from the machine, nothing after.
+        assert!(new.power[..0xc8] == old.power[..0xc8]);
+        assert!(new.power[0xd0..0x150] == old.power[0xd0..0x150]);
+        assert!(old.power[0x150..].iter().all(|&b| b == 0));
+        assert_eq!(word(&new.power, 0xc8), 8800);
+        assert_eq!(word(&new.power, 0xcc), 100 * p.fast_die0_release_temp);
+        assert!(new.power[0x150..].iter().all(|&b| b == 0));
+    }
+    #[test] fn the_26b123_images_refuse_missing_or_inverted_machine_values() {
+        let p = input();
+        let records = [0u8; 53 * 40];
+        for (bytes, target) in [(0, 88), (0x8001, 88), (0x20_0000, 88), (0x8000, 0), (0x8000, p.fast_die0_release_temp)] {
+            assert!(m3_power_26::PowerImages::new(&p, &[950_001; 9], 0xffff_fc21_0340_0000,
+                0xffff_fc21_0350_0000, 0xffff_fc2f_fc00_0000, &records,
+                Some(m3_power_26::Abi26B123 { crash_copy_bytes: bytes, fast_die_target_c: target })).is_err(),
+                "bytes {:#x} target {}", bytes, target);
+        }
     }
     fn word(b: &[u8], at: usize) -> u32 { u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) }
     #[test] fn native_controller_bounds_are_distinct_from_outputs_and_hardware_state() {
@@ -155,7 +228,9 @@ def main():
     code += "}\nmod initdata { use crate::{prelude::*,hw}; const PSTATE_TABLE_ENTRIES: usize = 16;\n"
     code += item(init, "pub(crate) struct PStateTables {") + "\n"
     code += item(init, "impl PStateTables {") + "\n}\n"
-    code += "mod m3_mmio_26 { pub const SLOTS:usize=53; pub const RECORD_BYTES:usize=40; }\n"
+    mmio = (M3 / "m3_mmio_26.rs").read_text()
+    code += ("mod m3_mmio_26 { pub const SLOTS:usize=53; pub const RECORD_BYTES:usize=40; pub const TABLE_OFFSET:usize=0x640;\n"
+             + item(mmio, "pub(crate) const fn position_26b123") + "\n}\n")
     code += f'#[path = "{M3}/m3_power_26.rs"] mod m3_power_26;\n'
     code += fixture
     for path in [M3 / "hw.rs", M3 / "initdata.rs", M3 / "m3_power_26.rs", ROOT / "drivers/gpu/drm/asahi/float.rs"]:

@@ -208,8 +208,14 @@ impl Command {
             pointer(bytes,0xc46,self.pool.get());
             bytes[0xc4e]=1;
             pointer(bytes,0xc57,native.firmware_aux.get());
-            bytes[0xc5f]=native.incarnation;
-            bytes[0xc84]=1;
+            if native.v26b123 {
+                // 26B123: a u64 binding generation; the host flag moves +7 with it.
+                bytes[0xc5f..0xc67].copy_from_slice(&u64::from(native.incarnation).to_le_bytes());
+                bytes[0xc8b]=1;
+            } else {
+                bytes[0xc5f]=native.incarnation;
+                bytes[0xc84]=1;
+            }
         } else {
         word(bytes,0xb88,0x67); // EncoderParams.encoder_id
         word(bytes,0xb90,u32::MAX); // EncoderParams.unk_mask
@@ -252,7 +258,7 @@ mod extended_tests {
                 stencil_compression:surface,zls_control:0,depth_dimensions:0,depth_clear:0,stencil_clear:0,
                 sample_size:4,process_empty_tiles:false}};
         let dispatch=||super::super::m3_tiler_command::Dispatch26 {incarnation:9,serial:1,peer_stamp:0,
-            usc_window:1<<32,firmware_aux:fw(12),scene_scratch:gpu(4)};
+            usc_window:1<<32,firmware_aux:fw(12),scene_scratch:gpu(4),v26b123:false};
         let mut bytes=[0xa5;EXTENDED_SIZE+8];
         command.encode_extended(dispatch(),&mut bytes).unwrap();
         let word=|at|u32::from_le_bytes(bytes[at..at+4].try_into().unwrap());
@@ -266,5 +272,30 @@ mod extended_tests {
         let mut short=[0xa5;EXTENDED_SIZE-1];
         assert!(command.encode_extended(dispatch(),&mut short).is_err());
         assert!(short.iter().all(|b|*b==0xa5));
+    }
+    #[test] fn u1_fs_generation_is_a_u64_and_the_flag_moves_on_26b123() {
+        let fw=|n:u64|FirmwareVa::new(0xffff_fc25_3000_0000+n*0x4000).unwrap();
+        let gpu=|n:u64|GpuVa::new(0x10_0300_0000+n*0x4000).unwrap();
+        let program=|n:u64|Program{address:0x1_0000_0000+n*0x1000,resources:n};
+        let surface=DepthStencil{base:0,stride:0};
+        let command=Command {context:3,register_set:RegisterSet::G15G,
+            sequence:Region::new(fw(0).get(),0x1000).unwrap(),notifier:fw(1),manager:fw(2),scene:fw(3),empty:fw(4),
+            gpu_alias:GpuVa::new(0x72_1000_4000).unwrap(),tilemap:gpu(0),heap:gpu(1),auxiliary:gpu(2),scene_user:gpu(3),
+            scratch:gpu(4),pool:fw(5),stamp:fw(6),fw_stamp:fw(7),stamp_value:0x3d000100,
+            timestamps:[fw(8),fw(9)],user_timestamps:[fw(10),fw(11)],
+            state:State {geometry:Geometry::new(64,64,super::super::agx_render::Utile::Pixels32,
+                super::super::agx_render::Utile::Pixels32,1).unwrap(),multisample:0,merge_upper:[0;2],
+                eot:program(1),background:program(2),partial_eot:program(3),partial_background:program(4),
+                scissor:0,depth_bias:0,query:0,isp_control:0xc000,tilebuffer_control:1,mirror_tilebuffer_control:1,
+                tile_mode:0x280,mirror_tile_mode:0x280,depth:surface,stencil:surface,depth_compression:surface,
+                stencil_compression:surface,zls_control:0,depth_dimensions:0,depth_clear:0,stencil_clear:0,
+                sample_size:4,process_empty_tiles:false}};
+        let dispatch=||super::super::m3_tiler_command::Dispatch26 {incarnation:9,serial:1,peer_stamp:0,
+            usc_window:1<<32,firmware_aux:fw(12),scene_scratch:gpu(4),v26b123:true};
+        let mut bytes=[0xa5;EXTENDED_SIZE+8];
+        command.encode_extended(dispatch(),&mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes[0xc5f..0xc67].try_into().unwrap()),9);
+        assert_eq!((bytes[0xc8b],bytes[0xc84]),(1,0));
+        assert_eq!(&bytes[EXTENDED_SIZE..],&[0xa5;8]);
     }
 }

@@ -55,7 +55,8 @@ impl Compute {
         let mut client_command=None;
         let mut command_bytes = KVec::new();
         command_bytes.resize(if profile.extended() {
-            command::EXTENDED_SIZE
+            // 26B123 caches 0x8e0 bytes of the work (target u32 at 0x8b3).
+            if profile.v26b123() { 0x8e0 } else { command::EXTENDED_SIZE }
         } else { command::SIZE }, 0u8, GFP_KERNEL)?;
         let mut sequence_bytes = KVec::new();
         sequence_bytes.resize(microsequence::STORAGE, 0u8, GFP_KERNEL)?;
@@ -83,7 +84,7 @@ impl Compute {
         // to render's unpublished seed entries, compute dispatches entry zero
         // immediately, so its initial producer cursor remains one.
         let address = |index: usize| queue::FirmwareVa::new(objects[index].va()).map_err(|_| EINVAL);
-        let info = queue::QueueInfo { state: address(storage::QUEUE_STATE)?, ring: address(storage::RING)?,
+        let info = queue::QueueInfo { v26b123: profile.v26b123(), state: address(storage::QUEUE_STATE)?, ring: address(storage::RING)?,
             job_list: address(JOB_LIST)?, gpu_scratch: address(QUEUE_SCRATCH)?,
             context: address(GPU_CONTEXT)?, uuid: 0xc10000 };
         let command = address(storage::COMMAND)?;
@@ -152,7 +153,7 @@ impl Compute {
         let offset = |owner:usize| storage::slot_offset_for(profile,owner,slot).map_err(|_|EINVAL);
         let fw = |owner: usize| queue::FirmwareVa::new(objects[owner].va()+offset(owner)? as u64).map_err(|_| EINVAL);
         let region = |owner: usize| Region::new(objects[owner].va()+offset(owner)? as u64, storage::allocation_for(profile,owner).map_err(|_|EINVAL)?.size).map_err(|_| EINVAL);
-        let value = microsequence::Sequence {
+        let value = microsequence::Sequence { v26b123: profile.v26b123(),
             command: region(storage::COMMAND)?, stats, notifier: region(NOTIFIER)?,
             queue: fw(storage::QUEUE)?, context,
             generation: if profile.extended() { 0 } else { 1 }, pool: fw(storage::POOL)?,

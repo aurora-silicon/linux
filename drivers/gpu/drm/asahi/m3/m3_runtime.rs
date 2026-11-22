@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 use core::{mem::ManuallyDrop, sync::atomic::Ordering};
-use kernel::{device::Core, platform, prelude::*, soc::apple::rtkit, sync::Arc,
-    time::{Instant, Monotonic, Delta, delay::fsleep}};
+use kernel::{device::Core, platform, prelude::*, sync::Arc,
+    time::{Instant, Monotonic, Delta, delay::{fsleep, udelay}}};
 use crate::{driver, mmu, m3::m3_device::Device, m3::m3_config::Config, m3::m3_rtkit};
 
 #[path = "m3_batch_policy.rs"]
@@ -44,7 +44,7 @@ impl NativeJob {
     fn batch_gpu_span(&mut self)->Result<[u64;2]> {match self {Self::Compute(j)=>j.batch_gpu_span(),Self::Render(j)=>j.batch_gpu_span()}}
 }
 struct Inner {
-    transport: rtkit::RtKit<m3_rtkit::Operations>,
+    transport: m3_rtkit::Transport,
     state: Arc<m3_rtkit::State>,
     jobs: KVec<NativeJob>,
     packets: KVec<Arc<crate::m3::m3_submit::Packet>>,
@@ -1052,7 +1052,7 @@ impl Runtime {
         let owner = KBox::<Inner>::new_uninit(GFP_KERNEL)?;
         let drm: driver::AsahiDevRef = drm.into();
         let state = m3_rtkit::State::new(pdev, drm.clone(), device.firmware().resources.regions[5]).inspect_err(coproc_refused)?;
-        let mut transport = rtkit::RtKit::new(pdev.as_ref(), None, 0, state.clone()).inspect_err(coproc_refused)?;
+        let mut transport = m3_rtkit::Transport::new(pdev.as_ref(), state.clone(), device.firmware().profile()).inspect_err(coproc_refused)?;
         if crate::m3::m3_adt_config::stop_before_asc(pdev.as_ref()) {
             return Err(ENODEV);
         }
@@ -1081,6 +1081,10 @@ impl Runtime {
             device.start_asc(pdev)?;
             Pin::new(&mut transport).wake()?;
             if !state.healthy() || !Pin::new(&transport).is_running() {return Err(EIO);}
+            if device.firmware().profile().v26b123() {
+                // 26B123 reads the host block before its endpoints start.
+                device.publish_host_block_26b123()?;
+            }
             for ep in [0x20,0x21] {
                 if !Pin::new(&mut transport).has_endpoint(ep) {return Err(ENODEV);}
                 Pin::new(&mut transport).start_endpoint(ep)?;
@@ -1281,6 +1285,9 @@ impl Runtime {
     fn boot_extended(&mut self, pdev: &platform::Device<Core<'_>>) -> Result {
         use super::m3_channel_format::Action;
         use crate::m3::t8122_start::BootStep;
+        if self.inner.device.firmware().profile().v26b123() {
+            return self.boot_26b123(pdev);
+        }
         // The first control is pending when the root becomes visible. Its
         // retirement comes from InitData consumption, without a work kick.
         let first = self.inner.config.control_extended(Action::Initialize)?;
@@ -1311,6 +1318,71 @@ impl Runtime {
         inner.config.log_ready(&inner.drm)?;
         inner.state.health.set_gpu_pending(false);
         dev_info!(pdev.as_ref(), "M3: extended firmware ready; native controllers and idle policy admitted\n");
+        Ok(())
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+    /// The 26B123 (27.2) start, in the order the J615 runs proved (G15G; the shared constants
+    /// are G16 26B123's): nothing staged on device control before the root (26.6.2 stages its
+    /// Initialize), the host log buffer on the crash-log endpoint, the InitData root, the
+    /// device-control doorbell, then IMPORT_GLOBALS + START together behind one write-index
+    /// update with the SGX generation, retired by the firmware within 20 ms, then READY. No
+    /// Register or Idle controls follow: the firmware registers its engines itself.
+    fn boot_26b123(&mut self, pdev: &platform::Device<Core<'_>>) -> Result {
+        use crate::m3::t8122_start::BootStep;
+        // The firmware copies the register map itself; DATA has no host descriptor slot.
+        let (logbuf, bytes) = self.inner.config.log_buffer().ok_or(EINVAL)?;
+        let pages = u64::from(bytes) >> 12;
+        let message = (0x9u64 << 52) | (pages << 44) | (logbuf & ((1u64 << 44) - 1));
+        Pin::new(&mut self.inner.transport).send_message(1, message)?;
+        fsleep(Delta::from_millis(2));
+        if !self.inner.state.healthy() { return Err(EIO); }
+        let root = self.inner.config.root();
+        Pin::new(&mut self.inner.transport).send_message(0x20,
+            0x0081_0000_0000_0000 | (root & ((1u64 << 44) - 1)))?;
+        Pin::new(&mut self.inner.transport).send_message(0x21, 0x0083_0000_0000_0011)?;
+        let next = self.inner.config.post_boot_pair_26b123()?;
+        self.inner.device.set_control_generation_26b123(next)?;
+        Pin::new(&mut self.inner.transport).send_message(0x21, 0x0084_0000_0000_0011)?;
+        let posted = Instant::<Monotonic>::now();
+        loop {
+            let [read, completion, _] = self.inner.config.control_cursors()?;
+            if read == next && completion == next { break; }
+            if !self.inner.state.healthy() { return Err(EIO); }
+            if posted.elapsed() > Delta::from_millis(20) { break; }
+            udelay(Delta::from_micros(5));
+        }
+        Pin::new(&mut self.inner.transport).send_message(0x21, 0x0083_0000_0000_0010)?;
+        self.inner.boot_step = BootStep::AwaitReady;
+        let deadline = Instant::<Monotonic>::now();
+        while !self.inner.config.ready()? {
+            let inner: &mut Inner = &mut *self.inner;
+            inner.config.drain(&inner.drm)?;
+            if !inner.state.healthy() { return Err(EIO); }
+            if deadline.elapsed() >= Delta::from_secs(2) { return Err(ETIMEDOUT); }
+            fsleep(Delta::from_millis(1));
+        }
+        let [read, completion, write] = self.inner.config.control_cursors()?;
+        if read != write || completion != write || write != next {
+            dev_err!(pdev.as_ref(), "M3: 27.2 boot controls not retired (device control [{}, {}, {}], want {})\n",
+                read, completion, write, next);
+            return Err(ETIMEDOUT);
+        }
+        self.inner.boot_step = BootStep::PostReady;
+        let inner: &mut Inner = &mut *self.inner;
+        inner.config.log_ready(&inner.drm)?;
+        inner.state.health.set_gpu_pending(false);
+        dev_info!(pdev.as_ref(), "M3: 27.2 firmware ready\n");
         Ok(())
     }
 
@@ -1410,7 +1482,8 @@ fn adopt_uat(drm: &driver::AsahiDrmDevice, soc: &'static crate::m3::m3_soc::Soc,
     let uat = mmu::Uat::new_adopted_ram_with_user_upper(drm, geometry, &regions,
         profile == super::m3_profile::Profile::Legacy)?;
     let mut window = crate::g15::uat::Window::from_regions(handoff.base, ttbs.base, tables.base, shared_l2.base)?;
-    window.bootstrap(drm.as_ref().as_ref(), &uat)?;
+    let ppl = if profile.v26b123() { crate::g15::hw::PPL_MAGIC_V3 } else { crate::g15::hw::PPL_MAGIC };
+    window.bootstrap_with(drm.as_ref().as_ref(), &uat, ppl)?;
     // 7.1.12 cleaned every reserved-table write to the point of coherency; these regions may be
     // reserved System RAM mapped cacheable.
     window.clean_tables();

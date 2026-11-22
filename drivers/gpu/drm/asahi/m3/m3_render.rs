@@ -193,7 +193,7 @@ impl Render {
     fn initialize_queues(&mut self) -> Result {
         for owner in &RENDER_QUEUES {
             let address = |index: usize| queue::FirmwareVa::new(self.objects[index].va()).map_err(|_| EINVAL);
-            let info = queue::QueueInfo {
+            let info = queue::QueueInfo { v26b123: self.profile.v26b123(),
                 state: address(owner.state)?, ring: address(owner.ring)?,
                 job_list: address(JOB_LIST)?, gpu_scratch: address(owner.scratch)?,
                 context: address(GPU_CONTEXT)?, uuid: owner.uuid,
@@ -295,7 +295,7 @@ impl Render {
             multisample:r.multisample_control,ppp:r.ppp_control,process_empty_tiles:r.flags&2!=0,
         };
         if self.profile.extended() {
-            value.encode_extended(tiler::Dispatch26 {incarnation:self._binding.generation(),serial:draw.checked_mul(2).ok_or(EOVERFLOW)?,
+            value.encode_extended(tiler::Dispatch26 {v26b123:self.profile.v26b123(),incarnation:self._binding.generation(),serial:draw.checked_mul(2).ok_or(EOVERFLOW)?,
                 peer_stamp:self.stamp_epoch.value(s::STAMP_FRAGMENT-256,draw),usc_window:usc,
                 firmware_aux:queue::FirmwareVa::new(self.objects[UMA_POOLS[0].manager].va()+0x100).map_err(|_|EINVAL)?,
                 scene_scratch:gpu(P::FragmentScratch)?},&mut self.tiler_bytes).map_err(|_|EINVAL)?;
@@ -310,7 +310,7 @@ impl Render {
             let fw=|field:P| queue::FirmwareVa::new(pass.get(field).va()).map_err(|_|EINVAL);
             let target=if fs{P::FragmentSequence}else{P::TilerSequence};
             let notifier=&self.objects[NOTIFIER];
-            let owners=sequence::Owners {
+            let owners=sequence::Owners {v26b123:self.profile.v26b123(),
                 command:region(if fs{P::FragmentCommand}else{P::TilerCommand})?,sequence:region(target)?,
                 stats:self.stats[usize::from(fs)],notifier:Region::new(notifier.va()+
                     if fs && self.profile.extended() {0x200} else {0},
@@ -399,7 +399,7 @@ impl Render {
             },
         };
         if self.profile.extended() {
-            value.encode_extended(tiler::Dispatch26 {incarnation:self._binding.generation(),serial:draw.checked_mul(2).and_then(|v|v.checked_sub(1)).ok_or(EOVERFLOW)?,
+            value.encode_extended(tiler::Dispatch26 {v26b123:self.profile.v26b123(),incarnation:self._binding.generation(),serial:draw.checked_mul(2).and_then(|v|v.checked_sub(1)).ok_or(EOVERFLOW)?,
                 peer_stamp:0,usc_window:usc,
                 firmware_aux:queue::FirmwareVa::new(self.objects[UMA_POOLS[1].manager].va()+0x200).map_err(|_|EINVAL)?,
                 scene_scratch:gpu(P::FragmentScratch)?},&mut self.fragment_bytes).map_err(|_|EINVAL)?;

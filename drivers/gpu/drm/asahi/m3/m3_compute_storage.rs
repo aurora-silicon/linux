@@ -104,7 +104,7 @@ pub(crate) fn allocation_for(profile: super::m3_profile::Profile, index: usize)
         EVENT => owner.size = 8,
         QUEUE => owner.size = 0x24c0,
         PREEMPTION => owner.size = 0x4000,
-        COMMAND => { owner.size = 0x8b0; owner.mapping = Mapping::CommandAlias(0x73_0000_0000); }
+        COMMAND => { owner.size = if profile.v26b123() { 0x8e0 } else { 0x8b0 }; owner.mapping = Mapping::CommandAlias(0x73_0000_0000); }
         TAIL_SCRATCH => { owner.size = 0x4000; owner.mapping = Mapping::Client(0x72_0100_0000); }
         46 => { owner.size = 0x40000; owner.mapping = Mapping::Client(0x72_0000_0000); }
         45 | 47..=49 => { owner.size = 0x4000; owner.mapping = Mapping::FirmwareOnly; }
@@ -151,5 +151,16 @@ mod extended_tests {
             }
             assert_eq!(batch_allocation_for(Profile::Legacy, index), batch_allocation(index));
         }
+    }
+}
+
+#[cfg(test)]
+mod u1_tests {
+    use super::*;
+    use super::super::m3_profile::Profile;
+    #[test] fn u1_compute_command_grows_to_the_26b123_cached_size_in_one_page() {
+        assert_eq!(allocation_for(Profile::Extended27, COMMAND).unwrap().size, 0x8e0);
+        assert_eq!(slot_offset_for(Profile::Extended27, COMMAND, 1).unwrap(), 0x4000);
+        assert_eq!(allocation_for(Profile::Extended, COMMAND).unwrap().size, 0x8b0);
     }
 }

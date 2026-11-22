@@ -290,6 +290,8 @@ pub(crate) mod pte {
 
 /// PPL handoff magic.
 pub(crate) const PPL_MAGIC: u64 = 0x4b1d000000000002;
+/// PPL magic version 3, exchanged by the 27.2 firmware (as on G14/G16 27.2).
+pub(crate) const PPL_MAGIC_V3: u64 = 0x4b1d000000000003;
 
 /// UAT handoff region sizes of this firmware ABI (TTBAT page, TTBAT tables (the firmware kernel
 /// root), PPL handoff page, shared L2 page); the addresses come from the ADT.

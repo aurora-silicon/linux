@@ -56,13 +56,17 @@ impl Device {
             .iomap()?
             .into_devres()?;
         dev_info!(pdev.as_ref(), "M3: SGX aperture mapped\n");
-        let pmp = crate::m3::m3_board::has_pmp_link(pdev);
+        // The 26.6.2 start needs the GPU's PMP supplier; the 27.2 (26B123) start takes no PMP
+        // link or vote (GPU power through its power domain), as on G16 27.2, even where the DT
+        // names one.
+        let v26b123 = firmware.profile().v26b123();
+        let pmp = crate::m3::m3_board::has_pmp_link(pdev) && !v26b123;
         let t8122 = crate::m3::t8122_start::is_t8122(soc);
         if pmp && !t8122 {
             dev_err!(pdev.as_ref(), "M3: optional apple,pmp GPU link is unsupported\n");
             return Err(ENOTSUPP);
         }
-        if t8122 && !pmp {
+        if t8122 && !pmp && !v26b123 {
             dev_err!(pdev.as_ref(), "M3 G15G: current14 GPU requires its PMP supplier link\n");
             return Err(ENODEV);
         }
@@ -136,6 +140,34 @@ impl Device {
         }
         device.core_mask = core_mask;
         Ok(device)
+    }
+
+    /// The 26B123 (27.2) host block at SGX+0xd60000 (the Runtime+0x18 scratch): zeroed in the
+    /// order the G16 26B123 start uses, then its ready word +0x60 raised, before the endpoints
+    /// start.
+    pub(crate) fn publish_host_block_26b123(&self) -> Result {
+        const ORDER: [usize; 13] = [0x00, 0x20, 0x40, 0x08, 0x28, 0x48, 0x10, 0x30, 0x50, 0x18, 0x38, 0x58, 0x60];
+        let guard = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = guard.as_view();
+        for o in ORDER {
+            sgx.try_write32(0, 0xd60000 + o)?;
+        }
+        let _ = sgx.try_read32(0xd640c0)?;
+        let _ = sgx.try_read32(0xd60060)?;
+        sgx.try_write32(1, 0xd60060)?;
+        Ok(())
+    }
+
+    /// The 26B123 device-control generation at SGX+0xd60000 +0: the ring's next write index,
+    /// published before the ring's write index moves and the 0x0084 doorbell. Read back.
+    pub(crate) fn set_control_generation_26b123(&self, value: u32) -> Result {
+        let guard = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = guard.as_view();
+        sgx.try_write32(value, 0xd60000)?;
+        if sgx.try_read32(0xd60000)? != value {
+            return Err(EIO);
+        }
+        Ok(())
     }
 
     pub(crate) fn core_mask(&self) -> u64 { self.core_mask }

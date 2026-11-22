@@ -33,6 +33,8 @@ pub(crate) struct Sequence {
     pub(crate) scratch: [FirmwareVa; 5],
     pub(crate) fw_stamp: FirmwareVa,
     pub(crate) stamp_value: u32,
+    /// 26B123 (27.2) records: the binding generation is a u64, so the fields after it move +7.
+    pub(crate) v26b123: bool,
 }
 impl Sequence {
     /// All references and output extents are checked before output mutation.
@@ -101,10 +103,12 @@ impl Sequence {
         let pairs = self.command.at(0x834, 16)?;
         let end_pair = self.command.at(0x83c, 8)?;
         let pool_pointer = self.command.at(0x86a, 8)?;
-        let status = self.command.at(0x8ac, 4)?;
-        let time_aux = self.command.at(0x89c, 8)?;
+        // 26B123 moves completion/aux/target +7 behind the u64 generation.
+        let d = if self.v26b123 { 7 } else { 0 };
+        let status = self.command.at(0x8ac + d, 4)?;
+        let time_aux = self.command.at(0x89c + d, 8)?;
         let elapsed = self.command.at(0x7dc, 8)?;
-        let tail = self.command.at(0x88c, 8)?;
+        let tail = self.command.at(0x88c + d, 8)?;
         let activity = self.stats.at(0, 8)?;
         let bytes = output.get_mut(..STORAGE).ok_or(Error::Size)?;
         bytes.fill(0);
@@ -163,7 +167,7 @@ mod extended_tests {
             stats: Region::new(fw(1).get(), 0xe10).unwrap(),
             notifier: Region::new(fw(2).get(), 0x200).unwrap(), queue: fw(3),
             context: 3, generation: 0, pool: fw(4), scratch: [fw(5); 5],
-            fw_stamp: fw(6), stamp_value: 0x700 }
+            fw_stamp: fw(6), stamp_value: 0x700, v26b123: false }
     }
     fn ptr(bytes: &[u8], at: usize) -> u64 { u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) }
     #[test] fn extended_timestamps_and_retirement_refer_to_their_live_owners() {
@@ -190,5 +194,21 @@ mod extended_tests {
                 super::super::m3_pool_layout::GpuRegion::new(0x6000_0000, 0x20000).unwrap(), 0, &mut output).is_err());
             assert_eq!(output, [0xa5; STORAGE]);
         }
+    }
+    #[test] fn u1_retirement_pointers_move_seven_bytes_on_26b123() {
+        let mut s = fixture();
+        s.v26b123 = true;
+        s.command = Region::new(s.command.at(0, 1).unwrap(), 0x8e0).unwrap();
+        let mut output = [0xa5; STORAGE + 8];
+        s.encode_extended(command::GpuVa::new(0x5000_0000).unwrap(),
+            super::super::m3_pool_layout::GpuRegion::new(0x6000_0000, 0x20000).unwrap(), 7, &mut output).unwrap();
+        let base = s.command.at(0, 1).unwrap();
+        assert_eq!(ptr(&output, 0x1a8), base + 0x8b3);
+        assert_eq!(ptr(&output, 0x1bc + 0x2c), base + 0x8a3);
+        assert_eq!(ptr(&output, 0x20c + 0x2c), base + 0x8a3);
+        assert_eq!(ptr(&output, 0x1bc + 0x34), base + 0x7dc);
+        let tail = (0..STORAGE - 8).filter(|&at| ptr(&output, at) == base + 0x893).count();
+        let old = (0..STORAGE - 8).filter(|&at| ptr(&output, at) == base + 0x88c).count();
+        assert!(tail >= 1 && old == 0, "completion pointer: {} at +0x893, {} at +0x88c", tail, old);
     }
 }

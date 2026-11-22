@@ -295,9 +295,15 @@ impl Window {
     /// The PPL exchange and the exclusive startup epoch: host window and TTBAT context 0 (step 3
     /// above).
     pub(crate) fn bootstrap(&mut self, dev: &device::Device, uat: &mmu::Uat) -> Result {
+        self.bootstrap_with(dev, uat, hw::PPL_MAGIC)
+    }
+
+    /// [`Self::bootstrap`] with the PPL magic version the admitted firmware exchanges
+    /// ([`hw::PPL_MAGIC`] up to 26.6.2, [`hw::PPL_MAGIC_V3`] on 27.2).
+    pub(crate) fn bootstrap_with(&mut self, dev: &device::Device, uat: &mmu::Uat, ppl: u64) -> Result {
         let h = self.handoff.io();
         // AP side of the PPL exchange; never overwrite firmware interest/magic.
-        h.try_write64(hw::PPL_MAGIC, 0x00)?;
+        h.try_write64(ppl, 0x00)?;
         h.try_write32(0xffffffff, 0x18)?;
         for i in 0..=64 {
             for w in 0..3 {
@@ -310,12 +316,12 @@ impl Window {
         let start = Instant::<Monotonic>::now();
         loop {
             let magic = h.try_read64(0x08)?;
-            if magic == hw::PPL_MAGIC {
+            if magic == ppl {
                 break;
             }
             if start.elapsed() > Delta::from_millis(1000) {
                 let magic = h.try_read64(0x08)?;
-                if magic == hw::PPL_MAGIC {
+                if magic == ppl {
                     break;
                 }
                 dev_err!(dev, "PPL firmware magic missing: {:#x}\n", magic);

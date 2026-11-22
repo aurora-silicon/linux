@@ -70,6 +70,8 @@ pub(crate) struct Owners {
     pub(crate) fw_stamp: FirmwareVa,
     pub(crate) context: u32,
     pub(crate) stamp: u32,
+    /// 26B123 (27.2) records: the binding generation is a u64, so the fields after it move +7.
+    pub(crate) v26b123: bool,
 }
 struct Timestamps { time:u64, pair:u64, end:u64, complete:u64 }
 impl Timestamps {
@@ -194,6 +196,9 @@ impl Owners {
         let activity=self.stats.at(0,8)?;
         let scene_tail=self.scene.get().checked_add(0x54).ok_or(Error::Address)?;
         let (clock,pair,aux_time,elapsed)=if fragment {(0xc08,0xc10,0xc70,0xb84)}else{(0x8c0,0x8c8,0x928,0x83c)};
+        // 26B123: completion and auxiliary targets move +7 behind the u64 generation.
+        let d26:u64=if self.v26b123 {7} else {0};
+        let aux_time=aux_time+d26;
         let first=if fragment {0x1e4}else{0x1cc};
         let finalize=if fragment {0x280}else{0x268};
         let pool=if fragment {0x1b0}else{0x190};
@@ -262,7 +267,7 @@ impl Owners {
             pointer(bytes,finalize+0x64,command+0xa58);
             pointer(bytes,finalize+0x98,sequence+pool as u64);
             word(bytes,finalize+0xa0,(-(finalize as i32))as u32);
-            pointer(bytes,finalize+0xa5,command+0xc60);
+            pointer(bytes,finalize+0xa5,command+0xc60+d26);
             word(bytes,finalize+0xad,1);
             bytes[finalize+0xb1]=1;
             // J613 terminates this record after the 16-bit event field.
@@ -281,7 +286,7 @@ impl Owners {
             word(bytes,finalize+0x50,self.stamp);
             pointer(bytes,finalize+0x78,sequence+pool as u64);
             word(bytes,finalize+0x80,(-(finalize as i32))as u32);
-            pointer(bytes,finalize+0x85,command+0x918);
+            pointer(bytes,finalize+0x85,command+0x918+d26);
             bytes[finalize+0x8d]=1;
             word(bytes,finalize+0x94,0x4000_0002);
         }
@@ -296,7 +301,7 @@ mod native_tests {
         let fw=|index:u64|FirmwareVa::new(0xffff_fc25_2000_0000+index*0x4000).unwrap();
         let o=Owners {command:Region::new(fw(0).get(),0xca0).unwrap(),sequence:Region::new(fw(1).get(),STORAGE).unwrap(),
             stats:Region::new(fw(2).get(),0x1000).unwrap(),notifier:Region::new(fw(3).get(),0x200).unwrap(),
-            queue:fw(4),scene:fw(5),manager:fw(6),pool:fw(7),fw_stamp:fw(8),context:3,stamp:0x3d000100};
+            queue:fw(4),scene:fw(5),manager:fw(6),pool:fw(7),fw_stamp:fw(8),context:3,stamp:0x3d000100,v26b123:false};
         let mut output=[0xa5;STORAGE+8];
         let length=o.encode_extended(true,super::super::m3_compute_layout::GpuVa::new(0x72_3000_0200).unwrap(),1,&mut output).unwrap();
         assert_eq!(length,0x370);
@@ -349,6 +354,25 @@ mod attachment_tests {
             assert_eq!(bytes[flag],0);
             assert_eq!(bytes[start-1],0xa5);
             assert_eq!(bytes[start+SIZE],0xa5);
+        }
+    }
+}
+
+#[cfg(test)]
+mod u1_tests {
+    use super::*;
+    fn ptr(b: &[u8], at: usize) -> u64 { u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) }
+    #[test] fn u1_render_completion_and_aux_targets_move_seven_bytes_on_26b123() {
+        let fw=|index:u64|FirmwareVa::new(0xffff_fc25_2000_0000+index*0x4000).unwrap();
+        for (fragment,size,finalize,completion,aux) in [(false,0x940,0x268+0x85,0x91f,0x92f),(true,0xca0,0x280+0xa5,0xc67,0xc77)] {
+            let o=Owners {command:Region::new(fw(0).get(),size).unwrap(),sequence:Region::new(fw(1).get(),STORAGE).unwrap(),
+                stats:Region::new(fw(2).get(),0x1000).unwrap(),notifier:Region::new(fw(3).get(),0x200).unwrap(),
+                queue:fw(4),scene:fw(5),manager:fw(6),pool:fw(7),fw_stamp:fw(8),context:3,stamp:0x3d000100,v26b123:true};
+            let mut out=[0xa5;STORAGE+8];
+            o.encode_extended(fragment,super::super::m3_compute_layout::GpuVa::new(0x72_3000_0200).unwrap(),1,&mut out).unwrap();
+            assert_eq!(ptr(&out,finalize),fw(0).get()+completion, "fragment {}", fragment);
+            let first=if fragment {0x1e4} else {0x1cc};
+            assert_eq!(ptr(&out,first+0x2c),fw(0).get()+aux, "fragment {}", fragment);
         }
     }
 }

@@ -5,6 +5,7 @@
 
 use super::m3_init_layout::{Error, Region, Root};
 use super::m3_init_storage::{self as storage, Allocation, Initial};
+use super::m3_profile::Profile;
 
 pub(crate) const COUNT: usize = 56;
 pub(crate) const DYNAMIC_STATE: usize = 49;
@@ -20,7 +21,16 @@ pub(crate) const RX_BYTES: usize = 0x48;
 pub(crate) const LOG_PAYLOAD_BYTES: usize = 0xd8;
 
 /// Extend the existing M3 owner indices instead of introducing another owner graph.
+/// The 26.6.2 sizes; see [`allocation_for`] for the firmware the owners are built for.
 pub(crate) fn allocation(index: usize) -> Result<Allocation, Error> {
+    allocation_for(Profile::Extended, index)
+}
+
+/// The owner of `index` for the Extended firmware `profile`. 26B123 (27.2) grows the main
+/// configuration, Globals, power, firmware-data control and performance objects; every owner
+/// keeps its address.
+pub(crate) fn allocation_for(profile: Profile, index: usize) -> Result<Allocation, Error> {
+    let v26b123 = profile.v26b123();
     let size = match index {
         0..=23 if index % 2 == 0 => 0x30,
         0..=23 => 0x1800,
@@ -35,6 +45,11 @@ pub(crate) fn allocation(index: usize) -> Result<Allocation, Error> {
         36 => 0xc8,
         37 => 0x4000,
         38 => RUNTIME_SIZE,
+        39 if v26b123 => 0x2788,
+        45 if v26b123 => 0xe4c,
+        46 if v26b123 => 0x698,
+        47 if v26b123 => 0xedd0,
+        PERFORMANCE_CONTROL if v26b123 => 0x6c48,
         39 => 0x2658,
         40 => 0x88,
         41 => LOG_THREADS * 256 * LOG_PAYLOAD_BYTES,
@@ -66,6 +81,7 @@ pub(crate) fn cached(index: usize) -> bool {
 }
 
 pub(crate) struct PointerGraph<'a> {
+    pub(crate) profile: Profile,
     pub(crate) owners: &'a [Region; COUNT],
     pub(crate) scratch: Region,
     pub(crate) pool_alias: u64,
@@ -77,7 +93,7 @@ impl PointerGraph<'_> {
     fn addresses(&self) -> Result<[u64; COUNT], Error> {
         let mut addresses = [0; COUNT];
         for (index, owner) in self.owners.iter().enumerate() {
-            let size = allocation(index)?.size;
+            let size = allocation_for(self.profile, index)?.size;
             addresses[index] = owner.at(0, size)?;
             if addresses[index] & 0x3fff != 0
                 || addresses[index] < 0xffff_fc20_0000_0000
@@ -93,7 +109,7 @@ impl PointerGraph<'_> {
                 return Err(Error::Address);
             }
             for prior in 0..index {
-                let prior_size = (allocation(prior)?.size + 0x3fff) & !0x3fff;
+                let prior_size = (allocation_for(self.profile, prior)?.size + 0x3fff) & !0x3fff;
                 if addresses[index] < addresses[prior] + prior_size as u64
                     && addresses[prior] < addresses[index] + mapped as u64
                 {
@@ -110,7 +126,7 @@ impl PointerGraph<'_> {
             return Err(Error::Address);
         }
         for (index, address) in addresses.iter().enumerate() {
-            let bytes = (allocation(index)?.size + 0x3fff) & !0x3fff;
+            let bytes = (allocation_for(self.profile, index)?.size + 0x3fff) & !0x3fff;
             if scratch < *address + bytes as u64 && *address < scratch_end {
                 return Err(Error::Address);
             }
@@ -136,7 +152,7 @@ impl PointerGraph<'_> {
             control: self.owners[storage::CONTROL_REGION],
             power: self.owners[storage::GLOBALS_POWER],
         }
-        .encode_26(output, self.owners[DYNAMIC_STATE])
+        .encode_26(output, self.owners[DYNAMIC_STATE], self.profile)
     }
 
     pub(crate) fn runtime(&self, output: &mut [u8]) -> Result<(), Error> {
@@ -170,10 +186,12 @@ impl PointerGraph<'_> {
             (0x26c, RECOVERY_ACTIVITY),
             (0x2d8, GLOBAL_PARAMETERS),
             (0x2e8, GLOBAL_POOL),
-            (0x469, PERFORMANCE_CONTROL),
         ] {
             pointer(bytes, offset, addresses[owner]);
         }
+        // 26B123 moves the performance-controller pointer 16 bytes later.
+        let perf_at = if self.profile.v26b123() { 0x479 } else { 0x469 };
+        pointer(bytes, perf_at, addresses[PERFORMANCE_CONTROL]);
         for channel in 0..13 {
             let offset = 0x20 + channel * 0x20;
             let state = addresses[channel * 2];
@@ -188,12 +206,14 @@ impl PointerGraph<'_> {
     pub(crate) fn firmware_control(&self, output: &mut [u8]) -> Result<(), Error> {
         let addresses = self.addresses()?;
         let bytes = output
-            .get_mut(..allocation(storage::CONTROL_REGION)?.size)
+            .get_mut(..allocation_for(self.profile, storage::CONTROL_REGION)?.size)
             .ok_or(Error::Size)?;
         bytes.fill(0);
-        bytes[0x4f88..0x4f90].copy_from_slice(&addresses[storage::FW_CONTROL_STATE].to_le_bytes());
-        bytes[0x4f90..0x4f98].copy_from_slice(&addresses[storage::FW_CONTROL_RING].to_le_bytes());
-        bytes[0x4fd4..0x4fd8].copy_from_slice(&1u32.to_le_bytes());
+        // 26B123 inserts a table before these, moving the three 0x1e0 bytes later.
+        let d = if self.profile.v26b123() { 0x1e0 } else { 0 };
+        bytes[0x4f88 + d..0x4f90 + d].copy_from_slice(&addresses[storage::FW_CONTROL_STATE].to_le_bytes());
+        bytes[0x4f90 + d..0x4f98 + d].copy_from_slice(&addresses[storage::FW_CONTROL_RING].to_le_bytes());
+        bytes[0x4fd4 + d..0x4fd8 + d].copy_from_slice(&1u32.to_le_bytes());
         Ok(())
     }
 }
@@ -211,6 +231,7 @@ mod tests {
 
     fn graph(owners: &[Region; COUNT]) -> PointerGraph<'_> {
         PointerGraph {
+            profile: Profile::Extended,
             owners,
             scratch: Region::new(0xffff_fc22_0000_0000, 0x8000).unwrap(),
             pool_alias: 0x70_0000_0000,

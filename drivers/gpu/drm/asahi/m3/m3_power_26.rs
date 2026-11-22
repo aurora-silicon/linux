@@ -45,6 +45,16 @@ impl Image {
     }
 }
 
+/// What the 26B123 (27.2) images need beyond the 26.6.2 build, from the machine.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Abi26B123 {
+    /// Size of the host crash copy buffer (the boot loader's `apple,coredump-copy-buffer`).
+    pub(crate) crash_copy_bytes: u32,
+    /// The FastDie temperature target in degrees C (the boot loader's `apple,fast-die0-target`,
+    /// the machine ADT's `gpu-fast-die0-target`).
+    pub(crate) fast_die_target_c: u32,
+}
+
 pub(crate) struct PowerImages {
     pub(crate) hardware: KVec<u8>,
     pub(crate) performance: KVec<u8>,
@@ -63,6 +73,7 @@ impl PowerImages {
         retention: u64,
         timestamp_base: u64,
         io_records: &[u8],
+        v26b123: Option<Abi26B123>,
     ) -> Result<Self> {
         let table = PStateTables::new(pwr, true, None, false)?;
         let second = table.secondary.ok_or(EINVAL)?;
@@ -403,12 +414,107 @@ impl PowerImages {
         performance.word(0x3b58, 0x4b48)?;
         performance.word(0x3b60, 1)?;
         performance.word(0x62a8, 1)?;
+        if let Some(abi) = v26b123 {
+            return Self::relocate_26b123(abi, pwr, &main, &performance, &power, &globals,
+                io_records, top.freq_hz / 1000);
+        }
         Ok(Self {
             hardware: main.0,
             performance: performance.0,
             power: power.0,
             globals: globals.0,
             maximum_khz: top.freq_hz / 1000,
+        })
+    }
+
+    /// The 26.6.2 images at their 26B123 (27.2) positions. The same objects and words, moved
+    /// by the 26B123 runs (the InitData family G16 26B123 shares; bytes outside the runs stay
+    /// zero), plus what 26B123 adds:
+    /// - the register map at its 26B123 positions ([`super::m3_mmio_26::position_26b123`]);
+    ///   positions without a 26.6.2 slot stay empty;
+    /// - main +0xfa0 empty and +0xfa8 the host crash copy buffer size (the retention table moves
+    ///   to the runtime pointers, see `m3_config`);
+    /// - the four power-up words at the performance object +0x9c..+0xa8;
+    /// - the power-control image (root +0xb8) grown to 0x698 bytes: the words the 26.6.2 build
+    ///   writes there (+0x10..+0x14c: average power, FastDie, PPM, SE enable) keep their
+    ///   positions, so they carry over;
+    /// - the state word of the performance object's shared3 block (see below).
+    #[allow(clippy::too_many_arguments)]
+    fn relocate_26b123(
+        abi: Abi26B123,
+        pwr: &hw::PwrConfig,
+        main: &Image,
+        performance: &Image,
+        power: &Image,
+        globals: &Image,
+        io_records: &[u8],
+        maximum_khz: u32,
+    ) -> Result<Self> {
+        use super::m3_mmio_26::{position_26b123, RECORD_BYTES, SLOTS, TABLE_OFFSET};
+        fn reloc(src: &[u8], runs: &[(usize, usize, usize)], size: usize) -> Result<Image> {
+            let mut out = Image::new(size)?;
+            for &(start, end, delta) in runs {
+                out.0.get_mut(start + delta..end + delta).ok_or(ERANGE)?
+                    .copy_from_slice(src.get(start..end).ok_or(ERANGE)?);
+            }
+            Ok(out)
+        }
+        let release_cc = pwr.fast_die0_release_temp.checked_mul(100).ok_or(EOVERFLOW)?;
+        let target_cc = abi.fast_die_target_c.checked_mul(100).ok_or(EOVERFLOW)?;
+        if abi.crash_copy_bytes == 0 || abi.crash_copy_bytes & 0xfff != 0
+            || abi.crash_copy_bytes > 0x10_0000
+            || target_cc <= release_cc
+            || io_records.len() != SLOTS * RECORD_BYTES
+        {
+            return Err(EINVAL);
+        }
+        let mut hardware = reloc(&main.0, &[(0, TABLE_OFFSET, 0), (0xe90, 0xebc, 0x120),
+            (0xec0, 0x25b4, 0x11c), (0x2600, 0x263c, 0x120), (0x263c, 0x2658, 0x124)], 0x2788)?;
+        for slot in 0..SLOTS {
+            let Some(position) = position_26b123(slot) else { continue };
+            let at = TABLE_OFFSET + position * RECORD_BYTES;
+            hardware.0[at..at + RECORD_BYTES]
+                .copy_from_slice(&io_records[slot * RECORD_BYTES..(slot + 1) * RECORD_BYTES]);
+        }
+        hardware.0[0xfa8..0xfb0].copy_from_slice(&u64::from(abi.crash_copy_bytes).to_le_bytes());
+        let mut performance = reloc(&performance.0, &[(0, 0x9c, 0), (0x9c, 0x28b0, 0x10),
+            (0x28b0, 0x2d08, 0x28), (0x2f08, 0x3b50, 0x20), (0x3b50, 0x62c4, 0x48),
+            (0x6318, 0x63cc, 0x28), (0x63cc, 0x6578, 0x6a8)], 0x6c48)?;
+        // Power-up target words, 1 each as the G16 26B123 path sets them: with 0 the power-up
+        // returns at once and the register restore runs on an unpowered GPU.
+        for at in [0x9c, 0xa0, 0xa4, 0xa8] {
+            performance.word(at, 1)?;
+        }
+        let globals = reloc(&globals.0, &[(0, 0x38, 0), (0x38, 0xe48, 4)], 0xe4c)?;
+        // Two performance-object words this InitData family adds, 1 each as the G14 27.2 path
+        // sets them in the same 0x6c48-byte object; a word the 26.6.2 build already fills keeps
+        // its value.
+        for at in [0x2f34, 0x6ac8] {
+            if performance.0[at..at + 4] == [0; 4] {
+                performance.word(at, 1)?;
+            }
+        }
+        // Every word the 26.6.2 build writes in the power-control image lies below +0x150.
+        let mut power = reloc(&power.0, &[(0, 0x150, 0)], 0x698)?;
+        // The FastDie limiter's target and release temperatures (centi-degrees C) come from the
+        // machine: the target from its ADT, the release from the device tree's
+        // apple,fast-die0-release-temp as for every G15 part.
+        power.word(0xc8, target_cc)?;
+        power.word(0xcc, release_cc)?;
+        // The performance object carries a shared3 block (`fw::initdata::raw::HwDataShared3`)
+        // at +0x62ac; the G14 27.2 path fills its table at +0x62b8. Its state word (`unk_8`,
+        // `HwConfig::shared3_unk`, a performance-state index) must not stay 0: with the block
+        // all zero the firmware never takes the first device-control records. T8122 has no
+        // shared3 table (`shared3_tab` is empty, as upstream), so the table stays empty and the
+        // state word lies above every state: the DT state count.
+        let above_top = u32::try_from(pwr.perf_states.len()).map_err(|_| EINVAL)?;
+        performance.word(0x62ac + 8, above_top)?;
+        Ok(Self {
+            hardware: hardware.0,
+            performance: performance.0,
+            power: power.0,
+            globals: globals.0,
+            maximum_khz,
         })
     }
 }

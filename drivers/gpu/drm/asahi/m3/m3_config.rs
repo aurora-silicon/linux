@@ -54,6 +54,8 @@ pub(crate) struct Config {
     io_descriptors: Option<KVec<u8>>,
     _iomaps: KVec<mmu::KernelMapping>,
     pub(crate) completed_events: u64,
+    /// 26B123 (27.2): the host log buffer the firmware gets on its crash-log endpoint.
+    log_buffer: Option<(u64, u32)>,
     pstates: crate::m3::m3_adt_config::PstateWatch,
     thermal: crate::m3::m3_thermal::Governor,
     request_top: u32,
@@ -70,10 +72,12 @@ impl Config {
         contents.check_for_upload()?;
         if let Some(inputs) = &contents.extended {
             if !firmware.profile().extended() { return Err(EINVAL); }
-            let owners = ExtendedStorage::new(dev, uat, &inputs.power, &inputs.sram_uv, inputs.bases)?;
+            let owners = ExtendedStorage::new(dev, uat, &inputs.power, &inputs.sram_uv, inputs.bases,
+                firmware.profile(), inputs.crash_copy_bytes, inputs.fast_die_target_c)?;
             let thermal = crate::m3::m3_thermal::Governor::new(dev.as_ref().as_ref(), &contents.pstates)?;
             return Ok(Self { objects: owners.objects, _iomaps: owners.iomaps,
                 profile: firmware.profile(), control_generation: 0, completed_events: 0,
+                log_buffer: owners.log_buffer,
                 io_descriptors: Some(owners.descriptors),
                 pstates: crate::m3::m3_adt_config::PstateWatch::new(contents.pstates), thermal,
                 request_top: 8, request_value: 0, request_checked: false, request_check_at: None,
@@ -155,7 +159,7 @@ impl Config {
         agx_memory::publish();
         let thermal = crate::m3::m3_thermal::Governor::new(dev.as_ref().as_ref(), &contents.pstates)?;
         Ok(Self { objects, profile: firmware.profile(), control_generation: 0, io_descriptors: None,
-            _iomaps: iomaps, completed_events: 0,
+            _iomaps: iomaps, completed_events: 0, log_buffer: None,
             pstates: crate::m3::m3_adt_config::PstateWatch::new(contents.pstates), thermal,
             request_top:contents.table.0,request_value:0,request_checked:false,
             request_check_at:None,request_writes:0,request_observed:0 })
@@ -336,7 +340,8 @@ impl Config {
     pub(crate) fn log_ready(&mut self, dev: &driver::AsahiDrmDevice) -> Result {
         if self.profile.extended() {
             let ready = self.objects[RUNTIME_FLAGS].read_u32(0x14)?;
-            let consumed = self.objects[CONTROL_REGION].read_u32(0xeae8)?;
+            let consumed_at = self.control_consumed();
+            let consumed = self.objects[CONTROL_REGION].read_u32(consumed_at)?;
             dev_info!(dev.as_ref(), "M3: extended firmware ready={} control-generation={}/{}\n",
                 ready, consumed, self.control_generation);
             return Ok(());
@@ -441,19 +446,63 @@ impl Config {
         let cursor = format::idle_cursor(cursors).map_err(|error| {
             if error == init::Error::Bounds { EIO } else { EBUSY }
         })?;
-        let consumed = self.objects[CONTROL_REGION].read_u32(0xeae8)?;
+        let consumed_at = self.control_consumed();
+            let consumed = self.objects[CONTROL_REGION].read_u32(consumed_at)?;
         let generation = action.generation(self.control_generation, consumed).map_err(|_| EOVERFLOW)?;
         let mut record = [0; format::CONTROL_BYTES];
         action.encode(&mut record).map_err(|_| EINVAL)?;
         self.objects[state + 1].write(cursor as usize * format::CONTROL_BYTES, &record)?;
         if generation != 0 {
-            self.objects[GLOBALS].write(0xe41, &generation.to_le_bytes())?;
+            self.objects[GLOBALS].write(if self.profile.v26b123() { 0xe45 } else { 0xe41 }, &generation.to_le_bytes())?;
         }
         agx_memory::publish();
         let next = (cursor + 1) % format::SLOTS;
         self.objects[state].u32(0x20, next)?;
         agx_memory::publish();
         self.control_generation = generation;
+        Ok(next)
+    }
+
+    /// The firmware's consumed-generation word: the last u32 pair of the firmware-data control
+    /// object (0xeaf0 bytes on 26.6.2, 0xedd0 on 26B123).
+    fn control_consumed(&self) -> usize {
+        if self.profile.v26b123() { 0xedd0 - 8 } else { 0xeaf0 - 8 }
+    }
+
+    /// 26B123: the host log buffer (VA, bytes) for the crash-log endpoint, if this firmware has one.
+    pub(crate) fn log_buffer(&self) -> Option<(u64, u32)> {
+        self.log_buffer
+    }
+
+    /// Device-control state cursors: [read, completion, write].
+    pub(crate) fn control_cursors(&mut self) -> Result<[u32; 3]> {
+        let st = storage::DEVICE_CONTROL * 2;
+        Ok([self.objects[st].read_u32(0)?, self.objects[st].read_u32(0x10)?, self.objects[st].read_u32(0x20)?])
+    }
+
+    /// 26B123 boot: the scheduler request word is set (1 if the firmware left it 0), then
+    /// IMPORT_GLOBALS (0x35) and START (0x0a) go into the device-control ring at its write slot
+    /// behind ONE write-index update. The Globals generation is not written on this path.
+    /// Returns the new write index; the caller publishes the SGX generation and rings the
+    /// doorbell.
+    pub(crate) fn post_boot_pair_26b123(&mut self) -> Result<u32> {
+        if !self.profile.v26b123() { return Err(EINVAL); }
+        if self.objects[CONTROL_REGION].read_u32(0x51b4)? == 0 {
+            self.objects[CONTROL_REGION].u32(0x51b4, 1)?;
+        }
+        let st = storage::DEVICE_CONTROL * 2;
+        let w = self.objects[st].read_u32(0x20)?;
+        let ops = [0x35u32, 0x0a];
+        for (i, op) in ops.iter().enumerate() {
+            let mut record = [0u8; super::m3_channel_format::CONTROL_BYTES];
+            record[0..4].copy_from_slice(&op.to_le_bytes());
+            let slot = (w as usize + i) % super::m3_channel_format::SLOTS as usize;
+            self.objects[st + 1].write(slot * super::m3_channel_format::CONTROL_BYTES, &record)?;
+        }
+        let next = (w + ops.len() as u32) % super::m3_channel_format::SLOTS;
+        agx_memory::publish();
+        self.objects[st].u32(0x20, next)?;
+        agx_memory::publish();
         Ok(next)
     }
 
@@ -568,6 +617,8 @@ pub(crate) struct ExtendedStorage {
     pub(crate) iomaps: KVec<mmu::KernelMapping>,
     pub(crate) descriptors: KVec<u8>,
     pub(crate) maximum_khz: u32,
+    /// 26B123: the host log buffer (VA, bytes).
+    pub(crate) log_buffer: Option<(u64, u32)>,
 }
 
 impl ExtendedStorage {
@@ -577,11 +628,27 @@ impl ExtendedStorage {
         pwr: &super::hw::PwrConfig,
         sram_uv: &[u32],
         bases: super::m3_mmio_26::RegisterBases,
+        profile: super::m3_profile::Profile,
+        crash_copy_bytes: Option<u32>,
+        fast_die_target_c: Option<u32>,
     ) -> Result<Self> {
         use super::{m3_init_26 as plan, m3_mmio_26 as io};
+        let v26b123 = profile.v26b123();
+        // 26B123 names the host crash copy buffer's size in HW data and takes a host log buffer of
+        // that size on its crash-log endpoint, and reads its FastDie target directly; the boot
+        // loader gives both from the machine. Without them the 27.2 firmware is not started.
+        let abi = if v26b123 {
+            let (Some(crash_copy_bytes), Some(fast_die_target_c)) = (crash_copy_bytes, fast_die_target_c) else {
+                dev_err!(dev.as_ref(), "M3: the boot loader gives no apple,coredump-copy-buffer / apple,fast-die0-target; 27.2 GPU not started\n");
+                return Err(ENODEV);
+            };
+            Some(super::m3_power_26::Abi26B123 { crash_copy_bytes, fast_die_target_c })
+        } else {
+            None
+        };
         let mut objects = KVec::new();
         for index in 0..plan::COUNT {
-            let entry = plan::allocation(index).map_err(|_| EINVAL)?;
+            let entry = plan::allocation_for(profile, index).map_err(|_| EINVAL)?;
             let alias = match index {
                 plan::GLOBAL_POOL => Some((uat.kernel_lower_vm(), 0x70_0000_0000)),
                 plan::GLOBAL_PARAMETERS => Some((uat.kernel_lower_vm(), 0x70_0000_8000)),
@@ -600,7 +667,9 @@ impl ExtendedStorage {
         let mut iomaps = KVec::new();
         for slot in 0..io::SLOTS {
             let mut region = None;
-            if let Some(area) = io::area(slot, bases).map_err(|_| EINVAL)? {
+            // 26B123 has no register-map position for some 26.6.2 slots: nothing is mapped for them.
+            let described = !v26b123 || io::position_26b123(slot).is_some();
+            if let Some(area) = io::area(slot, bases).map_err(|_| EINVAL)?.filter(|_| described) {
                 let address = 0xffff_fc23_0000_0000 + slot as u64 * 0x10_0000;
                 let access = if area.writable() { prot::PROT_FW_MMIO_RW } else { prot::PROT_FW_MMIO_RO };
                 for (physical, bytes, offset) in area.banks() {
@@ -626,19 +695,19 @@ impl ExtendedStorage {
         for (index, object) in objects.iter().enumerate() {
             regions[index] = init::Region::new(object.va(), object.size()).map_err(|_| EINVAL)?;
         }
-        let graph = plan::PointerGraph { owners: &regions, scratch: scratch_region,
+        let graph = plan::PointerGraph { profile, owners: &regions, scratch: scratch_region,
             pool_alias: objects[plan::GLOBAL_POOL].gpu_va()?,
             parameter_alias: objects[plan::GLOBAL_PARAMETERS].gpu_va()? };
         let mut root = [0; 0xc8];
         let mut runtime = [0; plan::RUNTIME_SIZE];
         let mut control = KVec::new();
-        control.resize(plan::allocation(CONTROL_REGION).map_err(|_| EINVAL)?.size, 0, GFP_KERNEL)?;
+        control.resize(plan::allocation_for(profile, CONTROL_REGION).map_err(|_| EINVAL)?.size, 0, GFP_KERNEL)?;
         graph.root(&mut root).map_err(|_| EINVAL)?;
         graph.runtime(&mut runtime).map_err(|_| EINVAL)?;
         graph.firmware_control(&mut control).map_err(|_| EINVAL)?;
         let images = super::m3_power_26::PowerImages::new(pwr, sram_uv,
             objects[plan::SENSOR_VALUE].va(), objects[plan::RETENTION_STATE].va(),
-            agx_memory::TIMESTAMP_RANGE.start, &descriptors)?;
+            agx_memory::TIMESTAMP_RANGE.start, &descriptors, abi)?;
         objects[storage::ROOT].write(0, &root)?;
         objects[RUNTIME_POINTERS].write(0, &runtime)?;
         objects[CONTROL_REGION].write(0, &control)?;
@@ -649,7 +718,20 @@ impl ExtendedStorage {
         // Fragment scheduler entries start unassigned; these are input sentinels.
         objects[UNKNOWN_C1].u32(0xc18, u32::MAX)?;
         objects[UNKNOWN_C1].u32(0xc30, u32::MAX)?;
+        let mut log_buffer = None;
+        if let Some(abi) = abi {
+            // 26B123 takes the retention table from the runtime pointers (+0x2c8) and leaves
+            // HW data +0xfa0 empty (see `PowerImages`).
+            let retention = objects[plan::RETENTION_STATE].va();
+            objects[RUNTIME_POINTERS].u64(0x2c8, retention)?;
+            // The host log buffer, at the first owner VA after the InitData objects.
+            let at = 0xffff_fc21_0000_0000u64 + 68 * 0x10_0000;
+            let bytes = abi.crash_copy_bytes as usize;
+            let buffer = Buffer::at(dev, uat.kernel_vm(), None, Some(at), bytes, false)?;
+            log_buffer = Some((buffer.va(), abi.crash_copy_bytes));
+            objects.push(buffer, GFP_KERNEL)?;
+        }
         agx_memory::publish();
-        Ok(Self { objects, iomaps, descriptors, maximum_khz: images.maximum_khz })
+        Ok(Self { objects, iomaps, descriptors, maximum_khz: images.maximum_khz, log_buffer })
     }
 }

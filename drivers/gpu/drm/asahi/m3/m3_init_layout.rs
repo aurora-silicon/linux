@@ -82,20 +82,30 @@ impl Root {
     }
 
     /// Encode the extended root without admitting a firmware image or publishing it.
-    pub(crate) fn encode_26(&self, out: &mut [u8], extra: Region) -> Result<(), Error> {
+    pub(crate) fn encode_26(
+        &self,
+        out: &mut [u8],
+        extra: Region,
+        profile: super::m3_profile::Profile,
+    ) -> Result<(), Error> {
+        // 26B123 grows Globals, the firmware-data control object and the power object.
+        let v26b123 = profile.v26b123();
         let references = [
             (root::REGION_A, self.region_a.at(0, 0x4000)?),
             (root::RUNTIME, self.runtime.at(0, 0x4b8)?),
-            (root::GLOBALS, self.globals.at(0, 0xe48)?),
+            (root::GLOBALS, self.globals.at(0, if v26b123 { 0xe4c } else { 0xe48 })?),
             (root::NEW_A, self.new_a.at(0, 0x20)?),
-            (root::CONTROL, self.control.at(0, 0xeaf0)?),
-            (root::POWER, self.power.at(0, 0x670)?),
+            (root::CONTROL, self.control.at(0, if v26b123 { 0xedd0 } else { 0xeaf0 })?),
+            (root::POWER, self.power.at(0, if v26b123 { 0x698 } else { 0x670 })?),
             (0xc0, extra.at(0, 0x4000)?),
         ];
         if references.iter().any(|(_, address)| address & 7 != 0) {
             return Err(Error::Address);
         }
-        Self::write_root(out, 0xc8, 0x0c89_c357_8392_04b8, &references)
+        // The InitData version each Extended image accepts (the admitted image's
+        // `KnownImage::initdata_magic`).
+        let word = if v26b123 { 0x0c8a_836f_0394_04b8 } else { 0x0c89_c357_8392_04b8 };
+        Self::write_root(out, 0xc8, word, &references)
     }
 
     fn write_root(
@@ -245,7 +255,7 @@ mod root_format_tests {
         let mut older = [0x55; 0xd0];
         let mut newer = older;
         root.encode(&mut older).unwrap();
-        root.encode_26(&mut newer, extra).unwrap();
+        root.encode_26(&mut newer, extra, super::super::m3_profile::Profile::Extended).unwrap();
         assert_eq!(&older[8..0xc0], &newer[8..0xc0]);
         assert_eq!(
             u64::from_le_bytes(newer[..8].try_into().unwrap()),
@@ -278,7 +288,7 @@ mod root_format_tests {
         for length in 0..0xc8 {
             let mut output = [0xa5; 0xc8];
             assert_eq!(
-                root.encode_26(&mut output[..length], extra),
+                root.encode_26(&mut output[..length], extra, super::super::m3_profile::Profile::Extended),
                 Err(Error::Size)
             );
             assert_eq!(output, [0xa5; 0xc8]);
@@ -309,7 +319,7 @@ mod root_format_tests {
                 *reference =
                     Region::new(0xffff_fc02_0000_0000 + u64::from(!aligned), size).unwrap();
                 let mut output = [0xa5; 0xc8];
-                let result = root.encode_26(&mut output, extra);
+                let result = root.encode_26(&mut output, extra, super::super::m3_profile::Profile::Extended);
                 assert_eq!(
                     result.is_ok(),
                     valid,

@@ -12,6 +12,8 @@ pub(crate) struct Dispatch26 {
     pub(crate) usc_window:u64,
     pub(crate) firmware_aux:FirmwareVa,
     pub(crate) scene_scratch:GpuVa,
+    /// 26B123 (27.2) records: the binding generation is a u64, so the fields after it move +7.
+    pub(crate) v26b123: bool,
 }
 
 pub(crate) const REGISTERS:usize=ta::REGISTERS;
@@ -184,7 +186,12 @@ impl Command {
             pointer(bytes, 0x8fe, self.pool.get());
             bytes[0x906] = 1;
             pointer(bytes, 0x90f, native.firmware_aux.get());
-            bytes[0x917] = native.incarnation;
+            if native.v26b123 {
+                // 26B123: the binding generation is a u64 at the same offset.
+                bytes[0x917..0x91f].copy_from_slice(&u64::from(native.incarnation).to_le_bytes());
+            } else {
+                bytes[0x917] = native.incarnation;
+            }
         } else {
         word(bytes,STAMP_VALUE,self.stamp_value);
         pointer(bytes,ta::STRUCT3+0x24,preemption[0]);
@@ -226,7 +233,7 @@ mod extended_tests {
         let value=command();let mut bytes=[0xa5;EXTENDED_SIZE+8];
         value.encode_extended(Dispatch26 {incarnation:9,serial:2,peer_stamp:0x3d000100,
             usc_window:1<<32,firmware_aux:value.scratch,
-            scene_scratch:GpuVa::new(0x10_0200_0000).unwrap()},&mut bytes).unwrap();
+            scene_scratch:GpuVa::new(0x10_0200_0000).unwrap(),v26b123:false},&mut bytes).unwrap();
         let word=|at|u32::from_le_bytes(bytes[at..at+4].try_into().unwrap());
         assert_eq!(word(0x780),0x3d000100);
         assert_eq!(word(0x888),value.stamp_value);
@@ -238,5 +245,13 @@ mod extended_tests {
         assert!(!registers.chunks_exact(12).any(|r|u32::from_le_bytes(r[..4].try_into().unwrap())==0x12099));
         let usc=registers.chunks_exact(12).find(|r|u32::from_le_bytes(r[..4].try_into().unwrap())==0x10061).unwrap();
         assert_eq!(u64::from_le_bytes(usc[4..].try_into().unwrap()),1<<32);
+    }
+    #[test] fn u1_ta_generation_is_a_u64_on_26b123() {
+        let value=command();let mut bytes=[0xa5;EXTENDED_SIZE+8];
+        value.encode_extended(Dispatch26 {incarnation:9,serial:2,peer_stamp:0x3d000100,usc_window:1<<32,
+            firmware_aux:value.scratch,scene_scratch:GpuVa::new(0x10_0200_0000).unwrap(),v26b123:true},&mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes[0x917..0x91f].try_into().unwrap()),9);
+        assert_eq!(u64::from_le_bytes(bytes[0x90f..0x917].try_into().unwrap()),value.scratch.get());
+        assert_eq!(&bytes[EXTENDED_SIZE..],&[0xa5;8]);
     }
 }

@@ -3,6 +3,7 @@
 //! RTKit callbacks for the identified J514S firmware. The firmware advertises
 //! its crash storage by physical address inside the reserved data segment.
 
+use core::pin::Pin;
 use crate::m3::agx_resources::Region;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
@@ -249,93 +250,162 @@ impl rtkit::Buffer for FirmwareBuffer {
     }
 }
 
-pub(crate) struct Operations;
+/// RTKit operations of the M3 GPU. `Operations` serves the 14.8.3 and 26.6.2 firmware;
+/// `OperationsPlaced` the 27.2 (26B123) firmware, which places its own buffers: their requests
+/// carry an IOVA and are acknowledged unchanged, as on G16 27.2.
+macro_rules! m3_rtkit_operations {
+    ($name:ident, $placed:expr) => {
+        pub(crate) struct $name;
 
-#[kernel::macros::vtable]
-impl rtkit::Operations for Operations {
-    type Data = Arc<State>;
-    type Buffer = FirmwareBuffer;
+        #[kernel::macros::vtable]
+        impl rtkit::Operations for $name {
+            const COPROC_PLACES_BUFFERS: bool = $placed;
 
-    fn crashed(state: ArcBorrow<'_, State>, crashlog: Option<&[u8]>) {
-        state.health.crashed.store(true, Ordering::Release);
-        // Wake the serialized worker even if the firmware can no longer send
-        // its usual completion notification. Never take the runtime lock here.
-        state.events.record();
-        crate::m3::m3_completion::queue(&state);
-        dev_err!(
-            state.dev.as_ref(),
-            "M3 G15S: firmware crashed, retained crashlog bytes={}\n",
-            crashlog.map_or(0, |b| b.len())
-        );
-    }
+            type Data = Arc<State>;
+            type Buffer = FirmwareBuffer;
 
-    fn shmem_map(
-        state: ArcBorrow<'_, State>,
-        physical: usize,
-        size: usize,
-    ) -> Result<FirmwareBuffer> {
-        // The only system buffer advertised by this admitted firmware is its
-        // preallocated crash log. Never reinterpret an arbitrary DVA as a PA.
-        let offset = physical
-            .checked_sub(state.data.base as usize)
-            .ok_or(EINVAL)?;
-        if size == 0
-            || (physical | size) & 0xfff != 0
-            || offset.checked_add(size).ok_or(EOVERFLOW)? > state.data.size as usize
-        {
-            return Err(EINVAL);
+            fn crashed(state: ArcBorrow<'_, State>, crashlog: Option<&[u8]>) {
+                state.health.crashed.store(true, Ordering::Release);
+                // Wake the serialized worker even if the firmware can no longer send
+                // its usual completion notification. Never take the runtime lock here.
+                state.events.record();
+                crate::m3::m3_completion::queue(&state);
+                dev_err!(
+                    state.dev.as_ref(),
+                    "M3 G15S: firmware crashed, retained crashlog bytes={}\n",
+                    crashlog.map_or(0, |b| b.len())
+                );
+            }
+
+            fn shmem_map(
+                state: ArcBorrow<'_, State>,
+                physical: usize,
+                size: usize,
+            ) -> Result<FirmwareBuffer> {
+                // The only system buffer advertised by this admitted firmware is its
+                // preallocated crash log. Never reinterpret an arbitrary DVA as a PA.
+                let offset = physical
+                    .checked_sub(state.data.base as usize)
+                    .ok_or(EINVAL)?;
+                if size == 0
+                    || (physical | size) & 0xfff != 0
+                    || offset.checked_add(size).ok_or(EOVERFLOW)? > state.data.size as usize
+                {
+                    return Err(EINVAL);
+                }
+                if state.claimed.swap(true, Ordering::AcqRel) {
+                    return Err(EBUSY);
+                }
+                let node = state.dev.as_ref().of_node().ok_or(ENODEV)?;
+                let resource = crate::m3::m3_resources::reserved_resource(&node,c_str!("fw-data"))?;
+                if resource.start() != state.data.base || resource.size() != state.data.size {
+                    return Err(EINVAL);
+                }
+                // SAFETY: The validated no-map data reservation belongs to this
+                // firmware session. This CPU mapping is retained by RTKit until ASC
+                // is stopped and callbacks drained; physical pages are never freed.
+                // An uncached CPU alias lets RTKit snapshot newly written crash data.
+                let mapping = unsafe { Mem::try_new(resource, MemFlag::WC.into()) }?;
+                dev_info!(
+                    state.dev.as_ref(),
+                    "M3 G15S: mapped firmware crash storage PA={:#x} size={:#x}\n",
+                    physical,
+                    size
+                );
+                state.health.mapped.store(true, Ordering::Release);
+                Ok(FirmwareBuffer {
+                    state: state.into(),
+                    mapping,
+                    physical,
+                    offset,
+                    size,
+                })
+            }
+
+            fn recv_message(state: ArcBorrow<'_, State>, endpoint: u8, message: u64) {
+                // Firmware retries its event notification until the shared rings are
+                // drained, including after the final userspace job. Never take the
+                // runtime mutex in the RTKit callback: enqueue the serialized worker.
+                if endpoint == 0x20 && message == 0x0042_0000_0000_0000 {
+                    // Record the IRQ-safe token before publishing the external count.
+                    // A concurrent waiter sees either the moved sequence or a token.
+                    state.events.record();
+                    state.event_messages.fetch_add(1, Ordering::Release);
+                    if crate::debug::debug_enabled(crate::debug::DebugFlags::SubmitTiming) {
+                        dev_info!(state.dev.as_ref(), "M3 G15S_TIMING event monotonic_ns={} messages={}\n",
+                            <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get(),
+                            state.event_messages.load(Ordering::Acquire));
+                    }
+                    crate::m3::m3_completion::queue(&state);
+                    return;
+                }
+                dev_warn!(
+                    state.dev.as_ref(),
+                    "M3 G15S: RTKit application ep={:#x} message={:#018x}\n",
+                    endpoint,
+                    message
+                );
+            }
         }
-        if state.claimed.swap(true, Ordering::AcqRel) {
-            return Err(EBUSY);
+    };
+}
+
+m3_rtkit_operations!(Operations, false);
+m3_rtkit_operations!(OperationsPlaced, true);
+
+/// The RTKit session of the admitted firmware, with the operations its profile needs.
+pub(crate) enum Transport {
+    Host(rtkit::RtKit<Operations>),
+    Placed(rtkit::RtKit<OperationsPlaced>),
+}
+
+macro_rules! each {
+    ($self:expr, $t:ident => $e:expr) => {
+        match $self {
+            Transport::Host($t) => $e,
+            Transport::Placed($t) => $e,
         }
-        let node = state.dev.as_ref().of_node().ok_or(ENODEV)?;
-        let resource = crate::m3::m3_resources::reserved_resource(&node,c_str!("fw-data"))?;
-        if resource.start() != state.data.base || resource.size() != state.data.size {
-            return Err(EINVAL);
-        }
-        // SAFETY: The validated no-map data reservation belongs to this
-        // firmware session. This CPU mapping is retained by RTKit until ASC
-        // is stopped and callbacks drained; physical pages are never freed.
-        // An uncached CPU alias lets RTKit snapshot newly written crash data.
-        let mapping = unsafe { Mem::try_new(resource, MemFlag::WC.into()) }?;
-        dev_info!(
-            state.dev.as_ref(),
-            "M3 G15S: mapped firmware crash storage PA={:#x} size={:#x}\n",
-            physical,
-            size
-        );
-        state.health.mapped.store(true, Ordering::Release);
-        Ok(FirmwareBuffer {
-            state: state.into(),
-            mapping,
-            physical,
-            offset,
-            size,
+    };
+}
+
+impl Transport {
+    pub(crate) fn new(
+        dev: &kernel::device::Device,
+        state: Arc<State>,
+        profile: super::m3_profile::Profile,
+    ) -> Result<Self> {
+        Ok(if profile.v26b123() {
+            Self::Placed(rtkit::RtKit::new(dev, None, 0, state)?)
+        } else {
+            Self::Host(rtkit::RtKit::new(dev, None, 0, state)?)
         })
     }
 
-    fn recv_message(state: ArcBorrow<'_, State>, endpoint: u8, message: u64) {
-        // Firmware retries its event notification until the shared rings are
-        // drained, including after the final userspace job. Never take the
-        // runtime mutex in the RTKit callback: enqueue the serialized worker.
-        if endpoint == 0x20 && message == 0x0042_0000_0000_0000 {
-            // Record the IRQ-safe token before publishing the external count.
-            // A concurrent waiter sees either the moved sequence or a token.
-            state.events.record();
-            state.event_messages.fetch_add(1, Ordering::Release);
-            if crate::debug::debug_enabled(crate::debug::DebugFlags::SubmitTiming) {
-                dev_info!(state.dev.as_ref(), "M3 G15S_TIMING event monotonic_ns={} messages={}\n",
-                    <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get(),
-                    state.event_messages.load(Ordering::Acquire));
-            }
-            crate::m3::m3_completion::queue(&state);
-            return;
-        }
-        dev_warn!(
-            state.dev.as_ref(),
-            "M3 G15S: RTKit application ep={:#x} message={:#018x}\n",
-            endpoint,
-            message
-        );
+    pub(crate) fn wake(self: Pin<&mut Self>) -> Result {
+        each!(self.get_mut(), t => Pin::new(t).wake())
+    }
+
+    pub(crate) fn idle(self: Pin<&mut Self>) -> Result {
+        each!(self.get_mut(), t => Pin::new(t).idle())
+    }
+
+    pub(crate) fn start_endpoint(self: Pin<&mut Self>, endpoint: u8) -> Result {
+        each!(self.get_mut(), t => Pin::new(t).start_endpoint(endpoint))
+    }
+
+    pub(crate) fn send_message(self: Pin<&mut Self>, endpoint: u8, message: u64) -> Result {
+        each!(self.get_mut(), t => Pin::new(t).send_message(endpoint, message))
+    }
+
+    pub(crate) fn has_endpoint(self: Pin<&mut Self>, endpoint: u8) -> bool {
+        each!(self.get_mut(), t => Pin::new(t).has_endpoint(endpoint))
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        each!(self, t => t.is_running())
+    }
+
+    pub(crate) fn is_crashed(&self) -> bool {
+        each!(self, t => t.is_crashed())
     }
 }

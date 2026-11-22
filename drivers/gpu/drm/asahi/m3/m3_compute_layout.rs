@@ -160,7 +160,10 @@ impl Command {
         pointer(bytes, tail + if extended { 0x4f } else { 0x3f },
             if extended { 0xef8000 } else { 0x1600000 });
         pointer(bytes, tail + if extended { 0x57 } else { 0x47 }, self.tail_scratch.get());
-        if extended { bytes[0x88b] = asid_generation; }
+        if profile.v26b123() {
+            // 26B123: a u64 binding generation (completion/aux/target move +7).
+            bytes[0x88b..0x893].copy_from_slice(&u64::from(asid_generation).to_le_bytes());
+        } else if extended { bytes[0x88b] = asid_generation; }
         else { bytes[TAIL + 0x4f] = 1; }
         Ok(())
     }
@@ -253,4 +256,11 @@ mod tests {
         assert_eq!(output, [0xa5; EXTENDED_SIZE]);
     }
 
+    #[test]
+    fn u1_compute_generation_is_a_u64_on_26b123() {
+        let mut b = [0xa5; 0x8e0];
+        fixture().encode_for(Profile::Extended27, 9, 0, &mut b).unwrap();
+        assert_eq!(read64(&b, 0x88b), 9);
+        assert_eq!(read64(&b, 0x883), fixture().tail_scratch.get());
+    }
 }

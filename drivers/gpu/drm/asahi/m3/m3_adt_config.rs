@@ -264,6 +264,12 @@ pub(crate) struct ExtendedInputs {
     pub(crate) power: hw::PwrConfig,
     pub(crate) sram_uv: KVec<u32>,
     pub(crate) bases: super::m3_mmio_26::RegisterBases,
+    /// The boot loader's `apple,coredump-copy-buffer` (bytes), from the machine's ADT
+    /// (gfx-asc `coredump-copy-buffer`); the 27.2 firmware needs it, absent = not started.
+    pub(crate) crash_copy_bytes: Option<u32>,
+    /// The boot loader's `apple,fast-die0-target` (degrees C, the ADT's gpu-fast-die0-target);
+    /// the 27.2 firmware reads its FastDie target directly, absent = not started.
+    pub(crate) fast_die_target_c: Option<u32>,
 }
 
 pub(crate) struct Contents {
@@ -421,7 +427,10 @@ impl Contents {
             boot_mhz: freqs[1], freqs, thermal: ThermalMode::Off };
         let mut images = KVec::new();
         for _ in 0..super::m3_init_26::COUNT { images.push(None, GFP_KERNEL)?; }
-        Ok(Self { extended: Some(ExtendedInputs { power, sram_uv, bases }),
+        let crash_copy_bytes = node.get_property::<u32>(c_str!("apple,coredump-copy-buffer")).ok();
+        let fast_die_target_c = node.get_property::<u32>(c_str!("apple,fast-die0-target")).ok();
+        Ok(Self { extended: Some(ExtendedInputs { power, sram_uv, bases, crash_copy_bytes,
+            fast_die_target_c }),
             images, pstates, iomaps: &[], table: (8, 1338), read_only_slots: 0, hwdata_object: None })
     }
 
