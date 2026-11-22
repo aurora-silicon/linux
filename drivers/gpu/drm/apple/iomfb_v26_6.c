@@ -780,8 +780,16 @@ static int dcp_v26_callback(void *cookie, u32 tag,
 	}
 	if (tag == D(100) && SHAPE(0, 0))
 		return dcp_v26_simple_call(v26, A(390), false, true, false);
-	dev_err(v26->dev, "J613 unhandled kernel callback %#x %u/%u\n", tag, in_size, out_size);
-	return -EOPNOTSUPP;
+	/*
+	 * TRIAL ONLY (not for #2583): harvest the rest of the sleep sequence in one
+	 * boot. Log the callback and answer it with zeros instead of failing the call;
+	 * a zero reply to a callback that expects one is an invented "false/0".
+	 */
+	dev_warn(v26->dev, "J613 TRIAL harvest: callback %#x %u/%u in %*ph%s\n", tag, in_size, out_size,
+		 (int)min_t(u32, in_size, 16), in, out_size ? " -> INVENTED zero reply" : " (notification)");
+	if (out_size)
+		memset(out, 0, out_size);
+	return 0;
 #undef SHAPE
 }
 
