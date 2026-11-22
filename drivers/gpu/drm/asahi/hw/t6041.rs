@@ -204,8 +204,11 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
         },
     ],
     // Four clusters: the tiler segment values of 25F84 on this machine.
+    // T6041's 25G83 firmware emits pstate reports (tags 0x19/0x1b) and 8 ms
+    // timestamped utilisation records (tag 0x13).
     variant: &fw::variant::Variant {
         ta_mode_1: true,
+        telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_8MS,
         ..fw::variant::V25G83
     },
     config: None,
