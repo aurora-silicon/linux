@@ -213,15 +213,20 @@ struct ave_fw_build {
 	const char *name;
 	u32 text_size;
 	u32 data_size;
+	/* 0: any build in the known list */
 	u32 text_crc;
+	/*
+	 * TEXT offset of a 32-bit word this build's loader sets differently on
+	 * every boot; a TEXT CRC that is not a known build is retried with it
+	 * zeroed. 0 when there is none, and the CRC must match as it is.
+	 */
+	u32 text_boot_word;
 };
 
 struct ave_variant {
 	const struct ave_coproc_regs *regs;
 	u32 fw_text_size;
 	u32 fw_data_size;
-	/* A second DATA size the variant accepts (the M4 Max build), or 0 */
-	u32 fw_data_size_alt;
 	/*
 	 * When set, the builds the variant admits. They replace fw_text_size,
 	 * fw_data_size and text_crc: the segment sizes select the build, and
@@ -243,12 +248,6 @@ struct ave_variant {
 	 */
 	u32 text_link_cell;
 	/*
-	 * TEXT offset of a 32-bit word the loader sets differently on every
-	 * boot; a TEXT CRC that is not a known build is retried with it zeroed.
-	 * 0 when there is none.
-	 */
-	u32 text_boot_word;
-	/*
 	 * Mailbox offset of the SVE idle (clock gating) word that must read 0
 	 * before the firmware starts, or 0 when the variant has none.
 	 */
@@ -260,9 +259,9 @@ struct ave_variant {
 	 * bootloader preloads, with a start and command protocol of its own.
 	 * The firmware segment sizes the bootloader reserved select it.
 	 * NULL when there is none. Use builds[] when the builds differ only
-	 * in TEXT CRC (and command layout) but start the same way; use
-	 * next_build when a build needs other start fields (boot device,
-	 * handshake type, boot word, DATA handling) and has sizes of its own.
+	 * in TEXT CRC, boot word (and command layout) but start the same way;
+	 * use next_build when a build needs other start fields (boot device,
+	 * handshake type, DATA handling) and has sizes of its own.
 	 */
 	const struct ave_variant *next_build;
 
@@ -577,8 +576,8 @@ static inline struct ave_ctx *ave_file_to_ctx(struct file *file)
 	return container_of(file_to_v4l2_fh(file), struct ave_ctx, fh);
 }
 
-extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112, ave_t8132,
-	ave_m3;
+extern const struct ave_variant ave_t6000, ave_t6041, ave_t6050, ave_t8112,
+	ave_t8132, ave_m3;
 
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);

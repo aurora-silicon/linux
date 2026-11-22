@@ -79,10 +79,14 @@ const struct ave_variant ave_t6000 = {
  * the bootloader's code base (marked valid) left as it is, and DATA restored
  * from the boot snapshot before every start.
  */
+static const struct ave_fw_build ave_t8112_26b123_builds[] = {
+	{ "26B123", 0x11c000, 0x128000, AVE_FW_TEXT_CRC_T8112_26B123, 0x4224 },
+};
+
 static const struct ave_variant ave_t8112_26b123 = {
 	.regs = &ave_coproc_6070,
-	.fw_text_size = 0x11c000,
-	.fw_data_size = 0x128000,
+	.builds = ave_t8112_26b123_builds,
+	.build_count = ARRAY_SIZE(ave_t8112_26b123_builds),
 	.boot_device_id = 12,
 	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
 	.timebase_multiplier = 1,
@@ -90,8 +94,6 @@ static const struct ave_variant ave_t8112_26b123 = {
 	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
 	.device_type = 12,
 	.lfs_ref_scale = 2,
-	.text_crc = AVE_FW_TEXT_CRC_T8112_26B123,
-	.text_boot_word = 0x4224,
 	.mbox_idle = 0x38,
 	.restore_data_first = true,
 	.boot_qualified = true,
@@ -123,12 +125,16 @@ const struct ave_variant ave_t8112 = {
  * with soc-id t6040, the same way; iBoot 25G83 preloads it with a 0x130000
  * DATA and sets a word at TEXT 0x4224 differently on every boot.
  */
+static const struct ave_fw_build ave_t6041_builds[] = {
+	{ "25G83", 0x14c000, 0x12c000, 0, 0x4224 },
+	/* The M4 Max's first encoder */
+	{ "25G83", 0x14c000, 0x130000, 0, 0x4224 },
+};
+
 const struct ave_variant ave_t6041 = {
 	.regs = &ave_coproc_v40,
-	.fw_text_size = 0x14c000,
-	.fw_data_size = 0x12c000,
-	.fw_data_size_alt = 0x130000,
-	.text_boot_word = 0x4224,
+	.builds = ave_t6041_builds,
+	.build_count = ARRAY_SIZE(ave_t6041_builds),
 	.boot_device_id = 27,
 	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
 	.timebase_multiplier = 1,
@@ -174,10 +180,14 @@ static const struct ave_variant ave_t8122 = {
  * unknown CRC is retried with it zeroed. The coprocessor and its start are
  * the M4 Pro's; this build boots as device 23 and takes handshake type 23.
  */
+static const struct ave_fw_build ave_t8132_builds[] = {
+	{ "26B123", 0x154000, 0x12c000, AVE_FW_TEXT_CRC_T8132_26B123, 0x4224 },
+};
+
 const struct ave_variant ave_t8132 = {
 	.regs = &ave_coproc_v40,
-	.fw_text_size = 0x154000,
-	.fw_data_size = 0x12c000,
+	.builds = ave_t8132_builds,
+	.build_count = ARRAY_SIZE(ave_t8132_builds),
 	.boot_device_id = 23,
 	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
 	.timebase_multiplier = 1,
@@ -185,8 +195,6 @@ const struct ave_variant ave_t8132 = {
 	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
 	.device_type = 23,
 	.lfs_ref_scale = 2,
-	.text_crc = AVE_FW_TEXT_CRC_T8132_26B123,
-	.text_boot_word = 0x4224,
 	.boot_qualified = true,
 };
 
@@ -209,10 +217,12 @@ static const struct ave_variant ave_t8140 = {
  * 0x154000 and DATA 0x134000 (ADT ave0 segment-ranges). macOS starts the coprocessor as on the
  * A18 Pro, after clearing the SVE idle word at mailbox +0x118. Its boot configuration names
  * device 28, and so does its handshake's device type. The macOS 27.3 beta 1 build is admitted
- * beside it.
+ * beside it. As on the M4 Max, the 26A428 build's TEXT word at 0x4224 differs on every boot
+ * (the Mac Studio, J775D), so an unknown TEXT CRC of that build is retried with the word zeroed.
+ * The 26C5035 build has not been checked for such a word, so its CRC must match as it is.
  */
 static const struct ave_fw_build ave_t6050_builds[] = {
-	{ "26A428", 0x154000, 0x134000, AVE_FW_TEXT_CRC_T6050_26A428 },
+	{ "26A428", 0x154000, 0x134000, AVE_FW_TEXT_CRC_T6050_26A428, 0x4224 },
 	/*
 	 * macOS 27.3 beta 1 (iBoot 20457.60.65): TEXT is 0x4000 larger, DATA
 	 * keeps its size. It starts as 26A428 does and takes 26A428's command
@@ -221,10 +231,8 @@ static const struct ave_fw_build ave_t6050_builds[] = {
 	{ "26C5035", 0x158000, 0x134000, AVE_FW_TEXT_CRC_T6050_26C5035 },
 };
 
-static const struct ave_variant ave_t6050 = {
+const struct ave_variant ave_t6050 = {
 	.regs = &ave_coproc_v40,
-	.fw_text_size = 0x154000,
-	.fw_data_size = 0x134000,
 	.builds = ave_t6050_builds,
 	.build_count = ARRAY_SIZE(ave_t6050_builds),
 	.boot_device_id = 28,
@@ -234,7 +242,6 @@ static const struct ave_variant ave_t6050 = {
 	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
 	.device_type = 28,
 	.lfs_ref_scale = 2,
-	.text_crc = AVE_FW_TEXT_CRC_T6050_26A428,
 	.mbox_idle = 0x118,
 	.boot_qualified = true,
 };
