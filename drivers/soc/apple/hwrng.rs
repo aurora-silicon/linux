@@ -21,7 +21,12 @@ extern "C" {
     fn sep_hwrng_unregister(mem: *mut c_void);
 }
 
-pub(crate) const QUALITY: c_ushort = 1024;
+/// Bits of entropy credited per 1024 bits read. This is a policy, not a
+/// measurement: a source with no public analysis of its noise and of how its
+/// firmware conditions it does not get full credit by default. 900 is what
+/// most SoC TRNG drivers declare under the same policy (omap, stm32, mtk).
+/// An administrator can change it through hw_random's rng_quality.
+pub(crate) const QUALITY: c_ushort = 900;
 
 pub(crate) const NAME: &CStr = c"apple-sep";
 
