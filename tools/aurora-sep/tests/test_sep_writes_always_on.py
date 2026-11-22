@@ -6,7 +6,8 @@ The driver has no xart_writes or provision_keybag parameter any more, so nothing
 ships one: load-driver runs a plain `modprobe apple_sep`, no modprobe.d file the packages install
 sets either, and the installer refuses --read-only. An install, a re-run and --reset-touchid
 delete the file an earlier --read-only install wrote, and keep any other file at that path, with
-a warning. Nothing here touches the host: the installer's commands are stubbed.
+a warning. An install asks for a yes on the terminal, or takes --yes. Nothing here touches the
+host: the installer's commands are stubbed.
 """
 import os
 import re
@@ -26,6 +27,7 @@ OLD_READ_ONLY_CONF = (
     "options apple_sep xart_writes=0 provision_keybag=0\n")
 WRITE_PARAMS = re.compile(r"\b(xart_writes|provision_keybag)\b")
 KEPT = "is not the file an earlier --read-only install wrote, so it stays as it is"
+NO_TTY = "no terminal to confirm the SEP writes on. Nothing was installed."
 IGNORED = "Kernels from aurora-silicon/linux#2591 on ignore xart_writes and provision_keybag"
 
 
@@ -250,16 +252,59 @@ systemctl() {{ echo "systemctl $*" >>"$CALLS"; }}
 
     def test_the_write_notice_offers_no_read_only_install(self):
         self.conf.write_text(OLD_READ_ONLY_CONF)
-        proc = self.sh("sep_write_notice")
+        proc = self.sh("SEP_WRITES_YES=1\nsep_write_notice")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         err = flat(proc.stderr)
         self.assertIn("the SEP driver creates an identity keybag and writes to the enclave's anti-replay "
                       "store (xART). SEP writes are always on. Use a Mac you can DFU-restore", err)
         self.assertNotIn("read-only", err)
+        self.assertNotIn("Ctrl-C", err)
+        self.assertIn("--yes: going on", proc.stdout)
         # An owner's block: the driver is not loaded, so there is nothing to warn about.
         proc = self.sh("sep_block_line() { echo '/etc/modprobe.d/mine.conf:1:blacklist apple_sep'; }\n"
                        "sep_write_notice")
         self.assertEqual((proc.returncode, proc.stderr), (0, ""))
+
+    def test_the_write_notice_needs_a_yes(self):
+        # No terminal (a session of its own) and no --yes: the install stops before anything changes.
+        proc = self.sh("sep_write_notice\necho AFTER")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(NO_TTY, flat(proc.stderr))
+        self.assertIn("add --yes (bash -s -- --yes)", flat(proc.stderr))
+        self.assertNotIn("AFTER", proc.stdout)
+        self.assertEqual(self.log(), "")
+        # The kit's own --yes is a yes on the command line as well.
+        proc = self.sh("M3MAX_KIT_YES=1\nsep_write_notice\necho AFTER")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("AFTER", proc.stdout)
+
+    def test_yes_is_for_an_install(self):
+        for args, err in ((["--yes", "--uninstall"], "--yes goes with an install"),
+                          (["--uninstall", "--yes"], "--yes goes with an install")):
+            with self.subTest(args=args):
+                proc = subprocess.run(["bash", str(INSTALLER), *args], capture_output=True, text=True,
+                                      env=self.env, start_new_session=True, stdin=subprocess.DEVNULL)
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertIn(err, proc.stderr)
+                self.assertEqual(self.log(), "")
+
+    def test_yes_works_before_or_after_the_command(self):
+        # --yes is that command's own, wherever it is on the line: both orders end the same way,
+        # and neither is refused as an install's --yes.
+        for cmd in ("--reset-touchid", "--m3max-kit"):
+            with self.subTest(cmd=cmd):
+                runs = [subprocess.run(["bash", str(INSTALLER), *args], capture_output=True, text=True,
+                                       env=self.env, start_new_session=True, stdin=subprocess.DEVNULL)
+                        for args in (["--yes", cmd], [cmd, "--yes"])]
+                for proc in runs:
+                    self.assertNotIn("--yes goes with", proc.stderr)
+                self.assertEqual([(p.returncode, p.stdout, p.stderr) for p in runs][0],
+                                 [(p.returncode, p.stdout, p.stderr) for p in runs][1])
+        # The command still sees it: an option it does not know is reported as its own.
+        proc = subprocess.run(["bash", str(INSTALLER), "--yes", "--reset-touchid", "--nope"],
+                              capture_output=True, text=True, env=self.env, start_new_session=True,
+                              stdin=subprocess.DEVNULL)
+        self.assertIn("unknown option --nope for --reset-touchid", proc.stderr)
 
     def test_the_agent_prompt_offers_no_read_only_install(self):
         start = SRC.index("SAFETY, NON-NEGOTIABLE")
