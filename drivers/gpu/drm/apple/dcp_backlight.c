@@ -902,6 +902,7 @@ static int dcp_set_brightness(struct backlight_device *bd)
 		return 0;
 	}
 	dcp->brightness.fading = false;
+	dcp->brightness.off = !brightness;
 	dcp->brightness.level = brightness;
 	dcp->brightness.dac = calculate_dac(dcp, brightness);
 	dcp->brightness.update = true;

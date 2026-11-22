@@ -4636,7 +4636,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.bl_unk = 1;
 #endif
 		req->swap.bl_value = dcp->brightness.dac;
-		req->swap.bl_power = 0x40;
+		req->swap.bl_power = dcp->brightness.off ? 0 : 0x40;
 		dcp_backlight_presented(dcp, dcp->brightness.level);
 #endif
 		dcp->brightness.update = false;
