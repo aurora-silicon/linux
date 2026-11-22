@@ -560,6 +560,21 @@ impl Job::ver {
             return Err(EBUSY);
         }
 
+        // The done pointer is written by the firmware. One inside the slots this job is about to
+        // fill does not match our own count of pending commands: refuse the job rather than
+        // overwrite entries the firmware may still read.
+        let doneptr = inner.doneptr();
+        if ring_reaches_done(wptr, command_count, inner.size, doneptr) {
+            pr_err!(
+                "WorkQueue: firmware done pointer {} inside the {} slots after {} (ring size {})\n",
+                doneptr,
+                command_count,
+                wptr,
+                inner.size
+            );
+            return Err(EIO);
+        }
+
         inner.pending.reserve(command_count, GFP_KERNEL)?;
 
         inner.last_submitted = Some(self.event_info.value);
@@ -578,7 +593,6 @@ impl Job::ver {
             command.as_mut().inner_mut().set_wptr(wptr);
 
             let next_wptr = (wptr + 1) % inner.size;
-            assert!(inner.doneptr() != next_wptr);
             inner.info_mut().ring[wptr as usize] = command.inner.gpu_va().get();
             wptr = next_wptr;
 
@@ -1190,9 +1204,35 @@ impl WorkQueue for WorkQueue::ver {
     }
 }
 
+/// Returns whether writing `count` ring entries from `wptr` would move the write pointer onto
+/// `doneptr`, the firmware's done pointer, in a ring of `size` entries.
+fn ring_reaches_done(wptr: u32, count: usize, size: u32, doneptr: u32) -> bool {
+    let mut wptr = wptr;
+    for _ in 0..count {
+        wptr = (wptr + 1) % size;
+        if wptr == doneptr {
+            return true;
+        }
+    }
+    false
+}
+
 #[kunit_tests(asahi_legacy_inline_workqueue)]
 mod tests {
-    use super::can_submit_inline;
+    use super::{can_submit_inline, ring_reaches_done};
+
+    #[test]
+    fn done_pointer_inside_the_new_entries_is_refused() {
+        // Firmware caught up: done == wptr, the next entries are free.
+        assert!(!ring_reaches_done(5, 3, 8, 5));
+        // Done pointer in the slots the job would fill, including after the wrap.
+        assert!(ring_reaches_done(5, 3, 8, 6));
+        assert!(ring_reaches_done(5, 3, 8, 0));
+        assert!(!ring_reaches_done(5, 3, 8, 1));
+        // A done pointer outside the ring never matches.
+        assert!(!ring_reaches_done(5, 3, 8, 8));
+        assert!(!ring_reaches_done(5, 3, 8, u32::MAX));
+    }
 
     #[test]
     fn depth_192_stops_at_the_first_inflight_command() {
