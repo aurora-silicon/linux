@@ -360,6 +360,10 @@ def check(root, output):
     }
     '''
     af=(root/'drivers/gpu/drm/apple/afk.c').read_text()
+    if 'afkep->owns_bfr' in af:
+        queued = '#define HAS_OWNED_AFK_BUFFER 1\n' + queued
+        queued = queued.replace('void *debugfs_entry;', 'void *debugfs_entry; bool owns_bfr; '
+                                'size_t bfr_size; void *bfr; dma_addr_t bfr_dma;', 1)
     if 'atomic_inc(&ep->sleep_jobs);' in af:
         # The receive jobs a firmware sleep waits for; nothing here waits.
         anchor='struct apple_dcp_afkep { u8 *command_tags;int started,stopped;'
@@ -424,10 +428,20 @@ def check(root, output):
             empty->endpoint=replacement->endpoint=0x20;
             d.v27_sleep_transport=true;
             d.sleep_v27_ep[0]=replacement;
+            unsigned expected_frees = dma_frees;
+#ifdef HAS_OWNED_AFK_BUFFER
+            empty->owns_bfr = true;
+            empty->bfr_size = 32;
+            empty->bfr = dma_alloc_coherent(d.dev, empty->bfr_size, &empty->bfr_dma, GFP_KERNEL);
+            assert(empty->bfr);
+            expected_frees++;
+#endif
             afk_release_context(empty);
+            assert(dma_frees == expected_frees);
             assert(d.sleep_v27_ep[0]==replacement && "retired endpoint cannot clear its replacement");
             afk_release_context(replacement);
             assert(!d.sleep_v27_ep[0] && "owned endpoint clears its own route");
+            assert(dma_frees == expected_frees);
             cleanup();
         }
         assert(!drain_warnings);

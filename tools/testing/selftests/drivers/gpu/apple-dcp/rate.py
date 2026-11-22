@@ -56,11 +56,16 @@ def parser_fixture(root):
     header = header[header.index('struct apple_dcp;'):header.index('int parse(')]
     refresh = (base / 'dcp-refresh.h').read_text().replace('#include <linux/types.h>', '')
     header = refresh + '\n' + header
-    # parse_dptx_caps() fills the firmware-27 DPTX capabilities parser.c
-    # takes from dcp-peer-v27.h.
-    peer_v27 = base / 'dcp-peer-v27.h'
-    if peer_v27.exists():
-        header += block(peer_v27.read_text(), 'struct dcp_dptx_caps {') + ';\n'
+    caps = base / 'dptx-caps.h'
+    if not caps.exists():
+        caps = base / 'dcp-peer-v27.h'
+    if caps.exists():
+        header += block(caps.read_text(), 'struct dcp_dptx_caps {') + ';\n'
+    if 'dcp_t602x_wire_clock(' in parser:
+        wire_header = (base / 'dcp-peer-v13_5.h').read_text()
+        header += ''.join(d + '\n' for d in source_defines(wire_header)
+                          if d.split()[1] in ('T602X_TIMING_SIZE', 'T602X_CLOCK_OFFSET'))
+        header += block(wire_header, 'static inline u32 dcp_t602x_wire_clock(') + '\n'
     # Header helpers stay header-like: unused here, as in any includer.
     header = header.replace('static inline ', 'static inline __attribute__((unused)) ')
     edid_header = (root / 'include/drm/drm_edid.h').read_text()
@@ -245,6 +250,11 @@ static __attribute__((unused)) unsigned long int_sqrt(unsigned long x)
 #define cpu_to_le16(v) (v)
 #define cpu_to_le32(v) (v)
 #define cpu_to_be16(v) __builtin_bswap16(v)
+static inline __attribute__((unused)) u32 get_unaligned_le32(const void *p)
+{
+    const u8 *b = p;
+    return b[0] | (u32)b[1] << 8 | (u32)b[2] << 16 | (u32)b[3] << 24;
+}
 struct drm_display_mode {
     unsigned int type, flags;
     int clock, vdisplay, vsync_start, vsync_end, vtotal;
@@ -597,7 +607,7 @@ struct apple_dcp {
     struct dptx_port dptxport[1];
     struct apple_connector *connector;
     void *dev, *phy, *active_typec_route;
-    bool dptx_tunnel, usb4, typec_cable_connected, quiescing, hpd_mutex;
+    bool dptx_tunnel, usb4, typec_cable_connected, quiescing, hpd_mutex, t602x_pair_offered;
     u64 typec_generation; unsigned int nr_modes;
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
@@ -803,6 +813,8 @@ struct apple_connector {''')
 #define xchg(p,v) __extension__ ({ __typeof__(*(p)) old=*(p); *(p)=(v); old; })
 #define DRM_MODE_MATCH_TIMINGS 1
 #define DRM_MODE_MATCH_CLOCK 2
+#define DRM_MODE_MATCH_FLAGS 4
+#define DRM_MODE_MATCH_3D_FLAGS 8
 #define DCP_FIRMWARE_H17P 2
 #define DPAVSERV_ENDPOINT_V2 0x2a
 #define DRM_CONNECTOR_eDP 14
@@ -884,6 +896,10 @@ static void dcp_firmware_metadata_begin(struct apple_dcp *d) {
 }
 static void dcp_firmware_metadata_timing(struct apple_dcp *d) { (void)d; }
 static void dcp_firmware_metadata_attributes(struct apple_dcp *d,const struct dcp_display_metadata *m) { (void)d; (void)m; }
+/* This catalogue fixture exercises an ordinary single-engine output. */
+static bool __attribute__((unused)) dcp_t602x_ext13_5(struct apple_dcp *d) { (void)d;return false; }
+static bool __attribute__((unused)) t602x_pair_element(struct apple_dcp *d,const struct dcp_display_mode *m)
+{ (void)d;(void)m;assert(!"unexpected paired lookup");return false; }
 /* Deferred to dimensions_wq since the catalogue ownership change. */
 static void __attribute__((unused)) dcp_set_dimensions(struct apple_dcp *d) { (void)d; }
 struct dcp_set_dcpav_prop_end_req { char key[64]; };
@@ -941,7 +957,8 @@ static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,
                     + mode_helpers)
     # The desktop 26.6 VRR filter is gone once that firmware takes adaptive sync.
     vrr_filter = block(iomfb,'static bool dcp_mode_vrr_supported(')+'\n' if 'static bool dcp_mode_vrr_supported(' in iomfb else ''
-    publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+vrr_filter+block(iomfb,'int dcp_get_modes(')+block(iomfb,'bool lookup_mode(')
+    publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+vrr_filter+block(iomfb,'int dcp_get_modes(')
+    publication += apple_function(root, 'lookup_mode_matching') + block(iomfb, 'bool lookup_mode(')
     if 'dcp_edid_sdr(' in publication:
         # Keep extracting the real publication path, including its SDR helper.
         # Model only kernel allocation/DRM ownership at the host boundary.

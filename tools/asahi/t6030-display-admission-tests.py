@@ -29,8 +29,12 @@ def main():
     init = extract.function(drv, 'static int apple_drm_init(')
     uninit = extract.function(drv, 'static void apple_drm_uninit(')
     assert init.index('ret = drm_dev_register(') < init.index('drm_client_setup_with_fourcc(') < init.index('ret = apple_g15_display_publish(')
-    assert uninit.index('apple_g15_display_withdraw(') < uninit.index('apple_drm_quiesce_connectors(') < uninit.index('drm_dev_unplug(')
-    assert 'drm_dev_unregister(&apple->drm);\n\t\tgoto err_unbind;' in init
+    unplug = extract.function(drv, 'static void apple_drm_unplug_atomic(')
+    assert unplug.index('drm_dev_unplug(') < unplug.index('flush_workqueue(')
+    assert uninit.index('apple_g15_display_withdraw(') < uninit.index('apple_drm_quiesce_connectors(') < uninit.index('apple_drm_unplug_atomic(')
+    after_publish = init[init.index('ret = apple_g15_display_publish('):]
+    publish_error = extract.function(after_publish, 'if (ret) {')
+    assert publish_error.index('apple_drm_unplug_atomic(apple)') < publish_error.index('goto err_unbind;')
     code = '\n'.join([extract.function(drv, 'static struct device **apple_g15_display_slot('),
                       extract.function(drv, 'static int apple_g15_display_publish('),
                       extract.function(drv, 'static void apple_g15_display_withdraw('),

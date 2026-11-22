@@ -14,7 +14,6 @@ def identity(root, output):
 typedef int32_t s32;
 #define ALIGN(x,n) (((x)+(n)-1)&~((n)-1))
 #define SZ_16M (16U<<20)
-static u32 get_unaligned_le32(const void *p) {u32 n;memcpy(&n,p,4);return n;}
 '''
     unit += block((base / 'dcp-panel-adt.h').read_text(), 'struct dcp_panel_adt {') + ';\n'
     unit += '\n'.join(line for line in (base / 'dcp-panel-adt.c').read_text().splitlines()
