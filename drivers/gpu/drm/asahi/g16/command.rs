@@ -111,16 +111,15 @@ impl Order {
         })
     }
 
-    /// A same-engine command cannot jump a hole in its queue's completed frontier.
-    /// Cross-engine historical dependencies end at the named prefix, even while later
-    /// commands in that older submission remain pending.
+    /// A same-engine command cannot jump a hole in its queue's published frontier.
+    /// Cross-engine dependencies may also follow published predecessors via hardware
+    /// ring barriers (FS -> CDM and CDM -> TA) while same-VM work pipelines; cross-VM
+    /// switches, InitBM and timestamp query accesses still drain to completion.
     pub(crate) fn ready(&self, completed: [u64; 2], published: [u64; 2]) -> bool {
-        // Same-engine order and barriers are kept by the firmware engine rings (in-order
-        // CDM execution for compute, explicit TA/FS barriers for pipelined renders): the
-        // same-engine published frontier suffices. Every cross-engine dependency still waits
-        // for the other engine's completed frontier.
-        let mut frontier = completed;
-        frontier[self.engine] = published[self.engine].max(completed[self.engine]);
+        let frontier = [
+            published[RENDER].max(completed[RENDER]),
+            published[COMPUTE].max(completed[COMPUTE]),
+        ];
         frontier[self.engine].checked_add(1) == Some(self.sequence)
             && self
                 .wait_through

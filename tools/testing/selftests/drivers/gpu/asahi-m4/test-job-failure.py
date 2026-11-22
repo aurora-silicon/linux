@@ -43,7 +43,7 @@ impl Error { fn from_errno(error: i32)->Self { Self(error) } }
 type Result<T=()> = core::result::Result<T,Error>;
 const EIO:Error=Error(-5); const ENODEV:Error=Error(-19); const ECANCELED:Error=Error(-125);
 const ETIMEDOUT:Error=Error(-110);const ENOMEM:Error=Error(-12);const EAGAIN:Error=Error(-11); const EINVAL:Error=Error(-22);
-const EOVERFLOW:Error=Error(-75); const NONE:u16=u16::MAX; const COMPUTE:usize=1;
+const EOVERFLOW:Error=Error(-75); const NONE:u16=u16::MAX; const RENDER:usize=0; const COMPUTE:usize=1;
 ORDER_SOURCE
 pub mod task { pub const MAX_SCHEDULE_TIMEOUT:i64=i64::MAX; }
 struct InputState { status:AtomicI32,waits:AtomicUsize,interrupted:AtomicI64,gate:Mutex<()>,changed:Condvar }
@@ -98,7 +98,7 @@ impl Fence {
 mod command { pub(crate) use super::Order; }
 struct QueueState { completed:[AtomicU64;2],published:[AtomicU64;2],cancelled_at:[AtomicU64;2] }
 impl QueueState { QUEUE_METHODS }
-struct Job { id:u64,vm:Vm,_guard:Guard,progress:Progress,started:AtomicBool,accepted:AtomicBool,fence:Fence,commands:Vec<()>,inputs:Vec<InputFence>,orders:Vec<Order>,queue:Arc<QueueState>,full_retired:AtomicU32,terminal_retired:AtomicBool }
+struct Job { id:u64,vm:Vm,_guard:Guard,progress:Progress,started:AtomicBool,accepted:AtomicBool,fence:Fence,commands:Vec<()>,inputs:Vec<InputFence>,orders:Vec<Order>,queue:Arc<QueueState>,full_retired:AtomicU64,terminal_retired:AtomicBool }
 struct Shared { crashed:AtomicBool,sleeping:AtomicBool,contended:AtomicBool,submitted:Mutex<Vec<u64>>,submit_result:Result }
 impl Shared {
     fn new()->Arc<Self> {
@@ -126,7 +126,7 @@ fn job_with_orders(id:u64,status:Arc<Status>,inputs:Vec<InputFence>,orders:Vec<O
     Arc::new(Job{id,vm:Vm{status:status.clone()},_guard:Guard(AtomicBool::new(false)),
         progress:Progress{signaled:AtomicBool::new(false),sent:AtomicU32::new(0),next:AtomicU32::new(0),pending:AtomicBool::new(false)},started:AtomicBool::new(false),accepted:AtomicBool::new(true),
         fence:Fence{vm:status,signals:Mutex::new(vec![])},commands:vec![();orders.len()],inputs,orders,queue,
-        full_retired:AtomicU32::new(0),terminal_retired:AtomicBool::new(false)})
+        full_retired:AtomicU64::new(0),terminal_retired:AtomicBool::new(false)})
 }
 #[test]
 fn a_failed_vm_is_rejected_without_an_input_error() {
@@ -383,17 +383,21 @@ fn never_published_capacity_failure_closes_only_its_queue() {
     assert_eq!(*shared.submitted.lock().unwrap(),vec![2]);assert_eq!(status.get(),0);
 }
 #[test]
-fn full_receipts_are_consecutive_bounded_and_once() {
+fn full_receipts_are_unique_bounded_and_allow_cross_engine_order() {
     let queued=job(1,Arc::new(Status::new()));
     assert_eq!(queued.note_full_retirement(0,1),Err(EINVAL));
     queued.progress.sent.store(2,Ordering::Release);
     assert_eq!(queued.note_full_retirement(0,0),Err(EINVAL));
+    // Command 1 may retire before command 0 when compute and render run concurrently.
+    queued.note_full_retirement(1,1).unwrap();
     assert_eq!(queued.note_full_retirement(1,1),Err(EIO));
+    assert_eq!(queued.mark_terminal_retired(),Err(EIO));
     queued.note_full_retirement(0,1).unwrap();
     assert_eq!(queued.note_full_retirement(0,1),Err(EIO));
     assert_eq!(queued.note_full_retirement(1,2),Err(EINVAL));
     assert_eq!(queued.note_full_retirement(u32::MAX,1),Err(EOVERFLOW));
-    queued.note_full_retirement(1,1).unwrap();
+    queued.progress.next.store(2,Ordering::Release);
+    queued.mark_terminal_retired().unwrap();
 }
 #[test]
 fn inline_start_submits_once_and_falls_back_on_pending_input_or_contention() {

@@ -397,6 +397,31 @@ fn fs_event_without_settled_receipt_still_polls_tail_and_sets_short_repoll() {
     assert!(!retry_tail);
     assert!(fw.engine.short_repoll);
 }
+
+#[test]
+fn concurrent_compute_completion_behind_pending_render_wakes_submit_retire() {
+    CLOCK.with(|c| c.set(100_000));
+    let mut fw = Firmware::new();
+    fw.engine.flights.push(Flight {
+        computes: 0,
+        renders: 1,
+        target: 0,
+        fs_target: 0x200,
+    });
+    fw.engine.flights.push(Flight {
+        computes: 1,
+        renders: 0,
+        target: 0x100,
+        fs_target: 0,
+    });
+    fw.engine.fs_target = 0x200;
+    fw.engine.target = 0x100;
+    // Render still running, compute reached its stamp.
+    fw.graph.render.fw_stamp[1].0.set(0x100);
+    fw.graph.compute.fw_stamp.0.set(0x100);
+    assert!(fw.oldest_stamp_reached());
+    assert_eq!(fw.oldest_terminal_events(), Some((Some(0), Some(0))));
+}
 '''
 
 for token, decl in {

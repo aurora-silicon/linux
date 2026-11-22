@@ -29,7 +29,7 @@
 //! [`mmu::VmJobGuard`] keeps the VM's mappings and its VM state keeps the VM's TTBAT slot until
 //! the last `Arc<Job>` drops.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
     c_str,
     cpu::CpuId,
@@ -107,8 +107,10 @@ pub(crate) struct Job {
     pub(crate) progress: super::engine::Progress,
     /// Inputs and resolved historical-prefix dependencies, held through every command.
     inputs: KVec<Fence>,
-    /// Consecutive commands with full owner-retirement proof; an aborted receipt never counts.
-    full_retired: AtomicU32,
+    /// Bitmask of commands (`0..MAX_COMMANDS`) with full owner-retirement proof; an aborted
+    /// receipt never sets its bit. Tracks per-command bits so concurrent compute/render
+    /// commands within one job may retire in either hardware completion order.
+    full_retired: AtomicU64,
     /// No future publication and every previously published owner fully retired. This proof
     /// is separate from an error result: an affected full receipt may still fail the job.
     terminal_retired: AtomicBool,
@@ -159,7 +161,7 @@ impl Job {
                 fence,
                 progress,
                 inputs,
-                full_retired: AtomicU32::new(0),
+                full_retired: AtomicU64::new(0),
                 terminal_retired: AtomicBool::new(false),
                 // Scheduler free can race the final off-lock completion reference.
                 // Prepare destruction work before acceptance; dropping a completed job
@@ -370,17 +372,33 @@ impl Job {
         Ok(())
     }
 
-    /// Records a consecutive full owner receipt independently of success/error attribution.
+    /// Records a unique full owner receipt independently of success/error attribution.
     /// Only the receipt owner may call this after successful resource-ledger retirement.
     pub(crate) fn note_full_retirement(&self, first: u32, count: u32) -> Result {
         let end = first.checked_add(count).ok_or(EOVERFLOW)?;
-        if count == 0 || end > self.progress.sent() {
+        if count == 0 || end > self.progress.sent() || end > 64 {
             return Err(EINVAL);
         }
-        self.full_retired
-            .compare_exchange(first, end, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| EIO)?;
-        Ok(())
+        let bits = if count == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << count) - 1) << first
+        };
+        let mut current = self.full_retired.load(Ordering::Acquire);
+        loop {
+            if current & bits != 0 {
+                return Err(EIO);
+            }
+            match self.full_retired.compare_exchange_weak(
+                current,
+                current | bits,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Certifies a terminal job before publishing its error. The caller first removes it
@@ -389,9 +407,14 @@ impl Job {
     /// A never-published job has the same proof with all three counters equal to zero.
     pub(crate) fn mark_terminal_retired(&self) -> Result {
         let sent = self.progress.sent();
+        let expected = if sent >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << sent) - 1
+        };
         if self.progress.is_pending()
             || self.progress.next() != sent
-            || self.full_retired.load(Ordering::Acquire) != sent
+            || self.full_retired.load(Ordering::Acquire) != expected
         {
             return Err(EIO);
         }

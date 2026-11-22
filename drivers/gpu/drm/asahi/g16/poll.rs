@@ -513,59 +513,85 @@ impl Firmware {
         Ok(())
     }
 
-    /// Terminal completion-event counter for the oldest in-flight command (`fs_events` for a
-    /// render-only flight, `compute_events` for a compute-only flight).
-    fn oldest_terminal_events(&self) -> Option<u32> {
-        let f = self.engine.oldest()?;
-        if f.renders != 0 && f.computes == 0 {
-            Some(self.events.fs_events)
-        } else if f.computes != 0 && f.renders == 0 {
-            Some(self.events.compute_events)
-        } else {
-            None
+    /// Terminal completion-event counters for the oldest active flight of each class
+    /// (`(compute_events, fs_events)`), used to distinguish TA-only (0x70) non-terminal events.
+    fn oldest_terminal_events(&self) -> Option<(Option<u32>, Option<u32>)> {
+        if self.engine.flights.is_empty()
+            || self
+                .engine
+                .flights
+                .iter()
+                .any(|f| f.computes != 0 && f.renders != 0)
+        {
+            return None;
         }
+        let compute = self
+            .engine
+            .flights
+            .iter()
+            .any(|f| f.computes != 0)
+            .then_some(self.events.compute_events);
+        let render = self
+            .engine
+            .flights
+            .iter()
+            .any(|f| f.renders != 0)
+            .then_some(self.events.fs_events);
+        Some((compute, render))
     }
 
-    /// Cheap single-stage stamp check for the oldest flight's terminal stage so `submit_locked()`
-    /// can eagerly retire finished work without scanning all rings when nothing has completed.
+    /// Cheap single-stage stamp check for the oldest compute and oldest render flights' terminal
+    /// stages so `submit_locked()` can eagerly retire finished work without scanning all rings
+    /// when nothing has completed.
     fn oldest_stamp_reached(&self) -> bool {
-        let Some(f) = self.engine.oldest() else {
+        if self.engine.flights.is_empty() {
             return false;
-        };
+        }
         rmb();
-        let behind = self.engine.flights.len() > 1;
-        let compute_ok = if f.computes != 0 {
-            let Ok(obs) = self.graph.compute.fw_stamp.r32(0) else {
-                return false;
-            };
-            if behind {
-                stamp_reached(obs, f.target, self.engine.target)
-            } else {
-                obs == f.target
+        let compute_behind = self
+            .engine
+            .flights
+            .iter()
+            .filter(|f| f.computes != 0)
+            .count()
+            > 1;
+        if let Some(f) = self.engine.flights.iter().find(|f| f.computes != 0) {
+            if let Ok(obs) = self.graph.compute.fw_stamp.r32(0) {
+                let reached = if compute_behind {
+                    stamp_reached(obs, f.target, self.engine.target)
+                } else {
+                    obs == f.target
+                };
+                if reached {
+                    return true;
+                }
             }
-        } else {
-            true
-        };
-        if !compute_ok {
-            return false;
         }
-        if f.renders != 0 {
-            let Ok(obs) = self.graph.render.fw_stamp[1].r32(0) else {
-                return false;
-            };
-            if behind {
-                stamp_reached(obs, f.fs_target, self.engine.fs_target)
-            } else {
-                obs == f.fs_target
+        let render_behind = self
+            .engine
+            .flights
+            .iter()
+            .filter(|f| f.renders != 0)
+            .count()
+            > 1;
+        if let Some(f) = self.engine.flights.iter().find(|f| f.renders != 0) {
+            if let Ok(obs) = self.graph.render.fw_stamp[1].r32(0) {
+                let reached = if render_behind {
+                    stamp_reached(obs, f.fs_target, self.engine.fs_target)
+                } else {
+                    obs == f.fs_target
+                };
+                if reached {
+                    return true;
+                }
             }
-        } else {
-            true
         }
+        false
     }
 
-    /// Drains the event/stats rings and retires all currently complete flights without sleeping.
-    /// Returns whether at least one flight retired. A receipt fault is left in
-    /// `Recovery::receipt_fault` for the hang checks.
+    /// Drains the event/stats rings and retires all currently complete oldest compute and render
+    /// flights independently without sleeping. Returns whether at least one flight retired. A
+    /// receipt fault is left in `Recovery::receipt_fault` for the hang checks.
     pub(crate) fn retire_once(&mut self, done: &mut Completions) -> Result<bool> {
         let mut lap = Lap::start();
         self.drain_events_and_stats()?;
@@ -575,15 +601,12 @@ impl Firmware {
             self.check_hangs(done)?;
         }
         let mut retired_any = false;
-        let mut ret = self.retired();
-        while let Ok(receipt) = ret {
-            if !receipt.complete() {
-                break;
-            }
-            let outcome = self.retire_outcome(receipt);
-            self.retire_oldest(receipt, outcome, done);
+        let mut ret = self.retired_flight();
+        while let Ok(Some((index, receipt))) = ret {
+            let outcome = self.retire_outcome_at(index, receipt);
+            self.retire_oldest(index, receipt, outcome, done);
             retired_any = true;
-            ret = self.retired();
+            ret = self.retired_flight();
         }
         self.recovery.receipt_fault = ret.is_err();
         Ok(retired_any)
@@ -702,25 +725,60 @@ impl Firmware {
     /// receipt omits only the writes firmware does not make for an aborted command,
     /// after the recovery grace period and its queue/pipe/stage passed proof.
     pub(crate) fn retired(&mut self) -> Result<Retirement> {
-        match self.retired_snapshot() {
+        self.retired_at(0)
+    }
+
+    fn retired_at(&mut self, index: usize) -> Result<Retirement> {
+        match self.retired_snapshot_at(index) {
             // A changing packed receipt is not an authenticated firmware failure.
             Err(error) if error == EAGAIN => Ok(Retirement::Pending),
             result => result,
         }
     }
 
+    /// Inspects the oldest compute flight and oldest render flight independently so either
+    /// class can retire as soon as its hardware receipt settles without waiting on the other.
+    pub(crate) fn retired_flight(&mut self) -> Result<Option<(usize, Retirement)>> {
+        let compute_idx = self.engine.flights.iter().position(|f| f.computes != 0);
+        let render_idx = self.engine.flights.iter().position(|f| f.renders != 0);
+        for index in [compute_idx, render_idx].into_iter().flatten() {
+            let receipt = self.retired_at(index)?;
+            if receipt.complete() {
+                return Ok(Some((index, receipt)));
+            }
+        }
+        Ok(None)
+    }
+
     fn retired_snapshot(&mut self) -> Result<Retirement> {
-        let Some(f) = self.engine.oldest() else {
+        self.retired_snapshot_at(0)
+    }
+
+    fn retired_snapshot_at(&mut self, index: usize) -> Result<Retirement> {
+        let Some(f) = self.engine.flights.get(index) else {
             return Ok(Retirement::Pending);
         };
         rmb();
         let mut full = true;
         let mut ticks = [0u64; 4];
-        // Later compute flights queued behind this one: the queue, pipe and stamp cells
-        // already moved on, so their receipt is "passed", in order; the newest flight keeps
-        // the exact receipt.
-        let behind = self.engine.flights.len() > 1;
-        if f.computes != 0 && behind {
+        // Later flights of the same engine class queued behind this one: that class's queue,
+        // pipe and stamp cells already moved on, so its receipt is "passed", in order; the
+        // newest flight of a class keeps the exact receipt.
+        let compute_behind = self
+            .engine
+            .flights
+            .iter()
+            .filter(|f| f.computes != 0)
+            .count()
+            > 1;
+        let render_behind = self
+            .engine
+            .flights
+            .iter()
+            .filter(|f| f.renders != 0)
+            .count()
+            > 1;
+        if f.computes != 0 && compute_behind {
             let g = &self.graph.compute;
             let e = &self.engine;
             if !stamp_reached(g.fw_stamp.r32(0)?, f.target, e.target)
@@ -762,7 +820,7 @@ impl Firmware {
                 && start != 0
                 && end > start;
         }
-        if f.renders != 0 && behind {
+        if f.renders != 0 && render_behind {
             let g = &self.graph.render;
             let e = &self.engine;
             if !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target)
@@ -851,7 +909,7 @@ impl Firmware {
         if f.recovery_suspect && now_ns().saturating_sub(f.recovery_started_ns) >= 20_000_000 {
             // Queues, pipes and every participating stage passed the retained command.
             // The firmware recovered it without normal completion: fail and quarantine.
-            if let Some(f) = self.engine.flights.first_mut() {
+            if let Some(f) = self.engine.flights.get_mut(index) {
                 f.doomed = true;
             }
             return Ok(Retirement::Aborted);
@@ -885,19 +943,20 @@ impl Firmware {
         }
     }
 
-    /// Retire the oldest prefix's scheduling ownership. Only a full normal receipt retires
-    /// its storage; a passed abort quarantines it. Job failure independently drops remaining
-    /// unpublished commands even when the storage fully retired.
+    /// Retire the flight at `index` (the oldest of its engine class). Only a full normal receipt
+    /// retires its storage; a passed abort quarantines it. Job failure independently drops
+    /// remaining unpublished commands even when the storage fully retired.
     pub(crate) fn retire_oldest(
         &mut self,
+        index: usize,
         receipt: Retirement,
         result: Result,
         done: &mut Completions,
     ) {
-        if self.engine.flights.is_empty() {
+        if index >= self.engine.flights.len() {
             return;
         }
-        let Ok(mut f) = self.engine.flights.remove(0) else {
+        let Ok(mut f) = self.engine.flights.remove(index) else {
             return;
         };
         let timestamp_claims = f.claims;
@@ -992,8 +1051,13 @@ impl Firmware {
             self.engine.stats.idle_from_ns = now_ns();
             self.power.utilization.idle(self.engine.stats.idle_from_ns);
         }
-        // The next prefix starts executing about now.
-        self.renew_deadlines();
+        // The next prefix on the retired flight's class(es) starts executing about now.
+        if f.renders != 0 {
+            self.renew_render_deadline();
+        }
+        if f.computes != 0 {
+            self.renew_compute_deadline();
+        }
         let job = f.job.clone();
         let p = &job.progress;
         p.next.store(p.next() + f.count as u32, Ordering::Relaxed);
@@ -1058,31 +1122,42 @@ impl Firmware {
         }
     }
 
-    /// Progress of the oldest prefix: a FW stamp of an engine on which it still has unreached
-    /// work moved since the last poll (later prefixes' work on other engines does not count).
-    /// Renews the deadline; the first call for a prefix only records its position.
+    /// Progress of the oldest compute and oldest render flights: a FW stamp of an engine on
+    /// which its oldest flight still has unreached work moved since the last poll. Renews the
+    /// deadline; the first call for a flight pair only records its position.
     /// [`Self::check_hangs`] calls it while no firmware recovery notification is pending.
     pub(crate) fn progress(&mut self) {
-        let Some(f) = self.engine.oldest() else {
+        if self.engine.flights.is_empty() {
             return;
-        };
+        }
         let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
         // None denotes an inactive/reached stage. A real unreached stamp may be zero
         // immediately after native wrap and must remain distinguishable from completion.
         let pending =
             |observed, own, tail| (!stamp_reached(observed, own, tail)).then_some(observed);
         let (mut c, mut ta, mut fs) = (None, None, None);
-        if f.computes != 0 {
-            c = pending(g.fw_stamp.r32(0).unwrap_or(0), f.target, e.target);
+        let mut published = [0u64; 2];
+        let fc = e.flights.iter().find(|f| f.computes != 0);
+        if let Some(fc) = fc {
+            c = pending(g.fw_stamp.r32(0).unwrap_or(0), fc.target, e.target);
+            published[0] = fc.published_ns;
         }
-        if f.renders != 0 {
-            ta = pending(r.fw_stamp[0].r32(0).unwrap_or(0), f.ta_target, e.ta_target);
-            fs = pending(r.fw_stamp[1].r32(0).unwrap_or(0), f.fs_target, e.fs_target);
+        let fr = e.flights.iter().find(|f| f.renders != 0);
+        if let Some(fr) = fr {
+            ta = pending(r.fw_stamp[0].r32(0).unwrap_or(0), fr.ta_target, e.ta_target);
+            fs = pending(r.fw_stamp[1].r32(0).unwrap_or(0), fr.fs_target, e.fs_target);
+            published[1] = fr.published_ns;
         }
-        let moved = e.progress_flight == f.published_ns && [c, ta, fs] != e.progress;
-        let published = f.published_ns;
-        if moved {
-            self.renew_deadlines();
+        let compute_moved =
+            fc.is_some() && e.progress_flight[0] == published[0] && c != e.progress[0];
+        let render_moved = fr.is_some()
+            && e.progress_flight[1] == published[1]
+            && [ta, fs] != [e.progress[1], e.progress[2]];
+        if compute_moved {
+            self.renew_compute_deadline();
+        }
+        if render_moved {
+            self.renew_render_deadline();
         }
         self.engine.progress_flight = published;
         self.engine.progress = [c, ta, fs];

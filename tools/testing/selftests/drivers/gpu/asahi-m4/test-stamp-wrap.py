@@ -63,7 +63,10 @@ impl Firmware{
     // The ITS-pair ticks (25G83, and the first choice on 26B123): the receipt tests set them.
     fn compute_ticks(&self,unit:&CUnit)->Result<(u64,u64)>{Ok((unit.its.r64(0)?,unit.its.r64(8)?))}
     __RETIRED__
+    __RETIRED_AT__
+    __RETIRED_FLIGHT__
     __RETIRED_SNAPSHOT__
+    __RETIRED_SNAPSHOT_AT__
 }
 fn firmware(render:bool,ordinal:u64)->Firmware{
     let target=encode::stamp(ordinal);
@@ -178,8 +181,38 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     assert_eq!(r.engine.retired_ticks,[100,101,102,103]);
 }
 
+#[test]fn concurrent_compute_and_render_retire_independently_by_class(){
+    // Render at index 0 (pending) + Compute at index 1 (complete): compute retires ahead of render.
+    let mut f=firmware(true,10);
+    let c=firmware(false,20).engine.flights.remove(0);
+    f.engine.flights.push(c);
+    f.engine.target=encode::stamp(20);
+    f.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(20)));
+    f.graph.compute.notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(20)));
+    f.graph.compute.notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+    // Keep render FS stamp unreached so render at index 0 stays pending.
+    f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(9)));
+    assert_eq!(f.retired_flight(),Ok(Some((1,Retirement::Full))));
+    f.engine.flights.remove(1);
+    assert_eq!(f.retired_flight(),Ok(None));
+    // Now finish render: render retires cleanly with exact single-class receipt.
+    f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(10)));
+    assert_eq!(f.retired_flight(),Ok(Some((0,Retirement::Full))));
+    // Reverse order: Compute at index 0 (pending) + Render at index 1 (complete).
+    let mut f2=firmware(false,30);
+    let r=firmware(true,40).engine.flights.remove(0);
+    f2.engine.flights.push(r);
+    f2.engine.ta_target=encode::stamp(40);
+    f2.engine.fs_target=encode::stamp(40);
+    for stage in 0..2 { f2.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(40))); }
+    f2.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(40)));
+    f2.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(40)));
+    f2.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(29)));
+    assert_eq!(f2.retired_flight(),Ok(Some((1,Retirement::Full))));
+}
+
 '''.replace('__LOGIC__', str(backend/'recovery/logic.rs'))
-for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot')]:
+for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at')]:
     harness=harness.replace(token,function((backend/path).read_text(),name))
 unit=out/'stamp-wrap.rs';unit.write_text(harness)
 log=''
