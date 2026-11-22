@@ -235,6 +235,14 @@
 		status = "disabled";
 	};
 
+	pmp_report: pmp-report@3803c0000 {
+		compatible = "apple,t8142-pmp-v2-report";
+		reg = <0x3 0x803c0000 0x0 0x20000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
 	mtp_dart: iommu@394800000 {
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x3 0x94800000 0x0 0xc000>,
