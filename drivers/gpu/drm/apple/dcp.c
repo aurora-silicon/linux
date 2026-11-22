@@ -306,7 +306,7 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
  * apple,retention-workaround entries (power manager offset, mask, value while off), in the
  * node's "pwrgate" block, and the value each reads now, with the DCP running, is the one it
  * gets back at power-on. It counts in pmc-dcp where the node has that word. The DART streams
- * are the ones its DARTs have enabled at the first stop, see dcp_s2r_find_darts().
+ * are the ones its DARTs have enabled at probe, see dcp_s2r_layout_streams().
  */
 static int dcp_s2r_layout_from_dt(struct apple_dcp *dcp)
 {
@@ -338,7 +338,8 @@ static int dcp_s2r_layout_from_dt(struct apple_dcp *dcp)
 
 		of_node_put(parent);
 		if (parent != pmgr || of_property_read_u32(ps[i], "reg", &off[i]) ||
-		    off[i] > resource_size(&ps_res) - 4)
+		    resource_size(&ps_res) < 4 || off[i] > resource_size(&ps_res) - 4 ||
+		    off[i] % 4)
 			goto out;
 	}
 	if (of_property_read_u32_array(ps[0], "apple,retention-workaround", ret, 6) ||
@@ -388,7 +389,8 @@ static struct device *dcp_s2r_find_dart(struct device_node *np);
 
 /*
  * A device-tree layout's DART streams: the ones its DARTs have enabled at probe, with the
- * firmware running. A DCP DART that reads none leaves nothing for the stop to restore.
+ * firmware running. A DCP DART, or a piodma DART where the DCP has a piodma node, that is
+ * missing or reads none leaves nothing for the stop to restore, so the layout is refused.
  */
 static int dcp_s2r_layout_streams(struct apple_dcp *dcp)
 {
@@ -406,10 +408,12 @@ static int dcp_s2r_layout_streams(struct apple_dcp *dcp)
 	if (piodma) {
 		dart = dcp_s2r_find_dart(piodma);
 		of_node_put(piodma);
-		if (dart) {
-			dcp->s2r_dt_layout.disp_streams = apple_dart_enabled_streams(dart);
-			put_device(dart);
-		}
+		if (!dart)
+			return -ENODEV;
+		dcp->s2r_dt_layout.disp_streams = apple_dart_enabled_streams(dart);
+		put_device(dart);
+		if (!dcp->s2r_dt_layout.disp_streams)
+			return -ENODATA;
 	}
 	dev_dbg(dcp->dev, "DART streams for the stop: DCP %#x, display %#x\n",
 		dcp->s2r_dt_layout.dcp_streams, dcp->s2r_dt_layout.disp_streams);
