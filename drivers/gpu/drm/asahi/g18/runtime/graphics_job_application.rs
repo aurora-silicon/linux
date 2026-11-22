@@ -89,6 +89,10 @@ impl ApplicationJob {
         if remap {
             self.job.program.rebind_retired(&self.storage)?;
             self.user_aliases.clear();self.pool_aliases.clear();
+            // The last frame retired (checked above) and the previous VM's
+            // views are gone: clear what its renders left before this VM
+            // maps the PB. The pool scratch is cleared as it is aliased.
+            if new_client && self.generation!=0 {self.job.parameter_buffer.clear_client_data()?;}
         }
         if self.generation==0 {
             let alias=self.job.graph.map_alias_at(uat.kernel_lower_vm(),va::GRAPHICS_JOB_LOW,
@@ -110,8 +114,13 @@ impl ApplicationJob {
             }
         }
         if remap {
+            // The job context only reads the commands' register lists here
+            // (the RCE addresses encode_into places at GRAPHICS_JOB_LOW);
+            // firmware uses GRAPHICS_JOB_HIGH. The client view is read-only,
+            // as g17 maps M5 command storage, so the client's own GPU work
+            // cannot rewrite commands after the kernel encoded and audited them.
             self.user_aliases.push(self.job.graph.map_alias_at(vm,va::GRAPHICS_JOB_LOW,
-                mmu::PROT_GPU_SHARED_RW)?,GFP_KERNEL)?;
+                mmu::PROT_GPU_SHARED_RO)?,GFP_KERNEL)?;
             let aliases=self.job.parameter_buffer.application_aliases(vm)?;
             for alias in aliases {self.user_aliases.push(alias,GFP_KERNEL)?;}
         }
