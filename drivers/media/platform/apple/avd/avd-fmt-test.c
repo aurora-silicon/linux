@@ -111,12 +111,34 @@ static void avd_fmt_comp_mismatch_test(struct kunit *test)
 			-EINVAL);
 }
 
+/* Scratch sized at STREAMON for 8 bits does not take a 10-bit picture. */
+static void avd_fmt_scratch_depth_test(struct kunit *test)
+{
+	struct avd_ctx *ctx = avd_fmt_test_ctx(test, AVD_IMG_FMT_420_10BIT,
+					       V4L2_PIX_FMT_P010);
+
+	ctx->scratch_sized = true;
+	ctx->scratch_fmt = AVD_IMG_FMT_ANY;
+	KUNIT_EXPECT_EQ(test,
+			avd_check_run_image_fmt(ctx, AVD_IMG_FMT_420_10BIT),
+			-EINVAL);
+	ctx->scratch_fmt = AVD_IMG_FMT_420_10BIT;
+	KUNIT_EXPECT_EQ(test,
+			avd_check_run_image_fmt(ctx, AVD_IMG_FMT_420_10BIT), 0);
+	/* Codecs that size no scratch from the format are not limited. */
+	ctx->scratch_sized = false;
+	ctx->scratch_fmt = AVD_IMG_FMT_ANY;
+	KUNIT_EXPECT_EQ(test,
+			avd_check_run_image_fmt(ctx, AVD_IMG_FMT_420_10BIT), 0);
+}
+
 static struct kunit_case avd_fmt_test_cases[] = {
 	KUNIT_CASE(avd_fmt_any_test),
 	KUNIT_CASE(avd_fmt_any_p010_test),
 	KUNIT_CASE(avd_fmt_10bit_test),
 	KUNIT_CASE(avd_fmt_422_test),
 	KUNIT_CASE(avd_fmt_comp_mismatch_test),
+	KUNIT_CASE(avd_fmt_scratch_depth_test),
 	{}
 };
 

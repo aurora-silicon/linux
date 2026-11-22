@@ -1264,6 +1264,7 @@ static void avd_vp9_stop(struct avd_ctx *ctx)
 	/* drain() excludes readiness callbacks before private storage is freed. */
 	avd_vp9_free(ctx, ctx->priv);
 	ctx->priv = NULL;
+	ctx->scratch_sized = false;
 }
 
 static int avd_vp9_start(struct avd_ctx *ctx)
@@ -1284,6 +1285,9 @@ static int avd_vp9_start(struct avd_ctx *ctx)
 		avd_init_v4l2_vp9_count_tbl(&vp9_ctx->bank[i]);
 	}
 	ctx->max_frames = vp9_ctx->nbanks;
+	/* avd_vp9_alloc_bufs() sized the scratch for this depth */
+	ctx->scratch_fmt = ctx->image_fmt;
+	ctx->scratch_sized = true;
 	/* job_ready can run while STREAMON is still initializing this codec. */
 	smp_store_release(&ctx->priv, vp9_ctx);
 

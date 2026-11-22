@@ -345,6 +345,12 @@ struct avd_ctx {
 	void *priv;
 
 	struct avd_comp comp;
+	/*
+	 * Picture format the codec sized its per-stream scratch for at
+	 * STREAMON, if it sizes any from the picture format.
+	 */
+	bool scratch_sized;
+	enum avd_image_fmt scratch_fmt;
 	int fifo_idx;
 	/* Pictures of this context the queue may hold at once (0 or 1: one). */
 	unsigned int max_frames;

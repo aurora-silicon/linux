@@ -748,6 +748,7 @@ static void avd_h264_stop(struct avd_ctx *ctx)
 	unsigned int i;
 
 	ctx->max_frames = 1;
+	ctx->scratch_sized = false;
 	if (!h264_ctx)
 		return;
 
@@ -782,7 +783,7 @@ static int avd_h264_start(struct avd_ctx *ctx)
 	if (!ctrl)
 		return -EINVAL;
 
-	ret = avd_h264_validate_sps(ctx, ctrl->p_new.p_h264_sps);
+	ret = avd_h264_validate_sps(ctx, ctrl->p_cur.p_h264_sps);
 	if (ret)
 		return ret;
 
@@ -799,7 +800,7 @@ static int avd_h264_start(struct avd_ctx *ctx)
 		struct avd_bank *bank = &h264_ctx->bank[i];
 
 		bank->alloc_slice_num =
-			avd_h264_start_slices(ctrl->p_new.p_h264_sps);
+			avd_h264_start_slices(ctrl->p_cur.p_h264_sps);
 		bank->slices = kcalloc(bank->alloc_slice_num,
 				       sizeof(*bank->slices), GFP_KERNEL_ACCOUNT);
 		if (!bank->slices) {
@@ -812,6 +813,9 @@ static int avd_h264_start(struct avd_ctx *ctx)
 			goto err_free_ctx;
 	}
 	ctx->max_frames = h264_ctx->nbanks;
+	/* avd_h264_alloc_bufs() sized the scratch rows for this depth */
+	ctx->scratch_fmt = ctx->image_fmt;
+	ctx->scratch_sized = true;
 
 	return 0;
 

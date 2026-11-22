@@ -74,8 +74,15 @@ static bool avd_image_fmt_fits_capture(struct avd_ctx *ctx,
  * 4:2:0), and the control's value can differ from it: it may have been set
  * while another codec was selected, or kept over an OUTPUT format change, and
  * an unchanged value never reaches s_ctrl. Refuse the job unless both are the
- * same and the CAPTURE buffers fit it.
+ * same and the CAPTURE buffers fit it, and unless the scratch a codec sized at
+ * STREAMON has the bit depth of the picture (s_ctrl only refuses a change
+ * while CAPTURE buffers are allocated, not while OUTPUT streams).
  */
+static bool avd_image_fmt_10bit(enum avd_image_fmt fmt)
+{
+	return fmt == AVD_IMG_FMT_420_10BIT || fmt == AVD_IMG_FMT_422_10BIT;
+}
+
 int avd_check_run_image_fmt(struct avd_ctx *ctx, enum avd_image_fmt image_fmt)
 {
 	enum avd_image_fmt sized = ctx->image_fmt;
@@ -84,7 +91,9 @@ int avd_check_run_image_fmt(struct avd_ctx *ctx, enum avd_image_fmt image_fmt)
 		sized = AVD_IMG_FMT_420_8BIT;
 	if (image_fmt == AVD_IMG_FMT_ANY)
 		image_fmt = AVD_IMG_FMT_420_8BIT;
-	if (image_fmt != sized || !avd_image_fmt_fits_capture(ctx, image_fmt)) {
+	if (image_fmt != sized || !avd_image_fmt_fits_capture(ctx, image_fmt) ||
+	    (ctx->scratch_sized &&
+	     avd_image_fmt_10bit(ctx->scratch_fmt) != avd_image_fmt_10bit(image_fmt))) {
 		dev_dbg_ratelimited(ctx->dev->dev,
 				    "picture format %d does not fit the buffers (%d)\n",
 				    image_fmt, ctx->image_fmt);
