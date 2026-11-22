@@ -1498,9 +1498,34 @@ static void avd_hevc_normalize_slices(struct avd_hevc_run *run, u32 payload)
 	}
 }
 
+/*
+ * A copy of a control's current value. The caller holds the control lock,
+ * so the control must have been looked up before (v4l2_ctrl_find() takes
+ * that lock too).
+ */
+static void *avd_hevc_ctrl_dup(struct v4l2_ctrl *ctrl)
+{
+	if (!ctrl)
+		return NULL;
+	return kmemdup(ctrl->p_cur.p, ctrl->elems * ctrl->elem_size,
+		       GFP_KERNEL);
+}
+
+static void avd_hevc_free_run(struct avd_hevc_run *run)
+{
+	kfree(run->tile_info.ctb_addr_rs_to_ts);
+	kfree(run->tile_info.tile_ids);
+	kfree(run->sl);
+	kfree(run->entry_point_offsets);
+	kfree(run->decode);
+	kfree(run->sps);
+	kfree(run->pps);
+	kfree(run->scaling_matrix);
+}
+
 static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 {
-	struct v4l2_ctrl *ctrl, *sl, *ep;
+	struct v4l2_ctrl *sl, *ep, *decode, *sps, *pps, *scaling;
 	u32 dst_len, mv_color_len;
 
 	if (!v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SLICE_PARAMS) ||
@@ -1518,20 +1543,15 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	if (run->base.setup_err)
 		return run->base.setup_err;
 
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_HEVC_DECODE_PARAMS);
-	run->decode = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SPS);
-	run->sps = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_PPS);
-	run->pps = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_HEVC_SCALING_MATRIX);
-	run->scaling_matrix = ctrl ? ctrl->p_cur.p : NULL;
-
 	sl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SLICE_PARAMS);
 	ep = v4l2_ctrl_find(&ctx->ctrl_hdl,
 			    V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS);
+	decode = v4l2_ctrl_find(&ctx->ctrl_hdl,
+				V4L2_CID_STATELESS_HEVC_DECODE_PARAMS);
+	sps = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SPS);
+	pps = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_PPS);
+	scaling = v4l2_ctrl_find(&ctx->ctrl_hdl,
+				 V4L2_CID_STATELESS_HEVC_SCALING_MATRIX);
 
 	/*
 	 * Setting a larger dynamic array on a queued request reallocates the
@@ -1539,15 +1559,24 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	 * the run needs while holding the control lock.
 	 */
 	v4l2_ctrl_lock(sl);
+	/*
+	 * A plain VIDIOC_S_EXT_CTRLS can also change the picture controls
+	 * while the job is built. The checks below and the builder must see
+	 * the same values, so take copies of those too.
+	 */
+	run->decode = avd_hevc_ctrl_dup(decode);
+	run->sps = avd_hevc_ctrl_dup(sps);
+	run->pps = avd_hevc_ctrl_dup(pps);
+	run->scaling_matrix = avd_hevc_ctrl_dup(scaling);
 	run->num_slices = sl->elems;
 	run->sl = kmemdup(sl->p_cur.p, sl->elems * sl->elem_size, GFP_KERNEL);
 	run->num_entry_point_offsets = ep->elems;
 	run->entry_point_offsets =
 		kmemdup(ep->p_cur.p, ep->elems * ep->elem_size, GFP_KERNEL);
 	v4l2_ctrl_unlock(sl);
-	if (!run->sl || !run->entry_point_offsets) {
-		kfree(run->sl);
-		kfree(run->entry_point_offsets);
+	if (!run->sl || !run->entry_point_offsets || !run->decode ||
+	    !run->sps || !run->pps || !run->scaling_matrix) {
+		avd_hevc_free_run(run);
 		avd_run_postamble(ctx, &run->base);
 		return -ENOMEM;
 	}
@@ -1612,10 +1641,7 @@ complete:
 	/* The request was applied; complete it on every way out. */
 	avd_run_postamble(ctx, &run.base);
 done:
-	kfree(run.tile_info.ctb_addr_rs_to_ts);
-	kfree(run.tile_info.tile_ids);
-	kfree(run.sl);
-	kfree(run.entry_point_offsets);
+	avd_hevc_free_run(&run);
 	return ret;
 }
 
