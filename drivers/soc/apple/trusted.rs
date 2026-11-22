@@ -89,8 +89,9 @@ unsafe extern "C" fn tk_init() -> c_int {
     rc.unwrap_or_else(|| ENODEV.to_errno())
 }
 
-/// `datablob` options (keyhandle/hash/policy) are ignored: no migration or
-/// policy binding, so a key is bound only to the machine ref-key.
+/// No migration or policy binding: a key is bound only to the machine
+/// ref-key. `trusted_shim.c` refuses any `datablob` option (keyhandle,
+/// blobauth, pcrinfo, policy) with EINVAL before this runs.
 ///
 /// # Safety
 /// Called by the framework with a live `struct trusted_key_payload *p`.
