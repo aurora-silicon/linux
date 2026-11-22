@@ -291,6 +291,10 @@ enum drm_asahi_feature {
 	 * toggled. Therefore, it is exposed as a feature bit and not a
 	 * userspace-settable flag on the VM. When soft fault is enabled,
 	 * userspace can speculate memory accesses more aggressively.
+	 *
+	 * On G17 GPUs the first 0x74000 bytes of a VM are not unmapped memory:
+	 * they hold the views of the execution context, which the kernel and
+	 * userspace map there. Loads from them return the context's data.
 	 */
 	DRM_ASAHI_FEATURE_SOFT_FAULTS = (1UL) << 0,
 
@@ -779,6 +783,10 @@ struct drm_asahi_gem_create {
  * mapping pins the page-cache pages themselves, which then stay resident
  * while the object lives. Device and PFN mappings, including CPU mappings of
  * other buffer objects, are refused (EFAULT).
+ *
+ * In a process whose page size is smaller than the native one, a native page
+ * is accepted only where the process maps all of it, in order at consecutive
+ * addresses; otherwise the call fails with EFAULT.
  *
  * The object cannot be mapped with DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET, exported,
  * given advice with DRM_IOCTL_ASAHI_GEM_MADVISE, bound with
