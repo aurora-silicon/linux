@@ -437,3 +437,13 @@
 &mtp {
 	apple,rtkit-keep-running;
 };
+
+/*
+ * What the sleep driver's probe needs on J613: the display coprocessor it lowers, and the
+ * port controller behind the debug port. The node stays disabled (t8122.dtsi) until the
+ * J613 match leaves qualification.
+ */
+&sleep {
+	apple,display-coprocessors = <&dcp>;
+	apple,debug-port = <&hpm0>;
+};
