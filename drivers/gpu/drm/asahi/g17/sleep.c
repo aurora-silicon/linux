@@ -753,8 +753,13 @@ bool asahi_g17_commit_finish(struct asahi_g17_commit *c, u32 *saved)
  * idle the firmware with interrupts off here, so its run bit is cleared cold and the word
  * lowered, and the stop reports that.
  */
-#define M3_GFX_OFF_POLL_MS	20
-#define M3_GFX_OFF_WAIT_MS	3000
+/*
+ * .prepare waits for GFX's own state change (PS_ACTUAL reading off), polling every 20 ms. The
+ * 3 s bound is not a measured GFX power-off time: it only limits how long a sleep waits before
+ * it refuses. A GPU still on at the bound refuses the sleep; nothing is forced.
+ */
+#define M3_GFX_OFF_POLL_US	(20 * USEC_PER_MSEC)
+#define M3_GFX_OFF_WAIT_US	(3000 * USEC_PER_MSEC)
 
 static struct asahi_m3_sleep {
 	struct device *dev;
@@ -806,7 +811,6 @@ int asahi_m3_sleep_prepare(struct device *dev)
 {
 	struct asahi_m3_sleep *c = &asahi_m3_sleep;
 	struct device_node *np;
-	unsigned int waited = 0;
 	u32 offset, val;
 	int ret = -ENODEV;
 
@@ -827,15 +831,10 @@ int asahi_m3_sleep_prepare(struct device *dev)
 	if (!c->cpu || !c->ps)
 		goto err;
 
-	for (;;) {
-		val = readl(c->ps);
-		if (!FIELD_GET(PS_ACTUAL, val) || waited >= M3_GFX_OFF_WAIT_MS)
-			break;
-		msleep(M3_GFX_OFF_POLL_MS);
-		waited += M3_GFX_OFF_POLL_MS;
-	}
-	if (FIELD_GET(PS_ACTUAL, val)) {
-		dev_warn(dev, "M3: GFX still on (%#x) after %u ms: refusing the sleep\n", val, waited);
+	if (readl_poll_timeout(c->ps, val, !FIELD_GET(PS_ACTUAL, val), M3_GFX_OFF_POLL_US,
+			       M3_GFX_OFF_WAIT_US)) {
+		dev_warn(dev, "M3: GFX still on (%#x) after %u ms: refusing the sleep\n", val,
+			 (unsigned int)(M3_GFX_OFF_WAIT_US / USEC_PER_MSEC));
 		ret = -EBUSY;
 		goto err;
 	}
@@ -844,8 +843,7 @@ int asahi_m3_sleep_prepare(struct device *dev)
 		goto err;
 	c->registered = true;
 	apple_sleep_coproc_set_ready(dev, true);
-	dev_info(dev, "M3: GFX off (%#x) after %u ms; stop left to the sleep's commit, no restart exists\n",
-		 val, waited);
+	dev_info(dev, "M3: GFX off (%#x); stop left to the sleep's commit, no restart exists\n", val);
 
 	return 0;
 
