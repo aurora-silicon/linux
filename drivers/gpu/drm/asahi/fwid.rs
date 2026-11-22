@@ -586,21 +586,23 @@ mod tests {
     }
 
     #[test]
-    fn m5_pro_builds_name_their_layouts() {
+    fn m5_builds_name_their_layouts() {
         use crate::g17::fw::variant::{Firmware, M5Layouts};
-        let Firmware::Identified(builds) = crate::hw::t6050::CONFIG.firmware else {
-            panic!("the M5 Pro must identify its loaded firmware");
-        };
-        for (i, build) in builds.iter().enumerate() {
-            // 27.2 (26B123) moved the InitData layouts.
-            let layouts = if build.os_version >= [27, 2, 0] {
-                M5Layouts::V26B123
-            } else {
-                M5Layouts::V26A428
+        for cfg in [&crate::hw::t6050::CONFIG, &crate::hw::t6050::CONFIG_MAX] {
+            let Firmware::Identified(builds) = cfg.firmware else {
+                panic!("the M5 Pro and Max must identify their loaded firmware");
             };
-            assert_eq!(build.variant.m5_layouts, Some(layouts));
-            for other in &builds[i + 1..] {
-                assert_ne!(build.images[0].text_sha256, other.images[0].text_sha256);
+            for (i, build) in builds.iter().enumerate() {
+                // 27.2 (26B123) moved the InitData layouts.
+                let layouts = if build.os_version >= [27, 2, 0] {
+                    M5Layouts::V26B123
+                } else {
+                    M5Layouts::V26A428
+                };
+                assert_eq!(build.variant.m5_layouts, Some(layouts));
+                for other in &builds[i + 1..] {
+                    assert_ne!(build.images[0].text_sha256, other.images[0].text_sha256);
+                }
             }
         }
     }
