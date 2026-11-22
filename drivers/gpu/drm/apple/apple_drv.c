@@ -1264,6 +1264,31 @@ static int apple_probe_per_dcp(struct device *dev,
 }
 
 /*
+ * A native26 pipeline scans out XRGB8888 only (see apple_plane_init()), so a
+ * Type-C connector any of whose pipelines is native26 offers no BT.2020/PQ
+ * output contract. Every other pipeline has a 10-bit primary.
+ */
+static bool apple_typec_port_rgb8_only(struct platform_device **dcp, int num_dcp,
+				       struct platform_device *pipeline,
+				       unsigned int port_idx)
+{
+	int i;
+
+	for (i = 0; i < num_dcp; i++) {
+		struct apple_dcp *d;
+
+		if (pipeline && dcp[i] != pipeline)
+			continue;
+		if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
+			continue;
+		d = platform_get_drvdata(dcp[i]);
+		if (d && dcp_is_ext26(d))
+			return true;
+	}
+	return false;
+}
+
+/*
  * Create a connector per physical Type-C port and attach it to every
  * pipeline that can drive it. The M2 Pro/Max laptops append a second
  * connector per port for a dock's second DP tunnel, preserving primary
@@ -1360,12 +1385,11 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		if (ret)
 			return ret;
 		/*
-		 * T8122's retained external scanout accepts only 8-bit RGB.
-		 * Do not advertise the BT.2020/PQ output contract until this
-		 * route has a qualified 10-bit primary-plane format. The sink
-		 * EDID remains intact; its capabilities are not the pipeline's.
+		 * A native26 route scans out 8-bit RGB only: do not advertise
+		 * the BT.2020/PQ output contract on it. The sink EDID remains
+		 * intact; its capabilities are not the pipeline's.
 		 */
-		if (!of_machine_is_compatible("apple,t8122")) {
+		if (!apple_typec_port_rgb8_only(dcp, num_dcp, pipeline, port_idx)) {
 			ret = apple_connector_attach_hdr(&connector->base, false);
 			if (ret)
 				return ret;
