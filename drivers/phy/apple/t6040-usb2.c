@@ -286,8 +286,6 @@ struct t6040_usb2_phy {
 	struct completion app_reply;
 	struct t6040_recovery_state recovery;
 	atomic_t drop_next_power_down_ack;
-	struct notifier_block pm_nb;
-	bool s2idle_held;	/* held out of this suspend-to-idle, see t6040_pm_notify() */
 	struct dentry *debugfs;
 	enum typec_orientation orientation;
 	bool usb3_up;		/* tuned by the coprocessor this power cycle */
@@ -2135,47 +2133,60 @@ static void t6040_rtkit_cleanup(void *data)
  * Suspend-to-idle leaves the Type-C link up: the USB4/Thunderbolt router keeps
  * its own domains out of the system transition while a cable is set up, and a
  * running PHY coprocessor is not stopped either. genpd would still power off
- * common_dp (and with it phymxwrap) in its noirq phase once this device has
- * suspended, under the running coprocessor: the link then dies after resume and
- * the next detach finds a coprocessor that no longer answers (AP idle -62).
- * Hold this device out of the whole transition, from before its prepare to
- * after its complete, while its coprocessor runs, so its domains stay on. A
- * sleep the platform takes part in (firmware suspend) is left as it was.
+ * common_dp (and with it phymxwrap) in its noirq phase under the running
+ * coprocessor: the link then dies after resume and the next detach finds a
+ * coprocessor that no longer answers (AP idle -62). Put this device on the
+ * awake path while its coprocessor runs, so genpd keeps the domains on
+ * (common_dp carries apple,sleep-wakeup-path). The decision is taken again in
+ * every suspend pass, dark wakes included, and once more in noirq for a
+ * coprocessor started after .suspend. A sleep the platform takes part in
+ * (firmware suspend) is left as it was.
  */
-static int t6040_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+static void t6040_keep_running_cpu_awake(struct t6040_usb2_phy *tphy, bool noirq)
 {
-	struct t6040_usb2_phy *tphy = container_of(nb, struct t6040_usb2_phy, pm_nb);
+	bool running;
 
-	switch (action) {
-	case PM_SUSPEND_PREPARE:
-		if (!pm_suspend_no_platform())
-			break;
-		scoped_guard(mutex, &tphy->lock) {
-			if (tphy->rtk && apple_rtkit_is_running(tphy->rtk)) {
-				dev_pm_syscore_device(tphy->dev, true);
-				tphy->s2idle_held = true;
-				dev_dbg(tphy->dev, "PHY coprocessor running: domains kept on for s2idle\n");
-			}
+	if (!pm_suspend_no_platform())
+		return;
+
+	if (noirq) {
+		/*
+		 * An attach or detach holding the lock may wait for a coprocessor
+		 * reply that cannot arrive now. Its outcome is unknown: keep the
+		 * domains on for this sleep.
+		 */
+		if (!mutex_trylock(&tphy->lock)) {
+			device_set_awake_path(tphy->dev);
+			return;
 		}
-		break;
-	case PM_POST_SUSPEND:
-		scoped_guard(mutex, &tphy->lock) {
-			if (tphy->s2idle_held) {
-				dev_pm_syscore_device(tphy->dev, false);
-				tphy->s2idle_held = false;
-			}
-		}
-		break;
+	} else {
+		mutex_lock(&tphy->lock);
 	}
-	return NOTIFY_DONE;
+	running = tphy->rtk && apple_rtkit_is_running(tphy->rtk);
+	mutex_unlock(&tphy->lock);
+
+	if (running) {
+		device_set_awake_path(tphy->dev);
+		dev_dbg(tphy->dev, "PHY coprocessor running: domains kept on for s2idle\n");
+	}
 }
 
-static void t6040_pm_notifier_unregister(void *data)
+static int t6040_usb2_suspend(struct device *dev)
 {
-	struct t6040_usb2_phy *tphy = data;
-
-	unregister_pm_notifier(&tphy->pm_nb);
+	t6040_keep_running_cpu_awake(dev_get_drvdata(dev), false);
+	return 0;
 }
+
+static int t6040_usb2_suspend_noirq(struct device *dev)
+{
+	t6040_keep_running_cpu_awake(dev_get_drvdata(dev), true);
+	return 0;
+}
+
+static const struct dev_pm_ops t6040_usb2_pm_ops = {
+	.suspend = t6040_usb2_suspend,
+	.suspend_noirq = t6040_usb2_suspend_noirq,
+};
 
 static void t6040_mbox_dev_put(void *data)
 {
@@ -2342,14 +2353,6 @@ static int t6040_usb3_probe(struct t6040_usb2_phy *tphy, struct platform_device 
 		return 0;
 	}
 	ret = devm_add_action_or_reset(dev, t6040_rtkit_cleanup, tphy);
-	if (ret)
-		return ret;
-
-	tphy->pm_nb.notifier_call = t6040_pm_notify;
-	ret = register_pm_notifier(&tphy->pm_nb);
-	if (ret)
-		return ret;
-	ret = devm_add_action_or_reset(dev, t6040_pm_notifier_unregister, tphy);
 	if (ret)
 		return ret;
 
@@ -2562,6 +2565,7 @@ static struct platform_driver t6040_usb2_driver = {
 	.driver = {
 		.name = "phy-apple-t6040-usb2",
 		.of_match_table = t6040_usb2_of_match,
+		.pm = pm_sleep_ptr(&t6040_usb2_pm_ops),
 	},
 };
 module_platform_driver(t6040_usb2_driver);
