@@ -1178,6 +1178,8 @@ static const struct apple_sleep_ops t8122_sleep_ops = {
 static const struct apple_sleep_word t8122_trial_stray[] = {
 	{ "isp_sys", 0x1e8 }, { "i2c1", 0x238 }, { "i2c2", 0x240 }, { "i2c3", 0x248 },
 	{ "spi2", 0x2a8 }, { "qspi", 0x2c8 },
+	/* n105: the two macOS has at 4 (t8122_match's AUTO_IDLE write does not take), fully off */
+	{ "sio_cpu", 0x210 }, { "apcie_phy_sw", 0x4a0 },
 };
 
 static const struct apple_sleep_soc t8122_sleep_soc = {
