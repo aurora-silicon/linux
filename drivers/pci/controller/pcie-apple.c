@@ -551,8 +551,10 @@ struct apple_pcie {
 	bool			t6050_warm_done;
 	/* When this wake's bring-up of that port had the link up and its 100 ms over; 0 before */
 	ktime_t			t6050_link_up;
-	/* The endpoint requests a warm reset after link shutdown; no radio wake is armed. */
+	/* Endpoint requests warm reset after link shutdown (no radio wake armed). */
 	bool			t6050_reset_before_sleep;
+	/* Endpoint kept its firmware alive for this sleep; skip the wake warm reset. */
+	bool			t6050_keep_alive;
 	unsigned long		t6050_parked;
 	/* Parked ports whose registers a firmware sleep has taken: not even their root port answers */
 	unsigned long		t6050_cold_lost;
@@ -3655,6 +3657,39 @@ out_wifi:
 	return ret;
 }
 
+/*
+ * For hosts whose links the boot loader trained (adopt_link), the driver
+ * leaves CLKREQ# pads and reference-clock gating in firmware state.
+ * Disabling L0s/L1 capabilities alone does not disable Clock PM. Keep
+ * Clock PM off before enabling endpoints and after host enumeration. The
+ * policy mask prevents later ASPM policy changes from re-enabling it.
+ */
+static void apple_pcie_adopted_no_clkpm(struct pci_dev *pdev, bool locked)
+{
+	u32 lnkcap;
+	int ret;
+
+	if (pci_is_root_bus(pdev->bus) || !pci_is_pcie(pdev))
+		return;
+	if (pcie_capability_read_dword(pdev, PCI_EXP_LNKCAP, &lnkcap) ||
+	    !(lnkcap & PCI_EXP_LNKCAP_CLKPM))
+		return;
+	ret = locked ? pci_disable_link_state_locked(pdev, PCIE_LINK_STATE_CLKPM) :
+		       pci_disable_link_state(pdev, PCIE_LINK_STATE_CLKPM);
+	if (ret == -EINVAL)	/* no ASPM link state: nothing turns Clock PM on */
+		return;
+	if (ret)
+		pci_warn(pdev, "cannot turn Clock PM off: %d\n", ret);
+	else if (locked)
+		pci_info(pdev, "Clock PM off: the host does not handle CLKREQ#\n");
+}
+
+static int apple_pcie_adopted_no_clkpm_walk(struct pci_dev *pdev, void *data)
+{
+	apple_pcie_adopted_no_clkpm(pdev, true);
+	return 0;
+}
+
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
@@ -3705,6 +3740,7 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	if (pcie->hw->adopt_link) {
 		if (READ_ONCE(port->link_failed))
 			return -ENODEV;
+		apple_pcie_adopted_no_clkpm(pdev, false);
 		mutex_lock(&pcie->lock);
 		err = apple_pcie_adopted_route(port, rid);
 		mutex_unlock(&pcie->lock);
@@ -5318,6 +5354,7 @@ static int apple_pcie_t6050_pm_notify(struct notifier_block *nb, unsigned long a
 	pcie->t6050_warm_done = false;
 	pcie->t6050_link_up = 0;
 	pcie->t6050_reset_before_sleep = false;
+	pcie->t6050_keep_alive = false;
 	/*
 	 * The DART wasn't bound when this host probed. Looked up here, before the freezer and any
 	 * device callback: a device link added in the noirq phase would reorder this host in the
@@ -5325,7 +5362,8 @@ static int apple_pcie_t6050_pm_notify(struct notifier_block *nb, unsigned long a
 	 */
 	if (!pcie->t6050_dart)
 		pcie->t6050_dart = apple_pcie_neo_dart(pcie->dev, false);
-	if (!pm_suspend_default_s2idle())
+	/* A "freeze" is a suspend-to-idle with deep as the default too: its check wants the link. */
+	if (!pm_suspend_default_s2idle() && !pm_suspend_no_platform())
 		apple_pcie_t6050_park_cold(pcie);
 	return NOTIFY_DONE;
 }
@@ -5487,7 +5525,7 @@ static int apple_pcie_t6050_sleep_down(struct apple_pcie *pcie)
 	return 0;
 }
 
-static int apple_pcie_t6050_sleep_up(struct apple_pcie *pcie, bool noirq)
+static int apple_pcie_t6050_sleep_up(struct apple_pcie *pcie, bool noirq, bool warm_reset)
 {
 	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
 	struct apple_pcie_port *port;
@@ -5510,7 +5548,8 @@ static int apple_pcie_t6050_sleep_up(struct apple_pcie *pcie, bool noirq)
 		goto unlock;
 	}
 	park = true;
-	apple_pcie_t6050_warm_reset(pcie, noirq);
+	if (warm_reset)
+		apple_pcie_t6050_warm_reset(pcie, noirq);
 	/* The pin restore left PERST# low, as the shutdown did; it stays low until the train */
 	ret = apple_pcie_t6050_perst(port, true) ?:
 	      apple_pcie_t6050_port_enable(port) ?:
@@ -5606,10 +5645,29 @@ void apple_pcie_t6050_sleep_reset(struct pci_dev *bridge)
 {
 	struct apple_pcie *pcie = apple_pcie_t6050_from_bridge(bridge);
 
-	if (pcie && pcie->t6050_warm_count)
+	if (pcie && pcie->t6050_warm_count) {
+		pcie->t6050_keep_alive = false;
 		pcie->t6050_reset_before_sleep = true;
+	}
 }
 EXPORT_SYMBOL_GPL(apple_pcie_t6050_sleep_reset);
+
+/*
+ * For the endpoint's driver, from its suspend: the endpoint entered firmware
+ * host-sleep and expects its live firmware and PCI functions to survive this
+ * sleep without a wake warm reset. Cleared on the next suspend prepare or if
+ * apple_pcie_t6050_sleep_reset() is called.
+ */
+void apple_pcie_t6050_sleep_keep_alive(struct pci_dev *bridge)
+{
+	struct apple_pcie *pcie = apple_pcie_t6050_from_bridge(bridge);
+
+	if (pcie) {
+		pcie->t6050_keep_alive = true;
+		pcie->t6050_reset_before_sleep = false;
+	}
+}
+EXPORT_SYMBOL_GPL(apple_pcie_t6050_sleep_keep_alive);
 
 /* In the noirq suspend, the link just shut down for the sleep. */
 static int apple_pcie_t6050_reset_for_sleep(struct apple_pcie *pcie)
@@ -5624,7 +5682,7 @@ static int apple_pcie_t6050_reset_for_sleep(struct apple_pcie *pcie)
 		 * Restore the host here before its children resume. If recovery fails,
 		 * the existing lost-port path blocks their config-space accesses.
 		 */
-		apple_pcie_t6050_sleep_up(pcie, true);
+		apple_pcie_t6050_sleep_up(pcie, true, true);
 		pcie->t6050_woke = !READ_ONCE(pcie->t6050_down) && !pcie->t6050_lost &&
 				   pcie->t6050_warm_done;
 		dev_err(pcie->dev, "port %d: sleep refused after endpoint reset failed: %d\n",
@@ -5658,7 +5716,7 @@ int apple_pcie_t6050_port_recycle(struct pci_dev *bridge)
 	ret = apple_pcie_t6050_sleep_down(pcie);
 	if (ret)
 		return ret;
-	apple_pcie_t6050_sleep_up(pcie, false);
+	apple_pcie_t6050_sleep_up(pcie, false, true);
 	if (pcie->t6050_lost)
 		return -ENOLINK;
 	pci_restore_state(bridge);
@@ -5667,6 +5725,16 @@ int apple_pcie_t6050_port_recycle(struct pci_dev *bridge)
 	return pcie->t6050_warm_done ? 0 : -EIO;
 }
 EXPORT_SYMBOL_GPL(apple_pcie_t6050_port_recycle);
+
+static int apple_pcie_host_init(struct platform_device *pdev, struct pci_host_bridge *bridge)
+{
+	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
+	int ret = pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
+
+	if (!ret && pcie->hw->adopt_link)
+		pci_walk_bus(bridge->bus, apple_pcie_adopted_no_clkpm_walk, NULL);
+	return ret;
+}
 
 static int apple_pcie_probe(struct platform_device *pdev)
 {
@@ -5835,7 +5903,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 
 	if (hw->adopt_link)
 		bridge->reset_root_port = apple_pcie_t6050_reset_root_port;
-	ret = pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
+	ret = apple_pcie_host_init(pdev, bridge);
 	if (ret) {
 		apple_pcie_cleanup(pcie);
 		if (pcie->piodma_supplier) {
@@ -7356,10 +7424,13 @@ static int apple_pcie_resume_noirq(struct device *dev)
 	if (pcie->hw->adopt_link) {
 		/* Also after a sleep that was abandoned: the link is down either way */
 		if (READ_ONCE(pcie->t6050_down)) {
-			ret = apple_pcie_t6050_sleep_up(pcie, true);
-			/* Up, and the endpoint reset if it has a reset: nothing takes it down again */
+			bool warm_reset = !pcie->t6050_keep_alive;
+
+			ret = apple_pcie_t6050_sleep_up(pcie, true, warm_reset);
+			/* Up, and reset unless kept alive: nothing takes it down again */
 			pcie->t6050_woke = !READ_ONCE(pcie->t6050_down) && !pcie->t6050_lost &&
-					   (pcie->t6050_warm_done || !pcie->t6050_warm_count);
+					   (!warm_reset || pcie->t6050_warm_done ||
+					    !pcie->t6050_warm_count);
 			list_for_each_entry(port, &pcie->ports, entry)
 				if (pcie->t6050_parked & BIT(port->idx))
 					dev_dbg(dev, "port %d at the wake: parked since before the sleep, power off, PERST# low, no functions, root port %s, DART %s; %s\n",
