@@ -887,11 +887,12 @@ impl Slots {
                 *dirty = true;
             }
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                self.render.scrub_full[k] = true;
-                self.scrub.clear_clean(k);
-            }
+        let mut mask = f.pass_mask & PASS_MASK;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.render.scrub_full[k] = true;
+            self.scrub.clear_clean(k);
         }
     }
 
@@ -1181,19 +1182,101 @@ impl Slots {
                 self.stats.last_retarget[0] = proof;
             }
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                if let Some(proof) = self.render.pending_retarget[k].take() {
-                    self.stats.cross_vm_retargets[1] =
-                        self.stats.cross_vm_retargets[1].saturating_add(1);
-                    self.stats.last_retarget[1] = proof;
-                }
+        let mut mask = f.pass_mask & PASS_MASK;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some(proof) = self.render.pending_retarget[k].take() {
+                self.stats.cross_vm_retargets[1] =
+                    self.stats.cross_vm_retargets[1].saturating_add(1);
+                self.stats.last_retarget[1] = proof;
             }
         }
     }
 
+    /// Retains one newly claimed compute unit's VM/ASID lease and owner arena in O(1).
+    pub(crate) fn hold_compute_slot(
+        &mut self,
+        k: usize,
+        vm: &Arc<super::vm::VmState>,
+        resources: &super::resources::Prepared,
+    ) -> Result {
+        if k >= sizes::COMPUTE_UNITS {
+            return Err(EINVAL);
+        }
+        self.compute.pending_retarget[k] = self.compute.owner[k]
+            .as_ref()
+            .and_then(|old| Self::vm_retarget(k, old, vm));
+        self.compute.pending_owner[k] = Some(vm.clone());
+        self.compute.pending_arena[k] = resources.compute_arena(k);
+        Ok(())
+    }
+
+    /// Retains one newly claimed render pass slot's VM/ASID lease and owner arena in O(1).
+    pub(crate) fn hold_render_pass(
+        &mut self,
+        k: usize,
+        vm: &Arc<super::vm::VmState>,
+        resources: &super::resources::Prepared,
+    ) -> Result {
+        if k >= sizes::RENDER_SLOTS {
+            return Err(EINVAL);
+        }
+        self.render.pending_retarget[k] = self.render.owner[k]
+            .as_ref()
+            .and_then(|old| Self::vm_retarget(k, old, vm));
+        self.render.pending_owner[k] = Some(vm.clone());
+        self.render.pending_arena[k] = resources.pass_owner_arena(k);
+        Ok(())
+    }
+
+    /// Validates claim bounds/masks and confirms every claimed slot already holds a pending
+    /// VM lease without re-cloning `Arc` leases at publication time.
+    pub(crate) fn verify_held(&self, f: &Claims) -> Result {
+        if f.slot_count as usize > f.slot.len()
+            || f.pass_count as usize > f.pass.len()
+            || f.pass_mask & !PASS_MASK != 0
+        {
+            return Err(EINVAL);
+        }
+        for &k in &f.slot[..f.slot_count as usize] {
+            let k = k as usize;
+            if k >= sizes::COMPUTE_UNITS || self.compute.pending_owner[k].is_none() {
+                return Err(EINVAL);
+            }
+        }
+        if f.pass_count != 0 {
+            let mut mask = 0u64;
+            for &k in &f.pass[..f.pass_count as usize] {
+                let k = k as usize;
+                if k >= sizes::RENDER_SLOTS || self.render.pending_owner[k].is_none() {
+                    return Err(EINVAL);
+                }
+                let bit = 1u64 << k;
+                if mask & bit != 0 {
+                    return Err(EINVAL);
+                }
+                mask |= bit;
+            }
+            if mask != f.pass_mask {
+                return Err(EINVAL);
+            }
+        } else {
+            let mut mask = f.pass_mask;
+            while mask != 0 {
+                let k = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if self.render.pending_owner[k].is_none() {
+                    return Err(EINVAL);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Retains each actual owner's VM/ASID binding through the firmware's last-owner era.
     /// A previous lease is replaced only after the new publication fully retires.
+    #[allow(dead_code)]
     pub(crate) fn hold_vm(&mut self, f: &Claims, vm: &Arc<super::vm::VmState>) -> Result {
         if f.slot_count as usize > f.slot.len()
             || f.slot[..f.slot_count as usize]
@@ -1227,29 +1310,32 @@ impl Slots {
                 .and_then(|old| Self::vm_retarget(k, old, vm));
             self.compute.pending_owner[k] = Some(vm.clone());
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                self.render.pending_retarget[k] = self.render.owner[k]
-                    .as_ref()
-                    .and_then(|old| Self::vm_retarget(k, old, vm));
-                self.render.pending_owner[k] = Some(vm.clone());
-            }
+        let mut mask = f.pass_mask;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.render.pending_retarget[k] = self.render.owner[k]
+                .as_ref()
+                .and_then(|old| Self::vm_retarget(k, old, vm));
+            self.render.pending_owner[k] = Some(vm.clone());
         }
         Ok(())
     }
 
     /// With [`Self::hold_vm`]: the claimed units' arenas, held with their VM leases. The VM's
     /// own cache lets go of its arenas when its client closes.
+    #[allow(dead_code)]
     pub(crate) fn hold_arenas(&mut self, f: &Claims, resources: &super::resources::Prepared) {
         for &k in &f.slot[..(f.slot_count as usize).min(f.slot.len())] {
             if let Some(cell) = self.compute.pending_arena.get_mut(k as usize) {
                 *cell = resources.compute_arena(k as usize);
             }
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                self.render.pending_arena[k] = resources.pass_owner_arena(k);
-            }
+        let mut mask = f.pass_mask & PASS_MASK;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.render.pending_arena[k] = resources.pass_owner_arena(k);
         }
     }
 
@@ -1273,8 +1359,11 @@ impl Slots {
                 }
             }
         } else {
-            for k in 0..sizes::RENDER_SLOTS {
-                if f.pass_mask & (1 << k) != 0 && !p.publish(k) {
+            let mut mask = f.pass_mask & PASS_MASK;
+            while mask != 0 {
+                let k = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if !p.publish(k) {
                     return Err(EBUSY);
                 }
             }
@@ -1304,8 +1393,11 @@ impl Slots {
                 }
             }
         } else {
-            for k in 0..sizes::RENDER_SLOTS {
-                if f.pass_mask & (1 << k) != 0 && !p.retire(k) {
+            let mut mask = f.pass_mask & PASS_MASK;
+            while mask != 0 {
+                let k = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if !p.retire(k) {
                     return Err(EINVAL);
                 }
             }
@@ -1320,13 +1412,14 @@ impl Slots {
                 self.compute.scrub_full[k as usize] = false;
             }
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                self.render.owner[k] = self.render.pending_owner[k].take();
-                self.render.arena[k] = self.render.pending_arena[k].take();
-                if clean_scrub {
-                    self.render.scrub_full[k] = false;
-                }
+        let mut mask = f.pass_mask & PASS_MASK;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.render.owner[k] = self.render.pending_owner[k].take();
+            self.render.arena[k] = self.render.pending_arena[k].take();
+            if clean_scrub {
+                self.render.scrub_full[k] = false;
             }
         }
         self.pass_busy &= !f.pass_mask;
@@ -1342,13 +1435,14 @@ impl Slots {
             self.compute.pending_retarget[k as usize] = None;
             self.compute.scrub_full[k as usize] = true;
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                self.render.lifetime.quarantine(k);
-                self.render.pending_retarget[k] = None;
-                self.render.scrub_full[k] = true;
-                self.scrub.clear_clean(k);
-            }
+        let mut mask = f.pass_mask & PASS_MASK;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.render.lifetime.quarantine(k);
+            self.render.pending_retarget[k] = None;
+            self.render.scrub_full[k] = true;
+            self.scrub.clear_clean(k);
         }
         self.pass_busy &= !f.pass_mask;
         f.slot_count = 0;
@@ -1365,15 +1459,16 @@ impl Slots {
             self.compute.pending_arena[k as usize] = None;
             self.compute.scrub_full[k as usize] = true;
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                self.render.lifetime.cancel(k);
-                self.render.pending_retarget[k] = None;
-                self.render.pending_owner[k] = None;
-                self.render.pending_arena[k] = None;
-                self.render.scrub_full[k] = true;
-                self.scrub.clear_clean(k);
-            }
+        let mut mask = f.pass_mask & PASS_MASK;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.render.lifetime.cancel(k);
+            self.render.pending_retarget[k] = None;
+            self.render.pending_owner[k] = None;
+            self.render.pending_arena[k] = None;
+            self.render.scrub_full[k] = true;
+            self.scrub.clear_clean(k);
         }
         self.pass_busy &= !f.pass_mask;
         f.slot_count = 0;

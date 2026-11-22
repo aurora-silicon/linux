@@ -1118,6 +1118,69 @@ pub mod g16 {
         assert!(!pools.retired_at(0,6).unwrap());
     }
 
+    #[test]fn per_unit_hold_and_verify_held_match_batch_and_reject_unheld_slots(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
+        let mut passes=KVec::new();
+        for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
+            passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
+        }
+        let render=sync::Arc::new(g16::resources::RenderArena{
+            passes,
+            tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
+            tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
+        },0).unwrap();
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render)};
+        let a=vm(1);let b=vm(2);
+
+        // Per-unit compute hold_compute_slot + verify_held + note_published.
+        let mut cc=Claims::new();
+        let k0=s.claim_compute_for(&prep,&mut cc,Some(a.id)).unwrap().unwrap();
+        assert_eq!(s.verify_held(&cc),Err(EINVAL));
+        assert_eq!(s.hold_compute_slot(g16::hw::sizes::COMPUTE_UNITS,&a,&prep),Err(EINVAL));
+        s.hold_compute_slot(k0,&a,&prep).unwrap();
+        s.verify_held(&cc).unwrap();
+        s.publish(&cc).unwrap();
+        s.note_published(&cc);
+        s.retire(&mut cc).unwrap();
+
+        // High render pass slots (46, 47) held individually via hold_render_pass.
+        let mut cr=Claims::new();
+        for (i,&k) in [46usize,47].iter().enumerate() {
+            s.claim_pass_in(&prep,k,Some(a.id),0x1000).unwrap();
+            cr.pass[i]=k as u32;
+            cr.pass_count+=1;
+            cr.pass_mask|=1u64<<k;
+            s.pass_busy|=1u64<<k;
+            assert_eq!(s.verify_held(&cr),Err(EINVAL));
+            s.hold_render_pass(k,&a,&prep).unwrap();
+            s.verify_held(&cr).unwrap();
+        }
+        assert_eq!(s.hold_render_pass(g16::hw::sizes::RENDER_SLOTS,&a,&prep),Err(EINVAL));
+        let mut bad=cr;
+        bad.pass_mask^=1u64<<1;
+        assert_eq!(s.verify_held(&bad),Err(EINVAL));
+        let mut dup=cr;
+        dup.pass[1]=46;
+        assert_eq!(s.verify_held(&dup),Err(EINVAL));
+        s.publish(&cr).unwrap();
+        s.note_published(&cr);
+        s.retire(&mut cr).unwrap();
+
+        // Cross-VM reuse of displaced slot 46 records retarget via bit-set note_published.
+        let mut cr2=Claims::new();
+        s.claim_pass_in(&prep,46,Some(b.id),0x1000).unwrap();
+        cr2.pass[0]=46;cr2.pass_count=1;cr2.pass_mask=1u64<<46;s.pass_busy|=1u64<<46;
+        s.hold_render_pass(46,&b,&prep).unwrap();
+        s.verify_held(&cr2).unwrap();
+        s.publish(&cr2).unwrap();
+        s.note_published(&cr2);
+        assert_eq!(s.stats.cross_vm_retargets[1],1);
+        assert_eq!(s.stats.last_retarget[1].unit,46);
+        assert_eq!(s.stats.last_retarget[1].old_vm,1);
+        assert_eq!(s.stats.last_retarget[1].new_vm,2);
+        s.retire(&mut cr2).unwrap();
+    }
+
     #[test]fn render_ext_tiers_grow_on_demand_and_keep_shallow_clients_bounded(){
         use crate::g16::resources::{BASE_RENDER_SLOTS, EXT_RENDER_TIERS, target_render_slots};
         let tier0_end = EXT_RENDER_TIERS[0].1;
@@ -1427,7 +1490,7 @@ for command in [
         raise SystemExit(result.returncode)
 files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs']
 (out/'resource-host.json').write_text(json.dumps({
-    'result': 'pass', 'tests': 33,
+    'result': 'pass', 'tests': 34,
     'scope': 'Actual production allocation, initialization and lifetime code against a CPU-only backing recorder; no hardware qualification.',
     'private_rw_pte': hex(private_rw),
     'private_rw_reference': 'Qualified J713 NC read/write leaf attributes',
