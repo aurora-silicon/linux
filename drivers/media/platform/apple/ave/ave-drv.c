@@ -238,7 +238,7 @@ const struct ave_variant ave_m3 = {
 };
 
 /*
- * debugfs: apple-ave/last_start_{h264,hevc} hold the last Start built and
+ * debugfs: apple-ave-<dev>/last_start_{h264,hevc} hold the last Start built and
  * last_process0_{h264,hevc} the first Process of the last session, so the
  * generated commands can be compared with reference captures.
  */
@@ -394,10 +394,13 @@ static void ave_debugfs_init(struct ave_dev *ave)
 		{ "last_start_h264", "last_process0_h264" },
 		{ "last_start_hevc", "last_process0_hevc" },
 	};
+	char dir_name[64];
 
 	if (!IS_ENABLED(CONFIG_DEBUG_FS) || !ave->layout)
 		return;
-	ave->debugfs = debugfs_create_dir("apple-ave", NULL);
+	snprintf(dir_name, sizeof(dir_name), "apple-ave-%s",
+		 dev_name(ave->dev));
+	ave->debugfs = debugfs_create_dir(dir_name, NULL);
 	if (ave->layout->abi == &ave_abi_6070) {
 		debugfs_create_file("lifecycle_test", 0200, ave->debugfs, ave,
 				    &ave_lifecycle_fops);
