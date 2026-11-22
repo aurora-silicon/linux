@@ -1416,6 +1416,18 @@ static int macsmc_hwmon_die_register(struct macsmc_hwmon *hwmon)
 			 hwmon->die_listed);
 		return 0;
 	}
+	/*
+	 * A board that marks its key list complete has every listed key in
+	 * its firmware. A missing key there is a discovery failure, so there
+	 * is no zone rather than one that leaves out part of the die, such
+	 * as a CPU-only zone when a GPU key is missing.
+	 */
+	if (of_property_read_bool(hwmon->dev->of_node, "apple,soc-die-keys-complete") &&
+	    hwmon->die_count != hwmon->die_listed) {
+		dev_warn(hwmon->dev, "no SoC die temperature zone: only %u of %u required keys is present\n",
+			 hwmon->die_count, hwmon->die_listed);
+		return 0;
+	}
 
 	for (i = 0; i < hwmon->temp.count && len + 6 <= sizeof(keys); i++) {
 		smc_key key = hwmon->temp.sensors[i].macsmc_key;

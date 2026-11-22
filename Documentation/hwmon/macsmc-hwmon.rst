@@ -50,7 +50,9 @@ the ``temperature-*`` children, in list order, with labels ``SoC die <key>``.
 Only readable four-byte floating-point keys are used. When thermal support is
 enabled, their hottest reading supplies the ``macsmc_soc_die`` thermal zone.
 A failed or implausible reading fails the zone read rather than reporting a
-partial result. Keys absent from the firmware are skipped.
+partial result. Keys absent from the firmware are skipped. When the node also
+has ``apple,soc-die-keys-complete``, the zone is registered only when every
+listed key is present.
 With ``apple,discover-temperatures`` the listed keys add no channels: the
 discovered channel of each listed key, labelled with the key, joins the zone.
 

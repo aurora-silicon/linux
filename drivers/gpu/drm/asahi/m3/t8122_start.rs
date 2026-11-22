@@ -16,7 +16,18 @@
 //! | `asahi.t8122_sgx_setup` | `t6030`: SGX+0xd14000 = 0x70001 | `none` |
 //! | `asahi.t8122_unit_mask_a` | `0x700000003` | nonzero, within `0x700000003` |
 //! | `asahi.t8122_unit_mask_b` | `0x7` | nonzero, within `0x7` |
-//! | `asahi.t8122_pstate_cap` | `2` | 1 to 5 |
+//! | `asahi.t8122_pstate_cap` | `8` with `apple,soc-die-keys-complete` and `asahi.m3_thermal=on`, else `2` | 1 to 5; 6 to 8 with `asahi.m3_thermal=on` |
+//!
+//! Where the device tree marks its SoC die key list complete (`apple,soc-die-keys-complete`, as
+//! the J615 tree does) states 6 to 8 are the default ceiling and need no parameter; the
+//! parameters only override. A T8122 without the property keeps the ceiling of 2.
+//!
+//! A cap above 2 is the thermal limit's ceiling (`m3_thermal`), not a fixed cap: the runtime
+//! cap starts at 2 and rises above it only while `asahi.m3_thermal` is on (the default) and the
+//! limit reads a usable SoC die temperature; it is back at 2 without one or at the critical
+//! temperature. With `hold` it stays at 2; with `off` the cap is a fixed 2. A cap of 6 to 8
+//! needs `on`: with `hold` or `off` it is lowered to 5 first, with one boot line, and the GPU
+//! still starts (`t8122_knobs::pstate_cap_use`).
 //!
 //! The defaults are the T8122 table's values. A parameter given with a value it does not accept
 //! refuses the start. Unlisted boards remain refused by the existing backend admission.
@@ -32,10 +43,11 @@ use crate::{
     m3::m3_adt_config::T8122_IO_MAPPINGS,
     m3::m3_init_storage::{self as storage, IoMap},
     m3::m3_soc::{IoMapping, Soc, T8122_HWDATA_B},
+    m3::m3_thermal_policy::ThermalMode,
     pgtable::{prot, Prot},
     m3::t8122_knobs::{
-        self as knobs, ClockGen, Start, Values, CLOCK_GEN_E1C, CLOCK_GEN_E5C, FENDER_ADT,
-        FENDER_RULE,
+        self as knobs, CapUse, ClockGen, Feedback, Start, Values, CLOCK_GEN_E1C, CLOCK_GEN_E5C,
+        FENDER_ADT, FENDER_RULE,
     },
 };
 
@@ -138,6 +150,16 @@ const _: () = {
     assert!(knobs::UNIT_MASK_B as u64 & !knobs::UNIT_MASK_B_LIMIT == 0);
     assert!(offset_of!(raw::HwDataBG15V14_8_3, unit_mask_a) == 0x17c0);
     assert!(offset_of!(raw::HwDataBG15V14_8_3, unit_mask_b) == 0x17c8);
+    // The ceiling the experiment accepts without the thermal limit on is the driver's own
+    // no-feedback limit, the fallback is the T8122 safe cap that `PstatePolicy::new` computes
+    // (`ThermalMode::pstate_caps`), and the default ceiling needs no feedback.
+    assert!(
+        knobs::PSTATE_CAP_NO_FEEDBACK_MAX == crate::m3::m3_thermal_policy::ADT_MAX_PSTATE_LIMIT
+    );
+    assert!(knobs::PSTATE_FALLBACK == crate::m3::m3_thermal_policy::T8122_SAFE_PSTATE);
+    assert!(knobs::PSTATE_FALLBACK <= knobs::PSTATE_CAP);
+    assert!(knobs::PSTATE_CAP <= knobs::PSTATE_CAP_NO_FEEDBACK_MAX);
+    assert!(knobs::PSTATE_CAP_NO_FEEDBACK_MAX <= knobs::PSTATE_CAP_MAX);
     // An armed start skips `require_complete`. The only `unported` item of the T8122 table is the
     // opt-in itself; if another is added, this fails the build until the start accounts for it.
     assert!(crate::m3::m3_soc::T8122.unported.len() == 1);
@@ -145,7 +167,7 @@ const _: () = {
 
 /// The values of one armed boot.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct Experiment(Values);
+pub(crate) struct Experiment(Values, bool);
 
 /// Whether `soc` is the T8122 table.
 pub(crate) fn is_t8122(soc: &Soc) -> bool {
@@ -220,10 +242,42 @@ impl Experiment {
         self.0.sgx_setup
     }
 
+    /// Whether the device tree marks its SoC die key list complete
+    /// (`apple,soc-die-keys-complete`).
+    pub(crate) fn die_keys_complete(&self) -> bool {
+        self.1
+    }
+
     /// The highest performance state the firmware may use (`asahi.t8122_pstate_cap`).
     pub(crate) fn pstate_cap(&self) -> u32 {
         self.0.pstate_cap
     }
+
+    /// What that cap gives the firmware with the thermal limit in `mode`: the ceiling, the
+    /// runtime cap's fallback and whether the runtime cap may rise above it.
+    pub(crate) fn cap_use(&self, mode: ThermalMode) -> CapUse {
+        knobs::pstate_cap_use(self.0.pstate_cap, feedback(mode))
+    }
+
+    /// The ceiling `m3_adt_config::PstatePolicy::new` is given with the thermal limit in
+    /// `mode`: the cap, lowered to 5 if it is above 5 and the limit is not on.
+    pub(crate) fn admitted_cap(&self, mode: ThermalMode) -> u32 {
+        knobs::admitted_cap(self.0.pstate_cap, feedback(mode))
+    }
+}
+
+/// The thermal limit's mode as the ceiling sees it.
+fn feedback(mode: ThermalMode) -> Feedback {
+    match mode {
+        ThermalMode::Off => Feedback::Off,
+        ThermalMode::Hold => Feedback::Hold,
+        ThermalMode::On => Feedback::On,
+    }
+}
+
+/// `asahi.m3_thermal`; unset is on, as in `m3_adt_config::PstatePolicy::new`.
+fn thermal_mode() -> ThermalMode {
+    crate::m3::m3_params::thermal_param().unwrap_or(ThermalMode::On)
 }
 
 /// Firmware page protection of the IO map of `slot`, with the read-only slots `read_only`.
@@ -271,7 +325,15 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
         dev_err!(dev, "M3 G15G start: refused: the T8122 table is not the one this experiment expects\n");
         return Err(ENODEV);
     }
-    let v = knobs::resolve(&raw).map_err(|refusal| {
+    // Where the device tree marks its SoC die key list complete the ceiling defaults to all
+    // eight states. The hwmon driver then registers the SoC die zone only with every listed key
+    // present, and the runtime cap still starts at and falls back to 2 and rises only while the
+    // thermal limit reads a usable temperature from that zone. Elsewhere, or with the limit not
+    // on, the default is the old 2. `asahi.t8122_pstate_cap` overrides either.
+    let mode = thermal_mode();
+    let die_keys_complete = crate::m3::m3_board::soc_die_keys_complete();
+    let default_cap = knobs::default_pstate_cap(die_keys_complete, feedback(mode));
+    let v = knobs::resolve_with(&raw, default_cap).map_err(|refusal| {
         dev_err!(
             dev,
             "M3 G15G start: refused: asahi.{} has a value it does not accept ({}); GPU startup disabled\n",
@@ -280,7 +342,10 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
         );
         ENODEV
     })?;
-    let e = Experiment(v);
+    // A cap above the no-feedback limit is the thermal limit's ceiling. Without the limit on it
+    // is lowered to the no-feedback limit (below), so the GPU still starts.
+    let u = knobs::pstate_cap_use(v.pstate_cap, feedback(mode));
+    let e = Experiment(v, die_keys_complete);
     dev_warn!(
         dev,
         "M3 G15G start: armed (board default or asahi.t8122_start=1, boot loader handoff admitted): initdata_version={:#018x} fender={:#x} clkgen={} sgx_setup={} unit_mask_a={:#x} unit_mask_b={:#x} pstate_cap={}\n",
@@ -301,17 +366,59 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
         e.mapping_count(),
         storage::IOMAP_BASE
     );
-    // J613/J615 have no SoC die temperature zone yet, so a cap above the no-feedback limit runs
-    // the fanless GPU without any temperature feedback (`m3_thermal` holds the cap but gets no
-    // reading). The runtime cap and the firmware ceiling stay equal, because the cap is at most
-    // the no-feedback limit.
-    if v.pstate_cap > knobs::PSTATE_CAP {
+    // The runtime cap starts at the fallback (2) and the firmware may use states up to the
+    // ceiling only as far as the runtime cap allows. Whether a SoC die temperature zone exists is
+    // not known here: the SMC hwmon driver that registers it may probe seconds after the GPU
+    // (7.6 s against 1.6 s on a J615). With the thermal limit on or holding (the default),
+    // `m3_thermal` says so when its reading finds no zone. `asahi.m3_max_pstate` can lower the
+    // ceiling further (`PstatePolicy::new`); the "firmware highest state" line then has the
+    // result.
+    let lowered = if crate::m3::m3_params::max_pstate_param().is_some() {
+        " (asahi.m3_max_pstate can lower that; see the firmware highest state line)"
+    } else {
+        ""
+    };
+    let admitted = e.admitted_cap(mode);
+    // The print macros take plain expressions only, so the mode's name is chosen here.
+    let mode_name = if mode == ThermalMode::Off { "off" } else { "hold" };
+    if admitted < v.pstate_cap {
         dev_warn!(
             dev,
-            "M3 G15G start: pstate_cap={} is above {}: no SoC die temperature zone on this board, so states up to {} run with no temperature feedback\n",
+            "M3 G15G start: pstate_cap={} lowered to {}: states above {} need asahi.m3_thermal=on (the default); with asahi.m3_thermal={} the firmware gets states up to {} and the runtime cap stays at {}\n",
             v.pstate_cap,
-            knobs::PSTATE_CAP,
-            v.pstate_cap
+            admitted,
+            knobs::PSTATE_CAP_NO_FEEDBACK_MAX,
+            mode_name,
+            u.ceiling,
+            u.fallback
+        );
+    } else if u.ranges {
+        dev_warn!(
+            dev,
+            "M3 G15G start: pstate_cap={} is above {}: the runtime cap starts at {} and rises to at most {}{} only while the thermal limit reads a usable SoC die temperature (asahi.m3_thermal=on)\n",
+            v.pstate_cap,
+            u.fallback,
+            u.fallback,
+            u.ceiling,
+            lowered
+        );
+    } else if u.ceiling > u.fallback {
+        dev_warn!(
+            dev,
+            "M3 G15G start: pstate_cap={} is above {}: asahi.m3_thermal=hold gives the firmware states up to {}{} and keeps the runtime cap at {} for this boot\n",
+            v.pstate_cap,
+            u.fallback,
+            u.ceiling,
+            lowered,
+            u.fallback
+        );
+    } else if v.pstate_cap > u.ceiling {
+        dev_warn!(
+            dev,
+            "M3 G15G start: pstate_cap={} with the thermal limit off (asahi.m3_thermal=off): states above {} need temperature feedback, so the firmware gets states up to {}\n",
+            v.pstate_cap,
+            u.ceiling,
+            u.ceiling
         );
     }
     Ok(Some(e))
