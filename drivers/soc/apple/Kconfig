@@ -128,6 +128,17 @@ config APPLE_SOC_SLEEP_KUNIT_TEST
 
 	  If unsure, say N.
 
+config APPLE_T6050_AOP_KUNIT_TEST
+	bool "KUnit tests for the T6050 AOP2 driver" if !KUNIT_ALL_TESTS
+	depends on APPLE_SOC_SLEEP && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Checks that each AOP2 endpoint gets one ring buffer for as long as
+	  its firmware runs, and that a ring is read only inside it. The tests
+	  touch no hardware.
+
+	  If unsure, say N.
+
 config APPLE_RTKIT
 	tristate "Apple RTKit co-processor IPC protocol"
 	depends on APPLE_MAILBOX
