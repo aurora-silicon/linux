@@ -672,9 +672,23 @@ static int avd_h264_validate_slice(struct avd_ctx *ctx,
 	return 0;
 }
 
-static int avd_h264_validate_sps(struct avd_ctx *ctx,
-				 const struct v4l2_ctrl_h264_sps *sps)
+/*
+ * H.264 7.4.2.1.1: the picture is PicWidthInMbs macroblocks wide and
+ * FrameHeightInMbs = (2 - frame_mbs_only_flag) * PicHeightInMapUnits high.
+ * The decoded buffers and the per-row scratch are sized from the OUTPUT
+ * format, which S_FMT rounds up to whole macroblocks, so a picture must fit
+ * in it.
+ */
+VISIBLE_IF_KUNIT int avd_h264_validate_sps(struct avd_ctx *ctx,
+					   const struct v4l2_ctrl_h264_sps *sps)
 {
+	u32 width = (sps->pic_width_in_mbs_minus1 + 1) * 16;
+	u32 height = (sps->pic_height_in_map_units_minus1 + 1) * 16 *
+		     (sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY ? 1 : 2);
+
+	if (width > ctx->coded_fmt.fmt.pix_mp.width ||
+	    height > ctx->coded_fmt.fmt.pix_mp.height)
+		return -EINVAL;
 	if (sps->chroma_format_idc > 2)
 		/* Only 4:0:0, 4:2:0 and 4:2:2 are supported */
 		return -EINVAL;
@@ -697,6 +711,7 @@ static int avd_h264_validate_sps(struct avd_ctx *ctx,
 
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(avd_h264_validate_sps);
 
 /* Free the slices held for one bank's picture. */
 static void avd_h264_drop_bank_slices(struct avd_ctx *ctx, struct avd_bank *bank)

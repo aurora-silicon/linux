@@ -393,6 +393,8 @@ int avd_av1_check_tiles(struct device *dev, unsigned int tile_rows,
 			unsigned int tile_cols,
 			const struct v4l2_ctrl_av1_tile_group_entry *tile_group,
 			unsigned int entries, size_t payload);
+int avd_h264_validate_sps(struct avd_ctx *ctx,
+			  const struct v4l2_ctrl_h264_sps *sps);
 int avd_try_capture_fmt(struct file *file, void *priv, struct v4l2_format *f);
 int avd_s_capture_fmt(struct file *file, void *priv, struct v4l2_format *f);
 int avd_vp9_check_tiling(const struct v4l2_ctrl_vp9_frame *frame);
