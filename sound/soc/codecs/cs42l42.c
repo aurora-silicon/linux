@@ -1153,6 +1153,11 @@ static int cs42l42_unmute_locked(struct snd_soc_component *component, int stream
  * The unmutes that ASoC's card resume asked for, run once the host clocks the
  * stream again: the host DAI's trigger has run before the codec DAI's, so SCLK
  * runs. With the PLL the lock below is the codec's own proof of that.
+ *
+ * The held unmute is only dropped once it has been applied. If the PLL does
+ * not lock, the codec stays on the oscillator and the unmute stays held for
+ * the stream's next START, RESUME or PAUSE_RELEASE: with PCM RESUME there may
+ * be no new prepare to unmute it.
  */
 static void cs42l42_resume_unmute_work(struct work_struct *work)
 {
@@ -1163,12 +1168,18 @@ static void cs42l42_resume_unmute_work(struct work_struct *work)
 	guard(mutex)(&cs42l42->stream_lock);
 	for_each_pcm_streams(stream) {
 		if (!test_bit(stream, &cs42l42->resume_unmute_clocked) ||
-		    !test_and_clear_bit(stream, &cs42l42->resume_unmute))
+		    !test_bit(stream, &cs42l42->resume_unmute))
 			continue;
 
 		ret = cs42l42_unmute_locked(cs42l42->resume_unmute_dai->component, stream);
-		if (ret)
+		if (ret) {
+			/* SCLK is not there yet: wait for the next trigger */
+			clear_bit(stream, &cs42l42->resume_unmute_clocked);
 			dev_warn(cs42l42->dev, "unmute after resume failed: %d\n", ret);
+			continue;
+		}
+
+		clear_bit(stream, &cs42l42->resume_unmute);
 	}
 }
 

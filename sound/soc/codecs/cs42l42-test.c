@@ -549,6 +549,8 @@ static void cs42l42_test_resume_without_host_clock(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, priv->regs[CS42L42_HP_CTL] & CS42L42_TEST_HP_MUTE_MASK,
 			CS42L42_TEST_HP_MUTE_MASK);
 	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, 0);
+	KUNIT_EXPECT_TRUE(test, test_bit(SNDRV_PCM_STREAM_PLAYBACK,
+					 &priv->cs42l42.resume_unmute));
 
 	/* Stopped and prepared again, it switches */
 	cs42l42_test_clear_log(priv);
@@ -556,6 +558,51 @@ static void cs42l42_test_resume_without_host_clock(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_PREPARE), 0);
 	cs42l42_test_expect_switch_to_pll(test, clk, false);
 	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, BIT(SNDRV_PCM_STREAM_PLAYBACK));
+}
+
+/*
+ * A PLL that fails to lock after RESUME keeps the unmute held: with no new
+ * prepare, the stream's next trigger from a clocking host switches the codec
+ * onto SCLK and unmutes it.
+ */
+static void cs42l42_test_resume_pll_fail_keeps_held_unmute(struct kunit *test)
+{
+	const struct cs42l42_test_clk_param *clk = &cs42l42_test_pll_clks[0];
+	struct cs42l42_test_priv *priv = test->priv;
+	struct snd_pcm_substream *substream;
+	struct cs42l42_test_pcm *pcm;
+
+	if (!IS_ENABLED(CONFIG_PM))
+		kunit_skip(test, "card power state needs CONFIG_PM");
+	pcm = cs42l42_test_suspend_resume(test);
+	substream = pcm->pcm_file.substream;
+	pcm->host_clocks = false;
+
+	KUNIT_EXPECT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_RESUME), 0);
+	flush_work(&priv->cs42l42.resume_unmute_work);
+	KUNIT_EXPECT_GT(test, priv->num_lock_reads, 0);
+	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, 0);
+	KUNIT_EXPECT_EQ(test, priv->regs[CS42L42_HP_CTL] & CS42L42_TEST_HP_MUTE_MASK,
+			CS42L42_TEST_HP_MUTE_MASK);
+	KUNIT_EXPECT_TRUE(test, test_bit(SNDRV_PCM_STREAM_PLAYBACK,
+					 &priv->cs42l42.resume_unmute));
+
+	/* The host clocks the next START: host DAI first, then the codec DAI */
+	pcm->host_clocks = true;
+	cs42l42_test_clear_log(priv);
+	KUNIT_EXPECT_EQ(test, cs42l42_test_cpu_trigger(substream, SNDRV_PCM_TRIGGER_START,
+						       &pcm->cpu), 0);
+	KUNIT_EXPECT_EQ(test, priv->dai.driver->ops->trigger(substream,
+							     SNDRV_PCM_TRIGGER_START,
+							     &priv->dai), 0);
+	flush_work(&priv->cs42l42.resume_unmute_work);
+
+	KUNIT_EXPECT_EQ(test, pcm->prepares, 1);
+	cs42l42_test_expect_switch_to_pll(test, clk, false);
+	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, BIT(SNDRV_PCM_STREAM_PLAYBACK));
+	KUNIT_EXPECT_EQ(test, priv->regs[CS42L42_HP_CTL] & CS42L42_TEST_HP_MUTE_MASK, 0);
+	KUNIT_EXPECT_FALSE(test, test_bit(SNDRV_PCM_STREAM_PLAYBACK,
+					  &priv->cs42l42.resume_unmute));
 }
 
 /* A SoundWire codec is clocked by its bus: the D2 unmute goes ahead */
@@ -815,6 +862,7 @@ static struct kunit_case cs42l42_test_cases[] = {
 	KUNIT_CASE(cs42l42_test_resume_prepare_replaces_held_unmute),
 	KUNIT_CASE(cs42l42_test_resume_mute_drops_held_unmute),
 	KUNIT_CASE(cs42l42_test_resume_without_host_clock),
+	KUNIT_CASE(cs42l42_test_resume_pll_fail_keeps_held_unmute),
 	KUNIT_CASE(cs42l42_test_soundwire_unmutes_below_d0),
 	KUNIT_CASE(cs42l42_test_capture_resume_remains_supported),
 	KUNIT_CASE_PARAM(cs42l42_test_unmute_pll_locked, cs42l42_test_pll_clks_gen_params),
