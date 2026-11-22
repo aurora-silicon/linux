@@ -295,7 +295,8 @@ impl SyncItem {
 
         const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_sync>();
         let size = STRIDE.checked_mul(count as usize).ok_or(EOVERFLOW)?;
-        let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL)?;
+        // Userspace picks the count: a request too large fails, it does not warn.
+        let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL | __GFP_NOWARN)?;
         let mut anchor = None;
 
         // Read each record once so validation and use see the same retained bytes.
@@ -1136,7 +1137,8 @@ impl File {
             .checked_mul(usize::try_from(data.num_binds)?)
             .ok_or(EOVERFLOW)?;
         let reader = UserSlice::new(UserPtr::from_addr(data.userptr as usize), size).reader();
-        reader.read_all(&mut vec, GFP_KERNEL)?;
+        // Without a GPU batch limit, userspace picks the size: fail, do not warn.
+        reader.read_all(&mut vec, GFP_KERNEL | __GFP_NOWARN)?;
         let mut reader = Reader::new(&vec);
 
         for _i in 0..data.num_binds {
@@ -1155,7 +1157,7 @@ impl File {
         let mut bytes = KVec::new();
         UserSlice::new(UserPtr::from_addr(data.userptr as usize), size)
             .reader()
-            .read_all(&mut bytes, GFP_KERNEL)?;
+            .read_all(&mut bytes, GFP_KERNEL | __GFP_NOWARN)?;
         let (vm, user_range, kernel_range) = {
             let vms = file.inner().vms();
             let guard = vms.lock();
@@ -1822,7 +1824,7 @@ impl File {
                 data.cmdbuf_size as usize,
             )
             .reader()
-            .read_all(bytes, GFP_KERNEL)
+            .read_all(bytes, GFP_KERNEL | __GFP_NOWARN)
         };
         let guarded = gpu.as_any().is::<crate::g17::Gpu>() || gpu.tracked_submission();
         // Once G17 output syncobjs are resolved, its queue must install a fence

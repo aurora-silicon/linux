@@ -346,8 +346,10 @@ impl WorkItem for GpuManager::ver {
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
 pub(crate) trait Gpu: Send + Sync {
     /// Admission bound checked before copying the userspace command stream.
+    /// Finite, so an oversized SUBMIT fails with E2BIG instead of asking the
+    /// allocator for up to 4 GiB: four times the 4 MiB G15 and G16 accept.
     fn max_cmdbuf_size(&self) -> usize {
-        usize::MAX
+        16 << 20
     }
 
     /// The firmware statistics snapshot of this GPU, if its firmware reports any.

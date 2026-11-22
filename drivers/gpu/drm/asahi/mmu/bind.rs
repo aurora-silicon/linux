@@ -45,7 +45,8 @@ pub(crate) struct PreparedUserBindBatch {
 impl PreparedUserBindBatch {
     pub(crate) fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
-            ops: KVec::with_capacity(capacity, GFP_KERNEL)?,
+            // The capacity is the caller's num_binds: fail, do not warn.
+            ops: KVec::with_capacity(capacity, GFP_KERNEL | __GFP_NOWARN)?,
         })
     }
     pub(crate) fn push_map(&mut self, map: PreparedUserMap) -> Result {
