@@ -207,6 +207,7 @@ ASAHI_TESTS = {
     'g15-stats-drain-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'g15-zero-words-tests.py': [([], PASS), (['--mutations'], PASS)],
     'g18-client-handoff-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
+    'g18-job-error-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'm5-client-handoff-tests.py': [([], PASS), (['--mutations'], PASS)],
     'g17-telemetry-integration-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('fields', 'range', 'timestamp', 'age', 'delivery',

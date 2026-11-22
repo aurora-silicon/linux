@@ -65,6 +65,9 @@ impl ApplicationJob {
         if let Some(status)=self.job.vm().status(){status.record(EIO);}
     }
     pub(crate) fn retired(&mut self) {self.retired=true;self.guard=None;}
+    /// No frame is committed: the last one retired and none was prepared
+    /// since, so the firmware holds nothing of this job beyond it.
+    pub(crate) fn unpublished(&self) -> bool {self.retired && self.guard.is_none()}
     /// One of the first frames of its client: logged even when job logging
     /// is sparse, so every isolated client leaves a kick/retirement pair.
     pub(crate) fn traced(&self) -> bool {self.client_frames<=3}
@@ -94,7 +97,8 @@ impl ApplicationJob {
             // maps the PB. The pool scratch is cleared as it is aliased.
             if new_client && self.generation!=0 {self.job.parameter_buffer.clear_client_data()?;}
         }
-        if self.generation==0 {
+        // Once: a first frame refused after this keeps the alias.
+        if self.generation==0 && self.job.aliases.is_empty() {
             let alias=self.job.graph.map_alias_at(uat.kernel_lower_vm(),va::GRAPHICS_JOB_LOW,
                 mmu::PROT_GPU_SHARED_RW)?;
             self.job.aliases.push(alias,GFP_KERNEL)?;
@@ -127,8 +131,6 @@ impl ApplicationJob {
         // Retract even an unchanged root before publish_h1's fresh lease
         // publication. Retain the mappings when the actual VM is unchanged.
         self.job.program.rebind_retired(vm)?;
-        self.guard=Some(guard);self.generation=frame.generation;self.retired=false;
-        self.client_frames=if new_client {1} else {self.client_frames.saturating_add(1)};
         if remap {
             crate::g18_kick_info!(dev.as_ref(),"G18_APP_VM frame={} vm={} context={} target={}x{} aliases={}\n",
                 frame.generation,vm.id(),self.job.context_id(),render.target.width,render.target.height,self.user_aliases.len());
@@ -153,6 +155,10 @@ impl ApplicationJob {
         self.job.signals.with_bytes_mut(|out| {out[0xc000..0xc020].fill(0);Ok(())})?;
         self.job.encoded=None;
         self.encode_application(dev,frame)?;
+        // Commit the frame only now: until here an error leaves the job
+        // retired, and the next prepare() rebuilds whatever this one changed.
+        self.guard=Some(guard);self.generation=frame.generation;self.retired=false;
+        self.client_frames=if new_client {1} else {self.client_frames.saturating_add(1)};
         Ok(())
     }
 
