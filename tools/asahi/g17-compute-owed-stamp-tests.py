@@ -78,7 +78,7 @@ def fixture():
         'pub(crate) fn quarantine(', 'pub(crate) fn retire(', 'fn classify_unexecuted(',
         'pub(crate) fn owns_packet(', 'pub(crate) fn retired_held(',
         'pub(crate) fn expire_stamp_wait(', 'pub(crate) fn timeout(',
-        'pub(crate) fn can_classify_timeout('])
+        'pub(crate) fn can_classify_timeout(', 'pub(crate) fn forfeit_head('])
     backend = '\n'.join([
         item(control, 'pub(super) fn defer_compute_timeout(').replace('pub(super) ', '', 1),
         item(control, 'fn retire_on_record('),
@@ -199,6 +199,10 @@ pub struct Packet { completion: Arc<Completion>, order: Order, context: Context 
 impl Packet {
     fn check_firmware_producers(&self) -> Result { Ok(()) }
     fn within_allowance(&self, _: u64) -> bool { false }
+    fn forfeit_allowance(&self) -> bool { true }
+    fn allowance_forfeited(&self) -> bool { false }
+    fn note_first_excuse(&self, _: u64) {}
+    fn first_excuse(&self) -> u64 { 0 }
 }
 pub struct WorkStateLease { drained: Cell<bool> }
 impl WorkStateLease { fn drained(&self) -> Result<bool> { Ok(self.drained.get()) } }
@@ -262,6 +266,15 @@ impl Queues {
     /// Other VMs' heads, as render pairs and other queues give them.
     fn render_timeout_heads(&self) -> impl Iterator<Item = g17::timeout::Head> + '_ {
         self.render.iter().copied()
+    }
+    fn forfeit_blocker(&self, verdict: &g17::timeout::Verdict, excuse: g17::timeout::Excuse,
+        first: u64) -> Option<g17::timeout::Head> {
+        let computes: Vec<_> = self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
+            .filter_map(|queue| queue.timeout_head()).collect();
+        let blocker = verdict.forfeits(excuse, first,
+            Iterator::chain(self.render_timeout_heads(), computes.into_iter()))?;
+        self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| queue.forfeit_head(blocker)).then_some(blocker)
     }
 }
 pub struct Init;

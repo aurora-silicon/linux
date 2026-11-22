@@ -380,6 +380,40 @@ impl Verdict {
             Decision::Retire => false,
         })
     }
+
+    /// The blocker a waiting job is first excused behind, by its publication: the command
+    /// that held the GPU when the waiting job started waiting. See [`Self::forfeits`].
+    pub(crate) fn first_excuse(&self, excuse: Excuse) -> Option<u64> {
+        self.blocker
+            .filter(|_| self.decision == Decision::Excuse && excuse.used == 0)
+            .map(|blocker| blocker.published)
+    }
+
+    /// The blocker that loses its allowance at this decision.
+    ///
+    /// The excuse ([`decide`]) is bounded per waiting job, but each command of a queue gets an
+    /// allowance of its own, so a queue kept full of long commands would excuse its blockers
+    /// one after the other until the waiting job is spared. Once the waiting job has used its
+    /// whole [`Excuse::limit`] and is deferred behind a live blocker that is still inside its
+    /// allowance, the blocker loses what is left of that allowance instead, so that the
+    /// waiting job's remaining renewals see it settled. Not the command the waiting job was
+    /// first excused behind (`first`, [`Self::first_excuse`]): that one started before the
+    /// wait and only runs on inside its own allowance. Nor a blocker that itself waits behind
+    /// older work of the waiting job's VM (`others`, every head), which does not hold it up.
+    pub(crate) fn forfeits(&self, excuse: Excuse, first: u64,
+        others: impl Iterator<Item = Head>) -> Option<Head> {
+        let candidate = self.blocker.filter(|blocker| {
+            self.decision == Decision::Defer
+                && blocker.excused
+                && !blocker.failed
+                && excuse.used >= excuse.limit
+                && blocker.published != first
+        })?;
+        match blocker(candidate, others) {
+            Some(ahead) if ahead.vm == self.own.vm => None,
+            _ => Some(candidate),
+        }
+    }
 }
 
 pub(crate) fn attribute(own: Head, renewals: u8, excuse: Excuse,
@@ -769,6 +803,92 @@ mod tests {
         assert_eq!(excuse_limit(0), 1);
         // The default maximum gives 15 + 8 renewals behind other VMs' live work: 46 s of them.
         assert_eq!(POLL_MS * (excuse_limit(30_000) + u32::from(MAX_RENEWALS)), 46_000);
+    }
+    #[test]
+    fn an_exhausted_excuse_charges_the_blocker() {
+        let own = head(9, 103, false);
+        let used = Excuse { used: FRESH.limit, ..FRESH };
+        let none = || core::iter::empty::<Head>();
+        // The first excuse names its blocker; inside the excuse nobody loses anything.
+        let inside = attribute(own, 0, FRESH, [excused(5, 100)].into_iter());
+        assert_eq!(inside.decision, Decision::Excuse);
+        assert_eq!(inside.first_excuse(FRESH), Some(100));
+        assert_eq!(inside.forfeits(FRESH, 0, none()), None);
+        let later = Excuse { used: 3, ..FRESH };
+        assert_eq!(attribute(own, 0, later, [excused(5, 100)].into_iter()).first_excuse(later),
+            None);
+        // Once it is used up, a later blocker still inside its allowance loses it.
+        let spent = attribute(own, 0, used, [excused(5, 101)].into_iter());
+        assert_eq!(spent.decision, Decision::Defer);
+        assert_eq!(spent.forfeits(used, 100, none()), Some(excused(5, 101)));
+        // Not the command the job was first excused behind: it runs inside its own allowance.
+        let first = attribute(own, 0, used, [excused(5, 100)].into_iter());
+        assert_eq!(first.forfeits(used, 100, none()), None);
+        // A job spared anyway does not take the blocker with it.
+        let late = attribute(own, MAX_RENEWALS, used, [excused(5, 101)].into_iter());
+        assert_eq!(late.decision, Decision::Spare);
+        assert_eq!(late.forfeits(used, 100, none()), None);
+        // A blocker without an allowance, or one that already failed, has nothing to lose.
+        assert_eq!(attribute(own, 0, used, [head(5, 101, false)].into_iter())
+            .forfeits(used, 100, none()), None);
+        let failed_in_allowance = Head { excused: true, ..failed(5, 101) };
+        assert_eq!(attribute(own, 0, used, [failed_in_allowance].into_iter())
+            .forfeits(used, 100, none()), None);
+        // Finished own work is retired, whatever is ahead.
+        assert_eq!(attribute(head(9, 103, true), 0, used, [excused(5, 101)].into_iter())
+            .forfeits(used, 100, none()), None);
+    }
+    #[test]
+    fn a_blocker_waiting_on_the_waiting_vm_keeps_its_allowance() {
+        let own = head(9, 103, false);
+        let used = Excuse { used: FRESH.limit, ..FRESH };
+        let spent = attribute(own, 0, used, [excused(5, 101)].into_iter());
+        // Older live work of the waiting job's own VM is ahead of the blocker: not its fault.
+        assert_eq!(spent.forfeits(used, 100, [head(9, 99, false)].into_iter()), None);
+        // Older work of a third VM, or newer work of the waiting VM, changes nothing.
+        assert_eq!(spent.forfeits(used, 100, [head(7, 99, false)].into_iter()),
+            Some(excused(5, 101)));
+        assert_eq!(spent.forfeits(used, 100, [head(9, 102, false), own].into_iter()),
+            Some(excused(5, 101)));
+    }
+    #[test]
+    fn blockers_taking_turns_lose_their_allowance_not_the_waiting_job() {
+        // Commands of one long queue reach the head by turns while another VM's job waits.
+        // With the forfeit applied, the command ahead once the excuse is used up loses its
+        // allowance, fails as its own at its next expiry and drains; the waiting job is never
+        // spared, and the command it was first excused behind keeps its allowance.
+        let own = head(9, 200, false);
+        let (mut renewals, mut excuse, mut polls) = (0u8, FRESH, 0u32);
+        let mut first = 0u64;
+        let mut forfeited: Option<(u64, u32)> = None;
+        loop {
+            let ahead = match forfeited {
+                None => Some(excused(5, 100 + u64::from(polls / 4))),
+                Some((published, at)) if polls == at + 1 => Some(head(5, published, false)),
+                Some((published, at)) if polls <= at + 3 => Some(failed(5, published)),
+                Some(_) => None,
+            };
+            let Some(ahead) = ahead else { break };
+            let verdict = attribute(own, renewals, excuse, [ahead].into_iter());
+            if let Some(published) = verdict.first_excuse(excuse) {
+                first = published;
+            }
+            if let Some(blocker) = verdict.forfeits(excuse, first, core::iter::empty()) {
+                assert!(forfeited.is_none());
+                assert_ne!(blocker.published, first);
+                forfeited = Some((blocker.published, polls));
+            }
+            match verdict.decision {
+                Decision::Excuse => excuse.used += 1,
+                Decision::Defer => renewals += 1,
+                decision => panic!("waiting job failed: {:?}", decision),
+            }
+            polls += 1;
+            assert!(polls < 100);
+        }
+        assert_eq!(first, 100);
+        assert_eq!(forfeited.map(|(_, at)| at), Some(FRESH.limit));
+        assert!(renewals < MAX_RENEWALS);
     }
     #[test]
     fn blockers_taking_turns_do_not_extend_the_excuse_or_the_renewals() {
