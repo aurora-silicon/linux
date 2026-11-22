@@ -102,6 +102,16 @@ struct avd_h264_ctx {
 	struct avd_bank bank[AVD_H264_BANKS];
 	/* bank of the picture being built */
 	struct avd_bank *b;
+
+	/* What the run being built took from the controls, see avd_ctrl_copy(). */
+	struct {
+		struct v4l2_ctrl_h264_decode_params decode_params;
+		struct v4l2_ctrl_h264_sps sps;
+		struct v4l2_ctrl_h264_pps pps;
+		struct v4l2_ctrl_h264_slice_params slice_params;
+		struct v4l2_ctrl_h264_scaling_matrix scaling_matrix;
+		struct v4l2_ctrl_h264_pred_weights pred_weights;
+	} params;
 };
 
 /* ffmpeg submits wrong timestamp, use first_mb_in_slice as a workaround */
@@ -824,27 +834,10 @@ err_free_ctx:
 	return ret;
 }
 
-static void avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
+static int avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
 {
-	struct v4l2_ctrl *ctrl;
+	struct avd_h264_ctx *h264_ctx = ctx->priv;
 	u32 dst_len, mv_color_len;
-
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_H264_DECODE_PARAMS);
-	run->decode_params = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_H264_SPS);
-	run->sps = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_H264_PPS);
-	run->pps = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_H264_SLICE_PARAMS);
-	run->slice_params = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_H264_SCALING_MATRIX);
-	run->scaling_matrix = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_H264_PRED_WEIGHTS);
-	run->pred_weights = ctrl ? ctrl->p_cur.p : NULL;
 
 	avd_run_preamble(ctx, &run->base);
 
@@ -853,6 +846,43 @@ static void avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
 	mv_color_len = mv_color_size(ctx, fmt_width(ctx), fmt_height(ctx));
 
 	run->addresses.mv_color = run->base.y_out + (dst_len - mv_color_len);
+
+	if (run->base.setup_err)
+		return run->base.setup_err;
+
+	/*
+	 * The checks in avd_h264_run() and the builders must see the same
+	 * parameters, and the controls can be set again at any time: use
+	 * copies.
+	 */
+	if (avd_ctrl_copy(ctx, V4L2_CID_STATELESS_H264_DECODE_PARAMS,
+			  &h264_ctx->params.decode_params,
+			  sizeof(h264_ctx->params.decode_params)) ||
+	    avd_ctrl_copy(ctx, V4L2_CID_STATELESS_H264_SPS,
+			  &h264_ctx->params.sps,
+			  sizeof(h264_ctx->params.sps)) ||
+	    avd_ctrl_copy(ctx, V4L2_CID_STATELESS_H264_PPS,
+			  &h264_ctx->params.pps,
+			  sizeof(h264_ctx->params.pps)) ||
+	    avd_ctrl_copy(ctx, V4L2_CID_STATELESS_H264_SLICE_PARAMS,
+			  &h264_ctx->params.slice_params,
+			  sizeof(h264_ctx->params.slice_params)) ||
+	    avd_ctrl_copy(ctx, V4L2_CID_STATELESS_H264_SCALING_MATRIX,
+			  &h264_ctx->params.scaling_matrix,
+			  sizeof(h264_ctx->params.scaling_matrix)) ||
+	    avd_ctrl_copy(ctx, V4L2_CID_STATELESS_H264_PRED_WEIGHTS,
+			  &h264_ctx->params.pred_weights,
+			  sizeof(h264_ctx->params.pred_weights)))
+		return -EINVAL;
+
+	run->decode_params = &h264_ctx->params.decode_params;
+	run->sps = &h264_ctx->params.sps;
+	run->pps = &h264_ctx->params.pps;
+	run->slice_params = &h264_ctx->params.slice_params;
+	run->scaling_matrix = &h264_ctx->params.scaling_matrix;
+	run->pred_weights = &h264_ctx->params.pred_weights;
+
+	return 0;
 }
 
 static int avd_h264_realloc_slices(struct avd_ctx *ctx, size_t max_slices)
@@ -1044,16 +1074,9 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		      h264_ctx->b->slice_num : 0;
 	int ret;
 
-	avd_h264_run_preamble(ctx, &run);
-
-	if (run.base.setup_err) {
-		ret = run.base.setup_err;
+	ret = avd_h264_run_preamble(ctx, &run);
+	if (ret)
 		goto err_free_jobs;
-	}
-	if (!run.sps || !run.pps || !run.slice_params || !run.decode_params) {
-		ret = -EINVAL;
-		goto err_free_jobs;
-	}
 
 	/* Recheck controls applied from this request before building instructions. */
 	ret = avd_h264_validate_sps(ctx, run.sps);
