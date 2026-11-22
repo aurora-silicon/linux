@@ -372,7 +372,14 @@ pub(crate) fn reserved_ranges() -> [Range<u64>; 2] {
 }
 
 /// Creates a user VM (`gpu::Gpu::new_vm`).
-pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Result<mmu::Vm> {
+///
+/// Kernel memory sized by the VM's client (its private arenas) is charged to `memory`.
+pub(crate) fn new_vm(
+    gpu: &Gpu,
+    kernel_range: Range<u64>,
+    file_id: u64,
+    memory: Option<Arc<crate::memacct::Client>>,
+) -> Result<mmu::Vm> {
     if gpu.shared.crashed.load(Ordering::Acquire) {
         return Err(EIO);
     }
@@ -387,10 +394,13 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Resul
     };
     let reservation = registry.reserve(file_id)?;
     let id = gpu.ids.vm.next();
-    let vm = gpu
+    let mut vm = gpu
         .uat
         .new_vm(id, kernel_range.clone())?
         .with_tracked_status()?;
+    if let Some(memory) = memory {
+        vm = vm.with_memory_client(memory);
+    }
     // Driver mappings retain their VM. Break that ownership if any later step fails,
     // including binding/state allocation and registry insertion.
     let failed_vm = kernel::types::ScopeGuard::new_with_data(vm.clone(), |vm| {

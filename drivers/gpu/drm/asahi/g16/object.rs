@@ -314,6 +314,7 @@ impl Factory {
             mappings: KVec::new(),
             error: None,
             pages: 0,
+            charges: KVec::new(),
         }
     }
 }
@@ -340,6 +341,8 @@ pub(crate) struct Objects {
     error: Option<Error>,
     /// Host-window pages backed by objects.
     pages: usize,
+    /// The charges of private objects sized by the VM's client, held as long as their backing.
+    charges: KVec<crate::memacct::Charge>,
 }
 
 impl Objects {
@@ -360,6 +363,7 @@ impl Objects {
             mappings: KVec::new(),
             error: None,
             pages: 0,
+            charges: KVec::new(),
         })
     }
 
@@ -417,7 +421,25 @@ impl Objects {
             & !(hw::PAGE as usize - 1);
         self.retained.reserve(1, GFP_KERNEL)?;
         self.mappings.reserve(3, GFP_KERNEL)?;
-        let mut backing = gem::new_kernel_object_wc(&self.dev, bytes)?;
+        // A client VM's arena is client memory: admitted against, and counted for, its client
+        // instead of the device's kernel total.
+        let charge = match private.vm.memory_client() {
+            Some(client) => {
+                self.charges.reserve(1, GFP_KERNEL)?;
+                let commit = crate::memacct::LEDGER.admit(client, bytes as u64)?;
+                Some(crate::memacct::Charge::user(commit, None))
+            }
+            None => None,
+        };
+        let mut backing = if charge.is_some() {
+            gem::new_kernel_object_wc_user_charged(&self.dev, bytes)?
+        } else {
+            gem::new_kernel_object_wc(&self.dev, bytes)?
+        };
+        if let Some(charge) = charge {
+            charge.set_held(true);
+            self.charges.push(charge, GFP_KERNEL)?;
+        }
         let registered = self.dev.registration_guard().ok_or(ENODEV)?;
         let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
         gem::prepare_new_object(&backing.gem, parent.as_ref())?;
