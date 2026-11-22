@@ -48,8 +48,86 @@ static void avd_vp9_tiling_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, avd_vp9_check_tiling(&frame), c->ret);
 }
 
+#define AVD_TEST_MAX_TILES	2
+
+struct avd_vp9_tiles_case {
+	const char *desc;
+	const u8 *data;
+	u32 payload;
+	u32 header;
+	unsigned int tiles;
+	int ret;
+	u32 offsets[AVD_TEST_MAX_TILES];
+	u32 sizes[AVD_TEST_MAX_TILES];
+};
+
+/* Two tiles after a 2-byte header: a 3-byte tile, then the rest. */
+static const u8 avd_test_two_tiles[] = {
+	0xaa, 0xbb, 0x00, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03, 0x04, 0x05,
+};
+
+/* The first tile's size reaches one byte past the payload. */
+static const u8 avd_test_long_tile[] = {
+	0xaa, 0xbb, 0x00, 0x00, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05,
+};
+
+/* The first tile's size is the largest u32. */
+static const u8 avd_test_huge_tile[] = {
+	0xaa, 0xbb, 0xff, 0xff, 0xff, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05,
+};
+
+/* The first tile fills the payload and leaves nothing for the last one. */
+static const u8 avd_test_no_last_tile[] = {
+	0xaa, 0xbb, 0x00, 0x00, 0x00, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05,
+};
+
+/* An empty first tile. */
+static const u8 avd_test_empty_tile[] = {
+	0xaa, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+};
+
+static const struct avd_vp9_tiles_case avd_vp9_tiles_cases[] = {
+	{ "one tile", avd_test_two_tiles, 11, 2, 1, 0, { 2 }, { 9 } },
+	{ "two tiles", avd_test_two_tiles, 11, 2, 2, 0, { 6, 9 }, { 3, 2 } },
+	{ "headers beyond the payload", avd_test_two_tiles, 11, 12, 1, -EINVAL },
+	{ "headers fill the payload", avd_test_two_tiles, 11, 11, 1, -EINVAL },
+	{ "headers beyond the payload, two tiles", avd_test_two_tiles, 11,
+	  0xffff + 0xffff, 2, -EINVAL },
+	{ "three bytes for a tile size", avd_test_two_tiles, 5, 2, 2, -EINVAL },
+	{ "no bytes for a tile size", avd_test_two_tiles, 2, 2, 2, -EINVAL },
+	{ "tile beyond the payload", avd_test_long_tile, 11, 2, 2, -EINVAL },
+	{ "tile size wraps", avd_test_huge_tile, 11, 2, 2, -EINVAL },
+	{ "no data for the last tile", avd_test_no_last_tile, 11, 2, 2, -EINVAL,
+	  { 6 }, { 5 } },
+	{ "empty tile", avd_test_empty_tile, 11, 2, 2, -EINVAL },
+	{ "no mapping", NULL, 11, 2, 1, -EINVAL },
+};
+
+KUNIT_ARRAY_PARAM_DESC(avd_vp9_tiles, avd_vp9_tiles_cases, desc);
+
+/* Walks the tiles as set_tiles() does. */
+static void avd_vp9_tiles_test(struct kunit *test)
+{
+	const struct avd_vp9_tiles_case *c = test->param_value;
+	u32 offset = c->header, size;
+	int ret = 0;
+
+	for (unsigned int i = 0; i < c->tiles; i++) {
+		ret = avd_vp9_next_tile(c->data, c->payload, i == c->tiles - 1,
+					&offset, &size);
+		if (ret)
+			break;
+		KUNIT_EXPECT_EQ(test, offset, c->offsets[i]);
+		KUNIT_EXPECT_EQ(test, size, c->sizes[i]);
+		KUNIT_EXPECT_LE(test, (u64)offset + size, (u64)c->payload);
+		offset += size;
+	}
+	KUNIT_EXPECT_EQ(test, ret, c->ret);
+}
+
 static struct kunit_case avd_vp9_test_cases[] = {
 	KUNIT_CASE_PARAM(avd_vp9_tiling_test, avd_vp9_tiling_gen_params),
+	KUNIT_CASE_PARAM(avd_vp9_tiles_test, avd_vp9_tiles_gen_params),
 	{}
 };
 

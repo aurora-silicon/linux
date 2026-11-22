@@ -493,19 +493,53 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 		set_refs(ctx, run);
 }
 
-static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
+/*
+ * Find the next tile in the frame (VP9 6.4 decode_tiles()): at @offset each
+ * tile but the last starts with its size as a 32-bit big-endian word, the
+ * last one takes the rest of the payload. Returns the tile's data offset in
+ * @offset and its size in @size, both within @payload. A tile holds at least
+ * one byte (9.2.1: sz is at least 1).
+ */
+VISIBLE_IF_KUNIT int avd_vp9_next_tile(const u8 *data, u32 payload, bool last,
+				       u32 *offset, u32 *size)
+{
+	u32 off = *offset, tile_size;
+
+	if (!data || off > payload)
+		return -EINVAL;
+
+	if (last) {
+		tile_size = payload - off;
+	} else {
+		if (payload - off < 4)
+			return -EINVAL;
+		tile_size = get_unaligned_be32(&data[off]);
+		off += 4;
+		if (tile_size > payload - off)
+			return -EINVAL;
+	}
+	if (!tile_size)
+		return -EINVAL;
+
+	*offset = off;
+	*size = tile_size;
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_vp9_next_tile);
+
+static int set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 {
 	const struct v4l2_ctrl_vp9_frame *frame = run->decode_params;
 	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
 	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
-
+	u32 payload = vb2_get_plane_payload(&src->vb2_buf, 0);
 	u32 offset =
 		frame->uncompressed_header_size + frame->compressed_header_size;
-	u32 size = vb2_get_plane_payload(&src->vb2_buf, 0) - offset;
 	u32 num_tile_rows = 1 << frame->tile_rows_log2;
 	u32 num_tile_cols = 1 << frame->tile_cols_log2;
 	u32 tile_size;
+	int ret;
 
 	/* 6.2.6 Compute image size syntax */
 	u32 sb_64_cols = (((frame->frame_width_minus_1 + 8) >> 3) + 7) >> 3;
@@ -513,18 +547,15 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 
 	for (int row = 0; row < num_tile_rows; row++)
 		for (int col = 0; col < num_tile_cols; col++) {
+			/* Every tile lies within the payload. */
+			ret = avd_vp9_next_tile(data, payload,
+						row == num_tile_rows - 1 &&
+						col == num_tile_cols - 1,
+						&offset, &tile_size);
+			if (ret)
+				return ret;
+
 			ctx->job.num++;
-			if (row == num_tile_rows - 1 &&
-			    col == num_tile_cols - 1) {
-				tile_size = size;
-			} else {
-				tile_size = get_unaligned_be32(&data[offset]);
-				/* i have crashed my computer because of this */
-				if (tile_size > size - 4)
-					return;
-				offset += 4;
-				size -= 4;
-			}
 			push(AVD_OP_CODED_DATA |
 				     AVD_OP_CODED_DATA_ADDR(
 					     run->base.coded_in >> 32),
@@ -547,9 +578,10 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 			     "til_ac0_tile_dims");
 
 			offset += tile_size;
-			size -= tile_size;
 			vp9_ctx->b->submit_num++;
 		}
+
+	return 0;
 }
 
 static void update_dec_buf_info(struct avd_decoded_buffer *buf,
@@ -940,8 +972,10 @@ static int avd_vp9_run(struct avd_ctx *ctx)
 
 	set_header(ctx, &run);
 	vp9_ctx->b->submit_num = 0;
-	set_tiles(ctx, &run);
+	ret = set_tiles(ctx, &run);
 	avd_run_postamble(ctx, &run.base);
+	if (ret)
+		goto out;
 
 	if (avd_backend_is_qfw(ctx->dev)) {
 		/* Forward updates need no hardware result; publish before next prepare. */
