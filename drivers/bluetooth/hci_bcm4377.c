@@ -1814,8 +1814,10 @@ static int bcm4377_hci_close(struct hci_dev *hdev)
 	}
 
 	if (bcm4377->needs_reset) {
-		dev_warn(&bcm4377->pdev->dev,
-			 "transport needs hardware reset on next open\n");
+		/* A queued rebind resets it in probe: there is no next open. */
+		if (!test_bit(0, &bcm4377->reset_pending))
+			dev_warn(&bcm4377->pdev->dev,
+				 "transport needs hardware reset on next open\n");
 		bcm4377->acl_d2h_ring.enabled = false;
 		bcm4377->acl_h2d_ring.enabled = false;
 		bcm4377->sco_d2h_ring.enabled = false;

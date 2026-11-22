@@ -16,7 +16,8 @@
 #define HCI_UP_INDEX 5
 #define dev_dbg(...) ((void)0)
 #define dev_err(...) ((void)0)
-#define dev_warn(...) ((void)0)
+static int dev_warnings;
+#define dev_warn(...) ((void)(dev_warnings++))
 #define dev_info(...) ((void)0)
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
@@ -65,6 +66,7 @@ struct bcm4377_data {
 	bool resume_armed, resume_blocked, resume_powered;
 	bool resume_guarded, resume_recovering;
 	unsigned long dma_window_base;
+	unsigned int reset_pending;
 	struct work_struct resume_work;
  struct ring acl_d2h_ring,acl_h2d_ring,sco_d2h_ring,sco_h2d_ring,hci_d2h_ring,hci_h2d_ring,sco_event_ring,sco_ack_ring,hci_acl_event_ring,hci_acl_ack_ring;
 };
@@ -76,9 +78,9 @@ static int power_rebinds;
 static bool pm_resume_via_firmware(void) { return resume_via_firmware; }
 static void __bcm4377_queue_rebind(struct bcm4377_data *b, const char *why, bool expected)
 {
-	(void)b;
 	(void)why;
 	assert(expected);
+	b->reset_pending |= 1;
 	power_rebinds++;
 }
 
