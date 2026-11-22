@@ -197,6 +197,8 @@ const FAST_POLL_WORK: u64 = 1;
 const SCRUB_WORK: u64 = 2;
 /// Work item ID of the asynchronous CPU feed-boost work.
 const FEED_WORK: u64 = 3;
+/// Work item ID of the unbound fast event poll work used when pipelined (`active_flights >= 2`).
+const UNBOUND_POLL_WORK: u64 = 4;
 /// Capacity hint for `drm_syncobj_wait` during active submit bursts (mirroring G17's wait hint).
 const WAIT_UTIL_MIN: u32 = 512;
 const WAIT_HINT_MS: u32 = 8;
@@ -223,6 +225,8 @@ pub(crate) struct Shared {
     pub(crate) publish_wake: AtomicBool,
     /// CPU that last submitted work, for placing the per-CPU completion worker.
     pub(crate) submitter: AtomicU32,
+    /// Number of flights currently active under `Shared::state`, for poll worker placement.
+    pub(crate) active_flights: AtomicU32,
     /// Monotonic timestamp (ns) of the previous submit, for active-burst wait hints.
     pub(crate) last_submit_ns: AtomicU64,
     /// Consecutive back-to-back submits within [`WAIT_HINT_GAP_NS`].
@@ -261,6 +265,8 @@ pub(crate) struct Shared {
     sleep_commit: AtomicPtr<core::ffi::c_void>,
     /// Dedicated high-priority per-CPU workqueue for immediate completion polling.
     pub(crate) events: OwnedQueue,
+    /// Dedicated high-priority unbound workqueue for pipelined (`active_flights >= 2`) polling.
+    pub(crate) events_unbound: OwnedQueue,
     /// Dedicated unbound workqueue for asynchronous off-lock pass-slot WC scrubbing.
     pub(crate) scrub_wq: OwnedQueue,
     /// Host-refill CPU frequency floor actuator (mirroring G17's feed worker).
@@ -273,6 +279,8 @@ pub(crate) struct Shared {
     pub(crate) poll: DelayedWork<Shared, POLL_WORK>,
     #[pin]
     pub(crate) fast_poll: Work<Shared, FAST_POLL_WORK>,
+    #[pin]
+    pub(crate) fast_poll_unbound: Work<Shared, UNBOUND_POLL_WORK>,
     #[pin]
     pub(crate) scrub_queue: SpinLock<slots::ScrubQueue>,
     #[pin]
@@ -304,6 +312,10 @@ impl_has_work! {
 
 impl_has_work! {
     impl HasWork<Shared, FEED_WORK> for Shared { self.feed_work }
+}
+
+impl_has_work! {
+    impl HasWork<Shared, UNBOUND_POLL_WORK> for Shared { self.fast_poll_unbound }
 }
 
 impl WorkItem<POLL_WORK> for Shared {
@@ -339,6 +351,17 @@ impl WorkItem<FEED_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
         this.feed.run();
+    }
+}
+
+impl WorkItem<UNBOUND_POLL_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        if this.orphaned.load(Ordering::Acquire) {
+            this.drain_orphan();
+            return;
+        }
+        this.run_poll();
     }
 }
 
@@ -535,6 +558,8 @@ impl Gpu {
         // the platform-device field. Retain the typed DRM device before that point.
         let drm_device: ARef<AsahiDrmDevice> = dev.into();
         let events = OwnedQueue::new_percpu_reclaim(c_str!("aurora_g16_events"), true)?;
+        let events_unbound =
+            OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_events_unbound"), true)?;
         let scrub_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_scrub"), false)?;
         let feed = feed::Feed::new()?;
         let feed_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_feed"), false)?;
@@ -548,6 +573,7 @@ impl Gpu {
                 evented: AtomicBool::new(false),
                 publish_wake: AtomicBool::new(false),
                 submitter: AtomicU32::new(u32::MAX),
+                active_flights: AtomicU32::new(0),
                 last_submit_ns: AtomicU64::new(0),
                 wait_hint_streak: AtomicU32::new(0),
                 wait_hint_until_ns: AtomicU64::new(0),
@@ -566,12 +592,14 @@ impl Gpu {
                 sleep_ps: AtomicU32::new(0),
                 sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
                 events,
+                events_unbound,
                 scrub_wq,
                 feed,
                 feed_wq,
                 orphan <- new_mutex!(None, "g16::Shared::orphan"),
                 poll <- new_delayed_work!("g16::Shared::poll"),
                 fast_poll <- new_work!("g16::Shared::fast_poll"),
+                fast_poll_unbound <- new_work!("g16::Shared::fast_poll_unbound"),
                 scrub_queue <- new_spinlock!(slots::ScrubQueue::new(), "g16::Shared::scrub_queue"),
                 scrub_work <- new_work!("g16::Shared::scrub_work"),
                 feed_work <- new_work!("g16::Shared::feed_work"),

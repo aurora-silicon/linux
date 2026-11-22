@@ -38,7 +38,7 @@ use super::fw::work::compute;
 use super::job::{self, Completions, Job};
 use super::recovery::logic::{Retirement, ABORT_GRACE_NS};
 use super::regs::EngineState;
-use super::{params, Firmware, Shared, FAST_POLL_WORK, POLL_WORK, SCRUB_WORK};
+use super::{params, Firmware, Shared, FAST_POLL_WORK, POLL_WORK, SCRUB_WORK, UNBOUND_POLL_WORK};
 use crate::module_parameters;
 
 /// Cadence of periodic housekeeping (power governor, window health, administrative hang check).
@@ -149,6 +149,7 @@ impl Shared {
                     && !firmware.engine.frozen
                     && !self.sleeping.load(Ordering::Acquire);
                 scrubs = firmware.slots.stage_and_take_scrubs(allow_stage);
+                self.sync_active_flights(firmware);
             }
             job::complete_all(done);
             self.enqueue_scrubs(scrubs);
@@ -181,6 +182,7 @@ impl Shared {
                     } else if firmware.engine.flights.is_empty() {
                         self.arm_idle_power_poll(firmware);
                     }
+                    self.sync_active_flights(firmware);
                 }
             }
             job::complete_all(done);
@@ -279,6 +281,7 @@ impl Shared {
             let allow_stage = firmware.recovery.failed().is_none()
                 && !firmware.engine.frozen
                 && !self.sleeping.load(Ordering::Acquire);
+            self.sync_active_flights(firmware);
             (res, firmware.slots.stage_and_take_scrubs(allow_stage))
         };
         job::complete_all(done);
@@ -312,6 +315,7 @@ impl Shared {
                         && !firmware.engine.frozen
                         && !self.sleeping.load(Ordering::Acquire);
                     scrubs = firmware.slots.stage_and_take_scrubs(allow_stage);
+                    self.sync_active_flights(firmware);
                     res
                 }
                 None => Err(ENODEV),
@@ -376,8 +380,22 @@ impl Shared {
         }
     }
 
-    /// Queues the fast poll work immediately on the submitting CPU. Callable from any context.
+    /// Publishes the active flight depth for lock-free completion worker placement.
+    fn sync_active_flights(&self, firmware: &Firmware) {
+        self.active_flights
+            .store(firmware.engine.flights.len() as u32, Ordering::Release);
+    }
+
+    /// Queues fast completion polling: pinned to the submitting CPU for single-flight (`d=1`)
+    /// wakeups so the sleeping waiter stays cache-hot, and unbound when pipelined (`d>=2`) so
+    /// completion polling does not preempt an actively recording submitter.
     pub(crate) fn poll_now(self: &Arc<Self>) {
+        if self.active_flights.load(Ordering::Acquire) >= 2 {
+            let _ = self
+                .events_unbound
+                .enqueue::<Arc<Shared>, UNBOUND_POLL_WORK>(self.clone());
+            return;
+        }
         let _ = match self.submitter_cpu() {
             Some(cpu) => self
                 .events

@@ -114,6 +114,7 @@ impl Shared {
             drop(unsafe { Arc::from_raw(Arc::as_ptr(self)) });
         }
         self.events.drain();
+        self.events_unbound.drain();
         // `sleeping` is already set, so taking the queued scrubs under `scrub_queue`
         // guarantees no concurrent `enqueue_scrubs()` can still queue onto `scrub_wq`
         // while `scrub_wq.drain()` runs. Drop the drained batch outside the spinlock.
@@ -212,6 +213,7 @@ impl Shared {
                     .and_then(|_| {
                         if self.leave_for_commit(firmware) {
                             firmware.power.release_clpc_now();
+                            self.active_flights.store(0, Ordering::Release);
                             Ok(())
                         } else {
                             Err(EBUSY)

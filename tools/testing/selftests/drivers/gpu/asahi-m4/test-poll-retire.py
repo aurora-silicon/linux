@@ -9,6 +9,7 @@ production = kernel_root() / 'drivers/gpu/drm/asahi/g16/poll.rs'
 queue_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/queue.rs').read_text()
 event_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/event.rs').read_text()
 mod_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/mod.rs').read_text()
+sleep_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/sleep.rs').read_text()
 source = production.read_text()
 output = output_dir()
 
@@ -22,6 +23,12 @@ assert (
 assert (
     '.add_union(engine, start, end, super::hw::COMMAND_TIMESTAMP_HZ as u32)' in source
 ), 'G16 poll retirement must deduplicate per-file intervals via Client::add_union'
+assert (
+    'OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_events_unbound"), true)' in mod_source
+), 'aurora_g16_events_unbound must use new_unbound_reclaim(..., true)'
+assert (
+    'self.events_unbound.drain();' in sleep_source
+), 'sleep.rs must drain events_unbound on suspend'
 
 
 def item(declaration, text=source):
@@ -1035,6 +1042,91 @@ fn per_file_usage_union_deduplicates_pipelined_and_dual_pipe_siblings() {
     // Compute union: [100k, 130k] = 30k ticks = 1_250_000 ns (not 48k ticks = 2.0 ms).
     assert_eq!(c_ns, 1_250_000);
 }
+
+mod poll_placement_test {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    };
+
+    const FAST_POLL_WORK: u64 = 1;
+    const UNBOUND_POLL_WORK: u64 = 4;
+
+    #[derive(Default)]
+    struct Queue {
+        calls: Mutex<Vec<(Option<u32>, u64)>>,
+    }
+    impl Queue {
+        fn enqueue<P, const ID: u64>(&self, _item: P) -> Result<(), ()> {
+            self.calls.lock().unwrap().push((None, ID));
+            Ok(())
+        }
+        fn enqueue_on<P, const ID: u64>(&self, cpu: u32, _item: P) -> Result<(), ()> {
+            self.calls.lock().unwrap().push((Some(cpu), ID));
+            Ok(())
+        }
+        fn take(&self) -> Vec<(Option<u32>, u64)> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    struct Shared {
+        active_flights: AtomicU32,
+        submitter: AtomicU32,
+        events: Queue,
+        events_unbound: Queue,
+    }
+    impl Shared {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                active_flights: AtomicU32::new(0),
+                submitter: AtomicU32::new(u32::MAX),
+                events: Queue::default(),
+                events_unbound: Queue::default(),
+            })
+        }
+        fn submitter_cpu(&self) -> Option<u32> {
+            let v = self.submitter.load(Ordering::Relaxed);
+            (v != u32::MAX).then_some(v)
+        }
+        __POLL_NOW__
+    }
+
+    #[test]
+    fn poll_now_pins_single_flight_and_routes_pipelined_flights_unbound() {
+        let shared = Shared::new();
+        shared.submitter.store(3, Ordering::Relaxed);
+
+        // d=0 and d=1 pin FAST_POLL_WORK onto the submitting CPU.
+        shared.active_flights.store(0, Ordering::Release);
+        shared.poll_now();
+        assert_eq!(shared.events.take(), vec![(Some(3), FAST_POLL_WORK)]);
+        assert!(shared.events_unbound.take().is_empty());
+
+        shared.active_flights.store(1, Ordering::Release);
+        shared.poll_now();
+        assert_eq!(shared.events.take(), vec![(Some(3), FAST_POLL_WORK)]);
+        assert!(shared.events_unbound.take().is_empty());
+
+        // Without a recorded submitter CPU, d=1 falls back to events.enqueue().
+        shared.submitter.store(u32::MAX, Ordering::Relaxed);
+        shared.poll_now();
+        assert_eq!(shared.events.take(), vec![(None, FAST_POLL_WORK)]);
+        assert!(shared.events_unbound.take().is_empty());
+
+        // d>=2 routes UNBOUND_POLL_WORK onto events_unbound even with a valid submitter CPU.
+        shared.submitter.store(3, Ordering::Relaxed);
+        for depth in [2u32, 4, 16] {
+            shared.active_flights.store(depth, Ordering::Release);
+            shared.poll_now();
+            assert!(shared.events.take().is_empty());
+            assert_eq!(
+                shared.events_unbound.take(),
+                vec![(None, UNBOUND_POLL_WORK)]
+            );
+        }
+    }
+}
 '''
 
 harness = harness.replace(
@@ -1048,6 +1140,7 @@ for token, decl in {
     '__OLDEST_STAMP_REACHED__': 'fn oldest_stamp_reached(',
     '__CANCEL_RESNAP__': 'pub(crate) fn cancel_resnap(',
     '__REARM__': 'pub(crate) fn rearm(',
+    '__POLL_NOW__': 'pub(crate) fn poll_now(',
 }.items():
     harness = harness.replace(token, item(decl))
 for token, decl in {
@@ -1073,7 +1166,7 @@ for command in [
     json.dumps(
         {
             'passed': True,
-            'tests': 12,
+            'tests': 14,
             'cpu_only': True,
             'hardware_execution': False,
             'scope': 'Verbatim production submit_locked inline retirement and poll_step TA-only non-spin logic.',
