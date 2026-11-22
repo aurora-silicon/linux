@@ -179,8 +179,8 @@
  * did not tune the PHY gets its domains power-cycled and one more complete
  * bring-up. Why it gets into that state is not known yet, see
  * https://github.com/aurora-silicon/linux/issues/2315: every step is logged,
- * and debugfs counts the recoveries, so that the retry does not hide how often
- * it happens.
+ * and debugfs counts the recoveries and the bring-ups that failed, so that the
+ * retry does not hide how often it happens or whether it worked.
  */
 #define T6040_RECOVERY_RETRIES		1
 
@@ -191,7 +191,8 @@ MODULE_PARM_DESC(recovery_dwell_ms,
 
 /*
  * @hard_recoveries: domain power cycles started, @retried: bring-ups tried
- * again, @exhausted: bring-ups that failed with no retry left
+ * again, @exhausted: bring-ups that failed with no retry left, @failed: all
+ * bring-ups that failed, also by a power cycle or a wake that did not work
  */
 struct t6040_recovery_state {
 	bool cycle_pending;
@@ -199,6 +200,7 @@ struct t6040_recovery_state {
 	u32 hard_recoveries;
 	u32 retried;
 	u32 exhausted;
+	u32 failed;
 };
 
 static void t6040_recovery_power_down(struct t6040_recovery_state *state,
@@ -224,6 +226,12 @@ static bool t6040_recovery_retry(struct t6040_recovery_state *state)
 	state->retries++;
 	state->retried++;
 	return true;
+}
+
+/* The bring-up gave up, on any path: the port has no USB3 or CIO until the next one. */
+static void t6040_recovery_failed(struct t6040_recovery_state *state)
+{
+	state->failed++;
 }
 
 static void t6040_recovery_complete(struct t6040_recovery_state *state)
@@ -1147,6 +1155,7 @@ sleep:
 	t6040_usb3_sleep(tphy);
 
 failed:
+	t6040_recovery_failed(&tphy->recovery);
 	dev_warn(tphy->dev, "USB3 PHY bring-up failed (%d), USB2 only\n", ret);
 }
 
@@ -1783,6 +1792,7 @@ retry:
 sleep:
 	t6040_usb3_sleep(tphy);
 put:
+	t6040_recovery_failed(&tphy->recovery);
 	pm_runtime_put(tphy->dev);
 	dev_warn(tphy->dev, "CIO PHY bring-up failed: %d\n", ret);
 	return ret;
@@ -2200,6 +2210,7 @@ static int t6040_debugfs_init(struct t6040_usb2_phy *tphy)
 	debugfs_create_u32("bringup_retries", 0400, tphy->debugfs, &tphy->recovery.retried);
 	debugfs_create_u32("bringup_retries_exhausted", 0400, tphy->debugfs,
 			   &tphy->recovery.exhausted);
+	debugfs_create_u32("bringup_failures", 0400, tphy->debugfs, &tphy->recovery.failed);
 	ret = devm_add_action_or_reset(tphy->dev, t6040_debugfs_remove, tphy->debugfs);
 	if (ret)
 		tphy->debugfs = NULL;
