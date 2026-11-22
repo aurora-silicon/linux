@@ -1505,6 +1505,43 @@ static int avd_av1_validate_sequence(struct avd_ctx *ctx,
 	return 0;
 }
 
+/*
+ * The map, CDFs and color data sit at the end of the CAPTURE buffer, sized by
+ * the frame, so the frame must fit the CAPTURE format. So must the width it
+ * is upscaled to, which goes into the header as it is and divides the scale
+ * factors: superres only widens the frame, from frame_width to upscaled_width
+ * (AV1 7.16), and without it the two are equal (AV1 5.9.8, superres_params()).
+ */
+VISIBLE_IF_KUNIT int
+avd_av1_check_frame_size(const struct v4l2_ctrl_av1_frame *frame, u32 width,
+			 u32 height)
+{
+	u32 frame_width;
+
+	if (frame->frame_width_minus_1 >= width ||
+	    frame->frame_height_minus_1 >= height)
+		return -EINVAL;
+
+	frame_width = frame->frame_width_minus_1 + 1;
+	if (frame->upscaled_width < frame_width ||
+	    frame->upscaled_width > width)
+		return -EINVAL;
+	if (!(frame->flags & V4L2_AV1_FRAME_FLAG_USE_SUPERRES) &&
+	    frame->upscaled_width != frame_width)
+		return -EINVAL;
+	/*
+	 * With superres the denominator goes into the header less one; the
+	 * stream codes it as 9 to 16 (AV1 5.9.8), the control core only
+	 * bounds it from above.
+	 */
+	if ((frame->flags & V4L2_AV1_FRAME_FLAG_USE_SUPERRES) &&
+	    frame->superres_denom < 9)
+		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_av1_check_frame_size);
+
 static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 {
 	struct avd_av1_stream *av1_ctx = ((struct avd_av1_ctx *)ctx->priv)->stream;
@@ -1543,10 +1580,11 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	if (ret)
 		return ret;
 
-	/* The map, CDFs and color data sit at the buffer's end, sized by the frame. */
-	if (run->frame->frame_width_minus_1 + 1 > ctx->decoded_fmt.fmt.pix_mp.width ||
-	    run->frame->frame_height_minus_1 + 1 > ctx->decoded_fmt.fmt.pix_mp.height)
-		return -EINVAL;
+	ret = avd_av1_check_frame_size(run->frame,
+				       ctx->decoded_fmt.fmt.pix_mp.width,
+				       ctx->decoded_fmt.fmt.pix_mp.height);
+	if (ret)
+		return ret;
 
 	/*
 	 * The CDF and segmentation map loads index the reference arrays with

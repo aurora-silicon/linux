@@ -404,6 +404,8 @@ int avd_av1_check_tiles(struct device *dev, unsigned int tile_rows,
 			unsigned int entries, size_t payload);
 struct v4l2_ctrl_av1_tile_group_entry *
 avd_av1_copy_tile_group(struct v4l2_ctrl *ctrl, unsigned int *entries);
+int avd_av1_check_frame_size(const struct v4l2_ctrl_av1_frame *frame,
+			     u32 width, u32 height);
 int avd_h264_validate_sps(struct avd_ctx *ctx,
 			  const struct v4l2_ctrl_h264_sps *sps);
 size_t avd_h264_start_slices(const struct v4l2_ctrl_h264_sps *sps);

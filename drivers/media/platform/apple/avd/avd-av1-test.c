@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * KUnit tests for the AV1 tile checks of the Apple video decoder.
+ * KUnit tests for the AV1 tile and frame size checks of the Apple video
+ * decoder.
  */
 
 #include <kunit/test.h>
@@ -171,12 +172,66 @@ static void avd_av1_copy_tile_group_test(struct kunit *test)
 	v4l2_ctrl_handler_free(hdl);
 }
 
+struct avd_av1_size_case {
+	const char *desc;
+	u32 width;
+	u32 height;
+	u32 upscaled_width;
+	bool superres;
+	int ret;
+	u8 denom;
+};
+
+/* Frames for 1920x1088 CAPTURE buffers. */
+static const struct avd_av1_size_case avd_av1_size_cases[] = {
+	{ "frame of the buffer size", 1920, 1088, 1920, false, 0 },
+	{ "smaller frame", 1280, 720, 1280, false, 0 },
+	{ "one sample", 1, 1, 1, false, 0 },
+	{ "superres to the buffer width", 960, 1080, 1920, true, 0, 16 },
+	{ "superres to a smaller width", 1000, 1080, 1280, true, 0, 16 },
+	{ "superres with equal widths", 1920, 1080, 1920, true, 0, 16 },
+	{ "frame wider than the buffer", 1921, 1080, 1921, false, -EINVAL },
+	{ "frame higher than the buffer", 1920, 1089, 1920, false, -EINVAL },
+	{ "frame width wraps", 0, 1080, 1920, false, -EINVAL },
+	{ "frame height wraps", 1920, 0, 1920, false, -EINVAL },
+	{ "no upscaled width", 1920, 1080, 0, false, -EINVAL },
+	{ "no upscaled width, superres", 1920, 1080, 0, true, -EINVAL, 16 },
+	{ "upscaled width below the frame's", 1920, 1080, 1919, true, -EINVAL, 16 },
+	{ "upscaled width past the buffer", 960, 1080, 1921, true, -EINVAL, 16 },
+	{ "huge upscaled width", 960, 1080, U32_MAX, true, -EINVAL, 16 },
+	{ "upscaled width without superres", 960, 1080, 1920, false, -EINVAL },
+	{ "superres, smallest denominator", 1072, 1080, 1920, true, 0, 9 },
+	{ "superres, no denominator", 960, 1080, 1920, true, -EINVAL, 0 },
+	{ "superres, denominator below 9", 960, 1080, 1920, true, -EINVAL, 8 },
+};
+
+KUNIT_ARRAY_PARAM_DESC(avd_av1_size, avd_av1_size_cases, desc);
+
+static void avd_av1_frame_size_test(struct kunit *test)
+{
+	const struct avd_av1_size_case *c = test->param_value;
+	struct v4l2_ctrl_av1_frame *frame;
+
+	frame = kunit_kzalloc(test, sizeof(*frame), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	frame->frame_width_minus_1 = c->width - 1;
+	frame->frame_height_minus_1 = c->height - 1;
+	frame->upscaled_width = c->upscaled_width;
+	frame->superres_denom = c->denom;
+	if (c->superres)
+		frame->flags |= V4L2_AV1_FRAME_FLAG_USE_SUPERRES;
+
+	KUNIT_EXPECT_EQ(test, avd_av1_check_frame_size(frame, 1920, 1088),
+			c->ret);
+}
+
 static struct kunit_case avd_av1_test_cases[] = {
 	KUNIT_CASE(avd_av1_tiles_valid_test),
 	KUNIT_CASE(avd_av1_tiles_count_test),
 	KUNIT_CASE(avd_av1_tiles_extent_test),
 	KUNIT_CASE_PARAM(avd_av1_tiles_rowcol_test, avd_av1_rowcol_gen_params),
 	KUNIT_CASE(avd_av1_copy_tile_group_test),
+	KUNIT_CASE_PARAM(avd_av1_frame_size_test, avd_av1_size_gen_params),
 	{}
 };
 
