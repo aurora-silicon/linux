@@ -279,6 +279,34 @@ unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_i
     }
 }
 
+extern "C" {
+    fn asahi_sleep_pd_init(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+    fn asahi_sleep_pd_suspend_noirq(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+    fn asahi_sleep_pd_resume_noirq(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+}
+
+/// Allocates per-device suspend-to-idle power-domain hold state tied to `dev`'s binding.
+fn sleep_pd_init(dev: &kernel::device::Device<Core<'_>>) -> Result {
+    // SAFETY: `dev` is being probed, so attaching devres state to its raw device is valid.
+    kernel::error::to_result(unsafe { asahi_sleep_pd_init(dev.as_raw().cast()) })
+}
+
+/// Holds the GPU's attached power domain across suspend-to-idle while its firmware stays live.
+pub(crate) unsafe extern "C" fn sleep_suspend_noirq(
+    dev: *mut bindings::device,
+) -> core::ffi::c_int {
+    // SAFETY: Called by the PM core with a bound GPU device.
+    unsafe { asahi_sleep_pd_suspend_noirq(dev.cast()) }
+}
+
+/// Releases any suspend-to-idle power-domain hold taken by [`sleep_suspend_noirq`].
+pub(crate) unsafe extern "C" fn sleep_resume_noirq(
+    dev: *mut bindings::device,
+) -> core::ffi::c_int {
+    // SAFETY: Called by the PM core with a bound GPU device.
+    unsafe { asahi_sleep_pd_resume_noirq(dev.cast()) }
+}
+
 /// Runs after every device resumed. Does nothing unless [`sleep_prepare`] stopped the firmware.
 unsafe extern "C" fn sleep_complete(dev: *mut bindings::device) {
     // SAFETY: Called by the PM core.
@@ -290,6 +318,8 @@ unsafe extern "C" fn sleep_complete(dev: *mut bindings::device) {
 static SLEEP_OPS: SleepOps = SleepOps(bindings::dev_pm_ops {
     prepare: Some(sleep_prepare),
     complete: Some(sleep_complete),
+    suspend_noirq: Some(sleep_suspend_noirq),
+    resume_noirq: Some(sleep_resume_noirq),
     // SAFETY: All-zero is the absence of every other callback.
     ..unsafe { core::mem::zeroed() }
 });
@@ -306,6 +336,8 @@ unsafe extern "C" fn sleep_refuse(_dev: *mut bindings::device) -> core::ffi::c_i
 
 static SLEEP_REFUSE_OPS: SleepOps = SleepOps(bindings::dev_pm_ops {
     prepare: Some(sleep_refuse),
+    suspend_noirq: Some(sleep_suspend_noirq),
+    resume_noirq: Some(sleep_resume_noirq),
     // SAFETY: All-zero is the absence of every other callback.
     ..unsafe { core::mem::zeroed() }
 });
@@ -353,7 +385,10 @@ impl platform::Driver for AsahiPlatformDriver {
 
         dev_info!(pdev.as_ref(), "Probing...\n");
 
-        let cfg = match info.ok_or(ENODEV)? {
+        let info = info.ok_or(ENODEV)?;
+        sleep_pd_init(pdev.as_ref())?;
+
+        let cfg = match info {
             ProbeConfig::Legacy(cfg) => *cfg,
             ProbeConfig::G17(cfg) => {
                 return AsahiPlatformDriver::probe_g17(pdev, regs::G17Resources::new(pdev)?, cfg)
@@ -466,6 +501,7 @@ impl AsahiPlatformDriver {
         pdev: &'bound platform::Device<Core<'_>>,
         cfg: &'static crate::g15::Config,
     ) -> Result<AsahiPlatformDriverData<'bound>> {
+        sleep_pd_init(pdev.as_ref())?;
         // SAFETY: Admission checks the SoC and the UAT output width before DMA starts.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
         let resources = regs::Resources::new(pdev)?;
@@ -667,6 +703,7 @@ impl AsahiPlatformDriver {
         pdev: &'bound platform::Device<Core<'_>>,
         cfg: &'static crate::g16::Config,
     ) -> Result<AsahiPlatformDriverData<'bound>> {
+        sleep_pd_init(pdev.as_ref())?;
         // SAFETY: the qualified UAT output width constrains this device's DMA.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
         let resources = regs::Resources::new(pdev)?;
