@@ -382,6 +382,8 @@ struct macaudio_snd_data {
 	 */
 	struct macaudio_pm_volume *pm_volumes;
 	unsigned int pm_nr_volumes;
+	/* The system-sleep lock clipped the volumes and its unlock has not come */
+	bool pm_lock_taken;
 	/* Allocated with them, so that setting them again cannot fail */
 	struct snd_ctl_elem_value *pm_uval;
 
@@ -673,6 +675,7 @@ static void macaudio_pm_volumes_drop(struct macaudio_snd_data *ma)
 	ma->pm_volumes = NULL;
 	ma->pm_nr_volumes = 0;
 	ma->pm_uval = NULL;
+	ma->pm_lock_taken = false;
 }
 
 /*
@@ -734,6 +737,7 @@ static void macaudio_pm_volumes_save(struct macaudio_snd_data *ma)
 	ma->pm_volumes = vols;
 	ma->pm_nr_volumes = i;
 	ma->pm_uval = uval;
+	dev_dbg(ma->card.dev, "Kept %u speaker volumes for the system sleep\n", i);
 	return;
 out:
 	kfree(uval);
@@ -753,7 +757,7 @@ static void macaudio_pm_volumes_restore(struct macaudio_snd_data *ma)
 	int ret;
 
 	if (!ma->pm_volumes)
-		return;
+		goto out;
 
 	for (i = 0; i < ma->pm_nr_volumes; i++) {
 		struct snd_kcontrol *kctl = ma->pm_volumes[i].kctl;
@@ -770,6 +774,9 @@ static void macaudio_pm_volumes_restore(struct macaudio_snd_data *ma)
 			snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
 				       &kctl->id);
 	}
+	dev_dbg(ma->card.dev, "Set %u speaker volumes again after the system sleep\n",
+		ma->pm_nr_volumes);
+out:
 	macaudio_pm_volumes_drop(ma);
 }
 
@@ -843,7 +850,29 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 				ma->speaker_volume_was_locked = true;
 		}
 
+		/*
+		 * The system-sleep lock keeps the volumes wherever it is taken.
+		 * With a speaker stream running at suspend-prepare, the stop
+		 * that macaudio_spk_close_gate() queues reaches here through
+		 * lock_update_work before macaudio_vlimit_pm() does; keeping
+		 * them only there left nothing to set again at the unlock, and
+		 * the volumes stayed at the lock's ceiling for the whole boot.
+		 */
+		if (!unlock && ma->pm_quiesced) {
+			macaudio_pm_volumes_save(ma);
+			ma->pm_lock_taken = true;
+		}
 		macaudio_vlimit_unlock(ma, unlock);
+		if (unlock && ma->pm_lock_taken && !ma->pm_volumes) {
+			/*
+			 * Nothing kept: the daemon does not set volumes it
+			 * believes unchanged, so tell it the lock was lost; it
+			 * sets them again from its model.
+			 */
+			dev_warn(ma->card.dev,
+				 "No speaker volumes kept for the system sleep: the daemon sets them again\n");
+			ma->speaker_volume_was_locked = true;
+		}
 		if (unlock)
 			macaudio_pm_volumes_restore(ma);
 		if (!unlock && ma->cfg->amp == AMP_MAX98360A) {
@@ -878,7 +907,6 @@ static void macaudio_vlimit_pm(struct macaudio_snd_data *ma, bool quiesce)
 	if (quiesce) {
 		cancel_delayed_work(&ma->lock_timeout_work);
 		ma->speaker_lock_remain = 0;
-		macaudio_pm_volumes_save(ma);
 	}
 	macaudio_vlimit_update(ma);
 	mutex_unlock(&ma->volume_lock_mutex);
@@ -943,6 +971,11 @@ static void macaudio_vlimit_timeout_work(struct work_struct *wrk)
 						    struct macaudio_snd_data, lock_timeout_work);
 	ktime_t now, left;
 
+	/*
+	 * An expiry with pm_quiesced set keeps the volumes, which walks the
+	 * card's controls: hold them as macaudio_vlimit_update_work() does.
+	 */
+	down_read(&ma->card.snd_card->controls_rwsem);
 	mutex_lock(&ma->volume_lock_mutex);
 
 	/*
@@ -967,6 +1000,7 @@ static void macaudio_vlimit_timeout_work(struct work_struct *wrk)
 
 out:
 	mutex_unlock(&ma->volume_lock_mutex);
+	up_read(&ma->card.snd_card->controls_rwsem);
 }
 
 static void macaudio_vlimit_update_work(struct work_struct *wrk)
