@@ -11,8 +11,10 @@
 use core::mem;
 use core::sync::atomic::{fence, AtomicI32, AtomicPtr, Ordering};
 
+mod pmp_alloc;
 mod pmp_bootargs;
 mod pmp_power;
+use pmp_alloc::AllocBudget;
 use pmp_power::Command;
 
 use kernel::{
@@ -85,7 +87,7 @@ const OPC_UPDATE_IOREG: u64 = 0x36;
 const OPC_CONFIRM_IOREG: u64 = 0x37;
 const OPC_ACK_MASK: u64 = 0x1;
 const OPC_SHIFT: u32 = 48;
-const MALLOC_SIZE_MASK: u64 = 0xFFFFFF;
+const MALLOC_SIZE_MASK: u64 = pmp_alloc::MALLOC_SIZE_MAX;
 const MSG_IOVA_MASK: u64 = 0xFFFFFFFFFFFF;
 const SET_IOREG_INDEX_MASK: u64 = 0xFFFF;
 const PIO_VM_BASE: u64 = 0xc0000000;
@@ -130,6 +132,8 @@ struct SramCopy {
 struct PmpState {
     iova_table: Option<Coherent<[IovaTableEntry]>>,
     allocs: KVec<PmpAllocation>,
+    /// The number and total size of `allocs`.
+    alloc_budget: AllocBudget,
     value_buf: Option<u64>,
     ioreg_entries: KVec<u32>,
     /// Held from a system sleep's start until its end.
@@ -141,6 +145,7 @@ impl PmpState {
         Ok(PmpState {
             iova_table: None,
             allocs: KVec::with_capacity(10, GFP_KERNEL)?,
+            alloc_budget: AllocBudget::new(),
             value_buf: None,
             ioreg_entries: KVec::with_capacity(340, GFP_KERNEL)?,
             sram: None,
@@ -319,23 +324,42 @@ impl PmpData {
     fn malloc(&self, size: u64) -> Result<u64> {
         // SAFETY: TODO: ensure self.dev is bound
         let bound_dev = unsafe { self.dev.as_bound() };
-        let iomem = Coherent::<u8>::zeroed_slice(bound_dev, size as usize, GFP_KERNEL)?;
         let mut state = self.state.lock();
+        if !state.alloc_budget.claim(size) {
+            dev_err!(
+                self.dev,
+                "Refusing a {} byte allocation: {} held\n",
+                size,
+                state.allocs.len()
+            );
+            return Err(ENOMEM);
+        }
+        let iomem = match Coherent::<u8>::zeroed_slice(bound_dev, size as usize, GFP_KERNEL) {
+            Ok(iomem) => iomem,
+            Err(e) => {
+                state.alloc_budget.release(size);
+                return Err(e);
+            }
+        };
         let addr = iomem.dma_address();
         let msg = (OPC_MALLOC | OPC_ACK_MASK) << OPC_SHIFT | addr;
-        state.allocs.push(
+        if let Err(e) = state.allocs.push(
             PmpAllocation {
                 addr: addr,
                 alloc: iomem,
             },
             GFP_KERNEL,
-        )?;
+        ) {
+            state.alloc_budget.release(size);
+            return Err(e.into());
+        }
         Ok(msg)
     }
     fn free(&self, addr: u64) -> Result<u64> {
         let mut state = self.state.lock();
         if let Some(idx) = state.find_alloc(addr) {
-            state.allocs.swap_remove(idx);
+            let freed = state.allocs.swap_remove(idx);
+            state.alloc_budget.release(freed.alloc.size() as u64);
         } else {
             dev_err!(
                 self.dev,
@@ -370,6 +394,14 @@ impl PmpData {
     }
     fn register_ioreg(&self, addr: u64) -> Result<u64> {
         let mut state = self.state.lock();
+        if !pmp_alloc::ioreg_fits(state.ioreg_entries.len()) {
+            dev_err!(
+                self.dev,
+                "Refusing register {}: no index left\n",
+                state.ioreg_entries.len() + 1
+            );
+            return Err(ENOSPC);
+        }
         let msg_buf = if let Some(s) = state.get_buf(addr) {
             s
         } else {
