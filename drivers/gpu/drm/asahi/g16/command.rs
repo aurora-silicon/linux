@@ -49,6 +49,7 @@ const SET_COMPUTE_ATTACHMENTS: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMP
 const MAX_DIMENSION: u16 = 16384;
 const MAX_LAYERS: u16 = 2048;
 const MAX_TILE_BUFFER: u32 = 32768;
+const ZLS_METADATA_STRIDE: u64 = 0x80;
 /// Size of a queue's USC window.
 pub(crate) const USC_WINDOW: u64 = 1 << 32;
 
@@ -694,28 +695,42 @@ fn compact(gva: u64) -> bool {
     (0x1000000000..0x9000000000).contains(&gva)
 }
 
-/// Validate uncompressed Z/S register state and coverage through each layer base.
-/// This is a minimum span check, not a complete plane-extent validation: the UAPI
-/// does not describe the complete ZLS surface layout. The encoded stride is a
-/// register word, not a byte distance (the C HAL200 contract).
+/// Validate Z/S register state (including compressed metadata) and coverage through each layer
+/// base. This is a minimum span check, not a complete plane-extent validation: the UAPI does
+/// not describe the complete ZLS surface layout. The encoded stride is a register word, not a
+/// byte distance (the C HAL200 contract).
 fn check_zls_plane(
     batch: &mut SpanBatch,
     context: &Context<'_>,
     cmd: &uapi::drm_asahi_cmd_render,
     stencil: bool,
 ) -> Result {
-    let (z, mask) = if stencil {
-        (&cmd.stencil, (1u64 << 3) | (1 << 7) | (1 << 14) | (1 << 18))
+    let (z, mask, comp_mask) = if stencil {
+        (
+            &cmd.stencil,
+            (1u64 << 3) | (1 << 4) | (1 << 7) | (1 << 8) | (1 << 14) | (1 << 18),
+            (1u64 << 4) | (1 << 8),
+        )
     } else {
         (
             &cmd.depth,
-            (1u64 << 1) | (1 << 5) | (1 << 15) | (1 << 19) | (3 << 25),
+            (1u64 << 1) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 15) | (1 << 19) | (3 << 25),
+            (1u64 << 2) | (1 << 6),
         )
     };
-    if (z.base == 0 && (z.stride != 0 || cmd.zls_ctrl & mask != 0))
+    let compressed = cmd.zls_ctrl & comp_mask != 0;
+    if (z.base == 0
+        && (z.stride != 0
+            || z.comp_base != 0
+            || z.comp_stride != 0
+            || cmd.zls_ctrl & mask != 0))
         || (z.base != 0 && cmd.layers > 1 && z.stride == 0)
         || (z.stride != 0 && z.stride & 0x3fff != 1)
         || z.base & 3 != 0
+        || (z.comp_base == 0 && z.comp_stride != 0)
+        || (z.comp_base != 0) != compressed
+        || z.comp_base & 3 != 0
+        || z.comp_stride & 0x3fff != 0
     {
         return Err(EINVAL);
     }
@@ -729,6 +744,20 @@ fn check_zls_plane(
             context.vm,
             z.base,
             z.base.checked_add(minimum).ok_or(EINVAL)?,
+            true,
+            true,
+        )?;
+    }
+    if z.comp_base != 0 {
+        let distance = (u64::from(z.comp_stride >> 14) + 1) * ZLS_METADATA_STRIDE;
+        let minimum = distance
+            .checked_mul(u64::from(cmd.layers - 1))
+            .and_then(|bytes| bytes.checked_add(1))
+            .ok_or(EINVAL)?;
+        batch.push(
+            context.vm,
+            z.comp_base,
+            z.comp_base.checked_add(minimum).ok_or(EINVAL)?,
             true,
             true,
         )?;
@@ -774,20 +803,15 @@ fn check_render(
         || cmd.sampler_heap != 0
         || cmd.sampler_count != 0
         || cmd.ppp_ctrl & !0x203 != 0
-        || cmd.zls_ctrl & !0x00000000060cc0aa != 0
+        || cmd.zls_ctrl & !0x00000000060cc1fe != 0
         || cmd.isp_zls_pixels & 0xc0000000 != 0
         || !matches!((cmd.zls_ctrl >> 25) & 3, 0 | 2)
         || ((cmd.zls_ctrl >> 1) & 1) != ((cmd.zls_ctrl >> 5) & 1)
+        || ((cmd.zls_ctrl >> 2) & 1) != ((cmd.zls_ctrl >> 6) & 1)
         || ((cmd.zls_ctrl >> 3) & 1) != ((cmd.zls_ctrl >> 7) & 1)
+        || ((cmd.zls_ctrl >> 4) & 1) != ((cmd.zls_ctrl >> 8) & 1)
     {
         return Err(EINVAL);
-    }
-    if cmd.stencil.comp_base != 0
-        || cmd.stencil.comp_stride != 0
-        || cmd.depth.comp_base != 0
-        || cmd.depth.comp_stride != 0
-    {
-        return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
     }
     // VDM: compact-addressable and readable; scissor: four-byte aligned.
     let vdm = cmd.vdm_ctrl_stream_base;

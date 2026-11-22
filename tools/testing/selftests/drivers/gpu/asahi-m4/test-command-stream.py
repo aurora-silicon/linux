@@ -60,6 +60,10 @@ names = ['drm_asahi_cmd_header', 'drm_asahi_attachment', 'drm_asahi_cmd_render',
 constants = command[command.index('/// Largest command buffer.'):command.index('/// A validated render command.')]
 inline_containers = command[command.index('/// Inline storage for the common 1-2 command submission'):command.index('/// A validated SUBMIT.')]
 parser = command[command.index('/// One command of the stream.'):command.index('/// Checks that `[start, end)`')]
+render_admission = (
+    command[command.index('/// Checks that `[start, end)`'):command.index('/// Parses the attachment list')]
+    + command[command.index('/// Whether a GVA can be named by a 32-bit compact pointer.'):command.index('/// Per-command compute admission.')]
+)
 g17 = (ROOT / 'drivers/gpu/drm/asahi/g17/command.rs').read_text()
 # The stage-prefix offset and the render payload reader precede the parser.
 g17_parser = g17[g17.index('/// Where a render command\'s stage-prefix fields start'):g17.index('#[derive(Clone, Copy, PartialEq, Eq)]')]
@@ -511,6 +515,172 @@ mod inline_submit_containers {
         assert_eq!(resolved.next(), None);
     }
 }
+mod render_admission_tests {
+    use super::{
+        check_render_helpers, hw, uapi, Result, DBIAS_IS_INT, EINVAL, FRAGMENT_BARRIERS,
+        MAX_DIMENSION, MAX_LAYERS, MAX_TILE_BUFFER, PROCESS_EMPTY_TILES, RSRC_SPEC_HI,
+        ZLS_METADATA_STRIDE,
+    };
+    const ENOENT: i32 = -2;
+    const EACCES: i32 = -13;
+
+    pub(crate) mod vm {
+        pub(crate) fn reserved_ranges() -> &'static [core::ops::Range<u64>] {
+            &[]
+        }
+    }
+    pub(crate) mod params {
+        pub(crate) fn early_tiling() -> bool { true }
+    }
+    pub(crate) mod gate {
+        use super::{mmu, Result};
+        pub(crate) fn vdm(_vm: &mmu::Vm, _va: u64) -> Result { Ok(()) }
+    }
+    pub(crate) mod mmu {
+        pub(crate) const UAT_PGMSK: usize = 0x3fff;
+        pub(crate) struct Vm {
+            pub(crate) maps: Vec<(u64, u64, bool, bool)>,
+        }
+        impl Vm {
+            pub(crate) fn covers_range(&self, start: u64, size: u64, read: bool, write: bool) -> bool {
+                let Some(end) = start.checked_add(size) else { return false };
+                self.maps.iter().any(|&(s, e, r, w)| {
+                    start >= s && end <= e && (!read || r) && (!write || w)
+                })
+            }
+            pub(crate) fn covers_ranges_batch(&self, ranges: &[(u64, u64, u8)]) -> (bool, usize) {
+                for (i, &(start, size, acc)) in ranges.iter().enumerate() {
+                    if !self.covers_range(start, size, acc & 1 != 0, acc & 2 != 0) {
+                        return (false, i);
+                    }
+                }
+                (true, ranges.len())
+            }
+        }
+    }
+    pub(crate) struct Context<'a> {
+        pub(crate) vm: &'a mmu::Vm,
+        pub(crate) usc_base: u64,
+    }
+    RENDER_ADMISSION
+
+    const BASE_GVA: u64 = 0x10_0000_0000;
+    fn base_vm() -> mmu::Vm {
+        mmu::Vm {
+            maps: vec![
+                (BASE_GVA, BASE_GVA + 0x10_0000, true, false),
+                (BASE_GVA + 0x20_0000, BASE_GVA + 0x40_0000, true, true),
+                (BASE_GVA + 0x50_0000, BASE_GVA + 0x51_0000, true, false),
+            ],
+        }
+    }
+    fn base_cmd() -> uapi::drm_asahi_cmd_render {
+        uapi::drm_asahi_cmd_render {
+            width_px: 64,
+            height_px: 64,
+            layers: 1,
+            samples: 1,
+            utile_width_px: 32,
+            utile_height_px: 32,
+            sample_size_B: 8,
+            vdm_ctrl_stream_base: BASE_GVA,
+            isp_scissor_base: BASE_GVA + 0x100,
+            ..Default::default()
+        }
+    }
+    const Z_COMP: u64 = (1 << 1) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 15) | (1 << 19);
+    const S_COMP: u64 = (1 << 3) | (1 << 4) | (1 << 7) | (1 << 8) | (1 << 14) | (1 << 18);
+
+    #[test]
+    fn compressed_zls_1x_layered_and_2x_accepted() {
+        let vm = base_vm();
+        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        // 1x compressed D32F depth + stencil.
+        let mut cmd = base_cmd();
+        cmd.zls_ctrl = Z_COMP | S_COMP;
+        cmd.depth.base = BASE_GVA + 0x20_0000;
+        cmd.depth.comp_base = BASE_GVA + 0x24_0000;
+        cmd.stencil.base = BASE_GVA + 0x28_0000;
+        cmd.stencil.comp_base = BASE_GVA + 0x2c_0000;
+        assert_eq!(check_render(&ctx, &cmd, &[], &[]), Ok(()));
+        // 1x compressed D16 depth (Z Format = 2 at bits 25..26).
+        let mut d16 = base_cmd();
+        d16.zls_ctrl = Z_COMP | (2 << 25);
+        d16.depth.base = BASE_GVA + 0x20_0000;
+        d16.depth.comp_base = BASE_GVA + 0x24_0000;
+        assert_eq!(check_render(&ctx, &d16, &[], &[]), Ok(()));
+        // 2x MSAA compressed depth.
+        let mut msaa2 = d16;
+        msaa2.samples = 2;
+        assert_eq!(check_render(&ctx, &msaa2, &[], &[]), Ok(()));
+        // Layered compressed depth/stencil with comp_stride == 0 (1 line = 0x80) and nonzero stride.
+        let mut layered = cmd;
+        layered.layers = 4;
+        layered.depth.stride = (1 << 14) | 1;
+        layered.stencil.stride = (1 << 14) | 1;
+        assert_eq!(check_render(&ctx, &layered, &[], &[]), Ok(()));
+        layered.depth.comp_stride = 3 << 14;
+        layered.stencil.comp_stride = 2 << 14;
+        assert_eq!(check_render(&ctx, &layered, &[], &[]), Ok(()));
+    }
+
+    #[test]
+    fn compressed_zls_invalid_ctrl_alignment_and_vm_spans_rejected() {
+        let vm = base_vm();
+        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        let valid = || {
+            let mut cmd = base_cmd();
+            cmd.zls_ctrl = Z_COMP | S_COMP;
+            cmd.depth.base = BASE_GVA + 0x20_0000;
+            cmd.depth.comp_base = BASE_GVA + 0x24_0000;
+            cmd.stencil.base = BASE_GVA + 0x28_0000;
+            cmd.stencil.comp_base = BASE_GVA + 0x2c_0000;
+            cmd
+        };
+        // Asymmetric compress bits per plane.
+        for bit in [1u64 << 2, 1 << 6, 1 << 4, 1 << 8] {
+            let mut bad = valid();
+            bad.zls_ctrl ^= bit;
+            assert_eq!(check_render(&ctx, &bad, &[], &[]), Err(EINVAL));
+        }
+        // Unaligned comp_stride or comp_base.
+        for bad_stride in [1u32, 0x4001, 0x3fff] {
+            let mut bad = valid();
+            bad.depth.comp_stride = bad_stride;
+            assert_eq!(check_render(&ctx, &bad, &[], &[]), Err(EINVAL));
+        }
+        let mut bad = valid();
+        bad.depth.comp_base += 2;
+        assert_eq!(check_render(&ctx, &bad, &[], &[]), Err(EINVAL));
+        // comp_base without compress bits, compress bits without comp_base, stride without base.
+        let mut bad = valid();
+        bad.zls_ctrl &= !((1 << 2) | (1 << 6));
+        assert_eq!(check_render(&ctx, &bad, &[], &[]), Err(EINVAL));
+        let mut bad = valid();
+        bad.depth.comp_base = 0;
+        assert_eq!(check_render(&ctx, &bad, &[], &[]), Err(EINVAL));
+        let mut bad = valid();
+        bad.zls_ctrl = Z_COMP;
+        bad.stencil = Default::default();
+        bad.stencil.comp_stride = 1 << 14;
+        assert_eq!(check_render(&ctx, &bad, &[], &[]), Err(EINVAL));
+        // Unmapped comp_base -> ENOENT; read-only comp_base -> EACCES.
+        let mut unmapped = valid();
+        unmapped.depth.comp_base = BASE_GVA + 0x60_0000;
+        assert_eq!(check_render(&ctx, &unmapped, &[], &[]), Err(ENOENT));
+        let mut ro = valid();
+        ro.depth.comp_base = BASE_GVA + 0x50_0000;
+        assert_eq!(check_render(&ctx, &ro, &[], &[]), Err(EACCES));
+        // Layered metadata span extending past mapped range -> ENOENT.
+        let mut past_end = valid();
+        past_end.layers = 4;
+        past_end.depth.stride = 1;
+        past_end.stencil.stride = 1;
+        past_end.depth.comp_base = BASE_GVA + 0x3f_c000;
+        past_end.depth.comp_stride = 0x100 << 14;
+        assert_eq!(check_render(&ctx, &past_end, &[], &[]), Err(ENOENT));
+    }
+}
 '''
 replacements = {'FULL_UAPI': str(BINDINGS), 'READER': reader,
                 'CAPACITIES': capacities, 'FW_GRAPH': str(SOURCE.parent/'fw/graph.rs'),
@@ -518,6 +688,7 @@ replacements = {'FULL_UAPI': str(BINDINGS), 'READER': reader,
                 'IMPLS': '\n'.join('unsafe impl AnyBitPattern for uapi::' + name + ' {}' for name in names),
                 'PRODUCTION_CONSTANTS': constants, 'PRODUCTION_PARSER': parser.replace('super::encode::', 'encode::'),
                 'INLINE_CONTAINERS': inline_containers.replace('crate::timestamp::', 'timestamp::'),
+                'RENDER_ADMISSION': render_admission.replace('super::vm::', 'vm::').replace('super::params::', 'params::'),
                 'G17_CONSTANTS': g17_constants, 'G17_PARSER': g17_parser}
 for key in sorted(replacements,key=len,reverse=True):
     harness = harness.replace(key,replacements[key])
