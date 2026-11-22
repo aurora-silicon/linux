@@ -739,7 +739,7 @@ static int dcp_pcm_sync_stop(struct snd_pcm_substream *substream)
 	return 0;
 }
 
-struct snd_pcm_ops dcp_playback_ops = {
+static const struct snd_pcm_ops dcp_playback_ops = {
 	.open = dcp_pcm_open,
 	.close = dcp_pcm_close,
 	.hw_params = dcp_pcm_hw_params,
