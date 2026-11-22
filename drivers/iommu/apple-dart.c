@@ -4584,7 +4584,7 @@ static void __apple_dart_j713_v27_fw_prot(struct apple_dart_master_cfg *cfg, str
 	phys_addr_t table;
 	u64 *root, span, base;
 	size_t entries;
-	u32 ttbr;
+	u32 ttbr, tcr = 0;
 	int sid;
 
 	if (!cfg || !cfg->stream_maps[0].dart || cfg->stream_maps[1].dart)
@@ -4599,11 +4599,12 @@ static void __apple_dart_j713_v27_fw_prot(struct apple_dart_master_cfg *cfg, str
 		return;
 	if (pm_runtime_resume_and_get(dart->dev) < 0)
 		return;
+	/* Read both registers while the DART is held powered. */
 	ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, 0));
+	if (dart->hw->tcr_4level)
+		tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
 	pm_runtime_put(dart->dev);
-	if (!(ttbr & dart->hw->ttbr_valid) ||
-	    (dart->hw->tcr_4level &&
-	     (apple_dart_readl(dart, DART_TCR(dart, sid)) & dart->hw->tcr_4level)))
+	if (!(ttbr & dart->hw->ttbr_valid) || (tcr & dart->hw->tcr_4level))
 		return;
 	ttbr &= ~dart->hw->ttbr_valid;
 	if (dart->hw->ttbr_addr_field_shift)

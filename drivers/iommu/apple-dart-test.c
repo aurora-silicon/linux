@@ -1430,6 +1430,13 @@ static void apple_dart_test_j713_v27_fw_prot(struct kunit *test)
 	SetPageReserved(virt_to_page(leaf));
 	KUNIT_EXPECT_EQ(test, text.prot, IOMMU_READ | IOMMU_WRITE);
 
+	/* A four-level root is not walked: nothing changes. */
+	text.prot = IOMMU_READ | IOMMU_WRITE;
+	writel(dart->hw->tcr_4level, dart->regs + DART_TCR(dart, 23));
+	__apple_dart_j713_v27_fw_prot(&master, dart->dev, &head);
+	writel(0, dart->regs + DART_TCR(dart, 23));
+	KUNIT_EXPECT_EQ(test, text.prot, IOMMU_READ | IOMMU_WRITE);
+
 	/* Not a 27.2 J713 display DART: nothing changes. */
 	text.prot = IOMMU_READ | IOMMU_WRITE;
 	dart->j713_v27 = false;
