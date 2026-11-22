@@ -831,7 +831,8 @@ static void tb_xdp_handle_request(struct work_struct *work)
 		 * timing out, we will restart the handshake now that we
 		 * received UUID request from the remote host.
 		 */
-		if (!ret && xd && xd->state == XDOMAIN_STATE_ERROR) {
+		if (!READ_ONCE(tb->noirq_ctl_retained) && !ret && xd &&
+		    xd->state == XDOMAIN_STATE_ERROR) {
 			mutex_lock(&xd->lock);
 			if (!xd->removing) {
 				dev_dbg(&xd->dev, "restarting handshake\n");
@@ -2665,6 +2666,21 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
 		return true;
 	if (length < sizeof(*hdr) / 4 - sizeof(hdr->xd_hdr) / 4)
 		return true;
+
+	if (READ_ONCE(tb->noirq_ctl_retained)) {
+		if (type != TB_CFG_PKG_XDOMAIN_REQ || !uuid_equal(&hdr->uuid, &tb_xdp_uuid))
+			return true;
+		switch (hdr->type) {
+		case UUID_REQUEST_OLD:
+		case UUID_REQUEST:
+		case PROPERTIES_REQUEST:
+		case LINK_STATE_STATUS_REQUEST:
+			tb_dbg(tb, "XDomain discovery request %#x during s2idle\n", hdr->type);
+			break;
+		default:
+			return true;
+		}
+	}
 
 	/*
 	 * Handle XDomain discovery protocol packets directly here. For
