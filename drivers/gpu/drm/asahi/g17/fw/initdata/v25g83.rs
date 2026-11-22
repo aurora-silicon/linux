@@ -21,6 +21,7 @@ use super::{
     RegisterMapEntry, Words, COMPLETION_RING_ENTRIES, COMPLETION_RING_ENTRY_SIZE,
     COMPLETION_RING_INDEX, PERF_STATES, REGISTER_MAP_SLOTS,
 };
+use crate::g17::die_limit::{DieLimit, Limits};
 use kernel::prelude::*;
 
 /// Kernel-window objects whose placement differs from the A18 Pro's, as offsets in the upper
@@ -415,6 +416,11 @@ fn overlay_words(bytes: &mut [u8], words: Words) -> Result {
 const PERIOD_CLOCKS: u32 = 200_000;
 /// Temperature sensors read by the die and MTR temperature limiters.
 const TEMP_SENSOR_MASK: u32 = 0x2a22_2aa2;
+/// Default die limiter temperatures of the power configuration, in 0.01 °C.
+const CONFIG_DIE_LIMIT: Limits = Limits { target_cc: 11_000, release_cc: 8_000 };
+/// Offsets of the die limiter target and release in the power configuration.
+const CONFIG_TEMP_TARGET: usize = 0x22c4;
+const CONFIG_TEMP_RELEASE: usize = 0x2270;
 
 pub(crate) struct Chip {
     pub(crate) max_power_mw: u32,
@@ -506,7 +512,7 @@ const POWER_CONFIG_WORDS: Words = &[
     (0x2224, 0x3f4ccccd, 1),
     (0x2228, 0x3e4ccccd, 1),
     (0x2268, TEMP_SENSOR_MASK, 1),
-    (0x2270, 0x1f40, 1),
+    (CONFIG_TEMP_RELEASE, CONFIG_DIE_LIMIT.release_cc, 1),
     (0x2278, 0x4, 1),
     (0x228c, 0x3f800000, 1),
     (0x2294, 0x414eeeee, 1),
@@ -514,7 +520,7 @@ const POWER_CONFIG_WORDS: Words = &[
     (0x22a4, 0x42140000, 1),
     (0x22b0, 0x64, 1),
     (0x22b4, 0x3e8, 2),
-    (0x22c4, 0x2af8, 1),
+    (CONFIG_TEMP_TARGET, CONFIG_DIE_LIMIT.target_cc, 1),
     (0x22f8, 0x3e8, 1),
     (0x2728, 0xb8520000, 1),
     (0x272c, 0x3f7e, 1),
@@ -643,6 +649,11 @@ impl PowerConfig25G83 {
     pub(crate) fn apply_chip(&mut self, chip: &Chip) -> Result {
         overlay_words(&mut self.0, chip.power_config_words)
     }
+
+    /// Applies the board's die limit, after any chip overlay.
+    pub(crate) fn apply_die_limit(&mut self, limit: &DieLimit) {
+        limit.write(&mut self.0, CONFIG_DIE_LIMIT, CONFIG_TEMP_TARGET, CONFIG_TEMP_RELEASE);
+    }
 }
 
 /// The AON temperature-source rows the power configuration names: the GPU cluster 0, GPU
@@ -662,4 +673,12 @@ pub(crate) const AON_TABLE: [u32; 9] = [
 /// Nonzero words of the power-state object. The fast-die limiter reads its target
 /// (`+0xc8`, 101.00 °C) and release (`+0xcc`, 96.00 °C) temperatures in 0.01 °C; left at zero
 /// the limit is 0 °C and the GPU stays at its lowest state whenever the PMP runs.
-pub(crate) const POWER_STATE_WORDS: Words = &[(0xc8, 10_100, 1), (0xcc, 9_600, 1)];
+pub(crate) const POWER_STATE_WORDS: Words = &[
+    (STATE_TEMP_TARGET, STATE_DIE_LIMIT.target_cc, 1),
+    (STATE_TEMP_RELEASE, STATE_DIE_LIMIT.release_cc, 1),
+];
+/// Default die limiter temperatures of the power state, in 0.01 °C.
+pub(crate) const STATE_DIE_LIMIT: Limits = Limits { target_cc: 10_100, release_cc: 9_600 };
+/// Offsets of the die limiter target and release in the power state.
+pub(crate) const STATE_TEMP_TARGET: usize = 0xc8;
+pub(crate) const STATE_TEMP_RELEASE: usize = 0xcc;

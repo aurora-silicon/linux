@@ -233,6 +233,8 @@ struct BuildEnv<'a> {
     dynamic: Range<u64>,
     /// GPU clusters, as the GPU reports them.
     clusters: u32,
+    /// The board's die temperature limit, applied to every limiter table of the build.
+    die_limit: super::die_limit::DieLimit,
 }
 
 impl BuildEnv<'_> {
@@ -1184,6 +1186,7 @@ impl InitData {
             base: range.start,
             dynamic: t8140::dynamic::upper(range.clone()),
             clusters,
+            die_limit: super::die_limit::DieLimit::read(dev.as_ref().as_ref()),
         };
         if variant.graph == super::fw::variant::InitGraph::V25G83 {
             return self.build_25g83(&env, cfg, metrics, active_cores, variant);
@@ -1524,7 +1527,7 @@ impl InitData {
         let fwctl_va = self.object(tables.fwctl)?.gpu_va();
         self.object_mut(self.cluster)?
             .initialize::<abi::PrimaryStatusB>(abi::private::STATUS_B, |status| {
-                status.init(fwctl_va);
+                status.init(fwctl_va, &env.die_limit);
                 Ok(())
             })?;
         self.object_mut(self.cluster)?
@@ -1537,7 +1540,7 @@ impl InitData {
             )?;
         self.object_mut(self.bundle)?
             .initialize::<abi::PowerConfig>(abi::bundle::POWER_CONFIG, |power| {
-                power.init();
+                power.init(&env.die_limit);
                 Ok(())
             })?;
         let secondary_status = base

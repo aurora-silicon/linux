@@ -26,6 +26,7 @@
 use kernel::prelude::*;
 
 use super::clear;
+use crate::g17::die_limit::{DieLimit, Limits};
 
 pub(crate) mod v25g83;
 
@@ -1558,14 +1559,14 @@ impl PrimaryStatusB {
     pub(crate) const POWER_STATE: usize = 0xe440;
 
     /// Initializes the primary status B; `fwctl_va` is the zeroed
-    /// firmware-control page ([`FWCTL_SIZE`] bytes).
-    pub(crate) fn init(&mut self, fwctl_va: u64) {
+    /// firmware-control page ([`FWCTL_SIZE`] bytes), `limit` the board's die limit.
+    pub(crate) fn init(&mut self, fwctl_va: u64, limit: &DieLimit) {
         clear(self);
         self.status = StatusBlock::new();
         self.fwctl_state_va = fwctl_va;
         self.fwctl_ring_va = fwctl_va + FWCTL_RING;
         self.unk_e434 = 1;
-        self.power.init();
+        self.power.init(limit);
     }
 }
 
@@ -1604,10 +1605,18 @@ static_assert!(private::STATUS_B + size_of::<SecondaryConfig>() == private::SECO
 
 /// Die temperature sensors read by the die temperature limiter.
 const TEMP_SENSOR_MASK: u64 = 0x82a;
-/// Die temperature the limiter holds the GPU below, in 0.01 °C.
-const TEMP_TARGET: u32 = 11_000;
-/// Die temperature below which the limiter releases, in 0.01 °C.
-const TEMP_RELEASE: u32 = 8_000;
+/// Default die temperatures of the limiter, in 0.01 °C: it holds the GPU below the target and
+/// releases below the release temperature. A board may lower them
+/// ([`DieLimit`](crate::g17::die_limit::DieLimit)).
+pub(crate) const DIE_LIMIT: Limits = Limits { target_cc: 11_000, release_cc: 8_000 };
+const TEMP_TARGET: u32 = DIE_LIMIT.target_cc;
+const TEMP_RELEASE: u32 = DIE_LIMIT.release_cc;
+/// Offsets of the limiter target and release in the [`PowerConfigTail`].
+const TAIL_TEMP_TARGET: usize = 0x5ac;
+const TAIL_TEMP_RELEASE: usize = 0x558;
+/// Offsets of the limiter target and release in the [`PowerState`].
+const STATE_TEMP_TARGET: usize = 0xc8;
+const STATE_TEMP_RELEASE: usize = 0xcc;
 /// Proportional gain of the limiter: 20.34 as an IEEE-754 single.
 const TEMP_KP: u32 = 0x41a2_b852;
 /// Integral gain of the limiter, per control period: 9.376 as an IEEE-754
@@ -1715,7 +1724,7 @@ const POWER_CONFIG_TAIL_WORDS: Words = &[
     (0x50c, 0x3f4ccccd, 1),
     (0x510, 0x3e4ccccd, 1),
     (0x550, TEMP_SENSOR_MASK as u32, 1),
-    (0x558, TEMP_RELEASE, 1),
+    (TAIL_TEMP_RELEASE, TEMP_RELEASE, 1),
     (0x560, 4, 1),
     (0x574, 0x3f800000, 1),
     (0x57c, TEMP_KI, 1),
@@ -1723,7 +1732,7 @@ const POWER_CONFIG_TAIL_WORDS: Words = &[
     (0x58c, TEMP_KP, 1),
     (0x598, 0x28, 1),
     (0x59c, 0x3e8, 2),
-    (0x5ac, TEMP_TARGET, 1),
+    (TAIL_TEMP_TARGET, TEMP_TARGET, 1),
     (0x5e0, 0x3e8, 1),
     (0x7fc, 0x42000006, 1),
     (0xa10, 0xb8520000, 1),
@@ -1805,8 +1814,8 @@ const POWER_STATE_WORDS: Words = &[
     (0x18, 0x40880000, 1),
     (0x1c, 0x28, 1),
     (0x20, 1, 1),
-    (0xc8, TEMP_TARGET, 1),
-    (0xcc, TEMP_RELEASE, 1),
+    (STATE_TEMP_TARGET, TEMP_TARGET, 1),
+    (STATE_TEMP_RELEASE, TEMP_RELEASE, 1),
     (0xd8, TEMP_KP, 1),
     (0xdc, TEMP_KI, 1),
     (0xf0, 0x26ac, 1),
@@ -1905,13 +1914,14 @@ pub(crate) use super::power::PowerState;
 unsafe impl Zeroable for PowerState {}
 
 impl PowerState {
-    fn init(&mut self) {
+    fn init(&mut self, limit: &DieLimit) {
         // SAFETY: The repr(C) object consists entirely of initialized integer
         // and byte-array storage; every bit pattern is valid.
         let bytes = unsafe {
             core::slice::from_raw_parts_mut(core::ptr::from_mut(self).cast(), size_of::<Self>())
         };
         fill_words(bytes, POWER_STATE_WORDS);
+        limit.write(bytes, DIE_LIMIT, STATE_TEMP_TARGET, STATE_TEMP_RELEASE);
         self.ppm_enabled = 1;
         self.ppm_target_mw = 9750;
     }
@@ -1957,8 +1967,9 @@ pub(crate) struct PowerConfigTail(pub(crate) [u8; 0x1000]);
 unsafe impl Zeroable for PowerConfigTail {}
 
 impl PowerConfigTail {
-    fn init(&mut self) {
+    fn init(&mut self, limit: &DieLimit) {
         fill_words(&mut self.0, POWER_CONFIG_TAIL_WORDS);
+        limit.write(&mut self.0, DIE_LIMIT, TAIL_TEMP_TARGET, TAIL_TEMP_RELEASE);
     }
 }
 
@@ -1998,10 +2009,10 @@ static_assert!(bundle::VIEWS[2] + 0xe40 == bundle::POWER_CONFIG);
 unsafe impl Zeroable for PowerConfig {}
 
 impl PowerConfig {
-    /// Initializes the power configuration.
-    pub(crate) fn init(&mut self) {
+    /// Initializes the power configuration with the board's die limit.
+    pub(crate) fn init(&mut self, limit: &DieLimit) {
         self.head.init();
-        self.tail.init();
+        self.tail.init(limit);
     }
 }
 
