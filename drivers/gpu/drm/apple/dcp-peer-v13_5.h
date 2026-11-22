@@ -7,10 +7,13 @@
 #include <linux/bits.h>
 #include <linux/build_bug.h>
 #include <linux/errno.h>
+#include <linux/of.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
+
+#include "dptx-caps.h"
 
 /* The 13.5 TimingElements entry and A359 use the same physical timing. */
 #define T602X_TIMING_SIZE	0x50
@@ -25,29 +28,40 @@ static inline u32 dcp_t602x_wire_clock(const u8 *timing, size_t size)
 }
 
 /*
- * The T602x 13.5 firmware allocator defaults to a width of 6144 pixels
- * and a 1.438 GHz pixel clock per pipe. On M2 Max, the firmware reported
- * a limit of 1274019840 active pixels/s when rejecting 2560x1440 at 359 Hz.
+ * The M2 Max 13.5 firmware reports width and active-pixel limits in its
+ * rejection log. With one engine and the AW2725DF, its catalogue offered
+ * physical SDR RGB through 1360 MHz. This is a fallback for paired RGB.
  */
-#define T602X_SINGLE_WIDTH	6144U
-#define T602X_SINGLE_RATE	1438000000U
-#define T602X_SINGLE_ACTIVE	(6144ULL * 3456 * 60)
-
-static inline bool dcp_t602x_rate_fits(u16 width, u16 height, u16 htotal, u16 vtotal,
-				       u64 clock, unsigned int pipes)
+static inline struct dcp_dptx_caps dcp_t602x_limits(const struct dcp_dptx_caps *caps)
 {
-	if (!pipes || pipes > 2 || !width || !height || width > htotal || height > vtotal ||
-	    !clock || width > pipes * T602X_SINGLE_WIDTH)
-		return false;
-	if (clock > (u64)pipes * T602X_SINGLE_RATE)
-		return false;
-	return clock * width * height <= pipes * T602X_SINGLE_ACTIVE * htotal * vtotal;
+	if (caps->width && caps->total_rate && caps->active_rate)
+		return *caps;
+
+	return (struct dcp_dptx_caps){
+		.width = 6144,
+		.total_rate = 1360000000,
+		.active_rate = 1274019840,
+	};
 }
 
-static inline bool dcp_t602x_mode_fits(u16 width, u16 height, u16 htotal, u16 vtotal,
-				       int clock_khz, unsigned int pipes)
+static inline bool dcp_t602x_rate_fits(struct dcp_dptx_caps caps, u16 width, u16 height,
+				      u16 htotal, u16 vtotal, u64 clock, unsigned int pipes)
 {
-	return clock_khz > 0 && dcp_t602x_rate_fits(width, height, htotal, vtotal,
+	u64 active = (u64)pipes * caps.active_rate;
+
+	if (!pipes || pipes > 2 || !width || !height || width > htotal || height > vtotal ||
+	    !clock || clock > U32_MAX || width > (u64)pipes * caps.width ||
+	    clock > (u64)pipes * caps.total_rate)
+		return false;
+
+	/* In the product comparison active < clock <= U32_MAX. */
+	return clock <= active || clock * width * height <= active * htotal * vtotal;
+}
+
+static inline bool dcp_t602x_mode_fits(struct dcp_dptx_caps caps, u16 width, u16 height,
+				      u16 htotal, u16 vtotal, int clock_khz, unsigned int pipes)
+{
+	return clock_khz > 0 && dcp_t602x_rate_fits(caps, width, height, htotal, vtotal,
 						   (u64)clock_khz * 1000, pipes);
 }
 
@@ -58,15 +72,17 @@ static inline bool dcp_t602x_even_horizontal(u16 active, u16 sync_start,
 	return !((active | sync_start | sync_end | total) & 1);
 }
 
-static inline bool dcp_t602x_allowed(u32 primary_index, u32 peer_index)
+static inline bool dcp_t602x_is_peer(const struct device_node *source,
+				     const struct device_node *peer)
 {
-	/* External pipes are zero-based in the crossbar, one-based in the DT. */
-	static const u8 allowed[] = { 0x0c, 0x0d, 0x08, 0 };
+	u32 handle;
 
-	if (!primary_index || primary_index > ARRAY_SIZE(allowed) ||
-	    !peer_index || peer_index > ARRAY_SIZE(allowed))
+	if (!source || !peer || source == peer || !peer->phandle)
 		return false;
-	return allowed[primary_index - 1] & BIT(peer_index - 1);
+	of_property_for_each_u32(source, "apple,scanout-peers", handle)
+		if (handle == peer->phandle)
+			return true;
+	return false;
 }
 
 /*

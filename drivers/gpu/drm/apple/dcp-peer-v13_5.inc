@@ -32,15 +32,39 @@ static DEFINE_MUTEX(t602x_scanout_lock);
 
 bool dcp_t602x_ext13_5(struct apple_dcp *dcp)
 {
-	return dcp->hw.t602x_paired_dp && !dcp->main_display &&
+	return dcp->hw.t602x_paired_dp && !dcp->main_display && dcp->index && dcp->index <= 4 &&
 	       dcp->fw_compat == DCP_FIRMWARE_V_13_5;
+}
+
+static bool dcp_t602x_can_pair(struct apple_dcp *dcp)
+{
+	return dcp_t602x_ext13_5(dcp) &&
+	       of_property_present(dcp->dev->of_node, "apple,scanout-peers");
 }
 
 bool dcp_t602x_needs_pair(struct apple_dcp *dcp, const struct drm_display_mode *mode)
 {
-	return dcp_t602x_ext13_5(dcp) &&
-	       !dcp_t602x_mode_fits(mode->hdisplay, mode->vdisplay, mode->htotal,
-				    mode->vtotal, mode->clock, 1);
+	struct dcp_dptx_caps caps = dcp_t602x_limits(&dcp->dptxport[0].caps);
+	struct dcp_display_mode entry;
+
+	if (!dcp_t602x_can_pair(dcp) ||
+	    dcp_t602x_mode_fits(caps, mode->hdisplay, mode->vdisplay, mode->htotal,
+				mode->vtotal, mode->clock, 1))
+		return false;
+
+	/*
+	 * With no reported clock limit, the fallback describes paired RGB.
+	 * Trust ordinary firmware catalogues and their non-RGB formats.
+	 */
+	if (!dcp->dptxport[0].caps.total_rate && (u64)mode->clock * 1000 > caps.total_rate) {
+		caps.total_rate = U32_MAX;
+		if (dcp_t602x_mode_fits(caps, mode->hdisplay, mode->vdisplay, mode->htotal,
+					mode->vtotal, mode->clock, 1) &&
+		    lookup_mode(dcp, mode, &entry) &&
+		    (!entry.t602x_pair_offered || entry.sdr_rgb.score < 0))
+			return false;
+	}
+	return true;
 }
 
 static bool dcp_t602x_mode_has_equal_halves(const struct drm_display_mode *mode)
@@ -58,14 +82,21 @@ static struct apple_dcp *dcp_t602x_idle_peer_locked(struct apple_dcp *dcp, u32 i
 	drm_for_each_crtc(crtc, dcp->crtc->base.dev) {
 		struct apple_dcp *p = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
 		struct apple_connector *connector;
+		struct dcp_dptx_caps caps, required;
 
 		if (!p || p == dcp || (index && p->index != index) || !dcp_t602x_ext13_5(p) ||
-		    !dcp_t602x_allowed(dcp->index, p->index) || p->dptx_die != dcp->dptx_die ||
+		    p->dptx_die != dcp->dptx_die ||
+		    !dcp_t602x_is_peer(dcp->dev->of_node, p->dev->of_node) ||
 		    !p->active || p->crashed || p->peer_unbinding || READ_ONCE(p->quiescing) ||
 		    p->peer_reserved || p->peer_owner ||
 		    dcp_t602x_port_reserved(p) || READ_ONCE(p->active_typec_route) ||
 		    READ_ONCE(p->typec_cable_connected) || READ_ONCE(p->dptxport[0].connected) ||
-		    READ_ONCE(p->dptxport[1].connected) || p->fixed_phy)
+		    READ_ONCE(p->dptxport[1].connected))
+			continue;
+		caps = dcp_t602x_limits(&p->dptxport[0].caps);
+		required = dcp_t602x_limits(&dcp->dptxport[0].caps);
+		if (caps.width < required.width || caps.total_rate < required.total_rate ||
+		    caps.active_rate < required.active_rate)
 			continue;
 		connector = READ_ONCE(p->connector);
 		if (connector && READ_ONCE(connector->connected))
@@ -85,8 +116,8 @@ static bool dcp_t602x_pair_fits(struct apple_dcp *dcp, const struct drm_display_
 	return dcp->crtc && READ_ONCE(dcp->active_typec_route) &&
 	       !READ_ONCE(dcp->dptx_tunnel) && dcp_t602x_mode_has_equal_halves(mode) &&
 	       !(mode->flags & ~sync_flags) && !mode->hskew && mode->vscan <= 1 &&
-	       dcp_t602x_mode_fits(mode->hdisplay, mode->vdisplay, mode->htotal,
-				  mode->vtotal, mode->clock, 2);
+	       dcp_t602x_mode_fits(dcp_t602x_limits(&dcp->dptxport[0].caps), mode->hdisplay,
+				  mode->vdisplay, mode->htotal, mode->vtotal, mode->clock, 2);
 }
 
 bool dcp_t602x_mode_limited(struct apple_dcp *dcp, const struct drm_display_mode *mode)
@@ -164,7 +195,7 @@ bool dcp_t602x_has_pair_engine(struct drm_device *dev)
 	drm_for_each_crtc(crtc, dev) {
 		struct apple_dcp *dcp = dcp_t602x_crtc_pipe(crtc);
 
-		if (dcp && dcp_t602x_ext13_5(dcp))
+		if (dcp && dcp_t602x_can_pair(dcp))
 			return true;
 	}
 	return false;
@@ -250,16 +281,17 @@ int dcp_t602x_plan_commit(struct drm_atomic_commit *commit)
 void dcp_t602x_display_hints(struct apple_dcp *dcp,
 			       struct dcp_display_hints_v13_5 *reply)
 {
+	struct dcp_dptx_caps caps = dcp_t602x_limits(&dcp->dptxport[0].caps);
 	const u32 width = get_unaligned_le32(reply->hints + 0x38);
 	const u32 rate = get_unaligned_le32(reply->hints + 0x40);
 	struct apple_dcp *peer;
 
-	if (!dcp_t602x_ext13_5(dcp) || !dcp->crtc ||
+	if (!dcp_t602x_can_pair(dcp) || !dcp->crtc ||
 	    dcp->dptx_tunnel || !READ_ONCE(dcp->active_typec_route) ||
 	    (reply->hints[0] & 3) != 1)
 		return;
-	if (!width || !rate || (width <= T602X_SINGLE_WIDTH && rate <= T602X_SINGLE_RATE) ||
-	    width > 2 * T602X_SINGLE_WIDTH || (u64)rate > 2ULL * T602X_SINGLE_RATE)
+	if (!width || !rate || (width <= caps.width && rate <= caps.total_rate) ||
+	    width > 2ULL * caps.width || (u64)rate > 2ULL * caps.total_rate)
 		return;
 
 	guard(mutex)(&dcp_peer_lock);
@@ -269,8 +301,8 @@ void dcp_t602x_display_hints(struct apple_dcp *dcp,
 	reply->allocation.primary_id = cpu_to_le32(dcp->index - 1);
 	reply->allocation.peer_id = cpu_to_le32(peer->index - 1);
 	reply->allocation.extra_pipes = 1;
-	reply->allocation.max_width = cpu_to_le32(T602X_SINGLE_WIDTH);
-	reply->allocation.max_rate = cpu_to_le32(T602X_SINGLE_RATE);
+	reply->allocation.max_width = cpu_to_le32(caps.width);
+	reply->allocation.max_rate = cpu_to_le32(caps.total_rate);
 }
 
 /* Firmware 13.5 A359 and A360 share the 124/116-byte insert layout. */
@@ -723,14 +755,16 @@ static bool t602x_axis_matches(const u8 *axis, u16 active, u16 start, u16 end, u
 	       get_unaligned_le32(axis + 16) == start - active;
 }
 
-static bool t602x_timing_matches(const u8 *timing, const struct drm_display_mode *mode)
+static bool t602x_timing_matches(struct apple_dcp *dcp, const u8 *timing,
+				const struct drm_display_mode *mode)
 {
 	return t602x_axis_matches(timing + 4, mode->hdisplay, mode->hsync_start,
 				  mode->hsync_end, mode->htotal) &&
 	       t602x_axis_matches(timing + 36, mode->vdisplay, mode->vsync_start,
 				  mode->vsync_end, mode->vtotal) &&
-	       dcp_t602x_rate_fits(mode->hdisplay, mode->vdisplay, mode->htotal, mode->vtotal,
-				   get_unaligned_le32(timing + 68), 2);
+	       dcp_t602x_rate_fits(dcp_t602x_limits(&dcp->dptxport[0].caps), mode->hdisplay,
+				  mode->vdisplay, mode->htotal, mode->vtotal,
+				  get_unaligned_le32(timing + T602X_CLOCK_OFFSET), 2);
 }
 
 static int t602x_start_scanout(struct t602x_scanout *s, struct drm_crtc_state *state,
@@ -748,7 +782,8 @@ static int t602x_start_scanout(struct t602x_scanout *s, struct drm_crtc_state *s
 	if (ret)
 		return ret;
 	if (dcp_t602x_wire_clock(physical.video.timing, sizeof(physical.video.timing)) !=
-	    selected->t602x_clock_hz || !t602x_timing_matches(physical.video.timing, &state->mode))
+	    selected->t602x_clock_hz ||
+	    !t602x_timing_matches(owner, physical.video.timing, &state->mode))
 		return -ERANGE;
 	half.video = physical.video;
 	dcp_peer_split_timing(half.video.timing);

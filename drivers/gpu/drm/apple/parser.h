@@ -38,6 +38,7 @@ struct dcp_parse_ctx {
 	bool metadata_timing;
 	/* T602x 13.5 uses the catalogue clock to verify paired readback. */
 	bool t602x_pair_timing;
+	bool t602x_pair_offered;
 	/*
 	 * A firmware 27 external processor: for SDR, prefer the timing's
 	 * Default RGB element, as macOS does, over a higher-scored BT.2020 one.
@@ -160,6 +161,7 @@ struct dcp_display_mode {
 	bool needs_timestamps;
 	/* IsPreferred, outside the external SDR path */
 	bool preferred;
+	bool t602x_pair_offered;
 	bool metadata_timing_valid;
 	bool automatic_rgb8_quirk;
 	/* IsPreferred on every path; an external display's native resolution */

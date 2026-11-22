@@ -7,10 +7,7 @@
 #include <linux/unaligned.h>
 
 #include "dcp-peer-v26_6.h"
-
-struct dcp_dptx_caps {
-	u32 width, total_rate, active_rate;
-};
+#include "dptx-caps.h"
 
 /* Per-engine state used by D114/D115 in a VFTG pair. This is not
  * display-wall emulation: membership is set only while a split mode is active.

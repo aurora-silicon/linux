@@ -881,6 +881,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	struct drm_display_mode *mode = &out->mode;
 
 	*out = (struct dcp_display_mode) {
+		.t602x_pair_offered = handle->t602x_pair_offered,
 		.sdr_rgb.score = -1,
 		.sdr_444.score = -1,
 		.sdr.score = -1,

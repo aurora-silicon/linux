@@ -498,6 +498,7 @@ struct apple_dcp {
 	struct delayed_work hybrid_wq;
 	struct dcp_peer_tiling peer_tiling;
 	bool peer_unbinding;
+	bool t602x_pair_offered; /* Last enabled DPTX allocation reply. */
 	bool t602x_peer_reserved; /* Claimed under the fabric lock, released after stop. */
 	u32 t602x_pair_clock, t602x_frame_id;
 	bool t602x_frame_waiting;

@@ -1021,11 +1021,15 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		if (dcp->fw_compat == DCP_FIRMWARE_V_13_5 && !dptx->unit &&
 		    of_device_is_compatible(dcp->dev->of_node, "apple,t6020-dcpext") &&
 		    data_size == sizeof(struct dcp_display_hints_v13_5)) {
-			ret = dcp_no_peer_hints_v13_5(data, reply, reply_size);
+			struct dcp_display_hints_v13_5 *hints = reply;
+
+			ret = dcp_no_peer_hints_v13_5(data, hints, reply_size);
 			if (ret)
 				return ret;
 			dptxport_note_tile_hint(service, data, data_size);
-			dcp_t602x_display_hints(dcp, reply);
+			dcp_t602x_display_hints(dcp, hints);
+			if (hints->hints[0] & 1)
+				WRITE_ONCE(dcp->t602x_pair_offered, hints->allocation.extra_pipes);
 			return 0;
 		}
 

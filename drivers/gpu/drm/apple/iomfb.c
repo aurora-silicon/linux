@@ -2457,6 +2457,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 			return ret;
 		ctx->metadata_timing = dcp_firmware_metadata_enabled(dcp);
 		ctx->t602x_pair_timing = dcp_t602x_ext13_5(dcp);
+		ctx->t602x_pair_offered = READ_ONCE(dcp->t602x_pair_offered);
 		ctx->sdr_default_rgb = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
 				       !dcp_has_panel(dcp);
 		ctx->pq_dsc = dcp->fw_compat == DCP_FIRMWARE_V_27_0;
@@ -3446,15 +3447,16 @@ int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 }
 
 /* The same catalogue entry must be usable when probing and setting a paired mode. */
-static bool t602x_pair_element(const struct dcp_display_mode *entry)
+static bool t602x_pair_element(struct apple_dcp *dcp, const struct dcp_display_mode *entry)
 {
 	const struct drm_display_mode *mode = &entry->mode;
 
 	return entry->timing_mode_id && entry->timing_mode_id < DCP_SPLIT_MODE_SUFFIX &&
 	       entry->sdr_rgb.id && entry->sdr_rgb.id < DCP_SPLIT_MODE_SUFFIX &&
 	       entry->sdr_rgb.score >= 0 &&
-	       dcp_t602x_rate_fits(mode->hdisplay, mode->vdisplay, mode->htotal, mode->vtotal,
-				   entry->t602x_clock_hz, 2);
+	       dcp_t602x_rate_fits(dcp_t602x_limits(&dcp->dptxport[0].caps), mode->hdisplay,
+				  mode->vdisplay, mode->htotal, mode->vtotal,
+				  entry->t602x_clock_hz, 2);
 }
 
 static bool lookup_mode_matching(struct apple_dcp *dcp,
@@ -3473,7 +3475,7 @@ static bool lookup_mode_matching(struct apple_dcp *dcp,
 	modes = dcp_modes_snapshot(dcp, NULL, &count);
 	for (i = 0; i < count; ++i) {
 		if (drm_mode_match(mode, &modes[i].mode, match_flags)) {
-			if (paired && !t602x_pair_element(&modes[i]))
+			if (paired && !t602x_pair_element(dcp, &modes[i]))
 				continue;
 			if (!modes[i].automatic_rgb8_quirk)
 				goto found;

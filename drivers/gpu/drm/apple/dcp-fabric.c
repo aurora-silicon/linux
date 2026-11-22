@@ -305,8 +305,7 @@ static bool dcp_typec_safe_held(struct apple_dcp *dcp)
 static int dcp_t602x_claim_port_locked(struct apple_dcp *dcp)
 {
 	lockdep_assert_held(&dcp_typec_fabric_lock);
-	if (dcp->fixed_phy || dcp->active_typec_route || dcp_typec_safe_held(dcp) ||
-	    dcp_t602x_port_reserved(dcp) ||
+	if (dcp->active_typec_route || dcp_typec_safe_held(dcp) || dcp_t602x_port_reserved(dcp) ||
 	    READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->crashed))
 		return -EBUSY;
 	WRITE_ONCE(dcp->t602x_peer_reserved, true);
