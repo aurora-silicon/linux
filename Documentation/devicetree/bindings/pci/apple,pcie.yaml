@@ -580,6 +580,15 @@ allOf:
                   - const: ltssm
                   - const: oe-fabric
                   - const: intr2axi
+              apple,msi-vector-base:
+                description:
+                  The bridge's 32-vector slice of the shared MSI window,
+                  after the internal host's vectors 0..31.
+                minimum: 32
+                maximum: 224
+                multipleOf: 32
+            required:
+              - apple,msi-vector-base
         - if:
             properties:
               compatible:
