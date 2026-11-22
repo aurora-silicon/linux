@@ -4951,12 +4951,16 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
 
 	/*
 	 * These PHYs have no drive level control: the lanes keep the levels
-	 * their tunables set up. Tell a drive level request apart from a bad
-	 * one, so the caller can keep the levels it asked for.
+	 * their tunables set up, as the T8132 branch above does. A drive-only
+	 * request succeeds, so DCP's link training goes on with those levels;
+	 * drive levels together with a rate change are not a request DCP makes.
 	 */
-	if (opts->set_voltages)
-		return -EOPNOTSUPP;
-	if (opts->set_lanes)
+	if (opts->set_voltages && !opts->set_rate && !opts->set_lanes) {
+		dev_dbg(atcphy->dev, "DP drive request ignored (lane 0 swing %u pre %u)\n",
+			opts->voltage[0], opts->pre[0]);
+		return 0;
+	}
+	if (opts->set_voltages || opts->set_lanes)
 		return -EINVAL;
 
 	if (opts->set_rate) {
