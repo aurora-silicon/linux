@@ -447,5 +447,3 @@
 	apple,rtkit-keep-running;
 };
 
-/* Older Stage 2 loaders prune the shared ATC0 suppliers of this unused node. */
-/delete-node/ &usb_otg0;
