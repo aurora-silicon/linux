@@ -321,6 +321,14 @@
 		    <0x200 &dart_apcie2 1 1>;
 };
 
+&port00 {
+	/* ADT pci-bridge0 function-clkreq and maximum-link-speed */
+	clkreq-gpios = <&pinctrl_ap 160 GPIO_ACTIVE_LOW>;
+	max-link-speed = <2>;
+};
+
 &port02 {
+	/* ADT pci-bridge2 maximum-link-speed */
+	max-link-speed = <1>;
 	status = "okay";
 };
