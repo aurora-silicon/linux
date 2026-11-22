@@ -137,7 +137,7 @@ pub(crate) const DRM_ASAHI_COMPUTE_USES_MATRIX: u32 =
 /// The compute command neither copies nor resets queries, so it cannot observe
 /// timestamps the host publishes after earlier commands complete
 /// (DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS). Accepted, and reported with
-/// DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS by the M5 command set.
+/// DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS by the G17 command sets.
 pub(crate) const DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: u32 =
     uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS as u32;
 
