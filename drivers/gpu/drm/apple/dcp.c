@@ -1854,9 +1854,11 @@ struct dcp_rtkit_live {
 };
 
 /*
- * Inside one of this DCP's reserved-memory carveouts. Those are also what the IOMMU
- * core rebuilds the DCP's DART mappings from when it takes over a locked
- * root, so a buffer outside them would lose its mapping at attach.
+ * Inside one of this DCP's no-map reserved-memory carveouts. Those are also what
+ * the IOMMU core rebuilds the DCP's DART mappings from when it takes over a
+ * locked root, so a buffer outside them would lose its mapping at attach. A
+ * region in the linear map would alias the write-combined mapping of the buffer
+ * with a cacheable one, and a reusable (CMA) region could be handed out.
  */
 static bool dcp_rtkit_live_carveout(struct device_node *np, phys_addr_t phys,
 				    size_t size)
@@ -1871,8 +1873,8 @@ static bool dcp_rtkit_live_carveout(struct device_node *np, phys_addr_t phys,
 		if (!mem)
 			break;
 		rmem = of_reserved_mem_lookup(mem);
-		/* A reusable (CMA) region could be handed out by the kernel. */
-		found = rmem && !of_property_present(mem, "reusable") &&
+		found = rmem && of_property_present(mem, "no-map") &&
+			!of_property_present(mem, "reusable") &&
 			phys >= rmem->base && size <= rmem->size &&
 			phys - rmem->base <= rmem->size - size;
 		of_node_put(mem);
@@ -1934,8 +1936,11 @@ static int dcp_rtkit_live_parse(struct apple_dcp *dcp, struct dcp_rtkit_live *li
 	if (ret)
 		return ret;
 
+	/* A session without shared buffers has the property, empty. */
+	if (!of_find_property(np, "apple,rtkit-buffers", NULL))
+		return -EINVAL;
 	count = of_property_count_u32_elems(np, "apple,rtkit-buffers");
-	if (count == -EINVAL || count == -ENODATA)
+	if (count == -ENODATA)
 		count = 0;
 	if (count < 0 || count > ARRAY_SIZE(cells) ||
 	    count % DCP_RTKIT_LIVE_BUFFER_CELLS)
@@ -1989,6 +1994,10 @@ static int dcp_rtkit_live_parse(struct apple_dcp *dcp, struct dcp_rtkit_live *li
 		b->endpoint = t[0];
 		b->shmem.iova = iova;
 		b->shmem.size = size;
+		/*
+		 * The is_mapped cell only says who placed the buffer; Linux has
+		 * mapped every one here, and is_mapped makes RTKit unmap it.
+		 */
 		b->shmem.is_mapped = true;
 		live->session.num_buffers = i + 1;
 	}
@@ -6891,13 +6900,21 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	}
 
-	/* Registering the mailbox can already expose RTKit buffer requests. */
-	ret = dcp_pin_live_session(dcp);
-	if (ret)
-		goto err_piodma;
+	/*
+	 * Check a handed-over session before anything is retained for it: a
+	 * description that fails leaves the DCP unbound and nothing pinned.
+	 * Its buffers are in no-map carveouts, which the kernel never hands out.
+	 */
 	live = dcp_rtkit_live_parse(dcp, &live_rtkit);
 	if (live < 0) {
 		ret = dev_err_probe(dev, live, "Invalid live RTKit handoff\n");
+		goto err_piodma;
+	}
+	/* Registering the mailbox can already expose RTKit buffer requests. */
+	ret = dcp_pin_live_session(dcp);
+	if (ret) {
+		if (live)
+			dcp_rtkit_live_unmap(&live_rtkit);
 		goto err_piodma;
 	}
 	/* External H17P supplies shared-buffer addresses during RTKit startup. */
