@@ -599,6 +599,8 @@ struct apple_sleep_ops {
 	/* After final peer stops: errors are fatal, never a veto. */
 	int (*commit_notice)(struct apple_sleep *s);
 	void (*finish)(struct apple_sleep *s);
+	/* Optional: the PMU's wake steps, after the SMC's first wake commands */
+	void (*pmu_wake)(struct apple_sleep *s);
 	int (*cpu_prepare)(u64 mpidr);
 	void (*cpu_restore)(u64 mpidr);
 	/* Optional: a stopped core's own last steps and WFI at the commit (never returns) */
@@ -955,6 +957,7 @@ struct apple_sleep {
 	/* Per-attempt M5 ANS receipt; survives platform .wake reporting. */
 	int ans_m5_wake_error;
 	int pcie_ans_on_ret;
+	int apcie_port_clk_ret[2];
 	void __iomem *apcie_axi;
 	void __iomem *apcie_cio3pll;
 	void __iomem *apcie_clkgen;
@@ -966,7 +969,10 @@ struct apple_sleep {
 	bool apcie_port_down;
 	void __iomem *apcie_port;
 	void __iomem *apcie_port_phy;
-	/* Port 2 and its PHY glue, when the host has an enabled pci@2,0, or NULL */
+	/* Ports no host sets up again after a real sleep: no managed radio contract */
+	bool apcie_ports_unowned;
+	/* The host has an available pci@2,0: the endpoint on port 2 is stopped at the commit */
+	bool apcie_port2_enabled;
 	void __iomem *apcie_port2;
 	void __iomem *apcie_port2_phy;
 	void __iomem *apcie_engine;
@@ -2467,16 +2473,14 @@ static void sleep_cpu_down_off(u64 mpidr)
 }
 
 /*
- * apple_sleep.cpu_on_trace: after a sleep, one line per core start. aura's spin-table slot is
+ * After a sleep, one line per core start, when its dynamic debug site is on (no runtime switch;
+ * without CONFIG_DYNAMIC_DEBUG it is compiled out, and so is its wait). aura's spin-table slot is
  * { mpidr, flag, target, ... } with cpu-release-addr = &target, and aura bumps flag as the core
  * enters its reset path: "flag a -> b" tells a core that never left reset from one that ran
  * and stopped later (in the kernel's pen or its bring-up). Also the cpu-start words before and
- * after, the core's power and power-gate words and its EDPRSR (bit 0 PU).
+ * after, the core's power and power-gate words and its EDPRSR (bit 0 PU). On with
+ * dyndbg="func sleep_cpu_on +p" (only +p matters: the line is a pr_info).
  */
-static bool sleep_cpu_on_trace = true;
-module_param_named(cpu_on_trace, sleep_cpu_on_trace, bool, 0644);
-MODULE_PARM_DESC(cpu_on_trace, "Report each core start after a sleep (aura slot flag, cpu-start words, EDPRSR)");
-
 static void __iomem *sleep_cpu_slot[NR_CPUS];
 
 static void __iomem *sleep_cpu_slot_map(int cpu)
@@ -2515,14 +2519,17 @@ static int sleep_cpu_on(u64 mpidr)
 {
 	struct apple_sleep *s = apple_sleep;
 	unsigned int cluster = sleep_cpu_cluster(s, mpidr), core = sleep_cpu_core(mpidr);
-	bool trace = READ_ONCE(sleep_cpu_on_trace) && s->soc->cpu_clusters >= 2;
 	int cpu = get_logical_index(mpidr & MPIDR_HWID_BITMASK);
-	void __iomem *slot = trace ? sleep_cpu_slot_map(cpu) : NULL;
+	void __iomem *slot = NULL;
 	u32 before[4], after[4], ps = 0, gate = 0, edprsr = ~0U;
 	u64 flag0 = 0, flag1 = 0;
 	unsigned int us = 0;
+	bool trace;
+	DEFINE_DYNAMIC_DEBUG_METADATA(cpu_on_trace, "apple-sleep: cpu start after a sleep\n");
 
+	trace = DYNAMIC_DEBUG_BRANCH(cpu_on_trace) && s->soc->cpu_clusters >= 2;
 	if (trace) {
+		slot = sleep_cpu_slot_map(cpu);
 		sleep_cpu_start_words(s, before);
 		if (slot)
 			flag0 = sleep_cpu_slot_read(slot, 8);
@@ -3842,14 +3849,14 @@ static void sleep_apcie_port_stop(struct apple_sleep *s, void __iomem *port,
 /*
  * The endpoint on port 2, stopped as the radio's port is, so that the block's power doesn't go
  * with its link up while the endpoint's own rail stays on. Its host trains it again after the
- * wake. Only a host that describes and enables port 2 has it mapped. A port with its link down
+ * wake. Only a host that describes and enables port 2 has it stopped. A port with its link down
  * or never clocked is left as it is: the power going takes nothing from it.
  */
 static void sleep_apcie_port2_stop_once(struct apple_sleep *s)
 {
 	void __iomem *port = s->apcie_port2;
 
-	if (s->apcie_port2_stopped || !port || !s->apcie_port2_phy)
+	if (s->apcie_port2_stopped || !s->apcie_port2_enabled || !port || !s->apcie_port2_phy)
 		return;
 	s->apcie_port2_stopped = true;
 	if (!(readl(port + APCIE_PORT_APPCLK) & APCIE_PORT_APPCLK_EN) ||
@@ -3870,6 +3877,35 @@ static void sleep_apcie_port_stop_once(struct apple_sleep *s)
 	s->apcie_port_stopped = true;
 	sleep_apcie_port_stop(s, s->apcie_port, s->apcie_port_phy, s->radio_perst,
 			      s->radio_perst_low, true);
+}
+
+/*
+ * A port that no host sets up again after a real sleep (one without the managed radio
+ * contract) gets its clocks back as the loader set them at boot: the DART in its unit is
+ * clocked by the port and its resume reads it. PERST# and the link stay as the wake left them.
+ * It stops before the reset release when a clock doesn't ack: the wake's report names the port.
+ */
+static int sleep_apcie_port_clock(void __iomem *port, void __iomem *phy)
+{
+	u32 val;
+	int ret;
+
+	if (!port || !phy)
+		return 0;
+	writel(readl(port + APCIE_PORT_APPCLK) | APCIE_PORT_APPCLK_EN, port + APCIE_PORT_APPCLK);
+	writel(readl(phy) & ~(APCIE_PHY_CTRL_CLK0REQ | APCIE_PHY_CTRL_CLK1REQ), phy);
+	writel(readl(phy) | APCIE_PHY_CTRL_CLK0REQ, phy);
+	ret = readl_poll_timeout_atomic(phy, val, val & APCIE_PHY_CTRL_CLK0ACK, 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+	writel(readl(phy) | APCIE_PHY_CTRL_CLK1REQ, phy);
+	ret = readl_poll_timeout_atomic(phy, val, val & APCIE_PHY_CTRL_CLK1ACK, 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+	writel(readl(phy) & ~APCIE_PHY_CTRL_RESET, phy);
+	writel(readl(phy) | APCIE_PORT_PHY_EN0, phy);
+	writel(readl(phy) | APCIE_PORT_PHY_EN1, phy);
+	return 0;
 }
 
 /* A poll here only paces the steps: the power goes next whatever it reads. */
@@ -4633,10 +4669,41 @@ static void sleep_ps_rewake(struct apple_sleep *s)
 		s->ps_rewake_timeouts += redo_aon[i];
 }
 
+/*
+ * Which blocks lost their power across this sleep: a coprocessor whose word is listed lost its
+ * firmware as well, whatever the wake wrote back, and a driver that talks to it after the wake
+ * talks to a reset block. A line at info for the PMGR or the always-on PMGR only when one of
+ * its words was lost; the usual case, every word back on, is at debug.
+ */
+
+static void sleep_ps_report_off(struct apple_sleep *s, const char *name,
+				const struct apple_sleep_words *w, const u32 *commit,
+				const u32 *woke)
+{
+	char buf[384];
+	int i, len = 0, off = 0;
+
+	for (i = 0; i < w->count; i++) {
+		if (!FIELD_GET(PS_TARGET, commit[i]) || FIELD_GET(PS_ACTUAL, woke[i]))
+			continue;
+		off++;
+		if (len < sizeof(buf) - 8)
+			len += scnprintf(buf + len, sizeof(buf) - len, " %#x", w->offset[i]);
+	}
+	if (off)
+		dev_info(s->dev, "%s: %d words on at the commit were off at the wake:%s\n", name,
+			 off, buf);
+	else
+		dev_dbg(s->dev, "%s: all words on at the commit were on at the wake\n", name);
+}
+
 static void sleep_ps_rewake_report(struct apple_sleep *s)
 {
 	const struct apple_sleep_words *all = &s->soc->ps_all, *aon = &s->soc->ps_aon_all;
 	int i;
+
+	sleep_ps_report_off(s, "PMGR", all, s->ps_commit, s->ps_woke);
+	sleep_ps_report_off(s, "AON PMGR", aon, s->ps_aon_commit, s->ps_aon_woke);
 
 	dev_dbg(s->dev, "power words: %u written back, %u not on in time\n", s->ps_rewoken,
 		s->ps_rewake_timeouts);
@@ -5826,6 +5893,14 @@ static void t8132_wake(struct apple_sleep *s)
 
 	if (s->pcie_ans_stopped)
 		s->pcie_ans_on_ret = apple_sleep_raise_apcie(s);
+	s->apcie_port_clk_ret[0] = 0;
+	s->apcie_port_clk_ret[1] = 0;
+	if (s->pcie_ans_stopped && !s->pcie_ans_on_ret && s->apcie_ports_unowned) {
+		s->apcie_port_clk_ret[0] = sleep_apcie_port_clock(s->apcie_port,
+								  s->apcie_port_phy);
+		s->apcie_port_clk_ret[1] = sleep_apcie_port_clock(s->apcie_port2,
+								  s->apcie_port2_phy);
+	}
 	s->apcie_port_down = true;
 	s->pins_lost = s->pins_saved_valid;
 }
@@ -6432,6 +6507,9 @@ static void apple_sleep_end(void)
 	sleep_v27_scope_end();
 	if (pm_suspend_via_firmware() && apple_sleep->soc->ops->finish)
 		apple_sleep->soc->ops->finish(apple_sleep);
+	/* Nothing left by now after a wake; the platform wake takes it */
+	if (pm_suspend_via_firmware() && apple_sleep->soc->ops->pmu_wake)
+		apple_sleep->soc->ops->pmu_wake(apple_sleep);
 	if (pm_suspend_via_firmware())
 		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
 }
@@ -6678,6 +6756,8 @@ static void apple_sleep_smc_scope_end(void)
 	ret = s->smc.saved_ops->end(s->smc.data);
 	if (ret)
 		dev_err(s->smc.dev, "SMC state not restored after the sleep: %d\n", ret);
+	else if (s->smc.saved_ops->woken)
+		s->smc.saved_ops->woken(s->smc.data);
 	s->smc.held = false;
 	device_unlock(s->smc.dev);
 }
@@ -6796,7 +6876,10 @@ static void apple_sleep_report(void)
 	sleep_note(s, 0x7e);
 	if (s->soc->ops->finish)
 		s->soc->ops->finish(s);
+	/* AP ON, then the SMC's wake record and waka, then the PMU's wake steps: macOS's order */
 	apple_sleep_smc_scope_end();
+	if (s->soc->ops->pmu_wake)
+		s->soc->ops->pmu_wake(s);
 	sleep_v27_scope_end();
 	s->smc_woke_alone = false;
 	if (!s->returned)
@@ -6861,6 +6944,12 @@ static void apple_sleep_report(void)
 	if (s->pcie_ans_stopped && s->pcie_ans_on_ret)
 		dev_err(s->dev, "ANS's PCIe block did not come up after the wake: %d\n",
 			s->pcie_ans_on_ret);
+	if (s->apcie_port_clk_ret[0])
+		dev_err(s->dev, "PCIe port 0's PHY clocks did not ack after the wake: %d\n",
+			s->apcie_port_clk_ret[0]);
+	if (s->apcie_port_clk_ret[1])
+		dev_err(s->dev, "PCIe port 2's PHY clocks did not ack after the wake: %d\n",
+			s->apcie_port_clk_ret[1]);
 }
 
 static int apple_sleep_valid(suspend_state_t state)
@@ -7239,10 +7328,10 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 
 	s->apcie_port = apple_sleep_apcie_block(s, np, "port0", NULL, NULL);
 	s->apcie_port_phy = apple_sleep_apcie_block(s, np, "phy0", NULL, NULL);
-	if (of_device_is_available(np) && apple_sleep_apcie_has_port(np, 2)) {
-		s->apcie_port2 = apple_sleep_apcie_block(s, np, "port2", NULL, NULL);
-		s->apcie_port2_phy = apple_sleep_apcie_block(s, np, "phy2", NULL, NULL);
-	}
+	s->apcie_port2 = apple_sleep_apcie_block(s, np, "port2", NULL, NULL);
+	s->apcie_port2_phy = apple_sleep_apcie_block(s, np, "phy2", NULL, NULL);
+	s->apcie_ports_unowned = !of_property_present(np, "apple,managed-sids");
+	s->apcie_port2_enabled = of_device_is_available(np) && apple_sleep_apcie_has_port(np, 2);
 	engine = of_parse_phandle(np, "apple,piodma", 0);
 	if (engine) {
 		s->apcie_engine = apple_sleep_apcie_block(s, engine, "engine", NULL, NULL);
@@ -7573,11 +7662,8 @@ EXPORT_SYMBOL_GPL(apple_sleep_display_v27_power_ready);
  * the display coprocessor after a wake, outside a system sleep, in this order and with these
  * values. No PMC word is written here: the display driver does the PMC requests around this. The
  * display pipe DART's Linux-owned streams are remembered before the power-off and written back
- * after the power-on (m5_disp_dart_rewrite). The sleep's own entry and exit don't call this.
+ * after the power-on. The sleep's own entry and exit don't call this.
  */
-static bool t6050_disp_dart_rewrite = true;
-module_param_named(m5_disp_dart_rewrite, t6050_disp_dart_rewrite, bool, 0644);
-
 static void __iomem *t6050_disp_dcp_gate;
 
 static int t6050_disp_ps_settle(void __iomem *word, u32 mask, u32 want)
@@ -7613,15 +7699,13 @@ int apple_sleep_m5_display_power(bool on)
 		writel(0, t6050_disp_dcp_gate + 0x1c);
 		writel(1, t6050_disp_dcp_gate + 0x40);
 		writel(0x1f00000f, cpu);
-		if (t6050_disp_dart_rewrite)
-			apple_dart_m5_display_rewrite(NULL);
+		apple_dart_m5_display_rewrite(NULL);
 		dev_dbg(s->dev, "display power on: %d, CPU %#x FE %#x SYS %#x gate %#x %#x\n", ret,
 			readl(cpu), readl(fe), readl(sys), readl(t6050_disp_dcp_gate + 0x1c),
 			readl(t6050_disp_dcp_gate + 0x40));
 		return ret;
 	}
-	if (t6050_disp_dart_rewrite)
-		apple_dart_m5_display_snapshot(NULL);
+	apple_dart_m5_display_snapshot(NULL);
 	writel(0x0f0000ff, cpu);
 	ret |= t6050_disp_ps_settle(cpu, 0xf0, 0xf0);
 	writel(3, t6050_disp_dcp_gate + 0x1c);

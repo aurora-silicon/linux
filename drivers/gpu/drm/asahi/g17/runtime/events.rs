@@ -392,6 +392,7 @@ impl Firmware {
             || self.hold.active()
             || self.registration_power_release_pending
             || self.effort.applied() != 0
+            || self.effort.streaming()
         {
             return Ok(false);
         }

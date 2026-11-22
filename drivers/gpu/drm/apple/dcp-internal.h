@@ -208,6 +208,12 @@ struct dcp_brightness {
 	u32 fade_from;
 	u32 fade_to;
 	bool fading;
+	/*
+	 * Without the present-coupled policy: the level the last present set
+	 * (struct dcp_bl_presented), while nits is the firmware's report.
+	 * Under the backlight lock.
+	 */
+	struct dcp_bl_presented presented;
 };
 
 struct audiosrv_data;
@@ -432,6 +438,7 @@ struct dcp_desktop_state {
 /* TODO: move IOMFB members to its own struct */
 struct dcpext_scanout;
 struct dcp_hdmi;
+struct dcp_cec;
 
 bool dcp_desktop_present_complete(struct apple_dcp *dcp, u32 id);
 void dcp_panel_metadata_replace(struct apple_dcp *dcp,
@@ -992,6 +999,11 @@ struct apple_dcp {
 	 * Activate/Deactivate belong to it until its answer is in.
 	 */
 	bool t8132_release_late;
+	/*
+	 * T8132 dcpext: its display was released and its route parked for a
+	 * deep sleep (dcp_t8132_sleep_release()), to be connected again after it.
+	 */
+	bool t8132_sleep_released;
 	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes */
 	bool dptx_tunnel;
 	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1 */
@@ -1163,6 +1175,7 @@ struct apple_dcp {
 	struct dcp_desktop_state *desktop;
 	/* Internal panel identity; NULL without an internal panel. */
 	struct dcp_panel_identity *panel_identity;
+	struct dcp_cec *cec;
 };
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
