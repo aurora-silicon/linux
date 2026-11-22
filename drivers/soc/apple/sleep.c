@@ -3238,10 +3238,23 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 		refused = true;
 	}
 
-	/* Only a driver takes the display to where its domain can be lowered. */
-	if (!s->display[0].bound) {
-		dev_err(s->dev, "refused: no driver bound to the display coprocessor\n");
-		refused = true;
+	/* Only a driver takes each available display to where its domain can be lowered. */
+	if (!s->display[0].np || of_device_is_available(s->display[0].np)) {
+		if (!s->display[0].bound) {
+			dev_err(s->dev, "refused: no driver bound to the display coprocessor\n");
+			refused = true;
+		}
+	} else {
+		for (i = 1; i < s->soc->ndisp; i++) {
+			if (!s->display[i].np || !of_device_is_available(s->display[i].np))
+				continue;
+			if (!s->display[i].bound) {
+				dev_err(s->dev,
+					"refused: no driver bound to external display coprocessor %d\n",
+					i - 1);
+				refused = true;
+			}
+		}
 	}
 
 	/*
@@ -7293,6 +7306,33 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 	of_node_put(np);
 }
 
+/* Return whether a PCIe root port carries the wireless radio. */
+static bool apple_sleep_port_is_radio(struct device_node *port)
+{
+	struct device_node *wifi, *child;
+
+	wifi = of_find_node_by_path("wifi0");
+	if (wifi) {
+		struct device_node *parent = of_get_parent(wifi);
+		bool match = (parent == port);
+
+		of_node_put(parent);
+		of_node_put(wifi);
+		if (match)
+			return true;
+	}
+
+	for_each_child_of_node(port, child) {
+		if (of_node_name_eq(child, "wifi") ||
+		    of_node_name_eq(child, "bluetooth")) {
+			of_node_put(child);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 /* The radio port's PERST# on the AP pins @np, from the ports of the SoC's enabled PCIe host. */
 static void apple_sleep_find_radio_perst(struct apple_sleep *s, struct device_node *np)
 {
@@ -7304,6 +7344,8 @@ static void apple_sleep_find_radio_perst(struct apple_sleep *s, struct device_no
 		return;
 	if (of_device_is_available(host)) {
 		for_each_available_child_of_node(host, port) {
+			if (!apple_sleep_port_is_radio(port))
+				continue;
 			if (of_parse_phandle_with_args(port, "reset-gpios", "#gpio-cells", 0,
 						       &args))
 				continue;
@@ -7313,6 +7355,10 @@ static void apple_sleep_find_radio_perst(struct apple_sleep *s, struct device_no
 				s->radio_perst_low = args.args[1] & GPIO_ACTIVE_LOW;
 			}
 			of_node_put(args.np);
+			if (s->radio_perst >= 0) {
+				of_node_put(port);
+				break;
+			}
 		}
 	}
 	of_node_put(host);
