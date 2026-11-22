@@ -27,14 +27,26 @@
 	};
 };
 
+/*
+ * DT reg/reg-names overrides replace the base property whole; keep this list
+ * a superset of &pcie0's shared windows in t8132.dtsi (axi2af, cio3pll,
+ * clkgen, phy-block, phy-ip) when adding port 2.
+ */
 &pcie0 {
 	reg = <0x1c 0xb0000000 0x0 0x10000000>, /* config */
 	      <0x4 0x94000000 0x0 0x4000>,     /* common */
 	      <0x4 0x90028000 0x0 0x8000>,     /* port 0 */
 	      <0x4 0x97020000 0x0 0x4000>,     /* port 0 PHY glue */
+	      <0x4 0x96000000 0x0 0x1000000>,  /* axi2af */
+	      <0x4 0x95046200 0x0 0x4000>,     /* cio3pll */
+	      <0x4 0x95044000 0x0 0x4000>,     /* clkgen */
+	      <0x4 0x97000000 0x0 0x40000>,    /* phy-block */
+	      <0x4 0x97040000 0x0 0x20000>,    /* phy-ip */
 	      <0x4 0x92028000 0x0 0x8000>,     /* port 2 */
 	      <0x4 0x97028000 0x0 0x4000>;     /* port 2 PHY glue */
-	reg-names = "config", "rc", "port0", "phy0", "port2", "phy2";
+	reg-names = "config", "rc", "port0", "phy0",
+		    "axi2af", "cio3pll", "clkgen", "phy-block", "phy-ip",
+		    "port2", "phy2";
 
 	/* One per port, in port order; port 1 is unused. */
 	interrupts = <AIC_IRQ 1231 IRQ_TYPE_LEVEL_HIGH>,
