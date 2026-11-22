@@ -118,11 +118,20 @@ pub mod g16 {
     }
     pub mod graph {
         use crate::*;use crate::sync::Arc;use super::object::*;
-        use super::hw::{pte,tuning};
+        use super::fw::graph::{self, job_list, notifier_page, qinfo, qstate, sched_ctx};
+        use super::hw::{pte, sizes, tuning};
+        #[derive(Copy, Clone)]
+        pub(crate) struct FwAbi;
+        impl FwAbi {
+            pub(crate) fn qinfo(self) -> &'static graph::qinfo::Layout {
+                &graph::qinfo::V25G83
+            }
+        }
         __CLIENT__
         __CMD_CLASSES__
         __ALLOC__
         __ALLOC_WORK__
+        __GRAPH_TYPES__
     }
     pub mod encode {
         pub struct Geometry{pub tpc_bytes:u64,pub tilemap_bytes:u64}
@@ -1501,6 +1510,43 @@ pub mod g16 {
         assert_eq!(render.passes[0].heap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
         assert!(render.passes[0].tilemap.snapshot()[..0x10000].iter().all(|&x|x==0));
     }
+    #[test]fn queue_graph_objects_cache_only_firmware_owned_records(){
+        use g16::object::Class;
+        use g16::graph::{ComputeGraph, FwAbi, RenderGraph, cmd_fw, cmd_shared, graph_fw, qinfo_cached};
+        assert_eq!(graph_fw(), Class::FwCached);
+        assert!(qinfo_cached());
+        assert_eq!(cmd_fw(), Class::Fw);
+        assert_eq!(cmd_shared(), Class::Shared);
+        let mut o = Objects::new();
+        let c = ComputeGraph::new(&mut o).unwrap();
+        let r = RenderGraph::new(&mut o, c.sched_ctx.clone()).unwrap();
+        c.init(FwAbi).unwrap();
+        r.init(FwAbi).unwrap();
+        assert_eq!(c.qinfo.class, Class::FwCached);
+        assert_eq!(c.qscratch.class, Class::FwCached);
+        assert_eq!(c.job_list.class, Class::FwCached);
+        assert_eq!(c.sched_ctx.class, Class::Fw);
+        assert_eq!(c.qstate.class, Class::Fw);
+        assert_eq!(c.notifier.class, Class::Fw);
+        assert_eq!(c.threshold.class, Class::Fw);
+        assert_eq!(c.ring.class, Class::Fw);
+        assert_eq!(c.user_stamp.class, Class::Shared);
+        assert_eq!(c.fw_stamp.class, Class::Shared);
+        for stage in 0..2 {
+            assert_eq!(r.qinfo[stage].class, Class::FwCached);
+            assert_eq!(r.qscratch[stage].class, Class::FwCached);
+            assert_eq!(r.job_list[stage].class, Class::FwCached);
+            assert_eq!(r.qstate[stage].class, Class::Fw);
+            assert_eq!(r.ring[stage].class, Class::Fw);
+            assert_eq!(r.user_stamp[stage].class, Class::Shared);
+            assert_eq!(r.fw_stamp[stage].class, Class::Shared);
+        }
+        assert_eq!(r.sched_ctx.class, Class::Fw);
+        assert_eq!(r.notifier.class, Class::Fw);
+        assert_eq!(r.threshold.class, Class::Fw);
+        assert_eq!(r.legacy_empty.class, Class::Shared);
+        assert_eq!(r.registration_barrier.class, Class::Fw);
+    }
 
 }
 '''
@@ -1556,7 +1602,21 @@ render_burst_lines = (
     + '\npub(crate) ' + item(resources_source, 'fn should_expand_compute_ext(')
     + '\npub(crate) ' + item(resources_source, 'fn target_render_slots(')
 )
-source = source.replace('__CMD_CLASSES__',item(graph_source,'pub(crate) const fn cmd_fw(')+'\n'+item(graph_source,'pub(crate) const fn cmd_shared(')).replace('__SET_DIRTY__',item(resources_source,'pub(crate) fn set_dirty(')).replace('__RENDER_BURST__', render_burst_lines)
+source = source.replace('__CMD_CLASSES__', '\n'.join(item(graph_source, decl) for decl in ('pub(crate) const fn graph_fw(', 'pub(crate) const fn qinfo_cached(', 'pub(crate) const fn cmd_fw(', 'pub(crate) const fn cmd_shared('))).replace('__SET_DIRTY__',item(resources_source,'pub(crate) fn set_dirty(')).replace('__RENDER_BURST__', render_burst_lines)
+graph_types = '\n'.join(
+    item(graph_source, decl)
+    for decl in (
+        'pub(crate) struct ComputeGraph {',
+        'struct QueueObjects {',
+        'impl QueueObjects {',
+        'fn init_queue(',
+        'fn init_notifier(',
+        'impl ComputeGraph {',
+        'pub(crate) struct RenderGraph {',
+        'impl RenderGraph {',
+    )
+).replace('fn new(', 'pub(crate) fn new(').replace('fn init(', 'pub(crate) fn init(')
+source = source.replace('__GRAPH_TYPES__', graph_types)
 source = source.replace('__ALLOC__',item(graph_source,'pub(crate) fn alloc(')).replace('__ALLOC_WORK__',item(graph_source,'pub(crate) fn alloc_work('))
 source = source.replace('__HW__','\n'.join(module(hw,n) for n in ('client','sizes','engine','tuning','pte'))).replace('__ROOT__',str(production)).replace('__PRIVATE_RW__',hex(private_rw)+'u64').replace('__CLIENT__', '#[derive(Copy,Clone)]\n'+item(graph_source, 'pub(crate) struct Client {')+'\n'+item(graph_source, 'impl Client {'))
 (out/'check-resources.rs').write_text(source)

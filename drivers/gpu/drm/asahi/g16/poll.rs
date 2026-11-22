@@ -868,7 +868,7 @@ impl Firmware {
                 return Ok(false);
             }
         }
-        if !super::hw::tuning::FW_CACHED {
+        if !super::hw::tuning::FW_CACHED && !super::graph::qinfo_cached() {
             for offset in [0x20, 0x24, 0x28] {
                 if info.r32(offset)? != head {
                     return Ok(false);
@@ -909,7 +909,7 @@ impl Firmware {
         if !ring_passed(state.r32(qstate::READ)?, start, head, tail, cap) {
             return Ok(false);
         }
-        if !super::hw::tuning::FW_CACHED {
+        if !super::hw::tuning::FW_CACHED && !super::graph::qinfo_cached() {
             for offset in [0x20, 0x24, 0x28] {
                 if !ring_passed(info.r32(offset)?, start, head, tail, cap) {
                     return Ok(false);

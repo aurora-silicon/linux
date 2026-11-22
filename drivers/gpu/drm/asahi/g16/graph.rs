@@ -18,6 +18,15 @@ use super::object::{Class, FwObject, Objects, Placement, Request};
 use super::Firmware;
 use crate::driver::AsahiDrmDevice;
 
+/// Firmware-owned queue graph records initialized once before `register_context()`.
+/// Firmware reads and writes them through the ASC-cached mapping after initialization;
+/// host receipt checks authenticate on NC `qstate::READ` and submit-pipe cursors.
+pub(crate) const fn graph_fw() -> Class {
+    Class::FwCached
+}
+pub(crate) const fn qinfo_cached() -> bool {
+    matches!(graph_fw(), Class::FwCached)
+}
 pub(crate) const fn cmd_fw() -> Class {
     if tuning::FW_CACHED {
         Class::FwCached
@@ -42,7 +51,7 @@ pub(crate) const fn manager_class(class: Class) -> Class {
 }
 #[allow(dead_code)]
 pub(crate) const fn queue_scratch() -> Class {
-    cmd_fw()
+    graph_fw()
 }
 
 /// A private client alias uses the working M4 driver's AttrIndex-2 NC policy.
@@ -127,7 +136,7 @@ struct QueueObjects {
 impl QueueObjects {
     fn new(o: &mut Objects) -> Result<Self> {
         Ok(Self {
-            qinfo: alloc(o, qinfo::SIZE, cmd_fw(), None, 0, false)?,
+            qinfo: alloc(o, qinfo::SIZE, graph_fw(), None, 0, false)?,
             qstate: alloc(o, qstate::SIZE, Class::Fw, None, 0, false)?,
             ring: alloc(o, sizes::QUEUE_CAP as usize * 8, cmd_fw(), None, 0, false)?,
             user_stamp: alloc(o, 8, Class::Shared, None, 0, false)?,
@@ -168,10 +177,11 @@ impl ComputeGraph {
     fn new(o: &mut Objects) -> Result<Self> {
         let q = QueueObjects::new(o)?;
         Ok(Self {
-            sched_ctx: alloc(o, sched_ctx::SIZE, cmd_fw(), None, 0, false)?,
+            // Host polls sched_ctx from WC during register_context(); keep uncached.
+            sched_ctx: alloc(o, sched_ctx::SIZE, Class::Fw, None, 0, false)?,
             notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
-            job_list: alloc(o, job_list::SIZE, cmd_fw(), None, 0, false)?,
+            job_list: alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
             qscratch: q.qinfo.clone(),
             qinfo: q.qinfo,
             qstate: q.qstate,
@@ -229,8 +239,8 @@ impl RenderGraph {
             notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
             job_list: [
-                alloc(o, job_list::SIZE, cmd_fw(), None, 0, false)?,
-                alloc(o, job_list::SIZE, cmd_fw(), None, 0, false)?,
+                alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
+                alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
             ],
             legacy_empty: alloc(o, 0x40, Class::Shared, None, 0, false)?,
             registration_barrier: alloc(

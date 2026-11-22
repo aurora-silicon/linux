@@ -359,9 +359,133 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     assert_eq!(c.retired(),Ok(Retirement::Pending));
 }
 
+mod queue_proof {
+    use super::{Channel, Object, Result, EINVAL};
+    use super::logic::ring_passed;
+    pub(crate) mod object {
+        pub(crate) type FwObject = super::Object;
+    }
+    pub(crate) mod hw {
+        __HW_CLIENT__
+        __HW_ENGINE__
+        __HW_TUNING__
+        __HW_SIZES__
+    }
+    pub(crate) mod fw {
+        pub(crate) mod channels {
+            pub(crate) const RING_SLOTS: u32 = 256;
+        }
+    }
+    pub(crate) mod graph {
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        pub(crate) enum Class { Fw, FwCached }
+        __GRAPH_FW__
+        __QINFO_CACHED__
+    }
+    mod qstate {
+        pub(crate) const READ: usize = 0x10;
+        pub(crate) const WRITE: usize = 0x14;
+    }
+    struct QInfoLayout { busy: usize }
+    struct Abi;
+    impl Abi { fn qinfo(&self) -> QInfoLayout { QInfoLayout { busy: 0x30 } } }
+    struct Init { abi: Abi }
+    struct Pipe { read: u32, completion: u32, write: u32 }
+    impl Pipe {
+        fn read(&self) -> Result<u32> { Ok(self.read) }
+        fn completion(&self) -> Result<u32> { Ok(self.completion) }
+        fn write(&self) -> Result<u32> { Ok(self.write) }
+    }
+    struct Channels { compute: Pipe, ta: Pipe, fs: Pipe }
+    impl Channels {
+        fn channel(&self, ch: Channel) -> &Pipe {
+            match ch { Channel::Compute => &self.compute, Channel::Ta => &self.ta, Channel::Fs => &self.fs }
+        }
+        fn producer(&self, ch: Channel) -> u32 { self.channel(ch).write }
+    }
+    struct Engine { head: u32, ta_head: u32, fs_head: u32 }
+    struct Flight { c_start: u32, head: u32, ta_start: u32, ta_head: u32, fs_start: u32, fs_head: u32, rec: [u32; 3] }
+    struct Firmware { init: Init, channels: Channels, engine: Engine }
+    mod inner {
+        use super::*;
+        impl Firmware {
+            __QUEUE_RECEIPT__
+            __QUEUE_PASSED__
+        }
+        #[test]
+        fn cached_qinfo_skips_info_wc_reads_and_authenticates_on_nc_qstate_and_pipe() {
+            assert!(!hw::tuning::FW_CACHED);
+            assert!(graph::qinfo_cached());
+            let mut fw = Firmware {
+                init: Init { abi: Abi },
+                channels: Channels {
+                    compute: Pipe { read: 5, completion: 5, write: 5 },
+                    ta: Pipe { read: 7, completion: 7, write: 7 },
+                    fs: Pipe { read: 9, completion: 9, write: 9 },
+                },
+                engine: Engine { head: 10, ta_head: 20, fs_head: 30 },
+            };
+            let mut state = Object::default();
+            let mut info = Object::default();
+            // Deliberately poison qinfo with stale consumer cursors and nonzero busy flag.
+            info.set(0x20, 0);
+            info.set(0x24, 0);
+            info.set(0x28, 0);
+            info.set(0x30, 1);
+            state.set(qstate::READ, 10);
+            state.set(qstate::WRITE, 10);
+            assert_eq!(fw.queue_receipt(Channel::Compute, &state, &info, 10, 5), Ok(true));
+            assert_eq!(info.reads.get(), 0);
+            // Lagging NC qstate::READ or qstate::WRITE rejects receipt.
+            state.set(qstate::READ, 9);
+            assert_eq!(fw.queue_receipt(Channel::Compute, &state, &info, 10, 5), Ok(false));
+            state.set(qstate::READ, 10);
+            state.set(qstate::WRITE, 11);
+            assert_eq!(fw.queue_receipt(Channel::Compute, &state, &info, 10, 5), Ok(false));
+            state.set(qstate::WRITE, 10);
+            // Lagging submit pipe completion rejects receipt.
+            fw.channels.compute.completion = 4;
+            assert_eq!(fw.queue_receipt(Channel::Compute, &state, &info, 10, 5), Ok(false));
+            fw.channels.compute.completion = 5;
+            assert_eq!(fw.queue_receipt(Channel::Compute, &state, &info, 256, 5), Err(EINVAL));
+            assert_eq!(info.reads.get(), 0);
+
+            // queue_passed with queued work behind flight (including wrap-around) never reads qinfo.
+            fw.engine.ta_head = 2;
+            fw.channels.ta = Pipe { read: 2, completion: 2, write: 3 };
+            let f = Flight { c_start: 0, head: 10, ta_start: 254, ta_head: 0, fs_start: 0, fs_head: 1, rec: [1, 1, 5] };
+            state.set(qstate::READ, 1);
+            assert_eq!(fw.queue_passed(Channel::Ta, &state, &info, &f), Ok(true));
+            assert_eq!(info.reads.get(), 0);
+            // Unpassed NC qstate::READ rejects queue_passed.
+            state.set(qstate::READ, 255);
+            assert_eq!(fw.queue_passed(Channel::Ta, &state, &info, &f), Ok(false));
+            state.set(qstate::READ, 1);
+            // Unpassed pipe completion rejects queue_passed.
+            fw.channels.ta.completion = 0;
+            assert_eq!(fw.queue_passed(Channel::Ta, &state, &info, &f), Ok(false));
+            assert_eq!(info.reads.get(), 0);
+        }
+    }
+}
+
 '''.replace('__LOGIC__', str(backend/'recovery/logic.rs'))
-for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_FLIGHT_CLASSES__','poll.rs','retired_flight_classes'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at')]:
+for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_FLIGHT_CLASSES__','poll.rs','retired_flight_classes'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at'),('__QUEUE_RECEIPT__','poll.rs','queue_receipt'),('__QUEUE_PASSED__','poll.rs','queue_passed'),('__GRAPH_FW__','graph.rs','graph_fw'),('__QINFO_CACHED__','graph.rs','qinfo_cached')]:
     harness=harness.replace(token,function((backend/path).read_text(),name))
+hw_text=(backend/'hw.rs').read_text()
+def mod_block(text, name):
+    start=text.index('pub(crate) mod '+name+' {')
+    at=text.index('{',start)
+    depth,end=1,at+1
+    while depth:
+        depth+=(text[end]=='{')-(text[end]=='}')
+        end+=1
+    return text[start:end]
+harness=(harness
+    .replace('__HW_CLIENT__',mod_block(hw_text,'client'))
+    .replace('__HW_ENGINE__',mod_block(hw_text,'engine'))
+    .replace('__HW_TUNING__',mod_block(hw_text,'tuning'))
+    .replace('__HW_SIZES__',mod_block(hw_text,'sizes')))
 unit=out/'stamp-wrap.rs';unit.write_text(harness)
 log=''
 for command in [rustc()+['--edition=2021','--test',str(unit),'-o',str(out/'stamp-wrap')],[str(out/'stamp-wrap'),'--nocapture']]:
