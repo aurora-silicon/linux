@@ -3773,6 +3773,41 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 }
 
 
+/*
+ * Desktop 26.x external display replugged while the compositor kept its CRTC
+ * active: no atomic enable follows, and the firmware, which powered the pipe
+ * off with the unplug, swallows every swap.  Run the power-on and mode set the
+ * enable would have run, once.
+ *
+ * Only for a mode the display lists again: a mode whose link has to be proven
+ * first, such as the 180 Hz exception mode, is missing from the list for a
+ * while after the link comes back, and setting it then fails with no match.
+ * The hotplug that lists it sets it (dcp_retrain_active_crtc()), and
+ * userspace may pick another mode meanwhile.
+ */
+static void dcp_desktop_ext_repower(struct apple_dcp *dcp, struct drm_crtc *crtc,
+				    struct drm_atomic_commit *commit)
+{
+	struct drm_crtc_state *cs;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP ||
+	    !dcp->desktop->ext_pipe_off || dcp->main_display ||
+	    READ_ONCE(dcp->mode_state.valid) || !dcp->connector ||
+	    !READ_ONCE(dcp->connector->connected))
+		return;
+	cs = drm_atomic_get_new_crtc_state(commit, crtc);
+	if (!cs || !cs->active || !cs->mode.hdisplay)
+		return;
+	if (!dcp_mode_settable(dcp, &cs->mode)) {
+		dev_dbg(dcp->dev, "external pipe stays off until " DRM_MODE_FMT " is listed\n",
+			DRM_MODE_ARG(&cs->mode));
+		return;
+	}
+	dev_dbg(dcp->dev, "re-powering the external pipe of an active CRTC\n");
+	dcp_poweron(to_apple_crtc(crtc)->dcp);
+	dcp_crtc_atomic_modeset(crtc, commit);
+}
+
 static void iomfb_scanout_release_h17p(struct iomfb_scanout_h17p *scanout)
 {
 	unsigned int i;
@@ -4375,24 +4410,7 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		return;
 	}
 
-	/*
-	 * Desktop 26.x external display replugged while the compositor kept
-	 * its CRTC active: no atomic enable follows, and the firmware, which
-	 * powered the pipe off with the unplug, swallows every swap.  Run the
-	 * power-on and mode set the enable would have run, once.
-	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	    dcp->desktop->ext_pipe_off && !dcp->main_display &&
-	    !READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
-	    READ_ONCE(dcp->connector->connected)) {
-		struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(commit, crtc);
-
-		if (cs && cs->active && cs->mode.hdisplay) {
-			dev_dbg(dcp->dev, "re-powering the external pipe of an active CRTC\n");
-			dcp_poweron(pdev);
-			dcp_crtc_atomic_modeset(crtc, commit);
-		}
-	}
+	dcp_desktop_ext_repower(dcp, crtc, commit);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		iomfb_v14_7_flush(dcp, crtc, commit);
 		return;
