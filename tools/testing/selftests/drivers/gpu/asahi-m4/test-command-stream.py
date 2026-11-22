@@ -99,6 +99,7 @@ mod g17 {
     const STAGE_PREFIXES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
     const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
     const GFP_KERNEL: u32 = 0;
+    const GFP_KERNEL_ACCOUNT: u32 = 0;
     pub struct Arc<T>(std::rc::Rc<T>);
     impl<T> Arc<T> { fn new(value: T, _: u32) -> Result<Self> { Ok(Self(std::rc::Rc::new(value))) } }
     impl<T> Clone for Arc<T> { fn clone(&self) -> Self { Self(self.0.clone()) } }

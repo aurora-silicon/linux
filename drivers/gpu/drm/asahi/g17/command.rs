@@ -290,19 +290,21 @@ impl<'a> Parser<'a> {
                         return Err(EINVAL);
                     }
                     self.render_resources = if bytes.is_empty() { None }
-                        else { Some(Arc::new(Programs::parse(bytes)?, GFP_KERNEL)?) };
+                        else { Some(Arc::new(Programs::parse(bytes)?, GFP_KERNEL_ACCOUNT)?) };
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES_V2 => {
                     if barriers != [uapi::DRM_ASAHI_BARRIER_NONE as u16; 2] { return Err(EINVAL); }
                     self.render_resources = if bytes.is_empty() { None }
-                        else { Some(Arc::new(Programs::parse_v2(bytes)?, GFP_KERNEL)?) };
+                        else { Some(Arc::new(Programs::parse_v2(bytes)?, GFP_KERNEL_ACCOUNT)?) };
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_RESOURCES => {
                     if barriers != [uapi::DRM_ASAHI_BARRIER_NONE as u16; 2] {
                         return Err(EINVAL);
                     }
                     self.compute_resources = if bytes.is_empty() { None }
-                        else { Some(Arc::new(ComputePrograms::parse(bytes)?, GFP_KERNEL)?) };
+                        else {
+                            Some(Arc::new(ComputePrograms::parse(bytes)?, GFP_KERNEL_ACCOUNT)?)
+                        };
                 }
                 _ => return Err(EINVAL),
             }
