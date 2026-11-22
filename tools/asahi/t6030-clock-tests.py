@@ -25,8 +25,10 @@ FUNCTIONS = {
 }
 CASES = ['dual-start', 'reverse-start', 'stop-second', 'same-rate',
          'stale-owner', 'same-source', 'retune-one', 'busy-mode', 'busy-pll',
-         'invalid-source', 'invalid-rate', 'wrong-generation', 'failed-cleanup', 'failed-final-stop']
+         'invalid-source', 'invalid-rate', 'wrong-generation', 'failed-cleanup', 'failed-final-stop',
+         'stale-ack', 'unflagged-ack']
 CASES += ['fail-start-' + str(i) for i in range(4)]
+CASES += ['t6050-dpin-clocks']
 
 def function(source, name):
     match = re.search(r'^(?:static\s+)?(?:inline\s+)?(?:unsigned\s+)?(?:int|void|bool)\s+' + name +

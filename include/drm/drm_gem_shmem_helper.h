@@ -38,11 +38,14 @@ struct drm_gem_shmem_object {
 	bool reclaimable_cpu_mappings;
 
 	/**
-	 * @pages_no_reclaim: Disable direct reclaim during backing population.
-	 * Set before drm_gem_shmem_init(). Drivers that can fail a large pin
-	 * request cheaply may opt in; background reclaim remains enabled.
+	 * @pages_bounded_reclaim: Populate the backing with direct reclaim that
+	 * neither swaps nor writes back (no __GFP_IO or __GFP_FS): clean page
+	 * cache is released, and the allocation fails quickly and without the
+	 * OOM killer when nothing clean is left. Set before
+	 * drm_gem_shmem_init(). Drivers that pin large objects in one go and
+	 * can fail the request cheaply may opt in.
 	 */
-	bool pages_no_reclaim;
+	bool pages_bounded_reclaim;
 
 	/**
 	 * @cpu_pages: Pages populated one at a time by CPU faults on revocable

@@ -1,0 +1,16 @@
+What:		/sys/bus/platform/drivers/macsmc-reboot/<dev>/ac_power_mode
+Date:		November 2026
+KernelVersion:	7.4
+Description:
+		What the machine does when external power arrives, as kept in
+		the PMU (present only when the device tree gives the reboot
+		node a pm_setting cell). Reading lists the modes with the
+		current one in brackets; writing a mode name sets it:
+
+		off:
+			stay off
+		restore:
+			power on after a power loss if the machine was on
+		always:
+			power on whenever power is connected (the 2024 and later
+			desktops; other machines may ignore it)

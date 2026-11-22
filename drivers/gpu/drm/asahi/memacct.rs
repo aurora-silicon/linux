@@ -21,7 +21,9 @@
 //!   counter is back to its own value before `__mmdrop()` checks it.
 //! - Each client (DRM file) and the device keep totals of created and held bytes,
 //!   reported in fdinfo (`drm-total-system`, `drm-resident-system`) and in the
-//!   `gpu_memory` sysfs file next to `agx_stats`.
+//!   `gpu_memory` sysfs file next to `agx_stats`. The device also totals the bytes of
+//!   objects that userspace asked to keep resident (which idle reclaim releases after
+//!   the other objects of their VM), in `gpu_memory`.
 //! - A new user object is admitted only while its client stays within a per-client
 //!   limit and the device within a device-wide limit, both fractions of RAM.
 //!   A refused allocation fails with `ENOMEM`, which userspace reports as
@@ -66,13 +68,16 @@ pub(crate) struct Ledger {
     pub(crate) limit: AtomicU64,
     /// Per-client limit on committed bytes (0: none).
     pub(crate) client_limit: AtomicU64,
+    /// Size of the live user objects kept resident at userspace's request.
+    pub(crate) user_kept: AtomicU64,
 }
 
 // Keep the Rust half of the C sysfs layout contract checked as well.
 const _: () = {
     assert!(core::mem::offset_of!(Ledger, refused) == 24);
     assert!(core::mem::offset_of!(Ledger, client_limit) == 40);
-    assert!(core::mem::size_of::<Ledger>() == 48);
+    assert!(core::mem::offset_of!(Ledger, user_kept) == 48);
+    assert!(core::mem::size_of::<Ledger>() == 56);
 };
 
 /// The ledger of the (single) AGX GPU.
@@ -94,6 +99,26 @@ fn pct_of(total: u64, pct: u32) -> u64 {
         p if p >= 100 => 0,
         p => total / 100 * u64::from(p) + total % 100 * u64::from(p) / 100,
     }
+}
+
+fn total_ram_bytes() -> u64 {
+    // SAFETY: `struct sysinfo` is plain integers, for which all zeroes is a valid value.
+    let mut info: kernel::bindings::sysinfo = unsafe { core::mem::zeroed() };
+    // SAFETY: `si_meminfo()` only fills in the structure it is given.
+    unsafe { kernel::bindings::si_meminfo(&mut info) };
+    (info.totalram as u64).saturating_mul(u64::from(info.mem_unit))
+}
+
+/// Sets both limits from the percentage written through sysfs.
+#[no_mangle]
+pub extern "C" fn asahi_set_mem_limit_pct(pct: u32) {
+    let limits = limits_for(total_ram_bytes(), pct, pct);
+    LEDGER.set_limits(limits);
+    pr_info!(
+        "GPU memory limits set: device {} MiB, per client {} MiB (0 = none)\n",
+        limits.device >> 20,
+        limits.client >> 20
+    );
 }
 
 /// Computes the limits for `total_ram` bytes of RAM.
@@ -145,18 +170,14 @@ impl Ledger {
             refused: AtomicU64::new(0),
             limit: AtomicU64::new(0),
             client_limit: AtomicU64::new(0),
+            user_kept: AtomicU64::new(0),
         }
     }
 
     /// Sets the limits from the module parameters and the amount of RAM.
     pub(crate) fn configure(&self) {
-        // SAFETY: `struct sysinfo` is plain integers, for which all zeroes is a valid value.
-        let mut info: kernel::bindings::sysinfo = unsafe { core::mem::zeroed() };
-        // SAFETY: `si_meminfo()` only fills in the structure it is given.
-        unsafe { kernel::bindings::si_meminfo(&mut info) };
-        let total = (info.totalram as u64).saturating_mul(u64::from(info.mem_unit));
         let limits = limits_for(
-            total,
+            total_ram_bytes(),
             module_parameters::mem_limit_pct.value(),
             module_parameters::client_mem_limit_pct.value(),
         );
@@ -271,6 +292,8 @@ pub(crate) struct Charge {
     bytes: u64,
     /// Whether the bytes are currently counted as held by the GPU.
     held: AtomicBool,
+    /// Whether the bytes are currently counted as kept resident.
+    kept: AtomicBool,
 }
 
 // SAFETY: `ARef<Mm>` may be dropped on any thread and the counters are atomic.
@@ -279,12 +302,14 @@ unsafe impl Send for Charge {}
 unsafe impl Sync for Charge {}
 
 impl Charge {
-    /// An object that is not counted (a dma-buf import).
+    /// An object that is not counted: a dma-buf import, or a kernel object whose owner holds a
+    /// user charge for it.
     pub(crate) fn none() -> Self {
         Self {
             kind: Kind::None,
             bytes: 0,
             held: AtomicBool::new(false),
+            kept: AtomicBool::new(false),
         }
     }
 
@@ -294,6 +319,7 @@ impl Charge {
             kind: Kind::Kernel(ledger),
             bytes,
             held: AtomicBool::new(false),
+            kept: AtomicBool::new(false),
         }
     }
 
@@ -309,6 +335,7 @@ impl Charge {
             kind: Kind::User { commit, mm },
             bytes,
             held: AtomicBool::new(false),
+            kept: AtomicBool::new(false),
         }
     }
 
@@ -351,6 +378,33 @@ impl Charge {
         }
     }
 
+    /// Moves a user object's charge to `to`, the client now using it: its committed bytes,
+    /// within `to`'s limit, and its held bytes. The device totals and the process attribution
+    /// stay as they are. A refusal fails with `ENOMEM` and leaves the charge where it was.
+    /// Other kinds are attributed to no client and are left alone.
+    pub(crate) fn transfer(&mut self, to: &Arc<Client>) -> Result {
+        let bytes = self.bytes;
+        let held = *self.held.get_mut();
+        let Kind::User { commit, .. } = &mut self.kind else {
+            return Ok(());
+        };
+        if Arc::ptr_eq(&commit.client, to) {
+            return Ok(());
+        }
+        let ledger = commit.ledger;
+        if !try_add_within(&to.committed, bytes, ledger.client_limit.load(Ordering::Relaxed), 0) {
+            ledger.refused.fetch_add(1, Ordering::Relaxed);
+            return Err(ENOMEM);
+        }
+        if held {
+            to.resident.fetch_add(bytes, Ordering::AcqRel);
+            sub(&commit.client.resident, bytes);
+        }
+        sub(&commit.client.committed, bytes);
+        commit.client = to.clone();
+        Ok(())
+    }
+
     /// Records that the GPU now holds (or no longer holds) the object's backing.
     ///
     /// Idempotent: only a change of state is counted.
@@ -359,11 +413,31 @@ impl Charge {
             self.apply(held);
         }
     }
+
+    /// Records that userspace asked (or no longer asks) to keep the object resident. Only user
+    /// objects are counted, in the device's total, which a transfer to another client leaves
+    /// as it is.
+    ///
+    /// Idempotent: only a change of state is counted.
+    pub(crate) fn set_kept(&self, kept: bool) {
+        let Kind::User { commit, .. } = &self.kind else {
+            return;
+        };
+        if self.kept.swap(kept, Ordering::AcqRel) == kept {
+            return;
+        }
+        if kept {
+            commit.ledger.user_kept.fetch_add(self.bytes, Ordering::AcqRel);
+        } else {
+            sub(&commit.ledger.user_kept, self.bytes);
+        }
+    }
 }
 
 impl Drop for Charge {
     fn drop(&mut self) {
         // Uncharge before `kind` (and with it the mm reference) is dropped.
+        self.set_kept(false);
         self.set_held(false);
     }
 }
@@ -487,6 +561,65 @@ mod tests {
         assert_eq!(a.committed(), 0);
         assert_eq!(HELD.user_resident.load(Ordering::Relaxed), 0);
         assert_eq!(HELD.user_committed.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    static MOVE: Ledger = Ledger::new();
+
+    #[test]
+    fn a_transfer_moves_the_charge_once() -> Result {
+        MOVE.set_limits(Limits { device: 100 * MIB, client: 60 * MIB });
+        let a = Client::new()?;
+        let b = Client::new()?;
+        let mut charge = Charge::user(MOVE.admit(&a, 40 * MIB)?, None);
+        charge.set_held(true);
+        let other = MOVE.admit(&b, 30 * MIB)?;
+        // b is within 60 MiB only without the 40 MiB: refused, and nothing moved.
+        assert_eq!(charge.transfer(&b), Err(ENOMEM));
+        assert_eq!((a.committed(), a.resident(), b.committed()), (40 * MIB, 40 * MIB, 30 * MIB));
+        drop(other);
+        charge.transfer(&b)?;
+        assert_eq!((a.committed(), a.resident()), (0, 0));
+        assert_eq!((b.committed(), b.resident()), (40 * MIB, 40 * MIB));
+        // The device counts the bytes once, before and after the move.
+        assert_eq!(MOVE.user_committed.load(Ordering::Relaxed), 40 * MIB);
+        assert_eq!(MOVE.user_resident.load(Ordering::Relaxed), 40 * MIB);
+        assert_eq!(MOVE.kernel_resident.load(Ordering::Relaxed), 0);
+        // Moving to the current client changes nothing; dropping uncharges the new client.
+        charge.transfer(&b)?;
+        drop(charge);
+        assert_eq!((b.committed(), b.resident()), (0, 0));
+        assert_eq!(MOVE.user_committed.load(Ordering::Relaxed), 0);
+        assert_eq!(MOVE.user_resident.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    static KEPT: Ledger = Ledger::new();
+
+    #[test]
+    fn kept_bytes_follow_the_object() -> Result {
+        KEPT.set_limits(Limits { device: 0, client: 0 });
+        let a = Client::new()?;
+        let b = Client::new()?;
+        let mut charge = Charge::user(KEPT.admit(&a, 8 * MIB)?, None);
+        charge.set_kept(true);
+        charge.set_kept(true);
+        assert_eq!(KEPT.user_kept.load(Ordering::Relaxed), 8 * MIB);
+        charge.set_kept(false);
+        assert_eq!(KEPT.user_kept.load(Ordering::Relaxed), 0);
+        charge.set_kept(true);
+        // A move to another client leaves the device's count as it is.
+        charge.transfer(&b)?;
+        assert_eq!(KEPT.user_kept.load(Ordering::Relaxed), 8 * MIB);
+        // Freeing a kept object stops counting it.
+        drop(charge);
+        assert_eq!(KEPT.user_kept.load(Ordering::Relaxed), 0);
+        // Kernel objects and imports are never counted as kept.
+        let k = Charge::kernel(&KEPT, MIB);
+        k.set_kept(true);
+        let i = Charge::none();
+        i.set_kept(true);
+        assert_eq!(KEPT.user_kept.load(Ordering::Relaxed), 0);
         Ok(())
     }
 

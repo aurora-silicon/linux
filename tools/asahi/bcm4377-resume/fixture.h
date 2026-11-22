@@ -125,6 +125,16 @@ static void *pci_get_drvdata(struct pci_dev *p) {return p->data;}
 static void iowrite32(int val,void *addr) {if(val==1){assert(!request.fn && !active->resume_work.queued && !active_running);quiesces++;}}
 static bool fixture_wakeup;
 static bool device_may_wakeup(struct device *d) { return fixture_wakeup; }
+/* Not a J713 sleep: the radio sleep hooks do nothing, as on every other board. */
+static bool apple_radio_sleep_owned(struct device *d) { return false; }
+static int apple_radio_sleep_endpoint_prepare(struct device *d,
+					      void (*finish)(struct device *))
+{
+	return 0;
+}
+static int apple_radio_sleep_endpoint_suspended(struct device *d) { return 0; }
+static int apple_radio_sleep_endpoint_resume(struct device *d) { return 0; }
+static void apple_radio_sleep_endpoint_resumed(struct device *d, int result) {}
 static void pci_save_state(struct pci_dev *p) {}
 static int enable_irq_wake(int irq) { return 0; }
 static void disable_irq_wake(int irq) {}

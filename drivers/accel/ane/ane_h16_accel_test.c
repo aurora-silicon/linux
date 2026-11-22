@@ -17,9 +17,10 @@ static void ane_h16_accel_fops_test(struct kunit *test)
 {
 	KUNIT_EXPECT_TRUE(test, ane_h16_fops.fop_flags & FOP_UNSIGNED_OFFSET);
 	KUNIT_EXPECT_TRUE(test, ane_h16_fops.open == accel_open);
-	/* Without DRIVER_GEM there is no offset manager to mmap through. */
-	KUNIT_EXPECT_NULL(test, ane_h16_fops.mmap);
+	/* No GEM offset manager: surfaces map through the driver's own mmap. */
+	KUNIT_EXPECT_TRUE(test, ane_h16_fops.mmap == ane_h16_mmap);
 	KUNIT_EXPECT_FALSE(test, ane_h16_drm_driver.driver_features & DRIVER_GEM);
+	KUNIT_EXPECT_EQ(test, ane_h16_drm_driver.minor, 1);
 }
 
 static void ane_h16_accel_open_test(struct kunit *test)

@@ -70,7 +70,7 @@ fn with_sep<T>(f: impl FnOnce(&SepData) -> T) -> Option<T> {
 /// Called by the key-type core as the `init` op; takes no arguments.
 unsafe extern "C" fn tk_init() -> c_int {
     let rc = with_sep(|sep| {
-        dev_info!(
+        dev_info_ratelimited!(
             sep.dev,
             "trusted-keys: registering \"trusted\" key type backed by the SEP ref-key seal\n"
         );
@@ -78,7 +78,7 @@ unsafe extern "C" fn tk_init() -> c_int {
         // SAFETY: no preconditions; -EEXIST if already registered.
         let krc = unsafe { sep_tk_register_key_type() };
         if krc != 0 {
-            dev_err!(
+            dev_err_ratelimited!(
                 sep.dev,
                 "trusted-keys: register_key_type failed ({}); registration aborted\n",
                 krc
@@ -109,7 +109,7 @@ unsafe extern "C" fn tk_seal(p: *mut c_void, _datablob: *mut c_char) -> c_int {
                 // Callers retry until the ref-key is up: warn once, and keep
                 // each failure for debugging.
                 kernel::do_once_lite! {
-                    dev_warn!(
+                    dev_warn_ratelimited!(
                         sep.dev,
                         "trusted-keys: seal failed ({:?}); the machine ref-key may not be established yet\n",
                         e
@@ -123,7 +123,7 @@ unsafe extern "C" fn tk_seal(p: *mut c_void, _datablob: *mut c_char) -> c_int {
         // SAFETY: no preconditions.
         let max_blob = unsafe { sep_tk_max_blob_size() };
         if blob.len() > max_blob {
-            dev_warn!(
+            dev_warn_ratelimited!(
                 sep.dev,
                 "trusted-keys: sealed blob {} byte(s) exceeds MAX_BLOB_SIZE {} byte(s); refusing\n",
                 blob.len(),
@@ -141,7 +141,7 @@ unsafe extern "C" fn tk_seal(p: *mut c_void, _datablob: *mut c_char) -> c_int {
         unsafe { sep_tk_set_blob_len(p, blob.len() as c_uint) };
 
         // Lengths only, never the key or blob bytes.
-        dev_info!(
+        dev_dbg!(
             sep.dev,
             "trusted-keys: sealed {}-byte key into {}-byte enclave blob\n",
             key_len,
@@ -183,7 +183,7 @@ unsafe extern "C" fn tk_unseal(p: *mut c_void, _datablob: *mut c_char) -> c_int 
         // SAFETY: `p` is live.
         unsafe { sep_tk_set_key_len(p, plain.len() as c_uint) };
 
-        dev_info!(
+        dev_dbg!(
             sep.dev,
             "trusted-keys: unsealed {}-byte enclave blob to {}-byte key\n",
             blob_len,

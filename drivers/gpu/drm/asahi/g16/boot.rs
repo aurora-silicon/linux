@@ -44,8 +44,6 @@ pub(crate) mod glue {
         fn asahi_g16_board() -> bool;
         fn asahi_g16_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
-        fn asahi_g16_module_try_get() -> bool;
-        fn asahi_g16_module_put();
         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
         fn asahi_g16_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
         fn asahi_g16_dma_unsupported(dev: *mut core::ffi::c_void) -> bool;
@@ -87,21 +85,10 @@ pub(crate) mod glue {
         RETAINED.load(Ordering::Acquire)
     }
 
-    /// Pins this module until reboot, once (`try_module_get(THIS_MODULE)`).
+    /// Pins this module until reboot, once (`try_module_get(THIS_MODULE)`, see `retain.rs`).
     /// ENODEV, with nothing pinned or marked, once the module's removal has begun.
     pub(crate) fn retain_module() -> Result {
-        if RETAINED.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        // SAFETY: Takes a reference to this module unless its removal has begun.
-        if !unsafe { asahi_g16_module_try_get() } {
-            return Err(ENODEV);
-        }
-        if RETAINED.swap(true, Ordering::AcqRel) {
-            // SAFETY: Drops only the reference this call took; the first one is never put.
-            unsafe { asahi_g16_module_put() };
-        }
-        Ok(())
+        crate::retain::retain_module(&RETAINED)
     }
 
     /// The physical range is disjoint from System RAM.
@@ -199,7 +186,10 @@ unsafe extern "C" fn rtkit_recv(cookie: *mut c_void, endpoint: u8, message: u64)
         endpoint,
         message
     );
-    shared.fail_stop(eproto());
+    // What a firmware says while it comes back from a sleep isn't known yet.
+    if !shared.sleeping.load(Ordering::Acquire) {
+        shared.fail_stop(eproto());
+    }
 }
 
 /// EP 0x20 ring-service request, in the mailbox interrupt: wake only. The drain and the
@@ -294,6 +284,7 @@ static RTKIT_OPS: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
     flags: 0,
     crashed: Some(rtkit_crashed),
     recv_message: Some(rtkit_recv),
+    recv_message_timed: None,
     recv_message_early: Some(rtkit_recv_early),
     shmem_setup: None,
     shmem_setup_ep: Some(rtkit_shmem_setup),
@@ -335,9 +326,26 @@ impl Rtkit {
         }
     }
 
-    fn wake(&mut self) -> Result {
+    pub(crate) fn wake(&mut self) -> Result {
         // SAFETY: `rtk` is live by the type invariant.
         to_result(unsafe { bindings::apple_rtkit_wake(self.rtk) })
+    }
+
+    /// The C handle, for the stop at a sleep's commit.
+    pub(crate) fn as_raw(&self) -> *mut bindings::apple_rtkit {
+        self.rtk
+    }
+
+    /// Prepares for HELLO from firmware restarting warm, which keeps its buffers and rings.
+    pub(crate) fn warm_restart(&mut self) -> Result {
+        // SAFETY: `rtk` is live by the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_warm_restart(self.rtk) })
+    }
+
+    /// Waits for the firmware to report in, and sets the AP on.
+    pub(crate) fn boot(&mut self) -> Result {
+        // SAFETY: `rtk` is live by the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
     }
 
     fn running(&self) -> bool {
@@ -452,6 +460,7 @@ impl Orphan {
 }
 
 /// Probe-time admission.
+#[inline(never)]
 pub(crate) fn admit(
     pdev: &platform::Device<Core<'_>>,
     _dev: &AsahiDrmDevice,
@@ -495,7 +504,8 @@ pub(crate) fn admit(
     }
     let regs = regs::Regs::new(pdev, res)?;
     // Once power admission starts, even a rejected cold check must not detach the GFX
-    // domain under an inherited firmware owner. Keep the module and platform binding.
+    // domain under an inherited firmware owner. Keep the module and platform binding; once
+    // the module's removal has begun nothing is held.
     glue::retain_module()?;
     glue::hold_power(dev)?;
     let (power_offset, power_state) = glue::power_domain_state(dev)?;
@@ -670,6 +680,7 @@ fn run(
 }
 
 /// Brings the firmware to READY.
+#[inline(never)]
 pub(crate) fn start(
     admitted: Admitted,
     dev: &AsahiDrmDevice,
@@ -741,9 +752,12 @@ pub(crate) fn start(
         return Err(e);
     }
 
-    // From here on the firmware is touched: nothing it can reach is freed.
-    // Admission already pinned the module, so this cannot fail.
-    let _ = glue::retain_module();
+    // From here on the firmware is touched: nothing it can reach is freed. Admission pinned
+    // the module, so this only confirms it.
+    if let Err(e) = glue::retain_module() {
+        core::mem::forget(objects);
+        return Err(e);
+    }
     let rtkit = match Rtkit::new(&d, shared) {
         Ok(rtkit) => rtkit,
         Err(e) => {

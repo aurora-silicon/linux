@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Install in /usr/lib/udev/rules.d/ before loading mt7932-fullmac with AWDL.
+# The station iftype represents AWDL, not a second infrastructure connection.
+SUBSYSTEM=="net", ACTION=="add|change", DRIVERS=="mt7932-fullmac", KERNEL=="awdl*", ENV{NM_UNMANAGED}="1"

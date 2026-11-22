@@ -24,6 +24,8 @@
 /* AGX: command 0x0f, logical device 5, state 1. The reply carries no tag. */
 #define PMP_AGX_REQUEST		0x0020f50100000000ULL
 #define PMP_DISP_REQUEST	0x0020f80100000000ULL
+/* DISP, state 0: released while its DCP has powered the display domains down. */
+#define PMP_DISP_RELEASE	0x0020f80000000000ULL
 #define PMP_POWER_REPLY		0x0021000000000000ULL
 #define PMP_ENDPOINT		0x20
 
@@ -41,6 +43,8 @@ struct pmp_power_vote {
 	/* A failed PMP owner invalidates every accepted vote as well. */
 	int provider_error;
 	enum pmp_power_kind pending;
+	/* The pending request releases its vote rather than taking it. */
+	bool releasing;
 	bool held[PMP_POWER_COUNT];
 };
 
@@ -48,7 +52,11 @@ static void pmp_vote_fail(struct pmp_power_vote *s, int error)
 {
 	if (!s->error)
 		s->error = error < 0 ? error : -EIO;
+	/* A release with an unknown outcome no longer counts as held. */
+	if (s->pending && s->releasing)
+		s->held[s->pending] = false;
 	s->pending = PMP_POWER_NONE;
+	s->releasing = false;
 }
 
 /* The Rust owner latches every ambiguous transaction as a provider failure.
@@ -57,10 +65,12 @@ static void pmp_vote_fail(struct pmp_power_vote *s, int error)
  */
 static void pmp_vote_send_failed(struct pmp_power_vote *s)
 {
-	if (s->provider_error)
+	if (s->provider_error) {
 		pmp_vote_fail(s, s->provider_error);
-	else
+	} else {
 		s->pending = PMP_POWER_NONE;
+		s->releasing = false;
+	}
 }
 
 /* One means send the request, zero means the same retained vote is held. */
@@ -78,6 +88,52 @@ static int pmp_vote_begin(struct pmp_power_vote *s, enum pmp_power_kind kind)
 		return -EBUSY;
 	s->pending = kind;
 	return 1;
+}
+
+/* One means send the release, zero means the vote is not held. */
+static int pmp_vote_begin_release(struct pmp_power_vote *s, enum pmp_power_kind kind)
+{
+	if (kind <= PMP_POWER_NONE || kind >= PMP_POWER_COUNT)
+		return -EINVAL;
+	if (s->provider_error)
+		return s->provider_error;
+	if (!s->held[kind])
+		return 0;
+	if (s->error)
+		return s->error;
+	if (s->pending)
+		return -EBUSY;
+	s->pending = kind;
+	s->releasing = true;
+	return 1;
+}
+
+/*
+ * Whether a vote can be released now and taken again later, changing
+ * nothing: held, no request in flight, and admission open (a failed untagged
+ * request closes it, and the later get is a new request).
+ */
+static int pmp_vote_check_release(struct pmp_power_vote *s, enum pmp_power_kind kind)
+{
+	if (kind <= PMP_POWER_NONE || kind >= PMP_POWER_COUNT)
+		return -EINVAL;
+	if (s->provider_error)
+		return s->provider_error;
+	if (!s->held[kind])
+		return -ENODEV;
+	if (s->error)
+		return s->error;
+	return s->pending ? -EBUSY : 0;
+}
+
+/* Released, or the outcome is unknown and admission is closed. */
+static int pmp_vote_finish_release(struct pmp_power_vote *s, enum pmp_power_kind kind)
+{
+	if (s->provider_error)
+		return s->provider_error;
+	if (s->pending == kind && s->releasing)
+		pmp_vote_fail(s, -ETIMEDOUT);
+	return s->held[kind] || s->error ? s->error ?: -EIO : 0;
 }
 
 /* Accepted votes are retained even if a different untagged request fails. */
@@ -110,8 +166,9 @@ static void pmp_vote_reply(struct pmp_power_vote *s, u8 endpoint, u64 word)
 		pmp_vote_fail(s, -EPROTO);
 		return;
 	}
-	s->held[s->pending] = true;
+	s->held[s->pending] = !s->releasing;
 	s->pending = PMP_POWER_NONE;
+	s->releasing = false;
 }
 
 static inline bool j713_disp_table(const void *data, size_t size)
@@ -338,7 +395,7 @@ out:
 	return ret;
 }
 
-static int pmp_power_check(struct device *consumer, enum pmp_power_kind kind)
+static int pmp_power_check(struct device *consumer, enum pmp_power_kind kind, bool release)
 {
 	struct apple_pmp_display *p = pmp_power_consumer(consumer, kind);
 	unsigned long flags;
@@ -347,7 +404,7 @@ static int pmp_power_check(struct device *consumer, enum pmp_power_kind kind)
 	if (IS_ERR(p))
 		return PTR_ERR(p);
 	spin_lock_irqsave(&p->lock, flags);
-	ret = pmp_vote_check(&p->vote, kind);
+	ret = release ? pmp_vote_check_release(&p->vote, kind) : pmp_vote_check(&p->vote, kind);
 	spin_unlock_irqrestore(&p->lock, flags);
 	return ret;
 }
@@ -405,6 +462,55 @@ out:
 	return ret;
 }
 
+/*
+ * Release the DISP vote while the consumer has powered the display domains
+ * down; apple_pmp_j713_display_get() takes it again before power-up. An
+ * ambiguous release closes admission: the vote is then neither held nor
+ * taken again.
+ */
+static int pmp_power_put(struct device *consumer, enum pmp_power_kind kind)
+{
+	struct apple_pmp_display *p = pmp_power_consumer(consumer, kind);
+	unsigned long flags;
+	int ret;
+
+	if (IS_ERR(p))
+		return PTR_ERR(p);
+	if (kind != PMP_POWER_DISP)
+		return -EINVAL;
+	device_lock(p->dev);
+	mutex_lock(&p->request);
+	if (p->dev->driver != p->driver || !dev_get_drvdata(p->dev)) {
+		ret = -ENODEV;
+		apple_pmp_display_fail(p, ret);
+		goto out;
+	}
+	spin_lock_irqsave(&p->lock, flags);
+	reinit_completion(&p->reply);
+	ret = pmp_vote_begin_release(&p->vote, kind);
+	spin_unlock_irqrestore(&p->lock, flags);
+	if (ret <= 0)
+		goto out;
+	ret = p->send(p->cookie, PMP_DISP_RELEASE);
+	if (ret) {
+		spin_lock_irqsave(&p->lock, flags);
+		pmp_vote_send_failed(&p->vote);
+		spin_unlock_irqrestore(&p->lock, flags);
+		goto out;
+	}
+	spin_lock_irqsave(&p->lock, flags);
+	pmp_vote_reply(&p->vote, PMP_ENDPOINT, PMP_POWER_REPLY);
+	ret = pmp_vote_finish_release(&p->vote, kind);
+	spin_unlock_irqrestore(&p->lock, flags);
+	if (!ret)
+		dev_dbg(p->dev, "Retained DISP vote released: request=%016llx\n",
+			PMP_DISP_RELEASE);
+out:
+	mutex_unlock(&p->request);
+	device_unlock(p->dev);
+	return ret;
+}
+
 /* Probe creates the retained supplier links; get/check never change owners. */
 int apple_pmp_j713_display_prepare(struct device *consumer)
 {
@@ -420,13 +526,19 @@ EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_prepare);
 
 int apple_pmp_j713_display_check(struct device *consumer)
 {
-	return apple_pmp_j713_board() ? pmp_power_check(consumer, PMP_POWER_DISP) : -ENODEV;
+	return apple_pmp_j713_board() ? pmp_power_check(consumer, PMP_POWER_DISP, false) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_display_check);
 
+int apple_pmp_j713_display_check_release(struct device *consumer)
+{
+	return apple_pmp_j713_board() ? pmp_power_check(consumer, PMP_POWER_DISP, true) : -ENODEV;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_j713_display_check_release);
+
 int apple_pmp_j713_gpu_check(struct device *consumer)
 {
-	return apple_pmp_j713_board() ? pmp_power_check(consumer, PMP_POWER_AGX) : -ENODEV;
+	return apple_pmp_j713_board() ? pmp_power_check(consumer, PMP_POWER_AGX, false) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_check);
 
@@ -435,6 +547,12 @@ int apple_pmp_j713_display_get(struct device *consumer)
 	return apple_pmp_j713_board() ? pmp_power_get(consumer, PMP_POWER_DISP) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_display_get);
+
+int apple_pmp_j713_display_put(struct device *consumer)
+{
+	return apple_pmp_j713_board() ? pmp_power_put(consumer, PMP_POWER_DISP) : -ENODEV;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_j713_display_put);
 
 int apple_pmp_j713_gpu_get(struct device *consumer)
 {

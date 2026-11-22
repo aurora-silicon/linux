@@ -2535,9 +2535,14 @@ static int set_id_aa64pfr1_el1(struct kvm_vcpu *vcpu,
 	 * ID_AA64PFR1_EL1.MTE_frac to 0. However, ignore it to avoid
 	 * incorrectly claiming hardware support for MTE_ASYNC in the
 	 * guest.
+	 *
+	 * Only a VM with MTE sees MTE_frac. Without MTE both fields read
+	 * as 0 and the 0 written back must stay 0, or the value no longer
+	 * matches the one KVM itself provided.
 	 */
 
-	if (mte == ID_AA64PFR1_EL1_MTE_MTE2 &&
+	if (kvm_has_mte(vcpu->kvm) &&
+	    mte == ID_AA64PFR1_EL1_MTE_MTE2 &&
 	    hw_mte_frac == ID_AA64PFR1_EL1_MTE_frac_NI &&
 	    user_mte_frac == ID_AA64PFR1_EL1_MTE_frac_ASYNC) {
 		user_val &= ~ID_AA64PFR1_EL1_MTE_frac_MASK;

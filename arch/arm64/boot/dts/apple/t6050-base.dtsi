@@ -41,7 +41,7 @@
  * number the cores 18 * d + 6 * c + n. The boot loader removes the nodes of
  * the cores it did not start.
  */
-#define T6050_CPU(label, mpidr, type, opp, cluster)		\
+#define T6050_CPU(label, mpidr, type, opp, cluster, cpu_cap, l2, l1i, l1d)	\
 	label: cpu@mpidr {					\
 		compatible = type;				\
 		device_type = "cpu";				\
@@ -49,13 +49,42 @@
 		enable-method = "spin-table";			\
 		operating-points-v2 = <&opp>;			\
 		performance-domains = <&cluster>;		\
+		capacity-dmips-mhz = <cpu_cap>;		\
+		next-level-cache = <&l2>;			\
+		i-cache-size = <l1i>;				\
+		d-cache-size = <l1d>;				\
 		cpu-release-addr = <0 0>; /* to be filled by the loader */ \
 	}
 
-#define T6050_M_CPU(label, mpidr, cluster) \
-	T6050_CPU(label, mpidr, "apple,sawtooth", mcluster_opp, cluster)
-#define T6050_P_CPU(label, mpidr, cluster) \
-	T6050_CPU(label, mpidr, "apple,everest", pcluster_opp, cluster)
+/*
+ * capacity-dmips-mhz from pinned single-thread throughput with every cluster at 4284 MHz (in
+ * both OPP tables), normalised by each core's measured clock (J714sAP): per MHz an M core runs
+ * zstd -3 compression at 0.736, decompression at 0.871 and a Python dict loop at 0.728 of a P
+ * core, geometric mean 0.776, so M 794 and P 1024. Small L1-resident loops run at 0.92-1.01.
+ */
+#define T6050_M_CPU(label, mpidr, cluster, l2) \
+	T6050_CPU(label, mpidr, "apple,sawtooth", mcluster_opp, cluster, 794, l2, 0x20000, 0x10000)
+#define T6050_P_CPU(label, mpidr, cluster, l2) \
+	T6050_CPU(label, mpidr, "apple,everest", pcluster_opp, cluster, 1024, l2, 0x30000, 0x20000)
+
+/*
+ * Caches. Every cluster has its own unified L2, shared by its six cores: the ADT's /cpus/cpuN
+ * l2-cache-size is 8 MiB on the M-tier (apple,sawtooth) cores and 16 MiB on the P-tier
+ * (apple,everest) cores in the J714c/s, J716c/s, J775c/d and J873s ADTs, and macOS reports
+ * hw.perflevelN.cpusperl2 = 6 on both tiers. The L1 sizes are macOS's
+ * hw.perflevelN.l1icachesize/l1dcachesize: 128 KiB I and 64 KiB D on the M tier, 192 KiB I and
+ * 128 KiB D on the P tier. The system level cache sits behind the memory controllers and is
+ * shared with every agent; it is not part of the CPUs' cache hierarchy and is not described here.
+ */
+#define T6050_L2(label, name, bytes)	\
+	label: name {			\
+		compatible = "cache";	\
+		cache-level = <2>;	\
+		cache-unified;		\
+		cache-size = <bytes>;	\
+	}
+#define T6050_M_L2(label, name)	T6050_L2(label, name, 0x800000)
+#define T6050_P_L2(label, name)	T6050_L2(label, name, 0x1000000)
 
 / {
 	compatible = "apple,t6050", "apple,arm-platform";
@@ -90,10 +119,12 @@
 	 * (measured on J775D: every state's clock from a dependent-add chain). iBoot leaves M cluster
 	 * 0 of each die in state 6 (2652 MHz), the other clusters in state 2.
 	 *
-	 * Bring-up: the clusters' controllers (t6050-dieX.dtsi) assert apple,firmware-managed-thermal,
-	 * which the T6050 profile requires, before that ownership is qualified on this boot chain (no
-	 * Linux PMP driver runs; the SMC drives the fans). A qualification settles it: an all-core
-	 * load at the top states, watching TCMb, the fans and the measured clock.
+	 * The clusters' controllers (t6050-dieX.dtsi) assert apple,firmware-managed-thermal, which the
+	 * T6050 profile requires: the firmware keeps the voltage and PLL control. It does not lower a
+	 * cluster's requested state on its own: on J714s, under a sustained all-core load, the PMP's
+	 * fast-die effort reaches its maximum while the clusters stay at their top state, so boards
+	 * whose PMP runs give each cluster apple,fast-die-effort (t6050-j714s.dts). Other boards are
+	 * not qualified yet.
 	 */
 	mcluster_opp: opp-table-mcluster {
 		compatible = "operating-points-v2";
@@ -281,12 +312,19 @@
 			     <AIC_FIQ 0 AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
 	};
 
+	cpu_pmu: pmu {
+		compatible = "apple,t6050-pmu";
+		interrupt-parent = <&aic>;
+		/* The AIC raises both core types' PMU FIQs as this one. */
+		interrupts = <AIC_FIQ 0 AIC_CPU_PMU_P IRQ_TYPE_LEVEL_HIGH>;
+	};
+
 	/* Die 0 MMIO */
 	die0: soc@200000000 {
 		compatible = "simple-bus";
 		#address-cells = <2>;
 		#size-cells = <2>;
-		ranges = <0x2 0x0 0x2 0x0 0x3 0xc0000000>;
+		ranges = <0x2 0x0 0x2 0x0 0x4 0x0>;
 		nonposted-mmio;
 	};
 };

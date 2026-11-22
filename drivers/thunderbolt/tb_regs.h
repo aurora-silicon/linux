@@ -368,6 +368,7 @@ struct tb_regs_port_header {
 #define LANE_ADP_CS_1_CURRENT_SPEED_GEN4	0x2
 #define LANE_ADP_CS_1_CURRENT_WIDTH_MASK	GENMASK(25, 20)
 #define LANE_ADP_CS_1_CURRENT_WIDTH_SHIFT	20
+#define LANE_ADP_CS_1_ADAPTER_STATE_MASK	GENMASK(29, 26)	/* enum tb_port_state */
 #define LANE_ADP_CS_1_PMS			BIT(30)
 
 /* USB4 port registers */
@@ -398,6 +399,7 @@ struct tb_regs_port_header {
 #define PORT_CS_19_WOD				BIT(17)
 #define PORT_CS_19_WOU4				BIT(18)
 #define PORT_CS_19_START_ASYM			BIT(24)
+#define PORT_CS_19_GEN4_LINK_RECOVERY		BIT(31)
 
 /* Display Port adapter registers */
 #define ADP_DP_CS_0				0x00

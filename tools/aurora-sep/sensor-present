@@ -1,0 +1,31 @@
+#!/usr/bin/python3
+"""Exit successfully only when the enclave reports a physical fingerprint reader."""
+import fcntl
+import os
+import struct
+
+
+DEVICE = '/dev/sep-bio'
+# GET_INFO has the same 32-byte layout in v4 and v5. Reject unknown ABIs.
+INFO_VERSIONS = (4, 5)
+INFO_BYTES = 32
+# _IOR(0xB1, 0x01, struct sep_bio_info) from apple-sep.h.
+GET_INFO = (2 << 30) | (INFO_BYTES << 16) | (0xB1 << 8) | 0x01
+
+
+def present(device=DEVICE):
+    fd = os.open(device, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        info = bytearray(INFO_BYTES)
+        fcntl.ioctl(fd, GET_INFO, info, True)
+        version, sensor = struct.unpack_from('=II', info)
+        return version in INFO_VERSIONS and sensor == 1
+    finally:
+        os.close(fd)
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(0 if present() else 1)
+    except OSError:
+        raise SystemExit(1)

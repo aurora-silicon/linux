@@ -79,15 +79,20 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     source = (subprocess.check_output(['git','show','990a45b609dd:'+PATH.replace('/asahi/', '/asahi-neo/')], cwd=ROOT,text=True)
               if args.old else (ROOT/PATH).read_text())
-    structure = item(source, 'pub(super) struct Generation').replace('pub(super)', '')
-    constructor = item(source[source.index('impl Generation'):], '    fn new(')
-    addresses = item(source, '    pub(super) fn addresses').replace('pub(super)', '')
+    # The G17P generation is NeoGeneration since the M5 one joined it behind
+    # the Generation enum; the old revision still calls it Generation.
+    generation = 'Generation' if args.old else 'NeoGeneration'
+    structure = item(source, 'pub(super) struct ' + generation + ' ').replace('pub(super)', '')
+    implementation = source[source.index('impl ' + generation + ' {'):]
+    constructor = item(implementation, '    fn new(')
+    addresses = item(implementation, '    pub(super) fn addresses').replace('pub(super)', '')
     storage=(ROOT/'drivers/gpu/drm/asahi/g17/fw/render/storage.rs').read_text()
     constants=[]
     for name in ['STATE_SIZE','DEFLAKE','TA_STATUS','AUXILIARY','AUXILIARY_SIZE']:
         line=next(x for x in storage.splitlines() if 'const '+name+':' in x)
         constants.append(line.replace('pub(crate)','pub'))
-    code=PREFIX.replace('CONSTANTS','\n'.join(constants))+structure+'\nimpl Generation{'+constructor+addresses+'}\n'+MAIN
+    code=(PREFIX.replace('CONSTANTS','\n'.join(constants))+structure+'\nimpl '+generation+'{'+constructor+addresses+'}\n'
+          +('' if generation=='Generation' else 'type Generation='+generation+';\n')+MAIN)
     if args.mutation:
         code=code.replace('self.state.gpu_va() + storage::AUXILIARY as u64','self.state.gpu_va()')
     path=args.output/'controls.rs';path.write_text(code)

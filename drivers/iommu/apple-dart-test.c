@@ -13,6 +13,25 @@ struct apple_dart_test_window {
 	u64 size;
 };
 
+/* PARAMS read back from a window that is not a DART must not probe. */
+static void apple_dart_test_topology(struct kunit *test)
+{
+	/* T8112 DARTs: 16 KiB pages, 36-bit address space, 16 streams. */
+	KUNIT_EXPECT_TRUE(test, apple_dart_topology_valid(SZ_16K, 36, 36, 16));
+	/* T6020 PCIe-C fixed topology and the T8020 32-bit IOVA. */
+	KUNIT_EXPECT_TRUE(test, apple_dart_topology_valid(SZ_16K, 42, 42, 64));
+	KUNIT_EXPECT_TRUE(test, apple_dart_topology_valid(SZ_4K, 32, 36, 16));
+	/* A zero address width would make DMA_BIT_MASK(0). */
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(SZ_16K, 0, 36, 16));
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(SZ_16K, 36, 0, 16));
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(SZ_16K, 65, 36, 16));
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(SZ_16K, 36, 36, 0));
+	/* A page shift of 0 reads as a 1-byte page. */
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(1, 36, 36, 16));
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(SZ_64K, 36, 36, 16));
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(0, 0, 0, 0));
+}
+
 static void apple_dart_test_iommu_specifiers(struct kunit *test)
 {
 	static const struct apple_dart_test_window windows[] = {
@@ -963,8 +982,353 @@ static void apple_dart_test_strict_engines(struct kunit *test)
 				       "%s", lazy[i]);
 }
 
+#if IS_ENABLED(CONFIG_APPLE_DART_J713_DCP)
+#define APPLE_DART_TEST_PS_SLICE 42
+
+static void apple_dart_test_regmap_exit(void *map)
+{
+	regmap_exit(map);
+}
+
+/* An internal display DART with one live stream and a PS_PROT bank in RAM. */
+static struct apple_dart *apple_dart_test_host_dart(struct kunit *test)
+{
+	static const struct regmap_config cfg = {
+		.reg_bits = 32, .val_bits = 32, .reg_stride = 4,
+		.max_register = APPLE_PS_PROT_SLICE(APPLE_PS_PROT_SLICES - 1),
+	};
+	static atomic_t instance = ATOMIC_INIT(0);
+	struct apple_dart *dart;
+	char name[40];
+	void *bank;
+
+	dart = kunit_kzalloc(test, sizeof(*dart), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart);
+	/* Device names must be unique: a test may set up several. */
+	snprintf(name, sizeof(name), "apple-dart-host-power-%d", atomic_inc_return(&instance));
+	dart->dev = kunit_device_register(test, name);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dart->dev);
+	dev_set_drvdata(dart->dev, dart);
+	/* Up to the exception registers at 0x4000, which a 0x0203 DART reads. */
+	dart->regs = (__force void __iomem *)kunit_kzalloc(test, APPLE_DART_TEST_REGS_SIZE,
+							   GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart->regs);
+	dart->hw = &apple_dart_hw_t8110;
+	dart->num_streams = 2;
+	dart->pgsize = SZ_16K;
+	dart->version = 0x0203;
+	dart->power_gated = true;
+	spin_lock_init(&dart->lock);
+	spin_lock_init(&dart->pm_gate_lock);
+	init_waitqueue_head(&dart->pm_wq);
+	pm_runtime_set_active(dart->dev);
+	pm_runtime_enable(dart->dev);
+
+	bank = kunit_kzalloc(test, APPLE_PS_PROT_SLICE(APPLE_PS_PROT_SLICES), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, bank);
+	dart->ps_prot = regmap_init_mmio(NULL, (__force void __iomem *)bank, &cfg);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dart->ps_prot);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, apple_dart_test_regmap_exit,
+							dart->ps_prot), 0);
+	dart->ps_prot_slice = APPLE_DART_TEST_PS_SLICE;
+	regmap_write(dart->ps_prot, APPLE_PS_PROT_ENABLE, 1);
+	regmap_write(dart->ps_prot, APPLE_PS_PROT_SLICE(APPLE_DART_TEST_PS_SLICE), 0x12);
+
+	writel(1 << 16, dart->regs + DART_PARAMS2);	/* one port */
+	writel(DART_T8110_TCR_TRANSLATE_ENABLE, dart->regs + DART_TCR(dart, 1));
+	writel(dart->hw->ttbr_valid | 0x1234, dart->regs + DART_TTBR(dart, 1, 0));
+	writel(DART_T8110_PROTECT_TTBR_TCR, dart->regs + DART_T8110_PROTECT);
+	writel(DART_T8110_PROTECT_TTBR_TCR, dart->regs + DART_T8110_PROTECT_LOCK);
+	return dart;
+}
+
+static u32 apple_dart_test_slice(struct apple_dart *dart)
+{
+	u32 value = 0;
+
+	regmap_read(dart->ps_prot, APPLE_PS_PROT_SLICE(dart->ps_prot_slice), &value);
+	return value;
+}
+
+static void apple_dart_test_host_power_cycle(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_host_dart(test);
+
+	KUNIT_ASSERT_EQ(test, apple_dart_host_power_off(dart), 0);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dart->host_off));
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dart->commands_gated));
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_TLB_CMD), DART_T8110_TLB_CMD_POWERDOWN);
+	KUNIT_EXPECT_EQ(test, apple_dart_test_slice(dart), 0x2U);
+	/* Its registers are not used until power-up. */
+	KUNIT_EXPECT_FALSE(test, apple_dart_pm_get(dart));
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_off(dart), -EALREADY);
+
+	KUNIT_ASSERT_EQ(test, apple_dart_host_power_on(dart), 0);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->host_off));
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->commands_gated));
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_TLB_CMD), DART_T8110_TLB_CMD_V2);
+	KUNIT_EXPECT_EQ(test, apple_dart_test_slice(dart), 0x12U);
+	KUNIT_EXPECT_TRUE(test, apple_dart_pm_get(dart));
+	apple_dart_pm_put(dart);
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_on(dart), -EALREADY);
+}
+
+static void apple_dart_test_host_power_lost(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_host_dart(test);
+
+	KUNIT_ASSERT_EQ(test, apple_dart_host_power_off(dart), 0);
+	/* Power came back with a reset DART: not rebuilt, not used. */
+	writel(0, dart->regs + DART_TTBR(dart, 1, 0));
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_on(dart), -EIO);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dart->host_off));
+	KUNIT_EXPECT_FALSE(test, apple_dart_pm_get(dart));
+}
+
+static void apple_dart_test_host_power_refused(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_host_dart(test);
+
+	regmap_write(dart->ps_prot, APPLE_PS_PROT_LOCK, 1);
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_off(dart), -EPERM);
+	KUNIT_EXPECT_EQ(test, apple_dart_test_slice(dart), 0x12U);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_TLB_CMD), 0U);
+
+	dart = apple_dart_test_host_dart(test);
+	/* A stream that stays enabled: the flush and the slice are left alone. */
+	writel(BIT(1), dart->regs + DART_T8110_ENABLE_STREAMS);
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_off(dart), -EIO);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_DISABLE_STREAMS), BIT(1));
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_TLB_CMD), 0U);
+	KUNIT_EXPECT_EQ(test, apple_dart_test_slice(dart), 0x12U);
+
+	/* An outstanding transaction that does not drain in time. */
+	dart = apple_dart_test_host_dart(test);
+	writel(1, dart->regs + DART_T8110_OUTSTANDING(0));
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_off(dart), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, apple_dart_test_slice(dart), 0x12U);
+
+	/* A pending fault is not waited for. */
+	dart = apple_dart_test_host_dart(test);
+	writel(1, dart->regs + DART_T8110_EXCEPTION(0));
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_off(dart), -EIO);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_TLB_CMD), 0U);
+	KUNIT_EXPECT_EQ(test, apple_dart_test_slice(dart), 0x12U);
+}
+
+/*
+ * Power-up after a real sleep, with the values a J604 read (1.926 boot 57fd7070, 1.928 boot
+ * ed446d35): the wake left SID6 TTBR0 0x03200000 (0x01200000 on 1.923 boot 87d1369e) where the
+ * power-down state had 0. The internal display DART is TTBR/TCR protected and locked.
+ */
+static const u32 apple_dart_test_wake_ttbr[] = { 0x03200000, 0x01200000 };
+
+struct apple_dart_test_sleep {
+	u32 drop_offset;	/* a register write the DART does not take, 0 for none */
+};
+
+static void apple_dart_test_sleep_writel(struct apple_dart *dart, u32 value, u32 offset)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct apple_dart_test_sleep *sleep = test ? test->priv : NULL;
+
+	if (sleep && sleep->drop_offset && offset == sleep->drop_offset)
+		return;
+	/* DISABLE_STREAMS clears ENABLE_STREAMS bits, as the hardware does. */
+	if (offset == DART_T8110_DISABLE_STREAMS)
+		writel(readl(dart->regs + DART_T8110_ENABLE_STREAMS) & ~value,
+		       dart->regs + DART_T8110_ENABLE_STREAMS);
+	writel(value, dart->regs + offset);
+}
+
+static struct apple_dart *apple_dart_test_slept_dart(struct kunit *test, bool locked, u32 tcr6,
+						     bool on6, u32 wake_ttbr6)
+{
+	struct apple_dart *dart = apple_dart_test_host_dart(test);
+	struct apple_dart_test_sleep *sleep;
+
+	sleep = kunit_kzalloc(test, sizeof(*sleep), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, sleep);
+	test->priv = sleep;
+	kunit_activate_static_stub(test, apple_dart_writel, apple_dart_test_sleep_writel);
+	dart->num_streams = 8;
+	if (!locked) {
+		writel(0, dart->regs + DART_T8110_PROTECT);
+		writel(0, dart->regs + DART_T8110_PROTECT_LOCK);
+	}
+	writel(tcr6, dart->regs + DART_TCR(dart, 6));
+	KUNIT_ASSERT_EQ(test, apple_dart_host_power_off(dart), 0);
+	/* SID6 on at power-down with nothing in it. */
+	if (on6)
+		dart->off_streams |= BIT(6);
+	/* The wake, as the J604 read it. */
+	dart->host_off_slept = true;
+	writel(wake_ttbr6, dart->regs + DART_TTBR(dart, 6, 0));
+	return dart;
+}
+
+/* The J604 case: a TTBR without its valid bit is no loss, on or off, TCR 0 or not. */
+static void apple_dart_test_host_power_slept_invalid_ttbr(struct kunit *test)
+{
+	unsigned int i, variant;
+
+	for (i = 0; i < ARRAY_SIZE(apple_dart_test_wake_ttbr); i++) {
+		for (variant = 0; variant < 4; variant++) {
+			u32 tcr6 = variant & 1 ? DART_T8110_TCR_TRANSLATE_ENABLE : 0;
+			bool on6 = variant & 2;
+			struct apple_dart *dart;
+
+			dart = apple_dart_test_slept_dart(test, true, tcr6, on6,
+							  apple_dart_test_wake_ttbr[i]);
+			KUNIT_EXPECT_EQ_MSG(test, apple_dart_host_power_on(dart), 0,
+					    "TTBR0 %08x tcr %08x on %d",
+					    apple_dart_test_wake_ttbr[i], tcr6, on6);
+			KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->host_off));
+			/* Locked: nothing written. */
+			KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 6, 0)),
+					apple_dart_test_wake_ttbr[i]);
+			KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_ENABLE_STREAMS),
+					on6 ? BIT(6) : 0U);
+		}
+	}
+}
+
+/* Unlocked, the saved state goes back, and a stream the wake turned on goes off. */
+static void apple_dart_test_host_power_slept_write_back(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_slept_dart(test, false, 0, false, 0x03200000);
+
+	writel(BIT(6), dart->regs + DART_T8110_ENABLE_STREAMS);
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_on(dart), 0);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 6, 0)), 0U);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_ENABLE_STREAMS), 0U);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->host_off));
+}
+
+/* A valid saved TTBR that comes back different: restored if the DART takes it, else lost. */
+static void apple_dart_test_host_power_slept_valid_ttbr(struct kunit *test)
+{
+	const u32 saved = apple_dart_hw_t8110.ttbr_valid | 0x1234;
+	const u32 other = apple_dart_hw_t8110.ttbr_valid | 0x5678;
+	struct apple_dart_test_sleep *sleep;
+	struct apple_dart *dart;
+
+	dart = apple_dart_test_slept_dart(test, true, 0, false, 0);
+	writel(other, dart->regs + DART_TTBR(dart, 1, 0));
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_on(dart), -EIO);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 1, 0)), other);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dart->host_off));
+
+	dart = apple_dart_test_slept_dart(test, false, 0, false, 0);
+	writel(other, dart->regs + DART_TTBR(dart, 1, 0));
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_on(dart), 0);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 1, 0)), saved);
+
+	dart = apple_dart_test_slept_dart(test, false, 0, false, 0);
+	sleep = test->priv;
+	sleep->drop_offset = DART_TTBR(dart, 1, 0);
+	writel(other, dart->regs + DART_TTBR(dart, 1, 0));
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_on(dart), -EIO);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dart->host_off));
+}
+
+/*
+ * A valid TTBR the wake gave a stream with no table of ours (J604 1.929 boot 4554d16a: SID6 TCR
+ * 0x1 kept, TTBR0 0x01000000, saved 0): on the locked DART it is iBoot's and stays, not written;
+ * on an unlocked one it is put back to the saved state. Either way the power-up goes on, unless
+ * the stream was on at power-down on the locked DART: power-up would enable it through that
+ * table.
+ */
+static void apple_dart_test_host_power_slept_foreign_valid(struct kunit *test)
+{
+	const u32 wake = apple_dart_hw_t8110.ttbr_valid | 0x01000000;
+	struct apple_dart *dart;
+
+	dart = apple_dart_test_slept_dart(test, true, DART_T8110_TCR_TRANSLATE_ENABLE, false,
+					  wake);
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_on(dart), 0);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 6, 0)), wake);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->host_off));
+
+	dart = apple_dart_test_slept_dart(test, false, DART_T8110_TCR_TRANSLATE_ENABLE, false,
+					  wake);
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_on(dart), 0);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 6, 0)), 0U);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->host_off));
+
+	dart = apple_dart_test_slept_dart(test, true, DART_T8110_TCR_TRANSLATE_ENABLE, true, wake);
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_on(dart), -EIO);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dart->host_off));
+}
+
+/* Without a sleep an invalid TTBR that differs is no loss either (a valid one: host_power_lost). */
+static void apple_dart_test_host_power_invalid_ttbr_no_sleep(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_host_dart(test);
+
+	dart->num_streams = 8;
+	KUNIT_ASSERT_EQ(test, apple_dart_host_power_off(dart), 0);
+	writel(0x03200000, dart->regs + DART_TTBR(dart, 6, 0));
+	KUNIT_EXPECT_EQ(test, apple_dart_host_power_on(dart), 0);
+}
+
+/*
+ * Generic SID0 DMA while the DCP has the DART powered down: translations,
+ * flushes and unmaps use the page tables only, and the power-up flushes.
+ */
+static void apple_dart_test_host_power_tables(struct kunit *test)
+{
+	const u64 iova = DCP_DART_ALIAS + 3 * DCP_DART_SLICE + 5 * DCP_DART_PAGE;
+	const unsigned int root = (iova >> 25) & 2047, leaf = (iova >> 14) & 2047;
+	const u64 pte = (0x12340000ULL >> 4) | 1 | (0xfffULL << 40);
+	struct apple_dart *dart = apple_dart_test_host_dart(test);
+	struct iommu_iotlb_gather gather;
+	struct apple_dart_domain *domain;
+	struct apple_dart_dcp *dcp;
+
+	dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	domain = kunit_kzalloc(test, sizeof(*domain), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, domain);
+	dcp->dart = dart;
+	spin_lock_init(&dcp->lock);
+	dcp->root = kunit_kzalloc(test, DCP_DART_ENTRIES * sizeof(u64), GFP_KERNEL);
+	dcp->table[root] = kunit_kzalloc(test, DCP_DART_ENTRIES * sizeof(u64), GFP_KERNEL);
+	dcp->expected[root] = kunit_kzalloc(test, DCP_DART_ENTRIES * sizeof(u64), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->root);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->table[root]);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->expected[root]);
+	dcp->root[root] = 0x5670001;
+	dcp->entry[root] = dcp->root[root];
+	dcp->table[root][leaf] = pte;
+	dcp->expected[root][leaf] = pte;
+	dart->frontend[0] = dcp;
+	domain->dcp = dcp;
+
+	KUNIT_ASSERT_EQ(test, apple_dart_host_power_off(dart), 0);
+	writel(0, dart->regs + DART_T8110_TLB_CMD);	/* Any later command shows here. */
+
+	KUNIT_EXPECT_EQ(test, apple_dart_dcp_translate(dcp, iova + 0x123),
+			dcp_dart_pte_phys(pte) | 0x123);
+	KUNIT_EXPECT_EQ(test, apple_dart_dcp_domain_flush(domain), 0);
+	iommu_iotlb_gather_init(&gather);
+	KUNIT_EXPECT_EQ(test, apple_dart_dcp_unmap(dcp, iova, DCP_DART_PAGE, 1, &gather),
+			(size_t)DCP_DART_PAGE);
+	KUNIT_EXPECT_EQ(test, dcp->table[root][leaf], 0ULL);
+	KUNIT_EXPECT_EQ(test, dcp->expected[root][leaf], 0ULL);
+	KUNIT_EXPECT_EQ(test, apple_dart_dcp_translate(dcp, iova), (phys_addr_t)0);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dcp->failed));
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_TLB_CMD), 0U);
+
+	KUNIT_ASSERT_EQ(test, apple_dart_host_power_on(dart), 0);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_TLB_CMD), DART_T8110_TLB_CMD_V2);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->host_off));
+}
+#endif
+
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_strict_engines),
+	KUNIT_CASE(apple_dart_test_topology),
 	KUNIT_CASE(apple_dart_test_iommu_specifiers),
 	KUNIT_CASE(apple_dart_test_independent_remap_roots),
 	KUNIT_CASE(apple_dart_test_before_attach),
@@ -989,6 +1353,17 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_resume_reset_retry),
 	KUNIT_CASE(apple_dart_test_resume_retained_bypass_t8103),
 	KUNIT_CASE(apple_dart_test_resume_retained_bypass_t8110),
+#if IS_ENABLED(CONFIG_APPLE_DART_J713_DCP)
+	KUNIT_CASE(apple_dart_test_host_power_cycle),
+	KUNIT_CASE(apple_dart_test_host_power_lost),
+	KUNIT_CASE(apple_dart_test_host_power_refused),
+	KUNIT_CASE(apple_dart_test_host_power_tables),
+	KUNIT_CASE(apple_dart_test_host_power_slept_invalid_ttbr),
+	KUNIT_CASE(apple_dart_test_host_power_slept_write_back),
+	KUNIT_CASE(apple_dart_test_host_power_slept_valid_ttbr),
+	KUNIT_CASE(apple_dart_test_host_power_slept_foreign_valid),
+	KUNIT_CASE(apple_dart_test_host_power_invalid_ttbr_no_sleep),
+#endif
 	{}
 };
 

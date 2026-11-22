@@ -68,7 +68,7 @@ struct ave_ctx {
 	struct delayed_work poll_work;
 	struct mutex queue_lock;
 	int ready;
-	bool failed, draining, flush_pending, stopped;
+	bool failed, draining, flush_pending, stopped, mctf;
 	struct vb2_v4l2_buffer *drain_src;
 };
 
@@ -91,9 +91,18 @@ struct ave_dev {
 	u64 ipc_fw_base;
 	bool irq_kick;
 	int irq_wait;
+	unsigned long mctf_pool_flags;
+	struct ave_buf mctf_pool[AVE_MCTF_BUFS];
+	struct ave_buf mctf_pool_in[AVE_MCTF_IN_BUFS];
+	struct ave_buf mctf_pool_out[AVE_MCTF_OUT_BUFS];
+	u32 mctf_pool_crc;
+	bool mctf_pool_crc_valid;
+	bool witness_unusable;
+	u32 mctf_pool_changed;
 };
 
 static void *test_ctrl_addr;
+static void ave_ipc_dump(struct ave_dev *ave, const char *why) {}
 static int halt_result, close_result;
 static unsigned int halts, closes, freed, suspends, resumes, schedules, barriers;
 static unsigned int polls, sleep_ms;
@@ -190,10 +199,17 @@ static int ave_cmd_halt(struct ave_dev *ave)
 static int ave_cmd_close(struct ave_ctx *ctx)
 {
 	closes++;
+	if (!close_result)
+		ctx->sess->fw_open = false;
 	return close_result;
 }
 
 static int ave_cmd_complete(struct ave_ctx *ctx, unsigned int n)
+{
+	return 0;
+}
+
+static int ave_cmd_flush(struct ave_ctx *ctx)
 {
 	return 0;
 }

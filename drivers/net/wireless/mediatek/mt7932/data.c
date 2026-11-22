@@ -33,6 +33,12 @@ void mt_data_clean_locked(struct mt7932 *m)
 	if (READ_ONCE(m->connected) && mt_rf_allowed(m) && mt_bss_tx_allowed(m) &&
 	    !m->data_live[q->head] && q->queued < q->count - 1)
 		netif_wake_queue(m->netdev);
+#if IS_ENABLED(CONFIG_MT7932_AWDL)
+	if (READ_ONCE(m->awdl.active) && READ_ONCE(m->awdl.sync_enabled) &&
+	    READ_ONCE(m->awdl.slot_open) && !m->data_live[q->head] &&
+	    q->queued < q->count - 1)
+		netif_wake_queue(m->awdl.netdev);
+#endif
 }
 
 /*
@@ -279,6 +285,7 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 	m->rx_ethernet++;
 	spin_lock(&m->data_lock);
 	m->station_rx_packets++;
+	m->station_rx_time = jiffies;
 	m->rx_band_records[frame->band == NL80211_BAND_2GHZ ? 0 :
 			   frame->band == NL80211_BAND_5GHZ ? 1 : 2]++;
 	m->station_rx_bytes += frame->length;

@@ -67,6 +67,7 @@ mod queue;
 mod recovery;
 mod regs;
 mod resources;
+mod sleep;
 mod slots;
 mod timestamp;
 mod uat;
@@ -74,7 +75,7 @@ mod vm;
 
 use core::any::Any;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use kernel::{
     c_str,
@@ -145,7 +146,11 @@ impl platform::Driver for Driver {
     type Data<'bound> = Option<crate::driver::AsahiPlatformDriverData<'bound>>;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
-    /// The firmware session cannot be stopped once started.
+    fn pm_ops() -> Option<&'static kernel::bindings::dev_pm_ops> {
+        Some(sleep::ops())
+    }
+
+    /// The firmware session cannot be stopped by an unbind.
     fn suppress_bind_attrs() -> bool {
         true
     }
@@ -173,7 +178,8 @@ impl platform::Driver for Driver {
     fn unbind<'bound>(_pdev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
         if let Some(driver) = this.get_ref() {
             if let Some(gpu) = &driver.g16 {
-                gpu.retain();
+                // Admission pinned the module; this only confirms the pin.
+                let _ = gpu.retain();
             }
             driver.close_binding();
         }
@@ -208,6 +214,13 @@ pub(crate) struct Shared {
     pub(crate) rtkit_buffer: AtomicU64,
     /// A firmware session whose start or backend start failed: retained, rings still drained.
     pub(crate) orphaned: AtomicBool,
+    /// From a system sleep's `.prepare` until the firmware restarted: nothing reads its
+    /// registers and nothing is published.
+    pub(crate) sleeping: AtomicBool,
+    /// The GFX power state word from before a system sleep.
+    sleep_ps: AtomicU32,
+    /// The stop left to a system sleep's commit, until `.complete` finishes it.
+    sleep_commit: AtomicPtr<core::ffi::c_void>,
     #[pin]
     pub(crate) orphan: Mutex<Option<KBox<boot::Orphan>>>,
     #[pin]
@@ -386,6 +399,9 @@ impl Gpu {
                 data,
                 rtkit_buffer: AtomicU64::new(0),
                 orphaned: AtomicBool::new(false),
+                sleeping: AtomicBool::new(false),
+                sleep_ps: AtomicU32::new(0),
+                sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
                 orphan <- new_mutex!(None, "g16::Shared::orphan"),
                 poll <- new_delayed_work!("g16::Shared::poll"),
                 resnap <- HrTimer::new(),
@@ -415,24 +431,27 @@ impl Gpu {
             },
             GFP_KERNEL,
         )?;
-        gpu.retain();
+        gpu.retain()?;
         Ok(gpu)
     }
 
     /// Keeps the firmware session and this module alive until reboot.
     ///
-    /// Takes the module reference once. Nothing firmware-reachable is freed on any path: the
-    /// RTKit callbacks hold [`Shared`], which holds the [`Firmware`] (or the [`boot::Orphan`] of a
-    /// failed start) until reboot.
-    pub(crate) fn retain(&self) {
-        // Admission already pinned the module, so this cannot fail.
-        let _ = boot::glue::retain_module();
+    /// Takes the module reference once; admission already took it, so this only confirms it.
+    /// Nothing firmware-reachable is freed on any path: the RTKit callbacks hold [`Shared`],
+    /// which holds the [`Firmware`] (or the [`boot::Orphan`] of a failed start) until reboot.
+    pub(crate) fn retain(&self) -> Result {
+        boot::glue::retain_module()
     }
 }
 
 impl Firmware {
     /// Builds the graphs and the engine after READY. On failure the firmware stays at READY,
     /// retained as an orphan of `shared`.
+    ///
+    /// Out of line, like [`boot::admit`] and [`boot::start`]: each of [`Gpu::new`]'s phases
+    /// has a large frame, and the probe's stack holds them only one at a time.
+    #[inline(never)]
     fn start_backend(
         dev: &AsahiDrmDevice,
         booted: boot::Booted,

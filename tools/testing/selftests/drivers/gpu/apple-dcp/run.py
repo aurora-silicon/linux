@@ -58,14 +58,17 @@ def main():
     tests = [
         ('display', 'panel-colorimetry', lambda r: colorimetry.panel(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('audio', 'compact-audio-reply-bounds', audio.reply_bounds, ((),), ()),
+        ('audio', 'cec-only-av-endpoint', audio.cec_only_endpoint, ((),), ()),
         ('display', 'desktop-gamma', desktop.gamma, ((),), ()),
         ('display', 'hdr-static-metadata', display.hdr_metadata, ((),), ()),
         ('display', 'ctm-encoding', colorimetry.ctm, ((),), ()),
         ('lifecycle', 'desktop-modeset-unmap', desktop.modeset_unmap, ((),), ()),
         ('lifecycle', 'desktop-unknown-modeset-recovery', desktop.modeset_unknown, ((),), ()),
         ('display', 'panel-backlight-ramp', display.backlight, ((),), ()),
+        ('display', 'panel-dac-words', display.dac_words, ((),), ()),
         ('display', 'panel-takeover-registration', desktop.brightness_takeover, ((),), ()),
         ('display', 'panel-brightness-commit', display.brightness_commit, ((),), ()),
+        ('display', 'camera-indicator-dpms', display.indicator_dpms, ((),), ()),
         ('display', 'panel-brightness-takeover', display.takeover, ((),), ()),
         ('display', 'panel-mode-catalog', display.modes, ((),), ()),
         ('display', 'desktop-brightness-notifications', desktop.brightness_notifications, ((),), ()),
@@ -83,10 +86,12 @@ def main():
         ('m4', 'm4-common-plane', m4.plane, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('m4', 'm4-producer-retirement', m4.prepare, ((),), ('-Wno-unused-function',)),
         ('m4', 'm4-dpms-retirement', m4.blank, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
+        ('m4', 'm4-power-gate', m4.gate, ((),), ('-Wno-unused-function',)),
         ('m4', 'm4-dart-consumer', m4.dart, ((),), ('-Wno-unused-function',)),
         ('m4', 'm4-panel-timing', m4.timing, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('boot', 'oslog-events', boot.oslog, ((),), ()),
         ('boot', 'syslog-policy', boot.syslog, ((),), ()),
+        ('boot', 't6041-v27-admission', boot.t6041_v27_admission, ((),), ()),
         ('edid', 'dpavserv-start', edid.startup, ((),), ()),
         ('edid', 'service-rebind', edid.rebind, ((),), ()),
         ('edid', 'provider-admission', edid.admission, ((),), ()),
@@ -154,7 +159,9 @@ def main():
                           '#define iomfb_m4_get_mode(...) (-95)\n'
                           '#define iomfb_m4_blank(...) (-95)\n')
                 if 'dcp_fail_stop(' in unit:
+                    # Firmware 27 fail-stops like H17P; no fixture here runs firmware 27.
                     prefix += ('struct apple_dcp;\n'
+                               '#define DCP_FIRMWARE_V_27_0 0x2700\n'
                                'static inline bool dcp_fail_stop(const struct apple_dcp *dcp);\n')
                     unit += '\n' + block((apple / 'dcp-internal.h').read_text(),
                                           'static inline bool dcp_fail_stop(')

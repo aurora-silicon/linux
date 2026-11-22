@@ -13,7 +13,8 @@ FUNCTIONS = {
     'include/linux/soc/apple/dp-tunnel.h': [
         'apple_dp_tunnel_t6030_pclk', 'apple_dp_tunnel_wiring_dual',
         'apple_dp_tunnel_mux_matches', 'apple_dp_tunnel_t6030_legacy_mux',
-        'apple_dp_tunnel_route_wired', 'apple_dp_tunnel_dual_stream'],
+        'apple_dp_tunnel_route_wired', 'apple_dp_tunnel_routes_port',
+        'apple_dp_tunnel_dual_stream'],
     'drivers/gpu/drm/apple/dcp-fabric-core.c': ['dcp_fabric_wiring'],
     'drivers/gpu/drm/apple/dcp-fabric.c': ['dcp_typec_route_endpoints', 'dcp_typec_route_wiring'],
 }
@@ -22,10 +23,13 @@ CASES = ['tb-source0', 'tb-source2', 'dcp-source0', 'dcp-source2',
          'single-endpoint', 'wrong-provider', 'missing-primary', 'parse-failure',
          'primary-cell1', 'primary-two-args', 'named', 'named-other-soc',
          'named-wrong-cell', 'named-other-provider', 'partial-named',
-         'usb4', 'usb4-other-soc', 'bad-usb4']
+         'usb4', 'usb4-other-soc', 'bad-usb4',
+         'routes-port2', 'four-dpin', 'four-dpin-short-xbar', 'extra-dpin-unpaired']
 
 def function(source, name):
-    match = re.search(r'^[^\n;{}]*\b' + name + r'\([^;]*?\)\n\{', source, re.M | re.S)
+    # A return type on a line of its own belongs to the definition.
+    match = re.search(r'^(?:static[^\n;{}()]*\n)?[^\n;{}]*\b' + name + r'\([^;]*?\)\n\{',
+                      source, re.M | re.S)
     if not match:
         raise ValueError(name)
     pos = source.index('{', match.start()) + 1
@@ -50,10 +54,12 @@ def main():
             if args.old_ref and name == old_name:
                 body = function(subprocess.check_output(['git', 'show', args.old_ref + ':' + path], cwd=ROOT, text=True), name)
             bodies[name] = body
-    enum = re.search(r'enum dcp_fabric_wiring \{.*?\n\};',
-                     (ROOT / 'drivers/gpu/drm/apple/dcp-fabric-core.h').read_text(), re.S).group()
+    core = (ROOT / 'drivers/gpu/drm/apple/dcp-fabric-core.h').read_text()
+    enum = re.search(r'enum dcp_fabric_wiring \{.*?\n\};', core, re.S).group()
+    dpin_max = re.search(r'^#define DCP_FABRIC_DPIN_MAX\b.*$', core, re.M).group()
     fixture = (ROOT / 'tools/asahi/t6030-wiring/fixture.c').read_text()
-    code = fixture.replace('/* PRODUCTION_FUNCTIONS */', enum + '\n' + '\n'.join(bodies.values()))
+    code = fixture.replace('/* FABRIC_DEFINES */', dpin_max).replace(
+        '/* PRODUCTION_FUNCTIONS */', enum + '\n' + '\n'.join(bodies.values()))
     args.out.mkdir(parents=True, exist_ok=True)
     source, binary = args.out / 'production.c', args.out / 'production'
     source.write_text(code)

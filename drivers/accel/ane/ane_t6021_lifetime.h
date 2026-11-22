@@ -49,6 +49,7 @@
 #ifndef __ANE_T6021_LIFETIME_H__
 #define __ANE_T6021_LIFETIME_H__
 
+#include <asm/byteorder.h>
 #include <linux/errno.h>
 #include <linux/limits.h>
 #include <linux/sizes.h>
@@ -651,7 +652,28 @@ static inline void ane_t6021_progtab_count(const struct ane_t6021_progtab *t,
  * overtake it, so only the RUN clear is tried. If STOPPED is not seen
  * nothing is powered off, and the caller keeps the instance quarantined
  * with every mapping and its power claim.
+ *
+ * A job that hangs the engine leaves the core busy: RUN clear never brings
+ * STOPPED (halt returns ANE_T6021_ASC_BUSY). Only an unplanned stop may then
+ * use the contain step, which replaces the STOPPED proof with a power-off of
+ * the CPU and engine domains through the power-domain framework (children
+ * first, the PMGR state machine doing each transition, address translation
+ * kept on). It never asserts a reset: a power-state reset of the live CPU
+ * domain resets the whole SoC. The power cycle that follows still has to
+ * read every domain back off, and the cold CPU must read STOPPED again
+ * before the firmware boots.
  */
+#define ANE_T6021_ASC_BUSY	1	/* RUN clear, STOPPED never seen */
+
+/*
+ * Module parameters hung_stop and hung_settle_ms, shared by the T8112 and
+ * H16 paths of ane_t6021.ko: whether a hung job's engine is powered off and
+ * cold-booted (1) or kept quarantined until reboot (0), and the extra wait
+ * before that power-off.
+ */
+extern unsigned int ane_t6021_hung_stop;
+extern unsigned int ane_t6021_hung_settle_ms;
+
 enum ane_t6021_restart_stage {
 	ANE_T6021_RESTART_STOP,		/* failed before power removal */
 	ANE_T6021_RESTART_CYCLE,	/* failed in the power cycle */
@@ -663,6 +685,7 @@ struct ane_t6021_restart_ops {
 	int (*power_down)(void *ctx);	/* POWER_DOWN taken by the firmware */
 	int (*wait_idle)(void *ctx);	/* bounded wait for WFI */
 	int (*halt)(void *ctx);		/* clear RUN, require STOPPED */
+	int (*contain)(void *ctx);	/* optional: busy core, unplanned only */
 	int (*power_cycle)(void *ctx);	/* domains verified off, then on */
 	int (*boot)(void *ctx);		/* cold boot and handshake */
 };
@@ -682,7 +705,14 @@ static inline int ane_t6021_restart_stop(const struct ane_t6021_restart_ops *ops
 		if (ret)
 			return ret;
 	}
-	return ops->halt(ctx);
+	ret = ops->halt(ctx);
+	if (ret != ANE_T6021_ASC_BUSY)
+		return ret;
+	/* A planned stop of an idle instance that will not stop is not a hang. */
+	if (planned || !ops->contain)
+		return -ETIMEDOUT;
+	ret = ops->contain(ctx);
+	return ret == -EOPNOTSUPP ? -ETIMEDOUT : ret;
 }
 
 static inline int ane_t6021_restart_run(const struct ane_t6021_restart_ops *ops,
@@ -705,6 +735,41 @@ static inline int ane_t6021_restart_run(const struct ane_t6021_restart_ops *ops,
 		return ret;
 	*stage = ANE_T6021_RESTART_DONE;
 	return 0;
+}
+
+/*
+ * CH_PROPERTY_WRITE body: three little-endian words after the command
+ * header, on the command channel. The engine performance mode is one of
+ * these properties: macOS writes it with value 1 once at every firmware
+ * power-on, and with it the per-call overhead drops on the M2 (about 7 us
+ * per call, 5 to 10 us per MobileNet ring). 1 is the only value written.
+ */
+#define ANE_T6021_PROP_CHANNEL_OFF	0x08	/* channel the property belongs to */
+#define ANE_T6021_PROP_ID_OFF		0x0c	/* property id */
+#define ANE_T6021_PROP_VALUE_OFF	0x10	/* new value */
+#define ANE_T6021_PROP_WRITE_LEN	0x14	/* header + the three words */
+#define ANE_T6021_PROP_CHANNEL_ENGINE	0	/* the engine-wide channel */
+#define ANE_T6021_PROP_PERF_MODE	0x10aa	/* engine performance mode */
+#define ANE_T6021_PERF_MODE_ON		1
+
+/*
+ * Fill @cmd (at least ANE_T6021_PROP_WRITE_LEN bytes, the header left to the
+ * transport) with a property write and return its length.
+ */
+static inline size_t ane_t6021_prop_write(u8 *cmd, u32 channel, u32 prop,
+					  u32 value)
+{
+	*(__le32 *)(cmd + ANE_T6021_PROP_CHANNEL_OFF) = cpu_to_le32(channel);
+	*(__le32 *)(cmd + ANE_T6021_PROP_ID_OFF) = cpu_to_le32(prop);
+	*(__le32 *)(cmd + ANE_T6021_PROP_VALUE_OFF) = cpu_to_le32(value);
+	return ANE_T6021_PROP_WRITE_LEN;
+}
+
+static inline size_t ane_t6021_perf_mode_cmd(u8 *cmd)
+{
+	return ane_t6021_prop_write(cmd, ANE_T6021_PROP_CHANNEL_ENGINE,
+				    ANE_T6021_PROP_PERF_MODE,
+				    ANE_T6021_PERF_MODE_ON);
 }
 
 #endif /* __ANE_T6021_LIFETIME_H__ */

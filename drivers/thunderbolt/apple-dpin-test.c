@@ -360,6 +360,8 @@ static void apple_dpin_qualification_profiles(struct kunit *test)
 		{ "apple,t6031", &apple_dpin_m3, true, &apple_dpin_disabled },
 		{ "apple,t8132", &apple_dpin_m4, true, &apple_dpin_m4 },
 		{ "apple,t8132", &apple_dpin_m4, false, &apple_dpin_m4 },
+		{ "apple,t6050", &apple_dpin_m5, true, &apple_dpin_m5 },
+		{ "apple,t6050", &apple_dpin_m5, false, &apple_dpin_m5 },
 		{ "apple,unknown", &apple_dpin_m1, true, &apple_dpin_disabled },
 	};
 	unsigned int i;

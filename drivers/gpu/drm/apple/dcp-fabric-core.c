@@ -41,7 +41,7 @@ int dcp_fabric_tunnel_request(const struct dcp_fabric_port *ports,
 	const struct dcp_fabric_port *port;
 
 	*found = NULL;
-	if (!key || dpin > 1)
+	if (!key || dpin >= DCP_FABRIC_DPIN_MAX)
 		return -EINVAL;
 	for (port = ports; port; port = port->next) {
 		if (port->key != key)
@@ -186,7 +186,8 @@ dcp_fabric_free_route(const struct dcp_fabric_port *port,
 	for (route = port->routes; route; route = route->next) {
 		unsigned int score;
 
-		if (!dcp_fabric_available(route->pipeline, policy))
+		if (route->tunnel_only ||
+		    !dcp_fabric_available(route->pipeline, policy))
 			continue;
 		score = dcp_fabric_score(route->pipeline, policy);
 		if (score < best_score) {
@@ -194,7 +195,8 @@ dcp_fabric_free_route(const struct dcp_fabric_port *port,
 			best_score = score;
 		}
 	}
-	if (!last || !dcp_fabric_available(last->pipeline, policy))
+	if (!last || last->tunnel_only ||
+	    !dcp_fabric_available(last->pipeline, policy))
 		return best;
 	if (!policy->dual_stream && best &&
 	    best_score < dcp_fabric_score(last->pipeline, policy))
@@ -213,6 +215,17 @@ dcp_fabric_port_route(const struct dcp_fabric_port *port,
 		if (route->pipeline == pipeline)
 			return route;
 	return NULL;
+}
+
+/* Does a DP tunnel hold any of @port's owner slots? */
+static bool dcp_fabric_port_tunneled(const struct dcp_fabric_port *port)
+{
+	unsigned int i;
+
+	for (i = 0; i < DCP_FABRIC_DPIN_MAX; i++)
+		if (port->owner[i] && port->owner[i]->tunnel)
+			return true;
+	return false;
 }
 
 static void dcp_fabric_plan_pipeline(struct dcp_fabric_pipeline *pipeline,
@@ -242,10 +255,11 @@ static void dcp_fabric_plan_pipeline(struct dcp_fabric_pipeline *pipeline,
 			      BIT(pipeline->crtc_index)))
 				continue;
 			route = dcp_fabric_port_route(port, pipeline);
-			tunnel = stream || (port->owner[0] && port->owner[0]->tunnel) ||
+			tunnel = stream || dcp_fabric_port_tunneled(port) ||
 				 (port == arriving && dpin == 0);
 			if (!route || (tunnel &&
-				       (route->tunnel_clock_blocked & BIT(stream))))
+				       (route->tunnel_clock_blocked & BIT(stream))) ||
+			    (!tunnel && route->tunnel_only))
 				continue;
 			port->plan->target[stream] = route;
 			return;
@@ -288,11 +302,18 @@ void dcp_fabric_plan(struct dcp_fabric_pipeline *pipelines,
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_plan);
 
-/* 1 means an already handed, matching stream; zero admits allocation. */
+/*
+ * 1 means an already handed, matching stream; zero admits allocation.
+ * @per_dpin: DP IN 2 and 3 have owner slots of their own.
+ */
 int dcp_fabric_tunnel_slot(const struct dcp_fabric_port *port,
-			   unsigned int dpin)
+			   unsigned int dpin, bool per_dpin)
 {
-	const struct dcp_fabric_route *slot = port->owner[dpin];
+	const struct dcp_fabric_route *slot;
+
+	if (dpin >= DCP_FABRIC_DPIN_MAX)
+		return -EINVAL;
+	slot = port->owner[dcp_fabric_tunnel_owner(dpin, per_dpin)];
 
 	if (slot)
 		return slot->tunnel && slot->dpin == dpin ? 1 : -EADDRINUSE;
@@ -301,6 +322,25 @@ int dcp_fabric_tunnel_slot(const struct dcp_fabric_port *port,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_tunnel_slot);
+
+/*
+ * Whether a tunnel should take one of @port's tunnel-only routes before a
+ * route that can carry a DP alt mode display: once another of the pipelines
+ * it reaches drives a display. A DP alt mode display can never use a
+ * tunnel-only pipeline, so tunnels on every other one would leave it none
+ * while that one stays idle. The first display keeps the lowest pipeline.
+ */
+static bool dcp_fabric_tunnel_keeps_direct(const struct dcp_fabric_port *port)
+{
+	const struct dcp_fabric_route *route;
+	bool tunnel_only = false, owned = false;
+
+	for (route = port->routes; route; route = route->next) {
+		tunnel_only |= route->tunnel_only;
+		owned |= route->pipeline->owned;
+	}
+	return tunnel_only && owned;
+}
 
 struct dcp_fabric_route *
 dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
@@ -312,12 +352,14 @@ dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 	struct dcp_fabric_route *route, *best = NULL;
 	unsigned int best_score = UINT_MAX;
 	bool waiting = false, clock_blocked = false, clock_capable = false;
+	bool keep_direct;
 
-	if (dpin > 1) {
+	if (dpin >= DCP_FABRIC_DPIN_MAX) {
 		*error = -EINVAL;
 		return NULL;
 	}
 
+	keep_direct = dcp_fabric_tunnel_keeps_direct(port);
 	for (route = port->routes; route; route = route->next) {
 		const struct dcp_fabric_pipeline *pipeline = route->pipeline;
 		unsigned int score;
@@ -331,7 +373,7 @@ dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 		    !dcp_fabric_available(pipeline, policy))
 			continue;
 		if (!dcp_fabric_fits(pipeline, policy,
-				     port->candidate_crtcs[dpin],
+				     port->candidate_crtcs[dcp_fabric_dpin_slot(dpin)],
 				     connector_present))
 			continue;
 		if (pipeline->terminal) {
@@ -343,9 +385,13 @@ dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 			continue;
 		}
 		score = dcp_fabric_score(pipeline, policy);
-		if (policy->dual_stream && !dpin && !pipeline->has_fixed &&
+		if (policy->dual_stream && !dcp_fabric_dpin_slot(dpin) &&
+		    !pipeline->has_fixed &&
 		    score < UINT_MAX - 100)
 			score += 100;
+		/* below the hybrid and stream penalties, above the CRTC order (indices < 50) */
+		if (keep_direct && !route->tunnel_only && score < UINT_MAX - 100)
+			score += 50;
 		if (score < best_score) {
 			best = route;
 			best_score = score;
@@ -384,11 +430,15 @@ dcp_fabric_follow(const struct dcp_fabric_route *from,
 		return DCP_FABRIC_FOLLOW_REFUSE;
 	if (from == to)
 		return DCP_FABRIC_FOLLOW_STAY;
-	if ((from->tunnel && (from->dpin > 1 ||
+	if ((from->tunnel && (from->dpin >= DCP_FABRIC_DPIN_MAX ||
 		(to->tunnel_clock_blocked & BIT(from->dpin)))) ||
 	    (holder && holder->tunnel && holder_back &&
-		(holder->dpin > 1 ||
+		(holder->dpin >= DCP_FABRIC_DPIN_MAX ||
 		 (holder_back->tunnel_clock_blocked & BIT(holder->dpin)))))
+		return DCP_FABRIC_FOLLOW_REFUSE;
+	/* A direct stream never moves onto a tunnel-only route. */
+	if ((!from->tunnel && to->tunnel_only) ||
+	    (holder && !holder->tunnel && holder_back && holder_back->tunnel_only))
 		return DCP_FABRIC_FOLLOW_REFUSE;
 	pipeline = to->pipeline;
 	if (!pipeline->bound || pipeline->fixed_busy || pipeline->terminal ||
@@ -529,6 +579,14 @@ bool dcp_fabric_t6030_link(bool tunnel, bool has_xbar, bool t6030_dpin)
 	return tunnel && has_xbar && t6030_dpin;
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_t6030_link);
+
+bool dcp_fabric_merged_fits(unsigned int displays, unsigned int extra,
+			    unsigned int engines)
+{
+	return displays && extra && displays < engines &&
+	       extra < engines - displays;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_merged_fits);
 
 MODULE_DESCRIPTION("Apple display fabric decisions");
 MODULE_LICENSE("Dual MIT/GPL");

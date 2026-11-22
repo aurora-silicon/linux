@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * SMC sensors and the fan of the MacBook Pro (14-inch, M5, 2025), J704.
+ */
+
+#include "t8142-hwmon.dtsi"
+#include "hwmon-fan.dtsi"
+
+&smc_hwmon {
+	fan-F0Ac {
+		/* This SMC names the fan mode key in lower case. */
+		apple,fan-mode = "F0md";
+		apple,fan-manual-control;
+	};
+};

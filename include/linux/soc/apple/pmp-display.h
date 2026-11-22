@@ -31,12 +31,17 @@ void apple_pmp_display_fail(struct apple_pmp_display *display, int error);
 struct apple_pmp_display *apple_pmp_display_bound_owner(struct device *dev);
 
 /* J713 votes share the existing PMP owner's untagged request stream.
- * Prepare is probe-only; accepted DISP/AGX votes and supplier links persist
- * until reboot.
+ * Prepare is probe-only; supplier links persist until reboot, and so do
+ * accepted votes, except that the DCP releases its DISP vote while it has
+ * powered the display domains down (put) and takes it again (get). Before
+ * that it asks, changing nothing, whether the vote can be released now and
+ * taken again later (check_release).
  */
 int apple_pmp_j713_display_prepare(struct device *consumer);
 int apple_pmp_j713_display_get(struct device *consumer);
+int apple_pmp_j713_display_put(struct device *consumer);
 int apple_pmp_j713_display_check(struct device *consumer);
+int apple_pmp_j713_display_check_release(struct device *consumer);
 int apple_pmp_j713_gpu_prepare(struct device *consumer);
 int apple_pmp_j713_gpu_get(struct device *consumer);
 int apple_pmp_j713_gpu_check(struct device *consumer);

@@ -5,8 +5,11 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
+# python3 -I leaves the script directory off sys.path; run.py sits next to this file.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run import declaration, function, source
 
 
@@ -18,10 +21,14 @@ def main():
     code += '\ntypedef uintptr_t phys_addr_t;\n'
     code += '#define HZ 1000\n#define time_before(a, b) ((long)((a) - (b)) < 0)\n'
     code += source((src / 'ave-recovery.h').read_text())
-    for name in ('AVE_MAX_SLOTS', 'AVE_MAX_REFS', 'AVE_TILE_BUFS', 'AVE_MAX_SESSIONS'):
+    for name in ('AVE_MAX_SLOTS', 'AVE_MAX_REFS', 'AVE_TILE_BUFS',
+                 'AVE_ENTROPY_SETS', 'AVE_NEIGHBOUR_SETS', 'AVE_MAX_SESSIONS',
+                 'AVE_MCTF_BUFS', 'AVE_MCTF_IN_BUFS', 'AVE_MCTF_OUT_BUFS',
+                 'AVE_MCTF_POOL_LENT', 'AVE_MCTF_POOL_READY'):
         code += re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)[0] + '\n'
     code += source((src / 'ave-regs.h').read_text())
     code += 'struct vb2_v4l2_buffer;\n'
+    code += source((src / 'ave-cmp420.h').read_text())
     for name in ('ave_codec', 'ave_buf', 'ave_fw_segment', 'ave_ring', 'ave_fw_state',
                  'ave_coproc_regs', 'ave_variant', 'ave_params', 'ave_slot', 'ave_session'):
         code += declaration(header, name)
@@ -35,9 +42,9 @@ def main():
     code += source((src / 'ave-vb2.c').read_text())
     code += (here / 'command-boundary.h').read_text()
     groups = {
-        'ave-fw.c': ('ave_fw_vcbar', 'ave_fw_lost', 'ave_fw_mark_broken', 'ave_fw_halt', 'ave_fw_shutdown',
+        'ave-fw.c': ('ave_fw_vcbar', 'ave_fw_lost', 'ave_fw_mark_broken', 'ave_fw_halt', 'ave_fw_stop_hung', 'ave_fw_shutdown',
                      'ave_fw_runtime_suspend', 'ave_fw_prepare_restart', 'ave_fw_restore_data'),
-        'ave-sess.c': ('ave_sess_free_bufs', 'ave_sess_destroy', 'ave_sess_reap'),
+        'ave-sess.c': ('ave_mctf_pool_crc', 'ave_mctf_pool_check', 'ave_mctf_pool_return', 'ave_sess_domain_unsafe', 'ave_sess_free_bufs', 'ave_sess_destroy', 'ave_sess_reap'),
         'ave-v4l2.c': ('ave_return_bufs', 'ave_buf_queue', 'ave_session_index',
                        'ave_session_count', 'ave_session_close', 'ave_session_free',
                        'ave_session_end', 'ave_stop_streaming',

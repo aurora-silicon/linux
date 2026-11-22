@@ -67,7 +67,7 @@ impl kernel::fmt::Display for DeviceStatus {
 pub(crate) const HEADER_WORDS: usize = 7;
 pub(crate) const HEADER_LEN: usize = HEADER_WORDS * 4;
 
-const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 1;
 
 pub(crate) const MAX_TRANSACTION: u32 = 0x4B000;
 

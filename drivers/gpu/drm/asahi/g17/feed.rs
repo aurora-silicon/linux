@@ -9,6 +9,9 @@
 //! Policy creation and the initial snapshot take the policy rwsem before the
 //! requests mutex. Removal callbacks and the worker take only requests;
 //! notifier unregistration joins callbacks without holding that mutex.
+//! M5 requests full CPU capacity only while refill pressure keeps the detector
+//! active. Sustained demand can renew its deadline indefinitely; withdrawal
+//! occurs on a later worker poll, not at an exact eight-millisecond boundary.
 
 use crate::hw::t8140::qos::CLOCK_HZ;
 use core::{
@@ -16,8 +19,9 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use kernel::{
+    new_spinlock,
     prelude::*,
-    sync::Arc,
+    sync::{Arc, SpinLock},
     time::{delay::fsleep, ClockSource, Delta, Monotonic},
 };
 
@@ -26,7 +30,14 @@ use core::ptr;
 #[cfg(CONFIG_CPU_FREQ)]
 use kernel::{bindings, new_mutex, sync::Mutex, types::Opaque};
 
+unsafe extern "C" {
+    /// The system time base in ticks of `hz`, the clock the firmware stamps command execution
+    /// with.
+    fn asahi_g17_firmware_clock(hz: u64) -> u64;
+}
+
 const MAX_REFILL_TICKS: u64 = CLOCK_HZ / 500;
+const _: () = assert!(CLOCK_HZ == crate::hw::t8140::resources::COMMAND_TIMESTAMP_HZ);
 const STREAK_ON: u32 = 8;
 const STREAK_MAX: u32 = 64;
 const LINGER_NS: u64 = 8_000_000;
@@ -76,7 +87,7 @@ impl Detector {
     }
 
     fn note(&self, start: u64, end: u64, now: u64) {
-        if end <= start {
+        if start == 0 || end <= start {
             return;
         }
         let previous = self.last_end.fetch_max(end, Ordering::AcqRel);
@@ -141,6 +152,8 @@ struct Requests {
     policies: [*mut bindings::cpufreq_policy; MAX_POLICIES],
     maxima: [u32; MAX_POLICIES],
     applied: [u32; MAX_POLICIES],
+    /// Full CPU capacity for M5 refill pressure; other profiles retain their floor.
+    floor_percent: u64,
 }
 
 // SAFETY: Each nonnull policy owns a kobject reference. The device requests
@@ -150,12 +163,21 @@ unsafe impl Send for Requests {}
 
 #[cfg(CONFIG_CPU_FREQ)]
 impl Requests {
-    fn new() -> Self {
+    fn new(m5: bool) -> Self {
         Self {
             requests: Opaque::zeroed(),
             policies: [ptr::null_mut(); MAX_POLICIES],
             maxima: [0; MAX_POLICIES],
             applied: [0; MAX_POLICIES],
+            floor_percent: if m5 { 100 } else { FLOOR_PERCENT },
+        }
+    }
+
+    fn target_floor(maximum: u32, floor_percent: u64, enabled: bool) -> u32 {
+        if enabled {
+            (u64::from(maximum) * floor_percent / 100) as u32
+        } else {
+            bindings::FREQ_QOS_MIN_DEFAULT_VALUE as u32
         }
     }
 
@@ -206,11 +228,7 @@ impl Requests {
             if this.policies[index].is_null() {
                 continue;
             }
-            let value = if enabled {
-                (u64::from(this.maxima[index]) * FLOOR_PERCENT / 100) as u32
-            } else {
-                bindings::FREQ_QOS_MIN_DEFAULT_VALUE
-            };
+            let value = Self::target_floor(this.maxima[index], *this.floor_percent, enabled);
             if this.applied[index] != value {
                 // SAFETY: This slot is registered, pinned and exclusively locked;
                 // the policy reference keeps its constraints alive through REMOVE.
@@ -284,6 +302,10 @@ unsafe impl Sync for PolicyNotifier {}
 #[pin_data(PinnedDrop)]
 pub(crate) struct Feed {
     detector: Detector,
+    /// Every command's execution per client, for the performance effort
+    /// ([`super::power::BusyRuns`]).
+    #[pin]
+    runs: SpinLock<super::power::BusyRuns>,
     #[cfg(CONFIG_CPU_FREQ)]
     #[pin]
     requests: Mutex<Requests>,
@@ -296,12 +318,15 @@ pub(crate) struct Feed {
 }
 
 impl Feed {
-    pub(crate) fn new() -> Result<Arc<Self>> {
+    pub(crate) fn new(m5: bool) -> Result<Arc<Self>> {
+        #[cfg(not(CONFIG_CPU_FREQ))]
+        let _ = m5;
         let feed = Arc::pin_init(
             pin_init!(Self {
                 detector: Detector::new(),
+                runs <- new_spinlock!(super::power::BusyRuns::new(), "G17 busy runs"),
                 #[cfg(CONFIG_CPU_FREQ)]
-                requests <- new_mutex!(Requests::new(), "G17 CPU feed"),
+                requests <- new_mutex!(Requests::new(m5), "G17 CPU feed"),
                 #[cfg(CONFIG_CPU_FREQ)]
                 notifier <- pin_init!(PolicyNotifier {
                     block: Opaque::new(bindings::notifier_block {
@@ -422,10 +447,35 @@ impl Feed {
         Monotonic::ktime_get() as u64
     }
 
+    /// Firmware execution intervals in the device's 24 MHz timestamp domain.
+    /// Missing, unexecuted and wrapped intervals must not affect the detector.
     pub(crate) fn note_pass(&self, start: u64, end: u64) {
         if cfg!(CONFIG_CPU_FREQ) {
             self.detector.note(start, end, Self::now());
         }
+    }
+
+    /// A command of `client` (its context id) executed from `start` to `end`, in the firmware
+    /// timestamp domain, for the performance effort's busy runs. A gap of the firmware's idle
+    /// power-off delay between the client's commands ends its run.
+    pub(crate) fn note_work(&self, client: u32, start: u64, end: u64) {
+        let idle_ticks = u64::from(super::power::FIRMWARE_IDLE_OFF_MS) * (CLOCK_HZ / 1000);
+        self.runs.lock().note(client, start, end, idle_ticks);
+    }
+
+    /// Whether a client that is still running has kept the GPU running without going idle for
+    /// longer than the effort is held after work stops ([`super::power::BusyRuns`]).
+    pub(crate) fn busy_run(&self) -> bool {
+        let hold_ticks = super::power::IDLE_HOLD_NS * CLOCK_HZ / 1_000_000_000;
+        let idle_ticks = u64::from(super::power::FIRMWARE_IDLE_OFF_MS) * (CLOCK_HZ / 1000);
+        // SAFETY: Reads the system counter; plain value in and out.
+        let now = unsafe { asahi_g17_firmware_clock(CLOCK_HZ) };
+        self.runs.lock().bound(now, hold_ticks, idle_ticks)
+    }
+
+    /// The effort was taken down after the hold: every client's next command begins a new run.
+    pub(crate) fn end_busy_run(&self) {
+        self.runs.lock().end();
     }
 
     /// Whether the GPU itself is the bottleneck: passes follow each other with refill gaps

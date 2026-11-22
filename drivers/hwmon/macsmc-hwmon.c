@@ -48,25 +48,6 @@
 #define FLT_MANT_MASK	GENMASK(22, 0)
 #define FLT_SIGN_MASK	BIT(31)
 
-/*
- * Fans whose device tree node has apple,fan-manual-control take a target speed
- * from userspace. This parameter, kept for compatibility, allows it for every
- * fan with a mode key, whatever the device tree says.
- */
-static bool fan_control;
-module_param_unsafe(fan_control, bool, 0644);
-MODULE_PARM_DESC(fan_control,
-		 "Allow manual fan speeds on every fan with a mode key, also where the device tree does not (default: the device tree decides)");
-
-static bool macsmc_hwmon_is_m3(void)
-{
-	return of_machine_is_compatible("apple,t6030") ||
-	       of_machine_is_compatible("apple,t6031") ||
-	       of_machine_is_compatible("apple,t6032") ||
-	       of_machine_is_compatible("apple,t6034") ||
-	       of_machine_is_compatible("apple,t8122");
-}
-
 struct macsmc_hwmon_sensor {
 	struct apple_smc_key_info info;
 	smc_key macsmc_key;
@@ -74,6 +55,9 @@ struct macsmc_hwmon_sensor {
 	u32 attrs;
 	/* Part of the SoC die temperature zone. */
 	bool die;
+	/* Readings below no_data_below are powered-down placeholders, not temperatures. */
+	bool has_no_data_below;
+	s32 no_data_below;
 };
 
 struct macsmc_hwmon_fan {
@@ -87,6 +71,8 @@ struct macsmc_hwmon_fan {
 	bool manual;
 	/* The device tree allows a manual speed from userspace. */
 	bool manual_control;
+	/* Manual for a kernel thermal policy (macsmc_hwmon_fans_request()). */
+	bool kernel;
 };
 
 struct macsmc_hwmon_sensors {
@@ -454,6 +440,7 @@ static int macsmc_hwmon_fan_auto(struct macsmc_hwmon *hwmon,
 
 	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_AUTO);
 	fan->manual = false;
+	fan->kernel = false;
 	hwmon->fan.manual--;
 
 	if (hwmon->fan.unlocked && !hwmon->fan.manual) {
@@ -542,10 +529,13 @@ relock:
 	return ret;
 }
 
-/* Whether userspace may set this fan's speed. */
+/*
+ * Whether userspace may set this fan's speed: only fans whose device tree
+ * node has apple,fan-manual-control. On other fans fanX_target is read-only.
+ */
 static bool macsmc_hwmon_fan_user_control(const struct macsmc_hwmon_fan *fan)
 {
-	return fan->mode.macsmc_key && (fan->manual_control || fan_control);
+	return fan->mode.macsmc_key && fan->manual_control;
 }
 
 static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long val)
@@ -575,6 +565,8 @@ static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long va
 	if (!ret)
 		ret = macsmc_hwmon_fan_manual(hwmon, fan);
 	if (!ret) {
+		/* Userspace takes the fan over from a kernel policy. */
+		fan->kernel = false;
 		ret = macsmc_hwmon_write_key(hwmon->smc, &fan->set, clamp(val, min, max));
 		if (ret >= 0)
 			return 0;
@@ -584,10 +576,119 @@ static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long va
 	return ret;
 }
 
+/**
+ * macsmc_hwmon_fans_request() - set the fans for a kernel thermal policy
+ * @dev: the bound macsmc-hwmon device; the caller holds its device lock
+ * @permille: each fan's target as a share of its minimum-to-maximum range;
+ *	0 hands the fans this interface set back to the SMC
+ * @min_step_rpm: a fan already set by this interface whose target is closer
+ *	than this to the new one keeps its target
+ *
+ * The fans go through the same manual mode as a userspace request, so the
+ * mode key has one owner: fans userspace holds are left alone, and every fan
+ * returns to the SMC at suspend, shutdown and unbind. Only fans whose device
+ * tree node names their mode, target, minimum and maximum keys take part.
+ *
+ * Return: the first such fan's target in rpm (0 once handed back), -ENODEV
+ * without such a fan, -EBUSY while stopped, or the first error.
+ */
+int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
+			      unsigned int min_step_rpm)
+{
+	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
+	long first = -ENODEV;
+	int ret = 0;
+	u32 i;
+
+	if (!hwmon)
+		return -ENODEV;
+	permille = min(permille, 1000U);
+
+	guard(mutex)(&hwmon->fan.lock);
+
+	if (permille && hwmon->fan.stopped)
+		return -EBUSY;
+
+	for (i = 0; i < hwmon->fan.count; i++) {
+		struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[i];
+		long min, max, now, target;
+		int err;
+
+		if (!fan->mode.macsmc_key ||
+		    (fan->attrs & (HWMON_F_TARGET | HWMON_F_MIN | HWMON_F_MAX)) !=
+		    (HWMON_F_TARGET | HWMON_F_MIN | HWMON_F_MAX))
+			continue;
+		if (fan->manual && !fan->kernel)
+			continue;
+
+		if (!permille) {
+			if (first < 0)
+				first = 0;
+			err = macsmc_hwmon_fan_auto(hwmon, fan);
+			if (err && !ret)
+				ret = err;
+			continue;
+		}
+
+		err = macsmc_hwmon_read_key(hwmon->smc, &fan->min, 1, &min);
+		if (!err)
+			err = macsmc_hwmon_read_key(hwmon->smc, &fan->max, 1, &max);
+		if (!err && (min <= 0 || max < min))
+			err = -EIO;
+		if (err) {
+			dev_warn_ratelimited(hwmon->dev, "%s: no fan range for a kernel request (%d)\n",
+					     fan->label, err);
+			if (!ret)
+				ret = err;
+			continue;
+		}
+		target = min + (max - min) * permille / 1000;
+		if (first < 0)
+			first = target;
+
+		if (fan->kernel &&
+		    !macsmc_hwmon_read_key(hwmon->smc, &fan->set, 1, &now) &&
+		    abs(now - target) < (long)min_step_rpm)
+			continue;
+
+		err = macsmc_hwmon_fan_manual(hwmon, fan);
+		if (!err) {
+			fan->kernel = true;
+			err = macsmc_hwmon_write_key(hwmon->smc, &fan->set, target);
+			if (err > 0)
+				err = 0;
+		}
+		if (err) {
+			/* -EOPNOTSUPP: the fan is in system mode and this SMC has no unlock key. */
+			dev_warn_ratelimited(hwmon->dev, "%s: kernel fan request refused (%d)\n",
+					     fan->label, err);
+			macsmc_hwmon_fan_auto(hwmon, fan);
+			if (!ret)
+				ret = err;
+		}
+	}
+
+	return ret ? ret : first;
+}
+EXPORT_SYMBOL_GPL(macsmc_hwmon_fans_request);
+
 static int macsmc_hwmon_write_fan(struct device *dev, u32 attr, int channel,
 				  long val)
 {
-	return macsmc_hwmon_set_fan(dev_get_drvdata(dev), channel, val);
+	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
+	int ret;
+
+	/*
+	 * Unlocking or releasing system fan control polls the SMC for up to
+	 * MACSMC_FAN_MODE_TIMEOUT_MS. Drop the chip-wide hwmon lock so thermal
+	 * zones and sensor reads are not stalled while waiting on the SMC;
+	 * hwmon->fan.lock and smc->mutex serialize fan state and SMC accesses.
+	 */
+	hwmon_unlock(dev);
+	ret = macsmc_hwmon_set_fan(hwmon, channel, val);
+	hwmon_lock(dev);
+
+	return ret;
 }
 
 /* Hand every manual fan back to the firmware. */
@@ -616,10 +717,15 @@ static int macsmc_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 	int ret = 0;
 
 	switch (type) {
-	case hwmon_temp:
-		ret = macsmc_hwmon_read_key(hwmon->smc,
-					    &hwmon->temp.sensors[channel], 1000, val);
+	case hwmon_temp: {
+		struct macsmc_hwmon_sensor *sensor = &hwmon->temp.sensors[channel];
+
+		ret = macsmc_hwmon_read_key(hwmon->smc, sensor, 1000, val);
+		/* A powered-down sensor's placeholder is not a temperature. */
+		if (!ret && sensor->has_no_data_below && *val < sensor->no_data_below)
+			ret = -ENODATA;
 		break;
+	}
 	case hwmon_in:
 		ret = macsmc_hwmon_read_key(hwmon->smc,
 					    &hwmon->volt.sensors[channel], 1000, val);
@@ -754,22 +860,25 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
 	if (ret)
 		return ret;
 
-	if (macsmc_hwmon_is_m3()) {
-		if (!(sensor->info.flags & APPLE_SMC_READABLE))
-			return -EACCES;
+	/*
+	 * macsmc_hwmon_read_key() decodes only these two types, so a key of any
+	 * other type, or one the SMC does not let us read, could only ever
+	 * return an error: do not set up a channel for it.
+	 */
+	if (!(sensor->info.flags & APPLE_SMC_READABLE))
+		return -EACCES;
 
-		switch (sensor->info.type_code) {
-		case __SMC_KEY('f', 'l', 't', ' '):
-			if (sensor->info.size != sizeof(u32))
-				return -EINVAL;
-			break;
-		case __SMC_KEY('i', 'o', 'f', 't'):
-			if (sensor->info.size != sizeof(u64))
-				return -EINVAL;
-			break;
-		default:
-			return -EOPNOTSUPP;
-		}
+	switch (sensor->info.type_code) {
+	case __SMC_KEY('f', 'l', 't', ' '):
+		if (sensor->info.size != sizeof(u32))
+			return -EINVAL;
+		break;
+	case __SMC_KEY('i', 'o', 'f', 't'):
+		if (sensor->info.size != sizeof(u64))
+			return -EINVAL;
+		break;
+	default:
+		return -EOPNOTSUPP;
 	}
 
 	ret = of_property_read_string(sensor_node, "label", &label);
@@ -778,6 +887,10 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
 	else
 		strscpy_pad(sensor->label, label, sizeof(sensor->label));
 
+	sensor->has_no_data_below =
+		!of_property_read_s32(sensor_node, "apple,no-data-below-millicelsius",
+				      &sensor->no_data_below);
+
 	return 0;
 }
 
@@ -785,6 +898,18 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
  * A SoC die temperature sensor: a readable float temperature key, labelled
  * "SoC die <key>".
  */
+/* The temperature channel set up so far for @key, if any. */
+static struct macsmc_hwmon_sensor *macsmc_hwmon_find_temp(struct macsmc_hwmon *hwmon,
+							  smc_key key)
+{
+	u32 i;
+
+	for (i = 0; i < hwmon->temp.count; i++)
+		if (hwmon->temp.sensors[i].macsmc_key == key)
+			return &hwmon->temp.sensors[i];
+	return NULL;
+}
+
 static int macsmc_hwmon_create_die_sensor(struct macsmc_hwmon *hwmon, const char *key,
 					  struct macsmc_hwmon_sensor *sensor)
 {
@@ -889,6 +1014,9 @@ static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
 	if (!smc->key_count || smc->key_count > U16_MAX)
 		return -EINVAL;
 
+	ret = of_property_count_strings(hwmon->dev->of_node, "apple,soc-die-keys");
+	hwmon->die_listed = ret > 0 ? ret : 0;
+
 	hwmon->temp.sensors = devm_kcalloc(hwmon->dev, smc->key_count,
 					   sizeof(*sensor), GFP_KERNEL);
 	if (!hwmon->temp.sensors)
@@ -922,6 +1050,12 @@ static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
 		/* Key identity only: do not invent locations or calibration. */
 		snprintf(sensor->label, sizeof(sensor->label), "%c%c%c%c",
 			 key >> 24, (key >> 16) & 0xff, (key >> 8) & 0xff, key & 0xff);
+		/* A listed SoC die key keeps its discovered channel and joins the die zone. */
+		if (of_property_match_string(hwmon->dev->of_node, "apple,soc-die-keys",
+					     sensor->label) >= 0) {
+			sensor->die = true;
+			hwmon->die_count++;
+		}
 	}
 
 	return 0;
@@ -1105,7 +1239,11 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 	for_each_child_of_node_with_prefix(hwmon_node, key_node, "temperature-") {
 		n_temperature++;
 	}
-	n_temperature += n_die_keys;
+	/* With discovery, listed die keys mark discovered channels instead (see there). */
+	if (!of_property_read_bool(hwmon_node, "apple,discover-temperatures"))
+		n_temperature += n_die_keys;
+	else
+		n_die_keys = 0;
 
 	if (n_temperature) {
 		hwmon->temp.sensors = devm_kcalloc(hwmon->dev, n_temperature,
@@ -1141,6 +1279,19 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 				continue;
 			}
 			hwmon->die_listed++;
+			/*
+			 * A key whose temperature node has a no-data threshold
+			 * joins the zone through that channel instead of a
+			 * second channel without the threshold.
+			 */
+			sensor = macsmc_hwmon_find_temp(hwmon, _SMC_KEY(key));
+			if (sensor && sensor->has_no_data_below) {
+				if (!sensor->die) {
+					sensor->die = true;
+					hwmon->die_count++;
+				}
+				continue;
+			}
 			sensor = &hwmon->temp.sensors[hwmon->temp.count];
 			if (!macsmc_hwmon_create_die_sensor(hwmon, key, sensor)) {
 				hwmon->die_count++;
@@ -1198,16 +1349,16 @@ static void macsmc_hwmon_populate_fan_configs(u32 *configs, const struct macsmc_
  * the zone up by name). It has no trip points and is not polled; each read
  * queries every SoC die sensor. A read fails if any of them cannot be read or
  * reads outside -40..150 degrees Celsius, so users never act on a partial or
- * implausible view.
+ * implausible view. A sensor below its no-data threshold is powered down and
+ * left out.
  */
 #if IS_ENABLED(CONFIG_THERMAL)
 #define MACSMC_SOC_DIE_ZONE	"macsmc_soc_die"
 #define MACSMC_DIE_MIN_MC	-40000
 #define MACSMC_DIE_MAX_MC	150000
 
-static int macsmc_hwmon_die_get_temp(struct thermal_zone_device *tz, int *temp)
+static int macsmc_hwmon_die_hottest(struct macsmc_hwmon *hwmon, int *temp)
 {
-	struct macsmc_hwmon *hwmon = thermal_zone_device_priv(tz);
 	bool found = false;
 	long hottest = 0, value;
 	u32 i;
@@ -1221,6 +1372,9 @@ static int macsmc_hwmon_die_get_temp(struct thermal_zone_device *tz, int *temp)
 		ret = macsmc_hwmon_read_key(hwmon->smc, sensor, 1000, &value);
 		if (ret)
 			return ret;
+		/* A powered-down sensor (a GPU key while the GPU is off) has no say. */
+		if (sensor->has_no_data_below && value < sensor->no_data_below)
+			continue;
 		if (value < MACSMC_DIE_MIN_MC || value > MACSMC_DIE_MAX_MC)
 			return -ERANGE;
 		if (!found || value > hottest)
@@ -1232,6 +1386,11 @@ static int macsmc_hwmon_die_get_temp(struct thermal_zone_device *tz, int *temp)
 
 	*temp = hottest;
 	return 0;
+}
+
+static int macsmc_hwmon_die_get_temp(struct thermal_zone_device *tz, int *temp)
+{
+	return macsmc_hwmon_die_hottest(thermal_zone_device_priv(tz), temp);
 }
 
 static const struct thermal_zone_device_ops macsmc_hwmon_die_ops = {
@@ -1521,8 +1680,7 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 		return dev_err_probe(hwmon->dev, PTR_ERR(hwmon->hwmon_dev),
 				     "Probing SMC hwmon device failed\n");
 
-	if (macsmc_hwmon_is_m3())
-		macsmc_hwmon_debugfs_init(hwmon);
+	macsmc_hwmon_debugfs_init(hwmon);
 
 	ret = macsmc_hwmon_die_register(hwmon);
 	if (ret)

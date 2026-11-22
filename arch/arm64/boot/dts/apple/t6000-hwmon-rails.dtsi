@@ -1,0 +1,480 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T6000 rail voltages published by the SMC.
+ *
+ * The three CLVR SPMI buses (clvr-spmi0-2) connect the SMC to the cluster,
+ * GPU and SoC voltage regulators. Linux leaves those buses to the SMC and
+ * reads the SMC's VCxy keys instead (x = bus + 1, y = regulator output).
+ * With the other clusters held at their lowest step, one cluster under load
+ * moves only its own keys:
+ *   P0 cluster (cpu2-5): VC12 566-906 mV, VC13 768-1058 mV
+ *   P1 cluster (cpu6-9): VC10 571-906 mV, VC11 770-1060 mV
+ *   GPU: VC20-VC23, 0 mV while power-gated, 700-800 mV under load
+ *   SoC (clvr-spmi2): VC30/VC31 stay flat, VC32/VC33 rise with GPU load
+ * The E cluster (cpu0-1) is fed by the main PMU: VP0b 547-834 mV and
+ * VP2b 768-924 mV; their currents and powers (IP0b/PP0b, IP2b/PP2b)
+ * follow E-cluster load.
+ *
+ * The SMC also samples the other main PMU outputs (VPxy/IPxy/PPxy) and a
+ * second regulator family (VRxy/IRxy/PRxy) whose consumers are not mapped;
+ * they are labelled "PMU <key>" and "Rail <key>". Outputs that read 0 in
+ * every state (unpopulated or unsensed) are left out, as are their currents
+ * and powers.
+ */
+
+&smc_hwmon {
+	voltage-VC10 {
+		apple,key-id = "VC10";
+		label = "P1-cluster VC10";
+	};
+
+	voltage-VC11 {
+		apple,key-id = "VC11";
+		label = "P1-cluster VC11";
+	};
+
+	voltage-VC12 {
+		apple,key-id = "VC12";
+		label = "P0-cluster VC12";
+	};
+
+	voltage-VC13 {
+		apple,key-id = "VC13";
+		label = "P0-cluster VC13";
+	};
+
+	voltage-VC20 {
+		apple,key-id = "VC20";
+		label = "GPU VC20";
+	};
+
+	voltage-VC21 {
+		apple,key-id = "VC21";
+		label = "GPU VC21";
+	};
+
+	voltage-VC22 {
+		apple,key-id = "VC22";
+		label = "GPU VC22";
+	};
+
+	voltage-VC23 {
+		apple,key-id = "VC23";
+		label = "GPU VC23";
+	};
+
+	voltage-VC30 {
+		apple,key-id = "VC30";
+		label = "SoC VC30";
+	};
+
+	voltage-VC31 {
+		apple,key-id = "VC31";
+		label = "SoC VC31";
+	};
+
+	voltage-VC32 {
+		apple,key-id = "VC32";
+		label = "SoC VC32";
+	};
+
+	voltage-VC33 {
+		apple,key-id = "VC33";
+		label = "SoC VC33";
+	};
+
+	voltage-VP0b {
+		apple,key-id = "VP0b";
+		label = "E-cluster VP0b";
+	};
+
+	voltage-VP2b {
+		apple,key-id = "VP2b";
+		label = "E-cluster VP2b";
+	};
+
+	voltage-VP0s {
+		apple,key-id = "VP0s";
+		label = "PMU VP0s";
+	};
+
+	voltage-VP1b {
+		apple,key-id = "VP1b";
+		label = "PMU VP1b";
+	};
+
+	voltage-VP1l {
+		apple,key-id = "VP1l";
+		label = "PMU VP1l";
+	};
+
+	voltage-VP2l {
+		apple,key-id = "VP2l";
+		label = "PMU VP2l";
+	};
+
+	voltage-VP3b {
+		apple,key-id = "VP3b";
+		label = "PMU VP3b";
+	};
+
+	voltage-VP4b {
+		apple,key-id = "VP4b";
+		label = "PMU VP4b";
+	};
+
+	voltage-VP5b {
+		apple,key-id = "VP5b";
+		label = "PMU VP5b";
+	};
+
+	voltage-VP5l {
+		apple,key-id = "VP5l";
+		label = "PMU VP5l";
+	};
+
+	voltage-VP6b {
+		apple,key-id = "VP6b";
+		label = "PMU VP6b";
+	};
+
+	voltage-VP7b {
+		apple,key-id = "VP7b";
+		label = "PMU VP7b";
+	};
+
+	voltage-VP8b {
+		apple,key-id = "VP8b";
+		label = "PMU VP8b";
+	};
+
+	voltage-VP9b {
+		apple,key-id = "VP9b";
+		label = "PMU VP9b";
+	};
+
+	voltage-VPab {
+		apple,key-id = "VPab";
+		label = "PMU VPab";
+	};
+
+	voltage-VR0b {
+		apple,key-id = "VR0b";
+		label = "Rail VR0b";
+	};
+
+	voltage-VR0l {
+		apple,key-id = "VR0l";
+		label = "Rail VR0l";
+	};
+
+	voltage-VR0s {
+		apple,key-id = "VR0s";
+		label = "Rail VR0s";
+	};
+
+	voltage-VR1b {
+		apple,key-id = "VR1b";
+		label = "Rail VR1b";
+	};
+
+	voltage-VR2b {
+		apple,key-id = "VR2b";
+		label = "Rail VR2b";
+	};
+
+	voltage-VR3b {
+		apple,key-id = "VR3b";
+		label = "Rail VR3b";
+	};
+
+	voltage-VR4b {
+		apple,key-id = "VR4b";
+		label = "Rail VR4b";
+	};
+
+	voltage-VR5b {
+		apple,key-id = "VR5b";
+		label = "Rail VR5b";
+	};
+
+	voltage-VR6b {
+		apple,key-id = "VR6b";
+		label = "Rail VR6b";
+	};
+
+	voltage-VR8b {
+		apple,key-id = "VR8b";
+		label = "Rail VR8b";
+	};
+
+	voltage-VR9b {
+		apple,key-id = "VR9b";
+		label = "Rail VR9b";
+	};
+
+	voltage-VRab {
+		apple,key-id = "VRab";
+		label = "Rail VRab";
+	};
+
+	current-IP0b {
+		apple,key-id = "IP0b";
+		label = "E-cluster IP0b";
+	};
+
+	current-IP0s {
+		apple,key-id = "IP0s";
+		label = "PMU IP0s";
+	};
+
+	current-IP1l {
+		apple,key-id = "IP1l";
+		label = "PMU IP1l";
+	};
+
+	current-IP2b {
+		apple,key-id = "IP2b";
+		label = "E-cluster IP2b";
+	};
+
+	current-IP2l {
+		apple,key-id = "IP2l";
+		label = "PMU IP2l";
+	};
+
+	current-IP3b {
+		apple,key-id = "IP3b";
+		label = "PMU IP3b";
+	};
+
+	current-IP4b {
+		apple,key-id = "IP4b";
+		label = "PMU IP4b";
+	};
+
+	current-IP5l {
+		apple,key-id = "IP5l";
+		label = "PMU IP5l";
+	};
+
+	current-IP6b {
+		apple,key-id = "IP6b";
+		label = "PMU IP6b";
+	};
+
+	current-IP7b {
+		apple,key-id = "IP7b";
+		label = "PMU IP7b";
+	};
+
+	current-IP8b {
+		apple,key-id = "IP8b";
+		label = "PMU IP8b";
+	};
+
+	current-IP9b {
+		apple,key-id = "IP9b";
+		label = "PMU IP9b";
+	};
+
+	current-IPab {
+		apple,key-id = "IPab";
+		label = "PMU IPab";
+	};
+
+	current-IR0b {
+		apple,key-id = "IR0b";
+		label = "Rail IR0b";
+	};
+
+	current-IR0l {
+		apple,key-id = "IR0l";
+		label = "Rail IR0l";
+	};
+
+	current-IR0s {
+		apple,key-id = "IR0s";
+		label = "Rail IR0s";
+	};
+
+	current-IR1b {
+		apple,key-id = "IR1b";
+		label = "Rail IR1b";
+	};
+
+	current-IR3b {
+		apple,key-id = "IR3b";
+		label = "Rail IR3b";
+	};
+
+	current-IR4b {
+		apple,key-id = "IR4b";
+		label = "Rail IR4b";
+	};
+
+	current-IR5b {
+		apple,key-id = "IR5b";
+		label = "Rail IR5b";
+	};
+
+	current-IR6b {
+		apple,key-id = "IR6b";
+		label = "Rail IR6b";
+	};
+
+	current-IR8b {
+		apple,key-id = "IR8b";
+		label = "Rail IR8b";
+	};
+
+	current-IRab {
+		apple,key-id = "IRab";
+		label = "Rail IRab";
+	};
+
+	current-IPMC {
+		apple,key-id = "IPMC";
+		label = "PMU IPMC";
+	};
+
+	current-IPSC {
+		apple,key-id = "IPSC";
+		label = "PMU IPSC";
+	};
+
+	current-IPBR {
+		apple,key-id = "IPBR";
+		label = "PMU IPBR";
+	};
+
+	power-PP0b {
+		apple,key-id = "PP0b";
+		label = "E-cluster PP0b";
+	};
+
+	power-PP0s {
+		apple,key-id = "PP0s";
+		label = "PMU PP0s";
+	};
+
+	power-PP1l {
+		apple,key-id = "PP1l";
+		label = "PMU PP1l";
+	};
+
+	power-PP2b {
+		apple,key-id = "PP2b";
+		label = "E-cluster PP2b";
+	};
+
+	power-PP2l {
+		apple,key-id = "PP2l";
+		label = "PMU PP2l";
+	};
+
+	power-PP3b {
+		apple,key-id = "PP3b";
+		label = "PMU PP3b";
+	};
+
+	power-PP4b {
+		apple,key-id = "PP4b";
+		label = "PMU PP4b";
+	};
+
+	power-PP5l {
+		apple,key-id = "PP5l";
+		label = "PMU PP5l";
+	};
+
+	power-PP6b {
+		apple,key-id = "PP6b";
+		label = "PMU PP6b";
+	};
+
+	power-PP7b {
+		apple,key-id = "PP7b";
+		label = "PMU PP7b";
+	};
+
+	power-PP8b {
+		apple,key-id = "PP8b";
+		label = "PMU PP8b";
+	};
+
+	power-PP9b {
+		apple,key-id = "PP9b";
+		label = "PMU PP9b";
+	};
+
+	power-PPab {
+		apple,key-id = "PPab";
+		label = "PMU PPab";
+	};
+
+	power-PR0b {
+		apple,key-id = "PR0b";
+		label = "Rail PR0b";
+	};
+
+	power-PR0l {
+		apple,key-id = "PR0l";
+		label = "Rail PR0l";
+	};
+
+	power-PR0s {
+		apple,key-id = "PR0s";
+		label = "Rail PR0s";
+	};
+
+	power-PR1b {
+		apple,key-id = "PR1b";
+		label = "Rail PR1b";
+	};
+
+	power-PR3b {
+		apple,key-id = "PR3b";
+		label = "Rail PR3b";
+	};
+
+	power-PR4b {
+		apple,key-id = "PR4b";
+		label = "Rail PR4b";
+	};
+
+	power-PR5b {
+		apple,key-id = "PR5b";
+		label = "Rail PR5b";
+	};
+
+	power-PR6b {
+		apple,key-id = "PR6b";
+		label = "Rail PR6b";
+	};
+
+	power-PR8b {
+		apple,key-id = "PR8b";
+		label = "Rail PR8b";
+	};
+
+	power-PRab {
+		apple,key-id = "PRab";
+		label = "Rail PRab";
+	};
+
+	power-PPMC {
+		apple,key-id = "PPMC";
+		label = "PMU PPMC";
+	};
+
+	power-PPSC {
+		apple,key-id = "PPSC";
+		label = "PMU PPSC";
+	};
+
+	power-PPBR {
+		apple,key-id = "PPBR";
+		label = "PMU PPBR";
+	};
+};

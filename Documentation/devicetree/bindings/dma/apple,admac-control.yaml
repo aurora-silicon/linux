@@ -10,9 +10,9 @@ maintainers:
   - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
 
 description: |
-  A T6050 block described from the ADT so that the device tree lists all of
-  the SoC's hardware. No driver uses it yet: the node stays disabled until
-  one does and the block is brought up on hardware.
+  The LLT escalation detector of a T6050 display engine's ADMAC. The ADMAC
+  driver sets it up through the ADMAC's apple,admac-control phandle, with
+  the ADT's tunables, which the boot loader copies into the node.
 
 properties:
   compatible:
@@ -27,6 +27,28 @@ properties:
 
   interrupts:
     maxItems: 1
+
+  apple,tunable-ced:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description:
+      The ADT's ced-tunables for the first window, as [offset, mask, value]
+      entries; supplied by the boot loader.
+    items:
+      items:
+        - description: register offset
+        - description: mask of the bits to clear
+        - description: bits to set
+
+  apple,tunable-ssw:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description:
+      The ADT's ssw-tunables for the second window, as [offset, mask, value]
+      entries; supplied by the boot loader.
+    items:
+      items:
+        - description: register offset
+        - description: mask of the bits to clear
+        - description: bits to set
 
 required:
   - compatible

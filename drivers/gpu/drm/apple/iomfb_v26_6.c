@@ -1161,16 +1161,22 @@ int iomfb_v26_6_bind(struct apple_dcp *dcp)
 		return dev_err_probe(dev, -EINVAL, "J613/25G83 same-boot clock observation required\n");
 
 	dcp_v26_link_init(&v26->link, dev, NULL);
+	/* The mailbox's callbacks need this module until reboot. */
+	if (!try_module_get(THIS_MODULE))
+		return dev_err_probe(dev, -ENODEV,
+				     "%s display not started: the module is being removed\n",
+				     v26->board->name);
 	rtk = apple_rtkit_init(dev, v26, "mbox", 0, &dcp_v26_rtkit_ops);
-	if (IS_ERR(rtk))
+	if (IS_ERR(rtk)) {
+		module_put(THIS_MODULE);
 		return dev_err_probe(dev, PTR_ERR(rtk),
 				     "%s display not started: RTKit init failed\n",
 				     v26->board->name);
+	}
 	/* From here nothing is freed and the module stays loaded. */
 	v26->rtk = rtk;
 	v26->link.rtk = rtk;
 	dcp_v26_session = true;
-	__module_get(THIS_MODULE);
 
 	ret = apple_rtkit_wake(rtk);
 	if (ret) {

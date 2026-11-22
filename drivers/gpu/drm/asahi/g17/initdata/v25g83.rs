@@ -44,6 +44,18 @@ impl InitData {
         let objects = self.build_25g83_objects(env, variant.split_firmware_area)?;
         self.views = Some(objects.views);
         self.initialize_25g83(env, cfg, active_cores, &tables, &bundle, &objects, variant)?;
+        if variant.v26b123 {
+            self.upgrade_26b123(
+                env,
+                cfg,
+                active_cores,
+                &bundle,
+                objects.aon,
+                objects.power_state,
+                objects.firmware_area,
+                objects.views,
+            )?;
+        }
         if cfg.uat_quirks.clean_tables {
             // Write back every host-built byte before the firmware may read it.
             for object in self.objects.iter_mut() {
@@ -130,9 +142,10 @@ impl InitData {
                 calibration.max_power_mw,
                 &calibration.leakage,
             ),
-            (None, Some(chip)) => (cfg.perf, chip.max_power_mw, &chip.leakage),
+            (None, Some(chip)) => (cfg.perf()?, chip.max_power_mw, &chip.leakage),
             _ => return Err(EINVAL),
         };
+        self.active_effort = super::active_effort(&opps, perf)?;
         let hw_args = abi::HwDataArgs {
             chip_id: cfg.chip_id,
             windows: cfg.windows,
@@ -165,7 +178,7 @@ impl InitData {
             })?;
         self.object_mut(self.region_c)?
             .initialize::<abi::RegionC>(0, |region| {
-                region.init(cfg.region_c);
+                region.init(cfg.region_c()?);
                 region.max_power_mw = max_power_mw;
                 Ok(())
             })?;

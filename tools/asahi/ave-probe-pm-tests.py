@@ -121,6 +121,7 @@ static int ave_v4l2_register(struct ave_dev *a)
     return 0;
 }
 static void ave_debugfs_init(struct ave_dev *a) { (void)a; }
+static void ave_map_darts(struct ave_dev *a) { (void)a; }
 '''
 
 CASES = r'''

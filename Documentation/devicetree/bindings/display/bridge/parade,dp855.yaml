@@ -11,9 +11,14 @@ maintainers:
 
 description: |
   Panel timing controller controlled through SPI. The controller also
-  mediates access to panel management devices. Its downstream address
-  transport must be established before exposing those clients on a host
-  bus; the SPI chip select is not their downstream device address.
+  mediates access to panel management devices through an internal I2C
+  engine that it shares with the display firmware under an access lock.
+  The SPI chip select is not a downstream device address.
+
+  The optional i2c node exposes that engine as a read-only bus. Only its
+  enabled children are reachable, and only by reads. Panel power, source
+  driver, write-protect and EEPROM endpoints stay with the display firmware
+  and are not described here.
 
 allOf:
   - $ref: /schemas/spi/spi-peripheral-props.yaml#
@@ -25,6 +30,8 @@ properties:
   reg:
     maxItems: 1
 
+  spi-max-frequency: true
+
   i2c:
     type: object
     $ref: /schemas/i2c/i2c-controller.yaml#
@@ -33,7 +40,9 @@ properties:
     patternProperties:
       '^temperature-sensor@7[0-2]$':
         type: object
-        $ref: /schemas/trivial-devices.yaml#
+        $ref: /schemas/hwmon/ti,tmp103.yaml#
+        required:
+          - read-only
 
     unevaluatedProperties: false
 
@@ -42,3 +51,27 @@ required:
   - reg
 
 unevaluatedProperties: false
+
+examples:
+  - |
+    spi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        panel-controller@0 {
+            compatible = "parade,dp855";
+            reg = <0>;
+            spi-max-frequency = <1000000>;
+
+            i2c {
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                temperature-sensor@70 {
+                    compatible = "ti,tmp103";
+                    reg = <0x70>;
+                    read-only;
+                };
+            };
+        };
+    };

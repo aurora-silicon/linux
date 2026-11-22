@@ -172,8 +172,9 @@
 	 *   throttle only the cluster their sensor sits on. The 1 s samples
 	 *   jump by about 10 C, so the zones are integral-led.
 	 * - GPU zones: the GPU firmware limits itself from 101 C; these shed
-	 *   CPU power from the same point (on at 90 C) and shut down at 118 C.
-	 *   A powered-off GPU reads -4 to 4 C.
+	 *   CPU power from the same point (on at 90 C) and shut down at 118 C
+	 *   after three samples, as the CPU zones do. A powered-off GPU reads
+	 *   -4 to 4 C.
 	 * - Hot at 120 C only reports; critical is the ADT's 125 C sochot
 	 *   level, after three samples (critical-samples).
 	 * - The fans stay with the SMC, as on macOS: no active trips.
@@ -1000,6 +1001,7 @@
 		gpu0-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			critical-samples = <3>;
 			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 17>;	/* Tg05 */
 
@@ -1058,6 +1060,7 @@
 		gpu1-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			critical-samples = <3>;
 			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 18>;	/* Tg0S */
 
@@ -1116,6 +1119,7 @@
 		gpu2-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			critical-samples = <3>;
 			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 19>;	/* Tg0Y */
 
@@ -1174,6 +1178,7 @@
 		gpu3-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			critical-samples = <3>;
 			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 20>;	/* Tg0k */
 
@@ -1232,6 +1237,7 @@
 		gpu4-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			critical-samples = <3>;
 			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 21>;	/* Tg0z */
 
@@ -1290,6 +1296,7 @@
 		gpu5-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			critical-samples = <3>;
 			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 22>;	/* Tg1V */
 
@@ -1348,6 +1355,7 @@
 		gpu6-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			critical-samples = <3>;
 			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 23>;	/* Tg1l */
 
@@ -1499,35 +1507,42 @@
 	temperature-Tg05 {
 		apple,key-id = "Tg05";
 		label = "GPU Tg05";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0S {
 		apple,key-id = "Tg0S";
 		label = "GPU Tg0S";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0Y {
 		apple,key-id = "Tg0Y";
 		label = "GPU Tg0Y";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0k {
 		apple,key-id = "Tg0k";
 		label = "GPU Tg0k";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0z {
 		apple,key-id = "Tg0z";
 		label = "GPU Tg0z";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1V {
 		apple,key-id = "Tg1V";
 		label = "GPU Tg1V";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1l {
 		apple,key-id = "Tg1l";
 		label = "GPU Tg1l";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 };

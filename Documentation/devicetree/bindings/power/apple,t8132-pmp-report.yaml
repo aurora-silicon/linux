@@ -20,10 +20,53 @@ properties:
     maxItems: 1
   power-domains:
     maxItems: 1
+  '#address-cells':
+    const: 1
+  '#size-cells':
+    const: 0
+
+patternProperties:
+  '^report@[0-9a-f]+$':
+    type: object
+    description:
+      A device whose power state the host reports to the PMP, provided as a
+      power domain.
+    additionalProperties: false
+
+    properties:
+      compatible:
+        const: apple,t6000-pmp-v2-report-entry
+      reg:
+        maxItems: 1
+        description: PMP soc-device index of the device.
+      label:
+        description: Name of the power domain.
+      '#power-domain-cells':
+        const: 0
+      power-domains:
+        minItems: 1
+        maxItems: 2
+      apple,always-on:
+        type: boolean
+        description: Report the device as on from probe.
+      apple,release-for-sleep:
+        type: boolean
+        description: Release the request while the system is suspended.
+      apple,irq-safe:
+        type: boolean
+        description: The parent PMGR power state is switched with IRQs off.
+
+    required:
+      - compatible
+      - reg
+      - label
+      - '#power-domain-cells'
 
 required:
   - compatible
   - reg
   - power-domains
+  - '#address-cells'
+  - '#size-cells'
 
 additionalProperties: false

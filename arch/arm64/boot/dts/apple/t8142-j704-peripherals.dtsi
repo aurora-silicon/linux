@@ -1,0 +1,264 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	aliases {
+		mtp = &mtp;
+		keyboard = &keyboard;
+		nvram = &nvram;
+		pmp = &pmp;
+	};
+
+	/* ADT /arm-io/qspi clock-ids [396]; rate as the T8140 QSPI. */
+	clk_qspi: clock-qspi {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+		clock-output-names = "clk_qspi";
+	};
+
+	led-controller {
+		compatible = "pwm-leds";
+
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+			default-brightness = <127>;
+			default-state = "on";
+		};
+	};
+};
+
+&pmgr {
+	ps_fpwm0: power-controller@330 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x330 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fpwm0";
+	};
+
+	/* ADT pmgr devices: SPI_P id 94 (+0x390), QSPI id 120 (+0x460). */
+	ps_spi_p: power-controller@390 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x390 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "spi_p";
+	};
+
+	/* ADT pmgr devices: PMP id 159 (+0x598), PMS_SRAM id 160 (+0x5a0). */
+	ps_pmp: power-controller@598 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x598 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pmp";
+		/* The PMP's SRAM, which the driver reads first. */
+		power-domains = <&ps_pms_sram>;
+	};
+
+	ps_pms_sram: power-controller@5a0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x5a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pms_sram";
+		/* T8140 holds it through its always-on PMP report node. */
+		apple,always-on;
+	};
+
+	ps_qspi: power-controller@460 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x460 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "qspi";
+		power-domains = <&ps_spi_p>;
+	};
+};
+
+&{/soc} {
+	/*
+	 * PMP, laid out as on T8140 (ADT /arm-io/pmp, dart-pmp): it runs the
+	 * DRAM controller (DCS) and fabric DVFS. Without it the memory stays at
+	 * the bootloader's state (memcpy ~20 GB/s against ~120 GB/s on macOS).
+	 */
+	pmp: pmp@380500000 {
+		compatible = "apple,t8142-pmp-v2", "apple,t8140-pmp-v2";
+		reg = <0x3 0x80500000 0x0 0xd0000>,
+		      <0x3 0x80e00000 0x0 0x4000>;
+		reg-names = "pmp", "asc";
+		mboxes = <&pmp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&pmp_dart 0>;
+		power-domains = <&ps_pmp>;
+		/*
+		 * ADT /arm-io/pmgr pmc, pmc-pmgr (registry-v2 boot arguments).
+		 * The loader adds apple,board-id, apple,dram-vendor-id and the
+		 * apple,tunable-* values from this machine's ADT.
+		 */
+		apple,pmc = <1>;
+		apple,pmc-pmgr = <31>;
+	};
+
+	pmp_mbox: mailbox@380e08000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x80e08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1000 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1001 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1002 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1003 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_pmp>;
+	};
+
+	/* ADT /arm-io/qspi: 0x195118000 and its FIFO window at +0x800, IRQ 1245. */
+	qspi: spi@3a5118000 {
+		compatible = "apple,t8142-qspi", "apple,t8140-qspi";
+		reg = <0x3 0xa5118000 0x0 0x4800>;
+		clocks = <&clk_qspi>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1245 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		power-domains = <&ps_qspi>;
+
+		flash@0 {
+			compatible = "jedec,spi-nor";
+			reg = <0>;
+			/* Conservative until the input clock is confirmed. */
+			spi-max-frequency = <10000000>;
+
+			partitions {
+				compatible = "fixed-partitions";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				/* ADT spinor/anvram reg: 0x100000 bytes at 0x700000. */
+				nvram: partition@700000 {
+					label = "nvram";
+					reg = <0x700000 0x100000>;
+				};
+			};
+		};
+	};
+
+	fpwm0: pwm@3a5040000 {
+		compatible = "apple,t8142-fpwm", "apple,s5l-fpwm";
+		reg = <3 0xa5040000 0 0x4000>;
+		power-domains = <&ps_fpwm0>;
+		clocks = <&clkref>;
+		#pwm-cells = <2>;
+	};
+
+	smc_mbox: mailbox@38c608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0x8c608000 0 0x4000>;
+		interrupts = <AIC_IRQ 633 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 634 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 635 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 636 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	smc: smc@38c600000 {
+		compatible = "apple,t8142-smc", "apple,t8103-smc";
+		reg = <3 0x8c600000 0 0x4000>, <3 0x8de00000 0 0x120000>;
+		reg-names = "smc", "sram";
+		mboxes = <&smc_mbox>;
+
+		smc_hwmon: hwmon {
+			compatible = "apple,smc-hwmon";
+		};
+
+		smc_gpio: gpio {
+			compatible = "apple,smc-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+	};
+
+	mtp: mtp@394600000 {
+		compatible = "apple,t8142-mtp", "apple,t8142-rtk-helper-asc4",
+			     "apple,mtp", "apple,rtk-helper-asc4";
+		/* The second region is firmware SRAM, not the ASC control window. */
+		reg = <3 0x94600000 0 0x4000>, <3 0x94c00000 0 0x100000>;
+		reg-names = "asc", "sram";
+		mboxes = <&mtp_mbox>;
+		iommus = <&mtp_dart 0>;
+	};
+
+	mtp_mbox: mailbox@394608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0x94608000 0 0x4000>;
+		interrupts = <AIC_IRQ 1299 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1300 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1301 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1302 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	mtp_dockchannel: fifo@394b14000 {
+		compatible = "apple,t8142-dockchannel", "apple,dockchannel";
+		reg = <3 0x94b14000 0 0x1000>;
+		reg-names = "irq";
+		interrupts = <AIC_IRQ 1277 IRQ_TYPE_LEVEL_HIGH>;
+		ranges = <0 3 0x94b28000 0x20000>;
+		nonposted-mmio;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+
+		mtp_hid: input@8000 {
+			compatible = "apple,dockchannel-hid";
+			reg = <0x8000 0x1000>, <0xc000 0x1000>,
+			      <0x0000 0x1000>, <0x4000 0x1000>;
+			reg-names = "config", "data", "rmt-config", "rmt-data";
+			iommus = <&mtp_dart 0>;
+			interrupt-parent = <&mtp_dockchannel>;
+			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>, <3 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "tx", "rx";
+			apple,fifo-size = <0x800>;
+			apple,helper-cpu = <&mtp>;
+			/*
+			 * ADT dockchannel-mtp/mtp-transport/multi-touch:
+			 * function-afe-reset = smc-pmu pKW4('gP1c'), SMC GPIO 28,
+			 * as on J813.
+			 */
+			apple,afe-reset-gpios = <&smc_gpio 28 GPIO_ACTIVE_LOW>;
+
+			stm { };
+
+			multi-touch {
+				firmware-name = "apple/tpmtfw-j704.bin";
+				apple,power-method = <2>;
+			};
+
+			/* Layout is filled by the loader using this machine's own data. */
+			keyboard: keyboard { };
+		};
+	};
+};
+
+&pmp_dart {
+	apple,dma-range = /bits/ 64 <0x10000000000 0xbff00000>;
+	power-domains = <&ps_pmp>;
+	status = "okay";
+};
+
+&mtp_dart {
+	/* Keep host allocations clear of firmware's low IOVA mappings. */
+	apple,dma-range = <0 0x02000000 0 0x10000000>;
+	status = "okay";
+};

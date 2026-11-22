@@ -190,9 +190,13 @@ Desktop external audio (draft)
 
 The desktop audio integration uses the existing DCP PCM and native link
 lifecycle, with a separate compact service binding on endpoint 0x2b. Endpoint
-0x29 retains AV device control. Only the external firmware role admits the
-``dcpav-audio-epic`` unit-zero service; the internal panel does not acquire an
-audio client. The existing ``hdmi_audio`` opt-in still controls service startup.
+0x29 retains AV device control. Only the external processors
+(``apple,t6041-dcpext``) admit the ``dcpav-audio-interface-epic`` unit-zero
+service; the internal panel does not acquire an audio client. With its role
+prefix the compact announcement does not fit its 32-byte field and arrives cut
+to 31 characters without the unit; such a cut of at least 20 characters is
+admitted as unit zero. ``hdmi_audio`` (on by default; 0 turns it off) controls
+service startup.
 
 A PCM opens and pins one service instance. Prepare, Start, Stop and Complete
 use that instance's element link data. Sink termination disconnects the card,
@@ -202,10 +206,12 @@ method replies must have the expected body length; serialized property replies
 must contain their declared used bytes within the actual received body.
 
 J616s DPA1 and DPA2 are described with SIO channels 0x66 and 0x68, connected
-bidirectionally to DCPEXT0 and DCPEXT1 port zero, respectively. Both clients
-remain disabled. This description does not enable SIO, its DART, its mailbox
-or any DPA power domain. A generation-specific SIO firmware backend and loader
-handoff are still required before a candidate may enable the clients.
+bidirectionally to DCPEXT0 and DCPEXT1 port zero, respectively. DPA1 is
+enabled with the SIO DART, mailbox, CPU domain and the DPA power domains. The
+SIO node stays disabled in the device tree: the boot loader reserves the
+firmware iBoot preloaded, publishes the T6041 boot tables and enables the node
+(``apple,t6041-sio``, see the apple-sio driver). DPA2 stays disabled until it
+is qualified the same way.
 
 The desktop service name/unit, shared 13.5 command numbers and native 14.7 link
 and element layouts are provisional integration choices. Build and synthetic

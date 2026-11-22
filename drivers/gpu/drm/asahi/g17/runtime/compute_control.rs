@@ -9,10 +9,11 @@ use kernel::{prelude::*, sync::Arc};
 impl Backend {
     /// A final retirement pass precedes bounded cross-VM timeout attribution.
     /// All completion callbacks run after releasing the device mutex.
-    pub(super) fn defer_compute_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool {
+    pub(super) fn defer_compute_timeout(&self, packet: &Arc<Packet>, renewals: u8, excused: u32)
+        -> crate::g17::timeout::Decision {
         use crate::g17::{recovery::Class, timeout::{self, Decision}};
         let Ok(mut deferred) = DeferredBatch::worker() else {
-            return false;
+            return Decision::Own;
         };
         let result = (|| -> Result<Decision> {
             let mut state = self.shared.state.lock();
@@ -20,6 +21,14 @@ impl Backend {
                 return Ok(Decision::Own);
             };
             firmware.scan_compute(None, &mut deferred)?;
+            if let Some((older, own)) = self.behind_own_head(packet, &firmware.init, renewals) {
+                if renewals == 0 {
+                    dev_info!(self.shared.dev.as_ref(),
+                        "Compute watchdog owner={} behind its context's older node {:#x} (own {:#x}); the firmware progresses: renewed\n",
+                        self.owner, older, own);
+                }
+                return Ok(Decision::Defer);
+            }
             // Each queue is locked on its own: release this one before visiting the others.
             let Some(own) = firmware.queues.compute(self.owner)
                 .filter(|queue| queue.can_classify_timeout(packet))
@@ -31,22 +40,72 @@ impl Backend {
                 .filter(|other| other.owner() != Some(self.owner))
                 .filter_map(|other| other.timeout_head());
             let others = Iterator::chain(computes, firmware.queues.render_timeout_heads());
-            let verdict = timeout::attribute(own, renewals, others);
+            let excuse = timeout::Excuse { used: excused, limit: timeout::excuse_limit(
+                crate::module_parameters::compute_timeout_max_ms.value()) };
+            let mut verdict = timeout::attribute(own, renewals, excuse, others);
+            if verdict.decision == Decision::Retire {
+                verdict.decision = self.retire_on_record(firmware, packet, &mut deferred)?;
+            }
             let decision = verdict.decision;
             if decision == Decision::Spare {
                 firmware.queues.compute(self.owner).ok_or(EIO)?
                     .classify(&|_| Class::Spared);
             }
-            if let Some(blocker) = verdict.reported_blocker(renewals) {
+            if let Some(blocker) = verdict.reported_blocker(renewals, excuse) {
                 dev_warn!(self.shared.dev.as_ref(),
-                    "Compute watchdog owner={} vm={} publication={} renewals={} decision={:?} behind earlier work of another VM: blocker_vm={} blocker_publication={} blocker_failed={}\n",
-                    self.owner, own.vm, own.published, renewals, decision,
-                    blocker.vm, blocker.published, u8::from(blocker.failed));
+                    "Compute watchdog owner={} vm={} publication={} renewals={} excused={} decision={:?} behind earlier work of another VM: blocker_vm={} blocker_publication={} blocker_failed={} blocker_in_allowance={}\n",
+                    self.owner, own.vm, own.published, renewals, excused, decision,
+                    blocker.vm, blocker.published, u8::from(blocker.failed),
+                    u8::from(blocker.excused));
             }
             Ok(decision)
         })();
         deferred.finish();
-        matches!(result, Ok(Decision::Defer))
+        result.unwrap_or(Decision::Own)
+    }
+
+    /// [`crate::g17::timeout::Decision::Retire`]: the firmware finished `packet`'s command, the
+    /// oldest of its queue still to retire, and only its completion stamp is missing. It retires
+    /// on its completion record with its stamp owed, as after the stamp fallback bound, so that
+    /// its client keeps its device and later commands of the queue retire past it. Where it
+    /// cannot (M5, ring entries not consumed, a recovery since), the watchdog fails it as before.
+    fn retire_on_record(&self, firmware: &mut crate::g17::Firmware, packet: &Arc<Packet>,
+        deferred: &mut DeferredBatch) -> Result<crate::g17::timeout::Decision> {
+        use crate::g17::timeout::Decision;
+        use core::sync::atomic::{AtomicU32, Ordering};
+        let expired = firmware.queues.compute_mut(self.owner)
+            .is_some_and(|mut queue| queue.expire_stamp_wait(packet));
+        if !expired {
+            return Ok(Decision::Own);
+        }
+        firmware.scan_compute(None, deferred)?;
+        if !firmware.queues.compute(self.owner).is_some_and(|queue| queue.retired_held(packet)) {
+            return Ok(Decision::Own);
+        }
+        static REPORTED: AtomicU32 = AtomicU32::new(0);
+        if REPORTED.fetch_add(1, Ordering::Relaxed) < 8 {
+            dev_info!(self.shared.dev.as_ref(),
+                "Compute watchdog owner={}: its command finished without a completion stamp; retired on its completion record\n",
+                self.owner);
+        }
+        Ok(Decision::Retire)
+    }
+
+    /// The older node of the packet's context ahead of its own, with its own word, when the
+    /// firmware's progress word moved within the watchdog's interval, the packet's VM has no
+    /// failed work and the job's deferrals are within budget
+    /// ([`crate::g17::timeout::behind_own_head`]). The word is read at every poll. Firmware
+    /// without the word renews nothing by this rule.
+    pub(super) fn behind_own_head(&self, packet: &Arc<Packet>,
+        init: &crate::g17::initdata::InitData, renewals: u8) -> Option<(u32, u32)> {
+        let work = packet.completion.work_state().ok()?;
+        let older = work.older_node();
+        let progressing = init.m5_progress().is_ok_and(crate::g17::timeout::note_progress);
+        let status = packet.completion.status();
+        let failed = status.get() != 0 || status.reported_error() != 0;
+        crate::g17::timeout::behind_own_head(packet.is_published(), older, progressing,
+            failed, renewals)
+            .then(|| (older.unwrap_or(0), work.word()))
     }
 
     /// The caller owns cancellation of a packet that never claimed publication.
@@ -66,7 +125,8 @@ impl Backend {
             let Some(mut queue) = firmware.queues.compute_mut(self.owner) else {
                 return Ok(None);
             };
-            if !queue.owns_packet(packet) {
+            // A command that retired in this pass has its result.
+            if !queue.owns_packet(packet) || queue.retired_held(packet) {
                 return Ok(None);
             }
             queue.timeout(&mut |event| deferred.push(event))

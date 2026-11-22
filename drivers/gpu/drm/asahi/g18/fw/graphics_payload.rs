@@ -109,8 +109,22 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 
 /// Transfer integrity only; the offline receipt carries SHA256 provenance.
 pub(crate) fn fnv64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b|
-        (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3))
+    fnv64_from(0xcbf2_9ce4_8422_2325, bytes)
+}
+
+fn fnv64_from(basis: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(basis, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3))
+}
+
+/// [`fnv64`] of bytes in uncached (write-combined) memory. They are read in
+/// wide copies: a byte load from such memory is a bus transaction each.
+pub(crate) fn fnv64_uncached(bytes: &[u8]) -> u64 {
+    let mut chunk = [0u8; 256];
+    bytes.chunks(chunk.len()).fold(0xcbf2_9ce4_8422_2325, |h, part| {
+        let copy = &mut chunk[..part.len()];
+        copy.copy_from_slice(part);
+        fnv64_from(h, copy)
+    })
 }
 
 impl<'a> GraphicsPayload<'a> {

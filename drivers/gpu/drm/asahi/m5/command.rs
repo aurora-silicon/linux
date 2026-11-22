@@ -755,8 +755,11 @@ fn validate_zls<A: GpuAddressSpace>(
 }
 
 /// Validate the complete single-layer M5 Z/S allocations before their unused
-/// array strides are discarded. AIL stores samples in an expanded 2D surface:
-/// 2x doubles Y, and 4x doubles both axes. The dimensions register stays in pixels.
+/// array strides are discarded. AIL folds the sample count into the data
+/// plane's element size, so 2x Z16 tiles as 4-byte elements over the pixel
+/// dimensions; the compression metadata uses the expanded surface instead
+/// (2x doubles Y, 4x doubles both axes). The dimensions register stays in
+/// pixels either way.
 pub(crate) fn validate_m5_reference_depth<A: GpuAddressSpace>(
     command: &UapiRenderCommand,
     address_space: &A,
@@ -796,20 +799,28 @@ pub(crate) fn validate_m5_reference_depth<A: GpuAddressSpace>(
         }
         expected_control |= command.zls_control & transfers;
         if compressed { expected_control |= compression; }
-        // AIL tiles contain 16 KiB: 64x64 Z32, 128x64 Z16, 128x128 S8.
+        // AIL tiles contain 16 KiB and their shape follows the element size:
+        // 64x64 at four bytes, 128x64 at two, 128x128 at one, 64x32 at eight
+        // and 32x32 at sixteen. The sample count scales that element size,
+        // so the tile shape must be picked from bytes_per_sample * samples
+        // and the tiles counted over the pixel dimensions.
         // A miptail smaller than either tile axis is power-of-two padded and
         // cacheline aligned, rather than rounded to a whole 16-KiB page.
-        let (tile_width, tile_height) = match bytes_per_sample {
-            4 => (64u32, 64u32),
+        let bytes_per_element = bytes_per_sample * u64::from(command.samples);
+        let (tile_width, tile_height) = match bytes_per_element {
+            1 => (128u32, 128u32),
             2 => (128, 64),
-            _ => (128, 128),
+            4 => (64, 64),
+            8 => (64, 32),
+            16 => (32, 32),
+            _ => return Err(UapiTranslateError::ZlsFields),
         };
-        let data_bytes = if sample_width >= tile_width && sample_height >= tile_height {
-            u64::from(sample_width.div_ceil(tile_width))
-                * u64::from(sample_height.div_ceil(tile_height)) * 0x4000
+        let data_bytes = if width >= tile_width && height >= tile_height {
+            u64::from(width.div_ceil(tile_width))
+                * u64::from(height.div_ceil(tile_height)) * 0x4000
         } else {
-            (u64::from(sample_width.next_power_of_two())
-                * u64::from(sample_height.next_power_of_two()) * bytes_per_sample)
+            (u64::from(width.next_power_of_two())
+                * u64::from(height.next_power_of_two()) * bytes_per_element)
                 .div_ceil(128) * 128
         };
         require_range(address_space, plane.base, data_bytes, GpuAccess::ReadWrite)?;
@@ -1005,6 +1016,8 @@ fn translate_render_command_with_capacity<A: GpuAddressSpace>(
     parameters.height = command.height as u32;
     parameters.encoder = command.vdm_base;
     parameters.layers = command.layers;
+    parameters.samples = command.samples;
+    parameters.sample_size = command.sample_size;
     parameters.utile_width = command.utile_width;
     parameters.utile_height = command.utile_height;
     parameters.utile_config = utile_config;

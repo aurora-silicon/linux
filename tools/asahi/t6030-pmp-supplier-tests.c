@@ -47,6 +47,7 @@ struct apple_pmp_report_offsets {
 	const char *name, *fallback, *pwrstate;
 };
 struct apple_pmp_report {
+	struct device_node *native_pmp;
 	void *base;
 	const struct apple_pmp_report_offsets *offsets;
 	struct device *dev;
@@ -84,6 +85,14 @@ static void rcu_read_unlock(void)
 {
 	assert(rcu_depth-- == 1);
 }
+static int apple_pmp_report_record(struct device_node *pmp,
+                                  struct device_node *entry, u32 *id, bool *record)
+{
+        (void)pmp;
+        *id = entry->reg;
+        *record = false;
+        return 0;
+}
 static int apple_pmp_report_bit(struct apple_pmp_start *st,
 				struct device_node *entry, u32 *id,
 				bool *record)
@@ -96,7 +105,7 @@ static int apple_pmp_report_bit(struct apple_pmp_start *st,
 static struct apple_pmp_start managed_start;
 static int ready_result, start_calls;
 #define msecs_to_jiffies(n) (n)
-#define system_unbound_wq NULL
+#define system_dfl_wq NULL
 static bool wait_for_completion_timeout(struct completion *c,
 					unsigned long timeout)
 {
@@ -126,6 +135,8 @@ static bool passive_present, passive_lockable, passive_data;
 static const char *machine;
 static const void *pmp_data;
 static struct device *pmp_device;
+/* Set only while the PMP is stopped for a system sleep, which this test never does. */
+static bool pmp_asleep;
 static int pmp_lock, ready_calls, add_calls, add_result;
 static int poll_calls, device_locked, power_calls, power_result, link_calls;
 static int find_calls, lockable, present_device, link_ok;

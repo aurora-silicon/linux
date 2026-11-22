@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14-inch and 16-inch, M4 Pro) USB4/Thunderbolt: each Type-C
+ * port's connector is linked to the USB4 router behind the same ATC PHY
+ * (ADT acioN atc-phy-parent = atc-phyN): typec0 (left back) to ACIO0,
+ * typec1 (left front) to ACIO1, typec2 (right) to ACIO2. The routers stay
+ * disabled, and a port controller skips a link to a disabled router, so this
+ * changes nothing until a board enables them.
+ */
+
+&usb4_0_acio_tbt {
+	remote-endpoint = <&typec0_con_tbt>;
+};
+
+&usb4_1_acio_tbt {
+	remote-endpoint = <&typec1_con_tbt>;
+};
+
+&usb4_2_acio_tbt {
+	remote-endpoint = <&typec2_con_tbt>;
+};
+
+&typec0 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec0_con_tbt: endpoint {
+				remote-endpoint = <&usb4_0_acio_tbt>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec1_con_tbt: endpoint {
+				remote-endpoint = <&usb4_1_acio_tbt>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec2_con_tbt: endpoint {
+				remote-endpoint = <&usb4_2_acio_tbt>;
+			};
+		};
+	};
+};

@@ -16,7 +16,7 @@
 //! or submit says which pool ran out.
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use kernel::{bindings, module_param::KernelParam, prelude::*};
+use kernel::{bindings, prelude::*};
 
 use crate::g18::compat::g17p::{self as g17_channel, QID_COUNT};
 
@@ -173,16 +173,10 @@ unsafe extern "C" fn slots_set(_: *const core::ffi::c_char, _: *const bindings::
 static SLOTS_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(slots_set), get: Some(slots_get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static SLOTS_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_queue_slots"
-    } else { c"aurora.g17p_queue_slots" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&SLOTS_OPS), perm: 0o400, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    SLOTS_PARAM,
+    "g17p_queue_slots",
+    ops: core::ptr::from_ref(&SLOTS_OPS),
+    perm: 0o400,
+    arg: core::ptr::null_mut(),
+);

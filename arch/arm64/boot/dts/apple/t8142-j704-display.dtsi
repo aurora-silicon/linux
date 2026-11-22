@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J704 internal display pipeline: the DCP coprocessor and its DARTs.
+ *
+ * The bootloader leaves DCP running with its firmware mapped through
+ * locked DART tables. The loader reserves those mappings and enables the
+ * nodes below; Linux attaches to the running coprocessor without resetting
+ * it. Resources were read from this machine's Apple Device Tree.
+ */
+
+/ {
+	aliases {
+		dcp = &dcp;
+		disp0 = &display;
+		disp0_piodma = &disp0_piodma;
+	};
+
+	display: display-subsystem {
+		compatible = "apple,t8142-display-subsystem", "apple,display-subsystem";
+		/* disp0_dart must be first since it is locked */
+		iommus = <&disp0_dart 0>;
+		/* generate phandle explicitly for use in loader */
+		phandle = <&display>;
+	};
+};
+
+&{/soc} {
+	pmgr_dcp: power-management@382720000 {
+		reg = <3 0x82720000 0 0x8>, <3 0x827a4000 0 0x4>;
+		reg-names = "dcp-bw-scratch", "dcp-bw-doorbell";
+		#apple,bw-scratch-cells = <3>;
+		#apple,bw-doorbell-cells = <2>;
+	};
+
+	dcp_mbox: mailbox@286e08000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <2 0x86e08000 0 0x4000>;
+		interrupts = <AIC_IRQ 776 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 777 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 778 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 779 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	dcp: dcp@286e00000 {
+		compatible = "apple,t8142-dcp", "apple,dcp";
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcp_dart 23>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2",
+			    "disp-3", "disp-4", "iop-vbar";
+		reg = <2 0x86e00000 0 0x4000>,
+		      <2 0x84000000 0 0xb1c000>,
+		      <2 0x86240000 0 0x10000>,
+		      <2 0x863ac000 0 0x4000>,
+		      <2 0x86800000 0 0x800000>,
+		      <3 0x82700000 0 0x114000>,
+		      <2 0x86850000 0 0x4000>;
+		apple,bw-scratch = <&pmgr_dcp 0 5 0>;
+		apple,bw-doorbell = <&pmgr_dcp 1 6>;
+		/* Scan out the primary plane on IOMFB surface 2. */
+		apple,iomfb-surfaces = <0 0 1 0>;
+		clocks = <&clkref>;
+		/* generate phandle explicitly for use in loader */
+		phandle = <&dcp>;
+		status = "disabled";
+		/* required bus properties for 'piodma' subdevice */
+		#address-cells = <2>;
+		#size-cells = <2>;
+
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 16>;
+			phandle = <&disp0_piodma>;
+		};
+
+		/*
+		 * 14.2" mini-LED, 3024x1964 (1890 below the notch, which the
+		 * loader passes as apple,notch-height). Makes the connector eDP
+		 * and gives the DCP a backlight to drive.
+		 */
+		panel: panel {
+			compatible = "apple,panel-j704", "apple,panel-mini-led",
+				     "apple,panel";
+			width-mm = <302>;
+			height-mm = <196>;
+			adj-height-mm = <189>;
+			apple,max-brightness = <600>;
+		};
+	};
+};
+
+&disp0_dart {
+	apple,dma-range = <0x100 0x0 0x10 0x0>;
+	status = "disabled";
+};
+
+&dcp_dart {
+	apple,dma-range = <0x100 0x0 0x10 0x0>;
+	status = "okay";
+};

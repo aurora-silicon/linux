@@ -80,9 +80,21 @@ int ane_perf_begin(struct ane_device *ane)
 	if (p->report && !p->clock_held) {
 		ret = apple_pmp_report_ane_perf(p->report, ane->dev, p->high_level,
 						&p->clock_held);
-		if (ret)
+		/*
+		 * -EAGAIN: the PMP that serves the report is not running (on
+		 * the M1 Pro and Max Linux does not start it), so nobody can
+		 * take a level request. The engine still runs at the level the
+		 * firmware chose; failing every submit would leave it unusable.
+		 */
+		if (ret == -EAGAIN && !p->clock_held) {
+			dev_info_once(ane->dev,
+				      "performance controller not running; running at the firmware's level\n");
+			ret = 0;
+		} else if (ret) {
 			goto out;
-		p->level = p->high_level;
+		} else {
+			p->level = p->high_level;
+		}
 	}
 out:
 	p->error = ret;

@@ -21,7 +21,7 @@ impl<'a> KeybagCreateIntent<'a> {
         unfinished: crate::xart_guard::Unfinished,
     ) -> Option<Self> {
         if let Err(e) = keybag::write_intent(slot, unfinished) {
-            dev_err!(dev, "sks: cannot persist keybag-create intent: {:?}\n", e);
+            dev_err_ratelimited!(dev, "sks: cannot persist keybag-create intent: {:?}\n", e);
             return None;
         }
         Some(Self {
@@ -40,7 +40,7 @@ impl Drop for KeybagCreateIntent<'_> {
     fn drop(&mut self) {
         if !self.sent {
             if let Err(e) = keybag::mark_refused(self.slot) {
-                dev_err!(
+                dev_err_ratelimited!(
                     self.dev,
                     "sks: cannot mark unsent keybag create retryable: {:?}\n",
                     e
@@ -71,7 +71,7 @@ impl SepData {
             if let Some(a) = matched {
                 let _ = self.sks_zero_buffers();
                 self.sks_wedged.store(0, Relaxed);
-                dev_warn!(
+                dev_warn_ratelimited!(
                     self.dev,
                     "sks: late answer to {} after {} ms; wedge lifted\n",
                     a.label,
@@ -129,8 +129,10 @@ impl SepData {
     }
 
     pub(crate) fn sks_next_seq(&self) -> crate::sks::Sequence {
-        let n = self.sks_seq.load(Relaxed);
-        self.sks_seq.store(n.wrapping_add(1), Relaxed);
+        // One atomic step: concurrent callers build requests outside the
+        // exchange lock, and two requests with the same sequence would defeat
+        // the late-reply bookkeeping of an abandoned one.
+        let n = self.sks_seq.fetch_add(1, Relaxed);
         crate::sks::Sequence::from_counter(n as u8)
     }
 
@@ -233,7 +235,7 @@ impl SepData {
             if condemn {
                 self.sks_wedged.store(1, Relaxed);
             }
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: {} got no reply after {} ms\n",
                 label,
@@ -350,7 +352,7 @@ impl SepData {
         };
 
         let Some(out) = self.sks_send(self.sks_req_get_capabilities()) else {
-            dev_err!(self.dev, "sks: GET_CAPABILITIES got no reply\n");
+            dev_err_ratelimited!(self.dev, "sks: GET_CAPABILITIES got no reply\n");
             return false;
         };
         // Reply: struct version 0, u64 capability word, blob.
@@ -361,7 +363,7 @@ impl SepData {
         match word {
             // Version 0 leaves out the header fields the payload hash covers.
             Some(0) | None => {
-                dev_err!(
+                dev_err_ratelimited!(
                     self.dev,
                     "sks: GET_CAPABILITIES status {}, no usable capability word\n",
                     out.reply.status
@@ -371,7 +373,7 @@ impl SepData {
             Some(word) => {
                 let version = if word < 2 { 1 } else { 2 };
                 self.sks_header_version.store(version, Relaxed);
-                dev_info!(
+                dev_info_ratelimited!(
                     self.dev,
                     "sks: capability word {}, IPC header version {}\n",
                     word,
@@ -381,7 +383,7 @@ impl SepData {
         }
 
         let Some(out) = self.sks_send(self.sks_req_set_env(cpx_encryption_mode)) else {
-            dev_err!(self.dev, "sks: SET_ENV got no reply\n");
+            dev_err_ratelimited!(self.dev, "sks: SET_ENV got no reply\n");
             return false;
         };
         // The reply is the struct-version word 0 alone (0x…4c44-4c5c).
@@ -389,7 +391,7 @@ impl SepData {
             .sks_report_response(c"SET_ENV", &out)
             .is_some_and(|body| body.len() == 4 && image::operation_status(body) == Some(0));
         if out.reply.status != 0 || !accepted {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: SET_ENV (cpx-encryption-mode {}) refused: status {}\n",
                 cpx_encryption_mode,
@@ -548,13 +550,31 @@ impl SepData {
     }
 
     /// `0x02` copy the designated biometric identity bag.
-    fn sks_req_copy_keybag_special(&self, handle: crate::sks::SpecialHandle) -> Result<SksRequest> {
+    pub(crate) fn sks_req_copy_keybag_special(&self, handle: crate::sks::SpecialHandle) -> Result<SksRequest> {
         let op = crate::sks::sks_copy_keybag();
         let mut body = image::Body::new();
         body.put_u32(0)?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
         body.put_i32(handle.value())?;
         self.sks_seal(&op, &body)
+    }
+
+    /// Loads a wrapped bag (`0x03`) and returns its temporary handle. Used for
+    /// per-user bags, whose wrapped container userspace keeps.
+    pub(crate) fn sks_load_wrapped(&self, wrapped: &[u8]) -> Option<crate::sks::KeyBagHandle> {
+        let out = self.sks_send(self.sks_req_load_keybag(wrapped))?;
+        let body = self.sks_report_response(crate::sks::SKS_LOAD_NAME, &out)?;
+        if out.reply.status != 0 || body.len() != SKS_LOAD_REPLY_LEN {
+            dev_info_refusal!(self.dev, "sks: LOAD_KEYBAG (user bag): status {}, {} bytes\n", out.reply.status, body.len());
+            return None;
+        }
+        let status = i32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        let handle = i32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        if status != 0 || handle < 0 {
+            dev_info_refusal!(self.dev, "sks: LOAD_KEYBAG (user bag): operation status {}, handle {}\n", status, handle);
+            return None;
+        }
+        Some(crate::sks::KeyBagHandle::from_load_reply(handle))
     }
 
     /// `0x03` load key bag.
@@ -622,7 +642,7 @@ impl SepData {
             return;
         }
         if let Err(e) = keybag::mark_refused(slot) {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: cannot mark refused keybag create retryable: {:?}\n",
                 e
@@ -638,7 +658,7 @@ impl SepData {
             .with_store(|store| store.guard_listed_at_load())
             .flatten();
         if !crate::xart_guard::may_retry_create(unfinished, listed) {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: an earlier CREATE_KEYBAG never completed and may have left a bag (intent {:?}, xART guard list {:?}); not creating another\n",
                 unfinished,
@@ -647,7 +667,7 @@ impl SepData {
             return None;
         }
         let proof = keybag::retry_unfinished(slot, unfinished).ok()?;
-        dev_notice!(
+        dev_notice_ratelimited!(
             self.dev,
             "sks: an earlier CREATE_KEYBAG never completed and left no record; creating the identity keybag again\n"
         );
@@ -666,7 +686,7 @@ impl SepData {
         let proof = match proof {
             Ok(proof) => proof,
             Err(e) => {
-                dev_err!(
+                dev_err_ratelimited!(
                     self.dev,
                     "sks: identity keybag state is ambiguous: {:?}\n",
                     e
@@ -702,7 +722,7 @@ impl SepData {
         let request = match self.sks_req_create_identity_keybag(&secret, &uuid, proof) {
             Ok(request) => request,
             Err(e) => {
-                dev_err!(
+                dev_err_ratelimited!(
                     self.dev,
                     "sks: cannot build identity keybag request: {:?}\n",
                     e
@@ -723,14 +743,14 @@ impl SepData {
             )
         });
         let Some(out) = exchanged else {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: CREATE_KEYBAG exchange did not complete (buffers unregistered, wedged, or OOL write failed)\n"
             );
             return false;
         };
         let Some(body) = self.sks_report_response(crate::sks::SKS_CREATE_NAME, &out) else {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: CREATE_KEYBAG reply carried no parsable body: mailbox status {}, response {} bytes, response_size {}\n",
                 out.reply.status,
@@ -747,7 +767,7 @@ impl SepData {
             profile::KeyStore::Variant5 => 12,
         };
         if out.reply.status != 0 || body.len() < reply_min {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: CREATE_KEYBAG failed: mailbox {}, body {} bytes\n",
                 out.reply.status,
@@ -762,7 +782,7 @@ impl SepData {
             profile::KeyStore::Sepos13 { .. } => 8,
             profile::KeyStore::Variant5 => {
                 let Some((_fv_data, end)) = image::read_blob(body, 8) else {
-                    dev_err!(
+                    dev_err_ratelimited!(
                         self.dev,
                         "sks: CREATE_KEYBAG reply has no fv_data blob at offset 8 (body {} bytes)\n",
                         body.len()
@@ -774,7 +794,7 @@ impl SepData {
         };
         if variant != self.profile.keybag_create.variant || raw_handle < 0 || end != body.len()
         {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: invalid CREATE_KEYBAG reply: variant {}, handle {}\n",
                 variant,
@@ -790,18 +810,18 @@ impl SepData {
             profile::KeyStore::Sepos13 { .. } => None,
             profile::KeyStore::Variant5 => {
                 let Some(bag_uuid) = self.sks_read_uuid(handle) else {
-                    dev_err!(self.dev, "sks: could not read the new keybag's UUID back\n");
+                    dev_err_ratelimited!(self.dev, "sks: could not read the new keybag's UUID back\n");
                     return false;
                 };
                 Some(bag_uuid)
             }
         };
         let Some(out) = self.sks_send(self.sks_req_copy_keybag(handle)) else {
-            dev_err!(self.dev, "sks: COPY_KEYBAG of the new identity keybag got no reply\n");
+            dev_err_ratelimited!(self.dev, "sks: COPY_KEYBAG of the new identity keybag got no reply\n");
             return false;
         };
         let Some(wrapped) = self.wrapped_from_copy_reply(&out, c"new identity keybag") else {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: COPY_KEYBAG reply unusable: mailbox status {}, response {} bytes\n",
                 out.reply.status,
@@ -814,11 +834,11 @@ impl SepData {
             None => keybag::write_generated_uuid(slot, &wrapped, &uuid, &secret),
         };
         if let Err(e) = committed {
-            dev_err!(self.dev, "sks: cannot commit identity keybag: {:?}\n", e);
+            dev_err_ratelimited!(self.dev, "sks: cannot commit identity keybag: {:?}\n", e);
             return false;
         }
         let _ = self.sks_send(self.sks_req_unload_keybag(handle));
-        dev_info!(self.dev, "sks: identity keybag provisioned\n");
+        dev_info_ratelimited!(self.dev, "sks: identity keybag provisioned\n");
         true
     }
 
@@ -841,7 +861,7 @@ impl SepData {
         let designation = crate::sks::Designation::new(handle, user);
 
         let Some(out) = self.sks_send(self.sks_req_designate(&designation, secret)) else {
-            dev_warn!(
+            dev_warn_ratelimited!(
                 self.dev,
                 "sks: DESIGNATE_KEYBAG did not complete; enrolment will refuse\n"
             );
@@ -970,7 +990,7 @@ impl SepData {
         // macOS 13.5 sends 0x4d once, at endpoint init, never again.
         if self.profile.key_store != profile::KeyStore::Variant5 {
             if !self.sks_initialized.load(Relaxed) {
-                dev_err!(
+                dev_err_ratelimited!(
                     self.dev,
                     "sks: health check ({}): endpoint not initialised\n",
                     why
@@ -980,7 +1000,7 @@ impl SepData {
             return Some(Healthy(()));
         }
         let Some(out) = self.sks_send(self.sks_req_get_capabilities()) else {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: health check ({}) got no reply; endpoint gone for this boot\n",
                 why
@@ -988,7 +1008,7 @@ impl SepData {
             return None;
         };
         if out.reply.status != 0 {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: health check ({}) returned status {}\n",
                 why,
@@ -1016,7 +1036,7 @@ impl SepData {
         let request = match self.sks_req_load_keybag(key) {
             Ok(request) => request,
             Err(e) => {
-                dev_err!(
+                dev_err_ratelimited!(
                     self.dev,
                     "sks: could not build LOAD_KEYBAG request: {:?}\n",
                     e
@@ -1026,7 +1046,7 @@ impl SepData {
         };
         let out = self.sks_exchange(request.name, request.msg, &request.img)?;
 
-        dev_info!(
+        dev_dbg!(
             self.dev,
             "sks: LOAD_KEYBAG reply mailbox status {}, response size {}, copied {} bytes\n",
             out.reply.status,
@@ -1037,7 +1057,7 @@ impl SepData {
         let body = match self.sks_report_response(crate::sks::SKS_LOAD_NAME, &out) {
             Some(body) => body,
             None => {
-                dev_warn!(
+                dev_warn_ratelimited!(
                     self.dev,
                     "sks: LOAD_KEYBAG reply image was empty or malformed\n"
                 );
@@ -1046,7 +1066,7 @@ impl SepData {
         };
 
         if out.reply.status != 0 {
-            dev_warn!(
+            dev_warn_ratelimited!(
                 self.dev,
                 "sks: LOAD_KEYBAG mailbox status {}; no handle\n",
                 out.reply.status
@@ -1054,7 +1074,7 @@ impl SepData {
             return None;
         }
         if body.len() != SKS_LOAD_REPLY_LEN {
-            dev_warn!(
+            dev_warn_ratelimited!(
                 self.dev,
                 "sks: LOAD_KEYBAG returned {} bytes, expected {}\n",
                 body.len(),
@@ -1065,7 +1085,7 @@ impl SepData {
         let status = i32::from_le_bytes([body[0], body[1], body[2], body[3]]);
         let handle = i32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         if status != 0 || handle < 0 {
-            dev_warn!(
+            dev_warn_ratelimited!(
                 self.dev,
                 "sks: LOAD_KEYBAG operation status {}, handle {}\n",
                 status,
@@ -1080,7 +1100,7 @@ impl SepData {
         }
 
         let Some(uuid) = self.sks_read_uuid(handle) else {
-            dev_warn!(self.dev, "sks: loaded keybag has no readable UUID\n");
+            dev_warn_ratelimited!(self.dev, "sks: loaded keybag has no readable UUID\n");
             let _ = self.sks_send(self.sks_req_unload_keybag(handle));
             return None;
         };
@@ -1088,7 +1108,7 @@ impl SepData {
         if uuid == *stored.uuid() {
             Some((handle, uuid))
         } else {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: load succeeded but bag identity mismatch: stored UUID {}, loaded UUID {}\n",
                 Hex(stored.uuid()),
@@ -1106,7 +1126,7 @@ impl SepData {
                 return false;
             };
             let Some(identity) = material.snapshot_identity else {
-                dev_err!(self.dev, "sks: refusing snapshot without a recovered-bag identity binding\n");
+                dev_err_ratelimited!(self.dev, "sks: refusing snapshot without a recovered-bag identity binding\n");
                 return false;
             };
             (material.special, identity)
@@ -1130,7 +1150,7 @@ impl SepData {
         match keybag::replace_wrapped(keybag::Slot::Identity, &wrapped, &uuid, &identity) {
             Ok(()) => true,
             Err(e) => {
-                dev_err!(
+                dev_err_ratelimited!(
                     self.dev,
                     "enrol: could not commit the identity-bag snapshot ({:?}); may not survive reboot\n",
                     e
@@ -1169,7 +1189,7 @@ impl SepData {
             return true;
         }
         if !self.endpoint_present(proto::EP_SKS) {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: endpoint 0x{:02x} (key store) not advertised; {} EPs up (control={} xarm={} sbio={} scrd={}); keybag/ref-key cannot run\n",
                 proto::EP_SKS,
@@ -1182,14 +1202,14 @@ impl SepData {
             return false;
         }
         if let Err(e) = self.enable_sks() {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: could not register out-of-line buffers ({:?})\n",
                 e
             );
             return false;
         }
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "sks: endpoint 0x{:02x} (key store) up; {} EPs; out-of-line buffers registered\n",
             proto::EP_SKS,
@@ -1218,12 +1238,15 @@ impl SepData {
                 || guard.captured.len() >= until || remaining == 0 {
                 return;
             }
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .sks_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         }
@@ -1354,6 +1377,13 @@ const OP_SKS_LOAD_KEYBAG: u8 = 0x03;
 
 pub(crate) const SKS_LOAD_NAME: &CStr = c"LOAD_KEYBAG";
 
+const OP_SKS_CHANGE_SECRET: u8 = 0x07;
+pub(crate) const SKS_CHANGE_SECRET_NAME: &CStr = c"CHANGE_SECRET";
+
+pub(crate) fn encode_sks_change_secret(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_CHANGE_SECRET, seq.value(), len.value())
+}
+
 const OP_SKS_CHANGE_LOCK_STATE: u8 = 0x04;
 
 pub(crate) const SKS_LOCK_STATE_NAME: &CStr = c"CHANGE_LOCK_STATE";
@@ -1363,6 +1393,27 @@ pub(crate) const SKS_DEVICE_STATE_NAME: &CStr = c"DEVICE_STATE_TRANSITION";
 
 pub(crate) fn encode_sks_device_state_transition(seq: Sequence, len: ImageLen) -> Message {
     encode_sks_raw(OP_SKS_DEVICE_STATE_TRANSITION, seq.value(), len.value())
+}
+
+const OP_SKS_GET_DEVICE_STATE: u8 = 0x19;
+pub(crate) const SKS_GET_DEVICE_STATE_NAME: &CStr = c"GET_DEVICE_STATE";
+
+pub(crate) fn encode_sks_get_device_state(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_GET_DEVICE_STATE, seq.value(), len.value())
+}
+
+const OP_SKS_GET_CONFIGURATION: u8 = 0x23;
+pub(crate) const SKS_GET_CONFIGURATION_NAME: &CStr = c"GET_CONFIGURATION";
+
+pub(crate) fn encode_sks_get_configuration(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_GET_CONFIGURATION, seq.value(), len.value())
+}
+
+const OP_SKS_HANDLE_TIMER_FIRE: u8 = 0x2f;
+pub(crate) const SKS_HANDLE_TIMER_FIRE_NAME: &CStr = c"HANDLE_TIMER_FIRE";
+
+pub(crate) fn encode_sks_handle_timer_fire(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_HANDLE_TIMER_FIRE, seq.value(), len.value())
 }
 
 const OP_SKS_VERIFY_SECRET: u8 = 0x21;

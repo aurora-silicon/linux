@@ -79,8 +79,20 @@ static void dwc3_xhci_plat_start(struct usb_hcd *hcd)
 	dwc3_enable_susphy(dwc, true);
 }
 
+static int dwc3_xhci_plat_resume_quirk(struct usb_hcd *hcd)
+{
+	struct platform_device *pdev = to_platform_device(hcd->self.controller);
+	struct dwc3 *dwc = dev_get_drvdata(pdev->dev.parent);
+
+	if (!usb_hcd_is_primary_hcd(hcd) || !dwc->glue_ops || !dwc->glue_ops->pre_host_resume)
+		return 0;
+
+	return dwc->glue_ops->pre_host_resume(dwc);
+}
+
 static const struct xhci_plat_priv dwc3_xhci_plat_quirk = {
 	.plat_start = dwc3_xhci_plat_start,
+	.resume_quirk = dwc3_xhci_plat_resume_quirk,
 };
 
 static void dwc3_host_fill_xhci_irq_res(struct dwc3 *dwc,

@@ -187,26 +187,26 @@
 /arm-io/pmgr/power-devices/DISPEXT1_FE 0x28e080260 -> /soc/power-management@28e080000/power-controller@260
 /arm-io/pmgr/power-devices/ANE_SYS 0x28e080268 -> /soc/power-management@28e080000/power-controller@268
 /arm-io/pmgr/power-devices/AVD_SYS 0x28e080270 -> /soc/power-management@28e080000/power-controller@270
-/arm-io/pmgr/power-devices/DISPEXT0_BE - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DISPEXT0_BE 0x28e080278 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 /arm-io/pmgr/power-devices/DISPEXT0_CPU0 0x28e080280 -> /soc/power-management@28e080000/power-controller@280
-/arm-io/pmgr/power-devices/DISPEXT0_GP0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
-/arm-io/pmgr/power-devices/DISPEXT0_GP1 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
-/arm-io/pmgr/power-devices/DISPEXT0_PPP - -> WAIVED: Virtual PMGR vote; no independent power-state register.
-/arm-io/pmgr/power-devices/DISPEXT1_BE - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DISPEXT0_GP0 0x28e080288 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISPEXT0_GP1 0x28e080290 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISPEXT0_PPP 0x28e080298 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISPEXT1_BE 0x28e0802a0 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 /arm-io/pmgr/power-devices/DISPEXT1_CPU0 0x28e0802a8 -> /soc/power-management@28e080000/power-controller@2a8
-/arm-io/pmgr/power-devices/DISPEXT1_GP0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
-/arm-io/pmgr/power-devices/DISPEXT1_GP1 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
-/arm-io/pmgr/power-devices/DISPEXT1_PPP - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DISPEXT1_GP0 0x28e0802b0 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISPEXT1_GP1 0x28e0802b8 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISPEXT1_PPP 0x28e0802c0 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 /arm-io/pmgr/power-devices/ANE_SYS_CPU 0x28e0802c8 -> /soc/power-management@28e080000/power-controller@2c8
-/arm-io/pmgr/power-devices/DISPEXT0_DP - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DISPEXT0_DP 0x28e0802d0 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 /arm-io/pmgr/power-devices/PMP 0x28e0802d8 -> /soc/power-management@28e080000/power-controller@2d8
 /arm-io/pmgr/power-devices/PMS_SRAM 0x28e0802e0 -> /soc/power-management@28e080000/power-controller@2e0
 /arm-io/pmgr/power-devices/APCIE_ST_SYS 0x28e0802e8 -> /soc/power-management@28e080000/power-controller@2e8
 /arm-io/pmgr/power-devices/APCIE_ST1_SYS 0x28e0802f0 -> /soc/power-management@28e080000/power-controller@2f0
 /arm-io/pmgr/power-devices/ATC2_COMMON 0x28e0802f8 -> /soc/power-management@28e080000/power-controller@2f8
 /arm-io/pmgr/power-devices/ATC3_COMMON 0x28e080300 -> /soc/power-management@28e080000/power-controller@300
-/arm-io/pmgr/power-devices/DISPEXT0_DSC - -> WAIVED: Virtual PMGR vote; no independent power-state register.
-/arm-io/pmgr/power-devices/DISPEXT1_DP - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DISPEXT0_DSC 0x28e080308 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+/arm-io/pmgr/power-devices/DISPEXT1_DP 0x28e080310 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 /arm-io/pmgr/power-devices/USB 0x28e080318 -> /soc/power-management@28e080000/power-controller@318
 /arm-io/pmgr/power-devices/APCIE_GP_SYS 0x28e080320 -> /soc/power-management@28e080000/power-controller@320
 /arm-io/pmgr/power-devices/ATC0_CIO 0x28e080328 -> /soc/power-management@28e080000/power-controller@328
@@ -228,7 +228,7 @@
 /arm-io/pmgr/power-devices/ATC3_CIO_PCIE 0x28e0803a8 -> /soc/power-management@28e080000/power-controller@3a8
 /arm-io/pmgr/power-devices/ATC3_CIO_USB 0x28e0803b0 -> /soc/power-management@28e080000/power-controller@3b0
 /arm-io/pmgr/power-devices/TRACE_FAB 0x28e0803b8 -> /soc/power-management@28e080000/power-controller@3b8
-/arm-io/pmgr/power-devices/DISPEXT1_DSC - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/DISPEXT1_DSC 0x28e0803c0 -> WAIVED: Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 /arm-io/pmgr/power-devices/CLVR_SPMI0 0x28e580100 -> /soc/power-management@28e580000/power-controller@100
 /arm-io/pmgr/power-devices/CLVR_SPMI1 0x28e580108 -> /soc/power-management@28e580000/power-controller@108
 /arm-io/pmgr/power-devices/CLVR_SPMI2 0x28e580110 -> /soc/power-management@28e580000/power-controller@110
@@ -320,7 +320,7 @@
 /arm-io/pmgr/power-devices/GFX 0x28e5803c0 -> /soc/power-management@28e580000/power-controller@3c0
 /arm-io/pmgr/power-devices/DISP0_BRC - -> WAIVED: Virtual PMGR vote; no independent power-state register.
 /arm-io/pmgr/power-devices/SEP 0x28e580c00 -> /soc/power-management@28e580000/power-controller@c00
-/arm-io/pmgr/power-devices/SEP_EISP - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/SEP_EISP 0x28e580c08 -> WAIVED: Power state with a register, switched by the SEP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 /arm-io/pmgr/power-devices/VENC_DMA 0x28e588000 -> /soc/power-management@28e580000/power-controller@8000
 /arm-io/pmgr/power-devices/VENC_PIPE4 0x28e588008 -> /soc/power-management@28e580000/power-controller@8008
 /arm-io/pmgr/power-devices/VENC_PIPE5 0x28e588010 -> /soc/power-management@28e580000/power-controller@8010
@@ -566,7 +566,7 @@
 /arm-io/smc/iop-smc-nub/smc-charger-util - -> /soc/smc@290400000
 /arm-io/uart0 0x39b200000 -> /soc/serial@39b200000
 /arm-io/uart0/debug-console - -> /soc/serial@39b200000
-/arm-io/dockchannel-uart 0x29250c000 -> /soc/fifo@29250c000
+/arm-io/dockchannel-uart 0x29250c000 -> /soc/serial@29252c000
 /arm-io/spi1 0x39b104000 -> /soc/spi@39b104000
 /arm-io/spi1/spinor /arm-io/spi1@0x0 -> /soc/spi@39b104000/flash@0
 /arm-io/spi1/spinor/firmware - -> WAIVED: Firmware flash partition; parent flash hardware is inventoried separately.

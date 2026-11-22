@@ -16,7 +16,21 @@ impl RenderState {
         self.pools.observe(init)
     }
 
+    /// Nothing of `context` still runs on its render pairs, so a kill of it may be published.
+    /// A pair whose commands all ran unstamped (`Pair::executed_for_kill`) counts as idle: only
+    /// that kill releases it.
     pub(in crate::g17::runtime) fn teardown_idle(&self, context: &Arc<Context>) -> Result<bool> {
+        self.idle_for(context, false)
+    }
+
+    /// As [`Self::teardown_idle`], for releasing `context`'s scheduler: a pair whose commands ran
+    /// unstamped counts only once a kill of the context has been published, since until then
+    /// the firmware still links that work.
+    pub(in crate::g17::runtime) fn release_idle(&self, context: &Arc<Context>) -> Result<bool> {
+        self.idle_for(context, true)
+    }
+
+    fn idle_for(&self, context: &Arc<Context>, release: bool) -> Result<bool> {
         // A pair that changed owner keeps running this scheduler's queues until
         // the new owner's first command leaves it, whichever context owns it now.
         let scheduler = Some(context.scheduler_va());
@@ -38,7 +52,9 @@ impl RenderState {
                 return Ok(false);
             }
             if let Some(pair) = entry.pair.as_ref() {
-                if !pair.idle_for_context(context)? && !pair.executed_for_kill(context) {
+                if !pair.idle_for_context(context)?
+                    && !((!release || context.kill_published()) && pair.executed_for_kill(context))
+                {
                     return Ok(false);
                 }
             }
@@ -77,7 +93,13 @@ impl RenderState {
         }
         let mut index = 0;
         while index < self.retired.len() {
-            if self.retired[index].buffer_id().is_some() {
+            // An M5 pool replaced by a same-context rebind stays until
+            // firmware acknowledged its release.
+            let pool = self.retired[index].pool();
+            if self.retired[index].buffer_id().is_some()
+                || (self.retired[index].wait_for_pool_release()
+                    && !self.pools.released(u32::from(pool.id()), pool.control_va()))
+            {
                 index += 1;
                 continue;
             }

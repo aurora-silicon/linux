@@ -13,6 +13,60 @@
 
 #include <linux/tracepoint.h>
 
+/* Submit lifecycle: 0 ioctl entry, 1 output fence installed, 2 ioctl return. */
+TRACE_EVENT(asahi_g17_submit,
+	TP_PROTO(u8 phase, u64 submit_id, u32 ctx, u32 inputs, u32 outputs,
+		 s32 result, u64 fence_context, u64 fence_seqno, u64 counter),
+	TP_ARGS(phase, submit_id, ctx, inputs, outputs, result, fence_context,
+		fence_seqno, counter),
+	TP_STRUCT__entry(
+		__field(u8, phase)
+		__field(u64, submit_id)
+		__field(u32, ctx)
+		__field(u32, inputs)
+		__field(u32, outputs)
+		__field(s32, result)
+		__field(u64, fence_context)
+		__field(u64, fence_seqno)
+		__field(u64, counter)
+	),
+	TP_fast_assign(
+		__entry->phase = phase;
+		__entry->submit_id = submit_id;
+		__entry->ctx = ctx;
+		__entry->inputs = inputs;
+		__entry->outputs = outputs;
+		__entry->result = result;
+		__entry->fence_context = fence_context;
+		__entry->fence_seqno = fence_seqno;
+		__entry->counter = counter;
+	),
+	TP_printk("phase=%u submit=%llu ctx=%u inputs=%u outputs=%u result=%d fence=%llu:%llu counter=%llu",
+		  __entry->phase, __entry->submit_id, __entry->ctx,
+		  __entry->inputs, __entry->outputs, __entry->result,
+		  __entry->fence_context, __entry->fence_seqno, __entry->counter)
+);
+
+/* Terminal aggregate output, joined to submit by fence context and sequence. */
+TRACE_EVENT(asahi_g17_output,
+	TP_PROTO(s32 result, u64 fence_context, u64 fence_seqno, u64 counter),
+	TP_ARGS(result, fence_context, fence_seqno, counter),
+	TP_STRUCT__entry(
+		__field(s32, result)
+		__field(u64, fence_context)
+		__field(u64, fence_seqno)
+		__field(u64, counter)
+	),
+	TP_fast_assign(
+		__entry->result = result;
+		__entry->fence_context = fence_context;
+		__entry->fence_seqno = fence_seqno;
+		__entry->counter = counter;
+	),
+	TP_printk("result=%d fence=%llu:%llu counter=%llu", __entry->result,
+		  __entry->fence_context, __entry->fence_seqno, __entry->counter)
+);
+
 TRACE_EVENT(asahi_g17_publish,
 	TP_PROTO(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
 		 u64 fence_context, u64 fence_seqno, u64 counter),
@@ -188,8 +242,9 @@ TRACE_EVENT(asahi_g17_inputs,
 	      __entry->sources, __entry->waits, __entry->converted, __entry->counter)
 );
 
-/* phase: 0 enqueue, 1 inline published, 2 scheduler fallback, 3 run begin,
- * 4 run end, 5 prepare begin, 6 prepare end. detail: dependencies, error or wait. */
+/* phase: 0 enqueue, 1 inline published, 2 queued, 3 run begin, 4 run end,
+ * 5 prepare begin, 6 prepare end. For phase 2, detail is 2 dependency,
+ * 3 inline capacity fallback; otherwise it is a count/error/wait. */
 TRACE_EVENT(asahi_g17_schedule,
     TP_PROTO(u8 engine, u32 ctx, u64 seq, u8 phase, s32 detail, u64 counter),
     TP_ARGS(engine, ctx, seq, phase, detail, counter),

@@ -74,7 +74,7 @@ static void iomfb_callback_envelope_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, cases[i].depth);
 	}
 	dcp->crashed = false;
-	dcpep_handle_cb(dcp, 1, NULL, sizeof(struct dcp_packet_header), 0);
+	dcpep_handle_cb(dcp, DCP_NUM_CONTEXTS, NULL, sizeof(struct dcp_packet_header), 0);
 	KUNIT_EXPECT_TRUE(test, dcp->crashed);
 }
 

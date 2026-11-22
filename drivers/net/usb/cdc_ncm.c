@@ -133,7 +133,44 @@ static void cdc_ncm_get_strings(struct net_device __always_unused *netdev, u32 s
 
 static void cdc_ncm_update_rxtx_max(struct usbnet *dev, u32 new_rx, u32 new_tx);
 
+/*
+ * Wake-on-LAN for functions known to wake the host on a magic packet while
+ * they are suspended with remote wakeup enabled (CDC_NCM_FLAG_WAKE_ON_MAGIC).
+ * Such a function matches the magic packet by itself, so WAKE_MAGIC is the
+ * remote wakeup setting of the USB device (power/wakeup in sysfs).
+ */
+static void cdc_ncm_get_wol(struct net_device *net, struct ethtool_wolinfo *wol)
+{
+	struct usbnet *dev = netdev_priv(net);
+	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+
+	if (!(ctx->drvflags & CDC_NCM_FLAG_WAKE_ON_MAGIC))
+		return;
+
+	wol->supported = WAKE_MAGIC;
+	if (device_may_wakeup(&dev->udev->dev))
+		wol->wolopts = WAKE_MAGIC;
+}
+
+static int cdc_ncm_set_wol(struct net_device *net, struct ethtool_wolinfo *wol)
+{
+	struct usbnet *dev = netdev_priv(net);
+	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+	bool enable = wol->wolopts & WAKE_MAGIC;
+
+	if (!(ctx->drvflags & CDC_NCM_FLAG_WAKE_ON_MAGIC))
+		return -EOPNOTSUPP;
+	if (wol->wolopts & ~WAKE_MAGIC)
+		return -EINVAL;
+
+	if (device_may_wakeup(&dev->udev->dev) == enable)
+		return 0;
+	return device_set_wakeup_enable(&dev->udev->dev, enable);
+}
+
 static const struct ethtool_ops cdc_ncm_ethtool_ops = {
+	.get_wol		= cdc_ncm_get_wol,
+	.set_wol		= cdc_ncm_set_wol,
 	.get_link		= usbnet_get_link,
 	.nway_reset		= usbnet_nway_reset,
 	.get_drvinfo		= usbnet_get_drvinfo,
@@ -1074,7 +1111,8 @@ static int cdc_ncm_bind(struct usbnet *dev, struct usb_interface *intf)
 	 * Additionally, generic NCM devices are assumed to accept arbitrarily
 	 * placed NDP.
 	 */
-	return cdc_ncm_bind_common(dev, intf, CDC_NCM_DATA_ALTSETTING_NCM, 0);
+	return cdc_ncm_bind_common(dev, intf, CDC_NCM_DATA_ALTSETTING_NCM,
+				   dev->driver_info->data);
 }
 
 static void cdc_ncm_align_tail(struct sk_buff *skb, size_t modulus, size_t remainder, size_t max)
@@ -1939,6 +1977,26 @@ static const struct driver_info cdc_ncm_zlp_info = {
 	.set_rx_mode = cdc_ncm_update_filter,
 };
 
+/*
+ * Same as cdc_ncm_zlp_info, for DisplayLink docks whose Ethernet wakes the
+ * host on a magic packet. Their CDC Ethernet descriptor lists power
+ * management pattern filters, but the function stalls the requests that
+ * load them; the magic packet match is built in.
+ */
+static const struct driver_info cdc_ncm_displaylink_wol_info = {
+	.description = "CDC NCM (SEND ZLP)",
+	.flags = FLAG_POINTTOPOINT | FLAG_NO_SETINT | FLAG_MULTI_PACKET
+			| FLAG_LINK_INTR | FLAG_ETHER | FLAG_SEND_ZLP,
+	.bind = cdc_ncm_bind,
+	.unbind = cdc_ncm_unbind,
+	.manage_power = usbnet_manage_power,
+	.status = cdc_ncm_status,
+	.rx_fixup = cdc_ncm_rx_fixup,
+	.tx_fixup = cdc_ncm_tx_fixup,
+	.set_rx_mode = cdc_ncm_update_filter,
+	.data = CDC_NCM_FLAG_WAKE_ON_MAGIC,
+};
+
 /* Same as cdc_ncm_info, but with FLAG_SEND_ZLP */
 static const struct driver_info apple_tethering_interface_info = {
 	.description = "CDC NCM (Apple Tethering)",
@@ -2111,6 +2169,12 @@ static const struct usb_device_id cdc_devs[] = {
 	},
 
 	/* DisplayLink docking stations */
+	/* Plugable UD-ULTC4K: wakes the host on a magic packet */
+	{ USB_DEVICE_AND_INTERFACE_INFO(0x17e9, 0x6011,
+		USB_CLASS_COMM,
+		USB_CDC_SUBCLASS_NCM, USB_CDC_PROTO_NONE),
+	  .driver_info = (unsigned long)&cdc_ncm_displaylink_wol_info,
+	},
 	{ .match_flags = USB_DEVICE_ID_MATCH_INT_INFO
 		| USB_DEVICE_ID_MATCH_VENDOR,
 	  .idVendor = 0x17e9,

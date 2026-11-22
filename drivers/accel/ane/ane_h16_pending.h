@@ -66,14 +66,31 @@ ane_h16_pending_remove(struct ane_h16_pending_table *table,
 	request->active = false;
 }
 
+/* A session fault fails every waiter and pins all DMA backing until reset. */
+static inline void
+ane_h16_pending_fail_all(struct ane_h16_pending_table *table, int status)
+{
+	unsigned int i;
+
+	table->quarantined = true;
+	table->error = status;
+	for (i = 0; i < ANE_H16_PENDING_MAX; i++) {
+		struct ane_h16_pending *request = table->slots[i];
+
+		if (!request)
+			continue;
+		request->status = status;
+		request->active = false;
+		table->slots[i] = NULL;
+	}
+}
+
 /* A published command with an uncertain outcome pins all its mappings. */
 static inline void
 ane_h16_pending_abort(struct ane_h16_pending_table *table,
 		      struct ane_h16_pending *request, int status)
 {
-	table->quarantined = true;
-	table->error = status;
-	ane_h16_pending_remove(table, request);
+	ane_h16_pending_fail_all(table, status);
 	request->status = status;
 }
 
@@ -113,15 +130,12 @@ ane_h16_pending_event(struct ane_h16_pending_table *table, const void *bytes,
 	ane_h16_pending_remove(table, request);
 	request->terminal = true;
 	request->status = ret == ANE_H16_EVENT_COMPLETE ? 0 : -EIO;
-	if (request->status) {
-		table->error = request->status;
-		table->quarantined = true;
-	}
+	if (request->status)
+		ane_h16_pending_fail_all(table, request->status);
 	return ret;
 
 corrupt:
-	table->error = ret;
-	table->quarantined = true;
+	ane_h16_pending_fail_all(table, ret);
 	return ret;
 }
 

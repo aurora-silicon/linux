@@ -152,6 +152,7 @@ struct apple_spi {
 	 */
 	spinlock_t        lock;         /* protects the state below and IE */
 	bool              active;
+	bool              threaded_tx; /* transmit-only fallback */
 	const void        *tx_ptr;
 	void              *rx_ptr;
 	u32               remaining_tx;
@@ -325,7 +326,10 @@ static bool apple_spi_prep_transfer(struct apple_spi *spi, struct spi_transfer *
 
 	/* Calculate and program the clock rate */
 	cr = DIV_ROUND_UP(clk_get_rate(spi->clk), t->speed_hz);
-	reg_write(spi, APPLE_SPI_CLKDIV, min_t(u32, cr, APPLE_SPI_CLKDIV_MAX));
+	cr = min_t(u32, cr, APPLE_SPI_CLKDIV_MAX);
+	cr = max(cr, 1U);
+	reg_write(spi, APPLE_SPI_CLKDIV, cr);
+	t->effective_speed_hz = clk_get_rate(spi->clk) / cr;
 
 	/* Update bits per word */
 	reg_mask(spi, APPLE_SPI_SHIFTCFG, APPLE_SPI_SHIFTCFG_BITS,
@@ -338,7 +342,7 @@ static bool apple_spi_prep_transfer(struct apple_spi *spi, struct spi_transfer *
 	 *    200000 * bits_per_word * fifo_threshold <= hz
 	 */
 	fifo_threshold = APPLE_SPI_FIFO_DEPTH / 2;
-	return (200000 * t->bits_per_word * fifo_threshold) <= t->speed_hz;
+	return (200000 * t->bits_per_word * fifo_threshold) <= t->effective_speed_hz;
 }
 
 static int apple_spi_poll(struct apple_spi *spi, u32 fifo_bit, u32 xfer_bit)
@@ -488,6 +492,15 @@ static irqreturn_t apple_spi_irq(int irq, void *dev_id)
 		return IRQ_NONE;
 	}
 
+	/* Keep the working thread-driven handshake for transmit-only uploads. */
+	if (spi->active && spi->threaded_tx) {
+		reg_write(spi, APPLE_SPI_IE_XFER, 0);
+		reg_write(spi, APPLE_SPI_IE_FIFO, 0);
+		complete(&spi->done);
+		spin_unlock(&spi->lock);
+		return IRQ_HANDLED;
+	}
+
 	if (spi->active)
 		apple_spi_service(spi);
 	reg_write(spi, APPLE_SPI_IF_FIFO,
@@ -533,6 +546,7 @@ static int apple_spi_transfer_one(struct spi_controller *ctlr, struct spi_device
 	spi->remaining_tx = t->tx_buf ? words : 0;
 	spi->remaining_rx = t->rx_buf ? words : 0;
 	spi->bytes_per_word = bytes_per_word;
+	spi->threaded_tx = t->tx_buf && !t->rx_buf;
 
 	/* Reset FIFOs */
 	reg_write(spi, APPLE_SPI_CTRL, APPLE_SPI_CTRL_RX_RESET | APPLE_SPI_CTRL_TX_RESET);
@@ -572,11 +586,39 @@ static int apple_spi_transfer_one(struct spi_controller *ctlr, struct spi_device
 			/* Transmit and receive everything we can */
 			apple_spi_service(spi);
 		}
+	} else if (spi->threaded_tx) {
+		/*
+		 * Transmit-only uploads can lose FIFO progress with the IRQ
+		 * engine. Use the pre-IRQ-engine wake/refill/rearm sequence;
+		 * retain in-handler service for receive and duplex transfers.
+		 */
+		while (spi->xfer_flags) {
+			reinit_completion(&spi->done);
+			spin_lock_irqsave(&spi->lock, flags);
+			spi->active = true;
+			reg_write(spi, APPLE_SPI_IE_XFER, spi->xfer_flags);
+			reg_write(spi, APPLE_SPI_IE_FIFO, apple_spi_fifo_flags(spi));
+			spin_unlock_irqrestore(&spi->lock, flags);
+
+			if (!wait_for_completion_timeout(&spi->done,
+							 msecs_to_jiffies(APPLE_SPI_TIMEOUT_MS)))
+				ret = -ETIMEDOUT;
+
+			spin_lock_irqsave(&spi->lock, flags);
+			spi->active = false;
+			reg_write(spi, APPLE_SPI_IE_XFER, 0);
+			reg_write(spi, APPLE_SPI_IE_FIFO, 0);
+			spin_unlock_irqrestore(&spi->lock, flags);
+			synchronize_irq(spi->irq);
+			if (ret)
+				break;
+			apple_spi_service(spi);
+		}
 	} else {
 		/* Allow for the transfer itself on top of the usual timeout. */
 		unsigned long ms = APPLE_SPI_TIMEOUT_MS +
 			DIV_ROUND_UP_ULL((u64)words * t->bits_per_word * 1000,
-					 max(t->speed_hz, 1U));
+					 max(t->effective_speed_hz, 1U));
 
 		reinit_completion(&spi->done);
 		spin_lock_irqsave(&spi->lock, flags);

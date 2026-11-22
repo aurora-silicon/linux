@@ -289,6 +289,21 @@ static inline void dcp_m4_swap_set_intent(void *output, u32 intent, u32 surface_
 	put_unaligned_le32(surface_id, data + 0x9c);
 }
 
+/*
+ * Set an encoded swap's presentation deadline: IOMobileFramebuffer timestamp
+ * types 1, 2 and 7 (+0x0, +0x8, +0x30), as the firmware 26 desktop path
+ * fills them (dcp_desktop_present_deadline()). Left 0 on a 120 Hz panel, the
+ * DCP completes a swap only every second vblank.
+ */
+static inline void dcp_m4_swap_set_deadline(void *output, u64 deadline)
+{
+	u8 *data = output;
+
+	put_unaligned_le64(deadline, data + 0x0);
+	put_unaligned_le64(deadline, data + 0x8);
+	put_unaligned_le64(deadline, data + 0x30);
+}
+
 static inline int dcp_m4_swap_encode_checked(void *output, size_t length, u32 swap_id,
 					     const struct dcp_m4_frame *frame,
 					     bool brightness_change, u32 nits,

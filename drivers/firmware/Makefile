@@ -39,5 +39,3 @@ obj-y				+= samsung/
 obj-y				+= smccc/
 obj-y				+= tegra/
 obj-y				+= xilinx/
-
-obj-$(CONFIG_AURORA_APIF_MMIO) += aurora-apif-mmio.o

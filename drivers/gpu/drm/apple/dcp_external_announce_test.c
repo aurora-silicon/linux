@@ -102,6 +102,7 @@ static struct announce_test *announce_test_init(struct kunit *test)
 	dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	iomfb_queue_init(dcp);
 	mutex_init(&dcp->hpd_mutex);
+	mutex_init(&dcp->tb_event_lock);
 	spin_lock_init(&dcp->relink_lock);
 	mutex_init(&dcp->dcpavserv.lock);
 	spin_lock_init(&dcp->metadata.lock);
@@ -115,11 +116,13 @@ static struct announce_test *announce_test_init(struct kunit *test)
 	INIT_DELAYED_WORK(&dcp->hybrid_wq, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->backlight.fade_work, announce_test_noop);
+	INIT_DELAYED_WORK(&dcp->brightness.fade_work, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->backlight.retry_work, announce_test_noop);
 	INIT_WORK(&dcp->external_stop_work, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, announce_test_noop);
 	INIT_WORK(&dcp->vblank_wq, announce_test_noop);
 	INIT_WORK(&dcp->dimensions_wq, announce_test_noop);
+	INIT_WORK(&dcp->tb_event_work, announce_test_noop);
 	INIT_WORK(&t->con.hotplug_wq, announce_test_event);
 	mutex_init(&t->drm.mode_config.mutex);
 

@@ -34,6 +34,7 @@ select:
           - apple,t8122-mcc
           - apple,t8132-mcc
           - apple,t8140-mcc
+          - apple,t8142-mcc
   required:
     - compatible
 
@@ -92,6 +93,7 @@ allOf:
             - items:
                 - enum:
                     - apple,t6041-mcc
+                    - apple,t8142-mcc
                 - const: apple,t8140-mcc
 
         reg:

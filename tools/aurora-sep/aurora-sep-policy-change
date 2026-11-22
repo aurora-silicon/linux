@@ -4,11 +4,12 @@
 
 A new Stage 1, another boot object or a boot mode conversion changes the
 Mac's boot policy for Linux. The first time Linux's identity keybag is
-unlocked under the new policy, the enclave rewrites one session record in
-the shared xART gigalocker. Linux did not create that record, so the
-driver's xART guard refuses the write, the machine ref-key stays down and
-Touch ID is unavailable. The keybag, the ref-key and the enrolled
-fingerprints are all intact: the refused write changed nothing.
+used under the new policy (unlocked, or designated for Touch ID), the
+enclave rewrites one session record in the shared xART gigalocker. Linux
+did not create that record, so the driver's xART guard refuses the write,
+the enclave stops answering and Touch ID is unavailable. The keybag, the
+ref-key and the enrolled fingerprints are all intact: the refused write
+changed nothing.
 
 This lets the enclave make that one write on the next boot:
 
@@ -19,6 +20,11 @@ This lets the enclave make that one write on the next boot:
                                       enclave asks to rewrite next boot
   aurora-sep-policy-change --status   what is armed, and this boot's refusals
   aurora-sep-policy-change --cancel   remove an allowance not used yet
+
+Only a kernel with the xART guard's allowance code reads the allowance.
+After a planned change, make the first boot such a kernel; any other
+kernel leaves the allowance for a later boot. See "Changing Stage 1 on
+purpose" in XART-SAFETY.md.
 
 Before it arms anything it backs up the whole gigalocker extent, the
 driver's host files and the fingerprint store to

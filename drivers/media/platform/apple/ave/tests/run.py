@@ -37,13 +37,31 @@ def build(src, out, baseline):
     has_layout = (src / 'ave-layout.h').exists()
     code = (Path(__file__).parent / 'shim.h').read_text()
     for name in ('AVE_MAX_SLOTS', 'AVE_MAX_REFS', 'AVE_TILE_BUFS',
-                 'AVE_MAX_SESSIONS', 'AVE_FW_TEXT_CRC_9003_78_0'):
+                 'AVE_MAX_SESSIONS', 'AVE_FW_TEXT_CRC_9003_78_0',
+                 'AVE_6070_LOWRES_RESULTS',
+                 'AVE_6070_AVC_ENTROPY_TILES',
+                 'AVE_6070_CLIENT_MEM_BYTES', 'AVE_6070_CODED_HEADER_BYTES',
+                 'AVE_AVC_FLAT_SCALING_WEIGHT', 'AVE_AVC_RECON_SKIP_MODE',
+                 'AVE_AVC_STATIC_AREA_MASK_ALL'):
         code += re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)[0] + '\n'
+    for name in ('AVE_ENTROPY_SETS', 'AVE_NEIGHBOUR_SETS'):
+        match = re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)
+        if match:
+            code += match[0] + '\n'
+    # Every firmware build's text CRC and the rate-control modes: ave-layout.c and
+    # ave-sess.c name them, and each new build adds one, so take them all.
+    defined = set(re.findall(r'^#define (\w+)', code, re.M))
+    for m in re.finditer(r'^#define ((?:AVE_FW_TEXT_CRC|AVE_RC)_\w+)\s+[^\n]+', header, re.M):
+        if m[1] not in defined:
+            code += m[0] + '\n'
     # Later firmware builds; an older baseline does not define them.
-    for name in ('AVE_FW_TEXT_CRC_T6040_25G83',):
+    for name in ('AVE_MCTF_BUFS', 'AVE_MCTF_IN_BUFS',
+                 'AVE_MCTF_OUT_BUFS', 'AVE_MCTF_POOL_LENT', 'AVE_MCTF_POOL_READY'):
         m = re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)
         if m:
             code += m[0] + '\n'
+    if (src / 'ave-cmp420.h').exists():
+        code += source((src / 'ave-cmp420.h').read_text())
     for name in ('ave_codec', 'ave_buf', 'ave_fw_state', 'ave_image',
                  'ave_coproc_regs', 'ave_variant', 'ave_params', 'ave_slot', 'ave_session'):
         code += declaration(header, name)
@@ -77,7 +95,7 @@ def build(src, out, baseline):
             while line.endswith('\\'):
                 line = next(lines)
                 code += line + '\n'
-    for name in ('ave_buf_req_cmp', 'ave_req', 'ave_sess_alloc', 'ave_sess_free_bufs', 'ave_sess_reply'):
+    for name in ('ave_buf_req_cmp', 'ave_req', 'ave_sess_alloc', 'ave_mctf_pool_crc', 'ave_mctf_pool_check', 'ave_mctf_pool_return', 'ave_sess_free_bufs', 'ave_sess_reply'):
         code += function(session, name)
     if not baseline:
         fw = (src / 'ave-fw.c').read_text()
@@ -89,6 +107,8 @@ def build(src, out, baseline):
     (out / 'host.c').write_text(code)
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-O1', '-g',
                     '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
+                    # host.c pastes whole driver files: helpers the tests don't call are fine.
+                    '-Wno-unused-function',
                     '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
                     str(out / 'host.c'), '-o', str(out / 'ave-test')], check=True)
     return out / 'ave-test'

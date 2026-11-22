@@ -1,0 +1,157 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J714s DisplayPort audio, as macOS 27 has it: each external display engine's dp-audio takes
+ * its samples from that engine's own ADMAC (admac-dispextN, behind dart-dispextN-isoc), all in
+ * the engine's DISPEXTN_ADMA. dp-audio1 belongs to dcpext0, dp-audio2 to dcpext1 and dp-audio3
+ * to dcpext2: the three engines that drive a display on their own (the DP alt mode routes and
+ * the DP tunnels). dcpext3's dp-audio4 is not described: on the J714s dcpext3 only joins
+ * another engine for a mode that needs two pipelines, and that display's audio is the primary
+ * engine's. The DCP side starts unless appledrm.hdmi_audio=0. The boot loader finds each
+ * ADMAC's control block by its alias and copies the block's ADT tunables into it.
+ */
+
+/ {
+	aliases {
+		admac-dispext0-control = &admac_dispext0_ced_ssw;
+		admac-dispext1-control = &admac_dispext1_ced_ssw;
+		admac-dispext2-control = &admac_dispext2_ced_ssw;
+	};
+
+	dpaudio1: audio-controller-1 {
+		compatible = "apple,t6050-dpaudio", "apple,dpaudio";
+		dmas = <&admac_dispext0 0>;
+		dma-names = "tx";
+		power-domains = <&ps_dispext0_adma>;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio1_dcpext0: endpoint {
+					remote-endpoint = <&dcpext0_audio>;
+				};
+			};
+		};
+	};
+
+	dpaudio2: audio-controller-2 {
+		compatible = "apple,t6050-dpaudio", "apple,dpaudio";
+		dmas = <&admac_dispext1 0>;
+		dma-names = "tx";
+		power-domains = <&ps_dispext1_adma>;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio2_dcpext1: endpoint {
+					remote-endpoint = <&dcpext1_audio>;
+				};
+			};
+		};
+	};
+
+	dpaudio3: audio-controller-3 {
+		compatible = "apple,t6050-dpaudio", "apple,dpaudio";
+		dmas = <&admac_dispext2 0>;
+		dma-names = "tx";
+		power-domains = <&ps_dispext2_adma>;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio3_dcpext2: endpoint {
+					remote-endpoint = <&dcpext2_audio>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext0_audio: endpoint {
+				remote-endpoint = <&dpaudio1_dcpext0>;
+			};
+		};
+	};
+};
+
+&dcpext1 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext1_audio: endpoint {
+				remote-endpoint = <&dpaudio2_dcpext1>;
+			};
+		};
+	};
+};
+
+&dcpext2 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext2_audio: endpoint {
+				remote-endpoint = <&dpaudio3_dcpext2>;
+			};
+		};
+	};
+};
+
+&ps_dispext0_adma {
+	status = "okay";
+};
+
+&dispext0_isoc_dart {
+	status = "okay";
+};
+
+&admac_dispext0 {
+	status = "okay";
+};
+
+&ps_dispext1_adma {
+	status = "okay";
+};
+
+&dispext1_isoc_dart {
+	status = "okay";
+};
+
+&admac_dispext1 {
+	status = "okay";
+};
+
+&ps_dispext2_adma {
+	status = "okay";
+};
+
+&dispext2_isoc_dart {
+	status = "okay";
+};
+
+&admac_dispext2 {
+	status = "okay";
+};

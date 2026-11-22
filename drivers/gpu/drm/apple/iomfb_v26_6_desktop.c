@@ -52,46 +52,24 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 
 #include "iomfb_template.c"
 
-struct dcp_dict_passthrough_req_v26_6 {
-	u8 key[0x40];
-	u8 value[0x1000];
-	u8 value_null;
-	u8 padding[3];
-} __packed;
-
-struct dcp_dict_passthrough_resp_v26_6 {
-	u8 value[0x1000];
-	u8 ret;
-	u8 padding[3];
-} __packed;
-
-static_assert(sizeof(struct dcp_dict_passthrough_req_v26_6) == 0x1044);
-static_assert(sizeof(struct dcp_dict_passthrough_resp_v26_6) == 0x1004);
-
 /*
- * D114 periodically publishes dictionary-valued statistics.  The value is an
- * in/out pointer, which the firmware deserializes again: the firmware's own
- * client returns the serialized buffer unchanged and reports false.  An
- * all-zero reply is not a harmless false.
+ * D114 periodically publishes dictionary-valued statistics: the analytics
+ * event, answered by dcp_dict_passthrough_reply().
  */
 static bool trampoline_passthrough_dict_v26_6(struct apple_dcp *dcp, int tag,
 					      void *out, void *in)
 {
-	const struct dcp_dict_passthrough_req_v26_6 *req = in;
-	struct dcp_dict_passthrough_resp_v26_6 *resp = out;
+	const struct dcp_dict_passthrough_req *req = in;
+	struct dcp_dict_passthrough_resp *resp = out;
 
 	trace_iomfb_callback(dcp, tag, "dcpep_cb_passthrough_dict");
 	dcp_trace_panel_property(dcp, tag, (const char *)req->key,
 				 strnlen((const char *)req->key, sizeof(req->key)),
 				 req->value_null ? NULL : req->value, sizeof(req->value));
 
-	if (!req->value_null) {
+	if (!req->value_null)
 		dcp_panel_edid_receive(dcp, req->value, sizeof(req->value));
-		memcpy(resp->value, req->value, sizeof(resp->value));
-	}
-
-	resp->ret = false;
-	memset(resp->padding, 0, sizeof(resp->padding));
+	dcp_dict_passthrough_reply(req, resp);
 
 	return true;
 }
@@ -101,7 +79,7 @@ static bool trampoline_panel_dictionary_v26_6(struct apple_dcp *dcp, int tag,
 					      void *out, void *in)
 {
 	/* Service dictionary setters prefix the same record with a handle. */
-	const struct dcp_dict_passthrough_req_v26_6 *req = tag == 413 ? in + 4 : in;
+	const struct dcp_dict_passthrough_req *req = tag == 413 ? in + 4 : in;
 	const char *key = (const char *)req->key;
 	struct dcp_display_metadata metadata;
 	struct dcp_parse_ctx ctx;
@@ -297,8 +275,8 @@ static const struct dcp_cb_min_v26_6_desktop cb_min[IOMFB_MAX_CB] = {
 	[111] = CB_MIN(0, sizeof(u8)),
 	[112] = CB_MIN(0, sizeof(u8)),
 	[113] = CB_MIN(0, sizeof(u8)),
-	[114] = CB_MIN(sizeof(struct dcp_dict_passthrough_req_v26_6),
-		       sizeof(struct dcp_dict_passthrough_resp_v26_6)),
+	[114] = CB_MIN(sizeof(struct dcp_dict_passthrough_req),
+		       sizeof(struct dcp_dict_passthrough_resp)),
 	[115] = CB_MIN(sizeof(struct dcpep_get_tiling_state_req),
 		       sizeof(struct dcpep_get_tiling_state_resp)),
 	[116] = CB_MIN(sizeof(struct dcpep_get_tiling_state_req), sizeof(u32)),

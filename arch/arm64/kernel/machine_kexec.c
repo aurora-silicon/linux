@@ -6,11 +6,13 @@
  * Copyright (C) Huawei Futurewei Technologies.
  */
 
+#include <linux/delay.h>
 #include <linux/execmem.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/kernel.h>
 #include <linux/kexec.h>
+#include <linux/kprobes.h>
 #include <linux/page-flags.h>
 #include <linux/reboot.h>
 #include <linux/set_memory.h>
@@ -56,15 +58,18 @@ void machine_kexec_cleanup(struct kimage *kimage)
 int machine_kexec_prepare(struct kimage *kimage)
 {
 	/*
-	 * The relocation code runs from an ordinary page, outside the window,
-	 * and a crash dump can start on a core enforcing it.
+	 * A new kernel runs from ordinary memory, outside the window, so the
+	 * confined secondaries could never run it. Only a crash kernel can
+	 * start: it runs on the boot CPU alone, which the window doesn't
+	 * confine (see crash_handoff()).
 	 */
-	if (execmem_confine_active()) {
+	if (execmem_confine_active() && kimage->type != KEXEC_TYPE_CRASH) {
 		pr_err("Can't kexec: the kernel's code is confined to a CTXR window.\n");
 		return -EOPNOTSUPP;
 	}
 
-	if (kimage->type != KEXEC_TYPE_CRASH && cpus_are_stuck_in_kernel()) {
+	if (kimage->type != KEXEC_TYPE_CRASH &&
+	    (cpus_are_stuck_in_kernel() || spin_table_cpus_stuck())) {
 		pr_err("Can't kexec: CPUs are stuck in the kernel.\n");
 		return -EBUSY;
 	}
@@ -165,6 +170,100 @@ int machine_kexec_post_load(struct kimage *kimage)
 	return 0;
 }
 
+#if defined(CONFIG_CRASH_DUMP) && defined(CONFIG_ARM64_CTXR_EXECMEM)
+/*
+ * Under a CTXR window every core but the boot CPU fetches code only from the
+ * window, and the crash kernel sits in ordinary memory. A crash handled on a
+ * confined core therefore offers the jump to CPU 0, which waits for it in its
+ * stop handler. The state makes taking the offer and withdrawing it after a
+ * timeout exclusive, so exactly one of the two CPUs goes on.
+ */
+enum {
+	CRASH_HANDOFF_IDLE,
+	CRASH_HANDOFF_OFFERED,
+	CRASH_HANDOFF_TAKEN,
+	CRASH_HANDOFF_WITHDRAWN,
+};
+
+static int crash_handoff_state;
+static struct kimage *crash_handoff_image;
+
+static bool crash_needs_handoff(void)
+{
+	return execmem_confine_active() && smp_processor_id() != 0;
+}
+
+/*
+ * Called by every CPU told to stop, with interrupts masked. On CPU 0, with a
+ * window and a crash kernel loaded, wait for a confined core to hand the crash
+ * kernel over instead of parking. Waiting is parking until that happens.
+ */
+void arm64_crash_handoff_wait(void)
+{
+	if (!execmem_confine_active() || smp_processor_id() != 0 ||
+	    !kexec_crash_loaded())
+		return;
+
+	for (;;) {
+		if (cmpxchg(&crash_handoff_state, CRASH_HANDOFF_OFFERED,
+			    CRASH_HANDOFF_TAKEN) == CRASH_HANDOFF_OFFERED)
+			machine_kexec(READ_ONCE(crash_handoff_image));
+		wfe();
+	}
+}
+NOKPROBE_SYMBOL(arm64_crash_handoff_wait);
+
+/*
+ * Offer the crash kernel to CPU 0 and park. Returns only when CPU 0 can't take
+ * it: it never acknowledged the stop, or didn't answer within a second. The
+ * panic then goes on to its normal restart.
+ */
+static void crash_handoff(struct kimage *kimage)
+{
+	unsigned int cpu = smp_processor_id();
+	unsigned long timeout = USEC_PER_SEC;
+
+	if (cpu_online(0)) {
+		pr_err("CPU 0 did not stop, so the crash kernel can't start from confined CPU %u\n",
+		       cpu);
+		return;
+	}
+
+	pr_info("CPU %u is confined to the CTXR window, CPU 0 starts the crash kernel\n",
+		cpu);
+	WRITE_ONCE(crash_handoff_image, kimage);
+	/* CPU 0 then sees no other CPU online, as after any crash stop. */
+	set_cpu_online(cpu, false);
+	if (cmpxchg(&crash_handoff_state, CRASH_HANDOFF_IDLE,
+		    CRASH_HANDOFF_OFFERED) != CRASH_HANDOFF_IDLE)
+		cpu_park_loop();
+	dsb(ish);
+	sev();
+
+	while (timeout--) {
+		if (READ_ONCE(crash_handoff_state) == CRASH_HANDOFF_TAKEN)
+			cpu_park_loop();
+		udelay(1);
+	}
+
+	if (cmpxchg(&crash_handoff_state, CRASH_HANDOFF_OFFERED,
+		    CRASH_HANDOFF_WITHDRAWN) == CRASH_HANDOFF_TAKEN)
+		cpu_park_loop();
+
+	set_cpu_online(cpu, true);
+	pr_err("CPU 0 did not take the crash kernel\n");
+}
+#else
+static bool crash_needs_handoff(void)
+{
+	return false;
+}
+
+static void crash_handoff(struct kimage *kimage)
+{
+}
+#endif
+
 /**
  * machine_kexec - Do the kexec reboot.
  *
@@ -174,6 +273,11 @@ void machine_kexec(struct kimage *kimage)
 {
 	bool in_kexec_crash = (kimage == kexec_crash_image);
 	bool stuck_cpus = cpus_are_stuck_in_kernel();
+
+	if (in_kexec_crash && crash_needs_handoff()) {
+		crash_handoff(kimage);
+		return;
+	}
 
 	/*
 	 * New cpus may have become stuck_in_kernel after we loaded the image.

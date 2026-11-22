@@ -22,7 +22,7 @@
 			 { DCP_EXPERT_ENDPOINT, "dcpexpert" },     \
 			 { DISP0_ENDPOINT, "disp0" },              \
 			 { DPTX_ENDPOINT, "dptxport" },            \
-			 { HDCP_ENDPOINT, "hdcp" },                \
+			 { AV_VIDEO_ENDPOINT, "avvideo" },         \
 			 { REMOTE_ALLOC_ENDPOINT, "remotealloc" }, \
 			 { IOMFB_ENDPOINT, "iomfb" })
 #define print_epic_type(etype)                                  \

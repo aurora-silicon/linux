@@ -8,6 +8,7 @@ use kernel::prelude::*;
 const TAG_SET: u8 = 0x31;
 const TAG_SEQUENCE: u8 = 0x30;
 const TAG_UTF8: u8 = 0x0c;
+const TAG_BOOLEAN: u8 = 0x01;
 pub(crate) const TAG_INTEGER: u8 = 0x02;
 pub(crate) const TAG_OCTET_STRING: u8 = 0x04;
 
@@ -51,6 +52,8 @@ pub(crate) enum RefKeyValue<'a> {
     Integer(u32),
     Octets(&'a [u8]),
     Der(&'a [u8]),
+    /// BOOLEAN, encoded as the key store writes it (true = 0x01).
+    Bool(bool),
 }
 
 /// Canonical DER `SET OF SEQUENCE`, members sorted by key — the shape the
@@ -85,6 +88,10 @@ pub(crate) fn encode_refkey_set(items: &[(&[u8], RefKeyValue<'_>)]) -> Result<KV
                 inner.extend_from_slice(b, GFP_KERNEL)?;
             }
             RefKeyValue::Der(d) => inner.extend_from_slice(d, GFP_KERNEL)?,
+            RefKeyValue::Bool(b) => {
+                put_header(&mut inner, TAG_BOOLEAN, 1)?;
+                inner.push(u8::from(*b), GFP_KERNEL)?;
+            }
         }
         let mut seq = KVec::new();
         put_header(&mut seq, TAG_SEQUENCE, inner.len())?;
@@ -157,4 +164,30 @@ pub(crate) fn octet_string_body(tlv: &[u8]) -> Option<&[u8]> {
         Some((TAG_OCTET_STRING, body, [])) => Some(body),
         _ => None,
     }
+}
+
+fn integer_value(tlv: &[u8]) -> Option<i64> {
+    let body = match take_tlv(tlv) {
+        Some((TAG_INTEGER, body, [])) if !body.is_empty() && body.len() <= 5 => body,
+        _ => return None,
+    };
+    // DER integers are minimal, signed, big-endian values.
+    if body.len() > 1
+        && ((body[0] == 0 && body[1] & 0x80 == 0) || (body[0] == 0xff && body[1] & 0x80 != 0))
+    {
+        return None;
+    }
+    let mut value = if body[0] & 0x80 != 0 { -1i64 } else { 0 };
+    for byte in body {
+        value = (value << 8) | i64::from(*byte);
+    }
+    Some(value)
+}
+
+pub(crate) fn integer_u32(tlv: &[u8]) -> Option<u32> {
+    u32::try_from(integer_value(tlv)?).ok()
+}
+
+pub(crate) fn integer_i32(tlv: &[u8]) -> Option<i32> {
+    i32::try_from(integer_value(tlv)?).ok()
 }

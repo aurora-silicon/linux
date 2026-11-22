@@ -1433,9 +1433,11 @@ static void ane_transport_bar_context_h16_test(struct kunit *test)
 
 	f->soc.chip_family = 16;
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
-	/* Not yet measured on H16: requests are published unchanged. */
+	/* Each H16 program switch installs the queued job's private BARs. */
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 0), ANE_H16_EXECUTE_FLAG_QUEUED);
 	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 0), 0U);
-	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 1, 1), 0U);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 1, 1), ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 0), ANE_H16_EXECUTE_FLAG_QUEUED);
 }
 
 /* Each relax() learns how long its wait has run, and every call is counted. */

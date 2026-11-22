@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * H16 and H17 accel node (ABI version 3). It exists only after the staged
- * opt-in completed its program stage. Every firmware-visible byte lives in private
- * kernel mappings; userspace passes the original HWX, the host-built sections
- * and plain input/output buffers, never DVAs, firmware IDs or commands.
+ * opt-in completed its program stage. Programs, sections and scratch live in
+ * private kernel mappings; userspace passes the original HWX, the host-built
+ * sections and plain input/output buffers, never DVAs, firmware IDs or
+ * commands. A process may map its program's surfaces (inputs and outputs
+ * only) and run requests on them in place, without copies.
  */
 #include <linux/ktime.h>
+#include <linux/mm.h>
+#include <linux/sizes.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
@@ -25,11 +29,13 @@
 struct ane_h16_accel {
 	struct drm_device drm;
 	struct ane_h16_session *session;
-	/* Serializes the session, every program and all firmware traffic. */
+	/* Serializes admission, transport traffic and completion dispatch. */
 	struct mutex lock;
 };
 
 struct ane_h16_accel_file {
+	/* Pins the program lifetime across LOAD and an EXECUTE's copy phases. */
+	struct mutex lock;
 	struct ane_h16_program *program;
 };
 
@@ -109,9 +115,12 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 						     args->hwx_size, &snapshot);
 	if (ret)
 		goto out;
+	mutex_lock(&f->lock);
 	ret = ane_h16_session_enter(a->session, file->filp->f_flags & O_NONBLOCK);
-	if (ret)
+	if (ret) {
+		mutex_unlock(&f->lock);
 		goto out;
+	}
 	/* Lost across system sleep: release it, the caller is reloading. */
 	if (f->program && ane_h16_program_lost(a->session, f->program) &&
 	    !ane_h16_session_close(a->session, f->program)) {
@@ -123,9 +132,6 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	} else {
 		ret = ane_h16_session_load(a->session, &snapshot,
 					   (const void *const *)aux, aux_size, &program);
-		if (ret == -EBUSY)
-			/* The caller's own EBUSY, not a driver error. */
-			drm_dbg(drm, "another program is still loaded; close it first\n");
 		if (!ret)
 			f->program = program;
 	}
@@ -141,6 +147,7 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 		}
 	}
 	mutex_unlock(&a->lock);
+	mutex_unlock(&f->lock);
 out:
 	/* A consumed snapshot was moved into the program and reads as empty. */
 	if (snapshot.bytes)
@@ -161,35 +168,44 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	unsigned int i;
 	int ret = 0;
 
-	if (args->flags || !args->count || args->count > ANE_H16_SURFACES)
+	const bool in_place = args->flags & DRM_ANE_H16_EXEC_IN_PLACE;
+
+	if ((args->flags & ~DRM_ANE_H16_EXEC_IN_PLACE) || !args->count ||
+	    args->count > ANE_H16_SURFACES || (in_place && args->buffers_ptr))
 		return -EINVAL;
-	if (copy_from_user(buffers, u64_to_user_ptr(args->buffers_ptr),
-			   array_size(args->count, sizeof(*buffers))))
+	if (!in_place && copy_from_user(buffers, u64_to_user_ptr(args->buffers_ptr),
+					array_size(args->count, sizeof(*buffers))))
 		return -EFAULT;
 	start = ktime_get_ns();
+	mutex_lock(&f->lock);
 	ret = ane_h16_session_enter(a->session, file->filp->f_flags & O_NONBLOCK);
-	if (ret)
+	if (ret) {
+		mutex_unlock(&f->lock);
 		return ret;
-	locked = ktime_get_ns();
+	}
 	p = f->program;
 	if (!p || p->closed || args->count != p->resource_count) {
 		ret = -EINVAL;
 		goto unlock;
 	}
-	for (i = 0; i < args->count; i++) {
+	for (i = 0; i < args->count && !in_place; i++) {
 		if (buffers[i].size != p->resources[i].buffer.size) {
 			ret = -EINVAL;
 			goto unlock;
 		}
 	}
-	/* The firmware is idle for this program, so its inputs may change now. */
-	for (i = 0; i < args->count; i++) {
+	ret = ane_h16_session_acquire(a->session, p);
+	if (ret)
+		goto unlock;
+	locked = ktime_get_ns();
+	/* This program's shared surfaces are ours through the final copy-out. */
+	for (i = 0; i < args->count && !in_place; i++) {
 		void *cpu = p->surfaces[i]->cpu;
 
 		if (p->resources[i].permissions == 1) {
 			if (copy_from_user(cpu, u64_to_user_ptr(buffers[i].ptr), buffers[i].size)) {
 				ret = -EFAULT;
-				goto unlock;
+				goto release;
 			}
 		} else {
 			memset(cpu, 0xff, buffers[i].size);
@@ -197,12 +213,12 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	}
 	ane_h16_session_sync(a->session, p, true);
 	copied = ktime_get_ns();
-	ret = ane_h16_session_execute(a->session, p);
+	ret = ane_h16_session_run(a->session, p);
 	if (ret)
-		goto unlock;
+		goto release;
 	done = ktime_get_ns();
 	ane_h16_session_sync(a->session, p, false);
-	for (i = 0; i < args->count; i++)
+	for (i = 0; i < args->count && !in_place; i++)
 		if (p->resources[i].permissions == 2 &&
 		    copy_to_user(u64_to_user_ptr(buffers[i].ptr), p->surfaces[i]->cpu,
 				 buffers[i].size))
@@ -228,8 +244,101 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 			       div_u64(ns[ANE_H16_T_FIRMWARE], 1000),
 			       div_u64(end - start, 1000), a->session->timing.polls);
 	}
+release:
+	ane_h16_session_release(a->session, p);
 unlock:
 	mutex_unlock(&a->lock);
+	mutex_unlock(&f->lock);
+	return ret;
+}
+
+static void ane_h16_vm_open(struct vm_area_struct *vma)
+{
+	ane_h16_export_get(vma->vm_private_data);
+}
+
+static void ane_h16_vm_close(struct vm_area_struct *vma)
+{
+	ane_h16_export_put(vma->vm_private_data);
+}
+
+static const struct vm_operations_struct ane_h16_vm_ops = {
+	.open = ane_h16_vm_open,
+	.close = ane_h16_vm_close,
+};
+
+/*
+ * Map a prefix of surface i of the file's program at DRM_ANE_H16_MMAP_OFFSET(i).
+ * Inputs may be written, outputs only read. The pages are the surface's own,
+ * held by the mapping (struct ane_h16_export) until it is gone.
+ */
+static int ane_h16_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct drm_file *file = filp->private_data;
+	struct ane_h16_accel *a = to_h16_accel(file->minor->dev);
+	struct ane_h16_accel_file *f = file->driver_priv;
+	const u64 offset = (u64)vma->vm_pgoff << PAGE_SHIFT;
+	const unsigned long pages = vma_pages(vma);
+	struct ane_h16_export *e = NULL;
+	struct ane_h16_program *p;
+	unsigned long n, i;
+	struct page **list;
+	unsigned int index;
+	bool input = false;
+	int ret;
+
+	/*
+	 * Surfaces are 16 KiB blocks of order-0 pages only with 16 KiB pages;
+	 * a smaller page would map the tail pages of a higher-order block.
+	 */
+	if (PAGE_SIZE != SZ_16K)
+		return -EOPNOTSUPP;
+	if (offset & GENMASK_ULL(31, 0) || offset >> 32 < 1 ||
+	    offset >> 32 > ANE_H16_SURFACES || (vma->vm_flags & VM_EXEC))
+		return -EINVAL;
+	index = (offset >> 32) - 1;
+	mutex_lock(&f->lock);
+	ret = ane_h16_session_enter(a->session, filp->f_flags & O_NONBLOCK);
+	if (ret) {
+		mutex_unlock(&f->lock);
+		return ret;
+	}
+	p = f->program;
+	ret = -EINVAL;
+	if (p && !p->closed && index < p->resource_count &&
+	    pages <= DIV_ROUND_UP(p->resources[index].buffer.size, PAGE_SIZE) &&
+	    pages <= p->surfaces[index]->size >> PAGE_SHIFT &&
+	    !((vma->vm_flags & VM_WRITE) && p->resources[index].permissions != 1)) {
+		input = p->resources[index].permissions == 1;
+		ret = ane_h16_session_export(a->session, p, index, &e);
+	}
+	mutex_unlock(&a->lock);
+	mutex_unlock(&f->lock);
+	if (ret)
+		return ret;
+
+	list = kvmalloc_array(pages, sizeof(*list), GFP_KERNEL);
+	if (!list) {
+		ane_h16_export_put(e);
+		return -ENOMEM;
+	}
+	for (i = 0; i < pages; i++)
+		list[i] = vmalloc_to_page(e->surface.cpu + i * PAGE_SIZE);
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_DONTCOPY);
+	vm_flags_clear(vma, VM_MAYEXEC);
+	if (!input)
+		vm_flags_clear(vma, VM_MAYWRITE);
+	vma->vm_private_data = e;
+	vma->vm_ops = &ane_h16_vm_ops;
+	n = pages;
+	ret = vm_insert_pages(vma, vma->vm_start, list, &n);
+	kvfree(list);
+	if (ret) {
+		/* The failed mmap is unmapped without our close: drop the reference here. */
+		vma->vm_ops = NULL;
+		vma->vm_private_data = NULL;
+		ane_h16_export_put(e);
+	}
 	return ret;
 }
 
@@ -239,6 +348,7 @@ static int ane_h16_open(struct drm_device *drm, struct drm_file *file)
 
 	if (!f)
 		return -ENOMEM;
+	mutex_init(&f->lock);
 	file->driver_priv = f;
 	return 0;
 }
@@ -270,6 +380,7 @@ static void ane_h16_postclose(struct drm_device *drm, struct drm_file *file)
 			ane_h16_session_put(a->session, f->program);
 	}
 	mutex_unlock(&a->lock);
+	mutex_destroy(&f->lock);
 	kfree(f);
 }
 
@@ -280,9 +391,9 @@ static const struct drm_ioctl_desc ane_h16_ioctls[] = {
 };
 
 /*
- * No GEM objects and no mmap: buffers travel by copy only, so this is
- * DRM_ACCEL_FOPS without .mmap (drm_gem_mmap needs DRIVER_GEM). The DRM core
- * refuses to open a file whose fops lack FOP_UNSIGNED_OFFSET.
+ * No GEM objects: DRM_ACCEL_FOPS with the driver's own surface .mmap
+ * (drm_gem_mmap needs DRIVER_GEM). The DRM core refuses to open a file whose
+ * fops lack FOP_UNSIGNED_OFFSET.
  */
 static const struct file_operations ane_h16_fops = {
 	.owner = THIS_MODULE,
@@ -294,6 +405,7 @@ static const struct file_operations ane_h16_fops = {
 	.poll = drm_poll,
 	.read = drm_read,
 	.llseek = noop_llseek,
+	.mmap = ane_h16_mmap,
 };
 
 static const struct drm_driver ane_h16_drm_driver = {
@@ -304,7 +416,7 @@ static const struct drm_driver ane_h16_drm_driver = {
 	.num_ioctls = ARRAY_SIZE(ane_h16_ioctls),
 	.fops = &ane_h16_fops,
 	.major = DRM_ANE_ABI_V3,
-	.minor = 0,
+	.minor = 1,
 	.name = "ane",
 	.desc = "Apple Neural Engine (H16 and later)",
 };

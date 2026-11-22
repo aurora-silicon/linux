@@ -724,6 +724,10 @@ impl Firmware {
     /// and latches the device failed. Dependency errors and exhausted resource classes are handled
     /// separately before preparation, without failing an otherwise healthy engine class.
     pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+        // What arrives during a system sleep waits for its end.
+        if self.session.shared.sleeping.load(core::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         self.session.check()?;
         self.objects.health()?;
         self.service_power()?;

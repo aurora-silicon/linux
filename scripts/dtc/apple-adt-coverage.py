@@ -126,6 +126,13 @@ def main(argv=None):
                     # DTBs. Later runs always use the base's committed inventory.
                     baseline = manifest
                     print(f"{board}: bootstrapping baseline from head inventory")
+                    if not (args.baseline_dtb_dir / (board + ".dtb")).is_file():
+                        # The board itself is new: nothing at the base can regress,
+                        # but its own inventory must still resolve in the head DTB.
+                        print(f"{board}: new board, no base DTB")
+                        for target in sorted(broken):
+                            errors.append(f"{board}: new absent DT path: {target}")
+                        continue
                 old, before, old_broken = inventory(
                     baseline, args.baseline_dtb_dir / (board + ".dtb"), board)
                 removed = {e[1] for e in old} - {e[1] for e in entries}

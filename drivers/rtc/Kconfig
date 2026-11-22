@@ -2099,10 +2099,14 @@ config RTC_DRV_APPLE_PMU
 	depends on ARCH_APPLE && NVMEM_APPLE_SPMI && PM_SLEEP
 	help
 	  Read the PMU clock on M1 Pro/Max/Ultra, M2, M4 Pro and A18 Pro
-	  systems and use its alarm to wake the system
-	  from suspend-to-idle. Alarms are limited to one hour; deeper
-	  suspend states are not supported. Continue setting the shared
-	  clock through the SMC RTC.
+	  systems and use its alarm to wake the system from suspend-to-idle,
+	  and on A18 Pro from a firmware-driven suspend too. A18 Pro alarms
+	  reach as far as the PMU's comparator, and the clock can be set here;
+	  elsewhere alarms are limited to one hour and the shared clock is set
+	  through the SMC RTC.
+
+	  Say Y where this is the system's first RTC (rtc0), so that it sets
+	  the system time at boot.
 
 	  This driver can be built as the module rtc-apple-pmu.
 

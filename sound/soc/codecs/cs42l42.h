@@ -71,6 +71,11 @@ struct  cs42l42_private {
 	bool hp_adc_up_pending;
 	/* Set once at probe for the base-M1 I2C resume workaround. */
 	bool resume_reprepare;
+	/* CS42L83 on I2C: the register restore after a sleep, from ASoC's card resume. */
+	struct mutex restore_lock;
+	struct completion powered;
+	bool asoc_suspended;
+	bool restore_pending;
 	bool suspended;
 	bool sdw_waiting_first_unattach;
 	bool init_done;

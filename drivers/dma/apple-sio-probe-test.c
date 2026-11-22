@@ -72,6 +72,8 @@ static void sio_match_data_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, hw->fifo_threshold, 0x800U);
 	KUNIT_EXPECT_FALSE(test, hw->clear_period_desc);
 	KUNIT_EXPECT_FALSE(test, hw->check_boot_tables);
+	KUNIT_EXPECT_FALSE(test, hw->firmware_only);
+	KUNIT_EXPECT_FALSE(test, sio_hw_t8140.firmware_only);
 }
 
 static struct kunit_case sio_probe_test_cases[] = {

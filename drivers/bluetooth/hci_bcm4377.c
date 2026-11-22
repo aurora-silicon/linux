@@ -19,8 +19,10 @@
 #include <linux/of.h>
 #include <linux/wait.h>
 #include <linux/pci.h>
+#include <linux/soc/apple/radio-sleep.h>
 #include <linux/printk.h>
 #include <linux/property.h>
+#include <linux/suspend.h>
 #include <linux/workqueue.h>
 
 #include <linux/unaligned.h>
@@ -3098,6 +3100,15 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 					hdev);
 }
 
+/* Final release runs after every device resume, including reversible unwind. */
+static void bcm4377_sleep_finish(struct device *dev)
+{
+	struct bcm4377_data *bcm4377 = pci_get_drvdata(to_pci_dev(dev));
+
+	WRITE_ONCE(bcm4377->setup_retry_blocked, false);
+	bcm4377_queue_setup_retry(bcm4377);
+}
+
 static int bcm4377_resume(struct device *dev);
 
 static int bcm4377_suspend(struct device *dev)
@@ -3105,6 +3116,12 @@ static int bcm4377_suspend(struct device *dev)
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
 	int ret;
+
+	ret = apple_radio_sleep_endpoint_prepare(dev, bcm4377_sleep_finish);
+	if (ret)
+		return ret;
+	if (apple_radio_sleep_owned(dev) && device_may_wakeup(dev))
+		return -EBUSY;
 
 	bcm4377_resume_recovery_stop(bcm4377);
 	WRITE_ONCE(bcm4377->setup_retry_blocked, true);
@@ -3116,8 +3133,10 @@ static int bcm4377_suspend(struct device *dev)
 	ret = hci_suspend_dev(bcm4377->hdev);
 	if (ret) {
 		bcm4377->resume_powered = false;
-		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
-		bcm4377_queue_setup_retry(bcm4377);
+		if (!apple_radio_sleep_owned(dev)) {
+			WRITE_ONCE(bcm4377->setup_retry_blocked, false);
+			bcm4377_queue_setup_retry(bcm4377);
+		}
 		return ret;
 	}
 
@@ -3152,8 +3171,11 @@ static int bcm4377_suspend(struct device *dev)
 	/* Flush the posted write before the system goes to sleep. */
 	ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
 	bcm4377->quiesced = true;
-
-	return 0;
+	/* This records the command/readflush, not a firmware idle acknowledgment. */
+	ret = apple_radio_sleep_endpoint_suspended(dev);
+	if (ret)
+		bcm4377_resume(dev);
+	return ret;
 }
 
 static int bcm4377_resume(struct device *dev)
@@ -3162,6 +3184,10 @@ static int bcm4377_resume(struct device *dev)
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
 	unsigned long flags;
 	int ret;
+
+	ret = apple_radio_sleep_endpoint_resume(dev);
+	if (ret)
+		return ret;
 
 	if (bcm4377->wake_armed) {
 		disable_irq_wake(pdev->irq);
@@ -3186,13 +3212,46 @@ static int bcm4377_resume(struct device *dev)
 	bcm4377->resume_powered = false;
 
 	ret = hci_resume_dev(bcm4377->hdev);
-	WRITE_ONCE(bcm4377->setup_retry_blocked, false);
-	if (!ret)
-		bcm4377_queue_setup_retry(bcm4377);
+	apple_radio_sleep_endpoint_resumed(dev, ret);
+	if (!apple_radio_sleep_owned(dev)) {
+		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
+		if (!ret)
+			bcm4377_queue_setup_retry(bcm4377);
+	}
 	return ret;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(bcm4377_ops, bcm4377_suspend, bcm4377_resume);
+static int bcm4377_resume_noirq(struct device *dev)
+{
+	struct bcm4377_data *bcm4377 = pci_get_drvdata(to_pci_dev(dev));
+	u32 before, after;
+	int ret;
+
+	if (!apple_radio_sleep_owned(dev) || !pm_resume_via_firmware())
+		return 0;
+
+	/*
+	 * PERST resets the private BAR windows, which PCI's standard saved state
+	 * does not cover. Restore them before the IRQ handler or UNQUIESCE can
+	 * access the retained controller through those windows.
+	 */
+	ret = pci_read_config_dword(bcm4377->pdev, BCM4377_PCIECFG_BAR0_WINDOW1, &before);
+	if (!ret)
+		ret = bcm4377_init_cfg(bcm4377);
+	if (!ret)
+		ret = pci_read_config_dword(bcm4377->pdev, BCM4377_PCIECFG_BAR0_WINDOW1,
+					    &after);
+	if (ret || after != bcm4377->hw->bar0_window1)
+		panic("J713 Bluetooth PCI window restore failed: %d", ret);
+	dev_info(dev, "private PCI windows restored after sleep (%#x -> %#x)\n",
+		 before, after);
+	return 0;
+}
+
+static const struct dev_pm_ops bcm4377_ops = {
+	SYSTEM_SLEEP_PM_OPS(bcm4377_suspend, bcm4377_resume)
+	.resume_noirq = bcm4377_resume_noirq,
+};
 
 static const struct dmi_system_id bcm4377_dmi_board_table[] = {
 	{

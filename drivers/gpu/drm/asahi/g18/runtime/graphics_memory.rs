@@ -124,14 +124,25 @@ impl G18GraphicsMemory {
 
     pub(crate) fn audit(&self) -> Result<usize> {
         let mut checked = 0;
+        // Each page's first and last byte, and their compact aliases below
+        // 0x78000, translated under one lock.
+        let mut addresses = KVec::with_capacity(self.pages.len() * 4, GFP_KERNEL)?;
+        let mut aliases = KVec::with_capacity(self.pages.len() * 4, GFP_KERNEL)?;
         for page in self.pages.iter() {
             for offset in [0, va::PAGE - 1] {
-                let address = page.iova() + offset;
-                self.vm().translate_iova(address)?;
-                if page.iova() < 0x78000 && self.vm().translate_iova(address)?
-                    != self.vm().translate_iova(address + va::COMPACT_BIAS)? { return Err(EFAULT); }
+                addresses.push(page.iova() + offset, GFP_KERNEL)?;
+                aliases.push(false, GFP_KERNEL)?;
+                if page.iova() < 0x78000 {
+                    addresses.push(page.iova() + offset + va::COMPACT_BIAS, GFP_KERNEL)?;
+                    aliases.push(true, GFP_KERNEL)?;
+                }
                 checked += 1;
             }
+        }
+        let physical = self.vm().translate_each(&addresses)?;
+        for (index, &alias) in aliases.iter().enumerate() {
+            // An alias follows the address it must match.
+            if alias && physical[index] != physical[index - 1] { return Err(EFAULT); }
         }
         if let Some((source, target)) = self.vdm_alias {
             for offset in [0, va::PAGE - 1] {

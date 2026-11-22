@@ -16,6 +16,7 @@
 #include <linux/refcount.h>
 #include <linux/gpio/consumer.h>
 #include <linux/regulator/consumer.h>
+#include <linux/suspend.h>
 #include <linux/regmap.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -66,6 +67,8 @@ struct tas2764_priv {
 
 	int v_sense_slot;
 	int i_sense_slot;
+	/* TAS2764_CLK_CFG value for a fixed BCLK/FS ratio, or -1 to auto-detect */
+	int bclk_ratio_code;
 
 	bool dac_powered;
 	bool unmuted;
@@ -397,9 +400,49 @@ static int tas2764_codec_suspend(struct snd_soc_component *component)
 	return 0;
 }
 
+/*
+ * Whether the amp came back from a power-on reset, read from the amp itself:
+ * PWR_CTRL resets to 0x1a with BOP_SRC clear, and the probe sets BOP_SRC on
+ * every SN012776. A failed read counts as lost too. Bypasses the cache, which
+ * still holds the probe's value.
+ */
+static bool tas2764_lost_state(struct tas2764_priv *tas2764)
+{
+	unsigned int val;
+	int ret;
+
+	if (tas2764->devid != DEVID_SN012776)
+		return false;
+	regcache_cache_bypass(tas2764->regmap, true);
+	ret = regmap_read(tas2764->regmap, TAS2764_PWR_CTRL, &val);
+	regcache_cache_bypass(tas2764->regmap, false);
+	return ret || !(val & TAS2764_PWR_CTRL_BOP_SRC);
+}
+
+/*
+ * An amp back from a power-on reset that could not be restored keeps its
+ * reset defaults (gain, brownout, interrupt masks, no quirk page), while the
+ * cache holds the restored values. ASoC ignores the resume's error, so a
+ * later unmute would set it active as it is. Fail the group closed, as for a
+ * latched fault: its supply goes off and every stream is refused.
+ */
+static void tas2764_restore_failed(struct tas2764_priv *tas2764)
+{
+	if (!tas2764_group_failed(tas2764))
+		tas2764_group_shutdown(tas2764, 0);
+}
+
 static int tas2764_codec_resume(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
+	/*
+	 * A firmware-driven (deep) sleep powers the SoC's pin controller off,
+	 * so the group's SDZ line drops while asleep and every amp comes back
+	 * from a power-on reset when the pin controller restores the line
+	 * (its resume_noirq, before this). s2idle keeps the line and the
+	 * amps' registers and stays on the path below.
+	 */
+	bool power_on = tas2764->sdz_group && pm_resume_via_firmware();
 	int ret;
 
 	if (!tas2764->sdz_group) {
@@ -417,6 +460,37 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 
 	regcache_cache_only(tas2764->regmap, false);
 
+	/*
+	 * Any other sleep that cut the line or the supply (an s2idle wake
+	 * after a deep sleep that failed half way) leaves the same reset
+	 * state without the firmware saying so; a stream started on it
+	 * latches an over-current on a woofer amp. Check the amp itself.
+	 */
+	if (tas2764->sdz_group && !power_on && tas2764_lost_state(tas2764)) {
+		dev_warn(tas2764->dev, "registers lost in a sleep: restoring as from power-on\n");
+		power_on = true;
+	}
+
+	if (power_on) {
+		/* SDZ high to the first I2C access, as at probe */
+		usleep_range(1000, 2000);
+		/*
+		 * Start from the reset state the cache sync assumes. The page
+		 * register is back at 0 while the cache may hold another page:
+		 * drop it, so the next page switch is read from the amp.
+		 */
+		ret = regmap_write(tas2764->regmap, TAS2764_SW_RST, TAS2764_RST);
+		if (ret) {
+			dev_err(tas2764->dev,
+				"no answer on I2C after a deep sleep (%d): SDZ or supply not back\n",
+				ret);
+			tas2764_restore_failed(tas2764);
+			goto out_irq;
+		}
+		usleep_range(1000, 2000);
+		regcache_drop_region(tas2764->regmap, TAS2764_PAGE, TAS2764_PAGE);
+	}
+
 	ret = regcache_sync(tas2764->regmap);
 	/*
 	 * An amp whose SDZ went low came back from a power-on reset, and the
@@ -426,8 +500,13 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 	 * over-current at the first stream after a resume. Apply them again,
 	 * as the probe does.
 	 */
-	if (ret >= 0 && !tas2764->sdz_group && tas2764->devid == DEVID_SN012776)
+	if (ret >= 0 && (!tas2764->sdz_group || power_on) &&
+	    tas2764->devid == DEVID_SN012776)
 		ret = tas2764_apply_init_quirks(tas2764);
+	if (ret < 0 && power_on) {
+		dev_err(tas2764->dev, "restore after a deep sleep failed: %d\n", ret);
+		tas2764_restore_failed(tas2764);
+	}
 	if (ret >= 0)
 		ret = tas2764_update_pwr_ctrl(tas2764);
 
@@ -1067,6 +1146,26 @@ static const struct hwmon_chip_info tas2764_hwmon_chip_info = {
 	.info	= tas2764_hwmon_info,
 };
 
+/*
+ * Program the fixed BCLK/FS ratio from ti,bclk-ratio (tas2764_parse_bclk_ratio()).
+ * Without one nothing is written: the amplifier auto-detects the ratio.
+ */
+static int tas2764_apply_bclk_ratio(struct tas2764_priv *tas2764)
+{
+	int ret;
+
+	if (tas2764->bclk_ratio_code < 0)
+		return 0;
+
+	ret = regmap_write(tas2764->regmap, TAS2764_CLK_CFG, tas2764->bclk_ratio_code);
+	if (ret < 0)
+		return ret;
+
+	return regmap_update_bits(tas2764->regmap, TAS2764_TDM_CFG0,
+				  TAS2764_TDM_CFG0_FIXED_RATIO,
+				  TAS2764_TDM_CFG0_FIXED_RATIO);
+}
+
 static int tas2764_codec_probe(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
@@ -1180,6 +1279,10 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 	default:
 		break;
 	}
+
+	ret = tas2764_apply_bclk_ratio(tas2764);
+	if (ret < 0)
+		goto err_sdz;
 
 	/*
 	 * Last, so that no failure leaves the handler behind. The component owns the IRQ and
@@ -1409,7 +1512,7 @@ static int tas2764_parse_bop_config(struct device *dev, struct tas2764_priv *tas
 
 	len = of_property_count_u8_elems(dev->of_node, "apple,bop-config");
 	if (len == -EINVAL) {
-		dev_info(dev, "no brownout configuration in the device tree\n");
+		dev_dbg(dev, "no brownout configuration in the device tree\n");
 		return 0;
 	}
 	if (len != TAS2764_BOP_CFG_LEN)
@@ -1499,6 +1602,41 @@ static int tas2764_parse_tx_zd_config(struct device *dev, struct tas2764_priv *t
 	return 0;
 }
 
+/*
+ * BCLK/FS ratios and the TAS2764_CLK_CFG value that makes the amplifier
+ * accept them. Only the J873 speaker frame (250 BCLKs, which the ratio
+ * auto-detection rejects with "bad TDM clock") is verified on hardware;
+ * other ratios are left to the auto-detection.
+ */
+static const struct {
+	u16 ratio;
+	u8 code;
+} tas2764_bclk_ratio_codes[] = {
+	{ 250, 0x30 },
+};
+
+/*
+ * ti,bclk-ratio: a fixed BCLK/FS ratio, as its TAS2764_CLK_CFG code in
+ * bclk_ratio_code. Without the property bclk_ratio_code stays -1, set before
+ * the device tree is read, and the ratio is auto-detected.
+ */
+static int tas2764_parse_bclk_ratio(struct device *dev, struct tas2764_priv *tas2764)
+{
+	u32 ratio;
+	int i;
+
+	if (device_property_read_u32(dev, "ti,bclk-ratio", &ratio))
+		return 0;
+
+	for (i = 0; i < ARRAY_SIZE(tas2764_bclk_ratio_codes); i++)
+		if (tas2764_bclk_ratio_codes[i].ratio == ratio)
+			tas2764->bclk_ratio_code = tas2764_bclk_ratio_codes[i].code;
+	if (tas2764->bclk_ratio_code < 0)
+		return dev_err_probe(dev, -EINVAL, "unsupported ti,bclk-ratio %u\n", ratio);
+
+	return 0;
+}
+
 static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 {
 	int ret = 0;
@@ -1559,6 +1697,10 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 	if (ret)
 		return ret;
 
+	ret = tas2764_parse_bclk_ratio(dev, tas2764);
+	if (ret)
+		return ret;
+
 	return tas2764_group_join(dev, tas2764);
 }
 
@@ -1580,6 +1722,8 @@ static int tas2764_i2c_probe(struct i2c_client *client)
 	result = devm_mutex_init(&client->dev, &tas2764->fault_lock);
 	if (result)
 		return result;
+	/* Auto-detect the ratio unless the firmware node sets one. */
+	tas2764->bclk_ratio_code = -1;
 	i2c_set_clientdata(client, tas2764);
 	dev_set_drvdata(&client->dev, tas2764);
 
@@ -1649,4 +1793,5 @@ MODULE_LICENSE("GPL v2");
 
 #if IS_ENABLED(CONFIG_SND_SOC_TAS2764_KUNIT_TEST)
 #include "tas2764-bop-test.h"
+#include "tas2764-bclk-ratio-test.h"
 #endif

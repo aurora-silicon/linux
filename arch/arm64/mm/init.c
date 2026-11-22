@@ -109,17 +109,10 @@ static void __init arch_reserve_crashkernel(void)
 		return;
 
 	/*
-	 * A CTXR window refuses kexec (the relocation code runs outside it), so
-	 * a crash kernel can never run. Don't reserve and waste its memory.
+	 * Under a CTXR window the crash kernel runs on the boot CPU, which the
+	 * window doesn't confine. The window is already reserved, so the crash
+	 * kernel lands outside it.
 	 */
-	if (ctxr_exec_window_reserved()) {
-		if (parse_crashkernel(boot_command_line, memblock_phys_mem_size(),
-				      &crash_size, &crash_base, &low_size,
-				      &cma_size, &high) == 0 && crash_size)
-			pr_warn("ctxr-execmem: ignoring crashkernel=, kexec is unavailable under a window\n");
-		return;
-	}
-
 	ret = parse_crashkernel(boot_command_line, memblock_phys_mem_size(),
 				&crash_size, &crash_base,
 				&low_size, &cma_size, &high);

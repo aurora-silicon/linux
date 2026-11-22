@@ -53,6 +53,23 @@ static int __init lockdown_param(char *level)
 early_param("lockdown", lockdown_param);
 
 /**
+ * lockdown_from_firmware - lock down because the boot firmware verified this boot
+ * @where: what verified it, for the notice
+ * @level: LOCKDOWN_INTEGRITY_MAX or LOCKDOWN_CONFIDENTIALITY_MAX
+ *
+ * For platform code that learns from its boot chain that this kernel was
+ * started under a verified boot (the equivalent of lockdown on UEFI Secure
+ * Boot). Only raises the level; returns -EPERM if it is already as high.
+ */
+int __init lockdown_from_firmware(const char *where, enum lockdown_reason level)
+{
+	if (level != LOCKDOWN_INTEGRITY_MAX &&
+	    level != LOCKDOWN_CONFIDENTIALITY_MAX)
+		return -EINVAL;
+	return lock_kernel_down(where, level);
+}
+
+/**
  * lockdown_is_locked_down - Find out if the kernel is locked down
  * @what: Tag to use in notice generated if lockdown is in effect
  */

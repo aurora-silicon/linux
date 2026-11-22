@@ -154,9 +154,11 @@ static struct av_life_test *av_life_setup(struct kunit *test, work_func_t owner_
 	KUNIT_ASSERT_NOT_NULL(test, t->ep);
 	t->dcp->dev = t->dev;
 	dev_set_drvdata(t->dev, t->dcp);
-	spin_lock_init(&t->ep->lock);
-	INIT_LIST_HEAD(&t->ep->compact_cmds);
+	afk_ep_init_state(t->ep);
 	init_rwsem(&t->asrv->srv_rwsem);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	init_waitqueue_head(&t->asrv->gen_wq);
+#endif
 	INIT_WORK(&t->asrv->start_av_service_wq, owner_fn);
 	INIT_WORK(&t->asrv->terminate_wq, owner_fn);
 	INIT_WORK(&t->dcp->external_audio_work, av_life_owner_fn);
@@ -484,8 +486,7 @@ static struct av_life_test *av_life_group_setup(struct kunit *test,
 	if (endpoint > 0) {
 		t->ep = devm_kzalloc(t->dev, sizeof(*t->ep), GFP_KERNEL);
 		KUNIT_ASSERT_NOT_NULL(test, t->ep);
-		spin_lock_init(&t->ep->lock);
-		INIT_LIST_HEAD(&t->ep->compact_cmds);
+		afk_ep_init_state(t->ep);
 		t->ep->dcp = t->dcp;
 		t->wq = alloc_ordered_workqueue("av-lifetime-devres", 0);
 		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, t->wq);
@@ -594,6 +595,7 @@ static void av_lifetime_devres_preserves_successor(struct kunit *test)
 
 	KUNIT_ASSERT_NOT_NULL(test, next);
 	KUNIT_ASSERT_NOT_NULL(test, ep);
+	afk_ep_init_state(ep);
 	KUNIT_ASSERT_EQ(test, av_audiosrv_register_cleanup(t->dcp, t->asrv, t->ep), 0);
 	devres_close_group(t->dev, t->group);
 	t->dcp->audiosrv = next;

@@ -171,6 +171,8 @@ pub(crate) const fn stage_runs_firmware(stage: u32) -> bool {
 /// The firmware initializes once per boot; the module is pinned from then on,
 /// so this survives unbind/rebind and refuses a second attempt.
 static G18_FIRMWARE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+/// Set once the module is pinned for the retained session.
+static G18_MODULE_RETAINED: AtomicBool = AtomicBool::new(false);
 /// Bit per PSD request kind written by this module instance: bit 0 sgx,
 /// bit 1 gfx-asc, bit 2 gfx1-asc (power-on), bit 3 restore. Each kind is
 /// written at most once per module load; a re-bind does not repeat it.
@@ -1056,6 +1058,8 @@ struct G18Session {
     _registers: regs::Resources,
     dev: ARef<AsahiDrmDevice>,
     stage: u32,
+    /// InitData profile of the firmware build the loader admitted.
+    profile: crate::g18::fw::initdata::RootProfile,
 }
 
 fn cntvct() -> u64 {
@@ -1256,7 +1260,8 @@ impl G18Session {
     /// for G18G yet).
     fn build_initdata(&mut self) -> Result {
         let roots = self.uat.prepare_t8140_firmware_high_roots()?;
-        let memory = G18FirmwareMemory::new_with_uat(&self.dev, self.uat.clone(), cntvct(), matches!(self.stage, STAGE_RENDER | STAGE_DRM))?;
+        let memory = G18FirmwareMemory::new_with_uat(&self.dev, self.uat.clone(), cntvct(),
+            matches!(self.stage, STAGE_RENDER | STAGE_DRM), self.profile)?;
         self.memory = Some(memory);
         if matches!(self.stage, STAGE_RENDER | STAGE_DRM) {
             self.render_job = Some(crate::g18::boot::render_stage::prepare(&self.dev, &self.uat)?);
@@ -1903,9 +1908,10 @@ fn prepare_firmware_session(pdev: &platform::Device<Core<'_>>, probe: T8152Probe
     let dev: &kernel::device::Device<Core<'_>> = pdev.as_ref();
     let stage = probe.stage;
     dev_warn!(dev, "G18 stage {}: starts the GPU ASC CPUs (REQUIRES USER APPROVAL)\n", stage);
-    if !probe.firmware_profile_admitted {
-        return Err(ENODEV);
-    }
+    let profile = match probe.firmware_build {
+        Some(profile) if probe.firmware_profile_admitted => profile,
+        _ => return Err(ENODEV),
+    };
     if G18_FIRMWARE_ATTEMPTED.load(Ordering::Acquire) {
         dev_err!(dev, "G18 refused: the firmware was already started this boot; reboot first\n");
         return Err(EBUSY);
@@ -2019,17 +2025,15 @@ fn prepare_firmware_session(pdev: &platform::Device<Core<'_>>, probe: T8152Probe
         _registers: probe.registers,
         dev: drm,
         stage,
+        profile,
     }, GFP_KERNEL)?;
 
     // Point of no return: from here every path retains the session, and the
     // module stays loaded so RTKit callbacks keep valid code until reboot.
+    // No ASC CPU has started yet: once module removal has begun, refuse with
+    // nothing started and the session freed.
+    crate::retain::retain_module(&G18_MODULE_RETAINED)?;
     G18_FIRMWARE_ATTEMPTED.store(true, Ordering::Release);
-    // SAFETY: THIS_MODULE is this module; the reference is never dropped.
-    unsafe {
-        bindings::__module_get(
-            <crate::DriverModule as kernel::ModuleMetadata>::THIS_MODULE.as_ptr(),
-        )
-    };
     Ok(Retained(Some(session)))
 }
 

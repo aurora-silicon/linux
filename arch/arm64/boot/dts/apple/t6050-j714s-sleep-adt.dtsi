@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The sleep's skipped pins and wake sources, which the boot loader fills from the ADT. Set here,
+ * with the ADT's values, for a boot loader that does not fill them yet.
+ */
+
+&sleep {
+	apple,pinctrl-skip-pins = <5 6 7 112 141>;
+	apple,wake-enable = <16 18 28 30 38 39 62 65 69 71 72 73 74 76 122 127
+			     147 148 149 150 151 152 153 154 171 183 290>;
+	apple,wake-enable-gfx = <1>;
+};

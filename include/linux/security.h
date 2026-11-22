@@ -170,6 +170,16 @@ struct lsm_prop {
 
 extern const char *const lockdown_reasons[LOCKDOWN_CONFIDENTIALITY_MAX+1];
 
+#ifdef CONFIG_SECURITY_LOCKDOWN_LSM
+int lockdown_from_firmware(const char *where, enum lockdown_reason level);
+#else
+static inline int lockdown_from_firmware(const char *where,
+					 enum lockdown_reason level)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 /* These functions are in security/commoncap.c */
 extern int cap_capable(const struct cred *cred, struct user_namespace *ns,
 		       int cap, unsigned int opts);

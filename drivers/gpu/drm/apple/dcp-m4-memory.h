@@ -3,6 +3,7 @@
 #define APPLE_DCP_M4_MEMORY_H
 
 #include <linux/errno.h>
+#include <linux/log2.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
@@ -32,6 +33,8 @@ struct dcp_m4_memory {
 	 * internal firmware's requests are only qualified as they are.
 	 */
 	bool relaxed;
+	/* Internal DCP: also an alignment up to a page (the profile's alloc_page_align). */
+	bool page_align;
 };
 
 struct dcp_m4_memory_ops {
@@ -129,9 +132,10 @@ static inline int dcp_m4_memory_callback(struct dcp_m4_memory *memory,
 		size = get_unaligned_le64(in + 4);
 		align = get_unaligned_le32(in + 12);
 		/*
-		 * The qualified internal firmware requests 4. An external one's
-		 * alignment, in bytes, must be a power of two within a page, which
-		 * every buffer has.
+		 * The qualified internal firmware requests 4, the J604's also a
+		 * power of two within a page. An external one's alignment, in
+		 * bytes, must be a power of two within a page, which every buffer
+		 * has.
 		 */
 		if (memory->relaxed && (!size || size > DCP_M4_MEMORY_MAX ||
 					(align && (align > DCP_M4_MEMORY_PAGE ||
@@ -140,7 +144,9 @@ static inline int dcp_m4_memory_callback(struct dcp_m4_memory *memory,
 			goto failed;
 		if (!memory->relaxed &&
 		    (get_unaligned_le32(in) != 0x703 || !size || size > DCP_M4_MEMORY_MAX ||
-		     align != 4 || in[16] || in[17] || in[18]))
+		     (align != 4 && (!memory->page_align || !is_power_of_2(align) ||
+				     align > DCP_M4_MEMORY_PAGE)) ||
+		     in[16] || in[17] || in[18]))
 			goto failed;
 		/* Byte 19 is padding, observed nonzero in otherwise valid requests. */
 		size = (size + DCP_M4_MEMORY_PAGE - 1) & ~(u64)(DCP_M4_MEMORY_PAGE - 1);

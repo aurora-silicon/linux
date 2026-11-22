@@ -177,7 +177,7 @@ static void dcp_connector_set_dict(struct apple_connector *connector,
 	 * replaced, and freeing it against the connector's current DCP then
 	 * fails devres_destroy() -- one WARN and one leak per dictionary.
 	 */
-	kfree(dict->data);
+	kvfree(dict->data);
 
 	*dict = *chunks;
 }
@@ -195,7 +195,7 @@ void dcp_connector_update_dict(struct apple_connector *connector, const char *ke
 	else if (!strcmp(key, "Transport"))
 		dcp_connector_set_dict(connector, &connector->transport, chunks);
 	else
-		kfree(chunks->data);
+		kvfree(chunks->data);
 
 	chunks->data = NULL;
 	chunks->length = 0;

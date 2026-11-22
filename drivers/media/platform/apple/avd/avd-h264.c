@@ -997,6 +997,10 @@ static int avd_h264_run(struct avd_ctx *ctx)
 
 	avd_h264_run_preamble(ctx, &run);
 
+	if (run.base.setup_err) {
+		ret = run.base.setup_err;
+		goto err_free_jobs;
+	}
 	if (!run.sps || !run.pps || !run.slice_params || !run.decode_params) {
 		ret = -EINVAL;
 		goto err_free_jobs;

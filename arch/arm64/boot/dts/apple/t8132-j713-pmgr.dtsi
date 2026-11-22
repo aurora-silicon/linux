@@ -105,13 +105,16 @@
 	status = "disabled";
 };
 
+/* The DCP powers these down while the display is off. */
 &ps_disp_sys {
 	apple,firmware-owned;
+	apple,consumer-switched;
 	status = "okay";
 };
 
 &ps_disp_fe {
 	apple,firmware-owned;
+	apple,consumer-switched;
 	status = "okay";
 };
 
@@ -198,7 +201,7 @@
 };
 
 &ps_venc_sys {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_spi1 {
@@ -418,23 +421,23 @@
 };
 
 &ps_msr {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_msr_ase_core {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_ane_sys {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_jpg {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_avd_sys {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_sep {
@@ -494,43 +497,46 @@
 };
 
 &ps_venc_dma {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_venc_pipe4 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_venc_pipe5 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_venc_me0 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_venc_me1 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_ane_mpm {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_ane_cpu {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_ane_td {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_ane_base {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_disp_cpu {
 	apple,firmware-owned;
+	apple,consumer-switched;
+	/* Power-gate retention workaround, as macOS sets it while off. */
+	apple,retention-workaround = <0x2504c 0x3 0x3>, <0x25070 0x1 0x0>;
 	status = "okay";
 };
 

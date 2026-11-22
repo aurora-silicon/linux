@@ -2035,9 +2035,9 @@ static bool xhci_s2idle_port_change(struct xhci_hcd *xhci, struct xhci_port *por
 }
 
 /*
- * Only hubs that the USB core kept awake for a remote wakeup have transfers in
- * flight, see usb_suspend_both(): a completed one reports a change on one of
- * their ports.
+ * Only devices that the USB core kept awake for a remote wakeup have transfers
+ * in flight, see usb_suspend_both(): a completed one reports a change on one of
+ * a hub's ports, or the input of a device that wakes itself when suspended.
  */
 VISIBLE_IF_KUNIT bool xhci_s2idle_transfer_wakeup(const struct usb_device *udev)
 {

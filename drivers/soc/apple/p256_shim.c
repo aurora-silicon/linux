@@ -59,7 +59,7 @@ static int p256_agree(const u8 *priv_be, const u8 *peer_pub_be,
 	tfm = crypto_alloc_kpp("ecdh-nist-p256", 0, 0);
 	if (IS_ERR(tfm)) {
 		rc = PTR_ERR(tfm);
-		pr_err("apple_sep p256: alloc_kpp rc=%d\n", rc);
+		pr_err_ratelimited("apple_sep p256: alloc_kpp rc=%d\n", rc);
 		return rc;
 	}
 
@@ -80,12 +80,12 @@ static int p256_agree(const u8 *priv_be, const u8 *peer_pub_be,
 	}
 	rc = crypto_ecdh_encode_key(enc, enc_len, &params);
 	if (rc) {
-		pr_err("apple_sep p256: encode_key rc=%d\n", rc);
+		pr_err_ratelimited("apple_sep p256: encode_key rc=%d\n", rc);
 		goto out_enc;
 	}
 	rc = crypto_kpp_set_secret(tfm, enc, enc_len);
 	if (rc) {
-		pr_err("apple_sep p256: set_secret rc=%d\n", rc);
+		pr_err_ratelimited("apple_sep p256: set_secret rc=%d\n", rc);
 		goto out_enc;
 	}
 
@@ -107,7 +107,7 @@ static int p256_agree(const u8 *priv_be, const u8 *peer_pub_be,
 				 crypto_req_done, &wait);
 	rc = crypto_wait_req(crypto_kpp_generate_public_key(req), &wait);
 	if (rc) {
-		pr_err("apple_sep p256: generate_public_key rc=%d\n", rc);
+		pr_err_ratelimited("apple_sep p256: generate_public_key rc=%d\n", rc);
 		goto out_pub;
 	}
 	memcpy(pub_be_out, pub_buf, P256_POINT_LEN);
@@ -127,7 +127,7 @@ static int p256_agree(const u8 *priv_be, const u8 *peer_pub_be,
 				 crypto_req_done, &wait);
 	rc = crypto_wait_req(crypto_kpp_compute_shared_secret(req), &wait);
 	if (rc) {
-		pr_err("apple_sep p256: compute_shared_secret rc=%d\n", rc);
+		pr_err_ratelimited("apple_sep p256: compute_shared_secret rc=%d\n", rc);
 		goto out_pub;
 	}
 	memcpy(shared_be_out, shared_buf, P256_COORD_LEN);

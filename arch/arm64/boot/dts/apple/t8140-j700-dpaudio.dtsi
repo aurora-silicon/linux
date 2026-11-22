@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Neo (J700) DisplayPort/HDMI audio, as macOS has it: DPA1 belongs
+ * to the external display processor (ADT dcpext audio = dp-audio1, SIO DMA
+ * channel 0x66, power state DPA1 under DPA_P). DPA0 belongs to the internal
+ * panel's DCP, which has no audio sink, and stays off.
+ *
+ * SIO supplies the sample stream. iBoot preloads its firmware; the boot
+ * loader reserves it, publishes the boot tables and then enables the SIO
+ * node, which it finds by the alias. Without such a loader DPA1 waits for
+ * its DMA channel and nothing else changes.
+ */
+
+/ {
+	aliases {
+		sio = &sio;
+	};
+
+	dpaudio1: audio-controller-1 {
+		compatible = "apple,t8140-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x66>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa1>;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio1_dcpext: endpoint {
+					remote-endpoint = <&dcpext_audio>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext_audio: endpoint {
+				remote-endpoint = <&dpaudio1_dcpext>;
+			};
+		};
+	};
+};
+
+/* The boot tables sit in the window above the preloaded segments (ADT vm-base, vm-size). */
+&sio_dart {
+	apple,dma-range = <0x100 0x1c000 0x2ff 0xfffe4000>;
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
+};

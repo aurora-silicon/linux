@@ -63,6 +63,7 @@ use kernel::{
         atomic::{
             Acquire,
             Atomic,
+            Relaxed,
             Release, //
         },
         Arc,
@@ -99,7 +100,7 @@ const FW_REGION_MAX_SIZE: u64 = 0x10_0000;
 /// The DART page size the firmware segments are mapped with.
 const FW_REGION_PAGE: u64 = 0x4000;
 const AFK_ENDPOINT_START: u8 = 0x20;
-const AFK_ENDPOINT_COUNT: u8 = 0xf;
+const AFK_ENDPOINT_COUNT: u8 = 0x11;
 const AFK_OPC_GET_BUF: u64 = 0x89;
 const AFK_OPC_INIT: u64 = 0x80;
 const AFK_OPC_INIT_RX: u64 = 0x8b;
@@ -108,12 +109,16 @@ const AFK_OPC_INIT_UNK: u64 = 0x8c;
 const AFK_OPC_SEND: u64 = 0xa2;
 const AFK_OPC_START_ACK: u64 = 0x86;
 const AFK_OPC_SHUTDOWN_ACK: u64 = 0xc1;
+const AFK_OPC_SLEEP_ACK: u64 = 0x87;
 const AFK_OPC_RECV: u64 = 0x85;
 const AFK_MSG_GET_BUF_ACK: u64 = 0xa1 << 48;
 const AFK_MSG_INIT: u64 = AFK_OPC_INIT << 48;
 const AFK_MSG_INIT_ACK: u64 = 0xa0 << 48;
 const AFK_MSG_START: u64 = 0xa3 << 48;
 const AFK_MSG_SHUTDOWN: u64 = 0xc0 << 48;
+/// Stops an endpoint for a system sleep. It keeps its rings, and `AFK_MSG_START`
+/// brings it back.
+const AFK_MSG_SLEEP: u64 = 0xa4 << 48;
 const AFK_RB_BLOCK_STEP: usize = 0x40;
 const EPIC_TYPE_NOTIFY: u32 = 0;
 const EPIC_CATEGORY_REPORT: u8 = 0x00;
@@ -128,6 +133,11 @@ const EPIC_SUBTYPE_ACCEL_REPORT: u16 = 0xc2;
 const EPIC_SUBTYPE_RETCODE: u16 = 0x84;
 const EPIC_SUBTYPE_RETCODE_PAYLOAD: u16 = 0xa0;
 const EPIC_SUBTYPE_STRING: u16 = 0x8a;
+/// Replies to the client-open (25) and client-close (26) commands. As with
+/// the other replies, the subtype is the request's with bit 7 set, and the
+/// body starts with the return code.
+const EPIC_SUBTYPE_CLIENT_OPEN_REPLY: u16 = 0x99;
+const EPIC_SUBTYPE_CLIENT_CLOSE_REPLY: u16 = 0x9a;
 const QE_MAGIC1: u32 = from_fourcc(b" POI");
 const QE_MAGIC2: u32 = from_fourcc(b" POA");
 /// Bound on the wait for the reply to an EPIC call. The firmware can stop
@@ -136,6 +146,8 @@ const EPIC_CALL_TIMEOUT_MS: u32 = 5000;
 /// Bound on the wait for the shutdown acknowledgments of all endpoints
 /// together, so that a firmware that stopped answering costs one timeout.
 const AFK_SHUTDOWN_TIMEOUT_MS: u32 = 5000;
+/// Bound on the answer to each stop or start around a system sleep.
+const AFK_SLEEP_TIMEOUT_MS: u32 = 1000;
 
 // The T8140 AOP boots through a second mailbox, its "setup port", besides the
 // RTKit one. Its management endpoint runs a HELLO / endpoint map / power
@@ -169,6 +181,8 @@ const SETUP_BUFFER_ENTRY_SIZE: usize = 16;
 /// The service endpoints that request buffers; boot completes once all of
 /// them have theirs.
 const SETUP_ENDPOINTS: [u8; 5] = [0x20, 0x21, 0x23, 0x30, 0x32];
+/// Service endpoints a setup port may announce in its EPMAP.
+const SETUP_MAX_ENDPOINTS: usize = 16;
 const SETUP_BOOT_TIMEOUT_MS: u32 = 15000;
 /// How long the AP power request waits for the last endpoint map fragment.
 const SETUP_MAP_TIMEOUT_MS: u32 = 1000;
@@ -197,11 +211,40 @@ const SETUP_SET_SOURCE_BUFFER: u64 = 0x6b80_3ce4_92bd_9547;
 const ALS_CALIBRATION_LEN: usize = 80;
 const ALS_CALIBRATION_OPERATION: u64 = 0x0746_b8d6_6515_2e31;
 const ALS_CALIBRATION_BODY_LEN: u64 = 56;
+/// The VD6286's calibration blob and the message that carries it (see `als_calibration_message`).
+const ALS_SENSOR_BLOB_LEN: usize = 193;
+const ALS_SENSOR_MESSAGE_LEN: usize = 216;
 
 mod aop_ring;
 
 /// Index into the AFK endpoint tables for RTKit endpoint `ep`, if it is one
 /// of the endpoints this driver drives.
+/// Iterates over `list`, or over every AFK endpoint if `list` is empty.
+struct AfkOrder<'a> {
+    list: &'a [u8],
+    next: usize,
+}
+
+impl<'a> AfkOrder<'a> {
+    fn new(list: &'a [u8]) -> AfkOrder<'a> {
+        AfkOrder { list, next: 0 }
+    }
+}
+
+impl Iterator for AfkOrder<'_> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        let at = self.next;
+        self.next += 1;
+        if self.list.is_empty() {
+            (at < AFK_ENDPOINT_COUNT as usize).then(|| AFK_ENDPOINT_START + at as u8)
+        } else {
+            self.list.get(at).copied()
+        }
+    }
+}
+
 fn afk_endpoint_index(ep: u8) -> Option<usize> {
     ep.checked_sub(AFK_ENDPOINT_START)
         .filter(|i| *i < AFK_ENDPOINT_COUNT)
@@ -221,6 +264,28 @@ fn le_u32(b: &[u8], off: usize) -> u32 {
 /// Reads the little-endian `u64` at `off`; `b` must hold it.
 fn le_u64(b: &[u8], off: usize) -> u64 {
     u64::from(le_u32(b, off)) | u64::from(le_u32(b, off + 4)) << 32
+}
+
+/// The calibration file as the message the firmware takes on the ALS endpoint. T8140's file is
+/// that 80-byte message already. The 14-inch M5 Max's sensor takes the 193-byte blob its
+/// firmware keeps for the VD6286 in a longer one: the operation code, the blob's length, the
+/// blob and zeros, 216 bytes in all. Returns the message and its length.
+fn als_calibration_message(data: &[u8]) -> Option<([u8; ALS_SENSOR_MESSAGE_LEN], usize)> {
+    let mut message = [0u8; ALS_SENSOR_MESSAGE_LEN];
+    if data.len() == ALS_CALIBRATION_LEN
+        && le_u64(data, 0) == ALS_CALIBRATION_OPERATION
+        && le_u64(data, 8) == ALS_CALIBRATION_BODY_LEN
+    {
+        message[..ALS_CALIBRATION_LEN].copy_from_slice(data);
+        Some((message, ALS_CALIBRATION_LEN))
+    } else if data.len() == ALS_SENSOR_BLOB_LEN {
+        message[..8].copy_from_slice(&ALS_CALIBRATION_OPERATION.to_le_bytes());
+        message[8..16].copy_from_slice(&(ALS_SENSOR_BLOB_LEN as u64).to_le_bytes());
+        message[16..16 + ALS_SENSOR_BLOB_LEN].copy_from_slice(data);
+        Some((message, ALS_SENSOR_MESSAGE_LEN))
+    } else {
+        None
+    }
 }
 
 #[inline(always)]
@@ -465,7 +530,7 @@ impl AFKEndpoint {
                 self.recv_get_buf(client.dev.clone(), rtkit, msg)?;
             }
             AFK_OPC_INIT_UNK => {} // no-op
-            AFK_OPC_START_ACK => {}
+            AFK_OPC_START_ACK | AFK_OPC_SLEEP_ACK => client.sleep_answered(self.index),
             AFK_OPC_INIT_RX => {
                 if self.rxbuf.is_some() {
                     dev_err!(
@@ -776,6 +841,8 @@ impl AFKEndpoint {
             if subtype == EPIC_SUBTYPE_RETCODE_PAYLOAD
                 || subtype == EPIC_SUBTYPE_RETCODE
                 || subtype == EPIC_SUBTYPE_STRING
+                || subtype == EPIC_SUBTYPE_CLIENT_OPEN_REPLY
+                || subtype == EPIC_SUBTYPE_CLIENT_CLOSE_REPLY
             {
                 if data.len() < mem::size_of::<u32>() {
                     return Err(EMSGSIZE);
@@ -1023,7 +1090,14 @@ struct SetupState {
     arena: Option<Coherent<[u8]>>,
     /// The next unassigned page of the arena.
     next_page: usize,
-    endpoints: [Option<SetupEndpoint>; SETUP_ENDPOINTS.len()],
+    endpoints: [Option<SetupEndpoint>; SETUP_MAX_ENDPOINTS],
+    /// The service endpoints that must get buffers: T8140's fixed set, or
+    /// those the EPMAP announces.
+    expected: [u8; SETUP_MAX_ENDPOINTS],
+    expected_count: usize,
+    epmap_endpoints: bool,
+    /// Boot also waits for the system endpoints (below 0x20) it maps.
+    wait_system: bool,
     map_done: bool,
     ap_ready: bool,
     power_sent: bool,
@@ -1032,12 +1106,22 @@ struct SetupState {
 }
 
 impl SetupState {
-    fn new() -> SetupState {
+    fn new(epmap_endpoints: bool, wait_system: bool) -> SetupState {
+        let mut expected = [0; SETUP_MAX_ENDPOINTS];
+        let mut expected_count = 0;
+        if !epmap_endpoints {
+            expected[..SETUP_ENDPOINTS.len()].copy_from_slice(&SETUP_ENDPOINTS);
+            expected_count = SETUP_ENDPOINTS.len();
+        }
         SetupState {
             mbox: None,
             arena: None,
             next_page: 0,
-            endpoints: [None; SETUP_ENDPOINTS.len()],
+            endpoints: [None; SETUP_MAX_ENDPOINTS],
+            expected,
+            expected_count,
+            epmap_endpoints,
+            wait_system,
             map_done: false,
             ap_ready: false,
             power_sent: false,
@@ -1077,9 +1161,17 @@ impl SetupState {
     }
 
     /// Boot is complete once the AP power state is on and every service
-    /// endpoint has its buffers.
+    /// endpoint has its buffers. A system endpoint that never asks for one
+    /// is not waited for unless `wait_system` is set.
     fn ready(&self) -> bool {
-        self.ap_ready && self.endpoint_count() == SETUP_ENDPOINTS.len()
+        self.ap_ready
+            && self.expected_count != 0
+            && self.expected[..self.expected_count]
+                .iter()
+                .zip(self.endpoints.iter())
+                .all(|(ep, slot)| {
+                    slot.is_some() || (!self.wait_system && *ep < AFK_ENDPOINT_START)
+                })
     }
 
     /// Sends one word to a setup-port endpoint. Callers run in process
@@ -1251,6 +1343,22 @@ struct AopData {
     call_turn: [Mutex<()>; AFK_ENDPOINT_COUNT as usize],
     #[pin]
     ep_shutdown: [FutureValue<()>; AFK_ENDPOINT_COUNT as usize],
+    /// Answers to the stop and start of each endpoint around a system sleep.
+    #[pin]
+    ep_sleep: [FutureValue<()>; AFK_ENDPOINT_COUNT as usize],
+    /// The order endpoints stop for a system sleep and start after it, from
+    /// the device tree where it gives one. Empty means all started ones in
+    /// endpoint order.
+    sleep_endpoints: KVec<u8>,
+    wake_endpoints: KVec<u8>,
+    /// No call starts until the system has resumed.
+    sleeping: Atomic<bool>,
+    /// RTKit reported the firmware crashed. Nothing restarts it short of a reboot.
+    crashed: Atomic<bool>,
+    /// The endpoints stopped for this sleep, by index.
+    sleep_stopped: Atomic<u32>,
+    /// The firmware was told the AP is going to sleep.
+    ap_idle: Atomic<bool>,
     #[pin]
     hid_listeners: Mutex<KVec<ListenerEntry>>,
     #[pin]
@@ -1356,7 +1464,53 @@ impl WorkItem for AopServiceRegisterWork {
 }
 
 impl AopData {
+    /// The order the device tree gives in `name` for the endpoints around a
+    /// system sleep, or `default` where it gives none. A list naming anything
+    /// but an AFK endpoint, or one twice, is not used.
+    fn endpoint_order(dev: &device::Device, name: &CStr, default: &[u8]) -> Result<KVec<u8>> {
+        let mut order = KVec::new();
+        let listed = dev.fwnode().and_then(|node| {
+            let len = node.property_count_elem::<u32>(name).ok()?;
+            node.property_read_array_vec::<u32>(name, len)
+                .ok()?
+                .optional()
+        });
+        if let Some(listed) = listed {
+            let mut seen = 0u32;
+            let distinct = listed.iter().all(|&ep| {
+                let index = u8::try_from(ep).ok().and_then(afk_endpoint_index);
+                index.is_some_and(|index| {
+                    let first = seen & (1 << index) == 0;
+                    seen |= 1 << index;
+                    first
+                })
+            });
+            if distinct {
+                for &ep in listed.iter() {
+                    order.push(ep as u8, GFP_KERNEL)?;
+                }
+                return Ok(order);
+            }
+            dev_warn!(
+                dev,
+                "{}: not a list of distinct endpoints; not used\n",
+                name
+            );
+        }
+        order.extend_from_slice(default, GFP_KERNEL)?;
+        Ok(order)
+    }
     fn new(dev: &platform::Device<Core<'_>>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
+        let sleep_endpoints = Self::endpoint_order(
+            dev.as_ref(),
+            c_str!("apple,sleep-endpoints"),
+            cfg.sleep_endpoints,
+        )?;
+        let wake_endpoints = Self::endpoint_order(
+            dev.as_ref(),
+            c_str!("apple,wake-endpoints"),
+            cfg.wake_endpoints,
+        )?;
         let registration_queue = OwnedQueue::new_ordered(c_str!("apple-aop"))?;
         let setup_queue = if cfg.setup_port {
             Some(OwnedQueue::new_ordered(c_str!("apple-aop-setup"))?)
@@ -1377,7 +1531,10 @@ impl AopData {
                     required_endpoints: cfg.required_endpoints,
                     setup_queue,
                     setup_lost: Atomic::new(false),
-                    setup <- new_mutex!(SetupState::new()),
+                    setup <- new_mutex!(SetupState::new(
+                        cfg.setup_epmap_endpoints,
+                        cfg.setup_wait_system_endpoints
+                    )),
                     setup_cv <- new_condvar!(),
                     rtkit <- new_mutex!(None),
                     endpoints <- pin_init::pin_init_array_from_fn(|i| {
@@ -1385,6 +1542,13 @@ impl AopData {
                     }),
                     call_turn <- pin_init::pin_init_array_from_fn(|_| new_mutex!(())),
                     ep_shutdown <- pin_init::pin_init_array_from_fn(|_| FutureValue::pin_init()),
+                    ep_sleep <- pin_init::pin_init_array_from_fn(|_| FutureValue::pin_init()),
+                    sleep_endpoints,
+                    wake_endpoints,
+                    sleeping: Atomic::new(false),
+                    crashed: Atomic::new(false),
+                    sleep_stopped: Atomic::new(0),
+                    ap_idle: Atomic::new(false),
                     hid_listeners <- new_mutex!(KVec::new()),
                     report_listeners <- new_mutex!(KVec::new()),
                     source_ring <- new_mutex!(None),
@@ -1482,6 +1646,8 @@ impl AopData {
             b"als" => c_str!("als"),
             b"accel" => c_str!("accel"),
             b"gyro" => c_str!("gyro"),
+            b"devmotion6" => c_str!("devmotion6"),
+            b"als-temp" => c_str!("als-temp"),
             _ => {
                 return Ok(());
             }
@@ -1592,10 +1758,185 @@ impl AopData {
         ret
     }
 
+    fn sleep_answered(&self, endpoint: u8) {
+        if let Some(index) = afk_endpoint_index(endpoint) {
+            self.ep_sleep[index].complete(());
+        }
+    }
+
+    /// Sends `msg` to one endpoint and waits for its answer.
+    fn sleep_switch(&self, endpoint: u8, msg: u64) -> Result<()> {
+        let index = afk_endpoint_index(endpoint).ok_or(EINVAL)?;
+        self.ep_sleep[index].reset();
+        {
+            let mut guard = self.rtkit.lock();
+            let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+            rtk.send_message(endpoint, msg)?;
+        }
+        self.ep_sleep[index]
+            .wait_timeout(AFK_SLEEP_TIMEOUT_MS)
+            .ok_or(ETIMEDOUT)
+    }
+
+    /// Tells the firmware about the AP's power state. Waits with the RTKit lock
+    /// dropped, as the answer shares a worker with messages that take it.
+    fn ap_power(&self, on: bool) -> Result<()> {
+        let rtk = (*self.rtkit.lock())
+            .as_ref()
+            .map(|rtk| rtk.as_raw())
+            .ok_or(ENODEV)?;
+        // SAFETY: the handle lives until removal, which holds the device lock
+        // that system sleep also runs under.
+        to_result(unsafe { bindings::apple_rtkit_ap_power(rtk, on) })
+    }
+
+    /// A crashed firmware hears nothing more, so it's left out of every sleep from then on,
+    /// rather than refusing them all.
+    fn crashed_skip(&self) -> bool {
+        self.crashed.load(Acquire)
+    }
+
+    /// Puts back what `sleep_enter` did, in the order the firmware expects.
+    fn sleep_undo(&self) {
+        if self.crashed_skip() {
+            self.sleep_stopped.store(0, Relaxed);
+            self.ap_idle.store(false, Relaxed);
+            self.sleeping.store(false, Release);
+            return;
+        }
+        let stopped = self.sleep_stopped.xchg(0, Relaxed);
+        let was_idle = self.ap_idle.load(Relaxed);
+        if self.ap_idle.xchg(false, Relaxed) {
+            if let Err(e) = self.ap_power(true) {
+                dev_err!(self.dev, "Wake notice not answered ({:?})", e);
+            }
+        }
+        let order = AfkOrder::new(&self.wake_endpoints);
+        for endpoint in order {
+            let Some(index) = afk_endpoint_index(endpoint) else {
+                continue;
+            };
+            if stopped & (1 << index) == 0 {
+                continue;
+            }
+            if let Err(e) = self.sleep_switch(endpoint, AFK_MSG_START) {
+                dev_err!(self.dev, "Endpoint {:#04x} did not restart ({:?})", endpoint, e);
+            }
+        }
+        self.sleeping.store(false, Release);
+        if was_idle {
+            dev_dbg!(self.dev, "AP on notice sent and endpoints restarted after a sleep\n");
+        }
+    }
+
+    /// The AOP keeps running through a firmware-driven suspend. It stops its
+    /// endpoints and hears the AP's power state, then the reverse after a wake,
+    /// with no firmware restart. Measured on T8140, unverified on other SoCs.
+    fn sleep_enter(&self) -> Result<()> {
+        if !self.cpu_started.load(Acquire) {
+            return Ok(());
+        }
+        if self.crashed_skip() {
+            dev_warn!(self.dev, "firmware crashed: sleeping without it\n");
+            self.sleeping.store(true, Release);
+            return Ok(());
+        }
+        self.sleeping.store(true, Release);
+        // Any call in progress finishes first; new ones see `sleeping`.
+        for turn in &self.call_turn {
+            drop(turn.lock());
+        }
+
+        let mut result = Ok(());
+        for endpoint in AfkOrder::new(&self.sleep_endpoints) {
+            let Some(index) = afk_endpoint_index(endpoint) else {
+                continue;
+            };
+            if !self.endpoints[index].lock().started {
+                continue;
+            }
+            result = self.sleep_switch(endpoint, AFK_MSG_SLEEP).inspect_err(|e| {
+                dev_err!(self.dev, "Endpoint {:#04x} did not stop ({:?})", endpoint, e);
+            });
+            if result.is_err() {
+                break;
+            }
+            self.sleep_stopped
+                .store(self.sleep_stopped.load(Relaxed) | (1 << index), Relaxed);
+        }
+        if result.is_ok() {
+            // Set first: a notice without an answer may still have been taken.
+            self.ap_idle.store(true, Relaxed);
+            result = self.ap_power(false).inspect_err(|e| {
+                dev_err!(self.dev, "Sleep notice not answered ({:?})", e);
+            });
+        }
+        if result.is_err() {
+            self.sleep_undo();
+        } else {
+            dev_dbg!(self.dev, "Endpoints stopped and AP idle notice answered for a sleep\n");
+        }
+        result
+    }
+
+    fn bootargs_has_ed0p(
+        aop_mmio: &Mmio<'_, Region<AOP_MMIO_SIZE>>,
+        word_access: bool,
+    ) -> Result<bool> {
+        let offset = aop_mmio.read32(BOOTARGS_OFFSET) as usize;
+        let size = aop_mmio.read32(BOOTARGS_SIZE) as usize;
+        if offset > aop_mmio.size() || size > aop_mmio.size() - offset {
+            return Err(EINVAL);
+        }
+        let start = if word_access { offset & !3 } else { offset };
+        let end = if word_access {
+            (offset + size).checked_add(3).ok_or(EINVAL)? & !3
+        } else {
+            offset + size
+        };
+        if end > aop_mmio.size() || (word_access && size == 0) {
+            return Err(EINVAL);
+        }
+        let mut bytes = KVec::<u8>::from_elem(0, end - start, GFP_KERNEL)?;
+        let aop_io_array: Mmio<'_, [u8; AOP_MMIO_SIZE]> = aop_mmio.try_cast()?;
+        let bootargs = io_project!(aop_io_array, [try: offset .. offset+size]);
+        if word_access {
+            for (i, chunk) in bytes.chunks_exact_mut(4).enumerate() {
+                chunk.copy_from_slice(&aop_mmio.try_read32(start + i * 4)?.to_le_bytes());
+            }
+        } else {
+            bootargs.copy_to_slice(&mut bytes);
+        }
+        let ed0p_key = from_fourcc(b"ED0p");
+        let mut seen = false;
+        let first = offset - start;
+        let arg_bytes = &bytes[first..first + size];
+        let mut idx = 0;
+        while idx < size {
+            if size - idx < 8 {
+                return Err(EINVAL);
+            }
+            let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
+            let len = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
+            idx += 8;
+            if len > size - idx {
+                return Err(EINVAL);
+            }
+            if key == ed0p_key {
+                if seen || len != mem::size_of::<u64>() {
+                    return Err(EINVAL);
+                }
+                seen = true;
+            }
+            idx += len;
+        }
+        Ok(seen)
+    }
+
     fn patch_bootargs(
         &self,
         aop_mmio: &Mmio<'_, Region<AOP_MMIO_SIZE>>,
-        patches: &[(u32, u64)],
+        patches: &[(u32, Option<u64>)],
         word_access: bool,
     ) -> Result<()> {
         let offset = aop_mmio.read32(BOOTARGS_OFFSET) as usize;
@@ -1622,6 +1963,9 @@ impl AopData {
         } else {
             bootargs.copy_to_slice(&mut bytes);
         }
+        let ed0p_key = from_fourcc(b"ED0p");
+        let need_ed0p = patches.iter().any(|&(k, v)| k == ed0p_key && v.is_some());
+        let mut seen_ed0p = false;
         let first = offset - start;
         let arg_bytes = &mut bytes[first..first + size];
         let mut idx = 0;
@@ -1639,6 +1983,17 @@ impl AopData {
                 if *k != key {
                     continue;
                 }
+                // `None` keeps the value the firmware image carries (including
+                // an unused `ED0p` entry on firmware without `__EDATA`).
+                let Some(v) = v else {
+                    break;
+                };
+                if key == ed0p_key {
+                    if seen_ed0p || len != mem::size_of::<u64>() {
+                        return Err(EINVAL);
+                    }
+                    seen_ed0p = true;
+                }
                 if len > mem::size_of::<u64>() {
                     return Err(EINVAL);
                 }
@@ -1646,6 +2001,9 @@ impl AopData {
                 break;
             }
             idx += len;
+        }
+        if need_ed0p && !seen_ed0p {
+            return Err(EINVAL);
         }
         if word_access {
             for (i, chunk) in bytes.chunks_exact(4).enumerate() {
@@ -1757,15 +2115,29 @@ impl AopData {
         Ok((phys, iova, size))
     }
 
+    /// Whether the bootloader reserved any firmware `memory-region` for `dev`.
+    fn has_fw_regions(dev: &device::Device) -> bool {
+        // SAFETY: `dev` is a live device being probed.
+        let np = unsafe { (*dev.as_raw()).of_node };
+        // SAFETY: `np` is the device's node, valid while it is bound.
+        !np.is_null() && unsafe { bindings::of_reserved_mem_region_count(np) } > 0
+    }
+
     /// Checks the firmware segments the AOP runs from DRAM (T6040). The
     /// bootloader reserves them and lists them in `memory-region`, and each
     /// one's `iommu-addresses` gives the IOVA the firmware uses for it. The
     /// IOMMU core maps them in the default domain when the device is added
     /// (one to one when the IOVA is the physical address, translated
     /// otherwise), so they are only checked here. Every page has to be mapped
-    /// where the DT says, the external code (`__ETEXT`) at `ec0p` and any
-    /// other segment (`__OS_LOG`) at its physical address.
-    fn check_fw_regions(dev: &device::Device, ec0p: u64) -> Result<()> {
+    /// where the DT says, with the external code (`__ETEXT`) at `ec0p`.
+    /// When the firmware bootargs declare `ED0p` (`allow_ed0p`), macOS 27
+    /// firmware may also supply one translated `__EDATA` segment after
+    /// `__ETEXT`, while `__OS_LOG` remains identity-mapped.
+    fn check_fw_regions(
+        dev: &device::Device,
+        ec0p: u64,
+        allow_ed0p: bool,
+    ) -> Result<Option<(u64, u64)>> {
         // SAFETY: `dev` is a live device being probed.
         let np = unsafe { (*dev.as_raw()).of_node };
         if np.is_null() {
@@ -1790,11 +2162,14 @@ impl AopData {
             return Err(ENODEV);
         }
         let mut etext = false;
+        let mut etext_end = 0;
+        let mut external_data = None;
         for idx in 0..count {
             let (phys, iova, size) = Self::fw_region(np, idx).inspect_err(|e| {
                 dev_err!(dev, "Invalid firmware memory-region {} ({:?})", idx, e);
             })?;
             if phys % FW_REGION_PAGE != 0
+                || size == 0
                 || size % FW_REGION_PAGE != 0
                 || size > FW_REGION_MAX_SIZE
                 || iova % FW_REGION_PAGE != 0
@@ -1810,15 +2185,22 @@ impl AopData {
                     return Err(EINVAL);
                 }
                 etext = true;
+                etext_end = iova + size;
             } else if iova != phys {
-                dev_err!(
-                    dev,
-                    "Firmware memory-region {} at IOVA {:#x}, neither EC0p {:#x} nor its physical address",
-                    idx,
-                    iova,
-                    ec0p
-                );
-                return Err(EINVAL);
+                if !allow_ed0p {
+                    dev_err!(
+                        dev,
+                        "Firmware memory-region {} is translated without ED0p ({:#x} != {:#x})",
+                        idx,
+                        iova,
+                        phys
+                    );
+                    return Err(EINVAL);
+                }
+                if external_data.replace((iova, size)).is_some() {
+                    dev_err!(dev, "Multiple translated external data regions");
+                    return Err(EINVAL);
+                }
             }
             let mut off = 0;
             while off < size {
@@ -1841,7 +2223,22 @@ impl AopData {
             dev_err!(dev, "No firmware memory-region at EC0p {:#x}", ec0p);
             return Err(ENOENT);
         }
-        Ok(())
+        if let Some((iova, size)) = external_data {
+            if iova < etext_end {
+                dev_err!(
+                    dev,
+                    "External data region precedes or overlaps the external code"
+                );
+                return Err(EINVAL);
+            }
+            dev_info!(
+                dev,
+                "Validated external data region at IOVA {:#x}, size {:#x}",
+                iova,
+                size
+            );
+        }
+        Ok(external_data)
     }
 
     /// Leaks every allocation the firmware may still access. Called when the
@@ -1902,8 +2299,15 @@ impl AOP for AopData {
         if self.transport_closing.load(Acquire) {
             return Err(ENODEV);
         }
+        if self.sleeping.load(Acquire) {
+            return Err(EAGAIN);
+        }
         let ep_idx = afk_endpoint_index(svc.endpoint).ok_or(EINVAL)?;
         let _turn = self.take_call_turn(ep_idx);
+        // The sleep's drain may have passed this endpoint since the check above.
+        if self.sleeping.load(Acquire) {
+            return Err(EAGAIN);
+        }
         let call = {
             let mut rtk_guard = self.rtkit.lock();
             let mut rtk = rtk_guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
@@ -1922,8 +2326,15 @@ impl AOP for AopData {
         if self.transport_closing.load(Acquire) {
             return Err(ENODEV);
         }
+        if self.sleeping.load(Acquire) {
+            return Err(EAGAIN);
+        }
         let ep_idx = afk_endpoint_index(svc.endpoint).ok_or(EINVAL)?;
         let _turn = self.take_call_turn(ep_idx);
+        // The sleep's drain may have passed this endpoint since the check above.
+        if self.sleeping.load(Acquire) {
+            return Err(EAGAIN);
+        }
         let call = {
             let mut rtk_guard = self.rtkit.lock();
             let mut rtk = rtk_guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
@@ -2002,7 +2413,18 @@ impl AOP for AopData {
         false
     }
     fn source_ring(&self, dev: &device::Device<Bound>, size: usize) -> Result<Arc<SourceRing>> {
-        if self.setup_queue.is_none() || self.transport_closing.load(Acquire) {
+        if self.setup_queue.is_none() {
+            return Err(ENODEV);
+        }
+        self.bound_ring(dev, size, &mut |iova, size| self.setup_bind_source(iova, size))
+    }
+    fn bound_ring(
+        &self,
+        dev: &device::Device<Bound>,
+        size: usize,
+        bind: &mut dyn FnMut(u64, u64) -> Result<()>,
+    ) -> Result<Arc<SourceRing>> {
+        if self.transport_closing.load(Acquire) {
             return Err(ENODEV);
         }
         let mut guard = self.source_ring.lock();
@@ -2025,7 +2447,7 @@ impl AOP for AopData {
             ring: ring.clone(),
             confirmed: false,
         });
-        self.setup_bind_source(iova, size as u64)?;
+        bind(iova, size as u64)?;
         if let Some(binding) = &mut *guard {
             binding.confirmed = true;
         }
@@ -2190,6 +2612,24 @@ impl AopData {
                     // Each fragment of the endpoint map is acknowledged by
                     // echoing it.
                     st.send(SETUP_MGMT_EP, word)?;
+                    if st.epmap_endpoints {
+                        // RTKit layout: a 32-endpoint bitmap, its base in
+                        // bits 32..34. Endpoint 0 is this management one.
+                        let base = ((word >> 32) & 7) as u8 * 32;
+                        dev_dbg!(self.dev, "setup port: EPMAP {:#x}\n", word);
+                        for bit in 0..32u8 {
+                            let ep = base + bit;
+                            if word & (1 << bit) != 0 && ep != SETUP_MGMT_EP
+                                && !st.expected[..st.expected_count].contains(&ep)
+                            {
+                                if st.expected_count == SETUP_MAX_ENDPOINTS {
+                                    return Err(ENOSPC);
+                                }
+                                st.expected[st.expected_count] = ep;
+                                st.expected_count += 1;
+                            }
+                        }
+                    }
                     if word & SETUP_EPMAP_LAST != 0 {
                         st.map_done = true;
                     }
@@ -2246,7 +2686,7 @@ impl AopData {
     /// from the arena.
     fn setup_endpoint_request(&self, st: &mut SetupState, ep: u8, word: u64) -> Result<()> {
         let requested = (word & 0xffff_ffff) as usize;
-        let slot = SETUP_ENDPOINTS
+        let slot = st.expected[..st.expected_count]
             .iter()
             .position(|e| *e == ep)
             .ok_or(EINVAL)?;
@@ -2413,7 +2853,18 @@ impl AopData {
     /// sensor answers property reads and accepts its reporting interval but
     /// never reports; the trusted side does not start it. A missing file is
     /// not an error: the AOP's other services work without it.
+    ///
+    /// Only firmware that asks for the ALS endpoint's setup buffer takes its
+    /// calibration this way: T8140's fixed endpoint set includes it, and where
+    /// the EPMAP is read it has to be among the endpoints announced. Elsewhere
+    /// the ALS driver sends the sensor its calibration as a property.
     fn setup_als_calibration(&self) -> Result<()> {
+        {
+            let st = self.setup.lock();
+            if !st.expected[..st.expected_count].contains(&SETUP_ALS_EP) {
+                return Ok(());
+            }
+        }
         let Some(name) = self
             .dev
             .fwnode()
@@ -2441,22 +2892,19 @@ impl AopData {
                 return Ok(());
             }
         };
-        let data = calibration.data();
-        if data.len() != ALS_CALIBRATION_LEN
-            || le_u64(data, 0) != ALS_CALIBRATION_OPERATION
-            || le_u64(data, 8) != ALS_CALIBRATION_BODY_LEN
-        {
+        let Some((message, message_len)) = als_calibration_message(calibration.data()) else {
             dev_err!(
                 self.dev,
-                "ALS calibration {:?} is not an {}-byte calibration message",
+                "ALS calibration {:?} is neither an {}-byte calibration message nor a {}-byte sensor blob",
                 &*name,
-                ALS_CALIBRATION_LEN
+                ALS_CALIBRATION_LEN,
+                ALS_SENSOR_BLOB_LEN
             );
             return Err(EINVAL);
-        }
+        };
         let status = self.setup_request(
             SETUP_ALS_EP,
-            data,
+            &message[..message_len],
             &[SETUP_REPLY_READY, SETUP_REPLY_READY_ALT],
         )?;
         if status != 0 {
@@ -2495,7 +2943,7 @@ impl AopData {
                 "setup port: boot incomplete (AP power on: {}, endpoints: {}/{}): {:?}",
                 st.ap_ready,
                 st.endpoint_count(),
-                SETUP_ENDPOINTS.len(),
+                st.expected_count,
                 e
             );
             return Err(e);
@@ -2541,6 +2989,7 @@ impl rtkit::Operations for AopData {
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
+        data.crashed.store(true, Release);
         dev_err!(data.dev, "AOP firmware crashed");
     }
 }
@@ -2553,8 +3002,8 @@ struct AopDriver(Arc<dyn AOP>);
 
 struct AopHwConfig {
     ec0p: u64,
-    /// The `nCal` boot argument.
-    ncal: u64,
+    /// The `nCal` boot argument, or `None` to keep the firmware's own value.
+    ncal: Option<u64>,
     alig: u64,
     aopt: u64,
     /// Complete the firmware's boot arguments before starting it.
@@ -2563,6 +3012,15 @@ struct AopHwConfig {
     epic_v4: bool,
     /// The firmware boots through a second, "setup", mailbox as well.
     setup_port: bool,
+    /// The order endpoints stop for a system sleep where the device tree
+    /// gives none (`apple,sleep-endpoints`); empty means endpoint order.
+    sleep_endpoints: &'static [u8],
+    /// The order they start after one (`apple,wake-endpoints`).
+    wake_endpoints: &'static [u8],
+    /// Its service endpoints are the ones its EPMAP announces, not T8140's.
+    setup_epmap_endpoints: bool,
+    /// Its boot waits for the system endpoints the EPMAP names as well.
+    setup_wait_system_endpoints: bool,
     /// Shut the co-processor down on unbind and retain its buffers if the
     /// shutdown cannot be confirmed.
     quiesce_on_unbind: bool,
@@ -2575,63 +3033,102 @@ struct AopHwConfig {
     bootargs_word_access: bool,
     /// Halt the co-processor again when its start fails (T6040).
     halt_on_failed_start: bool,
+    /// The configuration to start with when the bootloader reserved no
+    /// firmware `memory-region` for a `fw_regions` block: the segments iBoot
+    /// left in DRAM are then neither reserved nor mapped, so it runs as its
+    /// fallback compatible's block did (T8122: `apple,t6020-aop`).
+    without_fw_regions: Option<&'static AopHwConfig>,
+}
+
+impl AopHwConfig {
+    /// The configuration to start the block with, given whether the
+    /// bootloader reserved its firmware regions.
+    fn for_regions(&'static self, has_fw_regions: bool) -> &'static AopHwConfig {
+        match self.without_fw_regions {
+            Some(alt) if self.fw_regions && !has_fw_regions => alt,
+            _ => self,
+        }
+    }
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
-    ncal: 0,
+    ncal: Some(0),
     aopt: 1,
     alig: 128,
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    sleep_endpoints: &[],
+    wake_endpoints: &[],
+    setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
+/// `nCal` keeps the firmware's own value, as on T6040: the J413 image carries 1,
+/// and with 0 the firmware never announces its accelerometer and gyroscope.
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
-    ncal: 0,
+    ncal: None,
     aopt: 0,
     alig: 128,
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    sleep_endpoints: &[],
+    wake_endpoints: &[],
+    setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
+/// `nCal` keeps the firmware's own value, as on T8112.
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
-    ncal: 0,
+    ncal: None,
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    sleep_endpoints: &[],
+    wake_endpoints: &[],
+    setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
-    ncal: 0,
+    ncal: Some(0),
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    sleep_endpoints: &[],
+    wake_endpoints: &[],
+    setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 /// T6040 (J616s): the firmware's external code and log live in DRAM, mapped
 /// through the reserved regions the bootloader describes; the RTKit firmware
@@ -2640,22 +3137,35 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
 /// and report interval but never send a report.
 const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
-    ncal: 1,
+    ncal: Some(1),
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    sleep_endpoints: &[],
+    wake_endpoints: &[],
+    setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: true,
     required_endpoints: &[],
     fw_regions: true,
     bootargs_word_access: true,
     halt_on_failed_start: true,
+    without_fw_regions: None,
 };
 /// T8132 (J713): as T6040. The bootloader hands the AOP over the same way, with
 /// the DART's DAPF programmed and its windows reserved alongside the firmware
 /// segments.
 const HW_CFG_T8132: AopHwConfig = HW_CFG_T6040;
+/// T8122 (M3): as T6040. iBoot leaves the AOP halted with its external code,
+/// data and log in DRAM, which the bootloader reserves in `memory-region`;
+/// the 27.2 firmware reads its `__EDATA` base from `ED0p`. A bootloader that
+/// reserves none leaves it to start as `apple,t6020-aop`, as before.
+const HW_CFG_T8122: AopHwConfig = AopHwConfig {
+    without_fw_regions: Some(&HW_CFG_T6020),
+    ..HW_CFG_T6040
+};
 /// T8140: the firmware is started with the boot arguments the bootloader
 /// left, boots through the setup port and speaks EPIC version 4. Of the
 /// advertised AFK endpoints, the application map is 0x20 misc, 0x21
@@ -2663,17 +3173,119 @@ const HW_CFG_T8132: AopHwConfig = HW_CFG_T6040;
 /// are started if they will.
 const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     ec0p: 0,
-    ncal: 0,
+    ncal: Some(0),
     aopt: 0,
     alig: 0,
     patch_bootargs: false,
     epic_v4: true,
     setup_port: true,
+    sleep_endpoints: &[0x2b, 0x23, 0x22, 0x20, 0x21],
+    wake_endpoints: &[0x20, 0x21, 0x22, 0x2b, 0x23],
+    setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: true,
     required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
+};
+/// T8152: like T8140, but the setup port (mailbox 1 of the AOP bank, and the
+/// ADT aop-exclave-mailbox) is not reachable from the AP: both bus-error.
+const HW_CFG_T8152: AopHwConfig = AopHwConfig {
+    ec0p: 0,
+    ncal: None,
+    aopt: 0,
+    alig: 0,
+    patch_bootargs: false,
+    epic_v4: true,
+    setup_port: false,
+    sleep_endpoints: &[],
+    wake_endpoints: &[],
+    setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
+    quiesce_on_unbind: true,
+    required_endpoints: &[],
+    fw_regions: false,
+    bootargs_word_access: false,
+    halt_on_failed_start: false,
+    without_fw_regions: None,
+};
+
+/// T8142 (M5): booted through a setup port as on T8140, at the ADT's
+/// aop-exclave-mailbox (0x3d067c000, AOP ASC + 0x4007c000, untranslated),
+/// whose EPMAP names the service endpoints (0x4, 0x20, 0x23 and 0x32 on the
+/// MacBook Air J813, not T8140's set). EPIC and AFK as on T8152; the
+/// firmware runs with the boot arguments iBoot left.
+const HW_CFG_T8142: AopHwConfig = AopHwConfig {
+    ec0p: 0,
+    ncal: None,
+    aopt: 0,
+    alig: 0,
+    patch_bootargs: false,
+    epic_v4: true,
+    setup_port: true,
+    sleep_endpoints: &[],
+    wake_endpoints: &[],
+    setup_epmap_endpoints: true,
+    setup_wait_system_endpoints: true,
+    quiesce_on_unbind: true,
+    required_endpoints: &[],
+    fw_regions: false,
+    bootargs_word_access: false,
+    halt_on_failed_start: false,
+    without_fw_regions: None,
+};
+/// T6050 (M5 Pro and Max): booted as T8142, through the setup port at
+/// AOP ASC + 0x4007c000. Its EPMAP also names system endpoint 4, which never
+/// asks for a buffer, so boot doesn't wait for it.
+const HW_CFG_T6050: AopHwConfig = AopHwConfig {
+    setup_wait_system_endpoints: false,
+    ..HW_CFG_T8142
+};
+
+/// The data of a bound AOP device.
+///
+/// # Safety
+///
+/// `dev` is an AOP device between the end of probe and the start of removal.
+unsafe fn aop_from_dev<'a>(dev: *mut bindings::device) -> &'a AopData {
+    // SAFETY: by the caller's contract, drvdata is the `AopDriver` probe set.
+    let driver = unsafe { &*bindings::dev_get_drvdata(dev).cast::<AopDriver>() };
+    let data: *const dyn AOP = &*driver.0;
+    // SAFETY: probe made this `Arc<dyn AOP>` from an `Arc<AopData>`.
+    unsafe { &*data.cast::<AopData>() }
+}
+
+/// # Safety
+///
+/// Called by the PM core with a bound AOP device.
+unsafe extern "C" fn aop_suspend_late(dev: *mut bindings::device) -> c_int {
+    // SAFETY: only reads a flag.
+    if !unsafe { bindings::pm_suspend_via_firmware() } {
+        return 0;
+    }
+    // SAFETY: by this function's contract.
+    match unsafe { aop_from_dev(dev) }.sleep_enter() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// # Safety
+///
+/// Called by the PM core with a bound AOP device.
+unsafe extern "C" fn aop_resume(dev: *mut bindings::device) -> c_int {
+    // SAFETY: by this function's contract.
+    unsafe { aop_from_dev(dev) }.sleep_undo();
+    0
+}
+
+static AOP_PM_OPS: bindings::dev_pm_ops = bindings::dev_pm_ops {
+    suspend_late: Some(aop_suspend_late),
+    resume: Some(aop_resume),
+    // SAFETY: all-zero is a valid `dev_pm_ops`: no callbacks.
+    ..unsafe { core::mem::zeroed() }
 };
 
 kernel::of_device_table!(
@@ -2683,10 +3295,14 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t8103-aop")), &HW_CFG_T8103),
         (of::DeviceId::new(c_str!("apple,t8112-aop")), &HW_CFG_T8112),
         (of::DeviceId::new(c_str!("apple,t6000-aop")), &HW_CFG_T6000),
+        (of::DeviceId::new(c_str!("apple,t8122-aop")), &HW_CFG_T8122),
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
         (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6040),
         (of::DeviceId::new(c_str!("apple,t8132-aop")), &HW_CFG_T8132),
+        (of::DeviceId::new(c_str!("apple,t6050-aop")), &HW_CFG_T6050),
+        (of::DeviceId::new(c_str!("apple,t8142-aop")), &HW_CFG_T8142),
+        (of::DeviceId::new(c_str!("apple,t8152-aop")), &HW_CFG_T8152),
     ]
 );
 
@@ -2696,11 +3312,22 @@ impl platform::Driver for AopDriver {
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        Some(&AOP_PM_OPS)
+    }
+
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
-        let cfg = info.ok_or(ENODEV)?;
+        let matched: &'static AopHwConfig = info.ok_or(ENODEV)?;
+        let cfg = matched.for_regions(AopData::has_fw_regions(pdev.as_ref()));
+        if !core::ptr::eq(cfg, matched) {
+            dev_info!(
+                pdev.as_ref(),
+                "No firmware memory-region from the bootloader: starting with the fallback compatible's configuration"
+            );
+        }
         if RETIRED.load(Acquire) {
             dev_err!(
                 pdev.as_ref(),
@@ -2715,28 +3342,40 @@ impl platform::Driver for AopDriver {
         let asc_req = pdev.io_request_by_index(1).ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
         let asc_mmio = asc_mmio.as_view().relaxed();
-        if cfg.fw_regions {
+        let aop_mmio = aop_mmio.as_view();
+        let ed0p = if cfg.fw_regions {
             // Before anything is written to the AOP: no mapping, no start.
-            AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p)?;
-        }
+            let allow_ed0p = cfg.patch_bootargs
+                && AopData::bootargs_has_ed0p(&aop_mmio, cfg.bootargs_word_access)?;
+            AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p, allow_ed0p)?.map(|(iova, _)| iova)
+        } else {
+            None
+        };
         let data = AopData::new(pdev, cfg)?;
         // Whatever fails below leaves the AOP running and its children
         // registering; the same teardown as unbind's cleans that up.
         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
-        let aop_mmio = aop_mmio.as_view();
         if cfg.patch_bootargs {
             data.patch_bootargs(
                 &aop_mmio,
                 &[
-                    (from_fourcc(b"EC0p"), cfg.ec0p),
+                    (from_fourcc(b"EC0p"), Some(cfg.ec0p)),
+                    (from_fourcc(b"ED0p"), ed0p),
                     (from_fourcc(b"nCal"), cfg.ncal),
-                    (from_fourcc(b"alig"), cfg.alig),
-                    (from_fourcc(b"AOPt"), cfg.aopt),
+                    (from_fourcc(b"alig"), Some(cfg.alig)),
+                    (from_fourcc(b"AOPt"), Some(cfg.aopt)),
                 ],
                 cfg.bootargs_word_access,
             )?;
         }
-        let rtkit = rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?;
+        // The T8142 AOP places its own crashlog buffer in its firmware-mapped
+        // DART slot and asks for it on endpoint 1 with that IOVA; take it as
+        // the firmware's instead of refusing the request.
+        let rtkit = if cfg.setup_epmap_endpoints {
+            rtkit::RtKit::<AopData>::new_with_firmware_crashlog(pdev.as_ref(), None, 0, data.clone())?
+        } else {
+            rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?
+        };
         data.rtkit.lock().as_mut().set(Some(rtkit));
         if cfg.setup_port {
             AopData::setup_open(&data, pdev.as_ref())?;

@@ -203,7 +203,7 @@ def brightness_takeover(root):
     prefix = prefix.replace('static inline ', 'static inline __attribute__((unused)) ')
     functions = '\n'.join(block(source, marker) for marker in (
         'static bool dcp_backlight_desktop(', 'static int dcp_get_brightness(',
-        'static void dcp_backlight_sync_hint(',
+        'void dcp_backlight_presented(', 'static void dcp_backlight_sync_hint(',
         'int dcp_backlight_register(', 'static int dcp_set_brightness(',
         'static bool dcp_backlight_controls_device('))
     # The 14.7 panel's nits policy and class operations (an M3 internal
@@ -221,7 +221,10 @@ def brightness_takeover(root):
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define DCP_FIRMWARE_V_26_6_DESKTOP 5
 #define DCP_FIRMWARE_H17P 1
+#define DCP_FIRMWARE_V_27_0 6
 #define DCP_IOMFB_METHODS_H17G 7
+static bool v27_keep_level = true;
+static bool pm_suspend_via_firmware(void) {return false;}
 #define MAX_BRIGHTNESS_PART2 510U
 #define BACKLIGHT_PLATFORM 1
 #define BACKLIGHT_SCALE_LINEAR 1
@@ -242,7 +245,8 @@ struct apple_dcp {
     int fw_compat;bool quiescing;
     struct {int iomfb_method_profile;} hw;
     struct {u32 maximum,nits,dac;bool update;struct backlight_device *bl_dev;
-        u32 level,fade_from,fade_to;bool fading;unsigned long fade_start;int fade_work;} brightness;
+        u32 level,fade_from,fade_to;bool fading;unsigned long fade_start;int fade_work;
+        struct dcp_bl_presented presented;} brightness;
     struct {bool lock;struct dcp_backlight_state state;unsigned long fade_start;
         int fade_work;void (*kick)(struct apple_dcp *);} backlight;
     struct {bool inherited_brightness_valid;u32 inherited_brightness;} *desktop;
@@ -333,6 +337,20 @@ int main(void)
     inject_user=true;dcp_backlight_sync_hint(&d);
     assert(d.backlight.state.controlled && d.backlight.state.target==450);
     assert(registered.props.brightness==450 && !registered.ops_lock);
+    /*
+     * DAC firmware (J414s, 13.5): the report of the loader's level until a
+     * present, then the presented level, through a display power cycle whose
+     * power-off report of 0 is not followed by one for the lit panel.
+     */
+    struct apple_dcp dac={.fw_compat=0,.brightness={.maximum=500,.nits=140}};
+    struct backlight_device dac_bl={.data=&dac};
+    assert(dcp_get_brightness(&dac_bl)==140);
+    dcp_backlight_presented(&dac,500);
+    assert(dcp_get_brightness(&dac_bl)==500);
+    dcp_backlight_presented(&dac,0);dac.brightness.nits=0;
+    assert(dcp_get_brightness(&dac_bl)==0);
+    dcp_backlight_presented(&dac,500);
+    assert(dcp_get_brightness(&dac_bl)==500 && !dac.backlight.lock);
     return 0;
 }
 '''
@@ -397,7 +415,8 @@ def panel_identity(root, output=None):
     backend = (root / 'drivers/gpu/drm/apple/iomfb_v26_6_desktop.c').read_text()
     dictionary = block((root/'drivers/gpu/drm/apple/parser.c').read_text(), 'static int parse_panel_edid_value(')
     dictionary += block((root/'drivers/gpu/drm/apple/parser.c').read_text(), 'int parse_panel_edid_data(')
-    dictionary += block(backend, 'struct dcp_dict_passthrough_req_v26_6 {')+';\n'
+    # The dictionary record is shared with firmware 27's analytics event.
+    dictionary += block((root/'drivers/gpu/drm/apple/iomfb.h').read_text(), 'struct dcp_dict_passthrough_req {')+';\n'
     dictionary += block(backend, 'static bool trampoline_panel_dictionary_v26_6(')
     dictionary += block(backend, 'static bool iomfb_check_callback_exact_v26_6_desktop(')
     dictionary += '\n#define iomfb_check_callback_v26_6_desktop iomfb_check_callback_exact_v26_6_desktop\n'
@@ -462,7 +481,7 @@ int main(int argc, char **argv)
     };
     for(unsigned form=0;form<3;form++) {
         desktop=(__typeof__(desktop)){0};notifications=0;
-        struct dcp_dict_passthrough_req_v26_6 wire={0};u32 result=0;
+        struct dcp_dict_passthrough_req wire={0};u32 result=0;
         strcpy((char *)wire.key,form?"ProductAttributes":"DisplayAttributes");
         const u8 *data=form==2?minimal:form?product:attributes;
         size_t size=form==2?sizeof(minimal):form?sizeof(product):sizeof(attributes);
@@ -587,21 +606,23 @@ def powerlog_framing(root):
     system = (root / 'drivers/gpu/drm/apple/systemep.c').read_text()
     prefix = f['prefix'] + f['metadata'] + f['epoch'].replace('static inline ', 'static inline __attribute__((unused)) ') + f['header'] + f['edid_header'] + f['parser']
     prefix += block(header, 'struct dcp_system_ev_mnits {') + ';\n'
+    prefix += '#define __le64 u64\n#define EPIC_SERVICE_CALL_MAGIC 0x69706378\n'
     prefix += block(afkh, 'struct epic_compact_sub_hdr {') + ';\n'
     prefix += block(afkh, 'struct epic_compact_desc {') + ';\n'
+    prefix += block(afkh, 'struct epic_service_call {') + ' __attribute__((packed));\n'
     prefix += '#undef kfree\n#define kfree(p) free((void *)(p))\n#define pr_err(...) ((void)0)\n'
     prefix += block(parser, 'int parse_system_log_mnits(')
     prefix += block(parser, 'int parse_system_log_mnits_pairs(')
     prefix += r'''
 #define DCP_FIRMWARE_H17P 1
 #define DCP_FIRMWARE_V_26_6_DESKTOP 5
+#define DCP_FIRMWARE_V_27_0 6
 #define DCP_IOMFB_METHODS_H17G 7
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define dev_dbg(...) ((void)0)
 #define dev_info(...) ((void)0)
 #define dev_warn(...) ((void)0)
-#define __le64 u64
 #define EPIC_SUBTYPE_STD_SERVICE 0xc0
 enum epic_subtype { REPORT = 0xc0 };
 struct work_struct { unsigned scheduled; };
@@ -626,10 +647,20 @@ static void afk_recv_handle_compact_call(struct apple_dcp_afkep *e,u16 id,const 
 {(void)e;(void)id;(void)p;(void)n;assert(false);}
 static void afk_recv_handle_compact_reply(struct apple_dcp_afkep *e,u16 id,u8 t,const void *p,size_t n)
 {(void)e;(void)id;(void)t;(void)p;(void)n;assert(false);}
+static unsigned call_reports;static u32 call_magic,call_cmd;
+static int call_report_cb(struct apple_epic_service *s,enum epic_subtype t,const void *p,size_t n)
+{
+    const struct epic_service_call *c=p;
+    (void)s;(void)t;
+    assert(n==sizeof(*c)+0x10);
+    call_reports++;call_magic=get_unaligned_le32(&c->magic);call_cmd=get_unaligned_le32(&c->command);
+    return 0;
+}
 '''
     functions = '\n'.join(block(source, name) for source, name in (
         (system, 'static int powerlog_report('),
         (afk, 'static bool afk_compact_report_dictionary('),
+        (afk, 'static bool afk_compact_report_service_call('),
         (afk, 'static void afk_recv_compact_message(')))
     return prefix + '\n' + functions + '\nstatic const u8 report[]={'+','.join(map(str,raw))+'};\n' + r'''
 int main(void)
@@ -663,10 +694,36 @@ int main(void)
     d.fw_compat=DCP_FIRMWARE_H17P;
     afk_recv_compact_message(&ep,3,wire,sizeof(wire)-8);
     assert(hints==3 && !service.users);
+    d.fw_compat=DCP_FIRMWARE_V_27_0;
+    afk_recv_compact_message(&ep,3,wire,sizeof(wire)-8);
+    assert(hints==3 && !service.users);
     d.fw_compat=DCP_FIRMWARE_V_26_6_DESKTOP;
     /* The first key without its value gives no reading. */
     afk_recv_compact_message(&ep,3,wire,24+12);
     assert(hints==3 && !service.users);
+    /* Firmware 27 takes a framed report's hint as H17P does. */
+    d.fw_compat=DCP_FIRMWARE_V_27_0;hint=0;
+    memcpy(wire+16,report,sizeof(report));
+    afk_recv_compact_message(&ep,3,wire,16+sizeof(report));
+    assert(hints==4 && hint==123000 && !service.users);
+    /* Bare and descriptor-wrapped EPIC service-call reports both preserve their header. */
+    {
+        u8 cwire[16+sizeof(struct epic_compact_desc)+sizeof(struct epic_service_call)+0x10]={0};
+        struct epic_compact_sub_hdr *csub=(void *)(cwire+8);
+        struct epic_service_call *ccall=(void *)(cwire+16);
+        csub->category=0;csub->type=EPIC_SUBTYPE_STD_SERVICE;
+        ops.report=call_report_cb;
+        ccall->group=2;ccall->command=3;ccall->data_len=0x10;
+        ccall->magic=EPIC_SERVICE_CALL_MAGIC;
+        afk_recv_compact_message(&ep,3,cwire,16+sizeof(*ccall)+0x10);
+        assert(call_reports==1 && call_magic==EPIC_SERVICE_CALL_MAGIC && call_cmd==3 && !service.users);
+        memset(cwire+16,0,sizeof(cwire)-16);
+        ccall=(void *)(cwire+16+sizeof(struct epic_compact_desc));
+        ccall->group=2;ccall->command=4;ccall->data_len=0x10;
+        ccall->magic=EPIC_SERVICE_CALL_MAGIC;
+        afk_recv_compact_message(&ep,3,cwire,sizeof(cwire));
+        assert(call_reports==2 && call_magic==EPIC_SERVICE_CALL_MAGIC && call_cmd==4 && !service.users);
+    }
     return 0;
 }
 '''

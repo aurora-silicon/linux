@@ -1,14 +1,24 @@
 # Shared xART gigalocker safety gate
 
-## Current default
+## SEP writes are always on
 
-`xart_writes=1` is the driver default. The APFS extent-ownership checks,
-record validation and write-ordering checks remain mandatory; unsupported
-layouts fail closed. `xart_writes=0 provision_keybag=0` explicitly selects
-read-only operation. `provision_keybag=1` is the default: create the Linux
-identity if missing and recover an existing identity without replacing it.
+xART writes and identity-keybag provisioning are always on. The `apple_sep`
+driver has no parameter that turns them off: `xart_writes` and
+`provision_keybag` were removed (aurora-silicon/linux#2591), and a stale value
+on the kernel command line or in modprobe.d is ignored. The APFS
+extent-ownership checks, record validation and write-ordering checks remain
+mandatory, and unsupported layouts fail closed. Provisioning creates the Linux
+identity keybag if it is missing and keeps an existing one without replacing
+it.
+
 The historical evidence below records the earlier opt-in deployments and
 does not establish qualification on every supported Mac or APFS layout.
+
+Kernels from before linux#2591 still have both parameters. They default to 1
+there, but a `0` is still honoured. So remove any `xart_writes=0` or
+`provision_keybag=0` that an earlier read-only install or an old version of
+these docs left in `/etc/modprobe.d/` or on the kernel command line.
+`aurora-xart status` names each one.
 
 ## Other OSes' records: `xart_guard`
 
@@ -135,13 +145,36 @@ The same kernel, under the old policy, unlocked the keybag without any
 session record write. Linux had never created a record there: the guard
 ran from Linux's first boot and its list stayed empty.
 
-Under an unchanged policy that first unlock rewrites no session record at
-all (every J616s boot before the change). So the driver treats a rewrite
-inside it as the policy change and lets exactly one through, by itself, on
-the first boot after the change:
+Touch ID can use the keybag first instead. When fprintd opens the sensor
+before any trusted key is unsealed (a login screen that offers Touch ID,
+for example), the first use of the keybag under the new policy is the
+`DESIGNATE_KEYBAG` in `activate_touchid` (`sbio.rs`), and the enclave asks
+for the rewrite there, after LOAD_KEYBAG has answered. The guard refuses
+it, and the designate is never answered:
 
-- only during the first unlock of an identity keybag that already existed,
-  once per boot; a keybag or ref-key created this boot closes the window;
+    xART guard: refused to rewrite kind-4 record <id>, which this Linux install did not create
+    sks: DESIGNATE_KEYBAG got no reply after 2037 ms
+    sks: DESIGNATE_KEYBAG did not complete; enrolment will refuse
+    hwrng: read produced nothing (ETIMEDOUT)
+    matching unavailable this boot: ...
+
+Touch ID and the enclave's RNG stay down for that boot, and the refusal
+repeats on every boot until the record is allowed. This was seen on the
+MacBook Air M3 (T8122, J613) on 2026-11-07, after a change from a raw
+m1n1 Stage 1 to a Mach-O one, and on a J616s after every Recovery
+enrolment of a Stage 1 that day (https://github.com/aurora-silicon/linux/issues/1190). Kernels from before that
+designate ran in the window below need `aurora-sep-policy-change` for this
+case.
+
+Under an unchanged policy neither that first unlock nor that designate
+rewrites an existing session record (every J616s boot before the change,
+and every guarded Touch ID boot on the J613 and J616s). So the driver
+treats a rewrite inside them as the policy change and lets exactly one
+through, by itself, on the first boot after the change:
+
+- only during the first unlock or Touch ID designate of an identity keybag
+  that already existed, whichever comes first, once per boot; a keybag or
+  ref-key created this boot closes the window;
 - only one kind-4 session record, only a rewrite, never a delete or a
   shared root, and the record is not added to Linux's list;
 - only once the record's previous value is durable in
@@ -160,8 +193,12 @@ boot:
   run it with no arguments. It takes the session id from the refusal.
 - Before a planned change, run it with `--expect`. The record cannot be
   named in advance, so the allowance covers the first existing kind-4
-  record the enclave asks to rewrite. The identity unlock is the first
-  thing that asks.
+  record the enclave asks to rewrite. The keybag's first use, Touch ID's
+  designate or the first unlock, is the first thing that asks. See
+  "Changing Stage 1 on purpose" below.
+- On a kernel whose refusal line names no session id (one from before the
+  allowance code), the tool with no arguments finds nothing to allow. Use
+  `--expect` there, and boot a kernel with the allowance code next.
 
 Either way it first copies the whole 6 MiB gigalocker extent, the driver's
 host files and `/var/lib/fprint` to
@@ -174,6 +211,30 @@ log names the record either way. `--status`
 shows what is armed and what this boot refused; `--cancel` removes an
 allowance that was not used yet.
 
+#### Changing Stage 1 on purpose
+
+Arm the allowance before the change, so the first boot under the new
+policy keeps Touch ID:
+
+1. On the Linux install, run `aurora-sep-policy-change --expect` as root.
+   The running kernel only has to load the driver, which logs where the
+   gigalocker is; it need not have the allowance code.
+2. Change Stage 1 (for example, enrol it from 1TR).
+3. Make the first boot afterwards a kernel with the allowance code, the
+   one that reads `/var/lib/aurora-sep-xart-allow-once.bin`. It empties
+   the file at probe and logs "this boot may rewrite the first existing
+   kind-4 record the enclave asks for, once", then "allowed one rewrite of
+   kind-4 record ... for a boot policy change" when the enclave asks.
+   A kernel without that code does not read the file. With the guard on,
+   it refuses the rewrite as above and leaves the allowance for a later
+   boot; with the guard off, it lets the rewrite through without saving
+   the previous value.
+4. Later boots under the same policy need nothing, on either kernel.
+
+If the first boot was the wrong kernel, Touch ID is down for that boot
+only: boot one with the allowance code next, and it uses the allowance
+still in the file.
+
 `aurora-sep-load` recognises a refusal and stops at once with a message
 that points here, instead of retrying for two minutes.
 
@@ -181,6 +242,15 @@ On the J616s the first such update (2026-10-28, Stage 1 window change)
 rewrote one kind-4 record and one shared root. The other six kind-4
 records and the kind-3 record kept their revisions, Ryan's enrolled
 finger matched afterwards, and it kept matching across later reboots.
+
+On the J613 (2026-11-07) the tool with no arguments armed the record the
+designate refusal named. The next boot logged "allowed one rewrite of
+kind-4 record ... for a boot policy change", restored the Catacomb and the
+enrolment ("Touch ID: restored 1 enrolled identity/identities; enrolment
+survived reboot"), and a kernel without the allowance code brought Touch
+ID up on later boots. A second Stage 1 change on that Mac (2026-11-08),
+armed beforehand as in "Changing Stage 1 on purpose", kept Touch ID on
+the first boot with no refusal.
 
 The copy of the gigalocker is evidence and a last resort, not an undo:
 writing an old copy back does not roll back the enclave's anti-replay
@@ -309,14 +379,15 @@ same way; that is untested.
 
 ## Earlier deployment policy
 
-The iBoot APFS container and its XART `.gl` file are shared with macOS. The
-deployed `m2fix4` kernel remains read-only. The `m2fix5` source has an explicit
-`xart_writes=1` opt-in; it accepts writes only when the APFS-resolved extent is
-single-owner, unsnapshotted, un-cloned, and all existing records validate.
-`xart_start_sector` remains only an assertion against the APFS result. The
-opt-in is for the controlled J414s hardware test, not general APFS write
-support or a promise that restoring an old raw image reverses SEP anti-replay
-state. Do not enable it on other installations without equivalent checks.
+The iBoot APFS container and its XART `.gl` file are shared with macOS. At
+the time, the deployed `m2fix4` kernel was read-only, and the `m2fix5` source
+had an explicit `xart_writes=1` opt-in, a parameter since removed
+(aurora-silicon/linux#2591). It accepted writes only when the APFS-resolved
+extent was single-owner, unsnapshotted, un-cloned, and all existing records
+validated, as the driver still requires. `xart_start_sector` remains only an
+assertion against the APFS result. That opt-in was for the controlled J414s
+hardware test; it was not general APFS write support or a promise that
+restoring an old raw image reverses SEP anti-replay state.
 
 ## Evidence collected on 2026-09-21
 

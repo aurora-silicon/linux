@@ -152,6 +152,21 @@ impl Mapping {
     pub(crate) fn phys(&self) -> u64 {
         self.phys
     }
+
+    /// Cleans the whole mapping to the point of coherency when it is the kernel's cacheable
+    /// mapping of reserved System RAM ([`Self::region`]); device and write-combined mappings
+    /// need nothing.
+    pub(crate) fn clean_poc(&self) {
+        if self.kind != Kind::WriteBack {
+            return;
+        }
+        let start = self.raw.addr();
+        // SAFETY: `start..start + maxsize` is this live mapping; cleaning a cacheable range has
+        // no other effect.
+        unsafe {
+            bindings::dcache_clean_poc(start as _, (start + self.raw.size()) as _);
+        }
+    }
 }
 
 impl Drop for Mapping {

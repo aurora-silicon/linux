@@ -80,6 +80,7 @@ unsafe impl<T: Driver> driver::RegistrationOps for Adapter<T> {
             (*pdrv.get()).driver.of_match_table = of_table;
             (*pdrv.get()).driver.acpi_match_table = acpi_table;
             (*pdrv.get()).driver.suppress_bind_attrs = T::suppress_bind_attrs();
+            (*pdrv.get()).driver.pm = T::pm_ops().map_or(core::ptr::null(), core::ptr::from_ref);
         }
 
         // SAFETY: `pdrv` is guaranteed to be a valid `DriverType`.
@@ -228,6 +229,11 @@ pub trait Driver {
     /// Evaluated before registration, including before a deferred probe.
     fn suppress_bind_attrs() -> bool {
         false
+    }
+
+    /// The driver's power management callbacks, if it has any.
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        None
     }
 
     /// Platform driver probe.

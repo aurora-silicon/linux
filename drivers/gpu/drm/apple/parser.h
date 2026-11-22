@@ -17,6 +17,7 @@ typedef void (*dcp_identity_key_fn)(void *data, const char *key, u32 key_len,
 int parse_identity_keys(const void *blob, size_t len, dcp_identity_key_fn emit, void *data);
 struct apple_connector;
 struct apple_dcp_typec_route;
+struct dcp_dptx_caps;
 
 struct dcp_parse_ctx {
 	struct apple_dcp *dcp;
@@ -27,12 +28,30 @@ struct dcp_parse_ctx {
 	bool ambiguous_180hz;
 	/* Desktop 26.6 uses zero placeholders for an unreported VRR range. */
 	bool zero_vrr_range_fallback;
+	/* Desktop 26.6 internal panels take a deadline at every timing. */
+	bool internal_present_deadline;
 	/*
 	 * A desktop 26.x external processor: read the sink timing keys that
 	 * describe the preferred timing for the firmware-derived EDID, without
 	 * the H17P external color policy.
 	 */
 	bool metadata_timing;
+	/*
+	 * A firmware 27 external processor: for SDR, prefer the timing's
+	 * Default RGB element, as macOS does, over a higher-scored BT.2020 one.
+	 */
+	bool sdr_default_rgb;
+	/*
+	 * A firmware 27 processor: it compresses a PQ element the timing lists
+	 * as needing DSC itself, so such an element is usable for PQ.
+	 */
+	bool pq_dsc;
+	/*
+	 * Size of the tiled display the sink reported (0 when untiled). Its
+	 * full-size timing needs DSC, which DCP runs itself, so that timing
+	 * keeps its DSC-required color modes.
+	 */
+	u32 tiled_width, tiled_height;
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	/*
 	 * T6030 external processor audio elements (DCP firmware 14.7, external
@@ -224,7 +243,9 @@ int parse_panel_product_metadata(struct dcp_parse_ctx *handle,
 int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 			     int *height_mm, bool *backlight_control);
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
-			    const char **class, s64 *unit, bool h17p_keys);
+			    const char **class, s64 *unit, bool h17p_keys,
+			    bool epic_unit_first);
+int parse_dptx_caps(struct dcp_parse_ctx *handle, struct dcp_dptx_caps *caps);
 
 struct dcp_sound_format_mask {
 	u64 formats;			/* SNDRV_PCM_FMTBIT_* */

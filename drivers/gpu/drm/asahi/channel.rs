@@ -45,6 +45,25 @@ use kernel::{
 
 pub(crate) use crate::fw::channels::PipeType;
 
+#[derive(Default)]
+struct PowerTransitionBatch {
+    final_powered: Option<bool>,
+}
+
+impl PowerTransitionBatch {
+    fn power_on(&mut self) {
+        self.final_powered = Some(true);
+    }
+
+    fn power_off(&mut self) {
+        self.final_powered = Some(false);
+    }
+
+    fn ends_powered_off(&self) -> bool {
+        self.final_powered == Some(false)
+    }
+}
+
 /// A receive (FW->driver) channel.
 pub(crate) struct RxChannel<T: RxChannelState, U: Copy + Default>
 where
@@ -595,13 +614,12 @@ pub(crate) struct StatsChannel {
     /// Last raw sample of every statistics kind, shared with the export
     /// through `crate::stats_raw`.
     raw: Arc<SpinLock<RawStatsSnapshot>>,
-    /// Rate of firmware stats-message timestamps (Hz). All stats timestamps
-    /// run on the chip base clock (`HwConfig::base_clock_hz`, 24 MHz on every
-    /// supported SoC), not nanoseconds.
-    ts_hz: u64,
-    /// Last `Utilization` message timestamp (raw base-clock ticks), for
-    /// utilization-weighted `busy_ns` integration.
-    last_util_ts: u64,
+    /// Utilization-weighted `busy_ns` integration across `Utilization`
+    /// windows. All stats timestamps run on the chip base clock
+    /// (`HwConfig::base_clock_hz`, 24 MHz on every supported SoC), not
+    /// nanoseconds.
+    busy: crate::stats_busy::BusyIntegrator,
+    gpu: Option<Arc<dyn gpu::GpuManager>>,
 }
 
 #[versions(AGX)]
@@ -619,9 +637,14 @@ impl StatsChannel::ver {
             ch: RxChannel::<ChannelState, RawStatsMsg::ver>::new(alloc, 0x100)?,
             snap,
             raw,
-            ts_hz,
-            last_util_ts: 0,
+            busy: crate::stats_busy::BusyIntegrator::new(ts_hz),
+            gpu: None,
         })
+    }
+
+    /// Registers the manager that owns firmware objects retired by power events.
+    pub(crate) fn set_manager(&mut self, gpu: Arc<dyn gpu::GpuManager>) {
+        self.gpu = Some(gpu);
     }
 
     /// Returns the raw `ChannelRing` structure to pass to firmware.
@@ -631,6 +654,8 @@ impl StatsChannel::ver {
 
     /// Polls for new statistics messages on this ring.
     pub(crate) fn poll(&mut self) {
+        let mut power = PowerTransitionBatch::default();
+
         while let Some(msg) = self.ch.get(0) {
             // SAFETY: The raw view is always valid for all bit patterns.
             let tag = unsafe { msg.raw.0 };
@@ -641,6 +666,13 @@ impl StatsChannel::ver {
                     let msg = unsafe { msg.msg };
                     cls_dev_dbg!(StatsCh, self.dev, "Stats: {:?}\n", msg);
                     self.record_raw(&msg);
+
+                    match &msg {
+                        StatsMsg::ver::PowerOn { .. } => power.power_on(),
+                        StatsMsg::ver::PowerOff { .. } => power.power_off(),
+                        _ => {}
+                    }
+
                     if module_parameters::stats_export.value() != 0 {
                         // Retain the latest values for /sys/class/drm/card*/
                         // device/agx_stats. Read-only with respect to
@@ -666,37 +698,20 @@ impl StatsChannel::ver {
                                 // across a saturated 30 s matmul and 0-2 on
                                 // an idle desktop, while FwBusy timestamp
                                 // deltas (the prior producer) covered 0.17%
-                                // of that matmul. The timestamps are base-
-                                // clock ticks (24 MHz), so convert to ns
-                                // once here. The kernel runtime has no
-                                // 128-bit division, so split whole seconds
-                                // from the tick remainder: whole seconds
-                                // contribute util * 1e7 ns each (1e9 / 100
-                                // exactly), the remainder contributes
-                                // rem * util * 1e9 / (100 * ts_hz), which
-                                // cannot overflow u64 (rem < ts_hz <= 24e6
-                                // on supported SoCs).
-                                let util = u64::from(
-                                    [*util1, *util2, *util3, *util4]
-                                        .into_iter()
-                                        .max()
-                                        .unwrap_or(0)
-                                        .min(100),
-                                );
-                                let ts = timestamp.0;
-                                if self.last_util_ts != 0 && ts > self.last_util_ts {
-                                    let delta = ts - self.last_util_ts;
-                                    let whole_s = delta / self.ts_hz;
-                                    let rem = delta % self.ts_hz;
-                                    let busy = whole_s
-                                        .saturating_mul(util)
-                                        .saturating_mul(10_000_000)
-                                        .saturating_add(
-                                            rem * util * 1_000_000_000 / (100 * self.ts_hz),
-                                        );
+                                // of that matmul.
+                                let util = [*util1, *util2, *util3, *util4]
+                                    .into_iter()
+                                    .max()
+                                    .unwrap_or(0);
+                                let busy = self.busy.utilization(timestamp.0, util);
+                                if busy != 0 {
                                     self.snap.busy_ns.fetch_add(busy, Ordering::Relaxed);
                                 }
-                                self.last_util_ts = ts;
+                            }
+                            // No Utilization is sent while the GPU is off:
+                            // the next window must not span the gap.
+                            StatsMsg::ver::PowerOn { .. } | StatsMsg::ver::PowerOff { .. } => {
+                                self.busy.power_changed();
                             }
                             StatsMsg::ver::PowerState { pstate, .. } => {
                                 self.snap.pstate.store(*pstate, Ordering::Relaxed);
@@ -720,6 +735,19 @@ impl StatsChannel::ver {
                     // SAFETY: The raw view is always valid for all bit patterns.
                     pr_warn!("Unknown stats message: {:?}\n", unsafe { msg.raw });
                 }
+            }
+        }
+
+        // Only the final transition in this batch is a release boundary. In
+        // particular, an old PowerOff followed by PowerOn must not release
+        // objects retired while the GPU is live again.
+        if power.ends_powered_off() {
+            match self.gpu.as_ref() {
+                Some(gpu) => gpu.fw_power_off(),
+                None => dev_crit!(
+                    self.dev.as_ref(),
+                    "StatsChannel: No GPU manager available!\n"
+                ),
             }
         }
     }
@@ -798,5 +826,33 @@ impl StatsChannel::ver {
             // The remaining tags are not decoded by the driver.
             _ => {}
         }
+    }
+}
+
+#[kunit_tests(asahi_agx_context_release)]
+mod tests {
+    use super::PowerTransitionBatch;
+
+    #[test]
+    fn power_off_is_release_boundary() {
+        let mut batch = PowerTransitionBatch::default();
+        batch.power_off();
+        assert!(batch.ends_powered_off());
+    }
+
+    #[test]
+    fn later_power_on_cancels_release() {
+        let mut batch = PowerTransitionBatch::default();
+        batch.power_off();
+        batch.power_on();
+        assert!(!batch.ends_powered_off());
+    }
+
+    #[test]
+    fn final_power_off_wins() {
+        let mut batch = PowerTransitionBatch::default();
+        batch.power_on();
+        batch.power_off();
+        assert!(batch.ends_powered_off());
     }
 }

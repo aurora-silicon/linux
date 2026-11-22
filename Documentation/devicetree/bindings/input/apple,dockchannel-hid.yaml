@@ -66,7 +66,11 @@ properties:
       - const: rx
 
   iommus:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
+    description:
+      DART streams of the transport. A second stream carries the coprocessor's
+      writes into the receive ring on firmware that has one.
 
   apple,fifo-size:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -204,6 +208,16 @@ properties:
           - description: Strength of the release click.
             minimum: 1
             maximum: 255
+
+      apple,sleep-report:
+        $ref: /schemas/types.yaml#/definitions/uint8-array
+        minItems: 1
+        maxItems: 65524
+        description:
+          A feature report, starting with its report ID, that the host sets
+          on this interface before it tells the coprocessor of a system sleep
+          that removes power, in one command frame, which holds up to 65524
+          bytes. When absent, nothing is sent. Filled in by the bootloader.
 
   tp_accel:
     type: object

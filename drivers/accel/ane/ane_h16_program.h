@@ -2,6 +2,8 @@
 #ifndef __ANE_H16_PROGRAM_H__
 #define __ANE_H16_PROGRAM_H__
 
+#include <linux/bitmap.h>
+#include <linux/refcount.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/spinlock.h>
@@ -29,6 +31,14 @@
 #define ANE_H16_UNLOAD_SIZE 0xc
 #define ANE_H16_GATE_SIZE 0xc
 #define ANE_H16_REPORT_MAX 0x100
+/*
+ * One program's LOAD and CREATE, which stay in the command arena while the
+ * program lives, in a record of their own. 128 records take 136 KiB of the
+ * 256 KiB arena and leave the rest to EXECUTE batches and teardown.
+ */
+#define ANE_H16_RECORD_SIZE (ALIGN(ANE_H16_LOAD_SIZE, ANE_FW_SLOT_SIZE) + \
+			     ALIGN(ANE_H16_CREATE_SIZE, ANE_FW_SLOT_SIZE))
+#define ANE_H16_RECORDS 128
 /* First value of the firmware mcache DSID pool (custom-BAR facts, 4). */
 #define ANE_H16_MCACHE_DSID 36
 
@@ -149,10 +159,22 @@ int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 			const struct ane_h16_hwx *hwx, u32 dsid,
 			struct ane_h16_custom_bar *bars, unsigned int *count);
 
-/* Private, pinned mappings in the firmware domain. Never released before reset. */
+/*
+ * Private, pinned mappings in the firmware domain. Without unmap they are
+ * never released before reset.
+ */
 struct ane_h16_session_ops {
 	int (*map)(void *ctx, size_t size, bool device_write,
 		   struct ane_fw_surface *surface);
+	/*
+	 * Optional. Give back a surface map() returned: unmap it from the
+	 * engine, free its memory and its DVA range. The session calls it
+	 * only for memory the firmware no longer uses (UNLOAD acknowledged,
+	 * the program lost to a new firmware, or never seen by the firmware),
+	 * only while the engine is up (not asleep, not parked), and with the
+	 * session lock held.
+	 */
+	void (*unmap)(void *ctx, const struct ane_fw_surface *surface);
 	void (*log)(void *ctx, const char *item, u64 a, u64 b);
 	/*
 	 * Optional. For a surface with a handle: before the engine uses it
@@ -162,11 +184,40 @@ struct ane_h16_session_ops {
 	 */
 	void (*sync)(void *ctx, const struct ane_fw_surface *surface, bool for_device);
 	/*
-	 * Optional. Called with true before an EXECUTE touches the firmware
-	 * and with false after it ended, successful or not, so a backend can
-	 * hold a performance vote only while work is in flight.
+	 * Optional. Called with true before the first EXECUTE touches firmware
+	 * and false after the last one ends, successful or not. A backend can
+	 * hold a performance vote while any request is in flight.
 	 */
 	void (*busy)(void *ctx, bool busy);
+	/*
+	 * Optional. The engine is parked (off, no firmware) until a request needs
+	 * it: bring it up, or return an error if it can't come up now.
+	 */
+	int (*wake)(void *ctx);
+	/*
+	 * Optional. Called once when the session quarantines (a request hung
+	 * or the firmware answered something it cannot have meant), possibly
+	 * with the session lock held: the backend may cycle the engine off and
+	 * boot it again (ane_h16_session_restart(), then
+	 * ane_h16_session_recovered()). It must not take the session lock.
+	 */
+	void (*hung)(void *ctx, int error);
+};
+
+/*
+ * A program surface mapped into a process (ane_h16_session_export()). The
+ * pages stay with the mapping: when the program is torn down, the surface
+ * goes back to the session's spares only after the last mapping is gone,
+ * so a later program, maybe of another process, never shares them.
+ */
+struct ane_h16_export {
+	refcount_t ref;
+	struct ane_h16_session *session;
+	struct ane_fw_surface surface;
+	bool write;
+	/* The program gave the surface back; the last put returns it to the spares. */
+	bool released;
+	struct list_head node;
 };
 
 struct ane_h16_program {
@@ -179,6 +230,8 @@ struct ane_h16_program {
 	struct ane_h16_load_slot slots[ANE_H16_LOAD_SLOTS];
 	struct ane_h16_resource resources[ANE_H16_SURFACES];
 	struct ane_fw_surface *surfaces[ANE_H16_SURFACES];
+	/* Mapped surfaces, by region; the program holds one reference each. */
+	struct ane_h16_export *exports[ANE_H16_REGIONS];
 	struct ane_h16_custom_bar bars[ANE_H16_MAX_CUSTOM_BARS];
 	unsigned int bar_count;
 	unsigned int resource_count;
@@ -194,6 +247,8 @@ struct ane_h16_program {
 	/* Session-local identity; firmware program IDs are reused after UNLOAD. */
 	u64 generation;
 	struct ane_h16_request_key key;
+	/* Owns the shared surfaces from copy-in through copy-out. */
+	bool executing;
 	bool created;
 	bool closed;
 	/* Torn down cleanly: its memory went back to the session's spares. */
@@ -202,6 +257,8 @@ struct ane_h16_program {
 	struct list_head deferred;
 	/* Firmware boot the program was loaded in; an older one means lost. */
 	u64 epoch;
+	/* Its LOAD and CREATE record in the session's arena range, or -1. */
+	int record;
 	/* In the session's list of programs to replay after a cold boot. */
 	struct list_head node;
 };
@@ -248,16 +305,19 @@ void ane_h16_exec_stats_add(struct ane_h16_exec_stats *st,
 			    const struct ane_h16_exec_sample *x);
 
 /*
- * Programs of one firmware session: one loaded at a time, any number per
- * boot; a switch-safe transport may hold several. See ane_h16_session_load().
+ * Programs of one firmware session, with private surfaces for each program.
  */
 /*
  * Program memory given back by a program that the firmware unloaded. It
- * stays mapped until reset like every firmware-visible mapping, and serves
- * a later program's mapping of the same size and permission instead of a
- * new one, so loading the same model again and again uses no new memory.
+ * serves a later program's mapping of the same size and permission instead
+ * of a new one, so loading the same model again and again uses no new
+ * memory. With ops->unmap the oldest spares beyond ANE_H16_SPARES_KEEP
+ * entries or ANE_H16_SPARE_BYTES are freed, and all of them when a new
+ * mapping finds no room; without it, they stay mapped until reset.
  */
 #define ANE_H16_SPARES 64
+#define ANE_H16_SPARES_KEEP 32
+#define ANE_H16_SPARE_BYTES SZ_128M
 
 struct ane_h16_spare {
 	struct ane_fw_surface surface;
@@ -272,8 +332,10 @@ struct ane_h16_session {
 	struct ane_h16_pending_table pending;
 	/* The last loaded program. */
 	struct ane_h16_program *program;
+	/* Oldest first. */
 	struct ane_h16_spare spares[ANE_H16_SPARES];
 	unsigned int spare_count;
+	size_t spare_bytes;
 	/* Quiet time that ends serving the SHAREDMALLOC ring after UNLOAD. */
 	u64 settle_ns;
 	/*
@@ -281,6 +343,10 @@ struct ane_h16_session {
 	 * ane_h16_session_enter() and closes are deferred to the reopen.
 	 */
 	bool asleep;
+	/* Off until the next request, which calls ops->wake first. */
+	bool parked;
+	/* A system sleep is under way: a parked engine can't come up until it ends. */
+	bool wake_blocked;
 	struct list_head deferred;
 	/*
 	 * Firmware boot count: a cold restart across system sleep loses every
@@ -290,6 +356,12 @@ struct ane_h16_session {
 	u64 epoch;
 	/* Created programs not yet closed, in load order. */
 	struct list_head programs;
+	/*
+	 * Programs closed while quarantined: the old firmware may still read
+	 * their memory, so it is kept until a verified power cycle ends that
+	 * firmware (ane_h16_session_recovered()).
+	 */
+	struct list_head held;
 	wait_queue_head_t wake;
 	/* The accel node lock the sleep gate serializes on. */
 	struct mutex *lock;
@@ -298,13 +370,26 @@ struct ane_h16_session {
 	u64 executed;
 	u32 dsid;
 	int error;
+	/* All admission, transport and completion state is under lock. */
+	unsigned int depth;
+	unsigned int active;
+	unsigned int running;
+	unsigned int draining;
+	bool pipelined;
+	/* Reclaim a batch of command buffers only after its last caller ends. */
+	size_t execute_mark;
+	/*
+	 * Records in use in the transport's placed range (ane_h16_program
+	 * record), cleared when the firmware boots again.
+	 */
+	DECLARE_BITMAP(records, ANE_H16_RECORDS);
 	/* Firmware log lines printed after the last failed EXECUTE. */
 	unsigned int fwlog_lines;
 	bool quarantined;
 	/*
 	 * Dynamic power gating (0x002d) held off across back-to-back requests.
-	 * With gate_hold_ns zero every EXECUTE opens and closes the gate itself.
-	 * Otherwise the first EXECUTE opens it, later ones find it open, and it
+	 * The first EXECUTE opens it and the last one closes it. With a nonzero
+	 * gate_hold_ns, back-to-back requests find it open instead, and it
 	 * closes gate_hold_ns after the last one ended (gate_work, serialized on
 	 * lock), before TERMINATE, and before system sleep.
 	 */
@@ -317,24 +402,42 @@ struct ane_h16_session {
 	/* Accounted EXECUTEs; the lock lets a reader snapshot them. */
 	spinlock_t stats_lock;
 	struct ane_h16_exec_stats stats;
+	/* Exports whose last mapping is gone, returned by export_work. */
+	spinlock_t export_lock;
+	struct list_head exports_done;
+	struct work_struct export_work;
 };
 
 int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
 			 const struct ane_h16_session_ops *ops, void *ctx,
 			 u64 timeout_ns);
+int ane_h16_session_init_parked(struct ane_h16_session *s,
+				struct ane_fw_transport *transport,
+				const struct ane_h16_session_ops *ops, void *ctx,
+				u64 timeout_ns);
 int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_hwx_snapshot *snapshot,
 			 const void *const aux[ANE_H16_AUX_COUNT],
 			 const size_t aux_size[ANE_H16_AUX_COUNT],
 			 struct ane_h16_program **program);
+/* Caller holds s->lock; acquire may drop it while waiting. */
+int ane_h16_session_acquire(struct ane_h16_session *s, struct ane_h16_program *p);
+void ane_h16_session_release(struct ane_h16_session *s, struct ane_h16_program *p);
+int ane_h16_session_run(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p);
 void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p);
+int ane_h16_session_export(struct ane_h16_session *s, struct ane_h16_program *p,
+			   unsigned int index, struct ane_h16_export **out);
+void ane_h16_export_get(struct ane_h16_export *e);
+void ane_h16_export_put(struct ane_h16_export *e);
+void ane_h16_session_flush_exports(struct ane_h16_session *s);
 int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock);
 unsigned int ane_h16_session_dump_fwlog(struct ane_h16_session *s);
 void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep);
 int ane_h16_session_gate_expire(struct ane_h16_session *s);
 void ane_h16_session_restart(struct ane_h16_session *s);
+void ane_h16_session_recovered(struct ane_h16_session *s);
 int ane_h16_session_replay(struct ane_h16_session *s, unsigned int *replayed,
 			   u64 *first_ns);
 bool ane_h16_program_lost(const struct ane_h16_session *s, const struct ane_h16_program *p);

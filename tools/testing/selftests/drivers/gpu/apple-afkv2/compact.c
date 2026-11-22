@@ -19,6 +19,8 @@ typedef int64_t s64;
 struct apple_epic_service;
 struct apple_epic_service_ops {
 	void (*teardown)(struct apple_epic_service *service);
+	/* One instance ever live; a re-announcement supersedes it in place. */
+	bool singleton;
 };
 
 struct apple_epic_service {
@@ -67,16 +69,22 @@ static void teardown(struct apple_epic_service *service)
 
 static const struct apple_epic_service_ops ops = { .teardown = teardown };
 static const struct apple_epic_service_ops other_ops;
+static const struct apple_epic_service_ops singleton_ops = {
+	.teardown = teardown,
+	.singleton = true,
+};
 
 /* Model publication after allocation; poweroff performs no AFK teardown. */
 static struct apple_epic_service *
-announce(struct apple_dcp_afkep *ep, const char *name, s64 unit,
-	 unsigned int interface)
+announce_ops(struct apple_dcp_afkep *ep,
+	     const struct apple_epic_service_ops *service_ops, const char *name,
+	     s64 unit, unsigned int interface)
 {
-	struct apple_epic_service *service = afk_compact_slot(ep, &ops, name, unit);
+	struct apple_epic_service *service =
+		afk_compact_slot(ep, service_ops, name, unit);
 
 	assert(service);
-	service->ops = &ops;
+	service->ops = service_ops;
 	strcpy(service->name, name);
 	service->unit = unit;
 	service->channel = interface;
@@ -84,6 +92,13 @@ announce(struct apple_dcp_afkep *ep, const char *name, s64 unit,
 	service->torndown = false;
 	service->debugfs = true;
 	return service;
+}
+
+static struct apple_epic_service *
+announce(struct apple_dcp_afkep *ep, const char *name, s64 unit,
+	 unsigned int interface)
+{
+	return announce_ops(ep, &ops, name, unit, interface);
 }
 
 /* What one DCP poweron announces on an endpoint. */
@@ -148,6 +163,38 @@ static void hotplug_test(void)
 	for (unsigned int i = 0; i < 2 * AFK_MAX_CHANNEL; i++)
 		assert(announce(&ep, "dcpav-service-epic", 0, 3 + i) == av);
 	assert(ep.num_channels == 1 && av->channel == 2 + 2 * AFK_MAX_CHANNEL);
+}
+
+/*
+ * A singleton AV interface (dcpav-audio/cec/video on AV_AUDIO_ENDPOINT_DESKTOP
+ * 0x2b, which is not a hotplug endpoint) is re-announced on every DP relink
+ * without a poweron. Only one is ever live, so each re-announcement must
+ * reclaim the one slot in place instead of consuming a fresh channel until the
+ * endpoint runs out at AFK_MAX_CHANNEL.
+ */
+static void singleton_test(void)
+{
+	struct apple_dcp dcp = { .afk_power_gen = 3 };
+	struct apple_dcp_afkep ep = { .dcp = &dcp, .endpoint = 0x2b };
+	struct apple_epic_service *first;
+	unsigned int before;
+
+	first = announce_ops(&ep, &singleton_ops, "dcpav-audio-interface-epic",
+			     0, 1);
+	before = teardowns;
+
+	/* Many relinks within one generation: one slot, one live instance. */
+	for (unsigned int i = 0; i < 4 * AFK_MAX_CHANNEL; i++)
+		assert(announce_ops(&ep, &singleton_ops,
+				    "dcpav-audio-interface-epic", 0, 3 + i) ==
+		       first);
+	assert(ep.num_channels == 1 && first->channel == 2 + 4 * AFK_MAX_CHANNEL);
+	assert(teardowns - before == 4 * AFK_MAX_CHANNEL);
+
+	/* A different name on the same endpoint still takes its own slot. */
+	assert(announce_ops(&ep, &singleton_ops, "dcpav-cec-interface-epic", 0,
+			    1000) == &ep.services[1]);
+	assert(ep.num_channels == 2);
 }
 
 /* Same-generation siblings are not replacements on non-hotplug endpoints. */
@@ -215,6 +262,7 @@ int main(void)
 	for (u32 endpoint = 0x20; endpoint <= 0x2f; endpoint++)
 		power_cycle_test(endpoint);
 	hotplug_test();
+	singleton_test();
 	controller_test();
 	identity_test();
 	free_slot_test();

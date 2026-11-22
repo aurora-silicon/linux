@@ -102,6 +102,7 @@
 #include "slab.c"
 #include "spinlock.c"
 #include "string.c"
+#include "suspend.c"
 #include "srcu.c"
 #include "sync.c"
 #include "task.c"

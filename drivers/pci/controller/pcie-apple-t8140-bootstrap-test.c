@@ -61,12 +61,12 @@ static void apple_piodma_transition_guards_test(struct kunit *test)
 {
 	int state, event, next;
 
-	/* Exhaust all transitions: no retained state can release or retry. */
+	/* Exhaust all transitions: only a power loss can end a retained state. */
 	for (state = PIODMA_IDLE; state < PIODMA_STATE_COUNT; state++) {
 		for (event = PIODMA_GUARD; event < PIODMA_EVENT_COUNT; event++) {
 			next = apple_piodma_next(state, event);
 			if (apple_piodma_retained(state)) {
-				if (next >= 0)
+				if (next >= 0 && event != PIODMA_POWER_LOST)
 					KUNIT_EXPECT_TRUE(test, apple_piodma_retained(next));
 				if (event == PIODMA_RELEASE || event == PIODMA_PRIME ||
 				    event == PIODMA_GUARD)
@@ -128,8 +128,24 @@ static void apple_piodma_irq_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_piodma_irq_matches(BIT(0), 1, 2));
 }
 
+/* Losing power reopens the guard from an admitted radio, and from nothing else. */
+static void apple_piodma_power_lost_test(struct kunit *test)
+{
+	static const enum apple_piodma_state refused[] = {
+		PIODMA_IDLE, PIODMA_GUARDED, PIODMA_ATTEMPTED, PIODMA_FAILED,
+		PIODMA_REJECTED, PIODMA_RETAINED, PIODMA_READY, PIODMA_FAILED_RETAINED,
+	};
+	int i;
+
+	KUNIT_EXPECT_EQ(test, apple_piodma_next(PIODMA_ADMITTED, PIODMA_POWER_LOST),
+			PIODMA_GUARDED);
+	for (i = 0; i < ARRAY_SIZE(refused); i++)
+		KUNIT_EXPECT_LT(test, apple_piodma_next(refused[i], PIODMA_POWER_LOST), 0);
+}
+
 static struct kunit_case apple_piodma_cases[] = {
 	KUNIT_CASE(apple_piodma_lifecycle_test),
+	KUNIT_CASE(apple_piodma_power_lost_test),
 	KUNIT_CASE(apple_piodma_failure_test),
 	KUNIT_CASE(apple_piodma_transition_guards_test),
 	KUNIT_CASE(apple_piodma_arena_test),

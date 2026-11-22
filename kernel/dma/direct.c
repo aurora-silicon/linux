@@ -680,7 +680,8 @@ dma_addr_t dma_direct_map_phys(struct device *dev, phys_addr_t phys,
 	}
 
 	if (is_swiotlb_force_bounce(dev)) {
-		if (attrs & (DMA_ATTR_MMIO | DMA_ATTR_REQUIRE_COHERENT))
+		if (attrs & (DMA_ATTR_MMIO | DMA_ATTR_REQUIRE_COHERENT |
+			     DMA_ATTR_NO_BOUNCE))
 			return DMA_MAPPING_ERROR;
 
 		return swiotlb_map(dev, phys, size, dir, attrs);
@@ -699,6 +700,12 @@ dma_addr_t dma_direct_map_phys(struct device *dev, phys_addr_t phys,
 
 	if (unlikely(!dma_capable(dev, dma_addr, size, true, attrs)) ||
 	    dma_kmalloc_needs_bounce(dev, size, dir)) {
+		/*
+		 * Not an overflow: the caller asked for this refusal, with
+		 * or without a SWIOTLB that could have made the mapping.
+		 */
+		if (attrs & DMA_ATTR_NO_BOUNCE)
+			return DMA_MAPPING_ERROR;
 		if (is_swiotlb_active(dev) &&
 		    !(attrs & DMA_ATTR_REQUIRE_COHERENT))
 			return swiotlb_map(dev, phys, size, dir, attrs);

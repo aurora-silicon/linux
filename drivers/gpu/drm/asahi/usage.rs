@@ -5,6 +5,9 @@
 //! Queues retain their file's ledger until their last completion. Only authenticated,
 //! successful completion timestamps are charged, before signalling the completion fence.
 //! These are command timer ticks, not shader clock cycles. Never export them as drm-cycles.
+//!
+//! A backend whose firmware overlaps the commands of one queue charges through a [`Lane`]
+//! per queue, so each engine of a queue counts the union of its stage intervals.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -53,6 +56,57 @@ impl Client {
     /// Vertex, fragment and compute, in ns. No cross-engine atomic snapshot is promised.
     pub(crate) fn snapshot(&self) -> [u64; 3] {
         self.ns.each_ref().map(|ns| ns.load(Ordering::Relaxed))
+    }
+}
+
+/// A stage this far behind its lane's mark is not an overlap, since no stage runs this
+/// long: the timestamps jumped, so the mark restarts at the stage instead of holding every
+/// later charge back.
+const DISCONTINUITY_S: u64 = 60;
+
+/// The engine time of one queue, charged to its file's [`Client`].
+///
+/// Firmware can run several commands of one queue at once. A queue that keeps several
+/// commands in flight sees their stage intervals overlap, and their sum then exceeds the
+/// time the engine was busy: three seconds of compute per second at depth 4 on the A18 Pro.
+/// A lane charges each engine the union of the queue's stage intervals instead. A queue's
+/// stages retire in the order they started, so a mark of the latest end charged per engine
+/// gives the exact union: a stage adds only its part after the mark. Queues of one file
+/// still add up, one union each.
+pub(crate) struct Lane<P> {
+    client: P,
+    covered: [AtomicU64; 3],
+}
+
+impl<P: core::ops::Deref<Target = Client>> Lane<P> {
+    pub(crate) fn new(client: P) -> Self {
+        Self {
+            client,
+            covered: [const { AtomicU64::new(0) }; 3],
+        }
+    }
+
+    /// As [`Client::add`], for one retired stage of this lane's queue: only the part of
+    /// `start..end` after the engine's mark is charged, and the mark moves to `end`.
+    pub(crate) fn add(&self, engine: Engine, start: u64, end: u64, frequency_hz: u32) {
+        if start == 0 || end <= start || frequency_hz == 0 {
+            return;
+        }
+        let limit = u64::from(frequency_hz).saturating_mul(DISCONTINUITY_S);
+        let mark = &self.covered[engine as usize];
+        let mut covered = mark.load(Ordering::Relaxed);
+        let from = loop {
+            let jumped = covered.saturating_sub(start) > limit;
+            let from = if jumped { start } else { start.max(covered) };
+            if from >= end {
+                return;
+            }
+            match mark.compare_exchange_weak(covered, end, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break from,
+                Err(value) => covered = value,
+            }
+        };
+        self.client.add(engine, from, end, frequency_hz);
     }
 }
 
@@ -138,6 +192,112 @@ mod tests {
         assert_eq!(client.snapshot()[2], u64::MAX);
         client.add(Engine::Compute, 1, 25, HZ);
         assert_eq!(client.snapshot()[2], u64::MAX);
+    }
+
+    /// A queue `depth` commands deep: one command retires every `period` ticks, and each
+    /// stays in flight for `depth` periods, so neighbouring intervals overlap.
+    fn pipeline(lane: &Lane<&Client>, base: u64, period: u64, depth: u64, commands: u64) {
+        for i in 0..commands {
+            let start = base + i * period;
+            lane.add(Engine::Compute, start, start + depth * period, HZ);
+        }
+    }
+
+    #[test]
+    fn a_deep_queue_counts_its_busy_time_once() {
+        // 1,181 us per command, as the A18 Pro's ALU load at depth 4.
+        const PERIOD: u64 = 28_344;
+        for depth in [1, 4, 8] {
+            let client = Client::new();
+            let lane = Lane::new(&client);
+            pipeline(&lane, 1_000, PERIOD, depth, 1_000);
+            let wall = ticks_to_ns((1_000 - 1 + depth) * PERIOD, HZ);
+            assert_eq!(client.snapshot()[2], wall, "depth {depth}");
+            // The sum of the intervals is `depth` times the busy time.
+            let summed = Client::new();
+            for i in 0..1_000 {
+                let start = 1_000 + i * PERIOD;
+                summed.add(Engine::Compute, start, start + depth * PERIOD, HZ);
+            }
+            assert_eq!(summed.snapshot()[2], 1_000 * ticks_to_ns(depth * PERIOD, HZ));
+        }
+    }
+
+    #[test]
+    fn idle_gaps_and_disjoint_stages() {
+        let client = Client::new();
+        let lane = Lane::new(&client);
+        lane.add(Engine::Compute, 24, 48, HZ);
+        lane.add(Engine::Compute, 96, 120, HZ);
+        lane.add(Engine::Compute, 100, 110, HZ); // inside the previous stage
+        lane.add(Engine::Compute, 0, 100, HZ); // no start: nothing
+        assert_eq!(client.snapshot(), [0, 0, 2_000]);
+        // A covered stage leaves the mark where it was.
+        lane.add(Engine::Compute, 104, 144, HZ);
+        assert_eq!(client.snapshot(), [0, 0, 3_000]);
+    }
+
+    #[test]
+    fn engines_keep_their_own_marks() {
+        let client = Client::new();
+        let lane = Lane::new(&client);
+        lane.add(Engine::Vertex, 1, 25, HZ);
+        lane.add(Engine::Fragment, 13, 37, HZ);
+        lane.add(Engine::Vertex, 13, 37, HZ);
+        assert_eq!(client.snapshot(), [1_500, 1_000, 0]);
+    }
+
+    #[test]
+    fn queues_of_one_file_add_up() {
+        let client = Client::new();
+        let a = Lane::new(&client);
+        let b = Lane::new(&client);
+        a.add(Engine::Compute, 1, 49, HZ);
+        b.add(Engine::Compute, 1, 49, HZ);
+        a.add(Engine::Compute, 25, 49, HZ);
+        assert_eq!(client.snapshot(), [0, 0, 4_000]);
+    }
+
+    #[test]
+    fn a_timestamp_jump_restarts_the_mark() {
+        let client = Client::new();
+        let lane = Lane::new(&client);
+        let far = 61 * u64::from(HZ);
+        lane.add(Engine::Compute, 1, far, HZ);
+        let before = client.snapshot()[2];
+        // Far behind the mark: charged in full, and the mark follows it.
+        lane.add(Engine::Compute, 24, 48, HZ);
+        lane.add(Engine::Compute, 36, 72, HZ);
+        assert_eq!(client.snapshot()[2] - before, 2_000);
+        // Within the limit, a stage behind the mark is an overlap.
+        let near = Client::new();
+        let lane = Lane::new(&near);
+        lane.add(Engine::Compute, 1, 59 * u64::from(HZ), HZ);
+        let before = near.snapshot()[2];
+        lane.add(Engine::Compute, 24, 48, HZ);
+        assert_eq!(near.snapshot()[2], before);
+    }
+
+    #[test]
+    fn concurrent_retirements_never_exceed_the_union() {
+        let client = std::sync::Arc::new(Client::new());
+        let lane = std::sync::Arc::new(Lane::new(client.clone()));
+        let threads: std::vec::Vec<_> = (0..8)
+            .map(|_| {
+                let lane = lane.clone();
+                std::thread::spawn(move || {
+                    for i in 0..10_000u64 {
+                        lane.add(Engine::Compute, 24 + i * 24, 24 + i * 24 + 96, HZ);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let union = ticks_to_ns((10_000 - 1) * 24 + 96, HZ);
+        let charged = client.snapshot()[2];
+        assert!(charged > 0 && charged <= union, "{charged} > {union}");
     }
 
     #[test]

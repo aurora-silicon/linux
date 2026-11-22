@@ -8,10 +8,12 @@
 #include <linux/mfd/core.h>
 #include <linux/mfd/macsmc.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/platform_device.h>
 #include <linux/reboot.h>
 #include <linux/slab.h>
+#include <linux/sysfs.h>
 
 struct macsmc_reboot_nvmem {
 	struct nvmem_cell *shutdown_flag;
@@ -33,10 +35,39 @@ enum boot_stage {
 	BOOT_STAGE_KERNEL_STARTED	= 0x30, /* Normal OS booting */
 };
 
+/*
+ * The PMU's power-on policy byte: bit 0 set keeps the machine off when power returns after a
+ * loss, bit 5 set keeps it off when power is connected (bit 5 clear powers it on at connect
+ * whatever bit 0 says). Changes are read-modify-write: the other bits are the PMU's.
+ */
+#define PM_SETTING_NO_RESTORE		BIT(0)
+#define PM_SETTING_NO_POWER_ON_CONNECT	BIT(5)
+#define PM_SETTING_AC_POWER_MASK	(PM_SETTING_NO_RESTORE | PM_SETTING_NO_POWER_ON_CONNECT)
+
+enum ac_power_mode {
+	AC_POWER_OFF,		/* stay off */
+	AC_POWER_RESTORE,	/* power on after a power loss if it was on */
+	AC_POWER_ALWAYS,	/* power on whenever power is connected */
+};
+
+static const char * const ac_power_modes[] = {
+	[AC_POWER_OFF]		= "off",
+	[AC_POWER_RESTORE]	= "restore",
+	[AC_POWER_ALWAYS]	= "always",
+};
+
+static const u8 ac_power_mode_bits[] = {
+	[AC_POWER_OFF]		= PM_SETTING_NO_RESTORE | PM_SETTING_NO_POWER_ON_CONNECT,
+	[AC_POWER_RESTORE]	= PM_SETTING_NO_POWER_ON_CONNECT,
+	[AC_POWER_ALWAYS]	= PM_SETTING_NO_RESTORE,
+};
+
 struct macsmc_reboot {
 	struct device *dev;
 	struct apple_smc *smc;
 	struct notifier_block reboot_notify;
+	struct nvmem_cell *pm_setting;
+	struct mutex pm_setting_lock;
 
 	union {
 		struct macsmc_reboot_nvmem nvm;
@@ -198,6 +229,80 @@ static void macsmc_power_init_error_counts(struct macsmc_reboot *reboot)
 		dev_err(reboot->dev, "Failed to reset boot_error_count\n");
 }
 
+static enum ac_power_mode macsmc_ac_power_mode(u8 val)
+{
+	if (!(val & PM_SETTING_NO_POWER_ON_CONNECT))
+		return AC_POWER_ALWAYS;
+	if (val & PM_SETTING_NO_RESTORE)
+		return AC_POWER_OFF;
+	return AC_POWER_RESTORE;
+}
+
+static ssize_t ac_power_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct macsmc_reboot *reboot = dev_get_drvdata(dev);
+	enum ac_power_mode mode;
+	int val, i, len = 0;
+
+	val = nvmem_cell_get_u8(reboot->pm_setting);
+	if (val < 0)
+		return val;
+	mode = macsmc_ac_power_mode(val);
+
+	for (i = 0; i < ARRAY_SIZE(ac_power_modes); i++)
+		len += sysfs_emit_at(buf, len, i == mode ? "[%s] " : "%s ", ac_power_modes[i]);
+	buf[len - 1] = '\n';
+
+	return len;
+}
+
+static ssize_t ac_power_mode_store(struct device *dev, struct device_attribute *attr,
+				   const char *buf, size_t n)
+{
+	struct macsmc_reboot *reboot = dev_get_drvdata(dev);
+	int mode, val, ret;
+	u8 new;
+
+	mode = sysfs_match_string(ac_power_modes, buf);
+	if (mode < 0)
+		return mode;
+
+	mutex_lock(&reboot->pm_setting_lock);
+	val = nvmem_cell_get_u8(reboot->pm_setting);
+	if (val < 0) {
+		ret = val;
+		goto out;
+	}
+	new = (val & ~PM_SETTING_AC_POWER_MASK) | ac_power_mode_bits[mode];
+	ret = new == val ? 0 : nvmem_cell_set_u8(reboot->pm_setting, new);
+	if (!ret && new != val)
+		dev_info(dev, "PM setting %02x => %02x (ac_power_mode %s)\n", val, new,
+			 ac_power_modes[mode]);
+out:
+	mutex_unlock(&reboot->pm_setting_lock);
+
+	return ret < 0 ? ret : n;
+}
+static DEVICE_ATTR_RW(ac_power_mode);
+
+static struct attribute *macsmc_reboot_attrs[] = {
+	&dev_attr_ac_power_mode.attr,
+	NULL
+};
+
+static umode_t macsmc_reboot_attr_visible(struct kobject *kobj, struct attribute *attr, int n)
+{
+	struct macsmc_reboot *reboot = dev_get_drvdata(kobj_to_dev(kobj));
+
+	return reboot && reboot->pm_setting ? attr->mode : 0;
+}
+
+static const struct attribute_group macsmc_reboot_group = {
+	.attrs = macsmc_reboot_attrs,
+	.is_visible = macsmc_reboot_attr_visible,
+};
+__ATTRIBUTE_GROUPS(macsmc_reboot);
+
 static int macsmc_reboot_probe(struct platform_device *pdev)
 {
 	struct apple_smc *smc = dev_get_drvdata(pdev->dev.parent);
@@ -235,6 +340,18 @@ static int macsmc_reboot_probe(struct platform_device *pdev)
 			cell = NULL;
 		}
 		reboot->nvm_cells[i] = cell;
+	}
+
+	/* Optional: the power-on policy byte, for ac_power_mode */
+	mutex_init(&reboot->pm_setting_lock);
+	reboot->pm_setting = devm_nvmem_cell_get(&pdev->dev, "pm_setting");
+	if (IS_ERR(reboot->pm_setting)) {
+		ret = PTR_ERR(reboot->pm_setting);
+		if (ret == -EPROBE_DEFER)
+			return ret;
+		if (ret != -ENOENT)
+			dev_warn(&pdev->dev, "Missing NVMEM cell pm_setting (%d)\n", ret);
+		reboot->pm_setting = NULL;
 	}
 
 	/* Set the boot_stage to indicate we're running the OS kernel */
@@ -287,6 +404,7 @@ static struct platform_driver macsmc_reboot_driver = {
 	.driver = {
 		.name = "macsmc-reboot",
 		.of_match_table = macsmc_reboot_of_table,
+		.dev_groups = macsmc_reboot_groups,
 	},
 	.probe = macsmc_reboot_probe,
 };

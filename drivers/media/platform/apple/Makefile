@@ -5,3 +5,4 @@ obj-y += avd/
 obj-y += ave/
 obj-y += jpeg/
 obj-y += prores/
+obj-y += scaler/

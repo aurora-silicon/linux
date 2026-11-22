@@ -2,6 +2,11 @@
 /* Populated board control clients. Transport ownership is not transferred. */
 
 &i2c4 {
+	/*
+	 * Unidentified client: a bare read may change its state. Keep it
+	 * disabled, and never probe, scan or read address 0x20. SD card
+	 * detection does not use it.
+	 */
 	sd_card_control: sd-card-control@20 {
 		compatible = "apple,t6000-sd-card-control", "apple,sd-card-control";
 		reg = <0x20>;
@@ -24,16 +29,19 @@
 			temperature-sensor@70 {
 				compatible = "ti,tmp103";
 				reg = <0x70>;
+				read-only;
 				status = "disabled";
 			};
 			temperature-sensor@71 {
 				compatible = "ti,tmp103";
 				reg = <0x71>;
+				read-only;
 				status = "disabled";
 			};
 			temperature-sensor@72 {
 				compatible = "ti,tmp103";
 				reg = <0x72>;
+				read-only;
 				status = "disabled";
 			};
 		};

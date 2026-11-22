@@ -1342,12 +1342,9 @@ static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_siz
 	}
 	/* Unsigned property read. */
 	if (tag == D(401) && SHAPE(80, 12)) {
-		/*
-		 * The PMU temperature the M1/M2 mini-LED hosts report: a fixed
-		 * placeholder in centidegrees, not a measurement.
-		 */
+		/* The PMU temperature: the battery temperature in 0.1 K. */
 		if (!memcmp(in, "SUMP", 4) && !strncmp(in + 4, "Temperature", 64)) {
-			put_unaligned_le64(3029, out);
+			put_unaligned_le64(dcp_pmu_temperature(v14->dev), out);
 			out[8] = 1;
 			return 0;
 		}
@@ -1941,7 +1938,10 @@ static ssize_t dcpext_start_store(struct device *dev, struct device_attribute *a
 	if (atomic_cmpxchg(&dcp->external_requested, 0, 1))
 		return -EBUSY;
 	/* Keep code and firmware callbacks alive after this one-shot request. */
-	__module_get(THIS_MODULE);
+	if (!try_module_get(THIS_MODULE)) {
+		atomic_set(&dcp->external_requested, 0);
+		return -ENODEV;
+	}
 	schedule_work(&dcp->external_work);
 	return count;
 }
@@ -2069,10 +2069,13 @@ bool iomfb_v14_7_external_ready(struct apple_dcp *dcp)
 			    smp_load_acquire(&dcp->external_phase) != DCPEXT_IDLE)
 				return false;
 			if (!atomic_cmpxchg(&dcp->external_requested, 0, 1)) {
+				/* Firmware callbacks may outlive any later module removal. */
+				if (!try_module_get(THIS_MODULE)) {
+					atomic_set(&dcp->external_requested, 0);
+					return false;
+				}
 				WRITE_ONCE(dcp->external_phase, DCPEXT_STARTING);
 				dev_info(dcp->dev, "display attached: starting the external display processor\n");
-				/* Firmware callbacks may outlive any later module removal. */
-				__module_get(THIS_MODULE);
 				queue_work(system_freezable_wq, &dcp->external_work);
 			}
 		}
@@ -2398,17 +2401,23 @@ int iomfb_v14_7_bind(struct apple_dcp *dcp)
 				     v14->board->name);
 
 	dcp_v14_link_init(&v14->link, dev, NULL);
+	/* The mailbox's callbacks need this module until reboot. */
+	if (!try_module_get(THIS_MODULE))
+		return dev_err_probe(dev, -ENODEV,
+				     "%s display not started: the module is being removed\n",
+				     v14->board->name);
 	rtk = apple_rtkit_init(dev, v14, "mbox", 0, &dcp_v14_rtkit_ops);
-	if (IS_ERR(rtk))
+	if (IS_ERR(rtk)) {
+		module_put(THIS_MODULE);
 		return dev_err_probe(dev, PTR_ERR(rtk),
 				     "%s display not started: RTKit init failed\n",
 				     v14->board->name);
+	}
 	/* From here nothing is freed and the module stays loaded. */
 	v14->rtk = rtk;
 	v14->link.rtk = rtk;
 	dcp->rtk = rtk;
 	dcp_v14_panel_session = true;
-	__module_get(THIS_MODULE);
 
 	ret = apple_rtkit_wake(rtk);
 	for (n = 0; ret == -ETIME && n < DCP_V14_RTKIT_RETRIES; n++)

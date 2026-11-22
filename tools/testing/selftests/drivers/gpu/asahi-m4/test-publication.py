@@ -57,6 +57,8 @@ impl Engine {
     __UNPEND__
 }
 struct Checks;impl Checks{fn check(&self)->Result{Ok(())}fn health(&self)->Result{Ok(())}}
+struct Shared{sleeping:AtomicBool}
+struct Session{shared:Shared}impl Session{fn check(&self)->Result{Ok(())}}
 struct Recovery{error:Option<Error>,publication_wait_deadline:Option<u64>}impl Recovery{fn failed(&self)->Option<Error>{self.error}}
 struct Slots{compute_exhausted:bool,render_exhausted:bool,releases:u32,quarantines:u32}
 impl Slots{
@@ -107,7 +109,7 @@ struct Stage{result:Result,visible:bool}
 #[derive(Default)]struct Power{work:Vec<bool>}
 impl Power{fn report_work(&mut self,in_flight:bool){self.work.push(in_flight);}}
 struct Firmware{
-    session:Checks,objects:Checks,recovery:Recovery,engine:Engine,slots:Slots,power:Power,
+    session:Session,objects:Checks,recovery:Recovery,engine:Engine,slots:Slots,power:Power,
     unavailable:Vec<(usize,Error)>,stages:VecDeque<Stage>,retained:Vec<u32>,attempted:Vec<u32>,fail_stops:u32,
 }
 impl Firmware {
@@ -145,7 +147,7 @@ fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
         commands:vec![if render{Command::Render(())}else{Command::Compute(())};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false)})
 }
 fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
-    Firmware{session:Checks,objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
+    Firmware{session:Session{shared:Shared{sleeping:AtomicBool::new(false)}},objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
         engine:Engine{ordinal:0,draw:0,pending:jobs,flights:vec![],frozen:false,turn:0,stats:Stats::default(),chan_wait:false},
         slots:Slots{compute_exhausted:false,render_exhausted:false,releases:0,quarantines:0},power:Power::default(),
         unavailable:vec![],stages:stages.into_iter().map(|(result,visible)|Stage{result,visible}).collect(),
@@ -220,6 +222,12 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         CLOCK.with(|clock|clock.set(deadline+1));
         assert_eq!(f.publish(&mut done),Err(ETIMEDOUT));
         assert_eq!(f.recovery.publication_wait_deadline,Some(deadline));
+    }
+    #[test]fn nothing_is_published_during_a_system_sleep(){
+        let mut f=firmware(vec![job(1,false,0,Ok(()))],vec![(Ok(()),true)]);f.session.shared.sleeping.store(true,Ordering::Relaxed);
+        let mut done=vec![];assert_eq!(f.publish(&mut done),Ok(()));
+        assert!(done.is_empty());assert!(f.attempted.is_empty());assert_eq!(f.engine.pending.len(),1);assert!(f.power.work.is_empty());
+        f.session.shared.sleeping.store(false,Ordering::Relaxed);assert_eq!(f.publish(&mut done),Ok(()));assert_eq!(f.attempted,[1]);
     }
 
 }

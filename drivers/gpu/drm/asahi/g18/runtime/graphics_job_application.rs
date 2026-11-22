@@ -164,26 +164,25 @@ impl ApplicationJob {
         if scheduler.submitted!=frame.submitted()-2 || scheduler.completed!=frame.submitted()-2
             || scheduler.linked!=0 || self.job.stamps()?!=[frame.previous_stamp();2] {return Err(EBUSY);}
         for target in &self.job.targets {
-            for off in (0..target.logical_size).step_by(mmu::UAT_PGSZ) {
-                let low=target.iova()+off as u64;let pa=self.storage.translate_iova(low)?;
-                if self.job.vm().translate_iova(low)?!=pa || self.job.vm().translate_iova(low+va::COMPACT_BIAS)?!=pa {return Err(EFAULT);}pages+=1;
-            }
+            let pa=self.storage.translate_pages(target.iova(),target.logical_size)?;
+            if self.job.vm().translate_pages(target.iova(),target.logical_size)?!=pa
+                || self.job.vm().translate_pages(target.iova()+va::COMPACT_BIAS,target.logical_size)?!=pa {return Err(EFAULT);}
+            pages+=pa.len();
         }
         pages+=self.job.parameter_buffer.audit_job_mappings(uat,self.job.vm(),va::COMPACT_BIAS)?;
-        for off in (0..va::GRAPHICS_JOB_BYTES).step_by(mmu::UAT_PGSZ) {
-            let pa=uat.kernel_vm().translate_iova(va::GRAPHICS_JOB_HIGH+off as u64)?;
-            for vm in [uat.kernel_lower_vm(),self.job.vm()] {
-                if vm.translate_iova(va::GRAPHICS_JOB_LOW+off as u64)?!=pa {return Err(EFAULT);}
-            }pages+=1;
+        let pa=uat.kernel_vm().translate_pages(va::GRAPHICS_JOB_HIGH,va::GRAPHICS_JOB_BYTES)?;
+        for vm in [uat.kernel_lower_vm(),self.job.vm()] {
+            if vm.translate_pages(va::GRAPHICS_JOB_LOW,va::GRAPHICS_JOB_BYTES)?!=pa {return Err(EFAULT);}
         }
+        pages+=pa.len();
         for (address,bytes) in [(va::GRAPHICS_SIGNALS,va::GRAPHICS_SIGNALS_BYTES),
             (va::GRAPHICS_SCHEDULER_START,0x8000),(va::PB_TABLE,0x4000),(va::UMA_TABLE,0x8000)] {
-            for off in (0..bytes).step_by(mmu::UAT_PGSZ) {uat.kernel_vm().translate_iova(address+off as u64)?;pages+=1;}
+            pages+=uat.kernel_vm().translate_pages(address,bytes)?.len();
         }
         let expected=self.job.encoded.as_ref().ok_or(EINVAL)?.digests;
         self.job.graph.with_bytes_mut(|out| {
-            if crate::g18::fw::graphics_payload::fnv64(&out[..cmd::G18_TA_COMMAND_BYTES])!=expected[0]
-                || crate::g18::fw::graphics_payload::fnv64(&out[0x4000..0x4000+cmd::G18_3D_COMMAND_BYTES])!=expected[1] {return Err(EIO);}Ok(())
+            if crate::g18::fw::graphics_payload::fnv64_uncached(&out[..cmd::G18_TA_COMMAND_BYTES])!=expected[0]
+                || crate::g18::fw::graphics_payload::fnv64_uncached(&out[0x4000..0x4000+cmd::G18_3D_COMMAND_BYTES])!=expected[1] {return Err(EIO);}Ok(())
         })?;
         if frame.generation<=3 {
             for (name,digest) in assembly::DIGEST_NAMES.iter().zip(expected) {

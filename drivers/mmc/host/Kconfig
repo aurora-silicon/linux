@@ -107,6 +107,16 @@ config MMC_SDHCI_UHS2
 
 	  If you have a controller with this feature, say Y or M here.
 
+config MMC_SDHCI_PCI_GLI_PWRSEQ_KUNIT_TEST
+	tristate "KUnit tests for GL9755 board power sequencing" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test the GL9755 no-media board power state machine with mock rail,
+	  port and PCI operations. No hardware power gating is enabled: a
+	  platform adapter with an always-on insertion wake source is needed.
+	  These tests run without a PCI controller or an attached SD card.
+
 config MMC_SDHCI_PCI
 	tristate "SDHCI support on PCI bus"
 	depends on MMC_SDHCI && PCI

@@ -15,6 +15,7 @@
 
 #include "parser.h"
 #include "dcp-refresh.h"
+#include "dcp-peer-v27.h"
 #include "trace.h"
 
 #define DCP_PARSE_HEADER 0xd3
@@ -470,6 +471,23 @@ static unsigned int external_sdr_rank(const struct color_mode *color)
 	}
 }
 
+/*
+ * SDR RGB on a firmware 27 external: Default RGB first, then sRGB or BT.709,
+ * then any other colorimetry, so a wide-gamut element stays a fallback.
+ */
+static unsigned int sdr_default_rgb_rank(const struct color_mode *color)
+{
+	switch (color->colorimetry) {
+	case DCP_COLORIMETRY_RGB:
+		return 3;
+	case DCP_COLORIMETRY_SRGB:
+	case DCP_COLORIMETRY_BT709:
+		return 2;
+	default:
+		return 1;
+	}
+}
+
 /* Firmware lists color element IDs which this timing cannot safely use. */
 #define DCP_TIMING_COLOR_ID_LIMIT 64
 
@@ -577,15 +595,26 @@ static unsigned int pq_mode_rank(const struct color_mode *cmode)
 	return rank + (cmode->depth == 10);
 }
 
+/* A PQ element that needs DSC ranks below every one that does not. */
+#define PQ_RANK_NO_DSC 4
+
+/*
+ * @dsc: firmware 27, whose processor compresses an element the timing lists
+ * as needing DSC itself, as for SDR: such a PQ element is usable too.
+ */
 static void collect_pq_mode(struct dcp_color_mode *pq, unsigned int *best_rank,
 			    struct color_mode *cmode,
-			    const struct timing_color_restrictions *limits)
+			    const struct timing_color_restrictions *limits, bool dsc)
 {
 	unsigned int rank = pq_mode_rank(cmode);
 
-	if (!rank || rank < *best_rank ||
-	    timing_color_contains(&limits->unsafe, cmode->id) ||
-	    timing_color_contains(&limits->dsc_required, cmode->id))
+	if (!rank || timing_color_contains(&limits->unsafe, cmode->id))
+		return;
+	if (!timing_color_contains(&limits->dsc_required, cmode->id))
+		rank += PQ_RANK_NO_DSC;
+	else if (!dsc)
+		return;
+	if (rank < *best_rank)
 		return;
 	if (rank > *best_rank)
 		pq->score = -1;
@@ -602,6 +631,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	struct iterator outer_it;
 	struct dcp_color_mode bootstrap = { .score = -1 };
 	unsigned int best_sdr_rank = 0, best_unsafe_rank = 0, best_pq_rank = 0;
+	unsigned int best_rgb_rank = 0;
 	int ret = 0;
 	out->sdr_444.score = -1;
 	out->sdr_rgb.score = -1;
@@ -693,7 +723,8 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				       cmode.pixel_encoding);
 
 		if (limits_known)
-			collect_pq_mode(&out->pq, &best_pq_rank, &cmode, limits);
+			collect_pq_mode(&out->pq, &best_pq_rank, &cmode, limits,
+					handle->pq_dsc);
 		if (cmode.eotf == DCP_EOTF_SDR_GAMMA &&
 		    (!limits_known ||
 		     (!timing_color_contains(&limits->unsafe, cmode.id) &&
@@ -734,6 +765,17 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 
 		if (cmode.eotf == DCP_EOTF_SDR_GAMMA) {
 			if (cmode.pixel_encoding == DCP_COLOR_FORMAT_RGB &&
+			    cmode.depth <= 10 && handle->sdr_default_rgb) {
+				struct dcp_color_mode color = { .score = -1 };
+				unsigned int rank = sdr_default_rgb_rank(&cmode);
+
+				if (!fill_color_mode(&color, &cmode) && color.score >= 0 &&
+				    (rank > best_rgb_rank ||
+				     (rank == best_rgb_rank && color.score > out->sdr_rgb.score))) {
+					out->sdr_rgb = color;
+					best_rgb_rank = rank;
+				}
+			} else if (cmode.pixel_encoding == DCP_COLOR_FORMAT_RGB &&
 				cmode.depth <= 10)
 				fill_color_mode(&out->sdr_rgb, &cmode);
 			else if (cmode.pixel_encoding == DCP_COLOR_FORMAT_YCBCR444 &&
@@ -759,6 +801,40 @@ static u64 calculate_clock(struct dimension *horiz, struct dimension *vert)
 	u64 clock = pixels * vert->precise_sync_rate;
 
 	return DIV_ROUND_CLOSEST_ULL(clock >> 16, 1000);
+}
+
+/* Is this timing the full size of the tiled display the sink reported? */
+static bool timing_is_tiled_size(const struct dcp_parse_ctx *handle)
+{
+	struct dcp_parse_ctx scan = *handle;
+	struct iterator it;
+	s64 width = -1, height = -1;
+
+	if (iterator_begin(&scan, &it, true))
+		return false;
+	for (; it.idx < it.len; it.idx++) {
+		struct dimension dim;
+		char *key = parse_string(&scan);
+		int ret;
+
+		if (IS_ERR(key))
+			return false;
+		if (!strcmp(key, "HorizontalAttributes")) {
+			ret = parse_dimension(&scan, &dim, false);
+			if (!ret)
+				width = dim.active;
+		} else if (!strcmp(key, "VerticalAttributes")) {
+			ret = parse_dimension(&scan, &dim, false);
+			if (!ret)
+				height = dim.active;
+		} else {
+			ret = skip(&scan);
+		}
+		kfree(key);
+		if (ret)
+			return false;
+	}
+	return width == handle->tiled_width && height == handle->tiled_height;
 }
 
 static int parse_mode(struct dcp_parse_ctx *handle,
@@ -810,6 +886,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		limits_known = !ret;
 		ret = 0;
 	}
+	if (!internal && handle->tiled_width && timing_is_tiled_size(handle))
+		limits.dsc_required.count = 0;
 	ret = iterator_begin(handle, &it, true);
 	if (ret)
 		return ret;
@@ -945,8 +1023,9 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		out->vrr = dcp_refresh_range(vert.precise_sync_rate, min_vrr,
 					     max_vrr, internal && vrr_fallback,
 					     &out->min_vrr, &out->max_vrr);
-	out->needs_timestamps = out->vrr ||
-		(internal && dcp_refresh_is_promotion(vert.precise_sync_rate));
+	out->needs_timestamps = dcp_refresh_needs_deadline(vert.precise_sync_rate,
+							   out->vrr, internal,
+							   handle->internal_present_deadline);
 
 	clock = calculate_clock(&horiz, &vert);
 	if (!clock || clock > INT_MAX)
@@ -1490,6 +1569,21 @@ static int parse_panel_label(struct dcp_parse_ctx *handle, char out[14])
 	return 0;
 }
 
+/*
+ * An optional value an EDID can do without: on any error the value is skipped,
+ * the caller's default stays, and the field is noted in @defaults.
+ */
+static int parse_metadata_optional(struct dcp_parse_ctx *handle,
+				   const struct dcp_parse_ctx *at, int ret,
+				   u32 *defaults, u32 field)
+{
+	if (!ret)
+		return 0;
+	*handle = *at;
+	*defaults |= field;
+	return skip(handle);
+}
+
 static int parse_metadata_product(struct dcp_parse_ctx *handle,
 				  struct dcp_display_metadata *out, bool panel)
 {
@@ -1501,11 +1595,13 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle,
 	if (ret)
 		return ret;
 	for (; it.idx < it.len; it.idx++) {
+		struct dcp_parse_ctx at;
 		char key[64];
 
 		ret = parse_metadata_string(handle, key, sizeof(key));
 		if (ret)
 			return ret;
+		at = *handle;
 		if (!strcmp(key, "ManufacturerID")) {
 			if (seen & 1)
 				return -EINVAL;
@@ -1516,8 +1612,11 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle,
 			if (seen & 2)
 				return -EINVAL;
 			seen |= 2;
-			ret = panel ? parse_panel_label(handle, out->name) :
-				parse_metadata_string(handle, out->name, sizeof(out->name));
+			/* Longer than a descriptor holds: keep its first 13 characters. */
+			ret = parse_panel_label(handle, out->name);
+			if (!panel)
+				ret = parse_metadata_optional(handle, &at, ret, &out->defaults,
+							      DCP_METADATA_DEFAULT_NAME);
 		} else if (!strcmp(key, "ProductID")) {
 			if (seen & 4)
 				return -EINVAL;
@@ -1527,14 +1626,23 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle,
 			if (seen & 8)
 				return -EINVAL;
 			seen |= 8;
+			/* 255: the year is a model year (EDID 1.4). */
 			ret = panel ? skip(handle) :
-				parse_metadata_number(handle, &out->week, 0, 53);
+				parse_metadata_number(handle, &out->week, 0, 255);
+			if (!panel && !ret && out->week > 53 && out->week != 255)
+				ret = -EINVAL;
+			if (!panel)
+				ret = parse_metadata_optional(handle, &at, ret, &out->defaults,
+							      DCP_METADATA_DEFAULT_DATE);
 		} else if (!strcmp(key, "YearOfManufacture")) {
 			if (seen & 16)
 				return -EINVAL;
 			seen |= 16;
 			ret = panel ? skip(handle) :
 				parse_metadata_number(handle, &out->year, 1990, 2245);
+			if (!panel)
+				ret = parse_metadata_optional(handle, &at, ret, &out->defaults,
+							      DCP_METADATA_DEFAULT_DATE);
 		} else if (!strcmp(key, "SerialNumber")) {
 			if (seen & 64)
 				return -EINVAL;
@@ -1547,6 +1655,9 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle,
 			ret = panel ? parse_panel_label(handle, out->serial_text) :
 				parse_metadata_string(handle, out->serial_text,
 						      sizeof(out->serial_text));
+			if (!panel)
+				ret = parse_metadata_optional(handle, &at, ret, &out->defaults,
+							      DCP_METADATA_DEFAULT_SERIAL);
 		} else if (!strcmp(key, "LegacyManufacturerID")) {
 			if (seen & 32)
 				return -EINVAL;
@@ -1558,14 +1669,26 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle,
 		if (ret)
 			return ret;
 	}
-	if (panel && !(seen & 1) && (seen & 32)) {
+	if (!(seen & 1) && (seen & 32)) {
 		for (unsigned int i = 0; i < 3; i++)
 			out->manufacturer[i] = '@' + ((legacy >> (10 - 5 * i)) & 31);
 		seen |= 1;
 	}
-	if ((seen & (panel ? 5 : 31)) != (panel ? 5 : 31) ||
-	    strlen(out->manufacturer) != 3)
+	/*
+	 * The identity is the manufacturer and product code. A sink's name,
+	 * serial and date are optional, as in its own EDID.
+	 */
+	if ((seen & 5) != 5 || strlen(out->manufacturer) != 3)
 		return -EINVAL;
+	if (!panel) {
+		if (!(seen & 2) || !out->name[0])
+			out->defaults |= DCP_METADATA_DEFAULT_NAME;
+		if ((seen & 24) != 24 || (out->defaults & DCP_METADATA_DEFAULT_DATE)) {
+			out->week = 0;
+			out->year = 0;
+			out->defaults |= DCP_METADATA_DEFAULT_DATE;
+		}
+	}
 	for (unsigned int i = 0; i < 3; i++)
 		if (out->manufacturer[i] < 'A' || out->manufacturer[i] > 'Z')
 			return -EINVAL;
@@ -1635,6 +1758,12 @@ static int parse_metadata_capability(struct dcp_parse_ctx *handle, bool *out)
 	return skip(handle);
 }
 
+/*
+ * A sink's DisplayAttributes. Only its identity (ProductAttributes) is
+ * required: a missing or out-of-range size or colour description is noted in
+ * defaults and left to the EDID's own defaults, as a sink's EDID may leave
+ * them undefined too.
+ */
 int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out)
 {
 	struct dcp_display_metadata parsed = {};
@@ -1645,31 +1774,41 @@ int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_meta
 	if (ret)
 		return ret;
 	for (; it.idx < it.len; it.idx++) {
+		struct dcp_parse_ctx at;
 		char key[64];
 
 		ret = parse_metadata_string(handle, key, sizeof(key));
 		if (ret)
 			return ret;
+		at = *handle;
 		if (!strcmp(key, "MaxHorizontalImageSize")) {
 			if (seen & 1)
 				return -EINVAL;
 			seen |= 1;
 			ret = parse_metadata_number(handle, &parsed.width_cm, 1, 255);
+			ret = parse_metadata_optional(handle, &at, ret, &parsed.defaults,
+						      DCP_METADATA_DEFAULT_SIZE);
 		} else if (!strcmp(key, "MaxVerticalImageSize")) {
 			if (seen & 2)
 				return -EINVAL;
 			seen |= 2;
 			ret = parse_metadata_number(handle, &parsed.height_cm, 1, 255);
+			ret = parse_metadata_optional(handle, &at, ret, &parsed.defaults,
+						      DCP_METADATA_DEFAULT_SIZE);
 		} else if (!strcmp(key, "Chromaticity")) {
 			if (seen & 4)
 				return -EINVAL;
 			seen |= 4;
 			ret = parse_metadata_chromaticity(handle, &parsed);
+			ret = parse_metadata_optional(handle, &at, ret, &parsed.defaults,
+						      DCP_METADATA_DEFAULT_COLOR);
 		} else if (!strcmp(key, "DefaultWhitePoint")) {
 			if (seen & 8)
 				return -EINVAL;
 			seen |= 8;
 			ret = parse_metadata_point(handle, parsed.white, &parsed.gamma, false);
+			ret = parse_metadata_optional(handle, &at, ret, &parsed.defaults,
+						      DCP_METADATA_DEFAULT_COLOR);
 		} else if (!strcmp(key, "ProductAttributes")) {
 			if (seen & 16)
 				return -EINVAL;
@@ -1689,8 +1828,22 @@ int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_meta
 		if (ret)
 			return ret;
 	}
-	if (seen != 31)
+	if (!(seen & 16))
 		return -EINVAL;
+	/* An image size is both dimensions or none. */
+	if ((seen & 3) != 3 || !parsed.width_cm || !parsed.height_cm ||
+	    (parsed.defaults & DCP_METADATA_DEFAULT_SIZE)) {
+		parsed.width_cm = 0;
+		parsed.height_cm = 0;
+		parsed.defaults |= DCP_METADATA_DEFAULT_SIZE;
+	}
+	/* Primaries and white point are one description: both or neither. */
+	if ((seen & 12) != 12 || (parsed.defaults & DCP_METADATA_DEFAULT_COLOR)) {
+		memset(parsed.chromaticity, 0, sizeof(parsed.chromaticity));
+		memset(parsed.white, 0, sizeof(parsed.white));
+		parsed.gamma = 0;
+		parsed.defaults |= DCP_METADATA_DEFAULT_COLOR;
+	}
 	*out = parsed;
 	return 0;
 }
@@ -1761,12 +1914,58 @@ int parse_panel_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metada
 	return 0;
 }
 
+int parse_dptx_caps(struct dcp_parse_ctx *handle, struct dcp_dptx_caps *caps)
+{
+	struct iterator it;
+	struct dcp_dptx_caps parsed = {};
+	int ret = 0;
+
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; ++it.idx) {
+		u32 *field = NULL;
+		char *key = parse_string(it.handle);
+		s64 value;
+
+		if (IS_ERR(key))
+			return PTR_ERR(key);
+		if (!strcmp(key, "MaxPixelWidth"))
+			field = &parsed.width;
+		else if (!strcmp(key, "MaxTotalPixelRate"))
+			field = &parsed.total_rate;
+		else if (!strcmp(key, "MaxActivePixelRate"))
+			field = &parsed.active_rate;
+		kfree(key);
+		if (!field) {
+			ret = skip(it.handle);
+			if (ret)
+				return ret;
+			if (it.handle->pos > it.handle->len)
+				return -EINVAL;
+			continue;
+		}
+		if (*field)
+			return -EINVAL;
+		ret = parse_int_bound(it.handle, &value, 1, U32_MAX);
+		if (ret)
+			return ret;
+		*field = value;
+	}
+	if (!parsed.width || !parsed.total_rate || !parsed.active_rate)
+		return -ENOENT;
+	*caps = parsed;
+	return 0;
+}
+
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
-			    const char **class, s64 *unit, bool h17p_keys)
+			    const char **class, s64 *unit, bool h17p_keys,
+			    bool epic_unit_first)
 {
 	int ret = 0;
 	struct iterator it;
 	bool parsed_unit = false;
+	bool explicit_unit = false;
 	bool parsed_name = false;
 	bool parsed_class = false;
 
@@ -1793,7 +1992,9 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 		 * service to ask and idles the panel, so no vblank and no swap
 		 * ever completes.  Only H17P callers accept them.  If a
 		 * dictionary carries both spellings, the later value wins and
-		 * the earlier string is freed.
+		 * the earlier string is freed, except that with
+		 * @epic_unit_first (firmware 27) EPICUnit is the unit in
+		 * either order.
 		 */
 		if (!strcmp(key, "EPICName") ||
 		    (h17p_keys && !strcmp(key, "compartment"))) {
@@ -1814,10 +2015,13 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			else
 				parsed_class = true;
 		} else if (!strcmp(key, "EPICUnit") ||
-			   (h17p_keys && !strcmp(key, "interface-id"))) {
+			   (h17p_keys && !explicit_unit && !strcmp(key, "interface-id"))) {
 			ret = parse_int(it.handle, unit);
-			if (!ret)
+			if (!ret) {
 				parsed_unit = true;
+				explicit_unit |= epic_unit_first &&
+						 !strcmp(key, "EPICUnit");
+			}
 		} else {
 			ret = skip(it.handle);
 		}

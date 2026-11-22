@@ -271,7 +271,7 @@ impl queue::Queue for M5Queue {
             parser.finish().map_err(|_| EINVAL)?;
             if let command::ParsedHardwareCommand::Compute { payload, attachments, .. } = command {
                 let timestamps = [payload.timestamps.start, payload.timestamps.end];
-                if payload.flags != 0 || payload.sampler_heap != 0 || payload.sampler_count != 0
+                if payload.flags != 0
                     || timestamps.iter().any(|t| t.handle != 0 || t.offset != 0) {
                     pr_err!("M5 compute admission rejected flags={:#x} sampler_heap={:#x} samplers={} timestamps={}\n",
                         payload.flags, payload.sampler_heap, payload.sampler_count,
@@ -332,14 +332,6 @@ impl queue::Queue for M5Queue {
             translated.parameters.depth_aux_stride = 0;
             translated.parameters.stencil_stride = 0;
             translated.parameters.stencil_aux_stride = 0;
-            if payload.samples > 1 {
-                // 25G76 2x/4x captures: 10051 carries samples << 16,
-                // d491 enables multisampling, and PTC gains eight entries.
-                // The UAPI already supplies sample positions and utile size.
-                translated.parameters.tib_blocks = u64::from(payload.samples) << 16;
-                controls.fragment.resource_flags |= 1 << 32;
-                controls.fragment.ptc_max = 0xd6;
-            }
             // Native 25G76 indexed draws use 15021=0x10c000. The reference
             // triangle's low bit causes fragment recovery with larger
             // indexed overdraw, even after the tiling stage completes.
@@ -369,27 +361,24 @@ impl queue::Queue for M5Queue {
     }
 }
 
-/// Admit the captured M5 single-layer render-state envelope. This is an experimental first-job ABI
+/// Admit the captured M5 single-layer render-state envelope. An occlusion
+/// (visibility) buffer is admitted: translate range-checks it and it is
+/// written to 0x15311 and the descriptor, and Apple's visibility renders move
+/// only the ISP control and query-index words beside it
+/// (gpu/g17g-witness/ppp/statedump.m occl=1/2). A sampler heap is admitted:
+/// translate range-checks it and the descriptor carries it
+/// (+0x87a/+0x882/+0x886 as on G17P). This is an experimental first-job ABI
 /// path, not an assertion that arbitrary Vulkan programs are supported.
 fn admit_reference_render(command: &command::UapiRenderCommand) -> Result {
-    // A single 32-bit color target has an eight-byte aligned sample stride
-    // in Mesa's tilebuffer layout; sample_size includes that padding.
-    let sample_layout = match command.samples {
-        1 => command.utile_width == 32 && command.utile_height == 32,
-        2 => command.utile_width == 32 && command.utile_height == 32
-            && command.sample_size == 8 && command.multisample_control == 0x44cc,
-        4 => command.utile_width == 32 && command.utile_height == 16
-            && command.sample_size == 8 && command.multisample_control == 0xeaa2_6e26,
-        _ => false,
-    };
+    let sample_layout = matches!((command.utile_width, command.utile_height,
+                                  command.samples),
+                                 (32, 32, 1) | (32, 32, 2) | (32, 16, 4));
     let timestamps = [command.vertex_timestamps.start, command.vertex_timestamps.end,
         command.fragment_timestamps.start, command.fragment_timestamps.end];
     if !(1..=command::M5_MAX_RENDER_DIMENSION).contains(&u32::from(command.width))
         || !(1..=command::M5_MAX_RENDER_DIMENSION).contains(&u32::from(command.height))
         || command.layers != 1
         || !sample_layout
-        || command.sampler_heap != 0 || command.sampler_count != 0
-        || command.occlusion_query_base != 0
         || timestamps.iter().any(|timestamp| timestamp.handle != 0 || timestamp.offset != 0) {
         return Err(ENOTSUPP);
     }

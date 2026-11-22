@@ -5,14 +5,18 @@
 #include "afk.h"
 #include "dptxep.h"
 
+/*
+ * T8140 external firmware names its one port by the DCP index; the others,
+ * firmware 27 among them, by port unit 0 or 1.
+ */
 static inline int dptx_service_port(const char *name, const char *class,
-				    s64 unit, bool wire_v2, u32 index,
+				    s64 unit, bool unit_is_index, u32 index,
 				    u32 num_ports)
 {
 	if (!name || !class || strcmp(name, "dcpdptx-port-epic") ||
 	    strcmp(class, "AppleDCPDPTXRemotePort"))
 		return -EINVAL;
-	if (wire_v2)
+	if (unit_is_index)
 		return num_ports == 1 && unit == index ? 0 : -EINVAL;
 	return unit >= 0 && unit < 2 ? unit : -EINVAL;
 }

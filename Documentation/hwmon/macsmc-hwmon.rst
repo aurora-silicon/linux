@@ -26,15 +26,23 @@ Manual fan speed is available on the fans whose Devicetree node has
 apple,fan-manual-control, which a machine's Devicetree sets once its SMC
 firmware is known to accept a manual speed and to take the fan back. On
 those fans fanX_target is writable; writing 0 hands the fan back to the
-firmware. The fan_control module parameter, disabled by default and marked
-as unsafe, allows manual speeds on every fan with a mode key whatever the
-Devicetree says. It cannot be proven that the system will fail safe if it
-overheats under a manual fan speed.
+firmware. On other fans fanX_target is read-only; there is no module
+parameter to override the Devicetree. The SMC does not check a manual speed
+against its own thermal policy, so a machine's Devicetree should set
+apple,fan-manual-control only where the firmware is known to take the fan
+back.
 
 The driver leaves fan policy to the SMC until userspace writes a nonzero
 ``fanX_target``. Thermal zones do not take fans into manual mode. Suspend,
 shutdown and removal release only fans taken over by such a request; resume
 does not reapply it. A new target write is required after resume.
+
+A kernel thermal policy (the M5 GPU governor) sets the fans through
+macsmc_hwmon_fans_request(), as a share of each fan's range, on every fan
+whose node names its mode, target, minimum and maximum keys, with or without
+apple,fan-manual-control. It uses the same manual mode, leaves fans userspace
+holds alone, and its fans return to the SMC at suspend, shutdown and removal
+like userspace's.
 
 SoC die temperatures are described by the ``apple,soc-die-keys`` string list
 on the hwmon device node. The driver appends these temperature channels after
@@ -43,6 +51,8 @@ Only readable four-byte floating-point keys are used. When thermal support is
 enabled, their hottest reading supplies the ``macsmc_soc_die`` thermal zone.
 A failed or implausible reading fails the zone read rather than reporting a
 partial result. Keys absent from the firmware are skipped.
+With ``apple,discover-temperatures`` the listed keys add no channels: the
+discovered channel of each listed key, labelled with the key, joins the zone.
 
 The optional ``apple,thermal-pressure-key`` on the same node describes a
 readable signed 32-bit firmware thermal pressure level. Neither feature needs

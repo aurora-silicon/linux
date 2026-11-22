@@ -2280,7 +2280,9 @@ int hcd_bus_suspend(struct usb_device *rhdev, pm_message_t msg)
 		usb_set_device_state(rhdev, USB_STATE_SUSPENDED);
 		hcd->state = HC_STATE_SUSPENDED;
 
-		if (!PMSG_IS_AUTO(msg))
+		/* A suspend after a raced autoresume finds them released already. */
+		if (!PMSG_IS_AUTO(msg) &&
+		    !test_and_set_bit(HCD_FLAG_PHY_SUSPENDED, &hcd->flags))
 			usb_phy_roothub_suspend(hcd->self.sysdev,
 						hcd->phy_roothub);
 
@@ -2321,11 +2323,12 @@ int hcd_bus_resume(struct usb_device *rhdev, pm_message_t msg)
 		return 0;
 	}
 
-	if (!PMSG_IS_AUTO(msg)) {
+	if (!PMSG_IS_AUTO(msg) && test_bit(HCD_FLAG_PHY_SUSPENDED, &hcd->flags)) {
 		status = usb_phy_roothub_resume(hcd->self.sysdev,
 						hcd->phy_roothub);
 		if (status)
 			return status;
+		clear_bit(HCD_FLAG_PHY_SUSPENDED, &hcd->flags);
 	}
 
 	if (!hcd->driver->bus_resume)
@@ -2368,7 +2371,11 @@ int hcd_bus_resume(struct usb_device *rhdev, pm_message_t msg)
 		}
 	} else {
 		hcd->state = old_state;
-		usb_phy_roothub_suspend(hcd->self.sysdev, hcd->phy_roothub);
+		/* Only release what this resume took: an autoresume took nothing. */
+		if (!PMSG_IS_AUTO(msg)) {
+			usb_phy_roothub_suspend(hcd->self.sysdev, hcd->phy_roothub);
+			set_bit(HCD_FLAG_PHY_SUSPENDED, &hcd->flags);
+		}
 		dev_dbg(&rhdev->dev, "bus %s fail, err %d\n",
 				"resume", status);
 		if (status != -ESHUTDOWN)
@@ -3084,8 +3091,16 @@ void usb_remove_hcd(struct usb_hcd *hcd)
 	usb_deregister_bus(&hcd->self);
 	hcd_buffer_destroy(hcd);
 
-	usb_phy_roothub_power_off(hcd->phy_roothub);
-	usb_phy_roothub_exit(hcd->phy_roothub);
+	/*
+	 * A root hub whose resume failed still has its PHYs released by the suspend,
+	 * powered off and, without wakeup, exited too. Don't release them twice.
+	 */
+	if (!test_bit(HCD_FLAG_PHY_SUSPENDED, &hcd->flags)) {
+		usb_phy_roothub_power_off(hcd->phy_roothub);
+		usb_phy_roothub_exit(hcd->phy_roothub);
+	} else if (device_may_wakeup(hcd->self.sysdev)) {
+		usb_phy_roothub_exit(hcd->phy_roothub);
+	}
 
 	usb_put_invalidate_rhdev(hcd);
 	hcd->flags = 0;

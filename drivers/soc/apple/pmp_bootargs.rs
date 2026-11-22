@@ -7,6 +7,11 @@ pub(super) fn region_valid(offset: usize, size: usize, sram_size: usize) -> bool
     size != 0 && offset <= sram_size && size <= sram_size - offset
 }
 
+/// A range of SRAM that can be copied as 32-bit words.
+pub(super) fn word_range_valid(offset: usize, size: usize, sram_size: usize) -> bool {
+    region_valid(offset, size, sram_size) && offset % 4 == 0 && size % 4 == 0
+}
+
 fn header(bytes: &[u8]) -> Option<(u32, usize)> {
     let key = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
     let size = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
@@ -67,6 +72,15 @@ mod tests {
         assert!(!region_valid(0, 0, 0x80000));
         assert!(!region_valid(usize::MAX, 8, 0x80000));
         assert!(!region_valid(1, usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn a_word_range_is_aligned_and_inside_the_window() {
+        assert!(word_range_valid(0x3c000, 0x5c000, 0xa0000));
+        assert!(!word_range_valid(0x3c002, 0x5c000, 0xa0000));
+        assert!(!word_range_valid(0x3c000, 0x5c002, 0xa0000));
+        assert!(!word_range_valid(0x3c000, 0x64004, 0xa0000));
+        assert!(!word_range_valid(0x3c000, 0, 0xa0000));
     }
 
     #[test]

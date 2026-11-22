@@ -16,6 +16,8 @@
 #include <linux/timer.h>
 #include <linux/jiffies.h>
 
+#include "apple_dockchannel.h"
+
 #define FIFO_SIZE         0x800
 
 #define IRQ_MASK          0x0
@@ -44,7 +46,13 @@
  * that is about 115 bytes per poll, far below the FIFO size.
  */
 #define SW_DRAIN_MS       10
-#define TX_RETRIES        10000
+/*
+ * TX never waits for FIFO room: what does not fit stays in the xmit buffer
+ * and the timer sends it as room appears. After this many ticks with no room
+ * at all, nothing is reading the channel: drop what is queued, so writers do
+ * not block on a reader that may never come.
+ */
+#define TX_STUCK_TICKS    2
 
 struct dcuart_port {
 	struct uart_port port;
@@ -57,6 +65,12 @@ struct dcuart_port {
 	struct timer_list drain_timer;
 	/* Serializes IRQ mask updates and RX FIFO draining. */
 	spinlock_t lock;
+	/* DOCKCHANNEL_NEVER_WAIT: TX never waits for room (J775D only). */
+	bool never_wait;
+	/* One console write's view of the TX FIFO (dockchannel_console_putc). */
+	struct dockchannel_tx console_tx;
+	/* Timer ticks in a row that found TX output queued and no FIFO room. */
+	unsigned int tx_stuck_ticks;
 };
 
 static struct uart_driver dcuart_drv;
@@ -95,24 +109,43 @@ static void dcuart_irq_disable(struct dcuart_port *dcuart, u32 bits)
 	dcuart_irq_update(dcuart, bits, false);
 }
 
+/* The last console character timed out: see dockchannel_wait_putc(). */
+static bool dcuart_no_reader;
+
 static void dcuart_putc(struct uart_port *port, unsigned char c)
 {
-	unsigned int retries = TX_RETRIES;
+	struct dcuart_port *dcuart = container_of(port, struct dcuart_port, port);
 
-	while (readl(port->membase + DATA_TX_FREE) == 0 && --retries)
-		cpu_relax();
-	if (!retries)
-		return;
-
-	writel(c, port->membase + DATA_TX8);
+	if (dcuart->never_wait)
+		dockchannel_console_putc(port->membase, &dcuart->console_tx, c);
+	else
+		dockchannel_wait_putc(port->membase, &dcuart_no_reader, c);
 }
 
 static void dcuart_write(struct console *co, const char *s,
 			 unsigned int n)
 {
 	struct dcuart_port *dcuart = dcuart_ports[co->index];
+	struct uart_port *port = &dcuart->port;
+	unsigned long flags;
+	bool locked = true;
 
-	uart_console_write(&dcuart->port, s, n, dcuart_putc);
+	if (!dcuart->never_wait) {
+		uart_console_write(port, s, n, dcuart_putc);
+		return;
+	}
+
+	/* The TX path writes the same FIFO, and the room read must stay true. */
+	if (oops_in_progress)
+		locked = uart_port_trylock_irqsave(port, &flags);
+	else
+		uart_port_lock_irqsave(port, &flags);
+
+	dockchannel_tx_begin(&dcuart->console_tx);
+	uart_console_write(port, s, n, dcuart_putc);
+
+	if (locked)
+		uart_port_unlock_irqrestore(port, flags);
 }
 
 static int dcuart_console_setup(struct console *co, char *options)
@@ -198,39 +231,106 @@ static irqreturn_t dcuart_interrupt(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/*
+ * Send what the TX FIFO has room for, without waiting. From the timer (tick),
+ * also count ticks without room and drop the queue after TX_STUCK_TICKS.
+ * Called with the port lock held. Returns the bytes left queued.
+ */
+static unsigned int dcuart_tx_chars(struct dcuart_port *dcuart, bool tick)
+{
+	struct uart_port *port = &dcuart->port;
+	struct tty_port *tport = &port->state->port;
+	unsigned int queued = kfifo_len(&tport->xmit_fifo), pending;
+	u8 ch;
+
+	if (!queued && !port->x_char)
+		return 0;
+
+	pending = uart_port_tx_limited(port, ch, readl(port->membase + DATA_TX_FREE),
+				       true, writel(ch, port->membase + DATA_TX8), ({}));
+	if (!pending || pending < queued) {
+		dcuart->tx_stuck_ticks = 0;
+		return pending;
+	}
+	if (!tick || ++dcuart->tx_stuck_ticks < TX_STUCK_TICKS)
+		return pending;
+
+	kfifo_reset_out(&tport->xmit_fifo);
+	dcuart->tx_stuck_ticks = 0;
+	uart_write_wakeup(port);
+	return 0;
+}
+
 static void dcuart_drain_timer(struct timer_list *t)
 {
 	struct dcuart_port *dcuart = timer_container_of(dcuart, t, drain_timer);
+	struct uart_port *port = &dcuart->port;
 	unsigned long flags;
-	bool got;
+	unsigned int pending;
 
-	spin_lock_irqsave(&dcuart->lock, flags);
-	got = dcuart_drain_rx(dcuart);
-	spin_unlock_irqrestore(&dcuart->lock, flags);
+	if (!dcuart->never_wait) {
+		bool got;
 
-	if (got)
-		tty_flip_buffer_push(&dcuart->port.state->port);
-	mod_timer(&dcuart->drain_timer, jiffies + msecs_to_jiffies(SW_DRAIN_MS));
+		spin_lock_irqsave(&dcuart->lock, flags);
+		got = dcuart_drain_rx(dcuart);
+		spin_unlock_irqrestore(&dcuart->lock, flags);
+
+		if (got)
+			tty_flip_buffer_push(&port->state->port);
+		mod_timer(&dcuart->drain_timer, jiffies + msecs_to_jiffies(SW_DRAIN_MS));
+		return;
+	}
+
+	if (dcuart->sw_drain) {
+		bool got;
+
+		spin_lock_irqsave(&dcuart->lock, flags);
+		got = dcuart_drain_rx(dcuart);
+		spin_unlock_irqrestore(&dcuart->lock, flags);
+
+		if (got)
+			tty_flip_buffer_push(&port->state->port);
+	}
+
+	uart_port_lock_irqsave(port, &flags);
+	pending = dcuart_tx_chars(dcuart, true);
+	uart_port_unlock_irqrestore(port, flags);
+
+	if (dcuart->sw_drain || pending)
+		mod_timer(&dcuart->drain_timer, jiffies + msecs_to_jiffies(SW_DRAIN_MS));
 }
 
+/*
+ * Bytes in the FIFO stay there for a host to read whenever it comes; a full
+ * FIFO means none is reading, not that a transmission is in progress. So
+ * report empty: a close or tcdrain must not wait for a reader (it waited
+ * twice the port timeout, 0.4 s, on every close of an unread channel).
+ */
 static unsigned int dcuart_tx_empty(struct uart_port *port)
 {
-	return (readl(port->membase + DATA_TX_FREE) != 0) ?
-		TIOCSER_TEMT :
-		0;
+	if (!port_to_dc(port)->never_wait)
+		return (readl(port->membase + DATA_TX_FREE) != 0) ? TIOCSER_TEMT : 0;
+	return TIOCSER_TEMT;
 }
 
 static void dcuart_start_tx(struct uart_port *port)
 {
-	char ch;
-	struct tty_port *tport = &port->state->port;
+	struct dcuart_port *dcuart = port_to_dc(port);
 
-	if (!kfifo_is_empty(&tport->xmit_fifo)) {
+	if (!dcuart->never_wait) {
+		struct tty_port *tport = &port->state->port;
+		char ch;
+
 		while (kfifo_get(&tport->xmit_fifo, &ch)) {
 			dcuart_putc(port, ch);
 			port->icount.tx++;
 		}
+		return;
 	}
+
+	/* The rest goes from the timer, which the RX poll keeps running anyway. */
+	if (dcuart_tx_chars(dcuart, false) && !timer_pending(&dcuart->drain_timer))
+		mod_timer(&dcuart->drain_timer, jiffies + msecs_to_jiffies(SW_DRAIN_MS));
 }
 
 static void dcuart_stop_tx(struct uart_port *port)
@@ -258,6 +358,14 @@ static int dcuart_startup(struct uart_port *port)
 	struct dcuart_port *dcuart = port_to_dc(port);
 	unsigned long flags;
 
+	/*
+	 * A close waits for the xmit buffer to empty, which on an unread
+	 * channel takes until the timer drops it (systemd closes the console
+	 * after every status line: 30 ms each). Never wait for a reader.
+	 */
+	if (dcuart->never_wait)
+		port->state->port.closing_wait = ASYNC_CLOSING_WAIT_NONE;
+
 	spin_lock_irqsave(&dcuart->lock, flags);
 	dcuart_irq_disable(dcuart, dcuart->irq_tx | dcuart->irq_rx);
 	writel_relaxed(1, dcuart->config_base + CONFIG_RX_THRESH);
@@ -278,9 +386,10 @@ static void dcuart_shutdown(struct uart_port *port)
 	struct dcuart_port *dcuart = port_to_dc(port);
 	unsigned long flags;
 
-	if (dcuart->sw_drain)
+	/* With never_wait the timer also sends TX in IRQ mode. */
+	if (dcuart->sw_drain || dcuart->never_wait)
 		timer_delete_sync(&dcuart->drain_timer);
-	else
+	if (!dcuart->sw_drain)
 		disable_irq(port->irq);
 
 	spin_lock_irqsave(&dcuart->lock, flags);
@@ -376,6 +485,7 @@ static int dcuart_probe(struct platform_device *pdev)
 	dcuart->irq_tx = IRQ_TX(channel);
 	dcuart->irq_rx = IRQ_RX(channel);
 	dcuart->sw_drain = of_property_read_bool(pdev->dev.of_node, "apple,sw-drain");
+	dcuart->never_wait = of_property_read_bool(pdev->dev.of_node, DOCKCHANNEL_NEVER_WAIT);
 	timer_setup(&dcuart->drain_timer, dcuart_drain_timer, 0);
 
 	dcuart->irq_base = devm_platform_ioremap_resource_byname(pdev, "irq");

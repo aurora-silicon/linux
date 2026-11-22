@@ -693,7 +693,10 @@ static ssize_t dcpext_pattern_store(struct device *dev, struct device_attribute 
 	}
 	mutex_unlock(&dcp->hpd_mutex);
 	/* Firmware DMA and callbacks may outlive any error returned by this worker. */
-	__module_get(THIS_MODULE);
+	if (!try_module_get(THIS_MODULE)) {
+		atomic_set(&scanout->requested, 0);
+		return -ENODEV;
+	}
 	queue_work(system_dfl_wq, &scanout->work);
 	return count;
 }

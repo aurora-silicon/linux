@@ -973,6 +973,7 @@ extern struct arm64_ftr_override id_aa64mmfr2_override;
 extern struct arm64_ftr_override id_aa64mmfr4_override;
 extern struct arm64_ftr_override id_aa64pfr0_override;
 extern struct arm64_ftr_override id_aa64pfr1_override;
+extern struct arm64_ftr_override id_aa64pfr2_override;
 extern struct arm64_ftr_override id_aa64zfr0_override;
 extern struct arm64_ftr_override id_aa64smfr0_override;
 extern struct arm64_ftr_override id_aa64isar1_override;
@@ -1089,6 +1090,7 @@ static inline bool cpu_has_lpa2(void)
 }
 
 void __init init_cpucap_indirect_list_impdef(void);
+void arm64_impdef_cpu_reset_restore(void);
 void __init init_cpucap_indirect_list_from_array(const struct arm64_cpu_capabilities *caps);
 bool cpufeature_matches(u64 reg, const struct arm64_cpu_capabilities *entry);
 

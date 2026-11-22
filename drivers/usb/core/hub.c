@@ -3709,14 +3709,61 @@ void usb_enable_ltm(struct usb_device *udev)
 EXPORT_SYMBOL_GPL(usb_enable_ltm);
 
 /*
+ * usb_set_function_suspend - send FUNCTION_SUSPEND to every function
+ * @udev: target USB-3 device
+ * @options: USB_INTRF_FUNC_SUSPEND_* bits, 0 to leave function suspend
+ *
+ * A USB-3 device enables remote wakeup per function: the host arms it with a
+ * FUNCTION_SUSPEND request to the first interface of each function (USB 3.2,
+ * sections 9.4.9 and 9.2.5.2). An interface association descriptor groups
+ * the interfaces of one function; an interface outside any association is a
+ * function of its own. A composite device such as a dock with a display, an
+ * audio and a network function signals remote wakeup only for the functions
+ * that were armed.
+ *
+ * Return: the status of the request to the device's first interface. The
+ * other functions only log a failure: older code armed just the first
+ * interface, and a device that refuses the request elsewhere must keep
+ * working as before.
+ */
+static int usb_set_function_suspend(struct usb_device *udev, u16 options)
+{
+	struct usb_host_config *config = udev->actconfig;
+	int i, ret, status = -ENODEV;
+
+	if (!config)
+		return status;
+
+	for (i = 0; i < config->desc.bNumInterfaces; i++) {
+		struct usb_interface *intf = config->interface[i];
+		struct usb_interface_assoc_descriptor *iad = intf->intf_assoc;
+		u8 ifnum = intf->altsetting[0].desc.bInterfaceNumber;
+
+		if (iad && iad->bFirstInterface != ifnum)
+			continue;
+
+		ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
+				USB_REQ_SET_FEATURE, USB_RECIP_INTERFACE,
+				USB_INTRF_FUNC_SUSPEND, options | ifnum,
+				NULL, 0, USB_CTRL_SET_TIMEOUT);
+		if (i == 0)
+			status = ret;
+		else if (ret < 0)
+			dev_dbg(&udev->dev,
+				"function suspend 0x%04x of interface %u failed: %d\n",
+				options, ifnum, ret);
+	}
+
+	return status;
+}
+
+/*
  * usb_enable_remote_wakeup - enable remote wakeup for a device
  * @udev: target device
  *
  * For USB-2 devices: Set the device's remote wakeup feature.
  *
- * For USB-3 devices: Assume there's only one function on the device and
- * enable remote wake for the first interface.  FIXME if the interface
- * association descriptor shows there's more than one function.
+ * For USB-3 devices: Enable remote wake for every function of the device.
  */
 static int usb_enable_remote_wakeup(struct usb_device *udev)
 {
@@ -3726,12 +3773,9 @@ static int usb_enable_remote_wakeup(struct usb_device *udev)
 				USB_DEVICE_REMOTE_WAKEUP, 0, NULL, 0,
 				USB_CTRL_SET_TIMEOUT);
 	else
-		return usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
-				USB_REQ_SET_FEATURE, USB_RECIP_INTERFACE,
-				USB_INTRF_FUNC_SUSPEND,
+		return usb_set_function_suspend(udev,
 				USB_INTRF_FUNC_SUSPEND_RW |
-					USB_INTRF_FUNC_SUSPEND_LP,
-				NULL, 0, USB_CTRL_SET_TIMEOUT);
+				USB_INTRF_FUNC_SUSPEND_LP);
 }
 
 /*
@@ -3740,9 +3784,7 @@ static int usb_enable_remote_wakeup(struct usb_device *udev)
  *
  * For USB-2 devices: Clear the device's remote wakeup feature.
  *
- * For USB-3 devices: Assume there's only one function on the device and
- * disable remote wake for the first interface.  FIXME if the interface
- * association descriptor shows there's more than one function.
+ * For USB-3 devices: Disable remote wake for every function of the device.
  */
 static int usb_disable_remote_wakeup(struct usb_device *udev)
 {
@@ -3752,10 +3794,7 @@ static int usb_disable_remote_wakeup(struct usb_device *udev)
 				USB_DEVICE_REMOTE_WAKEUP, 0, NULL, 0,
 				USB_CTRL_SET_TIMEOUT);
 	else
-		return usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
-				USB_REQ_SET_FEATURE, USB_RECIP_INTERFACE,
-				USB_INTRF_FUNC_SUSPEND,	0, NULL, 0,
-				USB_CTRL_SET_TIMEOUT);
+		return usb_set_function_suspend(udev, 0);
 }
 
 /* Count of wakeup-enabled devices at or below udev */

@@ -86,6 +86,12 @@ void mt_rf_fail_locked(struct mt7932 *m, int error)
 		spin_lock(&m->data_lock);
 	netif_carrier_off(m->netdev);
 	netif_stop_queue(m->netdev);
+#if IS_ENABLED(CONFIG_MT7932_AWDL)
+	if (m->awdl.netdev) {
+		netif_carrier_off(m->awdl.netdev);
+		netif_stop_queue(m->awdl.netdev);
+	}
+#endif
 	if (data_ready)
 		spin_unlock(&m->data_lock);
 	if (m->connecting) {
@@ -115,21 +121,39 @@ void mt_rf_fail_locked(struct mt7932 *m, int error)
 	}
 }
 
-/* One owned station and firmware handshake; no host key fabrication. */
+/*
+ * One owned station and firmware handshake; no host key fabrication.
+ *
+ * The infrastructure connection takes its station and WTBL indices from one
+ * index space, as it did before AWDL, so none of its WTBL entries reuses one
+ * of its station indices; the firmware refuses such a connect with -EINVAL.
+ * Each index is still recorded in its own allocator, so AWDL peers keep
+ * their per-table release.
+ */
 static int mt_peer_reserve(struct mt7932 *m)
 {
-	u8 *ids = (u8 *)&m->peer_ids;
-	unsigned long allocation = m->peer_alloc;
+	unsigned long station = m->station_alloc, wtbl = m->wtbl_alloc;
+	unsigned long used = station | wtbl;
 	unsigned int i, id;
 
-	for (i = 0; i < 6; i++) {
-		id = find_first_zero_bit(&allocation, i < 2 ? 15 : 14);
-		if (id >= (i < 2 ? 15 : 14))
+	for (i = 0; i < ARRAY_SIZE(m->peer_ids.station); i++) {
+		id = find_first_zero_bit(&used, 15);
+		if (id >= 15)
 			return -ENOSPC;
-		__set_bit(id, &allocation);
-		ids[i] = id;
+		__set_bit(id, &used);
+		__set_bit(id, &station);
+		m->peer_ids.station[i] = id;
 	}
-	m->peer_alloc = allocation;
+	for (i = 0; i < ARRAY_SIZE(m->peer_ids.wtbl); i++) {
+		id = find_first_zero_bit(&used, 14);
+		if (id >= 14)
+			return -ENOSPC;
+		__set_bit(id, &used);
+		__set_bit(id, &wtbl);
+		m->peer_ids.wtbl[i] = id;
+	}
+	m->station_alloc = station;
+	m->wtbl_alloc = wtbl;
 	return 0;
 }
 
@@ -305,11 +329,12 @@ static int mt_association_calibration(struct mt7932 *m)
 /* command_mutex and response_lock held; all old DMA/readers already retired. */
 static void mt_peer_release(struct mt7932 *m)
 {
-	const u8 *ids = (const u8 *)&m->peer_ids;
 	unsigned int i;
 
-	for (i = 0; i < sizeof(m->peer_ids); i++)
-		__clear_bit(ids[i], &m->peer_alloc);
+	for (i = 0; i < ARRAY_SIZE(m->peer_ids.station); i++)
+		__clear_bit(m->peer_ids.station[i], &m->station_alloc);
+	for (i = 0; i < ARRAY_SIZE(m->peer_ids.wtbl); i++)
+		__clear_bit(m->peer_ids.wtbl[i], &m->wtbl_alloc);
 	memset(&m->peer_ids, 0, sizeof(m->peer_ids));
 	memset(m->duplicates, 0, sizeof(m->duplicates));
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
@@ -415,10 +440,12 @@ static int mt_retire_connection(struct mt7932 *m)
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (!ret && (m->cal_state.active || m->cal_state.error || m->cal_request_count || m->waiting))
 		ret = -EPROTO;
-	if (!ret)
+	if (!ret) {
 		mt_peer_release(m);
-	else
+	} else {
 		m->link_failed = true; /* uncertain ownership: recovery required */
+		mt_request_recovery(m, "the firmware didn't confirm the connection's end");
+	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	mutex_unlock(&m->command_mutex);
 	dev_dbg(&m->pdev->dev, "CONNECTION_RETIRED: status=%d%s\n", ret,
@@ -842,6 +869,7 @@ report:
 		m->station_tx_bytes = m->station_rx_bytes = 0;
 		m->station_tx_packets = m->station_rx_packets = 0;
 		m->station_connected = jiffies;
+		m->station_beacon_tu = response.links[0].bss->beacon_interval;
 		m->station_signal_valid = false;
 		m->station_rx_rate_valid = false;
 		spin_unlock(&m->data_lock);
@@ -1068,10 +1096,12 @@ void mt_disconnect_work(struct work_struct *work)
 	unsigned long flags;
 	int ret = mt_scan_quiesce(m);
 
-	if (!ret)
+	if (!ret) {
 		ret = mt_retire_connection(m);
-	else
+	} else {
 		WRITE_ONCE(m->link_failed, true);
+		mt_request_recovery(m, "a scan didn't end before the connection did");
+	}
 
 	/* Clear admission and queue its terminal event before a new connect can
 	 * start; both paths are serialized by response_lock.
@@ -1089,6 +1119,64 @@ void mt_disconnect_work(struct work_struct *work)
 	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	dev_dbg(&m->pdev->dev, "DISCONNECTED: teardown=%d local=%u\n", ret, local);
+}
+
+/*
+ * response_lock held, connected. The host ends the connection: the worker asks the
+ * firmware to leave the AP and reports the end once the firmware has let go of it.
+ */
+static void mt_end_connection_locked(struct mt7932 *m, u16 reason, bool local)
+{
+	m->connected = false;
+	m->disconnecting = true;
+	m->disconnect_seen = false;
+	m->disconnect_event_received = false;
+	m->disconnect_local = local;
+	m->disconnect_reason = reason;
+	if (!m->roam_moving)
+		netif_carrier_off(m->netdev);
+	netif_stop_queue(m->netdev);
+	reinit_completion(&m->disconnect_done);
+	schedule_work(&m->disconnect_work);
+}
+
+/*
+ * response_lock held. The firmware doesn't end a connection whose AP it lost, so
+ * the host does. Left alone, the station would stay associated in name and pass
+ * nothing until user space gave up on it. A frame from the AP within the beacon
+ * loss span of its beacon interval shows the AP is still there, and keeps the
+ * link. The end is reported as from the AP, like the firmware's own disconnect,
+ * with the reason mac80211 gives a lost connection, so that the supplicant tries
+ * the same AP again first.
+ */
+void mt_beacon_timeout_event(struct mt7932 *m, const struct mt7932_event *event)
+{
+	const u8 *body = event->packet + 36;
+	bool rx_recent = false;
+
+	if (event->length < 36 + MT7932_BEACON_TIMEOUT_LENGTH || !m->netdev)
+		return;
+	/* BSS 0 is the station's. */
+	if (body[0] || !m->connected || m->disconnecting || m->stopping)
+		return;
+	/* Pairs with the release that publishes the data path and its lock. */
+	if (smp_load_acquire(&m->data_ready)) {
+		unsigned long span;
+
+		spin_lock(&m->data_lock);
+		span = msecs_to_jiffies(mt7932_beacon_loss_ms(m->station_beacon_tu));
+		rx_recent = m->station_rx_packets && span &&
+			    time_before(jiffies, m->station_rx_time + span);
+		spin_unlock(&m->data_lock);
+	}
+	if (rx_recent) {
+		dev_dbg(&m->pdev->dev, "beacon timeout %u: the AP was just heard from, link kept\n",
+			body[1]);
+		return;
+	}
+	dev_info(&m->pdev->dev, "connection lost: the firmware lost the AP (reason %u, deauthentication %u)\n",
+		 body[1], get_unaligned_le16(body + 2));
+	mt_end_connection_locked(m, WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY, false);
 }
 
 int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)
@@ -1113,17 +1201,7 @@ int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)
 		complete(&m->assoc_done);
 		complete(&m->discovery_done);
 	} else if (m->connected) {
-		m->connected = false;
-		m->disconnecting = true;
-		m->disconnect_seen = false;
-		m->disconnect_event_received = false;
-		m->disconnect_local = true;
-		m->disconnect_reason = reason;
-		if (!m->roam_moving)
-			netif_carrier_off(m->netdev);
-		netif_stop_queue(m->netdev);
-		reinit_completion(&m->disconnect_done);
-		schedule_work(&m->disconnect_work);
+		mt_end_connection_locked(m, reason, true);
 	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	/* iwd may issue its next connect as soon as this command is ACKed.

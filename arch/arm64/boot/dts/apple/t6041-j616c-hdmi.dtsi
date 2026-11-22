@@ -5,7 +5,7 @@
  *
  * Every node is disabled. No DISPEXT0 power domain is described: the chain
  * runs as iBoot leaves it powered. The boot loader fills dcpext0's firmware
- * memory (the data and heap regions below; the text region is the internal
+ * memory (the regions below; it points the text region at the internal
  * DCP's), and the display gate (drivers/soc/apple/display-gate.c) then
  * enables the chain and adds dispext0's DART to the display subsystem's
  * iommus.
@@ -17,6 +17,17 @@
 	};
 
 	reserved-memory {
+		/*
+		 * The loader replaces this placeholder with the internal DCP's
+		 * TEXT, which the external processors share, as on the M4 Pro.
+		 */
+		dcpext0_text: dcpext0-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
 		dcpext0_data: dcpext0-data {
 			compatible = "apple,asc-mem";
 			reg = <0x0 0x0 0x0 0x4000>;
@@ -46,8 +57,8 @@
 	mux-control-names = "dp-xbar";
 	mux-index = <0>;
 	apple,dptx-phy = <3>;
-	memory-region = <&dcpext0_data>, <&dcpext0_heap>;
-	memory-region-names = "data", "heap";
+	memory-region = <&dcpext0_text>, <&dcpext0_data>, <&dcpext0_heap>;
+	memory-region-names = "text", "data", "heap";
 };
 
 &atcphy3 {

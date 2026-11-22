@@ -6,18 +6,32 @@
 use super::RenderState;
 use crate::g17::{
     channel::Rings,
-    fw::channels::{ControlRecord, FreeListCompletion, TvbGrowReply, TvbGrowRequest, EVENT_SLOTS},
+    fw::channels::{
+        ChannelErrorAck, ControlRecord, Engine, FreeListCompletion, TvbGrowReply, TvbGrowRequest,
+        EVENT_SLOTS,
+    },
 };
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
 
 const RETRY_LIMIT: u16 = 1000;
 
+/// A channel-error acknowledgement: its record, and once published the control cursor the
+/// consumer must pass before the queue it names may be reused.
+pub(super) struct ChannelAck {
+    record: ChannelErrorAck,
+    qid: u8,
+    cursor: Option<u32>,
+}
+
 pub(super) struct Grow {
     pub(super) requests: KVec<TvbGrowRequest>,
     pub(super) active: Option<TvbGrowRequest>,
     pub(super) reply: Option<(TvbGrowRequest, bool, u16)>,
     release_attempts: u16,
+    /// Channel errors not yet consumed by the firmware, oldest first.
+    pub(super) acks: KVec<ChannelAck>,
+    ack_attempts: u16,
 }
 impl Grow {
     pub(super) fn new() -> Result<Self> {
@@ -26,13 +40,15 @@ impl Grow {
             active: None,
             reply: None,
             release_attempts: 0,
+            acks: KVec::new(),
+            ack_attempts: 0,
         })
     }
 }
 
 impl RenderState {
     pub(in crate::g17::runtime) fn control_backpressured(&self) -> bool {
-        self.grow.reply.is_some() || self.pools.pending()
+        self.grow.reply.is_some() || self.pools.pending() || !self.grow.acks.is_empty()
     }
     fn grow_owner(&self, request: TvbGrowRequest) -> Option<usize> {
         self.entries.iter().position(|entry| {
@@ -44,6 +60,14 @@ impl RenderState {
                     })
             })
         })
+    }
+    /// The queue record the firmware runs physical queue `qid` from, if a pair holds it.
+    pub(in crate::g17::runtime) fn queue_record_va(&self, qid: u8) -> Option<u64> {
+        self.entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_deref())
+            .find_map(|pair| pair.queue_record_va(qid))
     }
     fn grow_owner_busy(&self, request: TvbGrowRequest) -> bool {
         self.grow_owner(request).is_some_and(|slot| {
@@ -86,7 +110,126 @@ impl crate::g17::Firmware {
             })
     }
     pub(in crate::g17) fn render_control_backpressured(&self) -> bool {
-        self.queues.render.grow.reply.is_some() || self.queues.render.pools.pending()
+        self.queues.render.grow.reply.is_some()
+            || self.queues.render.pools.pending()
+            || !self.queues.render.grow.acks.is_empty()
+    }
+
+    /// Whether a channel error of physical queue `qid` still waits for the firmware to consume
+    /// its acknowledgement: the queue must not be vacated, rebound or released until then.
+    pub(in crate::g17) fn channel_error_pending(&self, qid: u8) -> bool {
+        self.queues.render.grow.acks.iter().any(|ack| ack.qid == qid)
+    }
+
+    /// Queues the acknowledgement of a channel error. The queue record is the one the firmware
+    /// runs the named engine of `qid` from; an error of a queue no longer bound is still logged.
+    pub(in crate::g17) fn queue_channel_error(&mut self, engine: Engine, qid: u8, stamp: u32) -> Result {
+        let queue_va = match engine {
+            Engine::Compute => self
+                .queues
+                .compute
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .find(|queue| queue.qid() == qid)
+                .map(|queue| queue.queue_record_va()),
+            Engine::Tiling | Engine::Fragment => self.queues.render.queue_record_va(qid),
+        };
+        let dev = self.primary.state.shared.dev.as_ref();
+        dev_warn!(
+            dev,
+            "G17: firmware channel error on queue {} {:?} stamp {:#x}{}\n",
+            qid,
+            engine,
+            stamp,
+            if queue_va.is_some() { "" } else { " (queue not bound)" }
+        );
+        let Some(queue_va) = queue_va else {
+            return Ok(());
+        };
+        let record = ChannelErrorAck::new(engine, queue_va, stamp);
+        let acks = &mut self.queues.render.grow.acks;
+        if acks.iter().any(|ack| ack.qid == qid && ack.record == record) {
+            return Ok(());
+        }
+        acks.push(ChannelAck { record, qid, cursor: None }, GFP_ATOMIC)?;
+        self.mark_channel_error(qid, true);
+        Ok(())
+    }
+
+    /// Holds (or frees) the queue or pair that runs physical queue `qid` for reuse.
+    fn mark_channel_error(&mut self, qid: u8, pending: bool) {
+        for mut queue in self
+            .queues
+            .compute
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref_mut())
+            .filter(|queue| queue.qid() == qid)
+        {
+            queue.set_channel_error(pending);
+        }
+        for pair in self
+            .queues
+            .render
+            .entries
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_deref_mut())
+            .filter(|pair| pair.qids().contains(&qid))
+        {
+            pair.set_channel_error(pending);
+        }
+    }
+
+    /// Publishes every unpublished acknowledgement in order and forgets the ones the firmware
+    /// consumed. False means ring backpressure: the rest is retried on the next pass.
+    pub(in crate::g17) fn flush_channel_errors(&mut self) -> Result<bool> {
+        if self.queues.render.grow.acks.is_empty() {
+            return Ok(true);
+        }
+        let mut published = false;
+        let mut full = false;
+        for ack in self.queues.render.grow.acks.iter_mut() {
+            if ack.cursor.is_some() {
+                continue;
+            }
+            match Rings::publish_control(&self.init, &ControlRecord::ChannelErrorAck(ack.record)) {
+                Err(error) if error == EAGAIN => {
+                    full = true;
+                    break;
+                }
+                result => ack.cursor = Some(result?),
+            }
+            published = true;
+        }
+        if published {
+            fence(Ordering::SeqCst);
+            self.primary.notify(crate::g17::MSG_CONTROL_NOTIFY)?;
+        }
+        let consumer = self.init.control_consumer()?.load(Ordering::Acquire);
+        let producer = self.init.control_producer()?.load(Ordering::Acquire);
+        let mut index = 0;
+        while index < self.queues.render.grow.acks.len() {
+            let ack = &self.queues.render.grow.acks[index];
+            let done = match ack.cursor {
+                Some(cursor) => crate::g17::freelist::control_consumed(consumer, producer, cursor)?,
+                None => false,
+            };
+            if !done {
+                index += 1;
+                continue;
+            }
+            let qid = ack.qid;
+            self.queues.render.grow.acks.remove(index).map_err(|_| EINVAL)?;
+            if !self.channel_error_pending(qid) {
+                self.mark_channel_error(qid, false);
+            }
+        }
+        if self.queues.render.grow.acks.is_empty() {
+            self.queues.render.grow.ack_attempts = 0;
+        }
+        Ok(!full)
     }
     pub(in crate::g17) fn complete_freelist_grow(&mut self, event: FreeListCompletion) -> Result {
         self.queues.render.pools.complete_grow(event)
@@ -134,6 +277,8 @@ impl crate::g17::Firmware {
         let render = &mut self.queues.render;
         let attempts = if let Some((_, _, attempts)) = render.grow.reply.as_mut() {
             attempts
+        } else if !render.grow.acks.is_empty() {
+            &mut render.grow.ack_attempts
         } else if render.pools.pending() {
             &mut render.grow.release_attempts
         } else {
@@ -148,10 +293,15 @@ impl crate::g17::Firmware {
 }
 
 impl crate::g17::Firmware {
+    /// Commits a host growth prepared for the pair in `slot`. A `busy` pair's
+    /// growth only appends blocks to the inventory, as a firmware grow request's
+    /// does; if it cannot be committed the pair keeps its heap and the render
+    /// is published as it would have been without it.
     pub(super) fn commit_render_growth(
         &mut self,
         slot: u8,
         prepared: &mut Option<crate::g17::buffer::PreparedGrowth>,
+        busy: bool,
     ) -> Result {
         if prepared.is_none() {
             return Ok(());
@@ -163,28 +313,45 @@ impl crate::g17::Firmware {
             .pair
             .as_mut()
             .ok_or(EIO)?;
-        let vm = pair.context().vm().clone();
-        let pool = pair.pool_id();
-        let buffer_id = pair.buffer_id();
-        // Preflight every destination before the graph starts publishing.
-        let table = self.init.pb_descriptor_table()?;
-        let offset = usize::from(buffer_id) * 16;
-        let words = [
-            table.word(offset)?,
-            table.word(offset + 4)?,
-            table.word(offset + 8)?,
-            table.word(offset + 12)?,
-        ];
-        let descriptor = pair
-            .manager()
-            .commit_growth(prepared, |previous, blocks, mappings| {
-                vm.append_render_pool_mappings_prepared(slot, pool, previous, blocks, mappings)
-            })?;
-        if let Some(descriptor) = descriptor {
-            for (word, value) in words.into_iter().zip(descriptor) {
-                word.store(value, Ordering::Relaxed);
+        let previous = pair.manager().blocks();
+        let source = if busy {
+            crate::g17::trace::HEAP_HOST_BUSY
+        } else {
+            crate::g17::trace::HEAP_HOST_IDLE
+        };
+        let committed: Result = (|| {
+            let vm = pair.context().vm().clone();
+            let pool = pair.pool_id();
+            let buffer_id = pair.buffer_id();
+            // Preflight every destination before the graph starts publishing.
+            let table = self.init.pb_descriptor_table()?;
+            let offset = usize::from(buffer_id) * 16;
+            let words = [
+                table.word(offset)?,
+                table.word(offset + 4)?,
+                table.word(offset + 8)?,
+                table.word(offset + 12)?,
+            ];
+            let descriptor = pair
+                .manager()
+                .commit_growth(prepared, |previous, blocks, mappings| {
+                    vm.append_render_pool_mappings_prepared(slot, pool, previous, blocks, mappings)
+                })?;
+            if let Some(descriptor) = descriptor {
+                for (word, value) in words.into_iter().zip(descriptor) {
+                    word.store(value, Ordering::Relaxed);
+                }
+                fence(Ordering::SeqCst);
             }
-            fence(Ordering::SeqCst);
+            Ok(())
+        })();
+        let manager = pair.manager();
+        crate::g17::trace::heap(source, committed.is_ok(), previous, manager.blocks());
+        match committed {
+            Ok(()) if busy => manager.note_busy_growth(previous),
+            // The prepared growth is dropped by the caller after the device mutex.
+            Err(_) if busy => manager.defer_busy_growth(crate::g17::now_ns()),
+            committed => committed?,
         }
         Ok(())
     }
@@ -238,20 +405,20 @@ impl crate::g17::Shared {
                 render.grow.active = Some(request);
                 (request, slot, pair)
             };
+            let before = pair.as_mut().map_or(0, |pair| pair.manager().blocks());
             let prepared = match pair.as_mut() {
                 Some(pair) => {
                     let vm = pair.context().vm().clone();
                     let pool = pair.pool_id();
                     let slot = pair.slot();
                     let manager = pair.manager();
-                    let before = manager.blocks();
                     if vm.render_pool_tvb_blocks(slot, pool) != Some(before) {
                         Err(EFAULT)
                     } else {
                         manager.prepare_growth(
                             &dev,
                             &vm,
-                            crate::g17::buffer::firmware_growth_target(before),
+                            manager.firmware_target(),
                             None,
                         )
                     }
@@ -275,6 +442,7 @@ impl crate::g17::Shared {
                 entry.growing = false;
                 // The grow work item requests an event pass when it finishes.
                 entry.missed_event = false;
+                firmware.queues.hold_render_slot(slot);
             }
             if firmware.queues.render.grow.active != Some(request) {
                 return Err(EIO);
@@ -319,6 +487,22 @@ impl crate::g17::Shared {
                     false
                 }
             };
+            // A refused or capped request leaves the tiling pass to partial-render
+            // within the heap it has.
+            let after = slot
+                .and_then(|slot| firmware.queues.render.entries[slot].as_mut())
+                .and_then(|entry| entry.pair.as_mut())
+                .map_or(before, |pair| pair.manager().blocks());
+            crate::g17::trace::heap(
+                if grew {
+                    crate::g17::trace::HEAP_FIRMWARE_GRANTED
+                } else {
+                    crate::g17::trace::HEAP_FIRMWARE_REFUSED
+                },
+                grew,
+                before,
+                after,
+            );
             firmware.queues.render.grow.reply = Some((request, grew, 0));
             if !firmware.flush_tvb_reply()? {
                 return Ok(());

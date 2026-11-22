@@ -7,6 +7,112 @@ from common import block
 import rate
 
 
+def indicator_dpms(root):
+    source = (root / 'drivers/gpu/drm/apple/iomfb.c').read_text()
+    return r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <string.h>
+#define SWAP_SURFACES 4
+#define BIT(i) (1U << (i))
+#define IOMFB_SET_BACKGROUND BIT(31)
+#define lockdep_assert_held(lock) ((void)(lock))
+#define scoped_guard(kind, lock) for (int once = ((void)(lock), 1); once; once = 0)
+struct drm_framebuffer { unsigned int refs; };
+struct dcp_swap_submit_req_h17p {
+    struct {
+        unsigned int swap_enabled, swap_completed, bg_color;
+        unsigned int src_rect[4], dst_rect[4], surf_ids[4], surf_flags[4], surf_unk[4];
+    } swap;
+    unsigned int surf[4], surf_iova[4];
+    bool surf_null[4];
+};
+struct iomfb_scanout_h17p {
+    struct drm_framebuffer *fb[4];
+    struct dcp_swap_submit_req_h17p request;
+};
+struct apple_dcp {
+    struct dcp_camera_indicator {
+        bool has_surf;
+        unsigned int surf;
+        int lock;
+        struct { bool wanted; } state;
+    } camera_ind;
+    struct { struct dcp_swap_submit_req_h17p h17p; } swap;
+    struct { int lock; struct iomfb_scanout_h17p *scanout, *next_scanout; } iomfb;
+};
+static void drm_framebuffer_put(struct drm_framebuffer *fb)
+{
+    assert(fb->refs);
+    fb->refs--;
+}
+static void iomfb_scanout_release_h17p(struct iomfb_scanout_h17p *scanout)
+{
+    if (scanout)
+        for (unsigned int i = 0; i < SWAP_SURFACES; ++i)
+            if (scanout->fb[i])
+                drm_framebuffer_put(scanout->fb[i]);
+}
+static struct drm_framebuffer *confirmed;
+static void dcp_indicator_swap_done(struct apple_dcp *dcp, struct drm_framebuffer *fb)
+{
+    assert(dcp->camera_ind.has_surf);
+    confirmed = fb;
+}
+''' + '\n'.join(block(source, name) for name in (
+    'static void iomfb_null_surface_h17p(',
+    'void iomfb_prepare_indicator_h17p(',
+    'static void iomfb_retire_indicator_h17p(',
+    'void iomfb_scanout_complete_h17p(',
+)) + r'''
+int main(void)
+{
+    struct drm_framebuffer desktop = { 1 }, dot = { 2 };
+    struct iomfb_scanout_h17p old = { .fb = { [3] = &dot } };
+    struct iomfb_scanout_h17p next = { .fb = { [0] = &desktop, [3] = &dot } };
+    struct apple_dcp dcp = {
+        .camera_ind = { .has_surf = true, .surf = 3 },
+        .iomfb = { .scanout = &old, .next_scanout = &next },
+        .swap.h17p = {
+            .swap.swap_enabled = BIT(0),
+            .swap.swap_completed = BIT(0),
+            .surf_null = { false, true, true, true },
+        },
+    };
+    iomfb_prepare_indicator_h17p(&dcp);
+    assert(dcp.swap.h17p.swap.swap_enabled == (BIT(0) | BIT(3)));
+    assert(dcp.swap.h17p.swap.swap_completed == dcp.swap.h17p.swap.swap_enabled);
+    assert(old.fb[3] == &dot && dot.refs == 2);
+    confirmed = &dot;
+    iomfb_scanout_complete_h17p(&dcp);
+    assert(dcp.iomfb.scanout == &next && !dcp.iomfb.next_scanout);
+    assert(!next.fb[3] && !dot.refs && !confirmed);
+    assert(next.request.surf_null[3] && !(next.request.swap.swap_enabled & BIT(3)));
+    assert(next.fb[0] == &desktop && desktop.refs == 1);
+    assert(next.request.swap.swap_enabled == BIT(0));
+
+    /* A brightness or wake replay shares the retained scanout, with no next one. */
+    dot.refs = 1;
+    next.fb[3] = &dot;
+    next.request.surf_null[3] = false;
+    next.request.surf_iova[3] = 42;
+    next.request.swap.swap_enabled |= BIT(3);
+    dcp.swap.h17p = next.request;
+    dcp.camera_ind.state.wanted = true;
+    iomfb_prepare_indicator_h17p(&dcp);
+    assert(!dcp.swap.h17p.surf_null[3] && dcp.swap.h17p.surf_iova[3] == 42);
+    dcp.camera_ind.state.wanted = false;
+    iomfb_prepare_indicator_h17p(&dcp);
+    assert(dcp.swap.h17p.surf_null[3] && !dcp.swap.h17p.surf_iova[3]);
+    assert(next.fb[3] == &dot && dot.refs == 1);
+    iomfb_retire_indicator_h17p(&dcp, &next);
+    assert(!next.fb[3] && !dot.refs && !next.request.surf_iova[3]);
+    assert(next.request.surf_null[3] && next.request.swap.swap_enabled == BIT(0));
+    return 0;
+}
+'''
+
+
 def backlight(root):
     header = (root / 'drivers/gpu/drm/apple/dcp_backlight.h').read_text()
     header = '\n'.join(line for line in header.splitlines()
@@ -92,9 +198,93 @@ int main(void)
     assert(!dcp_bl_dpms(&s,false) && dcp_bl_effective(&s)==0);
     assert(!dcp_bl_dpms(&s,true) && dcp_bl_effective(&s)==450);
     assert(!dcp_bl_resend(&s));
+    /*
+     * DAC firmware: the report stays 0 after a display power cycle while the
+     * panel is lit again (J414s, 13.5). Boot and resume end at the same level.
+     */
+    {
+        struct dcp_bl_presented boot={0}, resume={0};
+        assert(dcp_bl_presented_actual(&boot,140)==140);
+        dcp_bl_presented_set(&boot,500);
+        dcp_bl_presented_set(&boot,0);
+        assert(dcp_bl_presented_actual(&boot,0)==0);
+        dcp_bl_presented_set(&boot,500);
+        assert(dcp_bl_presented_actual(&boot,0)==500);
+        dcp_bl_presented_set(&resume,500);
+        dcp_bl_presented_set(&resume,0);
+        dcp_bl_presented_set(&resume,0);
+        assert(dcp_bl_presented_actual(&resume,0)==0);
+        dcp_bl_presented_set(&resume,500);
+        assert(dcp_bl_presented_actual(&resume,500)==dcp_bl_presented_actual(&boot,0));
+    }
     return 0;
 }
 '''
+
+
+
+def dac_words(root):
+    """The production DAC tables, interpolate() and calculate_dac() at every level."""
+    import re
+    source = (root / 'drivers/gpu/drm/apple/dcp_backlight.c').read_text()
+    defines = '\n'.join(re.findall(r'^#define (?:MIN|MAX)_BRIGHTNESS_PART[12]\s.*$', source, re.M))
+    tables = '\n'.join(re.findall(r'^static u32 brightness_part[0-9]+\[\] = \{.*?\};', source, re.M | re.S))
+    functions = '\n'.join(block(source, marker) for marker in (
+        'static u32 interpolate(', 'static u32 calculate_dac('))
+    return r"""
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+typedef uint32_t u32;
+typedef uint64_t u64;
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define WARN(c, ...) (c)
+#define SCALE_FACTOR (1 << 10)
+struct apple_dcp;
+""" + defines + '\n' + tables + '\n' + functions + r"""
+/* Every word is two 16-bit DAC halves, each a table value times 16. */
+static void check_word(u32 word, u32 *hi, u32 *lo)
+{
+    *hi = word >> 16;
+    *lo = word & 0xffff;
+    assert(!(*hi & 0xf) && !(*lo & 0xf));
+    assert(*hi <= 0x7ff0 && *lo <= *hi);
+}
+/* The widest gap between a table word's two halves, times 16. */
+static u32 widest(const u32 *tbl, size_t n, u32 gap)
+{
+    for (size_t i = 0; i < n; i++)
+        if (16 * ((tbl[i] >> 16) - (tbl[i] & 0xffff)) > gap)
+            gap = 16 * ((tbl[i] >> 16) - (tbl[i] & 0xffff));
+    return gap;
+}
+int main(void)
+{
+    u32 prev_hi = 0, prev_lo = 0, hi, lo, gap;
+    gap = widest(brightness_part1, ARRAY_SIZE(brightness_part1), 0);
+    gap = widest(brightness_part12, ARRAY_SIZE(brightness_part12), gap);
+    gap = widest(brightness_part2, ARRAY_SIZE(brightness_part2), gap);
+    /* The table points themselves, as before. */
+    assert(calculate_dac(NULL, 2) == 0);
+    assert(calculate_dac(NULL, MAX_BRIGHTNESS_PART1) == 16 * brightness_part1[ARRAY_SIZE(brightness_part1) - 1]);
+    assert(calculate_dac(NULL, MIN_BRIGHTNESS_PART2) == 16 * brightness_part2[0]);
+    assert(calculate_dac(NULL, MAX_BRIGHTNESS_PART2) == 16 * brightness_part2[ARRAY_SIZE(brightness_part2) - 1]);
+    for (int nits = 0; nits <= (int)MAX_BRIGHTNESS_PART2; nits++) {
+        check_word(calculate_dac(NULL, nits), &hi, &lo);
+        /* Both halves rise with the level; neither picks up the other's fraction. */
+        assert(hi >= prev_hi && lo >= prev_lo);
+        /* The lower half stays the half step below, as in the table. */
+        assert(hi - lo <= gap);
+        prev_hi = hi;
+        prev_lo = lo;
+    }
+    /* 370 nits (J313): the lower half was 0x10a0, a 4 to 5 nit value. */
+    check_word(calculate_dac(NULL, 370), &hi, &lo);
+    assert(hi > 0x7800 && lo > 0x7800);
+    return 0;
+}
+"""
 
 
 def modes(root):
@@ -113,7 +303,7 @@ def modes(root):
         blobs.append('static const unsigned char b%u[]={%s};' %
                      (i, ','.join(map(str, raw))))
         check = (f'{{ struct dcp_parse_ctx c; unsigned n=99; '
-                 f'assert(!parse(b{i},sizeof(b{i}),&c)); c.zero_vrr_range_fallback={int(desktop)}; '
+                 f'assert(!parse(b{i},sizeof(b{i}),&c)); c.zero_vrr_range_fallback={int(desktop)}; c.internal_present_deadline={int(desktop)}; '
                  'struct dcp_display_mode *m=enumerate_modes(&c,&n,355,230,0,true,false); '
                  f'assert(!IS_ERR(m) && n=={len(expected)});')
         for j, hz in enumerate(expected):
@@ -122,8 +312,11 @@ def modes(root):
                       f'assert(m[{j}].mode.htotal==2200 && m[{j}].mode.vtotal==1125); '
                       f'assert(m[{j}].mode.flags==(DRM_MODE_FLAG_PHSYNC|DRM_MODE_FLAG_PVSYNC)); ')
         for j, hz in enumerate(expected):
-            if hz >= 119.88:
+            # A desktop internal panel takes the deadline at every timing.
+            if desktop or hz >= 119.88:
                 check += f'assert(m[{j}].needs_timestamps); '
+            elif not (ranges and ranges[j][0]):
+                check += f'assert(!m[{j}].needs_timestamps); '
         if ranges:
             for j, (lo, hi) in enumerate(ranges):
                 check += f'assert(m[{j}].vrr=={int(bool(lo))}); '
@@ -190,6 +383,12 @@ int main(void) {
     assert(dcp_desktop_present_deadline(true,true)==120);
     assert(dcp_desktop_present_deadline(true,false)==0);
     assert(dcp_desktop_present_deadline(false,true)==0);
+    assert(dcp_refresh_needs_deadline(48U<<16,false,true,true));
+    assert(dcp_refresh_needs_deadline(60U<<16,false,true,true));
+    assert(!dcp_refresh_needs_deadline(48U<<16,false,true,false));
+    assert(!dcp_refresh_needs_deadline(60U<<16,false,false,true));
+    assert(dcp_refresh_needs_deadline(120U<<16,false,true,false));
+    assert(dcp_refresh_needs_deadline(48U<<16,true,false,false));
     return 0;
 }
 '''
@@ -249,6 +448,10 @@ def watchdog(root):
         'VISIBLE_IF_KUNIT void dcp_swap_watchdog(',
         'void dcp_swap_watchdog_arm(',
         'void dcp_swap_watchdog_complete('))
+    internal=(root/'drivers/gpu/drm/apple/dcp-internal.h').read_text()
+    helpers='\n'.join(block(internal, marker) for marker in (
+        'static inline bool dcp_desktop_swap_watched(',
+        'static inline void dcp_takeover_adopt_proven('))
     definitions='\n'.join(line for line in source.splitlines()
                           if line.startswith('#define DCP_SWAP_WATCHDOG_'))
     return r'''
@@ -273,7 +476,7 @@ struct work_struct {unsigned unused;};
 struct delayed_work {struct work_struct work;};
 struct apple_dcp {
     int fw_compat;bool vrr_enabled,typec;
-    struct {u32 present_id;bool present_pending,vrr_failed;} *desktop;
+    struct {u32 present_id;bool present_pending,vrr_failed,takeover_adopted,mode_live;} *desktop;
     struct {bool valid;} mode_state;
     struct delayed_work swap_watchdog_wq;
     unsigned long swap_watchdog_deadline;
@@ -294,7 +497,7 @@ static bool dcp_is_typec_output(struct apple_dcp *d) {return d->typec;}
 static void mod_delayed_work(void *q,struct delayed_work *w,unsigned long delay)
 {assert(delay==1000);scheduled++;}
 static void cancel_delayed_work(struct delayed_work *w) {cancelled++;}
-''' + definitions + '\n' + production + r'''
+''' + definitions + '\n' + helpers + '\n' + production + r'''
 int main(void) {
     struct apple_dcp d={.fw_compat=5,.vrr_enabled=true,.mode_state={true},.connector=(void *)1};
     __typeof__(*d.desktop) state={.present_id=42,.present_pending=true};d.desktop=&state;
@@ -321,6 +524,17 @@ int main(void) {
     d.fw_compat=1;d.typec=true;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
     allow_retire=false;d.mode_state.valid=true;
     dcp_swap_watchdog(&d.swap_watchdog_wq.work);assert(d.mode_state.valid && hotplugs==1);
+    /* A takeover that adopted the loader's mode is watched until a swap
+     * completes; with none, the mode is set through the hotplug worker. */
+    allow_retire=true;d.fw_compat=5;d.typec=false;d.vrr_enabled=false;
+    state.takeover_adopted=true;state.mode_live=true;
+    before=scheduled;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
+    dcp_swap_watchdog_complete(&d);assert(!state.takeover_adopted);
+    before=scheduled;dcp_swap_watchdog_arm(&d);assert(scheduled==before);
+    state.takeover_adopted=true;state.present_id=45;state.present_pending=true;
+    jiffies=d.swap_watchdog_deadline;unsigned hp=hotplugs;
+    dcp_swap_watchdog(&d.swap_watchdog_wq.work);
+    assert(!state.takeover_adopted && !state.mode_live && !d.mode_state.valid && hotplugs==hp+1);
     return 0;
 }
 '''

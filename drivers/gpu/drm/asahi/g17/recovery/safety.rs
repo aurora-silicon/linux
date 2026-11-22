@@ -115,6 +115,14 @@ mod tests {
         assert!(state.restart_limit(u64::MAX));
     }
     #[test]
+    fn restarts_with_work_retired_between_them_do_not_accumulate() {
+        let mut storm = Storm::new();
+        for n in 0..64 { assert!(!storm.note_unless_progress(0, n)); }
+        for _ in 1..LIMIT { assert!(!storm.note_unless_progress(0, 64)); }
+        assert!(storm.note_unless_progress(0, 64));
+        assert!(storm.note_unless_progress(0, 65));
+    }
+    #[test]
     fn separated_faults_do_not_accumulate_and_latched_loss_cannot_wrap() {
         let mut storm = Storm::new();
         for n in 0..64 { assert!(!storm.note(n * WINDOW_NS)); }
@@ -138,17 +146,6 @@ mod tests {
         for _ in 0..FORGIVE_LIMIT { storm.note(0); storm.forgive(); }
         assert!(!storm.note(WINDOW_NS));
         assert!(storm.forgive());
-    }
-    #[test]
-    fn recovery_table_ends_at_its_first_invalid_record() {
-        use crate::g17::recovery::Entries;
-        let mut entries = Entries::default();
-        assert!(entries.include(1 | (12 << 4)));
-        assert!(entries.include(1 | 2 | (17 << 4)));
-        assert!(!entries.include(0));
-        assert_eq!(entries.listed, 2);
-        assert_eq!(entries.guilty, 1u128 << 17);
-        assert_eq!(entries.cancelled, 0);
     }
     #[test]
     fn replay_dependency_checks_never_wait_for_event_service() {

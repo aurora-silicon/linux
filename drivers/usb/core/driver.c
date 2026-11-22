@@ -1389,12 +1389,24 @@ done:
 	return status;
 }
 
+/* Whether the host controller keeps running in this sleep and may wake the system */
+static bool usb_s2idle_may_keep_awake(struct usb_device *udev, pm_message_t msg)
+{
+	struct usb_hcd *hcd = bus_to_hcd(udev->bus);
+
+	return msg.event == PM_EVENT_SUSPEND && hcd->runs_in_s2idle &&
+	       pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
+	       device_may_wakeup(hcd->self.controller);
+}
+
 /*
  * Whether to keep a device awake in suspend-to-idle so that a remote wakeup
  * can reach the host controller: a hub that does not pass one on from below
  * while it is suspended itself, a hub with wakeup enabled that does not signal
  * the changes of its own ports while it is suspended, and every device between
- * such a hub and the root hub, root hub included. This only works while the
+ * such a hub and the root hub, root hub included, and a device that wakes
+ * itself whenever it is suspended, which then wakes the system with its own
+ * input instead, as do the devices above it. This only works while the
  * host controller keeps running, so its interrupt reports the hub's status
  * change.
  *
@@ -1405,13 +1417,10 @@ done:
  */
 VISIBLE_IF_KUNIT bool usb_stay_awake_for_wakeup(struct usb_device *udev, pm_message_t msg)
 {
-	struct usb_hcd *hcd = bus_to_hcd(udev->bus);
 	struct usb_device *child;
 	int port1;
 
-	if (msg.event != PM_EVENT_SUSPEND || !hcd->runs_in_s2idle ||
-	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
-	    !device_may_wakeup(hcd->self.controller))
+	if (!usb_s2idle_may_keep_awake(udev, msg))
 		return false;
 
 	if ((udev->quirks & USB_QUIRK_HUB_NO_SUSPENDED_PORT_WAKEUP) &&
@@ -1420,6 +1429,10 @@ VISIBLE_IF_KUNIT bool usb_stay_awake_for_wakeup(struct usb_device *udev, pm_mess
 
 	if ((udev->quirks & USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP) &&
 	    usb_wakeup_reaches(udev))
+		return true;
+
+	if ((udev->quirks & USB_QUIRK_WAKES_ITSELF_WHEN_SUSPENDED) &&
+	    udev->do_remote_wakeup)
 		return true;
 
 	/* Children are done with their suspend before their parent starts */
@@ -1666,6 +1679,14 @@ static void choose_wakeup(struct usb_device *udev, pm_message_t msg)
 	 * autoresume now so the setting can be changed.
 	 */
 	if (udev->state == USB_STATE_SUSPENDED && w != udev->do_remote_wakeup)
+		pm_runtime_resume(&udev->dev);
+	/*
+	 * A device that wakes itself when suspended is kept awake instead, see
+	 * usb_stay_awake_for_wakeup(), so bring it back from an autosuspend.
+	 */
+	else if (udev->state == USB_STATE_SUSPENDED && w &&
+		 (udev->quirks & USB_QUIRK_WAKES_ITSELF_WHEN_SUSPENDED) &&
+		 usb_s2idle_may_keep_awake(udev, msg))
 		pm_runtime_resume(&udev->dev);
 	udev->do_remote_wakeup = w;
 }

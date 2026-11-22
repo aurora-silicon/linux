@@ -185,7 +185,7 @@ impl G18GraphicsJob {
         for (address,bytes) in [(va::GRAPHICS_SIGNALS,va::GRAPHICS_SIGNALS_BYTES),
             (va::GRAPHICS_SCHEDULER_START,0x8000),(va::PB_TABLE,0x4000),
             (va::UMA_TABLE,0x8000),(va::GRAPHICS_UMA_STATE,0x8000)] {
-            for off in (0..bytes).step_by(mmu::UAT_PGSZ) { uat.kernel_vm().translate_iova(address+off as u64)?;pages+=1; }
+            pages += uat.kernel_vm().translate_pages(address,bytes)?.len();
         }
         // Captured shader/VDM/PPP pages are immutable except terminate/poison.
         // Validate all enabled direct register pointer inputs; bind/flag words
@@ -303,11 +303,19 @@ impl G18GraphicsJob {
         // zero is valid for every field. Initialize the allocation in place.
         unsafe { core::ptr::write_bytes(workspace.as_mut_ptr(), 0, 1); }
         let mut workspace = unsafe { workspace.assume_init() };
-        let encoded = self.graph.with_bytes_mut(|bytes| {
+        // Encode in cached memory and copy the commands to the write-combined
+        // graph at once: the encoder and its digests read what they write.
+        let mut commands = KVec::from_elem(0u8, cmd::G18_TA_COMMAND_BYTES + cmd::G18_3D_COMMAND_BYTES,
+            GFP_KERNEL)?;
+        let (ta, fragment) = commands.split_at_mut(cmd::G18_TA_COMMAND_BYTES);
+        let encoded = assembly::encode_into(ta.try_into().map_err(|_| EINVAL)?,
+            fragment.try_into().map_err(|_| EINVAL)?,
+            &self.parameters, &self.controls, inputs, &mut workspace).map_err(|_| EINVAL)?;
+        self.graph.with_bytes_mut(|bytes| {
             let (ta_page, rest) = bytes.split_at_mut(assembly::FRAGMENT_OFFSET);
-            assembly::encode_into((&mut ta_page[..cmd::G18_TA_COMMAND_BYTES]).try_into().map_err(|_| EINVAL)?,
-                (&mut rest[..cmd::G18_3D_COMMAND_BYTES]).try_into().map_err(|_| EINVAL)?,
-                &self.parameters, &self.controls, inputs, &mut workspace).map_err(|_| EINVAL)
+            ta_page[..cmd::G18_TA_COMMAND_BYTES].copy_from_slice(ta);
+            rest[..cmd::G18_3D_COMMAND_BYTES].copy_from_slice(fragment);
+            Ok(())
         })?;
         self.encoded = Some(encoded);
         fence(Ordering::SeqCst);
@@ -317,21 +325,17 @@ impl G18GraphicsJob {
     fn audit_mappings(&self, uat: &mmu::Uat) -> Result<usize> {
         let mut count = self.program.audit()?;
         for target in self.targets.iter() {
-            for offset in (0..target.logical_size).step_by(mmu::UAT_PGSZ) {
-                let low = target.iova() + offset as u64;
-                if self.vm().translate_iova(low)? != self.vm().translate_iova(va::COMPACT_BIAS + low)? {
-                    return Err(EFAULT);
-                }
-                count += 1;
+            let low = self.vm().translate_pages(target.iova(), target.logical_size)?;
+            if self.vm().translate_pages(va::COMPACT_BIAS + target.iova(), target.logical_size)? != low {
+                return Err(EFAULT);
             }
+            count += low.len();
         }
-        for offset in (0..va::GRAPHICS_JOB_BYTES).step_by(mmu::UAT_PGSZ) {
-            let pa = uat.kernel_vm().translate_iova(va::GRAPHICS_JOB_HIGH + offset as u64)?;
-            for vm in [uat.kernel_lower_vm(), self.vm()] {
-                if vm.translate_iova(va::GRAPHICS_JOB_LOW + offset as u64)? != pa { return Err(EFAULT); }
-            }
-            count += 1;
+        let pa = uat.kernel_vm().translate_pages(va::GRAPHICS_JOB_HIGH, va::GRAPHICS_JOB_BYTES)?;
+        for vm in [uat.kernel_lower_vm(), self.vm()] {
+            if vm.translate_pages(va::GRAPHICS_JOB_LOW, va::GRAPHICS_JOB_BYTES)? != pa { return Err(EFAULT); }
         }
+        count += pa.len();
         Ok(count)
     }
 

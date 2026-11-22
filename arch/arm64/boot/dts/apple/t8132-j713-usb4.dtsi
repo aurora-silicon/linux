@@ -16,38 +16,7 @@
 	};
 };
 
-/* ACIO is the consumer that owns these domains while a cable is up. */
-&ps_atc0_pcie {
-	status = "okay";
-};
-
-&ps_atc1_pcie {
-	status = "okay";
-};
-
-&ps_atc0_cio {
-	status = "okay";
-};
-
-&ps_atc0_cio_pcie {
-	status = "okay";
-};
-
-&ps_atc0_cio_usb {
-	status = "okay";
-};
-
-&ps_atc1_cio {
-	status = "okay";
-};
-
-&ps_atc1_cio_pcie {
-	status = "okay";
-};
-
-&ps_atc1_cio_usb {
-	status = "okay";
-};
+#include "t8132-j713-usb4-pmgr.dtsi"
 
 &pmgr_cio {
 	status = "okay";

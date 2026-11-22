@@ -1002,10 +1002,13 @@ struct dwc3_scratchpad_array {
  *				need to be passed on to glue layer
  * @pre_set_role: Notify glue of role switch notifications
  * @pre_run_stop: Notify run stop enable/disable information to glue
+ * @pre_host_resume: Before xHCI touches the core at a system resume; an error keeps it away,
+ *		     and a positive value says the core lost its state and was set up again
  */
 struct dwc3_glue_ops {
 	void	(*pre_set_role)(struct dwc3 *dwc, enum usb_role role);
 	void	(*pre_run_stop)(struct dwc3 *dwc, bool is_on);
+	int	(*pre_host_resume)(struct dwc3 *dwc);
 };
 
 /**
