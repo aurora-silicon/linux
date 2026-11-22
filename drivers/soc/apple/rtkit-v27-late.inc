@@ -96,7 +96,11 @@ undo:
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_v27_arm);
 
-int apple_rtkit_v27_check(struct apple_rtkit_v27_scope *s)
+/*
+ * Before the commit, a pending message refuses the sleep (it is kept for the disarm). After it,
+ * the stop that follows reads the mailbox itself: a message there is left to it.
+ */
+int apple_rtkit_v27_check(struct apple_rtkit_v27_scope *s, bool committed)
 {
 	struct apple_mbox_msg msg;
 	int ret;
@@ -109,6 +113,8 @@ int apple_rtkit_v27_check(struct apple_rtkit_v27_scope *s)
 		return -EBUSY;
 	if (kfifo_is_full(&s->deferred))
 		return -ENOBUFS;
+	if (committed)
+		return 0;
 	ret = apple_mbox_recv_nowait(s->rtk->mbox, &msg);
 	if (ret > 0) {
 		kfifo_put(&s->deferred, msg);
@@ -190,10 +196,19 @@ int apple_rtkit_v27_idle_atomic(struct apple_rtkit_v27_scope *s)
 				} else if (apple_rtkit_oslog_owed_msg(rtk, msg.msg1, msg.msg0)) {
 					echo = msg;
 					echo_pending = true;
-				} else {
+				} else if (msg.msg1 == APPLE_RTKIT_EP_MGMT ||
+					   msg.msg1 == APPLE_RTKIT_EP_CRASHLOG) {
+					/* Off the power-state handshake, or a crash: no stop. */
 					kfifo_put(&s->deferred, msg);
 					ret = -EPROTO;
 					goto poison;
+				} else {
+					/*
+					 * Ordinary traffic (a log line, a report, an endpoint's
+					 * message): kept for the disarm's replay, and the wait
+					 * for the power-state answers goes on.
+					 */
+					kfifo_put(&s->deferred, msg);
 				}
 			}
 		}

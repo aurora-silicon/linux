@@ -1305,7 +1305,7 @@ static int dcp_v27_late_arm(void *data)
 	return 0;
 }
 
-static int dcp_v27_late_check(void *data)
+static int dcp_v27_late_check(void *data, bool committed)
 {
 	struct dcp_v27_sleep *s = data;
 	struct apple_dcp *dcp = s->dcp;
@@ -1322,7 +1322,7 @@ static int dcp_v27_late_check(void *data)
 	if (!ret)
 		ret = apple_dart_v27_check(s->firmware);
 	if (!ret)
-		ret = apple_rtkit_v27_check(s->rx);
+		ret = apple_rtkit_v27_check(s->rx, committed);
 	return ret;
 }
 

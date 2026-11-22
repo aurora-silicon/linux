@@ -67,6 +67,8 @@ ASAHI_TESTS = {
     'dcpext26-slot-unregister-tests.py': [(out(), PASS)],
     'dcpext26-budget-tests.py': [([], PASS)],
     'dcpext26-queue-tests.py': [([], PASS), (['--drop-v27-close'], KILL)],
+    'rtkit-v27-late-tests.py': [(out(), PASS), (out() + ['--consume-committed'], KILL),
+                                (out() + ['--fail-foreign'], KILL)],
     'dcpext26-retrain-tests.py': [([], PASS), (['--negative-control'], KILL)],
     'dcpext26-lifecycle-tests.py': [([], PASS)],
     'dcpext26-modeset-tests.py': [([], PASS)],
