@@ -611,6 +611,9 @@ struct apple_pcie {
 	bool			neo_rc_down;
 	/* Down already when the sleep began: a failed wake left it unprogrammed */
 	bool			neo_rc_was_down;
+	/* Multi-port T8132 host: ports stopped by sleep.c and retrained on wake */
+	bool			t8132_sleep;
+	bool			t8132_sleep_down;
 	const struct hw_info	*hw;
 	unsigned long		*bitmap;
 	struct list_head	ports;
@@ -653,6 +656,15 @@ struct apple_pcie_port {
 	bool			powered;	/* cold train: pwren raised, port not parked yet */
 	struct device		*cold_dart;	/* a parked port's DART: gated while the port is parked */
 	struct pci_saved_state	*cold_rp_state;	/* a parked port's root port, as it was before the park */
+	struct gpio_desc	*clkreq_gpio;
+	struct device		*sleep_dart;
+	struct apple_tunable	*sleep_tables[4];
+	u32			*saved_msimap;
+	u32			saved_appclk;
+	u32			saved_msicfg;
+	u32			saved_msibase;
+	u32			saved_msiaddr;
+	u32			saved_msiaddr_hi;
 };
 
 static bool apple_radio_writer_closed(struct apple_pcie *pcie);
@@ -4990,6 +5002,316 @@ absent:
 	dev_warn(dev, "no deep sleep: the loader didn't publish what this host needs\n");
 }
 
+static struct device *apple_pcie_t8132_port_dart(struct apple_pcie_port *port)
+{
+	struct of_phandle_args iommu = {};
+	struct platform_device *pdev;
+	u32 bus_start;
+	int ret;
+
+	if (of_property_read_u32_index(port->np, "bus-range", 0, &bus_start))
+		return NULL;
+	if (of_map_iommu_id(port->pcie->dev->of_node, bus_start << 8, &iommu) || !iommu.np)
+		return NULL;
+	pdev = of_find_device_by_node(iommu.np);
+	of_node_put(iommu.np);
+	if (!pdev)
+		return NULL;
+	ret = apple_dart_set_host_resumes(&pdev->dev);
+	if (!ret && !device_link_add(port->pcie->dev, &pdev->dev, DL_FLAG_STATELESS))
+		ret = -EINVAL;
+	if (ret) {
+		if (ret != -EPROBE_DEFER)
+			dev_warn(port->pcie->dev,
+				 "port %d: its DART can't wait for the port: %d\n",
+				 port->idx, ret);
+		put_device(&pdev->dev);
+		return NULL;
+	}
+	return &pdev->dev;
+}
+
+static void apple_pcie_t8132_sleep_probe(struct platform_device *pdev, struct apple_pcie *pcie)
+{
+	static const char *const names[4] = {
+		"apple,tunable-port",
+		"apple,tunable-rc",
+		"apple,tunable-rc-gen3",
+		"apple,tunable-rc-gen4",
+	};
+	struct device *dev = &pdev->dev;
+	struct resource *cfg, *port_res;
+	struct apple_pcie_port *port, *port0 = NULL;
+	char res_name[16];
+	unsigned int i;
+
+	if (!of_device_is_compatible(dev->of_node, "apple,t8132-pcie") ||
+	    pcie->managed_sids || pcie->piodma_supplier ||
+	    pcie->hw->tunneled || pcie->hw->adopt_link ||
+	    list_empty(&pcie->ports) || !pcie->hw->port_msimap ||
+	    !pcie->hw->port_msiaddr_hi)
+		return;
+
+	cfg = platform_get_resource_byname(pdev, IORESOURCE_MEM, "config");
+	if (!cfg)
+		return;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port0 || port->idx == 0)
+			port0 = port;
+	}
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		struct gpio_desc *gpio;
+
+		if (!port->phy)
+			return;
+		if (!port->perst_gpio) {
+			gpio = devm_fwnode_gpiod_get(dev, of_fwnode_handle(port->np),
+						     "reset", GPIOD_ASIS, "PERST#");
+			if (IS_ERR(gpio)) {
+				dev_warn(dev, "port %d: no PERST# for deep sleep: %pe\n",
+					 port->idx, gpio);
+				return;
+			}
+			if (gpiod_cansleep(gpio)) {
+				dev_warn(dev, "port %d: sleeping PERST# unsupported for deep sleep\n",
+					 port->idx);
+				return;
+			}
+			port->perst_gpio = gpio;
+		}
+		if (!port->clkreq_gpio) {
+			gpio = devm_fwnode_gpiod_get_optional(dev, of_fwnode_handle(port->np),
+							      "clkreq", GPIOD_ASIS, "CLKREQ#");
+			if (!IS_ERR_OR_NULL(gpio) && !gpiod_cansleep(gpio))
+				port->clkreq_gpio = gpio;
+		}
+		port->saved_msimap = devm_kcalloc(dev, pcie->nvecs, sizeof(*port->saved_msimap),
+						  GFP_KERNEL);
+		if (!port->saved_msimap)
+			return;
+
+		snprintf(res_name, sizeof(res_name), "port%d", port->idx);
+		port_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, res_name);
+		for (i = 0; i < ARRAY_SIZE(names); i++) {
+			struct resource *res = i ? cfg : port_res;
+			struct apple_tunable *t;
+
+			if (!res)
+				continue;
+			t = devm_apple_tunable_parse(dev, port->np, names[i], res);
+			if (!IS_ERR(t))
+				port->sleep_tables[i] = t;
+		}
+		port->sleep_dart = apple_pcie_t8132_port_dart(port);
+	}
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		for (i = 0; i < ARRAY_SIZE(names); i++) {
+			if (!port->sleep_tables[i] && port0)
+				port->sleep_tables[i] = port0->sleep_tables[i];
+		}
+	}
+
+	pcie->t8132_sleep = true;
+	dev_info(dev, "T8132 multi-port deep sleep recovery registered\n");
+}
+
+static int apple_pcie_t8132_suspend_noirq(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	int i;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->sleep_dart)
+			port->sleep_dart = apple_pcie_t8132_port_dart(port);
+		apple_pcie_port_disable_irq(port);
+		port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
+		port->saved_appclk = apple_pcie_port_readl(port, PORT_APPCLK);
+		port->saved_msicfg = apple_pcie_port_readl(port, PORT_MSICFG);
+		port->saved_msibase = apple_pcie_port_readl(port, PORT_MSIBASE);
+		port->saved_msiaddr = apple_pcie_port_readl(port, pcie->hw->port_msiaddr);
+		port->saved_msiaddr_hi = apple_pcie_port_readl(port, pcie->hw->port_msiaddr_hi);
+		for (i = 0; i < port->sid_map_sz; i++)
+			port->saved_rid2sid[i] =
+				apple_pcie_port_readl(port, port_rid2sid_offset(port, i));
+		for (i = 0; i < pcie->nvecs; i++)
+			port->saved_msimap[i] =
+				apple_pcie_port_readl(port, pcie->hw->port_msimap + 4 * i);
+	}
+
+	pcie->t8132_sleep_down = true;
+	device_set_awake_path(pcie->dev);
+	return 0;
+}
+
+static int apple_pcie_t8132_port_restore(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	static const struct apple_pcie_reset_reg defaults[] = {
+		{ 0x088, 0x00000110 }, { 0x100, 0xffffffff }, { 0x148, 0xffffffff },
+		{ 0x210, 0xffffffff }, { 0x080, 0x00000000 }, { 0x084, 0x00000000 },
+		{ 0x104, 0xffffffff }, { 0x124, 0x00000100 }, { 0x16c, 0x00000000 },
+		{ 0x13c, 0x00000010 }, { 0x800, 0x00100100 }, { 0x808, 0x001000ff },
+		{ 0x82c, 0x00000000 }, { 0x130, 0x03000000 }, { 0x140, 0x00000010 },
+		{ 0x144, 0x00253770 }, { 0x21c, 0x00000000 }, { 0x834, 0x00000000 },
+		{ 0x83c, 0x00000000 },
+	};
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	void __iomem *dbi = pcie->cfg->win + ((resource_size_t)port->idx << 15);
+	int speed = of_pci_get_max_link_speed(port->np);
+	struct pci_dev *rp;
+	u32 val;
+	int i, ret;
+
+	ret = gpiod_direction_output(port->perst_gpio, 1);
+	if (ret)
+		return ret;
+	if (port->clkreq_gpio) {
+		ret = gpiod_direction_input(port->clkreq_gpio);
+		if (ret)
+			return ret;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(defaults); i++)
+		apple_pcie_port_writel(port, defaults[i].value, defaults[i].offset);
+	if (port->sleep_tables[0])
+		apple_tunable_apply(port->base, port->sleep_tables[0]);
+
+	apple_pcie_port_rmw_set(port, PORT_APPCLK_EN, PORT_APPCLK);
+
+	rmw_clear(PHY_LANE_CFG_REFCLK0REQ | PHY_LANE_CFG_REFCLK1REQ,
+		  port->phy + PHY_LANE_CFG);
+	rmw_set(PHY_LANE_CFG_REFCLK0REQ, port->phy + PHY_LANE_CFG);
+	ret = readl_poll_timeout(port->phy + PHY_LANE_CFG, val,
+				 val & PHY_LANE_CFG_REFCLK0ACK, 100, NEO_PHY_POLL_US);
+	if (ret)
+		return ret;
+	rmw_set(PHY_LANE_CFG_REFCLK1REQ, port->phy + PHY_LANE_CFG);
+	ret = readl_poll_timeout(port->phy + PHY_LANE_CFG, val,
+				 val & PHY_LANE_CFG_REFCLK1ACK, 100, NEO_PHY_POLL_US);
+	if (ret)
+		return ret;
+	rmw_clear(PHY_LANE_CFG_REFBUF_OFF, port->phy + PHY_LANE_CFG);
+	rmw_set(BIT(9), port->phy + PHY_LANE_CFG);
+	rmw_set(BIT(10), port->phy + PHY_LANE_CFG);
+
+	apple_pcie_port_rmw_set(port, PORT_PERST_OFF, pcie->hw->port_perst);
+	ret = readl_poll_timeout(port->base + PORT_STATUS, val,
+				 val & PORT_STATUS_READY, 100, NEO_RC_POLL_US);
+	if (ret)
+		return ret;
+
+	val = apple_pcie_port_readl(port, PORT_APPCLK);
+	apple_pcie_port_writel(port, (val & ~PORT_APPCLK_CGDIS) |
+			       (port->saved_appclk & PORT_APPCLK_CGDIS), PORT_APPCLK);
+	rmw_set(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
+	ret = readl_poll_timeout(port->base + PORT_LINKSTS, val,
+				 !(val & PORT_LINKSTS_BUSY), 100, NEO_RC_POLL_US);
+	if (ret)
+		return ret;
+
+	rmw_set(NEO_DBI_RO_WR_EN, dbi + NEO_DBI_RO_WR);
+	for (i = 1; i < ARRAY_SIZE(port->sleep_tables); i++) {
+		if (port->sleep_tables[i])
+			apple_tunable_apply(dbi, port->sleep_tables[i]);
+	}
+	if (speed > 0 && speed <= 4) {
+		val = readl(dbi + NEO_DBI_CAP_LNKCAP);
+		writel((val & ~PCI_EXP_LNKCAP_SLS) | speed, dbi + NEO_DBI_CAP_LNKCAP);
+		val = readl(dbi + NEO_DBI_CAP_LNKCAP2);
+		writel((val & ~NEO_DBI_LNKCAP2_SLS) |
+		       FIELD_PREP(NEO_DBI_LNKCAP2_SLS, (1 << speed) - 1),
+		       dbi + NEO_DBI_CAP_LNKCAP2);
+		writew((readw(dbi + NEO_DBI_CAP_LNKCTL2) & ~PCI_EXP_LNKCTL2_TLS) | speed,
+		       dbi + NEO_DBI_CAP_LNKCTL2);
+		rmw_set(NEO_DBI_SPEED_CHANGE, dbi + NEO_DBI_WIDTH_SPEED_CONTROL);
+	}
+	val = readl(dbi + NEO_DBI_PORT_LINK_CONTROL) & ~NEO_DBI_PORT_LINK_MODE;
+	writel(val | FIELD_PREP(NEO_DBI_PORT_LINK_MODE, 1), dbi + NEO_DBI_PORT_LINK_CONTROL);
+	val = readl(dbi + NEO_DBI_WIDTH_SPEED_CONTROL) & ~NEO_DBI_LINK_WIDTH;
+	writel(val | FIELD_PREP(NEO_DBI_LINK_WIDTH, 1), dbi + NEO_DBI_WIDTH_SPEED_CONTROL);
+	val = readl(dbi + NEO_DBI_CAP_LNKCAP) & ~PCI_EXP_LNKCAP_MLW;
+	writel(val | FIELD_PREP(PCI_EXP_LNKCAP_MLW, 1), dbi + NEO_DBI_CAP_LNKCAP);
+	rmw_clear(NEO_DBI_RO_WR_EN, dbi + NEO_DBI_RO_WR);
+
+	apple_pcie_port_writel(port, port->saved_msicfg & ~PORT_MSICFG_EN, PORT_MSICFG);
+	for (i = 0; i < port->sid_map_sz; i++)
+		apple_pcie_rid2sid_write(port, i, port->saved_rid2sid[i]);
+	for (i = 0; i < pcie->nvecs; i++)
+		apple_pcie_port_writel(port, port->saved_msimap[i],
+				       pcie->hw->port_msimap + 4 * i);
+	apple_pcie_port_writel(port, port->saved_msibase, PORT_MSIBASE);
+	apple_pcie_port_writel(port, port->saved_msiaddr, pcie->hw->port_msiaddr);
+	apple_pcie_port_writel(port, port->saved_msiaddr_hi, pcie->hw->port_msiaddr_hi);
+	apple_pcie_port_writel(port, port->saved_msicfg, PORT_MSICFG);
+
+	if (port->sleep_dart) {
+		ret = apple_dart_host_resume(port->sleep_dart);
+		if (ret)
+			return ret;
+	}
+
+	rp = pci_get_slot(bridge->bus, PCI_DEVFN(port->idx, 0));
+	if (rp) {
+		pci_restore_state(rp);
+		pci_dev_put(rp);
+	}
+
+	msleep(100);
+	ret = gpiod_set_value(port->perst_gpio, 0);
+	if (ret)
+		return ret;
+	msleep(100);
+
+	apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+	ret = readl_poll_timeout(port->base + PORT_LINKSTS, val,
+				 val & PORT_LINKSTS_UP, 1000, 500000);
+	if (ret)
+		return ret;
+	msleep(100);
+
+	apple_pcie_port_writel(port, ~0U, PORT_INTSTAT);
+	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+	apple_pcie_port_enable_irq(port);
+	return 0;
+}
+
+static int apple_pcie_t8132_resume_noirq(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	bool any_up = false;
+	int ret, last_err = 0;
+
+	if (!pcie->t8132_sleep_down)
+		return 0;
+	pcie->t8132_sleep_down = false;
+
+	if (!pm_resume_via_firmware()) {
+		list_for_each_entry(port, &pcie->ports, entry)
+			apple_pcie_port_enable_irq(port);
+		return 0;
+	}
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		ret = apple_pcie_t8132_port_restore(pcie, port);
+		if (ret) {
+			dev_err(pcie->dev, "port %d: deep sleep restore failed: %d\n",
+				port->idx, ret);
+			last_err = ret;
+			continue;
+		}
+		any_up = true;
+		dev_info(pcie->dev, "port %d: link restored after deep sleep\n", port->idx);
+	}
+
+	if (any_up) {
+		apple_sleep_radio_port_up();
+		return 0;
+	}
+	return last_err;
+}
+
 #include "pcie-apple-radio.c"
 
 /*
@@ -5959,6 +6281,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		pci_walk_bus(bridge->bus, apple_pcie_tunnel_keep_d0, NULL);
 	if (pcie->hw->adopt_link)
 		apple_pcie_t6050_sleep_probe(pdev, pcie);
+	apple_pcie_t8132_sleep_probe(pdev, pcie);
 
 	apple_radio_register(pdev, pcie);
 	return 0;
@@ -6926,6 +7249,8 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 		pcie->link_kept = !ret;
 		return ret;
 	}
+	if (pcie->t8132_sleep && pm_suspend_via_firmware())
+		return apple_pcie_t8132_suspend_noirq(pcie);
 	if (!pcie->hw->tunneled) {
 		if (pm_suspend_no_platform() && pcie->num_pds)
 			return apple_pcie_hold_domains(pcie);
@@ -7458,6 +7783,8 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		}
 		return ret;
 	}
+	if (pcie->t8132_sleep)
+		return apple_pcie_t8132_resume_noirq(pcie);
 	if (!pcie->hw->tunneled)
 		return 0;
 	if (pcie->resume_failed)
