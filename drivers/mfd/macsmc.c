@@ -1849,7 +1849,7 @@ static int apple_smc_suspend_noirq(struct device *dev)
 	return ret;
 }
 
-static int apple_smc_resume_noirq(struct device *dev)
+static int __apple_smc_resume_noirq(struct device *dev)
 {
 	struct apple_smc *smc = dev_get_drvdata(dev);
 	bool woken = smc->woken_done;
@@ -1891,10 +1891,35 @@ static int apple_smc_resume_noirq(struct device *dev)
 	return 0;
 }
 
+/*
+ * Once the SMC is back, the rest of the noirq resume can need it: a PCIe host sets its ports up
+ * again there, before the PCI core restores the functions behind them, and the ports' power
+ * enables are SMC GPIOs. The mailbox's interrupt is still off, so until the early resume the
+ * replies are fetched, as this driver fetches its own in its noirq callbacks. A consumer's
+ * device link orders its noirq resume after this one.
+ */
+static int apple_smc_resume_noirq(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	int ret;
+
+	ret = __apple_smc_resume_noirq(dev);
+	if (!ret)
+		apple_smc_set_polled(smc, true);
+	return ret;
+}
+
+static int apple_smc_resume_early(struct device *dev)
+{
+	apple_smc_set_polled(dev_get_drvdata(dev), false);
+	return 0;
+}
+
 static const struct dev_pm_ops apple_smc_pm_ops = {
 	.prepare = pm_sleep_ptr(apple_smc_prepare),
 	.suspend = pm_sleep_ptr(apple_smc_suspend),
 	.complete = pm_sleep_ptr(apple_smc_complete),
+	LATE_SYSTEM_SLEEP_PM_OPS(NULL, apple_smc_resume_early)
 	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_smc_suspend_noirq, apple_smc_resume_noirq)
 };
 
