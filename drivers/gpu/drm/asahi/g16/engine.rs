@@ -2400,10 +2400,11 @@ impl Firmware {
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
         let p = job.resources.render_pass(k)?;
         let pass = p.refs();
+        let heap_bytes = if cmd.cmd.layers > 1 { 0x1000 } else { 0x200 };
         geometry.layer_metadata = pass.heap_gva + if cmd.cmd.layers > 1 { 0x200 } else { 0 };
         geometry.validate_capacity(p.tpc.size as u64, p.tilemap.size as u64)?;
         job.resources
-            .set_pass_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes)?;
+            .set_pass_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes, heap_bytes)?;
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
         encode::encode_ta_for(
             self.init.abi.ta(),
@@ -2434,17 +2435,18 @@ impl Firmware {
         );
         encode::render_attachments(&mut scratch.tas[..], 0, &cmd.vertex_attachments);
         encode::render_attachments(&mut scratch.fss[..], 1, &cmd.fragment_attachments);
-        encode::fill_scene(&refs, &pass, &mut scratch.scene[..]);
-        encode::scene_render(
-            &refs,
-            &pass,
-            &[0; 4],
-            job.vm.slot,
-            target,
-            init_buffer,
-            &mut scratch.scene[..],
-        );
-        if self.slots.render_needs_full_work(k) {
+        let full_work = self.slots.render_needs_full_work(k);
+        if full_work {
+            encode::fill_scene(&refs, &pass, &mut scratch.scene[..]);
+            encode::scene_render(
+                &refs,
+                &pass,
+                &[0; 4],
+                job.vm.slot,
+                target,
+                init_buffer,
+                &mut scratch.scene[..],
+            );
             p.ta_work.write(0, &scratch.ta[..])?;
             p.fs_work.write(0, &scratch.fs[..])?;
         } else {
@@ -2463,7 +2465,19 @@ impl Firmware {
         }
         p.ta_seq.write(0, &scratch.tas[..])?;
         p.fs_seq.write(0, &scratch.fss[..])?;
-        p.scene.write(0, &scratch.scene[..])?;
+        if full_work {
+            p.scene.write(0, &scratch.scene[..])?;
+        } else {
+            let hdr = encode::scene(&refs, &pass, 0);
+            let pfx = encode::scene_prefix(&refs, job.vm.slot, target, init_buffer);
+            p.scene.write(0, &hdr)?;
+            p.scene.fill(0x80, 0, 0x280)?;
+            p.scene.write(0x300, &pfx)?;
+            p.scene.w64(0x500, refs.uma_submitted)?;
+            // Zero TA/FS internal timestamp cells and targets so recovery FS execution
+            // proof and timestamp queries can never observe stale ticks from a prior pass.
+            p.scene.fill(0x600, 0, 0x40)?;
+        }
         // One retained descriptor is shared by TA and FS; its private submitted counter
         // advances by two per pass. Reused descriptors and their pool/list bytes remain intact.
         f.uma_submitted = refs.uma_submitted;

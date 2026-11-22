@@ -282,5 +282,5 @@ mod render_encoder;
 #[allow(unused_imports)] // Includes private-tail variants rejected by the shared Mesa UAPI.
 pub(crate) use render_encoder::{
     append_fs_timestamp_copies, encode_fs, encode_fs_for, encode_ta, encode_ta_for, fill_scene,
-    initbm, render_attachments, scene, scene_render, PassRefs, RenderRefs,
+    initbm, render_attachments, scene, scene_prefix, scene_render, PassRefs, RenderRefs,
 };

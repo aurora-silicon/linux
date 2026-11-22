@@ -209,9 +209,21 @@ pub(crate) struct RenderInner {
     pub(crate) pools: PoolSet,
     pub(crate) tpc_dirty: [AtomicU64; BASE_RENDER_SLOTS],
     pub(crate) tilemap_dirty: [AtomicU64; BASE_RENDER_SLOTS],
+    pub(crate) tilemap_last: [AtomicU64; BASE_RENDER_SLOTS],
+    pub(crate) tilemap_clean: [AtomicU64; BASE_RENDER_SLOTS],
+    pub(crate) heap_dirty: [AtomicU64; BASE_RENDER_SLOTS],
     _objects: Objects,
     _bind: mmu::VmBind,
     _live: Arc<super::vm::LiveToken>,
+}
+/// Per-pass dirty and pre-cleaned WC byte spans for one render pass slot.
+#[derive(Copy, Clone)]
+pub(crate) struct PassDirty<'a> {
+    pub(crate) tpc: &'a AtomicU64,
+    pub(crate) tilemap: &'a AtomicU64,
+    pub(crate) tilemap_last: &'a AtomicU64,
+    pub(crate) tilemap_clean: &'a AtomicU64,
+    pub(crate) heap: &'a AtomicU64,
 }
 impl RenderArena {
     fn new(
@@ -233,6 +245,9 @@ impl RenderArena {
                 pools,
                 tpc_dirty: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
                 tilemap_dirty: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
+                tilemap_last: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
+                tilemap_clean: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
+                heap_dirty: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
                 _objects: objects,
                 _bind: bind.clone(),
                 _live: live.clone(),
@@ -247,6 +262,9 @@ impl RenderArena {
         }
         self.tpc_dirty[k].fetch_max(tpc, Ordering::Relaxed);
         self.tilemap_dirty[k].fetch_max(tilemap, Ordering::Relaxed);
+        self.tilemap_last[k].store(tilemap, Ordering::Relaxed);
+        self.tilemap_clean[k].store(0, Ordering::Relaxed);
+        self.heap_dirty[k].fetch_max(0x200, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -265,6 +283,9 @@ pub(crate) struct RenderExtInner {
     pub(crate) passes: KVec<PassSlot>,
     pub(crate) tpc_dirty: KVec<AtomicU64>,
     pub(crate) tilemap_dirty: KVec<AtomicU64>,
+    pub(crate) tilemap_last: KVec<AtomicU64>,
+    pub(crate) tilemap_clean: KVec<AtomicU64>,
+    pub(crate) heap_dirty: KVec<AtomicU64>,
     _objects: Objects,
     _bind: mmu::VmBind,
     _live: Arc<super::vm::LiveToken>,
@@ -282,10 +303,16 @@ impl RenderExtArena {
         let mut passes = KVec::with_capacity(count, GFP_KERNEL)?;
         let mut tpc_dirty = KVec::with_capacity(count, GFP_KERNEL)?;
         let mut tilemap_dirty = KVec::with_capacity(count, GFP_KERNEL)?;
+        let mut tilemap_last = KVec::with_capacity(count, GFP_KERNEL)?;
+        let mut tilemap_clean = KVec::with_capacity(count, GFP_KERNEL)?;
+        let mut heap_dirty = KVec::with_capacity(count, GFP_KERNEL)?;
         for k in slots.clone() {
             passes.push(PassSlot::new(&mut objects, k as u64, 1)?, GFP_KERNEL)?;
             tpc_dirty.push(AtomicU64::new(0), GFP_KERNEL)?;
             tilemap_dirty.push(AtomicU64::new(0), GFP_KERNEL)?;
+            tilemap_last.push(AtomicU64::new(0), GFP_KERNEL)?;
+            tilemap_clean.push(AtomicU64::new(0), GFP_KERNEL)?;
+            heap_dirty.push(AtomicU64::new(0), GFP_KERNEL)?;
         }
         objects.finish_private()?;
         Ok(Arc::new(
@@ -294,6 +321,9 @@ impl RenderExtArena {
                 passes,
                 tpc_dirty,
                 tilemap_dirty,
+                tilemap_last,
+                tilemap_clean,
+                heap_dirty,
                 _objects: objects,
                 _bind: bind.clone(),
                 _live: live.clone(),
@@ -359,13 +389,31 @@ pub(crate) enum PassOwnerArena {
 }
 
 impl PassOwnerArena {
-    /// Returns the pass slot and its tilemap dirty high-water mark for global slot `k`.
-    pub(crate) fn pass_and_tilemap_dirty(&self, k: usize) -> Option<(&PassSlot, &AtomicU64)> {
+    /// Returns the pass slot and its dirty/clean WC span trackers for global slot `k`.
+    pub(crate) fn pass_and_dirty(&self, k: usize) -> Option<(&PassSlot, PassDirty<'_>)> {
         match self {
-            Self::Base(arena) => Some((arena.passes.get(k)?, arena.tilemap_dirty.get(k)?)),
+            Self::Base(arena) => Some((
+                arena.passes.get(k)?,
+                PassDirty {
+                    tpc: arena.tpc_dirty.get(k)?,
+                    tilemap: arena.tilemap_dirty.get(k)?,
+                    tilemap_last: arena.tilemap_last.get(k)?,
+                    tilemap_clean: arena.tilemap_clean.get(k)?,
+                    heap: arena.heap_dirty.get(k)?,
+                },
+            )),
             Self::Ext(arena) => {
                 let idx = k.checked_sub(arena.start)?;
-                Some((arena.passes.get(idx)?, arena.tilemap_dirty.get(idx)?))
+                Some((
+                    arena.passes.get(idx)?,
+                    PassDirty {
+                        tpc: arena.tpc_dirty.get(idx)?,
+                        tilemap: arena.tilemap_dirty.get(idx)?,
+                        tilemap_last: arena.tilemap_last.get(idx)?,
+                        tilemap_clean: arena.tilemap_clean.get(idx)?,
+                        heap: arena.heap_dirty.get(idx)?,
+                    },
+                ))
             }
         }
     }
@@ -955,25 +1003,43 @@ impl Prepared {
                 .ok_or(EINVAL),
         }
     }
-    /// The dirty high-water marks (`tpc_dirty`, `tilemap_dirty`) for pass slot `k`.
-    pub(crate) fn render_pass_dirty(&self, k: usize) -> Result<(&AtomicU64, &AtomicU64)> {
+    /// The dirty high-water marks and clean prefix trackers for pass slot `k`.
+    pub(crate) fn render_pass_dirty(&self, k: usize) -> Result<PassDirty<'_>> {
         let base = self.render()?;
         if k < base.passes.len() {
-            Ok((&base.tpc_dirty[k], &base.tilemap_dirty[k]))
+            Ok(PassDirty {
+                tpc: &base.tpc_dirty[k],
+                tilemap: &base.tilemap_dirty[k],
+                tilemap_last: &base.tilemap_last[k],
+                tilemap_clean: &base.tilemap_clean[k],
+                heap: &base.heap_dirty[k],
+            })
         } else {
             let (tier, idx) = self.render_ext_for(k).ok_or(EINVAL)?;
-            Ok((&tier.tpc_dirty[idx], &tier.tilemap_dirty[idx]))
+            Ok(PassDirty {
+                tpc: &tier.tpc_dirty[idx],
+                tilemap: &tier.tilemap_dirty[idx],
+                tilemap_last: &tier.tilemap_last[idx],
+                tilemap_clean: &tier.tilemap_clean[idx],
+                heap: &tier.heap_dirty[idx],
+            })
         }
     }
-    /// Updates dirty high-water marks for pass slot `k` (base or extension).
-    pub(crate) fn set_pass_dirty(&self, k: usize, tpc: u64, tilemap: u64) -> Result {
+    /// Updates dirty high-water marks and last-used spans for pass slot `k` (base or extension).
+    pub(crate) fn set_pass_dirty(&self, k: usize, tpc: u64, tilemap: u64, heap: u64) -> Result {
         let pass = self.render_pass(k)?;
-        if tpc > pass.tpc.size as u64 || tilemap > pass.tilemap.size as u64 {
+        if tpc > pass.tpc.size as u64
+            || tilemap > pass.tilemap.size as u64
+            || heap > pass.heap.size as u64
+        {
             return Err(E2BIG);
         }
-        let (tpc_dirty, tilemap_dirty) = self.render_pass_dirty(k)?;
-        tpc_dirty.fetch_max(tpc, Ordering::Relaxed);
-        tilemap_dirty.fetch_max(tilemap, Ordering::Relaxed);
+        let dirty = self.render_pass_dirty(k)?;
+        dirty.tpc.fetch_max(tpc, Ordering::Relaxed);
+        dirty.tilemap.fetch_max(tilemap, Ordering::Relaxed);
+        dirty.tilemap_last.store(tilemap, Ordering::Relaxed);
+        dirty.tilemap_clean.store(0, Ordering::Relaxed);
+        dirty.heap.fetch_max(heap, Ordering::Relaxed);
         Ok(())
     }
     /// The arena owning render pass slot `k`.
