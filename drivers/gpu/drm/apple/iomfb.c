@@ -899,10 +899,13 @@ static void iomfb_v27_sleep_start(struct apple_dcp *dcp,
 		 rpc->data, iomfb_v27_sleep_done, rpc);
 	dcp->push_out_prefill = NULL;
 	if ((rpc->a442 || rpc->a442_key) && !rpc->oob) {
-		static const struct dcp_method_entry a442 = {
-			.name = "v27_a442", .tag = { 'A', '4', '4', '2' },
-		};
+		struct dcp_method_entry a442 = { .name = "v27_a442" };
 		u8 in[92];
+
+		if (iomfb_v27_tag(dcp->v27_methods, "A442", a442.tag)) {
+			dev_warn_once(dcp->dev, "skipping v27 wake A442: unmapped method tag\n");
+			return;
+		}
 
 		memset(in, 0xaa, sizeof(in));
 		memset(in, 0, 16);
@@ -911,6 +914,9 @@ static void iomfb_v27_sleep_start(struct apple_dcp *dcp,
 		if (rpc->a442_key) {
 			memset(in + 80, 0, 12);
 			in[84] = 0x20;
+		} else if (iomfb_v27_methods_renumbered(dcp->v27_methods)) {
+			/* 27.2 reads the filler as an index count and a block size. */
+			memset(in + 16, 0, sizeof(in) - 16);
 		}
 		dcp_push(dcp, true, &a442, sizeof(in), 4100, in, iomfb_v27_a442_done, NULL);
 	}
@@ -988,6 +994,9 @@ int iomfb_v27_sleep_plain(struct apple_dcp *dcp, bool on)
 
 static int iomfb_v27_rpc(struct apple_dcp *dcp, bool a500, bool on, bool flags)
 {
+	struct dcp_method_entry method = {
+		.name = a500 ? "v27_sleep_500" : "v27_sleep_power",
+	};
 	struct iomfb_v27_sleep_rpc *rpc;
 	u8 args[IOMFB_V27_SLEEP_ARGS];
 	int ret;
@@ -998,6 +1007,9 @@ static int iomfb_v27_rpc(struct apple_dcp *dcp, bool a500, bool on, bool flags)
 	    (a500 || flags ? iomfb_v27_sleep_args(dcp, a500, args) :
 			     iomfb_v27_display_args(dcp, false, args)))
 		return -EOPNOTSUPP;
+	ret = iomfb_v27_tag(dcp->v27_methods, a500 ? "A500" : "A484", method.tag);
+	if (ret)
+		return ret;
 	rpc = kzalloc_obj(*rpc);
 	if (!rpc)
 		return -ENOMEM;
@@ -1006,10 +1018,7 @@ static int iomfb_v27_rpc(struct apple_dcp *dcp, bool a500, bool on, bool flags)
 	rpc->status = ~0U;
 	rpc->transaction.start = iomfb_v27_sleep_start;
 	rpc->transaction.release = iomfb_v27_sleep_release;
-	rpc->method = (struct dcp_method_entry) {
-		.name = a500 ? "v27_sleep_500" : "v27_sleep_power",
-	};
-	memcpy(rpc->method.tag, a500 ? "A500" : "A484", 4);
+	rpc->method = method;
 	/*
 	 * Off, before each DCP's and DCPEXT's sleep idle: A484 with the sleep's flags, then
 	 * A500's sleep form. On, after the wake: A500's wake form, then A484 with the flags.
@@ -1081,6 +1090,7 @@ int iomfb_v27_sleep_a115(struct apple_dcp *dcp, bool awake)
 static int iomfb_v27_call(struct apple_dcp *dcp, const char *tag, const void *in,
 			  u32 in_len, u32 out_len, bool inout, u8 a442_key)
 {
+	struct dcp_method_entry method = { .name = "v27_display_stage" };
 	struct iomfb_v27_sleep_rpc *rpc;
 	int ret;
 
@@ -1088,6 +1098,9 @@ static int iomfb_v27_call(struct apple_dcp *dcp, const char *tag, const void *in
 	    dcp->fw_compat != DCP_FIRMWARE_V_27_0 || in_len > sizeof(rpc->data) ||
 	    (inout && out_len > sizeof(rpc->data)))
 		return -EOPNOTSUPP;
+	ret = iomfb_v27_tag(dcp->v27_methods, tag, method.tag);
+	if (ret)
+		return ret;
 	rpc = kzalloc_obj(*rpc);
 	if (!rpc)
 		return -ENOMEM;
@@ -1097,8 +1110,7 @@ static int iomfb_v27_call(struct apple_dcp *dcp, const char *tag, const void *in
 	rpc->any_reply = true;
 	rpc->transaction.start = iomfb_v27_sleep_start;
 	rpc->transaction.release = iomfb_v27_sleep_release;
-	rpc->method = (struct dcp_method_entry) { .name = "v27_display_stage" };
-	memcpy(rpc->method.tag, tag, 4);
+	rpc->method = method;
 	rpc->input = in_len;
 	rpc->output = out_len;
 	rpc->inout = inout;
