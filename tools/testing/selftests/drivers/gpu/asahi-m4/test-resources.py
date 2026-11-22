@@ -892,6 +892,43 @@ pub mod g16 {
         assert!(!s.stage_and_take_scrubs(true).run());
         assert!(!s.scrubbing_active());
     }
+    #[test]fn multi_unit_compute_horizon_claims_publish_retire_and_release(){
+        use crate::g16::{hw, slots::ComputeSlot, resources::ComputeArena, vm};
+        use crate::sync::Arc;
+        let mut o=Objects::new();
+        let mut units=KVec::new();
+        for k in 0..hw::sizes::COMPUTE_UNITS {
+            units.push(ComputeSlot::new(&mut o,k as u64).unwrap(),0).unwrap();
+        }
+        let prep=ComputeArena{compute:units,render:None};
+        let a=Arc::new(vm::VmState{id:1,slot:1,generation:1,vm:()},0).unwrap();
+        let mut s=Slots::new().unwrap();
+        assert_eq!(s.free_compute_in(hw::sizes::COMPUTE_UNITS),hw::sizes::COMPUTE_UNITS as u32);
+        // Claim 4 units into one Claims for a compute horizon, publish, and retire in order.
+        let mut claims=Claims::new();
+        for i in 0..4 {
+            let k=s.claim_compute_for(&prep,&mut claims,Some(a.id)).unwrap().expect("free unit");
+            assert_eq!(k,i);
+            assert_eq!(claims.slot_count,(i+1) as u32);
+            assert_eq!(claims.slot[i],k as u32);
+        }
+        assert_eq!(s.free_compute_in(hw::sizes::COMPUTE_UNITS),(hw::sizes::COMPUTE_UNITS-4) as u32);
+        s.hold_vm(&claims,&a).unwrap();
+        s.hold_arenas(&claims,&prep);
+        s.publish(&claims).unwrap();
+        assert_eq!(s.compute_published(),4);
+        s.retire(&mut claims).unwrap();
+        assert_eq!(s.compute_published(),0);
+        // Unit 3 (the newest retired) holds the displacement slot; 15 units remain free.
+        assert_eq!(s.free_compute_in(hw::sizes::COMPUTE_UNITS),(hw::sizes::COMPUTE_UNITS-1) as u32);
+        // Claiming all remaining free units then releasing restores availability cleanly.
+        let mut batch=Claims::new();
+        while s.claim_compute_for(&prep,&mut batch,Some(a.id)).unwrap().is_some() {}
+        assert_eq!(batch.slot_count as usize,hw::sizes::COMPUTE_UNITS-1);
+        assert_eq!(s.free_compute_in(hw::sizes::COMPUTE_UNITS),0);
+        s.release(&mut batch);
+        assert_eq!(s.free_compute_in(hw::sizes::COMPUTE_UNITS),(hw::sizes::COMPUTE_UNITS-1) as u32);
+    }
 
 }
 '''

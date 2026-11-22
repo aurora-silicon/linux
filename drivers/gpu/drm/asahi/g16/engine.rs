@@ -170,10 +170,11 @@ pub(crate) struct Flight {
     pub(crate) fs_start: u32,
     /// Channel producers (TA, FS, compute) after the prefix's records.
     pub(crate) rec: [u32; 3],
-    /// Compute member j's FW stamp target, and the FS target it waits on directly (0: none):
-    /// its predecessors in the prefix (for the compute-hang check).
+    /// Compute member j's FW stamp target, the FS target it waits on directly (0: none), and
+    /// its private UMA counter value after publication.
     pub(crate) cstamp: [u32; sizes::COMPUTE_SLOTS],
     pub(crate) cwait: [u32; sizes::COMPUTE_SLOTS],
+    pub(crate) csubmitted: [u64; sizes::COMPUTE_SLOTS],
     /// Compute slots, pass slots and clustering buffers it holds.
     pub(crate) claims: Claims,
     /// A kill or recovery ended this prefix's VM: later prefixes of it fail with EIO.
@@ -220,6 +221,7 @@ impl Flight {
             rec: [0; 3],
             cstamp: [0; sizes::COMPUTE_SLOTS],
             cwait: [0; sizes::COMPUTE_SLOTS],
+            csubmitted: [0; sizes::COMPUTE_SLOTS],
             claims: Claims::new(),
             doomed: false,
             uma_submitted: 0,
@@ -668,7 +670,10 @@ impl Firmware {
             .flights
             .iter_mut()
             .find(|f| match event {
-                15 => f.computes != 0 && f.target == target,
+                15 => {
+                    f.computes != 0
+                        && f.cstamp[..(f.computes as usize).min(f.cstamp.len())].contains(&target)
+                }
                 0x70 => f.renders != 0 && f.ta_target == target,
                 0x71 => f.renders != 0 && f.fs_target == target,
                 _ => false,
@@ -1097,7 +1102,7 @@ impl Firmware {
                         };
                         waits_class(super::command::COMPUTE) || waits_class(super::command::RENDER)
                     });
-                let compute_count = e.flights.iter().filter(|f| f.computes != 0).count();
+                let compute_count: usize = e.flights.iter().map(|f| f.computes as usize).sum();
                 !waits_for_timestamps
                     && compute_count < params::compute_flights()
                     && !self.slots.compute_exhausted()
@@ -1137,29 +1142,42 @@ impl Firmware {
         if job.queue.completed[other].load(Ordering::Acquire) >= last {
             return Ok(None);
         }
-        for flight in &self.engine.flights {
-            if !Arc::ptr_eq(&flight.job.queue, &job.queue) {
-                continue;
-            }
-            if other == super::command::COMPUTE && flight.computes != 0 {
-                for member in 0..flight.count {
-                    if flight
-                        .job
-                        .command_order((flight.first + member) as u32)
-                        .is_some_and(|fo| fo.sequence == last)
-                    {
+        if other == super::command::COMPUTE {
+            for flight in &self.engine.flights {
+                if flight.computes == 0 || !Arc::ptr_eq(&flight.job.queue, &job.queue) {
+                    continue;
+                }
+                let mut member = 0usize;
+                for k in flight.first..flight.first + flight.count {
+                    if flight.job.command_order(k as u32).is_some_and(|fo| {
+                        fo.engine == super::command::COMPUTE && fo.sequence == last
+                    }) {
                         return Ok(Some(*flight.cstamp.get(member).ok_or(EAGAIN)?));
                     }
+                    member += 1;
                 }
-            } else if other == super::command::RENDER && flight.renders != 0 {
-                for member in 0..flight.count {
-                    if flight
-                        .job
-                        .command_order((flight.first + member) as u32)
-                        .is_some_and(|fo| fo.sequence == last)
-                    {
-                        return Ok(Some(flight.fs_target));
+                for j2 in flight.group.iter() {
+                    for k in 0..j2.progress.count() {
+                        if j2.command_order(k).is_some_and(|fo| {
+                            fo.engine == super::command::COMPUTE && fo.sequence == last
+                        }) {
+                            return Ok(Some(*flight.cstamp.get(member).ok_or(EAGAIN)?));
+                        }
+                        member += 1;
                     }
+                }
+            }
+            return Err(EAGAIN);
+        }
+        for flight in &self.engine.flights {
+            if flight.renders == 0 || !Arc::ptr_eq(&flight.job.queue, &job.queue) {
+                continue;
+            }
+            for k in flight.first..flight.first + flight.count {
+                if flight.job.command_order(k as u32).is_some_and(|fo| {
+                    fo.engine == super::command::RENDER && fo.sequence == last
+                }) {
+                    return Ok(Some(flight.fs_target));
                 }
             }
         }
@@ -1253,7 +1271,7 @@ impl Firmware {
     fn publish_prefix(
         &mut self,
         job: &Arc<Job>,
-        done: &mut Completions,
+        _done: &mut Completions,
         pending_rings: &mut u8,
     ) -> core::result::Result<(), PublicationError> {
         let mut f = Flight::new(job.clone());
@@ -1261,12 +1279,10 @@ impl Firmware {
         let result = self.publish_prefix_into(job, &mut f, &mut visible, pending_rings);
         match result {
             Err(e) if !visible => {
-                // Never published: its storage is free again, and horizon jobs taken into it
-                // fail with it.
+                // Never published: its storage is free again. Horizon candidates are removed
+                // from `pending` only after visibility begins, so they remain untouched here.
                 self.slots.release(&mut f.claims);
-                for j2 in f.group.iter() {
-                    complete(done, j2, Err(e));
-                }
+                f.group.clear();
                 Err(PublicationError::Unpublished(e))
             }
             Err(e) => Err(PublicationError::Uncertain(e)),
@@ -1370,6 +1386,7 @@ impl Firmware {
         if prefix.c_head >= 256 || prefix.ta_head >= 256 || prefix.fs_head >= 256 {
             return Err(super::boot::eproto());
         }
+        let mut c_read = prefix.c_head;
         if class_behind {
             if render {
                 let ta_read = self.graph.render.qstate[0].r32(qstate::READ)?;
@@ -1385,9 +1402,9 @@ impl Firmware {
                 }
             } else {
                 // Room for an optional cross-engine barrier plus compute work entry.
-                let read = self.graph.compute.qstate.r32(qstate::READ)?;
-                if read >= 256
-                    || prefix.c_head.wrapping_sub(read) % sizes::QUEUE_CAP >= sizes::QUEUE_CAP - 3
+                c_read = self.graph.compute.qstate.r32(qstate::READ)?;
+                if c_read >= 256
+                    || prefix.c_head.wrapping_sub(c_read) % sizes::QUEUE_CAP >= sizes::QUEUE_CAP - 3
                 {
                     return Err(EAGAIN);
                 }
@@ -1396,8 +1413,115 @@ impl Firmware {
         f.c_start = prefix.c_head;
         f.ta_start = prefix.ta_head;
         f.fs_start = prefix.fs_head;
+        let mut end = index + 1;
+        let mut hz_stop: Option<usize> = None;
         match cmd {
-            Command::Compute(c) => self.prefix_compute(job, c, &mut prefix, f, false)?,
+            Command::Compute(c) => {
+                self.prefix_compute(job, &job.resources, index, c, &mut prefix, f, false)?;
+                let mut last_seq = job.command_order(index).map(|o| o.sequence);
+                let vm_units = job.resources.compute_units()?.min(sizes::COMPUTE_UNITS);
+                let free_c = self.slots.free_compute_in(vm_units) as usize;
+                let active_computes: usize =
+                    self.engine.flights.iter().map(|fl| fl.computes as usize).sum();
+                let used = prefix.c_head.wrapping_sub(c_read) % sizes::QUEUE_CAP;
+                let ring_more = (sizes::QUEUE_CAP.saturating_sub(3)).saturating_sub(used) as usize;
+                let mut more_slots = free_c
+                    .min(params::compute_flights().saturating_sub(active_computes + 1))
+                    .min(sizes::COMPUTE_SLOTS.saturating_sub(1))
+                    .min(ring_more);
+                // Fold trailing barrier-free compute commands of the base job first.
+                while more_slots > 0 && end < job.progress.count() {
+                    let Some(next_seq) = last_seq.and_then(|s| s.checked_add(1)) else {
+                        break;
+                    };
+                    if !job.can_fold_horizon_cmd(end, next_seq)
+                        || super::recovery::logic::next_ordinal(prefix.n).is_none()
+                    {
+                        break;
+                    }
+                    let Some(Command::Compute(c2)) = command(job, end) else {
+                        break;
+                    };
+                    self.prefix_compute(job, &job.resources, end, c2, &mut prefix, f, false)?;
+                    last_seq = Some(next_seq);
+                    end += 1;
+                    more_slots -= 1;
+                }
+                // Compute horizon: fold subsequent ready, barrier-free compute-only jobs of
+                // the same queue and VM into the same CDM producer advance and doorbell.
+                // Any non-qualifying job of this queue ends the scan so no later job overtakes it.
+                if end == job.progress.count() {
+                    hz_stop = Some(0);
+                    let mut idx = 0;
+                    while idx < self.engine.pending.len() {
+                        let j2 = self.engine.pending[idx].clone();
+                        idx += 1;
+                        if Arc::ptr_eq(&j2, job) || !Arc::ptr_eq(&j2.queue, &job.queue) {
+                            continue;
+                        }
+                        if 1 + f.group.len() >= sizes::HORIZON_JOBS as usize {
+                            hz_stop = Some(1);
+                            break;
+                        }
+                        let n2 = j2.progress.count();
+                        let Some(first_seq) = last_seq.and_then(|s| s.checked_add(1)) else {
+                            hz_stop = Some(3);
+                            break;
+                        };
+                        if !Arc::ptr_eq(&j2.vm, &job.vm)
+                            || j2.progress.sent() != 0
+                            || n2 == 0
+                            || !j2.can_fold_horizon_job(first_seq)
+                        {
+                            hz_stop = Some(3);
+                            break;
+                        }
+                        let n2_usize = n2 as usize;
+                        if n2_usize > more_slots {
+                            hz_stop = Some(2);
+                            break;
+                        }
+                        let mut test_n = prefix.n;
+                        let mut ord_ok = true;
+                        for _ in 0..n2 {
+                            match super::recovery::logic::next_ordinal(test_n) {
+                                Some(next) => test_n = next,
+                                None => {
+                                    ord_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !ord_ok {
+                            hz_stop = Some(2);
+                            break;
+                        }
+                        if f.group.reserve(1, GFP_NOWAIT).is_err() {
+                            hz_stop = Some(1);
+                            break;
+                        }
+                        for k in 0..n2 {
+                            match command(&j2, k).ok_or(EINVAL)? {
+                                Command::Compute(c2) => {
+                                    self.prefix_compute(
+                                        &j2,
+                                        &job.resources,
+                                        k,
+                                        c2,
+                                        &mut prefix,
+                                        f,
+                                        false,
+                                    )?;
+                                }
+                                Command::Render(_) => return Err(EINVAL),
+                            }
+                        }
+                        last_seq = Some(first_seq + u64::from(n2 - 1));
+                        more_slots -= n2_usize;
+                        let _ = f.group.push_within_capacity(j2);
+                    }
+                }
+            }
             Command::Render(r) => {
                 let geometry = Geometry::new(&r.cmd, 0);
                 let n = job.resources.render_passes()?;
@@ -1422,7 +1546,7 @@ impl Firmware {
             }
         }
         f.first = index as usize;
-        f.count = 1;
+        f.count = (end - index) as usize;
         f.computes = prefix.computes;
         f.renders = prefix.renders;
         f.target = prefix.last_ct;
@@ -1468,11 +1592,13 @@ impl Firmware {
                 self.graph.render.threshold.w32(0, prefix.draw as u32)?;
                 self.graph.render.threshold.w32(8, prefix.draw as u32)?;
             } else {
-                let k = f.claims.slot[0] as usize;
-                job.resources
-                    .compute_unit(k)?
-                    .counter
-                    .w64(0, f.uma_submitted)?;
+                for m in 0..f.claims.slot_count as usize {
+                    let k = f.claims.slot[m] as usize;
+                    job.resources
+                        .compute_unit(k)?
+                        .counter
+                        .w64(0, f.csubmitted[m])?;
+                }
                 self.graph.compute.threshold.w32(0, prefix.n as u32)?;
             }
             wmb();
@@ -1568,8 +1694,34 @@ impl Firmware {
                 self.renew_compute_deadline();
             }
         }
-        job.progress.set_sent(index + 1);
-        job.command_published(index);
+        job.progress.set_sent(end);
+        for k in index..end {
+            job.command_published(k);
+        }
+        for j2 in f.group.iter() {
+            let n2 = j2.progress.count();
+            j2.progress.set_sent(n2);
+            for k in 0..n2 {
+                j2.command_published(k);
+            }
+            self.engine.turn += 1;
+            j2.queue.turn.store(self.engine.turn, Ordering::Relaxed);
+            j2.progress.set_pending(false);
+            self.engine.pending.retain(|p| !Arc::ptr_eq(p, j2));
+        }
+        if !render {
+            let s = &mut self.engine.stats;
+            let jobs = 1 + f.group.len();
+            let bucket = (jobs - 1).min(s.hz.len() - 1);
+            s.hz[bucket] += 1;
+            if let Some(stop) = hz_stop {
+                s.hz_stop[stop] += 1;
+            }
+            if class_behind {
+                s.hz_behind += 1;
+            }
+            s.grouped = s.grouped.saturating_add(f.group.len() as u64);
+        }
         let mut flight = Flight::new(job.clone());
         core::mem::swap(&mut flight, f);
         self.engine
@@ -1587,24 +1739,34 @@ impl Firmware {
     }
 
     /// Encodes one command into its retained compute unit and appends it to the CDM ring.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Encodes one compute member into a shared flight and prefix state."
+    )]
     fn prefix_compute(
         &mut self,
         job: &Arc<Job>,
+        resources: &super::resources::Prepared,
+        cmd_index: u32,
         cmd: &ComputeCommand,
         pf: &mut Prefix,
         f: &mut Flight,
         _later_render: bool,
     ) -> Result {
+        let member = pf.computes as usize;
+        if member >= sizes::COMPUTE_SLOTS {
+            return Err(EAGAIN);
+        }
         let n = super::recovery::logic::next_ordinal(pf.n).ok_or(EOVERFLOW)?;
         let target = encode::stamp(n);
         let index = self
             .slots
-            .claim_compute_for(&job.resources, &mut f.claims, Some(job.vm.id))?
+            .claim_compute_for(resources, &mut f.claims, Some(job.vm.id))?
             .ok_or(EAGAIN)?;
         let generation = job.vm.generation;
         self.slots.hold_vm(&f.claims, &job.vm)?;
-        self.slots.hold_arenas(&f.claims, &job.resources);
-        let s = job.resources.compute_unit(index)?;
+        self.slots.hold_arenas(&f.claims, resources);
+        let s = resources.compute_unit(index)?;
         let g = &self.graph.compute;
         let before = s.counter.r64(0)?;
         let submitted = before.checked_add(1).ok_or(EOVERFLOW)?;
@@ -1680,8 +1842,7 @@ impl Firmware {
                 &w[work::compute::BODY_ACTIVE_START..work::compute::BODY_ACTIVE_END],
             )?;
         }
-        let wait_render =
-            self.cross_engine_wait(job, job.progress.sent(), super::command::RENDER)?;
+        let wait_render = self.cross_engine_wait(job, cmd_index, super::command::RENDER)?;
         if let Some(wait_fs) = wait_render {
             let bar = encode::barrier(
                 self.graph.render.fw_stamp[1].va,
@@ -1694,20 +1855,21 @@ impl Firmware {
             s.barrier.write(0, &bar)?;
         }
         f.uma_submitted = submitted;
-        f.has_timestamps = !cmd.timestamp_outputs.is_empty();
+        f.csubmitted[member] = submitted;
+        f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
         wmb();
         if let Some(wait_fs) = wait_render {
             g.ring.w64(8 * pf.c_head as usize, s.barrier.va)?;
             pf.c_head = (pf.c_head + 1) % sizes::QUEUE_CAP;
             self.engine.stats.fs2c0 += 1;
-            f.cwait[0] = wait_fs;
+            f.cwait[member] = wait_fs;
         } else {
-            f.cwait[0] = 0;
+            f.cwait[member] = 0;
         }
         g.ring.w64(8 * pf.c_head as usize, s.work.va)?;
         pf.c_head = (pf.c_head + 1) % sizes::QUEUE_CAP;
-        f.cstamp[0] = target;
-        pf.computes = 1;
+        f.cstamp[member] = target;
+        pf.computes += 1;
         pf.n = n;
         pf.last_ct = target;
         pf.prev = Prev::Compute;

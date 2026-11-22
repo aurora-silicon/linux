@@ -9,6 +9,7 @@ production = kernel_root() / 'drivers/gpu/drm/asahi/g16/engine.rs'
 source = production.read_text()
 params_src = (production.parent / 'params.rs').read_text()
 queue_src = (production.parent / 'queue.rs').read_text()
+job_src = (production.parent / 'job.rs').read_text()
 mod_src = (production.parent / 'mod.rs').read_text()
 hw_src = (production.parent / 'hw.rs').read_text()
 gpu_src = (production.parent.parent / 'gpu.rs').read_text()
@@ -40,6 +41,8 @@ assert 'Some(params::queue_limits())' in gpu_limits_fn, gpu_limits_fn
 assert 'DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES' in gpu_src
 max_queues_line = next(line for line in hw_src.splitlines() if 'const MAX_QUEUES:' in line)
 flights_line = next(line for line in hw_src.splitlines() if 'const FLIGHTS:' in line)
+assert 'const COMPUTE_SLOTS: usize = COMPUTE_UNITS;' in hw_src
+assert 'const HORIZON_JOBS: u32 = COMPUTE_UNITS as u32;' in hw_src
 
 
 harness = r'''
@@ -458,7 +461,7 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     }
 
 }
-#[derive(Copy,Clone)]struct Order{sequence:u64,wait_through:[Option<u64>;2]}
+#[derive(Copy,Clone)]struct Order{engine:usize,sequence:u64,wait_through:[Option<u64>;2]}
 struct QueueBehindJob{id:u32,vm:Arc<Vm>,queue:Arc<Queue>,progress:Progress,commands:Vec<Command>,order:Order,extra_orders:Vec<Order>,dependency:Result,resources:Resources}
 impl QueueBehindJob{
     fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}
@@ -466,7 +469,7 @@ impl QueueBehindJob{
         if self.extra_orders.is_empty(){Some(self.order)}else{self.extra_orders.get(index as usize).copied()}
     }
 }
-struct QueueBehindFlight{job:Arc<QueueBehindJob>,first:usize,count:usize,computes:u32,renders:u32,target:u32,cstamp:[u32;16],fs_target:u32,initbm:bool,has_timestamps:bool,doomed:bool,recovery_suspect:bool}
+struct QueueBehindFlight{job:Arc<QueueBehindJob>,group:Vec<Arc<QueueBehindJob>>,first:usize,count:usize,computes:u32,renders:u32,target:u32,cstamp:[u32;16],fs_target:u32,initbm:bool,has_timestamps:bool,doomed:bool,recovery_suspect:bool}
 struct QueueBehindEngine{ordinal:u64,draw:u64,flights:Vec<QueueBehindFlight>}
 struct QueueBehindSlots{compute_exhausted:bool,render_exhausted:bool,compute_available:bool,pass_available:bool}
 impl QueueBehindSlots{
@@ -497,7 +500,7 @@ mod queue_behind_scope {
         let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,render:bool|Arc::new(QueueBehindJob{
             id,vm,queue,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})}],
-            order:Order{sequence:u64::from(id),wait_through:[None,None]},
+            order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:u64::from(id),wait_through:[None,None]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,
         });
         let j1=mk(1,vm1.clone(),q1.clone(),false);
@@ -505,7 +508,7 @@ mod queue_behind_scope {
         let j_other_vm=mk(3,vm2.clone(),q1.clone(),false);
         let j_render=mk(4,vm1.clone(),q1.clone(),true);
         let mut p=QueueBehindHost{
-            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:j1,first:0,count:1,computes:1,renders:0,target:0x100,cstamp:{let mut a=[0;16];a[0]=0x100;a},fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:j1,group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
@@ -534,7 +537,7 @@ mod queue_behind_scope {
             id,vm:vm1.clone(),queue,
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Compute(ComputeCommand{query_access})],
-            order:Order{sequence:u64::from(id),wait_through:[wait_vdm,wait_cdm]},
+            order:Order{engine:command::COMPUTE,sequence:u64::from(id),wait_through:[wait_vdm,wait_cdm]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,
         });
         let timed=mk(1,q1.clone(),true,None,None);
@@ -543,7 +546,7 @@ mod queue_behind_scope {
         let no_barrier=mk(2,q1.clone(),true,None,None);
         let other_queue=mk(2,q2.clone(),true,None,Some(1));
         let p=QueueBehindHost{
-            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:timed,first:0,count:1,computes:1,renders:0,target:0x100,cstamp:{let mut a=[0;16];a[0]=0x100;a},fs_target:0,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:timed,group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],fs_target:0,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
@@ -556,11 +559,11 @@ mod queue_behind_scope {
             id:1,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Render(())],
-            order:Order{sequence:1,wait_through:[None,None]},
+            order:Order{engine:command::RENDER,sequence:1,wait_through:[None,None]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,
         });
         let pr=QueueBehindHost{
-            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:timed_render,first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x200,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:timed_render,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x200,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
@@ -575,7 +578,7 @@ mod queue_behind_scope {
         let mk=|id:u32,vm:Arc<Vm>,render:bool|Arc::new(QueueBehindJob{
             id,vm,queue:q1.clone(),progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})}],
-            order:Order{sequence:u64::from(id),wait_through:[None,None]},
+            order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:u64::from(id),wait_through:[None,None]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,
         });
         let r1=mk(1,vm1.clone(),true);
@@ -583,7 +586,7 @@ mod queue_behind_scope {
         let r_other_vm=mk(3,vm2.clone(),true);
         let c1=mk(4,vm1.clone(),false);
         let mut p=QueueBehindHost{
-            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:r1,first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x200,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x200,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
@@ -613,7 +616,7 @@ mod queue_behind_scope {
             id,vm:vm1.clone(),queue,
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
-            order:Order{sequence:seq,wait_through:wait},
+            order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:seq,wait_through:wait},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,
         });
         let r1=mk(1,q1.clone(),true,1,[None,None]);
@@ -623,8 +626,8 @@ mod queue_behind_scope {
         let c_other_q=mk(5,q2.clone(),false,1,[None,None]);
         let p=QueueBehindHost{
             engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![
-                QueueBehindFlight{job:r1,first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x500,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
-                QueueBehindFlight{job:c1.clone(),first:0,count:1,computes:1,renders:0,target:0x700,cstamp:{let mut a=[0;16];a[0]=0x700;a},fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
+                QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x500,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
+                QueueBehindFlight{job:c1.clone(),group:vec![],first:0,count:1,computes:1,renders:0,target:0x700,cstamp:{let mut a=[0;16];a[0]=0x700;a},fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
             ]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
@@ -644,11 +647,11 @@ mod queue_behind_scope {
             id:6,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:3,pending:AtomicBool::new(true)},
             commands:vec![Command::Compute(ComputeCommand{query_access:false});3],
-            order:Order{sequence:1,wait_through:[None,None]},
+            order:Order{engine:command::COMPUTE,sequence:1,wait_through:[None,None]},
             extra_orders:vec![
-                Order{sequence:1,wait_through:[None,None]},
-                Order{sequence:2,wait_through:[None,None]},
-                Order{sequence:3,wait_through:[None,None]},
+                Order{engine:command::COMPUTE,sequence:1,wait_through:[None,None]},
+                Order{engine:command::COMPUTE,sequence:2,wait_through:[None,None]},
+                Order{engine:command::COMPUTE,sequence:3,wait_through:[None,None]},
             ],
             dependency:Ok(()),resources:Resources,
         });
@@ -659,7 +662,7 @@ mod queue_behind_scope {
         cstamp[0]=0x100;cstamp[1]=0x200;cstamp[2]=0x300;
         let pm=QueueBehindHost{
             engine:QueueBehindEngine{ordinal:3,draw:1,flights:vec![
-                QueueBehindFlight{job:multi_c,first:0,count:3,computes:3,renders:0,target:0x300,cstamp,fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
+                QueueBehindFlight{job:multi_c,group:vec![],first:0,count:3,computes:3,renders:0,target:0x300,cstamp,fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
             ]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
@@ -687,7 +690,7 @@ mod queue_behind_scope {
             id:1,vm:vm1.clone(),queue:q_comp.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Compute(ComputeCommand{query_access:false})],
-            order:Order{sequence:1,wait_through:[None,None]},
+            order:Order{engine:command::COMPUTE,sequence:1,wait_through:[None,None]},
             extra_orders:vec![],
             dependency:Ok(()),resources:Resources,
         });
@@ -695,13 +698,13 @@ mod queue_behind_scope {
             id:2,vm:vm1.clone(),queue:q_rend.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Render(())],
-            order:Order{sequence:1,wait_through:[None,None]},
+            order:Order{engine:command::RENDER,sequence:1,wait_through:[None,None]},
             extra_orders:vec![],
             dependency:Ok(()),resources:Resources,
         });
         let mut p=QueueBehindHost{
             engine:QueueBehindEngine{ordinal:1,draw:0,flights:vec![QueueBehindFlight{
-                job:c_job.clone(),first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],fs_target:0,
+                job:c_job.clone(),group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],fs_target:0,
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
@@ -712,11 +715,45 @@ mod queue_behind_scope {
         assert_eq!(p.cross_engine_wait(&r_job,0,command::COMPUTE),Ok(None));
         // Symmetrically, Queue 0 compute queues directly behind Queue 1 render on the same VM.
         p.engine.flights[0]=QueueBehindFlight{
-            job:r_job,first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x200,
+            job:r_job,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],fs_target:0x200,
             initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
         };
         assert!(p.can_queue_behind(&c_job));
         assert_eq!(p.cross_engine_wait(&c_job,0,command::RENDER),Ok(None));
+    }
+    #[test]fn cross_engine_wait_and_compute_flight_cap_account_for_batched_horizon_members(){
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:2,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let mk=|id:u32,render:bool,seq:u64,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
+            id,vm:vm1.clone(),queue:q1.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
+            order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:seq,wait_through:wait},
+            extra_orders:vec![],
+            dependency:Ok(()),resources:Resources,
+        });
+        let c1=mk(1,false,1,[None,None]);
+        let c2=mk(2,false,2,[None,None]);
+        let c3=mk(3,false,3,[None,None]);
+        let r_wait_c2=mk(4,true,1,[None,Some(2)]);
+        let r_wait_c3=mk(5,true,2,[None,Some(3)]);
+        let c4=mk(6,false,4,[None,None]);
+        let mut cstamp=[0u32;16];
+        cstamp[0]=0x100;cstamp[1]=0x200;cstamp[2]=0x300;
+        let mut p=QueueBehindHost{
+            engine:QueueBehindEngine{ordinal:3,draw:0,flights:vec![QueueBehindFlight{
+                job:c1,group:vec![c2,c3],first:0,count:1,computes:3,renders:0,target:0x300,cstamp,fs_target:0,
+                initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
+            }]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+        };
+        assert_eq!(p.cross_engine_wait(&r_wait_c2,0,command::COMPUTE),Ok(Some(0x200)));
+        assert_eq!(p.cross_engine_wait(&r_wait_c3,0,command::COMPUTE),Ok(Some(0x300)));
+        // Active computes sum flight.computes: 16 batched computes saturates compute_flights().
+        assert!(p.can_queue_behind(&c4));
+        p.engine.flights[0].computes=16;
+        assert!(!p.can_queue_behind(&c4));
     }
 }
 #[allow(non_camel_case_types, deprecated)]
@@ -791,6 +828,197 @@ mod queue_limits_scope {
         assert_eq!(client_a.queues(), 0);
     }
 }
+mod compute_horizon_scope {
+    use super::{Error, Result, EAGAIN, now_ns};
+    const ENOENT: Error = Error(2);
+    const ERANGE: Error = Error(34);
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    mod command { pub const RENDER: usize = 0; pub const COMPUTE: usize = 1; }
+    #[derive(Copy, Clone)]
+    struct Order { engine: usize, sequence: u64, wait_through: [Option<u64>; 2] }
+    #[derive(Copy, Clone)]
+    enum Command { Compute(()), Render(()) }
+    mod fence {
+        use super::{Result, EAGAIN};
+        pub fn check_dependencies(inputs: &[bool]) -> Result {
+            if inputs.iter().all(|&ready| ready) { Ok(()) } else { Err(EAGAIN) }
+        }
+    }
+    struct Status(AtomicU32);
+    impl Status { fn get(&self) -> u32 { self.0.load(Ordering::Relaxed) } }
+    struct Vm { status: Status }
+    struct Queue { cancelled_compute: u64 }
+    impl Queue {
+        fn check(&self, order: &Order) -> Result {
+            if self.cancelled_compute != 0 && order.sequence >= self.cancelled_compute {
+                Err(Error(125))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    struct Progress { sent: u32, count: u32 }
+    impl Progress {
+        fn sent(&self) -> u32 { self.sent }
+        fn count(&self) -> u32 { self.count }
+    }
+    struct Job {
+        vm: Vm,
+        queue: Queue,
+        progress: Progress,
+        commands: Vec<Command>,
+        orders: Vec<Order>,
+        inputs: Vec<bool>,
+        terminal_retired: AtomicBool,
+    }
+    impl Job {
+        __CAN_FOLD_CMD__
+        __CAN_FOLD_JOB__
+    }
+    #[test]
+    fn compute_horizon_eligibility_rejects_barriers_renders_unready_fences_and_gaps() {
+        let mk = |cmds: Vec<Command>, orders: Vec<Order>, inputs: Vec<bool>, cancelled: u64| Job {
+            vm: Vm { status: Status(AtomicU32::new(0)) },
+            queue: Queue { cancelled_compute: cancelled },
+            progress: Progress { sent: 0, count: cmds.len() as u32 },
+            commands: cmds,
+            orders,
+            inputs,
+            terminal_retired: AtomicBool::new(false),
+        };
+        let ok_job = mk(
+            vec![Command::Compute(()), Command::Compute(())],
+            vec![
+                Order { engine: command::COMPUTE, sequence: 2, wait_through: [None, None] },
+                Order { engine: command::COMPUTE, sequence: 3, wait_through: [None, None] },
+            ],
+            vec![true],
+            0,
+        );
+        assert!(ok_job.can_fold_horizon_cmd(0, 2));
+        assert!(ok_job.can_fold_horizon_cmd(1, 3));
+        assert!(!ok_job.can_fold_horizon_cmd(0, 5));
+        assert!(ok_job.can_fold_horizon_job(2));
+        assert!(!ok_job.can_fold_horizon_job(3));
+
+        // Render barrier or compute barrier breaks the batch.
+        let r_bar = mk(
+            vec![Command::Compute(())],
+            vec![Order { engine: command::COMPUTE, sequence: 2, wait_through: [Some(1), None] }],
+            vec![],
+            0,
+        );
+        assert!(!r_bar.can_fold_horizon_job(2));
+        let c_bar = mk(
+            vec![Command::Compute(())],
+            vec![Order { engine: command::COMPUTE, sequence: 2, wait_through: [None, Some(1)] }],
+            vec![],
+            0,
+        );
+        assert!(!c_bar.can_fold_horizon_job(2));
+
+        // Render interleaved breaks the batch.
+        let mixed = mk(
+            vec![Command::Compute(()), Command::Render(())],
+            vec![
+                Order { engine: command::COMPUTE, sequence: 2, wait_through: [None, None] },
+                Order { engine: command::RENDER, sequence: 1, wait_through: [None, None] },
+            ],
+            vec![],
+            0,
+        );
+        assert!(!mixed.can_fold_horizon_job(2));
+
+        // Pending input fence or cancelled queue breaks the batch.
+        let unready = mk(
+            vec![Command::Compute(())],
+            vec![Order { engine: command::COMPUTE, sequence: 2, wait_through: [None, None] }],
+            vec![false],
+            0,
+        );
+        assert!(!unready.can_fold_horizon_job(2));
+        let cancelled = mk(
+            vec![Command::Compute(())],
+            vec![Order { engine: command::COMPUTE, sequence: 2, wait_through: [None, None] }],
+            vec![],
+            2,
+        );
+        assert!(!cancelled.can_fold_horizon_job(2));
+    }
+
+    mod recovery {
+        pub mod logic {
+            pub fn last_retired_target(last: &[Option<u32>; 3], event: u32, target: u32) -> bool {
+                let idx = match event { 15 => 0, 0x70 => 1, 0x71 => 2, _ => return false };
+                last[idx] == Some(target)
+            }
+        }
+    }
+    mod poll {
+        pub fn stamp_reached(_obs: u32, _own: u32, _tail: u32) -> bool { true }
+    }
+    mod work { pub mod ta { pub const TPC_BYTES: usize = 0; } }
+    fn wmb() {}
+    struct PassBuf { size: usize }
+    impl PassBuf {
+        fn r64(&self, _o: usize) -> Result<u64> { Ok(0) }
+        fn fill(&self, _o: usize, _v: u8, _n: usize) -> Result { Ok(()) }
+    }
+    struct Pass { ta_work: PassBuf, tpc: PassBuf }
+    struct Resources;
+    impl Resources { fn render_pass(&self, _k: usize) -> Result<&Pass> { Err(ENOENT) } }
+    struct RecJob { resources: Resources }
+    struct RecClaims { pass: [u32; 2] }
+    struct RecFlight {
+        job: RecJob,
+        claims: RecClaims,
+        computes: u32,
+        renders: u32,
+        target: u32,
+        ta_target: u32,
+        fs_target: u32,
+        cstamp: [u32; 16],
+        doomed: bool,
+        recovery_suspect: bool,
+        recovery_started_ns: u64,
+    }
+    struct RecEngine { flights: Vec<RecFlight>, ta_target: u32 }
+    struct RecState { last_retired: [Option<u32>; 3] }
+    struct RecFirmware { engine: RecEngine, recovery: RecState }
+    impl RecFirmware {
+        __RECOVERY_PREPARE__
+    }
+    #[test]
+    fn recovery_prepare_matches_interior_cstamp_in_batched_compute_horizon() {
+        let mut cstamp = [0u32; 16];
+        cstamp[0] = 0x100;
+        cstamp[1] = 0x200;
+        cstamp[2] = 0x300;
+        let mut fw = RecFirmware {
+            engine: RecEngine {
+                flights: vec![RecFlight {
+                    job: RecJob { resources: Resources },
+                    claims: RecClaims { pass: [0; 2] },
+                    computes: 3,
+                    renders: 0,
+                    target: 0x300,
+                    ta_target: 0,
+                    fs_target: 0,
+                    cstamp,
+                    doomed: false,
+                    recovery_suspect: false,
+                    recovery_started_ns: 0,
+                }],
+                ta_target: 0,
+            },
+            recovery: RecState { last_retired: [None; 3] },
+        };
+        assert_eq!(fw.recovery_prepare(1, 15, 0x200, [0, 0, 0x100]), Ok(()));
+        assert!(fw.engine.flights[0].doomed);
+        assert!(fw.engine.flights[0].recovery_suspect);
+        assert_eq!(fw.recovery_prepare(1, 15, 0x400, [0, 0, 0x100]), Err(ENOENT));
+    }
+}
 '''
 harness = harness.replace('__LOGIC__', str(production.parent / 'recovery/logic.rs'))
 harness = harness.replace('__USAGE__', str(production.parent.parent / 'usage.rs'))
@@ -801,6 +1029,24 @@ harness = harness.replace('__GPU_QUEUE_LIMITS_FN__', gpu_limits_fn)
 harness = harness.replace('__QUEUE_CREDIT_STRUCT__', item_in(queue_src, 'struct QueueCredit {'))
 harness = harness.replace('__QUEUE_CREDIT_IMPL__', item_in(queue_src, 'impl QueueCredit {'))
 harness = harness.replace('__QUEUE_CREDIT_DROP__', item_in(queue_src, 'impl Drop for QueueCredit {'))
+harness = harness.replace(
+    '__CAN_FOLD_CMD__',
+    item_in(job_src, 'pub(crate) fn can_fold_horizon_cmd(')
+    .replace('super::command::', 'command::')
+    .replace('super::fence::', 'fence::'),
+)
+harness = harness.replace(
+    '__CAN_FOLD_JOB__',
+    item_in(job_src, 'pub(crate) fn can_fold_horizon_job(')
+    .replace('super::command::', 'command::')
+    .replace('super::fence::', 'fence::'),
+)
+harness = harness.replace(
+    '__RECOVERY_PREPARE__',
+    item('pub(crate) fn recovery_prepare(')
+    .replace('super::recovery::', 'recovery::')
+    .replace('super::poll::', 'poll::'),
+)
 for token, declaration in {
     '__PUBLICATION_ERROR__': 'enum PublicationError {',
     '__PICK__': 'fn pick(&self)',
@@ -828,7 +1074,7 @@ for command in [rustc() + ['--edition=2021', '--test', str(unit), '-o', str(outp
     if result.returncode:
         raise SystemExit(result.returncode)
 (output/'publication.json').write_text(json.dumps({
-    'passed': True, 'tests': 57, 'cpu_only': True, 'hardware_execution': False,
+    'passed': True, 'tests': 60, 'cpu_only': True, 'hardware_execution': False,
     'scope': 'Verbatim production publication wrapper, selection, error isolation and descriptor-error containment branch; wire encoder, descriptor failure injection and transport replaced by CPU recorders.',
     'source_sha256': sha(production),
 }, indent=2)+'\n')

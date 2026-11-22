@@ -666,11 +666,18 @@ impl Firmware {
     /// ABIs with `work_ticks` leave ITS 0/0 and write them into the work object. The ITS pair
     /// is used whenever it holds an interval.
     fn compute_ticks(&self, unit: &super::slots::ComputeSlot) -> Result<(u64, u64)> {
+        Self::compute_ticks_with(self.init.abi.compute().work_ticks, unit)
+    }
+
+    fn compute_ticks_with(
+        work_ticks: Option<(usize, usize)>,
+        unit: &super::slots::ComputeSlot,
+    ) -> Result<(u64, u64)> {
         let (start, end) = (unit.its.r64(0)?, unit.its.r64(8)?);
         if start != 0 && end > start {
             return Ok((start, end));
         }
-        let Some((start_off, end_off)) = self.init.abi.compute().work_ticks else {
+        let Some((start_off, end_off)) = work_ticks else {
             return Ok((start, end));
         };
         let w = &unit.work;
@@ -831,20 +838,32 @@ impl Firmware {
             {
                 return Ok(Retirement::Pending);
             }
-            let k = f.claims.slot[0] as usize;
-            let unit = f.job.resources.compute_unit(k)?;
-            let submitted = unit.counter.r64(0)?;
-            let (start, end) = self.compute_ticks(unit)?;
-            ticks = [start, end, 0, 0];
             let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
             full &= stamp_reached(stamp, f.target, e.target)
                 && (stamp != f.target
-                    || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot)
-                && submitted != 0
-                && unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted
-                && unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va
-                && start != 0
-                && end > start;
+                    || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot);
+            let count = f.claims.slot_count as usize;
+            full &= count != 0 && count == f.computes as usize;
+            if full {
+                for m in 0..count {
+                    let k = f.claims.slot[m] as usize;
+                    let unit = f.job.resources.compute_unit(k)?;
+                    let submitted = f.csubmitted[m];
+                    let (start, end) = self.compute_ticks(unit)?;
+                    if m == 0 && count == 1 {
+                        ticks = [start, end, 0, 0];
+                    }
+                    full &= submitted != 0
+                        && unit.counter.r64(0)? == submitted
+                        && unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted
+                        && unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va
+                        && start != 0
+                        && end > start;
+                    if !full {
+                        break;
+                    }
+                }
+            }
         } else if f.computes != 0 {
             let g = &self.graph.compute;
             if g.fw_stamp.r32(0)? != f.target
@@ -852,18 +871,30 @@ impl Firmware {
             {
                 return Ok(Retirement::Pending);
             }
-            let k = f.claims.slot[0] as usize;
-            let unit = f.job.resources.compute_unit(k)?;
-            let submitted = unit.counter.r64(0)?;
-            let (start, end) = self.compute_ticks(unit)?;
-            ticks = [start, end, 0, 0];
             full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
-                && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot
-                && submitted != 0
-                && unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted
-                && unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va
-                && start != 0
-                && end > start;
+                && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot;
+            let count = f.claims.slot_count as usize;
+            full &= count != 0 && count == f.computes as usize;
+            if full {
+                for m in 0..count {
+                    let k = f.claims.slot[m] as usize;
+                    let unit = f.job.resources.compute_unit(k)?;
+                    let submitted = f.csubmitted[m];
+                    let (start, end) = self.compute_ticks(unit)?;
+                    if m == 0 && count == 1 {
+                        ticks = [start, end, 0, 0];
+                    }
+                    full &= submitted != 0
+                        && unit.counter.r64(0)? == submitted
+                        && unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted
+                        && unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va
+                        && start != 0
+                        && end > start;
+                    if !full {
+                        break;
+                    }
+                }
+            }
         }
         if f.renders != 0 && render_behind {
             let g = &self.graph.render;
@@ -1015,6 +1046,10 @@ impl Firmware {
                 self.slots.quarantine(&mut f.claims);
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
+                for j2 in f.group.iter() {
+                    self.retain(j2);
+                    complete(done, j2, Err(error));
+                }
                 self.fail_stop(error, done);
                 core::mem::forget(f);
                 return;
@@ -1041,9 +1076,20 @@ impl Firmware {
                     return;
                 }
             }
-            if let Err(error) = f.job.note_full_retirement(f.first as u32, f.count as u32) {
+            let retired_ok = (|| -> Result {
+                f.job.note_full_retirement(f.first as u32, f.count as u32)?;
+                for j2 in f.group.iter() {
+                    j2.note_full_retirement(0, j2.progress.count())?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = retired_ok {
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
+                for j2 in f.group.iter() {
+                    self.retain(j2);
+                    complete(done, j2, Err(error));
+                }
                 self.fail_stop(error, done);
                 core::mem::forget(f);
                 return;
@@ -1063,6 +1109,9 @@ impl Firmware {
             }
             self.slots.quarantine(&mut f.claims);
             self.retain(&f.job);
+            for j2 in f.group.iter() {
+                self.retain(j2);
+            }
             self.recovery.aborted_receipts = self.recovery.aborted_receipts.saturating_add(1);
         }
         if self.slots.compute_exhausted() {
@@ -1075,6 +1124,10 @@ impl Firmware {
             if let Err(error) = self.publish_timestamps(&f, &timestamp_claims) {
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
+                for j2 in f.group.iter() {
+                    self.retain(j2);
+                    complete(done, j2, Err(error));
+                }
                 self.fail_stop(error, done);
                 core::mem::forget(f);
                 return;
@@ -1085,9 +1138,27 @@ impl Firmware {
                 if let Err(error) = f.job.command_retired(index as u32) {
                     self.retain(&f.job);
                     complete(done, &f.job, Err(error));
+                    for j2 in f.group.iter() {
+                        self.retain(j2);
+                        complete(done, j2, Err(error));
+                    }
                     self.fail_stop(error, done);
                     core::mem::forget(f);
                     return;
+                }
+            }
+            for j2 in f.group.iter() {
+                for index in 0..j2.progress.count() {
+                    if let Err(error) = j2.command_retired(index) {
+                        self.retain(&f.job);
+                        complete(done, &f.job, Err(error));
+                        for j3 in f.group.iter() {
+                            self.retain(j3);
+                            complete(done, j3, Err(error));
+                        }
+                        self.fail_stop(error, done);
+                        return;
+                    }
                 }
             }
             if receipt.owner_retired() && f.renders != 0 {
@@ -1137,6 +1208,10 @@ impl Firmware {
                 if let Err(proof_error) = job.mark_terminal_retired() {
                     self.retain(&job);
                     complete(done, &job, Err(proof_error));
+                    for j2 in f.group.iter() {
+                        self.retain(j2);
+                        complete(done, j2, Err(proof_error));
+                    }
                     self.fail_stop(proof_error, done);
                     core::mem::forget(f);
                     return;
@@ -1144,29 +1219,46 @@ impl Firmware {
             }
             complete(done, &job, Err(error));
         }
-        if p.next() < p.sent() || p.sent() < p.count() {
-            return; // more of it published or still to publish
+        let job_done = p.next() >= p.sent() && p.sent() >= p.count();
+        if job_done {
+            let s = &mut self.engine.stats;
+            if result.is_ok() {
+                s.jobs += 1;
+                s.job_cmds += u64::from(p.count());
+                s.job_max = s.job_max.max(u64::from(p.count()));
+            }
+            complete(done, &job, Ok(()));
         }
-        let s = &mut self.engine.stats;
-        if result.is_ok() {
-            s.jobs += 1;
-            s.job_cmds += u64::from(p.count());
-            s.job_max = s.job_max.max(u64::from(p.count()));
-        }
-        complete(done, &job, Ok(()));
-        // The rest of a compute horizon, after the first job (fence order).
+        // Complete folded compute-horizon jobs unconditionally (even if an earlier render
+        // command of `job` is still in flight; `Timeline` preserves queue fence order).
         for j2 in f.group.iter() {
             let p2 = &j2.progress;
             p2.next.store(p2.count(), Ordering::Relaxed);
             match result {
-                Err(error) => complete(done, j2, Err(error)),
+                Err(error) => {
+                    if receipt.owner_retired()
+                        && self.engine.flights.iter().all(|other| {
+                            !Arc::ptr_eq(&other.job, j2)
+                                && other.group.iter().all(|member| !Arc::ptr_eq(member, j2))
+                        })
+                    {
+                        if let Err(proof_error) = j2.mark_terminal_retired() {
+                            self.retain(j2);
+                            complete(done, j2, Err(proof_error));
+                            self.fail_stop(proof_error, done);
+                            return;
+                        }
+                    }
+                    complete(done, j2, Err(error));
+                }
                 Ok(()) => {
+                    let s = &mut self.engine.stats;
                     s.jobs += 1;
                     s.job_cmds += u64::from(p2.count());
                     s.job_max = s.job_max.max(u64::from(p2.count()));
+                    complete(done, j2, Ok(()));
                 }
             }
-            complete(done, j2, Ok(()));
         }
     }
 
@@ -1255,6 +1347,24 @@ impl Firmware {
                 }
             }
         }
+        for member in flight.group.iter() {
+            for command in member.commands.iter() {
+                match command {
+                    super::command::Command::Compute(command) => {
+                        let index = *slots.get(compute).ok_or(EINVAL)? as usize;
+                        if !command.timestamp_outputs.is_empty() {
+                            let unit = flight.job.resources.compute_unit(index)?;
+                            let ticks = [unit.its.r64(0)?, unit.its.r64(8)?, 0, 0];
+                            command
+                                .timestamp_outputs
+                                .publish(ticks, super::hw::COMMAND_TIMESTAMP_HZ);
+                        }
+                        compute += 1;
+                    }
+                    super::command::Command::Render(_) => return Err(EINVAL),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1272,6 +1382,7 @@ impl Firmware {
         };
         let (mut lo, mut hi) = (u64::MAX, 0u64);
         let (mut first, mut last) = (u64::MAX, 0u64);
+        let work_ticks = self.init.abi.compute().work_ticks;
         let s = &mut self.engine.stats;
 
         let mut add_interval =
@@ -1343,7 +1454,9 @@ impl Firmware {
                 let Ok(c) = f.job.resources.compute_unit(f.claims.slot[k] as usize) else {
                     return;
                 };
-                stage(&c.its, 0, &mut s.cdm_ticks, crate::usage::Engine::Compute);
+                if let Ok((start, end)) = Self::compute_ticks_with(work_ticks, c) {
+                    add_interval(start, end, &mut s.cdm_ticks, crate::usage::Engine::Compute);
+                }
             }
         }
         if hi > lo {

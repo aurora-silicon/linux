@@ -317,6 +317,58 @@ impl Job {
         self.orders.get(index as usize).copied()
     }
 
+    /// Whether command `index` is a ready, barrier-free compute command continuing a compute
+    /// horizon at queue-local compute ordinal `expected`.
+    pub(crate) fn can_fold_horizon_cmd(&self, index: u32, expected: u64) -> bool {
+        if self.terminal_retired.load(Ordering::Acquire) || self.vm.status.get() != 0 {
+            return false;
+        }
+        let Some(Command::Compute(_)) = self.commands.get(index as usize) else {
+            return false;
+        };
+        let Some(order) = self.orders.get(index as usize) else {
+            return false;
+        };
+        order.engine == super::command::COMPUTE
+            && order.sequence == expected
+            && order.wait_through == [None, None]
+            && self.queue.check(order).is_ok()
+            && super::fence::check_dependencies(&self.inputs).is_ok()
+    }
+
+    /// Whether every command of this job is a ready, barrier-free compute command continuing
+    /// sequentially from `first_expected`.
+    pub(crate) fn can_fold_horizon_job(&self, first_expected: u64) -> bool {
+        let count = self.progress.count();
+        if count == 0
+            || self.progress.sent() != 0
+            || self.terminal_retired.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+            || super::fence::check_dependencies(&self.inputs).is_err()
+        {
+            return false;
+        }
+        for k in 0..count {
+            let Some(expected) = first_expected.checked_add(u64::from(k)) else {
+                return false;
+            };
+            let Some(Command::Compute(_)) = self.commands.get(k as usize) else {
+                return false;
+            };
+            let Some(order) = self.orders.get(k as usize) else {
+                return false;
+            };
+            if order.engine != super::command::COMPUTE
+                || order.sequence != expected
+                || order.wait_through != [None, None]
+                || self.queue.check(order).is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Checks the retained dependency set for each command immediately before publication.
     /// Never waits or signals fences under the device lock. The scheduler and start() have
     /// already waited; a pending fence asks the engine to defer rather than publish early.

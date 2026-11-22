@@ -673,7 +673,8 @@ pub(crate) mod sizes {
     pub(crate) const POOL_SIZE: u64 = 0x200000;
     pub(crate) const FREELIST_SEED: u32 = 8192;
     pub(crate) const QUEUE_CAP: u32 = 256;
-    pub(crate) const COMPUTE_SLOTS: usize = 2;
+    /// Compute units claimable in one batched compute prefix (matches `COMPUTE_UNITS`).
+    pub(crate) const COMPUTE_SLOTS: usize = COMPUTE_UNITS;
     /// Base render pass slots allocated on first render (full TPC/tilemap capacity).
     pub(crate) const BASE_RENDER_SLOTS: usize = 2;
     /// Retained render pass slots per VM at most (host client-VA budget: 512 MiB / 32 MiB
@@ -707,8 +708,8 @@ pub(crate) mod sizes {
     /// (it displaced the unit), so `n` units keep up to `n - 1` compute commands in flight.
     pub(crate) const COMPUTE_UNITS: usize = 16;
     const _: () = assert!(super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP);
-    /// Inherited diagnostic histogram width; M4 does not fold jobs into a compute horizon.
-    pub(crate) const HORIZON_JOBS: u32 = 1;
+    /// Maximum jobs folded into one barrier-free compute horizon prefix.
+    pub(crate) const HORIZON_JOBS: u32 = COMPUTE_UNITS as u32;
     /// Jobs admitted to the engine per logical queue: enough to keep a queue's commands
     /// in flight back to back without scheduler backpressure stalls; exact prior-command
     /// dependencies still gate each one.
