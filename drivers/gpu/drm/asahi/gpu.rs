@@ -296,6 +296,9 @@ pub(crate) struct GpuManager {
     ids: SequenceIDs,
     #[pin]
     garbage_contexts: Mutex<KVec<workqueue::RetiredContext>>,
+    /// Queue structures of invalidated contexts that a running data master may still read.
+    #[pin]
+    powered_contexts: Mutex<KVec<KVec<workqueue::RetainedObject>>>,
     #[pin]
     fault_log: SpinLock<FaultLogState>,
 }
@@ -507,6 +510,9 @@ pub(crate) trait GpuManager: Send + Sync {
     fn get_dyncfg(&self) -> &hw::DynConfig;
     /// Register an unused context, with the objects it retains, for invalidation.
     fn free_context(&self, ctx: workqueue::RetiredContext);
+    /// Release the queue structures of invalidated contexts after firmware reports that all data
+    /// masters are powered off.
+    fn fw_power_off(&self);
 }
 
 /// Private generic trait for functions that don't need to escape this module.
@@ -842,6 +848,7 @@ impl GpuManager::ver {
         {
             let mut rxc = mgr.rx_channels.lock();
             rxc.event.set_manager(mgr.clone());
+            rxc.stats.set_manager(mgr.clone());
         }
 
         Ok(mgr)
@@ -1043,6 +1050,7 @@ impl GpuManager::ver {
                 buffer_mgr,
                 ids: Default::default(),
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
+                powered_contexts <- new_mutex!(KVec::new(), "powered_contexts"),
                 fault_log <- new_spinlock!(FaultLogState::default(), "fault_log"),
             }),
             GFP_KERNEL,
@@ -1714,10 +1722,38 @@ impl GpuManager for GpuManager::ver {
                 if debug_enabled(DebugFlags::OopsOnGpuCrash) {
                     panic!("GPU firmware timed out");
                 }
+                // The invalidation did not complete, so firmware may still use every object in
+                // the context. Leaking it is the only safe recovery from this fatal condition.
+                core::mem::forget(ctx);
+                continue;
             }
-            // The firmware no longer knows the context's queues, so their structures may go now,
-            // ahead of the context data they point to.
-            core::mem::drop(ctx.retained);
+
+            // Only the queue structures can still be read after the invalidation. The context data,
+            // with the TVB buffer it holds, goes now, so a retired context costs only its queues.
+            let workqueue::RetiredContext { data, retained } = ctx;
+            core::mem::drop(data);
+
+            // Device-control completion and statistics use separate receive rings. Drain the
+            // latter under its lock before publishing this context, so a PowerOff that was
+            // already pending before invalidation cannot release it. A concurrent later
+            // PowerOff cannot be handled until after the context has been queued here.
+            let mut rxc = self.rx_channels.lock();
+            rxc.stats.poll();
+
+            let mut powered = self.powered_contexts.lock();
+            if powered.reserve(1, GFP_KERNEL).is_err() {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "Failed to reserve invalidated context, leaking it for safety.\n"
+                );
+                core::mem::forget(retained);
+                continue;
+            }
+            // This cannot fail after the successful reservation. Preserve the object even if
+            // the vector implementation ever violates that contract.
+            if let Err(err) = powered.push_within_capacity(retained) {
+                core::mem::forget(err.0);
+            }
         }
 
         let mut guard = self.alloc.lock();
@@ -2019,12 +2055,28 @@ impl GpuManager for GpuManager::ver {
     fn free_context(&self, ctx: workqueue::RetiredContext) {
         let mut garbage = self.garbage_contexts.lock();
 
-        if garbage.push(ctx, GFP_KERNEL).is_err() {
+        if garbage.reserve(1, GFP_KERNEL).is_err() {
             dev_err!(
                 self.dev.as_ref(),
-                "Failed to reserve space for freed context, deadlock possible.\n"
+                "Failed to reserve freed context, leaking it for safety.\n"
             );
+            core::mem::forget(ctx);
+            return;
         }
+        if let Err(err) = garbage.push_within_capacity(ctx) {
+            core::mem::forget(err.0);
+        }
+    }
+
+    fn fw_power_off(&self) {
+        let mut released = KVec::new();
+        core::mem::swap(&mut *self.powered_contexts.lock(), &mut released);
+        mod_dev_dbg!(
+            self.dev,
+            "Releasing {} invalidated GPU contexts after firmware PowerOff\n",
+            released.len()
+        );
+        core::mem::drop(released);
     }
 }
 
