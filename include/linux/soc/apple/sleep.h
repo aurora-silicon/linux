@@ -227,6 +227,15 @@ void apple_sleep_debug_link_cut_wake(void);
 void apple_sleep_radio_port_up(void);
 
 /*
+ * A PCIe host owns its APCIe ports across real sleep (re-clocking and retraining them itself),
+ * so apple-sleep skips its fallback unowned-port clocking on wake.
+ */
+void apple_sleep_apcie_ports_owned(bool owned);
+
+/* One APCIe port's host has that port back after a real sleep, so the next commit may stop it. */
+void apple_sleep_apcie_port_up(unsigned int idx);
+
+/*
  * T6050: from the radio host's noirq suspend, with its DART saved and gated: the port's link
  * shutdown. An error means nothing was written and the sleep must be refused.
  */
@@ -429,6 +438,14 @@ static inline void apple_sleep_debug_link_cut_wake(void)
 }
 
 static inline void apple_sleep_radio_port_up(void)
+{
+}
+
+static inline void apple_sleep_apcie_ports_owned(bool owned)
+{
+}
+
+static inline void apple_sleep_apcie_port_up(unsigned int idx)
 {
 }
 
