@@ -948,13 +948,14 @@ static void pcie_aspm_override_default_link_state(struct pcie_link_state *link)
  */
 static void pcie_clkpm_override_default_link_state(struct pcie_link_state *link)
 {
-	if (!of_have_populated_dt() || !link->clkpm_capable || link->clkpm_default)
+	if (!of_have_populated_dt() || !link->clkpm_capable ||
+	    link->clkpm_disable || link->clkpm_default)
 		return;
 	if (!pcie_link_has_aspm_override(link, "supports-clkreq"))
 		return;
 
 	link->clkpm_default = 1;
-	pci_info(link->downstream, "ASPM: default Clock PM (supports-clkreq)\n");
+	pci_dbg(link->downstream, "ASPM: default Clock PM (supports-clkreq)\n");
 }
 
 static void pcie_aspm_cap_init(struct pcie_link_state *link, int blacklist)
