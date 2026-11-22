@@ -573,7 +573,9 @@ pub mod g16 {
         assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
     }
 
-    #[test]fn eight_render_passes_and_sixteen_compute_units_are_disjoint_in_mesa_hole(){
+    #[test]fn thirty_two_render_passes_and_eighteen_compute_units_are_disjoint_in_mesa_hole(){
+        assert_eq!(g16::hw::sizes::RENDER_SLOTS, 32);
+        assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 18);
         let mut o=Objects::new();
         let pools=PoolSet::new(&mut o).unwrap();
         for k in g16::hw::sizes::BASE_PB_SLOTS as u64..g16::hw::sizes::PB_SLOTS as u64 {
@@ -803,7 +805,7 @@ pub mod g16 {
         assert_eq!(arena.render.passes[0].scene.fills.lock().unwrap().len(),2);
     }
 
-    #[test]fn pipelined_render_pass_slots_keep_fifteen_in_flight(){
+    #[test]fn pipelined_render_pass_slots_keep_thirty_one_in_flight(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
         let mut passes=KVec::new();
         for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
@@ -825,23 +827,30 @@ pub mod g16 {
         let a=vm(1);
         let b=vm(2);
         let mut live:Vec<Claims>=Vec::new();
-        // Publish 15 concurrent passes in flight (slots 0..15).
-        for k in 0..15usize {
+        // Publish 31 concurrent passes in flight (slots 0..31), exercising bit 31 on the last slot.
+        for k in 0..31usize {
             let mut c=Claims::new();
-            c.pass[0]=k as u32;c.pass_mask=1<<k;
+            c.pass[0]=k as u32;c.pass_mask=1u32<<k;
             s.claim_pass_for(&arena,k,Some(a.id)).unwrap();
             assert!(s.render_needs_full_work(k));
             s.hold_vm(&c,&a).unwrap();
             s.publish(&mut c).unwrap();
             live.push(c);
         }
-        assert_eq!(s.render_published(),15);
-        assert!(s.pass_available(16)); // slot 15 is still fresh
-        // Retire 0 and 1 -> slot 0 is displaced and reusable while 13 others remain in flight.
+        assert_eq!(s.render_published(),31);
+        assert!(s.pass_available(32)); // slot 31 is still fresh
+        assert!(!s.pass_available(31));
+        // Retire 0 and 1 -> slot 0 is displaced and reusable while 29 others remain in flight.
         s.retire(&mut live[0]).unwrap();
-        assert!(!s.pass_available(15)); // slot 0 not displaced yet
+        assert!(!s.pass_available(31)); // slot 0 not displaced yet
         s.retire(&mut live[1]).unwrap();
-        assert!(s.pass_available(15)); // slot 0 displaced by slot 1!
+        assert!(s.pass_available(31)); // slot 0 displaced by slot 1!
+        // Claim and publish bit 31 (slot 31) explicitly to prove zero 32-bit mask overflow.
+        let mut c31=Claims::new();
+        c31.pass[0]=31;c31.pass_count=1;c31.pass_mask=1u32<<31;
+        s.claim_pass_for(&arena,31,Some(a.id)).unwrap();
+        s.hold_vm(&c31,&a).unwrap();
+        s.publish(&c31).unwrap();
         // Clean same-VM reuse of displaced slot 0 does not need full work write.
         s.claim_pass_for(&arena,0,Some(a.id)).unwrap();
         assert!(!s.render_needs_full_work(0));
@@ -854,6 +863,7 @@ pub mod g16 {
         for c in live.iter_mut().skip(2) {
             s.retire(c).unwrap();
         }
+        s.retire(&mut c31).unwrap();
         assert_eq!(s.render_published(),0);
     }
 
@@ -1041,23 +1051,23 @@ pub mod g16 {
         },0).unwrap();
         let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render)};
         let a=vm(1);
-        // Wrapped submission order [14, 15, 0]: retiring in order leaves slot 0 as last_retired
-        // while slots 14 and 15 are displaced and reusable immediately.
-        let order=[14usize,15,0];
+        // Wrapped submission order [30, 31, 0]: retiring in order leaves slot 0 as last_retired
+        // while slots 30 and 31 are displaced and reusable immediately.
+        let order=[30usize,31,0];
         let mut c=Claims::new();
         for (i,&k) in order.iter().enumerate() {
             s.claim_pass_in(&prep,k,Some(a.id),0x1000).unwrap();
             c.pass[i]=k as u32;
             c.pass_count+=1;
-            c.pass_mask|=1<<k;
-            s.pass_busy|=1<<k;
+            c.pass_mask|=1u32<<k;
+            s.pass_busy|=1u32<<k;
         }
         // Mismatched pass_mask or duplicate slot is rejected by hold_vm.
         let mut bad=c;
         bad.pass_mask^=1<<1;
         assert_eq!(s.hold_vm(&bad,&a),Err(EINVAL));
         let mut dup=c;
-        dup.pass[2]=14;
+        dup.pass[2]=30;
         assert_eq!(s.hold_vm(&dup,&a),Err(EINVAL));
 
         s.hold_vm(&c,&a).unwrap();
@@ -1069,19 +1079,19 @@ pub mod g16 {
         assert_eq!(c.pass_count,0);
         assert_eq!(c.pass_mask,0);
         assert_eq!(s.pass_busy,0);
-        // Slots 14 and 15 were displaced by slot 0 (newest), so 14 & 15 are claimable while 0 is held.
+        // Slots 30 and 31 were displaced by slot 0 (newest), so 30 & 31 are claimable while 0 is held.
         assert_eq!(s.claim_pass_in(&prep,0,Some(a.id),0x1000),Err(EBUSY));
-        s.claim_pass_in(&prep,14,Some(a.id),0x1000).unwrap();
-        s.claim_pass_in(&prep,15,Some(a.id),0x1000).unwrap();
+        s.claim_pass_in(&prep,30,Some(a.id),0x1000).unwrap();
+        s.claim_pass_in(&prep,31,Some(a.id),0x1000).unwrap();
         let mut cancel=Claims::new();
-        cancel.pass[0]=14;cancel.pass[1]=15;cancel.pass_count=2;cancel.pass_mask=(1<<14)|(1<<15);
+        cancel.pass[0]=30;cancel.pass[1]=31;cancel.pass_count=2;cancel.pass_mask=(1u32<<30)|(1u32<<31);
         s.pass_busy|=cancel.pass_mask;
         s.release(&mut cancel);
         assert_eq!(cancel.pass_count,0);
         assert_eq!(s.pass_busy,0);
-        s.claim_pass_in(&prep,14,Some(a.id),0x1000).unwrap();
+        s.claim_pass_in(&prep,30,Some(a.id),0x1000).unwrap();
         let mut cancel2=Claims::new();
-        cancel2.pass[0]=14;cancel2.pass_count=1;cancel2.pass_mask=1<<14;
+        cancel2.pass[0]=30;cancel2.pass_count=1;cancel2.pass_mask=1u32<<30;
         s.release(&mut cancel2);
 
         // PoolSet::publish_batch advances submitted by 2 * renders and rejects invalid deltas.
@@ -1094,41 +1104,89 @@ pub mod g16 {
         assert!(!pools.retired_at(0,6).unwrap());
     }
 
-    #[test]fn render_burst_expands_on_overlap_multipass_or_sub2ms_burst_not_steady_60_120fps(){
-        use crate::g16::resources::should_expand_render_ext;
+    #[test]fn render_ext_tiers_grow_on_demand_and_keep_shallow_clients_bounded(){
+        use crate::g16::resources::{BASE_RENDER_SLOTS, EXT_RENDER_TIERS, target_render_slots};
+        let tier0_end = EXT_RENDER_TIERS[0].1;
+        let tier1_end = EXT_RENDER_TIERS[1].1;
+        let full_end = EXT_RENDER_TIERS[2].1;
+        assert_eq!((BASE_RENDER_SLOTS, tier0_end, tier1_end, full_end), (2, 8, 18, 32));
+
         // Steady 60 fps (16.67 ms) and 120 fps (8.33 ms) single-pass depth-1 clients
-        // finish each frame before the next arrives (active_renders == 0) and stay on
-        // the two base pass slots without allocating RenderExtArena.
+        // finish each frame before the next arrives (active_passes == 0) and stay on
+        // the two base pass slots without allocating any RenderExtArena tier.
         for period_ns in [16_666_667u64, 8_333_333u64] {
             let mut last = 0u64;
             let mut burst = 0u32;
             for step in 1u64..=10 {
-                assert!(!should_expand_render_ext(&mut last, &mut burst, step * period_ns, 1, 0, false));
+                assert_eq!(
+                    target_render_slots(&mut last, &mut burst, step * period_ns, 1, 0, false, BASE_RENDER_SLOTS),
+                    BASE_RENDER_SLOTS
+                );
                 assert_eq!(burst, 0);
             }
         }
 
-        // Heavy multi-ms pipelined renders (e.g. 5 ms and 16.6 ms apart) overlap an
-        // already-active render (active_renders >= 1) and expand immediately.
+        // A 2-pass compositor or shallow depth-2 overlap grows ONLY to Tier 0 (8 slots),
+        // never allocating Tier 1 or Tier 2 until live concurrency actually requires them.
         let mut last = 0u64;
         let mut burst = 0u32;
-        assert!(!should_expand_render_ext(&mut last, &mut burst, 1_000_000, 1, 0, false));
-        assert!(should_expand_render_ext(&mut last, &mut burst, 6_000_000, 1, 1, false));
-        assert!(should_expand_render_ext(&mut last, &mut burst, 22_600_000, 1, 1, false));
+        assert_eq!(
+            target_render_slots(&mut last, &mut burst, 100_000_000, 2, 0, false, BASE_RENDER_SLOTS),
+            tier0_end
+        );
+        // Back-to-back 2-pass frames with 2 active passes (need = 2 + 2 + 1 = 5 <= 8) stay on Tier 0.
+        assert_eq!(
+            target_render_slots(&mut last, &mut burst, 108_333_333, 2, 2, false, tier0_end),
+            tier0_end
+        );
 
-        // Sub-2 ms back-to-back single-pass bursts still expand after 3 consecutive gaps.
+        // Heavy multi-ms pipelined renders (5 ms and 16.6 ms apart) overlap an already-active
+        // pass and grow progressively: Tier 0 -> Tier 1 -> Tier 2 only as depth climbs.
         let mut last = 0u64;
         let mut burst = 0u32;
-        assert!(!should_expand_render_ext(&mut last, &mut burst, 1_000_000, 1, 0, false));
-        assert!(!should_expand_render_ext(&mut last, &mut burst, 2_000_000, 1, 0, false));
-        assert!(!should_expand_render_ext(&mut last, &mut burst, 3_000_000, 1, 0, false));
-        assert!(should_expand_render_ext(&mut last, &mut burst, 4_000_000, 1, 0, false));
+        let mut backed = BASE_RENDER_SLOTS;
+        backed = target_render_slots(&mut last, &mut burst, 1_000_000, 1, 0, false, backed);
+        assert_eq!(backed, BASE_RENDER_SLOTS);
+        backed = target_render_slots(&mut last, &mut burst, 6_000_000, 1, 1, false, backed);
+        assert_eq!(backed, tier0_end);
+        backed = target_render_slots(&mut last, &mut burst, 22_600_000, 1, 6, false, backed);
+        assert_eq!(backed, tier0_end); // 6 + 1 + 1 == 8 fits in Tier 0
+        backed = target_render_slots(&mut last, &mut burst, 39_200_000, 1, 7, false, backed);
+        assert_eq!(backed, tier1_end); // 7 + 1 + 1 == 9 grows to Tier 1 (18 slots)
+        backed = target_render_slots(&mut last, &mut burst, 55_800_000, 1, 16, false, backed);
+        assert_eq!(backed, tier1_end); // 16 + 1 + 1 == 18 fits in Tier 1
+        backed = target_render_slots(&mut last, &mut burst, 72_400_000, 1, 17, false, backed);
+        assert_eq!(backed, full_end); // 17 + 1 + 1 == 19 grows to Tier 2 (32 slots)
+
+        // Sub-2 ms back-to-back single-pass bursts grow only to Tier 0 after 3 consecutive gaps.
+        let mut last = 0u64;
+        let mut burst = 0u32;
+        assert_eq!(target_render_slots(&mut last, &mut burst, 1_000_000, 1, 0, false, BASE_RENDER_SLOTS), BASE_RENDER_SLOTS);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 2_000_000, 1, 0, false, BASE_RENDER_SLOTS), BASE_RENDER_SLOTS);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 3_000_000, 1, 0, false, BASE_RENDER_SLOTS), BASE_RENDER_SLOTS);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 4_000_000, 1, 0, false, BASE_RENDER_SLOTS), tier0_end);
         assert_eq!(burst, 3);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 5_000_000, 1, 0, false, tier0_end), tier0_end);
 
-        // A single multi-pass SUBMIT with >= BASE_RENDER_SLOTS (2) renders expands immediately.
+        // A single large multi-pass SUBMIT jumps directly to the tier covering render_count + 1.
         let mut last = 0u64;
         let mut burst = 0u32;
-        assert!(should_expand_render_ext(&mut last, &mut burst, 100_000_000, 2, 0, false));
+        assert_eq!(target_render_slots(&mut last, &mut burst, 10_000_000, 8, 0, false, BASE_RENDER_SLOTS), tier1_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 20_000_000, 20, 0, false, BASE_RENDER_SLOTS), full_end);
+
+        // Verify exact per-slot mapped backing bytes for Base vs Ext slots.
+        let mut o_base = Objects::new();
+        g16::slots::PassSlot::new(&mut o_base, 0, 1).unwrap();
+        let base_slot_bytes: usize = o_base.objects.iter().map(|obj| obj.mapped).sum();
+        assert_eq!(base_slot_bytes, (16 * 1024 + 8 * 1024 + 608) * 1024);
+        let mut o_ext = Objects::new();
+        g16::slots::PassSlot::new(&mut o_ext, 2, 1).unwrap();
+        let ext_slot_bytes: usize = o_ext.objects.iter().map(|obj| obj.mapped).sum();
+        assert_eq!(ext_slot_bytes, (2 * 1024 + 1024 + 608) * 1024);
+        // Tier 0 (6 ext slots) is 21.5625 MiB vs 107.8125 MiB for all 30 ext slots.
+        assert_eq!((tier0_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 22_080 * 1024);
+        assert_eq!((tier1_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 58_880 * 1024);
+        assert_eq!((full_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 110_400 * 1024);
     }
 
     #[test]fn base_compute_quarantine_expands_fresh_vm_and_recovers_displacement(){
@@ -1171,7 +1229,7 @@ pub mod g16 {
     }
 
     #[test]fn base_render_quarantine_expands_fresh_vm_and_recovers_displacement(){
-        use crate::g16::resources::should_expand_render_ext;
+        use crate::g16::resources::{BASE_RENDER_SLOTS, EXT_RENDER_TIERS, target_render_slots};
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
         let mut passes=KVec::new();
         for k in 0..4u64 {
@@ -1195,9 +1253,12 @@ pub mod g16 {
         assert!(s.base_render_quarantined());
         assert!(s.render_exhausted_within(2));
         assert!(!s.render_exhausted_within(4));
-        // Fresh single-pass VM expands RenderExtArena immediately because a base pass slot is quarantined.
+        // Fresh single-pass VM expands Tier 0 RenderExtArena immediately because a base pass slot is quarantined.
         let mut last=0u64;let mut burst=0u32;
-        assert!(should_expand_render_ext(&mut last,&mut burst,10_000_000,1,0,s.base_render_quarantined()));
+        assert_eq!(
+            target_render_slots(&mut last,&mut burst,10_000_000,1,0,s.base_render_quarantined(),BASE_RENDER_SLOTS),
+            EXT_RENDER_TIERS[0].1
+        );
         // Expanded VM picks and retires pass slot 2, displacing base pass slot 0 back to reusable.
         let k=s.pick_pass_in(&prep,&geo,0).unwrap();
         assert_eq!(k,2);
@@ -1301,10 +1362,18 @@ budget += r'''
 source=source.replace('__BUDGET__',budget.replace('//!','//'))
 source = source.replace('__LIVE_TOKEN__' ,item((production/'vm.rs').read_text(),'pub(crate) struct LiveToken')).replace('__LIVE_DROP__',item((production/'vm.rs').read_text(),'impl Drop for LiveToken'))
 resources_source = (production/'resources.rs').read_text()
-render_burst_lines = '\n'.join(
-    line for line in resources_source.splitlines()
-    if line.startswith(('const BURST_SUBMITS:', 'const BURST_GAP_NS:', 'const BURST_COMMANDS:', 'const RENDER_BURST_COMMANDS:'))
-) + '\npub(crate) ' + item(resources_source, 'fn should_expand_compute_ext(') + '\npub(crate) ' + item(resources_source, 'fn should_expand_render_ext(')
+ext_tiers_start = resources_source.index('pub(crate) const EXT_RENDER_TIERS:')
+ext_tiers_end = resources_source.index('];\n', ext_tiers_start) + 3
+render_burst_lines = (
+    resources_source[ext_tiers_start:ext_tiers_end]
+    + '\n'
+    + '\n'.join(
+        line for line in resources_source.splitlines()
+        if line.startswith(('const BURST_SUBMITS:', 'const BURST_GAP_NS:', 'const BURST_COMMANDS:', 'const RENDER_BURST_COMMANDS:'))
+    )
+    + '\npub(crate) ' + item(resources_source, 'fn should_expand_compute_ext(')
+    + '\npub(crate) ' + item(resources_source, 'fn target_render_slots(')
+)
 source = source.replace('__CMD_CLASSES__',item(graph_source,'pub(crate) const fn cmd_fw(')+'\n'+item(graph_source,'pub(crate) const fn cmd_shared(')).replace('__SET_DIRTY__',item(resources_source,'pub(crate) fn set_dirty(')).replace('__RENDER_BURST__', render_burst_lines)
 source = source.replace('__ALLOC__',item(graph_source,'pub(crate) fn alloc(')).replace('__ALLOC_WORK__',item(graph_source,'pub(crate) fn alloc_work('))
 source = source.replace('__HW__','\n'.join(module(hw,n) for n in ('client','sizes','engine','tuning','pte'))).replace('__ROOT__',str(production)).replace('__PRIVATE_RW__',hex(private_rw)+'u64').replace('__CLIENT__', '#[derive(Copy,Clone)]\n'+item(graph_source, 'pub(crate) struct Client {')+'\n'+item(graph_source, 'impl Client {'))

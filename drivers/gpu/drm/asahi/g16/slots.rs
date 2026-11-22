@@ -156,7 +156,7 @@ impl PassSlot {
     /// Allocates pass slot `i`'s objects, with their client leaf classes.
     pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32) -> Result<Self> {
         let sh = Class::Shared;
-        let (ps, ws) = (i * client::PASS_STRIDE, i * client::WORK_STRIDE);
+        let off = client::pass_off(i);
         let tpc = if i >= sizes::BASE_RENDER_SLOTS as u64 {
             client::TPC_SLOT_SIZE
         } else {
@@ -169,32 +169,25 @@ impl PassSlot {
         };
         let _ = pre_records;
 
-        let aux = alloc(
-            o,
-            0x20000,
-            sh,
-            Client::nc(client::AUX + i * client::AUX_STRIDE),
-            0,
-            false,
-        )?;
+        let aux = alloc(o, 0x20000, sh, Client::nc(client::AUX + off), 0, false)?;
         let mut pre = KVec::with_capacity(3, GFP_KERNEL)?;
         pre.push(
-            alloc(o, 0x4000, sh, Client::nc(client::PRE0_PAGE + ps), 0, false)?,
+            alloc(o, 0x4000, sh, Client::nc(client::PRE0_PAGE + off), 0, false)?,
             GFP_KERNEL,
         )?;
         pre.push(
-            alloc(o, 0x4000, sh, Client::nc(client::PRE1_PAGE + ps), 0, false)?,
+            alloc(o, 0x4000, sh, Client::nc(client::PRE1_PAGE + off), 0, false)?,
             GFP_KERNEL,
         )?;
         pre.push(
-            alloc(o, 0x4000, sh, Client::nc(client::PRE2_PAGE + ps), 0, false)?,
+            alloc(o, 0x4000, sh, Client::nc(client::PRE2_PAGE + off), 0, false)?,
             GFP_KERNEL,
         )?;
         let tpc = alloc(
             o,
             tpc as usize,
             sh,
-            Client::nc(client::TPC + i * client::TPC_SLOT_STRIDE),
+            Client::nc(client::TPC + off),
             0,
             false,
         )?;
@@ -202,7 +195,7 @@ impl PassSlot {
             o,
             tilemap as usize,
             sh,
-            Client::nc(client::TILEMAP + i * client::TPC_SLOT_STRIDE),
+            Client::nc(client::pass_tilemap(i)),
             0,
             false,
         )?;
@@ -210,7 +203,7 @@ impl PassSlot {
             o,
             0x4000,
             sh,
-            Client::nc(client::HEAP_META_PAGE + ps),
+            Client::nc(client::HEAP_META_PAGE + off),
             0,
             false,
         )?;
@@ -218,7 +211,7 @@ impl PassSlot {
             o,
             0x10000,
             sh,
-            Client::nc(client::SCENE_USER + ps),
+            Client::nc(client::SCENE_USER + off),
             0,
             false,
         )?;
@@ -226,7 +219,7 @@ impl PassSlot {
             o,
             super::fw::buffer::SCENE_LIST_SIZE,
             sh,
-            Client::nc(client::SCENE_LIST + ps),
+            Client::nc(client::SCENE_LIST + off),
             0,
             false,
         )?;
@@ -234,20 +227,20 @@ impl PassSlot {
             o,
             0x10000,
             sh,
-            Client::nc(client::FS_SCRATCH + ps),
+            Client::nc(client::FS_SCRATCH + off),
             0,
             false,
         )?;
         let fs_work = alloc_work(
             o,
             fs::WORK_SIZE,
-            client::FS_WORK_PAGE + ws,
+            client::FS_WORK_PAGE + off,
             client::FS_WORK_OFF as usize,
         )?;
         let ta_work = alloc_work(
             o,
             ta::WORK_SIZE,
-            client::TA_WORK_PAGE + ws,
+            client::TA_WORK_PAGE + off,
             client::TA_WORK_OFF as usize,
         )?;
         Ok(Self {
@@ -446,7 +439,7 @@ pub(crate) struct ComputeOwners {
 }
 
 /// Bitmask of valid render pass slot indices (`0..sizes::RENDER_SLOTS`).
-const PASS_MASK: u32 = (1u32 << sizes::RENDER_SLOTS) - 1;
+const PASS_MASK: u32 = u32::MAX >> (32 - sizes::RENDER_SLOTS);
 
 /// Shared atomic coordination between `Shared::state` slot selection/claims and off-lock
 /// pre-scrubbing of displaced render pass slots.
