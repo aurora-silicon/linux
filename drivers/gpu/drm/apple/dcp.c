@@ -2467,16 +2467,15 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	bool late_hpd = dcp_ext_dptx_607(dcp);
 	bool t8132 = dcp_is_t8132_ext(dcp);
 	/*
-	 * A DP2HDMI output on the 13.5 firmware line asserts its own HPD, in
-	 * dcp_enable_dp2hdmi_hpd(), and the connect asks the firmware for HPD
-	 * only on a DisplayPort connector or a late-HPD path, so this firmware
-	 * is never asked to detect the sink and never sends the link
-	 * configuration the wait below looks for. Treat the timeout as
-	 * non-fatal, as the compact and late-HPD cases do, instead of
-	 * withdrawing the display.
+	 * A DP2HDMI output asserts its own HPD, in dcp_enable_dp2hdmi_hpd(),
+	 * and the connect asks the firmware for HPD only on a DisplayPort
+	 * connector or a late-HPD path, so the firmware is never asked to
+	 * detect the sink and need not send the link configuration the wait
+	 * below looks for (nor does one whose link a boot stage already
+	 * trained). Treat the timeout as non-fatal, as the compact and
+	 * late-HPD cases do, instead of withdrawing the display.
 	 */
-	bool dp2hdmi = dcp->hdmi_hpd && !dcp_is_typec_output(dcp) &&
-		       dcp->fw_compat == DCP_FIRMWARE_V_13_5;
+	bool dp2hdmi = dcp->hdmi_hpd && !dcp_is_typec_output(dcp);
 	bool compact, withdrawn;
 	unsigned long timeout;
 	u64 generation;
@@ -2674,7 +2673,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 
 	usleep_range(5, 10);
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort || late_hpd) {
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort || late_hpd ||
+	    (dp2hdmi && dcp->rtkit_adopted)) {
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
 		if (ret && late_hpd)
 			dev_err(dcp->dev,
@@ -4915,6 +4915,24 @@ int dcp_start(struct platform_device *pdev)
 		if (ret) {
 			dev_warn(dcp->dev, "Failed to start DPTX endpoint: %d\n",
 				 ret);
+		} else if (dcp->rtkit_adopted &&
+			   dptx_service_available(&dcp->dptxport[0])) {
+			/*
+			 * The boot stage that handed this DCP over left the
+			 * port's display up on a link it trained. Release it,
+			 * so that the next connect trains the link and reads
+			 * the sink again: until then the firmware only has its
+			 * default modes and no EDID. Its HPD goes low as well;
+			 * dcp_dptx_connect() raises it again after the link wait,
+			 * so that the firmware sees the display plugged.
+			 */
+			ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+			if (!ret)
+				ret = dptxport_release_display(dcp->dptxport[0].service);
+			if (ret)
+				dev_warn(dcp->dev, "adopted DPTX display not released: %d\n",
+					 ret);
+			ret = 0;
 #ifdef DCP_DPTX_DISCONNECT_ON_INIT
 		/*
 		 * This disconnect / connect cycle on init is only necessary
