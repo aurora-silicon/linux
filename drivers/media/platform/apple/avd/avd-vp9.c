@@ -492,19 +492,28 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 		set_refs(ctx, run);
 }
 
-static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
+static int set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 {
 	const struct v4l2_ctrl_vp9_frame *frame = run->decode_params;
 	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
 	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
-
+	u32 payload = vb2_get_plane_payload(&src->vb2_buf, 0);
 	u32 offset =
 		frame->uncompressed_header_size + frame->compressed_header_size;
-	u32 size = vb2_get_plane_payload(&src->vb2_buf, 0) - offset;
+	u32 size;
 	u32 num_tile_rows = 1 << frame->tile_rows_log2;
 	u32 num_tile_cols = 1 << frame->tile_cols_log2;
 	u32 tile_size;
+
+	/* The headers come from userspace and may claim more than the buffer */
+	if (!data || offset > payload) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "VP9: headers of %u bytes in a %u byte frame\n",
+				    offset, payload);
+		return -EINVAL;
+	}
+	size = payload - offset;
 
 	/* 6.2.6 Compute image size syntax */
 	u32 sb_64_cols = (((frame->frame_width_minus_1 + 8) >> 3) + 7) >> 3;
@@ -517,10 +526,15 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 			    col == num_tile_cols - 1) {
 				tile_size = size;
 			} else {
+				/*
+				 * A tile size past the frame makes the engine
+				 * read past it: fail the frame instead.
+				 */
+				if (size < 4)
+					return -EINVAL;
 				tile_size = get_unaligned_be32(&data[offset]);
-				/* i have crashed my computer because of this */
 				if (tile_size > size - 4)
-					return;
+					return -EINVAL;
 				offset += 4;
 				size -= 4;
 			}
@@ -549,6 +563,8 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 			size -= tile_size;
 			vp9_ctx->b->submit_num++;
 		}
+
+	return 0;
 }
 
 static void update_dec_buf_info(struct avd_decoded_buffer *buf,
@@ -672,6 +688,16 @@ static int validate_dec_params(struct avd_ctx *ctx,
 
 	if (dec_params->frame_height_minus_1 + 1 < 64 ||
 	    dec_params->frame_width_minus_1 + 1 < 64)
+		return -EINVAL;
+
+	/*
+	 * VP9 has at most 4 tile rows (log2 2), and a frame at most 4096
+	 * wide has at most VP9_MAX_TILE_COLS columns, which the scratch
+	 * buffers are sized for. The V4L2 core does not check the rows and
+	 * admits 64 columns.
+	 */
+	if (dec_params->tile_rows_log2 > 2 ||
+	    dec_params->tile_cols_log2 > ilog2(VP9_MAX_TILE_COLS))
 		return -EINVAL;
 
 	aligned_width = round_up(dec_params->frame_width_minus_1 + 1, 64);
@@ -886,8 +912,10 @@ static int avd_vp9_run(struct avd_ctx *ctx)
 
 	set_header(ctx, &run);
 	vp9_ctx->b->submit_num = 0;
-	set_tiles(ctx, &run);
+	ret = set_tiles(ctx, &run);
 	avd_run_postamble(ctx, &run.base);
+	if (ret)
+		return ret;
 
 	if (avd_backend_is_qfw(ctx->dev)) {
 		/* Forward updates need no hardware result; publish before next prepare. */
