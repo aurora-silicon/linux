@@ -168,7 +168,8 @@ impl recovery::Memory for Service<'_> {
             }
         }
         let mut sources = self.firmware.init.fault_sources()?;
-        // M5 reads no firmware reason word; a latched MMU fault is reason 3.
+        // M5 attribution leaves the firmware reason out (see InitData::fault_sources); a
+        // latched MMU fault is reason 3.
         if mmu_fault && sources.reason.is_none() {
             sources.reason = Some(recovery::PAGE_FAULT);
         }
@@ -391,6 +392,7 @@ impl Firmware {
             || self.hold.active()
             || self.registration_power_release_pending
             || self.effort.applied() != 0
+            || self.effort.streaming()
         {
             return Ok(false);
         }
