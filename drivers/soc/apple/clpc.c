@@ -990,9 +990,15 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 
 	apple_clpc_profile_limit(clpc);
 
-	/* Sample on time while graphics is powered, to see it power off, and in low power. */
+	/*
+	 * Sample on time while graphics is powered, to see it power off, and in
+	 * low power where it has a ceiling to keep. A profile with no low-power
+	 * ceiling (High Power only) has nothing to do there, so it stays
+	 * deferrable.
+	 */
 	apple_clpc_queue(clpc, !apple_clpc_floor(clpc, state) && !clpc->gpu_on &&
-			 !clpc->ane_qos_khz && !READ_ONCE(clpc->low_power));
+			 !clpc->ane_qos_khz &&
+			 !(clpc->hw->low_power_khz && READ_ONCE(clpc->low_power)));
 }
 
 static void apple_clpc_run(struct apple_clpc *clpc)
