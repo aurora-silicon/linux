@@ -3571,6 +3571,9 @@ static const struct apple_nvme_hw apple_nvme_t8122_hw = {
  * The post-M4 (T8132 and later) I/O queue setup follows Yureka Lilian's T8132
  * support in m1n1 (commit 53f8ee9b54ba, "nvme: support T8132").
  */
+/* Explicit flushes are required for writes to survive a reset on J713. */
+#define APPLE_NVME_T8132_QUIRKS NVME_QUIRK_BROKEN_FUA
+
 static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.has_lsq_nvmmu = true,
 	.has_separate_nvmmu = true,
@@ -3582,8 +3585,7 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.sleep_epmap_last_mask = BIT(0),
 	.sleep_flush_max_nsid = 1,
 	.sleep_shn = NVME_CC_SHN_MASK,
-	/* Explicit flushes are required for writes to survive a reset on J713. */
-	.quirks = NVME_QUIRK_BROKEN_FUA,
+	.quirks = APPLE_NVME_T8132_QUIRKS,
 };
 
 static const struct apple_nvme_hw apple_nvme_t8140_hw = {
@@ -3636,7 +3638,8 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.sleep_traced = true,
 	.sleep_flush_max_nsid = 1,
 	.sleep_shn = NVME_CC_SHN_MASK,
-	.quirks = NVME_QUIRK_NO_APST,
+	/* The T8132 controller, so the same FUA result applies. */
+	.quirks = APPLE_NVME_T8132_QUIRKS | NVME_QUIRK_NO_APST,
 };
 
 /*
