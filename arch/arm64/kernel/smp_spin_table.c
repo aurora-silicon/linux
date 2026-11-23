@@ -267,8 +267,8 @@ void spin_table_hibernate_pen_end(bool frozen)
 	spin_table_pen.self = __pa_symbol(&spin_table_pen);
 	spin_table_pen.magic = SPIN_TABLE_PEN_MAGIC;
 	spin_table_pen_clean(&spin_table_pen, offsetof(typeof(spin_table_pen), slot));
-	pr_info("hibernation: %u CPUs wait outside the image\n",
-		cpumask_weight(&spin_table_cpus_penned));
+	pr_debug("hibernation: %u CPUs wait outside the image\n",
+		 cpumask_weight(&spin_table_cpus_penned));
 }
 
 /*
@@ -305,7 +305,7 @@ void spin_table_hibernate_restored(void)
 		cpumask_set_cpu(cpu, &spin_table_cpus_penned);
 		found++;
 	}
-	pr_info("hibernation: %u CPUs start from the boot kernel's pen\n", found);
+	pr_debug("hibernation: %u CPUs start from the boot kernel's pen\n", found);
 }
 
 /* Leaves the kernel for the pen; the boot CPU waits for it to arrive (cpu_kill). */
