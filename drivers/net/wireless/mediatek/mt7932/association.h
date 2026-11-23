@@ -127,6 +127,9 @@ static inline int mt7932_connect_psk_akm(u8 *body, size_t length, u32 akm)
 /* Validate the entire RSN payload before using capabilities for admission.
  * The group management suite defaults to BIP-CMAC-128 when omitted. Reject
  * unsupported explicit suites rather than letting firmware choose one.
+ * A WPA/WPA2 mixed-mode AP advertises a TKIP group cipher. Admit it for
+ * WPA2-PSK (AKM 2) only, as mt7932_connect_auth() does; the pairwise list
+ * must still offer CCMP.
  */
 static inline int mt7932_rsn_admit(const u8 *rsn, size_t length, u32 akm,
 				   enum nl80211_mfp mfp, bool *pmf)
@@ -134,11 +137,15 @@ static inline int mt7932_rsn_admit(const u8 *rsn, size_t length, u32 akm,
 	unsigned int count, i;
 	u16 caps = 0;
 	bool selected = false, ccmp = false;
+	u32 group;
 
 	*pmf = false;
 	if (mfp > NL80211_MFP_OPTIONAL || length < 8 ||
-	    get_unaligned_le16(rsn) != 1 ||
-	    get_unaligned_be32(rsn + 2) != WLAN_CIPHER_SUITE_CCMP)
+	    get_unaligned_le16(rsn) != 1)
+		return -EINVAL;
+	group = get_unaligned_be32(rsn + 2);
+	if (group != WLAN_CIPHER_SUITE_CCMP &&
+	    (group != WLAN_CIPHER_SUITE_TKIP || akm != WLAN_AKM_SUITE_PSK))
 		return -EINVAL;
 	rsn += 6;
 	length -= 6;

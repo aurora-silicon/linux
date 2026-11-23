@@ -157,7 +157,9 @@ qualification. SAE-PK, SAE-EXT-KEY and additional ciphers are not advertised. OW
 
 TKIP is registered so that WPA2-PSK can join a WPA/WPA2 mixed-mode access point,
 which pairs a CCMP unicast key with a TKIP group key. Pairwise TKIP, WPA1, and a
-TKIP group key with SAE or OWE are refused. Firmware owns the TKIP group key like
+TKIP group key with SAE or OWE are refused. Because TKIP is in the cipher list,
+a supplicant may offer a TKIP-only or WPA1 network as selectable; the connect
+request then fails with ``-EOPNOTSUPP``. Firmware owns the TKIP group key like
 any other. MIC failure reporting and TKIP countermeasures are left to firmware and
 have not been verified: firmware runs the four-way handshake, so the host has no
 KCK and calling ``cfg80211_michael_mic_failure()`` would do nothing.
