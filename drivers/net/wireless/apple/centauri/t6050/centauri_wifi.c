@@ -2763,6 +2763,13 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	 * on the preferred scanning channels and those the 2.4/5 GHz APs report.
 	 */
 	wifi->wiphy->flags |= WIPHY_FLAG_SPLIT_SCAN_6GHZ;
+	/*
+	 * An AP serving several networks on one radio, the rule at 6 GHz,
+	 * beacons one of them and describes the others in a multiple-BSSID
+	 * element. cfg80211 makes scan entries for those nontransmitted BSSes
+	 * only with this set; the firmware joins any of them by its BSSID.
+	 */
+	wifi->wiphy->support_mbssid = true;
 	wifi->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	wifi->wiphy->reg_notifier = wifi_regulatory;
 	wifi->wiphy->cipher_suites = cipher_suites;
