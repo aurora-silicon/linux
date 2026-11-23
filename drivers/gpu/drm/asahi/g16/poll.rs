@@ -845,10 +845,13 @@ impl Firmware {
         Some((compute, render))
     }
 
-    /// Whether a render job paused by `TA_WAVE_PASSES` pacing has enough TA headroom to publish
+    /// Whether a render job paused by TA wave pacing has enough TA headroom to publish
     /// the next wave without dribbling 1-pass stub flights.
     fn ta_wave_ready(&self) -> bool {
-        self.engine.ta_wave_wait && self.ta_pending_passes() <= super::hw::sizes::TA_WAVE_REFILL
+        let cap = self.active_ta_wave_cap();
+        self.engine.ta_wave_wait
+            && self.ta_pending_passes()
+                <= cap.saturating_sub(super::hw::sizes::TA_WAVE_REFILL_HEADROOM)
     }
 
     /// Cheap single-stage stamp check for the oldest compute pipe 0/1 and oldest render flights'

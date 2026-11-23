@@ -344,6 +344,8 @@ pub(crate) struct Flight {
     pub(crate) has_timestamps: bool,
     /// Whether this flight runs ray-tracing or SCS-scratch compute (pinned to compute pipe 0).
     pub(crate) rt_compute: bool,
+    /// Whether this flight includes any heavy-TA render pass (multi-layer or large tilemap).
+    pub(crate) heavy_render: bool,
 }
 
 impl Flight {
@@ -386,6 +388,7 @@ impl Flight {
             initbm: false,
             has_timestamps: false,
             rt_compute: false,
+            heavy_render: false,
         }
     }
 }
@@ -1020,15 +1023,36 @@ impl Firmware {
             // while preserving per-queue FIFO, unless the head job itself requires
             // `flights` to drain to empty first (unprimed cold InitBM render, failed
             // VM, or recovery/InitBM in flight).
-            if !self.engine.flights.is_empty() && !self.can_queue_behind(&job) {
+            let mut ta_pending: Option<usize> = None;
+            if !self.engine.flights.is_empty()
+                && !self.can_queue_behind_with_ta(&job, &mut ta_pending)
+            {
                 if self.needs_engine_drain(&job) {
                     self.engine.stats.hold[0] += 1;
                     break;
                 }
-                let ta_wave_paused = self.ta_pending_passes() >= super::hw::sizes::TA_WAVE_PASSES;
+                let ta_val = *ta_pending.get_or_insert_with(|| self.ta_pending_passes());
+                let ta_wave_paused = ta_val >= self.active_ta_wave_cap();
                 let mut alt: Option<usize> = None;
                 for (i, cand) in self.engine.pending.iter().enumerate() {
-                    if i == index || !self.can_queue_behind(cand) {
+                    if i == index {
+                        continue;
+                    }
+                    // Fast O(1) skip for blocked head-queue followers: `Engine::pick` chose the
+                    // earliest pending job of `job.queue`, so later jobs of the same queue are
+                    // FIFO-blocked unless an independent non-query compute may bypass TA-wave
+                    // paused renders.
+                    if i > index
+                        && Arc::ptr_eq(&cand.queue, &job.queue)
+                        && !(ta_wave_paused
+                            && matches!(
+                                command(cand, cand.progress.sent()),
+                                Some(Command::Compute(c)) if !c.query_access
+                            ))
+                    {
+                        continue;
+                    }
+                    if !self.can_queue_behind_with_ta(cand, &mut ta_pending) {
                         continue;
                     }
                     // Preserve per-queue FIFO: never jump a later job of a queue ahead
@@ -1047,7 +1071,8 @@ impl Firmware {
                             )
                             && matches!(
                                 command(earlier, earlier.progress.sent()),
-                                Some(Command::Render(_))
+                                Some(Command::Render(r))
+                                    if ta_val >= self.ta_wave_cap_for(r.is_heavy_ta())
                             )
                             && !self.needs_engine_drain(earlier)
                             && earlier
@@ -1080,17 +1105,16 @@ impl Firmware {
                             .pending
                             .iter()
                             .any(|cand| self.blocked_on_slot_headroom(cand));
-                        self.engine.ta_wave_wait = self.ta_pending_passes()
-                            >= super::hw::sizes::TA_WAVE_PASSES
-                            && self.engine.pending.iter().any(|cand| {
-                                matches!(
-                                    command(cand, cand.progress.sent()),
-                                    Some(Command::Render(_))
-                                ) && !self.needs_engine_drain(cand)
-                                    && cand
-                                        .check_command_dependencies(cand.progress.sent())
-                                        .is_ok()
-                            });
+                        self.engine.ta_wave_wait = self.engine.pending.iter().any(|cand| {
+                            matches!(
+                                command(cand, cand.progress.sent()),
+                                Some(Command::Render(r))
+                                    if ta_val >= self.ta_wave_cap_for(r.is_heavy_ta())
+                            ) && !self.needs_engine_drain(cand)
+                                && cand
+                                    .check_command_dependencies(cand.progress.sent())
+                                    .is_ok()
+                        });
                         self.engine.stats.hold[0] += 1;
                         break;
                     }
@@ -1190,12 +1214,12 @@ impl Firmware {
                     if job.progress.sent() == job.progress.count() {
                         self.engine.unpend(&job); // fully published
                     }
-                    // Ring TA/FS immediately once a render wave fills TA_WAVE_PASSES so the GPU
-                    // starts tiling right away instead of waiting behind another loop iteration
-                    // or an alt-class compute publication.
+                    // Ring TA/FS immediately once a render wave fills the active TA wave window so
+                    // the GPU starts tiling right away instead of waiting behind another loop
+                    // iteration or an alt-class compute publication.
                     if pending_rings & ((1u8 << (Channel::Fs as u8)) | (1u8 << (Channel::Ta as u8)))
                         != 0
-                        && self.ta_pending_passes() >= super::hw::sizes::TA_WAVE_PASSES
+                        && self.ta_pending_passes() >= self.active_ta_wave_cap()
                     {
                         if let Err(e) = self.flush_doorbells(&mut pending_rings) {
                             dev_err!(
@@ -1413,6 +1437,45 @@ impl Firmware {
         pending
     }
 
+    /// Adaptive TA wave window for a candidate render pass: conservative `TA_WAVE_PASSES` (4)
+    /// when either the candidate or any active render flight is heavy (multi-layer or tilemap
+    /// above `TA_LIGHT_TILEMAP_BYTES`), and `TA_WAVE_PASSES_LIGHT` (8) for light single-layer
+    /// render bursts.
+    fn ta_wave_cap_for(&self, cand_heavy: bool) -> usize {
+        if cand_heavy
+            || self
+                .engine
+                .flights
+                .iter()
+                .any(|fl| fl.renders != 0 && fl.heavy_render)
+        {
+            super::hw::sizes::TA_WAVE_PASSES
+        } else {
+            super::hw::sizes::TA_WAVE_PASSES_LIGHT
+        }
+    }
+
+    /// Active TA wave window across in-flight renders and pending render heads, used for
+    /// immediate wave doorbell flushes and `ta_wave_ready()` hysteresis.
+    pub(crate) fn active_ta_wave_cap(&self) -> usize {
+        if self
+            .engine
+            .flights
+            .iter()
+            .any(|fl| fl.renders != 0 && fl.heavy_render)
+            || self.engine.pending.iter().any(|cand| {
+                matches!(
+                    command(cand, cand.progress.sent()),
+                    Some(Command::Render(r)) if r.is_heavy_ta()
+                )
+            })
+        {
+            super::hw::sizes::TA_WAVE_PASSES
+        } else {
+            super::hw::sizes::TA_WAVE_PASSES_LIGHT
+        }
+    }
+
     /// Whether `job`'s next command may be published behind the flights in flight:
     ///
     /// - Compute queues behind healthy non-InitBM compute flights of any VM or same-VM
@@ -1433,6 +1496,14 @@ impl Firmware {
     ///   firmware DM1 timeout. Cold InitBM priming renders and every failure or recovery path
     ///   still drain the engine first.
     fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
+        let mut ta_pending = None;
+        self.can_queue_behind_with_ta(job, &mut ta_pending)
+    }
+
+    /// [`Self::can_queue_behind`] with an optional caller-hoisted cache of
+    /// [`Self::ta_pending_passes`] so scanning many pending jobs performs at most one WC stamp
+    /// read per pass.
+    fn can_queue_behind_with_ta(&self, job: &Arc<Job>, ta_pending: &mut Option<usize>) -> bool {
         let e = &self.engine;
         let sent = job.progress.sent();
         if job.vm.status.get() != 0
@@ -1511,15 +1582,16 @@ impl Firmware {
                         .compute_slot_mask()
                         .is_ok_and(|mask| self.slots.compute_available_in_mask(mask))
             }
-            Some(Command::Render(_)) => {
+            Some(Command::Render(r)) => {
                 let cross_vm_compute = e
                     .flights
                     .iter()
                     .any(|f| f.computes != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
                 let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
+                let ta_cap = self.ta_wave_cap_for(r.is_heavy_ta());
                 !cross_vm_compute
                     && render_count < params::render_flights()
-                    && self.ta_pending_passes() < super::hw::sizes::TA_WAVE_PASSES
+                    && *ta_pending.get_or_insert_with(|| self.ta_pending_passes()) < ta_cap
                     && !self.slots.render_exhausted()
                     && !self.pools.exhausted()
                     && super::recovery::logic::next_ordinal(e.draw).is_some()
@@ -1650,7 +1722,7 @@ impl Firmware {
                     .min(super::hw::sizes::COMPUTE_SLOTS);
                 cap > 1 && pending_cmds < cap
             }
-            Some(Command::Render(_)) => {
+            Some(Command::Render(r)) => {
                 if head.resources.render_scs() || !head.fw_waits.is_empty() {
                     return false;
                 }
@@ -1667,10 +1739,14 @@ impl Firmware {
                 let Some(mut next_seq) = head_order.sequence.checked_add(1) else {
                     return false;
                 };
+                let mut wave_heavy = r.is_heavy_ta();
                 let mut pending_cmds = 1usize;
                 for k in (head_sent + 1)..head.progress.count() {
                     if !head.can_fold_render_cmd(k, next_seq) {
                         return false;
+                    }
+                    if matches!(command(head, k), Some(Command::Render(r2)) if r2.is_heavy_ta()) {
+                        wave_heavy = true;
                     }
                     let Some(s) = next_seq.checked_add(1) else {
                         return false;
@@ -1686,6 +1762,11 @@ impl Firmware {
                     {
                         return false;
                     }
+                    if (0..n).any(|k| {
+                        matches!(command(j, k), Some(Command::Render(r2)) if r2.is_heavy_ta())
+                    }) {
+                        wave_heavy = true;
+                    }
                     let Some(s) = next_seq.checked_add(u64::from(n)) else {
                         return false;
                     };
@@ -1698,8 +1779,8 @@ impl Firmware {
                     .iter()
                     .map(|fl| fl.renders as usize)
                     .sum();
-                let ta_room = super::hw::sizes::TA_WAVE_PASSES
-                    .saturating_sub(self.ta_pending_passes());
+                let wave_cap = self.ta_wave_cap_for(wave_heavy);
+                let ta_room = wave_cap.saturating_sub(self.ta_pending_passes());
                 let cap = super::hw::sizes::COALESCE_MAX_CMDS
                     .min(params::render_flights().saturating_sub(active_renders))
                     .min(ta_room)
@@ -2581,10 +2662,18 @@ impl Firmware {
                         .iter()
                         .map(|fl| fl.renders as usize)
                         .sum();
+                    let ta_pending_before = self.ta_pending_passes();
+                    let mut wave_heavy =
+                        self.ta_wave_cap_for(r.is_heavy_ta()) == sizes::TA_WAVE_PASSES;
+                    let wave_cap = if wave_heavy {
+                        sizes::TA_WAVE_PASSES
+                    } else {
+                        sizes::TA_WAVE_PASSES_LIGHT
+                    };
                     let mut more_renders = params::render_flights()
                         .saturating_sub(active_renders + 1)
                         .min(sizes::RENDER_SLOTS.saturating_sub(1))
-                        .min(sizes::TA_WAVE_PASSES.saturating_sub(self.ta_pending_passes() + 1));
+                        .min(wave_cap.saturating_sub(ta_pending_before + 1));
                     while more_renders > 0 && end < job.progress.count() {
                         let Some(next_seq) = last_seq.and_then(|s| s.checked_add(1)) else {
                             break;
@@ -2597,6 +2686,18 @@ impl Firmware {
                         let Some(Command::Render(r2)) = command(job, end) else {
                             break;
                         };
+                        if r2.is_heavy_ta() && !wave_heavy {
+                            if ta_pending_before + prefix.renders as usize + 1
+                                > sizes::TA_WAVE_PASSES
+                            {
+                                break;
+                            }
+                            wave_heavy = true;
+                            more_renders = more_renders.min(
+                                sizes::TA_WAVE_PASSES
+                                    .saturating_sub(ta_pending_before + prefix.renders as usize),
+                            );
+                        }
                         let Some(o2) = job.command_order(end) else {
                             break;
                         };
@@ -2672,7 +2773,7 @@ impl Firmware {
                         more_renders -= 1;
                     }
                     // Cross-job render horizon: fold subsequent ready render-only jobs of
-                    // the same queue and VM into the same <= TA_WAVE_PASSES flight, sharing
+                    // the same queue and VM into the same adaptive TA wave flight, sharing
                     // one TA/FS producer advance, one UMA submitted update, and one doorbell.
                     // Any non-qualifying job of this queue ends the scan so no later job
                     // overtakes it.
@@ -2725,14 +2826,18 @@ impl Firmware {
                             {
                                 break;
                             }
-                            let mut picked = [0usize; sizes::TA_WAVE_PASSES];
+                            let mut picked = [0usize; sizes::TA_WAVE_PASSES_LIGHT];
                             let mut picked_mask = f.claims.pass_mask;
                             let mut precheck_ok = true;
+                            let mut job_heavy = false;
                             for k in 0..n2 {
                                 let Some(Command::Render(r2)) = command(&j2, k) else {
                                     precheck_ok = false;
                                     break;
                                 };
+                                if r2.is_heavy_ta() {
+                                    job_heavy = true;
+                                }
                                 let Some(o2) = j2.command_order(k) else {
                                     precheck_ok = false;
                                     break;
@@ -2789,7 +2894,13 @@ impl Firmware {
                                 picked[k as usize] = slot;
                                 picked_mask |= 1u64 << slot;
                             }
-                            if !precheck_ok || f.group.reserve(1, GFP_NOWAIT).is_err() {
+                            if !precheck_ok
+                                || (job_heavy
+                                    && !wave_heavy
+                                    && ta_pending_before + prefix.renders as usize + n2_usize
+                                        > sizes::TA_WAVE_PASSES)
+                                || f.group.reserve(1, GFP_NOWAIT).is_err()
+                            {
                                 break;
                             }
                             let _ = f.group.push_within_capacity(j2.clone());
@@ -2818,6 +2929,12 @@ impl Firmware {
                             }
                             last_seq = Some(first_seq + u64::from(n2 - 1));
                             more_renders -= n2_usize;
+                            if job_heavy && !wave_heavy {
+                                wave_heavy = true;
+                                let ta_in_wave = ta_pending_before + prefix.renders as usize;
+                                more_renders = more_renders
+                                    .min(sizes::TA_WAVE_PASSES.saturating_sub(ta_in_wave));
+                            }
                         }
                     }
                 }
@@ -3363,6 +3480,7 @@ impl Firmware {
             (refs, false)
         };
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
+        f.heavy_render |= cmd.is_heavy_ta();
         let p = resources.render_pass(k)?;
         let pass = p.refs();
         let heap_bytes = if cmd.cmd.layers > 1 { 0x1000 } else { 0x200 };

@@ -1299,6 +1299,47 @@ pub mod g16 {
         assert_eq!(render.passes[0].pre[0].fills.lock().unwrap().len(),pre0_before);
     }
 
+    #[test]fn stage_displaced_pass_scrubs_prioritizes_pass_cursor_order(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();
+        let mut passes=KVec::new();
+        for k in 0..20 {
+            passes.push(g16::slots::PassSlot::new(&mut o, k as u64, 1, &crate::g16::object::test_cmds((k as u64) as u64)).unwrap(), 0).unwrap();
+        }
+        let render=sync::Arc::new(render_arena(passes), 0).unwrap();
+        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render.clone()),hw_slots:None};
+        let a=vm(1);
+        // Publish and retire slots 0..20 in order so slots 0..19 are displaced dirty and
+        // slot 19 is the undisplaced newest retired slot.
+        for k in 0..20 {
+            let mut c=Claims::new();c.pass[0]=k as u32;c.pass_count=1;c.pass_mask=1u64<<k;
+            s.claim_pass_in(&prep,k,Some(a.id),0x2000).unwrap();
+            s.hold_render_pass(k,&a,&prep).unwrap();
+            s.publish(&mut c).unwrap();
+            render.set_dirty(k,0x1000,0x2000).unwrap();
+            render.passes[k].tilemap.fill(0,0x33,0x2000).unwrap();
+            s.retire(&mut c).unwrap();
+        }
+        // Place pass_cursor at 11: the next pick_pass_in_for scan starts at 11, so the 8-slot
+        // async scrub batch must prioritize displaced slots 11..19 instead of 0..8.
+        s.pass_cursor = 11;
+        s.stage_displaced_pass_scrubs();
+        assert!(s.scrubbing_active());
+        let _ = drain_scrubs(s.take_staged_scrubs());
+        assert!(!s.scrubbing_active());
+        for k in 11..19 {
+            assert_eq!(render.tilemap_dirty[k].load(std::sync::atomic::Ordering::Acquire), 0, "cursor-upcoming slot {k} must be pre-scrubbed");
+        }
+        for k in 0..8 {
+            assert_eq!(render.tilemap_dirty[k].load(std::sync::atomic::Ordering::Acquire), 0x2000, "distant slot {k} waits for later batch");
+        }
+        // Remaining displaced slots stay pending and scrub cleanly on subsequent calls.
+        s.stage_displaced_pass_scrubs();
+        assert!(s.scrubbing_active());
+        let _ = drain_scrubs(s.take_staged_scrubs());
+        for k in 0..8 {
+            assert_eq!(render.tilemap_dirty[k].load(std::sync::atomic::Ordering::Acquire), 0, "remaining slot {k} scrubbed in next batch");
+        }
+    }
 
     #[test]fn offlock_scrub_falls_back_on_error_drop_recovery_and_cross_vm(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);

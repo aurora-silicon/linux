@@ -66,7 +66,8 @@ const EVENT_RETIRE_POLLS: u32 = 11;
 mod hw {
     pub mod sizes {
         pub const TA_WAVE_PASSES: usize = 4;
-        pub const TA_WAVE_REFILL: usize = TA_WAVE_PASSES / 2;
+        pub const TA_WAVE_PASSES_LIGHT: usize = 8;
+        pub const TA_WAVE_REFILL_HEADROOM: usize = 2;
         pub const COMPUTE_PIPES: usize = 2;
         pub const COALESCE_WINDOW_US: u32 = 18;
     }
@@ -324,6 +325,7 @@ struct Firmware {
     drain_fs_delta: u32,
     drain_compute_delta: u32,
     ta_pending: usize,
+    ta_wave_cap: usize,
     coalesce_us: Option<u32>,
     retire_calls: u32,
     publish_full_calls: u32,
@@ -379,6 +381,7 @@ impl Firmware {
             drain_fs_delta: 0,
             drain_compute_delta: 0,
             ta_pending: 0,
+            ta_wave_cap: hw::sizes::TA_WAVE_PASSES,
             coalesce_us: None,
             retire_calls: 0,
             publish_full_calls: 0,
@@ -450,6 +453,9 @@ impl Firmware {
     }
     fn ta_pending_passes(&self) -> usize {
         self.ta_pending
+    }
+    fn active_ta_wave_cap(&self) -> usize {
+        self.ta_wave_cap
     }
 
     __RECLAIM_CLOSED_VM_SLOTS__
@@ -1018,14 +1024,26 @@ fn ta_only_irq_wakes_ta_wave_wait_with_hysteresis_and_short_repoll() {
     assert!(!retry_tail);
     assert!(fw.engine.short_repoll);
 
-    // TA drains to 2 (<= TA_WAVE_REFILL): immediately wakes publish_checked() to launch the
-    // next wave cleanly.
+    // TA drains to 2 (<= cap - TA_WAVE_REFILL_HEADROOM): immediately wakes publish_checked().
     fw.ta_pending = 2;
     assert!(fw
         .poll_step(true, 0, &mut retry_tail, &mut deferred, &mut done)
         .unwrap());
     assert_eq!(fw.publish_checked_calls, 1);
     assert!(fw.engine.short_repoll);
+
+    // Light TA wave cap (8): stays paused at 7 (> 8 - 2), wakes at 6 (<= 6).
+    fw.ta_wave_cap = hw::sizes::TA_WAVE_PASSES_LIGHT;
+    fw.ta_pending = 7;
+    assert!(fw
+        .poll_step(true, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 1);
+    fw.ta_pending = 6;
+    assert!(fw
+        .poll_step(true, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 2);
 
     // Once ta_wave_wait clears, a TA-only 0x70 IRQ stays non_terminal_only (no spin/short_repoll).
     fw.engine.ta_wave_wait = false;
