@@ -54,6 +54,8 @@ struct ave_mctf_layout;
 #define AVE_IPC_BYTES (20 * SZ_1M)
 #define AVE_IPC_CHANNEL_OFF 0x4000
 #define AVE_IPC_HANDSHAKE_OFF 0x24000
+/* Most channel descriptors any firmware publishes (the 6070 one: 7). */
+#define AVE_IPC_MAX_CHANNELS 8
 #define AVE_IPC_SHARED_OFF 0x28000
 #define AVE_IPC_SHARED_BYTES SZ_64K
 #define AVE_IPC_CMD_OFF 0x40000
