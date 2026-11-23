@@ -120,25 +120,26 @@
  * The PMC's DCS floor vote is not touched: an access to that word hangs the bus. Every poll
  * here is bounded.
  */
-static const u64 t6040_acc_apsc_pa[] = { 0x210e20020ULL, 0x211e20020ULL, 0x212e20020ULL };
+static const char *const t6040_acc_apsc[] = { "apsc-e", "apsc-p0", "apsc-p1" };
 #define ACC_APSC_DISABLE	BIT_ULL(23)
 #define ACC_APSC_BUSY		BIT_ULL(7)
 #define ACC_PLL_RELOCK		BIT_ULL(42)
 #define ACC_PLL_RELOCK_COMPLEXES	2
 #define QUIESCE_TIMEOUT_US	2000
 
+/* Each TVM's block, its control word first, and the offset of its status word. */
 static const struct {
-	u64 ctl;
-	u64 status;
+	const char *reg;
+	u32 status;
 } t6040_tvm[] = {
-	{ 0x502920000ULL, 0x502920250ULL },	/* disp2-tvm */
-	{ 0x288e95000ULL, 0x288e953e0ULL },	/* afr-tvm */
-	{ 0x502908000ULL, 0x502908250ULL },	/* dcs-tvm */
-	{ 0x502910000ULL, 0x502910250ULL },
-	{ 0x288e94000ULL, 0x288e943e0ULL },	/* gfx-tvm */
-	{ 0x288e94400ULL, 0x288e947e0ULL },
-	{ 0x502918000ULL, 0x502918250ULL },	/* disp-tvm */
-	{ 0x502900000ULL, 0x502900250ULL },	/* soc-tvm */
+	{ "tvm-disp2", 0x250 },
+	{ "tvm-afr", 0x3e0 },
+	{ "tvm-dcs0", 0x250 },
+	{ "tvm-dcs1", 0x250 },
+	{ "tvm-gfx0", 0x3e0 },
+	{ "tvm-gfx1", 0x3e0 },
+	{ "tvm-disp", 0x250 },
+	{ "tvm-soc", 0x250 },
 };
 
 #define TVM_ENABLE		BIT(0)
@@ -302,8 +303,8 @@ struct t6040_sleep {
 	void __iomem *spmi0;
 	void __iomem *spmi_a0;
 	void __iomem *mastermini;
-	void __iomem *dcs[16];	/* DCS(n,k): 0x220200000 + n * 0x2000000 + k * 0x200000 */
-	void __iomem *atc_cfg[4];	/* ATCPHY_CFG(n) 0x383200000 + n * 0x8000000 */
+	void __iomem *dcs[16];	/* DCS(n,k): reg dcs<4n+k> */
+	void __iomem *atc_cfg[4];	/* ATCPHY_CFG(n): reg atc<n>-cfg */
 	void __iomem *aop_ps;	/* MiniPMGR AOP + audio island PS words 0x508304000..0x158 */
 	u32 sio_ps_saved[(PS_SIO_LAST - PS_SIO_FIRST) / PS_STRIDE + 1];
 	bool sio_ps_saved_valid;
@@ -328,8 +329,7 @@ struct t6040_sleep {
 	void __iomem *agx_gate;
 	void __iomem *s2r_lo_count;
 	void __iomem *acc_apsc[3];
-	void __iomem *tvm_ctl[8];
-	void __iomem *tvm_status[8];
+	void __iomem *tvm[8];
 	void __iomem *pmc_bwr;
 	void __iomem *afr_ps;
 	u32 cluster_saved[CLUSTER_CTL_NR];
@@ -625,23 +625,23 @@ static const struct t6040_axi2af_domain {
 	const char *name;
 	bool east;		/* power word in soc_east (true) or soc_ps (false) */
 	u32 ps_off;
-	phys_addr_t bridge_pa;
+	const char *reg;
 } t6040_axi2af[] = {
-	[AXI2AF_ATC0_COMMON]  = { "atc0_common",  false, 0x390, 0x380000000 },
-	[AXI2AF_ATC1_COMMON]  = { "atc1_common",  false, 0x3b8, 0x388000000 },
-	[AXI2AF_ATC2_COMMON]  = { "atc2_common",  false, 0x3e0, 0x390000000 },
-	[AXI2AF_ATC3_COMMON]  = { "atc3_common",  false, 0x408, 0x398000000 },
-	[AXI2AF_DISP_SYS]     = { "disp_sys",     true,  0x258, 0x403000000 },
-	[AXI2AF_DISPEXT0_SYS] = { "dispext0_sys", false, 0x340, 0x3a3000000 },
-	[AXI2AF_DISPEXT1_SYS] = { "dispext1_sys", false, 0x490, 0x603000000 },
-	[AXI2AF_DISPEXT2_SYS] = { "dispext2_sys", false, 0x4e0, 0x607000000 },
-	[AXI2AF_DISPEXT3_SYS] = { "dispext3_sys", false, 0x2d8, 0x307000000 },
-	[AXI2AF_ANS]          = { "ans",          true,  0x370, 0x40b000000 },
-	[AXI2AF_AVD_SYS]      = { "avd_sys",      false, 0x170, 0x280000000 },
-	[AXI2AF_VENC0_SYS]    = { "venc0_sys",    false, 0x278, 0x282000000 },
-	[AXI2AF_VENC1_SYS]    = { "venc1_sys",    false, 0x2a0, 0x284000000 },
-	[AXI2AF_JPG]          = { "jpg",          true,  0x3a0, 0x486000000 },
-	[AXI2AF_APCIE_SYS_GP] = { "apcie_sys_gp", true,  0x390, 0x416000000 },
+	[AXI2AF_ATC0_COMMON]  = { "atc0_common",  false, 0x390, "atc0-common" },
+	[AXI2AF_ATC1_COMMON]  = { "atc1_common",  false, 0x3b8, "atc1-common" },
+	[AXI2AF_ATC2_COMMON]  = { "atc2_common",  false, 0x3e0, "atc2-common" },
+	[AXI2AF_ATC3_COMMON]  = { "atc3_common",  false, 0x408, "atc3-common" },
+	[AXI2AF_DISP_SYS]     = { "disp_sys",     true,  0x258, "disp-sys" },
+	[AXI2AF_DISPEXT0_SYS] = { "dispext0_sys", false, 0x340, "dispext0-sys" },
+	[AXI2AF_DISPEXT1_SYS] = { "dispext1_sys", false, 0x490, "dispext1-sys" },
+	[AXI2AF_DISPEXT2_SYS] = { "dispext2_sys", false, 0x4e0, "dispext2-sys" },
+	[AXI2AF_DISPEXT3_SYS] = { "dispext3_sys", false, 0x2d8, "dispext3-sys" },
+	[AXI2AF_ANS]          = { "ans",          true,  0x370, "ans" },
+	[AXI2AF_AVD_SYS]      = { "avd_sys",      false, 0x170, "avd-sys" },
+	[AXI2AF_VENC0_SYS]    = { "venc0_sys",    false, 0x278, "venc0-sys" },
+	[AXI2AF_VENC1_SYS]    = { "venc1_sys",    false, 0x2a0, "venc1-sys" },
+	[AXI2AF_JPG]          = { "jpg",          true,  0x3a0, "jpg" },
+	[AXI2AF_APCIE_SYS_GP] = { "apcie_sys_gp", true,  0x390, "apcie-sys-gp" },
 };
 
 static void t6040_pmu_write(struct t6040_sleep *s, u16 reg, u8 val)
@@ -720,14 +720,14 @@ static void t6040_secondaries_off(struct t6040_sleep *s)
 	}
 }
 
-/* The hardware steps of the generic PMGR quiesce, in order (see t6040_acc_apsc_pa). */
+/* The hardware steps of the generic PMGR quiesce, in order (see t6040_acc_apsc). */
 static void t6040_pmgr_quiesce(struct t6040_sleep *s)
 {
 	u64 q;
 	u32 v;
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(t6040_acc_apsc_pa); i++) {
+	for (i = 0; i < ARRAY_SIZE(t6040_acc_apsc); i++) {
 		void __iomem *acc = s->acc_apsc[i];
 
 		if (!acc)
@@ -739,11 +739,11 @@ static void t6040_pmgr_quiesce(struct t6040_sleep *s)
 		if (s->acc_apsc[i])
 			writeq(readq(s->acc_apsc[i]) & ~ACC_PLL_RELOCK, s->acc_apsc[i]);
 	for (i = 0; i < ARRAY_SIZE(t6040_tvm); i++) {
-		if (!s->tvm_ctl[i] || !s->tvm_status[i])
+		if (!s->tvm[i])
 			continue;
-		writel(readl(s->tvm_ctl[i]) & ~TVM_ENABLE, s->tvm_ctl[i]);
-		if (readl_poll_timeout_atomic(s->tvm_status[i], v, !(v & TVM_BUSY), 1,
-					      QUIESCE_TIMEOUT_US))
+		writel(readl(s->tvm[i]) & ~TVM_ENABLE, s->tvm[i]);
+		if (readl_poll_timeout_atomic(s->tvm[i] + t6040_tvm[i].status, v,
+					      !(v & TVM_BUSY), 1, QUIESCE_TIMEOUT_US))
 			s->poll_timeouts++;
 	}
 }
@@ -1945,14 +1945,24 @@ static void __iomem *t6040_sleep_map(struct device *dev, const char *name)
 	return t6040_sleep_map_min(dev, name, 0);
 }
 
+/* A block a sleep can't do without: missing, it fails the probe. */
+static int t6040_sleep_map_req(struct device *dev, void __iomem **p, const char *name, size_t min)
+{
+	*p = t6040_sleep_map_min(dev, name, min);
+	if (!*p)
+		return dev_err_probe(dev, -ENODEV, "register block %s is missing or not mapped\n",
+				     name);
+	return 0;
+}
+
 /*
  * ANS's storage-apcie windows + PLL/lane tunables, from the apple,apcie node
  * the boot object publishes. Our static tree has none
  * of these, so until aura fills the node @valid stays false and a real sleep
  * with ANS stopped refuses (t6040_sleep_refuse). The reg-names and tunable
  * property names match the T8140's apple,apcie shape exactly, so the same
- * loader fills both SoCs. The GP PCIe host (pcie@1cb0000000, Wi-Fi and SD) is a
- * different node, mapped by t6040_sleep_map_gp().
+ * loader fills both SoCs. The GP PCIe host (Wi-Fi and SD) is a different node,
+ * apple,gp-pcie, mapped by t6040_sleep_map_gp().
  */
 static void t6040_sleep_map_apcie(struct t6040_sleep *s)
 {
@@ -1995,7 +2005,7 @@ static void t6040_sleep_map_gp(struct t6040_sleep *s)
 
 	s->gp_perst[0] = -1;
 	s->gp_perst[1] = -1;
-	host = of_find_compatible_node(NULL, NULL, "apple,t6041-pcie");
+	host = of_parse_phandle(s->dev->of_node, "apple,gp-pcie", 0);
 	if (!host)
 		return;
 	/* Also with the host disabled: its port blocks hold DARTs that stay bound. */
@@ -2045,6 +2055,7 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 	struct device *dev = c->dev;
 	struct t6040_sleep *s;
 	struct resource wres;
+	char name[24];
 	int ret, i, widx;
 
 	s = devm_kzalloc(dev, sizeof(*s), GFP_KERNEL);
@@ -2057,8 +2068,8 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 		return ret;
 
 	BUILD_BUG_ON(ARRAY_SIZE(t6040_axi2af) != T6040_AXI2AF_DOMAINS);
-	BUILD_BUG_ON(ARRAY_SIZE(t6040_tvm) != ARRAY_SIZE(((struct t6040_sleep *)0)->tvm_ctl));
-	BUILD_BUG_ON(ARRAY_SIZE(t6040_acc_apsc_pa) !=
+	BUILD_BUG_ON(ARRAY_SIZE(t6040_tvm) != ARRAY_SIZE(((struct t6040_sleep *)0)->tvm));
+	BUILD_BUG_ON(ARRAY_SIZE(t6040_acc_apsc) !=
 		     ARRAY_SIZE(((struct t6040_sleep *)0)->acc_apsc));
 	s->cpu_start = t6040_sleep_map(dev, "cpu-start");
 	s->wdt = t6040_sleep_map(dev, "wdt");
@@ -2082,13 +2093,24 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 		dev_warn(dev, "the wdt block is not the AON watchdog: no WD2 restart at the wake\n");
 
 	s->aop_ps = t6040_sleep_map_min(dev, "aop-ps", AOP_PS_SIZE);
-	for (i = 0; i < ARRAY_SIZE(s->dcs); i++)
-		s->dcs[i] = t6040_ioremap_np(dev, 0x220200000ULL + (i / 4) * 0x2000000ULL +
-					     (i % 4) * 0x200000ULL, 0x2000);
-	for (i = 0; i < ARRAY_SIZE(s->atc_cfg); i++)
-		s->atc_cfg[i] = t6040_ioremap_np(dev, 0x383200000ULL + i * 0x8000000ULL, 0x100);
-	for (i = 0; i < T6040_AXI2AF_DOMAINS; i++)
-		s->axi2af_bridge[i] = t6040_ioremap_np(dev, t6040_axi2af[i].bridge_pa, 0x200);
+	for (i = 0; i < ARRAY_SIZE(s->dcs); i++) {
+		snprintf(name, sizeof(name), "dcs%d", i);
+		ret = t6040_sleep_map_req(dev, &s->dcs[i], name, 0x2000);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < ARRAY_SIZE(s->atc_cfg); i++) {
+		snprintf(name, sizeof(name), "atc%d-cfg", i);
+		ret = t6040_sleep_map_req(dev, &s->atc_cfg[i], name, 0x100);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < T6040_AXI2AF_DOMAINS; i++) {
+		snprintf(name, sizeof(name), "axi2af-%s", t6040_axi2af[i].reg);
+		ret = t6040_sleep_map_req(dev, &s->axi2af_bridge[i], name, 0x200);
+		if (ret)
+			return ret;
+	}
 	t6040_sleep_map_apcie(s);
 	s->dcp_dart = t6040_sleep_map_min(dev, "disp-dart", 0x1000);
 	s->disp_pwrgate = t6040_sleep_map_min(dev, "disp-pwrgate", 0x100);
@@ -2099,11 +2121,16 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 	s->smc_wdt_deadline = t6040_sleep_map_min(dev, "smc-wdt", 4);
 	s->agx_gate = t6040_sleep_map_min(dev, "agx-gate", 4);
 	s->s2r_lo_count = t6040_sleep_map_min(dev, "s2r-count", 4);
-	for (i = 0; i < ARRAY_SIZE(t6040_acc_apsc_pa); i++)
-		s->acc_apsc[i] = t6040_ioremap_np(dev, t6040_acc_apsc_pa[i], 8);
+	for (i = 0; i < ARRAY_SIZE(t6040_acc_apsc); i++) {
+		ret = t6040_sleep_map_req(dev, &s->acc_apsc[i], t6040_acc_apsc[i], 8);
+		if (ret)
+			return ret;
+	}
 	for (i = 0; i < ARRAY_SIZE(t6040_tvm); i++) {
-		s->tvm_ctl[i] = t6040_ioremap_np(dev, t6040_tvm[i].ctl, 4);
-		s->tvm_status[i] = t6040_ioremap_np(dev, t6040_tvm[i].status, 4);
+		ret = t6040_sleep_map_req(dev, &s->tvm[i], t6040_tvm[i].reg,
+					  t6040_tvm[i].status + 4);
+		if (ret)
+			return ret;
 	}
 	s->afr_ps = t6040_sleep_map_min(dev, "gfx-ps", 4);
 	t6040_sleep_map_gp(s);
