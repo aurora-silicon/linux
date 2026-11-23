@@ -308,6 +308,11 @@ struct hw_info {
 	bool pipe_rst;
 	bool no_port_reset;
 	bool mps_timers;
+	/*
+	 * A firmware sleep powers the conventional ports off: the noirq resume
+	 * sets them up again as probe did, after the PWREN GPIOs' provider.
+	 */
+	bool s2r_ports_lost;
 };
 
 static const struct hw_info t8103_hw = {
@@ -331,6 +336,19 @@ static const struct hw_info t602x_hw = {
 	.port_msimap		= PORT_T602X_MSIMAP,
 	/* 16 on t602x, guess for autodetect on future HW */
 	.max_rid2sid		= 512,
+};
+
+/* T604x: the T602x layout, with ports that lose their power in a firmware sleep. */
+static const struct hw_info t6041_hw = {
+	.phy_lane_ctl		= 0,
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_msiaddr_hi	= PORT_T602X_MSIADDR_HI,
+	.port_refclk		= 0,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.max_rid2sid		= 512,
+	.s2r_ports_lost		= true,
 };
 
 /*
@@ -2914,7 +2932,7 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 		port->perst_gpio = reset;
 		port->pwren_gpio = pwren;
 	}
-	if (pwren) {
+	if (pwren && pcie->hw->s2r_ports_lost) {
 		ret = apple_pcie_link_pwren(pcie, pwren);
 		if (ret)
 			return ret;
@@ -7591,7 +7609,8 @@ failed:
  */
 static bool apple_pcie_s2r_conventional(struct apple_pcie *pcie)
 {
-	return READ_ONCE(s2r_conventional) && !pcie->hw->tunneled && !pcie->managed_sids &&
+	return READ_ONCE(s2r_conventional) && pcie->hw->s2r_ports_lost &&
+	       !pcie->hw->tunneled && !pcie->managed_sids &&
 	       !pcie->piodma_supplier && !pcie->hw->root_bus_only;
 }
 
@@ -7732,6 +7751,7 @@ static const struct of_device_id apple_pcie_of_match[] = {
 	/* T8132 currently inherits controller and PHY setup from m1n1. */
 	{ .compatible = "apple,t8132-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t8152-pcie",	.data = &t8152_hw },
+	{ .compatible = "apple,t6041-pcie",	.data = &t6041_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t8140-pcie",	.data = &t8140_hw },
 	{ .compatible = "apple,t6050-pcie",	.data = &t6050_hw },
