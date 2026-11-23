@@ -111,6 +111,7 @@ pub(super) const BUILD_26B123: fw::variant::Build = fw::variant::Build {
     }],
     variant: &fw::variant::Variant {
         ta_mode_1: true,
+        render_id_at_create: true,
         ..fw::variant::V26B123
     },
     config: None,
@@ -212,6 +213,7 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
         render_stage_prefixes: true,
         ta_mode_1: true,
         telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_8MS,
+        render_id_at_create: true,
         ..fw::variant::V25G83
     },
     config: None,

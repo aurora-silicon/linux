@@ -99,8 +99,8 @@ pub(crate) struct Variant {
     /// A context takes its render pool identity when it is created, not at its first render,
     /// so that identities held by render graphs kept until the firmware stops refuse new
     /// contexts with an error instead of failing a context's first render. Set for the A18
-    /// Pro only: the M4 Pro and Max keep the first-render claim until the claim at creation has
-    /// been tested on that hardware.
+    /// Pro and M4 Max (`25G83`/`26B123`); M4 Pro and M4 Max `25F84` keep the first-render
+    /// claim until tested on that hardware.
     pub(crate) render_id_at_create: bool,
     /// Cached descriptor storage, queue records and queue configuration that come back
     /// after their owner's release was consumed are reused once the firmware has consumed
