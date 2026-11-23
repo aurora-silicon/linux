@@ -449,6 +449,7 @@ impl Firmware {
             .firmware
             .port
             .set_generation(service.firmware.recovery.generation());
+        service.firmware.port.reset_m5_history();
         service.firmware.rings.invalidate_statistics();
         let result = result?;
         // Counted once the restart is classified, so the restart that reaches the limit has

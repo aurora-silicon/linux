@@ -7,9 +7,9 @@
 //! through a preparation lease ([`super::Shared::port`]): shutdown and device loss join every
 //! lease before they detach the session. Each piece below is atomic or has its own lock.
 //!
-//! Lock order: device mutex -> compute queue cell -> the locks of this port. The render
-//! publication lock comes first among the port's locks: device mutex -> render publication
-//! lock -> admission pool, QoS, mailbox. Its holder never takes the device mutex.
+//! Lock order: device mutex -> compute queue cell -> the locks of this port. Among the port's
+//! locks: render publication lock -> M5 outer-ring lock -> admission pool, QoS, mailbox. None
+//! of their holders ever takes the device mutex.
 
 use super::{
     fw::{
@@ -70,6 +70,14 @@ impl RingView {
     }
 }
 
+/// Raw pointers to the M5 submission-history table in firmware-shared memory.
+#[derive(Clone, Copy)]
+pub(super) struct M5HistoryView {
+    pub(super) generation: *const AtomicU32,
+    pub(super) config: [*const AtomicU32; 4],
+    pub(super) slots: *mut u8,
+}
+
 /// Raw views of the session's firmware-shared memory, fixed once the firmware is built.
 pub(super) struct Views {
     pub(super) compute: [RingView; PRIORITIES],
@@ -80,6 +88,8 @@ pub(super) struct Views {
     pub(super) qos: *mut u8,
     pub(super) recovery: *const AtomicU32,
     pub(super) mailbox: *const super::Mailbox,
+    pub(super) m5_credits: Option<Arc<super::initdata::outer_credit::Credits>>,
+    pub(super) m5_history: Option<M5HistoryView>,
 }
 
 // SAFETY: The views only name memory and a mailbox owned by the firmware session, which outlives
@@ -109,6 +119,10 @@ pub(super) struct Port {
     /// overlaps are ordered by publication order (see hazard.rs).
     #[pin]
     render: Mutex<()>,
+    /// Serializes M5 shared outer-ring writes, host-port gating transactions, and submission
+    /// history geometry/updates across direct compute publishers and device-mutex publishers.
+    #[pin]
+    m5_outer: Mutex<Option<(u32, u64, u64)>>,
     /// The accepted recovery generation, mirrored for publishers without the device mutex.
     generation: AtomicU64,
     /// Device publication order shared by compute and render commands.
@@ -177,6 +191,7 @@ impl Port {
                 feed,
                 rx_applied <- new_spinlock!(None, "g17::Port::rx_applied"),
                 render <- new_mutex!((), "g17::Port::render"),
+                m5_outer <- new_mutex!(None, "g17::Port::m5_outer"),
                 generation: AtomicU64::new(0),
                 publications: AtomicU64::new(0),
                 effort_full: AtomicBool::new(false),
@@ -305,6 +320,137 @@ impl Port {
     /// Taken around every render publication; see `render`.
     pub(super) fn render_lock(&self) -> MutexGuard<'_, ()> {
         self.render.lock()
+    }
+
+    /// Serializes M5 shared outer-ring and host-port updates with direct M5 compute publishers.
+    pub(super) fn m5_outer_lock(&self) -> MutexGuard<'_, Option<(u32, u64, u64)>> {
+        self.m5_outer.lock()
+    }
+
+    /// Clears the cached M5 submission-history geometry after firmware recovery restarts.
+    pub(super) fn reset_m5_history(&self) {
+        *self.m5_outer.lock() = None;
+    }
+
+    /// Reserves one slot on M5's shared outer ring for a direct compute publisher without
+    /// taking the device mutex. Returns EBUSY if a device-mutex OuterScope is active or full.
+    pub(super) fn reserve_m5_compute(&self, priority: u8) -> Result<super::initdata::OuterClaim> {
+        let views = self.views()?;
+        let credits = views.m5_credits.as_ref().ok_or(EINVAL)?;
+        let (_, ring) = self.ring(priority)?;
+        let _guard = self.m5_outer.lock();
+        if credits.is_scoped() {
+            return Err(EBUSY);
+        }
+        let cursors = ring.cursors()?;
+        credits.reserve(priority, 1, cursors)
+    }
+
+    /// Publishes one compute slot on M5's shared outer ring under the port's M5 outer lock
+    /// and consumes the caller's direct reservation.
+    pub(super) fn publish_m5_compute(
+        &self,
+        priority: u8,
+        claim: &mut super::initdata::OuterClaim,
+        record: &WorkSlot,
+    ) -> Result<u32> {
+        if record.data_master != DataMaster::Compute as u32 {
+            return Err(EINVAL);
+        }
+        let views = self.views()?;
+        let credits = views.m5_credits.as_ref().ok_or(EINVAL)?;
+        let (_, ring) = self.ring(priority)?;
+        let _guard = self.m5_outer.lock();
+        let [first, second, producer] = ring.cursors()?;
+        let next = (producer + 1) % WORK_RING_SLOTS;
+        if next == first || next == second {
+            return Err(EIO);
+        }
+        // SAFETY: The ring view spans WORK_RING_SLOTS records, checked when the session built
+        // it; `producer` is in range. The reservation proves firmware does not own this slot and
+        // `m5_outer` excludes every other host writer on M5's shared outer ring.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                core::ptr::from_ref(record).cast::<u8>(),
+                ring.slots
+                    .add(producer as usize * core::mem::size_of::<WorkSlot>()),
+                core::mem::size_of::<WorkSlot>(),
+            );
+        }
+        fence(Ordering::SeqCst);
+        // SAFETY: As for `RingView::cursors`.
+        unsafe { (*ring.producer).store(next, Ordering::Relaxed) };
+        fence(Ordering::SeqCst);
+        credits.consume_direct(claim)?;
+        Ok(next)
+    }
+
+    /// Issues an M5 host-port compute submission with gating held off, serialized by `m5_outer`.
+    pub(super) fn submit_m5_work_held(
+        &self,
+        submission: &super::fw::m5::queue::HardwareSubmission,
+    ) -> Result {
+        let regs = self.regs.as_ref().ok_or(ENODEV)?;
+        let _guard = self.m5_outer.lock();
+        regs.submit_m5_work_held(submission)
+    }
+
+    /// Counts `submissions` in the M5 submission-history table without taking the device mutex.
+    pub(super) fn note_m5_submission_history(&self, submissions: u8) -> Result {
+        let Some(history) = self.views()?.m5_history else {
+            return Ok(());
+        };
+        let mut geometry = self.m5_outer.lock();
+        for _ in 0..64 {
+            // SAFETY: Pointers name retained, bounds-checked firmware-shared words.
+            let generation = unsafe { (*history.generation).load(Ordering::Acquire) };
+            if generation & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let (period, count) = match *geometry {
+                Some((seen, period, count)) if seen == generation => (period, count),
+                _ => {
+                    // SAFETY: As above; seqlock generation recheck validates consistency.
+                    let c = unsafe {
+                        [
+                            (*history.config[0]).load(Ordering::Relaxed),
+                            (*history.config[1]).load(Ordering::Relaxed),
+                            (*history.config[2]).load(Ordering::Relaxed),
+                            (*history.config[3]).load(Ordering::Relaxed),
+                        ]
+                    };
+                    fence(Ordering::Acquire);
+                    // SAFETY: As above.
+                    if generation != unsafe { (*history.generation).load(Ordering::Acquire) } {
+                        core::hint::spin_loop();
+                        continue;
+                    }
+                    let period = u64::from(c[0]) | (u64::from(c[1]) << 32);
+                    let count = u64::from(c[2]) | (u64::from(c[3]) << 32);
+                    *geometry = Some((generation, period, count));
+                    (period, count)
+                }
+            };
+            if period == 0 || count == 0 || count > 256 {
+                return Err(EINVAL);
+            }
+            let (counter, frequency) = qos::clock();
+            let ticks = qos::time_from_host(counter, frequency)?;
+            let index = (ticks % period) / 25_000;
+            if index >= count {
+                return Err(ERANGE);
+            }
+            // SAFETY: `slots` spans 256 WC bytes and `index < count <= 256`.
+            unsafe {
+                let byte = history.slots.add(index as usize);
+                let value = core::ptr::read_volatile(byte).wrapping_add(submissions);
+                core::ptr::write_volatile(byte, value);
+            }
+            fence(Ordering::SeqCst);
+            return Ok(());
+        }
+        Err(EBUSY)
     }
 
     fn render_rings(&self, priority: u8) -> Result<(RingView, RingView)> {

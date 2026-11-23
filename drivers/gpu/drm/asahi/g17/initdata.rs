@@ -1068,6 +1068,8 @@ impl InitData {
             // The word recovery_state() reads: the status block moves with the firmware build.
             recovery: self.object(self.cluster)?.word(self.recovery_state_offset())?,
             mailbox,
+            m5_credits: self.outer_credits.clone(),
+            m5_history: self.m5_history_view()?,
         })
     }
 

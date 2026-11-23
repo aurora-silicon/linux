@@ -761,6 +761,7 @@ impl crate::g17::Firmware {
         // time and attachment overlaps are ordered by publication order.
         let port = self.port.clone();
         let _render = port.render_lock();
+        let _m5_outer = self.init.is_m5().then(|| port.m5_outer_lock());
         // Both outer destinations must have room before pool accounting or
         // either inner queue becomes visible. On M5 both are the shared compute ring: one
         // check covers the pair, and the pair is written against its cursors (this hold

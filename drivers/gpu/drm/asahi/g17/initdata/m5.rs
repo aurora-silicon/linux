@@ -52,6 +52,25 @@ impl InitData {
             ring(0), ring(1), ring(2), ring(3), page(canonical.start)]
     }
 
+    /// Direct-port view of the M5 submission-history table (none off M5 or on common 26A428).
+    pub(super) fn m5_history_view(&self) -> Result<Option<crate::g17::port::M5HistoryView>> {
+        if !self.m5 || self.graph.is_common26() {
+            return Ok(None);
+        }
+        let private = self.object(self.cluster)?;
+        let base = m::M5_PRIVATE_LAYOUT.status_config;
+        Ok(Some(crate::g17::port::M5HistoryView {
+            generation: private.word(base + 0x74c)?,
+            config: [
+                private.word(base + 0x73c)?,
+                private.word(base + 0x740)?,
+                private.word(base + 0x744)?,
+                private.word(base + 0x748)?,
+            ],
+            slots: private.pointer(base + 0x750, 256)?,
+        }))
+    }
+
     /// Counts `submissions` in the firmware's submission history, in the slot of this moment.
     pub(crate) fn note_m5_submission_history(&self, submissions: u8) -> Result {
         if !self.m5 { return Err(EINVAL); }

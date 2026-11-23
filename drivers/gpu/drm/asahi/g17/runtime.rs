@@ -1617,6 +1617,8 @@ impl compute::Host for ComputeHost<'_> {
 struct DirectHost<'a> {
     port: &'a super::port::Port,
     outer: Option<super::port::OuterClaim<'a>>,
+    m5_outer: Option<&'a mut super::initdata::OuterClaim>,
+    m5: bool,
     generation: u64,
 }
 impl compute::Host for DirectHost<'_> {
@@ -1647,18 +1649,29 @@ impl compute::Host for DirectHost<'_> {
     fn register_queue(&mut self, _queue: &super::fw::kick::KsmQueue) -> Result {
         Err(EAGAIN)
     }
-    fn publish_outer(&mut self, _priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
+    fn publish_outer(&mut self, priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
+        if self.m5 {
+            let claim = self.m5_outer.as_deref_mut().ok_or(EIO)?;
+            return self.port.publish_m5_compute(priority, claim, slot).map(|_| ());
+        }
         self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot).map(|_| ())
     }
     fn notify(&mut self, message: u64) -> Result {
+        if self.m5 && message >> super::MSG_TYPE_SHIFT == 0x83 && message & 3 == 2 {
+            if let Err(error) = self.port.note_m5_submission_history(1) {
+                pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
+            }
+        }
         self.port.notify(message)
     }
     fn note_submission(&mut self) -> Result {
         Ok(())
     }
-    fn submit_m5(&mut self, _submission: &super::fw::m5::queue::HardwareSubmission) -> Result {
-        // M5 never publishes without the device mutex (see compute_direct).
-        Err(EINVAL)
+    fn submit_m5(&mut self, submission: &super::fw::m5::queue::HardwareSubmission) -> Result {
+        if !self.m5 {
+            return Err(EINVAL);
+        }
+        self.port.submit_m5_work_held(submission)
     }
 }
 
@@ -1750,21 +1763,6 @@ impl super::Firmware {
         if self.recovery.pending() {
             return Err(EAGAIN);
         }
-        // No descriptor, accounting or inner producer changes precede this
-        // reservation; dropping it unused returns the work-ring slot. M5 compute takes its
-        // slot on the work ring M5 render shares, under this mutex (InitData::publish_work_at):
-        // a full ring is refused here, before a queue install or kick changes any state.
-        let mut outer_cursors = None;
-        let outer = if self.init.is_m5() {
-            let priority = packet.context.policy().priority();
-            let Some(cursors) = self.init.m5_compute_room(priority)? else {
-                return Err(EAGAIN);
-            };
-            outer_cursors = Some((priority, cursors));
-            None
-        } else {
-            Some(self.port.reserve_compute(packet.context.policy().priority())?)
-        };
         let queues = &mut self.queues;
         let mut queue = queues
             .compute
@@ -1782,6 +1780,22 @@ impl super::Firmware {
         {
             return Err(EAGAIN);
         }
+        // No descriptor, accounting or inner producer changes precede this
+        // reservation; dropping it unused returns the work-ring slot. M5 compute
+        // serializes the shared outer ring and host-port updates under `m5_outer`
+        // (after the compute cell lock, matching direct M5 publishers).
+        let _m5_outer = self.init.is_m5().then(|| self.port.m5_outer_lock());
+        let mut outer_cursors = None;
+        let outer = if self.init.is_m5() {
+            let priority = packet.context.policy().priority();
+            let Some(cursors) = self.init.m5_compute_room(priority)? else {
+                return Err(EAGAIN);
+            };
+            outer_cursors = Some((priority, cursors));
+            None
+        } else {
+            Some(self.port.reserve_compute(packet.context.policy().priority())?)
+        };
         let mut host = ComputeHost {
             shared: &self.primary.state.shared,
             init: &self.init,
@@ -2043,10 +2057,7 @@ impl Backend {
         required: super::freelist::ComputeCapacity,
         deferred: &mut DeferredBatch,
     ) -> Option<Result> {
-        // M5 compute is a shared-ring submission on the ring M5 render shares: it is published only
-        // under the device mutex, never through the classic compute ring producer.
-        if self.context.is_m5()
-            || packet.completion.sources().is_some()
+        if packet.completion.sources().is_some()
             || self.context.render_seen()
             || packet.cancel_requested()
             || packet.completion.status().get() != 0
@@ -2064,29 +2075,49 @@ impl Backend {
         if !port.note_submission() {
             return None;
         }
+        self.shared.note_submitter();
         self.shared.note_gpu_activity();
         match packet.completion.work_state().ok()?.acquire(crate::g17::job::Engine::Compute) {
             Ok(_) => {}
             Err(error) if error == EBUSY => return None,
             Err(error) => return Some(Err(error)),
         }
-        let mut queue = cell.lock()?;
-        if !queue.installed()
-            || queue.spared_pending()
-            || !queue.pool_fits(required)
-            || queue.pending_switch_from().is_some()
-            || !matches!(queue.matches(self.owner, queue.qid(), &self.context), Ok(true))
-            || !lease.is_current()
-        {
-            return None;
-        }
-        let outer = port.reserve_compute(packet.context.policy().priority()).ok()?;
-        let mut host = DirectHost {
-            port,
-            outer: Some(outer),
-            generation: port.generation(),
+        let m5 = self.context.is_m5();
+        let priority = packet.context.policy().priority();
+        // Reserve M5 outer room before locking the compute cell so an unspent claim drops
+        // outside the cell lock (dropping an unspent claim can notify availability fences).
+        let mut m5_outer = if m5 {
+            Some(port.reserve_m5_compute(priority).ok()?)
+        } else {
+            None
         };
-        match queue.publish(packet.clone(), &[], &mut host, &mut |event| deferred.push(event)) {
+        let result = {
+            let mut queue = cell.lock()?;
+            if !queue.installed()
+                || queue.spared_pending()
+                || !queue.pool_fits(required)
+                || queue.pending_switch_from().is_some()
+                || !matches!(queue.matches(self.owner, queue.qid(), &self.context), Ok(true))
+                || !lease.is_current()
+            {
+                return None;
+            }
+            let outer = if m5 {
+                None
+            } else {
+                Some(port.reserve_compute(priority).ok()?)
+            };
+            let mut host = DirectHost {
+                port,
+                outer,
+                m5_outer: m5_outer.as_mut(),
+                m5,
+                generation: port.generation(),
+            };
+            queue.publish(packet.clone(), &[], &mut host, &mut |event| deferred.push(event))
+        };
+        drop(m5_outer);
+        match result {
             Err(error) if (error == EAGAIN || error == EBUSY) && !packet.is_published() => None,
             result => Some(result),
         }

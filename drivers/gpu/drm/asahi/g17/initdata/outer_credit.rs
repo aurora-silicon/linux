@@ -9,7 +9,7 @@ use kernel::{prelude::*, sync::Arc};
 
 const PRIORITIES: usize = 4;
 
-pub(super) struct Credits {
+pub(crate) struct Credits {
     reserved: [AtomicU32; PRIORITIES],
     published: [AtomicU64; PRIORITIES],
     consumers: [AtomicU64; PRIORITIES],
@@ -53,15 +53,19 @@ impl Credits {
 
     pub(super) fn waiting(&self) -> bool { self.available.has_waiters() }
 
-    pub(super) fn capacity(&self, priority: u8, cursors: [u32; 3]) -> Result<u32> {
+    pub(crate) fn is_scoped(&self) -> bool {
+        self.scoped.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn capacity(&self, priority: u8, cursors: [u32; 3]) -> Result<u32> {
         let pending = self.reserved.get(usize::from(priority)).ok_or(EINVAL)?
             .load(Ordering::Acquire);
         Ok(free(cursors)?.saturating_sub(pending))
     }
 
-    /// Reserve under the sole publisher mutex. Off-lock cancellation may only
+    /// Reserve under the outer-ring lock. Off-lock cancellation may only
     /// reduce reserved counts, so the sampled capacity is conservative.
-    pub(super) fn reserve(self: &Arc<Self>, priority: u8, count: u32,
+    pub(crate) fn reserve(self: &Arc<Self>, priority: u8, count: u32,
         cursors: [u32; 3]) -> Result<OuterClaim>
     {
         if count == 0 || count >= WORK_RING_SLOTS { return Err(EINVAL); }
@@ -73,6 +77,20 @@ impl Credits {
         if self.capacity(priority, cursors)? < count { return Err(EBUSY); }
         counter.fetch_add(count, Ordering::AcqRel);
         Ok(OuterClaim { domain: self.clone(), priority: index, remaining: count })
+    }
+
+    /// Consumes one reserved slot for a direct M5 compute publication without touching
+    /// `published[]`, so an enclosing device-mutex `OuterScope` never debits a direct slot.
+    pub(crate) fn consume_direct(&self, claim: &mut OuterClaim) -> Result {
+        if !core::ptr::eq(self, &*claim.domain) {
+            return Err(EINVAL);
+        }
+        if claim.remaining == 0 {
+            return Err(EIO);
+        }
+        claim.remaining -= 1;
+        self.reserved[claim.priority].fetch_sub(1, Ordering::AcqRel);
+        Ok(())
     }
 
     pub(super) fn scope<'a>(self: &Arc<Self>, claim: &'a mut OuterClaim) -> Result<OuterScope<'a>> {
@@ -126,5 +144,106 @@ impl Drop for OuterClaim {
             self.domain.reserved[self.priority].fetch_sub(self.remaining, Ordering::AcqRel);
             self.domain.available.notify();
         }
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_g17_outer_credit)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_consumption_does_not_debit_outer_scope() {
+        let credits = Credits::new().unwrap();
+        let cursors = [0, 0, 0];
+        let full = free(cursors).unwrap();
+        let mut scoped_claim = credits.reserve(1, 2, cursors).unwrap();
+        let mut direct_claim = credits.reserve(1, 1, cursors).unwrap();
+        assert_eq!(credits.capacity(1, cursors).unwrap(), full - 3);
+
+        // Direct publish consumes only its own reserved slot and leaves published[] untouched.
+        assert!(!credits.is_scoped());
+        credits.consume_direct(&mut direct_claim).unwrap();
+        assert_eq!(direct_claim.remaining(), 0);
+        assert_eq!(credits.capacity(1, cursors).unwrap(), full - 2);
+        assert_eq!(credits.counter(1).unwrap().load(Ordering::Acquire), 0);
+
+        // An OuterScope taken afterward keeps its full 2 credits when nothing published via it.
+        {
+            let _scope = credits.scope(&mut scoped_claim).unwrap();
+            assert!(credits.is_scoped());
+            assert!(credits.reserve(1, 1, cursors).is_err());
+        }
+        assert!(!credits.is_scoped());
+        assert_eq!(scoped_claim.remaining(), 2);
+        drop(direct_claim);
+        drop(scoped_claim);
+        assert_eq!(credits.capacity(1, cursors).unwrap(), full);
+    }
+
+    #[test]
+    fn mixed_render_compute_wrap_and_generation_change_with_queued_claim() {
+        let credits = Credits::new().unwrap();
+        let n = WORK_RING_SLOTS;
+        // Producer sits two slots before wrap while both consumers lag 4 slots behind
+        // (free = WORK_RING_SLOTS - 5).
+        let mut consumer_a = n - 6;
+        let mut consumer_b = n - 6;
+        let mut producer = n - 2;
+        let cursors = [consumer_a, consumer_b, producer];
+        let initial_free = free(cursors).unwrap();
+        assert_eq!(initial_free, n - 5);
+
+        // Interleave a queued 2-slot render claim with 1-slot compute claims across ring wrap.
+        let mut queued_render = credits.reserve(2, 2, cursors).unwrap();
+        let mut compute_a = credits.reserve(2, 1, cursors).unwrap();
+        credits.consume_direct(&mut compute_a).unwrap();
+        producer = (producer + 1) % n; // n - 1
+        assert_eq!(
+            credits.capacity(2, [consumer_a, consumer_b, producer]).unwrap(),
+            initial_free - 3,
+        );
+
+        let mut compute_b = credits.reserve(2, 1, [consumer_a, consumer_b, producer]).unwrap();
+        credits.consume_direct(&mut compute_b).unwrap();
+        producer = (producer + 1) % n; // 0 (wrapped!)
+        assert_eq!(producer, 0);
+
+        // Fill remaining capacity so exactly 1 free slot remains; 2-slot render must fail EBUSY
+        // while 1-slot compute still succeeds across the wrap boundary.
+        let rem = credits.capacity(2, [consumer_a, consumer_b, producer]).unwrap();
+        let filler = credits.reserve(2, rem - 1, [consumer_a, consumer_b, producer]).unwrap();
+        assert_eq!(credits.capacity(2, [consumer_a, consumer_b, producer]).unwrap(), 1);
+        assert_eq!(credits.reserve(2, 2, [consumer_a, consumer_b, producer]).err(), Some(EBUSY));
+        let mut edge_compute = credits.reserve(2, 1, [consumer_a, consumer_b, producer]).unwrap();
+        credits.consume_direct(&mut edge_compute).unwrap();
+        producer = (producer + 1) % n; // 1
+        assert_eq!(credits.capacity(2, [consumer_a, consumer_b, producer]).unwrap(), 0);
+        drop(filler);
+
+        // Consumers advance across the wrap boundary and report progress.
+        consumer_a = 1;
+        consumer_b = 1;
+        let wrapped = [consumer_a, consumer_b, producer];
+        assert!(credits.progressed(2, wrapped).unwrap());
+        assert_eq!(credits.capacity(2, wrapped).unwrap(), (n - 1) - 2);
+
+        // Simulate locked render / recovery entering OuterScope while a queued compute claim
+        // waits across a generation change: new reserves fail EBUSY and direct consumption never
+        // debits OuterScope's published counter; dropping the queued claim after the generation
+        // change releases its reserved credits cleanly.
+        let queued_compute = credits.reserve(2, 1, wrapped).unwrap();
+        {
+            let _scope = credits.scope(&mut queued_render).unwrap();
+            assert!(credits.is_scoped());
+            assert_eq!(credits.reserve(2, 1, wrapped).err(), Some(EBUSY));
+            credits.counter(2).unwrap().fetch_add(2, Ordering::AcqRel);
+        }
+        assert!(!credits.is_scoped());
+        assert_eq!(queued_render.remaining(), 0);
+        // Generation changed before queued_compute published: dropping it returns its credit.
+        assert_eq!(queued_compute.remaining(), 1);
+        drop(queued_compute);
+        drop(queued_render);
+        assert_eq!(credits.capacity(2, wrapped).unwrap(), n - 1);
     }
 }
