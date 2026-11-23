@@ -1644,6 +1644,15 @@ static int brcmf_pcie_init_ringbuffers(struct brcmf_pciedev_info *devinfo)
 	}
 
 	if (devinfo->dma_idx_sz != 0) {
+		/* The host index arrays hold one index per ring the driver uses */
+		if (max_submissionrings <
+		    BRCMF_NROF_H2D_COMMON_MSGRINGS + max_flowrings ||
+		    max_completionrings < BRCMF_NROF_D2H_COMMON_MSGRINGS) {
+			brcmf_err(bus, "invalid ring counts: %u submission, %u completion, %u flowrings\n",
+				  max_submissionrings, max_completionrings,
+				  max_flowrings);
+			return -EINVAL;
+		}
 		bufsz = (max_submissionrings + max_completionrings) *
 			devinfo->dma_idx_sz * 2;
 		devinfo->idxbuf = dma_alloc_coherent(&devinfo->pdev->dev, bufsz,

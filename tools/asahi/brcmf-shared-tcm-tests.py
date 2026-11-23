@@ -7,6 +7,7 @@ address the driver does not check makes a control fail. Each --mutation drops on
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -17,7 +18,7 @@ DRIVER = ROOT / 'drivers/net/wireless/broadcom/brcm80211/brcmfmac'
 
 
 def function(source, name):
-    match = re.search(r'^(?:static\s+)?(?:inline\s+)?(?:void|int|bool|s32)\s+' + name +
+    match = re.search(r'^(?:static\s+)?(?:inline\s+)?(?:void|int|bool|s32|u16)\s+' + name +
                       r'\([^;]*?\)\s*\{', source, re.M)
     if not match:
         raise ValueError('Missing function ' + name)
@@ -101,8 +102,6 @@ static u16 brcmf_pcie_read_tcm16(struct brcmf_pciedev_info *d, u32 a) { u16 v; i
 static u8 brcmf_pcie_read_tcm8(struct brcmf_pciedev_info *d, u32 a) { in_tcm(d, a, 1); return tcm[a]; }
 static void brcmf_pcie_write_tcm32(struct brcmf_pciedev_info *d, u32 a, u32 v) { in_tcm(d, a, 4); memcpy(tcm + a, &v, 4); }
 static void brcmf_pcie_write_tcm16(struct brcmf_pciedev_info *d, u32 a, u16 v) { in_tcm(d, a, 2); memcpy(tcm + a, &v, 2); }
-static u16 brcmf_pcie_read_idx(struct brcmf_pciedev_info *d, u32 a) { (void)d; (void)a; return 0; }
-static void brcmf_pcie_write_idx(struct brcmf_pciedev_info *d, u32 a, u16 v) { (void)d; (void)a; (void)v; }
 static struct brcmf_pciedev_info devinfo;
 static void memcpy_fromio(void *dst, const u8 *src, size_t n)
 { assert(src >= tcm); in_tcm(&devinfo, (u32)(src - tcm), (u32)n); memcpy(dst, src, n); }
@@ -193,6 +192,14 @@ int main(void)
  /* The flowring indices count against the TCM too. */
  reset(); assert(!init()); ringinfo()->h2d_w_idx_ptr = TCM_SIZE - 4 * 4; ringinfo()->max_flowrings = 3;
  assert(rings() == -EINVAL); cases++;
+ /* Host memory ring indices: one per ring the driver uses, in a buffer sized from the ring counts. */
+ reset(); put32(SHARED + BRCMF_SHARED_FLAGS_OFFSET, 6 | BRCMF_PCIE_SHARED_DMA_INDEX | BRCMF_PCIE_SHARED_DMA_2B_IDX);
+ assert(!init() && devinfo.dma_idx_sz == 2 && !rings() && !errs); cases++;
+ /* Fewer submission or completion rings than the driver uses fail setup. */
+ reset(); put32(SHARED + BRCMF_SHARED_FLAGS_OFFSET, 6 | BRCMF_PCIE_SHARED_DMA_INDEX);
+ assert(!init()); ringinfo()->max_submissionrings = 2; assert(rings() == -EINVAL); cases++;
+ reset(); put32(SHARED + BRCMF_SHARED_FLAGS_OFFSET, 6 | BRCMF_PCIE_SHARED_DMA_INDEX);
+ assert(!init()); ringinfo()->max_completionrings = 0; assert(rings() == -EINVAL); cases++;
  /* A console descriptor or buffer outside the TCM leaves the console off; setup goes on. */
  reset(); put32(SHARED + BRCMF_SHARED_CONSOLE_ADDR_OFFSET, TCM_SIZE - 4);
  assert(!init() && !devinfo.shared.console.base_addr); cases++;
@@ -227,6 +234,8 @@ MUTATIONS = {
                  '\t\tif (0 && !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,\n\t\t\t\t\t\th2d_w_idx_ptr, h2d_idx_len) ||'),
     'flowring-idx': ('\t\th2d_idx_len = (BRCMF_NROF_H2D_COMMON_MSGRINGS + max_flowrings) *',
                      '\t\th2d_idx_len = (BRCMF_NROF_H2D_COMMON_MSGRINGS) *'),
+    'dma-counts': ('\t\tif (max_submissionrings <\n\t\t    BRCMF_NROF_H2D_COMMON_MSGRINGS + max_flowrings ||\n'
+                   '\t\t    max_completionrings < BRCMF_NROF_D2H_COMMON_MSGRINGS) {', '\t\tif (false) {'),
     'console-desc': ('\tif (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr,\n'
                      '\t\t\t\t\tBRCMF_CONSOLE_WRITEIDX_OFFSET + 4)) {', '\tif (false) {'),
     'console-buf': ('\t    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->buf_addr,\n'
@@ -260,7 +269,7 @@ def main():
     defines += '#define BRCMF_NROF_COMMON_MSGRINGS (BRCMF_NROF_H2D_COMMON_MSGRINGS + BRCMF_NROF_D2H_COMMON_MSGRINGS)\n'
     structs = struct((DRIVER / 'msgbuf.h').read_text(), 'msgbuf_buf_addr') + struct(pcie, 'brcmf_pcie_dhi_ringinfo')
     body = function((DRIVER / 'pcie.h').read_text(), 'brcmf_pcie_tcm_range_valid') + ''.join(
-        function(pcie, n) for n in ('brcmf_pcie_bus_console_init', 'brcmf_pcie_bus_console_read',
+        function(pcie, n) for n in ('brcmf_pcie_read_idx', 'brcmf_pcie_write_idx', 'brcmf_pcie_bus_console_init', 'brcmf_pcie_bus_console_read',
                                     'brcmf_pcie_init_ringbuffers', 'brcmf_pcie_init_share_ram_info'))
     if args.mutation:
         old, new = MUTATIONS[args.mutation]
@@ -277,7 +286,8 @@ def main():
         subprocess.run(['clang', '-std=gnu11', '-O1', '-g', '-fsanitize=address,undefined',
                         '-fno-sanitize-recover=all', '-Wno-incompatible-function-pointer-types',
                         str(source), '-o', str(exe)], check=True)
-        result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+        env = dict(os.environ, ASAN_OPTIONS='abort_on_error=1')
+        result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60, env=env)
         receipt = {'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr,
                    'limits': 'Fake TCM and dongle tables; no firmware, PCIe link or DMA proof.'}
         (out / 'results.json').write_text(json.dumps(receipt, indent=2) + '\n')
