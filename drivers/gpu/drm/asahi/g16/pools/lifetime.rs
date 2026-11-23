@@ -122,6 +122,12 @@ impl<const N: usize> Lifetime<N> {
     pub(crate) fn any_quarantined_within(&self, n: usize) -> bool {
         (0..n.min(N)).any(|k| self.units[k].state == State::Quarantined)
     }
+    /// Whether owner `k` is permanently quarantined.
+    pub(crate) fn is_quarantined(&self, k: usize) -> bool {
+        self.units
+            .get(k)
+            .is_some_and(|u| u.state == State::Quarantined)
+    }
     pub(crate) fn claim(&mut self, k: usize) -> bool {
         if !self.available(k) {
             return false;

@@ -64,7 +64,10 @@ impl ComputeArena {
         let mut objects = factory.objects(vm);
         let mut compute = KVec::with_capacity(units.len(), GFP_KERNEL)?;
         for k in units {
-            compute.push(ComputeSlot::new(&mut objects, k as u64)?, GFP_KERNEL)?;
+            compute.push(
+                ComputeSlot::new(&mut objects, factory, k as u64)?,
+                GFP_KERNEL,
+            )?;
         }
         objects.finish_private()?;
         Ok(Arc::new(
@@ -301,7 +304,7 @@ impl RenderArena {
         for k in 0..BASE_RENDER_SLOTS {
             passes.push(PassSlot::new(&mut objects, k as u64, 1)?, GFP_KERNEL)?;
         }
-        let pools = PoolSet::new_with_slots(&mut objects, base_pb_slots)?;
+        let pools = PoolSet::new_with_slots(&mut objects, factory, base_pb_slots)?;
         objects.finish_private()?;
         Ok(Arc::new(
             Self(crate::cleanup::Deferred::new(RenderInner {
@@ -425,8 +428,13 @@ impl PoolExtArena {
         heap: &Arc<super::object::FwObject>,
     ) -> Result<Arc<Self>> {
         let mut objects = factory.objects(vm);
-        let allocator =
-            super::pools::Allocator::new_at(&mut objects, local_idx as u64, hw_slot as u32, heap)?;
+        let allocator = super::pools::Allocator::new_at(
+            &mut objects,
+            factory,
+            local_idx as u64,
+            hw_slot as u32,
+            heap,
+        )?;
         objects.finish_private()?;
         Ok(Arc::new(
             Self(crate::cleanup::Deferred::new(PoolExtInner {
@@ -1195,6 +1203,13 @@ impl Prepared {
                 .and_then(|slot| slot.as_ref())
                 .map(|ext| PbOwnerArena::Ext(base.clone(), ext.clone(), heap_ext))
         }
+    }
+    /// VM-free firmware lease keeping PB/UMA allocator slot `k`'s `descriptor` + `submitted`
+    /// pages mapped in context-0 UAT across closed-VM reclaim.
+    pub(crate) fn pb_uma_lease(&self, k: usize) -> Option<Arc<super::object::FwLease>> {
+        self.pb_allocator(k)
+            .ok()
+            .map(super::pools::Allocator::uma_lease)
     }
     fn render_ext_for(&self, k: usize) -> Option<(&Arc<RenderExtArena>, usize)> {
         for tier in self.render_ext.iter().take_while(|t| t.is_some()).flatten() {

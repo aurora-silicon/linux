@@ -107,15 +107,26 @@ pub mod g16 {
             pub fn r32(&self,o:usize)->Result<u32>{let d=self.data.lock().unwrap();Ok(u32::from_le_bytes(d[self.offset+o..self.offset+o+4].try_into().unwrap()))}
             pub fn snapshot(&self)->Vec<u8>{self.data.lock().unwrap().clone()}
         }
+        pub struct FwLease(pub crate::cleanup::Deferred<Objects>);
+        impl FwLease {
+            pub fn new(mut objects: Objects) -> Result<Arc<Self>> {
+                objects.finish_private()?;
+                Arc::new(Self(crate::cleanup::Deferred::new(objects)?), 0)
+            }
+        }
         pub struct Factory;
-        impl Factory{pub fn objects(&self,_:&())->Objects{Objects::new()}}
+        impl Factory{
+            pub fn objects(&self,_:&super::vm::MockVm)->Objects{Objects::new()}
+            pub fn fw_objects(&self)->Objects{Objects::new()}
+        }
+        pub static NEXT_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0xfffffc2001000000);
         std::thread_local!{pub static ALL_OBJECTS:std::cell::RefCell<Vec<Arc<FwObject>>>=const{std::cell::RefCell::new(Vec::new())};}
-        pub struct Objects{pub objects:Vec<Arc<FwObject>>,next:u64}
+        pub struct Objects{pub objects:Vec<Arc<FwObject>>}
         impl Objects{
-            pub fn new()->Self{Self{objects:vec![],next:0xfffffc2001000000}}
+            pub fn new()->Self{Self{objects:vec![]}}
             pub fn finish_private(&mut self)->Result{Ok(())}
             pub fn alloc_dynamic_client(&mut self,size:usize)->Result<Arc<FwObject>>{self.alloc(Request{size,class:Class::Shared,placement:Placement::Anywhere,offset:0,client:Some((0x7040000000,super::hw::pte::LEAF_NC)),lower:None,cpu:true})}
-            pub fn alloc(&mut self,r:Request)->Result<Arc<FwObject>>{let bytes=(r.size+r.offset+0x3fff)&!0x3fff;let va=self.next;self.next+=bytes as u64+0x4000;let x=Arc::new(FwObject{class:r.class,client_leaf:r.client.map(|c|c.1),va:va+r.offset as u64,gva:r.client.map(|c|c.0+r.offset as u64),lower_gva:r.lower.map(|g|g+r.offset as u64),lower_leaf:r.lower.map(|_|super::hw::pte::LOWER),size:r.size,mapped:bytes,offset:r.offset,data:std::sync::Arc::new(std::sync::Mutex::new(if r.cpu{vec![0;bytes]}else{vec![]})),fills:std::sync::Mutex::new(Vec::new()),fail_fill:std::sync::atomic::AtomicBool::new(false),write_bytes:std::sync::atomic::AtomicUsize::new(0)},0)?;self.objects.push(x.clone());ALL_OBJECTS.with(|a|a.borrow_mut().push(x.clone()));Ok(x)}
+            pub fn alloc(&mut self,r:Request)->Result<Arc<FwObject>>{let bytes=(r.size+r.offset+0x3fff)&!0x3fff;let va=NEXT_VA.fetch_add(bytes as u64+0x4000,std::sync::atomic::Ordering::Relaxed);let x=Arc::new(FwObject{class:r.class,client_leaf:r.client.map(|c|c.1),va:va+r.offset as u64,gva:r.client.map(|c|c.0+r.offset as u64),lower_gva:r.lower.map(|g|g+r.offset as u64),lower_leaf:r.lower.map(|_|super::hw::pte::LOWER),size:r.size,mapped:bytes,offset:r.offset,data:std::sync::Arc::new(std::sync::Mutex::new(if r.cpu{vec![0;bytes]}else{vec![]})),fills:std::sync::Mutex::new(Vec::new()),fail_fill:std::sync::atomic::AtomicBool::new(false),write_bytes:std::sync::atomic::AtomicUsize::new(0)},0)?;self.objects.push(x.clone());ALL_OBJECTS.with(|a|a.borrow_mut().push(x.clone()));Ok(x)}
         }
     }
     pub mod graph {
@@ -140,8 +151,15 @@ pub mod g16 {
         pub struct PassRefs{pub ta_work:u64,pub ta_work_gva:u64,pub fs_work:u64,pub fs_work_gva:u64,pub ta_seq:u64,pub fs_seq:u64,pub scene:u64,pub tpc_gva:u64,pub tilemap_gva:u64,pub heap_gva:u64,pub scene_user_gva:u64,pub scene_list:u64,pub pre_gva:[u64;3],pub fs_scratch_gva:u64,pub aux_gva:u64,pub its:u64,pub ta_scratch:u64,pub tpc_fw:u64,pub scratch_fw:u64}
     }
     pub mod vm {
-        use crate::{mmu,sync::Arc};use core::sync::atomic::Ordering;
-        pub struct VmState{pub id:u64,pub slot:u32,pub generation:u8,pub vm:()}
+        use crate::{mmu,sync::Arc};
+        use core::sync::atomic::{AtomicBool,Ordering};
+        pub struct MockVm(AtomicBool);
+        impl MockVm{
+            pub fn new()->Self{Self(AtomicBool::new(false))}
+            pub fn is_closed(&self)->bool{self.0.load(Ordering::Acquire)}
+            pub fn close(&self){self.0.store(true,Ordering::Release);}
+        }
+        pub struct VmState{pub id:u64,pub slot:u32,pub generation:u8,pub vm:MockVm}
         struct Registry{live:std::sync::Arc<std::sync::atomic::AtomicU32>}impl Registry{fn release(&self,_file:u64){self.live.fetch_sub(1,Ordering::AcqRel);}}
         __LIVE_TOKEN__
         __LIVE_DROP__
@@ -171,10 +189,17 @@ pub mod g16 {
                 match self{Self::Base(a)=>Some((a.passes.get(k)?,PassDirty{tpc:a.tpc_dirty.get(k)?,tilemap:a.tilemap_dirty.get(k)?,tilemap_last:a.tilemap_last.get(k)?,tilemap_clean:a.tilemap_clean.get(k)?,heap:a.heap_dirty.get(k)?}))}
             }
         }
+        std::thread_local!{
+            pub static COMPUTE_OWNER_ARENA:std::cell::RefCell<
+                Option<crate::sync::Arc<ComputeArena>>,
+            >=const{std::cell::RefCell::new(None)};
+        }
         impl ComputeArena{
             pub fn compute_units(&self)->Result<usize>{Ok(self.compute.len())}
             pub fn compute_unit(&self,k:usize)->Result<&super::slots::ComputeSlot>{self.compute.get(k).ok_or(EINVAL)}
-            pub fn compute_arena(&self,_k:usize)->Option<crate::sync::Arc<ComputeArena>>{None}
+            pub fn compute_arena(&self,_k:usize)->Option<crate::sync::Arc<ComputeArena>>{
+                COMPUTE_OWNER_ARENA.with(|a|a.borrow().clone())
+            }
             pub fn render_arena(&self)->Option<crate::sync::Arc<RenderArena>>{self.render.clone()}
             pub fn render_passes(&self)->Result<usize>{self.render.as_deref().map(|r|r.passes.len()).ok_or(EINVAL)}
             pub fn render_pass(&self,k:usize)->Result<&super::slots::PassSlot>{self.render.as_deref().and_then(|r|r.passes.get(k)).ok_or(EINVAL)}
@@ -218,9 +243,13 @@ pub mod g16 {
             heap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
         }
     }
+    fn find_va(va:u64)->sync::Arc<g16::object::FwObject>{
+        g16::object::ALL_OBJECTS.with(|a|a.borrow().iter().find(|obj|obj.va==va).unwrap().clone())
+    }
     fn arenas(o:&mut Objects)->Arenas{
         let mut compute=KVec::new();let mut passes=KVec::new();
-        for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
+        let f=g16::object::Factory;
+        for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,&f,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
         Arenas{compute:g16::resources::ComputeArena{compute,render:None},render:render_arena(passes)}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();}
@@ -269,7 +298,7 @@ pub mod g16 {
     }
     #[test]fn production_allocations_are_aligned_disjoint_and_in_mesa_hole(){
         let mut o=Objects::new();let slots=Slots::new().unwrap();let arena=arenas(&mut o);
-        let pools=PoolSet::new(&mut o).unwrap();
+        let pools=PoolSet::new(&mut o,&g16::object::Factory).unwrap();
         let mut aliases=Vec::new();
         for a in &o.objects{if let Some(g)=a.gva{assert_eq!(a.client_leaf,Some(__PRIVATE_RW__),"private GPU alias must match qualified J713 NC RW PTE");let base=g-a.offset as u64;assert_eq!(base&0x3fff,0);assert_eq!(a.mapped&0x3fff,0);assert!(base>=0x7000000000);assert!(base+a.mapped as u64<=0x7100000000);aliases.push((base,base+a.mapped as u64));}}
         aliases.push((0x1000000000,0x1000010000)); // Per-VM context store.
@@ -315,11 +344,11 @@ pub mod g16 {
         }
     }
     #[test]fn allocator_metadata_is_firmware_only_and_shared_state_keeps_real_backing(){
-        let mut o=Objects::new();let pools=PoolSet::new(&mut o).unwrap();
+        let mut o=Objects::new();let pools=PoolSet::new(&mut o,&g16::object::Factory).unwrap();
         let read64=|obj:&g16::object::FwObject,at:usize|->u64{obj.r32(at).unwrap()as u64|((obj.r32(at+4).unwrap()as u64)<<32)};
         for k in 0..2 {
             let refs=pools.allocator_refs_for(k).unwrap();
-            let descriptor=o.objects.iter().find(|obj|obj.va==refs.uma_mgr[0]).unwrap();
+            let descriptor=find_va(refs.uma_mgr[0]);
             let auxiliary=o.objects.iter().find(|obj|obj.va+0x100==refs.uma_aux[0]).unwrap();
             assert_eq!(descriptor.class,g16::object::Class::Fw);
             assert_eq!(descriptor.gva,None);assert_eq!(descriptor.client_leaf,None);
@@ -342,8 +371,8 @@ pub mod g16 {
             }
             assert_eq!(metadata,descriptor.snapshot());
             // Freelist and pool-table pointers still select writable client mappings.
-            let state_va=read64(descriptor,g16::fw::graph::manager::FREELIST);
-            let list_va=read64(descriptor,g16::fw::graph::manager::POOL_TABLE);
+            let state_va=read64(&descriptor,g16::fw::graph::manager::FREELIST);
+            let list_va=read64(&descriptor,g16::fw::graph::manager::POOL_TABLE);
             for va in [list_va,state_va] {
                 let shared=o.objects.iter().find(|obj|obj.gva==Some(va)).unwrap();
                 assert_eq!(shared.class,g16::object::Class::Shared);
@@ -369,11 +398,11 @@ pub mod g16 {
         s.publish(&mut c).unwrap();s.quarantine(&mut c);assert!(s.compute_exhausted());
     }
     #[test]fn production_render_descriptors_preserve_firmware_bytes_and_exact_counter(){
-        let mut o=Objects::new();let mut pools=PoolSet::new(&mut o).unwrap();
+        let mut o=Objects::new();let mut pools=PoolSet::new(&mut o,&g16::object::Factory).unwrap();
         let a=pools.prepare(0,1).unwrap();assert!(a.init_buffer);assert_eq!(a.uma_submitted,2);
         assert!(!pools.retired(0).unwrap());pools.publish_batch(0,2,1).unwrap();
         assert!(pools.publish_batch(0,2,1).is_err());assert!(pools.prepare(0,2).is_err());
-        let d=o.objects.iter().find(|o|o.va==a.uma_mgr[0]).unwrap();
+        let d=find_va(a.uma_mgr[0]);
         d.w64(0x54,2).unwrap();d.w64(0x60,0x5a5aa5a5).unwrap();
         let original=d.snapshot();assert!(pools.retired(0).unwrap());
         let next=pools.prepare(0,2).unwrap();assert!(next.init_buffer);assert_eq!(next.uma_submitted,4);
@@ -382,9 +411,15 @@ pub mod g16 {
 
     #[test]fn cross_vm_evidence_counts_only_noted_publication(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
-        let a=sync::Arc::new(g16::vm::VmState{id:100,slot:1,generation:1,vm:()},0).unwrap();
-        let b=sync::Arc::new(g16::vm::VmState{id:101,slot:2,generation:1,vm:()},0).unwrap();
-        let c=sync::Arc::new(g16::vm::VmState{id:102,slot:3,generation:9,vm:()},0).unwrap();
+        let a=sync::Arc::new(
+            g16::vm::VmState{id:100,slot:1,generation:1,vm:g16::vm::MockVm::new()},0,
+        ).unwrap();
+        let b=sync::Arc::new(
+            g16::vm::VmState{id:101,slot:2,generation:1,vm:g16::vm::MockVm::new()},0,
+        ).unwrap();
+        let c=sync::Arc::new(
+            g16::vm::VmState{id:102,slot:3,generation:9,vm:g16::vm::MockVm::new()},0,
+        ).unwrap();
         let mut claims=Claims::new();
         for vm in [&a,&b]{s.claim_compute(&arena.compute,&mut claims,0).unwrap().unwrap();s.hold_vm(&claims,vm).unwrap();s.publish(&mut claims).unwrap();s.note_published(&claims);s.retire(&mut claims).unwrap();}
         assert_eq!(s.stats.cross_vm_retargets,[0,0]);
@@ -401,7 +436,11 @@ pub mod g16 {
         s.release(&mut claims);s.note_published(&claims);assert_eq!(s.stats.cross_vm_retargets,[1,0]);
     }
 
-    fn vm(id:u64)->sync::Arc<g16::vm::VmState>{sync::Arc::new(g16::vm::VmState{id,slot:id as u32,generation:1,vm:()},0).unwrap()}
+    fn vm(id:u64)->sync::Arc<g16::vm::VmState>{
+        sync::Arc::new(
+            g16::vm::VmState{id,slot:id as u32,generation:1,vm:g16::vm::MockVm::new()},0,
+        ).unwrap()
+    }
     #[test]fn previous_vm_lease_survives_replacement_publication_until_full_retirement(){
         let mut o=Objects::new();let arena=arenas(&mut o);let mut s=Slots::new().unwrap();
         let a=vm(1);let b=vm(2);let c=vm(3);let mut claims=Claims::new();
@@ -605,15 +644,15 @@ pub mod g16 {
         assert_eq!(g16::hw::sizes::RENDER_SLOTS, 48);
         assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 24);
         let mut o=Objects::new();
-        let pools=PoolSet::new(&mut o).unwrap();
+        let pools=PoolSet::new(&mut o,&g16::object::Factory).unwrap();
         for idx in 0..g16::hw::sizes::EXT_PB_SLOTS {
             let local=(g16::hw::sizes::BASE_PB_SLOTS+idx) as u64;
             let hw_slot=(g16::hw::sizes::WARM_PB_SLOTS+idx) as u32;
-            let ext=g16::pools::Allocator::new_at(&mut o,local,hw_slot,pools.heap()).unwrap();
+            let ext=g16::pools::Allocator::new_at(&mut o,&g16::object::Factory,local,hw_slot,pools.heap()).unwrap();
             assert_eq!(ext.refs().unwrap().parameter_id,hw_slot);
         }
         for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
-            g16::slots::ComputeSlot::new(&mut o,k).unwrap();
+            g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap();
         }
         let mut scene_lists=Vec::new();
         let count_client=|objs:&Objects|objs.objects.iter().filter(|a|a.gva.is_some()).count();
@@ -655,7 +694,7 @@ pub mod g16 {
     }
 
     #[test]fn decoupled_pb_allocator_supports_same_vm_pipelining_cross_vm_displacement_and_abort(){
-        let mut o=Objects::new();let pools=PoolSet::new(&mut o).unwrap();
+        let mut o=Objects::new();let pools=PoolSet::new(&mut o,&g16::object::Factory).unwrap();
         let vm1=vm(1);let vm2=vm(2);let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
         let e1=g16::pools::PbEpoch::new(&factory,&vm1,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
         e1.prepare(0,0x70c0000000,2048).unwrap();e1.check_assignment(0).unwrap();e1.expose();
@@ -668,7 +707,7 @@ pub mod g16 {
         let a1=pools.prepare_in_flight(0,1,false).unwrap();
         assert_eq!(a1.uma_submitted,2);
         pools.publish_batch(0,2,1).unwrap();p.publish_flight(0);
-        let d0=o.objects.iter().find(|obj|obj.va==a1.uma_mgr[0]).unwrap();
+        let d0=find_va(a1.uma_mgr[0]);
         d0.w64(0x54,2).unwrap();
         p.retire_flight(0,&e1,b1,true).unwrap();
         // Same-VM pipelining: 3 concurrent renders share slot 0 with cumulative uma_submitted (4, 6, 8).
@@ -705,12 +744,14 @@ pub mod g16 {
 
     #[test]fn render_allocators_use_distinct_uma_slots_within_firmware_window(){
         let mut o=Objects::new();
-        let pools=PoolSet::new_with_slots(&mut o,[7,8]).unwrap();
+        let f=g16::object::Factory;
+        let pools=PoolSet::new_with_slots(&mut o,&f,[7,8]).unwrap();
         assert_eq!(pools.unit(0).unwrap().id(),7);
         assert_eq!(pools.unit(1).unwrap().id(),8);
         assert_eq!(
             g16::pools::Allocator::new_at(
                 &mut o,
+                &f,
                 g16::hw::sizes::MAX_VM_PB_SLOTS as u64,
                 0,
                 pools.heap()
@@ -720,6 +761,7 @@ pub mod g16 {
         assert_eq!(
             g16::pools::Allocator::new_at(
                 &mut o,
+                &f,
                 0,
                 g16::hw::sizes::PB_SLOTS as u32,
                 pools.heap()
@@ -729,10 +771,10 @@ pub mod g16 {
         let mut uma_slots=Vec::new();
         for k in 0..g16::hw::sizes::PB_SLOTS {
             let local=(k % g16::hw::sizes::MAX_VM_PB_SLOTS) as u64;
-            let alloc=g16::pools::Allocator::new_at(&mut o,local,k as u32,pools.heap()).unwrap();
+            let alloc=g16::pools::Allocator::new_at(&mut o,&f,local,k as u32,pools.heap()).unwrap();
             let refs=alloc.prepare_in_flight(1,false).unwrap();
             assert_eq!(refs.parameter_id,k as u32);
-            let desc=o.objects.iter().find(|obj|obj.va==refs.uma_mgr[0]).unwrap();
+            let desc=find_va(refs.uma_mgr[0]);
             let slot_id=desc.r32(8).unwrap();
             let expected=g16::hw::engine::RENDER_UMA_SLOT+k as u32;
             assert_eq!(slot_id,expected);
@@ -1151,10 +1193,12 @@ pub mod g16 {
         let mut o=Objects::new();
         let mut units=KVec::new();
         for k in 0..hw::sizes::COMPUTE_UNITS {
-            units.push(ComputeSlot::new(&mut o,k as u64).unwrap(),0).unwrap();
+            units.push(ComputeSlot::new(&mut o,&g16::object::Factory,k as u64).unwrap(),0).unwrap();
         }
         let prep=ComputeArena{compute:units,render:None};
-        let a=Arc::new(vm::VmState{id:1,slot:1,generation:1,vm:()},0).unwrap();
+        let a=Arc::new(
+            vm::VmState{id:1,slot:1,generation:1,vm:vm::MockVm::new()},0,
+        ).unwrap();
         let mut s=Slots::new().unwrap();
         assert_eq!(s.free_compute_in(hw::sizes::COMPUTE_UNITS),hw::sizes::COMPUTE_UNITS as u32);
         // Claim 4 units into one Claims for a compute horizon, publish, and retire in order.
@@ -1237,7 +1281,7 @@ pub mod g16 {
         s.release(&mut cancel2);
 
         // PoolSet::publish_batch advances submitted by 2 * renders and rejects invalid deltas.
-        let pools=PoolSet::new(&mut o).unwrap();
+        let pools=PoolSet::new(&mut o,&g16::object::Factory).unwrap();
         assert_eq!(pools.publish_batch(0,0,0),Err(EINVAL));
         assert_eq!(pools.publish_batch(0,4,3),Err(EINVAL));
         assert_eq!(pools.publish_batch(0,6,3),Ok(()));
@@ -1417,7 +1461,7 @@ pub mod g16 {
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
         let mut units=KVec::new();
         for k in 0..4u64 {
-            units.push(g16::slots::ComputeSlot::new(&mut o,k).unwrap(),0).unwrap();
+            units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
         }
         let prep_full=g16::resources::ComputeArena{compute:units,render:None};
         let a=vm(1);let b=vm(2);
@@ -1444,7 +1488,7 @@ pub mod g16 {
         // A base-only (2-unit) VM can now claim displaced base unit 0 again.
         let mut base_units=KVec::new();
         for k in 0..2u64 {
-            base_units.push(g16::slots::ComputeSlot::new(&mut o,k).unwrap(),0).unwrap();
+            base_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
         }
         let prep_base=g16::resources::ComputeArena{compute:base_units,render:None};
         assert_eq!(s.claim_compute_for(&prep_base,&mut c,Some(b.id)).unwrap(),Some(0));
@@ -1455,7 +1499,7 @@ pub mod g16 {
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
         let mut units=KVec::new();
         for k in 0..4u64 {
-            units.push(g16::slots::ComputeSlot::new(&mut o,k).unwrap(),0).unwrap();
+            units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
         }
         let prep=g16::resources::ComputeArena{compute:units,render:None};
         let a=vm(1);let b=vm(2);
@@ -1492,7 +1536,7 @@ pub mod g16 {
         // reclaims displaced extension unit 2 on the 4-unit VM without touching base units 0..2.
         let mut base_units=KVec::new();
         for k in 0..2u64 {
-            base_units.push(g16::slots::ComputeSlot::new(&mut o,k).unwrap(),0).unwrap();
+            base_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
         }
         let prep_base=g16::resources::ComputeArena{compute:base_units,render:None};
         let mut c0c=Claims::new();
@@ -1788,7 +1832,7 @@ pub mod g16 {
         let mut s = Slots::new().unwrap();
         let mut units = KVec::new();
         for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
-            units.push(g16::slots::ComputeSlot::new(&mut o, k).unwrap(), 0).unwrap();
+            units.push(g16::slots::ComputeSlot::new(&mut o, &g16::object::Factory, k).unwrap(), 0).unwrap();
         }
         let prep = g16::resources::ComputeArena { compute: units, render: None };
         let vms = [vm(1), vm(2), vm(3), vm(4)];
@@ -2021,6 +2065,370 @@ pub mod g16 {
         assert_eq!(page_obj.r32(1023 * 4 * 4).unwrap(), 0);
         assert_eq!(block_obj.r32(1023 * 8).unwrap(), 0);
     }
+
+    #[test]fn closed_vms_reclaim_displaced_pb_render_and_compute_slots(){
+        use g16::hw::sizes::{COMPUTE_UNITS, WARM_PB_SLOTS};
+        use g16::resources::{COMPUTE_OWNER_ARENA, ComputeArena, PbOwnerArena};
+        use g16::slots::{ComputeSlot, PassSlot};
+
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let mut p = g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let mut s = Slots::new().unwrap();
+        let mut o = Objects::new();
+
+        let mut compute_slots = KVec::new();
+        for k in 0..COMPUTE_UNITS {
+            compute_slots.push(ComputeSlot::new(&mut o, &g16::object::Factory, k as u64).unwrap(), 0).unwrap();
+        }
+        let mut passes = KVec::new();
+        for k in 0..18 {
+            passes.push(PassSlot::new(&mut o, k as u64, 1).unwrap(), 0).unwrap();
+        }
+        let shared_prep_compute = ComputeArena { compute: compute_slots, render: None };
+        let geo = g16::encode::Geometry { tpc_bytes: 0x1000, tilemap_bytes: 0x2000 };
+
+        let mut vms = Vec::new();
+        let mut epochs = Vec::new();
+        let mut pb_arenas = Vec::new();
+        let mut pass_arenas = Vec::new();
+        let mut comp_arenas = Vec::new();
+
+        // Bind and retire 16 VMs across warm PB slots, render passes, and compute units.
+        for i in 0..WARM_PB_SLOTS {
+            let v = vm(400 + i as u64);
+            let pb_arena = sync::Arc::new(render_arena(KVec::new()), 0).unwrap();
+            let mut r_passes = KVec::new();
+            for k in 0..18 {
+                r_passes.push(PassSlot::new(&mut o, k as u64, 1).unwrap(), 0).unwrap();
+            }
+            let r_arena = sync::Arc::new(render_arena(r_passes), 0).unwrap();
+            let r_prep = ComputeArena { compute: KVec::new(), render: Some(r_arena.clone()) };
+            let c_arena = sync::Arc::new(
+                ComputeArena { compute: KVec::new(), render: None }, 0,
+            ).unwrap();
+
+            // 1) PB slot i
+            let pb_slot = i;
+            let e = g16::pools::PbEpoch::new(
+                &factory,
+                &v,
+                g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            ).unwrap();
+            e.prepare(pb_slot, g16::hw::client::pb_heap(0), 512).unwrap();
+            e.expose();
+            let b = p.bind(pb_slot, false);
+            p.hold_alloc(pb_slot, &v, Some(PbOwnerArena::Base(pb_arena.clone())), None).unwrap();
+            p.publish_flight(pb_slot);
+            p.retire_flight(pb_slot, &e, b, true).unwrap();
+
+            // 2) Render pass slot i
+            let pk = s.pick_pass_in_for(&r_prep, &geo, 0, Some(v.id)).unwrap();
+            s.claim_pass_in(&r_prep, pk, Some(v.id), geo.tilemap_bytes).unwrap();
+            let mut rc = Claims::new();
+            rc.pass[0] = pk as u32;
+            rc.pass_count = 1;
+            rc.pass_mask = 1u64 << pk;
+            s.hold_render_pass(pk, &v, &r_prep).unwrap();
+            s.publish(&mut rc).unwrap();
+            s.retire(&mut rc).unwrap();
+
+            // 3) Compute unit i
+            let mut cc = Claims::new();
+            let ck = s
+                .claim_compute_for(&shared_prep_compute, &mut cc, Some(v.id))
+                .unwrap()
+                .unwrap();
+            COMPUTE_OWNER_ARENA.with(|a| *a.borrow_mut() = Some(c_arena.clone()));
+            s.hold_compute_slot(ck, &v, &shared_prep_compute).unwrap();
+            COMPUTE_OWNER_ARENA.with(|a| *a.borrow_mut() = None);
+            s.publish(&mut cc).unwrap();
+            s.retire(&mut cc).unwrap();
+
+            vms.push(v);
+            epochs.push(e);
+            pb_arenas.push(pb_arena);
+            pass_arenas.push(r_arena);
+            comp_arenas.push(c_arena);
+        }
+
+        // Live VMs stay pinned and reusable across reclaim_closed().
+        assert!(!p.reclaim_closed());
+        assert!(!s.reclaim_closed());
+        for i in 0..WARM_PB_SLOTS {
+            assert!(sync::Arc::strong_count(&pb_arenas[i]) > 1);
+            assert!(sync::Arc::strong_count(&pass_arenas[i]) > 1);
+            assert!(sync::Arc::strong_count(&comp_arenas[i]) > 1);
+            assert!(p.reusable(i, &vms[i]).is_some());
+        }
+
+        // Close all VMs: displaced slots 0..15 reclaim immediately; last (15) stays undisplaced.
+        for v in &vms {
+            v.vm.close();
+        }
+        assert!(p.reclaim_closed(), "undisplaced last PB slot remains");
+        assert!(s.reclaim_closed(), "undisplaced last render/compute slot remain");
+        // Displaced pass scrubs must skip closed VMs.
+        s.stage_displaced_pass_scrubs();
+        assert!(!s.scrubbing_active());
+
+        let last = WARM_PB_SLOTS - 1;
+        for i in 0..last {
+            assert_eq!(sync::Arc::strong_count(&pb_arenas[i]), 1, "PB arena {i} reclaimed");
+            assert_eq!(sync::Arc::strong_count(&epochs[i]), 1, "PB epoch {i} reclaimed");
+            assert_eq!(sync::Arc::strong_count(&pass_arenas[i]), 1, "pass arena {i} reclaimed");
+            assert_eq!(sync::Arc::strong_count(&comp_arenas[i]), 1, "compute arena {i} reclaimed");
+            assert_eq!(sync::Arc::strong_count(&vms[i]), 2);
+        }
+        // Final undisplaced slot stays protected until displaced.
+        assert_eq!(sync::Arc::strong_count(&pb_arenas[last]), 2);
+        assert_eq!(sync::Arc::strong_count(&pass_arenas[last]), 2);
+        assert_eq!(sync::Arc::strong_count(&comp_arenas[last]), 2);
+
+        // Live VM runs 1 render + 1 compute, displacing slot 15 everywhere.
+        let live = vm(500);
+        let live_r_arena = sync::Arc::new(render_arena(passes), 0).unwrap();
+        let live_r_prep = ComputeArena { compute: KVec::new(), render: Some(live_r_arena.clone()) };
+        let live_slot = p.pick_slot_in_mask_blocks(&live, false, 0b11, 0, 512).unwrap();
+        assert_eq!(live_slot, 0);
+        let live_e = g16::pools::PbEpoch::new(
+            &factory,
+            &live,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+        ).unwrap();
+        live_e.prepare(live_slot, g16::hw::client::pb_heap(0), 512).unwrap();
+        live_e.expose();
+        let lb = p.bind(live_slot, false);
+        p.hold_alloc(live_slot, &live, Some(PbOwnerArena::Base(live_r_arena.clone())), None).unwrap();
+        p.publish_flight(live_slot);
+        p.retire_flight(live_slot, &live_e, lb, true).unwrap();
+
+        let lpk = s.pick_pass_in_for(&live_r_prep, &geo, 0, Some(live.id)).unwrap();
+        s.claim_pass_in(&live_r_prep, lpk, Some(live.id), geo.tilemap_bytes).unwrap();
+        let mut lrc = Claims::new();
+        lrc.pass[0] = lpk as u32;
+        lrc.pass_count = 1;
+        lrc.pass_mask = 1u64 << lpk;
+        s.hold_render_pass(lpk, &live, &live_r_prep).unwrap();
+        s.publish(&mut lrc).unwrap();
+        s.retire(&mut lrc).unwrap();
+
+        let mut lcc = Claims::new();
+        let lck = s
+            .claim_compute_for(&shared_prep_compute, &mut lcc, Some(live.id))
+            .unwrap()
+            .unwrap();
+        s.hold_compute_slot(lck, &live, &shared_prep_compute).unwrap();
+        s.publish(&mut lcc).unwrap();
+        s.retire(&mut lcc).unwrap();
+
+        // Now slot 15 is displaced -> reclaim_closed() evicts it and returns false (0 remaining).
+        assert!(!p.reclaim_closed());
+        assert!(!s.reclaim_closed());
+        assert_eq!(sync::Arc::strong_count(&pb_arenas[last]), 1);
+        assert_eq!(sync::Arc::strong_count(&epochs[last]), 1);
+        assert_eq!(sync::Arc::strong_count(&pass_arenas[last]), 1);
+        assert_eq!(sync::Arc::strong_count(&comp_arenas[last]), 1);
+        drop(epochs);
+        for (i, v) in vms.iter().enumerate() {
+            assert_eq!(sync::Arc::strong_count(v), 1, "closed VM {i} fully released");
+        }
+
+        // Active off-lock scrub on a closed VM's displaced pass slot waits for scrub completion.
+        let mut s2 = Slots::new().unwrap();
+        let mut sc_passes = KVec::new();
+        for k in 0..2 {
+            sc_passes.push(PassSlot::new(&mut o, k as u64, 1).unwrap(), 0).unwrap();
+        }
+        let sc_arena = sync::Arc::new(render_arena(sc_passes), 0).unwrap();
+        let sc_prep = ComputeArena { compute: KVec::new(), render: Some(sc_arena.clone()) };
+        let va = vm(600);
+        let vb = vm(601);
+        for (k, owner) in [(0usize, &va), (1usize, &vb)] {
+            s2.claim_pass_in(&sc_prep, k, Some(owner.id), 0x2000).unwrap();
+            sc_prep.set_pass_dirty(k, 0x1000, 0x2000, 0x200).unwrap();
+            let mut c = Claims::new();
+            c.pass[0] = k as u32;
+            c.pass_count = 1;
+            c.pass_mask = 1u64 << k;
+            s2.hold_render_pass(k, owner, &sc_prep).unwrap();
+            s2.publish(&mut c).unwrap();
+            s2.retire(&mut c).unwrap();
+        }
+        // Stage off-lock scrub on displaced slot 0 while va is still open, then close va.
+        s2.stage_displaced_pass_scrubs();
+        assert!(s2.scrubbing_active());
+        let batch = s2.take_staged_scrubs();
+        va.vm.close();
+        assert!(s2.reclaim_closed(), "must not evict slot 0 mid-scrub");
+        assert_eq!(sync::Arc::strong_count(&va), 2);
+        // Running the scrub wakes the reclaim waiter, then reclaim_closed() evicts slot 0.
+        assert!(drain_scrubs(batch));
+        assert!(s2.take_scrub_woke());
+        assert!(!s2.reclaim_closed());
+        assert_eq!(sync::Arc::strong_count(&va), 1);
+
+        // Quarantined closed-VM slots stay pinned forever AND do not keep reclaim_closed() armed.
+        let vq = vm(700);
+        let mut pq = g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let eq = g16::pools::PbEpoch::new(
+            &factory,
+            &vq,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+        ).unwrap();
+        pq.hold_alloc(0, &vq, Some(PbOwnerArena::Base(sc_arena.clone())), None).unwrap();
+        pq.publish_flight(0);
+        pq.quarantine_flight(0, Some(eq.clone()));
+        let mut cq = Claims::new();
+        let qk = s2.claim_compute_for(&shared_prep_compute, &mut cq, Some(vq.id)).unwrap().unwrap();
+        s2.hold_compute_slot(qk, &vq, &shared_prep_compute).unwrap();
+        s2.publish(&mut cq).unwrap();
+        s2.quarantine(&mut cq);
+        vq.vm.close();
+        assert!(!pq.reclaim_closed(), "quarantined PB slot must not spin reclaim");
+        assert!(!s2.reclaim_closed(), "quarantined compute slot must not spin reclaim");
+        assert!(sync::Arc::strong_count(&vq) > 1, "quarantined leases stay retained");
+    }
+    #[test]fn closed_vm_reclaim_retains_firmware_pb_and_uma_leases_until_overwritten(){
+        use g16::hw::sizes::{COMPUTE_UNITS, WARM_PB_SLOTS};
+        use g16::resources::{COMPUTE_OWNER_ARENA, ComputeArena, PbOwnerArena};
+        use g16::slots::ComputeSlot;
+
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let mut p = g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let mut s = Slots::new().unwrap();
+        let mut o = Objects::new();
+
+        // VM1 primes PB/UMA slot 0 and compute unit 0; VM2 displaces both via slot 1 / unit 1.
+        let vm1 = vm(1001);
+        let vm2 = vm(1002);
+        let vm3 = vm(1003);
+
+        let pools1 = PoolSet::new_with_slots(&mut o, &factory, [0, 1]).unwrap();
+        let uma1 = pools1.unit(0).unwrap().uma_lease();
+        let r_arena1 = sync::Arc::new(render_arena(KVec::new()), 0).unwrap();
+        let e1 = g16::pools::PbEpoch::new(
+            &factory,
+            &vm1,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+        ).unwrap();
+        let pb_lease1 = e1.records_lease();
+        e1.prepare(0, g16::hw::client::pb_heap(0), 512).unwrap();
+        e1.expose();
+        let b1 = p.bind(0, false);
+        p.hold_alloc(0, &vm1, Some(PbOwnerArena::Base(r_arena1.clone())), Some(uma1.clone())).unwrap();
+        p.publish_flight(0);
+        p.retire_flight(0, &e1, b1, true).unwrap();
+
+        let pools2 = PoolSet::new_with_slots(&mut o, &factory, [1, 2]).unwrap();
+        let uma2 = pools2.unit(0).unwrap().uma_lease();
+        let r_arena2 = sync::Arc::new(render_arena(KVec::new()), 0).unwrap();
+        let e2 = g16::pools::PbEpoch::new(
+            &factory,
+            &vm2,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+        ).unwrap();
+        e2.prepare(1, g16::hw::client::pb_heap(0), 512).unwrap();
+        e2.expose();
+        let b2 = p.bind(1, false);
+        p.hold_alloc(1, &vm2, Some(PbOwnerArena::Base(r_arena2.clone())), Some(uma2.clone())).unwrap();
+        p.publish_flight(1);
+        p.retire_flight(1, &e2, b2, true).unwrap();
+
+        // Compute unit 0 owned by VM1, displaced by VM2 on unit 1.
+        let mut units1 = KVec::new();
+        for k in 0..COMPUTE_UNITS {
+            units1.push(ComputeSlot::new(&mut o, &factory, k as u64).unwrap(), 0).unwrap();
+        }
+        let c_uma1 = units1[0].uma_lease();
+        let prep1 = ComputeArena { compute: units1, render: None };
+        let c_arena1 = sync::Arc::new(ComputeArena { compute: KVec::new(), render: None }, 0).unwrap();
+        let mut cc1 = Claims::new();
+        assert_eq!(s.claim_compute_for(&prep1, &mut cc1, Some(vm1.id)).unwrap(), Some(0));
+        COMPUTE_OWNER_ARENA.with(|a| *a.borrow_mut() = Some(c_arena1.clone()));
+        s.hold_compute_slot(0, &vm1, &prep1).unwrap();
+        COMPUTE_OWNER_ARENA.with(|a| *a.borrow_mut() = None);
+        s.publish(&mut cc1).unwrap();
+        s.retire(&mut cc1).unwrap();
+
+        let mut units2 = KVec::new();
+        for k in 0..COMPUTE_UNITS {
+            units2.push(ComputeSlot::new(&mut o, &factory, k as u64).unwrap(), 0).unwrap();
+        }
+        let prep2 = ComputeArena { compute: units2, render: None };
+        let mut cc2 = Claims::new();
+        assert_eq!(s.claim_compute_for(&prep2, &mut cc2, Some(vm2.id)).unwrap(), Some(1));
+        s.hold_compute_slot(1, &vm2, &prep2).unwrap();
+        s.publish(&mut cc2).unwrap();
+        s.retire(&mut cc2).unwrap();
+
+        let mut units3 = KVec::new();
+        units3.push(ComputeSlot::new(&mut o, &factory, 0).unwrap(), 0).unwrap();
+        let c_uma3 = units3[0].uma_lease();
+        let prep3 = ComputeArena { compute: units3, render: None };
+
+        // Drop local arena/epoch/pool handles for VM1 and close VM1.
+        drop(e1);
+        drop(pools1);
+        drop(prep1);
+        vm1.vm.close();
+
+        // Reclaim evicts VM1's VmState, RenderArena, PbEpoch, and ComputeArena immediately,
+        // WHILE retaining its tiny VM-free firmware PB & UMA leases until overwritten!
+        assert!(!p.reclaim_closed());
+        assert!(!s.reclaim_closed());
+        assert_eq!(sync::Arc::strong_count(&vm1), 1, "VM1 VmState/TTBAT must release immediately");
+        assert_eq!(sync::Arc::strong_count(&r_arena1), 1, "VM1 RenderArena/PB heap must release");
+        assert_eq!(sync::Arc::strong_count(&c_arena1), 1, "VM1 ComputeArena/32MiB pool must release");
+        assert_eq!(sync::Arc::strong_count(&pb_lease1), 2, "pb_mgr_table[0] lease must stay mapped");
+        assert_eq!(sync::Arc::strong_count(&uma1), 2, "render uma_mgr_table[33] lease must stay mapped");
+        assert_eq!(sync::Arc::strong_count(&c_uma1), 2, "compute uma_mgr_table[1] lease must stay mapped");
+
+        // Cancelling an unpublished replacement on slot 0 / unit 0 must NOT release VM1's leases.
+        let pools3 = PoolSet::new_with_slots(&mut o, &factory, [0, 2]).unwrap();
+        let uma3 = pools3.unit(0).unwrap().uma_lease();
+        let r_arena3 = sync::Arc::new(render_arena(KVec::new()), 0).unwrap();
+        p.hold_alloc(0, &vm3, Some(PbOwnerArena::Base(r_arena3.clone())), Some(uma3.clone())).unwrap();
+        p.cancel_alloc(0);
+        assert_eq!(sync::Arc::strong_count(&uma1), 2);
+        assert_eq!(sync::Arc::strong_count(&uma3), 2);
+
+        let mut cc3_cancel = Claims::new();
+        assert_eq!(s.claim_compute_for(&prep3, &mut cc3_cancel, Some(vm3.id)).unwrap(), Some(0));
+        s.hold_compute_slot(0, &vm3, &prep3).unwrap();
+        s.release(&mut cc3_cancel);
+        assert_eq!(sync::Arc::strong_count(&c_uma1), 2);
+
+        // Once VM3 retires on exact hardware slot 0 / unit 0, firmware tables are overwritten and
+        // VM1's old FwLeases drop cleanly while VM3's leases become retained.
+        let e3 = g16::pools::PbEpoch::new(
+            &factory,
+            &vm3,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+        ).unwrap();
+        let pb_lease3 = e3.records_lease();
+        e3.prepare(0, g16::hw::client::pb_heap(0), 512).unwrap();
+        e3.expose();
+        let b3 = p.bind(0, false);
+        p.hold_alloc(0, &vm3, Some(PbOwnerArena::Base(r_arena3)), Some(uma3.clone())).unwrap();
+        p.publish_flight(0);
+        p.retire_flight(0, &e3, b3, true).unwrap();
+        assert_eq!(sync::Arc::strong_count(&pb_lease1), 1, "overwritten pb_mgr_table[0] lease dropped");
+        assert_eq!(sync::Arc::strong_count(&uma1), 1, "overwritten render uma_mgr_table[33] lease dropped");
+        assert_eq!(sync::Arc::strong_count(&pb_lease3), 3, "new PB lease held by epoch + retained_pb");
+        assert_eq!(sync::Arc::strong_count(&uma3), 3, "new render UMA lease held by pool + retained_uma");
+
+        let mut cc3 = Claims::new();
+        assert_eq!(s.claim_compute_for(&prep3, &mut cc3, Some(vm3.id)).unwrap(), Some(0));
+        s.hold_compute_slot(0, &vm3, &prep3).unwrap();
+        s.publish(&mut cc3).unwrap();
+        s.retire(&mut cc3).unwrap();
+        assert_eq!(sync::Arc::strong_count(&c_uma1), 1, "overwritten compute uma_mgr_table[1] lease dropped");
+        assert_eq!(sync::Arc::strong_count(&c_uma3), 3, "new compute UMA lease held by unit + retained_uma");
+        let _ = WARM_PB_SLOTS;
+    }
+
 }
 '''
 poll_source = (production/'poll.rs').read_text()
@@ -2031,6 +2439,9 @@ assert 'while let Some(mut item) = self.scrub_queue.lock().pop()' not in poll_so
 assert 'self.enqueue_scrubs(scrubs)' in poll_source, 'poll.rs must enqueue scrubs asynchronously'
 assert 'OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_scrub"), false)' in mod_source
 assert 'self.scrub_wq.drain();' in sleep_source, 'sleep.rs::join_workers must drain scrub_wq'
+assert 'closed_vm_reclaim' in mod_source
+assert 'self.shared.closed_vm_reclaim.store(true, Ordering::Release);' in mod_source
+assert 'reclaim_closed_vm_slots' in poll_source
 lifetime_source = (production.parent / 'mmu' / 'lifetime.rs').read_text()
 is_closed_fn = item(lifetime_source, 'pub(crate) fn is_closed(')
 assert '.lock()' not in is_closed_fn, 'Vm::is_closed() must be lock-free'
@@ -2107,7 +2518,7 @@ for command in [
         raise SystemExit(result.returncode)
 files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs']
 (out/'resource-host.json').write_text(json.dumps({
-    'result': 'pass', 'tests': 38,
+    'result': 'pass', 'tests': 40,
     'scope': 'Actual production allocation, initialization and lifetime code against a CPU-only backing recorder; no hardware qualification.',
     'private_rw_pte': hex(private_rw),
     'private_rw_reference': 'Qualified J713 NC read/write leaf attributes',

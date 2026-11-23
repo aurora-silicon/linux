@@ -2569,6 +2569,7 @@ impl Firmware {
                 f.pb_slot as usize,
                 &job.vm,
                 job.resources.pb_owner_arena(f.pb_slot as usize),
+                job.resources.pb_uma_lease(f.pb_slot as usize),
             )?;
         }
         // Reserve lifetime ownership before any counter or producer becomes reachable.

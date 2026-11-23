@@ -250,6 +250,9 @@ pub(crate) struct Shared {
     /// Set by external state changes (VM teardown, unstarted queue cancellation) so the next
     /// `poll_step()` re-evaluates `publish_checked()` even while unrelated flights are active.
     pub(crate) publish_wake: AtomicBool,
+    /// Set on VM close (and re-armed while any non-quarantined slot still holds a closed VM)
+    /// so displaced closed-VM slot leases are reclaimed without scanning on the hot path.
+    pub(crate) closed_vm_reclaim: AtomicBool,
     /// CPU that last submitted work, for placing the per-CPU completion worker.
     pub(crate) submitter: AtomicU32,
     /// CPU whose cluster currently restricts `events_unbound` (`u32::MAX` before first pin).
@@ -643,6 +646,7 @@ impl Gpu {
                 crashed: AtomicBool::new(false),
                 evented: AtomicBool::new(false),
                 publish_wake: AtomicBool::new(false),
+                closed_vm_reclaim: AtomicBool::new(false),
                 submitter: AtomicU32::new(u32::MAX),
                 unbound_cluster_cpu: AtomicU32::new(u32::MAX),
                 unbound_pinning: AtomicBool::new(false),
@@ -893,6 +897,7 @@ impl gpu::Gpu for Gpu {
     }
     fn vm_closed(&self, vm: &mmu::Vm) {
         self.vms.close(vm.id());
+        self.shared.closed_vm_reclaim.store(true, Ordering::Release);
         self.shared.wake_publish();
     }
 
