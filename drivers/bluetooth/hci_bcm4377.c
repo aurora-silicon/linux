@@ -3126,7 +3126,7 @@ static void bcm4377_sleep_finish(struct device *dev)
 
 static int bcm4377_resume(struct device *dev);
 
-static int bcm4377_suspend(struct device *dev)
+static int __bcm4377_suspend(struct device *dev, bool wake)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
@@ -3155,7 +3155,7 @@ static int bcm4377_suspend(struct device *dev)
 		return ret;
 	}
 
-	if (device_may_wakeup(dev)) {
+	if (wake && device_may_wakeup(dev)) {
 		ret = enable_irq_wake(pdev->irq);
 		if (ret) {
 			int resume_ret;
@@ -3191,6 +3191,51 @@ static int bcm4377_suspend(struct device *dev)
 	if (ret)
 		bcm4377_resume(dev);
 	return ret;
+}
+
+static int bcm4377_suspend(struct device *dev)
+{
+	return __bcm4377_suspend(dev, true);
+}
+
+/*
+ * Hibernation: nothing wakes the system from an image freeze, and a
+ * controller left running for a wakeup keeps writing to host memory while
+ * the image is created or, in the kernel that loads one, while the image is
+ * restored over that memory. Quiesce the firmware without a wake source.
+ */
+static int bcm4377_freeze(struct device *dev)
+{
+	return __bcm4377_suspend(dev, false);
+}
+
+/*
+ * Restore from hibernation. The rings in the image date from its freeze,
+ * but the controller went on: it ran on through the image write
+ * (test_resume), or the kernel that loaded the image set it up again. The
+ * resume commands would only time out; rebind, and probe sets it up from
+ * scratch, as after a power loss.
+ */
+static int bcm4377_restore(struct device *dev)
+{
+	struct bcm4377_data *bcm4377 = pci_get_drvdata(to_pci_dev(dev));
+	int ret;
+
+	ret = apple_radio_sleep_endpoint_resume(dev);
+	if (ret)
+		return ret;
+
+	if (bcm4377->wake_armed) {
+		disable_irq_wake(bcm4377->pdev->irq);
+		bcm4377->wake_armed = false;
+	}
+	bcm4377->quiesced = false;
+	bcm4377->resume_powered = false;
+	/* The firmware's rings are not the image's: reset at the close. */
+	bcm4377->needs_reset = true;
+	WRITE_ONCE(bcm4377->setup_retry_blocked, false);
+	__bcm4377_queue_rebind(bcm4377, "restored from hibernation", true);
+	return 0;
 }
 
 static int bcm4377_resume(struct device *dev)
@@ -3279,7 +3324,12 @@ static int bcm4377_resume_noirq(struct device *dev)
 }
 
 static const struct dev_pm_ops bcm4377_ops = {
-	SYSTEM_SLEEP_PM_OPS(bcm4377_suspend, bcm4377_resume)
+	.suspend = pm_sleep_ptr(bcm4377_suspend),
+	.resume = pm_sleep_ptr(bcm4377_resume),
+	.freeze = pm_sleep_ptr(bcm4377_freeze),
+	.thaw = pm_sleep_ptr(bcm4377_resume),
+	.poweroff = pm_sleep_ptr(bcm4377_freeze),
+	.restore = pm_sleep_ptr(bcm4377_restore),
 	.resume_noirq = bcm4377_resume_noirq,
 };
 
