@@ -758,18 +758,11 @@ impl RootV27_2 {
         }
         for (i, state) in states.iter().enumerate() {
             let [mv] = state.volt_mv.as_slice() else { return Err(EINVAL); };
-            let sram_mv = match &sram_table {
-                Some(table) => {
-                    let (freq, voltage) = table[i * 8..i * 8 + 8].split_at(4);
-                    if u32::from_le_bytes(freq.try_into().map_err(|_| EINVAL)?) != state.freq_hz {
-                        return Err(EINVAL);
-                    }
-                    let value = u32::from_le_bytes(voltage.try_into().map_err(|_| EINVAL)?);
-                    if value < *mv || value > 1100 { return Err(EINVAL); }
-                    value
-                }
-                None => (*mv).max(850),
-            };
+            let (freq, voltage) = sram_table[i * 8..i * 8 + 8].split_at(4);
+            let sram_mv = u32::from_le_bytes(voltage.try_into().map_err(|_| EINVAL)?);
+            if u32::from_le_bytes(freq.try_into().map_err(|_| EINVAL)?) != state.freq_hz || sram_mv < *mv || sram_mv == 0 {
+                return Err(EINVAL);
+            }
             let mhz = state.freq_hz / 1_000_000;
             for series in [abi::COMMON26_HW_PERF_FREQUENCY, 0x1924] {
                 put32(hw, series + i * 4, mhz);
@@ -911,8 +904,8 @@ impl RootV27_2 {
     }
 
     /// The loader's `adt-perf-states-sram` table under `/chosen/aurora-gpu-resources/sgx`
-    /// (frequency and SRAM millivolts per state), if it published one. The node itself must exist.
-    fn sram_table(states: usize) -> Result<Option<KVec<u8>>> {
+    /// (frequency and SRAM millivolts per state).
+    fn sram_table(states: usize) -> Result<KVec<u8>> {
         let chosen = kernel::of::chosen().ok_or(ENODEV)?;
         let is = |name: Option<KVec<u8>>, want: &[u8]| {
             name.as_deref().is_some_and(|n| n.strip_suffix(b"\0").unwrap_or(n) == want)
@@ -921,8 +914,9 @@ impl RootV27_2 {
             if !is(parent.get_opt_property::<KVec<u8>>(c"name")?, b"aurora-gpu-resources") { continue; }
             for child in parent.children() {
                 if is(child.get_opt_property::<KVec<u8>>(c"name")?, b"sgx") {
-                    let table = child.get_opt_property::<KVec<u8>>(c"adt-perf-states-sram")?;
-                    if table.as_ref().is_some_and(|t| t.len() != states * 8) { return Err(EINVAL); }
+                    let table = child.get_opt_property::<KVec<u8>>(c"adt-perf-states-sram")?
+                        .ok_or(ENODEV)?;
+                    if table.len() != states * 8 { return Err(EINVAL); }
                     return Ok(table);
                 }
             }
