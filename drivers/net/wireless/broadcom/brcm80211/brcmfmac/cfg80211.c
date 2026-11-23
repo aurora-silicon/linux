@@ -8565,8 +8565,11 @@ static void brcmf_update_vht_cap(struct ieee80211_supported_band *band,
 }
 
 static void brcmf_update_he_cap(struct ieee80211_supported_band *band,
-				struct ieee80211_sband_iftype_data *data)
+				struct ieee80211_sband_iftype_data *data,
+				u32 bw_cap[4])
 {
+	bool has_160 = band->band != NL80211_BAND_2GHZ &&
+		       (bw_cap[band->band] & WLC_BW_160MHZ_BIT);
 	int idx = 1;
 	struct ieee80211_sta_he_cap *he_cap = &data->he_cap;
 	struct ieee80211_he_cap_elem *he_cap_elem = &he_cap->he_cap_elem;
@@ -8600,12 +8603,27 @@ static void brcmf_update_he_cap(struct ieee80211_supported_band *band,
 
 	he_cap_elem->mac_cap_info[4] = IEEE80211_HE_MAC_CAP4_AMSDU_IN_AMPDU;
 
-	/* HE PHY Capabilities Information */
-	he_cap_elem->phy_cap_info[0] =
-		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G |
-		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G |
-		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G;
-	;
+	/*
+	 * HE PHY Capabilities Information.
+	 *
+	 * The channel width set is per band (IEEE 802.11ax 9.4.2.248.3):
+	 * B0 is the 2.4 GHz bit, B1 and B2 apply to 5 GHz and 6 GHz.
+	 * 40/80 MHz stays on in 5 GHz and 6 GHz as before (80 MHz is
+	 * mandatory there, see brcmf_update_vht_cap()). 160 MHz follows the
+	 * firmware's per-band "bw_cap", the same source the VHT capability
+	 * uses, so it is only reported when the radio can use it. This runs
+	 * again when the wiphy bands are rebuilt, so set the field whole.
+	 */
+	if (band->band == NL80211_BAND_2GHZ) {
+		he_cap_elem->phy_cap_info[0] =
+			IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G;
+	} else {
+		he_cap_elem->phy_cap_info[0] =
+			IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G;
+		if (has_160)
+			he_cap_elem->phy_cap_info[0] |=
+				IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G;
+	}
 
 	he_cap_elem->phy_cap_info[1] =
 		IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD;
@@ -8646,10 +8664,14 @@ static void brcmf_update_he_cap(struct ieee80211_supported_band *band,
 		IEEE80211_HE_PHY_CAP7_MAX_NC_1;
 
 	he_cap_elem->phy_cap_info[8] =
-		IEEE80211_HE_PHY_CAP8_HE_ER_SU_PPDU_4XLTF_AND_08_US_GI |
-		IEEE80211_HE_PHY_CAP8_20MHZ_IN_40MHZ_HE_PPDU_IN_2G |
-		IEEE80211_HE_PHY_CAP8_20MHZ_IN_160MHZ_HE_PPDU |
-		IEEE80211_HE_PHY_CAP8_80MHZ_IN_160MHZ_HE_PPDU;
+		IEEE80211_HE_PHY_CAP8_HE_ER_SU_PPDU_4XLTF_AND_08_US_GI;
+	if (band->band == NL80211_BAND_2GHZ)
+		he_cap_elem->phy_cap_info[8] |=
+			IEEE80211_HE_PHY_CAP8_20MHZ_IN_40MHZ_HE_PPDU_IN_2G;
+	if (has_160)
+		he_cap_elem->phy_cap_info[8] |=
+			IEEE80211_HE_PHY_CAP8_20MHZ_IN_160MHZ_HE_PPDU |
+			IEEE80211_HE_PHY_CAP8_80MHZ_IN_160MHZ_HE_PPDU;
 
 	he_cap_elem->phy_cap_info[9] =
 		IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU |
@@ -8660,8 +8682,9 @@ static void brcmf_update_he_cap(struct ieee80211_supported_band *band,
 	/* HE Supported MCS and NSS Set */
 	he_mcs->rx_mcs_80 = cpu_to_le16(0xfffa);
 	he_mcs->tx_mcs_80 = cpu_to_le16(0xfffa);
-	he_mcs->rx_mcs_160 = cpu_to_le16(0xfffa);
-	he_mcs->tx_mcs_160 = cpu_to_le16(0xfffa);
+	/* 0xffff: no spatial stream is supported at 160 MHz */
+	he_mcs->rx_mcs_160 = cpu_to_le16(has_160 ? 0xfffa : 0xffff);
+	he_mcs->tx_mcs_160 = cpu_to_le16(has_160 ? 0xfffa : 0xffff);
 	/* HE 6 GHz band capabilities */
 	if (band->band == NL80211_BAND_6GHZ) {
 		u16 capa = 0;
@@ -8790,7 +8813,7 @@ static int brcmf_setup_wiphybands(struct brcmf_cfg80211_info *cfg)
 					     txbf_bfe_cap, txbf_bfr_cap,
 					     ldpc_cap, stbc_rx, stbc_tx);
 		if (he_enable)
-			brcmf_update_he_cap(band, &sdata[band->band]);
+			brcmf_update_he_cap(band, &sdata[band->band], bw_cap);
 	}
 
 	return 0;
