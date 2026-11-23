@@ -343,8 +343,8 @@ config APPLE_REGVIEW
 	  This is a development aid. If unsure, say 'n'.
 
 config APPLE_REGVIEW_KUNIT_TEST
-	bool "KUnit tests for the Apple SoC read-only register views" if !KUNIT_ALL_TESTS
-	depends on APPLE_REGVIEW=y && KUNIT=y
+	tristate "KUnit tests for the Apple SoC read-only register views" if !KUNIT_ALL_TESTS
+	depends on APPLE_REGVIEW && KUNIT
 	default KUNIT_ALL_TESTS
 	help
 	  Check every built-in register list against the apertures it

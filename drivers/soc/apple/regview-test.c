@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * KUnit tests for the Apple SoC read-only register views. Included by
- * regview.c.
+ * KUnit tests for the Apple SoC read-only register views.
  *
  * The register windows under test are zeroed buffers of kernel memory that
  * stand in for the mapped DT reg entries of a struct apple_regview. The tests
@@ -11,6 +10,8 @@
 #include <kunit/test.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
+
+#include "regview-internal.h"
 
 #define REGVIEW_TEST_MAX_REGS	4
 #define REGVIEW_TEST_SEQ_SIZE	(16 * 1024)
@@ -80,7 +81,7 @@ static struct regview_test_ctx *regview_test_setup(struct kunit *test,
 		KUNIT_ASSERT_EQ(test, 0,
 				kunit_add_action_or_reset(test, regview_test_vfree,
 							  ctx->buf[i]));
-		ctx->maps[i].base = (void __iomem *)ctx->buf[i];
+		ctx->maps[i].base = (void __iomem __force *)ctx->buf[i];
 		ctx->maps[i].size = size + extra;
 	}
 
@@ -102,11 +103,11 @@ static void regview_test_fill(struct regview_test_ctx *ctx)
 	unsigned int i;
 
 	for (i = 0; i < hw->nr_regs; i++) {
-		u32 *w = ctx->buf[i];
+		__le32 *w = ctx->buf[i];
 		u64 off;
 
 		for (off = 0; off + 4 <= ctx->maps[i].size; off += 4)
-			w[off / 4] = regview_test_tag(i, off);
+			w[off / 4] = cpu_to_le32(regview_test_tag(i, off));
 	}
 }
 
@@ -475,11 +476,11 @@ static void regview_test_show_values(struct kunit *test)
 		regview_test_hw("apple,t8112-spmi-sideband");
 	struct regview_test_ctx *ctx = regview_test_setup(test, hw, 0);
 	const char *want;
-	u32 *w;
+	__le32 *w;
 
 	w = ctx->buf[0];
-	w[SPMI_SB_BUS_FAULTS / 4] = 0xffffffff;
-	w[SPMI_SB_BUS_FAULTS / 4 + 1] = 0x1;
+	w[SPMI_SB_BUS_FAULTS / 4] = cpu_to_le32(U32_MAX);
+	w[SPMI_SB_BUS_FAULTS / 4 + 1] = cpu_to_le32(1);
 	regview_test_show(test, ctx);
 
 	want = "0+0x0000200 bus-fault-count[0]: 0xffffffff\n"
@@ -554,12 +555,12 @@ static void regview_test_show_never_writes(struct kunit *test)
 		regview_test_show(test, ctx);
 
 		for (i = 0; i < ctx->rv.hw->nr_regs; i++) {
-			u32 *w = ctx->buf[i];
+			__le32 *w = ctx->buf[i];
 			u64 off;
 			u32 guard;
 
 			for (off = 0; off + 4 <= ctx->maps[i].size; off += 4)
-				if (w[off / 4] != regview_test_tag(i, off))
+				if (le32_to_cpu(w[off / 4]) != regview_test_tag(i, off))
 					break;
 			KUNIT_EXPECT_EQ_MSG(test, off, (u64)ctx->maps[i].size,
 					    "%s reg %u", id->compatible, i);
@@ -572,9 +573,11 @@ static void regview_test_show_never_writes(struct kunit *test)
 /* The debugfs file has no write method. */
 static void regview_test_fops_read_only(struct kunit *test)
 {
-	KUNIT_EXPECT_NULL(test, apple_regview_fops.write);
-	KUNIT_EXPECT_NULL(test, apple_regview_fops.write_iter);
-	KUNIT_EXPECT_NOT_NULL(test, apple_regview_fops.read);
+	const struct file_operations *fops = apple_regview_test_fops();
+
+	KUNIT_EXPECT_NULL(test, fops->write);
+	KUNIT_EXPECT_NULL(test, fops->write_iter);
+	KUNIT_EXPECT_NOT_NULL(test, fops->read);
 }
 
 static struct kunit_case regview_test_cases[] = {
@@ -606,3 +609,6 @@ static struct kunit_suite regview_test_suite = {
 };
 
 kunit_test_suite(regview_test_suite);
+
+MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
+MODULE_LICENSE("GPL");
