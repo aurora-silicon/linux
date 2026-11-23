@@ -557,6 +557,12 @@ impl super::dependency::Retention for Fences {
 }
 
 impl Fences {
+    /// The command writes host timestamps: it is ready only once it has completed and the host
+    /// has written them (see `Scheduler::enqueue`).
+    pub(crate) fn publishes_timestamps(&self) -> bool {
+        self.ready.raw() == self.completed.raw()
+    }
+
     /// Scheduler::enqueue always supplies our explicit completion fence here.
     /// It has no polling callback, so pending frontier checks need no lock.
     pub(crate) fn status(&self) -> i32 {

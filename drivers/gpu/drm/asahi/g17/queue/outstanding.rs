@@ -16,8 +16,33 @@
 //! a prune is given its VM's failure counts and scans the whole list from when a failure starts
 //! until it has finished and one scan has run after that.
 
-use crate::g17::{job::Order, status::Failures};
+use crate::g17::{
+    dependency::{FailureRecord, Retention},
+    job::Order,
+    status::Failures,
+};
 use kernel::prelude::*;
+
+/// Prunes an engine's frontier and its list of publishers, a subset of it, with the same counts.
+/// Each entry that leaves either list goes to `record` and then to `finished`. A publisher can
+/// leave its own list while the frontier still holds it behind an older unfinished command, and
+/// the readers of that list would then not see its failure, so it is recorded wherever it leaves.
+/// One that leaves both lists is recorded twice until it retires.
+pub(crate) fn prune_engine<T: Status + Retention + Clone>(
+    frontier: &mut Outstanding<T>,
+    publishers: &mut Outstanding<T>,
+    failures: Failures,
+    record: &mut FailureRecord<T>,
+    finished: &mut KVVec<T>,
+) {
+    let mut left = |sequence, status, entry: T| {
+        record.note(sequence, status, &entry);
+        // Without room the entry is released here, as it always could be.
+        let _ = finished.push(entry, GFP_KERNEL_ACCOUNT);
+    };
+    frontier.prune(failures, &mut left);
+    publishers.prune(failures, &mut left);
+}
 
 /// A command's completion status, as `dma_fence_get_status()`: 0 while unfinished, then 1 or
 /// a negative error.
@@ -153,6 +178,12 @@ mod tests {
         }
     }
 
+    impl Retention for Command {
+        fn retained(&self) -> bool {
+            true
+        }
+    }
+
     impl Status for Command {
         fn status(&self) -> i32 {
             READS.fetch_add(1, Ordering::Relaxed);
@@ -263,6 +294,43 @@ mod tests {
         // The 4 held at the last scan, then the scan itself.
         assert_eq!(left, [2u64, 3, 4]);
         assert_eq!(prunes, 4 + 1);
+    }
+
+    #[test]
+    fn a_publisher_that_fails_behind_an_unfinished_command_is_recorded() {
+        // Command 1 is unfinished; command 2 publishes timestamps, so both lists hold it.
+        let (mut frontier, commands) = queue(2);
+        let mut publishers = Outstanding::new(0);
+        publishers.reserve(1).unwrap();
+        publishers
+            .push_within_capacity(2, commands[1].clone())
+            .unwrap();
+        let mut record = FailureRecord::new();
+        let mut finished = KVVec::new();
+        let counts = Failures {
+            started: 0,
+            finished: 0,
+        };
+        prune_engine(
+            &mut frontier,
+            &mut publishers,
+            counts,
+            &mut record,
+            &mut finished,
+        );
+        // Command 2 fails after this prune read the counts, so they have not moved: the
+        // frontier keeps it behind command 1 and its own list lets it go first.
+        commands[1].finish(EIO.to_errno());
+        prune_engine(
+            &mut frontier,
+            &mut publishers,
+            counts,
+            &mut record,
+            &mut finished,
+        );
+        assert_eq!(sequences(frontier.iter()), [1u64, 2]);
+        assert!(publishers.iter().next().is_none());
+        assert_eq!(record.earliest().map(|(sequence, _)| sequence), Some(2));
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::{
 use core::ops::Range;
 use kernel::{
     c_str,
-    dma_fence::{Fence, FenceContexts, RawDmaFence},
+    dma_fence::{Fence, FenceContexts},
     prelude::*,
     sync::{Arc, LockClassKey},
     xarray,
@@ -112,6 +112,10 @@ pub(crate) struct Queue<B: Backend> {
     /// Each engine's unfinished commands, as many as userspace keeps queued (thousands
     /// under vkd3d-proton).
     frontiers: [Outstanding<Fences>; 2],
+    /// The frontiers' host-timestamp publishers, again: the only entries the host-publication
+    /// links and the compute timestamp waits look for. Few commands publish, so those readers
+    /// walk this instead of every unfinished command.
+    publishers: [Outstanding<Fences>; 2],
     /// Finished frontier entries pruned during this ioctl. Their last references
     /// can tear a whole completion down; that waits until the ioctl has published.
     /// Like the frontiers it needs no contiguous pages, and its growth must not fail
@@ -167,6 +171,7 @@ impl<B: Backend> Queue<B> {
             proof: Proof::new(),
             sequence: [0; 2],
             frontiers: [Outstanding::new(failures), Outstanding::new(failures)],
+            publishers: [Outstanding::new(failures), Outstanding::new(failures)],
             finished: KVVec::new(),
             failures: [FailureRecord::new(), FailureRecord::new()],
             _slot: slot,
@@ -189,14 +194,13 @@ impl<B: Backend> Queue<B> {
     }
 
     fn prune_frontier(&mut self, index: usize) {
-        let failures = self.context.status().failures();
-        let failure = &mut self.failures[index];
-        let finished = &mut self.finished;
-        self.frontiers[index].prune(failures, |sequence, status, fences| {
-            failure.note(sequence, status, &fences);
-            // Without room the entry is released here, as it always could be.
-            let _ = finished.push(fences, GFP_KERNEL_ACCOUNT);
-        });
+        outstanding::prune_engine(
+            &mut self.frontiers[index],
+            &mut self.publishers[index],
+            self.context.status().failures(),
+            &mut self.failures[index],
+            &mut self.finished,
+        );
     }
 
     #[expect(
@@ -242,9 +246,9 @@ impl<B: Backend> Queue<B> {
             && self.frontiers[0]
                 .prefix(order.wait_through[0])
                 .all(|(_, fences)| fences.status() > 0)
-            && self.frontiers[1].prefix(order.wait_through[1]).all(|(_, fences)| {
-                fences.ready.raw() != fences.completed.raw() || fences.status() > 0
-            })
+            && self.publishers[1]
+                .prefix(order.wait_through[1])
+                .all(|(_, fences)| fences.status() > 0)
             && self.failures.iter_mut().enumerate().all(|(index, failure)| {
                 failure.earliest().is_none_or(|(sequence, _)| {
                     !Order::contains(order.wait_through[index], sequence)
@@ -268,7 +272,7 @@ impl<B: Backend> Queue<B> {
         // can delay host publication. These links never become GPU dependencies.
         // A finished one may still be held behind an unfinished one: it delays nothing.
         let host_prefix = if engine == Engine::Render { order.wait_through[index] } else { None };
-        let host_predecessors = self.frontiers[index]
+        let host_predecessors = self.publishers[index]
             .prefix(host_prefix)
             .filter_map(|(_, fences)| fences.publication.as_ref().filter(|_| fences.status() <= 0));
         let completion = Completion::new(
@@ -310,10 +314,8 @@ impl<B: Backend> Queue<B> {
         };
         // A finished publisher may still be held behind an unfinished one: its timestamps
         // are written, so there is nothing to wait for.
-        let pending_publisher = |fences: &Fences| {
-            fences.ready.raw() == fences.completed.raw() && fences.status() <= 0
-        };
-        let timestamps = self.frontiers[index].prefix(timestamp_prefix);
+        let pending_publisher = |fences: &Fences| fences.status() <= 0;
+        let timestamps = self.publishers[index].prefix(timestamp_prefix);
         let timestamp_count = timestamps
             .clone()
             .filter(|(_, fences)| pending_publisher(fences))
@@ -420,6 +422,9 @@ impl<B: Backend> Queue<B> {
                 .ok_or(ENODEV)?
                 .enqueue(packet, dependencies, early, publication)?;
         self.sequence[index] = order.sequence;
+        if fences.publishes_timestamps() {
+            self.publishers[index].push_within_capacity(order.sequence, fences.clone())?;
+        }
         self.frontiers[index].push_within_capacity(order.sequence, fences)?;
         Ok(())
     }
@@ -589,6 +594,9 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             }
             for (frontier, room) in self.frontiers.iter_mut().zip(room) {
                 frontier.reserve(room)?;
+            }
+            for (publishers, room) in self.publishers.iter_mut().zip(room) {
+                publishers.reserve(room)?;
             }
             let mut guards = guards.into_iter();
             // Where a firmware wait reports completion before a weak stream tail's writes are
