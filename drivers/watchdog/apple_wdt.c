@@ -261,3 +261,7 @@ module_platform_driver(apple_wdt_driver);
 MODULE_DESCRIPTION("Apple SoC watchdog driver");
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_APPLE_WATCHDOG_KUNIT_TEST)
+#include "apple_wdt-test.c"
+#endif

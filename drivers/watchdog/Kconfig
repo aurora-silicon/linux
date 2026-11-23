@@ -1172,6 +1172,17 @@ config APPLE_WATCHDOG
 	  To compile this driver as a module, choose M here: the
 	  module will be called apple_wdt.
 
+config APPLE_WATCHDOG_KUNIT_TEST
+	bool "KUnit tests for the Apple SoC watchdog" if !KUNIT_ALL_TESTS
+	depends on APPLE_WATCHDOG=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for the Apple SoC watchdog driver: the conversion of
+	  a timeout to counter ticks at the clock rate and its clamp to the
+	  32-bit counter, the time left before the reset, and the registers
+	  that start, stop, ping, restart, suspend and resume write. The
+	  registers are kernel memory, so the tests need no Apple hardware.
+
 config SUNPLUS_WATCHDOG
 	tristate "Sunplus watchdog support"
 	depends on ARCH_SUNPLUS || COMPILE_TEST
