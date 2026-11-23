@@ -2207,27 +2207,33 @@ impl Firmware {
             image(&mut scratch.cq)?,
         )
         .map_err(|_| EINVAL)?;
-        if before != 0 {
-            // Slots::claim_compute proved a different fully retired unit displaced this
-            // descriptor in the same hardware slot. Keep every firmware-mutated byte.
-            let mut descriptor = [0u8; work::compute::DESCRIPTOR_SIZE];
-            s.work.read(work::compute::DESCRIPTOR, &mut descriptor)?;
-            if encode::preserve_compute_descriptor(&refs, &descriptor, before, w).is_err() {
-                // This is retained allocator identity/completion corruption, not a client
-                // refusal. Keep the unit and its previous VM lease mapped forever; cancelling
-                // preparation would make the corrupt descriptor available to another job.
-                self.slots.quarantine(&mut f.claims);
-                self.sync_quarantine_hints();
-                return Err(EIO);
+        let full_work = self.slots.compute_needs_full_work(index) || before == 0;
+        if full_work {
+            if before != 0 {
+                // Slots::claim_compute proved a different fully retired unit displaced this
+                // descriptor in the same hardware slot. Keep every firmware-mutated byte.
+                let mut descriptor = [0u8; work::compute::DESCRIPTOR_SIZE];
+                s.work.read(work::compute::DESCRIPTOR, &mut descriptor)?;
+                if encode::preserve_compute_descriptor(&refs, &descriptor, before, w).is_err() {
+                    // This is retained allocator identity/completion corruption, not a client
+                    // refusal. Keep the unit and its previous VM lease mapped forever; cancelling
+                    // preparation would make the corrupt descriptor available to another job.
+                    self.slots.quarantine(&mut f.claims);
+                    self.sync_quarantine_hints();
+                    return Err(EIO);
+                }
             }
-        }
-        if self.slots.compute_needs_full_work(index) {
             s.work.write(0, w)?;
         } else {
+            // Clean same-VM reuse: DESCRIPTOR (0xe00..0xea0) was already authenticated on
+            // retirement for this exact unit and VM, and static NOTIFIER (0xc00..0xd18) and
+            // tail (0xee0..0xf08) remain intact in place. Skip the 160-byte WC read-back and
+            // write only the active head and encoded body through the microsequence end.
+            let body_end = work::compute::SEQ_EMBEDDED + work::compute::SEQ_SIZE;
             s.work.write(0, &w[..work::compute::HEAD_ACTIVE_SIZE])?;
             s.work.write(
                 work::compute::BODY_ACTIVE_START,
-                &w[work::compute::BODY_ACTIVE_START..work::compute::BODY_ACTIVE_END],
+                &w[work::compute::BODY_ACTIVE_START..body_end],
             )?;
         }
         let wait_render = self.cross_engine_wait(job, cmd_index, super::command::RENDER)?;
