@@ -214,6 +214,19 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 	return 0;
 }
 
+/*
+ * The fp32 trailer word at +0x880 (+0x8a0 with scratch) is 10000.0f in HWX
+ * from ANECompiler 10.205 and mil-hwx-compiler, and 1000.0f in H16 and H17
+ * HWX from ANECompiler 10.302 (macOS 27.3). Both load; any other value is
+ * refused.
+ */
+static u32 hwx_trailer_value(const u8 *c, u32 offset)
+{
+	u32 value = get_unaligned_le32(c + offset);
+
+	return value == 0x447a0000 ? value : 0x461c4000;
+}
+
 static int hwx_program(struct hwx_parser *p)
 {
 	const u8 *c = p->bytes + p->info.program_offset;
@@ -299,7 +312,7 @@ static int hwx_program(struct hwx_parser *p)
 	put_unaligned_le32(mixed ? 4 : 2, expected + 0x870);
 	put_unaligned_le32(mixed ? 2 : 7, expected + 0x878);
 	put_unaligned_le32(8, expected + 0x87c);
-	put_unaligned_le32(mixed ? get_unaligned_le32(c + 0x858) : 0x461c4000,
+	put_unaligned_le32(mixed ? get_unaligned_le32(c + 0x858) : hwx_trailer_value(c, 0x880),
 			   expected + 0x880);
 	put_unaligned_le32(mixed ? 3 : 9, expected + 0x888);
 	put_unaligned_le32(8, expected + 0x88c);
@@ -308,7 +321,7 @@ static int hwx_program(struct hwx_parser *p)
 		put_unaligned_le32(8, expected + 0x894);
 		put_unaligned_le32(7, expected + 0x898);
 		put_unaligned_le32(8, expected + 0x89c);
-		put_unaligned_le32(0x461c4000, expected + 0x8a0);
+		put_unaligned_le32(hwx_trailer_value(c, 0x8a0), expected + 0x8a0);
 		put_unaligned_le32(9, expected + 0x8a8);
 		put_unaligned_le32(8, expected + 0x8ac);
 	}
