@@ -92,6 +92,56 @@ echo "cand=${{candidate_archives[*]}}"
         r = self.stage(d, [f'a.pkg.tar.zst {sha(b"A")}'])
         self.assertEqual(r.returncode, 9)
 
+    def test_a_failed_copy_leaves_no_directory_behind(self):
+        d = self.downloads(**{'a.pkg.tar.zst': b'A', 'b.pkg.tar.zst': b'changed'})
+        r = self.sh(f"""
+sudo=fakesudo
+work='{d}'
+FROZEN_PACKAGES=0 NEO_GPU_PREPARED=0 M3_PERSISTENT_TRANSACTION_ACTIVE=0
+candidate_archives=()
+trap 'm3_install_cleanup' EXIT
+work_to_root <<'LIST'
+a.pkg.tar.zst {sha(b"A")}
+b.pkg.tar.zst {sha(b"B")}
+LIST
+""")
+        self.assertEqual(r.returncode, 9, r.stdout + r.stderr)
+        self.assertEqual(sorted(self.tmpdir.iterdir()), [])
+
+    def test_root_files_stay_readable_under_a_private_umask(self):
+        # sudo keeps the invoking user's umask. What root writes into its work directory is
+        # read back by the user's side, so its mode must not depend on that umask.
+        d = self.downloads(**{'a.pkg.tar.zst': b'A'})
+        state = self.root / 'state'
+        r = self.sh(f"""
+umask 077
+sudo=fakesudo
+work='{d}'
+candidate_archives=()
+work_to_root <<'LIST'
+a.pkg.tar.zst {sha(b"A")}
+LIST
+echo text | work_write "$work/dependency-result.json"
+m3_gpu_check_plan() {{ :; }}
+STATE='{state}' M3_GPU_CHECK='{self.root}/sbin/aurora-m3-gpu-check'
+m3_gpu_check_install
+stat -c 'mode %a %n' "$work" "$work"/*
+""")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        modes = {name: mode for mode, name in re.findall(r'^mode (\d+) \S*/([^/\n]+)$', r.stdout, re.M)}
+        self.assertEqual(modes.pop('a.pkg.tar.zst'), '644')
+        self.assertEqual(modes.pop('dependency-result.json'), '644')
+        self.assertEqual(modes.pop('aurora-m3-gpu-check'), '644')
+        self.assertEqual(list(modes.values()), ['755'], r.stdout)
+        self.assertEqual((self.root / 'sbin/aurora-m3-gpu-check').stat().st_mode & 0o777, 0o755)
+
+    def test_root_writes_into_its_work_directory_set_the_mode(self):
+        text = INSTALLER.read_text()
+        self.assertEqual(re.findall(r'^[^#\n]*\btee "\$work/[^\n]*', text, re.M), [])
+        for name in ('migrate-pro-session.py', 'frozen-dependencies.py', 'dependency-result.json',
+                     'dependency-files', 'aurora-m3-gpu-check'):
+            self.assertRegex(text, rf'work_write "\$work/{re.escape(name)}"')
+
     def test_odd_names_are_refused(self):
         d = self.downloads(**{'a.pkg.tar.zst': b'A'})
         for name in ('../a.pkg.tar.zst', '.hidden', 'x/y'):
@@ -138,6 +188,17 @@ m3_install_packages
         self.assertLess(install_all.index('work_to_root'), install_all.index('m3_install_packages'))
 
 
+class PythonIsolation(unittest.TestCase):
+    def test_every_root_python_is_isolated(self):
+        text = INSTALLER.read_text()
+        calls = re.findall(r'\$sudo python3\b[^\n]*', text)
+        self.assertGreater(len(calls), 10)
+        for call in calls:
+            self.assertTrue(call.startswith('$sudo python3 -I '), call)
+        self.assertIn('"Exec = /usr/bin/python3 -I "', text)
+        self.assertIn('python3 -I - "$1" "$d/install-aurora-sep.sh"', text)
+
+
 class KitRootCopy(unittest.TestCase):
     """--m3max-kit under sudo: root runs its own checked copy, from its own directory."""
 
@@ -151,11 +212,24 @@ class KitRootCopy(unittest.TestCase):
         (self.bin / 'fakesudo').chmod(0o755)
         self.tmpdir = self.root / 'tmp'
         self.tmpdir.mkdir()
-        self.copy = b'#!/bin/bash\necho "ran $0 $*"\n'
+        # The installer's own identity, and a stand-in copy that reports it when sourced
+        # (as the root side checks it) and says how it was run otherwise.
+        ident = subprocess.run(['bash', '-c', f"AURORA_SEP_SOURCE_ONLY=1 source '{INSTALLER}' && m3max_kit_identity"],
+                               capture_output=True, text=True, check=True).stdout
+        (self.root / 'identity').write_text(ident)
+        (self.root / 'other-identity').write_text('another release|')
+        self.copy = self.root / 'copy.sh'
+        self.copy.write_text(self.stand_in('identity'))
 
-    def setup(self, tamper=''):
+    def stand_in(self, ident):
+        return (f"#!/bin/bash\nm3max_kit_identity() {{ cat '{self.root}/{ident}'; }}\n"
+                "if [[ ${AURORA_SEP_SOURCE_ONLY:-} == 1 ]]; then return 0; fi\n"
+                'echo "ran $0 $*"\necho "mode $(stat -c %a "$0")"\n')
+
+    def setup(self, tamper='', before=''):
         script = f"""
 set -euo pipefail
+{before}
 AURORA_SEP_SOURCE_ONLY=1 source '{INSTALLER}'
 export TMPDIR='{self.tmpdir}'
 die() {{ echo "DIED: $*"; exit 9; }}
@@ -164,7 +238,7 @@ release_source() {{ :; }}
 require_supported_soc() {{ :; }}
 is_m3_max() {{ true; }}
 m3max_kit_self() {{
-  printf '%b' {self.copy.decode()!r} >"$M3MAX_KIT_WORK/install-aurora-sep.sh"
+  cp '{self.copy}' "$M3MAX_KIT_WORK/install-aurora-sep.sh"
   M3MAX_KIT_SELF_SHA=$(sha256sum "$M3MAX_KIT_WORK/install-aurora-sep.sh" | cut -d' ' -f1)
   echo "user-work=$M3MAX_KIT_WORK"
   {tamper}
@@ -189,6 +263,46 @@ m3max_kit_setup --yes
         self.assertNotEqual(r.returncode, 0)
         self.assertNotIn('ran ', r.stdout)
         self.assertIn('could not take the kit script', r.stderr)
+
+    def test_root_checks_the_identity_of_its_own_copy(self):
+        # The user-side checks saw a script that passed; the file root copies (its sha256 taken
+        # on that same content) is another script. Root's own identity check refuses it.
+        self.copy.write_text(self.stand_in('other-identity'))
+        r = self.setup()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn('ran ', r.stdout)
+        self.assertIn('is not the script that runs now', r.stderr)
+
+    def test_the_identity_check_of_roots_copy_runs_as_the_invoking_user(self):
+        # The check sources the script. With root's id differing from the invoking user's, it
+        # is run through runuser for that user, reading root's copy from its standard input.
+        log = self.root / 'runuser.log'
+        (self.bin / 'id').write_text('#!/bin/sh\nif [ "$*" = "-u" ]; then echo 0; else exec /usr/bin/id "$@"; fi\n')
+        (self.bin / 'runuser').write_text(
+            f'#!/bin/sh\necho "$*" >>"{log}"\nreadlink /proc/self/fd/0 >>"{log}"\nshift 3\nexec "$@"\n')
+        for name in ('id', 'runuser'):
+            (self.bin / name).chmod(0o755)
+        r = self.setup()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        m = re.search(r'^ran (\S+)/install-aurora-sep\.sh ', r.stdout, re.M)
+        self.assertIsNotNone(m, r.stdout)
+        call, stdin = log.read_text().splitlines()
+        user = subprocess.run(['/usr/bin/id', '-un'], capture_output=True, text=True).stdout.strip()
+        self.assertTrue(call.startswith(f'-u {user} -- env AURORA_SEP_SOURCE_ONLY=1 bash -c source /dev/stdin '), call)
+        self.assertEqual(stdin, f'{m.group(1)}/install-aurora-sep.sh')
+
+    def test_the_installer_reports_its_identity_from_standard_input(self):
+        with open(INSTALLER) as f:
+            r = subprocess.run(['bash', '-c', 'AURORA_SEP_SOURCE_ONLY=1 source /dev/stdin >/dev/null 2>&1 && m3max_kit_identity'],
+                               stdin=f, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, (self.root / 'identity').read_text())
+        self.assertGreater(r.stdout.count('|'), 8)
+
+    def test_roots_copy_is_readable_under_a_private_umask(self):
+        r = self.setup(before='umask 077')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('\nmode 755\n', r.stdout)
 
     def test_a_link_is_not_followed(self):
         r = self.setup(tamper=f'cp "$M3MAX_KIT_WORK/install-aurora-sep.sh" "{self.root}/real"; '

@@ -759,7 +759,7 @@ m3_pro_perf_activate() {
      $(cat /opt/mesa-m3/pro-vulkan/share/mesa-m3/profile) == t6030-pro-vulkan-legacy-hal ]] || die "paired Pro Mesa installation is incomplete"
   user=$(m3_pro_mesa_user)
   if [[ $user != root ]]; then
-    printf '%s' "$M3_PRO_PERF_MIGRATOR" | base64 -d | $sudo tee "$work/migrate-pro-session.py" >/dev/null
+    printf '%s' "$M3_PRO_PERF_MIGRATOR" | base64 -d | work_write "$work/migrate-pro-session.py"
     $sudo runuser -u "$user" -- python3 - "$user" < "$work/migrate-pro-session.py" || die "could not update the managed native Pro session"
   fi
   $sudo systemctl enable mesa-m3-pro-performance.service
@@ -3875,7 +3875,7 @@ frozen_dependency_prepare() {
   for archive in "$@"; do args+=(--candidate "$archive"); done
   args+=(--allow-remove linux-asahi --allow-remove linux-asahi-headers
          --allow-remove m1n1 --allow-remove mesa-m3-g15g)
-  $sudo tee "$work/frozen-dependencies.py" >/dev/null <<'FROZEN_DEPENDENCIES_PY'
+  work_write "$work/frozen-dependencies.py" <<'FROZEN_DEPENDENCIES_PY'
 #!/usr/bin/env python3
 """Admit missing repository dependencies without changing installed packages."""
 import argparse
@@ -4209,7 +4209,7 @@ def main():
     (work / "dependency-plan.json").write_text(json.dumps(receipt, indent=2) + "\n")
     hook.write_text("[Trigger]\nOperation = Install\nOperation = Upgrade\nOperation = Remove\n"
                     "Type = Package\nTarget = *\n[Action]\nWhen = PreTransaction\n"
-                    "Exec = /usr/bin/python3 " + str(helper) + " --verify-plan " + str(receipt_path) +
+                    "Exec = /usr/bin/python3 -I " + str(helper) + " --verify-plan " + str(receipt_path) +
                     " --plan-sha256 " + sha(receipt_path) + "\nAbortOnFail\n")
     print(json.dumps(receipt))
 
@@ -4222,7 +4222,7 @@ if __name__ == "__main__":
         sys.exit(1)
 FROZEN_DEPENDENCIES_PY
   say "Resolving only missing dependencies while preserving this image's package holds"
-  $sudo python3 "$work/frozen-dependencies.py" "${args[@]}" | $sudo tee "$work/dependency-result.json" >/dev/null ||
+  $sudo python3 -I "$work/frozen-dependencies.py" "${args[@]}" | work_write "$work/dependency-result.json" ||
     die "could not admit a missing-only dependency transaction. Nothing was installed. The package holds were preserved."
   FROZEN_TRANSACTION_CONFIG=$(python3 - "$work/dependency-result.json" <<'FROZEN_CONFIG_PY'
 import json, sys
@@ -4230,7 +4230,7 @@ print(json.load(open(sys.argv[1]))['transaction_config'])
 FROZEN_CONFIG_PY
   )
   $sudo test -f "$FROZEN_TRANSACTION_CONFIG" || die "missing admitted package transaction configuration"
-  python3 - "$work/dependency-result.json" <<'FROZEN_FILES_PY' | $sudo tee "$work/dependency-files" >/dev/null
+  python3 - "$work/dependency-result.json" <<'FROZEN_FILES_PY' | work_write "$work/dependency-files"
 import json, sys
 plan = json.load(open(sys.argv[1]))
 for filename in list(plan['candidate_sha256']) + [p['file'] for p in plan['dependencies']]:
@@ -4277,11 +4277,21 @@ package_database_check() {
 # sha256 again as root there, and use only that copy from then on: $work names it, and
 # candidate_archives is rewritten to it. The directory is 0700 while files arrive and 0755 after
 # (the user may read the packages, not change them).
+# Until it is done, WORK_DOWNLOADS names the user's directory, so that the EXIT trap removes
+# both directories when a copy or a check fails.
 WORK_ROOT_OWNED=0
+WORK_DOWNLOADS=""
 INSTALL_ARCHIVES=()
+# Write stdin to FILE in $work. Under sudo that directory is root's, and the invoking user's
+# side still reads these files: sudo keeps the user's umask, so set the mode here (0644), as
+# work_to_root does.
+work_write() { # FILE
+  $sudo sh -c 'umask 022 && cat >"$1"' _ "$1"
+}
 work_to_root() {
   local old=$work new file sha
   [[ -n $sudo ]] || return 0
+  WORK_DOWNLOADS=$old
   new=$($sudo mktemp -d) || die "could not make a work directory for root. Nothing was installed."
   work=$new
   WORK_ROOT_OWNED=1
@@ -4297,6 +4307,7 @@ work_to_root() {
   $sudo chmod 0755 "$new"
   candidate_archives=("${candidate_archives[@]/#"$old/"/"$new/"}")
   rm -rf -- "$old"
+  WORK_DOWNLOADS=""
 }
 
 install_all() {
@@ -5237,11 +5248,11 @@ m3_report_adt() { # DIR
         for ((i = 0; i < 10; i++)); do [[ -e $dev ]] && break; sleep 0.5; done
         if [[ ! -e $dev ]]; then
           why="no read-only device node $dev, so the ADT was not read"
-        elif ! $sudo python3 "$reader" --check "$dev" >>"$log" 2>"$M3_WORK/adt.err"; then
+        elif ! $sudo python3 -I "$reader" --check "$dev" >>"$log" 2>"$M3_WORK/adt.err"; then
           why="the ADT reader's check refused $dev, so the ADT was not read: $(tail -1 "$M3_WORK/adt.err" 2>/dev/null | cut -c1-200 || true)"
         else
           echo "read: $dev with ${reader##*/}" >>"$log"
-          $sudo python3 "$reader" "$dev" >"$out" 2>"$M3_WORK/adt.err" &
+          $sudo python3 -I "$reader" "$dev" >"$out" 2>"$M3_WORK/adt.err" &
           M3_ADT_PID=$!
           wait "$M3_ADT_PID" || rc=$?
           M3_ADT_PID=""
@@ -5302,7 +5313,7 @@ m3_report_stage2_log() { # DIR READER LOG
     return 1
   fi
   echo "log: $dev with ${reader##*/} --stage2-log" >>"$log"
-  $sudo python3 "$reader" --stage2-log "$dev" >"$out" 2>"$M3_WORK/log.err" &
+  $sudo python3 -I "$reader" --stage2-log "$dev" >"$out" 2>"$M3_WORK/log.err" &
   M3_ADT_PID=$!
   wait "$M3_ADT_PID" || rc=$?
   M3_ADT_PID=""
@@ -5315,7 +5326,7 @@ m3_report_stage2_log() { # DIR READER LOG
   # And all 16 KiB of it, byte for byte but the same lines overwritten (a reader without --raw
   # leaves this file out).
   rc=0
-  $sudo python3 "$reader" --stage2-log --raw "$dev" >"$1/m1n1-stage2-log.raw" 2>>"$M3_WORK/log.err" &
+  $sudo python3 -I "$reader" --stage2-log --raw "$dev" >"$1/m1n1-stage2-log.raw" 2>>"$M3_WORK/log.err" &
   M3_ADT_PID=$!
   wait "$M3_ADT_PID" || rc=$?
   M3_ADT_PID=""
@@ -7347,7 +7358,7 @@ esp_history_run() {
   [[ $(boot_chain) == limine ]] || die "EFI history archiving is available only with Limine"
   target=$(esp_bootbin) || die "could not find the mounted FAT boot partition"
   code=$(esp_history_builtin)
-  $sudo python3 -c "$code" "$1" --esp "${target%/m1n1/boot.bin}" --state "$STATE" \
+  $sudo python3 -I -c "$code" "$1" --esp "${target%/m1n1/boot.bin}" --state "$STATE" \
     --archive "$STATE/esp-history" || die "EFI history was retained where archive checks failed; retry after checking the error"
 }
 
@@ -7387,6 +7398,7 @@ m3_install_cleanup() {
   fi
   if ((FROZEN_PACKAGES || WORK_ROOT_OWNED)); then $sudo rm -rf "${work:-}"
   else rm -rf "${work:-}"; fi
+  [[ -z $WORK_DOWNLOADS ]] || rm -rf -- "$WORK_DOWNLOADS"
   return "$status"
 }
 
@@ -7394,7 +7406,7 @@ m3_persistent_transaction_begin() {
   local defaults=$M3_LIMINE_DEFAULTS target
   [[ $1 != grub ]] || defaults=$M3_GRUB_DEFAULTS
   target=$(esp_bootbin) || die "persistent GPU requires the mounted boot.bin"
-  $sudo python3 - "$STATE/m3-persistent-transaction.json" "$defaults" "$M1N1_CONF" "$target" \
+  $sudo python3 -I - "$STATE/m3-persistent-transaction.json" "$defaults" "$M1N1_CONF" "$target" \
     "$M3_GPU_OPTIN" "$M3_GPU_PROFILE_FILE" "$STATE/m3-gpu-persistent" "$STATE/m3-mode" \
     "$M3_PROFILE_HOOK" "$M3_PROFILE_UPDATE" "$M3_GPU_CHECK" "$STATE/m3-gpu-check" <<'M3_TRANSACTION_BEGIN'
 import base64, json, os, stat, sys
@@ -7416,7 +7428,7 @@ M3_TRANSACTION_BEGIN
 }
 
 m3_persistent_transaction_rollback() {
-  $sudo python3 - "$STATE/m3-persistent-transaction.json" <<'M3_TRANSACTION_ROLLBACK'
+  $sudo python3 -I - "$STATE/m3-persistent-transaction.json" <<'M3_TRANSACTION_ROLLBACK'
 import base64, json, os, stat, sys, tempfile
 from pathlib import Path
 snapshot=Path(sys.argv[1])
@@ -7493,7 +7505,7 @@ m3_persistent_cmdline() {
   if [[ $chain == grub ]]; then path=$M3_GRUB_DEFAULTS
   else path=$M3_LIMINE_DEFAULTS; fi
   [[ -f $STATE/m3-defaults.saved ]] || $sudo cp -p "$path" "$STATE/m3-defaults.saved"
-  $sudo python3 - "$path" "$chain" "$armed" "$M3_LIMINE_VENDOR_CONF" "$M3_PROCFS/cmdline" <<'M3_CMDLINE_PY'
+  $sudo python3 -I - "$path" "$chain" "$armed" "$M3_LIMINE_VENDOR_CONF" "$M3_PROCFS/cmdline" <<'M3_CMDLINE_PY'
 import os, re, sys, tempfile
 from pathlib import Path
 path, chain = Path(sys.argv[1]), sys.argv[2]
@@ -7877,7 +7889,7 @@ m3_limine_remove_check() {
   local target
   target=$(esp_bootbin) || die "cannot check the retained Limine entry without its mounted FAT boot partition; recovery state was kept"
   m3_boot_profile_install
-  $sudo python3 "$M3_BOOT_PROFILE_HELPER" "${1:-check-remove}" --esp "${target%/m1n1/boot.bin}" --state "$STATE" ||
+  $sudo python3 -I "$M3_BOOT_PROFILE_HELPER" "${1:-check-remove}" --esp "${target%/m1n1/boot.bin}" --state "$STATE" ||
     die "could not safely remove the retained Limine entry; its recovery state and modules were kept"
   if [[ ${1:-} == remove ]]; then $sudo rm -f "$M3_BOOT_PROFILE_HELPER"; fi
 }
@@ -7887,7 +7899,7 @@ m3_keep_limine_entry() {
   target=$(esp_bootbin) || die "persistent GPU requires the mounted FAT boot partition"
   esp=${target%/m1n1/boot.bin}
   m3_boot_profile_install
-  $sudo python3 "$M3_BOOT_PROFILE_HELPER" "$1" --esp "$esp" --state "$STATE" --kernel "${kernel:-linux-aurora}" ||
+  $sudo python3 -I "$M3_BOOT_PROFILE_HELPER" "$1" --esp "$esp" --state "$STATE" --kernel "${kernel:-linux-aurora}" ||
     die "could not retain/publish the checked GPU-off Limine entry"
   if [[ $1 == retain ]]; then
     release=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["release"])' "$STATE/m3-known-entry.json")
@@ -7917,7 +7929,7 @@ EOF
 }
 
 m3_grub_fallback_off() {
-  $sudo python3 - "$1" <<'M3_GRUB_OFF'
+  $sudo python3 -I - "$1" <<'M3_GRUB_OFF'
 from pathlib import Path
 import re, sys
 path=Path(sys.argv[1]);text=path.read_text()
@@ -7948,7 +7960,7 @@ m3_persistent_cmdline_remove() {
     if [[ -f $path ]] && grep -qF '# >>> aurora-sep: M3 GPU cmdline' "$path"; then owned=1; fi
   done
   ((owned)) || return 0
-  $sudo python3 - "$M3_GRUB_DEFAULTS" "$M3_LIMINE_DEFAULTS" <<'M3_REMOVE_CMDLINE'
+  $sudo python3 -I - "$M3_GRUB_DEFAULTS" "$M3_LIMINE_DEFAULTS" <<'M3_REMOVE_CMDLINE'
 from pathlib import Path
 import re, sys
 begin, end = '# >>> aurora-sep: M3 GPU cmdline', '# <<< aurora-sep: M3 GPU cmdline'
@@ -8050,9 +8062,9 @@ m3_gpu_check_plan() {
 m3_gpu_check_install() {
   local sha
   m3_gpu_check_plan
-  m3_gpu_check_builtin | $sudo tee "$work/aurora-m3-gpu-check" >/dev/null
+  m3_gpu_check_builtin | work_write "$work/aurora-m3-gpu-check"
   sha=$(sha256sum "$work/aurora-m3-gpu-check" | cut -d' ' -f1)
-  $sudo python3 - "$work/aurora-m3-gpu-check" "$M3_GPU_CHECK" "$STATE/m3-gpu-check" "$sha" <<'M3_CHECK_INSTALL_PY'
+  $sudo python3 -I - "$work/aurora-m3-gpu-check" "$M3_GPU_CHECK" "$STATE/m3-gpu-check" "$sha" <<'M3_CHECK_INSTALL_PY'
 import hashlib, os, stat, sys, tempfile
 from pathlib import Path
 source, helper, record = map(Path, sys.argv[1:4])
@@ -8745,7 +8757,7 @@ neo_gpu_transaction_begin() {
   [[ $original_m1n1 == /* && -f $original_m1n1 && ! -L $original_m1n1 ]] || die "cannot preserve this Neo's original M1N1 binary: $original_m1n1"
 
   $sudo install -d "$STATE"
-  $sudo python3 - "$STATE/neo-transaction.json" "$UPDATE_M1N1_CONF" "$target" \
+  $sudo python3 -I - "$STATE/neo-transaction.json" "$UPDATE_M1N1_CONF" "$target" \
     "$NEO_GPU_CONFIG/profile" "$NEO_GPU_CONFIG/gpu-experiment" "$STATE/neo-gpu" "$original_m1n1" <<'NEO_SNAPSHOT'
 import base64,json,stat,sys
 from pathlib import Path
@@ -8783,7 +8795,7 @@ NEO_BOOT_CONFIG
 neo_gpu_restore() {
   local snapshot=$1
   [[ -f $snapshot ]] || return 0
-  $sudo python3 - "$snapshot" <<'NEO_RESTORE'
+  $sudo python3 -I - "$snapshot" <<'NEO_RESTORE'
 import base64,json,os,tempfile,sys
 from pathlib import Path
 for row in json.loads(Path(sys.argv[1]).read_text()):
@@ -10875,6 +10887,7 @@ with os.fdopen(fd, "rb") as f:
 if hashlib.sha256(data).hexdigest() != want:
     sys.exit("its sha256 differs from the checked one")
 out = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o755)
+os.fchmod(out, 0o755)
 with os.fdopen(out, "wb") as f:
     f.write(data)
 KIT_SELF_COPY_PY
@@ -10883,9 +10896,23 @@ KIT_SELF_COPY_PY
         echo "install-aurora-sep: error: root could not take the kit script ($1) as checked. Nothing was changed." >&2
         exit 1
       fi
-      shift 3
+      # The identity check again, on root'"'"'s own copy, which can no longer change: what is run
+      # is what was checked. The check sources the script, so it runs as the invoking user, on
+      # the descriptor root opened (the directory stays root'"'"'s alone).
+      as_user=()
+      [[ $(id -u) == "$(id -u "$3")" ]] || as_user=(runuser -u "$3" --)
+      theirs=$(${as_user[@]+"${as_user[@]}"} env AURORA_SEP_SOURCE_ONLY=1 \
+        bash -c '"'"'source /dev/stdin >/dev/null 2>&1 && m3max_kit_identity'"'"' \
+        <"$d/install-aurora-sep.sh" 2>/dev/null) || theirs=""
+      if [[ -z $theirs || $theirs != "$4" ]]; then
+        rm -rf "$d"
+        echo "install-aurora-sep: error: root'"'"'s copy of the kit script is not the script that runs now. Nothing was changed." >&2
+        exit 1
+      fi
+      shift 4
       exec bash "$d/install-aurora-sep.sh" --m3max-kit --kit-work "$d" "$@"' \
-      _ "$M3MAX_KIT_WORK/install-aurora-sep.sh" "$M3MAX_KIT_SELF_SHA" "$(id -un)" "${a[@]}" || rc=$?
+      _ "$M3MAX_KIT_WORK/install-aurora-sep.sh" "$M3MAX_KIT_SELF_SHA" "$(id -un)" "$(m3max_kit_identity)" \
+      "${a[@]}" || rc=$?
     rm -rf -- "$M3MAX_KIT_WORK"
     exit "$rc"
   fi

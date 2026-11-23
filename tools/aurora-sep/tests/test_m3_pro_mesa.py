@@ -106,6 +106,11 @@ WORK_TO_ROOT = re.compile(r'sudo (mktemp -d|sh -c umask 022 && cat >"\$1" _ <tmp
                          r'sha256sum -- <tmp>/\S+|chmod 0755 <tmp>|rm -rf <tmp>)$')
 
 
+# work_write: what 12.2 wrote with "sudo tee" now gets its mode set in root's shell.
+WORK_WRITE = re.compile(r'^sudo sh -c umask 022 && cat >"\$1" _ (<tmp>/(?:migrate-pro-session\.py|'
+                        r'frozen-dependencies\.py|dependency-result\.json|dependency-files|aurora-m3-gpu-check))$')
+
+
 def package_check_log(tc, text):
     lines = text.splitlines()
     queries = [i for i, line in enumerate(lines) if line == 'pacman -Qu --color never']
@@ -119,8 +124,11 @@ def package_check_log(tc, text):
     out = []
     for line in lines:
         if line in ('pacman -Qu --color never', 'pacman -Sy --noconfirm', 'sudo pacman -Sy --noconfirm'): continue
+        line = WORK_WRITE.sub(r'sudo tee \1', line)
         # work_to_root: root's own checked copy of the downloads (not in 12.2).
         if WORK_TO_ROOT.match(line): continue
+        # Root's Python runs isolated (-I) since 12.2.
+        line = line.replace('sudo python3 -I ', 'sudo python3 ')
         line = line.replace('pacman -Sy --noconfirm --ask 4 ', 'pacman -S --noconfirm --ask 4 ')
         out.append(line)
     return out
