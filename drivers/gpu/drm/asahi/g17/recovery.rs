@@ -167,6 +167,9 @@ pub(super) trait Queues {
     /// collateral. Marks that pair, not the QID: a QID is reused once its owner closes, and the
     /// next owner starts unmarked. A retirement of the pair's work clears the mark.
     fn note_collateral(&mut self, _qid: u8, _generation: u64) {}
+    /// `note_collateral` keeps a mark for the queue that holds `qid`, so a repeated blame on it
+    /// can be told from a first one. Only G17P render pairs keep one.
+    fn marks_collateral(&self, _qid: u8) -> bool { false }
     /// Read while firmware is halted for the restart the host accepted after `generation`:
     /// every killed context whose kill the firmware finished counts as first seen done at
     /// `generation` at the latest, so this restart releases its guilty pairs
@@ -494,7 +497,8 @@ fn read_entries<H: Host>(host: &mut H) -> Entries {
 
 /// Resolves guilty QIDs before changing any completion's classification. Unknown ownership or
 /// too many distinct guilty VMs leaves all prior classifications intact. The oldest spared work
-/// of a QID makes later blame collateral to its previous recovery, rather than new VM guilt, once:
+/// of a QID, or blame that no evidence confirmed (`Attribution::Firmware`), makes that blame
+/// collateral rather than new VM guilt, once:
 /// the restart `generation` marks the render pair it blamed so (`Queues::note_collateral`), and
 /// when a later restart blames that pair again with none of its work retired in between, the
 /// hang is its own and its VM is guilty (`Queues::collateral_before`). Otherwise a first blame
@@ -525,6 +529,10 @@ fn classify<Q: Queues>(
         Attribution::NoCulprit => guilty_qids = 0,
     }
     let no_culprit = attribution == Attribution::NoCulprit;
+    // Only the firmware names these queues. A reason-0 restart can land on a bystander whose
+    // render started and waits behind the culprit's (2026-11-23 01:46 UTC, m4.179: t3code, then
+    // Hyprland), so the first such blame is collateral and only a repeat makes the VM guilty.
+    let unconfirmed = attribution == Attribution::Firmware;
     let blame = blamed.is_some_and(|qid| guilty_qids & (1u128 << qid) != 0);
     if guilty_qids == 0 && !no_culprit {
         return (0, blame, false, false);
@@ -532,7 +540,7 @@ fn classify<Q: Queues>(
     let mut guilty: [Option<Arc<VmStatus>>; MAX_GUILTY_VMS] = Default::default();
     let mut count = 0;
     let mut collateral = 0u128;
-    // Spared work blamed a second time (`collateral_before`): its VM is guilty now.
+    // Spared or unconfirmed work blamed a second time (`collateral_before`): its VM is guilty now.
     let mut repeated = 0u128;
     let mut unresolved = false;
     for qid in 0..QIDS {
@@ -541,9 +549,17 @@ fn classify<Q: Queues>(
         }
         match queues.oldest_spared(qid) {
             None => unresolved = true,
-            Some(true) if !queues.collateral_before(qid, generation) => collateral |= 1u128 << qid,
             Some(spared) => {
-                if spared {
+                // Blame on a VM an earlier recovery found guilty needs no confirmation.
+                let mut guilty_before = false;
+                queues.visit_owners(qid, &mut |status| guilty_before |= status.recovery_guilty());
+                // Without a mark a repeat looks like a first blame forever: such blame stays guilty.
+                let suspect = spared || (unconfirmed && !guilty_before && queues.marks_collateral(qid));
+                if suspect && !queues.collateral_before(qid, generation) {
+                    collateral |= 1u128 << qid;
+                    continue;
+                }
+                if suspect {
                     repeated |= 1u128 << qid;
                 }
                 let mut found = false;
@@ -882,6 +898,16 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_blame_without_a_collateral_mark_is_guilty_at_once() {
+        // A compute queue, or any queue on M5, keeps no mark: a repeat could never be seen.
+        let mut queues = owners();
+        let entries = Entries { exact_qids: 1u128 << 40, ..Entries::default() };
+        classify(&mut queues, entries, Some(40), Attribution::Firmware, 1);
+        assert!(queues.0[0].1.recovery_guilty());
+        assert_eq!(queues.1, [Some(Class::Guilty), Some(Class::Guilty), Some(Class::Spared), Some(Class::Spared)]);
+    }
+
+    #[test]
     fn a_guilty_vm_is_not_spared_by_another_vms_recovery() {
         let mut queues = owners();
         let entries = || Entries { exact_qids: 1u128 << 40, ..Entries::default() };
@@ -940,6 +966,14 @@ mod tests {
                 pair.failed = false;
             }
         }
+        /// The pair that holds `qid` submitted new work that no recovery has classified yet, and
+        /// it is now the pair's oldest in flight (its earlier work failed or retired).
+        fn submit(&mut self, qid: u8) {
+            if let Some(pair) = self.pair_mut(qid) {
+                pair.class = None;
+                pair.failed = false;
+            }
+        }
         /// Work of the pair that holds `qid` retired (`Pair::retire_front_command`).
         fn retire(&mut self, qid: u8) {
             if let Some(pair) = self.pair_mut(qid) {
@@ -989,6 +1023,7 @@ mod tests {
                 pair.collateral.get_or_insert(generation);
             }
         }
+        fn marks_collateral(&self, qid: u8) -> bool { self.pair(qid).is_some() }
         fn visit_owners(&self, qid: u8, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
             if let Some(pair) = self.pair(qid) {
                 visit(&pair.status);
@@ -1030,12 +1065,16 @@ mod tests {
     #[test]
     fn a_culprit_spared_by_a_misattributed_first_restart_turns_guilty() {
         // 11-20 15:03 UTC (m4.174), the 11-19 19:12 storm's shape: c spins on 40/41, and the
-        // first restart blames b (44/45), whose work c starved. b fails; c's work is spared.
+        // first restart blames b (44/45), whose work c starved. Nothing confirms the blame: b's
+        // command fails without poisoning its VM; c's work is spared.
         let (c, b, x) = (vm(), vm(), vm());
         let mut queues = Cascade::new([([40, 41], &c), ([44, 45], &b), ([60, 61], &x), ([62, 63], &x)]);
         assert!(!queues.restart(45, (1 << 41) | (1 << 45)));
+        assert!(!b.recovery_guilty() && b.get() == 0);
+        // The next restart blames b again with nothing of b retired: the repeat makes b guilty.
+        // Blame alone cannot tell a bystander starved twice from a culprit.
+        assert!(!queues.restart(45, 1 << 45));
         assert!(b.recovery_guilty() && b.get() != 0);
-        // The next restart blames b again and only drops b's work: forgiven.
         assert!(queues.restart(45, 1 << 45));
         // Then every restart blames c's queue 41 and drops its running group by exact stamp.
         // The first blame on work an earlier restart spared is collateral: c fails without
@@ -1052,9 +1091,10 @@ mod tests {
 
     #[test]
     fn a_bystander_that_retires_between_blames_stays_collateral() {
-        // c is blamed first; b's work is spared, then blamed while it waits behind c's.
+        // c is blamed first, twice; b's work is spared, then blamed while it waits behind c's.
         let (c, b, x) = (vm(), vm(), vm());
         let mut queues = Cascade::new([([40, 41], &c), ([44, 45], &b), ([60, 61], &x), ([62, 63], &x)]);
+        queues.restart(41, 1 << 41);
         queues.restart(41, 1 << 41);
         assert!(c.recovery_guilty());
         queues.restart(45, 1 << 45);
@@ -1117,7 +1157,9 @@ mod tests {
         for (blamed, dropped) in [(63, 1u128 << 63), (41, 1 << 41), (42, 1 << 42)] {
             counted += usize::from(!queues.restart(blamed, dropped));
         }
-        // quickshell's first blame was collateral: it saw one failed command, its VM stays usable.
+        // chromium's and quickshell's first blames were collateral: each saw one failed command,
+        // and their VMs stay usable.
+        assert!(!chromium.recovery_guilty() && chromium.get() == 0);
         assert!(!quickshell.recovery_guilty() && quickshell.get() == 0);
         // deqp's second blame makes it guilty, and later restarts that drop its work are forgiven.
         for _ in 3..8 {
@@ -1149,22 +1191,66 @@ mod tests {
         counted += usize::from(!queues.restart(62, 1 << 62));
         assert!(deqp.recovery_guilty());
         assert_ne!(deqp.get(), 0);
-        // The next restarts drop only failed deqp's work: forgiven, well under the storm limit.
+        // The next restarts drop only failed deqp's work: forgiven, under the storm limit. The
+        // chromium processes' first blames are collateral, so the restart that attribution moved
+        // to chromium2's pair (its second) counts too.
         assert!(queues.restart_as(62, 1 << 62, Attribution::Queues(3 << 61)));
         assert!(queues.restart(62, 1 << 62));
-        assert_eq!(counted, 5);
+        assert!(!chromium.recovery_guilty() && chromium.get() == 0);
+        assert!(!chromium3.recovery_guilty() && chromium3.get() == 0);
+        assert_eq!(counted, 6);
     }
 
     #[test]
-    fn a_culprit_blamed_first_is_guilty_at_once_as_before() {
-        // 2026-11-20 02:18 UTC (m4.173, T72 run 2): the first restart blamed deqp's 59.
+    fn a_culprit_blamed_first_is_guilty_at_its_second_blame() {
+        // 2026-11-20 02:18 UTC (m4.173, T72 run 2): the first restart blamed deqp's 59. Nothing
+        // confirmed that blame, so it is collateral: one failed command, the VM stays usable.
         let (deqp, b, x) = (vm(), vm(), vm());
         let mut queues = Cascade::new([([58, 59], &deqp), ([44, 45], &b), ([60, 61], &x), ([62, 63], &x)]);
         assert!(!queues.restart(59, 1 << 45));
+        assert!(!deqp.recovery_guilty() && deqp.get() == 0);
+        // Its hang comes back with nothing of it retired: the blame is its own.
+        assert!(!queues.restart(59, 1 << 59));
         assert!(deqp.recovery_guilty() && deqp.get() != 0);
         assert!(queues.restart(59, 1 << 59));
+        assert!(!b.recovery_guilty() && b.get() == 0);
+    }
+
+    #[test]
+    fn a_confirmed_first_blame_is_guilty_at_once() {
+        // Evidence (slot identity, the host's pass records or a latched MMU fault) names the VM.
+        let (deqp, b, x) = (vm(), vm(), vm());
+        let mut queues = Cascade::new([([58, 59], &deqp), ([44, 45], &b), ([60, 61], &x), ([62, 63], &x)]);
+        assert!(!queues.restart_as(59, 1 << 59, Attribution::Queues(3 << 58)));
+        assert!(deqp.recovery_guilty() && deqp.get() != 0);
         assert!(queues.restart(59, 1 << 59));
         assert!(!b.recovery_guilty() && b.get() == 0);
+    }
+
+    #[test]
+    fn the_m4_179_bystander_blames_poison_only_the_culprit() {
+        // 2026-11-23 01:46:44 UTC (m4.179, #2504 hang row run 7): deqp-vk (100/101) spins. Reason
+        // 0, no slot keys, and each bystander's front render had its tiler start written, so no
+        // evidence moved the blame. Gen 21 blamed t3code's 57, gen 22 Hyprland's 37, gen 23
+        // deqp's 101; both bystanders were failed as guilty and Hyprland lost the session.
+        let (deqp, t3code, hyprland, x) = (vm(), vm(), vm(), vm());
+        let mut queues =
+            Cascade::new([([100, 101], &deqp), ([56, 57], &t3code), ([36, 37], &hyprland), ([60, 61], &x)]);
+        let mut counted = 0;
+        counted += usize::from(!queues.restart(57, (3 << 56) | (1 << 101)));
+        assert!(!t3code.recovery_guilty() && t3code.get() == 0);
+        // Hyprland's next frame started after that restart: nothing spared it.
+        queues.submit(36);
+        counted += usize::from(!queues.restart(37, (3 << 36) | (1 << 101)));
+        assert!(!hyprland.recovery_guilty() && hyprland.get() == 0);
+        counted += usize::from(!queues.restart(101, 3 << 100));
+        assert!(!deqp.recovery_guilty());
+        counted += usize::from(!queues.restart(101, 1 << 101));
+        assert!(deqp.recovery_guilty() && deqp.get() != 0);
+        assert!(queues.restart(101, 1 << 101));
+        assert!(!t3code.recovery_guilty() && t3code.get() == 0);
+        assert!(!hyprland.recovery_guilty() && hyprland.get() == 0);
+        assert_eq!(counted, 4);
     }
 
     #[test]

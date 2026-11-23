@@ -239,6 +239,9 @@ impl recovery::Queues for Service<'_> {
             self.firmware.queues.note_render_collateral(qid, generation);
         }
     }
+    fn marks_collateral(&self, qid: u8) -> bool {
+        !self.firmware.init.is_m5() && self.firmware.queues.render_oldest_spared(qid).is_some()
+    }
     fn visit_owners(&self, qid: u8, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
         self.firmware.queues.visit_render_owners(qid, visit);
         for queue in self
