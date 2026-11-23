@@ -271,7 +271,7 @@ impl PmpData {
             let asc = self.asc_mmio.try_access().ok_or(ENODEV)?;
             asc.as_view().relaxed().read(ASC_CPU_CONTROL).cpu_run() != 0
         };
-        dev_info!(self.dev, "PMP restore: ASC CPU_RUN={}\n", cpu_running as u32);
+        dev_dbg!(self.dev, "PMP restore: ASC CPU_RUN={}\n", cpu_running as u32);
         {
             let mut guard = self.rtkit.lock();
             let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
@@ -282,7 +282,7 @@ impl PmpData {
             if cpu_running {
                 // The firmware never stopped (an aborted hibernation, or a
                 // restore failure in the boot kernel): nothing to rebuild.
-                dev_info!(self.dev, "PMP restore: firmware still running, left as is\n");
+                dev_dbg!(self.dev, "PMP restore: firmware still running, left as is\n");
                 return Ok(());
             }
             // Halted firmware: detach the stale session so a fresh HELLO/EPMAP
@@ -307,7 +307,7 @@ impl PmpData {
                 .update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         }
         self.start()?;
-        dev_info!(self.dev, "PMP restore: firmware and endpoint back\n");
+        dev_dbg!(self.dev, "PMP restore: firmware and endpoint back\n");
         Ok(())
     }
     fn start(&self) -> Result<()> {

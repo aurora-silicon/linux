@@ -438,7 +438,7 @@ static void apple_rtkit_helper_remove(struct platform_device *pdev)
 	 * without a handshake so that the next probe starts the CPU again.
 	 */
 	if (!apple_rtkit_helper_cpu_running(helper)) {
-		dev_info(&pdev->dev, "co-processor halted underneath (resume from disk): removed without quiesce\n");
+		dev_dbg(&pdev->dev, "co-processor halted underneath (resume from disk): removed without quiesce\n");
 		return;
 	}
 
@@ -729,7 +729,7 @@ static int apple_rtkit_helper_restore_own(struct apple_rtkit_helper *helper)
 				 ret);
 		} else {
 			helper->halted_underneath = true;
-			dev_info(dev, "resume from disk: self-started RTKit session left for a reload\n");
+			dev_dbg(dev, "resume from disk: self-started RTKit session left for a reload\n");
 		}
 		return 0;
 	}
