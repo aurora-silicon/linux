@@ -5,7 +5,6 @@
  * Copyright (C) The Asahi Linux Contributors
  */
 
-#include <linux/suspend.h>
 #include <linux/async.h>
 #include <linux/atomic.h>
 #include <linux/bitfield.h>
@@ -20,6 +19,7 @@
 #include <linux/of.h>
 #include <linux/wait.h>
 #include <linux/pci.h>
+#include <linux/pci-apple.h>
 #include <linux/soc/apple/radio-sleep.h>
 #include <linux/printk.h>
 #include <linux/property.h>
@@ -3210,11 +3210,12 @@ static int bcm4377_resume(struct device *dev)
 	}
 
 	/*
-	 * A real sleep took the function's power: the firmware is gone, and every resume command
-	 * would only time out (two times 2 s inside the system resume, then the rebind anyway).
-	 * Skip them and rebind from the work queue; probe boots the firmware from scratch.
+	 * A firmware sleep took the function's power (the host says so from its match data): the
+	 * firmware is gone, and every resume command would only time out (two times 2 s inside
+	 * the system resume, then the rebind anyway). Skip them and rebind from the work queue;
+	 * probe boots the firmware from scratch.
 	 */
-	if (pm_resume_via_firmware() && !bcm4377->dma_window_base) {
+	if (apple_pcie_s2r_power_lost(pdev)) {
 		bcm4377->quiesced = false;
 		bcm4377->resume_powered = false;
 		/* No firmware to take the rings down at the close before the rebind. */

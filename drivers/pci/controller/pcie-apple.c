@@ -7614,6 +7614,17 @@ static bool apple_pcie_s2r_conventional(struct apple_pcie *pcie)
 	       !pcie->piodma_supplier && !pcie->hw->root_bus_only;
 }
 
+/* For the driver of an endpoint below @pdev's host: a firmware sleep took its power. */
+bool apple_pcie_s2r_power_lost(struct pci_dev *pdev)
+{
+	struct pci_host_bridge *host = pdev ? pci_find_host_bridge(pdev->bus) : NULL;
+
+	if (!host || !host->dev.parent || host->dev.parent->driver != &apple_pcie_driver.driver)
+		return false;
+	return apple_pcie_s2r_conventional(pci_host_bridge_priv(host)) && pm_resume_via_firmware();
+}
+EXPORT_SYMBOL_GPL(apple_pcie_s2r_power_lost);
+
 /* What only the port registers hold. */
 static void apple_pcie_s2r_save(struct apple_pcie *pcie)
 {
