@@ -2093,6 +2093,7 @@ F:	drivers/soc/apple/pmp.rs
 F:	include/linux/mt7932.h
 F:	include/linux/soc/apple/pmp-report.h
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
+F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-running.yaml
 F:	Documentation/devicetree/bindings/chosen/aurora,ctxr-exec-window.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
@@ -2149,6 +2150,15 @@ F:	tools/testing/kunit/configs/apple_t8140_bootstrap.config
 F:	tools/testing/kunit/configs/mt7932.config
 F:	tools/testing/selftests/drivers/apple/aop-las.py
 F:	tools/testing/selftests/drivers/gpu/apple-dcp/
+
+APPLE T8152 DCP DISPLAY DRIVER (IBOOT INTERFACE)
+M:	Thomas Glanzmann <thomas@glanzmann.de>
+L:	dri-devel@lists.freedesktop.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/display/apple,t8152-dcp-iboot.yaml
+F:	drivers/gpu/drm/apple/iboot_drm.c
+F:	drivers/gpu/drm/apple/iomfb_iboot.*
+F:	drivers/gpu/drm/apple/t8152_*
 
 APPLETALK NETWORK LAYER
 L:	netdev@vger.kernel.org

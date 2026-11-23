@@ -97,6 +97,7 @@ struct apple_dart_hw {
     u32 tcr_enabled, tcr_4level, ttbr_shift, ttbr_addr_field_shift;
     void (*enable_remap)(struct apple_dart *, int, int);
     int (*invalidate_tlb)(struct apple_dart_stream_map *);
+    bool gen3;
 };
 struct apple_dart {
     const struct apple_dart_hw *hw;
