@@ -15,6 +15,7 @@
 
 #include "parser.h"
 #include "dcp-refresh.h"
+#include "dcp-peer-v13_5.h"
 #include "dcp-peer-v27.h"
 #include "trace.h"
 
@@ -837,6 +838,19 @@ static bool timing_is_tiled_size(const struct dcp_parse_ctx *handle)
 	return width == handle->tiled_width && height == handle->tiled_height;
 }
 
+/* An absent or unknown layout disables pairing only for this catalogue entry. */
+static u32 parse_t602x_clock(struct dcp_parse_ctx at)
+{
+	const struct dcp_parse_tag *tag = parse_tag_of_type(&at, DCP_TYPE_BLOB);
+	const u8 *data;
+
+	if (IS_ERR(tag) || tag->size != T602X_TIMING_SIZE)
+		return 0;
+
+	data = parse_bytes(&at, tag->size);
+	return IS_ERR(data) ? 0 : dcp_t602x_wire_clock(data, tag->size);
+}
+
 static int parse_mode(struct dcp_parse_ctx *handle,
 		      struct dcp_display_mode *out, s64 *score, int width_mm,
 		      int height_mm, unsigned notch_height, bool internal, bool external_sdr)
@@ -851,6 +865,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	struct timing_color_restrictions limits = {};
 	struct dcp_color_mode unsafe_rgb8 = { .score = -1 };
 	bool have_horiz = false, have_vert = false, have_virtual = false;
+	bool have_t602x_timing = false;
 	bool duplicate_scope = false, vrr_ambiguous = false, vrr_fallback;
 	unsigned int vrr_seen = 0;
 	s64 min_vrr = 0, max_vrr = 0;
@@ -866,6 +881,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	struct drm_display_mode *mode = &out->mode;
 
 	*out = (struct dcp_display_mode) {
+		.t602x_pair_offered = handle->t602x_pair_offered,
 		.sdr_rgb.score = -1,
 		.sdr_444.score = -1,
 		.sdr.score = -1,
@@ -907,7 +923,11 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 			ret = PTR_ERR(key);
 		else if (is_virtual)
 			ret = skip(it.handle);
-		else if (!strcmp(key, "HorizontalAttributes")) {
+		else if (handle->t602x_pair_timing && !strcmp(key, "ElementData")) {
+			out->t602x_clock_hz = have_t602x_timing ? 0 : parse_t602x_clock(*it.handle);
+			have_t602x_timing = true;
+			ret = skip(it.handle);
+		} else if (!strcmp(key, "HorizontalAttributes")) {
 			duplicate_scope |= have_horiz;
 			have_horiz = true;
 			ret = parse_dimension(it.handle, &horiz, timing_keys || internal);

@@ -6,7 +6,7 @@ Firmware, MMIO and USB role operations are synthetic leaves. The concurrency
 case executes production transactions with real pthread connector/fabric locks.
 """
 import quiesce
-from common import block, apple_function
+from common import block, apple_function, internal_inline
 
 
 def controls(ROOT):
@@ -42,7 +42,7 @@ def controls(ROOT):
      void *tb_dpin_set_active,*tb_dpin_ctx,*phy,*fixed_phy;
      struct mux_control *xbar,*fixed_xbar;
      /* desktop 26.x hybrid hand-over and dual-pipe state; fw_compat is never desktop here */
-     bool peer_starved,typec_narrow,hdmi_yielded;
+     bool peer_starved,typec_narrow,hdmi_yielded,t602x_peer_reserved;
      struct apple_dcp_typec_route *active_typec_route,*typec_routes;
      struct connector *connector,*fixed_connector;int connector_type,fixed_connector_type;
      struct mux_control *direct_xbar_up; bool external_native, ext_dead; int fw_compat; unsigned long long tb_generation;
@@ -66,6 +66,9 @@ def controls(ROOT):
     extra=r'''
     /* actual DCP leaves */
     #define WRITE_ONCE(x,v) ((x)=(v))
+    #define smp_load_acquire(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
+    static int pair_stop_error;
+    static int __attribute__((unused)) dcp_t602x_stop(struct apple_dcp *d) { (void)d;return pair_stop_error; }
     /* No T8132 dcpext here: every route has DP alt mode (production: the dcpext compatible). */
     struct apple_dcp_typec_route;
     static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route) { (void)route; return false; }
@@ -130,6 +133,7 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     static int __attribute__((unused)) dcp_dptx_recover_irq(struct apple_dcp *d) { (void)d;assert(!"IRQ_HPD recovery");return -EINVAL; }
     static int __attribute__((unused)) of_property_read_string(void *np,const char *name,const char **out) { (void)np;(void)name;(void)out;return -EINVAL; }
     '''+''.join(apple_function(ROOT,name) for name in ('apple_connector_invalidate_edid','apple_connector_set_pipeline','dcp_modes_end_typec','dcp_typec_port_busy','dcp_tb_events_retire'))
+    extra += internal_inline(ROOT, 'dcp_t602x_port_reserved')
     pos=actual.index('static int dcp_typec_route_deactivate(')
     actual=actual[:pos]+extra+actual[pos:]
     # The fabric core split: availability is the real dcp_fabric_available() over
@@ -187,6 +191,16 @@ static int late_finish_error(struct typec_mux_dev *m,struct typec_mux_state *s) 
       assert(!display.tb_events&&!display.tb_event_route&&!display.tb_event_generation&&tb_event_cancels>=1);
       puts("PASS actual DCP prepare + route_set + route_deactivate + framework normal SAFE");
      }
+     if(argv[1][0]=='p') {
+      struct apple_dcp peer={.t602x_peer_reserved=true};
+      struct apple_dcp_typec_route other={.dcp=&peer};
+      assert(!dcp_typec_route_available(&other));
+      peer.t602x_peer_reserved=false;
+      assert(dcp_typec_route_available(&other));
+      pair_stop_error=-ETIMEDOUT;
+      assert(dcp_typec_route_deactivate(&route)==-ETIMEDOUT);
+      assert(route.selected&&display.active_typec_route==&route&&!xbar_calls);
+     }
      if(argv[1][0]=='r') {
       mux.mux_devs[0]=&display_provider;mux.mux_devs[1]=&phy_provider;phy_error=-ETIMEDOUT;
       assert(typec_mux_set(&mux,&safe)==-ETIMEDOUT);
@@ -228,7 +242,10 @@ static int late_finish_error(struct typec_mux_dev *m,struct typec_mux_state *s) 
     '''
     bus=(ROOT/'drivers/usb/typec/bus.c').read_text()
     actual+='\nstruct altmode { struct typec_mux *mux; struct typec_altmode adev; };\n'+block(bus,'static inline int\ntypec_altmode_set_mux(')+'\n'+controls
-    check('actual-dcp-normal-safe',actual,(('ordered',),))
+    safe_cases = [('ordered',)]
+    if 'dcp_t602x_stop(' in dcp:
+        safe_cases.append(('pair-stop',))
+    check('actual-dcp-normal-safe',actual,safe_cases)
     check('actual-dcp-finalizer-recovery',actual,(('xbar-error',),('finalizer',)))
     check('provider-order-releases-failed-lease',actual,(('release',),))
     check('failed-safe-allows-new-dp-admission',actual,(('dp',),))

@@ -322,6 +322,17 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Display coprocessor index on multi-DCP systems.
 
+  apple,scanout-peers:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 1
+    maxItems: 3
+    items:
+      maxItems: 1
+    description:
+      External display coprocessors on the same die that can supply the
+      other half of a scanout driven by this coprocessor. Each phandle
+      describes one direction. Omit outputs reserved for fixed connectors.
+
   apple,typec-hybrid-first:
     type: boolean
     description:

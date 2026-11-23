@@ -2072,7 +2072,39 @@ static void parser_internal_v27_only_120hz(struct kunit *test)
 	dcp_modes_release(dcp);
 }
 
+static void parser_t602x_pair_catalogue(struct kunit *test)
+{
+	struct dcp_display_mode entries[2] = {
+		{ .mode = { .clock = 1690000, .hdisplay = 2560, .htotal = 2720,
+			    .vdisplay = 1440, .vtotal = 1726 },
+		  .timing_mode_id = 1, .sdr_rgb.id = 3 },
+	};
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct dcp_display_mode selected;
+	struct drm_display_mode requested = entries[0].mode;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	parser_modes_init(dcp);
+	entries[1] = entries[0];
+	entries[1].timing_mode_id = 2;
+	entries[1].t602x_clock_hz = 1690000000;
+	dcp->modes = entries;
+	dcp->nr_modes = ARRAY_SIZE(entries);
+	dcp->modes_admitted = true;
+
+	/* An incomplete first entry must not hide the usable duplicate. */
+	KUNIT_ASSERT_TRUE(test, lookup_mode_for_pair(dcp, &requested, &selected));
+	KUNIT_EXPECT_EQ(test, selected.timing_mode_id, 2U);
+	entries[1].sdr_rgb.score = -1;
+	KUNIT_EXPECT_FALSE(test, lookup_mode_for_pair(dcp, &requested, NULL));
+
+	/* Ordinary scanout can still use the original entry. */
+	KUNIT_ASSERT_TRUE(test, lookup_mode(dcp, &requested, &selected));
+	KUNIT_EXPECT_EQ(test, selected.timing_mode_id, 1U);
+}
+
 static struct kunit_case parser_cases[] = {
+	KUNIT_CASE(parser_t602x_pair_catalogue),
 	KUNIT_CASE(parser_internal_v27_only_120hz),
 	KUNIT_CASE(parser_panel_of_dimensions),
 	KUNIT_CASE(parser_panel_j616s_publication),

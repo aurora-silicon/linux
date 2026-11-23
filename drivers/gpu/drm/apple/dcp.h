@@ -10,6 +10,7 @@
 
 #include "connector.h"
 #include "dcp-internal.h"
+#include "dcp-peer-v13_5.h"
 #include "dcp-fabric.h"
 #include "parser.h"
 
@@ -20,6 +21,9 @@ struct apple_atomic_state {
 	struct drm_atomic_commit base;
 	/* Failed route transactions suppress both CRTC enables in this commit. */
 	u32 failed_routes;
+	bool t602x_topology;
+	/* Allocated only for modesets that need a T602x peer. */
+	struct dcp_t602x_assignment *t602x;
 };
 
 #define to_apple_atomic_state(s) container_of(s, struct apple_atomic_state, base)
@@ -66,6 +70,28 @@ void dcp_poweroff(struct platform_device *pdev);
 int dcp_typec_prepare_route(struct apple_dcp *dcp);
 void dcp_poweron(struct platform_device *pdev);
 void dcp_external_recover(struct platform_device *pdev);
+struct dcp_display_hints_v13_5;
+struct dcp_swap_submit_req_v13_3;
+bool dcp_t602x_needs_pair(struct apple_dcp *dcp, const struct drm_display_mode *mode);
+int dcp_t602x_modeset(struct apple_dcp *owner, struct drm_crtc_state *state,
+		      const struct dcp_t602x_assignment *assignments, bool fabric_held);
+int dcp_t602x_check(struct apple_dcp *dcp, struct drm_crtc_state *state,
+		    struct drm_atomic_commit *commit);
+bool dcp_session_retained(struct device *dev);
+bool dcp_t602x_ext13_5(struct apple_dcp *dcp);
+bool dcp_t602x_has_pair_engine(struct drm_device *dev);
+bool dcp_t602x_topology_changed(struct drm_atomic_commit *commit);
+int dcp_t602x_plan_commit(struct drm_atomic_commit *commit);
+int dcp_t602x_stop(struct apple_dcp *pipe);
+bool dcp_t602x_present(struct apple_dcp *owner, struct drm_atomic_commit *commit,
+		       const struct dcp_swap_submit_req_v13_3 *request);
+int dcp_t602x_claim_port(struct apple_dcp *dcp, bool fabric_held);
+void dcp_t602x_release_port(struct apple_dcp *dcp);
+bool dcp_t602x_frame_complete(struct apple_dcp *dcp, u32 id, ktime_t at);
+void iomfb_complete_pair_v13_3(struct apple_dcp *dcp, u32 id, ktime_t displayed);
+bool dcp_t602x_tiling(struct apple_dcp *dcp, bool write, u32 event, u32 param, u32 *value);
+void dcp_t602x_display_hints(struct apple_dcp *dcp, struct dcp_display_hints_v13_5 *reply);
+bool dcp_t602x_mode_limited(struct apple_dcp *dcp, const struct drm_display_mode *mode);
 int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 		      const void *data, size_t size, void *reply, size_t reply_size);
 bool dcp_peer_tiling_state_v27(struct apple_dcp *dcp, bool write,
@@ -124,7 +150,7 @@ int dcp_get_modes(struct drm_connector *connector);
 enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 				    const struct drm_display_mode *mode);
 int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
-			    struct drm_atomic_commit *commit);
+			    struct drm_atomic_commit *commit, bool fabric_held);
 bool dcp_crtc_can_retrain(struct drm_crtc *crtc, struct apple_connector *connector);
 bool dcp_crtc_needs_route_start(struct apple_dcp *dcp);
 bool dcp_crtc_route_ready(struct drm_crtc *crtc, struct drm_atomic_commit *commit,

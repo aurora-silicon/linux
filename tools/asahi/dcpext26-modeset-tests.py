@@ -83,8 +83,9 @@ static unsigned done,woken,notified,invalidated,powered,programmed;
 static unsigned classic_errors;
 static void dcp_drm_crtc_error(struct apple_crtc *c, struct drm_crtc_state *s, int error){assert(error);classic_errors++;}
 static int mode_error;
-static int dcp_typec_follow_crtc(struct drm_crtc *c,struct drm_atomic_commit *a,bool *locked){*locked=true;return 0;}
-static void dcp_typec_follow_done(bool locked){assert(locked);done++;}
+static bool route_locked = true;
+static int dcp_typec_follow_crtc(struct drm_crtc *c,struct drm_atomic_commit *a,bool *locked){*locked=route_locked;return 0;}
+static void dcp_typec_follow_done(bool locked){assert(locked==route_locked);done++;}
 static bool dcp_crtc_route_ready(struct drm_crtc *c,struct drm_atomic_commit *a,bool enable){return true;}
 static bool dcp_crtc_needs_route_start(struct apple_dcp *d){return false;}
 static int dcp_typec_prepare_route(struct apple_dcp *d){return 0;}
@@ -92,7 +93,10 @@ static int apple_drm_fabric_hold(void){return 0;}
 static void dcp_poweron(struct apple_dcp *d){assert(d->typec_enable_pending);powered++;}
 static void dcp_external_recover(struct apple_dcp *d){}
 static bool drm_atomic_crtc_needs_modeset(struct drm_crtc_state *s){return true;}
-static int dcp_crtc_atomic_modeset(struct drm_crtc *c,struct drm_atomic_commit *a){programmed++;return mode_error;}
+static int dcp_crtc_atomic_modeset(struct drm_crtc *c,struct drm_atomic_commit *a,bool locked)
+{
+ assert(locked==route_locked);programmed++;return mode_error;
+}
 static void dcp_mode_invalidate(int *m){invalidated++;*m=0;}
 static void schedule_work(int *w){woken++;}
 static void dcp_route_failure_notify(void *c){notified++;}
@@ -109,6 +113,8 @@ int main(void){
  }
  done=woken=notified=invalidated=0;mode_error=0;
  apple_crtc_atomic_enable(&crtc,&commit);assert(done==1&&!woken&&!notified&&!invalidated&&!d.typec_enable_pending);
+ route_locked=false;
+ apple_crtc_atomic_enable(&crtc,&commit);assert(done==2&&!woken&&!notified&&!invalidated);
  // Existing non-native error policy is preserved.
  d.native=false;done=woken=notified=invalidated=0;mode_error=-EIO;
  apple_crtc_atomic_enable(&crtc,&commit);assert(done==1&&!woken&&!notified&&!invalidated&&classic_errors==1&&!d.typec_enable_pending);

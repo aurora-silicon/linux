@@ -636,7 +636,6 @@ static unsigned hints;static u32 hint;
 static bool __attribute__((unused)) dcp_backlight_active(struct apple_dcp *d) {(void)d;return false;}
 static bool dcp_has_panel(struct apple_dcp *d) {(void)d;return true;}
 static int dcp_backlight_takeover(struct apple_dcp *d,u32 mnits) {(void)d;hints++;hint=mnits;return 0;}
-static u32 get_unaligned_le32(const void *p) {u32 v;memcpy(&v,p,4);return v;}
 static struct apple_epic_service *afk_epic_find_service(struct apple_dcp_afkep *e,u16 id)
 {assert(e->service->channel==id);return e->service;}
 static struct apple_epic_service *afk_service_get(struct apple_epic_service *s) {s->users++;return s;}

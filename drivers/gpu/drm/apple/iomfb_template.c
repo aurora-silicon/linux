@@ -847,6 +847,10 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 {
 	ktime_t now = dcp_is_ext26(dcp) ? ns_to_ktime(dcp->ext26_rx_ns) : ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
+#ifdef DCP_HAS_T602X_PEER
+	if (dcp_t602x_frame_complete(dcp, resp->swap_id, now))
+		return;
+#endif
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	if (dcp_peer_swap_complete_v27(dcp, resp->swap_id, now, dcp_peer_queue_completion))
 		return;
@@ -1480,7 +1484,13 @@ dcpep_cb_map_physical(struct apple_dcp *dcp, struct dcp_map_physical_req *req)
 
 static u64 dcpep_cb_get_frequency(struct apple_dcp *dcp)
 {
-	return clk_get_rate(dcp->clk);
+	u64 rate = clk_get_rate(dcp->clk);
+
+#ifdef DCP_HAS_T602X_PEER
+	if (!rate)
+		rate = READ_ONCE(dcp->t602x_pair_clock);
+#endif
+	return rate;
 }
 
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0) && !DCP_FW_H17(DCP_FW_VER) && \
@@ -2834,6 +2844,11 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct dcp_wait_cookie *poff_cookie;
 	typeof(DCP_FW_SWAP(dcp)) *swap = &DCP_FW_SWAP(dcp);
 
+#ifdef DCP_HAS_T602X_PEER
+	if (dcp_t602x_stop(dcp))
+		return;
+#endif
+
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	/*
 	 * Firmware 27 has its own paired stop sequence. Its hardware profile
@@ -3037,6 +3052,11 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 #endif
 
 	struct dcp_wait_cookie *cookie;
+
+#ifdef DCP_HAS_T602X_PEER
+	if (dcp_t602x_stop(dcp))
+		return;
+#endif
 
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	ret = dcp_peer_stop_v27(dcp);
@@ -3282,6 +3302,11 @@ dcpep_cb_get_tiling_state(struct apple_dcp *dcp,
 			.value = value,
 			.ret = 1,
 		};
+#elif defined(DCP_HAS_T602X_PEER)
+	u32 value = 0;
+
+	if (!req->value_null && dcp_t602x_tiling(dcp, false, req->event, req->param, &value))
+		return (struct dcpep_get_tiling_state_resp){ .value = value, .ret = 1 };
 #endif
 	return (struct dcpep_get_tiling_state_resp){
 		.value = 0,
@@ -4641,6 +4666,11 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 		dcp->brightness.update = false;
 	}
+#endif
+
+#ifdef DCP_HAS_T602X_PEER
+	if (dcp_t602x_present(dcp, commit, req))
+		return;
 #endif
 
 	if (crtc_state->color_mgmt_changed) {

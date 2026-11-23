@@ -82,6 +82,7 @@
 #include "ibootep.h"
 #include "iomfb_internal.h"
 #include "parser.h"
+#include "t8132_ext_drm.h"
 #include "trace.h"
 
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
@@ -99,7 +100,7 @@ struct dcp_session_ref {
 static LIST_HEAD(dcp_retained_sessions);
 static DEFINE_MUTEX(dcp_retained_sessions_lock);
 
-static bool dcp_session_retained(struct device *dev)
+bool dcp_session_retained(struct device *dev)
 {
 	struct dcp_session_ref *session;
 	bool retained = false;
@@ -275,7 +276,10 @@ static void dcp_release_secure_rtkit(void *data)
 	struct apple_dcp *dcp = data;
 
 	dcp_secure_poll_stop(dcp);
-	apple_rtkit_free(dcp->secure_rtk);
+	if (READ_ONCE(dcp->retain_dma) && READ_ONCE(dcp->t602x_scanout))
+		apple_rtkit_free_retaining_buffers(dcp->secure_rtk);
+	else
+		apple_rtkit_free(dcp->secure_rtk);
 	dcp->secure_rtk = NULL;
 }
 
@@ -505,6 +509,7 @@ bool dcp_t6041_ext_enabled(void)
 
 #include "iomfb_v26_6_swap.h"
 #include "dcp-peer-v26_6.inc"
+#include "dcp-peer-v13_5.inc"
 /* The firmware 27 pair shares dcp_peer_lock and dcp_peer_forget() above. */
 #include "dcp-peer-v27.inc"
 #include "dcp-peer-probe-v27.inc"
@@ -2009,6 +2014,7 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	struct drm_crtc_state *crtc_state;
 	bool needs_modeset;
+	int ret;
 
 	if (dcp_crtc_check_hdr(dcp, crtc, commit))
 		return -EINVAL;
@@ -2048,6 +2054,10 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	 */
 	if (dcp->crashed)
 		return crtc_state && crtc_state->enable ? -EINVAL : 0;
+
+	ret = dcp_t602x_check(dcp, crtc_state, commit);
+	if (ret)
+		return ret;
 
 	/* External H17P does not program adaptive sync. */
 	if (dcp->hw.iomfb_method_profile ==
@@ -5481,6 +5491,12 @@ static void dcp_release_piodma_iommu_dev(struct apple_dcp *dcp)
 		return;
 	}
 	if (dcp->piodma) {
+		if (dcp->piodma_domain_held) {
+			guard(device)(&dcp->piodma->dev);
+
+			iommu_device_unuse_default_domain(&dcp->piodma->dev);
+			dcp->piodma_domain_held = false;
+		}
 		if (dcp->piodma_created)
 			of_platform_device_destroy(&dcp->piodma->dev, NULL);
 		else
@@ -5590,6 +5606,14 @@ static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 		goto err_destroy_pdev;
 	}
 
+	if (dcp_t602x_ext13_5(dcp)) {
+		guard(device)(&dcp->piodma->dev);
+
+		ret = iommu_device_use_default_domain(&dcp->piodma->dev);
+		if (ret)
+			goto err_destroy_pdev;
+		dcp->piodma_domain_held = true;
+	}
 	dcp->iommu_dom = iommu_get_domain_for_dev(&dcp->piodma->dev);
 	if (IS_ERR(dcp->iommu_dom)) {
 		ret = dev_err_probe(dcp->dev, PTR_ERR(dcp->iommu_dom),
@@ -6815,6 +6839,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	int ret;
 
+	if (READ_ONCE(dcp->retain_dma) && READ_ONCE(dcp->t602x_scanout))
+		return -EBUSY;
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
 	dcp_peer_bound_26_6(dcp);
@@ -6838,6 +6864,11 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		return;
 	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
 		apple_sleep_v27_unregister(dev);
+	if (t602x_unbind_pair(dcp)) {
+		t602x_drain_callbacks(dcp);
+		dcp_disable_typec_work(dcp, false);
+		dev_err(dev, "paired stop unconfirmed, retaining its DMA until reboot\n");
+	}
 	dcp_indicator_release(dcp);
 	dcp_peer_forget(dcp);
 	/*
@@ -6933,6 +6964,13 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 			cancel_work_sync(&dcp->connector->hotplug_wq);
 		if (dcp->typec_connector && dcp->typec_connector != dcp->connector)
 			cancel_work_sync(&dcp->typec_connector->hotplug_wq);
+		if (READ_ONCE(dcp->t602x_scanout)) {
+			/* Detach RX before the component releases host-only scratch. */
+			if (dcp->secure_rtk)
+				devm_release_action(dev, dcp_release_secure_rtkit, dcp);
+			if (dcp->rtk)
+				devm_release_action(dev, dcp_release_rtkit, dcp);
+		}
 		dev_warn(dev, "retaining live DCP DMA resources after unbind; reboot required\n");
 		return;
 	}
@@ -7322,11 +7360,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		return ret;
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->external_lock);
+	init_waitqueue_head(&dcp->t602x_pair_wait);
 	INIT_WORK(&dcp->external_stop_work, dcp_external_stop_work);
 	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, dcp_external_stop_retry);
 	mutex_init(&dcp->tb_lock);
 	dcp_fabric_init(dcp);
 	spin_lock_init(&dcp->mode_state.lock);
+	init_completion(&dcp->t602x_frame_done);
 	spin_lock_init(&dcp->metadata.lock);
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
@@ -10064,6 +10104,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6020 = {
 static const struct apple_dcp_hw_data apple_dcp_hw_t6020_dcpext = {
 	.num_dptx_ports = 2,
 	.t6020_tunnel_flow = true,
+	.t602x_paired_dp = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8112 = {

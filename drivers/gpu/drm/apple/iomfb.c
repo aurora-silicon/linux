@@ -41,6 +41,7 @@
 #include "dcp.h"
 #include "dcp-hdr-metadata.h"
 #include "dcp-internal.h"
+#include "dcp-peer-v13_5.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
 #include "iomfb_m4.h"
@@ -2461,6 +2462,8 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		if (ret)
 			return ret;
 		ctx->metadata_timing = dcp_firmware_metadata_enabled(dcp);
+		ctx->t602x_pair_timing = dcp_t602x_ext13_5(dcp);
+		ctx->t602x_pair_offered = READ_ONCE(dcp->t602x_pair_offered);
 		ctx->sdr_default_rgb = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
 				       !dcp_has_panel(dcp);
 		ctx->pq_dsc = dcp->fw_compat == DCP_FIRMWARE_V_27_0;
@@ -3449,20 +3452,37 @@ int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	}
 }
 
-/* The user may own drm_display_mode, so we need to search for our copy */
-bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
-		 struct dcp_display_mode *out)
+/* The same catalogue entry must be usable when probing and setting a paired mode. */
+static bool t602x_pair_element(struct apple_dcp *dcp, const struct dcp_display_mode *entry)
+{
+	const struct drm_display_mode *mode = &entry->mode;
+
+	return entry->timing_mode_id && entry->timing_mode_id < DCP_SPLIT_MODE_SUFFIX &&
+	       entry->sdr_rgb.id && entry->sdr_rgb.id < DCP_SPLIT_MODE_SUFFIX &&
+	       entry->sdr_rgb.score >= 0 &&
+	       dcp_t602x_rate_fits(dcp_t602x_limits(&dcp->dptxport[0].caps), mode->hdisplay,
+				  mode->vdisplay, mode->htotal, mode->vtotal,
+				  entry->t602x_clock_hz, 2);
+}
+
+static bool lookup_mode_matching(struct apple_dcp *dcp,
+				 const struct drm_display_mode *mode,
+				 struct dcp_display_mode *out, bool paired)
 {
 	struct dcp_display_mode *modes;
 	unsigned int count, i;
 	unsigned long flags;
 	bool eligible;
+	unsigned int match_flags = DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_CLOCK;
+
+	if (paired)
+		match_flags |= DRM_MODE_MATCH_FLAGS | DRM_MODE_MATCH_3D_FLAGS;
 
 	modes = dcp_modes_snapshot(dcp, NULL, &count);
 	for (i = 0; i < count; ++i) {
-		if (drm_mode_match(mode, &modes[i].mode,
-				   DRM_MODE_MATCH_TIMINGS |
-					   DRM_MODE_MATCH_CLOCK)) {
+		if (drm_mode_match(mode, &modes[i].mode, match_flags)) {
+			if (paired && !t602x_pair_element(dcp, &modes[i]))
+				continue;
 			if (!modes[i].automatic_rgb8_quirk)
 				goto found;
 			mutex_lock(&dcp->hpd_mutex);
@@ -3486,6 +3506,19 @@ found:
 	return true;
 }
 
+/* The user may own drm_display_mode, so we need to search for our copy. */
+bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
+		 struct dcp_display_mode *out)
+{
+	return lookup_mode_matching(dcp, mode, out, false);
+}
+
+bool lookup_mode_for_pair(struct apple_dcp *dcp, const struct drm_display_mode *mode,
+			  struct dcp_display_mode *out)
+{
+	return lookup_mode_matching(dcp, mode, out, true);
+}
+
 /*
  * H17P keeps the mode the bootloader programmed and never sends
  * set_digital_out_mode (see DCP_INHERIT_BOOT_MODE in iomfb_template.c), so a
@@ -3497,6 +3530,9 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 			      const struct drm_display_mode *mode)
 {
 	struct dcp_display_mode dcp_mode;
+
+	if (dcp_t602x_needs_pair(dcp, mode))
+		return lookup_mode_for_pair(dcp, mode, NULL);
 
 	if (!lookup_mode(dcp, mode, &dcp_mode))
 		return false;
@@ -3542,13 +3578,15 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 	 * leaves this display no pair; dcp_peer_limit_update_v27() has the
 	 * connector probed again when that changes.
 	 */
+	if (dcp_t602x_mode_limited(dcp, mode))
+		return MODE_CLOCK_HIGH;
 	if (dcp_peer_mode_limited_v27(dcp, mode->clock))
 		return MODE_CLOCK_HIGH;
 	return dcp_mode_settable(dcp, mode) ? MODE_OK : MODE_BAD;
 }
 
 int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
-			    struct drm_atomic_commit *commit)
+			    struct drm_atomic_commit *commit, bool fabric_held)
 {
 	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 	struct apple_dcp *dcp = platform_get_drvdata(apple_crtc->dcp);
@@ -3612,7 +3650,10 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		ret = iomfb_modeset_v12_3(dcp, crtc_state);
 		break;
 	case DCP_FIRMWARE_V_13_5:
-		ret = iomfb_modeset_v13_3(dcp, crtc_state);
+		ret = dcp_t602x_modeset(dcp, crtc_state, to_apple_atomic_state(commit)->t602x,
+					fabric_held);
+		if (ret == -EOPNOTSUPP && !dcp_t602x_needs_pair(dcp, &crtc_state->mode))
+			ret = iomfb_modeset_v13_3(dcp, crtc_state);
 		break;
 	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		ret = iomfb_modeset_v14_7_0(dcp, crtc_state);
@@ -4364,7 +4405,7 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		if (cs && cs->active && cs->mode.hdisplay) {
 			dev_dbg(dcp->dev, "re-powering the external pipe of an active CRTC\n");
 			dcp_poweron(pdev);
-			dcp_crtc_atomic_modeset(crtc, commit);
+			dcp_crtc_atomic_modeset(crtc, commit, false);
 		}
 	}
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {

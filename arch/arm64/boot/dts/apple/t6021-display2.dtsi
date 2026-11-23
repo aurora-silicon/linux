@@ -36,6 +36,14 @@
 	};
 };
 
+&dcpext0 {
+	apple,scanout-peers = <&dcpext2>, <&dcpext3>;
+};
+
+&dcpext1 {
+	apple,scanout-peers = <&dcpext2>, <&dcpext3>;
+};
+
 &{/soc} {
 
 	dispext2_dart: iommu@48d304000 {
@@ -93,6 +101,7 @@
 		resets = <&ps_dispext2_cpu0>;
 		clocks = <&clk_dispext2>;
 		apple,dcp-index = <3>;
+		apple,scanout-peers = <&dcpext3>;
 		status = "okay";
 		apple,connector-type = "USB-C";
 		apple,dptx-phy = <1>;

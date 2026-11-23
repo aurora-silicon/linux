@@ -20,6 +20,7 @@
 #include "dcp-hdmi.h"
 #include "dptxep.h"
 #include "dcp-180hz.h"
+#include "dcp-peer-v13_5.h"
 #include "dptx-service.h"
 #include "parser.h"
 #include "trace.h"
@@ -1022,7 +1023,23 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		memcpy(reply, data, min(reply_size, data_size));
 		return 0;
 	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS: {
+		struct apple_dcp *dcp = service->ep->dcp;
 		int ret;
+
+		if (dcp->fw_compat == DCP_FIRMWARE_V_13_5 && dcp->hw.t602x_paired_dp &&
+		    !dptx->unit &&
+		    data_size == sizeof(struct dcp_display_hints_v13_5)) {
+			struct dcp_display_hints_v13_5 *hints = reply;
+
+			ret = dcp_no_peer_hints_v13_5(data, hints, reply_size);
+			if (ret)
+				return ret;
+			dptxport_note_tile_hint(service, data, data_size);
+			dcp_t602x_display_hints(dcp, hints);
+			if (hints->hints[0] & 1)
+				WRITE_ONCE(dcp->t602x_pair_offered, hints->allocation.extra_pipes);
+			return 0;
+		}
 
 		/*
 		 * A tiled sink behind a Thunderbolt tunnel (Studio Display over
@@ -1581,6 +1598,37 @@ static int dptx_native_controller_prepare(struct apple_epic_service *service,
 	return 0;
 }
 
+static void dptx_t602x_controller_init(struct apple_epic_service *service, const char *name,
+				       const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+
+	complete(&dcp->dptx_controller_ready);
+	if ((unsigned long)service->cookie == BIT(0))
+		wake_up_all(&dcp->t602x_pair_wait);
+}
+
+/* Firmware 13.5 also advertises this service on the controller endpoint. */
+static int dptx_t602x_expert_prepare(struct apple_epic_service *service,
+				     const char *name, const char *class, s64 unit)
+{
+	/* Scanout uses the DPTX controller interfaces only. */
+	return -EOPNOTSUPP;
+}
+
+static const struct apple_epic_service_ops dptx_t602x_controller_ops[] = {
+	{
+		.name = "AppleDCPDPTXController",
+		.prepare = dptx_native_controller_prepare,
+		.init = dptx_t602x_controller_init,
+	}, {
+		.name = "dcpexpert-service",
+		.optional = true,
+		.prepare = dptx_t602x_expert_prepare,
+	},
+	{}
+};
+
 static const struct apple_epic_service_ops dptx_native_controller_ops[] = {
 	{
 		.name = "AppleDCPDPTXController",
@@ -1600,12 +1648,16 @@ static const struct apple_epic_service_ops dptx_controller_ops[] = {
 
 int dptx_controller_init(struct apple_dcp *dcp)
 {
+	const struct apple_epic_service_ops *ops = dptx_controller_ops;
 	struct apple_dcp_afkep *ep;
 	int ret;
 
 	init_completion(&dcp->dptx_controller_ready);
-	ep = afk_init(dcp, DPTX_CONTROLLER_ENDPOINT,
-		      dcp_is_ext26(dcp) ? dptx_native_controller_ops : dptx_controller_ops);
+	if (dcp_is_ext26(dcp))
+		ops = dptx_native_controller_ops;
+	else if (dcp->fw_compat == DCP_FIRMWARE_V_13_5 && dcp->hw.t602x_paired_dp)
+		ops = dptx_t602x_controller_ops;
+	ep = afk_init(dcp, DPTX_CONTROLLER_ENDPOINT, ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	/* Controller interfaces require the same OPEN handshake as the port. */

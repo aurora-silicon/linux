@@ -1716,7 +1716,10 @@ static void initial(bool supported_firmware)
 static int match_providers(void)
 {
     struct component_match *match = NULL;
-    return add_dcp_components(&master, &match);
+    bool paired = false;
+    int count = add_dcp_components(&master, &match, &paired);
+    assert(!paired); /* Neither J700 display processor reserves a T602x DMA domain. */
+    return count;
 }
 int main(void)
 {
@@ -1817,6 +1820,9 @@ int main(void)
 '''
 
     header = (root / 'drivers/gpu/drm/apple/dcp-external-bw.h').read_text().replace('#include <linux/types.h>', '')
+    if 'bool *paired' not in function(drm, 'static int add_dcp_components('):
+        suffix = suffix.replace('add_dcp_components(&master, &match, &paired)',
+                                'add_dcp_components(&master, &match)')
     return prefix + header + production + suffix
 
 def vrr(root):
@@ -1886,6 +1892,10 @@ static bool dcp_vrr_live(struct apple_dcp *d)
 { return d->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && d->main_display; }
 static bool iomfb_is_m4(struct apple_dcp *d) { (void)d; return false; }
 static bool dcp_has_panel(struct apple_dcp *d) { return d->panel; }
+/* These firmware profiles do not offer T602x paired scanout. */
+static int __attribute__((unused)) dcp_t602x_check(struct apple_dcp *d,
+    struct drm_crtc_state *c, struct drm_atomic_commit *s)
+{ (void)d; (void)c; (void)s; return 0; }
 /* The firmware 27 paired-timing check (dcp-peer-runtime-v27.inc) runs on firmware 27 only. */
 static unsigned int peer_checks;
 static int dcp_peer_check_v27(struct apple_dcp *d, struct drm_atomic_commit *s,

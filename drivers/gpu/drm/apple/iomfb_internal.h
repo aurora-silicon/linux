@@ -115,6 +115,8 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context);
 /* The user may own drm_display_mode, so we need to search for our copy */
 bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 		 struct dcp_display_mode *out);
+bool lookup_mode_for_pair(struct apple_dcp *dcp, const struct drm_display_mode *mode,
+			  struct dcp_display_mode *out);
 
 /* One line for an external display's link, sink and mode, after a mode set. */
 void dcp_link_report(struct apple_dcp *dcp, const struct drm_display_mode *mode);
