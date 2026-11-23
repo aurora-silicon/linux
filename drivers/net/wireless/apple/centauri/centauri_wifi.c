@@ -1289,7 +1289,8 @@ static void connect_worker(struct work_struct *work)
 			probe_ret = query_station_stats(wifi);
 			dev_info(&wifi->control->pdev->dev,
 				 "connection counters: complete=%d rc=%d valid=%d length=%u\n",
-				 wifi->connect_event, probe_ret, wifi->station_stats_valid, wifi->stats_length);
+				 wifi->connect_event, probe_ret, wifi->station_stats_valid,
+				 wifi->station_stats_len);
 			if (!probe_ret && wifi->station_stats_valid)
 				for (i = 0; i < wifi->station_stats_len; i += 4) {
 					u32 value = get_unaligned_le32(wifi->station_stats + i);
@@ -2303,8 +2304,9 @@ static int station_stats_show(struct seq_file *seq, void *unused)
 
 	mutex_lock(&wifi->lock);
 	ret = query_station_stats(wifi);
-	seq_printf(seq, "rc=%d valid=%d size=%u tag=%#x length=%u\n", ret,
-		   wifi->station_stats_valid, wifi->stats_reply_size, wifi->stats_tag, wifi->stats_length);
+	seq_printf(seq, "rc=%d valid=%d size=%u tag=%#x length=%u counters=%u\n", ret,
+		   wifi->station_stats_valid, wifi->stats_reply_size, wifi->stats_tag,
+		   wifi->stats_length, wifi->station_stats_len);
 	if (!ret && wifi->station_stats_valid)
 		for (i = 0; i < wifi->station_stats_len; i += 4) {
 			u32 value = get_unaligned_le32(wifi->station_stats + i);

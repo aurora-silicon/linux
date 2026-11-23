@@ -28,9 +28,9 @@ config APPLE_CENTAURI_KUNIT_TEST
 	depends on APPLE_CENTAURI && KUNIT=y
 	default KUNIT_ALL_TESTS
 	help
-	  Build tests that pass statistics replies to the J813 Wi-Fi reply
-	  handler and check the recorded counter lengths. They need no N1
-	  hardware.
+	  Build tests that pass statistics replies to the Centauri Wi-Fi
+	  reply handler and check the recorded counter lengths. They need no
+	  N1 hardware.
 
 	  If unsure, say N.
 
