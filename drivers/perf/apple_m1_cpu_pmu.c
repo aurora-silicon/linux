@@ -1040,3 +1040,7 @@ static struct platform_driver m1_pmu_driver = {
 };
 
 module_platform_driver(m1_pmu_driver);
+
+#if IS_ENABLED(CONFIG_APPLE_M1_CPU_PMU_KUNIT_TEST)
+#include "apple_m1_cpu_pmu-test.c"
+#endif
