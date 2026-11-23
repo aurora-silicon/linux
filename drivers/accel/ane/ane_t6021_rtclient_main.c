@@ -73,6 +73,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
+#include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
@@ -1550,23 +1551,55 @@ static int ane_t6021_prog_unload_op(void *ctx, struct ane_t6021_prog *p)
 	return ret;
 }
 
-/* A program's kernel copy of one section: allocated for the same device as
- * the BOs, so the firmware reaches it the same way, never mapped to
- * userspace and not written after PROG_LOAD filled it. Counted against
- * bo_total_max_mb like a BO.
+/* A program's kernel copy of one section: kernel pages mapped for the same
+ * device as the BOs, never mapped to userspace and not written after
+ * PROG_LOAD filled it. The pages are mapped DMA_TO_DEVICE, which the DMA
+ * API maps read-only in the IOMMU: the engine, which runs every client's
+ * jobs in the same DART domain, can read the copy but not change it after
+ * it was checked. Counted against bo_total_max_mb like a BO.
  */
 struct ane_t6021_sec_copy {
 	struct device *dev;
+	struct page **pages;
+	unsigned int npages;
+	struct sg_table sgt;
 	void *cpu;
 	dma_addr_t dma;
 	size_t size;			/* allocated bytes, page aligned */
 };
+
+static void ane_t6021_sec_copy_put_pages(struct ane_t6021_sec_copy *c)
+{
+	unsigned int i;
+
+	for (i = 0; i < c->npages; i++)
+		if (c->pages[i])
+			__free_page(c->pages[i]);
+	kvfree(c->pages);
+}
+
+/* The mapping must be one IOVA range: a LOAD record names iova + size. */
+static bool ane_t6021_sec_copy_contiguous(const struct ane_t6021_sec_copy *c)
+{
+	struct scatterlist *sg;
+	dma_addr_t next = c->dma;
+	unsigned int i;
+
+	for_each_sgtable_dma_sg(&c->sgt, sg, i) {
+		if (sg_dma_address(sg) != next)
+			return false;
+		next += sg_dma_len(sg);
+	}
+	return next - c->dma == c->size;
+}
 
 static struct ane_t6021_sec_copy *
 ane_t6021_sec_copy_alloc(struct ane_rtclient *ane, u64 size)
 {
 	struct ane_t6021_sec_copy *c;
 	size_t alloc;
+	unsigned int i;
+	int ret = -ENOMEM;
 
 	/* No BO holds more, so a larger section is refused anyway. */
 	if (size > ANE_T6021_BO_MAX)
@@ -1578,32 +1611,62 @@ ane_t6021_sec_copy_alloc(struct ane_rtclient *ane, u64 size)
 		return ERR_PTR(-ENOSPC);
 	}
 	c = kzalloc_obj(*c);
-	if (!c) {
-		atomic64_sub(alloc, &ane_t6021_bo_total_bytes);
-		return ERR_PTR(-ENOMEM);
-	}
-	c->cpu = dma_alloc_coherent(ane->dev, alloc, &c->dma, GFP_KERNEL);
-	if (!c->cpu) {
-		atomic64_sub(alloc, &ane_t6021_bo_total_bytes);
-		kfree(c);
-		return ERR_PTR(-ENOMEM);
-	}
-	/* The same IOVA rules as a BO (see ane_t6021_bo_init_locked()). */
-	if (!IS_ALIGNED(c->dma, SZ_16K) ||
-	    (ane->fw && !ane_t6021_fw_alias_iova_ok(ane->fw, c->dma, alloc))) {
-		dma_free_coherent(ane->dev, alloc, c->cpu, c->dma);
-		atomic64_sub(alloc, &ane_t6021_bo_total_bytes);
-		kfree(c);
-		return ERR_PTR(-ERANGE);
-	}
+	if (!c)
+		goto err_account;
 	c->dev = ane->dev;
 	c->size = alloc;
+	c->npages = alloc >> PAGE_SHIFT;
+	c->pages = kvcalloc(c->npages, sizeof(*c->pages), GFP_KERNEL);
+	if (!c->pages)
+		goto err_free;
+	/* Zeroed: the device reads the tail past the section too. */
+	for (i = 0; i < c->npages; i++) {
+		c->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!c->pages[i])
+			goto err_pages;
+	}
+	if (sg_alloc_table_from_pages(&c->sgt, c->pages, c->npages, 0, alloc,
+				      GFP_KERNEL))
+		goto err_pages;
+	if (dma_map_sgtable(c->dev, &c->sgt, DMA_TO_DEVICE, 0))
+		goto err_sgt;
+	c->dma = sg_dma_address(c->sgt.sgl);
+	/* The same IOVA rules as a BO (see ane_t6021_bo_init_locked()). */
+	if (!ane_t6021_sec_copy_contiguous(c) || !IS_ALIGNED(c->dma, SZ_16K) ||
+	    (ane->fw && !ane_t6021_fw_alias_iova_ok(ane->fw, c->dma, alloc))) {
+		ret = -ERANGE;
+		goto err_unmap;
+	}
+	c->cpu = vmap(c->pages, c->npages, VM_MAP, PAGE_KERNEL);
+	if (!c->cpu)
+		goto err_unmap;
 	return c;
+
+err_unmap:
+	dma_unmap_sgtable(c->dev, &c->sgt, DMA_TO_DEVICE, 0);
+err_sgt:
+	sg_free_table(&c->sgt);
+err_pages:
+	ane_t6021_sec_copy_put_pages(c);
+err_free:
+	kfree(c);
+err_account:
+	atomic64_sub(alloc, &ane_t6021_bo_total_bytes);
+	return ERR_PTR(ret);
+}
+
+/* Hand what the CPU wrote to the copy over to the device. */
+static void ane_t6021_sec_copy_sync(struct ane_t6021_sec_copy *c)
+{
+	dma_sync_sgtable_for_device(c->dev, &c->sgt, DMA_TO_DEVICE);
 }
 
 static void ane_t6021_sec_copy_free(struct ane_t6021_sec_copy *c)
 {
-	dma_free_coherent(c->dev, c->size, c->cpu, c->dma);
+	vunmap(c->cpu);
+	dma_unmap_sgtable(c->dev, &c->sgt, DMA_TO_DEVICE, 0);
+	sg_free_table(&c->sgt);
+	ane_t6021_sec_copy_put_pages(c);
 	atomic64_sub(c->size, &ane_t6021_bo_total_bytes);
 	kfree(c);
 }
@@ -1812,8 +1875,8 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	/* Copy every section out of the caller's buffer into kernel memory no
 	 * client can map, then key and check the copies: identical sections
 	 * share one firmware program (see the table), and the bytes keyed and
-	 * checked here are the bytes every LOAD of the program names. The
-	 * buffer is read once, under bo_lock.
+	 * checked here are the bytes every LOAD of the program names. Each
+	 * copy is made with one read of the buffer, under bo_lock.
 	 */
 	/* Every section must name a BO of this file that holds it. */
 	for (i = 0; i < user->section_count; i++) {
@@ -1846,6 +1909,8 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 					    sections[i].offset,
 					    sections[i].size);
 		mutex_unlock(&ane_t6021_bo_lock);
+		if (bo)
+			ane_t6021_sec_copy_sync(c);
 		if (!bo) {
 			ane_t6021_sec_copy_free(c);
 			ret = -EINVAL;

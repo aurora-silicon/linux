@@ -223,9 +223,10 @@ struct ane_t6021_prog {
 
 /*
  * The sections of a program while PROG_LOAD builds it, by slot (id - 1).
- * Each is a kernel copy no client can map: the cache key, the TD check and
- * every LOAD of the program read the copy, never the caller's buffer, so
- * what was keyed and checked is what the firmware reads.
+ * Each is a kernel copy no client can map and the engine maps read-only:
+ * the cache key, the TD check and every LOAD of the program read the copy,
+ * never the caller's buffer, so what was keyed and checked is what the
+ * firmware reads.
  */
 struct ane_t6021_secs {
 	void *mem[ANE_T6021_PROG_SECS];	/* driver allocation, NULL: no section */
