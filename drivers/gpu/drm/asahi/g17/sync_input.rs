@@ -6,9 +6,9 @@
 use kernel::{bindings, dma_fence::{Fence, RawDmaFence}, prelude::*};
 
 #[repr(C)]
-pub(super) struct Leaf {
-    pub(super) fence: *mut bindings::dma_fence,
-    pub(super) status: i32,
+pub(crate) struct Leaf {
+    pub(crate) fence: *mut bindings::dma_fence,
+    pub(crate) status: i32,
 }
 
 unsafe extern "C" {
@@ -43,7 +43,7 @@ impl Drop for Leaf {
 }
 
 /// Allocation, unsupported containers, or a large prefix retain normal waits.
-pub(super) fn collect(input: &Fence) -> Option<KVec<Leaf>> {
+pub(crate) fn collect(input: &Fence) -> Option<KVec<Leaf>> {
     let mut capacity = 4;
     loop {
         let mut leaves = KVec::with_capacity(capacity, GFP_KERNEL).ok()?;

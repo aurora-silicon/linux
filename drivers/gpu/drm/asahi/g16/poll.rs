@@ -1539,11 +1539,34 @@ impl Firmware {
         let p = &job.progress;
         p.next.store(p.next() + f.count as u32, Ordering::Relaxed);
         if result.is_err() {
-            // Its queue's later commands queued behind it fail with it, as unpublished ones
-            // are cancelled: they never report a successful receipt after this hole.
+            // Later commands of this queue, and any cross-queue flights transitively waiting
+            // on it via firmware handoff, fail with it so no dependent command reports success
+            // after an upstream failure.
+            let mut changed = false;
             for later in self.engine.flights.iter_mut() {
-                if Arc::ptr_eq(&later.job.queue, &job.queue) {
+                if !later.doomed
+                    && (Arc::ptr_eq(&later.job.queue, &job.queue)
+                        || later.job.waits_on_queue(&job.queue))
+                {
                     later.doomed = true;
+                    changed = true;
+                }
+            }
+            while changed {
+                changed = false;
+                for i in 0..self.engine.flights.len() {
+                    if self.engine.flights[i].doomed {
+                        continue;
+                    }
+                    let dep_doomed = self.engine.flights.iter().any(|other| {
+                        other.doomed
+                            && (Arc::ptr_eq(&other.job.queue, &self.engine.flights[i].job.queue)
+                                || self.engine.flights[i].job.waits_on_queue(&other.job.queue))
+                    });
+                    if dep_doomed {
+                        self.engine.flights[i].doomed = true;
+                        changed = true;
+                    }
                 }
             }
         }

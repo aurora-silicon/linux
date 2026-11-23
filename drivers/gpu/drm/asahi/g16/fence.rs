@@ -12,6 +12,7 @@
 //! queue teardown). Fences of one context must signal in order, so a [`Timeline`] holds a
 //! completed fence back until every earlier fence of the queue has completed.
 
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use kernel::{
     c_str,
     dma_fence::{Fence, FenceContexts, FenceObject, FenceOps, RawDmaFence, UserFence},
@@ -21,6 +22,7 @@ use kernel::{
     sync::{Arc, LockClassKey, Mutex},
 };
 
+use super::queue::QueueState;
 use crate::file::SyncItem;
 
 /// Inline storage for the common 0-2 input fences, spilling to a heap `KVec` above 2.
@@ -119,9 +121,105 @@ pub(crate) fn wait_dependencies(inputs: &[Fence]) -> Result {
 
 static TIMELINE_KEY: Pin<&LockClassKey> = kernel::static_lock_class!();
 static ERROR_KEY: Pin<&LockClassKey> = kernel::static_lock_class!();
+static JOB_FENCE_OPS: AtomicUsize = AtomicUsize::new(0);
+
+/// Maximum distinct cross-queue firmware waits carried inline/on-heap by one job.
+pub(crate) const MAX_FW_WAITS: usize = 8;
+
+/// Immutable origin and atomic lifecycle flags attached to every G16 job fence so another
+/// logical queue on the same GPU and VM can resolve a binary or timeline semaphore into an
+/// in-firmware ring barrier instead of round-tripping through `drm_sched` and CPU retirement.
+pub(crate) struct FenceOrigin {
+    pub(crate) gpu_id: usize,
+    pub(crate) vm_id: u64,
+    pub(crate) queue: Arc<QueueState>,
+    pub(crate) last_ordinal: [Option<u64>; 2],
+    enqueued: AtomicBool,
+    failed: AtomicBool,
+}
+
+impl FenceOrigin {
+    pub(crate) fn new(
+        gpu_id: usize,
+        vm_id: u64,
+        queue: Arc<QueueState>,
+        last_ordinal: [Option<u64>; 2],
+    ) -> Self {
+        Self {
+            gpu_id,
+            vm_id,
+            queue,
+            last_ordinal,
+            enqueued: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn mark_enqueued(&self) {
+        self.enqueued.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_enqueued(&self) -> bool {
+        self.enqueued.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+}
+
+/// Cross-queue firmware waits resolved at `SUBMIT` (inline for 0-1 entries, bounded to
+/// [`MAX_FW_WAITS`]).
+pub(crate) enum FwWaits {
+    Empty,
+    One([Arc<FenceOrigin>; 1]),
+    Heap(KVec<Arc<FenceOrigin>>),
+}
+
+impl FwWaits {
+    fn push_unique(&mut self, origin: Arc<FenceOrigin>) -> Result {
+        if self.iter().any(|existing| Arc::ptr_eq(existing, &origin)) {
+            return Ok(());
+        }
+        if self.len() >= MAX_FW_WAITS {
+            return Err(E2BIG);
+        }
+        match self {
+            Self::Empty => *self = Self::One([origin]),
+            Self::One(_) => {
+                let mut vec = KVec::with_capacity(4, GFP_KERNEL)?;
+                if let Self::One([first]) = core::mem::replace(self, Self::Empty) {
+                    let _ = vec.push_within_capacity(first);
+                    let _ = vec.push_within_capacity(origin);
+                }
+                *self = Self::Heap(vec);
+            }
+            Self::Heap(vec) => vec.push(origin, GFP_KERNEL)?,
+        }
+        Ok(())
+    }
+}
+
+impl core::ops::Deref for FwWaits {
+    type Target = [Arc<FenceOrigin>];
+
+    fn deref(&self) -> &[Arc<FenceOrigin>] {
+        match self {
+            Self::Empty => &[],
+            Self::One(items) => items,
+            Self::Heap(vec) => vec,
+        }
+    }
+}
 
 /// Fence operations of G16 job fences.
-pub(crate) struct JobFenceOps;
+pub(crate) struct JobFenceOps {
+    origin: Arc<FenceOrigin>,
+}
 
 #[vtable]
 impl FenceOps for JobFenceOps {
@@ -132,6 +230,85 @@ impl FenceOps for JobFenceOps {
     fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
         c_str!("g16")
     }
+}
+
+/// Fence operations of pre-signalled refused-submission fences (distinct vtable from
+/// [`JobFenceOps`] so refused error fences never match [`origin_from_raw`]).
+struct RefusedFenceOps;
+
+#[vtable]
+impl FenceOps for RefusedFenceOps {
+    fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
+        c_str!("aurora")
+    }
+
+    fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
+        c_str!("g16-refused")
+    }
+}
+
+/// Resolves a G16 [`FenceOrigin`] from a raw `dma_fence` pointer if and only if its vtable
+/// pointer matches the registered [`JobFenceOps`] vtable.
+///
+/// # Safety
+///
+/// `raw` must be null or point to a live, initialized `dma_fence` whose reference is held for
+/// the duration of this call.
+unsafe fn origin_from_raw(raw: *mut kernel::bindings::dma_fence) -> Option<Arc<FenceOrigin>> {
+    let expected = JOB_FENCE_OPS.load(Ordering::Acquire);
+    if expected == 0 || raw.is_null() {
+        return None;
+    }
+    // SAFETY: Caller retains a live dma_fence reference. `JobFenceOps` has a distinct timeline
+    // name and nontrivial payload drop (`Arc<FenceOrigin>`). No cast precedes the exact
+    // registered vtable check, and `FenceObject` begins with its `dma_fence`.
+    let object = unsafe {
+        if (*raw).ops as usize != expected {
+            return None;
+        }
+        &*(raw as *const FenceObject<JobFenceOps>)
+    };
+    Some(object.origin.clone())
+}
+
+/// Resolves `inputs` into same-GPU, same-VM in-firmware cross-queue waits outside the device
+/// lock. Returns `None` if any leaf is failed, foreign, cross-VM, not yet enqueued, or exceeds
+/// [`MAX_FW_WAITS`], leaving the caller to retain normal `drm_sched` / `InputFences` waits.
+pub(crate) fn resolve_fw_waits(inputs: &[Fence], gpu_id: usize, vm_id: u64) -> Option<FwWaits> {
+    if inputs.is_empty() {
+        return Some(FwWaits::Empty);
+    }
+    let mut waits = FwWaits::Empty;
+    for input in inputs {
+        let status = dependency_status(input);
+        if status < 0 {
+            return None;
+        }
+        if status > 0 {
+            continue;
+        }
+        let leaves = crate::g17::sync_input::collect(input)?;
+        for leaf in leaves.iter() {
+            if leaf.status < 0 {
+                return None;
+            }
+            if leaf.status > 0 {
+                continue;
+            }
+            // SAFETY: `leaf` retains an owned reference to `leaf.fence` until dropped.
+            let origin = unsafe { origin_from_raw(leaf.fence) }?;
+            if origin.gpu_id != gpu_id
+                || origin.vm_id != vm_id
+                || !origin.is_enqueued()
+                || origin.is_failed()
+                || origin.last_ordinal == [None, None]
+            {
+                return None;
+            }
+            waits.push_unique(origin).ok()?;
+        }
+    }
+    Some(waits)
 }
 
 /// Stack batch size for signalling completed fences outside `Timeline::pending`.
@@ -192,11 +369,23 @@ impl Timeline {
 
     /// Creates the fence of the next accepted job. Fences are created in submission order: the
     /// caller holds the queue (SUBMIT is serialized per queue).
-    pub(crate) fn next(self: &Arc<Self>) -> Result<JobFence> {
+    pub(crate) fn next(self: &Arc<Self>, origin: Arc<FenceOrigin>) -> Result<JobFence> {
         // SUBMIT already holds the logical queue, so allocating the next sequence before
         // taking pending preserves creation order. Fence completion needs pending too:
         // never enter reclaim while holding that mutex.
-        let fence: UserFence<JobFenceOps> = self.jobs.new_fence(0, JobFenceOps)?.into();
+        let fence: UserFence<JobFenceOps> = self.jobs.new_fence(0, JobFenceOps { origin })?.into();
+        // SAFETY: `fence` is a live `UserFence<JobFenceOps>` whose `dma_fence::ops` is static.
+        let ops = unsafe { (*fence.raw()).ops as usize };
+        let previous = JOB_FENCE_OPS.load(Ordering::Acquire);
+        if previous == 0 {
+            match JOB_FENCE_OPS.compare_exchange(0, ops, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {}
+                Err(existing) if existing == ops => {}
+                Err(_) => return Err(EIO),
+            }
+        } else if previous != ops {
+            return Err(EIO);
+        }
         let mut pending = self.pending.lock();
         pending.reserve(1, GFP_NOWAIT)?;
         pending
@@ -276,7 +465,7 @@ impl Timeline {
 /// A fence on `contexts` signalled with `error`. Every fence of an error context signals at
 /// creation, so the context's fences signal in order.
 fn error_fence(contexts: &FenceContexts, error: Error) -> Result<Fence> {
-    let fence = contexts.new_fence(0, JobFenceOps)?;
+    let fence = contexts.new_fence(0, RefusedFenceOps)?;
     fence.set_error(error);
     fence.signal();
     Ok(Fence::from_fence(&fence))

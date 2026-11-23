@@ -101,6 +101,15 @@ impl QueueState {
         Ok(())
     }
 
+    /// Whether any accepted ordinal of `engine` at or before `seq` was cancelled.
+    pub(crate) fn cancelled_through(&self, engine: usize, seq: u64) -> Result {
+        let first = self.cancelled_at[engine].load(Ordering::Acquire);
+        if first != 0 && first <= seq {
+            return Err(ECANCELED);
+        }
+        Ok(())
+    }
+
     /// Whether compute ordinal `seq` already has a full successful firmware receipt, either
     /// at or below the contiguous `completed[COMPUTE]` frontier or recorded in `compute_ooo`.
     pub(crate) fn is_compute_retired(&self, seq: u64) -> bool {
@@ -264,7 +273,22 @@ impl Queue {
             .as_ref()
             .ok_or(EIO)?
             .prepare(&self.vm, &submission.commands, hints)?;
-        let fence = self.timeline.next()?;
+        let gpu_id = Arc::as_ptr(&self.shared) as usize;
+        let last_ordinal = [
+            (submission.counts[command::RENDER] != 0)
+                .then_some(self.accepted[command::RENDER] + submission.counts[command::RENDER]),
+            (submission.counts[command::COMPUTE] != 0)
+                .then_some(self.accepted[command::COMPUTE] + submission.counts[command::COMPUTE]),
+        ];
+        let origin = Arc::new(
+            super::fence::FenceOrigin::new(gpu_id, self.vm.id, self.state.clone(), last_ordinal),
+            GFP_KERNEL,
+        )?;
+        let (inputs, fw_waits) = match super::fence::resolve_fw_waits(&inputs, gpu_id, self.vm.id) {
+            Some(waits) => (InputFences::new(), waits),
+            None => (inputs, super::fence::FwWaits::Empty),
+        };
+        let fence = self.timeline.next(origin.clone())?;
         let job = Job::new(
             id,
             self.state.clone(),
@@ -275,6 +299,8 @@ impl Queue {
             fence,
             guard,
             inputs,
+            origin,
+            fw_waits,
         )?;
         let published = job.fence.fence();
         // Publish output syncs (including fallible cumulative scope allocation) before pushing
