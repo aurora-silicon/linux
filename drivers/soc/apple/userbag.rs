@@ -1455,6 +1455,12 @@ impl crate::SepData {
     /// stays locked until the password unlocks it), then drops the temporary
     /// handle, in macOS's order.
     pub(crate) fn userbag_import(&self, user: crate::sks::DesignateUser, wrapped: &[u8]) -> Result<()> {
+        // A bag still held (locked for a suspend, or a second session) is
+        // only unlocked again: EBUSY, before a second copy is loaded. Variant
+        // 5 refuses to designate a bag that is already designated.
+        if self.user_bags.lock().get(user.special_handle().value()).is_some() {
+            return Err(EBUSY);
+        }
         let handle = self.sks_load_wrapped(wrapped).ok_or(EACCES)?;
         // The 13.5 store keeps a designation after its bag is unloaded and
         // refuses to designate the slot again: a second login in one boot
