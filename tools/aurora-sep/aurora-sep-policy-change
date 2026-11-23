@@ -89,9 +89,10 @@ def driver_message(entry):
     if device is None:
         prefix = f"{DRIVER}: "
     else:
-        name = device[len("+platform:"):] if isinstance(device, str) else ""
-        if (entry.get("_KERNEL_SUBSYSTEM") != "platform" or not device.startswith("+platform:")
-                or not name.endswith(".sep")):
+        if not isinstance(device, str) or not device.startswith("+platform:"):
+            return None
+        name = device[len("+platform:"):]
+        if entry.get("_KERNEL_SUBSYSTEM") != "platform" or not name.endswith(".sep"):
             return None
         prefix = f"{DRIVER} {name}: "
     return msg[len(prefix):] if msg.startswith(prefix) else None

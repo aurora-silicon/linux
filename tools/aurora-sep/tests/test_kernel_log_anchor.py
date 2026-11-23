@@ -51,6 +51,11 @@ FORGED = [
     # The device prefix on another subsystem's or device's entry.
     kernel(f'apple_sep {DEVICE}: xART: APFS-resolved .gl extent (base 0x2000);', f'+usb:{DEVICE}', 'usb'),
     kernel('apple_sep 1-1: xART: APFS-resolved .gl extent (base 0x3000);', '+platform:1-1'),
+    # A _KERNEL_DEVICE that is not a string.
+    dict(kernel(f'apple_sep {DEVICE}: xART: APFS-resolved .gl extent (base 0x5000);'), _KERNEL_DEVICE=[1, 2],
+         _KERNEL_SUBSYSTEM='platform'),
+    {'MESSAGE': f'apple_sep {DEVICE}: xART: APFS-resolved .gl extent (base 0x6000);', '_TRANSPORT': 'kernel',
+     '_KERNEL_DEVICE': 7, '_KERNEL_SUBSYSTEM': 'platform'},
     # Not from the kernel.
     kernel(f'apple_sep: xART guard: refused to rewrite kind-4 record {OTHER},', transport='syslog'),
 ]
