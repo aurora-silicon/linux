@@ -117,6 +117,58 @@ impl Drop for AscControl {
     }
 }
 
+/// The GPU MMU fault status, read when a command times out: a pending fault names the faulting
+/// address and unit, an empty status says the work stalled without a page fault.
+struct FaultStatus {
+    page: *mut u8,
+    info: usize,
+    addr: Option<usize>,
+    g14x: bool,
+}
+// SAFETY: a device register page that is only read, one 32-bit MMIO load at a time.
+unsafe impl Send for FaultStatus {}
+// SAFETY: as above.
+unsafe impl Sync for FaultStatus {}
+
+impl FaultStatus {
+    fn new(sgx: u64, cfg: &'static hw::HwConfig) -> Result<Self> {
+        let (info, addr, g14x) = crate::regs::Resources::fault_registers(cfg);
+        let base = info & !0xfff;
+        if addr.is_some_and(|a| a & !0xfff != base) {
+            return Err(EINVAL);
+        }
+        // SAFETY: the page lies inside this platform device's SGX register window.
+        let page = unsafe { kernel::bindings::ioremap(sgx + base as u64, 0x1000) };
+        if page.is_null() { return Err(ENOMEM); }
+        Ok(Self { page: page.cast(), info: info - base, addr: addr.map(|a| a - base), g14x })
+    }
+    fn read64(&self, at: usize) -> u64 {
+        // SAFETY: `at` and `at + 4` are register offsets inside the mapped page.
+        let (lo, hi) = unsafe {
+            (kernel::bindings::readl(self.page.add(at).cast()),
+             kernel::bindings::readl(self.page.add(at + 4).cast()))
+        };
+        u64::from(lo) | (u64::from(hi) << 32)
+    }
+    fn log(&self, dev: &device::Device) {
+        let info = self.read64(self.info);
+        if info & 1 == 0 {
+            dev_err!(dev, "GPU: no MMU fault pending at the timeout (FAULT_INFO={:#x})\n", info);
+            return;
+        }
+        let addr = self.addr.map_or(info >> 30, |at| self.read64(at));
+        dev_err!(dev, "GPU: MMU fault pending at the timeout: FAULT_INFO={:#x} {:?}\n", info,
+                 crate::regs::decode_fault(info, addr, self.g14x));
+    }
+}
+
+impl Drop for FaultStatus {
+    fn drop(&mut self) {
+        // SAFETY: mapped in `new`, unmapped once.
+        unsafe { kernel::bindings::iounmap(self.page.cast()) }
+    }
+}
+
 /// Where the firmware's messages go: the runtime once it exists, nowhere before or after.
 #[pin_data]
 pub(crate) struct Notify {
@@ -271,6 +323,7 @@ pub(crate) fn start<'a>(
         GFP_KERNEL)?;
     let resources = crate::regs::Resources::new(pdev)?;
     let sgx = pdev.resource_by_name(c"sgx").ok_or(EINVAL)?;
+    let fault = FaultStatus::new(sgx.start(), cfg)?;
     let copy_bytes: u32 = dev.fwnode().ok_or(ENODEV)?
         .property_read(c"apple,coredump-copy-buffer").required_by(dev)?;
     let board = gpu::BoardV27_2 {
@@ -333,7 +386,7 @@ pub(crate) fn start<'a>(
     }
     // The firmware keeps using the window until it is stopped; it stays for the life of the boot.
     core::mem::forget(window);
-    let backend = Backend::start(&drm, dev, notify, peer, root, graph, pool, asc, cfg)?;
+    let backend = Backend::start(&drm, dev, notify, peer, root, graph, pool, asc, fault, cfg)?;
     Ok(Started { backend, drm, binding, resources })
 }
 
@@ -365,6 +418,7 @@ struct State {
     root: crate::fw::types::GpuObject<RootV27_2>,
     pool: CommandPool,
     asc: AscControl,
+    fault: FaultStatus,
     queue: QueueInfo,
     last: event::EventValue,
     sequence: u64,
@@ -774,6 +828,7 @@ impl Runtime {
         } else if flight.started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
             dev_err!(self.dev, "GPU: render timed out: TA retired={} fragment retired={}\n", ta_done, fs_done);
             state.root.log_timeout(&self.dev);
+            state.fault.log(&self.dev);
             return Err(ETIMEDOUT);
         }
         Ok(())
@@ -887,6 +942,7 @@ impl Runtime {
                 dev_err!(self.dev, "GPU: compute command timed out: stamp={:#x} expected={:#x} submitted={} completed={}\n",
                          state.queue_stamp(), front.stamp.raw(), state.submitted, state.retired);
                 state.root.log_timeout(&self.dev);
+                state.fault.log(&self.dev);
                 self.fail_all(state, ETIMEDOUT);
                 return;
             }
@@ -1021,6 +1077,7 @@ impl Backend {
         graph: Arc<GpuManagerG14V13_5>,
         pool: CommandPool,
         asc: AscControl,
+        fault: FaultStatus,
         cfg: &'static hw::HwConfig,
     ) -> Result<Arc<Self>> {
         // The runtime is created empty first, so no allocation failure can drop firmware-visible
@@ -1065,7 +1122,7 @@ impl Backend {
             }
         };
         *runtime.state.lock() = Some(State {
-            peer, root, pool, asc, queue, last,
+            peer, root, pool, asc, fault, queue, last,
             sequence: u64::from(head),
             next_slot: 0,
             waiting_unlink: None,

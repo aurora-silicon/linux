@@ -488,6 +488,16 @@ impl Resources<'_> {
         })
     }
 
+    /// The MMU fault status registers of this GPU core: the status word, the address register
+    /// (`None` where the address is part of the status word) and whether it uses the G14X layout.
+    pub(crate) fn fault_registers(cfg: &'static hw::HwConfig) -> (usize, Option<usize>, bool) {
+        if cfg.gpu_core as u32 >= hw::GpuCore::G14S as u32 {
+            (FAULT_INFO_G14X, Some(FAULT_ADDR_G14X), true)
+        } else {
+            (FAULT_INFO, None, false)
+        }
+    }
+
     /// Get the fault information from the MMU status register, if one occurred.
     pub(crate) fn get_fault_info(&self, cfg: &'static hw::HwConfig) -> Option<FaultInfo> {
         let g14x = cfg.gpu_core as u32 >= hw::GpuCore::G14S as u32;
