@@ -1089,6 +1089,24 @@
 #include "hwmon-common.dtsi"
 #include "hwmon-fan-dual.dtsi"
 
+&smc_hwmon {
+	/*
+	 * This SMC spells the fan mode keys F0md/F1md, as the T6050 one does
+	 * (it has no F0Md/F1Md and no Ftst unlock key). It accepts a manual
+	 * speed for both fans from userspace and returns them to firmware
+	 * control when the request is dropped.
+	 */
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+		apple,fan-manual-control;
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+		apple,fan-manual-control;
+	};
+};
+
 &pinctrl {
 	status = "okay";
 
