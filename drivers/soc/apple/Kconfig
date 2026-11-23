@@ -445,8 +445,9 @@ config APPLE_AURORA_BOOT_SECURITY_KUNIT_TEST
 	  /sys/firmware/aurora/boot_security/ shows for absent, empty,
 	  unterminated, short, long and oversized properties. The init
 	  cases add and remove a test /chosen/aurora,boot-security and are
-	  skipped when APPLE_AURORA_BOOT_SECURITY_LOCKDOWN is set, so the
-	  test kernel is never locked down. No hardware is touched.
+	  skipped when APPLE_AURORA_BOOT_SECURITY_LOCKDOWN is set. Both
+	  suites skip while the boot-security state is in use. The IMA
+	  formatting case skips when IMA is enabled. No hardware is touched.
 
 	  If unsure, say N.
 

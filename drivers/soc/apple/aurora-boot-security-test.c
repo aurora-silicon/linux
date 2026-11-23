@@ -3,7 +3,7 @@
  * KUnit tests for the Aurora boot security record reader.
  *
  * Each case builds a boot record in the live device tree with an
- * of_changeset (a test node under the root, or the real
+ * of_changeset (a test node under /chosen, or the real
  * /chosen/aurora,boot-security for the init cases) and runs the driver's
  * own decision and sysfs show functions on it: which Stage 1 measurement
  * counts as enforcing, how the chain state is demoted, and what every
@@ -25,6 +25,9 @@ struct bs_ctx {
 	struct of_changeset cs;
 	struct device_node *np;
 	bool applied;
+	const char *old_chain_state;
+	const char *old_lockdown_reason;
+	bool old_stage1_enforced;
 };
 
 struct bs_meas_spec {
@@ -47,17 +50,28 @@ static void bs_raw(struct kunit *test, struct device_node *np,
 {
 	struct bs_ctx *ctx = test->priv;
 	struct property *p = kzalloc(sizeof(*p), GFP_KERNEL);
+	int ret;
 
 	KUNIT_ASSERT_NOT_NULL(test, p);
 	p->name = kstrdup(name, GFP_KERNEL);
 	/* Like an FDT property: a valid pointer even when empty. */
 	p->value = kzalloc(len + 1, GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, p->name);
-	KUNIT_ASSERT_NOT_NULL(test, p->value);
+	if (!p->name || !p->value) {
+		kfree(p->value);
+		kfree(p->name);
+		kfree(p);
+		KUNIT_FAIL_AND_ABORT(test, "could not allocate property %s", name);
+	}
 	memcpy(p->value, val, len);
 	p->length = len;
 	/* Freed with the node when the changeset is destroyed. */
-	KUNIT_ASSERT_EQ(test, of_changeset_add_property(&ctx->cs, np, p), 0);
+	ret = of_changeset_add_property(&ctx->cs, np, p);
+	if (ret) {
+		kfree(p->value);
+		kfree(p->name);
+		kfree(p);
+		KUNIT_FAIL_AND_ABORT(test, "could not add property %s: %d", name, ret);
+	}
 }
 
 static void bs_str(struct kunit *test, struct device_node *np,
@@ -70,24 +84,37 @@ static void bs_str(struct kunit *test, struct device_node *np,
 	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_string(&ctx->cs, np, name, s), 0);
 }
 
+static struct device_node *bs_create_node(struct kunit *test,
+					  struct device_node *parent,
+					  const char *name)
+{
+	struct bs_ctx *ctx = test->priv;
+	struct device_node *np;
+
+	np = of_changeset_create_node(&ctx->cs, parent, name);
+	KUNIT_ASSERT_NOT_NULL(test, np);
+	/* The changeset holds a reference until bs_exit(). */
+	of_node_put(np);
+	return np;
+}
+
 static struct device_node *bs_record(struct kunit *test,
 				     struct device_node *parent,
 				     const char *name, const char *compatible)
 {
 	struct bs_ctx *ctx = test->priv;
 
-	ctx->np = of_changeset_create_node(&ctx->cs, parent, name);
-	KUNIT_ASSERT_NOT_NULL(test, ctx->np);
+	ctx->np = bs_create_node(test, parent, name);
 	bs_str(test, ctx->np, "compatible", compatible);
 	return ctx->np;
 }
 
-/* A test record under the root, not where the driver looks at boot. */
+/* Avoid adding platform devices while exercising the record reader. */
 static struct device_node *bs_test_record(struct kunit *test)
 {
-	if (!of_root)
-		kunit_skip(test, "no live device tree");
-	return bs_record(test, of_root, "kunit-aurora-boot-security",
+	if (!of_chosen)
+		kunit_skip(test, "no /chosen");
+	return bs_record(test, of_chosen, "kunit-aurora-boot-security",
 			 "aurora,boot-security-v1");
 }
 
@@ -105,8 +132,7 @@ static void bs_meas(struct kunit *test, const struct bs_meas_spec *m, int n)
 		struct device_node *c;
 
 		snprintf(name, sizeof(name), "measurement@%d", i);
-		c = of_changeset_create_node(&ctx->cs, ctx->np, name);
-		KUNIT_ASSERT_NOT_NULL(test, c);
+		c = bs_create_node(test, ctx->np, name);
 		bs_str(test, c, "stage", m[i].stage);
 		bs_str(test, c, "policy", m[i].policy);
 		bs_str(test, c, "component", m[i].component);
@@ -156,12 +182,18 @@ static void bs_expect_guard(struct kunit *test, const char *buf, size_t from,
 
 static int bs_init(struct kunit *test)
 {
-	struct bs_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct bs_ctx *ctx;
 
+	if (rec || aurora_kobj || bs_kobj)
+		kunit_skip(test, "boot-security state is in use");
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
 		return -ENOMEM;
 	of_changeset_init(&ctx->cs);
 	test->priv = ctx;
+	ctx->old_chain_state = chain_state;
+	ctx->old_lockdown_reason = lockdown_reason;
+	ctx->old_stage1_enforced = stage1_enforced;
 	bs_reset_globals();
 	return 0;
 }
@@ -170,7 +202,13 @@ static void bs_exit(struct kunit *test)
 {
 	struct bs_ctx *ctx = test->priv;
 
-	bs_reset_globals();
+	if (!ctx)
+		return;
+	test->priv = NULL;
+	rec = NULL;
+	chain_state = ctx->old_chain_state;
+	lockdown_reason = ctx->old_lockdown_reason;
+	stage1_enforced = ctx->old_stage1_enforced;
 	if (ctx->applied)
 		of_changeset_revert(&ctx->cs);
 	of_changeset_destroy(&ctx->cs);
@@ -276,17 +314,17 @@ static void bs_stage1_unterminated(struct kunit *test)
 {
 	static const char * const names[] = { "stage", "policy", "verdict" };
 	static const char * const vals[] = { "stage1", "enforce", "verified" };
-	struct bs_ctx *ctx = test->priv;
+	struct bs_ctx *ctx;
 	int bad, i;
 
 	for (bad = -1; bad < (int)ARRAY_SIZE(names); bad++) {
 		struct device_node *c;
 
-		KUNIT_ASSERT_EQ(test, bs_init(test), 0);
+		if (bad >= 0)
+			KUNIT_ASSERT_EQ(test, bs_init(test), 0);
 		ctx = test->priv;
 		bs_test_record(test);
-		c = of_changeset_create_node(&ctx->cs, ctx->np, "measurement@0");
-		KUNIT_ASSERT_NOT_NULL(test, c);
+		c = bs_create_node(test, ctx->np, "measurement@0");
 		for (i = 0; i < ARRAY_SIZE(names); i++)
 			bs_raw(test, c, names[i], vals[i],
 			       strlen(vals[i]) + (i != bad));
@@ -295,10 +333,6 @@ static void bs_stage1_unterminated(struct kunit *test)
 				    "unterminated %s", bad < 0 ? "none" : names[bad]);
 		bs_exit(test);
 	}
-	/* bs_exit() runs again after the case: leave it nothing to undo. */
-	ctx = test->priv;
-	of_changeset_init(&ctx->cs);
-	ctx->applied = false;
 }
 
 /* Only the first string of a string list is read. */
@@ -309,8 +343,7 @@ static void bs_stage1_string_list(struct kunit *test)
 	struct device_node *c;
 
 	bs_test_record(test);
-	c = of_changeset_create_node(&ctx->cs, ctx->np, "measurement@0");
-	KUNIT_ASSERT_NOT_NULL(test, c);
+	c = bs_create_node(test, ctx->np, "measurement@0");
 	bs_str(test, c, "stage", "stage1");
 	bs_raw(test, c, "policy", lists, sizeof(lists));
 	bs_str(test, c, "verdict", "verified");
@@ -511,6 +544,8 @@ static void bs_policy_show_bounded(struct kunit *test)
 	ssize_t ret;
 	int i, n = PAGE_SIZE / 64 + 8;
 
+	if (IS_ENABLED(CONFIG_IMA))
+		kunit_skip(test, "IMA is enabled");
 	m = kunit_kcalloc(test, n, sizeof(*m), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, m);
 	for (i = 0; i < n; i++) {
@@ -786,6 +821,8 @@ static void bs_measure_record_full_page(struct kunit *test)
 	struct bs_meas_spec *m;
 	int i, n = PAGE_SIZE / 64 + 8;
 
+	if (IS_ENABLED(CONFIG_IMA))
+		kunit_skip(test, "IMA is enabled");
 	m = kunit_kcalloc(test, n, sizeof(*m), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, m);
 	for (i = 0; i < n; i++)
@@ -840,10 +877,6 @@ static struct kunit_suite bs_suite = {
 static int bs_init_init(struct kunit *test)
 {
 	struct device_node *np;
-	int ret = bs_init(test);
-
-	if (ret)
-		return ret;
 	/* Never lock down the test kernel. */
 	if (IS_ENABLED(CONFIG_APPLE_AURORA_BOOT_SECURITY_LOCKDOWN))
 		kunit_skip(test, "would lock down the kernel");
@@ -851,14 +884,16 @@ static int bs_init_init(struct kunit *test)
 		kunit_skip(test, "no /chosen");
 	np = of_find_node_by_path("/chosen/aurora,boot-security");
 	of_node_put(np);
-	if (np || aurora_kobj)
+	if (np)
 		kunit_skip(test, "this kernel booted with a record");
-	return 0;
+	return bs_init(test);
 }
 
 /* What aurora_boot_security_exit() undoes, which is gone when built in. */
 static void bs_init_exit(struct kunit *test)
 {
+	if (!test->priv)
+		return;
 	if (bs_kobj) {
 		sysfs_remove_groups(bs_kobj, bs_groups);
 		kobject_put(bs_kobj);
@@ -884,9 +919,20 @@ static void bs_init_apply(struct kunit *test)
 	ctx->applied = true;
 }
 
+static int __init bs_run_driver_init(void)
+{
+	int ret = aurora_boot_security_init();
+
+	if (ret) {
+		aurora_kobj = NULL;
+		bs_kobj = NULL;
+	}
+	return ret;
+}
+
 static void __init bs_init_no_record(struct kunit *test)
 {
-	KUNIT_EXPECT_EQ(test, aurora_boot_security_init(), -ENODEV);
+	KUNIT_EXPECT_EQ(test, bs_run_driver_init(), -ENODEV);
 	KUNIT_EXPECT_NULL(test, rec);
 	KUNIT_EXPECT_NULL(test, aurora_kobj);
 	KUNIT_EXPECT_STREQ(test, chain_state, "none");
@@ -911,7 +957,7 @@ static void __init bs_init_wrong_compatible(struct kunit *test)
 		bs_str(test, np, "state", "verified");
 		bs_meas(test, m, ARRAY_SIZE(m));
 		bs_init_apply(test);
-		KUNIT_EXPECT_EQ_MSG(test, aurora_boot_security_init(), -ENODEV,
+		KUNIT_EXPECT_EQ_MSG(test, bs_run_driver_init(), -ENODEV,
 				    "compatible %s", compats[i] ?: "absent");
 		KUNIT_EXPECT_NULL(test, rec);
 		KUNIT_EXPECT_NULL(test, aurora_kobj);
@@ -960,7 +1006,7 @@ static void __init bs_init_verified(struct kunit *test)
 	bs_meas(test, m, ARRAY_SIZE(m));
 	bs_init_apply(test);
 
-	KUNIT_ASSERT_EQ(test, aurora_boot_security_init(), 0);
+	KUNIT_ASSERT_EQ(test, bs_run_driver_init(), 0);
 	KUNIT_EXPECT_PTR_EQ(test, rec, ctx->np);
 	KUNIT_EXPECT_TRUE(test, stage1_enforced);
 	KUNIT_EXPECT_STREQ(test, chain_state, "verified");
@@ -993,7 +1039,7 @@ static void __init bs_init_claims_verified(struct kunit *test)
 	bs_meas(test, m, ARRAY_SIZE(m));
 	bs_init_apply(test);
 
-	KUNIT_ASSERT_EQ(test, aurora_boot_security_init(), 0);
+	KUNIT_ASSERT_EQ(test, bs_run_driver_init(), 0);
 	KUNIT_EXPECT_FALSE(test, stage1_enforced);
 	KUNIT_EXPECT_STREQ(test, chain_state, "partial");
 	bs_init_check_files(test);
@@ -1015,7 +1061,7 @@ static void __init bs_init_compatible_list(struct kunit *test)
 	bs_raw(test, np, "compatible", compat, sizeof(compat));
 	bs_init_apply(test);
 
-	KUNIT_ASSERT_EQ(test, aurora_boot_security_init(), 0);
+	KUNIT_ASSERT_EQ(test, bs_run_driver_init(), 0);
 	KUNIT_EXPECT_NOT_NULL(test, rec);
 	KUNIT_EXPECT_STREQ(test, chain_state, "unverified");
 	bs_init_check_files(test);
