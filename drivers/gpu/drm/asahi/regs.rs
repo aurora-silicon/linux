@@ -657,6 +657,26 @@ impl G17Resources {
         Ok(true)
     }
 
+    /// Writes an M5 host command-port transaction to the SGX register block.
+    /// Only the first and last writes carry the write barrier of an ordered
+    /// MMIO write; interior writes to the same non-posted register block stay
+    /// in program order without stalling on intermediate GPU round trips.
+    fn write_m5_submission(
+        sgx: &IoMem<'_, SGX_SIZE>,
+        submission: &crate::g17::fw::m5::queue::HardwareSubmission,
+    ) -> Result {
+        let sgx = sgx.as_view();
+        let writes = submission.writes();
+        for (index, &(offset, value)) in writes.iter().enumerate() {
+            if index != 0 && index + 1 != writes.len() {
+                sgx.relaxed().try_write64(value, offset)?;
+            } else {
+                sgx.try_write64(value, offset)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Publishes through the M5 host command port, including the kick that
     /// makes an idle queue runnable. Core activity is not a prerequisite.
     pub(crate) fn submit_m5_work(
@@ -667,11 +687,7 @@ impl G17Resources {
             return Ok(());
         }
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        let sgx = (&*sgx).as_view();
-        for &(offset, value) in submission.writes() {
-            sgx.try_write64(value, offset)?;
-        }
-        Ok(())
+        Self::write_m5_submission(&*sgx, submission)
     }
 
     /// [`Self::submit_m5_work`] with core gating held off across the transaction, reading the
@@ -686,17 +702,14 @@ impl G17Resources {
             return Ok(());
         }
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        let sgx = (&*sgx).as_view();
-        let gating = sgx.try_read32(G17_GATING_CONTROL)?;
-        sgx.try_write32(gating | G17_GATING_HOLD, G17_GATING_CONTROL)?;
-        sgx.try_read32(G17_GATING_CONTROL)?;
-        let result = submission
-            .writes()
-            .iter()
-            .try_for_each(|&(offset, value)| sgx.try_write64(value, offset));
-        let gating = sgx.try_read32(G17_GATING_CONTROL)?;
-        sgx.try_write32(gating & !G17_GATING_HOLD, G17_GATING_CONTROL)?;
-        sgx.try_read32(G17_GATING_CONTROL)?;
+        let view = (&*sgx).as_view();
+        let gating = view.try_read32(G17_GATING_CONTROL)?;
+        view.try_write32(gating | G17_GATING_HOLD, G17_GATING_CONTROL)?;
+        view.try_read32(G17_GATING_CONTROL)?;
+        let result = Self::write_m5_submission(&*sgx, submission);
+        let gating = view.try_read32(G17_GATING_CONTROL)?;
+        view.try_write32(gating & !G17_GATING_HOLD, G17_GATING_CONTROL)?;
+        view.try_read32(G17_GATING_CONTROL)?;
         result
     }
 
