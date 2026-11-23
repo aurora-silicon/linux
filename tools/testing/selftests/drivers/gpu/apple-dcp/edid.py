@@ -100,6 +100,7 @@ struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;void *wq;struct wor
 struct apple_connector { void *dcp;bool connected,edid_invalidation_pending;struct { int registration_state; } base;unsigned int hotplug_wq; };
 struct apple_dcp {
     void *dev;int fw_compat;struct apple_dcp_afkep *dcpavservep;struct apple_connector *connector;
+    void *desktop;
     bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;u64 typec_generation;unsigned int nr_modes;
     struct { int iomfb_method_profile,firmware_compat; bool fw_14_7_endpoints,afk_announced_names; unsigned int num_dptx_ports; } hw; bool ext_dead,external_native;
     struct { bool lock,enabled;u64 epoch;int enable_completion;struct apple_epic_service *service,*opened;
@@ -111,6 +112,9 @@ struct apple_dcp {
 };
 '''+internal_inline(root,'dcp_fw_is_14_7')+internal_inline(root,'dcp_is_v14_7_external')+internal_inline(root,'dcp_is_v27_external')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
 static unsigned int dma_frees,opens;
+
+static void dcp_hdr_service_bind(struct apple_epic_service *s) { (void)s; }
+static void dcp_hdr_service_unbind(struct apple_epic_service *s) { (void)s; }
 
 static int open_error,open_action;
 void dpavservep_detach(struct apple_dcp *dcp);
@@ -667,6 +671,8 @@ static struct apple_epic_service *afk_service_get(struct apple_epic_service *s)
 { if(!s || !s->enabled || s->torndown) return NULL; s->users++; return s; }
 static void afk_service_put(struct apple_epic_service *s)
 { assert(s->users); s->users--; }
+static void dcp_hdr_service_bind(struct apple_epic_service *s) { (void)s; }
+static void dcp_hdr_service_unbind(struct apple_epic_service *s) { (void)s; }
 static void afk_service_retire(struct apple_epic_service *s) { s->enabled=false;s->torndown=true; }
 static void drm_edid_free(const struct drm_edid *e)
 { if(e) { assert(allocations); allocations--; free((void *)e); } }
