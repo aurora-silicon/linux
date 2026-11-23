@@ -116,6 +116,14 @@ static unsigned int apple_wdt_get_timeleft(struct watchdog_device *wdd)
 	cur_time = readl_relaxed(wdt->regs + APPLE_WDT_WD1_CUR_TIME);
 	reset_time = readl_relaxed(wdt->regs + APPLE_WDT_WD1_BITE_TIME);
 
+	/*
+	 * The counter runs on past the bite time while the reset is not
+	 * armed; the unsigned difference would wrap to up to the whole
+	 * counter range.
+	 */
+	if (cur_time >= reset_time)
+		return 0;
+
 	return (reset_time - cur_time) / wdt->clk_rate;
 }
 
