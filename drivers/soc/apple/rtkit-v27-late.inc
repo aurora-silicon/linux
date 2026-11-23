@@ -193,21 +193,20 @@ int apple_rtkit_v27_idle_atomic(struct apple_rtkit_v27_scope *s)
 				} else if (msg.msg1 == APPLE_RTKIT_EP_MGMT && iop_sent && !done &&
 					   type == APPLE_RTKIT_MGMT_IDLE_NOTIFY && !arg) {
 					done = true;
-				} else if (apple_rtkit_oslog_owed_msg(rtk, msg.msg1, msg.msg0)) {
-					echo = msg;
-					echo_pending = true;
 				} else if (msg.msg1 == APPLE_RTKIT_EP_MGMT ||
-					   msg.msg1 == APPLE_RTKIT_EP_CRASHLOG) {
-					/* Off the power-state handshake, or a crash: no stop. */
+					   msg.msg1 == APPLE_RTKIT_EP_CRASHLOG ||
+					   msg.msg1 >= APPLE_RTKIT_APP_ENDPOINT_START) {
+					/* A crash, unexpected handshake, or live application RPC. */
 					kfifo_put(&s->deferred, msg);
 					ret = -EPROTO;
 					goto poison;
+				} else if (apple_rtkit_oslog_owed_msg(rtk, msg.msg1, msg.msg0) ||
+					   apple_rtkit_notification_msg(msg.msg1, msg.msg0)) {
+					/* Echo now. The ring entry can be reused after the echo. */
+					echo = msg;
+					echo_pending = true;
 				} else {
-					/*
-					 * Ordinary traffic (a log line, a report, an endpoint's
-					 * message): kept for the disarm's replay, and the wait
-					 * for the power-state answers goes on.
-					 */
+					/* Other system messages are replayed on disarm. */
 					kfifo_put(&s->deferred, msg);
 				}
 			}

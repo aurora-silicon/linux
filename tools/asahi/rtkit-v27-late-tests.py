@@ -4,13 +4,13 @@
 
 The bodies of apple_rtkit_v27_check() and apple_rtkit_v27_idle_atomic() are compiled from
 drivers/soc/apple/rtkit-v27-late.inc, the RTKit constants and apple_rtkit_oslog_owed_msg()
-from rtkit.c. The fake firmware answers the AP and IOP power-state requests and can put
-ordinary traffic (a syslog line, an endpoint message) into the receive queue at any point.
+and notification classifier from rtkit.c. The fake firmware answers the AP and IOP power-state requests and can put
+system notifications or application traffic into the receive queue at any point.
 
 Cases: before the commit a pending message refuses (kept for the disarm); after the commit
 the check leaves it in the mailbox and the stop completes; traffic during the stop's wait is
-deferred into the scope FIFO in order and the stop completes; an unexpected management or a
-crashlog message still fails the stop; no answer still times out; a full FIFO still fails.
+either acknowledged inline or deferred in order; unexpected management, crashlog and
+application messages fail the stop; no answer still times out; a full FIFO still fails.
 
 Mutations: --consume-committed (the committed check consumes and refuses as before),
 --fail-foreign (the stop fails on any foreign message as before).
@@ -45,16 +45,19 @@ def scope_struct():
     return inc[a:inc.index('};', a) + 2]
 
 
-consts = []
+consts = [line for line in (root / "drivers/soc/apple/rtkit-internal.h").read_text().splitlines()
+          if line.startswith("#define APPLE_RTKIT_APP_ENDPOINT_START ")]
 for name in ['APPLE_RTKIT_PWR_STATE_IDLE', 'APPLE_RTKIT_PWR_STATE_ON', 'APPLE_RTKIT_EP_MGMT',
              'APPLE_RTKIT_EP_CRASHLOG', 'APPLE_RTKIT_EP_SYSLOG', 'APPLE_RTKIT_EP_OSLOG',
+             'APPLE_RTKIT_EP_IOREPORT',
              'APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE', 'APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE_ACK',
              'APPLE_RTKIT_MGMT_SET_AP_PWR_STATE', 'APPLE_RTKIT_MGMT_SET_AP_PWR_STATE_ACK',
              'APPLE_RTKIT_MGMT_IDLE_NOTIFY']:
     m = re.search(r'\b' + name + r' = (0x[0-9a-fA-F]+|[0-9]+),', rtkit)
     consts.append(f'#define {name} {m.group(1)}')
 for name in ['APPLE_RTKIT_MGMT_TYPE', 'APPLE_RTKIT_MGMT_PWR_STATE', 'APPLE_RTKIT_SYSLOG_TYPE',
-             'APPLE_RTKIT_SYSLOG_LOG', 'APPLE_RTKIT_OSLOG_TYPE', 'APPLE_RTKIT_OSLOG_LOG']:
+             'APPLE_RTKIT_SYSLOG_LOG', 'APPLE_RTKIT_OSLOG_TYPE', 'APPLE_RTKIT_OSLOG_LOG',
+             'APPLE_RTKIT_IOREPORT_UNKNOWN1', 'APPLE_RTKIT_IOREPORT_UNKNOWN2']:
     m = re.search(r'#define ' + name + r' (.+)', rtkit)
     consts.append(f'#define {name} {m.group(1)}')
 
@@ -65,10 +68,11 @@ if args.consume_committed:
     assert check.count(old) == 1
     check = check.replace(old, '')
 if args.fail_foreign:
-    old = ('\t\t\t\t\t */\n\t\t\t\t\tkfifo_put(&s->deferred, msg);\n\t\t\t\t}')
+    old = ('\t\t\t\t\t/* Other system messages are replayed on disarm. */\n'
+           '\t\t\t\t\tkfifo_put(&s->deferred, msg);\n')
     assert idle.count(old) == 1
-    idle = idle.replace(old, '\t\t\t\t\t */\n\t\t\t\t\tkfifo_put(&s->deferred, msg);\n'
-                        '\t\t\t\t\tret = -EPROTO;\n\t\t\t\t\tgoto poison;\n\t\t\t\t}')
+    idle = idle.replace(old, old + '\t\t\t\t\tret = -EPROTO;\n'
+                                   '\t\t\t\t\tgoto poison;\n')
 
 pre = r'''
 #include <assert.h>
@@ -152,7 +156,8 @@ static int apple_mbox_send_nowait(struct apple_mbox *b, struct apple_mbox_msg m)
 	return 0;
 }
 '''
-owed = function(rtkit, 'static bool apple_rtkit_oslog_owed_msg(')
+owed = function(rtkit, 'static bool apple_rtkit_oslog_owed_msg(') + '\n' + \
+    function(rtkit, 'static bool apple_rtkit_notification_msg(')
 
 main = r'''
 static struct apple_mbox mb;
@@ -191,18 +196,29 @@ int main(void)
 	assert(kfifo_len(&sc.deferred) == 0 && mb.rx_in != mb.rx_out);
 	assert(apple_rtkit_v27_idle_atomic(&sc) == 0);
 	stopped_ok();
-	assert(kfifo_get(&sc.deferred, &m) && m.msg1 == APPLE_RTKIT_EP_SYSLOG && m.msg0 == SYSLOG_LINE);
 	assert(!kfifo_get(&sc.deferred, &m));
+	{
+		unsigned echoes = 0;
+		for (unsigned i = 0; i < mb.tx_n; i++)
+			echoes += mb.tx[i].msg1 == APPLE_RTKIT_EP_SYSLOG &&
+				  mb.tx[i].msg0 == SYSLOG_LINE;
+		assert(echoes == 1);
+	}
 
-	/* Ordinary traffic in the middle of the wait: deferred in order, the stop completes. */
+	/* Other system messages are retained in FIFO order. */
 	reset(); rk.inject_at = 1; rk.ninject = 2;
-	rk.inject[0] = (struct apple_mbox_msg){ .msg0 = SYSLOG_LINE, .msg1 = APPLE_RTKIT_EP_SYSLOG };
-	rk.inject[1] = (struct apple_mbox_msg){ .msg0 = APP_MSG, .msg1 = 0x37 };
+	rk.inject[0] = (struct apple_mbox_msg){ .msg0 = 0, .msg1 = APPLE_RTKIT_EP_SYSLOG };
+	rk.inject[1] = (struct apple_mbox_msg){ .msg0 = 0, .msg1 = APPLE_RTKIT_EP_IOREPORT };
 	assert(apple_rtkit_v27_idle_atomic(&sc) == 0);
 	stopped_ok(); assert(rk.injected == 2);
 	assert(kfifo_get(&sc.deferred, &m) && m.msg1 == APPLE_RTKIT_EP_SYSLOG);
-	assert(kfifo_get(&sc.deferred, &m) && m.msg1 == 0x37 && m.msg0 == APP_MSG);
+	assert(kfifo_get(&sc.deferred, &m) && m.msg1 == APPLE_RTKIT_EP_IOREPORT);
 	assert(!kfifo_get(&sc.deferred, &m));
+
+	/* Application RPCs invalidate the stop. */
+	reset(); push(&mb, APPLE_RTKIT_APP_ENDPOINT_START, APP_MSG);
+	assert(apple_rtkit_v27_idle_atomic(&sc) == -EPROTO);
+	assert(sc.failed && !sc.stopped && rk.strict_idle_poisoned);
 
 	/* An owed OSLOG counter is still echoed, not deferred. */
 	reset(); rk.oslog_echo = true;
@@ -234,7 +250,7 @@ int main(void)
 	/* A full FIFO: nothing more is consumed, the stop fails. */
 	reset();
 	for (unsigned i = 0; i < FIFO_N; i++)
-		push(&mb, APPLE_RTKIT_EP_SYSLOG, SYSLOG_LINE);
+		push(&mb, APPLE_RTKIT_EP_SYSLOG, 0);
 	assert(apple_rtkit_v27_idle_atomic(&sc) == -ENOBUFS);
 	assert(sc.failed && !sc.stopped && kfifo_is_full(&sc.deferred));
 	assert(apple_rtkit_v27_check(&sc, true) == -EBUSY);
@@ -263,4 +279,5 @@ else:
 if rc:
     sys.exit(1)
 print('PASS rtkit v27 late stop: committed check leaves a message to the stop, '
-      'foreign traffic deferred in order, owed OSLOG echoed, MGMT/crashlog/timeout/full FIFO still fail')
+      'system traffic deferred in order, notification and OSLOG echoes, '
+      'MGMT/crashlog/application/timeout/full FIFO fail')
