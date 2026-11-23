@@ -17,8 +17,8 @@ description: |
   overlaps those drivers' register ranges and the driver does not claim them.
 
   On the T6040 the sleep engine waits for the display pipes, so the node lists
-  the power states that have to be off before a sleep, as the ADT's
-  device-check-ps-b4-sleep table does. Each entry names a PMGR register block,
+  the power states that have to be off before a sleep. Each entry names a PMGR
+  register block,
   the offset of a display pipe's CPU power state and the offset of its last
   sub-block; the states in between are 8 bytes apart. All of the T6040's
   register blocks are needed to enter a suspend and to undo it.
