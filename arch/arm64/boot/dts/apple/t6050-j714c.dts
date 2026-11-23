@@ -50,20 +50,34 @@
  * PHY and PERST; Linux owns the routing, MSI and the DART. Disabled with its DART
  * until the boot loader trains it, which also renumbers the bus here to the PCI
  * core's order.
+ *
+ * PCIe port 1: the SD card reader (t6050-sdreader.dtsi), as on J714s. From this
+ * board's ADT: port1, phy1 and intr2axi1 are apcie0 reg[22], reg[24] and
+ * reg[25], phy-shared reg[3], its interrupt 1531 (apcie0 interrupts[1]). The
+ * boot loader leaves the port down and the kernel trains it.
  */
 &pcie0 {
 	reg = <0x1c 0xb0000000 0x0 0x10000000>,
 	      <0x4 0x14000000 0x0 0x4000>,
 	      <0x4 0x10028000 0x0 0x8000>,
 	      <0x4 0x17010000 0x0 0x4000>,
-	      <0x4 0x10024000 0x0 0x4000>;
-	reg-names = "config", "rc", "port0", "phy0", "intr2axi0";
-	interrupts = <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>;
-	interrupt-names = "port0";
+	      <0x4 0x10024000 0x0 0x4000>,
+	      <0x4 0x11028000 0x0 0x8000>,
+	      <0x4 0x17014000 0x0 0x4000>,
+	      <0x4 0x11024000 0x0 0x4000>,
+	      <0x4 0x17020000 0x0 0x4000>;
+	reg-names = "config", "rc", "port0", "phy0", "intr2axi0", "port1", "phy1", "intr2axi1",
+		    "phy-shared";
+	interrupts = <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 0 1531 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "port0", "port1";
 
-	/* The N1's three functions are on DART streams 1-3 */
-	iommu-map = <0x100 &dart_apcie0 1 3>;
+	/* The N1's three functions are on DART streams 1-3, the SD reader on stream 1 */
+	iommu-map = <0x100 &dart_apcie0 1 3>,
+		    <0x200 &dart_apcie1 1 1>;
 	bus-range = <0 4>;
+	/* dart_apcie1 probes only once port 1 is up: the host must not wait for it */
+	post-init-providers = <&dart_apcie1>;
 
 	port00: pci@0,0 {
 		device_type = "pci";
@@ -107,6 +121,13 @@
 			local-bd-address = [00 00 00 00 00 00];
 		};
 	};
+};
+
+#include "t6050-sdreader.dtsi"
+
+/* The SD reader's power: SMC pcIO output 0 below (ADT pcie-sdreader function-sd_pwr_en) */
+&port01 {
+	pwren-gpios = <&smc_pcio 0 GPIO_ACTIVE_HIGH>;
 };
 
 /* ATC3 and the PD controller bus nub-spmi-a2: not on this board's ports */
@@ -200,11 +221,21 @@
 
 /*
  * Only the pins a node here names are exposed, as on the J716c: pin 112's register
- * takes an SError when read. 80 is PCIe port 0's PERST#, 106 the amps' fault interrupt and
- * 107 their shutdown line.
+ * takes an SError when read. 80 and 81 are PCIe ports 0 and 1's PERST#, 106 the amps'
+ * fault interrupt and 107 their shutdown line.
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <81 25>, <108 113>;
+	gpio-reserved-ranges = <0 80>, <82 24>, <108 113>;
+};
+
+/*
+ * The one SMC pcIO output this board drives, as a pKW8('pcIO', lo, hi) template
+ * written (hi << 32) | lo with the level in the low bits:
+ *   0 sd_pwr_en (0x0, 0x190000): ADT pcie-sdreader function-sd_pwr_en, the SD
+ *     reader's power on PCIe port 1
+ */
+&smc_pcio {
+	apple,output-commands = /bits/ 64 <0x0019000000000000>;
 };
 
 /* This board's SMC fan and power keys are not yet checked */

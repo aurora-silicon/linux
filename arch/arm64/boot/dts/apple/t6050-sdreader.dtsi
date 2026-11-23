@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The SD card reader of the T6050 MacBook Pros and Mac Studios: a Genesys
+ * GL9755 on PCIe port 1 of apcie0 (ADT pci-bridge1/pcie-sdreader). Every
+ * board's ADT gives it the same shape: PERST# is pci-bridge1's function-perst,
+ * GPIO 81; card detect and write protect are active high (card-detect-polarity
+ * and write-protect-polarity = 1); its power is the SMC pcIO template of
+ * function-sd_pwr_en, pKW8('pcIO', 0x0, 0x190000); it is behind dart-apcie1,
+ * which answers only once the root complex is up. mapper-apcie1 names no
+ * stream (the bridge requests one at run time), so the reader gets stream 1,
+ * below the DART's first bypass stream (16). pci-bridge1's function-clkreq
+ * (GPIO 77) is not described: the driver does not take CLKREQ# lines.
+ *
+ * The board includes this after its &pcie0 and gives what differs:
+ *  - pcie0's "port1", "phy1", "intr2axi1" and "phy-shared" registers (apcie0
+ *    reg[22], reg[24], reg[25] and reg[3]), interrupt 1531 (apcie0
+ *    interrupts[1]) and an iommu-map entry for the port's bus on dart_apcie1,
+ *    stream 1;
+ *  - T6050_SDREADER_BUS, the port's secondary bus in this tree, if it is not 2;
+ *  - pin 81 open in pinctrl_ap's gpio-reserved-ranges;
+ *  - how the link comes up. On the MacBook Pros the boot loader leaves port 1
+ *    down and the kernel trains it: the board gives port01 the reader's power,
+ *    pwren-gpios on its SMC pcIO output for sd_pwr_en. Where the boot loader
+ *    trains the port, port01 and dart_apcie1 stay disabled until it does.
+ */
+
+#ifndef T6050_SDREADER_BUS
+#define T6050_SDREADER_BUS 2
+#endif
+
+&pcie0 {
+	port01: pci@1,0 {
+		device_type = "pci";
+		reg = <0x800 0 0 0 0>;
+		bus-range = <T6050_SDREADER_BUS T6050_SDREADER_BUS>;
+		apple,link-trained-by-bootloader;
+		/* PERST#: ADT pci-bridge1 function-perst, GPIO 81 */
+		reset-gpios = <&pinctrl_ap 81 GPIO_ACTIVE_LOW>;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port01 0 0 0 0>,
+				<0 0 0 2 &port01 0 0 0 1>,
+				<0 0 0 3 &port01 0 0 0 2>,
+				<0 0 0 4 &port01 0 0 0 3>;
+
+		/* The GL9755; card detect and write protect active high */
+		sdhci0: mmc@0,0 {
+			compatible = "pci17a0,9755";
+			reg = <(T6050_SDREADER_BUS << 16) 0x0 0x0 0x0 0x0>;
+			cd-inverted;
+			wp-inverted;
+		};
+	};
+};
+
+/* It answers only once port 1's root complex is up: pcie-apple then enables it */
+&dart_apcie1 {
+	apple,manual-availability;
+	status = "okay";
+};
