@@ -382,10 +382,9 @@ impl Cache {
             .count()
             .try_into()?;
         let render = render_count != 0;
-        let (compute, compute_ext, render, render_ext) = {
-            // Never held by publication, completion, recovery or fence signalling.
-            // Serializing standby top-up under `ready` prevents concurrent SUBMITs on the
-            // same VM from over-allocating or racing each other's deficit calculation.
+        let (compute, compute_ext, render_arena, render_ext) = {
+            // Never held by publication, completion, recovery, fence signalling or
+            // standby waits, so Cache::close() and same-VM compute SUBMITs never block.
             let mut ready = self.ready.lock();
             if vm.status.get() != 0 || vm.vm.is_closed() || self.closed.load(Ordering::Acquire) {
                 return Err(EIO);
@@ -450,86 +449,6 @@ impl Cache {
                     ready.render_ext =
                         RenderExtArena::new(&self.factory, &self.bind, &vm.vm, &self.live).ok();
                 }
-                if render_count > super::budget::LIMIT {
-                    return Err(E2BIG);
-                }
-                let mut remaining = kernel::time::msecs_to_jiffies(10_000);
-                loop {
-                    let deficit = {
-                        let mut standby = self.standby.lock();
-                        if vm.status.get() != 0
-                            || vm.vm.is_closed()
-                            || self.closed.load(Ordering::Acquire)
-                        {
-                            return Err(EIO);
-                        }
-                        if let Some(needed) = standby
-                            .reserved
-                            .checked_add(render_count)
-                            .filter(|&n| n <= super::budget::LIMIT)
-                        {
-                            if standby.epochs.len() >= needed as usize {
-                                standby.reserved = needed;
-                                break;
-                            }
-                            needed - standby.epochs.len() as u32
-                        } else {
-                            match self
-                                .standby_available
-                                .wait_interruptible_timeout(&mut standby, remaining)
-                            {
-                                CondVarTimeoutResult::Woken { jiffies } => {
-                                    remaining = jiffies;
-                                    continue;
-                                }
-                                CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
-                                CondVarTimeoutResult::Timeout => {
-                                    if vm.status.get() != 0
-                                        || vm.vm.is_closed()
-                                        || self.closed.load(Ordering::Acquire)
-                                    {
-                                        return Err(EIO);
-                                    }
-                                    let needed = standby
-                                        .reserved
-                                        .checked_add(render_count)
-                                        .filter(|&n| n <= super::budget::LIMIT)
-                                        .ok_or(EBUSY)?;
-                                    if standby.epochs.len() >= needed as usize {
-                                        standby.reserved = needed;
-                                        break;
-                                    }
-                                    needed - standby.epochs.len() as u32
-                                }
-                            }
-                        }
-                    };
-                    let mut epochs = super::budget::Budget::reserve(&self.budget, deficit)?;
-                    let mut fresh = KVec::with_capacity(deficit as usize, GFP_KERNEL)?;
-                    for _ in 0..deficit {
-                        fresh.push(PbEpoch::new(&self.factory, vm, epochs.take()?)?, GFP_KERNEL)?;
-                    }
-                    let mut overflow = KVec::with_capacity(fresh.len(), GFP_KERNEL)?;
-                    {
-                        let mut standby = self.standby.lock();
-                        let closed = self.closed.load(Ordering::Acquire);
-                        for epoch in fresh {
-                            if closed {
-                                let _ = overflow.push_within_capacity(epoch);
-                            } else if let Err(err) = standby.epochs.push_within_capacity(epoch) {
-                                let _ = overflow.push_within_capacity(err.0);
-                            }
-                        }
-                    }
-                    drop(overflow);
-                }
-            }
-            // A concurrent fault retains even newly constructed backing in this VM cache.
-            if vm.status.get() != 0 || vm.vm.is_closed() {
-                if render {
-                    self.release_reserved(render_count);
-                }
-                return Err(EIO);
             }
             (
                 if compute { ready.compute.clone() } else { None },
@@ -538,10 +457,92 @@ impl Cache {
                 if render { ready.render_ext.clone() } else { None },
             )
         };
+        if render {
+            if render_count > super::budget::LIMIT {
+                return Err(E2BIG);
+            }
+            let mut remaining = kernel::time::msecs_to_jiffies(10_000);
+            loop {
+                let deficit = {
+                    let mut standby = self.standby.lock();
+                    if vm.status.get() != 0
+                        || vm.vm.is_closed()
+                        || self.closed.load(Ordering::Acquire)
+                    {
+                        return Err(EIO);
+                    }
+                    if let Some(needed) = standby
+                        .reserved
+                        .checked_add(render_count)
+                        .filter(|&n| n <= super::budget::LIMIT)
+                    {
+                        if standby.epochs.len() >= needed as usize {
+                            standby.reserved = needed;
+                            break;
+                        }
+                        needed - standby.epochs.len() as u32
+                    } else {
+                        match self
+                            .standby_available
+                            .wait_interruptible_timeout(&mut standby, remaining)
+                        {
+                            CondVarTimeoutResult::Woken { jiffies } => {
+                                remaining = jiffies;
+                                continue;
+                            }
+                            CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                            CondVarTimeoutResult::Timeout => {
+                                if vm.status.get() != 0
+                                    || vm.vm.is_closed()
+                                    || self.closed.load(Ordering::Acquire)
+                                {
+                                    return Err(EIO);
+                                }
+                                let needed = standby
+                                    .reserved
+                                    .checked_add(render_count)
+                                    .filter(|&n| n <= super::budget::LIMIT)
+                                    .ok_or(EBUSY)?;
+                                if standby.epochs.len() >= needed as usize {
+                                    standby.reserved = needed;
+                                    break;
+                                }
+                                needed - standby.epochs.len() as u32
+                            }
+                        }
+                    }
+                };
+                let mut epochs = super::budget::Budget::reserve(&self.budget, deficit)?;
+                let mut fresh = KVec::with_capacity(deficit as usize, GFP_KERNEL)?;
+                for _ in 0..deficit {
+                    fresh.push(PbEpoch::new(&self.factory, vm, epochs.take()?)?, GFP_KERNEL)?;
+                }
+                let mut overflow = KVec::with_capacity(fresh.len(), GFP_KERNEL)?;
+                {
+                    let mut standby = self.standby.lock();
+                    let closed = self.closed.load(Ordering::Acquire);
+                    for epoch in fresh {
+                        if closed {
+                            let _ = overflow.push_within_capacity(epoch);
+                        } else if let Err(err) = standby.epochs.push_within_capacity(epoch) {
+                            let _ = overflow.push_within_capacity(err.0);
+                        }
+                    }
+                }
+                drop(overflow);
+            }
+        }
+        // A concurrent fault or close retains even newly constructed backing in this VM cache.
+        if vm.status.get() != 0 || vm.vm.is_closed() || self.closed.load(Ordering::Acquire) {
+            if render {
+                self.release_reserved(render_count);
+            }
+            return Err(EIO);
+        }
         Ok(Prepared {
             compute,
             compute_ext,
-            render,
+            render: render_arena,
             render_ext,
             unpublished_renders: AtomicU32::new(render_count),
             cache: (render_count != 0).then(|| self.clone()),

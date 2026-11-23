@@ -368,6 +368,9 @@ pub(crate) struct Claims {
     pub(crate) ct_count: u32,
     #[allow(dead_code)]
     pub(crate) rotating: bool,
+    /// `Slots::scrub_gen` observed when these claims were published; a recovery invalidation
+    /// advances `scrub_gen` so in-flight slots still force a full scrub after retiring.
+    pub(crate) scrub_gen: u64,
 }
 impl Claims {
     pub(crate) const fn new() -> Self {
@@ -379,6 +382,7 @@ impl Claims {
             ct: [0; sizes::RENDER_SLOTS],
             ct_count: 0,
             rotating: true,
+            scrub_gen: 0,
         }
     }
 }
@@ -449,6 +453,7 @@ pub(crate) struct Slots {
     pub(crate) cursor: u32,
     pub(crate) pass_busy: u32,
     pub(crate) pass_cursor: u32,
+    scrub_gen: u64,
     pub(crate) stats: SlotStats,
     /// The compute and render owners, on the heap: `Firmware` (and so `Slots`) is built on the
     /// probe's stack, which has no room for them.
@@ -461,6 +466,7 @@ impl Slots {
             cursor: 0,
             pass_busy: 0,
             pass_cursor: 0,
+            scrub_gen: 0,
             stats: SlotStats::default(),
             compute: KBox::new(
                 ComputeOwners {
@@ -554,6 +560,7 @@ impl Slots {
     /// Forces a full scrub on the next claim of every slot (after firmware recovery).
     #[allow(dead_code)]
     pub(crate) fn invalidate_scrub(&mut self) {
+        self.scrub_gen = self.scrub_gen.wrapping_add(1);
         self.compute.scrub_full = [true; sizes::COMPUTE_UNITS];
         self.render.scrub_full = [true; sizes::RENDER_SLOTS];
     }
@@ -842,7 +849,7 @@ impl Slots {
     }
 
     /// Reserve the actual same-slot publication. Call before producers become visible.
-    pub(crate) fn publish(&mut self, f: &Claims) -> Result {
+    pub(crate) fn publish(&mut self, f: &mut Claims) -> Result {
         // Validate on a private copy so a failure changes no ownership.
         let mut c = self.compute.lifetime.clone();
         let mut p = self.render.lifetime.clone();
@@ -858,6 +865,7 @@ impl Slots {
         }
         self.compute.lifetime = c;
         self.render.lifetime = p;
+        f.scrub_gen = self.scrub_gen;
         Ok(())
     }
     /// Full wire retirement is a precondition; completion fences alone are insufficient.
@@ -876,16 +884,21 @@ impl Slots {
         }
         self.compute.lifetime = c;
         self.render.lifetime = p;
+        let clean_scrub = f.scrub_gen == self.scrub_gen;
         for &k in &f.slot[..f.slot_count as usize] {
             self.compute.owner[k as usize] = self.compute.pending_owner[k as usize].take();
             self.compute.arena[k as usize] = self.compute.pending_arena[k as usize].take();
-            self.compute.scrub_full[k as usize] = false;
+            if clean_scrub {
+                self.compute.scrub_full[k as usize] = false;
+            }
         }
         for k in 0..sizes::RENDER_SLOTS {
             if f.pass_mask & (1 << k) != 0 {
                 self.render.owner[k] = self.render.pending_owner[k].take();
                 self.render.arena[k] = self.render.pending_arena[k].take();
-                self.render.scrub_full[k] = false;
+                if clean_scrub {
+                    self.render.scrub_full[k] = false;
+                }
             }
         }
         self.pass_busy &= !f.pass_mask;

@@ -395,6 +395,9 @@ impl Firmware {
         } else {
             self.publish_checked(done)
         };
+        if self.engine.flights.is_empty() {
+            self.power.report_work(false);
+        }
         let s = &mut self.engine.stats;
         if self.engine.flights.is_empty() && s.idle_from_ns != 0 {
             // Idle with nothing ready is not a gap: the clients are late.
@@ -795,6 +798,7 @@ impl Firmware {
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
                 self.fail_stop(error, done);
+                core::mem::forget(f);
                 return;
             }
             if f.computes != 0 {
@@ -815,6 +819,7 @@ impl Firmware {
                     self.retain(&f.job);
                     complete(done, &f.job, Err(error));
                     self.fail_stop(error, done);
+                    core::mem::forget(f);
                     return;
                 }
             }
@@ -822,6 +827,7 @@ impl Firmware {
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
                 self.fail_stop(error, done);
+                core::mem::forget(f);
                 return;
             }
             if result.is_err() {
@@ -833,8 +839,9 @@ impl Firmware {
             // Only an actual passed abort lacks the full owner receipt. An affected job
             // with a full normal receipt fails its fence without poisoning healthy storage.
             if f.renders != 0 {
-                // Quarantine the aborted allocator slot permanently and keep no epoch for reuse.
-                self.pools.quarantine_flight(f.pb_slot as usize);
+                // Quarantine the aborted allocator slot permanently and retain the aborted
+                // flight's epoch alongside the prior slot owner.
+                self.pools.quarantine_flight(f.pb_slot as usize, f.pb.take());
             }
             self.slots.quarantine(&mut f.claims);
             self.retain(&f.job);
@@ -851,6 +858,7 @@ impl Firmware {
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
                 self.fail_stop(error, done);
+                core::mem::forget(f);
                 return;
             }
             // Publish queue-local EXACT_PRIOR frontiers only after every normal hardware
@@ -860,6 +868,7 @@ impl Firmware {
                     self.retain(&f.job);
                     complete(done, &f.job, Err(error));
                     self.fail_stop(error, done);
+                    core::mem::forget(f);
                     return;
                 }
             }
@@ -903,6 +912,7 @@ impl Firmware {
                     self.retain(&job);
                     complete(done, &job, Err(proof_error));
                     self.fail_stop(proof_error, done);
+                    core::mem::forget(f);
                     return;
                 }
             }

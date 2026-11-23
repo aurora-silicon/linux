@@ -308,6 +308,8 @@ pub(crate) struct Pools {
     inflight: [u32; 2],
     /// Permanently quarantined allocator slots after an aborted receipt.
     quarantined: [bool; 2],
+    /// Fresh PB epoch retained when an aborted render had not yet replaced `owners[k]`.
+    quarantined_epochs: [Option<Arc<PbEpoch>>; 2],
 }
 impl Pools {
     pub(crate) fn new(dev: &AsahiDrmDevice) -> Self {
@@ -325,6 +327,7 @@ impl Pools {
             last_clean_retired: None,
             inflight: [0, 0],
             quarantined: [false, false],
+            quarantined_epochs: [None, None],
         }
     }
     /// Allocator slot `k`'s owner epoch, if its render retired normally while the slot was still
@@ -464,13 +467,25 @@ impl Pools {
         self.retire_epoch(k, binding, completed);
         Ok(())
     }
-    /// Quarantines allocator slot `k` permanently after a passed abort, retaining all leases.
+    /// Quarantines allocator slot `k` permanently after a passed abort, retaining all leases
+    /// including any fresh epoch published on the aborted flight alongside `owners[k]`.
     #[allow(dead_code)]
-    pub(crate) fn quarantine_flight(&mut self, k: usize) {
+    pub(crate) fn quarantine_flight(&mut self, k: usize, pb: Option<Arc<PbEpoch>>) {
         if k < 2 {
             self.inflight[k] = self.inflight[k].saturating_sub(1);
             self.quarantined[k] = true;
             self.keep[k] = false;
+            if let Some(epoch) = pb {
+                if self.quarantined_epochs[k].is_none() {
+                    self.quarantined_epochs[k] = Some(epoch);
+                } else {
+                    // Already retaining an aborted epoch on this slot; never unmap an exposed
+                    // epoch or allocate under the device lock.
+                    core::mem::forget(epoch);
+                }
+            }
+        } else if let Some(epoch) = pb {
+            core::mem::forget(epoch);
         }
     }
     /// Slot `k` is handed to a render's epoch, `reused` or fresh (with InitBM). Returns the

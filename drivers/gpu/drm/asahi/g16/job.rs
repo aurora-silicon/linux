@@ -483,6 +483,9 @@ pub(crate) fn complete_all(mut done: Completions) {
 struct SchedJob {
     job: Arc<Job>,
     shared: Arc<Shared>,
+    /// Signalled once `run()`, `cancel()`, or `drop()` finishes handing off `job`.
+    /// Preserves queue-local inline-submit ordering without retaining `Arc<Job>`.
+    scheduled: Arc<AtomicBool>,
 }
 
 impl sched::JobImpl for SchedJob {
@@ -496,6 +499,7 @@ impl sched::JobImpl for SchedJob {
     fn run(job: &mut Self) -> Result<Option<Fence>> {
         let fence = job.job.fence.fence();
         job.job.start(&job.shared);
+        job.scheduled.store(true, Ordering::Release);
         Ok(Some(fence))
     }
 
@@ -506,6 +510,7 @@ impl sched::JobImpl for SchedJob {
 
     fn cancel(job: &mut Self) {
         job.job.cancel_unstarted();
+        job.scheduled.store(true, Ordering::Release);
     }
 }
 
@@ -513,6 +518,7 @@ impl Drop for SchedJob {
     fn drop(&mut self) {
         // Entity teardown frees jobs it never ran without calling `cancel`.
         self.job.cancel_unstarted();
+        self.scheduled.store(true, Ordering::Release);
     }
 }
 
@@ -522,9 +528,10 @@ pub(crate) struct Scheduler {
     // drains), and only then the scheduler is finalized.
     entity: sched::Entity<SchedJob>,
     _scheduler: sched::Scheduler<SchedJob>,
-    /// Most recently accepted job of this queue; an inline submit is permitted only once
-    /// this predecessor has already started so queue-local ordering is strictly preserved.
-    last_job: Option<Arc<Job>>,
+    /// Completion flag of the most recently queued (non-inline) job of this queue; an inline
+    /// submit is permitted only once this predecessor has started or been cancelled, without
+    /// retaining the predecessor `Arc<Job>` (and its `VmJobGuard` or prepared arenas).
+    last_scheduled: Option<Arc<AtomicBool>>,
 }
 
 impl Scheduler {
@@ -550,7 +557,7 @@ impl Scheduler {
         Ok(Self {
             entity,
             _scheduler: scheduler,
-            last_job: None,
+            last_scheduled: None,
         })
     }
 
@@ -558,9 +565,24 @@ impl Scheduler {
     /// submitted work of its VM) and the error is returned.
     pub(crate) fn push(&mut self, job: Arc<Job>, shared: Arc<Shared>) -> Result {
         shared.note_submitter();
-        let prev_started = self.last_job.as_ref().is_none_or(|prev| prev.is_started());
+        let prev_started = match &self.last_scheduled {
+            Some(done) if done.load(Ordering::Acquire) => {
+                self.last_scheduled = None;
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
         let handle = job.clone();
-        let mut pending = self.entity.new_job(1, SchedJob { job, shared: shared.clone() })?;
+        let scheduled = Arc::new(AtomicBool::new(false), GFP_KERNEL)?;
+        let mut pending = self.entity.new_job(
+            1,
+            SchedJob {
+                job,
+                shared: shared.clone(),
+                scheduled: scheduled.clone(),
+            },
+        )?;
         for fence in handle.inputs.iter() {
             pending.add_dependency(fence.clone())?;
         }
@@ -569,7 +591,11 @@ impl Scheduler {
         if prev_started {
             handle.try_start_inline(&shared);
         }
-        self.last_job = Some(handle);
+        if handle.is_started() {
+            scheduled.store(true, Ordering::Release);
+        } else {
+            self.last_scheduled = Some(scheduled);
+        }
         armed.push();
         Ok(())
     }

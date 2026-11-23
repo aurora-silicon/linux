@@ -1336,7 +1336,7 @@ impl Firmware {
         job.vm.vm.mark_binding_published()?;
         self.slots.hold_vm(&f.claims, &job.vm)?;
         self.slots.hold_arenas(&f.claims, &job.resources);
-        self.slots.publish(&f.claims)?;
+        self.slots.publish(&mut f.claims)?;
         // Even a failed first store may have become visible. From this boundary preserve
         // every owner and return explicit uncertainty rather than guessing from errno.
         *visible = true;

@@ -181,7 +181,7 @@ pub mod g16 {
         for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
         Arenas{compute:g16::resources::ComputeArena{compute},render:g16::resources::RenderArena{passes,tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};8],tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};8]}}
     }
-    fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&c).unwrap();s.retire(&mut c).unwrap();}
+    fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();}
     #[test]fn render_reuse_clears_only_previous_write_spans(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
         s.claim_pass(&arena.render,0).unwrap();
@@ -318,12 +318,12 @@ pub mod g16 {
         arena.compute.compute[0].pool_state.w64(8,0xdeadbeef).unwrap();
         arena.compute.compute[0].page_list.w64(0x1000,0xaabbccdd).unwrap();
         let a=arena.compute.compute[0].pool_state.snapshot();let b=arena.compute.compute[0].page_list.snapshot();
-        let mut c=Claims::new();assert_eq!(s.claim_compute(&arena.compute,&mut c,0).unwrap(),Some(0));s.publish(&c).unwrap();s.retire(&mut c).unwrap();
-        assert_eq!(s.free_compute(),1);assert_eq!(s.claim_compute(&arena.compute,&mut c,0).unwrap(),Some(1));s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        let mut c=Claims::new();assert_eq!(s.claim_compute(&arena.compute,&mut c,0).unwrap(),Some(0));s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
+        assert_eq!(s.free_compute(),1);assert_eq!(s.claim_compute(&arena.compute,&mut c,0).unwrap(),Some(1));s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
         arena.compute.compute[0].counter.w64(0,91).unwrap();
         assert_eq!(s.claim_compute(&arena.compute,&mut c,0).unwrap(),Some(0));
         assert_eq!(a,arena.compute.compute[0].pool_state.snapshot());assert_eq!(b,arena.compute.compute[0].page_list.snapshot());assert_eq!(arena.compute.compute[0].counter.r32(0).unwrap(),91);
-        s.publish(&c).unwrap();s.quarantine(&mut c);assert!(s.compute_exhausted());
+        s.publish(&mut c).unwrap();s.quarantine(&mut c);assert!(s.compute_exhausted());
     }
     #[test]fn production_render_descriptors_preserve_firmware_bytes_and_exact_counter(){
         let mut o=Objects::new();let mut pools=PoolSet::new(&mut o).unwrap();
@@ -343,11 +343,11 @@ pub mod g16 {
         let b=sync::Arc::new(g16::vm::VmState{id:101,slot:2,generation:1,vm:()},0).unwrap();
         let c=sync::Arc::new(g16::vm::VmState{id:102,slot:3,generation:9,vm:()},0).unwrap();
         let mut claims=Claims::new();
-        for vm in [&a,&b]{s.claim_compute(&arena.compute,&mut claims,0).unwrap().unwrap();s.hold_vm(&claims,vm).unwrap();s.publish(&claims).unwrap();s.note_published(&claims);s.retire(&mut claims).unwrap();}
+        for vm in [&a,&b]{s.claim_compute(&arena.compute,&mut claims,0).unwrap().unwrap();s.hold_vm(&claims,vm).unwrap();s.publish(&mut claims).unwrap();s.note_published(&claims);s.retire(&mut claims).unwrap();}
         assert_eq!(s.stats.cross_vm_retargets,[0,0]);
         assert_eq!(s.claim_compute(&arena.compute,&mut claims,0).unwrap(),Some(0));
         s.hold_vm(&claims,&c).unwrap();assert_eq!(s.stats.cross_vm_retargets,[0,0]);
-        s.publish(&claims).unwrap();assert_eq!(s.stats.cross_vm_retargets,[0,0]);
+        s.publish(&mut claims).unwrap();assert_eq!(s.stats.cross_vm_retargets,[0,0]);
         s.note_published(&claims);assert_eq!(s.stats.cross_vm_retargets,[1,0]);
         let proof=s.stats.last_retarget[0];
         assert_eq!((proof.unit,proof.old_vm,proof.new_vm),(0,100,102));
@@ -362,10 +362,10 @@ pub mod g16 {
     #[test]fn previous_vm_lease_survives_replacement_publication_until_full_retirement(){
         let mut o=Objects::new();let arena=arenas(&mut o);let mut s=Slots::new().unwrap();
         let a=vm(1);let b=vm(2);let c=vm(3);let mut claims=Claims::new();
-        for owner in [&a,&b]{s.claim_compute(&arena.compute,&mut claims,0).unwrap().unwrap();s.hold_vm(&claims,owner).unwrap();s.publish(&claims).unwrap();s.retire(&mut claims).unwrap();}
+        for owner in [&a,&b]{s.claim_compute(&arena.compute,&mut claims,0).unwrap().unwrap();s.hold_vm(&claims,owner).unwrap();s.publish(&mut claims).unwrap();s.retire(&mut claims).unwrap();}
         assert_eq!(sync::Arc::strong_count(&a),2);
         assert_eq!(s.claim_compute(&arena.compute,&mut claims,0).unwrap(),Some(0));
-        s.hold_vm(&claims,&c).unwrap();s.publish(&claims).unwrap();s.note_published(&claims);
+        s.hold_vm(&claims,&c).unwrap();s.publish(&mut claims).unwrap();s.note_published(&claims);
         assert_eq!(sync::Arc::strong_count(&a),2,"publication cannot release old ASID/backing");
         assert_eq!(sync::Arc::strong_count(&c),2,"candidate must be held too");
         s.retire(&mut claims).unwrap();
@@ -374,7 +374,7 @@ pub mod g16 {
     #[test]fn cancel_releases_candidate_but_quarantine_preserves_both_vm_leases(){
         let mut o=Objects::new();let arena=arenas(&mut o);let mut s=Slots::new().unwrap();
         let a=vm(1);let b=vm(2);let c=vm(3);let mut claims=Claims::new();
-        for owner in [&a,&b]{s.claim_compute(&arena.compute,&mut claims,0).unwrap().unwrap();s.hold_vm(&claims,owner).unwrap();s.publish(&claims).unwrap();s.retire(&mut claims).unwrap();}
+        for owner in [&a,&b]{s.claim_compute(&arena.compute,&mut claims,0).unwrap().unwrap();s.hold_vm(&claims,owner).unwrap();s.publish(&mut claims).unwrap();s.retire(&mut claims).unwrap();}
         s.claim_compute(&arena.compute,&mut claims,0).unwrap();s.hold_vm(&claims,&c).unwrap();s.release(&mut claims);
         assert_eq!(sync::Arc::strong_count(&a),2);assert_eq!(sync::Arc::strong_count(&c),1);
         s.claim_compute(&arena.compute,&mut claims,0).unwrap();s.hold_vm(&claims,&c).unwrap();
@@ -477,7 +477,7 @@ pub mod g16 {
             let k=s.claim_compute_for(&arena.compute,&mut c,Some(a.id)).unwrap().unwrap();
             assert_eq!(arena.compute.compute[k].context_store.fills.lock().unwrap().len(),1);
             assert_eq!(arena.compute.compute[k].its.fills.lock().unwrap().len(),1);
-            s.hold_vm(&c,&a).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+            s.hold_vm(&c,&a).unwrap();s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
         }
         // Same-VM clean reuse of unit 0 clears ONLY its (16 B), skipping context_store/aux/preempt/seq.
         let k=s.claim_compute_for(&arena.compute,&mut c,Some(a.id)).unwrap().unwrap();
@@ -487,14 +487,14 @@ pub mod g16 {
         assert_eq!(arena.compute.compute[0].context_store.fills.lock().unwrap().len(),1);
         assert_eq!(arena.compute.compute[0].preempt.fills.lock().unwrap().len(),1);
         assert_eq!(arena.compute.compute[0].aux.fills.lock().unwrap().len(),1);
-        s.hold_vm(&c,&a).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        s.hold_vm(&c,&a).unwrap();s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
         // Cross-VM switch on unit 1 runs full scrub.
         let k=s.claim_compute_for(&arena.compute,&mut c,Some(b.id)).unwrap().unwrap();
         assert_eq!(k,1);
         assert!(s.compute_needs_full_work(1));
         assert_eq!(arena.compute.compute[1].context_store.fills.lock().unwrap().len(),2);
         assert_eq!(arena.compute.compute[1].preempt.fills.lock().unwrap().len(),2);
-        s.hold_vm(&c,&b).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        s.hold_vm(&c,&b).unwrap();s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
         // Firmware recovery forces full scrub even for same VM.
         s.invalidate_scrub();
         let k=s.claim_compute_for(&arena.compute,&mut c,Some(a.id)).unwrap().unwrap();
@@ -507,7 +507,7 @@ pub mod g16 {
         assert_eq!(k,0);
         assert!(s.compute_needs_full_work(0));
         assert_eq!(arena.compute.compute[0].context_store.fills.lock().unwrap().len(),3);
-        s.hold_vm(&c,&a).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        s.hold_vm(&c,&a).unwrap();s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
     }
 
     #[test]fn pass_same_vm_reuse_skips_bulk_scrub_and_preserves_tpc_dirty_for_full_scrub(){
@@ -515,7 +515,7 @@ pub mod g16 {
         let a=vm(1);let b=vm(2);
         let retire=|s:&mut Slots,k:usize,owner:&sync::Arc<g16::vm::VmState>|{
             let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;
-            s.hold_vm(&c,owner).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+            s.hold_vm(&c,owner).unwrap();s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
         };
         // First use of slots 0 and 1 runs full scrub.
         s.claim_pass_for(&arena.render,0,Some(a.id)).unwrap();
@@ -629,11 +629,16 @@ pub mod g16 {
         p.publish_flight(1);
         p.retire_flight(1,&e2,b2,true).unwrap();
         assert!(!p.exhausted());
-        // Aborted render on slot 0 after slot 1 was previously retired leaves slot 1 undisplaced
-        // and slot 0 quarantined -> global pool exhaustion.
+        // Aborted render on slot 0 with a fresh epoch after slot 1 was previously retired
+        // retains BOTH the prior owner epoch (e1) and the fresh aborted epoch (e1_fresh),
+        // leaving slot 1 undisplaced and slot 0 quarantined -> global pool exhaustion.
+        let e1_fresh=g16::pools::PbEpoch::new(&factory,&vm1,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
+        e1_fresh.prepare(0,0x70c0000000,2048).unwrap();e1_fresh.expose();
         assert_eq!(p.pick_slot(&vm1,false),Some(0));
         p.publish_flight(0);
-        p.quarantine_flight(0);
+        p.quarantine_flight(0,Some(e1_fresh.clone()));
+        assert_eq!(sync::Arc::strong_count(&e1),2,"prior slot owner epoch must stay mapped");
+        assert_eq!(sync::Arc::strong_count(&e1_fresh),2,"aborted fresh epoch must stay mapped");
         assert!(p.reusable(0,&vm1).is_none());
         assert_eq!(p.pick_slot(&vm1,false),None);
         assert!(p.exhausted());
@@ -645,7 +650,7 @@ pub mod g16 {
         let mut q=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
         assert_eq!(q.pick_slot(&vm1,false),Some(0));
         q.publish_flight(0);
-        q.quarantine_flight(0);
+        q.quarantine_flight(0,None);
         assert!(!q.exhausted());
         assert_eq!(q.pick_slot(&vm2,false),Some(1));
         let qb2=q.bind(1,false);
@@ -661,6 +666,39 @@ pub mod g16 {
         q.invalidate();
         assert!(q.exhausted());
         assert!(q.exhausted_for(&vm2));
+    }
+
+    #[test]fn recovery_invalidate_scrub_survives_in_flight_retirement(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
+        let a=vm(1);
+        // Prime unit 0 and unit 1 so unit 0 is clean for same-VM reuse.
+        let mut c0=Claims::new();
+        assert_eq!(s.claim_compute_for(&arena.compute,&mut c0,Some(a.id)).unwrap(),Some(0));
+        s.hold_vm(&c0,&a).unwrap();s.publish(&mut c0).unwrap();
+        // Recovery fires while unit 0 is still in flight.
+        s.invalidate_scrub();
+        s.retire(&mut c0).unwrap();
+        // Displace unit 0 via unit 1 (published after recovery -> clean).
+        let mut c1=Claims::new();
+        assert_eq!(s.claim_compute_for(&arena.compute,&mut c1,Some(a.id)).unwrap(),Some(1));
+        s.hold_vm(&c1,&a).unwrap();s.publish(&mut c1).unwrap();s.retire(&mut c1).unwrap();
+        // Next claim of unit 0 by the same VM must still perform a full scrub!
+        let k=s.claim_compute_for(&arena.compute,&mut c0,Some(a.id)).unwrap().unwrap();
+        assert_eq!(k,0);
+        assert!(s.compute_needs_full_work(0));
+        assert_eq!(arena.compute.compute[0].context_store.fills.lock().unwrap().len(),2);
+        s.hold_vm(&c0,&a).unwrap();s.publish(&mut c0).unwrap();s.retire(&mut c0).unwrap();
+        // Same invariant for render pass slots in flight across recovery.
+        let mut r0=Claims::new();r0.pass[0]=0;r0.pass_mask=1;
+        s.claim_pass_for(&arena.render,0,Some(a.id)).unwrap();
+        s.hold_vm(&r0,&a).unwrap();s.publish(&mut r0).unwrap();
+        s.invalidate_scrub();
+        s.retire(&mut r0).unwrap();
+        let mut r1=Claims::new();r1.pass[0]=1;r1.pass_mask=2;
+        s.claim_pass_for(&arena.render,1,Some(a.id)).unwrap();
+        s.hold_vm(&r1,&a).unwrap();s.publish(&mut r1).unwrap();s.retire(&mut r1).unwrap();
+        s.claim_pass_for(&arena.render,0,Some(a.id)).unwrap();
+        assert_eq!(arena.render.passes[0].scene.fills.lock().unwrap().len(),2);
     }
 
     #[test]fn pipelined_render_pass_slots_keep_seven_in_flight(){
@@ -682,7 +720,7 @@ pub mod g16 {
             c.pass[0]=k as u32;c.pass_mask=1<<k;
             s.claim_pass_for(&arena,k,Some(a.id)).unwrap();
             s.hold_vm(&c,&a).unwrap();
-            s.publish(&c).unwrap();
+            s.publish(&mut c).unwrap();
             live.push(c);
         }
         assert_eq!(s.render_published(),7);
