@@ -76,7 +76,8 @@ struct pci_dev { struct device dev; };
 struct brcmf_bus { int unused; };
 static struct brcmf_bus bus;
 static struct brcmf_bus *dev_get_drvdata(struct device *dev) { (void)dev; return &bus; }
-struct brcmf_commonring { int unused; };
+struct brcmf_commonring { u16 r_ptr, w_ptr, depth; };
+enum brcmf_pcie_state { BRCMFMAC_PCIE_STATE_DOWN, BRCMFMAC_PCIE_STATE_UP };
 struct brcmf_pciedev_info;
 struct brcmf_pcie_ringbuf { struct brcmf_commonring commonring; struct brcmf_pciedev_info *devinfo;
  u32 w_idx_addr, r_idx_addr; u16 id; };
@@ -86,7 +87,7 @@ struct brcmf_pcie_shared_info { u32 tcm_base_address, flags; struct brcmf_pcie_r
  struct brcmf_pcie_ringbuf *flowrings; u16 max_rxbufpost, max_flowrings, max_submissionrings,
  max_completionrings; u32 rx_dataoffset, htod_mb_data_addr, dtoh_mb_data_addr, ring_info_addr;
  struct brcmf_pcie_console console; u8 version; bool mb_via_ctl; u32 flags2, flags3; };
-struct brcmf_pciedev_info { struct pci_dev *pdev; u8 *tcm; size_t tcm_size; struct brcmf_pcie_shared_info shared;
+struct brcmf_pciedev_info { enum brcmf_pcie_state state; struct pci_dev *pdev; u8 *tcm; size_t tcm_size; struct brcmf_pcie_shared_info shared;
  u8 dma_idx_sz; void *idxbuf; u32 idxbuf_sz; dma_addr_t idxbuf_dmahandle;
  u16 (*read_ptr)(struct brcmf_pciedev_info *devinfo, u32 mem_offset);
  void (*write_ptr)(struct brcmf_pciedev_info *devinfo, u32 mem_offset, u16 value); };
@@ -116,12 +117,12 @@ static struct brcmf_pcie_ringbuf *brcmf_pcie_alloc_dma_and_ring(struct brcmf_pci
   return &rings_pool[id]; }
 static void brcmf_pcie_release_ringbuffers(struct brcmf_pciedev_info *d) { (void)d; }
 static void brcmf_pcie_ring_mb_ring_bell(void) {}
-static void brcmf_pcie_ring_mb_update_rptr(void) {}
-static void brcmf_pcie_ring_mb_update_wptr(void) {}
 static void brcmf_pcie_ring_mb_write_rptr(void) {}
 static void brcmf_pcie_ring_mb_write_wptr(void) {}
-static void brcmf_commonring_register_cb(struct brcmf_commonring *c, void (*a)(void), void (*b)(void),
- void (*e)(void), void (*f)(void), void (*g)(void), void *r) { (void)c; (void)a; (void)b; (void)e; (void)f; (void)g; (void)r; }
+static int brcmf_pcie_ring_mb_update_rptr(void *ctx);
+static int brcmf_pcie_ring_mb_update_wptr(void *ctx);
+static void brcmf_commonring_register_cb(struct brcmf_commonring *c, void (*a)(void), int (*b)(void *),
+ int (*e)(void *), void (*f)(void), void (*g)(void), void *r) { (void)c; (void)a; (void)b; (void)e; (void)f; (void)g; (void)r; }
 '''
 
 MAIN = r'''
@@ -200,6 +201,15 @@ int main(void)
  assert(!init()); ringinfo()->max_submissionrings = 2; assert(rings() == -EINVAL); cases++;
  reset(); put32(SHARED + BRCMF_SHARED_FLAGS_OFFSET, 6 | BRCMF_PCIE_SHARED_DMA_INDEX);
  assert(!init()); ringinfo()->max_completionrings = 0; assert(rings() == -EINVAL); cases++;
+ /* Ring pointers from the dongle are taken only inside the ring; the last good one stays. */
+ reset(); devinfo.state = BRCMFMAC_PCIE_STATE_UP; assert(!init() && !rings());
+ struct brcmf_pcie_ringbuf *rb = devinfo.shared.commonrings[2]; rb->devinfo = &devinfo; rb->commonring.depth = 64;
+ put16(rb->r_idx_addr, 63); put16(rb->w_idx_addr, 10);
+ assert(!brcmf_pcie_ring_mb_update_rptr(rb) && !brcmf_pcie_ring_mb_update_wptr(rb));
+ assert(rb->commonring.r_ptr == 63 && rb->commonring.w_ptr == 10);
+ put16(rb->r_idx_addr, 64); put16(rb->w_idx_addr, 0xffff);
+ assert(brcmf_pcie_ring_mb_update_rptr(rb) == -EIO && brcmf_pcie_ring_mb_update_wptr(rb) == -EIO);
+ assert(rb->commonring.r_ptr == 63 && rb->commonring.w_ptr == 10); cases++;
  /* A console descriptor or buffer outside the TCM leaves the console off; setup goes on. */
  reset(); put32(SHARED + BRCMF_SHARED_CONSOLE_ADDR_OFFSET, TCM_SIZE - 4);
  assert(!init() && !devinfo.shared.console.base_addr); cases++;
@@ -240,6 +250,10 @@ MUTATIONS = {
                      '\t\th2d_idx_len = (BRCMF_NROF_H2D_COMMON_MSGRINGS) *'),
     'dma-counts': ('\t\tif (max_submissionrings <\n\t\t    BRCMF_NROF_H2D_COMMON_MSGRINGS + max_flowrings ||\n'
                    '\t\t    max_completionrings < BRCMF_NROF_D2H_COMMON_MSGRINGS) {', '\t\tif (false) {'),
+    'rptr-depth': ('\tptr = devinfo->read_ptr(devinfo, ring->r_idx_addr);\n\tif (ptr >= commonring->depth) {',
+                   '\tptr = devinfo->read_ptr(devinfo, ring->r_idx_addr);\n\tif (false) {'),
+    'wptr-depth': ('\tptr = devinfo->read_ptr(devinfo, ring->w_idx_addr);\n\tif (ptr >= commonring->depth) {',
+                   '\tptr = devinfo->read_ptr(devinfo, ring->w_idx_addr);\n\tif (false) {'),
     'console-desc': ('\t    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr,\n'
                      '\t\t\t\t\tBRCMF_CONSOLE_WRITEIDX_OFFSET + 4)) {', '\t    false) {'),
     'console-none': ('\tif (!console->base_addr ||\n', '\tif (false ||\n'),
@@ -274,7 +288,9 @@ def main():
     defines += '#define BRCMF_NROF_COMMON_MSGRINGS (BRCMF_NROF_H2D_COMMON_MSGRINGS + BRCMF_NROF_D2H_COMMON_MSGRINGS)\n'
     structs = struct((DRIVER / 'msgbuf.h').read_text(), 'msgbuf_buf_addr') + struct(pcie, 'brcmf_pcie_dhi_ringinfo')
     body = function((DRIVER / 'pcie.h').read_text(), 'brcmf_pcie_tcm_range_valid') + ''.join(
-        function(pcie, n) for n in ('brcmf_pcie_read_idx', 'brcmf_pcie_write_idx', 'brcmf_pcie_bus_console_init', 'brcmf_pcie_bus_console_read',
+        function(pcie, n) for n in ('brcmf_pcie_read_idx', 'brcmf_pcie_write_idx',
+                                    'brcmf_pcie_ring_mb_update_rptr', 'brcmf_pcie_ring_mb_update_wptr',
+                                    'brcmf_pcie_bus_console_init', 'brcmf_pcie_bus_console_read',
                                     'brcmf_pcie_init_ringbuffers', 'brcmf_pcie_init_share_ram_info'))
     if args.mutation:
         old, new = MUTATIONS[args.mutation]

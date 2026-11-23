@@ -1459,11 +1459,20 @@ static int brcmf_pcie_ring_mb_update_rptr(void *ctx)
 	struct brcmf_pcie_ringbuf *ring = (struct brcmf_pcie_ringbuf *)ctx;
 	struct brcmf_pciedev_info *devinfo = ring->devinfo;
 	struct brcmf_commonring *commonring = &ring->commonring;
+	u16 ptr;
 
 	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP)
 		return -EIO;
 
-	commonring->r_ptr = devinfo->read_ptr(devinfo, ring->r_idx_addr);
+	/* The dongle's index is only used inside the ring; keep the last good one */
+	ptr = devinfo->read_ptr(devinfo, ring->r_idx_addr);
+	if (ptr >= commonring->depth) {
+		brcmf_err(dev_get_drvdata(&devinfo->pdev->dev),
+			  "ring %d: r_ptr %u outside depth %u\n", ring->id, ptr,
+			  commonring->depth);
+		return -EIO;
+	}
+	commonring->r_ptr = ptr;
 
 	brcmf_dbg(PCIE, "R r_ptr %d (%d), ring %d\n", commonring->r_ptr,
 		  commonring->w_ptr, ring->id);
@@ -1477,11 +1486,20 @@ static int brcmf_pcie_ring_mb_update_wptr(void *ctx)
 	struct brcmf_pcie_ringbuf *ring = (struct brcmf_pcie_ringbuf *)ctx;
 	struct brcmf_pciedev_info *devinfo = ring->devinfo;
 	struct brcmf_commonring *commonring = &ring->commonring;
+	u16 ptr;
 
 	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP)
 		return -EIO;
 
-	commonring->w_ptr = devinfo->read_ptr(devinfo, ring->w_idx_addr);
+	/* The dongle's index is only used inside the ring; keep the last good one */
+	ptr = devinfo->read_ptr(devinfo, ring->w_idx_addr);
+	if (ptr >= commonring->depth) {
+		brcmf_err(dev_get_drvdata(&devinfo->pdev->dev),
+			  "ring %d: w_ptr %u outside depth %u\n", ring->id, ptr,
+			  commonring->depth);
+		return -EIO;
+	}
+	commonring->w_ptr = ptr;
 
 	brcmf_dbg(PCIE, "R w_ptr %d (%d), ring %d\n", commonring->w_ptr,
 		  commonring->r_ptr, ring->id);

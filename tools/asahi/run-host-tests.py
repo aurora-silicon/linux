@@ -161,7 +161,8 @@ ASAHI_TESTS = {
     'brcmf-roam-tests.py': [(out(), PASS)],
     'brcmf-shared-tcm-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('shared', 'htod-mb', 'dtoh-mb', 'ring-info', 'ring-mem', 'ring-idx',
-                                   'flowring-idx', 'dma-counts', 'console-desc', 'console-none',
+                                   'flowring-idx', 'dma-counts', 'rptr-depth', 'wptr-depth',
+                                   'console-desc', 'console-none',
                                    'console-buf', 'console-widx', 'console-reinit'), out()),
     'brcmf-sae-vendor-tests.py': [(out(), PASS)]
         + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
