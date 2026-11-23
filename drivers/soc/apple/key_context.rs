@@ -493,6 +493,17 @@ impl SepData {
         }
     }
 
+    /// A suspend: every context ends (EKEYREVOKED), as when its bag locks.
+    /// Files stay usable: NEW refuses while `suspending` is set, under the
+    /// registry lock this snapshot takes, so none can start unrevoked.
+    pub(crate) fn revoke_contexts_for_sleep(&self) {
+        for context in self.context_snapshot().into_iter().flatten() {
+            context.revoke(EKEYREVOKED);
+        }
+    }
+
+    /// The driver stops: every context ends, and every file open now refuses
+    /// context requests (ENODEV).
     pub(crate) fn revoke_key_contexts(&self, reason: Error) {
         self.key_context_generation.fetch_add(1, Relaxed);
         for context in self.context_snapshot().into_iter().flatten() {

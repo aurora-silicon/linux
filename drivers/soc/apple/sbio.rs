@@ -5363,7 +5363,7 @@ impl SepData {
         };
         self.cancel_key(ENODEV);
         self.cancel_context_commands(ENODEV);
-        self.revoke_key_contexts(ENODEV);
+        self.revoke_contexts_for_sleep();
         if woke {
             dev_info_ratelimited!(
                 self.dev,
