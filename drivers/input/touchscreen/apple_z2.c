@@ -265,7 +265,8 @@ static int apple_z2_send_firmware_blob(struct apple_z2 *z2, const u8 *data,
 	return 0;
 }
 
-static int apple_z2_upload_firmware(struct apple_z2 *z2)
+static int apple_z2_load_firmware(struct apple_z2 *z2,
+				  const struct firmware *fw)
 {
 	const struct apple_z2_fw_hdr *fw_hdr;
 	size_t fw_idx = sizeof(struct apple_z2_fw_hdr);
@@ -274,13 +275,6 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 	u32 address;
 	bool init;
 	size_t size;
-
-	const struct firmware *fw __free(firmware) = NULL;
-	error = request_firmware(&fw, z2->fw_name, &z2->spidev->dev);
-	if (error) {
-		dev_err(&z2->spidev->dev, "unable to load firmware\n");
-		return error;
-	}
 
 	fw_hdr = (const struct apple_z2_fw_hdr *)fw->data;
 	if (fw->size < sizeof(*fw_hdr) ||
@@ -340,6 +334,20 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 	z2->booted = true;
 	apple_z2_read_packet(z2);
 	return 0;
+}
+
+static int apple_z2_upload_firmware(struct apple_z2 *z2)
+{
+	int error;
+
+	const struct firmware *fw __free(firmware) = NULL;
+	error = request_firmware(&fw, z2->fw_name, &z2->spidev->dev);
+	if (error) {
+		dev_err(&z2->spidev->dev, "unable to load firmware\n");
+		return error;
+	}
+
+	return apple_z2_load_firmware(z2, fw);
 }
 
 static int apple_z2_boot(struct apple_z2 *z2)
