@@ -32,5 +32,8 @@
 	status = "disabled";
 };
 
+/* The headphone jack's CS42L84 on i2c2 (t6050-jack.dtsi) */
+#include "t6050-jack.dtsi"
+
 #define T6050_J873S
 #include "t6050-peripherals.dtsi"

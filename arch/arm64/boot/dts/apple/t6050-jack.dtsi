@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The 3.5 mm headphone jack's CS42L84 codec, the same on every T6050 board
+ * that has one (from each board's ADT): on i2c2 at 0x4b, its reset line on
+ * AP pin 139, driven high to run the codec, and its interrupt on AP pin 134,
+ * level low.
+ *
+ * A board that includes this file also exposes pins 134 and 139 in its
+ * pinctrl_ap gpio-reserved-ranges. The jack only reports a plug and plays
+ * through a sound card (macaudio) whose jack link names &jack_codec; a board
+ * without one gets the codec alone.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+&i2c2 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_ap 139 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 134 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Jack";
+	};
+};

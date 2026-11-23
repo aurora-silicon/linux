@@ -170,17 +170,17 @@
 	status = "disabled";
 };
 
-&i2c2 {
-	status = "disabled";
-};
+/* The headphone jack's CS42L84 on i2c2 (t6050-jack.dtsi) */
+#include "t6050-jack.dtsi"
 
 /*
  * Pin 112's register (0x29c0001c0) takes an SError when read, so only the pins a node
- * here names are exposed: 80 (PCIe port 0's PERST#, ADT pci-bridge0 function-perst).
+ * here names are exposed: 80 (PCIe port 0's PERST#, ADT pci-bridge0 function-perst), and
+ * 134 and 139 (the jack codec's interrupt and reset).
  * A reserved line cannot be requested, so a node that names a new pin opens it here too.
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <81 140>;
+	gpio-reserved-ranges = <0 80>, <81 53>, <135 4>, <140 81>;
 };
 
 /* This board's SMC fan and power keys are not yet checked */

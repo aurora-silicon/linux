@@ -445,21 +445,21 @@
 	status = "okay";
 };
 
-/* Audio is not brought up: six sn012776 on i2c1/i2c3 and a cs42l84 on i2c2 */
+/* The speakers are not brought up: six sn012776 on i2c1/i2c3 */
 &i2c1 {
 	status = "disabled";
 };
 
-&i2c2 {
-	status = "disabled";
-};
+/* The headphone jack's CS42L84 on i2c2 (t6050-jack.dtsi) */
+#include "t6050-jack.dtsi"
 
 /*
  * Pin 112 takes an SError when read (as on the J716c), so only the pins a node
- * here names are exposed: 80 (PCIe port 0's PERST#).
+ * here names are exposed: 80 (PCIe port 0's PERST#), and 134 and 139 (the jack
+ * codec's interrupt and reset).
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <81 140>;
+	gpio-reserved-ranges = <0 80>, <81 53>, <135 4>, <140 81>;
 };
 
 /*
