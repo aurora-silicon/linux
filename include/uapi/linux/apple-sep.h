@@ -460,9 +460,15 @@ struct sep_key_unseal_password {
  * AUTH) ends that request, such as an AUTH waiting for a finger.
  * Outcome: 0 authenticated, 1 not matched or wrong password, 5 failed.
  * Errors: EOPNOTSUPP without the feature, EKEYEXPIRED once the
- * context has ended, EPERM outside its scope, EBUSY while another request
- * runs or when a Touch ID verify or enrolment on /dev/sep-bio wants the
- * sensor during an AUTH, ECANCELED when cancelled, ETIMEDOUT at timeout_ms.
+ * context's lifetime has passed, EKEYREVOKED once it was ended early (REVOKE,
+ * the bag locking, a suspend, a failed AUTH), EPERM outside its scope, EBUSY
+ * while another request runs or when a Touch ID verify or enrolment on
+ * /dev/sep-bio wants the sensor during an AUTH, ECANCELED when cancelled,
+ * ETIMEDOUT at timeout_ms, ENODEV once the driver has stopped (every file
+ * open then refuses context requests; open /dev/sep-key again). At most 16
+ * contexts are live at once; a closed one frees its slot once the enclave
+ * has deleted its credential, so NEW right after a close may briefly get
+ * ENOSPC.
  */
 #define SEP_KEY_CTX_NEW_BAG       0x1
 #define SEP_KEY_CTX_LIFETIME_MAX  (12 * 3600)
