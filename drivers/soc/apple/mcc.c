@@ -43,8 +43,8 @@ struct apple_mcc {
 	bool enabled;
 	bool retained;
 	/*
-	 * T8142 and T6041: a deep sleep also turns the cache's ways off, as macOS does where the
-	 * ADT has no skip-mcc-off-to-s2r, and the wake puts the boot's way count back.
+	 * T8142 and T6041: a deep sleep also turns the cache's ways off, where no
+	 * skip-mcc-off-to-s2r is set, and the wake puts the boot's way count back.
 	 */
 	bool ways_off;
 	u32 ways;
@@ -347,7 +347,7 @@ static int apple_mcc_suspend_noirq(struct device *dev)
 		return 0;
 	apple_mcc_quiesce(mcc);
 	/*
-	 * T8142 and T6041 have no skip-mcc-off-to-s2r (T8140's J700 does), so macOS turns the ways
+	 * T8142 and T6041 have no skip-mcc-off-to-s2r (T8140's J700 does), so the ways are turned
 	 * off before the sleep: way count 0. The flush above (the kext's own cacheFlush) has
 	 * written everything back already, so a timeout here loses nothing and only leaves
 	 * the ways as they were.

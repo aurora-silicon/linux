@@ -11610,7 +11610,7 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 		if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp))
 			dev_warn(dev, "display calls still in flight after the power-off\n");
 		/*
-		 * An external one's system power state off, as macOS's sleep sends it: the
+		 * An external one's system power state off before the sleep: the
 		 * firmware takes the same call with state 1 after the wake only after this one.
 		 */
 		if (external && iomfb_system_power_v26_6_desktop(dcp, false))
@@ -12364,8 +12364,8 @@ static void dcp_t6040_fixed_phy_up(struct apple_dcp *dcp)
 }
 
 /*
- * An external DCP's firmware back after a T6040 S2R: the system power state on again, as
- * macOS sends it after a wake (the controller is off until then), then the link as after the
+ * An external DCP's firmware back after a T6040 S2R: the system power state on again
+ * after a wake (the controller is off until then), then the link as after the
  * firmware start at bind (dcp_wait_ready()): a Type-C cable or the HDMI port's HPD connects it
  * again, and the HPD interrupt is on again. The next sleep's stop waits for this.
  */

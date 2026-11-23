@@ -1746,7 +1746,7 @@ static int t6040_dp_seq_step(struct t6040_usb2_phy *tphy, const struct atc_op *s
 /*
  * A lane's registers are back at their reset values each time the lane has been powered
  * down: after one link at a rate, one DPMS cycle or one failed training, the lane tables
- * of the ADT and the DPTX lane tunables were gone for every link that followed. Write them
+ * and the DPTX lane tunables were gone for every link that followed. Write them
  * again once the link sequence has the lanes up.
  */
 static void t6040_dp_lane_tunables(struct t6040_usb2_phy *tphy)
@@ -2393,7 +2393,7 @@ EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_open);
 /* ---- CIO: USB4/Thunderbolt (PHY mode 2) ----
  *
  * The PHY init for mode 2 with the orientation: the power-up reset (shared
- * with USB3), the generic ADT tables, the CIO core tunables (the same
+ * with USB3), the generic tunable tables, the CIO core tunables (the same
  * three core tables as USB3) and the CIO-only tunables (the CIO lane
  * tables, applied in every CIO session: nothing on the PHY side picks 40G or
  * 80G), the mode-2 crossbar, the mode-2 sleep-control init (common and both
@@ -2411,7 +2411,7 @@ EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_open);
  * router has asked for it.
  */
 
-/* The ADT tables of the CIO-only tunables, in order; lane0/1 are required. */
+/* The tables of the CIO-only tunables, in order; lane0/1 are required. */
 static const char * const t6040_cio_tunable_props[] = {
 	"apple,tunable-cio-uc-regs",	/* tunable_UC_REGS_CIO_DFLT, core + 0x400 */
 	"apple,tunable-cio-lane0",	/* tunable_LN0_RX_TOP_CIO_DFLT, core + 0x9000 */
