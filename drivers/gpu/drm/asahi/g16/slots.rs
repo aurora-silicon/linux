@@ -1025,7 +1025,8 @@ impl Slots {
         if f.slot_count as usize >= f.slot.len() {
             return Ok(None);
         }
-        // Round robin over this VM's units eligible for `pipe`: pipe 0 spans `0..n`, while
+        // Prefer a warm unit already owned by `vm_id` (`!scrub_full`), then an unowned unit,
+        // before falling back to round-robin over `start..n`: pipe 0 spans `0..n`, while
         // secondary pipes stay in `BASE_COMPUTE_UNITS..n` so base units `0..2` only ever hold
         // pipe-0 leases and a 2-unit VM can never hit `compute_exhausted_within(2)`.
         let n = units.compute_units()?.min(sizes::COMPUTE_UNITS);
@@ -1039,28 +1040,58 @@ impl Slots {
         }
         let span = n - start;
         let base_cursor = (self.cursor as usize).saturating_sub(start) % span;
-        for i in 0..span {
-            let k = start + (base_cursor + i) % span;
-            if self.compute.lifetime.claim(k) {
-                let full = self.compute.scrub_full[k]
-                    || vm_id.is_none_or(|id| {
-                        self.compute.owner[k]
-                            .as_ref()
-                            .is_none_or(|prev| prev.id != id)
-                    });
-                if let Err(e) = units.compute_unit(k).and_then(|unit| unit.scrub(full)) {
-                    self.compute.lifetime.cancel(k);
-                    return Err(e);
+        let mut chosen = None;
+        if let Some(id) = vm_id {
+            for i in 0..span {
+                let k = start + (base_cursor + i) % span;
+                if !self.compute.scrub_full[k]
+                    && self.compute.owner[k]
+                        .as_ref()
+                        .is_some_and(|prev| prev.id == id)
+                    && self.compute.lifetime.claim(k)
+                {
+                    chosen = Some(k);
+                    break;
                 }
-                self.compute.last_full[k] = full;
-                f.slot[f.slot_count as usize] = k as u32;
-                f.slot_count += 1;
-                f.compute_pipe = pipe as u8;
-                self.cursor = ((k + 1) % n) as u32;
-                return Ok(Some(k));
+            }
+            if chosen.is_none() {
+                for i in 0..span {
+                    let k = start + (base_cursor + i) % span;
+                    if self.compute.owner[k].is_none() && self.compute.lifetime.claim(k) {
+                        chosen = Some(k);
+                        break;
+                    }
+                }
             }
         }
-        Ok(None)
+        if chosen.is_none() {
+            for i in 0..span {
+                let k = start + (base_cursor + i) % span;
+                if self.compute.lifetime.claim(k) {
+                    chosen = Some(k);
+                    break;
+                }
+            }
+        }
+        let Some(k) = chosen else {
+            return Ok(None);
+        };
+        let full = self.compute.scrub_full[k]
+            || vm_id.is_none_or(|id| {
+                self.compute.owner[k]
+                    .as_ref()
+                    .is_none_or(|prev| prev.id != id)
+            });
+        if let Err(e) = units.compute_unit(k).and_then(|unit| unit.scrub(full)) {
+            self.compute.lifetime.cancel(k);
+            return Err(e);
+        }
+        self.compute.last_full[k] = full;
+        f.slot[f.slot_count as usize] = k as u32;
+        f.slot_count += 1;
+        f.compute_pipe = pipe as u8;
+        self.cursor = ((k + 1) % n) as u32;
+        Ok(Some(k))
     }
     #[allow(dead_code)]
     pub(crate) fn pick_pass(

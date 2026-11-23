@@ -1755,6 +1755,73 @@ pub mod g16 {
         assert!(p.reusable_for_within(1, &vm1, 2, 2048).is_some());
     }
 
+    #[test]fn vm_affine_compute_claiming_keeps_four_interleaved_vms_warm(){
+        let mut o = Objects::new();
+        let mut s = Slots::new().unwrap();
+        let mut units = KVec::new();
+        for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
+            units.push(g16::slots::ComputeSlot::new(&mut o, k).unwrap(), 0).unwrap();
+        }
+        let prep = g16::resources::ComputeArena { compute: units, render: None };
+        let vms = [vm(1), vm(2), vm(3), vm(4)];
+        // Round 0 warms one unit per VM (4 units out of 24); VM2's retirement displaces VM1's
+        // unit immediately so from round 1 onward every sequential interleaved claim is warm.
+        for v in &vms {
+            let mut c = Claims::new();
+            let k = s.claim_compute_for(&prep, &mut c, Some(v.id)).unwrap().unwrap();
+            assert!(s.compute_needs_full_work(k));
+            s.hold_vm(&c, v).unwrap();
+            s.publish(&mut c).unwrap();
+            s.note_published(&c);
+            s.retire(&mut c).unwrap();
+        }
+        assert_eq!(s.stats.cross_vm_retargets[0], 0);
+        for _round in 0..4 {
+            for v in &vms {
+                let mut c = Claims::new();
+                let k = s.claim_compute_for(&prep, &mut c, Some(v.id)).unwrap().unwrap();
+                assert!(!s.compute_needs_full_work(k));
+                s.hold_vm(&c, v).unwrap();
+                s.publish(&mut c).unwrap();
+                s.note_published(&c);
+                s.retire(&mut c).unwrap();
+            }
+        }
+        assert_eq!(s.stats.cross_vm_retargets[0], 0);
+        // Pipelined depth-2 per VM across 4 concurrent VMs warms one additional unit per VM
+        // from the unowned pool and then reuses warm VM-owned units with zero cross-VM scrubs.
+        let mut live: Vec<Claims> = Vec::new();
+        for (idx, v) in vms.iter().enumerate() {
+            let mut c = Claims::new();
+            let k = s.claim_compute_for(&prep, &mut c, Some(v.id)).unwrap().unwrap();
+            if idx < 3 {
+                assert!(!s.compute_needs_full_work(k));
+            }
+            s.hold_vm(&c, v).unwrap();
+            s.publish(&mut c).unwrap();
+            s.note_published(&c);
+            live.push(c);
+        }
+        for _round in 0..4 {
+            for (idx, v) in vms.iter().enumerate() {
+                let mut c = Claims::new();
+                let k = s.claim_compute_for(&prep, &mut c, Some(v.id)).unwrap().unwrap();
+                if _round > 0 {
+                    assert!(!s.compute_needs_full_work(k));
+                }
+                s.hold_vm(&c, v).unwrap();
+                s.publish(&mut c).unwrap();
+                s.note_published(&c);
+                let mut old = std::mem::replace(&mut live[idx], c);
+                s.retire(&mut old).unwrap();
+            }
+        }
+        for mut c in live {
+            s.retire(&mut c).unwrap();
+        }
+        assert_eq!(s.stats.cross_vm_retargets[0], 0);
+    }
+
 }
 '''
 poll_source = (production/'poll.rs').read_text()
