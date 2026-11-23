@@ -49,14 +49,22 @@
 		label = "atc2-common";
 	};
 
-	/* These islands stay owned by the firmware session inherited from iBoot. */
+	/*
+	 * These islands stay owned by the firmware session inherited from iBoot:
+	 * as apple,firmware-owned domains they are always on for Linux, which
+	 * never reads or changes them. They are left enabled because &display
+	 * lists dispext1_dart, which the loader enables together with dcpext1
+	 * when it hands the session over (aura#409, dt_set_t8142_dcpext()); a
+	 * disabled state would leave that DART waiting for its domain. When the
+	 * loader does not hand dcpext1 over, it keeps dcpext1 and its DARTs
+	 * disabled and prunes dispext1_dart from &display, so nothing uses them.
+	 */
 	ps_dispext1_sys: power-controller@2b8 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2b8 4>;
 		#power-domain-cells = <0>;
 		apple,firmware-owned;
 		label = "dispext1-sys";
-		status = "disabled";
 	};
 
 	ps_dispext1_fe: power-controller@3a8 {
@@ -66,7 +74,6 @@
 		power-domains = <&ps_dispext1_sys>;
 		apple,firmware-owned;
 		label = "dispext1-fe";
-		status = "disabled";
 	};
 
 	ps_dispext1_cpu: power-controller@3b8 {
@@ -76,7 +83,6 @@
 		power-domains = <&ps_dispext1_fe>;
 		apple,firmware-owned;
 		label = "dispext1-cpu";
-		status = "disabled";
 	};
 };
 
