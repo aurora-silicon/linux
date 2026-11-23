@@ -986,7 +986,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		lc->lane_count = cpu_to_le64(dptx->lane_count);
 		return 0;
 	}
-        case DPTX_APCALL_SET_ACTIVE_LANE_COUNT:
+	case DPTX_APCALL_SET_ACTIVE_LANE_COUNT:
 		return dptxport_call_link_config(service, true, data, data_size,
 						 reply, reply_size);
 	case DPTX_APCALL_GET_SUPPORTS_HPD:
@@ -1059,7 +1059,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 						     reply, reply_size);
 		return dptxport_call_set_drive_settings(service, data, data_size,
 							reply, reply_size);
-        case DPTX_APCALL_ACTIVATE:
+	case DPTX_APCALL_ACTIVATE:
 		return dptxport_call_activate(service, data, data_size,
 					      reply, reply_size);
 	case DPTX_APCALL_DEACTIVATE:

@@ -84,6 +84,9 @@ pub(crate) struct Variant {
     pub(crate) programs: super::render::RegisterPrograms,
     /// Use 0x1c890 = 1, 0x1c918 = 0 in V25G83-format tiling arrays (device/build policy).
     pub(crate) ta_mode_1: bool,
+    /// The normal maximum of a G17P tiler heap in blocks, which bounds host growth and the
+    /// firmware's own (device/build policy).
+    pub(crate) tvb_normal_blocks: usize,
     pub(crate) compute: super::compute::ComputeProgram,
     pub(crate) opening_record: bool,
     pub(crate) split_firmware_area: bool,
@@ -99,8 +102,8 @@ pub(crate) struct Variant {
     /// A context takes its render pool identity when it is created, not at its first render,
     /// so that identities held by render graphs kept until the firmware stops refuse new
     /// contexts with an error instead of failing a context's first render. Set for the A18
-    /// Pro only: the M4 Pro and Max keep the first-render claim until the claim at creation has
-    /// been tested on that hardware.
+    /// Pro and M4 Max (`25G83`/`26B123`); M4 Pro and M4 Max `25F84` keep the first-render
+    /// claim until tested on that hardware.
     pub(crate) render_id_at_create: bool,
     /// Cached descriptor storage, queue records and queue configuration that come back
     /// after their owner's release was consumed are reused once the firmware has consumed
@@ -109,6 +112,9 @@ pub(crate) struct Variant {
     /// an M4 Pro crash on a recycled work state; extending this needs a create/destroy-heavy
     /// queue test on that hardware.
     pub(crate) objects_after_release: bool,
+    /// What the firmware reports in its statistics ring beyond utilisation
+    /// ([`crate::g17::telemetry::Protocol`]).
+    pub(crate) telemetry_protocol: crate::g17::telemetry::Protocol,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -156,6 +162,7 @@ pub(crate) const V26A428: Variant = Variant {
     lead_commands: false,
     programs: super::render::RegisterPrograms::G17P,
     ta_mode_1: false,
+    tvb_normal_blocks: super::buffer::NORMAL_MAX_BLOCKS,
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
@@ -164,6 +171,7 @@ pub(crate) const V26A428: Variant = Variant {
     registration_power_hold: true,
     render_id_at_create: true,
     objects_after_release: true,
+    telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_16MS,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -197,6 +205,7 @@ pub(crate) const V25G83: Variant = Variant {
     lead_commands: true,
     programs: super::render::RegisterPrograms::V25G83,
     ta_mode_1: false,
+    tvb_normal_blocks: super::buffer::NORMAL_MAX_BLOCKS,
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
@@ -205,6 +214,7 @@ pub(crate) const V25G83: Variant = Variant {
     registration_power_hold: true,
     render_id_at_create: false,
     objects_after_release: false,
+    telemetry_protocol: crate::g17::telemetry::Protocol::NONE,
 };
 
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
@@ -217,6 +227,7 @@ pub(crate) const V26A428_M5: Variant = Variant {
     registration_power_hold: false,
     render_id_at_create: false,
     objects_after_release: false,
+    telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_8MS,
     ..V26A428
 };
 

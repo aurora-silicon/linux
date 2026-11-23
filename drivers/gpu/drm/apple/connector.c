@@ -84,7 +84,7 @@ static int chunk_show(struct seq_file *m,
 	}
 
 	if (chunk)
-                seq_write(m, chunk->data, chunk->length);
+		seq_write(m, chunk->data, chunk->length);
 
 	mutex_unlock(&apple_con->chunk_lock);
 
@@ -94,18 +94,18 @@ static int chunk_show(struct seq_file *m,
 #define CONNECTOR_DEBUGFS_ENTRY(name, type) \
 static int chunk_ ## name ## _show(struct seq_file *m, void *data) \
 { \
-        return chunk_show(m, type); \
+	return chunk_show(m, type); \
 } \
 static int chunk_ ## name ## _open(struct inode *inode, struct file *file) \
 { \
-        return single_open(file,  chunk_ ## name ## _show, inode->i_private); \
+	return single_open(file,  chunk_ ## name ## _show, inode->i_private); \
 } \
 static const struct file_operations chunk_ ## name ## _fops = { \
-        .owner = THIS_MODULE, \
-        .open = chunk_ ## name ## _open, \
-        .read = seq_read, \
-        .llseek = seq_lseek, \
-        .release = single_release, \
+	.owner = THIS_MODULE, \
+	.open = chunk_ ## name ## _open, \
+	.read = seq_read, \
+	.llseek = seq_lseek, \
+	.release = single_release, \
 }
 
 CONNECTOR_DEBUGFS_ENTRY(color, DCP_CHUNK_COLOR_ELEMENTS);
@@ -170,7 +170,7 @@ void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry
         debugfs_create_file("DisplayAttributes", 0444, root, apple_con,
                             &chunk_display_attribs_fops);
         debugfs_create_file("Transport", 0444, root, apple_con,
-                            &chunk_transport_fops);
+			    &chunk_transport_fops);
 
 	switch (connector->connector_type) {
 	case DRM_MODE_CONNECTOR_DisplayPort:

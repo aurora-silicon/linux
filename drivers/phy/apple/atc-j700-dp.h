@@ -483,7 +483,7 @@ static int j700_dp_configure(struct apple_atcphy *p, const struct phy_configure_
 	if (p->mode != APPLE_ATCPHY_MODE_DP && p->mode != APPLE_ATCPHY_MODE_USB3_DP)
 		return -EINVAL;
 	mode = atcphy_get_mode_config(p, p->mode);
-	pmas = !!mode->dp_lane[0] | (!!mode->dp_lane[1] << 1);
+	pmas = mode->dp_lane[0] | (mode->dp_lane[1] << 1);
 	capacity = 2 * hweight32(pmas);
 	if (o->lanes > capacity || (o->set_lanes && o->lanes != 1 &&
 				    o->lanes != 2 && o->lanes != 4))

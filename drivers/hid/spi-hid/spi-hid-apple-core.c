@@ -105,6 +105,8 @@ struct spihid_apple {
 	wait_queue_head_t wait;
 	struct mutex tx_lock; //< protects against concurrent SPI writes
 	struct mutex get_report_lock; /* serializes synchronous GET_REPORTs */
+	/* GETs a retry recovered after a bad status; get_report_lock */
+	unsigned int get_report_recovered;
 	spinlock_t reply_lock; /* protects reply state shared with the IRQ thread */
 
 	struct spi_message rx_msg;
@@ -440,7 +442,7 @@ static int spihid_get_report(struct spihid_apple *spihid,
 {
 	unsigned long flags;
 	int attempt, ret;
-	unsigned int rejected = 0;
+	unsigned int rejected = 0, recovered = 0;
 	bool bad_status, timed_out;
 
 	ret = mutex_lock_interruptible(&spihid->get_report_lock);
@@ -471,11 +473,16 @@ static int spihid_get_report(struct spihid_apple *spihid,
 
 		/*
 		 * RX CRC validation can discard a reply even after a valid
-		 * write status. A valid GET can also receive a bad status,
-		 * including the first dimensions query after enabling MT.
-		 * Retry either with a fresh ID, sharing the attempt limit.
-		 * Keep SPI errors (even -EPROTO) and signals distinct from
-		 * status mismatches so they are never replayed.
+		 * write status. A valid GET can also receive a bad status:
+		 * the M1 Pro trackpad answers 9c 17 e5 f8 to the first
+		 * dimensions query after the multitouch SET on about one boot
+		 * in four. That is the status a report the device does not
+		 * have gets, so the mode switch may complete only after the
+		 * SET is acknowledged; nothing here waits for it. The cause is
+		 * not established (aurora-silicon/linux#2316), so retry either
+		 * case with a fresh ID, sharing the attempt limit, and count
+		 * the recoveries. Keep SPI errors (even -EPROTO) and signals
+		 * distinct from status mismatches so they are never replayed.
 		 */
 		if (!timed_out && !bad_status)
 			break;
@@ -483,6 +490,8 @@ static int spihid_get_report(struct spihid_apple *spihid,
 			rejected++;
 	}
 
+	if (ret >= 0 && rejected)
+		recovered = ++spihid->get_report_recovered;
 	mutex_unlock(&spihid->get_report_lock);
 	if (ret < 0 && rejected)
 		dev_err(&spihid->spidev->dev,
@@ -493,8 +502,8 @@ static int spihid_get_report(struct spihid_apple *spihid,
 			"get report %02x failed: %d\n", reportnum, ret);
 	else if (rejected)
 		dev_info_ratelimited(&spihid->spidev->dev,
-				     "get report %02x recovered by retry (bad status: %u)\n",
-				     reportnum, rejected);
+				     "get report %02x recovered by retry (bad status: %u; %u GETs recovered since probe)\n",
+				     reportnum, rejected, recovered);
 	return ret;
 }
 
