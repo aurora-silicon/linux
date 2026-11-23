@@ -302,7 +302,8 @@ static int ane_iommu_reserve(struct ane_device *ane, struct ane_bo *bo)
 	/* reserve area from ANE address space */
 	err = drm_mm_insert_node_generic(&ane->mm, bo->mm,
 					 ane_bo_iova_size(bo->npages, ane->shift),
-					 1UL << ane->shift, 0, 0);
+					 1UL << ane->shift, ANE_MM_BO_UNMAPPED,
+					 0);
 	mutex_unlock(&ane->iommu_lock);
 	if (err < 0) {
 		dev_err(ane->dev, "out of ANE space: %d\n", err);
@@ -315,7 +316,15 @@ static int ane_iommu_reserve(struct ane_device *ane, struct ane_bo *bo)
 	return 0;
 }
 
-/* Put the pages of a BO with a reserved range into the DART. */
+/*
+ * Put the pages of a BO with a reserved range into the DART. A fault
+ * drain may have put a scratch page into the range of a BO that is not in
+ * the DART (ane_dart_drain_fault()); the scratch pages are released when
+ * the faulting job completes or at the recovery after it, both before any
+ * later SUBMIT gets here, so such a page is never found here. Refuse it
+ * anyway: mapping over it would take the scratch PTE for a stray and
+ * clear it, and the scratch release would then unmap the BO's page.
+ */
 static int ane_bo_dart_map(struct ane_device *ane, struct ane_bo *bo)
 {
 	int err;
@@ -325,12 +334,16 @@ static int ane_bo_dart_map(struct ane_device *ane, struct ane_bo *bo)
 		return 0;
 	if (!bo->mm)
 		return -EINVAL;
+	if (WARN_ON_ONCE(ane_dart_scratch_in(ane, bo->mm)))
+		return -EBUSY;
 
 	mutex_lock(&ane->iommu_lock);
 	if (READ_ONCE(map_batch))
 		err = ane_iommu_map_batch(ane, bo, bo->prot);
 	else
 		err = ane_iommu_map_each(ane, bo, bo->prot);
+	if (!err)
+		bo->mm->color = ANE_MM_BO_MAPPED;
 	mutex_unlock(&ane->iommu_lock);
 	if (err < 0)
 		return err;
@@ -361,6 +374,7 @@ static void ane_bo_dart_unmap(struct ane_device *ane, struct ane_bo *bo)
 			bo->iova, size, unmapped);
 		ane_iommu_clear_range(ane, bo->iova, bo->iova + size);
 	}
+	bo->mm->color = ANE_MM_BO_UNMAPPED;
 	mutex_unlock(&ane->iommu_lock);
 
 	list_del_init(&bo->mapped_node);
@@ -379,6 +393,8 @@ static void ane_iommu_unmap_pages(struct ane_device *ane, struct ane_bo *bo)
 
 	list_del_init(&bo->node);
 	ane_bo_dart_unmap(ane, bo);
+	/* ane_gem_free_object() preserves a range that holds a drain page. */
+	WARN_ON_ONCE(ane_dart_scratch_in(ane, mm));
 	mutex_lock(&ane->iommu_lock);
 	drm_mm_remove_node(mm);
 	bo->mm = NULL;
@@ -438,12 +454,17 @@ struct ane_preserved {
 	struct drm_mm_node *mm;
 	struct page **pages;
 	u32 npages;
+	/* The BO's pages were in the DART, not only drain pages. */
+	bool mapped;
 };
 
 static void ane_preserve_bo(struct ane_device *ane, struct ane_bo *bo)
 {
 	struct ane_preserved *p;
 
+	mutex_lock(&ane->iommu_lock);
+	bo->mm->color = ANE_MM_PRESERVED;
+	mutex_unlock(&ane->iommu_lock);
 	p = kzalloc_obj(*p);
 	if (!p) {
 		/* Fail closed the old way: the node stays inserted and the
@@ -457,6 +478,7 @@ static void ane_preserve_bo(struct ane_device *ane, struct ane_bo *bo)
 	p->mm = bo->mm;
 	p->pages = bo->pages;
 	p->npages = bo->npages;
+	p->mapped = bo->mapped;
 	list_add_tail(&p->list, &ane->preserved_list);
 	bo->mm = NULL;
 	bo->pages = NULL;
@@ -475,7 +497,8 @@ void ane_reclaim_preserved(struct ane_device *ane)
 		u64 iova = p->mm->start;
 
 		mutex_lock(&ane->iommu_lock);
-		for (u32 i = 0; i < p->npages; i++) {
+		/* Its drain pages went with the scratch release above. */
+		for (u32 i = 0; p->mapped && i < p->npages; i++) {
 			size_t unmapped;
 
 			unmapped = iommu_unmap(ane->domain,
@@ -540,7 +563,13 @@ static void ane_gem_free_object(struct drm_gem_object *gem)
 
 	mutex_lock(&ane->engine_lock);
 	if (bo->mm) {
-		if (atomic_read(&ane->wedged) && bo->mapped) {
+		/*
+		 * A drain page in the range of a BO that is not in the DART
+		 * stays until the recovery that follows the wedge, and the
+		 * range must stay reserved until then.
+		 */
+		if ((atomic_read(&ane->wedged) && bo->mapped) ||
+		    ane_dart_scratch_in(ane, bo->mm)) {
 			/* Fail closed: keep the mapping and the pages so no
 			 * IOVA is torn down or page reused underneath active
 			 * DMA. The range's node stays reserved and tracked
@@ -554,8 +583,8 @@ static void ane_gem_free_object(struct drm_gem_object *gem)
 			dev_err(ane->dev, "wedged: preserving bo mapping\n");
 			list_del_init(&bo->node);
 			list_del_init(&bo->mapped_node);
-			bo->mapped = false;
 			ane_preserve_bo(ane, bo);
+			bo->mapped = false;
 		} else {
 			ane_iommu_unmap_pages(ane, bo);
 		}
@@ -1486,9 +1515,10 @@ static void ane_platform_remove(struct platform_device *pdev)
 		return;
 	}
 
+	/* Drain pages first: they may sit in the range of a listed BO. */
+	ane_reclaim_preserved(ane);
 	list_for_each_entry_safe(bo, tmp, &ane->bo_list, node)
 		ane_iommu_unmap_pages(ane, bo);
-	ane_reclaim_preserved(ane);
 	drm_mm_takedown(&ane->mm);
 
 	ane_detach_genpd(ane);

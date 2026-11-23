@@ -10,6 +10,8 @@
 #include <linux/mm.h>
 #include <linux/sizes.h>
 
+#include <drm/drm_mm.h>
+
 #include "ane.h"
 
 struct ane_submit_size_case {
@@ -237,10 +239,111 @@ static void ane_dart_scratch_page_zeroed_test(struct kunit *test)
 	}
 }
 
+/*
+ * Where a fault-drain page may go. The H13 layout: 16 KiB DART pages,
+ * BO ranges packed back to back by the allocator. A job's buffer is in
+ * the DART (MAPPED); the next BO, of this or another file, is not
+ * (UNMAPPED), so a read a few bytes past the job's buffer faults in the
+ * neighbour's range.
+ */
+#define ANE_TEST_PG SZ_16K
+
+static struct drm_mm_node *ane_test_node(struct kunit *test, struct drm_mm *mm,
+					 u64 page, u64 pages,
+					 enum ane_mm_owner owner)
+{
+	struct drm_mm_node *node = kunit_kzalloc(test, sizeof(*node),
+						  GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, node);
+	node->start = page * ANE_TEST_PG;
+	node->size = pages * ANE_TEST_PG;
+	node->color = owner;
+	KUNIT_ASSERT_EQ(test, drm_mm_reserve_node(mm, node), 0);
+	return node;
+}
+
+static void ane_dart_scratch_slot_test(struct kunit *test)
+{
+	struct drm_mm_node *job, *next, *other, *scratch, *kept, *host;
+	struct drm_mm mm;
+
+	/* One page above zero up to 64 pages. */
+	drm_mm_init(&mm, ANE_TEST_PG, 63 * ANE_TEST_PG);
+	job = ane_test_node(test, &mm, 1, 4, ANE_MM_BO_MAPPED);
+	next = ane_test_node(test, &mm, 5, 3, ANE_MM_BO_UNMAPPED);
+	other = ane_test_node(test, &mm, 8, 2, ANE_MM_BO_UNMAPPED);
+	scratch = ane_test_node(test, &mm, 12, 1, ANE_MM_SCRATCH);
+	kept = ane_test_node(test, &mm, 13, 2, ANE_MM_PRESERVED);
+
+	/* Past the end of the job's buffer: the packed neighbour. */
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 5 * ANE_TEST_PG,
+						    ANE_TEST_PG, &host), 0);
+	KUNIT_EXPECT_PTR_EQ(test, host, next);
+	/* Inside and at the last page of a buffer the job does not name. */
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 6 * ANE_TEST_PG,
+						    ANE_TEST_PG, &host), 0);
+	KUNIT_EXPECT_PTR_EQ(test, host, next);
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 9 * ANE_TEST_PG,
+						    ANE_TEST_PG, &host), 0);
+	KUNIT_EXPECT_PTR_EQ(test, host, other);
+	/* A hole: the drain reserves its own node. */
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 10 * ANE_TEST_PG,
+						    ANE_TEST_PG, &host), 0);
+	KUNIT_EXPECT_NULL(test, host);
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 40 * ANE_TEST_PG,
+						    ANE_TEST_PG, &host), 0);
+	KUNIT_EXPECT_NULL(test, host);
+	/* Ranges with PTEs cannot take a drain page. */
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 4 * ANE_TEST_PG,
+						    ANE_TEST_PG, &host), -EBUSY);
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 12 * ANE_TEST_PG,
+						    ANE_TEST_PG, &host), -EBUSY);
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 14 * ANE_TEST_PG,
+						    ANE_TEST_PG, &host), -EBUSY);
+	KUNIT_EXPECT_NULL(test, host);
+	/* Past the end of the allocator range. */
+	KUNIT_EXPECT_NE(test, ane_dart_scratch_slot(&mm, 64 * ANE_TEST_PG,
+						    ANE_TEST_PG, &host), 0);
+	KUNIT_EXPECT_NE(test, ane_dart_scratch_slot(&mm, U64_MAX & ~(u64)(ANE_TEST_PG - 1),
+						    ANE_TEST_PG, &host), 0);
+
+	drm_mm_remove_node(job);
+	drm_mm_remove_node(next);
+	drm_mm_remove_node(other);
+	drm_mm_remove_node(scratch);
+	drm_mm_remove_node(kept);
+	drm_mm_takedown(&mm);
+}
+
+/*
+ * A BO whose range holds a drain page must not be mapped or have its
+ * range freed until the drain page is released.
+ */
+static void ane_dart_scratch_in_test(struct kunit *test)
+{
+	struct ane_device *ane = kunit_kzalloc(test, sizeof(*ane), GFP_KERNEL);
+	struct drm_mm_node a = {}, b = {};
+
+	KUNIT_ASSERT_NOT_NULL(test, ane);
+	KUNIT_EXPECT_FALSE(test, ane_dart_scratch_in(ane, &a));
+	ane->scratch[0].host = NULL;	/* a page in a hole */
+	ane->scratch[1].host = &b;
+	ane->scratch_pages = 2;
+	KUNIT_EXPECT_FALSE(test, ane_dart_scratch_in(ane, &a));
+	KUNIT_EXPECT_TRUE(test, ane_dart_scratch_in(ane, &b));
+	KUNIT_EXPECT_FALSE(test, ane_dart_scratch_in(ane, NULL));
+	/* Released: the count is what the drain and release maintain. */
+	ane->scratch_pages = 0;
+	KUNIT_EXPECT_FALSE(test, ane_dart_scratch_in(ane, &b));
+}
+
 static struct kunit_case ane_bo_test_cases[] = {
 	KUNIT_CASE(ane_bo_iova_size_test),
 	KUNIT_CASE_PARAM(ane_bo_check_size_test, ane_bo_size_gen_params),
 	KUNIT_CASE(ane_dart_scratch_page_zeroed_test),
+	KUNIT_CASE(ane_dart_scratch_slot_test),
+	KUNIT_CASE(ane_dart_scratch_in_test),
 	{}
 };
 

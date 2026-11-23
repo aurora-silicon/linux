@@ -20,10 +20,33 @@
 #define ANE_DART_MAX 3
 #define ANE_DART_SCRATCH_MAX 16
 
+/*
+ * What owns a node of ane_device.mm, kept in drm_mm_node.color (the
+ * allocator has no color_adjust, so the color only labels the node).
+ * Written under iommu_lock.
+ */
+enum ane_mm_owner {
+	ANE_MM_NONE,
+	/* A BO's range, its pages not in the DART. */
+	ANE_MM_BO_UNMAPPED,
+	/* A BO's range, its pages in the DART. */
+	ANE_MM_BO_MAPPED,
+	/* A fault-drain page in a hole, reserved by the drain. */
+	ANE_MM_SCRATCH,
+	/* The range of a BO freed while wedged (ane_preserve_bo()). */
+	ANE_MM_PRESERVED,
+};
+
+/*
+ * A fault-drain page. @node is the node the drain reserved for a page in
+ * a hole; @host is the node of an unmapped BO whose range holds the page.
+ * Exactly one of them is set.
+ */
 struct ane_dart_scratch {
 	u64 iova;
 	struct page *page;
 	struct drm_mm_node *node;
+	struct drm_mm_node *host;
 };
 
 struct ane_device {
@@ -237,6 +260,8 @@ static inline bool ane_tm_failure_recoverable(bool tm_retention,
 u64 ane_bo_iova_size(u32 npages, unsigned int shift);
 int ane_bo_check_size(u64 size, u64 iova_span);
 struct page *ane_dart_alloc_scratch_page(void);
+int ane_dart_scratch_slot(struct drm_mm *mm, u64 iova, u64 size,
+			  struct drm_mm_node **host);
 int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
 			   size_t btsp_size);
 #endif
@@ -267,5 +292,6 @@ int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova,
 			 struct ane_dart_scratch *scratch, int *pages);
 void ane_dart_release_scratch(struct ane_device *ane,
 			      struct ane_dart_scratch *scratch, int pages);
+bool ane_dart_scratch_in(struct ane_device *ane, struct drm_mm_node *host);
 
 #endif /* __ANE_H__ */
