@@ -207,6 +207,10 @@ int main(void)
  assert(!init() && !devinfo.shared.console.base_addr && !devinfo.shared.console.bufsize); cases++;
  reset(); put32(CONS + BRCMF_CONSOLE_BUFSIZE_OFFSET, 0xffffffff);
  assert(!init() && !devinfo.shared.console.base_addr); cases++;
+ /* No console reported: nothing is read at address 0, and a partial line is dropped. */
+ reset(); assert(!init()); devinfo.shared.console.log_idx = 5; put32(SHARED + BRCMF_SHARED_CONSOLE_ADDR_OFFSET, 0);
+ reads = 0; brcmf_pcie_bus_console_init(&devinfo);
+ assert(reads == 1 && !devinfo.shared.console.base_addr && !devinfo.shared.console.log_idx); cases++;
  /* A write index at or past the buffer size is not followed. */
  reset(); put32(CONS + BRCMF_CONSOLE_WRITEIDX_OFFSET, 64); assert(!init() && devinfo.shared.console.read_idx == 0); cases++;
  reset(); put32(CONS + BRCMF_CONSOLE_WRITEIDX_OFFSET, 0x10000); assert(!init()); cases++;
@@ -236,8 +240,9 @@ MUTATIONS = {
                      '\t\th2d_idx_len = (BRCMF_NROF_H2D_COMMON_MSGRINGS) *'),
     'dma-counts': ('\t\tif (max_submissionrings <\n\t\t    BRCMF_NROF_H2D_COMMON_MSGRINGS + max_flowrings ||\n'
                    '\t\t    max_completionrings < BRCMF_NROF_D2H_COMMON_MSGRINGS) {', '\t\tif (false) {'),
-    'console-desc': ('\tif (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr,\n'
-                     '\t\t\t\t\tBRCMF_CONSOLE_WRITEIDX_OFFSET + 4)) {', '\tif (false) {'),
+    'console-desc': ('\t    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr,\n'
+                     '\t\t\t\t\tBRCMF_CONSOLE_WRITEIDX_OFFSET + 4)) {', '\t    false) {'),
+    'console-none': ('\tif (!console->base_addr ||\n', '\tif (false ||\n'),
     'console-buf': ('\t    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->buf_addr,\n'
                     '\t\t\t\t\tconsole->bufsize)) {', '\t    false) {'),
     'console-widx': ('\tif (newidx >= console->bufsize || console->read_idx >= console->bufsize)\n\t\treturn;\n', ''),

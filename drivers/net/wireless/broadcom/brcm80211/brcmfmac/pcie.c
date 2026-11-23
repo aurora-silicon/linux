@@ -1142,9 +1142,11 @@ static void brcmf_pcie_bus_console_init(struct brcmf_pciedev_info *devinfo)
 	console->base_addr = brcmf_pcie_read_tcm32(devinfo, addr);
 	console->bufsize = 0;
 	console->read_idx = 0;
+	console->log_idx = 0;
 	console->scan_idx = 0;
 	console->scan_len = 0;
-	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr,
+	if (!console->base_addr ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr,
 					BRCMF_CONSOLE_WRITEIDX_OFFSET + 4)) {
 		console->base_addr = 0;
 		return;
