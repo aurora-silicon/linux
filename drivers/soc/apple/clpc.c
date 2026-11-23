@@ -1991,6 +1991,17 @@ static const struct apple_clpc_hw apple_clpc_hw_t8142 = {
 	 * mm-512x2048).
 	 */
 	.ane = { [APPLE_CLPC_DCS] = 7, [APPLE_CLPC_SOC] = 3 },
+	/*
+	 * With the engine AXI2AF bridge tunables applied, pure ANE execution
+	 * time on J813 also tracks the P-cluster frequency (cpu-map cluster1),
+	 * independent of which cluster hosts the submitting thread (pinned to
+	 * an E-core with DCS 7 / SOC 3, unet-320 firmware report_done drops
+	 * from 660.5 us with no P-cluster floor to 350.7 us at 4176 MHz,
+	 * 4.49 W, with no further gain at 4464 MHz, 5.31 W).
+	 */
+	.ane_cluster = 1,
+	.ane_cluster_khz = 4176000,
+	.ane_cluster_machine = "apple,t8142",
 };
 
 #if IS_BUILTIN(CONFIG_KUNIT) && !defined(MODULE)
@@ -2262,6 +2273,8 @@ static void apple_clpc_ane_cluster_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, time_before(now + msecs_to_jiffies(APPLE_CLPC_HOLD_MS),
 					     clpc->ane_until));
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane_cluster, 2u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8142.ane_cluster, 1u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8142.ane_cluster_khz, 4176000u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8140.ane_cluster_khz, 0u);
 }
 
