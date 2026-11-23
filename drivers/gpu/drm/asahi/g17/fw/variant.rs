@@ -109,6 +109,9 @@ pub(crate) struct Variant {
     /// an M4 Pro crash on a recycled work state; extending this needs a create/destroy-heavy
     /// queue test on that hardware.
     pub(crate) objects_after_release: bool,
+    /// What the firmware reports in its statistics ring beyond utilisation
+    /// ([`crate::g17::telemetry::Protocol`]).
+    pub(crate) telemetry_protocol: crate::g17::telemetry::Protocol,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -164,6 +167,7 @@ pub(crate) const V26A428: Variant = Variant {
     registration_power_hold: true,
     render_id_at_create: true,
     objects_after_release: true,
+    telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_16MS,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -205,6 +209,7 @@ pub(crate) const V25G83: Variant = Variant {
     registration_power_hold: true,
     render_id_at_create: false,
     objects_after_release: false,
+    telemetry_protocol: crate::g17::telemetry::Protocol::NONE,
 };
 
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
@@ -217,6 +222,7 @@ pub(crate) const V26A428_M5: Variant = Variant {
     registration_power_hold: false,
     render_id_at_create: false,
     objects_after_release: false,
+    telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_8MS,
     ..V26A428
 };
 
