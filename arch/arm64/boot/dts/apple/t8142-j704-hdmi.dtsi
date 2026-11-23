@@ -63,6 +63,7 @@
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2b8 4>;
 		#power-domain-cells = <0>;
+		#reset-cells = <0>;
 		apple,firmware-owned;
 		label = "dispext1-sys";
 	};
@@ -71,6 +72,7 @@
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x3a8 4>;
 		#power-domain-cells = <0>;
+		#reset-cells = <0>;
 		power-domains = <&ps_dispext1_sys>;
 		apple,firmware-owned;
 		label = "dispext1-fe";
@@ -80,6 +82,7 @@
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x3b8 4>;
 		#power-domain-cells = <0>;
+		#reset-cells = <0>;
 		power-domains = <&ps_dispext1_fe>;
 		apple,firmware-owned;
 		label = "dispext1-cpu";
