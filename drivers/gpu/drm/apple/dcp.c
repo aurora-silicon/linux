@@ -7916,12 +7916,16 @@ static int dcp_platform_probe_t8132_ext(struct platform_device *pdev)
  * bind's, may still appear (bounded by the deferred probe timeout); on any
  * other failure join as an unusable pipe.
  */
+static void dcp_t6041_note_power(struct device *dev);
+
 static int dcp_platform_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
 	void *group;
 	int ret;
+
+	dcp_t6041_note_power(dev);
 
 	/* t6041_dcpext=0: stay off the external processors' hardware. */
 	if (of_device_is_compatible(dev->of_node, "apple,t6041-dcpext") &&
@@ -10240,21 +10244,34 @@ static const struct of_device_id dcp_t6041_power_of_match[] = {
 	{}
 };
 
+/*
+ * The T604x display power complex, from the apple,display-power of the DCP that names one.
+ * Taken as each DCP starts to probe, so a DCP that fails its probe still gives it, and kept.
+ */
+static struct device_node *dcp_t6041_power_np;
+
+static void dcp_t6041_note_power(struct device *dev)
+{
+	struct device_node *np = of_parse_phandle(dev->of_node, "apple,display-power", 0);
+
+	if (np && of_match_node(dcp_t6041_power_of_match, np) &&
+	    !cmpxchg(&dcp_t6041_power_np, NULL, np))
+		return;
+	of_node_put(np);
+}
+
 /* NULL without a T604x display power complex in the device tree. */
 static const struct dcp_t6041_power_soc *dcp_t6041_power(void)
 {
 	static const struct dcp_t6041_power_soc *soc;
 	const struct of_device_id *match = NULL;
-	struct device_node *dcp_np, *np;
+	struct device_node *np;
 
 	if (READ_ONCE(soc))
 		return soc;
-	dcp_np = of_find_compatible_node(NULL, NULL, "apple,t6041-dcp");
-	np = dcp_np ? of_parse_phandle(dcp_np, "apple,display-power", 0) : NULL;
-	of_node_put(dcp_np);
+	np = READ_ONCE(dcp_t6041_power_np);
 	if (np)
 		match = of_match_node(dcp_t6041_power_of_match, np);
-	of_node_put(np);
 	if (match)
 		WRITE_ONCE(soc, match->data);
 	return soc;
@@ -10498,7 +10515,7 @@ abort:
 
 /*
  * The power words the stop and the restart below write, from the apple,t6041-display-power
- * node the internal DCP names in apple,display-power. Mapped at the first sleep and kept.
+ * node a DCP names in apple,display-power. Mapped at the first sleep and kept.
  */
 enum dcp_t6041_pw {
 	DCP_PW_PMC,		/* the display voter count */
@@ -10611,14 +10628,12 @@ static void dcp_t6041_unmap_power(void)
 
 static bool dcp_t6041_map_power(void)
 {
-	struct device_node *dcp_np, *np;
+	struct device_node *np;
 	int i;
 
 	if (dcp_t6041_pw[DCP_PW_NR - 1])
 		return true;
-	dcp_np = of_find_compatible_node(NULL, NULL, "apple,t6041-dcp");
-	np = dcp_np ? of_parse_phandle(dcp_np, "apple,display-power", 0) : NULL;
-	of_node_put(dcp_np);
+	np = READ_ONCE(dcp_t6041_power_np);
 	if (!np) {
 		pr_warn_once("dcp: no apple,display-power in the device tree, the display stays up across a sleep\n");
 		return false;
@@ -10629,7 +10644,6 @@ static bool dcp_t6041_map_power(void)
 		if (!dcp_t6041_pw[i])
 			break;
 	}
-	of_node_put(np);
 	if (i == DCP_PW_NR)
 		return true;
 	pr_warn_once("dcp: no %s display power words, the display stays up across a sleep\n",
