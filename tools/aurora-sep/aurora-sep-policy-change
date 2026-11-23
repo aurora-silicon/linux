@@ -79,8 +79,13 @@ def driver_message(entry):
 
     Its device messages carry the SEP platform device in the journal's
     kernel fields and start "apple_sep <device>: "; its messages without a
-    device start "apple_sep: ". The prefix is removed."""
+    device start "apple_sep: ". The prefix is removed.
+
+    The journal's kernel transport also carries what processes write to
+    /dev/kmsg; only the kernel's own messages have facility 0 there."""
     if not isinstance(entry, dict) or entry.get("_TRANSPORT") != "kernel":
+        return None
+    if entry.get("SYSLOG_FACILITY") != "0":
         return None
     msg = entry.get("MESSAGE")
     if not isinstance(msg, str):

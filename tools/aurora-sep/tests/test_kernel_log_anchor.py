@@ -29,8 +29,10 @@ def load_policy_change():
 M = load_policy_change()
 
 
-def kernel(msg, device=None, subsystem='platform', transport='kernel'):
+def kernel(msg, device=None, subsystem='platform', transport='kernel', facility='0'):
     e = {'MESSAGE': msg, '_TRANSPORT': transport}
+    if facility is not None:
+        e['SYSLOG_FACILITY'] = facility
     if device is not None:
         e['_KERNEL_DEVICE'] = device
         e['_KERNEL_SUBSYSTEM'] = subsystem
@@ -55,7 +57,13 @@ FORGED = [
     dict(kernel(f'apple_sep {DEVICE}: xART: APFS-resolved .gl extent (base 0x5000);'), _KERNEL_DEVICE=[1, 2],
          _KERNEL_SUBSYSTEM='platform'),
     {'MESSAGE': f'apple_sep {DEVICE}: xART: APFS-resolved .gl extent (base 0x6000);', '_TRANSPORT': 'kernel',
-     '_KERNEL_DEVICE': 7, '_KERNEL_SUBSYSTEM': 'platform'},
+     'SYSLOG_FACILITY': '0', '_KERNEL_DEVICE': 7, '_KERNEL_SUBSYSTEM': 'platform'},
+    # The kernel transport, but not the kernel's own facility (or none, or not a string).
+    kernel(f'apple_sep: xART guard: refused to rewrite kind-4 record {OTHER},', facility='1'),
+    kernel(f'apple_sep: xART guard: refused to rewrite kind-3 record {OTHER},', facility='3'),
+    kernel(f'apple_sep: xART guard: refused to rewrite kind-4 record {OTHER},', facility=None),
+    kernel(f'apple_sep: xART guard: refused to rewrite kind-4 record {OTHER},', facility=0),
+    kernel('apple_sep: xART: APFS-resolved .gl extent (base 0x7000);', facility='1'),
     # Not from the kernel.
     kernel(f'apple_sep: xART guard: refused to rewrite kind-4 record {OTHER},', transport='syslog'),
 ]
