@@ -300,3 +300,7 @@ module_exit(apple_regview_exit);
 
 MODULE_DESCRIPTION("Apple SoC read-only register views");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_APPLE_REGVIEW_KUNIT_TEST)
+#include "regview-test.c"
+#endif
