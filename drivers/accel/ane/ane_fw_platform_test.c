@@ -38,6 +38,27 @@ static void ane_preload_ranges_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ane_fw_preload_ranges_valid(&soc, phys, size, dva));
 }
 
+static void ane_preload_physical_order_test(struct kunit *test)
+{
+	const struct ane_fw_platform platform = {
+		.preload_dva = { SZ_1M, SZ_1M + SZ_16K },
+		.preload_size = { SZ_16K, SZ_32K },
+	};
+	const u64 *size = platform.preload_size;
+	const u64 *dva = platform.preload_dva;
+	u64 phys[] = { SZ_2M + SZ_32K, SZ_2M };
+
+	/* DATA can precede TEXT and touch its boundary in physical memory. */
+	KUNIT_EXPECT_TRUE(test, ane_fw_preload_ranges_valid(&platform, phys, size, dva));
+	phys[0] -= SZ_16K;
+	KUNIT_EXPECT_FALSE(test, ane_fw_preload_ranges_valid(&platform, phys, size, dva));
+
+	/* DATA's end must not wrap, even if its base is valid and aligned. */
+	phys[0] = SZ_2M;
+	phys[1] = U64_MAX - SZ_16K + 1;
+	KUNIT_EXPECT_FALSE(test, ane_fw_preload_ranges_valid(&platform, phys, size, dva));
+}
+
 /*
  * H16 and H17 devices (any firmware platform) take the backend's sleep path,
  * never the rtclient one; only the H13/H14 rtclient (no platform) does.
@@ -164,6 +185,7 @@ static struct kunit_case ane_fw_platform_cases[] = {
 	KUNIT_CASE(ane_platform_staged_bind_test),
 	KUNIT_CASE(ane_platform_sleep_path_test),
 	KUNIT_CASE(ane_preload_ranges_test),
+	KUNIT_CASE(ane_preload_physical_order_test),
 	{}
 };
 
