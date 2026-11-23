@@ -7,6 +7,7 @@
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/rtnetlink.h>
+#include <linux/seq_file.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <net/cfg80211.h>
@@ -26,7 +27,15 @@
 #define DATA_TX_BUFFER (SZ_16M + SZ_8M)
 #define DATA_RX_SLOTS 2048
 #define DATA_TX_SLOTS 2048
-#define DATA_TX_QUEUE_LIMIT DATA_TX_SLOTS
+/*
+ * Frames waiting for a ring slot, and frames the firmware holds until it
+ * reports them sent. Both queues are first-in first-out and shared by every
+ * flow, so what does not fit waits in the qdisc instead, where it is
+ * scheduled per flow. 512 frames are about 25 ms at ~240 Mbit/s; the ring
+ * itself holds 2047 (about 100 ms).
+ */
+#define DATA_TX_QUEUE_LIMIT 128
+#define DATA_TX_INFLIGHT_MAX 512
 
 static_assert(DATA_TX_BUFFER >=
 	      CEN_ALPHA_SCRATCH_OFFSET + CEN_ALPHA_SCRATCH_SIZE);
@@ -90,6 +99,8 @@ struct centauri_t6050_wifi {
 	bool data_tx_busy[DATA_TX_SLOTS];
 	u32 data_tx_submitted, data_tx_completed, data_tx_failed;
 	u32 data_tx_coalesced, data_tx_bad;
+	u32 data_tx_capped, data_tx_cap_bypassed;
+	unsigned long data_tx_completed_at;
 	s8 station_signal;
 	bool station_signal_valid;
 	unsigned long station_signal_at, connected_at;
@@ -522,6 +533,7 @@ static void drain_data_tx(struct centauri_t6050_wifi *wifi)
 			}
 			if (count > 1)
 				wifi->data_tx_coalesced++;
+			wifi->data_tx_completed_at = jiffies;
 			for (i = 0; i < count; i++) {
 				unsigned int slot = (first + i) % DATA_TX_SLOTS;
 
@@ -551,9 +563,28 @@ static void drain_data_tx(struct centauri_t6050_wifi *wifi)
 		u8 *descriptor = wifi->a.window + 0x540000 + post * 32;
 		struct sk_buff *skb;
 		u64 metadata = 6ULL << 27;
+		u32 inflight = wifi->data_tx_submitted - wifi->data_tx_completed;
 
 		if (wifi->data_tx_busy[post] || next == index_read(wifi, 1, 25))
 			break;
+		/*
+		 * Keep at most DATA_TX_INFLIGHT_MAX frames with the firmware. A
+		 * completion that never comes would hold its frame's place for
+		 * good, so the cap gives way once no completion has arrived for
+		 * half a second (beacon reports keep this path running).
+		 */
+		if (inflight >= DATA_TX_INFLIGHT_MAX &&
+		    !skb_queue_empty(&wifi->data_tx_queue)) {
+			if (time_before(jiffies,
+					wifi->data_tx_completed_at + HZ / 2)) {
+				wifi->data_tx_capped++;
+				break;
+			}
+			if (!wifi->data_tx_cap_bypassed++)
+				dev_warn(&wifi->control->pdev->dev,
+					 "Wi-Fi TX: no completion for %u in-flight frames; posting past the cap\n",
+					 inflight);
+		}
 		skb = skb_dequeue(&wifi->data_tx_queue);
 		if (!skb)
 			break;
@@ -571,6 +602,8 @@ static void drain_data_tx(struct centauri_t6050_wifi *wifi)
 		metadata |= 4ULL << 15;
 		put_unaligned_le64(metadata, descriptor + 16);
 		put_unaligned_le64(2000000, descriptor + 24);
+		if (wifi->data_tx_submitted == wifi->data_tx_completed)
+			wifi->data_tx_completed_at = jiffies;
 		wifi->data_tx_length[post] = skb->len;
 		wifi->data_tx_busy[post] = true;
 		wifi->data_tx_submitted++;
@@ -2677,6 +2710,27 @@ static int query_link_status(struct centauri_t6050_wifi *wifi)
 	return ret;
 }
 
+static int data_stats_show(struct seq_file *m, void *unused)
+{
+	struct centauri_t6050_wifi *wifi = m->private;
+
+	mutex_lock(&wifi->lock);
+	seq_printf(m,
+		   "rx received %u reposted %u bad %u\n"
+		   "tx submitted %u completed %u in_flight %u failed %u bad %u coalesced %u\n"
+		   "tx queued %u capped %u cap_bypassed %u\n",
+		   wifi->data_rx_received, wifi->data_rx_reposted,
+		   wifi->data_rx_bad, wifi->data_tx_submitted,
+		   wifi->data_tx_completed,
+		   wifi->data_tx_submitted - wifi->data_tx_completed,
+		   wifi->data_tx_failed, wifi->data_tx_bad,
+		   wifi->data_tx_coalesced, skb_queue_len(&wifi->data_tx_queue),
+		   wifi->data_tx_capped, wifi->data_tx_cap_bypassed);
+	mutex_unlock(&wifi->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(data_stats);
+
 int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_wifi *wifi;
@@ -2771,6 +2825,8 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 			    &wifi->hw_channels_blob);
 	debugfs_create_blob("system_caps", 0400, wifi->wiphy->debugfsdir,
 			    &wifi->system_caps_blob);
+	debugfs_create_file("data_stats", 0400, wifi->wiphy->debugfsdir, wifi,
+			    &data_stats_fops);
 	rtnl_lock();
 	channels_apply(wifi);
 	rtnl_unlock();
