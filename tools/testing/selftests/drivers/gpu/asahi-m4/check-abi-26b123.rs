@@ -324,6 +324,15 @@ fn catalog() {
     assert!(!wire::layout_fits(&bad_globals));
     bad_globals.globals_policy = &[(0x7c, 1)]; // collides with remapped 25G83 0x78
     assert!(!wire::layout_fits(&bad_globals));
+    let mut bad_main = wire::Layout { name: "test", ..wire::V26B123 };
+    bad_main.main_policy = &[(0xfa8, 1)]; // collides with coredump_copy
+    assert!(!wire::layout_fits(&bad_main));
+    bad_main.main_policy = &[(0x640, 1)]; // collides with register map
+    assert!(!wire::layout_fits(&bad_main));
+    bad_main.main_policy = &[(0x2778, 1)]; // collides with remapped 25G83 0x2654
+    assert!(!wire::layout_fits(&bad_main));
+    bad_main.main_policy = &[(0x2786, 1)]; // overflows MAIN (0x2788)
+    assert!(!wire::layout_fits(&bad_main));
 }
 
 fn main() {
@@ -349,6 +358,7 @@ fn main() {
     // RETENTION object at RUNTIME +0x2c8.
     assert_eq!(r64(main, 0xfa0), 0);
     assert_eq!(r64(main, 0xfa8), input().coredump_copy_size);
+    assert_eq!(r32(main, 0x277e), 1);
     assert_eq!(r64(object(&v26, l, id::RUNTIME), 0x2c8), input().va[id::RETENTION]);
     // CRE (25G83 slot 28) is register-map slot 33 in 26B123.
     assert_eq!(r64(main, 0x640 + 33 * 0x28), 0x300d58000);

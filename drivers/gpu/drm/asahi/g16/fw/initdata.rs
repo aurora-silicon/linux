@@ -143,6 +143,8 @@ pub(crate) struct Layout {
     pub(crate) coredump_copy: Option<usize>,
     /// Where the RETENTION object is published.
     pub(crate) retention: Retention,
+    /// MAIN (HW data) words of this build that have no 25G83 position, at their own offsets.
+    pub(crate) main_policy: &'static [(usize, u32)],
     /// GLOBALS (region C) words of this build that have no 25G83 position, at their own offsets.
     pub(crate) globals_policy: &'static [(usize, u32)],
     /// POWER_PERFORMANCE (power config) words of this build that have no 25G83 position, at
@@ -302,6 +304,7 @@ pub(crate) const V25G83: Layout = Layout {
     pstate_selectors: [0x88, 0x8c, 0x98],
     coredump_copy: None,
     retention: Retention::Main,
+    main_policy: &[],
     globals_policy: &[],
     power_policy: &[],
     power_sampling: None,
@@ -312,8 +315,8 @@ pub(crate) const V25G83: Layout = Layout {
 /// - the main-config power-config pointer 16 bytes later;
 /// - a 60-slot register map in MAIN, then the retention pointer at 0xfa0, a new u64 at 0xfa8
 ///   (the crash copy buffer size), the old 0xe90.. words +0x120, 0xec0.. +0x11c (one word
-///   removed at 0xebc), 0x2600.. +0x120 and the last bytes +0x124 (new u32s at 0x275c and
-///   0x277e, left zero);
+///   removed at 0xebc), 0x2600.. +0x120 and the last bytes +0x124 (new u32s at 0x275c, left
+///   zero, and 0x277e, enabled via `main_policy`);
 /// - a u32 inserted at GLOBALS 0x38, so every later word moves by four;
 /// - POWER_PERFORMANCE with words inserted at 0x9c (0x10 bytes), 0x28b0 (0x18), 0x3b50 (0x28)
 ///   and 0x63cc (0x680), 8 bytes removed between 0x2d08 and 0x2f08 and 0x20 between 0x62c4 and
@@ -363,6 +366,9 @@ pub(crate) const V26B123: Layout = Layout {
     // +0xfa8 faulted on the first resume from idle power-off.
     coredump_copy: Some(0xfa8),
     retention: Retention::Runtime(0x2c8),
+    // macOS 27.2 writes 1 here; with 0 the firmware falsely flags long compute dispatches as
+    // stalled.
+    main_policy: &[(0x277e, 1)],
     globals_policy: &[],
     // The four u32s this build inserts at +0x9c, 1 each as macOS 27.2 writes them. 0xa4 selects
     // the powered-up state; leaving 0 there keeps the GPU unpowered and triggers an SError on
@@ -434,6 +440,44 @@ const POWER_CEILING_U32: &[usize] = &[
 
 const fn ranges_overlap(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
     a < b + b_len && b < a + a_len
+}
+
+/// Every `main_policy` word fits in MAIN and is disjoint from every other policy word, the
+/// register map, `coredump_copy`, and every remapped 25G83 MAIN run.
+const fn main_policy_fits(layout: &Layout) -> bool {
+    let size = layout.object_size[id::MAIN];
+    let map_len = layout.register_slots * LOADER_STRIDE;
+    let mut i = 0;
+    while i < layout.main_policy.len() {
+        let at = layout.main_policy[i].0;
+        if at + 4 > size || ranges_overlap(at, 4, 0x640, map_len) {
+            return false;
+        }
+        if let Some(cc) = layout.coredump_copy {
+            if ranges_overlap(at, 4, cc, 8) {
+                return false;
+            }
+        }
+        let mut j = 0;
+        while j < i {
+            if ranges_overlap(at, 4, layout.main_policy[j].0, 4) {
+                return false;
+            }
+            j += 1;
+        }
+        let mut r = 0;
+        while r < layout.main.len() {
+            let run = layout.main[r];
+            let start = run.start + run.delta;
+            let len = run.end - run.start;
+            if ranges_overlap(at, 4, start, len) {
+                return false;
+            }
+            r += 1;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Every `globals_policy` word fits in GLOBALS and is disjoint from every other policy word,
@@ -664,6 +708,7 @@ pub(crate) const fn layout_fits(layout: &Layout) -> bool {
         && runs_fit(layout.globals, size[id::GLOBALS])
         && runs_fit(layout.power_performance, size[id::POWER_PERFORMANCE])
         && retention_fits(layout)
+        && main_policy_fits(layout)
         && globals_policy_fits(layout)
         && power_policy_fits(layout)
 }
@@ -1246,6 +1291,9 @@ pub(crate) fn encode_for(
     }
     if let Some(at) = layout.coredump_copy {
         put64(main, at, input.coredump_copy_size)?;
+    }
+    for &(at, value) in layout.main_policy {
+        put32(main, at, value)?;
     }
     for (at, value) in [
         (0xea0, 1),

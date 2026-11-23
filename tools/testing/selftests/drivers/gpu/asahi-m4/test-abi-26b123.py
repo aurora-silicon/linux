@@ -65,8 +65,9 @@ POWER_MAP = [(0x3b50, 0x3b98, 8)] + fields([
     (0x2210, 0x2220), (0x22b0, 0x22c0), (0x22b4, 0x22c4), (0x22f8, 0x2308), (0x279e, 0x27ae),
     (0x2870, 0x2880), (0x2a3c, 0x2a64), (0x2b84, 0x2bac), (0x2b88, 0x2bb0), (0x2b8c, 0x2bb4),
     (0x2bcc, 0x2bf4), (0x2c40, 0x2c68), (0x2c44, 0x2c6c), (0x2c88, 0x2cb0)])
-# Words new in 26B123 that the host writes: the u64 crash copy buffer size at HW data 0xfa8.
-NEW_26B123 = {MAIN: [(0xfa8, 0x8000)]}
+# Words new in 26B123 that the host writes: u64 crash copy buffer size at HW data 0xfa8,
+# and u32 USC shader-core progress monitoring enable at HW data 0x277e.
+NEW_26B123 = {MAIN: [(0xfa8, 8, 0x8000), (0x277e, 4, 1)]}
 MOVED = {GLOBALS: GLOBALS_MAP, FIRMWARE_DATA: FIRMWARE_DATA_MAP, MAIN: MAIN_MAP,
          POWER_PERFORMANCE: POWER_MAP,
          # Main config: only the power-config pointer moves (16 bytes later).
@@ -130,9 +131,9 @@ def expect_initdata(old_image):
                               (0x2c10, 8333)):
                 assert not any(after[at:at + 4]), f'POWER_PERFORMANCE +{at:#x}'
                 struct.pack_into('<I', after, at, value)
-        for at, value in NEW_26B123.get(index, []):
-            assert not any(after[at:at + 8]), f'object {index} +{at:#x}'
-            struct.pack_into('<Q', after, at, value)
+        for at, width, value in NEW_26B123.get(index, []):
+            assert not any(after[at:at + width]), f'object {index} +{at:#x}'
+            struct.pack_into('<Q' if width == 8 else '<I', after, at, value)
         new.append(bytes(after))
     return b''.join(new)
 
