@@ -538,6 +538,17 @@ struct apple_dart {
 	bool cold_ane;
 	u16 managed_sids;
 	bool managed_failed;
+	/*
+	 * The one page the radio's SID16 may reach, or 0 to keep its bypass.
+	 * Its table is kept for the lifetime of the binding unless probe
+	 * fails and tears the narrowing down before releasing the device.
+	 */
+	u64 sid16_page;
+	struct io_pgtable_ops *sid16_ops;
+	u32 sid16_ttbr;
+	u32 sid16_init_tcr;
+	u32 sid16_init_ttbr;
+	bool sid16_init_enabled;
 	/* Serialize owned TCR publication against IRQ quarantine. */
 	spinlock_t managed_lock;
 	struct apple_dart_sleep *sleep_record;
@@ -2426,6 +2437,160 @@ static bool apple_dart_managed_static_bypass(u32 tcr)
 	return (tcr & ~DART_T8110_TCR_BYPASS_DAPF) == DART_T8110_TCR_BYPASS_DART;
 }
 
+/* SID16 translates through the one-page table this driver published. */
+static bool apple_dart_managed_sid16_narrowed(struct apple_dart *dart)
+{
+	u32 tcr = apple_dart_readl(dart, DART_TCR(dart, 16));
+
+	return dart->sid16_ops && tcr == DART_T8110_TCR_TRANSLATE_ENABLE &&
+	       apple_dart_readl(dart, DART_TTBR(dart, 16, 0)) == dart->sid16_ttbr &&
+	       (apple_dart_readl(dart, dart->hw->enable_streams) & BIT(16));
+}
+
+/*
+ * SID16 needs no more than one page, but a bypassed stream reaches all of
+ * physical memory, and nothing routes a requester to it that admission can
+ * check. Translate it through a table that maps only that page. Called after
+ * admission and before any radio DMA is set up; the SID16 TLB is flushed after
+ * switching TCR to translate so no firmware entry survives.
+ */
+static int apple_dart_managed_narrow_sid16(struct apple_dart *dart)
+{
+	struct apple_dart_stream_map stream = { .dart = dart };
+	struct io_pgtable_cfg cfg = {
+		.pgsize_bitmap = SZ_16K,
+		.ias = 36,
+		.oas = dart->oas,
+		.coherent_walk = 1,
+		.iommu_dev = dart->dev,
+	};
+	struct io_pgtable_ops *ops;
+	size_t mapped = 0;
+	phys_addr_t root;
+	u32 tcr, ttbr, init_tcr, init_ttbr;
+	int ret;
+
+	if (dart->hw->type != DART_T8110 || dart->num_streams <= 16 ||
+	    dart->hw->ttbr_count != 1 || dart->pgsize != SZ_16K ||
+	    dart->oas < 36 || dart->sid16_page >= BIT_ULL(dart->oas))
+		return -EINVAL;
+	if (dart->sid16_ops)
+		return -EBUSY;
+	init_tcr = apple_dart_readl(dart, DART_TCR(dart, 16));
+	init_ttbr = apple_dart_readl(dart, DART_TTBR(dart, 16, 0));
+	if (init_tcr == dart->hw->tcr_disabled) {
+		if (init_ttbr & dart->hw->ttbr_valid)
+			return -EBUSY;
+	} else if (apple_dart_managed_static_bypass(init_tcr)) {
+		if (!dart->supports_bypass || !dart->hw->tcr_bypass)
+			return -EBUSY;
+	} else {
+		return -EBUSY;
+	}
+	ops = alloc_io_pgtable_ops(APPLE_DART2, &cfg, NULL);
+	if (!ops)
+		return -ENOMEM;
+	if (cfg.apple_dart_cfg.n_ttbrs != 1 || cfg.apple_dart_cfg.n_levels != 3) {
+		ret = -EINVAL;
+		goto err_free;
+	}
+	ret = ops->map_pages(ops, dart->sid16_page, dart->sid16_page, SZ_16K, 1,
+			     IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO, GFP_KERNEL, &mapped);
+	if (!ret && (mapped != SZ_16K ||
+		     ops->iova_to_phys(ops, dart->sid16_page) != dart->sid16_page))
+		ret = -EIO;
+	if (ret)
+		goto err_free;
+
+	dart->sid16_init_tcr = init_tcr;
+	dart->sid16_init_ttbr = init_ttbr;
+	dart->sid16_init_enabled = !!(apple_dart_readl(dart, dart->hw->enable_streams) & BIT(16));
+	root = virt_to_phys(cfg.apple_dart_cfg.ttbr[0]);
+	dart->sid16_ttbr = dart->hw->ttbr_valid |
+			   (root >> dart->hw->ttbr_shift) << dart->hw->ttbr_addr_field_shift;
+	/* From here on the table may be walked until torn down and flushed. */
+	dart->sid16_ops = ops;
+	apple_dart_writel(dart, dart->sid16_ttbr, DART_TTBR(dart, 16, 0));
+	ttbr = apple_dart_readl(dart, DART_TTBR(dart, 16, 0));
+	if (ttbr != dart->sid16_ttbr) {
+		dev_err(dart->dev, "SID16 TTBR0 readback failed (TTBR0 %#x)\n", ttbr);
+		return -EIO;
+	}
+	/* Plain translation: sleep restore replays the TCR as it reads back. */
+	apple_dart_writel(dart, DART_T8110_TCR_TRANSLATE_ENABLE, DART_TCR(dart, 16));
+	tcr = apple_dart_readl(dart, DART_TCR(dart, 16));
+	if (tcr != DART_T8110_TCR_TRANSLATE_ENABLE) {
+		dev_err(dart->dev, "SID16 narrowing readback failed (TCR %#x)\n", tcr);
+		return -EIO;
+	}
+	__set_bit(16, stream.sidmap);
+	ret = dart->hw->invalidate_tlb(&stream);
+	if (ret) {
+		dev_err(dart->dev, "SID16 TLB invalidation failed (%d)\n", ret);
+		return ret;
+	}
+	apple_dart_writel(dart, BIT(16), dart->hw->enable_streams);
+	if (!apple_dart_managed_sid16_narrowed(dart)) {
+		dev_err(dart->dev, "SID16 enable readback failed (ENABLE %#x)\n",
+			apple_dart_readl(dart, dart->hw->enable_streams));
+		return -EIO;
+	}
+	dev_info(dart->dev, "SID16 bypass narrowed to page %#llx\n", dart->sid16_page);
+	return 0;
+
+err_free:
+	free_io_pgtable_ops(ops);
+	return ret;
+}
+
+static void apple_dart_managed_unnarrow_sid16(struct apple_dart *dart)
+{
+	struct apple_dart_stream_map stream = { .dart = dart };
+	u32 tcr, enabled, restore_tcr;
+
+	if (!dart->sid16_ops)
+		return;
+
+	__set_bit(16, stream.sidmap);
+	if (!dart->sid16_init_enabled) {
+		apple_dart_writel(dart, BIT(16), DART_T8110_DISABLE_STREAMS);
+		if (apple_dart_readl(dart, dart->hw->enable_streams) & BIT(16)) {
+			dev_warn(dart->dev,
+				 "failed to tear down SID16 narrowing; keeping page table\n");
+			return;
+		}
+	}
+
+	/*
+	 * Static bypass restores the documented bypass request (including DAPF)
+	 * while checking exact readback against the saved entry TCR.
+	 */
+	restore_tcr = dart->sid16_init_tcr == dart->hw->tcr_disabled ?
+		      dart->hw->tcr_disabled : dart->hw->tcr_bypass;
+	apple_dart_writel(dart, restore_tcr, DART_TCR(dart, 16));
+	tcr = apple_dart_readl(dart, DART_TCR(dart, 16));
+	if (tcr != dart->sid16_init_tcr) {
+		dev_warn(dart->dev, "failed to tear down SID16 narrowing; keeping page table\n");
+		return;
+	}
+
+	apple_dart_writel(dart, dart->sid16_init_ttbr, DART_TTBR(dart, 16, 0));
+	enabled = apple_dart_readl(dart, dart->hw->enable_streams);
+	if (apple_dart_readl(dart, DART_TTBR(dart, 16, 0)) != dart->sid16_init_ttbr ||
+	    !!(enabled & BIT(16)) != dart->sid16_init_enabled ||
+	    dart->hw->invalidate_tlb(&stream)) {
+		dev_warn(dart->dev, "failed to tear down SID16 narrowing; keeping page table\n");
+		return;
+	}
+
+	free_io_pgtable_ops(dart->sid16_ops);
+	dart->sid16_ops = NULL;
+	dart->sid16_ttbr = 0;
+	dart->sid16_init_tcr = 0;
+	dart->sid16_init_ttbr = 0;
+	dart->sid16_init_enabled = false;
+}
+
 static ssize_t j713_radio_fault_state_show(struct device *dev,
 					 struct device_attribute *attr, char *buf)
 {
@@ -2535,9 +2700,15 @@ static int apple_dart_managed_admit(struct apple_dart *dart, bool *init_bypass)
 			return -EBUSY;
 		}
 	}
-	/* ADT assigns SID16 a static bypass role, independently of radio data. */
+	/*
+	 * ADT assigns SID16 a static bypass role, independently of radio data.
+	 * Once narrowed to its one page by this driver, it stays so.
+	 */
 	reserved_tcr = apple_dart_readl(dart, DART_TCR(dart, 16));
-	if (!apple_dart_managed_static_bypass(reserved_tcr)) {
+	if (dart->sid16_ops) {
+		if (!apple_dart_managed_sid16_narrowed(dart))
+			return -EBUSY;
+	} else if (!apple_dart_managed_static_bypass(reserved_tcr)) {
 		if (reserved_tcr != dart->hw->tcr_disabled || !dart->supports_bypass)
 			return -EBUSY;
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
@@ -5594,6 +5765,12 @@ static int apple_dart_probe(struct platform_device *pdev)
 		    ids[0] != 1 || ids[1] != 2)
 			return -EINVAL;
 		dart->managed_sids = BIT(1) | BIT(2);
+		/* An identity-mapped page needs a 36-bit, 3-level table. */
+		if (of_property_present(dev->of_node, "apple,sid16-page") &&
+		    (of_property_read_u64(dev->of_node, "apple,sid16-page", &dart->sid16_page) ||
+		     !dart->sid16_page || !IS_ALIGNED(dart->sid16_page, SZ_16K) ||
+		     dart->sid16_page >= BIT_ULL(36)))
+			return dev_err_probe(dev, -EINVAL, "invalid apple,sid16-page\n");
 	}
 	spin_lock_init(&dart->managed_lock);
 	ret = apple_dart_cio_init(dart, resource_size(res), j713_display);
@@ -6141,7 +6318,8 @@ params_done:
 		ret = apple_dart_retain_radio(dart);
 		if (ret)
 			goto err_clk_disable;
-		if (init_bypass) {
+		/* With a named page, a disabled SID16 is narrowed, never bypassed. */
+		if (init_bypass && !dart->sid16_page) {
 			struct apple_dart_stream_map stream = { .dart = dart };
 			u32 bypass_tcr;
 
@@ -6154,6 +6332,13 @@ params_done:
 				goto err_clk_disable;
 			}
 			apple_dart_writel(dart, BIT(16), dart->hw->enable_streams);
+		}
+		if (dart->sid16_page) {
+			ret = apple_dart_managed_narrow_sid16(dart);
+			if (ret) {
+				ret = dev_err_probe(dev, ret, "cannot narrow the SID16 bypass\n");
+				goto err_clk_disable;
+			}
 		}
 		/* ENABLE is write-one-to-set; no foreign stream changes state. */
 		apple_dart_writel(dart, dart->managed_sids, dart->hw->enable_streams);
@@ -6253,6 +6438,8 @@ err_free_irq:
 err_clk_disable:
 	if (dart->managed_sids && dart->retained && !READ_ONCE(dart->managed_failed))
 		apple_dart_managed_quarantine(dart);
+	if (dart->sid16_ops)
+		apple_dart_managed_unnarrow_sid16(dart);
 	/* Do not schedule suspend on failed radio or display adoption. */
 	if (dart->retained || dart->preserve_display)
 		pm_runtime_put_noidle(dev);
