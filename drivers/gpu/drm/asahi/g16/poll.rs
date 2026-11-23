@@ -1380,6 +1380,9 @@ impl Firmware {
                 .base_compute_quarantined
                 .store(self.slots.base_compute_quarantined(), Ordering::Release);
             shared
+                .quarantined_compute_mask
+                .store(self.slots.quarantined_compute_mask(), Ordering::Release);
+            shared
                 .base_render_quarantined
                 .store(self.slots.base_render_quarantined(), Ordering::Release);
             shared

@@ -847,9 +847,17 @@ pub(crate) mod sizes {
         super::engine::COMPUTE_UMA_SLOT + (COMPUTE_UNITS as u32)
             <= super::engine::RENDER_UMA_SLOT
     );
-    /// SCS-capable compute units per VM, which share ledger indices (and UMA slots) with the
-    /// first base units.
+    /// SCS-capable compute units per VM, bound dynamically to healthy compute ledger indices
+    /// (and UMA slots) preferring pipe-0-exclusive indices `0..PIPE1_COMPUTE_START`.
     pub(crate) const SCS_COMPUTE_UNITS: usize = 2;
+    /// First hardware compute ledger index usable by secondary compute pipes (`pipe >= 1`).
+    /// Keeping `0..PIPE1_COMPUTE_START` exclusive to pipe 0 guarantees that pipe 1 never holds
+    /// an undisplaced lease on those units, so 2-unit base-only and SCS compute VMs always have
+    /// at least one claimable unit across up to `PIPE1_COMPUTE_START - 2` permanent quarantines.
+    pub(crate) const PIPE1_COMPUTE_START: usize = 6;
+    const _: () = assert!(
+        PIPE1_COMPUTE_START >= SCS_COMPUTE_UNITS && PIPE1_COMPUTE_START + 2 <= COMPUTE_UNITS
+    );
     /// Bytes of a base UMA pool (its seeds of 4 KiB).
     pub(crate) const POOL_BYTES: u64 = 0x2000000;
     const _: () = assert!(

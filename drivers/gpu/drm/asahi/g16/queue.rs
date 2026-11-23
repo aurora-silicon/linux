@@ -276,6 +276,7 @@ impl Queue {
         // No GPU completion lock is held; reclaim can wait for earlier hardware work.
         let hints = super::resources::PrepareHints {
             expand_compute_ext: self.shared.base_compute_quarantined.load(Ordering::Acquire),
+            quarantined_compute_mask: self.shared.quarantined_compute_mask.load(Ordering::Acquire),
             expand_render_ext: self.shared.base_render_quarantined.load(Ordering::Acquire),
             quarantined_pb_mask: self.shared.quarantined_pb_mask.load(Ordering::Acquire),
             next_pb_slot: &self.shared.next_pb_slot,

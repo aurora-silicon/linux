@@ -91,6 +91,9 @@ impl ComputeArena {
 /// CDM pipe retains one undisplaced last-retired unit until displacement.
 pub(crate) struct ComputeUnitSet {
     units: KVec<Arc<ComputeArena>>,
+    /// Device-wide compute ledger indices bound to local SCS units `0..SCS_COMPUTE_UNITS`, or
+    /// `None` for contiguous base/extension sets whose local index equals the ledger index.
+    hw_slots: Option<[usize; super::hw::sizes::SCS_COMPUTE_UNITS]>,
 }
 impl ComputeUnitSet {
     /// Units `range` (each index and `placement` fix its client addresses; the index fixes its
@@ -110,7 +113,38 @@ impl ComputeUnitSet {
                 GFP_KERNEL,
             )?;
         }
-        Ok(Arc::new(Self { units }, GFP_KERNEL)?)
+        Ok(Arc::new(
+            Self {
+                units,
+                hw_slots: None,
+            },
+            GFP_KERNEL,
+        )?)
+    }
+    /// SCS-capable compute units mapped at local VA indices `0..SCS_COMPUTE_UNITS` and bound to
+    /// device-wide healthy compute ledger indices `hw_slots`.
+    fn new_scs(
+        factory: &Factory,
+        bind: &mmu::VmBind,
+        vm: &mmu::Vm,
+        live: &Arc<super::vm::LiveToken>,
+        hw_slots: [usize; super::hw::sizes::SCS_COMPUTE_UNITS],
+        seeds: u32,
+    ) -> Result<Arc<Self>> {
+        let mut units = KVec::with_capacity(super::hw::sizes::SCS_COMPUTE_UNITS, GFP_KERNEL)?;
+        for local in 0..super::hw::sizes::SCS_COMPUTE_UNITS {
+            units.push(
+                ComputeArena::new(factory, bind, vm, live, local, Placement::Scs { seeds })?,
+                GFP_KERNEL,
+            )?;
+        }
+        Ok(Arc::new(
+            Self {
+                units,
+                hw_slots: Some(hw_slots),
+            },
+            GFP_KERNEL,
+        )?)
     }
     fn len(&self) -> usize {
         self.units.len()
@@ -176,6 +210,8 @@ const RENDER_BURST_COMMANDS: usize = BASE_RENDER_SLOTS;
 pub(crate) struct PrepareHints<'a> {
     /// A base compute unit (`0..BASE_COMPUTE_UNITS`) is quarantined: allocate extension units.
     pub(crate) expand_compute_ext: bool,
+    /// Bitmask of permanently quarantined device-wide compute units (`0..COMPUTE_UNITS`).
+    pub(crate) quarantined_compute_mask: u32,
     /// A base render pass slot (`0..BASE_RENDER_SLOTS`) is quarantined: allocate extension slots.
     pub(crate) expand_render_ext: bool,
     /// Bitmask of permanently quarantined device-wide PB/UMA allocator slots (`0..PB_SLOTS`).
@@ -184,6 +220,81 @@ pub(crate) struct PrepareHints<'a> {
     pub(crate) next_pb_slot: &'a AtomicU32,
     /// Live open VMs owning a `RenderArena`, used for multi-VM pass-slot headroom.
     pub(crate) active_render_vms: &'a Arc<AtomicU32>,
+}
+
+/// Selects `SCS_COMPUTE_UNITS` distinct hardware compute ledger indices for a VM's SCS compute
+/// set, skipping permanently quarantined units in `quarantined_mask`. Scans from `0` up so
+/// pipe-0-exclusive units (`0..PIPE1_COMPUTE_START`) are preferred before falling back to
+/// `PIPE1_COMPUTE_START..max_units`.
+fn pick_scs_compute_slots(
+    quarantined_mask: u32,
+    max_units: usize,
+) -> [usize; super::hw::sizes::SCS_COMPUTE_UNITS] {
+    let limit = max_units
+        .min(super::hw::sizes::COMPUTE_UNITS)
+        .max(super::hw::sizes::SCS_COMPUTE_UNITS);
+    let mut out = [0usize; super::hw::sizes::SCS_COMPUTE_UNITS];
+    let mut found = 0usize;
+    for k in 0..limit {
+        if (quarantined_mask & (1u32 << k)) == 0 {
+            out[found] = k;
+            found += 1;
+            if found == out.len() {
+                return out;
+            }
+        }
+    }
+    for k in 0..limit {
+        if !out[..found].contains(&k) {
+            out[found] = k;
+            found += 1;
+            if found == out.len() {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Selects `[home, alt]` distinct physical PB/UMA allocator slots for a new `RenderArena`,
+/// starting round-robin from `start % WARM_PB_SLOTS` and skipping permanently quarantined slots
+/// in `quarantined_mask`. Scans `0..WARM_PB_SLOTS` first, then `WARM_PB_SLOTS..PB_SLOTS`, so
+/// both base and `render_scs` VMs always start with two healthy PB slots after recovery.
+fn pick_base_pb_slots(start: usize, quarantined_mask: u32) -> [usize; BASE_PB_SLOTS] {
+    let warm = super::hw::sizes::WARM_PB_SLOTS;
+    let total = super::hw::sizes::PB_SLOTS;
+    let mut out = [0usize; BASE_PB_SLOTS];
+    let mut found = 0usize;
+    for i in 0..warm {
+        let slot = (start + i) % warm;
+        if (quarantined_mask & (1u32 << slot)) == 0 {
+            out[found] = slot;
+            found += 1;
+            if found == out.len() {
+                return out;
+            }
+        }
+    }
+    for slot in warm..total {
+        if (quarantined_mask & (1u32 << slot)) == 0 {
+            out[found] = slot;
+            found += 1;
+            if found == out.len() {
+                return out;
+            }
+        }
+    }
+    for i in 0..total {
+        let slot = (start + i) % total;
+        if !out[..found].contains(&slot) {
+            out[found] = slot;
+            found += 1;
+            if found == out.len() {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 /// Updates the consecutive-compute burst counter and reports whether this submission
@@ -889,15 +1000,17 @@ impl Cache {
             if compute_scs {
                 match ready.compute_scs.as_ref().map(|set| set.seeds()) {
                     None => {
-                        ready.compute_scs = Some(ComputeUnitSet::new(
+                        let hw_slots = pick_scs_compute_slots(
+                            hints.quarantined_compute_mask,
+                            super::params::compute_units(),
+                        );
+                        ready.compute_scs = Some(ComputeUnitSet::new_scs(
                             &self.factory,
                             &self.bind,
                             &vm.vm,
                             &self.live,
-                            0..super::hw::sizes::SCS_COMPUTE_UNITS,
-                            Placement::Scs {
-                                seeds: compute_seeds.pool,
-                            },
+                            hw_slots,
+                            compute_seeds.pool,
                         )?);
                     }
                     // The units cannot grow once the hardware may hold them.
@@ -932,15 +1045,14 @@ impl Cache {
                 }
             }
             if render && ready.render.is_none() {
-                let home = (hints.next_pb_slot.fetch_add(1, Ordering::Relaxed) as usize)
-                    % super::hw::sizes::WARM_PB_SLOTS;
-                let alt = (home + 1) % super::hw::sizes::WARM_PB_SLOTS;
+                let start = hints.next_pb_slot.fetch_add(1, Ordering::Relaxed) as usize;
+                let base_pb_slots = pick_base_pb_slots(start, hints.quarantined_pb_mask);
                 ready.render = Some(RenderArena::new(
                     &self.factory,
                     &self.bind,
                     &vm.vm,
                     &self.live,
-                    [home, alt],
+                    base_pb_slots,
                 )?);
                 if ready.render_vm_counter.is_none() {
                     hints.active_render_vms.fetch_add(1, Ordering::AcqRel);
@@ -1258,12 +1370,34 @@ impl Prepared {
         self.compute.as_deref().ok_or(EINVAL)
     }
     /// Compute units this job can use.
+    #[allow(dead_code)]
     pub(crate) fn compute_units(&self) -> Result<usize> {
         Ok(self.compute()?.len() + self.compute_ext.as_deref().map_or(0, ComputeUnitSet::len))
+    }
+    /// Hardware compute ledger bitmask (bit `k` -> unit `k`) this job can use.
+    pub(crate) fn compute_slot_mask(&self) -> Result<u32> {
+        let base = self.compute()?;
+        if let Some(slots) = base.hw_slots {
+            let mut mask = 0u32;
+            for slot in slots {
+                mask |= 1u32 << slot;
+            }
+            return Ok(mask);
+        }
+        let total = self.compute_units()?.min(super::hw::sizes::COMPUTE_UNITS);
+        Ok(if total >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << total) - 1
+        })
     }
     /// The per-unit arena holding compute unit `k`.
     pub(crate) fn compute_arena(&self, k: usize) -> Option<Arc<ComputeArena>> {
         let base = self.compute.as_ref()?;
+        if let Some(slots) = base.hw_slots {
+            let local = slots.iter().position(|&slot| slot == k)?;
+            return base.arena(local);
+        }
         if k < base.len() {
             base.arena(k)
         } else {
@@ -1454,9 +1588,13 @@ impl Prepared {
                 .map(|(tier, _)| PassOwnerArena::Ext(tier.clone()))
         }
     }
-    /// Compute unit `k`: the VM's base units, then its extension units.
+    /// Compute unit `k`: the VM's base/SCS units, then its extension units.
     pub(crate) fn compute_unit(&self, k: usize) -> Result<&ComputeSlot> {
         let base = self.compute()?;
+        if let Some(slots) = base.hw_slots {
+            let local = slots.iter().position(|&slot| slot == k).ok_or(EINVAL)?;
+            return base.unit(local).ok_or(EINVAL);
+        }
         match base.unit(k) {
             Some(unit) => Ok(unit),
             None => self

@@ -118,7 +118,7 @@ impl Progress {
     fn count(&self)->u32{self.count}
     fn set_pending(&self,v:bool){self.pending.store(v,Ordering::Relaxed)}
 }
-struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}fn compute_scs(&self)->bool{false}fn render_passes(&self)->Result<usize>{Ok(8)}fn render_scs(&self)->bool{false}fn pb_slots(&self)->Result<usize>{Ok(2)}fn pb_slot_mask(&self)->Result<(u32,usize)>{Ok((0b11,0))}fn pb_heap_blocks(&self)->Result<u32>{Ok(512)}}
+struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}fn compute_slot_mask(&self)->Result<u32>{Ok(0b11)}fn compute_scs(&self)->bool{false}fn render_passes(&self)->Result<usize>{Ok(8)}fn render_scs(&self)->bool{false}fn pb_slots(&self)->Result<usize>{Ok(2)}fn pb_slot_mask(&self)->Result<(u32,usize)>{Ok((0b11,0))}fn pb_heap_blocks(&self)->Result<u32>{Ok(512)}}
 struct Job { id:u32,vm:Arc<Vm>,queue:Arc<Queue>,progress:Progress,commands:Vec<Command>,dependency:Result,terminal_marked:AtomicBool,resources:Resources }
 impl Job {
     fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}
@@ -153,7 +153,7 @@ struct Slots{compute_exhausted:bool,render_exhausted:bool,releases:u32,quarantin
 impl Slots{
     fn compute_exhausted(&self)->bool{self.compute_exhausted}
     fn render_exhausted(&self)->bool{self.render_exhausted}
-    fn compute_exhausted_within(&self,_units:usize)->bool{self.compute_exhausted}
+    fn compute_exhausted_within(&self,_units:usize)->bool{self.compute_exhausted}fn compute_exhausted_in_mask(&self,_mask:u32)->bool{self.compute_exhausted}
     fn render_exhausted_within(&self,_passes:usize)->bool{self.render_exhausted}
     fn release(&mut self,_claims:&mut Claims){self.releases+=1;}
     fn quarantine(&mut self,_claims:&mut Claims){self.quarantines+=1;}
@@ -177,7 +177,7 @@ mod encode {
     // containment branch below decides whether the unit becomes claimable again.
     pub fn preserve_compute_descriptor(refs:&ComputeRefs,_old:&[u8;160],_before:u64,_work:&mut[u8;8192])->Result<(),()>{if refs.invalid{Err(())}else{Ok(())}}
 }
-mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=4; pub const TA_WAVE_REFILL:usize=TA_WAVE_PASSES/2; pub const COMPUTE_PIPES:usize=2; } }
+mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=4; pub const TA_WAVE_REFILL:usize=TA_WAVE_PASSES/2; pub const COMPUTE_PIPES:usize=2; pub const PIPE1_COMPUTE_START:usize=6; } }
 mod command {pub const RENDER:usize=0;pub const COMPUTE:usize=1;}
 thread_local!{static CLOCK:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};}
 fn now_ns()->u64{CLOCK.with(|clock|clock.get())}
@@ -737,8 +737,13 @@ impl QueueBehindSlots{
     fn compute_exhausted(&self)->bool{self.compute_exhausted}
     fn render_exhausted(&self)->bool{self.render_exhausted}
     fn compute_available(&self,_n:usize)->bool{self.compute_available}
+    fn compute_available_in_mask(&self,_mask:u32)->bool{self.compute_available}
+    fn compute_available_in_mask_for_pipe(&self,mask:u32,pipe:usize)->bool{
+        let allowed = if pipe == 0 { mask } else { mask & !((1u32 << hw::sizes::PIPE1_COMPUTE_START) - 1) };
+        self.compute_available && allowed != 0
+    }
     fn compute_available_for_pipe(&self,n:usize,pipe:usize)->bool{
-        self.compute_available && (pipe == 0 || n > resources::BASE_COMPUTE_UNITS)
+        self.compute_available && (pipe == 0 || n > hw::sizes::PIPE1_COMPUTE_START)
     }
     fn pass_available(&self,_n:usize)->bool{self.pass_available}
 }
@@ -1642,17 +1647,18 @@ mod queue_behind_scope {
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Empty engine uses next_compute_pipe (0), then balances onto pipe 1 while pipe 0 is active.
-        assert_eq!(host.choose_compute_pipe([None, None], 24, false), 0);
+        assert_eq!(host.choose_compute_pipe([None, None], (1u32 << 24) - 1, false), 0);
         host.engine.flights.push(QueueBehindFlight{
             job:c1.clone(),group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,rt_compute:false,target:0x100,
             cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,
             has_timestamps:false,doomed:false,recovery_suspect:false,
         });
-        assert_eq!(host.choose_compute_pipe([None, None], 24, false), 1);
+        assert_eq!(host.choose_compute_pipe([None, None], (1u32 << 24) - 1, false), 1);
         // RT/SCS compute stays pinned to pipe 0 even while pipe 0 is active.
-        assert_eq!(host.choose_compute_pipe([None, None], 24, true), 0);
+        assert_eq!(host.choose_compute_pipe([None, None], (1u32 << 24) - 1, true), 0);
         // A 2-unit base-only VM stays pinned to pipe 0 even while pipe 0 is active.
-        assert_eq!(host.choose_compute_pipe([None, None], 2, false), 0);
+        assert_eq!(host.choose_compute_pipe([None, None], 0b11, false), 0);
+        assert_eq!(host.choose_compute_pipe([None, None], 0b110, false), 0);
         assert!(host.can_queue_behind(&c2));
         // Add second concurrent flight on pipe 1: both pipes active,
         // tie-break uses next_compute_pipe, and cross-VM compute overlaps cleanly.
@@ -1662,9 +1668,9 @@ mod queue_behind_scope {
             has_timestamps:false,doomed:false,recovery_suspect:false,
         });
         host.engine.next_compute_pipe=1;
-        assert_eq!(host.choose_compute_pipe([None, None], 24, false), 1);
+        assert_eq!(host.choose_compute_pipe([None, None], (1u32 << 24) - 1, false), 1);
         host.engine.next_compute_pipe=0;
-        assert_eq!(host.choose_compute_pipe([None, None], 24, false), 0);
+        assert_eq!(host.choose_compute_pipe([None, None], (1u32 << 24) - 1, false), 0);
         assert!(host.can_queue_behind(&c_vm2));
         // Same-VM compute still pipelines without draining.
         assert!(host.can_queue_behind(&c2));
@@ -1705,13 +1711,13 @@ mod queue_behind_scope {
         // Waiting on seq 1 (pipe 0 only) returns [Some(0x100), None] and reuses pipe 0 (zero c2c barrier).
         let w1 = host.wait_compute_stamps_for(&c3, Some(1)).unwrap();
         assert_eq!(w1, [Some(WaitTarget{stamp:0x100,initbm:false}), None]);
-        assert_eq!(host.choose_compute_pipe(w1, 24, false), 0);
+        assert_eq!(host.choose_compute_pipe(w1, (1u32 << 24) - 1, false), 0);
         // Waiting on seq 2 (both pipe 0 seq 1 and pipe 1 seq 2 <= 2) returns both stamps and
         // selects the least-loaded pipe (pipe 0 has 1 active vs pipe 1 has 2 -> picks pipe 0,
         // so prefix_compute emits one cross-pipe c2c barrier on pipe 1's 0x200).
         let w2 = host.wait_compute_stamps_for(&c4, Some(2)).unwrap();
         assert_eq!(w2, [Some(WaitTarget{stamp:0x100,initbm:false}), Some(WaitTarget{stamp:0x200,initbm:false})]);
-        assert_eq!(host.choose_compute_pipe(w2, 24, false), 0);
+        assert_eq!(host.choose_compute_pipe(w2, (1u32 << 24) - 1, false), 0);
         // Unpublished seq 3 returns Err(EAGAIN).
         assert_eq!(host.wait_compute_stamps_for(&c4, Some(3)), Err(EAGAIN));
         // If seq 2 retired out-of-order on pipe 1 while seq 1 is still active on pipe 0,
@@ -1722,7 +1728,7 @@ mod queue_behind_scope {
         assert!(q1.is_compute_retired(2));
         let w2_ooo = host.wait_compute_stamps_for(&c4, Some(2)).unwrap();
         assert_eq!(w2_ooo, [Some(WaitTarget{stamp:0x100,initbm:false}), None]);
-        assert_eq!(host.choose_compute_pipe(w2_ooo, 24, false), 0);
+        assert_eq!(host.choose_compute_pipe(w2_ooo, (1u32 << 24) - 1, false), 0);
         // Once contiguous completed[COMPUTE] reaches 2, wait_compute_stamps_for returns [None, None].
         q1.completed[command::COMPUTE].store(2, Ordering::Release);
         q1.compute_ooo.store(0, Ordering::Release);
@@ -1782,7 +1788,7 @@ mod queue_behind_scope {
         // Cross-queue compute wait resolves pipe 0 stamp 0x100 and keeps q2 on pipe 0 (zero c2c).
         let cw=host.wait_compute_stamps_for(&c2_wait_q1,None).unwrap();
         assert_eq!(cw,[Some(WaitTarget{stamp:0x100,initbm:false}),None]);
-        assert_eq!(host.choose_compute_pipe(cw,24,false),0);
+        assert_eq!(host.choose_compute_pipe(cw,(1u32<<24)-1,false),0);
         // Cross-queue render wait resolves q1's FS stamp 0x200.
         assert_eq!(host.wait_stamp_for(&c2_wait_q1,command::RENDER,None),Ok(Some(WaitTarget{stamp:0x200,initbm:false})));
         // query_access compute waiting via fw_waits on a timestamped q1 flight must wait to retire;

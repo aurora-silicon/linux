@@ -1114,8 +1114,8 @@ impl Firmware {
                 && matches!(command(&job, job.progress.sent()), Some(Command::Compute(_)))
                 && job
                     .resources
-                    .compute_units()
-                    .is_ok_and(|n| self.slots.compute_exhausted_within(n))
+                    .compute_slot_mask()
+                    .is_ok_and(|mask| self.slots.compute_exhausted_in_mask(mask))
             {
                 self.engine.unpend(&job);
                 let _ = job.mark_terminal_retired();
@@ -1351,8 +1351,8 @@ impl Firmware {
                     && (compute_count >= params::compute_flights()
                         || job
                             .resources
-                            .compute_units()
-                            .is_ok_and(|units| !self.slots.compute_available(units)))
+                            .compute_slot_mask()
+                            .is_ok_and(|mask| !self.slots.compute_available_in_mask(mask)))
             }
             Some(Command::Render(_)) => {
                 let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
@@ -1490,8 +1490,8 @@ impl Firmware {
                     && super::recovery::logic::next_ordinal(e.ordinal).is_some()
                     && job
                         .resources
-                        .compute_units()
-                        .is_ok_and(|units| self.slots.compute_available(units))
+                        .compute_slot_mask()
+                        .is_ok_and(|mask| self.slots.compute_available_in_mask(mask))
             }
             Some(Command::Render(_)) => {
                 let cross_vm_compute = e
@@ -1796,8 +1796,9 @@ impl Firmware {
     }
 
     /// Chooses which compute pipe (`0..COMPUTE_PIPES`) executes the next compute command:
-    /// - Base-only VMs (`units <= BASE_COMPUTE_UNITS`) or states where pipe 1 has no available
-    ///   extension unit stay on pipe 0 so base units `0..2` never split across two pipes.
+    /// - Base-only/SCS VMs (bits strictly in `0..PIPE1_COMPUTE_START`) or states where pipe 1
+    ///   has no available unit in `slot_mask` stay on pipe 0 so `0..PIPE1_COMPUTE_START` never
+    ///   split across two pipes.
     /// - If the command waits only on one pipe, reuse that pipe (in-order ring, zero `c2c`
     ///   barrier).
     /// - If barrier-free (`[None, None]`) or waiting on both pipes (`[Some, Some]`), pick the
@@ -1805,7 +1806,7 @@ impl Firmware {
     fn choose_compute_pipe(
         &self,
         waits: [Option<WaitTarget>; sizes::COMPUTE_PIPES],
-        units: usize,
+        slot_mask: u32,
         rt_compute: bool,
     ) -> usize {
         if rt_compute
@@ -1814,8 +1815,7 @@ impl Firmware {
                 .flights
                 .iter()
                 .any(|fl| fl.computes != 0 && fl.rt_compute)
-            || units <= super::resources::BASE_COMPUTE_UNITS
-            || !self.slots.compute_available_for_pipe(units, 1)
+            || !self.slots.compute_available_in_mask_for_pipe(slot_mask, 1)
         {
             return 0;
         }
@@ -1823,7 +1823,7 @@ impl Firmware {
             [Some(_), None] => 0,
             [None, Some(_)] => 1,
             _ => {
-                if !self.slots.compute_available_for_pipe(units, 0) {
+                if !self.slots.compute_available_in_mask_for_pipe(slot_mask, 0) {
                     return 1;
                 }
                 let mut active = [0usize; sizes::COMPUTE_PIPES];
@@ -2059,7 +2059,7 @@ impl Firmware {
         let (compute_pipe, c_waits) = if render {
             (0usize, [None; sizes::COMPUTE_PIPES])
         } else {
-            let units = job.resources.compute_units()?;
+            let slot_mask = job.resources.compute_slot_mask()?;
             let rt_compute = job.resources.compute_scs()
                 || matches!(cmd, Command::Compute(c) if c.is_rt());
             let waits = self.wait_compute_stamps_for(
@@ -2067,7 +2067,7 @@ impl Firmware {
                 job.command_order(index)
                     .and_then(|o| o.wait_through[super::command::COMPUTE]),
             )?;
-            (self.choose_compute_pipe(waits, units, rt_compute), waits)
+            (self.choose_compute_pipe(waits, slot_mask, rt_compute), waits)
         };
         let pipe_behind = !render
             && self
@@ -2172,10 +2172,11 @@ impl Firmware {
                     false,
                 )?;
                 let mut last_seq = job.command_order(index).map(|o| o.sequence);
-                let vm_units = job.resources.compute_units()?.min(sizes::COMPUTE_UNITS);
+                let slot_mask = job.resources.compute_slot_mask()?;
                 let free_c = self
                     .slots
-                    .free_compute_in_for_pipe(vm_units, compute_pipe) as usize;
+                    .free_compute_in_mask_for_pipe(slot_mask, compute_pipe)
+                    as usize;
                 let mut active_pipe = [0usize; sizes::COMPUTE_PIPES];
                 for fl in &self.engine.flights {
                     if fl.computes != 0 {

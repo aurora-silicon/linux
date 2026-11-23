@@ -923,8 +923,17 @@ impl Slots {
             .exhausted_within(super::params::compute_units())
     }
     /// Whether none of the first `n` compute units (a VM's own) can ever be claimed again.
+    #[allow(dead_code)]
     pub(crate) fn compute_exhausted_within(&self, n: usize) -> bool {
         self.compute.lifetime.exhausted_within(n)
+    }
+    /// Whether none of the compute units in `mask` (bit `k` -> unit `k`) can ever be claimed.
+    pub(crate) fn compute_exhausted_in_mask(&self, mask: u32) -> bool {
+        self.compute.lifetime.exhausted_in_mask(mask)
+    }
+    /// Bitmask of permanently quarantined compute units (`0..COMPUTE_UNITS`).
+    pub(crate) fn quarantined_compute_mask(&self) -> u32 {
+        self.compute.lifetime.quarantined_mask()
     }
     pub(crate) fn render_exhausted(&self) -> bool {
         self.render.lifetime.exhausted()
@@ -949,20 +958,44 @@ impl Slots {
         [self.compute.lifetime.counts(), self.render.lifetime.counts()]
     }
     /// Whether one of the first `n` compute units can be claimed now.
+    #[allow(dead_code)]
     pub(crate) fn compute_available(&self, n: usize) -> bool {
         (0..n.min(sizes::COMPUTE_UNITS)).any(|k| self.compute.lifetime.available(k))
     }
+    /// Whether any compute unit in `mask` can be claimed now.
+    pub(crate) fn compute_available_in_mask(&self, mask: u32) -> bool {
+        let mut rem = mask;
+        while rem != 0 {
+            let k = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            if k < sizes::COMPUTE_UNITS && self.compute.lifetime.available(k) {
+                return true;
+            }
+        }
+        false
+    }
+    /// Whether any compute unit in `mask` eligible for `pipe` can be claimed now.
+    /// Pipe 0 may claim any bit in `mask`; secondary pipes stay in
+    /// `PIPE1_COMPUTE_START..COMPUTE_UNITS` so `0..PIPE1_COMPUTE_START` only ever hold pipe-0
+    /// leases.
+    pub(crate) fn compute_available_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> bool {
+        let allowed = if pipe == 0 {
+            mask
+        } else {
+            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
+        };
+        self.compute_available_in_mask(allowed)
+    }
     /// Whether one of the first `n` compute units eligible for `pipe` can be claimed now.
-    /// Pipe 0 may claim `0..n`; secondary pipes stay in `BASE_COMPUTE_UNITS..n` so a 2-unit
-    /// base-only VM can never see both base units undisplaced across two pipes.
+    #[allow(dead_code)]
     pub(crate) fn compute_available_for_pipe(&self, n: usize, pipe: usize) -> bool {
         let limit = n.min(sizes::COMPUTE_UNITS);
-        let start = if pipe == 0 {
-            0
+        let mask = if limit >= 32 {
+            u32::MAX
         } else {
-            super::resources::BASE_COMPUTE_UNITS.min(limit)
+            (1u32 << limit) - 1
         };
-        (start..limit).any(|k| self.compute.lifetime.available(k))
+        self.compute_available_in_mask_for_pipe(mask, pipe)
     }
     /// Whether one of the first `n` render pass slots can be claimed now.
     #[allow(dead_code)]
@@ -1161,20 +1194,37 @@ impl Slots {
         self.free_compute_in(super::params::compute_units())
     }
     /// Available compute units within the first `n` units (a VM's prepared count).
+    #[allow(dead_code)]
     pub(crate) fn free_compute_in(&self, n: usize) -> u32 {
         self.free_compute_in_for_pipe(n, 0)
     }
+    /// Available compute units in `mask` eligible for `pipe`.
+    pub(crate) fn free_compute_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> u32 {
+        let mut rem = if pipe == 0 {
+            mask
+        } else {
+            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
+        };
+        let mut count = 0u32;
+        while rem != 0 {
+            let k = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            if k < sizes::COMPUTE_UNITS && self.compute.lifetime.available(k) {
+                count += 1;
+            }
+        }
+        count
+    }
     /// Available compute units within the first `n` units eligible for `pipe`.
+    #[allow(dead_code)]
     pub(crate) fn free_compute_in_for_pipe(&self, n: usize, pipe: usize) -> u32 {
         let limit = n.min(sizes::COMPUTE_UNITS);
-        let start = if pipe == 0 {
-            0
+        let mask = if limit >= 32 {
+            u32::MAX
         } else {
-            super::resources::BASE_COMPUTE_UNITS.min(limit)
+            (1u32 << limit) - 1
         };
-        (start..limit)
-            .filter(|&k| self.compute.lifetime.available(k))
-            .count() as u32
+        self.free_compute_in_mask_for_pipe(mask, pipe)
     }
     /// Forces a full scrub on the next claim of every slot (after firmware recovery).
     #[allow(dead_code)]
@@ -1241,25 +1291,26 @@ impl Slots {
             return Ok(None);
         }
         // Prefer a warm unit already owned by `vm_id` (`!scrub_full`), then an unowned unit,
-        // before falling back to round-robin over `start..n`: pipe 0 spans `0..n`, while
-        // secondary pipes stay in `BASE_COMPUTE_UNITS..n` so base units `0..2` only ever hold
-        // pipe-0 leases and a 2-unit VM can never hit `compute_exhausted_within(2)`.
-        let n = units.compute_units()?.min(sizes::COMPUTE_UNITS);
-        let start = if pipe == 0 {
-            0
+        // before falling back to round-robin over `allowed`: pipe 0 spans `mask`, while
+        // secondary pipes stay in `PIPE1_COMPUTE_START..COMPUTE_UNITS` so `0..PIPE1_COMPUTE_START`
+        // only ever hold pipe-0 leases and 2-unit base/SCS VMs never split across two pipes.
+        let mask = units.compute_slot_mask()?;
+        let allowed = if pipe == 0 {
+            mask
         } else {
-            super::resources::BASE_COMPUTE_UNITS
+            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
         };
-        if start >= n {
+        if allowed == 0 {
             return Ok(None);
         }
-        let span = n - start;
-        let base_cursor = (self.cursor as usize).saturating_sub(start) % span;
+        let n = sizes::COMPUTE_UNITS;
+        let base_cursor = (self.cursor as usize) % n;
         let mut chosen = None;
         if let Some(id) = vm_id {
-            for i in 0..span {
-                let k = start + (base_cursor + i) % span;
-                if !self.compute.scrub_full[k]
+            for i in 0..n {
+                let k = (base_cursor + i) % n;
+                if (allowed & (1u32 << k)) != 0
+                    && !self.compute.scrub_full[k]
                     && self.compute.owner[k]
                         .as_ref()
                         .is_some_and(|prev| prev.id == id)
@@ -1270,9 +1321,12 @@ impl Slots {
                 }
             }
             if chosen.is_none() {
-                for i in 0..span {
-                    let k = start + (base_cursor + i) % span;
-                    if self.compute.owner[k].is_none() && self.compute.lifetime.claim(k) {
+                for i in 0..n {
+                    let k = (base_cursor + i) % n;
+                    if (allowed & (1u32 << k)) != 0
+                        && self.compute.owner[k].is_none()
+                        && self.compute.lifetime.claim(k)
+                    {
                         chosen = Some(k);
                         break;
                     }
@@ -1280,9 +1334,9 @@ impl Slots {
             }
         }
         if chosen.is_none() {
-            for i in 0..span {
-                let k = start + (base_cursor + i) % span;
-                if self.compute.lifetime.claim(k) {
+            for i in 0..n {
+                let k = (base_cursor + i) % n;
+                if (allowed & (1u32 << k)) != 0 && self.compute.lifetime.claim(k) {
                     chosen = Some(k);
                     break;
                 }

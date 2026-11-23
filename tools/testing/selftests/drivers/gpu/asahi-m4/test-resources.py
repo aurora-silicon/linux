@@ -176,7 +176,7 @@ pub mod g16 {
     pub mod resources {
         use core::sync::atomic::{AtomicU64,Ordering};use crate::*;
         pub struct PassDirty<'a>{pub tpc:&'a AtomicU64,pub tilemap:&'a AtomicU64,pub tilemap_last:&'a AtomicU64,pub tilemap_clean:&'a AtomicU64,pub heap:&'a AtomicU64}
-        pub struct ComputeArena{pub compute:KVec<super::slots::ComputeSlot>,pub render:Option<crate::sync::Arc<RenderArena>>}
+        pub struct ComputeArena{pub compute:KVec<super::slots::ComputeSlot>,pub render:Option<crate::sync::Arc<RenderArena>>,pub hw_slots:Option<[usize;super::hw::sizes::SCS_COMPUTE_UNITS]>}
         // A job's compute units; here one arena.
         pub type Prepared=ComputeArena;
         #[derive(Clone)]
@@ -199,10 +199,28 @@ pub mod g16 {
         }
         impl ComputeArena{
             pub fn compute_units(&self)->Result<usize>{Ok(self.compute.len())}
-            pub fn compute_unit(&self,k:usize)->Result<&super::slots::ComputeSlot>{self.compute.get(k).ok_or(EINVAL)}
+            pub fn compute_slot_mask(&self)->Result<u32>{
+                if let Some(slots)=self.hw_slots {
+                    let mut mask=0u32;
+                    for slot in slots { mask |= 1u32 << slot; }
+                    return Ok(mask);
+                }
+                let n=self.compute.len().min(super::hw::sizes::COMPUTE_UNITS);
+                Ok(if n>=32 { u32::MAX } else { (1u32 << n) - 1 })
+            }
+            pub fn compute_unit(&self,k:usize)->Result<&super::slots::ComputeSlot>{
+                if let Some(slots)=self.hw_slots {
+                    let local=slots.iter().position(|&s|s==k).ok_or(EINVAL)?;
+                    return self.compute.get(local).ok_or(EINVAL);
+                }
+                self.compute.get(k).ok_or(EINVAL)
+            }
             pub fn compute_arena(&self,k:usize)->Option<crate::sync::Arc<ComputeArena>>{
+                let idx=if let Some(slots)=self.hw_slots {
+                    slots.iter().position(|&s|s==k)?
+                } else { k };
                 COMPUTE_OWNER_ARENAS
-                    .with(|a|a.borrow().as_ref().and_then(|v|v.get(k).cloned()))
+                    .with(|a|a.borrow().as_ref().and_then(|v|v.get(idx).cloned()))
                     .or_else(||COMPUTE_OWNER_ARENA.with(|a|a.borrow().clone()))
             }
             pub fn render_arena(&self)->Option<crate::sync::Arc<RenderArena>>{self.render.clone()}
@@ -216,6 +234,7 @@ pub mod g16 {
         impl RenderArena{ __SET_DIRTY__ }
         pub(crate) const BASE_COMPUTE_UNITS: usize = 2;
         pub(crate) const BASE_RENDER_SLOTS: usize = super::hw::sizes::BASE_RENDER_SLOTS;
+        const BASE_PB_SLOTS: usize = super::hw::sizes::BASE_PB_SLOTS;
         __RENDER_BURST__
     }
     pub mod boot {pub fn eproto()->crate::Error{crate::Error(71)}}
@@ -256,7 +275,7 @@ pub mod g16 {
         let mut compute=KVec::new();let mut passes=KVec::new();
         let f=g16::object::Factory;
         for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,&f,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
-        Arenas{compute:g16::resources::ComputeArena{compute,render:None},render:render_arena(passes)}
+        Arenas{compute:g16::resources::ComputeArena{compute,render:None,hw_slots:None},render:render_arena(passes)}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();}
     fn drain_scrubs(batch:g16::slots::ScrubBatch)->bool{let mut q=g16::slots::ScrubQueue::new();q.push_batch(batch);let mut wake=false;while let Some(mut item)=q.pop(){wake|=item.run_one();}wake}
@@ -1062,7 +1081,7 @@ pub mod g16 {
     #[test]fn offlock_scrub_cleans_displaced_slot_and_skips_sync_scrub_on_same_vm_claim(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
         let render=sync::Arc::new(arena.render,0).unwrap();
-        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone())};
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone()),hw_slots:None};
         let a=vm(1);
         let geo=g16::encode::Geometry{tpc_bytes:0x2000,tilemap_bytes:0x4000};
         // Publish and retire slot 0: not displaced yet, so nothing is staged.
@@ -1113,7 +1132,7 @@ pub mod g16 {
     #[test]fn offlock_scrub_falls_back_on_error_drop_recovery_and_cross_vm(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
         let render=sync::Arc::new(arena.render,0).unwrap();
-        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone())};
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone()),hw_slots:None};
         let a=vm(1);let b=vm(2);
         // Prime and displace slot 0.
         let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
@@ -1164,7 +1183,7 @@ pub mod g16 {
     #[test]fn post_publish_scrub_staging_does_not_block_immediate_slot_reuse(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
         let render=sync::Arc::new(arena.render,0).unwrap();
-        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone())};
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone()),hw_slots:None};
         let a=vm(1);
         let geo=g16::encode::Geometry{tpc_bytes:0x1000,tilemap_bytes:0x2000};
         // Prime slot 0, then displace it by retiring slot 1; record retirement without staging yet.
@@ -1206,7 +1225,7 @@ pub mod g16 {
         for k in 0..hw::sizes::COMPUTE_UNITS {
             units.push(ComputeSlot::new(&mut o,&g16::object::Factory,k as u64).unwrap(),0).unwrap();
         }
-        let prep=ComputeArena{compute:units,render:None};
+        let prep=ComputeArena{compute:units,render:None,hw_slots:None};
         let a=Arc::new(
             vm::VmState{id:1,slot:1,generation:1,vm:vm::MockVm::new()},0,
         ).unwrap();
@@ -1246,7 +1265,7 @@ pub mod g16 {
             passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes),0).unwrap();
-        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render)};
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render),hw_slots:None};
         let a=vm(1);
         // Wrapped submission order [46, 47, 0]: retiring in order leaves slot 0 as last_retired
         // while high slots 46 and 47 (bits above 31) are displaced and reusable immediately.
@@ -1308,7 +1327,7 @@ pub mod g16 {
             passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes),0).unwrap();
-        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render)};
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render),hw_slots:None};
         let a=vm(1);let b=vm(2);
 
         // Per-unit compute hold_compute_slot + verify_held + note_published.
@@ -1474,7 +1493,7 @@ pub mod g16 {
         for k in 0..4u64 {
             units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
         }
-        let prep_full=g16::resources::ComputeArena{compute:units,render:None};
+        let prep_full=g16::resources::ComputeArena{compute:units,render:None,hw_slots:None};
         let a=vm(1);let b=vm(2);
         // Retire base unit 0, then hang and quarantine base unit 1 (or vice versa):
         // unit 0 is now retired-undisplaced and unit 1 is quarantined -> base [0..2] exhausted.
@@ -1501,37 +1520,38 @@ pub mod g16 {
         for k in 0..2u64 {
             base_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
         }
-        let prep_base=g16::resources::ComputeArena{compute:base_units,render:None};
+        let prep_base=g16::resources::ComputeArena{compute:base_units,render:None,hw_slots:None};
         assert_eq!(s.claim_compute_for(&prep_base,&mut c,Some(b.id)).unwrap(),Some(0));
         s.release(&mut c);
     }
 
     #[test]fn two_pipe_compute_out_of_order_retire_and_base_unit_isolation(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
+        let p1_start = g16::hw::sizes::PIPE1_COMPUTE_START;
         let mut units=KVec::new();
-        for k in 0..4u64 {
+        for k in 0..(p1_start + 2) as u64 {
             units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
         }
-        let prep=g16::resources::ComputeArena{compute:units,render:None};
+        let prep=g16::resources::ComputeArena{compute:units,render:None,hw_slots:None};
         let a=vm(1);let b=vm(2);
-        // Pipe 0 claims unit 0; pipe 1 stays out of base units 0..2 and claims unit 2.
+        // Pipe 0 claims unit 0; pipe 1 stays out of 0..PIPE1_COMPUTE_START and claims PIPE1_COMPUTE_START.
         let mut c0=Claims::new();
         let mut c1=Claims::new();
         assert_eq!(s.claim_compute_for_pipe(&prep,&mut c0,Some(a.id),0).unwrap(),Some(0));
         assert_eq!(c0.compute_pipe,0);
         s.hold_vm(&c0,&a).unwrap();s.publish(&mut c0).unwrap();
-        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c1,Some(a.id),1).unwrap(),Some(2));
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c1,Some(a.id),1).unwrap(),Some(p1_start));
         assert_eq!(c1.compute_pipe,1);
         s.hold_vm(&c1,&a).unwrap();s.publish(&mut c1).unwrap();
         // Pipe 1 finishes ahead of still-running pipe 0: retire must succeed (no EINVAL).
         assert_eq!(s.retire(&mut c1),Ok(()));
-        // Second pipe-1 flight claims unit 3 and retires, displacing unit 2 on pipe 1.
+        // Second pipe-1 flight claims PIPE1_COMPUTE_START + 1 and retires, displacing PIPE1_COMPUTE_START.
         let mut c1b=Claims::new();
-        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c1b,Some(a.id),1).unwrap(),Some(3));
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c1b,Some(a.id),1).unwrap(),Some(p1_start + 1));
         s.hold_vm(&c1b,&a).unwrap();s.publish(&mut c1b).unwrap();
         assert_eq!(s.retire(&mut c1b),Ok(()));
-        assert!(s.compute_available_for_pipe(4,1));
-        // Now pipe 0's unit 0 retires: pipe 1's newer unit 3 must NOT mark unit 0 reusable,
+        assert!(s.compute_available_for_pipe(p1_start + 2,1));
+        // Now pipe 0's unit 0 retires: pipe 1's newer retirement must NOT mark unit 0 reusable,
         // while base unit 1 remains fresh so a 2-unit base-only VM is never exhausted!
         assert_eq!(s.retire(&mut c0),Ok(()));
         assert!(!s.compute_exhausted_within(2));
@@ -1544,18 +1564,87 @@ pub mod g16 {
         assert!(!s.compute_exhausted_within(2));
         assert!(s.compute_available(2));
         // A 2-unit base-only VM can claim displaced base unit 0 on pipe 0, while pipe 1
-        // reclaims displaced extension unit 2 on the 4-unit VM without touching base units 0..2.
+        // reclaims displaced extension unit PIPE1_COMPUTE_START without touching 0..PIPE1_COMPUTE_START.
         let mut base_units=KVec::new();
         for k in 0..2u64 {
             base_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
         }
-        let prep_base=g16::resources::ComputeArena{compute:base_units,render:None};
+        let prep_base=g16::resources::ComputeArena{compute:base_units,render:None,hw_slots:None};
         let mut c0c=Claims::new();
         assert_eq!(s.claim_compute_for_pipe(&prep_base,&mut c0c,Some(b.id),0).unwrap(),Some(0));
         let mut c1c=Claims::new();
-        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c1c,Some(b.id),1).unwrap(),Some(2));
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c1c,Some(b.id),1).unwrap(),Some(p1_start));
         s.release(&mut c0c);
         s.release(&mut c1c);
+    }
+
+    #[test]fn scs_compute_and_base_pb_route_around_quarantined_slots(){
+        use crate::g16::resources::{pick_base_pb_slots, pick_scs_compute_slots};
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();
+        let p1_start = g16::hw::sizes::PIPE1_COMPUTE_START;
+        let mut full_units=KVec::new();
+        for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
+            full_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
+        }
+        let prep_full=g16::resources::ComputeArena{compute:full_units,render:None,hw_slots:None};
+        let bad=vm(1);let fresh=vm(2);let other=vm(3);
+        // Exact dcp102b sequence: a prior process hangs and permanently quarantines compute unit 0.
+        let mut c=Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&prep_full,&mut c,Some(bad.id),0).unwrap(),Some(0));
+        s.hold_vm(&c,&bad).unwrap();s.publish(&mut c).unwrap();s.quarantine(&mut c);
+        assert_eq!(s.quarantined_compute_mask(), 1u32 << 0);
+        // Pipe 1 runs concurrent non-SCS compute on PIPE1_COMPUTE_START..COMPUTE_UNITS.
+        let mut c_p1=Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&prep_full,&mut c_p1,Some(other.id),1).unwrap(),Some(p1_start));
+        s.hold_vm(&c_p1,&other).unwrap();s.publish(&mut c_p1).unwrap();s.retire(&mut c_p1).unwrap();
+        // Brand-new SCS compute VM skips quarantined unit 0 and binds [1, 2] (mask 0b110), both < PIPE1_COMPUTE_START.
+        let scs_slots = pick_scs_compute_slots(s.quarantined_compute_mask(), g16::hw::sizes::COMPUTE_UNITS);
+        assert_eq!(scs_slots, [1, 2]);
+        let mut scs_units=KVec::new();
+        for local in 0..g16::hw::sizes::SCS_COMPUTE_UNITS as u64 {
+            scs_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,local).unwrap(),0).unwrap();
+        }
+        let prep_scs=g16::resources::ComputeArena{compute:scs_units,render:None,hw_slots:Some(scs_slots)};
+        let scs_mask = prep_scs.compute_slot_mask().unwrap();
+        assert_eq!(scs_mask, (1u32 << 1) | (1u32 << 2));
+        // Execute two back-to-back SCS compute commands (e.g. rt.scene p_rt + p_comp) repeatedly:
+        // must never hit compute_exhausted_in_mask and must ping-pong cleanly across [1, 2].
+        for expected in [1usize, 2, 1, 2] {
+            assert!(!s.compute_exhausted_in_mask(scs_mask));
+            assert!(s.compute_available_in_mask(scs_mask));
+            let mut cs=Claims::new();
+            assert_eq!(s.claim_compute_for_pipe(&prep_scs,&mut cs,Some(fresh.id),0).unwrap(),Some(expected));
+            s.hold_vm(&cs,&fresh).unwrap();s.publish(&mut cs).unwrap();s.retire(&mut cs).unwrap();
+        }
+        // Up to 4 quarantines in 0..PIPE1_COMPUTE_START stay inside pipe-0-exclusive 0..6; beyond that falls back cleanly.
+        assert_eq!(pick_scs_compute_slots(0b001111, g16::hw::sizes::COMPUTE_UNITS), [4, 5]);
+        assert_eq!(pick_scs_compute_slots(0b111111, g16::hw::sizes::COMPUTE_UNITS), [6, 7]);
+        // Twin fix: pick_base_pb_slots skips quarantined warm PB slots and falls back to EXT_PB_SLOTS.
+        assert_eq!(pick_base_pb_slots(0, 0), [0, 1]);
+        assert_eq!(pick_base_pb_slots(3, 1u32 << 3), [4, 5]);
+        assert_eq!(pick_base_pb_slots(3, (1u32 << 3) | (1u32 << 4)), [5, 6]);
+        let all_warm_but_one = ((1u32 << g16::hw::sizes::WARM_PB_SLOTS) - 1) & !(1u32 << 7);
+        assert_eq!(pick_base_pb_slots(0, all_warm_but_one), [7, g16::hw::sizes::WARM_PB_SLOTS]);
+        // Confirm Pools::exhausted_for_mask_mode stays false for render_scs with picked healthy slots.
+        let mut pools = g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let bad_vm = vm(10);
+        let good_vm = vm(11);
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let ep = g16::pools::PbEpoch::new(
+            &factory,
+            &bad_vm,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+        )
+        .unwrap();
+        ep.prepare(3, 0x70c0000000, 2048).unwrap();
+        ep.expose();
+        pools.publish_flight(3);
+        pools.quarantine_flight(3, Some(ep));
+        let picked = pick_base_pb_slots(3, pools.quarantined_mask());
+        assert_eq!(picked, [4, 5]);
+        let pb_mask = (1u32 << picked[0]) | (1u32 << picked[1]);
+        assert!(!pools.exhausted_for_mask_mode(&good_vm, pb_mask, picked[0], true));
     }
 
     #[test]fn base_render_quarantine_expands_fresh_vm_and_recovers_displacement(){
@@ -1566,7 +1655,7 @@ pub mod g16 {
             passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes),0).unwrap();
-        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render)};
+        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render),hw_slots:None};
         let a=vm(1);let b=vm(2);
         let geo=g16::encode::Geometry{tpc_bytes:0x1000,tilemap_bytes:0x1000};
         // Retire base pass slot 0, then hang and quarantine base pass slot 1 -> base [0..2] exhausted.
@@ -1598,7 +1687,7 @@ pub mod g16 {
         use crate::g16::slots::ScrubQueue;
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
         let render=sync::Arc::new(arena.render,0).unwrap();
-        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone())};
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone()),hw_slots:None};
         let a=vm(1);
         let geo=g16::encode::Geometry{tpc_bytes:0x1000,tilemap_bytes:0x2000};
         // Prime and displace slot 0.
@@ -1659,7 +1748,7 @@ pub mod g16 {
             passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes),0).unwrap();
-        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render.clone())};
+        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render.clone()),hw_slots:None};
         let a=vm(1);let b=vm(2);
         let pub_retire=|s:&mut Slots,k:usize,vm:&sync::Arc<g16::vm::VmState>|{
             let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1u64<<k;
@@ -1845,7 +1934,7 @@ pub mod g16 {
         for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
             units.push(g16::slots::ComputeSlot::new(&mut o, &g16::object::Factory, k).unwrap(), 0).unwrap();
         }
-        let prep = g16::resources::ComputeArena { compute: units, render: None };
+        let prep = g16::resources::ComputeArena { compute: units, render: None, hw_slots: None };
         let vms = [vm(1), vm(2), vm(3), vm(4)];
         // Round 0 warms one unit per VM (4 units out of 24); VM2's retirement displaces VM1's
         // unit immediately so from round 1 onward every sequential interleaved claim is warm.
@@ -2007,6 +2096,7 @@ pub mod g16 {
         let prep = g16::resources::ComputeArena {
             compute: KVec::new(),
             render: Some(render),
+            hw_slots: None,
         };
         let geo = g16::encode::Geometry { tpc_bytes: 0x1000, tilemap_bytes: 0x2000 };
         let vms: Vec<_> = (0..16u64).map(|i| vm(200 + i)).collect();
@@ -2096,7 +2186,7 @@ pub mod g16 {
         for k in 0..18 {
             passes.push(PassSlot::new(&mut o, k as u64, 1).unwrap(), 0).unwrap();
         }
-        let shared_prep_compute = ComputeArena { compute: compute_slots, render: None };
+        let shared_prep_compute = ComputeArena { compute: compute_slots, render: None, hw_slots: None };
         let geo = g16::encode::Geometry { tpc_bytes: 0x1000, tilemap_bytes: 0x2000 };
 
         let mut vms = Vec::new();
@@ -2114,9 +2204,9 @@ pub mod g16 {
                 r_passes.push(PassSlot::new(&mut o, k as u64, 1).unwrap(), 0).unwrap();
             }
             let r_arena = sync::Arc::new(render_arena(r_passes), 0).unwrap();
-            let r_prep = ComputeArena { compute: KVec::new(), render: Some(r_arena.clone()) };
+            let r_prep = ComputeArena { compute: KVec::new(), render: Some(r_arena.clone()), hw_slots: None };
             let c_arena = sync::Arc::new(
-                ComputeArena { compute: KVec::new(), render: None }, 0,
+                ComputeArena { compute: KVec::new(), render: None, hw_slots: None }, 0,
             ).unwrap();
 
             // 1) PB warm slot i
@@ -2205,7 +2295,7 @@ pub mod g16 {
         // Live VM 17 runs 1 render + 1 compute, displacing slot 15 everywhere.
         let live = vm(500);
         let live_r_arena = sync::Arc::new(render_arena(passes), 0).unwrap();
-        let live_r_prep = ComputeArena { compute: KVec::new(), render: Some(live_r_arena.clone()) };
+        let live_r_prep = ComputeArena { compute: KVec::new(), render: Some(live_r_arena.clone()), hw_slots: None };
         let live_slot = p
             .pick_slot_in_mask_blocks_mode(&live, false, 0b11, 0, 512, false)
             .unwrap();
@@ -2281,7 +2371,7 @@ pub mod g16 {
             sc_passes.push(PassSlot::new(&mut o, k as u64, 1).unwrap(), 0).unwrap();
         }
         let sc_arena = sync::Arc::new(render_arena(sc_passes), 0).unwrap();
-        let sc_prep = ComputeArena { compute: KVec::new(), render: Some(sc_arena.clone()) };
+        let sc_prep = ComputeArena { compute: KVec::new(), render: Some(sc_arena.clone()), hw_slots: None };
         let va = vm(600);
         let vb = vm(601);
         for (k, owner) in [(0usize, &va), (1usize, &vb)] {
@@ -2341,7 +2431,7 @@ pub mod g16 {
         for k in 0..COMPUTE_UNITS {
             compute_slots.push(ComputeSlot::new(&mut o, &g16::object::Factory, k as u64).unwrap(), 0).unwrap();
         }
-        let prep = ComputeArena { compute: compute_slots, render: None };
+        let prep = ComputeArena { compute: compute_slots, render: None, hw_slots: None };
 
         // Simulate 8 compute VMs, each owning 24 independent per-unit ComputeArenas
         // (matching production ComputeUnitSet), running across BOTH CDM pipes (0 and 1).
@@ -2352,7 +2442,11 @@ pub mod g16 {
             let mut per_unit = Vec::with_capacity(COMPUTE_UNITS);
             for _ in 0..COMPUTE_UNITS {
                 per_unit.push(
-                    sync::Arc::new(ComputeArena { compute: KVec::new(), render: None }, 0).unwrap(),
+                    sync::Arc::new(
+                        ComputeArena { compute: KVec::new(), render: None, hw_slots: None },
+                        0,
+                    )
+                    .unwrap(),
                 );
             }
             COMPUTE_OWNER_ARENAS.with(|a| *a.borrow_mut() = Some(per_unit.clone()));
@@ -2468,8 +2562,12 @@ pub mod g16 {
             units1.push(ComputeSlot::new(&mut o, &factory, k as u64).unwrap(), 0).unwrap();
         }
         let c_uma1 = units1[0].uma_lease();
-        let prep1 = ComputeArena { compute: units1, render: None };
-        let c_arena1 = sync::Arc::new(ComputeArena { compute: KVec::new(), render: None }, 0).unwrap();
+        let prep1 = ComputeArena { compute: units1, render: None, hw_slots: None };
+        let c_arena1 = sync::Arc::new(
+            ComputeArena { compute: KVec::new(), render: None, hw_slots: None },
+            0,
+        )
+        .unwrap();
         let mut cc1 = Claims::new();
         assert_eq!(s.claim_compute_for(&prep1, &mut cc1, Some(vm1.id)).unwrap(), Some(0));
         COMPUTE_OWNER_ARENA.with(|a| *a.borrow_mut() = Some(c_arena1.clone()));
@@ -2482,7 +2580,7 @@ pub mod g16 {
         for k in 0..COMPUTE_UNITS {
             units2.push(ComputeSlot::new(&mut o, &factory, k as u64).unwrap(), 0).unwrap();
         }
-        let prep2 = ComputeArena { compute: units2, render: None };
+        let prep2 = ComputeArena { compute: units2, render: None, hw_slots: None };
         let mut cc2 = Claims::new();
         assert_eq!(s.claim_compute_for(&prep2, &mut cc2, Some(vm2.id)).unwrap(), Some(1));
         s.hold_compute_slot(1, &vm2, &prep2).unwrap();
@@ -2492,7 +2590,7 @@ pub mod g16 {
         let mut units3 = KVec::new();
         units3.push(ComputeSlot::new(&mut o, &factory, 0).unwrap(), 0).unwrap();
         let c_uma3 = units3[0].uma_lease();
-        let prep3 = ComputeArena { compute: units3, render: None };
+        let prep3 = ComputeArena { compute: units3, render: None, hw_slots: None };
 
         // Drop local arena/epoch/pool handles for VM1 and close VM1.
         drop(e1);
@@ -2682,6 +2780,8 @@ render_burst_lines = (
         line for line in resources_source.splitlines()
         if line.startswith(('const BURST_SUBMITS:', 'const BURST_GAP_NS:', 'const BURST_COMMANDS:', 'const RENDER_BURST_COMMANDS:'))
     )
+    + '\npub(crate) ' + item(resources_source, 'fn pick_scs_compute_slots(')
+    + '\npub(crate) ' + item(resources_source, 'fn pick_base_pb_slots(')
     + '\npub(crate) ' + item(resources_source, 'fn should_expand_compute_ext(')
     + '\npub(crate) ' + item(resources_source, 'fn target_render_slots(')
     + '\npub(crate) ' + item(resources_source, 'fn target_render_slots_for(')
