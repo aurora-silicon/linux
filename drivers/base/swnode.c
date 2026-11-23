@@ -1207,12 +1207,16 @@ void software_node_notify_remove(struct device *dev)
 	if (!device_match_fwnode(dev, &swnode->fwnode) && swnode->fwnode.dev == dev)
 		swnode->fwnode.dev = NULL;
 
-	swnode_put(swnode);
-
+	/*
+	 * Check ownership before dropping this device's reference: when the
+	 * owner is already gone, the put below may free the node.
+	 */
 	if (swnode->owner == dev) {
 		set_secondary_fwnode(dev, NULL);
 		swnode_put(swnode);
 	}
+
+	swnode_put(swnode);
 }
 
 void __init software_node_init(void)
