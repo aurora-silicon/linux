@@ -1868,6 +1868,8 @@ impl Firmware {
         };
         let (mut lo, mut hi) = (u64::MAX, 0u64);
         let (mut first, mut last) = (u64::MAX, 0u64);
+        let mut cdm_flight_ticks = 0u64;
+        let mut cdm_counted = 0u32;
         let work_ticks = self.init.abi.compute().work_ticks;
         let s = &mut self.engine.stats;
 
@@ -1904,6 +1906,10 @@ impl Firmware {
                 &mut s.cdm_ticks,
                 crate::usage::Engine::Compute,
             );
+            if ticks[1] >= ticks[0] {
+                cdm_flight_ticks = ticks[1] - ticks[0];
+                cdm_counted = 1;
+            }
         } else {
             // Multi-command prefix fallback: read each member's internal timestamp cells.
             let mut stage = |o: &super::object::FwObject,
@@ -1942,8 +1948,19 @@ impl Firmware {
                 };
                 if let Ok((start, end)) = Self::compute_ticks_with(work_ticks, c) {
                     add_interval(start, end, &mut s.cdm_ticks, crate::usage::Engine::Compute);
+                    if start != 0 && end >= start {
+                        cdm_flight_ticks = cdm_flight_ticks.saturating_add(end - start);
+                        cdm_counted += 1;
+                    }
                 }
             }
+        }
+        if cdm_counted != 0 {
+            let per_cmd_ticks = cdm_flight_ticks / u64::from(cdm_counted);
+            let per_cmd_us = (per_cmd_ticks.saturating_mul(1_000_000)
+                / super::hw::COMMAND_TIMESTAMP_HZ)
+                .clamp(1, 100_000) as u32;
+            f.job.queue.note_compute_us(per_cmd_us);
         }
         if hi > lo {
             s.span_ticks = s.span_ticks.saturating_add(hi - lo);

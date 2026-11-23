@@ -1619,7 +1619,7 @@ impl Firmware {
 
     /// Whether `self.engine.pending` is an eligible single-queue, single-VM busy horizon
     /// batch that can accumulate more same-queue commands before publishing.
-    fn can_defer_busy_coalesce(&self) -> bool {
+    fn can_defer_busy_coalesce(&self, now: u64) -> bool {
         if self.recovery.failed().is_some()
             || self.engine.frozen
             || self.engine.flights.is_empty()
@@ -1643,6 +1643,11 @@ impl Firmware {
             || !self.can_queue_behind(head)
             || self
                 .engine
+                .flights
+                .iter()
+                .any(|fl| !Arc::ptr_eq(&fl.job.queue, &head.queue))
+            || self
+                .engine
                 .pending
                 .iter()
                 .any(|j| !Arc::ptr_eq(&j.queue, &head.queue) || !Arc::ptr_eq(&j.vm, &head.vm))
@@ -1658,6 +1663,7 @@ impl Firmware {
                     || c.is_rt()
                     || head_order.wait_through != [None, None]
                     || !head.fw_waits.is_empty()
+                    || self.compute_queue_is_heavy(&head.queue, now)
                 {
                     return false;
                 }
@@ -1714,7 +1720,8 @@ impl Firmware {
                 let Ok(slot_mask) = head.resources.compute_slot_mask() else {
                     return false;
                 };
-                let pipe = self.choose_compute_pipe(&head.queue, [None, None], slot_mask, false);
+                let pipe =
+                    self.choose_compute_pipe(&head.queue, [None, None], slot_mask, false, false);
                 let free_c = self.slots.free_compute_in_mask_for_pipe(slot_mask, pipe) as usize;
                 let cap = super::hw::sizes::COALESCE_MAX_CMDS
                     .min(free_c)
@@ -1797,7 +1804,7 @@ impl Firmware {
     /// producer updates, and doorbells without delaying `d=1`/`d=2`, barriered streams, RT/SCS
     /// work, or multi-queue/cross-VM handoffs.
     pub(crate) fn defer_busy_coalesce(&mut self, now: u64) -> Option<u32> {
-        if !self.can_defer_busy_coalesce() {
+        if !self.can_defer_busy_coalesce(now) {
             self.engine.coalesce_deadline_ns = 0;
             return None;
         }
@@ -2081,23 +2088,54 @@ impl Firmware {
         Ok(waits)
     }
 
+    /// Whether `queue`'s recent or active compute work is heavy enough to benefit from 2-pipe
+    /// CDM fanout rather than 1-pipe affinity and horizon folding:
+    /// - per-queue retired CDM GPU duration EWMA `>= COMPUTE_HEAVY_EMA_US`, or
+    /// - a sole active single-command compute flight of `queue` on its pipe has already been
+    ///   executing for `>= COMPUTE_HEAVY_INFLIGHT_NS` without completing (instant detection
+    ///   before retirement updates the EWMA, while queued multi-flight light bursts never false-
+    ///   trigger from queueing age).
+    fn compute_queue_is_heavy(&self, queue: &Arc<super::queue::QueueState>, now: u64) -> bool {
+        if queue.compute_ewma_us.load(Ordering::Relaxed) >= super::hw::sizes::COMPUTE_HEAVY_EMA_US {
+            return true;
+        }
+        let mut pipe_flights = [0usize; super::hw::sizes::COMPUTE_PIPES];
+        for fl in &self.engine.flights {
+            if fl.computes != 0 {
+                let p = (fl.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                pipe_flights[p] += 1;
+            }
+        }
+        self.engine.flights.iter().any(|fl| {
+            let p = (fl.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+            fl.computes == 1
+                && pipe_flights[p] == 1
+                && Arc::ptr_eq(&fl.job.queue, queue)
+                && fl.published_ns != 0
+                && now.saturating_sub(fl.published_ns)
+                    >= super::hw::sizes::COMPUTE_HEAVY_INFLIGHT_NS
+        })
+    }
+
     /// Chooses which compute pipe (`0..COMPUTE_PIPES`) executes the next compute command:
     /// - Base-only/SCS VMs (bits strictly in `0..PIPE1_COMPUTE_START`) or states where pipe 1
     ///   has no available unit in `slot_mask` stay on pipe 0 so `0..PIPE1_COMPUTE_START` never
     ///   split across two pipes.
     /// - If the command waits only on one pipe, reuse that pipe (in-order ring, zero `c2c`
     ///   barrier).
-    /// - If barrier-free (`[None, None]`) and `queue` already has an active compute flight on a
-    ///   single pipe with free units, keep that queue pipe-affine so consecutive horizon submits
-    ///   fold onto one workqueue without splitting across pipes.
-    /// - Otherwise (other queues, cross-VM compute, or waiting on both pipes `[Some, Some]`),
-    ///   pick the pipe with fewer active compute commands, breaking ties by `next_compute_pipe`.
+    /// - If barrier-free (`[None, None]`), `!heavy_compute`, and `queue` already has an active
+    ///   compute flight on a single pipe with free units, keep that light queue pipe-affine so
+    ///   consecutive horizon submits fold onto one workqueue without splitting across pipes.
+    /// - Otherwise (heavy compute streams, other queues, cross-VM compute, or waiting on both
+    ///   pipes `[Some, Some]`), pick the pipe with fewer active compute commands, breaking ties
+    ///   by `next_compute_pipe`.
     fn choose_compute_pipe(
         &self,
         queue: &Arc<super::queue::QueueState>,
         waits: [Option<WaitTarget>; sizes::COMPUTE_PIPES],
         slot_mask: u32,
         rt_compute: bool,
+        heavy_compute: bool,
     ) -> usize {
         if rt_compute
             || self
@@ -2112,7 +2150,7 @@ impl Firmware {
         match waits {
             [Some(_), None] => return 0,
             [None, Some(_)] => return 1,
-            [None, None] => {
+            [None, None] if !heavy_compute => {
                 let mut q_pipe: Option<usize> = None;
                 for fl in &self.engine.flights {
                     if fl.computes != 0 && Arc::ptr_eq(&fl.job.queue, queue) {
@@ -2133,7 +2171,7 @@ impl Firmware {
                     }
                 }
             }
-            [Some(_), Some(_)] => {}
+            [None, None] | [Some(_), Some(_)] => {}
         }
         if !self.slots.compute_available_in_mask_for_pipe(slot_mask, 0) {
             return 1;
@@ -2366,8 +2404,8 @@ impl Firmware {
         } else {
             &[Channel::Compute]
         };
-        let (compute_pipe, c_waits) = if render {
-            (0usize, [None; sizes::COMPUTE_PIPES])
+        let (compute_pipe, c_waits, heavy_compute) = if render {
+            (0usize, [None; sizes::COMPUTE_PIPES], false)
         } else {
             let slot_mask = job.resources.compute_slot_mask()?;
             let rt_compute = job.resources.compute_scs()
@@ -2377,9 +2415,11 @@ impl Firmware {
                 job.command_order(index)
                     .and_then(|o| o.wait_through[super::command::COMPUTE]),
             )?;
+            let heavy = self.compute_queue_is_heavy(&job.queue, now_ns());
             (
-                self.choose_compute_pipe(&job.queue, waits, slot_mask, rt_compute),
+                self.choose_compute_pipe(&job.queue, waits, slot_mask, rt_compute, heavy),
                 waits,
+                heavy,
             )
         };
         let pipe_behind = !render
@@ -2490,18 +2530,28 @@ impl Firmware {
                     .slots
                     .free_compute_in_mask_for_pipe(slot_mask, compute_pipe)
                     as usize;
-                let active_computes: usize = self
-                    .engine
-                    .flights
-                    .iter()
-                    .map(|fl| fl.computes as usize)
-                    .sum();
+                let mut active_pipe = [0usize; sizes::COMPUTE_PIPES];
+                for fl in &self.engine.flights {
+                    if fl.computes != 0 {
+                        let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
+                        active_pipe[p] += fl.computes as usize;
+                    }
+                }
+                let active_computes = active_pipe[0] + active_pipe[1];
+                // Keep heavy barrier-free compute balanced across both CDM pipes while light
+                // single-queue compute streams stay pipe-affine and fold freely into one batch.
+                let pipe_fold_cap = if heavy_compute && c_waits == [None; sizes::COMPUTE_PIPES] {
+                    active_pipe[1 - compute_pipe].saturating_sub(active_pipe[compute_pipe] + 1)
+                } else {
+                    usize::MAX
+                };
                 let used = prefix.c_head.wrapping_sub(c_read) % sizes::QUEUE_CAP;
                 let ring_more = (sizes::QUEUE_CAP.saturating_sub(4)).saturating_sub(used) as usize;
                 let mut more_slots = free_c
                     .min(params::compute_flights().saturating_sub(active_computes + 1))
                     .min(sizes::COMPUTE_SLOTS.saturating_sub(1))
-                    .min(ring_more);
+                    .min(ring_more)
+                    .min(pipe_fold_cap);
                 let rt_head = job.resources.compute_scs() || c.is_rt();
                 // Fold trailing barrier-free compute commands of the base job first.
                 while !rt_head && more_slots > 0 && end < job.progress.count() {
