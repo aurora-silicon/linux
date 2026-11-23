@@ -1,11 +1,13 @@
-"""The boot-partition tools' compatibility lock in /tmp: taken only when it is already there as a
-regular file of the tool's own user (root), never created and never followed through a link.
-The /run/lock lock is taken as before."""
+"""The boot-partition tools' compatibility lock in /tmp: created when missing and locked, never
+followed through a link, and anything at that path that is not a regular file of the tool's own
+user (root) makes the tool refuse before it changes anything. The /run/lock lock is taken as
+before."""
 from pathlib import Path
 import fcntl
 import importlib.util
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -59,40 +61,55 @@ class PythonLocks(unittest.TestCase):
         self.assertIn("args.lock = [Path('/run/lock/boot-partition.lock')]", text)
         self.assertIn("args.compat_lock = args.compat_lock or [Path('/tmp/limine-global.lock')]", text)
 
-    def test_missing_compat_lock_is_not_created(self):
+    def test_missing_compat_lock_is_created_and_locked(self):
         for name, locker in self.lockers():
             with self.subTest(name):
                 with locker():
                     self.assertTrue(held_by_someone(self.boot))
-                self.assertFalse(self.compat.exists())
+                    self.assertTrue(held_by_someone(self.compat))
+                st = self.compat.lstat()
+                self.assertTrue(stat.S_ISREG(st.st_mode))
+                self.assertEqual(stat.S_IMODE(st.st_mode), 0o600)
+                self.compat.unlink()
 
-    def test_symlinked_compat_lock_is_not_followed(self):
+    def assert_refused(self):
+        for name, locker in self.lockers():
+            with self.subTest(name):
+                with self.assertRaises(ValueError) as e:
+                    with locker():
+                        self.fail('ran without the compatibility lock')
+                self.assertIn('Nothing was changed', str(e.exception))
+                self.assertFalse(held_by_someone(self.boot))
+
+    def test_symlinked_compat_lock_refuses(self):
         target = self.root / 'victim'
         self.compat.symlink_to(target)
-        for name, locker in self.lockers():
-            with self.subTest(name):
-                with locker():
-                    pass
-                self.assertFalse(target.exists())
+        self.assert_refused()
+        self.assertFalse(target.exists())
         target.write_text('x')
-        for name, locker in self.lockers():
-            with self.subTest(name + ' existing target'):
-                with locker():
-                    self.assertFalse(held_by_someone(target))
+        self.assert_refused()
+        self.assertFalse(held_by_someone(target))
 
-    def test_compat_lock_of_another_user_is_ignored_even_when_held(self):
+    def test_compat_lock_of_another_user_refuses(self):
         self.compat.touch()
-        holder = os.open(self.compat, os.O_RDONLY)
-        self.addCleanup(os.close, holder)
-        fcntl.flock(holder, fcntl.LOCK_EX)
         # The file belongs to someone else when the tool's own uid is another one.
+        with patch.object(os, 'geteuid', return_value=os.geteuid() + 1):
+            self.assert_refused()
+
+    def test_open_refused_by_the_kernel_refuses(self):
+        # fs.protected_regular: root's O_CREAT open of another user's file in sticky /tmp.
+        real = os.open
+
+        def protected(path, flags, *a):
+            if Path(path) == self.compat:
+                raise PermissionError(13, 'Permission denied')
+            return real(path, flags, *a)
         for module in (ESP, M3):
-            with self.subTest(module.__name__), patch.object(module.os, 'geteuid',
-                                                             return_value=os.geteuid() + 1):
-                ctx = ESP.lock([self.boot], [self.compat]) if module is ESP else \
-                    M3.locks([self.boot], 0.2, [self.compat])
-                with ctx:
-                    self.assertTrue(held_by_someone(self.boot))
+            with self.subTest(module.__name__), patch.object(module.os, 'open', side_effect=protected):
+                with self.assertRaises(ValueError):
+                    with (ESP.lock([self.boot], [self.compat]) if module is ESP
+                          else M3.locks([self.boot], 0.2, [self.compat])):
+                        self.fail('ran without the compatibility lock')
 
     def test_own_compat_lock_is_taken_and_a_holder_still_blocks(self):
         self.compat.touch()
@@ -112,12 +129,9 @@ class PythonLocks(unittest.TestCase):
             with M3.locks([self.boot], 0.2, [self.compat]):
                 pass
 
-    def test_a_fifo_is_not_a_lock(self):
+    def test_a_fifo_refuses(self):
         os.mkfifo(self.compat)
-        for name, locker in self.lockers():
-            with self.subTest(name):
-                with locker():
-                    pass
+        self.assert_refused()
 
     def test_installer_copies_match(self):
         installer = INSTALLER.read_text()
@@ -161,24 +175,24 @@ echo "held ${{#LOCK_FDS[@]}}"
         self.assertIn('\nLOCKS="/run/lock/boot-partition.lock"\n', text)
         self.assertIn('\nCOMPAT_LOCKS="/tmp/limine-global.lock"\n', text)
 
-    def test_missing_compat_lock_is_not_created(self):
-        r = self.take()
+    def test_missing_compat_lock_is_created_and_held(self):
+        r = self.take(self.probe(self.compat))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn('held 1', r.stdout)
-        self.assertFalse(self.compat.exists())
+        self.assertIn('held 2', r.stdout)
+        self.assertIn('busy', r.stdout)
+        self.assertTrue(self.compat.is_file() and not self.compat.is_symlink())
 
-    def test_symlinked_compat_lock_is_not_used(self):
+    def test_symlinked_compat_lock_refuses(self):
         target = self.root / 'victim'
         target.write_text('x')
         self.compat.symlink_to(target)
         r = self.take(self.probe(target))
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn('held 1', r.stdout)
-        self.assertIn('free', r.stdout)
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        self.assertIn("not root's own lock file", r.stdout)
         self.compat.unlink()
         self.compat.symlink_to(self.root / 'missing')
         r = self.take()
-        self.assertIn('held 1', r.stdout)
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
         self.assertFalse((self.root / 'missing').exists())
 
     def test_own_regular_compat_lock_is_held(self):
@@ -188,12 +202,12 @@ echo "held ${{#LOCK_FDS[@]}}"
         self.assertIn('held 2', r.stdout)
         self.assertIn('busy', r.stdout)
 
-    def test_a_fifo_is_not_a_lock(self):
+    def test_a_fifo_refuses(self):
         os.mkfifo(self.compat)
         r = self.take()
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn('held 1', r.stdout)
-
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        # The /run/lock lock was let go again.
+        self.assertFalse(held_by_someone(self.boot))
 
 if __name__ == '__main__':
     unittest.main()

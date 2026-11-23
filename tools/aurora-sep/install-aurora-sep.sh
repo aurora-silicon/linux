@@ -685,7 +685,7 @@ M3_PERSISTENT_TRANSACTION_ACTIVE=0
 M3_PERSISTENT_MAIN_ARMED=0
 M3_GPU_BIN=/usr/local/bin
 M3_GPU_SCRIPTS=(
-  "air-gpu-oneshot.sh 0cb379e91c4cdccbfa8591dfea362413bb420953918b4f6d29f0f610c9cd7923"
+  "air-gpu-oneshot.sh 26b0417faf36ff6f4440ba2aa99aeb9de8272eafe04d45bddc8a50e4a4017158"
   "air-gpu-collect.sh 6a457261dc9773401f2ec7e436839a5f0d3b2bccdd9a90f013f8e72878189879"
   "air-gpu-job.sh 9a0eb9aab52fd099488054e4ed4846c579b19fc9f78144245242b6975a40da1d"
 )
@@ -7125,6 +7125,7 @@ esp_history_builtin() {
 """Archive unreferenced EFI history while retaining boot and recovery entries."""
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -7211,20 +7212,25 @@ def inventory(esp, state):
 
 
 def compat_lock(path):
-    """fd of the compatibility lock older Omarchy Limine tools take, or None.
+    """fd of the compatibility lock older Omarchy Limine tools take (/tmp/limine-global.lock).
 
-    It sits in world-writable /tmp, where any user could create it first or
-    hold it. So it is never created or followed: it is used only when it is
-    already there as a regular file owned by this (root) user; otherwise the
-    /run/lock lock alone serializes the boot partition."""
+    It is created when missing (root's, 0600) and never followed through a
+    link. /tmp is world-writable, so anything else at that path (a file of
+    another user, a link, a FIFO, or a file fs.protected_regular will not let
+    root open) is refused: going on without the lock could let an older
+    Limine tool write the EFI partition at the same time."""
     try:
-        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError:
-        return None
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    except OSError as error:
+        if error.errno in (errno.EACCES, errno.EPERM, errno.ELOOP, errno.ENXIO):
+            raise ValueError(f'{path} is not root\'s own lock file ({os.strerror(error.errno)}); '
+                             'remove it and retry. Nothing was changed') from None
+        raise
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
         os.close(fd)
-        return None
+        raise ValueError(f'{path} is not root\'s own lock file (a link, another user\'s file or '
+                         'not a regular file); remove it and retry. Nothing was changed')
     return fd
 
 @contextlib.contextmanager
@@ -7240,8 +7246,6 @@ def lock(paths, compat=()):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for path in compat:
             fd = compat_lock(path)
-            if fd is None:
-                continue
             fds.append(fd)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield
@@ -7573,6 +7577,7 @@ m3_boot_profile_install() {
 """Retain the running Limine UKI and publish bounded experimental activation."""
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -7610,20 +7615,25 @@ def atomic(path, data):
         if os.path.exists(name): os.unlink(name)
 
 def compat_lock(path):
-    """fd of the compatibility lock older Omarchy Limine tools take, or None.
+    """fd of the compatibility lock older Omarchy Limine tools take (/tmp/limine-global.lock).
 
-    It sits in world-writable /tmp, where any user could create it first or
-    hold it. So it is never created or followed: it is used only when it is
-    already there as a regular file owned by this (root) user; otherwise the
-    /run/lock lock alone serializes the boot partition."""
+    It is created when missing (root's, 0600) and never followed through a
+    link. /tmp is world-writable, so anything else at that path (a file of
+    another user, a link, a FIFO, or a file fs.protected_regular will not let
+    root open) is refused: going on without the lock could let an older
+    Limine tool write the EFI partition at the same time."""
     try:
-        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError:
-        return None
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    except OSError as error:
+        if error.errno in (errno.EACCES, errno.EPERM, errno.ELOOP, errno.ENXIO):
+            raise ValueError(f'{path} is not root\'s own lock file ({os.strerror(error.errno)}); '
+                             'remove it and retry. Nothing was changed') from None
+        raise
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
         os.close(fd)
-        return None
+        raise ValueError(f'{path} is not root\'s own lock file (a link, another user\'s file or '
+                         'not a regular file); remove it and retry. Nothing was changed')
     return fd
 
 @contextlib.contextmanager
@@ -7639,7 +7649,6 @@ def locks(paths, timeout=30.0, compat=()):
                 if not stat.S_ISREG(os.fstat(fd).st_mode): raise ValueError('nonregular boot lock')
             else:
                 fd = compat_lock(path)
-                if fd is None: continue
                 fds.append(fd)
             while True:
                 try:
@@ -7832,7 +7841,7 @@ def main():
     p.add_argument('--modules', type=Path, default=Path('/usr/lib/modules'))
     p.add_argument('--lock', type=Path, action='append')
     p.add_argument('--compat-lock', type=Path, action='append',
-                   help='a lock taken only if it already exists as a regular file of this user')
+                   help='a lock in a shared directory: created if missing, refused unless a regular file of this user')
     p.add_argument('--lock-timeout', type=float, default=30.0, help='total boot-lock wait, in seconds (0..30)')
     args = p.parse_args()
     if not 0 <= args.lock_timeout <= 30:

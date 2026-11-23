@@ -2,6 +2,7 @@
 """Archive unreferenced EFI history while retaining boot and recovery entries."""
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -88,20 +89,25 @@ def inventory(esp, state):
 
 
 def compat_lock(path):
-    """fd of the compatibility lock older Omarchy Limine tools take, or None.
+    """fd of the compatibility lock older Omarchy Limine tools take (/tmp/limine-global.lock).
 
-    It sits in world-writable /tmp, where any user could create it first or
-    hold it. So it is never created or followed: it is used only when it is
-    already there as a regular file owned by this (root) user; otherwise the
-    /run/lock lock alone serializes the boot partition."""
+    It is created when missing (root's, 0600) and never followed through a
+    link. /tmp is world-writable, so anything else at that path (a file of
+    another user, a link, a FIFO, or a file fs.protected_regular will not let
+    root open) is refused: going on without the lock could let an older
+    Limine tool write the EFI partition at the same time."""
     try:
-        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError:
-        return None
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    except OSError as error:
+        if error.errno in (errno.EACCES, errno.EPERM, errno.ELOOP, errno.ENXIO):
+            raise ValueError(f'{path} is not root\'s own lock file ({os.strerror(error.errno)}); '
+                             'remove it and retry. Nothing was changed') from None
+        raise
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
         os.close(fd)
-        return None
+        raise ValueError(f'{path} is not root\'s own lock file (a link, another user\'s file or '
+                         'not a regular file); remove it and retry. Nothing was changed')
     return fd
 
 @contextlib.contextmanager
@@ -117,8 +123,6 @@ def lock(paths, compat=()):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for path in compat:
             fd = compat_lock(path)
-            if fd is None:
-                continue
             fds.append(fd)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield

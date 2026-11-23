@@ -92,8 +92,8 @@ UBOOT_GUID=b2ac5fc9-92b7-4acd-aeac-11e818c3130c
 GLOBAL_GUID=8be4df61-93ca-11d2-aa0d-00e098032b8c
 # Omarchy's Limine tools take one of these before they touch the EFI partition (newer ones the
 # first, older ones the second); maclab takes both in this order, and so does this script. The
-# second is in world-writable /tmp, where any user could make or hold it first: it is taken only
-# when it is already there as a regular file of root's (COMPAT_LOCKS, never created).
+# second is in world-writable /tmp, where any user could make or hold it first: it is created if
+# missing, and anything there that is not root's own regular file makes the script refuse.
 LOCKS="/run/lock/boot-partition.lock"
 COMPAT_LOCKS="/tmp/limine-global.lock"
 STATE_DIR=/var/lib/air-gpu
@@ -307,7 +307,10 @@ take_locks() {
     LOCK_FDS+=("$fd")
   done
   for l in $COMPAT_LOCKS; do
-    open_compat_lock "$l" || continue
+    if ! open_compat_lock "$l"; then
+      release_locks
+      refuse "$l is not root's own lock file (a link, another user's file or not a regular file); remove it and retry."
+    fi
     fd=$COMPAT_FD
     if ! flock -w 5 "$fd"; then
       release_locks
@@ -316,14 +319,17 @@ take_locks() {
     LOCK_FDS+=("$fd")
   done
 }
-# Open a compatibility lock read-only (never created) into COMPAT_FD, and keep it only when the
-# opened file is a regular file owned by this user (root) and is the path itself, not something
-# a symbolic link points to; that is checked on the open descriptor. The test before the open only
-# avoids opening a FIFO (which would block): in sticky /tmp nobody else can replace root's file.
+# Open the compatibility lock into COMPAT_FD; fails (and the caller refuses) unless it ends up
+# a regular file owned by this user (root) at that very path. A missing one is created with
+# noclobber, which opens with O_EXCL and so never follows a link. The test before the open
+# keeps a FIFO or another user's file from being opened at all; in sticky /tmp nobody else can
+# replace root's own file afterwards. The open descriptor is checked again (owner, type, and
+# the path's own inode, so not a link's target).
 COMPAT_FD=
 open_compat_lock() {
   local l=$1 fd owner inode type
   COMPAT_FD=
+  [[ -e $l || -L $l ]] || (set -C; : >"$l") 2>/dev/null || true
   [[ -f $l && ! -L $l && -O $l ]] || return 1
   exec {fd}<"$l" 2>/dev/null || return 1
   # stat inherits the descriptor: /proc/self/fd/N is the file that was opened.
