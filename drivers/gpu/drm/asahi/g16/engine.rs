@@ -292,6 +292,10 @@ pub(crate) struct Flight {
     pub(crate) uma_submitted: u64,
     pub(crate) recovery_suspect: bool,
     pub(crate) recovery_started_ns: u64,
+    /// First time this suspect flight passed its stage/queue gates with unsettled receipts, and
+    /// how many consecutive unsettled polls have observed it since then.
+    pub(crate) gate_passed_ns: Option<u64>,
+    pub(crate) unsettled_polls: u32,
     /// Publication time, ns.
     pub(crate) published_ns: u64,
     /// Published behind another flight.
@@ -337,6 +341,8 @@ impl Flight {
             uma_submitted: 0,
             recovery_suspect: false,
             recovery_started_ns: 0,
+            gate_passed_ns: None,
+            unsettled_polls: 0,
             published_ns: 0,
             behind: false,
             pb: None,
@@ -823,6 +829,8 @@ impl Firmware {
         f.doomed = true;
         f.recovery_suspect = true;
         f.recovery_started_ns = now_ns();
+        f.gate_passed_ns = None;
+        f.unsettled_polls = 0;
         Ok(())
     }
 
@@ -849,6 +857,8 @@ impl Firmware {
             if unfinished {
                 f.recovery_suspect = true;
                 f.recovery_started_ns = now_ns();
+                f.gate_passed_ns = None;
+                f.unsettled_polls = 0;
                 if fault_asid.is_some_and(|asid| asid >= 1 && asid == f.job.vm.slot) {
                     f.doomed = true;
                 }

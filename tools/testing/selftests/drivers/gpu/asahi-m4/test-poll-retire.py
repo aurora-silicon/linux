@@ -6,6 +6,7 @@ import json
 import subprocess
 
 production = kernel_root() / 'drivers/gpu/drm/asahi/g16/poll.rs'
+queue_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/queue.rs').read_text()
 event_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/event.rs').read_text()
 mod_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/mod.rs').read_text()
 source = production.read_text()
@@ -15,6 +16,12 @@ assert 'const EVENT_RETIRE_POLLS: u32 = 11;' in source, 'EVENT_RETIRE_POLLS expe
 assert (
     'OwnedQueue::new_percpu_reclaim(c_str!("aurora_g16_events"), true)' in mod_source
 ), 'aurora_g16_events must use new_percpu_reclaim(..., true)'
+assert (
+    'pub(crate) usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>' in queue_source
+), 'QueueState::usage must deduplicate per-queue pipelined stages via usage::Lane'
+assert (
+    'crate::usage::Lane::new(usage)' in queue_source
+), 'Queue::new must wrap client usage in usage::Lane'
 
 
 def item(declaration, text=source):
@@ -180,6 +187,7 @@ struct Shared {
     evented: AtomicBool,
     publish_wake: AtomicBool,
     rearmed: Cell<u32>,
+    idle_power_polls: Cell<u32>,
 }
 impl Shared {
     fn new() -> Arc<Self> {
@@ -188,12 +196,15 @@ impl Shared {
             evented: AtomicBool::new(false),
             publish_wake: AtomicBool::new(false),
             rearmed: Cell::new(0),
+            idle_power_polls: Cell::new(0),
         })
     }
     fn rearm(&self, _soon: bool) {
         self.rearmed.set(self.rearmed.get() + 1);
     }
-    fn arm_idle_power_poll(&self, _firmware: &Firmware) {}
+    fn arm_idle_power_poll(&self, _firmware: &Firmware) {
+        self.idle_power_polls.set(self.idle_power_polls.get() + 1);
+    }
     fn fail_stop(&self, _e: Error) {}
     __SUBMIT_LOCKED__
 }
@@ -201,12 +212,17 @@ impl Shared {
 #[derive(Default)]
 struct Power {
     ramp: bool,
+    idle_reports: u32,
 }
 impl Power {
     fn needs_ramp(&self, _now: u64) -> bool {
         self.ramp
     }
-    fn report_work(&mut self, _in_flight: bool) {}
+    fn report_work(&mut self, in_flight: bool) {
+        if !in_flight {
+            self.idle_reports += 1;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -994,7 +1010,35 @@ mod resnap_sync_test {
         }
     }
 }
+
+#[path = "__USAGE_PATH__"]
+mod usage;
+
+#[test]
+fn per_queue_usage_lane_charges_distinct_stages_and_deduplicates_overlap() {
+    let client = Arc::new(usage::Client::new());
+    let lane = usage::Lane::new(client.clone());
+    const HZ: u32 = 24_000_000;
+    // Two pipelined renders whose TA and FS intervals overlap across flights.
+    lane.add(usage::Engine::Vertex, 24_000, 48_000, HZ);
+    lane.add(usage::Engine::Fragment, 40_000, 88_000, HZ);
+    lane.add(usage::Engine::Vertex, 36_000, 72_000, HZ);
+    lane.add(usage::Engine::Fragment, 64_000, 120_000, HZ);
+    lane.add(usage::Engine::Compute, 100_000, 124_000, HZ);
+    let [v_ns, f_ns, c_ns] = client.snapshot();
+    // Vertex union: [24k, 72k] = 48k ticks = 2_000_000 ns (not 60k ticks = 2.5 ms).
+    assert_eq!(v_ns, 2_000_000);
+    // Fragment union: [40k, 120k] = 80k ticks = 3_333_333 ns (distinct from Vertex).
+    assert_eq!(f_ns, 3_333_333);
+    assert_ne!(v_ns, f_ns);
+    // Compute: [100k, 124k] = 24k ticks = 1_000_000 ns.
+    assert_eq!(c_ns, 1_000_000);
+}
 '''
+
+harness = harness.replace(
+    '__USAGE_PATH__', str(kernel_root() / 'drivers/gpu/drm/asahi/usage.rs')
+)
 
 for token, decl in {
     '__SUBMIT_LOCKED__': 'fn submit_locked(',

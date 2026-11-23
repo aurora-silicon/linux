@@ -421,6 +421,10 @@ fn main() {
     assert!(main[0x640 + 28 * 0x28..0x640 + 29 * 0x28].iter().all(|&b| b == 0));
     let power = object(&v26, l, id::POWER_PERFORMANCE);
     assert_eq!(r64(power, 0x3b98), input().va[id::TEMPERATURE]);
+    assert_eq!(r32(object(&v25, &wire::V25G83, id::GLOBALS), 0x9c8), 750);
+    assert_eq!(r32(object(&v26, l, id::GLOBALS), 0x9cc), 750);
+    assert_eq!(r32(object(&v25, &wire::V25G83, id::GLOBALS), 0x9cc), 800);
+    assert_eq!(r32(object(&v26, l, id::GLOBALS), 0x9d0), 800);
     std::fs::write(out.join("initdata-25g83.bin"), &v25).unwrap();
     std::fs::write(out.join("initdata-26b123.bin"), &v26).unwrap();
     render(&out);

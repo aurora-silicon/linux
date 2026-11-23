@@ -1484,6 +1484,8 @@ mod compute_horizon_scope {
         doomed: bool,
         recovery_suspect: bool,
         recovery_started_ns: u64,
+        gate_passed_ns: Option<u64>,
+        unsettled_polls: u32,
     }
     struct RecEngine { flights: Vec<RecFlight>, ta_target: u32 }
     struct RecState { last_retired: recovery::logic::RetiredStamps }
@@ -1513,6 +1515,8 @@ mod compute_horizon_scope {
                     doomed: false,
                     recovery_suspect: false,
                     recovery_started_ns: 0,
+                    gate_passed_ns: None,
+                    unsettled_polls: 0,
                 }],
                 ta_target: 0,
             },
@@ -1555,6 +1559,8 @@ mod compute_horizon_scope {
                     doomed: false,
                     recovery_suspect: false,
                     recovery_started_ns: 0,
+                    gate_passed_ns: None,
+                    unsettled_polls: 0,
                 }],
                 ta_target: 0x300,
             },
