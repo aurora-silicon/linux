@@ -244,12 +244,20 @@ static int ane_t6021_pmu_map(struct ane_t6021 *ane, struct iommu_domain *dom)
  * fw_iova. Map the __TEXT pages there again, at the same IOVA and PA,
  * read-only. The IOVA range stays the DMA API's and the same number of
  * bytes stays mapped, so dma_free_coherent() unmaps it as before.
+ *
+ * Each step is one 16 KiB DART leaf (the coherent allocation is 16 KiB
+ * aligned in IOVA and PA, checked below), so iommu_unmap() takes it out
+ * whole or not at all, and it syncs the IOTLB before it returns. If a page
+ * can be neither mapped read-only nor put back read-write, the range has a
+ * hole that dma_free_coherent() would trip on: then the allocation is kept
+ * (fw_buf cleared, a bounded leak on a failed probe) instead of freed.
  */
 static int ane_t6021_fw_staged_protect(struct ane_t6021 *ane)
 {
 	const struct ane_t602x_soc *soc = of_device_get_match_data(ane->dev);
 	struct iommu_domain *dom = iommu_get_domain_for_dev(ane->dev);
 	int rw = IOMMU_READ | IOMMU_WRITE;
+	size_t unmapped;
 	u64 off;
 	int ret;
 
@@ -268,15 +276,18 @@ static int ane_t6021_fw_staged_protect(struct ane_t6021 *ane)
 		pa = iommu_iova_to_phys(dom, iova);
 		if (!pa || pa & (ANE_T6021_FW_ALIAS_PAGE - 1))
 			return -EFAULT;
-		if (iommu_unmap(dom, iova, ANE_T6021_FW_ALIAS_PAGE) !=
-		    ANE_T6021_FW_ALIAS_PAGE)
+		unmapped = iommu_unmap(dom, iova, ANE_T6021_FW_ALIAS_PAGE);
+		if (unmapped != ANE_T6021_FW_ALIAS_PAGE) {
+			if (unmapped)
+				goto hole;
 			return -EIO;
+		}
 		ret = iommu_map(dom, iova, pa, ANE_T6021_FW_ALIAS_PAGE, prot,
 				GFP_KERNEL);
 		/* Never leave a hole for dma_free_coherent() to trip on. */
 		if (ret && iommu_map(dom, iova, pa, ANE_T6021_FW_ALIAS_PAGE, rw,
 				     GFP_KERNEL))
-			dev_err(ane->dev, "fwload: +%#llx left unmapped\n", off);
+			goto hole;
 		if (!ret && iommu_iova_to_phys(dom, iova) != pa)
 			ret = -EIO;
 		if (ret) {
@@ -286,6 +297,13 @@ static int ane_t6021_fw_staged_protect(struct ane_t6021 *ane)
 		}
 	}
 	return 0;
+
+hole:
+	dev_err(ane->dev,
+		"fwload: +%#llx left unmapped, keeping the firmware buffer\n",
+		off);
+	ane->fw_buf = NULL;
+	return -EIO;
 }
 
 static int ane_t6021_fw_alias_map(struct ane_t6021 *ane, bool reserved)
