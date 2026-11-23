@@ -237,6 +237,7 @@ static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define ndelay(n) ((void)(n))
 #define udelay(n) ((void)(n))
 #define usleep_range(a, b) ((void)(a), (void)(b))
+#define USEC_PER_MSEC 1000L
 enum { TYPEC_STATE_SAFE, TYPEC_STATE_USB, TYPEC_MODE_USB4,
        TYPEC_DP_STATE_C, TYPEC_DP_STATE_D, TYPEC_DP_STATE_E };
 enum { USB_TYPEC_TBT_SID = 0x8087, USB_TYPEC_DP_SID = 0xff01 };
@@ -2057,6 +2058,7 @@ typedef uint16_t u16;
 #define guard(kind) (void)
 #define fallthrough __attribute__((fallthrough))
 #define usleep_range(...) ((void)0)
+#define USEC_PER_MSEC 1000L
 #define udelay(n) ((void)(n))
 #define __iomem
 enum { TYPEC_STATE_SAFE, TYPEC_STATE_USB, TYPEC_MODE_USB4,
@@ -2480,6 +2482,7 @@ static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define ndelay(n) ((void)(n))
 #define udelay(n) ((void)(n))
 #define usleep_range(a, b) ((void)(a), (void)(b))
+#define USEC_PER_MSEC 1000L
 enum { TYPEC_STATE_SAFE, TYPEC_STATE_USB, TYPEC_MODE_USB4,
        TYPEC_DP_STATE_C, TYPEC_DP_STATE_D, TYPEC_DP_STATE_E };
 enum { USB_TYPEC_TBT_SID = 0x8087, USB_TYPEC_DP_SID = 0xff01 };

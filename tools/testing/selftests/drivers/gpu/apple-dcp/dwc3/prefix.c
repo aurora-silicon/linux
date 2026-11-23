@@ -19,6 +19,7 @@ typedef uint8_t u8;
 #define __iomem
 #define udelay(n) ((void)(n))
 #define usleep_range(a, b) ((void)(a), (void)(b))
+#define USEC_PER_MSEC 1000L
 #define fallthrough __attribute__((fallthrough))
 static unsigned int warnings, generic_warnings;
 static void warning(const char *message)
