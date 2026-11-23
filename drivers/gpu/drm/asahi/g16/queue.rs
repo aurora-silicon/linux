@@ -274,11 +274,14 @@ impl Queue {
             .ok_or(EIO)?
             .prepare(&self.vm, &submission.commands, hints)?;
         let gpu_id = Arc::as_ptr(&self.shared) as usize;
+        // Record cumulative queue ordinals across both engines so coalescing multiple
+        // same-queue fences in a timeline semaphore chain to the latest fence preserves
+        // any earlier unretired render or compute command on that queue.
+        let total_render = self.accepted[command::RENDER] + submission.counts[command::RENDER];
+        let total_compute = self.accepted[command::COMPUTE] + submission.counts[command::COMPUTE];
         let last_ordinal = [
-            (submission.counts[command::RENDER] != 0)
-                .then_some(self.accepted[command::RENDER] + submission.counts[command::RENDER]),
-            (submission.counts[command::COMPUTE] != 0)
-                .then_some(self.accepted[command::COMPUTE] + submission.counts[command::COMPUTE]),
+            (total_render != 0).then_some(total_render),
+            (total_compute != 0).then_some(total_compute),
         ];
         let origin = Arc::new(
             super::fence::FenceOrigin::new(gpu_id, self.vm.id, self.state.clone(), last_ordinal),

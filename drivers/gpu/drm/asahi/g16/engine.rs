@@ -3010,10 +3010,11 @@ impl Firmware {
                 .find(|fl| fl.renders != 0)
                 .is_some_and(|fl| !Arc::ptr_eq(&fl.job.vm, &job.vm));
         let plan_flags = if !staged
-            && job
-                .fw_waits
-                .iter()
-                .any(|w| w.last_ordinal[super::command::RENDER].is_some())
+            && job.fw_waits.iter().any(|w| {
+                w.last_ordinal[super::command::RENDER].is_some_and(|last| {
+                    w.queue.completed[super::command::RENDER].load(Ordering::Acquire) < last
+                })
+            })
         {
             cmd.cmd.flags
                 & !kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS

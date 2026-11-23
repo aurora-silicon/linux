@@ -172,42 +172,90 @@ impl FenceOrigin {
     }
 }
 
-/// Cross-queue firmware waits resolved at `SUBMIT` (inline for 0-1 entries, bounded to
-/// [`MAX_FW_WAITS`]).
+/// One per-queue cross-queue firmware barrier target, coalescing multiple fences from the same
+/// logical queue (e.g. from a timeline semaphore chain or repeated input syncs) to the highest
+/// required render and compute ordinals on that queue.
+pub(crate) struct FwWait {
+    pub(crate) queue: Arc<QueueState>,
+    pub(crate) last_ordinal: [Option<u64>; 2],
+    origin: Arc<FenceOrigin>,
+}
+
+impl FwWait {
+    pub(crate) fn is_failed(&self) -> bool {
+        self.origin.is_failed()
+    }
+}
+
+/// Cross-queue firmware waits resolved at `SUBMIT` (inline for 0-1 queues, bounded to
+/// [`MAX_FW_WAITS`] distinct logical queues).
 pub(crate) enum FwWaits {
     Empty,
-    One([Arc<FenceOrigin>; 1]),
-    Heap(KVec<Arc<FenceOrigin>>),
+    One([FwWait; 1]),
+    Heap(KVec<FwWait>),
 }
 
 impl FwWaits {
     fn push_unique(&mut self, origin: Arc<FenceOrigin>) -> Result {
-        if self.iter().any(|existing| Arc::ptr_eq(existing, &origin)) {
+        let existing = match self {
+            Self::Empty => None,
+            Self::One(items) => items
+                .iter_mut()
+                .find(|wait| Arc::ptr_eq(&wait.queue, &origin.queue)),
+            Self::Heap(vec) => vec
+                .iter_mut()
+                .find(|wait| Arc::ptr_eq(&wait.queue, &origin.queue)),
+        };
+        if let Some(wait) = existing {
+            let mut newer = false;
+            for engine in 0..2 {
+                if let Some(seq) = origin.last_ordinal[engine] {
+                    match wait.last_ordinal[engine] {
+                        Some(cur) if seq > cur => {
+                            wait.last_ordinal[engine] = Some(seq);
+                            newer = true;
+                        }
+                        None => {
+                            wait.last_ordinal[engine] = Some(seq);
+                            newer = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if newer {
+                wait.origin = origin;
+            }
             return Ok(());
         }
         if self.len() >= MAX_FW_WAITS {
             return Err(E2BIG);
         }
+        let wait = FwWait {
+            queue: origin.queue.clone(),
+            last_ordinal: origin.last_ordinal,
+            origin,
+        };
         match self {
-            Self::Empty => *self = Self::One([origin]),
+            Self::Empty => *self = Self::One([wait]),
             Self::One(_) => {
                 let mut vec = KVec::with_capacity(4, GFP_KERNEL)?;
                 if let Self::One([first]) = core::mem::replace(self, Self::Empty) {
                     let _ = vec.push_within_capacity(first);
-                    let _ = vec.push_within_capacity(origin);
+                    let _ = vec.push_within_capacity(wait);
                 }
                 *self = Self::Heap(vec);
             }
-            Self::Heap(vec) => vec.push(origin, GFP_KERNEL)?,
+            Self::Heap(vec) => vec.push(wait, GFP_KERNEL)?,
         }
         Ok(())
     }
 }
 
 impl core::ops::Deref for FwWaits {
-    type Target = [Arc<FenceOrigin>];
+    type Target = [FwWait];
 
-    fn deref(&self) -> &[Arc<FenceOrigin>] {
+    fn deref(&self) -> &[FwWait] {
         match self {
             Self::Empty => &[],
             Self::One(items) => items,
@@ -287,7 +335,7 @@ pub(crate) fn resolve_fw_waits(inputs: &[Fence], gpu_id: usize, vm_id: u64) -> O
         if status > 0 {
             continue;
         }
-        let leaves = crate::g17::sync_input::collect(input)?;
+        let leaves = crate::g17::sync_input::collect_coalesced(input)?;
         for leaf in leaves.iter() {
             if leaf.status < 0 {
                 return None;

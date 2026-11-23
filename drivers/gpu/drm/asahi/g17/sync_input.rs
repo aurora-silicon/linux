@@ -14,6 +14,8 @@ pub(crate) struct Leaf {
 unsafe extern "C" {
     fn asahi_g17_collect_fences(head: *mut bindings::dma_fence,
         out: *mut Leaf, capacity: usize) -> i32;
+    fn asahi_g17_collect_fences_coalesced(head: *mut bindings::dma_fence,
+        out: *mut Leaf, capacity: usize) -> i32;
     fn asahi_g17_put_fence(fence: *mut bindings::dma_fence);
     fn asahi_g17_merge_fences(fences: *const *mut bindings::dma_fence, count: usize)
         -> *mut bindings::dma_fence;
@@ -42,25 +44,38 @@ impl Drop for Leaf {
     }
 }
 
-/// Allocation, unsupported containers, or a large prefix retain normal waits.
-pub(crate) fn collect(input: &Fence) -> Option<KVec<Leaf>> {
+fn collect_with(
+    input: &Fence,
+    collector: unsafe extern "C" fn(*mut bindings::dma_fence, *mut Leaf, usize) -> i32,
+) -> Option<KVec<Leaf>> {
     let mut capacity = 4;
     loop {
         let mut leaves = KVec::with_capacity(capacity, GFP_KERNEL).ok()?;
         // SAFETY: The input owns its fence. The C helper writes at most capacity
         // fully initialized records and releases every reference on failure.
-        let count = unsafe {
-            asahi_g17_collect_fences(input.raw(), leaves.as_mut_ptr(), capacity)
-        };
+        let count = unsafe { collector(input.raw(), leaves.as_mut_ptr(), capacity) };
         if count == ENOSPC.to_errno() && capacity < 128 {
             capacity = (capacity * 4).min(128);
             continue;
         }
-        if count < 0 { return None; }
+        if count < 0 {
+            return None;
+        }
         // SAFETY: The helper returned this many initialized, owned records.
         unsafe { leaves.set_len(count as usize) };
         return Some(leaves);
     }
+}
+
+/// Allocation, unsupported containers, or a large prefix retain normal waits.
+pub(crate) fn collect(input: &Fence) -> Option<KVec<Leaf>> {
+    collect_with(input, asahi_g17_collect_fences)
+}
+
+/// Like [`collect`], coalescing unsignalled non-error leaves sharing a `dma_fence` context to
+/// their latest sequence number so deep timeline chains stay bounded by distinct contexts.
+pub(crate) fn collect_coalesced(input: &Fence) -> Option<KVec<Leaf>> {
+    collect_with(input, asahi_g17_collect_fences_coalesced)
 }
 
 
