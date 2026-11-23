@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * The actual dcp-dp-audio late sleep callback and dev_pm_ops against an OF
- * graph and driver-core model that counts every node and device reference.
+ * The actual dcp-dp-audio late sleep callback and dev_pm_ops, and the DCP's
+ * dcp_sleep_keeps_firmware(), against an OF graph and driver-core model that
+ * counts every node and device reference and checks the device lock.
  */
 #include <assert.h>
 #include <errno.h>
@@ -12,6 +13,7 @@
 /* The harness builds with -Wno-unused-function. */
 #define __maybe_unused
 #define pm_sleep_ptr(fn) (fn)
+#define EXPORT_SYMBOL_GPL(sym)
 
 /* ACTUAL_PM_MACROS */
 
@@ -20,10 +22,21 @@ struct device_node {
 	bool available;
 };
 
+struct device_driver {
+	int unused;
+};
+
 struct device {
 	struct device_node *of_node;
 	int refs;
-	bool bound, wakeup_path, set_wakeup_path;
+	const struct device_driver *driver;
+	void *drvdata;
+	bool locked, set_wakeup_path;
+};
+
+/* What the DCP's suspend left: see the sites setting it in dcp.c. */
+struct apple_dcp {
+	bool sleep_fw_runs;
 };
 
 struct platform_device {
@@ -52,6 +65,8 @@ struct dev_pm_ops {
 /* The model: the dpaudio node, its endpoint, the DCP node and device. */
 static struct device_node audio_node, endpoint_node, dcp_node;
 static struct platform_device dcp_pdev;
+static const struct device_driver dcp_driver;
+static struct apple_dcp dcp_state;
 static struct device audio_dev = { .of_node = &audio_node };
 static bool have_endpoint, have_remote, have_pdev;
 static int force_suspend_ret, force_suspend_calls, find_calls;
@@ -112,16 +127,23 @@ static void put_device(struct device *dev)
 	dev->refs--;
 }
 
-static bool device_is_bound(struct device *dev)
+/* The driver core's contract: driver and driver data are read under the lock. */
+static void device_lock(struct device *dev)
 {
-	assert(dev == &dcp_pdev.dev && dev->refs > 0);
-	return dev->bound;
+	assert(dev == &dcp_pdev.dev && dev->refs > 0 && !dev->locked);
+	dev->locked = true;
 }
 
-static bool device_wakeup_path(struct device *dev)
+static void device_unlock(struct device *dev)
 {
-	assert(dev == &dcp_pdev.dev && dev->refs > 0);
-	return dev->wakeup_path;
+	assert(dev == &dcp_pdev.dev && dev->locked);
+	dev->locked = false;
+}
+
+static void *dev_get_drvdata(const struct device *dev)
+{
+	assert(dev == &dcp_pdev.dev && dev->locked && dev->driver);
+	return dev->drvdata;
 }
 
 static void device_set_wakeup_path(struct device *dev)
@@ -168,6 +190,8 @@ static int dcpaud_resume(struct device *dev)
 	return 4;
 }
 
+/* ACTUAL_DCP_FUNCTION */
+
 /* ACTUAL_FUNCTION */
 
 /* ACTUAL_PM_OPS */
@@ -184,8 +208,10 @@ int main(void)
 		have_remote = bits & 2;
 		dcp_node.available = bits & 4;
 		have_pdev = bits & 8;
-		dcp_pdev.dev.bound = bits & 16;
-		dcp_pdev.dev.wakeup_path = bits & 32;
+		dcp_pdev.dev.driver = bits & 16 ? &dcp_driver : NULL;
+		dcp_pdev.dev.drvdata = bits & 16 ? &dcp_state : NULL;
+		dcp_state.sleep_fw_runs = bits & 32;
+		dcp_pdev.dev.locked = false;
 		force_suspend_ret = bits & 64 ? -EBUSY : 0;
 		endpoint_node.refs = dcp_node.refs = dcp_pdev.dev.refs = 0;
 		audio_dev.set_wakeup_path = false;
@@ -195,13 +221,14 @@ int main(void)
 		ret = dcpaud_pm_ops.suspend_late(&audio_dev);
 
 		expect = have_endpoint && have_remote && dcp_node.available && have_pdev &&
-			 (!dcp_pdev.dev.bound || dcp_pdev.dev.wakeup_path);
+			 (!dcp_pdev.dev.driver || dcp_state.sleep_fw_runs);
 		if (audio_dev.set_wakeup_path != expect)
 			fprintf(stderr, "case %#x: wakeup path %d, expected %d\n", bits,
 				audio_dev.set_wakeup_path, expect);
 		assert(audio_dev.set_wakeup_path == expect);
 		/* Every reference taken is dropped, whatever the topology. */
 		assert(!endpoint_node.refs && !dcp_node.refs && !dcp_pdev.dev.refs);
+		assert(!dcp_pdev.dev.locked);
 		/* An unavailable or missing DCP node is never looked up. */
 		if (!(have_endpoint && have_remote && dcp_node.available))
 			assert(!find_calls);

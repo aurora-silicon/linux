@@ -9740,10 +9740,36 @@ static void dcp_t8132_sleep_stopped(struct apple_dcp *dcp)
 	WRITE_ONCE(dcp->t8132_release_late, false);
 }
 
+/**
+ * dcp_sleep_keeps_firmware - whether a DCP's firmware runs through this sleep
+ * @dev: the DCP device
+ *
+ * For blocks the DCP's firmware drives (DP audio), from their late or noirq
+ * suspend, after every device's .suspend: true when the DCP's suspend left
+ * its coprocessor running with its domains on, or when no driver is bound
+ * (a boot stage or an earlier bind may have left the firmware running).
+ * False when the suspend stopped the firmware (S2R, the 27.x sleep, an M4
+ * stop or power gate) or never ran it.
+ */
+bool dcp_sleep_keeps_firmware(struct device *dev)
+{
+	struct apple_dcp *dcp;
+	bool runs;
+
+	device_lock(dev);
+	dcp = dev->driver ? dev_get_drvdata(dev) : NULL;
+	runs = !dev->driver || (dcp && dcp->sleep_fw_runs);
+	device_unlock(dev);
+
+	return runs;
+}
+EXPORT_SYMBOL_GPL(dcp_sleep_keeps_firmware);
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	dcp->sleep_fw_runs = false;
 	/* Its power sequences may crash the DCP and blank the panel. */
 	if (dcp_takeover_was_aborted(dcp))
 		return -EBUSY;
@@ -9799,6 +9825,7 @@ static int dcp_platform_suspend(struct device *dev)
 			return ret;
 		}
 		dcp_t8132_sleep_stopped(dcp);
+		dcp->sleep_fw_runs = !iomfb_m4_sleep_stopped(dcp);
 		device_set_wakeup_path(dev);
 		return 0;
 	}
@@ -9854,6 +9881,7 @@ static int dcp_platform_suspend(struct device *dev)
 		/* Pair with the H17P unpark; native26 has its own retained resume. */
 		if (dcp_is_external_h17p(dcp))
 			dcp_typec_route_park(dcp);
+		dcp->sleep_fw_runs = true;
 		device_set_wakeup_path(dev);
 		if (dcp_is_ext26(dcp))
 			dev_dbg(dev, "native26 retained s2idle stop; firmware and supplier leases held\n");
@@ -9887,6 +9915,7 @@ static int dcp_platform_suspend(struct device *dev)
 	 * domains to stay on. We need this as we do not support full
 	 * shutdown properly yet.
 	 */
+	dcp->sleep_fw_runs = true;
 	device_set_wakeup_path(dev);
 	/* Last: the steps above still talk to the coprocessor. */
 	dcp_hold_for_sleep(dcp);
@@ -9898,6 +9927,7 @@ static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	dcp->sleep_fw_runs = false;
 	if (dcp_takeover_was_aborted(dcp))
 		return 0;
 

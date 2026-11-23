@@ -2073,12 +2073,14 @@ static __maybe_unused int dcpaud_system_suspend(struct device *dev)
 
 /*
  * The DCP's firmware drives this block. A DCP that keeps its coprocessor
- * running through a sleep keeps its own power domains for it (its suspend
- * sets its wakeup path), and this block's domain must stay with them:
- * cutting it at noirq under running DCP firmware resets the machine. A DCP
- * device without a driver may still run firmware that a boot stage or an
- * earlier bind left running, so its block is kept too. Every device's
- * .suspend has run before this late phase, so the DCP's choice is known.
+ * running through a sleep keeps its own power domains for it, and this
+ * block's domain must stay with them: cutting it at noirq under running DCP
+ * firmware resets the machine. A DCP that stops its firmware for the sleep
+ * needs nothing held here, so the domain goes down as before. A DCP device
+ * without a driver may still run firmware that a boot stage or an earlier
+ * bind left running, so its block is kept too. Every device's .suspend has
+ * run before this late phase, so the DCP's choice is known
+ * (dcp_sleep_keeps_firmware()).
  */
 static __maybe_unused int dcpaud_suspend_late(struct device *dev)
 {
@@ -2094,7 +2096,7 @@ static __maybe_unused int dcpaud_suspend_late(struct device *dev)
 		dcp_pdev = of_find_device_by_node(dcp_node);
 	of_node_put(dcp_node);
 	if (dcp_pdev) {
-		if (!device_is_bound(&dcp_pdev->dev) || device_wakeup_path(&dcp_pdev->dev))
+		if (dcp_sleep_keeps_firmware(&dcp_pdev->dev))
 			device_set_wakeup_path(dev);
 		put_device(&dcp_pdev->dev);
 	}

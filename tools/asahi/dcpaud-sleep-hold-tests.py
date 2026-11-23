@@ -5,12 +5,16 @@
 genpd powers the dp-audio domain off at noirq unless the device is on the
 wakeup path, and cutting it under running DCP firmware resets the J473 on
 s2idle. dcpaud_suspend_late() puts dp-audio on the wakeup path when the DCP
-linked by its OF graph exists and is unbound or on its own wakeup path. The
+linked by its OF graph exists and is unbound or kept its firmware running
+through the sleep (dcp_sleep_keeps_firmware()); a DCP that stopped its
+firmware (S2R, the 27.x sleep, an M4 stop) leaves the domain to genpd. The
 fixture builds the real function and the real dcpaud_pm_ops (with the
-kernel's PM_OPS macros) from drivers/gpu/drm/apple/audio.c against an OF
-graph and driver-core model that counts every node and device reference.
+kernel's PM_OPS macros) from drivers/gpu/drm/apple/audio.c, and the real
+dcp_sleep_keeps_firmware() from dcp.c, against an OF graph and driver-core
+model that counts every node and device reference and checks that the
+DCP's driver data is read under its device lock.
 
---mutation names a change to the production function that the matrix must
+--mutation names a change to a production function that the matrix must
 kill. --ref reads audio.c from an older revision: before the fix the late
 slot was pm_runtime_force_suspend, which never holds the domain, so the
 matrix fails (the old-code negative control).
@@ -26,18 +30,26 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 AUDIO = "drivers/gpu/drm/apple/audio.c"
+DCP = "drivers/gpu/drm/apple/dcp.c"
 PM = "include/linux/pm.h"
 
+# (file, old, new): each must apply exactly once and the matrix must kill it.
 MUTATIONS = {
-    # Hold only for a DCP on its wakeup path; an unbound DCP loses the domain.
-    "bound-only": ("!device_is_bound(&dcp_pdev->dev) || device_wakeup_path(",
-                   "device_wakeup_path("),
+    # Hold only for a bound DCP that kept its firmware; an unbound DCP loses the domain.
+    "bound-only": ("dcp", "runs = !dev->driver || (dcp && dcp->sleep_fw_runs);",
+                   "runs = dcp && dcp->sleep_fw_runs;"),
+    # Hold for any bound DCP, also one that stopped its firmware for the sleep.
+    "stopped-holds": ("dcp", "(dcp && dcp->sleep_fw_runs)", "(dcp != NULL)"),
+    # Hold for a bound DCP that stopped its firmware, not for one that kept it.
+    "invert-runs": ("dcp", "(dcp && dcp->sleep_fw_runs)", "(dcp && !dcp->sleep_fw_runs)"),
+    # Read the driver data without the device lock.
+    "no-lock": ("dcp", "\tdevice_lock(dev);\n", ""),
     # Leak the DCP device reference from of_find_device_by_node().
-    "leak-device": ("\t\tput_device(&dcp_pdev->dev);\n", ""),
+    "leak-device": ("audio", "\t\tput_device(&dcp_pdev->dev);\n", ""),
     # Leak the DCP node reference from of_graph_get_remote_port_parent().
-    "leak-node": ("\tof_node_put(dcp_node);\n", ""),
-    # Hold for a bound DCP that is NOT on its wakeup path.
-    "invert-wakeup": ("|| device_wakeup_path(", "|| !device_wakeup_path("),
+    "leak-node": ("audio", "\tof_node_put(dcp_node);\n", ""),
+    # Back to the wakeup-path test that also held for a stopped DCP.
+    "ignore-dcp": ("audio", "if (dcp_sleep_keeps_firmware(&dcp_pdev->dev))", "if (true)"),
 }
 
 
@@ -53,6 +65,13 @@ def block(text, start):
 def function(text, name):
     match = re.search(r"^static [^\n;]*\bint " + name + r"\(struct device \*dev\)\n\{",
                       text, re.M)
+    if not match:
+        return None
+    return text[match.start():block(text, match.start())]
+
+
+def dcp_function(text):
+    match = re.search(r"^bool dcp_sleep_keeps_firmware\(struct device \*dev\)\n\{", text, re.M)
     if not match:
         return None
     return text[match.start():block(text, match.start())]
@@ -77,22 +96,28 @@ def main():
     args = parser.parse_args()
 
     if args.ref:
-        audio = subprocess.check_output(["git", "show", f"{args.ref}:{AUDIO}"],
-                                        cwd=ROOT, text=True)
+        audio, dcp = (subprocess.check_output(["git", "show", f"{args.ref}:{path}"],
+                                              cwd=ROOT, text=True) for path in (AUDIO, DCP))
     else:
-        audio = (ROOT / AUDIO).read_text()
+        audio, dcp = ((ROOT / path).read_text() for path in (AUDIO, DCP))
     pm = (ROOT / PM).read_text()
     late = function(audio, "dcpaud_suspend_late")
+    keeps = dcp_function(dcp)
     if args.mutation:
-        old, new = MUTATIONS[args.mutation]
-        if not late or late.count(old) != 1:
+        where, old, new = MUTATIONS[args.mutation]
+        body = late if where == "audio" else keeps
+        if not body or body.count(old) != 1:
             raise RuntimeError(f"mutation {args.mutation} did not apply exactly once")
-        late = late.replace(old, new)
+        if where == "audio":
+            late = late.replace(old, new)
+        else:
+            keeps = keeps.replace(old, new)
 
     macros = "".join(macro(pm, name) for name in
                      ("SYSTEM_SLEEP_PM_OPS", "LATE_SYSTEM_SLEEP_PM_OPS", "RUNTIME_PM_OPS"))
     code = (Path(__file__).with_suffix(".c").read_text()
             .replace("/* ACTUAL_PM_MACROS */", macros)
+            .replace("/* ACTUAL_DCP_FUNCTION */", keeps or "")
             .replace("/* ACTUAL_FUNCTION */", late or "")
             .replace("/* ACTUAL_PM_OPS */", pm_ops(audio)))
 
