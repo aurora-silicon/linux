@@ -958,10 +958,14 @@ impl RootV27_2 {
                                 (0x109c, 0), (0x1064, 0), (0x2728, 0)] {
             put32(hw, offset as usize, value);
         }
-        // Compute resource mask, one low bit per configured core; the firmware seeds the
-        // compute engine's population from it.
-        let cores = id.total_active_cores;
-        put32(hw, 0x2670, if cores < 32 { (1u32 << cores) - 1 } else { u32::MAX });
+        // Per-engine kick masks. The firmware gives an engine a kick slot only for bits set
+        // here, so an engine whose mask is left zero is never scheduled. The tiler takes one
+        // bit per cluster; the fragment and compute engines take one bit per configured core.
+        let low_bits = |n: u32| if n < 32 { (1u32 << n) - 1 } else { u32::MAX };
+        put32(hw, 0x2668, low_bits(id.num_clusters));
+        for offset in [0x266c, 0x2670] {
+            put32(hw, offset, low_bits(id.total_active_cores));
+        }
         // Firmware-managed operating points, CRE and event-assisted operating-point completion.
         for offset in [0xfc0, 0x26b8, 0x1054] {
             put32(hw, offset, 1);
