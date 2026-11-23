@@ -806,13 +806,26 @@ static void cft_test_suspend_lazy(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->policy->cur, 600000);
 }
 
+#ifdef CONFIG_SUSPEND
+static void cft_restore_pm_flags(void *flags)
+{
+	pm_suspend_global_flags = *(unsigned int *)flags;
+}
+#endif
+
 /* After a firmware-driven sleep the state the cluster woke in is adopted. */
 static void cft_test_resume(struct kunit *test)
 {
 #ifdef CONFIG_SUSPEND
 	struct cft_ctx *ctx = cft_setup(test, &soc_t6050_info, 4);
 	struct apple_cpu_priv *priv = ctx->priv;
-	unsigned int flags = pm_suspend_global_flags;
+	unsigned int *flags;
+
+	/* Put the global flags back even if an assertion ends the case. */
+	flags = kunit_kmalloc(test, sizeof(*flags), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, flags);
+	*flags = pm_suspend_global_flags;
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, cft_restore_pm_flags, flags), 0);
 
 	pm_suspend_clear_flags();
 
@@ -839,8 +852,6 @@ static void cft_test_resume(struct kunit *test)
 	cft_set_cmd(ctx->regs, 9);
 	KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_resume(ctx->policy), 0);
 	KUNIT_EXPECT_EQ(test, ctx->priv->expected_pstate, 4);
-
-	pm_suspend_global_flags = flags;
 #else
 	kunit_skip(test, "needs CONFIG_SUSPEND");
 #endif
@@ -1212,7 +1223,10 @@ static void cft_test_fast_die_init_described(struct kunit *test)
 	struct apple_fast_die *fd;
 	__be32 *value;
 
-	/* Any node with a phandle can stand in for the report node. */
+	/*
+	 * Any node with a phandle can stand in for the report node. The walk
+	 * takes no reference: take one for the time the test uses the node.
+	 */
 	for_each_of_allnodes(np) {
 		if (np->phandle) {
 			report = np;
