@@ -196,12 +196,12 @@ static void apple_pcie_cio_t6050_reset(struct apple_pcie *pcie, struct apple_pci
  * J714s: the tunnel's root port takes PME_Turn_Off at its own register. Through the other
  * one nothing is sent: the send bit reads clear at once, no PME_TO_Ack is waited for, the
  * link never reaches L2, and it is stopped and reset from L0 before its routers are told
- * to sleep. Other boards keep the register they had; no trace of theirs has been read.
+ * to sleep. In force where the T6050 sleep is described (apple,t6050-sleep), whose router
+ * sleep in place this is for; a T6050 board without it keeps the register it had.
  */
 static u32 apple_pcie_cio_t6050_pme_reg(void)
 {
-	return (of_machine_is_compatible("apple,j714s") ||
-		of_machine_is_compatible("apple,j716c")) ? PORT_T6050_PCIEC_PME_TURN_OFF :
+	return apple_t6050_sleep_described() ? PORT_T6050_PCIEC_PME_TURN_OFF :
 							 PORT_PME_TURN_OFF;
 }
 
@@ -388,8 +388,7 @@ static int apple_pcie_cio_suspend(struct apple_pcie *pcie)
 	u32 stat;
 	int i, ret, recover;
 
-	if (pcie->hw == &t6050_pciec_hw && (of_machine_is_compatible("apple,j714s") ||
-					    of_machine_is_compatible("apple,j716c")))
+	if (pcie->hw == &t6050_pciec_hw && apple_t6050_sleep_described())
 		return apple_pcie_cio_suspend_t6050(pcie);
 	port = list_first_entry(&pcie->ports, struct apple_pcie_port, entry);
 	dev_info(pcie->dev, "CIO PCIe-C drain and reset\n");
