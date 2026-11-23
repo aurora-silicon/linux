@@ -156,11 +156,13 @@ struct ane_fw_backend {
 	 * from then on genpd's next ANE_SYS OFF, with the PMGR actual state off,
 	 * sets hung_off (ane_fw_genpd_event()), the proof the firmware is gone.
 	 */
-	struct work_struct recover;
+	struct delayed_work recover;
 	bool hung_down, hung_off;
+	/* Runtime recoveries, limited (ane_fw_recover_admit()); under lock. */
+	struct ane_fw_recover_limit recover_limit;
 	/* A power-down outside a sleep: a stuck power word cannot wait for one. */
 	bool runtime_off;
-	u64 recoveries, recover_failures;
+	u64 recoveries, recover_failures, recover_limited;
 };
 
 /* One ANE per SoC. The observer exists before platform driver registration:
@@ -1210,12 +1212,61 @@ static void ane_fw_hung_recovered(struct ane_fw_backend *b)
 	b->recoveries++;
 }
 
+/*
+ * Runtime recovery limit (ane_fw_recover_admit()): at most five recoveries
+ * within a minute, backing off from 1 s (doubling each time) so a client that
+ * hangs the engine again right away cannot storm ANE_SYS power cycles. A sixth
+ * hang within the window leaves the engine quarantined until a system sleep.
+ */
+#define ANE_FW_RECOVER_BURST 5U
+#define ANE_FW_RECOVER_WINDOW_S 60U
+#define ANE_FW_RECOVER_BACKOFF_MS 1000U
+
+static const struct ane_fw_recover_policy ane_fw_recover_default = {
+	.burst = ANE_FW_RECOVER_BURST,
+	.window_ns = (u64)ANE_FW_RECOVER_WINDOW_S * NSEC_PER_SEC,
+	.backoff_ns = (u64)ANE_FW_RECOVER_BACKOFF_MS * NSEC_PER_MSEC,
+};
+
+/*
+ * Whether this recovery may run now. Called under b->lock; a recovery that
+ * must wait is queued again for then, with the session left quarantined
+ * (requests fail with -EIO meanwhile and nothing reaches the engine).
+ */
+static bool ane_fw_recover_admitted(struct ane_fw_backend *b, u64 now)
+{
+	bool tripped = b->recover_limit.tripped;
+	u64 wait;
+
+	switch (ane_fw_recover_admit(&b->recover_limit, &ane_fw_recover_default, now, &wait)) {
+	case ANE_FW_RECOVER_NOW:
+		ane_fw_recover_note(&b->recover_limit, now);
+		return true;
+	case ANE_FW_RECOVER_LATER:
+		dev_warn(&b->pdev->dev,
+			 "H17 ANE: hung again within %u s: recovery backs off %llu ms\n",
+			 ANE_FW_RECOVER_WINDOW_S, div_u64(wait, NSEC_PER_MSEC));
+		mod_delayed_work(system_dfl_wq, &b->recover,
+				 nsecs_to_jiffies(wait) + 1);
+		return false;
+	case ANE_FW_RECOVER_STOP:
+	default:
+		b->recover_limited++;
+		if (!tripped)
+			dev_err(&b->pdev->dev,
+				"H17 ANE: %u recoveries within %u s: no more runtime recoveries; quarantined until the next system sleep\n",
+				ANE_FW_RECOVER_BURST, ANE_FW_RECOVER_WINDOW_S);
+		return false;
+	}
+}
+
 static void ane_fw_recover_work(struct work_struct *work)
 {
-	struct ane_fw_backend *b = container_of(work, struct ane_fw_backend, recover);
+	struct ane_fw_backend *b = container_of(to_delayed_work(work), struct ane_fw_backend,
+						recover);
 	struct device *dev = &b->pdev->dev;
 	bool rpm = ane_fw_rpm(b), held = false, reschedule = false;
-	u64 start = ktime_get_ns();
+	u64 start, last;
 	int ret;
 
 	/*
@@ -1236,6 +1287,9 @@ static void ane_fw_recover_work(struct work_struct *work)
 				     !READ_ONCE(b->in_sleep) && !b->session.quarantined;
 			break;
 		}
+		start = ktime_get_ns();
+		if (!ane_fw_recover_admitted(b, ktime_get_boottime_ns()))
+			break;
 		/* Closes admission: requests wait in ane_h16_session_enter() meanwhile. */
 		ane_h16_session_sleep(&b->session, true);
 		/*
@@ -1288,9 +1342,12 @@ static void ane_fw_recover_work(struct work_struct *work)
 		}
 		ane_h16_session_sleep(&b->session, false);
 		dev_info(dev,
-			 "H17 ANE: %s after a hung request in %llu ms, %u programs replayed\n",
+			 "H17 ANE: %s after a hung request in %llu ms, %u programs replayed; recovery %u of %u within %u s\n",
 			 ret ? "recovery FAILED" : "firmware recovered",
-			 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), b->resume_replayed);
+			 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), b->resume_replayed,
+			 ane_fw_recover_recent(&b->recover_limit, ktime_get_boottime_ns(),
+					       ane_fw_recover_default.window_ns, &last),
+			 ANE_FW_RECOVER_BURST, ANE_FW_RECOVER_WINDOW_S);
 	}
 	if (held) {
 		if (reschedule) {
@@ -1309,9 +1366,16 @@ static void ane_fw_hung(void *ctx, int error)
 
 	if (READ_ONCE(b->in_sleep))
 		return;
+	if (READ_ONCE(b->recover_limit.tripped)) {
+		dev_warn(&b->pdev->dev,
+			 "H17 ANE: session quarantined (%d); recovery limit reached, left quarantined\n",
+			 error);
+		return;
+	}
 	dev_warn(&b->pdev->dev, "H17 ANE: session quarantined (%d); restarting the engine\n",
 		 error);
-	queue_work(system_dfl_wq, &b->recover);
+	/* A recovery already waiting out its backoff keeps its time. */
+	queue_delayed_work(system_dfl_wq, &b->recover, 0);
 }
 
 /*
@@ -1601,6 +1665,8 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 	}
 	/* Stay off until a request needs the engine, as macOS does. */
 	if (b->soc->macos_sleep && !recover) {
+		/* Powered off for the sleep: runtime recoveries start counting afresh. */
+		ane_fw_recover_reset(&b->recover_limit);
 		WRITE_ONCE(b->parked, true);
 		WRITE_ONCE(b->session.parked, true);
 		dev_info(&b->pdev->dev, "H17 ANE: resume ok: parked until the next request\n");
@@ -1628,7 +1694,9 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 	} else if (recover) {
 		ane_fw_hung_recovered(b);
 		ane_fw_rpm_idle(b);
-		dev_info(&b->pdev->dev, "H17 ANE: quarantined engine recovered by system sleep\n");
+		dev_info(&b->pdev->dev, "H17 ANE: quarantined engine recovered by system sleep%s\n",
+			 b->recover_limit.tripped ? "; recovery limit reset" : "");
+		ane_fw_recover_reset(&b->recover_limit);
 	}
 	ane_h16_session_sleep(&b->session, false);
 	/* genpd's record of the domain across this sleep (boot time, so it counts s2idle). */
@@ -1685,8 +1753,11 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 	if (event == PM_SUSPEND_PREPARE) {
 		WRITE_ONCE(b->in_sleep, true);
 		WRITE_ONCE(b->session.wake_blocked, true);
-		/* A recovery under way finishes first; one not yet started is left to sleep. */
-		cancel_work_sync(&b->recover);
+		/*
+		 * A recovery under way finishes first; one still waiting out its
+		 * backoff is dropped: the sleep recovers the engine itself.
+		 */
+		cancel_delayed_work_sync(&b->recover);
 	}
 	if (event == PM_SUSPEND_PREPARE && retained) {
 		struct device *dev = &b->pdev->dev;
@@ -2644,6 +2715,8 @@ static void ane_fw_debugfs(struct ane_fw_backend *b)
 	/* Hung-request recoveries (ane_fw_hung()), at runtime or by a sleep. */
 	debugfs_create_u64("recoveries", 0400, dir, &b->recoveries);
 	debugfs_create_u64("recover_failures", 0400, dir, &b->recover_failures);
+	/* Recoveries refused by the limit (ane_fw_recover_admit()). */
+	debugfs_create_u64("recover_limited", 0400, dir, &b->recover_limited);
 	if (found)
 		dput(root);
 }
@@ -3115,7 +3188,7 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 	}
 	dev_info(&pdev->dev, "H17 ANE: loader hand-off verified; starting the engine\n");
 	INIT_WORK(&b->start, ane_fw_start_work);
-	INIT_WORK(&b->recover, ane_fw_recover_work);
+	INIT_DELAYED_WORK(&b->recover, ane_fw_recover_work);
 	return 0;
 fail:
 	ane_fw_observer_free(b);
@@ -3231,7 +3304,7 @@ bool ane_fw_staged_exit(void)
 	if (!b)
 		return false;
 	cancel_work_sync(&b->start);
-	cancel_work_sync(&b->recover);
+	cancel_delayed_work_sync(&b->recover);
 	/* A retained backend pins the module. No unload or in-place retry. */
 	if (WARN_ON(b->retained))
 		return true;

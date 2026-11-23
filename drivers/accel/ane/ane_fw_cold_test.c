@@ -410,7 +410,135 @@ static void ane_cold_hung_gone_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&proven, &s));
 }
 
+#define REC_S(x) ((u64)(x) * NSEC_PER_SEC)
+#define REC_MS(x) ((u64)(x) * NSEC_PER_MSEC)
+
+/* Ask at @now and, when admitted, start the attempt then (as the recover work does). */
+static enum ane_fw_recover_verdict rec_try(struct ane_fw_recover_limit *l,
+					   const struct ane_fw_recover_policy *p,
+					   u64 now, u64 *wait)
+{
+	enum ane_fw_recover_verdict v = ane_fw_recover_admit(l, p, now, wait);
+
+	if (v == ANE_FW_RECOVER_NOW)
+		ane_fw_recover_note(l, now);
+	return v;
+}
+
+/*
+ * A storm of hangs (0.6 s after each recovery): with the policy (5 in 60 s,
+ * 1 s backoff) the recoveries spread out to 0, 1, 3, 7 and 15 s, and the
+ * sixth hang stops them until a system sleep resets the limit.
+ */
+static void ane_cold_recover_storm_test(struct kunit *test)
+{
+	const struct ane_fw_recover_policy p = {
+		.burst = 5, .window_ns = REC_S(60), .backoff_ns = REC_S(1),
+	};
+	static const u64 expect[] = { 0, 1, 3, 7, 15 };
+	struct ane_fw_recover_limit l = {};
+	u64 now = REC_S(100), wait, started[ARRAY_SIZE(expect)];
+	unsigned int done = 0, refused = 0;
+
+	/* Hang 0.6 s after each recovery; a refused one is asked again when told. */
+	while (done < ARRAY_SIZE(expect)) {
+		enum ane_fw_recover_verdict v = rec_try(&l, &p, now, &wait);
+
+		KUNIT_ASSERT_NE(test, v, ANE_FW_RECOVER_STOP);
+		if (v == ANE_FW_RECOVER_LATER) {
+			KUNIT_ASSERT_GT(test, wait, 0ULL);
+			refused++;
+			now += wait;
+			continue;
+		}
+		started[done++] = now;
+		now += REC_MS(600);
+	}
+	for (unsigned int i = 0; i < ARRAY_SIZE(expect); i++)
+		KUNIT_EXPECT_EQ(test, started[i] - started[0], REC_S(expect[i]));
+	KUNIT_EXPECT_EQ(test, refused, 4U);
+	/* The sixth hang within the minute trips the limit, and it stays tripped. */
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_STOP);
+	KUNIT_EXPECT_TRUE(test, l.tripped);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + REC_S(3600), &wait), ANE_FW_RECOVER_STOP);
+	KUNIT_EXPECT_EQ(test, wait, 0ULL);
+	/* A system sleep clears it: the next one runs at once. */
+	ane_fw_recover_reset(&l);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + REC_S(3601), &wait), ANE_FW_RECOVER_NOW);
+}
+
+/* Backoff doubling, its cap, the sliding window and the burst bounds. */
+static void ane_cold_recover_backoff_test(struct kunit *test)
+{
+	struct ane_fw_recover_policy p = {
+		.burst = 16, .window_ns = REC_S(10), .backoff_ns = REC_S(1),
+	};
+	struct ane_fw_recover_limit l = {};
+	u64 now = REC_S(1), wait;
+
+	/* First in the window: at once. */
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	KUNIT_EXPECT_EQ(test, wait, 0ULL);
+	/* Second: 1 s after the first; asked 0.25 s after it, wait 0.75 s. */
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + REC_MS(250), &wait), ANE_FW_RECOVER_LATER);
+	KUNIT_EXPECT_EQ(test, wait, REC_MS(750));
+	now += REC_S(1);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	/* Third: 2 s after the second; fourth: 4 s; fifth: capped at the window. */
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_LATER);
+	KUNIT_EXPECT_EQ(test, wait, REC_S(2));
+	now += REC_S(2);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_LATER);
+	KUNIT_EXPECT_EQ(test, wait, REC_S(4));
+	now += REC_S(4);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	/* Started at 0, 1, 3 and 7 s; at 7 s all four are in the 10 s window. */
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_LATER);
+	KUNIT_EXPECT_EQ(test, wait, REC_S(8));
+	/* At 10 s the first has left the window: three recent, 4 s after the latest. */
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + REC_S(3), &wait), ANE_FW_RECOVER_LATER);
+	KUNIT_EXPECT_EQ(test, wait, REC_S(1));
+	/* At 11 s the first two have: two recent, 2 s after the latest, due. */
+	now += REC_S(4);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	KUNIT_EXPECT_FALSE(test, l.tripped);
+	/* Quiet for a whole window: no backoff at all. */
+	now += REC_S(10);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+
+	/* Delays never exceed the window, whatever the backoff. */
+	ane_fw_recover_reset(&l);
+	p.backoff_ns = REC_S(60);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_LATER);
+	KUNIT_EXPECT_EQ(test, wait, REC_S(10));
+
+	/* No backoff: only the burst limits. A burst of 0 counts as 1. */
+	ane_fw_recover_reset(&l);
+	p.backoff_ns = 0;
+	p.burst = 0;
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + 1, &wait), ANE_FW_RECOVER_STOP);
+
+	/* A burst above the ring is the ring: 16 at once, the 17th stops. */
+	ane_fw_recover_reset(&l);
+	p.burst = 100;
+	for (unsigned int i = 0; i < ANE_FW_RECOVER_BURST_MAX; i++)
+		KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + i, &wait), ANE_FW_RECOVER_NOW);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + 16, &wait), ANE_FW_RECOVER_STOP);
+
+	/* A clock that went back (a stamp after now) is not counted as recent. */
+	ane_fw_recover_reset(&l);
+	p.burst = 2;
+	p.backoff_ns = REC_S(1);
+	ane_fw_recover_note(&l, now + REC_S(5));
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+}
+
 static struct kunit_case ane_cold_cases[] = {
+	KUNIT_CASE(ane_cold_recover_storm_test),
+	KUNIT_CASE(ane_cold_recover_backoff_test),
 	KUNIT_CASE(ane_cold_hung_gone_test),
 	KUNIT_CASE(ane_cold_no_clpc_test),
 	KUNIT_CASE(ane_cold_restartable_test),

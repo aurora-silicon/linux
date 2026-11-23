@@ -117,6 +117,106 @@ static inline bool ane_fw_hung_gone(const struct ane_fw_hung_proof *p,
 }
 
 /*
+ * Runtime recoveries of a hung engine are limited. Each one powers the
+ * engine off under its firmware and boots it again; a client that hangs it
+ * again right away turns that into a storm of power cycles, and eight of them
+ * within six seconds locked the whole SoC up on a J700. So:
+ *
+ * - the first recovery in @window_ns runs at once; each later one in the
+ *   window waits @backoff_ns after the one before it, twice as long for each
+ *   recovery already in the window, at most @window_ns;
+ * - a recovery that would be the (@burst + 1)th within @window_ns trips the
+ *   limit: no more runtime recoveries, the engine stays quarantined until a
+ *   system sleep powers it off and boots it again.
+ *
+ * Every attempt counts, failed or not, from when it starts.
+ */
+#define ANE_FW_RECOVER_BURST_MAX 16
+
+struct ane_fw_recover_policy {
+	unsigned int burst;
+	u64 window_ns, backoff_ns;
+};
+
+struct ane_fw_recover_limit {
+	/* Start times of the latest attempts, a ring of count entries before next. */
+	u64 at[ANE_FW_RECOVER_BURST_MAX];
+	unsigned int next, count;
+	bool tripped;
+};
+
+enum ane_fw_recover_verdict {
+	ANE_FW_RECOVER_NOW,
+	ANE_FW_RECOVER_LATER,
+	ANE_FW_RECOVER_STOP,
+};
+
+/* Attempts that started less than @window_ns before @now, and the latest start. */
+static inline unsigned int ane_fw_recover_recent(const struct ane_fw_recover_limit *l,
+						 u64 now, u64 window_ns, u64 *last)
+{
+	unsigned int i, recent = 0;
+
+	*last = 0;
+	for (i = 0; i < l->count; i++) {
+		u64 at = l->at[(l->next + ANE_FW_RECOVER_BURST_MAX - 1 - i) %
+			       ANE_FW_RECOVER_BURST_MAX];
+
+		if (at > now || now - at >= window_ns)
+			break;
+		if (!recent++)
+			*last = at;
+	}
+	return recent;
+}
+
+/*
+ * May a recovery start at @now? LATER sets *@wait_ns, after which to ask
+ * again; STOP trips the limit, which stays tripped until
+ * ane_fw_recover_reset().
+ */
+static inline enum ane_fw_recover_verdict
+ane_fw_recover_admit(struct ane_fw_recover_limit *l, const struct ane_fw_recover_policy *p,
+		     u64 now, u64 *wait_ns)
+{
+	unsigned int burst = clamp(p->burst, 1U, (unsigned int)ANE_FW_RECOVER_BURST_MAX);
+	u64 last, delay = p->backoff_ns;
+	unsigned int recent, i;
+
+	*wait_ns = 0;
+	if (l->tripped)
+		return ANE_FW_RECOVER_STOP;
+	recent = ane_fw_recover_recent(l, now, p->window_ns, &last);
+	if (recent >= burst) {
+		l->tripped = true;
+		return ANE_FW_RECOVER_STOP;
+	}
+	if (!recent)
+		return ANE_FW_RECOVER_NOW;
+	for (i = 1; i < recent && delay < p->window_ns; i++)
+		delay *= 2;
+	delay = min(delay, p->window_ns);
+	if (now - last >= delay)
+		return ANE_FW_RECOVER_NOW;
+	*wait_ns = last + delay - now;
+	return ANE_FW_RECOVER_LATER;
+}
+
+/* A recovery attempt starts at @now. */
+static inline void ane_fw_recover_note(struct ane_fw_recover_limit *l, u64 now)
+{
+	l->at[l->next] = now;
+	l->next = (l->next + 1) % ANE_FW_RECOVER_BURST_MAX;
+	if (l->count < ANE_FW_RECOVER_BURST_MAX)
+		l->count++;
+}
+
+static inline void ane_fw_recover_reset(struct ane_fw_recover_limit *l)
+{
+	memset(l, 0, sizeof(*l));
+}
+
+/*
  * RVBAR (engine +0x1050000) and the TEXT entry: latched at TEXT (bit 0 set)
  * is ready; with bit 0 clear the entry may be written; latched at any other
  * entry is refused (never write RVBAR while bit 0 is set).
