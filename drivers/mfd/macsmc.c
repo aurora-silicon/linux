@@ -629,9 +629,15 @@ static const struct apple_smc_wake_reason apple_smc_j714s_wake_reasons[] = {
 	{ 43, "USB2_plug" }, { 44, "USB2_wake" }, { 45, "aupo" }, { 48, "rtc" }, { }
 };
 
+/* What sets an SoC's SMC apart, from its match entry. */
+struct apple_smc_hw {
+	bool wktp;
+};
+
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	const struct apple_smc_hw *hw;
 	struct apple_smc *smc;
 	__be32 count = 0;
 	bool t6050;
@@ -646,7 +652,8 @@ static int apple_smc_probe(struct platform_device *pdev)
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
 	smc->dev = &pdev->dev;
-	smc->wktp = of_device_is_compatible(dev->of_node, "apple,t6041-smc");
+	hw = of_device_get_match_data(dev);
+	smc->wktp = hw && hw->wktp;
 	smc->saved_enabled = of_machine_is_compatible("apple,t6050") &&
 		(of_machine_is_compatible("apple,j714s") ||
 		 of_machine_is_compatible("apple,j716c")) &&
@@ -748,7 +755,12 @@ static int apple_smc_probe(struct platform_device *pdev)
 					       ARRAY_SIZE(apple_smc_t6050_described_devs));
 }
 
+static const struct apple_smc_hw apple_smc_t6041_hw = {
+	.wktp = true,
+};
+
 static const struct of_device_id apple_smc_of_match[] = {
+	{ .compatible = "apple,t6041-smc", .data = &apple_smc_t6041_hw },
 	{ .compatible = "apple,t8152-smc" },
 	{ .compatible = "apple,t6050-smc" },
 	{ .compatible = "apple,t8103-smc" },
