@@ -41,6 +41,7 @@ use std::cell::Cell;
 use std::sync::{Mutex,MutexGuard,atomic::{AtomicBool,AtomicU64,Ordering,fence}};
 type Result<T=()> = std::result::Result<T,i32>;
 type KBox<T> = Box<T>;
+type KVec<T> = Vec<T>;
 const EIO:i32=-5;const EAGAIN:i32=-11;const ENODEV:i32=-19;const EBUSY:i32=-16;const ECANCELED:i32=-125;
 const RECOVERY_WAIT_MS:u32=26_000;
 static NOW:AtomicU64=AtomicU64::new(0);static ALIAS:AtomicBool=AtomicBool::new(false);static PAGES:AtomicBool=AtomicBool::new(false);
@@ -76,6 +77,7 @@ impl Drop for Alias{fn drop(&mut self){ALIAS.store(false,Ordering::SeqCst);}}
 mod compute{pub(crate) use crate::Queue;}
 struct Queue{fresh:bool}
 impl Queue{
+ fn owner(&self)->Option<u64>{Some(1)}
  fn pool_fits(&self,_:usize)->bool{false}
  fn begin_growth(&mut self,_:&(),_:usize)->Result<bool>{Ok(false)}
  fn growth_token(&self)->Option<u64>{Some(7)}
@@ -89,6 +91,8 @@ struct Registry{compute:Vec<Option<Entry>>}
 impl Registry{
  fn compute(&self,_:u64)->Option<&Queue>{self.compute[0].as_ref().unwrap().queue.as_deref()}
  fn compute_mut(&mut self,_:u64)->Option<&mut Queue>{self.compute[0].as_mut().unwrap().queue.as_deref_mut()}
+ fn compute_primary(&mut self,owner:u64)->Option<&mut Queue>{self.compute_mut(owner)}
+ fn drain_compute_siblings(&mut self,_:u64)->Result<Vec<(ComputeReservation,Box<Queue>)>>{Ok(Vec::new())}
  fn cancel_compute(&mut self,_:ComputeReservation)->Result{assert!(!ALIAS.load(Ordering::SeqCst)&&!PAGES.load(Ordering::SeqCst));RESERVED.store(false,Ordering::SeqCst);Ok(())}
 }
 struct Primary;impl Primary{fn notify(&self,_:u32)->Result{Ok(())}}

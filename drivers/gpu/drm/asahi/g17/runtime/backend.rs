@@ -34,30 +34,48 @@ impl Backend {
         // No outer preparation lease survives compute_packet's return. Hold a
         // fresh epoch through alias destruction so recovery can join this work.
         loop {
-        let lease = self.shared.preparations.enter(false)?;
-        let mut retired = None;
-        let mut state = self.shared.state.lock();
-        let firmware = state.as_deref_mut().ok_or(ENODEV)?;
-        if !lease.is_current() { drop(state); drop(lease); continue; }
-        let mut binding = None;
-        if let Some(index) = firmware.queues.compute.iter().position(|entry| {
-            entry.as_ref().and_then(|entry| entry.queue.as_deref())
-                .is_some_and(|queue| queue.owner() == Some(self.owner))
-        }) {
-            let entry = firmware.queues.compute[index].as_mut().ok_or(EIO)?;
-            let (cancel, replaced) = entry.queue.as_deref_mut().ok_or(EIO)?
-                .rollback_unpublished(self.owner, &self.context)?;
-            binding = replaced;
-            if cancel {
-                retired = entry.queue.take().map(|queue| (entry.reservation, queue));
+            let lease = self.shared.preparations.enter(false)?;
+            let mut retired = KVec::new();
+            let mut bindings = KVec::new();
+            let mut state = self.shared.state.lock();
+            let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+            if !lease.is_current() { drop(state); drop(lease); continue; }
+            // Roll back sibling channels before the primary channel for deterministic teardown.
+            for primary_pass in [false, true] {
+                for index in 0..firmware.queues.compute.len() {
+                    let matches = firmware.queues.compute[index]
+                        .as_ref()
+                        .and_then(|entry| entry.queue.as_deref())
+                        .is_some_and(|queue| {
+                            queue.owner() == Some(self.owner) && queue.is_primary() == primary_pass
+                        });
+                    if !matches {
+                        continue;
+                    }
+                    let entry = firmware.queues.compute[index].as_mut().ok_or(EIO)?;
+                    let (cancel, replaced) = entry
+                        .queue
+                        .as_deref_mut()
+                        .ok_or(EIO)?
+                        .rollback_unpublished(self.owner, &self.context)?;
+                    if let Some(replaced) = replaced {
+                        let _ = bindings.push(replaced, GFP_KERNEL);
+                    }
+                    if cancel {
+                        if let Some(queue) = entry.queue.take() {
+                            let _ = retired.push((entry.reservation, queue), GFP_KERNEL);
+                        }
+                    }
+                }
             }
-        }
-        drop(state);
-        drop(binding);
-        self.finish_uninstalled_compute(retired)?;
-        self.shared.channels.notify();
-        self.shared.queue_events();
-        return Ok(());
+            drop(state);
+            drop(bindings);
+            for item in retired {
+                self.finish_uninstalled_compute(Some(item))?;
+            }
+            self.shared.channels.notify();
+            self.shared.queue_events();
+            return Ok(());
         }
     }
 

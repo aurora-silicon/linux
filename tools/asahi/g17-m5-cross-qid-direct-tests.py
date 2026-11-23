@@ -290,7 +290,7 @@ def build_rust_harness(mutation=None):
         '(has_sources && !m5)' in compute_direct_fn
         and ordered_ok(
             compute_direct_fn,
-            'let target_qid = cell.qid()?;',
+            'let target_qid = cells[0].as_ref()?.qid()?;',
             'self.resolve_direct_sources(port, generation, target_qid, sources)?',
             'queue.qid() != target_qid',
             'queue.publish(',
