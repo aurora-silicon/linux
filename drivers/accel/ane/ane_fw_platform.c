@@ -318,7 +318,55 @@ const struct ane_fw_platform ane_t6050_platform = {
  * T8140's order: sub-block, PWGATE request 3, acknowledge 0, CPU, then
  * ANE_SYS. So sleep and the parked start follow T8140.
  */
+/*
+ * T8142 engine bus-bridge setup (engine + 0x0000..0x400c), written after
+ * CE bring-up and before releasing the ANE CPU on every power-up. Without
+ * these register updates the bridge remains at its reset configuration and
+ * bottlenecks compute-bound models by 1.4x-3.1x on J813.
+ *
+ * Derived directly from clean-room Aura Stage-2 hypervisor MMIO traces of
+ * engine + 0x0000..0x401c across two consecutive ANE power-up cycles on
+ * J813 (T8142); /arm-io/ane in the T8142 ADT carries no bridge tunable
+ * properties. Each entry records only the bits observed to change
+ * (clear = R32 & ~W32, set = W32 & ~R32) on the 25 registers whose value
+ * changed (8 traced no-op writes where W32 == R32 are omitted), preserving
+ * all unmodified reset bits without inferred field masks.
+ */
+static const struct ane_fw_bridge_op ane_t8142_bridge_ops[] = {
+	/* Engine bridge block +0x0000..0x0034. */
+	{ 0x0000, 0x00000000, 0x8000001a },
+	{ 0x0004, 0x00000002, 0x800c000c },
+	{ 0x0008, 0x00000002, 0x800c000c },
+	{ 0x000c, 0x00000002, 0x800c000c },
+	{ 0x0010, 0x00000000, 0x80000001 },
+	{ 0x0014, 0x00000000, 0x80000001 },
+	{ 0x0018, 0x00000008, 0x80000012 },
+	{ 0x001c, 0x00000000, 0x80000010 },
+	{ 0x0020, 0x00000002, 0x8010000c },
+	{ 0x0024, 0x00000002, 0x80000004 },
+	{ 0x0028, 0x00000002, 0x80000004 },
+	{ 0x002c, 0x00000000, 0x80000004 },
+	{ 0x0030, 0x00000008, 0x80000010 },
+	{ 0x0034, 0x00000008, 0x80000010 },
+	/* Engine bridge block +0x0100..0x0108. */
+	{ 0x0100, 0x00000000, 0x000000ff },
+	{ 0x0104, 0x00000000, 0x00000003 },
+	{ 0x0108, 0x00000006, 0x00000001 },
+	/* Engine bridge block +0x0300..0x0404. */
+	{ 0x0300, 0x00000000, 0x1c000001 },
+	{ 0x0304, 0x00000000, 0x02020000 },
+	{ 0x0314, 0x00000000, 0x80000000 },
+	{ 0x031c, 0x00000000, 0x80000000 },
+	{ 0x0324, 0x00000000, 0x80000000 },
+	{ 0x0404, 0xffee0000, 0x00000041 },
+	/* Engine bridge registers +0x0b00 and +0x400c. */
+	{ 0x0b00, 0x00000000, 0x7fffffff },
+	{ 0x400c, 0x00000001, 0x00000000 },
+};
+
 #define ANE_T8142_PLATFORM						\
+	.bridge_ops = ane_t8142_bridge_ops,				\
+	.bridge_op_count = ARRAY_SIZE(ane_t8142_bridge_ops),		\
 	.soc = 0x8142,							\
 	.chip_family = 17,						\
 	.ane_type = 0x210,						\

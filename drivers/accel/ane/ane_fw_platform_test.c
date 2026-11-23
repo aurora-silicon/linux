@@ -174,6 +174,49 @@ static void ane_t6050_builds_test(struct kunit *test)
 					i == j);
 	}
 }
+
+/*
+ * T8142: both firmware builds carry the AXI2AF bridge register updates with
+ * aligned offsets inside the engine window, disjoint clear/set masks, and
+ * non-empty transitions; other H17 platforms stay untouched.
+ */
+static void ane_t8142_bridge_ops_test(struct kunit *test)
+{
+	const struct ane_fw_platform *b27_0 = &ane_t8142_platform, *b27_2 = b27_0->next_build;
+	const struct ane_fw_platform *builds[] = { b27_0, b27_2 };
+	unsigned int i, j;
+
+	KUNIT_ASSERT_NOT_NULL(test, b27_2);
+	KUNIT_EXPECT_NULL(test, b27_2->next_build);
+	KUNIT_EXPECT_EQ(test, ane_h17_platform.bridge_op_count, 0U);
+	KUNIT_EXPECT_EQ(test, ane_t6050_platform.bridge_op_count, 0U);
+	for (i = 0; i < ARRAY_SIZE(builds); i++) {
+		const struct ane_fw_platform *b = builds[i];
+
+		KUNIT_EXPECT_EQ(test, b->soc, 0x8142U);
+		KUNIT_ASSERT_NOT_NULL(test, b->bridge_ops);
+		KUNIT_ASSERT_EQ(test, b->bridge_op_count, 25U);
+		for (j = 0; j < b->bridge_op_count; j++) {
+			const struct ane_fw_bridge_op *op = &b->bridge_ops[j];
+
+			KUNIT_EXPECT_TRUE(test, IS_ALIGNED(op->offset, 4));
+			KUNIT_EXPECT_LE(test, op->offset + 4, b->reg_sizes[0]);
+			KUNIT_EXPECT_EQ(test, op->clear & op->set, 0U);
+			KUNIT_EXPECT_NE(test, op->clear | op->set, 0U);
+		}
+	}
+	/* Preserves untouched reset bits and stays idempotent once applied. */
+	KUNIT_EXPECT_EQ(test, ane_fw_bridge_op_apply(0x10000008U, &b27_0->bridge_ops[12]),
+			0x90000010U);
+	KUNIT_EXPECT_EQ(test, ane_fw_bridge_op_apply(0x90000010U, &b27_0->bridge_ops[12]),
+			0x90000010U);
+	KUNIT_EXPECT_EQ(test, ane_fw_bridge_op_apply(0x000413b6U, &b27_0->bridge_ops[16]),
+			0x000413b1U);
+	KUNIT_EXPECT_EQ(test, ane_fw_bridge_op_apply(0xffff0030U, &b27_0->bridge_ops[22]),
+			0x00110071U);
+	KUNIT_EXPECT_EQ(test, ane_fw_bridge_op_apply(0x00000001U, &b27_0->bridge_ops[24]),
+			0x00000000U);
+}
 #endif
 
 static struct kunit_case ane_fw_platform_cases[] = {
@@ -181,6 +224,7 @@ static struct kunit_case ane_fw_platform_cases[] = {
 	KUNIT_CASE(ane_t8132_platform_test),
 	KUNIT_CASE(ane_t8132_builds_test),
 	KUNIT_CASE(ane_t6050_builds_test),
+	KUNIT_CASE(ane_t8142_bridge_ops_test),
 #endif
 	KUNIT_CASE(ane_platform_staged_bind_test),
 	KUNIT_CASE(ane_platform_sleep_path_test),
