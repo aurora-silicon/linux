@@ -150,8 +150,11 @@ kexec and crash kernels
     with a warning when a window is active.
 
 Hibernate
-    Resume runs from a ``trans_pgd`` page outside the window. This is unchanged
-    and untested under a window.
+    A boot CPU that a system sleep restarted at its reset vector is confined
+    like the secondaries, so the code that writes the image back and jumps to
+    the restored kernel runs from a nosave page of the kernel image, inside the
+    window, instead of an ordinary page. The image's kernel must have run at the
+    same physical address; a restore of an image from elsewhere is refused.
 
 Verifying confinement
 =====================

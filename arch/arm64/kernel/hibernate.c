@@ -11,6 +11,7 @@
  */
 #define pr_fmt(x) "hibernate: " x
 #include <linux/cpu.h>
+#include <linux/execmem.h>
 #include <linux/kvm_host.h>
 #include <linux/memblock.h>
 #include <linux/of.h>
@@ -324,6 +325,17 @@ static void *hibernate_page_alloc(void *arg)
  * Length is provided as we probably only want 4K of data, even on a 64K
  * page system.
  */
+/*
+ * A core confined to an execute window (Documentation/arch/arm64/ctxr-execmem.rst)
+ * fetches only from inside it. The boot CPU starts unconfined, but once a system
+ * sleep has restarted it at its reset vector it is confined like the secondaries,
+ * and a page from get_safe_page() can be anywhere in RAM. The kernel image is
+ * inside the window, so while one is active the exit code runs from this page of
+ * the image instead. It is nosave: the image doesn't hold it and the restore
+ * doesn't write it, as long as the image's kernel ran at this physical address.
+ */
+static u8 hibernate_exit_page[PAGE_SIZE] __nosavedata __aligned(PAGE_SIZE);
+
 static int create_safe_exec_page(void *src_start, size_t length,
 				 phys_addr_t *phys_dst_addr)
 {
@@ -332,13 +344,23 @@ static int create_safe_exec_page(void *src_start, size_t length,
 		.trans_alloc_arg	= (__force void *)GFP_ATOMIC,
 	};
 
-	void *page = (void *)get_safe_page(GFP_ATOMIC);
 	phys_addr_t trans_ttbr0;
 	unsigned long t0sz;
+	void *page;
 	int rc;
 
-	if (!page)
-		return -ENOMEM;
+	if (execmem_confine_active()) {
+		if (length > sizeof(hibernate_exit_page) ||
+		    resume_hdr.ttbr1_el1 != __pa_symbol(swapper_pg_dir)) {
+			pr_err("the image's kernel ran at another physical address: no page for the exit code inside the execute window\n");
+			return -EINVAL;
+		}
+		page = hibernate_exit_page;
+	} else {
+		page = (void *)get_safe_page(GFP_ATOMIC);
+		if (!page)
+			return -ENOMEM;
+	}
 
 	memcpy(page, src_start, length);
 	caches_clean_inval_pou((unsigned long)page, (unsigned long)page + length);
