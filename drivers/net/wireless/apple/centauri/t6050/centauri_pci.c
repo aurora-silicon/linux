@@ -798,7 +798,7 @@ static int centauri_t6050_quiesce(struct centauri_t6050 *c)
 	centauri_t6050_wifi_unregister(c);
 	centauri_t6050_free_irqs(&c->alpha_irqs);
 	centauri_t6050_free_irqs(&c->irqs);
-	c->firmware_sleep = true;
+	WRITE_ONCE(c->firmware_sleep, true);
 	c->boot_phase = CEN_BOOT_STOPPED;
 	/*
 	 * A completed teardown already released every published DMA tuple. After
@@ -1114,7 +1114,7 @@ static int centauri_t6050_prepare(struct device *dev)
 	mutex_unlock(&cen_recovery_lock);
 	mutex_lock(&c->boot_lock);
 	centauri_t6050_wifi_pm_prepare(c);
-	c->pm_prepared = true;
+	WRITE_ONCE(c->pm_prepared, true);
 	mutex_unlock(&c->boot_lock);
 	return 0;
 }
@@ -1131,7 +1131,7 @@ static void centauri_t6050_complete(struct device *dev)
 	}
 	error = centauri_t6050_wifi_pm_error(c);
 	centauri_t6050_wifi_pm_complete(c);
-	c->pm_prepared = false;
+	WRITE_ONCE(c->pm_prepared, false);
 	mutex_unlock(&c->boot_lock);
 	/* Complete also runs if cfg80211 refused suspend before F0 suspend ran. */
 	if (error || c->firmware_sleep)

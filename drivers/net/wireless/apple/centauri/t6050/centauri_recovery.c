@@ -56,7 +56,6 @@ static void centauri_t6050_transport_recover_worker(struct work_struct *work)
 	struct centauri_t6050 *c =
 		container_of(work, struct centauri_t6050, transport_recover_work);
 
-	c->transport_recover_count++;
 	centauri_t6050_schedule_transport_recover(c);
 }
 
@@ -73,15 +72,16 @@ void centauri_t6050_transport_recover_cancel(struct centauri_t6050 *c)
 
 void centauri_t6050_request_transport_recover(struct centauri_t6050 *c)
 {
-	if (!c || READ_ONCE(c->removing))
+	if (!c || READ_ONCE(c->removing) || READ_ONCE(c->pm_prepared) ||
+	    READ_ONCE(c->firmware_sleep))
 		return;
-	if (c->transport_recover_count >= CEN_TRANSPORT_RECOVER_MAX) {
+	if (READ_ONCE(c->transport_recover_count) >= CEN_TRANSPORT_RECOVER_MAX) {
 		dev_err(&c->pdev->dev,
 			"Wi-Fi transport recovery limit (%u) reached\n",
 			CEN_TRANSPORT_RECOVER_MAX);
 		return;
 	}
-	schedule_work(&c->transport_recover_work);
+	queue_work(system_freezable_wq, &c->transport_recover_work);
 }
 EXPORT_SYMBOL_GPL(centauri_t6050_request_transport_recover);
 
@@ -91,14 +91,16 @@ void centauri_t6050_schedule_transport_recover(struct centauri_t6050 *c)
 	u32 control;
 	int ret;
 
-	if (!c || READ_ONCE(c->removing))
+	if (!c || READ_ONCE(c->removing) || READ_ONCE(c->pm_prepared) ||
+	    READ_ONCE(c->firmware_sleep))
 		return;
 
 	mutex_lock(&c->boot_lock);
-	if (READ_ONCE(c->removing) || c->boot_phase == CEN_BOOT_STOPPED ||
-	    c->boot_phase == CEN_BOOT_FAILED)
+	if (READ_ONCE(c->removing) || c->pm_prepared || c->firmware_sleep ||
+	    c->boot_phase == CEN_BOOT_STOPPED || c->boot_phase == CEN_BOOT_FAILED)
 		goto out_unlock;
 
+	WRITE_ONCE(c->transport_recover_count, c->transport_recover_count + 1);
 	control = readl(c->bar + 0x8000);
 	ret = centauri_t6050_boot_phase_for_control_stage(control, &phase);
 	if (ret) {

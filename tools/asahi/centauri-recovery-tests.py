@@ -73,6 +73,7 @@ struct centauri_t6050 {
     bool boot_attempted;
     unsigned char *bar;
     int boot_work, boot_lock, alpha_irqs, irqs, boot_phase;
+    unsigned int transport_recover_count;
     void *firmware, *descriptor;
 };
 static int cen_recovery_lock, cen_recovery_owners, cen_rewake_wq;
@@ -173,6 +174,22 @@ int main(void)
         assert(!centauri_t6050_rewake_already_reset(&rw));
         assert(centauri_t6050_rewake_already_reset(&rw)); /* Once per runtime request. */
     }
+    /* Mid-suspend faults must not race PM by freeing IPC, queueing boot_work, or forcing reset. */
+    for (unsigned stage=0; stage<=4; stage++) {
+        reset(&c,&rw,fn,&bridge,&bus);
+        c.bar=bar; c.boot_phase=CEN_BOOT_READY; c.ipc=&ipc;
+        control_stage=stage; wake_reset_done=true;
+        assert(!centauri_t6050_prepare(&fn[0].dev) && c.pm_prepared);
+        centauri_t6050_schedule_transport_recover(&c);
+        assert(!queues && c.ipc==&ipc && !c.boot_work && !rw.force_reset);
+        assert(!c.transport_recover_count && !c.boot_lock);
+        assert(centauri_t6050_rewake_already_reset(&rw));
+    }
+    reset(&c,&rw,fn,&bridge,&bus);
+    c.bar=bar; c.boot_phase=CEN_BOOT_READY; c.ipc=&ipc; c.firmware_sleep=true;
+    control_stage=1;
+    centauri_t6050_schedule_transport_recover(&c);
+    assert(!queues && c.ipc==&ipc && !c.boot_work && !c.transport_recover_count);
     reset(&c,&rw,fn,&bridge,&bus);
     c.ipc=&ipc; c.firmware=&c; c.descriptor=&rw;
     assert(!centauri_t6050_quiesce(&c));
@@ -522,7 +539,12 @@ def run():
                 ('negative-skip-fence', bodies.replace('!centauri_t6050_domain_fence(c->recovery)', 'false')),
                 ('negative-skip-release', bodies.replace('ret = centauri_t6050_beta_call(c->recovery, true);', 'ret = 0;')),
                 ('negative-lost-pm-error', bodies.replace('error = centauri_t6050_wifi_pm_error(c);', 'error = 0;')),
-                ('negative-drop-new-generation', bodies.replace('rw->rerun = true;', 'rw->rerun = false;'))]
+                ('negative-drop-new-generation', bodies.replace('rw->rerun = true;', 'rw->rerun = false;')),
+                ('negative-recover-during-pm', bodies.replace(
+                    'if (!c || READ_ONCE(c->removing) || READ_ONCE(c->pm_prepared) ||\n\t    READ_ONCE(c->firmware_sleep))',
+                    'if (!c || READ_ONCE(c->removing))').replace(
+                    'if (READ_ONCE(c->removing) || c->pm_prepared || c->firmware_sleep ||',
+                    'if (READ_ONCE(c->removing) ||'))]
     ownership = '\n'.join(block(name) for name in [
         'apple_centauri_sleep_register', 'apple_centauri_sleep_unregister',
         'centauri_t6050_beta_call'])
@@ -537,6 +559,7 @@ def run():
             '\tdevice_unlock(&fn->dev);\n\tif (!ret)\n\t\tret = centauri_t6050_beta_call(rw, true);'))]
     failures = {
         'negative-reuse-old-wake-reset': '!centauri_t6050_rewake_already_reset(&rw)',
+        'negative-recover-during-pm': '!queues && c.ipc==&ipc && !c.boot_work && !rw.force_reset',
         'negative-unlock-before-tuples': '!remove_done && original->dev.locked && rw->control==original',
         'negative-skip-fence': 'first(WIFI_STOP)<first(CLEAR)',
         'negative-skip-release': 'first(RELEASE)>first(FENCE) && first(FREE)>first(RELEASE)',
