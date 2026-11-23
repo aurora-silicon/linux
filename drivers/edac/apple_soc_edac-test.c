@@ -170,6 +170,7 @@ static unsigned long edac_test_fire(struct kunit *test,
 	before = jiffies;
 	KUNIT_EXPECT_EQ(test, IRQ_HANDLED,
 			apple_soc_edac_irq_thread(irq_data->irq, irq_data));
+	KUNIT_EXPECT_EQ(test, ctx->fake.stray, 0U);
 	after = jiffies;
 
 	if (!delayed_work_pending(&irq_data->rearm)) {

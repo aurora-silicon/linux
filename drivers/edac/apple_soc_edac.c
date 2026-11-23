@@ -5,7 +5,9 @@
  * Copyright The Aurora Silicon Contributors
  */
 
+#if IS_ENABLED(CONFIG_EDAC_APPLE_SOC_KUNIT_TEST)
 #include <kunit/static_stub.h>
+#endif
 #include <linux/bitops.h>
 #include <linux/edac.h>
 #include <linux/io.h>
@@ -222,13 +224,17 @@ static const char *apple_soc_edac_source(const struct apple_soc_edac_hw *hw,
 /* Status register accessors; KUnit redirects them to a fake register block. */
 static u32 apple_soc_edac_read(void __iomem *reg)
 {
+#if IS_ENABLED(CONFIG_EDAC_APPLE_SOC_KUNIT_TEST)
 	KUNIT_STATIC_STUB_REDIRECT(apple_soc_edac_read, reg);
+#endif
 	return readl(reg);
 }
 
 static void apple_soc_edac_write(void __iomem *reg, u32 val)
 {
+#if IS_ENABLED(CONFIG_EDAC_APPLE_SOC_KUNIT_TEST)
 	KUNIT_STATIC_STUB_REDIRECT(apple_soc_edac_write, reg, val);
+#endif
 	writel(val, reg);
 }
 
