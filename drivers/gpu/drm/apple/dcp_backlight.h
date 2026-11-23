@@ -29,6 +29,8 @@ struct dcp_backlight_state {
 	u8 retries;
 	/* Presents carrying a level that the firmware refused, in total. */
 	u32 refused;
+	/* The refusal that used up the deferred presents is not reported yet. */
+	bool retry_report;
 	bool ready;
 	bool controlled;
 	/* An unchanged registration default cannot take over an unknown level. */
@@ -67,8 +69,8 @@ struct dcp_backlight_present {
  * present coming) the refused level is presented again after
  * DCP_BL_RETRY_BASE_MS ms, doubling each time, at most DCP_BL_RETRY_MAX
  * times per request.  After that it stays pending for the next present or
- * request, and dcp_backlight_retry_delay() warns.  The cause of refusals is
- * not known yet: https://github.com/aurora-silicon/linux/issues/2332
+ * request, and dcp_backlight_retry_delay() warns once.  The cause of refusals
+ * is not known yet: https://github.com/aurora-silicon/linux/issues/2332
  */
 #define DCP_BL_RETRY_MAX	3U
 #define DCP_BL_RETRY_BASE_MS	100U
@@ -324,8 +326,10 @@ static inline bool dcp_bl_complete(struct dcp_backlight_state *state,
 	} else {
 		state->dirty = true;
 		state->refused++;
-		if (state->retries <= DCP_BL_RETRY_MAX)
+		if (state->retries <= DCP_BL_RETRY_MAX) {
 			state->retries++;
+			state->retry_report = state->retries > DCP_BL_RETRY_MAX;
+		}
 	}
 	return true;
 }
@@ -342,6 +346,18 @@ static inline bool dcp_bl_retry_exhausted(const struct dcp_backlight_state *stat
 {
 	return state->ready && state->dirty && !state->in_flight &&
 	       state->retries > DCP_BL_RETRY_MAX;
+}
+
+/*
+ * True once for each exhausted budget, for the refusal that used it up.
+ * Later refusals of the same request are counted but not reported again.
+ */
+static inline bool dcp_bl_retry_exhausted_report(struct dcp_backlight_state *state)
+{
+	if (!state->retry_report || !dcp_bl_retry_exhausted(state))
+		return false;
+	state->retry_report = false;
+	return true;
 }
 
 /* Delay before the next deferred present of a refused level, 0 for none. */

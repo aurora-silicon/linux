@@ -144,9 +144,15 @@ int main(void) {
  }
  assert(d.backlight.state.dirty&&d.backlight.state.retries==4&&!d.iomfb.active);
  assert(d.backlight.state.refused==4);
+ /* Later refusals of the same request are counted, not reported again. */
+ for(unsigned i=0;i<2;i++) {reserve(&d,&t);delay=0;reject(&d);assert(!delay&&warned==1);}
+ assert(d.backlight.state.retries==4&&d.backlight.state.refused==6);
  /* A new user request re-arms the budget and can complete. */
  assert(!dcp_bl_request(&d.backlight.state,36,false,false));assert(!d.backlight.state.retries);
- reserve(&d,&t);reject(&d);assert(delay==100);
+ reserve(&d,&t);reject(&d);assert(delay==100&&warned==1);
+ /* Its budget ends with its own report. */
+ for(unsigned i=0;i<3;i++) {reserve(&d,&t);reject(&d);}
+ assert(warned==2);
  for(unsigned stopped=0;stopped<2;stopped++) {
   init(&d);reserve(&d,&t);iomfb_present_failed_h17p(&d);
   d.crashed=!stopped;d.iomfb.stopped=stopped;delay=scheduled=0;

@@ -540,13 +540,16 @@ int dcp_backlight_wake_lit(struct apple_dcp *dcp)
 	return ret;
 }
 
-/* Called with the lock held; warns if a refused level gets no more presents. */
+/*
+ * Called with the lock held; warns once when a refused level gets no more
+ * deferred presents.
+ */
 static unsigned int dcp_backlight_retry_delay_locked(struct apple_dcp *dcp)
 {
 	struct dcp_backlight_state *state = &dcp->backlight.state;
 
 	lockdep_assert_held(&dcp->backlight.lock);
-	if (dcp_bl_retry_exhausted(state))
+	if (dcp_bl_retry_exhausted_report(state))
 		dev_warn_ratelimited(dcp->dev,
 				     "backlight: %u nits refused %u times, %u presents refused in total; waiting for the next present\n",
 				     dcp_bl_effective(state), DCP_BL_RETRY_MAX + 1,
