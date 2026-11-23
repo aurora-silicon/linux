@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * KUnit tests for the Apple SoC read-only debug register views. Included by
- * dbgview.c.
+ * KUnit tests for the Apple SoC read-only debug register views.
  *
  * The view under test is a struct dbgview whose register block is a buffer
  * of kernel memory and whose device is a KUnit device with runtime PM and no
@@ -13,8 +12,12 @@
 #include <kunit/test.h>
 #include <linux/fs.h>
 #include <linux/mman.h>
+#include <linux/pm_runtime.h>
+#include <asm/arch_timer.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+
+#include "dbgview-internal.h"
 
 #define DBGVIEW_TEST_USER_SIZE	(3 * PAGE_SIZE)
 #define DBGVIEW_TEST_SEQ_SIZE	(8 * 1024)
@@ -22,8 +25,8 @@
 struct dbgview_test_ctx {
 	struct dbgview dv;
 	struct file file;
-	u32 *regs;
-	u32 *copy;
+	__le32 *regs;
+	__le32 *copy;
 	char __user *ubuf;
 	u8 *kbuf;
 	char *seq_buf;
@@ -59,11 +62,11 @@ static struct dbgview_test_ctx *dbgview_test_setup(struct kunit *test,
 	ctx->copy = kunit_kzalloc(test, size + 4, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ctx->copy);
 	for (i = 0; i < size / 4 + 1; i++)
-		ctx->regs[i] = dbgview_test_word(i);
+		ctx->regs[i] = cpu_to_le32(dbgview_test_word(i));
 	memcpy(ctx->copy, ctx->regs, size + 4);
 
 	ctx->dv.dev = dev;
-	ctx->dv.base = (void __iomem *)ctx->regs;
+	ctx->dv.base = (void __iomem __force *)ctx->regs;
 	ctx->dv.size = size;
 	ctx->file.private_data = &ctx->dv;
 
@@ -107,12 +110,22 @@ static int dbgview_test_usage(struct dbgview_test_ctx *ctx)
 }
 
 /* Bytes [0, len) of the user buffer are the registers from @pos on. */
+static void dbgview_test_compare_words(struct kunit *test, const u8 *buf,
+				       size_t pos, size_t len)
+{
+	const u32 *words = (const u32 *)buf;
+	size_t i;
+
+	for (i = 0; i < len / 4; i++)
+		KUNIT_EXPECT_EQ(test, words[i], dbgview_test_word(pos / 4 + i));
+}
+
 static void dbgview_test_expect_words(struct kunit *test,
 				      struct dbgview_test_ctx *ctx,
 				      loff_t pos, size_t len)
 {
 	dbgview_test_fetch_user(test, ctx);
-	KUNIT_EXPECT_MEMEQ(test, ctx->kbuf, (u8 *)ctx->regs + pos, len);
+	dbgview_test_compare_words(test, ctx->kbuf, pos, len);
 	/* nothing past the returned length was written */
 	KUNIT_EXPECT_EQ(test, ctx->kbuf[len], 0xee);
 }
@@ -236,7 +249,7 @@ static void dbgview_test_read_sequential(struct kunit *test)
 	}
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, pos, size);
-	KUNIT_EXPECT_MEMEQ(test, all, (u8 *)ctx->regs, size);
+	dbgview_test_compare_words(test, all, 0, size);
 }
 
 /* Every read takes and drops one runtime PM reference. */
@@ -341,7 +354,7 @@ static void dbgview_test_snapshot_format(struct kunit *test)
 
 	KUNIT_ASSERT_EQ(test, dbgview_test_snapshot(test, ctx, 0x40), 0);
 
-	KUNIT_EXPECT_EQ(test, dbgview_test_lines(ctx->seq_buf), 16 + 3);
+	KUNIT_ASSERT_EQ(test, dbgview_test_lines(ctx->seq_buf), 16 + 3);
 	n = sscanf(ctx->seq_buf, "cntvct_before %16llx\n", &before);
 	KUNIT_ASSERT_EQ(test, n, 1);
 	KUNIT_EXPECT_EQ(test, ctx->seq_buf[strlen("cntvct_before ") + 16], '\n');
@@ -420,11 +433,13 @@ static void dbgview_test_snapshot_rpm_error(struct kunit *test)
 /* Neither file has a write method. */
 static void dbgview_test_fops_read_only(struct kunit *test)
 {
+	const struct file_operations *snapshot = dbgview_test_snapshot_fops();
+
 	KUNIT_EXPECT_NULL(test, dbgview_regs_fops.write);
 	KUNIT_EXPECT_NULL(test, dbgview_regs_fops.write_iter);
 	KUNIT_EXPECT_TRUE(test, dbgview_regs_fops.read == dbgview_regs_read);
-	KUNIT_EXPECT_NULL(test, dbgview_snapshot_fops.write);
-	KUNIT_EXPECT_NULL(test, dbgview_snapshot_fops.write_iter);
+	KUNIT_EXPECT_NULL(test, snapshot->write);
+	KUNIT_EXPECT_NULL(test, snapshot->write_iter);
 }
 
 static struct kunit_case dbgview_test_cases[] = {
@@ -453,3 +468,6 @@ static struct kunit_suite dbgview_test_suite = {
 };
 
 kunit_test_suite(dbgview_test_suite);
+
+MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
+MODULE_LICENSE("GPL");

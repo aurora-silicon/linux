@@ -4,6 +4,7 @@ obj-$(CONFIG_APPLE_J613_DISPLAY_SYNC) += j613-display.o
 
 obj-$(CONFIG_APPLE_DBGVIEW) += apple-dbgview.o
 apple-dbgview-y = dbgview.o
+obj-$(CONFIG_APPLE_DBGVIEW_KUNIT_TEST) += dbgview-test.o
 
 obj-$(CONFIG_APPLE_DOCKCHANNEL) += apple-dockchannel.o
 apple-dockchannel-y = dockchannel.o

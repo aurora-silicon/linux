@@ -26,8 +26,8 @@ config APPLE_DBGVIEW
 	  Say m here if you debug an Apple SoC.
 
 config APPLE_DBGVIEW_KUNIT_TEST
-	bool "KUnit tests for the Apple SoC debug register views" if !KUNIT_ALL_TESTS
-	depends on APPLE_DBGVIEW=y && KUNIT=y && PM
+	tristate "KUnit tests for the Apple SoC debug register views" if !KUNIT_ALL_TESTS
+	depends on APPLE_DBGVIEW && KUNIT && PM
 	default KUNIT_ALL_TESTS
 	help
 	  Read the regs and snapshot views of a register block that the
