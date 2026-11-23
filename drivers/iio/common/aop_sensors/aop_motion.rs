@@ -21,8 +21,8 @@ use core::{
 
 use kernel::{
     bindings, c_str,
-    device::{self, Core},
-    module_platform_driver, new_mutex, new_spinlock, of, platform,
+    device::{self, Bound, Core},
+    devres, module_platform_driver, new_mutex, new_spinlock, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, FakehidListener, FakehidRegistration, AOP},
     sync::{
@@ -512,10 +512,40 @@ struct Spec {
     _p: PhantomPinned,
 }
 
-/// The IIO device of a service, with its buffer.
-struct MotionIio {
+/// Owns the IIO device and what it points to.
+///
+/// It is handed to the platform device's resources right after the
+/// allocation. Those are released in reverse order, so the IIO device is
+/// freed after the trigger and the triggered buffer, whose release still
+/// uses it, and after the driver's own data is gone.
+struct IioAlloc {
     dev: *mut bindings::iio_dev,
     _spec: Pin<KBox<Spec>>,
+}
+
+impl Drop for IioAlloc {
+    fn drop(&mut self) {
+        // SAFETY: `self.dev` was allocated in `MotionIio::new()` with an
+        // `Arc<State>` as its private data. `MotionIio` has unregistered it
+        // and the resources registered after this one are released, so
+        // nothing uses either after this.
+        unsafe {
+            drop(Arc::<State>::from_foreign((*self.dev).priv_.cast()));
+            bindings::iio_device_free(self.dev);
+        }
+    }
+}
+
+// SAFETY: The IIO device may be freed from any thread, and the channel
+// table is only read.
+unsafe impl Send for IioAlloc {}
+
+/// The IIO device of a service, with its buffer.
+///
+/// The device itself belongs to the platform device's resources, which are
+/// released after the driver's data; this only takes it out of view again.
+struct MotionIio {
+    dev: *mut bindings::iio_dev,
     registered: bool,
 }
 
@@ -523,11 +553,10 @@ impl MotionIio {
     /// Allocates the device and its buffer; [`MotionIio::register`] makes it
     /// visible.
     fn new(
-        pdev: &platform::Device<Core<'_>>,
+        dev: &device::Device<Bound>,
         kind: &'static Kind,
         control: Arc<Control>,
     ) -> Result<(Self, Arc<State>)> {
-        let dev = pdev.as_ref();
         let spec = KBox::pin(
             Spec {
                 channels: [
@@ -579,9 +608,20 @@ impl MotionIio {
             (*indio_dev).modes = bindings::INDIO_DIRECT_MODE as i32;
             (*indio_dev).available_scan_masks = SCAN_MASKS.as_ptr();
         }
+        // From here the device, its private data and `spec` are freed with
+        // the resources of `dev`, also if this fails. It has to come before
+        // the trigger and the buffer: resources are released in reverse
+        // order, and the release of those two uses the IIO device.
+        devres::register(
+            dev,
+            IioAlloc {
+                dev: indio_dev,
+                _spec: spec,
+            },
+            GFP_KERNEL,
+        )?;
         let this = Self {
             dev: indio_dev,
-            _spec: spec,
             registered: false,
         };
         // The buffer fills as the AOP reports, so the trigger never fires.
@@ -603,9 +643,9 @@ impl MotionIio {
         if trig.is_null() {
             return Err(ENOMEM);
         }
-        // SAFETY: `trig` was allocated above; it is unregistered and freed
-        // with the platform device's resources, after the IIO device that
-        // holds a reference to it.
+        // SAFETY: `trig` was allocated above; it is unregistered with the
+        // platform device's resources, before the IIO device is freed. The
+        // IIO device holds its own reference to it until then.
         let ret = unsafe { bindings::devm_iio_trigger_register(dev.as_raw(), trig) };
         if ret < 0 {
             return Err(Error::from_errno(ret));
@@ -614,10 +654,11 @@ impl MotionIio {
         // here is dropped when the IIO device is released.
         unsafe { (*indio_dev).trig = bindings::iio_trigger_get(trig) };
         // SAFETY: Both devices are valid. The buffer is released with the
-        // platform device's resources; the IIO device holds its own
-        // reference to it until it is freed. The poll function only stamps
-        // the time and completes the trigger; the report listener pushes the
-        // scans. The setup ops start the reports for the buffer.
+        // platform device's resources, before the IIO device, which that
+        // release reads the buffer and the poll function from. The poll
+        // function only stamps the time and completes the trigger; the
+        // report listener pushes the scans. The setup ops start the reports
+        // for the buffer.
         let ret = unsafe {
             bindings::devm_iio_triggered_buffer_setup_ext(
                 dev.as_raw(),
@@ -649,14 +690,11 @@ impl MotionIio {
 
 impl Drop for MotionIio {
     fn drop(&mut self) {
-        // SAFETY: `self.dev` was allocated in `new()` with an `Arc<State>`
-        // as its private data, and nothing uses it after this.
-        unsafe {
-            if self.registered {
-                bindings::iio_device_unregister(self.dev);
-            }
-            drop(Arc::<State>::from_foreign((*self.dev).priv_.cast()));
-            bindings::iio_device_free(self.dev);
+        if self.registered {
+            // SAFETY: `self.dev` was registered by `register()`. It is
+            // freed with the platform device's resources, which outlive
+            // this.
+            unsafe { bindings::iio_device_unregister(self.dev) };
         }
     }
 }
@@ -829,7 +867,7 @@ impl platform::Driver for IIOAopMotionDriver {
         let service = unsafe { *service };
 
         let control = Control::new(dev, aop.clone(), service)?;
-        let (mut iio, state) = MotionIio::new(pdev, kind, control.clone())?;
+        let (mut iio, state) = MotionIio::new(dev, kind, control.clone())?;
         let listener = FakehidRegistration::new(aop, service, state)?;
         let pm = PmHook::new(control.clone())?;
         // Check once that the service takes the calibration and the interval,
@@ -858,4 +896,156 @@ module_platform_driver! {
     description: "AOP accelerometer and gyroscope driver",
     license: "Dual MIT/GPL",
     alias: ["platform:iio_aop_motion"],
+}
+
+#[kunit_tests(iio_aop_motion)]
+mod tests {
+    use super::*;
+    use kernel::{
+        faux,
+        soc::apple::aop::{ReportListener, SourceRing},
+    };
+
+    /// Stands in for the AOP core. The private data of the IIO device holds
+    /// the last reference to it once the test has dropped its own, so it
+    /// goes when that private data is freed, and notes that in `gone`.
+    struct FakeAop {
+        gone: Arc<Atomic<bool>>,
+    }
+
+    impl Drop for FakeAop {
+        fn drop(&mut self) {
+            self.gone.store(true, Relaxed);
+        }
+    }
+
+    impl AOP for FakeAop {
+        fn epic_call(&self, _svc: &EPICService, _subtype: u16, _msg: &[u8]) -> Result<u32> {
+            Ok(0)
+        }
+        fn epic_call_ret(
+            &self,
+            _svc: &EPICService,
+            _subtype: u16,
+            _msg: &[u8],
+            _ret_len: usize,
+        ) -> Result<(u32, KVec<u8>)> {
+            Err(ENODEV)
+        }
+        fn add_fakehid_listener(
+            &self,
+            _svc: EPICService,
+            _listener: Arc<dyn FakehidListener>,
+        ) -> Result<()> {
+            Err(ENODEV)
+        }
+        fn remove_fakehid_listener(&self, _svc: &EPICService) -> bool {
+            false
+        }
+        fn add_report_listener(
+            &self,
+            _svc: EPICService,
+            _subtype: u16,
+            _listener: Arc<dyn ReportListener>,
+        ) -> Result<()> {
+            Err(ENODEV)
+        }
+        fn remove_report_listener(&self, _svc: &EPICService, _subtype: u16) -> bool {
+            false
+        }
+        fn source_ring(
+            &self,
+            _dev: &device::Device<Bound>,
+            _size: usize,
+        ) -> Result<Arc<SourceRing>> {
+            Err(ENODEV)
+        }
+        fn bound_ring(
+            &self,
+            _dev: &device::Device<Bound>,
+            _size: usize,
+            _bind: &mut dyn FnMut(u64, u64) -> Result<()>,
+        ) -> Result<Arc<SourceRing>> {
+            Err(ENODEV)
+        }
+        fn remove(&self) {}
+    }
+
+    /// A device resource registered after the IIO device is set up, so that
+    /// it is released first: it notes whether the IIO device's private data
+    /// was already freed when the release of the resources began.
+    struct ReleaseStart {
+        gone: Arc<Atomic<bool>>,
+        ran: Arc<Atomic<bool>>,
+        gone_before: Arc<Atomic<bool>>,
+    }
+
+    impl Drop for ReleaseStart {
+        fn drop(&mut self) {
+            self.gone_before.store(self.gone.load(Relaxed), Relaxed);
+            self.ran.store(true, Relaxed);
+        }
+    }
+
+    /// The IIO device and its private data stay until the resources of the
+    /// parent device, among them the triggered buffer and the trigger, are
+    /// released; dropping `MotionIio`, as a failed probe and an unbind do
+    /// before that release, does not free them.
+    #[test]
+    fn iio_device_is_freed_with_the_device_resources() -> Result {
+        let gone = Arc::new(Atomic::new(false), GFP_KERNEL)?;
+        let ran = Arc::new(Atomic::new(false), GFP_KERNEL)?;
+        let gone_before = Arc::new(Atomic::new(false), GFP_KERNEL)?;
+
+        let reg = faux::Registration::new(c"iio-aop-motion-kunit", None)?;
+        let fdev: &faux::Device<Bound> = reg.as_ref();
+        let dev: &device::Device<Bound> = fdev.as_ref();
+        let plain: &device::Device = dev;
+        let aop: Arc<dyn AOP> = Arc::new(FakeAop { gone: gone.clone() }, GFP_KERNEL)?;
+        let control = Arc::pin_init(
+            pin_init!(Control {
+                dev: plain.into(),
+                aop,
+                service: EPICService {
+                    channel: 0,
+                    endpoint: 0,
+                },
+                packets: [KVec::new(), KVec::new(), KVec::new()],
+                stream <- new_mutex!(Stream::default()),
+            }),
+            GFP_KERNEL,
+        )?;
+        let (iio, state) = MotionIio::new(dev, &ACCEL, control.clone())?;
+        // The test's own reference keeps the memory of the IIO device valid
+        // whoever drops the allocation's reference, and whenever.
+        let indio_dev = iio.dev;
+        // SAFETY: `indio_dev` was just allocated and is live.
+        unsafe { bindings::get_device(&raw mut (*indio_dev).dev) };
+        let started = devres::register(
+            dev,
+            ReleaseStart {
+                gone: gone.clone(),
+                ran: ran.clone(),
+                gone_before: gone_before.clone(),
+            },
+            GFP_KERNEL,
+        );
+
+        drop(state);
+        drop(control);
+        drop(iio);
+        let gone_after_drop = gone.load(Relaxed);
+        // Unbinds the device, which releases its resources.
+        drop(reg);
+        let gone_after_release = gone.load(Relaxed);
+        // SAFETY: Drops the reference taken above.
+        unsafe { bindings::put_device(&raw mut (*indio_dev).dev) };
+
+        started?;
+        assert!(!gone_after_drop);
+        assert!(ran.load(Relaxed));
+        assert!(!gone_before.load(Relaxed));
+        assert!(gone_after_release);
+        Ok(())
+    }
 }
