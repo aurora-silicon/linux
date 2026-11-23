@@ -1955,7 +1955,7 @@ void dcp_route_failure_notify(struct apple_connector *connector)
 static void dcp_hotplug_retrain_reset(struct apple_dcp *dcp, const char *why)
 {
 	if (dcp->hotplug_retrain_stopped)
-		dev_info(dcp->dev, "hotplug: link retrains resumed (%s)\n", why);
+		dev_dbg(dcp->dev, "hotplug: link retrains resumed (%s)\n", why);
 	dcp->hotplug_retrain_stopped = false;
 	dcp->hotplug_retrains = 0;
 }
