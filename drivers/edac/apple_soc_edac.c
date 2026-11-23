@@ -5,6 +5,7 @@
  * Copyright The Aurora Silicon Contributors
  */
 
+#include <kunit/static_stub.h>
 #include <linux/bitops.h>
 #include <linux/edac.h>
 #include <linux/io.h>
@@ -218,6 +219,19 @@ static const char *apple_soc_edac_source(const struct apple_soc_edac_hw *hw,
 	return NULL;
 }
 
+/* Status register accessors; KUnit redirects them to a fake register block. */
+static u32 apple_soc_edac_read(void __iomem *reg)
+{
+	KUNIT_STATIC_STUB_REDIRECT(apple_soc_edac_read, reg);
+	return readl(reg);
+}
+
+static void apple_soc_edac_write(void __iomem *reg, u32 val)
+{
+	KUNIT_STATIC_STUB_REDIRECT(apple_soc_edac_write, reg, val);
+	writel(val, reg);
+}
+
 /*
  * Read and acknowledge a T6041 NI status word. Returns whether it was set;
  * @error says whether a bit in the platform error policy was set and
@@ -236,14 +250,14 @@ static bool apple_soc_edac_t6041_status(struct apple_soc_edac_irq *irq_data,
 		void __iomem *reg = edac->status_regs[irq_data->index - 45] +
 				    T6041_NI_STATUS;
 
-		status = readl(reg);
+		status = apple_soc_edac_read(reg);
 		if (!status)
 			return false;
 
 		/* Bit 3 is not part of the platform error policy. */
 		*error = status & 0xf7;
-		writel(status, reg);
-		left = readl(reg);
+		apple_soc_edac_write(reg, status);
+		left = apple_soc_edac_read(reg);
 		if (left) {
 			*cleared = false;
 			dev_info_ratelimited(edac->dev,
@@ -273,11 +287,11 @@ static bool apple_soc_edac_ni_status(struct apple_soc_edac_irq *irq_data,
 	*cleared = true;
 	for_each_set_bit(bit, &words, 32) {
 		offset = ni->status + 4 * bit;
-		status = readl(irq_data->ni_base + offset);
+		status = apple_soc_edac_read(irq_data->ni_base + offset);
 		if (!status)
 			continue;
-		writel(status, irq_data->ni_base + offset);
-		left = readl(irq_data->ni_base + offset);
+		apple_soc_edac_write(irq_data->ni_base + offset, status);
+		left = apple_soc_edac_read(irq_data->ni_base + offset);
 		dev_err_ratelimited(irq_data->edac->dev,
 				    "%s: status %#x at %#x, %#x after the acknowledge\n",
 				    irq_data->source, status, offset, left);
@@ -541,3 +555,7 @@ module_platform_driver(apple_soc_edac_driver);
 MODULE_AUTHOR("The Aurora Silicon Contributors");
 MODULE_DESCRIPTION("Apple SoC platform error reporting driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_EDAC_APPLE_SOC_KUNIT_TEST)
+#include "apple_soc_edac-test.c"
+#endif
