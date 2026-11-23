@@ -21,6 +21,7 @@ ane-y := \
 	ane_boost.o
 
 ane_t6021-y := \
+	ane_cluster_hold.o \
 	ane_fw_platform.o \
 	ane_h16_backend.o \
 	ane_h16_accel.o \

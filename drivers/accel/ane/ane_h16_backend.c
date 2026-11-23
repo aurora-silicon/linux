@@ -27,6 +27,7 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
+#include "ane_cluster_hold.h"
 #include "ane_fw_sleep.h"
 #include "ane_fw_platform.h"
 #include "ane_h16_accel.h"
@@ -62,6 +63,8 @@ struct ane_h16_device {
 	bool perf_held;
 	/* Optional CLPC input: DRAM and fabric floors while an EXECUTE is in flight. */
 	struct apple_clpc_ane *clpc;
+	/* The CPU cluster of the node's performance-domains, while requests run. */
+	struct ane_cluster_hold hold;
 	struct device *dart[3];
 	u32 powered;
 	u32 darts_powered;
@@ -769,6 +772,8 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 	 */
 	if (!pinned)
 		return NOTIFY_DONE;
+	if (event == PM_SUSPEND_PREPARE)
+		ane_cluster_hold_drop(&h->hold);
 	/* Without a sleep path on this platform, every sleep is refused as before. */
 	if (!h->boot.soc->sleep_warm && !h->boot.soc->sleep_cold) {
 		if (ane_fw_sleep_refused(event, pinned))
@@ -1617,6 +1622,7 @@ static void ane_h16_release(struct ane_h16_device *h)
 		dev_pm_domain_detach(h->perf, false);
 		h->perf = NULL;
 	}
+	ane_cluster_hold_fini(&h->hold);
 	apple_clpc_ane_put(h->clpc);
 	h->clpc = NULL;
 	while (h->powered) {
@@ -1678,6 +1684,7 @@ static void ane_h16_busy(void *ctx, bool busy)
 	struct ane_h16_device *h = ctx;
 
 	apple_clpc_ane_set_active(h->clpc, busy);
+	ane_cluster_hold_busy(&h->hold, busy);
 	if (!h->perf)
 		return;
 	if (busy) {
@@ -1756,6 +1763,9 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 	}
 	/* Optional: success with no input when the SoC's CLPC takes none. */
 	ret = apple_clpc_ane_get(h->dev, &h->clpc);
+	if (ret)
+		return ret;
+	ret = ane_cluster_hold_init(&h->hold, h->dev);
 	if (ret)
 		return ret;
 	for (i = 0; i < ARRAY_SIZE(names); i++) {

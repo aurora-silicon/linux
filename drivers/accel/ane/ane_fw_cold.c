@@ -26,6 +26,7 @@
 #include <linux/suspend.h>
 #include <linux/vmalloc.h>
 
+#include "ane_cluster_hold.h"
 #include "ane_fw_cold.h"
 #include "ane_fw_pages.h"
 #include "ane_fw_sleep.h"
@@ -82,6 +83,8 @@ struct ane_fw_backend {
 	/* Programs and their ABI 3 node, after the program stage. */
 	struct ane_h16_session session;
 	struct apple_clpc_ane *clpc;
+	/* The CPU cluster of the node's performance-domains, while requests run. */
+	struct ane_cluster_hold hold;
 	struct ane_fw_surface pool, ipc, heap;
 	/*
 	 * For the cold boot after system sleep: the private TEXT/DATA copies,
@@ -1251,6 +1254,7 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 	if (event == PM_SUSPEND_PREPARE) {
 		WRITE_ONCE(b->in_sleep, true);
 		WRITE_ONCE(b->session.wake_blocked, true);
+		ane_cluster_hold_drop(&b->hold);
 	}
 	if (event == PM_SUSPEND_PREPARE && retained) {
 		if (!ane_fw_sleep_prepare(b))
@@ -2104,6 +2108,7 @@ static void ane_fw_program_busy(void *ctx, bool busy)
 	struct ane_fw_backend *b = ctx;
 
 	apple_clpc_ane_set_active(b->clpc, busy);
+	ane_cluster_hold_busy(&b->hold, busy);
 }
 
 static const struct ane_h16_session_ops ane_fw_session_ops = {
@@ -2186,9 +2191,16 @@ static int ane_fw_program_stage(struct ane_fw_backend *b)
 	ret = apple_clpc_ane_get(&b->pdev->dev, &b->clpc);
 	if (ret)
 		return ret;
+	ret = ane_cluster_hold_init(&b->hold, &b->pdev->dev);
+	if (ret) {
+		apple_clpc_ane_put(b->clpc);
+		b->clpc = NULL;
+		return ret;
+	}
 	b->session.gate_hold_ns = ANE_FW_GATE_HOLD_NS;
 	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
 	if (ret) {
+		ane_cluster_hold_fini(&b->hold);
 		apple_clpc_ane_put(b->clpc);
 		b->clpc = NULL;
 		return ret;
@@ -2218,9 +2230,16 @@ static int ane_fw_register_parked(struct ane_fw_backend *b)
 	ret = apple_clpc_ane_get(&b->pdev->dev, &b->clpc);
 	if (ret)
 		return ret;
+	ret = ane_cluster_hold_init(&b->hold, &b->pdev->dev);
+	if (ret) {
+		apple_clpc_ane_put(b->clpc);
+		b->clpc = NULL;
+		return ret;
+	}
 	b->session.gate_hold_ns = ANE_FW_GATE_HOLD_NS;
 	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
 	if (ret) {
+		ane_cluster_hold_fini(&b->hold);
 		apple_clpc_ane_put(b->clpc);
 		b->clpc = NULL;
 		return ret;
@@ -2496,6 +2515,7 @@ static void ane_fw_observer_free(struct ane_fw_backend *b)
 		iounmap(b->pmgr);
 	if (b->gate)
 		iounmap(b->gate);
+	ane_cluster_hold_fini(&b->hold);
 	apple_clpc_ane_put(b->clpc);
 	put_device(&b->pdev->dev);
 	kfree(b);
