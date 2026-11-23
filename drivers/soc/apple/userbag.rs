@@ -792,6 +792,112 @@ pub(crate) enum EnclaveAction {
     LockBag,
 }
 
+/// Why an account's Touch ID refuses a verify before any capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountRefusal {
+    /// The administrator asked for a password after boot
+    /// (`SEP_BIO_REQUIRE_PASSWORD`) and this account has not given its own.
+    AfterBoot,
+    /// Too many failed matches in this account's domain since its last
+    /// match or password.
+    Lockout,
+}
+
+/// One account's Touch ID gates: the failed-attempt count, the lockout and
+/// the wait for its first password since boot, kept per account as macOS
+/// keeps them per user. A match runs in an account's domain only once its bag
+/// was unlocked by its password this boot, so nothing here outlives a
+/// restart: the bag's password after it clears the account's state anyway.
+#[derive(Clone, Copy, Debug)]
+struct AccountGate {
+    uid: u32,
+    failures: u32,
+    locked: bool,
+    password_since_boot: bool,
+}
+
+impl AccountGate {
+    const fn new(uid: u32) -> Self {
+        AccountGate { uid, failures: 0, locked: false, password_since_boot: false }
+    }
+}
+
+/// The Touch ID gates of every account that has matched in its own domain
+/// or given its bag's password this boot. The configured user's gates are
+/// the machine-wide ones (`bio_lockout`, `bio_after_boot`) and are never
+/// kept here; a password clears only the state of its own account.
+pub(crate) struct AccountGates(KVec<AccountGate>);
+
+impl AccountGates {
+    pub(crate) const fn new() -> Self {
+        AccountGates(KVec::new())
+    }
+
+    fn get(&self, uid: u32) -> AccountGate {
+        self.0.iter().find(|g| g.uid == uid).copied().unwrap_or(AccountGate::new(uid))
+    }
+
+    fn entry(&mut self, uid: u32) -> Result<&mut AccountGate> {
+        if let Some(i) = self.0.iter().position(|g| g.uid == uid) {
+            return Ok(&mut self.0[i]);
+        }
+        self.0.push(AccountGate::new(uid), GFP_KERNEL)?;
+        let last = self.0.len() - 1;
+        Ok(&mut self.0[last])
+    }
+
+    /// Whether a verify in `uid`'s domain may capture. `after_boot_asked`:
+    /// `SEP_BIO_REQUIRE_PASSWORD` was called this boot.
+    pub(crate) fn admit(&self, uid: u32, after_boot_asked: bool) -> core::result::Result<(), AccountRefusal> {
+        let g = self.get(uid);
+        if after_boot_asked && !g.password_since_boot {
+            return Err(AccountRefusal::AfterBoot);
+        }
+        if g.locked {
+            return Err(AccountRefusal::Lockout);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn failures(&self, uid: u32) -> u32 {
+        self.get(uid).failures
+    }
+
+    /// A definitive result in `uid`'s domain. A match the enclave answered
+    /// for another user is a miss for `uid`, so it never resets this count.
+    /// Returns true when this miss locked the account (`limit` misses since
+    /// its last match or password).
+    pub(crate) fn record(&mut self, uid: u32, matched: bool, limit: u32) -> Result<bool> {
+        let g = self.entry(uid)?;
+        if matched {
+            g.failures = 0;
+            return Ok(false);
+        }
+        g.failures = g.failures.saturating_add(1);
+        let newly = !g.locked && g.failures >= limit;
+        g.locked |= newly;
+        Ok(newly)
+    }
+
+    /// The enclave stopped matching in `uid`'s domain: locked until its
+    /// password.
+    pub(crate) fn lock(&mut self, uid: u32) -> Result<()> {
+        self.entry(uid)?.locked = true;
+        Ok(())
+    }
+
+    /// The enclave accepted `uid`'s own password (its bag's): its failed
+    /// attempts and lockout end, and it no longer waits for a password after
+    /// boot. No other account's state changes.
+    pub(crate) fn password_verified(&mut self, uid: u32) -> Result<()> {
+        let g = self.entry(uid)?;
+        g.failures = 0;
+        g.locked = false;
+        g.password_since_boot = true;
+        Ok(())
+    }
+}
+
 /// Host-side copy of the macOS rules for one user's bag. Times are
 /// CLOCK_BOOTTIME seconds, so time asleep counts, as it does on macOS.
 ///
@@ -1392,6 +1498,14 @@ impl crate::SepData {
         let uid = u32::try_from(-user.special_handle().value())
             .ok()
             .and_then(|id| id.checked_sub(USER_BAG_BASE));
+        // The account's own password: its Touch ID failed attempts and
+        // lockout end, and its wait for a password after boot. No other
+        // account's state, and not the configured user's, changes.
+        if let Some(uid) = uid {
+            if self.account_gates.lock().password_verified(uid).is_err() {
+                dev_warn_ratelimited!(self.dev, "userbag: could not re-arm Touch ID for uid {} after its password\n", uid);
+            }
+        }
         if let Some(uid) = uid {
             if let Some(_writer) = self.userbag_writer_for_restore(user, uid) {
                 let mut bags = self.user_bags.lock();
@@ -2239,6 +2353,51 @@ mod tests {
         assert!(bags.held_locked(-5));
         bags.release_hold(-5);
         assert!(!bags.held_locked(-5));
+    }
+
+    // One account's misses, lockout and password touch only that account,
+    // and a match answered for another user is a miss for the named one.
+    #[test]
+    fn touch_id_gates_are_kept_per_account() {
+        let (a, b) = (1001, 1002);
+        let mut g = AccountGates::new();
+        g.password_verified(a).unwrap();
+        g.password_verified(b).unwrap();
+        for i in 1..5 {
+            assert_eq!(g.record(a, false, 5), Ok(false));
+            assert_eq!(g.failures(a), i);
+        }
+        assert_eq!(g.failures(b), 0);
+        // A match in another domain is reported as no match: still a miss.
+        assert_eq!(g.record(a, false, 5), Ok(true));
+        assert_eq!(g.admit(a, false), Err(AccountRefusal::Lockout));
+        assert_eq!(g.record(a, false, 5), Ok(false));
+        assert_eq!(g.admit(b, false), Ok(()));
+        // B's match and B's password leave A locked.
+        assert_eq!(g.record(b, true, 5), Ok(false));
+        g.password_verified(b).unwrap();
+        assert_eq!(g.admit(a, false), Err(AccountRefusal::Lockout));
+        // A's own password re-arms A.
+        g.password_verified(a).unwrap();
+        assert_eq!(g.admit(a, false), Ok(()));
+        assert_eq!(g.failures(a), 0);
+        // A match resets only its own account's count.
+        g.record(b, false, 5).unwrap();
+        g.record(a, true, 5).unwrap();
+        assert_eq!(g.failures(b), 1);
+    }
+
+    // With a password asked for after boot, each account waits for its own.
+    #[test]
+    fn each_account_waits_for_its_own_password_after_boot() {
+        let mut g = AccountGates::new();
+        assert_eq!(g.admit(1001, true), Err(AccountRefusal::AfterBoot));
+        assert_eq!(g.admit(1001, false), Ok(()));
+        g.password_verified(1002).unwrap();
+        assert_eq!(g.admit(1001, true), Err(AccountRefusal::AfterBoot));
+        assert_eq!(g.admit(1002, true), Ok(()));
+        g.lock(1002).unwrap();
+        assert_eq!(g.admit(1002, true), Err(AccountRefusal::Lockout));
     }
 
     const H: u64 = 3600;

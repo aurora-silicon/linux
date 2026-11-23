@@ -2759,7 +2759,8 @@ impl SepData {
         } else {
             bio::verify_account(&self.bio_session.lock())
         };
-        let subject = match account.map(|uid| self.userbag_bio_subject(uid)) {
+        // Held to the end: it routes this match to the account's domain.
+        let _subject = match account.map(|uid| self.userbag_bio_subject(uid)) {
             Some(Err(_)) => {
                 dev_info_refusal!(self.dev, "verify: the account's key bag is locked, or not loaded while it holds the account's fingerprints; refusing without a capture until its password\n");
                 self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT), [0u8; bio::TOKEN_LEN]);
@@ -2768,9 +2769,11 @@ impl SepData {
             Some(Ok(Some(subject))) => Some(crate::SubjectScope::new(self, subject)),
             _ => None,
         };
-        // The gates below are the configured user's. A bag user's own lock
-        // and the enclave's per-user count stand in for them.
-        let bag_user = subject.is_some();
+        // The after-boot and lockout gates below are the configured user's.
+        // A match in an account's own domain (a verify naming it, or a key
+        // touch under its bag) has that account's gates instead
+        // (`account_gates`): its misses, lockout and password are its own.
+        let domain = self.match_account();
         // A match in a bag user's own domain (a verify naming them, or a key
         // touch under their bag) is proven by the enclave's own list of that
         // user's identities, read now, after the bag's catacomb loaded.
@@ -2791,7 +2794,26 @@ impl SepData {
         // Asked to wait for the first password since boot, as macOS does
         // after a restart: nothing is wrong with the finger or the enclave,
         // so refuse at once, before any capture.
-        if !bag_user && self.bio_after_boot.load(Relaxed) {
+        if let Some(uid) = domain {
+            let gate = self.account_gates.lock().admit(uid, self.bio_after_boot_asked.load(Relaxed));
+            if let Err(why) = gate {
+                dev_info_refusal!(
+                    self.dev,
+                    "verify: Touch ID for uid {} {}; refusing without a capture until that account's password\n",
+                    uid,
+                    match why {
+                        crate::userbag::AccountRefusal::AfterBoot => "waits for its first password since this boot",
+                        crate::userbag::AccountRefusal::Lockout => "is locked after too many failed attempts",
+                    }
+                );
+                self.finish_verify(
+                    bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT),
+                    [0u8; bio::TOKEN_LEN],
+                );
+                return;
+            }
+        }
+        if domain.is_none() && self.bio_after_boot.load(Relaxed) {
             if !self.bio_lockout_logged.xchg(true, Relaxed) {
                 dev_info_refusal!(
                     self.dev,
@@ -2806,7 +2828,7 @@ impl SepData {
         }
         // A capture now would only be refused at MATCH_RESULT again, so do
         // not ask the user to touch the sensor for it.
-        if !bag_user && self.bio_lockout.load(Relaxed) {
+        if domain.is_none() && self.bio_lockout.load(Relaxed) {
             if !self.bio_lockout_logged.xchg(true, Relaxed) {
                 dev_info_refusal!(
                     self.dev,
@@ -2819,7 +2841,7 @@ impl SepData {
             );
             return;
         }
-        if self.enclave_reports_lockout() {
+        if domain.is_none() && self.enclave_reports_lockout() {
             let outcome = self.enter_lockout();
             self.finish_verify(outcome, [0u8; bio::TOKEN_LEN]);
             return;
@@ -3026,7 +3048,11 @@ impl SepData {
         let no_match = matches!(outcome, bio::VerifyOutcome::NoMatch);
         let miss = u32::from(no_match);
         let prompt_misses = self.match_scope_misses.load(Relaxed).saturating_add(miss);
-        let total_misses = self.bio_nomatch_streak.load(Relaxed).saturating_add(miss);
+        let total_misses = match domain {
+            Some(uid) => self.account_gates.lock().failures(uid),
+            None => self.bio_nomatch_streak.load(Relaxed),
+        }
+        .saturating_add(miss);
         self.match_scope_misses.store(prompt_misses, Relaxed);
         let step = prompt_step(no_match, capture_retry, prompt_misses, total_misses);
         let keep_open = !key_mode && !self.enclave_reports_lockout() && step == PromptStep::KeepOpen;
@@ -3157,8 +3183,24 @@ impl SepData {
             self.forget_finger_lift();
             sensor::power(false);
         }
+        if let Some(uid) = domain {
+            if matches!(outcome, bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch) {
+                let matched = matches!(outcome, bio::VerifyOutcome::Matched(_));
+                match self.account_gates.lock().record(uid, matched, VERIFY_RETRY_LIMIT) {
+                    Ok(true) => dev_info_ratelimited!(
+                        self.dev,
+                        "verify: {} failed attempts for uid {} since its last match or password; its Touch ID is locked until that account's password (the retry limit)\n",
+                        VERIFY_RETRY_LIMIT,
+                        uid
+                    ),
+                    Ok(false) => {}
+                    Err(_) => dev_warn_ratelimited!(self.dev, "verify: could not count a result for uid {}\n", uid),
+                }
+            }
+        }
         let streak_before = self.bio_nomatch_streak.load(Relaxed);
         match &outcome {
+            _ if domain.is_some() => {}
             bio::VerifyOutcome::Matched(_) => {
                 self.bio_nomatch_streak.store(0, Relaxed);
                 self.enclave_failures_owed.store(false, Relaxed);
@@ -3185,7 +3227,8 @@ impl SepData {
         }
         // The enclave announces its lockout with the no-match that causes it;
         // the next verify must not ask for another touch.
-        if matches!(outcome, bio::VerifyOutcome::NoMatch)
+        if domain.is_none()
+            && matches!(outcome, bio::VerifyOutcome::NoMatch)
             && self.enclave_reports_lockout()
             && !self.bio_lockout.load(Relaxed)
         {
@@ -3195,7 +3238,8 @@ impl SepData {
         // until a password authentication, as the enclave itself does on
         // macOS. Recorded on the host too, so the lockout holds even if the
         // enclave's own announcement is missed, and across a restart.
-        if matches!(outcome, bio::VerifyOutcome::NoMatch)
+        if domain.is_none()
+            && matches!(outcome, bio::VerifyOutcome::NoMatch)
             && !self.bio_lockout.load(Relaxed)
             && self.bio_nomatch_streak.load(Relaxed) >= VERIFY_RETRY_LIMIT
         {
@@ -3394,7 +3438,7 @@ impl SepData {
 
         let result = match self.sbio_match_step() {
             MatchStep::Answer(result) => result,
-            MatchStep::LockedOut => return self.enter_lockout(),
+            MatchStep::LockedOut => return self.enter_match_lockout(),
             MatchStep::Refused => return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
         };
         // On a no-match macOS finishes the touch before MATCH_POLICY.
@@ -5437,6 +5481,31 @@ impl SepData {
             && (last as u16) & bits != 0
     }
 
+    /// The Unix uid whose own domain the current match runs in: a verify
+    /// naming an account with its own fingerprints, or a key touch under its
+    /// bag. None for the configured user.
+    pub(crate) fn match_account(&self) -> Option<u32> {
+        self.bio_subject.lock().map(|s| s.uid)
+    }
+
+    /// The enclave refused MATCH_RESULT as locked out: in an account's own
+    /// domain that account is locked until its password; otherwise the
+    /// configured user's lockout (`enter_lockout`).
+    fn enter_match_lockout(&self) -> bio::VerifyOutcome {
+        let Some(uid) = self.match_account() else {
+            return self.enter_lockout();
+        };
+        if self.account_gates.lock().lock(uid).is_err() {
+            dev_warn_ratelimited!(self.dev, "verify: could not record the lockout of uid {}\n", uid);
+        }
+        dev_warn_ratelimited!(
+            self.dev,
+            "verify: the enclave stopped matching in the domain of uid {}; its Touch ID is locked until that account's password\n",
+            uid
+        );
+        bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT)
+    }
+
     fn enclave_reports_lockout(&self) -> bool {
         self.enclave_reports_state(LOCK_STATE_NEEDS_PASSWORD)
     }
@@ -5637,6 +5706,7 @@ impl SepData {
             }
             bio::IOC_REQUIRE_PASSWORD => {
                 bio::require_admin()?;
+                self.bio_after_boot_asked.store(true, Relaxed);
                 if !self.bio_after_boot.xchg(true, Relaxed) {
                     self.bio_lockout_logged.store(false, Relaxed);
                     dev_info_ratelimited!(

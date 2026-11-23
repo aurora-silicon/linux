@@ -120,6 +120,14 @@ struct sep_bio_enrol_poll {
  * its password, the match runs against that user's own templates; while it
  * is loaded but locked, the verify fails and the password is needed. With
  * no loaded bag, or without the flag, the built-in Linux user matches.
+ *
+ * In an account's own domain Touch ID's gates are that account's: its
+ * failed attempts (a finger that matches only another account is a miss for
+ * it), the lockout after five of them, and, once SEP_BIO_REQUIRE_PASSWORD was
+ * called this boot, the wait for its own first password. A refusal is
+ * SEP_BIO_STATUS_LOCKOUT, as for the configured user. The account's bag
+ * password (its unlock) clears its state and no other; SEP_BIO_LOCKOUT_STATE
+ * and SEP_BIO_REARM report and clear only the configured user's.
  */
 #define SEP_BIO_VERIFY_ACCOUNT 1u
 
