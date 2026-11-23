@@ -286,6 +286,9 @@ impl Registry {
         owner: Option<u64>,
         require_ids: bool,
     ) -> Result<Option<UnusedRenderSpare>> {
+        if owner.is_some_and(|owner| owner == 0 || self.admission.owns_live_slot(owner)) {
+            return Ok(None);
+        }
         // Prefer an empty reservation or an already parked channel, then a
         // reusable or warmed unpublished pair, then an idle drained published
         // sibling (render only).
@@ -361,10 +364,14 @@ impl Registry {
                     }
                     None
                 };
-                if !self
-                    .admission
-                    .reassign_unused_spare(slot as u8, expected, owner)
-                {
+                let claimed = if detach {
+                    self.admission
+                        .release_unused_sibling(slot as u8, expected, true)
+                } else {
+                    self.admission
+                        .reassign_unused_spare(slot as u8, expected, owner)
+                };
+                if !claimed {
                     continue;
                 }
                 if owner.is_none() {

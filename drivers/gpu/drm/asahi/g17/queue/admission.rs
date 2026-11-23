@@ -134,6 +134,15 @@ impl State {
     fn has_live_owner(&self, owner: u64) -> bool {
         (1..cfg::RENDER_SLOTS).any(|slot| self.owns_live(owner, slot))
     }
+    fn mark_published(&mut self, slot: u8) {
+        let index = usize::from(slot);
+        if index > 0 && index < cfg::RENDER_SLOTS {
+            let bit = 1u64 << index;
+            if self.owners[index] != 0 && self.released & bit == 0 {
+                self.published |= bit;
+            }
+        }
+    }
     fn live_owners(&self) -> usize {
         let mut count = 0usize;
         for slot in 1..cfg::RENDER_SLOTS {
@@ -1186,15 +1195,11 @@ impl Pool {
     pub(crate) fn owns_slot(&self, owner: u64, slot: usize) -> bool {
         self.state.lock().owns_live(owner, slot)
     }
+    pub(crate) fn owns_live_slot(&self, owner: u64) -> bool {
+        self.state.lock().has_live_owner(owner)
+    }
     pub(crate) fn note_published(&self, slot: u8) {
-        let index = usize::from(slot);
-        if index > 0 && index < cfg::RENDER_SLOTS {
-            let bit = 1u64 << index;
-            let mut state = self.state.lock();
-            if state.owners[index] != 0 && state.released & bit == 0 {
-                state.published |= bit;
-            }
-        }
+        self.state.lock().mark_published(slot);
     }
     pub(crate) fn release_owner(&self, owner: u64) {
         let mut state = self.state.lock();
@@ -1505,7 +1510,7 @@ impl RenderLease {
     /// including a replay, which supersedes the earlier kick.
     pub(crate) fn note_publication(&self, fragment: KickDependency) {
         let mut state = self.pool.state.lock();
-        state.published |= (1u64 << self.slot) & State::MASK;
+        state.mark_published(self.slot);
         let Some(record) = self.record else {
             return;
         };
@@ -2324,6 +2329,45 @@ mod two_pair_tests {
         drop(q2);
         drop(q1);
         crate::g17::pairs::set_sibling_backlog(1);
+    }
+
+    #[test]
+    fn render_lease_note_publication_ignores_released_slot() {
+        use crate::g17::fw::kick::KickTimestamp;
+
+        let kick = KickDependency::new(10, KickTimestamp::new(1).unwrap()).unwrap();
+        let mut footprint = Footprint::new(1, false);
+        footprint.push_vm(0, 0x1000);
+        let footprint = Arc::new(footprint, GFP_KERNEL).unwrap();
+        let request = Request {
+            footprint: &footprint,
+            sequence: 1,
+            prefix: None,
+        };
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        pool.note_build_room(true, 2);
+        let q1 = pool.try_reserve_queue(2).unwrap();
+        let lease = pool
+            .acquire_render(1, 1, Some(request), u64::MAX, || Ok(()))
+            .unwrap();
+        let slot = lease.slot();
+        let bit = 1u64 << slot;
+        // Concurrent owner release while the pair is lent out off-lock must not
+        // have `published` re-set when `lease.note_publication()` acquires the lock.
+        pool.release_owner(1);
+        lease.note_publication(kick);
+        {
+            let state = pool.state.lock();
+            assert_eq!(state.published & bit, 0);
+            assert_ne!(state.released & bit, 0);
+            assert_eq!(state.owners[usize::from(slot)], 1);
+            assert!(state
+                .footprints
+                .iter()
+                .any(|entry| entry.slot == Some(slot) && entry.fragment.is_some()));
+        }
+        drop(lease);
+        drop(q1);
     }
 }
 
