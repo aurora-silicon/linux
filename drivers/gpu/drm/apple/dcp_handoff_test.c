@@ -9,6 +9,8 @@
 #include <kunit/test.h>
 #include <linux/of.h>
 
+#include "dcp-lifecycle.h"
+
 #define DCP_HANDOFF_COPROC_SIZE	(APPLE_DCP_COPROC_CPU_STATUS + sizeof(u32))
 
 static struct apple_dcp *dcp_handoff_coproc(struct kunit *test, u32 control, u32 status)
@@ -29,6 +31,7 @@ static void dcp_handoff_external_idle(struct kunit *test)
 	const u32 run = APPLE_DCP_COPROC_CPU_CONTROL_RUN;
 	const u32 stopped = APPLE_DCP_COPROC_CPU_STATUS_STOPPED;
 	const u32 idle = APPLE_DCP_COPROC_CPU_STATUS_IDLE;
+	const u32 others = ~(u32)APPLE_DCP_COPROC_CPU_STATUS_RUNNING;
 	unsigned int bits;
 
 	/* Inherited idle: the CPU enabled, and stopped and idle in its status. */
@@ -46,12 +49,18 @@ static void dcp_handoff_external_idle(struct kunit *test)
 				       "control %#x status %#x", control, status);
 	}
 
-	/* Other bits in either register do not change the answer. */
-	KUNIT_EXPECT_TRUE(test, dcp_external_is_idle(dcp_handoff_coproc(test, ~0u, ~0u)));
-	KUNIT_EXPECT_FALSE(test, dcp_external_is_idle(dcp_handoff_coproc(test, ~run, ~0u)));
-	KUNIT_EXPECT_FALSE(test, dcp_external_is_idle(dcp_handoff_coproc(test, ~0u, ~idle)));
+	/*
+	 * Other bits in either register do not change the answer. RUNNING is
+	 * left out of them: apple_dcp_coprocessor_is_active() reads it as an
+	 * active processor, and whether the check should refuse it next to
+	 * STOPPED and IDLE is not this test's to pin.
+	 */
+	KUNIT_EXPECT_TRUE(test, dcp_external_is_idle(dcp_handoff_coproc(test, ~0u, others)));
+	KUNIT_EXPECT_FALSE(test, dcp_external_is_idle(dcp_handoff_coproc(test, ~run, others)));
 	KUNIT_EXPECT_FALSE(test, dcp_external_is_idle(dcp_handoff_coproc(test, ~0u,
-									   ~stopped)));
+									   others & ~idle)));
+	KUNIT_EXPECT_FALSE(test, dcp_external_is_idle(dcp_handoff_coproc(test, ~0u,
+									   others & ~stopped)));
 }
 
 /*
