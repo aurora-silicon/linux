@@ -145,15 +145,26 @@ static void t6050_aop_send(struct t6050_aop *aop, u8 ep, u64 msg)
  * What a GETBUF gets: 0 a new buffer, 1 the endpoint's own again, as it fits in it, or -EINVAL for
  * no size or more than the endpoint's buffer holds. An endpoint has one buffer for as long as the
  * firmware runs: its rings are read from it at a sleep and a wake, by other threads.
+ *
+ * A GETBUF that is answered starts the endpoint's rings over: they are announced again after it,
+ * so the endpoint has none, and sends nothing, until then.
  */
-static int t6050_aop_getbuf_check(const struct t6050_aop_ring *r, size_t size)
+static int t6050_aop_getbuf_claim(struct t6050_aop_ring *r, size_t size)
 {
+	int ret;
+
 	if (!size)
 		return -EINVAL;
-	if (!r->buf)
-		return 0;
+	ret = !r->buf ? 0 : size <= r->size ? 1 : -EINVAL;
+	if (ret < 0)
+		return ret;
 
-	return size <= r->size ? 1 : -EINVAL;
+	WRITE_ONCE(r->tx_ready, false);
+	WRITE_ONCE(r->rx_ready, false);
+	r->seq = 0;
+	r->tx_rptr = 0;
+	r->tx_wptr = 0;
+	return ret;
 }
 
 static void t6050_aop_getbuf(struct t6050_aop *aop, u8 ep, u64 msg)
@@ -164,12 +175,14 @@ static void t6050_aop_getbuf(struct t6050_aop *aop, u8 ep, u64 msg)
 	int ret;
 
 	/* Only this endpoint's messages, in order, change its buffer. */
-	ret = t6050_aop_getbuf_check(r, size);
+	ret = t6050_aop_getbuf_claim(r, size);
 	if (ret < 0) {
 		dev_err_ratelimited(aop->dev, "endpoint %#x: no buffer for a %#zx byte GETBUF (has %#zx)\n",
 				    ep, size, r->buf ? r->size : 0);
 		return;
 	}
+	/* Open again once its rings start (AFK_START_ACK). */
+	clear_bit(ep - AOP_EP_FIRST, &aop->opened);
 	if (!ret) {
 		buf = dmam_alloc_coherent(aop->dev, size, &r->iova, GFP_KERNEL);
 		if (!buf) {
