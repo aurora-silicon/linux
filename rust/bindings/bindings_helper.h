@@ -114,7 +114,6 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp.h>
 #include <linux/soc/apple/pmp-report.h>
-#include <linux/soc/apple/aura-hibernate.h>
 #include <linux/suspend.h>
 #include <linux/sys_soc.h>
 #include <linux/task_work.h>
