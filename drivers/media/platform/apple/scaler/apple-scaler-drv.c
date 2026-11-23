@@ -353,13 +353,20 @@ static void asc_fill(struct v4l2_pix_format_mplane *pix, const struct v4l2_pix_f
 		     u32 default_fourcc)
 {
 	const struct asc_format *f = asc_find_format(pix->pixelformat);
-	u32 w = ref ? ref->width : pix->width, h = ref ? ref->height : pix->height;
 	struct v4l2_pix_format_mplane in = *pix;
+	u32 w, h;
 
-	if (!f)
+	/* Use a same-size RGB format when CAPTURE cannot subsample OUTPUT. */
+	if (!f || (ref && (!IS_ALIGNED(ref->width, f->hsub) ||
+			   !IS_ALIGNED(ref->height, f->vsub))))
 		f = asc_find_format(default_fourcc);
-	w = clamp_t(u32, ALIGN(w, f->hsub), ASC_MIN_SIZE, ASC_MAX_SIZE);
-	h = clamp_t(u32, ALIGN(h, f->vsub), ASC_MIN_SIZE, ASC_MAX_SIZE);
+	if (ref) {
+		w = ref->width;
+		h = ref->height;
+	} else {
+		w = clamp_t(u32, ALIGN(pix->width, f->hsub), ASC_MIN_SIZE, ASC_MAX_SIZE);
+		h = clamp_t(u32, ALIGN(pix->height, f->vsub), ASC_MIN_SIZE, ASC_MAX_SIZE);
+	}
 
 	memset(pix, 0, sizeof(*pix));
 	if (f->lossless) {
