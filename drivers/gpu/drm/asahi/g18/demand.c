@@ -54,7 +54,7 @@ int g18_demand_get(struct device *dev, struct g18_demand **out)
 	int ret = apple_clpc_gpu_get(dev, &gpu);
 
 	*out = NULL;
-	if (ret == -EPROBE_DEFER)
+	if (ret == -EPROBE_DEFER || ret == -ENOMEM)
 		return ret;
 	if (ret || !gpu) {
 		if (ret)
