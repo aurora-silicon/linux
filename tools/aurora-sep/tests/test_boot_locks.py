@@ -202,6 +202,39 @@ echo "held ${{#LOCK_FDS[@]}}"
         self.assertIn('held 2', r.stdout)
         self.assertIn('busy', r.stdout)
 
+    def test_created_compat_lock_is_private(self):
+        r = self.take()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(stat.S_IMODE(self.compat.stat().st_mode) & 0o077, 0)
+
+    def test_stderr_survives_the_compat_lock(self):
+        # Opening the compatibility lock must leave the script's stderr alone: what it
+        # prints afterwards (a refusal, say) still has to reach the operator.
+        self.compat.write_text('')
+        r = self.take('echo "after the locks" >&2')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('after the locks', r.stderr)
+
+    def test_held_compat_lock_refusal_is_printed(self):
+        self.compat.write_text('')
+        script = f"""
+set -euo pipefail
+AIR_GPU_SOURCE_ONLY=1 source '{ONESHOT}'
+LOCKS='{self.boot}'
+COMPAT_LOCKS='{self.compat}'
+log() {{ :; }}
+flock() {{ if [[ $1 == -w ]]; then command flock -n "${{@:3}}"; else command flock "$@"; fi; }}
+take_locks
+echo "held ${{#LOCK_FDS[@]}}"
+"""
+        with open(self.compat) as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            r = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn('held', r.stdout)
+        self.assertIn('is held by another tool', r.stderr)
+        self.assertIn('Nothing was changed.', r.stderr)
+
     def test_a_fifo_refuses(self):
         os.mkfifo(self.compat)
         r = self.take()

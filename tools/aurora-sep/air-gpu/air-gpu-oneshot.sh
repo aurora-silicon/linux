@@ -329,9 +329,10 @@ COMPAT_FD=
 open_compat_lock() {
   local l=$1 fd owner inode type
   COMPAT_FD=
-  [[ -e $l || -L $l ]] || (set -C; : >"$l") 2>/dev/null || true
+  [[ -e $l || -L $l ]] || (umask 077; set -C; : >"$l") 2>/dev/null || true
   [[ -f $l && ! -L $l && -O $l ]] || return 1
-  exec {fd}<"$l" 2>/dev/null || return 1
+  # In braces: a redirection on exec itself would stay on the script's stderr.
+  { exec {fd}<"$l"; } 2>/dev/null || return 1
   # stat inherits the descriptor: /proc/self/fd/N is the file that was opened.
   read -r owner inode type < <(stat -L -c '%u %d:%i %F' "/proc/self/fd/$fd" 2>/dev/null) || true
   if [[ $owner == "$EUID" && $type == regular* &&
